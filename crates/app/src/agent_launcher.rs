@@ -46,16 +46,62 @@ const KIMI_EFFORTS: &[ReasoningEffort] = &[
 ];
 // `support_efforts`가 없는 Kimi 모델은 강도 단계 없이 thinking 켬/끔만 있다.
 const KIMI_THINKING_TOGGLE: &[ReasoningEffort] = &[ReasoningEffort::On, ReasoningEffort::Off];
-// grok-4.5가 광고하는 단계. Grok의 전체 어휘는 none/minimal도 포함하지만 모델마다
-// 부분집합만 받으므로, 카탈로그를 못 읽을 때 쓰는 이 폴백은 기본 모델 기준으로 둔다.
-const GROK_EFFORTS: &[ReasoningEffort] = &[
+const GROK_46_EFFORTS: &[ReasoningEffort] = &[
+    ReasoningEffort::Low,
+    ReasoningEffort::Medium,
+    ReasoningEffort::High,
+    ReasoningEffort::XHigh,
+];
+const GROK_45_EFFORTS: &[ReasoningEffort] = &[
     ReasoningEffort::Low,
     ReasoningEffort::Medium,
     ReasoningEffort::High,
 ];
 
+/// 에이전트가 끝나면 그 자리에 평범한 셸을 얹는 래퍼.
+///
+/// `stty sane` 뒤의 드레인 한 줄이 핵심이다. 에이전트 TUI는 터미널에 커서 위치(CPR
+/// `ESC[2;1R`), 전경·배경색(OSC 10/11), 장치 속성(DA `ESC[?6c`)을 **질의**하고, 우리
+/// 터미널이 그 **응답을 PTY 입력 쪽으로 되돌려 쓴다**. 에이전트가 응답을 읽기 전에
+/// 끝나면 그 바이트가 입력 버퍼에 남아, 뒤이어 뜬 셸이 사용자가 타이핑한 것으로
+/// 읽는다 — 실제로 `zsh: command not found: 1R10`처럼 깨진 명령이 실행됐다
+/// (2026-08-19 사용자 보고).
+///
+/// `stty sane`은 **모드만 되돌릴 뿐 남은 입력을 버리지 않는다**. 그래서 비정규 모드로
+/// 잠깐 두고(`min 0 time 1` = 최대 0.1초, 없으면 즉시 반환) 남은 바이트를 `dd`로 읽어
+/// 버린다. 그동안 `-echo`라 그 바이트가 화면에 얼룩으로 찍히지도 않는다. 실측으로
+/// 두 효과를 모두 확인했다(실제 CPR/OSC/DA 시퀀스를 PTY에 주입 → 잔여 입력 없음,
+/// 화면 출력 없음). `stty`가 없거나 실패하면 `&&`로 건너뛰어 기존 동작 그대로다.
+/// 남은 터미널 질의 응답을 버리는 조각. 스크립트와 테스트가 **같은 문자열**을 쓰도록
+/// 상수로 둔다 — 한쪽만 고치면 회귀를 못 잡는다.
+///
+/// `time 0`(기다리지 않음)인 이유: 이 드레인은 **이미 버퍼에 있는 것만** 버려야 한다.
+/// `time 1`(0.1초 대기)로 두면 그 사이에 사용자가 친 글자까지 함께 삼킨다 — 실측으로
+/// 확인했다(에이전트 종료 50ms 뒤 타이핑: `time 1`은 삼킴, `time 0`은 살아남음).
+/// 질의 응답은 우리 터미널이 질의를 파싱하는 즉시(= 에이전트가 살아 있을 때) 써 넣으므로
+/// 이 시점엔 이미 버퍼에 있고, `time 0`으로도 그대로 걸린다(실측: 잔여 입력 없음).
 #[cfg(unix)]
-const AGENT_THEN_SHELL_SCRIPT: &str = r#""$@"; stty sane 2>/dev/null || true; unset DEPPY_AGENT_EXECUTABLE DEPPY_SHIM_GUARD; exec "${SHELL:-/bin/sh}""#;
+const DRAIN_PENDING_TTY_INPUT: &str =
+    "stty -icanon -echo min 0 time 0 2>/dev/null && dd of=/dev/null bs=4096 count=1 2>/dev/null";
+
+/// `"$@"` 직후 `$?`(에이전트의 진짜 종료 코드 — 뒤이어 붙는 폴백 셸의 것이 아니다)를
+/// 잡아 sentinel 파일에 남긴다. 파일명은 이 래퍼 셸 자신의 PID(`$$`)로 결정되는데, 그
+/// PID는 runtime이 `process_identity()`로 이미 알고 있는 값과 정확히 같은 프로세스를
+/// 가리킨다(PTY가 직접 스폰하는 게 바로 이 `/bin/sh`) — 그래서 새 IPC 없이 파일 하나로
+/// 만난다. 경로 계산은 `session::agent_exit_sentinel_path`와 이 접두사를 공유한다
+/// (`DRAIN_PENDING_TTY_INPUT`과 같은 관례 — 한쪽만 고치면 서로 못 찾는다).
+///
+/// **화면에는 아무것도 안 남는다** — `printf`는 파일로만 쓰고, 실패해도(temp dir 없음
+/// 등) `|| true`로 조용히 넘어가 기존 동작(폴백 셸 진입)을 막지 않는다. 세션 로그
+/// redaction과도 무관하다 — PTY로 나가는 바이트가 아니라 파일 시스템 쓰기라 로그에
+/// 찍힐 게 없다.
+#[cfg(unix)]
+fn agent_then_shell_script() -> String {
+    let prefix = runtime::AGENT_EXIT_SENTINEL_PREFIX;
+    format!(
+        r#""$@"; __deppy_exit=$?; printf '%s' "$__deppy_exit" > "${{TMPDIR:-/tmp}}/{prefix}$$" 2>/dev/null || true; stty sane 2>/dev/null || true; {DRAIN_PENDING_TTY_INPUT}; stty sane 2>/dev/null || true; unset DEPPY_AGENT_EXECUTABLE DEPPY_SHIM_GUARD; exec "${{SHELL:-/bin/sh}}""#
+    )
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum AgentKind {
@@ -362,13 +408,21 @@ impl AgentKind {
                 },
             ],
             // Grok의 `~/.grok/models_cache.json`은 로그인 후 서버에서 받아야 생긴다.
-            // 그 전까지는 내장 기본 모델 하나만 제시한다.
-            Self::Grok => &[BuiltinModel {
-                value: "grok-4.5",
-                label: "Grok 4.5",
-                efforts: GROK_EFFORTS,
-                default_effort: Some(ReasoningEffort::High),
-            }],
+            // 그 전까지는 현재 CLI가 광고하는 두 모델을 내장 목록으로 제시한다.
+            Self::Grok => &[
+                BuiltinModel {
+                    value: "grok-4.6",
+                    label: "Grok 4.6",
+                    efforts: GROK_46_EFFORTS,
+                    default_effort: Some(ReasoningEffort::High),
+                },
+                BuiltinModel {
+                    value: "grok-4.5",
+                    label: "Grok 4.5",
+                    efforts: GROK_45_EFFORTS,
+                    default_effort: Some(ReasoningEffort::High),
+                },
+            ],
             // Qwen Code는 모델 카탈로그를 받아오지 않는다. OAuth 기본 모델만 확실하고,
             // 나머지는 사용자가 settings.json에 직접 선언해야 쓸 수 있어 카탈로그에서 읽는다.
             // 추론 강도는 CLI 플래그가 없어(설정 파일/슬래시 명령 전용) 제시하지 않는다.
@@ -399,7 +453,7 @@ impl AgentKind {
         match self {
             Self::Codex => CODEX_EFFORTS_XHIGH,
             Self::Claude => CLAUDE_EFFORTS,
-            Self::Grok => GROK_EFFORTS,
+            Self::Grok => GROK_45_EFFORTS,
             _ => &[],
         }
     }
@@ -449,6 +503,30 @@ pub(crate) fn is_builtin_config_id(id: &str) -> bool {
     AgentKind::from_stable_config_id(id).is_some()
 }
 
+/// 사용자가 런처에서 끈 에이전트 거부 목록을 정규화한다: 미지 id 제거 + 중복 제거 +
+/// 안정 정렬(id 문자열 오름차순). 미지 id를 걸러내고 중복을 접으므로 결과 길이는
+/// `AgentKind::ALL` 개수를 자연히 넘지 않는다. `config::Config::normalize`(로드 경계)와
+/// 저장 양쪽에서 쓴다.
+pub(crate) fn normalize_disabled_agents(raw: &[String]) -> Vec<String> {
+    let mut ids: Vec<String> = raw
+        .iter()
+        .filter(|id| {
+            AgentKind::ALL
+                .into_iter()
+                .any(|kind| kind.id() == id.as_str())
+        })
+        .cloned()
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+/// 거부 목록에 없으면 켜진 것이다 — 빈 목록이면 전부 켜짐.
+pub(crate) fn agent_is_enabled(disabled: &[String], kind: AgentKind) -> bool {
+    !disabled.iter().any(|id| id == kind.id())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReasoningEffort {
     Low,
@@ -496,6 +574,7 @@ pub(crate) struct DetectedAgent {
     /// CLI가 자기 설정에 적어 둔 기본 모델(목록 안에 있을 때만). 런처는 이 값을 미리
     /// 골라 두어, 앱으로 띄운 결과가 CLI를 그냥 실행한 것과 같게 유지한다.
     default_model: Option<String>,
+    default_effort: Option<ReasoningEffort>,
 }
 
 impl DetectedAgent {
@@ -505,6 +584,10 @@ impl DetectedAgent {
 
     pub(crate) fn executable(&self) -> &Path {
         &self.executable
+    }
+
+    pub(crate) fn launch_path(&self) -> Option<&str> {
+        self.launch_path.as_deref()
     }
 
     pub(crate) fn models(&self) -> &[ModelChoice] {
@@ -519,6 +602,14 @@ impl DetectedAgent {
             .filter(|model| find_model(&self.models, model).is_some())
             .or_else(|| self.models.first().map(ModelChoice::value))
             .unwrap_or_default()
+    }
+
+    pub(crate) fn initial_effort(&self, model: &str) -> Option<ReasoningEffort> {
+        let choice = find_model(&self.models, model)?;
+        self.default_effort
+            .filter(|effort| choice.efforts().contains(effort))
+            .or_else(|| choice.default_effort())
+            .or_else(|| choice.efforts().first().copied())
     }
 
     pub(crate) fn supported_efforts(&self, model: &str) -> &[ReasoningEffort] {
@@ -590,8 +681,30 @@ impl DetectionSnapshot {
                     launch_path: None,
                     models: kind.builtin_model_choices(),
                     default_model: None,
+                    default_effort: None,
                 })
                 .collect(),
+            claude_default_model: None,
+            claude_default_effort: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_agent_with_defaults(
+        kind: AgentKind,
+        executable: PathBuf,
+        default_model: Option<String>,
+        default_effort: Option<ReasoningEffort>,
+    ) -> Self {
+        Self {
+            agents: vec![DetectedAgent {
+                kind,
+                executable,
+                launch_path: None,
+                models: kind.builtin_model_choices(),
+                default_model,
+                default_effort,
+            }],
             claude_default_model: None,
             claude_default_effort: None,
         }
@@ -631,7 +744,7 @@ impl LaunchSpec {
 pub(crate) fn wrap_agent_then_shell(command: String, args: Vec<String>) -> (String, Vec<String>) {
     let mut wrapped_args = Vec::with_capacity(args.len() + 4);
     wrapped_args.push("-c".to_owned());
-    wrapped_args.push(AGENT_THEN_SHELL_SCRIPT.to_owned());
+    wrapped_args.push(agent_then_shell_script());
     wrapped_args.push("deppy-agent-session".to_owned());
     wrapped_args.push(command);
     wrapped_args.extend(args);
@@ -651,23 +764,31 @@ pub(crate) fn detect_installed_agents(excluded_directory: Option<&Path>) -> Dete
     let home = crate::paths::home_dir();
     let (claude_default_model, claude_default_effort) =
         crate::agent_model_catalog::claude_configured_defaults(home.as_deref());
+    let (grok_default_model, grok_default_effort) =
+        crate::agent_model_catalog::grok_configured_defaults(home.as_deref());
     let agents = AgentKind::ALL
         .into_iter()
         .filter_map(|kind| {
             resolve_executable(kind.detect_command(), &paths).map(|executable| {
                 // 설정 파일은 종류마다 한 번만 읽는다. 모델 목록과 초기 선택이 같은 값을
                 // 쓰므로 각각 읽으면 같은 파일을 두 번 열고 파싱하게 된다.
-                let configured = if kind == AgentKind::Claude {
-                    claude_default_model.clone()
-                } else {
-                    crate::agent_model_catalog::configured_default_model(kind, home.as_deref())
+                let configured = match kind {
+                    AgentKind::Claude => claude_default_model.clone(),
+                    AgentKind::Grok => grok_default_model.clone(),
+                    _ => {
+                        crate::agent_model_catalog::configured_default_model(kind, home.as_deref())
+                    }
                 };
+                let default_effort = (kind == AgentKind::Grok)
+                    .then_some(grok_default_effort)
+                    .flatten();
                 DetectedAgent {
                     kind,
                     executable,
                     launch_path: launch_path.clone(),
                     models: resolve_models(kind, home.as_deref(), configured.as_deref()),
                     default_model: configured,
+                    default_effort,
                 }
             })
         })
@@ -687,7 +808,7 @@ fn resolve_models(
     configured: Option<&str>,
 ) -> Vec<ModelChoice> {
     let mut models = if crate::agent_model_catalog::has_disk_catalog(kind) {
-        crate::agent_model_catalog::load(kind, home)
+        crate::agent_model_catalog::load(kind, home, configured)
     } else {
         Vec::new()
     };
@@ -953,7 +1074,10 @@ fn push_detection_path(paths: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, pa
 /// `--dangerously-bypass-hook-trust` 같은 플래그가 두 번 전달돼 codex가 시작을 거부한다
 /// (실측 재현: cmux의 codex wrapper가 동일 패턴으로 hook을 주입한다).
 fn push_path_env_entry(paths: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, path: PathBuf) {
-    if is_transient_shim_directory(&path) {
+    // 상대 PATH 항목은 현재 작업 디렉터리에 따라 다른 파일을 가리킨다. 런처는 나중에
+    // 절대 실행경로만 허용하고 사용량 프로브도 같은 감지값을 공유하므로, 감지 경계에서
+    // 제거해 두 경로의 계약을 일치시킨다.
+    if !path.is_absolute() || is_transient_shim_directory(&path) {
         return;
     }
     push_detection_path(paths, seen, path);
@@ -1027,6 +1151,32 @@ fn valid_executable_string(path: &Path) -> Result<String, LaunchSpecErrorCode> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn 거부_목록은_미지_id와_중복을_버린다() {
+        let raw = vec![
+            "kimi".into(),
+            "kimi".into(),
+            "없는에이전트".into(),
+            "claude".into(),
+        ];
+        assert_eq!(
+            normalize_disabled_agents(&raw),
+            vec!["claude".to_owned(), "kimi".to_owned()]
+        );
+        assert!(normalize_disabled_agents(&[]).is_empty());
+    }
+
+    #[test]
+    fn 거부_목록에_없으면_켜진_것이다() {
+        let disabled = vec!["kimi".to_owned()];
+        assert!(!agent_is_enabled(&disabled, AgentKind::Kimi));
+        assert!(agent_is_enabled(&disabled, AgentKind::Claude));
+        assert!(
+            agent_is_enabled(&[], AgentKind::Kimi),
+            "빈 목록이면 전부 켜짐"
+        );
+    }
+
     fn detected(kind: AgentKind) -> DetectedAgent {
         DetectedAgent {
             kind,
@@ -1034,7 +1184,63 @@ mod tests {
             launch_path: None,
             models: kind.builtin_model_choices(),
             default_model: None,
+            default_effort: None,
         }
+    }
+
+    #[test]
+    fn grok_builtin_models_match_the_current_cli_effort_ladders() {
+        let models = AgentKind::Grok.builtin_model_choices();
+        assert_eq!(
+            models.iter().map(ModelChoice::value).collect::<Vec<_>>(),
+            ["grok-4.6", "grok-4.5"]
+        );
+        assert_eq!(
+            find_model(&models, "grok-4.6").unwrap().efforts(),
+            [
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+                ReasoningEffort::XHigh,
+            ]
+        );
+        assert_eq!(
+            find_model(&models, "grok-4.5").unwrap().efforts(),
+            [
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+            ]
+        );
+    }
+
+    #[test]
+    fn grok_46_launch_accepts_xhigh_and_grok_45_rejects_it() {
+        let grok = detected(AgentKind::Grok);
+        let spec = build_launch_spec(
+            &grok,
+            LaunchOptions {
+                model: "grok-4.6".to_owned(),
+                effort: Some(ReasoningEffort::XHigh),
+                yolo: false,
+            },
+            None,
+        )
+        .unwrap();
+        let (_, _, args, _) = spec.into_parts();
+        assert_eq!(args, ["--model", "grok-4.6", "--reasoning-effort", "xhigh"]);
+        assert!(matches!(
+            build_launch_spec(
+                &grok,
+                LaunchOptions {
+                    model: "grok-4.5".to_owned(),
+                    effort: Some(ReasoningEffort::XHigh),
+                    yolo: false,
+                },
+                None,
+            ),
+            Err(LaunchSpecErrorCode::UnsupportedEffort)
+        ));
     }
 
     #[test]
@@ -1193,6 +1399,7 @@ mod tests {
             launch_path: None,
             models,
             default_model: Some("opus[1m]".to_owned()),
+            default_effort: None,
         };
         assert_eq!(agent.initial_model(), "opus[1m]");
         let spec = build_launch_spec(
@@ -1434,6 +1641,7 @@ mod tests {
             )),
             models: AgentKind::Kimi.builtin_model_choices(),
             default_model: None,
+            default_effort: None,
         };
         let spec = build_launch_spec(
             &agent,
@@ -1503,7 +1711,7 @@ mod tests {
         );
         assert_eq!(command, "/bin/sh");
         assert_eq!(args[0], "-c");
-        assert_eq!(args[1], AGENT_THEN_SHELL_SCRIPT);
+        assert_eq!(args[1], agent_then_shell_script());
         assert_eq!(args[2], "deppy-agent-session");
         assert_eq!(args[3], "/bin/sh");
         assert_eq!(args[4..], ["-c", "printf 'agent-done\\n'"]);
@@ -1527,6 +1735,154 @@ mod tests {
         let stdout = String::from_utf8(output.stdout).unwrap();
         assert!(stdout.contains("agent-done\n"), "{stdout:?}");
         assert!(stdout.contains("shell-ready\n"), "{stdout:?}");
+    }
+
+    /// 래퍼가 폴백 셸의 exit code로 완료/실패를 오판하지 않도록, 에이전트 자신의 진짜
+    /// 종료 코드를 sentinel 파일에 남긴다. 파일 경로는 이 래퍼 프로세스의 PID(=`child.id()`)
+    /// 로 계산되므로 runtime과 같은 공식(`runtime::agent_exit_sentinel_path`)을 쓰면
+    /// 테스트 없이도 서로 찾는다는 걸 이 테스트가 고정한다.
+    #[cfg(unix)]
+    #[test]
+    fn 에이전트의_진짜_종료코드가_보이지_않게_sentinel_파일에_남는다() {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        let (command, args) = wrap_agent_then_shell(
+            "/bin/sh".to_owned(),
+            vec!["-c".to_owned(), "exit 7".to_owned()],
+        );
+        let mut child = Command::new(command)
+            .args(args)
+            .env("SHELL", "/bin/sh")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.stdin.take().unwrap().write_all(b"exit\n").unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "폴백 셸 자체는 정상 종료해야 한다");
+
+        let sentinel = runtime::agent_exit_sentinel_path(&std::env::temp_dir(), pid);
+        let content = std::fs::read_to_string(&sentinel)
+            .unwrap_or_else(|error| panic!("sentinel 파일이 없다({sentinel:?}): {error}"));
+        assert_eq!(
+            content, "7",
+            "폴백 셸이 아니라 에이전트 자신의 종료 코드여야 한다"
+        );
+
+        // 화면(stdout/stderr) 어디에도 흔적이 없어야 한다 — 터미널 질의 응답 유출
+        // 사고(2026-08-19)와 같은 종류의 문제를 이 sentinel이 반복하면 안 된다.
+        let visible = [output.stdout, output.stderr].concat();
+        let visible = String::from_utf8_lossy(&visible);
+        assert!(!visible.contains("__deppy_exit"), "{visible:?}");
+        assert!(
+            !visible.contains(sentinel.file_name().unwrap().to_str().unwrap()),
+            "{visible:?}"
+        );
+
+        let _ = std::fs::remove_file(&sentinel);
+    }
+
+    /// 정상 종료(0)도 같은 경로로 정확히 남아야 한다 — 7만 통과하고 0이 어긋나는
+    /// off-by-something을 잡는다.
+    #[cfg(unix)]
+    #[test]
+    fn 정상_종료코드_0도_sentinel에_그대로_남는다() {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        let (command, args) = wrap_agent_then_shell(
+            "/bin/sh".to_owned(),
+            vec!["-c".to_owned(), "exit 0".to_owned()],
+        );
+        let mut child = Command::new(command)
+            .args(args)
+            .env("SHELL", "/bin/sh")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.stdin.take().unwrap().write_all(b"exit\n").unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+
+        let sentinel = runtime::agent_exit_sentinel_path(&std::env::temp_dir(), pid);
+        let content = std::fs::read_to_string(&sentinel).unwrap();
+        assert_eq!(content, "0");
+        let _ = std::fs::remove_file(&sentinel);
+    }
+
+    /// 2026-08-19 사용자 보고 — 에이전트 TUI가 던진 터미널 질의의 **응답**(CPR·OSC
+    /// 10/11·DA)이 늦게 도착해 뒤이어 뜬 셸의 입력으로 들어가면 깨진 명령이 실행된다
+    /// (`zsh: command not found: 1R10`).
+    ///
+    /// **`stty sane`은 모드만 되돌릴 뿐 남은 입력을 버리지 않는다** — 이 테스트가 그
+    /// 사실과 드레인의 효과를 진짜 PTY로 함께 고정한다. `DRAIN_PENDING_TTY_INPUT`을
+    /// 빼면 `LEFT:` 줄에 질의 응답이 그대로 남아 실패한다.
+    #[cfg(unix)]
+    #[test]
+    fn 드레인은_stty_sane이_못_버리는_터미널_질의_응답을_없앤다() {
+        use pty::PtyBackend as _;
+
+        fn leftover_after(script: &str) -> String {
+            let mut session = pty::PortablePtyBackend
+                .spawn(
+                    &pty::CommandSpec {
+                        program: "/bin/sh".into(),
+                        args: vec!["-c".into(), script.into()],
+                        env: Vec::new(),
+                        cwd: None,
+                    },
+                    80,
+                    24,
+                )
+                .unwrap();
+            let rx = session.take_output().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            // 실제로 우리 터미널이 되돌려 쓰는 바이트 그대로.
+            session.write_input(b"\x1b[2;1R\x1b[?6c\n").unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut out = String::new();
+            while std::time::Instant::now() < deadline {
+                if let Ok(chunk) = rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                    out.push_str(&String::from_utf8_lossy(&chunk));
+                }
+                if out.contains("LEFT:") {
+                    break;
+                }
+            }
+            let _ = session.kill();
+            out
+        }
+
+        // ① stty sane만으로는 남는다 — 이게 사용자가 겪은 상황이다.
+        let sane_only = leftover_after(
+            "sleep 0.4; stty sane 2>/dev/null || true; if read -t 2 x 2>/dev/null; then printf 'LEFT:[%s]\\n' \"$x\"; else printf 'LEFT:none\\n'; fi",
+        );
+        assert!(
+            sane_only.contains("LEFT:[") && !sane_only.contains("LEFT:none"),
+            "stty sane만으로 입력이 비워지면 이 수정의 전제가 무너진다: {sane_only:?}"
+        );
+
+        // ② 드레인을 붙이면 사라진다.
+        let drained = leftover_after(&format!(
+            "sleep 0.4; stty sane 2>/dev/null || true; {DRAIN_PENDING_TTY_INPUT}; stty sane 2>/dev/null || true; if read -t 2 x 2>/dev/null; then printf 'LEFT:[%s]\\n' \"$x\"; else printf 'LEFT:none\\n'; fi",
+        ));
+        assert!(
+            drained.contains("LEFT:none"),
+            "드레인 뒤에도 질의 응답이 남았다: {drained:?}"
+        );
+
+        // ③ 그 드레인이 실제 래퍼 스크립트에 배선돼 있어야 한다 — ①②만으로는
+        //    "조각은 잘 도는데 아무도 안 쓴다"를 못 잡는다.
+        assert!(
+            agent_then_shell_script().contains(DRAIN_PENDING_TTY_INPUT),
+            "에이전트→셸 래퍼가 드레인을 쓰지 않는다"
+        );
     }
 
     #[cfg(unix)]
@@ -1619,6 +1975,19 @@ mod tests {
             paths,
             [real],
             "임시 디렉터리 아래 PATH 항목(다른 도구의 세션별 hook shim)은 실제 설치 위치가 아니므로 걸러야 한다"
+        );
+    }
+
+    #[test]
+    fn 상대_path_항목은_절대_실행경로_계약에서_제외한다() {
+        let mut paths = Vec::new();
+        let mut seen = HashSet::new();
+
+        push_path_env_entry(&mut paths, &mut seen, PathBuf::from("relative/bin"));
+
+        assert!(
+            paths.is_empty(),
+            "런처·사용량 프로브가 공유하는 감지 실행경로는 절대 경로여야 한다"
         );
     }
 }

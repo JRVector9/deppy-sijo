@@ -29,6 +29,23 @@ jobs:
       - name: git diff --check
         run: git diff --check
 
+  # Relay 데이터 평면은 Linux에 배포된다. 워크스페이스 테스트는 macOS에서 돌지만,
+  # 실제 배포 타깃에서 바이너리가 빌드되는지는 따로 확인해야 한다.
+  relay-data-plane:
+    name: Relay protocol and server (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo clippy -p relay-protocol -p relay-server --all-targets -- -D warnings
+        run: cargo clippy -p relay-protocol -p relay-server --locked --all-targets -- -D warnings
+      - name: cargo test -p relay-protocol -p relay-server
+        run: cargo test -p relay-protocol -p relay-server --locked -- --test-threads=1
+      - name: Build the deployable relay binary
+        run: cargo build --locked --release -p relay-server --bin relay-server
+
   build-test:
     name: Build, clippy, and test (macOS)
     runs-on: macos-15

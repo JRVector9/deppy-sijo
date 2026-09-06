@@ -18,12 +18,14 @@ mod claude_usage;
 mod codex_app_server;
 mod codex_backend_usage;
 mod config;
+mod document_io;
 mod dotenv_sync;
 mod env;
 mod env_reload;
 mod fleet;
 mod fonts;
 mod git_cli;
+mod grok_usage;
 mod kimi_usage;
 mod lazy_worker;
 mod llm_proxy;
@@ -41,7 +43,11 @@ mod port_inventory;
 mod proc_info;
 mod process_storm;
 mod prompt_library;
+mod provider_usage_command;
 mod pty_effort;
+// Task 2 어댑터만 제공한다 — 기동 배선은 Relay 클라이언트를 붙이는 Task 4의 몫이다.
+#[allow(dead_code)]
+mod relay_repository;
 mod shortcuts;
 mod status_feed;
 mod tailscale;

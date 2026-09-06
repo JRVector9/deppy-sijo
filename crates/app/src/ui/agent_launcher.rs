@@ -157,6 +157,12 @@ pub(crate) enum AgentLauncherIntent {
     BlankTerminal {
         workspace_id: String,
     },
+    /// 카드 상시 토글 스위치가 올린다. leaf는 config를 직접 쓰지 않으므로 거부
+    /// 목록 갱신·저장은 App(`crates/app/src/app.rs`)이 맡는다.
+    SetAgentEnabled {
+        kind: AgentKind,
+        enabled: bool,
+    },
 }
 
 pub(crate) struct AgentLauncherUi {
@@ -241,11 +247,12 @@ impl AgentLauncherUi {
         snapshot: Option<&DetectionSnapshot>,
         detecting: bool,
         catalog: &i18n::Catalog,
+        disabled: &[String],
     ) -> Option<AgentLauncherIntent> {
         if !self.open {
             return None;
         }
-        self.reconcile_selection(snapshot);
+        self.reconcile_selection(snapshot, disabled);
 
         let mut intent = None;
         let palette = launcher_palette(ctx.global_style().visuals.dark_mode);
@@ -364,7 +371,7 @@ impl AgentLauncherUi {
                                     ui.vertical(|ui| {
                                         ui.set_width(AGENT_PANE_WIDTH - 28.0);
                                         if let Some(list_intent) = self.render_agent_list(
-                                            ui, snapshot, detecting, catalog, palette,
+                                            ui, snapshot, detecting, catalog, disabled, palette,
                                         ) {
                                             intent = Some(list_intent);
                                         }
@@ -506,6 +513,7 @@ impl AgentLauncherUi {
         snapshot: Option<&DetectionSnapshot>,
         detecting: bool,
         catalog: &i18n::Catalog,
+        disabled: &[String],
         palette: LauncherPalette,
     ) -> Option<AgentLauncherIntent> {
         let mut intent = None;
@@ -563,16 +571,41 @@ impl AgentLauncherUi {
                     .show(ui, |ui| {
                         for (index, agent) in snapshot.agents().iter().enumerate() {
                             let kind = agent.kind();
-                            let card = agent_card(ui, kind, self.selected == Some(kind), palette);
-                            if (card.clicked() || card.double_clicked()) && !self.launch_pending {
+                            let enabled = crate::agent_launcher::agent_is_enabled(disabled, kind);
+                            let card = agent_card(
+                                ui,
+                                kind,
+                                self.selected == Some(kind),
+                                enabled,
+                                catalog,
+                                palette,
+                            );
+                            // 꺼진 카드는 본문 클릭을 무시한다 — 스위치만 반응한다(B안 계약).
+                            if enabled
+                                && !self.launch_pending
+                                && (card.card.clicked() || card.card.double_clicked())
+                            {
                                 self.select(agent);
                             }
                             // egui는 더블클릭의 두 번째 릴리즈에서 clicked()도 함께
                             // 발생시킨다. 선택을 먼저 반영한 뒤 기존 단일 시작 경로를 쓴다.
-                            if card.double_clicked()
+                            if enabled
+                                && card.card.double_clicked()
                                 && let Some(launch_intent) = self.start_launch()
                             {
                                 intent = Some(launch_intent);
+                            }
+                            if card.toggle.clicked() {
+                                let now_enabled = !enabled;
+                                intent = Some(AgentLauncherIntent::SetAgentEnabled {
+                                    kind,
+                                    enabled: now_enabled,
+                                });
+                                // 켜져 있던 현재 선택을 껐으면 선택을 비운다 — 고른 적
+                                // 없는 게 골라져 있으면 다음 실행이 엉뚱해진다.
+                                if !now_enabled && self.selected == Some(kind) {
+                                    self.selected = None;
+                                }
                             }
                             if index + 1 < snapshot.agents().len() {
                                 ui.add_space(AGENT_ROW_GAP);
@@ -721,25 +754,32 @@ impl AgentLauncherUi {
         });
     }
 
-    fn reconcile_selection(&mut self, snapshot: Option<&DetectionSnapshot>) {
+    fn reconcile_selection(&mut self, snapshot: Option<&DetectionSnapshot>, disabled: &[String]) {
         let Some(snapshot) = snapshot else {
             return;
         };
         let previous_selected = self.selected;
-        if self
-            .selected
-            .is_some_and(|selected| snapshot.find(selected).is_none())
-        {
+        // 탐지에서 사라졌거나 그새 꺼진 선택은 비운다 — 꺼진 카드는 골라져 있을 수 없다.
+        if self.selected.is_some_and(|selected| {
+            snapshot.find(selected).is_none()
+                || !crate::agent_launcher::agent_is_enabled(disabled, selected)
+        }) {
             self.selected = None;
         }
         if self.selected.is_none() {
-            self.selected = snapshot.agents().first().map(|agent| agent.kind());
+            self.selected = snapshot
+                .agents()
+                .iter()
+                .find(|agent| crate::agent_launcher::agent_is_enabled(disabled, agent.kind()))
+                .map(|agent| agent.kind());
         }
-        if self.selected != previous_selected {
+        let provider_changed = self.selected != previous_selected;
+        if provider_changed {
             self.model.clear();
+            self.effort = None;
         }
         if let Some(agent) = self.selected.and_then(|kind| snapshot.find(kind)) {
-            self.reconcile_options(agent);
+            self.reconcile_options(agent, provider_changed);
         }
     }
 
@@ -764,18 +804,24 @@ impl AgentLauncherUi {
     }
 
     fn select(&mut self, agent: &DetectedAgent) {
-        if self.selected != Some(agent.kind()) {
+        let provider_changed = self.selected != Some(agent.kind());
+        if provider_changed {
             self.model.clear();
+            self.effort = None;
         }
         self.selected = Some(agent.kind());
         self.error = None;
-        self.reconcile_options(agent);
+        self.reconcile_options(agent, provider_changed);
     }
 
     /// 선택된 모델/강도/YOLO가 이 에이전트에서 여전히 유효한지 맞춘다.
-    fn reconcile_options(&mut self, agent: &DetectedAgent) {
-        self.reconcile_model(agent);
-        self.reconcile_effort(agent.models());
+    fn reconcile_options(&mut self, agent: &DetectedAgent, provider_changed: bool) {
+        let model_replaced = self.reconcile_model(agent);
+        if provider_changed || model_replaced {
+            self.effort = agent.initial_effort(&self.model);
+        } else {
+            self.reconcile_effort(agent.models());
+        }
         if !agent.kind().supports_yolo() {
             self.yolo = false;
         }
@@ -784,10 +830,12 @@ impl AgentLauncherUi {
     /// 모델은 "기본 모델" 항목 없이 항상 하나가 선택돼 있다. 선택이 비었거나 이 에이전트가
     /// 더 이상 제공하지 않는 모델이면, CLI가 자기 설정에 적어 둔 기본 모델로 되돌린다.
     /// 그래야 앱으로 띄운 결과가 CLI를 그냥 실행한 것과 같다.
-    fn reconcile_model(&mut self, agent: &DetectedAgent) {
-        if crate::agent_launcher::find_model(agent.models(), &self.model).is_none() {
-            self.model = agent.initial_model().to_owned();
+    fn reconcile_model(&mut self, agent: &DetectedAgent) -> bool {
+        if crate::agent_launcher::find_model(agent.models(), &self.model).is_some() {
+            return false;
         }
+        self.model = agent.initial_model().to_owned();
+        true
     }
 
     /// 강도는 "기본값" 항목 없이 항상 하나가 선택돼 있다. 화면에 보이는 값이 곧
@@ -858,19 +906,39 @@ fn launcher_toggle(
     response
 }
 
+/// 카드 본문(선택) 응답과 상시 토글 스위치(켜기/끄기) 응답을 함께 돌려준다.
+struct AgentCardResponse {
+    card: egui::Response,
+    toggle: egui::Response,
+}
+
+/// `kind`가 여전히 이 에이전트가 아니라 매 프레임 값으로 넘어오므로, 카드·스위치의
+/// egui `Id`는 이 함수 안에서 `kind`로 고유하게 파생한다.
+///
+/// 스위치는 카드 rect 안의 부분 영역이다. 카드 interact를 **먼저**, 스위치 interact를
+/// **나중에** 등록한다 — egui는 겹칠 때 나중에 등록된 위젯이 클릭을 가져가므로, 이
+/// 순서가 곧 "스위치 > 카드" 우선순위다(`workspace.rs`의 보조 탭 닫기 버튼이 세션
+/// 헤더보다 나중에 등록되는 것과 같은 트릭).
 fn agent_card(
     ui: &mut egui::Ui,
     kind: AgentKind,
     selected: bool,
+    enabled: bool,
+    catalog: &i18n::Catalog,
     palette: LauncherPalette,
-) -> egui::Response {
+) -> AgentCardResponse {
+    let tokens = crate::ui::designall::tokens(ui.visuals());
     let width = ui.available_width().max(240.0);
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(width, AGENT_ROW_HEIGHT), egui::Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Button, enabled, selected, kind.label())
+    });
+
     let visuals = ui.visuals();
     let fill = if selected {
         palette.selected
-    } else if response.hovered() {
+    } else if response.hovered() && enabled {
         palette.surface
     } else {
         egui::Color32::TRANSPARENT
@@ -884,37 +952,103 @@ fn agent_card(
     ui.painter()
         .rect_stroke(rect, 5.0, stroke, egui::StrokeKind::Inside);
 
+    // 꺼진 카드는 흐리게 — `launcher_toggle`이 egui 비활성 상태에 쓰는 것과 같은
+    // 배수(0.45)로 배지·글자를 낮춘다.
+    let alpha = if enabled { 1.0 } else { 0.45 };
     let badge_rect = egui::Rect::from_center_size(
         egui::pos2(rect.left() + 23.0, rect.center().y),
         egui::vec2(30.0, 30.0),
     );
     let (red, green, blue) = kind.badge_color();
-    ui.painter()
-        .rect_filled(badge_rect, 7.0, egui::Color32::from_rgb(red, green, blue));
+    ui.painter().rect_filled(
+        badge_rect,
+        7.0,
+        egui::Color32::from_rgb(red, green, blue).gamma_multiply(alpha),
+    );
     ui.painter().text(
         badge_rect.center(),
         egui::Align2::CENTER_CENTER,
         kind.badge(),
         egui::FontId::proportional(10.0),
-        egui::Color32::WHITE,
+        egui::Color32::WHITE.gamma_multiply(alpha),
     );
+    let label_color = if enabled {
+        visuals.text_color()
+    } else {
+        tokens.muted_text
+    };
     ui.painter().text(
         egui::pos2(rect.left() + 47.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         kind.label(),
         egui::FontId::proportional(14.0),
-        visuals.text_color(),
+        label_color,
     );
+
+    // 스위치는 오른쪽 끝에 고정한다. 상태 표시(선택 체크·꺼짐 배지)는 스위치
+    // 왼쪽에 오른쪽 정렬로 붙여, 로케일마다 길이가 달라도 스위치와 겹치지 않는다.
+    let switch_size = egui::vec2(31.0, 18.0);
+    let switch_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.right() - 12.0 - switch_size.x / 2.0, rect.center().y),
+        switch_size,
+    );
+    let status_anchor = egui::pos2(switch_rect.left() - 8.0, rect.center().y);
     if selected {
         ui.painter().text(
-            egui::pos2(rect.right() - 15.0, rect.center().y),
-            egui::Align2::CENTER_CENTER,
+            status_anchor,
+            egui::Align2::RIGHT_CENTER,
             "✓",
             egui::FontId::proportional(13.0),
             palette.accent,
         );
+    } else if !enabled {
+        ui.painter().text(
+            status_anchor,
+            egui::Align2::RIGHT_CENTER,
+            catalog.t("launcher.agent.disabled_badge", &[]),
+            egui::FontId::proportional(10.0),
+            tokens.muted_text,
+        );
     }
-    response
+
+    // 카드보다 나중에 등록 — 겹치는 영역의 클릭은 스위치가 가져간다.
+    let toggle_id = egui::Id::new(("agent-launcher-card-toggle", kind));
+    let toggle_response = ui.interact(switch_rect, toggle_id, egui::Sense::click());
+    let hint_key = if enabled {
+        "launcher.agent.enabled_hint"
+    } else {
+        "launcher.agent.disabled_hint"
+    };
+    let hint = catalog.t(hint_key, &[("agent", kind.label())]);
+    let track = if enabled {
+        tokens.accent
+    } else {
+        tokens.separator
+    };
+    let knob = if enabled {
+        egui::Color32::WHITE
+    } else {
+        tokens.muted_text
+    };
+    ui.painter().rect_filled(switch_rect, 9.0, track);
+    let knob_center_x = if enabled {
+        switch_rect.right() - 9.0
+    } else {
+        switch_rect.left() + 9.0
+    };
+    ui.painter()
+        .circle_filled(egui::pos2(knob_center_x, switch_rect.center().y), 6.0, knob);
+    let toggle_response = toggle_response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(&hint);
+    toggle_response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, enabled, &hint)
+    });
+
+    AgentCardResponse {
+        card: response,
+        toggle: toggle_response,
+    }
 }
 
 const fn effort_message_key(effort: ReasoningEffort) -> &'static str {
@@ -983,11 +1117,11 @@ mod tests {
         let mut ui = AgentLauncherUi::new();
         ui.open_for("workspace".to_owned(), "Project".to_owned());
         let first = snapshot(&[AgentKind::Codex, AgentKind::Claude]);
-        ui.reconcile_selection(Some(&first));
+        ui.reconcile_selection(Some(&first), &[]);
         assert_eq!(ui.selected, Some(AgentKind::Codex));
         ui.yolo = true;
         let second = snapshot(&[AgentKind::OpenCode]);
-        ui.reconcile_selection(Some(&second));
+        ui.reconcile_selection(Some(&second), &[]);
         assert_eq!(ui.selected, Some(AgentKind::OpenCode));
         assert!(!ui.yolo);
     }
@@ -1036,6 +1170,30 @@ mod tests {
         ui.effort = Some(ReasoningEffort::Max);
         ui.reconcile_effort(codex.models());
         assert_eq!(ui.effort, Some(ReasoningEffort::Max));
+    }
+
+    #[test]
+    fn grok_initial_selection_uses_configured_model_and_effort_once() {
+        let detected = DetectionSnapshot::from_test_agent_with_defaults(
+            AgentKind::Grok,
+            PathBuf::from("/tmp/grok"),
+            Some("grok-4.6".to_owned()),
+            Some(ReasoningEffort::Medium),
+        );
+        let grok = agent(&detected, AgentKind::Grok);
+        let mut ui = AgentLauncherUi::new();
+        ui.select(grok);
+        assert_eq!(ui.model, "grok-4.6");
+        assert_eq!(ui.effort, Some(ReasoningEffort::Medium));
+
+        ui.effort = Some(ReasoningEffort::High);
+        ui.select(grok);
+        assert_eq!(ui.effort, Some(ReasoningEffort::High));
+
+        ui.model = "grok-4.5".to_owned();
+        ui.effort = Some(ReasoningEffort::XHigh);
+        ui.reconcile_effort(grok.models());
+        assert_eq!(ui.effort, Some(ReasoningEffort::High));
     }
 
     #[test]
@@ -1148,5 +1306,282 @@ mod tests {
         ui.select(agent(&detected, AgentKind::Codex));
         assert!(ui.start_launch().is_some());
         assert!(ui.start_launch().is_none());
+    }
+
+    #[test]
+    fn 선택_재조정은_꺼진_에이전트를_건너뛴다() {
+        // 꺼진 에이전트는 자동 선택 후보에서 빠진다 — 아니면 끈 바로 다음 프레임에
+        // 다시 골라져 "선택 비우기"가 무의미해진다.
+        let detected = snapshot(&[AgentKind::Claude, AgentKind::Kimi]);
+        let mut ui = AgentLauncherUi::new();
+        ui.reconcile_selection(Some(&detected), &["claude".to_owned()]);
+        assert_eq!(ui.selected, Some(AgentKind::Kimi));
+
+        // 선택돼 있던 에이전트가 그새 꺼졌으면 비워지고 남은 켜진 것으로 옮겨간다.
+        ui.selected = Some(AgentKind::Kimi);
+        ui.reconcile_selection(Some(&detected), &["kimi".to_owned()]);
+        assert_eq!(ui.selected, Some(AgentKind::Claude));
+
+        // 전부 꺼졌으면 고를 게 없다 — 빈 채로 둔다(막지 않는다, B안 동작 4).
+        ui.selected = None;
+        ui.reconcile_selection(Some(&detected), &["claude".to_owned(), "kimi".to_owned()]);
+        assert_eq!(ui.selected, None);
+    }
+
+    /// `render_agent_list`가 렌더 중 올리는 인텐트와, 그 렌더가 직접 건드린 선택
+    /// 상태를 함께 들여다보기 위한 캡처. 카드가 목록 전체를 훑어야 스위치 우선순위를
+    /// 실제 클릭으로 검증할 수 있어, `render_card`(`work_history.rs`)처럼 함수
+    /// 하나만 감싸지 않고 목록 렌더를 통째로 감싼다.
+    struct AgentListCapture {
+        ui: AgentLauncherUi,
+        intents: Vec<AgentLauncherIntent>,
+    }
+
+    fn agent_list_harness<'a>(
+        catalog: &'a i18n::Catalog,
+        snapshot: &'a DetectionSnapshot,
+        disabled: Vec<String>,
+        initial_selected: Option<AgentKind>,
+    ) -> egui_kittest::Harness<'a, AgentListCapture> {
+        let mut initial_ui = AgentLauncherUi::new();
+        initial_ui.selected = initial_selected;
+        let palette = launcher_palette(false);
+        egui_kittest::Harness::new_ui_state(
+            move |ui, capture: &mut AgentListCapture| {
+                if let Some(intent) = capture.ui.render_agent_list(
+                    ui,
+                    Some(snapshot),
+                    false,
+                    catalog,
+                    disabled.as_slice(),
+                    palette,
+                ) {
+                    capture.intents.push(intent);
+                }
+            },
+            AgentListCapture {
+                ui: initial_ui,
+                intents: Vec::new(),
+            },
+        )
+    }
+
+    /// 한 지점에서 좌클릭 press→release를 흘려보내고 프레임을 한 번 더 처리한다.
+    /// `kittest_card_background_click_only_toggles_card`(`work_history.rs`)와 같은
+    /// 이벤트 시퀀스를 네 테스트가 공유하기 위한 헬퍼.
+    fn click_at(harness: &mut egui_kittest::Harness<'_, AgentListCapture>, pos: egui::Pos2) {
+        harness.hover_at(pos);
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        harness.run();
+    }
+
+    #[test]
+    fn kittest_꺼진_카드_본문_클릭은_선택을_바꾸지_않는다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let detected = snapshot(&[AgentKind::Kimi]);
+        let mut harness = agent_list_harness(&catalog, &detected, vec!["kimi".to_owned()], None);
+
+        let card =
+            harness.get_by_role_and_label(egui::accesskit::Role::Button, AgentKind::Kimi.label());
+        // 배지 쪽(카드 왼쪽) — 스위치 히트박스 밖이라 본문 클릭 판정을 겨냥한다.
+        let click_pos = card.rect().left_top() + egui::vec2(6.0, 6.0);
+
+        click_at(&mut harness, click_pos);
+
+        assert_eq!(harness.state().ui.selected, None);
+        assert!(harness.state().intents.is_empty());
+    }
+
+    #[test]
+    fn kittest_스위치_클릭은_양방향으로_set_agent_enabled를_올린다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let enabled_hint = catalog.t(
+            "launcher.agent.enabled_hint",
+            &[("agent", AgentKind::Kimi.label())],
+        );
+        let disabled_hint = catalog.t(
+            "launcher.agent.disabled_hint",
+            &[("agent", AgentKind::Kimi.label())],
+        );
+        let detected = snapshot(&[AgentKind::Kimi]);
+
+        // 켜짐 → 꺼짐
+        let mut harness = agent_list_harness(&catalog, &detected, Vec::new(), None);
+        let switch = harness.get_by_role_and_label(egui::accesskit::Role::CheckBox, &enabled_hint);
+        let pos = switch.rect().center();
+        click_at(&mut harness, pos);
+        match harness.state().intents.as_slice() {
+            [AgentLauncherIntent::SetAgentEnabled { kind, enabled }] => {
+                assert_eq!(*kind, AgentKind::Kimi);
+                assert!(!enabled);
+            }
+            _ => panic!("expected exactly one SetAgentEnabled(false) intent"),
+        }
+
+        // 꺼짐 → 켜짐
+        let mut harness = agent_list_harness(&catalog, &detected, vec!["kimi".to_owned()], None);
+        let switch = harness.get_by_role_and_label(egui::accesskit::Role::CheckBox, &disabled_hint);
+        let pos = switch.rect().center();
+        click_at(&mut harness, pos);
+        match harness.state().intents.as_slice() {
+            [AgentLauncherIntent::SetAgentEnabled { kind, enabled }] => {
+                assert_eq!(*kind, AgentKind::Kimi);
+                assert!(enabled);
+            }
+            _ => panic!("expected exactly one SetAgentEnabled(true) intent"),
+        }
+    }
+
+    #[test]
+    fn kittest_현재_선택을_끄면_선택이_비워진다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let enabled_hint = catalog.t(
+            "launcher.agent.enabled_hint",
+            &[("agent", AgentKind::Kimi.label())],
+        );
+        let detected = snapshot(&[AgentKind::Kimi]);
+        let mut harness =
+            agent_list_harness(&catalog, &detected, Vec::new(), Some(AgentKind::Kimi));
+        assert_eq!(harness.state().ui.selected, Some(AgentKind::Kimi));
+
+        let switch = harness.get_by_role_and_label(egui::accesskit::Role::CheckBox, &enabled_hint);
+        let pos = switch.rect().center();
+        click_at(&mut harness, pos);
+
+        assert_eq!(harness.state().ui.selected, None);
+        match harness.state().intents.as_slice() {
+            [AgentLauncherIntent::SetAgentEnabled { kind, enabled }] => {
+                assert_eq!(*kind, AgentKind::Kimi);
+                assert!(!enabled);
+            }
+            _ => panic!("expected exactly one SetAgentEnabled(false) intent"),
+        }
+    }
+
+    #[test]
+    fn 스위치_접근성_이름은_에이전트별로_구분된다() {
+        use egui_kittest::kittest::Queryable;
+
+        // 힌트에 `{agent}`가 안 박히면 켜진 카드끼리, 꺼진 카드끼리 접근성 이름이
+        // 전부 같아져 스크린리더로는 어느 스위치가 누구 것인지 구분할 수 없다.
+        // 에이전트 둘(Claude·Codex)을 동시에 띄우고 **이름만으로** 각 스위치를
+        // 찾아 클릭해, 이름이 실제로 에이전트를 구분해내는지 확인한다 — 기존
+        // 테스트들이 단일 에이전트 스냅샷을 쓰거나(위 두 테스트) 픽셀 좌표로
+        // 스위치를 찾은(아래 `다른_카드의_스위치를_꺼도` 테스트) 것도 이 결함을
+        // 못 잡았기 때문이다.
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let claude_hint = catalog.t(
+            "launcher.agent.enabled_hint",
+            &[("agent", AgentKind::Claude.label())],
+        );
+        let codex_hint = catalog.t(
+            "launcher.agent.enabled_hint",
+            &[("agent", AgentKind::Codex.label())],
+        );
+        assert_ne!(
+            claude_hint, codex_hint,
+            "두 에이전트의 스위치 접근성 이름이 같으면 안 된다"
+        );
+
+        let detected = snapshot(&[AgentKind::Claude, AgentKind::Codex]);
+        let mut harness = agent_list_harness(&catalog, &detected, Vec::new(), None);
+
+        // Codex 스위치를 Claude와 헷갈리지 않고 이름만으로 정확히 찾아 클릭한다.
+        let codex_switch =
+            harness.get_by_role_and_label(egui::accesskit::Role::CheckBox, &codex_hint);
+        let pos = codex_switch.rect().center();
+        click_at(&mut harness, pos);
+
+        match harness.state().intents.as_slice() {
+            [AgentLauncherIntent::SetAgentEnabled { kind, enabled }] => {
+                assert_eq!(
+                    *kind,
+                    AgentKind::Codex,
+                    "이름으로 찾은 스위치가 Codex여야 한다"
+                );
+                assert!(!enabled);
+            }
+            _ => panic!("expected exactly one SetAgentEnabled(false) intent for codex"),
+        }
+
+        // Claude 스위치는 그대로 남아 이름으로 계속 찾아진다 — Codex 클릭이
+        // Claude의 접근성 이름을 건드리지 않았다는 뜻이다.
+        assert!(
+            harness
+                .query_by_role_and_label(egui::accesskit::Role::CheckBox, &claude_hint)
+                .is_some(),
+            "Claude 스위치는 이름으로 계속 찾아져야 한다"
+        );
+    }
+
+    #[test]
+    fn kittest_다른_카드의_스위치를_꺼도_기존_선택은_유지된다() {
+        use egui_kittest::kittest::Queryable;
+
+        // 스위치 클릭이 카드 본문 클릭도 함께 발화시키는 회귀가 생기면, 꺼지는 카드가
+        // `select(kind)`로 먼저 선택됐다가 곧바로 토글 분기가 그 선택을 지운다. 그런데
+        // 위 두 테스트 — (선택 안 된 카드를 끄기) · (지금 선택된 카드를 끄기) — 는 둘 다
+        // 최종 상태가 우연히 일치해 이 회귀를 못 잡는다. 여기서는 A가 선택된 채로
+        // **다른, 켜져 있는** B의 스위치를 꺼서 — 우선순위가 깨지면 B가 잠깐 선택됐다가
+        // 토글 분기가 그걸 지워 `selected`가 `None`이 되고, 우선순위가 정상이면 A 선택은
+        // 전혀 손대지 않는다.
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let detected = snapshot(&[AgentKind::Claude, AgentKind::Codex]);
+        let mut harness =
+            agent_list_harness(&catalog, &detected, Vec::new(), Some(AgentKind::Claude));
+
+        let card_b =
+            harness.get_by_role_and_label(egui::accesskit::Role::Button, AgentKind::Codex.label());
+        // 스위치 위치는 `agent_card`의 `switch_rect` 계산과 같다 — 카드 오른쪽 끝에서
+        // 12px 안쪽, 폭 31px 스위치의 중심.
+        let pos = egui::pos2(
+            card_b.rect().right() - 12.0 - 31.0 / 2.0,
+            card_b.rect().center().y,
+        );
+
+        click_at(&mut harness, pos);
+
+        assert_eq!(
+            harness.state().ui.selected,
+            Some(AgentKind::Claude),
+            "다른 카드의 스위치를 꺼도 기존 선택(A)이 유지돼야 한다"
+        );
+        match harness.state().intents.as_slice() {
+            [AgentLauncherIntent::SetAgentEnabled { kind, enabled }] => {
+                assert_eq!(*kind, AgentKind::Codex);
+                assert!(!enabled);
+            }
+            _ => panic!("expected exactly one SetAgentEnabled(false) intent"),
+        }
+    }
+
+    #[test]
+    fn kittest_꺼진_카드는_목록에_남는다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let detected = snapshot(&[AgentKind::Claude, AgentKind::Kimi]);
+        let harness = agent_list_harness(&catalog, &detected, vec!["kimi".to_owned()], None);
+
+        // B안 계약 — 꺼진 카드는 숨지 않고 목록에 남는다.
+        assert!(
+            harness
+                .query_by_role_and_label(egui::accesskit::Role::Button, AgentKind::Kimi.label())
+                .is_some(),
+            "disabled card must still be rendered"
+        );
     }
 }

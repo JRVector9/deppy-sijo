@@ -146,8 +146,13 @@ impl TerminalRenderCache {
 struct RowRenderCache {
     bg_runs: Vec<RowBgRun>,
     text_runs: Vec<RowTextRun>,
+    /// 밑줄·취소선은 갤리(TextFormat)가 아니라 셀 격자 위에 직접 긋는다(2026-08-21).
+    /// 갤리에 맡기면 공백과 wide 문자마다 run이 끊겨 선이 토막나 보인다.
+    underline_runs: Vec<RowBgRun>,
+    strikeout_runs: Vec<RowBgRun>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RowBgRun {
     start_col: usize,
     end_col: usize,
@@ -160,9 +165,25 @@ struct RowTextRun {
     color: egui::Color32,
 }
 
-/// bold 셀에 쓸 모노 굵은 폰트 패밀리 이름 (B-1). 앱(fonts.rs)이 같은 이름으로 등록한다 —
-/// 미등록이면 egui가 기본 Monospace로 폴백하므로 안전하다.
+/// bold 셀에 쓸 모노 굵은 폰트 패밀리 이름 (B-1). 앱(fonts.rs)이 같은 이름으로 등록한다.
+///
+/// **미등록이면 egui는 폴백하지 않고 패닉한다** — `FontFamily::Name`이 어떤 폰트에도
+/// 묶여 있지 않으면 epaint가 `panic!("FontFamily::{{family:?}} is not bound to any fonts")`로
+/// 죽는다(egui 0.35 실측, 2026-08-21 리뷰). 예전 주석은 "기본 Monospace로 폴백하므로
+/// 안전하다"고 적혀 있었으나 사실이 아니었다. 그래서 렌더러가 직접 등록 여부를 확인하고
+/// 미등록이면 Monospace로 내려간다(`mono_bold_family_ready`).
 pub const MONO_BOLD_FAMILY: &str = "mono_bold";
+
+/// bold 패밀리가 실제로 등록돼 있는지 — 미등록 상태로 그리면 epaint가 패닉하므로,
+/// 프레임마다 한 번 확인해 bold run의 폴백 여부를 정한다(2026-08-21).
+/// 폰트 설정을 런타임에 바꿀 수 있어 한 번 캐시하지 않고 프레임마다 본다.
+fn mono_bold_family_ready(ctx: &egui::Context) -> bool {
+    ctx.fonts(|fonts| {
+        fonts.families().iter().any(|family| {
+            matches!(family, egui::FontFamily::Name(name) if name.as_ref() == MONO_BOLD_FAMILY)
+        })
+    })
+}
 
 /// 속성이 적용된 셀 텍스트 갤리를 만든다 (B-1). bold는 굵은 패밀리, italic은 egui가
 /// 합성(기울임), underline/strikeout은 TextFormat의 선, dim은 색을 낮춘다.
@@ -172,12 +193,14 @@ fn layout_attr_text(
     font_id: &egui::FontId,
     color: egui::Color32,
     attrs: CellAttrs,
+    bold_family_ready: bool,
 ) -> Arc<egui::Galley> {
     if attrs.is_empty() {
-        return painter.layout_no_wrap(text, font_id.clone(), color);
+        return layout_spaced(painter, text, font_id.clone(), color, false);
     }
     let mut font = font_id.clone();
-    if attrs.contains(CellAttrs::BOLD) {
+    // 미등록 패밀리를 지정하면 epaint가 패닉한다 — 등록됐을 때만 바꾼다.
+    if attrs.contains(CellAttrs::BOLD) && bold_family_ready {
         font.family = egui::FontFamily::Name(MONO_BOLD_FAMILY.into());
     }
     let color = if attrs.contains(CellAttrs::DIM) {
@@ -185,21 +208,31 @@ fn layout_attr_text(
     } else {
         color
     };
-    let line = egui::Stroke::new(1.0, color);
+    // 밑줄은 여기서 긋지 않는다 — 셀 격자 위에 직접 그어야 공백/wide 문자에서
+    // 끊기지 않는다(underline_runs).
+    layout_spaced(
+        painter,
+        text,
+        font,
+        color,
+        attrs.contains(CellAttrs::ITALIC),
+    )
+}
+
+/// 자간을 반영한 갤리를 만든다 — 셀 폭과 같은 값을 써야 격자와 어긋나지 않는다.
+fn layout_spaced(
+    painter: &egui::Painter,
+    text: String,
+    font: egui::FontId,
+    color: egui::Color32,
+    italics: bool,
+) -> Arc<egui::Galley> {
+    let extra = extra_letter_spacing(font.size);
     let format = egui::TextFormat {
         font_id: font,
+        extra_letter_spacing: extra,
         color,
-        italics: attrs.contains(CellAttrs::ITALIC),
-        underline: if attrs.contains(CellAttrs::UNDERLINE) {
-            line
-        } else {
-            egui::Stroke::NONE
-        },
-        strikethrough: if attrs.contains(CellAttrs::STRIKEOUT) {
-            line
-        } else {
-            egui::Stroke::NONE
-        },
+        italics,
         ..Default::default()
     };
     let mut job = egui::text::LayoutJob::default();
@@ -231,10 +264,62 @@ pub fn cell_size(ctx: &egui::Context, metrics: CellMetrics) -> egui::Vec2 {
     let font_id = egui::FontId::monospace(metrics.font_size);
     ctx.fonts_mut(|fonts| {
         egui::vec2(
-            fonts.glyph_width(&font_id, 'M'),
+            fonts.glyph_width(&font_id, 'M') + extra_letter_spacing(metrics.font_size),
             fonts.row_height(&font_id) * metrics.line_height,
         )
     })
+}
+
+/// 글자 사이에 더하는 여백. 셀 폭(`cell_size`)과 갤리 레이아웃에 **같은 값**이 들어가야
+/// run 안에서 글자가 자기 셀에서 밀리지 않는다.
+fn extra_letter_spacing(font_size: f32) -> f32 {
+    (font_size * TERMINAL_LETTER_SPACING_RATIO).round()
+}
+
+/// 폰트 크기 대비 자간 비율.
+///
+/// **0이어야 한다 — 모노 격자에 가로 자간을 더하면 한글·CJK가 반드시 깨진다**
+/// (2026-09-03 사용자 신고: grok 에이전트 한글이 글자마다 벌어짐).
+///
+/// 자간 `s`는 글자 **뒤에** 붙는 여백이라 셀 폭은 `M + s`가 되는데, wide 글자의 상자는
+/// 2칸이라 `2M + 2s`인 반면 글리프 advance는 `2M + s`에 그친다. 그래서 한글끼리의
+/// 간격만 `2s`가 되어 라틴(`s`)의 **정확히 두 배**로 벌어진다. D2Coding 13.5pt 실측:
+/// 라틴 6.75+1=7.75(셀 폭과 일치, 간격 1px), 한글 13.5+1=14.5 in 15.5(간격 2px).
+///
+/// 글리프를 가로로만 늘리지 않는 한 이 배수는 없앨 수 없고, 그래서 실제 터미널들도
+/// 이 값을 0으로 둔다 — cmux(manaflow-ai/cmux)가 쓰는 xterm.js v6도 `letterSpacing`
+/// 기본값이 0이고 cmux는 이 옵션을 아예 설정하지 않는다.
+///
+/// 글자가 답답하면 **세로 여백(`line_height`)이나 폰트 크기**로 조절한다 — 둘 다 격자의
+/// 1:2 관계를 깨지 않는다.
+const TERMINAL_LETTER_SPACING_RATIO: f32 = 0.0;
+
+/// 밑줄·취소선 두께와, 밑줄을 글자 블록 바닥에서 끌어올리는 양.
+const UNDERLINE_THICKNESS: f32 = 1.0;
+const UNDERLINE_LIFT: f32 = 2.0;
+/// 취소선을 글자 블록 높이의 어디에 둘지(위에서부터의 비율).
+const STRIKEOUT_HEIGHT_RATIO: f32 = 0.55;
+
+/// 셀 격자 위에 가로선 런을 긋는다 — 밑줄과 취소선이 공유한다(2026-08-21).
+/// 갤리에 맡기지 않는 이유는 `RowRenderCache::underline_runs` 주석 참고.
+fn paint_cell_lines(
+    painter: &egui::Painter,
+    runs: &[RowBgRun],
+    origin_x: f32,
+    cell_width: f32,
+    y: f32,
+) {
+    for run in runs {
+        let rect = egui::Rect::from_min_max(
+            egui::pos2(origin_x + run.start_col as f32 * cell_width, y),
+            egui::pos2(
+                origin_x + run.end_col as f32 * cell_width,
+                y + UNDERLINE_THICKNESS,
+            ),
+        )
+        .round_to_pixels(painter.pixels_per_point());
+        painter.rect_filled(rect, 0.0, run.color);
+    }
 }
 
 /// snapshot을 그린다. preedit은 IME 조합 중 텍스트 — 커서 위치에 표시한다.
@@ -256,10 +341,13 @@ pub fn draw(
 ) -> RenderOutput {
     let font_id = egui::FontId::monospace(metrics.font_size);
     let cell = cell_size(ui.ctx(), metrics);
+    let bold_family_ready = mono_bold_family_ready(ui.ctx());
     // 셀 안에서 글자를 세로 중앙에 둔다 — 안 그러면 넓힌 행간이 전부 글자 아래로만 몰린다.
     // cell.y는 글자 높이 × line_height라 나누면 원래 글자 높이가 되고(config에서 0.8 하한으로
     // clamp되어 0으로 나눌 일이 없다), 그 차이의 절반이 위쪽 여백이다.
     let text_dy = (cell.y - cell.y / metrics.line_height) * 0.5;
+    // 글자 블록 높이(행간 배수를 뺀 순수 글자 높이) — 밑줄을 그 바로 아래에 둔다.
+    let text_height = cell.y / metrics.line_height;
     // hit-test/응답 rect는 pane 영역을 넘지 않게 clamp한다 — split/resize 직후
     // stale(더 큰) snapshot이 이웃 pane의 클릭/스크롤을 가로채는 것 방지 (codex 리뷰).
     // 넘치는 셀은 아래 content_rect로 잘리며 좌우 여백을 침범하지 않는다.
@@ -284,7 +372,15 @@ pub fn draw(
     // interrupt하므로, 진행 중 preedit 동안 비-TextEdit 포커스가 한 프레임 튀었다고
     // 호출하면 macOS가 자모를 강제 commit한다. 진행 중 조합은 아래 IME output을 유지한
     // 채 호출측이 논리적 입력 소유권으로 계속 소비하고, commit 뒤 다음 프레임에 복귀한다.
-    let continues_preedit = ime_active && preedit.is_some_and(|preedit| !preedit.is_empty());
+    // 호출측 `preedit`은 draw 뒤에 이벤트를 읽어 채우므로 조합이 **시작되는 프레임**에는
+    // 아직 비어 있다. 그 한 프레임의 공백만 보고 request_focus를 부르면 egui가
+    // `Memory::interrupt_ime`를 켜고, egui-winit이 그걸 `set_ime_allowed(false)/(true)`로
+    // 바꾼다. winit macOS는 그때 marked_text를 비우고 `ImeState::Disabled`로 래치하는데
+    // `(true)`는 상태를 되돌리지 않아, 아직 조합을 들고 있는 macOS IM의 다음 커밋이
+    // `Ime::Commit` 없이 원시 키로 새어 나간다. 이번 프레임 입력도 함께 본다.
+    let continues_preedit = ime_active
+        && (preedit.is_some_and(|preedit| !preedit.is_empty())
+            || frame_has_active_preedit(ui.ctx()));
     if ime_active && !continues_preedit && !ui.memory(|memory| memory.owns_ime_events(response.id))
     {
         response.request_focus();
@@ -321,7 +417,14 @@ pub fn draw(
                 .and_then(|cached| cached.as_ref())
                 .is_none();
         if needs_rebuild {
-            let row_cache = build_row_cache(&painter, snapshot, row, &font_id, SNAPSHOT_DEFAULT_BG);
+            let row_cache = build_row_cache(
+                &painter,
+                snapshot,
+                row,
+                &font_id,
+                SNAPSHOT_DEFAULT_BG,
+                bold_family_ready,
+            );
             if let Some(slot) = cache.rows_cache.get_mut(row) {
                 *slot = Some(row_cache);
                 cache.counters.rows_rebuilt += 1;
@@ -346,9 +449,28 @@ pub fn draw(
                 let pos = origin + egui::vec2(run.col as f32 * cell.x, row_y + text_dy);
                 painter.galley(pos, Arc::clone(&run.galley), run.color);
             }
+            // 밑줄·취소선은 셀 경계까지 이어 긋는다 — 글자 아래/한가운데.
+            let text_top = origin.y + row_y + text_dy;
+            paint_cell_lines(
+                &painter,
+                &row_cache.underline_runs,
+                origin.x,
+                cell.x,
+                text_top + text_height - UNDERLINE_LIFT,
+            );
+            paint_cell_lines(
+                &painter,
+                &row_cache.strikeout_runs,
+                origin.x,
+                cell.x,
+                text_top + text_height * STRIKEOUT_HEIGHT_RATIO,
+            );
             cache.counters.rows_painted += 1;
-            cache.counters.shapes +=
-                row_cache.bg_runs.len() + row_cache.text_runs.len() + selection_shapes;
+            cache.counters.shapes += row_cache.bg_runs.len()
+                + row_cache.text_runs.len()
+                + row_cache.underline_runs.len()
+                + row_cache.strikeout_runs.len()
+                + selection_shapes;
         }
     }
 
@@ -433,6 +555,24 @@ fn terminal_content_rect(rect: egui::Rect) -> egui::Rect {
     )
 }
 
+/// 이번 프레임 raw 입력이 **진행 중인** IME 조합을 나타내는지.
+///
+/// 비어 있지 않은 `Preedit`만 조합으로 센다. 조합이 끝나며 오는 `Preedit("")`
+/// (winit의 `unmarkText`와 커밋 경로가 낸다)와 `Commit`만 남은 프레임은 조합 중이
+/// 아니므로 포커스 복구를 막지 않아야 한다 — 막으면 터미널이 egui 포커스를 영영
+/// 되찾지 못한다. 호출측이 `ime_active`로 이미 TextEdit·팝업 소유 프레임을 걸러내므로
+/// 이 판정이 다른 입력창의 조합을 가로채지 않는다.
+pub fn frame_has_active_preedit(ctx: &egui::Context) -> bool {
+    ctx.input(|input| {
+        input.raw.events.iter().any(|event| {
+            matches!(
+                event,
+                egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }) if !text.is_empty()
+            )
+        })
+    })
+}
+
 pub fn terminal_focus_lock_filter() -> egui::EventFilter {
     egui::EventFilter {
         tab: true,
@@ -458,6 +598,7 @@ fn build_row_cache(
     row: usize,
     font_id: &egui::FontId,
     default_bg: egui::Color32,
+    bold_family_ready: bool,
 ) -> RowRenderCache {
     let cols = snapshot.cols as usize;
     let row_start = row * cols;
@@ -466,6 +607,8 @@ fn build_row_cache(
         return RowRenderCache {
             bg_runs: Vec::new(),
             text_runs: Vec::new(),
+            underline_runs: Vec::new(),
+            strikeout_runs: Vec::new(),
         };
     };
 
@@ -482,34 +625,41 @@ fn build_row_cache(
         push_bg_run(&mut bg_runs, col, (col + width_cols).min(cols), bg);
     }
 
+    let (underline_runs, strikeout_runs) = build_line_runs(cells, cols);
+
     let mut text_runs = Vec::new();
     let mut pending = PendingTextRun::default();
     for (col, term_cell) in cells.iter().enumerate() {
         if term_cell.wide_spacer || term_cell.c == ' ' {
-            pending.flush(&mut text_runs, painter, font_id);
+            pending.flush(&mut text_runs, painter, font_id, bold_family_ready);
             continue;
         }
 
         let fg = rgb(term_cell.fg);
         let attrs = term_cell.attrs;
         if term_cell.wide {
-            pending.flush(&mut text_runs, painter, font_id);
+            pending.flush(&mut text_runs, painter, font_id, bold_family_ready);
             let text = display_char(term_cell.c).to_string();
             text_runs.push(RowTextRun {
                 col,
-                galley: layout_attr_text(painter, text, font_id, fg, attrs),
+                galley: layout_attr_text(painter, text, font_id, fg, attrs, bold_family_ready),
                 color: fg,
             });
         } else {
             if pending.needs_flush(col, fg, attrs) {
-                pending.flush(&mut text_runs, painter, font_id);
+                pending.flush(&mut text_runs, painter, font_id, bold_family_ready);
             }
             pending.push(col, display_char(term_cell.c), fg, attrs);
         }
     }
-    pending.flush(&mut text_runs, painter, font_id);
+    pending.flush(&mut text_runs, painter, font_id, bold_family_ready);
 
-    RowRenderCache { bg_runs, text_runs }
+    RowRenderCache {
+        bg_runs,
+        text_runs,
+        underline_runs,
+        strikeout_runs,
+    }
 }
 
 #[derive(Default)]
@@ -544,6 +694,7 @@ impl PendingTextRun {
         text_runs: &mut Vec<RowTextRun>,
         painter: &egui::Painter,
         font_id: &egui::FontId,
+        bold_family_ready: bool,
     ) {
         let Some(color) = self.color.take() else {
             return;
@@ -555,10 +706,47 @@ impl PendingTextRun {
         let attrs = std::mem::take(&mut self.attrs);
         text_runs.push(RowTextRun {
             col: self.start_col,
-            galley: layout_attr_text(painter, text, font_id, color, attrs),
+            galley: layout_attr_text(painter, text, font_id, color, attrs, bold_family_ready),
             color,
         });
     }
+}
+
+/// 밑줄·취소선 런을 만든다(2026-08-21). 공백 셀도 SGR 속성을 물고 있으므로 함께 이어
+/// 붙인다 — 그래야 「A. 사이드네비 상태」처럼 단어 사이에서 선이 끊기지 않는다.
+///
+/// `wide_spacer` 칸은 `bg_runs`와 똑같이 건너뛴다. 두 종류가 다 걸린다:
+/// 소유자가 같은 행에 있는 **뒷칸**은 소유자가 이미 2칸을 덮었으니 다시 밀어넣으면
+/// 겹치는 run이 생기고, 행 끝 **필러**(`LEADING_WIDE_CHAR_SPACER`)는 소유자가 다음 줄에
+/// 있어 이 행엔 그릴 글자가 없는데도 pen 속성을 물고 있어 **빈 칸 아래 유령 밑줄**이
+/// 그려진다. 선택 하이라이트가 2026-08-18에 같은 자리에서 같은 실수를 했다
+/// (`selection_covers_cell` 주석 참고).
+fn build_line_runs(cells: &[crate::TerminalCell], cols: usize) -> (Vec<RowBgRun>, Vec<RowBgRun>) {
+    let mut underline_runs: Vec<RowBgRun> = Vec::new();
+    let mut strikeout_runs: Vec<RowBgRun> = Vec::new();
+    for (col, term_cell) in cells.iter().enumerate() {
+        if term_cell.wide_spacer {
+            continue;
+        }
+        let attrs = term_cell.attrs;
+        if !attrs.contains(CellAttrs::UNDERLINE) && !attrs.contains(CellAttrs::STRIKEOUT) {
+            continue;
+        }
+        let color = if attrs.contains(CellAttrs::DIM) {
+            dim_color(rgb(term_cell.fg))
+        } else {
+            rgb(term_cell.fg)
+        };
+        let width_cols = if term_cell.wide { 2 } else { 1 };
+        let end_col = (col + width_cols).min(cols);
+        if attrs.contains(CellAttrs::UNDERLINE) {
+            push_bg_run(&mut underline_runs, col, end_col, color);
+        }
+        if attrs.contains(CellAttrs::STRIKEOUT) {
+            push_bg_run(&mut strikeout_runs, col, end_col, color);
+        }
+    }
+    (underline_runs, strikeout_runs)
 }
 
 fn push_bg_run(runs: &mut Vec<RowBgRun>, start_col: usize, end_col: usize, color: egui::Color32) {
@@ -597,6 +785,37 @@ fn range_intersects_row(range: &CellRange, row_start: usize, row_end: usize) -> 
 }
 
 /// 선택 배경을 그리고 **발행한 rect 수**를 돌려준다 (shapes 카운터용).
+/// 이 셀이 선택 **강조**(칠하기) 대상인가. `previous_selected`는 같은 행의 직전 열이
+/// 선택됐는지다.
+///
+/// wide 글자(한글·CJK)는 2칸을 쓰고, 뒷칸은 `wide_spacer`다. 끝점은
+/// [`normalize_selection_endpoint`]가 자리 채움을 **앞 글자로 되돌리므로**, 자리 채움을
+/// `end`로 판정하면 행 끝 wide 글자가 절반만 칠해진다 — 복사는 정상인데 선택이 끝까지
+/// 안 된 것처럼 보인다(2026-08-17 사용자 보고). 자리 채움은 앞 칸이 선택됐는지로만
+/// 판정해 글자 하나가 반쪽으로 칠해지는 일이 없게 한다.
+fn selection_covers_cell(
+    snapshot: &TerminalViewportSnapshot,
+    index: usize,
+    start: usize,
+    end: usize,
+    previous_selected: bool,
+) -> bool {
+    match snapshot.visible_cells.get(index) {
+        // 행 끝 필러(`LEADING_WIDE_CHAR_SPACER`)는 앞 글자의 뒷칸이 **아니다** — 소유자가
+        // 다음 줄에 있으므로 `end` 상한을 그대로 적용한다. 구분하지 않으면 CJK로 wrap되는
+        // 행에서 강조가 한 칸 더 칠해진다(2026-08-18 리뷰 실측).
+        Some(cell) if cell.wide_spacer => {
+            if snapshot.is_trailing_wide_spacer(index) {
+                previous_selected
+            } else {
+                index >= start && index <= end
+            }
+        }
+        Some(_) => index >= start && index <= end,
+        None => false,
+    }
+}
+
 fn paint_selection_row(
     painter: &egui::Painter,
     snapshot: &TerminalViewportSnapshot,
@@ -637,12 +856,7 @@ fn paint_selection_row(
     };
     for col in 0..cols {
         let index = row_start + col;
-        let selected = index >= start
-            && index <= end
-            && snapshot
-                .visible_cells
-                .get(index)
-                .is_some_and(|cell| !cell.wide_spacer || run_start.is_some());
+        let selected = selection_covers_cell(snapshot, index, start, end, run_start.is_some());
         if selected {
             if run_start.is_none() {
                 run_start = Some(col);
@@ -751,6 +965,130 @@ mod tests {
     use crate::AlacrittyBackend;
     use crate::backend::TerminalBackend;
     use crate::viewport_snapshot::{CellRange, CursorShape, CursorSnapshot, TerminalCell};
+
+    /// 밑줄 런 테스트용 셀 — 문자/속성/wide 지정.
+    fn line_cell(c: char, bits: u8, wide: bool, wide_spacer: bool) -> crate::TerminalCell {
+        crate::TerminalCell {
+            c,
+            fg: [0xd8; 3],
+            bg: [0x18, 0x18, 0x1c],
+            wide,
+            wide_spacer,
+            attrs: CellAttrs(bits),
+        }
+    }
+
+    #[test]
+    fn bold_패밀리가_미등록이면_기본_모노로_내려간다() {
+        // egui는 미등록 FontFamily::Name을 만나면 폴백하지 않고 패닉한다(0.35 실측).
+        // 등록 여부를 확인해 내려가지 않으면 bold 셀을 그리는 순간 렌더가 죽는다.
+        let ctx = egui::Context::default();
+        let mut checked = false;
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let ready = mono_bold_family_ready(ui.ctx());
+            assert!(
+                !ready,
+                "기본 Context에는 mono_bold가 등록돼 있지 않다 — 이 전제가 깨지면 테스트가 무의미하다"
+            );
+            // 폴백이 없으면 이 호출이 패닉한다.
+            let galley = layout_attr_text(
+                ui.painter(),
+                "A".to_owned(),
+                &egui::FontId::monospace(12.0),
+                egui::Color32::WHITE,
+                CellAttrs(CellAttrs::BOLD),
+                ready,
+            );
+            assert_eq!(
+                galley.job.sections[0].format.font_id.family,
+                egui::FontFamily::Monospace,
+                "미등록이면 Monospace로 내려가야 한다"
+            );
+            checked = true;
+        });
+        assert!(checked, "프레임이 돌지 않으면 검증이 비어 있다");
+    }
+
+    #[test]
+    fn 밑줄은_공백을_건너뛰지_않고_한_런으로_이어진다() {
+        // 원래 결함: 갤리에 밑줄을 맡기면 공백마다 run이 끊겨 밑줄이 토막나 보였다.
+        let u = CellAttrs::UNDERLINE;
+        let cells = vec![
+            line_cell('A', u, false, false),
+            line_cell(' ', u, false, false),
+            line_cell('B', u, false, false),
+        ];
+
+        let (underline, strikeout) = build_line_runs(&cells, 3);
+
+        assert_eq!(underline.len(), 1, "공백에서 끊기면 안 된다: {underline:?}");
+        assert_eq!(underline[0].start_col, 0);
+        assert_eq!(underline[0].end_col, 3);
+        assert!(strikeout.is_empty());
+    }
+
+    #[test]
+    fn 밑줄은_wide_문자의_뒷칸을_중복으로_담지_않는다() {
+        // wide 소유자가 이미 2칸을 덮으므로 뒷칸(wide_spacer)까지 밀어넣으면 겹치는
+        // run이 생긴다 — bg_runs는 이 칸을 건너뛴다. 같은 규칙을 지켜야 한다.
+        let u = CellAttrs::UNDERLINE;
+        let cells = vec![
+            line_cell('가', u, true, false),
+            line_cell(' ', u, false, true),
+            line_cell('나', u, true, false),
+            line_cell(' ', u, false, true),
+        ];
+
+        let (underline, _) = build_line_runs(&cells, 4);
+
+        assert_eq!(
+            underline,
+            vec![RowBgRun {
+                start_col: 0,
+                end_col: 4,
+                color: egui::Color32::from_rgb(0xd8, 0xd8, 0xd8),
+            }],
+            "wide 두 글자는 겹침 없이 한 런이어야 한다"
+        );
+    }
+
+    #[test]
+    fn 밑줄은_행끝_필러에_유령선을_긋지_않는다() {
+        // 행 끝 필러(LEADING_WIDE_CHAR_SPACER)는 소유자가 다음 줄에 있어 이 행엔 그릴
+        // 글자가 없는데도 pen 속성을 물고 있다 — 빈 칸 아래 밑줄이 그려지면 안 된다.
+        let u = CellAttrs::UNDERLINE;
+        let cells = vec![
+            line_cell('A', u, false, false),
+            line_cell(' ', u, false, true),
+        ];
+
+        let (underline, _) = build_line_runs(&cells, 2);
+
+        assert_eq!(
+            underline,
+            vec![RowBgRun {
+                start_col: 0,
+                end_col: 1,
+                color: egui::Color32::from_rgb(0xd8, 0xd8, 0xd8),
+            }],
+            "필러 칸까지 선이 넘어가면 안 된다"
+        );
+    }
+
+    #[test]
+    fn 취소선은_밑줄과_독립적으로_런을_만든다() {
+        let cells = vec![
+            line_cell('A', CellAttrs::UNDERLINE, false, false),
+            line_cell('B', CellAttrs::STRIKEOUT, false, false),
+        ];
+
+        let (underline, strikeout) = build_line_runs(&cells, 2);
+
+        assert_eq!(underline.len(), 1);
+        assert_eq!((underline[0].start_col, underline[0].end_col), (0, 1));
+        assert_eq!(strikeout.len(), 1);
+        assert_eq!((strikeout[0].start_col, strikeout[0].end_col), (1, 2));
+    }
 
     fn snap(cols: u16, rows: u16, text: &[&str]) -> TerminalViewportSnapshot {
         let mut cells = Vec::new();
@@ -1144,6 +1482,142 @@ mod tests {
         );
     }
 
+    /// 조합이 **이번 프레임에 막 시작된** 경우, 호출측 `preedit`은 아직 비어 있다
+    /// (UI는 draw 뒤에 이벤트를 읽어 다음 프레임에야 채운다). 그 한 프레임의 공백을
+    /// 근거로 `request_focus`를 부르면 egui가 `Memory::interrupt_ime`를 켜고,
+    /// egui-winit이 `set_ime_allowed(false)/(true)`로 바꾼다. winit macOS는 그때
+    /// marked_text를 비우고 `ImeState::Disabled`를 걸어두는데 `set_ime_allowed(true)`는
+    /// 상태를 되돌리지 않는다. macOS IM은 계속 조합 중이므로 다음 `insertText:`가
+    /// `hasMarkedText() == false`를 만나 `Ime::Commit`을 못 내고, 원시
+    /// `NSEvent.characters`(한글 입력 소스에서는 자모)가 그대로 키 입력으로 나간다 —
+    /// 빠르게 칠 때 "ㄱㅏ"로 갈라지는 경로다.
+    #[test]
+    fn 이번_프레임에_시작된_조합은_포커스_복구가_중단시키지_않는다() {
+        let ctx = egui::Context::default();
+        let mut cache = TerminalRenderCache::default();
+        let snapshot = snap(4, 1, &["test"]);
+
+        // 다른 위젯이 포커스를 쥔 상태 — 터미널은 논리적 키보드 소유자지만 egui의
+        // 공식 소유자가 아니라 draw가 포커스를 되찾으려 한다.
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let transient = ui.button("transient focus");
+            transient.request_focus();
+        });
+
+        let input = egui::RawInput {
+            events: vec![egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: "ㄱ".into(),
+                active_range_chars: None,
+            })],
+            ..Default::default()
+        };
+        let full = ctx.run_ui(input, |ui| {
+            ui.set_min_size(egui::vec2(500.0, 200.0));
+            let _ = ui.button("transient focus");
+            draw(
+                ui,
+                &snapshot,
+                m(13.0, 1.0),
+                &mut cache,
+                // 호출측 preedit은 한 프레임 늦으므로 아직 비어 있다.
+                None,
+                true,
+                None,
+                next_gen(),
+            );
+        });
+
+        let ime = full
+            .platform_output
+            .ime
+            .expect("키보드 소유 터미널은 IME allowance를 유지해야 한다");
+        assert!(
+            !ime.should_interrupt_composition,
+            "이번 프레임에 시작된 조합을 포커스 복구가 강제 중단시켰다"
+        );
+    }
+
+    /// 조합이 **끝나는** 프레임(`Preedit("")` + `Commit`)까지 조합 중으로 세면 터미널이
+    /// egui 포커스를 영영 되찾지 못한다. 그 프레임에는 포커스 복구가 그대로 일어나야 한다.
+    #[test]
+    fn 조합이_끝난_프레임은_포커스_복구를_막지_않는다() {
+        let ctx = egui::Context::default();
+        let mut cache = TerminalRenderCache::default();
+        let snapshot = snap(4, 1, &["test"]);
+
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let transient = ui.button("transient focus");
+            transient.request_focus();
+        });
+
+        let input = egui::RawInput {
+            events: vec![
+                egui::Event::Ime(egui::ImeEvent::Preedit {
+                    text: String::new(),
+                    active_range_chars: None,
+                }),
+                egui::Event::Ime(egui::ImeEvent::Commit("가".into())),
+            ],
+            ..Default::default()
+        };
+        let mut owns_ime_events = false;
+        let full = ctx.run_ui(input, |ui| {
+            ui.set_min_size(egui::vec2(500.0, 200.0));
+            let _ = ui.button("transient focus");
+            let output = draw(
+                ui,
+                &snapshot,
+                m(13.0, 1.0),
+                &mut cache,
+                None,
+                true,
+                None,
+                next_gen(),
+            );
+            owns_ime_events = ui.memory(|memory| memory.owns_ime_events(output.response.id));
+        });
+
+        assert!(
+            owns_ime_events,
+            "조합이 끝난 프레임에서는 터미널이 egui IME 소유권을 되찾아야 한다"
+        );
+        assert!(
+            full.platform_output.ime.is_some(),
+            "소유권을 되찾은 프레임은 IME 영역을 내보내야 한다"
+        );
+    }
+
+    /// 비활성 터미널(다른 TextEdit이 포커스를 쥔 프레임 등)은 이번 프레임에 조합
+    /// 이벤트가 있어도 IME를 가져가지 않는다 — `ime_active`가 유일한 관문이다.
+    #[test]
+    fn 비활성_터미널은_조합_이벤트가_있어도_ime를_가져가지_않는다() {
+        let ctx = egui::Context::default();
+        let mut cache = TerminalRenderCache::default();
+        let snapshot = snap(4, 1, &["test"]);
+
+        let input = egui::RawInput {
+            events: vec![egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: "ㄱ".into(),
+                active_range_chars: None,
+            })],
+            ..Default::default()
+        };
+        let full = ctx.run_ui(input, |ui| {
+            ui.set_min_size(egui::vec2(500.0, 200.0));
+            draw(
+                ui,
+                &snapshot,
+                m(13.0, 1.0),
+                &mut cache,
+                None,
+                false,
+                None,
+                next_gen(),
+            );
+        });
+        assert!(full.platform_output.ime.is_none());
+    }
+
     #[test]
     fn 행높이_배수는_셀_높이만_키우고_폭은_그대로다() {
         let ctx = egui::Context::default();
@@ -1297,6 +1771,69 @@ mod tests {
 
         let ascii = backend_snap("src/main.rs");
         assert_eq!(selection_text(&ascii, 4, 7), "main");
+    }
+
+    /// 2칸 글자가 행 끝에 안 들어가 다음 줄로 밀리면 그 행 마지막 칸에 **필러**가 남는다
+    /// (alacritty `LEADING_WIDE_CHAR_SPACER`). 이건 앞 글자의 뒷칸이 아니므로 `end` 상한을
+    /// 지켜야 한다 — 구분하지 않으면 강조가 한 칸 더 칠해진다(2026-08-18 리뷰 실측).
+    #[test]
+    fn 행_끝_wrap_필러는_end를_넘어_칠하지_않는다() {
+        // cols=6에 "abcde"(5칸) 뒤 "가"(2칸) → row0 마지막 칸이 필러, "가"는 row1 0열.
+        let mut backend = crate::alacritty_backend::AlacrittyBackend::new(6, 3, 100);
+        backend.feed("abcde가".as_bytes()).unwrap();
+        let snapshot = backend.viewport_snapshot().unwrap();
+
+        let filler = 5; // row0의 마지막 칸
+        assert!(
+            snapshot.visible_cells[filler].wide_spacer,
+            "백엔드가 필러도 wide_spacer로 평탄화한다(이 테스트의 전제)"
+        );
+        assert!(
+            !snapshot.is_trailing_wide_spacer(filler),
+            "필러는 앞 칸이 소유자가 아니라 진짜 뒷칸이 아니다"
+        );
+        // 끝점이 마지막 실제 글자 'e'(idx 4)일 때 필러(5)는 칠하지 않는다.
+        assert!(
+            !selection_covers_cell(&snapshot, filler, 0, 4, true),
+            "end 밖의 필러를 칠하면 강조가 한 칸 더 나간다"
+        );
+        // "가"의 뒷칸은 여전히 소유자와 함께 칠한다(회귀 방지).
+        let owner = snapshot.cols as usize; // row1 0열
+        assert!(snapshot.visible_cells[owner].wide);
+        assert!(snapshot.is_trailing_wide_spacer(owner + 1));
+        assert!(selection_covers_cell(
+            &snapshot,
+            owner + 1,
+            owner,
+            owner,
+            true
+        ));
+    }
+
+    /// 행 끝이 wide 글자(한글 등)일 때 **강조가 글자 전체**를 덮어야 한다. 끝점이
+    /// 자리 채움에서 앞 글자로 정규화되므로, 칠하기를 `end`로만 판정하면 마지막 글자가
+    /// 반쪽만 칠해진다 — 복사는 정상이라 더 헷갈린다(2026-08-17 사용자 보고).
+    #[test]
+    fn wide_글자로_끝나는_선택은_자리_채움까지_칠한다() {
+        for fixture in ["프로젝트", "設定", "项目"] {
+            let snapshot = backend_snap(fixture);
+            let spacer = first_wide_spacer(&snapshot);
+            let owner = owning_wide_cell(&snapshot, spacer).expect("wide spacer owner");
+            // 끝점을 owner로 준다 — normalize가 자리 채움을 이렇게 되돌린 결과와 같다.
+            assert!(
+                selection_covers_cell(&snapshot, owner, 0, owner, false),
+                "{fixture}: wide 글자 자체는 선택 대상이다"
+            );
+            assert!(
+                selection_covers_cell(&snapshot, spacer, 0, owner, true),
+                "{fixture}: 앞 칸이 선택됐으면 자리 채움도 칠한다(end 밖이라도)"
+            );
+            // 앞 칸이 선택되지 않았으면 자리 채움만 홀로 칠하지 않는다.
+            assert!(
+                !selection_covers_cell(&snapshot, spacer, 0, owner, false),
+                "{fixture}: 고아 자리 채움은 칠하지 않는다"
+            );
+        }
     }
 
     #[test]

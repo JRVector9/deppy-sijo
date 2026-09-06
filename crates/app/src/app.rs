@@ -11,6 +11,7 @@ use secret::KeyringSecretStore;
 use storage::Db;
 
 use crate::agent_resume::ArchivedResumePresentation;
+use crate::document_io;
 
 /// 커스텀 상단 타이틀바 높이 — macOS 신호등(닫기/최소화/전체화면) 수직 중앙 정렬에도
 /// 쓰인다(main.rs의 `set_traffic_light_titlebar_height`). 값이 바뀌면 신호등도 다시
@@ -518,6 +519,7 @@ impl<'a> From<&'a storage::AgentWorkTurnRow> for ui::work_history::WorkHistoryRo
             source_offset: row.source_offset,
             instruction: &row.instruction,
             agent_summary: row.agent_summary.as_deref(),
+            messages_json: row.messages_json.as_deref(),
             model: row.model.as_deref(),
             effort: row.effort.as_deref(),
             branch: row.branch.as_deref(),
@@ -814,6 +816,10 @@ impl crate::agent_state_worker::AgentStateBackend for AppAgentStateBackend {
                     AppAgentStateProjectionKind::Restore,
                 ) => {
                     storage_job.include_agent_sessions = true;
+                    // warm(비활성) 워크스페이스 행의 「이어가기」 노출 판정용 — 전 워크스페이스
+                    // 스코프의 pane_id 존재 여부(2026-08-20, 유계 준수는 db.rs의
+                    // AGENT_SESSIONS_GLOBAL_BOUNDED_* 참고).
+                    storage_job.include_global_agent_sessions = true;
                     storage_needed = true;
                 }
                 (
@@ -1497,6 +1503,45 @@ fn runtime_command_requires_dotenv(command: &runtime::RuntimeCommand) -> bool {
     ) || runtime_command_is_targeted_workspace_restore(command)
 }
 
+fn classify_workspace_protocol_delivery(
+    result: anyhow::Result<()>,
+) -> Result<(), ui::workspace::WorkspaceProtocolErrorCode> {
+    result.map_err(|error| {
+        if error.downcast_ref::<runtime::RuntimeCommandSendError>()
+            == Some(&runtime::RuntimeCommandSendError::Backpressure)
+        {
+            ui::workspace::WorkspaceProtocolErrorCode::Busy
+        } else {
+            ui::workspace::WorkspaceProtocolErrorCode::DeliveryFailed
+        }
+    })
+}
+
+/// dotenv 동기화가 실패했을 때도 통과시킬 continuation인가(2026-08-21).
+///
+/// **세션을 여는 일은 `.env`와 독립이어야 한다.** `.env` 한 줄이 문제라고 그
+/// 워크스페이스에서 셸도 에이전트도 못 열면, 정작 그 `.env`를 고치러 들어갈 수단마저
+/// 사라진다(사용자 보고). 값 하나를 보호할 수 없는 경우는 이제 동기화 단계에서 그
+/// 항목만 제외하므로(`apply_workspace_dotenv_plan`), 여기까지 오는 실패는 저장소·키체인
+/// 장애 같은 계통 문제다 — 그때도 세션은 열려야 한다.
+///
+/// 복원(`RestoreWorkspace`/`RestoreWorkspacePane`)은 제외한다. 그건 사용자가 방금 누른
+/// 동작이 아니라 자동 절차라, 환경이 불완전한 채로 밀어붙일 이유가 없다.
+fn dotenv_failure_allows_session(continuation: &PendingDotenvContinuation) -> bool {
+    let command = match continuation {
+        PendingDotenvContinuation::RuntimeCommand(command) => command,
+        PendingDotenvContinuation::WorkspaceProtocol { command, .. } => command,
+        PendingDotenvContinuation::AgentLaunch { command, .. } => command,
+        PendingDotenvContinuation::PrimaryPaneActivation { .. } => return false,
+    };
+    matches!(
+        command,
+        runtime::RuntimeCommand::SpawnShell { .. }
+            | runtime::RuntimeCommand::SplitPane { .. }
+            | runtime::RuntimeCommand::SpawnAgent { .. }
+    )
+}
+
 fn runtime_command_creates_session(command: &runtime::RuntimeCommand) -> bool {
     matches!(
         command,
@@ -1600,6 +1645,73 @@ struct PendingPrimaryPaneActivation {
 
 const PRIMARY_PANE_MATERIALIZATION_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(10);
+
+/// warm(비활성) 워크스페이스 행의 「이어가기」 — `switch_workspace` 직후 새 활성
+/// 워크스페이스의 `restore_agents`가 비동기로 채워지길 기다리는 지연 실행 대상
+/// (2026-08-20). `PendingPaneFocus`와 같은 이유로 `runtime_instance`까지 확인한다 —
+/// 워크스페이스 id는 워크스페이스가 닫혔다 같은 이름으로 다시 만들어질 수 있어
+/// 재사용을 배제할 수 없다.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingResumeAgent {
+    workspace_id: String,
+    runtime_instance: u64,
+    pane_key: String,
+    title: String,
+    session: runtime::SessionId,
+    requested_at: std::time::Instant,
+}
+
+impl PendingResumeAgent {
+    fn timed_out(&self, now: std::time::Instant) -> bool {
+        now.saturating_duration_since(self.requested_at) >= PRIMARY_PANE_MATERIALIZATION_TIMEOUT
+    }
+}
+
+/// warm 「이어가기」 지연 실행이 이번 틱에 할 일(2026-08-21). `poll_pending_resume_agent`가
+/// 판단과 실행을 한 몸으로 갖고 있어 상태 전이를 테스트할 수 없었다 —
+/// `should_stage_catalog_restore`/`primary_pane_materialization_timed_out`과 같은 관례로
+/// 판단만 순수 함수로 떼어 검증 가능하게 만든다.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingResumeStep {
+    /// 워크스페이스/런타임이 어긋났다 — 재개할 화면이 이미 없다, 조용히 버린다.
+    Abandon,
+    /// `restore_agents`가 아직 안 채워졌다 — 다음 틱에 다시 본다.
+    Wait,
+    /// 기다리다 한도를 넘겼다 — 버리고 실패를 알린다.
+    TimedOut,
+    /// 데이터가 도착했다 — 재개를 실행한다.
+    Run,
+}
+
+/// `pending_resume_agent`가 이번 틱에 무엇을 해야 하는지 판단한다(2026-08-21).
+///
+/// `restore_loaded_for`를 **대상 워크스페이스와 대조**하는 것이 이 함수의 핵심이다.
+/// 이 검사가 없으면 `switch_workspace` 직후 옛 워크스페이스의 `restore_agents`로
+/// 재개해 엉뚱한 pane에 명령을 넣는다.
+fn pending_resume_step(
+    pending: &PendingResumeAgent,
+    active_workspace_id: &str,
+    active_runtime_instance: u64,
+    restore_loaded_for: Option<&str>,
+    now: std::time::Instant,
+) -> PendingResumeStep {
+    if !workspace_focus_target_matches_runtime(
+        &pending.workspace_id,
+        Some(pending.runtime_instance),
+        active_workspace_id,
+        active_runtime_instance,
+    ) {
+        return PendingResumeStep::Abandon;
+    }
+    if restore_loaded_for != Some(pending.workspace_id.as_str()) {
+        return if pending.timed_out(now) {
+            PendingResumeStep::TimedOut
+        } else {
+            PendingResumeStep::Wait
+        };
+    }
+    PendingResumeStep::Run
+}
 const RUNTIME_DELIVERY_FAILURE_LIMIT: u8 = 6;
 const RUNTIME_DELIVERY_RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(16);
 const RUNTIME_DELIVERY_RECOVERY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
@@ -3208,11 +3320,26 @@ fn execute_dotenv_sync_job(
                 payload,
             })
         }
-        Err(_) => {
+        Err(error) => {
+            // 이 게이트는 fail-closed다 — 여기서 실패하면 그 워크스페이스에서는 빈
+            // 터미널조차 열리지 않는다. 이유를 버리면(예전엔 `Err(_)`였다) 로그에
+            // "execute_failed"만 남아 원인을 좁힐 수단이 전혀 없다(2026-08-21 사용자
+            // 보고: 특정 워크스페이스가 열리지 않는데 로그에 이유가 없었다).
+            //
+            // 에러 문구에 .env 값이 섞여 들어올 수 있으므로 **레닥션을 거쳐** 남긴다 —
+            // 이 저장소는 디스크 기록 전부에 레닥션을 요구한다.
+            // StreamRedactor는 비밀이 청크 경계에 걸칠 수 있어 뒤끝을 버퍼에 쥐고 있다 —
+            // flush()로 남은 것까지 꺼내지 않으면 문구가 통째로 비어 나온다(첫 시도에서
+            // `error=`가 빈 채로 찍혔다).
+            let mut redactor = resource.redaction.stream_redactor();
+            let mut redacted = redactor.redact_chunk(format!("{error:#}").as_bytes());
+            redacted.extend(redactor.flush());
+            let detail = String::from_utf8_lossy(&redacted).into_owned();
             tracing::warn!(
                 kind = "dotenv",
                 phase = "synchronize",
                 error_code = "execute_failed",
+                error = %detail,
                 "dotenv synchronization failed"
             );
             Err(crate::dotenv_sync::DotenvWorkerErrorCode::ExecuteFailed)
@@ -3946,6 +4073,25 @@ fn reconcile_and_migrate_startup_secrets(
         );
     }
     Ok(())
+}
+
+/// Best-effort startup repair must never make the whole application depend on an interactive
+/// system keychain dialog. The runtime remains fail-closed when reconciliation did not converge:
+/// legacy logical pointers are rejected by `AppRuntimeSecretResolver`, and incomplete physical
+/// slots retain their durable ledger rows for a later retry.
+fn reconcile_startup_secrets_best_effort(db: &Db, store: &dyn secret::SecretStore) -> bool {
+    match reconcile_and_migrate_startup_secrets(db, store) {
+        Ok(()) => true,
+        Err(_) => {
+            tracing::warn!(
+                kind = "secret_store",
+                phase = "startup_reconciliation",
+                error_code = "keychain_unavailable",
+                "startup secret reconciliation deferred"
+            );
+            false
+        }
+    }
 }
 
 fn execute_settings_job(
@@ -7142,16 +7288,21 @@ fn claude_usage_snapshot() -> Option<ProviderUsage> {
     usage
 }
 
-/// app-server가 5시간 창 없이 주간만 준 결과에 백엔드 보충값을 접붙인다.
-/// 5시간 창이 이미 있거나 서버 결과 자체가 없으면 보충하지 않는다 (orca의
-/// `withBackendSessionWindow`와 같은 조건).
-pub(crate) fn supplement_codex_five_hour(
+/// app-server 값이 있으면 우선하고, 아직 응답이 없거나 일부 창만 보고했으면
+/// 인증된 백엔드 값으로 빈 창만 채운다.
+pub(crate) fn merge_codex_usage(
     server: Option<ProviderUsage>,
-    backend_five_hour: Option<u8>,
+    backend: Option<crate::codex_backend_usage::BackendUsage>,
 ) -> Option<ProviderUsage> {
-    match server {
-        Some((None, weekly @ Some(_))) => Some((backend_five_hour, weekly)),
-        other => other,
+    match (server, backend) {
+        (Some((server_five_hour, server_weekly)), Some(backend)) => Some((
+            server_five_hour.or(backend.five_hour),
+            server_weekly.or(backend.weekly),
+        )),
+        (None, Some(backend)) if backend.five_hour.is_some() || backend.weekly.is_some() => {
+            Some((backend.five_hour, backend.weekly))
+        }
+        (server, _) => server,
     }
 }
 
@@ -7193,13 +7344,138 @@ fn relative_reset_label(resets_at: i64, now: i64) -> Option<String> {
     })
 }
 
+/// 사용량 바 폭 — 실제로 그려지는 provider 칸 수에 따라 정해진다. 원래 코드는 칸이
+/// Claude·Codex(항상 표시) + Kimi(감지됐을 때) 두 경우뿐이라 상수 두 개(430/620)로
+/// 충분했다. 이제 감지되고 켜진 Grok도 독립 칸으로 붙어 칸 수가 0~4까지 늘었으므로, 그 두 상수(칸 2개→430,
+/// 칸 3개→620, 칸당 +190)를 그대로 외삽해 순수 함수로 뽑았다 — 폭은 egui 컨테이너의
+/// 크기 힌트일 뿐이라 정확한 픽셀보다 "칸 수에 비례해 줄어든다"가 중요하다. 값으로
+/// 테스트한다(0·1·2·3·4칸). 0칸은 상자 자체를 그리지 않으므로(`top_provider_usage`) 0.0 —
+/// 50.0을 남기면 빈 상자가 폭만큼 자리를 차지해 버린다.
+fn provider_usage_bar_width(visible_count: usize) -> f32 {
+    if visible_count == 0 {
+        0.0
+    } else {
+        50.0 + 190.0 * visible_count as f32
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProviderUsageDensity {
+    Full,
+    Compact,
+}
+
+fn provider_usage_density(available_width: f32, visible_count: usize) -> ProviderUsageDensity {
+    if available_width >= provider_usage_bar_width(visible_count) {
+        ProviderUsageDensity::Full
+    } else {
+        ProviderUsageDensity::Compact
+    }
+}
+
+fn format_grok_credits(credits: crate::grok_usage::GrokCredits) -> String {
+    match credits.currency {
+        crate::grok_usage::GrokCurrency::Usd => format!(
+            "${}.{:02}",
+            credits.minor_units / 100,
+            credits.minor_units % 100
+        ),
+    }
+}
+
+fn grok_usage_labels(
+    usage: crate::grok_usage::GrokUsage,
+    catalog: &i18n::Catalog,
+) -> (String, String, String) {
+    let mut parts = Vec::with_capacity(3);
+    if let Some(value) = usage.weekly_remaining_percent {
+        parts.push(catalog.t(
+            "status_bar.grok.weekly_short",
+            &[("value", &value.to_string())],
+        ));
+    }
+    if let Some(value) = usage.monthly_remaining_percent {
+        parts.push(catalog.t(
+            "status_bar.grok.monthly_short",
+            &[("value", &value.to_string())],
+        ));
+    }
+    if let Some(credits) = usage.credits_left {
+        let value = format_grok_credits(credits);
+        parts.push(catalog.t("status_bar.grok.credits_short", &[("value", &value)]));
+    }
+    let visible = parts.join(" · ");
+    let accessibility = catalog.t(
+        "status_bar.grok.accessibility",
+        &[("values", visible.as_str())],
+    );
+    let hover = catalog.t("status_bar.grok.hover", &[("values", visible.as_str())]);
+    (visible, accessibility, hover)
+}
+
+pub(crate) struct ProviderUsageInputs<'a> {
+    pub(crate) claude: Option<ProviderUsage>,
+    pub(crate) codex: Option<ProviderUsage>,
+    pub(crate) codex_meta: Option<&'a crate::ui::agent_sessions::CodexUsageMeta>,
+    /// 바깥 `Option`은 설치 감지, 안쪽 `Option`은 숫자 조회 결과다. 감지됐지만 아직
+    /// 값이 없으면 `Some(None)`으로 자리표시자를 유지한다.
+    pub(crate) kimi: Option<Option<ProviderUsage>>,
+    /// 바깥 `Option`은 설치 감지, 안쪽 `Option`은 숫자 조회 결과다. 감지됐지만 아직
+    /// 값이 없으면 `Some(None)`으로 Codex 옆의 자리표시자를 유지한다.
+    pub(crate) grok: Option<Option<crate::grok_usage::GrokUsage>>,
+}
+
+fn grok_status_visible(disabled: &[String], detected: bool) -> bool {
+    detected
+        && crate::agent_launcher::agent_is_enabled(disabled, crate::agent_launcher::AgentKind::Grok)
+}
+
+fn provider_probe_enabled(
+    disabled: &[String],
+    kind: crate::agent_launcher::AgentKind,
+    detected: bool,
+) -> bool {
+    detected && crate::agent_launcher::agent_is_enabled(disabled, kind)
+}
+
+/// 런처 카드 스위치 토글 결과로 새 거부 목록을 만든다 — 정규화까지 마친 상태로 돌려주므로
+/// 호출부(`handle_agent_launcher_intent`)는 그대로 `config.agents.disabled`에 대입하면
+/// 된다. 저장은 호출부 책임(config는 여기서 건드리지 않는다 — 순수 함수라 값으로 테스트한다).
+fn toggled_disabled_agents(
+    current: &[String],
+    kind: crate::agent_launcher::AgentKind,
+    enabled: bool,
+) -> Vec<String> {
+    let mut disabled = current.to_vec();
+    if enabled {
+        disabled.retain(|id| id != kind.id());
+    } else {
+        disabled.push(kind.id().to_owned());
+    }
+    crate::agent_launcher::normalize_disabled_agents(&disabled)
+}
+
+/// 하단 사용량 바의 provider 칸들. `disabled`는 usage 값과 분리된 신호다 — 「켜짐인데
+/// 값 없음」(Claude·Codex와 감지된 Kimi·Grok은 「—」로 자리를 지킨다)과 「꺼짐」(모든 칸
+/// 자체가 없다)을 usage 값 하나로는 구분할 수 없어서 나눴다. Kimi/Grok의 바깥 `Option`은
+/// 설치 감지를, 안쪽 `Option`은 숫자를 나타내며 여기서 활성화 여부까지 함께 판정한다.
+///
+/// 칸을 하나라도 그렸으면 `true`를 돌려준다 — 호출부(`agent_terminal.rs`)가 이 값으로
+/// 뒤이은 구분선을 그릴지 정한다. 모든 provider 칸이 숨겨지면 상자도 안 그리고 `false`를
+/// 돌려줘, "빈 50px 상자 + 오른쪽에 아무것도 안 나누는 구분선"이 남지 않게 한다.
 pub(crate) fn top_provider_usage(
     ui: &mut egui::Ui,
-    claude_usage: Option<ProviderUsage>,
-    codex_usage: Option<ProviderUsage>,
-    codex_meta: Option<&crate::ui::agent_sessions::CodexUsageMeta>,
-    kimi_usage: Option<ProviderUsage>,
-) {
+    usage: ProviderUsageInputs<'_>,
+    disabled: &[String],
+    catalog: &i18n::Catalog,
+) -> bool {
+    let ProviderUsageInputs {
+        claude: claude_usage,
+        codex: codex_usage,
+        codex_meta,
+        kimi: kimi_usage,
+        grok: grok_usage,
+    } = usage;
     let sidebar_font = crate::fonts::sidebar_font(ui.ctx(), 13.0);
     for text_style in [
         egui::TextStyle::Body,
@@ -7226,9 +7502,33 @@ pub(crate) fn top_provider_usage(
         accent: egui::Color32,
         usage: Option<ProviderUsage>,
         meta: Option<&crate::ui::agent_sessions::CodexUsageMeta>,
+        density: ProviderUsageDensity,
     ) {
         let (logo, _) = ui.allocate_exact_size(egui::vec2(14.5, 14.5), egui::Sense::hover());
         crate::ui::agent_terminal::paint_announcement_provider_logo(ui, logo, name);
+
+        if density == ProviderUsageDensity::Compact {
+            let prioritized = usage.and_then(|(five_hour, weekly)| weekly.or(five_hour));
+            let (text, weak) = prioritized
+                .map(|value| (format!("{value}%"), false))
+                .unwrap_or_else(|| ("—".to_owned(), true));
+            let mut label = egui::RichText::new(text.clone()).size(13.0);
+            label = if weak {
+                label.weak()
+            } else {
+                label.color(accent).strong()
+            };
+            let response = ui.label(label);
+            let enabled = ui.is_enabled();
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::Label,
+                    enabled,
+                    format!("{name} usage {text}"),
+                )
+            });
+            return;
+        }
 
         // 구독 플랜 — 있으면 로고 옆에 약하게 (orca "Codex · Pro" 대응).
         if let Some(plan) = meta
@@ -7292,7 +7592,15 @@ pub(crate) fn top_provider_usage(
                 value.on_hover_text(hover);
             }
         } else if five_hour.is_none() {
-            ui.label(egui::RichText::new("—").size(13.0).weak());
+            let response = ui.label(egui::RichText::new("—").size(13.0).weak());
+            let enabled = ui.is_enabled();
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::Label,
+                    enabled,
+                    format!("{name} usage —"),
+                )
+            });
         }
 
         // 사용량 리셋 크레딧 — 있을 때만 작은 표식으로 (orca는 redeem까지 있지만
@@ -7305,48 +7613,132 @@ pub(crate) fn top_provider_usage(
         }
     }
 
-    // Kimi 칸은 값이 있을 때만 자리를 차지한다 — 없는 provider 몫으로 폭을 비워두면
-    // 나머지가 왼쪽으로 몰려 보인다.
-    let width = if kimi_usage.is_some() { 620.0 } else { 430.0 };
+    fn grok_provider(
+        ui: &mut egui::Ui,
+        usage: Option<crate::grok_usage::GrokUsage>,
+        catalog: &i18n::Catalog,
+        density: ProviderUsageDensity,
+    ) {
+        let (logo, _) = ui.allocate_exact_size(egui::vec2(14.5, 14.5), egui::Sense::hover());
+        crate::ui::agent_terminal::paint_announcement_provider_logo(ui, logo, "Grok");
+        let (full_visible, accessibility, hover) = usage.map_or_else(
+            || {
+                (
+                    "—".to_owned(),
+                    catalog.t("status_bar.grok.unavailable", &[]),
+                    catalog.t("status_bar.grok.unavailable_hover", &[]),
+                )
+            },
+            |usage| grok_usage_labels(usage, catalog),
+        );
+        let visible = if density == ProviderUsageDensity::Compact {
+            usage
+                .and_then(|usage| {
+                    usage
+                        .weekly_remaining_percent
+                        .or(usage.monthly_remaining_percent)
+                        .map(|value| format!("{value}%"))
+                        .or_else(|| usage.credits_left.map(format_grok_credits))
+                })
+                .unwrap_or_else(|| "—".to_owned())
+        } else {
+            full_visible
+        };
+        let response = ui
+            .label(egui::RichText::new(visible).size(13.0).strong())
+            .on_hover_text(hover);
+        let enabled = ui.is_enabled();
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Label, enabled, accessibility.as_str())
+        });
+    }
+
+    use crate::agent_launcher::{AgentKind, agent_is_enabled};
+    // 꺼진 provider는 칸 자체가 사라진다(사용자 요청) — 모든 provider에 같은
+    // 규칙이다. Claude/Codex는 이 앱의 1급 provider라 켜져 있으면 값이 없어도 「—」로
+    // 자리를 지킨다. Kimi/Grok은 런처에서 감지되고 켜져 있으면 probe 중/실패에도
+    // 각각의 「—」 칸을 유지한다.
+    let claude_shown = agent_is_enabled(disabled, AgentKind::Claude);
+    let codex_shown = agent_is_enabled(disabled, AgentKind::Codex);
+    let kimi_shown = agent_is_enabled(disabled, AgentKind::Kimi) && kimi_usage.is_some();
+    let grok_shown = grok_status_visible(disabled, grok_usage.is_some());
+    let visible_count = usize::from(claude_shown)
+        + usize::from(codex_shown)
+        + usize::from(kimi_shown)
+        + usize::from(grok_shown);
+    if visible_count == 0 {
+        // 그릴 칸이 없으면 상자 자체를 할당하지 않는다 — 빈 50px 상자가 남으면
+        // 호출부가 그 오른쪽에 붙이는 구분선도 아무것도 안 나누는 채로 남는다.
+        return false;
+    }
+    let available_width = ui.available_width().max(0.0);
+    let preferred_width = provider_usage_bar_width(visible_count);
+    let density = provider_usage_density(available_width, visible_count);
+    let width = preferred_width.min(available_width);
     ui.allocate_ui_with_layout(
         egui::vec2(width, 20.0),
         egui::Layout::left_to_right(egui::Align::Center),
         |ui| {
-            ui.spacing_mut().item_spacing.x = 5.0;
-            provider(
-                ui,
-                "Claude",
-                egui::Color32::from_rgb(0xe7, 0x9a, 0x3b),
-                claude_usage,
-                None,
-            );
-            ui.add_space(4.0);
-            separator(ui, 18.0);
-            ui.add_space(4.0);
-            provider(
-                ui,
-                "Codex",
-                ui.visuals().hyperlink_color,
-                codex_usage,
-                codex_meta,
-            );
-            // Claude/Codex는 이 앱의 1급 provider라 값이 없어도 「—」로 자리를 지키지만,
-            // Kimi는 **쓰는 사람에게만** 보여야 한다(2026-08-10 사용자 요구). 값이 없으면
-            // 로고조차 그리지 않는다 — 안 쓰는 사용자에게 빈 칸을 남기지 않는다.
-            if kimi_usage.is_some() {
-                ui.add_space(4.0);
-                separator(ui, 18.0);
-                ui.add_space(4.0);
+            ui.spacing_mut().item_spacing.x = if density == ProviderUsageDensity::Compact {
+                3.0
+            } else {
+                5.0
+            };
+            let mut drawn = false;
+            if claude_shown {
+                provider(
+                    ui,
+                    "Claude",
+                    egui::Color32::from_rgb(0xe7, 0x9a, 0x3b),
+                    claude_usage,
+                    None,
+                    density,
+                );
+                drawn = true;
+            }
+            if codex_shown {
+                if drawn {
+                    ui.add_space(4.0);
+                    separator(ui, 18.0);
+                    ui.add_space(4.0);
+                }
+                provider(
+                    ui,
+                    "Codex",
+                    ui.visuals().hyperlink_color,
+                    codex_usage,
+                    codex_meta,
+                    density,
+                );
+                drawn = true;
+            }
+            if grok_shown {
+                if drawn {
+                    ui.add_space(4.0);
+                    separator(ui, 18.0);
+                    ui.add_space(4.0);
+                }
+                grok_provider(ui, grok_usage.flatten(), catalog, density);
+                drawn = true;
+            }
+            if kimi_shown {
+                if drawn {
+                    ui.add_space(4.0);
+                    separator(ui, 18.0);
+                    ui.add_space(4.0);
+                }
                 provider(
                     ui,
                     "Kimi",
                     egui::Color32::from_rgb(0x6b, 0x8a, 0xff),
-                    kimi_usage,
+                    kimi_usage.flatten(),
                     None,
+                    density,
                 );
             }
         },
     );
+    true
 }
 
 impl WorkspaceRuntime {
@@ -7498,6 +7890,73 @@ struct WebRemoteState {
     server: web_remote::WebRemoteServer,
     /// keyring에서 로드한 페어링 토큰 — 서버가 `/?token=` 게이트로 검증하는 값과 동일.
     token: String,
+}
+
+/// Relay에서 복호화된 프레임을 받아 공유 코어로 넘기는 싱크.
+///
+/// **모든 명령이 권한 어댑터를 먼저 지난다.** 브라우저에서 버튼을 숨기는 것은 강제가 아니고,
+/// 위조된 메시지는 UI를 거치지 않기 때문이다. 1차 릴리스의 기기는 view-only이므로 입력·키·
+/// 스크롤·전환·승인·업로드는 전부 거부되며, 거부가 상한을 넘으면 채널을 닫는다.
+///
+/// Relay 자격증명은 protocol-v3 `auth`나 loopback 라우터로 넘어가지 않는다 — 어댑터가
+/// `auth` 프레임 자체를 이 전송에서 거부한다.
+struct RelayDashboardSink {
+    core: Arc<web_remote::session_core::SessionCore>,
+    permissions: web_remote::relay_client::RelayMessageAdapter,
+}
+
+impl RelayDashboardSink {
+    fn new(core: Arc<web_remote::session_core::SessionCore>) -> Self {
+        Self {
+            core,
+            // 1차 릴리스는 고정 view-only다. 입력·승인·업로드는 휴면 상태의 미래 권한이다.
+            permissions: web_remote::relay_client::RelayMessageAdapter::new(
+                web_remote::relay::contract::RelayPermissions::default(),
+            ),
+        }
+    }
+}
+
+impl web_remote::relay_client::RelayFrameSink for RelayDashboardSink {
+    fn accept(&mut self, frame: &[u8]) -> web_remote::relay_client::SinkOutcome {
+        let Ok(text) = std::str::from_utf8(frame) else {
+            return web_remote::relay_client::SinkOutcome::Continue;
+        };
+        let Some(message) = web_remote::protocol::ClientMsg::parse(text) else {
+            return web_remote::relay_client::SinkOutcome::Continue;
+        };
+        match self.permissions.admit(message) {
+            web_remote::relay_client::RelayAdmission::Allow(message) => {
+                // 허용된 것만 코어로 넘어간다. 현재 view-only 집합은 시청 제어뿐이다.
+                match message {
+                    web_remote::protocol::ClientMsg::Watch { session } => {
+                        self.core.dashboard().rebind_watch(None, Some(&session));
+                    }
+                    web_remote::protocol::ClientMsg::Unwatch => {
+                        self.core.dashboard().rebind_watch(None, None);
+                    }
+                    _ => {}
+                }
+                web_remote::relay_client::SinkOutcome::Continue
+            }
+            web_remote::relay_client::RelayAdmission::AllowUpload => {
+                web_remote::relay_client::SinkOutcome::Continue
+            }
+            web_remote::relay_client::RelayAdmission::Denied(reason) => {
+                tracing::debug!(?reason, "Relay 명령 거부");
+                web_remote::relay_client::SinkOutcome::Continue
+            }
+            web_remote::relay_client::RelayAdmission::CloseChannel(reason) => {
+                tracing::warn!(?reason, "Relay 위반 상한 초과 — 채널을 닫는다");
+                // 로그만 남기고 계속 받으면 상한이 아무것도 강제하지 못한다.
+                web_remote::relay_client::SinkOutcome::CloseChannel
+            }
+        }
+    }
+
+    fn session_ended(&mut self) {
+        self.core.dashboard().rebind_watch(None, None);
+    }
 }
 
 /// Optional web-remote persistence adapter. The concrete SQLite handle is constructed only from
@@ -7802,14 +8261,133 @@ pub struct App {
     /// Render가 반환한 controller action 한 건. 다음 logic tick에서만 실행해 process와
     /// protocol I/O가 render call graph에 들어오지 않게 한다.
     pending_agent_sessions_action: Option<ui::agent_sessions::AgentSessionsDeferredAction>,
-    /// 세션 cwd 레포의 git 변경분 리뷰 패널 (사이드바 「변경 보기」).
+    /// 세션 cwd 레포의 git 변경분 리뷰 패널 (사이드바 「변경 보기」). 진입점은
+    /// 2026-08-15부터 사이드바 Git 탭 + `diff_viewer_ui`로 옮겨갔다 — 이 필드는
+    /// work history의 「변경 보기」(`open_for_path`)가 계속 쓴다(Task 11에서 은퇴 검토).
     diff_panel_ui: ui::diff_panel::DiffPanelUi,
+    /// Git 보조 본문 우측(마스터-디테일) 실용형 diff 뷰어 — git 패널 행 클릭이 연다
+    /// (2026-08-15 2차, 스펙 §8-3). 전면 뷰가 아니라 `render_git_tab_body`가 그린다.
+    diff_viewer_ui: ui::diff_viewer::DiffViewerUi,
+    /// git 패널 IO 완료의 stale 폐기용 세대. 요청마다 증가하며, 완료 시점에 이 값과
+    /// 다르면 조용히 버린다(기존 Diff IO의 generation 관례, 2026-08-15).
+    git_panel_generation: u64,
+    /// Git 패널 렌더 상태 — 2026-08-15 2차부터 file_tree(사이드바)가 아니라 App이 직접
+    /// 소유한다. Git이 사이드바 인라인 탭에서 pane 보조 탭으로 옮겨가면서, 사이드바
+    /// leaf가 더는 git IO 결과를 들고 있을 이유가 없어졌다(§8-1).
+    git_panel_ui: ui::git_panel::GitPanelUi,
+    /// 지금 Git 패널이 보여주는(요청 중인) repo cwd — `request_git_panel_io_at`이 요청마다
+    /// 갱신한다. ⟳ 새로고침·파일 diff는 포커스 세션을 다시 묻지 않고 이 값을 그대로
+    /// 써서, 패널이 열려 있는 동안 포커스가 다른 세션으로 옮겨가도 다른 repo로 갈아타지
+    /// 않는다(2026-08-16, 「변경 보기」로 세션에 고정한 뒤 ⟳를 누르면 포커스 세션으로
+    /// 조용히 바뀌던 결함 수정).
+    git_panel_cwd: Option<PathBuf>,
+    /// 이력과 같은 보조 UI 탭 상태 기계 — runtime의 mux 탭/pane과 무관하다.
+    git_tab: ui::workspace::PaneAuxTabState,
+    /// Git 본문 좌(목록)/우(diff) 분할 폭 — 사용자가 구분선을 한 번도 안 끌었으면
+    /// `None`(자동 계산), 끌고 나면 `Some(px)`로 그 값을 기억한다. 이력과는 따로 기억한다
+    /// (2026-08-16 사용자: 가로 폭을 조절할 수 없다). 재시작 시 유지하지 않는다(사이드바
+    /// 폭도 그렇다).
+    git_tab_split_width: Option<f32>,
     work_history_ui: ui::work_history::WorkHistoryUi,
     /// 이력은 전역 중앙 페이지가 아니라 현재 세션 pane 헤더 옆의 **보조 UI 탭**이다.
     /// 이 상태는 runtime의 mux 탭/pane과 무관하다 — 열고 닫아도 PTY·세션은 그대로다
     /// (2026-08-14 사용자: 터미널 전체가 다른 페이지로 바뀌는 방식은 원하지 않는다).
-    work_history_tab: ui::work_history::WorkHistoryTabState,
+    work_history_tab: ui::workspace::PaneAuxTabState,
+    /// 이력 본문 좌(카드)/우(원문) 분할 폭 — `git_tab_split_width`와 같은 규칙, Git과는
+    /// 따로 기억한다.
+    work_history_tab_split_width: Option<f32>,
+    /// 이력·Git과 같은 보조 UI 탭 상태 기계 — 문서 **그룹** 전체(멀티 문서 탭 설계
+    /// §2)의 활성 여부다. 문서가 하나도 없으면 `Closed`, 하나 이상 있으면
+    /// `OpenActive`/`OpenInactive` — 이력·Git·문서 그룹 중 어느 것이 보조 본문을
+    /// 차지하는지는 여전히 이 셋의 상호배타(`resolve_aux_tab_exclusivity`)로 정해지고,
+    /// 문서 그룹 **안에서** 어느 문서가 보이는지는 `active_document`가 따로 정한다.
+    document_tab: ui::workspace::PaneAuxTabState,
+    /// 지금 열려 있는 문서들 — App 소유(멀티 문서 탭 설계 §2). 탭이 닫히면
+    /// 그 자리만 빠지고 나머지는 그대로다. `DOCUMENT_TABS_MAX`·
+    /// `DOCUMENT_TOTAL_RETAINED_BYTES_MAX` 둘 다로 유계다(§4).
+    documents: Vec<OpenDocument>,
+    /// 문서 그룹 안에서 지금 보이는 문서 — `documents`가 비어 있으면 `None`이다.
+    active_document: Option<ui::workspace::DocumentTabId>,
+    /// 다음에 배정할 `DocumentTabId` — 절대 감소하지 않고, 닫힌 문서의 id를
+    /// 재사용하지 않는다(멀티 문서 탭 설계 §1 — 재사용하면 그 문서의 늦게 도착한
+    /// IO 결과가 새 문서에 잘못 적용될 수 있다).
+    next_document_tab_id: u32,
+    /// 문서 본문 좌(source)/우(preview) Split 분할 폭 — `git_tab_split_width`와 같은
+    /// 규칙, Git·이력과는 따로 기억한다. 문서마다 따로 기억하지 않는다(설계 §4 지시
+    /// — 분할 폭은 공유해도 된다).
+    document_tab_split_width: Option<f32>,
+    /// 아직 워커에 admit되지 못한 로드 요청들 — 문서를 연달아 열면 쌓일 수 있다
+    /// (워커는 한 번에 하나만 처리한다, `document_load_inflight` 참고). FIFO로
+    /// 순서대로 admit한다.
+    document_pending_loads: std::collections::VecDeque<(ui::workspace::DocumentTabId, PathBuf)>,
+    /// 지금 워커가 처리 중인 로드 잡의 문서 id — 워커가 panic/disconnect로 결과
+    /// 없이 죽었을 때 "그 잡이 어느 문서였는지"를 정확히 알려준다(문서가 여러 개
+    /// 동시에 `Loading` 상태일 수 있어, 그중 아무거나 실패로 처리하면 안 된다).
+    document_load_inflight: Option<ui::workspace::DocumentTabId>,
+    /// 문서 로드 lane — `document_io::load_document`를 스레드에서 돌린다. 잡·결과에
+    /// 문서 id를 실어 보낸다(닫힌 문서의 결과는 `documents`에서 id를 못 찾아
+    /// 자연히 버려진다).
+    document_load_worker: crate::lazy_worker::LazyBoundedWorker<
+        (
+            ui::workspace::DocumentTabId,
+            document_io::DocumentLoadRequest,
+        ),
+        (
+            ui::workspace::DocumentTabId,
+            document_io::DocumentLoadOutcome,
+        ),
+    >,
+    /// 아직 워커에 admit되지 못한 저장 요청들.
+    document_pending_saves: std::collections::VecDeque<(
+        ui::workspace::DocumentTabId,
+        document_io::DocumentSaveRequest,
+    )>,
+    /// 지금 워커가 처리 중인 저장 잡의 문서 id — `document_load_inflight`와 같은 이유.
+    document_save_inflight: Option<ui::workspace::DocumentTabId>,
+    /// 문서 저장 lane — `document_io::save_document`.
+    document_save_worker: crate::lazy_worker::LazyBoundedWorker<
+        (
+            ui::workspace::DocumentTabId,
+            document_io::DocumentSaveRequest,
+        ),
+        (
+            ui::workspace::DocumentTabId,
+            document_io::DocumentSaveOutcome,
+        ),
+    >,
+    /// dirty 상태에서 문서를 닫으려 하거나 저장이 충돌했을 때의 확인 대기 큐(설계
+    /// §3.3·§7). 맨 앞(`front`)이 지금 그리는 모달이다. 문서별로 전역 단일 슬롯이
+    /// 아니라 큐인 이유: 두 문서의 확인이 겹치면(예: A의 닫기 확인이 뜬 채 B의
+    /// 저장이 Conflict로 돌아오거나 사용자가 B의 ×를 누르면) 응답 전에 먼저 온
+    /// 확인이 조용히 덮어써지던 결함이 있었다(2026-08-22 리뷰) — 이제 도착 순서대로
+    /// 쌓여(FIFO) 먼저 것부터 순서대로 처리한다. 어느 문서에 대한 확인인지는 각
+    /// `DocumentPendingConfirm` 안의 id가 말한다.
+    document_pending_confirms: std::collections::VecDeque<DocumentPendingConfirm>,
+    /// 「저장 후 닫기」가 걸린 문서 id들 — dirty 확인 모달에서 「저장」을 고르면 여기
+    /// 담고, 그 문서의 저장이 성공하면 실제로 닫는다. 문서별로 독립이라(멀티 문서
+    /// 탭 설계) App 전역 슬롯 하나가 아니라 집합이다 — 서로 다른 문서 둘을 동시에
+    /// "저장 후 닫기"해도 서로의 continuation을 덮어쓰지 않는다.
+    document_close_after_save: std::collections::HashSet<ui::workspace::DocumentTabId>,
+    /// 상한(`DOCUMENT_TABS_MAX`·`DOCUMENT_TOTAL_RETAINED_BYTES_MAX`)에 걸렸는데 닫을 clean
+    /// 문서가 하나도 없어 새 문서를 열지 못했다는 안내(설계 §4). `true`면 모달을
+    /// 그린다.
+    document_cap_notice: bool,
+    /// Markdown Preview/Split 렌더 캐시 — leaf 소유 상태를 App이 세션처럼 들고
+    /// 있는다(`transcript_viewer_ui`·`diff_viewer_ui`와 같은 관례). 문서마다 캐시가
+    /// 갈리는 건 `MarkdownDocumentSlot`을 문서 id로 만들기 때문이다(단일 인스턴스를
+    /// 여러 문서가 슬롯으로 나눠 쓴다).
+    document_markdown_viewer: ui::markdown_viewer::MarkdownViewer,
+    /// pane이 하나도 없는 워크스페이스에서 문서를 열었을 때 — 셸 pane을 먼저 스폰하고
+    /// (`SpawnShellAt`), 그 pane이 나타나면 `poll_pending_document_open`이 이어받아 연다.
+    pending_document_open: Option<PathBuf>,
     work_history_rows: Vec<storage::AgentWorkTurnRow>,
+    /// `work_history_rows`를 실제로 수정할 때마다(교체·in-place 갱신·비움) 올린다.
+    /// leaf(`ui::work_history::WorkHistorySnapshot::rows_revision`)가 이 값으로
+    /// "행 목록이 그대로인가"를 판단해 필터·정렬·그룹핑 캐시를 재사용한다 — 이 필드를
+    /// 만지는 자리마다 함께 올려야 한다(놓치면 leaf가 옛 그룹핑 결과를 계속 보여주는
+    /// 사고가 난다). `wrapping_add(1)`은 이 크레이트의 다른 세대 카운터
+    /// (`transcript_generation` 등)와 같은 관례.
+    work_history_rows_revision: u64,
     work_history_workspace_id: Option<String>,
     work_history_loading: bool,
     work_history_error: Option<ui::work_history::WorkHistoryErrorCode>,
@@ -7829,6 +8407,16 @@ pub struct App {
     work_history_git_manual_refresh: bool,
     work_history_git_manual_generation: Option<u64>,
     pending_work_history_action: Option<ui::work_history::WorkHistoryAction>,
+    /// 이력 보조 본문 우측(마스터-디테일) 원문 뷰어 — 카드 「원문 보기」가 연다
+    /// (2026-08-15 Task 10, 스펙 §2). 아무것도 저장하지 않는다.
+    transcript_viewer_ui: ui::transcript_viewer::TranscriptViewerUi,
+    /// 원문 IO 완료의 stale 폐기용 세대 — `git_panel_generation`과 같은 관례.
+    transcript_generation: u64,
+    /// 보조 본문(이력·Git) 검색 상태 — App이 소유하고 leaf는 읽기만 한다(2026-08-18
+    /// 스펙 `docs/superpowers/specs/2026-08-18-aux-search-design.md`).
+    /// 활성 보조 탭이 바뀌거나(`apply_work_history_tab_intent`/`apply_git_tab_intent`)
+    /// 워크스페이스가 바뀌면(`reset_git_surfaces` 옆) `reset()`한다.
+    aux_search: ui::aux_search::AuxSearchState,
     /// Lazy aggregate boundary for hook/attention/restore/binding/resume/catalog/project-name
     /// persistence and filesystem projections. Construction opens no DB and starts no thread.
     agent_state_worker: crate::agent_state_worker::AgentStateWorker<AppAgentStateBackend>,
@@ -7863,6 +8451,9 @@ pub struct App {
     /// Render가 반환한 native-host intent. 다음 logic tick에서만 host task로 넘기며
     /// latest-only 한 건만 보존한다.
     pending_app_host_action: Option<AppHostIoAction>,
+    /// 위 슬롯이 차 있어 밀려난 「원문 보기」 요청. 사용자 클릭이라 버리지 않고 다음
+    /// 프레임에 태운다. 여기도 latest-only 한 건이다(2026-08-16).
+    pending_app_host_retry: Option<AppHostIoAction>,
     pending_file_tree_maintenance: Option<ui::file_tree::FileTreeMaintenanceIntent>,
     file_tree_watcher: Option<AppFileTreeWatcher>,
     /// Settings가 반환한 lifecycle action 한 건. 다음 logic tick에서만 실행한다.
@@ -8123,17 +8714,23 @@ pub struct App {
     /// 막기 위해서, 2026-08-14). SessionId만으로 키를 잡으면 워커가 재생성될 때(새
     /// runtime_instance, SessionId가 1부터 재시작) 재사용된 id가 옛 세션의 값을 물려받는
     /// 사고가 나서, 반드시 runtime_instance로 네임스페이스한다.
-    agent_info: std::collections::HashMap<
-        (u64, runtime::SessionId),
-        crate::agent_detect::AgentDisplay,
-    >,
+    agent_info:
+        std::collections::HashMap<(u64, runtime::SessionId), crate::agent_detect::AgentDisplay>,
     /// transcript 없이 프로세스만으로 판정한 세션별 에이전트 종류. `agent_bindings`는
     /// transcript가 확정돼야 생겨서, 방금 띄운 에이전트는 여기에만 있다.
     /// 키 구조는 `agent_info`와 같은 이유(runtime_instance 네임스페이스)다.
-    agent_kinds: std::collections::HashMap<
-        (u64, runtime::SessionId),
-        crate::agent_detect::RunningAgent,
-    >,
+    agent_kinds:
+        std::collections::HashMap<(u64, runtime::SessionId), crate::agent_detect::RunningAgent>,
+    /// 완료 알림 겹④의 **한 틱 확인 유예** 목록 — 지난 감지에서 에이전트가 사라진
+    /// 세션과 그때의 종류.
+    ///
+    /// ps 스캔은 한 번 튈 수 있어서(pass가 MAX_DETECT_SESSIONS로 잘리거나 일시적
+    /// 미분류) 사라지자마자 알리면 아직 일하는 중인데 "끝났다"가 뜬다 — 안 온 알림보다
+    /// 틀린 알림이 나쁘다. 그래서 한 틱 적어 두고 **다음 감지에서도 여전히 없을 때만**
+    /// 알린다. 종류를 함께 들고 있는 이유는, 그 시점엔 세션이 이미 `agent_kinds`에서
+    /// 빠져 있어 어느 에이전트였는지 알 길이 없기 때문이다.
+    agent_vanish_last_kind:
+        std::collections::HashMap<(u64, runtime::SessionId), crate::agent_detect::RunningAgent>,
     /// 방금 우리가 PTY에 보낸 강도/모델. statusLine(→DB)은 다음 턴에야 갱신돼서,
     /// 이게 없으면 연속으로 눌러도 매번 같은 낡은 값에서 한 칸 움직여 같은 명령을
     /// 반복한다 (2026-08-02 실증: 강도를 올렸는데 계속 같은 단계가 적용됐다).
@@ -8158,6 +8755,13 @@ pub struct App {
     restore_agents: std::collections::HashMap<String, storage::AgentSessionRow>,
     /// restore_agents를 로드한 워크스페이스 id (전환 시 재로드 판정).
     restore_loaded_for: Option<String>,
+    /// 전 워크스페이스 스코프의 `(workspace_id, pane_id)` — warm(비활성) 워크스페이스 행의
+    /// 「이어가기」 노출 판정용(2026-08-20). `restore_agents`와 달리 활성 워크스페이스
+    /// 하나가 아니라 `AgentStateSection::Restore` 프로젝션이 돌 때마다 전 워크스페이스가
+    /// 갱신된다 — 실제 kind/session_id는 여기 없다(존재 여부만). 전환 후 실행은
+    /// `restore_agents`가 새 활성 워크스페이스로 다시 채워진 뒤에야 한다
+    /// (`pending_resume_agent` 참고).
+    global_resumable_panes: std::collections::HashSet<(String, String)>,
     /// 이번 workspace 활성화에서 자동 resume 판단을 끝낸 pane. 명령을 보낸 경우뿐 아니라
     /// 이미 에이전트/ssh 등 다른 작업이 있어 건너뛴 경우도 포함한다. 그래야 사용자가
     /// 작업을 종료한 뒤 뒤늦게 resume 명령이 주입되지 않는다.
@@ -8165,6 +8769,13 @@ pub struct App {
     resume_probe_pending_panes: std::collections::HashSet<String>,
     /// 알림 클릭으로 다른 workspace 전환 후, mux 재구성되면 이동할 (workspace, session).
     pending_focus: Option<(String, u64, runtime::SessionId)>,
+    /// warm(비활성) 워크스페이스 행에서 「이어가기」를 눌러 `switch_workspace`한 직후 —
+    /// 새 활성 워크스페이스의 `restore_agents`가 비동기로 채워질 때까지 지연 실행할
+    /// 대상(2026-08-20). `pending_focus`와 동일한 패턴: 매 프레임 `poll_pending_workspace_
+    /// focus`에서 워크스페이스/런타임이 여전히 일치하는지 확인하고, 어긋나면(사용자가
+    /// 다른 곳으로 옮겼거나 워크스페이스가 닫혔으면) 조용히 버린다. 타임아웃도 같은
+    /// `PRIMARY_PANE_MATERIALIZATION_TIMEOUT`을 써서 무한 대기하지 않는다.
+    pending_resume_agent: Option<PendingResumeAgent>,
     /// 저장 세션 선택 시 정확한 pane이 materialize될 때까지 유지하는 포커스 intent.
     pending_pane_focus: Option<PendingPaneFocus>,
     /// 저장 pane의 dotenv 완료, targeted restore, materialization, focus, full restore를
@@ -8201,6 +8812,19 @@ pub struct App {
     web: Option<WebRemoteState>,
     /// 웹서버 시작/토큰 재발급 실패 시 settings에 표시할 에러.
     web_error: Option<String>,
+    /// 두 전송(loopback/Tailscale, Relay)이 공유하는 전송 중립 대시보드 코어.
+    ///
+    /// 어느 한쪽이라도 켜져 있을 때만 존재한다 — 둘 다 OFF면 브리지 스레드도 없다.
+    /// **소유자는 앱**이므로 한 전송을 꺼도 다른 전송의 코어가 죽지 않는다.
+    session_core: Option<Arc<web_remote::session_core::SessionCore>>,
+    /// Relay 클라이언트 워커 (켜져 있을 때만 Some). OFF면 스레드도 소켓도 없다.
+    relay_worker: Option<web_remote::relay_client::RelayWorker>,
+    /// Relay 시작 실패 시 settings에 표시할 에러. `web_error`와 **별개**다 — 한 전송의
+    /// 실패가 다른 전송의 표시를 덮어쓰면 사용자가 무엇이 꺼졌는지 알 수 없다.
+    ///
+    /// 읽는 쪽(설정 화면)은 계획 Task 5가 붙인다. 지금은 쓰기만 한다.
+    #[allow(dead_code)]
+    relay_error: Option<String>,
     /// settings의 접속 URL 표시(reveal) 토글 — URL에 페어링 토큰이 실리므로 기본 마스킹.
     web_reveal_url: bool,
     /// 접속 URL QR 텍스처 캐시 — URL이 바뀔 때만 재생성, 설정창 닫으면 반환.
@@ -8307,6 +8931,38 @@ type PtyAdjustWrites = Vec<Vec<u8>>;
 /// 종류만 먼저 뜬다(빈 줄보다 낫다).
 ///
 /// 이미 있는 항목은 덮지 않는다. transcript에서 온 model/effort/context가 더 풍부하다.
+/// 새 감지값에 **작업 설명이 비어 있으면 직전 값을 그대로 이어받는다**.
+///
+/// transcript 스캔은 최근 구간만 본다 — 에이전트가 말을 멈추고 대기 상태로 오래 있으면
+/// 그 구간에서 요약/지시가 사라져 `None`이 되고, 사이드바 활동 줄이 프로젝트 폴더명으로
+/// 떨어진다(`agent_activity_line`의 폴백 순서). 사용자가 원하는 건 **마지막으로 한 일이
+/// 그대로 남아 있는 것**이므로(2026-08-19 확인), 새 값이 비었을 때만 옛 값을 유지한다.
+/// 새 값이 있으면 언제나 새 값이 이긴다 — 오래된 문구가 최신 활동을 가리면 안 된다.
+///
+/// model/effort/context_pct는 **이어받지 않는다**. 그건 "지금 이 에이전트가 무엇인가"라
+/// 사라졌다면 사라진 게 맞고, 옛 값을 남기면 실제와 어긋난 정보를 보여주게 된다.
+fn carry_forward_agent_activity(
+    next: &mut crate::agent_detect::AgentDisplay,
+    previous: &crate::agent_detect::AgentDisplay,
+) {
+    // **에이전트가 바뀌었으면 이어받지 않는다.** 에이전트가 끝나면 shim이 같은 pane에
+    // 폴백 셸을 얹으므로(wrap_agent_then_shell) SessionId가 그대로다 — 사용자가 그
+    // 셸에서 다른 에이전트를 직접 띄우면 같은 키에 새 종류가 들어온다. 그때 이어받으면
+    // **옛 에이전트가 한 말이 새 대화의 것처럼** 보인다(2026-08-19 코드 리뷰).
+    if next.kind != previous.kind {
+        return;
+    }
+    fn is_blank(value: &Option<String>) -> bool {
+        value.as_deref().is_none_or(|text| text.trim().is_empty())
+    }
+    if is_blank(&next.last_agent_summary) && !is_blank(&previous.last_agent_summary) {
+        next.last_agent_summary = previous.last_agent_summary.clone();
+    }
+    if is_blank(&next.user_instruction) && !is_blank(&previous.user_instruction) {
+        next.user_instruction = previous.user_instruction.clone();
+    }
+}
+
 /// 새로 넣는 항목은 `RunningAgent`가 **argv에서 뽑아둔** model/effort를 그대로 쓴다 —
 /// 런처가 넘긴 값이라 실행 순간의 진실이고, `--model`/`--effort` 파싱은 provider와
 /// 무관하게 일반적이라 Kimi의 `--model kimi-code/k3`도 그대로 잡힌다.
@@ -8622,6 +9278,789 @@ fn is_bounded_https_url(url: &str) -> bool {
         && url.starts_with("https://")
 }
 
+/// git 브랜치명을 GitHub `/tree/<path>` URL 세그먼트로 만든다. "/"는 세그먼트
+/// 구분자로 그대로 둔다(예: "feat/git-panel" 같은 중첩 브랜치명이 GitHub에서 그대로
+/// 라우팅된다) — 그 외 예약/비ASCII 문자만 퍼센트 인코딩한다. git 브랜치명은
+/// 공백을 허용하지 않지만 "#"·"?"·유니코드는 허용해 URL에서 깨질 수 있다(2026-08-15,
+/// git 패널 ↗ 버튼).
+fn github_branch_url_path(branch: &str) -> String {
+    branch
+        .split('/')
+        .map(|segment| {
+            let mut out = String::with_capacity(segment.len());
+            for byte in segment.bytes() {
+                match byte {
+                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                        out.push(byte as char);
+                    }
+                    _ => out.push_str(&format!("%{byte:02X}")),
+                }
+            }
+            out
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// 어느 보조 탭이 방금 활성이 됐는지.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AuxTabWinner {
+    History,
+    Git,
+    Document,
+}
+
+/// 문서 탭에 지금 열려 있는 문서(설계 §4 `OpenDocument`). App 소유 — leaf
+/// (`ui::document`)는 이 값에서 뽑은 스냅샷만 받는다.
+struct OpenDocument {
+    /// 안정 id(멀티 문서 탭 설계 §1) — `ui::workspace::PaneAuxTabKind::Document`가
+    /// 그대로 들고, `MarkdownDocumentSlot`도 이 값으로 만들어 문서마다 Preview 캐시가
+    /// 갈린다.
+    id: ui::workspace::DocumentTabId,
+    path: PathBuf,
+    /// authoritative state — Viewer는 이 값을 재직렬화·저장하지 않는다(설계 §5).
+    source: String,
+    mode: ui::document::DocumentViewMode,
+    load_state: DocumentLoadState,
+    /// 저장(또는 로드) 시점 내용 — dirty 판정 기준. 설계 §4는 `saved_hash`(해시)를
+    /// 적었지만, Full 티어 상한이 1 MiB라 통째로 들고 비교해도 비용이 무시할 만하고
+    /// 해시 충돌 걱정이 아예 없다 — 단순함을 우선했다.
+    saved_source: String,
+    dirty: bool,
+    /// 저장 요청이 이미 나가 있는 동안 true — 저장 버튼 중복 클릭을 막는다.
+    saving: bool,
+    /// 저장 워커에 **실제로 보낸** 내용. 저장은 요청 시점 스냅샷을 디스크에 쓰는데,
+    /// 그 사이에도 편집기는 계속 입력을 받는다. 완료 시 `saved_source`를 현재 버퍼로
+    /// 스탬프하면 디스크에 없는 편집분까지 "저장됨"이 되어 **조용히 사라진다**
+    /// (2026-08-23 리뷰 CRITICAL). 그래서 보낸 스냅샷을 들고 있다가 그걸로 스탬프한다.
+    saving_source: Option<String>,
+    /// 마지막 저장 실패 이유 — 편집을 계속할 수 있어야 하므로(§6은 로드 실패만
+    /// 전면 차단이다) `load_state`를 덮어쓰지 않고 이 필드에만 남긴다. 다음 편집이나
+    /// 저장 재시도에서 지운다.
+    save_error: Option<document_io::DocumentIoErrorCode>,
+    /// 저장이 막 성공했다는 짧은 피드백("저장됨") 창 — 이 시각까지만 툴바에 보인다.
+    saved_feedback_until: Option<std::time::Instant>,
+    /// ViewOnly 티어로 열렸을 때의 파일 크기 — 툴바 문구에 이유(1 MiB 초과)를 함께
+    /// 보여준다. Full 티어면 `None`.
+    view_only_byte_len: Option<u64>,
+    /// `source`가 바뀔 때마다(편집·로드·재로드) 올리는 카운터 — 문서마다 따로 올라가야
+    /// `MarkdownDocumentSlot`과 짝을 이뤄 Preview 캐시가 문서별로 갈린다(멀티 문서 탭
+    /// 설계 §2 — 예전에는 App 전역 카운터 하나를 모든 문서가 공유해 슬롯도 `0`으로
+    /// 고정돼 있었다).
+    source_revision: u64,
+}
+
+impl OpenDocument {
+    /// 평문(`.txt` 등)은 모드 토글을 숨긴다(설계 §3.1) — Markdown 확장자만 preview를
+    /// 지원한다.
+    fn supports_preview(&self) -> bool {
+        matches!(
+            self.path.extension().and_then(|ext| ext.to_str()),
+            Some(ext) if ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown")
+        )
+    }
+
+    fn limit_tier(&self) -> Option<document_io::DocumentLimitTier> {
+        match &self.load_state {
+            DocumentLoadState::Loaded { limit, .. } => Some(*limit),
+            DocumentLoadState::Refused { .. } => Some(document_io::DocumentLimitTier::Refuse),
+            DocumentLoadState::Binary { .. } => Some(document_io::DocumentLimitTier::Binary),
+            DocumentLoadState::Loading | DocumentLoadState::Failed { .. } => None,
+        }
+    }
+
+    fn is_editable(&self) -> bool {
+        matches!(
+            self.load_state,
+            DocumentLoadState::Loaded {
+                limit: document_io::DocumentLimitTier::Full,
+                ..
+            }
+        )
+    }
+
+    fn has_save_eligibility(&self) -> bool {
+        self.dirty && !self.saving && self.is_editable()
+    }
+
+    fn source_fits_save_limit(&self) -> bool {
+        self.source.len() as u64 <= document_io::DOCUMENT_REFUSE_BYTES_MAX
+    }
+
+    fn can_save(&self) -> bool {
+        self.has_save_eligibility() && self.source_fits_save_limit()
+    }
+
+    fn can_save_then_close(&self) -> bool {
+        self.dirty && self.is_editable() && self.source_fits_save_limit()
+    }
+
+    /// dirty 판정 — 저장(또는 로드) 시점 내용과 현재 내용을 직접 비교한다. 편집 →
+    /// dirty, 저장 → 해제, 원래 내용으로 되돌리면 → 해제(모두 이 비교 하나로
+    /// 성립한다 — 별도의 "편집했었다" 플래그가 없다).
+    fn recompute_dirty(&mut self) {
+        self.dirty = self.source != self.saved_source;
+    }
+}
+
+/// 문서 로드 결과의 App 쪽 표현(설계 §6 4티어 + Loading). `document_io::DocumentLoadOutcome`을
+/// 그대로 들고 있지 않는 이유: 그 타입은 "이번 로드 한 번"의 결과값이고, 여기서는
+/// "지금 문서 탭이 보여줄 상태"가 필요하다(재로드로 다시 Loading에 들어갔다가 새
+/// 결과로 갱신되는 상태 기계).
+#[derive(Debug, Clone)]
+enum DocumentLoadState {
+    Loading,
+    Loaded {
+        revision: document_io::DocumentRevision,
+        limit: document_io::DocumentLimitTier,
+    },
+    Refused {
+        byte_len: u64,
+    },
+    Binary {
+        byte_len: u64,
+    },
+    Failed {
+        code: document_io::DocumentIoErrorCode,
+    },
+}
+
+/// 로드 결과(설계 §6 4티어 + 실패) → `DocumentLoadState` 매핑. `source`는 여기서
+/// 다루지 않는다(순수 함수라 소유권을 가져가지 않는다) — 호출부가 `&outcome`으로
+/// 먼저 이 매핑을 뽑은 뒤, 같은 `outcome`을 값으로 소비해 `source`를 옮긴다.
+fn document_load_state_from_outcome(
+    outcome: &document_io::DocumentLoadOutcome,
+) -> DocumentLoadState {
+    match outcome {
+        document_io::DocumentLoadOutcome::Loaded { revision, .. } => DocumentLoadState::Loaded {
+            revision: *revision,
+            limit: document_io::DocumentLimitTier::Full,
+        },
+        document_io::DocumentLoadOutcome::ViewOnly { revision, .. } => DocumentLoadState::Loaded {
+            revision: *revision,
+            limit: document_io::DocumentLimitTier::ViewOnly,
+        },
+        document_io::DocumentLoadOutcome::Refused { byte_len } => DocumentLoadState::Refused {
+            byte_len: *byte_len,
+        },
+        document_io::DocumentLoadOutcome::Binary { byte_len } => DocumentLoadState::Binary {
+            byte_len: *byte_len,
+        },
+        document_io::DocumentLoadOutcome::Failed { code } => {
+            DocumentLoadState::Failed { code: *code }
+        }
+    }
+}
+
+fn apply_document_load_outcome_to_document(
+    document: &mut OpenDocument,
+    outcome: document_io::DocumentLoadOutcome,
+) {
+    document.load_state = document_load_state_from_outcome(&outcome);
+    document.view_only_byte_len = None;
+    match outcome {
+        document_io::DocumentLoadOutcome::Loaded { source, .. } => {
+            document.saved_source = source.clone();
+            document.source = source;
+            document.dirty = false;
+        }
+        document_io::DocumentLoadOutcome::ViewOnly {
+            source, byte_len, ..
+        } => {
+            document.saved_source = source.clone();
+            document.source = source;
+            document.dirty = false;
+            document.view_only_byte_len = Some(byte_len);
+        }
+        document_io::DocumentLoadOutcome::Refused { .. }
+        | document_io::DocumentLoadOutcome::Binary { .. }
+        | document_io::DocumentLoadOutcome::Failed { .. } => {}
+    }
+    document.save_error = None;
+    document.saved_feedback_until = None;
+    document.source_revision = document.source_revision.wrapping_add(1);
+}
+
+/// 저장 결과를 문서 필드에 반영한다 — Conflict는 `source`를 절대 건드리지 않는다
+/// (설계 §7, 이 함수의 가장 중요한 계약). 확인 모달이 필요하면 그 종류를 돌려주고,
+/// 필요 없으면(저장 성공/실패) `None`을 돌려준다 — App은 `Some`이면 continuation을
+/// 실행하지 않고 그대로 확인 모달로 간다. `id`는 반환하는 `SaveConflict`에 실을
+/// 뿐이라 순수성은 그대로다 — 여러 문서가 동시에 열려 있을 때 어느 문서의 충돌인지
+/// 확인 모달이 알아야 한다(멀티 문서 탭 설계).
+fn apply_save_outcome_to_document(
+    id: ui::workspace::DocumentTabId,
+    document: &mut OpenDocument,
+    outcome: &document_io::DocumentSaveOutcome,
+) -> Option<DocumentPendingConfirm> {
+    match outcome {
+        document_io::DocumentSaveOutcome::Saved { revision } => {
+            document.saving = false;
+            // 디스크에 들어간 것은 **요청 시점 스냅샷**이다. 저장 중에 들어온 편집은
+            // 아직 저장되지 않았으므로 dirty로 남아야 한다(위 `saving_source` 주석).
+            document.saved_source = document
+                .saving_source
+                .take()
+                .unwrap_or_else(|| document.source.clone());
+            document.dirty = document.source != document.saved_source;
+            document.save_error = None;
+            document.saved_feedback_until =
+                Some(std::time::Instant::now() + DOCUMENT_SAVED_FEEDBACK_DURATION);
+            if let DocumentLoadState::Loaded { revision: slot, .. } = &mut document.load_state {
+                *slot = *revision;
+            }
+            None
+        }
+        document_io::DocumentSaveOutcome::Conflict => {
+            document.saving = false;
+            document.saving_source = None;
+            Some(DocumentPendingConfirm::SaveConflict { id })
+        }
+        document_io::DocumentSaveOutcome::Failed { code } => {
+            document.saving = false;
+            document.saving_source = None;
+            document.save_error = Some(*code);
+            None
+        }
+    }
+}
+
+fn apply_document_save_infrastructure_failure(
+    documents: &mut [OpenDocument],
+    close_after_save: &mut std::collections::HashSet<ui::workspace::DocumentTabId>,
+    id: ui::workspace::DocumentTabId,
+) {
+    if let Some(document) = documents.iter_mut().find(|document| document.id == id) {
+        document.saving = false;
+        document.saving_source = None;
+        document.save_error = Some(document_io::DocumentIoErrorCode::ReadFailed);
+    }
+    close_after_save.remove(&id);
+}
+
+/// 문서 탭 확인 모달 종류(설계 §3.3·§7, 멀티 문서 탭 설계). 셋 다 버튼은 최대 두세
+/// 개 — "다른 이름으로 저장"은 이번 범위에서 생략한다(설계 §4 지시). 여러 문서가
+/// 동시에 열려 있을 수 있어 어느 문서에 대한 확인인지 `id`로 못박는다. 교체
+/// 확인(`ReplaceWithDirty`)은 더는 없다 — 새 문서를 열어도 기존 문서를 교체하지
+/// 않으니 버릴 것도 없다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DocumentPendingConfirm {
+    /// dirty 상태에서 이 문서 탭을 닫으려던 참.
+    CloseWithDirty { id: ui::workspace::DocumentTabId },
+    /// 저장 직전 다시 읽은 revision이 로드 시점과 달랐다 — 덮어쓰지 않았다.
+    SaveConflict { id: ui::workspace::DocumentTabId },
+}
+
+impl DocumentPendingConfirm {
+    /// 이 확인이 어느 문서에 대한 것인지 — 큐 중복 제거(`enqueue_document_pending_confirm`)와
+    /// 문서를 닫을 때 큐 정리(`close_document_entry`)가 공용으로 쓴다.
+    fn document_id(self) -> ui::workspace::DocumentTabId {
+        match self {
+            Self::CloseWithDirty { id } | Self::SaveConflict { id } => id,
+        }
+    }
+}
+
+/// 확인 대기 큐에 새 항목을 넣는다 — 순수 함수라 App 없이 테스트한다. 같은 문서에
+/// 대한 같은 종류의 확인이 이미 큐에 있으면 중복을 만들지 않는다. 다만 저장 충돌은
+/// 닫기 확인보다 우선하므로 같은 문서의 `CloseWithDirty`를 그 자리에서 교체한다.
+/// 서로 다른 문서의 확인은 도착한 순서대로 뒤에 쌓인다(FIFO) — 응답 전에 다른
+/// 확인이 와도 먼저 것이 사라지지 않는다(2026-08-22 리뷰: 예전엔 전역 단일 슬롯이라
+/// 응답 없이 조용히 덮어써졌다).
+fn enqueue_document_pending_confirm(
+    queue: &mut std::collections::VecDeque<DocumentPendingConfirm>,
+    confirm: DocumentPendingConfirm,
+) {
+    let id = confirm.document_id();
+    if let Some(existing) = queue
+        .iter_mut()
+        .find(|existing| existing.document_id() == id)
+    {
+        if matches!(confirm, DocumentPendingConfirm::SaveConflict { .. })
+            && matches!(existing, DocumentPendingConfirm::CloseWithDirty { .. })
+        {
+            *existing = confirm;
+        }
+        return;
+    }
+    queue.push_back(confirm);
+}
+
+fn should_complete_pending_close_after_save(
+    queue: &std::collections::VecDeque<DocumentPendingConfirm>,
+    id: ui::workspace::DocumentTabId,
+    still_dirty: bool,
+) -> bool {
+    !still_dirty
+        && queue.iter().any(|confirm| {
+            matches!(confirm, DocumentPendingConfirm::CloseWithDirty { id: pending } if *pending == id)
+        })
+}
+
+/// `apply_document_confirm_choice`(닫기 확인 모달)가 실행해야 할 일 — 순수 함수인
+/// `resolve_document_confirm_choice`가 무엇을 할지만 계산하고, 실제 실행(문서 닫기·
+/// 저장 요청)은 App이 한다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DocumentConfirmAction {
+    /// 「버리기」 — 그 문서를 곧장 닫는다.
+    Discard(ui::workspace::DocumentTabId),
+    /// 「저장」 — 저장 후 닫기를 걸고 저장을 요청한다.
+    SaveThenClose(ui::workspace::DocumentTabId),
+}
+
+/// 큐 맨 앞(front) 항목에 사용자의 선택을 적용한다 — 순수 함수라 App 없이 테스트한다.
+/// 맨 앞이 곧 지금 화면에 그려지는 모달이므로 `pop_front`는 항상 사용자가 실제로 본
+/// 확인과 일치한다(여러 확인이 쌓여 있어도 뒤엣것은 절대 건드리지 않는다 — "각
+/// 확인이 올바른 문서에 적용되는지"). `SaveConflict`는 재로드/취소 두 가지뿐이라
+/// `resolve_document_conflict_choice`가 따로 처리한다(여기서는 `None`).
+fn resolve_document_confirm_choice(
+    queue: &mut std::collections::VecDeque<DocumentPendingConfirm>,
+    choice: DocumentConfirmChoice,
+) -> Option<DocumentConfirmAction> {
+    let pending = queue.pop_front()?;
+    match (choice, pending) {
+        (DocumentConfirmChoice::Cancel, _) => None,
+        (DocumentConfirmChoice::Discard, DocumentPendingConfirm::CloseWithDirty { id }) => {
+            Some(DocumentConfirmAction::Discard(id))
+        }
+        (DocumentConfirmChoice::Save, DocumentPendingConfirm::CloseWithDirty { id }) => {
+            Some(DocumentConfirmAction::SaveThenClose(id))
+        }
+        (_, DocumentPendingConfirm::SaveConflict { .. }) => None,
+    }
+}
+
+/// 큐 맨 앞 항목에 저장 충돌 확인(재로드/취소)의 선택을 적용한다 —
+/// `resolve_document_confirm_choice`와 같은 이유로 순수 함수다. `reload`가 참이고
+/// 맨 앞이 `SaveConflict`면 그 문서 id를 돌려준다(App이 `reload_document_from_disk`를
+/// 부른다).
+fn resolve_document_conflict_choice(
+    queue: &mut std::collections::VecDeque<DocumentPendingConfirm>,
+    reload: bool,
+) -> Option<ui::workspace::DocumentTabId> {
+    let pending = queue.pop_front()?;
+    if reload && let DocumentPendingConfirm::SaveConflict { id } = pending {
+        Some(id)
+    } else {
+        None
+    }
+}
+
+/// dirty 확인 모달(교체/닫기 공용)에서 사용자가 누른 버튼.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DocumentConfirmChoice {
+    Save,
+    Discard,
+    Cancel,
+}
+
+/// `MarkdownLinkIntent`를 실제로 실행할 행동으로 분류한 결과(설계 §5·§7.3). 실행은
+/// App이 하지만, 분류 자체는 App 상태 없이 순수하게 계산해 유닛 테스트로 3종
+/// 라우팅을 직접 확인한다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DocumentLinkAction {
+    OpenExternal(String),
+    OpenDocument(PathBuf),
+    Ignored,
+}
+
+/// Markdown 링크 intent → 실행할 행동. `base_directory`는 현재 문서의 디렉터리 —
+/// 상대 문서 경로를 여기 기준으로 해석한다(설계 §5).
+fn classify_document_link_intent(
+    base_directory: &Path,
+    intent: &ui::markdown_viewer::MarkdownLinkIntent,
+) -> DocumentLinkAction {
+    match intent {
+        ui::markdown_viewer::MarkdownLinkIntent::OpenExternal(url) => {
+            DocumentLinkAction::OpenExternal(url.clone())
+        }
+        ui::markdown_viewer::MarkdownLinkIntent::OpenRelativeDocument(relative) => {
+            DocumentLinkAction::OpenDocument(base_directory.join(relative))
+        }
+        ui::markdown_viewer::MarkdownLinkIntent::Rejected(_) => DocumentLinkAction::Ignored,
+    }
+}
+
+/// 문서 탭 X — dirty면 곧장 닫지 않고 확인을 받는다(설계 §3.3). `apply_document_tab_intent`의
+/// 다만 저장 중이면 dirty 판정보다 먼저 결과를 기다린다. Close 분기가 쓰는
+/// 상태 분류 그 자체이며, 순수 함수라 App 없이 테스트한다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DocumentCloseDisposition {
+    CloseNow,
+    ConfirmDirty,
+    DeferUntilSave,
+}
+
+fn document_close_disposition(document: Option<&OpenDocument>) -> DocumentCloseDisposition {
+    match document {
+        Some(document) if document.saving => DocumentCloseDisposition::DeferUntilSave,
+        Some(document) if document.dirty => DocumentCloseDisposition::ConfirmDirty,
+        _ => DocumentCloseDisposition::CloseNow,
+    }
+}
+
+/// source 편집기의 `TextEditState` id. `source_editor`가 **절대 id**를 쓰므로 여기서
+/// 만드는 값이 곧 그 위젯의 id다 — 예전처럼 위젯 계층을 역산할 필요가 없다
+/// (2026-08-23). 컨테이너가 달라도 같은 값이라 Source·Split 두 모드가 커서와 undo
+/// 기록을 공유한다.
+fn document_source_editor_id(path: &Path) -> egui::Id {
+    egui::Id::new(("document_tab_source_editor", path))
+}
+
+/// 문서를 닫을 때 egui가 들고 있던 source 편집기 `TextEditState`를 지운다 — 안 지우면
+/// 실행취소 스냅샷이 남아 같은 경로를 다시 열 때 되살아나고, 세션 동안 편집한 서로
+/// 다른 문서 수만큼 무한정 쌓인다.
+///
+/// Source·Split 두 모드가 **같은 절대 id**를 쓰므로 한 번만 지우면 된다(2026-08-23).
+/// 그 모드로 열린 적이 없으면 애초에 저장된 적이 없어 `remove`가 조용히 no-op이다.
+fn clear_document_editor_state(ctx: &egui::Context, document: &OpenDocument) {
+    let editor_id = document_source_editor_id(&document.path);
+    ctx.data_mut(|d| d.remove::<egui::text_edit::TextEditState>(editor_id));
+}
+
+/// 문서가 닫힐 때 미리보기 쪽이 들고 있던 그 문서 몫의 상태도 지운다 — 가로 스크롤
+/// 오프셋과 목적지 파싱 캐시다(2026-08-23 리뷰). 편집기 상태와 같은 이유로, egui는
+/// persisted 위젯 상태를 자동으로 GC하지 않는다.
+fn clear_document_viewer_state(
+    viewer: &mut ui::markdown_viewer::MarkdownViewer,
+    ctx: &egui::Context,
+    id: ui::workspace::DocumentTabId,
+) {
+    viewer.forget_document(
+        ctx,
+        ui::markdown_viewer::MarkdownDocumentSlot(u64::from(id.0)),
+    );
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DocumentDropOpenMode {
+    ClaimedPane,
+    ResolvePane,
+}
+
+fn dispatch_document_drop_paths(
+    paths: Vec<PathBuf>,
+    mode: DocumentDropOpenMode,
+    mut open: impl FnMut(DocumentDropOpenMode, PathBuf),
+) {
+    for path in paths {
+        open(mode, path);
+    }
+}
+
+/// 같은 경로가 이미 열려 있으면 그 id를 돌려준다(멀티 문서 탭 설계 ③) —
+/// `begin_document_open`이 이 값이 있으면 새로 열지 않고 그 탭만 활성화한다.
+/// 순수 함수라 App 없이 테스트한다.
+fn find_open_document_by_path(
+    documents: &[OpenDocument],
+    path: &Path,
+) -> Option<ui::workspace::DocumentTabId> {
+    documents
+        .iter()
+        .find(|document| document.path == path)
+        .map(|document| document.id)
+}
+
+fn retained_document_bytes(document: &OpenDocument) -> Option<u64> {
+    let source = u64::try_from(document.source.len()).ok()?;
+    let saved_source = u64::try_from(document.saved_source.len()).ok()?;
+    source.checked_add(saved_source)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DocumentLoadAdmission {
+    Missing,
+    Admit {
+        evict: Vec<ui::workspace::DocumentTabId>,
+    },
+    Reject,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct DocumentLoadAdmissionExecution {
+    apply_outcome: bool,
+    show_cap_notice: bool,
+}
+
+fn execute_document_load_admission(
+    admission: DocumentLoadAdmission,
+    incoming_id: ui::workspace::DocumentTabId,
+    mut close_document: impl FnMut(ui::workspace::DocumentTabId),
+) -> DocumentLoadAdmissionExecution {
+    match admission {
+        DocumentLoadAdmission::Missing => DocumentLoadAdmissionExecution {
+            apply_outcome: false,
+            show_cap_notice: false,
+        },
+        DocumentLoadAdmission::Admit { evict } => {
+            for victim in evict {
+                close_document(victim);
+            }
+            DocumentLoadAdmissionExecution {
+                apply_outcome: true,
+                show_cap_notice: false,
+            }
+        }
+        DocumentLoadAdmission::Reject => {
+            close_document(incoming_id);
+            DocumentLoadAdmissionExecution {
+                apply_outcome: false,
+                show_cap_notice: true,
+            }
+        }
+    }
+}
+
+fn plan_document_load_admission(
+    documents: &[OpenDocument],
+    incoming_id: ui::workspace::DocumentTabId,
+    incoming_source_bytes: u64,
+    active_document: Option<ui::workspace::DocumentTabId>,
+) -> DocumentLoadAdmission {
+    if !documents.iter().any(|document| document.id == incoming_id) {
+        return DocumentLoadAdmission::Missing;
+    }
+    let Some(incoming_retained) = incoming_source_bytes.checked_mul(2) else {
+        return DocumentLoadAdmission::Reject;
+    };
+    let mut remaining: Vec<&OpenDocument> = documents
+        .iter()
+        .filter(|document| document.id != incoming_id)
+        .collect();
+    let Some(existing_retained) = remaining.iter().try_fold(0_u64, |total, document| {
+        total.checked_add(retained_document_bytes(document)?)
+    }) else {
+        return DocumentLoadAdmission::Reject;
+    };
+    let Some(mut retained) = existing_retained.checked_add(incoming_retained) else {
+        return DocumentLoadAdmission::Reject;
+    };
+    let mut evict = Vec::new();
+
+    while retained > DOCUMENT_TOTAL_RETAINED_BYTES_MAX {
+        let Some(position) = remaining.iter().position(|document| {
+            !document.dirty
+                && !document.saving
+                && Some(document.id) != active_document
+                && retained_document_bytes(document).is_some_and(|bytes| bytes > 0)
+        }) else {
+            return DocumentLoadAdmission::Reject;
+        };
+        let victim = remaining.remove(position);
+        let Some(victim_retained) = retained_document_bytes(victim) else {
+            return DocumentLoadAdmission::Reject;
+        };
+        let Some(next_retained) = retained.checked_sub(victim_retained) else {
+            return DocumentLoadAdmission::Reject;
+        };
+        retained = next_retained;
+        evict.push(victim.id);
+    }
+
+    DocumentLoadAdmission::Admit { evict }
+}
+
+/// 새 문서 하나를 위해 상한(개수 `DOCUMENT_TABS_MAX`·바이트
+/// `DOCUMENT_TOTAL_RETAINED_BYTES_MAX`, 설계 §4) 안으로 자리를 만들려면 어떤
+/// 문서들을(가장 먼저 연 것부터) 닫아야 하는지 결정한다 — 순수 함수라 App 없이
+/// 테스트한다. 활성 문서는 후보에서 제외한다. clean 비활성 문서를 다 닫아도
+/// 여전히 상한을 넘으면(=더 닫을 게 없는데 아직 넘는다) `None`을 돌려준다 —
+/// 자리를 못 만든다는 뜻이다. dirty 문서는 절대 후보에 넣지 않는다 — 저장 안 된
+/// 내용을 조용히 버리지 않는다.
+fn plan_document_eviction(
+    documents: &[OpenDocument],
+    active_document: Option<ui::workspace::DocumentTabId>,
+) -> Option<Vec<ui::workspace::DocumentTabId>> {
+    // 논리 보유량은 source 하나가 아니라 source + saved_source 두 사본이다 —
+    // `apply_document_load_outcome`이 로드마다 saved_source도 항상 채우고(dirty
+    // 판정 기준이라 저장 후에도 계속 들고 있어야 한다), source만 세면 상한이 실제
+    // 보유량의 절반만 반영한다(2026-08-22 리뷰).
+    let mut remaining: Vec<&OpenDocument> = documents.iter().collect();
+    let mut bytes = remaining.iter().try_fold(0_u64, |total, document| {
+        total.checked_add(retained_document_bytes(document)?)
+    })?;
+    let mut evict = Vec::new();
+    while remaining.len() + 1 > DOCUMENT_TABS_MAX || bytes > DOCUMENT_TOTAL_RETAINED_BYTES_MAX {
+        let needs_tab_room = remaining.len() + 1 > DOCUMENT_TABS_MAX;
+        let position = remaining.iter().position(|document| {
+            !document.dirty
+                && !document.saving
+                && Some(document.id) != active_document
+                && (needs_tab_room
+                    || retained_document_bytes(document).is_some_and(|bytes| bytes > 0))
+        })?;
+        let victim = remaining.remove(position);
+        bytes = bytes.checked_sub(retained_document_bytes(victim)?)?;
+        evict.push(victim.id);
+    }
+    Some(evict)
+}
+
+/// 문서 하나를 닫은 뒤(`documents`에서 이미 그 문서가 제거된 상태) 다음에 활성화할
+/// 문서를 고른다(순수 함수, 멀티 문서 탭 설계 ⑥) — 이웃(오른쪽 우선, 없으면 왼쪽).
+/// `closed_index`는 방금 제거된 문서가 있던 자리(`Vec::remove`에 준 인덱스)다.
+fn next_active_document_after_close(
+    documents: &[OpenDocument],
+    closed_index: usize,
+) -> Option<ui::workspace::DocumentTabId> {
+    let neighbor_index = closed_index.min(documents.len().checked_sub(1)?);
+    documents.get(neighbor_index).map(|document| document.id)
+}
+
+/// 보조 본문은 하나뿐이라 세 탭이 동시에 활성일 수 없다. 진 쪽은 세션 탭으로 물러나되
+/// 탭 자체는 남는다(`on_session_tab_click`) — 이미 비활성/닫힘인 탭에 걸어도 안전하다
+/// (`on_session_tab_click`은 그 경우 그대로 돌려준다).
+fn resolve_aux_tab_exclusivity(
+    history: ui::workspace::PaneAuxTabState,
+    git: ui::workspace::PaneAuxTabState,
+    document: ui::workspace::PaneAuxTabState,
+    winner: AuxTabWinner,
+) -> (
+    ui::workspace::PaneAuxTabState,
+    ui::workspace::PaneAuxTabState,
+    ui::workspace::PaneAuxTabState,
+) {
+    let demote = |state: ui::workspace::PaneAuxTabState, is_winner: bool| {
+        if is_winner {
+            state
+        } else {
+            state.on_session_tab_click()
+        }
+    };
+    (
+        demote(history, winner == AuxTabWinner::History),
+        demote(git, winner == AuxTabWinner::Git),
+        demote(document, winner == AuxTabWinner::Document),
+    )
+}
+
+/// 세션이 중앙 본문을 차지할 때 열린 보조 탭은 유지하되 모두 inactive로
+/// 물러난다. 반환 boolean은 실제로 활성 본문이 바뀌었는지이며, 공유
+/// 보조 검색 상태를 초기화할지 결정한다.
+fn reveal_session_aux_tabs(
+    history: ui::workspace::PaneAuxTabState,
+    git: ui::workspace::PaneAuxTabState,
+    document: ui::workspace::PaneAuxTabState,
+) -> (
+    ui::workspace::PaneAuxTabState,
+    ui::workspace::PaneAuxTabState,
+    ui::workspace::PaneAuxTabState,
+    bool,
+) {
+    let reset_search = history.is_active() || git.is_active() || document.is_active();
+    (
+        history.on_session_tab_click(),
+        git.on_session_tab_click(),
+        document.on_session_tab_click(),
+        reset_search,
+    )
+}
+
+/// Git 보조 본문 좌측 목록 폭 — 목록은 경로가 읽히는 최소 폭이 있고, diff는 넓을수록
+/// 좋다. 넓은 창에서는 300pt 고정, 좁아지면 40%로 따라 줄되 180pt 밑으로는 내려가지
+/// 않는다(스펙 §8-3).
+/// Git 보조 본문 좌측 목록의 최소 폭. 자동 계산(`git_tab_list_width`)과 드래그 clamp
+/// (`aux_split_width`)가 **같은 값**을 써야 한쪽만 바뀌어 조용히 어긋나지 않는다
+/// (2026-08-17 리뷰).
+const GIT_TAB_LIST_MIN_WIDTH: f32 = 180.0;
+/// 이력 보조 본문 좌측 목록의 최소 폭 — 카드가 git 파일 행보다 정보가 많아 더 크다.
+const HISTORY_TAB_LIST_MIN_WIDTH: f32 = 220.0;
+
+fn git_tab_list_width(body_width: f32) -> f32 {
+    const FIXED: f32 = 300.0;
+    (body_width * 0.4).clamp(GIT_TAB_LIST_MIN_WIDTH, FIXED)
+}
+
+/// 이력 보조 본문 좌측 카드 목록 폭 — `git_tab_list_width`와 같은 규칙(스펙 §2-1)이지만
+/// 카드가 git 파일 행보다 정보가 많아 하한을 조금 크게 잡는다(220 vs 180).
+fn history_tab_list_width(body_width: f32) -> f32 {
+    const FIXED: f32 = 360.0;
+    (body_width * 0.4).clamp(HISTORY_TAB_LIST_MIN_WIDTH, FIXED)
+}
+
+/// 이력·Git 우측 상세(원문/diff)가 완전히 가려지지 않게 남겨두는 최소 폭 — 사용자가
+/// 구분선을 끝까지 끌어도 상세가 0폭이 되면 안 된다(2026-08-16 사용자 보고: 우측이
+/// 잘려 읽기 힘들다).
+const AUX_DETAIL_MIN_WIDTH: f32 = 240.0;
+
+/// 문서 탭 Split 좌측 source 편집기의 최소 폭 — 목록이 아니라 편집기라 이력·Git의
+/// 목록 최소 폭보다 넉넉하게 잡는다.
+const DOCUMENT_TAB_SOURCE_MIN_WIDTH: f32 = 320.0;
+
+/// 저장 성공 직후 툴바에 "저장됨" 문구를 보여주는 시간.
+const DOCUMENT_SAVED_FEEDBACK_DURATION: std::time::Duration =
+    std::time::Duration::from_millis(1500);
+
+/// 동시에 열 수 있는 문서 탭 개수 상한(멀티 문서 탭 설계 §4) — split pane 여러 개에
+/// 문서를 몇 개씩 참고하는 워크플로를 감안했다. 이력·Git 자리(최대 2개)를 더해도
+/// 헤더 축약 사다리(×부터 접는다)가 충분히 감당하는 수다.
+const DOCUMENT_TABS_MAX: usize = 8;
+
+/// 열려 있는 문서들의 **논리 텍스트 보유량** 상한(멀티 문서 탭 설계 §4) — `source` +
+/// `saved_source` 두 문자열 길이를 합친 값이다(`retained_document_bytes`).
+/// `apply_document_load_outcome`이 로드마다 saved_source도 항상 채워 dirty 판정용 사본을
+/// 계속 들고 있으므로, source 하나만 세면 보유한 텍스트의 절반만 반영하게 된다. 문서 하나가
+/// §6 ViewOnly 티어로 최대 8 MiB(`document_io::DOCUMENT_REFUSE_BYTES_MAX`)까지 열릴
+/// 수 있다. `DOCUMENT_TABS_MAX`(8개)보다 훨씬 작게 잡아, 큰 ViewOnly 문서 몇 개만
+/// 몰려도(개수 상한에 한참 못 미쳐도) 전체 보유량이 무한정 커지지 않게 한다 —
+/// ViewOnly 문서(사본 둘 합쳐 16 MiB) 두 개만으로도 이 상한에 걸린다.
+const DOCUMENT_TOTAL_RETAINED_BYTES_MAX: u64 = 24 * 1024 * 1024;
+
+/// 이력·Git 본문의 좌우 분할 폭 — 사용자가 구분선을 끌기 전(`stored: None`)에는 `auto`
+/// (`git_tab_list_width`/`history_tab_list_width`가 계산한 기존 자동값)를 쓰고, 한 번
+/// 끌고 나면(`Some(px)`) 그 값을 쓴다. 매 프레임 좌측 최소(`min_list`)·우측 최소
+/// (`AUX_DETAIL_MIN_WIDTH`)로 다시 clamp해, 저장된 폭이 이전 프레임 창 크기 기준이어도
+/// 창을 줄였다 늘렸을 때 항상 유효한 값이 나온다.
+fn aux_split_width(stored: Option<f32>, auto: f32, body_width: f32, min_list: f32) -> f32 {
+    let requested = stored.unwrap_or(auto);
+    let upper = (body_width - AUX_DETAIL_MIN_WIDTH).max(0.0);
+    let lower = min_list.min(upper);
+    requested.clamp(lower, upper)
+}
+
+/// 보조 검색 ↑↓ — 활성 일치 인덱스를 총 일치 수 기준으로 순환 이동한다(스펙: 마지막
+/// 다음은 처음, 처음 이전은 마지막). `total == 0`이면 옮길 데가 없으므로 그대로 `0`을
+/// 돌려준다 — 호출부가 "아무 일도 안 한다"를 별도로 분기하지 않아도 된다.
+fn aux_search_step_active(current: usize, total: usize, forward: bool) -> usize {
+    if total == 0 {
+        return 0;
+    }
+    if forward {
+        (current + 1) % total
+    } else {
+        (current + total - 1) % total
+    }
+}
+
+/// 검색 바(`ui::aux_search::search_bar`)가 올린 intent를 `state`에 반영한다. `total`은
+/// 호출부가 검색 바를 그리기 **전에** 읽은 그 본문의 일치 수 — ↑↓ 순환
+/// (`aux_search_step_active`)의 상한이다. Esc는 `search_bar` 내부가 입력창 포커스일
+/// 때만 `Close`로 소비하므로(워크스페이스 터미널 검색 바와 같은 관례) 여기서 따로
+/// Esc를 가로챌 필요가 없다 — `Close` 처리 하나로 충분하다. 순수 함수로 뽑아 App
+/// 없이 값으로 검증한다.
+fn apply_aux_search_action(
+    state: &mut ui::aux_search::AuxSearchState,
+    action: ui::aux_search::AuxSearchAction,
+    total: usize,
+) {
+    use ui::aux_search::AuxSearchAction;
+    match action {
+        AuxSearchAction::QueryChanged(query) => {
+            state.query = query;
+            // 질의가 바뀌면 일치 위치가 전부 달라진다 — 옛 활성 인덱스를 그대로
+            // 두면 새 질의의 엉뚱한 일치를 가리키거나 범위 밖일 수 있어 처음으로
+            // 되돌린다.
+            state.active = 0;
+        }
+        AuxSearchAction::Prev => {
+            state.active = aux_search_step_active(state.active, total, false);
+        }
+        AuxSearchAction::Next => {
+            state.active = aux_search_step_active(state.active, total, true);
+        }
+        AuxSearchAction::Close => state.close(),
+    }
+}
+
 enum AppHostIoAction {
     Connector(connector_service::HostAction),
     Workspace {
@@ -8633,6 +10072,17 @@ enum AppHostIoAction {
     FileTreeMaintenance(ui::file_tree::FileTreeMaintenanceIntent),
     InboxPreview(ui::inbox_waiting::LogPreviewIntent),
     Diff(ui::diff_panel::DiffIoIntent),
+    GitPanel(ui::git_panel::GitPanelIoIntent),
+    /// 이력 카드 「원문 보기」 — transcript 파일을 blocking으로 읽는다(2026-08-15
+    /// Task 10, 스펙 §2-3). git 패널 IO와 같은 latest-only·in-flight 1개 규칙.
+    Transcript {
+        generation: u64,
+        path: PathBuf,
+        kind: crate::agent_detect::AgentKind,
+        /// 카드가 가리키는 턴을 연 레코드 줄의 절대 파일 오프셋(스펙 §6-1). 뷰어가
+        /// 그 턴을 강조·스크롤하는 데 쓴다.
+        focus_offset: u64,
+    },
     ComposerContextFile(ui::composer::ContextFileRequest),
     ComposerClipboard(ui::composer::ClipboardAttachmentRequest),
     PersistComposerHistory {
@@ -8642,6 +10092,57 @@ enum AppHostIoAction {
     FolderPicker(FolderPickerPurpose),
     OpenPath(PathBuf),
     ExternalHttpsUrl(String),
+}
+
+/// 워크스페이스 전환 시 Git 보조 본문 표면을 무효화한다(2026-08-16, 코드 리뷰 항목 1) —
+/// `git_tab` 자체는 건드리지 않는다(이력 탭과 대칭으로 열린 채 유지). 스냅샷을 `None`으로
+/// 되돌리면 `GitPanelUi::render`가 다음 프레임에 스스로 `GitPanelAction::Refresh`를 반환해
+/// 새 워크스페이스 기준으로 다시 채운다. `diff_viewer_ui`도 함께 비워 선택돼 있던 파일
+/// diff가 이전 워크스페이스 것으로 남지 않게 하고, `git_panel_generation`을 올려 이미
+/// in-flight이던 이전 워크스페이스 IO의 완료가 새 화면에 반영되지 않게 막는다.
+fn reset_git_surfaces(
+    git_panel_ui: &mut ui::git_panel::GitPanelUi,
+    diff_viewer_ui: &mut ui::diff_viewer::DiffViewerUi,
+    git_panel_generation: &mut u64,
+    git_panel_cwd: &mut Option<PathBuf>,
+) {
+    *git_panel_ui = ui::git_panel::GitPanelUi::default();
+    *diff_viewer_ui = ui::diff_viewer::DiffViewerUi::default();
+    *git_panel_generation = git_panel_generation.wrapping_add(1).max(1);
+    *git_panel_cwd = None;
+}
+
+/// 워크스페이스 전환 시 원문 뷰어 IO 요청을 무효화한다(항목 2) — `transcript_generation`을
+/// 올려, 이미 in-flight이거나 `pending_app_host_action` 슬롯에 들어간 이전 워크스페이스의
+/// 원문 읽기가 완료돼도 세대 검사(`generation == self.transcript_generation`)에 걸려
+/// 버려지게 한다. 슬롯이 차 있어 대기 중이던 `pending_app_host_retry`는 아직 어떤
+/// IO도 시작하지 않았으므로 세대 검사로 걸러지지 않는다 — 여기서 직접 비워, 슬롯이
+/// 빌 때 이전 워크스페이스 요청이 다시 실행되지 않게 한다.
+fn invalidate_transcript_requests(
+    transcript_generation: &mut u64,
+    pending_app_host_retry: &mut Option<AppHostIoAction>,
+) {
+    *transcript_generation = transcript_generation.wrapping_add(1).max(1);
+    *pending_app_host_retry = None;
+}
+
+/// `GitPanelAction::Refresh`가 쓸 cwd(항목 3) — 패널이 이미 어떤 repo를 보여주고 있으면
+/// (`pinned`, ⟳ 클릭·파일 diff 재요청) 포커스가 다른 세션으로 옮겨가 있어도 그 repo를
+/// 그대로 유지한다. 아직 보여줄 repo가 없으면(방금 탭이 열렸거나 워크스페이스 전환
+/// 직후 `reset_git_surfaces`가 비운 자리를 `GitPanelUi::render`가 자동으로 다시 채우는
+/// 경우) 포커스 세션 기준으로 새로 고른다.
+///
+/// 두 후보를 **이름 있는 필드**로 받는다. 둘 다 `Option<PathBuf>`라 위치 인자로 두면
+/// 호출부에서 순서를 바꿔도 컴파일이 통과하고, 소스 문자열 스캔 테스트도
+/// `resolve_git_refresh_cwd(`를 그대로 찾아내 통과한다 — 그러면 포커스 세션이 고정된
+/// repo를 덮어써 이 함수가 막으려던 결함이 그대로 되살아난다(2026-08-17 리뷰).
+struct GitRefreshCwd {
+    pinned: Option<PathBuf>,
+    focused: Option<PathBuf>,
+}
+
+fn resolve_git_refresh_cwd(cwd: GitRefreshCwd) -> Option<PathBuf> {
+    cwd.pinned.or(cwd.focused)
 }
 
 /// Root-owned lifecycle mutations emitted by Settings. The UI keeps at most one action and
@@ -8687,6 +10188,9 @@ enum WorkspaceControllerAction {
         cwd: Option<String>,
     },
     ResumeAgent {
+        /// 이 pane이 속한 워크스페이스. 활성 워크스페이스와 다르면 먼저 전환한다
+        /// (2026-08-20, `FocusPty`와 동일한 관례).
+        workspace_id: String,
         pane_key: String,
         title: String,
         session: runtime::SessionId,
@@ -9005,6 +10509,15 @@ enum AppHostIoCompletion {
     FileTreeMaintenance(ui::file_tree::FileTreeMaintenanceCompletion),
     InboxPreview(ui::inbox_waiting::LogPreviewCompletion),
     Diff(ui::diff_panel::DiffIoCompletion),
+    GitPanel(ui::git_panel::GitPanelIoCompletion),
+    Transcript {
+        generation: u64,
+        focus_offset: u64,
+        result: Result<
+            crate::agent_transcript::TranscriptConversation,
+            crate::agent_transcript::TranscriptViewError,
+        >,
+    },
     ComposerContextFile {
         request: ui::composer::ContextFileRequest,
         selected_path: Option<PathBuf>,
@@ -9056,6 +10569,16 @@ enum AppHostIoFallback {
     Diff {
         operation: ui::diff_panel::DiffIoOperation,
         generation: u64,
+    },
+    GitPanel {
+        generation: u64,
+        /// 원 요청이 FileDiff였는지 — 폴백 완료를 같은 결과 변형(Snapshot/FileDiff)으로
+        /// 되돌려야 App이 올바른 화면(사이드바 스냅샷 vs diff 뷰어)에 오류를 반영한다.
+        is_file_diff: bool,
+    },
+    Transcript {
+        generation: u64,
+        focus_offset: u64,
     },
     ComposerContextFile(ui::composer::ContextFileRequest),
     ComposerClipboard(ui::composer::ClipboardAttachmentRequest),
@@ -9126,6 +10649,21 @@ impl AppHostIoFallback {
             AppHostIoAction::Diff(intent) => Self::Diff {
                 operation: intent.operation,
                 generation: intent.generation,
+            },
+            AppHostIoAction::GitPanel(intent) => Self::GitPanel {
+                generation: intent.generation,
+                is_file_diff: matches!(
+                    intent.request,
+                    ui::git_panel::GitPanelIoRequest::FileDiff { .. }
+                ),
+            },
+            AppHostIoAction::Transcript {
+                generation,
+                focus_offset,
+                ..
+            } => Self::Transcript {
+                generation: *generation,
+                focus_offset: *focus_offset,
             },
             AppHostIoAction::ComposerContextFile(request) => {
                 Self::ComposerContextFile(request.clone())
@@ -9215,6 +10753,29 @@ impl AppHostIoFallback {
                 generation,
                 result: Err(ui::diff_panel::DiffIoErrorCode::CollectionFailed),
             }),
+            Self::GitPanel {
+                generation,
+                is_file_diff,
+            } => AppHostIoCompletion::GitPanel(ui::git_panel::GitPanelIoCompletion {
+                generation,
+                result: if is_file_diff {
+                    ui::git_panel::GitPanelIoResult::FileDiff(Err(
+                        ui::git_panel::GitPanelErrorCode::CollectionFailed,
+                    ))
+                } else {
+                    ui::git_panel::GitPanelIoResult::Snapshot(Err(
+                        ui::git_panel::GitPanelErrorCode::CollectionFailed,
+                    ))
+                },
+            }),
+            Self::Transcript {
+                generation,
+                focus_offset,
+            } => AppHostIoCompletion::Transcript {
+                generation,
+                focus_offset,
+                result: Err(crate::agent_transcript::TranscriptViewError::ReadFailed),
+            },
             Self::ComposerContextFile(request) => AppHostIoCompletion::ComposerContextFile {
                 request,
                 selected_path: None,
@@ -9478,11 +11039,13 @@ impl AppFileTreeWatcher {
                     None
                 }
             }
-            Err(std::sync::mpsc::TrySendError::Disconnected(_job)) => Some(AppFileTreeWatchCompletion {
-                operation,
-                generation,
-                result: Err(ui::file_tree::FileTreeMaintenanceErrorCode::WatchUnavailable),
-            }),
+            Err(std::sync::mpsc::TrySendError::Disconnected(_job)) => {
+                Some(AppFileTreeWatchCompletion {
+                    operation,
+                    generation,
+                    result: Err(ui::file_tree::FileTreeMaintenanceErrorCode::WatchUnavailable),
+                })
+            }
         }
     }
 
@@ -9513,7 +11076,8 @@ impl AppFileTreeWatcher {
     }
 
     fn apply_completion_metadata(&mut self, completion: &AppFileTreeWatchCompletion) {
-        let is_current = self.pending_operation == Some((completion.operation, completion.generation));
+        let is_current =
+            self.pending_operation == Some((completion.operation, completion.generation));
         if is_current {
             self.pending_operation = None;
         }
@@ -10173,6 +11737,15 @@ fn app_host_move(
     }
 }
 
+fn app_host_rename_is_noop(source: &Path, requested_name: &str) -> bool {
+    source
+        .parent()
+        .is_some_and(|parent| parent.join(requested_name) == source)
+        || source
+            .file_name()
+            .is_some_and(|name| ui::os_str_canonically_eq(name, requested_name))
+}
+
 fn run_file_tree_host_io(
     request: ui::file_tree::FileTreeIoRequest,
     cancel: &std::sync::atomic::AtomicBool,
@@ -10184,10 +11757,10 @@ fn run_file_tree_host_io(
                 return Err(Error::InvalidName);
             }
             let source = source.into_path();
-            let destination = source.parent().ok_or(Error::InvalidPath)?.join(name);
-            if destination == source {
+            if app_host_rename_is_noop(&source, &name) {
                 return Ok(());
             }
+            let destination = source.parent().ok_or(Error::InvalidPath)?.join(name);
             app_host_rename_no_replace(&source, &destination).map_err(|error| {
                 if error.kind() == std::io::ErrorKind::AlreadyExists {
                     Error::Conflict
@@ -10380,9 +11953,9 @@ fn run_file_tree_listing(
         if items.len() >= max_items {
             return Err(Error::ListingTooLarge);
         }
-        let name = entry.file_name().to_string_lossy().into_owned();
+        let name = entry.file_name();
         bytes = bytes
-            .checked_add(name.len())
+            .checked_add(name.as_encoded_bytes().len())
             .filter(|bytes| *bytes <= max_bytes)
             .ok_or(Error::ListingTooLarge)?;
         let is_dir = entry
@@ -10513,6 +12086,19 @@ fn run_app_host_io(
         AppHostIoAction::Diff(intent) => {
             AppHostIoCompletion::Diff(ui::diff_panel::execute_io(intent))
         }
+        AppHostIoAction::GitPanel(intent) => {
+            AppHostIoCompletion::GitPanel(ui::git_panel::execute_io(intent))
+        }
+        AppHostIoAction::Transcript {
+            generation,
+            path,
+            kind,
+            focus_offset,
+        } => AppHostIoCompletion::Transcript {
+            generation,
+            focus_offset,
+            result: crate::agent_transcript::read_conversation(&path, kind),
+        },
         AppHostIoAction::PersistComposerHistory { path, history } => {
             if write_composer_history(&path, &history) {
                 AppHostIoCompletion::Complete
@@ -10748,6 +12334,35 @@ impl App {
                 self.diff_panel_ui.complete_io(completion);
                 self.egui_ctx.request_repaint();
             }
+            AppHostIoCompletion::GitPanel(completion) => {
+                // stale(세대 불일치)은 조용히 버린다 — 최신 요청의 완료만 반영한다.
+                if completion.generation == self.git_panel_generation {
+                    match completion.result {
+                        ui::git_panel::GitPanelIoResult::Snapshot(result) => {
+                            self.git_panel_ui.set_snapshot(result);
+                        }
+                        ui::git_panel::GitPanelIoResult::FileDiff(result) => match result {
+                            Ok(view) => self.diff_viewer_ui.set_view(view),
+                            Err(_) => self
+                                .diff_viewer_ui
+                                .set_view(ui::diff_viewer::FileDiffView::default()),
+                        },
+                    }
+                    self.egui_ctx.request_repaint();
+                }
+            }
+            AppHostIoCompletion::Transcript {
+                generation,
+                focus_offset,
+                result,
+            } => {
+                // stale(세대 불일치)은 조용히 버린다 — git 패널 IO와 같은 규칙.
+                if generation == self.transcript_generation {
+                    self.transcript_viewer_ui
+                        .set_conversation(result, Some(focus_offset));
+                    self.egui_ctx.request_repaint();
+                }
+            }
             AppHostIoCompletion::ComposerContextFile {
                 request,
                 selected_path,
@@ -10888,9 +12503,13 @@ impl App {
             self.file_tree_watcher = AppFileTreeWatcher::new(ctx.clone()).ok();
         }
         let submitted = match self.file_tree_watcher.as_mut() {
-            Some(watcher) => {
-                watcher.submit_replace(operation, generation, directories, ignored_prefixes, show_hidden)
-            }
+            Some(watcher) => watcher.submit_replace(
+                operation,
+                generation,
+                directories,
+                ignored_prefixes,
+                show_hidden,
+            ),
             None => Err(ui::file_tree::FileTreeMaintenanceErrorCode::WatchUnavailable),
         };
         // submitted == Ok(()) 인 경우 완료는 이 프레임에서 알 수 없다 — 워커가 백그라운드
@@ -10935,6 +12554,13 @@ impl App {
         }
         if !self.try_apply_pending_folder_picker_completion() {
             return;
+        }
+        // 슬롯이 차 있어 밀려났던 원문 보기 요청을 먼저 태운다 — 사용자 클릭이라
+        // 버리지 않는다(WorkHistoryAction::ShowTranscript 참조).
+        if self.pending_app_host_action.is_none()
+            && let Some(request) = self.pending_app_host_retry.take()
+        {
+            self.pending_app_host_action = Some(request);
         }
         let action = self
             .connector_coordinator
@@ -11128,10 +12754,11 @@ impl App {
         }
         let redaction = secret::RedactionService::new();
         let i18n = load_catalog(&config.i18n.locale);
-        // Complete crash reconciliation and one-time logical→physical migration before any
-        // runtime, dotenv, Connector, or settings worker can resolve a credential.
-        reconcile_and_migrate_startup_secrets(&db, &KeyringSecretStore)
-            .expect("physical secret startup reconciliation failed");
+        // Try crash reconciliation and one-time logical→physical migration before any runtime,
+        // dotenv, Connector, or settings worker can resolve a credential. A locked or foreign-ACL
+        // login keychain must not open a password dialog or abort the app; unresolved legacy
+        // pointers remain fail-closed and the durable ledger preserves exact retry state.
+        reconcile_startup_secrets_best_effort(&db, &KeyringSecretStore);
         let pending_approval_owner = Arc::new(
             db.acquire_pending_approval_owner()
                 .expect("pending approval owner acquire failed"),
@@ -11244,6 +12871,35 @@ impl App {
                 }
             },
             move || launcher_ctx.request_repaint(),
+        );
+        // 문서 탭 로드/저장 lane(설계 §4·§9 D1, 멀티 문서 탭 설계) — `document_io`는 UI
+        // 타입을 모르는 순수 동기 함수만 노출한다. 파일 I/O를 UI 프레임에서 하지
+        // 않도록 여기서 각각 자기 스레드로 돌린다. 잡/결과에 문서 id를 실어 보내 어느
+        // 문서의 결과인지 App 쪽에서 알 수 있게 한다(`document_io` 자체는 path를
+        // 결과에 담지 않는다).
+        let document_load_ctx = egui_ctx.clone();
+        let document_load_worker = crate::lazy_worker::LazyBoundedWorker::new(
+            "document-load",
+            std::time::Duration::from_secs(30),
+            || {
+                |(id, request): (
+                    ui::workspace::DocumentTabId,
+                    document_io::DocumentLoadRequest,
+                )| { (id, document_io::load_document(&request)) }
+            },
+            move || document_load_ctx.request_repaint(),
+        );
+        let document_save_ctx = egui_ctx.clone();
+        let document_save_worker = crate::lazy_worker::LazyBoundedWorker::new(
+            "document-save",
+            std::time::Duration::from_secs(30),
+            || {
+                |(id, request): (
+                    ui::workspace::DocumentTabId,
+                    document_io::DocumentSaveRequest,
+                )| { (id, document_io::save_document(request)) }
+            },
+            move || document_save_ctx.request_repaint(),
         );
         let dotenv_sync_worker =
             new_dotenv_sync_worker(db_path.clone(), redaction.clone(), egui_ctx.clone());
@@ -11407,7 +13063,7 @@ impl App {
             agent_launcher_snapshot: None,
             claude_direct_defaults: ClaudeDirectDefaults::default(),
             claude_direct_defaults_ignore_next_completion: false,
-            agent_launcher_detection_requested: false,
+            agent_launcher_detection_requested: true,
             agent_launcher_detection_in_flight: false,
             pending_agent_launcher_intent: None,
             next_agent_launcher_request_id: 0,
@@ -11420,9 +13076,33 @@ impl App {
                 })),
             pending_agent_sessions_action: None,
             diff_panel_ui: ui::diff_panel::DiffPanelUi::new(),
+            diff_viewer_ui: ui::diff_viewer::DiffViewerUi::default(),
+            git_panel_generation: 0,
+            git_panel_ui: ui::git_panel::GitPanelUi::default(),
+            git_panel_cwd: None,
+            git_tab: ui::workspace::PaneAuxTabState::default(),
+            git_tab_split_width: None,
             work_history_ui: ui::work_history::WorkHistoryUi::new(),
-            work_history_tab: ui::work_history::WorkHistoryTabState::default(),
+            work_history_tab: ui::workspace::PaneAuxTabState::default(),
+            work_history_tab_split_width: None,
+            document_tab: ui::workspace::PaneAuxTabState::default(),
+            documents: Vec::new(),
+            active_document: None,
+            next_document_tab_id: 0,
+            document_tab_split_width: None,
+            document_pending_loads: std::collections::VecDeque::new(),
+            document_load_inflight: None,
+            document_load_worker,
+            document_pending_saves: std::collections::VecDeque::new(),
+            document_save_inflight: None,
+            document_save_worker,
+            document_pending_confirms: std::collections::VecDeque::new(),
+            document_close_after_save: std::collections::HashSet::new(),
+            document_cap_notice: false,
+            document_markdown_viewer: ui::markdown_viewer::MarkdownViewer::new(),
+            pending_document_open: None,
             work_history_rows: Vec::new(),
+            work_history_rows_revision: 0,
             work_history_workspace_id: None,
             work_history_loading: false,
             work_history_error: None,
@@ -11437,6 +13117,9 @@ impl App {
             work_history_git_manual_refresh: false,
             work_history_git_manual_generation: None,
             pending_work_history_action: None,
+            transcript_viewer_ui: ui::transcript_viewer::TranscriptViewerUi::default(),
+            transcript_generation: 0,
+            aux_search: ui::aux_search::AuxSearchState::default(),
             agent_state_worker,
             agent_state_scope: initial_agent_state_scope,
             pending_agent_state_scope: None,
@@ -11454,6 +13137,7 @@ impl App {
             pending_connector_dispatch: None,
             app_host_io: None,
             pending_app_host_action: None,
+            pending_app_host_retry: None,
             pending_file_tree_maintenance: None,
             file_tree_watcher: None,
             pending_app_controller_action: None,
@@ -11572,15 +13256,18 @@ impl App {
             session_cwds: std::collections::HashMap::new(),
             agent_info: std::collections::HashMap::new(),
             agent_kinds: std::collections::HashMap::new(),
+            agent_vanish_last_kind: std::collections::HashMap::new(),
             pty_agent_pending: std::collections::HashMap::new(),
             pty_agent_queued: std::collections::HashMap::new(),
             pty_agent_surfaces_cache: Vec::new(),
             statuslines: std::collections::HashMap::new(),
             restore_agents: std::collections::HashMap::new(),
             restore_loaded_for: None,
+            global_resumable_panes: std::collections::HashSet::new(),
             resumed_panes: std::collections::HashSet::new(),
             resume_probe_pending_panes: std::collections::HashSet::new(),
             pending_focus: None,
+            pending_resume_agent: None,
             pending_pane_focus: None,
             pending_primary_pane_activation: None,
             pending_workspace_restore_delivery: std::collections::HashMap::with_capacity(
@@ -11600,6 +13287,9 @@ impl App {
             remote_reveal_token: false,
             web: None,
             web_error: None,
+            session_core: None,
+            relay_worker: None,
+            relay_error: None,
             web_reveal_url: false,
             web_qr: None,
             worktree_rx: None,
@@ -11650,6 +13340,11 @@ impl App {
                     app.web_error = Some(format!("{e:#}"));
                 }
             }
+        }
+        // Relay 자동 시작 — web과 **독립**이다. 한쪽이 실패해도 다른 쪽은 그대로 간다.
+        // 프로덕션 엔드포인트가 아직 배정되지 않아 현재는 Relay 범위 오류로만 끝난다.
+        if app.config.relay.enabled {
+            app.relay_enable();
         }
         app
     }
@@ -12304,16 +13999,18 @@ impl App {
                     || (saved.kind == kind.as_str()
                         && saved.agent_session_id == binding.session_id.as_str())
             });
-            let mut display = self.agent_info.get(&(instance, *session)).cloned().unwrap_or(
-                crate::agent_detect::AgentDisplay {
+            let mut display = self
+                .agent_info
+                .get(&(instance, *session))
+                .cloned()
+                .unwrap_or(crate::agent_detect::AgentDisplay {
                     kind: binding.kind,
                     model: None,
                     effort: None,
                     context_pct: None,
                     last_agent_summary: None,
                     user_instruction: None,
-                },
-            );
+                });
             apply_claude_statusline(&mut display, self.statuslines.get(&(instance, *session)));
             if let Some(running) = self.agent_kinds.get(&(instance, *session)) {
                 if display.model.is_none() {
@@ -12388,6 +14085,7 @@ impl App {
                     source_offset: turn.source_offset,
                     instruction: turn.instruction.clone(),
                     agent_summary: turn.agent_summary.clone(),
+                    messages_json: turn.messages_json(),
                     model: display.model.clone(),
                     effort: display.effort.clone(),
                     cwd,
@@ -12538,6 +14236,7 @@ impl App {
                 source_offset: row.source_offset,
                 instruction: row.instruction.clone(),
                 agent_summary: row.agent_summary.clone(),
+                messages_json: row.messages_json.clone(),
                 model: row.model.clone(),
                 effort: row.effort.clone(),
                 cwd: row.cwd.clone(),
@@ -12549,8 +14248,14 @@ impl App {
             });
         }
         self.work_history_git_manual_generation = None;
-        if !changed.is_empty() && !self.stage_work_history_rows(changed) {
-            self.work_history_git_force_refresh = true;
+        if !changed.is_empty() {
+            // `self.work_history_rows[index]`를 in-place로 고쳤다(branch/변경 수) —
+            // leaf 캐시가 이번 프레임에 새 값을 반영하도록 리비전을 올린다.
+            self.work_history_rows_revision =
+                self.work_history_rows_revision.wrapping_add(1).max(1);
+            if !self.stage_work_history_rows(changed) {
+                self.work_history_git_force_refresh = true;
+            }
         }
     }
 
@@ -12757,9 +14462,10 @@ impl App {
                 // 매 폴마다 지워진다.
                 let instance = self.active.runtime_instance;
                 self.statuslines.retain(|(rt, _), _| *rt != instance);
-                self.statuslines.extend(snapshot.statuslines.iter().filter_map(|row| {
-                    Some(((instance, session_id(&row.session_key)?), row.clone()))
-                }));
+                self.statuslines
+                    .extend(snapshot.statuslines.iter().filter_map(|row| {
+                        Some(((instance, session_id(&row.session_key)?), row.clone()))
+                    }));
                 self.push_agent_display();
             }
             crate::agent_state_worker::AgentStateSection::Attention => {
@@ -12850,6 +14556,11 @@ impl App {
                     .collect::<std::collections::HashMap<_, _>>();
                 self.restore_agents = rows.clone();
                 self.persisted_agents = rows;
+                // warm(비활성) 워크스페이스 행의 「이어가기」 노출 판정용 — 전 워크스페이스
+                // 스코프(2026-08-20). Restore 프로젝션이 돌 때마다 통째로 재구성한다
+                // (global_waiting/global_working과 동일한 관례).
+                self.global_resumable_panes =
+                    snapshot.global_agent_sessions.iter().cloned().collect();
                 self.archived_agent_resume = snapshot
                     .archived_agent_resume
                     .iter()
@@ -12931,6 +14642,11 @@ impl App {
             }
             crate::agent_state_worker::AgentStateSection::WorkHistory => {
                 self.work_history_rows.clone_from(&snapshot.work_turns);
+                // 통째로 새 스냅샷으로 갈아 끼웠다 — 내용이 실제로 같아도(드물지만
+                // 가능) 비교 없이 항상 올린다. 캐시가 가끔 불필요하게 무효화되는 건
+                // 무해하지만, 놓치면 leaf가 옛 카드 목록을 계속 보여주는 사고가 된다.
+                self.work_history_rows_revision =
+                    self.work_history_rows_revision.wrapping_add(1).max(1);
                 self.work_history_workspace_id = Some(self.active.id.clone());
                 self.work_history_loading = false;
                 self.work_history_error = None;
@@ -13268,6 +14984,10 @@ impl App {
             .collect();
         // 터미널 경로 더블클릭의 상대경로 해석용 — 같은 목록을 workspace UI에도 나른다.
         self.active.workspace_ui.set_session_pids(&sessions);
+        // 감지 결과 병합에서 "아직 살아 있는 세션"을 판정할 집합 — 결과에 빠진 세션의
+        // 마지막 표시값을 남길지, 죽은 세션이라 정리할지 가른다(아래 latest_info 병합).
+        let live_detect_sessions: std::collections::HashSet<runtime::SessionId> =
+            sessions.iter().map(|(session, _)| *session).collect();
         // 감지할 세션이 없으면 hook/statusline DB에도 접근하지 않는다. 캐시를 비워 두면
         // empty input의 latest-only worker가 thread/backend/repaint 모두 유휴 상태로 남는다.
         let bounded_refresh_due =
@@ -13344,9 +15064,21 @@ impl App {
         // 통과했으므로 항상 현재 self.active의 세션 집합을 가리킨다.
         let instance = self.active.runtime_instance;
         if let Some(info) = latest_info {
-            self.agent_info.retain(|(rt, _), _| *rt != instance);
-            self.agent_info
-                .extend(info.into_iter().map(|(session, display)| ((instance, session), display)));
+            // 감지 결과에 없는 세션의 마지막 표시값을 **지우지 않는다**. 워커의 pass는
+            // MAX_DETECT_SESSIONS로 잘리고(agent_detect_worker::bound_pass) 대기 세션은
+            // 갱신 대상에서 빠질 수 있어서, 통째로 갈아끼우면 그 세션의 활동 문구가
+            // 사라진다 — 그러면 사이드바 헤드라인이 폴더명으로 떨어져 "대기 상태로
+            // 두고 다른 세션에 갔다 오면 이름이 폴더명으로 바뀐다"가 된다
+            // (2026-08-19 사용자). 살아 있는 세션이 아닐 때만 정리해 무한정 쌓이는 것도 막는다.
+            self.agent_info.retain(|(rt, session), _| {
+                *rt != instance || live_detect_sessions.contains(session)
+            });
+            for (session, mut display) in info {
+                if let Some(previous) = self.agent_info.get(&(instance, session)) {
+                    carry_forward_agent_activity(&mut display, previous);
+                }
+                self.agent_info.insert((instance, session), display);
+            }
         }
         if let Some(kinds) = latest_kinds {
             let previous_for_instance: std::collections::HashMap<
@@ -13358,6 +15090,58 @@ impl App {
                 .filter(|((rt, _), _)| *rt == instance)
                 .map(|((_, session), running)| (*session, running.clone()))
                 .collect();
+            // 완료/실패 알림 겹④(최후의 그물) — exit sentinel(agent_launcher)도 화면
+            // regex도 결과를 못 낸 채 ps 스캔에서 에이전트 프로세스가 사라진 세션에
+            // 중립 알림을 한 번만 낸다. Done/Error가 아니다 — 그 둘 다 실패했을 때만
+            // 의미 있는 마지막 신호라서 notifications.rs가 SessionStatus 없이 native
+            // intent만 낸다(agent_detect::agent_vanished_sessions 문서 참고).
+            let resolved = |session: runtime::SessionId| {
+                matches!(
+                    self.active.workspace_ui.last_session_status(session),
+                    Some(runtime::SessionStatus::Done | runtime::SessionStatus::Error)
+                )
+            };
+            // ㉮ 지난 틱에 사라졌다고 적어 둔 것을 **이번 틱에서 재확인**한다. 다시
+            //    잡혔거나(한 틱 튄 것), 세션이 죽었거나, 그 사이 sentinel·regex가 결과를
+            //    냈으면 알리지 않고 조용히 지운다. 판정 조건이 ㉯와 완전히 같아서
+            //    (적어둘 때 있었고 · 지금 없고 · 세션은 살아 있고 · 아직 결과 없음)
+            //    이미 테스트된 같은 함수를 유예 목록에 그대로 적용한다 — 규칙이 두
+            //    벌이 되면 한쪽만 고쳐지는 사고가 난다.
+            let pending_for_instance: std::collections::HashMap<
+                runtime::SessionId,
+                crate::agent_detect::RunningAgent,
+            > = self
+                .agent_vanish_last_kind
+                .iter()
+                .filter(|((rt, _), _)| *rt == instance)
+                .map(|((_, session), running)| (*session, running.clone()))
+                .collect();
+            let confirmed = crate::agent_detect::agent_vanished_sessions(
+                &pending_for_instance,
+                &kinds,
+                &live_detect_sessions,
+                resolved,
+            );
+            self.agent_vanish_last_kind
+                .retain(|(rt, _), _| *rt != instance);
+            for session in confirmed {
+                if let Some(running) = pending_for_instance.get(&session) {
+                    let title = crate::agent_surface::AgentProvider::from(running.kind).label();
+                    self.notifications_ui.on_agent_vanished(title, &self.i18n);
+                }
+            }
+            // ㉯ 이번 틱에 새로 사라진 것은 **적어만 두고** 다음 틱에 재확인한다.
+            for session in crate::agent_detect::agent_vanished_sessions(
+                &previous_for_instance,
+                &kinds,
+                &live_detect_sessions,
+                resolved,
+            ) {
+                if let Some(running) = previous_for_instance.get(&session) {
+                    self.agent_vanish_last_kind
+                        .insert((instance, session), running.clone());
+                }
+            }
             if claude_defaults_refresh_needed(&previous_for_instance, &kinds) {
                 // 새 직접-실행 Claude 세션은 직전 런처 스냅샷을 재사용하면
                 // 설정 변경 전 값으로 단축키를 보낼 수 있다. 먼저 무효화하고 worker
@@ -13368,8 +15152,11 @@ impl App {
                 self.agent_launcher_detection_requested = true;
             }
             self.agent_kinds.retain(|(rt, _), _| *rt != instance);
-            self.agent_kinds
-                .extend(kinds.into_iter().map(|(session, running)| ((instance, session), running)));
+            self.agent_kinds.extend(
+                kinds
+                    .into_iter()
+                    .map(|(session, running)| ((instance, session), running)),
+            );
         }
         // 에이전트 표시정보 최종본(claude는 statusLine으로 effort/model/context 병합) →
         // WorkspaceUi. statuslines가 매 1s 갱신되므로 매 poll에서 병합해 최신을 반영한다.
@@ -13518,6 +15305,25 @@ impl App {
         let Some(extra_args) = target.extra_args else {
             return false;
         };
+        // App Server(구조화 Agent Sessions 패널)가 같은 codex thread를 이미 writer로
+        // 붙잡고 있으면 PTY에서 `codex resume`을 또 실행하지 않는다 — codex의 rollout
+        // 파일은 writer 하나만 허용해 -32600으로 거부한다. 대신 이미 열려 있는 구조화
+        // 세션으로 옮겨 대화가 실제로 이어지게 한다.
+        let row = archived_agent_row_for_session(&mux, &self.archived_agent_resume, session);
+        if let Some(local_session_id) = attached_app_server_conflict(row, |thread_id| {
+            self.agent_sessions_ui
+                .attached_local_session_for_thread(thread_id)
+                .map(str::to_owned)
+        }) {
+            if self.agent_sessions_ui.open_session(&local_session_id) {
+                self.egui_ctx.request_repaint();
+            } else {
+                // 거의 발생하지 않는 레이스(attach는 됐는데 로컬 세션 항목이 사라짐) —
+                // 원문 codex 에러 대신 이해할 수 있는 안내를 보여준다.
+                self.agent_sessions_ui.report_thread_attached_elsewhere();
+            }
+            return true;
+        }
         let command = runtime::RuntimeCommand::RespawnArchivedAgent {
             session,
             extra_args,
@@ -13526,6 +15332,83 @@ impl App {
             scrollback_lines: self.config.terminal.scrollback_lines as usize,
         };
         self.active.runtime.send_command(command).is_ok()
+    }
+
+    /// PR-resume-without-pane(2026-08-19): work history 카드에서 「이어서 하기」를
+    /// 눌렀는데 살아 있는 pane이 없는 archived 대화를 **새 pane**에서 이어간다.
+    /// `resolve_work_history_activation`이 이미 `agent_resume::resume_plan`으로
+    /// `extra_args`를 확정해 넘긴다 — 여기서 CLI 플래그를 다시 판정하지 않는다
+    /// (`dispatch_respawn_archived_agent`와 규칙 공유, 두 벌 방지).
+    ///
+    /// 명령 조립은 Agent Launcher의 새 실행 파이프라인이 쓰는 `build_launch_spec`을
+    /// 그대로 탄다(`handle_agent_launcher_intent`의 `Launch` 분기와 동일한 executable
+    /// 감지·shim 배선) — 그 뒤 이어가기 플래그만 덧붙인다. 모델/강도는 재지정하지
+    /// 않는다(빈 model, effort 없음): 이어갈 대화가 이미 자기 모델을 알고 있어 CLI
+    /// 기본값으로 충분하고, 원래 세션의 정확한 model/effort는 이력 행에 없다(단순화).
+    /// cwd도 지정하지 않는다 — `RuntimeCommand::SpawnAgent`는 항상 워크스페이스
+    /// 현재 cwd에서 뜬다(「새로 실행」과 동일한 기존 제약, PreparedAgentLaunch에도
+    /// cwd 필드가 없다).
+    fn dispatch_resume_archived_agent_new_pane(
+        &mut self,
+        kind: crate::agent_launcher::AgentKind,
+        extra_args: Vec<String>,
+        native_session_id: &str,
+    ) -> bool {
+        // 살아 있는 pane 경로(dispatch_respawn_archived_agent)와 **같은 판정**을 먼저
+        // 거친다. App Server가 그 codex thread를 이미 writer로 쥐고 있으면 새 PTY로
+        // `codex resume`을 또 띄워봐야 rollout 파일의 writer가 하나뿐이라
+        // `-32600 already has an active writer`로 거부된다 — pane이 없다고 해서
+        // 그 제약이 사라지지는 않는다(2026-08-19 코드 리뷰에서 이 경로의 누락 발견).
+        if kind.id() == "codex"
+            && let Some(local_session_id) = self
+                .agent_sessions_ui
+                .attached_local_session_for_thread(native_session_id)
+                .map(str::to_owned)
+        {
+            if self.agent_sessions_ui.open_session(&local_session_id) {
+                self.egui_ctx.request_repaint();
+            } else {
+                self.agent_sessions_ui.report_thread_attached_elsewhere();
+            }
+            return true;
+        }
+        let Some(agent) = self
+            .agent_launcher_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.find(kind))
+        else {
+            return false;
+        };
+        let shim = (self.config.ui.agent_status_hooks && kind.supports_deppy_shim())
+            .then(crate::agent_shim::shim_dir)
+            .flatten()
+            .map(|directory| directory.join(kind.id()));
+        let options = crate::agent_launcher::LaunchOptions {
+            model: String::new(),
+            effort: None,
+            yolo: false,
+        };
+        let Ok(spec) = crate::agent_launcher::build_launch_spec(agent, options, shim.as_deref())
+        else {
+            return false;
+        };
+        let (_, command, mut args, env_plain) = spec.into_parts();
+        args.extend(extra_args);
+        let runtime_command = runtime::RuntimeCommand::SpawnAgent {
+            agent_config_id: Some(kind.stable_config_id().to_owned()),
+            cols: 80,
+            rows: 24,
+            scrollback_lines: self.config.terminal.scrollback_lines as usize,
+            command,
+            args,
+            env_plain,
+            env_secrets: Vec::new(),
+            waiting_regex: None,
+            approval_regex: None,
+            error_regex: None,
+            done_regex: None,
+        };
+        self.active.runtime.send_command(runtime_command).is_ok()
     }
 
     fn pty_agent_surfaces(
@@ -13555,17 +15438,22 @@ impl App {
                 // 사이드바(`push_agent_display`)와 **같은 병합**을 거쳐야 한다. claude는
                 // transcript에 effort가 아예 없고 statusLine에만 있어서, 병합을 건너뛰면
                 // effort가 영영 None이고 강도 단축키가 조용히 아무것도 안 한다.
-                let mut display = self.agent_info.get(&(instance, session_id)).cloned().unwrap_or(
-                    crate::agent_detect::AgentDisplay {
+                let mut display = self
+                    .agent_info
+                    .get(&(instance, session_id))
+                    .cloned()
+                    .unwrap_or(crate::agent_detect::AgentDisplay {
                         kind,
                         model: None,
                         effort: None,
                         context_pct: None,
                         last_agent_summary: None,
                         user_instruction: None,
-                    },
+                    });
+                apply_claude_statusline(
+                    &mut display,
+                    self.statuslines.get(&(instance, session_id)),
                 );
-                apply_claude_statusline(&mut display, self.statuslines.get(&(instance, session_id)));
                 // statusLine은 1시간 창으로 만료된다(STATUSLINES_PREFIX_PREFLIGHT).
                 // 오래 유휴한 세션에서는 값이 통째로 사라져 강도·모델 단축키가 "현재
                 // 값을 몰라" 아무것도 못 한다(2026-08-03 실증: 7시간 전 행이 걸러짐).
@@ -13889,22 +15777,82 @@ impl App {
         self.session_cwds.get(&session).cloned()
     }
 
-    fn open_session_diff(&mut self, ctx: &egui::Context, session: runtime::SessionId) {
-        let cwd = self.cached_session_cwd(session);
-        let workspace_name = self
-            .workspaces
-            .iter()
-            .find(|workspace| workspace.id == self.active.id)
-            .map(Self::workspace_display_name);
-        let session_label = self.inbox_session_label(&self.active.id, session);
-        let title = match (workspace_name, session_label) {
-            (Some(workspace), Some(session)) => format!("{workspace} · {session}"),
-            (Some(workspace), None) => workspace,
-            (None, Some(session)) => session,
-            (None, None) => String::new(),
+    /// Git 보조 탭을 **새로** 여는 경로(레일 「Git」·pane 헤더 탭 클릭)가 쓰는 cwd —
+    /// 포커스된 세션 기준(2026-08-15, Task 10 Step 6). `ShowDiff{session}`(세션 메뉴
+    /// 「변경 보기」)은 더 이상 이 값으로 수렴하지 않는다 — 포커스가 다른 세션에 있으면
+    /// 엉뚱한 repo가 뜨는 회귀가 있어 그 세션 고유 cwd로 고정하게 바뀌었다(2026-08-15
+    /// 회귀 수정). ⟳ 새로고침·파일 diff처럼 **이미 열린** 패널을 다루는 경로는 이 값을
+    /// 다시 묻지 않고 `git_panel_cwd`(패널이 지금 보여주는 repo)를 쓴다(2026-08-16,
+    /// 항목 3 — 안 그러면 ⟳가 포커스 세션 쪽으로 조용히 갈아탄다).
+    fn focused_session_repo_cwd(&self) -> Option<PathBuf> {
+        let session = self.active.workspace_ui.focused_session()?;
+        self.cached_session_cwd(session).map(PathBuf::from)
+    }
+
+    /// git 패널 IO를 기존 `pending_app_host_action` capacity-1 큐(2026-08-15 Task 10)에
+    /// 태운다. 포커스 세션 기준 cwd로 요청한다(Git 탭 새로고침/원격 열기/파일 diff).
+    /// 특정 세션의 cwd를 써야 하는 호출부(세션 행 「변경 보기」 메뉴)는
+    /// `request_git_panel_io_at`을 직접 쓴다(2026-08-15 회귀 수정).
+    fn request_git_panel_io(
+        &mut self,
+        ctx: &egui::Context,
+        request: ui::git_panel::GitPanelIoRequest,
+    ) {
+        let cwd = self.focused_session_repo_cwd();
+        self.request_git_panel_io_at(ctx, cwd, request);
+    }
+
+    /// `request_git_panel_io`의 cwd 인자 버전 — cwd를 못 찾으면(repo 미감지) IO 없이
+    /// 바로 NoRepo 스냅샷을 밀어넣는다(조용한 실패 금지, 패널은 항상 무언가를 보여준다).
+    fn request_git_panel_io_at(
+        &mut self,
+        ctx: &egui::Context,
+        cwd: Option<PathBuf>,
+        request: ui::git_panel::GitPanelIoRequest,
+    ) {
+        let Some(cwd) = cwd else {
+            // repo를 못 찾았다 — 고정도 함께 푼다(옛 repo에 붙잡히지 않게).
+            self.git_panel_cwd = None;
+            self.git_panel_ui
+                .set_snapshot(Err(ui::git_panel::GitPanelErrorCode::NoRepo));
+            return;
         };
-        self.diff_panel_ui
-            .open_for(ctx, self.active.id.clone(), session, cwd, title);
+        self.git_panel_generation = self.git_panel_generation.wrapping_add(1).max(1);
+        let action = AppHostIoAction::GitPanel(ui::git_panel::GitPanelIoIntent {
+            generation: self.git_panel_generation,
+            cwd: cwd.clone(),
+            request,
+        });
+        // 공유 capacity-1 슬롯이 차 있어도 **버리지 않는다**. 「변경 보기」·⟳·파일 diff는
+        // 전부 사용자 클릭이라 되살릴 주체가 없고, 예전처럼 조용히 건너뛰면 화면은 옛
+        // repo인데 고정 cwd만 새 repo로 바뀌어 ⟳가 설명 없이 튀었다(2026-08-17 리뷰).
+        // 대기 슬롯에 얹어 다음 프레임에 태운다(원문 보기와 같은 규칙, latest-only).
+        if self.pending_app_host_action.is_none() {
+            self.pending_app_host_action = Some(action);
+        } else {
+            self.pending_app_host_retry = Some(action);
+        }
+        // 패널이 지금 보여주는(요청 중인) repo cwd — ⟳·파일 diff 재요청이 포커스 세션을
+        // 다시 묻지 않고 이 값을 쓴다(`resolve_git_refresh_cwd`). **요청이 실제로 큐나
+        // 대기 슬롯에 올라간 뒤에만** 갱신한다.
+        self.git_panel_cwd = Some(cwd);
+        ctx.request_repaint();
+        self.git_panel_ui.set_loading();
+    }
+
+    /// ↗ 클릭 — upstream이 GitHub remote면 브랜치 페이지를 연다. remote 조회는 이미
+    /// 스냅샷 수집 시점에 끝나 있어(`GitPanelSnapshot::remote_https_base`) 여기서는
+    /// IO 없이 즉시 URL을 구성한다(스펙 §4, Task 10 Step 7).
+    fn open_git_panel_remote(&mut self, ctx: &egui::Context) {
+        let Some((base, branch)) = self.git_panel_ui.remote_target() else {
+            tracing::info!(kind = "git_panel", "non-github remote — open skipped");
+            return;
+        };
+        let url = format!("{base}/tree/{}", github_branch_url_path(&branch));
+        if self.pending_app_host_action.is_none() && is_bounded_https_url(&url) {
+            self.pending_app_host_action = Some(AppHostIoAction::ExternalHttpsUrl(url));
+            ctx.request_repaint();
+        }
     }
 
     fn resolve_work_history_activation(
@@ -13993,65 +15941,754 @@ impl App {
         let Some(snapshot) = self.agent_launcher_snapshot.as_ref() else {
             return AppWorkHistoryActivation::Disabled(Disabled::Checking);
         };
-        if snapshot.find(kind).is_some() {
-            AppWorkHistoryActivation::NewRun(kind)
-        } else {
-            AppWorkHistoryActivation::Disabled(Disabled::AgentUnavailable)
+        if snapshot.find(kind).is_none() {
+            return AppWorkHistoryActivation::Disabled(Disabled::AgentUnavailable);
+        }
+        // 살아 있는 pane이 없다(위 mux 루프가 아무것도 못 찾았거나 mux 자체가 없다) —
+        // PR-resume-without-pane: 이력 행의 kind + agent_sessions 바인딩만으로 정확한
+        // 재개가 가능한지 마지막으로 확인한다. pane_id는 mux 존재와 무관하게 워크스페이스
+        // 전체에서 로드된 값이라(§resume_without_pane_plan 문서) 여기까지 와도 유효하다.
+        let binding = self
+            .restore_agents
+            .get(&row.pane_id)
+            .map(|saved| (saved.kind.as_str(), saved.session_id.as_str()));
+        let native_session_id = binding.map(|(_, session_id)| session_id.to_owned());
+        match (resume_without_pane_plan(kind, binding), native_session_id) {
+            (Some(extra_args), Some(native_session_id)) => {
+                AppWorkHistoryActivation::ResumeArchivedNoPane {
+                    kind,
+                    extra_args,
+                    native_session_id,
+                }
+            }
+            _ => AppWorkHistoryActivation::NewRun(kind),
         }
     }
 
-    fn work_history_presentations(&self) -> Vec<ui::work_history::WorkHistoryActionPresentation> {
-        self.work_history_rows
-            .iter()
-            .map(|row| ui::work_history::WorkHistoryActionPresentation {
-                identity: ui::work_history::WorkTurnIdentity::from(row),
-                primary: self.resolve_work_history_activation(row).presentation(),
-                show_diff: row.cwd.as_deref().is_some_and(|cwd| {
-                    Path::new(cwd).is_absolute()
-                        && cwd.len() <= APP_HOST_PATH_MAX_BYTES
-                        && !cwd.as_bytes().contains(&0)
-                }),
-            })
-            .collect()
-    }
-
-    /// 이력 본문을 **세션 pane의 body rect 그대로**에 그린다. 탭 스트립은 WorkspaceUi가
-    /// 이미 잘라낸 뒤 넘긴 rect라, 여기서 헤더 높이를 다시 빼지 않는다.
+    /// 이력 본문 — 좌 카드 목록 / 우 원문 마스터-디테일(2026-08-15 Task 10, 스펙 §2-1).
+    /// **세션 pane의 body rect 그대로**에 그린다. 탭 스트립은 WorkspaceUi가 이미 잘라낸
+    /// 뒤 넘긴 rect라, 여기서 헤더 높이를 다시 빼지 않는다. 폭 규칙·구분선 관례는
+    /// `render_git_tab_body`와 같다 — 카드가 git 파일 행보다 정보가 많아 하한만 다르다
+    /// (`history_tab_list_width`).
     fn render_work_history_tab_body(
         &mut self,
         ui: &mut egui::Ui,
         body: egui::Rect,
-        presentations: &[ui::work_history::WorkHistoryActionPresentation],
         workspace_name: &str,
         current_branch: Option<&str>,
         text: &i18n::Catalog,
     ) -> Option<ui::work_history::WorkHistoryAction> {
+        // 보조 검색 바 — 열려 있을 때만 본문 상단 전폭에 그리고, 그 아래 남은 rect를
+        // 기존 좌우 마스터-디테일에 넘긴다. total/truncated는 우측 원문 뷰어의
+        // `search_summary()`에서 가져온다 — 그 값은 **직전 프레임** 캐시라(질의가 막
+        // 바뀐 프레임만 1프레임 지연) 반드시 검색 바를 먼저 그린 뒤에 그 결과로
+        // `render`를 불러야 한다(transcript_viewer.rs `search_summary` 문서의 계약).
+        let (search_total, search_truncated) = self.transcript_viewer_ui.search_summary();
+        let body = if self.aux_search.open {
+            let mut bar = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(body)
+                    .id_salt("work_history_aux_search_bar"),
+            );
+            bar.set_clip_rect(body.intersect(ui.clip_rect()));
+            if let Some(action) = ui::aux_search::search_bar(
+                &mut bar,
+                &self.aux_search,
+                search_total,
+                search_truncated,
+                text,
+            ) {
+                apply_aux_search_action(&mut self.aux_search, action, search_total);
+            }
+            // `bar`는 body 안에 고정된 max_rect의 child라 검색 바가 소비한 세로
+            // 공간만큼 커서가 내려가 있다 — 남은 영역이 곧 마스터-디테일에 넘길 rect다.
+            bar.available_rect_before_wrap()
+        } else {
+            body
+        };
+        let filter = if self.aux_search.is_active() {
+            self.aux_search.query.as_str()
+        } else {
+            ""
+        };
+
+        let auto_list_width = history_tab_list_width(body.width());
+        let list_width = aux_split_width(
+            self.work_history_tab_split_width,
+            auto_list_width,
+            body.width(),
+            HISTORY_TAB_LIST_MIN_WIDTH,
+        );
+        let (list_rect, transcript_rect) = body.split_left_right_at_x(body.left() + list_width);
+
         let mut child = ui.new_child(
             egui::UiBuilder::new()
-                .max_rect(body)
+                .max_rect(list_rect)
                 .id_salt("work_history_pane_tab"),
         );
-        child.set_clip_rect(body.intersect(ui.clip_rect()));
+        child.set_clip_rect(list_rect.intersect(ui.clip_rect()));
         // leaf는 storage 크레이트를 모른다 — 렌더 직전에 빌린 뷰만 만들어 넘긴다.
         // `self.work_history_rows`(공유 대여)와 `self.work_history_ui`(가변 대여)는
         // 서로 다른 필드라 아래처럼 직접 필드로 접근하는 한 동시에 빌릴 수 있다.
+        //
+        // `rows`와 `presentations`를 **한 번의 순회에서 같이** 만든다 — 예전에는
+        // `work_history_presentations()`가 별도로 전체 행을 순회하며 매 행마다
+        // `WorkTurnIdentity::from(row)`(String 4개)를 할당해 프레임당 1,024개
+        // (256행 × 4)를 만들었다(2026-08-19 계측). presentation은 카드가 펼쳐졌을
+        // 때만 읽히고(`render_card`의 `if expanded` 블록), 눌렸을 때 필요한 identity는
+        // 그 자리에서 들고 있는 row로 즉석에서 만들면 되므로 여기선 identity를 아예
+        // 담지 않는다(`WorkHistoryActionPresentation` 문서 참고). 대신 `rows[i]`와
+        // `presentations[i]`가 항상 같은 턴을 가리키도록 **같은 순회에서 함께**
+        // 만들어 인덱스 정합을 자명하게 보장한다 — leaf는 이 인덱스로 O(1) 조회한다
+        // (문자열 4개를 비교하는 선형 탐색이 없다, 스펙 이슈 #2).
+        let mut presentations: Vec<ui::work_history::WorkHistoryActionPresentation> =
+            Vec::with_capacity(self.work_history_rows.len());
         let rows: Vec<ui::work_history::WorkHistoryRow<'_>> = self
             .work_history_rows
             .iter()
-            .map(ui::work_history::WorkHistoryRow::from)
+            .map(|row| {
+                presentations.push(ui::work_history::WorkHistoryActionPresentation {
+                    primary: self.resolve_work_history_activation(row).presentation(),
+                    show_diff: row.cwd.as_deref().is_some_and(|cwd| {
+                        Path::new(cwd).is_absolute()
+                            && cwd.len() <= APP_HOST_PATH_MAX_BYTES
+                            && !cwd.as_bytes().contains(&0)
+                    }),
+                });
+                ui::work_history::WorkHistoryRow::from(row)
+            })
             .collect();
-        self.work_history_ui.show(
+        let action = self.work_history_ui.show(
             &mut child,
             ui::work_history::WorkHistorySnapshot {
                 workspace_name,
                 current_branch,
                 rows: &rows,
+                rows_revision: self.work_history_rows_revision,
                 loading: self.work_history_loading,
                 error: self.work_history_error,
             },
-            presentations,
+            &presentations,
             text,
-        )
+            filter,
+        );
+
+        // 목록/원문 경계 세로 구분선 — 드래그로 폭 조절(2026-08-16 사용자: 가로 폭을
+        // 조절할 수 없다). 드래그 누적은 cross-workspace 분할선과 같은 패턴이다 —
+        // `drag_started()`에서 시작 폭을 `ctx.data_mut`에 저장하고 `total_drag_delta()`로
+        // 시작 폭 기준 절대 계산한다(`primary_divider_requested_width` 참고: 매 프레임
+        // `pointer.delta()`를 누적하면 드리프트가 생긴다).
+        let divider_hit_rect = egui::Rect::from_min_max(
+            egui::pos2(list_rect.right() - 3.0, body.top()),
+            egui::pos2(list_rect.right() + 3.0, body.bottom()),
+        );
+        let resize_id = ui.id().with("work_history_tab_split_resize");
+        let resize_response = ui
+            .interact(divider_hit_rect, resize_id, egui::Sense::drag())
+            .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+        let resize_start_id = resize_id.with("drag_start_width");
+        if resize_response.drag_started() {
+            ui.ctx()
+                .data_mut(|data| data.insert_temp(resize_start_id, list_width));
+        }
+        if let Some(total_drag_delta) = resize_response.total_drag_delta() {
+            let start_width = ui
+                .ctx()
+                .data(|data| data.get_temp::<f32>(resize_start_id))
+                .unwrap_or(list_width);
+            self.work_history_tab_split_width =
+                aux_divider_requested_width(start_width, total_drag_delta.x);
+            ui.ctx().request_repaint();
+        }
+        if resize_response.drag_stopped() {
+            ui.ctx()
+                .data_mut(|data| data.remove::<f32>(resize_start_id));
+        }
+        // 구분선 색 — 기본은 designall::separator_stroke, hover/drag는 사이드바 리사이즈와
+        // 같은 규칙(file_tree.rs의 file_tree_sidebar_resize 참고).
+        let separator = if resize_response.dragged() {
+            ui.visuals().widgets.active.bg_stroke
+        } else if resize_response.hovered() {
+            ui.visuals().widgets.hovered.bg_stroke
+        } else {
+            ui::designall::separator_stroke(ui.visuals())
+        };
+        let ppp = ui.ctx().pixels_per_point();
+        let sep_x = ui::snap_line_to_pixel(
+            ui::designall::panel_edge_separator_x(list_rect.right(), ppp),
+            separator.width,
+            ppp,
+        );
+        ui.painter().vline(sep_x, body.y_range(), separator);
+
+        let mut transcript = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(transcript_rect.shrink2(egui::vec2(6.0, 0.0)))
+                .id_salt("work_history_transcript_pane_tab"),
+        );
+        transcript.set_clip_rect(transcript_rect.intersect(ui.clip_rect()));
+        let search = self
+            .aux_search
+            .is_active()
+            .then_some((self.aux_search.query.as_str(), self.aux_search.active));
+        self.transcript_viewer_ui
+            .render(&mut transcript, text, search);
+
+        action
+    }
+
+    /// Git 보조 탭 본문 — 좌 목록 / 우 diff 마스터-디테일(스펙 §8-3). 이력 본문
+    /// (`render_work_history_tab_body`)과 같은 자리에 같은 규칙으로 그린다.
+    fn render_git_tab_body(
+        &mut self,
+        ui: &mut egui::Ui,
+        body: egui::Rect,
+        text: &i18n::Catalog,
+    ) -> Option<ui::git_panel::GitPanelAction> {
+        // 보조 검색 바 — render_work_history_tab_body와 같은 규칙. total/truncated는
+        // 우측 diff 뷰어의 `search_summary()`(직전 프레임 캐시)에서 가져온다.
+        let (search_total, search_truncated) = self.diff_viewer_ui.search_summary();
+        let body = if self.aux_search.open {
+            let mut bar = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(body)
+                    .id_salt("git_tab_aux_search_bar"),
+            );
+            bar.set_clip_rect(body.intersect(ui.clip_rect()));
+            if let Some(action) = ui::aux_search::search_bar(
+                &mut bar,
+                &self.aux_search,
+                search_total,
+                search_truncated,
+                text,
+            ) {
+                apply_aux_search_action(&mut self.aux_search, action, search_total);
+            }
+            bar.available_rect_before_wrap()
+        } else {
+            body
+        };
+        let filter = if self.aux_search.is_active() {
+            self.aux_search.query.as_str()
+        } else {
+            ""
+        };
+
+        let auto_list_width = git_tab_list_width(body.width());
+        // 180.0 = git_tab_list_width의 MIN과 같은 값(파일 목록 좌측 최소 폭).
+        let list_width = aux_split_width(
+            self.git_tab_split_width,
+            auto_list_width,
+            body.width(),
+            GIT_TAB_LIST_MIN_WIDTH,
+        );
+        let (list_rect, diff_rect) = body.split_left_right_at_x(body.left() + list_width);
+
+        let mut list = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(list_rect)
+                .id_salt("git_panel_pane_tab"),
+        );
+        list.set_clip_rect(list_rect.intersect(ui.clip_rect()));
+        let action = self.git_panel_ui.render(&mut list, text, filter);
+
+        // 목록/diff 경계 세로 구분선 — 드래그로 폭 조절(2026-08-16 사용자: 가로 폭을
+        // 조절할 수 없다). 드래그 누적은 cross-workspace 분할선과 같은 패턴이다 —
+        // `drag_started()`에서 시작 폭을 `ctx.data_mut`에 저장하고 `total_drag_delta()`로
+        // 시작 폭 기준 절대 계산한다(`primary_divider_requested_width` 참고: 매 프레임
+        // `pointer.delta()`를 누적하면 드리프트가 생긴다).
+        let divider_hit_rect = egui::Rect::from_min_max(
+            egui::pos2(list_rect.right() - 3.0, body.top()),
+            egui::pos2(list_rect.right() + 3.0, body.bottom()),
+        );
+        let resize_id = ui.id().with("git_tab_split_resize");
+        let resize_response = ui
+            .interact(divider_hit_rect, resize_id, egui::Sense::drag())
+            .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+        let resize_start_id = resize_id.with("drag_start_width");
+        if resize_response.drag_started() {
+            ui.ctx()
+                .data_mut(|data| data.insert_temp(resize_start_id, list_width));
+        }
+        if let Some(total_drag_delta) = resize_response.total_drag_delta() {
+            let start_width = ui
+                .ctx()
+                .data(|data| data.get_temp::<f32>(resize_start_id))
+                .unwrap_or(list_width);
+            self.git_tab_split_width = aux_divider_requested_width(start_width, total_drag_delta.x);
+            ui.ctx().request_repaint();
+        }
+        if resize_response.drag_stopped() {
+            ui.ctx()
+                .data_mut(|data| data.remove::<f32>(resize_start_id));
+        }
+        // 구분선 색 — 기본은 designall::separator_stroke, hover/drag는 사이드바 리사이즈와
+        // 같은 규칙(file_tree.rs의 file_tree_sidebar_resize 참고).
+        let separator = if resize_response.dragged() {
+            ui.visuals().widgets.active.bg_stroke
+        } else if resize_response.hovered() {
+            ui.visuals().widgets.hovered.bg_stroke
+        } else {
+            ui::designall::separator_stroke(ui.visuals())
+        };
+        let ppp = ui.ctx().pixels_per_point();
+        let sep_x = ui::snap_line_to_pixel(
+            ui::designall::panel_edge_separator_x(list_rect.right(), ppp),
+            separator.width,
+            ppp,
+        );
+        ui.painter().vline(sep_x, body.y_range(), separator);
+
+        let mut detail = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(diff_rect.shrink2(egui::vec2(6.0, 0.0)))
+                .id_salt("git_diff_pane_tab"),
+        );
+        detail.set_clip_rect(diff_rect.intersect(ui.clip_rect()));
+        let search = self
+            .aux_search
+            .is_active()
+            .then_some((self.aux_search.query.as_str(), self.aux_search.active));
+        self.diff_viewer_ui.render(&mut detail, text, search);
+        action
+    }
+
+    /// 보조 본문(이력·Git)이 보이려면 중앙이 Terminal 뷰여야 한다 — 홈/작업 페이지
+    /// 위에서 레일을 눌러도 탭이 있는 작업면으로 먼저 돌아온다.
+    fn reveal_terminal_view_for_aux_tab(&mut self) {
+        self.agent_terminal_ui
+            .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
+    }
+
+    /// 문서 탭 본문 — 툴바 + source 편집기/Preview/Split(설계 §3·§5·§6). 본문 자체는
+    /// leaf(`ui::document`·`ui::markdown_viewer`)가 그리고, 여기서는 상태 판정과
+    /// 액션 적용만 한다(leaf는 intent만 돌려준다).
+    fn render_document_tab_body(
+        &mut self,
+        ui: &mut egui::Ui,
+        body: egui::Rect,
+        text: &i18n::Catalog,
+    ) {
+        let Some(id) = self.active_document else {
+            return;
+        };
+        let Some(document) = self.documents.iter().find(|document| document.id == id) else {
+            return;
+        };
+        let mode = document.mode;
+        let show_mode_toggle = document.supports_preview();
+        let can_save = document.can_save();
+        let status_text = self.document_toolbar_status_text(id, text);
+        let load_state = document.load_state.clone();
+        let workspace_root = self.active_tree_root().unwrap_or_else(|| {
+            document
+                .path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_default()
+        });
+        let base_directory = document
+            .path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        // 슬롯을 문서 id로 만든다 — 안 그러면 문서마다 다른 캐시가 아니라 하나를
+        // 나눠 써서 문서 A의 Preview 렌더 캐시가 문서 B에 그대로 보이는 사고가 난다
+        // (멀티 문서 탭 설계 §2, 예전에는 슬롯이 고정값 하나였다).
+        let slot = ui::markdown_viewer::MarkdownDocumentSlot(u64::from(id.0));
+        let revision = ui::markdown_viewer::MarkdownSourceRevision(document.source_revision);
+
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(body)
+                .id_salt("document_tab_body"),
+        );
+        child.set_clip_rect(body.intersect(ui.clip_rect()));
+
+        let mut toolbar_action = None;
+        let mut editor_changed = false;
+        let mut link_intent = None;
+        let mut split_width: Option<f32> = None;
+        let mut open_with_os_clicked = false;
+        let mut toolbar_separator_y: Option<f32> = None;
+
+        child.vertical(|ui| {
+            // 툴바와 구분선 사이에 기본 item_spacing이 들어가면, 툴바 텍스트 **아래에만**
+            // 여백이 더 붙어 글자가 위로 밀려 보인다(2026-08-22 사용자 지적). 이 세로
+            // 컨테이너에서는 간격을 0으로 두고 필요한 여백은 각자 프레임이 갖는다.
+            ui.spacing_mut().item_spacing.y = 0.0;
+            if matches!(load_state, DocumentLoadState::Loaded { .. }) {
+                toolbar_action = ui::document::toolbar(
+                    ui,
+                    &ui::document::DocumentToolbarSnapshot {
+                        mode,
+                        show_mode_toggle,
+                        can_save,
+                        status_text,
+                    },
+                    text,
+                );
+                // 툴바 아래 구분선은 **긋지 않는다**(2026-08-23 사용자 요청) — 툴바가
+                // 헤더와 같은 면이고 본문은 다른 단이라, 선이 없어도 경계가 보인다.
+                // 나란히 모드의 세로 분리선은 툴바 바로 아래(본문 시작)에서 시작한다.
+                toolbar_separator_y = Some(ui.cursor().top());
+            }
+
+            match &load_state {
+                DocumentLoadState::Loading => {
+                    ui.centered_and_justified(|ui| ui.label(text.t("document.loading", &[])));
+                }
+                DocumentLoadState::Refused { byte_len } => {
+                    ui.centered_and_justified(|ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.label(text.t(
+                                "document.limit.refused",
+                                &[("bytes", &byte_len.to_string())],
+                            ));
+                            ui.add_space(8.0);
+                            if ui.button(text.t("file_tree.open_with_os", &[])).clicked() {
+                                open_with_os_clicked = true;
+                            }
+                        });
+                    });
+                }
+                DocumentLoadState::Binary { byte_len } => {
+                    ui.centered_and_justified(|ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                text.t(
+                                    "document.limit.binary",
+                                    &[("bytes", &byte_len.to_string())],
+                                ),
+                            );
+                            ui.add_space(8.0);
+                            if ui.button(text.t("file_tree.open_with_os", &[])).clicked() {
+                                open_with_os_clicked = true;
+                            }
+                        });
+                    });
+                }
+                DocumentLoadState::Failed { code } => {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(text.t("document.error.load_failed", &[("code", code.as_str())]));
+                    });
+                }
+                DocumentLoadState::Loaded { .. } => {
+                    let Some(document) =
+                        self.documents.iter_mut().find(|document| document.id == id)
+                    else {
+                        return;
+                    };
+                    let editable = document.is_editable();
+                    match mode {
+                        ui::document::DocumentViewMode::Source => {
+                            let editor_id = document_source_editor_id(&document.path);
+                            editor_changed = ui::document::source_editor(
+                                ui,
+                                editor_id,
+                                &mut document.source,
+                                editable,
+                            );
+                        }
+                        ui::document::DocumentViewMode::Preview => {
+                            link_intent = self.document_markdown_viewer.show(
+                                ui,
+                                &document.source,
+                                ui::markdown_viewer::MarkdownViewerContext {
+                                    slot,
+                                    revision,
+                                    workspace_root: &workspace_root,
+                                    base_directory: &base_directory,
+                                },
+                            );
+                        }
+                        ui::document::DocumentViewMode::Split => {
+                            let content_rect = ui.available_rect_before_wrap();
+                            let auto_source_width = content_rect.width() * 0.5;
+                            let source_width = aux_split_width(
+                                self.document_tab_split_width,
+                                auto_source_width,
+                                content_rect.width(),
+                                DOCUMENT_TAB_SOURCE_MIN_WIDTH,
+                            );
+                            let (source_rect, preview_rect) = content_rect
+                                .split_left_right_at_x(content_rect.left() + source_width);
+
+                            let mut source_ui = ui.new_child(
+                                egui::UiBuilder::new()
+                                    .max_rect(source_rect)
+                                    .id_salt("document_tab_split_source"),
+                            );
+                            source_ui.set_clip_rect(source_rect.intersect(ui.clip_rect()));
+                            let document = self
+                                .documents
+                                .iter_mut()
+                                .find(|document| document.id == id)
+                                .expect("checked above");
+                            let editor_id = document_source_editor_id(&document.path);
+                            editor_changed = ui::document::source_editor(
+                                &mut source_ui,
+                                editor_id,
+                                &mut document.source,
+                                editable,
+                            );
+                            // Split은 같은 프레임에 source와 preview를 함께 그린다 —
+                            // `revision`(외부 스코프)이 다음 프레임에야 올라가면 방금 친
+                            // 글자가 이 프레임의 preview에는 반영되지 않는다(캐시 키가
+                            // 그대로라 재파싱을 건너뛴다). 이 프레임에서만 로컬로 앞당겨
+                            // 써서 preview가 같은 프레임에 최신 내용을 그리게 한다 —
+                            // `self.document_source_revision`(App 상태) 자체는
+                            // `on_document_source_edited`가 이 함수 끝에서 올린다.
+                            let revision = if editor_changed {
+                                ui::markdown_viewer::MarkdownSourceRevision(
+                                    revision.0.wrapping_add(1),
+                                )
+                            } else {
+                                revision
+                            };
+
+                            let divider_hit_rect = egui::Rect::from_min_max(
+                                egui::pos2(source_rect.right() - 3.0, content_rect.top()),
+                                egui::pos2(source_rect.right() + 3.0, content_rect.bottom()),
+                            );
+                            let resize_id = ui.id().with("document_tab_split_resize");
+                            let resize_response = ui
+                                .interact(divider_hit_rect, resize_id, egui::Sense::drag())
+                                .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+                            let resize_start_id = resize_id.with("drag_start_width");
+                            if resize_response.drag_started() {
+                                ui.ctx().data_mut(|data| {
+                                    data.insert_temp(resize_start_id, source_width)
+                                });
+                            }
+                            if let Some(total_drag_delta) = resize_response.total_drag_delta() {
+                                let start_width = ui
+                                    .ctx()
+                                    .data(|data| data.get_temp::<f32>(resize_start_id))
+                                    .unwrap_or(source_width);
+                                split_width =
+                                    aux_divider_requested_width(start_width, total_drag_delta.x);
+                                ui.ctx().request_repaint();
+                            }
+                            if resize_response.drag_stopped() {
+                                ui.ctx()
+                                    .data_mut(|data| data.remove::<f32>(resize_start_id));
+                            }
+                            let separator = if resize_response.dragged() {
+                                ui.visuals().widgets.active.bg_stroke
+                            } else if resize_response.hovered() {
+                                ui.visuals().widgets.hovered.bg_stroke
+                            } else {
+                                ui::designall::separator_stroke(ui.visuals())
+                            };
+                            let ppp = ui.ctx().pixels_per_point();
+                            let sep_x = ui::snap_line_to_pixel(
+                                ui::designall::panel_edge_separator_x(source_rect.right(), ppp),
+                                separator.width,
+                                ppp,
+                            );
+                            // 위쪽을 툴바 구분선까지 끌어올려 이어 붙인다.
+                            let divider_top = toolbar_separator_y
+                                .unwrap_or(content_rect.top())
+                                .min(content_rect.top());
+                            ui.painter().vline(
+                                sep_x,
+                                egui::Rangef::new(divider_top, content_rect.bottom()),
+                                separator,
+                            );
+
+                            let mut preview_ui = ui.new_child(
+                                egui::UiBuilder::new()
+                                    .max_rect(preview_rect.shrink2(egui::vec2(6.0, 0.0)))
+                                    .id_salt("document_tab_split_preview"),
+                            );
+                            preview_ui.set_clip_rect(preview_rect.intersect(ui.clip_rect()));
+                            link_intent = self.document_markdown_viewer.show(
+                                &mut preview_ui,
+                                &document.source,
+                                ui::markdown_viewer::MarkdownViewerContext {
+                                    slot,
+                                    revision,
+                                    workspace_root: &workspace_root,
+                                    base_directory: &base_directory,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        });
+
+        if let Some(action) = toolbar_action {
+            match action {
+                ui::document::DocumentToolbarAction::SetMode(mode) => {
+                    if let Some(document) =
+                        self.documents.iter_mut().find(|document| document.id == id)
+                    {
+                        document.mode = mode;
+                    }
+                }
+                ui::document::DocumentToolbarAction::Save => {
+                    self.request_document_save(id);
+                }
+            }
+        }
+        if editor_changed {
+            self.on_document_source_edited(id);
+        }
+        if let Some(width) = split_width {
+            self.document_tab_split_width = Some(width);
+        }
+        if open_with_os_clicked {
+            self.open_document_path_with_os(ui.ctx(), id);
+        }
+        if let Some(intent) = link_intent {
+            self.apply_document_link_intent(ui.ctx(), id, intent);
+        }
+    }
+
+    /// 툴바 상태 문구 — 저장 직후 잠깐의 "저장됨" 피드백이 dirty/ViewOnly 문구보다
+    /// 우선한다. `DOCUMENT_SAVED_FEEDBACK_DURATION`이 지나면 자연히 사라진다(피드백
+    /// 창이 열려 있는 동안 계속 리페인트를 예약해 타이머 만료가 화면에 반영되게 한다).
+    fn document_toolbar_status_text(
+        &self,
+        id: ui::workspace::DocumentTabId,
+        text: &i18n::Catalog,
+    ) -> Option<String> {
+        let document = self.documents.iter().find(|document| document.id == id)?;
+        if document.is_editable() && !document.source_fits_save_limit() {
+            return Some(text.t("document.limit.save_too_large", &[]));
+        }
+        if let Some(until) = document.saved_feedback_until {
+            let now = std::time::Instant::now();
+            if now < until {
+                self.egui_ctx.request_repaint_after(until - now);
+                return Some(text.t("document.saved", &[]));
+            }
+        }
+        if let Some(code) = document.save_error {
+            return Some(text.t("document.error.save_failed", &[("code", code.as_str())]));
+        }
+        // 편집으로 Full 티어 상한을 넘겼으면 알려준다(2026-08-23 리뷰). 티어는 **열 때**
+        // 정해지고 편집 중엔 재평가하지 않는다 — 타이핑 도중 편집기를 잠그는 건 더
+        // 나쁘기 때문이다. 대신 성능 근거(§6의 1 MiB 실측)를 넘겼다는 사실이 보이게
+        // 한다. 저장은 8 MiB 절대 상한에서만 막힌다.
+        let over_full = document.source.len() as u64 > document_io::DOCUMENT_FULL_BYTES_MAX;
+        if over_full && document.limit_tier() == Some(document_io::DocumentLimitTier::Full) {
+            let bytes = document.source.len().to_string();
+            return Some(text.t("document.limit.grew_past_full", &[("bytes", &bytes)]));
+        }
+        if document.dirty {
+            return Some(text.t("document.dirty", &[]));
+        }
+        if document.limit_tier() == Some(document_io::DocumentLimitTier::ViewOnly) {
+            let bytes = document.view_only_byte_len.unwrap_or_default().to_string();
+            return Some(text.t("document.limit.view_only", &[("bytes", &bytes)]));
+        }
+        None
+    }
+
+    /// 편집 반영 — dirty 판정(저장 시점 내용과 비교)과 Preview 캐시 무효화 카운터를
+    /// 함께 올린다. 안 올리면 뷰어가 옛 내용을 계속 보여준다. `id`가 가리키는 문서만
+    /// 건드린다 — 여러 문서가 열려 있어도 편집 중인 문서만 dirty·revision이 바뀐다.
+    fn on_document_source_edited(&mut self, id: ui::workspace::DocumentTabId) {
+        let Some(document) = self.documents.iter_mut().find(|document| document.id == id) else {
+            return;
+        };
+        document.recompute_dirty();
+        document.save_error = None;
+        document.source_revision = document.source_revision.wrapping_add(1);
+    }
+
+    /// Markdown 링크 클릭 intent 라우팅(설계 §5·§7.3) — leaf는 절대 파일을 열거나 URL을
+    /// 열지 않는다. 실제 분류는 `classify_document_link_intent`(순수 함수, 유닛 테스트
+    /// 대상)에 맡기고 여기서는 그 결과를 실행만 한다. `id`는 링크가 걸린 문서 —
+    /// 상대 문서 경로 해석의 기준 디렉터리를 정한다.
+    fn apply_document_link_intent(
+        &mut self,
+        ctx: &egui::Context,
+        id: ui::workspace::DocumentTabId,
+        intent: ui::markdown_viewer::MarkdownLinkIntent,
+    ) {
+        let Some(base_directory) = self
+            .documents
+            .iter()
+            .find(|document| document.id == id)
+            .map(|document| {
+                document
+                    .path
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .to_path_buf()
+            })
+        else {
+            return;
+        };
+        match classify_document_link_intent(&base_directory, &intent) {
+            DocumentLinkAction::OpenExternal(url) => {
+                ctx.open_url(egui::OpenUrl::new_tab(url));
+            }
+            DocumentLinkAction::OpenDocument(path) => self.open_document(path),
+            DocumentLinkAction::Ignored => {
+                // 내용(스킴·경로)은 로그에 남기지 않는다(§7) — 무슨 일이 있었는지만.
+                tracing::debug!(kind = "document_link", "rejected link scheme");
+            }
+        }
+    }
+
+    /// 「OS로 열기」 — Refused/Binary 티어에서 쓴다. `FileTreeIoRequest::OpenPath`와
+    /// 같은 실행 경로(`app_host_open_path_reaped`)를 쓰지만, file_tree 사이드바의
+    /// 자체 세대 큐(`FileTreeUi::queue_io`)를 거치지 않는 독립 슬롯
+    /// (`AppHostIoAction::OpenPath`, 세션 폴더 열기가 이미 쓰는 것과 같은 자리)을
+    /// 재사용한다 — 사이드바가 열려 있지 않아도 동작하고, 세대 번호 충돌 여지가 없다.
+    fn open_document_path_with_os(
+        &mut self,
+        ctx: &egui::Context,
+        id: ui::workspace::DocumentTabId,
+    ) {
+        let Some(path) = self
+            .documents
+            .iter()
+            .find(|document| document.id == id)
+            .map(|document| document.path.clone())
+        else {
+            return;
+        };
+        if self.pending_app_host_action.is_none() {
+            self.pending_app_host_action = Some(AppHostIoAction::OpenPath(path));
+            ctx.request_repaint();
+        }
+    }
+
+    /// 저장 요청 — dirty && Full 티어일 때만 유효. 워커
+    /// admit은 `poll_document_io`가 매 틱 재시도한다. `id`가 가리키는 문서만 저장한다
+    /// — 여러 문서가 동시에 dirty여도 서로의 저장 요청이 섞이지 않는다.
+    fn request_document_save(&mut self, id: ui::workspace::DocumentTabId) {
+        let Some(document) = self.documents.iter_mut().find(|document| document.id == id) else {
+            return;
+        };
+        if !document.has_save_eligibility() {
+            return;
+        }
+        if !document.source_fits_save_limit() {
+            document.save_error = Some(document_io::DocumentIoErrorCode::ContentTooLarge);
+            self.document_close_after_save.remove(&id);
+            return;
+        }
+        let DocumentLoadState::Loaded { revision, .. } = document.load_state else {
+            return;
+        };
+        document.saving = true;
+        document.save_error = None;
+        document.saving_source = Some(document.source.clone());
+        self.document_pending_saves.push_back((
+            id,
+            document_io::DocumentSaveRequest {
+                path: document.path.clone(),
+                contents: document.source.clone(),
+                expected_revision: revision,
+            },
+        ));
     }
 
     /// 이력 탭이 방금 활성화됐을 때의 공통 진입 — projection을 새로 요청하고, 카드
@@ -14063,8 +16700,8 @@ impl App {
         }
     }
 
-    /// 세션을 드러내는 네비게이션 — 정보 페이지에서 나오고, 이력 탭이 활성이면 세션
-    /// 탭으로 되돌린다(탭 자체는 유지한다).
+    /// 세션을 드러내는 네비게이션 — 정보 페이지에서 나오고, 활성 이력·Git·
+    /// 문서 보조 탭을 세션 탭으로 되돌린다(열린 탭과 모델은 유지한다).
     ///
     /// 이력이 전역 view이던 시절에는 `set_view(Terminal)` 하나가 두 일을 다 했다.
     /// 이력이 pane 보조 탭이 된 뒤로는 view만 바꾸면 본문이 계속 이력이라, 사용자가
@@ -14073,7 +16710,14 @@ impl App {
     fn reveal_terminal_session(&mut self) {
         self.agent_terminal_ui
             .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
-        self.work_history_tab = self.work_history_tab.on_session_tab_click();
+        let (history, git, document, reset_search) =
+            reveal_session_aux_tabs(self.work_history_tab, self.git_tab, self.document_tab);
+        self.work_history_tab = history;
+        self.git_tab = git;
+        self.document_tab = document;
+        if reset_search {
+            self.aux_search.reset();
+        }
     }
 
     /// pane 헤더 보조 탭이 올린 의도. 어떤 경로도 `RuntimeCommand`를 만들지 않는다 —
@@ -14085,8 +16729,465 @@ impl App {
             ui::workspace::PaneAuxTabIntent::ShowSession => previous.on_session_tab_click(),
             ui::workspace::PaneAuxTabIntent::Close => previous.on_close(),
         };
+        if self.work_history_tab.is_active() != previous.is_active() {
+            // 활성 보조 탭이 바뀌었다(켜졌거나 꺼졌거나) — 이력에서 찾던 문구가 남아
+            // 있으면 다음에 뭘 보든 "왜 안 보이지"가 된다(스펙).
+            self.aux_search.reset();
+        }
         if self.work_history_tab.is_active() && !previous.is_active() {
+            // 헤더에서 이력 탭을 직접 눌러 활성화하는 경로 — Git이 활성이었다면 물러난다
+            // (보조 본문은 하나뿐이다, 스펙 §8-2).
+            (self.work_history_tab, self.git_tab, self.document_tab) = resolve_aux_tab_exclusivity(
+                self.work_history_tab,
+                self.git_tab,
+                self.document_tab,
+                AuxTabWinner::History,
+            );
             self.enter_work_history_tab();
+        }
+    }
+
+    /// Git 보조 탭이 올린 의도 — `apply_work_history_tab_intent`와 같은 모양이다.
+    /// 활성화되는 순간 상호배타를 걸고(스펙 §8-2), 캐시 없이 최신 스냅샷을 요청한다.
+    fn apply_git_tab_intent(
+        &mut self,
+        ctx: &egui::Context,
+        intent: ui::workspace::PaneAuxTabIntent,
+    ) {
+        let previous = self.git_tab;
+        self.git_tab = match intent {
+            ui::workspace::PaneAuxTabIntent::Activate => previous.on_tab_click(),
+            ui::workspace::PaneAuxTabIntent::ShowSession => previous.on_session_tab_click(),
+            ui::workspace::PaneAuxTabIntent::Close => previous.on_close(),
+        };
+        if self.git_tab.is_active() != previous.is_active() {
+            // apply_work_history_tab_intent와 같은 이유로 비운다.
+            self.aux_search.reset();
+        }
+        if self.git_tab.is_active() && !previous.is_active() {
+            (self.work_history_tab, self.git_tab, self.document_tab) = resolve_aux_tab_exclusivity(
+                self.work_history_tab,
+                self.git_tab,
+                self.document_tab,
+                AuxTabWinner::Git,
+            );
+            self.request_git_panel_io(ctx, ui::git_panel::GitPanelIoRequest::Snapshot);
+        }
+    }
+
+    /// 문서 보조 탭이 올린 의도 — `apply_work_history_tab_intent`와 같은 모양이지만,
+    /// 문서 그룹 안에는 여러 탭이 있을 수 있어 `id`로 어느 탭인지 받는다(멀티 문서
+    /// 탭 설계). 문서 X는 UI 탭만 닫는다 — 어떤 경로도 runtime에 종료 명령을 보내지
+    /// 않는다. dirty 상태에서 닫으려 하면 곧장 닫지 않고 확인을 받는다(설계 §3.3).
+    fn apply_document_tab_intent(
+        &mut self,
+        id: ui::workspace::DocumentTabId,
+        intent: ui::workspace::PaneAuxTabIntent,
+    ) {
+        match intent {
+            ui::workspace::PaneAuxTabIntent::Close => {
+                let document = self.documents.iter().find(|document| document.id == id);
+                match document_close_disposition(document) {
+                    DocumentCloseDisposition::DeferUntilSave => {
+                        self.document_close_after_save.insert(id);
+                    }
+                    DocumentCloseDisposition::ConfirmDirty => {
+                        enqueue_document_pending_confirm(
+                            &mut self.document_pending_confirms,
+                            DocumentPendingConfirm::CloseWithDirty { id },
+                        );
+                    }
+                    DocumentCloseDisposition::CloseNow => self.close_document_entry(id),
+                }
+            }
+            ui::workspace::PaneAuxTabIntent::Activate => self.activate_document_tab(id),
+            ui::workspace::PaneAuxTabIntent::ShowSession => {
+                let previous_group_active = self.document_tab.is_active();
+                self.document_tab = self.document_tab.on_session_tab_click();
+                if self.document_tab.is_active() != previous_group_active {
+                    self.aux_search.reset();
+                }
+            }
+        }
+    }
+
+    /// 문서 그룹 안에 이미 있는 문서를 활성화한다(멀티 문서 탭 설계 ③) — 헤더에서
+    /// 그 탭을 직접 클릭했을 때(`apply_document_tab_intent`)와 이미 열려 있는 파일을
+    /// 다시 열었을 때(`begin_document_open`) 공용으로 쓴다. 호출부가 이미 그 문서를
+    /// `documents`에서 찾은 뒤에만 부르므로(`documents`가 비어 있지 않다) `document_tab`이
+    /// `Closed`일 수 없어 `on_tab_click`으로 충분하다 — 닫혀 있던 그룹을 처음 여는
+    /// 것은 `begin_document_open`의 새 문서 경로가 따로 한다.
+    fn activate_document_tab(&mut self, id: ui::workspace::DocumentTabId) {
+        let previous_group_active = self.document_tab.is_active();
+        let previous_active_document = self.active_document;
+        self.active_document = Some(id);
+        self.document_tab = self.document_tab.on_tab_click();
+        if self.document_tab.is_active() != previous_group_active
+            || self.active_document != previous_active_document
+        {
+            // 활성 보조 탭이 바뀌었거나(그룹이 켜지거나 꺼졌다) 보이는 문서 자체가
+            // 바뀌었다 — 어느 쪽이든 이전 문서에서 찾던 문구가 남아 있으면 안 된다.
+            self.aux_search.reset();
+        }
+        if self.document_tab.is_active() && !previous_group_active {
+            (self.work_history_tab, self.git_tab, self.document_tab) = resolve_aux_tab_exclusivity(
+                self.work_history_tab,
+                self.git_tab,
+                self.document_tab,
+                AuxTabWinner::Document,
+            );
+        }
+    }
+
+    /// 문서 탭 하나를 실제로 닫는다 — 사용자가 명시적으로 닫았을 때(dirty 확인을
+    /// 통과했거나 애초에 dirty가 아니었을 때)와, 상한 때문에 App이 스스로 자리를
+    /// 비울 때(`make_room_for_document_open`, 항상 clean·비활성 문서만 대상) 공용으로
+    /// 쓴다. 활성 문서를 닫으면 이웃(오른쪽 우선, 없으면 왼쪽)을 활성화하고, 마지막
+    /// 문서를 닫으면 문서 그룹 자체가 닫혀 터미널로 돌아간다(멀티 문서 탭 설계 ⑥).
+    fn close_document_entry(&mut self, id: ui::workspace::DocumentTabId) {
+        let Some(index) = self.documents.iter().position(|document| document.id == id) else {
+            return;
+        };
+        let document = self.documents.remove(index);
+        // egui가 경로 기반 id로 들고 있던 source 편집기 상태(실행취소 스냅샷 포함)를
+        // 지운다 — 안 그러면 문서를 닫아도 안 지워지고 무한정 쌓인다(리뷰 지적 ②).
+        clear_document_editor_state(&self.egui_ctx, &document);
+        clear_document_viewer_state(&mut self.document_markdown_viewer, &self.egui_ctx, id);
+        self.document_pending_loads
+            .retain(|(job_id, _)| *job_id != id);
+        self.document_pending_saves
+            .retain(|(job_id, _)| *job_id != id);
+        self.document_close_after_save.remove(&id);
+        self.document_pending_confirms
+            .retain(|confirm| confirm.document_id() != id);
+        if self.active_document == Some(id) {
+            self.active_document = next_active_document_after_close(&self.documents, index);
+            self.aux_search.reset();
+        }
+        if self.documents.is_empty() {
+            self.document_tab = self.document_tab.on_close();
+        }
+    }
+
+    /// dirty 확인을 통과한 뒤(또는 확인이 필요 없을 때) 문서 탭을 포커스된 pane 위에
+    /// 연다 — `SidebarAction::OpenDocument` 라우팅과 `poll_pending_document_open` 둘
+    /// 다 이 헬퍼로 모인다. 이미 열려 있는 문서와 같은 경로면 새 탭을 만들지 않고 그
+    /// 탭만 활성화한다 — 다른 문서를 열어도 기존 문서는 그대로 남는다(멀티 문서 탭
+    /// 설계 ③). 상한에 걸리면(`plan_document_eviction`이 자리를 못 만들면) 열지 않고
+    /// 안내를 띄운다. 무엇을 할지 자체는 `find_open_document_by_path`·
+    /// `plan_document_eviction`(둘 다 순수 함수)이 판정하고, 여기서는 그 결정을
+    /// 실행만 한다.
+    fn begin_document_open(&mut self, path: PathBuf) {
+        if let Some(id) = find_open_document_by_path(&self.documents, &path) {
+            self.activate_document_tab(id);
+            self.document_cap_notice = false;
+            self.reveal_terminal_view_for_aux_tab();
+            return;
+        }
+        let Some(evict) = plan_document_eviction(&self.documents, self.active_document) else {
+            self.document_cap_notice = true;
+            return;
+        };
+        for victim in evict {
+            self.close_document_entry(victim);
+        }
+        let id = ui::workspace::DocumentTabId(self.next_document_tab_id);
+        self.next_document_tab_id = self.next_document_tab_id.wrapping_add(1);
+        self.documents.push(OpenDocument {
+            id,
+            path: path.clone(),
+            source: String::new(),
+            mode: ui::document::DocumentViewMode::Source,
+            load_state: DocumentLoadState::Loading,
+            saved_source: String::new(),
+            dirty: false,
+            saving: false,
+            saving_source: None,
+            save_error: None,
+            saved_feedback_until: None,
+            view_only_byte_len: None,
+            source_revision: 0,
+        });
+        self.document_pending_loads.push_back((id, path));
+        self.active_document = Some(id);
+        self.document_tab = ui::workspace::PaneAuxTabState::OpenActive;
+        (self.work_history_tab, self.git_tab, self.document_tab) = resolve_aux_tab_exclusivity(
+            self.work_history_tab,
+            self.git_tab,
+            self.document_tab,
+            AuxTabWinner::Document,
+        );
+        self.document_cap_notice = false;
+        self.aux_search.reset();
+        self.reveal_terminal_view_for_aux_tab();
+    }
+
+    /// 파일 트리에서 문서를 열었다(또는 Markdown 링크로 다른 문서를 열었다). 이제
+    /// 교체가 없으니 확인도 없다(멀티 문서 탭 설계 ③ — dirty든 아니든 기존 문서는
+    /// 그대로 두고 새 탭을 더한다, `begin_document_open`이 판단한다). 포커스된
+    /// pane이 있으면 곧장 열고, 하나도 없으면 셸 pane을 먼저 스폰하고
+    /// `poll_pending_document_open`이 다음 틱들에서 이어받는다(설계 §3.2).
+    fn open_document(&mut self, path: PathBuf) {
+        let has_focused_pane = self
+            .active
+            .workspace_ui
+            .mux()
+            .is_some_and(|mux| mux.focused_pane.is_some());
+        if has_focused_pane {
+            self.begin_document_open(path);
+        } else {
+            self.pending_document_open = Some(path);
+            self.stage_workspace_controller_action(WorkspaceControllerAction::SpawnShellAt {
+                cwd: None,
+            });
+        }
+    }
+
+    /// `open_document`가 pane이 없어 미룬 문서 열기 — 스폰된 pane이 포커스를 받으면
+    /// 이어받는다. `poll_pending_resume_agent`와 같은 틱에서 돈다.
+    fn poll_pending_document_open(&mut self) {
+        let Some(path) = self.pending_document_open.clone() else {
+            return;
+        };
+        let ready = self
+            .active
+            .workspace_ui
+            .mux()
+            .is_some_and(|mux| mux.focused_pane.is_some());
+        if ready {
+            self.pending_document_open = None;
+            self.begin_document_open(path);
+        }
+    }
+
+    /// 저장 Conflict 확인에서 「다시 불러오기」를 골랐다 — 로컬 편집을 버리고 디스크의
+    /// 최신 내용을 다시 읽는다. 보기 모드(`mode`)는 그대로 둔다.
+    fn reload_document_from_disk(&mut self, id: ui::workspace::DocumentTabId) {
+        let Some(document) = self.documents.iter_mut().find(|document| document.id == id) else {
+            return;
+        };
+        let path = document.path.clone();
+        document.load_state = DocumentLoadState::Loading;
+        document.saving = false;
+        document.save_error = None;
+        self.document_pending_saves
+            .retain(|(job_id, _)| *job_id != id);
+        self.document_close_after_save.remove(&id);
+        self.document_pending_loads.push_back((id, path));
+    }
+
+    /// 확인 모달 문구에 넣을 파일명 — 어느 문서에 대한 확인인지 사용자가 알 수
+    /// 있어야 한다(2026-08-22 리뷰: 예전엔 제네릭 문구뿐이라 대상을 알 수 없었다).
+    /// 큐에 확인이 남아 있는 한 그 문서는 `close_document_entry`가 지우기 전까지
+    /// `documents`에 그대로 있으므로 찾지 못하는 경우는 방어적으로만 다룬다.
+    fn document_file_name(&self, id: ui::workspace::DocumentTabId) -> String {
+        self.documents
+            .iter()
+            .find(|document| document.id == id)
+            .map(|document| ui::path_file_name_display(&document.path))
+            .unwrap_or_default()
+    }
+
+    /// dirty 확인 모달(닫기)에서 사용자가 고른 선택을 적용한다 — 무엇을 할지는
+    /// 순수 함수 `resolve_document_confirm_choice`가 큐 맨 앞을 보고 정하고, 여기서는
+    /// 그 결정만 실행한다.
+    fn apply_document_confirm_choice(&mut self, choice: DocumentConfirmChoice) {
+        match resolve_document_confirm_choice(&mut self.document_pending_confirms, choice) {
+            Some(DocumentConfirmAction::Discard(id)) => self.close_document_entry(id),
+            Some(DocumentConfirmAction::SaveThenClose(id)) => {
+                self.document_close_after_save.insert(id);
+                self.request_document_save(id);
+            }
+            None => {}
+        }
+    }
+
+    /// 저장 Conflict 확인(재로드/취소 두 가지)에서 사용자가 고른 선택을 적용한다 —
+    /// `apply_document_confirm_choice`와 같은 구조.
+    fn apply_document_conflict_choice(&mut self, reload: bool) {
+        if let Some(id) =
+            resolve_document_conflict_choice(&mut self.document_pending_confirms, reload)
+        {
+            self.reload_document_from_disk(id);
+        }
+    }
+
+    /// 문서 로드/저장 lane 폴링(설계 §4·§7, 멀티 문서 탭 설계) — 파일 I/O는 워커에서
+    /// 끝났고, 여기서는 최신 결과만 짧게 적용한다. `logic()`에서만 부른다(render
+    /// 경로에서 IO를 시작하지 않는다). 워커는 한 번에 잡 하나만 처리하므로 여러
+    /// 문서를 연달아 열거나 저장하면 `document_pending_loads`/`document_pending_saves`
+    /// 큐에 쌓였다가 순서대로 admit된다.
+    fn poll_document_io(&mut self) {
+        while let Some(outcome) = self.document_load_worker.try_recv() {
+            let inflight = self.document_load_inflight.take();
+            match outcome.into_result() {
+                Ok((id, load_outcome)) => self.apply_document_load_outcome(id, load_outcome),
+                // 잡 데이터를 잃는 실패(spawn 실패·panic·disconnect) — 어느 문서였는지는
+                // `document_load_inflight`가 정확히 기억한다(문서 여러 개가 동시에
+                // `Loading`일 수 있어 "아무 Loading이나"로는 어느 것인지 알 수 없다).
+                Err(_) => {
+                    if let Some(id) = inflight
+                        && let Some(document) =
+                            self.documents.iter_mut().find(|document| document.id == id)
+                    {
+                        document.load_state = DocumentLoadState::Failed {
+                            code: document_io::DocumentIoErrorCode::ReadFailed,
+                        };
+                    }
+                }
+            }
+        }
+        if self.document_load_inflight.is_none()
+            && let Some((id, path)) = self.document_pending_loads.pop_front()
+        {
+            match self
+                .document_load_worker
+                .try_request((id, document_io::DocumentLoadRequest { path }))
+            {
+                Ok(()) => self.document_load_inflight = Some(id),
+                Err(crate::lazy_worker::LazyWorkerSubmitError::Full(job)) => {
+                    self.document_pending_loads.push_front((job.0, job.1.path));
+                }
+                Err(crate::lazy_worker::LazyWorkerSubmitError::Unavailable { .. }) => {
+                    if let Some(document) =
+                        self.documents.iter_mut().find(|document| document.id == id)
+                    {
+                        document.load_state = DocumentLoadState::Failed {
+                            code: document_io::DocumentIoErrorCode::ReadFailed,
+                        };
+                    }
+                }
+            }
+        }
+
+        while let Some(outcome) = self.document_save_worker.try_recv() {
+            let inflight = self.document_save_inflight.take();
+            match outcome.into_result() {
+                Ok((id, save_outcome)) => self.apply_document_save_outcome(id, save_outcome),
+                Err(_) => {
+                    if let Some(id) = inflight {
+                        apply_document_save_infrastructure_failure(
+                            &mut self.documents,
+                            &mut self.document_close_after_save,
+                            id,
+                        );
+                    }
+                }
+            }
+        }
+        if self.document_save_inflight.is_none()
+            && let Some((id, request)) = self.document_pending_saves.pop_front()
+        {
+            match self.document_save_worker.try_request((id, request)) {
+                Ok(()) => self.document_save_inflight = Some(id),
+                Err(crate::lazy_worker::LazyWorkerSubmitError::Full(job)) => {
+                    self.document_pending_saves.push_front(job);
+                }
+                Err(crate::lazy_worker::LazyWorkerSubmitError::Unavailable { .. }) => {
+                    apply_document_save_infrastructure_failure(
+                        &mut self.documents,
+                        &mut self.document_close_after_save,
+                        id,
+                    );
+                }
+            }
+        }
+    }
+
+    /// 로드 결과 4종(Loaded/ViewOnly/Refused/Binary) + 실패를 App 상태로 반영한다.
+    /// 티어 매핑 자체는 `document_load_state_from_outcome`(순수 함수)에 맡긴다. `id`가
+    /// 가리키는 문서가 이미 닫혔으면(`documents`에 없으면) 조용히 버린다.
+    fn apply_document_load_outcome(
+        &mut self,
+        id: ui::workspace::DocumentTabId,
+        outcome: document_io::DocumentLoadOutcome,
+    ) {
+        let incoming_source_bytes = match &outcome {
+            document_io::DocumentLoadOutcome::Loaded { source, .. }
+            | document_io::DocumentLoadOutcome::ViewOnly { source, .. } => {
+                Some(u64::try_from(source.len()).unwrap_or(u64::MAX))
+            }
+            document_io::DocumentLoadOutcome::Refused { .. }
+            | document_io::DocumentLoadOutcome::Binary { .. }
+            | document_io::DocumentLoadOutcome::Failed { .. } => None,
+        };
+        if let Some(incoming_source_bytes) = incoming_source_bytes {
+            let admission = plan_document_load_admission(
+                &self.documents,
+                id,
+                incoming_source_bytes,
+                self.active_document,
+            );
+            let execution = execute_document_load_admission(admission, id, |victim| {
+                self.close_document_entry(victim);
+            });
+            if execution.show_cap_notice {
+                self.document_cap_notice = true;
+            }
+            if !execution.apply_outcome {
+                return;
+            }
+        }
+        let Some(document) = self.documents.iter_mut().find(|document| document.id == id) else {
+            return;
+        };
+        apply_document_load_outcome_to_document(document, outcome);
+    }
+
+    /// 저장 결과를 App 상태로 반영한다 — Conflict는 덮어쓰지 않고 확인 상태로 간다
+    /// (설계 §7). 문서 필드 갱신 자체는 `apply_save_outcome_to_document`(순수 함수)에
+    /// 맡기고, 여기서는 그 결과(확인 모달 요청)와 저장 후 「닫기」continuation만
+    /// 실행한다. `id`가 가리키는 문서가 이미 닫혔으면 continuation 표시만 지우고
+    /// 조용히 버린다.
+    fn apply_document_save_outcome(
+        &mut self,
+        id: ui::workspace::DocumentTabId,
+        outcome: document_io::DocumentSaveOutcome,
+    ) {
+        let Some(document) = self.documents.iter_mut().find(|document| document.id == id) else {
+            self.document_close_after_save.remove(&id);
+            return;
+        };
+        if let Some(confirm) = apply_save_outcome_to_document(id, document, &outcome) {
+            self.document_close_after_save.remove(&id);
+            enqueue_document_pending_confirm(&mut self.document_pending_confirms, confirm);
+            return;
+        }
+        match outcome {
+            document_io::DocumentSaveOutcome::Saved { .. } => {
+                self.egui_ctx
+                    .request_repaint_after(DOCUMENT_SAVED_FEEDBACK_DURATION);
+                let still_dirty = self
+                    .documents
+                    .iter()
+                    .find(|document| document.id == id)
+                    .is_some_and(|document| document.dirty);
+                let close_after_save = self.document_close_after_save.remove(&id);
+                let complete_pending_close = should_complete_pending_close_after_save(
+                    &self.document_pending_confirms,
+                    id,
+                    still_dirty,
+                );
+                if close_after_save || complete_pending_close {
+                    // 저장 중에 들어온 편집이 있으면 아직 dirty다 — 그대로 닫으면
+                    // 그 편집이 경고 없이 사라진다(2026-08-23 리뷰 CRITICAL).
+                    // 닫지 말고 확인을 다시 받는다.
+                    if still_dirty {
+                        enqueue_document_pending_confirm(
+                            &mut self.document_pending_confirms,
+                            DocumentPendingConfirm::CloseWithDirty { id },
+                        );
+                    } else {
+                        self.close_document_entry(id);
+                    }
+                }
+            }
+            document_io::DocumentSaveOutcome::Failed { .. } => {
+                self.document_close_after_save.remove(&id);
+            }
+            document_io::DocumentSaveOutcome::Conflict => {
+                unreachable!("Conflict는 위 apply_save_outcome_to_document에서 이미 처리됐다")
+            }
         }
     }
 
@@ -14126,6 +17227,56 @@ impl App {
                 self.diff_panel_ui
                     .open_for_path(ctx, self.active.id.clone(), cwd, row.instruction);
             }
+            WorkHistoryAction::ShowTranscript(identity) => {
+                let row = self
+                    .work_history_rows
+                    .iter()
+                    .find(|row| ui::work_history::WorkTurnIdentity::from(*row) == identity)
+                    .cloned();
+                let Some(row) = row else {
+                    let _ = self.request_work_history_projection(false);
+                    return;
+                };
+                let Some(kind) = crate::agent_detect::kind_from_str(&row.kind) else {
+                    // 원문 자체를 못 찾은 경로라 초점도 의미가 없다 — None.
+                    self.transcript_viewer_ui.set_conversation(
+                        Err(crate::agent_transcript::TranscriptViewError::NotFound),
+                        None,
+                    );
+                    return;
+                };
+                let Some(path) = crate::agent_detect::transcript_path_for(
+                    kind,
+                    &row.agent_session_id,
+                    row.cwd.as_deref(),
+                ) else {
+                    // 원문 자체를 못 찾은 경로라 초점도 의미가 없다 — None.
+                    self.transcript_viewer_ui.set_conversation(
+                        Err(crate::agent_transcript::TranscriptViewError::NotFound),
+                        None,
+                    );
+                    return;
+                };
+                self.transcript_generation = self.transcript_generation.wrapping_add(1).max(1);
+                let request = AppHostIoAction::Transcript {
+                    generation: self.transcript_generation,
+                    path,
+                    kind,
+                    focus_offset: row.source_offset,
+                };
+                // git 패널 IO와 capacity-1 슬롯을 공유한다. 차 있을 때 그냥 버리면
+                // 사용자가 「원문 보기」를 눌러도 아무 일도 안 일어난 것처럼 보인다
+                // (갱신을 스스로 다시 시도하는 패널 새로고침과 달리, 이건 **사용자
+                // 클릭**이라 되살릴 사람이 없다). 대기 슬롯에 얹어 두고 다음 프레임에
+                // 태운다 — 슬롯도 최신 하나만 유지한다(latest-only).
+                if self.pending_app_host_action.is_none() {
+                    self.pending_app_host_action = Some(request);
+                } else {
+                    self.pending_app_host_retry = Some(request);
+                }
+                ctx.request_repaint();
+                self.transcript_viewer_ui.set_loading();
+            }
             WorkHistoryAction::Activate(identity) => {
                 let row = self
                     .work_history_rows
@@ -14153,6 +17304,9 @@ impl App {
                     } => {
                         let _ = self.stage_workspace_controller_action(
                             WorkspaceControllerAction::ResumeAgent {
+                                // 작업 이력 탭은 항상 활성 워크스페이스의 턴만 보여준다
+                                // (work_history.rs 소유 밖).
+                                workspace_id: self.active.id.clone(),
                                 pane_key,
                                 title,
                                 session,
@@ -14161,6 +17315,19 @@ impl App {
                     }
                     AppWorkHistoryActivation::ResumeArchived { session } => {
                         if self.dispatch_respawn_archived_agent(session) {
+                            self.reveal_terminal_session();
+                        }
+                    }
+                    AppWorkHistoryActivation::ResumeArchivedNoPane {
+                        kind,
+                        extra_args,
+                        native_session_id,
+                    } => {
+                        if self.dispatch_resume_archived_agent_new_pane(
+                            kind,
+                            extra_args,
+                            &native_session_id,
+                        ) {
                             self.reveal_terminal_session();
                         }
                     }
@@ -14314,7 +17481,7 @@ impl App {
     /// 모바일 웹(PWA) 서버 기동 (mobile-pwa v3.3 P1): keyring 페어링 토큰 로드/생성 →
     /// 127.0.0.1 평문 bind(serve 모드 — HTTPS 종단은 tailscale serve 몫).
     /// cert 모드(자체 TLS + 비-loopback)는 후속 — config에 자리만 있다.
-    fn start_web(&self) -> anyhow::Result<WebRemoteState> {
+    fn start_web(&mut self) -> anyhow::Result<WebRemoteState> {
         let token = web_remote::pairing::get_or_create_token(&self.secret_store)?;
         // 웹푸시(P4) VAPID 키 — keyring에서 get_or_create(SecretStore 접근이 app 소유). 개인키는
         // keyring에만, 공개키만 서버가 JS에 노출한다. 실패하면 푸시만 비활성(대시보드는 유지).
@@ -14327,23 +17494,38 @@ impl App {
         };
         let addr =
             std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, self.config.web.port));
-        let hostname = self.config.web.ts_hostname.trim();
+        // 소유 문자열로 떼어 둔다 — 아래에서 공유 코어를 확보할 때 `&mut self`가 필요하다.
+        let hostname = self.config.web.ts_hostname.trim().to_owned();
         let repository: Arc<dyn web_remote::repository::WebRemoteRepository> =
             Arc::new(AppWebRemoteRepository::open(&self.db_path)?);
-        let server = web_remote::WebRemoteServer::serve(
+        // 코어는 **앱이 소유**하고 두 전송이 공유한다. 서버가 자기 코어를 만들면 Relay만
+        // 켜는 배치가 불가능해지고, 서버를 끄는 것만으로 Relay 쪽 대시보드가 죽는다.
+        // 웹푸시 발송기도 코어가 소유한다 — 같은 이유다.
+        let core = self.shared_session_core(Some(Arc::clone(&repository)), vapid);
+        let server = match web_remote::WebRemoteServer::serve_with_core(
             addr,
             web_remote::ServeOptions {
                 token: token.clone(),
-                allowed_host: (!hostname.is_empty()).then(|| hostname.to_owned()),
+                allowed_host: (!hostname.is_empty()).then_some(hostname),
                 // app-owned adapter 한 개를 Dashboard와 Push가 공유한다. web-remote는
                 // concrete Db를 생성하거나 storage row를 contract에 노출하지 않는다.
                 repository: Some(repository),
-                vapid,
+                // VAPID 키는 코어에 넘겼다. 서버에도 주면 발송기 소유권이 둘로 갈린다.
+                vapid: None,
                 // 모바일 파일 첨부(P6d) — 세션에 묶이지 않는 평면 디렉터리라 workspace별
                 // logs_root가 아닌 logs_base 바로 아래에 둔다(remote/ 분리와 같은 이유).
                 uploads_dir: Some(self.logs_base.join("uploads")),
             },
-        )?;
+            core,
+        ) {
+            Ok(server) => server,
+            Err(error) => {
+                // bind 실패로 web이 서지 않았다. 방금 붙인 발송기를 떼고, Relay도 꺼져
+                // 있으면 코어까지 놓아준다 — 둘 다 OFF인데 스레드만 남으면 안 된다.
+                self.web_transport_stopped();
+                return Err(error);
+            }
+        };
         // 활성 workspace worker 이벤트를 대시보드에 붙인다(P2). wake 클로저는 egui 프레임과
         // 무관하게 브리지 스레드를 깨운다(§14.1 Warm 알림 유지) — 창이 숨겨져도 상태가 흐른다.
         // 워크스페이스 전환 시엔 rebind_web_dashboard가 새 worker로 재구독한다.
@@ -14379,6 +17561,110 @@ impl App {
             switch_ctx.request_repaint();
         }));
         Ok(WebRemoteState { server, token })
+    }
+
+    /// 두 전송이 공유하는 코어를 확보한다. 이미 있으면 그대로 쓴다 — 한 전송을 켰다고
+    /// 다른 전송의 코어를 갈아 끼우면 그 전송의 대시보드가 끊긴다.
+    fn shared_session_core(
+        &mut self,
+        repository: Option<Arc<dyn web_remote::repository::WebRemoteRepository>>,
+        vapid: Option<web_remote::push::VapidKey>,
+    ) -> Arc<web_remote::session_core::SessionCore> {
+        if let Some(core) = &self.session_core {
+            // Relay를 먼저 켜면 코어가 VAPID 키 없이 만들어진다. 그 뒤 web을 켜는 경우를
+            // 위해 여기서 발송기를 보정한다 — 없으면 키가 있는데도 푸시가 영영 꺼진다.
+            core.ensure_push(repository, vapid);
+            return Arc::clone(core);
+        }
+        let core = web_remote::session_core::SessionCore::spawn_with_push(repository, vapid);
+        self.session_core = Some(Arc::clone(&core));
+        core
+    }
+
+    /// web 전송이 내려갔다. 웹푸시는 **web 전송의 수명에 묶이므로** 코어가 Relay 때문에
+    /// 살아남더라도 발송기는 함께 멈춘다 — 그러지 않으면 사용자가 모바일 웹을 껐는데도
+    /// 폰으로 알림이 계속 간다. 그 뒤 두 전송이 모두 꺼졌으면 코어까지 놓아준다.
+    fn web_transport_stopped(&mut self) {
+        if let Some(core) = &self.session_core {
+            core.stop_push();
+        }
+        self.release_session_core_if_idle();
+    }
+
+    /// 두 전송이 모두 꺼져 있으면 코어를 놓아준다. OFF면 브리지 스레드도 0이어야 한다.
+    fn release_session_core_if_idle(&mut self) {
+        if self.web.is_some() || self.relay_worker.is_some() {
+            return;
+        }
+        if let Some(core) = self.session_core.take() {
+            core.shutdown();
+        }
+    }
+
+    /// Relay를 켠다. Tailscale/loopback 경로는 **전혀 건드리지 않는다** — 서버도, 토큰도,
+    /// Host 허용 목록도, 리스너도 그대로다.
+    ///
+    /// 엔드포인트 정책은 워커를 띄우기 **전에** 검사한다. 프로덕션 좌표가 아직 배정되지
+    /// 않았으므로(`deploy/relay/README.md`의 BLOCKED 상태표) 현재는 여기서 실패하며, 그
+    /// 실패는 Relay 범위로만 표시된다.
+    fn relay_enable(&mut self) {
+        let endpoint = match web_remote::relay_client::RelayEndpoint::production() {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                tracing::warn!("Relay 시작 불가: {error}");
+                self.relay_error = Some(format!("{error}"));
+                return;
+            }
+        };
+        let repository: Arc<dyn web_remote::repository::WebRemoteRepository> =
+            match AppWebRemoteRepository::open(&self.db_path) {
+                Ok(repository) => Arc::new(repository),
+                Err(error) => {
+                    tracing::warn!("Relay 저장소 열기 실패: {error:#}");
+                    self.relay_error = Some(format!("{error:#}"));
+                    return;
+                }
+            };
+        // 코어는 web과 공유한다. web이 이미 켜져 있으면 그 코어를 그대로 쓴다.
+        let core = self.shared_session_core(Some(repository), None);
+        let worker = web_remote::relay_client::RelayWorker::spawn(
+            endpoint,
+            Box::new(web_remote::relay_client::TlsRelayTransport),
+            Box::new(RelayDashboardSink::new(Arc::clone(&core))),
+            Arc::new(web_remote::relay_client::worker::IgnoreObserver),
+            web_remote::relay_client::RelayDeadlines::default(),
+            web_remote::relay_client::BackoffPolicy::default(),
+        );
+        worker.enable();
+        self.relay_worker = Some(worker);
+        self.relay_error = None;
+        self.config.relay.enabled = true;
+        if let Err(error) = self.config.save(&self.config_path) {
+            tracing::warn!("config 저장 실패: {error:#}");
+            self.relay_error = Some(format!(
+                "Relay는 켰지만 설정 저장 실패 — 다음 실행엔 자동시작 안 됨: {error:#}"
+            ));
+        }
+    }
+
+    /// Relay를 끈다. Tailscale 서버·토큰·리스너에는 손대지 않는다.
+    ///
+    /// 호출부(설정 화면의 Relay 스위치)는 계획 Task 5가 붙인다. 종료 경로는 워커를 직접
+    /// 정지하므로 이 함수에 의존하지 않는다.
+    #[allow(dead_code)]
+    fn relay_disable(&mut self) {
+        if let Some(mut worker) = self.relay_worker.take() {
+            worker.shutdown();
+        }
+        self.relay_error = None;
+        self.release_session_core_if_idle();
+        self.config.relay.enabled = false;
+        if let Err(error) = self.config.save(&self.config_path) {
+            tracing::warn!("config 저장 실패: {error:#}");
+            self.relay_error = Some(format!(
+                "Relay는 껐지만 설정 저장 실패 — 다음 실행에 다시 켜질 수 있습니다: {error:#}"
+            ));
+        }
     }
 
     /// 워크스페이스 전환 시 웹 대시보드를 새 활성 worker에 재구독시킨다 — 옛 receiver는
@@ -14574,6 +17860,9 @@ impl App {
         if let Some(state) = self.web.take() {
             state.server.shutdown();
         }
+        // Relay가 아직 켜져 있으면 코어는 그대로 둔다 — 한 전송을 끄는 것이 다른 전송의
+        // 대시보드를 죽이면 안 된다. 다만 웹푸시는 web 전송의 것이므로 함께 멈춘다.
+        self.web_transport_stopped();
         self.web_error = None;
         self.serve_state = None; // 서버가 없으면 진단은 의미 없다
         self.config.web.enabled = false;
@@ -14717,6 +18006,10 @@ impl App {
                             .send_command(runtime::RuntimeCommand::FocusPane { pane: pane.clone() })
                             .is_ok()
                     {
+                        // 어디로 갔는지 보이게 그 pane을 잠깐 강조한다(2026-08-18 사용자
+                        // 요청). **포커스에 성공한 이 분기에서만** — 아무 데도 안 갔는데
+                        // 번쩍이면 거짓말이다. 아래 else(실패)에서는 세우지 않는다.
+                        self.active.workspace_ui.flash_pane(&pane);
                         self.active.workspace_ui.arm_terminal_focus(pane);
                         self.reveal_terminal_session();
                     } else {
@@ -14760,14 +18053,42 @@ impl App {
                     .spawn_shell_at(self.config.terminal.scrollback_lines as usize, cwd);
             }
             WorkspaceControllerAction::ResumeAgent {
+                workspace_id,
                 pane_key,
                 title,
                 session,
             } => {
-                if self.stage_agent_resume(&pane_key, &title, session) {
-                    self.resumed_panes.insert(pane_key);
-                    self.reveal_terminal_session();
+                if workspace_id == self.active.id {
+                    if self.stage_agent_resume(&pane_key, &title, session) {
+                        self.resumed_panes.insert(pane_key);
+                        self.reveal_terminal_session();
+                    } else {
+                        // 활성 워크스페이스인데도 실패 — 이미 재개할 게 없어졌다(pane
+                        // 정리 등). 버튼을 눌렀는데 조용히 아무 일도 없어 보이면 안 된다.
+                        self.notify_resume_failed(&title);
+                    }
+                    return;
                 }
+                // warm(비활성) 워크스페이스 행 — FocusPty와 같은 관례로 먼저 전환한다.
+                // 전환 직후엔 새 활성 워크스페이스의 restore_agents가 아직 안 채워져
+                // 있다(agent state worker가 비동기로 채운다) — 지금 바로
+                // stage_agent_resume을 부르면 조용히 false로 떨어져 아무 일도 안
+                // 일어난 것처럼 보인다. poll_pending_resume_agent가 데이터 도착 후
+                // 대신 실행하도록 지연시킨다(2026-08-20).
+                self.switch_workspace(&workspace_id);
+                if self.active.id != workspace_id {
+                    // 전환 자체가 실패했다(warm 한도 초과 등) — 조용히 포기하지 않는다.
+                    self.notify_resume_failed(&title);
+                    return;
+                }
+                self.pending_resume_agent = Some(PendingResumeAgent {
+                    workspace_id,
+                    runtime_instance: self.active.runtime_instance,
+                    pane_key,
+                    title,
+                    session,
+                    requested_at: std::time::Instant::now(),
+                });
             }
             WorkspaceControllerAction::ClosePane(pane) => {
                 self.active.workspace_ui.request_close_pane(pane);
@@ -14883,10 +18204,8 @@ impl App {
             let Some(runtime) = self.runtime_by_instance_mut(runtime_instance) else {
                 continue;
             };
-            let result = runtime
-                .runtime
-                .send_command(command)
-                .map_err(|_| ui::workspace::WorkspaceProtocolErrorCode::DeliveryFailed);
+            let result =
+                classify_workspace_protocol_delivery(runtime.runtime.send_command(command));
             let delivered = result.is_ok();
             runtime
                 .workspace_ui
@@ -14918,10 +18237,7 @@ impl App {
             let result = if runtime_command_requires_dotenv(&command) {
                 Err(ui::workspace::WorkspaceProtocolErrorCode::DeliveryFailed)
             } else {
-                runtime
-                    .runtime
-                    .send_command(command)
-                    .map_err(|_| ui::workspace::WorkspaceProtocolErrorCode::DeliveryFailed)
+                classify_workspace_protocol_delivery(runtime.runtime.send_command(command))
             };
             runtime
                 .workspace_ui
@@ -15019,6 +18335,51 @@ impl App {
             self.egui_ctx.request_repaint_after(delay);
         } else {
             self.active.workspace_ui.cancel_terminal_focus();
+        }
+    }
+
+    /// warm(비활성) 워크스페이스 행 「이어가기」의 지연 실행(2026-08-20) —
+    /// `WorkspaceControllerAction::ResumeAgent`가 `switch_workspace` 직후 남겨둔
+    /// `pending_resume_agent`를, 새 활성 워크스페이스의 `restore_agents`가 채워지고 나서
+    /// 대신 실행한다. `poll_pending_workspace_focus`와 같은 틱에서 돈다(그 뒤에 호출) —
+    /// 둘 다 `poll_workspace_controller`가 만든 상태를 그날 프레임 안에서 소비한다.
+    fn poll_pending_resume_agent(&mut self) {
+        let Some(pending) = self.pending_resume_agent.clone() else {
+            return;
+        };
+        // 판단은 pending_resume_step이 갖는다(테스트 가능) — 여기서는 실행만 한다.
+        match pending_resume_step(
+            &pending,
+            &self.active.id,
+            self.active.runtime_instance,
+            self.restore_loaded_for.as_deref(),
+            std::time::Instant::now(),
+        ) {
+            // 사용자가 그 사이 다른 워크스페이스로 옮겼거나 runtime이 재구성됐다 —
+            // 재개할 화면이 이미 없다, 조용히 포기한다.
+            PendingResumeStep::Abandon => {
+                self.pending_resume_agent = None;
+            }
+            // agent state worker가 아직 restore_agents를 못 채웠다 — 다음 틱에 다시 본다.
+            PendingResumeStep::Wait => {
+                self.egui_ctx
+                    .request_repaint_after(std::time::Duration::from_millis(50));
+            }
+            PendingResumeStep::TimedOut => {
+                self.pending_resume_agent = None;
+                self.notify_resume_failed(&pending.title);
+            }
+            PendingResumeStep::Run => {
+                self.pending_resume_agent = None;
+                if self.stage_agent_resume(&pending.pane_key, &pending.title, pending.session) {
+                    self.resumed_panes.insert(pending.pane_key);
+                    self.reveal_terminal_session();
+                } else {
+                    // 데이터는 도착했는데 이미 재개할 게 없어졌다(그 사이 pane이 정리됐거나
+                    // 다른 이유로 stale해짐) — 조용히 포기하지 않는다.
+                    self.notify_resume_failed(&pending.title);
+                }
+            }
         }
     }
 
@@ -16335,10 +19696,34 @@ impl App {
         self.work_history_projection_cache.clear();
         self.work_history_pending.clear();
         self.work_history_rows.clear();
+        self.work_history_rows_revision = self.work_history_rows_revision.wrapping_add(1).max(1);
         self.work_history_workspace_id = None;
         self.work_history_error = None;
         self.work_history_git_cwds.clear();
         self.work_history_git_generation = self.work_history_git_generation.wrapping_add(1).max(1);
+        if !self.transcript_viewer_ui.is_empty() {
+            // 열려 있던 원문은 이전 워크스페이스 턴의 것이라 더 이상 유효하지 않다 —
+            // 닫힌 상태로 되돌린다(2026-08-15 Task 10).
+            self.transcript_viewer_ui = ui::transcript_viewer::TranscriptViewerUi::default();
+        }
+        // 원문 IO 세대도 올린다 — 뷰어를 방금 비웠어도 in-flight이거나 큐 대기 중이던
+        // 이전 워크스페이스의 원문 읽기가 완료되면 세대 검사 없이는 방금 비운 뷰어를
+        // 되살릴 수 있었다(2026-08-16, 코드 리뷰 항목 2).
+        invalidate_transcript_requests(
+            &mut self.transcript_generation,
+            &mut self.pending_app_host_retry,
+        );
+        // Git 보조 본문도 이력과 같은 자리에서 무효화한다 — `git_tab`은 열린 채 유지하되
+        // 스냅샷·diff·cwd·세대는 새 워크스페이스 기준으로 다시 채워야 한다(항목 1).
+        reset_git_surfaces(
+            &mut self.git_panel_ui,
+            &mut self.diff_viewer_ui,
+            &mut self.git_panel_generation,
+            &mut self.git_panel_cwd,
+        );
+        // 보조 검색도 같은 자리에서 비운다 — 이전 워크스페이스에서 찾던 문구가 새
+        // 워크스페이스의 이력/Git 목록을 걸러 놓으면 "왜 안 보이지"가 된다(스펙).
+        self.aux_search.reset();
         // 이력 탭은 워크스페이스를 바꿔도 유지한다 — 열려 활성인 상태였다면 새
         // 워크스페이스 projection을 기다리는 loading으로 이어 붙인다.
         self.work_history_loading = self.work_history_tab.is_active();
@@ -16632,7 +20017,16 @@ impl App {
                     tracing::warn!("터미널 글꼴 크기 저장 실패: {error:#}");
                 }
             }
-            A::TerminalSearch => self.active.workspace_ui.open_search(),
+            // 보조 본문(이력·Git)이 활성이면 이 단축키는 터미널 검색이 아니라 보조
+            // 검색을 토글한다 — 세션 헤더 검색 버튼(workspace.rs
+            // `search_click_targets_aux_search`)과 같은 규칙(스펙 "진입").
+            A::TerminalSearch => {
+                if self.work_history_tab.is_active() || self.git_tab.is_active() {
+                    self.aux_search.toggle();
+                } else {
+                    self.active.workspace_ui.open_search();
+                }
+            }
             // 컴포저 포커스+펼침. 이미 포커스면 이 경로는 오지 않는다(text_edit_focused
             // 조기 반환) — 접기는 컴포저가 ⌘J를 직접 소비해 처리한다.
             // 설정 OFF면 무시 — 숨겨진(미생성) 도크에 포커스를 줄 수 없다.
@@ -18205,6 +21599,92 @@ impl App {
             _ => None,
         };
         let Some(outcome) = outcome else {
+            // 세션은 .env와 독립이다(위 dotenv_failure_allows_session 주석 참고).
+            //
+            // `runtime.dotenv_state`는 **절대 건드리지 않는다**. 여기서 baseline을
+            // 기록하면 execute_dotenv_sync_job이 다음 요청을 "변한 게 없다"며 건너뛰어
+            // (`job.previous_state == Some(baseline)`) 재시도가 영영 막힌다. 동기화는
+            // 여전히 실패한 상태로 남겨두고 세션만 통과시킨다.
+            if dotenv_failure_allows_session(&pending.continuation) {
+                // 에이전트면 승인 티켓을 성공 경로와 **동일하게** 소비한다. 빼먹으면
+                // 티켓이 미소비로 남아 승인 추적이 어긋나고 런처 요청이 매달린다.
+                if let Some(ticket_id) = agent_ticket
+                    && !self
+                        .approval_launch_tracker
+                        .mark_spawn_sent(ticket_id, std::time::Instant::now())
+                {
+                    self.agents_ui
+                        .report_error(ui::agents::AgentsUiErrorCode::LaunchFailed);
+                    if let Some(request_id) = launcher_request_id {
+                        self.fail_agent_launcher_request(request_id);
+                    }
+                    tracing::warn!(
+                        kind = "agent",
+                        phase = "spawn_admission",
+                        error_code = "stale_ticket",
+                        "agent launch ticket expired before delivery"
+                    );
+                    return;
+                }
+            }
+            // runtime을 mut로 빌리기 전에 만들어 둔다 — 안에서 self를 다시 못 빌린다.
+            let fallback_cache_policy = self.terminal_cache_policy_command();
+            if dotenv_failure_allows_session(&pending.continuation)
+                && let Some(runtime) = self.runtime_by_instance_mut(pending.runtime_instance)
+            {
+                let delivered = match pending.continuation {
+                    PendingDotenvContinuation::AgentLaunch { command, .. } => {
+                        runtime.runtime.send_command(command).is_ok()
+                    }
+                    PendingDotenvContinuation::WorkspaceProtocol {
+                        operation,
+                        generation,
+                        command,
+                    } => {
+                        let delivered = runtime.runtime.send_command(command).is_ok();
+                        runtime.workspace_ui.complete_protocol(
+                            ui::workspace::WorkspaceProtocolCompletion {
+                                operation,
+                                generation,
+                                result: delivered.then_some(()).ok_or(
+                                    ui::workspace::WorkspaceProtocolErrorCode::DeliveryFailed,
+                                ),
+                            },
+                        );
+                        delivered
+                    }
+                    PendingDotenvContinuation::RuntimeCommand(command) => {
+                        runtime.runtime.send_command(command).is_ok()
+                    }
+                    _ => unreachable!("dotenv_failure_allows_session이 세션 생성만 통과시킨다"),
+                };
+                // 캐시 정책은 성공 경로가 모든 세션에 반드시 보내는 것이다. 여기서
+                // 빼면 그 워커는 다음 설정 변경 때까지 기본 예산으로 돈다(2026-08-21 리뷰).
+                let _ = runtime.runtime.send_command(fallback_cache_policy);
+                tracing::warn!(
+                    kind = "dotenv",
+                    phase = "continuation",
+                    error_code = "session_without_env",
+                    workspace_id = %pending.workspace_id,
+                    delivered,
+                    "dotenv sync failed; opened the session without project env"
+                );
+                if delivered && is_agent_launch {
+                    // 성공 경로와 **같은 뒷정리**를 한다. `mark_launch_accepted`를 빼면
+                    // `pending_agent_spawns`가 안 늘어, 곧바로 워크스페이스를 전환했을 때
+                    // `has_live_sessions`가 그 워크스페이스를 죽은 것으로 오판해 방금
+                    // 띄운 에이전트 PTY가 suspend로 죽을 수 있다(2026-07-05에 고쳤던
+                    // race를 이 경로에만 재도입하는 셈이었다, 2026-08-21 리뷰 HIGH).
+                    self.agents_ui.mark_launch_accepted();
+                    self.reveal_active_workspace_for_new_session();
+                }
+                if delivered {
+                    // env 없이 떴다는 사실이 사용자에게 보여야 한다 — 로그만 남기면
+                    // 에이전트가 인증 실패로 죽어도 원인을 알 수 없다(리뷰 HIGH).
+                    self.notify_session_without_env();
+                }
+                return;
+            }
             if restore_lifetime
                 && let Some(runtime) = self.runtime_by_instance_mut(pending.runtime_instance)
             {
@@ -18283,15 +21763,23 @@ impl App {
         }
         let live_reload = self.config.ui.env_live_reload;
         let cache_policy = self.terminal_cache_policy_command();
+        let mut skipped_env_keys: Vec<String> = Vec::new();
         if let Some(payload) = &mut payload {
             if let Some(report) = payload.report.take()
-                && report.upserted + report.removed > 0
+                && report.upserted + report.removed + report.skipped_keys.len() > 0
             {
                 tracing::info!(
                     upserted = report.upserted,
                     removed = report.removed,
+                    // 보호할 수 없어 제외한 키. 채우기만 하고 여기서 버리면 사용자가
+                    // "이 환경변수가 왜 세션에 없지"를 알 방법이 없다(2026-08-21 리뷰).
+                    skipped = report.skipped_keys.len(),
+                    skipped_keys = %report.skipped_keys.join(","),
                     "dotenv launch synchronization"
                 );
+                if !report.skipped_keys.is_empty() {
+                    skipped_env_keys = report.skipped_keys.clone();
+                }
             }
             if live_reload && let Some(root) = pending.root.as_deref() {
                 payload
@@ -18301,6 +21789,17 @@ impl App {
                     .env_plain
                     .push(("DEPPY_PROJECT_ROOT".to_owned(), root.display().to_string()));
             }
+        }
+        if !skipped_env_keys.is_empty() {
+            // 제외된 키를 사용자에게 알린다. 로그만 남기면 "이 환경변수가 왜 세션에
+            // 없지"를 알 방법이 없다(2026-08-21 리뷰: skipped_keys가 죽은 데이터였다).
+            platform::notify(
+                &self.i18n.t(
+                    "dotenv.keys_excluded",
+                    &[("keys", &skipped_env_keys.join(", "))],
+                ),
+                "",
+            );
         }
         let restore_command_allowed = restore_pane.as_ref().is_none_or(|pane| {
             self.cross_workspace_restore
@@ -19046,6 +22545,16 @@ impl App {
                 } else {
                     self.agent_launcher_ui
                         .report_error(ui::agent_launcher::LauncherErrorCode::LaunchBusy);
+                }
+            }
+            // 카드 스위치 → 거부 목록 갱신 + config 저장. leaf는 config를 직접 쓰지
+            // 않으므로(저장소 관례) 여기 App(logic 경로, render 아님)이 맡는다 —
+            // A::ToggleSidebar 등 기존 단축키 핸들러와 같은 자리·같은 방식.
+            ui::agent_launcher::AgentLauncherIntent::SetAgentEnabled { kind, enabled } => {
+                self.config.agents.disabled =
+                    toggled_disabled_agents(&self.config.agents.disabled, kind, enabled);
+                if let Err(error) = self.config.save(&self.config_path) {
+                    tracing::warn!("에이전트 거부 목록 저장 실패: {error:#}");
                 }
             }
         }
@@ -20357,15 +23866,29 @@ impl App {
     /// `resolve_session_title`과 같은 규칙: 사용자가 rename했으면 그대로, 기본 제목
     /// ("셸 N")이면 세션 cwd의 프로젝트명으로 대체한다. 감지 워커는 활성 워크스페이스만
     /// 돌지만 cwd는 worker가 DB에 영속하므로(UpdateSessionCwd) 여기서 재사용한다.
-    /// cwd를 못 찾으면 기본 제목을 i18n 렌더한 값("셸 1")으로 폴백.
+    /// cwd를 못 찾으면 기본 제목을 i18n 렌더한 값("셸 1")으로 폴백. 대체한 프로젝트명이
+    /// 이 워크스페이스 자체 이름과 다르면 소속을 함께 밝힌다(`ui::workspace::
+    /// qualify_project_name` — `resolve_session_title`/`session_project_context`와
+    /// 규칙을 공유해, 사이드바·활동 패널·폰 대시보드·OS 알림 어디서 봐도 표기가 갈리지
+    /// 않는다. 2026-08-19 코드 리뷰: 이 호출부(warm/유휴 행)가 실제로 사용자가 본 화면
+    /// 이었다).
     fn activity_session_name(&self, workspace_id: &str, raw_title: &str) -> String {
         let cwd = self
             .persisted_activity_panes
             .get(workspace_id)
             .and_then(|panes| pane_cwd(panes, raw_title));
-        activity_session_name(raw_title, cwd, &self.i18n, |cwd| {
-            self.activity_project_names.get(cwd).cloned().flatten()
-        })
+        let workspace_name = self
+            .workspaces
+            .iter()
+            .find(|row| row.id == workspace_id)
+            .map(Self::workspace_display_name);
+        activity_session_name(
+            raw_title,
+            cwd,
+            &self.i18n,
+            workspace_name.as_deref(),
+            |cwd| self.activity_project_names.get(cwd).cloned().flatten(),
+        )
     }
 
     /// 폭주 확정 알림 큐(active+warm)를 비워 OS 알림을 1회씩 발화한다 (로드맵 B2).
@@ -20396,6 +23919,26 @@ impl App {
             );
             platform::notify(&summary, &body);
         }
+    }
+
+    /// dotenv 동기화가 실패한 채로 세션을 열었을 때(2026-08-21). 세션을 여는 일은
+    /// `.env`와 독립이지만, **프로젝트 환경 없이 떴다는 사실은 보여야 한다** — 안
+    /// 보이면 에이전트가 인증 실패로 죽어도 사용자가 원인을 알 수 없다.
+    fn notify_session_without_env(&self) {
+        platform::notify(&self.i18n.t("dotenv.session_without_env", &[]), "");
+    }
+
+    /// warm(비활성) 워크스페이스 행의 「이어가기」가 실패했을 때 — 전환 자체가
+    /// 실패했거나, 전환 후 데이터를 기다리다 타임아웃했거나, 데이터가 도착했는데도
+    /// 이미 재개할 게 없어졌을 때 호출한다(2026-08-20). 버튼을 눌렀는데 조용히 아무
+    /// 일도 없어 보이면 안 된다는 요구사항 — worktree 실패 알림과 같은 패턴
+    /// (`platform::notify` + `self.i18n.t`, `dispatch_storm_notifications` 주석의
+    /// notify-rust 금지 사유도 동일하게 적용).
+    fn notify_resume_failed(&self, title: &str) {
+        platform::notify(
+            &self.i18n.t("sidebar.resume_failed", &[("title", title)]),
+            "",
+        );
     }
 
     /// macOS의 시스템 전체 메모리 압박이 Critical로 격상됐을 때 OS 알림을 발화한다.
@@ -22512,6 +26055,14 @@ impl App {
         if let Some(state) = self.web.take() {
             state.server.shutdown();
         }
+        // Relay 워커도 같은 이유로 runtime보다 먼저 정지·join한다.
+        if let Some(mut worker) = self.relay_worker.take() {
+            worker.shutdown();
+        }
+        // 두 전송이 모두 멈춘 뒤에야 공유 코어를 정리한다.
+        if let Some(core) = self.session_core.take() {
+            core.shutdown();
+        }
         // remote TLS 서버를 먼저 정지 — accept 루프·접속·전용 worker(그 세션들 reap)를 정리한다.
         if let Some(state) = self.remote.take() {
             state.server.shutdown();
@@ -22695,6 +26246,9 @@ impl eframe::App for App {
         }
         self.poll_workspace_controller();
         self.poll_pending_workspace_focus();
+        self.poll_pending_resume_agent();
+        self.poll_pending_document_open();
+        self.poll_document_io();
         self.poll_turn_done_clear();
         self.apply_pending_visual_settings(ctx);
         self.poll_worktree_jobs();
@@ -23595,8 +27149,29 @@ impl eframe::App for App {
                 entry.attention = entry
                     .session
                     .is_some_and(|session| needs_input.contains(&session));
-                entry.resumable =
-                    entry.agent_line.is_none() && self.restore_agents.contains_key(&entry.pane.0);
+                // 비활성(warm) 워크스페이스 행의 「이어가기」 노출 판정(2026-08-20).
+                //
+                // 한때 `self.restore_agents`를 그대로 조회해 우연히 false가 나오고
+                // 있었다 — 그 캐시는 활성 워크스페이스 한 곳만 담아(`request_agent_state_
+                // scope`가 `self.active.id` 하나만 싣는다) `MuxPaneId`가 UUID라 warm 행의
+                // pane id가 들어 있을 수 없었다. 우연히 맞는 동작이라 위험했다: 그
+                // 캐시를 전역화하면 버튼은 뜨는데, 실행부(`stage_agent_resume`)는 여전히
+                // 활성 워크스페이스의 `restore_agents`만 봐서 눌러도 조용히 아무 일도
+                // 안 일어났다(`WorkspaceControllerAction::ResumeAgent`가 워크스페이스를
+                // 전환하지 않았다).
+                //
+                // 이제 둘 다 갖췄다 — (1) `self.global_resumable_panes`가 전
+                // 워크스페이스 스코프의 (workspace_id, pane_id) 존재 여부를 담고(유계,
+                // `AGENT_SESSIONS_GLOBAL_BOUNDED_*`, `AgentStateSection::Restore`가 돌 때마다
+                // 갱신), (2) `ResumeAgent` 핸들러가 비활성 워크스페이스면 먼저
+                // `switch_workspace`한 뒤 `pending_resume_agent`로 지연 실행해 새 활성
+                // 워크스페이스의 `restore_agents`가 채워진 뒤에야 `stage_agent_resume`을
+                // 부른다(`poll_pending_resume_agent`). 그래서 여기서 다시 true를 켜도
+                // 안전하다.
+                entry.resumable = entry.agent_line.is_none()
+                    && self
+                        .global_resumable_panes
+                        .contains(&(workspace.id.clone(), entry.pane.0.clone()));
             }
             let entries = entries
                 .into_iter()
@@ -23638,6 +27213,7 @@ impl eframe::App for App {
             // 안 된다. 매 프레임 build_fleet_sessions를 돌리지 않는 싼 프록시다.
             fleet_count: self.approvals_ui.pending().len() + self.global_waiting.len(),
             history_tab_active: self.work_history_tab.is_active(),
+            git_tab_active: self.git_tab.is_active(),
             agents_open: self.agent_sessions_ui.is_open(),
             workspace_note: self.workspace_note.as_deref(),
         };
@@ -23731,25 +27307,71 @@ impl eframe::App for App {
                     .inner_margin(egui::Margin::ZERO),
             )
             .show(ui, |ui| {
-                // app-server가 5시간 창 없이 주간만 줬을 때만 백엔드 보충을 깨운다 —
-                // 5시간 창이 있는 계정은 백엔드를 아예 두드리지 않는다.
+                // app-server가 아직 없거나 일부 창만 줬을 때만 백엔드 보충을 깨운다.
+                // Finder 실행 환경에서 app-server 시작이 늦어져도 인증된 계정 사용량은
+                // 하단 바에 표시하고, app-server 값이 도착하면 그 값이 우선한다.
                 let codex_server_usage = self.agent_sessions_ui.codex_usage();
-                let codex_backend_five_hour = matches!(codex_server_usage, Some((None, Some(_))))
+                let codex_enabled = crate::agent_launcher::agent_is_enabled(
+                    &self.config.agents.disabled,
+                    crate::agent_launcher::AgentKind::Codex,
+                );
+                let codex_needs_backend = codex_server_usage
+                    .is_none_or(|(five_hour, weekly)| five_hour.is_none() || weekly.is_none());
+                let codex_backend = (codex_enabled && codex_needs_backend)
                     .then(|| crate::codex_backend_usage::current(ui.ctx()))
-                    .flatten()
-                    .and_then(|backend| backend.five_hour);
-                // 사용량은 계정 단위 값이라 워크스페이스와 무관하다. 「안 쓰는 사용자에게
-                // 걸지 않는다」는 kimi_usage가 설치 여부로 스스로 판정한다 —
-                // agent_kinds는 **활성 워크스페이스만** 담아서, 다른 워크스페이스에서
-                // Kimi를 쓰면 게이트가 조용히 막았다(2026-08-10 실증: 프로브가 한 번도
-                // 안 돌았다). claude 경로와 같은 모양으로 무조건 부른다.
-                let kimi_usage = crate::kimi_usage::current(ui.ctx());
+                    .flatten();
+                // 사용량은 계정 단위 값이라 워크스페이스와 무관하다. 전역 런처 스냅샷이
+                // 감지한 정확한 실행 경로가 있고 provider도 켜진 경우에만 프로브한다.
+                // 활성 워크스페이스의 agent_kinds로 게이트하던 과거 구현은 다른
+                // 워크스페이스의 Kimi를 놓쳤다(2026-08-10 실증).
+                let launcher_snapshot = self.agent_launcher_snapshot.as_ref();
+                let kimi_agent = launcher_snapshot
+                    .and_then(|snapshot| snapshot.find(crate::agent_launcher::AgentKind::Kimi));
+                let claude_agent = launcher_snapshot
+                    .and_then(|snapshot| snapshot.find(crate::agent_launcher::AgentKind::Claude));
+                let kimi_usage = provider_probe_enabled(
+                    &self.config.agents.disabled,
+                    crate::agent_launcher::AgentKind::Kimi,
+                    kimi_agent.is_some(),
+                )
+                .then(|| crate::kimi_usage::current(ui.ctx(), kimi_agent))
+                .flatten();
+                let claude_usage = provider_probe_enabled(
+                    &self.config.agents.disabled,
+                    crate::agent_launcher::AgentKind::Claude,
+                    claude_agent.is_some(),
+                )
+                .then(|| {
+                    claude_usage_snapshot()
+                        .or_else(|| crate::claude_usage::current(ui.ctx(), claude_agent))
+                })
+                .flatten();
+                let codex_usage = merge_codex_usage(codex_server_usage, codex_backend);
+                let grok_agent = launcher_snapshot
+                    .and_then(|snapshot| snapshot.find(crate::agent_launcher::AgentKind::Grok));
+                let grok_usage = crate::agent_launcher::agent_is_enabled(
+                    &self.config.agents.disabled,
+                    crate::agent_launcher::AgentKind::Grok,
+                )
+                .then(|| crate::grok_usage::current(ui.ctx(), grok_agent))
+                .flatten();
+                // 바깥 Option은 설치 감지, 안쪽 Option은 probe 숫자다. 설치된 Grok의
+                // 첫 probe/일시 실패는 `Some(None)`으로 넘겨 Codex 옆 칸을 유지하되,
+                // 미설치 상태는 `None`이라 칸 자체를 만들지 않는다.
+                let grok_status = grok_agent.map(|_| grok_usage);
+                let kimi_status = kimi_agent.map(|_| kimi_usage);
                 status_intent = self.agent_terminal_ui.status_bar_with_managers(
                     ui,
-                    claude_usage_snapshot().or_else(|| crate::claude_usage::current(ui.ctx())),
-                    supplement_codex_five_hour(codex_server_usage, codex_backend_five_hour),
+                    claude_usage,
+                    codex_usage,
                     self.agent_sessions_ui.codex_usage_meta(),
-                    kimi_usage,
+                    kimi_status,
+                    grok_status,
+                    // 런처에서 끈 에이전트는 사용량 바에서도 권하지 않는다 — usage 값은
+                    // 그대로 넘기고 「꺼짐」만 별도 신호로 보내, top_provider_usage가
+                    // "켜짐인데 값 없음"(—로 자리 유지)과 "꺼짐"(칸 자체 없음)을
+                    // 구분하게 한다. 표시 규칙일 뿐이라 탐지·이력에는 손대지 않는다.
+                    &self.config.agents.disabled,
                     activity_rows.rows(),
                     approval_count,
                     &waiting_sessions,
@@ -23859,30 +27481,71 @@ impl eframe::App for App {
                     // 레일은 이제 전역 페이지가 아니라 **현재 워크스페이스의 이력 보조
                     // 탭**을 연다/활성화한다. 재클릭은 탭을 지우지 않고 세션 탭으로만
                     // 돌아간다(탭 제거는 이력 X 전용).
+                    let previous_history_active = self.work_history_tab.is_active();
                     self.work_history_tab = self.work_history_tab.on_rail_click();
+                    if self.work_history_tab.is_active() != previous_history_active {
+                        // 헤더 탭 클릭(apply_work_history_tab_intent)과 같은 이유로
+                        // 비운다 — 레일도 활성 보조 탭을 바꾸는 또 다른 진입점이다.
+                        self.aux_search.reset();
+                    }
                     if self.work_history_tab.is_active() {
+                        // Git이 활성이었다면 물러난다 — 보조 본문은 하나뿐이다(스펙 §8-2).
+                        (self.work_history_tab, self.git_tab, self.document_tab) =
+                            resolve_aux_tab_exclusivity(
+                                self.work_history_tab,
+                                self.git_tab,
+                                self.document_tab,
+                                AuxTabWinner::History,
+                            );
                         // 홈/작업 페이지 위에서 눌렀다면 탭이 있는 작업면으로 먼저 돌아간다.
-                        self.agent_terminal_ui
-                            .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
+                        self.reveal_terminal_view_for_aux_tab();
                         self.enter_work_history_tab();
+                    }
+                }
+                Some(ui::file_tree::SidebarAction::ShowGit) => {
+                    // 레일 「Git」 — 이력과 같은 재클릭 규칙(활성 재클릭 시 세션으로 복귀,
+                    // 탭 자체는 남는다).
+                    let previous = self.git_tab;
+                    self.git_tab = previous.on_rail_click();
+                    if self.git_tab.is_active() != previous.is_active() {
+                        // 레일도 활성 보조 탭을 바꾸는 진입점이다(apply_git_tab_intent와
+                        // 같은 이유).
+                        self.aux_search.reset();
+                    }
+                    if self.git_tab.is_active() {
+                        // 이력과 같은 진입 — 활성이 될 때만 스냅샷을 새로 받는다(폴링 없음).
+                        (self.work_history_tab, self.git_tab, self.document_tab) =
+                            resolve_aux_tab_exclusivity(
+                                self.work_history_tab,
+                                self.git_tab,
+                                self.document_tab,
+                                AuxTabWinner::Git,
+                            );
+                        self.reveal_terminal_view_for_aux_tab();
+                        self.request_git_panel_io(
+                            ui.ctx(),
+                            ui::git_panel::GitPanelIoRequest::Snapshot,
+                        );
                     }
                 }
                 Some(ui::file_tree::SidebarAction::OpenAgents) => {
                     self.agent_sessions_ui.open();
                 }
+                Some(ui::file_tree::SidebarAction::CheckUpdate) => {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(
+                        "https://github.com/JRVector9/deppy-sijo/releases",
+                    ));
+                }
+                Some(ui::file_tree::SidebarAction::OpenFeedback) => {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(
+                        "https://github.com/JRVector9/deppy-sijo/issues/new",
+                    ));
+                }
                 Some(ui::file_tree::SidebarAction::OpenSettings) => {
                     self.settings_open = true;
                 }
-                Some(ui::file_tree::SidebarAction::OpenHelp) => {
-                    ui.ctx().open_url(egui::OpenUrl::new_tab(
-                        "https://github.com/JRVector9/deppy-sijo",
-                    ));
-                }
-                Some(ui::file_tree::SidebarAction::ShowFocusedDiff) => {
-                    if let Some(session) = self.active.workspace_ui.focused_session() {
-                        self.open_session_diff(ui.ctx(), session);
-                    }
-                }
+                // Git은 2026-08-15 2차부터 pane 보조 탭이다 — 새로고침/원격 열기/파일
+                // diff는 이제 git 패널이 보조 본문 안에서 App에 직접 올린다.
                 Some(ui::file_tree::SidebarAction::NoteEdited(body)) => {
                     // 기록은 여기서 하지 않는다 — 디바운스 만료와 깨우기는 logic()이
                     // 소유한다(check-boundary: App::ui는 repaint 타이머를 설치하지 않는다).
@@ -24000,12 +27663,35 @@ impl eframe::App for App {
                         None => tracing::warn!("세션 cwd 미확인 — 경로 복사 생략"),
                     }
                 }
-                // 변경 보기 — 세션 cwd 레포의 diff 패널(독립 창)을 연다.
-                // cwd 미확인이어도 패널은 열어 안내를 표시한다 (조용한 실패 금지).
-                // 제목은 인박스와 같은 관례로 해석 — "세션 #2"보다 "SKRT · Claude"가
-                // 무엇의 변경분인지 바로 판단된다(2026-07-18 사용자: 가독성 개선 요청).
+                // 변경 보기 — 세션 행 컨텍스트 메뉴. Git 보조 탭을 열고 활성화해 **그
+                // 세션의** repo 스냅샷을 연다. 한때 포커스 세션 기준으로 일원화했었는데
+                // (Task 10 Step 9) 회귀였다 — 포커스가 다른 세션에 있으면 엉뚱한 repo가
+                // 떴다. Git 탭 진입은 유지하되 cwd는 이 세션 기준으로 고정한다
+                // (2026-08-15 회귀 수정 유지, 2차에서 사이드바 탭 → 보조 탭으로 갱신).
                 Some(ui::file_tree::SidebarAction::ShowDiff { session }) => {
-                    self.open_session_diff(ui.ctx(), session);
+                    self.git_tab = ui::workspace::PaneAuxTabState::OpenActive;
+                    (self.work_history_tab, self.git_tab, self.document_tab) =
+                        resolve_aux_tab_exclusivity(
+                            self.work_history_tab,
+                            self.git_tab,
+                            self.document_tab,
+                            AuxTabWinner::Git,
+                        );
+                    self.reveal_terminal_view_for_aux_tab();
+                    let cwd = self.cached_session_cwd(session).map(PathBuf::from);
+                    self.request_git_panel_io_at(
+                        ui.ctx(),
+                        cwd,
+                        ui::git_panel::GitPanelIoRequest::Snapshot,
+                    );
+                }
+                // 파일 트리에서 문서 대상(md·txt 등)을 열었다(D0) — kind는 아직 쓰지 않는다
+                // (본문은 자리표시자, 실제 소스/미리보기는 D1·D2가 채운다).
+                Some(ui::file_tree::SidebarAction::OpenDocument {
+                    target,
+                    kind: _kind,
+                }) => {
+                    self.open_document(target.as_path().to_path_buf());
                 }
                 // 새 워크트리 셸 (PR-W) — 백그라운드에서 repo_root → exclude 보장 →
                 // worktree add 후, 아래 worktree_rx 폴링부가 그 폴더에서 셸을 연다.
@@ -24052,13 +27738,16 @@ impl eframe::App for App {
                     );
                 }
                 // 저장된 에이전트 수동 이어가기 — 자동 이어가기 OFF여도 동작한다.
+                // 비활성(warm) 행이면 workspace_id가 활성과 달라 App이 먼저 전환한다.
                 Some(ui::file_tree::SidebarAction::ResumeAgent {
+                    workspace_id,
                     pane,
                     session,
                     title,
                 }) => {
                     self.stage_workspace_controller_action(
                         WorkspaceControllerAction::ResumeAgent {
+                            workspace_id,
                             pane_key: pane.0,
                             title,
                             session,
@@ -24139,6 +27828,10 @@ impl eframe::App for App {
         let information_visible = home_visible || fleet_visible;
         // 이력은 전역 페이지가 아니라 포커스된 세션 pane 헤더 옆의 보조 탭이다.
         let history_tab_active = self.work_history_tab.is_active();
+        // Git도 이력과 같은 보조 탭이다 — 동시 활성은 없다(스펙 §8-2).
+        let git_tab_active = self.git_tab.is_active();
+        // 문서도 같은 보조 탭이다(D0) — 셋 다 동시 활성은 없다.
+        let document_tab_active = self.document_tab.is_active();
         // 홈/작업함/fleet이 중앙을 차지해도 활성 워크스페이스 이벤트는 계속 소화한다.
         if information_visible {
             self.active
@@ -24218,19 +27911,40 @@ impl eframe::App for App {
         };
 
         let terminal_visible = central_view == ui::agent_terminal::AgentTerminalView::Terminal;
-        // 이력 탭 chrome은 **탭이 열려 있고** 작업면이 보일 때만 존재한다. 닫힘 상태와
-        // 홈/작업 페이지에서는 세션 헤더가 예전 그대로다 — 이력 X가 실제로 탭을 없앤다.
-        self.active.workspace_ui.set_aux_tab(
-            (terminal_visible && self.work_history_tab.is_open()).then(|| {
-                ui::workspace::PaneAuxTab {
-                    label: text.t("workspace.tab.history", &[]),
-                    active: history_tab_active,
-                }
-            }),
-        );
-        // 이력 본문이 떠 있는 동안 입력 소유권은 명시적으로 없다(fail-closed) —
+        // 보조 탭(이력·Git) chrome은 **탭이 열려 있고** 작업면이 보일 때만 존재한다.
+        // 닫힘 상태와 홈/작업 페이지에서는 세션 헤더가 예전 그대로다 — X가 실제로
+        // 탭을 없앤다.
+        let mut aux_tabs = Vec::new();
+        if terminal_visible && self.work_history_tab.is_open() {
+            aux_tabs.push(ui::workspace::PaneAuxTab {
+                kind: ui::workspace::PaneAuxTabKind::History,
+                label: text.t("workspace.tab.history", &[]),
+                active: history_tab_active,
+            });
+        }
+        if terminal_visible && self.git_tab.is_open() {
+            aux_tabs.push(ui::workspace::PaneAuxTab {
+                kind: ui::workspace::PaneAuxTabKind::Git,
+                label: text.t("workspace.tab.git", &[]),
+                active: git_tab_active,
+            });
+        }
+        // 문서 탭 라벨은 파일명이다(설계 §2 — 문서가 먼저 축약되는 이유이기도 하다).
+        // 열려 있는 문서마다 하나씩(멀티 문서 탭 설계 §2) — `active`는 그중 지금
+        // 보이는 문서 하나에만 선다.
+        if terminal_visible && self.document_tab.is_open() {
+            for document in &self.documents {
+                aux_tabs.push(ui::workspace::PaneAuxTab {
+                    kind: ui::workspace::PaneAuxTabKind::Document(document.id),
+                    label: ui::path_file_name_display(&document.path),
+                    active: document_tab_active && self.active_document == Some(document.id),
+                });
+            }
+        }
+        self.active.workspace_ui.set_aux_tabs(aux_tabs);
+        // 이력·Git 본문이 떠 있는 동안 입력 소유권은 명시적으로 없다(fail-closed) —
         // 타이핑·IME·붙여넣기가 숨은 PTY로 새지 않게 한다.
-        if terminal_visible && !history_tab_active {
+        if terminal_visible && !(history_tab_active || git_tab_active || document_tab_active) {
             self.frame_terminal_owner = frame_terminal_owner(
                 &self.cross_workspace_pane,
                 true,
@@ -24249,8 +27963,11 @@ impl eframe::App for App {
             self.frame_terminal_owner = FrameTerminalOwner::None;
         }
         // 컴포저는 터미널 표면에만 붙는다. 홈/작업함/fleet은 전체 폭 페이지가 중앙을 쓴다.
-        // 이력 탭이 활성이면 보낼 터미널이 없으므로 함께 감춘다.
-        if terminal_visible && !history_tab_active && self.config.ui.composer_enabled {
+        // 이력·Git 탭이 활성이면 보낼 터미널이 없으므로 함께 감춘다.
+        if terminal_visible
+            && !(history_tab_active || git_tab_active || document_tab_active)
+            && self.config.ui.composer_enabled
+        {
             self.render_composer_dock(ui, &text);
         }
 
@@ -24269,12 +27986,8 @@ impl eframe::App for App {
         let mut fleet_page_click = None;
         let mut fleet_action = None;
         let mut work_history_action = None;
-        let mut work_history_tab_intent = None;
-        let work_history_presentations = if history_tab_active {
-            self.work_history_presentations()
-        } else {
-            Vec::new()
-        };
+        let mut git_panel_action = None;
+        let mut aux_tab_intent = None;
         let work_history_workspace_name = self.active_workspace_display_name();
         let work_history_current_branch = self
             .work_history_rows
@@ -24319,6 +28032,7 @@ impl eframe::App for App {
         };
         let mut primary_focus_requested = false;
         let mut primary_local_focus_claim = None;
+        let mut dropped_document_paths = Vec::new();
         let mut attached_focus_requested = None;
         let mut attached_detach_requested = None;
         let mut attached_reorder_requested = None;
@@ -24329,7 +28043,7 @@ impl eframe::App for App {
         let mut current_owner = FrameTerminalOwner::None;
         let mut dropped_session_open = None;
         let session_drop_label = (terminal_visible
-            && !history_tab_active
+            && !(history_tab_active || git_tab_active || document_tab_active)
             && egui::DragAndDrop::has_payload_of_type::<ui::file_tree::SessionRowDragPayload>(
                 ui.ctx(),
             ))
@@ -24685,28 +28399,35 @@ impl eframe::App for App {
                             .id_salt("cross_workspace_primary"),
                     );
                     primary.set_clip_rect(primary_rect.intersect(ui.clip_rect()));
-                    let primary_output = self
-                        .active
-                        .workspace_ui
-                        .show_with_input(
-                            &mut primary,
-                            &self.config.terminal,
-                            &events,
-                            &text,
-                            current_owner == FrameTerminalOwner::Primary && !history_tab_active,
-                        );
+                    let primary_output = self.active.workspace_ui.show_with_input(
+                        &mut primary,
+                        &self.config.terminal,
+                        &events,
+                        &text,
+                        current_owner == FrameTerminalOwner::Primary
+                            && !(history_tab_active || git_tab_active || document_tab_active),
+                    );
                     primary_focus_requested = primary_output.focus_requested;
                     primary_local_focus_claim = primary_output.local_focus_claimed;
-                    work_history_tab_intent = primary_output.aux_tab_intent;
+                    aux_tab_intent = primary_output.aux_tab_intent;
+                    dropped_document_paths.extend(primary_output.document_drop_paths);
+                    if primary_output.aux_search_toggle_requested {
+                        self.aux_search.toggle();
+                    }
                     if let Some(body) = primary_output.aux_body_rect {
-                        work_history_action = self.render_work_history_tab_body(
-                            &mut primary,
-                            body,
-                            &work_history_presentations,
-                            &work_history_workspace_name,
-                            work_history_current_branch.as_deref(),
-                            &text,
-                        );
+                        if git_tab_active {
+                            git_panel_action = self.render_git_tab_body(&mut primary, body, &text);
+                        } else if document_tab_active {
+                            self.render_document_tab_body(&mut primary, body, &text);
+                        } else {
+                            work_history_action = self.render_work_history_tab_body(
+                                &mut primary,
+                                body,
+                                &work_history_workspace_name,
+                                work_history_current_branch.as_deref(),
+                                &text,
+                            );
+                        }
                     }
                     if let Some(label) = session_drop_label.as_deref()
                         && dropped_session_open.is_none()
@@ -24728,20 +28449,29 @@ impl eframe::App for App {
                         &self.config.terminal,
                         &events,
                         &text,
-                        !history_tab_active,
+                        !(history_tab_active || git_tab_active || document_tab_active),
                     );
                     primary_focus_requested = primary_output.focus_requested;
                     primary_local_focus_claim = primary_output.local_focus_claimed;
-                    work_history_tab_intent = primary_output.aux_tab_intent;
+                    aux_tab_intent = primary_output.aux_tab_intent;
+                    dropped_document_paths.extend(primary_output.document_drop_paths);
+                    if primary_output.aux_search_toggle_requested {
+                        self.aux_search.toggle();
+                    }
                     if let Some(body) = primary_output.aux_body_rect {
-                        work_history_action = self.render_work_history_tab_body(
-                            ui,
-                            body,
-                            &work_history_presentations,
-                            &work_history_workspace_name,
-                            work_history_current_branch.as_deref(),
-                            &text,
-                        );
+                        if git_tab_active {
+                            git_panel_action = self.render_git_tab_body(ui, body, &text);
+                        } else if document_tab_active {
+                            self.render_document_tab_body(ui, body, &text);
+                        } else {
+                            work_history_action = self.render_work_history_tab_body(
+                                ui,
+                                body,
+                                &work_history_workspace_name,
+                                work_history_current_branch.as_deref(),
+                                &text,
+                            );
+                        }
                     }
                     if let Some(label) = session_drop_label.as_deref() {
                         dropped_session_open = session_pane_drop_interaction(
@@ -24761,13 +28491,21 @@ impl eframe::App for App {
                 .take(ui::cross_workspace::HARD_MAX_CROSS_WORKSPACE_PANES),
         );
         // 이력 본문이 떠 있던 프레임은 어떤 pane도 입력 소유자가 아니다.
-        self.frame_terminal_owner = if history_tab_active {
+        self.frame_terminal_owner = if history_tab_active || git_tab_active || document_tab_active {
             FrameTerminalOwner::None
         } else {
             current_owner
         };
-        if let Some(intent) = work_history_tab_intent {
-            self.apply_work_history_tab_intent(intent);
+        if let Some((kind, intent)) = aux_tab_intent {
+            match kind {
+                ui::workspace::PaneAuxTabKind::History => {
+                    self.apply_work_history_tab_intent(intent);
+                }
+                ui::workspace::PaneAuxTabKind::Git => self.apply_git_tab_intent(ui.ctx(), intent),
+                ui::workspace::PaneAuxTabKind::Document(id) => {
+                    self.apply_document_tab_intent(id, intent);
+                }
+            }
             ui.ctx().request_repaint();
         }
         self.sync_attached_runtime_visibility();
@@ -24803,12 +28541,30 @@ impl eframe::App for App {
         } else if primary_focus_requested {
             self.cross_workspace_pane.focus_primary();
         }
+        let document_drop_open_mode = if primary_local_focus_claim.is_some() {
+            DocumentDropOpenMode::ClaimedPane
+        } else {
+            DocumentDropOpenMode::ResolvePane
+        };
         if let Some(pane) = primary_local_focus_claim {
             // A click on the pane already focused by the runtime produces no FocusPane command,
             // but it is still a newer user navigation event than an asynchronous restore.
             self.cancel_terminal_focus_intents();
             self.active.workspace_ui.arm_terminal_focus(pane);
         }
+        dispatch_document_drop_paths(
+            dropped_document_paths,
+            document_drop_open_mode,
+            |mode, path| {
+                match mode {
+                    // Workspace가 이 프레임에 실제 visible pane을 claim했다. mux의 focus ACK는
+                    // 비동기이므로 옛 snapshot을 다시 물으면 다중 drop이 단일 pending slot을
+                    // 덮어쓴다. 방금 확인한 pane을 신뢰해 모든 경로를 순서대로 바로 연다.
+                    DocumentDropOpenMode::ClaimedPane => self.begin_document_open(path),
+                    DocumentDropOpenMode::ResolvePane => self.open_document(path),
+                }
+            },
+        );
         if let Some(attachment_id) = attached_detach_requested {
             self.stage_workspace_controller_action(WorkspaceControllerAction::DetachWorkspacePane(
                 attachment_id,
@@ -24822,6 +28578,53 @@ impl eframe::App for App {
         {
             self.pending_work_history_action = Some(action);
             ui.ctx().request_repaint();
+        }
+        // Git 보조 본문 intent — 새로고침/원격 열기/파일 diff는 IO 왕복이 필요해 바로
+        // 처리한다(스펙 §8-3·§8-5).
+        match git_panel_action {
+            Some(ui::git_panel::GitPanelAction::Refresh) => {
+                // 포커스 세션을 다시 묻지 않는다 — 패널이 이미 보여주고 있는 repo가
+                // 있으면(⟳ 클릭) 그 repo를 유지한다. 아직 없으면(워크스페이스 전환
+                // 직후 `reset_git_surfaces`가 비운 자리를 렌더가 자동으로 다시 채우는
+                // 경우) 포커스 세션 기준으로 새로 고른다(항목 3).
+                let cwd = resolve_git_refresh_cwd(GitRefreshCwd {
+                    pinned: self.git_panel_cwd.clone(),
+                    focused: self.focused_session_repo_cwd(),
+                });
+                self.request_git_panel_io_at(
+                    ui.ctx(),
+                    cwd,
+                    ui::git_panel::GitPanelIoRequest::Snapshot,
+                );
+            }
+            Some(ui::git_panel::GitPanelAction::OpenRemoteBranch) => {
+                self.open_git_panel_remote(ui.ctx());
+            }
+            Some(ui::git_panel::GitPanelAction::ShowFileDiff { rel_path, mode }) => {
+                self.diff_viewer_ui.open(rel_path.clone(), mode);
+                // 지금 패널이 보여주는 repo(`git_panel_cwd`)의 파일이다 — 포커스 세션을
+                // 다시 묻지 않는다(항목 3, Refresh와 같은 규칙).
+                self.request_git_panel_io_at(
+                    ui.ctx(),
+                    self.git_panel_cwd.clone(),
+                    ui::git_panel::GitPanelIoRequest::FileDiff { rel_path, mode },
+                );
+            }
+            Some(ui::git_panel::GitPanelAction::OpenWorktreeShell { path }) => {
+                // 「새 워크트리에서 셸」(PR-W)과 **같은 스폰 경로**다 — 워크트리를 만들지도
+                // 지우지도 않고, 이미 있는 워크트리로 들어갈 뿐이다(스펙 §8-5).
+                //
+                // 렌더 안에서 `reveal_active_workspace_for_new_session`을 직접 부르면
+                // `xtask check-boundary`가 막는다(렌더는 워크스페이스 수명 상태를 쓰지
+                // 않는다). 이미 있는 `SpawnShellAt` 액션으로 올려 다음 logic tick이
+                // 처리하게 한다 — 그 핸들러가 reveal + spawn_shell_at을 함께 한다.
+                // 셸이 뜨는 곳을 봐야 하므로 Git 탭은 세션 탭으로 물러난다(탭은 남는다).
+                self.git_tab = self.git_tab.on_session_tab_click();
+                self.stage_workspace_controller_action(WorkspaceControllerAction::SpawnShellAt {
+                    cwd: Some(path),
+                });
+            }
+            None => {}
         }
         // 작업함 페이지에서 세션 점프 — 터미널로 복귀한 뒤 기존 알림 네비게이션 경로
         // (아래 notif_click 합류 지점)에 태운다(사이드바 FocusSession과 같은 규칙).
@@ -25259,6 +29062,118 @@ impl eframe::App for App {
                 }
                 Some(false) => self.ws_close_confirm = None,
                 None => {}
+            }
+        }
+
+        // 문서 탭 확인 모달(설계 §3.3·§7, 멀티 문서 탭 설계) — 닫기는 저장/버리기/취소,
+        // 저장 충돌은 다시 불러오기/취소(「다른 이름으로」는 이번 범위에서 뺐다). 교체
+        // 확인은 더 이상 없다 — 새 문서를 열어도 기존 문서를 교체하지 않는다. 큐 맨
+        // 앞(front)만 그린다 — 나머지는 대기하다 이 모달이 처리되면 다음 프레임에
+        // 이어서 그려진다(2026-08-22 리뷰: 여러 문서의 확인이 겹쳐도 먼저 것이 사라지지
+        // 않는다). 문구에 파일명을 넣어 "어느 문서" 확인인지 보이게 한다 — 예전엔
+        // 제네릭 문구뿐이라 사용자가 대상을 알 수 없었다.
+        if let Some(pending) = self.document_pending_confirms.front().copied() {
+            let queued_after = self.document_pending_confirms.len() - 1;
+            match pending {
+                DocumentPendingConfirm::CloseWithDirty { id } => {
+                    let name = self.document_file_name(id);
+                    let document = self.documents.iter().find(|document| document.id == id);
+                    let can_save = document.is_some_and(OpenDocument::can_save_then_close);
+                    let save_too_large = document.is_some_and(|document| {
+                        document.is_editable() && !document.source_fits_save_limit()
+                    });
+                    let mut choice = None;
+                    egui::Window::new(text.t("document.confirm_discard.title", &[]))
+                        .collapsible(false)
+                        .resizable(false)
+                        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                        .show(ui.ctx(), |ui| {
+                            ui.label(text.t("document.confirm_discard.body", &[("name", &name)]));
+                            if queued_after > 0 {
+                                ui.label(text.t(
+                                    "document.confirm_discard.queued",
+                                    &[("count", &queued_after.to_string())],
+                                ));
+                            }
+                            if save_too_large {
+                                ui.label(text.t("document.limit.save_too_large", &[]));
+                            }
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                let save = ui.add_enabled(
+                                    can_save,
+                                    egui::Button::new(text.t("document.confirm_discard.save", &[])),
+                                );
+                                if save.clicked() {
+                                    choice = Some(DocumentConfirmChoice::Save);
+                                }
+                                if ui
+                                    .button(text.t("document.confirm_discard.discard", &[]))
+                                    .clicked()
+                                {
+                                    choice = Some(DocumentConfirmChoice::Discard);
+                                }
+                                if ui
+                                    .button(text.t("document.confirm_discard.cancel", &[]))
+                                    .clicked()
+                                {
+                                    choice = Some(DocumentConfirmChoice::Cancel);
+                                }
+                            });
+                        });
+                    if let Some(choice) = choice {
+                        self.apply_document_confirm_choice(choice);
+                    }
+                }
+                DocumentPendingConfirm::SaveConflict { id } => {
+                    let name = self.document_file_name(id);
+                    let mut decision: Option<bool> = None; // Some(true)=다시 불러오기, Some(false)=취소
+                    egui::Window::new(text.t("document.conflict.title", &[]))
+                        .collapsible(false)
+                        .resizable(false)
+                        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                        .show(ui.ctx(), |ui| {
+                            ui.label(text.t("document.conflict.body", &[("name", &name)]));
+                            if queued_after > 0 {
+                                ui.label(text.t(
+                                    "document.conflict.queued",
+                                    &[("count", &queued_after.to_string())],
+                                ));
+                            }
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                if ui.button(text.t("document.conflict.reload", &[])).clicked() {
+                                    decision = Some(true);
+                                }
+                                if ui.button(text.t("document.conflict.cancel", &[])).clicked() {
+                                    decision = Some(false);
+                                }
+                            });
+                        });
+                    if let Some(reload) = decision {
+                        self.apply_document_conflict_choice(reload);
+                    }
+                }
+            }
+        }
+
+        // 문서 탭 상한 안내(멀티 문서 탭 설계 §4) — clean 비활성 문서가 하나도 없어
+        // 자리를 못 만들었을 때만 선다. 확인만 있는 단순 안내라 확인 모달과 달리
+        // 액션 분기가 없다.
+        if self.document_cap_notice {
+            let mut acknowledged = false;
+            egui::Window::new(text.t("document.cap.title", &[]))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ui.ctx(), |ui| {
+                    ui.label(text.t("document.cap.full", &[]));
+                    if ui.button(text.t("action.close", &[])).clicked() {
+                        acknowledged = true;
+                    }
+                });
+            if acknowledged {
+                self.document_cap_notice = false;
             }
         }
 
@@ -26261,10 +30176,20 @@ impl eframe::App for App {
                 self.agent_launcher_snapshot.as_ref(),
                 self.agent_launcher_detection_in_flight,
                 &text,
+                // 꺼진 카드도 화면에는 남는다(B안) — leaf가 흐리게 그리고 선택을 막는
+                // 판단 재료로만 거부 목록을 받는다. 탐지 결과 자체는 여기서 거르지 않는다.
+                &self.config.agents.disabled,
             )
         {
             self.pending_agent_launcher_intent = Some(intent);
             ui.ctx().request_repaint();
+        }
+        // egui는 이 workspace 뒤의 widget도 request_discard할 수 있다. Terminal resize와
+        // split commit은 모든 UI-producing widget이 끝난 이 경계에서만 같은 pass 후보를
+        // flush해야 discarded/correction pass가 중간 SIGWINCH를 만들지 않는다.
+        self.active.workspace_ui.flush_render_side_effects(ui.ctx());
+        for runtime in self.warm.values_mut() {
+            runtime.workspace_ui.flush_render_side_effects(ui.ctx());
         }
         self.frame_stats.end();
         // B1: 이번 프레임에 그린 터미널 렌더 카운터를 프레임 이벤트에 실어 보낸다.
@@ -26352,6 +30277,42 @@ fn pane_of_session(
         .map(|pane| pane.id.clone())
 }
 
+/// `session`이 앉은 pane의 durable `sessions.id`로 PTY-native resume 바인딩 행을 찾는다.
+/// `dispatch_respawn_archived_agent`가 이 행의 `kind`/`session_id`(에이전트 자신의 native
+/// 세션 id — codex면 thread id)로 App Server writer 충돌 여부를 판정한다.
+fn archived_agent_row_for_session<'a>(
+    mux: &runtime::MuxSnapshot,
+    rows: &'a std::collections::HashMap<String, storage::ArchivedAgentResumeRow>,
+    session: runtime::SessionId,
+) -> Option<&'a storage::ArchivedAgentResumeRow> {
+    mux.tabs
+        .iter()
+        .flat_map(|tab| &tab.panes)
+        .find(|pane| pane.session_id == Some(session))
+        .and_then(|pane| pane.persistent_session_id.as_deref())
+        .and_then(|persistent_id| rows.get(persistent_id))
+}
+
+/// PTY 「이어서 하기」가 만들려는 codex resume이 App Server가 이미 writer로 붙잡고 있는
+/// thread와 같은 대상인지 판정한다. 같으면 그 local(App 소유, `agent_sessions_ui`) 세션
+/// id를 돌려준다 — dispatch가 PTY `codex resume`을 만드는 대신 그 세션으로 이어간다.
+///
+/// codex만 대상이다: App Server가 다루는 provider가 codex뿐이라(claude/kimi/qwen-code는
+/// PTY로만 실행된다) 다른 provider의 native binding은 애초에 App Server와 겹칠 수 없다.
+/// 겹치는데도 놓치면 codex가 rollout 파일당 writer 하나만 허용해 -32600("already has an
+/// active writer")으로 거부한다(2026-08-19 재현).
+fn attached_app_server_conflict(
+    row: Option<&storage::ArchivedAgentResumeRow>,
+    attached_local_session_for_thread: impl FnOnce(&str) -> Option<String>,
+) -> Option<String> {
+    let row = row?;
+    if row.kind.as_deref() != Some("codex") {
+        return None;
+    }
+    let thread_id = row.session_id.as_deref()?;
+    attached_local_session_for_thread(thread_id)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ArchivedResumeTarget {
     presentation: ArchivedResumePresentation,
@@ -26372,6 +30333,20 @@ enum AppWorkHistoryActivation {
     ResumeArchived {
         session: runtime::SessionId,
     },
+    /// PR-resume-without-pane(2026-08-19): 살아 있는 pane이 없어도 이력 행 자체
+    /// (kind + `agent_sessions` 바인딩)만으로 정확한 재개가 가능하다. 판정
+    /// (`resolve_work_history_activation`)과 실행(`dispatch_resume_archived_agent_
+    /// without_pane`)이 서로 다른 프레임/호출에서 어긋나지 않도록 `extra_args`를
+    /// 여기서 확정해 들고 다닌다 — 실행 시점에 다시 계산하지 않는다.
+    ResumeArchivedNoPane {
+        kind: crate::agent_launcher::AgentKind,
+        extra_args: Vec<String>,
+        /// 에이전트 자신의 native 세션 id(codex면 thread id). 실행 직전에 App Server가
+        /// 그 thread를 이미 writer로 쥐고 있는지 판정하는 데 쓴다 — 살아 있는 pane
+        /// 경로가 `attached_app_server_conflict`로 막는 그 충돌을 이 경로도 막아야
+        /// 한다(2026-08-19 코드 리뷰: 새 경로에 가드가 빠져 있었다).
+        native_session_id: String,
+    },
     NewRun(crate::agent_launcher::AgentKind),
     Disabled(ui::work_history::WorkHistoryDisabledReason),
 }
@@ -26380,13 +30355,38 @@ impl AppWorkHistoryActivation {
     fn presentation(&self) -> ui::work_history::WorkHistoryPrimaryAction {
         match self {
             Self::Focus { .. } => ui::work_history::WorkHistoryPrimaryAction::Focus,
-            Self::ResumeLive { .. } | Self::ResumeArchived { .. } => {
+            Self::ResumeLive { .. }
+            | Self::ResumeArchived { .. }
+            | Self::ResumeArchivedNoPane { .. } => {
                 ui::work_history::WorkHistoryPrimaryAction::Resume
             }
             Self::NewRun(_) => ui::work_history::WorkHistoryPrimaryAction::NewRun,
             Self::Disabled(reason) => ui::work_history::WorkHistoryPrimaryAction::Disabled(*reason),
         }
     }
+}
+
+/// PR-resume-without-pane(2026-08-19): 살아 있는 pane/mux 없이도 「이어서 하기」가
+/// 가능한지 순수하게 판정한다. 근거는 딱 둘 — 이력 행의 `kind`(agent 종류)와
+/// `agent_sessions` 바인딩(native provider kind + native session id)뿐이다. 둘 다
+/// pane 존재 여부와 무관하게 이미 App에 로드돼 있다(`launcher_kind_from_history`,
+/// `self.restore_agents` — agent_sessions는 mux_panes JOIN 없이 workspace 전체를
+/// 읽는다, `AGENT_SESSIONS_BOUNDED_SELECT` 참고). CLI 플래그 자체는
+/// `agent_resume::resume_plan`에 위임한다 — `dispatch_respawn_archived_agent`(살아
+/// 있는 pane 경로)와 같은 함수를 공유해 같은 규칙이 두 벌로 갈라지지 않게 한다.
+///
+/// `ResumeMode::Exact`만 인정한다. `agent_id`로 항상 인식되는 built-in
+/// `stable_config_id()`를 넘기므로 `resume_plan`은 `Unsupported`를 절대 반환하지
+/// 않고(바인딩이 없거나 무효면) `RecentInCwd`로 강등한다 — `resume --last`/`-c`류는
+/// "이 turn을 이어간다"는 약속을 못 지킨다(정확한 native session id 없이 가장 최근
+/// 대화로 뭉뚱그리면 사용자가 클릭한 턴과 다른 대화가 열릴 수 있다). 그래서 여기서는
+/// Exact만 「이어서 하기」로 인정하고, 나머지는 호출측이 「새로 실행」으로 떨어뜨린다.
+fn resume_without_pane_plan(
+    kind: crate::agent_launcher::AgentKind,
+    binding: Option<(&str, &str)>,
+) -> Option<Vec<String>> {
+    let plan = crate::agent_resume::resume_plan(kind.stable_config_id(), binding);
+    (plan.mode == crate::agent_resume::ResumeMode::Exact).then(|| plan.into_extra_args())
 }
 
 fn archived_resume_target(
@@ -26834,6 +30834,22 @@ fn fluid_cross_workspace_layout(
         divider,
         foreign,
     }
+}
+
+/// 보조 본문(이력·Git) 좌우 분할선을 끌었을 때의 새 좌측 폭.
+///
+/// 분할선은 목록의 **오른쪽** 경계라 포인터가 오른쪽으로 가면 목록이 넓어진다 —
+/// 부호가 `+`인 이유다(왼쪽에 붙은 cross-workspace 분할선의
+/// [`primary_divider_requested_width`]는 반대로 `-`다). 인라인으로 두면 부호를 뒤집어도
+/// 어떤 테스트도 잡지 못해(소스 문자열 스캔은 통과한다) 함수로 뽑아 수치로 고정한다
+/// (2026-08-17 리뷰).
+///
+/// NaN/무한대는 `None` — 그 값을 폭에 넣으면 이후 clamp가 전부 오염된다.
+fn aux_divider_requested_width(start_width: f32, total_drag_delta_x: f32) -> Option<f32> {
+    if !start_width.is_finite() || !total_drag_delta_x.is_finite() {
+        return None;
+    }
+    Some((start_width + total_drag_delta_x).max(0.0))
 }
 
 fn primary_divider_requested_width(start_width: f32, total_drag_delta_x: f32) -> Option<f32> {
@@ -27444,11 +31460,14 @@ fn pane_cwd<'a>(panes: &'a [storage::PersistedActivityPane], raw_title: &str) ->
 /// 비활성(warm/유휴) 워크스페이스 pane의 표시명 (순수 — 테스트 대상).
 /// 활성 워크스페이스의 `resolve_session_title`과 같은 규칙: 사용자가 rename했으면
 /// 그대로, 기본 제목("셸 N")이면 세션 cwd의 프로젝트명으로 대체, cwd가 없거나 판별
-/// 불가면 기본 제목을 i18n 렌더한 값으로 폴백.
+/// 불가면 기본 제목을 i18n 렌더한 값으로 폴백. 대체한 프로젝트명이 `workspace_name`과
+/// 다르면 `ui::workspace::qualify_project_name`으로 소속을 함께 밝힌다 — 규칙 정의는
+/// 그쪽 leaf에 있다(App이 leaf를 참조하는 방향은 허용, 반대는 금지).
 fn activity_session_name(
     raw_title: &str,
     cwd: Option<&str>,
     catalog: &i18n::Catalog,
+    workspace_name: Option<&str>,
     resolve_project: impl Fn(&str) -> Option<String>,
 ) -> String {
     if !ui::workspace::is_default_session_title(raw_title) {
@@ -27457,6 +31476,7 @@ fn activity_session_name(
     cwd.filter(|cwd| !cwd.is_empty())
         .and_then(resolve_project)
         .filter(|name| !name.trim().is_empty())
+        .map(|name| ui::workspace::qualify_project_name(&name, workspace_name))
         .unwrap_or_else(|| ui::workspace::display_pane_title(raw_title, catalog))
 }
 
@@ -27495,10 +31515,315 @@ fn pty_shortcut_missing_feedback(
 
 #[cfg(test)]
 mod tests {
+    /// Relay는 loopback/Tailscale 경로와 **완전히 독립**이다. 프로덕션 엔드포인트가 아직
+    /// 배정되지 않았으므로 Relay 시작은 지금 실패하는 것이 정상인데, 그 실패가 web 서버·
+    /// 토큰·Host 허용 목록·리스너 중 무엇도 건드리면 안 된다.
+    #[test]
+    fn relay_시작_실패는_relay_범위로만_보고된다() {
+        let error = web_remote::relay_client::RelayEndpoint::production()
+            .expect_err("프로덕션 좌표는 아직 배정되지 않았다");
+        assert_eq!(error, web_remote::relay_client::EndpointError::NotAssigned);
+        // 실패 메시지가 왜 막혔는지 가리켜야 한다 — 그래야 BLOCKED가 버그로 오인되지 않는다.
+        let rendered = format!("{error}");
+        assert!(rendered.contains("BLOCKED"), "{rendered}");
+    }
+
+    /// 두 전송의 시작 경로가 서로의 상태를 건드리지 않는다는 것을 소스로 고정한다.
+    /// `relay_enable`은 web 서버·토큰·Host 허용 목록·리스너를 이름조차 대지 않아야 한다.
+    #[test]
+    fn relay_시작_경로는_tailscale_상태를_건드리지_않는다() {
+        let source = include_str!("app.rs");
+        let body = source
+            .split_once("    fn relay_enable(&mut self) {")
+            .expect("relay_enable")
+            .1
+            .split_once("\n    /// Relay를 끈다")
+            .expect("relay_enable 끝")
+            .0;
+        for forbidden in [
+            "self.web",
+            "start_web",
+            "WebRemoteServer",
+            "pairing::",
+            "rotate_token",
+            "ts_hostname",
+            "allowed_host",
+            "serve_state",
+            "web_error",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "relay_enable이 {forbidden}를 건드린다"
+            );
+        }
+        // 반대 방향도 마찬가지다 — web 끄기는 Relay 워커를 멈추지 않는다.
+        let disable = source
+            .split_once("    fn web_disable(&mut self) {")
+            .expect("web_disable")
+            .1
+            .split_once("\n    /// ")
+            .expect("web_disable 끝")
+            .0;
+        assert!(
+            !disable.contains("relay_worker.take()"),
+            "web을 끄는 것이 Relay 워커를 멈추면 안 된다"
+        );
+        assert!(
+            disable.contains("web_transport_stopped"),
+            "web을 끄면 웹푸시를 함께 멈추고, 두 전송이 모두 꺼진 뒤에만 코어를 놓아준다"
+        );
+    }
+
+    /// bind 실패로 web이 서지 못하면 방금 만든 공유 코어를 그대로 두면 안 된다 —
+    /// 둘 다 OFF인데 브리지 스레드만 남는다.
+    #[test]
+    fn web_시작_실패는_공유_코어를_남기지_않는다() {
+        let source = include_str!("app.rs");
+        let body = source
+            .split_once("    fn start_web(&mut self) -> anyhow::Result<WebRemoteState> {")
+            .expect("start_web")
+            .1
+            .split_once("\n    /// ")
+            .expect("start_web 끝")
+            .0;
+        let failure = body
+            .find("Err(error) => {")
+            .expect("bind 실패 경로가 있어야 한다");
+        let release = body
+            .find("self.web_transport_stopped();")
+            .expect("실패 시 발송기를 떼고 코어를 놓아줘야 한다");
+        assert!(failure < release, "실패 분기 안에서 코어를 놓아줘야 한다");
+    }
+
+    /// 웹푸시는 web 전송의 수명에 묶인다. Relay 때문에 코어가 살아남아도, web이 내려가면
+    /// 발송기는 멈춰야 한다 — 안 그러면 모바일 웹을 껐는데 폰으로 알림이 계속 간다.
+    #[test]
+    fn 웹푸시는_web_전송이_내려가면_함께_멈춘다() {
+        let source = include_str!("app.rs");
+        let body = source
+            .split_once("    fn web_transport_stopped(&mut self) {")
+            .expect("web_transport_stopped")
+            .1
+            .split_once("\n    /// ")
+            .expect("함수 끝")
+            .0;
+        let stop = body.find("core.stop_push()").expect("발송기 정지");
+        let release = body
+            .find("release_session_core_if_idle()")
+            .expect("코어 해제 판정");
+        assert!(stop < release, "코어를 놓아주기 전에 발송기를 떼야 한다");
+    }
+
+    /// Relay를 먼저 켜고 나중에 web을 켜도 웹푸시가 살아나야 한다.
+    #[test]
+    fn relay_먼저_켠_뒤_web을_켜도_웹푸시가_보정된다() {
+        let source = include_str!("app.rs");
+        let body = source
+            .split_once("    fn shared_session_core(")
+            .expect("shared_session_core")
+            .1
+            .split_once("\n    /// ")
+            .expect("함수 끝")
+            .0;
+        let reuse = body
+            .find("if let Some(core) = &self.session_core")
+            .expect("재사용 분기");
+        let ensure = body.find("core.ensure_push(").expect("발송기 보정");
+        assert!(
+            reuse < ensure,
+            "기존 코어를 재사용할 때 발송기를 보정해야 한다"
+        );
+    }
+
+    /// 위반 상한을 넘으면 로그만 남기는 것이 아니라 실제로 채널을 닫아야 한다.
+    #[test]
+    fn relay_위반_상한_초과는_채널을_실제로_닫는다() {
+        let source = include_str!("app.rs");
+        let body = source
+            .split_once("impl web_remote::relay_client::RelayFrameSink for RelayDashboardSink {")
+            .expect("RelayFrameSink impl")
+            .1;
+        let close_arm = body
+            .find("RelayAdmission::CloseChannel(reason)")
+            .expect("CloseChannel 분기");
+        let outcome = body[close_arm..]
+            .find("SinkOutcome::CloseChannel")
+            .expect("닫기 신호를 워커로 돌려줘야 한다");
+        assert!(
+            outcome < 400,
+            "CloseChannel 분기가 닫기 신호를 돌려주지 않는다"
+        );
+    }
+
+    /// 공유 코어는 두 전송 중 하나라도 켜져 있으면 살아 있어야 한다.
+    #[test]
+    fn 공유_코어는_두_전송이_모두_꺼진_뒤에만_정리된다() {
+        let source = include_str!("app.rs");
+        let body = source
+            .split_once("    fn release_session_core_if_idle(&mut self) {")
+            .expect("release_session_core_if_idle")
+            .1
+            .split_once("\n    }")
+            .expect("함수 끝")
+            .0;
+        assert!(
+            body.contains("self.web.is_some() || self.relay_worker.is_some()"),
+            "어느 한쪽이라도 켜져 있으면 코어를 놓아주면 안 된다"
+        );
+    }
     use super::*;
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
+
+    fn display_with(
+        summary: Option<&str>,
+        instruction: Option<&str>,
+    ) -> crate::agent_detect::AgentDisplay {
+        crate::agent_detect::AgentDisplay {
+            kind: crate::agent_detect::AgentKind::Codex,
+            model: Some("gpt-test".to_owned()),
+            effort: Some("high".to_owned()),
+            context_pct: Some(40),
+            last_agent_summary: summary.map(str::to_owned),
+            user_instruction: instruction.map(str::to_owned),
+        }
+    }
+
+    /// 비활성(warm/절전) 워크스페이스 행의 「이어가기」는 전 워크스페이스 스코프
+    /// `global_resumable_panes`로 판정해야 한다(2026-08-20) — 이전엔 상수 `false`로
+    /// 못박혀 있었다: 실행부(`stage_agent_resume`)가 활성 워크스페이스의
+    /// `restore_agents`만 보고 `WorkspaceControllerAction::ResumeAgent`가 워크스페이스를
+    /// 전환하지 않아서, 노출을 켜면 눌러도 조용히 아무 일도 안 일어났기 때문이다. 이제는
+    /// (1) `global_resumable_panes`가 유계 전역 조회로 채워지고 (2) `ResumeAgent`
+    /// 핸들러가 필요하면 먼저 전환한 뒤 `pending_resume_agent`로 지연 실행하므로 다시
+    /// 켤 수 있다. 활성 범위 캐시(`restore_agents`)를 여기서 오독하면 예전처럼 우연히
+    /// 맞는 값이 나올 뿐인 위험한 배선이므로 계속 금지한다. 배선이라 순수 함수로 뽑을
+    /// 수 없어 소스로 고정한다.
+    #[test]
+    fn 비활성_워크스페이스_행의_이어가기는_전역_resumable_집합으로_판정한다() {
+        let source = include_str!("app.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        // 비활성 워크스페이스만 도는 루프(활성은 continue로 건너뛴다) 안쪽을 잘라 본다.
+        let warm_loop = production
+            .split_once("if workspace.id == active_workspace_id {")
+            .expect("비활성 워크스페이스 루프가 있어야 한다")
+            .1;
+        let warm_loop = warm_loop
+            .split_once("SidebarSessionRow::from_live")
+            .expect("행 조립 지점이 있어야 한다")
+            .0;
+        assert!(
+            !warm_loop.contains("entry.resumable = false;"),
+            "비활성 행의 resumable을 다시 상수 false로 못박으면 안 된다"
+        );
+        assert!(
+            warm_loop.contains("self.global_resumable_panes"),
+            "비활성 행은 전역 스코프 집합(global_resumable_panes)으로 판정해야 한다"
+        );
+        // workspace.id로 스코프를 좁히지 않으면 pane_id만으로 다른 워크스페이스의
+        // 저장된 에이전트를 오판정할 수 있다(pane_id는 사실상 유일하지만, 계약으로
+        // (workspace_id, pane_id) 쌍을 강제한다).
+        assert!(
+            warm_loop.contains("workspace.id.clone()"),
+            "resumable 판정은 이 행의 workspace.id로 스코프를 좁혀야 한다"
+        );
+        // 주석에는 이 이름이 근거 설명으로 나오므로 **코드 형태**로 겨냥한다.
+        assert!(
+            !warm_loop.contains("self.restore_agents.contains_key"),
+            "활성 범위 캐시(restore_agents)로 비활성 행을 판정하면 안 된다"
+        );
+    }
+
+    /// 2026-08-19 사용자: 대기 상태로 두고 다른 세션에 갔다 오면 활동 문구가 폴더명으로
+    /// 바뀐다. transcript 스캔 구간에서 요약이 빠지면 새 감지값이 비는데, 그때 옛 값을
+    /// 이어받지 않으면 `agent_activity_line`이 프로젝트명까지 폴백하기 때문이다.
+    #[test]
+    fn 감지값이_비면_직전_작업설명을_이어받는다() {
+        let previous = display_with(Some("PR #124 코드 리뷰 완료"), Some("PR #124를 검토해"));
+        let mut next = display_with(None, None);
+
+        carry_forward_agent_activity(&mut next, &previous);
+
+        assert_eq!(
+            next.last_agent_summary.as_deref(),
+            Some("PR #124 코드 리뷰 완료")
+        );
+        assert_eq!(next.user_instruction.as_deref(), Some("PR #124를 검토해"));
+    }
+
+    /// 공백만 있는 값도 "비었다"로 본다 — 그러지 않으면 빈 줄이 옛 문구를 덮는다.
+    #[test]
+    fn 공백뿐인_감지값도_직전_값을_이어받는다() {
+        let previous = display_with(Some("이전 작업"), None);
+        let mut next = display_with(Some("   "), None);
+
+        carry_forward_agent_activity(&mut next, &previous);
+
+        assert_eq!(next.last_agent_summary.as_deref(), Some("이전 작업"));
+    }
+
+    /// 새 값이 있으면 언제나 새 값이 이긴다 — 옛 문구가 최신 활동을 가리면 안 된다.
+    #[test]
+    fn 새_감지값이_있으면_직전_값을_덮어쓰지_않는다() {
+        let previous = display_with(Some("옛 작업"), Some("옛 지시"));
+        let mut next = display_with(Some("새 작업"), Some("새 지시"));
+
+        carry_forward_agent_activity(&mut next, &previous);
+
+        assert_eq!(next.last_agent_summary.as_deref(), Some("새 작업"));
+        assert_eq!(next.user_instruction.as_deref(), Some("새 지시"));
+    }
+
+    /// 같은 pane에서 **다른 에이전트**를 띄우면 이어받지 않는다 — shim이 폴백 셸을
+    /// 얹어 SessionId가 그대로라, 이어받으면 옛 에이전트의 말이 새 대화 것처럼 보인다.
+    #[test]
+    fn 에이전트_종류가_다르면_직전_값을_이어받지_않는다() {
+        let previous = display_with(Some("codex가 한 말"), Some("codex에게 준 지시"));
+        let mut next = crate::agent_detect::AgentDisplay {
+            kind: crate::agent_detect::AgentKind::Claude,
+            ..display_with(None, None)
+        };
+
+        carry_forward_agent_activity(&mut next, &previous);
+
+        assert!(
+            next.last_agent_summary.is_none(),
+            "다른 에이전트의 말을 물려받으면 안 된다"
+        );
+        assert!(next.user_instruction.is_none());
+    }
+
+    /// model/effort/context는 **이어받지 않는다** — 사라졌으면 사라진 게 맞고, 옛 값을
+    /// 남기면 실제와 어긋난 정보를 보여준다.
+    #[test]
+    fn 모델과_추론강도_컨텍스트는_이어받지_않는다() {
+        let previous = display_with(Some("이전 작업"), None);
+        let mut next = crate::agent_detect::AgentDisplay {
+            model: None,
+            effort: None,
+            context_pct: None,
+            ..display_with(None, None)
+        };
+
+        carry_forward_agent_activity(&mut next, &previous);
+
+        assert!(next.model.is_none(), "모델은 이어받지 않는다");
+        assert!(next.effort.is_none(), "추론 강도는 이어받지 않는다");
+        assert!(next.context_pct.is_none(), "컨텍스트는 이어받지 않는다");
+        assert_eq!(next.last_agent_summary.as_deref(), Some("이전 작업"));
+    }
+
+    /// 소스 스캔 계약 테스트용 — 연속된 공백(줄바꿈·들여쓰기 포함)을 한 칸으로 접는다.
+    ///
+    /// 이 파일을 `include_str!`로 읽어 코드 조각을 찾는 테스트들은 원래 **줄바꿈 위치까지**
+    /// 앵커에 박아 뒀다. 그러면 rustfmt가 한 줄을 접기만 해도 계약과 무관하게 깨진다 —
+    /// 실제로 2026-08-19 저장소 전체 rustfmt 정리에서 두 건이 그렇게 깨졌고, 이 결합이
+    /// 그동안 fmt 정리를 막아 어긋남이 쌓인 원인이었다. 지키려는 건 "이 호출이 이 인자로
+    /// 존재한다"이지 "이 줄에 이렇게 적혀 있다"가 아니므로, 양쪽을 접어 비교한다.
+    fn squeeze_ws(source: &str) -> String {
+        source.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
 
     #[test]
     fn catalog_restore_stages_only_when_needed() {
@@ -27660,6 +31985,35 @@ mod tests {
     }
 
     #[test]
+    fn app_flushes_workspace_render_effects_after_the_last_widget() {
+        let source = include_str!("app.rs");
+        let ui_body = source
+            .split_once("fn ui(&mut self, ui: &mut egui::Ui")
+            .expect("App::ui")
+            .1
+            .split_once("\n    }\n}\n\n/// Instant")
+            .expect("end of App::ui")
+            .0;
+        let last_widget = ui_body
+            .rfind("self.agent_launcher_ui.show(")
+            .expect("agent launcher is the final widget");
+        let active_flush = ui_body
+            .rfind("self.active.workspace_ui.flush_render_side_effects(ui.ctx())")
+            .expect("active workspace final-pass flush");
+        let warm_flush = ui_body
+            .rfind("runtime.workspace_ui.flush_render_side_effects(ui.ctx())")
+            .expect("attached warm workspace final-pass flush");
+        let stats_end = ui_body
+            .rfind("self.frame_stats.end();")
+            .expect("frame stats end");
+
+        assert!(last_widget < active_flush);
+        assert!(last_widget < warm_flush);
+        assert!(active_flush < stats_end);
+        assert!(warm_flush < stats_end);
+    }
+
+    #[test]
     fn startup_restore_is_driven_after_catalog_apply() {
         let source = include_str!("app.rs");
         let constructor_tail = source
@@ -27688,6 +32042,85 @@ mod tests {
             .0;
         assert!(catalog_restore.contains("stage_runtime_restore"));
         assert!(!catalog_restore.contains("stage_primary_pane_activation"));
+    }
+
+    #[test]
+    fn pending_resume는_대상_워크스페이스_데이터가_오기_전엔_실행하지_않는다() {
+        // 이 테스트가 지키는 것: restore_loaded_for 대조를 지우면 switch_workspace 직후
+        // 옛 워크스페이스의 restore_agents로 재개해 엉뚱한 pane에 명령이 들어간다.
+        let pending = pending_resume_fixture();
+        let now = pending.requested_at;
+
+        // 아무것도 로드 안 됐다 → 기다린다.
+        assert_eq!(
+            pending_resume_step(&pending, "workspace-b", 7, None, now),
+            PendingResumeStep::Wait
+        );
+        // **다른** 워크스페이스 데이터가 로드돼 있다 → 그건 이 재개에 쓸 수 없다, 기다린다.
+        assert_eq!(
+            pending_resume_step(&pending, "workspace-b", 7, Some("workspace-a"), now),
+            PendingResumeStep::Wait,
+            "다른 워크스페이스의 restore_agents로 재개하면 안 된다"
+        );
+        // 대상 워크스페이스 데이터가 도착했다 → 그때 실행한다.
+        assert_eq!(
+            pending_resume_step(&pending, "workspace-b", 7, Some("workspace-b"), now),
+            PendingResumeStep::Run
+        );
+    }
+
+    #[test]
+    fn pending_resume는_워크스페이스나_런타임이_어긋나면_포기한다() {
+        let pending = pending_resume_fixture();
+        let now = pending.requested_at;
+
+        // 사용자가 다른 워크스페이스로 옮겼다.
+        assert_eq!(
+            pending_resume_step(&pending, "workspace-c", 7, Some("workspace-b"), now),
+            PendingResumeStep::Abandon
+        );
+        // 워크스페이스가 닫혔다 다시 열려 runtime이 새로 만들어졌다 — 데이터가 도착해
+        // 있어도 그 화면은 이미 없다.
+        assert_eq!(
+            pending_resume_step(&pending, "workspace-b", 8, Some("workspace-b"), now),
+            PendingResumeStep::Abandon,
+            "runtime이 재구성됐으면 재개할 화면이 없다"
+        );
+    }
+
+    #[test]
+    fn pending_resume는_무한히_기다리지_않는다() {
+        let pending = pending_resume_fixture();
+        let just_before = pending.requested_at + PRIMARY_PANE_MATERIALIZATION_TIMEOUT
+            - std::time::Duration::from_millis(1);
+        let at_limit = pending.requested_at + PRIMARY_PANE_MATERIALIZATION_TIMEOUT;
+
+        assert_eq!(
+            pending_resume_step(&pending, "workspace-b", 7, None, just_before),
+            PendingResumeStep::Wait
+        );
+        assert_eq!(
+            pending_resume_step(&pending, "workspace-b", 7, None, at_limit),
+            PendingResumeStep::TimedOut,
+            "한도를 넘기면 버리고 실패를 알려야 한다"
+        );
+        // 한도를 넘겨도 데이터가 이미 와 있으면 실행이 우선이다 — 실패 알림을 띄우고
+        // 나서 재개되는 모순이 없어야 한다.
+        assert_eq!(
+            pending_resume_step(&pending, "workspace-b", 7, Some("workspace-b"), at_limit),
+            PendingResumeStep::Run
+        );
+    }
+
+    fn pending_resume_fixture() -> PendingResumeAgent {
+        PendingResumeAgent {
+            workspace_id: "workspace-b".to_owned(),
+            runtime_instance: 7,
+            pane_key: "pane-b".to_owned(),
+            title: "세션".to_owned(),
+            session: runtime::SessionId(3),
+            requested_at: std::time::Instant::now(),
+        }
     }
 
     #[test]
@@ -28577,7 +33010,11 @@ mod tests {
 
         retain_other_runtime_instance(&mut map, 1);
 
-        assert_eq!(map.len(), 1, "은퇴한 instance 1의 항목은 전부 사라져야 한다");
+        assert_eq!(
+            map.len(),
+            1,
+            "은퇴한 instance 1의 항목은 전부 사라져야 한다"
+        );
         assert_eq!(
             map.get(&(2, runtime::SessionId(10))),
             Some(&"c"),
@@ -28736,50 +33173,59 @@ mod tests {
         );
     }
 
-    /// 백엔드 보충은 "5시간만 빠진 구멍"에만 끼운다 — 그 외에는 서버 값 그대로.
+    /// app-server가 아직 없거나 일부 창만 보고해도 백엔드가 읽은 창으로 빈칸만
+    /// 채운다. app-server 값이 있으면 언제나 그 값이 우선한다.
     #[test]
-    fn 백엔드_보충은_5시간_구멍에만_끼운다() {
-        /// (설명, 서버 값, 백엔드 보충값, 기대 결과) — 튜플이 길어 clippy
+    fn codex_백엔드는_server의_빈_사용량_창만_채운다() {
+        /// (설명, 서버 값, 백엔드 값, 기대 결과) — 튜플이 길어 clippy
         /// `type_complexity`에 걸린다. 표를 그대로 두면서 이름만 붙인다.
         type Case = (
             &'static str,
             Option<ProviderUsage>,
-            Option<u8>,
+            Option<crate::codex_backend_usage::BackendUsage>,
             Option<ProviderUsage>,
         );
         let cases: &[Case] = &[
             (
-                "구멍 + 보충값 → 접붙임",
+                "server 없음 + backend 주간 → backend 표시",
+                None,
+                Some(crate::codex_backend_usage::BackendUsage {
+                    five_hour: None,
+                    weekly: Some(2),
+                }),
+                Some((None, Some(2))),
+            ),
+            (
+                "server 주간만 + backend 양쪽 → 5시간만 보충",
                 Some((None, Some(91))),
-                Some(24),
+                Some(crate::codex_backend_usage::BackendUsage {
+                    five_hour: Some(24),
+                    weekly: Some(99),
+                }),
                 Some((Some(24), Some(91))),
             ),
             (
-                "구멍인데 보충도 없음 → 그대로",
-                Some((None, Some(91))),
-                None,
-                Some((None, Some(91))),
-            ),
-            (
-                "서버가 이미 5시간을 줌 → 보충 무시",
+                "server 양쪽 + backend 양쪽 → server 유지",
                 Some((Some(12), Some(91))),
-                Some(99),
+                Some(crate::codex_backend_usage::BackendUsage {
+                    five_hour: Some(99),
+                    weekly: Some(98),
+                }),
                 Some((Some(12), Some(91))),
             ),
             (
-                "주간이 없으면 구멍이 아니다 → 그대로",
-                Some((None, None)),
-                Some(24),
-                Some((None, None)),
+                "server 5시간만 + backend 주간 → 주간만 보충",
+                Some((Some(12), None)),
+                Some(crate::codex_backend_usage::BackendUsage {
+                    five_hour: Some(99),
+                    weekly: Some(88),
+                }),
+                Some((Some(12), Some(88))),
             ),
-            ("서버 응답 자체가 없음 → 그대로", None, Some(24), None),
+            ("양쪽 모두 없음", None, None, None),
         ];
         for (name, server, backend, expected) in cases {
-            assert_eq!(
-                supplement_codex_five_hour(*server, *backend),
-                *expected,
-                "{name}"
-            );
+            assert_eq!(merge_codex_usage(*server, *backend), *expected, "{name}");
         }
     }
 
@@ -30187,6 +34633,599 @@ mod tests {
         );
     }
 
+    /// 세션 점프 강조는 **포커스에 성공한 분기에서만** 세운다 — 아무 데도 안 갔는데
+    /// 번쩍이면 거짓말이다(2026-08-18). 배선이라 순수 함수로 뽑을 수 없어 소스로 고정한다.
+    #[test]
+    fn 세션_점프_강조는_포커스_성공_경로에서만_세운다() {
+        let source = include_str!("app.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        // `FocusSession {`은 **액션을 만드는 자리**에도 나온다 — 핸들러 본문의 고유한
+        // 첫 줄로 앵커를 잡는다(2026-08-18 실측).
+        let handler = production
+            .split_once("if workspace_id != self.active.id {")
+            .expect("FocusSession 핸들러가 있어야 한다")
+            .1;
+        let handler = handler
+            .split_once("\n            WorkspaceControllerAction::")
+            .expect("다음 arm이 있어야 한다")
+            .0;
+        let (success, failure) = handler
+            .split_once("} else {")
+            .expect("실패 분기(else)가 있어야 한다");
+        assert!(
+            success.contains("flash_pane("),
+            "성공 분기에서 강조를 세워야 한다"
+        );
+        assert!(
+            !failure.contains("flash_pane("),
+            "실패 분기에서는 강조하지 않는다 — 이동하지 않았는데 번쩍이면 안 된다"
+        );
+    }
+
+    /// 보조 본문은 하나뿐이라 이력·Git·문서가 동시에 활성일 수 없다 — 새로 활성된
+    /// 쪽이 이기고, 진 쪽은 세션 탭으로 물러나되 탭 자체는 남는다(스펙 §8-2).
+    #[test]
+    fn 보조_탭은_동시에_활성되지_않는다() {
+        use ui::workspace::PaneAuxTabState::{OpenActive, OpenInactive};
+        let (history, git, document) =
+            resolve_aux_tab_exclusivity(OpenActive, OpenActive, OpenActive, AuxTabWinner::Git);
+        assert_eq!(git, OpenActive);
+        assert_eq!(history, OpenInactive, "본문은 하나뿐이라 진 쪽은 물러난다");
+        assert_eq!(document, OpenInactive, "문서도 진 쪽이면 물러난다");
+        let (history, git, document) =
+            resolve_aux_tab_exclusivity(OpenActive, OpenActive, OpenActive, AuxTabWinner::History);
+        assert_eq!(history, OpenActive);
+        assert_eq!(git, OpenInactive);
+        assert_eq!(document, OpenInactive);
+        let (history, git, document) =
+            resolve_aux_tab_exclusivity(OpenActive, OpenActive, OpenActive, AuxTabWinner::Document);
+        assert_eq!(document, OpenActive, "문서가 이기면 나머지 둘이 물러난다");
+        assert_eq!(history, OpenInactive);
+        assert_eq!(git, OpenInactive);
+    }
+
+    #[test]
+    fn 세션이동은_모든_보조탭을_inactive로_보존한다() {
+        use ui::workspace::PaneAuxTabState;
+
+        let (history, git, document, reset_search) = reveal_session_aux_tabs(
+            PaneAuxTabState::OpenInactive,
+            PaneAuxTabState::OpenInactive,
+            PaneAuxTabState::OpenActive,
+        );
+        assert_eq!(history, PaneAuxTabState::OpenInactive);
+        assert_eq!(git, PaneAuxTabState::OpenInactive);
+        assert_eq!(document, PaneAuxTabState::OpenInactive);
+        assert!(reset_search);
+
+        let (history, git, document, reset_search) = reveal_session_aux_tabs(
+            PaneAuxTabState::Closed,
+            PaneAuxTabState::Closed,
+            PaneAuxTabState::Closed,
+        );
+        assert_eq!(history, PaneAuxTabState::Closed);
+        assert_eq!(git, PaneAuxTabState::Closed);
+        assert_eq!(document, PaneAuxTabState::Closed);
+        assert!(!reset_search);
+    }
+
+    /// Git 보조 본문 좌측 목록 폭 — 넓은 창은 300pt 고정, 좁아지면 40%로 따라
+    /// 줄되 180pt 밑으로는 내려가지 않는다(스펙 §8-3).
+    #[test]
+    fn git_본문은_목록_300에_diff_나머지다() {
+        assert_eq!(git_tab_list_width(1200.0), 300.0);
+        assert_eq!(git_tab_list_width(600.0), 240.0, "좁으면 40%");
+        assert_eq!(
+            git_tab_list_width(300.0),
+            180.0,
+            "최소 폭 밑으로는 안 내려간다"
+        );
+    }
+
+    /// 이력 보조 본문 좌측 카드 목록 폭 — git과 같은 규칙이지만 카드 정보량 때문에
+    /// 하한이 220pt로 조금 더 크다(2026-08-15 Task 10, 스펙 §2-1).
+    #[test]
+    fn 이력_본문은_목록_360에_원문_나머지다() {
+        assert_eq!(history_tab_list_width(1400.0), 360.0);
+        assert_eq!(history_tab_list_width(700.0), 280.0, "좁으면 40%");
+        assert_eq!(
+            history_tab_list_width(400.0),
+            220.0,
+            "최소 폭 밑으로는 안 내려간다"
+        );
+    }
+
+    /// 사용자가 구분선을 한 번도 안 끌었으면(`stored: None`) 기존 자동 계산값을 그대로
+    /// 쓴다(2026-08-16 사용자: 가로 폭을 조절할 수 없다 — 드래그 기능 추가).
+    #[test]
+    fn aux_split_width는_저장값_없으면_자동_계산값을_쓴다() {
+        let auto = git_tab_list_width(1200.0);
+        assert_eq!(aux_split_width(None, auto, 1200.0, 180.0), 300.0);
+    }
+
+    /// 한 번 끌고 나면(`Some(px)`) 자동 계산값 대신 저장된 값을 쓴다.
+    #[test]
+    fn aux_split_width는_저장값_있으면_그_값을_쓴다() {
+        let auto = git_tab_list_width(1200.0);
+        assert_eq!(aux_split_width(Some(250.0), auto, 1200.0, 180.0), 250.0);
+    }
+
+    /// 저장값이 좌측 최소 밑이거나 우측 최소(`AUX_DETAIL_MIN_WIDTH`)를 침범하면 매
+    /// 프레임 다시 clamp한다 — 상세(diff/원문)가 0폭이 되면 안 된다.
+    #[test]
+    fn aux_split_width는_좌우_최소_폭으로_clamp한다() {
+        let auto = git_tab_list_width(1200.0);
+        assert_eq!(
+            aux_split_width(Some(50.0), auto, 1200.0, 180.0),
+            180.0,
+            "좌측 최소 밑으로는 안 내려간다"
+        );
+        assert_eq!(
+            aux_split_width(Some(2000.0), auto, 1200.0, 180.0),
+            1200.0 - AUX_DETAIL_MIN_WIDTH,
+            "우측 최소를 침범하지 않는다"
+        );
+    }
+
+    /// 창이 아주 좁아 좌우 최소를 동시에 만족 못 해도(180 + 240 > 300) 항상
+    /// `0..=body_width` 범위의 유효한 값이 나온다 — 창을 줄였다 늘려도 값이 안 망가진다.
+    #[test]
+    fn aux_split_width는_창이_아주_좁아도_유효한_값을_돌려준다() {
+        let auto = history_tab_list_width(300.0);
+        let width = aux_split_width(Some(9999.0), auto, 300.0, 220.0);
+        assert!((0.0..=300.0).contains(&width), "값: {width}");
+        assert_eq!(width, 300.0 - AUX_DETAIL_MIN_WIDTH);
+
+        let width = aux_split_width(None, auto, 0.0, 220.0);
+        assert_eq!(width, 0.0, "창 폭이 0이어도 패닉 없이 0을 돌려준다");
+    }
+
+    /// 보조 검색 ↑↓는 총 일치 수 기준으로 순환한다 — 마지막 다음은 처음, 처음
+    /// 이전은 마지막(스펙 "우측 본문 강조·이동").
+    #[test]
+    fn aux_search_step_active는_양_끝에서_순환한다() {
+        assert_eq!(aux_search_step_active(4, 5, true), 0, "마지막 다음은 처음");
+        assert_eq!(aux_search_step_active(0, 5, false), 4, "처음 이전은 마지막");
+        assert_eq!(aux_search_step_active(2, 5, true), 3, "중간은 +1");
+        assert_eq!(aux_search_step_active(2, 5, false), 1, "중간은 -1");
+    }
+
+    /// 총 일치 수가 0이면 옮길 데가 없다 — "아무 일도 안 한다"를 그대로 0으로
+    /// 표현한다(호출부가 별도 분기를 두지 않아도 되게).
+    #[test]
+    fn aux_search_step_active는_총계가_0이면_그대로_0이다() {
+        assert_eq!(aux_search_step_active(0, 0, true), 0);
+        assert_eq!(
+            aux_search_step_active(3, 0, false),
+            0,
+            "옛 활성 인덱스가 남아 있어도 총계가 0이면 0"
+        );
+    }
+
+    /// `QueryChanged`는 질의를 반영하고 활성 인덱스를 처음으로 되돌린다 — 옛 질의의
+    /// 활성 인덱스가 새 질의의 엉뚱한 일치(또는 범위 밖)를 가리키면 안 된다.
+    #[test]
+    fn apply_aux_search_action은_질의가_바뀌면_활성_인덱스를_처음으로_되돌린다() {
+        let mut state = ui::aux_search::AuxSearchState {
+            query: "old".into(),
+            open: true,
+            active: 3,
+        };
+        apply_aux_search_action(
+            &mut state,
+            ui::aux_search::AuxSearchAction::QueryChanged("new".into()),
+            0,
+        );
+        assert_eq!(state.query, "new");
+        assert_eq!(state.active, 0);
+    }
+
+    /// `Prev`/`Next`는 `aux_search_step_active`로 활성 인덱스를 옮긴다(순환 포함).
+    #[test]
+    fn apply_aux_search_action은_prev_next로_활성_인덱스를_순환한다() {
+        let mut state = ui::aux_search::AuxSearchState {
+            query: "q".into(),
+            open: true,
+            active: 0,
+        };
+        apply_aux_search_action(&mut state, ui::aux_search::AuxSearchAction::Prev, 3);
+        assert_eq!(state.active, 2, "처음에서 이전은 마지막으로 순환한다");
+        apply_aux_search_action(&mut state, ui::aux_search::AuxSearchAction::Next, 3);
+        assert_eq!(state.active, 0);
+        apply_aux_search_action(&mut state, ui::aux_search::AuxSearchAction::Next, 3);
+        assert_eq!(state.active, 1);
+    }
+
+    /// `Close`는 검색 바를 닫되 질의는 남긴다(`AuxSearchState::close`와 같은 계약) —
+    /// 다시 열면 하던 검색이 이어진다.
+    #[test]
+    fn apply_aux_search_action은_close로_질의를_남긴_채_닫는다() {
+        let mut state = ui::aux_search::AuxSearchState {
+            query: "q".into(),
+            open: true,
+            active: 2,
+        };
+        apply_aux_search_action(&mut state, ui::aux_search::AuxSearchAction::Close, 5);
+        assert!(!state.open);
+        assert_eq!(state.query, "q", "닫아도 질의는 남아야 다시 열 때 이어진다");
+    }
+
+    /// 분할선 드래그의 **부호와 수치**를 고정한다. 소스 문자열 스캔만으로는
+    /// `start_width + delta`를 `- delta`로 뒤집는 회귀(드래그 방향이 반대로 도는)를
+    /// 잡지 못한다 — 사람이 직접 끌어봐야 드러난다(2026-08-17 리뷰).
+    #[test]
+    fn aux_divider는_오른쪽으로_끌면_목록이_넓어진다() {
+        // 목록의 **오른쪽** 경계라 포인터가 오른쪽(+x)으로 가면 목록이 넓어진다.
+        assert_eq!(aux_divider_requested_width(300.0, 50.0), Some(350.0));
+        assert_eq!(aux_divider_requested_width(300.0, -50.0), Some(250.0));
+        // 왼쪽에 붙은 cross-workspace 분할선은 부호가 반대다 — 둘을 헷갈리면 안 된다.
+        assert_eq!(primary_divider_requested_width(300.0, 50.0), Some(250.0));
+    }
+
+    #[test]
+    fn aux_divider는_음수_폭을_만들지_않고_비정상_값을_거른다() {
+        assert_eq!(aux_divider_requested_width(100.0, -400.0), Some(0.0));
+        assert_eq!(aux_divider_requested_width(f32::NAN, 10.0), None);
+        assert_eq!(aux_divider_requested_width(100.0, f32::INFINITY), None);
+    }
+
+    /// Git 본문 구분선의 드래그 누적이 `total_drag_delta()` 기반인지 고정한다 —
+    /// `drag_delta().x`를 매 프레임 더하면 드리프트가 생긴다(cross-workspace 분할선의
+    /// `primary_resize` 테스트와 같은 형태, `primary_divider_requested_width` 참고).
+    #[test]
+    fn git_tab_divider는_total_drag_delta_기반으로_폭을_누적한다() {
+        let source = include_str!("app.rs");
+        let divider = source
+            .split_once("let resize_id = ui.id().with(\"git_tab_split_resize\")")
+            .unwrap()
+            .1
+            .split_once("let mut detail = ui.new_child(")
+            .unwrap()
+            .0;
+        assert!(divider.contains("resize_response.total_drag_delta()"));
+        assert!(!divider.contains("resize_response.drag_delta().x"));
+    }
+
+    /// 이력 본문 구분선도 같은 계약 — `git_tab_divider는_total_drag_delta_기반으로_폭을_누적한다`
+    /// 참고.
+    #[test]
+    fn history_tab_divider는_total_drag_delta_기반으로_폭을_누적한다() {
+        let source = include_str!("app.rs");
+        let divider = source
+            .split_once("let resize_id = ui.id().with(\"work_history_tab_split_resize\")")
+            .unwrap()
+            .1
+            .split_once("let mut transcript = ui.new_child(")
+            .unwrap()
+            .0;
+        assert!(divider.contains("resize_response.total_drag_delta()"));
+        assert!(!divider.contains("resize_response.drag_delta().x"));
+    }
+
+    /// 워크스페이스 전환은 Git 보조 본문을 무효화해야 한다(2026-08-16 코드 리뷰 항목 1) —
+    /// 스냅샷을 비우면 `GitPanelUi::render`가 다음 프레임에 스스로 다시 채우고, 세대를
+    /// 올려 이전 워크스페이스의 in-flight 완료가 새 화면에 반영되지 않게 막는다.
+    /// 문자열 존재만 보는 소스 스캔이 아니라 `remote_target()` 같은 실제 공개 동작으로
+    /// 검증한다 — 리셋 전에는 remote 정보가 있고, 리셋 후에는 없어야 한다.
+    #[test]
+    fn reset_git_surfaces는_스냅샷_diff_세대_cwd를_모두_비운다() {
+        let mut git_panel_ui = ui::git_panel::GitPanelUi::default();
+        git_panel_ui.set_snapshot(Ok(ui::git_panel::GitPanelSnapshot {
+            repo_root: PathBuf::from("/repo/a"),
+            branch: "main".to_owned(),
+            upstream: Some("origin/main".to_owned()),
+            ahead: 1,
+            behind: 0,
+            changes: Vec::new(),
+            committed: Vec::new(),
+            changes_truncated: false,
+            committed_truncated: false,
+            remote_https_base: Some("https://github.com/o/r".to_owned()),
+            worktrees: Vec::new(),
+            worktrees_truncated: false,
+        }));
+        assert!(
+            git_panel_ui.remote_target().is_some(),
+            "리셋 전에는 스냅샷이 채워져 있어야 한다"
+        );
+
+        let mut diff_viewer_ui = ui::diff_viewer::DiffViewerUi::default();
+        diff_viewer_ui.open("src/lib.rs".to_owned(), ui::diff_viewer::DiffMode::Working);
+
+        let mut generation = 41u64;
+        let mut cwd = Some(PathBuf::from("/repo/a"));
+
+        reset_git_surfaces(
+            &mut git_panel_ui,
+            &mut diff_viewer_ui,
+            &mut generation,
+            &mut cwd,
+        );
+
+        assert!(
+            git_panel_ui.remote_target().is_none(),
+            "리셋 후에는 스냅샷이 비어 remote_target도 None이어야 한다"
+        );
+        assert_eq!(
+            generation, 42,
+            "세대를 올려 이전 in-flight 완료를 stale로 만든다"
+        );
+        assert_eq!(
+            cwd, None,
+            "cwd도 함께 비워 새 워크스페이스 기준으로 다시 잡게 한다"
+        );
+    }
+
+    /// 세대 증가는 다른 generation 필드들과 같은 관례(`wrapping_add(1).max(1)`)를
+    /// 따라야 한다 — `u64::MAX`에서 넘어가면 0이 아니라 1이어야 한다(0은 "아직 아무
+    /// 요청도 없었다"는 미요청 상태와 겹친다).
+    #[test]
+    fn reset_git_surfaces의_세대_증가는_wrap_한다() {
+        let mut git_panel_ui = ui::git_panel::GitPanelUi::default();
+        let mut diff_viewer_ui = ui::diff_viewer::DiffViewerUi::default();
+        let mut generation = u64::MAX;
+        let mut cwd = None;
+        reset_git_surfaces(
+            &mut git_panel_ui,
+            &mut diff_viewer_ui,
+            &mut generation,
+            &mut cwd,
+        );
+        assert_eq!(generation, 1);
+    }
+
+    /// 워크스페이스 전환 시 `switch_workspace_with_preferred_pane`가 실제로
+    /// `reset_git_surfaces`를 부르는지 — 순수 함수 자체는 위 두 테스트로 동작을
+    /// 검증했으니, 여기서는 배선(호출) 여부만 소스로 확인한다(보조 용도).
+    #[test]
+    fn 워크스페이스_전환은_reset_git_surfaces를_부른다() {
+        let source = include_str!("app.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let body = production
+            .split_once("fn switch_workspace_with_preferred_pane(")
+            .expect("전환 함수가 있어야 한다")
+            .1
+            .split_once("fn cycle_workspace(")
+            .expect("다음 함수 경계가 있어야 한다")
+            .0;
+        assert!(
+            body.contains("reset_git_surfaces("),
+            "전환 시 Git 보조 본문을 무효화해야 한다"
+        );
+        assert!(
+            body.contains("invalidate_transcript_requests("),
+            "전환 시 원문 IO 세대도 무효화해야 한다(항목 2)"
+        );
+        assert!(
+            !body.contains("self.git_tab = "),
+            "git_tab 자체는 건드리지 않는다 — 이력 탭과 같은 규칙으로 열린 채 유지한다"
+        );
+        assert!(
+            body.contains("self.aux_search.reset()"),
+            "워크스페이스 전환 시 보조 검색도 비워야 한다 — \
+             안 그러면 이전 워크스페이스에서 찾던 문구가 새 워크스페이스의 이력/Git \
+             목록을 걸러 놓는다"
+        );
+    }
+
+    /// 원문 IO 세대 무효화(항목 2) — in-flight이거나 슬롯 대기 중이던 이전 워크스페이스의
+    /// 원문 읽기가 완료돼도 세대 검사에 걸려 버려져야 하고, 대기 슬롯 자체도 비워야
+    /// 슬롯이 빌 때 그 요청이 다시 실행되지 않는다.
+    #[test]
+    fn invalidate_transcript_requests는_세대를_올리고_대기_요청을_비운다() {
+        let mut generation = 7u64;
+        let mut pending = Some(AppHostIoAction::Transcript {
+            generation: 7,
+            path: PathBuf::from("/tmp/session.jsonl"),
+            kind: crate::agent_detect::AgentKind::Claude,
+            focus_offset: 0,
+        });
+        invalidate_transcript_requests(&mut generation, &mut pending);
+        assert_eq!(generation, 8);
+        assert!(
+            pending.is_none(),
+            "슬롯 대기 중이던 이전 워크스페이스 요청은 버려야 한다"
+        );
+    }
+
+    #[test]
+    fn invalidate_transcript_requests의_세대_증가도_wrap_한다() {
+        let mut generation = u64::MAX;
+        let mut pending = None;
+        invalidate_transcript_requests(&mut generation, &mut pending);
+        assert_eq!(generation, 1);
+    }
+
+    /// ⟳ 새로고침은 패널이 이미 보여주는 repo가 있으면 포커스 세션이 다른 곳으로
+    /// 옮겨가 있어도 그 repo를 유지해야 한다(항목 3 — 세션1 「변경 보기」로 repo A에
+    /// 고정한 뒤 세션2로 포커스가 옮겨가도 ⟳는 repo A를 유지해야 한다. 재현: 세션1
+    /// (repo A)·세션2(repo B, 포커스) → 세션1 우클릭 「변경 보기」 → repo A 표시 → ⟳
+    /// → 안내 없이 repo B로 바뀌던 결함).
+    #[test]
+    fn resolve_git_refresh_cwd는_고정된_repo가_있으면_포커스보다_그것을_우선한다() {
+        let pinned = Some(PathBuf::from("/repo/a"));
+        let focused = Some(PathBuf::from("/repo/b"));
+        assert_eq!(
+            resolve_git_refresh_cwd(GitRefreshCwd { pinned, focused }),
+            Some(PathBuf::from("/repo/a"))
+        );
+    }
+
+    /// 아직 보여줄 repo가 없으면(방금 탭을 열었거나 워크스페이스 전환 직후
+    /// `reset_git_surfaces`가 비운 자리를 렌더가 자동으로 다시 채우는 경우) 포커스
+    /// 세션 기준으로 새로 고른다.
+    #[test]
+    fn resolve_git_refresh_cwd는_고정된_repo가_없으면_포커스_세션으로_새로_고른다() {
+        let focused = Some(PathBuf::from("/repo/b"));
+        assert_eq!(
+            resolve_git_refresh_cwd(GitRefreshCwd {
+                pinned: None,
+                focused: focused.clone()
+            }),
+            focused
+        );
+    }
+
+    #[test]
+    fn resolve_git_refresh_cwd는_둘_다_없으면_none이다() {
+        assert_eq!(
+            resolve_git_refresh_cwd(GitRefreshCwd {
+                pinned: None,
+                focused: None
+            }),
+            None
+        );
+    }
+
+    /// `GitPanelAction::Refresh`·`ShowFileDiff` 핸들러가 포커스 세션 기준 헬퍼
+    /// (`request_git_panel_io`)가 아니라 `git_panel_cwd`/`resolve_git_refresh_cwd`를
+    /// 쓰는지 — 순수 함수 자체는 위 테스트로 검증했으니 여기서는 배선만 확인한다.
+    #[test]
+    fn git_panel의_새로고침_파일diff는_포커스_세션이_아니라_고정된_cwd를_쓴다() {
+        let source = include_str!("app.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let refresh = production
+            .split_once("Some(ui::git_panel::GitPanelAction::Refresh) => {")
+            .expect("Refresh 핸들러가 있어야 한다")
+            .1
+            .split_once("Some(ui::git_panel::GitPanelAction::OpenRemoteBranch)")
+            .expect("다음 액션 경계가 있어야 한다")
+            .0;
+        assert!(
+            refresh.contains("resolve_git_refresh_cwd("),
+            "⟳는 고정된 cwd를 우선하고 없을 때만 포커스 세션으로 새로 고른다"
+        );
+        let show_file_diff = production
+            .split_once("Some(ui::git_panel::GitPanelAction::ShowFileDiff { rel_path, mode }) => {")
+            .expect("ShowFileDiff 핸들러가 있어야 한다")
+            .1
+            .split_once("Some(ui::git_panel::GitPanelAction::OpenWorktreeShell")
+            .expect("다음 액션 경계가 있어야 한다")
+            .0;
+        assert!(
+            show_file_diff.contains("self.git_panel_cwd.clone()"),
+            "파일 diff 재요청도 포커스 세션이 아니라 지금 보여주는 repo cwd를 써야 한다"
+        );
+        assert!(
+            !show_file_diff.contains("self.focused_session_repo_cwd()")
+                && !show_file_diff.contains("self.request_git_panel_io(ui.ctx()"),
+            "파일 diff 재요청이 포커스 세션 기준 헬퍼로 되돌아가면 안 된다"
+        );
+    }
+
+    /// `focused_session_repo_cwd`의 doc은 한때 "ShowFocusedDiff·ShowDiff{session} 둘 다
+    /// 이 값으로 수렴한다"고 적었는데, 회귀 수정으로 `ShowDiff{session}`은 세션별 cwd를
+    /// 쓰게 바뀌어 문서가 거짓이 됐다(항목 4). 문서만 보고 그 회귀를 되살리지 않도록
+    /// 실제 동작에 맞는 문구인지 확인한다.
+    #[test]
+    fn focused_session_repo_cwd_문서는_showdiff_세션이_수렴한다고_주장하지_않는다() {
+        let source = include_str!("app.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let doc = production
+            .split_once("fn focused_session_repo_cwd(&self)")
+            .expect("문서 대상 함수가 있어야 한다")
+            .0;
+        let doc = &doc[doc.len().saturating_sub(1200)..];
+        assert!(
+            !doc.contains("`ShowFocusedDiff`(Git 탭)와 `ShowDiff{session}`(세션 메뉴 「변경 보기」)\n    /// 둘 다 이 값으로 수렴한다"),
+            "ShowDiff{{session}}이 이 값으로 수렴한다는 거짓 문서가 남아있으면 안 된다"
+        );
+        assert!(
+            doc.contains("git_panel_cwd"),
+            "새 문서는 이미 열린 패널이 git_panel_cwd를 쓴다는 점을 설명해야 한다"
+        );
+    }
+
+    /// 「원문 보기」는 사용자 클릭이다. git 패널 IO와 capacity-1 슬롯을 공유하는데,
+    /// 차 있다고 그냥 반환하면 클릭이 아무 반응 없이 죽는다(패널 새로고침처럼 스스로
+    /// 다시 시도하는 주체가 없다). 대기 슬롯에 얹어 다음 프레임에 태운다.
+    #[test]
+    fn 원문_보기_클릭은_슬롯이_차_있어도_버려지지_않는다() {
+        let source = include_str!("app.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let handler = production
+            .split_once("WorkHistoryAction::ShowTranscript(identity)")
+            .expect("원문 보기 핸들러가 있어야 한다")
+            .1;
+        let cut = handler
+            .char_indices()
+            .map(|(index, _)| index)
+            .take_while(|index| *index <= 4000)
+            .last()
+            .unwrap_or(0);
+        let handler = &handler[..cut];
+        assert!(
+            handler.contains("pending_app_host_retry = Some(request)"),
+            "슬롯이 차 있으면 대기 슬롯에 얹어야 한다"
+        );
+        assert!(
+            handler.contains("set_loading()"),
+            "어느 경로로 가든 로딩 표시는 세운다 — 클릭이 먹혔다는 신호다"
+        );
+        assert!(
+            production.contains("self.pending_app_host_retry.take()"),
+            "대기 슬롯을 다음 프레임에 태우는 배수 지점이 있어야 한다"
+        );
+    }
+
+    /// 「원문 보기」는 카드가 가리키는 그 턴이 원문에서 선택돼야 한다(스펙 §6) — 그러려면
+    /// IO 요청에 그 턴의 오프셋이 실려야 한다.
+    #[test]
+    fn 원문_보기는_그_턴의_오프셋을_함께_넘긴다() {
+        let source = include_str!("app.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        assert!(
+            production.contains("focus_offset: row.source_offset"),
+            "카드가 가리키는 턴의 오프셋이 IO 요청에 실려야 한다"
+        );
+    }
+
+    /// 워크트리 행 클릭은 **이미 있는** 워크트리에서 셸을 열 뿐이다 — 생성·삭제는
+    /// 계속 세션 우클릭 메뉴가 담당한다(스펙 §8-5).
+    #[test]
+    fn 워크트리_클릭은_그_경로에서_셸을_연다() {
+        let source = include_str!("app.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let handler = production
+            .split_once("GitPanelAction::OpenWorktreeShell { path }")
+            .expect("워크트리 클릭 핸들러가 있어야 한다")
+            .1;
+        // 바이트 창 대신 **match arm 끝**에서 자른다 — 창을 넉넉히 잡으면 뒤따르는
+        // 다른 코드가 딸려 들어와 부정 단언이 엉뚱하게 깨진다(2026-08-17 실측).
+        let handler = handler
+            .split_once("\n            None => {}")
+            .expect("match arm이 None으로 끝나야 한다")
+            .0;
+        // 렌더는 워크스페이스 수명 상태를 직접 쓰지 않는다(xtask check-boundary) —
+        // 스폰은 SpawnShellAt 액션으로 올려 다음 logic tick이 처리한다.
+        assert!(
+            handler.contains("WorkspaceControllerAction::SpawnShellAt"),
+            "스폰을 액션으로 올려야 한다"
+        );
+        // 이름이 아니라 **호출 형태**를 본다 — 주석이 심볼을 언급하는 것까지 걸리면
+        // 근거를 적을 수 없다. `xtask check-boundary`도 같은 형태를 찾는다.
+        assert!(
+            !handler.contains("self.reveal_active_workspace_for_new_session("),
+            "렌더에서 워크스페이스 수명 상태를 직접 쓰면 check-boundary가 막는다"
+        );
+        assert!(
+            !handler.contains("CreateWorktree") && !handler.contains("RemoveWorktree"),
+            "이번 범위는 기존 워크트리로 들어가는 것뿐이다"
+        );
+    }
+
+    /// 전면 diff 전용 view는 2026-08-15 2차에서 은퇴했다 — diff는 이제 Git 보조 본문
+    /// (`render_git_tab_body`) 안에서만 산다(스펙 §8-3).
+    #[test]
+    fn diff는_전면_뷰가_아니라_보조_본문에서만_산다() {
+        let source = include_str!("app.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        assert!(
+            !production.contains("AgentTerminalView::Diff"),
+            "전면 diff 뷰는 2026-08-15 2차에서 은퇴했다(스펙 §8-3)"
+        );
+    }
+
     /// 이력은 보조 UI 탭이다 — 전역 view가 아니고, 활성 중에는 입력 소유자/컴포저가
     /// 명시적으로 없어야 하며, 본문은 WorkspaceUi가 넘긴 pane body rect에 그린다.
     #[test]
@@ -30207,18 +35246,18 @@ mod tests {
             .unwrap()
             .0;
         assert!(
-            render.contains("if terminal_visible && !history_tab_active {"),
-            "이력 활성 프레임은 터미널 입력 소유자를 잡으면 안 된다"
+            render.contains("if terminal_visible && !(history_tab_active || git_tab_active || document_tab_active) {"),
+            "이력·Git 활성 프레임은 터미널 입력 소유자를 잡으면 안 된다"
         );
         assert!(
-            render.contains("(terminal_visible && self.work_history_tab.is_open()).then("),
+            render.contains("if terminal_visible && self.work_history_tab.is_open() {"),
             "이력 탭 chrome은 탭이 열려 있을 때만 붙어야 한다(이력 X가 실제로 없앤다)"
         );
         assert!(
-            render.contains(
-                "terminal_visible && !history_tab_active && self.config.ui.composer_enabled"
+            squeeze_ws(render).contains(
+                "terminal_visible && !(history_tab_active || git_tab_active || document_tab_active) && self.config.ui.composer_enabled"
             ),
-            "이력 활성 프레임은 컴포저를 감춰야 한다"
+            "이력·Git 활성 프레임은 컴포저를 감춰야 한다"
         );
         assert_eq!(
             render.matches("render_work_history_tab_body(").count(),
@@ -30256,14 +35295,1976 @@ mod tests {
                 "이력 탭 의도 처리에서 {forbidden}가 파생되면 안 된다"
             );
         }
+        assert_eq!(
+            intent.matches("self.aux_search.reset()").count(),
+            6,
+            "apply_work_history_tab_intent·apply_git_tab_intent·\
+             apply_document_tab_intent(ShowSession 분기)·activate_document_tab·\
+             close_document_entry·begin_document_open 여섯 다 활성 보조 탭이 바뀌면\
+             (켜지거나 꺼지거나, 보이는 문서 자체가 바뀌거나) 보조 검색을 비워야 한다 \
+             (activate_document_tab·close_document_entry는 문서가 여러 개일 수 있어\
+             apply_document_tab_intent의 Activate/Close 분기가 위임하는 별도 함수다)"
+        );
     }
 
-    /// 이력이 pane 보조 탭이 된 뒤로 `set_view(Terminal)`만으로는 이력 본문이 걷히지
+    // ── 문서 탭 상태 기계(설계 §3.3·§4·§6·§7) ───────────────────────────────
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-app-document-{label}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    // macOS/APFS rejects invalid UTF-8 path components with EILSEQ before `read_dir`; keep the
+    // real-filesystem boundary regression on Unix platforms that admit such names. The tree-level
+    // raw identity regression runs on every Unix target, including macOS.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn file_tree_listing_preserves_invalid_utf8_name_bytes() {
+        use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+
+        let root = unique_temp_dir("file-tree-invalid-utf8");
+        let raw = std::ffi::OsString::from_vec(b"broken-\xff".to_vec());
+        std::fs::write(root.join(&raw), b"x").unwrap();
+
+        let snapshot = run_file_tree_listing(
+            &root,
+            &root,
+            ui::file_tree::FILE_TREE_LISTING_MAX_ITEMS,
+            ui::file_tree::FILE_TREE_LISTING_MAX_BYTES,
+        )
+        .unwrap();
+        let item = snapshot
+            .items()
+            .iter()
+            .find(|item| item.name().as_bytes() == raw.as_bytes())
+            .expect("listing must retain the exact OS filename bytes");
+        assert_eq!(item.name().as_bytes(), raw.as_bytes());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn canonical_equivalent_rename_display_value_is_a_noop_in_both_directions() {
+        let nfd = "\u{1112}\u{1161}\u{11AB}\u{1100}\u{1173}\u{11AF}.md";
+        let nfd_source = Path::new("/tmp").join(nfd);
+        let nfc_source = Path::new("/tmp/한글.md");
+
+        assert!(app_host_rename_is_noop(&nfd_source, "한글.md"));
+        assert!(app_host_rename_is_noop(nfc_source, nfd));
+    }
+
+    #[test]
+    fn canonical_equivalent_rename_host_action_keeps_raw_source() {
+        let root = unique_temp_dir("file-tree-canonical-rename");
+        let raw_name = concat!("\u{1112}\u{1161}\u{11AB}", "\u{1100}\u{1173}\u{11AF}.md");
+        let source = root.join(raw_name);
+        std::fs::write(&source, b"raw-content").unwrap();
+        let request = ui::file_tree::FileTreeIoRequest::Rename {
+            source: ui::file_tree::FileTreePathPayload::try_new(source.clone()).unwrap(),
+            name: "한글.md".to_owned(),
+        };
+
+        let result = run_file_tree_host_io(request, &std::sync::atomic::AtomicBool::new(false));
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(std::fs::read(&source).unwrap(), b"raw-content");
+        let entries = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec![std::ffi::OsString::from(raw_name)]);
+        assert!(
+            !entries
+                .iter()
+                .any(|name| name == std::ffi::OsStr::new("한글.md")),
+            "host action must not create a second NFC-named directory entry"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reverse_canonical_equivalent_rename_host_action_keeps_raw_source() {
+        let root = unique_temp_dir("file-tree-reverse-canonical-rename");
+        let nfd_name = concat!("\u{1112}\u{1161}\u{11AB}", "\u{1100}\u{1173}\u{11AF}.md");
+        let source = root.join("한글.md");
+        std::fs::write(&source, b"raw-content").unwrap();
+        let request = ui::file_tree::FileTreeIoRequest::Rename {
+            source: ui::file_tree::FileTreePathPayload::try_new(source.clone()).unwrap(),
+            name: nfd_name.to_owned(),
+        };
+
+        let result = run_file_tree_host_io(request, &std::sync::atomic::AtomicBool::new(false));
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(std::fs::read(&source).unwrap(), b"raw-content");
+        let entries = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec![std::ffi::OsString::from("한글.md")]);
+        assert!(
+            !entries
+                .iter()
+                .any(|name| name == std::ffi::OsStr::new(nfd_name)),
+            "host action must not create a second NFD-named directory entry"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_utf8_name_is_not_equal_to_its_lossy_display() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let source = Path::new("/tmp").join(std::ffi::OsString::from_vec(b"broken-\xff".to_vec()));
+
+        assert!(!app_host_rename_is_noop(&source, "broken-�"));
+    }
+
+    fn stub_open_document(
+        path: &str,
+        source: &str,
+        saved_source: &str,
+        dirty: bool,
+    ) -> OpenDocument {
+        OpenDocument {
+            id: ui::workspace::DocumentTabId(0),
+            path: PathBuf::from(path),
+            source: source.to_owned(),
+            mode: ui::document::DocumentViewMode::Source,
+            load_state: DocumentLoadState::Loading,
+            saved_source: saved_source.to_owned(),
+            dirty,
+            saving: false,
+            saving_source: None,
+            save_error: None,
+            saved_feedback_until: None,
+            view_only_byte_len: None,
+            source_revision: 0,
+        }
+    }
+
+    /// `stub_open_document`에 명시적 id를 얹는다 — 여러 문서가 동시에 열려 있는
+    /// 시나리오(멀티 문서 탭 설계)를 만들 때 쓴다.
+    fn stub_open_document_id(
+        id: u32,
+        path: &str,
+        source: &str,
+        saved_source: &str,
+        dirty: bool,
+    ) -> OpenDocument {
+        OpenDocument {
+            id: ui::workspace::DocumentTabId(id),
+            ..stub_open_document(path, source, saved_source, dirty)
+        }
+    }
+
+    fn stub_loaded_document_id(
+        id: u32,
+        path: &str,
+        source: &str,
+        saved_source: &str,
+        dirty: bool,
+    ) -> OpenDocument {
+        let dir = unique_temp_dir("loaded-stub-revision");
+        let fixture = dir.join("fixture.txt");
+        std::fs::write(&fixture, b"x").unwrap();
+        let revision =
+            match document_io::load_document(&document_io::DocumentLoadRequest { path: fixture }) {
+                document_io::DocumentLoadOutcome::Loaded { revision, .. } => revision,
+                _ => panic!("stub revision fixture must load"),
+            };
+        let _ = std::fs::remove_dir_all(dir);
+        let mut document = stub_open_document_id(id, path, source, saved_source, dirty);
+        document.load_state = DocumentLoadState::Loaded {
+            revision,
+            limit: document_io::DocumentLimitTier::Full,
+        };
+        document
+    }
+
+    #[test]
+    fn plan_document_load_admission은_닫힌_incoming의_늦은_결과를_missing으로_버린다() {
+        let documents = vec![stub_loaded_document_id(
+            1,
+            "/tmp/unrelated.md",
+            "kept",
+            "kept",
+            false,
+        )];
+
+        assert_eq!(
+            plan_document_load_admission(
+                &documents,
+                ui::workspace::DocumentTabId(99),
+                u64::MAX,
+                Some(ui::workspace::DocumentTabId(1)),
+            ),
+            DocumentLoadAdmission::Missing
+        );
+        assert_eq!(
+            documents.len(),
+            1,
+            "planner는 unrelated 문서를 변경하지 않는다"
+        );
+    }
+
+    #[test]
+    fn plan_document_load_admission은_0byte_loading을_건너뛰고_oldest_clean_loaded를_고른다() {
+        let eight_mib = "a".repeat(8 * 1024 * 1024);
+        let documents = vec![
+            stub_loaded_document_id(1, "/tmp/loaded.md", &eight_mib, &eight_mib, false),
+            stub_open_document_id(2, "/tmp/still-loading.md", "", "", false),
+            stub_open_document_id(3, "/tmp/incoming.md", "", "", false),
+        ];
+
+        assert_eq!(
+            plan_document_load_admission(
+                &documents,
+                ui::workspace::DocumentTabId(3),
+                eight_mib.len() as u64,
+                Some(ui::workspace::DocumentTabId(3)),
+            ),
+            DocumentLoadAdmission::Admit {
+                evict: vec![ui::workspace::DocumentTabId(1)]
+            }
+        );
+    }
+
+    #[test]
+    fn plan_document_load_admission은_exact_24mib를_허용한다() {
+        let four_mib = "a".repeat(4 * 1024 * 1024);
+        let documents = vec![
+            stub_loaded_document_id(1, "/tmp/existing.md", &four_mib, &four_mib, false),
+            stub_open_document_id(2, "/tmp/incoming.md", "", "", false),
+        ];
+
+        assert_eq!(
+            plan_document_load_admission(
+                &documents,
+                ui::workspace::DocumentTabId(2),
+                (8 * 1024 * 1024) as u64,
+                Some(ui::workspace::DocumentTabId(2)),
+            ),
+            DocumentLoadAdmission::Admit { evict: Vec::new() }
+        );
+    }
+
+    #[test]
+    fn plan_document_load_admission은_dirty_active_saving을_각각_보호한다() {
+        let eight_mib = "a".repeat(8 * 1024 * 1024);
+        for protected in ["dirty", "active", "saving"] {
+            let mut existing = stub_loaded_document_id(
+                1,
+                "/tmp/protected.md",
+                &eight_mib,
+                &eight_mib,
+                protected == "dirty",
+            );
+            existing.saving = protected == "saving";
+            let documents = vec![
+                existing,
+                stub_open_document_id(2, "/tmp/incoming.md", "", "", false),
+            ];
+            let active = if protected == "active" {
+                Some(ui::workspace::DocumentTabId(1))
+            } else {
+                Some(ui::workspace::DocumentTabId(2))
+            };
+
+            assert_eq!(
+                plan_document_load_admission(
+                    &documents,
+                    ui::workspace::DocumentTabId(2),
+                    eight_mib.len() as u64,
+                    active,
+                ),
+                DocumentLoadAdmission::Reject,
+                "{protected} 문서를 자동으로 닫으면 안 된다"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_document_load_admission은_0byte를_보존하고_필요한_victim을_oldest_first로_고른다() {
+        let one_mib = "a".repeat(1024 * 1024);
+        let two_mib = "b".repeat(2 * 1024 * 1024);
+        let three_mib = "c".repeat(3 * 1024 * 1024);
+        let documents = vec![
+            stub_loaded_document_id(1, "/tmp/first.md", &one_mib, &one_mib, false),
+            stub_open_document_id(2, "/tmp/loading.md", "", "", false),
+            stub_loaded_document_id(3, "/tmp/second.md", &two_mib, &two_mib, false),
+            stub_loaded_document_id(4, "/tmp/protected.md", &three_mib, &three_mib, true),
+            stub_open_document_id(5, "/tmp/incoming.md", "", "", false),
+        ];
+
+        assert_eq!(
+            plan_document_load_admission(
+                &documents,
+                ui::workspace::DocumentTabId(5),
+                (8 * 1024 * 1024) as u64,
+                Some(ui::workspace::DocumentTabId(5)),
+            ),
+            DocumentLoadAdmission::Admit {
+                evict: vec![
+                    ui::workspace::DocumentTabId(1),
+                    ui::workspace::DocumentTabId(3),
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn plan_document_load_admission은_reload의_기존_두사본을_새_결과로_교체해_계산한다() {
+        let eight_mib = "a".repeat(8 * 1024 * 1024);
+        let documents = vec![stub_loaded_document_id(
+            1,
+            "/tmp/reload.md",
+            &eight_mib,
+            &eight_mib,
+            false,
+        )];
+
+        assert_eq!(
+            plan_document_load_admission(
+                &documents,
+                ui::workspace::DocumentTabId(1),
+                eight_mib.len() as u64,
+                Some(ui::workspace::DocumentTabId(1)),
+            ),
+            DocumentLoadAdmission::Admit { evict: Vec::new() },
+            "incoming의 기존 source/saved_source를 새 결과와 중복 계산하면 안 된다"
+        );
+    }
+
+    #[test]
+    fn plan_document_load_admission은_산술_overflow를_reject한다() {
+        let documents = vec![stub_open_document_id(1, "/tmp/incoming.md", "", "", false)];
+
+        assert_eq!(
+            plan_document_load_admission(
+                &documents,
+                ui::workspace::DocumentTabId(1),
+                u64::MAX,
+                Some(ui::workspace::DocumentTabId(1)),
+            ),
+            DocumentLoadAdmission::Reject
+        );
+    }
+
+    #[test]
+    fn execute_document_load_admission은_missing이면_문서와_notice를_건드리지_않는다() {
+        let mut documents = vec![stub_loaded_document_id(
+            1,
+            "/tmp/unrelated.md",
+            "kept",
+            "kept",
+            false,
+        )];
+        let before_paths = documents
+            .iter()
+            .map(|document| document.path.clone())
+            .collect::<Vec<_>>();
+        let mut closed = Vec::new();
+
+        let execution = execute_document_load_admission(
+            DocumentLoadAdmission::Missing,
+            ui::workspace::DocumentTabId(99),
+            |id| {
+                closed.push(id);
+                documents.retain(|document| document.id != id);
+            },
+        );
+
+        assert!(!execution.apply_outcome);
+        assert!(!execution.show_cap_notice);
+        assert!(closed.is_empty());
+        assert_eq!(
+            documents
+                .iter()
+                .map(|document| document.path.clone())
+                .collect::<Vec<_>>(),
+            before_paths
+        );
+    }
+
+    #[test]
+    fn execute_document_load_admission은_reject시_active_incoming만_닫고_오른쪽_이웃을_고른다() {
+        let incoming = ui::workspace::DocumentTabId(2);
+        let mut documents = vec![
+            stub_loaded_document_id(1, "/tmp/left.md", "left", "left", false),
+            stub_open_document_id(2, "/tmp/incoming.md", "", "", false),
+            stub_loaded_document_id(3, "/tmp/right.md", "right", "right", false),
+        ];
+        let mut active = Some(incoming);
+        let mut closed = Vec::new();
+
+        let execution =
+            execute_document_load_admission(DocumentLoadAdmission::Reject, incoming, |id| {
+                let index = documents
+                    .iter()
+                    .position(|document| document.id == id)
+                    .expect("close target");
+                documents.remove(index);
+                if active == Some(id) {
+                    active = next_active_document_after_close(&documents, index);
+                }
+                closed.push(id);
+            });
+
+        assert!(!execution.apply_outcome);
+        assert!(execution.show_cap_notice);
+        assert_eq!(closed, vec![incoming]);
+        assert_eq!(active, Some(ui::workspace::DocumentTabId(3)));
+        assert_eq!(
+            documents
+                .iter()
+                .map(|document| document.id)
+                .collect::<Vec<_>>(),
+            vec![
+                ui::workspace::DocumentTabId(1),
+                ui::workspace::DocumentTabId(3),
+            ]
+        );
+    }
+
+    #[test]
+    fn load_admission과_outcome적용은_exact_24mib를_넘지_않는다() {
+        let four_mib = "a".repeat(4 * 1024 * 1024);
+        let eight_mib = "b".repeat(8 * 1024 * 1024);
+        let incoming = ui::workspace::DocumentTabId(2);
+        let mut documents = vec![
+            stub_loaded_document_id(1, "/tmp/existing.md", &four_mib, &four_mib, false),
+            stub_open_document_id(2, "/tmp/incoming.md", "", "", false),
+        ];
+        let admission = plan_document_load_admission(
+            &documents,
+            incoming,
+            eight_mib.len() as u64,
+            Some(incoming),
+        );
+        let execution = execute_document_load_admission(admission, incoming, |id| {
+            documents.retain(|document| document.id != id);
+        });
+        assert!(execution.apply_outcome);
+        assert!(!execution.show_cap_notice);
+        let revision =
+            match stub_loaded_document_id(99, "/tmp/revision", "x", "x", false).load_state {
+                DocumentLoadState::Loaded { revision, .. } => revision,
+                _ => panic!("loaded stub"),
+            };
+        let document = documents
+            .iter_mut()
+            .find(|document| document.id == incoming)
+            .expect("incoming placeholder");
+        apply_document_load_outcome_to_document(
+            document,
+            document_io::DocumentLoadOutcome::Loaded {
+                source: eight_mib,
+                revision,
+            },
+        );
+        let retained = documents.iter().try_fold(0_u64, |total, document| {
+            total.checked_add(retained_document_bytes(document)?)
+        });
+
+        assert_eq!(retained, Some(DOCUMENT_TOTAL_RETAINED_BYTES_MAX));
+    }
+
+    #[test]
+    fn apply_document_load_outcome은_missing_admit_reject를_source_clone전에_실행한다() {
+        let source = include_str!("app.rs");
+        let body = source
+            .split_once("fn apply_document_load_outcome(")
+            .expect("apply_document_load_outcome 정의")
+            .1
+            .split_once("\n    fn ")
+            .expect("다음 함수 경계")
+            .0;
+        let plan = body
+            .find("plan_document_load_admission(")
+            .expect("로드 결과 적용 전 admission 판정");
+        let execute = body
+            .find("execute_document_load_admission(")
+            .expect("Missing/Admit/Reject 실행");
+        let clone = body
+            .find("apply_document_load_outcome_to_document(")
+            .expect("admission 뒤 outcome 적용");
+        assert!(plan < execute && execute < clone);
+        assert!(body.contains("self.close_document_entry(victim);"));
+        assert!(body.contains("self.document_cap_notice = true;"));
+        assert!(body.contains("if !execution.apply_outcome {"));
+    }
+
+    #[test]
+    fn dispatch_document_drop_paths는_입력_순서를_그대로_보존한다() {
+        let paths = vec![
+            PathBuf::from("/tmp/a.rs"),
+            PathBuf::from("/tmp/b.json"),
+            PathBuf::from("/tmp/c.yaml"),
+        ];
+        let mut opened = Vec::new();
+
+        dispatch_document_drop_paths(
+            paths.clone(),
+            DocumentDropOpenMode::ResolvePane,
+            |_, path| {
+                opened.push(path);
+            },
+        );
+
+        assert_eq!(opened, paths);
+    }
+
+    #[test]
+    fn dispatch_document_drop_paths는_현재_frame의_pane_claim이_있으면_모두_직접_연다() {
+        let paths = vec![PathBuf::from("/tmp/a.md"), PathBuf::from("/tmp/b.md")];
+        let mut direct = Vec::new();
+        let mut deferred = Vec::new();
+
+        dispatch_document_drop_paths(
+            paths.clone(),
+            DocumentDropOpenMode::ClaimedPane,
+            |mode, path| match mode {
+                DocumentDropOpenMode::ClaimedPane => direct.push(path),
+                DocumentDropOpenMode::ResolvePane => deferred.push(path),
+            },
+        );
+
+        assert_eq!(
+            direct, paths,
+            "stale mux focus와 무관하게 두 파일 모두 열어야 한다"
+        );
+        assert!(
+            deferred.is_empty(),
+            "방금 drop이 claim한 pane이 있으면 shell spawn 대기로 보내면 안 된다"
+        );
+    }
+
+    #[test]
+    fn app은_primary_workspace_document_drop을_포커스_claim_뒤에_열고_pty로_보내지_않는다() {
+        let source = include_str!("app.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        assert_eq!(
+            production
+                .matches("dropped_document_paths.extend(primary_output.document_drop_paths);")
+                .count(),
+            2,
+            "cross-workspace strip 유무 두 primary render 경로 모두 수집해야 한다"
+        );
+        let focus = production
+            .find("if let Some(pane) = primary_local_focus_claim")
+            .expect("primary focus claim 적용이 있어야 한다");
+        let dispatch = focus
+            + production[focus..]
+                .find("dispatch_document_drop_paths(")
+                .expect("focus claim 뒤 drop dispatch가 있어야 한다");
+        assert!(
+            focus < dispatch,
+            "drop 대상 pane focus를 문서 열기보다 먼저 적용해야 한다"
+        );
+        let dispatch_tail = &production[dispatch..];
+        assert!(dispatch_tail.contains("DocumentDropOpenMode::ClaimedPane"));
+        assert!(dispatch_tail.contains("self.begin_document_open(path)"));
+        assert!(dispatch_tail.contains("self.open_document(path)"));
+        assert!(
+            !dispatch_tail
+                .lines()
+                .take(8)
+                .any(|line| line.contains("WriteInput"))
+        );
+    }
+
+    #[test]
+    fn find_open_document_by_path은_같은_경로면_그_id를_돌려주고_아니면_없다() {
+        let documents = vec![
+            stub_open_document_id(1, "/tmp/a.md", "A", "A", false),
+            stub_open_document_id(2, "/tmp/b.md", "B", "B", false),
+        ];
+        assert_eq!(
+            find_open_document_by_path(&documents, Path::new("/tmp/b.md")),
+            Some(ui::workspace::DocumentTabId(2)),
+            "같은 파일을 다시 열면 새 탭이 아니라 기존 id를 활성화해야 한다"
+        );
+        assert_eq!(
+            find_open_document_by_path(&documents, Path::new("/tmp/c.md")),
+            None,
+            "새 파일이면 어느 기존 문서와도 매칭되면 안 된다 — 그래야 기존 문서를 \
+             건드리지 않고 새 탭을 더한다"
+        );
+    }
+    /// `document_source_editor_id`가 `ui::document::source_editor`(실제 리프)가 진짜로
+    /// 저장하는 `TextEditState` 위치와 맞는지. 편집기가 **절대 id**를 쓰므로 컨테이너가
+    /// 달라도 같은 값이어야 한다 — Source 모드와 Split 모드(컨테이너 한 겹 더)를 같은
+    /// 하네스에서 확인해 그 불변식을 고정한다(2026-08-23).
+    #[test]
+    fn 문서_편집기_id는_컨테이너와_무관하게_같고_실제_저장_위치와_일치한다() {
+        let path = PathBuf::from("/tmp/explore.md");
+        let editor_id = document_source_editor_id(&path);
+        let mut source = "hello".to_owned();
+
+        // Source 모드 — body ui에 그대로 그린다.
+        let mut harness = egui_kittest::Harness::new_ui(|ui| {
+            ui::document::source_editor(ui, editor_id, &mut source, true);
+        });
+        harness.run();
+        assert!(
+            egui::text_edit::TextEditState::load(&harness.ctx, editor_id).is_some(),
+            "절대 id가 실제 저장 위치와 어긋난다 — egui나 source_editor 내부가 바뀌었다"
+        );
+
+        // Split 모드 — 컨테이너를 한 겹 더 씌워도 **같은 id**여야 커서·undo가 이어진다.
+        let mut split_source = "hello".to_owned();
+        let mut split_harness = egui_kittest::Harness::new_ui(|ui| {
+            let rect = ui.available_rect_before_wrap();
+            let mut child = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(rect)
+                    .id_salt("document_tab_split_source"),
+            );
+            ui::document::source_editor(&mut child, editor_id, &mut split_source, true);
+        });
+        split_harness.run();
+        assert!(
+            egui::text_edit::TextEditState::load(&split_harness.ctx, editor_id).is_some(),
+            "Split 컨테이너 안에서도 같은 id에 저장돼야 한다 — 다르면 모드를 오갈 때 \
+             커서와 undo 기록이 따로 논다"
+        );
+    }
+
+    /// ② 문서를 닫으면 그 위젯이 들고 있던 `TextEditState`(실행취소 스냅샷 포함)가
+    /// 실제로 지워지는지 — `clear_document_editor_state`를 되돌리면(호출을 지우면)
+    /// 이 테스트가 실패한다.
+    #[test]
+    fn clear_document_editor_state는_저장된_텍스트편집기_상태를_지운다() {
+        let path = PathBuf::from("/tmp/explore.md");
+        let editor_id = document_source_editor_id(&path);
+        let mut source = "hello".to_owned();
+        let mut harness = egui_kittest::Harness::new_ui(|ui| {
+            ui::document::source_editor(ui, editor_id, &mut source, true);
+        });
+        harness.run();
+
+        let document = stub_open_document(path.to_str().unwrap(), "hello", "hello", false);
+        let candidate = editor_id;
+        assert!(
+            egui::text_edit::TextEditState::load(&harness.ctx, candidate).is_some(),
+            "전제: 렌더 한 번으로 상태가 이미 저장돼 있어야 한다"
+        );
+
+        clear_document_editor_state(&harness.ctx, &document);
+
+        assert!(
+            egui::text_edit::TextEditState::load(&harness.ctx, candidate).is_none(),
+            "문서를 닫을 때 TextEditState가 지워지지 않았다 — 닫아도 남아 다시 열면 \
+             되살아나고, 세션 동안 편집한 문서 수만큼 무한정 쌓인다"
+        );
+    }
+
+    /// `close_document_entry`가 실제로 `clear_document_editor_state`를 호출하는지 —
+    /// App 전체를 구성하지 않고도 배선을 검증한다(다른 문서 탭 테스트와 같은 관례).
+    #[test]
+    fn close_document_entry는_텍스트편집기_상태_정리를_호출한다() {
+        let source = include_str!("app.rs");
+        let function_body = source
+            .split_once("fn close_document_entry(&mut self")
+            .expect("close_document_entry 정의를 찾아야 한다")
+            .1
+            .split_once("\n    fn ")
+            .expect("다음 함수 경계를 찾아야 한다")
+            .0;
+        assert!(
+            function_body.contains("clear_document_editor_state"),
+            "문서를 닫을 때 TextEditState도 함께 정리해야 한다 — 안 그러면 egui가 \
+             경로 기반 id로 들고 있는 실행취소 스냅샷(egui 0.35 max_undos=100)이 \
+             무한정 쌓인다: {function_body}"
+        );
+    }
+
+    #[test]
+    fn plan_document_eviction은_개수_상한을_넘으면_가장_먼저_연_clean_비활성_문서부터_닫는다() {
+        let mut documents = Vec::new();
+        for i in 0..DOCUMENT_TABS_MAX as u32 {
+            documents.push(stub_open_document_id(
+                i,
+                &format!("/tmp/{i}.md"),
+                "x",
+                "x",
+                false,
+            ));
+        }
+        let active = Some(ui::workspace::DocumentTabId(DOCUMENT_TABS_MAX as u32 - 1));
+        let evict = plan_document_eviction(&documents, active)
+            .expect("clean 비활성 문서가 있으니 자리를 만들 수 있어야 한다");
+        assert_eq!(
+            evict,
+            vec![ui::workspace::DocumentTabId(0)],
+            "가장 먼저 연(맨 앞) clean 비활성 문서 하나만 닫아도 개수 상한 안으로 \
+             들어와야 한다"
+        );
+    }
+
+    #[test]
+    fn plan_document_eviction은_dirty_문서를_절대_후보에_넣지_않는다() {
+        // 개수 상한을 넘겼는데 활성 문서를 뺀 나머지가 전부 dirty면 자리를 못 만든다
+        // — 저장 안 된 내용을 조용히 버리면 안 된다(설계 ④).
+        let mut documents = Vec::new();
+        for i in 0..DOCUMENT_TABS_MAX as u32 {
+            documents.push(stub_open_document_id(
+                i,
+                &format!("/tmp/{i}.md"),
+                "dirty",
+                "clean",
+                true,
+            ));
+        }
+        let active = Some(ui::workspace::DocumentTabId(DOCUMENT_TABS_MAX as u32 - 1));
+        assert_eq!(
+            plan_document_eviction(&documents, active),
+            None,
+            "닫을 clean 비활성 문서가 하나도 없으면 자리를 만들 수 없어야 한다"
+        );
+    }
+
+    #[test]
+    fn plan_document_eviction은_활성_문서를_절대_후보로_뽑지_않는다() {
+        // documents[0]만 clean이고 활성 문서다. 나머지는 dirty라 후보가 안 되고,
+        // 유일한 clean 문서는 활성이라 후보가 안 된다 — 자리를 못 만들어야 한다.
+        let mut documents = Vec::new();
+        for i in 0..DOCUMENT_TABS_MAX as u32 {
+            documents.push(stub_open_document_id(
+                i,
+                &format!("/tmp/{i}.md"),
+                "x",
+                "x",
+                i != 0,
+            ));
+        }
+        let active = Some(ui::workspace::DocumentTabId(0));
+        assert_eq!(
+            plan_document_eviction(&documents, active),
+            None,
+            "활성 문서는 clean이어도 절대 후보가 아니다"
+        );
+    }
+
+    #[test]
+    fn plan_document_eviction은_saving_문서를_절대_후보로_뽑지_않는다() {
+        let mut documents = Vec::new();
+        for i in 0..DOCUMENT_TABS_MAX as u32 {
+            let mut document = stub_open_document_id(
+                i,
+                &format!("/tmp/{i}.md"),
+                if i == 0 { "saving" } else { "dirty" },
+                if i == 0 { "saving" } else { "clean" },
+                i != 0,
+            );
+            document.saving = i == 0;
+            documents.push(document);
+        }
+
+        assert_eq!(
+            plan_document_eviction(
+                &documents,
+                Some(ui::workspace::DocumentTabId(DOCUMENT_TABS_MAX as u32 - 1)),
+            ),
+            None,
+            "clean이어도 저장 lane에 들어간 문서는 자동으로 닫으면 안 된다"
+        );
+    }
+
+    #[test]
+    fn plan_document_eviction은_바이트만_넘을때_0byte_loading보다_retained_victim을_고른다() {
+        let eight_mib = "a".repeat(8 * 1024 * 1024);
+        let five_mib = "b".repeat(5 * 1024 * 1024);
+        let documents = vec![
+            stub_open_document_id(1, "/tmp/loading.md", "", "", false),
+            stub_loaded_document_id(2, "/tmp/oldest-loaded.md", &eight_mib, &eight_mib, false),
+            stub_loaded_document_id(3, "/tmp/active.md", &five_mib, &five_mib, false),
+        ];
+
+        assert_eq!(
+            plan_document_eviction(&documents, Some(ui::workspace::DocumentTabId(3))),
+            Some(vec![ui::workspace::DocumentTabId(2)]),
+            "0-byte placeholder를 닫아도 byte를 회수하지 못하므로 loaded victim만 골라야 한다"
+        );
+    }
+
+    #[test]
+    fn plan_document_eviction은_바이트_상한도_넘으면_자리를_만든다() {
+        // 개수는 상한 밑이지만(3개) ViewOnly급 큰 문서 하나가 바이트 상한을 이미
+        // 넘겼다 — clean 비활성 문서를 닫아 자리를 만들어야 한다.
+        let big = vec![b'a'; (DOCUMENT_TOTAL_RETAINED_BYTES_MAX + 1) as usize];
+        let big_source = String::from_utf8(big).unwrap();
+        let mut documents = vec![stub_open_document_id(
+            0,
+            "/tmp/big.md",
+            &big_source,
+            &big_source,
+            false,
+        )];
+        documents.push(stub_open_document_id(1, "/tmp/small.md", "x", "x", false));
+        let evict = plan_document_eviction(&documents, Some(ui::workspace::DocumentTabId(1)))
+            .expect("clean 비활성 문서를 닫으면 바이트 상한 안으로 들어와야 한다");
+        assert_eq!(
+            evict,
+            vec![ui::workspace::DocumentTabId(0)],
+            "바이트 상한을 넘긴 큰 문서부터(맨 앞이기도 하다) 닫아야 한다"
+        );
+    }
+
+    /// ③ source만 세면(예전 버그) 상한의 절반보다 살짝 큰 정도라 넘지 않는 것처럼
+    /// 보이지만, `apply_document_load_outcome`이 항상 채우는 saved_source까지
+    /// 합치면(고친 계산) 실제로는 상한을 넘는다 — 되돌리면 실패하는 형태.
+    #[test]
+    fn plan_document_eviction은_source와_saved_source_두_사본을_합쳐서_바이트_상한을_판정한다() {
+        let half_plus = vec![b'a'; (DOCUMENT_TOTAL_RETAINED_BYTES_MAX / 2 + 1) as usize];
+        let half_plus_source = String::from_utf8(half_plus).unwrap();
+        let documents = vec![stub_open_document_id(
+            0,
+            "/tmp/half.md",
+            &half_plus_source,
+            &half_plus_source,
+            false,
+        )];
+        let evict = plan_document_eviction(&documents, None)
+            .expect("clean 비활성 문서 하나뿐이니 자리를 만들 수 있어야 한다");
+        assert_eq!(
+            evict,
+            vec![ui::workspace::DocumentTabId(0)],
+            "source만 세면(옛 계산) 상한의 절반+1이라 안 넘어 evict가 비어야 하지만, \
+             source+saved_source 두 사본을 합치면(고친 계산) 상한을 넘어 이 유일한 \
+             문서가 닫혀야 한다"
+        );
+    }
+
+    #[test]
+    fn next_active_document_after_close는_오른쪽_이웃을_우선하고_없으면_왼쪽이다() {
+        let a = ui::workspace::DocumentTabId(1);
+        let b = ui::workspace::DocumentTabId(2);
+        let c = ui::workspace::DocumentTabId(3);
+
+        // [a, b, c]에서 가운데(b, index 1)를 닫으면 [a, c]가 남는다 — 오른쪽 이웃(c)이
+        // 그 자리를 밀고 들어와 있으니 그대로 활성화한다.
+        let after_removing_middle = vec![
+            stub_open_document_id(a.0, "/tmp/a.md", "A", "A", false),
+            stub_open_document_id(c.0, "/tmp/c.md", "C", "C", false),
+        ];
+        assert_eq!(
+            next_active_document_after_close(&after_removing_middle, 1),
+            Some(c),
+            "오른쪽 이웃이 있으면 그쪽을 활성화해야 한다"
+        );
+
+        // [a, b, c]에서 마지막(c, index 2)을 닫으면 [a, b]가 남는다 — 오른쪽 이웃이
+        // 없으니 왼쪽 이웃(b)을 활성화한다.
+        let after_removing_last = vec![
+            stub_open_document_id(a.0, "/tmp/a.md", "A", "A", false),
+            stub_open_document_id(b.0, "/tmp/b.md", "B", "B", false),
+        ];
+        assert_eq!(
+            next_active_document_after_close(&after_removing_last, 2),
+            Some(b),
+            "오른쪽 이웃이 없으면 왼쪽 이웃을 활성화해야 한다"
+        );
+
+        // 마지막 하나 남은 문서를 닫으면(제거 후 목록이 빈다) 활성화할 문서가 없다
+        // — 문서 그룹 자체가 닫히고 터미널로 돌아간다(설계 ⑥).
+        assert_eq!(
+            next_active_document_after_close(&[], 0),
+            None,
+            "마지막 문서를 닫으면 활성화할 문서가 없어야 한다"
+        );
+    }
+
+    #[test]
+    fn close_document_entry는_활성_문서를_닫으면_이웃을_고르고_마지막이면_그룹을_닫는다() {
+        let source = include_str!("app.rs");
+        let function_body = source
+            .split_once("fn close_document_entry(&mut self")
+            .expect("close_document_entry 정의를 찾아야 한다")
+            .1
+            .split_once("\n    fn ")
+            .expect("다음 함수 경계를 찾아야 한다")
+            .0;
+        assert!(
+            function_body.contains(
+                "self.active_document = next_active_document_after_close(&self.documents, index);"
+            ),
+            "활성 문서를 닫으면 next_active_document_after_close로 이웃을 골라야 한다: \
+             {function_body}"
+        );
+        assert!(
+            function_body.contains("if self.documents.is_empty() {")
+                && function_body.contains("self.document_tab = self.document_tab.on_close();"),
+            "마지막 문서를 닫으면 문서 그룹 자체가 닫혀야 한다: {function_body}"
+        );
+    }
+
+    #[test]
+    fn begin_document_open은_새_문서를_추가만_하고_기존_문서를_건드리지_않는다() {
+        let source = include_str!("app.rs");
+        let function_body = source
+            .split_once("fn begin_document_open(&mut self, path: PathBuf) {")
+            .expect("begin_document_open 정의를 찾아야 한다")
+            .1
+            .split_once("\n    fn ")
+            .expect("다음 함수 경계를 찾아야 한다")
+            .0;
+        assert!(
+            function_body.contains("self.documents.push(OpenDocument {"),
+            "새 문서는 목록에 추가돼야 한다(교체가 아니다): {function_body}"
+        );
+        assert!(
+            !function_body.contains("self.documents = ")
+                && !function_body.contains("self.documents.clear()"),
+            "새 문서를 열 때 기존 목록을 지우거나 통째로 바꾸면 안 된다: {function_body}"
+        );
+        let refuse_branch = function_body
+            .split_once("plan_document_eviction(&self.documents, self.active_document) else {")
+            .expect("상한 판정 호출이 있어야 한다")
+            .1
+            .split_once("};")
+            .expect("else 블록이 끝나야 한다")
+            .0;
+        assert!(
+            refuse_branch.contains("self.document_cap_notice = true;"),
+            "자리를 못 만들면 상한 안내를 세워야 한다: {refuse_branch}"
+        );
+        assert!(
+            !refuse_branch.contains("self.documents.push"),
+            "자리를 못 만들었으면 문서를 열면 안 된다: {refuse_branch}"
+        );
+    }
+
+    /// 문서마다 `MarkdownDocumentSlot`이 달라야 Preview 렌더 캐시가 문서별로
+    /// 갈린다(멀티 문서 탭 설계 §2) — 예전에는 `MarkdownDocumentSlot(0)`으로 고정돼
+    /// 있어 모든 문서가 캐시를 공유했다(문서 A의 렌더 결과가 B에 보이는 사고).
+    #[test]
+    fn render_document_tab_body는_슬롯을_문서_id로_만들어_문서별로_캐시를_가른다() {
+        let source = include_str!("app.rs");
+        let function_body = source
+            .split_once("fn render_document_tab_body(")
+            .expect("render_document_tab_body 정의를 찾아야 한다")
+            .1
+            .split_once("\n    fn ")
+            .expect("다음 함수 경계를 찾아야 한다")
+            .0;
+        assert!(
+            function_body.contains("MarkdownDocumentSlot(u64::from(id.0))"),
+            "슬롯은 문서 id에서 만들어야 한다: {function_body}"
+        );
+        assert!(
+            !function_body.contains("MarkdownDocumentSlot(0)"),
+            "슬롯이 다시 0으로 고정되면 안 된다(모든 문서가 캐시를 공유하게 된다)"
+        );
+    }
+
+    #[test]
+    fn recompute_dirty는_편집_저장_원복을_올바르게_판정한다() {
+        let mut document = stub_open_document("/tmp/doc.md", "A", "A", false);
+
+        // 편집 → dirty.
+        document.source = "B".to_owned();
+        document.recompute_dirty();
+        assert!(
+            document.dirty,
+            "내용이 saved_source와 다르면 dirty여야 한다"
+        );
+
+        // 저장(=saved_source를 현재 내용으로 맞춤) → 해제.
+        document.saved_source = document.source.clone();
+        document.recompute_dirty();
+        assert!(!document.dirty, "저장 직후에는 dirty가 해제돼야 한다");
+
+        // 다시 편집한 뒤 saved_source와 같은 내용으로 되돌리면 → 해제(해시가 아니라
+        // 전체 비교 기준이지만 계약은 동일하다).
+        document.source = "C".to_owned();
+        document.recompute_dirty();
+        assert!(document.dirty);
+        document.source = document.saved_source.clone();
+        document.recompute_dirty();
+        assert!(
+            !document.dirty,
+            "원래 내용으로 되돌리면 dirty가 해제돼야 한다"
+        );
+    }
+
+    #[test]
+    fn document_can_save는_8mib까지_허용하고_그_다음_byte부터_막는다() {
+        let dir = unique_temp_dir("save-limit-app");
+        let path = dir.join("a.md");
+        std::fs::write(&path, b"x").unwrap();
+        let load =
+            document_io::load_document(&document_io::DocumentLoadRequest { path: path.clone() });
+        let document_io::DocumentLoadOutcome::Loaded { revision, .. } = load else {
+            panic!("expected Loaded");
+        };
+        let mut document = stub_open_document(path.to_str().unwrap(), "x", "", true);
+        document.load_state = DocumentLoadState::Loaded {
+            revision,
+            limit: document_io::DocumentLimitTier::Full,
+        };
+
+        document.source = "x".repeat(document_io::DOCUMENT_REFUSE_BYTES_MAX as usize);
+        assert!(document.can_save(), "정확히 8 MiB는 저장 가능해야 한다");
+        let exact_source = document.source.clone();
+        let exact = document_io::save_document(document_io::DocumentSaveRequest {
+            path: path.clone(),
+            contents: exact_source.clone(),
+            expected_revision: revision,
+        });
+        let document_io::DocumentSaveOutcome::Saved {
+            revision: exact_revision,
+        } = exact
+        else {
+            panic!("정확히 8 MiB 저장은 성공해야 한다");
+        };
+
+        document.source.push('x');
+        assert!(!document.can_save(), "8 MiB+1은 App 경계에서 막아야 한다");
+        let oversized = document_io::save_document(document_io::DocumentSaveRequest {
+            path: path.clone(),
+            contents: document.source.clone(),
+            expected_revision: exact_revision,
+        });
+        assert!(matches!(
+            oversized,
+            document_io::DocumentSaveOutcome::Failed {
+                code: document_io::DocumentIoErrorCode::ContentTooLarge
+            }
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), exact_source);
+
+        document.source.pop();
+        assert!(
+            document.can_save(),
+            "내용을 다시 8 MiB로 줄이면 저장 가능해야 한다"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn document_close_save_eligibility는_in_flight를_기다릴_수_있지만_초과_source는_막는다() {
+        let dir = unique_temp_dir("close-save-in-flight");
+        let path = dir.join("a.md");
+        std::fs::write(&path, b"x").unwrap();
+        let load =
+            document_io::load_document(&document_io::DocumentLoadRequest { path: path.clone() });
+        let document_io::DocumentLoadOutcome::Loaded { revision, .. } = load else {
+            panic!("expected Loaded");
+        };
+        let mut document = stub_open_document(path.to_str().unwrap(), "edited", "x", true);
+        document.load_state = DocumentLoadState::Loaded {
+            revision,
+            limit: document_io::DocumentLimitTier::Full,
+        };
+        document.saving = true;
+
+        assert!(
+            !document.can_save(),
+            "in-flight 저장을 중복 요청하면 안 된다"
+        );
+        assert!(
+            document.can_save_then_close(),
+            "현재 저장 완료 후 닫기 continuation은 선택할 수 있어야 한다"
+        );
+
+        document.source = "x".repeat(document_io::DOCUMENT_REFUSE_BYTES_MAX as usize + 1);
+        assert!(
+            !document.can_save_then_close(),
+            "8 MiB 초과 source로는 저장 후 닫기를 선택할 수 없어야 한다"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn document_saved_outcome은_clean이_된_pending_close만_자동_완료한다() {
+        let id = ui::workspace::DocumentTabId(7);
+        let queue: std::collections::VecDeque<_> = [
+            DocumentPendingConfirm::CloseWithDirty { id },
+            DocumentPendingConfirm::CloseWithDirty {
+                id: ui::workspace::DocumentTabId(8),
+            },
+        ]
+        .into_iter()
+        .collect();
+
+        assert!(should_complete_pending_close_after_save(&queue, id, false));
+        assert!(
+            !should_complete_pending_close_after_save(&queue, id, true),
+            "저장 중 새 편집이 들어와 여전히 dirty면 자동으로 닫으면 안 된다"
+        );
+        assert!(
+            !should_complete_pending_close_after_save(
+                &queue,
+                ui::workspace::DocumentTabId(9),
+                false,
+            ),
+            "닫기 intent가 없는 clean 문서를 저장 성공만으로 닫으면 안 된다"
+        );
+    }
+
+    #[test]
+    fn request_document_save는_상한을_clone보다_먼저_검사하고_close_continuation을_지운다() {
+        let source = include_str!("app.rs");
+        let function_body = source
+            .split_once("fn request_document_save(&mut self")
+            .expect("request_document_save 정의를 찾아야 한다")
+            .1
+            .split_once("\n    fn ")
+            .expect("다음 함수 경계를 찾아야 한다")
+            .0;
+        let guard = function_body
+            .find("if !document.source_fits_save_limit()")
+            .expect("host 저장 경계 검사가 있어야 한다");
+        let first_clone = function_body
+            .find("document.source.clone()")
+            .expect("정상 저장 snapshot clone은 유지해야 한다");
+        assert!(
+            guard < first_clone,
+            "크기 검사는 첫 source clone보다 앞이어야 한다"
+        );
+        let overflow_branch = &function_body[guard..first_clone];
+        assert!(
+            overflow_branch.contains(
+                "document.save_error = Some(document_io::DocumentIoErrorCode::ContentTooLarge);"
+            ),
+            "초과 이유를 명시적으로 남겨야 한다: {overflow_branch}"
+        );
+        assert!(
+            overflow_branch.contains("self.document_close_after_save.remove(&id);")
+                && overflow_branch.contains("return;"),
+            "초과면 close-after-save를 제거하고 clone 전에 끝내야 한다: {overflow_branch}"
+        );
+        assert_eq!(
+            function_body.matches("document.source.clone()").count(),
+            2,
+            "정상 저장의 worker request와 saving snapshot 두 소유본은 유지해야 한다"
+        );
+    }
+
+    #[test]
+    fn document_save_infrastructure_failure는_target의_snapshot과_close_continuation을_정리한다() {
+        let a = ui::workspace::DocumentTabId(1);
+        let b = ui::workspace::DocumentTabId(2);
+        let mut documents = vec![
+            stub_open_document_id(a.0, "/tmp/a.md", "A2", "A1", true),
+            stub_open_document_id(b.0, "/tmp/b.md", "B2", "B1", true),
+        ];
+        for document in &mut documents {
+            document.saving = true;
+            document.saving_source = Some(document.source.clone());
+        }
+        let mut close_after_save: std::collections::HashSet<_> = [a, b].into_iter().collect();
+
+        apply_document_save_infrastructure_failure(&mut documents, &mut close_after_save, a);
+
+        let failed = documents.iter().find(|document| document.id == a).unwrap();
+        assert!(!failed.saving);
+        assert_eq!(failed.saving_source, None);
+        assert_eq!(
+            failed.save_error,
+            Some(document_io::DocumentIoErrorCode::ReadFailed)
+        );
+        assert!(!close_after_save.contains(&a));
+
+        let unaffected = documents.iter().find(|document| document.id == b).unwrap();
+        assert!(unaffected.saving);
+        assert_eq!(unaffected.saving_source.as_deref(), Some("B2"));
+        assert!(close_after_save.contains(&b));
+    }
+
+    #[test]
+    fn document_poll의_두_save_worker_인프라_실패는_같은_정리_helper를_쓴다() {
+        let source = include_str!("app.rs");
+        let function_body = source
+            .split_once("fn poll_document_io(&mut self) {")
+            .expect("poll_document_io 정의를 찾아야 한다")
+            .1
+            .split_once("\n    fn ")
+            .expect("다음 함수 경계를 찾아야 한다")
+            .0;
+        assert_eq!(
+            function_body
+                .matches("apply_document_save_infrastructure_failure(")
+                .count(),
+            2,
+            "worker outcome Err와 admission Unavailable 모두 snapshot/continuation을 정리해야 한다"
+        );
+    }
+
+    #[test]
+    fn document_저장_상한은_toolbar와_dirty_close에서_같은_이유로_저장을_막는다() {
+        let source = include_str!("app.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let status_body = production
+            .split_once("fn document_toolbar_status_text(")
+            .expect("toolbar status 함수가 있어야 한다")
+            .1
+            .split_once("\n    fn ")
+            .expect("다음 함수 경계를 찾아야 한다")
+            .0;
+        let save_limit = status_body
+            .find("document.limit.save_too_large")
+            .expect("toolbar에 save 상한 이유가 있어야 한다");
+        let saved_feedback = status_body
+            .find("document.saved")
+            .expect("기존 저장 성공 피드백이 있어야 한다");
+        let editing_budget = status_body
+            .find("document.limit.grew_past_full")
+            .expect("기존 편집 권장 상한 이유가 있어야 한다");
+        assert!(
+            save_limit < saved_feedback && save_limit < editing_budget,
+            "절대 저장 상한 문구가 이전 Saved 피드백과 1 MiB 권장 상한보다 우선해야 한다"
+        );
+
+        let modal = production
+            .split_once("DocumentPendingConfirm::CloseWithDirty { id } => {")
+            .expect("dirty close modal 분기가 있어야 한다")
+            .1
+            .split_once("DocumentPendingConfirm::SaveConflict")
+            .expect("conflict modal 경계가 있어야 한다")
+            .0;
+        assert!(
+            modal.contains("document.limit.save_too_large"),
+            "dirty close에도 같은 초과 이유를 보여줘야 한다"
+        );
+        assert!(
+            modal.contains("document.is_some_and(OpenDocument::can_save_then_close)"),
+            "dirty close Save 버튼은 in-flight continuation을 허용하는 전용 자격을 써야 한다"
+        );
+        assert!(
+            !modal.contains("document.is_some_and(OpenDocument::can_save)"),
+            "일반 can_save는 saving 중 false라 dirty-close modal에 직접 쓰면 안 된다"
+        );
+        assert!(
+            modal.contains("ui.add_enabled(") && modal.contains("can_save,"),
+            "dirty close Save 버튼은 계산한 modal 자격으로 비활성화해야 한다"
+        );
+    }
+
+    #[test]
+    fn document_save_outcome은_clean이_된_stale_close_confirm을_닫기로_완료한다() {
+        let source = include_str!("app.rs");
+        let function_body = source
+            .split_once("fn apply_document_save_outcome(")
+            .expect("apply_document_save_outcome 정의를 찾아야 한다")
+            .1
+            .split_once("\n    fn ")
+            .expect("다음 함수 경계를 찾아야 한다")
+            .0;
+        assert!(
+            function_body.contains("should_complete_pending_close_after_save("),
+            "저장 성공은 clean이 된 pending CloseWithDirty를 감지해야 한다"
+        );
+        assert!(
+            function_body.contains("self.close_document_entry(id);"),
+            "clean pending close는 원래 close intent대로 문서를 닫아야 한다"
+        );
+    }
+
+    #[test]
+    fn open_document에는_사용되지_않는_body_ui_state가_없다() {
+        let source = include_str!("app.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        assert_eq!(
+            production.matches("body_ui_id").count(),
+            0,
+            "절대 editor id 도입 뒤 body UI id 상태는 필요 없다"
+        );
+    }
+
+    #[test]
+    fn document_load_state_from_outcome은_4티어를_올바르게_매핑한다() {
+        let dir = unique_temp_dir("load-tiers");
+
+        let full_path = dir.join("full.md");
+        std::fs::write(&full_path, b"hello").unwrap();
+        let outcome =
+            document_io::load_document(&document_io::DocumentLoadRequest { path: full_path });
+        assert!(
+            matches!(
+                document_load_state_from_outcome(&outcome),
+                DocumentLoadState::Loaded {
+                    limit: document_io::DocumentLimitTier::Full,
+                    ..
+                }
+            ),
+            "Full 티어는 Loaded{{limit: Full}}로 가야 한다"
+        );
+
+        let view_only_path = dir.join("view-only.md");
+        std::fs::write(
+            &view_only_path,
+            vec![b'a'; document_io::DOCUMENT_FULL_BYTES_MAX as usize + 1],
+        )
+        .unwrap();
+        let outcome = document_io::load_document(&document_io::DocumentLoadRequest {
+            path: view_only_path,
+        });
+        assert!(
+            matches!(
+                document_load_state_from_outcome(&outcome),
+                DocumentLoadState::Loaded {
+                    limit: document_io::DocumentLimitTier::ViewOnly,
+                    ..
+                }
+            ),
+            "ViewOnly 티어는 Loaded{{limit: ViewOnly}}로 가야 한다"
+        );
+
+        let refused_path = dir.join("refused.md");
+        std::fs::write(
+            &refused_path,
+            vec![b'a'; document_io::DOCUMENT_REFUSE_BYTES_MAX as usize + 1],
+        )
+        .unwrap();
+        let outcome =
+            document_io::load_document(&document_io::DocumentLoadRequest { path: refused_path });
+        assert!(matches!(
+            document_load_state_from_outcome(&outcome),
+            DocumentLoadState::Refused { .. }
+        ));
+
+        let binary_path = dir.join("binary.md");
+        std::fs::write(&binary_path, [0xFFu8, 0xFE, 0x00, 0x80]).unwrap();
+        let outcome =
+            document_io::load_document(&document_io::DocumentLoadRequest { path: binary_path });
+        assert!(matches!(
+            document_load_state_from_outcome(&outcome),
+            DocumentLoadState::Binary { .. }
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_save_outcome_to_document은_conflict에서_source를_보존하고_확인을_요청한다() {
+        let mut document = stub_open_document("/tmp/doc.md", "EDITED", "ORIGINAL", true);
+        document.saving = true;
+        let id = ui::workspace::DocumentTabId(0);
+
+        let confirm = apply_save_outcome_to_document(
+            id,
+            &mut document,
+            &document_io::DocumentSaveOutcome::Conflict,
+        );
+
+        assert_eq!(confirm, Some(DocumentPendingConfirm::SaveConflict { id }));
+        assert_eq!(
+            document.source, "EDITED",
+            "충돌 시 source를 덮어쓰면 안 된다"
+        );
+        assert!(document.dirty, "충돌 시 dirty를 임의로 해제하면 안 된다");
+        assert!(
+            !document.saving,
+            "충돌 결과를 받으면 저장 중 플래그는 내려간다"
+        );
+    }
+
+    #[test]
+    fn 저장_중_들어온_편집은_저장됨으로_표시되지_않는다() {
+        // 저장은 **요청 시점 스냅샷**을 디스크에 쓴다. 그 사이에도 편집기는 입력을
+        // 받으므로, 완료 시 `saved_source`를 현재 버퍼로 스탬프하면 디스크에 없는
+        // 편집분까지 "저장됨"이 되어 조용히 사라진다(2026-08-23 리뷰 CRITICAL).
+        let dir = unique_temp_dir("save-outcome-raced");
+        let path = dir.join("doc.md");
+        std::fs::write(&path, b"ORIGINAL").unwrap();
+        let load =
+            document_io::load_document(&document_io::DocumentLoadRequest { path: path.clone() });
+        let document_io::DocumentLoadOutcome::Loaded {
+            revision: initial_revision,
+            ..
+        } = load
+        else {
+            panic!("expected Loaded");
+        };
+
+        let mut document = stub_open_document(path.to_str().unwrap(), "SENT", "ORIGINAL", true);
+        document.load_state = DocumentLoadState::Loaded {
+            revision: initial_revision,
+            limit: document_io::DocumentLimitTier::Full,
+        };
+
+        // 워커에 "SENT"를 보낸 상태.
+        document.saving = true;
+        document.saving_source = Some("SENT".to_owned());
+        let save = document_io::save_document(document_io::DocumentSaveRequest {
+            path: path.clone(),
+            contents: "SENT".to_owned(),
+            expected_revision: initial_revision,
+        });
+
+        // 결과가 도착하기 전에 사용자가 한 글자 더 쳤다.
+        document.source = "SENT+MORE".to_owned();
+
+        let confirm =
+            apply_save_outcome_to_document(ui::workspace::DocumentTabId(0), &mut document, &save);
+
+        assert_eq!(confirm, None);
+        assert_eq!(
+            document.saved_source, "SENT",
+            "디스크에 들어간 것은 보낸 스냅샷이다"
+        );
+        assert!(
+            document.dirty,
+            "저장 중 들어온 편집은 아직 저장되지 않았으므로 dirty로 남아야 한다"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "SENT");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 저장중_close후_저장된_스냅샷과_현재_source가_다르면_dirty로_남는다() {
+        let dir = unique_temp_dir("save-revert-close");
+        let path = dir.join("doc.md");
+        std::fs::write(&path, b"A").unwrap();
+        let load =
+            document_io::load_document(&document_io::DocumentLoadRequest { path: path.clone() });
+        let document_io::DocumentLoadOutcome::Loaded {
+            revision: initial_revision,
+            ..
+        } = load
+        else {
+            panic!("expected Loaded");
+        };
+
+        let id = ui::workspace::DocumentTabId(0);
+        let mut document = stub_open_document(path.to_str().unwrap(), "A", "A", false);
+        document.load_state = DocumentLoadState::Loaded {
+            revision: initial_revision,
+            limit: document_io::DocumentLimitTier::Full,
+        };
+        document.saving = true;
+        document.saving_source = Some("B".to_owned());
+        assert_eq!(
+            document_close_disposition(Some(&document)),
+            DocumentCloseDisposition::DeferUntilSave,
+            "저장 중 닫기는 문서를 즉시 제거하면 안 된다"
+        );
+
+        let save = document_io::save_document(document_io::DocumentSaveRequest {
+            path: path.clone(),
+            contents: "B".to_owned(),
+            expected_revision: initial_revision,
+        });
+        let confirm = apply_save_outcome_to_document(id, &mut document, &save);
+
+        assert_eq!(confirm, None);
+        assert_eq!(document.saved_source, "B");
+        assert_eq!(document.source, "A");
+        assert!(
+            document.dirty,
+            "디스크에는 B, 현재 편집기에는 A가 남으므로 닫기 전에 다시 확인해야 한다"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "B");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_save_outcome_to_document은_saved에서_dirty를_해제하고_revision을_갱신한다() {
+        let dir = unique_temp_dir("save-outcome-saved");
+        let path = dir.join("doc.md");
+        std::fs::write(&path, b"ORIGINAL").unwrap();
+        let load =
+            document_io::load_document(&document_io::DocumentLoadRequest { path: path.clone() });
+        let document_io::DocumentLoadOutcome::Loaded {
+            revision: initial_revision,
+            ..
+        } = load
+        else {
+            panic!("expected Loaded");
+        };
+
+        let mut document = stub_open_document(path.to_str().unwrap(), "UPDATED", "ORIGINAL", true);
+        document.saving = true;
+        document.load_state = DocumentLoadState::Loaded {
+            revision: initial_revision,
+            limit: document_io::DocumentLimitTier::Full,
+        };
+
+        let save = document_io::save_document(document_io::DocumentSaveRequest {
+            path: path.clone(),
+            contents: document.source.clone(),
+            expected_revision: initial_revision,
+        });
+        let confirm =
+            apply_save_outcome_to_document(ui::workspace::DocumentTabId(0), &mut document, &save);
+
+        assert_eq!(confirm, None);
+        assert!(!document.dirty);
+        assert!(!document.saving);
+        assert_eq!(document.saved_source, "UPDATED");
+        let DocumentLoadState::Loaded {
+            revision: stored, ..
+        } = document.load_state
+        else {
+            panic!("expected Loaded load_state");
+        };
+        assert_ne!(stored, initial_revision, "저장 후 revision이 갱신돼야 한다");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn document_close_disposition은_saving을_dirty보다_우선한다() {
+        assert_eq!(
+            document_close_disposition(None),
+            DocumentCloseDisposition::CloseNow
+        );
+        let mut document = stub_open_document("/tmp/a.md", "A", "A", false);
+        assert_eq!(
+            document_close_disposition(Some(&document)),
+            DocumentCloseDisposition::CloseNow
+        );
+        document.dirty = true;
+        assert_eq!(
+            document_close_disposition(Some(&document)),
+            DocumentCloseDisposition::ConfirmDirty
+        );
+        document.saving = true;
+        document.dirty = false;
+        document.saving_source = Some("B".to_owned());
+        assert_eq!(
+            document_close_disposition(Some(&document)),
+            DocumentCloseDisposition::DeferUntilSave
+        );
+    }
+
+    /// ① 대기 중인 확인이 있을 때 다른 문서의 확인이 와도 먼저 것이 사라지면 안
+    /// 된다 — 예전엔 App 전역 슬롯 하나라 응답 없이 조용히 덮어써졌다. 이제는
+    /// 도착 순서대로 큐에 쌓인다(FIFO).
+    #[test]
+    fn enqueue_document_pending_confirm은_먼저_온_확인을_지우지_않고_뒤에_쌓는다() {
+        let a = ui::workspace::DocumentTabId(1);
+        let b = ui::workspace::DocumentTabId(2);
+        let mut queue = std::collections::VecDeque::new();
+        enqueue_document_pending_confirm(
+            &mut queue,
+            DocumentPendingConfirm::CloseWithDirty { id: a },
+        );
+        enqueue_document_pending_confirm(
+            &mut queue,
+            DocumentPendingConfirm::SaveConflict { id: b },
+        );
+        assert_eq!(
+            queue.into_iter().collect::<Vec<_>>(),
+            vec![
+                DocumentPendingConfirm::CloseWithDirty { id: a },
+                DocumentPendingConfirm::SaveConflict { id: b },
+            ],
+            "먼저 온 A의 확인이 사라지지 않고, B의 확인은 그 뒤에 쌓여야 한다"
+        );
+    }
+
+    /// 같은 문서에 대한 확인이 이미 대기 중이면 중복으로 쌓이면 안 된다(순서가
+    /// 결정적이어야 한다는 요구의 일부 — 같은 문서 확인이 여러 개면 어느 게 먼저인지
+    /// 모호해진다).
+    #[test]
+    fn enqueue_document_pending_confirm은_같은_문서의_중복_확인을_버린다() {
+        let a = ui::workspace::DocumentTabId(1);
+        let mut queue = std::collections::VecDeque::new();
+        enqueue_document_pending_confirm(
+            &mut queue,
+            DocumentPendingConfirm::CloseWithDirty { id: a },
+        );
+        enqueue_document_pending_confirm(
+            &mut queue,
+            DocumentPendingConfirm::CloseWithDirty { id: a },
+        );
+        assert_eq!(
+            queue.len(),
+            1,
+            "같은 문서에 대한 확인이 중복으로 쌓이면 안 된다"
+        );
+    }
+
+    #[test]
+    fn enqueue_document_pending_confirm은_save_conflict로_같은_id의_close를_제자리_교체한다() {
+        let a = ui::workspace::DocumentTabId(1);
+        let b = ui::workspace::DocumentTabId(2);
+        let mut queue: std::collections::VecDeque<_> = [
+            DocumentPendingConfirm::CloseWithDirty { id: b },
+            DocumentPendingConfirm::CloseWithDirty { id: a },
+        ]
+        .into_iter()
+        .collect();
+
+        enqueue_document_pending_confirm(
+            &mut queue,
+            DocumentPendingConfirm::SaveConflict { id: a },
+        );
+
+        assert_eq!(
+            queue.iter().copied().collect::<Vec<_>>(),
+            vec![
+                DocumentPendingConfirm::CloseWithDirty { id: b },
+                DocumentPendingConfirm::SaveConflict { id: a },
+            ],
+            "A의 queue 위치와 B→A FIFO는 유지하면서 conflict만 유실되지 않아야 한다"
+        );
+
+        enqueue_document_pending_confirm(
+            &mut queue,
+            DocumentPendingConfirm::SaveConflict { id: a },
+        );
+        assert_eq!(
+            queue.iter().copied().collect::<Vec<_>>(),
+            vec![
+                DocumentPendingConfirm::CloseWithDirty { id: b },
+                DocumentPendingConfirm::SaveConflict { id: a },
+            ],
+            "같은 SaveConflict variant는 기존처럼 dedupe돼야 한다"
+        );
+    }
+
+    /// 큐에 두 문서의 확인이 쌓여 있을 때 사용자가 응답하면 **맨 앞(지금 화면에 뜬
+    /// 모달)**에만 적용돼야 한다 — 뒤엣것(B)이 잘못 적용되면 안 된다("각 확인이
+    /// 올바른 문서에 적용되는지").
+    #[test]
+    fn resolve_document_confirm_choice는_큐_맨앞의_확인만_소비하고_뒤는_그대로_둔다() {
+        let a = ui::workspace::DocumentTabId(1);
+        let b = ui::workspace::DocumentTabId(2);
+        let mut queue: std::collections::VecDeque<_> = [
+            DocumentPendingConfirm::CloseWithDirty { id: a },
+            DocumentPendingConfirm::CloseWithDirty { id: b },
+        ]
+        .into_iter()
+        .collect();
+
+        let action = resolve_document_confirm_choice(&mut queue, DocumentConfirmChoice::Discard);
+
+        assert_eq!(
+            action,
+            Some(DocumentConfirmAction::Discard(a)),
+            "맨 앞(A)에 대한 확인이 적용돼야 한다 — B 것이 잘못 적용되면 안 된다"
+        );
+        assert_eq!(
+            queue.into_iter().collect::<Vec<_>>(),
+            vec![DocumentPendingConfirm::CloseWithDirty { id: b }],
+            "B의 확인은 큐에 그대로 남아 다음 프레임에 이어서 그려져야 한다"
+        );
+    }
+
+    #[test]
+    fn resolve_document_confirm_choice는_저장을_고르면_save_then_close를_돌려준다() {
+        let id = ui::workspace::DocumentTabId(9);
+        let mut queue: std::collections::VecDeque<_> =
+            [DocumentPendingConfirm::CloseWithDirty { id }]
+                .into_iter()
+                .collect();
+        assert_eq!(
+            resolve_document_confirm_choice(&mut queue, DocumentConfirmChoice::Save),
+            Some(DocumentConfirmAction::SaveThenClose(id))
+        );
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn resolve_document_confirm_choice는_취소면_아무것도_실행하지_않고_큐에서_지운다() {
+        let id = ui::workspace::DocumentTabId(3);
+        let mut queue: std::collections::VecDeque<_> =
+            [DocumentPendingConfirm::CloseWithDirty { id }]
+                .into_iter()
+                .collect();
+        assert_eq!(
+            resolve_document_confirm_choice(&mut queue, DocumentConfirmChoice::Cancel),
+            None
+        );
+        assert!(
+            queue.is_empty(),
+            "취소해도 큐에서는 빠져야 한다(모달이 닫힌다)"
+        );
+    }
+
+    /// Conflict 확인도 같은 계약 — 맨 앞만 소비하고 뒤는 그대로 둔다.
+    #[test]
+    fn resolve_document_conflict_choice는_큐_맨앞의_확인만_소비한다() {
+        let a = ui::workspace::DocumentTabId(1);
+        let b = ui::workspace::DocumentTabId(2);
+        let mut queue: std::collections::VecDeque<_> = [
+            DocumentPendingConfirm::SaveConflict { id: a },
+            DocumentPendingConfirm::SaveConflict { id: b },
+        ]
+        .into_iter()
+        .collect();
+
+        let reload_id = resolve_document_conflict_choice(&mut queue, true);
+
+        assert_eq!(reload_id, Some(a), "맨 앞(A)만 재로드 대상이어야 한다");
+        assert_eq!(
+            queue.into_iter().collect::<Vec<_>>(),
+            vec![DocumentPendingConfirm::SaveConflict { id: b }],
+            "B의 확인은 큐에 그대로 남아야 한다"
+        );
+    }
+
+    /// `document_replace_requires_confirm`은 멀티 문서 탭 설계에서 함께 사라졌다 —
+    /// 새 문서를 열어도 기존 문서를 교체하지 않으니(③) 교체 확인 자체가 필요 없다.
+    /// 대신 "같은 파일을 다시 열면 탭이 늘지 않고 활성화만 된다"는 계약을
+    /// `begin_document_open`은_이미_열린_문서를_다시_열면_탭을_늘리지_않고_활성화만_한다
+    /// (아래)이 검증한다.
+
+    #[test]
+    fn classify_document_link_intent은_3종을_올바르게_라우팅한다() {
+        let base = Path::new("/workspace/docs");
+        assert_eq!(
+            classify_document_link_intent(
+                base,
+                &ui::markdown_viewer::MarkdownLinkIntent::OpenExternal(
+                    "https://example.com".to_owned()
+                )
+            ),
+            DocumentLinkAction::OpenExternal("https://example.com".to_owned())
+        );
+        assert_eq!(
+            classify_document_link_intent(
+                base,
+                &ui::markdown_viewer::MarkdownLinkIntent::OpenRelativeDocument(
+                    "other.md".to_owned()
+                )
+            ),
+            DocumentLinkAction::OpenDocument(PathBuf::from("/workspace/docs/other.md"))
+        );
+        assert_eq!(
+            classify_document_link_intent(
+                base,
+                &ui::markdown_viewer::MarkdownLinkIntent::Rejected(
+                    "javascript:alert(1)".to_owned()
+                )
+            ),
+            DocumentLinkAction::Ignored
+        );
+    }
+
+    #[test]
+    fn 문서_source가_바뀌는_두_지점_모두_revision을_올린다() {
+        // on_document_source_edited(편집) · apply_document_load_outcome_to_document
+        // (로드·재로드 완료) — 둘 다 안 올리면 뷰어가 옛 내용을 계속 보여준다. 예전에는 새 문서를
+        // 열 때(begin_document_open)도 세 번째로 올려야 했다 — 그때는 슬롯이 모든
+        // 문서에 걸쳐 `0`으로 고정돼 있어 revision만이 유일한 캐시 구분 수단이었기
+        // 때문이다. 이제 슬롯 자체가 문서 id라 새 문서는 그냥 `source_revision: 0`으로
+        // 시작해도 다른 문서와 캐시가 섞이지 않는다.
+        let source = include_str!("app.rs");
+        let edited_body = source
+            .split_once("fn on_document_source_edited(&mut self")
+            .expect("on_document_source_edited 정의를 찾아야 한다")
+            .1
+            .split_once("fn apply_document_save_outcome(&mut self")
+            .expect("apply_document_save_outcome 정의를 찾아야 한다")
+            .0;
+        let loaded_body = source
+            .split_once("fn apply_document_load_outcome_to_document(")
+            .expect("apply_document_load_outcome_to_document 정의를 찾아야 한다")
+            .1
+            .split_once("fn apply_save_outcome_to_document(")
+            .expect("apply_save_outcome_to_document 정의를 찾아야 한다")
+            .0;
+        for (name, body) in [
+            ("on_document_source_edited", edited_body),
+            ("apply_document_load_outcome_to_document", loaded_body),
+        ] {
+            assert_eq!(
+                body.matches(
+                    "document.source_revision = document.source_revision.wrapping_add(1);"
+                )
+                .count(),
+                1,
+                "{name}은 source_revision을 한 번 올려야 한다"
+            );
+        }
+    }
+
+    #[test]
+    fn 문서_닫기_disposition은_지연과_확인을_즉시닫기보다_먼저_처리한다() {
+        let source = include_str!("app.rs");
+        let function_body = source
+            .split_once("fn apply_document_tab_intent(")
+            .expect("apply_document_tab_intent 정의를 찾아야 한다")
+            .1
+            .split_once("fn activate_document_tab(&mut self")
+            .expect("activate_document_tab 정의를 찾아야 한다")
+            .0;
+        let non_immediate_branches = function_body
+            .split_once("match document_close_disposition(document)")
+            .expect("문서 닫기 disposition 분기가 있어야 한다")
+            .1
+            .split_once("DocumentCloseDisposition::CloseNow")
+            .expect("확인이 필요하면 곧장 return해야 한다")
+            .0;
+        assert!(
+            non_immediate_branches.contains("DocumentPendingConfirm::CloseWithDirty"),
+            "확인 분기는 CloseWithDirty를 세워야 한다"
+        );
+        assert!(
+            !non_immediate_branches.contains("close_document_entry"),
+            "지연·확인 분기는 문서를 즉시 지우면 안 된다"
+        );
+        assert!(
+            non_immediate_branches.contains("self.document_close_after_save.insert(id);"),
+            "저장 중 닫기는 결과를 받을 때까지 지연해야 한다"
+        );
+    }
+
+    /// 멀티 문서 탭 설계 ③ — 다른 문서를 열어도 기존 문서를 교체하지 않으니 그
+    /// 확인(예전 `document_replace_requires_confirm`/`ReplaceWithDirty`)도 사라졌다.
+    /// `open_document`가 dirty 확인 없이 곧장 `begin_document_open`으로 가는지,
+    /// `begin_document_open`이 실제로 탭을 늘리는지는 아래
+    /// `begin_document_open은_이미_열린_문서를_다시_열면_탭을_늘리지_않고_활성화만_한다`·
+    /// `begin_document_open은_새_문서를_열어도_기존_문서를_그대로_둔다`가 검증한다.
+    #[test]
+    fn open_document는_교체_확인_없이_곧장_begin_document_open으로_간다() {
+        let source = include_str!("app.rs");
+        let function_body = source
+            .split_once("fn open_document(&mut self, path: PathBuf) {")
+            .expect("open_document 정의를 찾아야 한다")
+            .1
+            .split_once("\n    fn ")
+            .expect("다음 함수 경계를 찾아야 한다")
+            .0;
+        assert!(
+            !function_body.contains("DocumentPendingConfirm"),
+            "open_document는 이제 확인 모달을 세우지 않는다: {function_body}"
+        );
+        assert!(
+            function_body.contains("self.begin_document_open(path)"),
+            "포커스된 pane이 있으면 곧장 열어야 한다"
+        );
+    }
+
+    /// ⌘F(`A::TerminalSearch`)는 보조 본문이 활성이면 보조 검색을 토글하고, 아니면
+    /// 기존 터미널 검색을 그대로 연다 — 세션 헤더 검색 버튼과 같은 진입 규칙(스펙
+    /// "진입"), 보조 본문 비활성일 때 기존 동작이 회귀하지 않는다는 계약.
+    #[test]
+    fn 터미널서치_단축키는_보조_본문_활성_여부로_갈라진다() {
+        let source = include_str!("app.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let arm = production
+            .split_once("A::TerminalSearch => {")
+            .expect("A::TerminalSearch 분기가 있어야 한다")
+            .1
+            .split_once("A::FocusComposer =>")
+            .expect("다음 분기 경계가 있어야 한다")
+            .0;
+        assert!(
+            arm.contains("self.work_history_tab.is_active() || self.git_tab.is_active()"),
+            "보조 본문 활성 여부로 갈라야 한다"
+        );
+        assert!(
+            arm.contains("self.aux_search.toggle()"),
+            "활성이면 보조 검색을 토글해야 한다"
+        );
+        assert!(
+            arm.contains("self.active.workspace_ui.open_search()"),
+            "비활성이면 기존 터미널 검색을 그대로 열어야 한다(회귀 방지)"
+        );
+    }
+
+    /// 레일 「이력」·「Git」 클릭도 헤더 탭 클릭(`apply_work_history_tab_intent`/
+    /// `apply_git_tab_intent`)과 같은 진입점이다 — 활성 보조 탭을 바꾸면서
+    /// `aux_search.reset()`을 빠뜨리면 레일로 들어올 때만 이전 검색이 새 목록에
+    /// 조용히 남는다.
+    #[test]
+    fn 레일_이력_git_클릭도_보조_검색을_비운다() {
+        let source = include_str!("app.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let history = production
+            .split_once("Some(ui::file_tree::SidebarAction::ShowHistory) => {")
+            .expect("레일 이력 분기가 있어야 한다")
+            .1
+            .split_once("Some(ui::file_tree::SidebarAction::ShowGit) => {")
+            .expect("다음 분기 경계가 있어야 한다");
+        assert!(
+            history.0.contains("self.aux_search.reset()"),
+            "레일 이력 클릭도 활성 탭이 바뀌면 보조 검색을 비워야 한다"
+        );
+        let git = history
+            .1
+            .split_once("Some(ui::file_tree::SidebarAction::OpenAgents) => {")
+            .expect("다음 분기 경계가 있어야 한다")
+            .0;
+        assert!(
+            git.contains("self.aux_search.reset()"),
+            "레일 Git 클릭도 활성 탭이 바뀌면 보조 검색을 비워야 한다"
+        );
+    }
+
+    /// 이력/Git 본문 렌더가 `""`/`None` 고정 리터럴이 아니라 실제 `aux_search` 상태를
+    /// 조달하는지 소스로 고정한다(순수 함수 검증은 `apply_aux_search_action`/
+    /// `aux_search_step_active` 테스트가 맡는다).
+    #[test]
+    fn 이력_git_본문은_고정_리터럴이_아니라_aux_search_상태를_넘긴다() {
+        let source = include_str!("app.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let history_body = production
+            .split_once("fn render_work_history_tab_body(")
+            .expect("이력 본문 렌더가 있어야 한다")
+            .1
+            .split_once("fn render_git_tab_body(")
+            .expect("다음 함수 경계가 있어야 한다")
+            .0;
+        assert!(
+            history_body.contains("self.work_history_ui.show("),
+            "이력 카드 목록 렌더 호출이 있어야 한다"
+        );
+        assert!(
+            squeeze_ws(history_body).contains("presentations, text, filter"),
+            "카드 목록 필터는 aux_search에서 뽑은 filter를 써야 한다(고정 빈 문자열이면 안 된다)"
+        );
+        // 수신자와 인자를 나눠 본다 — 한 덩어리로 붙이면 rustfmt가 `self.x` 다음에서
+        // 접을 때 사이에 공백이 끼어 접힘 여부에 따라 매치가 갈린다. 나누면 접히든
+        // 펴지든 둘 다 통과하면서 "그 뷰어가 그 인자로 불린다"는 계약은 그대로 지킨다.
+        assert!(
+            squeeze_ws(history_body).contains("self.transcript_viewer_ui"),
+            "원문 뷰어를 그리는 주체가 transcript_viewer_ui여야 한다"
+        );
+        assert!(
+            squeeze_ws(history_body).contains(".render(&mut transcript, text, search);"),
+            "원문 뷰어는 aux_search에서 뽑은 search를 써야 한다"
+        );
+        let git_body = production
+            .split_once("fn render_git_tab_body(")
+            .unwrap()
+            .1
+            .split_once("fn reveal_terminal_view_for_aux_tab(")
+            .expect("다음 함수 경계가 있어야 한다")
+            .0;
+        assert!(
+            git_body.contains("self.git_panel_ui.render(&mut list, text, filter);"),
+            "Git 파일 목록 필터는 aux_search에서 뽑은 filter를 써야 한다"
+        );
+        assert!(
+            git_body.contains("self.diff_viewer_ui.render(&mut detail, text, search);"),
+            "diff 뷰어는 aux_search에서 뽑은 search를 써야 한다"
+        );
+    }
+
+    /// 턴 프로젝션이 `messages_json: None`으로 되돌아가면 저장된 메시지 배열이 조용히
+    /// 사라진다 — upsert 리터럴이 `turn.messages_json()`을 싣고 있는지 소스로 고정한다.
+    #[test]
+    fn 프로젝션은_턴_메시지를_그대로_올린다() {
+        let source = include_str!("app.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        assert!(
+            production.contains("messages_json: turn.messages_json()"),
+            "턴 메시지가 upsert에 실려야 한다"
+        );
+    }
+
+    /// 이력이 pane 보조 탭이 된 뒤로 `set_view(Terminal)`만으로는 보조 본문이 걷히지
     /// 않는다. 세션을 드러내는 네비게이션은 전부 `reveal_terminal_session`을 타야 하고,
     /// 날것의 `set_view(Terminal)`은 세 곳만 남는다 — 헬퍼 본문, 워크스페이스 전환
     /// (탭 유지 계약), 레일 이력 진입(작업면으로 먼저 복귀).
     #[test]
-    fn 세션을_드러내는_네비게이션은_전부_이력탭을_비활성화한다() {
+    fn 세션을_드러내는_네비게이션은_모든_보조탭을_비활성화한다() {
         let source = include_str!("app.rs");
         let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
 
@@ -30289,8 +37290,12 @@ mod tests {
             .unwrap()
             .0;
         assert!(
-            helper.contains("on_session_tab_click()"),
-            "세션 이동은 이력 탭을 비활성화하되 탭 자체는 남겨야 한다"
+            helper.contains("reveal_session_aux_tabs("),
+            "세션 이동은 이력·Git·문서 탭을 공통 전이로 비활성화해야 한다"
+        );
+        assert!(
+            helper.contains("if reset_search") && helper.contains("self.aux_search.reset();"),
+            "활성 보조 본문에서 세션으로 이동하면 공유 검색을 초기화해야 한다"
         );
         assert!(
             !helper.contains("on_close()"),
@@ -31875,6 +38880,60 @@ mod tests {
     /// ⑦ 검증: .env 외부 수정 감지의 근거인 baseline 상태가 파일 변경/생성/삭제를
     /// 구분한다 — 2초 점검이 이 값의 변화로 재동기화를 트리거한다(B 경로).
     #[test]
+    fn dotenv_동기화가_실패해도_세션은_열리고_복원만_막힌다() {
+        // 세션을 여는 일은 `.env`와 독립이어야 한다(2026-08-21 사용자 지시). 셸이든
+        // 에이전트든, `.env` 사정 때문에 못 열리면 정작 그 `.env`를 고칠 수단이 없다.
+        // 값 하나를 보호할 수 없는 경우는 동기화 단계에서 그 항목만 제외하므로
+        // (`apply_workspace_dotenv_plan`), 여기까지 오는 실패는 계통 장애다.
+        // 자동 복원만은 예외로 둔다 — 사용자가 방금 누른 동작이 아니다.
+        let shell = || runtime::RuntimeCommand::SpawnShell {
+            cols: 80,
+            rows: 24,
+            scrollback_lines: 1000,
+        };
+
+        assert!(
+            dotenv_failure_allows_session(&PendingDotenvContinuation::RuntimeCommand(shell())),
+            "빈 터미널은 .env 없이도 열려야 한다"
+        );
+        assert!(
+            dotenv_failure_allows_session(&PendingDotenvContinuation::WorkspaceProtocol {
+                operation: ui::workspace::WorkspaceProtocolOperation::for_test(1),
+                generation: 1,
+                command: shell(),
+            }),
+            "프로토콜 경로로 온 셸도 열려야 한다 — 빈 터미널 버튼이 이 경로다"
+        );
+        assert!(
+            dotenv_failure_allows_session(&PendingDotenvContinuation::AgentLaunch {
+                command: runtime::RuntimeCommand::SpawnAgent {
+                    agent_config_id: None,
+                    cols: 80,
+                    rows: 24,
+                    scrollback_lines: 1000,
+                    command: "/bin/sh".to_owned(),
+                    args: Vec::new(),
+                    env_plain: Vec::new(),
+                    env_secrets: Vec::new(),
+                    waiting_regex: None,
+                    approval_regex: None,
+                    error_regex: None,
+                    done_regex: None,
+                },
+                approval_ticket: None,
+                launcher_request_id: None,
+            }),
+            "에이전트도 .env와 독립적으로 열려야 한다"
+        );
+        assert!(
+            !dotenv_failure_allows_session(&PendingDotenvContinuation::RuntimeCommand(
+                runtime::RuntimeCommand::RestoreWorkspace
+            )),
+            "자동 복원은 이 예외에 포함되지 않는다"
+        );
+    }
+
+    #[test]
     fn dotenv_baseline은_외부_수정과_생성_삭제를_감지한다() {
         let dir = std::env::temp_dir().join(format!(
             "deppy-dotenv-state-{}-{}",
@@ -32007,12 +39066,13 @@ mod tests {
     #[test]
     fn 활동_pane_이름은_기본제목이면_프로젝트명으로_표시된다() {
         let catalog = load_catalog("ko-KR");
-        // 기본 제목 + cwd → 프로젝트(폴더)명
+        // 기본 제목 + cwd → 프로젝트(폴더)명. workspace_name=None(비교 대상 없음) → 그대로.
         assert_eq!(
             activity_session_name(
                 "workspace.spawn.shell 1",
                 Some("/Users/jr/Desktop/Projects/deppy-sijo"),
                 &catalog,
+                None,
                 |cwd| crate::agent_detect::project_display_name(
                     cwd,
                     crate::config::SessionNameStyle::Folder
@@ -32022,18 +39082,24 @@ mod tests {
         );
         // 사용자 rename은 cwd와 무관하게 그대로
         assert_eq!(
-            activity_session_name("배포 작업", Some("/tmp/whatever"), &catalog, |cwd| {
-                crate::agent_detect::project_display_name(
-                    cwd,
-                    crate::config::SessionNameStyle::Folder,
-                )
-            }),
+            activity_session_name(
+                "배포 작업",
+                Some("/tmp/whatever"),
+                &catalog,
+                None,
+                |cwd| {
+                    crate::agent_detect::project_display_name(
+                        cwd,
+                        crate::config::SessionNameStyle::Folder,
+                    )
+                }
+            ),
             "배포 작업"
         );
         // cwd 없음/빈 값 → 기본 제목 i18n 렌더로 폴백(기존 동작)
         let fallback = ui::workspace::display_pane_title("workspace.spawn.shell 3", &catalog);
         assert_eq!(
-            activity_session_name("workspace.spawn.shell 3", None, &catalog, |cwd| {
+            activity_session_name("workspace.spawn.shell 3", None, &catalog, None, |cwd| {
                 crate::agent_detect::project_display_name(
                     cwd,
                     crate::config::SessionNameStyle::Folder,
@@ -32042,7 +39108,7 @@ mod tests {
             fallback
         );
         assert_eq!(
-            activity_session_name("workspace.spawn.shell 3", Some(""), &catalog, |cwd| {
+            activity_session_name("workspace.spawn.shell 3", Some(""), &catalog, None, |cwd| {
                 crate::agent_detect::project_display_name(
                     cwd,
                     crate::config::SessionNameStyle::Folder,
@@ -32056,12 +39122,49 @@ mod tests {
                 "workspace.spawn.shell 3",
                 Some("relative/path"),
                 &catalog,
+                None,
                 |cwd| crate::agent_detect::project_display_name(
                     cwd,
                     crate::config::SessionNameStyle::Folder
                 )
             ),
             fallback
+        );
+    }
+
+    /// 2026-08-19 코드 리뷰 재현: warm/유휴 워크스페이스 행(activity_rows/
+    /// web_workspace_seed/사이드바 절전 목록이 전부 이 자유 함수를 거친다)에서도
+    /// cwd 프로젝트명이 워크스페이스 자체 이름과 다르면 소속을 함께 밝혀야 한다 —
+    /// 이게 사용자가 실제로 본 화면이었다(활성 경로만 고친 1차 수정에서 빠졌던 곳).
+    #[test]
+    fn 활동_pane_이름은_워크스페이스_자체_이름과_다르면_소속을_함께_보여준다() {
+        let catalog = load_catalog("ko-KR");
+        assert_eq!(
+            activity_session_name(
+                "workspace.spawn.shell 1",
+                Some("/projects/colon35/Design"),
+                &catalog,
+                Some("Crawler"),
+                |cwd| crate::agent_detect::project_display_name(
+                    cwd,
+                    crate::config::SessionNameStyle::Folder
+                ),
+            ),
+            "Design (Crawler)"
+        );
+        // 워크스페이스 루트 그대로면(가장 흔한 경우) 정보 중복 없이 그대로.
+        assert_eq!(
+            activity_session_name(
+                "workspace.spawn.shell 1",
+                Some("/projects/Crawler"),
+                &catalog,
+                Some("Crawler"),
+                |cwd| crate::agent_detect::project_display_name(
+                    cwd,
+                    crate::config::SessionNameStyle::Folder
+                ),
+            ),
+            "Crawler"
         );
     }
 
@@ -32126,6 +39229,23 @@ mod tests {
         });
         assert_eq!(workspace_ui.pending_spawns(), 1);
         workspace_ui
+    }
+
+    #[test]
+    fn workspace_protocol_delivery_maps_runtime_pressure_separately_from_disconnect() {
+        assert_eq!(
+            classify_workspace_protocol_delivery(Err(
+                runtime::RuntimeCommandSendError::Backpressure.into()
+            )),
+            Err(ui::workspace::WorkspaceProtocolErrorCode::Busy)
+        );
+        assert_eq!(
+            classify_workspace_protocol_delivery(Err(
+                runtime::RuntimeCommandSendError::Disconnected.into()
+            )),
+            Err(ui::workspace::WorkspaceProtocolErrorCode::DeliveryFailed)
+        );
+        assert_eq!(classify_workspace_protocol_delivery(Ok(())), Ok(()));
     }
 
     fn overflow_spawn_replay(
@@ -32258,7 +39378,13 @@ mod tests {
             panic!("expected a ReplaceWatchSet intent");
         };
         let (directories, ignored_prefixes, show_hidden) = plan.into_parts();
-        (operation, generation, directories, ignored_prefixes, show_hidden)
+        (
+            operation,
+            generation,
+            directories,
+            ignored_prefixes,
+            show_hidden,
+        )
     }
 
     #[test]
@@ -32287,7 +39413,11 @@ mod tests {
         assert_eq!(watcher.root, PathBuf::new());
         assert_eq!(watcher.generation, 0);
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // submit 지연 계약은 위의 50ms assertion이 따로 검증한다. 이 watchdog은
+        // macOS FSEvents 서버 등록 완료만 기다린다. 동시 watcher 부하에서
+        // FSEventStreamStart RPC가 5초를 넘기는 경로를 sample로 확인했으므로,
+        // OS 스케줄링 지연을 submit_replace 회귀로 오판하지 않도록 분리한다.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let completion = loop {
             if let Some(completion) = watcher.poll_completion() {
                 break completion;
@@ -32402,8 +39532,10 @@ mod tests {
         let root = app_file_tree_watch_temp_root("full-retry");
         let ctx = egui::Context::default();
         let mut tree = ui::file_tree::FileTreeUi::new(ctx.clone());
-        let (op1, gen1, dirs1, ignored1, hidden1) = app_file_tree_watch_intent(&mut tree, root.clone());
-        let (op2, gen2, dirs2, ignored2, hidden2) = app_file_tree_watch_intent(&mut tree, root.clone());
+        let (op1, gen1, dirs1, ignored1, hidden1) =
+            app_file_tree_watch_intent(&mut tree, root.clone());
+        let (op2, gen2, dirs2, ignored2, hidden2) =
+            app_file_tree_watch_intent(&mut tree, root.clone());
 
         let (mut watcher, request_rx) = app_file_tree_watcher_with_manual_channel();
 
@@ -32438,8 +39570,14 @@ mod tests {
         assert_eq!(drained.operation, op1);
 
         // 다음 폴(poll_retry)에서 자연 재시도가 성공해야 한다.
-        assert!(watcher.poll_retry().is_none(), "재전송 성공 -- 아직 완료 소식은 없다");
-        assert!(watcher.retry.is_none(), "재전송에 성공했으니 retry는 비워져야 한다");
+        assert!(
+            watcher.poll_retry().is_none(),
+            "재전송 성공 -- 아직 완료 소식은 없다"
+        );
+        assert!(
+            watcher.retry.is_none(),
+            "재전송에 성공했으니 retry는 비워져야 한다"
+        );
         assert_eq!(watcher.pending_operation, Some((op2, gen2)));
         let resent = request_rx.recv().expect("op2 job now in the channel");
         assert_eq!(resent.operation, op2);
@@ -32481,8 +39619,10 @@ mod tests {
         let root = app_file_tree_watch_temp_root("full-retry-timeout");
         let ctx = egui::Context::default();
         let mut tree = ui::file_tree::FileTreeUi::new(ctx.clone());
-        let (op1, gen1, dirs1, ignored1, hidden1) = app_file_tree_watch_intent(&mut tree, root.clone());
-        let (op2, gen2, dirs2, ignored2, hidden2) = app_file_tree_watch_intent(&mut tree, root.clone());
+        let (op1, gen1, dirs1, ignored1, hidden1) =
+            app_file_tree_watch_intent(&mut tree, root.clone());
+        let (op2, gen2, dirs2, ignored2, hidden2) =
+            app_file_tree_watch_intent(&mut tree, root.clone());
 
         let (mut watcher, _request_rx) = app_file_tree_watcher_with_manual_channel();
         watcher
@@ -32708,6 +39848,36 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+
+        drop(db);
+        remove_sqlite_files(&path);
+    }
+
+    #[test]
+    fn startup_keychain_access_failure는_app_bootstrap을_중단하지_않는다() {
+        let path = temp_db_path("startup-secret-keychain-denied");
+        let db = storage::Db::open(&path).unwrap();
+        let store = MemSecretStore::new();
+        let logical_id = uuid::Uuid::new_v4().to_string();
+        db.insert_credential(&storage::CredentialMeta {
+            id: logical_id.clone(),
+            provider: "legacy".to_owned(),
+            label: "denied".to_owned(),
+            credential_kind: "api_key".to_owned(),
+            masked_hint: None,
+            workspace_id: None,
+        })
+        .unwrap();
+
+        assert!(!reconcile_startup_secrets_best_effort(&db, &store));
+        assert_eq!(
+            db.credential_secret_location(&logical_id)
+                .unwrap()
+                .unwrap()
+                .keyring_username,
+            logical_id,
+            "failed migration must remain fail-closed at the legacy pointer"
         );
 
         drop(db);
@@ -35863,6 +43033,157 @@ mod tests {
         assert_eq!(target.extra_args, Some(Vec::new()));
     }
 
+    // resume_without_pane_plan (PR-resume-without-pane) — 살아 있는 pane 없이도
+    // 「이어서 하기」가 가능한지 판정하는 순수 함수. mux/pane 상태를 받지 않는다는
+    // 점이 위 archived_resume_targets_from_mux 계열과의 핵심 차이다.
+
+    #[test]
+    fn resume_without_pane_plan은_정확한_native_session_id가_있으면_exact_인자를_돌려준다() {
+        let extra_args = resume_without_pane_plan(
+            crate::agent_launcher::AgentKind::Codex,
+            Some(("codex", "codex-native-1")),
+        );
+        assert_eq!(
+            extra_args,
+            Some(vec!["resume".to_owned(), "codex-native-1".to_owned()])
+        );
+    }
+
+    #[test]
+    fn resume_without_pane_plan은_바인딩이_없으면_none이다() {
+        // resume_plan은 이 경우 RecentInCwd("resume --last")로 강등하지만, 이
+        // 함수는 Exact만 인정한다 — 클릭한 턴과 다른 대화가 열릴 수 있어서다.
+        assert_eq!(
+            resume_without_pane_plan(crate::agent_launcher::AgentKind::Codex, None),
+            None
+        );
+    }
+
+    #[test]
+    fn resume_without_pane_plan은_provider가_다른_바인딩을_무시하고_none이다() {
+        // agent_sessions 바인딩의 kind가 claude인데 이력 행은 codex — 오래되었거나
+        // 잘못 결속된 바인딩으로 보고 RecentInCwd로 강등, 결국 None.
+        assert_eq!(
+            resume_without_pane_plan(
+                crate::agent_launcher::AgentKind::Codex,
+                Some(("claude", "wrong-provider-token")),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn resume_without_pane_plan은_무효한_native_session_id를_none으로_떨어뜨린다() {
+        for invalid in ["", "bad\nsession", &"x".repeat(1025)] {
+            assert_eq!(
+                resume_without_pane_plan(
+                    crate::agent_launcher::AgentKind::Claude,
+                    Some(("claude", invalid)),
+                ),
+                None,
+                "invalid session id {invalid:?} must not resume"
+            );
+        }
+    }
+
+    #[test]
+    fn resume_without_pane_plan은_builtin_kind별로_올바른_exact_플래그를_고른다() {
+        // agent_resume::resume_plan의 provider별 exact_args 표를 그대로 위임하는지
+        // 확인한다 — 여기서 새로 만들지 않는다(dispatch_respawn_archived_agent와
+        // 규칙 공유 요구사항).
+        let cases: [(crate::agent_launcher::AgentKind, &str, &[&str]); 3] = [
+            (
+                crate::agent_launcher::AgentKind::Claude,
+                "claude",
+                &["--resume", "claude-native"],
+            ),
+            (
+                crate::agent_launcher::AgentKind::Codex,
+                "codex",
+                &["resume", "codex-native"],
+            ),
+            (
+                crate::agent_launcher::AgentKind::Kimi,
+                "kimi",
+                &["--session", "kimi-native"],
+            ),
+        ];
+        for (kind, native_kind, expected) in cases {
+            let native_id = format!("{native_kind}-native");
+            let extra_args = resume_without_pane_plan(kind, Some((native_kind, &native_id)));
+            assert_eq!(
+                extra_args,
+                Some(expected.iter().map(|s| (*s).to_owned()).collect()),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn archived_agent_row_for_session은_persistent_session_id로_찾는다() {
+        let mux = archived_resume_test_mux("persistent-codex");
+        let rows = HashMap::from([(
+            "persistent-codex".to_owned(),
+            archived_resume_row(
+                "persistent-codex",
+                "deppy-builtin-codex",
+                Some(("codex", "thread-x")),
+            ),
+        )]);
+
+        let row = archived_agent_row_for_session(&mux, &rows, runtime::SessionId(9))
+            .expect("row must be found via persistent_session_id");
+        assert_eq!(row.session_id.as_deref(), Some("thread-x"));
+
+        // 알 수 없는 session에는 아무 것도 못 찾는다(다른 pane/mux 상태).
+        assert!(archived_agent_row_for_session(&mux, &rows, runtime::SessionId(404)).is_none());
+    }
+
+    /// dispatch_respawn_archived_agent가 기대는 판정 — App Server writer 충돌은
+    /// **codex** provider + **같은 thread id**가 attach돼 있을 때만 성립한다.
+    #[test]
+    fn attached_app_server_conflict은_codex_thread가_attach됐을_때만_잡는다() {
+        let codex_row = archived_resume_row(
+            "p",
+            "deppy-builtin-codex",
+            Some(("codex", "codex-thread-1")),
+        );
+        let claude_row = archived_resume_row(
+            "p",
+            "deppy-builtin-claude",
+            Some(("claude", "codex-thread-1")),
+        );
+
+        // codex + 같은 thread가 attach돼 있으면 그 local session id를 돌려준다.
+        assert_eq!(
+            attached_app_server_conflict(Some(&codex_row), |thread_id| {
+                (thread_id == "codex-thread-1").then(|| "local-1".to_owned())
+            }),
+            Some("local-1".to_owned())
+        );
+
+        // provider가 codex가 아니면 App Server가 다루는 대상이 아니므로 절대 충돌하지
+        // 않는다(같은 문자열이 우연히 겹쳐도 마찬가지).
+        assert_eq!(
+            attached_app_server_conflict(Some(&claude_row), |thread_id| {
+                (thread_id == "codex-thread-1").then(|| "local-1".to_owned())
+            }),
+            None
+        );
+
+        // 그 thread가 App Server에 attach돼 있지 않으면 충돌 없음 — 평소의(다수) 경로.
+        assert_eq!(
+            attached_app_server_conflict(Some(&codex_row), |_| None),
+            None
+        );
+
+        // PTY 바인딩 자체가 없는 pane(row: None)은 판정 대상이 아니다.
+        assert_eq!(
+            attached_app_server_conflict(None, |_| Some("x".to_owned())),
+            None
+        );
+    }
+
     #[test]
     fn work_history_projection은_시각만_바뀌면_중복이고_요약은_같은_identity를_갱신한다() {
         let row = storage::AgentWorkTurnUpsert {
@@ -35874,6 +43195,7 @@ mod tests {
             source_offset: 42,
             instruction: "Implement history".to_owned(),
             agent_summary: Some("Working".to_owned()),
+            messages_json: None,
             model: Some("gpt-5.6-sol".to_owned()),
             effort: Some("xhigh".to_owned()),
             cwd: Some("/tmp/project".to_owned()),
@@ -35923,5 +43245,242 @@ mod tests {
 
         let older_first_seen = detected_work_history_facts(None, None);
         assert_eq!(older_first_seen, (None, None, None));
+    }
+
+    // --- Task 3: 런처 거부 목록 App 배선 + 사용량 바 ---
+
+    #[test]
+    fn 사용량_바_폭은_그려지는_칸_수에_비례한다() {
+        // 원래 상수 두 개(칸 2개→430, 칸 3개→620, 칸당 +190)를 1칸으로 외삽한
+        // 값을 고정한다 — claude·codex는 활성화 여부, kimi는 활성화와 설치 감지,
+        // grok은 설치 감지와 활성화 여부에 따라 칸 수가 0~4 전 구간을 오갈 수 있다.
+        // 0칸은 `top_provider_usage`가 상자 자체를 안 그리므로 0.0 — 50.0을
+        // 남기면 빈 상자가 폭만큼 자리를 차지해 버린다.
+        assert_eq!(provider_usage_bar_width(0), 0.0);
+        assert_eq!(provider_usage_bar_width(1), 240.0);
+        assert_eq!(provider_usage_bar_width(2), 430.0);
+        assert_eq!(provider_usage_bar_width(3), 620.0);
+        assert_eq!(provider_usage_bar_width(4), 810.0);
+    }
+
+    #[test]
+    fn 칸이_없으면_top_provider_usage는_아무것도_그리지_않았다고_보고한다() {
+        // 반환값이 호출부(`agent_terminal.rs`)가 뒤이은 구분선을 그릴지 정하는
+        // 신호다 — 모든 provider 칸이 숨겨지면 상자도 구분선도 남지 않아야 한다.
+        let all_disabled = vec![
+            "claude".to_owned(),
+            "codex".to_owned(),
+            "kimi".to_owned(),
+            "grok".to_owned(),
+        ];
+        let ctx = egui::Context::default();
+        let mut drew_nothing = true;
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            drew_nothing = top_provider_usage(
+                ui,
+                ProviderUsageInputs {
+                    claude: None,
+                    codex: None,
+                    codex_meta: None,
+                    kimi: None,
+                    grok: None,
+                },
+                &all_disabled,
+                &i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap(),
+            );
+        });
+        assert!(
+            !drew_nothing,
+            "칸이 하나도 없으면 top_provider_usage는 false를 돌려줘야 한다"
+        );
+
+        let mut drew_something = false;
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            drew_something = top_provider_usage(
+                ui,
+                ProviderUsageInputs {
+                    claude: None,
+                    codex: None,
+                    codex_meta: None,
+                    kimi: None,
+                    grok: None,
+                },
+                &[],
+                &i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap(),
+            );
+        });
+        assert!(
+            drew_something,
+            "Claude가 켜져 있으면(값이 없어도) 칸이 그려져 true여야 한다"
+        );
+    }
+
+    #[test]
+    fn 거부_목록은_kimi의_감지_여부와_함께_칸_표시를_결정한다() {
+        // Kimi 칸은 숫자 유무가 아니라 "켜짐 AND 런처 감지"를 본다. 감지된 무료
+        // 계정도 바깥 Option을 유지해 `—`로 표시한다. 숫자/꺼짐 렌더링 계약과 provider
+        // 순서는 상태바 kittest가 고정한다.
+        use crate::agent_launcher::{AgentKind, agent_is_enabled};
+
+        let none: &[String] = &[];
+        assert!(agent_is_enabled(none, AgentKind::Claude));
+        assert!(agent_is_enabled(none, AgentKind::Codex));
+        assert!(agent_is_enabled(none, AgentKind::Kimi));
+
+        let all_disabled = vec!["claude".to_owned(), "codex".to_owned(), "kimi".to_owned()];
+        assert!(!agent_is_enabled(&all_disabled, AgentKind::Claude));
+        assert!(!agent_is_enabled(&all_disabled, AgentKind::Codex));
+        assert!(!agent_is_enabled(&all_disabled, AgentKind::Kimi));
+
+        // kimi만 거부해도 claude·codex는 영향을 받지 않는다.
+        let kimi_only = vec!["kimi".to_owned()];
+        assert!(agent_is_enabled(&kimi_only, AgentKind::Claude));
+        assert!(agent_is_enabled(&kimi_only, AgentKind::Codex));
+        assert!(!agent_is_enabled(&kimi_only, AgentKind::Kimi));
+
+        // kimi_shown = enabled && detected.is_some() — 감지돼도 꺼져 있으면 숨고,
+        // 감지된 무료 계정(`Some(None)`)은 자리를 지킨다.
+        let kimi_detected_without_numeric_usage: Option<Option<ProviderUsage>> = Some(None);
+        let kimi_shown = agent_is_enabled(&kimi_only, AgentKind::Kimi)
+            && kimi_detected_without_numeric_usage.is_some();
+        assert!(!kimi_shown, "꺼졌으면 감지돼도 칸을 그리면 안 된다");
+        let kimi_shown = agent_is_enabled(none, AgentKind::Kimi)
+            && kimi_detected_without_numeric_usage.is_some();
+        assert!(
+            kimi_shown,
+            "켜져 있고 감지됐으면 숫자가 없어도 칸을 그려야 한다"
+        );
+    }
+
+    #[test]
+    fn grok_칸은_설치_감지와_활성화가_모두_필요하다() {
+        assert!(grok_status_visible(&[], true));
+        assert!(!grok_status_visible(&[], false));
+        assert!(!grok_status_visible(&["grok".to_owned()], true));
+    }
+
+    #[test]
+    fn provider_probe_enabled는_감지와_활성화를_모두_요구한다() {
+        use crate::agent_launcher::AgentKind;
+
+        assert!(!provider_probe_enabled(
+            &["kimi".to_owned()],
+            AgentKind::Kimi,
+            true,
+        ));
+        assert!(!provider_probe_enabled(&[], AgentKind::Kimi, false));
+        assert!(provider_probe_enabled(&[], AgentKind::Kimi, true));
+        assert!(!provider_probe_enabled(
+            &["claude".to_owned()],
+            AgentKind::Claude,
+            true,
+        ));
+    }
+
+    #[test]
+    fn provider_probe는_런처_감지값과_admission_gate_뒤에서만_호출된다() {
+        let source = include_str!("app.rs");
+        let status = source
+            .split_once("let launcher_snapshot = self.agent_launcher_snapshot.as_ref();")
+            .and_then(|(_, tail)| tail.split_once("let codex_usage = merge_codex_usage"))
+            .map(|(body, _)| body)
+            .expect("provider usage status block");
+        for provider in ["kimi", "claude"] {
+            assert!(
+                status.contains(&format!("provider_probe_enabled(\n                    &self.config.agents.disabled,\n                    crate::agent_launcher::AgentKind::{},", if provider == "kimi" { "Kimi" } else { "Claude" })),
+                "{provider} probe가 disabled/detected admission gate 뒤에 있지 않다: {status}"
+            );
+            assert!(
+                status.contains(&format!(
+                    "crate::{provider}_usage::current(ui.ctx(), {provider}_agent)"
+                )),
+                "{provider} probe가 launcher-detected agent를 받지 않는다: {status}"
+            );
+        }
+    }
+
+    #[test]
+    fn 토글은_거부_목록을_정규화된_상태로_갱신한다() {
+        use crate::agent_launcher::AgentKind;
+
+        // 켜짐 → 꺼짐: id가 추가된다.
+        let off = toggled_disabled_agents(&[], AgentKind::Kimi, false);
+        assert_eq!(off, vec!["kimi".to_owned()]);
+
+        // 꺼짐 → 켜짐: id가 빠진다.
+        let on = toggled_disabled_agents(&off, AgentKind::Kimi, true);
+        assert!(on.is_empty());
+
+        // 이미 꺼진 걸 다시 꺼도(중복) 미지 id가 섞여 있어도(구버전 config) 정규화된
+        // 상태(미지 id 제거·중복 제거·정렬)로 남는다.
+        let dirty = vec!["kimi".to_owned(), "없는에이전트".to_owned()];
+        let still_off = toggled_disabled_agents(&dirty, AgentKind::Kimi, false);
+        assert_eq!(still_off, vec!["kimi".to_owned()]);
+
+        let both_off = toggled_disabled_agents(&dirty, AgentKind::Claude, false);
+        assert_eq!(both_off, vec!["claude".to_owned(), "kimi".to_owned()]);
+    }
+
+    /// 경계(스펙 §넣지 않는 것): 숨김은 표시·선택 규칙일 뿐이다. 토글 처리가 탐지
+    /// 스냅샷을 고치거나, 떠 있는 세션을 종료하거나, 이력·상태 감지를 건드리면
+    /// "숨겼더니 이력이 사라졌다"가 된다 — 여기서는 config.agents.disabled 갱신과
+    /// 저장만 해야 한다.
+    #[test]
+    fn 거부_목록_토글_처리는_탐지_스냅샷과_세션_이력을_건드리지_않는다() {
+        let source = include_str!("app.rs");
+        let arm = source
+            .split_once(
+                "ui::agent_launcher::AgentLauncherIntent::SetAgentEnabled { kind, enabled } => {",
+            )
+            .and_then(|(_, tail)| tail.split_once("\n    fn fail_agent_launcher_request"))
+            .map(|(body, _)| body)
+            .expect("SetAgentEnabled 처리부를 찾지 못했다");
+        for forbidden in [
+            "agent_launcher_snapshot",
+            "close_workspace_sessions",
+            "work_history",
+            "agent_detect",
+        ] {
+            assert!(
+                !arm.contains(forbidden),
+                "SetAgentEnabled 처리가 '{forbidden}'을 건드린다 — 표시 규칙 밖으로 나갔다: {arm}"
+            );
+        }
+    }
+
+    /// 경계: 탐지(`detect_installed_agents`)는 "그 호스트가 띄울 수 있는 것"을 전부
+    /// 돌려줘야 한다 — 거부 목록으로 걸러지면 꺼진 카드가 화면에서 아예 사라져
+    /// B안 계약(꺼진 카드도 목록에 남는다)이 깨진다. 호출부에 인자가 추가되면 이
+    /// 정확한 문자열이 깨져 실패한다.
+    #[test]
+    fn 탐지_호출은_거부_목록_인자를_받지_않는다() {
+        let source = include_str!("app.rs");
+        assert!(
+            source.contains(
+                "crate::agent_launcher::detect_installed_agents(excluded_directory.as_deref())"
+            ),
+            "탐지 호출 시그니처가 바뀌었다 — 거부 목록을 넘기게 되지 않았는지 확인하라"
+        );
+    }
+
+    /// 경계: 런처 `show`는 탐지 스냅샷을 가공 없이 그대로 넘기고, 거부 목록은 별개
+    /// 인자로만 넘긴다 — 스냅샷을 거부 목록으로 걸러 넘기면 꺼진 카드가 화면에서
+    /// 사라져 B안 계약이 깨진다.
+    #[test]
+    fn 런처_show_호출은_탐지_스냅샷과_거부_목록을_각각_그대로_넘긴다() {
+        let source = include_str!("app.rs");
+        let call = source
+            .split_once("self.agent_launcher_ui.show(")
+            .and_then(|(_, tail)| tail.split_once("\n            )\n        {"))
+            .map(|(body, _)| body)
+            .expect("agent_launcher_ui.show 호출부를 찾지 못했다");
+        assert!(
+            call.contains("self.agent_launcher_snapshot.as_ref(),"),
+            "탐지 스냅샷은 가공 없이 그대로 전달돼야 한다: {call}"
+        );
+        assert!(
+            call.contains("&self.config.agents.disabled,"),
+            "거부 목록은 스냅샷과 별개 인자로 전달돼야 한다: {call}"
+        );
     }
 }

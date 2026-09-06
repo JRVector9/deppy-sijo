@@ -19,7 +19,7 @@
   <link rel="stylesheet" href="/app.__SHELL_VERSION__.css">
 </head>
 <body data-view="shell">
-  <main class="app">
+  <main id="dashboard-shell" class="app">
     <header class="brand">
       <img src="/icon-192.png" alt="" width="36" height="36">
       <h1>시조새</h1>
@@ -50,18 +50,43 @@
       <p id="approvals-empty" class="empty">대기 중인 승인이 없습니다.</p>
     </section>
 
-    <!-- 터미널 뷰어(P5d): 세션의 "보기"로 열린다. 읽기 전용 + 최소 제어(Ctrl-C/Enter)만. -->
-    <section id="viewer" class="panel viewer" aria-labelledby="viewer-title" hidden>
-      <h2 id="viewer-title">화면 <span id="viewer-session" class="count"></span></h2>
-      <div class="viewer-wrap"><canvas id="viewer-canvas"></canvas></div>
-      <!-- 스크롤백 열람 중 표시 — 터치/휠로 과거를 보는 동안만 나타난다 -->
+    <section class="panel" aria-labelledby="sessions-title">
+      <h2 id="sessions-title" tabindex="-1">세션</h2>
+      <ul id="sessions" class="sessions"></ul>
+      <p id="sessions-empty" class="empty">활성 세션이 없습니다.</p>
+      <p id="resource" class="resource"></p>
+    </section>
+  </main>
+  <section id="viewer" class="viewer-shell" role="dialog" aria-modal="true"
+           aria-labelledby="viewer-title viewer-session" hidden>
+    <header class="viewer-header">
+      <button id="viewer-back" class="viewer-back" type="button"
+              aria-label="세션 목록으로 돌아가기">‹</button>
+      <div class="viewer-heading">
+        <h2 id="viewer-title">터미널</h2>
+        <p id="viewer-session" class="viewer-session">세션</p>
+      </div>
+      <p id="viewer-connection" class="viewer-connection" role="status"
+         aria-live="polite" aria-atomic="true">
+        <span id="viewer-connection-label">연결 중</span>
+        <span id="viewer-connection-detail" class="sr-only">터미널 화면을 준비하고 있습니다.</span>
+      </p>
+    </header>
+    <div id="viewer-stage" class="viewer-stage">
+      <div class="viewer-wrap"><canvas id="viewer-canvas" aria-label="원격 터미널 화면"></canvas></div>
       <div id="viewer-scroll-note" class="viewer-scroll-note" hidden>
         <span id="viewer-offset-text"></span>
         <button id="viewer-bottom" type="button">맨 아래로</button>
       </div>
-      <!-- 특수키 행 (P6b): composer를 거치지 않고 즉시 전송 — claude code 메뉴 선택(↑↓+Enter)이
-           폰에서 되는 것이 핵심 사용례. 제어 시퀀스는 서버 화이트리스트가 생성한다. -->
-      <div class="viewer-keys">
+      <div id="viewer-connection-overlay" class="viewer-overlay" aria-hidden="true" hidden>
+        <strong id="viewer-overlay-title">연결 중</strong>
+        <span id="viewer-overlay-detail">터미널 화면을 준비하고 있습니다.</span>
+      </div>
+      <div id="viewer-privacy-curtain" class="viewer-privacy-curtain"
+           aria-hidden="true" hidden><span>화면이 보호되었습니다</span></div>
+    </div>
+    <footer class="viewer-controls">
+      <div class="viewer-keys" role="group" aria-label="터미널 특수키">
         <button type="button" data-key="esc">Esc</button>
         <button type="button" data-key="tab">Tab</button>
         <button type="button" data-key="up">↑</button>
@@ -72,33 +97,18 @@
         <button type="button" data-key="ctrl_d">Ctrl‑D</button>
         <button type="button" data-key="enter">Enter</button>
       </div>
-
-      <!-- composer (P6b): textarea라 브라우저가 한글 IME 조합을 네이티브로 처리한다.
-           Enter는 줄바꿈, 전송은 버튼(모바일 오전송 방지). 데스크톱은 Cmd/Ctrl-Enter.
-           첨부(P6d): 파일 선택 → POST /upload → 응답 경로를 textarea에 삽입. accept는
-           UX 힌트일 뿐 — 실제 검증은 서버 Content-Type 화이트리스트가 한다. -->
       <div class="composer">
         <input id="composer-file" type="file" hidden
                accept="image/png,image/jpeg,image/gif,image/webp,image/heic,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,.md">
         <button id="composer-attach" type="button" class="composer-attach" aria-label="파일 첨부">📎</button>
         <textarea id="composer-text" rows="1" placeholder="메시지 입력…"
+                  aria-label="터미널에 보낼 메시지"
                   autocapitalize="off" autocorrect="off" spellcheck="false"></textarea>
         <button id="composer-send" type="button">전송</button>
       </div>
       <p id="composer-note" class="composer-note" hidden></p>
-
-      <div class="viewer-actions">
-        <button id="viewer-close" type="button" class="viewer-close">닫기</button>
-      </div>
-    </section>
-
-    <section class="panel" aria-labelledby="sessions-title">
-      <h2 id="sessions-title">세션</h2>
-      <ul id="sessions" class="sessions"></ul>
-      <p id="sessions-empty" class="empty">활성 세션이 없습니다.</p>
-      <p id="resource" class="resource"></p>
-    </section>
-  </main>
+    </footer>
+  </section>
   <script src="/app.__SHELL_VERSION__.js"></script>
 </body>
 </html>

@@ -5,6 +5,7 @@
 //! 않고 bounded maintenance intent만 App host로 올린다.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -271,6 +272,9 @@ pub struct SidebarSnapshot<'a> {
     /// 현재 세션 pane 헤더 옆의 이력 보조 탭이 **활성**인지 — 레일 「이력」 선택 표시.
     /// 탭이 열려 있어도 비활성(터미널을 보는 중)이면 false다.
     pub history_tab_active: bool,
+    /// 현재 세션 pane 헤더 옆의 Git 보조 탭이 **활성**인지 — 레일 「Git」 선택 표시.
+    /// 이력과 같은 규칙(2026-08-15 2차, 스펙 §8-1).
+    pub git_tab_active: bool,
     /// Agents 창 열림 여부 — 하단 nav 「에이전트」 행의 선택 상태 (2026-07-18).
     pub agents_open: bool,
     /// 활성 워크스페이스에 저장된 메모 본문. 미작성이면 `None`.
@@ -291,10 +295,11 @@ pub enum SidebarAction {
     /// 현재 워크스페이스의 이력 보조 탭을 연다/활성화한다. 재클릭 토글 규칙은 App이
     /// 결정한다(탭 상태 소유자).
     ShowHistory,
+    /// 현재 워크스페이스의 Git 보조 탭을 연다/활성화한다 — 이력과 같은 규칙
+    /// (2026-08-15 2차, 스펙 §8-1).
+    ShowGit,
     OpenAgents,
     OpenSettings,
-    OpenHelp,
-    ShowFocusedDiff,
     /// 메모 본문이 바뀌었다. App이 디바운스해 DB에 쓴다(leaf는 IO를 하지 않는다).
     NoteEdited(String),
     /// root folder를 macOS가 거부한 상태에서 「개인정보 보호 및 보안 → 파일 및 폴더」를 연다.
@@ -328,8 +333,15 @@ pub enum SidebarAction {
     NewShellSameFolder {
         session: runtime::SessionId,
     },
+    /// 도움말 메뉴 — 업데이트 확인(릴리스 페이지를 연다).
+    CheckUpdate,
+    /// 도움말 메뉴 — 피드백 보내기(이슈 페이지를 연다).
+    OpenFeedback,
     /// 저장된 에이전트 세션을 이 pane 셸에서 resume한다 (수동 이어가기).
     ResumeAgent {
+        /// 이 행이 속한 워크스페이스 — 비활성(warm) 행이면 App이 먼저 전환한다
+        /// (2026-08-20).
+        workspace_id: String,
         pane: runtime::MuxPaneId,
         session: runtime::SessionId,
         title: String,
@@ -338,7 +350,11 @@ pub enum SidebarAction {
     ClosePane {
         pane: runtime::MuxPaneId,
     },
-    /// 이 세션 cwd 레포의 변경분(diff)을 본다 (「변경 보기」 메뉴).
+    /// 이 세션 cwd 레포의 변경분(diff)을 본다 (세션 행 컨텍스트 메뉴의 「변경 보기」).
+    /// 세션별 payload를 유지한다 — 2026-08-15 한때 유닛 variant로 단순화했었는데
+    /// (포커스 세션 기준으로 일원화, Task 10 Step 9) 회귀였다: 이 메뉴는 특정 세션
+    /// 행의 컨텍스트 메뉴인데 포커스가 다른 세션에 있으면 엉뚱한 repo가 떴다. App은
+    /// `cached_session_cwd(session)`으로 이 세션의 cwd를 찾아 스냅샷을 요청한다.
     ShowDiff {
         session: runtime::SessionId,
     },
@@ -364,25 +380,55 @@ pub enum SidebarAction {
     /// 워크스페이스를 만들어 전환한다. rfd 다이얼로그는 UI leaf가 아니라 App이 연다
     /// (기존 ws_create 관례, 2026-07-18).
     CreateWorkspaceFromPicker,
+    /// 파일 트리에서 문서 대상(md·txt 등) 파일을 열었다 — App이 포커스된 pane 위에
+    /// 문서 보조 탭을 연다(설계 §3.2). 그 외 확장자는 여전히 `FileTreeIoRequest::OpenPath`
+    /// 로 OS 기본 앱이 연다 — 이 액션으로 오지 않는다.
+    OpenDocument {
+        target: FileTreePathPayload,
+        kind: DocumentTargetKind,
+    },
+}
+
+/// 문서 탭으로 열리는 파일의 대상 종류(설계 §3.1). 순수 확장자 판정이라 filesystem에
+/// 접근하지 않는다 — host가 실존 regular file 여부를 다시 검증한다(기존 OpenPath 관례).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DocumentTargetKind {
+    Markdown,
+    PlainText,
+}
+
+/// 더블클릭 대상이 문서 탭으로 열릴지 분류한다. `.md`/`.markdown`은 markdown,
+/// `.txt`/`.log`/확장자 없음은 평문. 그 외는 `None` — 기존 OS 열기 동작을 그대로
+/// 유지한다(설계 §3.1, 기존 동작을 빼앗지 않는다).
+fn classify_document_target(path: &Path) -> Option<DocumentTargetKind> {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some(ext) if ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown") => {
+            Some(DocumentTargetKind::Markdown)
+        }
+        Some(ext) if ext.eq_ignore_ascii_case("txt") || ext.eq_ignore_ascii_case("log") => {
+            Some(DocumentTargetKind::PlainText)
+        }
+        None => Some(DocumentTargetKind::PlainText),
+        Some(_) => None,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SidebarTool {
     Files,
-    Git,
     /// 워크스페이스 스크래치패드. 「파일」과 같이 사이드바 본문을 차지하는 **인라인** 탭이다.
     Notes,
 }
 
-/// MCP 탭은 2026-08-10에 뺐다 — 다른 둘은 사이드바/메인 창 안에서 끝나는데 혼자
-/// **설정(별도 OS 창)** 을 열어 레벨이 달랐다. 연결 설정은 설정 → 관리 → 「연결」이
-/// 계속 담당한다.
-const SIDEBAR_TOOLS: [SidebarTool; 3] = [SidebarTool::Files, SidebarTool::Git, SidebarTool::Notes];
+/// Git은 2026-08-15 2차에서 내비게이션 레일로 옮겼다 — 사이드바 폭(약 220pt)이 목록에
+/// 모자랐다(스펙 §8-1). MCP 탭은 2026-08-10에 뺐다 — 다른 둘은 사이드바/메인 창 안에서
+/// 끝나는데 혼자 **설정(별도 OS 창)** 을 열어 레벨이 달랐다. 연결 설정은 설정 → 관리 →
+/// 「연결」이 계속 담당한다.
+const SIDEBAR_TOOLS: [SidebarTool; 2] = [SidebarTool::Files, SidebarTool::Notes];
 
 fn sidebar_tool_label_key(tool: SidebarTool) -> &'static str {
     match tool {
         SidebarTool::Files => "sidebar.tool.files",
-        SidebarTool::Git => "sidebar.tool.git",
         SidebarTool::Notes => "sidebar.tool.notes",
     }
 }
@@ -392,7 +438,6 @@ fn sidebar_tool_label_key(tool: SidebarTool) -> &'static str {
 fn sidebar_tool_action(tool: SidebarTool) -> Option<SidebarAction> {
     match tool {
         SidebarTool::Files | SidebarTool::Notes => None,
-        SidebarTool::Git => Some(SidebarAction::ShowFocusedDiff),
     }
 }
 
@@ -413,11 +458,11 @@ pub struct FileTreePathPayload {
 
 impl FileTreePathPayload {
     pub fn try_new(path: PathBuf) -> Result<Self, FileTreeIoErrorCode> {
-        let display = path.to_string_lossy();
-        if display.as_bytes().contains(&0) {
+        let encoded = path.as_os_str().as_encoded_bytes();
+        if encoded.contains(&0) {
             return Err(FileTreeIoErrorCode::InvalidPath);
         }
-        let bytes = display.len();
+        let bytes = encoded.len();
         if bytes == 0 || bytes > FILE_TREE_PATH_MAX_BYTES {
             return Err(FileTreeIoErrorCode::PathTooLarge);
         }
@@ -462,12 +507,12 @@ impl FileTreePathListPayload {
         }
         let mut bytes = 0usize;
         for path in &paths {
-            let display = path.to_string_lossy();
-            if display.as_bytes().contains(&0) || display.len() > FILE_TREE_PATH_MAX_BYTES {
+            let encoded = path.as_os_str().as_encoded_bytes();
+            if encoded.contains(&0) || encoded.len() > FILE_TREE_PATH_MAX_BYTES {
                 return Err(FileTreeIoErrorCode::InvalidPath);
             }
             bytes = bytes
-                .checked_add(display.len())
+                .checked_add(encoded.len())
                 .ok_or(FileTreeIoErrorCode::PathListTooLarge)?;
             if bytes > FILE_TREE_PATH_LIST_MAX_BYTES {
                 return Err(FileTreeIoErrorCode::PathListTooLarge);
@@ -602,23 +647,26 @@ pub struct FileTreeMaintenanceOperation(u64);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileTreeListingItem {
-    name: Arc<str>,
+    name: OsString,
+    display_name: Arc<str>,
     is_dir: bool,
 }
 
 impl FileTreeListingItem {
-    pub fn try_new(name: String, is_dir: bool) -> Result<Self, FileTreeMaintenanceErrorCode> {
-        if name.is_empty() || name.as_bytes().contains(&0) || name.len() > FILE_TREE_PATH_MAX_BYTES
-        {
+    pub fn try_new(name: OsString, is_dir: bool) -> Result<Self, FileTreeMaintenanceErrorCode> {
+        let bytes = name.as_encoded_bytes();
+        if name.is_empty() || bytes.contains(&0) || bytes.len() > FILE_TREE_PATH_MAX_BYTES {
             return Err(FileTreeMaintenanceErrorCode::InvalidSnapshot);
         }
+        let display_name = super::os_str_display(&name);
         Ok(Self {
-            name: Arc::from(name),
+            name,
+            display_name: Arc::from(display_name),
             is_dir,
         })
     }
 
-    pub fn name(&self) -> &str {
+    pub fn name(&self) -> &OsStr {
         &self.name
     }
 
@@ -644,11 +692,16 @@ impl FileTreeListingSnapshot {
         }
         let bytes = items.iter().try_fold(0usize, |total, item| {
             total
-                .checked_add(item.name.len())
+                .checked_add(item.name.as_encoded_bytes().len())
                 .filter(|total| *total <= FILE_TREE_LISTING_MAX_BYTES)
                 .ok_or(FileTreeMaintenanceErrorCode::ListingTooLarge)
         })?;
-        items.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
+        items.sort_by(|a, b| {
+            b.is_dir
+                .cmp(&a.is_dir)
+                .then_with(|| a.display_name.cmp(&b.display_name))
+                .then_with(|| a.name.cmp(&b.name))
+        });
         Ok(Self {
             items: Arc::from(items),
             bytes,
@@ -698,15 +751,15 @@ impl FileTreeWatchPlan {
                 .iter()
                 .chain(&ignored_prefixes)
                 .try_fold(0usize, |total, path| {
-                    let display = path.to_string_lossy();
-                    if display.is_empty()
-                        || display.as_bytes().contains(&0)
-                        || display.len() > FILE_TREE_PATH_MAX_BYTES
+                    let encoded = path.as_os_str().as_encoded_bytes();
+                    if encoded.is_empty()
+                        || encoded.contains(&0)
+                        || encoded.len() > FILE_TREE_PATH_MAX_BYTES
                     {
                         return Err(FileTreeMaintenanceErrorCode::InvalidSnapshot);
                     }
                     total
-                        .checked_add(display.len())
+                        .checked_add(encoded.len())
                         .filter(|total| *total <= FILE_TREE_WATCH_MAX_BYTES)
                         .ok_or(FileTreeMaintenanceErrorCode::WatchPlanTooLarge)
                 })?;
@@ -817,14 +870,11 @@ impl FileTreeWatchEvent {
         kind: FileTreeWatchEventKind,
         path: PathBuf,
     ) -> Result<Self, FileTreeMaintenanceErrorCode> {
-        let display = path.to_string_lossy();
-        if display.is_empty()
-            || display.as_bytes().contains(&0)
-            || display.len() > FILE_TREE_PATH_MAX_BYTES
-        {
+        let encoded = path.as_os_str().as_encoded_bytes();
+        if encoded.is_empty() || encoded.contains(&0) || encoded.len() > FILE_TREE_PATH_MAX_BYTES {
             return Err(FileTreeMaintenanceErrorCode::InvalidSnapshot);
         }
-        let bytes = display.len();
+        let bytes = encoded.len();
         Ok(Self { kind, path, bytes })
     }
 }
@@ -911,16 +961,19 @@ struct PendingFileTreeIo {
 /// 트리 노드. `children == None`은 아직 나열 안 됨(lazy).
 /// 접으면 children을 버려 캐시는 항상 "펼친 노드"만 유지한다(§3 메모리 상한).
 struct TreeNode {
-    name: String,
+    name: OsString,
+    display_name: String,
     is_dir: bool,
     expanded: bool,
     children: Option<Vec<TreeNode>>,
 }
 
 impl TreeNode {
-    fn new(name: String, is_dir: bool) -> Self {
+    fn new(name: OsString, is_dir: bool) -> Self {
+        let display_name = super::os_str_display(&name);
         Self {
             name,
+            display_name,
             is_dir,
             expanded: false,
             children: None,
@@ -932,7 +985,7 @@ impl TreeNode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FlatRow {
     path: PathBuf,
-    name: String,
+    display_name: String,
     depth: usize,
     is_dir: bool,
     expanded: bool,
@@ -944,8 +997,8 @@ enum RootListingError {
 }
 
 pub struct FileTreeUi {
-    /// 사이드바 본문을 차지하는 인라인 탭(파일 / 메모). Git은 다른 화면에 작용하므로
-    /// 여기 남지 않는다 — 눌러도 선택이 바뀌지 않고 diff만 열린다.
+    /// 사이드바 본문을 차지하는 인라인 탭(파일 / 메모). Git은 2026-08-15 2차부터 레일
+    /// 진입 + pane 보조 탭이라 여기 남지 않는다(App이 `GitPanelUi`를 직접 소유한다, §8-1).
     selected_tool: SidebarTool,
     /// 메모 탭 편집 상태. leaf라 DB를 만지지 않고 편집만 소유한다.
     notes: super::notes::NotesUi,
@@ -1036,6 +1089,7 @@ enum EditState {
         path: PathBuf,
         buffer: String,
         focus: bool,
+        changed: bool,
     },
     NewFolder {
         parent: PathBuf,
@@ -1521,14 +1575,14 @@ impl FileTreeUi {
     /// 워처 무시 prefix 설정 (앱 data dir 등). set_root 이전에 호출.
     pub fn set_watch_ignore(&mut self, prefixes: Vec<PathBuf>) {
         let bytes = prefixes.iter().try_fold(0usize, |total, path| {
-            let display = path.to_string_lossy();
-            if display.is_empty()
-                || display.as_bytes().contains(&0)
-                || display.len() > FILE_TREE_PATH_MAX_BYTES
+            let encoded = path.as_os_str().as_encoded_bytes();
+            if encoded.is_empty()
+                || encoded.contains(&0)
+                || encoded.len() > FILE_TREE_PATH_MAX_BYTES
             {
                 return None;
             }
-            total.checked_add(display.len())
+            total.checked_add(encoded.len())
         });
         if prefixes.len() > FILE_TREE_WATCH_IGNORE_MAX_ITEMS
             || bytes.is_none_or(|bytes| bytes > FILE_TREE_WATCH_IGNORE_MAX_BYTES)
@@ -2221,7 +2275,10 @@ impl FileTreeUi {
                                                             );
                                                                 ui.close();
                                                             }
-                                                                    // 변경 보기 — 세션 cwd 레포의 git diff 패널 (PR-D).
+                                                                    // 변경 보기 — 이 세션 cwd 레포의 diff를 사이드바 Git
+                                                                    // 탭에 연다(PR-D). session payload를 실어 보낸다 — App이
+                                                                    // 포커스 세션이 아니라 **이** 세션의 cwd로 수집해야 한다
+                                                                    // (2026-08-15 회귀 수정, Task 10 Step 9 되돌림).
                                                                     if ui
                                                                 .button(catalog.t(
                                                                     "sidebar.menu.show_diff",
@@ -2229,10 +2286,9 @@ impl FileTreeUi {
                                                                 ))
                                                                 .clicked()
                                                             {
-                                                                action =
-                                                                    Some(SidebarAction::ShowDiff {
-                                                                        session,
-                                                                    });
+                                                                action = Some(SidebarAction::ShowDiff {
+                                                                    session,
+                                                                });
                                                                 ui.close();
                                                             }
                                                                     // 새 워크트리에서 셸 — cwd를 아는 세션만 (레포 판정은
@@ -2278,6 +2334,10 @@ impl FileTreeUi {
                                                             {
                                                                 action = Some(
                                                                     SidebarAction::ResumeAgent {
+                                                                        workspace_id: entry
+                                                                            .target
+                                                                            .workspace_id()
+                                                                            .to_owned(),
                                                                         pane: entry.target.pane().clone(),
                                                                         session,
                                                                         title: entry.title.clone(),
@@ -2690,7 +2750,7 @@ impl FileTreeUi {
             });
             ui.weak(catalog.t(
                 "file_tree.location",
-                &[("path", &parent.display().to_string())],
+                &[("path", &super::path_display(parent))],
             ));
         }
         if let Some(EditState::NewFile {
@@ -2721,7 +2781,7 @@ impl FileTreeUi {
             });
             ui.weak(catalog.t(
                 "file_tree.location",
-                &[("path", &parent.display().to_string())],
+                &[("path", &super::path_display(parent))],
             ));
         }
 
@@ -2749,6 +2809,8 @@ impl FileTreeUi {
         let mut toggle: Option<PathBuf> = None;
         let mut navigate_root: Option<PathBuf> = None;
         let mut open_file: Option<PathBuf> = None; // 파일 더블클릭 → 연결 프로그램 열기
+        // 문서 대상(md·txt 등) 더블클릭 → 문서 탭. open_file과 같은 이유로 루프 밖에서 처리.
+        let mut open_document: Option<(PathBuf, DocumentTargetKind)> = None;
         let mut drop_action: Option<(PathBuf, PathBuf)> = None; // (src, dst_dir)
         let mut observed_row_height: Option<f32> = None;
         // ── OS 파일 반입 상태 (Finder → 트리, §드롭·⌘V) ──
@@ -2782,6 +2844,7 @@ impl FileTreeUi {
                         path,
                         buffer,
                         focus,
+                        changed,
                     }) = &mut edit
                         && path == &row.path
                     {
@@ -2792,6 +2855,7 @@ impl FileTreeUi {
                                     .margin(egui::Margin::ZERO) // 고정 행높이 유지 (§9-6)
                                     .desired_width(f32::INFINITY),
                             );
+                            *changed |= resp.changed();
                             if *focus {
                                 resp.request_focus(); // §9-8 — 편집 키가 터미널로 새지 않게
                                 *focus = false;
@@ -2836,7 +2900,7 @@ impl FileTreeUi {
                     // 드래그 중엔 egui 포인터가 멎으므로 drag_pos(AppKit 위치)로 판정한다.
                     if !inaccessible
                         && let Some(pos) = drag_pos
-                        && hover_rect.contains(pos)
+                        && tree_area_owns_os_drop(hover_rect, pos)
                     {
                         // 내부 드래그와 **같은 판정 함수**를 쓴다. 표시와 목적지를 각각
                         // 계산하면 반드시 어긋난다 — 실제로 어긋났었다: 폴더 행 가장자리에
@@ -2894,7 +2958,7 @@ impl FileTreeUi {
                                 // 캐럿+폴더/파일 아이콘을 도형으로 (이모지 □ 깨짐 회피, 목업 §트리)
                                 let caret_col = ui.visuals().weak_text_color();
                                 let entry_color = file_entry_color(
-                                    &row.name,
+                                    &row.display_name,
                                     row.is_dir,
                                     egui::Color32::from_rgb(0xc8, 0xcc, 0xd2),
                                 );
@@ -2925,7 +2989,7 @@ impl FileTreeUi {
                                 } else {
                                     let file_color = if inaccessible {
                                         ui.visuals().weak_text_color()
-                                    } else if row.name.starts_with('.') {
+                                    } else if row.display_name.starts_with('.') {
                                         entry_color.gamma_multiply(0.62)
                                     } else {
                                         entry_color
@@ -2940,12 +3004,12 @@ impl FileTreeUi {
                                 }
                                 let text_color = if inaccessible {
                                     ui.visuals().weak_text_color()
-                                } else if row.name.starts_with('.') {
+                                } else if row.display_name.starts_with('.') {
                                     entry_color.gamma_multiply(0.62)
                                 } else {
                                     entry_color
                                 };
-                                let rich = egui::RichText::new(&row.name)
+                                let rich = egui::RichText::new(&row.display_name)
                                     .family(crate::fonts::sidebar_font_family(ui.ctx()))
                                     .size(12.5)
                                     .color(text_color);
@@ -3044,13 +3108,33 @@ impl FileTreeUi {
                             toggle = Some(row.path.clone());
                         }
                     } else if row_resp.double_clicked() || label_resp.double_clicked() {
-                        // host가 실존 regular file + 원본/realpath 허용 확장자를 다시 검증한
-                        // 뒤에만 연다. leaf는 filesystem metadata를 읽지 않는다.
-                        open_file = Some(row.path.clone());
+                        match classify_document_target(&row.path) {
+                            // 문서 대상(md·txt 등)은 문서 탭으로 연다 — App이 포커스된
+                            // pane 위에 연다(설계 §3.2). 검증(`self.reject_io`가 필요할 수
+                            // 있는 mutable self 접근)은 루프 밖(`row`의 대여가 끝난 뒤)에서
+                            // `open_document`로 미룬다 — `open_file`과 같은 관례.
+                            Some(kind) => open_document = Some((row.path.clone(), kind)),
+                            // 그 외 확장자는 예전 그대로 OS 기본 앱이 연다. host가 실존
+                            // regular file + 원본/realpath 허용 확장자를 다시 검증한 뒤에만
+                            // 연다. leaf는 filesystem metadata를 읽지 않는다.
+                            None => open_file = Some(row.path.clone()),
+                        }
                     }
                     // 우클릭 컨텍스트 메뉴 (FT-3) — 행 전체에서 열리게 row_resp에 단다
                     if !inaccessible {
                         row_resp.context_menu(|ui| {
+                            // 문서 대상은 더블클릭이 문서 탭으로 가로채므로, OS 기본 앱으로
+                            // 여는 예전 길을 메뉴에 남긴다(설계 §3.1, 기존 동작을 빼앗지
+                            // 않는다).
+                            if !row.is_dir
+                                && classify_document_target(&row.path).is_some()
+                                && ui
+                                    .button(catalog.t("file_tree.open_with_os", &[]))
+                                    .clicked()
+                            {
+                                menu_action = Some(MenuAction::OpenWithOs(row.path.clone()));
+                                ui.close();
+                            }
                             let new_folder_parent = if row.is_dir {
                                 Some(row.path.clone())
                             } else {
@@ -3134,6 +3218,12 @@ impl FileTreeUi {
                 self.reject_io(code);
             }
         }
+        if let Some((path, kind)) = open_document {
+            match FileTreePathPayload::try_new(path) {
+                Ok(target) => action = Some(SidebarAction::OpenDocument { target, kind }),
+                Err(code) => self.reject_io(code),
+            }
+        }
         if let Some((src, dst_dir)) = drop_action {
             self.start_move(src, dst_dir);
         }
@@ -3141,7 +3231,7 @@ impl FileTreeUi {
         // ── Finder → 트리 반입: OS 드롭(①)·클립보드 ⌘V(②) — 원본 보존 복사 ──
         // 반입 영역 = 파일 헤더 + 행 목록 (워크스페이스 목록/하단 nav 제외).
         let tree_area = header_rect.union(scroll_output.inner_rect);
-        if os_drag_active && drag_pos.is_some_and(|pos| tree_area.contains(pos)) {
+        if os_drag_active && drag_pos.is_some_and(|pos| tree_area_owns_os_drop(tree_area, pos)) {
             if !drag_row_highlighted {
                 // 행 위가 아니면 루트 반입 — 외곽선 대신 면으로 덮는다(2026-08-10 사용자:
                 // 외곽 테두리 제거). 폴더 행 강조와 같은 언어라 "이 영역이 받는다"로 읽힌다.
@@ -3156,7 +3246,7 @@ impl FileTreeUi {
             ui.ctx().request_repaint();
         }
         if !os_dropped.is_empty()
-            && drag_pos.is_some_and(|pos| tree_area.contains(pos))
+            && drag_pos.is_some_and(|pos| tree_area_owns_os_drop(tree_area, pos))
             && let Some(root) = self.root.clone()
         {
             let dst_dir = drop_target_dir.unwrap_or(root);
@@ -3169,22 +3259,25 @@ impl FileTreeUi {
         match edit_done {
             Some(false) => edit = None,
             Some(true) => match edit {
-                Some(EditState::Rename { path, buffer, .. }) => {
-                    let validated = validate_name(&buffer)
-                        .map_err(|_| FileTreeIoErrorCode::InvalidName)
-                        .and_then(|name| {
-                            FileTreePathPayload::try_new(path.clone())
-                                .map(|source| FileTreeIoRequest::Rename { source, name })
-                        });
+                Some(EditState::Rename {
+                    path,
+                    buffer,
+                    changed,
+                    ..
+                }) => {
+                    let prepared = prepare_rename_request(&path, &buffer, changed);
                     let refresh = path.parent().map(Path::to_path_buf).into_iter().collect();
                     let retry = EditState::Rename {
                         path,
                         buffer,
                         focus: true,
+                        changed,
                     };
-                    match validated.and_then(|request| {
-                        self.queue_io(request, refresh, None, Some(retry.clone()))
-                    }) {
+                    let result = prepared.and_then(|request| match request {
+                        Some(request) => self.queue_io(request, refresh, None, Some(retry.clone())),
+                        None => Ok(()),
+                    });
+                    match result {
                         Ok(()) => edit = None,
                         Err(code) => {
                             self.reject_io(code);
@@ -3253,14 +3346,12 @@ impl FileTreeUi {
                 });
             }
             Some(MenuAction::Rename(path)) => {
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
+                let name = super::path_file_name_display(&path);
                 edit = Some(EditState::Rename {
                     path,
                     buffer: name,
                     focus: true,
+                    changed: false,
                 });
             }
             Some(MenuAction::Delete(path)) => self.spawn_trash(path),
@@ -3274,16 +3365,25 @@ impl FileTreeUi {
                 Ok(path) => action = Some(SidebarAction::CdPath(path)),
                 Err(code) => self.reject_io(code),
             },
+            Some(MenuAction::OpenWithOs(path)) => {
+                let request =
+                    FileTreePathPayload::try_new(path).map(|target| FileTreeIoRequest::OpenPath {
+                        target,
+                        require_openable_file: true,
+                    });
+                if let Err(code) =
+                    request.and_then(|request| self.queue_io(request, Vec::new(), None, None))
+                {
+                    self.reject_io(code);
+                }
+            }
             None => {}
         }
         self.edit = edit;
 
         // 휴지통 실패 → 영구삭제 확인 (§9-7 — 조용한 영구삭제 금지)
         if let Some(path) = self.confirm_delete.clone() {
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.display().to_string());
+            let name = super::path_file_name_display(&path);
             ui.colored_label(
                 ui.visuals().warn_fg_color,
                 catalog.t("file_tree.permanent_delete_prompt", &[("name", &name)]),
@@ -3333,7 +3433,7 @@ impl FileTreeUi {
         action
     }
 
-    /// 고정 내비게이션 레일 — 홈 / 작업 / 이력 / 에이전트. 홈과 작업 행 우측의
+    /// 고정 내비게이션 레일 — 홈 / 작업 / 이력 / Git / 에이전트. 홈과 작업 행 우측의
     /// 카운트 배지는 0이면 숨긴다. 정보 화면 재클릭 시 터미널 복귀 토글은 App이
     /// 처리한다(view 소유자).
     fn navigation(
@@ -3378,6 +3478,18 @@ impl FileTreeUi {
         .clicked()
         {
             action = Some(SidebarAction::ShowHistory);
+        }
+        if nav_row(
+            ui,
+            NavIcon::Git,
+            &catalog.t("sidebar.nav.git", &[]),
+            // 이력과 같은 규칙 — 보조 탭이 **활성**일 때만 켠다.
+            sidebar.git_tab_active,
+            None,
+        )
+        .clicked()
+        {
+            action = Some(SidebarAction::ShowGit);
         }
         if nav_row(
             ui,
@@ -3725,6 +3837,9 @@ enum MenuAction {
     CopyPath(PathBuf),
     InsertPath(PathBuf),
     CdPath(PathBuf),
+    /// 문서 대상 파일을 OS 기본 앱으로 연다 — 더블클릭이 문서 탭으로 가로챈 뒤에도
+    /// 남겨두는 우회로(설계 §3.1).
+    OpenWithOs(PathBuf),
 }
 
 /// 이름 검증 (§5): 빈 이름·경로 구분자·'.'/'..' 거부. Ok = 트림된 이름.
@@ -3740,6 +3855,19 @@ fn validate_name(name: &str) -> Result<String, String> {
         return Err("사용할 수 없는 이름입니다".to_owned());
     }
     Ok(name.to_owned())
+}
+
+fn prepare_rename_request(
+    path: &Path,
+    buffer: &str,
+    changed: bool,
+) -> Result<Option<FileTreeIoRequest>, FileTreeIoErrorCode> {
+    if !changed {
+        return Ok(None);
+    }
+    let name = validate_name(buffer).map_err(|_| FileTreeIoErrorCode::InvalidName)?;
+    let source = FileTreePathPayload::try_new(path.to_path_buf())?;
+    Ok(Some(FileTreeIoRequest::Rename { source, name }))
 }
 
 /// 이름 변경 (덮어쓰기 금지 §9-5 공유). 성공 시 새 경로.
@@ -4041,7 +4169,14 @@ fn workspace_row(
 /// 낮추면 둘이 붙고, 44는 클릭 대상 최소 크기이기도 하다. 워크스페이스 목록처럼
 /// 여백 0으로 붙이려면 아이콘 위 라벨 아래 구성 자체를 버려야 한다.
 const SIDEBAR_NAV_ROW_HEIGHT: f32 = 44.0;
-const SIDEBAR_NAV_ITEM_SPACING: f32 = 2.0;
+/// 레일 내비 항목 세로 간격. 2.0이던 시절엔 아이콘+라벨 두 줄이 서로 붙어 읽기
+/// 어려웠다 — 항목 사이를 눈으로 끊을 수 있을 만큼 띄운다(2026-08-21).
+const SIDEBAR_NAV_ITEM_SPACING: f32 = 12.0;
+/// 하단 설정 dot 버튼의 지름과 좌측 여백.
+const NAV_UTILITY_DOT_SIZE: f32 = 22.0;
+const NAV_UTILITY_LEFT_PAD: f32 = 2.0;
+/// 도움말 팝업 메뉴 최소 너비.
+const NAV_HELP_MENU_MIN_WIDTH: f32 = 170.0;
 const PROJECT_SECTION_MIN_HEIGHT: f32 = 84.0;
 const FILE_SECTION_MIN_HEIGHT: f32 = 50.0;
 const PROJECT_FILE_SPLIT_HEIGHT: f32 = 6.0;
@@ -4770,12 +4905,26 @@ fn session_row_fill(
     tokens: crate::ui::designall::Tokens,
     hovered: bool,
     attention: bool,
+    focused: bool,
     status: egui::Color32,
 ) -> Option<SessionRowFill> {
     if attention {
         return Some(SessionRowFill {
             color: status.gamma_multiply(SESSION_ATTENTION_FILL_ALPHA),
             full_bleed: false,
+        });
+    }
+    // **지금 화면에 떠 있는 세션**은 면을 유지한다(2026-08-20 사용자) — 선택된
+    // 워크스페이스만 배경이 있고 그 안에서 실제로 보고 있는 세션은 표시가 없어,
+    // 목록에서 "어느 것을 보고 있는지"를 제목 색(session_title_color) 하나로만
+    // 구분해야 했다. hover보다 우선한다 — 마우스를 다른 행에 얹어도 지금 보고 있는
+    // 곳이 사라지면 안 된다. attention(내 입력을 기다림)은 더 급한 신호라 그대로 이긴다.
+    // 워크스페이스 행처럼 accent를 섞지는 않는다 — 부모(워크스페이스)와 자식(세션)이
+    // 같은 색이면 계층이 뭉개진다.
+    if focused {
+        return Some(SessionRowFill {
+            color: tokens.selected_background,
+            full_bleed: true,
         });
     }
     hovered.then_some(SessionRowFill {
@@ -5011,7 +5160,9 @@ fn session_row_impl(
             drag_style.stroke,
             egui::StrokeKind::Inside,
         );
-    } else if let Some(fill) = session_row_fill(tokens, resp.hovered(), entry.attention, dot) {
+    } else if let Some(fill) =
+        session_row_fill(tokens, resp.hovered(), entry.attention, entry.focused, dot)
+    {
         // 면은 **점까지 덮는다**. 예전엔 좌측 레일이 배경 위에 얹힌 별도 요소라
         // 배경을 레일 다음부터 시작했는데, 점이 된 지금 그 규칙을 남기면 점만 면
         // 바깥에 떠서 행이 둘로 갈라져 보인다(2026-08-11 사용자).
@@ -5557,8 +5708,8 @@ enum NavIcon {
     Home,
     Fleet,
     History,
+    Git,
     Agents,
-    Settings,
     Help,
 }
 
@@ -5747,47 +5898,43 @@ fn nav_utility_height(width: f32) -> f32 {
 
 fn nav_utilities(ui: &mut egui::Ui, catalog: &i18n::Catalog) -> Option<SidebarAction> {
     let mut action = None;
-    let stacked = ui.available_width() < 56.0;
-    if stacked {
-        ui.spacing_mut().item_spacing.y = 0.0;
-        ui.vertical_centered(|ui| {
-            let side = ui.available_width().min(24.0);
-            if nav_utility_button(
-                ui,
-                NavIcon::Settings,
-                &catalog.t("settings.title", &[]),
-                side,
-            )
-            .clicked()
-            {
-                action = Some(SidebarAction::OpenSettings);
-            }
-            if nav_utility_button(ui, NavIcon::Help, &catalog.t("sidebar.nav.help", &[]), side)
+    // 설정 하나만 남긴다(도움말 물음표는 2026-08-21에 뺐다). 가운데 정렬이 아니라
+    // 레일 가장 좌측에 붙인다 — 위쪽 내비 아이콘 열과 겹치지 않는 자리다.
+    ui.spacing_mut().item_spacing.x = 0.0;
+    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        ui.add_space(NAV_UTILITY_LEFT_PAD);
+        let help = nav_utility_button(
+            ui,
+            NavIcon::Help,
+            &catalog.t("sidebar.nav.help", &[]),
+            NAV_UTILITY_DOT_SIZE,
+        );
+        // 버전 → 업데이트 → 피드백 → 설정 순(2026-08-21). 맨 윗줄은 버전 표시라
+        // 누를 수 없는 라벨이다.
+        egui::Popup::menu(&help).show(|ui| {
+            ui.set_min_width(NAV_HELP_MENU_MIN_WIDTH);
+            ui.label(catalog.t(
+                "sidebar.help.version",
+                &[("version", env!("CARGO_PKG_VERSION"))],
+            ));
+            ui.separator();
+            if ui
+                .button(catalog.t("sidebar.help.check_update", &[]))
                 .clicked()
             {
-                action = Some(SidebarAction::OpenHelp);
+                action = Some(SidebarAction::CheckUpdate);
+                ui.close();
             }
-        });
-    } else {
-        ui.spacing_mut().item_spacing.x = 0.0;
-        ui.horizontal_centered(|ui| {
-            if nav_utility_button(
-                ui,
-                NavIcon::Settings,
-                &catalog.t("settings.title", &[]),
-                28.0,
-            )
-            .clicked()
-            {
+            if ui.button(catalog.t("sidebar.help.feedback", &[])).clicked() {
+                action = Some(SidebarAction::OpenFeedback);
+                ui.close();
+            }
+            if ui.button(catalog.t("settings.title", &[])).clicked() {
                 action = Some(SidebarAction::OpenSettings);
-            }
-            if nav_utility_button(ui, NavIcon::Help, &catalog.t("sidebar.nav.help", &[]), 28.0)
-                .clicked()
-            {
-                action = Some(SidebarAction::OpenHelp);
+                ui.close();
             }
         });
-    }
+    });
     action
 }
 
@@ -5796,11 +5943,7 @@ fn nav_utility_button(ui: &mut egui::Ui, icon: NavIcon, label: &str, side: f32) 
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
     });
-    if response.hovered() {
-        let tokens = crate::ui::designall::tokens(ui.visuals());
-        ui.painter()
-            .rect_filled(rect.shrink(2.0), 0.0, tokens.hover_background);
-    }
+    // hover 배경 없음 — 아이콘 색만 바뀐다(2026-08-21, nav_row와 같은 규칙).
     let color = if response.hovered() {
         ui.visuals().text_color()
     } else {
@@ -5851,7 +5994,9 @@ fn nav_row(
     }
     let row = rect.shrink2(egui::vec2(4.0, 0.0));
     let tokens = crate::ui::designall::tokens(ui.visuals());
-    if let Some(fill) = crate::ui::designall::row_fill(tokens, selected, response.hovered()) {
+    // hover에는 배경을 칠하지 않는다 — 아이콘/라벨 색만 바뀐다(2026-08-21).
+    // 선택된 항목의 면은 그대로 유지한다.
+    if let Some(fill) = crate::ui::designall::row_fill(tokens, selected, false) {
         ui.painter().rect_filled(row, 0.0, fill);
     }
     if selected {
@@ -5934,6 +6079,26 @@ fn paint_nav_icon(p: &egui::Painter, c: egui::Pos2, icon: NavIcon, col: egui::Co
             p.line_segment([c, egui::pos2(c.x, c.y - 3.5)], stroke);
             p.line_segment([c, egui::pos2(c.x + 3.0, c.y + 1.5)], stroke);
         }
+        // Git — 가지: 위 점에서 아래 점으로 내려오는 줄기 + 오른쪽으로 갈라지는 가지.
+        NavIcon::Git => {
+            p.line_segment(
+                [
+                    egui::pos2(c.x - 3.5, c.y - 5.0),
+                    egui::pos2(c.x - 3.5, c.y + 5.0),
+                ],
+                stroke,
+            );
+            p.circle_stroke(egui::pos2(c.x - 3.5, c.y - 5.0), 1.8, stroke);
+            p.circle_stroke(egui::pos2(c.x - 3.5, c.y + 5.0), 1.8, stroke);
+            p.circle_stroke(egui::pos2(c.x + 4.0, c.y - 1.0), 1.8, stroke);
+            p.line_segment(
+                [
+                    egui::pos2(c.x - 3.5, c.y + 1.5),
+                    egui::pos2(c.x + 4.0, c.y - 1.0),
+                ],
+                stroke,
+            );
+        }
         // 봇 — 머리(사각) + 눈 2점 + 안테나.
         NavIcon::Agents => {
             let head =
@@ -5950,22 +6115,13 @@ fn paint_nav_icon(p: &egui::Painter, c: egui::Pos2, icon: NavIcon, col: egui::Co
             p.circle_filled(egui::pos2(c.x - 2.5, c.y + 1.0), 1.2, col);
             p.circle_filled(egui::pos2(c.x + 2.5, c.y + 1.0), 1.2, col);
         }
-        NavIcon::Settings => {
-            p.circle_stroke(c, 5.0, stroke);
-            p.circle_stroke(c, 1.8, stroke);
-            for index in 0..8 {
-                let angle = index as f32 * std::f32::consts::TAU / 8.0;
-                let direction = egui::vec2(angle.cos(), angle.sin());
-                p.line_segment([c + direction * 5.5, c + direction * 7.0], stroke);
-            }
-        }
         NavIcon::Help => {
-            p.circle_stroke(c, 6.0, stroke);
+            p.circle_stroke(c, 4.5, stroke);
             p.text(
                 c,
                 egui::Align2::CENTER_CENTER,
                 "?",
-                egui::FontId::monospace(10.0),
+                egui::FontId::proportional(9.0),
                 col,
             );
         }
@@ -6289,6 +6445,10 @@ fn is_tree_paste_signal(event: &egui::Event) -> bool {
     }
 }
 
+fn tree_area_owns_os_drop(tree_area: egui::Rect, pos: egui::Pos2) -> bool {
+    tree_area.contains(pos) && pos.x < tree_area.right()
+}
+
 /// OS 파일 드래그/드롭 중 포인터 위치(egui 창 좌표). winit 0.30은 macOS
 /// `draggingUpdated:`를 구현하지 않아 드래그 중 CursorMoved가 오지 않는다 — AppKit
 /// 전역 마우스 위치(bottom-left 스크린 좌표)를 primary 스크린 기준으로 뒤집고
@@ -6379,10 +6539,7 @@ fn read_children(path: &Path, _root: Option<&Path>) -> std::io::Result<Vec<TreeN
     for entry in std::fs::read_dir(path)? {
         let entry = entry?;
         let is_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
-        nodes.push(TreeNode::new(
-            entry.file_name().to_string_lossy().into_owned(),
-            is_dir,
-        ));
+        nodes.push(TreeNode::new(entry.file_name(), is_dir));
     }
     sort_nodes(&mut nodes);
     Ok(nodes)
@@ -6416,7 +6573,7 @@ fn tree_node_usage(nodes: &[TreeNode]) -> (usize, usize) {
             usage.0.saturating_add(1).saturating_add(child_usage.0),
             usage
                 .1
-                .saturating_add(node.name.len())
+                .saturating_add(node.name.as_encoded_bytes().len())
                 .saturating_add(child_usage.1),
         )
     })
@@ -6425,7 +6582,12 @@ fn tree_node_usage(nodes: &[TreeNode]) -> (usize, usize) {
 /// 정렬: 디렉터리 우선 + 이름 (단순 유니코드 순 — §3, 로케일 비교는 비목표).
 #[cfg(test)]
 fn sort_nodes(nodes: &mut [TreeNode]) {
-    nodes.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
+    nodes.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.display_name.cmp(&b.display_name))
+            .then_with(|| a.name.cmp(&b.name))
+    });
 }
 
 /// 펼친 트리를 가시 행 목록으로 평탄화한다 (숨김 필터 포함). 순수 함수 — 단위 테스트 대상.
@@ -6437,13 +6599,13 @@ fn flatten(
     out: &mut Vec<FlatRow>,
 ) {
     for node in nodes {
-        if !show_hidden && node.name.starts_with('.') {
+        if !show_hidden && node.name.as_encoded_bytes().starts_with(b".") {
             continue;
         }
         let path = base.join(&node.name);
         out.push(FlatRow {
             path: path.clone(),
-            name: node.name.clone(),
+            display_name: node.display_name.clone(),
             depth,
             is_dir: node.is_dir,
             expanded: node.expanded,
@@ -6460,7 +6622,7 @@ fn flatten(
 fn node_mut<'a>(mut nodes: &'a mut Vec<TreeNode>, rel: &Path) -> Option<&'a mut TreeNode> {
     let mut comps = rel.components().peekable();
     while let Some(comp) = comps.next() {
-        let name = comp.as_os_str().to_string_lossy();
+        let name = comp.as_os_str();
         let idx = nodes.iter().position(|n| n.name == name)?;
         if comps.peek().is_none() {
             return Some(&mut nodes[idx]);
@@ -6473,7 +6635,7 @@ fn node_mut<'a>(mut nodes: &'a mut Vec<TreeNode>, rel: &Path) -> Option<&'a mut 
 fn node_ref<'a>(mut nodes: &'a [TreeNode], rel: &Path) -> Option<&'a TreeNode> {
     let mut comps = rel.components().peekable();
     while let Some(comp) = comps.next() {
-        let name = comp.as_os_str().to_string_lossy();
+        let name = comp.as_os_str();
         let node = nodes.iter().find(|n| n.name == name)?;
         if comps.peek().is_none() {
             return Some(node);
@@ -6529,6 +6691,97 @@ fn reread(base: &Path, old: &[TreeNode]) -> std::io::Result<Vec<TreeNode>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_tree_os_drop은_공유_오른쪽_경계를_소유하지_않는다() {
+        let tree_area = egui::Rect::from_min_max(egui::pos2(10.0, 20.0), egui::pos2(110.0, 120.0));
+
+        assert!(tree_area_owns_os_drop(
+            tree_area,
+            egui::pos2(tree_area.right() - 0.001, tree_area.center().y)
+        ));
+        assert!(tree_area_owns_os_drop(tree_area, tree_area.center()));
+        assert!(tree_area_owns_os_drop(
+            tree_area,
+            egui::pos2(tree_area.left(), tree_area.top())
+        ));
+        assert!(tree_area_owns_os_drop(
+            tree_area,
+            egui::pos2(tree_area.center().x, tree_area.bottom())
+        ));
+        assert!(
+            !tree_area_owns_os_drop(
+                tree_area,
+                egui::pos2(tree_area.right(), tree_area.center().y)
+            ),
+            "중앙 pane과 공유하는 오른쪽 경계는 file tree가 소유하지 않아야 한다"
+        );
+    }
+
+    #[test]
+    fn file_tree_os_drop_행_feedback도_공유_오른쪽_경계를_소유하지_않는다() {
+        let source = include_str!("file_tree.rs");
+        let row_hover = source
+            .split_once("// Finder 드래그 대상:")
+            .expect("Finder 행 hover 분기")
+            .1
+            .split_once("// 행 전체 = 드래그 소스")
+            .expect("행 hover 분기 끝")
+            .0;
+
+        assert!(
+            row_hover.contains("tree_area_owns_os_drop(hover_rect, pos)"),
+            "실제 drop을 거부하는 shared right edge에 행 허용 feedback을 그리면 안 된다"
+        );
+    }
+
+    /// 문서 대상 분류(설계 §3.1) — md·markdown은 markdown, txt·log·확장자 없음은
+    /// 평문, 그 외는 `None`이라 더블클릭이 예전처럼 OS 기본 앱으로 간다(기존 동작을
+    /// 빼앗지 않는다).
+    #[test]
+    fn classify_document_target은_설계_3_1_대상만_분류한다() {
+        assert_eq!(
+            classify_document_target(Path::new("readme.md")),
+            Some(DocumentTargetKind::Markdown)
+        );
+        assert_eq!(
+            classify_document_target(Path::new("README.MD")),
+            Some(DocumentTargetKind::Markdown),
+            "확장자 대소문자를 가리지 않는다"
+        );
+        assert_eq!(
+            classify_document_target(Path::new("notes.markdown")),
+            Some(DocumentTargetKind::Markdown)
+        );
+        assert_eq!(
+            classify_document_target(Path::new("todo.txt")),
+            Some(DocumentTargetKind::PlainText)
+        );
+        assert_eq!(
+            classify_document_target(Path::new("server.log")),
+            Some(DocumentTargetKind::PlainText)
+        );
+        assert_eq!(
+            classify_document_target(Path::new("LICENSE")),
+            Some(DocumentTargetKind::PlainText),
+            "확장자 없는 파일은 평문이다"
+        );
+        assert_eq!(
+            classify_document_target(Path::new("main.rs")),
+            None,
+            "비대상 확장자는 예전 그대로 OS 열기로 가야 한다"
+        );
+        assert_eq!(
+            classify_document_target(Path::new("photo.png")),
+            None,
+            "비대상 확장자는 예전 그대로 OS 열기로 가야 한다"
+        );
+        assert_eq!(
+            classify_document_target(Path::new("archive.tar.gz")),
+            None,
+            "마지막 확장자(gz)만 본다 — 대상이 아니다"
+        );
+    }
 
     #[test]
     fn native_only_copy는_유효한_트리_행이_소유한다() {
@@ -6767,19 +7020,12 @@ mod tests {
     }
 
     #[test]
-    fn designall_사이드바도구는_기존기능으로만_연결된다() {
-        assert_eq!(
-            SIDEBAR_TOOLS,
-            [SidebarTool::Files, SidebarTool::Git, SidebarTool::Notes]
-        );
-        // 인라인 탭은 액션이 없다 — 탭 선택만 바꾼다.
+    fn 사이드바_도구는_파일과_메모_둘뿐이다() {
+        // Git은 2026-08-15 2차에서 레일로 옮겼다 — 사이드바 폭이 목록에 모자랐다(스펙 §8-1).
+        assert_eq!(SIDEBAR_TOOLS, [SidebarTool::Files, SidebarTool::Notes]);
+        // 둘 다 본문을 교체하는 인라인 탭이다 — 액션 없이 탭 선택만 바뀐다.
         assert!(sidebar_tool_action(SidebarTool::Files).is_none());
         assert!(sidebar_tool_action(SidebarTool::Notes).is_none());
-        // 다른 화면에 작용하는 탭만 액션을 낸다.
-        assert!(matches!(
-            sidebar_tool_action(SidebarTool::Git),
-            Some(SidebarAction::ShowFocusedDiff)
-        ));
     }
 
     #[test]
@@ -7043,31 +7289,54 @@ mod tests {
     }
 
     #[test]
-    fn 선택은_면을_쓰지_않고_승인만_면을_가진다() {
+    fn 보고있는_세션은_면을_갖고_승인은_그보다_우선한다() {
         let tokens = crate::ui::designall::DARK;
         let status =
             crate::ui::agent_visuals::status_color(crate::agent_surface::AgentVisualState::Waiting);
 
-        // 주안 — 면 없음: hover도 승인도 아닌 평상시 행엔 면이 없다. 선택은 이
-        // 함수에 들어오지도 않는다.
-        assert_eq!(session_row_fill(tokens, false, false, status), None);
+        // 평상시(hover·승인·보고있음 아님) 행엔 면이 없다 — 목록이 면으로 뒤덮이면
+        // 어느 것이 특별한지 알 수 없다.
+        assert_eq!(session_row_fill(tokens, false, false, false, status), None);
+        // 2026-08-20 갱신: **지금 보고 있는 세션**은 면을 갖는다. 예전엔 글자 밝기로만
+        // 날라서, 선택된 워크스페이스만 배경이 있고 그 안에서 실제로 보고 있는 세션은
+        // 표시가 없었다(사용자 보고).
+        assert_eq!(
+            session_row_fill(tokens, false, false, true, status),
+            Some(SessionRowFill {
+                color: tokens.selected_background,
+                full_bleed: true,
+            })
+        );
+        // hover보다 우선한다 — 마우스를 다른 행에 얹어도 보고 있는 곳이 사라지면 안 된다.
+        assert_eq!(
+            session_row_fill(tokens, true, false, true, status)
+                .expect("보고있는 행에 면이 없다")
+                .color,
+            tokens.selected_background,
+            "hover 면이 '보고 있는 세션' 표시를 덮었다"
+        );
         // 승인·입력 대기만 면을 가진다 — 「혼자만 면을 가져」 최대로 튄다.
         let attention_fill = Some(SessionRowFill {
             color: status.gamma_multiply(SESSION_ATTENTION_FILL_ALPHA),
             full_bleed: false,
         });
         assert_eq!(
-            session_row_fill(tokens, false, true, status),
+            session_row_fill(tokens, false, true, false, status),
             attention_fill
         );
         assert_eq!(
-            session_row_fill(tokens, true, true, status),
+            session_row_fill(tokens, true, true, false, status),
             attention_fill,
             "hover 회색 면이 승인 상태색을 덮었다"
         );
+        assert_eq!(
+            session_row_fill(tokens, true, true, true, status),
+            attention_fill,
+            "'보고 있음' 면이 승인 상태색을 덮었다 — 내 입력을 기다리는 쪽이 더 급하다"
+        );
         // hover는 패널 폭을 다 쓰고, 승인 면은 둥근 카드로 남는다.
         assert!(
-            session_row_fill(tokens, true, false, status)
+            session_row_fill(tokens, true, false, false, status)
                 .expect("hover 면이 없다")
                 .full_bleed,
             "hover 면이 여백을 남겼다"
@@ -7077,7 +7346,7 @@ mod tests {
         assert_eq!(bleed.left(), row.left() - SESSION_LIST_INDENT, "hover 좌측");
         assert_eq!(bleed.right(), row.right(), "hover 우측");
 
-        // 선택은 글자 밝기로만 나른다.
+        // 글자 밝기도 그대로 함께 나른다(면과 이중으로 표시).
         let mut visuals = egui::Visuals::dark();
         visuals.override_text_color = Some(tokens.text);
         assert_eq!(session_title_color(&visuals, true), tokens.text);
@@ -7118,7 +7387,7 @@ mod tests {
             generation: stale.generation,
             result: Ok(FileTreeMaintenanceResult::Listing(
                 FileTreeListingSnapshot::try_new(vec![
-                    FileTreeListingItem::try_new("stale.txt".to_owned(), false).unwrap(),
+                    FileTreeListingItem::try_new(OsString::from("stale.txt"), false).unwrap(),
                 ])
                 .unwrap(),
             )),
@@ -7131,7 +7400,7 @@ mod tests {
     #[test]
     fn cancel_플래그는_같은_epoch에서도_송신을_중단한다() {
         let items = (0..=FILE_TREE_LISTING_MAX_ITEMS)
-            .map(|i| FileTreeListingItem::try_new(format!("f{i}"), false).unwrap())
+            .map(|i| FileTreeListingItem::try_new(OsString::from(format!("f{i}")), false).unwrap())
             .collect();
         assert!(matches!(
             FileTreeListingSnapshot::try_new(items),
@@ -7148,7 +7417,72 @@ mod tests {
     }
 
     fn names(nodes: &[TreeNode]) -> Vec<&str> {
-        nodes.iter().map(|n| n.name.as_str()).collect()
+        nodes.iter().map(|n| n.display_name.as_str()).collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_utf8_rows_keep_distinct_raw_paths() {
+        use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+
+        let first = std::ffi::OsString::from_vec(b"broken-\xfe".to_vec());
+        let second = std::ffi::OsString::from_vec(b"broken-\xff".to_vec());
+        let snapshot = FileTreeListingSnapshot::try_new(vec![
+            FileTreeListingItem::try_new(first.clone(), false).unwrap(),
+            FileTreeListingItem::try_new(second.clone(), false).unwrap(),
+        ])
+        .unwrap();
+        let nodes = snapshot
+            .items()
+            .iter()
+            .map(|item| TreeNode::new(item.name().to_owned(), item.is_dir()))
+            .collect::<Vec<_>>();
+        let mut rows = Vec::new();
+        flatten(&nodes, Path::new("/root"), 0, true, &mut rows);
+
+        assert_eq!(rows[0].display_name, rows[1].display_name);
+        assert_eq!(rows[0].display_name, "broken-�");
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.path.clone())
+                .collect::<HashSet<_>>()
+                .len(),
+            2,
+            "same lossy display must not collapse raw path identity"
+        );
+        let raw_names = rows
+            .iter()
+            .map(|row| row.path.file_name().unwrap().as_bytes().to_vec())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            raw_names,
+            HashSet::from([first.into_vec(), second.into_vec()])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raw_path_caps_use_encoded_os_bytes() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let mut raw = vec![b'x'; FILE_TREE_PATH_MAX_BYTES];
+        *raw.last_mut().unwrap() = 0xff;
+        let path = PathBuf::from(std::ffi::OsString::from_vec(raw));
+        let expected = path.as_os_str().as_encoded_bytes().len();
+
+        let payload = FileTreePathPayload::try_new(path.clone()).unwrap();
+        assert_eq!(payload.bytes, expected);
+        let list = FileTreePathListPayload::try_new(vec![path.clone()]).unwrap();
+        assert_eq!(list.bytes, expected);
+        let plan = FileTreeWatchPlan::try_new(vec![path.clone()], Vec::new(), false).unwrap();
+        assert_eq!(plan.bytes, expected);
+        let event =
+            FileTreeWatchEvent::try_new(FileTreeWatchEventKind::DirtyDirectory, path.clone())
+                .unwrap();
+        assert_eq!(event.bytes, expected);
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.set_watch_ignore(vec![path]);
+        assert!(tree.error.is_none());
     }
 
     #[test]
@@ -7177,7 +7511,7 @@ mod tests {
 
         let got: Vec<(String, usize, bool)> = out
             .iter()
-            .map(|r| (r.name.clone(), r.depth, r.is_dir))
+            .map(|r| (r.display_name.clone(), r.depth, r.is_dir))
             .collect();
         assert_eq!(
             got,
@@ -7193,6 +7527,23 @@ mod tests {
     }
 
     #[test]
+    fn 평탄화는_nfd_경로를_보존하고_표시명만_nfc로_합성한다() {
+        let raw = concat!(
+            "\u{1112}\u{116A}\u{1106}\u{1167}\u{11AB} ",
+            "\u{1103}\u{1175}\u{110C}\u{1161}\u{110B}",
+            "\u{1175}\u{11AB}"
+        );
+        let nodes = vec![file(raw)];
+        let mut out = Vec::new();
+        flatten(&nodes, Path::new("/r"), 0, false, &mut out);
+
+        assert_eq!(nodes[0].name, raw);
+        assert_eq!(out[0].display_name, "화면 디자인");
+        assert_eq!(out[0].path, Path::new("/r").join(raw));
+        assert_ne!(out[0].path, Path::new("/r/화면 디자인"));
+    }
+
+    #[test]
     fn 평탄화_숨김_필터와_토글() {
         let mut secret_dir = dir(".git");
         secret_dir.expanded = true;
@@ -7202,7 +7553,7 @@ mod tests {
         let mut hidden_off = Vec::new();
         flatten(&nodes, Path::new("/r"), 0, false, &mut hidden_off);
         assert_eq!(hidden_off.len(), 1);
-        assert_eq!(hidden_off[0].name, "visible.txt");
+        assert_eq!(hidden_off[0].display_name, "visible.txt");
 
         let mut hidden_on = Vec::new();
         flatten(&nodes, Path::new("/r"), 0, true, &mut hidden_on);
@@ -7427,6 +7778,25 @@ mod tests {
         assert!(validate_name("..").is_err());
         assert_eq!(validate_name(" 새 폴더 ").unwrap(), "새 폴더");
         assert_eq!(validate_name(".env").unwrap(), ".env"); // 숨김 이름은 허용
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn untouched_invalid_utf8_rename_does_not_create_a_native_request() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let path = PathBuf::from(std::ffi::OsString::from_vec(b"broken-\xff".to_vec()));
+
+        assert!(
+            prepare_rename_request(&path, "broken-�", false)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            prepare_rename_request(&path, "broken-�", true)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -7720,7 +8090,7 @@ mod tests {
             generation: stale.generation,
             result: Ok(FileTreeMaintenanceResult::Listing(
                 FileTreeListingSnapshot::try_new(vec![
-                    FileTreeListingItem::try_new("a.txt".to_owned(), false).unwrap(),
+                    FileTreeListingItem::try_new(OsString::from("a.txt"), false).unwrap(),
                 ])
                 .unwrap(),
             )),
@@ -7729,11 +8099,11 @@ mod tests {
         pump_listings_for(&mut tree, std::time::Duration::from_millis(100));
 
         assert!(
-            tree.flat.iter().any(|row| row.name == "b.txt"),
+            tree.flat.iter().any(|row| row.display_name == "b.txt"),
             "현재 root 결과는 적용"
         );
         assert!(
-            !tree.flat.iter().any(|row| row.name == "a.txt"),
+            !tree.flat.iter().any(|row| row.display_name == "a.txt"),
             "이전 root late result는 epoch mismatch로 폐기"
         );
         std::fs::remove_dir_all(&base).unwrap();
@@ -7797,6 +8167,7 @@ mod tests {
                         home_notice_count: 0,
                         fleet_count: 0,
                         history_tab_active: false,
+                        git_tab_active: false,
                         agents_open: false,
                         workspace_note: None,
                     };
@@ -7854,17 +8225,21 @@ mod tests {
             generation: stale.generation,
             result: Ok(FileTreeMaintenanceResult::Listing(
                 FileTreeListingSnapshot::try_new(vec![
-                    FileTreeListingItem::try_new("child.txt".to_owned(), false).unwrap(),
+                    FileTreeListingItem::try_new(OsString::from("child.txt"), false).unwrap(),
                 ])
                 .unwrap(),
             )),
         });
 
         pump_listings_for(&mut tree, std::time::Duration::from_millis(100));
-        let d = tree.flat.iter().find(|row| row.name == "d").unwrap();
+        let d = tree
+            .flat
+            .iter()
+            .find(|row| row.display_name == "d")
+            .unwrap();
         assert!(!d.expanded);
         assert!(
-            !tree.flat.iter().any(|row| row.name == "child.txt"),
+            !tree.flat.iter().any(|row| row.display_name == "child.txt"),
             "collapse 이후 도착한 stale child listing은 tree state를 오염시키지 않는다"
         );
         std::fs::remove_dir_all(&base).unwrap();
@@ -7886,8 +8261,8 @@ mod tests {
         drain_listings(&mut tree);
         tree.toggle_dir(&base.join("other"));
         drain_listings(&mut tree);
-        assert!(tree.flat.iter().any(|r| r.name == "o.txt"));
-        assert!(!tree.flat.iter().any(|r| r.name == "new.txt"));
+        assert!(tree.flat.iter().any(|r| r.display_name == "o.txt"));
+        assert!(!tree.flat.iter().any(|r| r.display_name == "new.txt"));
 
         // 디스크 변경 후 watched만 재나열 → 새 파일 반영, other는 캐시 유지 확인
         std::fs::write(base.join("watched/new.txt"), b"n").unwrap();
@@ -7896,11 +8271,11 @@ mod tests {
         drain_listings(&mut tree);
 
         assert!(
-            tree.flat.iter().any(|r| r.name == "new.txt"),
+            tree.flat.iter().any(|r| r.display_name == "new.txt"),
             "부분 재나열 반영"
         );
         assert!(
-            !tree.flat.iter().any(|r| r.name == "late.txt"),
+            !tree.flat.iter().any(|r| r.display_name == "late.txt"),
             "다른 디렉터리는 재나열되지 않는다 (부분 갱신)"
         );
         std::fs::remove_dir_all(&base).unwrap();
@@ -7930,10 +8305,10 @@ mod tests {
             )
             .unwrap(),
         );
-        assert!(!tree.flat.iter().any(|r| r.name == "a.txt"));
+        assert!(!tree.flat.iter().any(|r| r.display_name == "a.txt"));
         drain_listings(&mut tree);
         assert!(
-            tree.flat.iter().any(|r| r.name == "a.txt"),
+            tree.flat.iter().any(|r| r.display_name == "a.txt"),
             "async listing 적용 후 반영"
         );
         std::fs::remove_dir_all(&base).unwrap();
@@ -7973,6 +8348,7 @@ mod tests {
             home_notice_count: 0,
             fleet_count: 0,
             history_tab_active: false,
+            git_tab_active: false,
             agents_open: false,
             workspace_note: None,
         };
@@ -7990,7 +8366,7 @@ mod tests {
         drain_listings(&mut tree);
 
         assert!(
-            tree.flat.iter().any(|r| r.name == "new.txt"),
+            tree.flat.iter().any(|r| r.display_name == "new.txt"),
             "접힘 중에도 워처 이벤트가 반영된다"
         );
         assert_eq!(tree.in_flight, 0);
@@ -8060,21 +8436,21 @@ mod tests {
         drain_listings(&mut tree);
 
         assert!(
-            tree.flat.iter().any(|r| r.name == "design"),
+            tree.flat.iter().any(|r| r.display_name == "design"),
             "gitignore에 등록된 디렉터리도 이제 보인다"
         );
         assert!(
-            tree.flat.iter().any(|r| r.name == "info.log"),
+            tree.flat.iter().any(|r| r.display_name == "info.log"),
             "git/info/exclude 경로도 이제 보인다"
         );
         assert!(
-            tree.flat.iter().any(|r| r.name == "node_modules"),
+            tree.flat.iter().any(|r| r.display_name == "node_modules"),
             "기본 generated-dir 필터는 더 이상 숨기지 않는다"
         );
 
         tree.toggle_dir(&base.join("design"));
         drain_listings(&mut tree);
-        assert!(tree.flat.iter().any(|r| r.name == "mockup.png"));
+        assert!(tree.flat.iter().any(|r| r.display_name == "mockup.png"));
 
         std::fs::remove_dir_all(&base).unwrap();
     }
@@ -8395,6 +8771,7 @@ mod tests {
                         home_notice_count: 0,
                         fleet_count: 0,
                         history_tab_active: false,
+                        git_tab_active: false,
                         agents_open: false,
                         workspace_note: None,
                     };
@@ -8557,6 +8934,7 @@ mod tests {
                         home_notice_count: 0,
                         fleet_count: 0,
                         history_tab_active: false,
+                        git_tab_active: false,
                         agents_open: false,
                         workspace_note: None,
                     };
@@ -8677,6 +9055,7 @@ mod tests {
                         home_notice_count: 0,
                         fleet_count: 0,
                         history_tab_active: false,
+                        git_tab_active: false,
                         agents_open: false,
                         workspace_note: None,
                     };
@@ -8747,6 +9126,7 @@ mod tests {
                         home_notice_count: 0,
                         fleet_count: 0,
                         history_tab_active: false,
+                        git_tab_active: false,
                         agents_open: false,
                         workspace_note: None,
                     };
@@ -8867,6 +9247,7 @@ mod tests {
                         home_notice_count: 0,
                         fleet_count: 0,
                         history_tab_active: false,
+                        git_tab_active: false,
                         agents_open: false,
                         workspace_note: None,
                     };
@@ -9137,6 +9518,7 @@ mod tests {
                         home_notice_count: 0,
                         fleet_count: 0,
                         history_tab_active: false,
+                        git_tab_active: false,
                         agents_open: false,
                         workspace_note: None,
                     };
@@ -9159,6 +9541,126 @@ mod tests {
         assert!(matches!(
             harness.state().1.as_slice(),
             [SidebarAction::ClosePane { pane }] if pane.0 == "pane-a"
+        ));
+    }
+
+    /// 회귀 고정(2026-08-15): 세션 행 컨텍스트 메뉴의 「변경 보기」는 **그 세션**의
+    /// ShowDiff{session}을 낸다 — 포커스 세션이 아니라 클릭한 행 기준이어야 한다.
+    /// 한때 payload 없는 유닛 variant로 단순화됐다가(포커스 세션 기준으로 App이
+    /// 일원화) 세션 B 행을 눌러도 세션 A(포커스)의 repo가 뜨는 회귀가 났다. 세션 A·B
+    /// 둘 다 초점(focused) 없이 두고 세션 B 행을 우클릭·클릭해, 액션이 세션 A가
+    /// 아니라 세션 B의 id를 담는지로 "포커스 아님, 클릭한 행"을 고정한다.
+    #[test]
+    fn kittest_세션_행_변경_보기는_그_세션의_showdiff_액션을_낸다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let workspaces = vec![SidebarWorkspaceEntry {
+            id: "workspace-a".to_owned(),
+            name: "Workspace A".to_owned(),
+            state: SidebarWorkspaceState::Active,
+            summary: SidebarSessionSummary::default(),
+        }];
+        let sessions = std::collections::HashMap::from([(
+            "workspace-a".to_owned(),
+            vec![
+                SidebarSessionRow::from_live(
+                    "workspace-a",
+                    7,
+                    SessionEntry {
+                        tab: runtime::MuxTabId("tab-a".to_owned()),
+                        pane: runtime::MuxPaneId("pane-a".to_owned()),
+                        session: Some(runtime::SessionId(1)),
+                        title: "Session A".to_owned(),
+                        status: None,
+                        summary: String::new(),
+                        focused: false,
+                        attention: false,
+                        pulse: None,
+                        agent_line: None,
+                        status_label: None,
+                        resumable: false,
+                        has_cwd: false,
+                        in_worktree: false,
+                        status_line: None,
+                        last_output_at: None,
+                    },
+                ),
+                SidebarSessionRow::from_live(
+                    "workspace-a",
+                    7,
+                    SessionEntry {
+                        tab: runtime::MuxTabId("tab-b".to_owned()),
+                        pane: runtime::MuxPaneId("pane-b".to_owned()),
+                        session: Some(runtime::SessionId(2)),
+                        title: "Session B".to_owned(),
+                        status: None,
+                        summary: String::new(),
+                        focused: false,
+                        attention: false,
+                        pulse: None,
+                        agent_line: None,
+                        status_label: None,
+                        resumable: false,
+                        has_cwd: false,
+                        in_worktree: false,
+                        status_line: None,
+                        last_output_at: None,
+                    },
+                ),
+            ],
+        )]);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(420.0, 700.0))
+            .build_ui_state(
+                |ui, state: &mut (FileTreeUi, Vec<SidebarAction>, bool)| {
+                    if !state.2 {
+                        return;
+                    }
+                    let snapshot = SidebarSnapshot {
+                        active_workspace_id: "workspace-a",
+                        workspaces: &workspaces,
+                        view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
+                        home_notice_count: 0,
+                        fleet_count: 0,
+                        history_tab_active: false,
+                        git_tab_active: false,
+                        agents_open: false,
+                        workspace_note: None,
+                    };
+                    if let Some(action) = state.0.panel(ui, &sessions, &snapshot, &catalog) {
+                        state.1.push(action);
+                    }
+                },
+                (FileTreeUi::new(egui::Context::default()), Vec::new(), false),
+            );
+        install_sidebar_test_fonts(&harness.ctx);
+        harness.state_mut().2 = true;
+
+        harness.run();
+        let row_rect = harness.get_by_label("Session B").rect();
+        harness.event(egui::Event::PointerMoved(row_rect.center()));
+        harness.event(egui::Event::PointerButton {
+            pos: row_rect.center(),
+            button: egui::PointerButton::Secondary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        });
+        harness.event(egui::Event::PointerButton {
+            pos: row_rect.center(),
+            button: egui::PointerButton::Secondary,
+            pressed: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        harness.run();
+        harness
+            .get_by_label(&catalog.t("sidebar.menu.show_diff", &[]))
+            .click();
+        harness.run();
+
+        assert!(matches!(
+            harness.state().1.as_slice(),
+            [SidebarAction::ShowDiff { session }] if *session == runtime::SessionId(2)
         ));
     }
 
@@ -9539,6 +10041,7 @@ mod tests {
                         home_notice_count: 0,
                         fleet_count: 0,
                         history_tab_active: false,
+                        git_tab_active: false,
                         agents_open: false,
                         workspace_note: None,
                     };
@@ -9607,7 +10110,7 @@ mod tests {
     }
 
     #[test]
-    fn kittest_설정은_레일하단에_고정되고_액션을_낸다() {
+    fn kittest_도움말_버튼은_레일하단에_고정되고_메뉴로_설정을_연다() {
         use egui_kittest::kittest::Queryable;
 
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
@@ -9628,6 +10131,7 @@ mod tests {
                         home_notice_count: 0,
                         fleet_count: 0,
                         history_tab_active: false,
+                        git_tab_active: false,
                         agents_open: false,
                         workspace_note: None,
                     };
@@ -9643,14 +10147,28 @@ mod tests {
             );
         harness.run();
 
-        let settings_rect = harness.get_by_label("Settings").rect();
+        // 레일 하단에 고정되는 것은 이제 도움말(물음표) 버튼이다(2026-08-21).
+        let help_rect = harness.get_by_label("Help").rect();
         let rail = egui::PanelState::load(&harness.ctx, egui::Id::new("designall_navigation_rail"))
             .unwrap();
         assert!(
-            (settings_rect.bottom() - rail.outer_rect.bottom()).abs() < 4.0,
-            "settings bottom {} vs rail bottom {}",
-            settings_rect.bottom(),
+            (help_rect.bottom() - rail.outer_rect.bottom()).abs() < 4.0,
+            "help bottom {} vs rail bottom {}",
+            help_rect.bottom(),
             rail.outer_rect.bottom()
+        );
+
+        harness.get_by_label("Help").click();
+        harness.run();
+
+        // 메뉴 순서는 버전 → 업데이트 → 피드백 → 설정이다. 사용자가 지정한 순서라
+        // y좌표로 고정한다.
+        let update_y = harness.get_by_label("Check for updates").rect().top();
+        let feedback_y = harness.get_by_label("Send feedback").rect().top();
+        let settings_y = harness.get_by_label("Settings").rect().top();
+        assert!(
+            update_y < feedback_y && feedback_y < settings_y,
+            "메뉴 순서가 업데이트 < 피드백 < 설정이어야 한다: {update_y} / {feedback_y} / {settings_y}"
         );
 
         harness.get_by_label("Settings").click();
@@ -9671,6 +10189,7 @@ mod tests {
             home_notice_count: 0,
             fleet_count: 0,
             history_tab_active: false,
+            git_tab_active: false,
             agents_open: false,
             workspace_note: None,
         };
@@ -9693,7 +10212,7 @@ mod tests {
     }
 
     #[test]
-    fn kittest_파일헤더는_파일_git_메모탭만_표시한다() {
+    fn kittest_파일헤더는_파일_메모탭만_표시한다() {
         use egui_kittest::kittest::Queryable;
 
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
@@ -9703,8 +10222,16 @@ mod tests {
         harness.run();
 
         assert!(harness.query_by_label("Files").is_some());
-        assert!(harness.query_by_label("Git").is_some());
         assert!(harness.query_by_label("Notes").is_some());
+        // Git은 2026-08-15 2차에서 레일로 옮겼다(스펙 §8-1). 이 하네스는 레일까지 같이
+        // 그리므로 "Git 라벨이 아예 없다"로는 확인할 수 없다 — **도구 탭 줄에는 없고
+        // 레일에만 있다**를 좌표로 고정한다.
+        let files_rect = harness.get_by_label("Files").rect();
+        let git_rect = harness.get_by_label("Git").rect();
+        assert!(
+            git_rect.right() <= files_rect.left(),
+            "Git이 도구 탭 줄에 남아 있다 — 레일(좌측)에만 있어야 한다: git={git_rect:?} files={files_rect:?}"
+        );
         // MCP 탭은 뺐다(2026-08-10) — 혼자 설정(별도 OS 창)을 열어 레벨이 달랐다.
         // 연결 설정은 설정 → 관리 → 「연결」이 계속 담당한다.
         assert!(harness.query_by_label("MCP").is_none());
@@ -9767,6 +10294,7 @@ mod tests {
                         home_notice_count: 4,
                         fleet_count: 0,
                         history_tab_active: false,
+                        git_tab_active: false,
                         agents_open: false,
                         workspace_note: None,
                     };
@@ -9814,14 +10342,14 @@ mod tests {
         let root = PathBuf::from("/ws");
         let dir_row = FlatRow {
             path: root.join("sub"),
-            name: "sub".to_owned(),
+            display_name: "sub".to_owned(),
             depth: 0,
             is_dir: true,
             expanded: false,
         };
         let file_row = FlatRow {
             path: root.join("sub/a.txt"),
-            name: "a.txt".to_owned(),
+            display_name: "a.txt".to_owned(),
             depth: 1,
             is_dir: false,
             expanded: false,
@@ -9930,6 +10458,7 @@ mod tests {
                         home_notice_count: 0,
                         fleet_count: 0,
                         history_tab_active: false,
+                        git_tab_active: false,
                         agents_open: false,
                         workspace_note: None,
                     };
@@ -10366,6 +10895,7 @@ mod tests {
                         home_notice_count: 0,
                         fleet_count: 0,
                         history_tab_active: false,
+                        git_tab_active: false,
                         agents_open: false,
                         workspace_note: None,
                     };

@@ -12,7 +12,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
-use serde::Deserialize;
+use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 
 use crate::agent_launcher::{AgentKind, ModelChoice, ReasoningEffort};
 
@@ -22,6 +23,14 @@ const CATALOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
 /// 드롭다운에 넣을 모델 수 상한. Kimi는 `kimi provider add <models.dev>`로
 /// `[models.*]`가 수백~수천 개까지 불어날 수 있어 상한이 반드시 필요하다.
 const CATALOG_MODELS_MAX: usize = 64;
+const GROK_PARSED_EFFORT_ORDER: &[ReasoningEffort] = &[
+    ReasoningEffort::Low,
+    ReasoningEffort::Medium,
+    ReasoningEffort::High,
+    ReasoningEffort::XHigh,
+    ReasoningEffort::Max,
+    ReasoningEffort::Ultra,
+];
 
 /// 이 종류의 에이전트가 디스크 카탈로그를 갖는지. 나머지는 내장 목록만 쓴다.
 pub(crate) const fn has_disk_catalog(kind: AgentKind) -> bool {
@@ -32,7 +41,11 @@ pub(crate) const fn has_disk_catalog(kind: AgentKind) -> bool {
 }
 
 /// 디스크 카탈로그를 읽어 모델 목록을 만든다. 읽지 못하면 빈 목록이다.
-pub(crate) fn load(kind: AgentKind, home: Option<&Path>) -> Vec<ModelChoice> {
+pub(crate) fn load(
+    kind: AgentKind,
+    home: Option<&Path>,
+    configured_default: Option<&str>,
+) -> Vec<ModelChoice> {
     let Some(home) = home else {
         return Vec::new();
     };
@@ -44,7 +57,7 @@ pub(crate) fn load(kind: AgentKind, home: Option<&Path>) -> Vec<ModelChoice> {
             .map(|text| parse_kimi(&text))
             .unwrap_or_default(),
         AgentKind::Grok => read_bounded(&home.join(".grok/models_cache.json"))
-            .map(|text| parse_grok(&text))
+            .map(|text| parse_grok(&text, configured_default))
             .unwrap_or_default(),
         AgentKind::QwenCode => read_bounded(&home.join(".qwen/settings.json"))
             .map(|text| parse_qwen(&text))
@@ -61,7 +74,7 @@ pub(crate) fn configured_default_model(kind: AgentKind, home: Option<&Path>) -> 
         AgentKind::Codex => codex_configured_default_model(home),
         AgentKind::Kimi => kimi_configured_default_model(home, kimi_model_name_env().as_deref()),
         AgentKind::Claude => claude_configured_default_model(home),
-        AgentKind::Grok => grok_configured_default_model(home),
+        AgentKind::Grok => grok_configured_defaults(Some(home)).0,
         AgentKind::QwenCode => qwen_configured_default_model(home),
         _ => None,
     }
@@ -179,16 +192,40 @@ struct GrokTopLevelConfig {
 struct GrokModelsSection {
     #[serde(default)]
     default: Option<String>,
+    #[serde(default)]
+    default_reasoning_effort: Option<String>,
 }
 
+fn parse_grok_defaults(text: &str) -> (Option<String>, Option<ReasoningEffort>) {
+    let Some(section) = toml::from_str::<GrokTopLevelConfig>(text)
+        .ok()
+        .and_then(|config| config.models)
+    else {
+        return (None, None);
+    };
+    (
+        trimmed_non_empty(section.default),
+        trimmed_non_empty(section.default_reasoning_effort)
+            .as_deref()
+            .and_then(effort_from_value),
+    )
+}
+
+#[cfg(test)]
 fn parse_grok_default_model(text: &str) -> Option<String> {
-    let config: GrokTopLevelConfig = toml::from_str(text).ok()?;
-    trimmed_non_empty(config.models?.default)
+    parse_grok_defaults(text).0
 }
 
-fn grok_configured_default_model(home: &Path) -> Option<String> {
-    let text = read_bounded(&home.join(".grok/config.toml"))?;
-    parse_grok_default_model(&text)
+pub(crate) fn grok_configured_defaults(
+    home: Option<&Path>,
+) -> (Option<String>, Option<ReasoningEffort>) {
+    let Some(home) = home else {
+        return (None, None);
+    };
+    let Some(text) = read_bounded(&home.join(".grok/config.toml")) else {
+        return (None, None);
+    };
+    parse_grok_defaults(&text)
 }
 
 /// `~/.qwen/settings.json`의 중첩 `model.name` 키.
@@ -394,17 +431,108 @@ fn supports_thinking(capabilities: Option<&toml::Value>) -> bool {
 
 #[derive(Deserialize)]
 struct GrokCache {
-    // Codex와 같은 이유로 관대한 `serde_json::Value`로 받는다 — `id` 누락 등 항목 하나의
-    // 스키마 불일치가 배열 전체를 날리지 않게 한다.
-    #[serde(default)]
-    models: Vec<serde_json::Value>,
+    models: GrokModelCollection,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum GrokModelCollection {
+    Array(Vec<serde_json::Value>),
+    Object(BTreeMap<String, GrokCacheEntry>),
+}
+
+struct GrokCacheEntry {
+    info: Option<serde_json::Value>,
+}
+
+impl<'de> Deserialize<'de> for GrokCacheEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct GrokCacheEntryVisitor;
+
+        impl<'de> Visitor<'de> for GrokCacheEntryVisitor {
+            type Value = GrokCacheEntry;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a Grok model cache entry")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut info = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    if key == "info" {
+                        info = Some(map.next_value()?);
+                    } else {
+                        map.next_value::<IgnoredAny>()?;
+                    }
+                }
+                Ok(GrokCacheEntry { info })
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(GrokCacheEntry { info: None })
+            }
+
+            fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+                Ok(GrokCacheEntry { info: None })
+            }
+
+            fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+                Ok(GrokCacheEntry { info: None })
+            }
+
+            fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+                Ok(GrokCacheEntry { info: None })
+            }
+
+            fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+                Ok(GrokCacheEntry { info: None })
+            }
+
+            fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
+                Ok(GrokCacheEntry { info: None })
+            }
+
+            fn visit_borrowed_str<E>(self, _value: &'de str) -> Result<Self::Value, E> {
+                Ok(GrokCacheEntry { info: None })
+            }
+
+            fn visit_string<E>(self, _value: String) -> Result<Self::Value, E> {
+                Ok(GrokCacheEntry { info: None })
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(GrokCacheEntry { info: None })
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(GrokCacheEntry { info: None })
+            }
+        }
+
+        deserializer.deserialize_any(GrokCacheEntryVisitor)
+    }
 }
 
 #[derive(Deserialize)]
 struct GrokModel {
-    id: String,
+    #[serde(default)]
+    id: Option<String>,
     #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
+    hidden: bool,
+    #[serde(default)]
+    supported_in_api: Option<bool>,
     #[serde(default)]
     supports_reasoning_effort: bool,
     #[serde(default)]
@@ -420,45 +548,89 @@ struct GrokReasoningEffort {
     default: bool,
 }
 
+fn grok_model_choice(value: serde_json::Value, fallback_id: Option<String>) -> Option<ModelChoice> {
+    let model = serde_json::from_value::<GrokModel>(value).ok()?;
+    if model.hidden || model.supported_in_api == Some(false) {
+        return None;
+    }
+    let id = trimmed_non_empty(model.id).or_else(|| trimmed_non_empty(fallback_id))?;
+    let efforts = if model.supports_reasoning_effort {
+        collect_grok_efforts(
+            model
+                .reasoning_efforts
+                .iter()
+                .map(|effort| effort.value.as_str()),
+        )
+    } else {
+        Vec::new()
+    };
+    let default_effort = model
+        .reasoning_efforts
+        .iter()
+        .find(|effort| effort.default)
+        .map(|effort| effort.value.as_str())
+        .or(model.reasoning_effort.as_deref())
+        .and_then(effort_from_value);
+    let label = model.name.as_deref().unwrap_or(&id);
+    ModelChoice::new(&id, label, efforts, default_effort)
+}
+
+fn push_unique_model(
+    models: &mut Vec<ModelChoice>,
+    seen: &mut HashSet<String>,
+    model: ModelChoice,
+) {
+    if models.len() < CATALOG_MODELS_MAX && seen.insert(model.value().to_owned()) {
+        models.push(model);
+    }
+}
+
 /// `~/.grok/models_cache.json`. Codex와 달리 `priority` 필드가 없으므로 정렬하지 않고
 /// 카탈로그 배열 순서를 그대로 쓴다.
-fn parse_grok(text: &str) -> Vec<ModelChoice> {
+fn parse_grok(text: &str, configured_default: Option<&str>) -> Vec<ModelChoice> {
     let Ok(cache) = serde_json::from_str::<GrokCache>(text) else {
         return Vec::new();
     };
-    cache
-        .models
-        .into_iter()
-        // `id`가 없는 항목 하나 때문에 배열 전체가 사라지지 않도록 항목별로 변환하고
-        // 실패한 항목만 건너뛴다.
-        .filter_map(|value| serde_json::from_value::<GrokModel>(value).ok())
-        .filter_map(|model| {
-            // `supports_reasoning_effort`가 꺼져 있으면 `reasoning_efforts`가 남아 있어도
-            // 강도 선택지를 만들지 않는다.
-            let efforts = if model.supports_reasoning_effort {
-                collect_efforts(
-                    model
-                        .reasoning_efforts
-                        .iter()
-                        .map(|effort| effort.value.as_str()),
-                )
-            } else {
-                Vec::new()
-            };
-            // `default: true`로 표시된 항목을 먼저 찾고, 없으면 최상위 `reasoning_effort`로
-            // 폴백한다. 지원 목록 밖의 값은 `ModelChoice::new`가 걸러낸다.
-            let default_effort = model
-                .reasoning_efforts
-                .iter()
-                .find(|effort| effort.default)
-                .map(|effort| effort.value.as_str())
-                .or(model.reasoning_effort.as_deref())
-                .and_then(effort_from_value);
-            let label = model.name.as_deref().unwrap_or(&model.id);
-            ModelChoice::new(&model.id, label, efforts, default_effort)
-        })
-        .take(CATALOG_MODELS_MAX)
-        .collect()
+    let mut seen = HashSet::new();
+    let mut models = Vec::new();
+    match cache.models {
+        GrokModelCollection::Array(values) => {
+            for value in values {
+                if models.len() >= CATALOG_MODELS_MAX {
+                    break;
+                }
+                if let Some(model) = grok_model_choice(value, None) {
+                    push_unique_model(&mut models, &mut seen, model);
+                }
+            }
+        }
+        GrokModelCollection::Object(values) => {
+            let mut promoted_key = None;
+            if let Some(default) = configured_default
+                && let Some(entry) = values.get(default)
+                && let Some(info) = entry.info.as_ref().cloned()
+                && let Some(model) = grok_model_choice(info, Some(default.to_owned()))
+                && model.value() == default
+            {
+                push_unique_model(&mut models, &mut seen, model);
+                promoted_key = Some(default);
+            }
+            for (id, entry) in values {
+                if promoted_key == Some(id.as_str()) {
+                    continue;
+                }
+                if models.len() >= CATALOG_MODELS_MAX {
+                    break;
+                }
+                if let Some(info) = entry.info
+                    && let Some(model) = grok_model_choice(info, Some(id))
+                {
+                    push_unique_model(&mut models, &mut seen, model);
+                }
+            }
+        }
+    }
+    models
 }
 
 /// `~/.qwen/settings.json`. Qwen은 서버 카탈로그를 내려받지 않고, 사용자가 손으로 등록한
@@ -583,6 +755,15 @@ fn collect_efforts<'a>(values: impl Iterator<Item = &'a str>) -> Vec<ReasoningEf
         }
     }
     efforts
+}
+
+fn collect_grok_efforts<'a>(values: impl Iterator<Item = &'a str>) -> Vec<ReasoningEffort> {
+    let available = collect_efforts(values);
+    GROK_PARSED_EFFORT_ORDER
+        .iter()
+        .copied()
+        .filter(|effort| available.contains(effort))
+        .collect()
 }
 
 fn effort_from_value(value: &str) -> Option<ReasoningEffort> {
@@ -739,6 +920,50 @@ display_name = "Plain"
       ]
     }"#;
 
+    const GROK_OBJECT_FIXTURE: &str = r#"{
+      "models": {
+        "grok-4.6": {
+          "api_key": "must-not-be-projected",
+          "info": {
+            "name": "Grok 4.6",
+            "hidden": false,
+            "supported_in_api": true,
+            "supports_reasoning_effort": true,
+            "reasoning_effort": "high",
+            "reasoning_efforts": [
+              { "value": "xhigh", "default": false },
+              { "value": "high", "default": true },
+              { "value": "medium", "default": false },
+              { "value": "low", "default": false }
+            ]
+          }
+        },
+        "grok-4.5": {
+          "env_key": "GROK_API_KEY",
+          "info": {
+            "id": "grok-4.5",
+            "name": "Grok 4.5",
+            "hidden": false,
+            "supported_in_api": true,
+            "supports_reasoning_effort": true,
+            "reasoning_effort": "high",
+            "reasoning_efforts": [
+              { "value": "high", "default": true },
+              { "value": "medium", "default": false },
+              { "value": "low", "default": false }
+            ]
+          }
+        },
+        "grok-hidden": {
+          "info": { "id": "grok-hidden", "hidden": true, "supported_in_api": true }
+        },
+        "grok-private": {
+          "info": { "id": "grok-private", "hidden": false, "supported_in_api": false }
+        },
+        "broken": { "info": "not-an-object" }
+      }
+    }"#;
+
     const QWEN_FIXTURE: &str = r#"{
       "model": { "name": "qwen3-coder-plus" },
       "modelProviders": {
@@ -882,7 +1107,7 @@ display_name = "Ok"
 
     #[test]
     fn grok_catalog_maps_efforts_default_flag_fallback_and_unsupported_models() {
-        let models = parse_grok(GROK_FIXTURE);
+        let models = parse_grok(GROK_FIXTURE, None);
         // `priority` 필드가 없으므로 카탈로그 배열 순서를 그대로 유지한다.
         assert_eq!(
             values(&models),
@@ -902,9 +1127,9 @@ display_name = "Ok"
         assert_eq!(
             grok_4_5.efforts(),
             [
-                ReasoningEffort::High,
+                ReasoningEffort::Low,
                 ReasoningEffort::Medium,
-                ReasoningEffort::Low
+                ReasoningEffort::High
             ]
         );
         assert_eq!(grok_4_5.default_effort(), Some(ReasoningEffort::High));
@@ -924,6 +1149,118 @@ display_name = "Ok"
         let grok_3_mini = by_value("grok-3-mini");
         assert_eq!(grok_3_mini.label(), "grok-3-mini");
         assert!(grok_3_mini.efforts().is_empty());
+    }
+
+    #[test]
+    fn grok_object_catalog_uses_public_info_key_fallback_and_model_efforts() {
+        let models = parse_grok(GROK_OBJECT_FIXTURE, Some("grok-4.6"));
+        assert_eq!(values(&models), ["grok-4.6", "grok-4.5"]);
+        let grok_46 = models
+            .iter()
+            .find(|model| model.value() == "grok-4.6")
+            .unwrap();
+        assert_eq!(grok_46.label(), "Grok 4.6");
+        assert_eq!(
+            grok_46.efforts(),
+            [
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+                ReasoningEffort::XHigh,
+            ]
+        );
+        assert_eq!(grok_46.default_effort(), Some(ReasoningEffort::High));
+        let grok_45 = models
+            .iter()
+            .find(|model| model.value() == "grok-4.5")
+            .unwrap();
+        assert_eq!(
+            grok_45.efforts(),
+            [
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+            ]
+        );
+        assert!(
+            models
+                .iter()
+                .all(|model| !model.label().contains("must-not-be-projected"))
+        );
+    }
+
+    #[test]
+    fn grok_array_catalog_deduplicates_ids_before_the_existing_cap() {
+        let models = parse_grok(
+            r#"{"models":[
+              {"id":"grok-4.5","name":"first"},
+              {"id":"grok-4.5","name":"duplicate"},
+              {"id":"grok-4.6","name":"second"}
+            ]}"#,
+            None,
+        );
+        assert_eq!(values(&models), ["grok-4.5", "grok-4.6"]);
+        assert_eq!(models[0].label(), "first");
+    }
+
+    #[test]
+    fn grok_object_catalog_keeps_configured_default_beyond_the_cap() {
+        let mut json = String::from(r#"{"models":{"#);
+        for index in 0..(CATALOG_MODELS_MAX + 10) {
+            if index > 0 {
+                json.push(',');
+            }
+            json.push_str(&format!(
+                r#""m{index:03}":{{"info":{{"id":"m{index:03}","name":"M {index}"}}}}"#
+            ));
+        }
+        json.push_str(r#","zzz-configured":{"info":{"name":"Configured"}}"#);
+        json.push_str("}}");
+
+        let models = parse_grok(&json, Some("zzz-configured"));
+        assert_eq!(models.len(), CATALOG_MODELS_MAX);
+        assert_eq!(models[0].value(), "zzz-configured");
+        assert_eq!(models[1].value(), "m000");
+        assert_eq!(models.last().unwrap().value(), "m062");
+        assert!(!models.iter().any(|model| model.value() == "m063"));
+    }
+
+    #[test]
+    fn grok_object_catalog_does_not_drop_mismatched_configured_key() {
+        let models = parse_grok(
+            r#"{"models":{
+              "configured-key":{"info":{"id":"actual-id","name":"Actual"}},
+              "other":{"info":{"id":"other","name":"Other"}}
+            }}"#,
+            Some("configured-key"),
+        );
+        assert_eq!(values(&models), ["actual-id", "other"]);
+    }
+
+    #[test]
+    fn grok_object_catalog_drops_only_entries_missing_info() {
+        let models = parse_grok(
+            r#"{"models":{
+              "missing-info":{"api_key":"must-not-be-projected"},
+              "grok-4.6":{"api_key":"must-not-be-projected","info":{"name":"Grok 4.6"}}
+            }}"#,
+            None,
+        );
+        assert_eq!(values(&models), ["grok-4.6"]);
+        assert_eq!(models[0].label(), "Grok 4.6");
+    }
+
+    #[test]
+    fn grok_object_catalog_drops_only_non_object_entries() {
+        let models = parse_grok(
+            r#"{"models":{
+              "broken":"not-an-object",
+              "grok-4.6":{"api_key":"must-not-be-projected","info":{"name":"Grok 4.6"}}
+            }}"#,
+            None,
+        );
+        assert_eq!(values(&models), ["grok-4.6"]);
+        assert_eq!(models[0].label(), "Grok 4.6");
     }
 
     #[test]
@@ -985,20 +1322,35 @@ display_name = "Ok"
         assert!(parse_codex(r#"{"models": "not-an-array"}"#).is_empty());
         assert!(parse_kimi("this is not = valid toml [[[").is_empty());
         assert!(parse_kimi("").is_empty());
-        assert!(parse_grok("").is_empty());
-        assert!(parse_grok(r#"{"models": "not-an-array"}"#).is_empty());
+        assert!(parse_grok("", None).is_empty());
+        assert!(parse_grok(r#"{"models": "not-an-array-or-object"}"#, None).is_empty());
         assert!(parse_qwen("").is_empty());
         assert!(parse_qwen(r#"{"modelProviders": "not-an-object"}"#).is_empty());
         // Qwen은 사용자가 설정을 한 번도 바꾸지 않으면 파일 자체가 없다 — 빈 목록으로 폴백한다.
         assert!(parse_qwen(r#"{"model": {"name": "qwen3-coder-plus"}}"#).is_empty());
-        assert!(load(AgentKind::Codex, None).is_empty());
-        assert!(load(AgentKind::Claude, Some(Path::new("/"))).is_empty());
-        assert!(load(AgentKind::Codex, Some(Path::new("/deppy-nonexistent-home"))).is_empty());
-        assert!(load(AgentKind::Grok, Some(Path::new("/deppy-nonexistent-home"))).is_empty());
+        assert!(load(AgentKind::Codex, None, None).is_empty());
+        assert!(load(AgentKind::Claude, Some(Path::new("/")), None).is_empty());
+        assert!(
+            load(
+                AgentKind::Codex,
+                Some(Path::new("/deppy-nonexistent-home")),
+                None
+            )
+            .is_empty()
+        );
+        assert!(
+            load(
+                AgentKind::Grok,
+                Some(Path::new("/deppy-nonexistent-home")),
+                None
+            )
+            .is_empty()
+        );
         assert!(
             load(
                 AgentKind::QwenCode,
-                Some(Path::new("/deppy-nonexistent-home"))
+                Some(Path::new("/deppy-nonexistent-home")),
+                None
             )
             .is_empty()
         );
@@ -1052,7 +1404,7 @@ display_name = "Ok"
             .collect::<Vec<_>>()
             .join(",");
         assert_eq!(
-            parse_grok(&format!(r#"{{"models":[{grok_entries}]}}"#)).len(),
+            parse_grok(&format!(r#"{{"models":[{grok_entries}]}}"#), None).len(),
             CATALOG_MODELS_MAX
         );
 
@@ -1114,6 +1466,24 @@ display_name = "K2.7 Coding"
         // Codex와 달리 최상위 `default` 키는 엉뚱한 자리이므로 무시해야 한다.
         let wrong_place = "default = \"grok-4.5\"\n";
         assert!(parse_grok_default_model(wrong_place).is_none());
+    }
+
+    #[test]
+    fn grok_configured_defaults_read_only_the_nested_models_table() {
+        assert_eq!(
+            parse_grok_defaults(
+                "default = \"wrong\"\ndefault_reasoning_effort = \"xhigh\"\n\
+                 [models]\ndefault = \"  grok-4.6  \"\n\
+                 default_reasoning_effort = \" medium \"\n"
+            ),
+            (Some("grok-4.6".to_owned()), Some(ReasoningEffort::Medium),)
+        );
+        assert_eq!(
+            parse_grok_defaults(
+                "[models]\ndefault = \"grok-4.6\"\ndefault_reasoning_effort = \"minimal\"\n"
+            ),
+            (Some("grok-4.6".to_owned()), None)
+        );
     }
 
     #[test]
@@ -1224,7 +1594,7 @@ display_name = "K2.7 Coding"
         let padding = " ".repeat(usize::try_from(CATALOG_MAX_BYTES).unwrap_or(usize::MAX) + 1);
         std::fs::write(&path, format!("{padding}{{\"models\":[]}}")).unwrap();
         assert!(read_bounded(&path).is_none());
-        assert!(load(AgentKind::Codex, Some(dir.as_path())).is_empty());
+        assert!(load(AgentKind::Codex, Some(dir.as_path()), None).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -208,6 +208,360 @@ mod tests {
     const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
     #[test]
+    fn 앱셸은_대시보드와_전체화면_뷰어를_형제로_둔다() {
+        let response = respond("/", &format!("token={TOKEN}"), TOKEN);
+        let html = String::from_utf8(response.body.into_owned()).unwrap();
+        let main_close = html.find("</main>").expect("dashboard </main> 없음");
+        let viewer_open = html
+            .find(r#"<section id="viewer""#)
+            .expect("viewer section 없음");
+        assert!(
+            viewer_open > main_close,
+            "viewer는 inert dashboard 뒤의 형제여야 함"
+        );
+        for marker in [
+            r#"<main id="dashboard-shell" class="app">"#,
+            r#"class="viewer-shell""#,
+            r#"role="dialog""#,
+            r#"aria-modal="true""#,
+            r#"id="viewer-back""#,
+            r#"id="viewer-stage""#,
+            r#"id="viewer-connection-overlay""#,
+            r#"id="viewer-privacy-curtain""#,
+            r#"aria-labelledby="viewer-title viewer-session""#,
+            r#"role="group" aria-label="터미널 특수키""#,
+            r#"aria-label="터미널에 보낼 메시지""#,
+            r#"id="viewer-connection-label""#,
+            r#"id="viewer-connection-detail" class="sr-only""#,
+        ] {
+            assert!(
+                html.contains(marker),
+                "전체화면 viewer marker 누락: {marker}"
+            );
+        }
+        let js = std::str::from_utf8(APP_JS).unwrap();
+        assert!(js.contains("'viewer-back'"), "새 back listener 누락");
+        assert!(
+            !js.contains("'viewer-close'"),
+            "삭제한 close listener가 남음"
+        );
+        let connection_tag = html
+            .split(r#"<p id="viewer-connection""#)
+            .nth(1)
+            .and_then(|rest| rest.split('>').next())
+            .expect("persistent viewer connection tag 없음");
+        for marker in [
+            r#"role="status""#,
+            r#"aria-live="polite""#,
+            r#"aria-atomic="true""#,
+        ] {
+            assert!(
+                connection_tag.contains(marker),
+                "persistent connection a11y marker 누락: {marker}"
+            );
+        }
+        assert!(
+            !connection_tag.contains(r#"aria-hidden="true""#),
+            "persistent connection status가 보조기술에서 숨겨짐"
+        );
+        let overlay_tag = html
+            .split(r#"<div id="viewer-connection-overlay""#)
+            .nth(1)
+            .and_then(|rest| rest.split('>').next())
+            .expect("viewer connection overlay tag 없음");
+        assert!(
+            overlay_tag.contains(r#"aria-hidden="true""#),
+            "visual connection overlay가 보조기술에서 숨겨지지 않음"
+        );
+        for duplicate in [r#"role="status""#, "aria-live"] {
+            assert!(
+                !overlay_tag.contains(duplicate),
+                "visual overlay에 중복 live status marker가 남음: {duplicate}"
+            );
+        }
+        let css = std::str::from_utf8(APP_CSS).unwrap();
+        assert!(
+            css.contains(".sr-only"),
+            "screen-reader-only CSS helper 누락"
+        );
+        for marker in [
+            "connectionStatus: document.getElementById('viewer-connection')",
+            "connectionLabel: document.getElementById('viewer-connection-label')",
+            "connectionDetail: document.getElementById('viewer-connection-detail')",
+            "viewer.connectionLabel.textContent = copy[0];",
+            "viewer.connectionDetail.textContent = copy[1];",
+            "viewer.connectionStatus.className = 'viewer-connection ' + state;",
+        ] {
+            assert!(
+                js.contains(marker),
+                "connection live-region JS marker 누락: {marker}"
+            );
+        }
+    }
+
+    #[test]
+    fn 전체화면_뷰어_css는_viewport와_safe_area_계약을_포함한다() {
+        let css = std::str::from_utf8(APP_CSS).unwrap();
+        for marker in [
+            "body.viewer-open",
+            ".viewer-shell",
+            "position: fixed",
+            "left: var(--viewer-left, 0px)",
+            "width: var(--viewer-width, 100vw)",
+            "height: var(--viewer-height, 100dvh)",
+            "env(safe-area-inset-top)",
+            "env(safe-area-inset-bottom)",
+            "max(12px, env(safe-area-inset-right))",
+            "max(12px, env(safe-area-inset-left))",
+            "max(10px, env(safe-area-inset-right))",
+            "max(10px, env(safe-area-inset-left))",
+            "grid-template-rows: auto minmax(0, 1fr) auto",
+            ".viewer-overlay",
+            ".viewer-privacy-curtain",
+        ] {
+            assert!(css.contains(marker), "전체화면 CSS marker 누락: {marker}");
+        }
+    }
+
+    #[test]
+    fn 전체화면_뷰어_js는_단일_lifecycle과_back_계약을_포함한다() {
+        let js = std::str::from_utf8(APP_JS).unwrap();
+        for marker in [
+            "function activateViewerShell()",
+            "function finishCloseViewer(",
+            "function requestCloseViewer(",
+            "function mergeViewerCloseOptions(",
+            "function setViewerClosing(",
+            "function stopAllKeyRepeats()",
+            "if (viewer.closing) return false;",
+            "if (!openViewer(id",
+            "queueMicrotask(() => consumePendingWatch(lastSessions))",
+            "if (pendingWatch === viewer.watching)",
+            "if (!target || target.exited)",
+            "if (viewer.watching !== endedSession) return;",
+            "queueMicrotask(() => {",
+            "let pointerActive = false;",
+            "repeated = repeated || pointerActive;",
+            "if (s.id && !s.exited)",
+            "else if (!s.id) {",
+            "if (known && !known.exited) {",
+            "if (!row || row.exited) return;",
+            "history.pushState",
+            "window.addEventListener('popstate'",
+            "dashboardShell.inert = true",
+            "dashboardShell.inert = false",
+            "viewBtn.dataset.sessionId = s.id",
+            "선택한 세션이 종료되었습니다",
+            "function clearViewerCanvas()",
+            "function clearStaleViewerHistory()",
+            "viewer.pendingClose = options",
+            "viewer.pendingClose = mergeViewerCloseOptions(viewer.pendingClose, options); // merge while awaiting popstate",
+            "setViewerClosing(true)",
+        ] {
+            assert!(
+                js.contains(marker),
+                "viewer lifecycle marker 누락: {marker}"
+            );
+        }
+        assert!(
+            !js.contains("scrollIntoView"),
+            "inline viewer 스크롤 진입이 남아 있음"
+        );
+    }
+
+    #[test]
+    fn 전체화면_뷰어는_재연결_입력잠금과_privacy_계약을_포함한다() {
+        let js = std::str::from_utf8(APP_JS).unwrap();
+        for marker in [
+            "function setViewerConnection(",
+            "viewer.connection === 'connected'",
+            "&& !document.hidden",
+            "inputBlocked = false; // reset per connection generation",
+            "viewer.overlay.hidden = connected",
+            "viewer.privacy.hidden = false",
+            "viewer.privacy.hidden = true",
+            "setViewerConnection('reconnecting')",
+            "setViewerConnection('paused')",
+            "intentionallyClosedSockets.has(socket)",
+            "function isCurrentSocket(",
+            "function stopAllKeyRepeats()",
+            "if (!remoteInputReady()) return;",
+            "const viewerDrafts = new Map()",
+            "composerText.maxLength = MAX_DRAFT_CHARS",
+            "const recoveredDraftSessions = new Set()",
+            "const evictedDraftSessions = new Set()",
+            "evictedDraftSessions.delete(composerSession);",
+            "let composerRecoveryWarningSession = null;",
+            "composerRecoveryWarningSession !== msg.session",
+            "const RECOVERY_WARNING = '최근 입력을 복원했습니다 — 중복 여부를 확인하세요.';",
+            "let draftCacheNotice = ''",
+            "const closeNotices = [notice, draftCacheNotice]",
+            "const RECENT_SEND_TTL_MS = 30_000",
+            "let recentSentExpiryTimer = null;",
+            "function scheduleRecentSentExpiry()",
+            "recentSentExpiryTimer = setTimeout",
+            "function saveComposerDraft()",
+            "function preserveComposerDraftForTransition()",
+            "function loadComposerDraft(",
+            "setComposerNote(notices.join(' ')); // clear stale note",
+            "function discardSessionDraft(",
+            "discardDraft: !!(watched && watched.exited)",
+            "const recentSentBySession = new Map()",
+            "for (const sessionId of Array.from(recentSentBySession.keys()))",
+            "sessionId === viewer.watching",
+            "function canRememberRecentSent(",
+            "if (!canRememberRecentSent(target, text))",
+            "scheduleRecentSentExpiry(); // arm journal expiry",
+            "const utf8Encoder = new TextEncoder()",
+            "const MAX_INPUT_FRAME_BYTES = 512 * 1024",
+            "function sendSerialized(",
+            "utf8Encoder.encode(text).byteLength",
+            "utf8Encoder.encode(serializedInput).byteLength",
+            "function restoreDraft(note, sessionId)",
+            "if (inputBlocked && !restoreDraft(",
+            "연결이 바뀌어 최근 입력을 복원했습니다",
+            "const MAX_TERMINAL_INPUT_LOCKS = 256;",
+            "const TERMINAL_INPUT_LOCK_OVERFLOW_NOTICE =",
+            "const terminalInputBlockedSessions = new Set();",
+            "let terminalInputLockOverflow = false;",
+            "function rememberTerminalInputLock(sessionId)",
+            "terminalInputBlockedSessions.size >= MAX_TERMINAL_INPUT_LOCKS",
+            "terminalInputLockOverflow = true; // fail closed without growing memory",
+            "&& !text.includes(TERMINAL_INPUT_LOCK_OVERFLOW_NOTICE)",
+            "notices.push(TERMINAL_INPUT_LOCK_OVERFLOW_NOTICE);",
+            "&& !terminalInputLockOverflow",
+            "&& !terminalInputBlockedSessions.has(viewer.watching)",
+            "rememberTerminalInputLock(msg.session); // remember non-current terminal lock",
+            "rememberTerminalInputLock(msg.session); // terminal input lock",
+            "terminalInputBlockedSessions.delete(sessionId);",
+            "const uploadSession = pickerSession",
+            "let pickerSession = null;",
+            "let pendingUploadSelection = null;",
+            "function consumePendingUploadSelection()",
+            "consumePendingUploadSelection(); // pressure resolved",
+            "recentSentBySession.delete(msg.session); // stale pressure resolved",
+            "pickerSession = viewer.watching;",
+            "viewer.watching !== uploadSession",
+            "function cancelActiveUpload()",
+            "cancelActiveUpload(); // terminal session cannot accept upload",
+            "signal: upload.controller.signal",
+            "if (activeUpload !== upload) return;",
+            "if (nextComposerValue.length > MAX_DRAFT_CHARS)",
+            "function projectVisibility()",
+            "if (document.hidden) projectVisibility();",
+        ] {
+            assert!(
+                js.contains(marker),
+                "connection safety marker 누락: {marker}"
+            );
+        }
+        assert!(
+            js.matches("if (!isCurrentSocket(socket)) return;").count() >= 2,
+            "old socket open/message generation guard 누락"
+        );
+        assert!(
+            js.matches("if (activeUpload !== upload) return;").count() >= 3,
+            "stale upload continuation guard 누락"
+        );
+        assert!(
+            js.matches(
+                "cancelPendingUploadSelection(); // terminal pressure cannot resume pending upload"
+            )
+            .count()
+                >= 2,
+            "terminal pressure pending upload cancel 누락"
+        );
+        let set_note = js
+            .split("function setComposerNote(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n  }\n").next())
+            .expect("setComposerNote body 없음");
+        for marker in [
+            "composerRecoveryWarningSession === composerSession",
+            "composerNote.textContent = message;",
+        ] {
+            assert!(
+                set_note.contains(marker),
+                "setComposerNote recovery 합성 marker 누락: {marker}"
+            );
+        }
+    }
+
+    #[test]
+    fn 전체화면_렌더러는_visual_viewport와_단일_frame_스케줄러를_사용한다() {
+        let js = std::str::from_utf8(APP_JS).unwrap();
+        for marker in [
+            "function scheduleViewerRender()",
+            "function scheduleViewportSettle()",
+            "function cancelScheduledViewerRender()",
+            "function scheduleViewerRenderForLayoutChange(",
+            "if (!viewer.watching) return; // do not arm settle after close",
+            "cancelScheduledViewerRender(); // central viewer close",
+            "scheduleViewerRender(); // first full-screen frame",
+            "requestAnimationFrame",
+            "window.visualViewport",
+            "visualViewport.addEventListener('resize'",
+            "visualViewport.addEventListener('scroll'",
+            "new ResizeObserver",
+            "visualViewport.offsetLeft",
+            "visualViewport.width",
+            "visualViewport.scale",
+            "viewer.el.style.setProperty('--viewer-left'",
+            "viewer.el.style.setProperty('--viewer-width'",
+            "viewer.el.style.setProperty('--viewer-controls-max-height'",
+            "viewer.el.style.setProperty('--viewer-composer-max-height'",
+            "availableHeight / (screen.rows * CELL_ASPECT_RATIO)",
+            "const MAX_CANVAS_PIXELS = 8 * 1024 * 1024",
+            "viewerScreenRevision += 1",
+            "if (renderKey === lastViewerRenderKey) return;",
+            "ctx.setTransform(dpr, 0, 0, dpr, 0, 0)",
+            "if (window.visualViewport && window.visualViewport.scale > 1.01) {",
+            "return; // native pan while zoomed",
+            "if (e.ctrlKey) return; // preserve browser pinch zoom",
+        ] {
+            assert!(
+                js.contains(marker),
+                "viewport renderer marker 누락: {marker}"
+            );
+        }
+        assert!(
+            !js.contains("drawScreen()"),
+            "legacy direct drawScreen call이 남아 있음"
+        );
+        assert!(
+            !js.contains("if (hasViewerResizeObserver) return;"),
+            "ResizeObserver callback은 현재 paint 뒤 frame이라 layout change immediate schedule을 생략하면 안 됨"
+        );
+        assert!(
+            js.matches("scheduleViewerRenderForLayoutChange(previousWrapHeight);")
+                .count()
+                >= 2,
+            "composer layout change scheduler 연결 누락"
+        );
+        let css = std::str::from_utf8(APP_CSS).unwrap();
+        for marker in [
+            "max-height: var(--viewer-controls-max-height",
+            "overflow-y: auto;",
+            "max-height: var(--viewer-composer-max-height",
+            "touch-action: pan-x pan-y pinch-zoom;",
+        ] {
+            assert!(
+                css.contains(marker),
+                "short viewport controls marker 누락: {marker}"
+            );
+        }
+        let viewer_canvas_css = css
+            .split(".viewer-wrap canvas {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("viewer canvas CSS block 없음");
+        assert!(
+            !viewer_canvas_css.contains("touch-action: none"),
+            "viewer canvas가 native pinch zoom을 차단함"
+        );
+    }
+
+    #[test]
     fn 토큰_일치는_앱셸_200() {
         let response = respond("/", &format!("token={TOKEN}"), TOKEN);
         assert_eq!(response.status, 200);

@@ -298,8 +298,17 @@ impl AgentTerminalUi {
         claude_usage: Option<crate::app::ProviderUsage>,
         codex_usage: Option<crate::app::ProviderUsage>,
         codex_meta: Option<crate::ui::agent_sessions::CodexUsageMeta>,
-        // `kimi_usage`: Kimi를 쓰는 사용자에게만 Some. None이면 칸 자체를 안 그린다.
-        kimi_usage: Option<crate::app::ProviderUsage>,
+        // 바깥 `Option`은 Kimi 설치 감지, 안쪽 `Option`은 숫자 조회 결과다.
+        // `Some(None)`이면 조회 중/실패 자리표시자를 유지하고 `None`이면 칸을 숨긴다.
+        kimi_usage: Option<Option<crate::app::ProviderUsage>>,
+        // 바깥 `Option`은 Grok 설치 감지, 안쪽 `Option`은 숫자 조회 결과다.
+        // `Some(None)`이면 조회 중/실패 자리표시자를 유지하고 `None`이면 칸을 숨긴다.
+        grok_usage: Option<Option<crate::grok_usage::GrokUsage>>,
+        // `disabled_agents`: 런처 카드 스위치로 끈 에이전트 id 목록. usage 값과는
+        // 분리된 신호다 — "켜짐인데 값 없음"(Claude·Codex·감지된 Grok은 「—」로 자리를 지킨다)과
+        // "꺼짐"(모든 칸이 사라진다)을 값 하나로는 구분할 수 없기 때문이다
+        // (`crate::app::top_provider_usage`가 이 둘을 여기서 갈라 그린다).
+        disabled_agents: &[String],
         rows: &[ActivityWorkspaceRow],
         approvals: usize,
         // `waiting_sessions`: 입력 대기 세션 — (표시 라벨, 이동 대상). 칩으로 직접 노출한다.
@@ -330,14 +339,23 @@ impl AgentTerminalUi {
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
                 ui.add_space(10.0);
-                crate::app::top_provider_usage(
+                // 칸이 하나도 없으면 상자도 이 뒤의
+                // 구분선도 그리지 않는다 — 반환값이 그 신호다(app.rs 주석 참고).
+                let usage_shown = crate::app::top_provider_usage(
                     ui,
-                    claude_usage,
-                    codex_usage,
-                    codex_meta.as_ref(),
-                    kimi_usage,
+                    crate::app::ProviderUsageInputs {
+                        claude: claude_usage,
+                        codex: codex_usage,
+                        codex_meta: codex_meta.as_ref(),
+                        kimi: kimi_usage,
+                        grok: grok_usage,
+                    },
+                    disabled_agents,
+                    catalog,
                 );
-                crate::ui::designall::vertical_separator(ui, 14.0);
+                if usage_shown {
+                    crate::ui::designall::vertical_separator(ui, 14.0);
+                }
                 ui.weak(catalog.t(
                     "status_bar.sessions",
                     &[("count", &totals.sessions.to_string())],
@@ -951,22 +969,26 @@ pub(crate) fn paint_announcement_provider_logo(ui: &mut egui::Ui, rect: egui::Re
         }
         "Grok" => {
             let color = egui::Color32::from_rgb(0xa5, 0x70, 0xff);
-            let stroke = egui::Stroke::new(2.0, color);
+            let stroke = egui::Stroke::new(2.0 * scale, color);
             painter.line_segment(
                 [
-                    center + egui::vec2(-7.0, 7.0),
-                    center + egui::vec2(7.0, -7.0),
+                    center + egui::vec2(-7.0 * scale, 7.0 * scale),
+                    center + egui::vec2(7.0 * scale, -7.0 * scale),
                 ],
                 stroke,
             );
             painter.line_segment(
                 [
-                    center + egui::vec2(-5.0, -6.0),
-                    center + egui::vec2(5.0, 6.0),
+                    center + egui::vec2(-5.0 * scale, -6.0 * scale),
+                    center + egui::vec2(5.0 * scale, 6.0 * scale),
                 ],
                 stroke,
             );
-            painter.circle_stroke(center + egui::vec2(4.0, -4.0), 3.0, stroke);
+            painter.circle_stroke(
+                center + egui::vec2(4.0 * scale, -4.0 * scale),
+                3.0 * scale,
+                stroke,
+            );
         }
         "Hugging Face" => {
             let yellow = egui::Color32::from_rgb(0xf4, 0xc4, 0x30);
@@ -1303,6 +1325,39 @@ mod tests {
     }
 
     #[test]
+    fn grok_상태바_로고는_claude_codex와_같은_시각크기다() {
+        fn visual_bounds(source: &str) -> egui::Rect {
+            let context = egui::Context::default();
+            let logo_rect =
+                egui::Rect::from_min_size(egui::pos2(40.0, 40.0), egui::vec2(14.5, 14.5));
+            let output = context.run_ui(egui::RawInput::default(), |ui| {
+                paint_announcement_provider_logo(ui, logo_rect, source);
+            });
+            output
+                .shapes
+                .iter()
+                .filter_map(|clipped| match &clipped.shape {
+                    egui::Shape::LineSegment { .. } | egui::Shape::Circle(_) => {
+                        Some(clipped.shape.visual_bounding_rect())
+                    }
+                    _ => None,
+                })
+                .fold(egui::Rect::NOTHING, |bounds, shape| bounds | shape)
+        }
+
+        let grok = visual_bounds("Grok");
+        let claude = visual_bounds("Claude");
+        let codex = visual_bounds("Codex");
+        let peer_min = claude.width().min(codex.width());
+        let peer_max = claude.width().max(codex.width());
+
+        assert!(
+            (peer_min - 0.5..=peer_max + 0.5).contains(&grok.width()),
+            "Grok={grok:?}, Claude={claude:?}, Codex={codex:?}"
+        );
+    }
+
+    #[test]
     fn kittest_하단상태바에는_서비스_점등이_없다_레일로_이동() {
         use egui_kittest::kittest::Queryable;
 
@@ -1318,6 +1373,8 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
+                    &[],
                     &[],
                     2,
                     &[],
@@ -1358,6 +1415,235 @@ mod tests {
         harness.get_by_label("Ports —");
     }
 
+    /// 표: 켜짐+값 있음 → 값, 켜짐+값 없음 → 모든 감지된 provider는 "—"로 자리 유지,
+    /// 미감지 또는 꺼짐 → 해당 칸 없음.
+    /// 로고는 `paint_announcement_provider_logo`가 "{provider} logo"로 라벨을 다는
+    /// `Image` 위젯이라, 칸이 그려졌는지를 클릭 없이도 값으로 확인할 수 있다.
+    #[test]
+    fn kittest_사용량_바_칸은_켜짐_값없음과_꺼짐을_구분해_그린다() {
+        use egui_kittest::kittest::Queryable;
+
+        let some_usage: Option<crate::app::ProviderUsage> = Some((Some(10), Some(20)));
+
+        fn run(
+            claude: Option<crate::app::ProviderUsage>,
+            codex: Option<crate::app::ProviderUsage>,
+            kimi: Option<Option<crate::app::ProviderUsage>>,
+            grok: Option<Option<crate::grok_usage::GrokUsage>>,
+            disabled: Vec<String>,
+        ) -> egui_kittest::Harness<'static, bool> {
+            run_at_width(claude, codex, kimi, grok, disabled, 1400.0)
+        }
+
+        fn run_at_width(
+            claude: Option<crate::app::ProviderUsage>,
+            codex: Option<crate::app::ProviderUsage>,
+            kimi: Option<Option<crate::app::ProviderUsage>>,
+            grok: Option<Option<crate::grok_usage::GrokUsage>>,
+            disabled: Vec<String>,
+            width: f32,
+        ) -> egui_kittest::Harness<'static, bool> {
+            let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+            let mut harness = egui_kittest::Harness::new_ui_state(
+                move |ui, fonts_ready| {
+                    if !*fonts_ready {
+                        return;
+                    }
+                    AgentTerminalUi::new().status_bar_with_managers(
+                        ui,
+                        claude,
+                        codex,
+                        None,
+                        kimi,
+                        grok,
+                        &disabled,
+                        &[],
+                        0,
+                        &[],
+                        &[],
+                        StatusBarApprovals {
+                            pending: &[],
+                            workspace_names: &HashMap::new(),
+                            session_titles: &HashMap::new(),
+                        },
+                        0,
+                        None,
+                        &HashMap::new(),
+                        None,
+                        0,
+                        &catalog,
+                    );
+                },
+                false,
+            );
+            harness.set_size(egui::vec2(width, 100.0));
+            install_sidebar_test_fonts(&harness.ctx);
+            *harness.state_mut() = true;
+            harness.run();
+            harness
+        }
+
+        // 켜짐+값 없음(Claude/Kimi/Grok) / 켜짐+값 있음(Codex).
+        let harness = run(None, some_usage, Some(None), Some(None), Vec::new());
+        assert!(
+            harness.query_by_label("Anthropic logo").is_some(),
+            "값이 없어도 켜져 있으면 Claude 칸은 남아야 한다"
+        );
+        assert!(
+            harness.query_by_label("Codex logo").is_some(),
+            "값이 있으면 Codex 칸이 그려져야 한다"
+        );
+        assert!(
+            harness.query_by_label("Kimi logo").is_some(),
+            "감지된 Kimi는 값을 불러오지 못해도 칸을 유지해야 한다"
+        );
+        harness.get_by_label("Kimi usage —");
+        assert!(
+            harness.query_by_label("Grok logo").is_some(),
+            "Grok은 값을 불러오는 중이어도 Codex 옆의 칸을 유지해야 한다"
+        );
+
+        // 꺼짐이 "값 있음"보다 우선한다 — Claude를 꺼도 값은 여전히 있다.
+        let harness = run(
+            some_usage,
+            some_usage,
+            None,
+            None,
+            vec!["claude".to_owned()],
+        );
+        assert!(
+            harness.query_by_label("Anthropic logo").is_none(),
+            "꺼진 Claude는 값이 있어도 칸이 사라져야 한다"
+        );
+        assert!(harness.query_by_label("Codex logo").is_some());
+
+        // 꺼짐이 Kimi의 "값 있으면 보인다" 규칙보다도 우선한다.
+        let harness = run(
+            None,
+            some_usage,
+            Some(some_usage),
+            None,
+            vec!["kimi".to_owned()],
+        );
+        assert!(
+            harness.query_by_label("Kimi logo").is_none(),
+            "꺼진 Kimi는 값이 있어도 칸이 사라져야 한다"
+        );
+
+        // 모든 provider를 끄면 Grok 값도 없고 로고가 하나도 안 남는다 — 칸이 0개일 때
+        // 빈 상자·구분선이 남지 않는지는 app.rs의
+        // `칸이_없으면_top_provider_usage는_아무것도_그리지_않았다고_보고한다`가
+        // 반환값으로 고정한다.
+        let harness = run(
+            some_usage,
+            some_usage,
+            Some(some_usage),
+            None,
+            vec![
+                "claude".to_owned(),
+                "codex".to_owned(),
+                "kimi".to_owned(),
+                "grok".to_owned(),
+            ],
+        );
+        assert!(harness.query_by_label("Anthropic logo").is_none());
+        assert!(harness.query_by_label("Codex logo").is_none());
+        assert!(harness.query_by_label("Kimi logo").is_none());
+        assert!(harness.query_by_label("Grok logo").is_none());
+
+        let grok = crate::grok_usage::GrokUsage {
+            weekly_remaining_percent: Some(70),
+            monthly_remaining_percent: Some(85),
+            credits_left: Some(crate::grok_usage::GrokCredits {
+                currency: crate::grok_usage::GrokCurrency::Usd,
+                minor_units: 1_234,
+            }),
+        };
+        let harness = run(None, some_usage, None, Some(Some(grok)), Vec::new());
+        assert!(harness.query_by_label("Grok logo").is_some());
+        harness.get_by_label("Grok remaining usage: W 70% · M 85% · $12.34");
+
+        let partial = crate::grok_usage::GrokUsage {
+            weekly_remaining_percent: Some(70),
+            monthly_remaining_percent: None,
+            credits_left: None,
+        };
+        let harness = run(None, some_usage, None, Some(Some(partial)), Vec::new());
+        harness.get_by_label("Grok remaining usage: W 70%");
+
+        let harness = run(None, some_usage, None, Some(None), Vec::new());
+        assert!(harness.query_by_label("Grok logo").is_some());
+        harness.get_by_label("Grok usage —");
+
+        let harness = run(None, some_usage, None, None, Vec::new());
+        assert!(
+            harness.query_by_label("Grok logo").is_none(),
+            "설치 감지가 없으면 Grok 칸을 만들면 안 된다"
+        );
+
+        let harness = run(
+            None,
+            some_usage,
+            None,
+            Some(Some(grok)),
+            vec!["grok".to_owned()],
+        );
+        assert!(harness.query_by_label("Grok logo").is_none());
+
+        // provider 순서는 언제나 Codex → Grok → Kimi다. Kimi가 켜져도 Grok이
+        // Codex 바로 옆에서 밀려나면 안 된다.
+        let harness = run(
+            None,
+            some_usage,
+            Some(some_usage),
+            Some(Some(grok)),
+            Vec::new(),
+        );
+        let codex = harness.get_by_label("Codex logo").rect();
+        let grok_rect = harness.get_by_label("Grok logo").rect();
+        let kimi = harness.get_by_label("Kimi logo").rect();
+        assert!(codex.right() < grok_rect.left());
+        assert!(grok_rect.right() < kimi.left());
+
+        // Claude/Codex가 없어도 Grok이 Kimi 왼쪽 provider 칸에 놓인다. 이 조합이
+        // Grok→Kimi 구분선 경로를 직접 지난다.
+        let harness = run(
+            None,
+            None,
+            Some(some_usage),
+            Some(Some(grok)),
+            vec!["claude".to_owned(), "codex".to_owned()],
+        );
+        let grok = harness.get_by_label("Grok logo").rect();
+        let kimi = harness.get_by_label("Kimi logo").rect();
+        assert!(kimi.left() > grok.right());
+
+        for width in [300.0, 430.0, 620.0, 810.0, 1200.0] {
+            let harness = run_at_width(
+                some_usage,
+                some_usage,
+                Some(some_usage),
+                Some(Some(crate::grok_usage::GrokUsage {
+                    weekly_remaining_percent: Some(70),
+                    monthly_remaining_percent: Some(85),
+                    credits_left: Some(crate::grok_usage::GrokCredits {
+                        currency: crate::grok_usage::GrokCurrency::Usd,
+                        minor_units: 1_234,
+                    }),
+                })),
+                Vec::new(),
+                width,
+            );
+            for provider in ["Anthropic logo", "Codex logo", "Grok logo", "Kimi logo"] {
+                let rect = harness.get_by_label(provider).rect();
+                assert!(
+                    rect.left() >= 0.0 && rect.right() <= width,
+                    "{provider}가 {width}pt 상태바 밖으로 잘렸다: {rect:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn kittest_에이전트_단축키_실패가_상태바에_보인다() {
         use egui_kittest::kittest::Queryable;
@@ -1376,6 +1662,8 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
+                    &[],
                     &[],
                     0,
                     &[],
@@ -1431,6 +1719,8 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
+                    &[],
                     &[],
                     2,
                     &[],
@@ -1511,6 +1801,8 @@ mod tests {
                         None,
                         None,
                         None,
+                        None,
+                        &[],
                         &[],
                         approvals,
                         &[],
@@ -1566,6 +1858,8 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
+                    &[],
                     &[],
                     // 승인이 0건 — 마지막 건을 방금 처리한 상황이다.
                     0,
@@ -1626,6 +1920,8 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
+                    &[],
                     &[],
                     0,
                     &waiting,
@@ -1685,6 +1981,8 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
+                    &[],
                     &[],
                     0,
                     &[],
@@ -1739,6 +2037,8 @@ mod tests {
                         None,
                         None,
                         None,
+                        None,
+                        &[],
                         &[],
                         0,
                         &[],
@@ -1818,6 +2118,8 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
+                    &[],
                     &[],
                     0,
                     &[],

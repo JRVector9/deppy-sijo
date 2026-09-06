@@ -18,6 +18,17 @@ use crate::config::TerminalConfig;
 
 /// 경로 해석 캐시 TTL. 실제 filesystem/process 조회는 App host가 수행한다.
 const PATH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+/// 창(pane) 리사이즈 드래그 중 PTY resize를 보내기 전에 목표 크기가 안정될 때까지
+/// 기다리는 디바운스 시간. 드래그 중에는 매 프레임 avail 크기가 바뀌어 목표 cols/rows도
+/// 계속 바뀌는데, 그때마다 그대로 PTY에 보내면 alacritty가 매번 실제로 grid를 reflow하고
+/// 자식 프로세스에 SIGWINCH를 보내 화면을 다시 그리게 만든다 — 드래그 중 화면이 계속
+/// 다시 그려지는 것이 사용자에게 깜빡임으로 보인다(2026-08-18 사용자 보고). 목표가 이
+/// 시간만큼 안 바뀌어야 그 순간의 최종 목표를 정확히 한 번 보낸다.
+const RESIZE_DRAG_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(120);
+const RESIZE_VIEWPORT_QUIET: std::time::Duration = std::time::Duration::from_millis(32);
+const RESIZE_VIEWPORT_HARD_DEADLINE: std::time::Duration = std::time::Duration::from_millis(250);
+const PROTOCOL_RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(16);
+const PROTOCOL_RETRY_LIMIT: u8 = 6;
 const WORKSPACE_IO_QUEUE_CAP: usize = 1;
 const WORKSPACE_PATH_MAX_BYTES: usize = 32 * 1024;
 const WORKSPACE_URL_MAX_BYTES: usize = 32 * 1024;
@@ -223,6 +234,15 @@ impl fmt::Debug for WorkspaceNotice {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct WorkspaceProtocolOperation(u64);
 
+#[cfg(test)]
+impl WorkspaceProtocolOperation {
+    /// 테스트에서만 쓰는 생성자 — 필드가 비공개라 App 쪽 테스트가 프로토콜 경로를
+    /// 재현할 수 없었다(2026-08-21).
+    pub(crate) fn for_test(raw: u64) -> Self {
+        Self(raw)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkspaceProtocolErrorCode {
     Busy,
@@ -367,7 +387,6 @@ fn workspace_protocol_command_is_valid(
             tab, path, ratio, ..
         } => {
             if id_is_valid(&tab.0)
-                && !path.is_empty()
                 && path.len() <= WORKSPACE_PROTOCOL_SPLIT_PATH_MAX_ITEMS
                 && path.iter().all(|part| *part <= 1)
                 && ratio.is_finite()
@@ -406,7 +425,14 @@ fn workspace_protocol_command_is_valid(
 
 // 각 split leaf가 독립 터미널이 되는 패널형 구조. 헤더는 한 줄로 얇게 유지하고
 // PTY는 외곽 카드 여백 없이 패널 면을 채운다.
-const TERMINAL_PANE_HEADER_HEIGHT: f32 = 32.0;
+/// pane 헤더(세션·문서 탭 줄)의 높이. 32 → 30 → 29로 줄였다(2026-08-22 사용자 요청) —
+/// 탭 줄이 화면에서 차지하는 몫을 줄여 본문에 돌려준다.
+const TERMINAL_PANE_HEADER_HEIGHT: f32 = 29.0;
+/// 각 terminal leaf가 분할 축에서 유지하는 최소 logical pixel 크기.
+/// 좌/우 분할에는 너비, 상/하 분할에는 높이로 적용한다.
+const TERMINAL_PANE_MIN_SIZE: f32 = 50.0;
+/// pane 사이의 실제 구분선 폭. 최소 크기와 split 배치가 같은 값을 공유해야 한다.
+const TERMINAL_SPLIT_GAP: f32 = 1.0;
 const TERMINAL_STREAM_LEFT_PADDING: f32 = 3.0;
 const TERMINAL_STREAM_RIGHT_PADDING: f32 = 3.0;
 const TERMINAL_STREAM_VERTICAL_PADDING: f32 = 6.0;
@@ -530,7 +556,7 @@ struct PaneDropFeedbackLabelLayout {
 fn layout_pane_drop_feedback_label(
     painter: &egui::Painter,
     pane_rect: egui::Rect,
-    label: &str,
+    label: impl Into<String>,
     style: PaneDropFeedbackStyle,
 ) -> Option<PaneDropFeedbackLabelLayout> {
     let margin = 8.0;
@@ -541,7 +567,7 @@ fn layout_pane_drop_feedback_label(
     }
 
     let mut job = egui::text::LayoutJob::single_section(
-        label.to_owned(),
+        label.into(),
         egui::TextFormat {
             font_id: egui::FontId::proportional(13.0),
             color: style.label_text,
@@ -707,6 +733,172 @@ fn terminal_pane_layout_for_state(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TerminalLayoutMetric {
+    min_size: egui::Vec2,
+    /// preorder 벡터에서 이 node와 모든 descendant가 차지하는 항목 수.
+    subtree_len: usize,
+}
+
+/// layout 전체의 minimum을 재귀 반환값으로 한 번만 계산해 preorder 벡터에 기록한다.
+/// render도 같은 순서로 순회하므로 HashMap이나 node별 재귀 재계산 없이 자식 metric을
+/// O(1)에 찾는다. 기존의 매-frame `LayoutNode::clone`도 이 compact 벡터로 대체한다.
+fn terminal_layout_metrics(node: &LayoutNode) -> Vec<TerminalLayoutMetric> {
+    fn append(node: &LayoutNode, metrics: &mut Vec<TerminalLayoutMetric>) -> TerminalLayoutMetric {
+        let index = metrics.len();
+        metrics.push(TerminalLayoutMetric {
+            min_size: egui::Vec2::ZERO,
+            subtree_len: 1,
+        });
+
+        let metric = match node {
+            LayoutNode::Pane(_) => TerminalLayoutMetric {
+                min_size: egui::vec2(TERMINAL_PANE_MIN_SIZE, TERMINAL_PANE_MIN_SIZE),
+                subtree_len: 1,
+            },
+            LayoutNode::Split {
+                direction,
+                first,
+                second,
+                ..
+            } => {
+                let first = append(first, metrics);
+                let second = append(second, metrics);
+                let min_size = match direction {
+                    SplitDirection::Horizontal => egui::vec2(
+                        first.min_size.x + TERMINAL_SPLIT_GAP + second.min_size.x,
+                        first.min_size.y.max(second.min_size.y),
+                    ),
+                    SplitDirection::Vertical => egui::vec2(
+                        first.min_size.x.max(second.min_size.x),
+                        first.min_size.y + TERMINAL_SPLIT_GAP + second.min_size.y,
+                    ),
+                };
+                TerminalLayoutMetric {
+                    min_size,
+                    subtree_len: 1 + first.subtree_len + second.subtree_len,
+                }
+            }
+        };
+        metrics[index] = metric;
+        metric
+    }
+
+    let mut metrics = Vec::new();
+    append(node, &mut metrics);
+    metrics
+}
+
+#[cfg(test)]
+fn terminal_layout_min_size(node: &LayoutNode) -> egui::Vec2 {
+    terminal_layout_metrics(node)[0].min_size
+}
+
+fn terminal_split_gap(rect: egui::Rect, direction: SplitDirection) -> f32 {
+    let axis_extent = match direction {
+        SplitDirection::Horizontal => rect.width(),
+        SplitDirection::Vertical => rect.height(),
+    };
+    if axis_extent <= TERMINAL_SPLIT_GAP {
+        axis_extent.max(0.0)
+    } else {
+        TERMINAL_SPLIT_GAP
+    }
+}
+
+/// 저장 ratio와 드래그 preview를 현재 rect의 실제 px minimum으로 제한한다.
+///
+/// 창이 subtree minimum보다 작으면 50px 보장은 물리적으로 불가능하다. 이 경우 한쪽을
+/// 임의로 굶기지 않고 두 subtree가 요구하는 크기에 비례해 가용 공간을 나눈다.
+fn terminal_split_ratio(
+    rect: egui::Rect,
+    direction: SplitDirection,
+    requested_ratio: f32,
+    first_min: egui::Vec2,
+    second_min: egui::Vec2,
+) -> f32 {
+    let (axis_extent, first_min, second_min) = match direction {
+        SplitDirection::Horizontal => (rect.width(), first_min.x, second_min.x),
+        SplitDirection::Vertical => (rect.height(), first_min.y, second_min.y),
+    };
+    let available = (axis_extent - terminal_split_gap(rect, direction)).max(0.0);
+    let required = first_min + second_min;
+
+    if available < required {
+        return first_min / required;
+    }
+
+    let requested_ratio = if requested_ratio.is_finite() {
+        requested_ratio
+    } else {
+        0.5
+    };
+    let min_ratio = first_min / available;
+    let max_ratio = 1.0 - second_min / available;
+    if min_ratio >= max_ratio {
+        // available == required인 비대칭 subtree는 서로 다른 f32 연산 반올림 때문에
+        // min_ratio가 max_ratio보다 1 ULP 커질 수 있다. f32::clamp는 그때 panic하므로
+        // 정확한 minimum 비율로 수렴시킨다.
+        return first_min / required;
+    }
+    requested_ratio.clamp(min_ratio, max_ratio)
+}
+
+fn terminal_split_rects(
+    rect: egui::Rect,
+    direction: SplitDirection,
+    ratio: f32,
+) -> (egui::Rect, egui::Rect, egui::Rect) {
+    let gap = terminal_split_gap(rect, direction);
+    let ratio = if ratio.is_finite() {
+        ratio.clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
+
+    match direction {
+        SplitDirection::Horizontal => {
+            let split_x = rect.min.x + (rect.width() - gap).max(0.0) * ratio;
+            (
+                egui::Rect::from_min_max(rect.min, egui::pos2(split_x, rect.max.y)),
+                egui::Rect::from_min_max(egui::pos2(split_x + gap, rect.min.y), rect.max),
+                egui::Rect::from_min_max(
+                    egui::pos2(split_x, rect.min.y),
+                    egui::pos2(split_x + gap, rect.max.y),
+                ),
+            )
+        }
+        SplitDirection::Vertical => {
+            let split_y = rect.min.y + (rect.height() - gap).max(0.0) * ratio;
+            (
+                egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, split_y)),
+                egui::Rect::from_min_max(egui::pos2(rect.min.x, split_y + gap), rect.max),
+                egui::Rect::from_min_max(
+                    egui::pos2(rect.min.x, split_y),
+                    egui::pos2(rect.max.x, split_y + gap),
+                ),
+            )
+        }
+    }
+}
+
+fn terminal_split_hit_rect(
+    parent: egui::Rect,
+    gap_rect: egui::Rect,
+    direction: SplitDirection,
+) -> egui::Rect {
+    gap_rect
+        .expand2(match direction {
+            SplitDirection::Horizontal => egui::vec2(2.0, 0.0),
+            SplitDirection::Vertical => egui::vec2(0.0, 2.0),
+        })
+        .intersect(parent)
+}
+
+fn split_handle_id(tab: &runtime::MuxTabId, path: &[u8]) -> egui::Id {
+    egui::Id::new(("split_handle", tab, path))
+}
+
 /// layout 트리의 pane을 배치 순서대로 모은다.
 fn layout_panes<'a>(node: &'a LayoutNode, out: &mut Vec<&'a runtime::MuxPaneId>) {
     match node {
@@ -721,12 +913,14 @@ fn layout_panes<'a>(node: &'a LayoutNode, out: &mut Vec<&'a runtime::MuxPaneId>)
 /// 보조 탭을 붙일 pane — focused pane이 이 layout 안에 있으면 그것, 없으면 첫 pane.
 fn aux_tab_owner_pane(
     layout: &LayoutNode,
+    pending: Option<&runtime::MuxPaneId>,
     focused: Option<&runtime::MuxPaneId>,
 ) -> Option<runtime::MuxPaneId> {
     let mut panes = Vec::new();
     layout_panes(layout, &mut panes);
-    focused
+    pending
         .filter(|id| panes.contains(id))
+        .or_else(|| focused.filter(|id| panes.contains(id)))
         .or_else(|| panes.first().copied())
         .cloned()
 }
@@ -742,11 +936,49 @@ const PANE_HEADER_TOOLBAR_GAP: f32 = 2.0;
 /// 제목의 좌측 원점. 예전 17px는 앞의 포커스 점(중심 8, 반지름 4)을 피한 값이었다 —
 /// 점을 지웠으니 그 자리를 되돌린다. pane_header_buttons와 render_pane_header가
 /// **같은 값**을 써야 닫기 버튼 위치와 제목 폭 계산이 어긋나지 않는다.
-const PANE_HEADER_TITLE_LEFT: f32 = 10.0;
+/// 헤더 탭 제목의 왼쪽 들여쓰기. 문서 툴바가 이 값에 자기 라벨을 맞춘다
+/// (`ui::document::toolbar`) — 둘이 따로 놀면 툴바가 헤더와 어긋나 보인다.
+pub(crate) const PANE_HEADER_TITLE_LEFT: f32 = 10.0;
+
+/// 문서 탭 하나를 식별하는 안정 id(멀티 문서 탭 설계 §1) — 헤더에서의 위치(인덱스)가
+/// 아니다. 인덱스는 탭이 닫히면 밀려서 조용히 어긋난다. App이 한 번 배정하면 그
+/// 문서가 열려 있는 동안 바뀌지 않고, 닫힌 뒤에도 재사용하지 않는다(닫힌 문서의
+/// 지연 IO 결과가 같은 id를 재사용한 새 문서에 잘못 적용되는 걸 막는다).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct DocumentTabId(pub u32);
+
+/// 보조 탭 종류 — 헤더에 붙는 순서이자 hover 문구 키의 근거다.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaneAuxTabKind {
+    History,
+    Git,
+    /// md·txt 등 문서를 pane 본문 전체에 연다(설계 §1) — 이력·Git과 같은 기구를 쓴다.
+    /// 문서는 여러 개를 동시에 열 수 있어(멀티 문서 탭 설계) id로 어느 것인지 구분한다.
+    Document(DocumentTabId),
+}
+
+impl PaneAuxTabKind {
+    fn hint_key(self) -> &'static str {
+        match self {
+            Self::History => "workspace.tab.history_hint",
+            Self::Git => "workspace.tab.git_hint",
+            Self::Document(_) => "workspace.tab.document_hint",
+        }
+    }
+
+    fn close_key(self) -> &'static str {
+        match self {
+            Self::History => "workspace.tab.history_close",
+            Self::Git => "workspace.tab.git_close",
+            Self::Document(_) => "workspace.tab.document_close",
+        }
+    }
+}
 
 /// 세션 헤더 옆에 붙는 보조 탭의 표시 상태 — App이 소유하고 매 프레임 넘긴다.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PaneAuxTab {
+    pub kind: PaneAuxTabKind,
     pub label: String,
     pub active: bool,
 }
@@ -761,6 +993,59 @@ pub enum PaneAuxTabIntent {
     ShowSession,
     /// 보조 탭 X — UI 탭만 닫는다.
     Close,
+}
+
+/// 현재 세션 pane 헤더 옆에 붙는 **보조 UI 탭**의 상태.
+///
+/// runtime의 `MuxTabId`/pane과 무관하다 — 이 상태가 바뀌어도 PTY·세션·mux 탭은
+/// 생성되거나 종료되지 않는다. 세션 X와 보조 탭 X가 서로 다른 동작인 이유다.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PaneAuxTabState {
+    #[default]
+    Closed,
+    OpenInactive,
+    OpenActive,
+}
+
+impl PaneAuxTabState {
+    /// 탭 chrome이 헤더에 존재하는지. `Closed`면 세션 헤더는 예전 그대로다.
+    pub fn is_open(self) -> bool {
+        self != Self::Closed
+    }
+
+    pub fn is_active(self) -> bool {
+        self == Self::OpenActive
+    }
+
+    /// 레일 「보조 탭」 클릭 — 닫혀 있으면 열고 활성화, 이미 활성이면 세션으로 돌아가되
+    /// 탭은 남긴다.
+    pub fn on_rail_click(self) -> Self {
+        match self {
+            Self::Closed | Self::OpenInactive => Self::OpenActive,
+            Self::OpenActive => Self::OpenInactive,
+        }
+    }
+
+    /// 보조 탭 클릭 — 열려 있을 때만 활성화한다.
+    pub fn on_tab_click(self) -> Self {
+        match self {
+            Self::Closed => Self::Closed,
+            Self::OpenInactive | Self::OpenActive => Self::OpenActive,
+        }
+    }
+
+    /// 세션 탭 클릭 — 터미널을 보여주되 보조 탭은 유지한다.
+    pub fn on_session_tab_click(self) -> Self {
+        match self {
+            Self::Closed => Self::Closed,
+            Self::OpenInactive | Self::OpenActive => Self::OpenInactive,
+        }
+    }
+
+    /// 보조 탭 X — UI 탭만 제거한다. 세션에는 어떤 종료 명령도 보내지 않는다.
+    pub fn on_close(self) -> Self {
+        Self::Closed
+    }
 }
 
 /// 보조 탭 라벨 좌측 여백·라벨과 닫기 중심 간격·닫기 뒤 여백. 세션 탭이 쓰는 값과
@@ -783,9 +1068,11 @@ fn pane_aux_tab_width(label_width: f32) -> f32 {
 }
 
 /// 보조 탭이 헤더 절반을 넘지 않게 라벨 폭을 자른다. 좁은 폭 우선순위 1은 **세션 제목
-/// 최소 폭**이라, 보조 탭이 먼저 양보한다.
-fn pane_aux_tab_label_width(header_width: f32, natural_label_width: f32) -> f32 {
-    let budget = (header_width * 0.5 - pane_aux_tab_width(0.0)).max(PANE_AUX_TAB_MIN_LABEL);
+/// 최소 폭**이라, 보조 탭이 먼저 양보한다. 탭이 여럿이면 절반 예산을 탭 수로 나눠 쓴다
+/// (탭 1개일 때는 `count == 1`이라 기존 계산과 정확히 같다).
+fn pane_aux_tab_label_width(header_width: f32, natural_label_width: f32, tab_count: usize) -> f32 {
+    let count = tab_count.max(1) as f32;
+    let budget = (header_width * 0.5 / count - pane_aux_tab_width(0.0)).max(PANE_AUX_TAB_MIN_LABEL);
     natural_label_width.max(0.0).min(budget)
 }
 
@@ -800,19 +1087,23 @@ struct PaneAuxTabGeometry {
     close: Option<egui::Rect>,
 }
 
-/// 세션 닫기(×) 오른쪽에 보조 탭을 놓는다 — 시작점은 세션 탭의 accent 경계와 같다.
+/// 세션 닫기(×) 오른쪽에 보조 탭을 놓는다 — 시작점은 세션 탭의 accent 경계(또는 그
+/// 앞에 이미 놓인 보조 탭의 오른쪽 끝)다. 여러 탭을 이어 붙일 때는 `left`를 호출부가
+/// 직접 관리한다(`layout_aux_tabs` 참고).
 ///
-/// 좁은 폭에서는 순서대로 양보한다: 닫기(×)를 먼저 버리고, 최소 라벨 폭조차 없으면
-/// 탭 자체를 만들지 않는다(레일로 계속 전환할 수 있다). 어떤 경우에도 `toolbar_left`나
-/// 헤더 오른쪽 끝을 넘지 않는다.
+/// 좁은 폭에서는 순서대로 양보한다: `include_close`가 꺼져 있으면(호출부의 축약
+/// 우선순위 판단) 애초에 닫기를 만들지 않는다. `include_close`가 켜져 있어도 자리가
+/// 없으면(다음 탭이 밀려 들어와 이 탭 몫이 줄었을 때) 닫기만 접는다. 최소 라벨 폭조차
+/// 없으면 탭 자체를 만들지 않는다(레일로 계속 전환할 수 있다). 어떤 경우에도
+/// `toolbar_left`나 헤더 오른쪽 끝을 넘지 않는다.
 fn pane_aux_tab_geometry(
     header: egui::Rect,
-    session_close: egui::Rect,
+    left: f32,
     toolbar_left: f32,
     label_width: f32,
+    include_close: bool,
 ) -> Option<PaneAuxTabGeometry> {
     let center_y = header.center().y;
-    let left = pane_header_active_boundary(header, session_close);
     let limit = toolbar_left.min(header.right());
     let label_left = left + PANE_AUX_TAB_LABEL_LEFT;
     let label_width = label_width.min(limit - PANE_AUX_TAB_RIGHT_PAD - label_left);
@@ -820,7 +1111,8 @@ fn pane_aux_tab_geometry(
         return None;
     }
     let close_center_x = label_left + label_width + PANE_AUX_TAB_CLOSE_GAP;
-    let close = (close_center_x + PANE_AUX_TAB_CLOSE_SIZE * 0.5 + PANE_AUX_TAB_RIGHT_PAD <= limit)
+    let close = (include_close
+        && close_center_x + PANE_AUX_TAB_CLOSE_SIZE * 0.5 + PANE_AUX_TAB_RIGHT_PAD <= limit)
         .then(|| {
             egui::Rect::from_center_size(
                 egui::pos2(close_center_x, center_y),
@@ -838,6 +1130,125 @@ fn pane_aux_tab_geometry(
         label_width,
         close,
     })
+}
+
+/// 배치된 보조 탭 하나 — 기하까지 계산이 끝난 뒤의 결과다.
+#[derive(Clone, Debug, PartialEq)]
+struct AuxTabPlacement {
+    kind: PaneAuxTabKind,
+    label: String,
+    active: bool,
+    geometry: PaneAuxTabGeometry,
+}
+
+/// 비활성 탭만, 축약 우선순위(멀티 문서 탭 설계 §5)로 나열한다 — 비활성 문서를
+/// 오른쪽(탭 스트립에서 나중에 오는 것)부터, 그다음 Git(비활성이면), 그다음
+/// 이력(비활성이면). **활성 탭은 이 목록에 절대 포함되지 않는다** — ⓑ(탭을 통째로
+/// 빼기)가 이 순서를 그대로 쓰므로, 활성 탭은 탭 자체가 빠지는 일이 없다(새 불변식).
+/// 문서가 먼저인 이유는 그대로다: 파일명이 라벨이라 길고, 닫기가 툴바에도 있다.
+fn aux_tab_inactive_priority(tabs: &[&PaneAuxTab]) -> Vec<PaneAuxTabKind> {
+    let mut order: Vec<PaneAuxTabKind> = tabs
+        .iter()
+        .rev()
+        .filter(|tab| !tab.active && matches!(tab.kind, PaneAuxTabKind::Document(_)))
+        .map(|tab| tab.kind)
+        .collect();
+    for target in [PaneAuxTabKind::Git, PaneAuxTabKind::History] {
+        if let Some(tab) = tabs.iter().find(|tab| !tab.active && tab.kind == target) {
+            order.push(tab.kind);
+        }
+    }
+    order
+}
+
+/// ⓐ(×부터 빼기) 순서 — `aux_tab_inactive_priority` 뒤에 활성 탭을 하나 더 얹는다.
+/// **활성 탭은 언제나 맨 마지막**이라 ×가 가장 늦게 접힌다(새 불변식: 활성 탭은
+/// 절대 버리지 않는다 — ⓐ 단계에서는 ×는 잃을 수 있지만 탭 자체는 ⓑ에서도 살아남는다).
+fn aux_tab_strip_priority(tabs: &[&PaneAuxTab]) -> Vec<PaneAuxTabKind> {
+    let mut order = aux_tab_inactive_priority(tabs);
+    if let Some(tab) = tabs.iter().find(|tab| tab.active) {
+        order.push(tab.kind);
+    }
+    order
+}
+
+/// 주어진 탭 집합을 세션 ×의 accent 경계에서 시작해 왼→오로 배치해본다. `stripped`에
+/// 속한 종류는 처음부터 ×를 만들지 않는다. 하나라도 최소 라벨 폭을 못 채우면 이
+/// 시도 전체가 실패다(`None`) — 호출부가 다음 축약 단계로 넘어간다.
+///
+/// `stripped`에 없는 탭인데도 `pane_aux_tab_geometry`가 자리가 없어 ×를 자체적으로
+/// 접었다면(뒤에 놓인 탭일수록 room이 먼저 바닥난다) 이 시도도 실패로 친다 — 그러지
+/// 않으면 우선순위(축약 순서 ⓐ)를 무시하고 "포지션상 뒤에 있다"는 이유만으로
+/// 엉뚱한 탭의 ×가 먼저 사라진다(활성 탭이 우연히 뒤쪽에 있으면 새 불변식이 깨진다).
+fn try_layout_aux_tabs(
+    header: egui::Rect,
+    session_close: egui::Rect,
+    toolbar_left: f32,
+    visible: &[&PaneAuxTab],
+    stripped: &[PaneAuxTabKind],
+    natural_width: &impl Fn(&str) -> f32,
+) -> Option<Vec<AuxTabPlacement>> {
+    let mut left = pane_header_active_boundary(header, session_close);
+    let mut out = Vec::with_capacity(visible.len());
+    for tab in visible {
+        let width =
+            pane_aux_tab_label_width(header.width(), natural_width(&tab.label), visible.len());
+        let include_close = !stripped.contains(&tab.kind);
+        let geometry = pane_aux_tab_geometry(header, left, toolbar_left, width, include_close)?;
+        if include_close && geometry.close.is_none() {
+            return None;
+        }
+        left = geometry.tab.right();
+        out.push(AuxTabPlacement {
+            kind: tab.kind,
+            label: tab.label.clone(),
+            active: tab.active,
+            geometry,
+        });
+    }
+    Some(out)
+}
+
+/// 세션 ×의 accent 경계에서 시작해 왼→오로 이어 붙인다. 좁을 때의 축약 순서(멀티
+/// 문서 탭 설계 §5, 새 불변식 — **활성 탭은 절대 버리지 않는다**):
+/// ⓐ 비활성 문서(오른쪽부터) → Git → 이력 → 활성 탭 순으로 ×를 뺀다 → ⓑ 그래도
+/// 모자라면 같은 순서(활성 탭 제외)로 탭 자체를 뺀다 → ⓒ 활성 탭과 세션 제목은
+/// 마지막까지 남는다(탭이 하나도 안 들어가도 세션 헤더는 그대로다). 탭 개수에
+/// 고정 상한이 없다 — App이 문서 탭 개수를 이미 유계로 관리한다.
+fn layout_aux_tabs(
+    header: egui::Rect,
+    session_close: egui::Rect,
+    toolbar_left: f32,
+    tabs: &[PaneAuxTab],
+    natural_width: impl Fn(&str) -> f32,
+) -> Vec<AuxTabPlacement> {
+    let mut visible: Vec<&PaneAuxTab> = tabs.iter().collect();
+    loop {
+        if visible.is_empty() {
+            return Vec::new();
+        }
+        let strip_order = aux_tab_strip_priority(&visible);
+        for strip in 0..=strip_order.len() {
+            let stripped = &strip_order[..strip];
+            if let Some(placements) = try_layout_aux_tabs(
+                header,
+                session_close,
+                toolbar_left,
+                &visible,
+                stripped,
+                &natural_width,
+            ) {
+                return placements;
+            }
+        }
+        // ×를 전부 빼도 안 맞는다 — 비활성 탭 중 우선순위 맨 앞을 통째로 뺀다. 활성
+        // 탭은 `aux_tab_inactive_priority`에 아예 없으므로 여기서 뽑힐 수 없다.
+        let Some(drop_kind) = aux_tab_inactive_priority(&visible).first().copied() else {
+            // 남은 게 활성 탭 하나뿐인데 그마저 안 들어간다 — 더 뺄 게 없다.
+            return Vec::new();
+        };
+        visible.retain(|tab| tab.kind != drop_kind);
+    }
 }
 
 /// 닫기(×) 글리프. 세션 닫기와 보조 탭 닫기가 같은 모양을 쓰되 **색만** 다르다
@@ -913,15 +1324,8 @@ fn paint_pane_header_base(
         );
         ui.painter().hline(range, top_y, active_stroke);
     }
-    ui.painter().hline(
-        header.x_range(),
-        crate::ui::snap_line_to_pixel(
-            header.bottom(),
-            crate::ui::designall::SEPARATOR_WIDTH,
-            ui.ctx().pixels_per_point(),
-        ),
-        crate::ui::designall::separator_stroke(ui.visuals()),
-    );
+    // 헤더와 본문 사이 하단 구분선은 긋지 않는다 — 탭 면과 터미널이 한 덩어리로
+    // 이어져 보여야 한다(2026-08-22 사용자 요청).
 }
 
 /// 두 탭 사이 세로 헤어라인 — 같은 배경을 쓰는 두 영역의 경계를 읽히게 한다.
@@ -955,7 +1359,7 @@ struct PaneHeaderButtons {
 /// 헤더 폭·제목 폭으로 닫기(×)와 우측 도구의 히트박스를 계산한다.
 ///
 /// codex 리뷰 P2 회귀 가드: compact 헤더(3e3e909)는 visible_toolbar를
-/// clamp(1,·)로 최소 1개 강제해 589pt 픽스처의 10% pane(≈59px)에서 Split
+/// clamp(1,·)로 최소 1개 강제해 당시 최소 pane(≈59px)에서 Split
 /// 버튼이 닫기 히트박스 22px 중 17px를 덮었고, 도구 interact가 나중에
 /// 등록되므로 겹침 클릭이 닫기 대신 분할을 실행했다. 지금은 도구 0개를
 /// 허용하고, 만에 하나 기하가 어긋나 도구가 닫기를 덮으면 왼쪽 도구를 더
@@ -1021,6 +1425,25 @@ enum TerminalToolbarIcon {
     NewTerminal,
     SplitColumns,
     SplitRows,
+}
+
+/// 세션 헤더 Search 버튼 클릭이 보조 검색(이력·Git) 토글로 가야 하는지 —
+/// 그 pane의 보조 본문이 활성일 때만 그렇다(2026-08-18 스펙 "진입").
+/// 다른 도구(새 셸·분할)나 보조 본문이 비활성인 Search는 항상 기존 경로
+/// (`activate_terminal_toolbar`/입력 소유권 없을 때의 포커스 클레임)로 간다 —
+/// 그 경로의 `input_enabled` 게이트는 그대로 두고 이 조건이 그 앞에 별도로 얹힌다.
+fn search_click_targets_aux_search(icon: TerminalToolbarIcon, aux_active: bool) -> bool {
+    matches!(icon, TerminalToolbarIcon::Search) && aux_active
+}
+
+/// 보조 탭이 실제로 활성인지 — App이 넘긴 원본 목록(`aux_tabs`, ground truth)만
+/// 본다. `layout_aux_tabs`가 돌려주는 배치(placements)로 판정하면 안 되는 이유:
+/// 헤더가 극단적으로 좁으면 그 함수가 활성 탭까지 접어(빈 Vec) 돌려줄 수 있는데,
+/// 그래도 그 문서는 실제로 활성이라 본문은 계속 그려진다(레이아웃과 무관한 별도
+/// 게이트) — 헤더 chrome(제목 밝기·검색 라우팅)만 이 목록을 안 쓰면 "세션이 선택된
+/// 것처럼" 실제 상태와 어긋나 보인다(2026-08-22 리뷰).
+fn any_aux_tab_active(aux_tabs: &[PaneAuxTab]) -> bool {
+    aux_tabs.iter().any(|tab| tab.active)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1118,11 +1541,16 @@ pub(crate) struct PreparedAttachedPaneOutput {
 pub struct WorkspaceSurfaceOutput {
     pub focus_requested: bool,
     pub local_focus_claimed: Option<runtime::MuxPaneId>,
-    /// 이번 프레임에 보조 탭이 올린 의도(있으면 App이 탭 상태를 옮긴다).
-    pub aux_tab_intent: Option<PaneAuxTabIntent>,
+    pub document_drop_paths: Vec<PathBuf>,
+    /// 이번 프레임에 보조 탭이 올린 의도(있으면 App이 그 종류의 탭 상태를 옮긴다).
+    pub aux_tab_intent: Option<(PaneAuxTabKind, PaneAuxTabIntent)>,
     /// 보조 탭이 활성일 때 App이 본문을 그릴 pane body rect. 이 rect가 있으면
     /// WorkspaceUi는 그 pane의 터미널 표면·입력을 **그리지 않았다**.
     pub aux_body_rect: Option<egui::Rect>,
+    /// 보조 본문이 활성인 세션 헤더에서 Search 버튼이 눌렸다 — App이 이번 프레임에
+    /// `aux_search.toggle()`을 부른다(스펙 "진입"). `input_enabled` 게이트는 그대로
+    /// 두고 그 앞에 얹은 별도 경로라, 이 값이 참이어도 터미널 검색은 열리지 않는다.
+    pub aux_search_toggle_requested: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1155,8 +1583,10 @@ impl PaneRenderMode<'_> {
 struct PaneRenderOutput {
     focus_requested: bool,
     local_focus_claimed: Option<runtime::MuxPaneId>,
-    aux_tab_intent: Option<PaneAuxTabIntent>,
+    document_drop_paths: Vec<PathBuf>,
+    aux_tab_intent: Option<(PaneAuxTabKind, PaneAuxTabIntent)>,
     aux_body_rect: Option<egui::Rect>,
+    aux_search_toggle_requested: bool,
 }
 
 impl PaneRenderOutput {
@@ -1165,12 +1595,14 @@ impl PaneRenderOutput {
         if other.local_focus_claimed.is_some() {
             self.local_focus_claimed = other.local_focus_claimed;
         }
+        self.document_drop_paths.extend(other.document_drop_paths);
         if other.aux_tab_intent.is_some() {
             self.aux_tab_intent = other.aux_tab_intent;
         }
         if other.aux_body_rect.is_some() {
             self.aux_body_rect = other.aux_body_rect;
         }
+        self.aux_search_toggle_requested |= other.aux_search_toggle_requested;
     }
 }
 
@@ -1301,6 +1733,76 @@ fn paint_terminal_toolbar_icon(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SplitDragPhase {
+    Active,
+    Committed { admitted: bool },
+}
+
+#[derive(Clone, Debug)]
+struct SplitDragTransaction {
+    tab: runtime::MuxTabId,
+    path: Vec<u8>,
+    ratio: f32,
+    phase: SplitDragPhase,
+    /// Local queue admission is not runtime delivery. Matching mux state is accepted as an ACK
+    /// only after this exact operation/generation completes successfully.
+    pending_delivery: Option<(WorkspaceProtocolOperation, u64)>,
+    retry: ProtocolRetryBackoff,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StagedTerminalResize {
+    pass: u64,
+    cols: u16,
+    rows: u16,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ResizeDeliveryRollback {
+    session: SessionId,
+    target: (u16, u16),
+    previous: Option<(u16, u16)>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ProtocolRetryBackoff {
+    failures: u8,
+    retry_at: Option<std::time::Instant>,
+}
+
+enum ProtocolRetryGate {
+    Ready,
+    Wait(std::time::Duration),
+    Exhausted,
+}
+
+impl ProtocolRetryBackoff {
+    fn record_busy(&mut self, now: std::time::Instant) -> bool {
+        if self.failures >= PROTOCOL_RETRY_LIMIT {
+            self.retry_at = None;
+            return false;
+        }
+        let shift = u32::from(self.failures);
+        self.failures = self.failures.saturating_add(1);
+        let delay = PROTOCOL_RETRY_BASE.saturating_mul(1_u32 << shift);
+        self.retry_at = Some(now + delay);
+        true
+    }
+
+    fn gate(&mut self, now: std::time::Instant) -> ProtocolRetryGate {
+        match self.retry_at {
+            Some(retry_at) if now < retry_at => ProtocolRetryGate::Wait(retry_at - now),
+            Some(_) => {
+                self.retry_at = None;
+                ProtocolRetryGate::Ready
+            }
+            None if self.failures >= PROTOCOL_RETRY_LIMIT => ProtocolRetryGate::Exhausted,
+            None => ProtocolRetryGate::Ready,
+        }
+    }
+}
+
 pub struct WorkspaceUi {
     mux: Option<Arc<MuxSnapshot>>,
     sessions: HashMap<SessionId, SessionView>,
@@ -1361,6 +1863,12 @@ pub struct WorkspaceUi {
     last_native_paste: Option<std::time::Instant>,
     /// 세션별 마지막 전송한 (cols, rows) — 변화 시에만 Resize 전송
     sent_sizes: HashMap<SessionId, (u16, u16)>,
+    /// 세션별 「아직 확정되지 않은」 resize 목표 —
+    /// (cols, rows, viewport 크기, 그 목표가 안정되기 시작한 시각).
+    /// 창 드래그로 pane 크기가 프레임마다 바뀌는 동안 목표나 viewport 크기도 계속
+    /// 갱신되고, RESIZE_DRAG_DEBOUNCE만큼 둘 다 유지돼야 비로소 전송된다
+    /// (queue_terminal_resize_debounced 참고).
+    pending_resize_target: HashMap<SessionId, (u16, u16, Option<egui::Vec2>, std::time::Instant)>,
     /// 트랙패드 미세 스크롤 누적 (focused pane 기준)
     scroll_residual: f32,
     /// 드래그 선택 오토스크롤 행 누적 — 경계 초과 속도(행/초)×dt의 소수부 보관 (T4)
@@ -1386,9 +1894,28 @@ pub struct WorkspaceUi {
     /// 성공 전달된 셸 spawn 순서와 프로토콜 입장을 기다리는 cd 후속 명령.
     /// spawn·후속 cd를 합쳐 최대 WORKSPACE_PROTOCOL_CAP개만 유지한다.
     pending_spawn_cwds: VecDeque<PendingShellSpawn>,
-    /// split 경계 드래그 중 로컬 미리보기 (path, ratio). 드래그 동안은 명령을 보내지
-    /// 않고(매 프레임 DB 저장 방지) 릴리즈 시 1회 ResizeSplit을 보낸다.
-    split_drag: Option<(Vec<u8>, f32)>,
+    /// split 경계의 로컬 미리보기와 비동기 mux ACK 수명. 릴리즈 뒤에도 matching
+    /// tab/path/ratio MuxUpdated까지 미리보기를 유지해 persisted ratio로 되튀지 않는다.
+    split_drag: Option<SplitDragTransaction>,
+    /// matching ACK 뒤 실제 grid가 바뀌어야 하는 visible session. 각 세션은 최종 UI
+    /// pass에서 distinct Resize를 admission하고 exact runtime completion을 받을 때까지
+    /// queued/in-flight 상태로 추적된다.
+    split_final_resize_sessions: HashSet<SessionId>,
+    /// Exact queued/in-flight final Resize operations. Selection invalidation and presentation
+    /// fencing begin only after the runtime accepts the matching operation.
+    split_final_resize_pending: HashMap<(WorkspaceProtocolOperation, u64), (SessionId, u16, u16)>,
+    /// `sent_sizes` is an optimistic queue-side dedupe. Preserve its previous value so an exact
+    /// delivery failure cannot masquerade as a successful PTY resize.
+    resize_delivery_rollbacks: HashMap<(WorkspaceProtocolOperation, u64), ResizeDeliveryRollback>,
+    /// A closed runtime channel must not create an immediate repaint/retry loop. A different
+    /// geometry or fresh viewport evidence clears this bounded per-session sentinel.
+    failed_resize_targets: HashMap<SessionId, (u16, u16)>,
+    resize_retry: HashMap<SessionId, ProtocolRetryBackoff>,
+    /// egui render pass에서는 protocol/debounce 상태를 직접 바꾸지 않는다. sizing pass는
+    /// 후보도 만들지 않고, 일반 pass 후보는 App::ui의 마지막 widget 뒤 final-pass flush가
+    /// 같은 cumulative pass만 실행한다.
+    staged_terminal_resizes: HashMap<SessionId, StagedTerminalResize>,
+    staged_split_commit_pass: Option<u64>,
     /// 닫기 확인 대기 중인 pane — 실행 중 세션이 있는 pane 닫기는 확인을 거친다
     /// (2026-07-05 사용자 보고: 닫기 실수로 셸 전체 즉사 방지).
     confirm_close: Option<runtime::MuxPaneId>,
@@ -1422,11 +1949,11 @@ pub struct WorkspaceUi {
     /// 활성 워크스페이스의 고유색 — 포커스된 pane 상단선에 쓴다.
     /// App이 매 프레임 밀어 넣는다(사이드바 목록 순서에 따라 배정되므로 여기서 못 만든다).
     workspace_accent: egui::Color32,
-    /// App이 소유한 보조 탭(이력) — 있으면 포커스된 로컬 pane 헤더의 **같은 32pt 행**에
-    /// 세션 탭 옆으로 그린다. runtime의 `MuxTabId`/pane이 아니므로 이 값이 바뀌어도
-    /// PTY·세션·mux 탭은 생기거나 죽지 않는다. WorkspaceUi는 클릭 의도만 돌려주고
-    /// 상태와 본문은 App이 소유한다.
-    aux_tab: Option<PaneAuxTab>,
+    /// App이 소유한 보조 탭 목록(이력·Git·문서 여러 개) — 있으면 포커스된
+    /// 로컬 pane 헤더의 **같은 32pt 행**에 세션 탭 옆으로 이어 붙여 그린다. runtime의
+    /// `MuxTabId`/pane이 아니므로 이 값이 바뀌어도 PTY·세션·mux 탭은 생기거나 죽지
+    /// 않는다. WorkspaceUi는 클릭 의도만 돌려주고 상태와 본문은 App이 소유한다.
+    aux_tabs: Vec<PaneAuxTab>,
     /// 이번 프레임에 보조 탭을 붙일 pane. 보통 focused pane이지만, runtime이 아직
     /// 아무 pane도 포커스하지 않은 프레임에서는 layout의 첫 pane으로 떨어진다 —
     /// 그러지 않으면 탭도 본문도 사라져 레일만 켜진 채 화면이 반응하지 않는다.
@@ -1452,6 +1979,13 @@ pub struct WorkspaceUi {
     /// 현재 error 배너가 input backpressure 경고인지 — 해소 이벤트(queued=0)가
     /// 무관한 오류(spawn 실패 등)를 지우지 않게 구분한다(codex 2026-07-09).
     error_is_pressure: bool,
+    /// 프로토콜 요청이 실제로 유실됐음을 표시하는 플래그(2026-08-18, "terminal protocol
+    /// request rejected" 배너 버그 수정). send/send_keep_selection/spawn_shell_at은 catalog가
+    /// 없어 문구를 미리 만들 수 없다 — 여기 플래그만 세우고 show_with_input이 렌더 시점에
+    /// catalog로 채운다. Busy(큐 포화)·InvalidCommand(내부 계약 위반)는 사용자가 어찌할 수
+    /// 없는 신호라 이 플래그를 쓰지 않고 tracing으로만 남긴다 — PayloadTooLarge/DeliveryFailed
+    /// 처럼 정말 되돌릴 수 없이 사라진 요청만 여기로 온다.
+    protocol_request_lost: bool,
     /// 터미널 텍스트 검색 상태 (T3). Cmd+F로 열리고, 열려 있으면 focused pane 우상단에
     /// 검색 바를 그린다. 한 번에 한 세션만 검색한다.
     search: Option<TerminalSearch>,
@@ -1522,11 +2056,11 @@ pub struct WorkspacePathPayload {
 
 impl WorkspacePathPayload {
     pub fn try_new(path: PathBuf) -> Result<Self, WorkspaceIoErrorCode> {
-        let display = path.to_string_lossy();
-        if display.as_bytes().contains(&0) {
+        let encoded = path.as_os_str().as_encoded_bytes();
+        if encoded.contains(&0) {
             return Err(WorkspaceIoErrorCode::InvalidPath);
         }
-        let bytes = display.len();
+        let bytes = encoded.len();
         if bytes == 0 || bytes > WORKSPACE_PATH_MAX_BYTES {
             return Err(WorkspaceIoErrorCode::PathTooLarge);
         }
@@ -1661,12 +2195,12 @@ impl TerminalClipboardPayload {
         }
         let mut path_bytes = 0usize;
         for path in &paths {
-            let display = path.to_string_lossy();
-            if display.as_bytes().contains(&0) || display.len() > WORKSPACE_PATH_MAX_BYTES {
+            let encoded = path.as_os_str().as_encoded_bytes();
+            if encoded.contains(&0) || encoded.len() > WORKSPACE_PATH_MAX_BYTES {
                 return Err(WorkspaceIoErrorCode::InvalidPath);
             }
             path_bytes = path_bytes
-                .checked_add(display.len())
+                .checked_add(encoded.len())
                 .ok_or(WorkspaceIoErrorCode::ClipboardTooLarge)?;
             if path_bytes > TERMINAL_CLIPBOARD_PATH_MAX_BYTES {
                 return Err(WorkspaceIoErrorCode::ClipboardTooLarge);
@@ -1748,6 +2282,19 @@ struct PendingPaste {
 const PASTE_TASK_TTL: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// 세션별 화면 캐시. hidden tab 세션의 스냅샷은 `MuxUpdated`에서 버린다.
+struct ResizePresentationFence {
+    target: (u16, u16),
+    started_at: std::time::Instant,
+    last_target_at: Option<std::time::Instant>,
+    latest_target: Option<Arc<TerminalViewportSnapshot>>,
+    stable_had_visible_text: bool,
+}
+
+struct InitialSnapshotFence {
+    started_at: std::time::Instant,
+    latest_blank: Option<Arc<TerminalViewportSnapshot>>,
+}
+
 #[derive(Default)]
 struct SessionView {
     snapshot: Option<Arc<TerminalViewportSnapshot>>,
@@ -1758,6 +2305,12 @@ struct SessionView {
     /// freeze(선택 중) 동안 도착한 최신 snapshot을 보관 — 선택 해제 시 이걸로 catch-up해
     /// 화면이 선택 당시에 머무는 것을 막는다(codex). 프레임 시작 시 프로모트한다.
     pending_snapshot: Option<Arc<TerminalViewportSnapshot>>,
+    /// split로 갓 생긴 shell의 output-free 80×24 seed만 숨기는 causal one-shot gate.
+    /// deadline은 replay/후속 blank로 연장하지 않는다.
+    initial_presentation: Option<InitialSnapshotFence>,
+    /// 최종 split Resize 뒤 TUI의 clear→redraw 중간 viewport가 표시되지 않도록 마지막
+    /// stable 화면을 유지하는 유계 fence. target shape 후보만 latest-wins로 받는다.
+    resize_presentation: Option<ResizePresentationFence>,
     render_cache: renderer_egui::TerminalRenderCache,
     bracketed_paste: bool,
     /// 사이드바 세션 목록에 보여줄 최신 화면 요약 (마지막 비어있지 않은 행, ≤48자)
@@ -1779,6 +2332,164 @@ struct SessionView {
     last_output_at: Option<i64>,
 }
 
+impl SessionView {
+    fn install_snapshot(&mut self, snapshot: Arc<TerminalViewportSnapshot>) {
+        self.summary = last_line_summary(&snapshot);
+        self.snapshot = Some(snapshot);
+        self.snapshot_gen = self.snapshot_gen.wrapping_add(1);
+        self.pending_snapshot = None;
+    }
+
+    fn arm_resize_presentation(&mut self, cols: u16, rows: u16, now: std::time::Instant) {
+        self.pending_snapshot = None;
+        self.resize_presentation = Some(ResizePresentationFence {
+            target: (cols, rows),
+            started_at: now,
+            last_target_at: None,
+            latest_target: None,
+            stable_had_visible_text: self
+                .snapshot
+                .as_deref()
+                .is_some_and(snapshot_has_visible_text),
+        });
+    }
+
+    /// 창 리사이즈로 나간 Resize도 split 최종 Resize와 같은 fence를 쓴다. fence가 이미
+    /// 있으면 목표만 갈아끼워 hard deadline을 늘리지 않는다(기존 계약).
+    ///
+    /// 지킬 안정 화면이 **없으면**(스냅샷 미도착) 걸지 않는다 — `buffer_resize_snapshot`은
+    /// fence가 있는 동안 target과 모양이 다른 viewport를 통째로 버리므로, 세션 생성 직후
+    /// 첫 Resize에 걸면 첫 화면이 사라져 「연결 중」이 최대 250ms 남는다.
+    fn arm_or_retarget_resize_presentation(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        now: std::time::Instant,
+    ) {
+        if self.resize_presentation.is_some() {
+            self.retarget_resize_presentation(cols, rows);
+        } else if self.snapshot.is_some() {
+            self.arm_resize_presentation(cols, rows, now);
+        }
+    }
+
+    fn retarget_resize_presentation(&mut self, cols: u16, rows: u16) {
+        let Some(fence) = self.resize_presentation.as_mut() else {
+            return;
+        };
+        if fence.target != (cols, rows) {
+            fence.target = (cols, rows);
+            fence.last_target_at = None;
+            fence.latest_target = None;
+        }
+    }
+
+    fn arm_initial_presentation(&mut self, now: std::time::Instant) {
+        if self.snapshot.is_none() && self.initial_presentation.is_none() {
+            self.initial_presentation = Some(InitialSnapshotFence {
+                started_at: now,
+                latest_blank: None,
+            });
+        }
+    }
+
+    /// initial gate가 이벤트를 소비했는지 반환한다. 첫 nonblank는 즉시 설치하고,
+    /// blank seed는 original deadline까지 latest-wins로 보관한다.
+    fn buffer_initial_snapshot(
+        &mut self,
+        snapshot: Arc<TerminalViewportSnapshot>,
+        now: std::time::Instant,
+    ) -> bool {
+        let Some(fence) = self.initial_presentation.as_ref() else {
+            return false;
+        };
+        if snapshot_has_visible_text(&snapshot)
+            || now.saturating_duration_since(fence.started_at) >= RESIZE_VIEWPORT_HARD_DEADLINE
+        {
+            self.initial_presentation = None;
+            self.install_snapshot(snapshot);
+            return true;
+        }
+        if let Some(fence) = self.initial_presentation.as_mut() {
+            fence.latest_blank = Some(snapshot);
+        }
+        true
+    }
+
+    fn settle_initial_presentation(
+        &mut self,
+        now: std::time::Instant,
+    ) -> Option<std::time::Duration> {
+        let fence = self.initial_presentation.as_ref()?;
+        let elapsed = now.saturating_duration_since(fence.started_at);
+        if elapsed >= RESIZE_VIEWPORT_HARD_DEADLINE {
+            let candidate = self
+                .initial_presentation
+                .take()
+                .and_then(|fence| fence.latest_blank);
+            if let Some(candidate) = candidate {
+                self.install_snapshot(candidate);
+            }
+            return None;
+        }
+        Some(RESIZE_VIEWPORT_HARD_DEADLINE - elapsed)
+    }
+
+    /// resize fence가 있으면 viewport를 표시하지 않고 target 후보에만 보관한다.
+    /// non-target은 resize 이전/중간 grid라 안정 화면을 덮을 수 없다.
+    fn buffer_resize_snapshot(
+        &mut self,
+        snapshot: Arc<TerminalViewportSnapshot>,
+        now: std::time::Instant,
+    ) -> bool {
+        let Some(fence) = self.resize_presentation.as_mut() else {
+            return false;
+        };
+        if (snapshot.cols, snapshot.rows) == fence.target {
+            fence.latest_target = Some(snapshot);
+            fence.last_target_at = Some(now);
+        }
+        true
+    }
+
+    /// 승격 전이면 다음으로 확인할 one-shot repaint 지연을 반환한다.
+    fn settle_resize_presentation(
+        &mut self,
+        now: std::time::Instant,
+    ) -> Option<std::time::Duration> {
+        let fence = self.resize_presentation.as_ref()?;
+        let hard_elapsed = now.saturating_duration_since(fence.started_at);
+        let hard_expired = hard_elapsed >= RESIZE_VIEWPORT_HARD_DEADLINE;
+        let quiet_ready = fence
+            .last_target_at
+            .is_some_and(|last| now.saturating_duration_since(last) >= RESIZE_VIEWPORT_QUIET);
+        let candidate_allowed = fence.latest_target.as_deref().is_some_and(|candidate| {
+            !fence.stable_had_visible_text || snapshot_has_visible_text(candidate)
+        });
+        let promote = hard_expired || (quiet_ready && candidate_allowed);
+
+        if promote {
+            let candidate = self
+                .resize_presentation
+                .take()
+                .and_then(|fence| fence.latest_target);
+            if let Some(candidate) = candidate {
+                self.install_snapshot(candidate);
+            }
+            return None;
+        }
+
+        let hard_remaining = RESIZE_VIEWPORT_HARD_DEADLINE.saturating_sub(hard_elapsed);
+        if candidate_allowed && let Some(last) = fence.last_target_at {
+            let quiet_remaining =
+                RESIZE_VIEWPORT_QUIET.saturating_sub(now.saturating_duration_since(last));
+            Some(hard_remaining.min(quiet_remaining))
+        } else {
+            Some(hard_remaining)
+        }
+    }
+}
+
 impl WorkspaceUi {
     pub fn new() -> Self {
         Self {
@@ -1797,6 +2508,7 @@ impl WorkspaceUi {
             paste_suppressed: false,
             copy_suppressed: false,
             sent_sizes: HashMap::new(),
+            pending_resize_target: HashMap::new(),
             scroll_residual: 0.0,
             drag_autoscroll_residual: 0.0,
             command_sent: false,
@@ -1808,6 +2520,13 @@ impl WorkspaceUi {
             terminal_focus_claimed: false,
             pending_spawn_cwds: VecDeque::with_capacity(WORKSPACE_PROTOCOL_CAP),
             split_drag: None,
+            split_final_resize_sessions: HashSet::new(),
+            split_final_resize_pending: HashMap::with_capacity(WORKSPACE_PROTOCOL_CAP),
+            resize_delivery_rollbacks: HashMap::with_capacity(WORKSPACE_PROTOCOL_CAP),
+            failed_resize_targets: HashMap::new(),
+            resize_retry: HashMap::new(),
+            staged_terminal_resizes: HashMap::new(),
+            staged_split_commit_pass: None,
             confirm_close: None,
             agent_send_presets: Vec::new(),
             open_environment_requested: false,
@@ -1819,7 +2538,7 @@ impl WorkspaceUi {
             project_name: None,
             ui_scale: 1.0,
             workspace_accent: egui::Color32::TRANSPARENT,
-            aux_tab: None,
+            aux_tabs: Vec::new(),
             aux_tab_pane: None,
             session_pids: HashMap::new(),
             path_click_cache: None,
@@ -1842,6 +2561,7 @@ impl WorkspaceUi {
             pending_paste: None,
             error: None,
             error_is_pressure: false,
+            protocol_request_lost: false,
             search: None,
             last_output_copy_pending: HashSet::new(),
             pending_copy: None,
@@ -1860,6 +2580,39 @@ impl WorkspaceUi {
     /// workspace and can otherwise re-request its deferred TextEdit focus.
     pub fn take_terminal_focus_claimed(&mut self) -> bool {
         std::mem::take(&mut self.terminal_focus_claimed)
+    }
+
+    /// 사이드바에서 세션 행을 눌러 그 pane으로 점프했을 때 **그 pane을 잠깐 강조**한다
+    /// (2026-08-18 사용자 요청: 어디로 갔는지 보이게).
+    ///
+    /// 새 강조 기구를 만들지 않고 이미 있는 `session_flash`에 얹는다 — 포커스 이동
+    /// (`FOCUS_FLASH`)과 상태 전이(`PANE_FLASH`)가 쓰는 바로 그 기구라 만료 정리·렌더·
+    /// repaint 예약이 전부 갖춰져 있다. 별도 기구를 두면 흔한 경우(여러 pane 사이 점프)에
+    /// **같은 pane에 같은 길이의 테두리가 두 겹**으로 그려진다.
+    ///
+    /// 이 진입점이 메우는 공백은 하나다 — `FOCUS_FLASH`는 `mux.focused_pane`이 **바뀔 때만**
+    /// 뜨므로, 이미 보고 있던 세션(특히 pane이 하나뿐인 워크스페이스)을 다시 누르면 아무
+    /// 확인 신호가 없었다. 여기서는 포커스가 바뀌든 말든 눌렀다는 사실 자체를 보여준다.
+    ///
+    /// pane에 세션이 없거나(연결 중) mux를 아직 못 받았으면 아무 일도 하지 않는다.
+    pub(crate) fn flash_pane(&mut self, pane: &runtime::MuxPaneId) {
+        let Some(session) = self
+            .mux
+            .as_ref()
+            .and_then(|mux| {
+                mux.tabs
+                    .iter()
+                    .flat_map(|tab| &tab.panes)
+                    .find(|candidate| &candidate.id == pane)
+            })
+            .and_then(|pane| pane.session_id)
+        else {
+            return;
+        };
+        self.session_flash.insert(
+            session,
+            (std::time::Instant::now() + FOCUS_FLASH, FOCUS_FLASH),
+        );
     }
 
     /// App이 저장 세션 복원/전환을 시작할 때 정확한 pane을 다음 터미널 입력 대상으로
@@ -1953,22 +2706,445 @@ impl WorkspaceUi {
         &mut self,
         command: RuntimeCommand,
     ) -> Result<(), WorkspaceProtocolErrorCode> {
-        self.queue_protocol_intent_with_spawn_cwd(command, None)
+        self.queue_protocol_intent_tracked(command).map(|_| ())
     }
 
-    fn queue_terminal_resize(&mut self, session: SessionId, cols: u16, rows: u16) {
+    fn queue_protocol_intent_tracked(
+        &mut self,
+        command: RuntimeCommand,
+    ) -> Result<(WorkspaceProtocolOperation, u64), WorkspaceProtocolErrorCode> {
+        self.queue_protocol_intent_tracked_with_spawn_cwd(command, None)
+    }
+
+    fn queue_terminal_resize_tracked(
+        &mut self,
+        session: SessionId,
+        cols: u16,
+        rows: u16,
+    ) -> Option<(WorkspaceProtocolOperation, u64)> {
         if self.sent_sizes.get(&session) == Some(&(cols, rows)) {
-            return;
+            return None;
         }
-        if self
-            .queue_protocol_intent(RuntimeCommand::Resize {
+        if self.failed_resize_targets.get(&session) == Some(&(cols, rows)) {
+            return None;
+        }
+        self.failed_resize_targets.remove(&session);
+        let previous = self.sent_sizes.get(&session).copied();
+        let key = self
+            .queue_protocol_intent_tracked(RuntimeCommand::Resize {
                 session,
                 cols,
                 rows,
             })
-            .is_ok()
+            .ok()?;
+        self.resize_delivery_rollbacks
+            .entry(key)
+            .and_modify(|rollback| rollback.target = (cols, rows))
+            .or_insert(ResizeDeliveryRollback {
+                session,
+                target: (cols, rows),
+                previous,
+            });
+        if let Some((pending_session, pending_cols, pending_rows)) =
+            self.split_final_resize_pending.get_mut(&key)
+            && *pending_session == session
         {
-            self.sent_sizes.insert(session, (cols, rows));
+            *pending_cols = cols;
+            *pending_rows = rows;
+        }
+        self.sent_sizes.insert(session, (cols, rows));
+        Some(key)
+    }
+
+    fn queue_terminal_resize(&mut self, session: SessionId, cols: u16, rows: u16) -> bool {
+        self.queue_terminal_resize_tracked(session, cols, rows)
+            .is_some()
+    }
+
+    fn apply_split_final_resize_at(
+        &mut self,
+        session: SessionId,
+        cols: u16,
+        rows: u16,
+        _now: std::time::Instant,
+    ) -> bool {
+        if !self.split_final_resize_sessions.contains(&session) {
+            return false;
+        }
+        if self.sent_sizes.get(&session) == Some(&(cols, rows))
+            || self.failed_resize_targets.get(&session) == Some(&(cols, rows))
+        {
+            self.split_final_resize_sessions.remove(&session);
+            self.pending_resize_target.remove(&session);
+            return false;
+        }
+        let Some(key) = self.queue_terminal_resize_tracked(session, cols, rows) else {
+            return false;
+        };
+
+        self.split_final_resize_sessions.remove(&session);
+        self.pending_resize_target.remove(&session);
+        self.split_final_resize_pending
+            .insert(key, (session, cols, rows));
+        true
+    }
+
+    fn resize_presentation_settlement_deferred(&self, session: SessionId) -> bool {
+        self.split_drag.is_some()
+            || self.split_final_resize_sessions.contains(&session)
+            || self
+                .split_final_resize_pending
+                .values()
+                .any(|(pending, _, _)| *pending == session)
+    }
+
+    fn settle_session_resize_presentation(
+        &mut self,
+        session: SessionId,
+        now: std::time::Instant,
+    ) -> Option<std::time::Duration> {
+        if self.resize_presentation_settlement_deferred(session) {
+            return None;
+        }
+        let view = self.sessions.get_mut(&session)?;
+        let generation_before = view.snapshot_gen;
+        let repaint_after = view.settle_resize_presentation(now);
+        if view.snapshot_gen != generation_before
+            && self
+                .selection
+                .is_some_and(|(selected, _, _)| selected == session)
+        {
+            self.selection = None;
+        }
+        repaint_after
+    }
+
+    /// `queue_terminal_resize`의 디바운스 래퍼 — pane 렌더 호출부는 매 프레임 이걸 부른다.
+    ///
+    /// 이 세션의 **첫 크기**(세션 생성·복원 — `sent_sizes`에 항목이 없는 경우)만 지연
+    /// 없이 즉시 보낸다. 그 뒤의 모든 크기 변경은 전송을 미루고 `pending_resize_target`에
+    /// 목표만 갱신한다 — 그러지 않으면 매 중간 크기마다 PTY가 실제로 reflow하고 자식
+    /// 프로세스가 SIGWINCH로 화면을 다시 그려 드래그 내내 깜빡인다. 같은 목표가
+    /// `RESIZE_DRAG_DEBOUNCE`만큼 유지되면(=드래그가 그 크기에서 멈췄다) 그제서야 보낸다.
+    ///
+    /// 「첫 mismatch」의 판정 기준이 **보류 유무가 아니라 `sent_sizes` 유무**인 것이
+    /// 핵심이다. 보류를 기준으로 삼으면, 목표가 직전 전송값과 같은 프레임에서 아래
+    /// 최상단 가드가 보류를 지우기 때문에 **다음 변경이 매번 「첫 mismatch」로 오인**된다.
+    /// 사람이 실제로 창을 끄는 속도에서는 한 칸마다 그렇게 머무는 프레임이 생겨,
+    /// 그리드 한 칸 옮길 때마다 SIGWINCH가 나가 화면이 심하게 깜빡였다(2026-09-06 보고).
+    /// 빠른 드래그는 머무는 프레임이 없어 증상이 나타나지 않는다 — 그래서 2026-08-18에
+    /// 디바운스를 넣고도 잡히지 않았다.
+    ///
+    /// 드래그가 끝나 더 이상 새 프레임이 오지 않아도 최종 목표가 유실되지 않도록, 목표를
+    /// 갱신할 때마다 `request_repaint_after`로 debounce 만료 시점에 다시 확인하러 오는
+    /// repaint를 예약한다 — 그 시점에 다른 입력이 전혀 없어도 이 경로가 다시 실행된다.
+    fn queue_terminal_resize_debounced(
+        &mut self,
+        ctx: &egui::Context,
+        session: SessionId,
+        cols: u16,
+        rows: u16,
+    ) -> bool {
+        if self.sent_sizes.get(&session) == Some(&(cols, rows)) {
+            self.pending_resize_target.remove(&session);
+            return false;
+        }
+        let now = std::time::Instant::now();
+        let viewport_size = ctx.input(|input| input.viewport().inner_rect.map(|rect| rect.size()));
+        match self.pending_resize_target.get(&session).copied() {
+            None if !self.sent_sizes.contains_key(&session) => {
+                // 이 세션에 아직 한 번도 크기를 보낸 적이 없다 — 세션 생성/복원처럼 진짜
+                // 1회성이라 지연 없이 즉시 보낸다.
+                self.pending_resize_target
+                    .insert(session, (cols, rows, viewport_size, now));
+                self.queue_terminal_resize(session, cols, rows)
+            }
+            None => {
+                // 이미 크기를 보낸 세션의 새 목표 — 드래그의 첫 칸일 수 있다. 목표만
+                // 기록하고 안정될 때까지 기다린다(아래 Some 분기와 동일한 시계).
+                self.pending_resize_target
+                    .insert(session, (cols, rows, viewport_size, now));
+                ctx.request_repaint_after(RESIZE_DRAG_DEBOUNCE);
+                false
+            }
+            Some((pending_cols, pending_rows, pending_viewport_size, since))
+                if (pending_cols, pending_rows) == (cols, rows)
+                    && pending_viewport_size == viewport_size =>
+            {
+                // 직전과 같은 목표 — 안정 여부만 판정한다.
+                let elapsed = now.duration_since(since);
+                if elapsed < RESIZE_DRAG_DEBOUNCE {
+                    ctx.request_repaint_after(RESIZE_DRAG_DEBOUNCE - elapsed);
+                    return false;
+                }
+                let admitted = self.queue_terminal_resize(session, cols, rows);
+                // 전송이 **성사됐을 때만** 보류를 지운다. 프로토콜 큐가 가득 차
+                // queue_terminal_resize가 삼켜버린 경우 보류를 지우면 다음 프레임이
+                // None 분기로 떨어져 즉시 재전송하고, 그 실패가 다시 이 분기로 와서
+                // 120ms짜리 repaint 예약을 무한히 갱신한다 — 큐가 계속 막혀 있으면
+                // 앱이 영영 유휴 상태로 못 내려간다. 보류를 남겨 두면 elapsed가 계속
+                // 만료 상태라 repaint를 예약하지 않고, 자연히 발생하는 프레임에서만
+                // 재시도한다(디바운스 도입 전과 같은 재시도 성격).
+                if self.sent_sizes.get(&session) == Some(&(cols, rows)) {
+                    self.pending_resize_target.remove(&session);
+                }
+                admitted
+            }
+            Some(_) => {
+                // 목표가 직전 프레임과 또 달라졌다 — 드래그가 계속되는 중. 디바운스
+                // 시계를 새로 시작한다(전송하지 않는다).
+                self.pending_resize_target
+                    .insert(session, (cols, rows, viewport_size, now));
+                ctx.request_repaint_after(RESIZE_DRAG_DEBOUNCE);
+                false
+            }
+        }
+    }
+
+    fn begin_split_drag(&mut self, tab: runtime::MuxTabId, path: Vec<u8>, ratio: f32) {
+        match self.split_drag.as_mut() {
+            Some(transaction)
+                if transaction.tab == tab
+                    && transaction.path == path
+                    && transaction.phase == SplitDragPhase::Active =>
+            {
+                transaction.ratio = ratio;
+            }
+            _ => {
+                self.split_drag = Some(SplitDragTransaction {
+                    tab,
+                    path,
+                    ratio,
+                    phase: SplitDragPhase::Active,
+                    pending_delivery: None,
+                    retry: ProtocolRetryBackoff::default(),
+                });
+            }
+        }
+        // 직전 geometry의 debounce/final 후보가 새 drag 중에 늦게 실행되면 중간
+        // SIGWINCH가 된다. sent_sizes는 마지막 stable grid 기준으로 보존한다.
+        self.pending_resize_target.clear();
+        self.staged_terminal_resizes.clear();
+        self.split_final_resize_sessions.clear();
+    }
+
+    fn cancel_active_split_drag(&mut self, ctx: &egui::Context) {
+        let Some(handle_id) = self
+            .split_drag
+            .as_ref()
+            .filter(|transaction| transaction.phase == SplitDragPhase::Active)
+            .map(|transaction| split_handle_id(&transaction.tab, &transaction.path))
+        else {
+            return;
+        };
+        if ctx.dragged_id() == Some(handle_id) {
+            ctx.stop_dragging();
+        }
+        self.split_drag = None;
+        self.staged_split_commit_pass = None;
+        self.staged_terminal_resizes.clear();
+        self.pending_resize_target.clear();
+        self.split_final_resize_sessions.clear();
+    }
+
+    fn reconcile_active_split_drag(
+        &mut self,
+        ctx: &egui::Context,
+        input_enabled: bool,
+        active_tab: Option<&runtime::MuxTabId>,
+    ) {
+        let Some(transaction) = self
+            .split_drag
+            .as_ref()
+            .filter(|transaction| transaction.phase == SplitDragPhase::Active)
+        else {
+            return;
+        };
+        let handle_id = split_handle_id(&transaction.tab, &transaction.path);
+        let owns_widget = input_enabled
+            && ctx.input(|input| input.focused)
+            && active_tab == Some(&transaction.tab)
+            && self.mux.as_deref().is_some_and(|mux| {
+                mux_split_ratio(mux, &transaction.tab, &transaction.path).is_some()
+            });
+        if !owns_widget {
+            self.cancel_active_split_drag(ctx);
+            return;
+        }
+        let is_being_dragged = ctx.is_being_dragged(handle_id);
+        let another_widget_owns_drag = ctx.dragged_id().is_some() && !is_being_dragged;
+        if another_widget_owns_drag {
+            self.cancel_active_split_drag(ctx);
+            return;
+        }
+        if ctx.drag_stopped_id() == Some(handle_id) {
+            self.commit_split_drag(ctx.cumulative_pass_nr());
+            return;
+        }
+
+        let primary_down = ctx.input(|input| input.pointer.primary_down());
+        if !is_being_dragged && !primary_down {
+            self.cancel_active_split_drag(ctx);
+        }
+    }
+
+    fn commit_split_drag(&mut self, pass: u64) {
+        let Some(transaction) = self.split_drag.as_mut() else {
+            return;
+        };
+        if transaction.phase == SplitDragPhase::Active {
+            transaction.phase = SplitDragPhase::Committed { admitted: false };
+        }
+        if matches!(
+            transaction.phase,
+            SplitDragPhase::Committed { admitted: false }
+        ) {
+            self.staged_split_commit_pass = Some(pass);
+        }
+    }
+
+    fn stage_unadmitted_split_commit_for_pass(
+        &mut self,
+        ctx: &egui::Context,
+        pass: u64,
+        sizing_pass: bool,
+    ) {
+        if sizing_pass {
+            return;
+        }
+        let should_stage = self.split_drag.as_mut().is_some_and(|transaction| {
+            if !matches!(
+                transaction.phase,
+                SplitDragPhase::Committed { admitted: false }
+            ) || transaction.pending_delivery.is_some()
+            {
+                return false;
+            }
+            match transaction.retry.gate(std::time::Instant::now()) {
+                ProtocolRetryGate::Ready => true,
+                ProtocolRetryGate::Wait(after) => {
+                    ctx.request_repaint_after(after);
+                    false
+                }
+                ProtocolRetryGate::Exhausted => false,
+            }
+        });
+        if should_stage {
+            self.staged_split_commit_pass = Some(pass);
+        }
+    }
+
+    fn split_preview_ratio(&self, tab: &runtime::MuxTabId, path: &[u8], persisted: f32) -> f32 {
+        self.split_drag
+            .as_ref()
+            .filter(|transaction| &transaction.tab == tab && transaction.path == path)
+            .map_or(persisted, |transaction| transaction.ratio)
+    }
+
+    fn stage_terminal_resize_for_pass(
+        &mut self,
+        pass: u64,
+        sizing_pass: bool,
+        session: SessionId,
+        cols: u16,
+        rows: u16,
+    ) {
+        if sizing_pass || self.split_drag.is_some() {
+            return;
+        }
+        self.staged_terminal_resizes
+            .insert(session, StagedTerminalResize { pass, cols, rows });
+    }
+
+    fn flush_render_side_effects_for_pass(
+        &mut self,
+        ctx: &egui::Context,
+        pass: u64,
+        will_discard: bool,
+    ) -> bool {
+        if will_discard {
+            return false;
+        }
+
+        let mut admitted = false;
+
+        if self.staged_split_commit_pass == Some(pass) {
+            let command = self.split_drag.as_ref().and_then(|transaction| {
+                (matches!(
+                    transaction.phase,
+                    SplitDragPhase::Committed { admitted: false }
+                ) && transaction.pending_delivery.is_none())
+                .then(|| RuntimeCommand::ResizeSplit {
+                    tab: transaction.tab.clone(),
+                    path: transaction.path.clone(),
+                    ratio: transaction.ratio,
+                })
+            });
+            if let Some(command) = command {
+                match self.queue_protocol_intent_tracked(command) {
+                    Ok(key) => {
+                        if let Some(transaction) = self.split_drag.as_mut()
+                            && matches!(
+                                transaction.phase,
+                                SplitDragPhase::Committed { admitted: false }
+                            )
+                        {
+                            transaction.pending_delivery = Some(key);
+                            admitted = true;
+                        }
+                    }
+                    Err(code) => self.report_protocol_queue_rejection(code, "protocol_queue"),
+                }
+            }
+            self.staged_split_commit_pass = None;
+        }
+
+        let mut staged = std::mem::take(&mut self.staged_terminal_resizes);
+        for (session, resize) in staged.drain() {
+            if resize.pass != pass || self.split_drag.is_some() {
+                continue;
+            }
+            if let Some(retry) = self.resize_retry.get_mut(&session) {
+                match retry.gate(std::time::Instant::now()) {
+                    ProtocolRetryGate::Ready => {}
+                    ProtocolRetryGate::Wait(after) => {
+                        ctx.request_repaint_after(after);
+                        continue;
+                    }
+                    ProtocolRetryGate::Exhausted => continue,
+                }
+            }
+            if self.split_final_resize_sessions.contains(&session) {
+                let final_resize_admitted = self.apply_split_final_resize_at(
+                    session,
+                    resize.cols,
+                    resize.rows,
+                    std::time::Instant::now(),
+                );
+                admitted |= final_resize_admitted;
+                // 같은 grid면 protocol은 보내지 않아도 marker는 소비된다. pane settlement는
+                // 이 tail flush보다 앞서 이미 보류됐으므로 다음 pass를 한 번 깨운다.
+                if !final_resize_admitted && !self.split_final_resize_sessions.contains(&session) {
+                    ctx.request_repaint();
+                }
+            } else {
+                admitted |=
+                    self.queue_terminal_resize_debounced(ctx, session, resize.cols, resize.rows);
+            }
+        }
+        self.staged_terminal_resizes = staged;
+        admitted
+    }
+
+    /// App host의 마지막 UI-producing widget 뒤에서만 호출한다. workspace 렌더 시점의
+    /// `will_discard`는 뒤쪽 widget이 나중에 discard를 요청할 수 있어 final 판별이 아니다.
+    pub fn flush_render_side_effects(&mut self, ctx: &egui::Context) {
+        if self.flush_render_side_effects_for_pass(
+            ctx,
+            ctx.cumulative_pass_nr(),
+            ctx.will_discard(),
+        ) {
+            ctx.request_repaint();
         }
     }
 
@@ -1977,6 +3153,15 @@ impl WorkspaceUi {
         command: RuntimeCommand,
         spawn_cwd: Option<String>,
     ) -> Result<(), WorkspaceProtocolErrorCode> {
+        self.queue_protocol_intent_tracked_with_spawn_cwd(command, spawn_cwd)
+            .map(|_| ())
+    }
+
+    fn queue_protocol_intent_tracked_with_spawn_cwd(
+        &mut self,
+        command: RuntimeCommand,
+        spawn_cwd: Option<String>,
+    ) -> Result<(WorkspaceProtocolOperation, u64), WorkspaceProtocolErrorCode> {
         workspace_protocol_command_is_valid(&command)?;
 
         let spawn = matches!(
@@ -2016,6 +3201,8 @@ impl WorkspaceUi {
             rows: next_rows,
         } = &command
             && let Some(WorkspaceProtocolIntent {
+                operation,
+                generation,
                 command:
                     RuntimeCommand::Resize {
                         session: queued_session,
@@ -2034,7 +3221,7 @@ impl WorkspaceUi {
             *queued_cols = *next_cols;
             *queued_rows = *next_rows;
             self.command_sent = true;
-            return Ok(());
+            return Ok((*operation, *generation));
         }
 
         if let RuntimeCommand::WriteInput {
@@ -2042,6 +3229,8 @@ impl WorkspaceUi {
             bytes: next_bytes,
         } = &command
             && let Some(WorkspaceProtocolIntent {
+                operation,
+                generation,
                 command:
                     RuntimeCommand::WriteInput {
                         session: queued_session,
@@ -2060,7 +3249,7 @@ impl WorkspaceUi {
             }
             queued_bytes.extend_from_slice(next_bytes);
             self.command_sent = true;
-            return Ok(());
+            return Ok((*operation, *generation));
         }
 
         if self
@@ -2079,7 +3268,7 @@ impl WorkspaceUi {
             spawn_cwd,
         });
         self.command_sent = true;
-        Ok(())
+        Ok((operation, generation))
     }
 
     /// Drains one validated protocol request for the composition root. A taken request occupies
@@ -2104,12 +3293,16 @@ impl WorkspaceUi {
     /// Applies only the exact operation/generation currently in flight. Unknown, duplicate, or
     /// pre-wrap completions are discarded without mutating UI lifecycle state.
     pub fn complete_protocol(&mut self, completion: WorkspaceProtocolCompletion) {
-        let Some(pending) = self
-            .protocol_inflight
-            .remove(&(completion.operation, completion.generation))
-        else {
+        let key = (completion.operation, completion.generation);
+        let Some(pending) = self.protocol_inflight.remove(&key) else {
             return;
         };
+        let split_delivery_matches = self
+            .split_drag
+            .as_ref()
+            .is_some_and(|transaction| transaction.pending_delivery == Some(key));
+        let resize_rollback = self.resize_delivery_rollbacks.remove(&key);
+        let final_resize = self.split_final_resize_pending.remove(&key);
         match completion.result {
             Ok(()) => {
                 if pending.spawn {
@@ -2119,10 +3312,107 @@ impl WorkspaceUi {
                             cwd: pending.spawn_cwd,
                         });
                 }
+                if split_delivery_matches && let Some(transaction) = self.split_drag.as_mut() {
+                    transaction.pending_delivery = None;
+                    transaction.phase = SplitDragPhase::Committed { admitted: true };
+                    transaction.retry = ProtocolRetryBackoff::default();
+                }
+                if let Some(rollback) = resize_rollback {
+                    self.failed_resize_targets.remove(&rollback.session);
+                    self.resize_retry.remove(&rollback.session);
+                    // split 최종이 아닌 Resize = 창/기하 변경으로 나간 것. 이것도 안정
+                    // 화면을 fence로 지켜야 reflow 뒤 clear→redraw 중간 viewport가
+                    // 그대로 올라와 번쩍이지 않는다(2026-09-06).
+                    if final_resize.is_none()
+                        && let Some(view) = self.sessions.get_mut(&rollback.session)
+                    {
+                        view.arm_or_retarget_resize_presentation(
+                            rollback.target.0,
+                            rollback.target.1,
+                            std::time::Instant::now(),
+                        );
+                    }
+                }
+                if let Some((session, cols, rows)) = final_resize {
+                    if self
+                        .selection
+                        .is_some_and(|(selected, _, _)| selected == session)
+                    {
+                        self.selection = None;
+                    }
+                    self.sessions
+                        .entry(session)
+                        .or_default()
+                        .arm_resize_presentation(cols, rows, std::time::Instant::now());
+                }
             }
-            Err(_) => {
-                self.error_is_pressure = false;
-                self.error = Some("terminal protocol delivery failed".to_owned());
+            Err(code) => {
+                let now = std::time::Instant::now();
+                let mut split_retry_exhausted = false;
+                let mut resize_busy_retry_scheduled = false;
+                if split_delivery_matches {
+                    match code {
+                        WorkspaceProtocolErrorCode::Busy => {
+                            if let Some(transaction) = self.split_drag.as_mut() {
+                                transaction.pending_delivery = None;
+                                transaction.phase = SplitDragPhase::Committed { admitted: false };
+                                split_retry_exhausted = !transaction.retry.record_busy(now);
+                            }
+                        }
+                        _ => {
+                            self.split_drag = None;
+                            self.staged_split_commit_pass = None;
+                        }
+                    }
+                }
+                if split_retry_exhausted {
+                    self.split_drag = None;
+                    self.staged_split_commit_pass = None;
+                }
+                if let Some(rollback) = resize_rollback
+                    && self.sent_sizes.get(&rollback.session) == Some(&rollback.target)
+                {
+                    if let Some(previous) = rollback.previous {
+                        self.sent_sizes.insert(rollback.session, previous);
+                    } else {
+                        self.sent_sizes.remove(&rollback.session);
+                    }
+                }
+                if let Some(rollback) = resize_rollback {
+                    match code {
+                        WorkspaceProtocolErrorCode::Busy => {
+                            let retry = self.resize_retry.entry(rollback.session).or_default();
+                            resize_busy_retry_scheduled = retry.record_busy(now);
+                            if !resize_busy_retry_scheduled {
+                                self.resize_retry.remove(&rollback.session);
+                                self.failed_resize_targets
+                                    .insert(rollback.session, rollback.target);
+                            }
+                        }
+                        _ => {
+                            self.resize_retry.remove(&rollback.session);
+                            self.failed_resize_targets
+                                .insert(rollback.session, rollback.target);
+                        }
+                    }
+                }
+                if resize_busy_retry_scheduled && let Some((session, _, _)) = final_resize {
+                    self.split_final_resize_sessions.insert(session);
+                }
+                // 운영 코드에서 app.rs가 여기로 넘기는 값은 Busy(dotenv 승인 상한 또는
+                // typed runtime backpressure)와 DeliveryFailed뿐이다. DeliveryFailed의
+                // 절대다수는 실제 전송
+                // 실패가 아니라 "느지막이 도착한 결과가 이미 한물간 상태"(워크스페이스
+                // 전환/종료, dotenv 계속 처리가 stale로 판정됨 등 반납 경로)다. 세션이
+                // 정말 죽어서 벌어진 소수 사례도 종료 배지 등 별도 신호가 이미 있어, 여기서
+                // 또 배너를 띄우면 "이유 모를 배너가 가끔 뜬다"(2026-08-18 사용자 보고)는
+                // 원래 버그를 그대로 재현한다. 화면은 건드리지 않고 진단용 tracing만 남긴다.
+                tracing::warn!(
+                    kind = "workspace",
+                    phase = "protocol_completion",
+                    error_code = ?code,
+                    "protocol intent completed with error"
+                );
             }
         }
         self.flush_pending_spawn_cd_writes();
@@ -2531,9 +3821,11 @@ impl WorkspaceUi {
         self.workspace_accent = color;
     }
 
-    /// 포커스된 로컬 pane 헤더 옆에 붙일 보조 탭. `None`이면 헤더는 예전 그대로다.
-    pub fn set_aux_tab(&mut self, tab: Option<PaneAuxTab>) {
-        self.aux_tab = tab;
+    /// 포커스된 로컬 pane 헤더 옆에 붙일 보조 탭 목록. 비어 있으면 헤더는 예전 그대로다.
+    /// 개수 상한은 여기서 자르지 않는다 — App이 문서 탭 개수를 이미 유계로 관리하고,
+    /// 좁은 헤더에서의 축약은 `layout_aux_tabs`가 활성 탭을 보존하며 처리한다.
+    pub fn set_aux_tabs(&mut self, tabs: Vec<PaneAuxTab>) {
+        self.aux_tabs = tabs;
     }
 
     pub fn set_ui_scale(&mut self, scale: f32) {
@@ -2697,6 +3989,15 @@ impl WorkspaceUi {
             .collect()
     }
 
+    /// cwd에서 뽑은 프로젝트명이 이 워크스페이스 자신의 이름과 다르면 소속을 함께
+    /// 밝힌다 — 규칙 본문·근거는 모듈 자유 함수 `qualify_project_name` 주석 참고.
+    /// App도 warm/유휴 워크스페이스 표시(`App::activity_session_name`, app.rs)에 같은
+    /// 자유 함수를 쓴다 — 규칙이 두 곳에 따로 구현되면 같은 화면 안에서 표기가 갈릴 수
+    /// 있다(2026-08-19 코드 리뷰).
+    fn qualify_cwd_project_name(&self, project_name: &str) -> String {
+        qualify_project_name(project_name, self.project_name.as_deref())
+    }
+
     /// 세션 표시 제목. 우선순위: ① 사용자 rename(기본 제목이 아니면) → 그대로,
     /// ② OSC 0/2 동적 제목(프로그램이 설정, 예: cwd/명령) → 그 제목, ③ 프로젝트 폴더명(≈깃
     /// 레포명), ④ 원 표기. osc는 이 세션 터미널의 현재 OSC 제목.
@@ -2722,7 +4023,7 @@ impl WorkspaceUi {
             })
             .filter(|t| !t.trim().is_empty())
         {
-            return n.to_owned();
+            return self.qualify_cwd_project_name(n);
         }
         // cwd 미탐지(pid 없음/lsof 지연) 폴백: OSC 타이틀 > 프로젝트명 > 기본.
         if let Some(t) = osc.map(str::trim).filter(|t| !t.is_empty()) {
@@ -2736,10 +4037,14 @@ impl WorkspaceUi {
 
     /// 작업 설명이 아직 없는 에이전트 행에 표시할 안정적인 프로젝트 컨텍스트.
     /// App이 미리 계산한 프로젝트명을 우선하고, 없으면 현재 cwd의 폴더명을 쓴다.
-    fn session_project_context(&self, session: Option<SessionId>) -> Option<&str> {
+    /// resolve_session_title과 같은 이유로 워크스페이스 자체 이름과 다르면 함께 밝힌다
+    /// (qualify_cwd_project_name 주석 참고) — 이 값이 실제로 에이전트 행 1행(헤드라인)에
+    /// 쓰이므로(session_title_lines의 status_line 우선 규칙) 착각은 주로 여기서 보인다.
+    fn session_project_context(&self, session: Option<SessionId>) -> Option<String> {
         session.and_then(|session| {
             let cwd = self.session_cwds.get(&session)?;
-            self.session_project_names
+            let name = self
+                .session_project_names
                 .project_name(session, cwd)
                 .filter(|name| !name.trim().is_empty())
                 .or_else(|| {
@@ -2747,7 +4052,8 @@ impl WorkspaceUi {
                         .file_name()
                         .and_then(|name| name.to_str())
                         .filter(|name| !name.trim().is_empty())
-                })
+                })?;
+            Some(self.qualify_cwd_project_name(name))
         })
     }
 
@@ -2790,10 +4096,38 @@ impl WorkspaceUi {
         for event in events {
             match event {
                 RuntimeEvent::MuxUpdated { snapshot } => {
+                    let split_acknowledged = self.split_drag.as_ref().is_some_and(|transaction| {
+                        matches!(
+                            transaction.phase,
+                            SplitDragPhase::Committed { admitted: true }
+                        ) && mux_split_ratio(snapshot, &transaction.tab, &transaction.path)
+                            .is_some_and(|ratio| (ratio - transaction.ratio).abs() <= 0.0001)
+                    });
+                    let split_tab_disappeared =
+                        self.split_drag.as_ref().is_some_and(|transaction| {
+                            !snapshot.tabs.iter().any(|tab| tab.id == transaction.tab)
+                        });
+                    let split_path_disappeared =
+                        self.split_drag.as_ref().is_some_and(|transaction| {
+                            snapshot.tabs.iter().any(|tab| tab.id == transaction.tab)
+                                && mux_split_ratio(snapshot, &transaction.tab, &transaction.path)
+                                    .is_none()
+                        });
                     // 사라진 세션의 캐시 정리
                     let alive = mux_sessions(snapshot);
                     self.sessions.retain(|id, _| alive.contains(id));
                     self.sent_sizes.retain(|id, _| alive.contains(id));
+                    self.pending_resize_target
+                        .retain(|id, _| alive.contains(id));
+                    self.failed_resize_targets
+                        .retain(|id, _| alive.contains(id));
+                    self.resize_retry.retain(|id, _| alive.contains(id));
+                    self.split_final_resize_sessions
+                        .retain(|id| alive.contains(id));
+                    self.resize_delivery_rollbacks
+                        .retain(|_, rollback| alive.contains(&rollback.session));
+                    self.split_final_resize_pending
+                        .retain(|_, (id, _, _)| alive.contains(id));
                     self.session_project_names =
                         self.session_project_names.retain_live_sessions(&alive);
                     self.last_output_copy_pending
@@ -2828,16 +4162,22 @@ impl WorkspaceUi {
                             view.snapshot = None;
                             view.snapshot_gen = view.snapshot_gen.wrapping_add(1);
                             view.pending_snapshot = None;
+                            view.initial_presentation = None;
+                            view.resize_presentation = None;
                             view.render_cache.clear();
                         }
                     }
-                    // 드래그 중 tab 전환/분할 구조 변경이면 미리보기가 다른 split에
-                    // 잘못 적용될 수 있다 — 구조가 바뀌는 지점에서 정리 (codex 리뷰).
-                    // 리사이즈 자신의 MuxUpdated는 drag_stopped 이후라 잃을 상태가 없다.
-                    if self.mux.as_ref().map(|m| (&m.active_tab, &m.tabs))
-                        != Some((&snapshot.active_tab, &snapshot.tabs))
-                    {
+                    if split_acknowledged {
+                        self.split_final_resize_sessions = visible_mux_sessions(snapshot);
+                        self.pending_resize_target.retain(|session, _| {
+                            !self.split_final_resize_sessions.contains(session)
+                        });
+                        self.staged_terminal_resizes.clear();
                         self.split_drag = None;
+                        self.staged_split_commit_pass = None;
+                    } else if split_tab_disappeared || split_path_disappeared {
+                        self.split_drag = None;
+                        self.staged_split_commit_pass = None;
                     }
                     self.mux = Some(Arc::clone(snapshot));
                 }
@@ -2873,16 +4213,17 @@ impl WorkspaceUi {
                         let frozen = self.selection.is_some_and(|(s, _, _)| s == *session);
                         let view = self.sessions.entry(*session).or_default();
                         view.bracketed_paste = *bracketed_paste;
-                        if frozen {
+                        let now = std::time::Instant::now();
+                        if view.buffer_initial_snapshot(Arc::clone(snapshot), now) {
+                            // split seed는 first nonblank 또는 original deadline까지 보류.
+                        } else if view.buffer_resize_snapshot(Arc::clone(snapshot), now) {
+                            // resize target이 quiet window를 통과할 때까지 last stable 화면 유지.
+                        } else if frozen {
                             // 선택 중엔 표시 snapshot을 얼리되, 최신본은 pending에 보관해
                             // 해제 시 catch-up한다(codex — 안 그러면 화면이 선택 당시에 멈춤).
                             view.pending_snapshot = Some(Arc::clone(snapshot));
                         } else {
-                            view.snapshot = Some(Arc::clone(snapshot));
-                            view.snapshot_gen = view.snapshot_gen.wrapping_add(1);
-                            view.pending_snapshot = None;
-                            // 사이드바 세션 요약 — 마지막 비어있지 않은 행 (2026-07-05)
-                            view.summary = last_line_summary(snapshot);
+                            view.install_snapshot(Arc::clone(snapshot));
                         }
                     }
                 }
@@ -2944,6 +4285,16 @@ impl WorkspaceUi {
                     ));
                 }
                 RuntimeEvent::ShellSpawned { session } => {
+                    if self
+                        .mux
+                        .as_deref()
+                        .is_some_and(|mux| visible_split_contains_session(mux, *session))
+                    {
+                        self.sessions
+                            .entry(*session)
+                            .or_default()
+                            .arm_initial_presentation(std::time::Instant::now());
+                    }
                     self.resolve_pending_shell_spawn(Some(*session));
                 }
                 // Launch correlation is app-owned lifecycle state (approval listener/runtime host),
@@ -3239,6 +4590,7 @@ impl WorkspaceUi {
         self.prepare_frame_with_native_input(ctx, events, catalog, false, || {
             crate::native_key_monitor::NativeKeyDownBatch::default()
         });
+        self.cancel_active_split_drag(ctx);
         self.flush_command_repaint(ctx);
     }
 
@@ -3305,6 +4657,16 @@ impl WorkspaceUi {
                     self.error = Some(crate::ui::render_message(catalog, message));
                 }
                 RuntimeEvent::ShellSpawned { session } => {
+                    if self
+                        .mux
+                        .as_deref()
+                        .is_some_and(|mux| visible_split_contains_session(mux, *session))
+                    {
+                        self.sessions
+                            .entry(*session)
+                            .or_default()
+                            .arm_initial_presentation(std::time::Instant::now());
+                    }
                     self.resolve_pending_shell_spawn(Some(*session));
                 }
                 RuntimeEvent::DurableEventBarrierReached { .. } => {}
@@ -3362,10 +4724,12 @@ impl WorkspaceUi {
                     self.pending_spawn_cwds.remove(index);
                 }
                 Err(WorkspaceProtocolErrorCode::Busy) => return,
-                Err(_) => {
+                Err(code) => {
+                    // spawn 자체는 이미 끝났으니 여기서 밀리면 재시도 여지가 없다 — Busy를
+                    // 뺀 나머지는 report_protocol_queue_rejection 공통 규칙(진짜 유실만
+                    // 배너)을 그대로 따른다.
                     self.pending_spawn_cwds.remove(index);
-                    self.error_is_pressure = false;
-                    self.error = Some("terminal spawn path delivery failed".to_owned());
+                    self.report_protocol_queue_rejection(code, "spawn_cd_write");
                 }
             }
         }
@@ -3380,14 +4744,38 @@ impl WorkspaceUi {
         input_enabled: bool,
     ) -> WorkspaceSurfaceOutput {
         self.prepare_frame(ui.ctx(), events, catalog, input_enabled);
+        request_terminal_os_drag_feedback_repaint(
+            ui.ctx(),
+            input_enabled,
+            ui.input(|input| !input.raw.hovered_files.is_empty()),
+        );
         self.reconcile_explicit_terminal_focus();
+        self.stage_unadmitted_split_commit_for_pass(
+            ui.ctx(),
+            ui.ctx().cumulative_pass_nr(),
+            ui.is_sizing_pass(),
+        );
 
         // 탭바 제거 (2026-07-05): 셸 전환은 좌측 사이드바 세션 목록이 담당하고,
         // 새 셸/분할/닫기는 각 pane 헤더가 담당한다 — 셸 수만큼 탭이 늘어나
         // 상단이 넘치던 문제 해소.
         // 에러 바가 있을 때만 pane과 분리하는 헤어라인을 둔다 — 평소엔 top_bar 하단
         // 헤어라인이 이미 구분선이라 여기 무조건 그리면 라인이 두 줄로 겹쳤다(#64 사용자).
-        if let Some(error) = self.error.clone() {
+        // protocol_request_lost는 catalog 없는 지점(send_keep_selection 등)에서 세운 플래그다
+        // — 여기서만 catalog가 있어 렌더 시점에 한국어(등 로케일) 문구로 채운다. self.error와
+        // 동시에 있을 순 있지만 배너 한 줄만 그리면 충분해 우선순위만 준다(2026-08-18).
+        if self.protocol_request_lost {
+            ui.horizontal(|ui| {
+                ui.colored_label(
+                    ui.visuals().error_fg_color,
+                    catalog.t("workspace.protocol_request_lost", &[]),
+                );
+                if ui.small_button("×").clicked() {
+                    self.protocol_request_lost = false;
+                }
+            });
+            crate::ui::hairline(ui);
+        } else if let Some(error) = self.error.clone() {
             ui.horizontal(|ui| {
                 ui.colored_label(ui.visuals().error_fg_color, error);
                 if ui.small_button("×").clicked() {
@@ -3398,15 +4786,16 @@ impl WorkspaceUi {
         }
 
         let Some(mux) = self.mux.clone() else {
+            self.reconcile_active_split_drag(ui.ctx(), input_enabled, None);
             // 세션이 없어도 이력 보조 탭은 유효하다 — 탭이 열려 있으면 예전처럼
             // 「새 셸」 프롬프트만 남기고 끝내지 않고 탭 스트립과 본문 rect를 만든다.
-            let output = match self.aux_tab.as_ref().map(|tab| tab.active) {
-                Some(active) => self.show_session_less_aux_tabs(ui, catalog, input_enabled, active),
-                None if input_enabled => {
-                    self.show_new_session_prompt(ui, catalog);
-                    WorkspaceSurfaceOutput::default()
-                }
-                None => self.show_disabled_empty_surface(ui),
+            let output = if !self.aux_tabs.is_empty() {
+                self.show_session_less_aux_tabs(ui, catalog, input_enabled)
+            } else if input_enabled {
+                self.show_new_session_prompt(ui, catalog);
+                WorkspaceSurfaceOutput::default()
+            } else {
+                self.show_disabled_empty_surface(ui)
             };
             self.flush_command_repaint(ui.ctx());
             return output;
@@ -3446,19 +4835,22 @@ impl WorkspaceUi {
             .as_ref()
             .and_then(|id| mux.tabs.iter().find(|tab| &tab.id == id))
         else {
+            self.reconcile_active_split_drag(ui.ctx(), input_enabled, None);
             // 세션이 없어도 이력 보조 탭은 유효하다 — 탭이 열려 있으면 예전처럼
             // 「새 셸」 프롬프트만 남기고 끝내지 않고 탭 스트립과 본문 rect를 만든다.
-            let output = match self.aux_tab.as_ref().map(|tab| tab.active) {
-                Some(active) => self.show_session_less_aux_tabs(ui, catalog, input_enabled, active),
-                None if input_enabled => {
-                    self.show_new_session_prompt(ui, catalog);
-                    WorkspaceSurfaceOutput::default()
-                }
-                None => self.show_disabled_empty_surface(ui),
+            let output = if !self.aux_tabs.is_empty() {
+                self.show_session_less_aux_tabs(ui, catalog, input_enabled)
+            } else if input_enabled {
+                self.show_new_session_prompt(ui, catalog);
+                WorkspaceSurfaceOutput::default()
+            } else {
+                self.show_disabled_empty_surface(ui)
             };
             self.flush_command_repaint(ui.ctx());
             return output;
         };
+
+        self.reconcile_active_split_drag(ui.ctx(), input_enabled, Some(&active_tab.id));
 
         // (출력/상태 폴링 제거 — 2026-07-04 상시 리페인트 원인 조사)
         // 예전엔 "가시+실행 세션 = 50ms 폴링"으로 출력을 끌어왔다(wake가 Viewport를
@@ -3471,18 +4863,26 @@ impl WorkspaceUi {
         }
 
         let rect = ui.available_rect_before_wrap();
-        let layout = active_tab.layout.clone();
-        self.aux_tab_pane = self
-            .aux_tab
-            .as_ref()
-            .and_then(|_| aux_tab_owner_pane(&layout, mux.focused_pane.as_ref()));
-        let embedded_headers = keeps_embedded_pane_header(&layout);
+        let layout = &active_tab.layout;
+        let layout_metrics = terminal_layout_metrics(layout);
+        self.aux_tab_pane = (!self.aux_tabs.is_empty())
+            .then(|| {
+                aux_tab_owner_pane(
+                    layout,
+                    self.pending_focus.as_ref(),
+                    mux.focused_pane.as_ref(),
+                )
+            })
+            .flatten();
+        let embedded_headers = keeps_embedded_pane_header(layout);
         let tab_id = active_tab.id.clone();
         let mut split_path = Vec::new();
         let pane_output = self.render_node(
             ui,
             rect,
-            &layout,
+            layout,
+            &layout_metrics,
+            0,
             &mux,
             config,
             &tab_id,
@@ -3497,8 +4897,10 @@ impl WorkspaceUi {
         WorkspaceSurfaceOutput {
             focus_requested: pane_output.focus_requested,
             local_focus_claimed: pane_output.local_focus_claimed,
+            document_drop_paths: pane_output.document_drop_paths,
             aux_tab_intent: pane_output.aux_tab_intent,
             aux_body_rect: pane_output.aux_body_rect,
+            aux_search_toggle_requested: pane_output.aux_search_toggle_requested,
         }
     }
 
@@ -3660,15 +5062,7 @@ impl WorkspaceUi {
         );
         ui.painter()
             .rect_filled(header, 0.0, identity_style.header_fill);
-        ui.painter().hline(
-            header.x_range(),
-            crate::ui::snap_line_to_pixel(
-                header.bottom(),
-                crate::ui::designall::SEPARATOR_WIDTH,
-                ui.ctx().pixels_per_point(),
-            ),
-            crate::ui::designall::separator_stroke(ui.visuals()),
-        );
+        // 하단 구분선 없음 — 일반 pane 헤더와 같은 규칙(2026-08-22).
         if identity_style.top_line.color != egui::Color32::TRANSPARENT {
             ui.painter().hline(
                 header.x_range(),
@@ -3774,7 +5168,6 @@ impl WorkspaceUi {
         ui: &mut egui::Ui,
         catalog: &i18n::Catalog,
         input_enabled: bool,
-        active: bool,
     ) -> WorkspaceSurfaceOutput {
         let rect = ui.available_rect_before_wrap();
         let header_height = TERMINAL_PANE_HEADER_HEIGHT.min(rect.height().max(0.0) * 0.5);
@@ -3798,35 +5191,35 @@ impl WorkspaceUi {
             egui::pos2(label_left + empty_width, header.center().y),
             egui::pos2(label_left + empty_width, header.center().y),
         );
-        let aux_label = self.aux_tab.as_ref().map(|tab| tab.label.clone());
-        let aux = aux_label.as_ref().and_then(|label| {
-            let natural = ui
-                .painter()
-                .layout_no_wrap(label.clone(), font.clone(), egui::Color32::WHITE)
-                .size()
-                .x;
-            pane_aux_tab_geometry(
-                header,
-                pseudo_close,
-                header.right() - 4.0,
-                pane_aux_tab_label_width(header.width(), natural),
-            )
-        });
+        let placements = layout_aux_tabs(
+            header,
+            pseudo_close,
+            header.right() - 4.0,
+            &self.aux_tabs,
+            |label| {
+                ui.painter()
+                    .layout_no_wrap(label.to_owned(), font.clone(), egui::Color32::WHITE)
+                    .size()
+                    .x
+            },
+        );
+        let active_kind = placements.iter().find(|p| p.active).map(|p| p.kind);
+        let any_active = active_kind.is_some();
 
         let style = pane_header_style(self.workspace_accent, true);
-        let accent_range = Some(match aux {
-            Some(geometry) if active => egui::Rangef::new(
-                geometry.tab.left(),
-                geometry.tab.right().min(header.right()),
+        let accent_range = Some(match placements.iter().find(|p| p.active) {
+            Some(placement) => egui::Rangef::new(
+                placement.geometry.tab.left(),
+                placement.geometry.tab.right().min(header.right()),
             ),
-            _ => egui::Rangef::new(
+            None => egui::Rangef::new(
                 header.left(),
                 pane_header_active_boundary(header, pseudo_close),
             ),
         });
         paint_pane_header_base(ui, header, style, accent_range);
-        if let Some(geometry) = aux {
-            paint_tab_divider(ui, header, geometry.tab.left());
+        if let Some(first) = placements.first() {
+            paint_tab_divider(ui, header, first.geometry.tab.left());
         }
 
         let empty_clip = egui::Rect::from_min_max(
@@ -3837,7 +5230,9 @@ impl WorkspaceUi {
             egui::Rect::from_min_max(
                 header.min,
                 egui::pos2(
-                    aux.map_or(header.right(), |geometry| geometry.tab.left()),
+                    placements
+                        .first()
+                        .map_or(header.right(), |p| p.geometry.tab.left()),
                     header.bottom(),
                 ),
             ),
@@ -3849,7 +5244,7 @@ impl WorkspaceUi {
             empty_clip,
             header.center().y,
             font.clone(),
-            if active {
+            if any_active {
                 tokens.muted_text
             } else {
                 tokens.text
@@ -3858,25 +5253,28 @@ impl WorkspaceUi {
         );
 
         let mut output = WorkspaceSurfaceOutput::default();
-        if empty_response.clicked() && active {
-            output.aux_tab_intent = Some(PaneAuxTabIntent::ShowSession);
+        if empty_response.clicked()
+            && let Some(kind) = active_kind
+        {
+            output.aux_tab_intent = Some((kind, PaneAuxTabIntent::ShowSession));
         }
-        if let (Some(geometry), Some(label)) = (aux, aux_label.as_ref())
-            && let Some(intent) = self.render_aux_tab(
+        for (index, placement) in placements.iter().enumerate() {
+            if let Some(intent) = self.render_aux_tab(
                 ui,
                 header,
-                geometry,
-                label,
-                active,
-                ui.id().with("workspace_session_less_aux"),
+                placement.geometry,
+                &placement.label,
+                placement.active,
+                ui.id().with(("workspace_session_less_aux", index)),
                 catalog,
                 &font,
-            )
-        {
-            output.aux_tab_intent = Some(intent);
+                placement.kind,
+            ) {
+                output.aux_tab_intent = Some((placement.kind, intent));
+            }
         }
 
-        if active {
+        if any_active {
             output.aux_body_rect = Some(body);
         } else {
             let mut child = ui.new_child(
@@ -3936,25 +5334,33 @@ impl WorkspaceUi {
         ];
         let title_left = header.left() + PANE_HEADER_TITLE_LEFT;
 
-        // 보조 탭(이력)은 이 프레임의 **소유 pane** 헤더에만 붙는다. 라벨을 먼저 재서
+        // 보조 탭(이력·Git)은 이 프레임의 **소유 pane** 헤더에만 붙는다. 라벨을 먼저 재서
         // 세션 제목이 쓸 수 있는 폭에서 미리 빼둔다 — 뒤늦게 겹치는 일이 없게.
+        // 여기서 뺄 폭은 **모든 탭의 합**이다 — 탭이 둘이면 둘 다 세션 제목보다 우선한다.
         let owns_aux_tab = self
             .aux_tab_pane
             .as_ref()
             .is_some_and(|owner| owner == &pane.id);
-        let aux_label = (owns_aux_tab && self.aux_tab.is_some()).then(|| {
-            let tab = self.aux_tab.as_ref().expect("aux tab checked");
-            let natural = ui
-                .painter()
-                .layout_no_wrap(tab.label.clone(), font.clone(), egui::Color32::WHITE)
-                .size()
-                .x;
-            let width = pane_aux_tab_label_width(header.width(), natural);
-            (tab.label.clone(), tab.active, width)
-        });
-        let aux_reserved_width = aux_label.as_ref().map_or(0.0, |(_, _, width)| {
-            pane_aux_tab_width(*width) + PANE_AUX_TAB_RIGHT_PAD
-        });
+        let aux_tabs: Vec<PaneAuxTab> = if owns_aux_tab {
+            self.aux_tabs.clone()
+        } else {
+            Vec::new()
+        };
+        let aux_reserved_width: f32 = aux_tabs
+            .iter()
+            .map(|tab| {
+                let natural = ui
+                    .painter()
+                    .layout_no_wrap(tab.label.clone(), font.clone(), egui::Color32::WHITE)
+                    .size()
+                    .x;
+                pane_aux_tab_width(pane_aux_tab_label_width(
+                    header.width(),
+                    natural,
+                    aux_tabs.len(),
+                )) + PANE_AUX_TAB_RIGHT_PAD
+            })
+            .sum();
 
         // 우측 도구 4개를 모두 표시하던 기존 제목 폭을 기준으로 실제 글자 수를 구한 뒤
         // 10자를 더 허용한다. 추가 폭이 필요하면 기존 규칙대로 왼쪽 도구부터 숨긴다.
@@ -3988,24 +5394,33 @@ impl WorkspaceUi {
             pane_header_buttons(header, title_width, toolbar_icons.len(), aux_reserved_width);
         let center_y = header.center().y;
         let close = buttons.close;
-        let aux = aux_label.as_ref().and_then(|(_, _, width)| {
-            pane_aux_tab_geometry(header, close, buttons.toolbar_left, *width)
+        let placements = layout_aux_tabs(header, close, buttons.toolbar_left, &aux_tabs, |label| {
+            ui.painter()
+                .layout_no_wrap(label.to_owned(), font.clone(), egui::Color32::WHITE)
+                .size()
+                .x
         });
-        let aux_active = aux_label.as_ref().is_some_and(|(_, active, _)| *active);
+        let active_kind = placements.iter().find(|p| p.active).map(|p| p.kind);
+        // 헤더 chrome(제목 밝기·검색 라우팅)은 레이아웃 결과(placements)가 아니라
+        // 실제 활성 상태(aux_tabs, ground truth)를 따라야 한다 — 헤더가 극단적으로
+        // 좁으면 `layout_aux_tabs`가 활성 탭까지 접어(빈 Vec) 돌려줄 수 있는데, 본문
+        // 게이트는 이미 이 목록으로 문서를 그리고 있어(레이아웃과 무관) 헤더만 다른
+        // 기준을 쓰면 "세션이 선택된 것처럼" 어긋나 보인다(2026-08-22 리뷰).
+        let aux_active = any_aux_tab_active(&aux_tabs);
         let tokens = crate::ui::designall::tokens(ui.visuals());
         let style = pane_header_style(self.workspace_accent, focused);
         // 상단 accent는 **선택된 탭**만 덮는다. 보조 탭이 붙으면 이 선의 범위가 곧
         // 탭 선택 표시라, 별도 선택 위젯을 새로 만들지 않고 같은 chrome을 나눠 쓴다.
-        let accent_range = Some(match aux {
-            Some(geometry) if aux_active => egui::Rangef::new(
-                geometry.tab.left(),
-                geometry.tab.right().min(header.right()),
+        let accent_range = Some(match placements.iter().find(|p| p.active) {
+            Some(placement) => egui::Rangef::new(
+                placement.geometry.tab.left(),
+                placement.geometry.tab.right().min(header.right()),
             ),
-            _ => egui::Rangef::new(header.left(), pane_header_active_boundary(header, close)),
+            None => egui::Rangef::new(header.left(), pane_header_active_boundary(header, close)),
         });
         paint_pane_header_base(ui, header, style, accent_range);
-        if let Some(geometry) = aux {
-            paint_tab_divider(ui, header, geometry.tab.left());
+        if let Some(first) = placements.first() {
+            paint_tab_divider(ui, header, first.geometry.tab.left());
         }
 
         let header_response = ui.interact(
@@ -4020,8 +5435,8 @@ impl WorkspaceUi {
             self.request_pane_focus(pane.id.clone());
             // 보조 탭이 활성인 동안 세션 탭(헤더의 남은 영역)을 누르면 터미널로 돌아간다.
             // 보조 탭·보조 닫기는 **나중에** 등록돼 이 응답을 가져가므로 여기 오지 않는다.
-            if aux_active {
-                output.aux_tab_intent = Some(PaneAuxTabIntent::ShowSession);
+            if let Some(kind) = active_kind {
+                output.aux_tab_intent = Some((kind, PaneAuxTabIntent::ShowSession));
             }
         }
         if input_enabled {
@@ -4102,7 +5517,13 @@ impl WorkspaceUi {
                 TerminalToolbarIcon::SplitRows => catalog.t("workspace.split_vertical", &[]),
             };
             if response.on_hover_text(tooltip).clicked() {
-                if input_enabled {
+                if search_click_targets_aux_search(icon, aux_active) {
+                    // 보조 본문(이력·Git)이 활성이면 Search는 터미널 검색이 아니라
+                    // 보조 검색을 토글한다 — `input_enabled` 게이트는 건드리지 않고
+                    // (입력 소유권 fail-closed 계약 유지) 그 앞에 별도 경로만 더한다.
+                    // 실제 토글은 App(`aux_search.toggle()`)이 한다.
+                    output.aux_search_toggle_requested = true;
+                } else if input_enabled {
                     if !focused {
                         self.request_pane_focus(pane.id.clone());
                     }
@@ -4118,19 +5539,20 @@ impl WorkspaceUi {
 
         // 보조 탭은 헤더·닫기·도구를 모두 등록한 **뒤**에 올린다. egui는 겹칠 때 나중에
         // 등록된 위젯이 클릭을 가져가므로, 이 순서가 곧 "보조 탭 > 세션 헤더" 우선순위다.
-        if let (Some(geometry), Some((label, _, _))) = (aux, aux_label.as_ref())
-            && let Some(intent) = self.render_aux_tab(
+        for (index, placement) in placements.iter().enumerate() {
+            if let Some(intent) = self.render_aux_tab(
                 ui,
                 header,
-                geometry,
-                label,
-                aux_active,
-                egui::Id::new(("terminal_pane_aux", &pane.id)),
+                placement.geometry,
+                &placement.label,
+                placement.active,
+                egui::Id::new(("terminal_pane_aux", &pane.id, index)),
                 catalog,
                 &font,
-            )
-        {
-            output.aux_tab_intent = Some(intent);
+                placement.kind,
+            ) {
+                output.aux_tab_intent = Some((placement.kind, intent));
+            }
         }
         output
     }
@@ -4149,6 +5571,7 @@ impl WorkspaceUi {
         id: egui::Id,
         catalog: &i18n::Catalog,
         font: &egui::FontId,
+        kind: PaneAuxTabKind,
     ) -> Option<PaneAuxTabIntent> {
         let tokens = crate::ui::designall::tokens(ui.visuals());
         let mut intent = None;
@@ -4174,7 +5597,7 @@ impl WorkspaceUi {
             label.to_owned(),
         );
         if tab_response
-            .on_hover_text(catalog.t("workspace.tab.history_hint", &[]))
+            .on_hover_text(catalog.t(kind.hint_key(), &[]))
             .clicked()
         {
             intent = Some(PaneAuxTabIntent::Activate);
@@ -4190,7 +5613,7 @@ impl WorkspaceUi {
             };
             paint_close_glyph(ui.painter(), aux_close.center(), close_color);
             if close_response
-                .on_hover_text(catalog.t("workspace.tab.history_close", &[]))
+                .on_hover_text(catalog.t(kind.close_key(), &[]))
                 .clicked()
             {
                 intent = Some(PaneAuxTabIntent::Close);
@@ -4242,6 +5665,8 @@ impl WorkspaceUi {
         ui: &mut egui::Ui,
         rect: egui::Rect,
         node: &LayoutNode,
+        layout_metrics: &[TerminalLayoutMetric],
+        metric_index: usize,
         mux: &MuxSnapshot,
         config: &TerminalConfig,
         tab_id: &runtime::MuxTabId,
@@ -4274,51 +5699,54 @@ impl WorkspaceUi {
                 first,
                 second,
             } => {
+                let first_metric_index = metric_index + 1;
+                let second_metric_index =
+                    first_metric_index + layout_metrics[first_metric_index].subtree_len;
+                let first_min = layout_metrics[first_metric_index].min_size;
+                let second_min = layout_metrics[second_metric_index].min_size;
                 // 목업처럼 pane을 붙이고 1px 구분선만 둔다 (기존 4px 투명 gap 제거).
                 // 리사이즈 잡기는 split_handle이 히트영역을 ±2px 확장해 보장한다.
-                let gap = 1.0;
+                let gap = terminal_split_gap(rect, *direction);
+                // egui는 이전 pass의 widget rect로 현재 drag owner를 먼저 확정한다. 그 owner를
+                // child보다 먼저 읽어 transaction/fence가 같은 프레임의 pane settlement보다
+                // 앞서게 한다. 실제 interact 등록은 hit 우선권을 위해 계속 child 뒤에 둔다.
+                if mode.input_enabled()
+                    && ui.ctx().is_being_dragged(split_handle_id(tab_id, path))
+                    && let Some(pointer) = ui.input(|input| input.pointer.interact_pos())
+                {
+                    let requested_ratio = match direction {
+                        SplitDirection::Horizontal => {
+                            (pointer.x - rect.min.x) / (rect.width() - gap)
+                        }
+                        SplitDirection::Vertical => {
+                            (pointer.y - rect.min.y) / (rect.height() - gap)
+                        }
+                    };
+                    let ratio = terminal_split_ratio(
+                        rect,
+                        *direction,
+                        requested_ratio,
+                        first_min,
+                        second_min,
+                    );
+                    self.begin_split_drag(tab_id.clone(), path.to_vec(), ratio);
+                }
                 // 드래그 중이면 로컬 미리보기 ratio 사용 (릴리즈 시에만 명령 전송)
-                let ratio = match &self.split_drag {
-                    Some((drag_path, preview)) if drag_path == path => *preview,
-                    _ => *ratio,
-                };
-                let (first_rect, second_rect, gap_rect) = match direction {
-                    SplitDirection::Horizontal => {
-                        // 좌/우 분할
-                        let split_x = rect.min.x + (rect.width() - gap) * ratio;
-                        (
-                            egui::Rect::from_min_max(rect.min, egui::pos2(split_x, rect.max.y)),
-                            egui::Rect::from_min_max(
-                                egui::pos2(split_x + gap, rect.min.y),
-                                rect.max,
-                            ),
-                            egui::Rect::from_min_max(
-                                egui::pos2(split_x, rect.min.y),
-                                egui::pos2(split_x + gap, rect.max.y),
-                            ),
-                        )
-                    }
-                    SplitDirection::Vertical => {
-                        // 상/하 분할
-                        let split_y = rect.min.y + (rect.height() - gap) * ratio;
-                        (
-                            egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, split_y)),
-                            egui::Rect::from_min_max(
-                                egui::pos2(rect.min.x, split_y + gap),
-                                rect.max,
-                            ),
-                            egui::Rect::from_min_max(
-                                egui::pos2(rect.min.x, split_y),
-                                egui::pos2(rect.max.x, split_y + gap),
-                            ),
-                        )
-                    }
-                };
+                let requested_ratio = self.split_preview_ratio(tab_id, path, *ratio);
+                // 저장된 ratio가 오래된 10% 규칙이나 remote snapshot에서 왔더라도 현재
+                // rect와 subtree의 실제 minimum으로 다시 제한한다. 창 축소도 같은 경로라
+                // divider를 드래그하지 않아도 모든 leaf가 가능한 한 50px를 유지한다.
+                let ratio =
+                    terminal_split_ratio(rect, *direction, requested_ratio, first_min, second_min);
+                let (first_rect, second_rect, gap_rect) =
+                    terminal_split_rects(rect, *direction, ratio);
                 path.push(0);
                 let mut output = self.render_node(
                     ui,
                     first_rect,
                     first,
+                    layout_metrics,
+                    first_metric_index,
                     mux,
                     config,
                     tab_id,
@@ -4333,6 +5761,8 @@ impl WorkspaceUi {
                     ui,
                     second_rect,
                     second,
+                    layout_metrics,
+                    second_metric_index,
                     mux,
                     config,
                     tab_id,
@@ -4346,7 +5776,7 @@ impl WorkspaceUi {
                 // 우선이라, ±2px 확장 히트영역이 터미널 선택 드래그에 밀리지 않는다
                 // (codex 리뷰: 가장자리에서 리사이즈 대신 선택이 잡히는 문제).
                 if mode.input_enabled() {
-                    self.split_handle(ui, rect, gap_rect, *direction, gap, tab_id, path);
+                    self.split_handle(ui, rect, gap_rect, *direction, tab_id, path);
                 } else {
                     ui.painter().rect_filled(
                         gap_rect,
@@ -4368,16 +5798,12 @@ impl WorkspaceUi {
         rect: egui::Rect,
         gap_rect: egui::Rect,
         direction: SplitDirection,
-        gap: f32,
         tab_id: &runtime::MuxTabId,
         path: &[u8],
     ) {
-        // 4px 경계는 잡기 어려우니 히트 영역만 양쪽 2px씩 확장 (시각 폭은 그대로)
-        let hit_rect = gap_rect.expand2(match direction {
-            SplitDirection::Horizontal => egui::vec2(2.0, 0.0),
-            SplitDirection::Vertical => egui::vec2(0.0, 2.0),
-        });
-        let id = egui::Id::new(("split_handle", tab_id, path));
+        // 1px 경계는 잡기 어려우니 히트 영역만 양쪽 2px씩 확장 (시각 폭은 그대로)
+        let hit_rect = terminal_split_hit_rect(rect, gap_rect, direction);
+        let id = split_handle_id(tab_id, path);
         let resp = ui.interact(hit_rect, id, egui::Sense::drag());
         let cursor = match direction {
             SplitDirection::Horizontal => egui::CursorIcon::ResizeHorizontal,
@@ -4391,25 +5817,13 @@ impl WorkspaceUi {
             tokens.separator
         };
         ui.painter().rect_filled(gap_rect, 0.0, color);
-        if resp.dragged()
-            && let Some(pointer) = resp.interact_pointer_pos()
-        {
-            let ratio = match direction {
-                SplitDirection::Horizontal => (pointer.x - rect.min.x) / (rect.width() - gap),
-                SplitDirection::Vertical => (pointer.y - rect.min.y) / (rect.height() - gap),
-            }
-            .clamp(0.1, 0.9);
-            self.split_drag = Some((path.to_vec(), ratio));
-        }
         if resp.drag_stopped()
-            && let Some((drag_path, ratio)) = self.split_drag.take()
-            && drag_path == path
+            && self
+                .split_drag
+                .as_ref()
+                .is_some_and(|transaction| &transaction.tab == tab_id && transaction.path == path)
         {
-            self.send(RuntimeCommand::ResizeSplit {
-                tab: tab_id.clone(),
-                path: drag_path,
-                ratio,
-            });
+            self.commit_split_drag(ui.ctx().cumulative_pass_nr());
         }
     }
 
@@ -4477,7 +5891,7 @@ impl WorkspaceUi {
                 .aux_tab_pane
                 .as_ref()
                 .is_some_and(|owner| owner == pane_id)
-                && self.aux_tab.as_ref().is_some_and(|tab| tab.active)
+                && self.aux_tabs.iter().any(|tab| tab.active)
             {
                 render_output.aux_body_rect = Some(pane_layout.surface);
                 return render_output;
@@ -4507,13 +5921,12 @@ impl WorkspaceUi {
 
         // 제목/닫기/검색/새 셸/분할은 각 leaf의 얇은 헤더에 있고, 본문은 그 아래를
         // 카드 외곽 여백 없이 채운다.
-        // 드롭 대상 표시는 pane 외곽선이 아니라 **글자가 실제로 들어갈 자리**에 그린다.
-        // 여기서는 여부만 기억하고, 커서 셀의 픽셀 위치를 아는 draw 이후에 그린다
-        // (2026-08-10 사용자: 테두리 말고 공간이 열려 들어가는 느낌으로).
-        let mut drop_target_hovered = false;
+        // 텍스트는 셀 위치를 아는 draw 이후에 삽입 마커를, 파일은
+        // 문서 탭으로 열린다는 별도 표시를 그린다.
+        let mut drop_feedback = None;
         if mode.is_local() && input_enabled && pane.session_id.is_some() {
-            // OS 파일 드롭 — 이 pane 위에서 놓으면 ⌘V 경로 붙여넣기와 같은 바이트를
-            // 세션에 쓴다(workspace.rs의 paths_insert_paste_bytes, ⌘V 경로와 동일 규칙).
+            // OS 파일 드롭 — 이 pane 위에서 놓으면 App이 문서 탭으로 열 경로 intent를
+            // 올린다. 텍스트 드롭만 기존처럼 터미널 입력으로 보낸다.
             // winit 0.30이 macOS draggingUpdated:를 구현하지 않아 드래그 중 egui
             // 포인터가 갱신되지 않는다 — file_tree.rs의 os_drag_pointer_pos로 신뢰
             // 가능한 위치를 구하고, 실패(kittest 등)하면 egui 포인터로 폴백한다
@@ -4537,21 +5950,24 @@ impl WorkspaceUi {
                 .flatten();
             let os_over_pane = os_drag_pos.is_some_and(|pos| pane_rect.contains(pos));
 
-            drop_target_hovered = pane_resp
-                .dnd_hover_payload::<std::path::PathBuf>()
-                .is_some()
-                || pane_resp
+            drop_feedback = classify_terminal_drop_feedback(
+                pane_resp
+                    .dnd_hover_payload::<std::path::PathBuf>()
+                    .is_some(),
+                pane_resp
                     .dnd_hover_payload::<TerminalTextDragPayload>()
-                    .is_some()
-                || (os_drag_active && os_over_pane);
+                    .is_some(),
+                os_drag_active && os_over_pane,
+            );
             if let Some(session) = pane.session_id {
                 if let Some(path) = release_typed_dnd_payload::<std::path::PathBuf>(&pane_resp) {
-                    let bytes = path_insert_paste_bytes(
-                        &path,
-                        self.session_shell_kind(session),
-                        self.session_bracketed_paste(session),
-                    );
-                    self.send(RuntimeCommand::WriteInput { session, bytes });
+                    render_output
+                        .document_drop_paths
+                        .push(path.as_ref().clone());
+                    render_output.local_focus_claimed = Some(pane_id.clone());
+                    if !focused {
+                        self.request_pane_focus(pane_id.clone());
+                    }
                 }
                 if let Some(text) = release_typed_dnd_payload::<TerminalTextDragPayload>(&pane_resp)
                 {
@@ -4562,12 +5978,11 @@ impl WorkspaceUi {
                     self.send(RuntimeCommand::WriteInput { session, bytes });
                 }
                 if !os_dropped.is_empty() && os_over_pane {
-                    let bytes = paths_insert_paste_bytes(
-                        &os_dropped,
-                        self.session_shell_kind(session),
-                        self.session_bracketed_paste(session),
-                    );
-                    self.send(RuntimeCommand::WriteInput { session, bytes });
+                    render_output.document_drop_paths.extend(os_dropped);
+                    render_output.local_focus_claimed = Some(pane_id.clone());
+                    if !focused {
+                        self.request_pane_focus(pane_id.clone());
+                    }
                 }
             }
         }
@@ -4668,6 +6083,9 @@ impl WorkspaceUi {
                 );
             }
         }
+        let pane_feedback_painter =
+            matches!(drop_feedback, Some(TerminalDropFeedback::DocumentOpen))
+                .then(|| ui.painter().clone());
         let mut terminal_ui = ui.new_child(
             egui::UiBuilder::new()
                 .max_rect(pane_layout.content)
@@ -4695,17 +6113,32 @@ impl WorkspaceUi {
         let cols =
             ((renderer_egui::grid_width_for_available(avail.x) / cell.x) as u16).clamp(10, 500);
         let rows = renderer_egui::grid_rows_for_available(avail.y, cell.y);
-        self.queue_terminal_resize(session, cols, rows);
+        // 창 드래그로 avail이 프레임마다 바뀌는 동안 cols/rows도 매 프레임 바뀐다 — 그대로
+        // 보내면 드래그 내내 PTY가 매번 reflow하며 화면이 깜빡인다. 디바운스 래퍼가 목표가
+        // 안정될 때까지 기다렸다가 한 번만 보낸다(최종 크기는 request_repaint_after로 보장).
+        self.stage_terminal_resize_for_pass(
+            ui.ctx().cumulative_pass_nr(),
+            ui.is_sizing_pass(),
+            session,
+            cols,
+            rows,
+        );
 
+        if let Some(after) =
+            self.settle_session_resize_presentation(session, std::time::Instant::now())
+        {
+            ui.ctx().request_repaint_after(after);
+        }
         let selected = self.selection.is_some_and(|(s, _, _)| s == session);
         let (exit_code, bracketed, restored_readonly, snapshot) = {
             let view = self.sessions.entry(session).or_default();
+            if let Some(after) = view.settle_initial_presentation(std::time::Instant::now()) {
+                ui.ctx().request_repaint_after(after);
+            }
             // 선택이 없으면(freeze 해제) freeze 중 보관한 최신본으로 catch-up한다 — 새
             // Viewport가 안 와도 화면이 선택 당시에 멈추지 않게(codex).
             if !selected && let Some(pending) = view.pending_snapshot.take() {
-                view.summary = last_line_summary(&pending);
-                view.snapshot = Some(pending);
-                view.snapshot_gen = view.snapshot_gen.wrapping_add(1);
+                view.install_snapshot(pending);
             }
             let Some(snapshot) = view.snapshot.clone() else {
                 let message = match mode {
@@ -4774,18 +6207,41 @@ impl WorkspaceUi {
         // B1 실측: 이 프레임에 그린 pane들의 렌더 비용을 합산한다 (visible pane 전부).
         self.frame_counters += output.counters;
 
-        // 드롭 삽입 마커. 떨어뜨리면 경로/텍스트는 **셸 입력줄 커서 위치**로 들어가므로
-        // (아래 release 처리의 path_insert_paste_bytes) 그 자리를 가리킨다. 터미널은 고정
-        // 셀 격자라 실제로 행을 벌릴 수 없어, 커서 셀 폭만큼 슬롯을 열어 보여주는 것으로
-        // 대신한다 — Finder에서 틈이 벌어지는 것과 같은 신호를 위치로 준다.
-        if drop_target_hovered {
-            Self::paint_drop_insertion_marker(
-                ui,
-                output.origin,
-                output.cell_size,
-                snapshot.cursor.col,
-                snapshot.cursor.row,
-            );
+        match drop_feedback {
+            Some(TerminalDropFeedback::TerminalInsert) => {
+                Self::paint_drop_insertion_marker(
+                    ui,
+                    output.origin,
+                    output.cell_size,
+                    snapshot.cursor.col,
+                    snapshot.cursor.row,
+                );
+            }
+            Some(TerminalDropFeedback::DocumentOpen) => {
+                let painter = pane_feedback_painter
+                    .expect("document drop feedback painter")
+                    .with_clip_rect(pane_rect);
+                let style = PaneDropFeedbackStyle {
+                    label_fill: tokens.input_background,
+                    label_text: tokens.text,
+                    ..pane_drop_feedback_style(tokens)
+                };
+                painter.rect_filled(pane_rect, 0.0, tokens.accent.gamma_multiply(0.10));
+                if let Some(label) = layout_pane_drop_feedback_label(
+                    &painter,
+                    pane_rect,
+                    catalog.t("workspace.drop.open_document", &[]),
+                    style,
+                ) {
+                    painter.rect_filled(label.rect, 4.0, style.label_fill);
+                    painter.galley(
+                        label.rect.min + egui::vec2(6.0, 3.0),
+                        label.galley,
+                        style.label_text,
+                    );
+                }
+            }
+            None => {}
         }
 
         // 선택된 텍스트 위에서 시작한 드래그는 terminal-internal DnD payload가 된다.
@@ -4861,13 +6317,28 @@ impl WorkspaceUi {
                     }
                 }
             }
-            if output.response.double_clicked()
+            if (output.response.double_clicked() || output.response.triple_clicked())
                 && let Some(pos) = output.response.interact_pointer_pos()
             {
-                // 더블클릭 → 커서 아래 단어(공백 구분) 선택 (복사용). URL 열기는 단일
-                // 클릭(위 hover/click 블록)으로 이동 — 여기서도 열면 이중 발화된다
-                // (2026-07-17). 파일 열기는 우클릭 메뉴, 폴더 진입은 단일 클릭 담당.
-                if let Some((s, e)) = word_range_at(&snapshot, cell_at(pos)) {
+                // 더블클릭 → 커서가 놓인 **행 전체** 선택 (2026-08-17 사용자 요청).
+                // 예전에는 단어를 잡았는데, 터미널에서 복사하고 싶은 단위는 명령 한 줄이나
+                // 출력 한 줄인 경우가 압도적이라 행으로 바꿨다.
+                //
+                // 트리플클릭도 **같은 행 선택**으로 받는다(멱등). egui의
+                // `double_clicked()`는 count==2일 때만 참이라, 3연클릭은 아래 else-if
+                // 사슬 끝의 `terminal_primary_pointer_clicked` 분기로 떨어져 **방금 만든
+                // 선택을 지웠다**. 다른 터미널(iTerm2 등)이 트리플클릭=행 선택이라 이어
+                // 클릭하는 사용자가 많다(2026-08-18 리뷰). 창 안에서 4번째 이상 연타해도
+                // egui가 count를 3으로 유지하므로 선택이 계속 살아 있다.
+                //
+                // 선택 위에서 드래그하면 행 전체가 DnD 페이로드가 된다(다른 pane에 끌어다
+                // 놓으면 그 세션 입력으로 들어간다). 그래서 더블클릭 직후 드래그로 **일부만
+                // 다시 잡을 수는 없다** — 먼저 한 번 클릭해 선택을 지워야 한다. DnD를
+                // 살리기로 한 사용자 결정이다(2026-08-18).
+                //
+                // URL 열기는 단일 클릭(위 hover/click 블록)이 담당한다 — 여기서도 열면
+                // 이중 발화된다(2026-07-17). 파일 열기는 우클릭 메뉴, 폴더 진입은 단일 클릭.
+                if let Some((s, e)) = line_range_at(&snapshot, cell_at(pos)) {
                     self.selection = Some((session, s, e));
                 }
             } else if output.response.drag_started()
@@ -4994,15 +6465,17 @@ impl WorkspaceUi {
             }
         }
 
-        // 파일 트리에서 드래그한 경로를 터미널 위에 드롭 → 입력으로 삽입 (2026-07-05).
+        // 파일 트리에서 드래그한 경로를 터미널 위에 드롭 → 문서 intent로 전달.
         // hover 테두리는 위 pane 배경 경로가 pane_rect에 그린다.
         if mode.is_local()
             && input_enabled
             && let Some(path) = release_typed_dnd_payload::<std::path::PathBuf>(&output.response)
         {
-            let bytes = path_insert_paste_bytes(&path, self.session_shell_kind(session), bracketed);
-            self.send(RuntimeCommand::WriteInput { session, bytes });
-            if mode.is_local() && !focused {
+            render_output
+                .document_drop_paths
+                .push(path.as_ref().clone());
+            render_output.local_focus_claimed = Some(pane_id.clone());
+            if !focused {
                 self.request_pane_focus(pane_id.clone());
             }
         }
@@ -5050,6 +6523,7 @@ impl WorkspaceUi {
             terminal_keyboard_active,
             terminal_owns_ime_events,
             !self.preedit.is_empty(),
+            renderer_egui::frame_has_active_preedit(ui.ctx()),
             ui.ctx().text_edit_focused(),
             ui.ctx().any_popup_open(),
             any_blocking_window_visible,
@@ -5256,10 +6730,23 @@ impl WorkspaceUi {
             let whole_rows = self.scroll_residual.trunc() as i32;
             if whole_rows != 0 {
                 self.scroll_residual -= whole_rows as f32;
-                self.send(RuntimeCommand::Scroll {
+                // 드래그 중이면 선택을 보존한 채 스크롤한다 — 한 화면을 넘는 범위를 휠로
+                // 이어 잡을 수 있어야 한다(`wheel_scroll_keeps_selection` 참고). 선택
+                // 앵커는 아래 `dragged()` 분기가 스냅샷 도착 시 `shift_selection_cell`로
+                // 보정하므로, 여기서는 해제만 피하면 된다.
+                let keep = wheel_scroll_keeps_selection(
+                    output.response.dragged(),
+                    self.selection.is_some_and(|(s, _, _)| s == session),
+                );
+                let command = RuntimeCommand::Scroll {
                     session,
                     delta: whole_rows,
-                });
+                };
+                if keep {
+                    self.send_keep_selection(command);
+                } else {
+                    self.send(command);
+                }
             }
         }
 
@@ -5631,10 +7118,7 @@ impl WorkspaceUi {
                     && let Some(PathClick::OpenFile(path)) =
                         self.resolve_path_cached(sel_session, text.trim())
                 {
-                    let name = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+                    let name = super::path_file_name_display(&path);
                     if ui
                         .button(catalog.t("workspace.open_file", &[("name", name.as_str())]))
                         .clicked()
@@ -5897,7 +7381,12 @@ impl WorkspaceUi {
                     Some(d) => (
                         Some(agent_info_line(d)),
                         Some(session_status_label(status, catalog)),
-                        Some(agent_activity_line(d, project_context, status, catalog)),
+                        Some(agent_activity_line(
+                            d,
+                            project_context.as_deref(),
+                            status,
+                            catalog,
+                        )),
                     ),
                     None => (None, None, None),
                 };
@@ -5952,23 +7441,26 @@ impl WorkspaceUi {
         if cwd.as_ref().is_some_and(|cwd| {
             cwd.is_empty() || cwd.len() > WORKSPACE_PATH_MAX_BYTES || cwd.as_bytes().contains(&0)
         }) {
-            self.error_is_pressure = false;
-            self.error = Some("terminal spawn path rejected".to_owned());
+            // cwd는 항상 앱이 자체 추적하는 실제 경로에서 오므로 이 분기는 사실상 도달
+            // 불가한 내부 불변식 방어다 — 사용자가 직접 만든 값이 아니라 배너로 보여줘도
+            // 이해도 대응도 못 한다. 진단용 로그만 남긴다.
+            tracing::warn!(
+                kind = "workspace",
+                phase = "spawn_admission",
+                error_code = "invalid_cwd",
+                "spawn cwd failed validation"
+            );
             return;
         }
-        if self
-            .queue_protocol_intent_with_spawn_cwd(
-                RuntimeCommand::SpawnShell {
-                    cols: 80,
-                    rows: 24,
-                    scrollback_lines,
-                },
-                cwd,
-            )
-            .is_err()
-        {
-            self.error_is_pressure = false;
-            self.error = Some("terminal protocol request rejected".to_owned());
+        if let Err(code) = self.queue_protocol_intent_with_spawn_cwd(
+            RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines,
+            },
+            cwd,
+        ) {
+            self.report_protocol_queue_rejection(code, "spawn_admission");
         }
     }
 
@@ -6166,12 +7658,53 @@ impl WorkspaceUi {
     /// 선택을 해제하지 않는 send — 드래그 오토스크롤 전용(선택을 유지·확장하며
     /// 스크롤해야 한다). 휠/타이핑은 반드시 [`Self::send`]를 쓴다.
     fn send_keep_selection(&mut self, command: RuntimeCommand) -> bool {
-        if self.queue_protocol_intent(command).is_err() {
-            self.error_is_pressure = false;
-            self.error = Some("terminal protocol request rejected".to_owned());
-            false
-        } else {
-            true
+        match self.queue_protocol_intent(command) {
+            Ok(()) => true,
+            Err(code) => {
+                self.report_protocol_queue_rejection(code, "protocol_queue");
+                false
+            }
+        }
+    }
+
+    /// queue_protocol_intent*의 동기 거부(2026-08-18, "terminal protocol request rejected"
+    /// 배너 버그 수정)를 공통 처리한다. Busy(자연히 풀리는 큐 포화)와 InvalidCommand(사용자가
+    /// 만들 수 없는 내부 계약 위반)는 배너를 띄워도 대응할 수 없어 tracing만 남긴다.
+    /// PayloadTooLarge/DeliveryFailed만 정말 되돌릴 수 없이 사라진 요청이라
+    /// protocol_request_lost를 세워 show_with_input이 catalog로 배너를 채우게 한다.
+    fn report_protocol_queue_rejection(
+        &mut self,
+        code: WorkspaceProtocolErrorCode,
+        phase: &'static str,
+    ) {
+        match code {
+            WorkspaceProtocolErrorCode::Busy => {
+                tracing::debug!(
+                    kind = "workspace",
+                    phase = phase,
+                    error_code = "busy",
+                    "protocol queue saturated; caller may retry"
+                );
+            }
+            WorkspaceProtocolErrorCode::InvalidCommand => {
+                tracing::warn!(
+                    kind = "workspace",
+                    phase = phase,
+                    error_code = "invalid_command",
+                    "internal protocol command failed validation"
+                );
+            }
+            WorkspaceProtocolErrorCode::PayloadTooLarge
+            | WorkspaceProtocolErrorCode::DeliveryFailed => {
+                self.error_is_pressure = false;
+                self.protocol_request_lost = true;
+                tracing::warn!(
+                    kind = "workspace",
+                    phase = phase,
+                    error_code = ?code,
+                    "terminal request was dropped"
+                );
+            }
         }
     }
 }
@@ -6255,9 +7788,74 @@ pub(crate) fn display_pane_title(raw: &str, catalog: &i18n::Catalog) -> String {
     raw.to_owned()
 }
 
+/// cwd에서 뽑은 프로젝트명이 이 프로젝트명이 속한 워크스페이스 **자신의** 이름과 다를
+/// 때 그 프로젝트명만 단독으로 보여주면, 세션이 실제로는 그대로인데도 "다른
+/// 워크스페이스의 세션이 섞여 들어왔다"는 착각을 준다(2026-08-19 사용자 보고 —
+/// Crawler 워크스페이스를 펼쳤더니 그 안의 세션이 「Design」으로 보였다. 실제로는
+/// Crawler 세션이 cwd만 다른 프로젝트(Design이라는 이름의 다른 폴더)를 가리켰을 뿐
+/// 세션이 섞인 게 아니었다 — 하필 그 폴더명이 다른 실제 워크스페이스 이름과 같아서
+/// 착각이 생겼다). 두 이름이 같으면(가장 흔한 경우 — 워크스페이스 루트에서 그대로
+/// 작업 중) 프로젝트명 그대로 보여 정보 중복이 없게 하고, 다르면 "프로젝트명
+/// (워크스페이스명)"으로 소속을 함께 밝힌다 — 다른 워크스페이스 세션을 옆에 열 때 쓰는
+/// attached_workspace_title(app.rs)과 같은 표기 관례라 사용자가 이미 본 패턴이다. cwd
+/// 기반 프로젝트명 자체는 다른 폴더에서 띄운 세션을 구분하는 원래 목적대로 계속
+/// 보여준다 — 워크스페이스 이름으로 완전히 대체하면 그 값어치가 없어진다.
+/// (주의: 이 함수는 "작업 워크스페이스 목록"과 "환경 및 API 프로젝트 목록"의 독립을
+/// 다루지 않는다 — 그건 closed_workspace_ids/hidden_env_project_ids의 별개 문제다.
+/// 여기서 섞이는 건 같은 세션 표시줄 안의 두 이름(워크스페이스 자체 이름 vs cwd
+/// 프로젝트명)일 뿐이다.)
+///
+/// 활성 워크스페이스(`WorkspaceUi::resolve_session_title`/`session_project_context`)와
+/// warm·유휴 워크스페이스(`App::activity_session_name`, app.rs)가 **같은 화면
+/// 문법**(사이드바 트리, 활동 패널, 폰 대시보드, OS 알림 모두 같은 세션 표시줄
+/// 규칙을 공유한다)을 쓰므로 이 규칙을 leaf(workspace.rs)의 순수 자유 함수로 뽑아
+/// 두 쪽이 같이 쓴다 — App은 leaf를 참조해도 되지만 leaf는 App을 참조하면 안 되므로
+/// (「App::ui 안에서 IO 직접 호출 금지」와 같은 leaf/App 경계 방향) 위치는 leaf쪽이다.
+/// App은 이미 계산해 갖고 있는 workspace_name 문자열만 넘기면 되는 순수 함수라
+/// app.rs에서 가져다 쓰기도 쉽다.
+pub(crate) fn qualify_project_name(project_name: &str, workspace_name: Option<&str>) -> String {
+    match workspace_name.map(str::trim).filter(|own| !own.is_empty()) {
+        Some(own) if own != project_name => format!("{project_name} ({own})"),
+        _ => project_name.to_owned(),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TerminalTextDragPayload {
     text: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalDropFeedback {
+    TerminalInsert,
+    DocumentOpen,
+}
+
+fn classify_terminal_drop_feedback(
+    typed_path_hovered: bool,
+    terminal_text_hovered: bool,
+    os_file_over_pane: bool,
+) -> Option<TerminalDropFeedback> {
+    if typed_path_hovered || os_file_over_pane {
+        Some(TerminalDropFeedback::DocumentOpen)
+    } else if terminal_text_hovered {
+        Some(TerminalDropFeedback::TerminalInsert)
+    } else {
+        None
+    }
+}
+
+fn request_terminal_os_drag_feedback_repaint(
+    ctx: &egui::Context,
+    input_enabled: bool,
+    os_drag_active: bool,
+) {
+    if input_enabled && os_drag_active {
+        // macOS winit 0.30은 draggingUpdated: 포인터 이동 이벤트를 주지 않는다.
+        // OS drag가 실제로 진행 중일 때만 다음 frame을 요청해 AppKit 좌표를
+        // 다시 샘플링한다. hovered_files가 비면 즉시 종료되어 idle 타이머가 남지 않는다.
+        ctx.request_repaint();
+    }
 }
 
 fn release_typed_dnd_payload<Payload>(response: &egui::Response) -> Option<Arc<Payload>>
@@ -6286,6 +7884,31 @@ fn drag_autoscroll_rate(pointer_y: f32, top: f32, bottom: f32, cell_h: f32) -> f
         return 0.0;
     };
     (overshoot / cell_h.max(1.0) * 8.0).clamp(-60.0, 60.0)
+}
+
+/// 휠 스크롤이 선택을 **보존**해야 하는가.
+///
+/// 평상시 휠은 선택을 해제한다(`send`) — 선택 중엔 화면이 freeze돼 있어서, 안 지우면
+/// 스크롤해도 화면이 멈춘 듯 보이기 때문이다(2026-07 사용자 보고).
+///
+/// 그런데 **드래그하는 도중에는** 반대다. 한 화면에 안 들어오는 범위를 잡으려면 버튼을
+/// 누른 채 휠로 화면을 옮기며 계속 끌 수 있어야 하는데, 여기서 선택이 풀리면 매번
+/// 처음부터 다시 잡아야 한다(2026-08-18 사용자 요청). 포인터를 pane 밖으로 밀어내는
+/// 기존 오토스크롤(`drag_autoscroll_rate`)과 같은 목적이고, 휠은 그보다 정밀하다.
+///
+/// 판정은 **드래그 중 + 그 세션의 선택이 살아 있음**이다.
+///
+/// `Response::dragged()`를 쓴다. 처음엔 "포인터가 멈춘 프레임엔 false가 된다"고 보고
+/// `pointer.primary_down()`을 썼는데 **그건 사실이 아니다** — egui 0.35의
+/// `interaction.rs`는 이전 프레임 값을 물려받고 릴리즈/Escape에서만 초기화하므로,
+/// 버튼을 누른 채 가만히 있어도 `dragged()`는 계속 true다(2026-08-18 리뷰가 egui 단독
+/// 프로젝트로 실측). 오히려 `primary_down`이 **더 넓어서** 문제였다 — 누른 직후
+/// 클릭/드래그 판정 유예 구간에도 참이라, 아래 `dragged()` 분기(앵커를 보정하는 그
+/// 분기)가 아직 안 도는데 스크롤만 나가 한 순간 화면이 안 따라오는 창이 생긴다.
+///
+/// 즉 **스크롤을 보존해 보내는 조건과 앵커를 보정하는 조건이 같아야** 어긋나지 않는다.
+fn wheel_scroll_keeps_selection(dragging: bool, selection_on_session: bool) -> bool {
+    dragging && selection_on_session
 }
 
 /// 스크롤로 화면이 delta_rows행 이동했을 때(양수=과거로 → 내용이 아래로 이동)
@@ -6330,17 +7953,31 @@ fn clean_terminal_selection_for_copy(text: &str) -> String {
     cleaned.join(" ")
 }
 
-/// 세션 행 2행: "[PTY] Codex · gpt-5.5 · xhigh · ctx 69%" (빈 부분은 생략).
+/// 모델명이 이미 provider 이름을 품고 있는가 — `Claude · claude-opus-5`처럼 같은
+/// 낱말이 한 줄에 두 번 나오는 것을 막는다(2026-08-20 사용자).
+///
+/// 포함 여부로만 판단한다: `claude-opus-5`는 "claude"를 품으므로 provider 라벨을
+/// 빼고, `gpt-5.6-sol`은 "codex"를 품지 않으므로 **남긴다** — 그 경우엔 라벨이 어느
+/// 에이전트인지 알려주는 유일한 단서라 지우면 정보가 준다.
+fn model_implies_provider(provider_label: &str, model: &str) -> bool {
+    let provider = provider_label.trim().to_ascii_lowercase();
+    !provider.is_empty() && model.to_ascii_lowercase().contains(&provider)
+}
+
+/// 세션 행 2행: "Codex · gpt-5.5 · xhigh · ctx 69%" (빈 부분은 생략).
 fn agent_info_line(d: &crate::agent_detect::AgentDisplay) -> String {
-    use crate::agent_surface::{AgentProvider, AgentTransport};
+    use crate::agent_surface::AgentProvider;
 
     let provider = AgentProvider::from(d.kind);
-    let mut parts = vec![format!(
-        "[{}] {}",
-        AgentTransport::Pty.badge(),
-        provider.label()
-    )];
-    if let Some(m) = d.model.as_deref().filter(|s| !s.is_empty()) {
+    // 전송 방식 배지([PTY])는 뺀다(2026-08-19 사용자) — 이 앱의 에이전트 행은 전부 PTY라
+    // 모든 행에 같은 글자가 붙어 구분에 기여하지 않았다. AgentTransport 자체는 다른
+    // 표면(구조화 세션 목록)이 계속 쓴다.
+    let model = d.model.as_deref().filter(|s| !s.is_empty());
+    let mut parts = Vec::new();
+    if !model.is_some_and(|m| model_implies_provider(provider.label(), m)) {
+        parts.push(provider.label().to_owned());
+    }
+    if let Some(m) = model {
         parts.push(m.to_owned());
     }
     if let Some(e) = d.effort.as_deref().filter(|s| !s.is_empty()) {
@@ -6508,6 +8145,49 @@ enum PathClick {
     OpenFile(std::path::PathBuf),
 }
 
+/// 셀이 "내용"인가 — 공백·NUL은 아니고, wide char 뒤 자리 채움은 앞 글자의 일부다.
+/// 단어 선택과 행 선택이 같은 판정을 써야 한글로 끝나는 경우가 갈리지 않는다.
+fn cell_has_content(snapshot: &terminal::TerminalViewportSnapshot, idx: usize) -> bool {
+    // wide 글자의 **뒷칸**은 글자의 일부라 내용이다. 반면 2칸 글자가 행 끝에 안 들어가
+    // 다음 줄로 밀릴 때 남는 **행 끝 필러**는 같은 `wide_spacer` 비트를 쓰지만 이 행에는
+    // 아무 글자도 없다 — 내용으로 세면 눈에 빈 행이 더블클릭에 강조된다(2026-08-18 리뷰).
+    if snapshot.is_trailing_wide_spacer(idx) {
+        return true;
+    }
+    snapshot
+        .visible_cells
+        .get(idx)
+        .is_some_and(|cell| !cell.wide_spacer && !cell.c.is_whitespace() && cell.c != '\0')
+}
+
+fn snapshot_has_visible_text(snapshot: &TerminalViewportSnapshot) -> bool {
+    (0..snapshot.visible_cells.len()).any(|index| cell_has_content(snapshot, index))
+}
+
+/// 더블클릭이 잡는 **화면 행 전체** 범위 (2026-08-17 사용자 요청).
+///
+/// 스냅샷은 평면 그리드라 wrap 정보가 없다 — 접힌 논리 줄을 이어 붙일 방법이 없으므로
+/// 단위는 "보이는 행 하나"다. 시작은 0열(앞 들여쓰기도 행의 일부), 끝은 마지막 내용
+/// 셀이다. 끝의 빈 칸을 넣으면 선택 강조만 화면 끝까지 늘어나고 복사 결과는 어차피
+/// 같다(`selection_text`가 행 끝 공백을 자른다).
+///
+/// 행이 통째로 비어 있으면 `None` — 빈 줄을 더블클릭해도 아무 일도 일어나지 않는다
+/// (공백 위 단어 선택이 `None`이던 것과 같은 감각).
+fn line_range_at(
+    snapshot: &terminal::TerminalViewportSnapshot,
+    idx: usize,
+) -> Option<(usize, usize)> {
+    let cols = snapshot.cols as usize;
+    if cols == 0 {
+        return None;
+    }
+    let base = (idx / cols) * cols;
+    let last = (0..cols)
+        .rev()
+        .find(|offset| cell_has_content(snapshot, base + offset))?;
+    Some((base, base + last))
+}
+
 fn word_range_at(
     snapshot: &terminal::TerminalViewportSnapshot,
     idx: usize,
@@ -6519,13 +8199,10 @@ fn word_range_at(
     let row = idx / cols;
     let col = idx % cols;
     let base = row * cols;
-    let is_word = |c: usize| -> bool {
-        snapshot.visible_cells.get(base + c).is_some_and(|cell| {
-            // wide char(한글 등) 뒤의 자리 채움 셀은 c==' '지만 단어의 일부다 —
-            // 공백으로 취급하면 "nant-성과분석.pdf"가 첫 한글에서 끊긴다 (2026-07-14).
-            cell.wide_spacer || (!cell.c.is_whitespace() && cell.c != '\0')
-        })
-    };
+    // wide char(한글 등) 뒤의 자리 채움 셀은 c==' '지만 단어의 일부다 — 공백으로
+    // 취급하면 "nant-성과분석.pdf"가 첫 한글에서 끊긴다 (2026-07-14). 판정은
+    // `cell_has_content`가 행 선택과 공유한다.
+    let is_word = |c: usize| -> bool { cell_has_content(snapshot, base + c) };
     if !is_word(col) {
         return None;
     }
@@ -6597,10 +8274,17 @@ fn terminal_keyboard_input_allowed(
     !popup_open && !top_window_open && (terminal_refocus_pending || !text_edit_focused)
 }
 
+/// `frame_has_active_preedit`은 이번 프레임 raw 입력에 비어 있지 않은 preedit이 있다는
+/// 뜻이다. 조합이 시작되는 프레임에는 egui 공식 소유권도 `self.preedit`도 아직 없어
+/// 나머지 두 근거가 모두 false다. 그 프레임을 거절하면 `self.preedit`이 영영 안 차고,
+/// renderer는 뒤이은 **입력 없는 프레임**에서 조합이 끝난 줄 알고 포커스를 복구하다가
+/// IME를 강제 중단한다(자모 분리). 관문은 `terminal_keyboard_active`와 TextEdit·팝업
+/// 배제 조건이 그대로 지키므로 다른 입력창의 조합을 가로채지 않는다.
 fn terminal_accepts_ime_events(
     terminal_keyboard_active: bool,
     owns_ime_events: bool,
     preedit_active: bool,
+    frame_has_active_preedit: bool,
     text_edit_focused: bool,
     popup_open: bool,
     blocking_window_open: bool,
@@ -6609,7 +8293,7 @@ fn terminal_accepts_ime_events(
         && !text_edit_focused
         && !popup_open
         && !blocking_window_open
-        && (owns_ime_events || preedit_active)
+        && (owns_ime_events || preedit_active || frame_has_active_preedit)
 }
 
 fn terminal_should_copy_selection(
@@ -6816,6 +8500,21 @@ fn mux_sessions(snapshot: &MuxSnapshot) -> HashSet<SessionId> {
         .collect()
 }
 
+fn mux_split_ratio(snapshot: &MuxSnapshot, tab_id: &runtime::MuxTabId, path: &[u8]) -> Option<f32> {
+    let mut node = &snapshot.tabs.iter().find(|tab| &tab.id == tab_id)?.layout;
+    for part in path {
+        match (node, part) {
+            (LayoutNode::Split { first, .. }, 0) => node = first,
+            (LayoutNode::Split { second, .. }, 1) => node = second,
+            _ => return None,
+        }
+    }
+    match node {
+        LayoutNode::Split { ratio, .. } => Some(*ratio),
+        LayoutNode::Pane(_) => None,
+    }
+}
+
 /// 분할이 대상으로 삼을 pane: 포커스된 pane이 있으면 그것, 없으면 활성 탭(없으면 첫 탭)의
 /// 첫 pane. pane이 하나도 없으면 None(빈 워크스페이스 — 분할할 게 없다).
 fn split_target_pane(snapshot: &MuxSnapshot) -> Option<runtime::MuxPaneId> {
@@ -6864,11 +8563,49 @@ fn visible_mux_sessions(snapshot: &MuxSnapshot) -> HashSet<SessionId> {
         .collect()
 }
 
+fn visible_split_contains_session(snapshot: &MuxSnapshot, session: SessionId) -> bool {
+    snapshot
+        .active_tab
+        .as_ref()
+        .and_then(|active| snapshot.tabs.iter().find(|tab| &tab.id == active))
+        .is_some_and(|tab| {
+            matches!(&tab.layout, LayoutNode::Split { .. })
+                && tab
+                    .panes
+                    .iter()
+                    .any(|pane| pane.session_id == Some(session))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use runtime::{MuxPaneId, MuxTabId, PaneSnapshot, TabSnapshot};
     use terminal::{CursorShape, CursorSnapshot, TerminalCell};
+
+    #[test]
+    fn pane_render_output_merge는_document_drop_경로_순서를_보존한다() {
+        let mut merged = PaneRenderOutput {
+            document_drop_paths: vec![PathBuf::from("/tmp/first.rs")],
+            ..Default::default()
+        };
+        merged.merge(PaneRenderOutput {
+            document_drop_paths: vec![
+                PathBuf::from("/tmp/second.json"),
+                PathBuf::from("/tmp/third.yaml"),
+            ],
+            ..Default::default()
+        });
+
+        assert_eq!(
+            merged.document_drop_paths,
+            vec![
+                PathBuf::from("/tmp/first.rs"),
+                PathBuf::from("/tmp/second.json"),
+                PathBuf::from("/tmp/third.yaml"),
+            ]
+        );
+    }
 
     /// hook "작업 중"(v32) 병합 우선순위: 확정 상태(승인대기/오류/완료/화면 대기)가
     /// 이기고, 그 외엔 hook working이 transcript(지연·활성 전용)보다 우선한다.
@@ -6922,6 +8659,1489 @@ mod tests {
             });
         }
         commands
+    }
+
+    fn split_mux_snapshot(ratio: f32) -> Arc<MuxSnapshot> {
+        mux(
+            "t",
+            vec![tab(
+                "t",
+                vec![pane("left", SessionId(41)), pane("right", SessionId(42))],
+                LayoutNode::Split {
+                    direction: SplitDirection::Horizontal,
+                    ratio,
+                    first: Box::new(LayoutNode::Pane(pane_id("left"))),
+                    second: Box::new(LayoutNode::Pane(pane_id("right"))),
+                },
+            )],
+            "left",
+        )
+    }
+
+    #[test]
+    fn pane_drag_stable_state_does_not_enqueue_resize_until_matching_ack() {
+        let mut ui = WorkspaceUi::new();
+        let ctx = egui::Context::default();
+        ui.handle_events(
+            &[RuntimeEvent::MuxUpdated {
+                snapshot: split_mux_snapshot(0.5),
+            }],
+            &catalog(),
+        );
+        ui.sent_sizes.insert(SessionId(41), (80, 24));
+        ui.sent_sizes.insert(SessionId(42), (80, 24));
+        assert!(ui.pending_resize_target.is_empty());
+
+        ui.begin_split_drag(tab_id("t"), Vec::new(), 0.72);
+        for (pass, cols) in [(10, 90), (11, 100), (12, 110)] {
+            ui.stage_terminal_resize_for_pass(pass, false, SessionId(41), cols, 24);
+            ui.stage_terminal_resize_for_pass(pass, false, SessionId(42), cols, 24);
+            ui.flush_render_side_effects_for_pass(&ctx, pass, false);
+            assert!(ui.protocol_intents.is_empty(), "active drag sent Resize");
+        }
+
+        ui.commit_split_drag(13);
+        ui.flush_render_side_effects_for_pass(&ctx, 13, false);
+        let commands = drain_protocol(&mut ui);
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, RuntimeCommand::ResizeSplit { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, RuntimeCommand::Resize { .. }))
+        );
+
+        ui.stage_terminal_resize_for_pass(14, false, SessionId(41), 110, 24);
+        ui.flush_render_side_effects_for_pass(&ctx, 14, false);
+        assert!(ui.protocol_intents.is_empty(), "pre-ACK Resize escaped");
+
+        ui.handle_events(
+            &[RuntimeEvent::MuxUpdated {
+                snapshot: split_mux_snapshot(0.6),
+            }],
+            &catalog(),
+        );
+        assert!(ui.split_drag.is_some(), "old ratio is not an ACK");
+
+        ui.handle_events(
+            &[RuntimeEvent::MuxUpdated {
+                snapshot: split_mux_snapshot(0.72),
+            }],
+            &catalog(),
+        );
+        assert!(ui.split_drag.is_none(), "matching ACK must settle preview");
+        assert_eq!(
+            ui.split_final_resize_sessions,
+            HashSet::from([SessionId(41), SessionId(42)])
+        );
+
+        ui.stage_terminal_resize_for_pass(15, false, SessionId(41), 110, 24);
+        ui.stage_terminal_resize_for_pass(15, false, SessionId(42), 50, 24);
+        ui.flush_render_side_effects_for_pass(&ctx, 15, false);
+        let commands = drain_protocol(&mut ui);
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, RuntimeCommand::Resize { .. }))
+                .count(),
+            2,
+            "matching ACK must produce one final Resize per changed session"
+        );
+    }
+
+    #[test]
+    fn committed_split_preview_survives_until_matching_mux_ack() {
+        let mut ui = WorkspaceUi::new();
+        let ctx = egui::Context::default();
+        ui.handle_events(
+            &[RuntimeEvent::MuxUpdated {
+                snapshot: split_mux_snapshot(0.5),
+            }],
+            &catalog(),
+        );
+        ui.begin_split_drag(tab_id("t"), Vec::new(), 0.7);
+        ui.commit_split_drag(20);
+        ui.flush_render_side_effects_for_pass(&ctx, 20, false);
+        assert!(matches!(
+            drain_protocol(&mut ui).as_slice(),
+            [RuntimeCommand::ResizeSplit { ratio, .. }] if (*ratio - 0.7).abs() < 0.0001
+        ));
+        assert!((ui.split_preview_ratio(&tab_id("t"), &[], 0.5) - 0.7).abs() < 0.0001);
+
+        ui.handle_events(
+            &[RuntimeEvent::MuxUpdated {
+                snapshot: split_mux_snapshot(0.5),
+            }],
+            &catalog(),
+        );
+        assert!((ui.split_preview_ratio(&tab_id("t"), &[], 0.5) - 0.7).abs() < 0.0001);
+
+        ui.handle_events(
+            &[RuntimeEvent::MuxUpdated {
+                snapshot: split_mux_snapshot(0.7),
+            }],
+            &catalog(),
+        );
+        assert!((ui.split_preview_ratio(&tab_id("t"), &[], 0.7) - 0.7).abs() < 0.0001);
+        assert!(ui.split_drag.is_none());
+    }
+
+    #[test]
+    fn late_first_ack_does_not_cancel_a_new_active_drag() {
+        let mut ui = WorkspaceUi::new();
+        let ctx = egui::Context::default();
+        ui.handle_events(
+            &[RuntimeEvent::MuxUpdated {
+                snapshot: split_mux_snapshot(0.5),
+            }],
+            &catalog(),
+        );
+        ui.begin_split_drag(tab_id("t"), Vec::new(), 0.65);
+        ui.commit_split_drag(30);
+        ui.flush_render_side_effects_for_pass(&ctx, 30, false);
+        drain_protocol(&mut ui);
+
+        ui.begin_split_drag(tab_id("t"), Vec::new(), 0.8);
+        ui.handle_events(
+            &[RuntimeEvent::MuxUpdated {
+                snapshot: split_mux_snapshot(0.65),
+            }],
+            &catalog(),
+        );
+
+        assert!((ui.split_preview_ratio(&tab_id("t"), &[], 0.65) - 0.8).abs() < 0.0001);
+        assert!(ui.split_drag.is_some(), "late ACK cancelled the new drag");
+    }
+
+    #[test]
+    fn discarded_or_sizing_pass_does_not_admit_split_protocol() {
+        let mut ui = WorkspaceUi::new();
+        let ctx = egui::Context::default();
+        let session = SessionId(51);
+
+        ui.stage_terminal_resize_for_pass(40, true, session, 80, 24);
+        ui.flush_render_side_effects_for_pass(&ctx, 40, false);
+        assert!(ui.protocol_intents.is_empty(), "sizing pass staged Resize");
+
+        ui.stage_terminal_resize_for_pass(41, false, session, 80, 24);
+        ui.flush_render_side_effects_for_pass(&ctx, 41, true);
+        assert!(
+            ui.protocol_intents.is_empty(),
+            "discarded pass admitted Resize"
+        );
+
+        ui.stage_terminal_resize_for_pass(42, false, session, 80, 24);
+        ui.flush_render_side_effects_for_pass(&ctx, 42, false);
+        assert!(matches!(
+            drain_protocol(&mut ui).as_slice(),
+            [RuntimeCommand::Resize { session: sent, cols: 80, rows: 24 }] if *sent == session
+        ));
+    }
+
+    #[test]
+    fn final_pass_admission_requests_the_next_logic_repaint() {
+        let mut ui = WorkspaceUi::new();
+        let ctx = egui::Context::default();
+        let repaint_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let repaint_count_for_callback = Arc::clone(&repaint_count);
+        ctx.set_request_repaint_callback(move |_| {
+            repaint_count_for_callback.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        let pass = ctx.cumulative_pass_nr();
+        let before = repaint_count.load(std::sync::atomic::Ordering::Relaxed);
+
+        ui.stage_terminal_resize_for_pass(pass, false, SessionId(52), 80, 24);
+        ui.flush_render_side_effects(&ctx);
+
+        assert!(
+            repaint_count.load(std::sync::atomic::Ordering::Relaxed) > before,
+            "tail admission must wake the next logic drain"
+        );
+    }
+
+    #[test]
+    fn flushed_resize_staging_reuses_its_bounded_allocation() {
+        let mut ui = WorkspaceUi::new();
+        let ctx = egui::Context::default();
+        for session in 1..=4 {
+            ui.stage_terminal_resize_for_pass(43, false, SessionId(session), 80, 24);
+        }
+        let capacity = ui.staged_terminal_resizes.capacity();
+
+        ui.flush_render_side_effects_for_pass(&ctx, 43, false);
+
+        assert!(ui.staged_terminal_resizes.is_empty());
+        assert!(
+            ui.staged_terminal_resizes.capacity() >= capacity,
+            "normal passes should retain the bounded staging allocation"
+        );
+    }
+
+    #[test]
+    fn failed_split_delivery_cancels_preview_and_unblocks_terminal_resize() {
+        let mut ui = WorkspaceUi::new();
+        let ctx = egui::Context::default();
+        ui.handle_events(
+            &[RuntimeEvent::MuxUpdated {
+                snapshot: split_mux_snapshot(0.5),
+            }],
+            &catalog(),
+        );
+        ui.begin_split_drag(tab_id("t"), Vec::new(), 0.7);
+        ui.commit_split_drag(44);
+        ui.flush_render_side_effects_for_pass(&ctx, 44, false);
+        let intent = ui.take_protocol_intent().expect("split commit");
+
+        ui.complete_protocol(WorkspaceProtocolCompletion {
+            operation: intent.operation(),
+            generation: intent.generation(),
+            result: Err(WorkspaceProtocolErrorCode::DeliveryFailed),
+        });
+
+        assert!(ui.split_drag.is_none(), "failed commit cannot await an ACK");
+        ui.stage_terminal_resize_for_pass(45, false, SessionId(41), 100, 24);
+        ui.flush_render_side_effects_for_pass(&ctx, 45, false);
+        assert!(matches!(
+            drain_protocol(&mut ui).as_slice(),
+            [RuntimeCommand::Resize { session, cols: 100, rows: 24 }]
+                if *session == SessionId(41)
+        ));
+    }
+
+    #[test]
+    fn matching_mux_ratio_is_not_an_ack_before_split_delivery_succeeds() {
+        let mut ui = WorkspaceUi::new();
+        let ctx = egui::Context::default();
+        ui.handle_events(
+            &[RuntimeEvent::MuxUpdated {
+                snapshot: split_mux_snapshot(0.5),
+            }],
+            &catalog(),
+        );
+        ui.begin_split_drag(tab_id("t"), Vec::new(), 0.7);
+        ui.commit_split_drag(46);
+        ui.flush_render_side_effects_for_pass(&ctx, 46, false);
+
+        ui.handle_events(
+            &[RuntimeEvent::MuxUpdated {
+                snapshot: split_mux_snapshot(0.7),
+            }],
+            &catalog(),
+        );
+
+        assert!(
+            ui.split_drag.is_some(),
+            "a locally queued command is not a delivered command"
+        );
+    }
+
+    #[test]
+    fn busy_split_delivery_waits_for_backoff_instead_of_hot_looping_or_cancelling() {
+        let mut ui = WorkspaceUi::new();
+        let ctx = egui::Context::default();
+        ui.handle_events(
+            &[RuntimeEvent::MuxUpdated {
+                snapshot: split_mux_snapshot(0.5),
+            }],
+            &catalog(),
+        );
+        ui.begin_split_drag(tab_id("t"), Vec::new(), 0.7);
+        ui.commit_split_drag(47);
+        ui.flush_render_side_effects_for_pass(&ctx, 47, false);
+        let intent = ui.take_protocol_intent().expect("split commit");
+        ui.complete_protocol(WorkspaceProtocolCompletion {
+            operation: intent.operation(),
+            generation: intent.generation(),
+            result: Err(WorkspaceProtocolErrorCode::Busy),
+        });
+
+        let transaction = ui
+            .split_drag
+            .as_ref()
+            .expect("transient pressure keeps preview");
+        assert!(transaction.pending_delivery.is_none());
+        assert!(transaction.retry.retry_at.is_some());
+        ui.stage_unadmitted_split_commit_for_pass(&ctx, 48, false);
+        ui.flush_render_side_effects_for_pass(&ctx, 48, false);
+        assert!(
+            ui.protocol_intents.is_empty(),
+            "same-frame retry is a hot loop"
+        );
+    }
+
+    #[test]
+    fn protocol_busy_backoff_is_exponential_and_stops_after_bounded_attempts() {
+        let started = std::time::Instant::now();
+        let mut retry = ProtocolRetryBackoff::default();
+
+        for failure in 0..PROTOCOL_RETRY_LIMIT {
+            assert!(retry.record_busy(started));
+            let expected = PROTOCOL_RETRY_BASE.saturating_mul(1_u32 << u32::from(failure));
+            assert!(matches!(
+                retry.gate(started),
+                ProtocolRetryGate::Wait(delay) if delay == expected
+            ));
+            assert!(matches!(
+                retry.gate(started + expected),
+                ProtocolRetryGate::Ready
+            ));
+        }
+
+        assert!(!retry.record_busy(started));
+        assert!(matches!(retry.gate(started), ProtocolRetryGate::Exhausted));
+    }
+
+    #[test]
+    fn disappearing_split_path_cancels_transaction_without_waiting_forever() {
+        let mut ui = WorkspaceUi::new();
+        ui.handle_events(
+            &[RuntimeEvent::MuxUpdated {
+                snapshot: split_mux_snapshot(0.5),
+            }],
+            &catalog(),
+        );
+        ui.begin_split_drag(tab_id("t"), Vec::new(), 0.7);
+
+        let collapsed = mux(
+            "t",
+            vec![tab(
+                "t",
+                vec![pane("left", SessionId(41))],
+                LayoutNode::Pane(pane_id("left")),
+            )],
+            "left",
+        );
+        ui.handle_events(
+            &[RuntimeEvent::MuxUpdated {
+                snapshot: collapsed,
+            }],
+            &catalog(),
+        );
+
+        assert!(ui.split_drag.is_none());
+    }
+
+    #[test]
+    fn hidden_input_cancels_active_split_drag_and_unblocks_resize() {
+        let mut ui = WorkspaceUi::new();
+        let ctx = egui::Context::default();
+        ui.begin_split_drag(tab_id("t"), Vec::new(), 0.72);
+        ui.cancel_active_split_drag(&ctx);
+        assert!(ui.split_drag.is_none());
+        ui.stage_terminal_resize_for_pass(45, false, SessionId(41), 100, 24);
+        ui.flush_render_side_effects_for_pass(&ctx, 45, false);
+        assert!(matches!(
+            drain_protocol(&mut ui).as_slice(),
+            [RuntimeCommand::Resize {
+                session,
+                cols: 100,
+                rows: 24
+            }] if *session == SessionId(41)
+        ));
+    }
+
+    #[test]
+    fn hidden_input_releases_matching_drag_owner_without_revival_on_return() {
+        let mut workspace = WorkspaceUi::new();
+        workspace.mux = Some(split_mux_snapshot(0.5));
+        for session in [SessionId(41), SessionId(42)] {
+            workspace
+                .sessions
+                .entry(session)
+                .or_default()
+                .install_snapshot(shaped_snapshot(80, 24, "stable"));
+        }
+        let ctx = egui::Context::default();
+        let handle_id = split_handle_id(&tab_id("t"), &[]);
+        workspace.begin_split_drag(tab_id("t"), Vec::new(), 0.72);
+        ctx.set_dragged_id(handle_id);
+
+        workspace.update_hidden_with_native_input(&ctx, &[], &catalog(), || {
+            crate::native_key_monitor::NativeKeyDownBatch::default()
+        });
+
+        assert_eq!(ctx.dragged_id(), None);
+        assert!(workspace.split_drag.is_none());
+
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(400.0, 240.0),
+            )),
+            events: vec![
+                egui::Event::PointerMoved(egui::pos2(200.0, 120.0)),
+                egui::Event::PointerButton {
+                    pos: egui::pos2(200.0, 120.0),
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..egui::RawInput::default()
+        };
+        let _ = ctx.run_ui(input, |ui| {
+            workspace.show_with_input(ui, &TerminalConfig::default(), &[], &catalog(), true);
+        });
+
+        assert!(workspace.split_drag.is_none());
+        assert!(
+            !drain_protocol(&mut workspace)
+                .iter()
+                .any(|command| matches!(command, RuntimeCommand::ResizeSplit { .. })),
+            "returning to input must not revive or commit the cancelled divider drag",
+        );
+        workspace.stage_terminal_resize_for_pass(45, false, SessionId(41), 100, 24);
+        workspace.flush_render_side_effects_for_pass(&ctx, 45, false);
+        assert!(drain_protocol(&mut workspace).iter().any(|command| {
+            matches!(
+                command,
+                RuntimeCommand::Resize {
+                    session: SessionId(41),
+                    cols: 100,
+                    rows: 24,
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn focus_loss_cancels_active_split_drag_and_matching_egui_owner() {
+        let mut workspace = WorkspaceUi::new();
+        workspace.mux = Some(split_mux_snapshot(0.5));
+        let ctx = egui::Context::default();
+        let handle_id = split_handle_id(&tab_id("t"), &[]);
+        workspace.begin_split_drag(tab_id("t"), Vec::new(), 0.72);
+        let input = egui::RawInput {
+            focused: false,
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(400.0, 240.0),
+            )),
+            ..egui::RawInput::default()
+        };
+
+        let _ = ctx.run_ui(input, |ui| {
+            ui.ctx().set_dragged_id(handle_id);
+            workspace.show_with_input(ui, &TerminalConfig::default(), &[], &catalog(), true);
+        });
+
+        assert!(workspace.split_drag.is_none());
+        assert_eq!(ctx.dragged_id(), None);
+        assert!(
+            !drain_protocol(&mut workspace)
+                .iter()
+                .any(|command| matches!(command, RuntimeCommand::ResizeSplit { .. })),
+        );
+    }
+
+    #[test]
+    fn split_drag_release_while_widget_absent_cancels_preview_and_unblocks_resize() {
+        let mut workspace = WorkspaceUi::new();
+        workspace.mux = Some(split_mux_snapshot(0.5));
+        for session in [SessionId(41), SessionId(42)] {
+            workspace
+                .sessions
+                .entry(session)
+                .or_default()
+                .install_snapshot(shaped_snapshot(80, 24, "stable"));
+        }
+        workspace.begin_split_drag(tab_id("t"), Vec::new(), 0.72);
+        let ctx = egui::Context::default();
+        let catalog = catalog();
+        let config = TerminalConfig::default();
+
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            workspace.show_with_input(ui, &config, &[], &catalog, false);
+        });
+
+        assert!(workspace.split_drag.is_none());
+        assert!(
+            !drain_protocol(&mut workspace)
+                .iter()
+                .any(|command| matches!(command, RuntimeCommand::ResizeSplit { .. })),
+            "losing the divider widget must cancel, not commit, the preview",
+        );
+        workspace.stage_terminal_resize_for_pass(45, false, SessionId(41), 100, 24);
+        workspace.flush_render_side_effects_for_pass(&ctx, 45, false);
+        assert!(matches!(
+            drain_protocol(&mut workspace).as_slice(),
+            [RuntimeCommand::Resize {
+                session,
+                cols: 100,
+                rows: 24
+            }] if *session == SessionId(41)
+        ));
+    }
+
+    #[test]
+    fn hidden_input_preserves_committed_split_ack_lifecycle() {
+        let mut workspace = WorkspaceUi::new();
+        let ctx = egui::Context::default();
+        workspace.begin_split_drag(tab_id("t"), Vec::new(), 0.72);
+        workspace.commit_split_drag(44);
+
+        workspace.cancel_active_split_drag(&ctx);
+
+        assert!(workspace.split_drag.as_ref().is_some_and(|transaction| {
+            matches!(transaction.phase, SplitDragPhase::Committed { .. })
+        }));
+    }
+
+    #[test]
+    fn active_split_drag_reconciles_stop_tab_and_widget_owner_changes() {
+        let mut workspace = WorkspaceUi::new();
+        workspace.mux = Some(split_mux_snapshot(0.5));
+        let ctx = egui::Context::default();
+        let tab = tab_id("t");
+
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            workspace.begin_split_drag(tab.clone(), Vec::new(), 0.72);
+            ui.ctx().set_dragged_id(split_handle_id(&tab, &[]));
+            ui.ctx().stop_dragging();
+            workspace.reconcile_active_split_drag(ui.ctx(), true, Some(&tab));
+            assert!(workspace.split_drag.as_ref().is_some_and(|transaction| {
+                matches!(transaction.phase, SplitDragPhase::Committed { .. })
+            }));
+
+            workspace.split_drag = None;
+            workspace.begin_split_drag(tab.clone(), Vec::new(), 0.72);
+            workspace.reconcile_active_split_drag(ui.ctx(), true, Some(&tab_id("other")));
+            assert!(workspace.split_drag.is_none());
+
+            workspace.begin_split_drag(tab.clone(), Vec::new(), 0.72);
+            let another_widget = egui::Id::new("another_widget");
+            ui.ctx().set_dragged_id(another_widget);
+            workspace.reconcile_active_split_drag(ui.ctx(), true, Some(&tab));
+            assert!(workspace.split_drag.is_none());
+            assert_eq!(ui.ctx().dragged_id(), Some(another_widget));
+        });
+    }
+
+    #[test]
+    fn final_resize_keeps_stable_snapshot_until_target_viewport_settles() {
+        let started = std::time::Instant::now();
+        let stable = shaped_snapshot(80, 24, "stable content");
+        let first_target = shaped_snapshot(100, 30, "first target");
+        let latest_target = shaped_snapshot(100, 30, "latest target");
+        let mut view = SessionView::default();
+        view.install_snapshot(Arc::clone(&stable));
+        let stable_generation = view.snapshot_gen;
+        view.arm_resize_presentation(100, 30, started);
+
+        view.buffer_resize_snapshot(
+            Arc::clone(&first_target),
+            started + std::time::Duration::from_millis(1),
+        );
+        view.buffer_resize_snapshot(
+            Arc::clone(&latest_target),
+            started + std::time::Duration::from_millis(10),
+        );
+        view.settle_resize_presentation(started + std::time::Duration::from_millis(41));
+
+        assert!(Arc::ptr_eq(view.snapshot.as_ref().unwrap(), &stable));
+        assert_eq!(view.snapshot_gen, stable_generation);
+        view.settle_resize_presentation(started + std::time::Duration::from_millis(42));
+        assert!(Arc::ptr_eq(view.snapshot.as_ref().unwrap(), &latest_target));
+        assert_eq!(view.snapshot_gen, stable_generation + 1);
+        assert!(view.resize_presentation.is_none());
+    }
+
+    #[test]
+    fn active_split_drag_defers_prior_resize_presentation_fence() {
+        let started = std::time::Instant::now();
+        let session = SessionId(62);
+        let mut ui = WorkspaceUi::new();
+        let view = ui.sessions.entry(session).or_default();
+        view.install_snapshot(shaped_snapshot(80, 24, "stable"));
+        view.arm_resize_presentation(100, 30, started);
+        assert!(view.buffer_resize_snapshot(
+            shaped_snapshot(100, 30, "old target"),
+            started + std::time::Duration::from_millis(1),
+        ));
+        ui.begin_split_drag(tab_id("t"), Vec::new(), 0.72);
+
+        let repaint = ui.settle_session_resize_presentation(
+            session,
+            started + std::time::Duration::from_millis(250),
+        );
+
+        assert_eq!(repaint, None);
+        assert_eq!(ui.sessions[&session].snapshot.as_ref().unwrap().cols, 80);
+        assert!(ui.sessions[&session].resize_presentation.is_some());
+    }
+
+    #[test]
+    fn committed_and_final_resize_lifecycle_defer_prior_presentation_fence() {
+        let started = std::time::Instant::now();
+        let session = SessionId(63);
+        let mut ui = WorkspaceUi::new();
+        let view = ui.sessions.entry(session).or_default();
+        view.install_snapshot(shaped_snapshot(80, 24, "stable"));
+        view.arm_resize_presentation(100, 30, started);
+        assert!(view.buffer_resize_snapshot(
+            shaped_snapshot(100, 30, "old target"),
+            started + std::time::Duration::from_millis(1),
+        ));
+
+        ui.begin_split_drag(tab_id("t"), Vec::new(), 0.72);
+        ui.commit_split_drag(44);
+        assert_eq!(
+            ui.settle_session_resize_presentation(
+                session,
+                started + std::time::Duration::from_millis(250),
+            ),
+            None
+        );
+        assert_eq!(ui.sessions[&session].snapshot.as_ref().unwrap().cols, 80);
+
+        ui.split_drag = None;
+        ui.split_final_resize_sessions.insert(session);
+        assert_eq!(
+            ui.settle_session_resize_presentation(
+                session,
+                started + std::time::Duration::from_millis(250),
+            ),
+            None
+        );
+        assert_eq!(ui.sessions[&session].snapshot.as_ref().unwrap().cols, 80);
+
+        ui.split_final_resize_sessions.clear();
+        ui.split_final_resize_pending
+            .insert((WorkspaceProtocolOperation(1), 1), (session, 100, 30));
+        assert_eq!(
+            ui.settle_session_resize_presentation(
+                session,
+                started + std::time::Duration::from_millis(250),
+            ),
+            None
+        );
+        assert_eq!(ui.sessions[&session].snapshot.as_ref().unwrap().cols, 80);
+
+        ui.split_final_resize_pending.clear();
+        assert_eq!(
+            ui.settle_session_resize_presentation(
+                session,
+                started + std::time::Duration::from_millis(250),
+            ),
+            None
+        );
+        assert_eq!(ui.sessions[&session].snapshot.as_ref().unwrap().cols, 100);
+        assert!(ui.sessions[&session].resize_presentation.is_none());
+    }
+
+    #[test]
+    fn split_drag_is_activated_before_child_pane_settlement() {
+        let started = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(250))
+            .unwrap();
+        let mut workspace = WorkspaceUi::new();
+        workspace.mux = Some(split_mux_snapshot(0.5));
+        for session in [SessionId(41), SessionId(42)] {
+            workspace
+                .sessions
+                .entry(session)
+                .or_default()
+                .install_snapshot(shaped_snapshot(80, 24, "stable"));
+        }
+        let view = workspace.sessions.get_mut(&SessionId(41)).unwrap();
+        let stable_generation = view.snapshot_gen;
+        view.arm_resize_presentation(100, 30, started);
+        assert!(view.buffer_resize_snapshot(
+            shaped_snapshot(100, 30, "old target"),
+            started + std::time::Duration::from_millis(1),
+        ));
+
+        let ctx = egui::Context::default();
+        let pointer = egui::pos2(200.0, 120.0);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(400.0, 240.0),
+            )),
+            events: vec![
+                egui::Event::PointerMoved(pointer),
+                egui::Event::PointerButton {
+                    pos: pointer,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..egui::RawInput::default()
+        };
+        let catalog = catalog();
+        let config = TerminalConfig::default();
+        let handle_id = split_handle_id(&tab_id("t"), &[]);
+        let _ = ctx.run_ui(input, |ui| {
+            ui.ctx().set_dragged_id(handle_id);
+            workspace.show_with_input(ui, &config, &[], &catalog, true);
+        });
+
+        assert!(workspace.split_drag.is_some());
+        assert_eq!(
+            workspace.sessions[&SessionId(41)].snapshot_gen,
+            stable_generation,
+            "the first dragged frame must activate the split fence before child panes settle",
+        );
+        assert!(
+            workspace.sessions[&SessionId(41)]
+                .resize_presentation
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn blank_target_viewport_waits_for_nonblank_or_hard_deadline() {
+        let started = std::time::Instant::now();
+        let stable = shaped_snapshot(80, 24, "stable content");
+        let blank = shaped_snapshot(100, 30, "");
+        let nonblank = shaped_snapshot(100, 30, "ready");
+        let mut view = SessionView::default();
+        view.install_snapshot(Arc::clone(&stable));
+        view.arm_resize_presentation(100, 30, started);
+        view.buffer_resize_snapshot(
+            Arc::clone(&blank),
+            started + std::time::Duration::from_millis(1),
+        );
+
+        view.settle_resize_presentation(started + std::time::Duration::from_millis(40));
+        assert!(Arc::ptr_eq(view.snapshot.as_ref().unwrap(), &stable));
+        view.buffer_resize_snapshot(
+            Arc::clone(&nonblank),
+            started + std::time::Duration::from_millis(50),
+        );
+        view.settle_resize_presentation(started + std::time::Duration::from_millis(81));
+        assert!(Arc::ptr_eq(view.snapshot.as_ref().unwrap(), &stable));
+        view.settle_resize_presentation(started + std::time::Duration::from_millis(82));
+        assert!(Arc::ptr_eq(view.snapshot.as_ref().unwrap(), &nonblank));
+
+        let mut hard_deadline_view = SessionView::default();
+        hard_deadline_view.install_snapshot(Arc::clone(&stable));
+        hard_deadline_view.arm_resize_presentation(100, 30, started);
+        hard_deadline_view.buffer_resize_snapshot(Arc::clone(&blank), started);
+        hard_deadline_view
+            .settle_resize_presentation(started + std::time::Duration::from_millis(249));
+        assert!(Arc::ptr_eq(
+            hard_deadline_view.snapshot.as_ref().unwrap(),
+            &stable
+        ));
+        hard_deadline_view
+            .settle_resize_presentation(started + std::time::Duration::from_millis(250));
+        assert!(Arc::ptr_eq(
+            hard_deadline_view.snapshot.as_ref().unwrap(),
+            &blank
+        ));
+    }
+
+    #[test]
+    fn final_resize_clears_selection_only_for_changed_grid() {
+        let now = std::time::Instant::now();
+        let session = SessionId(61);
+        let mut ui = WorkspaceUi::new();
+        ui.sessions
+            .entry(session)
+            .or_default()
+            .install_snapshot(shaped_snapshot(80, 24, "selected"));
+        ui.sessions.get_mut(&session).unwrap().pending_snapshot =
+            Some(shaped_snapshot(80, 24, "pending"));
+        ui.sent_sizes.insert(session, (80, 24));
+        ui.selection = Some((session, 0, 3));
+        ui.split_final_resize_sessions.insert(session);
+
+        assert!(!ui.apply_split_final_resize_at(session, 80, 24, now));
+        assert!(ui.selection.is_some(), "same grid must preserve selection");
+        assert!(
+            ui.sessions
+                .get(&session)
+                .unwrap()
+                .resize_presentation
+                .is_none()
+        );
+
+        ui.split_final_resize_sessions.insert(session);
+        assert!(ui.apply_split_final_resize_at(session, 100, 30, now));
+        assert!(
+            ui.selection.is_some(),
+            "selection stays valid until the runtime accepts the new grid"
+        );
+        assert!(
+            ui.sessions
+                .get(&session)
+                .unwrap()
+                .resize_presentation
+                .is_none(),
+            "the viewport fence starts at delivery, not local queue admission"
+        );
+        drain_protocol(&mut ui);
+        assert!(
+            ui.selection.is_none(),
+            "changed grid invalidates coordinates"
+        );
+        let view = ui.sessions.get(&session).unwrap();
+        assert!(view.pending_snapshot.is_none());
+        assert_eq!(
+            view.resize_presentation.as_ref().map(|fence| fence.target),
+            Some((100, 30))
+        );
+    }
+
+    #[test]
+    fn final_resize_promotion_clears_selection_created_while_fenced() {
+        let started = std::time::Instant::now();
+        let session = SessionId(62);
+        let mut ui = WorkspaceUi::new();
+        let view = ui.sessions.entry(session).or_default();
+        view.install_snapshot(shaped_snapshot(80, 24, "stable"));
+        view.arm_resize_presentation(100, 30, started);
+        assert!(view.buffer_resize_snapshot(
+            shaped_snapshot(100, 30, "settled"),
+            started + std::time::Duration::from_millis(1),
+        ));
+        ui.selection = Some((session, 0, 3));
+
+        let repaint = ui.settle_session_resize_presentation(
+            session,
+            started + std::time::Duration::from_millis(33),
+        );
+
+        assert_eq!(repaint, None);
+        assert!(ui.selection.is_none());
+        assert_eq!(
+            ui.sessions[&session]
+                .snapshot
+                .as_ref()
+                .map(|snapshot| (snapshot.cols, snapshot.rows)),
+            Some((100, 30))
+        );
+    }
+
+    #[test]
+    fn terminal_final_resize_failure_releases_prior_presentation_fence() {
+        let now = std::time::Instant::now();
+        let started = now
+            .checked_sub(std::time::Duration::from_millis(250))
+            .unwrap();
+        let session = SessionId(67);
+        let mut ui = WorkspaceUi::new();
+        let view = ui.sessions.entry(session).or_default();
+        view.install_snapshot(shaped_snapshot(80, 24, "stable"));
+        view.arm_resize_presentation(90, 30, started);
+        assert!(view.buffer_resize_snapshot(
+            shaped_snapshot(90, 30, "prior target"),
+            started + std::time::Duration::from_millis(1),
+        ));
+        ui.sent_sizes.insert(session, (80, 24));
+        ui.split_final_resize_sessions.insert(session);
+        assert!(ui.apply_split_final_resize_at(session, 100, 30, now));
+        let intent = ui.take_protocol_intent().expect("final resize");
+
+        ui.complete_protocol(WorkspaceProtocolCompletion {
+            operation: intent.operation(),
+            generation: intent.generation(),
+            result: Err(WorkspaceProtocolErrorCode::DeliveryFailed),
+        });
+
+        assert_eq!(ui.failed_resize_targets.get(&session), Some(&(100, 30)));
+        assert!(!ui.split_final_resize_sessions.contains(&session));
+        assert_eq!(ui.settle_session_resize_presentation(session, now), None);
+        assert_eq!(ui.sessions[&session].snapshot.as_ref().unwrap().cols, 90);
+        assert!(ui.sessions[&session].resize_presentation.is_none());
+    }
+
+    #[test]
+    fn later_split_ack_consumes_exact_failed_final_target_and_releases_prior_fence() {
+        let now = std::time::Instant::now();
+        let started = now
+            .checked_sub(std::time::Duration::from_millis(250))
+            .unwrap();
+        let session = SessionId(41);
+        let mut ui = WorkspaceUi::new();
+        let ctx = egui::Context::default();
+        ui.handle_events(
+            &[RuntimeEvent::MuxUpdated {
+                snapshot: split_mux_snapshot(0.5),
+            }],
+            &catalog(),
+        );
+        let ready = shaped_snapshot(90, 30, "prior target");
+        let view = ui.sessions.entry(session).or_default();
+        view.install_snapshot(shaped_snapshot(80, 24, "stable"));
+        view.arm_resize_presentation(90, 30, started);
+        assert!(view.buffer_resize_snapshot(
+            Arc::clone(&ready),
+            started + std::time::Duration::from_millis(1),
+        ));
+        ui.sent_sizes.insert(session, (80, 24));
+        ui.split_final_resize_sessions.insert(session);
+        assert!(ui.apply_split_final_resize_at(session, 100, 30, now));
+        let failed = ui.take_protocol_intent().expect("failed final resize");
+        ui.complete_protocol(WorkspaceProtocolCompletion {
+            operation: failed.operation(),
+            generation: failed.generation(),
+            result: Err(WorkspaceProtocolErrorCode::DeliveryFailed),
+        });
+        assert_eq!(ui.failed_resize_targets.get(&session), Some(&(100, 30)));
+
+        ui.begin_split_drag(tab_id("t"), Vec::new(), 0.72);
+        ui.commit_split_drag(60);
+        ui.flush_render_side_effects_for_pass(&ctx, 60, false);
+        assert!(matches!(
+            drain_protocol(&mut ui).as_slice(),
+            [RuntimeCommand::ResizeSplit { ratio, .. }] if (*ratio - 0.72).abs() < 0.0001
+        ));
+        ui.handle_events(
+            &[RuntimeEvent::MuxUpdated {
+                snapshot: split_mux_snapshot(0.72),
+            }],
+            &catalog(),
+        );
+        assert!(ui.split_final_resize_sessions.contains(&session));
+        assert_eq!(ui.settle_session_resize_presentation(session, now), None);
+
+        let repaint_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let repaint_count_for_callback = Arc::clone(&repaint_count);
+        ctx.set_request_repaint_callback(move |_| {
+            repaint_count_for_callback.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        let pass = ctx.cumulative_pass_nr();
+        ui.stage_terminal_resize_for_pass(pass, false, session, 100, 30);
+        let before = repaint_count.load(std::sync::atomic::Ordering::Relaxed);
+
+        ui.flush_render_side_effects(&ctx);
+
+        assert!(!ui.split_final_resize_sessions.contains(&session));
+        assert_eq!(ui.failed_resize_targets.get(&session), Some(&(100, 30)));
+        assert!(ui.protocol_intents.is_empty());
+        assert!(
+            repaint_count.load(std::sync::atomic::Ordering::Relaxed) > before,
+            "consuming an exact failed target must wake prior fence settlement",
+        );
+        assert_eq!(ui.settle_session_resize_presentation(session, now), None);
+        assert!(Arc::ptr_eq(
+            ui.sessions[&session].snapshot.as_ref().unwrap(),
+            &ready,
+        ));
+        assert!(ui.sessions[&session].resize_presentation.is_none());
+    }
+
+    #[test]
+    fn same_grid_final_marker_clear_wakes_prior_presentation_settlement() {
+        let now = std::time::Instant::now();
+        let started = now
+            .checked_sub(std::time::Duration::from_millis(250))
+            .unwrap();
+        let session = SessionId(68);
+        let mut ui = WorkspaceUi::new();
+        let ready = shaped_snapshot(80, 24, "prior target");
+        let view = ui.sessions.entry(session).or_default();
+        view.install_snapshot(shaped_snapshot(80, 24, "stable"));
+        view.arm_resize_presentation(80, 24, started);
+        assert!(view.buffer_resize_snapshot(
+            Arc::clone(&ready),
+            started + std::time::Duration::from_millis(1),
+        ));
+        ui.sent_sizes.insert(session, (80, 24));
+        ui.split_final_resize_sessions.insert(session);
+        assert_eq!(ui.settle_session_resize_presentation(session, now), None);
+
+        let ctx = egui::Context::default();
+        let repaint_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let repaint_count_for_callback = Arc::clone(&repaint_count);
+        ctx.set_request_repaint_callback(move |_| {
+            repaint_count_for_callback.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        let pass = ctx.cumulative_pass_nr();
+        ui.stage_terminal_resize_for_pass(pass, false, session, 80, 24);
+        let before = repaint_count.load(std::sync::atomic::Ordering::Relaxed);
+
+        ui.flush_render_side_effects(&ctx);
+
+        assert!(!ui.split_final_resize_sessions.contains(&session));
+        assert!(
+            repaint_count.load(std::sync::atomic::Ordering::Relaxed) > before,
+            "consuming a no-op final marker must wake the next settlement pass",
+        );
+        assert_eq!(ui.settle_session_resize_presentation(session, now), None);
+        assert!(Arc::ptr_eq(
+            ui.sessions[&session].snapshot.as_ref().unwrap(),
+            &ready,
+        ));
+        assert!(ui.sessions[&session].resize_presentation.is_none());
+    }
+
+    #[test]
+    fn failed_final_resize_rolls_back_and_requires_new_geometry_before_retry() {
+        let started = std::time::Instant::now();
+        let session = SessionId(63);
+        let mut ui = WorkspaceUi::new();
+        ui.sessions
+            .entry(session)
+            .or_default()
+            .install_snapshot(shaped_snapshot(80, 24, "stable"));
+        ui.sent_sizes.insert(session, (80, 24));
+        ui.selection = Some((session, 0, 3));
+        ui.split_final_resize_sessions.insert(session);
+        assert!(ui.apply_split_final_resize_at(session, 100, 30, started));
+        let intent = ui.take_protocol_intent().expect("final resize");
+
+        ui.complete_protocol(WorkspaceProtocolCompletion {
+            operation: intent.operation(),
+            generation: intent.generation(),
+            result: Err(WorkspaceProtocolErrorCode::DeliveryFailed),
+        });
+
+        assert_eq!(ui.sent_sizes.get(&session), Some(&(80, 24)));
+        assert!(
+            ui.sessions[&session].resize_presentation.is_none(),
+            "a command that never reached the runtime cannot own a viewport fence"
+        );
+        assert!(ui.selection.is_some());
+        assert!(!ui.split_final_resize_sessions.contains(&session));
+        assert!(!ui.queue_terminal_resize(session, 100, 30));
+        assert!(
+            ui.protocol_intents.is_empty(),
+            "do not spin on a dead channel"
+        );
+
+        ui.handle_events(
+            &[RuntimeEvent::Viewport {
+                session,
+                snapshot: shaped_snapshot(80, 24, "unrelated output"),
+                bracketed_paste: false,
+            }],
+            &catalog(),
+        );
+        assert!(
+            !ui.queue_terminal_resize(session, 100, 30),
+            "viewport output does not prove that command backpressure recovered"
+        );
+        assert!(ui.queue_terminal_resize(session, 101, 30));
+    }
+
+    #[test]
+    fn coalesced_newer_geometry_updates_the_exact_pending_final_fence() {
+        let started = std::time::Instant::now();
+        let session = SessionId(64);
+        let mut ui = WorkspaceUi::new();
+        ui.sessions
+            .entry(session)
+            .or_default()
+            .install_snapshot(shaped_snapshot(80, 24, "stable"));
+        ui.sent_sizes.insert(session, (80, 24));
+        ui.split_final_resize_sessions.insert(session);
+        assert!(ui.apply_split_final_resize_at(session, 100, 30, started));
+
+        assert!(ui.queue_terminal_resize(session, 120, 40));
+        assert_eq!(
+            ui.protocol_intents.len(),
+            1,
+            "same-session Resize coalesces"
+        );
+        drain_protocol(&mut ui);
+
+        assert_eq!(
+            ui.sessions[&session]
+                .resize_presentation
+                .as_ref()
+                .map(|fence| fence.target),
+            Some((120, 40)),
+            "the fence must match the command that actually reached the runtime"
+        );
+    }
+
+    /// 창 리사이즈로 나가는 Resize는 split 최종 Resize가 아니라 fence를 한 번도 얻지
+    /// 못했다. 그래서 PTY reflow 뒤 자식 TUI의 clear→redraw 중간 viewport가 그대로
+    /// 화면에 올라가 리사이즈가 끝나는 순간 한 번 번쩍였다(2026-09-06). 안정 화면은
+    /// target 모양의 viewport가 조용해질 때까지 유지돼야 한다.
+    #[test]
+    fn 창_리사이즈_전송도_안정_화면을_fence로_지킨다() {
+        let session = SessionId(66);
+        let mut ui = WorkspaceUi::new();
+        let stable = shaped_snapshot(80, 24, "이미 있던 출력");
+        ui.sessions
+            .entry(session)
+            .or_default()
+            .install_snapshot(Arc::clone(&stable));
+        ui.sent_sizes.insert(session, (80, 24));
+
+        // 창 드래그가 멈춰 최종 크기가 나간다 — split 경로가 아니다.
+        assert!(ui.queue_terminal_resize(session, 100, 30));
+        drain_protocol(&mut ui);
+        assert!(!ui.split_final_resize_sessions.contains(&session));
+
+        let started = ui.sessions[&session]
+            .resize_presentation
+            .as_ref()
+            .expect("창 리사이즈에도 fence가 걸려야 한다")
+            .started_at;
+        assert_eq!(
+            ui.sessions[&session]
+                .resize_presentation
+                .as_ref()
+                .map(|fence| fence.target),
+            Some((100, 30))
+        );
+
+        // clear 직후의 빈 중간 viewport는 안정 화면을 덮지 못한다.
+        assert!(
+            ui.sessions
+                .get_mut(&session)
+                .unwrap()
+                .buffer_resize_snapshot(
+                    shaped_snapshot(100, 30, ""),
+                    started + std::time::Duration::from_millis(1),
+                )
+        );
+        assert!(
+            ui.settle_session_resize_presentation(
+                session,
+                started + std::time::Duration::from_millis(40),
+            )
+            .is_some()
+        );
+        assert!(
+            Arc::ptr_eq(ui.sessions[&session].snapshot.as_ref().unwrap(), &stable),
+            "clear 직후의 빈 화면이 표시됐다"
+        );
+
+        // 실제로 다시 그려진 화면이 조용해지면 그때 승격된다.
+        assert!(
+            ui.sessions
+                .get_mut(&session)
+                .unwrap()
+                .buffer_resize_snapshot(
+                    shaped_snapshot(100, 30, "다시 그린 출력"),
+                    started + std::time::Duration::from_millis(50),
+                )
+        );
+        assert_eq!(
+            ui.settle_session_resize_presentation(
+                session,
+                started + std::time::Duration::from_millis(82),
+            ),
+            None
+        );
+        assert_eq!(ui.sessions[&session].snapshot.as_ref().unwrap().cols, 100);
+        assert!(ui.sessions[&session].resize_presentation.is_none());
+    }
+
+    /// 스냅샷이 아직 하나도 없는 세션(생성 직후 첫 Resize)에는 fence를 걸지 않는다.
+    /// 지킬 안정 화면이 없는데 걸면 target과 모양이 다른 첫 viewport가 통째로 버려져
+    /// 「연결 중」이 최대 250ms 남는다.
+    #[test]
+    fn 첫_화면이_없는_세션의_리사이즈는_fence를_걸지_않는다() {
+        let session = SessionId(67);
+        let mut ui = WorkspaceUi::new();
+
+        assert!(ui.queue_terminal_resize(session, 100, 30));
+        drain_protocol(&mut ui);
+
+        assert!(
+            ui.sessions
+                .get(&session)
+                .and_then(|view| view.resize_presentation.as_ref())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn newer_resize_delivery_retargets_existing_fence_without_extending_deadline() {
+        let started = std::time::Instant::now();
+        let session = SessionId(65);
+        let mut ui = WorkspaceUi::new();
+        let view = ui.sessions.entry(session).or_default();
+        view.install_snapshot(shaped_snapshot(80, 24, "stable"));
+        view.arm_resize_presentation(100, 30, started);
+        assert!(view.buffer_resize_snapshot(
+            shaped_snapshot(100, 30, ""),
+            started + std::time::Duration::from_millis(1),
+        ));
+        ui.sent_sizes.insert(session, (100, 30));
+
+        assert!(ui.queue_terminal_resize(session, 120, 40));
+        drain_protocol(&mut ui);
+        let fence = ui.sessions[&session]
+            .resize_presentation
+            .as_ref()
+            .expect("original stable presentation remains fenced");
+        assert_eq!(fence.target, (120, 40));
+        assert_eq!(fence.started_at, started, "hard deadline must not extend");
+        assert!(
+            fence.latest_target.is_none(),
+            "stale A candidate must be dropped"
+        );
+
+        assert!(
+            ui.sessions
+                .get_mut(&session)
+                .unwrap()
+                .buffer_resize_snapshot(
+                    shaped_snapshot(120, 40, "new target"),
+                    started + std::time::Duration::from_millis(10),
+                )
+        );
+        ui.settle_session_resize_presentation(
+            session,
+            started + std::time::Duration::from_millis(42),
+        );
+        assert_eq!(
+            ui.sessions[&session]
+                .snapshot
+                .as_ref()
+                .map(|snapshot| (snapshot.cols, snapshot.rows)),
+            Some((120, 40))
+        );
+    }
+
+    #[test]
+    fn busy_final_resize_rolls_back_and_waits_before_retrying() {
+        let started = std::time::Instant::now();
+        let session = SessionId(66);
+        let mut ui = WorkspaceUi::new();
+        let ctx = egui::Context::default();
+        ui.sessions
+            .entry(session)
+            .or_default()
+            .install_snapshot(shaped_snapshot(80, 24, "stable"));
+        ui.sent_sizes.insert(session, (80, 24));
+        ui.split_final_resize_sessions.insert(session);
+        assert!(ui.apply_split_final_resize_at(session, 100, 30, started));
+        let intent = ui.take_protocol_intent().expect("final resize");
+        ui.complete_protocol(WorkspaceProtocolCompletion {
+            operation: intent.operation(),
+            generation: intent.generation(),
+            result: Err(WorkspaceProtocolErrorCode::Busy),
+        });
+
+        assert_eq!(ui.sent_sizes.get(&session), Some(&(80, 24)));
+        assert!(ui.split_final_resize_sessions.contains(&session));
+        assert!(
+            ui.resize_retry
+                .get(&session)
+                .is_some_and(|retry| retry.retry_at.is_some())
+        );
+        ui.stage_terminal_resize_for_pass(49, false, session, 100, 30);
+        ui.flush_render_side_effects_for_pass(&ctx, 49, false);
+        assert!(
+            ui.protocol_intents.is_empty(),
+            "same-frame retry is a hot loop"
+        );
+    }
+
+    #[test]
+    fn exhausted_busy_final_resize_releases_prior_presentation_fence_without_hot_loop() {
+        let now = std::time::Instant::now();
+        let started = now
+            .checked_sub(std::time::Duration::from_millis(250))
+            .unwrap();
+        let session = SessionId(69);
+        let mut ui = WorkspaceUi::new();
+        let ctx = egui::Context::default();
+        let view = ui.sessions.entry(session).or_default();
+        view.install_snapshot(shaped_snapshot(80, 24, "stable"));
+        view.arm_resize_presentation(90, 30, started);
+        assert!(view.buffer_resize_snapshot(
+            shaped_snapshot(90, 30, "prior target"),
+            started + std::time::Duration::from_millis(1),
+        ));
+        ui.sent_sizes.insert(session, (80, 24));
+        ui.split_final_resize_sessions.insert(session);
+        assert!(ui.apply_split_final_resize_at(session, 100, 30, now));
+
+        for failure in 0..=PROTOCOL_RETRY_LIMIT {
+            let intent = ui.take_protocol_intent().expect("final resize attempt");
+            ui.complete_protocol(WorkspaceProtocolCompletion {
+                operation: intent.operation(),
+                generation: intent.generation(),
+                result: Err(WorkspaceProtocolErrorCode::Busy),
+            });
+            if failure < PROTOCOL_RETRY_LIMIT {
+                let retry = ui.resize_retry.get_mut(&session).expect("scheduled retry");
+                retry.retry_at = Some(
+                    std::time::Instant::now()
+                        .checked_sub(std::time::Duration::from_millis(1))
+                        .unwrap(),
+                );
+                let pass = 100 + u64::from(failure);
+                ui.stage_terminal_resize_for_pass(pass, false, session, 100, 30);
+                ui.flush_render_side_effects_for_pass(&ctx, pass, false);
+            }
+        }
+
+        assert_eq!(ui.failed_resize_targets.get(&session), Some(&(100, 30)));
+        assert!(!ui.resize_retry.contains_key(&session));
+        assert!(ui.protocol_intents.is_empty());
+        assert!(!ui.split_final_resize_sessions.contains(&session));
+        assert_eq!(ui.settle_session_resize_presentation(session, now), None);
+        assert_eq!(ui.sessions[&session].snapshot.as_ref().unwrap().cols, 90);
+        assert!(ui.sessions[&session].resize_presentation.is_none());
+    }
+
+    #[test]
+    fn one_matching_ack_produces_at_most_one_distinct_resize_per_session() {
+        let now = std::time::Instant::now();
+        let mut ui = WorkspaceUi::new();
+        ui.split_final_resize_sessions = HashSet::from([SessionId(71), SessionId(72)]);
+        ui.sent_sizes.insert(SessionId(71), (80, 24));
+        ui.sent_sizes.insert(SessionId(72), (80, 24));
+
+        assert!(ui.apply_split_final_resize_at(SessionId(71), 100, 30, now));
+        assert!(ui.apply_split_final_resize_at(SessionId(72), 50, 30, now));
+        assert!(!ui.apply_split_final_resize_at(SessionId(71), 100, 30, now));
+        assert!(!ui.apply_split_final_resize_at(SessionId(72), 50, 30, now));
+
+        let commands = drain_protocol(&mut ui);
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, RuntimeCommand::Resize { .. }))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn split_shell_blank_seed_is_withheld_until_first_nonblank_viewport() {
+        let new_session = SessionId(42);
+        let blank = shaped_snapshot(80, 24, "");
+        let prompt = shaped_snapshot(80, 24, "prompt ready");
+        let mut ui = WorkspaceUi::new();
+        ui.handle_events(
+            &[
+                RuntimeEvent::MuxUpdated {
+                    snapshot: split_mux_snapshot(0.5),
+                },
+                RuntimeEvent::ShellSpawned {
+                    session: new_session,
+                },
+                RuntimeEvent::Viewport {
+                    session: new_session,
+                    snapshot: Arc::clone(&blank),
+                    bracketed_paste: false,
+                },
+            ],
+            &catalog(),
+        );
+
+        let view = ui.sessions.get(&new_session).expect("new split view");
+        assert!(view.snapshot.is_none(), "blank seed became visible");
+        assert!(view.initial_presentation.is_some());
+
+        ui.handle_events(
+            &[RuntimeEvent::Viewport {
+                session: new_session,
+                snapshot: Arc::clone(&prompt),
+                bracketed_paste: true,
+            }],
+            &catalog(),
+        );
+        let view = ui.sessions.get(&new_session).unwrap();
+        assert!(Arc::ptr_eq(view.snapshot.as_ref().unwrap(), &prompt));
+        assert!(view.initial_presentation.is_none());
+        assert!(view.bracketed_paste);
+    }
+
+    #[test]
+    fn split_shell_blank_seed_is_bounded_by_250ms() {
+        let started = std::time::Instant::now();
+        let blank = shaped_snapshot(80, 24, "");
+        let mut view = SessionView::default();
+        view.arm_initial_presentation(started);
+        assert!(view.buffer_initial_snapshot(
+            Arc::clone(&blank),
+            started + std::time::Duration::from_millis(249)
+        ));
+        view.settle_initial_presentation(started + std::time::Duration::from_millis(249));
+        assert!(view.snapshot.is_none());
+        view.settle_initial_presentation(started + std::time::Duration::from_millis(250));
+        assert!(Arc::ptr_eq(view.snapshot.as_ref().unwrap(), &blank));
+        assert!(view.initial_presentation.is_none());
+    }
+
+    #[test]
+    fn ordinary_existing_session_blank_output_is_not_misclassified_as_seed() {
+        let session = SessionId(41);
+        let blank = shaped_snapshot(80, 24, "");
+        let mut ui = WorkspaceUi::new();
+        ui.handle_events(
+            &[
+                RuntimeEvent::MuxUpdated {
+                    snapshot: split_mux_snapshot(0.5),
+                },
+                RuntimeEvent::Viewport {
+                    session,
+                    snapshot: Arc::clone(&blank),
+                    bracketed_paste: false,
+                },
+            ],
+            &catalog(),
+        );
+        let view = ui.sessions.get(&session).unwrap();
+        assert!(Arc::ptr_eq(view.snapshot.as_ref().unwrap(), &blank));
+        assert!(view.initial_presentation.is_none());
+    }
+
+    #[test]
+    fn discarded_pass_does_not_consume_final_resize_arm() {
+        let ctx = egui::Context::default();
+        let session = SessionId(81);
+        let mut ui = WorkspaceUi::new();
+        ui.sent_sizes.insert(session, (80, 24));
+        ui.split_final_resize_sessions.insert(session);
+
+        ui.stage_terminal_resize_for_pass(50, false, session, 100, 30);
+        ui.flush_render_side_effects_for_pass(&ctx, 50, true);
+        assert!(ui.protocol_intents.is_empty());
+        assert!(ui.split_final_resize_sessions.contains(&session));
+
+        ui.stage_terminal_resize_for_pass(51, false, session, 100, 30);
+        ui.flush_render_side_effects_for_pass(&ctx, 51, false);
+        assert!(matches!(
+            drain_protocol(&mut ui).as_slice(),
+            [RuntimeCommand::Resize { session: sent, cols: 100, rows: 30 }] if *sent == session
+        ));
+        assert!(!ui.split_final_resize_sessions.contains(&session));
+    }
+
+    #[test]
+    fn warm_split_shell_replay_does_not_extend_seed_deadline() {
+        let new_session = SessionId(42);
+        let mut ui = WorkspaceUi::new();
+        let events = [
+            RuntimeEvent::MuxUpdated {
+                snapshot: split_mux_snapshot(0.5),
+            },
+            RuntimeEvent::ShellSpawned {
+                session: new_session,
+            },
+        ];
+        ui.apply_warm_events(&events, &catalog());
+        let started = ui
+            .sessions
+            .get(&new_session)
+            .and_then(|view| view.initial_presentation.as_ref())
+            .expect("warm split seed fence")
+            .started_at;
+
+        ui.apply_warm_events(
+            &[RuntimeEvent::ShellSpawned {
+                session: new_session,
+            }],
+            &catalog(),
+        );
+        assert_eq!(
+            ui.sessions
+                .get(&new_session)
+                .and_then(|view| view.initial_presentation.as_ref())
+                .unwrap()
+                .started_at,
+            started
+        );
     }
 
     #[test]
@@ -7196,24 +10416,201 @@ mod tests {
         }
     }
 
+    #[test]
+    fn 분할_최소크기는_모든_leaf의_축방향_50px를_합산한다() {
+        let leaf = || LayoutNode::Pane(pane_id("leaf"));
+        let columns = LayoutNode::Split {
+            direction: SplitDirection::Horizontal,
+            ratio: 0.5,
+            first: Box::new(leaf()),
+            second: Box::new(leaf()),
+        };
+        let rows = LayoutNode::Split {
+            direction: SplitDirection::Vertical,
+            ratio: 0.5,
+            first: Box::new(leaf()),
+            second: Box::new(leaf()),
+        };
+
+        assert_eq!(
+            terminal_layout_min_size(&columns),
+            egui::vec2(
+                TERMINAL_PANE_MIN_SIZE * 2.0 + TERMINAL_SPLIT_GAP,
+                TERMINAL_PANE_MIN_SIZE
+            )
+        );
+        assert_eq!(
+            terminal_layout_min_size(&rows),
+            egui::vec2(
+                TERMINAL_PANE_MIN_SIZE,
+                TERMINAL_PANE_MIN_SIZE * 2.0 + TERMINAL_SPLIT_GAP
+            )
+        );
+
+        let nested_columns = LayoutNode::Split {
+            direction: SplitDirection::Horizontal,
+            ratio: 0.5,
+            first: Box::new(columns),
+            second: Box::new(leaf()),
+        };
+        assert_eq!(
+            terminal_layout_min_size(&nested_columns),
+            egui::vec2(
+                TERMINAL_PANE_MIN_SIZE * 3.0 + TERMINAL_SPLIT_GAP * 2.0,
+                TERMINAL_PANE_MIN_SIZE
+            ),
+            "같은 축의 중첩 split도 각 leaf의 50px를 보존해야 한다"
+        );
+    }
+
+    #[test]
+    fn 분할_minimum측정은_각_node를_한번만_기록한다() {
+        let leaf = || LayoutNode::Pane(pane_id("leaf"));
+        let first = LayoutNode::Split {
+            direction: SplitDirection::Horizontal,
+            ratio: 0.5,
+            first: Box::new(leaf()),
+            second: Box::new(leaf()),
+        };
+        let tree = LayoutNode::Split {
+            direction: SplitDirection::Vertical,
+            ratio: 0.5,
+            first: Box::new(first),
+            second: Box::new(leaf()),
+        };
+
+        let metrics = terminal_layout_metrics(&tree);
+        assert_eq!(metrics.len(), 5, "split 2개 + leaf 3개를 각각 한 번만 측정");
+        assert_eq!(metrics[0].subtree_len, 5);
+        assert_eq!(metrics[1].subtree_len, 3);
+        assert_eq!(metrics[4].subtree_len, 1);
+        assert_eq!(metrics[0].min_size, terminal_layout_min_size(&tree));
+    }
+
+    #[test]
+    fn 분할_ratio는_좌우와_상하_모두_각_pane의_50px에서_멈춘다() {
+        let first = LayoutNode::Pane(pane_id("first"));
+        let second = LayoutNode::Pane(pane_id("second"));
+        let first_min = terminal_layout_min_size(&first);
+        let second_min = terminal_layout_min_size(&second);
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(501.0, 501.0));
+
+        for direction in [SplitDirection::Horizontal, SplitDirection::Vertical] {
+            let low = terminal_split_ratio(rect, direction, 0.0, first_min, second_min);
+            let high = terminal_split_ratio(rect, direction, 1.0, first_min, second_min);
+            let axis = match direction {
+                SplitDirection::Horizontal => rect.width(),
+                SplitDirection::Vertical => rect.height(),
+            } - TERMINAL_SPLIT_GAP;
+
+            assert!((axis * low - TERMINAL_PANE_MIN_SIZE).abs() < 0.0001);
+            assert!((axis * (1.0 - high) - TERMINAL_PANE_MIN_SIZE).abs() < 0.0001);
+        }
+    }
+
+    #[test]
+    fn 분할_ratio는_비대칭_subtree의_정확한_minimum에서도_panic하지_않는다() {
+        let first_min = egui::vec2(50.0, 50.0);
+        let second_min = egui::vec2(152.0, 152.0);
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(203.0, 203.0));
+
+        for direction in [SplitDirection::Horizontal, SplitDirection::Vertical] {
+            let ratio = terminal_split_ratio(rect, direction, 0.5, first_min, second_min);
+            let available = match direction {
+                SplitDirection::Horizontal => rect.width(),
+                SplitDirection::Vertical => rect.height(),
+            } - TERMINAL_SPLIT_GAP;
+            assert!(ratio.is_finite());
+            assert!((available * ratio - 50.0).abs() < 0.0001);
+            assert!((available * (1.0 - ratio) - 152.0).abs() < 0.0001);
+        }
+    }
+
+    #[test]
+    fn 분할_ratio는_중첩_minimum과_물리적으로_좁은_창을_안전하게_처리한다() {
+        let leaf = || LayoutNode::Pane(pane_id("leaf"));
+        let two_columns = LayoutNode::Split {
+            direction: SplitDirection::Horizontal,
+            ratio: 0.5,
+            first: Box::new(leaf()),
+            second: Box::new(leaf()),
+        };
+        let right = leaf();
+        let exact_width = TERMINAL_PANE_MIN_SIZE * 3.0 + TERMINAL_SPLIT_GAP * 2.0;
+        let exact = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(exact_width, TERMINAL_PANE_MIN_SIZE),
+        );
+        let two_columns_min = terminal_layout_min_size(&two_columns);
+        let right_min = terminal_layout_min_size(&right);
+        let ratio = terminal_split_ratio(
+            exact,
+            SplitDirection::Horizontal,
+            0.0,
+            two_columns_min,
+            right_min,
+        );
+        assert!(((exact.width() - TERMINAL_SPLIT_GAP) * ratio - two_columns_min.x).abs() < 0.0001);
+
+        // 세 leaf의 최소 합보다 좁으면 불가능한 50px를 가장하지 않고, 필요한 크기에
+        // 비례해 공간을 나눈다. NaN snapshot도 같은 안전한 경로로 수렴한다.
+        let narrow =
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(120.0, TERMINAL_PANE_MIN_SIZE));
+        let expected = two_columns_min.x / (two_columns_min.x + right_min.x);
+        let constrained = terminal_split_ratio(
+            narrow,
+            SplitDirection::Horizontal,
+            f32::NAN,
+            two_columns_min,
+            right_min,
+        );
+        assert!((constrained - expected).abs() < 0.0001);
+        assert!(constrained.is_finite());
+    }
+
+    #[test]
+    fn 분할_geometry는_축이_구분선보다_작아도_음수_rect를_만들지_않는다() {
+        let first = LayoutNode::Pane(pane_id("first"));
+        let second = LayoutNode::Pane(pane_id("second"));
+        let first_min = terminal_layout_min_size(&first);
+        let second_min = terminal_layout_min_size(&second);
+
+        for (direction, size) in [
+            (SplitDirection::Horizontal, egui::vec2(0.5, 100.0)),
+            (SplitDirection::Vertical, egui::vec2(100.0, 0.5)),
+        ] {
+            let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+            let ratio = terminal_split_ratio(rect, direction, 0.5, first_min, second_min);
+            let (first_rect, second_rect, gap_rect) = terminal_split_rects(rect, direction, ratio);
+            let hit_rect = terminal_split_hit_rect(rect, gap_rect, direction);
+
+            for child in [first_rect, second_rect, gap_rect, hit_rect] {
+                assert!(child.width() >= 0.0, "음수 width: {child:?}");
+                assert!(child.height() >= 0.0, "음수 height: {child:?}");
+                assert!(child.left() >= rect.left() && child.right() <= rect.right());
+                assert!(child.top() >= rect.top() && child.bottom() <= rect.bottom());
+            }
+        }
+    }
+
     /// codex 리뷰 P2 재현 가드 — compact 헤더(3e3e909)는 visible_toolbar를
-    /// clamp(1,·)로 최소 1개 강제해, 589pt 픽스처의 10% pane(58.9px)에서
+    /// clamp(1,·)로 최소 1개 강제해, 당시 최소 pane(58.9px)에서
     /// SplitRows 버튼([30.9, 54.9])이 닫기(×) 히트박스 22px 중 17.1px([26, 48])를
     /// 덮었다. 도구 interact가 나중에 등록되므로 겹침 클릭은 닫기 대신 분할을
     /// 실행했다. 지금은 도구 0개 허용 + 겹침 시 왼쪽 도구 추가 숨김으로 닫기가
     /// 항상 우선한다.
     #[test]
     fn 지원되는_모든_좁은_split에서_도구가_닫기를_덮지_않는다() {
-        // 589pt 픽스처의 지원 최소 split 비율 10%(resize clamp 0.1) — 58.9px pane.
+        // 현재 px 기반 최소 split 크기 — 정확히 50px pane.
         let narrow = egui::Rect::from_min_size(
             egui::Pos2::ZERO,
-            egui::vec2(58.9, TERMINAL_PANE_HEADER_HEIGHT),
+            egui::vec2(TERMINAL_PANE_MIN_SIZE, TERMINAL_PANE_HEADER_HEIGHT),
         );
         for title_width in [0.0_f32, 13.0, 26.0, 70.0, 130.0] {
             let buttons = pane_header_buttons(narrow, title_width, 4, 0.0);
             assert!(
                 buttons.toolbar.is_empty(),
-                "59px pane은 도구 0개가 정상 (title_width {title_width})"
+                "50px pane은 도구 0개가 정상 (title_width {title_width})"
             );
             assert!(
                 narrow.contains_rect(buttons.close),
@@ -7292,10 +10689,11 @@ mod tests {
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
         let config = TerminalConfig::default();
         let mut ws = WorkspaceUi::new();
-        ws.set_aux_tab(Some(PaneAuxTab {
+        ws.set_aux_tabs(vec![PaneAuxTab {
+            kind: PaneAuxTabKind::History,
             label: "History".to_owned(),
             active: true,
-        }));
+        }]);
         assert!(ws.mux.is_none(), "세션이 없는 상태를 전제로 한다");
 
         let context = egui::Context::default();
@@ -7315,16 +10713,146 @@ mod tests {
         );
     }
 
+    /// 문서 탭이 활성이면 **실제 세션이 있어도** pane 본문 rect가 App으로 넘어가고
+    /// 터미널 표면·입력은 렌더되지 않는다 — 이력·Git과 같은 fail-closed 규칙(설계
+    /// "터미널이 멀쩡해야 한다" 합격 기준의 반대쪽: 문서가 활성인 동안은 반대로
+    /// 막혀야 한다). 문서 탭이 **여러 개**(멀티 문서 탭 설계) 동시에 있어도 그중
+    /// 하나만 활성이면 같은 규칙이 적용돼야 한다 — 비활성 문서 탭이 몇 개 더 있다고
+    /// fail-closed가 느슨해지면 안 된다.
+    #[test]
+    fn 문서탭이_활성이면_세션이_있어도_본문rect를_주고_터미널을_건너뛴다() {
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let config = TerminalConfig::default();
+        let mut ws = WorkspaceUi::new();
+        ws.mux = Some(mux(
+            "t",
+            vec![tab(
+                "t",
+                vec![pane("p", SessionId(7))],
+                LayoutNode::Pane(pane_id("p")),
+            )],
+            "p",
+        ));
+        ws.set_aux_tabs(vec![
+            PaneAuxTab {
+                kind: PaneAuxTabKind::Document(DocumentTabId(1)),
+                label: "note.md".to_owned(),
+                active: true,
+            },
+            PaneAuxTab {
+                kind: PaneAuxTabKind::Document(DocumentTabId(2)),
+                label: "other.md".to_owned(),
+                active: false,
+            },
+            PaneAuxTab {
+                kind: PaneAuxTabKind::Document(DocumentTabId(3)),
+                label: "third.md".to_owned(),
+                active: false,
+            },
+        ]);
+
+        let context = egui::Context::default();
+        let mut output = None;
+        let _ = context.run_ui(egui::RawInput::default(), |ui| {
+            output = Some(ws.show_with_input(ui, &config, &[], &catalog, true));
+        });
+
+        let output = output.expect("렌더가 돌아야 한다");
+        let body = output
+            .aux_body_rect
+            .expect("문서 탭 활성 중에는 본문 rect가 있어야 한다");
+        assert!(body.height() > 0.0, "본문 높이가 0이면 안 된다");
+        assert!(
+            drain_protocol(&mut ws).is_empty(),
+            "문서 탭 활성 중에는 어떤 protocol intent도 나가면 안 된다(터미널 fail-closed)"
+        );
+    }
+
+    /// 위 테스트(정적 aux_body_rect·protocol 확인)를 실제 키 입력으로 재확인한다 —
+    /// 문서 편집기(`ui::document::source_editor`)가 포커스를 쥐고 실제로 타이핑해도
+    /// 터미널로 새지 않는다. 문서 탭 활성 중에는 터미널 표면 자체가 그려지지 않아
+    /// 구조적으로 불가능하지만(위 테스트), "TextEdit 포커스 상태에서 타이핑"이라는
+    /// 구체적 시나리오(설계 §10 수동 항목)를 직접 재현해 회귀를 잡는다. 문서 탭이
+    /// 여러 개 열려 있는 상태(멀티 문서 탭 설계)로 확장했다 — 탭 개수와 무관하게
+    /// fail-closed가 지켜져야 한다.
+    #[test]
+    fn kittest_문서탭_활성중_텍스트편집기_포커스로_타이핑해도_터미널_protocol이_비어있다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let config = TerminalConfig::default();
+        let mut ws = WorkspaceUi::new();
+        ws.mux = Some(mux(
+            "t",
+            vec![tab(
+                "t",
+                vec![pane("p", SessionId(7))],
+                LayoutNode::Pane(pane_id("p")),
+            )],
+            "p",
+        ));
+        ws.set_aux_tabs(vec![
+            PaneAuxTab {
+                kind: PaneAuxTabKind::Document(DocumentTabId(1)),
+                label: "note.md".to_owned(),
+                active: true,
+            },
+            PaneAuxTab {
+                kind: PaneAuxTabKind::Document(DocumentTabId(2)),
+                label: "other.md".to_owned(),
+                active: false,
+            },
+        ]);
+
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, state: &mut (WorkspaceUi, String)| {
+                let output = state.0.show_with_input(ui, &config, &[], &catalog, true);
+                if let Some(body) = output.aux_body_rect {
+                    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(body));
+                    crate::ui::document::source_editor(
+                        &mut child,
+                        egui::Id::new("test_document_editor"),
+                        &mut state.1,
+                        true,
+                    );
+                }
+            },
+            (ws, String::new()),
+        );
+        harness.run();
+
+        harness
+            .get_by_role(egui::accesskit::Role::MultilineTextInput)
+            .click();
+        harness.run();
+        harness
+            .get_by_role(egui::accesskit::Role::MultilineTextInput)
+            .type_text("hello");
+        harness.run();
+
+        assert_eq!(
+            harness.state().1,
+            "hello",
+            "문서 TextEdit이 포커스 상태에서 타이핑을 그대로 받아야 한다"
+        );
+        assert!(
+            drain_protocol(&mut harness.state_mut().0).is_empty(),
+            "문서 탭 활성 중 TextEdit 타이핑이 터미널 protocol intent로 새면 안 된다\
+             (fail-closed)"
+        );
+    }
+
     /// 세션이 없고 이력 탭이 **비활성**이면 예전처럼 「새 셸」 진입점이 본문을 쓴다.
     #[test]
     fn 세션없는_워크스페이스의_비활성_이력탭은_본문rect를_주지_않는다() {
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
         let config = TerminalConfig::default();
         let mut ws = WorkspaceUi::new();
-        ws.set_aux_tab(Some(PaneAuxTab {
+        ws.set_aux_tabs(vec![PaneAuxTab {
+            kind: PaneAuxTabKind::History,
             label: "History".to_owned(),
             active: false,
-        }));
+        }]);
 
         let context = egui::Context::default();
         let mut output = None;
@@ -7333,6 +10861,59 @@ mod tests {
         });
 
         assert_eq!(output.expect("렌더가 돌아야 한다").aux_body_rect, None);
+    }
+
+    /// 핸드오프가 고정한 상태 기계 — 레일 재클릭은 탭을 **지우지 않고** 세션으로만
+    /// 돌아가고, 탭 제거는 보조 탭 X 전용이다.
+    #[test]
+    fn 보조탭_상태기계는_레일_탭_세션_닫기_규칙을_지킨다() {
+        use PaneAuxTabState::{Closed, OpenActive, OpenInactive};
+
+        assert_eq!(Closed.on_rail_click(), OpenActive, "레일: 닫힘 → 열고 활성");
+        assert_eq!(
+            OpenInactive.on_rail_click(),
+            OpenActive,
+            "레일: 열림 → 활성"
+        );
+        assert_eq!(
+            OpenActive.on_rail_click(),
+            OpenInactive,
+            "레일 재클릭은 세션으로 돌아가되 탭은 남긴다"
+        );
+
+        assert_eq!(OpenInactive.on_tab_click(), OpenActive);
+        assert_eq!(OpenActive.on_tab_click(), OpenActive);
+        assert_eq!(
+            Closed.on_tab_click(),
+            Closed,
+            "없는 탭은 클릭으로 살아나지 않는다"
+        );
+
+        assert_eq!(OpenActive.on_session_tab_click(), OpenInactive);
+        assert_eq!(OpenInactive.on_session_tab_click(), OpenInactive);
+
+        for state in [Closed, OpenInactive, OpenActive] {
+            assert_eq!(state.on_close(), Closed, "보조 탭 X는 항상 탭만 제거한다");
+        }
+
+        assert!(OpenActive.is_active());
+        assert!(
+            !OpenInactive.is_active(),
+            "열려 있어도 비활성은 레일을 켜지 않는다"
+        );
+        assert!(!Closed.is_active());
+
+        // 탭 chrome 존재 여부 — 한 번도 열지 않았거나 보조 탭 X로 닫으면 헤더에 탭이 없다.
+        assert!(
+            !Closed.is_open(),
+            "열기 전에는 헤더에 보조 탭이 없어야 한다"
+        );
+        assert!(OpenInactive.is_open());
+        assert!(OpenActive.is_open());
+        assert!(
+            !OpenActive.on_close().is_open(),
+            "보조 탭 X 뒤에는 탭 chrome이 사라져야 한다"
+        );
     }
 
     /// A1 두 번째 경로 — runtime이 아직 아무 pane도 포커스하지 않은 프레임에서도
@@ -7347,19 +10928,37 @@ mod tests {
         };
 
         assert_eq!(
-            aux_tab_owner_pane(&layout, None),
+            aux_tab_owner_pane(&layout, None, None),
             Some(pane_id("left")),
             "포커스가 없으면 layout의 첫 pane이 받는다"
         );
         assert_eq!(
-            aux_tab_owner_pane(&layout, Some(&pane_id("right"))),
+            aux_tab_owner_pane(&layout, None, Some(&pane_id("right"))),
             Some(pane_id("right")),
             "포커스된 pane이 layout 안에 있으면 그것이 받는다"
         );
         assert_eq!(
-            aux_tab_owner_pane(&layout, Some(&pane_id("other-tab"))),
+            aux_tab_owner_pane(&layout, None, Some(&pane_id("other-tab"))),
             Some(pane_id("left")),
             "다른 탭의 focused pane은 이 layout의 주인이 될 수 없다"
+        );
+    }
+
+    #[test]
+    fn 보조탭_owner_focus는_mux_ack전_pending_pane을_우선한다() {
+        let previous = pane_id("left");
+        let dropped = pane_id("right");
+        let layout = LayoutNode::Split {
+            direction: SplitDirection::Horizontal,
+            ratio: 0.5,
+            first: Box::new(LayoutNode::Pane(previous.clone())),
+            second: Box::new(LayoutNode::Pane(dropped.clone())),
+        };
+
+        assert_eq!(
+            aux_tab_owner_pane(&layout, Some(&dropped), Some(&previous)),
+            Some(dropped),
+            "비포커스 split drop 직후에는 옛 mux focus보다 pending focus가 주인이어야 한다"
         );
     }
 
@@ -7370,10 +10969,11 @@ mod tests {
             egui::Pos2::ZERO,
             egui::vec2(520.0, TERMINAL_PANE_HEADER_HEIGHT),
         );
-        let label_width = pane_aux_tab_label_width(header.width(), 26.0);
+        let label_width = pane_aux_tab_label_width(header.width(), 26.0, 1);
         let aux_reserved = pane_aux_tab_width(label_width) + PANE_AUX_TAB_RIGHT_PAD;
         let buttons = pane_header_buttons(header, 180.0, 4, aux_reserved);
-        let aux = pane_aux_tab_geometry(header, buttons.close, buttons.toolbar_left, label_width)
+        let left = pane_header_active_boundary(header, buttons.close);
+        let aux = pane_aux_tab_geometry(header, left, buttons.toolbar_left, label_width, true)
             .expect("520pt 헤더에는 보조 탭이 들어간다");
         let aux_close = aux.close.expect("넓은 헤더에서는 이력 X도 보인다");
 
@@ -7412,10 +11012,11 @@ mod tests {
                 egui::Pos2::ZERO,
                 egui::vec2(width, TERMINAL_PANE_HEADER_HEIGHT),
             );
-            let label_width = pane_aux_tab_label_width(header.width(), 26.0);
+            let label_width = pane_aux_tab_label_width(header.width(), 26.0, 1);
             let aux_reserved = pane_aux_tab_width(label_width) + PANE_AUX_TAB_RIGHT_PAD;
             let buttons = pane_header_buttons(header, 120.0, 4, aux_reserved);
-            match pane_aux_tab_geometry(header, buttons.close, buttons.toolbar_left, label_width) {
+            let left = pane_header_active_boundary(header, buttons.close);
+            match pane_aux_tab_geometry(header, left, buttons.toolbar_left, label_width, true) {
                 None => saw_tab_dropped = true,
                 Some(aux) => {
                     assert!(
@@ -7444,6 +11045,86 @@ mod tests {
         );
     }
 
+    /// 이력·Git·문서 여러 개(가운데 문서가 활성)가 다 있을 때도 폭을 1pt씩 훑어
+    /// 어떤 rect도 툴바/헤더 경계를 넘지 않고 라벨이 0폭이 되지 않는지 확인한다(위
+    /// 단일 탭 스윕과 같은 방식, `layout_aux_tabs`가 실제로 쓰는 다중 탭 경로를
+    /// 훑는다). 멀티 문서 탭 설계 §5의 새 불변식도 같은 스윕에서 고정한다: **활성
+    /// 탭(가운데 문서)은 placements가 비지 않는 한 항상 그 안에 있어야 한다** — 탭이
+    /// 여러 개 있는 폭에서 활성 탭을 대신 접어 지워버리면 안 된다.
+    #[test]
+    fn 좁은_헤더에서_여러_탭도_경계를_넘지_않고_활성_탭을_버리지_않는다() {
+        let mut saw_tab_dropped = false;
+        let mut saw_close_stripped = false;
+        let active_kind = PaneAuxTabKind::Document(DocumentTabId(2));
+        let tabs = [
+            aux_tab(PaneAuxTabKind::History, "이력", false),
+            aux_tab(PaneAuxTabKind::Git, "Git", false),
+            aux_tab(PaneAuxTabKind::Document(DocumentTabId(1)), "a.md", false),
+            aux_tab(active_kind, "b.md", true),
+            aux_tab(PaneAuxTabKind::Document(DocumentTabId(3)), "c.md", false),
+        ];
+        let mut width = 40.0_f32;
+        while width <= 600.0 {
+            let header = egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width, TERMINAL_PANE_HEADER_HEIGHT),
+            );
+            let aux_reserved: f32 = tabs
+                .iter()
+                .map(|_tab| {
+                    pane_aux_tab_width(pane_aux_tab_label_width(header.width(), 26.0, tabs.len()))
+                        + PANE_AUX_TAB_RIGHT_PAD
+                })
+                .sum();
+            let buttons = pane_header_buttons(header, 120.0, 4, aux_reserved);
+            let close = buttons.close;
+            let placements = layout_aux_tabs(header, close, buttons.toolbar_left, &tabs, |_| 26.0);
+            if placements.len() < tabs.len() {
+                saw_tab_dropped = true;
+            }
+            assert!(
+                placements.is_empty() || placements.iter().any(|p| p.kind == active_kind),
+                "{width}: 활성 탭이 비어있지 않은 배치에서 빠졌다: {placements:?}"
+            );
+            let mut previous_right: Option<f32> = None;
+            for placement in &placements {
+                let aux = placement.geometry;
+                assert!(
+                    aux.label_width >= PANE_AUX_TAB_MIN_LABEL,
+                    "{width}: 라벨 0폭"
+                );
+                assert!(
+                    aux.tab.right() <= buttons.toolbar_left.min(header.right()) + 0.001,
+                    "{width}: 보조 탭이 도구/헤더 경계를 넘었다"
+                );
+                assert!(aux.tab.left() >= close.right(), "{width}: 세션 닫기와 겹침");
+                if let Some(previous_right) = previous_right {
+                    assert!(
+                        aux.tab.left() >= previous_right,
+                        "{width}: 보조 탭끼리 겹침"
+                    );
+                }
+                previous_right = Some(aux.tab.right());
+                match aux.close {
+                    Some(rect) => {
+                        assert!(rect.right() <= header.right() + 0.001, "{width}: X 초과");
+                        assert!(!rect.intersects(close), "{width}: 두 X가 겹침");
+                    }
+                    None => saw_close_stripped = true,
+                }
+            }
+            width += 1.0;
+        }
+        assert!(
+            saw_close_stripped,
+            "좁아지면 ×부터 접혀야 한다(축약 순서 ⓐ)"
+        );
+        assert!(
+            saw_tab_dropped,
+            "가장 좁은 폭에서는 탭 자체도 접혀야 한다(축약 순서 ⓑ)"
+        );
+    }
+
     /// 라벨은 들어가지만 X까지는 안 들어가는 폭에서는 **X만** 버리고 탭 전환은 남긴다.
     #[test]
     fn 라벨만_들어가는_폭에서는_이력_닫기만_접는다() {
@@ -7457,12 +11138,191 @@ mod tests {
         );
         // 라벨 끝(=76+10+20=106) 뒤로 6pt만 남기면 X(중심 +14, 반폭 10, 여백 6)가 못 들어간다.
         let toolbar_left = 112.0;
-        let aux = pane_aux_tab_geometry(header, session_close, toolbar_left, 20.0)
+        let left = pane_header_active_boundary(header, session_close);
+        let aux = pane_aux_tab_geometry(header, left, toolbar_left, 20.0, true)
             .expect("라벨은 들어가야 한다");
 
         assert_eq!(aux.close, None, "자리가 없으면 X만 접는다");
         assert!(aux.label_width >= PANE_AUX_TAB_MIN_LABEL);
         assert!(aux.tab.right() <= toolbar_left + 0.001);
+    }
+
+    fn aux_tab(kind: PaneAuxTabKind, label: &str, active: bool) -> PaneAuxTab {
+        PaneAuxTab {
+            kind,
+            label: label.to_owned(),
+            active,
+        }
+    }
+
+    #[test]
+    fn 보조_탭_두_개는_겹치지_않고_순서대로_놓인다() {
+        let header = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 24.0));
+        let close = egui::Rect::from_center_size(egui::pos2(120.0, 12.0), egui::vec2(20.0, 20.0));
+        let placements = layout_aux_tabs(
+            header,
+            close,
+            700.0,
+            &[
+                aux_tab(PaneAuxTabKind::History, "이력", false),
+                aux_tab(PaneAuxTabKind::Git, "Git", true),
+            ],
+            |_| 30.0,
+        );
+        assert_eq!(placements.len(), 2);
+        assert_eq!(placements[0].kind, PaneAuxTabKind::History);
+        assert_eq!(placements[1].kind, PaneAuxTabKind::Git);
+        assert!(
+            placements[0].geometry.tab.right() <= placements[1].geometry.tab.left(),
+            "두 탭이 겹친다: {:?}",
+            placements
+                .iter()
+                .map(|p| p.geometry.tab)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            placements[1].geometry.tab.right() <= 700.0,
+            "toolbar_left를 넘지 않는다"
+        );
+    }
+
+    #[test]
+    fn 폭이_모자라면_탭보다_x부터_먼저_사라진다() {
+        // 예전엔 이 폭에서 뒤 탭(Git)이 통째로 사라졌다. 축약 순서 ⓐ(×부터 뺀다)가
+        // 생긴 뒤로는 두 탭 다 남고 ×만 접힌다 — 탭이 사라지는 건 ×를 전부 빼도
+        // 안 맞을 때뿐이다(설계 §2).
+        let header = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(220.0, 24.0));
+        let close = egui::Rect::from_center_size(egui::pos2(120.0, 12.0), egui::vec2(20.0, 20.0));
+        let placements = layout_aux_tabs(
+            header,
+            close,
+            200.0,
+            &[
+                aux_tab(PaneAuxTabKind::History, "이력", false),
+                aux_tab(PaneAuxTabKind::Git, "Git", true),
+            ],
+            |_| 30.0,
+        );
+        assert_eq!(
+            placements.len(),
+            2,
+            "×를 뺀 두 탭 다 들어가야 한다: {placements:?}"
+        );
+        assert!(
+            placements.iter().all(|p| p.geometry.close.is_none()),
+            "이 폭에서는 ×가 전부 접혀야 한다: {placements:?}"
+        );
+        assert!(
+            placements
+                .iter()
+                .all(|p| p.geometry.label_width >= PANE_AUX_TAB_MIN_LABEL),
+            "라벨이 0폭이면 안 된다"
+        );
+    }
+
+    #[test]
+    fn 폭이_x를_다_접어도_모자라면_뒤_탭부터_사라진다() {
+        // ×를 전부 접어도(ⓐ) 안 들어가는 폭 — 그제서야 탭 자체가 우선순위대로
+        // 사라진다(ⓑ). Git이 활성이라(새 불변식) 비활성인 이력이 먼저 빠진다.
+        let header = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(220.0, 24.0));
+        let close = egui::Rect::from_center_size(egui::pos2(120.0, 12.0), egui::vec2(20.0, 20.0));
+        let placements = layout_aux_tabs(
+            header,
+            close,
+            180.0,
+            &[
+                aux_tab(PaneAuxTabKind::History, "이력", false),
+                aux_tab(PaneAuxTabKind::Git, "Git", true),
+            ],
+            |_| 30.0,
+        );
+        assert_eq!(
+            placements.len(),
+            1,
+            "이 폭에서는 한 탭만 남아야 한다: {placements:?}"
+        );
+        assert_eq!(
+            placements[0].kind,
+            PaneAuxTabKind::Git,
+            "이력이 먼저 빠지고 활성 탭(Git)이 남아야 한다"
+        );
+    }
+
+    /// 축약 순서(멀티 문서 탭 설계 §5) 전 단계를 좌표로 고정한다: 이력·Git·**활성**
+    /// 문서가 다 있을 때 폭을 줄이면 ⓐ 비활성 탭(Git → 이력) × 부터 접히고, **활성
+    /// 문서의 ×는 맨 마지막에** 접힌다(새 불변식) — ×를 다 접어도 모자라면 ⓑ 같은
+    /// 순서(활성 제외)로 탭 자체가 사라지고 나머지는 사다리를 처음부터 다시 타되,
+    /// **활성 문서 탭 자체는 끝까지 살아남는다.** ⓒ 활성 문서마저 최소 폭을 못 채우면
+    /// 그제서야 배열이 빈다(패닉하지 않는다).
+    #[test]
+    fn 세_탭의_축약_순서를_좌표로_고정한다() {
+        let header = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 24.0));
+        let close = egui::Rect::from_center_size(egui::pos2(120.0, 12.0), egui::vec2(20.0, 20.0));
+        let document = PaneAuxTabKind::Document(DocumentTabId(1));
+        let tabs = [
+            aux_tab(PaneAuxTabKind::History, "이력", false),
+            aux_tab(PaneAuxTabKind::Git, "Git", false),
+            aux_tab(document, "note.md", true),
+        ];
+        let place =
+            |toolbar_left: f32| layout_aux_tabs(header, close, toolbar_left, &tabs, |_| 30.0);
+        let has_close = |placements: &[AuxTabPlacement], kind: PaneAuxTabKind| {
+            placements
+                .iter()
+                .find(|p| p.kind == kind)
+                .expect("탭이 있어야 한다")
+                .geometry
+                .close
+                .is_some()
+        };
+
+        // 0단계: 셋 다 ×까지 온전하다.
+        let p = place(350.0);
+        assert_eq!(p.len(), 3);
+        assert!(has_close(&p, PaneAuxTabKind::History));
+        assert!(has_close(&p, PaneAuxTabKind::Git));
+        assert!(has_close(&p, document));
+
+        // ⓐ-1: 비활성인 Git의 ×가 먼저 접힌다 — 활성 문서는 아직 손대지 않는다.
+        let p = place(330.0);
+        assert_eq!(p.len(), 3, "{p:?}");
+        assert!(has_close(&p, PaneAuxTabKind::History));
+        assert!(!has_close(&p, PaneAuxTabKind::Git));
+        assert!(has_close(&p, document));
+
+        // ⓐ-2: Git에 이어 이력 ×도 접힌다 — 활성 문서는 여전히 남는다.
+        let p = place(310.0);
+        assert_eq!(p.len(), 3, "{p:?}");
+        assert!(!has_close(&p, PaneAuxTabKind::History));
+        assert!(!has_close(&p, PaneAuxTabKind::Git));
+        assert!(has_close(&p, document));
+
+        // ⓐ-3: 활성 문서의 ×도 결국 접힌다 — 새 불변식은 "면제"가 아니라 "맨 마지막"이다.
+        let p = place(270.0);
+        assert_eq!(p.len(), 3, "{p:?}");
+        assert!(p.iter().all(|t| t.geometry.close.is_none()));
+
+        // ⓑ-1: ×를 다 접어도 안 맞는다 — 비활성 탭 우선순위 맨 앞(Git)이 통째로
+        // 사라진다. 활성 문서는 `aux_tab_inactive_priority`에 없어 뽑히지 않는다.
+        let p = place(255.0);
+        assert_eq!(p.len(), 2, "{p:?}");
+        assert!(p.iter().any(|t| t.kind == PaneAuxTabKind::History));
+        assert!(!p.iter().any(|t| t.kind == PaneAuxTabKind::Git));
+        assert!(p.iter().any(|t| t.kind == document));
+        assert!(!has_close(&p, PaneAuxTabKind::History));
+        assert!(has_close(&p, document));
+
+        // ⓑ-2: 이력도 통째로 사라지고 활성 문서만 남는다(×는 다시 붙는다 — 사다리를
+        // 처음부터 다시 타므로). 활성 탭은 끝까지 살아남는다는 게 이 단계의 요점이다.
+        let p = place(210.0);
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert_eq!(p[0].kind, document);
+        assert!(p[0].geometry.close.is_some());
+
+        // ⓒ: 활성 문서마저 최소 라벨 폭을 못 채우는 폭 — 탭이 하나도 없다. 패닉하지
+        // 않고 빈 배열만 돌려줘야 세션 제목이 그대로 남는다.
+        let p = place(150.0);
+        assert!(p.is_empty(), "{p:?}");
     }
 
     /// 이력 X는 **UI 탭만** 닫는다 — 세션 닫기 확인이나 ClosePane이 나가면 설계 실패다.
@@ -7480,10 +11340,11 @@ mod tests {
             )],
             "p",
         ));
-        ws.set_aux_tab(Some(PaneAuxTab {
+        ws.set_aux_tabs(vec![PaneAuxTab {
+            kind: PaneAuxTabKind::History,
             label: "History".to_owned(),
             active: true,
-        }));
+        }]);
         // render_pane_header를 직접 부르는 테스트라, show_with_input이 매 프레임 정하는
         // 보조 탭 주인을 여기서 세운다.
         ws.aux_tab_pane = Some(pane_id("p"));
@@ -7494,7 +11355,7 @@ mod tests {
         let snapshot = pane("p", SessionId(7));
         let mut intents = Vec::new();
         let mut harness = egui_kittest::Harness::new_ui_state(
-            |ui, state: &mut (WorkspaceUi, Vec<Option<PaneAuxTabIntent>>)| {
+            |ui, state: &mut (WorkspaceUi, Vec<Option<(PaneAuxTabKind, PaneAuxTabIntent)>>)| {
                 let output = state
                     .0
                     .render_pane_header(ui, header, &snapshot, true, &config, &catalog, true);
@@ -7514,7 +11375,10 @@ mod tests {
         harness.run();
 
         assert!(
-            harness.state().1.contains(&Some(PaneAuxTabIntent::Close)),
+            harness
+                .state()
+                .1
+                .contains(&Some((PaneAuxTabKind::History, PaneAuxTabIntent::Close))),
             "이력 X는 Close 의도를 올려야 한다"
         );
         assert_eq!(
@@ -7533,6 +11397,78 @@ mod tests {
         );
     }
 
+    /// 문서 X도 **UI 탭만** 닫는다 — 세션 ×와 끝까지 다른 동작이어야 한다(설계
+    /// "보조 탭에서 RuntimeCommand가 파생되면 안 된다 — 문서 ×는 pane을 닫지 않는다").
+    /// 이력 X 테스트와 같은 모양이다.
+    #[test]
+    fn kittest_문서탭_닫기는_pane을_닫지_않고_닫기의도만_올린다() {
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let config = TerminalConfig::default();
+        let mut ws = WorkspaceUi::new();
+        ws.mux = Some(mux(
+            "t",
+            vec![tab(
+                "t",
+                vec![pane("p", SessionId(7))],
+                LayoutNode::Pane(pane_id("p")),
+            )],
+            "p",
+        ));
+        ws.set_aux_tabs(vec![PaneAuxTab {
+            kind: PaneAuxTabKind::Document(DocumentTabId(1)),
+            label: "note.md".to_owned(),
+            active: true,
+        }]);
+        ws.aux_tab_pane = Some(pane_id("p"));
+        let header = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(520.0, TERMINAL_PANE_HEADER_HEIGHT),
+        );
+        let snapshot = pane("p", SessionId(7));
+        let mut intents = Vec::new();
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, state: &mut (WorkspaceUi, Vec<Option<(PaneAuxTabKind, PaneAuxTabIntent)>>)| {
+                let output = state
+                    .0
+                    .render_pane_header(ui, header, &snapshot, true, &config, &catalog, true);
+                state.1.push(output.aux_tab_intent);
+            },
+            (ws, std::mem::take(&mut intents)),
+        );
+        harness.run();
+        let aux_close = aux_close_center(&harness.state().0, header, &snapshot);
+        harness.state_mut().1.clear();
+
+        harness.hover_at(aux_close);
+        harness.run();
+        harness.drag_at(aux_close);
+        harness.run();
+        harness.drop_at(aux_close);
+        harness.run();
+
+        assert!(
+            harness.state().1.contains(&Some((
+                PaneAuxTabKind::Document(DocumentTabId(1)),
+                PaneAuxTabIntent::Close
+            ))),
+            "문서 X는 Close 의도를 올려야 한다"
+        );
+        assert_eq!(
+            harness.state().0.confirm_close,
+            None,
+            "문서 X가 세션 닫기 확인을 띄우면 안 된다"
+        );
+        assert!(
+            !drain_protocol(&mut harness.state_mut().0)
+                .iter()
+                .any(|command| matches!(
+                    command,
+                    RuntimeCommand::ClosePane { .. } | RuntimeCommand::KillSession { .. }
+                )),
+            "문서 X가 세션/pane 종료 명령을 보내면 안 된다"
+        );
+    }
+
     /// 이력이 활성인 동안 세션 탭 영역을 누르면 터미널로 돌아가는 의도가 올라간다.
     #[test]
     fn kittest_이력활성중_세션탭_클릭은_터미널복귀_의도다() {
@@ -7548,10 +11484,11 @@ mod tests {
             )],
             "p",
         ));
-        ws.set_aux_tab(Some(PaneAuxTab {
+        ws.set_aux_tabs(vec![PaneAuxTab {
+            kind: PaneAuxTabKind::History,
             label: "History".to_owned(),
             active: true,
-        }));
+        }]);
         // render_pane_header를 직접 부르는 테스트라, show_with_input이 매 프레임 정하는
         // 보조 탭 주인을 여기서 세운다.
         ws.aux_tab_pane = Some(pane_id("p"));
@@ -7561,7 +11498,7 @@ mod tests {
         );
         let snapshot = pane("p", SessionId(7));
         let mut harness = egui_kittest::Harness::new_ui_state(
-            |ui, state: &mut (WorkspaceUi, Vec<Option<PaneAuxTabIntent>>)| {
+            |ui, state: &mut (WorkspaceUi, Vec<Option<(PaneAuxTabKind, PaneAuxTabIntent)>>)| {
                 let output = state
                     .0
                     .render_pane_header(ui, header, &snapshot, true, &config, &catalog, true);
@@ -7582,10 +11519,10 @@ mod tests {
         harness.run();
 
         assert!(
-            harness
-                .state()
-                .1
-                .contains(&Some(PaneAuxTabIntent::ShowSession)),
+            harness.state().1.contains(&Some((
+                PaneAuxTabKind::History,
+                PaneAuxTabIntent::ShowSession
+            ))),
             "세션 탭 클릭은 ShowSession 의도를 올려야 한다"
         );
     }
@@ -7605,10 +11542,11 @@ mod tests {
             )],
             "p",
         ));
-        ws.set_aux_tab(Some(PaneAuxTab {
+        ws.set_aux_tabs(vec![PaneAuxTab {
+            kind: PaneAuxTabKind::History,
             label: "History".to_owned(),
             active: false,
-        }));
+        }]);
         ws.aux_tab_pane = Some(pane_id("p"));
         let header = egui::Rect::from_min_size(
             egui::Pos2::ZERO,
@@ -7616,7 +11554,7 @@ mod tests {
         );
         let snapshot = pane("p", SessionId(7));
         let mut harness = egui_kittest::Harness::new_ui_state(
-            |ui, state: &mut (WorkspaceUi, Vec<Option<PaneAuxTabIntent>>)| {
+            |ui, state: &mut (WorkspaceUi, Vec<Option<(PaneAuxTabKind, PaneAuxTabIntent)>>)| {
                 let output = state
                     .0
                     .render_pane_header(ui, header, &snapshot, true, &config, &catalog, true);
@@ -7639,7 +11577,7 @@ mod tests {
             harness
                 .state()
                 .1
-                .contains(&Some(PaneAuxTabIntent::Activate)),
+                .contains(&Some((PaneAuxTabKind::History, PaneAuxTabIntent::Activate))),
             "비활성 이력 탭 클릭은 Activate 의도를 올려야 한다"
         );
     }
@@ -7653,14 +11591,14 @@ mod tests {
         let context = egui::Context::default();
         let mut geometry = None;
         let _ = context.run_ui(egui::RawInput::default(), |ui| {
-            let label = &ws.aux_tab.as_ref().expect("aux tab set").label;
+            let label = &ws.aux_tabs.first().expect("aux tab set").label;
             let font = egui::FontId::proportional(13.0);
             let natural = ui
                 .painter()
                 .layout_no_wrap(label.clone(), font.clone(), egui::Color32::WHITE)
                 .size()
                 .x;
-            let label_width = pane_aux_tab_label_width(header.width(), natural);
+            let label_width = pane_aux_tab_label_width(header.width(), natural, 1);
             let aux_reserved = pane_aux_tab_width(label_width) + PANE_AUX_TAB_RIGHT_PAD;
             let title_width = ui
                 .painter()
@@ -7668,8 +11606,8 @@ mod tests {
                 .size()
                 .x;
             let buttons = pane_header_buttons(header, title_width, 4, aux_reserved);
-            geometry =
-                pane_aux_tab_geometry(header, buttons.close, buttons.toolbar_left, label_width);
+            let left = pane_header_active_boundary(header, buttons.close);
+            geometry = pane_aux_tab_geometry(header, left, buttons.toolbar_left, label_width, true);
         });
         geometry.expect("테스트 헤더에는 보조 탭이 들어간다")
     }
@@ -7750,6 +11688,76 @@ mod tests {
         assert!((measured.rect.center().x - pane.center().x).abs() < f32::EPSILON);
         assert!((measured.rect.center().y - pane.center().y).abs() < f32::EPSILON);
         assert_eq!(measured.galley.job.sections[0].format.font_id.size, 13.0);
+    }
+
+    #[test]
+    fn document_drop_feedback_painter는_terminal_child전_parent_clip에서_조건부로_잡는다() {
+        let source = include_str!("workspace.rs");
+        let render_pane = source
+            .split_once("    fn render_pane(")
+            .expect("render_pane 정의")
+            .1
+            .split_once("    fn agent_send_targets(")
+            .expect("render_pane 끝")
+            .0;
+        let painter = render_pane
+            .find("let pane_feedback_painter")
+            .expect("document hover일 때만 parent painter를 보관해야 한다");
+        let child = render_pane
+            .find("let mut terminal_ui = ui.new_child")
+            .expect("terminal child 정의");
+
+        assert!(
+            painter < child,
+            "terminal child painter는 content clip이므로 pane 전체 feedback에 쓰면 안 된다"
+        );
+        assert!(
+            render_pane[painter..child]
+                .contains("matches!(drop_feedback, Some(TerminalDropFeedback::DocumentOpen))"),
+            "parent painter는 document feedback frame에만 복제해야 한다"
+        );
+    }
+
+    #[test]
+    fn terminal_drop_hover_feedback은_입력종류를_정확히_분리한다() {
+        assert_eq!(
+            classify_terminal_drop_feedback(false, true, false),
+            Some(TerminalDropFeedback::TerminalInsert)
+        );
+        assert_eq!(
+            classify_terminal_drop_feedback(true, false, false),
+            Some(TerminalDropFeedback::DocumentOpen)
+        );
+        assert_eq!(
+            classify_terminal_drop_feedback(false, false, true),
+            Some(TerminalDropFeedback::DocumentOpen)
+        );
+        assert_eq!(classify_terminal_drop_feedback(false, false, false), None);
+    }
+
+    #[test]
+    fn terminal_os_file_drag_repaint는_input_owner의_활성_drag에서만_유지된다() {
+        let ctx = egui::Context::default();
+        let repaint_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_count = Arc::clone(&repaint_count);
+        ctx.set_request_repaint_callback(move |_| {
+            callback_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        let before = repaint_count.load(std::sync::atomic::Ordering::Relaxed);
+
+        request_terminal_os_drag_feedback_repaint(&ctx, false, true);
+        request_terminal_os_drag_feedback_repaint(&ctx, true, false);
+        assert_eq!(
+            repaint_count.load(std::sync::atomic::Ordering::Relaxed),
+            before,
+            "input을 소유하지 않거나 OS drag가 아니면 idle repaint를 추가하면 안 된다"
+        );
+
+        request_terminal_os_drag_feedback_repaint(&ctx, true, true);
+        assert!(
+            repaint_count.load(std::sync::atomic::Ordering::Relaxed) > before,
+            "macOS drag 중에만 AppKit 포인터를 다시 샘플링할 다음 frame을 요청해야 한다"
+        );
     }
 
     #[test]
@@ -9092,6 +13100,16 @@ mod tests {
 
         assert!(harness.query_by_label(&unavailable).is_some());
         assert!(harness.query_by_label(&connecting).is_none());
+        let ctx = harness.ctx.clone();
+        let pass = harness
+            .state()
+            .staged_terminal_resizes
+            .get(&SessionId(7))
+            .expect("attached pane resize candidate")
+            .pass;
+        harness
+            .state_mut()
+            .flush_render_side_effects_for_pass(&ctx, pass, false);
         assert!(
             drain_protocol(harness.state_mut())
                 .iter()
@@ -9443,8 +13461,250 @@ mod tests {
         ));
     }
 
+    /// 세션 헤더 Search 버튼의 갈래 조건(2026-08-18 스펙) — Search 아이콘이면서
+    /// 보조 본문이 활성일 때만 보조 검색으로 간다. 다른 도구는 보조 본문이 활성이어도
+    /// 항상 기존 경로(`activate_terminal_toolbar`)로 간다.
     #[test]
-    fn agent_info_line_distinguishes_pty_transport() {
+    fn search_click_targets_aux_search는_search_아이콘이면서_보조본문_활성일_때만_참이다() {
+        assert!(search_click_targets_aux_search(
+            TerminalToolbarIcon::Search,
+            true
+        ));
+        assert!(!search_click_targets_aux_search(
+            TerminalToolbarIcon::Search,
+            false
+        ));
+        assert!(!search_click_targets_aux_search(
+            TerminalToolbarIcon::NewTerminal,
+            true
+        ));
+        assert!(!search_click_targets_aux_search(
+            TerminalToolbarIcon::SplitColumns,
+            true
+        ));
+        assert!(!search_click_targets_aux_search(
+            TerminalToolbarIcon::SplitRows,
+            true
+        ));
+    }
+
+    /// ④ 헤더가 극단적으로 좁아 `layout_aux_tabs`가 활성 문서 탭까지 접어(빈 배치)
+    /// 돌려줘도, `any_aux_tab_active`는 App이 넘긴 원본 목록만 보고 true를 돌려줘야
+    /// 한다 — `render_pane_header`가 이 값으로 세션 제목 밝기를 정하기 때문에,
+    /// placements가 아니라 이 값을 쓰지 않으면 세션이 선택된 것처럼 잘못 칠해진다.
+    #[test]
+    fn any_aux_tab_active는_레이아웃이_아니라_실제_활성_여부를_따른다() {
+        let header = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 24.0));
+        let close = egui::Rect::from_center_size(egui::pos2(120.0, 12.0), egui::vec2(20.0, 20.0));
+        let tabs = [aux_tab(
+            PaneAuxTabKind::Document(DocumentTabId(1)),
+            "note.md",
+            true,
+        )];
+        // 세_탭의_축약_순서를_좌표로_고정한다의 ⓒ 단계와 같은 폭(150.0) — 활성 문서마저
+        // 최소 라벨 폭을 못 채워 배치가 빈다.
+        let placements = layout_aux_tabs(header, close, 150.0, &tabs, |_| 30.0);
+        assert!(
+            placements.is_empty(),
+            "전제: 이 폭에서 배치는 비어야 한다 {placements:?}"
+        );
+        assert!(
+            any_aux_tab_active(&tabs),
+            "배치가 비어도 실제로는 문서가 활성이다"
+        );
+    }
+
+    /// 헤더가 실제로 배치한 것과 같은 기하로 Search 버튼(도구 4개 중 첫 번째) 중심을
+    /// 다시 계산한다. `aux_tab_geometry_for_test`와 같은 관례 — 테스트 헤더(520pt)는
+    /// 항상 도구 4개가 다 보여야 한다(좁아지면 왼쪽 도구부터 숨는데, Search가 바로
+    /// 그 왼쪽 끝이라 좁은 헤더에서는 이 헬퍼를 쓰면 안 된다).
+    fn search_toolbar_button_center(
+        ws: &WorkspaceUi,
+        header: egui::Rect,
+        snapshot: &runtime::PaneSnapshot,
+    ) -> egui::Pos2 {
+        let context = egui::Context::default();
+        let mut center = None;
+        let _ = context.run_ui(egui::RawInput::default(), |ui| {
+            let font = egui::FontId::proportional(13.0);
+            let aux_reserved: f32 = ws
+                .aux_tabs
+                .iter()
+                .map(|tab| {
+                    let natural = ui
+                        .painter()
+                        .layout_no_wrap(tab.label.clone(), font.clone(), egui::Color32::WHITE)
+                        .size()
+                        .x;
+                    pane_aux_tab_width(pane_aux_tab_label_width(
+                        header.width(),
+                        natural,
+                        ws.aux_tabs.len(),
+                    )) + PANE_AUX_TAB_RIGHT_PAD
+                })
+                .sum();
+            let title_width = ui
+                .painter()
+                .layout_no_wrap(snapshot.title.clone(), font, egui::Color32::WHITE)
+                .size()
+                .x;
+            let buttons = pane_header_buttons(header, title_width, 4, aux_reserved);
+            assert_eq!(
+                buttons.toolbar.len(),
+                4,
+                "테스트 헤더는 도구 4개가 모두 보여야 한다"
+            );
+            center = Some(buttons.toolbar[0].center());
+        });
+        center.expect("Search 버튼 rect를 계산해야 한다")
+    }
+
+    /// 회귀 방지 계약: 보조 본문(이력·Git)이 비활성이면 Search 버튼은 지금까지처럼
+    /// 터미널 검색을 연다 — `aux_search_toggle_requested`가 오르면 안 된다.
+    #[test]
+    fn kittest_보조본문_비활성이면_검색버튼은_기존_터미널검색을_연다() {
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let config = TerminalConfig::default();
+        let mut ws = WorkspaceUi::new();
+        ws.mux = Some(mux(
+            "t",
+            vec![tab(
+                "t",
+                vec![pane("p", SessionId(7))],
+                LayoutNode::Pane(pane_id("p")),
+            )],
+            "p",
+        ));
+        let header = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(520.0, TERMINAL_PANE_HEADER_HEIGHT),
+        );
+        let snapshot = pane("p", SessionId(7));
+        let search_center = search_toolbar_button_center(&ws, header, &snapshot);
+
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, state: &mut (WorkspaceUi, bool)| {
+                let output = state
+                    .0
+                    .render_pane_header(ui, header, &snapshot, true, &config, &catalog, true);
+                // `aux_search_toggle_requested`는 프레임마다 새로 계산되는 값이라
+                // `clicked()`가 참인 한 프레임에만 켜진다 — harness가 한 `run()`
+                // 안에서 내부적으로 여러 번 그릴 수 있어 `|=`로 누적한다(덮어쓰면
+                // 클릭 프레임 다음 그리기에서 다시 꺼진다).
+                state.1 |= output.aux_search_toggle_requested;
+            },
+            (ws, false),
+        );
+        harness.run();
+
+        harness.hover_at(search_center);
+        harness.run();
+        harness.drag_at(search_center);
+        harness.run();
+        harness.drop_at(search_center);
+        harness.run();
+
+        assert!(
+            !harness.state().1,
+            "보조 본문이 비활성이면 aux_search_toggle_requested가 오르면 안 된다"
+        );
+        assert_eq!(
+            harness
+                .state()
+                .0
+                .search
+                .as_ref()
+                .map(|search| search.session),
+            Some(SessionId(7)),
+            "보조 본문이 비활성이면 Search 버튼은 여전히 기존 터미널 검색을 연다(회귀 방지)"
+        );
+    }
+
+    /// 보조 본문이 활성인 헤더에서는 Search 버튼이 `aux_search_toggle_requested`를
+    /// 올리고, 기존 터미널 검색(`ws.search`)은 열지 않는다 — App이 그 intent로
+    /// `aux_search.toggle()`을 부른다(스펙 "진입"). `input_enabled: false`로 App이
+    /// 이 프레임에 실제로 넘기는 값(입력 소유권 fail-closed)을 재현한다.
+    #[test]
+    fn kittest_보조본문_활성이면_검색버튼은_보조검색_토글_의도를_올린다() {
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let config = TerminalConfig::default();
+        let mut ws = WorkspaceUi::new();
+        ws.mux = Some(mux(
+            "t",
+            vec![tab(
+                "t",
+                vec![pane("p", SessionId(7))],
+                LayoutNode::Pane(pane_id("p")),
+            )],
+            "p",
+        ));
+        ws.set_aux_tabs(vec![PaneAuxTab {
+            kind: PaneAuxTabKind::History,
+            label: "History".to_owned(),
+            active: true,
+        }]);
+        ws.aux_tab_pane = Some(pane_id("p"));
+        let header = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(520.0, TERMINAL_PANE_HEADER_HEIGHT),
+        );
+        let snapshot = pane("p", SessionId(7));
+        let search_center = search_toolbar_button_center(&ws, header, &snapshot);
+
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, state: &mut (WorkspaceUi, bool)| {
+                let output = state
+                    .0
+                    .render_pane_header(ui, header, &snapshot, true, &config, &catalog, false);
+                state.1 |= output.aux_search_toggle_requested;
+            },
+            (ws, false),
+        );
+        harness.run();
+
+        harness.hover_at(search_center);
+        harness.run();
+        harness.drag_at(search_center);
+        harness.run();
+        harness.drop_at(search_center);
+        harness.run();
+
+        assert!(
+            harness.state().1,
+            "보조 본문이 활성이면 Search 버튼은 aux_search_toggle_requested를 올려야 한다"
+        );
+        assert!(
+            harness.state().0.search.is_none(),
+            "보조 검색으로 갈 때는 기존 터미널 검색을 열면 안 된다"
+        );
+    }
+
+    /// 2026-08-20 사용자: `Claude · claude-opus-5`처럼 같은 낱말이 한 줄에 두 번
+    /// 나올 필요가 없다. 모델명이 provider를 품으면 라벨을 뺀다.
+    #[test]
+    fn 모델명이_provider를_품으면_라벨을_빼서_중복을_없앤다() {
+        let display = crate::agent_detect::AgentDisplay {
+            kind: crate::agent_detect::AgentKind::Claude,
+            model: Some("claude-opus-5".to_owned()),
+            effort: None,
+            context_pct: None,
+            last_agent_summary: None,
+            user_instruction: None,
+        };
+
+        assert_eq!(agent_info_line(&display), "claude-opus-5");
+        assert!(model_implies_provider("Claude", "claude-opus-5"));
+        assert!(!model_implies_provider("Codex", "gpt-5.6-sol"));
+        // 모델이 아예 없으면 라벨만 남아야 한다 — 빈 줄이 되면 안 된다.
+        let no_model = crate::agent_detect::AgentDisplay {
+            model: None,
+            ..display
+        };
+        assert_eq!(agent_info_line(&no_model), "Claude");
+    }
+
+    #[test]
+    fn agent_info_line은_전송배지_없이_provider와_모델을_보여준다() {
         let display = crate::agent_detect::AgentDisplay {
             kind: crate::agent_detect::AgentKind::Codex,
             model: Some("gpt-test".to_owned()),
@@ -9456,7 +13716,8 @@ mod tests {
 
         assert_eq!(
             agent_info_line(&display),
-            "[PTY] Codex · gpt-test · high · ctx 69%"
+            "Codex · gpt-test · high · ctx 69%",
+            "모델명이 provider를 안 품으면 라벨을 남긴다 — 어느 에이전트인지 알려주는 유일한 단서다"
         );
         let catalog = catalog();
         assert_eq!(
@@ -9546,11 +13807,155 @@ mod tests {
             scroll_offset: 0,
             is_alt_screen: false,
         };
-        // '성'(idx 7) 위를 더블클릭 — 파일명 전체가 한 단어여야 한다
+        // '성'(idx 7) 위 hover — 파일명 전체가 한 단어여야 한다(폴더 cd·URL 열기 판정용).
+        // 더블클릭은 2026-08-17부터 `line_range_at`(행 전체)을 쓴다.
         let (s, e) = word_range_at(&snap, 7).expect("단어");
         assert_eq!(renderer_egui::selection_text(&snap, s, e), "nant-성과.pdf");
         // 공백(idx 1)은 여전히 단어가 아니다
         assert!(word_range_at(&snap, 1).is_none());
+    }
+
+    /// 행 문자열 목록으로 스냅샷 하나 — 부족한 칸은 공백으로 채운다.
+    fn line_snap(cols: usize, lines: &[&str]) -> TerminalViewportSnapshot {
+        let mut cells = Vec::new();
+        for line in lines {
+            let mut width = 0usize;
+            for c in line.chars() {
+                // 픽스처에서는 비ASCII를 2칸(wide)으로 본다 — 한글 검증에 충분하다.
+                let wide = !c.is_ascii();
+                cells.push(TerminalCell {
+                    c,
+                    fg: [255; 3],
+                    bg: [0; 3],
+                    wide,
+                    wide_spacer: false,
+                    attrs: Default::default(),
+                });
+                width += 1;
+                if wide {
+                    cells.push(TerminalCell {
+                        c: ' ',
+                        fg: [255; 3],
+                        bg: [0; 3],
+                        wide: false,
+                        wide_spacer: true,
+                        attrs: Default::default(),
+                    });
+                    width += 1;
+                }
+            }
+            while width < cols {
+                cells.push(TerminalCell {
+                    c: ' ',
+                    fg: [255; 3],
+                    bg: [0; 3],
+                    wide: false,
+                    wide_spacer: false,
+                    attrs: Default::default(),
+                });
+                width += 1;
+            }
+        }
+        TerminalViewportSnapshot {
+            cols: cols as u16,
+            rows: lines.len() as u16,
+            cursor: CursorSnapshot {
+                col: 0,
+                row: 0,
+                shape: CursorShape::Block,
+                visible: true,
+            },
+            visible_cells: cells.into(),
+            dirty_ranges: Vec::new(),
+            title: None,
+            scroll_offset: 0,
+            is_alt_screen: false,
+        }
+    }
+
+    #[test]
+    fn 행_선택은_행_전체를_잡고_끝_공백은_뺀다() {
+        let snap = line_snap(12, &["ls -la", "second row"]);
+        let (s, e) = line_range_at(&snap, 3).expect("행");
+        assert_eq!(s, 0, "행 시작(0열)부터다 — 앞 들여쓰기도 행의 일부다");
+        assert_eq!(
+            renderer_egui::selection_text(&snap, s, e),
+            "ls -la",
+            "끝의 빈 칸은 선택에 넣지 않는다"
+        );
+    }
+
+    /// 3연클릭이 방금 만든 행 선택을 지우면 안 된다. egui `double_clicked()`는 count==2
+    /// 에서만 참이라, 트리플을 함께 받지 않으면 else-if 사슬 끝의 단일 클릭 분기가
+    /// `selection = None`을 실행한다(2026-08-18 리뷰).
+    ///
+    /// 제스처 배선은 렌더 안에 있어 순수 함수로 뽑을 수 없다 — 소스 계약으로 고정한다.
+    /// 이 테스트가 지키는 것은 **배선**이고, 행 범위 계산 자체는 위 `line_range_at`
+    /// 테스트들이 값으로 검증한다.
+    #[test]
+    fn 트리플클릭도_행_선택으로_받는다() {
+        let source = include_str!("workspace.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let branch = production
+            .split_once("line_range_at(&snapshot, cell_at(pos))")
+            .expect("행 선택 분기가 있어야 한다")
+            .0;
+        // 분기 조건은 그 호출 **직전**에 온다 — 뒤에서부터 가장 가까운 조건을 본다.
+        let condition = branch
+            .rsplit_once("if (")
+            .expect("더블/트리플을 함께 받는 조건이어야 한다")
+            .1;
+        assert!(
+            condition.contains("double_clicked()") && condition.contains("triple_clicked()"),
+            "더블·트리플 둘 다 받아야 3연클릭이 선택을 지우지 않는다: {condition:?}"
+        );
+    }
+
+    #[test]
+    fn 행_선택은_클릭한_행만_잡는다() {
+        let snap = line_snap(12, &["first", "second row"]);
+        // 두 번째 행(base 12)의 아무 칸이나
+        let (s, e) = line_range_at(&snap, 12 + 4).expect("행");
+        assert_eq!(s, 12);
+        assert_eq!(renderer_egui::selection_text(&snap, s, e), "second row");
+    }
+
+    #[test]
+    fn 빈_행은_선택하지_않는다() {
+        // 빈 줄을 더블클릭해도 아무 일도 일어나지 않는다(공백 위 단어 선택과 같은 감각).
+        let snap = line_snap(12, &["", "   "]);
+        assert!(line_range_at(&snap, 3).is_none());
+        assert!(line_range_at(&snap, 12 + 1).is_none());
+    }
+
+    /// 2칸 글자가 행 끝에 안 들어가 다음 줄로 밀리면 그 행 마지막 칸에 **필러**가 남는다
+    /// (alacritty `LEADING_WIDE_CHAR_SPACER` / ghostty `SpacerHead`). 눈에는 빈 행인데
+    /// `wide_spacer` 비트만 서 있어서, 구분하지 않으면 더블클릭에 강조 막대가 생긴다
+    /// (2026-08-18 리뷰가 실제 백엔드로 실측).
+    #[test]
+    fn 행_끝_wrap_필러만_있는_행은_선택하지_않는다() {
+        let mut snap = line_snap(6, &[""]);
+        let cells: &mut Vec<TerminalCell> = &mut snap.visible_cells.to_vec();
+        // 마지막 칸만 필러로 만든다 — 앞 칸은 소유자(wide)가 아니라 그냥 공백이다.
+        cells[5].wide_spacer = true;
+        snap.visible_cells = cells.clone().into();
+
+        assert!(
+            !snap.is_trailing_wide_spacer(5),
+            "앞 칸이 소유자가 아니면 진짜 뒷칸이 아니다"
+        );
+        assert!(
+            line_range_at(&snap, 2).is_none(),
+            "눈에 빈 행은 더블클릭해도 선택하지 않는다"
+        );
+    }
+
+    #[test]
+    fn 행_선택은_wide_문자로_끝나도_자리_채움까지_포함한다() {
+        // 한글로 끝나는 행에서 자리 채움 셀을 빼면 마지막 글자가 잘려 보인다.
+        let snap = line_snap(12, &["ok 한글"]);
+        let (s, e) = line_range_at(&snap, 0).expect("행");
+        assert_eq!(renderer_egui::selection_text(&snap, s, e), "ok 한글");
     }
 
     #[test]
@@ -9602,6 +14007,63 @@ mod tests {
         }
     }
 
+    /// 세션 행 점프 강조는 **새 기구를 만들지 않고** 기존 `session_flash`에 얹는다.
+    /// 그래야 여러 pane 사이를 점프할 때 `FOCUS_FLASH`와 같은 pane에 테두리가 두 겹으로
+    /// 그려지지 않는다(2026-08-18).
+    #[test]
+    fn flash_pane은_그_pane의_세션을_기존_플래시_기구에_넣는다() {
+        let mut ws = WorkspaceUi::new();
+        let session = SessionId(7);
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        ws.apply_warm_events(
+            &[RuntimeEvent::MuxUpdated {
+                snapshot: mux(
+                    "t1",
+                    vec![tab(
+                        "t1",
+                        vec![pane("p1", session)],
+                        LayoutNode::Pane(pane_id("p1")),
+                    )],
+                    "p1",
+                ),
+            }],
+            &catalog,
+        );
+
+        // 포커스 변경으로 들어간 플래시가 있으면 이 테스트의 전제가 흐려진다 — 비우고 시작한다.
+        ws.session_flash.clear();
+        ws.flash_pane(&pane_id("p1"));
+        assert!(
+            ws.session_flash.contains_key(&session),
+            "점프한 pane의 세션에 플래시가 들어가야 한다"
+        );
+    }
+
+    #[test]
+    fn flash_pane은_모르는_pane이면_아무것도_하지_않는다() {
+        let mut ws = WorkspaceUi::new();
+        let session = SessionId(7);
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        ws.apply_warm_events(
+            &[RuntimeEvent::MuxUpdated {
+                snapshot: mux(
+                    "t1",
+                    vec![tab(
+                        "t1",
+                        vec![pane("p1", session)],
+                        LayoutNode::Pane(pane_id("p1")),
+                    )],
+                    "p1",
+                ),
+            }],
+            &catalog,
+        );
+
+        ws.session_flash.clear();
+        ws.flash_pane(&pane_id("없는pane"));
+        assert!(ws.session_flash.is_empty(), "모르는 pane은 무시한다");
+    }
+
     fn tab_id(name: &str) -> MuxTabId {
         MuxTabId(name.to_owned())
     }
@@ -9633,8 +14095,10 @@ mod tests {
     }
 
     fn snapshot(text: &str) -> Arc<TerminalViewportSnapshot> {
-        let cols = 12;
-        let rows = 2;
+        shaped_snapshot(12, 2, text)
+    }
+
+    fn shaped_snapshot(cols: usize, rows: usize, text: &str) -> Arc<TerminalViewportSnapshot> {
         let mut cells = Vec::with_capacity(cols * rows);
         let chars: Vec<char> = text.chars().collect();
         for idx in 0..cols * rows {
@@ -10138,13 +14602,16 @@ mod tests {
         );
         assert_eq!(
             ui.session_project_context(Some(session)),
-            Some("precomputed-repo")
+            Some("precomputed-repo".to_owned())
         );
         ui.set_session_cwds(
             HashMap::from([(session, "/workspace/other".to_owned())]),
             crate::config::SessionNameStyle::Repo,
         );
-        assert_eq!(ui.session_project_context(Some(session)), Some("other"));
+        assert_eq!(
+            ui.session_project_context(Some(session)),
+            Some("other".to_owned())
+        );
         assert!(ui.session_project_names.entries.is_empty());
         assert_eq!(
             ui.resolve_session_title(
@@ -10161,6 +14628,76 @@ mod tests {
             ui.session_project_context(Some(session)),
             None,
             "세션 cwd가 없으면 활성 workspace 이름을 해당 세션의 작업으로 단정하지 않는다"
+        );
+    }
+
+    /// 2026-08-19 사용자 보고 재현: Crawler 워크스페이스의 세션인데 cwd가 우연히 다른
+    /// 이름(Design)의 폴더를 가리켜, 프로젝트명만 단독으로 보이면 "다른 워크스페이스의
+    /// 세션이 섞여 들어왔다"는 착각을 준다. 워크스페이스 자체 이름과 cwd 프로젝트명이
+    /// 다르면 "프로젝트명 (워크스페이스명)"으로 소속을 함께 밝혀야 한다.
+    #[test]
+    fn cwd_project_name이_워크스페이스_자체_이름과_다르면_소속을_함께_보여준다() {
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        let session = SessionId(20);
+        let mut ui = WorkspaceUi::new();
+        ui.set_project_name(Some("Crawler".to_owned()));
+        ui.set_session_cwds(
+            HashMap::from([(session, "/projects/colon35/Design".to_owned())]),
+            crate::config::SessionNameStyle::Folder,
+        );
+        let snapshot = SessionProjectNameSnapshot::try_new(
+            1,
+            vec![(
+                session,
+                "/projects/colon35/Design".to_owned(),
+                "Design".to_owned(),
+            )],
+        )
+        .unwrap();
+        ui.set_session_project_names(snapshot);
+
+        assert_eq!(
+            ui.resolve_session_title("workspace.spawn.shell 1", Some(session), None, &catalog),
+            "Design (Crawler)",
+            "세션 제목이 다른 워크스페이스 이름과 같은 단어로만 보이면 세션이 섞였다고 오해한다"
+        );
+        assert_eq!(
+            ui.session_project_context(Some(session)),
+            Some("Design (Crawler)".to_owned()),
+            "에이전트 행 1행(headline)에 쓰이는 project_context도 같은 규칙을 따라야 한다"
+        );
+    }
+
+    /// 워크스페이스 루트 그대로 작업 중이라 cwd 프로젝트명이 워크스페이스 자체 이름과
+    /// 같은, 가장 흔한 경우는 지금처럼 프로젝트명만 보여준다 — 정보 중복이 없다.
+    #[test]
+    fn cwd_project_name이_워크스페이스_자체_이름과_같으면_그대로_보여준다() {
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        let session = SessionId(21);
+        let mut ui = WorkspaceUi::new();
+        ui.set_project_name(Some("Crawler".to_owned()));
+        ui.set_session_cwds(
+            HashMap::from([(session, "/projects/Crawler".to_owned())]),
+            crate::config::SessionNameStyle::Folder,
+        );
+        let snapshot = SessionProjectNameSnapshot::try_new(
+            1,
+            vec![(
+                session,
+                "/projects/Crawler".to_owned(),
+                "Crawler".to_owned(),
+            )],
+        )
+        .unwrap();
+        ui.set_session_project_names(snapshot);
+
+        assert_eq!(
+            ui.resolve_session_title("workspace.spawn.shell 1", Some(session), None, &catalog),
+            "Crawler"
+        );
+        assert_eq!(
+            ui.session_project_context(Some(session)),
+            Some("Crawler".to_owned())
         );
     }
 
@@ -10277,6 +14814,16 @@ mod tests {
             ratio: 0.5,
         };
         assert_eq!(workspace_protocol_command_is_valid(&exact_path), Ok(()));
+        let root_path = RuntimeCommand::ResizeSplit {
+            tab: MuxTabId("t".to_owned()),
+            path: Vec::new(),
+            ratio: 0.5,
+        };
+        assert_eq!(
+            workspace_protocol_command_is_valid(&root_path),
+            Ok(()),
+            "빈 path는 최상위 split divider를 가리킨다"
+        );
         let too_deep_path = RuntimeCommand::ResizeSplit {
             tab: MuxTabId("t".to_owned()),
             path: vec![0; WORKSPACE_PROTOCOL_SPLIT_PATH_MAX_ITEMS + 1],
@@ -10415,6 +14962,214 @@ mod tests {
         ));
     }
 
+    /// 창 드래그 재현 — 세션의 첫 크기는 지연 없이 즉시 나가지만(세션 생성/split과 동일
+    /// 취급), 그 뒤로 목표가 프레임마다 계속 바뀌는 동안(=드래그 진행 중)은 어떤 중간
+    /// 크기도 PTY에 전송되면 안 된다(전송되면 매 중간 크기마다 alacritty가 reflow하며
+    /// 화면이 깜빡인다). 목표가 안정된 뒤 debounce가 지나야 그 최종 크기 하나만 더
+    /// 전송된다.
+    #[test]
+    fn 리사이즈_드래그_중_중간_크기는_보내지_않고_안정된_최종크기만_한번_보낸다() {
+        let mut ui = WorkspaceUi::new();
+        let session = SessionId(11);
+        let ctx = egui::Context::default();
+
+        // pane이 처음 나타날 때의 크기 — 첫 mismatch는 지연 없이 바로 나간다.
+        ui.queue_terminal_resize_debounced(&ctx, session, 80, 24);
+        assert_eq!(ui.sent_sizes.get(&session), Some(&(80, 24)));
+        drain_protocol(&mut ui);
+
+        // 드래그 시작 — 프레임마다 다른 목표. 직전 전송값(80,24)과 달라 mismatch지만,
+        // 이미 한 번 보낸 뒤이므로 여기서부터는 debounce가 걸려야 한다(전송 안 됨).
+        for (cols, rows) in [(100u16, 30u16), (101, 30), (105, 32), (110, 33)] {
+            ui.queue_terminal_resize_debounced(&ctx, session, cols, rows);
+            assert_eq!(
+                ui.sent_sizes.get(&session),
+                Some(&(80, 24)),
+                "드래그가 안정되기 전에는 새 크기가 전송되면 안 된다"
+            );
+            assert!(
+                ui.protocol_intents.is_empty(),
+                "중간 크기가 큐에 들어가면 안 된다"
+            );
+        }
+
+        // 드래그 종료 — 마지막 목표(110, 33)로 안정된다. debounce가 지나기 전엔 여전히 보류.
+        ui.queue_terminal_resize_debounced(&ctx, session, 110, 33);
+        assert_eq!(ui.sent_sizes.get(&session), Some(&(80, 24)));
+
+        std::thread::sleep(RESIZE_DRAG_DEBOUNCE + std::time::Duration::from_millis(30));
+        // 실제 앱에서는 request_repaint_after가 예약한 repaint가 이 시점에 App::ui()를
+        // 다시 불러 이 경로를 재실행시킨다 — 여기서는 그 프레임을 직접 흉내낸다.
+        ui.queue_terminal_resize_debounced(&ctx, session, 110, 33);
+
+        assert_eq!(
+            ui.sent_sizes.get(&session),
+            Some(&(110, 33)),
+            "드래그가 끝나면 최종 크기가 반드시 전달돼야 한다"
+        );
+        assert!(matches!(
+            &drain_protocol(&mut ui)[0],
+            RuntimeCommand::Resize { session: s, cols: 110, rows: 33 } if *s == session
+        ));
+    }
+
+    /// 창 테두리를 **사람이 실제로 끄는 속도**로 드래그하면 같은 cols/rows가 한 프레임
+    /// 이상 유지되다가 다음 칸으로 넘어간다. 그 "머무는" 프레임에서 보류가 지워지면
+    /// 다음 칸이 「첫 mismatch」로 오인돼 즉시 전송되고, 그리드 한 칸마다 PTY가 reflow하며
+    /// 자식이 SIGWINCH로 화면을 전부 다시 그린다 — 그것이 창 리사이즈 깜빡임이다
+    /// (2026-09-06 사용자 보고). 첫 크기를 이미 보낸 세션의 그 뒤 변경은 목표가 안정될
+    /// 때까지 단 한 번도 전송되면 안 된다.
+    #[test]
+    fn 느린_창_드래그는_칸마다_머물러도_중간_크기를_보내지_않는다() {
+        let mut ui = WorkspaceUi::new();
+        let session = SessionId(14);
+        let ctx = egui::Context::default();
+
+        // 세션이 처음 나타날 때의 크기 — 지연 없이 즉시 나간다.
+        ui.queue_terminal_resize_debounced(&ctx, session, 80, 24);
+        assert_eq!(ui.sent_sizes.get(&session), Some(&(80, 24)));
+        drain_protocol(&mut ui);
+        // 창이 그 크기에 머무는 평범한 프레임 — 최상단 가드가 보류를 지운다. 드래그를
+        // 시작하기 전의 앱은 항상 이 상태다.
+        ui.queue_terminal_resize_debounced(&ctx, session, 80, 24);
+
+        // 느린 드래그 — 한 칸 바뀌고, 그 크기로 프레임이 몇 번 더 지나가고, 또 한 칸.
+        for cols in [81u16, 82, 83] {
+            for _ in 0..3 {
+                ui.queue_terminal_resize_debounced(&ctx, session, cols, 24);
+            }
+            assert_eq!(
+                ui.sent_sizes.get(&session),
+                Some(&(80, 24)),
+                "느린 드래그의 중간 크기 {cols}가 전송됐다"
+            );
+            assert!(
+                ui.protocol_intents.is_empty(),
+                "느린 드래그의 중간 크기 {cols}가 큐에 들어갔다"
+            );
+        }
+
+        // 드래그가 멈추면 최종 크기 하나만 전달된다.
+        std::thread::sleep(RESIZE_DRAG_DEBOUNCE + std::time::Duration::from_millis(30));
+        ui.queue_terminal_resize_debounced(&ctx, session, 83, 24);
+        assert_eq!(ui.sent_sizes.get(&session), Some(&(83, 24)));
+        assert!(matches!(
+            &drain_protocol(&mut ui)[0],
+            RuntimeCommand::Resize { session: s, cols: 83, rows: 24 } if *s == session
+        ));
+    }
+
+    /// 창 폭이 계속 바뀌어도 문자 격자로 반올림한 cols/rows는 한동안 같을 수 있다.
+    /// 이 구간을 드래그 종료로 오인하면 debounce 만료 직후 중간 Resize가 나간다.
+    #[test]
+    fn 같은_격자_안에서_viewport가_움직이면_리사이즈를_확정하지_않는다() {
+        let mut ui = WorkspaceUi::new();
+        let session = SessionId(15);
+        let ctx = egui::Context::default();
+        ui.sent_sizes.insert(session, (80, 24));
+
+        let run_resize = |ui: &mut WorkspaceUi, viewport_width: f32| {
+            let mut input = egui::RawInput::default();
+            input
+                .viewports
+                .get_mut(&egui::ViewportId::ROOT)
+                .expect("root viewport")
+                .inner_rect = Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(viewport_width, 600.0),
+            ));
+            let _ = ctx.run_ui(input, |viewport_ui| {
+                ui.queue_terminal_resize_debounced(viewport_ui.ctx(), session, 81, 24);
+            });
+        };
+
+        run_resize(&mut ui, 800.0);
+        ui.pending_resize_target.get_mut(&session).unwrap().3 = std::time::Instant::now()
+            .checked_sub(RESIZE_DRAG_DEBOUNCE + std::time::Duration::from_millis(1))
+            .unwrap();
+        run_resize(&mut ui, 801.0);
+
+        assert_eq!(ui.sent_sizes.get(&session), Some(&(80, 24)));
+        assert!(
+            ui.protocol_intents.is_empty(),
+            "같은 문자 격자 안의 viewport 이동을 드래그 종료로 오인했다"
+        );
+    }
+
+    /// 세션이 막 생기거나 split 직후처럼 크기가 한 번만 바뀌는 경우(드래그가 아님)는
+    /// 지연 없이 즉시 전송돼야 한다 — 모든 resize에 디바운스 지연을 강제하지 않는다.
+    #[test]
+    fn 세션_생성같은_단일_리사이즈는_지연_없이_즉시_전송된다() {
+        let mut ui = WorkspaceUi::new();
+        let session = SessionId(12);
+        let ctx = egui::Context::default();
+
+        ui.queue_terminal_resize_debounced(&ctx, session, 80, 24);
+
+        assert_eq!(ui.sent_sizes.get(&session), Some(&(80, 24)));
+        assert!(matches!(
+            &drain_protocol(&mut ui)[0],
+            RuntimeCommand::Resize { session: s, cols: 80, rows: 24 } if *s == session
+        ));
+    }
+
+    /// 디바운스 만료 시점에 프로토콜 큐가 가득 차 전송이 삼켜지면 **보류를 지우면 안 된다**.
+    /// 지우면 다음 프레임이 None 분기로 떨어져 즉시 재전송하고, 그 실패가 다시 디바운스
+    /// 분기로 와서 repaint 예약을 무한히 갱신한다 — 큐가 계속 막혀 있는 동안 앱이 영영
+    /// 유휴로 못 내려간다. 보류가 남아 있으면 elapsed가 만료 상태로 고정돼 repaint를
+    /// 예약하지 않고, 자연히 오는 프레임에서만 재시도한다.
+    #[test]
+    fn 큐가_막혀_전송이_삼켜지면_보류를_남겨_repaint_루프를_만들지_않는다() {
+        let mut ui = WorkspaceUi::new();
+        let session = SessionId(13);
+        let ctx = egui::Context::default();
+
+        // 첫 크기는 즉시 나간다.
+        ui.queue_terminal_resize_debounced(&ctx, session, 80, 24);
+        assert_eq!(ui.sent_sizes.get(&session), Some(&(80, 24)));
+        drain_protocol(&mut ui);
+
+        // 목표가 바뀐다 — 여기서부터 디바운스가 걸린다(전송 안 됨).
+        ui.queue_terminal_resize_debounced(&ctx, session, 100, 30);
+        assert_eq!(ui.sent_sizes.get(&session), Some(&(80, 24)));
+
+        // 디바운스가 만료되기 전에 큐를 가득 채운다.
+        for delta in 1..=WORKSPACE_PROTOCOL_CAP {
+            assert_eq!(
+                ui.queue_protocol_intent(RuntimeCommand::Scroll {
+                    session: SessionId(1000 + delta as u64),
+                    delta: 1,
+                }),
+                Ok(())
+            );
+        }
+        std::thread::sleep(RESIZE_DRAG_DEBOUNCE + std::time::Duration::from_millis(30));
+
+        // 만료 후 전송 시도 — 큐가 가득 차 삼켜진다.
+        ui.queue_terminal_resize_debounced(&ctx, session, 100, 30);
+        assert_eq!(
+            ui.sent_sizes.get(&session),
+            Some(&(80, 24)),
+            "큐가 가득 차면 전송되지 않는다"
+        );
+        assert_eq!(
+            ui.pending_resize_target
+                .get(&session)
+                .map(|(cols, rows, _, _)| (*cols, *rows)),
+            Some((100, 30)),
+            "전송이 삼켜졌으면 보류가 남아야 한다"
+        );
+
+        // 큐가 풀리면 자연히 오는 다음 프레임에서 최종 크기가 전달된다.
+        drain_protocol(&mut ui);
+        ui.queue_terminal_resize_debounced(&ctx, session, 100, 30);
+        assert_eq!(ui.sent_sizes.get(&session), Some(&(100, 30)));
+        assert!(
+            !ui.pending_resize_target.contains_key(&session),
+            "전송이 성사되면 보류가 사라진다"
+        );
+    }
+
     #[test]
     fn pending_resize_for_same_session_is_latest_only() {
         let mut ui = WorkspaceUi::new();
@@ -10479,6 +15234,105 @@ mod tests {
                 rows: 40,
             } if *queued_session == session
         )));
+    }
+
+    /// 회귀 — 큐/inflight 8칸이 그냥 꽉 찬 것(Busy)은 자연히 풀리는 내부
+    /// 백프레셔라 배너를 띄우면 안 된다("terminal protocol request rejected" 버그).
+    #[test]
+    fn send_keep_selection이_큐_포화만으로는_배너를_띄우지_않는다() {
+        let mut ui = WorkspaceUi::new();
+        for index in 0..WORKSPACE_PROTOCOL_CAP {
+            ui.queue_protocol_intent(RuntimeCommand::Scroll {
+                session: SessionId(index as u64 + 1),
+                delta: 1,
+            })
+            .unwrap();
+        }
+
+        let delivered = ui.send_keep_selection(RuntimeCommand::Scroll {
+            session: SessionId(99),
+            delta: 1,
+        });
+
+        assert!(!delivered);
+        assert_eq!(ui.error, None, "큐 포화는 배너를 띄우지 않아야 한다");
+        assert!(!ui.protocol_request_lost);
+    }
+
+    /// spawn_shell_at도 동일 원칙 — spawn 상한 포화는 배너 없이 조용히 거부된다.
+    #[test]
+    fn spawn_shell_at이_큐_포화만으로는_배너를_띄우지_않는다() {
+        let mut ui = WorkspaceUi::new();
+        for index in 0..WORKSPACE_PROTOCOL_CAP {
+            ui.spawn_shell_at(1_000, Some(format!("/tmp/deppy-{index}")));
+        }
+        assert_eq!(ui.error, None, "정상 spawn 8개는 배너를 띄우면 안 된다");
+
+        ui.spawn_shell_at(1_000, Some("/tmp/deppy-overflow".to_owned()));
+
+        assert_eq!(ui.error, None, "spawn 상한 포화도 배너를 띄우면 안 된다");
+        assert!(!ui.protocol_request_lost);
+    }
+
+    /// 회귀 — complete_protocol의 Err(Busy)/Err(DeliveryFailed)는 대부분 stale/종료
+    /// 레이스라 배너를 띄우면 "이유 모를 배너가 가끔 뜬다"는 원래 버그를 재현한다.
+    /// 진단은 tracing으로만 남긴다("terminal protocol delivery failed" 버그).
+    #[test]
+    fn complete_protocol의_busy와_delivery_failed는_배너를_띄우지_않는다() {
+        let mut ui = WorkspaceUi::new();
+        ui.queue_protocol_intent(RuntimeCommand::Scroll {
+            session: SessionId(1),
+            delta: 1,
+        })
+        .unwrap();
+        let intent = ui.take_protocol_intent().unwrap();
+        ui.complete_protocol(WorkspaceProtocolCompletion {
+            operation: intent.operation(),
+            generation: intent.generation(),
+            result: Err(WorkspaceProtocolErrorCode::Busy),
+        });
+        assert_eq!(ui.error, None);
+
+        ui.queue_protocol_intent(RuntimeCommand::Scroll {
+            session: SessionId(2),
+            delta: 1,
+        })
+        .unwrap();
+        let intent = ui.take_protocol_intent().unwrap();
+        ui.complete_protocol(WorkspaceProtocolCompletion {
+            operation: intent.operation(),
+            generation: intent.generation(),
+            result: Err(WorkspaceProtocolErrorCode::DeliveryFailed),
+        });
+        assert_eq!(ui.error, None);
+        assert!(!ui.protocol_request_lost);
+    }
+
+    /// 진짜 유실(PayloadTooLarge)만 protocol_request_lost 플래그를 세운다 — send_keep_selection
+    /// 은 catalog가 없어 문구를 못 만들므로 플래그만 세우고 show_with_input이 렌더 시점에
+    /// catalog로 채운다. 이 키는 5개 로케일 모두에서 실제 한국어/현지어 문구로 존재해야 한다.
+    #[test]
+    fn send_keep_selection의_payload_too_large는_유실_플래그를_세운다() {
+        let mut ui = WorkspaceUi::new();
+
+        let delivered = ui.send_keep_selection(RuntimeCommand::WriteInput {
+            session: SessionId(1),
+            bytes: vec![b'x'; WORKSPACE_PROTOCOL_INPUT_MAX_BYTES + 1],
+        });
+
+        assert!(!delivered);
+        assert!(ui.protocol_request_lost, "실제 유실은 플래그로 남아야 한다");
+
+        let ko = i18n::Catalog::load("ko-KR").unwrap();
+        let message = ko.t("workspace.protocol_request_lost", &[]);
+        assert_ne!(
+            message, "workspace.protocol_request_lost",
+            "키가 아니라 실제 문구여야 한다"
+        );
+        assert!(
+            !message.is_ascii(),
+            "한국어 배너여야 한다 (영어 원문 그대로 노출 금지): {message}"
+        );
     }
 
     #[test]
@@ -10800,7 +15654,7 @@ mod tests {
         );
     }
 
-    /// kittest 재현 — 10% pane(58.9px) 헤더에서 닫기(×) 자리를 클릭하면 분할이
+    /// kittest 재현 — 최소 pane(50px) 헤더에서 닫기(×) 자리를 클릭하면 분할이
     /// 아니라 닫기 확인이 떠야 한다. compact 헤더(3e3e909)에서는 강제 표시된
     /// Split 버튼이 닫기 히트박스를 덮고 interact가 나중 등록이라 SplitPane이
     /// 나갔다 (codex 리뷰 P2).
@@ -10820,7 +15674,7 @@ mod tests {
         ));
         let header = egui::Rect::from_min_size(
             egui::Pos2::ZERO,
-            egui::vec2(58.9, TERMINAL_PANE_HEADER_HEIGHT),
+            egui::vec2(TERMINAL_PANE_MIN_SIZE, TERMINAL_PANE_HEADER_HEIGHT),
         );
         let snapshot = pane("p", SessionId(7));
         let mut harness = egui_kittest::Harness::new_ui_state(
@@ -10955,6 +15809,22 @@ mod tests {
             clipboard_terminal_paste_bytes(None, Some(text.clone()), ShellKind::Posix, true),
             Some(text)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_raw_path_caps_use_encoded_os_bytes() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let mut raw = vec![b'x'; WORKSPACE_PATH_MAX_BYTES];
+        *raw.last_mut().unwrap() = 0xff;
+        let path = PathBuf::from(std::ffi::OsString::from_vec(raw));
+        let expected = path.as_os_str().as_encoded_bytes().len();
+
+        let payload = WorkspacePathPayload::try_new(path.clone()).unwrap();
+        assert_eq!(payload.bytes, expected);
+        let clipboard = TerminalClipboardPayload::try_new(vec![path], None).unwrap();
+        assert_eq!(clipboard.path_bytes, expected);
     }
 
     #[test]
@@ -11095,6 +15965,29 @@ https://example.test/login \
         assert_eq!(drag_autoscroll_rate(-2000.0, 100.0, 500.0, 16.0), 60.0);
     }
 
+    /// 휠은 평상시 선택을 해제하지만(화면 freeze 때문), **드래그 중에는 보존**해야
+    /// 한 화면을 넘는 범위를 이어 잡을 수 있다(2026-08-18 사용자 요청).
+    #[test]
+    fn 휠은_드래그_중에만_선택을_보존한다() {
+        // 드래그 중이고 그 세션의 선택이 살아 있을 때만 보존한다. 조건이 앵커를 보정하는
+        // `dragged()` 분기와 **같아야** 스크롤과 선택이 어긋나지 않는다.
+        assert!(
+            wheel_scroll_keeps_selection(true, true),
+            "드래그 중이면 보존"
+        );
+        // 버튼을 뗀 뒤의 휠은 기존대로 해제한다 — 안 그러면 선택이 남아 화면이 멈춘 듯 보인다.
+        assert!(
+            !wheel_scroll_keeps_selection(false, true),
+            "드래그가 아니면 해제"
+        );
+        // 선택이 없으면 보존할 것도 없다(다른 세션의 선택이어도 마찬가지).
+        assert!(
+            !wheel_scroll_keeps_selection(true, false),
+            "그 세션 선택이 없으면 해제"
+        );
+        assert!(!wheel_scroll_keeps_selection(false, false));
+    }
+
     #[test]
     fn 드래그_오토스크롤_앵커는_스크롤량만큼_이동하고_화면_경계에서_clamp() {
         // 10열 × 5행, 앵커 = 2행 3열(idx 23)
@@ -11177,25 +16070,55 @@ https://example.test/login \
     #[test]
     fn 진행중_ime는_일시적_비textedit_포커스에서도_이벤트를_계속_받는다() {
         assert!(terminal_accepts_ime_events(
-            true, false, true, false, false, false
+            true, false, true, false, false, false, false
         ));
         assert!(!terminal_accepts_ime_events(
-            true, false, true, true, false, false
+            true, false, true, false, true, false, false
         ));
         assert!(!terminal_accepts_ime_events(
-            true, false, true, false, true, false
+            true, false, true, false, false, true, false
         ));
         assert!(!terminal_accepts_ime_events(
-            true, false, true, false, false, true
+            true, false, true, false, false, false, true
         ));
         assert!(!terminal_accepts_ime_events(
-            true, true, true, true, false, false
+            true, true, true, false, true, false, false
         ));
         assert!(!terminal_accepts_ime_events(
-            true, true, true, false, true, false
+            true, true, true, false, false, true, false
         ));
         assert!(!terminal_accepts_ime_events(
-            true, true, true, false, false, true
+            true, true, true, false, false, false, true
+        ));
+    }
+
+    /// 조합이 **시작되는** 프레임은 egui 공식 소유권도 직전 프레임 preedit도 없다.
+    /// 그 프레임을 거절하면 `self.preedit`이 채워지지 않고, renderer가 뒤이은 입력 없는
+    /// 프레임에서 조합이 끝난 줄 알고 포커스를 복구하다 IME를 강제 중단한다(자모 분리).
+    #[test]
+    fn 조합이_시작되는_프레임은_소유권과_직전_preedit이_없어도_받는다() {
+        // 이번 프레임 preedit만 근거인 경우 — 받아야 한다.
+        assert!(terminal_accepts_ime_events(
+            true, false, false, true, false, false, false
+        ));
+        // 근거가 하나도 없으면 종전대로 받지 않는다.
+        assert!(!terminal_accepts_ime_events(
+            true, false, false, false, false, false, false
+        ));
+        // TextEdit·팝업·모달 배제는 이번 프레임 preedit이 있어도 그대로 우선한다 —
+        // 다른 입력창의 조합을 터미널이 가로채면 안 된다.
+        assert!(!terminal_accepts_ime_events(
+            true, false, false, true, true, false, false
+        ));
+        assert!(!terminal_accepts_ime_events(
+            true, false, false, true, false, true, false
+        ));
+        assert!(!terminal_accepts_ime_events(
+            true, false, false, true, false, false, true
+        ));
+        // 터미널이 키보드 소유자가 아니면 무조건 거절한다.
+        assert!(!terminal_accepts_ime_events(
+            false, false, false, true, false, false, false
         ));
     }
 
@@ -11473,34 +16396,33 @@ https://example.test/login \
         assert!(!workspace.take_terminal_focus_claimed());
     }
 
-    /// OS 파일 드롭 — 터미널 pane 위에서 놓으면 그 세션에 ⌘V 경로 붙여넣기와 같은
-    /// 바이트를 쓴다(paths_insert_paste_bytes, workspace.rs 6176행). 예전엔 터미널
-    /// 영역에서 OS dropped_files를 읽는 핸들러가 아예 없어 조용히 버려졌다
-    /// (2026-08-14 사용자: "터미널에 넣으면 터미널로 들어가야해").
+    /// OS 파일 드롭은 확장자를 분류하거나 PTY에 경로를 쓰지 않고 App에 그대로 넘긴다.
     #[test]
-    fn kittest_터미널_pane_위_os_드롭은_경로를_붙여넣는다() {
+    fn kittest_터미널_pane_위_os_드롭은_모든_경로를_문서_intent로_보낸다() {
         let session = SessionId(7);
-        let mut harness = setup_focused_local_pane_harness(session);
-        let expected_bytes = paths_insert_paste_bytes(
-            &[PathBuf::from("/x/dropped.txt")],
-            harness.state().session_shell_kind(session),
-            harness.state().session_bracketed_paste(session),
-        );
+        let mut harness = setup_focused_local_pane_drop_harness(session);
+        let dropped = [
+            PathBuf::from("/x/main.rs"),
+            PathBuf::from("/x/config.json"),
+            PathBuf::from("/x/settings.toml"),
+            PathBuf::from("/x/deploy.yaml"),
+        ];
         let pane_point = egui::pos2(80.0, TERMINAL_PANE_HEADER_HEIGHT + 40.0);
         harness
             .input_mut()
             .events
             .push(egui::Event::PointerMoved(pane_point));
-        harness.input_mut().dropped_files.push(egui::DroppedFile {
-            path: Some(PathBuf::from("/x/dropped.txt")),
-            ..Default::default()
-        });
+        harness
+            .input_mut()
+            .dropped_files
+            .extend(dropped.iter().cloned().map(|path| egui::DroppedFile {
+                path: Some(path),
+                ..Default::default()
+            }));
         harness.run();
 
-        assert_eq!(
-            written_bytes(drain_protocol(harness.state_mut())),
-            expected_bytes
-        );
+        assert_eq!(harness.state().1.document_drop_paths, dropped.to_vec());
+        assert!(written_bytes(drain_protocol(&mut harness.state_mut().0)).is_empty());
     }
 
     /// pane 헤더처럼 터미널 표면 밖에 놓인 OS 드롭은 무시한다 — dropped_files가
@@ -11509,7 +16431,7 @@ https://example.test/login \
     #[test]
     fn kittest_pane_밖_os_드롭은_무시된다() {
         let session = SessionId(7);
-        let mut harness = setup_focused_local_pane_harness(session);
+        let mut harness = setup_focused_local_pane_drop_harness(session);
         // pane 헤더 영역(표면 rect 위) — TERMINAL_PANE_HEADER_HEIGHT보다 작은 y는
         // pane_layout.surface(=pane_rect) 밖이다.
         let header_point = egui::pos2(80.0, 4.0);
@@ -11523,7 +16445,8 @@ https://example.test/login \
         });
         harness.run();
 
-        assert!(written_bytes(drain_protocol(harness.state_mut())).is_empty());
+        assert!(harness.state().1.document_drop_paths.is_empty());
+        assert!(written_bytes(drain_protocol(&mut harness.state_mut().0)).is_empty());
     }
 
     /// 분할된 두 pane 중 포인터 밑 pane에만 들어간다 — 한 번의 OS 드롭이 두 목적지로
@@ -11558,43 +16481,68 @@ https://example.test/login \
         let mut harness = egui_kittest::Harness::builder()
             .with_size(egui::vec2(600.0, 400.0))
             .build_ui_state(
-                move |ui, workspace: &mut WorkspaceUi| {
-                    workspace.show_with_input(ui, &config, &[], &catalog, true);
+                move |ui, state: &mut (WorkspaceUi, WorkspaceSurfaceOutput)| {
+                    let frame = state.0.show_with_input(ui, &config, &[], &catalog, true);
+                    state
+                        .1
+                        .document_drop_paths
+                        .extend(frame.document_drop_paths);
+                    if frame.local_focus_claimed.is_some() {
+                        state.1.local_focus_claimed = frame.local_focus_claimed;
+                    }
                 },
-                workspace,
+                (workspace, WorkspaceSurfaceOutput::default()),
             );
         harness.run();
-        drain_protocol(harness.state_mut());
+        drain_protocol(&mut harness.state_mut().0);
 
-        let expected_bytes = paths_insert_paste_bytes(
-            &[PathBuf::from("/x/dropped.txt")],
-            harness.state().session_shell_kind(left),
-            harness.state().session_bracketed_paste(left),
-        );
-        // 왼쪽 pane(폭 300pt의 안쪽) 위에서 드롭.
-        let left_point = egui::pos2(100.0, TERMINAL_PANE_HEADER_HEIGHT + 40.0);
+        // 초기 포커스는 왼쪽이지만 오른쪽 pane 위에 드롭한다.
+        let right_point = egui::pos2(500.0, TERMINAL_PANE_HEADER_HEIGHT + 40.0);
         harness
             .input_mut()
             .events
-            .push(egui::Event::PointerMoved(left_point));
+            .push(egui::Event::PointerMoved(right_point));
         harness.input_mut().dropped_files.push(egui::DroppedFile {
-            path: Some(PathBuf::from("/x/dropped.txt")),
+            path: Some(PathBuf::from("/x/right-pane.rs")),
             ..Default::default()
         });
         harness.run();
 
-        let writes = drain_protocol(harness.state_mut())
-            .into_iter()
-            .filter_map(|command| match command {
-                RuntimeCommand::WriteInput { session, bytes } => Some((session, bytes)),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
         assert_eq!(
-            writes,
-            vec![(left, expected_bytes)],
-            "포인터 아래 왼쪽 pane에만, 정확히 한 번만 들어가야 한다"
+            harness.state().1.document_drop_paths,
+            vec![PathBuf::from("/x/right-pane.rs")]
         );
+        assert_eq!(
+            harness.state().1.local_focus_claimed,
+            Some(pane_id("right"))
+        );
+        assert!(written_bytes(drain_protocol(&mut harness.state_mut().0)).is_empty());
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn kittest_파일트리_PathBuf_드롭은_문서_intent이고_pty_write가_아니다() {
+        let session = SessionId(7);
+        let mut harness = setup_focused_local_pane_drop_harness(session);
+        let point = egui::pos2(80.0, TERMINAL_PANE_HEADER_HEIGHT + 40.0);
+        harness.hover_at(point);
+        harness.drag_at(point);
+        harness.run();
+        egui::DragAndDrop::set_payload(&harness.ctx, PathBuf::from("/x/lib.rs"));
+        harness.event(egui::Event::PointerMoved(point));
+        harness.event(egui::Event::PointerButton {
+            pos: point,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run();
+
+        assert_eq!(
+            harness.state().1.document_drop_paths,
+            vec![PathBuf::from("/x/lib.rs")]
+        );
+        assert!(written_bytes(drain_protocol(&mut harness.state_mut().0)).is_empty());
     }
 
     fn printable_key(key: egui::Key) -> egui::Event {
@@ -11848,6 +16796,43 @@ https://example.test/login \
         // 연속 타이핑 중의 정상 경로를 테스트하기 위함이다.
         harness.run();
         drain_protocol(harness.state_mut());
+        harness
+    }
+
+    fn setup_focused_local_pane_drop_harness(
+        session: SessionId,
+    ) -> egui_kittest::Harness<'static, (WorkspaceUi, WorkspaceSurfaceOutput)> {
+        let catalog = catalog();
+        let config = TerminalConfig::default();
+        let target_pane = pane_id("pane");
+        let mut workspace = WorkspaceUi::new();
+        workspace.mux = Some(mux(
+            "primary",
+            vec![tab(
+                "primary",
+                vec![pane("pane", session)],
+                LayoutNode::Pane(target_pane.clone()),
+            )],
+            "pane",
+        ));
+        workspace.last_focused_pane = Some(target_pane.clone());
+        workspace.pending_focus = Some(target_pane);
+        workspace.sessions.entry(session).or_default().snapshot = Some(snapshot("ready"));
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, state: &mut (WorkspaceUi, WorkspaceSurfaceOutput)| {
+                let frame = state.0.show_with_input(ui, &config, &[], &catalog, true);
+                state
+                    .1
+                    .document_drop_paths
+                    .extend(frame.document_drop_paths);
+                if frame.local_focus_claimed.is_some() {
+                    state.1.local_focus_claimed = frame.local_focus_claimed;
+                }
+            },
+            (workspace, WorkspaceSurfaceOutput::default()),
+        );
+        harness.run();
+        drain_protocol(&mut harness.state_mut().0);
         harness
     }
 

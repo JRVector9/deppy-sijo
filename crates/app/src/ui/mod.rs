@@ -5,25 +5,31 @@ pub mod agent_terminal;
 pub mod agent_visuals;
 pub mod agents;
 pub mod approvals;
+pub mod aux_search;
 pub mod clipboard_image;
 pub mod composer;
 pub mod credentials;
 pub(crate) mod cross_workspace;
 pub mod designall;
 pub mod diff_panel;
+pub mod diff_viewer;
+pub mod document;
 pub mod env_profiles;
 pub mod env_project_list;
 pub mod file_drop;
 pub mod file_tree;
 pub mod fleet;
+pub mod git_panel;
 pub mod inbox_approvals;
 pub mod inbox_waiting;
+pub mod markdown_viewer;
 pub mod notes;
 pub mod notifications;
 pub(crate) mod ports;
 pub mod prompt_palette;
 pub(crate) mod resource_manager;
 pub mod settings;
+pub mod transcript_viewer;
 pub mod work_history;
 pub mod workspace;
 
@@ -254,9 +260,43 @@ pub fn render_message(catalog: &i18n::Catalog, message: &runtime::MessagePayload
     catalog.t(&message.message_id, &args)
 }
 
+pub(crate) fn os_str_display(value: &std::ffi::OsStr) -> String {
+    use unicode_normalization::UnicodeNormalization as _;
+
+    value.to_string_lossy().nfc().collect()
+}
+
+pub(crate) fn os_str_canonically_eq(value: &std::ffi::OsStr, other: &str) -> bool {
+    use unicode_normalization::UnicodeNormalization as _;
+
+    value
+        .to_str()
+        .is_some_and(|value| value.nfc().eq(other.nfc()))
+}
+
+pub(crate) fn path_display(path: &std::path::Path) -> String {
+    use unicode_normalization::UnicodeNormalization as _;
+
+    path.to_string_lossy().nfc().collect()
+}
+
+pub(crate) fn path_file_name_display(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(os_str_display)
+        .unwrap_or_else(|| path_display(path))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nfd_file_name_and_path_are_displayed_as_nfc() {
+        let raw = std::path::Path::new("/tmp/\u{1112}\u{1161}\u{11AB}\u{1100}\u{1173}\u{11AF}.md");
+
+        assert_eq!(path_file_name_display(raw), "한글.md");
+        assert_eq!(path_display(raw), "/tmp/한글.md");
+    }
 
     /// 선의 **양끝이 물리픽셀 경계**에 떨어져야 안티에일리어싱으로 번지지 않는다.
     /// 홀수 폭이면 중심 정렬, 짝수 폭이면 경계 정렬이라야 그렇게 된다.

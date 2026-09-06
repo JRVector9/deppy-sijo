@@ -17,10 +17,11 @@
 //! ```
 //! 같은 시각 서버 API가 준 값(주간 6%, 5시간 0%)과 일치하는 것을 확인했다.
 //!
-//! 무료 계정은 이 패널 자리에 「Upgrade to a membership … see plan usage」가 뜬다 —
-//! 그 경우 아무것도 못 읽고 조용히 표시하지 않는다. 「쓰는 사람에게만 보인다」가
-//! 자연히 성립한다.
+//! 무료 계정은 이 패널 자리에 「Upgrade to a membership … see plan usage」가 뜬다.
+//! 숫자는 만들지 않되 런처에서 Kimi가 감지된 사실은 호출부가 별도로 보존하므로,
+//! 상태바에는 Kimi 로고와 `—`가 남아 "설치됐지만 수치 사용량은 없음"을 드러낸다.
 
+use std::path::Path;
 use std::sync::{Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
@@ -33,10 +34,12 @@ const STARTUP_DELAY: Duration = Duration::from_secs(2);
 const SETTLE_DELAY: Duration = Duration::from_secs(2);
 const MAX_OUTPUT_BYTES: usize = 100_000;
 
+type CompletedProbe = Option<(Instant, crate::app::ProviderUsage)>;
+
 #[derive(Default)]
 struct UsageState {
     usage: Option<(Instant, crate::app::ProviderUsage)>,
-    pending: Option<mpsc::Receiver<Option<crate::app::ProviderUsage>>>,
+    pending: Option<mpsc::Receiver<CompletedProbe>>,
     last_request: Option<Instant>,
 }
 
@@ -47,54 +50,71 @@ struct UsageState {
 ///
 /// 처음엔 「감지된 Kimi 세션이 있을 때만」으로 막았는데, 그 판정 근거인 `agent_kinds`가
 /// **활성 워크스페이스만** 담아서 다른 워크스페이스에서 Kimi를 쓰면 프로브가 영영 돌지
-/// 않았다(2026-08-10 실증). 사용량은 계정 단위 값이라 워크스페이스와 무관해야 한다.
-pub fn current(ctx: &egui::Context) -> Option<crate::app::ProviderUsage> {
-    if !kimi_installed() {
-        return None;
-    }
+/// 않았다(2026-08-10 실증). 지금은 전역 런처 스냅샷의 감지 결과와 그 정확한 실행 경로를
+/// 전달받으므로 사용량의 계정 단위 성격과 설치 경계를 함께 지킨다.
+pub(crate) fn current(
+    ctx: &egui::Context,
+    agent: Option<&crate::agent_launcher::DetectedAgent>,
+) -> Option<crate::app::ProviderUsage> {
+    let agent = agent?;
     static STATE: OnceLock<Mutex<UsageState>> = OnceLock::new();
     let state = STATE.get_or_init(|| Mutex::new(UsageState::default()));
     let Ok(mut state) = state.lock() else {
         return None;
     };
 
-    if let Some(receiver) = state.pending.as_ref() {
-        match receiver.try_recv() {
-            Ok(usage) => {
-                if let Some(usage) = usage {
-                    state.usage = Some((Instant::now(), usage));
-                }
-                state.pending = None;
-            }
-            Err(mpsc::TryRecvError::Disconnected) => state.pending = None,
-            Err(mpsc::TryRecvError::Empty) => {}
-        }
-    }
+    receive_pending_probe(&mut state);
 
     let refresh_due = state
         .last_request
         .is_none_or(|requested| requested.elapsed() >= REFRESH_INTERVAL);
     if state.pending.is_none() && refresh_due {
+        let executable = agent.executable().to_path_buf();
+        let detected_launch_path = agent.launch_path().map(std::ffi::OsString::from);
         let (sender, receiver) = mpsc::sync_channel(1);
         let repaint = ctx.clone();
-        if std::thread::Builder::new()
+        let attempted = Instant::now();
+        let spawned = std::thread::Builder::new()
             .name("kimi-usage-probe".to_owned())
             .spawn(move || {
-                let usage = fetch_kimi_usage().ok().flatten();
-                let _ = sender.send(usage);
+                let usage = fetch_kimi_usage(&executable, detected_launch_path.as_deref())
+                    .ok()
+                    .flatten();
+                let _ = sender.send(usage.map(|usage| (Instant::now(), usage)));
                 repaint.request_repaint();
             })
-            .is_ok()
-        {
+            .is_ok();
+        state.last_request = Some(last_request_after_spawn(attempted));
+        if spawned {
             state.pending = Some(receiver);
-            state.last_request = Some(Instant::now());
         }
     }
     let (measured_at, usage) = state.usage?;
     crate::app::fresh_usage_after(usage, measured_at.elapsed())
 }
 
-fn fetch_kimi_usage() -> anyhow::Result<Option<crate::app::ProviderUsage>> {
+fn last_request_after_spawn(attempted: Instant) -> Instant {
+    attempted
+}
+
+fn receive_pending_probe(state: &mut UsageState) {
+    let Some(receiver) = state.pending.as_ref() else {
+        return;
+    };
+    match receiver.try_recv() {
+        Ok(Some(completed)) => {
+            state.usage = Some(completed);
+            state.pending = None;
+        }
+        Ok(None) | Err(mpsc::TryRecvError::Disconnected) => state.pending = None,
+        Err(mpsc::TryRecvError::Empty) => {}
+    }
+}
+
+fn fetch_kimi_usage(
+    executable: &Path,
+    detected_launch_path: Option<&std::ffi::OsStr>,
+) -> anyhow::Result<Option<crate::app::ProviderUsage>> {
     let backend = pty::PortablePtyBackend;
     // claude 프로브와 같은 전용 디렉터리. 사용자의 실제 프로젝트에서 띄우지 않는다 —
     // 세션 기록이나 신뢰 설정이 그쪽에 섞이면 안 된다.
@@ -103,19 +123,14 @@ fn fetch_kimi_usage() -> anyhow::Result<Option<crate::app::ProviderUsage>> {
         .unwrap_or_else(std::env::temp_dir);
     std::fs::create_dir_all(&probe_dir)?;
 
-    let command = pty::CommandSpec {
-        program: resolve_kimi_command(),
-        args: Vec::new(),
-        env: vec![("TERM".to_owned(), "xterm-256color".to_owned())],
-        cwd: Some(probe_dir),
-    };
+    let command = kimi_probe_command(executable, probe_dir, detected_launch_path)?;
 
     let mut session = backend.spawn(&command, 120, 40)?;
     let output = session
         .take_output()
         .ok_or_else(|| anyhow::anyhow!("Kimi usage PTY output unavailable"))?;
     std::thread::sleep(STARTUP_DELAY);
-    session.write_input(b"/status\r")?;
+    write_required_input(session.as_mut(), b"/status\r")?;
 
     let started = Instant::now();
     let mut settle_at = None;
@@ -135,10 +150,10 @@ fn fetch_kimi_usage() -> anyhow::Result<Option<crate::app::ProviderUsage>> {
                 // 신뢰해도 사용자 프로젝트에 영향이 없다. 한 번만 보낸다 — 반복하면
                 // 다음 화면의 Enter까지 먹어 `/status`가 지워진다.
                 if !trusted && lower.contains("trust this folder") {
-                    let _ = session.write_input(b"\r");
+                    write_required_input(session.as_mut(), b"\r")?;
                     trusted = true;
                     // 신뢰 직후 TUI가 다시 그려지므로 명령을 한 번 더 보낸다.
-                    let _ = session.write_input(b"/status\r");
+                    write_required_input(session.as_mut(), b"/status\r")?;
                 }
                 if settle_at.is_none() && usage_panel_rendered(&lower) {
                     settle_at = Some(Instant::now() + SETTLE_DELAY);
@@ -157,32 +172,60 @@ fn fetch_kimi_usage() -> anyhow::Result<Option<crate::app::ProviderUsage>> {
     Ok(parse_usage(&clean))
 }
 
-/// Kimi를 실제로 쓰는 기기인가 — 실행 파일이 알려진 자리에 있는지로 본다.
-///
-/// PATH 폴백(`"kimi"`)은 여기서 「설치됨」으로 치지 않는다. 없는 명령을 60초마다
-/// 띄우려 시도하는 꼴이 되기 때문이다.
-fn kimi_installed() -> bool {
-    kimi_command_path().is_some()
+fn kimi_probe_command(
+    executable: &Path,
+    probe_dir: std::path::PathBuf,
+    detected_launch_path: Option<&std::ffi::OsStr>,
+) -> anyhow::Result<pty::CommandSpec> {
+    let (program, args) =
+        crate::provider_usage_command::probe_program_and_args(executable, cfg!(windows), "Kimi")?;
+    let search_path = probe_search_path(executable, detected_launch_path, "Kimi")?;
+    Ok(pty::CommandSpec {
+        program,
+        args,
+        env: vec![
+            ("TERM".to_owned(), "xterm-256color".to_owned()),
+            ("PATH".to_owned(), search_path),
+        ],
+        cwd: Some(probe_dir),
+    })
 }
 
-/// Kimi 실행 파일. 공식 설치 위치를 먼저 보고, 없으면 PATH에 맡긴다.
-fn resolve_kimi_command() -> String {
-    kimi_command_path()
-        .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "kimi".to_owned())
+fn probe_search_path(
+    executable: &Path,
+    detected_launch_path: Option<&std::ffi::OsStr>,
+    provider: &str,
+) -> anyhow::Result<String> {
+    let search_path = if let Some(path) = detected_launch_path {
+        path.to_os_string()
+    } else {
+        let mut paths = executable
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .into_iter()
+            .map(Path::to_path_buf)
+            .collect::<Vec<_>>();
+        if let Some(path) = std::env::var_os("PATH") {
+            paths.extend(std::env::split_paths(&path));
+        }
+        std::env::join_paths(paths)
+            .map_err(|_| anyhow::anyhow!("{provider} probe PATH could not be constructed"))?
+    };
+    search_path
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("{provider} probe PATH is not UTF-8"))
 }
 
-fn kimi_command_path() -> Option<std::path::PathBuf> {
-    let mut candidates = Vec::new();
-    if let Some(home) = crate::paths::home_dir() {
-        candidates.push(home.join(".kimi-code/bin/kimi"));
-        candidates.push(home.join(".local/bin/kimi"));
-    }
-    candidates.extend([
-        std::path::PathBuf::from("/opt/homebrew/bin/kimi"),
-        std::path::PathBuf::from("/usr/local/bin/kimi"),
-    ]);
-    candidates.into_iter().find(|path| path.is_file())
+fn required_input_result(result: pty::PtyInputEnqueueResult) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        result.is_accepted(),
+        "Kimi usage PTY input was not accepted"
+    );
+    Ok(())
+}
+
+fn write_required_input(session: &mut dyn pty::PtySession, bytes: &[u8]) -> anyhow::Result<()> {
+    required_input_result(session.write_input(bytes)?)
 }
 
 /// 패널이 다 그려졌는지. 무료 계정 안내와 로드 실패도 «더 기다릴 필요 없음»이다.
@@ -272,6 +315,96 @@ fn strip_terminal_control_sequences(output: &str) -> String {
 mod tests {
     use super::*;
 
+    fn backpressured_input() -> pty::PtyInputEnqueueResult {
+        pty::PtyInputEnqueueResult::Backpressured {
+            pressure: pty::PtyInputPressure {
+                attempted_bytes: 8,
+                queued_bytes: 8,
+                queued_messages: 1,
+                max_bytes: 8,
+                max_messages: 1,
+                reason: pty::PtyInputRejectReason::QueueFull,
+            },
+        }
+    }
+
+    #[test]
+    fn probe_command는_런처가_감지한_kimi와_path를_쓴다() {
+        let command = kimi_probe_command(
+            std::path::Path::new("/custom/bin/kimi"),
+            std::path::PathBuf::from("/tmp/deppy-kimi-probe"),
+            Some(std::ffi::OsStr::new("/custom/bin:/usr/bin:/bin")),
+        )
+        .expect("Kimi probe command");
+
+        assert_eq!(command.program, "/custom/bin/kimi");
+        assert!(
+            command
+                .env
+                .iter()
+                .any(|(key, value)| { key == "PATH" && value.starts_with("/custom/bin:") })
+        );
+    }
+
+    #[test]
+    fn windows_cmd_shim은_cmd_exe로_감싸서_실행한다() {
+        let (program, args) = crate::provider_usage_command::probe_program_and_args(
+            std::path::Path::new(
+                r"C:\Program Files (x86)\A&B\%SDK%\Preview=One\Caret^Name\kimi.bat",
+            ),
+            true,
+            "Kimi",
+        )
+        .expect("Windows Kimi probe executable");
+
+        assert_eq!(
+            std::path::PathBuf::from(&program),
+            crate::provider_usage_command::trusted_windows_command_processor_for_test()
+                .expect("trusted Windows command processor"),
+            "Win32가 알려 준 시스템 디렉터리의 cmd.exe여야 한다"
+        );
+        assert_eq!(
+            args,
+            vec![
+                "/d".to_owned(),
+                "/e:on".to_owned(),
+                "/v:off".to_owned(),
+                "/s".to_owned(),
+                "/c".to_owned(),
+                r"C:\Program^ Files^ ^(x86^)\A^&B\%%cd:~,%%SDK%%cd:~,%%\Preview^=One\Caret^^Name\kimi.bat".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn 필수_pty_입력은_backpressure를_성공으로_취급하지_않는다() {
+        assert!(required_input_result(pty::PtyInputEnqueueResult::Accepted).is_ok());
+        assert!(required_input_result(backpressured_input()).is_err());
+    }
+
+    #[test]
+    fn worker_spawn_실패도_마지막_시도_시각을_기록한다() {
+        let attempted = Instant::now();
+        assert_eq!(last_request_after_spawn(attempted), attempted);
+    }
+
+    #[test]
+    fn 완료된_probe의_측정시각을_ui수신시각으로_바꾸지_않는다() {
+        let measured_at = Instant::now() - Duration::from_secs(60);
+        let usage = (Some(10), Some(20));
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender.send(Some((measured_at, usage))).unwrap();
+        let mut state = UsageState {
+            pending: Some(receiver),
+            ..UsageState::default()
+        };
+
+        receive_pending_probe(&mut state);
+
+        assert_eq!(state.usage, Some((measured_at, usage)));
+        assert!(state.pending.is_none());
+    }
+
     /// 실제 CLI를 앱과 **같은 PTY 백엔드**로 띄워 값을 읽어본다. expect로 재현했을 때는
     /// 입력이 전혀 안 닿았는데, 그건 그쪽 PTY 사정이었을 수 있다 — 앱이 쓰는 경로로
     /// 확인해야 의미가 있다. Kimi가 없는 기기에서는 조용히 건너뛴다.
@@ -281,15 +414,46 @@ mod tests {
     #[test]
     #[ignore = "실제 kimi CLI를 띄운다(최대 25초)"]
     fn kimi_실측_프로브가_사용량을_읽는다() {
-        if !kimi_installed() {
+        let excluded = crate::agent_shim::shim_path();
+        let snapshot = crate::agent_launcher::detect_installed_agents(excluded.as_deref());
+        let Some(agent) = snapshot.find(crate::agent_launcher::AgentKind::Kimi) else {
             return;
-        }
-        let usage = fetch_kimi_usage().expect("프로브가 오류 없이 끝나야 한다");
+        };
+        let usage = fetch_kimi_usage(
+            agent.executable(),
+            agent.launch_path().map(std::ffi::OsStr::new),
+        )
+        .expect("프로브가 오류 없이 끝나야 한다");
         let usage = usage.expect("Plan usage를 읽지 못했다 — 화면 형식이 바뀌었을 수 있다");
         assert!(
             usage.0.is_some() || usage.1.is_some(),
             "창을 하나도 못 읽었다: {usage:?}"
         );
+    }
+
+    #[test]
+    #[ignore = "런처 감지와 실제 Kimi CLI를 최대 25초 실행한다"]
+    fn kimi_실측_프로브는_런처_감지_경로로_끝난다() {
+        let excluded = crate::agent_shim::shim_path();
+        let snapshot = crate::agent_launcher::detect_installed_agents(excluded.as_deref());
+        let agent = snapshot
+            .find(crate::agent_launcher::AgentKind::Kimi)
+            .expect("현재 계정에서 설치된 Kimi를 감지해야 한다");
+        let usage = fetch_kimi_usage(
+            agent.executable(),
+            agent.launch_path().map(std::ffi::OsStr::new),
+        )
+        .expect("launcher-detected bounded Kimi probe");
+        if std::env::var_os("DEPPY_KIMI_EXPECT_USAGE").as_deref() == Some(std::ffi::OsStr::new("1"))
+        {
+            assert!(usage.is_some(), "현재 계정에서 Kimi usage 숫자를 기대했다");
+        }
+        if let Some((short, weekly)) = usage {
+            assert!(
+                short.is_some() || weekly.is_some(),
+                "typed usage는 적어도 한 창을 포함해야 한다"
+            );
+        }
     }
 
     /// 2026-08-10 실측 화면 그대로. 라벨·퍼센트 표기가 바뀌면 여기서 깨져야 한다 —

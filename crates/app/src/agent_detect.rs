@@ -104,6 +104,78 @@ pub struct RunningAgent {
     pub effort: Option<String>,
 }
 
+/// 최후의 그물(완료/실패 알림 겹 ④) — ps 스캔이 "에이전트 있음"에서 "없음"으로 본
+/// 세션 중, **PTY 세션 자체는 아직 살아 있고**(=agent_launcher의 폴백 셸이 이어받았을
+/// 가능성) **아직 아무 결과 상태도 확정되지 않은** 세션만 고른다.
+///
+/// exit sentinel(①)이나 화면 regex가 이미 Done/Error를 확정했으면 여기서 다시 알리지
+/// 않는다 — 이건 그 둘이 **모두** 실패했을 때만 의미 있는 중립 신호다. 세션 자체가 이미
+/// 죽었으면(=`still_alive`에 없음) `SessionExited`/`on_pty_exit` 경로가 이미 담당하므로
+/// 제외한다. 어느 쪽이든 여기서 아는 건 "에이전트 프로세스가 사라졌다"뿐 — 완료인지
+/// 실패인지는 모른다. 그래서 호출측은 이 결과를 Done/Error가 아니라 **중립** 알림으로만
+/// 써야 한다(`NotificationsUi::on_agent_vanished`).
+pub fn agent_vanished_sessions(
+    previously_present: &HashMap<SessionId, RunningAgent>,
+    now_present: &HashMap<SessionId, RunningAgent>,
+    still_alive: &HashSet<SessionId>,
+    resolved: impl Fn(SessionId) -> bool,
+) -> Vec<SessionId> {
+    previously_present
+        .keys()
+        .filter(|session| !now_present.contains_key(session))
+        .filter(|session| still_alive.contains(session))
+        .filter(|session| !resolved(**session))
+        .copied()
+        .collect()
+}
+
+#[cfg(test)]
+mod agent_vanished_tests {
+    use super::*;
+
+    fn running() -> RunningAgent {
+        RunningAgent {
+            kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+        }
+    }
+
+    #[test]
+    fn 살아있고_미확정인_세션만_최후의_그물에_걸린다() {
+        let previous = HashMap::from([(SessionId(1), running()), (SessionId(2), running())]);
+        let now = HashMap::new(); // 둘 다 감지에서 사라짐
+        let alive = HashSet::from([SessionId(1), SessionId(2)]);
+        // 1은 아직 결과 미확정(신경 써야 함), 2는 이미 exit sentinel이 확정(신경 안 씀)
+        let vanished = agent_vanished_sessions(&previous, &now, &alive, |s| s == SessionId(2));
+        assert_eq!(vanished, vec![SessionId(1)]);
+    }
+
+    #[test]
+    fn 여전히_감지되면_그물에_안_걸린다() {
+        let previous = HashMap::from([(SessionId(1), running())]);
+        let now = HashMap::from([(SessionId(1), running())]); // 계속 있음
+        let alive = HashSet::from([SessionId(1)]);
+        assert!(agent_vanished_sessions(&previous, &now, &alive, |_| false).is_empty());
+    }
+
+    #[test]
+    fn 세션_자체가_죽었으면_session_exited가_이미_담당한다() {
+        let previous = HashMap::from([(SessionId(1), running())]);
+        let now = HashMap::new();
+        let alive = HashSet::new(); // pane 자체가 이미 닫힘/종료
+        assert!(agent_vanished_sessions(&previous, &now, &alive, |_| false).is_empty());
+    }
+
+    #[test]
+    fn 처음부터_없던_세션은_대상이_아니다() {
+        let previous = HashMap::new();
+        let now = HashMap::new();
+        let alive = HashSet::from([SessionId(1)]);
+        assert!(agent_vanished_sessions(&previous, &now, &alive, |_| false).is_empty());
+    }
+}
+
 /// 이미 확정된 세션→바인딩을 캐시해 재발견(lsof/codex 재귀 스캔)을 스킵한다(codex #3).
 /// 각 세션(셸 pid)에서 실행 중인 에이전트를 감지해 transcript로 바인딩한다 — ps를 한 번
 /// 에이전트 프로세스(owner_pid)가 여전히 ps 결과에 살아있으면 캐시를 재사용하고, 사라졌으면
@@ -170,9 +242,12 @@ fn owner_still_alive(entry: &CacheEntry) -> bool {
 
 /// 요청된 세션 중 캐시가 비결정적(휴리스틱)으로 바인딩한 항목이 하나라도 있는지.
 fn has_heuristic_entry(sessions: &[(SessionId, u32)], cache: &BindingCache) -> bool {
-    sessions
-        .iter()
-        .any(|(sid, _)| cache.entries.get(sid).is_some_and(|entry| !entry.deterministic))
+    sessions.iter().any(|(sid, _)| {
+        cache
+            .entries
+            .get(sid)
+            .is_some_and(|entry| !entry.deterministic)
+    })
 }
 
 /// 안전망 주기가 지나 전체 탐색을 강제해야 하는지. 배치에 휴리스틱 항목이 있으면 30초
@@ -184,7 +259,9 @@ fn safety_net_elapsed(cache: &BindingCache, has_heuristic: bool) -> bool {
     } else {
         FASTPATH_FULL_SCAN_INTERVAL
     };
-    cache.last_full_scan.is_none_or(|at| at.elapsed() >= interval)
+    cache
+        .last_full_scan
+        .is_none_or(|at| at.elapsed() >= interval)
 }
 
 /// 캐시에 남은 정보만으로 종류 tier 결과를 재구성한다(`process_rows` 불필요).
@@ -1154,6 +1231,65 @@ fn find_codex_transcript(cwd: &str) -> Option<(String, PathBuf)> {
     None
 }
 
+/// 저장된 이력 행(kind + 세션ID [+ cwd])에서 transcript 파일을 찾는다. 세션이 이미
+/// 끝났어도 파일은 남으므로 원문 보기가 이걸 쓴다(2026-08-15).
+///
+/// Codex는 `TranscriptFinder::find`가 이미 `~/.codex/sessions`를 역순(최신 먼저) 스캔해
+/// 세션ID로 직접 매칭한다(위 `TranscriptFinder` 문서 참고) — 그걸 그대로 우선 쓰고,
+/// 스캔 상한에 걸리는 등 못 찾을 때만 행의 cwd로 `find_codex_transcript`에 폴백한다.
+///
+/// **세 kind를 모두 덮어야 한다.** 하나라도 `None`으로 두면 그 에이전트로 돌린 이력은
+/// 원문 보기가 통째로 죽는데, 화면에는 「파일을 찾지 못했습니다」만 떠서 원인이
+/// 드러나지 않는다(2026-08-18: kimi가 그 상태였다).
+pub(crate) fn transcript_path_for(
+    kind: AgentKind,
+    session_id: &str,
+    cwd: Option<&str>,
+) -> Option<PathBuf> {
+    match kind {
+        AgentKind::Claude => find_claude_transcript(session_id),
+        AgentKind::Codex => TranscriptFinder::new()
+            .find(AgentKind::Codex, session_id)
+            .or_else(|| cwd.and_then(|cwd| find_codex_transcript(cwd).map(|(_, path)| path))),
+        AgentKind::Kimi => find_kimi_transcript(session_id),
+    }
+}
+
+/// 세션ID로 kimi transcript를 찾는다 — `~/.kimi-code/sessions/<작업폴더>/<sid>/agents/main/
+/// wire.jsonl`. 작업폴더 이름(`wd_<슬러그>_<해시>`)은 세션ID만으로는 알 수 없어 한 겹
+/// 훑는다. 상한은 다른 스캐너와 같은 `MAX_DIRECTORY_ENTRIES`다.
+///
+/// 이 해석기가 없던 동안 kimi 이력은 원문 보기가 **전부** 「파일을 찾지 못했습니다」로
+/// 떨어졌다(2026-08-18 사용자 보고, 실측: claude 10/10 정상 · kimi 3/3 실패). 파서
+/// (`agent_transcript::parse_kimi`)는 이미 있었고 경로 해석만 빠져 있었다.
+fn find_kimi_transcript(session_id: &str) -> Option<PathBuf> {
+    if !valid_session_id(session_id) {
+        return None;
+    }
+    let sessions = crate::paths::home_dir()?.join(".kimi-code/sessions");
+    let mut entries = std::fs::read_dir(sessions).ok()?;
+    for _ in 0..MAX_DIRECTORY_ENTRIES {
+        let Some(workdir) = entries.next() else {
+            break;
+        };
+        let Ok(workdir) = workdir else { return None };
+        if !workdir.file_type().ok().is_some_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let candidate = workdir
+            .path()
+            .join(session_id)
+            .join("agents/main/wire.jsonl");
+        if std::fs::symlink_metadata(&candidate)
+            .ok()
+            .is_some_and(|meta| meta.file_type().is_file())
+        {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>) -> bool {
     let mut budget = ScanBudget::default();
     if collect_jsonl_bounded(dir, out, 0, &mut budget) {
@@ -2116,7 +2252,9 @@ mod tests {
                 ),
                 (heuristic_sid, heuristic_entry),
             ]),
-            last_full_scan: Some(Instant::now() - HEURISTIC_RESCAN_INTERVAL - Duration::from_secs(1)),
+            last_full_scan: Some(
+                Instant::now() - HEURISTIC_RESCAN_INTERVAL - Duration::from_secs(1),
+            ),
         };
         let mut process_cache = sentinel_process_cache();
         let sessions = [(deterministic_sid, self_pid), (heuristic_sid, self_pid)];
@@ -2145,7 +2283,9 @@ mod tests {
         let entry = fresh_cache_entry(test_binding("det"), self_pid, start);
         let mut cache = BindingCache {
             entries: HashMap::from([(sid, entry)]),
-            last_full_scan: Some(Instant::now() - HEURISTIC_RESCAN_INTERVAL - Duration::from_secs(1)),
+            last_full_scan: Some(
+                Instant::now() - HEURISTIC_RESCAN_INTERVAL - Duration::from_secs(1),
+            ),
         };
         let mut process_cache = sentinel_process_cache();
         let sessions = [(sid, self_pid)];
@@ -2196,8 +2336,7 @@ mod tests {
     /// 실제로 돌 때 `last_full_scan` 갱신까지 바인딩 tier와 동일 정책을 따라야, 두 tier가
     /// 번갈아 전체 탐색하며 재탐색 목표를 어기지 않는다.
     #[test]
-    fn detect_kinds도_휴리스틱_재탐색_주기_안이면_fast_path를_타고_전체_탐색시_시각을_갱신한다()
-     {
+    fn detect_kinds도_휴리스틱_재탐색_주기_안이면_fast_path를_타고_전체_탐색시_시각을_갱신한다() {
         let _guard = COMMAND_TEST_LOCK.lock().unwrap();
         let self_pid = std::process::id();
         let Some(start) = crate::proc_info::pid_start_time(self_pid) else {
@@ -2208,7 +2347,9 @@ mod tests {
         entry.deterministic = false;
         let mut cache = BindingCache {
             entries: HashMap::from([(sid, entry)]),
-            last_full_scan: Some(Instant::now() - HEURISTIC_RESCAN_INTERVAL - Duration::from_secs(1)),
+            last_full_scan: Some(
+                Instant::now() - HEURISTIC_RESCAN_INTERVAL - Duration::from_secs(1),
+            ),
         };
         let mut process_cache = sentinel_process_cache();
         let sessions = [(sid, self_pid)];
@@ -2503,6 +2644,53 @@ mod tests {
         assert!(!request_debug.contains("valid"));
         assert!(!result_debug.contains(valid_cwd.to_str().unwrap()));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn 세션id로_transcript_경로를_찾는_함수가_공개돼_있다() {
+        // 세션이 죽어도 파일은 남는다 — 이력에서 원문을 열려면 이 해석기가 필요하다.
+        let missing = transcript_path_for(
+            AgentKind::Claude,
+            "00000000-0000-0000-0000-000000000000",
+            None,
+        );
+        assert!(missing.is_none(), "없는 세션은 None이다");
+        assert!(
+            transcript_path_for(AgentKind::Claude, "../탈출", None).is_none(),
+            "잘못된 id 거부"
+        );
+    }
+
+    /// **모든 kind가 실제 해석기를 가져야 한다.** kimi가 `None`으로 남아 있던 동안
+    /// kimi 이력은 원문 보기가 전부 「파일을 찾지 못했습니다」였고, 화면만 봐서는
+    /// 원인을 알 수 없었다(2026-08-18 사용자 보고). 새 에이전트를 더할 때 같은 구멍이
+    /// 생기지 않게 소스로 고정한다.
+    #[test]
+    fn transcript_경로_해석은_모든_kind를_덮는다() {
+        let source = include_str!("agent_detect.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let body = production
+            .split_once("pub(crate) fn transcript_path_for(")
+            .expect("해석기가 있어야 한다")
+            .1;
+        let body = body.split_once("\n}\n").expect("함수 끝").0;
+        for kind in [AgentKind::Claude, AgentKind::Codex, AgentKind::Kimi] {
+            let arm = format!("AgentKind::{kind:?} =>");
+            assert!(body.contains(&arm), "{kind:?} 분기가 없다");
+        }
+        assert!(
+            !body.contains("=> None,"),
+            "어떤 kind도 해석기 없이 None으로 두지 않는다 — 그 에이전트 이력이 통째로 죽는다"
+        );
+    }
+
+    /// kimi transcript는 `~/.kimi-code/sessions/<작업폴더>/<sid>/agents/main/wire.jsonl`
+    /// 이다. 없는 세션·잘못된 id는 안전하게 None으로 떨어진다.
+    #[test]
+    fn kimi_경로_해석은_없는_세션을_안전하게_거른다() {
+        assert!(find_kimi_transcript("session_00000000-0000-0000-0000-000000000000").is_none());
+        assert!(find_kimi_transcript("../탈출").is_none(), "경로 탈출 거부");
+        assert!(find_kimi_transcript("").is_none(), "빈 id 거부");
     }
 
     #[test]

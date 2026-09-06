@@ -123,6 +123,10 @@ pub struct Config {
     pub performance: PerformanceConfig,
     pub remote: RemoteConfig,
     pub web: WebConfig,
+    /// Relay(외부 중계) 설정. `web`과 **완전히 독립**이다 — 어느 한쪽을 켜거나 끄는 것이
+    /// 다른 쪽 상태를 바꾸지 않는다. 「둘 다」는 두 스위치에서 파생되는 표시일 뿐, 저장되는
+    /// 전송 모드 열거형 같은 것은 존재하지 않는다.
+    pub relay: RelayConfig,
     pub i18n: I18nConfig,
     /// 기본 단축키에서 달라진 항목만 저장한다. 키 이름은 `shortcuts` 모듈이 해석하며,
     /// 알 수 없는 항목은 무시해 이전/이후 버전의 config와 호환한다.
@@ -144,6 +148,11 @@ pub struct AgentsConfig {
     /// (내장 변환 프록시 경유, 기본), "responses" = /v1/responses 직결.
     /// 미지값은 로드 시 None으로 정규화.
     pub codex_llm_wire: Option<String>,
+    /// 사용자가 런처에서 끈 에이전트 id("claude"|"codex"|"kimi" 등, `agent_launcher::AgentKind::id`
+    /// 기준). 탐지 결과가 아니라 취향이다 — 설치돼 있어도 여기 있으면 목록·사용량에 권하지
+    /// 않는다. 미지 id는 로드 시 버린다(이전/이후 버전 config와 호환, `codex_llm_provider`와
+    /// 같은 로드 정규화 관례).
+    pub disabled: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -434,6 +443,18 @@ pub struct WebConfig {
     pub allow_non_loopback: bool,
 }
 
+/// Relay 설정. 기본은 **꺼짐**이며, `config.web.enabled`와 무관하게 독립적으로 켠다.
+///
+/// 엔드포인트는 여기 두지 않는다 — 프로덕션 주소는 모바일 셸의 CSP와 공유하는 릴리스
+/// 상수(`web_remote::relay_client::PRODUCTION_RELAY_ENDPOINT`)이고, 사용자가 바꿀 수 있게
+/// 만들면 그 자체가 중간자 경로가 된다.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RelayConfig {
+    /// 앱 시작 시 Relay 연결 시도. 기본 false.
+    pub enabled: bool,
+}
+
 impl Default for WebConfig {
     fn default() -> Self {
         Self {
@@ -537,6 +558,9 @@ impl Config {
         {
             self.agents.codex_llm_wire = None;
         }
+        // 거부 목록도 같은 관례: TOML을 손으로 고쳐 넣은 미지 id·중복을 로드 경계에서 버린다.
+        self.agents.disabled =
+            crate::agent_launcher::normalize_disabled_agents(&self.agents.disabled);
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
@@ -552,6 +576,40 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    /// Relay와 Tailscale(web)은 완전히 독립이다. 「둘 다」는 두 스위치에서 파생될 뿐,
+    /// 저장되는 전송 모드 열거형은 존재하지 않는다.
+    #[test]
+    fn relay_and_web_are_independent_switches_with_no_transport_enum() {
+        let default = super::Config::default();
+        assert!(!default.relay.enabled, "Relay 기본은 꺼짐이다");
+        assert!(!default.web.enabled);
+
+        // 한쪽만 켜기, 양쪽 켜기 — 어느 조합도 다른 쪽을 건드리지 않는다.
+        let mut config = super::Config::default();
+        config.relay.enabled = true;
+        assert!(!config.web.enabled, "Relay를 켜도 web은 그대로다");
+        config.web.enabled = true;
+        assert!(config.relay.enabled, "web을 켜도 Relay는 그대로다");
+        config.web.enabled = false;
+        assert!(config.relay.enabled, "web을 꺼도 Relay는 그대로다");
+
+        // 저장 형식에 전송 모드 열거형이 끼어들지 않는다.
+        let serialized = toml::to_string(&config).unwrap();
+        for forbidden in ["transport =", "transport=", "\"Both\"", "mode ="] {
+            assert!(!serialized.contains(forbidden), "{forbidden}");
+        }
+        assert!(serialized.contains("[relay]"));
+    }
+
+    /// Relay 섹션이 없는 예전 config도 그대로 열린다 — 기본은 꺼짐이다.
+    #[test]
+    fn a_config_without_a_relay_section_loads_with_relay_disabled() {
+        let legacy = "[web]\nenabled = true\nport = 8737\n";
+        let config: super::Config = toml::from_str(legacy).unwrap();
+        assert!(config.web.enabled);
+        assert!(!config.relay.enabled);
+    }
+
     use super::*;
 
     fn temp_path(tag: &str) -> PathBuf {
@@ -973,6 +1031,32 @@ mod tests {
             Some("http://localhost:11434/v1")
         );
         assert_eq!(c.agents.codex_llm_wire.as_deref(), Some("chat"));
+    }
+
+    #[test]
+    fn agents_거부_목록은_비어있는_기본값이고_roundtrip된다() {
+        assert!(Config::default().agents.disabled.is_empty());
+        let mut c = Config::default();
+        c.agents.disabled = vec!["claude".to_owned(), "kimi".to_owned()];
+        let text = toml::to_string_pretty(&c).unwrap();
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert_eq!(parsed, c);
+    }
+
+    #[test]
+    fn agents_거부_목록의_미지_id와_중복은_로드_정규화에서_버려진다() {
+        let mut c = Config::default();
+        c.agents.disabled = vec![
+            "kimi".to_owned(),
+            "kimi".to_owned(),
+            "없는에이전트".to_owned(),
+            "claude".to_owned(),
+        ];
+        c.normalize();
+        assert_eq!(
+            c.agents.disabled,
+            vec!["claude".to_owned(), "kimi".to_owned()]
+        );
     }
 
     #[test]

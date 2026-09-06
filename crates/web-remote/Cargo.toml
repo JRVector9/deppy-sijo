@@ -21,16 +21,34 @@ storage = { path = "../storage" }
 # WS JSON 프로토콜(브라우저 친화) — postcard 바이너리는 데스크톱 원격 전용으로 유지.
 serde = { workspace = true }
 serde_json = { workspace = true }
-# sync WebSocket. default-features=false(TLS off)에 handshake만 켜 derive_accept_key 사용.
-tungstenite = { workspace = true, features = ["handshake"] }
+# sync WebSocket. loopback 경로는 handshake만 쓴다(TLS는 tailscale serve가 종단).
+# Relay 클라이언트(Task 4)는 바깥으로 wss만 연다 — 그래서 rustls를 **컴파일된 WebPKI 루트로만**
+# 켠다. `rustls-tls-native-roots`나 `native-tls`는 절대 켜지 않는다: 시스템 신뢰 저장소를 쓰면
+# 기기에 심어진 임의 CA가 Relay 종단을 가로챌 수 있고, 그건 E2EE 밖의 메타데이터가 새는 길이다.
+tungstenite = { workspace = true, features = [
+    "handshake",
+    "rustls-tls-webpki-roots",
+] }
 # P4 웹푸시 암호 스택 — RustCrypto **sync** 계열만(tokio/async 크레이트 금지). VAPID JWT(ES256)와
 # RFC 8291 ECDH(P-256)에 p256, HKDF-SHA256에 hkdf, aes128gcm 레코드에 aes-gcm, base64url 인코딩에
 # base64. sha2/ureq는 워크스페이스 lock 기존(HKDF의 SHA-256, 발송 POST). 엔트로피는 getrandom(sync).
 # 기존 web-push 크레이트는 hyper(async) 의존이라 배제 — 여기 수제 구현(RFC 8291/8292 벡터로 검증).
 p256 = { version = "0.14", features = ["ecdh"] }
 hkdf = "0.13"
-aes-gcm = "0.11"
+aes-gcm = { version = "0.11", features = ["zeroize"] }
+# Force zeroizing Drop implementations for AES/GHASH schedules and HKDF's HMAC/SHA state.
+# These direct dependencies intentionally unify features used behind aes-gcm/hkdf.
+aes = { version = "0.9", features = ["zeroize"] }
+ghash = { version = "0.6", features = ["zeroize"] }
+hmac = { version = "0.13", features = ["zeroize"] }
+zeroize = "1"
 base64 = "0.22"
 getrandom = "0.4"
-sha2 = { workspace = true }
+sha2 = { workspace = true, features = ["zeroize"] }
 ureq = { workspace = true }
+# Relay pairing rendezvous secrets require an explicit constant-time equality primitive.
+subtle = "2"
+# Relay 데이터 평면 와이어 계약(의존성 0). Mac 클라이언트가 서버와 **같은 상한**을 쓰는지
+# 컴파일 타임에 묶어 두기 위해 참조한다 — 두 값이 갈라지면 한쪽이 만든 프레임을 다른 쪽이
+# 거부하는데, 그건 실제 기기에서만 드러난다.
+relay-protocol = { path = "../relay-protocol" }

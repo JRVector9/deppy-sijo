@@ -22,10 +22,13 @@ pub use db::{
     PENDING_APPROVAL_SESSION_CLEANUP_LIMIT_MAX, PENDING_APPROVAL_SESSION_KEY_BYTES_MAX,
     PHYSICAL_SECRET_SLOT_RECONCILIATION_BYTES_MAX, PHYSICAL_SECRET_SLOT_RECONCILIATION_LIMIT_MAX,
     PendingApprovalRow, PermissionRuleRow, PersistedActivityPane, PhysicalSecretSlotLedgerRow,
-    PhysicalSecretSlotState, SettingsWorkspaceProjectionRow, StatuslineRow,
-    StructuredThreadMutation, StructuredThreadRow, WORKSPACE_NOTE_MAX_BYTES,
-    WebPushSubscriptionRow, WorkspaceFindOrCreateResult, WorkspaceFolderAnchor,
-    WorkspaceMovedPathUpdate, WorkspaceRow, prepare_agent_state_job_for_retention,
+    PhysicalSecretSlotState, RELAY_DEVICE_ROWS_MAX, RELAY_DISPLAY_NAME_BYTES_MAX,
+    RELAY_PAIRING_WINDOW_SECS_MAX, RELAY_PENDING_DEVICE_ROWS_MAX, RelayDeviceApproval,
+    RelayDeviceRevocation, RelayDeviceRow, RelayPendingDeviceRow, RelayPendingInsert,
+    SettingsWorkspaceProjectionRow, StatuslineRow, StructuredThreadMutation, StructuredThreadRow,
+    WORKSPACE_NOTE_MAX_BYTES, WebPushSubscriptionRow, WorkspaceFindOrCreateResult,
+    WorkspaceFolderAnchor, WorkspaceMovedPathUpdate, WorkspaceRow,
+    prepare_agent_state_job_for_retention,
 };
 pub use mcp_store::{
     MCP_PERMISSION_POINT_BYTES_MAX, MCP_SERVER_INVENTORY_BYTES_MAX, MCP_SERVER_INVENTORY_LIMIT_MAX,

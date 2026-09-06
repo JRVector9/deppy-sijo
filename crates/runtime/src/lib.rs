@@ -35,7 +35,10 @@ pub(crate) fn signal_memory_released() {
     }
 }
 
-pub use client::{RuntimeClient, RuntimeCommandSink, RuntimeEventReceiver, RuntimeEventStream};
+pub use client::{
+    RuntimeClient, RuntimeCommandSendError, RuntimeCommandSink, RuntimeEventReceiver,
+    RuntimeEventStream,
+};
 pub use command::{
     MuxPaneId, MuxTabId, RuntimeCommand, RuntimeCommandPreparationErrorCode,
     RuntimeCommandRetention, SessionId, SplitDirection, WorkspaceRuntimeState,
@@ -65,7 +68,8 @@ pub use terminal::{
 };
 
 pub use session::{
-    SessionStatus, SessionStatusView, StatusConfidence, StatusSource, UserStatusOverride,
+    AGENT_EXIT_SENTINEL_PREFIX, SessionStatus, SessionStatusView, StatusConfidence, StatusSource,
+    UserStatusOverride, agent_exit_sentinel_path,
 };
 
 #[cfg(test)]

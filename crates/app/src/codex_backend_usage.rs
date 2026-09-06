@@ -1,9 +1,8 @@
-//! ChatGPT 백엔드 사용량 보충 — Codex app-server가 5시간 창을 보고하지 않을 때
-//! Codex CLI가 쓰는 백엔드 REST 엔드포인트를 직접 읽어 빠진 창만 메운다.
+//! ChatGPT 백엔드 사용량 보충 — Codex app-server가 아직 응답하지 않았거나 일부 창을
+//! 보고하지 않을 때 Codex CLI가 쓰는 백엔드 REST 엔드포인트를 읽어 빈 창만 메운다.
 //! stablyai/orca의 `withBackendSessionWindow`와 같은 전략·같은 요청 형태다.
 //!
-//! app-server 응답에 5시간 창이 이미 있으면 이 모듈은 호출조차 되지 않는다
-//! (app.rs의 merge 지점이 구멍이 있을 때만 `current`를 부른다). 토큰은
+//! app-server 응답에 두 창이 모두 있으면 이 모듈은 호출조차 되지 않는다. 토큰은
 //! `~/.codex/auth.json`에서 읽어 요청 헤더에만 쓰고 어디에도 남기지 않는다.
 
 use std::io::Read as _;
@@ -61,20 +60,25 @@ pub fn current(ctx: &egui::Context) -> Option<BackendUsage> {
     if state.pending.is_none() && refresh_due {
         let (sender, receiver) = mpsc::sync_channel(1);
         let repaint = ctx.clone();
-        if std::thread::Builder::new()
+        let attempted = Instant::now();
+        let spawned = std::thread::Builder::new()
             .name("codex-backend-usage".to_owned())
             .spawn(move || {
                 let usage = fetch_backend_usage();
                 let _ = sender.send(usage);
                 repaint.request_repaint();
             })
-            .is_ok()
-        {
+            .is_ok();
+        state.last_request = Some(last_request_after_spawn(attempted));
+        if spawned {
             state.pending = Some(receiver);
-            state.last_request = Some(Instant::now());
         }
     }
     state.fetched.and_then(|(_, usage)| usage)
+}
+
+fn last_request_after_spawn(attempted: Instant) -> Instant {
+    attempted
 }
 
 fn fetch_backend_usage() -> Option<BackendUsage> {
@@ -149,6 +153,12 @@ fn parse_backend_usage(json: &serde_json::Value) -> Option<BackendUsage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_spawn_실패도_마지막_시도_시각을_기록한다() {
+        let attempted = Instant::now();
+        assert_eq!(last_request_after_spawn(attempted), attempted);
+    }
 
     /// 실제 백엔드 응답 모양(2026-08 pro 계정) — 주간 창 하나뿐이다. 이 응답에서
     /// 5시간 칸이 주간 값으로 채워지면 app-server 쪽과 같은 회귀다.

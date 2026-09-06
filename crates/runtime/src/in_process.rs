@@ -13,13 +13,13 @@ use pty::CommandSpec;
 #[cfg(test)]
 use secret::SecretStore;
 use secret::{RedactionLease, RedactionService, StreamRedactor};
-use session::{Session, StatusDetector, StatusPatterns};
+use session::{Session, StatusDetector, StatusPatterns, agent_exit_sentinel_path};
 use storage::SessionLogWriter;
 use terminal::{TERMINAL_GLOBAL_CACHE_BUDGET_BYTES, TerminalCacheClass, TerminalCacheEvent};
 
 use crate::client::{
-    LOCAL_EVENT_QUEUE_CAP, RuntimeClient, RuntimeCommandSink, RuntimeEventReceiver,
-    RuntimeEventStream,
+    LOCAL_EVENT_QUEUE_CAP, RuntimeClient, RuntimeCommandSendError, RuntimeCommandSink,
+    RuntimeEventReceiver, RuntimeEventStream,
 };
 use crate::command::{
     RUNTIME_COMMAND_QUEUE_BYTES_MAX, RUNTIME_SESSION_CAP, RuntimeCommand, SessionId,
@@ -276,6 +276,7 @@ impl InProcessRuntimeClient {
                     seed_redaction_lease: None,
                     logs: std::collections::HashMap::new(),
                     detectors: std::collections::HashMap::new(),
+                    agent_exit_watch: std::collections::HashMap::new(),
                     status_overrides: std::collections::HashMap::new(),
                     logs_root,
                     run_logs_root,
@@ -381,7 +382,7 @@ impl RuntimeCommandSink for InProcessRuntimeClient {
     fn send_command(&self, command: RuntimeCommand) -> anyhow::Result<()> {
         let queued = prepare_queued_command(command, &self.command_budget)?;
         let Some(tx) = self.command_tx.as_ref() else {
-            anyhow::bail!("runtime worker가 종료됨");
+            return Err(RuntimeCommandSendError::Disconnected.into());
         };
         match tx.try_send(queued) {
             Ok(()) => {
@@ -390,10 +391,8 @@ impl RuntimeCommandSink for InProcessRuntimeClient {
                 }
                 Ok(())
             }
-            Err(TrySendError::Full(_)) => {
-                anyhow::bail!("runtime 명령 큐 가득참 — local runtime backpressure")
-            }
-            Err(TrySendError::Disconnected(_)) => anyhow::bail!("runtime worker가 종료됨"),
+            Err(TrySendError::Full(_)) => Err(RuntimeCommandSendError::Backpressure.into()),
+            Err(TrySendError::Disconnected(_)) => Err(RuntimeCommandSendError::Disconnected.into()),
         }
     }
 }
@@ -502,11 +501,9 @@ impl RuntimeHost for InProcessRuntimeClient {
                     }
                     Ok(())
                 }
-                Err(TrySendError::Full(_)) => {
-                    anyhow::bail!("runtime 명령 큐 가득참 — local runtime backpressure")
-                }
+                Err(TrySendError::Full(_)) => Err(RuntimeCommandSendError::Backpressure.into()),
                 Err(TrySendError::Disconnected(_)) => {
-                    anyhow::bail!("runtime worker가 종료됨")
+                    Err(RuntimeCommandSendError::Disconnected.into())
                 }
             }
         }))
@@ -599,7 +596,7 @@ impl RuntimeCommandQueueBudget {
             },
         );
         if reserved.is_err() {
-            anyhow::bail!("runtime_command_queue_bytes_exceeded");
+            return Err(RuntimeCommandSendError::Backpressure.into());
         }
         Ok(RuntimeCommandQueueReservation {
             budget: Arc::clone(self),
@@ -688,6 +685,11 @@ struct Worker {
     logs: std::collections::HashMap<SessionId, SessionLog>,
     /// 세션별 status detector (PR-12) — regex 있는 agent만
     detectors: std::collections::HashMap<SessionId, StatusDetector>,
+    /// 에이전트 exit sentinel 감시 목록 — `agent_launcher::wrap_agent_then_shell`이 남기는
+    /// 파일 경로(래퍼 PID로 결정). 값이 나타나면 detector에 진짜 종료 코드를 latch하고
+    /// 항목을 지운다(1회성). 폴백 셸이 아니라 에이전트 자신이 끝난 순간을 잡는다 —
+    /// SessionExited(폴백 셸이 exit 칠 때)보다 훨씬 먼저 온다.
+    agent_exit_watch: std::collections::HashMap<SessionId, PathBuf>,
     /// User status overrides. This affects `SessionStatusViewChanged` only;
     /// legacy `SessionStatusChanged` remains raw detector output.
     status_overrides: std::collections::HashMap<SessionId, session::SessionStatus>,
@@ -1629,6 +1631,7 @@ impl Worker {
                         );
                         // regex가 없어도 idle heuristic(3단)은 동작해야 한다 — 상시 설치
                         self.detectors.insert(id, StatusDetector::new(patterns));
+                        self.register_agent_exit_watch(id);
                         self.attach_in_new_tab(id, AGENT_TITLE_ID);
                         if let Some(pipe) = &mut self.persist {
                             // 스키마 CHECK: agent kind는 agent_id 필수 — config id가
@@ -2764,6 +2767,7 @@ impl Worker {
                         done_regex.as_deref(),
                     )),
                 );
+                self.register_agent_exit_watch(id);
 
                 // 여기서부터는 성공이 확정됐을 때만 실행된다 — 이전 archived 상태 정리.
                 self.remove_session(session);
@@ -2774,6 +2778,9 @@ impl Worker {
                 self.remote_viewing.remove(&session);
                 self.status_overrides.remove(&session);
                 self.detectors.remove(&session);
+                if let Some(path) = self.agent_exit_watch.remove(&session) {
+                    let _ = std::fs::remove_file(&path);
+                }
 
                 // 새 탭이 아니라 그 pane에 — attach_in_new_tab을 쓰면 안 된다 (새 탭 생성).
                 if let Some(pane) = self.mux.panes.get_mut(&pane_id) {
@@ -2898,9 +2905,14 @@ impl Worker {
                     .get_mut(&tab_id)
                     .is_some_and(|tab| tab.split_pane(&target, direction, pane_id.clone()));
                 if !split_ok {
-                    // 방어: split 실패 시 고아 pane/세션을 남기지 않는다
+                    // 방어: split 실패 시 고아 pane/세션을 남기지 않는다.
+                    // `detectors`도 반드시 함께 지운다 — 다른 정리 지점(close_pane,
+                    // kill_session_owned, close_tab)은 전부 지우는데 여기만 빠져 있었다
+                    // (2026-08-20 코드 리뷰). SessionId는 단조 증가라 한 번 새면 그
+                    // 항목은 영영 남는다.
                     self.mux.panes.remove(&pane_id);
                     self.remove_session(id);
+                    self.detectors.remove(&id);
                     self.status_overrides.remove(&id);
                     self.close_session_log(id, "killed", None);
                     self.emit(RuntimeEvent::SpawnFailed {
@@ -3254,6 +3266,55 @@ impl Worker {
         self.remote_viewing.keys().copied().collect()
     }
 
+    /// 방금 스폰한 세션에 exit sentinel 감시를 건다. pid를 못 구하면(플랫폼 제약,
+    /// portable-pty가 identity를 못 준 경우 등) 조용히 건너뛴다 — 실패해도 기존 동작
+    /// (idle heuristic·SessionExited)이 그대로 남는다. custom agent처럼
+    /// `wrap_agent_then_shell`을 거치지 않은 세션도 걸리지만, 그 sentinel은 영영 안
+    /// 나타날 뿐이고 세션 종료 시 항목을 함께 지우므로(아래 exited 처리) 누수되지 않는다.
+    #[cfg(unix)]
+    fn register_agent_exit_watch(&mut self, id: SessionId) {
+        let Some(pid) = self
+            .sessions
+            .get(&id)
+            .and_then(|session| session.process_identity().pid)
+        else {
+            return;
+        };
+        let path = agent_exit_sentinel_path(&std::env::temp_dir(), pid);
+        // 이 pid를 재사용한 옛 프로세스가 남긴 파일이 있으면(극히 드묾) 오판을 막기 위해
+        // 먼저 지운다 — session::agent_exit_sentinel_path 문서의 재사용 경고와 짝.
+        let _ = std::fs::remove_file(&path);
+        self.agent_exit_watch.insert(id, path);
+    }
+
+    #[cfg(not(unix))]
+    fn register_agent_exit_watch(&mut self, _id: SessionId) {}
+
+    /// exit sentinel이 나타났으면 detector에 진짜 종료 코드를 latch한다 —
+    /// SessionStatusChanged/SessionStatusViewChanged는 뒤이은 evaluate()가 평소처럼
+    /// emit한다(새 이벤트 타입 불필요, 기존 notifications 배선을 그대로 탄다).
+    /// 대부분의 tick은 아직 안 끝난 것뿐이라 못 찾는 게 정상 — 조용히 다음 tick으로.
+    fn poll_agent_exit_sentinels(&mut self) {
+        if self.agent_exit_watch.is_empty() {
+            return;
+        }
+        let mut resolved: Vec<(SessionId, PathBuf, u32)> = Vec::new();
+        for (session, path) in &self.agent_exit_watch {
+            if let Ok(content) = std::fs::read_to_string(path)
+                && let Ok(code) = content.trim().parse::<u32>()
+            {
+                resolved.push((*session, path.clone(), code));
+            }
+        }
+        for (session, path, code) in resolved {
+            self.agent_exit_watch.remove(&session);
+            let _ = std::fs::remove_file(&path);
+            if let Some(detector) = self.detectors.get_mut(&session) {
+                detector.note_exit_sentinel(code);
+            }
+        }
+    }
+
     /// 모든 세션의 PTY 출력을 반영하고, active pane 세션만 Viewport를 push한다
     /// (14.4: hidden pane snapshot 생성 금지 — dirty는 유지되어 포커스 전환 시 따라잡는다).
     fn pump_sessions(&mut self, allow_viewport: bool) -> PumpActivity {
@@ -3262,6 +3323,9 @@ impl Worker {
         // 다음 tick에야 archive 대상이 된다 — SessionExited emit과 detach MuxUpdated가
         // 서로 다른 tick(≈다른 UI drain)에 나뉘어, 알림/상태가 유실되지 않는다 (codex 리뷰).
         self.archive_over_cap();
+        // 폴백 셸이 이어받기 전에(=SessionExited보다 훨씬 먼저) 에이전트 자신의 진짜
+        // 종료 코드를 반영한다 — 아래 evaluate()가 이번 tick에 바로 새 상태를 emit한다.
+        self.poll_agent_exit_sentinels();
         let watched = self.mux.watched_sessions();
         // 원격 시청 lease 세션 — GUI 가시성과 무관하게 Viewport 대상 (P5a).
         let remote_viewed = self.remote_viewed_sessions();
@@ -3421,6 +3485,11 @@ impl Worker {
             self.close_session_log(session, "exited", detail.as_deref());
             self.detectors.remove(&session);
             self.status_overrides.remove(&session);
+            // sentinel이 끝내 안 나타났으면(에이전트가 아니었거나, 쓰기 실패 등) 감시
+            // 항목과 혹시 남은 파일을 함께 정리한다 — temp dir에 흔적을 남기지 않는다.
+            if let Some(path) = self.agent_exit_watch.remove(&session) {
+                let _ = std::fs::remove_file(&path);
+            }
             if let Some(pipe) = &mut self.persist {
                 pipe.session_exited(session);
             }
@@ -3444,19 +3513,29 @@ impl Worker {
         for (event, gui_viewport) in events {
             self.emit_gated(event, gui_viewport);
         }
-        // 셸 세션 종료 → pane 자동 닫힘 (tmux 관례 — exit하면 pane이 접히고 이웃이
-        // 공간을 차지, 2026-07-05 사용자 요청). agent pane은 결과 상태(✅/❌)와
-        // scrollback을 봐야 하므로 유지한다. SessionExited emit **후**라 UI는 같은
-        // drain에서 exit 알림을 먼저 받고 MuxUpdated로 pane 제거를 본다 (채널 FIFO).
-        // close_pane의 세션 정리는 위 exited 처리와 겹쳐도 멱등(no-op)이다.
+        // 세션 종료 → pane 자동 닫힘 (tmux 관례 — exit하면 pane이 접히고 이웃이
+        // 공간을 차지, 2026-07-05 사용자 요청). 예전엔 agent pane을 결과 상태(✅/❌)와
+        // scrollback 열람을 위해 제외했지만, 에이전트 실행은 항상
+        // `agent_launcher::wrap_agent_then_shell`로 감싸여 있다: 에이전트가 끝나면 그
+        // 자리에서 `exec`로 평범한 셸이 이어받는다. 즉 agent 세션의 SessionExited가
+        // 온다는 것 자체가 "그 폴백 셸에서 사용자가 exit을 쳤다"는 뜻이고, 결과
+        // 배지·scrollback은 exit을 치기 전에 이미 pane에서 다 봤다 — shim이 세션을
+        // 에이전트 프로세스보다 오래 살리는 한 그 근거는 계속 성립한다. 그래서 이제
+        // agent도 셸과 동일하게 닫는다(2026-08-19, "exit하면 pane 닫힘"과 "이어서
+        // 하기는 재기동해도 동작"을 동시에 요구 — 후자는 work history가 pane 생존과
+        // 무관하게 archived 바인딩만으로 재개하도록 별도로 처리한다, agent_resume 참고).
+        //
+        // 주의: `SessionRestored`(재시작 시 열람 전용으로 복원된 pane, restore_pane→
+        // restore_archived_pane)는 이 `exited_sessions`에 절대 섞이지 않는다 — 이
+        // 리스트는 이번 tick `pump_sessions`가 만든 `events`에서 SessionExited만 뽑은
+        // 것이고, SessionRestored는 그 이벤트 목록에 들어간 적이 없는 별도 경로에서
+        // emit된다. 여기서 SessionRestored까지 닫으면 앱을 켜자마자 복원 pane이 전부
+        // 사라진다 — 아래 회귀 테스트가 이를 고정한다.
+        //
+        // SessionExited emit **후**라 UI는 같은 drain에서 exit 알림을 먼저 받고
+        // MuxUpdated로 pane 제거를 본다 (채널 FIFO). close_pane의 세션 정리는 위
+        // exited 처리와 겹쳐도 멱등(no-op)이다.
         for session in exited_sessions {
-            let is_shell = self
-                .sessions
-                .get(&session)
-                .is_some_and(|s| s.kind() == session::SessionKind::Shell);
-            if !is_shell {
-                continue;
-            }
             let pane = self
                 .mux
                 .panes
@@ -4566,6 +4645,7 @@ mod tests {
                 secret_resolver: resolver,
                 logs: std::collections::HashMap::new(),
                 detectors: std::collections::HashMap::new(),
+                agent_exit_watch: std::collections::HashMap::new(),
                 status_overrides: std::collections::HashMap::new(),
                 run_logs_root: logs_root.join("run"),
                 logs_root,
@@ -5980,6 +6060,78 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn 복원된_archived_agent_pane은_시간이_지나도_자동으로_닫히지_않는다() {
+        // 2026-08-19 회귀 가드: agent도 exit 시 pane을 닫도록 바뀌면서, 실수로
+        // SessionRestored(재시작 시 열람 전용 복원)까지 그 판정에 섞이면 앱을 켜자마자
+        // 모든 복원 pane이 사라진다. restore_archived_pane이 만드는 세션은 pty가
+        // 처음부터 None이라 Session::pump의 just_exited가 구조적으로 다시 true가 될 수
+        // 없다(pty.is_some() 전제) — 이 테스트는 그 불변식을 실제 여러 pump tick에
+        // 걸쳐 관찰로도 고정한다.
+        init_mock_store();
+        let dir = unique_test_dir("lazy-restore-agent-survives-ticks");
+        let db_path = dir.join("metadata.sqlite3");
+        let workspace_id = "ws-lazy-restore-agent-survives-ticks";
+        create_persist_db(&db_path, workspace_id);
+        let (agent_pane, _) = seed_persisted_two_pane_window(&db_path, workspace_id, "agent");
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            dir.join("logs"),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+            Some(crate::persistence::PersistConfig {
+                db_path,
+                workspace_id: workspace_id.to_owned(),
+            }),
+        );
+        let mut probe = Probe::new(client.subscribe());
+
+        client
+            .send_command(RuntimeCommand::RestoreWorkspacePane {
+                pane: agent_pane.clone(),
+            })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::MuxUpdated { snapshot }
+                if snapshot
+                    .tabs
+                    .iter()
+                    .flat_map(|tab| &tab.panes)
+                    .any(|pane| pane.id == agent_pane && pane.session_id.is_some()) =>
+            {
+                Some(())
+            }
+            _ => None,
+        });
+        // 여러 pump tick이 지나가게 실제로 기다린 뒤, FocusPane으로 새 MuxUpdated를
+        // 끌어내 그 시점 스냅샷에도 pane이 그대로인지 확인한다.
+        std::thread::sleep(Duration::from_millis(150));
+        client
+            .send_command(RuntimeCommand::FocusPane {
+                pane: agent_pane.clone(),
+            })
+            .unwrap();
+        let still_present = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::MuxUpdated { snapshot } => Some(
+                snapshot
+                    .tabs
+                    .iter()
+                    .flat_map(|tab| &tab.panes)
+                    .any(|pane| pane.id == agent_pane && pane.session_id.is_some()),
+            ),
+            _ => None,
+        });
+        assert!(
+            still_present,
+            "복원된 archived agent pane이 자동으로 닫혔다"
+        );
+
+        drop(client);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     fn restore_workspace_from_fixture(
         db_path: &std::path::Path,
         logs_root: &std::path::Path,
@@ -6176,7 +6328,7 @@ mod tests {
     fn in_process_command_queue_full은_err로_surface된다() {
         let (tx, rx) = sync_channel(1);
         let command_budget = Arc::new(RuntimeCommandQueueBudget::default());
-        let client = InProcessRuntimeClient {
+        let mut client = InProcessRuntimeClient {
             command_tx: Some(tx),
             command_budget: Arc::clone(&command_budget),
             subscribers: Arc::default(),
@@ -6196,9 +6348,26 @@ mod tests {
             ))
             .unwrap_err();
         assert!(err.to_string().contains("명령 큐 가득참"));
+        assert_eq!(
+            err.downcast_ref::<crate::RuntimeCommandSendError>(),
+            Some(&crate::RuntimeCommandSendError::Backpressure),
+            "host must be able to distinguish retryable pressure from disconnect"
+        );
         assert_eq!(command_budget.retained_bytes(), retained_after_first);
         drop(rx);
         assert_eq!(command_budget.retained_bytes(), 0);
+
+        client.command_tx = None;
+        let err = client
+            .send_command(RuntimeCommand::SetWorkspaceState(
+                WorkspaceRuntimeState::Warm,
+            ))
+            .unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<crate::RuntimeCommandSendError>(),
+            Some(&crate::RuntimeCommandSendError::Disconnected),
+            "an explicitly shut-down local runtime must preserve typed disconnect"
+        );
     }
 
     #[test]
@@ -6207,7 +6376,15 @@ mod tests {
         let exact = budget.reserve(RUNTIME_COMMAND_QUEUE_BYTES_MAX).unwrap();
         assert_eq!(budget.retained_bytes(), RUNTIME_COMMAND_QUEUE_BYTES_MAX);
         for _ in 0..128 {
-            assert!(budget.reserve(1).is_err());
+            let error = match budget.reserve(1) {
+                Ok(_) => panic!("aggregate byte-budget overflow must be rejected"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error.downcast_ref::<crate::RuntimeCommandSendError>(),
+                Some(&crate::RuntimeCommandSendError::Backpressure),
+                "aggregate byte-budget pressure must remain retryable"
+            );
             assert_eq!(budget.retained_bytes(), RUNTIME_COMMAND_QUEUE_BYTES_MAX);
         }
         drop(exact);
@@ -6564,43 +6741,61 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn 종료_후에도_scrollback_열람_가능() {
-        // agent 세션으로 검증 — 셸은 exit 시 pane이 자동으로 닫힌다(2026-07-05).
-        // §14.3 "종료 후 scrollback 열람" 계약은 pane이 유지되는 agent에 적용된다.
+    fn 복원된_archived_agent_pane도_scroll로_스크롤백을_볼_수_있다() {
+        // 2026-08-19: agent도 exit 시 pane이 자동으로 닫히게 되면서("셸_exit시_
+        // pane_자동_닫힘_agent도_동일하게_닫힌다" 참고), §14.3 "종료 후에도
+        // scrollback 열람 가능" 계약은 더 이상 "살아있는 pane으로 exit 직후 관찰"로는
+        // 검증할 수 없다 — 검증 시도 자체가 그 pane을 없앤다. 이 계약이 실제로 남아
+        // 있는 자리는 재시작 시 열람 전용으로 복원된 archived pane이다: 그 세션은
+        // pty가 처음부터 None이라 pane 자동 닫힘 대상이 되지 않고(§셸_exit... 테스트의
+        // 코드 주석 참고) 무기한 유지된다. 이 테스트는 그 자리에서 Scroll이 여전히
+        // Viewport로 응답하는지 고정한다(예전 이름: 종료_후에도_scrollback_열람_가능).
+        init_mock_store();
+        let dir = unique_test_dir("archived-pane-scroll");
+        let db_path = dir.join("metadata.sqlite3");
+        let workspace_id = "ws-archived-pane-scroll";
+        create_persist_db(&db_path, workspace_id);
+        let (agent_pane, _) = seed_persisted_two_pane_window(&db_path, workspace_id, "agent");
         let client = InProcessRuntimeClient::with_shell(
             5,
             test_store(),
-            test_logs_root("t"),
+            dir.join("logs"),
             RedactionService::new(),
-            spec("/bin/echo", &["unused"]),
-            None,
+            spec("/bin/cat", &[]),
+            Some(crate::persistence::PersistConfig {
+                db_path,
+                workspace_id: workspace_id.to_owned(),
+            }),
         );
         let mut probe = Probe::new(client.subscribe());
         client
-            .send_command(spawn_agent_cmd("echo done", None, None))
+            .send_command(RuntimeCommand::RestoreWorkspacePane {
+                pane: agent_pane.clone(),
+            })
             .unwrap();
-        let session = probe.wait_for(Duration::from_secs(15), |e| match e {
-            RuntimeEvent::AgentSpawned { session } => Some(*session),
+        let session = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::MuxUpdated { snapshot } => snapshot
+                .tabs
+                .iter()
+                .flat_map(|tab| &tab.panes)
+                .find(|pane| pane.id == agent_pane)
+                .and_then(|pane| pane.session_id),
             _ => None,
         });
-        probe.wait_for(Duration::from_secs(15), |e| match e {
-            RuntimeEvent::SessionExited { .. } => Some(()),
-            _ => None,
-        });
-        // backend가 유지되어 Scroll에 Viewport로 응답해야 한다
-        // (종료 전 Viewport와 구분하기 위해 관측 버퍼를 비운다)
+        // 살아있는 세션의 exit-후-Scroll과 달리, 여기선 애초에 pane이 닫힐 일이 없다
+        // — Scroll이 여전히 Viewport로 응답하는지만 확인한다(seed 픽스처는 실제 ANSI
+        // 아카이브/로그가 없어 내용 검증은 다른 테스트들의 몫이다).
         probe.seen.clear();
         client
             .send_command(RuntimeCommand::Scroll { session, delta: 1 })
             .unwrap();
         probe.wait_for(Duration::from_secs(15), |e| match e {
-            RuntimeEvent::Viewport { snapshot, .. }
-                if snapshot_text(snapshot, 0).contains("done") =>
-            {
-                Some(())
-            }
+            RuntimeEvent::Viewport { session: s, .. } if *s == session => Some(()),
             _ => None,
         });
+
+        drop(client);
+        std::fs::remove_dir_all(dir).ok();
     }
 
     /// 셸 통합 1단계: 출력에 OSC 133;A 마크 2개를 심으면 ScrollToPrompt가
@@ -6862,7 +7057,11 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn 셸_exit시_pane_자동_닫힘_agent는_유지() {
+    fn 셸_exit시_pane_자동_닫힘_agent도_동일하게_닫힌다() {
+        // 2026-08-19: agent pane도 exit 시 닫히도록 바뀌었다(wrap_agent_then_shell이
+        // 세션을 에이전트보다 오래 살리므로 agent SessionExited = "폴백 셸에서 exit
+        // 쳤다"는 뜻 — in_process.rs의 pump_sessions 주석 참고). 이 테스트는 예전
+        // "agent는 유지"를 지키던 것을 뒤집어 셸·agent가 동일하게 닫힘을 고정한다.
         let client = InProcessRuntimeClient::with_shell(
             5,
             test_store(),
@@ -6872,9 +7071,9 @@ mod tests {
             None,
         );
         let mut probe = Probe::new(client.subscribe());
-        // agent(pane 유지 기대) + 셸(즉시 종료 — pane 자동 닫힘 기대)
+        // agent(즉시 종료)와 셸(즉시 종료) 둘 다 pane 자동 닫힘을 기대한다
         client
-            .send_command(spawn_agent_cmd("sleep 5", None, None))
+            .send_command(spawn_agent_cmd("true", None, None))
             .unwrap();
         let agent = probe.wait_for(Duration::from_secs(15), |e| match e {
             RuntimeEvent::AgentSpawned { session } => Some(*session),
@@ -6895,7 +7094,11 @@ mod tests {
             RuntimeEvent::SessionExited { session, .. } if *session == shell => Some(()),
             _ => None,
         });
-        // exit 직후의 MuxUpdated에서 셸 pane은 사라지고 agent pane은 남는다
+        probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::SessionExited { session, .. } if *session == agent => Some(()),
+            _ => None,
+        });
+        // exit 직후의 MuxUpdated에서 셸·agent pane 둘 다 사라진다
         probe.wait_for(Duration::from_secs(15), |e| match e {
             RuntimeEvent::MuxUpdated { snapshot } => {
                 let sessions: Vec<_> = snapshot
@@ -6904,7 +7107,7 @@ mod tests {
                     .flat_map(|t| &t.panes)
                     .filter_map(|p| p.session_id)
                     .collect();
-                (!sessions.contains(&shell) && sessions.contains(&agent)).then_some(())
+                (!sessions.contains(&shell) && !sessions.contains(&agent)).then_some(())
             }
             _ => None,
         });
@@ -7793,6 +7996,65 @@ mod tests {
         });
     }
 
+    /// agent_launcher::wrap_agent_then_shell이 만드는 것과 동등한 스크립트(app crate라
+    /// 여기서 직접 참조는 못 하지만 같은 형태)로 exit sentinel 경로를 진짜 PTY로 고정한다.
+    /// 폴백 셸은 일부러 오래 살려 둔다(sleep) — SessionExited가 오기 훨씬 전에, 에이전트
+    /// 자신의 종료 코드(0이 아님)로 Error가 즉시 반영돼야 한다는 게 이 테스트의 요점.
+    #[test]
+    #[cfg(unix)]
+    fn exit_sentinel은_폴백_셸이_살아있어도_에이전트의_진짜_종료코드를_즉시_반영한다() {
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("exit-sentinel"),
+            RedactionService::new(),
+            pty::default_shell(),
+            None,
+        );
+        let mut probe = Probe::new(client.subscribe());
+        let script = r#""$@"; __deppy_exit=$?; printf '%s' "$__deppy_exit" > "${TMPDIR:-/tmp}/deppy-agent-exit-$$" 2>/dev/null || true; sleep 30"#;
+        client
+            .send_command(RuntimeCommand::SpawnAgent {
+                agent_config_id: None,
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+                command: "/bin/sh".into(),
+                args: vec![
+                    "-c".into(),
+                    script.into(),
+                    "deppy-agent-session".into(),
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "exit 3".into(),
+                ],
+                env_plain: Vec::new(),
+                env_secrets: Vec::new(),
+                waiting_regex: None,
+                approval_regex: None,
+                error_regex: None,
+                done_regex: None,
+            })
+            .unwrap();
+        let session = probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::AgentSpawned { session } => Some(*session),
+            _ => None,
+        });
+        probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::SessionStatusChanged {
+                session: s,
+                status: session::SessionStatus::Error,
+            } if *s == session => Some(()),
+            _ => None,
+        });
+        assert!(
+            !probe.seen.iter().any(
+                |e| matches!(e, RuntimeEvent::SessionExited { session: s, .. } if *s == session)
+            ),
+            "폴백 셸이 아직 안 죽었으니 SessionExited보다 먼저 와야 한다"
+        );
+    }
+
     #[test]
     #[cfg(unix)]
     fn status_화면_패턴_hidden에서_snapshot_없이_감지() {
@@ -8237,12 +8499,32 @@ mod tests {
             }),
         );
         let mut probe = Probe::new(client.subscribe());
-        // agent 세션으로 검증 — 셸은 exit 시 pane이 자동으로 닫혀 layout에서 사라진다
-        // (2026-07-05). 영속 파이프라인(세션 행 + layout의 pane→세션 참조)은 pane이
-        // 유지되는 agent로 확인한다.
+        // agent 세션으로 검증. 2026-08-19: agent도 exit 시 pane이 자동으로 닫혀
+        // layout에서 사라지므로("셸_exit시_pane_자동_닫힘_agent도_동일하게_닫힌다"
+        // 참고), "pane→session_id 참조가 저장됐는지"는 세션이 살아 있는 동안(exit
+        // 전에) 확인해야 한다 — attach_in_new_tab 직후 emit_mux_snapshot이 이미
+        // save_layout을 거치므로 AgentSpawned를 받은 시점에 이미 반영돼 있다.
+        // "exit 상태가 영속되는지"는 그 뒤 exit을 기다려 별도로 확인한다.
         client
             .send_command(spawn_agent_cmd("echo persist-ok", None, None))
             .unwrap();
+        probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::AgentSpawned { .. } => Some(()),
+            _ => None,
+        });
+        // mux layout: window/tab/pane가 저장되고 pane이 영속 session id를 참조
+        // (아직 살아 있는 시점 — exit 후에는 pane 자체가 닫혀 확인할 수 없다)
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let windows = persist::load_window_layouts(&conn, "ws-rt").unwrap();
+            assert_eq!(windows.len(), 1);
+            assert_eq!(windows[0].tabs.len(), 1);
+            let pane_session = windows[0].tabs[0].panes[0].session_id.clone().unwrap();
+            let persisted_id: String = conn
+                .query_row("SELECT id FROM sessions", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(pane_session, persisted_id);
+        }
         probe.wait_for(Duration::from_secs(15), |e| match e {
             RuntimeEvent::SessionExited { .. } => Some(()),
             _ => None,
@@ -8274,19 +8556,11 @@ mod tests {
             )
             .unwrap();
         // config id 없는 SpawnAgent는 스키마 CHECK(agent kind ⇒ agent_id 필수) 때문에
-        // "shell" kind로 기록된다 — 런타임 SessionKind는 Agent라 pane은 유지된다.
+        // "shell" kind로 기록된다 — 런타임 SessionKind는 여전히 Agent다(위에서 이미
+        // 확인한 layout 참조와 무관하게 exit 시 pane은 닫힌다).
         assert_eq!(kind, "shell");
         assert_eq!(command, "/bin/sh");
         assert_eq!(status, "exited");
-        // mux layout: window/tab/pane가 저장되고 pane이 영속 session id를 참조
-        let windows = persist::load_window_layouts(&conn, "ws-rt").unwrap();
-        assert_eq!(windows.len(), 1);
-        assert_eq!(windows[0].tabs.len(), 1);
-        let pane_session = windows[0].tabs[0].panes[0].session_id.clone().unwrap();
-        let persisted_id: String = conn
-            .query_row("SELECT id FROM sessions", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(pane_session, persisted_id);
         // 재시작 crash recovery와의 연동: exited라 reconcile 대상 아님 (멱등)
         assert_eq!(persist::reconcile_orphan_sessions(&conn).unwrap(), 0);
         drop(conn);
@@ -8737,11 +9011,24 @@ mod tests {
                 .collect()
         };
 
-        // 1) agent(config id 있음 — DB kind 'agent') 실행 → 종료 → 워커 종료
+        // 1) agent(config id 있음 — DB kind 'agent') 실행 → 워커 종료(app 종료 흉내)
+        //
+        // 2026-08-19: 예전엔 여기서 SessionExited를 기다렸지만, agent도 exit 시 pane이
+        // 자동으로 닫히는 지금은 그러면 mux_panes 행이 재시작 전에 이미 지워져 복원할
+        // 게 없어진다(테스트 취지 파괴) — 그리고 실제 프로덕션에서도 agent는 항상
+        // wrap_agent_then_shell로 감싸여 있어, 진짜 agent 세션이 SessionExited를 내는
+        // 시점은 이미 사용자가 그 pane에서 명시적으로 exit을 친 뒤다(그때는 셸처럼
+        // pane이 사라지는 게 맞다 — in_process.rs의 pump_sessions 주석 참고). 그래서
+        // "재시작 시 열람 전용 복원"이 실제로 의미 있는 시나리오는 "pane이 아직 살아
+        // 있는 도중 앱이 통째로 꺼진(비정상 종료/그냥 종료) 경우"다 — 세션을 절대 exit
+        // 시키지 않고 워커를 그냥 drop해 그 상황을 흉내낸다. 스크롤백 아카이브는
+        // Worker 종료 루프가 "아직 running인 agent"도 예외 없이 기록한다(위 1286행
+        // 부근 "running 셸은 제외 — running agent는 기록" 주석 참고) — 그래서 exit을
+        // 기다리지 않아도 아카이브가 남는다.
         {
             let client = make_client();
             let mut probe = Probe::new(client.subscribe());
-            let mut cmd = spawn_agent_cmd("echo a2-restore-marker", None, None);
+            let mut cmd = spawn_agent_cmd("printf 'a2-restore-marker\\n'; sleep 30", None, None);
             if let RuntimeCommand::SpawnAgent {
                 agent_config_id, ..
             } = &mut cmd
@@ -8749,31 +9036,38 @@ mod tests {
                 *agent_config_id = Some("cfg-1".into());
             }
             client.send_command(cmd).unwrap();
+            // 마커가 화면에 반영될 때까지 — 세션은 sleep 30으로 계속 살아 있다.
             probe.wait_for(Duration::from_secs(15), |e| match e {
-                RuntimeEvent::SessionExited { .. } => Some(()),
+                RuntimeEvent::Viewport { snapshot, .. }
+                    if viewport_text(snapshot).contains("a2-restore-marker") =>
+                {
+                    Some(())
+                }
                 _ => None,
             });
-            // 아카이브 기록(exit 처리) 완료를 관측 가능한 상태로 기다린다 — 고정
-            // 200ms sleep은 느린 공유 CI 러너에서 복원 라운드가 아카이브를 놓쳐
-            // 실패할 수 있다 (2026-08-04).
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            loop {
-                let uuid = rusqlite::Connection::open(&db_path)
-                    .unwrap()
-                    .query_row("SELECT id FROM sessions", [], |r| r.get::<_, String>(0))
-                    .ok();
-                let archived = uuid
-                    .as_deref()
-                    .is_some_and(|uuid| storage::scrollback_archive::exists(&logs_root, uuid));
-                if archived {
-                    break;
-                }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "아카이브가 기록되지 않음"
-                );
-                std::thread::sleep(Duration::from_millis(20));
+            // client/probe를 여기서 drop — InProcessRuntimeClient::shutdown이
+            // worker.join()으로 종료 루프(아카이브 기록 포함)를 동기 대기한다.
+        }
+        // join이 동기라 이론상 이 시점에 아카이브가 이미 존재해야 하지만, 원래
+        // 테스트(2026-08-04 주석)가 겪은 느린 공유 CI 러너의 파일시스템 가시성 지연을
+        // 그대로 방어해 둔다.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let uuid = rusqlite::Connection::open(&db_path)
+                .unwrap()
+                .query_row("SELECT id FROM sessions", [], |r| r.get::<_, String>(0))
+                .ok();
+            let archived = uuid
+                .as_deref()
+                .is_some_and(|uuid| storage::scrollback_archive::exists(&logs_root, uuid));
+            if archived {
+                break;
             }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "아카이브가 기록되지 않음"
+            );
+            std::thread::sleep(Duration::from_millis(20));
         }
 
         // 2) 재시작 1: 아카이브로 열람 전용 복원 — respawn 없이 내용이 보인다
@@ -9692,6 +9986,147 @@ mod tests {
             .query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))
             .unwrap();
         assert_eq!(row_count, 1);
+        drop(client);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 셸 세션 화면 복원(2026-08-19): SSH로 원격에 붙어 vim·htop·tmux 같은
+    /// alt-screen 프로그램을 보던 중 앱이 재시작돼도 그 화면이 통째로 사라지면
+    /// 안 된다. restore_pane의 셸 respawn 경로가 alt-screen을 그냥 finish_ansi_replay로
+    /// 끝내버리면(§ finish_ansi_replay 원래 동작) 이 내용을 되찾을 길이 없다 —
+    /// scrollback 검색으로 보존을 확인하고, 동시에 fresh 셸이 즉시 입력 가능한지도
+    /// 같이 검증한다("화면 보존"과 "셸 재사용성" 둘 다).
+    #[cfg(unix)]
+    #[test]
+    fn 재시작시_alt_screen이었던_셸_pane도_화면이_보존된다() {
+        init_mock_store();
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-rt-altscreen-restore-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("metadata.sqlite3");
+        let logs_root = dir.join("logs");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE workspaces (id TEXT PRIMARY KEY, name TEXT, path TEXT,
+                     created_at TEXT DEFAULT '', updated_at TEXT DEFAULT '');
+                 CREATE TABLE agent_configs (id TEXT PRIMARY KEY);
+                 INSERT INTO workspaces (id) VALUES ('ws-alt');",
+            )
+            .unwrap();
+            conn.execute_batch(persist::MIGRATION_SQL).unwrap();
+            conn.execute_batch(persist::MIGRATION_SESSION_REGEX)
+                .unwrap();
+        }
+        let persist_config = || crate::persistence::PersistConfig {
+            db_path: db_path.clone(),
+            workspace_id: "ws-alt".into(),
+        };
+
+        {
+            // 원격 TUI를 흉내: alt-screen에 들어가 마커 텍스트를 찍고, exit 없이(연결이
+            // 끊긴 채) 그대로 둔다 — 앱이 재시작될 때 흔한 "TUI 화면에 멈춰있던" 상태.
+            let client = InProcessRuntimeClient::with_shell(
+                5,
+                test_store(),
+                logs_root.clone(),
+                RedactionService::new(),
+                spec(
+                    "/bin/sh",
+                    &[
+                        "-c",
+                        r"printf '\033[?1049hREMOTE-VIM-BUFFER'; exec /bin/cat",
+                    ],
+                ),
+                Some(persist_config()),
+            );
+            let mut probe = Probe::new(client.subscribe());
+            client
+                .send_command(RuntimeCommand::SpawnShell {
+                    cols: 80,
+                    rows: 24,
+                    scrollback_lines: 100,
+                })
+                .unwrap();
+            probe.wait_for(Duration::from_secs(15), |event| match event {
+                RuntimeEvent::Viewport { snapshot, .. }
+                    if snapshot.is_alt_screen
+                        && snapshot.visible_cells.iter().any(|cell| cell.c == 'R') =>
+                {
+                    Some(())
+                }
+                _ => None,
+            });
+        }
+
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            logs_root.clone(),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+            Some(persist_config()),
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::RestoreWorkspace)
+            .unwrap();
+        let restored_session = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::Viewport {
+                session, snapshot, ..
+            } if !snapshot.is_alt_screen => Some(*session),
+            _ => None,
+        });
+
+        // 1) 화면 보존 — alt-screen 내용이 scrollback에서 찾아져야 한다(위로 스크롤하면 보임).
+        client
+            .send_command(RuntimeCommand::SearchScrollback {
+                session: restored_session,
+                query: "REMOTE-VIM-BUFFER".into(),
+                max_matches: 10,
+            })
+            .unwrap();
+        let found = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::ScrollbackSearchResult {
+                session, result, ..
+            } if *session == restored_session => Some(!result.matches.is_empty()),
+            _ => None,
+        });
+        assert!(found, "alt-screen 화면이 scrollback에 보존돼야 함");
+
+        // 2) 셸 재사용성 — fresh 셸(/bin/cat)이 살아있어 입력이 그대로 에코된다.
+        client
+            .send_command(RuntimeCommand::WriteInput {
+                session: restored_session,
+                bytes: b"FRESH-INPUT-ECHO\n".to_vec(),
+            })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::Viewport {
+                session, snapshot, ..
+            } if *session == restored_session
+                && snapshot
+                    .visible_cells
+                    .iter()
+                    .any(|cell| cell.c == 'E' && !cell.wide_spacer) =>
+            {
+                snapshot
+                    .visible_cells
+                    .iter()
+                    .map(|cell| cell.c)
+                    .collect::<String>()
+                    .contains("FRESH-INPUT-ECHO")
+                    .then_some(())
+            }
+            _ => None,
+        });
+
         drop(client);
         std::fs::remove_dir_all(&dir).ok();
     }

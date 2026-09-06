@@ -905,6 +905,7 @@ mod tests {
             agent_summary: None,
             occurred_at: None,
             activity: AgentActivity::Working,
+            messages: Vec::new(),
         }
     }
 

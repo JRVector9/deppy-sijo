@@ -118,7 +118,8 @@ impl LayoutNode {
 
     /// 루트 기준 path(0=first, 1=second)로 내려가 그 Split의 ratio를 바꾼다 (마우스
     /// 리사이즈). path가 Split이 아닌 곳을 가리키면 false — layout이 명령 전송 후
-    /// 바뀌었을 수 있다(stale 명령은 무해하게 무시). ratio는 pane이 사라지지 않게 clamp.
+    /// 바뀌었을 수 있다(stale 명령은 무해하게 무시). ratio는 저장 가능한 범위로 clamp하고,
+    /// 실제 pane 최소 크기는 UI layout이 결정한다.
     /// 원격/기형 명령 방어: non-finite ratio(NaN은 clamp를 통과한다)와 0/1 밖의
     /// path byte는 거부한다 (codex 리뷰).
     pub fn set_split_ratio(&mut self, path: &[u8], ratio: f32) -> bool {
@@ -140,7 +141,7 @@ impl LayoutNode {
         }
         match node {
             LayoutNode::Split { ratio: r, .. } => {
-                *r = ratio.clamp(0.1, 0.9);
+                *r = ratio.clamp(0.0, 1.0);
                 true
             }
             LayoutNode::Pane(_) => false,
@@ -168,20 +169,20 @@ mod tests {
     }
 
     #[test]
-    fn set_split_ratio는_path로_찾고_clamp한다() {
+    fn set_split_ratio는_path로_찾고_유효한_작은_비율을_보존한다() {
         let (a, b, c) = (pane(), pane(), pane());
         let mut layout = LayoutNode::Pane(a.clone());
         assert!(layout.split_pane(&a, SplitDirection::Horizontal, b.clone()));
         assert!(layout.split_pane(&b, SplitDirection::Vertical, c.clone()));
         // 루트 Split
         assert!(layout.set_split_ratio(&[], 0.7));
-        // 두 번째 칸의 중첩 Split — clamp 하한
+        // 두 번째 칸의 중첩 Split — UI가 계산한 작은 비율도 그대로 보존
         assert!(layout.set_split_ratio(&[1], 0.01));
         match &layout {
             LayoutNode::Split { ratio, second, .. } => {
                 assert!((ratio - 0.7).abs() < f32::EPSILON);
                 match second.as_ref() {
-                    LayoutNode::Split { ratio, .. } => assert!((ratio - 0.1).abs() < f32::EPSILON),
+                    LayoutNode::Split { ratio, .. } => assert!((ratio - 0.01).abs() < f32::EPSILON),
                     _ => panic!("중첩 Split이어야 함"),
                 }
             }
@@ -194,6 +195,25 @@ mod tests {
         assert!(!layout.set_split_ratio(&[], f32::NAN));
         assert!(!layout.set_split_ratio(&[], f32::INFINITY));
         assert!(!layout.set_split_ratio(&[2], 0.5));
+    }
+
+    #[test]
+    fn set_split_ratio는_유효_범위_밖만_경계로_clamp한다() {
+        let (a, b) = (pane(), pane());
+        let mut layout = LayoutNode::Pane(a.clone());
+        assert!(layout.split_pane(&a, SplitDirection::Horizontal, b));
+
+        assert!(layout.set_split_ratio(&[], -0.1));
+        assert!(matches!(
+            layout,
+            LayoutNode::Split { ratio, .. } if ratio == 0.0
+        ));
+
+        assert!(layout.set_split_ratio(&[], 1.1));
+        assert!(matches!(
+            layout,
+            LayoutNode::Split { ratio, .. } if ratio == 1.0
+        ));
     }
 
     #[test]

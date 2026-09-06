@@ -1,8 +1,19 @@
 //! 세션 cwd 레포의 git 변경분(diff) 리뷰 패널 (PR-D).
 //!
-//! 사이드바 세션 우클릭 「변경 보기」 → 독립 egui Window. leaf는 immutable snapshot을
-//! 렌더하고 capacity-1 intent만 반환한다. App host가 Git/metadata I/O를 수행한 뒤
-//! operation/generation completion을 돌려주며, 닫힌 창은 모든 상태를 즉시 버린다.
+//! 독립 egui Window. leaf는 immutable snapshot을 렌더하고 capacity-1 intent만
+//! 반환한다. App host가 Git/metadata I/O를 수행한 뒤 operation/generation
+//! completion을 돌려주며, 닫힌 창은 모든 상태를 즉시 버린다.
+//!
+//! **2026-08-15부터 이 창의 프로덕션 진입점은 작업 이력의 「변경 보기」 하나뿐이다**
+//! (`open_for_path` — app.rs의 work-history 행 핸들러). 사이드바 Git 탭과 세션
+//! 우클릭 「변경 보기」는 사이드바 `git_panel.rs`(상태 목록) + 메인 영역
+//! `diff_viewer.rs`(파일별 diff)로 옮겨갔다(2026-08-15 스펙 §1).
+//!
+//! repo 전체 진입점 `open_for`는 그래서 프로덕션 호출자가 없다. 그래도 지우지 않는
+//! 이유: 이 파일의 테스트 6곳이 그것으로 **repo 전체 수집 경로**(status+staged+
+//! unstaged+untracked 병합, 바이트/파일 수 상한)를 커버하는데, 남은 진입점
+//! `open_for_path`는 경로 한정이라 그 경로를 대체하지 못한다. 창 자체의 완전 은퇴는
+//! work-history가 새 뷰어로 옮겨갈 때(후속 스코프) 함께 한다.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -733,6 +744,13 @@ impl DiffPanelUi {
 
     /// 사이드바 「변경 보기」 진입점 — 대상 세팅 + 창 열기 + 자동 1회 조회.
     /// cwd 미확인이면 조회 없이 열어 패널이 안내를 표시한다.
+    ///
+    /// 2026-08-15부터 프로덕션 호출자가 없다 — 사이드바 Git 탭과 세션 우클릭
+    /// 「변경 보기」가 git_panel.rs + diff_viewer.rs로 옮겨갔다(app.rs `ShowDiff`
+    /// 핸들러 참고). 그래도 남겨 둔 이유는 모듈 문서에 적었다: 이 파일 테스트 6곳이
+    /// 이것으로 repo 전체 수집 경로를 커버하고, 남은 진입점 `open_for_path`는
+    /// 경로 한정이라 그 커버리지를 대체하지 못한다.
+    #[allow(dead_code)]
     pub fn open_for(
         &mut self,
         ctx: &egui::Context,

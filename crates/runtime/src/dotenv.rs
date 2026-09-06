@@ -169,7 +169,13 @@ pub fn is_secret_key(key: &str) -> bool {
         "PWD",
         "CREDENTIAL",
         "AUTH",
-        "PRIVATE",
+        // `PRIVATE` 단독이 아니라 `PRIVATE_KEY`다(2026-08-21). 단독 부분문자열은
+        // `ALLOW_PRIVATE_URLS` 같은 평범한 플래그까지 비밀로 잡는데, 그 값이 redaction
+        // 최소 길이 미만이면 dotenv 동기화 전체가 fail-closed로 죽어 워크스페이스가
+        // 통째로 막혔다(사용자 보고). 저장소의 `secret_like_env_key`도 이 개념을
+        // `PRIVATE_KEY`/`_PRIVATE_KEY`로만 잡으므로, 좁히는 쪽이 두 판정의 간극을
+        // **줄인다** — 넓히는 게 아니다.
+        "PRIVATE_KEY",
     ]
     .iter()
     .any(|marker| upper.contains(marker))

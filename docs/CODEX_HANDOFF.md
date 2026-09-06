@@ -107,6 +107,80 @@ git status --short --branch
 /tmp/deppy-sijo-agents-20260906/cargo-serial test -p deppy-sijo --bin deppy-sijo --locked ui::workspace::tests -- --test-threads=1
 ```
 
+
+## 후속 진행 — 기존 출력 형태 보존과 창 너비 맞춤 (2026-09-06)
+
+- 현재 목표: 사용자가 "가로로 이동하지 않고 한 화면에서" 확인하도록 결정했다. 기존 글과
+  표의 논리 열 수를 유지하고 pane이 좁으면 터미널 내용 전체를 균일 축소한다.
+  이전 레이아웃 방식 확인 대기는 끝났다. 앞의 이전 세션 기록보다 이 절을 우선한다.
+- 작업 위치: `/Users/jr/Desktop/projects/deppy-sijo-layout-20260906`,
+  `fix/preserve-terminal-layout`, PR #148의 `50d195f` 기반 별도 draft PR 준비 중.
+- 변경 파일: `crates/app/src/ui/workspace.rs`, `crates/terminal/src/renderer_egui.rs`,
+  `crates/runtime/src/{command,lib}.rs`(기존 상수 공개),
+  `docs/superpowers/specs/2026-09-06-terminal-fit-width-design.md`,
+  `docs/superpowers/plans/2026-09-06-terminal-fit-width.md`, 이 핸드오프.
+- 완료: 전송한 cols → 표시 snapshot.cols 순으로 기존 폭을 선택한다. 둘 다 없으면 실제
+  첫 snapshot을 기다린다. MuxUpdated 뒤 Viewport가 늦게 와도 추측한 폭으로 복원 기록을
+  다시 줄바꿈하지 않는다. 초기 gate가 같은 프레임 후반에 열리면 repaint를 예약한다.
+  신규 세션도 backend 첫 폭(현재 기본 80열)을 유지하며, 확대는 설정 폰트 크기까지만
+  하므로 넓힌 창 오른쪽에는 여백이 남을 수 있다. 세로 스크롤백은 기존대로다.
+- 완료: 글자·배경·선택·밑줄·커서·preedit을 같은 비율로 표시한다. pane 배경/이웃
+  위젯은 변환 대상이 아니다. hit-test/IME 후보창/휠/드래그 스크롤은 표시 셀 좌표를 쓴다.
+  행 수는 표시 셀 높이로 계산하며 기존 3~200행 상한·resize debounce/fence/재시도·롤백
+  경로를 유지한다. backend/PTY/wire/storage는 변경하지 않는다.
+- Opus/high 병렬 구현·독립 리뷰에서 확인한 보강: TextShape 구간 변환이 원본 갤리를
+  매 프레임 깊이 복제하므로, text run마다 최근 배율의 축소 갤리 하나만 캐시한다. 캐시
+  text는 화면 좌표로 발행하고 실제 ShapeIdx만 구간 변환에서 제외한다. 원본은 불변이고
+  1배로 복귀하면 축소본을 버린다. 배율이 바뀌는 드래그 프레임의 복제 비용은 남는다.
+  좁힐수록 표시 행 수가 200까지 늘 수 있고 축소본 한 개의 메모리 비용이 추가된다.
+  FPS와 실제 가독성은 실측하지 않았다.
+- 테스트 먼저 확인한 실제 RED: 원래 크기 요청이 창 폭 300에서 **80→43열**로 변했다
+  (`layout-fit-red2.log`, 1 FAIL/0.02초). 복원 첫 snapshot 이전에도 추측한 폭이 예약됐다
+  (`layout-restore-red.log`, 1 FAIL/0.01초). 각각 재현한 뒤 구현을 수정했다.
+- 실패 기록: 첫 테스트가 삭제된 egui Context::run을 써 컴파일 실패했다. run_ui로 수정한
+  뒤의 실패만 제품 RED로 인정한다. 선택 rect 검사는 기존 두 경계 픽셀 반올림을 0.05pt로
+  비교해 첫 terminal 검사에서 85 PASS/1 FAIL/4 ignored였다. 반올림 최대 오차에 배율을
+  적용한 상한으로 오라클만 수정했다. 전용 layer도 GraphicLayers::drain에서 같은 text
+  복제를 하므로 캐시 문제의 해결책으로 채택하지 않았다.
+- 이전 구현 검증: terminal **86 PASS/4 ignored**, workspace **232 PASS**, fmt/diff-check
+  PASS, scoped clippy PASS(6m34초). 아래 최종 보강 소스 결과와 구분한다.
+- 최종 보강 terminal 검사: **87 PASS / 4 ignored**, 0.05초
+  (`layout-fit-terminal-final.log`). 같은 Context에서 축소 갤리 Arc 재사용, 실제 paint의
+  Arc 동일성, 한글 preedit 글자·IME 후보창·마지막 열·인접 shape 좌표를 검사했다.
+  전체 app --bin 검사도 **2109 PASS / 14 ignored**, 54.75초
+  (`layout-fit-app-final.log`). fmt/diff-check PASS. scoped clippy 진행 중. 독립 최종 리뷰는 F1/F3/F6 해결을 확인했다.
+  추가 N1을 실제 RED로 재현했다: **328×200 Resize 거부**, 1 FAIL/0.02초
+  (`layout-cap-red.log`). 기존 `TERMINAL_CELL_COUNT_MAX`를 공개/재수출하고 UI가 같은 값으로
+  rows를 제한한다. 상한 값과 runtime 검증 규칙은 바꾸지 않았다. 산술은 u32에서 min을
+  먼저 적용한 뒤 u16으로 바꿔 1열일 때 몫 65,536의 잘림을 피한다. 1/80/328/360/500열
+  실제 Resize 입장 검사가 회귀에 포함된다. 위 2109 PASS/clippy 4m26초는 N1 보강 전 결과.
+  N1 1차 app 재검사는 **2110 PASS/14 ignored**, 52.58초였다. 다만 이 컴파일 중
+  정수 변환 순서와 1열 경계 사례를 마지막으로 보강했으므로 최종 소스 검증으로 단정하지
+  않는다. 소스 해시를 저장한 뒤 `layout-final-app-verified.log`로 다시 검사해
+  **2110 PASS / 14 ignored**, 50.22초를 확인했다. 검사 전후 구현 4파일 해시 일치.
+  최종 clippy는 `-p terminal -p runtime -p deppy-sijo --all-targets -- -D warnings`로
+  공개 상수가 있는 runtime까지 포함해 **PASS**(1m35초,
+  `layout-final-clippy-verified.log`). fmt/diff-check PASS. 구현 4파일 해시 일치.
+- PR #147과 workspace/renderer/핸드오프의 merge-file 검사는 최종 코드에서도 충돌 0.
+  핸드오프를 맨 위에 넣었을 때만 IME 문서 삽입과 충돌해 현재처럼 리사이즈 절 뒤로
+  이동했다. 코드 이력 변경이나 실제 merge/rebase는 하지 않았다.
+- 사용자 지시대로 앱 재빌드·재실행·종료하지 않는다. 이 작업 중 실행 바이너리 mtime은
+  **08:18:40**, 앱 PID **16348**을 유지했다. 이전 세션의 넓은 cargo test가 그 시각에 앱을
+  갱신한 사실은 앞 절에 기록되어 있다. 검사 대상은 app `--bin deppy-sijo`, terminal
+  `--lib`로 제한한다. `cargo test --workspace`는 실행하지 않는다.
+- 남은 일: 검증된 변경 커밋·정상 push·별도 draft PR 생성, 인계 갱신. 실제 창 드래그·좁은 분할창·선택/검색/한글 후보창의 화면 확인은 재실행
+  승인 후 진행한다. 지금 화면 검증을 PASS로 표시하지 않는다.
+
+```sh
+cd /Users/jr/Desktop/projects/deppy-sijo-layout-20260906
+git status --short --branch
+git diff --stat
+rg -n '후속 진행 — 기존 출력' docs/CODEX_HANDOFF.md
+tail -n 20 /tmp/deppy-sijo-agents-20260906/layout-fit-app-final.log
+# 앱은 재빌드/재실행하지 않는다. Cargo 중복 실행은 직렬 래퍼로 막는다.
+/tmp/deppy-sijo-agents-20260906/cargo-serial clippy -p terminal -p runtime -p deppy-sijo --all-targets -- -D warnings
+```
+
 ## Fleet view: one list, top blocked item expanded in place (2026-09-05)
 
 - **The 작업(fleet) page no longer splits into a 「지금 처리」 hero column and a 「세션」

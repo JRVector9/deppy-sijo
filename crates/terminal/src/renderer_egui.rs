@@ -72,6 +72,89 @@ pub fn grid_width_for_available(available_width: f32) -> f32 {
     (available_width.max(0.0) - HORIZONTAL_PADDING * 2.0).max(0.0)
 }
 
+/// 보존된 `cols`를 pane 폭 안에 담기 위한 균일 축소 배율(0 < scale ≤ 1).
+///
+/// 리사이즈로 pane이 좁아져도 **기존 출력의 줄바꿈 형태를 그대로 유지**하려면 PTY를
+/// reflow시키지 않고 보존된 `snapshot.cols`를 그대로 그려야 한다. 그 폭이 pane보다 넓으면
+/// 지금까지는 우측 열이 clip으로 잘렸다 — 대신 그리드 전체를 이 배율로 균일 축소해
+/// 한 화면에 담는다. 폰트 크기는 건드리지 않으므로 행 갤리 캐시와 글리프 아틀라스가
+/// 그대로 재사용된다(`TerminalRenderCache`는 `font_size`로 무효화된다).
+///
+/// **1.0을 돌려주는 경우**: 축소가 필요 없거나(그리드가 이미 들어감), 배율을 정의할 수
+/// 없는 입력이다. 후자는 폭·셀 폭·`cols`가 0/음수/비유한이거나, 계산된 배율이 0으로
+/// 언더플로한 경우다. 0 배율은 역변환이 불가능해 clip 계산이 깨지므로, 그때는 1.0으로
+/// 두어 **기존 clip 경로**를 그대로 태운다.
+///
+/// 하한 clamp는 **의도적으로 없다** — 임의의 최소 배율에서 멈추면 그 아래에서 다시
+/// 우측 열이 잘려 "한 화면에 전부 보인다"는 요구가 깨진다.
+///
+/// 호출측(workspace)은 이 배율로 축소된 `cell.y`를 계산해 PTY 행 수를 정한다.
+pub fn fit_width_scale(available_width: f32, cell_width: f32, cols: u16) -> f32 {
+    if !available_width.is_finite() || !cell_width.is_finite() || cell_width <= 0.0 || cols == 0 {
+        return 1.0;
+    }
+    let grid_width = grid_width_for_available(available_width);
+    let needed = cell_width * cols as f32;
+    if grid_width <= 0.0 || !needed.is_finite() || needed <= 0.0 {
+        return 1.0;
+    }
+    let scale = grid_width / needed;
+    // NaN·0·언더플로는 역변환 불가 → 1.0(기존 clip 경로). 1 이상이면 축소하지 않는다.
+    if scale > 0.0 && scale < 1.0 {
+        scale
+    } else {
+        1.0
+    }
+}
+
+/// 축소 그리드의 좌표 변환 — `origin`을 고정점으로 하는 균일 스케일.
+/// `p ↦ origin + scale·(p − origin)` 이므로 translation은 `origin·(1 − scale)`이다.
+/// 고정점이 `content_rect.min`이라 좌측 내부 여백과 첫 열의 화면 위치가 그대로 유지된다.
+fn grid_fit_transform(origin: egui::Pos2, scale: f32) -> egui::emath::TSTransform {
+    egui::emath::TSTransform::new(origin.to_vec2() * (1.0 - scale), scale)
+}
+
+/// 이 painter가 쓰는 PaintList의 다음 shape 인덱스 — 나중에 변환할 구간의 경계다.
+fn next_shape_idx(painter: &egui::Painter) -> egui::layers::ShapeIdx {
+    painter
+        .ctx()
+        .graphics_mut(|graphics| graphics.entry(painter.layer_id()).next_idx())
+}
+
+/// 이미 발행한 shape 구간을 제자리 변환하되, `skip`에 적힌 인덱스는 건너뛴다
+/// (`PaintList::transform_range`).
+///
+/// 전용 레이어를 만들거나 부모/이웃 shape를 건드리지 않는다 — 구간 밖(터미널 배경 rect,
+/// 이웃 위젯)은 화면 좌표 그대로 남는다. `transform_range`는 각 shape의 `clip_rect`도
+/// 함께 변환하므로, 구간에 넣을 shape는 **역변환된 논리 clip**으로 발행해야 한다.
+///
+/// `skip`은 축소 갤리를 **이미 화면 좌표로** 그린 텍스트 shape다(`RowTextRun::scaled_galley`).
+/// 여기서 다시 변환하면 두 번 축소된다. 오직 그것만 빼며 preedit 같은 나머지 텍스트는
+/// 구간 안에 남는다 — 모든 Text를 빼면 조합 중 글자가 축소되지 않아 어긋난다.
+/// `skip`은 발행 순서대로 오름차순이라 사이 구간만 차례로 변환하면 되고, 그래픽 락은
+/// 한 번만 잡는다.
+fn transform_grid_shapes(
+    painter: &egui::Painter,
+    start: egui::layers::ShapeIdx,
+    end: egui::layers::ShapeIdx,
+    skip: &[egui::layers::ShapeIdx],
+    transform: egui::emath::TSTransform,
+) {
+    painter.ctx().graphics_mut(|graphics| {
+        let list = graphics.entry(painter.layer_id());
+        let mut range_start = start;
+        for skipped in skip {
+            if range_start.0 < skipped.0 {
+                list.transform_range(range_start, *skipped, transform);
+            }
+            range_start = egui::layers::ShapeIdx(skipped.0 + 1);
+        }
+        if range_start.0 < end.0 {
+            list.transform_range(range_start, end, transform);
+        }
+    });
+}
+
 /// pane 높이에서 만들 수 있는 PTY 행 수. 실제 가용 높이를 전부 행 계산에 사용하고,
 /// 남는 sub-cell 픽셀은 renderer가 터미널 배경으로 채운다.
 pub fn grid_rows_for_available(available_height: f32, cell_height: f32) -> u16 {
@@ -163,6 +246,44 @@ struct RowTextRun {
     col: usize,
     galley: Arc<egui::Galley>,
     color: egui::Color32,
+    /// 이 run의 **축소 갤리 하나**와 그것을 만든 배율(`f32::to_bits`).
+    ///
+    /// `TextShape::transform`은 `Arc::make_mut`으로 갤리를 깊은 복제한다
+    /// (epaint 0.35 `shapes/text_shape.rs:110-168`). 구간 변환에 그대로 맡기면 축소된
+    /// pane이 **idle일 때도 프레임마다 전 행을 복제**한다. 배율이 같으면 여기 보관한
+    /// 것을 Arc 클론으로 재사용한다.
+    ///
+    /// 보관은 run당 최대 1개다 — 배율이 바뀌면 교체되고, 축소가 없는 프레임(scale == 1)
+    /// 에서는 해제한다. 그래서 배율을 계속 바꿔도 무한히 쌓이지 않는다.
+    scaled: Option<(u32, Arc<egui::Galley>)>,
+}
+
+impl RowTextRun {
+    /// `scale` 배율의 축소 갤리 — 같은 배율이면 Arc 클론만 돌려준다(복제 없음).
+    ///
+    /// 원본 `self.galley`는 건드리지 않는다: `TextShape`에 **클론한 Arc**를 넣고
+    /// 변환하므로 `make_mut`이 사본을 만들고 원본 갤리와 행 캐시는 그대로다.
+    fn scaled_galley(&mut self, scale: f32) -> Arc<egui::Galley> {
+        let scale_bits = scale.to_bits();
+        if let Some((cached_bits, cached)) = &self.scaled
+            && *cached_bits == scale_bits
+        {
+            return Arc::clone(cached);
+        }
+        // 원점에서 크기만 줄인다 — 화면 위치는 그릴 때 transform.mul_pos로 준다.
+        // (원점 스케일 + 그때의 이동 = 구간 변환 전체를 적용한 것과 같은 기하다.)
+        let mut shape =
+            egui::epaint::TextShape::new(egui::Pos2::ZERO, Arc::clone(&self.galley), self.color);
+        shape.transform(egui::emath::TSTransform::from_scaling(scale));
+        let scaled = shape.galley;
+        self.scaled = Some((scale_bits, Arc::clone(&scaled)));
+        scaled
+    }
+
+    /// 축소 캐시를 버린다 — 비축소 프레임에서 쓰지 않는 사본을 들고 있지 않는다.
+    fn clear_scaled(&mut self) {
+        self.scaled = None;
+    }
 }
 
 /// bold 셀에 쓸 모노 굵은 폰트 패밀리 이름 (B-1). 앱(fonts.rs)이 같은 이름으로 등록한다.
@@ -357,11 +478,17 @@ pub fn draw(
     } else {
         cell.y * snapshot.rows as f32
     };
+    // 보존된 cols가 pane보다 넓으면 그리드만 균일 축소해 한 화면에 담는다(우측 열 잘림
+    // 방지). font_size·cell·font_id는 **원래 값 그대로** 두고 마지막에 shape 구간만
+    // 변환하므로 행 갤리 캐시와 글리프 아틀라스가 재사용된다.
+    let scale = fit_width_scale(avail.x, cell.x, snapshot.cols);
     // 그리드 폭은 셀 단위로 떨어지므로 pane 우측에 최대 한 셀만큼 남는다. 그 자리는
     // **호출부가** 작업면 색으로 미리 덮는다(pane 폭을 아는 쪽은 거기다) — 여기서
     // avail.x를 그대로 쓰면 무제한 ui에서 터미널이 화면 전체를 차지한다.
+    // 축소 배율이 곱해진 폭은 정의상 가용 폭을 넘지 않으므로, 축소가 정의되지 않는
+    // 경우(scale == 1)를 위해 기존 clamp를 그대로 남긴다.
     let size = egui::vec2(
-        ((cell.x * snapshot.cols as f32).min(grid_width_for_available(avail.x))
+        ((cell.x * snapshot.cols as f32 * scale).min(grid_width_for_available(avail.x))
             + HORIZONTAL_PADDING * 2.0)
             .min(avail.x.max(0.0)),
         render_height,
@@ -386,11 +513,33 @@ pub fn draw(
     }
     let background_painter = ui.painter_at(rect);
     let content_rect = terminal_content_rect(rect);
-    let painter = background_painter.with_clip_rect(content_rect);
+    // 두 painter는 **같은 레이어**를 쓴다(PaintList가 하나라 발행 순서가 그대로 유지된다).
+    // screen_painter: 화면 좌표 clip — 축소 갤리를 이미 줄여서 그리므로 변환 대상이 아니다.
+    // painter: 아래에서 논리(역변환) clip으로 바뀐다 — 나머지 그리드가 쓴다.
+    let screen_painter = background_painter.with_clip_rect(content_rect);
+    let mut painter = screen_painter.clone();
     let origin = content_rect.min;
+    // 그리드는 **축소 전 좌표**(원래 cell·origin)로 그린 뒤 이 변환으로 한 번에 줄인다.
+    // scale == 1이면 항등이라 아래 경로가 전부 기존 동작 그대로다.
+    let transform = grid_fit_transform(origin, scale);
+    if scale < 1.0 {
+        // transform_range는 shape의 clip_rect도 함께 변환한다. 화면에서 원하는 clip은
+        // 위 `content_rect ∩ 부모 clip`이므로, 변환 전에는 그 **역상**을 들고 있어야 한다.
+        // with_clip_rect는 부모 clip과 다시 교집합을 내 역상(축소의 역이라 더 넓은 rect)을
+        // 도로 깎아버리므로, 교집합 없이 세팅하는 set_clip_rect를 쓴다.
+        painter.set_clip_rect(transform.inverse().mul_rect(painter.clip_rect()));
+    }
     let default_bg = TERMINAL_SURFACE_BG;
     let selection = selection.and_then(|(a, b)| normalize_selection_range(snapshot, a, b));
+    // 터미널 배경은 pane 전체를 덮는 화면 좌표 rect다 — **변환 구간 밖**이어야 축소해도
+    // 우측/하단에 작업면이 아닌 앱 크롬이 비치지 않는다.
     background_painter.rect_filled(rect, 0.0, default_bg);
+    // 여기부터 발행하는 shape(배경 런·글자·선택·밑줄·커서·preedit)만 변환 대상이다.
+    // 축소할 때만 경계를 기록한다 — 비축소 경로에 그래픽 락을 추가하지 않는다.
+    let grid_shapes_start = (scale < 1.0).then(|| next_shape_idx(&painter));
+    // 이미 화면 좌표로 그린 축소 갤리들의 인덱스(발행 순서 오름차순). 축소할 때만
+    // 채우므로 비축소 경로에서는 할당이 일어나지 않는다(`Vec::new`는 힙을 잡지 않는다).
+    let mut scaled_text_shapes: Vec<egui::layers::ShapeIdx> = Vec::new();
 
     let dirty_fresh = cache.dirty_is_fresh(snapshot_gen);
     // line_height는 갤리 shaping에 영향을 주지 않는다(글자를 그리는 y 위치만 바뀐다) —
@@ -423,7 +572,12 @@ pub fn draw(
             }
         }
 
-        if let Some(row_cache) = cache.rows_cache.get(row).and_then(|cached| cached.as_ref()) {
+        // 행의 축소 갤리 캐시를 갱신해야 하므로 가변 참조로 받는다(원본 갤리는 불변).
+        if let Some(row_cache) = cache
+            .rows_cache
+            .get_mut(row)
+            .and_then(|cached| cached.as_mut())
+        {
             let row_y = row as f32 * cell.y;
             for bg in &row_cache.bg_runs {
                 let pos = origin + egui::vec2(bg.start_col as f32 * cell.x, row_y);
@@ -437,9 +591,26 @@ pub fn draw(
             }
             let selection_shapes =
                 paint_selection_row(&painter, snapshot, row, origin, cell, selection);
-            for run in &row_cache.text_runs {
+            for run in &mut row_cache.text_runs {
                 let pos = origin + egui::vec2(run.col as f32 * cell.x, row_y + text_dy);
-                painter.galley(pos, Arc::clone(&run.galley), run.color);
+                if scale < 1.0 {
+                    // 축소 갤리는 **화면 좌표로 직접** 그리고 아래 구간 변환에서 뺀다 —
+                    // 매 프레임 galley를 깊은 복제하지 않기 위해서다. 위치는 논리 좌표를
+                    // 변환한 값이라 나머지 그리드와 정확히 같은 화면 좌표에 놓인다.
+                    let scaled = run.scaled_galley(scale);
+                    // 빈 갤리는 painter.galley와 마찬가지로 아무것도 발행하지 않는다 —
+                    // 발행하지 않은 것을 skip 목록에 넣으면 인덱스가 밀린다.
+                    if !scaled.is_empty() {
+                        let idx = screen_painter.add(egui::Shape::Text(
+                            egui::epaint::TextShape::new(transform.mul_pos(pos), scaled, run.color),
+                        ));
+                        scaled_text_shapes.push(idx);
+                    }
+                } else {
+                    // 비축소 프레임에서는 원본 갤리를 그대로 쓰고 축소 사본을 버린다.
+                    run.clear_scaled();
+                    painter.galley(pos, Arc::clone(&run.galley), run.color);
+                }
             }
             // 밑줄·취소선은 셀 경계까지 이어 긋는다 — 글자 아래/한가운데.
             let text_top = origin.y + row_y + text_dy;
@@ -523,16 +694,36 @@ pub fn draw(
         }
         ui.ctx().output_mut(|o| {
             o.ime = Some(egui::output::IMEOutput {
+                // 터미널 영역은 이미 화면 좌표다(축소 대상이 아니다).
                 rect,
-                cursor_rect: egui::Rect::from_min_size(cursor_pos, cell),
+                // 커서 rect는 축소 전 좌표로 계산했으므로 후보창이 뜰 화면 좌표로 옮긴다 —
+                // shape가 아니라 output이라 transform_range가 닿지 않는다. scale == 1이면
+                // 항등이라 기존 값과 같다.
+                cursor_rect: transform.mul_rect(egui::Rect::from_min_size(cursor_pos, cell)),
                 should_interrupt_composition: false,
             });
         });
     }
 
+    // 그리드 shape 구간만 균일 축소한다. scale == 1이면 변환 자체를 건너뛰어 기존
+    // geometry(와 비용)를 그대로 둔다. 이미 축소해서 화면 좌표로 그린 글자 shape는
+    // 구간에서 빼고, preedit을 포함한 나머지는 그대로 변환한다.
+    if let Some(grid_shapes_start) = grid_shapes_start {
+        let grid_shapes_end = next_shape_idx(&painter);
+        transform_grid_shapes(
+            &painter,
+            grid_shapes_start,
+            grid_shapes_end,
+            &scaled_text_shapes,
+            transform,
+        );
+    }
+
     RenderOutput {
         response,
-        cell_size: cell,
+        // 호출측의 포인터→셀 변환·drop marker가 쓰는 값이라 **화면에 보이는** 셀 크기다.
+        cell_size: cell * scale,
+        // 변환의 고정점이라 축소해도 그대로다.
         origin,
         counters: cache.counters,
     }
@@ -618,6 +809,7 @@ fn build_row_cache(
                 col,
                 galley: layout_attr_text(painter, text, font_id, fg, attrs, bold_family_ready),
                 color: fg,
+                scaled: None,
             });
         } else {
             if pending.needs_flush(col, fg, attrs) {
@@ -682,6 +874,7 @@ impl PendingTextRun {
             col: self.start_col,
             galley: layout_attr_text(painter, text, font_id, color, attrs, bold_family_ready),
             color,
+            scaled: None,
         });
     }
 }
@@ -1774,5 +1967,423 @@ mod tests {
         // 선택이 이 행에 없으면 0
         let painted = paint_selection_row(&painter, &snapshot, 1, origin, cell, Some((0, 2)));
         assert_eq!(painted, 0);
+    }
+
+    // ---- 보존된 cols의 균일 축소(fit-width) ----
+
+    /// pane 폭을 직접 정해 draw한 결과 — 실제 호출측(workspace.rs)처럼 pane rect로
+    /// 자식 Ui를 만들어 그린다. 좌표계 회귀는 이 한 경로로만 본다.
+    struct PaneDraw {
+        rect: egui::Rect,
+        origin: egui::Pos2,
+        cell: egui::Vec2,
+        /// 축소 전(설정 그대로의) 셀 크기 — 배율 판정 기준.
+        base_cell: egui::Vec2,
+        ime_cursor_rect: Option<egui::Rect>,
+        rebuilt_rows: usize,
+        shapes: Vec<egui::epaint::ClippedShape>,
+    }
+
+    /// `marker`를 주면 draw **직전에 같은 레이어**로 표식 rect를 그린다 — 변환 구간이
+    /// 인접(부모) shape까지 삼키지 않는지 확인하는 용도다.
+    fn draw_in_pane(
+        ctx: &egui::Context,
+        cache: &mut TerminalRenderCache,
+        snapshot: &TerminalViewportSnapshot,
+        pane_width: f32,
+        generation: u64,
+        selection: Option<(usize, usize)>,
+        marker: Option<(egui::Rect, egui::Color32)>,
+    ) -> PaneDraw {
+        let mut measured = None;
+        let full = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.set_min_size(egui::vec2(900.0, 400.0));
+            if let Some((marker_rect, marker_color)) = marker {
+                ui.painter().rect_filled(marker_rect, 0.0, marker_color);
+            }
+            let pane =
+                egui::Rect::from_min_size(egui::pos2(20.0, 10.0), egui::vec2(pane_width, 200.0));
+            let mut pane_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(pane)
+                    .layout(egui::Layout::top_down(egui::Align::LEFT)),
+            );
+            let base_cell = cell_size(pane_ui.ctx(), m(13.0, 1.0));
+            let output = draw(
+                &mut pane_ui,
+                snapshot,
+                m(13.0, 1.0),
+                cache,
+                Some("한"),
+                true, // 조합 표시와 후보창 좌표까지 같은 프레임에서 확인한다
+                selection,
+                generation,
+            );
+            measured = Some((
+                output.response.rect,
+                output.origin,
+                output.cell_size,
+                base_cell,
+            ));
+        });
+        let (rect, origin, cell, base_cell) = measured.expect("terminal should be rendered");
+        PaneDraw {
+            rect,
+            origin,
+            cell,
+            base_cell,
+            ime_cursor_rect: full.platform_output.ime.map(|ime| ime.cursor_rect),
+            rebuilt_rows: cache.rebuilt_rows_last_frame(),
+            shapes: full.shapes,
+        }
+    }
+
+    fn first_rect_with_fill(
+        shapes: &[egui::epaint::ClippedShape],
+        fill: egui::Color32,
+    ) -> Option<egui::Rect> {
+        shapes.iter().find_map(|clipped| match &clipped.shape {
+            egui::Shape::Rect(rect_shape) if rect_shape.fill == fill => Some(rect_shape.rect),
+            _ => None,
+        })
+    }
+
+    /// 그려진 글자(갤리) shape들의 오른쪽 끝 — 마지막 열이 화면 안인지 보는 값이다.
+    fn max_text_right(shapes: &[egui::epaint::ClippedShape]) -> Option<f32> {
+        shapes
+            .iter()
+            .filter(|clipped| matches!(clipped.shape, egui::Shape::Text(_)))
+            .map(|clipped| clipped.shape.visual_bounding_rect().right())
+            .reduce(f32::max)
+    }
+
+    /// 배율이 정의되지 않는 입력은 전부 1.0 — 0 배율은 역변환이 불가능해 clip 계산이
+    /// 깨지므로 기존 clip 경로로 돌려보낸다. 반대로 **작은 양수는 하한 없이 그대로**
+    /// 쓴다(임의 최솟값에서 멈추면 그 아래에서 다시 우측 열이 잘린다).
+    #[test]
+    fn fit_width_scale은_가용폭을_맞추고_비정상_입력은_기존_clip을_유지한다() {
+        // 넉넉한 폭 — 축소 없음
+        assert_eq!(fit_width_scale(500.0, 8.0, 10), 1.0);
+        // 딱 맞는 폭도 축소하지 않는다(86 - 6 = 80 = 8 × 10)
+        assert_eq!(fit_width_scale(86.0, 8.0, 10), 1.0);
+        // 정의 불가 입력
+        for (width, cell, cols) in [
+            (0.0, 8.0, 10),
+            (HORIZONTAL_PADDING * 2.0, 8.0, 10), // 여백을 빼면 그리드 폭 0
+            (-100.0, 8.0, 10),
+            (f32::NAN, 8.0, 10),
+            (f32::INFINITY, 8.0, 10),
+            (100.0, 0.0, 10),
+            (100.0, -8.0, 10),
+            (100.0, f32::NAN, 10),
+            (100.0, f32::INFINITY, 10),
+            (100.0, 8.0, 0),
+        ] {
+            assert_eq!(
+                fit_width_scale(width, cell, cols),
+                1.0,
+                "width={width}, cell={cell}, cols={cols}"
+            );
+        }
+        // 실제 축소: (106 - 6) / (8 × 100) = 0.125
+        assert!((fit_width_scale(106.0, 8.0, 100) - 0.125).abs() < 1e-6);
+        // 아주 작은 양수도 하한으로 자르지 않는다: (6.5 - 6) / (8 × 500) = 0.000125
+        let tiny = fit_width_scale(6.5, 8.0, 500);
+        assert!(
+            tiny > 0.0 && (tiny - 0.000_125).abs() < 1e-9,
+            "임의 하한에서 clip하면 '한 화면에 전부' 요구가 깨진다: {tiny}"
+        );
+    }
+
+    /// 보존된 cols가 pane보다 넓을 때: 그리드만 균일 축소해 **마지막 열까지** 화면 폭
+    /// 안에 들어가야 하고, response/IME/RenderOutput이 모두 같은 화면 좌표여야 한다.
+    /// 터미널 배경 rect와 인접(먼저 그린) shape는 변환 대상이 아니다.
+    ///
+    /// 축소된 글자의 가독성은 이 검사가 판정하지 않는다(실제 화면 확인 대기).
+    #[test]
+    fn 좁은_pane은_그리드만_균일_축소해_마지막_열까지_화면_안에_그린다() {
+        let cols = 40u16;
+        let line = "M".repeat(cols as usize);
+        let mut snapshot = snap(cols, 2, &[&line, &line]);
+        snapshot.cursor.visible = true;
+        snapshot.cursor.col = 2;
+        snapshot.cursor.row = 1;
+        let selection = Some((cols as usize, cols as usize * 2 - 1)); // 둘째 행 전체
+        let marker_color = egui::Color32::from_rgb(0x11, 0x22, 0x33);
+        let marker_rect =
+            egui::Rect::from_min_size(egui::pos2(700.0, 300.0), egui::vec2(10.0, 10.0));
+
+        let mut cache = TerminalRenderCache::default();
+        let pane_width = 160.0;
+        let ctx = egui::Context::default();
+        let drawn = draw_in_pane(
+            &ctx,
+            &mut cache,
+            &snapshot,
+            pane_width,
+            next_gen(),
+            selection,
+            Some((marker_rect, marker_color)),
+        );
+
+        // 축소가 실제로 일어났고, 그리드 폭이 여백을 뺀 가용 폭에 정확히 맞는다.
+        assert!(
+            drawn.cell.x < drawn.base_cell.x,
+            "cols={cols}가 pane({pane_width})보다 넓은데 축소되지 않았다: {:?}",
+            drawn.cell
+        );
+        let grid_width = drawn.cell.x * cols as f32;
+        assert!(
+            (grid_width - grid_width_for_available(pane_width)).abs() < 0.05,
+            "그리드 폭 {grid_width}이 가용 폭 {}와 다르다",
+            grid_width_for_available(pane_width)
+        );
+        // 세로도 같은 배율(균일 변환) — 가로만 찌그러뜨리지 않는다.
+        let ratio_x = drawn.cell.x / drawn.base_cell.x;
+        let ratio_y = drawn.cell.y / drawn.base_cell.y;
+        assert!(
+            (ratio_x - ratio_y).abs() < 1e-4,
+            "가로/세로 배율이 다르다: {ratio_x} vs {ratio_y}"
+        );
+
+        // origin은 변환의 고정점 — 좌측 여백 3px가 그대로다.
+        assert!((drawn.origin.x - drawn.rect.left() - HORIZONTAL_PADDING).abs() < 0.01);
+        let content_right = drawn.rect.right() - HORIZONTAL_PADDING;
+        assert!(
+            drawn.origin.x + grid_width <= content_right + 0.05,
+            "마지막 열이 화면 밖이다: origin={:?}, grid_width={grid_width}, rect={:?}",
+            drawn.origin,
+            drawn.rect
+        );
+
+        // 실제로 발행된 글자 shape가 마지막 열까지 차 있어야 한다(잘라낸 게 아니다).
+        let text_right = max_text_right(&drawn.shapes).expect("글자 shape가 있어야 한다");
+        assert!(
+            text_right <= content_right + 0.1,
+            "글자가 화면 오른쪽을 넘었다: {text_right} > {content_right}"
+        );
+        assert!(
+            text_right >= content_right - drawn.cell.x * 1.5,
+            "마지막 열 글자가 빠졌다: {text_right}, content_right={content_right}"
+        );
+
+        // 선택 하이라이트도 같은 변환을 받는다(오버레이만 남는 어긋남 방지).
+        let selection_rect =
+            first_rect_with_fill(&drawn.shapes, egui::Color32::from_rgb(0x2d, 0x4f, 0x77))
+                .expect("선택 rect가 있어야 한다");
+        assert!(
+            selection_rect.right() <= content_right + 0.1
+                && selection_rect.right() >= content_right - drawn.cell.x * 1.5,
+            "선택 하이라이트가 축소된 그리드와 어긋났다: {selection_rect:?}"
+        );
+        // 선택 rect는 변환 전에 양쪽 경계를 물리 픽셀에 반올림한다. 높이 오차의
+        // 상한은 원본 1픽셀을 축소한 값이며, 셀 하나 이상 어긋나는 것은 허용하지 않는다.
+        let pixel_rounding_slack = ratio_y / ctx.pixels_per_point() + 0.01;
+        assert!(
+            (selection_rect.height() - drawn.cell.y).abs() <= pixel_rounding_slack,
+            "선택 rect 높이가 픽셀 반올림 오차를 넘었다: {selection_rect:?}, cell={:?}",
+            drawn.cell
+        );
+
+        // 원점이 아닌 커서로 이동·크기 변환을 함께 검사한다.
+        let ime_cursor = drawn.ime_cursor_rect.expect("IME 영역이 나와야 한다");
+        let cursor_screen = drawn.origin + egui::vec2(2.0 * drawn.cell.x, drawn.cell.y);
+        assert!(
+            (ime_cursor.min - cursor_screen).length() < 0.01,
+            "IME cursor_rect가 화면 셀 좌표와 어긋났다: {ime_cursor:?}, origin={:?}",
+            drawn.origin
+        );
+        assert!(
+            (ime_cursor.width() - drawn.cell.x).abs() < 0.01
+                && (ime_cursor.height() - drawn.cell.y).abs() < 0.01,
+            "IME cursor_rect가 축소된 셀 크기와 다르다: {ime_cursor:?}, cell={:?}",
+            drawn.cell
+        );
+
+        // 터미널 배경 rect는 화면 좌표 그대로(변환 구간 밖) — 축소되면 pane 우측에
+        // 앱 크롬이 비친다.
+        let background =
+            first_rect_with_fill(&drawn.shapes, TERMINAL_SURFACE_BG).expect("배경 rect");
+        assert!(
+            (background.width() - drawn.rect.width()).abs() < 0.01,
+            "배경 rect가 그리드와 함께 축소됐다: {background:?}, rect={:?}",
+            drawn.rect
+        );
+
+        // 먼저 그린 이웃 shape는 그대로 — 변환 구간이 부모/이웃을 삼키지 않았다.
+        let marker = first_rect_with_fill(&drawn.shapes, marker_color).expect("표식 rect");
+        assert!(
+            (marker.min - marker_rect.min).length() < 0.01
+                && (marker.width() - marker_rect.width()).abs() < 0.01,
+            "인접 shape가 함께 변환됐다: {marker:?} != {marker_rect:?}"
+        );
+    }
+
+    /// 폭만 바뀌는 리사이즈는 **행 갤리를 다시 shaping하지 않는다** — 축소를 font_size가
+    /// 아니라 shape 변환으로 하는 이유다(캐시 키는 font_size 그대로).
+    /// 축소가 필요 없는 pane에서는 기존 metrics와 완전히 같아야 한다.
+    #[test]
+    fn 폭_변화는_행_캐시를_무효화하지_않고_비축소_경로는_기존_metrics를_유지한다() {
+        let cols = 40u16;
+        let line = "M".repeat(cols as usize);
+        let snapshot = snap(cols, 2, &[&line, &line]); // dirty_ranges 없음
+
+        let mut cache = TerminalRenderCache::default();
+        let ctx = egui::Context::default();
+        let wide = draw_in_pane(&ctx, &mut cache, &snapshot, 600.0, next_gen(), None, None);
+        assert_eq!(wide.rebuilt_rows, 2, "첫 draw는 빈 캐시라 전 행을 만든다");
+        // 비축소 경로: 셀·원점이 기존과 동일하고 IME도 원래 셀 크기다.
+        assert_eq!(
+            wide.cell, wide.base_cell,
+            "넓은 pane에서 축소가 일어나면 안 된다"
+        );
+        assert!((wide.origin.x - wide.rect.left() - HORIZONTAL_PADDING).abs() < 0.01);
+        let wide_ime = wide.ime_cursor_rect.expect("IME 영역");
+        assert!(
+            (wide_ime.width() - wide.base_cell.x).abs() < 0.01,
+            "비축소 경로의 IME cursor_rect가 바뀌었다: {wide_ime:?}"
+        );
+
+        // 새 스냅샷 세대 + 좁아진 폭: 폭은 캐시 키가 아니므로 재-shaping이 0이어야 한다.
+        let narrow = draw_in_pane(&ctx, &mut cache, &snapshot, 160.0, next_gen(), None, None);
+        assert_eq!(
+            narrow.rebuilt_rows, 0,
+            "폭 변화가 행 갤리 캐시를 무효화했다 — 축소가 font_size를 건드렸다는 뜻이다"
+        );
+        assert!(
+            narrow.cell.x < wide.cell.x,
+            "좁아진 pane에서 축소되지 않았다: {:?}",
+            narrow.cell
+        );
+    }
+
+    /// 행 캐시의 첫 글자 run — 축소 갤리 보관 상태를 직접 본다.
+    fn first_text_run(cache: &TerminalRenderCache) -> &RowTextRun {
+        cache
+            .rows_cache
+            .iter()
+            .flatten()
+            .flat_map(|row| row.text_runs.iter())
+            .next()
+            .expect("행 캐시에 글자 run이 있어야 한다")
+    }
+
+    /// preedit 조합 상자의 배경 rect(불투명 0xd8d8d8) — 커서(알파 0xa0)와 구분된다.
+    fn preedit_box(shapes: &[egui::epaint::ClippedShape]) -> egui::Rect {
+        first_rect_with_fill(shapes, egui::Color32::from_rgb(0xd8, 0xd8, 0xd8))
+            .expect("preedit 배경 rect가 있어야 한다")
+    }
+
+    /// 축소는 `TextShape::transform`을 타는데, 이건 `Arc::make_mut`으로 갤리를 **깊은
+    /// 복제**한다(epaint 0.35 text_shape.rs:110-168). 구간 변환에 매 프레임 맡기면
+    /// 축소된 pane이 idle일 때도 전 행을 복제한다 — 같은 배율이면 run당 하나 보관한
+    /// 축소 갤리를 그대로 재사용해야 한다.
+    ///
+    /// `rows_rebuilt == 0`만으로는 복제 없음을 증명하지 못하므로(원본 shaping과 축소
+    /// 복제는 별개다) 보관한 Arc의 동일성(`ptr_eq`)을 직접 본다. 같은 Context에서
+    /// 넓게 → 좁게 → 같은 폭 → 다시 넓게 → 더 좁게 순으로 그린다.
+    ///
+    /// 프레임 시간은 여기서 재지 않는다(실측 없음).
+    #[test]
+    fn 같은_배율_재draw는_축소_갤리를_재사용하고_배율이_바뀌면_교체한다() {
+        let cols = 40u16;
+        let line = "M".repeat(cols as usize);
+        let snapshot = snap(cols, 2, &[&line, &line]);
+        let mut cache = TerminalRenderCache::default();
+        let ctx = egui::Context::default();
+
+        // 1) 넓은 pane(비축소): 축소 갤리를 만들지 않는다.
+        let wide = draw_in_pane(&ctx, &mut cache, &snapshot, 600.0, next_gen(), None, None);
+        assert_eq!(wide.cell, wide.base_cell, "넓은 pane은 축소하지 않는다");
+        assert!(
+            first_text_run(&cache).scaled.is_none(),
+            "비축소 경로가 축소 갤리를 만들었다"
+        );
+        let original = Arc::clone(&first_text_run(&cache).galley);
+        let original_rect = original.rect;
+        let wide_preedit = preedit_box(&wide.shapes);
+
+        // 2) 좁은 pane: 축소 갤리가 생기고 **원본 갤리는 그대로**다.
+        let narrow = draw_in_pane(&ctx, &mut cache, &snapshot, 160.0, next_gen(), None, None);
+        let (bits_a, scaled_a) = first_text_run(&cache)
+            .scaled
+            .clone()
+            .expect("축소 프레임이 축소 갤리를 보관해야 한다");
+        assert!(
+            Arc::ptr_eq(&first_text_run(&cache).galley, &original),
+            "원본 갤리 Arc가 교체됐다 — 제자리 변환이 캐시를 오염시켰다"
+        );
+        assert_eq!(
+            first_text_run(&cache).galley.rect,
+            original_rect,
+            "원본 갤리의 기하가 축소로 바뀌었다"
+        );
+        assert!(!Arc::ptr_eq(&scaled_a, &original));
+        assert!(
+            scaled_a.rect.width() < original_rect.width(),
+            "축소 갤리가 실제로 작아지지 않았다: {:?} vs {original_rect:?}",
+            scaled_a.rect
+        );
+        // preedit은 축소 갤리를 쓰지 않고 **구간 변환**을 그대로 탄다 — 축소 텍스트만
+        // 제외하고 나머지 Text를 빼지 않았는지 여기서 확인한다.
+        let ratio = narrow.cell.y / wide.cell.y;
+        let narrow_preedit = preedit_box(&narrow.shapes);
+        assert!(
+            (narrow_preedit.height() - wide_preedit.height() * ratio).abs() < 0.05,
+            "preedit이 구간 변환에서 빠졌다: {narrow_preedit:?} vs {wide_preedit:?} × {ratio}"
+        );
+
+        // 3) 같은 폭 재draw: 같은 Arc를 그대로 쓴다(복제 없음).
+        let again = draw_in_pane(&ctx, &mut cache, &snapshot, 160.0, next_gen(), None, None);
+        let (bits_b, scaled_b) = first_text_run(&cache).scaled.clone().expect("축소 갤리");
+        assert_eq!(bits_a, bits_b, "같은 폭인데 배율이 달라졌다");
+        assert!(
+            Arc::ptr_eq(&scaled_a, &scaled_b),
+            "같은 배율인데 축소 갤리를 다시 복제했다 (idle 프레임 낭비 회귀)"
+        );
+        assert_eq!(again.cell, narrow.cell);
+        assert!(Arc::ptr_eq(&first_text_run(&cache).galley, &original));
+        // 캐시에만 같은 Arc를 보관하고 실제 paint에서 다시 복제하는 회귀도 막는다.
+        assert!(
+            again.shapes.iter().any(|clipped| {
+                matches!(&clipped.shape, egui::Shape::Text(text)
+                if Arc::ptr_eq(&text.galley, &scaled_b))
+            }),
+            "화면에 발행한 글자가 축소 캐시를 그대로 사용해야 한다"
+        );
+        let preedit_height = |shapes: &[egui::epaint::ClippedShape]| {
+            shapes
+                .iter()
+                .find_map(|clipped| match &clipped.shape {
+                    egui::Shape::Text(text) if text.galley.job.text == "한" => {
+                        Some(text.galley.rect.height())
+                    }
+                    _ => None,
+                })
+                .expect("한글 조합 글자 shape가 있어야 한다")
+        };
+        assert!(
+            (preedit_height(&narrow.shapes) - preedit_height(&wide.shapes) * ratio).abs() < 0.05,
+            "조합 상자뿐 아니라 한글 글자도 같은 비율로 축소해야 한다"
+        );
+
+        // 4) 다시 넓은 pane: 배율이 1로 돌아가면 축소 캐시를 해제한다(보관 무한 증가 방지).
+        let back = draw_in_pane(&ctx, &mut cache, &snapshot, 600.0, next_gen(), None, None);
+        assert_eq!(back.cell, back.base_cell);
+        assert!(
+            first_text_run(&cache).scaled.is_none(),
+            "비축소로 돌아온 뒤에도 축소 갤리가 남았다"
+        );
+
+        // 5) 다른 배율: 보관은 run당 하나라 교체된다.
+        let narrower = draw_in_pane(&ctx, &mut cache, &snapshot, 120.0, next_gen(), None, None);
+        let (bits_c, scaled_c) = first_text_run(&cache).scaled.clone().expect("축소 갤리");
+        assert_ne!(bits_c, bits_a, "배율이 달라졌는데 이전 축소 갤리를 썼다");
+        assert!(!Arc::ptr_eq(&scaled_c, &scaled_a));
+        assert!(
+            narrower.cell.x < narrow.cell.x,
+            "더 좁은 pane인데 배율이 커졌다: {:?}",
+            narrower.cell
+        );
     }
 }

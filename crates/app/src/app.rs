@@ -4075,6 +4075,25 @@ fn reconcile_and_migrate_startup_secrets(
     Ok(())
 }
 
+/// Best-effort startup repair must never make the whole application depend on an interactive
+/// system keychain dialog. The runtime remains fail-closed when reconciliation did not converge:
+/// legacy logical pointers are rejected by `AppRuntimeSecretResolver`, and incomplete physical
+/// slots retain their durable ledger rows for a later retry.
+fn reconcile_startup_secrets_best_effort(db: &Db, store: &dyn secret::SecretStore) -> bool {
+    match reconcile_and_migrate_startup_secrets(db, store) {
+        Ok(()) => true,
+        Err(_) => {
+            tracing::warn!(
+                kind = "secret_store",
+                phase = "startup_reconciliation",
+                error_code = "keychain_unavailable",
+                "startup secret reconciliation deferred"
+            );
+            false
+        }
+    }
+}
+
 fn execute_settings_job(
     db: &mut Db,
     db_path: &std::path::Path,
@@ -7873,6 +7892,73 @@ struct WebRemoteState {
     token: String,
 }
 
+/// Relay에서 복호화된 프레임을 받아 공유 코어로 넘기는 싱크.
+///
+/// **모든 명령이 권한 어댑터를 먼저 지난다.** 브라우저에서 버튼을 숨기는 것은 강제가 아니고,
+/// 위조된 메시지는 UI를 거치지 않기 때문이다. 1차 릴리스의 기기는 view-only이므로 입력·키·
+/// 스크롤·전환·승인·업로드는 전부 거부되며, 거부가 상한을 넘으면 채널을 닫는다.
+///
+/// Relay 자격증명은 protocol-v3 `auth`나 loopback 라우터로 넘어가지 않는다 — 어댑터가
+/// `auth` 프레임 자체를 이 전송에서 거부한다.
+struct RelayDashboardSink {
+    core: Arc<web_remote::session_core::SessionCore>,
+    permissions: web_remote::relay_client::RelayMessageAdapter,
+}
+
+impl RelayDashboardSink {
+    fn new(core: Arc<web_remote::session_core::SessionCore>) -> Self {
+        Self {
+            core,
+            // 1차 릴리스는 고정 view-only다. 입력·승인·업로드는 휴면 상태의 미래 권한이다.
+            permissions: web_remote::relay_client::RelayMessageAdapter::new(
+                web_remote::relay::contract::RelayPermissions::default(),
+            ),
+        }
+    }
+}
+
+impl web_remote::relay_client::RelayFrameSink for RelayDashboardSink {
+    fn accept(&mut self, frame: &[u8]) -> web_remote::relay_client::SinkOutcome {
+        let Ok(text) = std::str::from_utf8(frame) else {
+            return web_remote::relay_client::SinkOutcome::Continue;
+        };
+        let Some(message) = web_remote::protocol::ClientMsg::parse(text) else {
+            return web_remote::relay_client::SinkOutcome::Continue;
+        };
+        match self.permissions.admit(message) {
+            web_remote::relay_client::RelayAdmission::Allow(message) => {
+                // 허용된 것만 코어로 넘어간다. 현재 view-only 집합은 시청 제어뿐이다.
+                match message {
+                    web_remote::protocol::ClientMsg::Watch { session } => {
+                        self.core.dashboard().rebind_watch(None, Some(&session));
+                    }
+                    web_remote::protocol::ClientMsg::Unwatch => {
+                        self.core.dashboard().rebind_watch(None, None);
+                    }
+                    _ => {}
+                }
+                web_remote::relay_client::SinkOutcome::Continue
+            }
+            web_remote::relay_client::RelayAdmission::AllowUpload => {
+                web_remote::relay_client::SinkOutcome::Continue
+            }
+            web_remote::relay_client::RelayAdmission::Denied(reason) => {
+                tracing::debug!(?reason, "Relay 명령 거부");
+                web_remote::relay_client::SinkOutcome::Continue
+            }
+            web_remote::relay_client::RelayAdmission::CloseChannel(reason) => {
+                tracing::warn!(?reason, "Relay 위반 상한 초과 — 채널을 닫는다");
+                // 로그만 남기고 계속 받으면 상한이 아무것도 강제하지 못한다.
+                web_remote::relay_client::SinkOutcome::CloseChannel
+            }
+        }
+    }
+
+    fn session_ended(&mut self) {
+        self.core.dashboard().rebind_watch(None, None);
+    }
+}
+
 /// Optional web-remote persistence adapter. The concrete SQLite handle is constructed only from
 /// the composition root and shared by dashboard/push through the storage-neutral port. Each
 /// method releases the mutex before the caller performs network I/O.
@@ -8726,6 +8812,19 @@ pub struct App {
     web: Option<WebRemoteState>,
     /// 웹서버 시작/토큰 재발급 실패 시 settings에 표시할 에러.
     web_error: Option<String>,
+    /// 두 전송(loopback/Tailscale, Relay)이 공유하는 전송 중립 대시보드 코어.
+    ///
+    /// 어느 한쪽이라도 켜져 있을 때만 존재한다 — 둘 다 OFF면 브리지 스레드도 없다.
+    /// **소유자는 앱**이므로 한 전송을 꺼도 다른 전송의 코어가 죽지 않는다.
+    session_core: Option<Arc<web_remote::session_core::SessionCore>>,
+    /// Relay 클라이언트 워커 (켜져 있을 때만 Some). OFF면 스레드도 소켓도 없다.
+    relay_worker: Option<web_remote::relay_client::RelayWorker>,
+    /// Relay 시작 실패 시 settings에 표시할 에러. `web_error`와 **별개**다 — 한 전송의
+    /// 실패가 다른 전송의 표시를 덮어쓰면 사용자가 무엇이 꺼졌는지 알 수 없다.
+    ///
+    /// 읽는 쪽(설정 화면)은 계획 Task 5가 붙인다. 지금은 쓰기만 한다.
+    #[allow(dead_code)]
+    relay_error: Option<String>,
     /// settings의 접속 URL 표시(reveal) 토글 — URL에 페어링 토큰이 실리므로 기본 마스킹.
     web_reveal_url: bool,
     /// 접속 URL QR 텍스처 캐시 — URL이 바뀔 때만 재생성, 설정창 닫으면 반환.
@@ -12655,10 +12754,11 @@ impl App {
         }
         let redaction = secret::RedactionService::new();
         let i18n = load_catalog(&config.i18n.locale);
-        // Complete crash reconciliation and one-time logical→physical migration before any
-        // runtime, dotenv, Connector, or settings worker can resolve a credential.
-        reconcile_and_migrate_startup_secrets(&db, &KeyringSecretStore)
-            .expect("physical secret startup reconciliation failed");
+        // Try crash reconciliation and one-time logical→physical migration before any runtime,
+        // dotenv, Connector, or settings worker can resolve a credential. A locked or foreign-ACL
+        // login keychain must not open a password dialog or abort the app; unresolved legacy
+        // pointers remain fail-closed and the durable ledger preserves exact retry state.
+        reconcile_startup_secrets_best_effort(&db, &KeyringSecretStore);
         let pending_approval_owner = Arc::new(
             db.acquire_pending_approval_owner()
                 .expect("pending approval owner acquire failed"),
@@ -13187,6 +13287,9 @@ impl App {
             remote_reveal_token: false,
             web: None,
             web_error: None,
+            session_core: None,
+            relay_worker: None,
+            relay_error: None,
             web_reveal_url: false,
             web_qr: None,
             worktree_rx: None,
@@ -13237,6 +13340,11 @@ impl App {
                     app.web_error = Some(format!("{e:#}"));
                 }
             }
+        }
+        // Relay 자동 시작 — web과 **독립**이다. 한쪽이 실패해도 다른 쪽은 그대로 간다.
+        // 프로덕션 엔드포인트가 아직 배정되지 않아 현재는 Relay 범위 오류로만 끝난다.
+        if app.config.relay.enabled {
+            app.relay_enable();
         }
         app
     }
@@ -17373,7 +17481,7 @@ impl App {
     /// 모바일 웹(PWA) 서버 기동 (mobile-pwa v3.3 P1): keyring 페어링 토큰 로드/생성 →
     /// 127.0.0.1 평문 bind(serve 모드 — HTTPS 종단은 tailscale serve 몫).
     /// cert 모드(자체 TLS + 비-loopback)는 후속 — config에 자리만 있다.
-    fn start_web(&self) -> anyhow::Result<WebRemoteState> {
+    fn start_web(&mut self) -> anyhow::Result<WebRemoteState> {
         let token = web_remote::pairing::get_or_create_token(&self.secret_store)?;
         // 웹푸시(P4) VAPID 키 — keyring에서 get_or_create(SecretStore 접근이 app 소유). 개인키는
         // keyring에만, 공개키만 서버가 JS에 노출한다. 실패하면 푸시만 비활성(대시보드는 유지).
@@ -17386,23 +17494,38 @@ impl App {
         };
         let addr =
             std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, self.config.web.port));
-        let hostname = self.config.web.ts_hostname.trim();
+        // 소유 문자열로 떼어 둔다 — 아래에서 공유 코어를 확보할 때 `&mut self`가 필요하다.
+        let hostname = self.config.web.ts_hostname.trim().to_owned();
         let repository: Arc<dyn web_remote::repository::WebRemoteRepository> =
             Arc::new(AppWebRemoteRepository::open(&self.db_path)?);
-        let server = web_remote::WebRemoteServer::serve(
+        // 코어는 **앱이 소유**하고 두 전송이 공유한다. 서버가 자기 코어를 만들면 Relay만
+        // 켜는 배치가 불가능해지고, 서버를 끄는 것만으로 Relay 쪽 대시보드가 죽는다.
+        // 웹푸시 발송기도 코어가 소유한다 — 같은 이유다.
+        let core = self.shared_session_core(Some(Arc::clone(&repository)), vapid);
+        let server = match web_remote::WebRemoteServer::serve_with_core(
             addr,
             web_remote::ServeOptions {
                 token: token.clone(),
-                allowed_host: (!hostname.is_empty()).then(|| hostname.to_owned()),
+                allowed_host: (!hostname.is_empty()).then_some(hostname),
                 // app-owned adapter 한 개를 Dashboard와 Push가 공유한다. web-remote는
                 // concrete Db를 생성하거나 storage row를 contract에 노출하지 않는다.
                 repository: Some(repository),
-                vapid,
+                // VAPID 키는 코어에 넘겼다. 서버에도 주면 발송기 소유권이 둘로 갈린다.
+                vapid: None,
                 // 모바일 파일 첨부(P6d) — 세션에 묶이지 않는 평면 디렉터리라 workspace별
                 // logs_root가 아닌 logs_base 바로 아래에 둔다(remote/ 분리와 같은 이유).
                 uploads_dir: Some(self.logs_base.join("uploads")),
             },
-        )?;
+            core,
+        ) {
+            Ok(server) => server,
+            Err(error) => {
+                // bind 실패로 web이 서지 않았다. 방금 붙인 발송기를 떼고, Relay도 꺼져
+                // 있으면 코어까지 놓아준다 — 둘 다 OFF인데 스레드만 남으면 안 된다.
+                self.web_transport_stopped();
+                return Err(error);
+            }
+        };
         // 활성 workspace worker 이벤트를 대시보드에 붙인다(P2). wake 클로저는 egui 프레임과
         // 무관하게 브리지 스레드를 깨운다(§14.1 Warm 알림 유지) — 창이 숨겨져도 상태가 흐른다.
         // 워크스페이스 전환 시엔 rebind_web_dashboard가 새 worker로 재구독한다.
@@ -17438,6 +17561,110 @@ impl App {
             switch_ctx.request_repaint();
         }));
         Ok(WebRemoteState { server, token })
+    }
+
+    /// 두 전송이 공유하는 코어를 확보한다. 이미 있으면 그대로 쓴다 — 한 전송을 켰다고
+    /// 다른 전송의 코어를 갈아 끼우면 그 전송의 대시보드가 끊긴다.
+    fn shared_session_core(
+        &mut self,
+        repository: Option<Arc<dyn web_remote::repository::WebRemoteRepository>>,
+        vapid: Option<web_remote::push::VapidKey>,
+    ) -> Arc<web_remote::session_core::SessionCore> {
+        if let Some(core) = &self.session_core {
+            // Relay를 먼저 켜면 코어가 VAPID 키 없이 만들어진다. 그 뒤 web을 켜는 경우를
+            // 위해 여기서 발송기를 보정한다 — 없으면 키가 있는데도 푸시가 영영 꺼진다.
+            core.ensure_push(repository, vapid);
+            return Arc::clone(core);
+        }
+        let core = web_remote::session_core::SessionCore::spawn_with_push(repository, vapid);
+        self.session_core = Some(Arc::clone(&core));
+        core
+    }
+
+    /// web 전송이 내려갔다. 웹푸시는 **web 전송의 수명에 묶이므로** 코어가 Relay 때문에
+    /// 살아남더라도 발송기는 함께 멈춘다 — 그러지 않으면 사용자가 모바일 웹을 껐는데도
+    /// 폰으로 알림이 계속 간다. 그 뒤 두 전송이 모두 꺼졌으면 코어까지 놓아준다.
+    fn web_transport_stopped(&mut self) {
+        if let Some(core) = &self.session_core {
+            core.stop_push();
+        }
+        self.release_session_core_if_idle();
+    }
+
+    /// 두 전송이 모두 꺼져 있으면 코어를 놓아준다. OFF면 브리지 스레드도 0이어야 한다.
+    fn release_session_core_if_idle(&mut self) {
+        if self.web.is_some() || self.relay_worker.is_some() {
+            return;
+        }
+        if let Some(core) = self.session_core.take() {
+            core.shutdown();
+        }
+    }
+
+    /// Relay를 켠다. Tailscale/loopback 경로는 **전혀 건드리지 않는다** — 서버도, 토큰도,
+    /// Host 허용 목록도, 리스너도 그대로다.
+    ///
+    /// 엔드포인트 정책은 워커를 띄우기 **전에** 검사한다. 프로덕션 좌표가 아직 배정되지
+    /// 않았으므로(`deploy/relay/README.md`의 BLOCKED 상태표) 현재는 여기서 실패하며, 그
+    /// 실패는 Relay 범위로만 표시된다.
+    fn relay_enable(&mut self) {
+        let endpoint = match web_remote::relay_client::RelayEndpoint::production() {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                tracing::warn!("Relay 시작 불가: {error}");
+                self.relay_error = Some(format!("{error}"));
+                return;
+            }
+        };
+        let repository: Arc<dyn web_remote::repository::WebRemoteRepository> =
+            match AppWebRemoteRepository::open(&self.db_path) {
+                Ok(repository) => Arc::new(repository),
+                Err(error) => {
+                    tracing::warn!("Relay 저장소 열기 실패: {error:#}");
+                    self.relay_error = Some(format!("{error:#}"));
+                    return;
+                }
+            };
+        // 코어는 web과 공유한다. web이 이미 켜져 있으면 그 코어를 그대로 쓴다.
+        let core = self.shared_session_core(Some(repository), None);
+        let worker = web_remote::relay_client::RelayWorker::spawn(
+            endpoint,
+            Box::new(web_remote::relay_client::TlsRelayTransport),
+            Box::new(RelayDashboardSink::new(Arc::clone(&core))),
+            Arc::new(web_remote::relay_client::worker::IgnoreObserver),
+            web_remote::relay_client::RelayDeadlines::default(),
+            web_remote::relay_client::BackoffPolicy::default(),
+        );
+        worker.enable();
+        self.relay_worker = Some(worker);
+        self.relay_error = None;
+        self.config.relay.enabled = true;
+        if let Err(error) = self.config.save(&self.config_path) {
+            tracing::warn!("config 저장 실패: {error:#}");
+            self.relay_error = Some(format!(
+                "Relay는 켰지만 설정 저장 실패 — 다음 실행엔 자동시작 안 됨: {error:#}"
+            ));
+        }
+    }
+
+    /// Relay를 끈다. Tailscale 서버·토큰·리스너에는 손대지 않는다.
+    ///
+    /// 호출부(설정 화면의 Relay 스위치)는 계획 Task 5가 붙인다. 종료 경로는 워커를 직접
+    /// 정지하므로 이 함수에 의존하지 않는다.
+    #[allow(dead_code)]
+    fn relay_disable(&mut self) {
+        if let Some(mut worker) = self.relay_worker.take() {
+            worker.shutdown();
+        }
+        self.relay_error = None;
+        self.release_session_core_if_idle();
+        self.config.relay.enabled = false;
+        if let Err(error) = self.config.save(&self.config_path) {
+            tracing::warn!("config 저장 실패: {error:#}");
+            self.relay_error = Some(format!(
+                "Relay는 껐지만 설정 저장 실패 — 다음 실행에 다시 켜질 수 있습니다: {error:#}"
+            ));
+        }
     }
 
     /// 워크스페이스 전환 시 웹 대시보드를 새 활성 worker에 재구독시킨다 — 옛 receiver는
@@ -17633,6 +17860,9 @@ impl App {
         if let Some(state) = self.web.take() {
             state.server.shutdown();
         }
+        // Relay가 아직 켜져 있으면 코어는 그대로 둔다 — 한 전송을 끄는 것이 다른 전송의
+        // 대시보드를 죽이면 안 된다. 다만 웹푸시는 web 전송의 것이므로 함께 멈춘다.
+        self.web_transport_stopped();
         self.web_error = None;
         self.serve_state = None; // 서버가 없으면 진단은 의미 없다
         self.config.web.enabled = false;
@@ -25825,6 +26055,14 @@ impl App {
         if let Some(state) = self.web.take() {
             state.server.shutdown();
         }
+        // Relay 워커도 같은 이유로 runtime보다 먼저 정지·join한다.
+        if let Some(mut worker) = self.relay_worker.take() {
+            worker.shutdown();
+        }
+        // 두 전송이 모두 멈춘 뒤에야 공유 코어를 정리한다.
+        if let Some(core) = self.session_core.take() {
+            core.shutdown();
+        }
         // remote TLS 서버를 먼저 정지 — accept 루프·접속·전용 worker(그 세션들 reap)를 정리한다.
         if let Some(state) = self.remote.take() {
             state.server.shutdown();
@@ -31277,6 +31515,162 @@ fn pty_shortcut_missing_feedback(
 
 #[cfg(test)]
 mod tests {
+    /// Relay는 loopback/Tailscale 경로와 **완전히 독립**이다. 프로덕션 엔드포인트가 아직
+    /// 배정되지 않았으므로 Relay 시작은 지금 실패하는 것이 정상인데, 그 실패가 web 서버·
+    /// 토큰·Host 허용 목록·리스너 중 무엇도 건드리면 안 된다.
+    #[test]
+    fn relay_시작_실패는_relay_범위로만_보고된다() {
+        let error = web_remote::relay_client::RelayEndpoint::production()
+            .expect_err("프로덕션 좌표는 아직 배정되지 않았다");
+        assert_eq!(error, web_remote::relay_client::EndpointError::NotAssigned);
+        // 실패 메시지가 왜 막혔는지 가리켜야 한다 — 그래야 BLOCKED가 버그로 오인되지 않는다.
+        let rendered = format!("{error}");
+        assert!(rendered.contains("BLOCKED"), "{rendered}");
+    }
+
+    /// 두 전송의 시작 경로가 서로의 상태를 건드리지 않는다는 것을 소스로 고정한다.
+    /// `relay_enable`은 web 서버·토큰·Host 허용 목록·리스너를 이름조차 대지 않아야 한다.
+    #[test]
+    fn relay_시작_경로는_tailscale_상태를_건드리지_않는다() {
+        let source = include_str!("app.rs");
+        let body = source
+            .split_once("    fn relay_enable(&mut self) {")
+            .expect("relay_enable")
+            .1
+            .split_once("\n    /// Relay를 끈다")
+            .expect("relay_enable 끝")
+            .0;
+        for forbidden in [
+            "self.web",
+            "start_web",
+            "WebRemoteServer",
+            "pairing::",
+            "rotate_token",
+            "ts_hostname",
+            "allowed_host",
+            "serve_state",
+            "web_error",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "relay_enable이 {forbidden}를 건드린다"
+            );
+        }
+        // 반대 방향도 마찬가지다 — web 끄기는 Relay 워커를 멈추지 않는다.
+        let disable = source
+            .split_once("    fn web_disable(&mut self) {")
+            .expect("web_disable")
+            .1
+            .split_once("\n    /// ")
+            .expect("web_disable 끝")
+            .0;
+        assert!(
+            !disable.contains("relay_worker.take()"),
+            "web을 끄는 것이 Relay 워커를 멈추면 안 된다"
+        );
+        assert!(
+            disable.contains("web_transport_stopped"),
+            "web을 끄면 웹푸시를 함께 멈추고, 두 전송이 모두 꺼진 뒤에만 코어를 놓아준다"
+        );
+    }
+
+    /// bind 실패로 web이 서지 못하면 방금 만든 공유 코어를 그대로 두면 안 된다 —
+    /// 둘 다 OFF인데 브리지 스레드만 남는다.
+    #[test]
+    fn web_시작_실패는_공유_코어를_남기지_않는다() {
+        let source = include_str!("app.rs");
+        let body = source
+            .split_once("    fn start_web(&mut self) -> anyhow::Result<WebRemoteState> {")
+            .expect("start_web")
+            .1
+            .split_once("\n    /// ")
+            .expect("start_web 끝")
+            .0;
+        let failure = body
+            .find("Err(error) => {")
+            .expect("bind 실패 경로가 있어야 한다");
+        let release = body
+            .find("self.web_transport_stopped();")
+            .expect("실패 시 발송기를 떼고 코어를 놓아줘야 한다");
+        assert!(failure < release, "실패 분기 안에서 코어를 놓아줘야 한다");
+    }
+
+    /// 웹푸시는 web 전송의 수명에 묶인다. Relay 때문에 코어가 살아남아도, web이 내려가면
+    /// 발송기는 멈춰야 한다 — 안 그러면 모바일 웹을 껐는데 폰으로 알림이 계속 간다.
+    #[test]
+    fn 웹푸시는_web_전송이_내려가면_함께_멈춘다() {
+        let source = include_str!("app.rs");
+        let body = source
+            .split_once("    fn web_transport_stopped(&mut self) {")
+            .expect("web_transport_stopped")
+            .1
+            .split_once("\n    /// ")
+            .expect("함수 끝")
+            .0;
+        let stop = body.find("core.stop_push()").expect("발송기 정지");
+        let release = body
+            .find("release_session_core_if_idle()")
+            .expect("코어 해제 판정");
+        assert!(stop < release, "코어를 놓아주기 전에 발송기를 떼야 한다");
+    }
+
+    /// Relay를 먼저 켜고 나중에 web을 켜도 웹푸시가 살아나야 한다.
+    #[test]
+    fn relay_먼저_켠_뒤_web을_켜도_웹푸시가_보정된다() {
+        let source = include_str!("app.rs");
+        let body = source
+            .split_once("    fn shared_session_core(")
+            .expect("shared_session_core")
+            .1
+            .split_once("\n    /// ")
+            .expect("함수 끝")
+            .0;
+        let reuse = body
+            .find("if let Some(core) = &self.session_core")
+            .expect("재사용 분기");
+        let ensure = body.find("core.ensure_push(").expect("발송기 보정");
+        assert!(
+            reuse < ensure,
+            "기존 코어를 재사용할 때 발송기를 보정해야 한다"
+        );
+    }
+
+    /// 위반 상한을 넘으면 로그만 남기는 것이 아니라 실제로 채널을 닫아야 한다.
+    #[test]
+    fn relay_위반_상한_초과는_채널을_실제로_닫는다() {
+        let source = include_str!("app.rs");
+        let body = source
+            .split_once("impl web_remote::relay_client::RelayFrameSink for RelayDashboardSink {")
+            .expect("RelayFrameSink impl")
+            .1;
+        let close_arm = body
+            .find("RelayAdmission::CloseChannel(reason)")
+            .expect("CloseChannel 분기");
+        let outcome = body[close_arm..]
+            .find("SinkOutcome::CloseChannel")
+            .expect("닫기 신호를 워커로 돌려줘야 한다");
+        assert!(
+            outcome < 400,
+            "CloseChannel 분기가 닫기 신호를 돌려주지 않는다"
+        );
+    }
+
+    /// 공유 코어는 두 전송 중 하나라도 켜져 있으면 살아 있어야 한다.
+    #[test]
+    fn 공유_코어는_두_전송이_모두_꺼진_뒤에만_정리된다() {
+        let source = include_str!("app.rs");
+        let body = source
+            .split_once("    fn release_session_core_if_idle(&mut self) {")
+            .expect("release_session_core_if_idle")
+            .1
+            .split_once("\n    }")
+            .expect("함수 끝")
+            .0;
+        assert!(
+            body.contains("self.web.is_some() || self.relay_worker.is_some()"),
+            "어느 한쪽이라도 켜져 있으면 코어를 놓아주면 안 된다"
+        );
+    }
     use super::*;
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
@@ -39454,6 +39848,36 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+
+        drop(db);
+        remove_sqlite_files(&path);
+    }
+
+    #[test]
+    fn startup_keychain_access_failure는_app_bootstrap을_중단하지_않는다() {
+        let path = temp_db_path("startup-secret-keychain-denied");
+        let db = storage::Db::open(&path).unwrap();
+        let store = MemSecretStore::new();
+        let logical_id = uuid::Uuid::new_v4().to_string();
+        db.insert_credential(&storage::CredentialMeta {
+            id: logical_id.clone(),
+            provider: "legacy".to_owned(),
+            label: "denied".to_owned(),
+            credential_kind: "api_key".to_owned(),
+            masked_hint: None,
+            workspace_id: None,
+        })
+        .unwrap();
+
+        assert!(!reconcile_startup_secrets_best_effort(&db, &store));
+        assert_eq!(
+            db.credential_secret_location(&logical_id)
+                .unwrap()
+                .unwrap()
+                .keyring_username,
+            logical_id,
+            "failed migration must remain fail-closed at the legacy pointer"
         );
 
         drop(db);

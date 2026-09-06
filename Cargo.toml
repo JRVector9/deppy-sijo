@@ -17,6 +17,8 @@ members = [
     "crates/mux",
     "crates/persist",
     "crates/pty",
+    "crates/relay-protocol",
+    "crates/relay-server",
     "crates/runtime",
     "crates/secret",
     "crates/session",

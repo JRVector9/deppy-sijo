@@ -32,7 +32,10 @@ pub mod http;
 pub mod pairing;
 pub mod protocol;
 pub mod push;
+pub mod relay;
+pub mod relay_client;
 pub mod repository;
+pub mod session_core;
 pub mod static_srv;
 pub mod upload;
 pub mod ws_api;
@@ -115,12 +118,11 @@ pub struct WebRemoteServer {
     stop: Arc<AtomicBool>,
     accept_thread: Option<JoinHandle<()>>,
     connections: Arc<ConnSet>,
-    /// WS 대시보드 브리지 핸들(app이 runtime 구독을 붙이는 데 쓴다).
-    dashboard: dashboard::DashboardHandle,
-    /// 브리지 스레드 join 대상 — shutdown 시 stop 후 join한다.
-    dashboard_thread: Option<JoinHandle<()>>,
-    /// 웹푸시 발송 매니저(P4) — 전용 스레드 소유. shutdown 시 stop+join. 비활성 시 None.
-    push: Option<push::PushManager>,
+    /// 전송 중립 대시보드 코어. 서버가 만들었을 수도, 앱이 만들어 공유했을 수도 있다.
+    core: Arc<session_core::SessionCore>,
+    /// 이 코어를 이 서버가 만들었는가. 공유받은 코어는 서버가 멈추지 않는다 —
+    /// 그러지 않으면 Tailscale을 끄는 것만으로 Relay의 대시보드까지 죽는다.
+    owns_core: bool,
 }
 
 impl WebRemoteServer {
@@ -128,6 +130,24 @@ impl WebRemoteServer {
     /// HTTPS 종단은 `tailscale serve` 몫이고, cert 모드(자체 TLS + 비-loopback bind)는
     /// 후속 구현이다(설정 자리만 예약).
     pub fn serve(addr: SocketAddr, options: ServeOptions) -> anyhow::Result<Self> {
+        Self::serve_inner(addr, options, None)
+    }
+
+    /// 앱이 소유한 코어를 공유해 서버를 띄운다. 두 전송을 함께 켤 때 쓰며, 이 서버의
+    /// shutdown은 공유 코어를 멈추지 않는다.
+    pub fn serve_with_core(
+        addr: SocketAddr,
+        options: ServeOptions,
+        core: Arc<session_core::SessionCore>,
+    ) -> anyhow::Result<Self> {
+        Self::serve_inner(addr, options, Some(core))
+    }
+
+    fn serve_inner(
+        addr: SocketAddr,
+        options: ServeOptions,
+        shared_core: Option<Arc<session_core::SessionCore>>,
+    ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             addr.ip().is_loopback(),
             "비-loopback 평문 bind({addr}) 거부 — HTTPS 없이는 열 수 없습니다. \
@@ -145,30 +165,31 @@ impl WebRemoteServer {
             Condvar::new(),
         ));
         // WS 대시보드 브리지 스레드. OFF(서버 미생성)면 이 스레드도 없다 — 리소스 0.
-        let (dashboard, dashboard_thread) =
-            dashboard::DashboardHandle::spawn(options.repository.clone());
-        // 웹푸시(P4) — VAPID 키 + 저장소 포트가 모두 있을 때만 발송 스레드를 띄운다.
-        let push = match (options.repository, options.vapid) {
-            (Some(repository), Some(vapid)) => match push::PushManager::spawn(repository, vapid) {
-                Ok(manager) => {
-                    dashboard.set_push_sink(manager.handle());
-                    Some(manager)
-                }
-                Err(e) => {
-                    tracing::warn!("web-remote 웹푸시 비활성(발송 스레드 생성 실패): {e:#}");
-                    None
-                }
-            },
-            _ => None,
+        // 공유 코어를 받았으면 새로 띄우지 않는다.
+        let owns_core = shared_core.is_none();
+        // 웹푸시 발송기는 **코어가 소유한다**. 공유 코어에 서버가 소유한 싱크를 심으면, 서버를
+        // 끄는 순간 코어가 죽은 싱크를 가리킨다 — Tailscale을 끄는 것만으로 Relay 쪽 코어가
+        // 망가지는 길이다. 공유 배치에서는 소유자가 `spawn_with_push`로 만들어 오고, 여기서는
+        // 그 핸들만 빌린다. 그래도 VAPID 키를 함께 넘기면 소유권이 둘로 갈리므로 거절한다.
+        anyhow::ensure!(
+            shared_core.is_none() || options.vapid.is_none(),
+            "공유 코어의 웹푸시는 코어 소유자가 만든다 — 서버에 VAPID 키를 함께 넘길 수 없다"
+        );
+        let core = match shared_core {
+            Some(shared) => shared,
+            None => session_core::SessionCore::spawn_with_push(
+                options.repository.clone(),
+                options.vapid,
+            ),
         };
-        let push_handle = push.as_ref().map(|manager| manager.handle());
+        let push_handle = core.push_handle();
         let ctx = Arc::new(ConnCtx {
             token: options.token,
             allowed_host: options
                 .allowed_host
                 .map(|host| host.trim().to_ascii_lowercase())
                 .filter(|host| !host.is_empty()),
-            dashboard: dashboard.clone(),
+            dashboard: core.dashboard().clone(),
             push: push_handle,
             uploads_dir: options.uploads_dir,
             stop: Arc::clone(&stop),
@@ -181,49 +202,53 @@ impl WebRemoteServer {
             stop,
             accept_thread: Some(accept_thread),
             connections,
-            dashboard,
-            dashboard_thread: Some(dashboard_thread),
-            push,
+            core,
+            owns_core,
         })
+    }
+
+    /// 이 서버가 쓰는 전송 중립 코어. 앱이 Relay와 공유할 때 쓴다.
+    pub fn core(&self) -> Arc<session_core::SessionCore> {
+        Arc::clone(&self.core)
     }
 
     /// `subscribe_with_wake`에 넘길 안정적 wake 클로저 — app이 활성 runtime을 구독할 때 쓴다.
     pub fn dashboard_wake(&self) -> Arc<dyn Fn() + Send + Sync> {
-        self.dashboard.wake_fn()
+        self.core.dashboard().wake_fn()
     }
 
     /// 활성 workspace worker 이벤트 구독을 대시보드에 붙인다(시작 + 워크스페이스 전환마다).
     pub fn set_runtime_source(&self, receiver: runtime::RuntimeEventReceiver) {
-        self.dashboard.set_runtime_source(receiver);
+        self.core.dashboard().set_runtime_source(receiver);
     }
 
     /// web → runtime 명령 싱크를 붙인다 (P5b — 시청 lease 전송용, receiver와 같은 시점에
     /// 교체). 미설정이면 터미널 뷰어만 비활성 — 대시보드/승인은 그대로 동작한다.
     pub fn set_runtime_command_sink(&self, sink: dashboard::CommandSink) {
-        self.dashboard.set_command_sink(sink);
+        self.core.dashboard().set_command_sink(sink);
     }
 
     /// web → app 워크스페이스 전환 싱크를 붙인다 (미러 진입 — I1b-2). app이 start_web에서
     /// 한 번 주입한다(app 레벨이라 워커별 교체 불필요). 미설정이면 폰 Switch가 무시된다.
     pub fn set_switch_sink(&self, sink: dashboard::SwitchSink) {
-        self.dashboard.set_switch_sink(sink);
+        self.core.dashboard().set_switch_sink(sink);
     }
 
     /// 폰에 띄울 일시 안내 배너를 세팅/해제한다 (미러 진입 상한 초과 등 — I1b-2).
     pub fn set_dashboard_notice(&self, notice: Option<String>) {
-        self.dashboard.set_notice(notice);
+        self.core.dashboard().set_notice(notice);
     }
 
     /// 현재 활성 workspace의 세션 상태를 대시보드에 시드한다(구독 등록 직후 호출 — 재구독 시
     /// edge-trigger 상태 유실 보정). app이 GUI 배지용으로 이미 추적 중인 상태를 넘긴다.
     pub fn set_workspaces(&self, seeds: Vec<dashboard::WorkspaceSeed>) {
-        self.dashboard.set_workspaces(seeds);
+        self.core.dashboard().set_workspaces(seeds);
     }
 
     /// 재구독 시점(start_web·워크스페이스 전환)에 활성 세션의 라이브 상태를 시드한다.
     /// 매 프레임 호출하는 [`Self::set_workspaces`]와 분리돼 있다 — 리뷰 P1-1 참조.
     pub fn reseed_active_sessions(&self, sessions: &[dashboard::SessionSeed]) {
-        self.dashboard.reseed_active_sessions(sessions);
+        self.core.dashboard().reseed_active_sessions(sessions);
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -273,13 +298,11 @@ impl WebRemoteServer {
             let _ = handle.join();
         }
         // 접속 스레드가 모두 끝난 뒤(ConnectionGuard drop 완료) 대시보드 스레드를 정지·join한다.
-        self.dashboard.stop();
-        if let Some(handle) = self.dashboard_thread.take() {
-            let _ = handle.join();
-        }
-        // 웹푸시 발송 스레드도 정지·join한다(발송 중이던 요청은 타임아웃까지 이어질 수 있다).
-        if let Some(push) = self.push.take() {
-            push.stop_and_join();
+        // 공유받은 코어라면 소유자(앱)가 멈춘다 — 여기서 멈추면 Tailscale을 끄는 것만으로
+        // Relay의 대시보드까지 함께 죽는다.
+        // 발송 스레드도 코어가 함께 정지·join한다(발송 중이던 요청은 타임아웃까지 이어질 수 있다).
+        if self.owns_core {
+            self.core.shutdown();
         }
         tracing::info!(addr = %self.addr, "web-remote 서버 정지");
     }
@@ -1151,14 +1174,14 @@ mod tests {
         }
 
         // 첫 프레임 = keyframe (전체 2행)
-        server.dashboard.inject_event(make_snapshot('a'));
+        server.core.dashboard().inject_event(make_snapshot('a'));
         let first = read_frame_of_type(&mut ws, "viewport", Duration::from_secs(3))
             .expect("viewport 프레임 없음");
         assert!(first.contains(r#""keyframe":true"#), "{first}");
         assert_eq!(first.matches(r#""runs":"#).count(), 2, "{first}");
 
         // 1행만 변경 → delta에 그 행만
-        server.dashboard.inject_event(make_snapshot('b'));
+        server.core.dashboard().inject_event(make_snapshot('b'));
         let delta = read_frame_of_type(&mut ws, "viewport", Duration::from_secs(3))
             .expect("delta 프레임 없음");
         assert!(delta.contains(r#""keyframe":false"#), "{delta}");
@@ -1475,7 +1498,8 @@ mod tests {
         assert!(read_frame_of_type(&mut ws, "welcome", Duration::from_secs(3)).is_some());
         seed_ids(&server, &[42]); // UUID 매핑(MuxUpdated) — 폰에는 UUID만 노출된다 (I1)
         server
-            .dashboard
+            .core
+            .dashboard()
             .inject_event(runtime::RuntimeEvent::SessionStatusChanged {
                 session: runtime::SessionId(42),
                 status: runtime::SessionStatus::NeedsApproval,
@@ -1501,7 +1525,7 @@ mod tests {
         // 접속이 없으면 폴링 타이머가 없다 — 잠시 기다려도 poll_count 0
         std::thread::sleep(Duration::from_millis(600));
         assert_eq!(
-            server.dashboard.poll_count(),
+            server.core.dashboard().poll_count(),
             0,
             "접속 0인데 승인 폴링이 돌았다"
         );
@@ -1513,11 +1537,11 @@ mod tests {
             &format!(r#"{{"type":"auth","v":1,"token":"{TEST_TOKEN}"}}"#),
         );
         let deadline = Instant::now() + Duration::from_secs(3);
-        while server.dashboard.poll_count() == 0 && Instant::now() < deadline {
+        while server.core.dashboard().poll_count() == 0 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(
-            server.dashboard.poll_count() >= 1,
+            server.core.dashboard().poll_count() >= 1,
             "접속 후에도 폴링이 안 돌았다"
         );
         drop(ws);
@@ -1666,7 +1690,7 @@ mod tests {
     /// 세션 u64 → "uuid-N".
     fn seed_ids(server: &WebRemoteServer, sessions: &[u64]) {
         let panes: Vec<(u64, &str)> = sessions.iter().map(|s| (*s, "p")).collect();
-        server.dashboard.inject_event(mux_event(&panes));
+        server.core.dashboard().inject_event(mux_event(&panes));
     }
 
     /// 앱의 재구독 경로(start_web/rebind)와 동일하게 상태 시딩 + 표시 스냅샷을 적용한다.
@@ -1711,7 +1735,8 @@ mod tests {
         // MuxUpdated는 소속(멤버십)만 근거다 — raw pane 제목("workspace.spawn.shell 140")으로
         // 앱이 해석한 표시명을 덮지 않고, 시드된 상태도 Running으로 리셋하지 않는다.
         server
-            .dashboard
+            .core
+            .dashboard()
             .inject_event(mux_event(&[(7, "workspace.spawn.shell 140")]));
         std::thread::sleep(Duration::from_millis(400));
         let frame = wait_dashboard_frame(&mut ws, r#""id":"uuid-7""#).unwrap_or_default();
@@ -1894,6 +1919,120 @@ mod tests {
     }
 
     // ── P4: 웹푸시 HTTP 통합(서버 소켓 경유 — http.rs 본문 읽기 + 라우팅) ──────
+    /// 공유 코어에 **서버가 소유한** 발송 싱크를 심지 못하게 한다. 심으면 서버를 끄는
+    /// 순간 코어가 죽은 싱크를 가리키게 되고, Tailscale을 끄는 것만으로 Relay 쪽 코어가
+    /// 망가진다. 공유 배치의 웹푸시 소유권은 아직 정해지지 않았으므로 조용히 무시하지 않고
+    /// 명시적으로 거절한다.
+    #[test]
+    fn 공유_코어에는_서버_소유_웹푸시_싱크를_붙일_수_없다() {
+        let core = session_core::SessionCore::spawn(None);
+        let refused = WebRemoteServer::serve_with_core(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            ServeOptions {
+                token: TEST_TOKEN.to_owned(),
+                allowed_host: None,
+                repository: None,
+                vapid: Some(push::VapidKey::generate()),
+                uploads_dir: None,
+            },
+            Arc::clone(&core),
+        );
+        let error = refused.err().expect("거절돼야 한다");
+        assert!(format!("{error:#}").contains("공유 코어"), "{error:#}");
+
+        // 거절이 공유 코어를 건드리지 않았다 — 여전히 자기 브리지를 돌린다.
+        let guard = core.dashboard().register_connection();
+        let before = core.dashboard().dash_build_count();
+        core.dashboard().set_notice(Some("untouched".to_owned()));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut rebuilt = false;
+        while Instant::now() < deadline {
+            if core.dashboard().dash_build_count() > before {
+                rebuilt = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(guard);
+        assert!(rebuilt, "거절된 조합이 공유 코어를 멈추면 안 된다");
+        core.shutdown();
+    }
+
+    /// 「둘 다 켬」 배치: 코어가 웹푸시를 소유하고 서버는 핸들만 빌린다. 서버를 꺼도 코어와
+    /// 발송기는 살아 있어야 한다 — Tailscale을 끄는 것이 Relay 쪽 푸시를 죽이면 안 된다.
+    #[test]
+    fn 공유_코어가_웹푸시를_소유하고_서버_종료에도_살아남는다() {
+        let db_path = temp_db_path();
+        let repository = repository::StorageTestRepository::open(&db_path)
+            as Arc<dyn repository::WebRemoteRepository>;
+        let core = session_core::SessionCore::spawn_with_push(
+            Some(repository.clone()),
+            Some(push::VapidKey::generate()),
+        );
+        assert!(
+            core.push_handle().is_some(),
+            "코어가 발송기를 소유해야 한다"
+        );
+
+        let server = WebRemoteServer::serve_with_core(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            ServeOptions {
+                token: TEST_TOKEN.to_owned(),
+                allowed_host: None,
+                repository: Some(repository),
+                // 소유권은 코어에 있으므로 서버에는 키를 넘기지 않는다.
+                vapid: None,
+                uploads_dir: None,
+            },
+            Arc::clone(&core),
+        )
+        .unwrap();
+        assert!(
+            server.core().push_handle().is_some(),
+            "서버가 핸들을 빌린다"
+        );
+
+        server.shutdown();
+        assert!(
+            core.push_handle().is_some(),
+            "서버 종료가 코어의 발송기를 죽이면 안 된다"
+        );
+
+        core.shutdown();
+        assert!(
+            core.push_handle().is_none(),
+            "코어 소유자가 멈추면 발송기도 함께 정리된다"
+        );
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    /// Relay를 먼저 켜면 코어가 VAPID 키 없이 만들어진다. 그 뒤 web을 켤 때 기존 코어를
+    /// 재사용하면서 발송기를 보정하지 않으면, 키가 있는데도 웹푸시가 영영 꺼진 채로 남는다.
+    #[test]
+    fn ensure_push는_키_없이_만들어진_코어를_나중에_보정한다() {
+        let db_path = temp_db_path();
+        let repository = repository::StorageTestRepository::open(&db_path)
+            as Arc<dyn repository::WebRemoteRepository>;
+
+        // Relay가 먼저 켜진 상황 — 키 없이 만들어진다.
+        let core = session_core::SessionCore::spawn(Some(repository.clone()));
+        assert!(core.push_handle().is_none());
+
+        // 나중에 web이 켜지며 키를 들고 온다.
+        core.ensure_push(Some(repository.clone()), Some(push::VapidKey::generate()));
+        assert!(
+            core.push_handle().is_some(),
+            "키가 생겼는데도 푸시가 꺼진 채면 안 된다"
+        );
+
+        // 두 번 불러도 발송기를 갈아 끼우지 않는다.
+        core.ensure_push(Some(repository), Some(push::VapidKey::generate()));
+        assert!(core.push_handle().is_some());
+
+        core.shutdown();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
     fn start_with_push(db_path: PathBuf) -> WebRemoteServer {
         let repository = repository::StorageTestRepository::open(&db_path)
             as Arc<dyn repository::WebRemoteRepository>;

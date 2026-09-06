@@ -1,0 +1,30 @@
+# 신뢰하지 않는 Relay 데이터 평면 서버. **암호문만** 중계한다.
+#
+# 의존성 법칙(테스트로 고정): 비밀 저장소·E2EE 암호·저장소·런타임·터미널·UI 크레이트를
+# 하나도 참조하지 않는다. 이 서버가 복호화할 수 있는 것은 아무것도 없어야 하고, 그러려면
+# 복호화에 필요한 코드가 애초에 링크되지 않아야 한다.
+#
+# TLS는 배포 edge가 종단한다(계획 Task 3 Step 2). 서버 자신은 평문 TCP 위 WebSocket을
+# 말하고, 공개 노출은 edge를 통해서만 이뤄진다.
+[package]
+name = "relay-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "relay_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "relay-server"
+path = "src/main.rs"
+
+[dependencies]
+relay-protocol = { path = "../relay-protocol" }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+# sync WebSocket 종단. handshake feature만 — TLS는 배포 edge가 맡는다.
+tungstenite = { workspace = true, features = ["handshake"] }

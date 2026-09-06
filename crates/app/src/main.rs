@@ -45,6 +45,9 @@ mod process_storm;
 mod prompt_library;
 mod provider_usage_command;
 mod pty_effort;
+// Task 2 어댑터만 제공한다 — 기동 배선은 Relay 클라이언트를 붙이는 Task 4의 몫이다.
+#[allow(dead_code)]
+mod relay_repository;
 mod shortcuts;
 mod status_feed;
 mod tailscale;

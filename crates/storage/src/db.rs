@@ -214,6 +214,8 @@ impl std::fmt::Debug for ActivePendingApprovalOwner {
 /// 35: bounded agent work-turn history, keyed by durable provider turn identity.
 /// 36: agent_work_turns.messages_json — 턴 안 최근 메시지 배열(유계 JSON). additive라
 ///     기존 행은 NULL이고 NULL이면 instruction+agent_summary만 보여주는 기존 렌더로 떨어진다.
+/// 37: Relay public device metadata and verified pending approvals. Private identities, pairing
+///     secrets, transport credentials, and terminal payloads are intentionally absent.
 /// 4~6은 각 crate가 소유한 DDL 상수를 그대로 붙인다 (스키마 정의는 한 곳에서만).
 pub(crate) const MIGRATIONS: &[&str] = &[
     "
@@ -735,6 +737,62 @@ CREATE INDEX idx_agent_work_turns_workspace_recency
     // 않았다. 턴 안 최신 메시지 5개를 유계 JSON으로 함께 보존한다(2026-08-15).
     // 기존 행은 NULL이고, NULL이면 예전대로 instruction+agent_summary만 보여준다.
     "ALTER TABLE agent_work_turns ADD COLUMN messages_json TEXT;",
+    // v37: opt-in Relay public metadata. Pending rows exist only after in-memory one-shot secret
+    // verification. Approval consumes one row and publishes exactly one device atomically.
+    "
+CREATE TABLE relay_pending_devices (
+    pairing_id BLOB PRIMARY KEY
+        CHECK (typeof(pairing_id) = 'blob' AND length(pairing_id) = 16),
+    device_id BLOB NOT NULL UNIQUE
+        CHECK (typeof(device_id) = 'blob' AND length(device_id) = 16),
+    identity_public_sec1 BLOB NOT NULL UNIQUE
+        CHECK (typeof(identity_public_sec1) = 'blob'
+            AND length(identity_public_sec1) = 65
+            AND hex(substr(identity_public_sec1, 1, 1)) = '04'),
+    display_name TEXT NOT NULL
+        CHECK (typeof(display_name) = 'text'
+            AND length(CAST(display_name AS BLOB)) BETWEEN 1 AND 128
+            AND instr(display_name, char(0)) = 0),
+    permission_view INTEGER NOT NULL CHECK (permission_view IN (0, 1)),
+    permission_input INTEGER NOT NULL CHECK (permission_input IN (0, 1)),
+    permission_upload INTEGER NOT NULL CHECK (permission_upload IN (0, 1)),
+    permission_approval INTEGER NOT NULL CHECK (permission_approval IN (0, 1)),
+    issued_at INTEGER NOT NULL CHECK (issued_at >= 0),
+    -- 5분 페어링 의식 마감. 이 시각 이후의 승인은 실패한다.
+    pairing_expires_at INTEGER NOT NULL
+        CHECK (pairing_expires_at > issued_at
+            AND pairing_expires_at - issued_at <= 300),
+    -- 승인이 커밋된 뒤 발급될 기기 인가 만료. 페어링 마감과 별개 수명이다.
+    device_expires_at INTEGER NOT NULL CHECK (device_expires_at >= pairing_expires_at)
+);
+
+CREATE INDEX idx_relay_pending_expiry
+    ON relay_pending_devices(pairing_expires_at, pairing_id);
+
+CREATE TABLE relay_devices (
+    device_id BLOB PRIMARY KEY
+        CHECK (typeof(device_id) = 'blob' AND length(device_id) = 16),
+    identity_public_sec1 BLOB NOT NULL UNIQUE
+        CHECK (typeof(identity_public_sec1) = 'blob'
+            AND length(identity_public_sec1) = 65
+            AND hex(substr(identity_public_sec1, 1, 1)) = '04'),
+    display_name TEXT NOT NULL
+        CHECK (typeof(display_name) = 'text'
+            AND length(CAST(display_name AS BLOB)) BETWEEN 1 AND 128
+            AND instr(display_name, char(0)) = 0),
+    permission_view INTEGER NOT NULL CHECK (permission_view IN (0, 1)),
+    permission_input INTEGER NOT NULL CHECK (permission_input IN (0, 1)),
+    permission_upload INTEGER NOT NULL CHECK (permission_upload IN (0, 1)),
+    permission_approval INTEGER NOT NULL CHECK (permission_approval IN (0, 1)),
+    issued_at INTEGER NOT NULL CHECK (issued_at >= 0),
+    device_expires_at INTEGER NOT NULL CHECK (device_expires_at > issued_at),
+    last_seen_at INTEGER CHECK (last_seen_at IS NULL OR last_seen_at >= issued_at),
+    revoked_at INTEGER CHECK (revoked_at IS NULL OR revoked_at >= issued_at)
+);
+
+CREATE INDEX idx_relay_devices_recency
+    ON relay_devices(revoked_at, last_seen_at DESC, issued_at DESC, device_id);
+",
 ];
 
 /// 옵션2: 저장된 에이전트 세션 한 행 — 재시작 복원 시 native resume에 쓴다.
@@ -3320,6 +3378,85 @@ pub struct WebPushSubscriptionRow {
     pub auth: String,
 }
 
+pub const RELAY_DEVICE_ROWS_MAX: usize = 64;
+pub const RELAY_PENDING_DEVICE_ROWS_MAX: usize = 256;
+pub const RELAY_DISPLAY_NAME_BYTES_MAX: usize = 128;
+/// 페어링 의식 창의 상한(초). `web-remote`의 `PAIRING_TTL_SECS`와 같은 5분이며,
+/// 스키마 CHECK에도 같은 값이 박혀 있다.
+pub const RELAY_PAIRING_WINDOW_SECS_MAX: i64 = 300;
+const RELAY_ID_BYTES: usize = 16;
+const RELAY_PUBLIC_KEY_BYTES: usize = 65;
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct RelayPendingDeviceRow {
+    pub pairing_id: [u8; RELAY_ID_BYTES],
+    pub device_id: [u8; RELAY_ID_BYTES],
+    pub identity_public_sec1: [u8; RELAY_PUBLIC_KEY_BYTES],
+    pub display_name: String,
+    pub permission_view: bool,
+    pub permission_input: bool,
+    pub permission_upload: bool,
+    pub permission_approval: bool,
+    pub issued_at: i64,
+    /// 5분 페어링 마감 — 이 시각부터 승인은 실패한다.
+    pub pairing_expires_at: i64,
+    /// 승인 후 발급할 기기 인가 만료 — 페어링 마감보다 길 수 있다.
+    pub device_expires_at: i64,
+}
+
+impl std::fmt::Debug for RelayPendingDeviceRow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RelayPendingDeviceRow")
+            .field("state", &"public-metadata")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct RelayDeviceRow {
+    pub device_id: [u8; RELAY_ID_BYTES],
+    pub identity_public_sec1: [u8; RELAY_PUBLIC_KEY_BYTES],
+    pub display_name: String,
+    pub permission_view: bool,
+    pub permission_input: bool,
+    pub permission_upload: bool,
+    pub permission_approval: bool,
+    pub issued_at: i64,
+    pub device_expires_at: i64,
+    pub last_seen_at: Option<i64>,
+    pub revoked_at: Option<i64>,
+}
+
+impl std::fmt::Debug for RelayDeviceRow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RelayDeviceRow")
+            .field("state", &"public-metadata")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayPendingInsert {
+    Stored,
+    LimitReached,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum RelayDeviceApproval {
+    Approved(RelayDeviceRow),
+    NotFound,
+    Expired,
+    DeviceLimitReached,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayDeviceRevocation {
+    Revoked,
+    NotFound,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnvProfileRow {
     pub id: String,
@@ -4982,6 +5119,96 @@ fn acquire_pending_approval_owner_for_identity(
         _owner_lock: owner_lock,
         db_identity: db_identity.to_owned(),
     })
+}
+
+fn validate_relay_pending_device(row: &RelayPendingDeviceRow) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        row.identity_public_sec1[0] == 0x04,
+        "relay pending device public key invalid"
+    );
+    anyhow::ensure!(
+        !row.display_name.trim().is_empty()
+            && row.display_name.len() <= RELAY_DISPLAY_NAME_BYTES_MAX
+            && !row.display_name.contains('\0'),
+        "relay pending device display name invalid"
+    );
+    anyhow::ensure!(
+        row.issued_at >= 0
+            && row.pairing_expires_at > row.issued_at
+            && row.pairing_expires_at - row.issued_at <= RELAY_PAIRING_WINDOW_SECS_MAX
+            && row.device_expires_at >= row.pairing_expires_at,
+        "relay pending device lifetime invalid"
+    );
+    Ok(())
+}
+
+fn relay_blob<const N: usize>(row: &rusqlite::Row<'_>, index: usize) -> anyhow::Result<[u8; N]> {
+    let rusqlite::types::ValueRef::Blob(bytes) = row.get_ref(index)? else {
+        anyhow::bail!("relay repository row invalid")
+    };
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("relay repository row invalid"))
+}
+
+fn relay_text(row: &rusqlite::Row<'_>, index: usize) -> anyhow::Result<String> {
+    let rusqlite::types::ValueRef::Text(bytes) = row.get_ref(index)? else {
+        anyhow::bail!("relay repository row invalid")
+    };
+    anyhow::ensure!(
+        !bytes.is_empty() && bytes.len() <= RELAY_DISPLAY_NAME_BYTES_MAX && !bytes.contains(&0),
+        "relay repository row invalid"
+    );
+    Ok(std::str::from_utf8(bytes)
+        .context("relay repository row invalid")?
+        .to_owned())
+}
+
+fn relay_pending_from_row(row: &rusqlite::Row<'_>) -> anyhow::Result<RelayPendingDeviceRow> {
+    let pending = RelayPendingDeviceRow {
+        pairing_id: relay_blob(row, 0)?,
+        device_id: relay_blob(row, 1)?,
+        identity_public_sec1: relay_blob(row, 2)?,
+        display_name: relay_text(row, 3)?,
+        permission_view: row.get(4)?,
+        permission_input: row.get(5)?,
+        permission_upload: row.get(6)?,
+        permission_approval: row.get(7)?,
+        issued_at: row.get(8)?,
+        pairing_expires_at: row.get(9)?,
+        device_expires_at: row.get(10)?,
+    };
+    validate_relay_pending_device(&pending)?;
+    Ok(pending)
+}
+
+fn relay_device_from_row(row: &rusqlite::Row<'_>) -> anyhow::Result<RelayDeviceRow> {
+    let device = RelayDeviceRow {
+        device_id: relay_blob(row, 0)?,
+        identity_public_sec1: relay_blob(row, 1)?,
+        display_name: relay_text(row, 2)?,
+        permission_view: row.get(3)?,
+        permission_input: row.get(4)?,
+        permission_upload: row.get(5)?,
+        permission_approval: row.get(6)?,
+        issued_at: row.get(7)?,
+        device_expires_at: row.get(8)?,
+        last_seen_at: row.get(9)?,
+        revoked_at: row.get(10)?,
+    };
+    anyhow::ensure!(
+        device.identity_public_sec1[0] == 0x04
+            && device.issued_at >= 0
+            && device.device_expires_at > device.issued_at
+            && device
+                .last_seen_at
+                .is_none_or(|timestamp| timestamp >= device.issued_at)
+            && device
+                .revoked_at
+                .is_none_or(|timestamp| timestamp >= device.issued_at),
+        "relay repository row invalid"
+    );
+    Ok(device)
 }
 
 impl Db {
@@ -9671,6 +9898,326 @@ impl Db {
         mcp_store::prune_resolved_approvals(&self.conn, resolved_before_epoch_secs)
     }
 
+    pub fn insert_relay_pending_device(
+        &self,
+        pending: &RelayPendingDeviceRow,
+        trusted_now: i64,
+    ) -> anyhow::Result<RelayPendingInsert> {
+        validate_relay_pending_device(pending)?;
+        anyhow::ensure!(
+            pending.issued_at <= trusted_now && trusted_now < pending.pairing_expires_at,
+            "relay pending device trusted timestamp invalid"
+        );
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
+            .context("relay pending device transaction failed")?;
+        tx.execute(
+            "DELETE FROM relay_pending_devices WHERE pairing_expires_at <= ?1",
+            [trusted_now],
+        )
+        .context("relay pending device expiry cleanup failed")?;
+        let duplicate: bool = tx.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM relay_pending_devices
+                 WHERE pairing_id = ?1 OR device_id = ?2 OR identity_public_sec1 = ?3
+             )",
+            rusqlite::params![
+                pending.pairing_id.as_slice(),
+                pending.device_id.as_slice(),
+                pending.identity_public_sec1.as_slice(),
+            ],
+            |row| row.get(0),
+        )?;
+        anyhow::ensure!(!duplicate, "relay pending device already exists");
+        let count: i64 = tx.query_row("SELECT COUNT(*) FROM relay_pending_devices", [], |row| {
+            row.get(0)
+        })?;
+        let count = usize::try_from(count).context("relay pending device count invalid")?;
+        if count >= RELAY_PENDING_DEVICE_ROWS_MAX {
+            tx.commit()?;
+            return Ok(RelayPendingInsert::LimitReached);
+        }
+        tx.execute(
+            "INSERT INTO relay_pending_devices (
+                 pairing_id, device_id, identity_public_sec1, display_name,
+                 permission_view, permission_input, permission_upload, permission_approval,
+                 issued_at, pairing_expires_at, device_expires_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            rusqlite::params![
+                pending.pairing_id.as_slice(),
+                pending.device_id.as_slice(),
+                pending.identity_public_sec1.as_slice(),
+                pending.display_name,
+                pending.permission_view,
+                pending.permission_input,
+                pending.permission_upload,
+                pending.permission_approval,
+                pending.issued_at,
+                pending.pairing_expires_at,
+                pending.device_expires_at,
+            ],
+        )
+        .context("relay pending device insert failed")?;
+        tx.commit().context("relay pending device commit failed")?;
+        Ok(RelayPendingInsert::Stored)
+    }
+
+    /// 승인은 발행 트랜잭션과 같은 스냅샷 안에서 `expected_identity_public_sec1`을 다시
+    /// 확인한다. 앱 어댑터가 곡선 검증을 마친 뒤와 이 트랜잭션 사이에 외부에서 행을
+    /// 바꿔치기해도(SQLite는 곡선을 못 본다) 아무것도 발행되지 않고 롤백된다.
+    pub fn approve_relay_pending_device(
+        &self,
+        pairing_id: &[u8; RELAY_ID_BYTES],
+        expected_identity_public_sec1: &[u8; RELAY_PUBLIC_KEY_BYTES],
+        approved_at: i64,
+    ) -> anyhow::Result<RelayDeviceApproval> {
+        anyhow::ensure!(approved_at >= 0, "relay approval timestamp invalid");
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
+            .context("relay approval transaction failed")?;
+        let pending = {
+            let mut statement = tx.prepare(
+                "SELECT pairing_id, device_id, identity_public_sec1, display_name,
+                        permission_view, permission_input, permission_upload, permission_approval,
+                        issued_at, pairing_expires_at, device_expires_at
+                 FROM relay_pending_devices WHERE pairing_id = ?1",
+            )?;
+            let mut rows = statement.query([pairing_id.as_slice()])?;
+            match rows.next()? {
+                Some(row) => Some(relay_pending_from_row(row)?),
+                None => None,
+            }
+        };
+        let Some(pending) = pending else {
+            tx.commit()?;
+            return Ok(RelayDeviceApproval::NotFound);
+        };
+        anyhow::ensure!(
+            pending.identity_public_sec1 == *expected_identity_public_sec1,
+            "relay pending device changed between validation and approval"
+        );
+        anyhow::ensure!(
+            approved_at >= pending.issued_at,
+            "relay approval clock rollback"
+        );
+        if approved_at >= pending.pairing_expires_at {
+            tx.execute(
+                "DELETE FROM relay_pending_devices WHERE pairing_id = ?1",
+                [pairing_id.as_slice()],
+            )?;
+            tx.commit()?;
+            return Ok(RelayDeviceApproval::Expired);
+        }
+
+        let existing: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM relay_devices WHERE device_id = ?1)",
+            [pending.device_id.as_slice()],
+            |row| row.get(0),
+        )?;
+        if !existing {
+            let count: i64 =
+                tx.query_row("SELECT COUNT(*) FROM relay_devices", [], |row| row.get(0))?;
+            if usize::try_from(count).context("relay device count invalid")?
+                >= RELAY_DEVICE_ROWS_MAX
+            {
+                return Ok(RelayDeviceApproval::DeviceLimitReached);
+            }
+        }
+
+        tx.execute(
+            "INSERT INTO relay_devices (
+                 device_id, identity_public_sec1, display_name,
+                 permission_view, permission_input, permission_upload, permission_approval,
+                 issued_at, device_expires_at, last_seen_at, revoked_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL)
+             ON CONFLICT(device_id) DO UPDATE SET
+                 identity_public_sec1 = excluded.identity_public_sec1,
+                 display_name = excluded.display_name,
+                 permission_view = excluded.permission_view,
+                 permission_input = excluded.permission_input,
+                 permission_upload = excluded.permission_upload,
+                 permission_approval = excluded.permission_approval,
+                 issued_at = excluded.issued_at,
+                 device_expires_at = excluded.device_expires_at,
+                 last_seen_at = NULL,
+                 revoked_at = NULL",
+            rusqlite::params![
+                pending.device_id.as_slice(),
+                pending.identity_public_sec1.as_slice(),
+                pending.display_name,
+                pending.permission_view,
+                pending.permission_input,
+                pending.permission_upload,
+                pending.permission_approval,
+                approved_at,
+                pending.device_expires_at,
+            ],
+        )
+        .context("relay device approval publish failed")?;
+        let deleted = tx.execute(
+            "DELETE FROM relay_pending_devices WHERE pairing_id = ?1",
+            [pairing_id.as_slice()],
+        )?;
+        anyhow::ensure!(deleted == 1, "relay approval consume failed");
+        tx.commit().context("relay approval commit failed")?;
+
+        Ok(RelayDeviceApproval::Approved(RelayDeviceRow {
+            device_id: pending.device_id,
+            identity_public_sec1: pending.identity_public_sec1,
+            display_name: pending.display_name,
+            permission_view: pending.permission_view,
+            permission_input: pending.permission_input,
+            permission_upload: pending.permission_upload,
+            permission_approval: pending.permission_approval,
+            issued_at: approved_at,
+            device_expires_at: pending.device_expires_at,
+            last_seen_at: None,
+            revoked_at: None,
+        }))
+    }
+
+    pub fn relay_pending_device_count(&self) -> anyhow::Result<usize> {
+        let count: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM relay_pending_devices", [], |row| {
+                    row.get(0)
+                })?;
+        usize::try_from(count).context("relay pending device count invalid")
+    }
+
+    /// 승인 전 검증용 단건 읽기. 앱 어댑터가 곡선 검증을 통과시킨 뒤에야 승인을
+    /// 호출할 수 있도록, 변형(승인) 이전에 원본 행을 그대로 돌려준다.
+    pub fn relay_pending_device(
+        &self,
+        pairing_id: &[u8; RELAY_ID_BYTES],
+    ) -> anyhow::Result<Option<RelayPendingDeviceRow>> {
+        let mut statement = self.conn.prepare_cached(
+            "SELECT pairing_id, device_id, identity_public_sec1, display_name,
+                    permission_view, permission_input, permission_upload, permission_approval,
+                    issued_at, pairing_expires_at, device_expires_at
+             FROM relay_pending_devices WHERE pairing_id = ?1",
+        )?;
+        let mut rows = statement.query([pairing_id.as_slice()])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(relay_pending_from_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// 재시작 정리. 검증된 메모리 승인이 사라진 뒤 남은 pending 행은 페어링 증거가
+    /// 될 수 없으므로 앱 시작 시 전부 지운다. 지운 행 수를 돌려준다.
+    pub fn delete_all_relay_pending_devices(&self) -> anyhow::Result<usize> {
+        let deleted = self
+            .conn
+            .execute("DELETE FROM relay_pending_devices", [])
+            .context("relay pending device restart purge failed")?;
+        Ok(deleted)
+    }
+
+    pub fn relay_device(
+        &self,
+        device_id: &[u8; RELAY_ID_BYTES],
+    ) -> anyhow::Result<Option<RelayDeviceRow>> {
+        let mut statement = self.conn.prepare_cached(
+            "SELECT device_id, identity_public_sec1, display_name,
+                    permission_view, permission_input, permission_upload, permission_approval,
+                    issued_at, device_expires_at, last_seen_at, revoked_at
+             FROM relay_devices WHERE device_id = ?1",
+        )?;
+        let mut rows = statement.query([device_id.as_slice()])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(relay_device_from_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn list_relay_devices_bounded(&self, limit: usize) -> anyhow::Result<Vec<RelayDeviceRow>> {
+        anyhow::ensure!(limit <= RELAY_DEVICE_ROWS_MAX, "relay device limit invalid");
+        let probe_limit = i64::try_from(limit.saturating_add(1))?;
+        let tx = self.conn.unchecked_transaction()?;
+        let count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM (
+                 SELECT 1 FROM relay_devices
+                 ORDER BY revoked_at, last_seen_at DESC, issued_at DESC, device_id
+                 LIMIT ?1
+             )",
+            [probe_limit],
+            |row| row.get(0),
+        )?;
+        let count = usize::try_from(count).context("relay device count invalid")?;
+        anyhow::ensure!(
+            count <= limit,
+            "relay device snapshot exceeds requested limit"
+        );
+
+        let mut result = Vec::with_capacity(count);
+        {
+            let mut statement = tx.prepare_cached(
+                "SELECT device_id, identity_public_sec1, display_name,
+                        permission_view, permission_input, permission_upload, permission_approval,
+                        issued_at, device_expires_at, last_seen_at, revoked_at
+                 FROM relay_devices
+                 ORDER BY revoked_at, last_seen_at DESC, issued_at DESC, device_id
+                 LIMIT ?1",
+            )?;
+            let mut rows = statement.query([i64::try_from(limit)?])?;
+            while let Some(row) = rows.next()? {
+                result.push(relay_device_from_row(row)?);
+            }
+        }
+        tx.commit()?;
+        Ok(result)
+    }
+
+    pub fn revoke_relay_device(
+        &self,
+        device_id: &[u8; RELAY_ID_BYTES],
+        revoked_at: i64,
+    ) -> anyhow::Result<RelayDeviceRevocation> {
+        anyhow::ensure!(revoked_at >= 0, "relay revocation timestamp invalid");
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let state = tx
+            .query_row(
+                "SELECT issued_at, revoked_at FROM relay_devices WHERE device_id = ?1",
+                [device_id.as_slice()],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )
+            .optional()?;
+        let Some((issued_at, existing_revocation)) = state else {
+            tx.commit()?;
+            return Ok(RelayDeviceRevocation::NotFound);
+        };
+        anyhow::ensure!(
+            revoked_at >= issued_at,
+            "relay revocation timestamp invalid"
+        );
+        if existing_revocation.is_none() {
+            tx.execute(
+                "UPDATE relay_devices SET revoked_at = ?2
+                 WHERE device_id = ?1 AND revoked_at IS NULL",
+                rusqlite::params![device_id.as_slice(), revoked_at],
+            )?;
+        }
+        tx.commit()?;
+        Ok(RelayDeviceRevocation::Revoked)
+    }
+
+    pub fn touch_relay_device(
+        &self,
+        device_id: &[u8; RELAY_ID_BYTES],
+        seen_at: i64,
+    ) -> anyhow::Result<bool> {
+        anyhow::ensure!(seen_at >= 0, "relay last-seen timestamp invalid");
+        let changed = self.conn.execute(
+            "UPDATE relay_devices SET last_seen_at = ?2
+             WHERE device_id = ?1
+               AND revoked_at IS NULL
+               AND issued_at <= ?2
+               AND ?2 < device_expires_at
+               AND (last_seen_at IS NULL OR last_seen_at <= ?2)",
+            rusqlite::params![device_id.as_slice(), seen_at],
+        )?;
+        Ok(changed == 1)
+    }
+
     /// 웹푸시 구독 등록/갱신 (v21, PR-P4). 같은 endpoint로 재구독하면 키만 갱신하고
     /// created_at은 보존한다(브라우저가 키를 회전해도 최초 등록 시각 유지). last_ok_at은
     /// 갱신 시 손대지 않는다 — 발송 성공만이 갱신한다.
@@ -11214,6 +11761,542 @@ mod tests {
         let path = dir.join("metadata.sqlite3");
         let db = Db::open(&path).unwrap();
         (dir, path, db)
+    }
+
+    fn relay_pending_row(pairing: u8, device: u8, identity: u8) -> RelayPendingDeviceRow {
+        let mut public_key = [identity; RELAY_PUBLIC_KEY_BYTES];
+        public_key[0] = 0x04;
+        RelayPendingDeviceRow {
+            pairing_id: [pairing; RELAY_ID_BYTES],
+            device_id: [device; RELAY_ID_BYTES],
+            identity_public_sec1: public_key,
+            display_name: format!("relay-device-{device}"),
+            permission_view: true,
+            permission_input: false,
+            permission_upload: false,
+            permission_approval: false,
+            issued_at: 1_800_000_000,
+            pairing_expires_at: 1_800_000_000 + RELAY_PAIRING_WINDOW_SECS_MAX,
+            device_expires_at: 1_800_086_400,
+        }
+    }
+
+    /// 페어링 마감(5분)과 기기 만료(장기)는 서로 다른 수명이다. 한 컬럼으로 합치면
+    /// 5분짜리 승인 창이 24시간으로 늘어나거나 기기가 5분 만에 죽는다.
+    #[test]
+    fn relay_pairing_window_and_device_expiry_are_independent() {
+        let (dir, _path, db) = file_db("relay-split-expiry");
+        let mut too_long = relay_pending_row(1, 1, 1);
+        too_long.pairing_expires_at = too_long.issued_at + RELAY_PAIRING_WINDOW_SECS_MAX + 1;
+        assert!(
+            db.insert_relay_pending_device(&too_long, too_long.issued_at)
+                .is_err(),
+            "pairing window must stay bounded by the five-minute ceremony"
+        );
+
+        let mut inverted = relay_pending_row(2, 2, 2);
+        inverted.device_expires_at = inverted.pairing_expires_at - 1;
+        assert!(
+            db.insert_relay_pending_device(&inverted, inverted.issued_at)
+                .is_err(),
+            "a device must not expire before the pairing deadline"
+        );
+
+        let pending = relay_pending_row(3, 3, 3);
+        db.insert_relay_pending_device(&pending, pending.issued_at)
+            .unwrap();
+        let RelayDeviceApproval::Approved(device) = db
+            .approve_relay_pending_device(
+                &pending.pairing_id,
+                &pending.identity_public_sec1,
+                pending.pairing_expires_at - 1,
+            )
+            .unwrap()
+        else {
+            panic!("approval inside the pairing window must succeed");
+        };
+        assert_eq!(device.issued_at, pending.pairing_expires_at - 1);
+        assert_eq!(device.device_expires_at, pending.device_expires_at);
+        assert!(
+            db.touch_relay_device(&device.device_id, pending.pairing_expires_at + 1)
+                .unwrap(),
+            "an admitted device outlives the pairing deadline"
+        );
+        drop(db);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn relay_approval_fails_closed_at_the_exact_pairing_deadline() {
+        let (dir, _path, db) = file_db("relay-pairing-deadline");
+        let pending = relay_pending_row(4, 4, 4);
+        db.insert_relay_pending_device(&pending, pending.issued_at)
+            .unwrap();
+        assert_eq!(
+            db.approve_relay_pending_device(
+                &pending.pairing_id,
+                &pending.identity_public_sec1,
+                pending.pairing_expires_at
+            )
+            .unwrap(),
+            RelayDeviceApproval::Expired
+        );
+        assert_eq!(db.relay_pending_device_count().unwrap(), 0);
+        assert!(db.relay_device(&pending.device_id).unwrap().is_none());
+        drop(db);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// SQLite는 곡선 위 점인지 검증하지 못한다 — 길이/접두사만 본다. 그래서 65바이트
+    /// `0x04` 접두사를 가진 잘못된 P-256 점은 여기까지 그대로 들어온다. 곡선 검증은
+    /// 값 생성자를 통과시키는 앱 어댑터의 책임이라는 것을 이 테스트가 고정한다.
+    #[test]
+    fn relay_rows_accept_structurally_valid_off_curve_keys_for_adapter_rejection() {
+        let (dir, _path, db) = file_db("relay-off-curve");
+        let mut pending = relay_pending_row(5, 5, 5);
+        pending.identity_public_sec1 = off_curve_sec1_point();
+        db.insert_relay_pending_device(&pending, pending.issued_at)
+            .unwrap();
+        let stored = db
+            .relay_pending_device(&pending.pairing_id)
+            .unwrap()
+            .expect("structurally valid row is readable");
+        assert_eq!(stored.identity_public_sec1, pending.identity_public_sec1);
+        assert!(matches!(
+            db.approve_relay_pending_device(
+                &pending.pairing_id,
+                &pending.identity_public_sec1,
+                pending.issued_at + 1,
+            )
+            .unwrap(),
+            RelayDeviceApproval::Approved(_)
+        ));
+        let device = db.relay_device(&pending.device_id).unwrap().unwrap();
+        assert_eq!(device.identity_public_sec1, pending.identity_public_sec1);
+        drop(db);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 재시작하면 검증된 메모리 승인(PairingApproval)이 사라진다. 남은 pending 행이
+    /// 페어링 증거로 되살아나지 못하도록 앱이 시작 시 전부 지운다.
+    #[test]
+    fn relay_pending_rows_are_purgeable_after_restart() {
+        let (dir, path, db) = file_db("relay-restart-purge");
+        for value in 1..=3u8 {
+            let pending = relay_pending_row(value, value, value);
+            db.insert_relay_pending_device(&pending, pending.issued_at)
+                .unwrap();
+        }
+        drop(db);
+
+        let reopened = Db::open(&path).unwrap();
+        assert_eq!(reopened.relay_pending_device_count().unwrap(), 3);
+        assert_eq!(reopened.delete_all_relay_pending_devices().unwrap(), 3);
+        assert_eq!(reopened.relay_pending_device_count().unwrap(), 0);
+        assert_eq!(reopened.delete_all_relay_pending_devices().unwrap(), 0);
+        drop(reopened);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// pending/기기 상한은 결정적으로 거절하고 기존 행을 절대 밀어내지 않는다.
+    /// (암호 연산이 없는 평행 행으로 경계를 그대로 재현한다.)
+    #[test]
+    fn relay_row_limits_reject_deterministically_without_eviction() {
+        let (dir, _path, db) = file_db("relay-limits");
+        for index in 0..RELAY_PENDING_DEVICE_ROWS_MAX {
+            let row = relay_filler_row(index);
+            assert_eq!(
+                db.insert_relay_pending_device(&row, row.issued_at).unwrap(),
+                RelayPendingInsert::Stored
+            );
+        }
+        let overflow = relay_filler_row(RELAY_PENDING_DEVICE_ROWS_MAX);
+        assert_eq!(
+            db.insert_relay_pending_device(&overflow, overflow.issued_at)
+                .unwrap(),
+            RelayPendingInsert::LimitReached
+        );
+        assert_eq!(
+            db.relay_pending_device_count().unwrap(),
+            RELAY_PENDING_DEVICE_ROWS_MAX
+        );
+        // 중복(pairing/device/공개키)은 상한과 무관하게 항상 거절이며 조용한 교체가 아니다.
+        let duplicate = relay_filler_row(0);
+        assert!(
+            db.insert_relay_pending_device(&duplicate, duplicate.issued_at)
+                .is_err()
+        );
+
+        for index in 0..RELAY_DEVICE_ROWS_MAX {
+            let row = relay_filler_row(index);
+            assert!(matches!(
+                db.approve_relay_pending_device(
+                    &row.pairing_id,
+                    &row.identity_public_sec1,
+                    row.issued_at + 1
+                )
+                .unwrap(),
+                RelayDeviceApproval::Approved(_)
+            ));
+        }
+        let extra = relay_filler_row(RELAY_DEVICE_ROWS_MAX);
+        assert_eq!(
+            db.approve_relay_pending_device(
+                &extra.pairing_id,
+                &extra.identity_public_sec1,
+                extra.issued_at + 1
+            )
+            .unwrap(),
+            RelayDeviceApproval::DeviceLimitReached
+        );
+        assert_eq!(
+            db.list_relay_devices_bounded(RELAY_DEVICE_ROWS_MAX)
+                .unwrap()
+                .len(),
+            RELAY_DEVICE_ROWS_MAX
+        );
+        assert!(
+            db.list_relay_devices_bounded(RELAY_DEVICE_ROWS_MAX - 1)
+                .is_err(),
+            "상한을 넘는 스냅샷은 잘라서 주지 않고 거부한다"
+        );
+        assert!(
+            db.relay_device(&extra.device_id).unwrap().is_none(),
+            "상한 거부는 기기를 발행하지 않는다"
+        );
+        drop(db);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 앱 어댑터가 곡선 검증을 마친 뒤 승인 트랜잭션 사이에 외부에서 공개키를
+    /// 바꿔치기하는 경쟁을 막는다 — 승인은 아무것도 발행하지 않고 롤백한다.
+    #[test]
+    fn relay_approval_rejects_a_pending_row_that_changed_after_validation() {
+        let (dir, _path, db) = file_db("relay-approval-race");
+        let pending = relay_pending_row(12, 12, 12);
+        db.insert_relay_pending_device(&pending, pending.issued_at)
+            .unwrap();
+
+        // 검증 시점에 본 값(원본)과 저장된 값(변조본)이 어긋난 상태를 그대로 재현한다.
+        db.conn
+            .execute(
+                "UPDATE relay_pending_devices SET identity_public_sec1 = ?1 WHERE pairing_id = ?2",
+                rusqlite::params![
+                    off_curve_sec1_point().as_slice(),
+                    pending.pairing_id.as_slice()
+                ],
+            )
+            .unwrap();
+
+        assert!(
+            db.approve_relay_pending_device(
+                &pending.pairing_id,
+                &pending.identity_public_sec1,
+                pending.issued_at + 1,
+            )
+            .is_err()
+        );
+        assert!(db.relay_device(&pending.device_id).unwrap().is_none());
+        assert_eq!(db.relay_pending_device_count().unwrap(), 1);
+
+        // 변조본을 그대로 기대값으로 넘겨도 검증은 앱 어댑터가 이미 막는다. 저장 계층은
+        // "검증한 값과 같은가"만 책임진다.
+        assert!(matches!(
+            db.approve_relay_pending_device(
+                &pending.pairing_id,
+                &off_curve_sec1_point(),
+                pending.issued_at + 1,
+            )
+            .unwrap(),
+            RelayDeviceApproval::Approved(_)
+        ));
+        drop(db);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 재승인은 같은 device_id 위에서 권한을 갱신하고 이전 취소를 지운다.
+    #[test]
+    fn relay_reapproval_updates_one_device_and_clears_prior_revocation() {
+        let (dir, _path, db) = file_db("relay-reapproval");
+        let first = relay_pending_row(6, 6, 6);
+        db.insert_relay_pending_device(&first, first.issued_at)
+            .unwrap();
+        db.approve_relay_pending_device(
+            &first.pairing_id,
+            &first.identity_public_sec1,
+            first.issued_at + 1,
+        )
+        .unwrap();
+        db.revoke_relay_device(&first.device_id, first.issued_at + 2)
+            .unwrap();
+
+        let mut again = relay_pending_row(7, 6, 7);
+        again.display_name = "renamed".to_owned();
+        again.permission_input = true;
+        db.insert_relay_pending_device(&again, again.issued_at)
+            .unwrap();
+        assert!(matches!(
+            db.approve_relay_pending_device(
+                &again.pairing_id,
+                &again.identity_public_sec1,
+                again.issued_at + 3
+            )
+            .unwrap(),
+            RelayDeviceApproval::Approved(_)
+        ));
+        let device = db.relay_device(&first.device_id).unwrap().unwrap();
+        assert_eq!(device.display_name, "renamed");
+        assert_eq!(device.identity_public_sec1, again.identity_public_sec1);
+        assert!(device.permission_input);
+        assert_eq!(device.revoked_at, None);
+        assert_eq!(
+            db.list_relay_devices_bounded(RELAY_DEVICE_ROWS_MAX)
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(db);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// last-seen은 발급 이전/만료 이후/취소 이후에는 절대 갱신되지 않는다.
+    #[test]
+    fn relay_last_seen_updates_only_inside_the_device_window() {
+        let (dir, _path, db) = file_db("relay-last-seen");
+        let pending = relay_pending_row(8, 8, 8);
+        db.insert_relay_pending_device(&pending, pending.issued_at)
+            .unwrap();
+        db.approve_relay_pending_device(
+            &pending.pairing_id,
+            &pending.identity_public_sec1,
+            pending.issued_at + 1,
+        )
+        .unwrap();
+
+        assert!(
+            !db.touch_relay_device(&pending.device_id, pending.issued_at)
+                .unwrap(),
+            "발급 이전 시각은 갱신하지 않는다"
+        );
+        assert!(
+            db.touch_relay_device(&pending.device_id, pending.issued_at + 1)
+                .unwrap()
+        );
+        assert!(
+            !db.touch_relay_device(&pending.device_id, pending.device_expires_at)
+                .unwrap(),
+            "만료 시각의 갱신은 실패한다"
+        );
+        assert_eq!(
+            db.relay_device(&pending.device_id)
+                .unwrap()
+                .unwrap()
+                .last_seen_at,
+            Some(pending.issued_at + 1)
+        );
+
+        db.revoke_relay_device(&pending.device_id, pending.issued_at + 2)
+            .unwrap();
+        assert!(
+            !db.touch_relay_device(&pending.device_id, pending.issued_at + 3)
+                .unwrap()
+        );
+        drop(db);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 존재하지 않는 기기 취소와 반복 취소는 결정적이며 최초 시각을 보존한다.
+    #[test]
+    fn relay_revocation_is_idempotent_and_keeps_the_first_timestamp() {
+        let (dir, _path, db) = file_db("relay-revocation");
+        let pending = relay_pending_row(9, 9, 9);
+        assert_eq!(
+            db.revoke_relay_device(&pending.device_id, pending.issued_at + 1)
+                .unwrap(),
+            RelayDeviceRevocation::NotFound
+        );
+        db.insert_relay_pending_device(&pending, pending.issued_at)
+            .unwrap();
+        db.approve_relay_pending_device(
+            &pending.pairing_id,
+            &pending.identity_public_sec1,
+            pending.issued_at + 1,
+        )
+        .unwrap();
+        for at in [pending.issued_at + 2, pending.issued_at + 3] {
+            assert_eq!(
+                db.revoke_relay_device(&pending.device_id, at).unwrap(),
+                RelayDeviceRevocation::Revoked
+            );
+        }
+        assert_eq!(
+            db.relay_device(&pending.device_id)
+                .unwrap()
+                .unwrap()
+                .revoked_at,
+            Some(pending.issued_at + 2)
+        );
+        drop(db);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn relay_filler_row(index: usize) -> RelayPendingDeviceRow {
+        let mut id = [0u8; RELAY_ID_BYTES];
+        id[..8].copy_from_slice(&(index as u64 + 1).to_be_bytes());
+        let mut public_key = [0x07u8; RELAY_PUBLIC_KEY_BYTES];
+        public_key[0] = 0x04;
+        public_key[1..9].copy_from_slice(&(index as u64 + 1).to_be_bytes());
+        RelayPendingDeviceRow {
+            pairing_id: id,
+            device_id: id,
+            identity_public_sec1: public_key,
+            display_name: format!("filler-{index}"),
+            permission_view: true,
+            permission_input: false,
+            permission_upload: false,
+            permission_approval: false,
+            issued_at: 1_800_000_000,
+            pairing_expires_at: 1_800_000_000 + RELAY_PAIRING_WINDOW_SECS_MAX,
+            device_expires_at: 1_800_086_400,
+        }
+    }
+
+    /// 65바이트/`0x04` 접두사를 만족하지만 곡선 위에 없는 점.
+    fn off_curve_sec1_point() -> [u8; RELAY_PUBLIC_KEY_BYTES] {
+        let mut point = [0u8; RELAY_PUBLIC_KEY_BYTES];
+        point[0] = 0x04;
+        point[1..].fill(0x01);
+        point
+    }
+
+    #[test]
+    fn relay_v36_file_migrates_to_v37_and_reopens() {
+        assert_eq!(MIGRATIONS.len(), 37);
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-relay-v36-migration-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("metadata.sqlite3");
+        let legacy = storage_core::open_with_migrations(&path, &MIGRATIONS[..36]).unwrap();
+        assert_eq!(storage_core::read_user_version(&legacy).unwrap(), 36);
+        drop(legacy);
+
+        let migrated = Db::open(&path).unwrap();
+        assert_eq!(Db::read_user_version(&migrated.conn).unwrap(), 37);
+        for table in ["relay_pending_devices", "relay_devices"] {
+            let present: bool = migrated
+                .conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(present, "missing {table}");
+        }
+        drop(migrated);
+        let reopened = Db::open(&path).unwrap();
+        assert_eq!(Db::read_user_version(&reopened.conn).unwrap(), 37);
+        drop(reopened);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn corrupted_relay_pending_row_fails_closed_without_consumption() {
+        let (dir, _path, db) = file_db("relay-corrupt-pending");
+        let pending = relay_pending_row(1, 1, 1);
+        assert_eq!(
+            db.insert_relay_pending_device(&pending, pending.issued_at)
+                .unwrap(),
+            RelayPendingInsert::Stored
+        );
+        db.conn
+            .execute_batch("PRAGMA ignore_check_constraints = ON;")
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE relay_pending_devices SET identity_public_sec1 = zeroblob(4096)
+                 WHERE pairing_id = ?1",
+                [pending.pairing_id.as_slice()],
+            )
+            .unwrap();
+        db.conn
+            .execute_batch("PRAGMA ignore_check_constraints = OFF;")
+            .unwrap();
+
+        assert!(
+            db.approve_relay_pending_device(
+                &pending.pairing_id,
+                &pending.identity_public_sec1,
+                pending.issued_at + 1,
+            )
+            .is_err()
+        );
+        assert_eq!(db.relay_pending_device_count().unwrap(), 1);
+        assert!(db.relay_device(&pending.device_id).unwrap().is_none());
+        drop(db);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn relay_approval_unique_conflict_rolls_back_pending_and_existing_device() {
+        let (dir, _path, db) = file_db("relay-approval-conflict");
+        let first = relay_pending_row(2, 2, 2);
+        db.insert_relay_pending_device(&first, first.issued_at)
+            .unwrap();
+        assert!(matches!(
+            db.approve_relay_pending_device(
+                &first.pairing_id,
+                &first.identity_public_sec1,
+                first.issued_at + 1
+            )
+            .unwrap(),
+            RelayDeviceApproval::Approved(_)
+        ));
+
+        let mut conflicting = relay_pending_row(3, 3, 3);
+        conflicting.identity_public_sec1 = first.identity_public_sec1;
+        db.insert_relay_pending_device(&conflicting, conflicting.issued_at)
+            .unwrap();
+        assert!(
+            db.approve_relay_pending_device(
+                &conflicting.pairing_id,
+                &conflicting.identity_public_sec1,
+                conflicting.issued_at + 1
+            )
+            .is_err()
+        );
+        assert_eq!(db.relay_pending_device_count().unwrap(), 1);
+        assert!(db.relay_device(&conflicting.device_id).unwrap().is_none());
+        let unchanged = db.relay_device(&first.device_id).unwrap().unwrap();
+        assert_eq!(unchanged.identity_public_sec1, first.identity_public_sec1);
+        assert_eq!(unchanged.display_name, first.display_name);
+        assert_eq!(
+            db.list_relay_devices_bounded(RELAY_DEVICE_ROWS_MAX)
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(db);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn relay_device_list_uses_one_read_transaction_before_allocation() {
+        let source = include_str!("db.rs");
+        let body = source
+            .split_once("pub fn list_relay_devices_bounded")
+            .unwrap()
+            .1
+            .split("\n    pub fn ")
+            .next()
+            .unwrap();
+        let transaction = body.find("unchecked_transaction").unwrap();
+        let allocation = body.find("Vec::with_capacity").unwrap();
+        assert!(transaction < allocation);
+        assert!(body.matches("tx.").count() >= 3, "{body}");
     }
 
     fn authorization_plan(

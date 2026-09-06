@@ -1,16 +1,350 @@
 # Codex handoff
 
+## Task 4 COMPLETE — application wiring (2026-08-29)
+
+- Task 4 of `docs/superpowers/plans/2026-08-28-production-relay.md` is now implemented, tested,
+  reviewed across two rounds, and committed. The user authorised editing `crates/app/src/app.rs`
+  and authorised the push; commits through this slice are on `origin/main`.
+- Wiring shape: the **application owns** the transport-neutral `SessionCore`. `start_web` shares it
+  through `serve_with_core`; `relay_enable` reuses the same one. The core is released only when
+  **both** transports are off, so stopping one never kills the other's dashboard. Web push
+  ownership moved from the server into the core, because a server-owned sink dies with the server
+  and would leave a shared core pointing at it.
+- `relay_enable` validates the endpoint **before** spawning a worker. The production endpoint
+  constant is still `None` (BLOCKED), so enabling Relay today fails with `EndpointError::NotAssigned`
+  and that failure is reported in `relay_error`, entirely separate from `web_error`. Tailscale, its
+  token, the Host allowlist, and the loopback listener are untouched — a source law asserts
+  `relay_enable` does not even name them.
+- `RelayDashboardSink` passes every decrypted frame through the permission adapter before any side
+  effect. The first release is fixed view-only, so only watch/unwatch reach the core today.
+- Review round 1 found three defects, all real, all fixed:
+  1. **medium** — a failed web bind leaked the freshly created shared core, leaving bridge threads
+     alive with both transports off.
+  2. **medium** — starting Relay first created a core without a push manager, and a later web start
+     reused it without topping up, so web push stayed dead despite a VAPID key being present. Fixed
+     with an idempotent `SessionCore::ensure_push`.
+  3. **medium** — a `CloseChannel` admission only logged, so a peer past the violation limit kept
+     its channel. `RelayFrameSink::accept` now returns `SinkOutcome`, and the worker closes the
+     session and backs off.
+  Round 2 confirmed all three closed and found one more **medium**: a failed web bind could leave a
+  newly attached push manager running on a Relay-retained core. Investigating it showed the same
+  leak on the **normal `web_disable` path**, which the reviewer had not flagged — turning mobile web
+  off would have kept sending push notifications to the phone. Web push is now explicitly tied to
+  the web transport's lifetime through `SessionCore::stop_push` and `App::web_transport_stopped`.
+- Gates: app crate 2030 + 38, workspace 3786 passed / 0 failed, workspace clippy `-D warnings`
+  exit 0, `cargo fmt --all -- --check`, `check-boundary`, `check-deps`, and both whitespace scans
+  clean.
+- `crates/app/src/app.rs` edit safety: the user's three uncommitted hunks (around lines 4075,
+  12748, and 39746) were left untouched; every change of ours is in a separate hunk. `rustfmt` was
+  run on the file only after confirming its diff was confined to our own added lines.
+- Carried into Task 5: `relay_disable` and `relay_error` are written but not yet read — the
+  settings switch and error display are Task 5's, and both carry an `#[allow(dead_code)]` naming
+  that task. Task 5 also owns the pairing UI, device list, and five-locale i18n.
+
+## Task 4 IN PROGRESS — third slice: permission enforcement adapter (2026-08-29)
+
+- **Task 4 is still NOT complete.** Steps 1-3 of the plan are now implemented. What remains is the
+  app startup wiring (`crates/app/src/app.rs`, blocked on the user's uncommitted changes there) and
+  the end-to-end coexistence tests that need that wiring to exist.
+- `relay_client/adapter.rs` enforces device permissions on the Mac **before any side effect**.
+  Hiding controls in the browser is not enforcement — a forged message never touches the UI. Every
+  decrypted command passes through `admit`, and only an `Allow` may reach a runtime command sink,
+  the upload path, or the approval repository. `may_emit` filters the outbound direction so a
+  view-only device never receives approval data, neither the snapshot present at connection time
+  nor any later update.
+- Enforced properties, each with a test: view-only still gets dashboard/viewport/input-pressure
+  traffic; forged input/key/scroll/switch/resolve/upload are refused with a recording executor
+  proving no sink was touched; granting input never implies upload or approval; ordinary allowed
+  traffic does not consume the violation budget; repeated forbidden commands close the channel at
+  exactly `MAX_PERMISSION_VIOLATIONS`; revocation and permission downgrade both apply to the
+  already-open channel immediately; and a protocol-v3 `auth` frame is refused over Relay no matter
+  how broad the device's permissions are.
+- Review round found two items:
+  - **medium, fixed** — `admit_upload()` returned `Allow(ClientMsg::Unwatch)`, so a caller
+    following the contract literally ("execute the allowed command") would have performed an
+    unrelated unwatch. Upload admission now has its own `RelayAdmission::AllowUpload` shape.
+  - **high, rejected as a false positive** — the reviewer proposed splitting `RelayPermissions`
+    so input, key, scroll, and switch each need their own grant. The plan's first-release
+    capability matrix deliberately groups them ("future input grant | key, input, scroll,
+    switch"), and Task 1's contract shipped that way in `e3617ea`. Splitting them would
+    contradict the approved design, so the grouping stands; a test now pins it and cites the
+    matrix so it cannot later be mistaken for an oversight. **If that grouping is ever to change,
+    change the plan first.**
+- Gates: `web-remote` 265 + 3 + 5, workspace 3775 passed / 0 failed across 59 binaries, workspace
+  clippy `-D warnings` exit 0, `cargo fmt --all -- --check`, and both whitespace scans clean.
+- Process note: two `cargo test --workspace` runs were briefly launched writing to the same log
+  file, which produced a nonsense "636 passed" reading. Give each background run its own log path.
+
+## Task 4 IN PROGRESS — second slice: reconnect worker and WSS transport (2026-08-29)
+
+- **Task 4 is still NOT complete.** This slice adds the bounded reconnect worker and the outbound
+  WSS transport. The permission-enforcing message adapter (Step 3) and the app startup wiring are
+  still missing. Do not report Task 4 as passing.
+- `relay_client/worker.rs` — one owner thread does connect, receive, and retry. The command queue
+  is bounded (32) and rejects rather than growing or blocking. Every wait is cancellable through a
+  condition variable, so disabling mid-backoff does not wait the delay out. `shutdown` sets the
+  stop flag, wakes the thread, and joins; `Drop` does the same and both are safe to call twice.
+  Transport is injected as a trait, so retry, halt, and cancellation behaviour is tested without a
+  network at all.
+- `relay_client/tls.rs` — outbound WSS only. Trust is the **compiled WebPKI root set alone**:
+  `tungstenite` is built with `rustls-tls-webpki-roots` and the connector argument is left `None`
+  so no custom verifier can be introduced. Source laws forbid native-tls, native/system roots,
+  private CAs, and any `dangerous`/`insecure` verifier path, and a manifest law checks the feature
+  selection (reading directives only — the comment there names the forbidden features in order to
+  explain them).
+- Direct review, two rounds. Round 1 found four defects, all real, all fixed:
+  1. **high** — DNS used blocking `to_socket_addrs` with no deadline, so a stalled resolver pinned
+     the owner thread and blocked shutdown. Lookups now run on a short-lived thread while the
+     caller waits with `recv_timeout`.
+  2. **high** — the TLS/WebSocket handshake used fixed socket timeouts, so it could run far past
+     the connect deadline after TCP had consumed most of the budget. The remaining budget is now
+     recomputed immediately before the handshake and applied to both directions.
+  3. **high** — `receive(timeout)` ignored its argument and used a fixed 30-second constant, so a
+     disable or shutdown during a read was not noticed for up to 30 seconds. The session now
+     applies the worker's timeout to the underlying `TcpStream` (reached through `MaybeTlsStream`)
+     and the fixed constant was deleted.
+  4. **medium** — `Wake::wait` lost a signal delivered just before the wait, so a disable racing
+     the wait still slept a full poll interval. It now checks and clears the flag under the lock
+     first.
+  Round 2 confirmed all four closed and found one more **medium**: abandoned DNS threads could
+  grow without bound if the resolver never returned. My own comment had claimed backoff prevented
+  this — it bounds the *rate*, not the outstanding total. There is now a hard cap of two
+  concurrent lookups, checked before the thread is spawned, with the slot returned on completion.
+- Gates after every fix: `web-remote` 251 + 3 + 5, workspace 3763 passed / 0 failed, workspace
+  clippy `-D warnings` exit 0, `cargo fmt --all -- --check`, and both whitespace scans clean.
+- Note for the next slice: `MAX_RELAY_FRAME_BYTES` in `tls.rs` is now asserted equal to
+  `relay::crypto::MAX_RELAY_CIPHERTEXT_BYTES + 52`. The remaining cross-crate gap is with
+  `relay_protocol::MAX_CIPHERTEXT_BYTES`, which still has no compile-time tie.
+
+## Task 4 IN PROGRESS — first slice only (2026-08-29)
+
+- **Task 4 is NOT complete.** This slice covers Step 1 (transport-neutral core extraction,
+  independent `RelayConfig`, endpoint policy) and the I/O-free half of Step 2 (backoff and the
+  reconnect state machine). The socket worker, TLS, the permission-enforcing message adapter,
+  and app startup wiring are **not written yet**. Do not report Task 4 as passing.
+- What landed:
+  - `crates/web-remote/src/session_core.rs` — `SessionCore` owns the dashboard bridge without a
+    listener. `WebRemoteServer::serve` still creates and owns one (behaviour unchanged, all
+    existing tests untouched); the new `serve_with_core` shares an app-owned one and, crucially,
+    does **not** stop it on shutdown. `serve` gained no new `ServeOptions` field on purpose —
+    adding one would have forced an edit to the dirty `crates/app/src/app.rs`.
+  - `crates/web-remote/src/relay_client/lifecycle.rs` — `RelayEndpoint` policy, `BackoffPolicy`,
+    and `RelayLifecycle`. No I/O at all (a source law asserts it), so revocation and
+    authentication-failure behaviour is deterministic without a network.
+  - `crates/app/src/config.rs` — `RelayConfig { enabled }`, default off, independent of
+    `config.web`. A test asserts no transport-mode enum is ever serialised and that a legacy
+    config without a `[relay]` section still loads with Relay disabled.
+  - `crates/web-remote/tests/transport_independence.rs` — the three arrangements
+    (Tailscale-only, Relay-only, both) plus server-start failure and repeated restart, all
+    proving neither transport disturbs the other's core.
+- Direct review (one round, scoped to this slice) found three real defects, all fixed:
+  1. **high** — `serve_with_core` installed a *server-owned* push sink into the *shared* core,
+     so stopping the loopback server left Relay's core pointing at a stopped sink. That is
+     exactly the cross-transport mutation this slice exists to prevent. Now the combination is
+     refused outright; web-push ownership under a shared core is an open decision for the app
+     wiring, and refusing loudly beats silently dropping push.
+  2. **medium** — `connecting()` could move to `Connecting` while still inside the backoff
+     window. Replaced with `begin_connect(now) -> bool`, which folds the deadline check and the
+     transition into one call so "checked but transitioned anyway" cannot be written.
+  3. **medium** — host validation accepted non-DNS labels (`-relay.example.test`,
+     `relay-.example.test`, 64-byte labels). Now every label is 1..=63 bytes and may not begin
+     or end with a hyphen.
+- Gates after the fixes: `web-remote` 236 + 3 + 5, workspace 3746 passed / 0 failed, workspace
+  clippy `-D warnings` exit 0, `cargo fmt --all -- --check`, `check-boundary`, `check-deps`,
+  and both whitespace scans all clean.
+- **Blocked on a decision, not on work:** Task 4's remaining steps need
+  `crates/app/src/app.rs`, which carries 58 lines of the user's uncommitted changes. Everything
+  above was built specifically to avoid touching it. The wiring is one composition-root edit —
+  construct `SessionCore`, pass it to `serve_with_core` when the web transport is on, and hand
+  the same core to the Relay client — and it should be applied only with the user's agreement,
+  or after their `app.rs` work is committed.
+- Remaining Task 4 work, in order: the bounded reconnect worker (one owner thread,
+  cancellation-aware DNS/connect/read/write deadlines, bounded command queue, stop-and-join on
+  disable/shutdown) with `tungstenite` rustls restricted to `rustls-tls-webpki-roots` and no
+  native-TLS/private-CA/insecure-verifier fallback; the decrypted-message adapter enforcing
+  view-only permissions before any side effect, with a bounded violation counter that closes the
+  channel; immediate termination or re-authorisation of a live channel on revocation or
+  permission downgrade; and the coexistence tests listed in the plan's Step 4. The Relay-only
+  Keychain lifecycle isolation test deferred from Task 2 also lands here.
+- Also still open from Task 3: nothing enforces that
+  `relay_protocol::MAX_CIPHERTEXT_BYTES` equals `web_remote::relay::crypto::MAX_RELAY_CIPHERTEXT_BYTES`.
+  Add that assertion when `web-remote` gains the `relay-protocol` dependency in the worker step.
+
+## Task 3 complete — untrusted Relay data plane (2026-08-29)
+
+- Status: Task 3 of `docs/superpowers/plans/2026-08-28-production-relay.md` is implemented,
+  tested, reviewed across four rounds, and committed. Tasks 1-2 remain `e3617ea` / `a2c0d79`.
+  Task 4 has not started. No push, no deploy, no packaging, no app relaunch.
+- New crates. `crates/relay-protocol` has **zero dependencies** (a test asserts the
+  `[dependencies]` section is empty) and defines the fixed big-endian `DRLY` v1 contract: a
+  52-byte header (magic, version, type, reserved flags, 16-byte route id, 16-byte connection id,
+  u64 sequence, u32 length), twelve frame types each with exactly one legal payload shape, a
+  512-byte opaque hello ceiling, a 1 MiB + 16 ciphertext ceiling, opaque ids that never render
+  their bytes, and a constant-time `AdmissionCredential::matches`. Decoding is preflighted —
+  magic, version, reserved flags, type, then the **declared length against the per-type ceiling**,
+  and only then whether the payload has arrived — so an oversized declaration is refused from the
+  52-byte header alone without buffering. `RelayFrames` stops at the first invalid frame and never
+  resumes; resynchronising a corrupted stream is itself an attack surface.
+- `crates/relay-server` splits an I/O-free state machine (`core.rs`) from a thin sync WebSocket
+  transport (`main.rs`). Every abuse property is therefore deterministic without sockets or a real
+  clock. The one state machine is `AwaitingAdmission -> Desktop{route} | Device{route}`; routes,
+  tickets and queues are allocated only **after** admission succeeds.
+- Golden vectors: `crates/relay-protocol/tests/fixtures/relay-wire-v1.json` was generated by an
+  encoder written independently of the Rust implementation, so it locks the specification rather
+  than the code. Nine accept vectors, eleven reject vectors, and a test asserting every reject
+  vector is exactly 52 bytes — which is the evidence that ceiling checks precede buffering. A
+  further test asserts the fixture contains no key-material vocabulary; the browser shell will
+  load this same file in Task 6.
+- Deployment is **BLOCKED, not PASS**. `deploy/relay/{README.md,staging,production}` carries the
+  status table for the eight unresolved coordinates (Mac admission credential
+  provisioning/rotation owner, staging and production domains, DNS owner, TLS edge, trusted
+  Origin, artifact registry, GitHub environment and secret names, deploy credentials). Six tests
+  in `crates/relay-server/tests/deploy_manifests.rs` keep it honest: they fail if a placeholder is
+  replaced by anything resembling a real coordinate, if a default admission credential appears, if
+  TLS stops being an edge responsibility, if a systemd unit loses its least-privilege settings or
+  passes credentials on the command line, or if the BLOCKED count changes without the table being
+  updated. `.github/workflows/relay-release.yml` builds and digests the binary and then **fails on
+  purpose** at the publish step — a green publish would be a false "deployed" signal.
+- Direct review: four `codex exec --model gpt-5.5 -c model_reasoning_effort=high --sandbox
+  read-only` rounds, each scoped to the Task 3 files and explicitly forbidden from reading this
+  handoff. Round 1 found six defects, all real and all fixed rather than suppressed:
+  1. **high** — expired tickets were only purged by `tick`, so a ticket past its TTL admitted if
+     cleanup had not run. Expiry is now judged by the decision-time clock inside `admit_device`.
+  2. **high** — `admission_windows` was unbounded, so rotating source addresses grew it forever.
+     Added `max_admission_windows`, pruning on tick and before insert, and a full table now
+     rejects with `RateLimited` rather than growing or evicting.
+  3. **high** — DRLY preflight can only run after a whole WebSocket message arrives, so an
+     unadmitted peer could make the server buffer a full frame. The accept path now caps messages
+     at `HEADER_BYTES + 32` and raises the ceiling to `MAX_FRAME_BYTES` only after
+     `RelayCore::connection_is_admitted` returns true.
+  4. **medium** — a ticket refused because the route was busy stayed reusable after the occupant
+     left. It is now consumed before the busy check.
+  5. **medium** — rejection frames were queued to the connection's own channel and the pump then
+     returned without writing them, so clients saw a close with no code. `flush_self` now writes
+     them on every closing path.
+  6. **low** — the desktop credential check short-circuited on route lookup, so timing
+     distinguished a missing route from a wrong credential. It now scans every verifier with no
+     early exit.
+  Round 2 confirmed all six closed and found one **high**: `drop_connection` freed the aggregate
+  reservation immediately while the transport still held those bytes in its channel, so new
+  connections could refill the budget over memory that was still live. Fixed with a two-phase
+  release — `drop_connection` moves the reservation into a `draining` budget that still counts
+  against the aggregate, and only `connection_closed` (the transport's confirmation) releases it;
+  `serve` drops the receiver **before** confirming. Round 3 confirmed that closed and found one
+  more **high**: there was no write deadline, so a peer with a full receive window pinned its
+  worker in `socket.send`, which then never saw the Close and never confirmed closure, stranding
+  the draining budget forever. Fixed with a 10-second `set_write_timeout` applied before the
+  handshake. Round 4 confirmed closed with no remaining critical or high defect.
+- Two further defects were found by re-reading rather than by review, and fixed: `tick` emitted a
+  duplicate `Disconnect` when a desktop's expiry cascaded onto its device; and the queue budget was
+  per-connection only, which multiplied to `max_connections * max_queue_bytes`. Added
+  `max_total_queue_bytes` (64 MiB aggregate) and lowered `max_connections` from 4096 to 512, since
+  that number also bounds the transport's worst-case concurrent read buffers.
+- Gate evidence, all re-run after the final fix (2026-08-29):
+  - `cargo test -p relay-protocol -p relay-server --locked -- --test-threads=1` — 12 + 5 + 25 + 6
+    + 7 = 55 passed, 0 failed.
+  - `cargo test --workspace --locked -- --test-threads=1` — 0 failed.
+  - `cargo clippy -p relay-protocol -p relay-server --locked --all-targets -- -D warnings` and
+    `cargo clippy --workspace --locked --all-targets -- -D warnings` — exit 0.
+  - `cargo fmt --all -- --check`, `git diff --check`, untracked whitespace scan — all clean.
+  - `cargo run --locked -p xtask -- check-boundary` and `check-deps` — pass.
+- Carried forward to Task 4, deliberately not done here: `relay_protocol::MAX_CIPHERTEXT_BYTES`
+  and `web_remote::relay::crypto::MAX_RELAY_CIPHERTEXT_BYTES` are both 1 MiB + 16 but **nothing
+  enforces the agreement across the crate boundary**. Task 4 is where `web-remote` gains the
+  `relay-protocol` dependency, so the assertion belongs there; adding the dependency now would
+  reach outside Task 3's file list.
+- Also for Task 4: the Mac client must not reconnect after credential revocation or an
+  authentication failure without explicit user action, and Relay start/stop must not touch the
+  Tailscale server, its token, or the loopback listener. The Task 2 App repository and Keychain
+  identity are wired only into Relay there, and the Relay-only Keychain lifecycle isolation test
+  deferred from Task 2 lands there too.
+
+## Task 2 complete — production Relay persistence (2026-08-29)
+
+- Status: Task 2 of `docs/superpowers/plans/2026-08-28-production-relay.md` is implemented,
+  tested, reviewed, and committed in isolation. Task 1 remains `e3617ea`. Task 3 has not
+  started. No push, no packaging, no deploy, no app relaunch was performed.
+- What Task 2 now owns: `crates/web-remote/src/relay/repository.rs` (storage-neutral port),
+  `crates/app/src/relay_repository.rs` (production adapter owning `storage::Db`), the v37
+  relay schema and relay APIs in `crates/storage/src/db.rs`, the relay exports in
+  `crates/storage/src/lib.rs`, `pub mod repository;` in `crates/web-remote/src/relay/mod.rs`,
+  and one `mod relay_repository;` line in `crates/app/src/main.rs`. Every other dirty file
+  (`Cargo.toml`, `Cargo.lock`, `crates/app/src/app.rs`, `crates/secret/*`, packaging scripts,
+  mockups, prototype plan) was left untouched and unstaged.
+- Findings from the previous stop that are now closed:
+  - **Split expiries.** `RelayPairingLifetime` carries `issued_at`, `pairing_expires_at`
+    (bounded by `PAIRING_TTL_SECS` = 300s) and `device_expires_at` as three typed values;
+    the v37 pending table has both columns with CHECK constraints
+    (`pairing_expires_at - issued_at <= 300`, `device_expires_at >= pairing_expires_at`) and
+    `relay_devices.device_expires_at` is the admitted-device window. Approval fails at the
+    exact pairing deadline and the published device outlives it. Boundary tests exist at the
+    value, SQL, and adapter level.
+  - **Real durable corruption.** The 65-byte `0x04`-prefixed off-curve point is now covered:
+    web-remote rejects it in both record constructors; storage documents that SQLite CHECKs
+    cannot see the curve; the app adapter rejects a tampered pending row before any approval
+    mutation and a tampered device row before admission (real `rusqlite` tampering of the DB
+    file, not a synthetic value).
+  - **Coordinator ordering and crash compensation.** `PendingAdmission` holds the
+    non-cloneable `PairingApproval` and enforces
+    `PairingRegistry::consume -> begin (pending row) -> user approval -> approve (DB commit)
+    -> AuthenticatedHandshake::confirm`. A confirmation failure after the commit revokes the
+    freshly published device; a failed compensating revocation is folded into the error, not
+    swallowed. `AppRelayRepository::open` purges leftover pending rows because a restart
+    destroys every in-memory approval.
+  - **Production adapter.** `AppRelayRepository` is the only SQLite owner; every row passes
+    through the validated `web-remote` constructors. `web-remote` production code contains no
+    `storage::`/`rusqlite` reference (source law test). The old `#[cfg(test)]`
+    `StorageRelayTestRepository` was removed so there is exactly one adapter.
+  - **Single-instance identity.** `create_relay_identity_after_single_instance_lock` requires
+    a `&persist::LockFile`, so identity creation cannot compile before the app's `deppy.lock`
+    is held. A source-law test proves `get_or_create_relay_identity` has exactly one call site
+    in the whole app crate.
+- Direct review round: `codex exec --model gpt-5.5 -c model_reasoning_effort=high
+  --sandbox read-only` with a prompt scoped to the four Task 2 files and explicitly forbidden
+  from reading this handoff (that is what filled the pipe last time). It returned one **High**
+  finding and no others: the adapter validated the pending row in one transaction while
+  storage approved in another, so a row swapped in between could be published and then fail
+  conversion, leaving an unrevoked device row (`PendingAdmission::approve` propagates that
+  error with `?` before compensation). Fixed by passing the validated
+  `expected_identity_public_sec1` into `Db::approve_relay_pending_device` and re-checking it
+  **inside** the approval transaction; a mismatch bails and the transaction rolls back, so
+  nothing is published. Regression test:
+  `db::tests::relay_approval_rejects_a_pending_row_that_changed_after_validation`.
+- Gate evidence, all re-run after that fix (2026-08-29):
+  - `cargo test -p storage --locked -- --test-threads=1` — 324 passed, 0 failed.
+  - `cargo test -p web-remote --locked -- --test-threads=1` — 221 + 3 passed, 0 failed,
+    1 ignored (the Chrome vector, run separately below).
+  - `cargo test -p deppy-sijo --locked relay_repository -- --test-threads=1` — 10 passed.
+  - `cargo test -p web-remote --locked --test relay_webcrypto_vectors -- --ignored` — 1 passed
+    against real Chrome.
+  - `cargo clippy -p web-remote -p storage -p deppy-sijo --locked --all-targets -- -D warnings`
+    — exit 0. Four findings were fixed rather than silenced (two large-enum variants, an
+    8-argument constructor, an explicit auto-deref); the only remaining `#[allow]` is
+    `large_enum_variant` on `AdmissionOutcome`, justified in place because boxing would copy
+    live AES-GCM key material to the heap and leave the stack copy unzeroized.
+  - `cargo fmt --all -- --check` — exit 0. `git diff --check` — exit 0. Untracked whitespace
+    scan — no matches.
+- Deliberately deferred, not skipped: the Relay-only **lifecycle** isolation test (proving a
+  Keychain denial neither starts, stops, nor mutates Tailscale) belongs to **Task 4**, because
+  Task 2 creates no startup wiring by design. What Task 2 does prove is that the denial is a
+  Relay-scoped error, that the repository still opens after it, and that the adapter module
+  imports nothing from the rest of the app (`use crate::` is forbidden by a source law).
+- Next: Task 3 (`relay-protocol` + untrusted `relay-server`). Its production publish stays
+  **BLOCKED** on Mac verifier provisioning, DNS, registry, TLS edge, Origin, GitHub
+  environments, and secret names. Tasks 4-7 checklists are unchanged and still recorded below.
+
 ## Current task — implement provider-usage visibility hardening (2026-08-26)
 
-- Current objective: complete the approved Claude/Codex/Grok/Kimi usage-visibility hardening and leave the branch reviewed, fully verified, documented, and committed without packaging, relaunching, or pushing.
+- Current objective: complete the approved Claude/Codex/Grok/Kimi usage-visibility hardening, push the reviewed commits, rebuild the trusted macOS release, and place the verified app bundle on the Desktop without relaunching it.
 - Completed work: all six plan tasks are complete. Installed+enabled Kimi now retains a `—` cell when its account exposes no numeric plan; Claude/Kimi reuse the launcher-detected executable and bounded PATH; disabled or undetected providers do no probe work; required PTY writes must be accepted; failed worker spawns are refresh-bounded; worker completion time, rather than UI receive time, controls freshness; Codex app-server gaps are supplemented window-by-window; narrow status bars preserve every provider logo and one priority value. Windows `.cmd`/`.bat` launch now uses the absolute command processor returned by `GetSystemDirectoryW`, enables extensions, disables delayed expansion, and escapes valid cmd-sensitive path characters including `%`, `=`, and `^`. Relative inherited PATH entries are rejected at the launcher detection boundary. Product changes and the completed implementation plan were committed as `f9e01d4`; the Workstep journal was created at `프로젝트 일지/deppy-sijo/2026-08-26 공급자 사용량 가시성 강화.md`.
 - Modified files: `crates/app/Cargo.toml`, `crates/app/src/agent_launcher.rs`, `crates/app/src/app.rs`, `crates/app/src/claude_usage.rs`, `crates/app/src/codex_backend_usage.rs`, `crates/app/src/kimi_usage.rs`, `crates/app/src/main.rs`, new `crates/app/src/provider_usage_command.rs`, `crates/app/src/ui/agent_terminal.rs`, the implementation plan, and this handoff.
 - Key design decisions: App owns installed/enabled visibility and probes own only numeric availability; installed+enabled+unavailable is visible, while missing/disabled is hidden and not probed. Launcher detection is the single executable/PATH authority and admits only absolute inherited PATH entries. Server data wins per Codex window and the backend fills only missing windows. Compact status rendering removes decoration before provider identity/value. Windows batch launch never searches the user-controlled probe PATH for `cmd.exe`.
 - Test commands and results: Finder-minimal Kimi live probe passed 1/1 in 22.36s with its truthful unavailable state; setting `DEPPY_KIMI_EXPECT_USAGE=1` failed as expected after 16.12s because this account has no numeric managed-plan data. Finder-minimal Grok numeric probe passed 1/1 in 17.53s. RED/GREEN covered Kimi placeholder state, launcher command construction, disabled gates, PTY backpressure, worker freshness/spawn failure, 300–1,200pt status widths, Windows `%`/`=`/`^` and `.cmd`/`.bat` wrapping, trusted `cmd.exe`, and relative PATH rejection. Final `CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 cargo test --workspace --locked -- --test-threads=1` exited 0 (App 2010 passed, 14 ignored; all integration/doc suites passed). The first full run had one unrelated macOS FSEvents watcher timeout after 30s; its exact rerun passed in 7.79s and the complete rerun passed. Final strict workspace all-target Clippy exited 0 in 4m43s; rustfmt, `git diff --check`, i18n (8 tests, 1,053 literal calls, 5 locales, 63 dynamic calls), and zero-allowlist boundary checks exited 0.
 - Review results: repeated independent Codex reviews found and drove fixes for direct batch execution, cmd metacharacters, user-PATH `cmd.exe` hijacking, percent expansion, disabled command extensions, non-independent trusted-path tests, missing `=`/`^`/`.bat` coverage, worker completion timestamp freshness, failed-spawn hot retry, and relative launcher PATH entries. The final scoped independent review returned `NO FINDINGS`.
 - Failed approaches: an initial `codex review --base` invocation with an extra prompt was invalid; the review skill preamble cleanup was rejected; some early Cargo filters selected the wrong package or zero tests; a Windows MSVC cross-check reached `ring` but failed because the host lacks the MSVC C headers/toolchain (`assert.h` missing), so it is not pass evidence. Several review runs emitted unrelated invalid-skill-frontmatter and read-only macOS cache warnings. The first final workspace test hit the isolated FSEvents timeout described above and is not counted as a pass.
-- Remaining work: no product, test, review, or journal work remains. Commit this final handoff state only. Packaging, Desktop replacement, relaunch, and push remain intentionally unperformed because this request did not authorize them.
-- Exact next commands: `git add docs/CODEX_HANDOFF.md && git commit -m 'docs(workstep): 공급자 사용량 작업 기록'`; record that documentation SHA in the external journal; inspect `git status --short --branch` and `git log --oneline -8`.
+- Delivery results: after `git fetch origin main` reported `0 behind / 8 ahead`, `git push origin main` advanced the remote from `fa45e46` to `22d4926`. `CARGO_NET_OFFLINE=true scripts/package-macos.sh` completed the optimized App+helper build in 18.45s, signed both nested executables and the bundle with `Developer ID Application: VectorNine INC (ZDTU5LS35K)`, and passed the script's bundle, plist, architecture, signature, extracted-archive, and ZIP verification. The previous exact Desktop bundle was moved to Trash, then the staged replacement was independently deep/strict codesign-verified at `/Users/jr/Desktop/Deppy Sijo.app`; it is arm64 with bundle id `app.vector9.deppy-sijo`. Source and Desktop main executable SHA-256 both equal `6f61cdd71aede55045cd3d3ad2e92fc27c57a1e303e31fbfdbe4b80c48174252`; the release ZIP SHA-256 is `98d0f5135d86554d4bf47df30911c14ecddb3c16d82a359db9768ae0232e0512`.
+- Remaining work: no product, test, review, packaging, copy, commit, or push work remains after committing and pushing this delivery record. The app was deliberately not stopped or relaunched because the user asked only for rebuild and Desktop copy.
+- Exact next commands: `git status --short --branch`; if the user later requests launch, open the exact verified bundle `/Users/jr/Desktop/Deppy Sijo.app` and verify its process path.
 
 ## Current task — review provider-usage visibility including Kimi (2026-08-26)
 
@@ -1802,3 +2136,15 @@
 - Build result: `DEPPY_SIGN_IDENTITY='Developer ID Application: VectorNine INC (ZDTU5LS35K)' CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 sh scripts/package-macos.sh` completed; independent `codesign --verify --deep --strict --verbose=2` and `unzip -tq` passed. Bundle: `/private/tmp/deppy-sf06-integration/target/bundle/Deppy Sijo.app`; archive: `/private/tmp/deppy-sf06-integration/target/bundle/Deppy Sijo.zip`.
 - Remaining work: visually exercise the resource and port popovers in the signed bundle, then commit/push only when explicitly requested. The current implementation files and handoff remain uncommitted.
 - Exact next commands: `open -n '/private/tmp/deppy-sf06-integration/target/bundle/Deppy Sijo.app'`; `git -C /private/tmp/deppy-sf06-integration status --short --branch`; `git -C /private/tmp/deppy-sf06-integration diff --check`; `git -C /private/tmp/deppy-sf06-integration diff -- crates/app/src/app.rs crates/app/src/ui/activity.rs crates/app/src/ui/agent_terminal.rs crates/app/src/ui/resource_manager.rs docs/CODEX_HANDOFF.md`.
+
+## 2026-09-06 completed IME and resize changes clean landing
+
+- Current objective: land only the completed Korean IME and window-resize fixes on `main`, without the unfinished Relay reconnect work in PR #146 or the unfinished terminal-layout work in PR #149.
+- Completed work: created `land/ime-resize-ready-20260906` directly from `origin/main` (`12ee4c7`); extracted the completed IME/CJK rendering changes as `4903b39`; extracted the completed resize debounce and presentation-fence changes as `bbead4f`; found and fixed one review defect where a viewport could keep moving inside the same rounded terminal grid after the 120 ms debounce expired.
+- Modified files: `crates/app/src/ui/workspace.rs`, `crates/terminal/src/renderer_egui.rs`, and this handoff.
+- Key design decisions: the first terminal size is still sent immediately; later resize targets require `(cols, rows)` and the root viewport size to remain stable for 120 ms; successful ordinary window resize delivery uses the same bounded stable-snapshot presentation fence as split resize; the five unused Fleet keys were not removed here because current `main` still references them and their safe removal depends on the Fleet UI portion of PR #146.
+- Code review: the first bounded IME review found no actual bug. The first resize review found the rounded-grid debounce defect. A RED test reproduced it, the viewport-size stability fix made it GREEN, and a second bounded review found no remaining correctness, race, or state-machine bug in the final diff.
+- Test commands and results: `cargo test -p deppy-sijo --bin deppy-sijo --locked '같은_격자_안에서_viewport가_움직이면_리사이즈를_확정하지_않는다' -- --nocapture` first failed with `sent_sizes = (81, 24)` and then passed after the fix; `cargo test -p deppy-sijo --bin deppy-sijo --locked ui::workspace::tests -- --test-threads=1` passed 233 tests; `cargo clippy -p terminal -p deppy-sijo --all-targets --locked -- -D warnings` passed; `cargo test -p deppy-sijo --bin deppy-sijo --locked` passed 2,035 tests with 14 ignored; `cargo test -p terminal --locked` passed 86 tests with 4 ignored; final `cargo fmt --all -- --check` and `git diff --check` passed.
+- Failed approaches: an initial unbounded `codex review --uncommitted` ran extensive checks but never produced a final review and was stopped by exact PID; it also attempted the invalid `cargo test -p deppy-sijo --lib` command even though the app has no library target. The first RED-test draft used unavailable `Context::run`, then captured `WorkspaceUi` too broadly; both compile-only mistakes were corrected before the intended RED assertion was observed. The first final format check found one line-wrap difference; `cargo fmt --all` corrected it and the rerun passed.
+- Remaining work: push this clean landing branch, create a PR to `main`, wait for required checks, merge only if green, close superseded PRs #147 and #148, and preserve PRs #146 and #149 plus their dependent remote branches for further development.
+- Exact next commands: `git push -u origin land/ime-resize-ready-20260906`; create a `main` PR for commits `4903b39` and `bbead4f`; run `gh pr checks <new-pr> --watch`; merge the new PR after all required checks pass; close #147 and #148 without deleting the `fix/window-resize-flicker` branch because PR #149 still targets it.

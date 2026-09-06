@@ -270,18 +270,29 @@ pub fn cell_size(ctx: &egui::Context, metrics: CellMetrics) -> egui::Vec2 {
     })
 }
 
-/// 글자 사이에 더하는 여백(2026-08-21). 모노 폰트의 원래 advance만 쓰면 글자가 서로
-/// 붙어 읽기 어려웠다.
-///
-/// 셀 폭(`cell_size`)과 갤리 레이아웃(`extra_letter_spacing`)에 **같은 값**이 들어가야
-/// 한다 — 한쪽만 넓히면 run 안에서 글자가 자기 셀에서 조금씩 밀려 커서·선택 영역과
-/// 어긋난다.
+/// 글자 사이에 더하는 여백. 셀 폭(`cell_size`)과 갤리 레이아웃에 **같은 값**이 들어가야
+/// run 안에서 글자가 자기 셀에서 밀리지 않는다.
 fn extra_letter_spacing(font_size: f32) -> f32 {
     (font_size * TERMINAL_LETTER_SPACING_RATIO).round()
 }
 
-/// 폰트 크기 대비 자간 비율 — 크기를 바꿔도 인상이 유지되도록 비례로 둔다.
-const TERMINAL_LETTER_SPACING_RATIO: f32 = 0.08;
+/// 폰트 크기 대비 자간 비율.
+///
+/// **0이어야 한다 — 모노 격자에 가로 자간을 더하면 한글·CJK가 반드시 깨진다**
+/// (2026-09-03 사용자 신고: grok 에이전트 한글이 글자마다 벌어짐).
+///
+/// 자간 `s`는 글자 **뒤에** 붙는 여백이라 셀 폭은 `M + s`가 되는데, wide 글자의 상자는
+/// 2칸이라 `2M + 2s`인 반면 글리프 advance는 `2M + s`에 그친다. 그래서 한글끼리의
+/// 간격만 `2s`가 되어 라틴(`s`)의 **정확히 두 배**로 벌어진다. D2Coding 13.5pt 실측:
+/// 라틴 6.75+1=7.75(셀 폭과 일치, 간격 1px), 한글 13.5+1=14.5 in 15.5(간격 2px).
+///
+/// 글리프를 가로로만 늘리지 않는 한 이 배수는 없앨 수 없고, 그래서 실제 터미널들도
+/// 이 값을 0으로 둔다 — cmux(manaflow-ai/cmux)가 쓰는 xterm.js v6도 `letterSpacing`
+/// 기본값이 0이고 cmux는 이 옵션을 아예 설정하지 않는다.
+///
+/// 글자가 답답하면 **세로 여백(`line_height`)이나 폰트 크기**로 조절한다 — 둘 다 격자의
+/// 1:2 관계를 깨지 않는다.
+const TERMINAL_LETTER_SPACING_RATIO: f32 = 0.0;
 
 /// 밑줄·취소선 두께와, 밑줄을 글자 블록 바닥에서 끌어올리는 양.
 const UNDERLINE_THICKNESS: f32 = 1.0;
@@ -361,7 +372,15 @@ pub fn draw(
     // interrupt하므로, 진행 중 preedit 동안 비-TextEdit 포커스가 한 프레임 튀었다고
     // 호출하면 macOS가 자모를 강제 commit한다. 진행 중 조합은 아래 IME output을 유지한
     // 채 호출측이 논리적 입력 소유권으로 계속 소비하고, commit 뒤 다음 프레임에 복귀한다.
-    let continues_preedit = ime_active && preedit.is_some_and(|preedit| !preedit.is_empty());
+    // 호출측 `preedit`은 draw 뒤에 이벤트를 읽어 채우므로 조합이 **시작되는 프레임**에는
+    // 아직 비어 있다. 그 한 프레임의 공백만 보고 request_focus를 부르면 egui가
+    // `Memory::interrupt_ime`를 켜고, egui-winit이 그걸 `set_ime_allowed(false)/(true)`로
+    // 바꾼다. winit macOS는 그때 marked_text를 비우고 `ImeState::Disabled`로 래치하는데
+    // `(true)`는 상태를 되돌리지 않아, 아직 조합을 들고 있는 macOS IM의 다음 커밋이
+    // `Ime::Commit` 없이 원시 키로 새어 나간다. 이번 프레임 입력도 함께 본다.
+    let continues_preedit = ime_active
+        && (preedit.is_some_and(|preedit| !preedit.is_empty())
+            || frame_has_active_preedit(ui.ctx()));
     if ime_active && !continues_preedit && !ui.memory(|memory| memory.owns_ime_events(response.id))
     {
         response.request_focus();
@@ -534,6 +553,24 @@ fn terminal_content_rect(rect: egui::Rect) -> egui::Rect {
         rect.min + egui::vec2(inset, 0.0),
         rect.max - egui::vec2(inset, 0.0),
     )
+}
+
+/// 이번 프레임 raw 입력이 **진행 중인** IME 조합을 나타내는지.
+///
+/// 비어 있지 않은 `Preedit`만 조합으로 센다. 조합이 끝나며 오는 `Preedit("")`
+/// (winit의 `unmarkText`와 커밋 경로가 낸다)와 `Commit`만 남은 프레임은 조합 중이
+/// 아니므로 포커스 복구를 막지 않아야 한다 — 막으면 터미널이 egui 포커스를 영영
+/// 되찾지 못한다. 호출측이 `ime_active`로 이미 TextEdit·팝업 소유 프레임을 걸러내므로
+/// 이 판정이 다른 입력창의 조합을 가로채지 않는다.
+pub fn frame_has_active_preedit(ctx: &egui::Context) -> bool {
+    ctx.input(|input| {
+        input.raw.events.iter().any(|event| {
+            matches!(
+                event,
+                egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }) if !text.is_empty()
+            )
+        })
+    })
 }
 
 pub fn terminal_focus_lock_filter() -> egui::EventFilter {
@@ -1443,6 +1480,142 @@ mod tests {
             !ime.should_interrupt_composition,
             "조합 중 request_focus는 egui가 IME 강제 중단으로 바꾼다"
         );
+    }
+
+    /// 조합이 **이번 프레임에 막 시작된** 경우, 호출측 `preedit`은 아직 비어 있다
+    /// (UI는 draw 뒤에 이벤트를 읽어 다음 프레임에야 채운다). 그 한 프레임의 공백을
+    /// 근거로 `request_focus`를 부르면 egui가 `Memory::interrupt_ime`를 켜고,
+    /// egui-winit이 `set_ime_allowed(false)/(true)`로 바꾼다. winit macOS는 그때
+    /// marked_text를 비우고 `ImeState::Disabled`를 걸어두는데 `set_ime_allowed(true)`는
+    /// 상태를 되돌리지 않는다. macOS IM은 계속 조합 중이므로 다음 `insertText:`가
+    /// `hasMarkedText() == false`를 만나 `Ime::Commit`을 못 내고, 원시
+    /// `NSEvent.characters`(한글 입력 소스에서는 자모)가 그대로 키 입력으로 나간다 —
+    /// 빠르게 칠 때 "ㄱㅏ"로 갈라지는 경로다.
+    #[test]
+    fn 이번_프레임에_시작된_조합은_포커스_복구가_중단시키지_않는다() {
+        let ctx = egui::Context::default();
+        let mut cache = TerminalRenderCache::default();
+        let snapshot = snap(4, 1, &["test"]);
+
+        // 다른 위젯이 포커스를 쥔 상태 — 터미널은 논리적 키보드 소유자지만 egui의
+        // 공식 소유자가 아니라 draw가 포커스를 되찾으려 한다.
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let transient = ui.button("transient focus");
+            transient.request_focus();
+        });
+
+        let input = egui::RawInput {
+            events: vec![egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: "ㄱ".into(),
+                active_range_chars: None,
+            })],
+            ..Default::default()
+        };
+        let full = ctx.run_ui(input, |ui| {
+            ui.set_min_size(egui::vec2(500.0, 200.0));
+            let _ = ui.button("transient focus");
+            draw(
+                ui,
+                &snapshot,
+                m(13.0, 1.0),
+                &mut cache,
+                // 호출측 preedit은 한 프레임 늦으므로 아직 비어 있다.
+                None,
+                true,
+                None,
+                next_gen(),
+            );
+        });
+
+        let ime = full
+            .platform_output
+            .ime
+            .expect("키보드 소유 터미널은 IME allowance를 유지해야 한다");
+        assert!(
+            !ime.should_interrupt_composition,
+            "이번 프레임에 시작된 조합을 포커스 복구가 강제 중단시켰다"
+        );
+    }
+
+    /// 조합이 **끝나는** 프레임(`Preedit("")` + `Commit`)까지 조합 중으로 세면 터미널이
+    /// egui 포커스를 영영 되찾지 못한다. 그 프레임에는 포커스 복구가 그대로 일어나야 한다.
+    #[test]
+    fn 조합이_끝난_프레임은_포커스_복구를_막지_않는다() {
+        let ctx = egui::Context::default();
+        let mut cache = TerminalRenderCache::default();
+        let snapshot = snap(4, 1, &["test"]);
+
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let transient = ui.button("transient focus");
+            transient.request_focus();
+        });
+
+        let input = egui::RawInput {
+            events: vec![
+                egui::Event::Ime(egui::ImeEvent::Preedit {
+                    text: String::new(),
+                    active_range_chars: None,
+                }),
+                egui::Event::Ime(egui::ImeEvent::Commit("가".into())),
+            ],
+            ..Default::default()
+        };
+        let mut owns_ime_events = false;
+        let full = ctx.run_ui(input, |ui| {
+            ui.set_min_size(egui::vec2(500.0, 200.0));
+            let _ = ui.button("transient focus");
+            let output = draw(
+                ui,
+                &snapshot,
+                m(13.0, 1.0),
+                &mut cache,
+                None,
+                true,
+                None,
+                next_gen(),
+            );
+            owns_ime_events = ui.memory(|memory| memory.owns_ime_events(output.response.id));
+        });
+
+        assert!(
+            owns_ime_events,
+            "조합이 끝난 프레임에서는 터미널이 egui IME 소유권을 되찾아야 한다"
+        );
+        assert!(
+            full.platform_output.ime.is_some(),
+            "소유권을 되찾은 프레임은 IME 영역을 내보내야 한다"
+        );
+    }
+
+    /// 비활성 터미널(다른 TextEdit이 포커스를 쥔 프레임 등)은 이번 프레임에 조합
+    /// 이벤트가 있어도 IME를 가져가지 않는다 — `ime_active`가 유일한 관문이다.
+    #[test]
+    fn 비활성_터미널은_조합_이벤트가_있어도_ime를_가져가지_않는다() {
+        let ctx = egui::Context::default();
+        let mut cache = TerminalRenderCache::default();
+        let snapshot = snap(4, 1, &["test"]);
+
+        let input = egui::RawInput {
+            events: vec![egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: "ㄱ".into(),
+                active_range_chars: None,
+            })],
+            ..Default::default()
+        };
+        let full = ctx.run_ui(input, |ui| {
+            ui.set_min_size(egui::vec2(500.0, 200.0));
+            draw(
+                ui,
+                &snapshot,
+                m(13.0, 1.0),
+                &mut cache,
+                None,
+                false,
+                None,
+                next_gen(),
+            );
+        });
+        assert!(full.platform_output.ime.is_none());
     }
 
     #[test]

@@ -140,6 +140,7 @@ dependencies = [
  "cipher",
  "cpubits",
  "cpufeatures 0.3.0",
+ "zeroize",
 ]
 
 [[package]]
@@ -154,6 +155,7 @@ dependencies = [
  "ctr",
  "ghash",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -613,6 +615,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa"
 dependencies = [
  "hybrid-array",
+ "zeroize",
 ]
 
 [[package]]
@@ -1224,6 +1227,7 @@ dependencies = [
  "const-oid",
  "crypto-common 0.2.2",
  "ctutils",
+ "zeroize",
 ]
 
 [[package]]
@@ -2017,6 +2021,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2eecf2d5dc9b66b732b97707a0210906b1d30523eb773193ab777c0c84b3e8d5"
 dependencies = [
  "polyval",
+ "zeroize",
 ]
 
 [[package]]
@@ -3844,6 +3849,7 @@ dependencies = [
  "cpubits",
  "cpufeatures 0.3.0",
  "universal-hash",
+ "zeroize",
 ]
 
 [[package]]
@@ -4231,6 +4237,21 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "relay-protocol"
+version = "0.1.0"
+
+[[package]]
+name = "relay-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "relay-protocol",
+ "tracing",
+ "tracing-subscriber",
+ "tungstenite",
+]
 
 [[package]]
 name = "renderdoc-sys"
@@ -5302,8 +5323,11 @@ dependencies = [
  "httparse",
  "log",
  "rand 0.10.2",
+ "rustls",
+ "rustls-pki-types",
  "sha1",
  "thiserror 2.0.18",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -5746,23 +5770,29 @@ dependencies = [
 name = "web-remote"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "aes-gcm",
  "anyhow",
  "base64",
  "deppy-core",
  "getrandom 0.4.3",
+ "ghash",
  "hkdf",
+ "hmac",
  "p256",
+ "relay-protocol",
  "runtime",
  "secret",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "storage",
+ "subtle",
  "tracing",
  "tungstenite",
  "ureq",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

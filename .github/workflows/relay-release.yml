@@ -1,0 +1,60 @@
+# Relay 데이터 평면 릴리스. **현재는 publish가 차단된 상태다.**
+#
+# 도메인·레지스트리·TLS edge·배포 자격증명·GitHub 환경 이름이 아직 정해지지 않았다
+# (deploy/relay/README.md의 상태표 참고). 그 좌표를 지어내는 대신, 아티팩트까지만 만들고
+# publish 단계에서 **명시적으로 실패**한다 — 차단을 조용한 성공으로 바꾸지 않기 위해서다.
+name: Relay release
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 배포 대상
+        required: true
+        type: choice
+        options: [staging, production]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and digest the relay binary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Gate on the relay test suite
+        run: cargo test -p relay-protocol -p relay-server --locked -- --test-threads=1
+      - name: Build release binary
+        run: cargo build --locked --release -p relay-server --bin relay-server
+      # 아티팩트는 내용 주소로 식별한다. 배포 시 이 다이제스트와 대조한다.
+      - name: Record the artifact digest
+        run: |
+          sha256sum target/release/relay-server | tee relay-server.sha256
+          echo "git_revision=$GITHUB_SHA" >> relay-server.sha256
+      - uses: actions/upload-artifact@v7
+        with:
+          name: relay-server-${{ inputs.environment }}
+          path: |
+            target/release/relay-server
+            relay-server.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish (BLOCKED)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      # 좌표가 생기면 이 단계를 실제 publish로 교체한다. 그전까지는 실패가 정답이다 —
+      # 성공으로 표시되면 "배포됨"이라는 잘못된 신호가 남는다.
+      - name: Refuse to publish without resolved coordinates
+        run: |
+          echo "Relay publish is BLOCKED."
+          echo "Unresolved: Mac admission credential provisioning/rotation owner, staging and"
+          echo "production domains, DNS owner, TLS edge, trusted Origin, artifact registry,"
+          echo "GitHub environment and secret names, deploy credentials."
+          echo "See deploy/relay/README.md for the status table."
+          exit 1

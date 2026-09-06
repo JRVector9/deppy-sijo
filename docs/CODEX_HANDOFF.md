@@ -2,14 +2,16 @@
 
 ## 진행 중 — Relay 보강·i18n 정리 완료, 리사이즈·IME 별도 PR 준비 (2026-09-06)
 
+- 최신 상태: PR #146 갱신, #147·#148 생성 완료. 후속 레이아웃은 방식 확인 대기.
 - 목표: PR #146의 Relay 개발을 이어가고 미사용 fleet 키를 삭제한다. 리사이즈 깜빡임과
   빠른 한글 입력을 별도 PR로 수정한 뒤, **기존 글의 리사이즈 레이아웃 보존**을 별도 PR로
-  진행한다. 마지막 레이아웃 작업은 아직 시작하지 않았다.
+  진행한다. 마지막 레이아웃 작업은 원본 backend 조사·왕복 검사까지 진행했다.
 - 최신 지시: 앱 재빌드·재실행하지 말고 작업 후 대기. 실행 앱 PID 16348, 시작 00:25:04를
   유지했다. 다만 넓은 `cargo test -p deppy-sijo`가 통합 테스트용 앱 실행 파일을 자동 갱신했다
   (08:18:40). 사용자에게 알렸고 이후 앱 테스트를 **`--bin deppy-sijo`로 제한**했다.
   재실행/종료/머지/rebase/force-push 없음. 화면 확인은 대기이며 PASS로 표시하지 않는다.
 - 루트: `feat/fleet-one-list-and-relay-wip`, PR #146 OPEN. 시작 HEAD `e960004`.
+  **3db4952 커밋을 정상 push하고 PR #146 제목/본문을 실제 검증 결과로 갱신했다.**
   Opus/high CLI 3개로 병렬 작업. 로그·프롬프트·검증 래퍼는 `/tmp/deppy-sijo-agents-20260906/`.
 - 완료: 로케일 5개의 `fleet.hero.now/next/clear/sessions/skip` 25줄 삭제. fleet 버튼 부재
   테스트는 예전 영어 문구 `Skip`을 직접 검사한다. approval/needs_input/blocked_for는 유지.
@@ -41,12 +43,12 @@
   올바른 루트 결과는 `root-app-tests-fresh.log`이며 Compiling 경로와 테스트 목록도 확인했다.
 - 리사이즈 worktree: `/Users/jr/Desktop/projects/deppy-sijo-resize-20260906`,
   `fix/resize-flicker-20260906`. 첫 세션 크기만 즉시 전송하고 이후 크기는 120ms 안정 후 전송.
-  실제 RED 후 1차 수정 workspace 229 PASS. 최종 clear/redraw를 숨기는 기존 bounded fence를
-  창 Resize에도 적용하는 추가 수정 진행 중. 이 추가 변경은 별도 검증 필요.
+  실제 RED 후 수정했고 최종 clear/redraw를 숨기는 기존 bounded fence도 창 Resize에 적용했다.
+  최종 workspace 231 PASS. 검증된 변경은 PR #148의 별도 worktree에 커밋·push했다.
 - IME worktree: `/Users/jr/Desktop/projects/deppy-sijo-ime-20260906`, `fix/korean-ime-20260906`.
   draw와 입력 수신 관문이 이번 프레임의 비어 있지 않은 Preedit도 고려하도록 수정.
   실제 terminal 원본 소스를 rustc --test로 컴파일: RED 1 실패 → 전체 86 PASS / 4 ignored.
-  새 app workspace 검사 `ime-workspace-fresh.log`, clippy `ime-clippy.log` 진행 중.
+  새 app workspace 검사 `ime-workspace-fresh.log` 229 PASS, clippy `ime-clippy.log` PASS.
   cmux @7d5d308450eac2991e748c6387d8718704be891a의 GhosttyTerminalView.swift를 설계 대조에
   참고했으며 코드는 복사하지 않았다. 실제 macOS 빠른 타이핑에서의 해결 여부는 미확인.
 - fleet 사용자 확인: 중복 없음 / 세션 0+승인 카드와 빈 안내 동시 표시 / 좁은 창 안 표시 확인.
@@ -56,8 +58,44 @@
   swap/프로시저 매크로 dylib 로딩 지연을 구분한다. `/tmp/deppy-sijo-target-20260906/debug`는
   중지한 불완전 clone이므로 사용하지 않는다. 최신 rlib를 임의로 골라 app을 직접 링크하는
   시도도 StableCrateId 충돌로 실패했다. 정확한 Cargo 의존성 그래프를 사용한다.
-- 남은 일: 루트 PR 갱신, IME/리사이즈 최종 검증·리뷰·각 별도 PR 생성, 그 다음 기존 글
-  레이아웃 보존 작업과 별도 PR. 앱 재빌드·재실행은 계속 대기한다.
+- PR 완료: IME **#147** (`3e10eb6`), 리사이즈 **#148** (`50d195f`)를 draft로 생성했다.
+  둘 다 PR #146 브랜치가 base이고 화면 확인 대기다. 두 변경의 workspace.rs와 핸드오프는
+  merge-file 검사에서도 충돌 없이 합쳐진다. 최신 3db4952 기반 `fix/window-resize-flicker`(deppy-sijo-resize-pr-20260906)와
+  `fix/korean-ime-preedit`(deppy-sijo-ime-pr-20260906) worktree로 검증된 코드 diff를 옮겼다.
+  원래 브랜치 이력은 재작성하지 않았다. 리사이즈 최종 workspace 231 PASS, IME 최신 소스
+  workspace 229 PASS. IME clippy 6m33초 PASS, 리사이즈 clippy 3m04초 PASS.
+  원본 에이전트 worktree는 보존했고 PR용 worktree는 커밋·push 완료했다.
+- 후속 레이아웃 단계: `fix/preserve-terminal-layout`,
+  `/Users/jr/Desktop/projects/deppy-sijo-layout-20260906`, 50d195f 기반. 현재 코드 수정 없음.
+  사용자에게 기존 줄바꿈/표 유지+가로 이동 vs 자동 줄바꿈+누락/겹침 방지 선호를 async로
+  질문했으며 답은 아직 없다. 초기 해석은 형태 보존이지만 큰 동작 변경은 조사 결과로 결정한다.
+  Opus/high 담당의 backend/reflow/scrollback 조사와 루트의 renderer/viewport 조사를 완료했다.
+  초기 보고서의 trailing 공백 손실 추론은 실제 왕복 검사로 반박되어 철회했다.
+- PR #146 GitHub CI: macOS build/clippy/test, Linux Relay, fmt/boundary, Node 채널,
+  licenses, RustSec 총 6개 SUCCESS. GitGuardian만 FAILURE: 3커밋에서 1 secret 표식.
+  원래 53f2a31·부모 e960004·현재 3db4952 모두 각각 1건을 보고했다. annotations는
+  비어 있고 대시보드 권한이 없어 정확한 탐지기/파일은 확인하지 못했다. 테스트용 고정
+  `relay-hello-v1.json`이 후보이지만 미확정이다. 억제/키 삭제/회전은 하지 않았다.
+  보고서는 `docs/handoff/2026-09-06-gitguardian.md`. 전체 CI PASS를 주장하지 않는다.
+- 레이아웃 조사: 단순 `Grid::resize(false)`는 잘린 열을 버리므로 형태 보존 해법이 아니다.
+  고정 폭+가로 이동은 현재 PTY 크기/새 입력/active TUI의 동작까지 바꾼다. 원본 backend를
+  80→10/11/20→80으로 각 3회 왕복한 신규 프로브 6개와 기존 83개, 총 **89 PASS / 4 ignored**.
+  행수 상한 미도달 조건에서 글자·표 경계·색·한글·내부 공백 손실은 재현되지 않았다.
+  프로브는 /tmp에 보존 후 worktree에서 제거했다. 실제 좁은 창의 표시·라이브 TUI 검증은
+  하지 않았다. 사용자 선호 응답은 아직 없으며 레이아웃 수정 PR은 아직 생성하지 않았다.
+  조사 범위/재개 명령: `docs/handoff/2026-09-06-layout-investigation.md`.
+- PR #147/#148 최초 CI: 앱 테스트 각각 **2105/2107 PASS, 14 ignored** 이후 기존 PTY
+  `고립된_1바이트_echo는_coalesce_대기_전체를_지불하지_않는다`가 중앙값 약 2.03ms로 실패했다
+  (실제 상한 1.9ms). 두 PR 모두 이 PTY 코드는 변경하지 않았다. 로컬 동일 검사 단독
+  실행 **1 PASS**(`pty-isolated-check.log`, 0.41초). 실패한 CI job을 한 번 재시도했으나
+  둘 다 같은 검사에서 다시 실패했다(중앙값 약 2.14ms). run 33999633264 / 33999820759,
+  attempt 2. GitGuardian 포함 나머지 검사는 통과했다. 전체 CI PASS가 아니다.
+  Opus/high 추가 진단 완료. CI도 --test-threads=1이며, 이 검사는 poll 대기 외의 wake 지연도
+  포함한 벽시계 검사다. 러너별 원인 계측은 미실행. 후속 관측 훅 제안은 미구현이고,
+  검사 상한 완화/무시는 하지 않았다. 기록: `docs/handoff/2026-09-06-pty-ci.md`.
+- 남은 일: 기대 레이아웃 방식 확인 후 구현·검증·별도 PR, 기존 PTY CI 검사 안정화,
+  GitGuardian 상세 확인, 승인된 시점의 화면/IME 검증. Relay 재접속과 외부 배포 검증은
+  위에 기록한 잔여 범위를 유지한다. 앱 재빌드·재실행은 계속 대기한다.
 
 ```sh
 cd /Users/jr/Desktop/projects/deppy-sijo

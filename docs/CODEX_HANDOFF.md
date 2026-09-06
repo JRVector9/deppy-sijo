@@ -1,5 +1,16 @@
 # Codex handoff
 
+## GUI 0.36 통합 이관 진행 (2026-09-07)
+
+- 목표: #142/#153을 eframe/egui/extras/kittest 0.36 + commonmark 0.25 통합 PR로 대체.
+- 작업: `/private/tmp/deppy-egui-036-20260907`, `fix/gui-stack-036-20260907`, base `6060e33`.
+- 완료: repo/업스트림 API 조사, 별도 spec/plan 작성. 변경 파일은 두 문서와 본 handoff.
+- 설계: Terminal IME purpose, ModifiersChanged 이벤트, vendored winit 0.30.13과 안전한 PNG broker 유지.
+- 검증: 아직 실행하지 않음. 실패 접근: 없음. 앱 재빌드/재실행/화면 PASS 주장 금지.
+- 남은 일: 의존성/API 이관, 테스트, 최신 main merge, Codex 리뷰, push/PR, 기존 PR 닫기.
+- 다음 명령: `CARGO_BUILD_JOBS=2 cargo check -p terminal --tests` (의존성 선언 갱신 후).
+
+
 ## Task 4 COMPLETE — application wiring (2026-08-29)
 
 - Task 4 of `docs/superpowers/plans/2026-08-28-production-relay.md` is now implemented, tested,

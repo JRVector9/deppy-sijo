@@ -78,7 +78,7 @@ libmimalloc-sys = { workspace = true }
 # §5 실측). default-features를 꺼서 업스트림 기본 file/http 이미지 loader와 fetch를
 # 배제한다. "pulldown_cmark" feature만 켠다 — `show_scrollable`(§6.4 static-content
 # 캐시)에 필요하고, 그 자체는 의존성 없는 순수 플래그다.
-egui_commonmark = { version = "=0.24", default-features = false, features = [
+egui_commonmark = { version = "=0.25", default-features = false, features = [
     "pulldown_cmark",
 ] }
 # 위 Viewer가 로컬 PNG를 텍스처로 디코드하는 데만 쓴다 — "image" feature만 켠다.

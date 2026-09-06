@@ -2,10 +2,23 @@
 
 ## 진행 중 — Relay 보강·i18n 정리 완료, 리사이즈·IME 별도 PR 준비 (2026-09-06)
 
-- 최신 상태: PR #146 갱신, #147·#148 생성 완료. 후속 레이아웃은 방식 확인 대기.
+- 최신 상태: PR #146 갱신, #147·#148 생성 완료. 사용자가 후속 레이아웃을 가로 스크롤
+  없이 한 화면 너비에 표시하도록 결정해 구현·로컬 검증·별도 PR 생성을 완료했다. 작업 위치는
+  `/Users/jr/Desktop/projects/deppy-sijo-layout-20260906`, `fix/preserve-terminal-layout`.
+  PR #148 위 별도 **draft PR #149** 생성: https://github.com/JRVector9/deppy-sijo/pull/149 .
+  구현 **16e642a**, 인계 포함 HEAD **320d906** 정상 push. 논리 열 수 고정+내용 균일 축소를 적용했으며 첫 복원
+  snapshot 이전의 추측 Resize를 막았다. 축소 갤리 캐시/표시 셀 입력 좌표 보강 완료.
+  최종 Opus/high 리뷰의 복제 비용·복원 순서·스크롤 좌표와 추가 셀 수 상한 지적까지
+  반영했다. 런타임의 기존 65,536셀 상수를 공유한다. 최종 소스 해시를 고정한 app --bin
+  **2110 PASS/14 ignored**, terminal **87 PASS/4 ignored**, fmt/diff-check PASS.
+  최종 `clippy -p terminal -p runtime -p deppy-sijo --all-targets -- -D warnings`도
+  **PASS**(1m35초). 최종 실행 로그 `layout-final-{app,clippy}-verified.log`.
+  상세 설계·실패·검증·재개 명령은 위 layout worktree의 docs/CODEX_HANDOFF.md
+  "후속 진행 — 기존 출력 형태 보존" 절을 따른다. PR #149 CI는 진행 중이며 완료 전
+  PASS로 표시하지 않는다. 앱 재빌드·재실행 없이 화면 검증을 대기한다.
 - 목표: PR #146의 Relay 개발을 이어가고 미사용 fleet 키를 삭제한다. 리사이즈 깜빡임과
   빠른 한글 입력을 별도 PR로 수정한 뒤, **기존 글의 리사이즈 레이아웃 보존**을 별도 PR로
-  진행한다. 마지막 레이아웃 작업은 원본 backend 조사·왕복 검사까지 진행했다.
+  진행한다. 마지막 레이아웃 작업의 현재 상태는 위 최신 상태와 별도 worktree 핸드오프를 따른다.
 - 최신 지시: 앱 재빌드·재실행하지 말고 작업 후 대기. 실행 앱 PID 16348, 시작 00:25:04를
   유지했다. 다만 넓은 `cargo test -p deppy-sijo`가 통합 테스트용 앱 실행 파일을 자동 갱신했다
   (08:18:40). 사용자에게 알렸고 이후 앱 테스트를 **`--bin deppy-sijo`로 제한**했다.

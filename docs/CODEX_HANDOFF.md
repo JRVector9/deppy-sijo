@@ -1,5 +1,82 @@
 # Codex handoff
 
+## 완료 — 독립 IME/리사이즈 변경 main 착지 및 브랜치 정리 (2026-09-06)
+
+- Current objective completed: 추가 개발이 필요한 Relay 재접속과 터미널 레이아웃 작업을 제외하고, 완료된 한글 IME와 창 리사이즈 수정만 `main`에 착지했다.
+- PR #150 `fix(ui): 한글 입력과 창 리사이즈를 안정화한다`를 `main`에 squash merge했다. merge commit은 `c4d662c4424cba6f28f82b94df747586d77c9ccc`이며 로컬 `main`과 `origin/main`이 모두 이 커밋을 가리킨다.
+- #146의 미완성 Relay 이력을 끌어오지 않도록 `origin/main`에서 독립 브랜치를 만들고, IME/CJK 변경과 resize 변경만 파일 단위로 옮겼다. 코드 리뷰에서 같은 문자 격자 안에서 viewport가 계속 움직여도 120ms 뒤 중간 Resize가 나가는 결함을 찾았고, 실제 viewport 크기도 안정성 시계에 포함하는 RED→GREEN 수정 후 재리뷰에서 잔여 지적이 없었다.
+- 최종 로컬 검증: app 2,035 PASS / 14 ignored, terminal 86 PASS / 4 ignored, workspace 233 PASS, strict clippy PASS, fmt PASS, diff-check PASS. PR #150 CI는 macOS 전체 build/clippy/test, Linux Relay, format/boundary/diff, licenses/duplicates, RustSec, GitGuardian 모두 SUCCESS.
+- Cleanup: 대체된 draft PR #147과 #148을 닫았다. clean worktree `deppy-sijo-land-ready-20260906`, `deppy-sijo-ime-pr-20260906`, `deppy-sijo-resize-pr-20260906`를 제거했고, 로컬/원격 `land/ime-resize-ready-20260906`와 `fix/korean-ime-preedit` 브랜치를 삭제했다.
+- Preserved intentionally: PR #146(`feat/fleet-one-list-and-relay-wip`)은 알려진 기기 재접속 인증 흐름 추가 개발이 남아 OPEN이다. PR #149(`fix/preserve-terminal-layout`)는 오른쪽 빈 영역 휠 입력 결함 수정이 남아 OPEN이다. #149가 base로 사용하는 원격 `fix/window-resize-flicker` 브랜치는 삭제하지 않았다. 두 dirty 원본 staging worktree와 Relay/layout worktree도 미완성 작업 및 상세 인계 보존을 위해 건드리지 않았다.
+- i18n note: `fleet.hero.now/next/clear/sessions/skip` 삭제는 현재 main의 Fleet 구현에서는 안전하지 않다. 해당 main 코드는 여전히 다섯 키를 참조하며, 참조 제거가 포함된 #146의 새 Fleet UI와 함께 착지해야 한다.
+- 앱은 이번 merge/cleanup 단계에서 재빌드하거나 재실행하지 않았다. 현재 실행 앱은 앞선 서명된 PR #149 빌드 상태이므로 `main`의 #150 적용은 다음 명시적 빌드·재실행 때 반영된다.
+- Remaining development: #146의 known-device reconnect 인증/입장권 흐름과 외부 DNS·TLS·배포 검증(BLOCKED), #149의 pane 오른쪽 빈 영역 휠 입력 수정 및 화면 검증. PR #150에 해당하는 추가 개발이나 머지 작업은 없다.
+- Exact next commands: `gh pr view 146`; `gh pr view 149`; `git status --short`; #149를 재개하면 `/tmp/deppy-sijo-review-149/repro`의 휠 RED 회귀를 제품 테스트로 옮긴 뒤 pane 본문 전체 입력 영역으로 휠 라우팅을 넓힌다. #146을 재개하면 known-device reconnect 인증 설계부터 구현하고 외부 배포 검증은 자격증명 부재로 계속 BLOCKED로 기록한다.
+
+## 코드 리뷰 완료 — PR #149 (2026-09-06)
+
+- 사용자 승인으로 PR #149 HEAD `320d906`을
+  `/tmp/deppy-sijo-agents-20260906/cargo-serial build -p deppy-sijo --bin deppy-sijo --locked`
+  명령으로 재빌드했다. **PASS**, dev profile 4m45초. 공유 실행 바이너리 mtime은
+  22:55:33으로 갱신됐다. 기존 앱 PID 16348을 빌드 성공 뒤 종료했다.
+- 실패 접근: 빌드 산출물을 직접 실행해 ad-hoc 서명
+  (`Identifier=deppy_sijo-847fd591bd363fbd`, `TeamIdentifier` 없음) 상태로 기동했고,
+  사용자가 Keychain 암호 확인창을 보았다. 이는 `CLAUDE.md:9`의 필수 실행 명령과
+  `scripts/dev-run.sh`를 따르지 않은 절차 오류다. raw `cargo build` 산출물은 빌드마다
+  cdhash가 바뀌어 Keychain에서 다른 앱으로 취급된다.
+- 복구: raw 앱 PID 72218을 종료하고 현재 바이너리에
+  `Developer ID Application: VectorNine INC (ZDTU5LS35K)`와 identifier
+  `app.vector9.deppy-sijo`로 고정 서명했다. 기존 배포 앱과 designated requirement가
+  바이트 단위로 같은 형태임을 `codesign -dr -`로 확인했다. 서명된 새 앱 PID
+  **27387**(시작 23:00:04)이 실행 중이며 SecurityAgent 프로세스 재생성은 없었다.
+  앞으로 개발 빌드·실행은 반드시 `scripts/dev-run.sh`를 사용한다. 앱 재실행 외 제품
+  코드·PR·브랜치 변경은 없다.
+- 요청: 사용자 "코드 리뷰해". 직전 PR #149를 대상으로 `50d195f..320d906`을 리뷰한다.
+  실제 PR의 base/head OID와 일치한다. 제품 코드 수정·커밋·push·앱 재빌드/재실행 없음.
+- Opus/high 독립 CLI 2개가 렌더링/세션 lifecycle 병렬 리뷰를 완료했다. 루트가 입력
+  좌표·캐시·CI와 보고서의 지적을 교차 확인했다. 로그와 보고서는 `/tmp/deppy-sijo-review-149/`.
+- 실제 CI 확인: 최신 320d906의 macOS job 101409549661 실패. 앱 **2110 PASS/14 ignored**
+  뒤, 변경되지 않은 `crates/pty/src/lib.rs:2983`의 고립 echo 지연 검사가 실패했다.
+  중앙값 2.051583ms, 요구 <1.9ms. 나머지 6개 체크 SUCCESS. 로컬 재실행/CI 재시도는
+  하지 않았다. 실패를 PR 레이아웃 코드의 회귀로 단정하지 않는다.
+- 확정 신규 결함(medium): `crates/terminal/src/renderer_egui.rs:490-498`의 입력 영역은
+  보존된 그리드 폭까지만 배정된다. 열 수를 고정한 뒤 넓힌 pane에 큰 여백이 계속 남는데,
+  `crates/app/src/ui/workspace.rs:6748`의 휠 처리는 `output.response.hovered()`에
+  묶여 여백에서 누락된다. 배경 interact가 클릭/드롭을 처리하므로 이 둘의 결함은 아니다.
+  그리드 표시 폭은 유지하고, 휠 수신 범위를 유한한 pane 본문 전체로 넓혀야 한다.
+- 실제 재현: `/tmp/deppy-sijo-review-149/repro`(detached 320d906)에만 회귀 harness를
+  추가했다. 1200px pane/80열에서 같은 휠 입력을 x=200과 x=900에 보내 실제
+  `RuntimeCommand::Scroll`을 수집했다. 글자 위 **5행**, 오른쪽 여백 **0행**.
+  검사 결과 **0 PASS / 1 FAIL / 2124 filtered out**, 빌드 3m16초, 검사 0.02초.
+  이는 입력 이벤트 라우팅 재현이며 실제 앱 화면 검증 PASS를 의미하지 않는다.
+- 실행 명령(임시 repro worktree에서):
+  `/tmp/deppy-sijo-agents-20260906/cargo-serial test -p deppy-sijo --bin deppy-sijo --locked review_보존된_그리드_오른쪽 -- --test-threads=1 --nocapture`
+  결과 로그 `/tmp/deppy-sijo-review-149/wheel-repro2.log`.
+  첫 harness는 egui 0.35 MouseWheel의 필수 phase 필드를 빠뜨려 E0063으로 컴파일
+  실패했다. 실제 타입을 확인해 TouchPhase::Move를 추가한 위 재검사에서 결함을 재현했다.
+  첫 컴파일 오류를 제품 회귀로 세지 않는다.
+- 리뷰 스킬의 필수 `.agents/skills/gstack/review/checklist.md`가 저장소/설치 위치에 없어
+  스킬 절차는 중단했다. 원래 요청은 소스 기반 독립 리뷰로 계속 진행한다. 사용자에게
+  스킬 경로·중단 문구·대체 진행을 알렸다.
+- 독립 보고서 2개를 받았다. 폰트 확대가 축소에 상쇄되는 것은 승인된 fit-width 선택의
+  결과다. 같은 SessionId respawn에서 옛 폭으로 돌아가는 지적은 기존에도 자연 폭으로
+  다시 Resize하던 동작과 구분되는 오류가 입증되지 않았다. 첫 snapshot 전 split 마커
+  잔류는 그 시점에 fence도 없고 도착 후 해소돼 실제 결함으로 보고하지 않는다.
+  geometry의 skip 정렬 debug_assert 권고는 현재 오름차순이 보장돼 결함이 아니다.
+  밑줄/얇은 커서 감쇠는 실제 화면 확인 항목으로 남긴다. 미확정 배율 발산은 단정하지 않는다.
+- 수정 파일: 루트 `docs/CODEX_HANDOFF.md`(리뷰 기록), 임시 repro의
+  `crates/app/src/ui/workspace.rs`(재현용 검사). PR #149 worktree는 깨끗하며 제품
+  코드를 고치거나 커밋·push하지 않았다. 마지막 조회에서도 PR head 320d906/base 50d195f.
+  실행 앱 PID 16348/시작 00:25:04와 실행용 바이너리 mtime 08:18:40 그대로다.
+- 남은 일: 사용자에게 확정 결함 1건과 기존 CI 실패를 구분해 보고한다. 수정 요청을 받으면
+  pane 본문의 휠 입력 영역을 보완하고 위 재현을 다시 확인한다. 화면 검증은 앱 재빌드·
+  재실행 승인 전까지 대기한다. 별도 Relay 배포 검증은 계속 BLOCKED다.
+- 다음 에이전트 확인 명령:
+  `git -C /Users/jr/Desktop/projects/deppy-sijo-layout-20260906 status --short`
+  `git -C /Users/jr/Desktop/projects/deppy-sijo-layout-20260906 diff 50d195f..320d906 -- crates/app/src/ui/workspace.rs crates/terminal/src/renderer_egui.rs`
+  `cat /tmp/deppy-sijo-review-149/wheel-repro2.log`
+
+
 ## 진행 중 — Relay 보강·i18n 정리 완료, 리사이즈·IME 별도 PR 준비 (2026-09-06)
 
 - 최신 상태: PR #146 갱신, #147·#148 생성 완료. 사용자가 후속 레이아웃을 가로 스크롤

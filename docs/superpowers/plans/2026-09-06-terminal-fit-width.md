@@ -40,5 +40,5 @@
 
 ## 5. 별도 PR
 
-- [ ] `fix/preserve-terminal-layout`을 정상 push하고 PR #148의 `fix/window-resize-flicker`를 base로 draft PR을 생성한다.
-- [ ] 앱은 재빌드/재실행하지 않는다. 시각 검증 대기를 PR 본문에 명시한다.
+- [x] `fix/preserve-terminal-layout`을 정상 push하고 PR #148의 `fix/window-resize-flicker`를 base로 draft PR #149를 생성했다. 구현 커밋 16e642a.
+- [x] 앱은 재빌드/재실행하지 않았다. 시각 검증 대기를 PR 본문에 명시한다.

@@ -114,7 +114,9 @@ git status --short --branch
   표의 논리 열 수를 유지하고 pane이 좁으면 터미널 내용 전체를 균일 축소한다.
   이전 레이아웃 방식 확인 대기는 끝났다. 앞의 이전 세션 기록보다 이 절을 우선한다.
 - 작업 위치: `/Users/jr/Desktop/projects/deppy-sijo-layout-20260906`,
-  `fix/preserve-terminal-layout`, PR #148의 `50d195f` 기반 별도 draft PR 준비 중.
+  `fix/preserve-terminal-layout`, PR #148의 `50d195f` 기반.
+  구현 커밋 **16e642a**를 정상 push하고 별도 **draft PR #149**를 생성했다:
+  https://github.com/JRVector9/deppy-sijo/pull/149 . 머지/rebase/force-push 없음.
 - 변경 파일: `crates/app/src/ui/workspace.rs`, `crates/terminal/src/renderer_egui.rs`,
   `crates/runtime/src/{command,lib}.rs`(기존 상수 공개),
   `docs/superpowers/specs/2026-09-06-terminal-fit-width-design.md`,
@@ -168,17 +170,20 @@ git status --short --branch
   **08:18:40**, 앱 PID **16348**을 유지했다. 이전 세션의 넓은 cargo test가 그 시각에 앱을
   갱신한 사실은 앞 절에 기록되어 있다. 검사 대상은 app `--bin deppy-sijo`, terminal
   `--lib`로 제한한다. `cargo test --workspace`는 실행하지 않는다.
-- 남은 일: 검증된 변경 커밋·정상 push·별도 draft PR 생성, 인계 갱신. 실제 창 드래그·좁은 분할창·선택/검색/한글 후보창의 화면 확인은 재실행
-  승인 후 진행한다. 지금 화면 검증을 PASS로 표시하지 않는다.
+- 코드 작업과 별도 PR 생성 완료. CI는 PR에서 확인하고 완료 전 PASS로 표시하지 않는다.
+  남은 일은 실제 창 드래그·좁은 분할창·선택/검색/한글 후보창 화면 확인이며, 사용자가
+  재실행을 승인한 뒤 진행한다. 지금 화면 검증을 PASS로 표시하지 않는다.
 
 ```sh
 cd /Users/jr/Desktop/projects/deppy-sijo-layout-20260906
 git status --short --branch
 git diff --stat
 rg -n '후속 진행 — 기존 출력' docs/CODEX_HANDOFF.md
-tail -n 20 /tmp/deppy-sijo-agents-20260906/layout-fit-app-final.log
-# 앱은 재빌드/재실행하지 않는다. Cargo 중복 실행은 직렬 래퍼로 막는다.
-/tmp/deppy-sijo-agents-20260906/cargo-serial clippy -p terminal -p runtime -p deppy-sijo --all-targets -- -D warnings
+gh pr view 149
+gh pr checks 149
+tail -n 8 /tmp/deppy-sijo-agents-20260906/layout-final-app-verified.log
+tail -n 8 /tmp/deppy-sijo-agents-20260906/layout-final-clippy-verified.log
+# 소스가 바뀌지 않았다면 검사를 반복하지 않는다. 앱 재빌드/재실행은 승인 대기.
 ```
 
 ## Fleet view: one list, top blocked item expanded in place (2026-09-05)

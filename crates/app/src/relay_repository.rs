@@ -162,6 +162,34 @@ impl RelayRepository for AppRelayRepository {
         )
     }
 
+    fn store_reconnect_verifier(
+        &self,
+        device_id: DeviceId,
+        identity: &[u8; 65],
+        verifier: &[u8; 32],
+        now: u64,
+    ) -> anyhow::Result<bool> {
+        let db = self.locked()?;
+        let Some(row) = db.relay_device(device_id.as_bytes())? else {
+            return Ok(false);
+        };
+        let device = device_from_row(row)?;
+        if !device.is_admitted(identity, now) {
+            return Ok(false);
+        }
+        db.store_relay_reconnect_verifier(
+            device_id.as_bytes(),
+            identity,
+            verifier,
+            i64::try_from(now)?,
+        )
+    }
+
+    fn reconnect_verifier(&self, device_id: DeviceId) -> anyhow::Result<Option<[u8; 32]>> {
+        self.locked()?
+            .relay_reconnect_verifier(device_id.as_bytes())
+    }
+
     fn touch_device(&self, device_id: DeviceId, seen_at: u64) -> anyhow::Result<bool> {
         self.locked()?
             .touch_relay_device(device_id.as_bytes(), i64::try_from(seen_at)?)
@@ -385,6 +413,49 @@ mod tests {
             device_id: device_id(value),
             public_key,
         }
+    }
+
+    #[test]
+    fn relay_reconnect_verifier_survives_adapter_restart_and_revocation_erases_it() {
+        let dir = TempDir::new("reconnect");
+        let repository = AppRelayRepository::open(&dir.db_path(), dir.lock()).unwrap();
+        let paired = insert(&repository, 5, 0x51);
+        repository
+            .approve_pending(paired.pairing_id, ISSUED_AT + 1)
+            .unwrap();
+        assert!(
+            repository
+                .store_reconnect_verifier(
+                    paired.device_id,
+                    &paired.public_key,
+                    &[6; 32],
+                    ISSUED_AT + 2
+                )
+                .unwrap()
+        );
+        drop(repository);
+        let repository = AppRelayRepository::open(&dir.db_path(), dir.lock()).unwrap();
+        assert_eq!(
+            repository.reconnect_verifier(paired.device_id).unwrap(),
+            Some([6; 32])
+        );
+        repository
+            .revoke_device(paired.device_id, ISSUED_AT + 3)
+            .unwrap();
+        assert_eq!(
+            repository.reconnect_verifier(paired.device_id).unwrap(),
+            None
+        );
+        assert!(
+            !repository
+                .store_reconnect_verifier(
+                    paired.device_id,
+                    &paired.public_key,
+                    &[6; 32],
+                    ISSUED_AT + 4
+                )
+                .unwrap()
+        );
     }
 
     #[test]

@@ -15,15 +15,15 @@ concurrency:
 
 jobs:
   relay-channel:
-    name: Relay WebCrypto concurrency
+    name: Relay WebCrypto and reconnect
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
-      - name: 송수신 순서, 재생 거부, 채널 종료와 대기열 상한
-        run: node --test web/relay-shell/tests/channel-concurrency.test.mjs
+      - name: 송수신 순서, 재접속 등록, 신원 고정과 대기열 상한
+        run: node --test web/relay-shell/tests/*.test.mjs
 
   fast-checks:
     name: Format, boundary, and diff checks

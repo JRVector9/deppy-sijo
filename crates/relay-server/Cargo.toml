@@ -24,6 +24,7 @@ path = "src/main.rs"
 [dependencies]
 relay-protocol = { path = "../relay-protocol" }
 anyhow = { workspace = true }
+sha2 = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 # sync WebSocket 종단. handshake feature만 — TLS는 배포 edge가 맡는다.

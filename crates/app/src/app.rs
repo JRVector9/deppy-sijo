@@ -7988,7 +7988,10 @@ struct RelayMailbox {
 #[derive(Default)]
 struct RelayMailboxInner {
     claim: Option<web_remote::relay_client::PairingClaim>,
-    activation: Option<web_remote::relay::SecureChannel>,
+    activation: Option<(
+        web_remote::relay::SecureChannel,
+        web_remote::relay::repository::RelayDeviceRecord,
+    )>,
     rejected: bool,
     /// 앱 → 싱크: 기기 입장 티켓 게시/회수. 세션이 끝나도 지우지 않는다 — 티켓은 의식의
     /// 수명을 따르지 세션의 수명을 따르지 않는다.
@@ -7997,7 +8000,11 @@ struct RelayMailboxInner {
 
 /// 앱이 싱크에 내린 결정.
 enum RelayDecision {
-    Activate(web_remote::relay::SecureChannel),
+    Activate(
+        web_remote::relay::SecureChannel,
+        // 공개 기기 기록만 간접 보관한다. 암호 채널의 비밀 키는 추가 힙 복사하지 않는다.
+        Box<web_remote::relay::repository::RelayDeviceRecord>,
+    ),
     Reject,
 }
 
@@ -8037,10 +8044,14 @@ impl RelayMailbox {
     }
 
     /// 앱: 승인된 채널을 싱크에 건넨다.
-    fn activate(&self, channel: web_remote::relay::SecureChannel) {
+    fn activate(
+        &self,
+        channel: web_remote::relay::SecureChannel,
+        device: web_remote::relay::repository::RelayDeviceRecord,
+    ) {
         let mut inner = self.lock();
         inner.rejected = false;
-        if let Some(mut stale) = inner.activation.replace(channel) {
+        if let Some((mut stale, _)) = inner.activation.replace((channel, device)) {
             stale.close();
         }
     }
@@ -8049,7 +8060,7 @@ impl RelayMailbox {
     fn reject(&self) {
         let mut inner = self.lock();
         inner.rejected = true;
-        if let Some(mut channel) = inner.activation.take() {
+        if let Some((mut channel, _)) = inner.activation.take() {
             channel.close();
         }
     }
@@ -8057,8 +8068,8 @@ impl RelayMailbox {
     /// 싱크: 앱의 결정을 꺼낸다.
     fn take_decision(&self) -> Option<RelayDecision> {
         let mut inner = self.lock();
-        if let Some(channel) = inner.activation.take() {
-            return Some(RelayDecision::Activate(channel));
+        if let Some((channel, device)) = inner.activation.take() {
+            return Some(RelayDecision::Activate(channel, Box::new(device)));
         }
         std::mem::take(&mut inner.rejected).then_some(RelayDecision::Reject)
     }
@@ -8087,10 +8098,29 @@ impl RelayMailbox {
         let mut inner = self.lock();
         inner.claim = None;
         inner.rejected = false;
-        if let Some(mut channel) = inner.activation.take() {
+        if let Some((mut channel, _)) = inner.activation.take() {
             channel.close();
         }
     }
+}
+
+#[cfg(test)]
+#[path = "relay_reconnect_tests.rs"]
+mod relay_reconnect_tests;
+
+fn relay_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn relay_unhex<const N: usize>(text: &str) -> Option<[u8; N]> {
+    if text.len() != N * 2 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = [0; N];
+    for (index, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(out)
 }
 
 /// Relay 세션 하나를 끝까지 책임지는 싱크 — 핸드셰이크, 채널 게이트, 권한 강제, 화면 송신.
@@ -8118,6 +8148,13 @@ struct RelayDashboardSink {
     viewport_seq: u64,
     baseline: Option<Arc<runtime::TerminalViewportSnapshot>>,
     last_dash: u64,
+    route: relay_protocol::RouteId,
+    principal: Option<web_remote::relay::repository::RelayDeviceRecord>,
+    control_outbound: Vec<Vec<u8>>,
+    pending_verifier: Option<[u8; 32]>,
+    registration_deadline: Option<u64>,
+    registration_ready: bool,
+    active_connection: Option<web_remote::relay::contract::ConnectionId>,
 }
 
 impl RelayDashboardSink {
@@ -8148,16 +8185,133 @@ impl RelayDashboardSink {
             viewport_seq: 0,
             baseline: None,
             last_dash: 0,
+            route,
+            principal: None,
+            control_outbound: Vec::new(),
+            pending_verifier: None,
+            registration_deadline: None,
+            registration_ready: false,
+            active_connection: None,
         }
     }
 
-    /// 채널을 건다. 첫 화면은 즉시 나간다 — 기기는 첫 암호문을 받아야 승인됐음을 안다.
-    fn activate(&mut self, channel: web_remote::relay::SecureChannel) {
+    /// 채널을 건 뒤 암호 제어 메시지로 승인을 알린다. 최초 등록은 게시 ACK까지 화면을 막는다.
+    fn activate(
+        &mut self,
+        channel: web_remote::relay::SecureChannel,
+        device: web_remote::relay::repository::RelayDeviceRecord,
+        known: bool,
+    ) {
+        self.active_connection = Some(channel.connection_id());
+        self.baseline = None;
         self.gate.activate(channel);
         self.handshake.activated();
         self.last_dash = 0;
         self.viewport_seq = 0;
-        self.baseline = None;
+        self.registration_ready = known;
+        self.registration_deadline = (!known).then(|| unix_now_secs().saturating_add(30));
+        self.pending_verifier = None;
+        let message = serde_json::json!({
+            "type": if known { "relay_ready" } else { "relay_registered" },
+            "version": 2,
+            "device_id": relay_hex(device.device_id().as_bytes()),
+            "route_id": relay_hex(self.route.as_bytes()),
+            "expires_at": device.device_expires_at(),
+        });
+        self.principal = Some(device);
+        if !self.queue_control(&message) {
+            self.gate.deactivate();
+        }
+    }
+
+    /// 인증한 신원·수명·권한은 수신과 송신 경계에서 다시 읽는다.
+    fn principal_is_current(&self) -> bool {
+        let Some(principal) = &self.principal else {
+            return false;
+        };
+        matches!(self.repository.device(principal.device_id()), Ok(Some(current))
+            if current.is_admitted(principal.identity_public_sec1(), unix_now_secs())
+                && current.permissions() == principal.permissions()
+                && current.permissions().allows(web_remote::relay::contract::RelayAction::View))
+    }
+
+    fn queue_control(&mut self, message: &serde_json::Value) -> bool {
+        if self.control_outbound.len() >= relay_protocol::MAX_RECONNECT_GRANTS + 2 {
+            return false;
+        }
+        let Some(frame) = self.gate.seal(message.to_string().as_bytes()) else {
+            return false;
+        };
+        self.control_outbound.push(frame);
+        true
+    }
+
+    fn queue_grant(
+        &mut self,
+        verifier: [u8; 32],
+        expires_at: u64,
+        connection: relay_protocol::ConnectionId,
+    ) -> bool {
+        if self.control_outbound.len() >= relay_protocol::MAX_RECONNECT_GRANTS + 2 {
+            return false;
+        }
+        let mut payload = verifier.to_vec();
+        payload.extend_from_slice(&expires_at.to_be_bytes());
+        let Ok(frame) = relay_protocol::RelayFrame::new(
+            relay_protocol::FrameType::ReconnectPublish,
+            self.route,
+            connection,
+            0,
+            &payload,
+        ) else {
+            return false;
+        };
+        self.control_outbound.push(frame.to_vec());
+        true
+    }
+
+    /// 재시작한 Relay에는 유효한 DB 검증자만 다시 게시한다. raw grant는 없다.
+    fn republish_grants(&mut self) -> bool {
+        let Ok(devices) = self
+            .repository
+            .list_devices(web_remote::relay::repository::MAX_RELAY_DEVICES)
+        else {
+            return false;
+        };
+        for device in devices {
+            if !device.is_admitted(device.identity_public_sec1(), unix_now_secs()) {
+                continue;
+            }
+            match self.repository.reconnect_verifier(device.device_id()) {
+                Ok(Some(verifier)) => {
+                    if !self.queue_grant(
+                        verifier,
+                        device.device_expires_at(),
+                        relay_protocol::ConnectionId::from_bytes([0; 16]),
+                    ) {
+                        return false;
+                    }
+                }
+                Ok(None) => {}
+                Err(_) => return false,
+            }
+        }
+        if self.control_outbound.len() >= relay_protocol::MAX_RECONNECT_GRANTS + 2 {
+            return false;
+        }
+        // 같은 소켓의 게시 프레임 뒤에 놓아 복원 중 입장을 회수로 오인하지 않게 한다.
+        self.control_outbound.push(
+            relay_protocol::RelayFrame::new(
+                relay_protocol::FrameType::ReconnectSync,
+                self.route,
+                relay_protocol::ConnectionId::from_bytes([0; 16]),
+                0,
+                &[],
+            )
+            .expect("빈 복원 완료 프레임")
+            .to_vec(),
+        );
+        true
     }
 
     /// 이미 페어링된 기기의 주장. 저장소 기록이 **지금** 이 신원을 허가할 때만 채널이 선다 —
@@ -8189,12 +8343,63 @@ impl RelayDashboardSink {
         if let Err(error) = self.repository.touch_device(claim.device_id, now) {
             tracing::warn!("Relay 기기 접속 시각 기록 실패: {error:#}");
         }
-        self.activate(channel);
+        self.activate(channel, record, true);
         web_remote::relay_client::SinkOutcome::Continue
     }
 
     /// 채널을 통과한 평문 하나. 권한 어댑터를 지난 것만 코어로 간다.
     fn command(&mut self, plaintext: &[u8]) -> web_remote::relay_client::SinkOutcome {
+        use web_remote::relay_client::SinkOutcome;
+        if !self.principal_is_current() {
+            return SinkOutcome::CloseChannel;
+        }
+        if !self.registration_ready {
+            if self.pending_verifier.is_some() || plaintext.len() > 256 {
+                return SinkOutcome::CloseChannel;
+            }
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Registration {
+                r#type: String,
+                version: u8,
+                verifier: String,
+            }
+            let Ok(request) = serde_json::from_slice::<Registration>(plaintext) else {
+                return SinkOutcome::CloseChannel;
+            };
+            if request.r#type != "relay_register" || request.version != 2 {
+                return SinkOutcome::CloseChannel;
+            }
+            let Some(verifier) = relay_unhex::<32>(&request.verifier) else {
+                return SinkOutcome::CloseChannel;
+            };
+            let Some(device) = self.principal.clone() else {
+                return SinkOutcome::CloseChannel;
+            };
+            if !matches!(
+                self.repository.store_reconnect_verifier(
+                    device.device_id(),
+                    device.identity_public_sec1(),
+                    &verifier,
+                    unix_now_secs()
+                ),
+                Ok(true)
+            ) {
+                return SinkOutcome::CloseChannel;
+            }
+            let Some(connection) = self.active_connection else {
+                return SinkOutcome::CloseChannel;
+            };
+            self.pending_verifier = Some(verifier);
+            if !self.queue_grant(
+                verifier,
+                device.device_expires_at(),
+                relay_protocol::ConnectionId::from_bytes(*connection.as_bytes()),
+            ) {
+                return SinkOutcome::CloseChannel;
+            }
+            return SinkOutcome::Continue;
+        }
         let Ok(text) = std::str::from_utf8(plaintext) else {
             return web_remote::relay_client::SinkOutcome::Continue;
         };
@@ -8250,6 +8455,13 @@ impl RelayDashboardSink {
 
     /// 활성 채널로 나갈 화면. web 전송과 같은 스냅샷·같은 인코더이며, 봉인만 다르다.
     fn push_view(&mut self, frames: &mut Vec<Vec<u8>>) {
+        if !self.principal_is_current() {
+            self.gate.deactivate();
+            return;
+        }
+        if !self.registration_ready {
+            return;
+        }
         if let Some((version, json)) = self.core.dashboard().dashboard_if_newer(self.last_dash) {
             let Some(frame) = self.gate.seal(json.as_bytes()) else {
                 return;
@@ -8282,6 +8494,35 @@ impl RelayDashboardSink {
 
 impl web_remote::relay_client::RelayFrameSink for RelayDashboardSink {
     fn accept(&mut self, frame: &[u8]) -> web_remote::relay_client::SinkOutcome {
+        if let Ok((decoded, consumed)) = relay_protocol::RelayFrame::decode(frame)
+            && consumed == frame.len()
+            && decoded.route_id() == self.route
+            && decoded.frame_type() == relay_protocol::FrameType::ReconnectPublished
+        {
+            if self
+                .pending_verifier
+                .as_ref()
+                .is_some_and(|verifier| decoded.payload() == verifier)
+                && self
+                    .active_connection
+                    .is_some_and(|id| id.as_bytes() == decoded.connection_id().as_bytes())
+            {
+                if !self.principal_is_current() {
+                    return web_remote::relay_client::SinkOutcome::CloseChannel;
+                }
+                self.pending_verifier = None;
+                self.registration_deadline = None;
+                self.registration_ready = true;
+                let device = self.principal.as_ref().expect("principal 확인");
+                let message = serde_json::json!({"type":"relay_ready", "version":2,
+                        "device_id":relay_hex(device.device_id().as_bytes()), "expires_at":device.device_expires_at(),
+                        "route_id":relay_hex(self.route.as_bytes())});
+                if !self.queue_control(&message) {
+                    return web_remote::relay_client::SinkOutcome::CloseChannel;
+                }
+            }
+            return web_remote::relay_client::SinkOutcome::Continue;
+        }
         // 원시 바이트 → 게이트. 평문으로 나온 것만 명령 후보고, 나머지는 핸드셰이크의 몫이다.
         let step = match self.gate.receive(frame) {
             web_remote::relay_client::GateOutcome::Plaintext(plaintext) => {
@@ -8296,7 +8537,13 @@ impl web_remote::relay_client::RelayFrameSink for RelayDashboardSink {
             web_remote::relay_client::GateOutcome::Control {
                 frame_type,
                 connection_id,
-            } => self.handshake.control(frame_type, connection_id),
+            } => {
+                let step = self.handshake.control(frame_type, connection_id);
+                if frame_type == relay_protocol::FrameType::Admitted && !self.republish_grants() {
+                    return web_remote::relay_client::SinkOutcome::CloseChannel;
+                }
+                step
+            }
             web_remote::relay_client::GateOutcome::Hello {
                 connection_id,
                 record,
@@ -8336,12 +8583,25 @@ impl web_remote::relay_client::RelayFrameSink for RelayDashboardSink {
         self.gate.deactivate();
         self.handshake.session_ended();
         self.mailbox.clear();
+        self.principal = None;
+        self.control_outbound.clear();
+        self.pending_verifier = None;
+        self.registration_deadline = None;
+        self.registration_ready = false;
+        self.active_connection = None;
         if let Some(session) = self.watched.take() {
             self.core.dashboard().rebind_watch(Some(&session), None);
         }
     }
 
     fn poll(&mut self) -> web_remote::relay_client::SinkOutcome {
+        if self
+            .registration_deadline
+            .is_some_and(|deadline| unix_now_secs() >= deadline)
+            || (self.gate.is_active() && !self.principal_is_current())
+        {
+            return web_remote::relay_client::SinkOutcome::CloseChannel;
+        }
         // 게이트가 스스로 채널을 닫았는데(봉인 실패) 상태 기계는 살아 있다면 그 세션은 이미
         // 죽은 것이다 — 기기의 암호문이 조용히 버려지는 상태로 두지 않는다.
         if self.handshake.is_active() && !self.gate.is_active() {
@@ -8368,11 +8628,11 @@ impl web_remote::relay_client::RelayFrameSink for RelayDashboardSink {
             self.handshake.publish_ticket(handle);
         }
         match self.mailbox.take_decision() {
-            Some(RelayDecision::Activate(channel)) => {
+            Some(RelayDecision::Activate(channel, device)) => {
                 // 승인된 채널은 그 주장을 낸 세션에만 걸린다. 그 사이 세션이 바뀌었으면 죽은
                 // 세션의 채널이다 — 기기는 다음 접속에서 기존 기기로 바로 들어온다.
                 if self.handshake.proposed_connection() == Some(channel.connection_id()) {
-                    self.activate(channel);
+                    self.activate(channel, *device, false);
                 } else {
                     let mut channel = channel;
                     channel.close();
@@ -8382,7 +8642,12 @@ impl web_remote::relay_client::RelayFrameSink for RelayDashboardSink {
             Some(RelayDecision::Reject) => self.handshake.rejected(),
             None => {}
         }
+        if self.gate.is_active() && !self.principal_is_current() {
+            self.gate.deactivate();
+            self.control_outbound.clear();
+        }
         let mut frames = self.handshake.take_outbound();
+        frames.append(&mut self.control_outbound);
         if self.gate.is_active() {
             self.push_view(&mut frames);
         }
@@ -18449,7 +18714,7 @@ impl App {
                     // 살아 있는 채널을 워커의 세션 게이트에 건넨다. 워커가 그 사이 죽었으면
                     // 닫는다 — 기기 행은 이미 발행됐으므로 다음 접속에서 기존 기기로 들어온다.
                     match &mailbox {
-                        Some(mailbox) => mailbox.activate(channel),
+                        Some(mailbox) => mailbox.activate(channel, device),
                         None => {
                             let mut channel = channel;
                             channel.close();

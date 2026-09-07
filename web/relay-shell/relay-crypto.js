@@ -47,6 +47,11 @@ export const FRAME_TYPE = Object.freeze({
   DEVICE_ADMISSION: 0x11,
   TICKET_PUBLISH: 0x12,
   TICKET_REVOKE: 0x13,
+  RECONNECT_PUBLISH: 0x14,
+  RECONNECT_REVOKE: 0x15,
+  RECONNECT_ADMISSION: 0x16,
+  RECONNECT_SYNC: 0x17,
+  RECONNECT_PUBLISHED: 0x24,
   ADMITTED: 0x20,
   REJECTED: 0x21,
   PEER_JOINED: 0x22,
@@ -122,6 +127,11 @@ const PAYLOAD_BOUNDS = new Map([
   [FRAME_TYPE.DEVICE_ADMISSION, [ADMISSION_HANDLE_BYTES, ADMISSION_HANDLE_BYTES]],
   [FRAME_TYPE.TICKET_PUBLISH, [ADMISSION_HANDLE_BYTES, ADMISSION_HANDLE_BYTES]],
   [FRAME_TYPE.TICKET_REVOKE, [ADMISSION_HANDLE_BYTES, ADMISSION_HANDLE_BYTES]],
+  [FRAME_TYPE.RECONNECT_PUBLISH, [40, 40]],
+  [FRAME_TYPE.RECONNECT_REVOKE, [32, 32]],
+  [FRAME_TYPE.RECONNECT_ADMISSION, [32, 32]],
+  [FRAME_TYPE.RECONNECT_PUBLISHED, [32, 32]],
+  [FRAME_TYPE.RECONNECT_SYNC, [0, 0]],
   [FRAME_TYPE.ADMITTED, [0, 0]],
   [FRAME_TYPE.REJECTED, [2, 2]],
   [FRAME_TYPE.PEER_JOINED, [0, 0]],
@@ -325,6 +335,7 @@ const IDENTITY_DB_VERSION = 1;
 const IDENTITY_STORE = "identity";
 const IDENTITY_RECORD_KEY = "device-identity-v1";
 const DEVICE_RECORD_KEY = "known-device-v1";
+const REGISTRATION_RECORD_KEY = "registration-v2";
 const IDENTITY_RECORD_VERSION = 1;
 const IDENTITY_PROBE = encoder.encode("deppy-relay-identity-probe-v1\0");
 
@@ -469,6 +480,7 @@ export async function resetIdentity() {
   await withStore("readwrite", async (store) => {
     await requestToPromise(store.delete(IDENTITY_RECORD_KEY));
     await requestToPromise(store.delete(DEVICE_RECORD_KEY));
+    await requestToPromise(store.delete(REGISTRATION_RECORD_KEY));
   });
   return createIdentity();
 }
@@ -491,6 +503,60 @@ export async function rememberDeviceId(deviceId) {
 
 export async function forgetKnownDeviceId() {
   await withStore("readwrite", (store) => requestToPromise(store.delete(DEVICE_RECORD_KEY)));
+}
+
+// 재접속 등록은 신원과 한 묶음이다. 예전 id 단독 레코드는 재접속 자격이 아니다.
+export function validateRegistration(record, identityFingerprint, now = Math.floor(Date.now() / 1000)) {
+  if (!record || record.version !== 2 || !Number.isSafeInteger(record.expiresAt) ||
+      record.expiresAt <= now) throw new IdentityUnusableError("registration-expired-or-invalid");
+  for (const [key, size] of [["deviceId",16], ["routeId",16], ["desktopFingerprint",32],
+      ["identityFingerprint",32], ["grant",32]]) {
+    const value = record[key];
+    if (!(value instanceof Uint8Array) || value.length !== size || value.every((v) => v === 0)) {
+      throw new IdentityUnusableError("registration-shape");
+    }
+  }
+  if (!sameBytes(record.identityFingerprint, identityFingerprint)) {
+    throw new IdentityUnusableError("registration-identity-mismatch");
+  }
+  return record;
+}
+
+export async function loadRegistration(identityFingerprint) {
+  const record = await withStore("readonly", (store) => requestToPromise(store.get(REGISTRATION_RECORD_KEY)));
+  if (record === undefined || record === null) return null;
+  return validateRegistration(record, identityFingerprint);
+}
+
+// request 성공은 commit이 아니다. 디스크 오류/취소가 있으면 성공 등록을 남기지 않는다.
+export async function saveRegistration(record, identityFingerprint, signal) {
+  validateRegistration(record, identityFingerprint);
+  const db = await openIdentityDb();
+  try {
+    if (signal?.aborted) throw new IdentityUnusableError("registration-cancelled");
+    await new Promise((resolve, reject) => {
+      const transaction = db.transaction(IDENTITY_STORE, "readwrite");
+      const abort = () => { try { transaction.abort(); } catch {} };
+      const clean = () => signal?.removeEventListener("abort", abort);
+      transaction.oncomplete = () => { clean(); resolve(); };
+      transaction.onabort = transaction.onerror = () => {
+        clean(); reject(new IdentityUnusableError("registration-commit-failed"));
+      };
+      signal?.addEventListener("abort", abort, {once: true});
+      transaction.objectStore(IDENTITY_STORE).put(structuredClone(record), REGISTRATION_RECORD_KEY);
+    });
+  } finally { db.close(); }
+}
+
+function sameBytes(left, right) {
+  return left instanceof Uint8Array && right instanceof Uint8Array && left.length === right.length &&
+    left.every((byte, index) => byte === right[index]);
+}
+
+export function assertPinnedDesktop(record, fingerprint) {
+  if (!sameBytes(record.desktopFingerprint, fingerprint)) {
+    throw new IdentityUnusableError("desktop-identity-changed");
+  }
 }
 
 // ── 연결마다 새로 만드는 ECDH 임시키 ──────────────────────────────────────────────────

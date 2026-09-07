@@ -150,7 +150,12 @@ impl RelaySessionGate {
                 connection_id,
             },
             FrameType::Close | FrameType::Rejected => GateOutcome::Close,
-            FrameType::DesktopAdmission
+            FrameType::ReconnectPublish
+            | FrameType::ReconnectRevoke
+            | FrameType::ReconnectAdmission
+            | FrameType::ReconnectSync
+            | FrameType::ReconnectPublished
+            | FrameType::DesktopAdmission
             | FrameType::DeviceAdmission
             | FrameType::TicketPublish
             | FrameType::TicketRevoke => GateOutcome::Dropped(GateDrop::Unexpected),

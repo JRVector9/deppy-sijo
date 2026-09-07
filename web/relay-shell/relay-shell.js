@@ -21,6 +21,7 @@ import {
   CONNECTION_ID_BYTES,
   IDENTITY_HELLO_BYTES,
   PROTOCOL_VERSION,
+  MAX_FRAME_BYTES,
   ROLE,
   RelaySecureChannel,
   createEphemeral,
@@ -34,7 +35,10 @@ import {
   encodeKnownDevice,
   encodePairingProof,
   importGcmKey,
-  loadKnownDeviceId,
+  loadRegistration,
+  saveRegistration,
+  assertPinnedDesktop,
+  validateRegistration,
   loadOrCreateIdentity,
   parsePairingLink,
   rejectionCodeOf,
@@ -164,11 +168,18 @@ function byId(id) {
 
 // ── 셸 본체 ────────────────────────────────────────────────────────────────────────
 
-export function createShell({ endpoint, socketFactory }) {
+export function createShell({ endpoint, socketFactory, identityStore = {loadOrCreateIdentity, loadRegistration, saveRegistration} }) {
   const state = {
     screen: SCREEN.BOOT,
     identity: null,
     knownDeviceId: null,
+    registration: null,
+    pendingRegistration: null,
+    desktopFingerprint: null,
+    generation: 0,
+    retryAttempts: 0,
+    retryTimer: null,
+    abort: new AbortController(),
     link: null,
     socket: null,
     routeId: ZERO_ID,
@@ -241,6 +252,8 @@ export function createShell({ endpoint, socketFactory }) {
   function fail(screen, note) {
     if (state.finished) return;
     state.finished = true;
+    state.generation += 1;
+    state.abort.abort();
     clearTimers();
     unmountSession();
     state.channel?.close();
@@ -254,9 +267,41 @@ export function createShell({ endpoint, socketFactory }) {
     setScreen(screen, note);
   }
 
+  // 네트워크 단절만 재시도한다. 인증·취소·저장 손상은 이 경로로 오지 않는다.
+  function networkFailed(note) {
+    if (state.finished) return;
+    const retry = state.registration && state.retryAttempts < 5;
+    fail(SCREEN.RECOVERY, note);
+    if (!retry) return;
+    const delay = Math.min(1000 * 2 ** state.retryAttempts++, 8000);
+    state.retryTimer = globalThis.setTimeout(async () => {
+      state.retryTimer = null;
+      state.finished = false;
+      state.generation += 1;
+      state.abort = new AbortController();
+      state.admitted = false;
+      state.ephemeral = null;
+      state.pendingDesktopHello = null;
+      state.pendingRegistration = null;
+      state.registration = null;
+      state.desktopFingerprint = null;
+      state.knownDeviceId = null;
+      state.routeId = ZERO_ID;
+      state.connectionId = null;
+      await start();
+    }, delay);
+  }
+
+  function dispose() {
+    if (state.retryTimer !== null) globalThis.clearTimeout(state.retryTimer);
+    state.retryTimer = null;
+    fail(SCREEN.RECOVERY, "연결을 종료했습니다.");
+  }
+
   // ── 전송 ─────────────────────────────────────────────────────────────────────────
 
   function sendFrame(frameType, payload) {
+    if (state.finished) return false;
     if (!state.socket || state.socket.readyState !== 1) return false;
     state.socket.send(
       encodeFrame({
@@ -277,9 +322,16 @@ export function createShell({ endpoint, socketFactory }) {
     if (!OUTBOUND_MESSAGE_TYPES.includes(type)) {
       throw new RangeError(`이 셸이 보낼 수 없는 메시지다: ${String(type)}`);
     }
+    if (state.screen !== SCREEN.SESSION) return false;
+    return sendEncrypted(message);
+  }
+
+  // 등록 제어는 보기 전용 앱 명령 목록과 분리한다. 외부 UI에서 호출할 수 없다.
+  async function sendEncrypted(message) {
+    const generation = state.generation;
     if (!state.channel || state.channel.closed) return false;
     const sealed = await state.channel.seal(new TextEncoder().encode(JSON.stringify(message)));
-    if (!state.socket || state.socket.readyState !== 1) return false;
+    if (state.finished || generation !== state.generation || !state.socket || state.socket.readyState !== 1) return false;
     state.socket.send(
       encodeFrame({
         frameType: FRAME_TYPE.CIPHERTEXT,
@@ -815,13 +867,18 @@ export function createShell({ endpoint, socketFactory }) {
 
   async function activate() {
     if (state.screen === SCREEN.SESSION) return;
+    state.retryAttempts = 0;
     clearTimers();
     mountSession();
     setScreen(SCREEN.SESSION, "");
   }
 
   async function handleCiphertext(frame) {
-    if (!state.channel) return;
+    const generation = state.generation;
+    if (!state.channel || state.finished) return;
+    if (hexOf(frame.routeId) !== hexOf(state.routeId) || hexOf(frame.connectionId) !== hexOf(state.connectionId)) {
+      fail(SCREEN.RECOVERY, "암호 프레임의 연결 정보가 다릅니다."); return;
+    }
     let plaintext;
     try {
       plaintext = await state.channel.open({
@@ -830,20 +887,58 @@ export function createShell({ endpoint, socketFactory }) {
         ciphertext: frame.payload,
       });
     } catch (error) {
-      fail(SCREEN.RECOVERY, `암호 채널이 끊겼습니다 (${error.message})`);
+      if (!state.finished && generation === state.generation) {
+        fail(SCREEN.RECOVERY, `암호 채널이 끊겼습니다 (${error.message})`);
+      }
       return;
     }
-    await activate();
+    if (state.finished || generation !== state.generation) return;
+    let message;
+    try { message = JSON.parse(new TextDecoder("utf-8", {fatal: true}).decode(plaintext)); }
+    catch { fail(SCREEN.RECOVERY, "암호 메시지가 올바르지 않습니다."); return; }
+    if (message?.type === "relay_registered") {
+      if (!state.link || state.registration || state.pendingRegistration || message.version !== 2) {
+        fail(SCREEN.RECOVERY, "등록 순서가 올바르지 않습니다."); return;
+      }
+      const record = {version: 2, deviceId: unhex(message.device_id,16),
+        routeId: unhex(message.route_id,16), desktopFingerprint: state.desktopFingerprint,
+        identityFingerprint: state.identity.fingerprint, grant: crypto.getRandomValues(new Uint8Array(32)),
+        expiresAt: message.expires_at};
+      validateRegistration(record, state.identity.fingerprint);
+      if (hexOf(record.routeId) !== hexOf(state.routeId)) throw new Error("등록 라우트 불일치");
+      state.pendingRegistration = record;
+      const verifier = await sha256(record.grant);
+      if (state.finished || generation !== state.generation) return;
+      await sendEncrypted({type: "relay_register", version: 2, verifier: hexOf(verifier)});
+      return;
+    }
+    if (message?.type === "relay_ready") {
+      const record = state.pendingRegistration ?? state.registration;
+      if (!record || state.screen === SCREEN.SESSION || message.version !== 2 ||
+          message.device_id !== hexOf(record.deviceId) || message.route_id !== hexOf(record.routeId) ||
+          message.expires_at !== record.expiresAt) throw new Error("등록 확인 불일치");
+      validateRegistration(record, state.identity.fingerprint);
+      if (state.pendingRegistration) {
+        await identityStore.saveRegistration(record, state.identity.fingerprint, state.abort.signal);
+        if (state.finished || generation !== state.generation) return;
+        state.registration = record;
+        state.pendingRegistration = null;
+        state.knownDeviceId = record.deviceId;
+      }
+      await activate();
+      return;
+    }
+    if (state.screen !== SCREEN.SESSION) throw new Error("등록 완료 전 애플리케이션 데이터");
     handlePlaintext(plaintext);
   }
 
   /// 데스크톱 hello 하나를 소화한다. 서명 검증 → 우리 hello 서명·송신 → 키 파생 → 증명 제출.
   ///
-  /// **주의(계약 미해결):** Task 1의 서명은 양쪽 offer를 모두 묶은 transcript 위에 있다.
-  /// 따라서 어느 쪽도 상대 임시키를 보기 전에는 서명할 수 없다. 이 셸은 데스크톱 hello를
-  /// 먼저 받고 나서 자기 hello를 보낸다(도착이 준비보다 빨라도 버퍼링한다). Mac 쪽이 같은
-  /// 규칙으로 기다리면 교착이므로, 누가 먼저 보내는지는 Mac 구현과 맞춰야 한다.
+  /// 양쪽 offer를 묶은 transcript에 서명한다. 입장 뒤 브라우저가 offer를 먼저 보내고
+  /// Mac의 서명된 hello를 검증한 다음 브라우저 hello를 보낸다.
   async function consumeDesktopHello(payload) {
+    const generation = state.generation;
+    const current = () => !state.finished && generation === state.generation;
     if (payload.length !== IDENTITY_HELLO_BYTES || payload[0] !== HELLO_TAG.IDENTITY) {
       fail(SCREEN.RECOVERY, "Mac이 보낸 첫 레코드가 계약과 다릅니다.");
       return;
@@ -875,12 +970,18 @@ export function createShell({ endpoint, socketFactory }) {
       },
     });
     const verified = await verifyPeerSignature(hello.identitySec1, hello.signature, transcript);
+    if (!current()) return;
     if (!verified) {
       fail(SCREEN.RECOVERY, "Mac의 서명을 확인하지 못했습니다.");
       return;
     }
 
+    const fingerprint = await sha256(hello.identitySec1);
+    if (!current()) return;
+    if (state.registration) assertPinnedDesktop(state.registration, fingerprint);
+    state.desktopFingerprint = fingerprint;
     const signature = await signTranscript(state.identity, transcript);
+    if (!current()) return;
     sendFrame(
       FRAME_TYPE.HELLO,
       encodeIdentityHello({
@@ -901,6 +1002,7 @@ export function createShell({ endpoint, socketFactory }) {
     zeroBytes(material.desktopToDeviceKeyBytes);
     zeroBytes(material.deviceToDesktopKeyBytes);
 
+    if (!current()) return;
     state.channel = new RelaySecureChannel({
       protocolVersion: PROTOCOL_VERSION,
       connectionId: state.connectionId,
@@ -909,30 +1011,28 @@ export function createShell({ endpoint, socketFactory }) {
       sendDirection: DIRECTION.DEVICE_TO_DESKTOP,
       receiveDirection: DIRECTION.DESKTOP_TO_DEVICE,
       ownFingerprint: state.identity.fingerprint,
-      peerFingerprint: await sha256(hello.identitySec1),
+      peerFingerprint: fingerprint,
     });
 
     state.sas = material.sas;
-    showVerification(material.sas);
+    if (state.registration) setScreen(SCREEN.CONNECT, "등록된 Mac의 인증을 기다리는 중…");
+    else showVerification(material.sas);
 
     const transcriptHash = await sha256(transcript);
+    if (!current()) return;
     const known = state.knownDeviceId;
     if (known) {
       sendFrame(FRAME_TYPE.HELLO, encodeKnownDevice(known));
     } else {
-      sendFrame(
-        FRAME_TYPE.HELLO,
-        await encodePairingProof({
-          pairingId: state.link.pairingId,
-          pairingSecret: state.link.pairingSecret,
-          transcriptHash,
-          connectionId: state.connectionId,
-          deviceFingerprint: state.identity.fingerprint,
-        }),
-      );
+      const proof = await encodePairingProof({
+        pairingId: state.link.pairingId, pairingSecret: state.link.pairingSecret,
+        transcriptHash, connectionId: state.connectionId, deviceFingerprint: state.identity.fingerprint,
+      });
+      if (!current()) return;
+      sendFrame(FRAME_TYPE.HELLO, proof);
     }
     // 페어링 비밀은 증명 계산 직후 지운다. 이 문서에는 더 이상 존재하지 않는다.
-    zeroBytes(state.link.pairingSecret);
+    if (state.link) zeroBytes(state.link.pairingSecret);
 
     clearTimers();
     after(APPROVAL_DEADLINE_MS, () => {
@@ -952,6 +1052,8 @@ export function createShell({ endpoint, socketFactory }) {
   }
 
   async function handleFrame(frame) {
+    const generation = state.generation;
+    if (state.finished) return;
     switch (frame.frameType) {
       case FRAME_TYPE.ADMITTED: {
         // 서버는 우리가 선언한 연결 id를 그대로 되돌려 준다. 다른 값이 오면 이 접속이
@@ -968,7 +1070,9 @@ export function createShell({ endpoint, socketFactory }) {
         // 라우트는 Mac이 먼저 소유해야 존재하므로, 입장이 허가된 시점에 상대는 이미 있다
         // (`PeerJoined`는 그 사실을 **Mac에게** 알리는 프레임이지 우리에게 오지 않는다).
         // 그러니 여기서 바로 문을 연다.
-        state.ephemeral = await createEphemeral();
+        const ephemeral = await createEphemeral();
+        if (state.finished || generation !== state.generation) return;
+        state.ephemeral = ephemeral;
         // 서명은 양쪽 offer를 덮으므로 어느 쪽도 먼저 서명할 수 없다. 기기가 서명 없는
         // Offer로 문을 열고, Mac이 그에 서명한 hello로 답하면 그때 기기도 서명한다.
         sendFrame(
@@ -1005,11 +1109,15 @@ export function createShell({ endpoint, socketFactory }) {
       case FRAME_TYPE.HEARTBEAT:
         return;
       case FRAME_TYPE.PEER_LEFT:
-        fail(SCREEN.RECOVERY, "Mac과의 연결이 끊겼습니다.");
+        networkFailed("Mac과의 연결이 끊겼습니다.");
         return;
       case FRAME_TYPE.REJECTED:
       case FRAME_TYPE.CLOSE: {
         const reason = rejectionCodeOf(frame);
+        if (state.registration && ["route-unknown", "ticket-unknown", "peer-disconnected", "idle-timeout",
+            "shutting-down", "route-busy", "rate-limited"].includes(reason)) {
+          networkFailed(`릴레이 연결을 다시 시도합니다 (${reason})`); return;
+        }
         const revoked = reason === "credential-rejected" || reason === "ticket-consumed";
         fail(
           revoked ? SCREEN.REVOKED : SCREEN.RECOVERY,
@@ -1024,22 +1132,34 @@ export function createShell({ endpoint, socketFactory }) {
   }
 
   function open() {
+    const generation = state.generation;
+    const current = () => !state.finished && generation === state.generation;
+    let inbound = Promise.resolve();
+    let pendingFrames = 0;
+    let pendingBytes = 0;
     const socket = socketFactory ? socketFactory(endpoint) : new WebSocket(endpoint);
     socket.binaryType = "arraybuffer";
     state.socket = socket;
     socket.addEventListener("open", () => {
+      if (!current()) return;
       // 입장 프레임 **헤더**가 이 세션의 연결 id를 선언한다. `sendFrame`이 그 값을 쓴다.
       state.connectionId = newConnectionId();
-      sendFrame(FRAME_TYPE.DEVICE_ADMISSION, state.link.admissionHandle);
-      // 입장 핸들은 1회용이다. 제출 직후 이 문서에서 지운다.
-      zeroBytes(state.link.admissionHandle);
+      if (state.link) {
+        sendFrame(FRAME_TYPE.DEVICE_ADMISSION, state.link.admissionHandle);
+        zeroBytes(state.link.admissionHandle);
+      } else {
+        sendFrame(FRAME_TYPE.RECONNECT_ADMISSION, state.registration.grant);
+      }
       setScreen(SCREEN.CONNECT, "릴레이에 입장하는 중…");
       after(ADMISSION_DEADLINE_MS, () => {
-        if (!state.admitted) fail(SCREEN.RECOVERY, "릴레이가 입장을 확인하지 않았습니다.");
+        if (!state.admitted) networkFailed("릴레이가 입장을 확인하지 않았습니다.");
       });
     });
     socket.addEventListener("message", (event) => {
-      if (!(event.data instanceof ArrayBuffer)) return;
+      if (!current() || !(event.data instanceof ArrayBuffer)) return;
+      if (pendingFrames >= 64 || pendingBytes + event.data.byteLength > 2 * MAX_FRAME_BYTES) {
+        fail(SCREEN.RECOVERY, "수신 대기열 상한을 넘었습니다."); return;
+      }
       let decoded;
       try {
         decoded = decodeFrame(event.data);
@@ -1047,36 +1167,60 @@ export function createShell({ endpoint, socketFactory }) {
         return;
       }
       if (decoded.consumed !== event.data.byteLength) return;
-      void handleFrame(decoded.frame).catch((error) => {
-        fail(SCREEN.RECOVERY, `처리할 수 없는 프레임입니다 (${error.message})`);
-      });
+      pendingFrames += 1;
+      pendingBytes += event.data.byteLength;
+      // 암호 열기뿐 아니라 등록 commit까지 직렬화한다. 다음 dashboard가 ACK를 추월하지 못한다.
+      inbound = inbound.then(() => current() ? handleFrame(decoded.frame) : undefined).catch((error) => {
+        if (current()) fail(SCREEN.RECOVERY, `처리할 수 없는 프레임입니다 (${error.message})`);
+      }).finally(() => { pendingFrames -= 1; pendingBytes -= event.data.byteLength; });
     });
     socket.addEventListener("close", () => {
-      fail(SCREEN.RECOVERY, "릴레이 연결이 끊어졌습니다.");
+      if (!current()) return;
+      networkFailed("릴레이 연결이 끊어졌습니다.");
     });
     socket.addEventListener("error", () => {
-      fail(SCREEN.RECOVERY, "릴레이에 연결할 수 없습니다.");
+      if (!current()) return;
+      networkFailed("릴레이에 연결할 수 없습니다.");
     });
   }
 
   async function start() {
+    const generation = state.generation;
+    if (state.finished) return;
     setScreen(SCREEN.BOOT, "");
     state.link = readPairingLinkFromLocation();
     try {
-      state.identity = await loadOrCreateIdentity();
+      const identity = await identityStore.loadOrCreateIdentity();
+      if (state.finished || generation !== state.generation) return;
+      state.identity = identity;
     } catch (error) {
+      if (state.finished || generation !== state.generation) return;
       setScreen(SCREEN.IDENTITY, `이 기기의 신원을 쓸 수 없습니다 (${error.reason ?? "unknown"})`);
       return;
     }
-    state.knownDeviceId = await loadKnownDeviceId().catch(() => null);
+    if (state.finished) return;
+    // 사용자가 새 링크를 열었다면 저장된 등록보다 이번 페어링이 우선한다.
     if (!state.link) {
-      setScreen(SCREEN.LINK, "");
-      return;
+      try {
+        const registration = await identityStore.loadRegistration(state.identity.fingerprint);
+        if (state.finished || generation !== state.generation) return;
+        state.registration = registration ? validateRegistration(registration, state.identity.fingerprint) : null;
+      }
+      catch (error) {
+        if (!state.finished && generation === state.generation) {
+          fail(SCREEN.RECOVERY, `기기 등록을 쓸 수 없습니다 (${error.reason ?? "storage"})`);
+        }
+        return;
+      }
+      if (state.finished) return;
+      if (!state.registration) { setScreen(SCREEN.LINK, ""); return; }
+      state.knownDeviceId = state.registration.deviceId;
+      state.routeId = state.registration.routeId;
     }
     open();
   }
 
-  return { start, state, sendMessage, stopWatching, startWatching };
+  return { start, state, sendMessage, stopWatching, startWatching, dispose };
 }
 
 // ── 표시 설정 (기기 로컬, 비밀 아님) ───────────────────────────────────────────────
@@ -1110,6 +1254,13 @@ function savePrefs(prefs) {
   }
 }
 
+function unhex(value, length) {
+  if (typeof value !== "string" || value.length !== length * 2 || !/^[0-9a-f]+$/.test(value)) {
+    throw new Error("등록 식별자 형식 불일치");
+  }
+  return Uint8Array.from(value.match(/../g), (part) => parseInt(part, 16));
+}
+
 function hexOf(bytes) {
   return Array.from(bytes ?? [], (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
@@ -1121,6 +1272,7 @@ function hexOf(bytes) {
 
 function attachChrome(shell) {
   byId("reset-identity")?.addEventListener("click", () => {
+    shell.dispose();
     void resetIdentity()
       .then(() => globalThis.location.reload())
       .catch(() => {

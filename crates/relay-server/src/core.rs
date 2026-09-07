@@ -15,6 +15,7 @@
 //! 자원(라우트·티켓·큐)은 **입장 판정 이후에만** 할당된다. 자격증명이 틀리거나 속도 제한에
 //! 걸린 상대는 라우트도 큐도 얻지 못한다.
 
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 
@@ -196,11 +197,20 @@ struct Ticket {
     published_at: u64,
 }
 
+struct ReconnectGrant {
+    verifier: AdmissionCredential,
+    published_at: u64,
+    expires_at: u64,
+}
+
 struct Route {
     desktop: ConnectionKey,
     device: Option<ConnectionKey>,
     session: Option<ConnectionId>,
     tickets: Vec<Ticket>,
+    grants: Vec<ReconnectGrant>,
+    device_grant: Option<AdmissionCredential>,
+    reconnect_ready: bool,
 }
 
 struct RateWindow {
@@ -404,12 +414,17 @@ impl RelayCore {
             (ConnectionState::AwaitingAdmission, FrameType::DesktopAdmission) => {
                 Ok(self.admit_desktop(connection, &frame, now))
             }
-            (ConnectionState::AwaitingAdmission, FrameType::DeviceAdmission) => {
-                Ok(self.admit_device(connection, &frame, now))
-            }
+            (
+                ConnectionState::AwaitingAdmission,
+                FrameType::DeviceAdmission | FrameType::ReconnectAdmission,
+            ) => Ok(self.admit_device(connection, &frame, now)),
             (ConnectionState::AwaitingAdmission, _) => {
                 Ok(self.reject(connection, RejectionCode::MalformedFrame))
             }
+            (
+                ConnectionState::Desktop { route },
+                FrameType::ReconnectPublish | FrameType::ReconnectRevoke | FrameType::ReconnectSync,
+            ) => Ok(self.reconnect_control(connection, route, &frame, now)),
             (ConnectionState::Desktop { route }, FrameType::TicketPublish) => {
                 Ok(self.publish_ticket(connection, route, &frame, now))
             }
@@ -471,6 +486,7 @@ impl RelayCore {
                     return Vec::new();
                 };
                 entry.device = None;
+                entry.device_grant = None;
                 entry.session = None;
                 let desktop = entry.desktop;
                 self.notify(
@@ -586,6 +602,9 @@ impl RelayCore {
                 device: None,
                 session: None,
                 tickets: Vec::new(),
+                grants: Vec::new(),
+                device_grant: None,
+                reconnect_ready: false,
             },
         );
         if let Some(entry) = self.connections.get_mut(&connection) {
@@ -625,31 +644,62 @@ impl RelayCore {
         {
             return self.reject(connection, RejectionCode::MalformedFrame);
         }
-        let route = frame.route_id();
+        let mut route = frame.route_id();
         let ticket_ttl = self.limits.ticket_ttl_secs;
+        // v1 페어링 링크에는 route가 없다. 상한 있는 ticket 표에서 유일한 후보만 찾는다.
+        // 명시적 route나 재접속에는 이 해석을 적용하지 않아 다른 route를 우회하지 못한다.
+        if frame.frame_type() == FrameType::DeviceAdmission && route.as_bytes() == &[0; 16] {
+            let mut candidates = self.routes.iter().filter(|(_, entry)| {
+                entry.tickets.iter().any(|ticket| {
+                    ticket.handle.matches(&handle)
+                        && now >= ticket.published_at
+                        && now - ticket.published_at < ticket_ttl
+                })
+            });
+            let found = candidates.next().map(|(route, _)| *route);
+            if found.is_none() || candidates.next().is_some() {
+                self.rejected_admissions += 1;
+                return self.reject(connection, RejectionCode::TicketUnknown);
+            }
+            route = found.expect("유일한 후보 확인");
+        }
         let Some(entry) = self.routes.get_mut(&route) else {
             self.rejected_admissions += 1;
             // 존재하지 않는 라우트와 모르는 티켓을 같은 코드로 답한다.
             return self.reject(connection, RejectionCode::TicketUnknown);
         };
-        // 만료는 정리 주기(`tick`)가 아니라 **판정 시점의 시계**로 본다. 정리가 아직
-        // 돌지 않았다는 이유로 만료된 티켓이 입장에 쓰이면 TTL이 무의미해진다.
-        let ttl = ticket_ttl;
-        let Some(index) = entry.tickets.iter().position(|ticket| {
-            ticket.handle.matches(&handle) && now.saturating_sub(ticket.published_at) < ttl
-        }) else {
-            self.rejected_admissions += 1;
-            return self.reject(connection, RejectionCode::TicketUnknown);
-        };
-
-        // 1회용이다. 라우트가 이미 차 있어도 **먼저 소비한다** — 소비하지 않으면 같은
-        // 핸들을 상대가 떠난 뒤 다시 쓸 수 있어 재생 공격이 열린다.
-        entry.tickets.remove(index);
+        let reconnect = frame.frame_type() == FrameType::ReconnectAdmission;
+        // DB 복원은 여러 프레임에 걸친다. 완료 전의 빈 registry는 회수가 아니다.
+        if reconnect && !entry.reconnect_ready {
+            return self.reject(connection, RejectionCode::RouteBusy);
+        }
+        let verifier = AdmissionCredential::from_bytes(Sha256::digest(handle.as_bytes()).into());
+        if reconnect {
+            if !entry.grants.iter().any(|grant| {
+                grant.verifier.matches(&verifier)
+                    && now >= grant.published_at
+                    && now < grant.expires_at
+            }) {
+                self.rejected_admissions += 1;
+                return self.reject(connection, RejectionCode::CredentialRejected);
+            }
+        } else {
+            // 기존 페어링은 5분·1회용이다. 바쁜 라우트에서도 먼저 소비한다.
+            let Some(index) = entry.tickets.iter().position(|ticket| {
+                ticket.handle.matches(&handle)
+                    && now.saturating_sub(ticket.published_at) < ticket_ttl
+            }) else {
+                self.rejected_admissions += 1;
+                return self.reject(connection, RejectionCode::TicketUnknown);
+            };
+            entry.tickets.remove(index);
+        }
         if entry.device.is_some() {
             self.rejected_admissions += 1;
             return self.reject(connection, RejectionCode::RouteBusy);
         }
 
+        entry.device_grant = reconnect.then_some(verifier);
         entry.device = Some(connection);
         entry.session = Some(frame.connection_id());
         let desktop = entry.desktop;
@@ -672,6 +722,85 @@ impl RelayCore {
             actions.push(action);
         }
         actions
+    }
+
+    /// 재접속 검증자는 권한이 아니라 자원 입장 필터다. 실제 신원은 종단 간 검증한다.
+    fn reconnect_control(
+        &mut self,
+        connection: ConnectionKey,
+        route: RouteId,
+        frame: &RelayFrame<'_>,
+        now: u64,
+    ) -> Vec<RelayAction> {
+        if frame.route_id() != route {
+            return self.reject(connection, RejectionCode::RouteUnknown);
+        }
+        if frame.frame_type() == FrameType::ReconnectSync {
+            let Some(entry) = self.routes.get_mut(&route) else {
+                return self.reject(connection, RejectionCode::RouteUnknown);
+            };
+            entry.reconnect_ready = true;
+            return Vec::new();
+        }
+        let verifier = AdmissionCredential::from_bytes(
+            frame.payload()[..32].try_into().expect("wire 길이 검증"),
+        );
+        let Some(entry) = self.routes.get_mut(&route) else {
+            return self.reject(connection, RejectionCode::RouteUnknown);
+        };
+        entry
+            .grants
+            .retain(|grant| now >= grant.published_at && now < grant.expires_at);
+        if frame.frame_type() == FrameType::ReconnectRevoke {
+            entry
+                .grants
+                .retain(|grant| !grant.verifier.matches(&verifier));
+            let active = entry
+                .device_grant
+                .is_some_and(|active| active.matches(&verifier));
+            let device = active.then_some(entry.device).flatten();
+            if let Some(device) = device {
+                return self.reject(device, RejectionCode::CredentialRejected);
+            }
+            return Vec::new();
+        }
+        let expires_at =
+            u64::from_be_bytes(frame.payload()[32..40].try_into().expect("wire 길이 검증"));
+        if expires_at <= now || expires_at - now > relay_protocol::MAX_RECONNECT_LIFETIME_SECS {
+            return self.reject(connection, RejectionCode::MalformedFrame);
+        }
+        if let Some(existing) = entry
+            .grants
+            .iter_mut()
+            .find(|grant| grant.verifier.matches(&verifier))
+        {
+            // 재게시는 수명을 늘리지 않는다.
+            existing.expires_at = existing.expires_at.min(expires_at);
+        } else {
+            if entry.grants.len() >= relay_protocol::MAX_RECONNECT_GRANTS {
+                return self.control(
+                    connection,
+                    FrameType::Rejected,
+                    route,
+                    RejectionCode::CapacityReached,
+                );
+            }
+            entry.grants.push(ReconnectGrant {
+                verifier,
+                published_at: now,
+                expires_at,
+            });
+        }
+        let ack = RelayFrame::new(
+            FrameType::ReconnectPublished,
+            route,
+            frame.connection_id(),
+            0,
+            verifier.as_bytes(),
+        )
+        .expect("고정 ACK 길이")
+        .to_vec();
+        self.enqueue(connection, ack).into_iter().collect()
     }
 
     fn publish_ticket(
@@ -841,6 +970,9 @@ impl RelayCore {
         let ttl = self.limits.ticket_ttl_secs;
         for route in self.routes.values_mut() {
             route
+                .grants
+                .retain(|grant| now >= grant.published_at && now < grant.expires_at);
+            route
                 .tickets
                 .retain(|ticket| now.saturating_sub(ticket.published_at) < ttl);
         }
@@ -945,6 +1077,7 @@ impl RelayCore {
                     return Vec::new();
                 };
                 entry.device = None;
+                entry.device_grant = None;
                 entry.session = None;
                 let desktop = entry.desktop;
                 self.notify(
@@ -1030,6 +1163,19 @@ mod tests {
 
     /// 데스크톱 하나를 입장시키고 그 키를 돌려준다.
     fn admit_desktop(core: &mut RelayCore, now: u64) -> ConnectionKey {
+        let key = admit_desktop_unrestored(core, now);
+        let actions = core
+            .frame_received(
+                key,
+                &frame(FrameType::ReconnectSync, connection_id(1), &[]),
+                now,
+            )
+            .unwrap();
+        assert!(actions.is_empty());
+        key
+    }
+
+    fn admit_desktop_unrestored(core: &mut RelayCore, now: u64) -> ConnectionKey {
         let key = core.connection_opened(DESKTOP_IP, now).unwrap();
         let actions = core
             .frame_received(
@@ -1114,6 +1260,343 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn reconnect_pairing_link_without_route_resolves_only_its_one_shot_ticket() {
+        let mut core = new_core();
+        let desktop = admit_desktop(&mut core, START);
+        publish_ticket(&mut core, desktop, 7, START);
+        let device = core.connection_opened(DEVICE_IP, START + 1).unwrap();
+        let admission = RelayFrame::new(
+            FrameType::DeviceAdmission,
+            RouteId::from_bytes([0; 16]),
+            connection_id(2),
+            0,
+            &[7; 32],
+        )
+        .unwrap()
+        .to_vec();
+        let actions = core.frame_received(device, &admission, START + 1).unwrap();
+        assert!(sent_types(&actions).contains(&FrameType::Admitted));
+        for action in &actions {
+            if let RelayAction::Send { frame, .. } = action {
+                assert_eq!(RelayFrame::decode(frame).unwrap().0.route_id(), route());
+            }
+        }
+    }
+
+    #[test]
+    fn reconnect_route_free_pairing_rejects_ambiguous_tickets() {
+        let second_route = RouteId::from_bytes([0x42; 16]);
+        let mut core = RelayCore::new(
+            RelayLimits::default(),
+            vec![
+                RouteVerifier::new(route(), credential(0xd1)),
+                RouteVerifier::new(second_route, credential(0xd2)),
+            ],
+        )
+        .unwrap();
+        let first = admit_desktop(&mut core, START);
+        publish_ticket(&mut core, first, 7, START);
+        let second = core.connection_opened([30; 16], START).unwrap();
+        for (kind, payload) in [
+            (FrameType::DesktopAdmission, credential(0xd2)),
+            (FrameType::TicketPublish, credential(7)),
+        ] {
+            let wire = RelayFrame::new(kind, second_route, connection_id(1), 0, payload.as_bytes())
+                .unwrap()
+                .to_vec();
+            let actions = core.frame_received(second, &wire, START).unwrap();
+            flush_all(&mut core, &actions);
+        }
+        let device = core.connection_opened(DEVICE_IP, START + 1).unwrap();
+        let admission = RelayFrame::new(
+            FrameType::DeviceAdmission,
+            RouteId::from_bytes([0; 16]),
+            connection_id(2),
+            0,
+            &[7; 32],
+        )
+        .unwrap()
+        .to_vec();
+        let actions = core.frame_received(device, &admission, START + 1).unwrap();
+        assert_eq!(
+            disconnects(&actions),
+            vec![(device, RejectionCode::TicketUnknown)]
+        );
+        assert_eq!(
+            core.ticket_count(),
+            2,
+            "중복 route의 티켓을 임의 소비하지 않는다"
+        );
+    }
+
+    #[test]
+    fn reconnect_during_desktop_restoration_is_transient_not_revoked() {
+        let mut core = new_core();
+        let desktop = admit_desktop_unrestored(&mut core, START);
+        let device = core.connection_opened(DEVICE_IP, START + 1).unwrap();
+        let actions = core
+            .frame_received(
+                device,
+                &frame(FrameType::ReconnectAdmission, connection_id(2), &[7; 32]),
+                START + 1,
+            )
+            .unwrap();
+        assert_eq!(
+            disconnects(&actions),
+            vec![(device, RejectionCode::RouteBusy)],
+            "DB verifier 복원 전 입장은 기기 회수가 아니라 일시적 대기다"
+        );
+        let verifier: [u8; 32] = Sha256::digest([7; 32]).into();
+        let mut published = verifier.to_vec();
+        published.extend_from_slice(&(START + 600).to_be_bytes());
+        let actions = core
+            .frame_received(
+                desktop,
+                &frame(FrameType::ReconnectPublish, connection_id(1), &published),
+                START + 2,
+            )
+            .unwrap();
+        flush_all(&mut core, &actions);
+        core.frame_received(
+            desktop,
+            &frame(FrameType::ReconnectSync, connection_id(1), &[]),
+            START + 2,
+        )
+        .unwrap();
+        let device = core.connection_opened(DEVICE_IP, START + 3).unwrap();
+        let actions = core
+            .frame_received(
+                device,
+                &frame(FrameType::ReconnectAdmission, connection_id(2), &[7; 32]),
+                START + 3,
+            )
+            .unwrap();
+        assert!(sent_types(&actions).contains(&FrameType::Admitted));
+        flush_all(&mut core, &actions);
+        let actions = core.connection_closed(device, START + 3);
+        flush_all(&mut core, &actions);
+        let wrong = core.connection_opened(DEVICE_IP, START + 4).unwrap();
+        let actions = core
+            .frame_received(
+                wrong,
+                &frame(FrameType::ReconnectAdmission, connection_id(2), &[8; 32]),
+                START + 4,
+            )
+            .unwrap();
+        assert_eq!(
+            disconnects(&actions),
+            vec![(wrong, RejectionCode::CredentialRejected)]
+        );
+    }
+
+    #[test]
+    fn reconnect_grant_is_revoked_and_never_accepted_with_wrong_bytes() {
+        let mut core = new_core();
+        let desktop = admit_desktop(&mut core, START);
+        let verifier: [u8; 32] = Sha256::digest([7; 32]).into();
+        let mut payload = verifier.to_vec();
+        payload.extend_from_slice(&(START + 600).to_be_bytes());
+        let actions = core
+            .frame_received(
+                desktop,
+                &frame(FrameType::ReconnectPublish, connection_id(1), &payload),
+                START,
+            )
+            .unwrap();
+        flush_all(&mut core, &actions);
+        let wrong = core.connection_opened(DEVICE_IP, START + 1).unwrap();
+        let actions = core
+            .frame_received(
+                wrong,
+                &frame(FrameType::ReconnectAdmission, connection_id(2), &[8; 32]),
+                START + 1,
+            )
+            .unwrap();
+        assert_eq!(
+            disconnects(&actions),
+            vec![(wrong, RejectionCode::CredentialRejected)]
+        );
+        let actions = core
+            .frame_received(
+                desktop,
+                &frame(FrameType::ReconnectRevoke, connection_id(1), &verifier),
+                START + 2,
+            )
+            .unwrap();
+        flush_all(&mut core, &actions);
+        let revoked = core.connection_opened(DEVICE_IP, START + 3).unwrap();
+        let actions = core
+            .frame_received(
+                revoked,
+                &frame(FrameType::ReconnectAdmission, connection_id(2), &[7; 32]),
+                START + 3,
+            )
+            .unwrap();
+        assert_eq!(
+            disconnects(&actions),
+            vec![(revoked, RejectionCode::CredentialRejected)]
+        );
+    }
+
+    #[test]
+    fn reconnect_registry_has_an_independent_fixed_bound() {
+        let mut core = new_core();
+        let desktop = admit_desktop(&mut core, START);
+        for index in 0..=relay_protocol::MAX_RECONNECT_GRANTS {
+            let mut payload = vec![index as u8; 32];
+            payload.extend_from_slice(&(START + 600).to_be_bytes());
+            let actions = core
+                .frame_received(
+                    desktop,
+                    &frame(FrameType::ReconnectPublish, connection_id(1), &payload),
+                    START,
+                )
+                .unwrap();
+            if index < relay_protocol::MAX_RECONNECT_GRANTS {
+                assert!(sent_types(&actions).contains(&FrameType::ReconnectPublished));
+            } else {
+                assert!(sent_types(&actions).contains(&FrameType::Rejected));
+            }
+            flush_all(&mut core, &actions);
+        }
+        assert_eq!(
+            core.routes[&route()].grants.len(),
+            relay_protocol::MAX_RECONNECT_GRANTS
+        );
+        assert_eq!(core.ticket_count(), 0);
+        assert_eq!(core.route_count(), 1);
+    }
+
+    #[test]
+    fn reconnect_grant_survives_disconnect_but_not_expiry() {
+        // SHA-256([7;32]), 고정 벡터를 써서 시험 자체에는 새 해시 의존성이 없다.
+        let verifier = [
+            0x4b, 0xb0, 0x6f, 0x8e, 0x4e, 0x3a, 0x77, 0x15, 0xd2, 0x01, 0xd5, 0x73, 0xd0, 0xaa,
+            0x42, 0x37, 0x62, 0xe5, 0x5d, 0xab, 0xd6, 0x1a, 0x2c, 0x02, 0x27, 0x8f, 0xa5, 0x6c,
+            0xc6, 0xd2, 0x94, 0xe0,
+        ];
+        let mut core = new_core();
+        let desktop = admit_desktop(&mut core, START);
+        let mut published = verifier.to_vec();
+        published.extend_from_slice(&(START + 600).to_be_bytes());
+        let actions = core
+            .frame_received(
+                desktop,
+                &frame(FrameType::ReconnectPublish, connection_id(1), &published),
+                START,
+            )
+            .unwrap();
+        assert!(
+            sent_types(&actions).contains(&FrameType::ReconnectPublished),
+            "{actions:?}"
+        );
+        flush_all(&mut core, &actions);
+        for at in [START + 1, START + 301] {
+            let device = core.connection_opened(DEVICE_IP, at).unwrap();
+            let actions = core
+                .frame_received(
+                    device,
+                    &frame(FrameType::ReconnectAdmission, connection_id(2), &[7; 32]),
+                    at,
+                )
+                .unwrap();
+            assert!(
+                sent_types(&actions).contains(&FrameType::Admitted),
+                "{actions:?}"
+            );
+            flush_all(&mut core, &actions);
+            let actions = core.connection_closed(device, at);
+            flush_all(&mut core, &actions);
+        }
+        let device = core.connection_opened(DEVICE_IP, START + 600).unwrap();
+        let actions = core
+            .frame_received(
+                device,
+                &frame(FrameType::ReconnectAdmission, connection_id(2), &[7; 32]),
+                START + 600,
+            )
+            .unwrap();
+        assert!(!sent_types(&actions).contains(&FrameType::Admitted));
+    }
+
+    #[test]
+    fn reconnect_publication_cannot_extend_expiry_or_cross_authority() {
+        for expires_at in [
+            START,
+            START + relay_protocol::MAX_RECONNECT_LIFETIME_SECS + 1,
+        ] {
+            let mut core = new_core();
+            let desktop = admit_desktop(&mut core, START);
+            let mut payload = vec![7; 32];
+            payload.extend_from_slice(&expires_at.to_be_bytes());
+            let actions = core
+                .frame_received(
+                    desktop,
+                    &frame(FrameType::ReconnectPublish, connection_id(1), &payload),
+                    START,
+                )
+                .unwrap();
+            assert_eq!(
+                disconnects(&actions),
+                vec![(desktop, RejectionCode::MalformedFrame)]
+            );
+        }
+        let mut core = new_core();
+        let desktop = admit_desktop(&mut core, START);
+        let verifier: [u8; 32] = Sha256::digest([7; 32]).into();
+        for expiry in [START + 100, START + 200] {
+            let mut payload = verifier.to_vec();
+            payload.extend_from_slice(&expiry.to_be_bytes());
+            let actions = core
+                .frame_received(
+                    desktop,
+                    &frame(FrameType::ReconnectPublish, connection_id(1), &payload),
+                    START,
+                )
+                .unwrap();
+            flush_all(&mut core, &actions);
+        }
+        assert_eq!(core.routes[&route()].grants[0].expires_at, START + 100);
+        let device = core.connection_opened(DEVICE_IP, START + 1).unwrap();
+        let actions = core
+            .frame_received(
+                device,
+                &frame(FrameType::ReconnectAdmission, connection_id(2), &[7; 32]),
+                START + 1,
+            )
+            .unwrap();
+        flush_all(&mut core, &actions);
+        // 입장한 기기도 grant 회수 권한은 없다.
+        let actions = core
+            .frame_received(
+                device,
+                &frame(FrameType::ReconnectRevoke, connection_id(2), &verifier),
+                START + 2,
+            )
+            .unwrap();
+        assert_eq!(
+            disconnects(&actions),
+            vec![(device, RejectionCode::MalformedFrame)]
+        );
+        let wrong_route = RelayFrame::new(
+            FrameType::ReconnectRevoke,
+            RouteId::from_bytes([9; 16]),
+            connection_id(1),
+            0,
+            &verifier,
+        )
+        .unwrap()
+        .to_vec();
+        let actions = core
+            .frame_received(desktop, &wrong_route, START + 3)
+            .unwrap();
+        assert_eq!(
+            disconnects(&actions),
+            vec![(desktop, RejectionCode::RouteUnknown)]
+        );
     }
 
     #[test]
@@ -2034,6 +2517,8 @@ mod tests {
     #[test]
     fn the_server_links_no_secret_crypto_storage_or_ui_dependency() {
         let manifest = include_str!("../Cargo.toml");
+        // SHA-256은 입장 grant의 단방향 검증에만 쓴다. ECDH/HKDF/AEAD는 계속 금지한다.
+        assert!(manifest.contains("sha2 = { workspace = true }"));
         for forbidden in [
             "secret",
             "web-remote",
@@ -2045,7 +2530,6 @@ mod tests {
             "p256",
             "aes-gcm",
             "hkdf",
-            "sha2",
             "rusqlite",
             "keyring",
         ] {

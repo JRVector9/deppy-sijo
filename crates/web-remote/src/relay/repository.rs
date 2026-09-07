@@ -306,6 +306,19 @@ pub trait RelayRepository: Send + Sync {
         device_id: DeviceId,
         revoked_at: u64,
     ) -> anyhow::Result<RevocationResult>;
+    /// raw grant는 이 포트에 들어오지 않는다. 미구현 어댑터는 닫힌 상태로 실패한다.
+    fn store_reconnect_verifier(
+        &self,
+        _device_id: DeviceId,
+        _identity: &[u8; 65],
+        _verifier: &[u8; 32],
+        _now: u64,
+    ) -> anyhow::Result<bool> {
+        anyhow::bail!("Relay reconnect storage unavailable")
+    }
+    fn reconnect_verifier(&self, _device_id: DeviceId) -> anyhow::Result<Option<[u8; 32]>> {
+        anyhow::bail!("Relay reconnect storage unavailable")
+    }
     fn touch_device(&self, device_id: DeviceId, seen_at: u64) -> anyhow::Result<bool>;
 }
 

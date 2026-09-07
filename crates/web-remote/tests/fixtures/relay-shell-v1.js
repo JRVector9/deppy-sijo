@@ -375,6 +375,25 @@ async function flow() {
     ownFingerprint: mac.fingerprint,
     peerFingerprint: await C.sha256(deviceIdentitySec1),
   });
+  const registeredDevice = "02".repeat(16);
+  const registeredExpiry = Math.floor(Date.now() / 1000) + 3600;
+  const registration = await macChannel.seal(new TextEncoder().encode(JSON.stringify({
+    type: "relay_registered", version: 2, device_id: registeredDevice,
+    route_id: toHex(route), expires_at: registeredExpiry,
+  })));
+  deliver(C.FRAME_TYPE.CIPHERTEXT, connection, registration.ciphertext, registration.sequence);
+  await waitFor(() => sent.length >= 5, "encrypted verifier registration");
+  ok(document.getElementById("relay-session") === null, "no DOM before publication ACK");
+  const register = JSON.parse(new TextDecoder().decode(await macChannel.open({
+    sequence: sent[4].sequence, direction: C.DIRECTION.DEVICE_TO_DESKTOP, ciphertext: sent[4].payload,
+  })));
+  eq(register.type, "relay_register", "only verifier sent to Mac");
+  eq(Object.keys(register).sort().join(","), "type,verifier,version", "raw grant never goes to Mac");
+  const ready = await macChannel.seal(new TextEncoder().encode(JSON.stringify({
+    type: "relay_ready", version: 2, device_id: registeredDevice,
+    route_id: toHex(route), expires_at: registeredExpiry,
+  })));
+  deliver(C.FRAME_TYPE.CIPHERTEXT, connection, ready.ciphertext, ready.sequence);
   const dashboard = new TextEncoder().encode(
     JSON.stringify({
       type: "dashboard",
@@ -420,9 +439,9 @@ async function flow() {
       }),
     );
   cards[0].click();
-  await waitFor(() => sent.length >= 5, "watch ciphertext");
-  eq(sent[4].frameType, C.FRAME_TYPE.CIPHERTEXT, "watch is ciphertext");
-  eq(await openFromMac(4), '{"type":"watch","session":"s1"}', "watch plaintext");
+  await waitFor(() => sent.length >= 6, "watch ciphertext");
+  eq(sent[5].frameType, C.FRAME_TYPE.CIPHERTEXT, "watch is ciphertext");
+  eq(await openFromMac(5), '{"type":"watch","session":"s1"}', "watch plaintext");
   eq(getComputedStyle(home).display, "none", "home hidden while watching");
   eq(getComputedStyle(terminal).display, "flex", "terminal visible while watching");
   eq(document.getElementById("term-name").textContent, "deppy-sijo", "terminal header name");
@@ -431,7 +450,7 @@ async function flow() {
   // 시청 불가 워크스페이스는 열리지 않는다(토스트만).
   cards[1].click();
   await new Promise((resolve) => realSetTimeout(resolve, 30));
-  eq(sent.length, 5, "an unwatchable workspace sends nothing");
+  eq(sent.length, 6, "an unwatchable workspace sends nothing");
 
   // Mac → keyframe viewport → DOM 행 렌더.
   const viewport = JSON.stringify({
@@ -518,16 +537,16 @@ async function flow() {
 
   // 뒤로 → unwatch, 목록 복귀.
   document.getElementById("term-back").click();
-  await waitFor(() => sent.length >= 6, "unwatch ciphertext");
-  eq(await openFromMac(5), '{"type":"unwatch"}', "unwatch plaintext");
+  await waitFor(() => sent.length >= 7, "unwatch ciphertext");
+  eq(await openFromMac(6), '{"type":"unwatch"}', "unwatch plaintext");
   eq(getComputedStyle(terminal).display, "none", "terminal hidden after back");
   eq(getComputedStyle(home).display, "flex", "home visible after back");
   eq(shell.state.watching, null, "shell forgets the watched session");
 
   // 셸 API로 보내는 보기 전용 메시지도 같은 채널을 탄다.
   await shell.sendMessage({ type: "request_keyframe" });
-  await waitFor(() => sent.length >= 7, "request_keyframe ciphertext");
-  eq(await openFromMac(6), '{"type":"request_keyframe"}', "request_keyframe plaintext");
+  await waitFor(() => sent.length >= 8, "request_keyframe ciphertext");
+  eq(await openFromMac(7), '{"type":"request_keyframe"}', "request_keyframe plaintext");
 
   let refused = false;
   try {
@@ -564,6 +583,77 @@ async function flow() {
   const afterFail = sent.length;
   advanceClock(60_000);
   eq(sent.length, afterFail, "no heartbeat after fail()");
+
+  // 새 문서는 링크 없이 같은 IndexedDB identity와 grant로 입장한다.
+  const nextSent = [];
+  const next = fakeSocket(nextSent);
+  const nextShell = createShell({endpoint: "wss://relay.example.test", socketFactory: () => next.socket});
+  await nextShell.start();
+  next.socket.readyState = 1;
+  next.emit("open");
+  await waitFor(() => nextSent.length >= 1, "URL-free reconnect admission");
+  eq(nextSent[0].frameType, C.FRAME_TYPE.RECONNECT_ADMISSION, "distinct reconnect admission");
+  eq(toHex(await C.sha256(nextSent[0].payload)), register.verifier, "durable grant matches Mac verifier");
+  const nextConnection = nextSent[0].connectionId;
+  ok(toHex(nextConnection) !== toHex(connection), "new connection id after reload");
+  const nextDeliver = (kind, payload, sequence = 0) => {
+    const bytes = C.encodeFrame({frameType:kind, routeId:route, connectionId:nextConnection, sequence, payload});
+    next.emit("message", {data:bytes.buffer});
+  };
+  nextDeliver(C.FRAME_TYPE.ADMITTED, new Uint8Array(0));
+  await waitFor(() => nextSent.length >= 2, "reconnect offer");
+  const nextEphemeral = await C.createEphemeral();
+  const nextOffer = nextSent[1].payload;
+  eq(toHex(nextOffer.slice(22,87)), toHex(deviceIdentitySec1), "same persistent device key");
+  ok(toHex(nextOffer.slice(87,152)) !== toHex(deviceEphemeralSec1), "fresh ephemeral after reload");
+  const nextTranscript = C.buildTranscript({protocolVersion, connectionId:nextConnection,
+    desktop:{identitySec1:mac.publicSec1, ephemeralSec1:nextEphemeral.publicSec1},
+    device:{identitySec1:nextOffer.slice(22,87), ephemeralSec1:nextOffer.slice(87,152)}});
+  nextDeliver(C.FRAME_TYPE.HELLO, C.encodeIdentityHello({protocolVersion, role:C.ROLE.DESKTOP,
+    connectionId:nextConnection, identitySec1:mac.publicSec1, ephemeralSec1:nextEphemeral.publicSec1,
+    signature:await C.signTranscript(mac,nextTranscript)}));
+  await waitFor(() => nextSent.length >= 4, "known-device claim without fresh SAS approval");
+  eq(nextSent[3].payload[0], C.HELLO_TAG.KNOWN_DEVICE, "known device claim");
+  eq(toHex(nextSent[3].payload.slice(1)), registeredDevice, "Mac-assigned id survives reload");
+  const nextShared = await C.deriveSharedSecret(nextEphemeral.privateKey, nextOffer.slice(87,152));
+  const nextMaterial = await C.deriveSessionMaterial(nextShared,nextTranscript);
+  const nextMacChannel = new C.RelaySecureChannel({protocolVersion, connectionId:nextConnection,
+    sendKey:await C.importGcmKey(nextMaterial.desktopToDeviceKeyBytes),
+    receiveKey:await C.importGcmKey(nextMaterial.deviceToDesktopKeyBytes),
+    sendDirection:C.DIRECTION.DESKTOP_TO_DEVICE, receiveDirection:C.DIRECTION.DEVICE_TO_DESKTOP,
+    ownFingerprint:mac.fingerprint, peerFingerprint:await C.sha256(deviceIdentitySec1)});
+  const nextReady = await nextMacChannel.seal(new TextEncoder().encode(JSON.stringify({
+    type:"relay_ready",version:2,device_id:registeredDevice,route_id:toHex(route),expires_at:registeredExpiry})));
+  nextDeliver(C.FRAME_TYPE.CIPHERTEXT,nextReady.ciphertext,nextReady.sequence);
+  await waitFor(() => nextShell.state.screen === SCREEN.SESSION, "authenticated reconnect session");
+  nextShell.dispose();
+
+  // 악성 Relay가 자기 Mac 키로 올바르게 서명해도 저장한 pin과 다르면 거절한다.
+  const forgedSent = [];
+  const forged = fakeSocket(forgedSent);
+  const forgedShell = createShell({endpoint:"wss://relay.example.test",socketFactory:()=>forged.socket});
+  await forgedShell.start(); forged.socket.readyState = 1; forged.emit("open");
+  const forgedConnection = forgedSent[0].connectionId;
+  const forgedDeliver = (kind,payload) => {
+    const bytes = C.encodeFrame({frameType:kind,routeId:route,connectionId:forgedConnection,sequence:0,payload});
+    forged.emit("message",{data:bytes.buffer});
+  };
+  forgedDeliver(C.FRAME_TYPE.ADMITTED,new Uint8Array(0));
+  await waitFor(()=>forgedSent.length>=2,"forged Mac offer");
+  const forgedKeys = await crypto.subtle.generateKey({name:"ECDSA",namedCurve:"P-256"},false,["sign","verify"]);
+  const forgedPublic = new Uint8Array(await crypto.subtle.exportKey("raw",forgedKeys.publicKey));
+  const forgedEphemeral = await C.createEphemeral();
+  const forgedOffer = forgedSent[1].payload;
+  const forgedTranscript = C.buildTranscript({protocolVersion,connectionId:forgedConnection,
+    desktop:{identitySec1:forgedPublic,ephemeralSec1:forgedEphemeral.publicSec1},
+    device:{identitySec1:forgedOffer.slice(22,87),ephemeralSec1:forgedOffer.slice(87,152)}});
+  forgedDeliver(C.FRAME_TYPE.HELLO,C.encodeIdentityHello({protocolVersion,role:C.ROLE.DESKTOP,
+    connectionId:forgedConnection,identitySec1:forgedPublic,ephemeralSec1:forgedEphemeral.publicSec1,
+    signature:await C.signTranscript({privateKey:forgedKeys.privateKey},forgedTranscript)}));
+  await waitFor(()=>forgedShell.state.screen===SCREEN.RECOVERY,"Mac pin mismatch rejection");
+  eq(forgedSent.length,2,"pin mismatch sends no signed identity or KnownDevice claim");
+  ok(document.getElementById("relay-session")===null,"pin mismatch creates no session DOM");
+  forgedShell.dispose();
 }
 
 window.addEventListener("error", (event) => done("error", `RELAY_SHELL_ERROR: uncaught ${event.message}`));

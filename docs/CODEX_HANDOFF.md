@@ -1,6 +1,6 @@
 # Codex handoff
 
-## GUI 0.36 통합 이관 — 최종 게이트 완료 (2026-09-07)
+## GUI 0.36 통합 이관 — PR 준비 완료 (2026-09-07)
 
 - 목표: #142/#153을 eframe/egui/extras/kittest 0.36.1 + commonmark/backend 0.25.0 통합 PR로 대체.
 - 작업: `/private/tmp/deppy-egui-036-20260907`, `fix/gui-stack-036-20260907`. 최신 main `c9bda3932d2475fdebdda216c78abae3dd22692b` 일반 merge 완료; 최종 fetch에서도 동일하다.
@@ -9,8 +9,10 @@
 - 설계: GUI 단일 minor, vendored winit0.30.13 IME backport 및 안전한 PNG broker 유지. 앱 재빌드/재실행/화면 PASS 주장 금지.
 - 검증: app2035 + 나머지workspace1720 + standalone integration38 = **3793 PASS / 27 ignored**. strict clippy/fmt/boundary/deps/diff-check/audit/deny 모두 exit0.
 - 리뷰: Codex CLI GUI 전체 및 DroppedFile 보완 리뷰 완료, actionable defect 없음. 실제 로그는 아래 기록.
-- 남은 일: 한국어 커밋·push·대체 PR 생성, 기존 #142/#153 종료, PR 주소 기록.
-- 다음 명령: `git diff --check`; `git add Cargo.toml Cargo.lock crates docs third_party/winit-0.30.13/DEPPY_BACKPORT.md`; `git commit -m "build: GUI 0.36과 IME·파일 드롭 호환성을 함께 이관한다"`; `git push -u origin fix/gui-stack-036-20260907`.
+- 완료 PR: https://github.com/JRVector9/deppy-sijo/pull/154 ; #142/#153 CLOSED. 구현 커밋 `a62f7bf`; 이후 본 커밋은 문서만 변경하며 검증한 Rust/manifest/lock 내용은 동일하다.
+- 남은 일: parent가 추가 승인한 main squash merge. 최종 head의 GitHub Actions 미실행 증거·GitGuardian·branch protection 확인 후 `--match-head-commit`으로 merge한다.
+- 다음 명령: `gh pr view 154 --json headRefOid,state,mergeable,statusCheckRollup`; 각 실패 Actions의 runner_id=0/steps=[]/billing 주석 확인; `gh pr merge 154 --squash --match-head-commit <최종 검증 SHA>`.
+- CI 대체 범위: macOS clippy/full test/format/boundary와 security audit/deny는 위 로컬 gate로 검증했다. Linux relay test·release build는 Linux에서 실행하지 않았고 relay 소스/manifest/배포 파일은 변경하지 않았다. 로컬 macOS relay tests/clippy는 workspace gate에 포함되었다. 릴리스 workflow는 workflow_dispatch 전용이며 배포를 실행하지 않는다.
 
 ### GUI 이관 API RED와 headless 수명 처리
 

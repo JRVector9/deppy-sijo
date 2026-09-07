@@ -73,4 +73,4 @@ URL 없는 재접속·Mac pin 거절과 브라우저 생성 서명의 Rust 재�
 - [ ] 최종 strict clippy/boundary 재실행은 사용자 추가 테스트 중단 지시로 미실행. focused Rust/Chrome/Node 통과 후 Clippy의 큰 enum·중첩 if 두 건을 정리했고 마지막 fmt만 PASS다. 정리 후 재검증을 PASS로 주장하지 않는다.
 - [x] Review diff for raw grant persistence, pin bypass, stale generation, unauthenticated DOM, expiry/revoke races, queue bounds. 독립 리뷰의 복원 race 수정 뒤 확정 잔여 finding 0.
 - [x] Record exact executed results and failures. DNS/TLS·배포·실기기·24h soak remain **BLOCKED**.
-- [ ] Commit and normal push to existing PR #146 branch; update PR body around final implementation and actual evidence. No app build/restart, rebase, force-push, merge or deploy.
+- [x] Commit `215c276e9c921cc6a8cbf43267c0f8b41a87ed13` and normal push to existing PR #146 branch; update PR body around final implementation and actual evidence. No app build/restart, rebase, force-push, merge or deploy. 최신 main 통합·앱 빌드·실행은 루트 후속 작업이다.

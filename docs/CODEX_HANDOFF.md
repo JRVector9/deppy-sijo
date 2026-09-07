@@ -1,3 +1,42 @@
+## ureq3 migration validated / PR landing next (2026-09-07)
+
+- Objective: replace dependency-only PR141 with native ureq3.4 migration, preserving OAuth/MCP status/body/redaction and SSE idle semantics.
+- Completed source: commit4fac641, latest GUI main21172a8 integrated at e34769d. http-client transport helper + native auth/MCP/app/Push APIs. No uncommitted product code.
+- Actual complete workspace gate: fmt/diff/boundary/deny/audit/tree/strict workspace all-target clippy PASS; full serial workspace3803 passed/27 ignored, exit0. Evidence /private/tmp/deppy-deps-evidence-20260907/ureq3/results.json and tests.log. Audit retained existing allowed yanked chacha20/wnaf warnings.
+- Focused helper5/auth105/MCP105/web278/app55 passed (548 total,4 ignored). Actual idle and typed timeout RED→GREEN recorded. Linux exact source e34769d strict Relay clippy/55 tests/release PASS.
+- Codex CLI static source review: C/H/M0 actionable findings. No app launch/packaging, force-push or rebase.
+- Failed approaches: initial ambiguous transport Duration conversion, MCP Config shadow and SendBody static lifetime fixed; tests then passed. No interruption in this lane after Cargo resumed.
+- Remaining: publish replacement PR, classify every hosted failure from runner_id/steps/annotation, confirm independent GitGuardian, freeze PR head/local gate evidence and standard --match-head-commit squash merge; close141 and verify main manifest + no deploy.
+- Exact next commands: git push -u origin build/ureq3-migration-20260907; gh pr create --base main --head build/ureq3-migration-20260907 --title '<Korean HTTP migration title>' --body-file /private/tmp/deppy-ureq3-pr-body.md; gh pr view <n> --json headRefOid,state,mergeable,statusCheckRollup; gh pr merge <n> --squash --match-head-commit <frozen SHA>. Parent has explicitly authorized merge.
+
+## ureq3 final workspace gate progress (2026-09-07)
+
+- Integrated source HEAD e34769d; migration files committed, checkpoint docs may remain modified. No app launch/rebase/force.
+- Actual executed results below; unlisted gates remain pending. Host jobs2 and serial tests.
+- fmt: exit0 (2.4s)
+- diff: exit0 (0.0s)
+- boundary: exit0 (4.4s)
+- deny: exit0 (1.5s)
+- audit: exit0 (1.8s)
+- tree: exit0 (0.3s)
+- clippy: exit0 (52.1s)
+- tests: exit0 (347.2s)
+- Evidence: /private/tmp/deppy-deps-evidence-20260907/ureq3
+- Remaining: failed/pending gates, validation checkpoint, replacement PR then close141.
+
+## App-focused and Linux GREEN (2026-09-07)
+
+- Latest-main app focused exit0 each: llm_proxy17 passed/2 ignored; local_llm10; status_feed25; codex_backend_usage3. Total55 passed/2 ignored. Logs /private/tmp/deppy-ureq3-app-*.log.
+- Exact committed e34769d source archive in rust:1.96 (1.96.1) Docker: strict Relay clippy,55 tests,release relay-server all exit0. /private/tmp/deppy-ureq3-linux.log. Existing cache volumes used only after docker ps confirmed no competing gate container.
+- No application packaging/launch. Remaining full workspace fmt/diff/boundary/deny/audit/clippy/tests, replacement PR and original141 closure.
+
+## Latest-main integration checkpoint (2026-09-07)
+
+- Implementation commit 4fac641; merged origin/main21172a8 using normal merge (no conflict/rebase/force). Integrated HEAD e34769d19ee6fda43ba2ed95b974332fffb6e7f9.
+- Both GUI and HTTP handoff entries retained. Diff vs latest main remains only intended HTTP native migration/spec/plan, Cargo.lock41-line minimal ureq3 change. Working tree clean before this checkpoint.
+- App LLM focused `cargo test -p deppy-sijo --bin deppy-sijo --locked llm_proxy -- --test-threads=1` compiling on jobs2/own target; /private/tmp/deppy-ureq3-app-llm.log. No app launch/packaging/release app rebuild.
+- Next: remaining app local_llm/status_feed/codex_backend_usage focused, full fmt/boundary/deny/audit/clippy/workspace tests, exact-source Linux Relay gates, post-review validation, PR/close141.
+
 ## Static review complete / integration pending (2026-09-07)
 
 - Codex CLI static source review exit0: no actionable introduced correctness/security defects, C/H/M0. Native3 bodies, redirects, SensitiveBytes lifetime and idle/TLS design reviewed. No reviewer tests/builds executed. /private/tmp/deppy-ureq3-review-result.txt.

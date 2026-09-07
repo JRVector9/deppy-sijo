@@ -1330,9 +1330,10 @@ mod tests {
             let context = egui::Context::default();
             let logo_rect =
                 egui::Rect::from_min_size(egui::pos2(40.0, 40.0), egui::vec2(14.5, 14.5));
-            let output = context.run_ui(egui::RawInput::default(), |ui| {
+            let mut output = context.run_ui(egui::RawInput::default(), |ui| {
                 paint_announcement_provider_logo(ui, logo_rect, source);
             });
+            output.textures_delta.clear();
             output
                 .shapes
                 .iter()
@@ -2185,7 +2186,7 @@ mod tests {
         let mut home = AgentTerminalUi::new();
 
         for _ in 0..300 {
-            let output = context.run_ui(egui::RawInput::default(), |ui| {
+            let mut output = context.run_ui(egui::RawInput::default(), |ui| {
                 assert_eq!(
                     home.home(
                         ui,
@@ -2200,6 +2201,7 @@ mod tests {
                     None
                 );
             });
+            output.textures_delta.clear();
             assert!(output.platform_output.commands.is_empty());
         }
     }

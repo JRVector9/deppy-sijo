@@ -1124,9 +1124,10 @@ mod tests {
         let context = egui::Context::default();
         let mut state = EnvProfilesUi::new();
         for _ in 0..300 {
-            let output = context.run_ui(egui::RawInput::default(), |ui| {
+            let mut output = context.run_ui(egui::RawInput::default(), |ui| {
                 assert!(state.contents_compact(ui, &snapshot, &catalog).is_none());
             });
+            output.textures_delta.clear();
             assert!(output.platform_output.commands.is_empty());
         }
         assert_eq!(adapter.calls.get(), calls_after_snapshot);
@@ -1141,9 +1142,10 @@ mod tests {
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
         let context = egui::Context::default();
         let mut state = EnvProfilesUi::new();
-        let output = context.run_ui(egui::RawInput::default(), |ui| {
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| {
             assert!(state.contents_compact(ui, &snapshot, &catalog).is_none());
         });
+        output.textures_delta.clear();
         assert!(output.shapes.len() < ENV_SNAPSHOT_MAX_VARS);
 
         let over = (0..=ENV_SNAPSHOT_MAX_VARS)

@@ -13,8 +13,10 @@ egui_commonmark는 0.25로 함께 이동한다. 잠금 파일에는 하나의 eg
 - 개별 crate만 올리면 0.35/0.36 타입과 renderer가 공존하므로 전체 GUI 계열을 함께 올린다.
 - 터미널 IMEOutput은 새 purpose 필드에 IMEPurpose::Terminal을 명시한다.
   기존 한글 조합 소유권, 진행 중 Preedit 보호, 후보창 위치 계약은 보존한다.
-- RawInput.modifiers 대신 Event::ModifiersChanged를 입력 이벤트 앞에 넣는다.
-  수정키의 프레임 상태와 Key 이벤트의 modifiers는 각각 원래 의미를 유지한다.
+- RawInput.modifiers 직접 사용 여부를 확인하고 필요하면 Event::ModifiersChanged로 이관한다.
+  실제 코드에는 제거된 필드 사용이 없으며 InputState.modifiers와 Key 이벤트의 modifiers는 그대로 유효하다.
+- RawInput의 DroppedFile은 trait handle로 바뀌므로 `path().to_path_buf()`로 경로만 소비한다.
+  UI에서는 bytes()를 호출하지 않는다. 기존 OS-drop kittest의 handle은 bytes() 호출을 panic시켜 이 경계를 검증한다.
 - eframe 0.36의 실제 winit 의존성을 검사하고 기존 winit 0.30.13 macOS IME
   backport를 유지한다. 업데이트가 동등한 upstream fix를 포함하지 않는 한 제거하지 않는다.
 - Markdown은 default-features=false, commonmark의 pulldown_cmark와 extras의 image만

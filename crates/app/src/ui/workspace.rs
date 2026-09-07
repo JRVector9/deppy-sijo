@@ -5939,7 +5939,7 @@ impl WorkspaceUi {
                 i.raw
                     .dropped_files
                     .iter()
-                    .filter_map(|file| file.path.clone())
+                    .map(|file| file.path().to_path_buf())
                     .collect()
             });
             let os_drag_pos = (os_drag_active || !os_dropped.is_empty())
@@ -9084,9 +9084,10 @@ mod tests {
             ],
             ..egui::RawInput::default()
         };
-        let _ = ctx.run_ui(input, |ui| {
+        ctx.run_ui(input, |ui| {
             workspace.show_with_input(ui, &TerminalConfig::default(), &[], &catalog(), true);
-        });
+        })
+        .drop_without_applying_deltas();
 
         assert!(workspace.split_drag.is_none());
         assert!(
@@ -9125,10 +9126,11 @@ mod tests {
             ..egui::RawInput::default()
         };
 
-        let _ = ctx.run_ui(input, |ui| {
+        ctx.run_ui(input, |ui| {
             ui.ctx().set_dragged_id(handle_id);
             workspace.show_with_input(ui, &TerminalConfig::default(), &[], &catalog(), true);
-        });
+        })
+        .drop_without_applying_deltas();
 
         assert!(workspace.split_drag.is_none());
         assert_eq!(ctx.dragged_id(), None);
@@ -9155,9 +9157,10 @@ mod tests {
         let catalog = catalog();
         let config = TerminalConfig::default();
 
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        ctx.run_ui(egui::RawInput::default(), |ui| {
             workspace.show_with_input(ui, &config, &[], &catalog, false);
-        });
+        })
+        .drop_without_applying_deltas();
 
         assert!(workspace.split_drag.is_none());
         assert!(
@@ -9199,7 +9202,7 @@ mod tests {
         let ctx = egui::Context::default();
         let tab = tab_id("t");
 
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        ctx.run_ui(egui::RawInput::default(), |ui| {
             workspace.begin_split_drag(tab.clone(), Vec::new(), 0.72);
             ui.ctx().set_dragged_id(split_handle_id(&tab, &[]));
             ui.ctx().stop_dragging();
@@ -9219,7 +9222,8 @@ mod tests {
             workspace.reconcile_active_split_drag(ui.ctx(), true, Some(&tab));
             assert!(workspace.split_drag.is_none());
             assert_eq!(ui.ctx().dragged_id(), Some(another_widget));
-        });
+        })
+        .drop_without_applying_deltas();
     }
 
     #[test]
@@ -9377,10 +9381,11 @@ mod tests {
         let catalog = catalog();
         let config = TerminalConfig::default();
         let handle_id = split_handle_id(&tab_id("t"), &[]);
-        let _ = ctx.run_ui(input, |ui| {
+        ctx.run_ui(input, |ui| {
             ui.ctx().set_dragged_id(handle_id);
             workspace.show_with_input(ui, &config, &[], &catalog, true);
-        });
+        })
+        .drop_without_applying_deltas();
 
         assert!(workspace.split_drag.is_some());
         assert_eq!(
@@ -10698,9 +10703,11 @@ mod tests {
 
         let context = egui::Context::default();
         let mut output = None;
-        let _ = context.run_ui(egui::RawInput::default(), |ui| {
-            output = Some(ws.show_with_input(ui, &config, &[], &catalog, true));
-        });
+        context
+            .run_ui(egui::RawInput::default(), |ui| {
+                output = Some(ws.show_with_input(ui, &config, &[], &catalog, true));
+            })
+            .drop_without_applying_deltas();
 
         let output = output.expect("렌더가 돌아야 한다");
         let body = output
@@ -10753,9 +10760,11 @@ mod tests {
 
         let context = egui::Context::default();
         let mut output = None;
-        let _ = context.run_ui(egui::RawInput::default(), |ui| {
-            output = Some(ws.show_with_input(ui, &config, &[], &catalog, true));
-        });
+        context
+            .run_ui(egui::RawInput::default(), |ui| {
+                output = Some(ws.show_with_input(ui, &config, &[], &catalog, true));
+            })
+            .drop_without_applying_deltas();
 
         let output = output.expect("렌더가 돌아야 한다");
         let body = output
@@ -10856,9 +10865,11 @@ mod tests {
 
         let context = egui::Context::default();
         let mut output = None;
-        let _ = context.run_ui(egui::RawInput::default(), |ui| {
-            output = Some(ws.show_with_input(ui, &config, &[], &catalog, true));
-        });
+        context
+            .run_ui(egui::RawInput::default(), |ui| {
+                output = Some(ws.show_with_input(ui, &config, &[], &catalog, true));
+            })
+            .drop_without_applying_deltas();
 
         assert_eq!(output.expect("렌더가 돌아야 한다").aux_body_rect, None);
     }
@@ -11590,25 +11601,28 @@ mod tests {
     ) -> PaneAuxTabGeometry {
         let context = egui::Context::default();
         let mut geometry = None;
-        let _ = context.run_ui(egui::RawInput::default(), |ui| {
-            let label = &ws.aux_tabs.first().expect("aux tab set").label;
-            let font = egui::FontId::proportional(13.0);
-            let natural = ui
-                .painter()
-                .layout_no_wrap(label.clone(), font.clone(), egui::Color32::WHITE)
-                .size()
-                .x;
-            let label_width = pane_aux_tab_label_width(header.width(), natural, 1);
-            let aux_reserved = pane_aux_tab_width(label_width) + PANE_AUX_TAB_RIGHT_PAD;
-            let title_width = ui
-                .painter()
-                .layout_no_wrap(snapshot.title.clone(), font, egui::Color32::WHITE)
-                .size()
-                .x;
-            let buttons = pane_header_buttons(header, title_width, 4, aux_reserved);
-            let left = pane_header_active_boundary(header, buttons.close);
-            geometry = pane_aux_tab_geometry(header, left, buttons.toolbar_left, label_width, true);
-        });
+        context
+            .run_ui(egui::RawInput::default(), |ui| {
+                let label = &ws.aux_tabs.first().expect("aux tab set").label;
+                let font = egui::FontId::proportional(13.0);
+                let natural = ui
+                    .painter()
+                    .layout_no_wrap(label.clone(), font.clone(), egui::Color32::WHITE)
+                    .size()
+                    .x;
+                let label_width = pane_aux_tab_label_width(header.width(), natural, 1);
+                let aux_reserved = pane_aux_tab_width(label_width) + PANE_AUX_TAB_RIGHT_PAD;
+                let title_width = ui
+                    .painter()
+                    .layout_no_wrap(snapshot.title.clone(), font, egui::Color32::WHITE)
+                    .size()
+                    .x;
+                let buttons = pane_header_buttons(header, title_width, 4, aux_reserved);
+                let left = pane_header_active_boundary(header, buttons.close);
+                geometry =
+                    pane_aux_tab_geometry(header, left, buttons.toolbar_left, label_width, true);
+            })
+            .drop_without_applying_deltas();
         geometry.expect("테스트 헤더에는 보조 탭이 들어간다")
     }
 
@@ -11652,14 +11666,16 @@ mod tests {
         let style = pane_drop_feedback_style(crate::ui::designall::DARK);
         let mut measured = None;
 
-        let _ = context.run_ui(egui::RawInput::default(), |ui| {
-            measured = layout_pane_drop_feedback_label(
-                ui.painter(),
-                pane,
-                "선택한 세션을 이 Pane의 오른쪽에 연결합니다",
-                style,
-            );
-        });
+        context
+            .run_ui(egui::RawInput::default(), |ui| {
+                measured = layout_pane_drop_feedback_label(
+                    ui.painter(),
+                    pane,
+                    "선택한 세션을 이 Pane의 오른쪽에 연결합니다",
+                    style,
+                );
+            })
+            .drop_without_applying_deltas();
 
         let measured = measured.expect("narrow pane still has room for a compact label");
         assert!(pane.contains_rect(measured.rect));
@@ -11675,14 +11691,16 @@ mod tests {
         let style = pane_drop_feedback_style(crate::ui::designall::DARK);
         let mut measured = None;
 
-        let _ = context.run_ui(egui::RawInput::default(), |ui| {
-            measured = layout_pane_drop_feedback_label(
-                ui.painter(),
-                pane,
-                "현재 화면 오른쪽에 열기",
-                style,
-            );
-        });
+        context
+            .run_ui(egui::RawInput::default(), |ui| {
+                measured = layout_pane_drop_feedback_label(
+                    ui.painter(),
+                    pane,
+                    "현재 화면 오른쪽에 열기",
+                    style,
+                );
+            })
+            .drop_without_applying_deltas();
 
         let measured = measured.expect("pane has room for the feedback label");
         assert!((measured.rect.center().x - pane.center().x).abs() < f32::EPSILON);
@@ -11918,7 +11936,7 @@ mod tests {
             session: SessionId(7),
         };
         let context = egui::Context::default();
-        let output = context.run_ui(egui::RawInput::default(), |ui| {
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| {
             let header = egui::Rect::from_min_size(
                 ui.available_rect_before_wrap().min,
                 egui::vec2(360.0, TERMINAL_PANE_HEADER_HEIGHT),
@@ -11933,6 +11951,7 @@ mod tests {
                 None,
             );
         });
+        output.textures_delta.clear();
         let rendered_text = output
             .shapes
             .iter()
@@ -11966,7 +11985,7 @@ mod tests {
         let header_width = 180.0;
         let mut title_right = None;
         let context = egui::Context::default();
-        let output = context.run_ui(egui::RawInput::default(), |ui| {
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| {
             let header = egui::Rect::from_min_size(
                 ui.available_rect_before_wrap().min,
                 egui::vec2(header_width, TERMINAL_PANE_HEADER_HEIGHT),
@@ -11976,6 +11995,7 @@ mod tests {
                 ui, header, &target, "Other", long_title, &catalog, None,
             );
         });
+        output.textures_delta.clear();
         let clipped_title = output
             .shapes
             .iter()
@@ -12038,20 +12058,22 @@ mod tests {
         let mut workspace = WorkspaceUi::new();
         workspace.pending_copy = Some("owned copy".to_owned());
 
-        let disabled_output = context.run_ui(egui::RawInput::default(), |ui| {
+        let mut disabled_output = context.run_ui(egui::RawInput::default(), |ui| {
             workspace.prepare_frame_with_native_input(ui.ctx(), &[], &catalog, false, || {
                 crate::native_key_monitor::NativeKeyDownBatch::default()
             });
         });
+        disabled_output.textures_delta.clear();
 
         assert_eq!(workspace.pending_copy.as_deref(), Some("owned copy"));
         assert!(disabled_output.platform_output.commands.is_empty());
 
-        let enabled_output = context.run_ui(egui::RawInput::default(), |ui| {
+        let mut enabled_output = context.run_ui(egui::RawInput::default(), |ui| {
             workspace.prepare_frame_with_native_input(ui.ctx(), &[], &catalog, true, || {
                 crate::native_key_monitor::NativeKeyDownBatch::default()
             });
         });
+        enabled_output.textures_delta.clear();
 
         assert!(workspace.pending_copy.is_none());
         assert!(enabled_output.platform_output.commands.iter().any(
@@ -13525,37 +13547,39 @@ mod tests {
     ) -> egui::Pos2 {
         let context = egui::Context::default();
         let mut center = None;
-        let _ = context.run_ui(egui::RawInput::default(), |ui| {
-            let font = egui::FontId::proportional(13.0);
-            let aux_reserved: f32 = ws
-                .aux_tabs
-                .iter()
-                .map(|tab| {
-                    let natural = ui
-                        .painter()
-                        .layout_no_wrap(tab.label.clone(), font.clone(), egui::Color32::WHITE)
-                        .size()
-                        .x;
-                    pane_aux_tab_width(pane_aux_tab_label_width(
-                        header.width(),
-                        natural,
-                        ws.aux_tabs.len(),
-                    )) + PANE_AUX_TAB_RIGHT_PAD
-                })
-                .sum();
-            let title_width = ui
-                .painter()
-                .layout_no_wrap(snapshot.title.clone(), font, egui::Color32::WHITE)
-                .size()
-                .x;
-            let buttons = pane_header_buttons(header, title_width, 4, aux_reserved);
-            assert_eq!(
-                buttons.toolbar.len(),
-                4,
-                "테스트 헤더는 도구 4개가 모두 보여야 한다"
-            );
-            center = Some(buttons.toolbar[0].center());
-        });
+        context
+            .run_ui(egui::RawInput::default(), |ui| {
+                let font = egui::FontId::proportional(13.0);
+                let aux_reserved: f32 = ws
+                    .aux_tabs
+                    .iter()
+                    .map(|tab| {
+                        let natural = ui
+                            .painter()
+                            .layout_no_wrap(tab.label.clone(), font.clone(), egui::Color32::WHITE)
+                            .size()
+                            .x;
+                        pane_aux_tab_width(pane_aux_tab_label_width(
+                            header.width(),
+                            natural,
+                            ws.aux_tabs.len(),
+                        )) + PANE_AUX_TAB_RIGHT_PAD
+                    })
+                    .sum();
+                let title_width = ui
+                    .painter()
+                    .layout_no_wrap(snapshot.title.clone(), font, egui::Color32::WHITE)
+                    .size()
+                    .x;
+                let buttons = pane_header_buttons(header, title_width, 4, aux_reserved);
+                assert_eq!(
+                    buttons.toolbar.len(),
+                    4,
+                    "테스트 헤더는 도구 4개가 모두 보여야 한다"
+                );
+                center = Some(buttons.toolbar[0].center());
+            })
+            .drop_without_applying_deltas();
         center.expect("Search 버튼 rect를 계산해야 한다")
     }
 
@@ -15078,9 +15102,10 @@ mod tests {
                 egui::Pos2::ZERO,
                 egui::vec2(viewport_width, 600.0),
             ));
-            let _ = ctx.run_ui(input, |viewport_ui| {
+            ctx.run_ui(input, |viewport_ui| {
                 ui.queue_terminal_resize_debounced(viewport_ui.ctx(), session, 81, 24);
-            });
+            })
+            .drop_without_applying_deltas();
         };
 
         run_resize(&mut ui, 800.0);
@@ -16146,12 +16171,13 @@ https://example.test/login \
     fn 터미널_enter_합성클릭은_hover_path를_활성화하지_않는다() {
         let ctx = egui::Context::default();
         let mut response_id = None;
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        ctx.run_ui(egui::RawInput::default(), |ui| {
             let (_, response) =
                 ui.allocate_exact_size(egui::vec2(120.0, 40.0), egui::Sense::click_and_drag());
             response.request_focus();
             response_id = Some(response.id);
-        });
+        })
+        .drop_without_applying_deltas();
         assert!(ctx.memory(|memory| memory.has_focus(response_id.unwrap())));
 
         let mut activation = None;
@@ -16165,14 +16191,15 @@ https://example.test/login \
             }],
             ..egui::RawInput::default()
         };
-        let _ = ctx.run_ui(input, |ui| {
+        ctx.run_ui(input, |ui| {
             let (_, response) =
                 ui.allocate_exact_size(egui::vec2(120.0, 40.0), egui::Sense::click_and_drag());
             activation = Some((
                 response.clicked(),
                 terminal_primary_pointer_clicked(&response),
             ));
-        });
+        })
+        .drop_without_applying_deltas();
 
         assert_eq!(activation, Some((true, false)));
     }
@@ -16180,13 +16207,14 @@ https://example.test/login \
     #[test]
     fn agents_window는_terminal_refocus를_막는_modal_layer가_아니다() {
         let ctx = egui::Context::default();
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        ctx.run_ui(egui::RawInput::default(), |ui| {
             egui::Window::new("Agents")
                 .id(crate::ui::agent_sessions::agents_window_id())
                 .show(ui.ctx(), |ui| {
                     ui.label("agent content");
                 });
-        });
+        })
+        .drop_without_applying_deltas();
         let agents = egui::LayerId::new(
             egui::Order::Middle,
             crate::ui::agent_sessions::agents_window_id(),
@@ -16412,13 +16440,12 @@ https://example.test/login \
             .input_mut()
             .events
             .push(egui::Event::PointerMoved(pane_point));
-        harness
-            .input_mut()
-            .dropped_files
-            .extend(dropped.iter().cloned().map(|path| egui::DroppedFile {
-                path: Some(path),
-                ..Default::default()
-            }));
+        harness.input_mut().dropped_files.extend(
+            dropped
+                .iter()
+                .cloned()
+                .map(crate::test_dropped_file::handle),
+        );
         harness.run();
 
         assert_eq!(harness.state().1.document_drop_paths, dropped.to_vec());
@@ -16439,10 +16466,12 @@ https://example.test/login \
             .input_mut()
             .events
             .push(egui::Event::PointerMoved(header_point));
-        harness.input_mut().dropped_files.push(egui::DroppedFile {
-            path: Some(PathBuf::from("/x/dropped.txt")),
-            ..Default::default()
-        });
+        harness
+            .input_mut()
+            .dropped_files
+            .push(crate::test_dropped_file::handle(PathBuf::from(
+                "/x/dropped.txt",
+            )));
         harness.run();
 
         assert!(harness.state().1.document_drop_paths.is_empty());
@@ -16502,10 +16531,12 @@ https://example.test/login \
             .input_mut()
             .events
             .push(egui::Event::PointerMoved(right_point));
-        harness.input_mut().dropped_files.push(egui::DroppedFile {
-            path: Some(PathBuf::from("/x/right-pane.rs")),
-            ..Default::default()
-        });
+        harness
+            .input_mut()
+            .dropped_files
+            .push(crate::test_dropped_file::handle(PathBuf::from(
+                "/x/right-pane.rs",
+            )));
         harness.run();
 
         assert_eq!(

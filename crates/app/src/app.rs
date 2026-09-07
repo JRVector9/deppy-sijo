@@ -33851,9 +33851,10 @@ mod tests {
         let (_, title_rect, close_rect) = app_attached_placeholder_header_rects(rect);
         let context = egui::Context::default();
 
-        let output = context.run_ui(egui::RawInput::default(), |ui| {
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| {
             show_app_attached_placeholder(ui, rect, &pane, &catalog);
         });
+        output.textures_delta.clear();
         let clipped_title = output
             .shapes
             .iter()
@@ -43275,7 +43276,7 @@ mod tests {
         ];
         let ctx = egui::Context::default();
         let mut drew_nothing = true;
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        ctx.run_ui(egui::RawInput::default(), |ui| {
             drew_nothing = top_provider_usage(
                 ui,
                 ProviderUsageInputs {
@@ -43288,14 +43289,15 @@ mod tests {
                 &all_disabled,
                 &i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap(),
             );
-        });
+        })
+        .drop_without_applying_deltas();
         assert!(
             !drew_nothing,
             "칸이 하나도 없으면 top_provider_usage는 false를 돌려줘야 한다"
         );
 
         let mut drew_something = false;
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        ctx.run_ui(egui::RawInput::default(), |ui| {
             drew_something = top_provider_usage(
                 ui,
                 ProviderUsageInputs {
@@ -43308,7 +43310,8 @@ mod tests {
                 &[],
                 &i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap(),
             );
-        });
+        })
+        .drop_without_applying_deltas();
         assert!(
             drew_something,
             "Claude가 켜져 있으면(값이 없어도) 칸이 그려져 true여야 한다"

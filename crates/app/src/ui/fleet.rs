@@ -1493,7 +1493,7 @@ mod tests {
         let library = crate::prompt_library::PromptLibrary::default();
         let summary = FleetSummary::from_states(sessions.iter().map(|s| s.state));
         let mut out = FleetPageOutput::default();
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        ctx.run_ui(egui::RawInput::default(), |ui| {
             out = ui_fleet.render(
                 ui,
                 sessions,
@@ -1513,7 +1513,8 @@ mod tests {
                     structured: &[],
                 },
             );
-        });
+        })
+        .drop_without_applying_deltas();
         out
     }
 

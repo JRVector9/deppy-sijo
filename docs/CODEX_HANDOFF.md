@@ -1,5 +1,84 @@
 # Codex handoff
 
+## GUI 0.36 통합 이관 — PR 준비 완료 (2026-09-07)
+
+- 목표: #142/#153을 eframe/egui/extras/kittest 0.36.1 + commonmark/backend 0.25.0 통합 PR로 대체.
+- 작업: `/private/tmp/deppy-egui-036-20260907`, `fix/gui-stack-036-20260907`. 최신 main `c9bda3932d2475fdebdda216c78abae3dd22692b` 일반 merge 완료; 최종 fetch에서도 동일하다.
+- 완료: 별도 spec/plan, API RED→GREEN, Terminal IME purpose, DroppedFile path-only 이관, headless texture delta 폐기. 제거된 RawInput.modifiers 직접 사용은 없어 수정 불필요.
+- 변경 파일: Cargo manifests/lock, terminal renderer, connector-ui 테스트, app main/test_dropped_file 및 app/ui 테스트·drop 소비자, backport 문서, 본 handoff와 spec/plan. 상세 범위는 `git diff --stat origin/main`.
+- 설계: GUI 단일 minor, vendored winit0.30.13 IME backport 및 안전한 PNG broker 유지. 앱 재빌드/재실행/화면 PASS 주장 금지.
+- 검증: app2035 + 나머지workspace1720 + standalone integration38 = **3793 PASS / 27 ignored**. strict clippy/fmt/boundary/deps/diff-check/audit/deny 모두 exit0.
+- 리뷰: Codex CLI GUI 전체 및 DroppedFile 보완 리뷰 완료, actionable defect 없음. 실제 로그는 아래 기록.
+- 완료 PR: https://github.com/JRVector9/deppy-sijo/pull/154 ; #142/#153 CLOSED. 구현 커밋 `a62f7bf`; 이후 본 커밋은 문서만 변경하며 검증한 Rust/manifest/lock 내용은 동일하다.
+- 남은 일: parent가 추가 승인한 main squash merge. 최종 head의 GitHub Actions 미실행 증거·GitGuardian·branch protection 확인 후 `--match-head-commit`으로 merge한다.
+- 다음 명령: `gh pr view 154 --json headRefOid,state,mergeable,statusCheckRollup`; 각 실패 Actions의 runner_id=0/steps=[]/billing 주석 확인; `gh pr merge 154 --squash --match-head-commit <최종 검증 SHA>`.
+- CI 대체 범위: macOS clippy/full test/format/boundary와 security audit/deny는 위 로컬 gate로 검증했다. Linux relay test·release build는 Linux에서 실행하지 않았고 relay 소스/manifest/배포 파일은 변경하지 않았다. 로컬 macOS relay tests/clippy는 workspace gate에 포함되었다. 릴리스 workflow는 workflow_dispatch 전용이며 배포를 실행하지 않는다.
+
+### GUI 이관 API RED와 headless 수명 처리
+
+- `cargo check -p terminal --tests`: E0063 IMEOutput.purpose 누락을 실제 확인. 로그 `/private/tmp/deppy-egui-036-api-red.log`.
+- `cargo test -p terminal --lib --locked ime_영역은_같은_프레임에_공식_소유권을_확보한_뒤_통보된다`: Normal/Terminal assertion RED. 이어 미폐기 TexturesDelta의 Drop panic으로 abort됨.
+- 새 egui 0.36은 텍스처 delta를 명시 소비/폐기해야 한다. 기존 run_ui headless 테스트 81곳에 clear/drop_without_applying_deltas를 적용했다. 테스트만 변경한다.
+- clean RED 재실행은 PID 70847 `_dyld_start`에서 60초 이상 지연. sample `/private/tmp/deppy-egui-036-terminal-sample.txt`의 footprint 96KB로 테스트 진입 전임을 확인. 아직 결과를 PASS로 기록하지 않음.
+- 남은 일: clean RED/Terminal GREEN, 앱 API 컴파일, focused/full gates, 최신 main merge 및 리뷰/PR.
+- 다음 명령: `tail -n 25 /private/tmp/deppy-egui-036-purpose-red-clean.log`; `CARGO_BUILD_JOBS=2 cargo test -p terminal --lib --locked`.
+
+### Rust 검증 직렬화 대기
+
+- clean RED 최종 결과: 0 PASS / 1 FAIL(Normal != Terminal), 실제 테스트 0.02초. 로더 지연과 제품 실패를 구분한다. Terminal 필드로 구현을 수정했다.
+- origin main의 다른 dependency lane(#151) 전체 검증을 우선하도록 요청받아 GUI Rust 실행을 일시 중단했다.
+- 정확한 종료 명령: `kill -TERM 32941 35186 36588` (GUI app --no-run cargo와 libc/serde build-script, 각각 로더 지연); `kill -TERM 99609 700` (standalone source gate Python와 agent_state_boundary test, 테스트 진입 전 로더 지연). 다른 작업의 프로세스는 종료하지 않았다.
+- 독립 APFS cache 복사는 `cp -c -nR /Users/jr/Desktop/projects/deppy-sijo/target/debug/. /private/tmp/deppy-egui-036-20260907/target/debug/`; 원본은 읽기 전용이고 기존 새 캐시는 덮지 않는다. 전용 target만 사용한다.
+- cache 복사는 4분 동안 진행 후 #151 우선 검증의 I/O를 줄이기 위해 정확한 PID80803에 SIGTERM을 보냈다. 부분적으로 복사한 캐시는 전용 target에 남기며 Cargo가 누락된 산출물은 재생성한다.
+- 정적 검증 완료: resolved GUI 단일 버전(0.36.1), commonmark/backend0.25.0, extras image-only, commonmark pulldown_cmark-only, 같은 pulldown-cmark0.13.4, vendored winit0.30.13 유지. diff-check PASS.
+- 남은 일: dependency lane 완료 신호 뒤 terminal GREEN, 앱 no-run/API 보완, focused/full gates. 새 Rust 프로세스는 신호 전 시작하지 않는다. Codex 읽기 전용 리뷰 진행 중.
+- 다음 명령(재개 신호 뒤): `CARGO_BUILD_JOBS=2 cargo test -p terminal --lib --locked`; `CARGO_BUILD_JOBS=2 cargo test -p deppy-sijo --bin deppy-sijo --locked --no-run`.
+
+### 정적 리뷰와 최신 base 변경
+
+- 첫 Codex CLI read-only review는 12분 동안 광범위 파일/과거 handoff와 잠금파일을 읽었으나 최종 판정을 반환하지 않았다. 리뷰 도중 origin/main이 #151(4c94f19)로 이동해 아직 일반 merge 전인 GUI 잠금파일을 역행으로 읽기 시작했다. 정확한 PID72182에 SIGTERM을 보내 중단했으며 리뷰 통과로 주장하지 않는다.
+- 최신 main 일반 merge 뒤 변경 범위를 제한한 Codex 리뷰를 다시 실행한다. Rust 실행은 dependency lane의 명시적인 재개 신호까지 계속 대기한다.
+
+### 최신 main 반영 및 검증 재개
+
+- #151/#152가 모두 반영된 origin/main `c9bda3932d2475fdebdda216c78abae3dd22692b`을 stash→일반 merge→stash pop으로 반영했다. 충돌 없음, stash 정상 삭제, rebase/force-push 없음.
+- 재개 후 `CARGO_BUILD_JOBS=2 cargo test -p terminal --lib --locked`: **86 PASS / 4 ignored**, 0.06초. 전용 작업 트리의 terminal 소스를 실제 재컴파일했다(`/private/tmp/deppy-egui-036-terminal-green.log`).
+- 현재 app --bin --no-run 컴파일 중(`/private/tmp/deppy-egui-036-app-api-final.log`), 제품 앱 실행 파일은 빌드하지 않는다.
+- 두 번째 Codex CLI 리뷰 완료: 읽기8회 후 concrete actionable defects 없음. GUI manifest/lock, vendored winit, Markdown image-only, IME Terminal 목적, headless delta 폐기 확인. 로그 `/private/tmp/deppy-egui-036-codex-review-final.log`. Rust 검증과 화면 검증을 수행한 리뷰는 아니다.
+
+### App OS-drop API 이관
+
+- app --bin --no-run 실제 RED: E0574 7개(DroppedFile struct가 trait로 변경), E0615 3개(path 필드가 메서드). 로그 `/private/tmp/deppy-egui-036-app-api-final.log`.
+- 변경: composer/file_tree/workspace의 path-only 소비를 `file.path().to_path_buf()`로 이관. cfg(test) 전용 `test_dropped_file.rs` handle을 기존7개 실제 drop kittest에 사용한다. bytes() 호출은 panic하여 render에서 파일 내용을 읽지 않음을 검증한다. hovered_files의 기존 Option 경로는 변경하지 않는다.
+- 다음: app no-run 재검증 후 OS-drop/전체 workspace/Markdown focused gate. 기존 GUI 정적 리뷰 이후 추가된 변경이므로 별도 Codex 보완 리뷰 필요.
+
+### App 컴파일 및 focused 검증
+
+- 새 DroppedFile API 수정 후 app --bin --no-run PASS, 32.92초. 제품 앱 대신 unittest executable만 생성했다(`/private/tmp/deppy-egui-036-app-api-green.log`).
+- workspace focused **233 PASS**, 1.39초(`/private/tmp/deppy-egui-036-workspace-focused.log`): 분할 pane·OS 드롭·IME 회귀 포함. 실제 Cargo artifact JSON도 같은 로그에 보관해 standalone integration gate의 정확한 rlib 그래프에 사용한다.
+- Markdown focused 결과와 전체 app/workspace/clippy/fmt/xtask/standalone integration gate는 후속 기록을 확인한다.
+
+### App 전체 검증 및 OS-drop 보완 리뷰 완료
+
+- app --bin 전체 **2035 PASS / 14 ignored**, 40.38초(`/private/tmp/deppy-egui-036-app-full.log`).
+- Markdown focused **28 PASS**, 0.88초(`/private/tmp/deppy-egui-036-markdown-focused.log`).
+- 추가 DroppedFile 변경의 Codex 리뷰도 완료: 새로운 결함 없음. 경로 순서/상한 유지, native handle 소유권 미탈취, UI bytes() 미호출과 fixture 경계 확인(`/private/tmp/deppy-egui-036-codex-drop-review.log`).
+- 현재 app 제외 workspace 전체/strict clippy/fmt/boundary/deps 직렬 gate 진행 중. 끝나면 같은 Cargo artifact의 rlib로6개 앱 integration 파일을 standalone 테스트한다.
+
+### Workspace 전체 검증 완료
+
+- `CARGO_BUILD_JOBS=2 cargo test --workspace --exclude deppy-sijo --locked -- --test-threads=1`: **1720 PASS / 10 ignored**, doc-tests 포함, 실제 exit0 수집(`/private/tmp/deppy-egui-036-workspace-full.log`).
+- Cargo PID43676은 정상 종료했다. 래퍼 Python23820은 다음 cargo-clippy32719를 기다리는 정상 상태였으며 불필요하게 종료하지 않았다.
+- app2035 + 나머지workspace1720 = **3755 PASS**, app integration은 별도 gate 예정이다.
+
+### 최종 local gate 결과
+
+- `CARGO_BUILD_JOBS=2 cargo clippy --workspace --all-targets --locked -- -D warnings`: exit0, 2분38초. `cargo fmt --all --check`, `git diff --check`, `cargo run --locked -p xtask -- check-boundary`, `cargo run --locked -p xtask -- check-deps`: 모두 exit0. `/private/tmp/deppy-egui-036-{clippy,fmt,boundary,deps,diff}.log`.
+- `python3 /private/tmp/deppy-egui-036-integration-gates.py`: Cargo JSON artifact의 정확한 rlib를 사용하는 standalone rustc test. agent_state_boundary4, dotenv_launch_boundary5, lazy_bounded_worker14, logging_policy15 PASS. alloc_phys_footprint_release1 및 scrollback_rss_end_to_end2는 기존 ignored 유지. 각 `/private/tmp/deppy-egui-036-integration-<name>.log`에 rustc 명령/실행 결과 기록.
+- standalone 실행기 첫 시도는 tracing, 다음 logging의 secret/libc `--extern` 누락으로 컴파일 실패했다. 실행기만 보완해 실패한 파일부터 재실행했고 모두 PASS했다. 제품 코드 수정은 없었다.
+- `CARGO_BUILD_JOBS=2 cargo audit`: exit0. chacha20 0.10.1·wnaf 0.14.0 yanked 허용 경고2개는 origin/main 잠금파일에도 같은 버전으로 존재한다. `cargo deny check bans licenses sources`: exit0, 정책상 duplicate version 경고만 허용. `/private/tmp/deppy-egui-036-{audit,deny}.log`.
+- i18n crate 전체/app 전체/xtask key coverage 테스트로 검증했다. 제품 앱을 자동 빌드하는 `xtask i18n-check` wrapper 자체는 실행하지 않았다. 제품 앱 빌드·실행, 실제 OS IME/화면 QA, ignored 성능·RSS 검사는 실행하지 않았다.
+
 ## Task 4 COMPLETE — application wiring (2026-08-29)
 
 - Task 4 of `docs/superpowers/plans/2026-08-28-production-relay.md` is now implemented, tested,

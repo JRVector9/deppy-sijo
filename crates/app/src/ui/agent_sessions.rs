@@ -4321,18 +4321,20 @@ mod tests {
         let catalog = catalog();
         let context = egui::Context::default();
         for _ in 0..300 {
-            let _ = context.run_ui(egui::RawInput::default(), |ui| {
-                let mut text_input_ids = Vec::new();
-                let mut intent = None;
-                state.render_llm_api_key_controls(
-                    ui,
-                    &mut text_input_ids,
-                    &snapshot,
-                    &mut intent,
-                    &catalog,
-                );
-                assert!(intent.is_none());
-            });
+            context
+                .run_ui(egui::RawInput::default(), |ui| {
+                    let mut text_input_ids = Vec::new();
+                    let mut intent = None;
+                    state.render_llm_api_key_controls(
+                        ui,
+                        &mut text_input_ids,
+                        &snapshot,
+                        &mut intent,
+                        &catalog,
+                    );
+                    assert!(intent.is_none());
+                })
+                .drop_without_applying_deltas();
         }
         assert_eq!(host.calls.load(std::sync::atomic::Ordering::Relaxed), 0);
     }

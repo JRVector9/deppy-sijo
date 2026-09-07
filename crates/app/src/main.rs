@@ -51,6 +51,8 @@ mod relay_repository;
 mod shortcuts;
 mod status_feed;
 mod tailscale;
+#[cfg(test)]
+mod test_dropped_file;
 mod theme;
 mod ui;
 mod worktree;

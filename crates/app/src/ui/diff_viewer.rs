@@ -827,14 +827,16 @@ index 111..222 100644
 
         // SAMPLE: "context1"·"context2"가 한 줄씩(질의 "context" 2건),
         // "old line"·"new line"·"added line"에 "line"이 한 번씩(질의 "line" 3건).
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        ctx.run_ui(egui::RawInput::default(), |ui| {
             viewer.render(ui, &catalog, Some(("context", 0)));
-        });
+        })
+        .drop_without_applying_deltas();
         assert_eq!(viewer.search_summary(), (2, false));
 
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        ctx.run_ui(egui::RawInput::default(), |ui| {
             viewer.render(ui, &catalog, Some(("line", 0)));
-        });
+        })
+        .drop_without_applying_deltas();
         assert_eq!(
             viewer.search_summary(),
             (3, false),
@@ -842,9 +844,10 @@ index 111..222 100644
         );
 
         // 같은 질의를 반복해도(캐시 재사용) 총계는 그대로다.
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        ctx.run_ui(egui::RawInput::default(), |ui| {
             viewer.render(ui, &catalog, Some(("line", 0)));
-        });
+        })
+        .drop_without_applying_deltas();
         assert_eq!(viewer.search_summary(), (3, false));
     }
 

@@ -74,19 +74,18 @@ toml_edit = "0.25.12"
 mimalloc = { workspace = true }
 libmimalloc-sys = { workspace = true }
 
-# 문서 탭 Markdown Viewer facade(`ui/markdown_viewer.rs`) 전용. egui 0.35와 짝인 0.24로
-# 고정한다(0.25는 egui 0.36용, `docs/superpowers/specs/2026-08-21-document-tab-design.md`
-# §5 실측). default-features를 꺼서 업스트림 기본 file/http 이미지 loader와 fetch를
+# 문서 탭 Markdown Viewer facade(`ui/markdown_viewer.rs`) 전용. egui 0.36과 짝인 0.25로
+# 고정한다. default-features를 꺼서 업스트림 기본 file/http 이미지 loader와 fetch를
 # 배제한다. "pulldown_cmark" feature만 켠다 — `show_scrollable`(§6.4 static-content
 # 캐시)에 필요하고, 그 자체는 의존성 없는 순수 플래그다.
-egui_commonmark = { version = "=0.24", default-features = false, features = [
+egui_commonmark = { version = "=0.25", default-features = false, features = [
     "pulldown_cmark",
 ] }
 # 위 Viewer가 로컬 PNG를 텍스처로 디코드하는 데만 쓴다 — "image" feature만 켠다.
 # "file"/"http" feature는 절대 켜지 않는다(워크스페이스 경계 밖 파일·원격 URL을 그대로
 # 읽는 egui_extras 기본 loader라 §7.2/§7.3 보안 정책과 정면으로 충돌한다).
-egui_extras = { version = "0.35", default-features = false, features = ["image"] }
-# 위 Viewer가 링크·이미지 목적지를 뽑을 때 egui_commonmark(0.24)가 내부에서 쓰는
+egui_extras = { version = "0.36", default-features = false, features = ["image"] }
+# 위 Viewer가 링크·이미지 목적지를 뽑을 때 egui_commonmark(0.25)가 내부에서 쓰는
 # 것과 **같은** pulldown-cmark 버전/옵션으로 직접 파싱한다 — 정규식으로 흉내 내면
 # CommonMark의 "목적지 안 균형 잡힌 괄호는 이스케이프 없이 허용"같은 규칙과 어긋나
 # (`[x](javascript:alert(1))`) 위험한 링크가 우리 link hook 등록을 비껴가 라이브러리
@@ -150,4 +149,4 @@ windows-sys = { version = "0.61", features = [
 [dev-dependencies]
 # egui 공식 테스트 하네스 — AccessKit 트리로 버튼/입력을 찾아 실제 클릭·타이핑을
 # 시뮬레이션한다(인박스 카드 상호작용 자동 검증, 2026-07-17). 렌더 백엔드 불필요.
-egui_kittest = "0.35"
+egui_kittest = "0.36"

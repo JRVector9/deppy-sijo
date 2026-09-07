@@ -989,7 +989,7 @@ impl ComposerUi {
             i.raw
                 .dropped_files
                 .iter()
-                .filter_map(|file| file.path.clone())
+                .map(|file| file.path().to_path_buf())
                 .take(COMPOSER_ATTACHMENT_MAX_ITEMS + 1)
                 .collect()
         });
@@ -2919,10 +2919,10 @@ mod tests {
             .input_mut()
             .events
             .push(egui::Event::PointerMoved(egui::pos2(50.0, 20.0)));
-        harness.input_mut().dropped_files.push(egui::DroppedFile {
-            path: Some(PathBuf::from("/x/a.png")),
-            ..Default::default()
-        });
+        harness
+            .input_mut()
+            .dropped_files
+            .push(crate::test_dropped_file::handle(PathBuf::from("/x/a.png")));
         harness.step();
         assert_eq!(buffer_of(&harness), "/x/a.png");
         assert_eq!(
@@ -2945,10 +2945,10 @@ mod tests {
             .input_mut()
             .events
             .push(egui::Event::PointerMoved(egui::pos2(5000.0, 5000.0)));
-        harness.input_mut().dropped_files.push(egui::DroppedFile {
-            path: Some(PathBuf::from("/x/a.png")),
-            ..Default::default()
-        });
+        harness
+            .input_mut()
+            .dropped_files
+            .push(crate::test_dropped_file::handle(PathBuf::from("/x/a.png")));
         harness.step();
         assert_eq!(
             buffer_of(&harness),
@@ -2973,10 +2973,10 @@ mod tests {
             .input_mut()
             .events
             .push(egui::Event::PointerMoved(egui::pos2(50.0, 20.0)));
-        harness.input_mut().dropped_files.push(egui::DroppedFile {
-            path: Some(nfd_path),
-            ..Default::default()
-        });
+        harness
+            .input_mut()
+            .dropped_files
+            .push(crate::test_dropped_file::handle(nfd_path));
         harness.step();
         let expected: String = format!("/x/{nfd_han}.txt").nfc().collect();
         assert_eq!(buffer_of(&harness), expected);

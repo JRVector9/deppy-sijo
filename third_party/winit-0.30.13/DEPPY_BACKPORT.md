@@ -17,7 +17,7 @@ ASCII character delivered later in the same `interpretKeyEvents` call. This
 prevents both a swallowed first punctuation key and duplicate Commit/keyboard
 text such as a doubled Space or comma.
 
-The upstream PR targets the winit 0.31 beta line, while eframe 0.35 currently
+The upstream PR targets the winit 0.31 beta line, while eframe 0.36 currently
 resolves winit 0.30.13. Remove this vendor copy and `[patch.crates-io]` entry
 once the application's stable eframe/winit dependency contains the equivalent
 fix.

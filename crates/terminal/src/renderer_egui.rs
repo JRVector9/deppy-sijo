@@ -531,6 +531,7 @@ pub fn draw(
         }
         ui.ctx().output_mut(|o| {
             o.ime = Some(egui::output::IMEOutput {
+                purpose: egui::IMEPurpose::Terminal,
                 rect,
                 cursor_rect: egui::Rect::from_min_size(cursor_pos, cell),
                 should_interrupt_composition: false,
@@ -984,7 +985,7 @@ mod tests {
         // 등록 여부를 확인해 내려가지 않으면 bold 셀을 그리는 순간 렌더가 죽는다.
         let ctx = egui::Context::default();
         let mut checked = false;
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        ctx.run_ui(egui::RawInput::default(), |ui| {
             let ready = mono_bold_family_ready(ui.ctx());
             assert!(
                 !ready,
@@ -1005,7 +1006,7 @@ mod tests {
                 "미등록이면 Monospace로 내려가야 한다"
             );
             checked = true;
-        });
+        }).drop_without_applying_deltas();
         assert!(checked, "프레임이 돌지 않으면 검증이 비어 있다");
     }
 
@@ -1154,7 +1155,7 @@ mod tests {
         generation: u64,
     ) -> usize {
         let ctx = egui::Context::default();
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        ctx.run_ui(egui::RawInput::default(), |ui| {
             ui.set_min_size(egui::vec2(500.0, 200.0));
             draw(
                 ui,
@@ -1166,7 +1167,8 @@ mod tests {
                 None,
                 generation,
             );
-        });
+        })
+        .drop_without_applying_deltas();
         cache.rebuilt_rows_last_frame()
     }
 
@@ -1274,9 +1276,10 @@ mod tests {
         {
             let mut c = TerminalRenderCache::default();
             let s = bench_snap(80, 24, 8);
-            let full = ctx.run_ui(raw.clone(), |ui| {
+            let mut full = ctx.run_ui(raw.clone(), |ui| {
                 draw(ui, &s, m(13.0, 1.0), &mut c, None, false, None, next_gen());
             });
+            full.textures_delta.clear();
             let _ = tessellate_ms(&ctx, full);
         }
 
@@ -1290,7 +1293,7 @@ mod tests {
             for _ in 0..ITERS {
                 let mut cache = TerminalRenderCache::default();
                 let t = Instant::now();
-                let full = ctx.run_ui(raw.clone(), |ui| {
+                let mut full = ctx.run_ui(raw.clone(), |ui| {
                     draw(
                         ui,
                         &snapshot,
@@ -1302,6 +1305,7 @@ mod tests {
                         next_gen(),
                     );
                 });
+                full.textures_delta.clear();
                 d_ms += t.elapsed().as_secs_f64() * 1e3;
                 shapes = cache.counters.shapes;
                 let (tm, tr) = tessellate_ms(&ctx, full);
@@ -1318,7 +1322,7 @@ mod tests {
             // (b) cached: 같은 세대 재draw → 재-shaping 0, 그래도 재-테셀레이션.
             let mut cache = TerminalRenderCache::default();
             let g = next_gen();
-            let full = ctx.run_ui(raw.clone(), |ui| {
+            let mut full = ctx.run_ui(raw.clone(), |ui| {
                 draw(
                     ui,
                     &snapshot,
@@ -1330,11 +1334,12 @@ mod tests {
                     g,
                 );
             });
+            full.textures_delta.clear();
             let _ = tessellate_ms(&ctx, full);
             let (mut cd_ms, mut ct_ms) = (0.0, 0.0);
             for _ in 0..ITERS {
                 let t = Instant::now();
-                let full = ctx.run_ui(raw.clone(), |ui| {
+                let mut full = ctx.run_ui(raw.clone(), |ui| {
                     draw(
                         ui,
                         &snapshot,
@@ -1346,6 +1351,7 @@ mod tests {
                         g,
                     );
                 });
+                full.textures_delta.clear();
                 cd_ms += t.elapsed().as_secs_f64() * 1e3;
                 let (tm, _) = tessellate_ms(&ctx, full);
                 ct_ms += tm;
@@ -1369,7 +1375,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut cache = TerminalRenderCache::default();
         let mut measured = None;
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        ctx.run_ui(egui::RawInput::default(), |ui| {
             ui.set_min_size(egui::vec2(500.0, 200.0));
             let output = draw(
                 ui,
@@ -1382,7 +1388,8 @@ mod tests {
                 next_gen(),
             );
             measured = Some((output.response.rect, output.origin, output.cell_size));
-        });
+        })
+        .drop_without_applying_deltas();
 
         let (rect, origin, cell) = measured.expect("terminal should be rendered");
         let grid_right = origin.x + cell.x * snapshot.cols as f32;
@@ -1405,7 +1412,7 @@ mod tests {
         let mut owns_ime_events = false;
         // 논리적 소유권이 넘어온 첫 프레임에도 request_focus 후 공식 소유자가 되어
         // IME 영역을 내보내야 한다.
-        let full = ctx.run_ui(egui::RawInput::default(), |ui| {
+        let mut full = ctx.run_ui(egui::RawInput::default(), |ui| {
             ui.set_min_size(egui::vec2(500.0, 200.0));
             let output = draw(
                 ui,
@@ -1419,7 +1426,13 @@ mod tests {
             );
             owns_ime_events = ui.memory(|memory| memory.owns_ime_events(output.response.id));
         });
+        full.textures_delta.clear();
         assert!(owns_ime_events, "터미널이 egui IME 소유자가 되어야 한다");
+        assert_eq!(
+            full.platform_output.ime.expect("터미널 IME 출력").purpose,
+            egui::IMEPurpose::Terminal,
+            "터미널 입력은 일반 문서 입력과 구분해야 한다"
+        );
         assert!(
             full.platform_output.ime.is_some(),
             "소유권 전환 프레임에서 IME가 비면 조합이 끊긴다"
@@ -1431,7 +1444,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut cache = TerminalRenderCache::default();
         let snapshot = snap(4, 1, &["test"]);
-        let full = ctx.run_ui(egui::RawInput::default(), |ui| {
+        let mut full = ctx.run_ui(egui::RawInput::default(), |ui| {
             ui.set_min_size(egui::vec2(500.0, 200.0));
             draw(
                 ui,
@@ -1444,6 +1457,7 @@ mod tests {
                 next_gen(),
             );
         });
+        full.textures_delta.clear();
         assert!(full.platform_output.ime.is_none());
     }
 
@@ -1453,11 +1467,12 @@ mod tests {
         let mut cache = TerminalRenderCache::default();
         let snapshot = snap(4, 1, &["test"]);
 
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        ctx.run_ui(egui::RawInput::default(), |ui| {
             let transient = ui.button("transient focus");
             transient.request_focus();
-        });
-        let full = ctx.run_ui(egui::RawInput::default(), |ui| {
+        })
+        .drop_without_applying_deltas();
+        let mut full = ctx.run_ui(egui::RawInput::default(), |ui| {
             ui.set_min_size(egui::vec2(500.0, 200.0));
             let _ = ui.button("transient focus");
             draw(
@@ -1471,6 +1486,7 @@ mod tests {
                 next_gen(),
             );
         });
+        full.textures_delta.clear();
 
         let ime = full
             .platform_output
@@ -1499,10 +1515,11 @@ mod tests {
 
         // 다른 위젯이 포커스를 쥔 상태 — 터미널은 논리적 키보드 소유자지만 egui의
         // 공식 소유자가 아니라 draw가 포커스를 되찾으려 한다.
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        ctx.run_ui(egui::RawInput::default(), |ui| {
             let transient = ui.button("transient focus");
             transient.request_focus();
-        });
+        })
+        .drop_without_applying_deltas();
 
         let input = egui::RawInput {
             events: vec![egui::Event::Ime(egui::ImeEvent::Preedit {
@@ -1511,7 +1528,7 @@ mod tests {
             })],
             ..Default::default()
         };
-        let full = ctx.run_ui(input, |ui| {
+        let mut full = ctx.run_ui(input, |ui| {
             ui.set_min_size(egui::vec2(500.0, 200.0));
             let _ = ui.button("transient focus");
             draw(
@@ -1526,6 +1543,7 @@ mod tests {
                 next_gen(),
             );
         });
+        full.textures_delta.clear();
 
         let ime = full
             .platform_output
@@ -1545,10 +1563,11 @@ mod tests {
         let mut cache = TerminalRenderCache::default();
         let snapshot = snap(4, 1, &["test"]);
 
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        ctx.run_ui(egui::RawInput::default(), |ui| {
             let transient = ui.button("transient focus");
             transient.request_focus();
-        });
+        })
+        .drop_without_applying_deltas();
 
         let input = egui::RawInput {
             events: vec![
@@ -1561,7 +1580,7 @@ mod tests {
             ..Default::default()
         };
         let mut owns_ime_events = false;
-        let full = ctx.run_ui(input, |ui| {
+        let mut full = ctx.run_ui(input, |ui| {
             ui.set_min_size(egui::vec2(500.0, 200.0));
             let _ = ui.button("transient focus");
             let output = draw(
@@ -1576,6 +1595,7 @@ mod tests {
             );
             owns_ime_events = ui.memory(|memory| memory.owns_ime_events(output.response.id));
         });
+        full.textures_delta.clear();
 
         assert!(
             owns_ime_events,
@@ -1602,7 +1622,7 @@ mod tests {
             })],
             ..Default::default()
         };
-        let full = ctx.run_ui(input, |ui| {
+        let mut full = ctx.run_ui(input, |ui| {
             ui.set_min_size(egui::vec2(500.0, 200.0));
             draw(
                 ui,
@@ -1615,6 +1635,7 @@ mod tests {
                 next_gen(),
             );
         });
+        full.textures_delta.clear();
         assert!(full.platform_output.ime.is_none());
     }
 
@@ -1623,13 +1644,14 @@ mod tests {
         let ctx = egui::Context::default();
         // fonts는 첫 프레임에 초기화된다 — run_ui 안에서 재야 한다.
         let mut measured = None;
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        ctx.run_ui(egui::RawInput::default(), |ui| {
             measured = Some((
                 cell_size(ui.ctx(), m(13.0, 1.0)),
                 cell_size(ui.ctx(), m(13.0, 1.5)),
                 cell_size(ui.ctx(), m(13.0, 0.8)),
             ));
-        });
+        })
+        .drop_without_applying_deltas();
         let (base, tall, tight) = measured.expect("cell size measured");
 
         // 폭은 배수와 무관 — 열 정렬이 깨지면 안 된다.
@@ -1686,7 +1708,7 @@ mod tests {
         ) -> RenderCounters {
             let ctx = egui::Context::default();
             let mut out = RenderCounters::default();
-            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ctx.run_ui(egui::RawInput::default(), |ui| {
                 ui.set_min_size(egui::vec2(500.0, 200.0));
                 out = draw(
                     ui,
@@ -1699,7 +1721,8 @@ mod tests {
                     next_gen(),
                 )
                 .counters;
-            });
+            })
+            .drop_without_applying_deltas();
             out
         }
 

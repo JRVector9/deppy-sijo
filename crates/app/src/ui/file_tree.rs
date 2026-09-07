@@ -2822,7 +2822,7 @@ impl FileTreeUi {
             i.raw
                 .dropped_files
                 .iter()
-                .filter_map(|file| file.path.clone())
+                .map(|file| file.path().to_path_buf())
                 .collect()
         });
         let drag_pos = (os_drag_active || !os_dropped.is_empty())
@@ -7080,7 +7080,7 @@ mod tests {
         };
         let catalog = catalog();
 
-        let output = context.run_ui(egui::RawInput::default(), |ui| {
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| {
             ui.set_width(220.0);
             workspace_row(
                 ui,
@@ -7091,6 +7091,7 @@ mod tests {
                 &catalog,
             );
         });
+        output.textures_delta.clear();
 
         assert!(
             output.shapes.iter().any(|clipped| {
@@ -8354,14 +8355,15 @@ mod tests {
         };
         let ctx = egui::Context::default();
         install_sidebar_test_fonts(&ctx);
-        let _ = ctx.run_ui(Default::default(), |ctx| {
+        ctx.run_ui(Default::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 assert!(
                     tree.panel(ui, &std::collections::HashMap::new(), &sidebar, &catalog,)
                         .is_none()
                 );
             });
-        });
+        })
+        .drop_without_applying_deltas();
         assert!(tree.maintenance_intent.is_some());
         drain_listings(&mut tree);
 
@@ -10196,11 +10198,12 @@ mod tests {
         let ctx = egui::Context::default();
         install_sidebar_test_fonts(&ctx);
         let mut tree = FileTreeUi::new(ctx.clone());
-        let _ = ctx.run_ui(egui::RawInput::default(), |ctx| {
+        ctx.run_ui(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let _ = tree.panel(ui, &std::collections::HashMap::new(), &snapshot, &catalog);
             });
-        });
+        })
+        .drop_without_applying_deltas();
 
         let navigation = egui::PanelState::load(&ctx, egui::Id::new("designall_navigation_rail"))
             .expect("DesignALL 내비게이션 레일이 별도 패널이어야 한다");
@@ -10504,10 +10507,10 @@ mod tests {
             .input_mut()
             .events
             .push(egui::Event::PointerMoved(row_pos));
-        harness.input_mut().dropped_files.push(egui::DroppedFile {
-            path: Some(src.clone()),
-            ..Default::default()
-        });
+        harness
+            .input_mut()
+            .dropped_files
+            .push(crate::test_dropped_file::handle(src.clone()));
         harness.step();
         let intent = harness.state_mut().0.take_io_intent().expect("copy intent");
         match intent.request {

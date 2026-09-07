@@ -348,7 +348,7 @@ mod tests {
         let ctx = egui::Context::default();
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
         let workspace_names = HashMap::new();
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        ctx.run_ui(egui::RawInput::default(), |ui| {
             let action = render(
                 ui,
                 &catalog,
@@ -360,7 +360,8 @@ mod tests {
             );
             assert!(action.decision.is_none());
             assert!(action.goto.is_none());
-        });
+        })
+        .drop_without_applying_deltas();
     }
 
     #[test]
@@ -374,7 +375,7 @@ mod tests {
             row("a2", None),
             row("a3", Some("ws-unknown:1")),
         ];
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        ctx.run_ui(egui::RawInput::default(), |ui| {
             let action = render(
                 ui,
                 &catalog,
@@ -386,7 +387,8 @@ mod tests {
             );
             assert!(action.decision.is_none());
             assert!(action.goto.is_none());
-        });
+        })
+        .drop_without_applying_deltas();
     }
 
     #[test]
@@ -397,7 +399,7 @@ mod tests {
         let rows: Vec<_> = (0..POPUP_MAX_CARDS + 3)
             .map(|i| row(&format!("a{i}"), None))
             .collect();
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        ctx.run_ui(egui::RawInput::default(), |ui| {
             let action = render(
                 ui,
                 &catalog,
@@ -409,7 +411,8 @@ mod tests {
             );
             assert!(action.decision.is_none());
             assert!(action.goto.is_none());
-        });
+        })
+        .drop_without_applying_deltas();
     }
 
     // ── kittest 상호작용 테스트 (2026-07-17) ──

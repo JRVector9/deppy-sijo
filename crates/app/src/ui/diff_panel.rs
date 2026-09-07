@@ -1214,9 +1214,11 @@ mod tests {
         panel.title = "Workspace · Agent".to_owned();
         panel.snapshot = Some(snapshot("/private/repo", Vec::new()));
         for _ in 0..300 {
-            let _ = context.run_ui(egui::RawInput::default(), |ui| {
-                panel.show(ui.ctx(), &catalog)
-            });
+            context
+                .run_ui(egui::RawInput::default(), |ui| {
+                    panel.show(ui.ctx(), &catalog)
+                })
+                .drop_without_applying_deltas();
             assert!(panel.take_io_intent().is_none());
         }
         assert!(panel.pending.is_none());

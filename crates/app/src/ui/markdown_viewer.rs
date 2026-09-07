@@ -915,7 +915,7 @@ mod tests {
         let mut viewer = MarkdownViewer::new();
 
         for (revision, source) in [(1, "[A](https://a.example)"), (2, "[B](https://b.example)")] {
-            let _ = ctx.run_ui(Default::default(), |ui| {
+            ctx.run_ui(Default::default(), |ui| {
                 viewer.show(
                     ui,
                     source,
@@ -926,7 +926,8 @@ mod tests {
                         base_directory: &workspace,
                     },
                 );
-            });
+            })
+            .drop_without_applying_deltas();
         }
 
         assert_eq!(viewer.cache.link_hooks().len(), 1);
@@ -943,7 +944,7 @@ mod tests {
         let slot = MarkdownDocumentSlot(2);
         let mut viewer = MarkdownViewer::new();
 
-        let _ = ctx.run_ui(Default::default(), |ui| {
+        ctx.run_ui(Default::default(), |ui| {
             viewer.show(
                 ui,
                 "![a](a.png)",
@@ -954,7 +955,8 @@ mod tests {
                     base_directory: &workspace,
                 },
             );
-        });
+        })
+        .drop_without_applying_deltas();
         let uri = viewer.image_broker.registered_uris[0].clone();
         let size_hint = egui::load::SizeHint::default();
         assert!(ctx.try_load_bytes(&uri).is_ok());
@@ -985,7 +987,7 @@ mod tests {
         let active = MarkdownDocumentSlot(2);
         let mut viewer = MarkdownViewer::new();
 
-        let _ = ctx.run_ui(Default::default(), |ui| {
+        ctx.run_ui(Default::default(), |ui| {
             viewer.show(
                 ui,
                 "[A](https://a.example) ![a](a.png)",
@@ -996,7 +998,8 @@ mod tests {
                     base_directory: &workspace,
                 },
             );
-        });
+        })
+        .drop_without_applying_deltas();
         let uri = viewer.image_broker.registered_uris[0].clone();
         let scroll_key = viewer.scroll_key;
 
@@ -1047,7 +1050,7 @@ mod tests {
         let ctx = egui::Context::default();
 
         // 실제 `show`는 egui::Ui가 필요해 `run_ui`로 감싼다.
-        let _ = ctx.run_ui(Default::default(), |ui| {
+        ctx.run_ui(Default::default(), |ui| {
             viewer.show(
                 ui,
                 source,
@@ -1058,11 +1061,12 @@ mod tests {
                     base_directory: &workspace,
                 },
             );
-        });
+        })
+        .drop_without_applying_deltas();
         let first_key = viewer.scroll_key;
         assert!(first_key.is_some());
 
-        let _ = ctx.run_ui(Default::default(), |ui| {
+        ctx.run_ui(Default::default(), |ui| {
             viewer.show(
                 ui,
                 source,
@@ -1073,7 +1077,8 @@ mod tests {
                     base_directory: &workspace,
                 },
             );
-        });
+        })
+        .drop_without_applying_deltas();
         assert_eq!(
             viewer.scroll_key, first_key,
             "리비전이 그대로면 render signature가 바뀌면 안 된다"
@@ -1089,7 +1094,7 @@ mod tests {
         let second = MarkdownDocumentSlot(8);
 
         let render = |viewer: &mut MarkdownViewer, slot| {
-            let _ = ctx.run_ui(Default::default(), |ui| {
+            ctx.run_ui(Default::default(), |ui| {
                 viewer.show(
                     ui,
                     "# 제목\n\n본문",
@@ -1100,7 +1105,8 @@ mod tests {
                         base_directory: &workspace,
                     },
                 );
-            });
+            })
+            .drop_without_applying_deltas();
         };
 
         render(&mut viewer, first);
@@ -1141,7 +1147,7 @@ mod tests {
         let slot = MarkdownDocumentSlot(7);
 
         let render = |viewer: &mut MarkdownViewer, revision| {
-            let _ = ctx.run_ui(
+            ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -1163,7 +1169,8 @@ mod tests {
                         );
                     });
                 },
-            );
+            )
+            .drop_without_applying_deltas();
         };
 
         render(&mut viewer, 1);
@@ -1201,7 +1208,7 @@ mod tests {
         let slot = MarkdownDocumentSlot(7);
 
         for (parent, revision) in [("preview-parent", 1), ("split-parent", 2)] {
-            let _ = ctx.run_ui(Default::default(), |ui| {
+            ctx.run_ui(Default::default(), |ui| {
                 ui.push_id(parent, |ui| {
                     viewer.show(
                         ui,
@@ -1214,7 +1221,8 @@ mod tests {
                         },
                     );
                 });
-            });
+            })
+            .drop_without_applying_deltas();
         }
 
         let horizontal_ids = viewer.horizontal_scroll_ids.get(&slot.0).unwrap().clone();
@@ -1230,7 +1238,7 @@ mod tests {
                 .clear_scrollable_with_id(scroll_source_id(slot)),
             "닫기 전에 현재 slot의 CommonMark cache가 있어야 한다"
         );
-        let _ = ctx.run_ui(Default::default(), |ui| {
+        ctx.run_ui(Default::default(), |ui| {
             ui.push_id("split-parent", |ui| {
                 viewer.show(
                     ui,
@@ -1243,7 +1251,8 @@ mod tests {
                     },
                 );
             });
-        });
+        })
+        .drop_without_applying_deltas();
 
         viewer.forget_document(&ctx, slot);
 

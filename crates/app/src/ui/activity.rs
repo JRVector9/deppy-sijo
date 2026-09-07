@@ -1162,9 +1162,10 @@ mod tests {
         let mut activity = ActivityUi::new();
         let before = Arc::strong_count(&snapshot.rows);
         for _ in 0..300 {
-            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ctx.run_ui(egui::RawInput::default(), |ui| {
                 assert!(activity.contents(ui, &catalog, &snapshot).is_none());
-            });
+            })
+            .drop_without_applying_deltas();
         }
         assert_eq!(Arc::strong_count(&snapshot.rows), before);
     }

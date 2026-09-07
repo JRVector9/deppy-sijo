@@ -1942,9 +1942,10 @@ mod tests {
     ) -> Option<ConnectorIntent> {
         let context = egui::Context::default();
         context.enable_accesskit();
-        let first = context.run_ui(raw_input(), |ui| {
+        let mut first = context.run_ui(raw_input(), |ui| {
             assert!(connector_ui.render(ui, snapshot).is_none());
         });
+        first.textures_delta.clear();
         let update = first
             .platform_output
             .accesskit_update
@@ -1964,9 +1965,11 @@ mod tests {
             },
         ));
         let mut emitted = None;
-        let _ = context.run_ui(input, |ui| {
-            emitted = connector_ui.render(ui, snapshot);
-        });
+        context
+            .run_ui(input, |ui| {
+                emitted = connector_ui.render(ui, snapshot);
+            })
+            .drop_without_applying_deltas();
         emitted
     }
 
@@ -1982,9 +1985,10 @@ mod tests {
         let context = egui::Context::default();
         context.enable_accesskit();
         let mut connector_ui = ConnectorUi::new(catalog);
-        let output = context.run_ui(raw_input(), |ui| {
+        let mut output = context.run_ui(raw_input(), |ui| {
             assert!(connector_ui.render(ui, snapshot).is_none());
         });
+        output.textures_delta.clear();
         output
             .platform_output
             .accesskit_update
@@ -2251,9 +2255,11 @@ mod tests {
             ..ConnectorSnapshot::default()
         };
         let mut ui = ConnectorUi::new(&catalog);
-        let _ = egui::Context::default().run_ui(raw_input(), |egui_ui| {
-            assert!(ui.render(egui_ui, &awaiting_client).is_none());
-        });
+        egui::Context::default()
+            .run_ui(raw_input(), |egui_ui| {
+                assert!(ui.render(egui_ui, &awaiting_client).is_none());
+            })
+            .drop_without_applying_deltas();
         let draft = ui.oauth_client.as_mut().expect("client draft");
         draft.client_id = "client-id".to_owned();
         draft.client_secret = "client-secret".to_owned();
@@ -2280,9 +2286,11 @@ mod tests {
         }
 
         let mut link_ui = ConnectorUi::new(&catalog);
-        let _ = egui::Context::default().run_ui(raw_input(), |egui_ui| {
-            assert!(link_ui.render(egui_ui, &awaiting_client).is_none());
-        });
+        egui::Context::default()
+            .run_ui(raw_input(), |egui_ui| {
+                assert!(link_ui.render(egui_ui, &awaiting_client).is_none());
+            })
+            .drop_without_applying_deltas();
         let link_draft = link_ui.oauth_client.as_mut().expect("client draft");
         link_draft.client_id = "kept-client-id".to_owned();
         link_draft.client_secret = "kept-client-secret".to_owned();
@@ -2445,9 +2453,11 @@ mod tests {
         let page_items = &snapshot.tool_page.as_ref().unwrap().items;
         let pointer = Arc::as_ptr(page_items);
 
-        let _ = context.run_ui(raw_input(), |egui_ui| {
-            assert!(ui.render(egui_ui, &snapshot).is_none());
-        });
+        context
+            .run_ui(raw_input(), |egui_ui| {
+                assert!(ui.render(egui_ui, &snapshot).is_none());
+            })
+            .drop_without_applying_deltas();
 
         let rendered = RENDERED_TOOL_ROWS.with(std::cell::Cell::get);
         let maximum_visible_with_overscan = (TOOL_LIST_HEIGHT / TOOL_ROW_HEIGHT) as usize + 2;
@@ -2487,9 +2497,11 @@ mod tests {
         let context = egui::Context::default();
         let catalog = Catalog::load("en-US").unwrap();
         let mut ui = ConnectorUi::new(&catalog);
-        let _ = context.run_ui(raw_input(), |egui_ui| {
-            assert!(ui.render(egui_ui, &snapshot).is_none());
-        });
+        context
+            .run_ui(raw_input(), |egui_ui| {
+                assert!(ui.render(egui_ui, &snapshot).is_none());
+            })
+            .drop_without_applying_deltas();
         let rendered = RENDERED_IMPORT_ROWS.with(std::cell::Cell::get);
         let maximum_visible_with_overscan = (IMPORT_LIST_HEIGHT / IMPORT_ROW_HEIGHT) as usize + 2;
         assert!(rendered > 0);
@@ -2538,15 +2550,19 @@ mod tests {
         let context = egui::Context::default();
         let catalog = Catalog::load("en-US").unwrap();
         let mut ui = ConnectorUi::new(&catalog);
-        let _ = context.run_ui(raw_input(), |egui_ui| {
-            assert!(ui.render(egui_ui, &snapshot).is_none());
-        });
+        context
+            .run_ui(raw_input(), |egui_ui| {
+                assert!(ui.render(egui_ui, &snapshot).is_none());
+            })
+            .drop_without_applying_deltas();
         assert_eq!(ui.prepared.rebuild_count, 1);
 
         for _ in 0..300 {
-            let _ = context.run_ui(raw_input(), |egui_ui| {
-                assert!(ui.render(egui_ui, &snapshot).is_none());
-            });
+            context
+                .run_ui(raw_input(), |egui_ui| {
+                    assert!(ui.render(egui_ui, &snapshot).is_none());
+                })
+                .drop_without_applying_deltas();
         }
         assert_eq!(ui.prepared.rebuild_count, 1);
     }
@@ -2682,9 +2698,11 @@ mod tests {
             ..ConnectorSnapshot::default()
         };
         let mut ui = ConnectorUi::new(&catalog);
-        let _ = egui::Context::default().run_ui(raw_input(), |egui_ui| {
-            assert!(ui.render(egui_ui, &awaiting_client).is_none());
-        });
+        egui::Context::default()
+            .run_ui(raw_input(), |egui_ui| {
+                assert!(ui.render(egui_ui, &awaiting_client).is_none());
+            })
+            .drop_without_applying_deltas();
         ui.oauth_client.as_mut().unwrap().client_secret = "drop-on-cancel".to_owned();
         let cancel_label = ui.labels.cancel.clone();
         assert!(matches!(

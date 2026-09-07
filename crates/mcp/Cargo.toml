@@ -17,6 +17,7 @@ deppy-core = { path = "../core" }
 secret = { path = "../secret" }
 # Streamable HTTP transport (H2) — sync ureq만 사용 (tokio 금지 관례)
 ureq = { workspace = true }
+http-client = { workspace = true }
 # 수동 redirect의 Location 해석·same-origin 비교·URL 정책 검증.
 # ureq 2가 이미 의존하는 crate(재노출은 안 함) — 새 lock 항목 없음.
 url = "2"

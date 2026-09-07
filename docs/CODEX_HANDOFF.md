@@ -1,3 +1,109 @@
+## ureq3 migration validated / PR landing next (2026-09-07)
+
+- Objective: replace dependency-only PR141 with native ureq3.4 migration, preserving OAuth/MCP status/body/redaction and SSE idle semantics.
+- Completed source: commit4fac641, latest GUI main21172a8 integrated at e34769d. http-client transport helper + native auth/MCP/app/Push APIs. No uncommitted product code.
+- Actual complete workspace gate: fmt/diff/boundary/deny/audit/tree/strict workspace all-target clippy PASS; full serial workspace3803 passed/27 ignored, exit0. Evidence /private/tmp/deppy-deps-evidence-20260907/ureq3/results.json and tests.log. Audit retained existing allowed yanked chacha20/wnaf warnings.
+- Focused helper5/auth105/MCP105/web278/app55 passed (548 total,4 ignored). Actual idle and typed timeout RED→GREEN recorded. Linux exact source e34769d strict Relay clippy/55 tests/release PASS.
+- Codex CLI static source review: C/H/M0 actionable findings. No app launch/packaging, force-push or rebase.
+- Failed approaches: initial ambiguous transport Duration conversion, MCP Config shadow and SendBody static lifetime fixed; tests then passed. No interruption in this lane after Cargo resumed.
+- Remaining: publish replacement PR, classify every hosted failure from runner_id/steps/annotation, confirm independent GitGuardian, freeze PR head/local gate evidence and standard --match-head-commit squash merge; close141 and verify main manifest + no deploy.
+- Exact next commands: git push -u origin build/ureq3-migration-20260907; gh pr create --base main --head build/ureq3-migration-20260907 --title '<Korean HTTP migration title>' --body-file /private/tmp/deppy-ureq3-pr-body.md; gh pr view <n> --json headRefOid,state,mergeable,statusCheckRollup; gh pr merge <n> --squash --match-head-commit <frozen SHA>. Parent has explicitly authorized merge.
+
+## ureq3 final workspace gate progress (2026-09-07)
+
+- Integrated source HEAD e34769d; migration files committed, checkpoint docs may remain modified. No app launch/rebase/force.
+- Actual executed results below; unlisted gates remain pending. Host jobs2 and serial tests.
+- fmt: exit0 (2.4s)
+- diff: exit0 (0.0s)
+- boundary: exit0 (4.4s)
+- deny: exit0 (1.5s)
+- audit: exit0 (1.8s)
+- tree: exit0 (0.3s)
+- clippy: exit0 (52.1s)
+- tests: exit0 (347.2s)
+- Evidence: /private/tmp/deppy-deps-evidence-20260907/ureq3
+- Remaining: failed/pending gates, validation checkpoint, replacement PR then close141.
+
+## App-focused and Linux GREEN (2026-09-07)
+
+- Latest-main app focused exit0 each: llm_proxy17 passed/2 ignored; local_llm10; status_feed25; codex_backend_usage3. Total55 passed/2 ignored. Logs /private/tmp/deppy-ureq3-app-*.log.
+- Exact committed e34769d source archive in rust:1.96 (1.96.1) Docker: strict Relay clippy,55 tests,release relay-server all exit0. /private/tmp/deppy-ureq3-linux.log. Existing cache volumes used only after docker ps confirmed no competing gate container.
+- No application packaging/launch. Remaining full workspace fmt/diff/boundary/deny/audit/clippy/tests, replacement PR and original141 closure.
+
+## Latest-main integration checkpoint (2026-09-07)
+
+- Implementation commit 4fac641; merged origin/main21172a8 using normal merge (no conflict/rebase/force). Integrated HEAD e34769d19ee6fda43ba2ed95b974332fffb6e7f9.
+- Both GUI and HTTP handoff entries retained. Diff vs latest main remains only intended HTTP native migration/spec/plan, Cargo.lock41-line minimal ureq3 change. Working tree clean before this checkpoint.
+- App LLM focused `cargo test -p deppy-sijo --bin deppy-sijo --locked llm_proxy -- --test-threads=1` compiling on jobs2/own target; /private/tmp/deppy-ureq3-app-llm.log. No app launch/packaging/release app rebuild.
+- Next: remaining app local_llm/status_feed/codex_backend_usage focused, full fmt/boundary/deny/audit/clippy/workspace tests, exact-source Linux Relay gates, post-review validation, PR/close141.
+
+## Static review complete / integration pending (2026-09-07)
+
+- Codex CLI static source review exit0: no actionable introduced correctness/security defects, C/H/M0. Native3 bodies, redirects, SensitiveBytes lifetime and idle/TLS design reviewed. No reviewer tests/builds executed. /private/tmp/deppy-ureq3-review-result.txt.
+- Review excluded known pending typed timeout item; that item separately completed actual RED→GREEN with 105 MCP tests. All focused completed: helper5/auth105/MCP105/web278, total493 passed and2 ignored.
+- Product migration ready for integration commit, but app-focused/full gates have NOT run yet. Next normal merge origin/main (21172a8 GUI), resolve handoff by preserving both lanes, run app HTTP focused and full local/Linux gates. No app launch/rebase/force.
+
+## Web Push GREEN (2026-09-07)
+
+- `cargo test -p web-remote --locked -- --test-threads=1` completed exit0: 278 passed, 2 ignored (270+3+5). New native HTTP410 status regression passes. Log /private/tmp/deppy-ureq3-push.log.
+- Static Codex source review still running read-only; no extra cargo from reviewer. Await result before source commit, then normal merge latest main and app/full gates.
+
+## Focused GREEN / formatter (2026-09-07)
+
+- Combined `cargo test -p http-client -p auth -p mcp --locked -- --test-threads=1` exit0: helper5/auth105/MCP105 = 215 passed, no ignored. Log /private/tmp/deppy-ureq3-focused.log.
+- Actual MCP RED→classifier GREEN verified; progressing SSE survives idle budget, silent SSE/body exits, OAuth400 remains parseable, existing redirects/session/caps/redaction/unknown-delivery regressions pass.
+- `cargo fmt --all` and `git diff --check` exit0. New native Push test/full web-remote suite currently compiling; log /private/tmp/deppy-ureq3-push.log.
+- Parent authorizes continuing latest-main merge, app/Push focused, review fixes and full gates; host Cargo concurrency max2 including Relay lane. This lane remains jobs2/one command at a time.
+
+## MCP typed timeout actual RED (2026-09-07)
+
+- Parent released Warp lane. MCP targeted compile now succeeded, then new typed timeout test FAILED as expected (0 passed/1 failed, exit101): /private/tmp/deppy-ureq3-mcp-red-2.log.
+- Implemented io_read_error recognition of inner ureq::Error::Timeout while preserving old TimedOut/WouldBlock. Running combined http-client/auth/mcp focused suite jobs2/serial: /private/tmp/deppy-ureq3-focused.log.
+- Static-only Codex source review started while waiting (explicit no cargo/build/test/app/edit/subagents), result pending /private/tmp/deppy-ureq3-review-result.txt.
+- origin/main fetched latest 21172a8 (#154). Must normal-merge before final workspace gates; do not rebase/force. Current product WIP based on c9bda393 with spec commit ef6c51b.
+
+## MCP compile checkpoint / host Cargo hold (2026-09-07)
+
+- MCP targeted command exited101 on four native API compile errors, not test RED: Config shadowing(name/bearer) and SendBody lifetime inferred static.
+- Fixed source by renaming agent_config and branching borrowed &[u8] / () Request construction through generic run_native_request. SensitiveBytes stays owned/zeroizing in sender closure; no body allocation or fabricated GET body.
+- Parent requested host Cargo hold while Warp focused tests run. Do not start another cargo until explicit release. Typed MCP timeout classifier still intentionally unfixed until actual RED.
+- Helper fifth delegation test and these compile fixes pending execution. A rustc PID1383 appeared idle briefly; sample failed because process had already progressed/exited, so no stall workaround applied.
+- Next after release: cargo test -p mcp --locked ureq_three_typed_timeout_retains_idle_error_classification -- --test-threads=1 with CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-deps-target-20260907; capture RED then fix classifier. Run helper/auth/mcp focused suites.
+
+## Idle RED/GREEN checkpoint — ureq3 (2026-09-07)
+
+- GUI released host Cargo lane. Executed helper baseline: exit101, progressing body PASS and silent body FAIL (expected missing idle enforcement); log /private/tmp/deppy-ureq3-idle-red.log.
+- Implemented DefaultConnector-chain IdleTransport preserving TLS/buffers/open state, per-I/O read/write idle caps, shorter deadline/reason. First compile hit ambiguous Into conversion; fixed explicit transport Duration::from.
+- Executed helper GREEN: 4 passed, exit0, /private/tmp/deppy-ureq3-idle-green.log. Added fifth deterministic delegation test afterwards, pending execution.
+- Cargo.lock updated minimally to exact ureq3.4 + ureq-proto/utf8-zero + shared helper, oauth2 adapter dependency removed.
+- Running native MCP typed-timeout regression RED; no timeout classifier fix yet. Source API migration may first expose compile errors.
+- Next: MCP RED/fix; focused auth/MCP/helper + app/Push; merge latest main normally before final gates; strict workspace/Linux gates + static Codex review + replacement PR/close141. No app launch/rebase/force.
+
+## Source/RED preparation checkpoint — ureq3 (2026-09-07)
+
+- Native3 API source migration is staged in working tree; no local cargo has executed because GUI lane still owns Rust gate.
+- Existing security contracts kept: OAuth agent max_redirects0/status-as-errorfalse; GET/POST dispatch uses Agent::run while preserving original headers and body semantics. DCR404/4xx/5xx explicitly classify response before bounded body parsing.
+- MCP request builders run inside existing bounded send governor with borrowed SensitiveBytes via AsSendBody. `global_timeout` argument only applies short global budget to DELETE, never SSE. Response status>=400 flows through existing classify_error_status and 3xx retains same-origin/unknown delivery checks.
+- Non-OAuth auto-redirect agents explicitly keep v2 limit5. Native3's default total header byte cap64KiB remains enabled (tighter than v2 per-header100KiB); native count128 remains bounded. Existing application body/header-value bounds remain.
+- Added pending regressions: auth OAuth400 body retention; MCP typed Timeout classification and slowly progressing SSE; Push native410; LLM 300-character Unicode excerpt. Existing test fixtures' Cell.set/MockTransport.set were restored after mechanical .set→.header accidentally touched them.
+- Crucial pending fix: ureq3 Error::Timeout.into_io yields ErrorKind::Other, so current MCP io_read_error fails new typed timeout test. Run RED first, then recognize get_ref().downcast_ref::<ureq::Error>() Timeout without losing old WouldBlock/TimedOut handling.
+- Crucial pending implementation: http-client baseline factory intentionally ignores idle. Run silent_body_exits_on_read_idle_timeout RED, then add IdleConnector/IdleTransport. Use ureq::unversioned::transport::{Connector,ConnectionDetails,DefaultConnector,Transport,Buffers,NextTimeout}; DefaultResolver in unversioned::resolver. Clamp duration via public time::Duration comparison, preserve reason for shorter incoming deadline, reason RecvBody/SendBody for own idle. Delegate is_tls/is_open/buffers. No new threads in production.
+- Parent source authority: explicitly assigned replacement work, existing #141 CI had34 API compile errors. Do not report locally executed RED/GREEN until actual cargo runs after GUI signal.
+- Next exact command after GUI signal: CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-deps-target-20260907 cargo test -p http-client -- --test-threads=1 > /private/tmp/deppy-ureq3-idle-red.log 2>&1 (allow Cargo.lock update once; subsequent --locked). Preserve result then implement wrapper. Run mcp typed timeout RED before its fix. Cargo fmt after source compiles; then focused/full gates per committed plan.
+
+## 진행 — PR141 ureq3 replacement (2026-09-07)
+
+- Current objective: c9bda3932d2475fdebdda216c78abae3dd22692b 기반 ureq3.4 replacement 이관, 오류 본문/SSE idle/security 계약 보존.
+- Worktree /private/tmp/deppy-ureq3-20260907; branch build/ureq3-migration-20260907. Spec/plan commit ef6c51b.
+- Completed source preparation (not yet compiled): ureq exact3.4.0/root http-client member, oauth2 unused adapter feature 제거; auth native response/body/header와 status-as-error(false) 수동 상태; MCP native http builder/Agent::run과 기존 bounded sender/SensitiveBytes lifetime 유지; 앱 fetch/LLM/Push native API.
+- New http-client crate currently contains a baseline default agent without idle enforcement plus loopback silent-body/progressing-body regressions. This is intentionally awaiting RED execution; do not claim idle transport implemented.
+- Tests: this migration has NO local cargo/check/test runs yet. Original #141 CI verified auth13/mcp21 API compile errors. GUI lane owns Rust execution; wait for parent's signal before any cargo command.
+- Modified files: Cargo.toml; crates/http-client/{Cargo.toml,src/lib.rs}; auth src lib/http/discovery/registration/slack; mcp Cargo.toml/src/http.rs; app Cargo.toml and src llm_proxy/local_llm/status_feed/codex_backend_usage; web-remote src/push.rs; this handoff. Cargo.lock not regenerated yet.
+- Design: new small shared idle transport after default TLS/proxy connector; per-I/O timeout min preserves shorter upstream deadline, TLS flag and buffers delegated. No new background readers/threads. Wrapper implementation follows actual RED.
+- Failed approaches: broad mechanical .set replacement initially touched test Cell/set fixtures; corrected before any build. No test pass claimed.
+- Remaining: after Rust signal generate lock; run http-client RED; implement wrapper and deterministic timeout/TLS delegation tests; compile/fix native3 migration; existing auth/MCP/LLM/Push contract suites; full strict/local gates; Codex static review; replacement PR then close #141. No force-push/rebase/app run.
+- Exact next commands (ONLY AFTER Rust signal): CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-deps-target-20260907 cargo test -p http-client -- --test-threads=1; save RED log, then implement wrapper; run cargo fmt; focused tests; full workspace gate.
+
 # Codex handoff
 
 ## GUI 0.36 통합 이관 — PR 준비 완료 (2026-09-07)

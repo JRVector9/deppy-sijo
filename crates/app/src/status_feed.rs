@@ -748,7 +748,11 @@ struct ProductionFeedFetcher {
 impl ProductionFeedFetcher {
     fn new() -> Self {
         Self {
-            agent: ureq::builder().timeout(HTTP_TIMEOUT).build(),
+            agent: ureq::Agent::config_builder()
+                .max_redirects(5)
+                .timeout_global(Some(HTTP_TIMEOUT))
+                .build()
+                .new_agent(),
             incidents_at: None,
             claude_incidents: Vec::new(),
             openai_incidents: Vec::new(),
@@ -970,8 +974,8 @@ fn fetch_incidents(agent: &ureq::Agent, base: &str) -> anyhow::Result<Vec<Incide
 fn fetch_hugging_face_models(agent: &ureq::Agent) -> anyhow::Result<Vec<IncidentNotice>> {
     let response = agent
         .get(HUGGING_FACE_MODELS_API)
-        .set("Accept", "application/json")
-        .set("User-Agent", "Deppy-Sijo/External-Updates")
+        .header("Accept", "application/json")
+        .header("User-Agent", "Deppy-Sijo/External-Updates")
         .call()?;
     let json = read_response_limited(response, NOTICE_RESPONSE_MAX_BYTES)?;
     parse_hugging_face_models(&json)
@@ -980,18 +984,21 @@ fn fetch_hugging_face_models(agent: &ureq::Agent) -> anyhow::Result<Vec<Incident
 fn fetch_grok_status(agent: &ureq::Agent) -> anyhow::Result<Vec<IncidentNotice>> {
     let response = agent
         .get(GROK_STATUS_RSS)
-        .set(
+        .header(
             "Accept",
             "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8",
         )
-        .set("User-Agent", "Deppy-Sijo/External-Updates")
+        .header("User-Agent", "Deppy-Sijo/External-Updates")
         .call()?;
     let json = read_response_limited(response, NOTICE_RESPONSE_MAX_BYTES)?;
     parse_grok_status_rss(&json)
 }
 
-fn read_response_limited(response: ureq::Response, max_bytes: usize) -> anyhow::Result<String> {
-    read_utf8_limited(response.into_reader(), max_bytes)
+fn read_response_limited(
+    response: ureq::http::Response<ureq::Body>,
+    max_bytes: usize,
+) -> anyhow::Result<String> {
+    read_utf8_limited(response.into_body().into_reader(), max_bytes)
 }
 
 fn read_utf8_limited(reader: impl Read, max_bytes: usize) -> anyhow::Result<String> {

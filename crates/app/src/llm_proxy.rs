@@ -198,21 +198,26 @@ fn stream_upstream(
     chat_request: &Value,
     machine: &mut ChatStreamState,
 ) -> anyhow::Result<()> {
-    let agent = ureq::builder()
-        .timeout_connect(CONNECT_TIMEOUT)
-        .timeout_read(UPSTREAM_READ_TIMEOUT)
+    let config = ureq::Agent::config_builder()
+        .max_redirects(5)
+        .timeout_connect(Some(CONNECT_TIMEOUT))
+        .http_status_as_error(false)
         .user_agent(PROXY_USER_AGENT)
         .build();
+    let agent = http_client::agent_with_idle_timeouts(config, UPSTREAM_READ_TIMEOUT, None);
     let mut request = agent
         .post(&format!("{}/chat/completions", state.upstream_base))
-        .set("Content-Type", "application/json");
+        .header("Content-Type", "application/json");
     if let Some(key) = &state.api_key {
-        request = request.set("Authorization", &format!("Bearer {}", key.expose()));
+        request = request.header("Authorization", &format!("Bearer {}", key.expose()));
     }
     let response = request
-        .send_string(&chat_request.to_string())
-        .map_err(describe_upstream_error)?;
-    let mut reader = BufReader::new(response.into_reader());
+        .send(&chat_request.to_string())
+        .map_err(|error| anyhow::anyhow!("upstream 연결 실패: {error}"))?;
+    if response.status().as_u16() >= 400 {
+        return Err(describe_upstream_error(response));
+    }
+    let mut reader = BufReader::new(response.into_body().into_reader());
     let mut line = String::new();
     loop {
         line.clear();
@@ -240,17 +245,19 @@ fn stream_upstream(
 
 /// GET /v1/models 패스스루 — codex가 목록 조회를 할 때 그대로 넘겨준다.
 fn handle_models(stream: &mut TcpStream, state: &ProxyState) -> anyhow::Result<()> {
-    let agent = ureq::builder()
-        .timeout(MODELS_TIMEOUT)
+    let agent = ureq::Agent::config_builder()
+        .max_redirects(5)
+        .timeout_global(Some(MODELS_TIMEOUT))
         .user_agent(PROXY_USER_AGENT)
-        .build();
+        .build()
+        .new_agent();
     let mut request = agent.get(&format!("{}/models", state.upstream_base));
     if let Some(key) = &state.api_key {
-        request = request.set("Authorization", &format!("Bearer {}", key.expose()));
+        request = request.header("Authorization", &format!("Bearer {}", key.expose()));
     }
     match request.call() {
-        Ok(response) => {
-            let body = response.into_string().unwrap_or_default();
+        Ok(mut response) => {
+            let body = response.body_mut().read_to_string().unwrap_or_default();
             write_json_response(stream, "200 OK", body.as_bytes())
         }
         Err(error) => {
@@ -261,15 +268,12 @@ fn handle_models(stream: &mut TcpStream, state: &ProxyState) -> anyhow::Result<(
 }
 
 /// upstream 오류를 짧은 메시지로 — 4xx/5xx는 본문 발췌 포함 (키는 포함되지 않음).
-fn describe_upstream_error(error: ureq::Error) -> anyhow::Error {
-    match error {
-        ureq::Error::Status(code, response) => {
-            let body = response.into_string().unwrap_or_default();
-            let excerpt: String = body.chars().take(300).collect();
-            anyhow::anyhow!("upstream HTTP {code}: {excerpt}")
-        }
-        other => anyhow::anyhow!("upstream 연결 실패: {other}"),
-    }
+fn describe_upstream_error(mut response: ureq::http::Response<ureq::Body>) -> anyhow::Error {
+    let code = response.status().as_u16();
+    // ureq's bounded string reader retains the previous 10 MiB response ceiling.
+    let body = response.body_mut().read_to_string().unwrap_or_default();
+    let excerpt: String = body.chars().take(300).collect();
+    anyhow::anyhow!("upstream HTTP {code}: {excerpt}")
 }
 
 fn write_empty_response(stream: &mut TcpStream, status: &str) -> anyhow::Result<()> {
@@ -647,6 +651,18 @@ fn usage_value(usage: Option<&Value>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_http_error_keeps_status_and_bounded_unicode_excerpt() {
+        let text = "가".repeat(350);
+        let response = ureq::http::Response::builder()
+            .status(429)
+            .body(ureq::Body::builder().data(text.into_bytes()))
+            .unwrap();
+        let error = describe_upstream_error(response).to_string();
+        assert!(error.starts_with("upstream HTTP 429: "));
+        assert_eq!(error.matches('가').count(), 300);
+    }
     use std::io::Read;
 
     // ------------------------------------------------------------------

@@ -9,8 +9,8 @@
 //! - 보안: https 필수(localhost/루프백만 http), ureq 자동 redirect 비활성 후
 //!   수동 최대 5회 — cross-origin이면 Authorization/Mcp-Session-Id 소거,
 //!   비-http(s) 스킴 fail-closed. Bearer 값은 Debug/에러 문자열에 비노출.
-//! - 타임아웃: ureq 2의 agent 전체 timeout은 SSE 스트리밍 바디를 중간 절단하는
-//!   함정이 있어 connect/read/write timeout만 설정한다. read timeout이 SSE idle
+//! - 타임아웃: agent 전체/body-total timeout은 SSE 스트리밍 바디를 중간 절단하므로
+//!   connect 제한과 shared transport의 read/write idle 제한만 설정한다. read idle이 SSE idle
 //!   timeout을 겸하고, 비스트리밍(JSON) 바디는 호출측 deadline으로 상한한다.
 //!   상태줄/헤더 수신까지는 전송을 오프로드 스레드로 분리해 벽시계 deadline을
 //!   강제한다 (`send_with_deadline` — H2 리뷰 P1).
@@ -270,17 +270,21 @@ impl HttpClient {
         request_timeout: Duration,
     ) -> anyhow::Result<(Self, Value, String)> {
         let url = parse_validated_url(&config.url)?;
-        // ureq 2 함정: agent 전체 timeout(.timeout)은 SSE 스트리밍 바디를 중간
-        // 절단한다 — connect/read/write timeout만 설정한다. read timeout이 SSE
+        // 전체/body-total timeout은 SSE 스트리밍 바디를 중간
+        // 절단한다 — connect 제한과 shared read/write idle만 설정한다. read idle이 SSE
         // idle timeout을 겸하고, 상태줄/헤더 수신과 JSON 바디의 벽시계 상한은
         // exchange의 deadline(send_with_deadline + read_body_capped)이 담당.
-        let agent = ureq::AgentBuilder::new()
-            .redirects(0) // 자동 redirect 금지 — 자격 헤더 소거를 보장하는 수동 처리(exchange_once)
-            .user_agent(&format!("deppy-sijo/{}", env!("CARGO_PKG_VERSION")))
-            .timeout_connect(request_timeout)
-            .timeout_read(request_timeout)
-            .timeout_write(request_timeout)
+        let agent_config = ureq::Agent::config_builder()
+            .max_redirects(0)
+            .http_status_as_error(false)
+            .user_agent(format!("deppy-sijo/{}", env!("CARGO_PKG_VERSION")))
+            .timeout_connect(Some(request_timeout))
             .build();
+        let agent = http_client::agent_with_idle_timeouts(
+            agent_config,
+            request_timeout,
+            Some(request_timeout),
+        );
         let mut client = Self {
             agent,
             url,
@@ -425,18 +429,18 @@ impl HttpClient {
     /// 보낸다 — cross-origin redirect credential 누출 방지 게이트를 호출측이 정한다.
     fn attach_common_headers(
         &self,
-        mut request: ureq::Request,
+        mut request: ureq::http::request::Builder,
         credentials: bool,
-    ) -> ureq::Request {
+    ) -> ureq::http::request::Builder {
         if let Some(version) = &self.negotiated_version {
-            request = request.set("MCP-Protocol-Version", version);
+            request = request.header("MCP-Protocol-Version", version);
         }
         if credentials {
             if let Some(bearer) = &self.bearer {
-                request = request.set("Authorization", &format!("Bearer {}", bearer.expose()));
+                request = request.header("Authorization", &format!("Bearer {}", bearer.expose()));
             }
             if let Some(session) = &self.session_id {
-                request = request.set("Mcp-Session-Id", session);
+                request = request.header("Mcp-Session-Id", session);
             }
         }
         request
@@ -457,12 +461,12 @@ impl HttpClient {
         let mut send_body = true;
         for _hop in 0..=MAX_REDIRECTS {
             let same_origin = current.origin() == self.url.origin();
-            let mut request = self
-                .agent
-                .request(http_method, current.as_str())
-                .set("Accept", "text/event-stream, application/json");
+            let mut request = ureq::http::Request::builder()
+                .method(http_method)
+                .uri(current.as_str())
+                .header("Accept", "text/event-stream, application/json");
             if send_body {
-                request = request.set("Content-Type", "application/json");
+                request = request.header("Content-Type", "application/json");
             }
             // cross-origin redirect 대상에는 자격 헤더를 보내지 않는다
             // (차용: extHostMcp.ts CROSS_ORIGIN_STRIPPED_HEADERS + Mcp-Session-Id).
@@ -472,14 +476,16 @@ impl HttpClient {
             // 블로킹되는데, timeout_read는 개별 read 단위(매 read마다 리셋)라
             // 느린 드립 서버에 벽시계 상한이 없다 — 오프로드로 deadline을 강제.
             let result = send_with_deadline(
+                self.agent.clone(),
                 request,
                 send_body.then(|| SensitiveBytes::copy_from_slice(body.as_slice())),
                 deadline,
                 method,
+                None,
             )?;
             let response = match result {
-                Ok(response) if (300..400).contains(&response.status()) => {
-                    let status = response.status();
+                Ok(response) if (300..400).contains(&response.status().as_u16()) => {
+                    let status = response.status().as_u16();
                     // A redirect arrives only after the original request was transmitted. For a
                     // mutating tools/call, following it would be an automatic second delivery;
                     // the first server may already have acted before redirecting. Fail Unknown
@@ -492,7 +498,9 @@ impl HttpClient {
                         )));
                     }
                     let location = response
-                        .header("location")
+                        .headers()
+                        .get("location")
+                        .and_then(|value| value.to_str().ok())
                         .with_context(|| format!("HTTP {status} redirect에 Location 헤더 없음"))?
                         .to_owned();
                     let next = current.join(&location).map_err(|error| {
@@ -511,34 +519,31 @@ impl HttpClient {
                     current = next;
                     continue;
                 }
+                Ok(response) if response.status().as_u16() >= 400 => {
+                    return Err(self.classify_error_status(
+                        response.status().as_u16(),
+                        response,
+                        session_attached,
+                        method,
+                    ));
+                }
                 Ok(response) => response,
-                Err(error) => match *error {
-                    ureq::Error::Status(status, response) => {
-                        return Err(self.classify_error_status(
-                            status,
-                            response,
-                            session_attached,
-                            method,
-                        ));
+                Err(error) => {
+                    if method == "tools/call" {
+                        drop(error);
+                        tracing::debug!(
+                            kind = "mcp_http",
+                            phase = "call_transport",
+                            error_code = "unknown_delivery"
+                        );
+                        return Err(ExchangeError::Other(anyhow::Error::new(
+                            McpDeliveryUnknown { status: None },
+                        )));
                     }
-                    error => {
-                        if method == "tools/call" {
-                            drop(error);
-                            tracing::debug!(
-                                kind = "mcp_http",
-                                phase = "call_transport",
-                                error_code = "unknown_delivery"
-                            );
-                            return Err(ExchangeError::Other(anyhow::Error::new(
-                                McpDeliveryUnknown { status: None },
-                            )));
-                        }
-                        return Err(ExchangeError::Other(
-                            anyhow::Error::new(error)
-                                .context(format!("MCP HTTP {method} 요청 실패")),
-                        ));
-                    }
-                },
+                    return Err(ExchangeError::Other(
+                        anyhow::Error::new(*error).context(format!("MCP HTTP {method} 요청 실패")),
+                    ));
+                }
             };
             let outcome = self.handle_success(response, expect_id, method, deadline);
             if method != "tools/call" {
@@ -570,7 +575,7 @@ impl HttpClient {
     fn classify_error_status(
         &self,
         status: u16,
-        response: ureq::Response,
+        response: ureq::http::Response<ureq::Body>,
         session_attached: bool,
         method: &str,
     ) -> ExchangeError {
@@ -581,7 +586,9 @@ impl HttpClient {
         // "승인 필요"로 분류하고 WWW-Authenticate 챌린지를 읽는다.
         if status == 401 || status == 403 {
             let www_authenticate = response
-                .header("www-authenticate")
+                .headers()
+                .get("www-authenticate")
+                .and_then(|value| value.to_str().ok())
                 .map(|value| self.mask_text(value));
             return ExchangeError::Other(
                 anyhow::Error::new(McpAuthRequired {
@@ -617,9 +624,13 @@ impl HttpClient {
     }
 
     /// 에러 바디 snippet — bearer 마스킹 + 길이 제한 후에만 에러 문자열에 싣는다.
-    fn read_error_snippet(&self, response: ureq::Response) -> String {
+    fn read_error_snippet(&self, response: ureq::http::Response<ureq::Body>) -> String {
         let mut text = String::new();
-        let _ = response.into_reader().take(2048).read_to_string(&mut text);
+        let _ = response
+            .into_body()
+            .into_reader()
+            .take(2048)
+            .read_to_string(&mut text);
         self.mask_snippet(&text)
     }
 
@@ -662,26 +673,39 @@ impl HttpClient {
     /// 그 외 content-type은 거부 (계획 §차용 안 함 #9 — 관대한 재파싱 미채택).
     fn handle_success(
         &mut self,
-        response: ureq::Response,
+        response: ureq::http::Response<ureq::Body>,
         expect_id: Option<u64>,
         method: &str,
         deadline: Instant,
     ) -> Result<Outcome, ExchangeError> {
         // 세션 캡처: initialize 응답이 주 경로 — 서버가 갱신해 주면 이후 반영.
-        if let Some(session) = response.header("mcp-session-id") {
+        if let Some(session) = response
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|value| value.to_str().ok())
+        {
             self.session_id = Some(session.to_owned());
         }
-        if response.status() == 202 {
+        if response.status().as_u16() == 202 {
             return Ok(Outcome::Accepted);
         }
         let Some(id) = expect_id else {
             // notification에 202가 아닌 2xx로 답하는 서버 편차 허용 — 바디는 버린다.
             return Ok(Outcome::Accepted);
         };
-        match response.content_type() {
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim();
+        match content_type {
             "application/json" => {
                 let body = read_body_capped(
-                    response.into_reader(),
+                    response.into_body().into_reader(),
                     MAX_JSON_BODY_BYTES,
                     deadline,
                     method,
@@ -720,11 +744,11 @@ impl HttpClient {
     /// id 있는 서버 request는 -32601 회신 (별도 POST, 베스트에포트).
     fn consume_sse(
         &mut self,
-        response: ureq::Response,
+        response: ureq::http::Response<ureq::Body>,
         expect_id: u64,
         method: &str,
     ) -> Result<Outcome, ExchangeError> {
-        let mut stream = SseStream::new(response.into_reader(), SseLimits::default());
+        let mut stream = SseStream::new(response.into_body().into_reader(), SseLimits::default());
         loop {
             let Some(event) = stream.next_event()? else {
                 return Err(anyhow::anyhow!("{method} 응답 전에 SSE 스트림이 종료됨").into());
@@ -778,19 +802,21 @@ impl HttpClient {
         let Ok(body) = SensitiveBytes::from_json(reply) else {
             return;
         };
-        let request = self
-            .agent
-            .post(self.url.as_str())
-            .set("Accept", "text/event-stream, application/json")
-            .set("Content-Type", "application/json");
+        let request = ureq::http::Request::builder()
+            .method("POST")
+            .uri(self.url.as_str())
+            .header("Accept", "text/event-stream, application/json")
+            .header("Content-Type", "application/json");
         // 항상 self.url 직행(redirect 없음) — same-origin이므로 자격 헤더 포함.
         let request = self.attach_common_headers(request, true);
         // 베스트에포트 회신도 같은 드립 방어(H2 리뷰 P1) — 헤더 대기에 벽시계 상한.
         let _ = send_with_deadline(
+            self.agent.clone(),
             request,
             Some(body),
             Instant::now() + self.request_timeout,
             "method-not-found 회신",
+            None,
         );
     }
 }
@@ -818,17 +844,18 @@ impl Drop for HttpClient {
         let Some(session) = self.session_id.take() else {
             return;
         };
-        let request = self
-            .agent
-            .delete(self.url.as_str())
-            .timeout(SESSION_DELETE_TIMEOUT)
-            .set("Mcp-Session-Id", &session);
+        let request = ureq::http::Request::builder()
+            .method("DELETE")
+            .uri(self.url.as_str())
+            .header("Mcp-Session-Id", &session);
         // 세션은 위에서 take()로 소진 — 헬퍼는 버전/Bearer만 마저 부착한다.
         let _ = send_with_deadline(
+            self.agent.clone(),
             self.attach_common_headers(request, true),
             None,
             Instant::now() + SESSION_DELETE_TIMEOUT,
             "session DELETE",
+            Some(SESSION_DELETE_TIMEOUT),
         );
     }
 }
@@ -867,25 +894,51 @@ fn run_with_progress<T>(
 /// 절단하는 함정이 있어 못 쓰므로(모듈 주석), 헤더 수신까지만 스레드로 분리해
 /// deadline을 강제하고 2xx 확인 후 바디(JSON/SSE)는 기존 경로에서 읽는다.
 ///
-/// ureq 2는 진행 중 요청을 강제 중단할 수 없다. deadline 뒤 sender는 caller와
+/// 동기 ureq 요청은 caller timeout으로 강제 중단할 수 없다. deadline 뒤 sender는 caller와
 /// 분리되지만 permit을 종료까지 소유하고, bounded handle reaper가 join한다.
 /// 따라서 UI 반환 latency와 background socket lifetime을 거짓으로 동일시하지
 /// 않으면서도 sender/socket 수는 `MAX_HTTP_SENDS`를 넘지 않는다.
 fn send_with_deadline(
-    request: ureq::Request,
+    agent: ureq::Agent,
+    request: ureq::http::request::Builder,
     body: Option<SensitiveBytes>,
     deadline: Instant,
     method: &str,
-) -> anyhow::Result<Result<ureq::Response, Box<ureq::Error>>> {
-    run_blocking_send(
-        http_send_governor(),
-        deadline,
-        method,
-        move || match &body {
-            Some(body) => request.send_bytes(body.as_slice()).map_err(Box::new),
-            None => request.call().map_err(Box::new),
-        },
-    )
+    global_timeout: Option<Duration>,
+) -> anyhow::Result<Result<ureq::http::Response<ureq::Body>, Box<ureq::Error>>> {
+    run_blocking_send(http_send_governor(), deadline, method, move || {
+        // Keep SensitiveBytes alive and zeroizing through the synchronous send.
+        // Branch before constructing Request: a no-body GET must not acquire a
+        // synthetic Content-Length or require a 'static borrowed SendBody.
+        match body.as_ref() {
+            Some(body) => run_native_request(
+                &agent,
+                request.body(body.as_slice()).map_err(ureq::Error::from)?,
+                global_timeout,
+            ),
+            None => run_native_request(
+                &agent,
+                request.body(()).map_err(ureq::Error::from)?,
+                global_timeout,
+            ),
+        }
+    })
+}
+
+fn run_native_request<S: ureq::AsSendBody>(
+    agent: &ureq::Agent,
+    request: ureq::http::Request<S>,
+    global_timeout: Option<Duration>,
+) -> Result<ureq::http::Response<ureq::Body>, Box<ureq::Error>> {
+    let request = if let Some(timeout) = global_timeout {
+        agent
+            .configure_request(request)
+            .timeout_global(Some(timeout))
+            .build()
+    } else {
+        request
+    };
+    agent.run(request).map_err(Box::new)
 }
 
 struct HttpSendState {
@@ -1074,10 +1127,16 @@ fn read_body_capped(
 
 /// 소켓 read timeout(idle)과 그 외 IO 오류를 구분해 에러 메시지를 만든다.
 fn io_read_error(error: std::io::Error, method: &str) -> anyhow::Error {
+    // ureq 3 wraps its typed timeout in ErrorKind::Other when exposing a Read.
+    let typed_timeout = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<ureq::Error>())
+        .is_some_and(|inner| matches!(inner, ureq::Error::Timeout(_)));
     if matches!(
         error.kind(),
         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-    ) {
+    ) || typed_timeout
+    {
         anyhow::anyhow!("{method} 응답 수신 idle timeout ({error})")
     } else {
         anyhow::Error::new(error).context(format!("{method} 응답 수신 실패"))
@@ -2655,6 +2714,44 @@ mod tests {
     }
 
     #[test]
+    fn ureq_three_typed_timeout_retains_idle_error_classification() {
+        let error = ureq::Error::Timeout(ureq::Timeout::RecvBody).into_io();
+        let message = io_read_error(error, "tools/list").to_string();
+        assert!(message.contains("idle timeout"), "{message}");
+    }
+
+    #[test]
+    fn progressing_sse_outlives_the_request_idle_budget() {
+        let server = spawn_mock(|index, request| match index {
+            0 => json_reply(request, init_result(), None),
+            1 => accepted(),
+            2 => {
+                let payload = json!({"jsonrpc": "2.0", "id": request.body_json()["id"], "result": tools_result()});
+                Reply::RawThenDrip {
+                    immediate: http_response_streaming(
+                        200,
+                        &[("Content-Type", "text/event-stream")],
+                        b"",
+                    ),
+                    drip: format!("data: {payload}\n\n").into_bytes(),
+                    interval: Duration::from_millis(5),
+                }
+            }
+            _ => not_found(),
+        });
+        let manager = LocalMcpManager::new(RedactionService::new())
+            .with_request_timeout(Duration::from_millis(200));
+        let mut connection = manager.connect_http(&http_config(&server, None)).unwrap();
+        let started = Instant::now();
+        let result = connection.list_tools();
+        assert!(
+            result.is_ok(),
+            "SSE progress must not hit a total body deadline: {result:?}"
+        );
+        assert!(started.elapsed() > Duration::from_millis(200));
+    }
+
+    #[test]
     fn 헤더_드립은_deadline에서_탈출() {
         // H2 리뷰 P1 재현: 상태줄/헤더를 timeout_read보다 짧은 간격으로 1바이트씩
         // 흘리면 개별 read가 매번 "진행"으로 간주돼 벽시계 상한이 없었다
@@ -2751,7 +2848,7 @@ mod tests {
         let raw_name = "private-server-name-42";
         let session_id = "private-session-id-42";
         let mut client = HttpClient {
-            agent: ureq::AgentBuilder::new().build(),
+            agent: ureq::Agent::new_with_defaults(),
             url: Url::parse(raw_url).unwrap(),
             server_name: raw_name.to_owned(),
             bearer: None,

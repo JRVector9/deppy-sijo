@@ -326,7 +326,12 @@ struct UreqTransport {
 impl UreqTransport {
     fn new() -> Self {
         Self {
-            agent: ureq::AgentBuilder::new().timeout(HTTP_TIMEOUT).build(),
+            agent: ureq::Agent::config_builder()
+                .max_redirects(5)
+                .timeout_global(Some(HTTP_TIMEOUT))
+                .http_status_as_error(false)
+                .build()
+                .new_agent(),
         }
     }
 }
@@ -343,19 +348,15 @@ impl PushTransport for UreqTransport {
         let result = self
             .agent
             .post(endpoint)
-            .set("TTL", &ttl.to_string())
-            .set("Urgency", urgency)
-            .set("Authorization", authorization)
-            .set("Content-Encoding", "aes128gcm")
-            .set("Content-Type", "application/octet-stream")
-            .send_bytes(body);
-        match result {
-            Ok(resp) => Ok(resp.status()),
-            // ureq는 4xx/5xx를 Err(Status)로 준다 — 상태코드는 정상 수신이므로 Ok로 되돌린다.
-            Err(ureq::Error::Status(code, _)) => Ok(code),
-            // 네트워크/전송 실패 — 재시도 대상.
-            Err(ureq::Error::Transport(_)) => Err(TransportError),
-        }
+            .header("TTL", &ttl.to_string())
+            .header("Urgency", urgency)
+            .header("Authorization", authorization)
+            .header("Content-Encoding", "aes128gcm")
+            .header("Content-Type", "application/octet-stream")
+            .send(body);
+        result
+            .map(|response| response.status().as_u16())
+            .map_err(|_| TransportError)
     }
 }
 
@@ -1315,6 +1316,32 @@ fn random_p256_scalar() -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_http_transport_preserves_gone_response_status() {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/push", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+                assert!(request.len() < 4096);
+            }
+            stream
+                .write_all(b"HTTP/1.1 410 Gone\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+        });
+        let result = UreqTransport::new().post(&endpoint, 1, "normal", "test-authorization", b"");
+        server.join().unwrap();
+        assert_eq!(result.unwrap(), 410);
+    }
     use std::path::PathBuf;
     use std::sync::{Condvar as StdCondvar, Mutex as StdMutex};
 

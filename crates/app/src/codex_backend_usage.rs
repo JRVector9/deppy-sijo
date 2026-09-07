@@ -92,21 +92,24 @@ fn fetch_backend_usage() -> Option<BackendUsage> {
     let access_token = tokens.get("access_token")?.as_str()?;
 
     // Codex CLI 자신이 보내는 헤더 구성을 그대로 쓴다 (orca도 동일).
-    let mut request = ureq::builder()
-        .timeout(HTTP_TIMEOUT)
+    let mut request = ureq::Agent::config_builder()
+        .max_redirects(5)
+        .timeout_global(Some(HTTP_TIMEOUT))
         .build()
+        .new_agent()
         .get("https://chatgpt.com/backend-api/wham/usage")
-        .set("Authorization", &format!("Bearer {access_token}"))
-        .set("User-Agent", "codex-cli")
-        .set("OpenAI-Beta", "codex-1")
-        .set("originator", "Codex Desktop");
+        .header("Authorization", &format!("Bearer {access_token}"))
+        .header("User-Agent", "codex-cli")
+        .header("OpenAI-Beta", "codex-1")
+        .header("originator", "Codex Desktop");
     if let Some(account_id) = tokens.get("account_id").and_then(serde_json::Value::as_str) {
-        request = request.set("ChatGPT-Account-Id", account_id);
+        request = request.header("ChatGPT-Account-Id", account_id);
     }
 
     let response = request.call().ok()?;
     let mut body = String::new();
     response
+        .into_body()
         .into_reader()
         .take(MAX_RESPONSE_BYTES)
         .read_to_string(&mut body)

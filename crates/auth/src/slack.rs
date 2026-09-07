@@ -136,18 +136,19 @@ pub fn resolve_slack_workspace_cancellable(
         return Err(SlackWorkspaceError::Cancelled);
     }
     let url = format!("https://{domain}/");
-    let http = ureq::AgentBuilder::new()
-        .timeout_connect(timeout)
-        .timeout(timeout)
-        .redirects(0)
-        .build();
+    let http = ureq::Agent::config_builder()
+        .timeout_connect(Some(timeout))
+        .timeout_global(Some(timeout))
+        .max_redirects(0)
+        .build()
+        .new_agent();
     let response = http
         .get(&url)
-        .set("Accept", "text/html")
-        .set("User-Agent", "Deppy-Sijo/Slack-Workspace-Resolver")
+        .header("Accept", "text/html")
+        .header("User-Agent", "Deppy-Sijo/Slack-Workspace-Resolver")
         .call()
         .map_err(|_| SlackWorkspaceError::RequestFailed)?;
-    if response.status() != 200 {
+    if response.status().as_u16() != 200 {
         return Err(SlackWorkspaceError::InvalidResponse);
     }
     if cancelled() {
@@ -158,6 +159,7 @@ pub fn resolve_slack_workspace_cancellable(
         .ok_or(SlackWorkspaceError::ResponseLimitExceeded)?;
     let mut html = Vec::new();
     response
+        .into_body()
         .into_reader()
         .take(probe as u64)
         .read_to_end(&mut html)

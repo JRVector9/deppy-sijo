@@ -279,22 +279,30 @@ fn fetch_discovery_json(
     headers: Option<&DiscoveryHeaders>,
 ) -> anyhow::Result<serde_json::Value> {
     let parsed = validate_https_or_loopback(url)?;
-    let mut request = http.get(url).set("Accept", "application/json");
+    let mut request = http.get(url).header("Accept", "application/json");
     if let Some(policy) = headers {
         for (name, value) in policy.for_target(&parsed) {
-            request = request.set(name, value);
+            request = request.header(name, value);
         }
     }
-    let response = request.call().map_err(|e| match e {
-        ureq::Error::Status(code, _) => anyhow::anyhow!("HTTP {code}"),
-        other => anyhow::anyhow!("요청 실패: {other}"),
-    })?;
-    // redirects(0)이라 3xx는 Err이 아니라 여기로 그대로 온다 (ureq는 4xx+만 Err) —
+    let response = request
+        .call()
+        .map_err(|error| anyhow::anyhow!("요청 실패: {error}"))?;
+    anyhow::ensure!(
+        response.status().as_u16() < 400,
+        "HTTP {}",
+        response.status().as_u16()
+    );
+    // 자동 redirect를 끄고 status를 응답으로 보존하므로 3xx는 여기서 거부한다 —
     // 따라가지 않고 명확히 거부한다. redirect 추적은 https→http 다운그레이드·SSRF·
     // 헤더 누출 경로다 (CWE-918, oauth_http_agent 참조). 정상 well-known은 직접 응답한다.
-    let status = response.status();
+    let status = response.status().as_u16();
     if (300..400).contains(&status) {
-        let location = response.header("Location").unwrap_or("<없음>");
+        let location = response
+            .headers()
+            .get("Location")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("<없음>");
         bail!(
             "redirect 거부 (HTTP {status} → {location}) — OAuth 발견 요청은 redirect를 따라가지 않습니다"
         );
@@ -302,6 +310,7 @@ fn fetch_discovery_json(
     let probe = OAUTH_DISCOVERY_RESPONSE_MAX_BYTES + 1;
     let mut body = Vec::new();
     response
+        .into_body()
         .into_reader()
         .take(probe as u64)
         .read_to_end(&mut body)

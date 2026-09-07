@@ -42,7 +42,11 @@ pub fn spawn_detect(
     let spawned = std::thread::Builder::new()
         .name("local-llm-detect".into())
         .spawn(move || {
-            let agent = ureq::builder().timeout(HTTP_TIMEOUT).build();
+            let agent = ureq::Agent::config_builder()
+                .max_redirects(5)
+                .timeout_global(Some(HTTP_TIMEOUT))
+                .build()
+                .new_agent();
             let snapshot = LocalLlmSnapshot {
                 ollama: fetch_ollama_models(&agent, &ollama_base),
                 custom: custom.as_ref().and_then(|(base, api_key)| {
@@ -67,7 +71,7 @@ fn fetch_ollama_models(agent: &ureq::Agent, base: &str) -> Option<Vec<String>> {
         .call()
         .map_err(|_| tracing::debug!("local_llm_ollama_request_failed"))
         .ok()?;
-    let json = read_bounded_utf8(response.into_reader(), MAX_HTTP_BODY_BYTES)
+    let json = read_bounded_utf8(response.into_body().into_reader(), MAX_HTTP_BODY_BYTES)
         .map_err(|_| tracing::debug!("local_llm_ollama_response_rejected"))
         .ok()?;
     parse_ollama_tags(&json)
@@ -84,13 +88,13 @@ fn fetch_openai_models(
     let url = format!("{}/v1/models", base.trim_end_matches('/'));
     let mut request = agent.get(&url);
     if let Some(key) = api_key {
-        request = request.set("Authorization", &format!("Bearer {key}"));
+        request = request.header("Authorization", &format!("Bearer {key}"));
     }
     let response = request
         .call()
         .map_err(|_| tracing::debug!("local_llm_openai_request_failed"))
         .ok()?;
-    let json = read_bounded_utf8(response.into_reader(), MAX_HTTP_BODY_BYTES)
+    let json = read_bounded_utf8(response.into_body().into_reader(), MAX_HTTP_BODY_BYTES)
         .map_err(|_| tracing::debug!("local_llm_openai_response_rejected"))
         .ok()?;
     parse_openai_models(&json)

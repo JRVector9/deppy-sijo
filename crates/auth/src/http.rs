@@ -68,32 +68,26 @@ impl SyncHttpClient for BoundedOAuthHttpClient {
         #[cfg(test)]
         HTTP_CALL_COUNT.with(|count| count.set(count.get().saturating_add(1)));
 
-        let mut outgoing = match request.method().as_str() {
-            "POST" => self.agent.post(&request.uri().to_string()),
-            "GET" => self.agent.get(&request.uri().to_string()),
-            _ => return Err(BoundedOAuthHttpError::InvalidRequest),
-        };
-        for (name, value) in request.headers() {
-            let value = value
+        for value in request.headers().values() {
+            value
                 .to_str()
                 .map_err(|_| BoundedOAuthHttpError::InvalidRequest)?;
-            outgoing = outgoing.set(name.as_str(), value);
         }
-
-        let received = match request.method().as_str() {
-            "POST" => outgoing.send_bytes(request.body()),
-            "GET" => outgoing.call(),
-            _ => unreachable!("method validated above"),
-        };
-        // Preserve OAuth error status responses for oauth2's typed error parser. Transport errors
-        // are deliberately collapsed so URL/request bodies cannot leak through Error formatting.
-        let response = match received {
-            Ok(response) | Err(ureq::Error::Status(_, response)) => response,
-            Err(_) => return Err(BoundedOAuthHttpError::RequestFailed),
-        };
-        let status = response.status();
-        let content_type = response.header("Content-Type").map(str::to_owned);
-        let body = read_bounded(response.into_reader())?;
+        // Status responses remain available to oauth2's typed error parser. The agent
+        // disables redirects/status-as-error, and transport errors stay secret-free.
+        let response = match request.method().as_str() {
+            "POST" => self.agent.run(request),
+            "GET" => self.agent.run(request.map(|_| ())),
+            _ => return Err(BoundedOAuthHttpError::InvalidRequest),
+        }
+        .map_err(|_| BoundedOAuthHttpError::RequestFailed)?;
+        let status = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get("Content-Type")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let body = read_bounded(response.into_body().into_reader())?;
 
         let mut builder = oauth2::http::Response::builder().status(status);
         if let Some(content_type) = content_type {
@@ -106,9 +100,9 @@ impl SyncHttpClient for BoundedOAuthHttpClient {
 }
 
 pub(crate) fn read_ureq_body_bounded(
-    response: ureq::Response,
+    response: ureq::http::Response<ureq::Body>,
 ) -> Result<Vec<u8>, BoundedOAuthHttpError> {
-    read_bounded(response.into_reader())
+    read_bounded(response.into_body().into_reader())
 }
 
 fn read_bounded(reader: impl std::io::Read) -> Result<Vec<u8>, BoundedOAuthHttpError> {
@@ -129,6 +123,35 @@ fn read_bounded(reader: impl std::io::Read) -> Result<Vec<u8>, BoundedOAuthHttpE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oauth_http_keeps_error_status_and_body_for_typed_parser() {
+        use std::io::Write as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/token", listener.local_addr().unwrap());
+        let body = br#"{"error":"invalid_grant"}"#;
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+                assert!(request.len() < 4096);
+            }
+            write!(stream, "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+            stream.write_all(body).unwrap();
+        });
+        let client = BoundedOAuthHttpClient::new(Duration::from_secs(2));
+        let result = client.call(oauth2::http::Request::get(url).body(Vec::new()).unwrap());
+        server.join().unwrap();
+        let response = result.unwrap();
+        assert_eq!(response.status().as_u16(), 400);
+        assert_eq!(response.body(), body);
+    }
 
     #[test]
     fn response_body_accepts_exact_limit_and_rejects_plus_one() {

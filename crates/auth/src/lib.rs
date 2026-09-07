@@ -110,18 +110,20 @@ pub fn validate_https_or_loopback(url: &str) -> anyhow::Result<oauth2::url::Url>
 /// 자동 redirect를 금지한다 — 따라가면 https→http 다운그레이드, 내부망/클라우드
 /// 메타데이터 SSRF(CWE-918), cross-origin으로의 커스텀 헤더 누출이 가능하다.
 /// crates/mcp http.rs(H2)와 같은 정책이되, well-known/token은 직접 응답이 정상이라
-/// 수동 추적 없이 명확한 에러로 끝낸다. ureq 2는 3xx를 Ok로 돌려주므로
-/// (Err은 4xx+만) 각 호출부가 상태를 보고 거부한다.
+/// 수동 추적 없이 명확한 에러로 끝낸다. HTTP status를 응답으로 보존하여
+/// 각 호출부가 redirect와 OAuth 오류 본문을 명시적으로 분류한다.
 /// discovery/registration/refresh는 timeout만 받아 내부에서 이 Agent를 만든다 —
 /// 호출측이 redirect 허용 Agent를 주입할 수 없다.
 pub fn oauth_http_agent(timeout: Duration) -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .redirects(0)
+    ureq::Agent::config_builder()
+        .max_redirects(0)
+        .http_status_as_error(false)
         // 응답 없는 endpoint에 flow가 매달리지 않게 연결·전체 시간 상한
         // (OAuth 응답은 소형 JSON — SSE 스트리밍이 없어 전체 timeout이 안전하다)
-        .timeout_connect(timeout)
-        .timeout(timeout)
+        .timeout_connect(Some(timeout))
+        .timeout_global(Some(timeout))
         .build()
+        .new_agent()
 }
 
 /// refresh token이 저장되는 keyring entry id (access와 분리).

@@ -113,31 +113,32 @@ pub fn register_client(
     let http = oauth_http_agent(timeout);
     let response = http
         .post(endpoint)
-        .set("Content-Type", "application/json")
-        .set("Accept", "application/json")
-        .send_string(&body.to_string());
-    let response = match response {
-        Ok(response) => response,
-        Err(ureq::Error::Status(404, _)) => {
-            return Err(RegistrationError::Unsupported(
-                "registration endpoint unavailable".to_owned(),
-            ));
-        }
-        Err(ureq::Error::Status(code, response)) if (400..500).contains(&code) => {
-            return Err(RegistrationError::Rejected(rejection_reason(
-                code, response,
-            )));
-        }
-        Err(_) => {
-            return Err(RegistrationError::Other(anyhow::anyhow!(
-                "OAuth registration request failed"
-            )));
-        }
-    };
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .send(&body.to_string());
+    let response = response.map_err(|_| {
+        RegistrationError::Other(anyhow::anyhow!("OAuth registration request failed"))
+    })?;
+    let code = response.status().as_u16();
+    if code == 404 {
+        return Err(RegistrationError::Unsupported(
+            "registration endpoint unavailable".to_owned(),
+        ));
+    }
+    if (400..500).contains(&code) {
+        return Err(RegistrationError::Rejected(rejection_reason(
+            code, response,
+        )));
+    }
+    if code >= 500 {
+        return Err(RegistrationError::Other(anyhow::anyhow!(
+            "OAuth registration request failed"
+        )));
+    }
 
-    // redirects(0)이라 3xx는 Err이 아니라 Ok로 온다 (ureq는 4xx+만 Err) —
+    // 자동 redirect를 끄고 status를 응답으로 보존하므로 3xx는 여기서 거부한다 —
     // 따라가지 않고 거부한다 (CWE-918 SSRF·헤더 누출 방지, oauth_http_agent 참조)
-    let status = response.status();
+    let status = response.status().as_u16();
     if (300..400).contains(&status) {
         return Err(RegistrationError::Other(anyhow::anyhow!(
             "redirect 거부 (HTTP {status}) — 등록 요청은 redirect를 따라가지 않습니다"
@@ -158,7 +159,7 @@ pub fn register_client(
 }
 
 /// RFC 7591 §3.2.2 에러 응답에서 사유 추출 — 형식이 아니면 상태코드 + 본문 앞부분.
-fn rejection_reason(code: u16, response: ureq::Response) -> String {
+fn rejection_reason(code: u16, response: ureq::http::Response<ureq::Body>) -> String {
     #[derive(serde::Deserialize)]
     struct ErrorBody {
         error: String,

@@ -49,7 +49,8 @@ pub(crate) const PROTO_MAGIC: [u8; 4] = *b"DPRT";
 /// 새 variant를 이해하지 못하는 피어는 handshake에서 명확하게 거부한다.
 /// **v14**: 실제 resize token/owner epoch/적용 stamp 및 tracked viewport를 끝에 append.
 /// 구버전에는 실제 적용 보장을 흉내 내지 않고 기존 exact-version handshake로 거부한다.
-pub(crate) const PROTO_VERSION: u16 = 14;
+/// v15: 워크스페이스 API 환경 연결을 기본 env 명령에 함께 전달한다.
+pub(crate) const PROTO_VERSION: u16 = 15;
 
 /// delta viewport 스트리밍 기능 비트 (§3.1).
 pub(crate) const FEAT_DELTA_VIEWPORT: u32 = 1 << 0;
@@ -492,6 +493,6 @@ mod tests {
         assert!(command_source.contains("SetScrollbackLimit"));
         assert!(event_source.contains("ScrollbackLimitApplied"));
         assert!(protocol_source.contains("**v13**"));
-        assert_eq!(PROTO_VERSION, 14);
+        assert_eq!(PROTO_VERSION, 15);
     }
 }

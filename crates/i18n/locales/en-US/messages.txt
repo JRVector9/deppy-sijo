@@ -1201,3 +1201,9 @@ settings.relay.time.expired = expired
 env.source_missing = The source environment files are missing. The values below are retained copies and will not be passed to new sessions.
 env.delete_all_sources = Delete from all files
 env.source_read_failed = The environment files could not be read. The retained values below may differ from the source files.
+credentials.env_bindings = Agent environment bindings
+credentials.env_binding_hint = Save an environment variable name to pass this key to new shells and agents. Save an empty name to disconnect. Shell live reload is disabled for projects with API bindings. Changes apply to new runs.
+credentials.env_name = Environment variable name (optional)
+credentials.env_overrides_dotenv = This API binding overrides the environment file value with the same name.
+
+env.source_api_only = Environment files could not be read. Only linked APIs are passed to new runs; file synchronization will retry.

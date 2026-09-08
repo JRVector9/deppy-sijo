@@ -23,6 +23,8 @@ pub struct CredentialListItem {
     label: Arc<str>,
     credential_kind: Arc<str>,
     masked_hint: Option<Arc<str>>,
+    env_name: Option<Arc<str>>,
+    overrides_dotenv: bool,
 }
 
 impl CredentialListItem {
@@ -39,7 +41,15 @@ impl CredentialListItem {
             label: label.into(),
             credential_kind: credential_kind.into(),
             masked_hint: masked_hint.map(Into::into),
+            env_name: None,
+            overrides_dotenv: false,
         }
+    }
+
+    pub fn with_env_binding(mut self, name: Option<String>, overrides_dotenv: bool) -> Self {
+        self.env_name = name.map(Arc::from);
+        self.overrides_dotenv = overrides_dotenv;
+        self
     }
 
     pub fn id(&self) -> &str {
@@ -64,6 +74,7 @@ impl CredentialListItem {
             + self.label.len()
             + self.credential_kind.len()
             + self.masked_hint.as_ref().map_or(0, |hint| hint.len())
+            + self.env_name.as_ref().map_or(0, |name| name.len())
     }
 }
 
@@ -173,6 +184,7 @@ impl Drop for SensitiveInput {
 }
 
 pub struct NewCredential {
+    env_name: String,
     provider: String,
     label: String,
     credential_kind: String,
@@ -180,8 +192,15 @@ pub struct NewCredential {
 }
 
 impl NewCredential {
-    pub fn into_parts(self) -> (String, String, String, SensitiveInput) {
-        (self.provider, self.label, self.credential_kind, self.secret)
+    pub fn into_parts(self) -> (String, String, String, SensitiveInput, Option<String>) {
+        let env_name = (!self.env_name.trim().is_empty()).then(|| self.env_name.trim().to_owned());
+        (
+            self.provider,
+            self.label,
+            self.credential_kind,
+            self.secret,
+            env_name,
+        )
     }
 }
 
@@ -246,6 +265,11 @@ impl std::error::Error for CredentialSensitiveError {}
 
 /// One render emits at most one intent. Secret variants deliberately have no Clone/Serialize.
 pub enum CredentialsIntent {
+    SetEnvBinding {
+        revision: u64,
+        credential_id: String,
+        env_name: Option<String>,
+    },
     Add {
         revision: u64,
         credential: NewCredential,
@@ -269,6 +293,7 @@ pub enum CredentialsIntent {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialsUiErrorCode {
+    BindingFailed,
     SnapshotUnavailable,
     DraftLimitExceeded,
     AddFailed,
@@ -282,6 +307,9 @@ pub enum CredentialsUiErrorCode {
 impl CredentialsUiErrorCode {
     const fn message(self) -> &'static str {
         match self {
+            Self::BindingFailed => {
+                "환경 연결을 저장하지 못했습니다. 환경변수 이름의 형식과 중복을 확인하세요."
+            }
             Self::SnapshotUnavailable => "Credential 목록을 불러오지 못했습니다.",
             Self::DraftLimitExceeded => "입력 크기 상한을 초과했습니다.",
             Self::AddFailed => "Credential 저장에 실패했습니다.",
@@ -301,6 +329,9 @@ enum OrphanStatus {
 
 /// Credential settings draft and bounded reveal state. All external work belongs to App.
 pub struct CredentialsUi {
+    env_name: String,
+    binding_drafts: HashMap<String, String>,
+    binding_pending: bool,
     provider: String,
     label: String,
     kind: &'static str,
@@ -324,6 +355,9 @@ pub struct CredentialsUi {
 impl CredentialsUi {
     pub fn new() -> Self {
         Self {
+            env_name: String::new(),
+            binding_drafts: HashMap::new(),
+            binding_pending: false,
             provider: String::new(),
             label: String::new(),
             kind: "api_key",
@@ -356,7 +390,16 @@ impl CredentialsUi {
         self.revealed_bytes = 0;
     }
 
+    pub fn binding_succeeded(&mut self) {
+        self.binding_pending = false;
+        self.binding_drafts.clear();
+        if self.error == Some(CredentialsUiErrorCode::BindingFailed) {
+            self.error = None;
+        }
+    }
+
     pub fn add_succeeded(&mut self) {
+        self.env_name.clear();
         self.provider.clear();
         self.label.clear();
         self.add_pending = false;
@@ -371,6 +414,7 @@ impl CredentialsUi {
 
     pub fn report_error(&mut self, code: CredentialsUiErrorCode) {
         match code {
+            CredentialsUiErrorCode::BindingFailed => self.binding_pending = false,
             CredentialsUiErrorCode::AddFailed => self.add_pending = false,
             CredentialsUiErrorCode::DeleteFailed => self.delete_pending.clear(),
             CredentialsUiErrorCode::OrphanScanFailed => self.orphan_scan_pending = false,
@@ -497,6 +541,7 @@ impl CredentialsUi {
         if self.show_add_form {
             self.render_add_form(ui, snapshot, catalog, &mut intent);
         }
+        self.render_env_bindings(ui, snapshot, catalog, &mut intent);
         self.render_orphan_controls(ui, snapshot, catalog, &mut intent);
         if let Some(error) = self.error {
             ui.colored_label(ui.visuals().error_fg_color, error.message());
@@ -512,6 +557,8 @@ impl CredentialsUi {
             return;
         }
         self.snapshot_revision = Some(snapshot.revision());
+        self.binding_drafts.clear();
+        self.binding_pending = false;
         let live = snapshot
             .items()
             .iter()
@@ -633,6 +680,61 @@ impl CredentialsUi {
         }
     }
 
+    fn render_env_bindings(
+        &mut self,
+        ui: &mut egui::Ui,
+        snapshot: &CredentialsSnapshot,
+        catalog: &i18n::Catalog,
+        intent: &mut Option<CredentialsIntent>,
+    ) {
+        if snapshot.items().is_empty() {
+            return;
+        }
+        ui.collapsing(catalog.t("credentials.env_bindings", &[]), |ui| {
+            ui.label(catalog.t("credentials.env_binding_hint", &[]));
+            for item in snapshot.items() {
+                ui.push_id(item.id(), |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(format!("{} · {}", item.provider(), item.label()));
+                        let draft = self
+                            .binding_drafts
+                            .entry(item.id().to_owned())
+                            .or_insert_with(|| {
+                                item.env_name.as_deref().unwrap_or_default().to_owned()
+                            });
+                        ui.add_enabled(
+                            !self.binding_pending,
+                            egui::TextEdit::singleline(draft)
+                                .hint_text(catalog.t("credentials.env_name", &[]))
+                                .desired_width(200.0),
+                        );
+                        truncate_utf8(draft, 256);
+                        let valid = draft.trim().is_empty()
+                            || storage::Db::validate_credential_env_name(draft.trim()).is_ok();
+                        if ui
+                            .add_enabled(
+                                valid && !self.binding_pending && intent.is_none(),
+                                egui::Button::new(catalog.t("action.save", &[])),
+                            )
+                            .clicked()
+                        {
+                            *intent = Some(CredentialsIntent::SetEnvBinding {
+                                revision: snapshot.revision(),
+                                credential_id: item.id().to_owned(),
+                                env_name: (!draft.trim().is_empty())
+                                    .then(|| draft.trim().to_owned()),
+                            });
+                            self.binding_pending = true;
+                        }
+                    });
+                    if item.overrides_dotenv {
+                        ui.label(catalog.t("credentials.env_overrides_dotenv", &[]));
+                    }
+                });
+            }
+        });
+    }
+
     fn render_add_form(
         &mut self,
         ui: &mut egui::Ui,
@@ -656,6 +758,12 @@ impl CredentialsUi {
             for kind in ["api_key", "token"] {
                 ui.selectable_value(&mut self.kind, kind, kind);
             }
+            ui.add(
+                egui::TextEdit::singleline(&mut self.env_name)
+                    .hint_text(catalog.t("credentials.env_name", &[]))
+                    .desired_width(200.0),
+            );
+            truncate_utf8(&mut self.env_name, 256);
             let response = ui.add(
                 egui::TextEdit::singleline(&mut self.secret_input)
                     .password(true)
@@ -676,7 +784,9 @@ impl CredentialsUi {
                 && !self.secret_input.is_empty()
                 && !self.secret_input_overflowed
                 && !self.add_pending
-                && snapshot.is_available();
+                && snapshot.is_available()
+                && (self.env_name.trim().is_empty()
+                    || storage::Db::validate_credential_env_name(self.env_name.trim()).is_ok());
             if ui
                 .add_enabled(filled, egui::Button::new(catalog.t("action.add", &[])))
                 .clicked()
@@ -690,6 +800,7 @@ impl CredentialsUi {
                         *intent = Some(CredentialsIntent::Add {
                             revision: snapshot.revision(),
                             credential: NewCredential {
+                                env_name: self.env_name.trim().to_owned(),
                                 provider: self.provider.trim().to_owned(),
                                 label: self.label.trim().to_owned(),
                                 credential_kind: self.kind.to_owned(),

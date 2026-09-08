@@ -2559,3 +2559,24 @@
 - 리뷰 반영: Medium 1건(원본 파일 읽기 오류가 정상 Credential snapshot까지 실패시키는 문제)을 재현 테스트 FAIL로 확인했다. 출처 읽기 실패를 별도 메타데이터로 분리해 보관값에 경고만 표시하고 API 관리는 유지한다. 수정 후 env_files 필터 6 PASS. clippy는 새 테스트 이름의 대문자 API 때문에 실패해 소문자로 수정했다. 재실행 중이며 성공 전 PASS로 기록하지 않는다.
 
 - PR 2 최종 검증: clippy all-targets PASS(테스트 이름 수정 후 10.83초), fmt/diff PASS, i18n-check PASS(키 1128건/5 locale). dotenv_sync 45 PASS 및 리뷰 반영 env_files 6 PASS. 리뷰의 파일 읽기/API 관리 결합 문제는 수정했고 실제 재현 실패→성공을 확인했다. 코드 완성, 화면 미검증으로 draft PR 생성한다.
+
+
+## 2026-09-09 API 환경 연결 PR 3 진행
+
+- 이전 PR 2는 #180 https://github.com/JRVector9/deppy-sijo/pull/180, commit 49ad36f로 생성했다(base #179, draft). 현재 worktree `/private/tmp/deppy-credential-env-20260909`, 브랜치 `feat/workspace-credential-env`, base #180.
+- 완료 구현: storage migration v41 `workspace_credential_env`(workspace당 최대 256개, 환경 이름 ASCII shell identifier 256바이트). metadata/physical slot 공개/환경 연결을 같은 transaction으로 확정한다. 소속 또는 전역 공유 credential만 연결하고 이름 충돌은 기존 연결을 rollback 보존한다. 참조 확인 및 조건부 credential 삭제 두 경로 모두 새 연결을 보호한다. 설정 snapshot은 같은 read transaction에서 연결 정보를 포함하고 합산 바이트를 제한한다.
+- UI: 신규 API 키의 선택적 환경변수명 입력, 기존 키의 Agent 환경 연결 편집/해제, dotenv 동일 키보다 우선한다는 안내를 추가했다. 작업은 metadata-only worker intent로 처리한다. 실제 값은 .env에 기록하지 않는다.
+- runtime: SetSessionDefaultEnv에 `api_secrets` 참조를 추가해 기존 env와 함께 원자 전달한다. command validation/retention/canonicalization/debug-count를 포함했고 protocol v15 exact handshake로 구버전 필드를 거부한다. dotenv < API < launch override 순서, 복원 시 API가 이기는 dotenv 값은 redaction 준비 전에 제외한다. 연결 수정은 runtime dotenv stamp를 무효화해 다음 spawn이 DB를 재조회한다. 기존 동기화 실패 fallback도 defaults를 비워 변경 전 API 참조를 사용하지 않게 한다.
+- 수정 파일: storage db.rs/lib.rs/새 workspace_env.rs, runtime command.rs/in_process.rs/protocol.rs, app app.rs/ui/credentials.rs, 5 locale. 기존 미커밋 UI worktree와 실행 앱은 그대로다.
+- 검증: schema 연결 보존 테스트를 먼저 FAIL로 확인했다. 구현 후 storage 관련 3 PASS, runtime 구성/실패 관련 2 PASS. app의 환경파일 없는 API 전달/해제 테스트 1 PASS. 실제 Agent 프로세스 검증은 test_store가 OS mock 없이 초기화되어 `No default store has been set`으로 실패했다. 실제 키가 기록되기 전 실패이며 테스트를 RecordingResolver 주입으로 고쳐 재실행한다. 중간 cargo check는 usize SQL 변환과 문자열 편집 범위 실수를 잡아 수정했고 app all-targets check는 PASS했다.
+- 현재: `/tmp/deppy-credential-env-review.txt` 소스 리뷰 진행. `/tmp/deppy-credential-env-all-targeted.log`에는 위 테스트 설정 실패가 있으므로 전체 PASS가 아니다. 고친 targeted 테스트, storage 전체 migration/회귀, runtime protocol/retention, 리뷰 반영, 최종 게이트/commit/PR이 남았다.
+- 다음 명령: 같은 target/env로 `cargo test --locked -p deppy-sijo -p storage -p runtime credential_env_ -- --test-threads=1`; `cargo test --locked -p storage -- --test-threads=1`; `cargo test --locked -p runtime protocol:: -- --test-threads=1`; 결과와 리뷰를 확인한 뒤 게이트. 이후 PR 4 환경파일 선택/출처, PR 5 Agent 적용 상태를 계속한다. 앱 재빌드·재실행/머지는 승인 전 실행하지 않는다.
+
+- 리뷰 보완 checkpoint: dotenv 파일 읽기 실패에도 API 연결을 유지하는 회귀를 FAIL로 확인하고 `source_failed` payload로 분리했다. 원본 stamp는 실패 시 인정하지 않아 재시도를 유지한다. 전송 실패에도 WorkspaceProtocol 완료 처리를 실행한다. API 연결이 있는 프로젝트는 기존 eval 기반 zsh 라이브 반영을 끄고 새 실행에 적용한다(5 locale 안내). 전송 제어값은 파일 설정보다 뒤에서 확정한다. migration 총수/remote v15 테스트의 오래된 assertion도 수정했다.
+- 재검증: API 연결 targeted app 1/runtime 3/storage 3 PASS(`/tmp/deppy-api-reviewed-test.log`). storage 전체와 runtime 전체 로직 회귀 진행 중이다. 파일 읽기 오류는 실제 키/DB 내용 없이 고정 코드로만 기록한다. 사용자 앱 재시작은 하지 않았다.
+
+- 실패/수정 추가: helper 정리에서 payload.report 부분 이동 컴파일 오류가 발생해 참조 읽기로 수정했다. runtime 전체를 단독 실행하니 기존 test_store가 macOS 경로를 사용해 정지했다. 정확한 테스트 PID 1991/cargo 1429만 종료하고 `--features secret/test-keyring-core`로 재실행했다. 앱에는 접근하지 않았다. 복원 파일의 DEPPY 제어키가 훅 비활성화를 덮는 재리뷰 지적도 RED로 확인하고 복원 필터에서 제외했다. 이후 테스트/게이트 재실행 전이므로 앞선 게이트는 PASS가 아니다.
+
+- PR 3 최종 로직 검증: storage 전체 341 PASS(`/tmp/deppy-api-storage-final.log`), runtime 전체 304 PASS(모의 Keychain feature, `/tmp/deppy-api-runtime-mock.log`). 재리뷰의 복원 제어키 경로 수정 뒤 targeted app 1/runtime 3 PASS(`/tmp/deppy-api-final-targeted.log`). 재리뷰 2건은 컴파일 오류 참조 처리와 복원 필터로 모두 반영했다. 전체 runtime 뒤 수정한 것은 복원 필터이며 해당 테스트로 재검증했다.
+
+- PR 3 최종 게이트 PASS: workspace clippy all-targets 16.77초, fmt/diff, i18n-check(1135 literal keys/5 locale). `/tmp/deppy-api-clippy-final.log`, `/tmp/deppy-api-i18n-final.log`. 변경 파일과 테스트는 위 checkpoint를 따른다. 화면 검증은 미실행이므로 draft PR로 제출한다. 다음은 `feat/workspace-env-sources` worktree를 이 commit 위에 생성하고 PR 4를 구현한다.

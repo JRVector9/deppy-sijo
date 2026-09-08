@@ -2358,3 +2358,6 @@
 - 너비 최종 게이트: terminal/runtime/app all-targets strict Clippy PASS. terminal 90, workspace 236, runtime command 18 PASS, ignored는 terminal 4. fmt/diff PASS. 시각 검증은 이 main 조합에서 미실행 상태다. 다음: 경계 검사 결과 기록 후 제품 커밋/push/main 새 PR.
 
 - 너비 경계 게이트 PASS: cargo run --locked -p xtask -- check-boundary, zero allowlist. 계획된 로컬 검증을 모두 완료했다. 다음: 한국어 구현 커밋과 push, main 대상 새 PR, 최종 PR 번호/SHA 기록.
+
+- 너비 PR 완료: 계획 75a2759/제품 c651438을 push하고 main 대상 PR #159(https://github.com/JRVector9/deppy-sijo/pull/159)을 생성했다. 원본 #149는 수정/닫지 않았고 merge도 수행하지 않았다. 이 마감 커밋은 문서만 수정한다.
+- 너비 남은 작업: 부모 lane의 CI/통합 확인과 승인된 시점의 이 main 조합 시각 검증. 현재 cargo/GUI 실행 없음. 다음 명령: `gh pr view 159 --json headRefOid,mergeStateStatus,statusCheckRollup`; `git log origin/main..fix/preserve-terminal-layout-main --oneline`. force push/rebase 없음.

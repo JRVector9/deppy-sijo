@@ -75,7 +75,7 @@ CARGO_BUILD_JOBS=2 cargo run --locked -p xtask -- check-boundary
 ```
 
 - [x] **Step 3: 실제 테스트 결과·리뷰·수정·시각 검증 대기를 handoff와 한국어 프로젝트 일지에 기록한다.** 기존 lane 기록은 보존한다.
-- [ ] **Step 4: 한국어 커밋, push, main 대상 새 PR을 만든다.** 원본 #149는 그대로 둔다. 새 PR 본문은 승인된 scale<=1 제품 동작의 main 이관, 실제 로컬 게이트, 이 main 조합의 시각 검증 대기를 명시한다.
+- [x] **Step 4: 한국어 커밋, push, main 대상 새 PR을 만든다.** 원본 #149는 그대로 둔다. 새 PR 본문은 승인된 scale<=1 제품 동작의 main 이관, 실제 로컬 게이트, 이 main 조합의 시각 검증 대기를 명시한다.
 
 ```sh
 git add crates/app/src/ui/workspace.rs crates/terminal/src/renderer_egui.rs crates/runtime/src/command.rs crates/runtime/src/lib.rs docs/CODEX_HANDOFF.md docs/superpowers/plans/2026-09-08-preserve-terminal-layout-main.md
@@ -83,3 +83,7 @@ git commit -m 'fix(ui): 검증된 터미널 너비 맞춤을 main에 이관한�
 git push -u origin fix/preserve-terminal-layout-main
 gh pr create --base main --head fix/preserve-terminal-layout-main --title 'fix(ui): 검증된 터미널 너비 맞춤 main 이관' --body-file /private/tmp/deppy-preserve-layout-pr-body.md
 ```
+
+## 완료 결과
+
+계획 75a2759, 제품 c651438, main PR #159. terminal 90/workspace 236/runtime command 18 PASS, terminal 4 ignored. strict Clippy/fmt/diff/boundary PASS. Codex 정적 리뷰 확정 결함 없음. 이 main 조합의 시각 검증은 대기이며 GUI 빌드·실행, 기존 #149 변경/닫기, PR merge는 수행하지 않았다.

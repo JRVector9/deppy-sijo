@@ -2938,6 +2938,29 @@ mod tests {
         assert_eq!(worker, AgentKind::Kimi, "워커 프로세스명을 놓치면 안 된다");
     }
 
+    #[test]
+    fn classify는_grok_트램폴린과_강도_플래그를_읽는다() {
+        let rows = vec![
+            ProcRow {
+                pid: 100,
+                ppid: Some(1),
+                command: "/bin/zsh".into(),
+            },
+            ProcRow {
+                pid: 101,
+                ppid: Some(100),
+                command: "node /Users/jr/.grok/bin/grok --model grok-4.6 --reasoning-effort xhigh"
+                    .into(),
+            },
+        ];
+        let found = agent_kinds_from_rows(&[(SessionId(1), 100)], &rows);
+        let agent = found.get(&SessionId(1)).expect("Grok을 찾아야 한다");
+        assert_eq!(agent.kind, AgentKind::Grok);
+        assert_eq!(agent.model.as_deref(), Some("grok-4.6"));
+        assert_eq!(agent.effort.as_deref(), Some("xhigh"));
+        assert!(classify("/usr/local/bin/not-grok").is_none());
+    }
+
     /// Kimi 바인딩은 **hook에서만** 온다. 프로세스 탐색(`bind`)은 만들지 않는다.
     ///
     /// Claude/Codex는 transcript 파일명·경로에서 세션을 역추적할 수 있지만, Kimi는

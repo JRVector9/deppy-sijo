@@ -1089,6 +1089,35 @@ mod kimi_tests {
     }
 
     #[test]
+    fn parse_grok은_summary와_마지막_레코드로_상태를_만든다() {
+        let dir = temp_root("grok-red").join("01a06c06-0a9e-7ed1-bae5-908c9b49ee97");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("summary.json"),
+            r#"{"info":{"cwd":"/Users/jr/work"},"current_model_id":"grok-4.6","reasoning_effort":"xhigh"}"#,
+        )
+        .unwrap();
+        let path = dir.join("chat_history.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","content":[{"type":"text","text":"수정해"}]}"#,
+                "\n",
+                r#"{"type":"assistant","content":"완료"}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        let state = parse_grok(&path).expect("Grok transcript를 파싱해야 한다");
+        assert_eq!(state.model.as_deref(), Some("grok-4.6"));
+        assert_eq!(state.effort.as_deref(), Some("xhigh"));
+        assert_eq!(state.activity, AgentActivity::Idle);
+        assert_eq!(state.user_instruction.as_deref(), Some("수정해"));
+        assert_eq!(state.last_agent_summary.as_deref(), Some("완료"));
+    }
+
+    #[test]
     fn kimi_transcript에서_모델_강도_활동_컨텍스트를_읽는다() {
         let path = fixture(
             "full",

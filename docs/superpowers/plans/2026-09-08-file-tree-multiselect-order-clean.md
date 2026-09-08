@@ -88,6 +88,6 @@
 
   Expected: 확정 finding이 없거나, finding마다 재현 테스트를 RED로 확인하고 수정 후 GREEN.
 
-- [ ] **Step 4: 문서화·커밋·PR을 완료한다.**
+- [x] **Step 4: 문서화·커밋·PR을 완료한다.**
 
   handoff와 Obsidian 일지에 실제 명령/결과/실패 접근/남은 화면 검증을 기록한다. 한국어 커밋을 push하고 `main` 대상 Ready PR을 만든다. 앱 빌드·재실행, rebase, force-push는 수행하지 않는다.

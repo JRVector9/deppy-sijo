@@ -2346,3 +2346,10 @@
 - Boundary verification: 최종 코드 diff 파일은 App/config/file_tree와 다섯 locale뿐이며 새 문서는 계획/이 handoff뿐이다. 추가 코드에서 #156/#158 전용 이름, Relay, Grok, launcher, Markdown 렌더, IME, Keychain 배선은 0건이다. App의 350 additions/7 deletions는 워크스페이스 순서 정렬·병합·저장 배선과 그 테스트뿐이고, locale 추가는 `workspace_sessions_expand`, `workspace_sessions_collapse`, `permanent_delete_folder_prompt` 세 키뿐이다.
 - Remaining work: Obsidian 일지 작성, 한국어 커밋, 일반 push, `main` 대상 Ready PR 생성, 원격 체크 상태를 확인한다. GitHub Actions가 billing/spending으로 실행되지 않으면 PASS가 아니라 BLOCKED로 기록한다. 화면 검증은 앱 build/launch를 금지한 이 작업 범위 때문에 PR에서 사용자 후속 확인으로 남긴다.
 - Exact next commands: `git add crates/app/src/app.rs crates/app/src/config.rs crates/app/src/ui/file_tree.rs crates/i18n/locales docs/CODEX_HANDOFF.md docs/superpowers/plans/2026-09-08-file-tree-multiselect-order-clean.md`; `git commit -m 'feat(ui): 파일 트리 다중 선택과 순서를 이관한다'`; `git push -u origin feat/file-tree-multiselect-order-clean`; `gh pr create --base main --head feat/file-tree-multiselect-order-clean ...`; `gh pr checks <PR 번호>`.
+
+### PR 완료 갱신
+
+- Commit/PR: 구현과 문서를 `c8a4086`(`feat(ui): 파일 트리 다중 선택과 순서를 이관한다`)으로 커밋해 일반 push했고, `main` 대상 Ready PR #173을 만들었다: https://github.com/JRVector9/deppy-sijo/pull/173
+- Remote checks: GitGuardian은 SUCCESS다. Build and test 3개와 Dependency security 2개 job은 모두 step 0개로 즉시 실패했다. check annotation은 `recent account payments have failed or your spending limit needs to be increased`이므로 코드 검증 실패가 아니라 GitHub Actions billing/spending BLOCKED로 기록한다. 로컬 전체 게이트 결과를 대체 PASS로 표기하지 않는다.
+- Remaining work: billing/spending이 복구되면 PR #173 Actions를 다시 실행하고, 사용자가 승인한 앱 build/launch 시 화면에서 마키·다중 선택·드래그 순서·펼침 상태를 확인한다.
+- Exact next commands: `gh pr checks 173`; billing 복구 뒤 `gh run rerun 34235575110`; `gh run rerun 34235575131`.

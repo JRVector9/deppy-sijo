@@ -2487,3 +2487,11 @@
 - 테스트: E 테스트 아직 실행하지 않음. D의 PASS를 E PASS로 대체하지 않는다. 앱 재빌드/실행 금지.
 - 남은 작업: admission RED→checked Session/worker→wire slots/delta→UI fence→관련 gate/유계 리뷰/일지/commit/push/stacked PR.
 - 다음 명령: `CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-deps-target-20260907 cargo test -p deppy-sijo --bin deppy-sijo --locked resize_admission -- --test-threads=1`.
+
+### PR E RED 확보 및 기반 PR 보완 대기
+- 문서 커밋 `fd93058` 완료. 실제 UI admission 회귀1개 RED: command 수락 뒤300ms면 기존 fence가 사라져 실패(`/private/tmp/deppy-resize-admission-red.log`, exit101).
+- Session checked API stub(항상Dimensions 오류)과 backend 경량 dimensions default Err 선언 및 회귀2개를 작성했다. hidden 실제크기/full-dirty,invalid-size 불변 모두 기대대로 RED(`/private/tmp/deppy-resize-session-red.log`,exit101). 아직 GREEN 구현 전이다.
+- 수정 파일: app/ui/workspace.rs(회귀만), terminal/backend.rs(default미지원 API선언), session/session.rs(타입/stub/회귀),session/lib.rs(export). worker/protocol/실제 Alacritty/Ghostty/reflow 구현은 수정하지 않았다.
+- 부모 지시: #165의100k resize P1 및32MiB archive P2 보완과 #160 bounded reflow 통합을 기다려 terminal/runtime 생산 코드 편집을 중단했다. 모든 Cargo 프로세스는 종료됐다. 새 #165 HEAD를 rebase/force 없이 일반 merge로 받은 뒤 재개한다.
+- 남은 작업: 기반 업데이트→현재 RED를 실제 checked resize/token/stamp로 GREEN→계획의worker/wire/UI/focused/full/review/게시. 지금 테스트 PASS나 구현 완료로 보고하지 않는다.
+- 다음 명령: `git status --short`; `git diff --stat`; 부모가 전달한 새D HEAD와 충돌범위 확인 후 작업보존 커밋과 `git merge <새D_HEAD>`; 이후 session focused부터 재개.

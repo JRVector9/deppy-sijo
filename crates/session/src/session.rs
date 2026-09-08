@@ -38,6 +38,23 @@ pub enum SessionKind {
     Agent,
 }
 
+/// 실제 resize 실패 경계. backend/PTY 오류 내용을 wire나 로그로 복사하지 않는다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResizeError {
+    InvalidSize,
+    Backend,
+    Pty,
+    Dimensions,
+    SizeMismatch,
+}
+
+#[derive(Debug)]
+pub struct ResizeApplied {
+    pub cols: u16,
+    pub rows: u16,
+    pub cache_event: Option<TerminalCacheEvent>,
+}
+
 /// pump() 결과 — 호출측(runtime worker)이 이벤트 발행 여부를 결정한다.
 #[derive(Debug, PartialEq)]
 pub struct PumpResult {
@@ -455,6 +472,14 @@ impl Session {
         None
     }
 
+    pub fn resize_checked(&mut self, _cols: u16, _rows: u16) -> Result<ResizeApplied, ResizeError> {
+        Err(ResizeError::Dimensions)
+    }
+
+    pub fn grid_dimensions(&self) -> Option<(u16, u16)> {
+        self.backend.grid_dimensions().ok()
+    }
+
     pub fn resize(&mut self, cols: u16, rows: u16) -> Option<TerminalCacheEvent> {
         let _ = self.backend.resize(cols, rows);
         if let Some(pty) = &mut self.pty
@@ -666,6 +691,26 @@ fn dirty_rows_to_ranges(dirty_rows: &mut Vec<u16>, cols: u16, rows: u16) -> Vec<
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn resize_checked는_hidden에서_실제_크기를_확인하고_full_dirty를_유지한다() {
+        let mut session = Session::restore_archived(SessionId(1), SessionKind::Agent,
+            80, 24, 1000, Some(0), &mut &b"stable"[..]);
+        session.set_visible(false);
+        let result = session.resize_checked(101, 31).expect("backend 실제 적용");
+        assert_eq!((result.cols, result.rows), (101, 31));
+        assert_eq!(session.grid_dimensions(), Some((101, 31)));
+        assert_eq!(session.cache_class(), TerminalCacheClass::Hidden);
+        assert!(!session.take_snapshot().unwrap().dirty_ranges.is_empty());
+    }
+
+    #[test]
+    fn resize_checked는_유효하지_않은_크기를_적용하지_않는다() {
+        let mut session = Session::restore_archived(SessionId(1), SessionKind::Agent,
+            80, 24, 1000, Some(0), &mut &b""[..]);
+        assert_eq!(session.resize_checked(0, 24).unwrap_err(), ResizeError::InvalidSize);
+        assert_eq!(session.cache_footprint().columns, 80);
+    }
 
     #[test]
     fn live_scrollback_검토_새pty는_이전_압박상한을_이어받지_않는다() {

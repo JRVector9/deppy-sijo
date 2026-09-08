@@ -9765,6 +9765,21 @@ mod tests {
     /// 화면에 올라가 리사이즈가 끝나는 순간 한 번 번쩍였다(2026-09-06). 안정 화면은
     /// target 모양의 viewport가 조용해질 때까지 유지돼야 한다.
     #[test]
+    fn resize_admission은_실제_적용_전_deadline을_시작하지_않는다() {
+        let session = SessionId(66);
+        let mut ui = WorkspaceUi::new();
+        ui.sessions.entry(session).or_default()
+            .install_snapshot(shaped_snapshot(80, 24, "stable"));
+        ui.sent_sizes.insert(session, (80, 24));
+        assert!(ui.queue_terminal_resize(session, 100, 30));
+        drain_protocol(&mut ui);
+        let view = ui.sessions.get_mut(&session).unwrap();
+        let now = std::time::Instant::now() + std::time::Duration::from_millis(300);
+        view.settle_resize_presentation(now);
+        assert!(view.resize_presentation.is_some(), "queue 수락은 실제 적용 증거가 아니다");
+    }
+
+    #[test]
     fn 창_리사이즈_전송도_안정_화면을_fence로_지킨다() {
         let session = SessionId(66);
         let mut ui = WorkspaceUi::new();

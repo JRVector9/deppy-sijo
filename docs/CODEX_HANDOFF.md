@@ -2409,3 +2409,10 @@
 - 새 `feat/relay-shell-main-clean`은 #161 exact6ee7eb4에서 생성했다. updated #162의65d807e를 squash 이관한 source commit ab0dbfc는 그 최종 tree와 전체 diff가 비어 있다. `git merge-base HEAD ce930906`은6ee7eb4이며 `git merge-base --is-ancestor ce930906 HEAD`는 exit1, 추가 이력은 새 source commit 하나뿐이다.
 - 새 Ready PR https://github.com/JRVector9/deppy-sijo/pull/168 , base feat/relay-reconnect-core-main. source head ab0dbfc의 GitGuardian SUCCESS를 직접 확인했다. 새 worktree golden1 PASS(`/private/tmp/deppy-relay-shell-clean-fixture.log`), 나머지 gate는 동일 tree의 #162 실행 증거를 그대로 구분해 기록한다.
 - 다음: 이 최종 clean shell 위에 `feat/relay-app-adapter-main-clean`을 만들고 adapter-only8dae223/5452873/fbb807f를 이관한다. 새 두 PR GitGuardian 성공 후 old162/163을 대체 링크와 함께 close하되 branch는 보존한다. Actions billing/spending과 DNS/TLS/배포/실기기/soak BLOCKED 유지.
+
+## 2026-09-08 R3 Relay 앱 어댑터 시작
+
+- 목표: R2 final206a350에서 전용 /private/tmp/deppy-relay-app-adapter-main-20260908, branch feat/relay-app-adapter-main을 만들어 Relay 앱 활성화 hunk만 R2 base stacked PR로 이관한다. 아직 제품 수정·테스트 실행 없음. writing-plans 계획을 먼저 작성했다.
+- 현재 main은 App::new에서 기존 OAuth reconcile_startup_secrets_best_effort가 eager keychain list/get/has/delete를 수행한다. 부모는 R3에서 Relay 신규경로 startup/OFF 접근0만 고정하고 기존 OAuth/secret는 변경하지 말라고 확정했다. 전체 앱 시작 팝업은 R3 게시 후 별도 R4 fix/keychain-startup-lazy를 최신main에서 진행한다.
+- 제외: config 원본diff는 workspace_order뿐이라 제외, package/verify/xtask 원본diff는 일반 공증이어서 제외. secret crate/root manifest 확대도 제외. app render는 typed intent만, logic/worker에서 I/O.
+- 다음: adapter reconnect 기본메서드 FAIL을 실제RED로 확인한 뒤 repository/storage Conflict hunk와 app/setting/locale Relay hunk를 수술적으로 이관한다. 앱실행/배포/force-push/rebase 금지.

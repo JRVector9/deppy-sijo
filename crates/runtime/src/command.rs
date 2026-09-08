@@ -4,7 +4,8 @@ pub use mux::SplitDirection;
 pub(crate) const RUNTIME_SESSION_CAP: usize = 256;
 pub(crate) const RUNTIME_COMMAND_QUEUE_BYTES_MAX: usize = 8 * 1024 * 1024;
 const TERMINAL_DIMENSION_MAX: u16 = 500;
-const TERMINAL_CELL_COUNT_MAX: u32 = 65_536;
+/// UI가 크기 목표를 계산할 때도 같은 셀 수 상한을 사용한다.
+pub const TERMINAL_CELL_COUNT_MAX: u32 = 65_536;
 use terminal::policy::SCROLLBACK_LINES_MAX;
 const COMMAND_BYTES_MAX: usize = 32 * 1024;
 const ARG_ITEMS_MAX: usize = 256;

@@ -2345,3 +2345,9 @@
 - Completed delivery: product/plan/handoff commit `a92d4b2` was pushed and main-target PR #158 was created at `https://github.com/JRVector9/deppy-sijo/pull/158`. No merge was performed.
 - Remaining work: wait for PR checks and perform visual repeated Markdown-drop verification only after an explicitly requested app rebuild/relaunch.
 - Exact next commands: `gh pr checks 158`; after rebuild approval, package and launch the combined preview, repeatedly drop external Markdown files, and confirm a renderer failure leaves the app alive with the recovery surface.
+
+### 2026-09-08 PR #158 hosted-check status
+
+- GitHub Actions run `34206317215` and the dependency-security run started but every failing job ended within 2–9 seconds without executing any steps (`steps: []`). This matches the repository's current Actions billing/spending block and is not evidence of a code or test failure.
+- GitGuardian Security Checks passed. The locally executed tests, strict Clippy, format, and diff checks recorded above remain the only completed verification for this PR.
+- Hosted CI must remain reported as BLOCKED/FAILURE until GitHub Actions can actually execute; do not label it PASS.

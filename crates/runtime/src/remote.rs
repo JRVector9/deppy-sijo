@@ -62,7 +62,7 @@ const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1
 /// 대형 붙여넣기(수 MB)와 큰 viewport 스냅샷이 여유 있게 들어간다.
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 /// 원격 명령의 scrollback 상한 — 무제한 usize로 과대 할당을 요구하지 못하게.
-const MAX_SCROLLBACK_LINES: usize = 100_000;
+use terminal::policy::SCROLLBACK_LINES_MAX as MAX_SCROLLBACK_LINES;
 /// 인증 프레임 대기 상한 — 접속만 열고 침묵하는 peer가 서버를 잡아두지 못하게.
 const AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// 클라이언트 최초 TCP connect 상한 — OS 기본 connect timeout에 의존하지 않는다.

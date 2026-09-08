@@ -5,7 +5,7 @@ pub(crate) const RUNTIME_SESSION_CAP: usize = 256;
 pub(crate) const RUNTIME_COMMAND_QUEUE_BYTES_MAX: usize = 8 * 1024 * 1024;
 const TERMINAL_DIMENSION_MAX: u16 = 500;
 const TERMINAL_CELL_COUNT_MAX: u32 = 65_536;
-const SCROLLBACK_LINES_MAX: usize = 100_000;
+use terminal::policy::SCROLLBACK_LINES_MAX;
 const COMMAND_BYTES_MAX: usize = 32 * 1024;
 const ARG_ITEMS_MAX: usize = 256;
 const ARG_BYTES_MAX: usize = 32 * 1024;

@@ -8,6 +8,7 @@ mod change_set;
 #[cfg(feature = "ghostty-backend")]
 mod ghostty_backend;
 pub mod input_mapper;
+pub mod policy;
 pub mod renderer_egui;
 mod viewport_snapshot;
 

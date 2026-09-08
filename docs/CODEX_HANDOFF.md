@@ -2391,3 +2391,10 @@
 - 일지: Obsidian 프로젝트 일지/deppy-sijo/2026-09-08 Relay 비UI 재접속 코어 main 이관.md 및 2026-09-08 Relay 브라우저 셸 stacked 이관.md.
 - 남은 일: 부모의 R1→R2 착지 단계에서 hosted checks와 공개 fixture 판정을 별도로 해결하고 exact head를 검증한다. R1 squash 착지 후 R2에서 git fetch origin; git merge origin/main; gh pr edit 162 --base main 순서로 일반 merge/retarget하고 적정 게이트를 재검증한다. 기존146/149 수정·닫기, rebase/force-push, merge/배포는 이 lane에서 하지 않았다.
 - 후속 app adapter: AppRelayRepository reconnect methods와 native pairing/lifecycle/UI 연결, Conflict/pending/재승인 정책을 별도 PR로 검증한다. DNS/TLS/자격증명/외부 배포/실기기/24h soak는 BLOCKED다.
+
+## 2026-09-08 R3 Relay 앱 어댑터 시작
+
+- 목표: R2 final206a350에서 전용 /private/tmp/deppy-relay-app-adapter-main-20260908, branch feat/relay-app-adapter-main을 만들어 Relay 앱 활성화 hunk만 R2 base stacked PR로 이관한다. 아직 제품 수정·테스트 실행 없음. writing-plans 계획을 먼저 작성했다.
+- 현재 main은 App::new에서 기존 OAuth reconcile_startup_secrets_best_effort가 eager keychain list/get/has/delete를 수행한다. 부모는 R3에서 Relay 신규경로 startup/OFF 접근0만 고정하고 기존 OAuth/secret는 변경하지 말라고 확정했다. 전체 앱 시작 팝업은 R3 게시 후 별도 R4 fix/keychain-startup-lazy를 최신main에서 진행한다.
+- 제외: config 원본diff는 workspace_order뿐이라 제외, package/verify/xtask 원본diff는 일반 공증이어서 제외. secret crate/root manifest 확대도 제외. app render는 typed intent만, logic/worker에서 I/O.
+- 다음: adapter reconnect 기본메서드 FAIL을 실제RED로 확인한 뒤 repository/storage Conflict hunk와 app/setting/locale Relay hunk를 수술적으로 이관한다. 앱실행/배포/force-push/rebase 금지.

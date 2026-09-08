@@ -28,3 +28,5 @@ python3 -m unittest discover -s scripts/tests -p test_relay_dev.py -v
 sh -n scripts/relay-dev.sh
 shellcheck scripts/relay-dev.sh
 ```
+
+API 근거: [공식 Serve CLI](https://tailscale.com/docs/reference/tailscale-cli/serve), [공식 ServeConfig 예시](https://tailscale.com/docs/kubernetes-operator/reference/troubleshooting). 지원하지 않는 응답 형식은 pending으로 보존하고 오류를 반환한다.

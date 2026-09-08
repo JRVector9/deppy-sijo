@@ -2438,3 +2438,9 @@
 - readiness 수정 최종 제한CLI는exit0, 신뢰80%이상확정P1/P2없음으로종료(`/private/tmp/deppy-relay-runner-review-ready-final.txt`). 앞5개리뷰finding도첫재리뷰에서추가지적없이수용됐고후속readiness까지해결했다.
 - 현재25fixture/shellcheck/sh-n/boundary/fmt/diff PASS. 실제앱명령/build/relaunch및TS/DNS/TLS/배포는실행하지않았으며외부검증BLOCKED.
 - 남은작업은한국어커밋과일반push, `gh pr create --base feat/relay-shell-main-clean --head dev/relay-local-runner-main --body-file /private/tmp/deppy-relay-runner-pr.md`, finalHEAD/CI annotations/clean확인과일지확정이다.
+
+### Relay runner Ready PR 게시
+- PR #175 https://github.com/JRVector9/deppy-sijo/pull/175 , base feat/relay-shell-main-clean(#168), Ready. 검증 소스커밋 `5637b3d54c6da8e48ae3c08e8e217b1ce68c221d`를 일반push했고GitHub일치를확인했다. 이후게시문서는코드변경없음이다.
+- 최초sourceHEAD GitGuardian COMPLETED/SUCCESS. Actions6개(102105404752/102105403392/102105404951/102105403754/102105404912/102105405016)는각annotation에서billing/spending때문에job미시작을직접확인했다. BLOCKED이며CI PASS가아니다. 실제TS/DNS/TLS/배포검증BLOCKED와별개이다.
+- 공식TailscaleCLI문서와ServeConfig예시의TCP/HTTPS/Web/Handlers/Proxy형식을추가대조했다. 이는실제노드동작검증을대체하지않는다.
+- 남은코드작업없음. 최종문서push뒤 `git rev-parse HEAD origin/dev/relay-local-runner-main`; `git status --short`; `gh pr view 175 --json headRefOid,statusCheckRollup,isDraft,baseRefName`; exactHEAD check-runannotations를확인하고PR본문/Obsidian일지에기록한다. merge/rebase/force/app실행은하지않는다.

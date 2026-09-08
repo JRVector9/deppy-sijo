@@ -31,4 +31,4 @@ self.assertFalse(owned_process(record, different_start))
 ### Task 3: gate·review·게시
 - [x] Python 전체 계약 tests, `sh -n`, `shellcheck scripts/relay-dev.sh`, fmt/diff/boundary를 실행한다. Tailscale/DNS/TLS/배포 실검증은 외부 자격/조건 부재 BLOCKED로 기록한다.
 - [x] actual source Codex CLI review를300초상한 실행하고 필요 시 제한 readonly 리뷰로 완료한다. 확정 finding RED→GREEN 보완 및 재검증.
-- [ ] handoff/Obsidian 일지, 한국어 commit/push, `gh pr create --base feat/relay-shell-main-clean --head dev/relay-local-runner-main --body-file /private/tmp/deppy-relay-runner-pr.md` Ready PR 생성. final HEAD/checks/annotations/clean 확인. rebase/force/merge 금지.
+- [x] handoff/Obsidian 일지, 한국어 commit/push, `gh pr create --base feat/relay-shell-main-clean --head dev/relay-local-runner-main --body-file /private/tmp/deppy-relay-runner-pr.md` Ready PR 생성. final HEAD/checks/annotations/clean 확인. rebase/force/merge 금지.

@@ -41,6 +41,13 @@ impl fmt::Debug for RuntimeSecret {
 /// runtime remains independent of those concrete adapter types.
 pub trait RuntimeSecretResolver: Send + Sync + 'static {
     fn resolve(&self, logical_credential_id: &str) -> anyhow::Result<RuntimeSecret>;
+    fn resolve_versioned(
+        &self,
+        logical_credential_id: &str,
+    ) -> anyhow::Result<(RuntimeSecret, Option<String>)> {
+        self.resolve(logical_credential_id)
+            .map(|value| (value, None))
+    }
 }
 
 /// Arguments needed to create one workspace runtime. This is inert data: merely

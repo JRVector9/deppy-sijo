@@ -265,6 +265,8 @@ impl InProcessRuntimeClient {
                     default_env_plain: Vec::new(),
                     default_env_secrets: Vec::new(),
                     default_api_secrets: Vec::new(),
+                    environment_revision: None,
+                    secret_versions: Vec::new(),
                     dotenv_source: None,
                     // needsInput hook 키를 워크스페이스 스코프로 만들기 위해 workspace_id를
                     // 워커에 보관한다(SessionId는 워커마다 1부터라 전역 유일하지 않음 — codex High).
@@ -680,6 +682,8 @@ struct Worker {
     default_env_plain: Vec<(String, String)>,
     default_env_secrets: Vec<(String, String)>,
     default_api_secrets: Vec<(String, String)>,
+    environment_revision: Option<u64>,
+    secret_versions: Vec<(String, String)>,
     dotenv_source: Option<crate::dotenv::DotenvSourceSelection>,
     /// 이 워커의 workspace id — needsInput hook 키(`{workspace_id}:{session_id}`)에 쓴다.
     workspace_id: String,
@@ -1086,10 +1090,23 @@ impl Worker {
     fn resolve_secret_set(
         &self,
         logical_ids: Vec<String>,
+        validate_generation: bool,
     ) -> anyhow::Result<(Vec<RuntimeSecret>, Option<RedactionLease>)> {
         let mut resolved = Vec::with_capacity(logical_ids.len());
         for logical_id in logical_ids {
-            resolved.push(self.secret_resolver.resolve(&logical_id)?);
+            let (value, generation) = self.secret_resolver.resolve_versioned(&logical_id)?;
+            if validate_generation
+                && let Some((_, expected)) = self
+                    .secret_versions
+                    .iter()
+                    .find(|(id, _)| id == &logical_id)
+            {
+                anyhow::ensure!(
+                    generation.as_ref() == Some(expected),
+                    "runtime_secret_generation_changed"
+                );
+            }
+            resolved.push(value);
         }
         if resolved.is_empty() {
             return Ok((resolved, None));
@@ -1113,7 +1130,7 @@ impl Worker {
             keys.push(key);
             logical_ids.push(logical_id);
         }
-        let (resolved, lease) = self.resolve_secret_set(logical_ids)?;
+        let (resolved, lease) = self.resolve_secret_set(logical_ids, true)?;
         let env = keys
             .into_iter()
             .zip(resolved)
@@ -1473,7 +1490,7 @@ impl Worker {
         )?;
         let worker_thread = std::thread::current();
         let output_wake: pty::PtyOutputWake = Arc::new(move || worker_thread.unpark());
-        Session::spawn_with_spec_and_output_wake(
+        let session = Session::spawn_with_spec_and_output_wake(
             id,
             kind,
             spec,
@@ -1481,7 +1498,18 @@ impl Worker {
             rows,
             self.requested_scrollback(scrollback_lines),
             output_wake,
-        )
+        )?;
+        // 실제 spawn 성공 뒤에만 기록한다. 복원 아카이브에는 이 이벤트를 만들지 않는다.
+        self.emit(RuntimeEvent::EnvironmentApplied {
+            session: Some(id),
+            revision: self.environment_revision.filter(|_| {
+                self.default_env_secrets
+                    .iter()
+                    .chain(&self.default_api_secrets)
+                    .all(|(_, id)| self.secret_versions.iter().any(|(pinned, _)| pinned == id))
+            }),
+        });
+        Ok(session)
     }
 
     fn run(&mut self) {
@@ -2005,6 +2033,8 @@ impl Worker {
                 }
             }
             RuntimeCommand::SetSessionDefaultEnv {
+                secret_versions,
+                environment_revision,
                 dotenv_source,
                 api_secrets,
                 env_plain,
@@ -2015,6 +2045,12 @@ impl Worker {
                 self.default_env_secrets = env_secrets;
                 self.default_api_secrets = api_secrets;
                 self.dotenv_source = dotenv_source;
+                self.environment_revision = environment_revision;
+                self.secret_versions = secret_versions;
+                self.emit(RuntimeEvent::EnvironmentApplied {
+                    session: None,
+                    revision: environment_revision,
+                });
             }
             RuntimeCommand::SetShellCwd(cwd) => {
                 // 프로젝트 폴더 live 변경 — 이후 SpawnShell/SpawnAgent가 이 cwd에서 뜬다.
@@ -2226,7 +2262,7 @@ impl Worker {
             RuntimeCommand::SeedRedaction { credential_ids } => {
                 // Wire compatibility only. Replace one latest-only checked lease instead of
                 // permanently growing the corpus; production composition no longer sends seeds.
-                match self.resolve_secret_set(credential_ids) {
+                match self.resolve_secret_set(credential_ids, false) {
                     Ok((_resolved, lease)) => self.seed_redaction_lease = lease,
                     Err(_) => {
                         tracing::warn!("redaction seed rejected");
@@ -2787,6 +2823,10 @@ impl Worker {
     /// Bounded dotenv projection for restored panes. Any missing/invalid/over-limit input is an
     /// empty fail-closed projection; restoration never applies a partial first-file result.
     fn restored_dotenv_for_session(&self, dir: &std::path::Path) -> Vec<(String, String)> {
+        // 버전이 있는 기본환경은 앱 worker가 확정한 snapshot이다. 재조회로 실행값과 버전을 갈라놓지 않는다.
+        if self.environment_revision.is_some() {
+            return Vec::new();
+        }
         let entries = match &self.dotenv_source {
             Some(source) => source
                 .root
@@ -5686,6 +5726,8 @@ mod tests {
                 default_env_plain: Vec::new(),
                 default_env_secrets: Vec::new(),
                 default_api_secrets: Vec::new(),
+                environment_revision: None,
+                secret_versions: Vec::new(),
                 dotenv_source: None,
                 workspace_id: "workspace".to_owned(),
                 next_id: 1,
@@ -6072,6 +6114,8 @@ mod tests {
         let mut probe = Probe::new(client.subscribe());
         client
             .send_command(RuntimeCommand::SetSessionDefaultEnv {
+                environment_revision: None,
+                secret_versions: Vec::new(),
                 dotenv_source: None,
                 env_plain: Vec::new(),
                 env_secrets: Vec::new(),
@@ -6105,6 +6149,123 @@ mod tests {
             }
             _ => None,
         });
+    }
+
+    #[test]
+    fn environment_application_캡처후_비밀회전은_이전버전_spawn을_막는다() {
+        struct RotatingResolver(std::sync::atomic::AtomicU64);
+        impl RuntimeSecretResolver for RotatingResolver {
+            fn resolve(&self, id: &str) -> anyhow::Result<RuntimeSecret> {
+                self.resolve_versioned(id).map(|(value, _)| value)
+            }
+            fn resolve_versioned(
+                &self,
+                _: &str,
+            ) -> anyhow::Result<(RuntimeSecret, Option<String>)> {
+                let generation = self.0.load(std::sync::atomic::Ordering::SeqCst);
+                Ok((
+                    RuntimeSecret::new(format!("fake-test-value-{generation}")),
+                    Some(format!("slot-{generation}")),
+                ))
+            }
+        }
+        let resolver = Arc::new(RotatingResolver(std::sync::atomic::AtomicU64::new(1)));
+        let (mut worker, events) = admission_worker(resolver.clone(), "environment-rotation");
+        let defaults = |generation| RuntimeCommand::SetSessionDefaultEnv {
+            secret_versions: vec![("logical".into(), format!("slot-{generation}"))],
+            environment_revision: Some(generation),
+            dotenv_source: None,
+            api_secrets: vec![("API_TOKEN".into(), "logical".into())],
+            env_plain: Vec::new(),
+            env_secrets: Vec::new(),
+        };
+        worker.handle_command(defaults(1));
+        while events.try_recv().is_ok() {}
+        assert!(worker.prepare_agent_env(Vec::new(), Vec::new()).is_ok());
+        resolver.0.store(2, std::sync::atomic::Ordering::SeqCst);
+        assert!(worker.prepare_agent_env(Vec::new(), Vec::new()).is_err());
+        assert!(worker.shell_with_session(SessionId(1)).is_err());
+        worker.handle_command(RuntimeCommand::SpawnShell {
+            cols: 80,
+            rows: 24,
+            scrollback_lines: 100,
+        });
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            RuntimeEvent::SpawnFailed { .. }
+        ));
+        assert!(events.try_recv().is_err());
+        assert!(
+            worker
+                .resolve_secret_set(vec!["logical".into()], false)
+                .is_ok()
+        );
+        worker.handle_command(defaults(2));
+        assert!(worker.prepare_agent_env(Vec::new(), Vec::new()).is_ok());
+    }
+
+    #[test]
+    fn environment_application_버전은_실제_spawn_성공에만_붙는다() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, events) = admission_worker(resolver, "environment-applied");
+        worker.handle_command(RuntimeCommand::SetSessionDefaultEnv {
+            secret_versions: Vec::new(),
+            environment_revision: Some(7),
+            dotenv_source: None,
+            api_secrets: Vec::new(),
+            env_plain: vec![("FLAG".into(), "captured".into())],
+            env_secrets: Vec::new(),
+        });
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            RuntimeEvent::EnvironmentApplied {
+                session: None,
+                revision: Some(7)
+            }
+        ));
+        worker.shell = spec("/bin/cat", &[]);
+        let (shell, _leases) = worker.shell_with_session(SessionId(9)).unwrap();
+        assert!(shell.env.contains(&("FLAG".into(), "captured".into())));
+        let child = worker
+            .spawn_session(
+                SessionId(9),
+                session::SessionKind::Shell,
+                &shell,
+                80,
+                24,
+                100,
+            )
+            .unwrap();
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            RuntimeEvent::EnvironmentApplied {
+                session: Some(SessionId(9)),
+                revision: Some(7)
+            }
+        ));
+        drop(child);
+        let invalid = spec("/nonexistent-deppy-test-command", &[]);
+        assert!(
+            worker
+                .spawn_session(
+                    SessionId(10),
+                    session::SessionKind::Shell,
+                    &invalid,
+                    80,
+                    24,
+                    100
+                )
+                .is_err()
+        );
+        assert!(events.try_recv().is_err());
+        let dir = std::env::temp_dir().join(format!("deppy-applied-file-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".env"), "FLAG=changed-after-capture\n").unwrap();
+        assert!(worker.restored_dotenv_for_session(&dir).is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -6142,6 +6303,8 @@ mod tests {
         });
         let (mut worker, _events) = admission_worker(resolver, "credential-env-precedence");
         worker.handle_command(RuntimeCommand::SetSessionDefaultEnv {
+            environment_revision: None,
+            secret_versions: Vec::new(),
             dotenv_source: None,
             env_plain: vec![("SERVICE_KEY".into(), "file-value".into())],
             env_secrets: Vec::new(),
@@ -6198,6 +6361,8 @@ mod tests {
         );
         std::fs::remove_dir_all(dir).unwrap();
         worker.handle_command(RuntimeCommand::SetSessionDefaultEnv {
+            environment_revision: None,
+            secret_versions: Vec::new(),
             dotenv_source: None,
             env_plain: Vec::new(),
             env_secrets: Vec::new(),
@@ -6220,6 +6385,8 @@ mod tests {
         });
         let (mut worker, _events) = admission_worker(resolver, "credential-env-failed");
         worker.handle_command(RuntimeCommand::SetSessionDefaultEnv {
+            environment_revision: None,
+            secret_versions: Vec::new(),
             dotenv_source: None,
             env_plain: vec![("PORT".into(), "1000".into())],
             env_secrets: Vec::new(),
@@ -6243,6 +6410,8 @@ mod tests {
         value.push_str("value");
         env_plain.push((key, value));
         worker.handle_command(RuntimeCommand::SetSessionDefaultEnv {
+            environment_revision: None,
+            secret_versions: Vec::new(),
             dotenv_source: None,
             api_secrets: Vec::new(),
             env_plain,
@@ -8642,6 +8811,8 @@ mod tests {
         let mut probe = Probe::new(client.subscribe());
         client
             .send_command(RuntimeCommand::SetSessionDefaultEnv {
+                environment_revision: None,
+                secret_versions: Vec::new(),
                 dotenv_source: None,
                 api_secrets: Vec::new(),
                 env_plain: vec![

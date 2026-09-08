@@ -2897,7 +2897,7 @@ mod tests {
                 features: CLIENT_FEATURES,
                 token: b"irrelevant".to_vec(),
             };
-            assert_eq!(PROTO_VERSION, 16);
+            assert_eq!(PROTO_VERSION, 17);
             assert!(!client_hello_matches_protocol(&old));
         }
     }
@@ -3745,12 +3745,20 @@ mod tests {
             RuntimeEvent::ResizeApplied { .. } => "ResizeApplied",
             RuntimeEvent::ResizeFailed { .. } => "ResizeFailed",
             RuntimeEvent::ViewportTracked { .. } => "ViewportTracked",
+            RuntimeEvent::EnvironmentApplied { .. } => "EnvironmentApplied",
         }
     }
 
     #[test]
     fn unattached_session_event_names_and_remote_codecs_roundtrip() {
         let events = [
+            (
+                RuntimeEvent::EnvironmentApplied {
+                    session: Some(SessionId(4)),
+                    revision: Some(99),
+                },
+                "EnvironmentApplied",
+            ),
             (
                 RuntimeEvent::UnattachedSessionsInspected { count: 7 },
                 "UnattachedSessionsInspected",

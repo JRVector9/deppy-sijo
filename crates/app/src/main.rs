@@ -22,6 +22,7 @@ mod document_io;
 mod dotenv_sync;
 mod env;
 mod env_reload;
+mod environment_application;
 mod fleet;
 mod fonts;
 mod git_cli;

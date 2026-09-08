@@ -1437,6 +1437,8 @@ struct DotenvSyncJob {
 }
 
 struct DotenvSyncPayload {
+    secret_versions: EnvPairs,
+    revision: u64,
     dotenv_source: Option<runtime::dotenv::DotenvSourceSelection>,
     source_failed: bool,
     api_secrets: EnvPairs,
@@ -1471,6 +1473,42 @@ fn configure_dotenv_live_reload(
             .env_plain
             .push(("DEPPY_PROJECT_ROOT".into(), root.display().to_string()));
     }
+}
+
+// 소스와 연결의 표식만 사용한다. 비밀값의 해시를 표시하거나 저장하지 않는다.
+fn dotenv_environment_revision(
+    workspace: &str,
+    baseline: DotenvState,
+    payload: &DotenvSyncPayload,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::hash::DefaultHasher::new();
+    workspace.hash(&mut hash);
+    baseline.hash(&mut hash);
+    payload.api_secrets.hash(&mut hash);
+    payload.env_secrets.hash(&mut hash);
+    payload.secret_versions.hash(&mut hash);
+    payload.source_failed.hash(&mut hash);
+    if let Some(source) = &payload.dotenv_source {
+        source.root.hash(&mut hash);
+        source.files.hash(&mut hash);
+    }
+    hash.finish()
+}
+
+fn capture_dotenv_secret_versions(db: &Db, payload: &mut DotenvSyncPayload) -> anyhow::Result<()> {
+    let mut ids = std::collections::BTreeSet::new();
+    for (_, id) in payload.api_secrets.iter().chain(&payload.env_secrets) {
+        ids.insert(id);
+    }
+    for id in ids {
+        if let Some(location) = db.credential_secret_location(id)? {
+            payload
+                .secret_versions
+                .push((id.clone(), location.keyring_username));
+        }
+    }
+    Ok(())
 }
 
 struct DotenvSyncOutcome {
@@ -3375,14 +3413,19 @@ fn execute_dotenv_sync_job(
             .map(|binding| (binding.env_name, binding.credential_id))
             .collect();
         let Some(root) = job.root.as_deref() else {
-            return Ok(Some(DotenvSyncPayload {
+            let mut payload = DotenvSyncPayload {
+                secret_versions: Vec::new(),
+                revision: 0,
                 dotenv_source: selection.clone(),
                 source_failed: false,
                 api_secrets,
                 report: None,
                 env_plain: Vec::new(),
                 env_secrets: Vec::new(),
-            }));
+            };
+            capture_dotenv_secret_versions(db, &mut payload)?;
+            payload.revision = dotenv_environment_revision(&job.workspace_id, baseline, &payload);
+            return Ok(Some(payload));
         };
         // API 조회 성공과 파일 동기화 실패를 분리한다. 보관된 dotenv 값은 주입하지 않는다.
         let source = (|| -> anyhow::Result<_> {
@@ -3419,14 +3462,19 @@ fn execute_dotenv_sync_job(
                 (true, None, Vec::new(), Vec::new())
             }
         };
-        Ok(Some(DotenvSyncPayload {
+        let mut payload = DotenvSyncPayload {
+            secret_versions: Vec::new(),
+            revision: 0,
             dotenv_source: selection,
             source_failed,
             api_secrets,
             report,
             env_plain,
             env_secrets,
-        }))
+        };
+        capture_dotenv_secret_versions(db, &mut payload)?;
+        payload.revision = dotenv_environment_revision(&job.workspace_id, baseline, &payload);
+        Ok(Some(payload))
     };
     match execute() {
         Ok(payload)
@@ -5732,6 +5780,13 @@ impl AppRuntimeSecretResolver {
 
 impl runtime::RuntimeSecretResolver for AppRuntimeSecretResolver {
     fn resolve(&self, logical_credential_id: &str) -> anyhow::Result<runtime::RuntimeSecret> {
+        self.resolve_versioned(logical_credential_id)
+            .map(|(value, _)| value)
+    }
+    fn resolve_versioned(
+        &self,
+        logical_credential_id: &str,
+    ) -> anyhow::Result<(runtime::RuntimeSecret, Option<String>)> {
         let logical = secret::LogicalCredentialId::new(logical_credential_id.to_owned())
             .map_err(|_| anyhow::anyhow!("runtime_secret_logical_id_invalid"))?;
         let mut db = self
@@ -5762,7 +5817,10 @@ impl runtime::RuntimeSecretResolver for AppRuntimeSecretResolver {
         );
         let value = secret::SecretStore::get_secret(&self.secret_store, slot.as_str())
             .map_err(|_| anyhow::anyhow!("runtime_secret_read_failed"))?;
-        Ok(runtime::RuntimeSecret::new(value.into_string()))
+        Ok((
+            runtime::RuntimeSecret::new(value.into_string()),
+            Some(slot.as_str().to_owned()),
+        ))
     }
 }
 
@@ -7475,6 +7533,8 @@ struct WorkspaceRuntime {
     /// Source stamp whose default env was accepted by this exact runtime lifetime.
     dotenv_state: Option<DotenvState>,
     dotenv_files: Vec<String>,
+    environment_has_secrets: bool,
+    environment_application: crate::environment_application::EnvironmentApplication,
     runtime: InProcessRuntimeClient,
     events: RuntimeEventReceiver,
     workspace_ui: ui::workspace::WorkspaceUi,
@@ -14668,6 +14728,8 @@ impl App {
             ),
             dotenv_state: None,
             dotenv_files: Db::default_env_source_files(),
+            environment_has_secrets: false,
+            environment_application: Default::default(),
             runtime,
             events: runtime_events,
             workspace_ui: ui::workspace::WorkspaceUi::with_resize_owner(
@@ -16601,7 +16663,11 @@ impl App {
             rows: 24,
             scrollback_lines: self.config.terminal.scrollback_lines as usize,
         };
-        self.active.runtime.send_command(command).is_ok()
+        self.stage_dotenv_continuation(
+            self.active.runtime_instance,
+            PendingDotenvContinuation::RuntimeCommand(command),
+        )
+        .is_ok()
     }
 
     /// PR-resume-without-pane(2026-08-19): work history 카드에서 「이어서 하기」를
@@ -19950,6 +20016,10 @@ impl App {
         let Some(runtime) = self.runtime_by_instance(runtime_instance) else {
             return false;
         };
+        // 비밀 참조는 파일이 그대로여도 회전할 수 있어 매 실행 metadata를 캡처한다.
+        if runtime.environment_has_secrets {
+            return false;
+        }
         let creation_blocked = startup_catalog_blocks_session_creation(
             &self.catalog_startup_recovery,
             runtime.restore_lifecycle,
@@ -23037,9 +23107,11 @@ impl App {
     fn workspace_environment_changed(&mut self, workspace_id: &str) {
         if workspace_id == self.active.id {
             self.active.dotenv_state = None;
+            self.active.environment_application.changed();
             self.last_dotenv_state = None;
         } else if let Some(runtime) = self.warm.get_mut(workspace_id) {
             runtime.dotenv_state = None;
+            runtime.environment_application.changed();
         }
         self.sync_settings_workspace_dotenv(workspace_id);
         self.invalidate_env_api_projects();
@@ -23063,6 +23135,12 @@ impl App {
         let context = (workspace_id.clone(), root.clone(), runtime_instance);
         let context_changed = self.dotenv_sync_context.as_ref() != Some(&context);
         if context_changed {
+            if let Some((_, _, old_instance)) = self.dotenv_sync_context.as_ref()
+                && let Some(runtime) = self.runtime_by_instance_mut(*old_instance)
+                && runtime.environment_application.cancel_pending()
+            {
+                runtime.dotenv_state = None;
+            }
             self.dotenv_sync_generation = self.dotenv_sync_generation.wrapping_add(1);
             self.dotenv_sync_context = Some(context);
             self.last_dotenv_state = None;
@@ -23086,6 +23164,7 @@ impl App {
         };
         match self.dotenv_sync_worker.request_state(correlation, job) {
             Ok(replaced) => {
+                self.active.environment_application.begin();
                 if let Some(replaced) = replaced {
                     // The latest-only state slot intentionally displaced this bounded job.
                     let _ = replaced.into_parts();
@@ -23101,6 +23180,7 @@ impl App {
                     "dotenv synchronization admission failed"
                 );
                 self.last_dotenv_state = None;
+                self.active.environment_application.fail();
             }
         }
     }
@@ -23177,9 +23257,17 @@ impl App {
         ) else {
             return Err(Box::new(continuation));
         };
-        let Some((workspace_id, previous_state)) = self
-            .runtime_by_instance(runtime_instance)
-            .map(|runtime| (runtime.id.clone(), runtime.dotenv_state))
+        let Some((workspace_id, previous_state)) =
+            self.runtime_by_instance(runtime_instance).map(|runtime| {
+                (
+                    runtime.id.clone(),
+                    if runtime.environment_has_secrets {
+                        None
+                    } else {
+                        runtime.dotenv_state
+                    },
+                )
+            })
         else {
             return Err(Box::new(continuation));
         };
@@ -23436,9 +23524,21 @@ impl App {
             _ => None,
         };
         let Some(outcome) = outcome else {
+            if matches!(
+                &pending.continuation,
+                PendingDotenvContinuation::RuntimeCommand(
+                    runtime::RuntimeCommand::RespawnArchivedAgent { .. }
+                )
+            ) {
+                platform::notify(&self.i18n.t("env.apply_failed", &[]), "");
+            }
+            if let Some(runtime) = self.runtime_by_instance_mut(pending.runtime_instance) {
+                runtime.environment_application.fail();
+                runtime.dotenv_state = None;
+            }
             // 세션은 .env와 독립이다(위 dotenv_failure_allows_session 주석 참고).
             //
-            // `runtime.dotenv_state`는 **절대 건드리지 않는다**. 여기서 baseline을
+            // `runtime.dotenv_state`를 비워 재시도를 유지한다. 여기서 baseline을
             // 기록하면 execute_dotenv_sync_job이 다음 요청을 "변한 게 없다"며 건너뛰어
             // (`job.previous_state == Some(baseline)`) 재시도가 영영 막힌다. 동기화는
             // 여전히 실패한 상태로 남겨두고 세션만 통과시킨다.
@@ -23472,6 +23572,8 @@ impl App {
                 let defaults_cleared = runtime
                     .runtime
                     .send_command(runtime::RuntimeCommand::SetSessionDefaultEnv {
+                        secret_versions: Vec::new(),
+                        environment_revision: None,
                         dotenv_source: None,
                         api_secrets: Vec::new(),
                         env_plain: Vec::new(),
@@ -23691,10 +23793,21 @@ impl App {
             }
             return;
         };
+        if let Some(payload) = &payload {
+            runtime.environment_has_secrets =
+                !payload.api_secrets.is_empty() || !payload.env_secrets.is_empty();
+            runtime
+                .environment_application
+                .synced(payload.revision, payload.source_failed);
+        } else {
+            runtime.environment_application.unchanged();
+        }
         let env_delivered = match payload {
             Some(payload) => runtime
                 .runtime
                 .send_command(runtime::RuntimeCommand::SetSessionDefaultEnv {
+                    secret_versions: payload.secret_versions,
+                    environment_revision: Some(payload.revision),
                     dotenv_source: payload.dotenv_source,
                     api_secrets: payload.api_secrets,
                     env_plain: payload.env_plain,
@@ -23705,6 +23818,9 @@ impl App {
         };
         runtime.dotenv_files = outcome.source_files;
         runtime.dotenv_state = (env_delivered && !source_failed).then_some(baseline);
+        if !env_delivered {
+            runtime.environment_application.fail();
+        }
         let policy_delivered = env_delivered && runtime.runtime.send_command(cache_policy).is_ok();
         let (delivered, restore_delivery, queue_full_restore) = match pending.continuation {
             PendingDotenvContinuation::WorkspaceProtocol {
@@ -23928,6 +24044,12 @@ impl App {
                 Ok(outcome) => outcome,
                 Err(error) => {
                     self.last_dotenv_state = None;
+                    if let Some((_, _, origin_instance)) = self.dotenv_sync_context.as_ref()
+                        && let Some(runtime) = self.runtime_by_instance_mut(*origin_instance)
+                    {
+                        runtime.environment_application.fail();
+                        runtime.dotenv_state = None;
+                    }
                     tracing::warn!(
                         kind = "dotenv",
                         phase = "completion",
@@ -23945,12 +24067,19 @@ impl App {
                     && self.active.runtime_instance == outcome.runtime_instance
             });
             if !current {
+                if let Some(runtime) = self.runtime_by_instance_mut(outcome.runtime_instance)
+                    && runtime.environment_application.cancel_pending()
+                {
+                    runtime.dotenv_state = None;
+                }
                 continue;
             }
             if dotenv_state_for_sources(outcome.root.as_deref(), &outcome.source_files)
                 != outcome.baseline
             {
                 self.last_dotenv_state = None;
+                self.active.environment_application.fail();
+                self.active.dotenv_state = None;
                 tracing::warn!(
                     kind = "dotenv",
                     phase = "completion_verify",
@@ -23961,7 +24090,9 @@ impl App {
             }
             self.last_dotenv_state = Some(outcome.baseline);
             match outcome.payload {
-                None => {}
+                None => {
+                    self.active.environment_application.unchanged();
+                }
                 Some(payload) => {
                     if let Some(ref report) = payload.report
                         && report.upserted + report.removed > 0
@@ -23980,10 +24111,17 @@ impl App {
                         self.config.ui.env_live_reload,
                         outcome.root.as_deref(),
                     );
+                    self.active.environment_has_secrets =
+                        !payload.api_secrets.is_empty() || !payload.env_secrets.is_empty();
+                    self.active
+                        .environment_application
+                        .synced(payload.revision, payload.source_failed);
                     let env_ready = self
                         .active
                         .runtime
                         .send_command(runtime::RuntimeCommand::SetSessionDefaultEnv {
+                            secret_versions: payload.secret_versions,
+                            environment_revision: Some(payload.revision),
                             dotenv_source: payload.dotenv_source,
                             api_secrets: payload.api_secrets,
                             env_plain: payload.env_plain,
@@ -23998,6 +24136,7 @@ impl App {
                         self.active.dotenv_state = Some(outcome.baseline);
                     } else {
                         self.active.dotenv_state = None;
+                        self.active.environment_application.fail();
                         // Never acknowledge the source stamp until the exact runtime instance has
                         // accepted its default environment.
                         self.last_dotenv_state = None;
@@ -24041,6 +24180,11 @@ impl App {
     }
 
     fn observe_scrollback_policy(rt: &mut WorkspaceRuntime, events: &[runtime::RuntimeEvent]) {
+        rt.environment_application.observe(events);
+        if events.iter().any(|event| matches!(event, runtime::RuntimeEvent::SpawnFailed { message, .. } if matches!(message.message_id.as_str(), "runtime.spawn_failed.shell_secret" | "runtime.spawn_failed.agent_secret"))) {
+            // 회전된 physical slot은 다음 실행에서 다시 캡처한다.
+            rt.dotenv_state = None;
+        }
         Self::observe_scrollback_delivery(&mut rt.scrollback_delivery, rt.runtime_instance, events);
     }
 
@@ -25354,33 +25498,40 @@ impl App {
                 SettingsOutcomeKind::Loaded => {}
                 SettingsOutcomeKind::EnvSourcesSet(result) => {
                     if result.is_ok() {
-                        self.env_profiles_ui.sources_saved();
-                        self.env_profiles_ui
-                            .clear_error(ui::env_profiles::EnvUiErrorCode::SourcesSaveFailed);
+                        if projection_current {
+                            self.env_profiles_ui.sources_saved();
+                            self.env_profiles_ui
+                                .clear_error(ui::env_profiles::EnvUiErrorCode::SourcesSaveFailed);
+                        }
                         self.workspace_environment_changed(&outcome.workspace_id);
-                    } else {
+                    } else if projection_current {
                         self.env_profiles_ui
                             .report_error(ui::env_profiles::EnvUiErrorCode::SourcesSaveFailed);
                     }
                 }
                 SettingsOutcomeKind::CredentialEnvSet(result) => {
                     if result.is_ok() {
-                        self.credentials_ui.binding_succeeded();
+                        if projection_current {
+                            self.credentials_ui.binding_succeeded();
+                        }
                         self.workspace_environment_changed(&outcome.workspace_id);
-                    } else {
+                    } else if projection_current {
                         self.credentials_ui
                             .report_error(ui::credentials::CredentialsUiErrorCode::BindingFailed);
                     }
                 }
                 SettingsOutcomeKind::CredentialAdded(result) => match result {
                     Ok(()) => {
-                        self.credentials_ui.add_succeeded();
+                        if projection_current {
+                            self.credentials_ui.add_succeeded();
+                        }
                         self.workspace_environment_changed(&outcome.workspace_id);
                         self.invalidate_env_api_projects();
                     }
-                    Err(_) => self
+                    Err(_) if projection_current => self
                         .credentials_ui
                         .report_error(ui::credentials::CredentialsUiErrorCode::AddFailed),
+                    Err(_) => {}
                 },
                 SettingsOutcomeKind::CredentialDeleted {
                     credential_id,
@@ -31664,6 +31815,23 @@ impl eframe::App for App {
             (!project.path.trim().is_empty() && !project.path_missing)
                 .then(|| PathBuf::from(&project.path))
         });
+        let application_view = if self.settings_open && is_environment {
+            std::iter::once(&self.active)
+                .chain(self.warm.values())
+                .find(|runtime| runtime.id == settings_wsid)
+                .map(|runtime| {
+                    runtime.environment_application.view(|id| {
+                        runtime
+                            .session_titles
+                            .get(&id)
+                            .map(|title| ui::workspace::display_pane_title(title, &text))
+                            .unwrap_or_else(|| format!("{}", id.0))
+                    })
+                })
+                .unwrap_or_default()
+        } else {
+            Default::default()
+        };
         let env_project_rows_loading =
             self.env_api_projects_cache.is_none() && self.env_project_rows_in_flight.is_some();
         let env_project_rows_failed = self.env_project_rows_failed;
@@ -31949,6 +32117,11 @@ impl eframe::App for App {
                                                     );
                                                 }
 
+                                                ui::env_profiles::render_application_status(
+                                                    ui,
+                                                    &application_view,
+                                                    &text,
+                                                );
                                                 if let Some(action) =
                                                     self.env_profiles_ui.contents_compact(
                                                         ui,
@@ -43124,6 +43297,14 @@ mod tests {
             .payload
             .unwrap();
         assert_eq!(
+            payload.revision,
+            execute_dotenv_sync_job(&mut resource, job())
+                .unwrap()
+                .payload
+                .unwrap()
+                .revision
+        );
+        assert_eq!(
             payload.api_secrets,
             vec![("SERVICE_KEY".into(), "api-credential".into())]
         );
@@ -43158,14 +43339,12 @@ mod tests {
             .unwrap()
             .set_credential_env_binding(&workspace, "api-credential", None)
             .unwrap();
-        assert!(
-            execute_dotenv_sync_job(&mut resource, job())
-                .unwrap()
-                .payload
-                .unwrap()
-                .api_secrets
-                .is_empty()
-        );
+        let unbound = execute_dotenv_sync_job(&mut resource, job())
+            .unwrap()
+            .payload
+            .unwrap();
+        assert!(unbound.api_secrets.is_empty());
+        assert_ne!(unbound.revision, payload.revision);
     }
 
     #[test]

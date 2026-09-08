@@ -201,6 +201,15 @@ pub struct UiConfig {
     /// DB 행은 보존하고, 사용자가 워크스페이스 선택기로 다시 열 때까지 목록에서 숨긴다.
     #[serde(default)]
     pub closed_workspace_ids: BTreeSet<String>,
+    /// 사이드바 워크스페이스 표시 순서 — 사용자가 드래그로 정한 결과. 순서는 워크스페이스의
+    /// 속성이 아니라 **이 기기의 표시 취향**이라 DB가 아니라 config에 산다. 목록에 없는 id는
+    /// 생성순으로 뒤에 붙으므로, 새로 만든 워크스페이스는 자연히 맨 아래로 간다.
+    /// 드래그 결과는 **덮어쓰기가 아니라 병합**이다 — 사이드바가 넘겨주는 목록은 그때 보이던
+    /// 행뿐이라, 종료(숨김)한 워크스페이스까지 통째로 덮어쓰면 그 자리를 영영 잃는다.
+    /// 숨긴 id는 저장된 상대 순서를 지킨 채 뒤에 남고, 실제로 **삭제된** id만
+    /// `refresh_workspaces`의 정리에서 빠진다(2026-09-03 리뷰 defect 1·5).
+    #[serde(default)]
+    pub workspace_order: Vec<String>,
     /// 환경 및 API 프로젝트 목록에서 사용자가 `X`로 닫은 workspace ID. 이 상태는
     /// sidebar의 workspace 종료/실행 상태와 독립이며 `+`로 같은 폴더를 다시 고르면 해제된다.
     #[serde(default)]
@@ -280,6 +289,7 @@ impl Default for UiConfig {
             last_workspace_id: None,
             confirm_workspace_close: false,
             closed_workspace_ids: BTreeSet::new(),
+            workspace_order: Vec::new(),
             hidden_env_project_ids: BTreeSet::new(),
             ui_font: None,
             ui_scale: 1.0,
@@ -885,6 +895,20 @@ mod tests {
         assert_eq!(parsed.ui.last_workspace_id, None);
         assert!(parsed.ui.closed_workspace_ids.is_empty());
         assert!(parsed.ui.hidden_env_project_ids.is_empty());
+        assert!(parsed.ui.workspace_order.is_empty());
+    }
+
+    /// 드래그로 바꾼 사이드바 순서는 앱을 다시 켜도 그대로여야 한다(2026-09-03 사용자).
+    /// 리스트라 **순서 자체가 값**이다 — BTreeSet처럼 정렬되면 의미가 사라지므로 넣은
+    /// 순서 그대로 돌아오는지 본다.
+    #[test]
+    fn 워크스페이스_순서는_넣은_그대로_roundtrip된다() {
+        let mut c = Config::default();
+        assert!(c.ui.workspace_order.is_empty());
+        c.ui.workspace_order = vec!["ws-c".to_owned(), "ws-a".to_owned(), "ws-b".to_owned()];
+        let text = toml::to_string_pretty(&c).unwrap();
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert_eq!(parsed.ui.workspace_order, ["ws-c", "ws-a", "ws-b"]);
     }
 
     #[test]

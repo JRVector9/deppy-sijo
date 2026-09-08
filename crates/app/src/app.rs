@@ -4693,7 +4693,10 @@ fn new_env_project_rows_worker(db_path: PathBuf, ctx: egui::Context) -> EnvProje
         move || {
             let db_path = db_path.clone();
             let mut db = None;
-            move |job: EnvProjectRowsJob| {
+            move |mut job: EnvProjectRowsJob| {
+                // 넘어온 목록은 사이드바 순서로 정렬돼 있다. 환경 및 API 목록은 사이드바와
+                // 독립 도메인이라 여기서 자기 순서(생성순)를 세운다.
+                App::sort_workspaces_for_env_projects(&mut job.workspaces);
                 let rows = (|| -> anyhow::Result<_> {
                     if db.is_none() {
                         db = Some(Db::open(&db_path)?);
@@ -22601,6 +22604,94 @@ impl App {
         }
     }
 
+    /// 사이드바에 저장된 순서(config)를 앞세워 워크스페이스를 정렬한다.
+    ///
+    /// 저장된 목록에 있는 것끼리는 그 순서대로, 목록에 없는 것은 그 뒤에 생성순으로 붙는다 —
+    /// 사용자가 순서를 정한 뒤 새로 만든 워크스페이스가 중간에 끼어들지 않고 맨 아래로 간다.
+    fn sort_workspaces_for_sidebar(workspaces: &mut [storage::WorkspaceRow], order: &[String]) {
+        workspaces.sort_by(|left, right| {
+            let rank = |id: &String| order.iter().position(|saved| saved == id);
+            match (rank(&left.id), rank(&right.id)) {
+                (Some(left_rank), Some(right_rank)) => left_rank.cmp(&right_rank),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => left
+                    .created_at
+                    .cmp(&right.created_at)
+                    .then(left.id.cmp(&right.id)),
+            }
+        });
+    }
+
+    /// 「환경 및 API」 프로젝트 목록의 순서 — **생성순 고정**이다.
+    ///
+    /// 사이드바 목록과 환경 목록은 독립 도메인이라(ui/settings.rs의
+    /// 「설정_네비의_관리그룹은_연결_환경_에이전트_셋뿐이다」 참조) 한쪽 순서가 다른 쪽으로
+    /// 새면 안 된다. 그런데 워커에 넘기는 `self.workspaces`는 이미 사이드바 순서로 정렬돼
+    /// 있어, 그대로 순회하면 드래그가 환경 목록까지 뒤집는다(2026-09-03 리뷰 defect 2).
+    /// 환경 목록은 여기서 자기 순서를 스스로 세운다 — DB의 `ORDER BY created_at, id`와
+    /// 같은 키를 써서 사이드바 정렬 이전의 원래 순서로 되돌린다.
+    fn sort_workspaces_for_env_projects(workspaces: &mut [storage::WorkspaceRow]) {
+        workspaces.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then(left.id.cmp(&right.id))
+        });
+    }
+
+    /// 드래그가 emit한 순서를 저장된 순서에 **병합**한다(덮어쓰기가 아니다).
+    ///
+    /// `dragged`는 그때 사이드바에 보이던 행만 담는다 — 「워크스페이스 종료」로 숨겼거나
+    /// 생성 시 자동으로 숨겨진 워크스페이스는 빠져 있다. 통째로 덮어쓰면 그 id가 저장된
+    /// 자리를 영영 잃고, 다시 열 때 생성순 맨 아래로 떨어지며 강조색까지 바뀐다
+    /// (2026-09-03 리뷰 defect 1). 그래서 살아 있지만(`known`) emit되지 않은 id는 저장된
+    /// 상대 순서를 지킨 채 **드래그 결과 뒤**에 붙인다 — 화면에 없는 행이라 사용자가 방금
+    /// 만든 순서를 흔들지 않는 자리가 뒤다. `known`에 없는 id(= DB에서 지워진 것)는 떨군다.
+    fn merge_workspace_order(
+        saved: &[String],
+        dragged: &[String],
+        known: &std::collections::HashSet<&str>,
+    ) -> Vec<String> {
+        let mut merged = dragged.to_vec();
+        let preserved: Vec<String> = saved
+            .iter()
+            .filter(|id| {
+                known.contains(id.as_str()) && !merged.iter().any(|kept| kept == id.as_str())
+            })
+            .cloned()
+            .collect();
+        merged.extend(preserved);
+        merged
+    }
+
+    /// 순서 목록에서 **삭제된** 워크스페이스 id만 걷어낸다 — 정리하지 않으면 지운 프로젝트가
+    /// config에 영영 쌓인다(2026-09-03 리뷰 defect 5). 종료(숨김)한 워크스페이스는
+    /// `self.workspaces`에 그대로 있어 `known`에 들므로 살아남는다 — 여기서 같이 지우면
+    /// defect 1(숨긴 워크스페이스가 자리를 잃는 문제)이 그대로 되살아난다.
+    fn prune_workspace_order(order: &mut Vec<String>, known: &std::collections::HashSet<&str>) {
+        order.retain(|id| known.contains(id.as_str()));
+    }
+
+    /// 드래그로 정한 사이드바 순서를 그 자리에서 반영하고 config에 남긴다 — 앱을 다시 켜도
+    /// 같은 순서로 뜬다. 목록은 드래그 시점에 **보이던** 사이드바 행뿐이라, 숨긴 워크스페이스의
+    /// 자리를 지키려면 저장된 순서와 병합해야 한다(`merge_workspace_order`).
+    fn apply_workspace_order(&mut self, order: Vec<String>) {
+        let known = self
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let merged = Self::merge_workspace_order(&self.config.ui.workspace_order, &order, &known);
+        if self.config.ui.workspace_order == merged {
+            return;
+        }
+        self.config.ui.workspace_order = merged;
+        Self::sort_workspaces_for_sidebar(&mut self.workspaces, &self.config.ui.workspace_order);
+        if let Err(error) = self.config.save(&self.config_path) {
+            tracing::warn!("워크스페이스 순서 저장 실패: {error:#}");
+        }
+    }
+
     fn upsert_workspace_projection(&mut self, row: storage::SettingsWorkspaceProjectionRow) {
         let anchor = row.folder_anchor;
         let workspace = storage::WorkspaceRow {
@@ -22617,11 +22708,7 @@ impl App {
             Some(existing) => *existing = workspace.clone(),
             None => self.workspaces.push(workspace.clone()),
         }
-        self.workspaces.sort_by(|left, right| {
-            left.created_at
-                .cmp(&right.created_at)
-                .then(left.id.cmp(&right.id))
-        });
+        Self::sort_workspaces_for_sidebar(&mut self.workspaces, &self.config.ui.workspace_order);
         match anchor {
             Some(anchor) => {
                 self.workspace_anchors.insert(workspace.id, anchor);
@@ -23783,6 +23870,10 @@ impl App {
                         }
                     })
                     .collect();
+                Self::sort_workspaces_for_sidebar(
+                    &mut self.workspaces,
+                    &self.config.ui.workspace_order,
+                );
                 self.workspace_anchors = anchors;
             }
             Err(_) => tracing::warn!(
@@ -23827,8 +23918,12 @@ impl App {
             .ui
             .hidden_env_project_ids
             .retain(|id| workspaces.iter().any(|workspace| workspace.id == *id));
+        // 실제로 삭제된 워크스페이스 ID만 저장 순서에서 정리한다.
+        let order_before = self.config.ui.workspace_order.len();
+        Self::prune_workspace_order(&mut self.config.ui.workspace_order, &known_workspace_ids);
         if (self.config.ui.closed_workspace_ids.len() != persisted_before
-            || self.config.ui.hidden_env_project_ids != hidden_env_before)
+            || self.config.ui.hidden_env_project_ids != hidden_env_before
+            || self.config.ui.workspace_order.len() != order_before)
             && let Err(error) = self.config.save(&self.config_path)
         {
             tracing::warn!("삭제 워크스페이스 UI 숨김 표식 정리 저장 실패: {error:#}");
@@ -27443,6 +27538,9 @@ impl eframe::App for App {
                     self.stage_workspace_controller_action(
                         WorkspaceControllerAction::SwitchWorkspace(workspace_id),
                     );
+                }
+                Some(ui::file_tree::SidebarAction::ReorderWorkspaces(order)) => {
+                    self.apply_workspace_order(order);
                 }
                 Some(ui::file_tree::SidebarAction::ActivatePersistedSession {
                     workspace_id,
@@ -43484,6 +43582,251 @@ mod tests {
         assert!(
             call.contains("&self.config.agents.disabled,"),
             "거부 목록은 스냅샷과 별개 인자로 전달돼야 한다: {call}"
+        );
+    }
+
+    /// 드래그로 정한 순서가 생성순보다 우선한다. 순서 목록에 없는 워크스페이스(= 사용자가
+    /// 순서를 정한 뒤 새로 만든 것)는 중간에 끼어들지 않고 생성순으로 맨 뒤에 붙는다.
+    #[test]
+    fn 저장된_순서가_생성순보다_먼저다() {
+        let row = |id: &str, created_at: &str| storage::WorkspaceRow {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            path: format!("/projects/{id}"),
+            created_at: created_at.to_owned(),
+        };
+        // 입력을 일부러 흐트러뜨린다 — 이미 정렬된 벡터를 넣으면 아래 첫 단언이
+        // `Ordering::Equal`만 돌려주는 비교자도 통과시킨다(2026-09-03 리뷰 defect 4).
+        let mut workspaces = vec![
+            row("c", "2026-01-03"),
+            row("newer", "2026-09-04"),
+            row("a", "2026-01-01"),
+            row("new", "2026-09-03"),
+            row("b", "2026-01-02"),
+        ];
+
+        // 저장된 순서가 없으면 예전 그대로 생성순.
+        App::sort_workspaces_for_sidebar(&mut workspaces, &[]);
+        let ids: Vec<&str> = workspaces.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(ids, ["a", "b", "c", "new", "newer"]);
+
+        // 사용자가 c → a → b로 끌어 놓은 뒤.
+        let order = ["c".to_owned(), "a".to_owned(), "b".to_owned()];
+        App::sort_workspaces_for_sidebar(&mut workspaces, &order);
+        let ids: Vec<&str> = workspaces.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["c", "a", "b", "new", "newer"],
+            "저장된 것은 그 순서대로, 나머지는 생성순으로 뒤에"
+        );
+
+        // 이미 정렬된 목록을 다시 정렬해도 흔들리지 않는다(매 projection 갱신마다 돈다).
+        App::sort_workspaces_for_sidebar(&mut workspaces, &order);
+        let ids: Vec<&str> = workspaces.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(ids, ["c", "a", "b", "new", "newer"]);
+
+        // 지워진 워크스페이스 id가 순서 목록에 남아 있어도 남은 것들의 순서는 유지된다.
+        let stale = [
+            "gone".to_owned(),
+            "c".to_owned(),
+            "a".to_owned(),
+            "b".to_owned(),
+        ];
+        App::sort_workspaces_for_sidebar(&mut workspaces, &stale);
+        let ids: Vec<&str> = workspaces.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(ids, ["c", "a", "b", "new", "newer"]);
+    }
+
+    /// 저장된 순서가 없을 때의 정렬은 DB의 `ORDER BY created_at, id`
+    /// (`storage::Db::settings_workspace_projection_rows`)와 **바이트 단위로 같아야** 한다.
+    /// 생성시각이 같은 워크스페이스(같은 초에 만든 두 개, 마이그레이션으로 일괄 삽입된 것)는
+    /// id 오름차순 tiebreak이 유일한 결정자다 — 이게 없으면 DB 순서와 화면 순서가 갈린다
+    /// (2026-09-03 리뷰 defect 4: 기존 fixture는 created_at이 모두 달라 이 갈래를 못 밟았다).
+    #[test]
+    fn 저장된_순서가_없으면_생성시각_동률은_id순으로_갈린다() {
+        let row = |id: &str, created_at: &str| storage::WorkspaceRow {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            path: format!("/projects/{id}"),
+            created_at: created_at.to_owned(),
+        };
+        let mut workspaces = vec![
+            row("ws-c", "2026-01-01T00:00:00Z"),
+            row("ws-a", "2026-01-01T00:00:00Z"),
+            row("ws-b", "2026-01-01T00:00:00Z"),
+        ];
+
+        App::sort_workspaces_for_sidebar(&mut workspaces, &[]);
+
+        let ids: Vec<&str> = workspaces.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["ws-a", "ws-b", "ws-c"],
+            "created_at 동률이면 id 오름차순 — SQLite ORDER BY created_at, id와 동일"
+        );
+    }
+
+    /// 사이드바가 넘겨주는 목록은 **그때 보이는 행**뿐이라, 「워크스페이스 종료」로 숨긴
+    /// 워크스페이스는 빠져 있다. 통째로 덮어쓰면 숨긴 워크스페이스가 저장해 둔 자리를 영영
+    /// 잃고, 다시 열 때 생성순 맨 아래로 떨어지며 강조색까지 바뀐다(2026-09-03 리뷰 defect 1).
+    /// 병합 규칙: 드래그 결과가 앞, 살아 있지만 emit되지 않은 id는 저장된 상대 순서를 지킨 채
+    /// **그 뒤**에 붙는다 — 보이지 않는 행이라 눈에 보이는 순서를 흔들지 않는 자리가 뒤다.
+    #[test]
+    fn 숨긴_워크스페이스는_드래그_병합에서_자리를_잃지_않는다() {
+        let known = ["a", "b", "c"].into_iter().collect();
+        let saved = ["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        // "b"를 종료해 숨긴 상태에서 c를 a 위로 끌어 놓았다 → 사이드바는 c, a만 emit한다.
+        let dragged = ["c".to_owned(), "a".to_owned()];
+
+        let merged = App::merge_workspace_order(&saved, &dragged, &known);
+
+        assert_eq!(
+            merged,
+            ["c", "a", "b"],
+            "숨긴 b는 사라지지 않고 드래그 결과 뒤에 남는다"
+        );
+    }
+
+    /// 병합이 자리를 지켜준다고 **삭제된** 워크스페이스까지 남기면 config가 무한히 자란다.
+    /// `self.workspaces`에 없는 id(= DB에서 지워진 것)는 병합에서 떨어진다(2026-09-03 defect 1).
+    #[test]
+    fn 드래그_병합은_삭제된_워크스페이스_id를_떨군다() {
+        let known = ["a", "c"].into_iter().collect();
+        let saved = ["a".to_owned(), "gone".to_owned(), "c".to_owned()];
+        let dragged = ["c".to_owned(), "a".to_owned()];
+
+        let merged = App::merge_workspace_order(&saved, &dragged, &known);
+
+        assert_eq!(
+            merged,
+            ["c", "a"],
+            "DB에서 지워진 id는 순서 목록에서도 빠진다"
+        );
+    }
+
+    /// 「환경 및 API」 프로젝트 목록은 사이드바 목록과 **독립 도메인**이다
+    /// (ui/settings.rs 「설정_네비의_관리그룹은_연결_환경_에이전트_셋뿐이다」 참조).
+    /// 워커에 넘기는 `self.workspaces`는 사이드바 순서로 정렬돼 있으므로, 그대로 순회하면
+    /// 사이드바 드래그가 환경 목록 순서로 새 나간다(2026-09-03 리뷰 defect 2).
+    /// 환경 목록은 자기 순서(생성순)를 스스로 세운다.
+    #[test]
+    fn 환경_및_api_목록_순서는_사이드바_드래그와_독립이다() {
+        let row = |id: &str, created_at: &str| storage::WorkspaceRow {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            path: format!("/projects/{id}"),
+            created_at: created_at.to_owned(),
+        };
+        let mut workspaces = vec![
+            row("a", "2026-01-01"),
+            row("b", "2026-01-02"),
+            row("c", "2026-01-03"),
+        ];
+        // 사용자가 사이드바에서 c → a → b로 끌어 놓은 뒤의 self.workspaces 상태.
+        let order = ["c".to_owned(), "a".to_owned(), "b".to_owned()];
+        App::sort_workspaces_for_sidebar(&mut workspaces, &order);
+
+        App::sort_workspaces_for_env_projects(&mut workspaces);
+
+        let ids: Vec<&str> = workspaces.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["a", "b", "c"],
+            "환경 목록은 사이드바 순서가 아니라 생성순을 쓴다"
+        );
+    }
+
+    /// 워커가 실제로 그 정렬을 통과시키는지 고정한다 — 순수 함수만 테스트하면
+    /// 호출부를 지워도 초록이다. 워커는 DB가 있어야 돌아 소스로 고정한다(2026-09-03 defect 2).
+    #[test]
+    fn env_project_rows_워커는_생성순으로_되돌린_뒤_행을_만든다() {
+        let source = include_str!("app.rs");
+        let start = source
+            .find("fn new_env_project_rows_worker(")
+            .expect("워커 생성 함수를 찾지 못했다");
+        let end = source[start..]
+            .find("\nfn load_approval_snapshot(")
+            .map(|offset| start + offset)
+            .expect("워커 생성 함수의 끝을 찾지 못했다");
+        let worker = &source[start..end];
+        assert!(
+            worker.contains("App::sort_workspaces_for_env_projects(&mut job.workspaces)"),
+            "워커가 사이드바 순서를 그대로 물려받고 있다"
+        );
+    }
+
+    /// `apply_workspace_order`가 (1) 병합 결과를 쓰고 (2) 메모리 목록을 다시 정렬하고
+    /// (3) config에 영속하는지 고정한다. `App`은 egui 컨텍스트와 DB가 있어야 만들어져
+    /// 단위 테스트로 못 세우므로, 판단 로직은 순수 함수로 빼고 배선만 소스로 본다
+    /// (2026-09-03 리뷰 defect 3: 이 함수에 커버리지가 전혀 없어 `config.save`를 지워도 초록이었다).
+    #[test]
+    fn 순서_적용은_병합_재정렬_영속을_모두_한다() {
+        let source = include_str!("app.rs");
+        let start = source
+            .find("    fn apply_workspace_order(&mut self, order: Vec<String>) {")
+            .expect("apply_workspace_order를 찾지 못했다");
+        let end = source[start..]
+            .find("\n    fn upsert_workspace_projection(")
+            .map(|offset| start + offset)
+            .expect("apply_workspace_order의 끝을 찾지 못했다");
+        let body = &source[start..end];
+        assert!(
+            body.contains("Self::merge_workspace_order("),
+            "드래그 목록을 통째로 덮어쓰고 있다 — 저장된 순서와 병합해야 한다"
+        );
+        assert!(
+            body.contains("Self::sort_workspaces_for_sidebar(&mut self.workspaces"),
+            "메모리 목록을 다시 정렬하지 않으면 다음 projection 갱신까지 화면이 안 바뀐다"
+        );
+        assert!(
+            body.contains("self.config.save(&self.config_path)"),
+            "config에 저장하지 않으면 앱을 다시 켤 때 순서가 사라진다"
+        );
+    }
+
+    /// 삭제된 워크스페이스의 UI 숨김 표식 정리에 `workspace_order`도 포함한다 —
+    /// 셋 중 이것만 빠져 있어 지운 프로젝트 id가 config에 영영 남았다(2026-09-03 defect 5).
+    /// **종료(숨김)한 워크스페이스는 `self.workspaces`에 그대로 있으므로 살아남는다** —
+    /// 여기서 같이 지우면 defect 1이 그대로 되살아난다.
+    #[test]
+    fn 순서_정리는_삭제된_id만_걷어내고_숨긴_id는_남긴다() {
+        // "hidden"은 종료로 숨겼을 뿐 DB에 살아 있어 self.workspaces에 그대로 있다.
+        let known = ["a", "hidden", "c"].into_iter().collect();
+        let mut order = vec![
+            "a".to_owned(),
+            "gone".to_owned(),
+            "hidden".to_owned(),
+            "c".to_owned(),
+        ];
+
+        App::prune_workspace_order(&mut order, &known);
+
+        assert_eq!(
+            order,
+            ["a", "hidden", "c"],
+            "삭제된 gone만 빠지고 숨긴 hidden은 자리를 지킨다"
+        );
+    }
+
+    /// 정리 호출과 저장 조건이 실제로 배선돼 있는지 고정한다(2026-09-03 defect 5).
+    #[test]
+    fn refresh_workspaces는_순서_목록도_정리하고_저장한다() {
+        let source = include_str!("app.rs");
+        let start = source
+            .find("    fn refresh_workspaces(&mut self) {")
+            .expect("refresh_workspaces를 찾지 못했다");
+        let end = source[start..]
+            .find("\n    fn fresh_pressure(")
+            .map(|offset| start + offset)
+            .expect("refresh_workspaces의 끝을 찾지 못했다");
+        let body = &source[start..end];
+        assert!(
+            body.contains("Self::prune_workspace_order("),
+            "workspace_order만 정리에서 빠져 있다"
+        );
+        assert!(
+            body.contains("self.config.ui.workspace_order.len() != order_before"),
+            "순서 목록이 줄어든 것만으로는 config를 저장하지 않는다"
         );
     }
 }

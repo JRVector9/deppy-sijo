@@ -14437,14 +14437,16 @@ mod tests {
             .state_mut()
             .flush_render_side_effects_for_pass(&ctx, pass, false);
         assert!(
-            drain_protocol(harness.state_mut()).iter().any(|command| matches!(
-                command,
-                RuntimeCommand::ResizeTracked {
-                    session: SessionId(7),
-                    cols: 80,
-                    ..
-                }
-            )),
+            drain_protocol(harness.state_mut())
+                .iter()
+                .any(|command| matches!(
+                    command,
+                    RuntimeCommand::ResizeTracked {
+                        session: SessionId(7),
+                        cols: 80,
+                        ..
+                    }
+                )),
             "debounce가 끝나면 보존한 폭으로 tracked resize를 보내야 한다"
         );
     }

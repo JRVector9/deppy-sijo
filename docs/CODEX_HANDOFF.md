@@ -2523,3 +2523,21 @@
   `ps -o pid=,ppid=,pgid=,state=,etime=,command= -p 63974`; production Relay 검증은
   자격증명 확보 뒤 `docs/CODEX_HANDOFF.md`의 Relay Task 2 절에 적힌 staging 명령부터
   재개한다.
+
+
+## 2026-09-09 환경 및 API 개선 PR 착수
+
+- 목표: 사용자 감사 결과를 PR 단위로 정리하고 구현을 시작한다. 계획은 `docs/superpowers/plans/2026-09-09-environment-api-prs.md`. PR 순서는 조회 상태 → 파일 일관성 → credential 환경 연결 → 파일 선택/출처 → Agent 적용 상태다.
+- 현재 작업: PR 1 `fix/environment-snapshot-state`, worktree `/private/tmp/deppy-env-state-20260909`, base `origin/main` ea587b6. 기존 UI dirty worktree `/private/tmp/deppy-settings-session-background-20260909`와 PID 99747의 앱은 그대로 유지한다.
+- 완료: `settings_snapshot.rs`의 Loading/Ready/Failed 상태를 환경/Credential snapshot에 연결했다. 초기/프로젝트 전환은 Loading, 실제 조회 실패는 Failed, 정상 빈 목록은 Ready다. 성공/로딩 진입 때 조회 오류만 해제하고 다른 작업 오류는 보존한다. 조회되지 않은 상태의 편집 액션을 차단한다. 실패 snapshot을 포함한 완료 결과도 1초 뒤 재시도한다. 원본 DB 오류 문자열 없이 고정 코드로 실패를 기록한다.
+- 수정 파일: `crates/app/src/settings_snapshot.rs`, `main.rs`, `app.rs`, `ui/credentials.rs`, `ui/env_profiles.rs`, 계획 문서와 이 handoff. Cargo가 `Cargo.lock`의 기존 dependency 순서 1곳을 정렬했으며 버전은 변경되지 않았다.
+- 검증: 기존 코드에 성공 후 오류 해제를 요구하는 두 상태 테스트를 추가해 실제 FAIL을 확인했다(2 FAIL, 같은 필터의 기존 Keychain 무접근 테스트 1 PASS). 수정 후 관련 상태 테스트와 실제 DB snapshot 재시도 테스트까지 10 PASS. 명령은 `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo test -p deppy-sijo --bin deppy-sijo settings_load_ -- --test-threads=1`. 결과 `/tmp/deppy-env-state-final-test.log`.
+- 현재 검증: Codex CLI 읽기 소스 리뷰 `/tmp/deppy-env-state-review.txt` 생성 중, workspace clippy `--all-targets --locked -- -D warnings` 진행 중. fmt/i18n/diff 게이트와 PR 생성은 아직 남았다. 앱 패키징/재실행·화면 검증은 미실행이다.
+- 실패 접근: 처음 테스트 실패는 의도한 재현이다. 원본 오류를 삭제해 숨기거나 Keychain 권한 문제로 추정하지 않았다. 실제 운영 DB는 이전 감사에서 read-only SELECT 162회 오류 없이 확인했지만 이번 테스트는 별도 임시 DB만 사용한다.
+- 남은 작업: 리뷰 발견 사항 반영, 게이트 결과 기록, commit/draft PR. 이후 PR 2~5는 계획 단계이며 구현 완료로 보고하지 않는다. 재빌드/재실행은 사용자 승인 전 수행하지 않는다.
+- 다음 명령: `tail -n 30 /tmp/deppy-env-state-clippy.log`; `cat /tmp/deppy-env-state-review.txt`; `git diff --check`; 성공 뒤 `git add Cargo.lock crates/app/src/app.rs crates/app/src/main.rs crates/app/src/settings_snapshot.rs crates/app/src/ui/credentials.rs crates/app/src/ui/env_profiles.rs docs/CODEX_HANDOFF.md docs/superpowers/plans/2026-09-09-environment-api-prs.md`와 한국어 commit, `git push -u origin fix/environment-snapshot-state`, `gh pr create --draft --base main --head fix/environment-snapshot-state --body-file /tmp/deppy-env-state-pr.md`.
+
+- 리뷰 checkpoint: Codex CLI에서 Medium 2건을 발견했다. 기존 `.env` 저장/동기화/경로 실패가 조회 오류 코드를 공유해 해제되는 문제와, 저장 성공 후 재조회 실패가 Loaded 분기에만 묶여 재시도되지 않는 문제다. 작업별 오류 코드·성공 시 해당 코드 해제, 모든 수신 snapshot의 retry 적용으로 수정했다. 수정 후 상태 로직 테스트 11 PASS(`/tmp/deppy-env-state-reviewed-test.log`). 소스 재리뷰 진행 중이다.
+- 게이트 checkpoint: workspace clippy `--all-targets --locked -- -D warnings` PASS(19.97초), fmt/diff PASS, `cargo run --locked -p xtask -- i18n-check` PASS(리터럴 키 1124건/로케일 5개 대조). 리뷰 반영으로 app 소스가 바뀌어 app all-targets clippy를 다시 실행 중이다. 화면 테스트/패키지 빌드/재실행은 수행하지 않았다.
+
+- 최종 checkpoint: 두 리뷰 지적을 반영한 재리뷰는 새 발견 사항 없음으로 종료했다(`/tmp/deppy-env-state-rereview.txt`). app all-targets clippy 재검증 PASS, 수정 후 fmt/diff 검사 PASS. 첫 PR은 코드/로직 검증 완료, 사용자 화면 확인 대기로 draft 생성한다. PR 2~5는 아직 구현 전이다.

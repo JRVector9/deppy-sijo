@@ -1,3 +1,4 @@
+use crate::settings_snapshot::SnapshotLoadState;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -86,7 +87,7 @@ impl std::error::Error for CredentialSnapshotError {}
 /// Bounded immutable render input. The composition root replaces it only when revision changes.
 pub struct CredentialsSnapshot {
     revision: u64,
-    available: bool,
+    state: SnapshotLoadState,
     items: Arc<[CredentialListItem]>,
 }
 
@@ -108,15 +109,22 @@ impl CredentialsSnapshot {
         }
         Ok(Self {
             revision,
-            available: true,
+            state: SnapshotLoadState::Ready,
             items: items.into(),
         })
+    }
+
+    pub fn loading(revision: u64) -> Self {
+        Self {
+            state: SnapshotLoadState::Loading,
+            ..Self::unavailable(revision)
+        }
     }
 
     pub fn unavailable(revision: u64) -> Self {
         Self {
             revision,
-            available: false,
+            state: SnapshotLoadState::Failed,
             items: Arc::from([]),
         }
     }
@@ -126,7 +134,7 @@ impl CredentialsSnapshot {
     }
 
     pub const fn is_available(&self) -> bool {
-        self.available
+        matches!(self.state, SnapshotLoadState::Ready)
     }
 
     pub fn items(&self) -> &[CredentialListItem] {
@@ -453,7 +461,13 @@ impl CredentialsUi {
         self.sync_snapshot(snapshot);
         let mut intent = None;
         if !snapshot.is_available() {
-            self.error = Some(CredentialsUiErrorCode::SnapshotUnavailable);
+            if snapshot.state == SnapshotLoadState::Loading {
+                ui.spinner();
+            }
+            if let Some(error) = self.error {
+                ui.colored_label(ui.visuals().error_fg_color, error.message());
+            }
+            return None;
         }
 
         ui.add_space(2.0);
@@ -491,6 +505,9 @@ impl CredentialsUi {
     }
 
     fn sync_snapshot(&mut self, snapshot: &CredentialsSnapshot) {
+        snapshot
+            .state
+            .reconcile_error(&mut self.error, CredentialsUiErrorCode::SnapshotUnavailable);
         if self.snapshot_revision == Some(snapshot.revision()) {
             return;
         }
@@ -1076,6 +1093,59 @@ mod tests {
                 .collect();
             CredentialsSnapshot::try_new(9, items).unwrap()
         }
+    }
+
+    #[test]
+    fn settings_load_로딩과_빈_정상목록은_오류가_아니다() {
+        let mut view = CredentialsUi::new();
+        view.report_error(CredentialsUiErrorCode::SnapshotUnavailable);
+        let loading = CredentialsSnapshot::loading(8);
+        view.sync_snapshot(&loading);
+        assert!(!loading.is_available());
+        assert_eq!(view.error, None);
+        let ready = CredentialsSnapshot::try_new(8, Vec::new()).unwrap();
+        view.sync_snapshot(&ready);
+        assert!(ready.is_available());
+        assert_eq!(view.error, None);
+    }
+
+    #[test]
+    fn settings_load_실제실패는_오류를_남기고_재조회성공으로_복구한다() {
+        let mut view = CredentialsUi::new();
+        let failed = CredentialsSnapshot::unavailable(8);
+        view.sync_snapshot(&failed);
+        assert_eq!(
+            view.error,
+            Some(CredentialsUiErrorCode::SnapshotUnavailable)
+        );
+        let ready = CredentialsSnapshot::try_new(8, Vec::new()).unwrap();
+        view.sync_snapshot(&ready);
+        assert_eq!(view.error, None);
+    }
+
+    #[test]
+    fn settings_load_조회상태변경은_별도_작업오류를_지우지_않는다() {
+        let mut view = CredentialsUi::new();
+        view.report_error(CredentialsUiErrorCode::DeleteFailed);
+        for snapshot in [
+            CredentialsSnapshot::loading(8),
+            CredentialsSnapshot::unavailable(8),
+            CredentialsSnapshot::try_new(8, Vec::new()).unwrap(),
+        ] {
+            view.sync_snapshot(&snapshot);
+            assert_eq!(view.error, Some(CredentialsUiErrorCode::DeleteFailed));
+        }
+    }
+
+    #[test]
+    fn settings_load_성공하면_이전_조회_오류를_지운다() {
+        let mut view = CredentialsUi::new();
+        let ready = CredentialsSnapshot::try_new(7, Vec::new()).unwrap();
+        view.sync_snapshot(&ready);
+        view.report_error(CredentialsUiErrorCode::SnapshotUnavailable);
+        // 같은 revision에서도 정상 결과를 반영하면 오래된 조회 오류가 남지 않는다.
+        view.sync_snapshot(&ready);
+        assert_eq!(view.error, None);
     }
 
     #[test]

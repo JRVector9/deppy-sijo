@@ -2541,3 +2541,5 @@
 - 게이트 checkpoint: workspace clippy `--all-targets --locked -- -D warnings` PASS(19.97초), fmt/diff PASS, `cargo run --locked -p xtask -- i18n-check` PASS(리터럴 키 1124건/로케일 5개 대조). 리뷰 반영으로 app 소스가 바뀌어 app all-targets clippy를 다시 실행 중이다. 화면 테스트/패키지 빌드/재실행은 수행하지 않았다.
 
 - 최종 checkpoint: 두 리뷰 지적을 반영한 재리뷰는 새 발견 사항 없음으로 종료했다(`/tmp/deppy-env-state-rereview.txt`). app all-targets clippy 재검증 PASS, 수정 후 fmt/diff 검사 PASS. 첫 PR은 코드/로직 검증 완료, 사용자 화면 확인 대기로 draft 생성한다. PR 2~5는 아직 구현 전이다.
+
+- PR 생성 완료: https://github.com/JRVector9/deppy-sijo/pull/179 (draft), 구현 commit `7f3fb81`. main 머지와 앱 재빌드/재실행은 하지 않았다. 다음 구현 대상은 계획의 PR 2 파일 일관성이다. 분리 명령: `git worktree add -b fix/environment-file-consistency /private/tmp/deppy-env-files-20260909 origin/fix/environment-snapshot-state`; 실제 작성 전에 PR 2의 원본 변경/부분 실패 및 보관값 표시 계약을 확인한다.

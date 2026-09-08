@@ -10,6 +10,7 @@
 
 ## PR 1 — 설정 조회 상태와 오류 수명 수정
 
+- GitHub PR: #179 (draft), 구현 commit `7f3fb81`.
 - 브랜치: `fix/environment-snapshot-state`, base `main`.
 - 파일: `crates/app/src/settings_snapshot.rs`, `main.rs`, `app.rs`, `ui/env_profiles.rs`, `ui/credentials.rs`.
 - [x] 기존 코드에서 정상 snapshot 수신 후 오류가 남는 상태 전이 테스트를 실패시킨다.

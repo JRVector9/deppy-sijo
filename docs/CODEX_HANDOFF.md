@@ -2333,3 +2333,56 @@
 - Failed approaches: an initial unbounded `codex review --uncommitted` ran extensive checks but never produced a final review and was stopped by exact PID; it also attempted the invalid `cargo test -p deppy-sijo --lib` command even though the app has no library target. The first RED-test draft used unavailable `Context::run`, then captured `WorkspaceUi` too broadly; both compile-only mistakes were corrected before the intended RED assertion was observed. The first final format check found one line-wrap difference; `cargo fmt --all` corrected it and the rerun passed.
 - Remaining work: push this clean landing branch, create a PR to `main`, wait for required checks, merge only if green, close superseded PRs #147 and #148, and preserve PRs #146 and #149 plus their dependent remote branches for further development.
 - Exact next commands: `git push -u origin land/ime-resize-ready-20260906`; create a `main` PR for commits `4903b39` and `bbead4f`; run `gh pr checks <new-pr> --watch`; merge the new PR after all required checks pass; close #147 and #148 without deleting the `fix/window-resize-flicker` branch because PR #149 still targets it.
+
+## 2026-09-08 PR B scrollback 정책 계약 시작
+
+- 목표: origin/main 45e66cc 기반 feat/scrollback-policy-contract에서 settings 숫자 직접 입력과 공통 범위·Auto/Manual 예산 계약을 분리 개발한다.
+- 완료: 코드 경계 조사, `docs/superpowers/plans/2026-09-08-scrollback-policy-contract.md` 작성.
+- 변경 파일: 위 계획과 handoff만.
+- 결정: terminal policy→app/runtime 의존; 설정100..100000·wire0유지; 이전 수동 예산은Manual·신규Auto; RAM/128 clamp128..512 MiB·실패128 MiB.
+- 테스트: 아직 실행하지 않음. UI 재빌드/재실행 금지, 시각 검증 대기.
+- 실패 접근: 없음.
+- 남은 작업: settings patch 분리, TDD 구현, codex 리뷰, gate, 커밋/push/PR 생성.
+- 다음 명령: `git show --format= 2fa3052 -- crates/app/src/ui/settings.rs`; `CARGO_BUILD_JOBS=2 cargo test -p terminal policy --locked`.
+
+### PR B 첫 RED/GREEN 및 patch 분리
+- settings.rs만 2fa3052/7584847에서 추출했다. 첫 patch는 이전 parser helper 차이로 두 곳 충돌하여 해당 helper·테스트를 포함한 숫자 입력 버전으로 해결했다. session/Markdown은 변경하지 않았다.
+- `CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-deps-target-20260907 cargo test -p terminal policy --locked`: 최초 함수 누락 컴파일 실패를 기록한 뒤 고정128 stub에서 32GiB→256 기대값의 assertion RED(1 failed)를 확인했다. 계산 구현 후 GREEN(1 passed). 로그 `/private/tmp/deppy-policy-{red,green}.log`.
+- config 마이그레이션·실제 terminal 페이지 최소100줄 테스트를 추가했다. config RED 컴파일 진행 중.
+- 후속: config/UI RED 확인→마이그레이션·Auto UI·locale 연결→focused tests/review/gate. UI 실화면 검증은 계속 대기.
+
+### PR B 설정·마이그레이션 GREEN
+- 공통 정책 `terminal::policy`를 추가했고 app/runtime의 기존 의존 방향을 유지한다. runtime/remote 변경은 상수 import뿐이며 wire 0 허용과 protocol v12를 유지한다.
+- 기존 TerminalConfig 모드 누락은 Manual, 신규 Default는 Auto. RAM/128 clamp128..512 MiB(실패128)를 기존 cache policy 전파 경로에 연결했다. live scrollback/backend 변경은 없다.
+- 5개 locale에 새 세션 적용·실제 class 상한·보관량 감소·Auto/Manual 예산 안내를 추가했다. 수동 입력값은 모드 전환 후에도 보존하며 자동값은 비활성 숫자 위젯에 표시한다.
+- RED: config 신규 Auto 필드 누락 assertion, 실제 terminal 페이지에서100입력이1000이 되는 assertion, Automatic 선택지 부재를 각각 확인했다. 로그 `/private/tmp/deppy-{config,settings,cache-ui}-red.log`.
+- GREEN: 같은 CARGO_BUILD_JOBS=2/CARGO_TARGET_DIR 환경에서 `cargo test -p deppy-sijo --bin deppy-sijo ui::settings::tests --locked -- --test-threads=1` 19 passed; `... config::tests ...` 39 passed; `cargo test -p i18n --locked` 8 passed.
+- 추가 검증: 모드 전환 직전 미확정 직접 입력이 유실되지 않는 assert를 같은 kittest에 추가했다. runtime command focused와 codex 읽기 전용 소스 리뷰 진행 중.
+- 실패 접근: fmt check는 변경 파일의 포맷 차이를 보고하여 최종 format 적용 예정. 외부 qwen/skillplatform/vision-paper SKILL frontmatter 경고가 codex review 시작 로그에 있으나 리뷰는 계속 진행 중.
+- 다음 명령: `cargo fmt --all`; settings 추가 focus 회귀와 runtime wire 검증; strict clippy; review 결과 반영; 커밋/push/PR. UI 시각 검증 대기.
+
+### PR B 리뷰 중 추가 정밀도 회귀
+- runtime command focused 18 passed, `와이어_검증_규칙` 1 passed, `plain_코덱은` 1 passed: 기존0허용/최대값/enum순서/golden bytes 보존.
+- `cargo fmt --all` 후 `cargo fmt --all --check`, `git diff --check` 통과.
+- `CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-deps-target-20260907 cargo clippy -p terminal -p runtime -p deppy-sijo --all-targets --locked -- -D warnings` 통과(추가 정밀도 수정 전).
+- 자체 리뷰에서 1.0→1.0000001 직접 입력이 실제 값은 바꾸지만 epsilon 비교로 config_changed가 false인 결함 발견. `... cargo test -p deppy-sijo --bin deppy-sijo kittest_소수_최소_변경 --locked -- --test-threads=1`에서 의도한 assertion RED를 확인했다(`/private/tmp/deppy-numeric-epsilon-red.log`). 유한 값의 정확한 비교로 수정했고 settings 전체 focused 재검사 중이다.
+- Enter 없이 수동 예산416을 입력하고 Auto로 전환해도 입력값이 보존되는 kittest GREEN(1 passed).
+- codex review는 읽기 전용으로 계속 진행 중. 최종 소스에서 clippy/format/diff gate를 재확인하고 커밋/push/PR을 생성한다.
+
+### PR B codex 리뷰 반영
+- 첫 codex review는 P2 두 건을 보고했다.
+  - 수용: Linux/Windows RAM 조회가 없어 항상128 MiB로 폴백하던 점. 기존 libc의 sysconf(페이지수×페이지크기), 기존 windows-sys의 GlobalMemoryStatusEx로 보완했다. macOS sysctl 조회와 warm 권장 기본값 정책은 유지했다. 추가 dependency/lock 변경 없음.
+  - 미수용: wire1..99 거부 제안. 이번 계약은 설정100..100000과 기존 wire0..100000 유지이며 wire 최소값 변경은 비호환이므로 적용하지 않았다. runtime command의 기존0허용 테스트와 postcard golden 검증이 통과했다.
+- RAM 페이지 계산: 정상16GiB에서None을 반환하는 stub의 RED를 확인한 뒤 음수·0·checked_mul overflow를None으로 처리하도록 구현했다. 최종 config focused40 passed, settings focused20 passed.
+- `/private/tmp/deppy-policy-codex-followup.log`에서 후속 수정 범위를 읽기 전용 재검토 중이다.
+- 플랫폼 한계: Windows/Linux OS 경로는 공식 crate binding의 시그니처를 정적으로 확인했고 해당 실환경 실행·cross-target 검증은 미실행. macOS 로직 테스트만 PASS이며 이 한계를 다른 플랫폼 PASS로 표현하지 않는다.
+- 시각 검증: 앱 재빌드/재실행하지 않음, 실제 UI/IME 시각 검증 대기.
+
+### PR B 최종 로컬 게이트
+- 최종 설정20 tests, config40 tests GREEN. i18n8, policy1, runtime command18 + wire1 + plain postcard1 GREEN. 새 Linux 페이지 변환은 양수/음수/0/overflow 로직을 host 테스트에서 검증했다.
+- 최종 `CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-deps-target-20260907 cargo clippy -p terminal -p runtime -p deppy-sijo --all-targets --locked -- -D warnings` PASS(`/private/tmp/deppy-policy-clippy-final.log`, exit0). `cargo fmt --all --check`, `git diff --check` PASS.
+- PR 본문 초안: `/private/tmp/deppy-scrollback-policy-pr-body.md`. 다음 단계: 후속 리뷰 결과 기록→지정 파일 git add→한국어 구현 커밋→일반 push→main 대상 PR 생성.
+
+### PR B 후속 리뷰 완료
+- 후속 codex review(exit0)는 설정100..100000 / wire0..100000·protocol 유지, Linux/Windows RAM 조회, f32 정확 비교에서 남은 확정 결함 없음으로 종료했다(`/private/tmp/deppy-policy-codex-followup.log`).
+- 최종 소스 strict clippy, fmt, diff gate PASS. 구현 커밋과 PR 생성 단계로 진행한다.

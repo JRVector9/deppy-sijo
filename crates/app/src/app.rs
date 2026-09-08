@@ -22163,7 +22163,7 @@ impl App {
         runtime::RuntimeCommand::SetTerminalCachePolicy {
             max_exited_backends: self.config.terminal.exited_backend_cap as usize,
             cache_budget_bytes: per_runtime_cache_budget_bytes(
-                self.config.terminal.cache_budget_mb,
+                self.config.terminal.effective_cache_budget_mib(),
                 1 + self.warm.len(),
             ),
         }

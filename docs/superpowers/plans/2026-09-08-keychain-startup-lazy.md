@@ -57,7 +57,7 @@ git diff --check
 ### Task 4: 게시
 
 - [x] handoff/Obsidian 일지에 실제 결과·실패·후속 한계를 기록한다.
-- [ ] 한국어 commit/push 후 main 대상 PR을 생성하고 check 상태를 보고한다.
+- [x] 한국어 commit/push 후 main 대상 PR을 생성하고 check 상태를 보고한다.
 
 ```sh
 git commit -m 'fix(secret): 시작 Keychain 정리를 명시적 사용 시점으로 지연한다'

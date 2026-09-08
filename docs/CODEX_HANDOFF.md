@@ -2361,3 +2361,9 @@
 - 실패 접근: eager 호출을 한 번 제거해도 Codex API key has가1회남아 실제spybacktrace로 추가제거했다. naive지연전체ledger정리는새Staging을삭제해RED였다. test의중간revision2대기는discovery완료revision3을놓치는race였으므로실제backend호출로검증했다. 신규test파일boundary는파일내cfg(test)모듈로 명시하고xtask규칙은변경하지않았다.
 - 수정파일: app.rs/새keychain_startup_tests.rs/agent_sessions.rs, appdevCargo+lock, storage/db.rs v38generation/CAS, connector-service ports/coordinator, 계획/계약/handoff. 다음 명령: git commit -m 'fix(secret): 시작 Keychain 접근을 명시적 사용으로 지연한다'; git push -u origin fix/keychain-startup-lazy; gh pr create --base main --head fix/keychain-startup-lazy --body-file /private/tmp/deppy-keychain-startup-pr-body.md.
 - 착지주의: 독립main v38은 #161 v38/#163 v39와번호충돌한다. 먼저착지한PR을기준으로나머지는git merge origin/main 후migration을새끝번호로재배치·전체migration재검증한다. rebase/force-push금지. 다른lane상태는보존했다.
+
+## 2026-09-08 R4 PR 게시 완료
+
+- PR https://github.com/JRVector9/deppy-sijo/pull/166, base main, 제품 HEAD4bf99410b62ae912d4674e616d351b8399c96d54. 이 checkpoint는문서만추가한다. Workstep Obsidian 일지 `2026-09-08 시작 Keychain 접근 지연.md` 기록완료.
+- 제품HEAD GitGuardian SUCCESS. Actions run34219643252/34219643223에서4개job은runner_id0/steps[] FAILURE, Linux Relayjob은아직queued(runner_idnull/steps[]). 실행PASS가아니다. 로컬2550 PASS·19ignored와구분한다.
+- 구현/검증/리뷰지적수정/commit/push/main PR 목표완료. 앱빌드·재실행·외부배포·merge는하지않았다. 남은것은부모lane의PR검토/착지와실제앱시각확인이다. R4v38과Relay#161v38/#163v39의migration번호충돌은착지순서에따라나머지PR에서git fetch origin; git merge origin/main; migration끝번호재배치; 전체migration·영향gate를수행한다. force-push/rebase금지.

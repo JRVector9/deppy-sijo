@@ -9399,6 +9399,9 @@ struct OpenDocument {
     /// 설계 §2 — 예전에는 App 전역 카운터 하나를 모든 문서가 공유해 슬롯도 `0`으로
     /// 고정돼 있었다).
     source_revision: u64,
+    /// 문서 렌더러에서 panic이 난 뒤 같은 내용을 매 프레임 다시 그리다 앱 전체를
+    /// 종료하지 않도록 해당 탭만 안전 안내 화면으로 전환한다.
+    render_failed: bool,
 }
 
 impl OpenDocument {
@@ -9452,6 +9455,13 @@ impl OpenDocument {
     fn recompute_dirty(&mut self) {
         self.dirty = self.source != self.saved_source;
     }
+
+    fn quarantine_render_failure(&mut self) {
+        // Split 모드에서는 source 편집이 반영된 뒤 preview가 panic할 수 있다. 함수 끝의
+        // 일반 편집 후처리를 건너뛰더라도 저장하지 않은 본문을 잃지 않게 다시 판정한다.
+        self.recompute_dirty();
+        self.render_failed = true;
+    }
 }
 
 /// 문서 로드 결과의 App 쪽 표현(설계 §6 4티어 + Loading). `document_io::DocumentLoadOutcome`을
@@ -9499,6 +9509,31 @@ fn document_load_state_from_outcome(
         },
         document_io::DocumentLoadOutcome::Failed { code } => {
             DocumentLoadState::Failed { code: *code }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum GuardedDocumentRender<R> {
+    Skipped,
+    Rendered(R),
+    Panicked,
+}
+
+fn guard_document_render<S, R>(
+    state: &mut S,
+    should_skip: impl FnOnce(&S) -> bool,
+    render: impl FnOnce(&mut S) -> R,
+    quarantine: impl FnOnce(&mut S),
+) -> GuardedDocumentRender<R> {
+    if should_skip(state) {
+        return GuardedDocumentRender::Skipped;
+    }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| render(state))) {
+        Ok(output) => GuardedDocumentRender::Rendered(output),
+        Err(_) => {
+            quarantine(state);
+            GuardedDocumentRender::Panicked
         }
     }
 }
@@ -16661,6 +16696,75 @@ impl App {
         }
     }
 
+    fn render_document_tab_body_safely(
+        &mut self,
+        ui: &mut egui::Ui,
+        body: egui::Rect,
+        text: &i18n::Catalog,
+    ) {
+        let Some(id) = self.active_document else {
+            return;
+        };
+        match guard_document_render(
+            self,
+            |app| {
+                app.documents
+                    .iter()
+                    .find(|document| document.id == id)
+                    .is_some_and(|document| document.render_failed)
+            },
+            |app| app.render_document_tab_body(ui, body, text),
+            |app| {
+                if let Some(document) = app.documents.iter_mut().find(|document| document.id == id)
+                {
+                    document.quarantine_render_failure();
+                }
+            },
+        ) {
+            GuardedDocumentRender::Skipped => {
+                self.render_document_failure_surface(ui, body, text, id);
+            }
+            GuardedDocumentRender::Rendered(()) => {}
+            GuardedDocumentRender::Panicked => {
+                tracing::error!(
+                    kind = "document",
+                    phase = "render",
+                    error_code = "document_render_panic",
+                    "document rendering panicked and was isolated"
+                );
+                ui.ctx().request_repaint();
+            }
+        }
+    }
+
+    fn render_document_failure_surface(
+        &mut self,
+        ui: &mut egui::Ui,
+        body: egui::Rect,
+        text: &i18n::Catalog,
+        id: ui::workspace::DocumentTabId,
+    ) {
+        let mut open_with_os_clicked = false;
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(body)
+                .id_salt("document_render_failed"),
+        );
+        child.set_clip_rect(body.intersect(ui.clip_rect()));
+        child.centered_and_justified(|ui| {
+            ui.vertical_centered(|ui| {
+                ui.label(text.t("document.error.render_failed", &[]));
+                ui.add_space(8.0);
+                if ui.button(text.t("file_tree.open_with_os", &[])).clicked() {
+                    open_with_os_clicked = true;
+                }
+            });
+        });
+        if open_with_os_clicked {
+            self.open_document_path_with_os(ui.ctx(), id);
+        }
+    }
+
     /// 툴바 상태 문구 — 저장 직후 잠깐의 "저장됨" 피드백이 dirty/ViewOnly 문구보다
     /// 우선한다. `DOCUMENT_SAVED_FEEDBACK_DURATION`이 지나면 자연히 사라진다(피드백
     /// 창이 열려 있는 동안 계속 리페인트를 예약해 타이머 만료가 화면에 반영되게 한다).
@@ -17021,6 +17125,7 @@ impl App {
             saved_feedback_until: None,
             view_only_byte_len: None,
             source_revision: 0,
+            render_failed: false,
         });
         self.document_pending_loads.push_back((id, path));
         self.active_document = Some(id);
@@ -28820,7 +28925,7 @@ impl eframe::App for App {
                         if git_tab_active {
                             git_panel_action = self.render_git_tab_body(&mut primary, body, &text);
                         } else if document_tab_active {
-                            self.render_document_tab_body(&mut primary, body, &text);
+                            self.render_document_tab_body_safely(&mut primary, body, &text);
                         } else {
                             work_history_action = self.render_work_history_tab_body(
                                 &mut primary,
@@ -28864,7 +28969,7 @@ impl eframe::App for App {
                         if git_tab_active {
                             git_panel_action = self.render_git_tab_body(ui, body, &text);
                         } else if document_tab_active {
-                            self.render_document_tab_body(ui, body, &text);
+                            self.render_document_tab_body_safely(ui, body, &text);
                         } else {
                             work_history_action = self.render_work_history_tab_body(
                                 ui,
@@ -35920,6 +36025,7 @@ mod tests {
             saved_feedback_until: None,
             view_only_byte_len: None,
             source_revision: 0,
+            render_failed: false,
         }
     }
 
@@ -36736,6 +36842,94 @@ mod tests {
         assert!(
             !function_body.contains("MarkdownDocumentSlot(0)"),
             "슬롯이 다시 0으로 고정되면 안 된다(모든 문서가 캐시를 공유하게 된다)"
+        );
+    }
+
+    #[test]
+    fn 문서_렌더_panic은_앱_전체가_아니라_해당_문서에서_격리된다() {
+        #[derive(Default)]
+        struct RenderProbe {
+            quarantined: bool,
+            calls: usize,
+        }
+
+        let mut failed = RenderProbe::default();
+        let first: GuardedDocumentRender<()> = guard_document_render(
+            &mut failed,
+            |probe| probe.quarantined,
+            |probe| {
+                probe.calls += 1;
+                panic!("렌더 실패 재현");
+            },
+            |probe| probe.quarantined = true,
+        );
+        assert!(matches!(first, GuardedDocumentRender::Panicked));
+        assert!(failed.quarantined);
+        assert_eq!(failed.calls, 1);
+
+        let second = guard_document_render(
+            &mut failed,
+            |probe| probe.quarantined,
+            |probe| probe.calls += 1,
+            |probe| probe.quarantined = true,
+        );
+        assert!(matches!(second, GuardedDocumentRender::Skipped));
+        assert_eq!(
+            failed.calls, 1,
+            "같은 문서를 다음 프레임에 다시 그리면 안 된다"
+        );
+
+        let mut other = RenderProbe::default();
+        let other_result = guard_document_render(
+            &mut other,
+            |probe| probe.quarantined,
+            |probe| probe.calls += 1,
+            |probe| probe.quarantined = true,
+        );
+        assert!(matches!(other_result, GuardedDocumentRender::Rendered(())));
+        assert_eq!(other.calls, 1, "다른 문서는 계속 렌더돼야 한다");
+
+        let source = include_str!("app.rs");
+        let production = source
+            .split_once("\n#[cfg(test)]\nmod tests")
+            .expect("테스트 모듈 경계")
+            .0;
+        assert_eq!(
+            production
+                .matches("self.render_document_tab_body_safely(")
+                .count(),
+            2,
+            "단일·분할 작업면의 문서 렌더 진입점이 모두 격리 경계를 써야 한다"
+        );
+        let wrapper = source
+            .split_once("fn render_document_tab_body_safely(")
+            .expect("문서 렌더 격리 함수")
+            .1
+            .split_once("\n    fn ")
+            .expect("함수 끝")
+            .0;
+        assert!(wrapper.contains("guard_document_render("));
+        assert!(
+            wrapper.contains("document.quarantine_render_failure()"),
+            "같은 문서를 다음 프레임에 다시 렌더해 panic 반복을 만들면 안 된다"
+        );
+    }
+
+    #[test]
+    fn 문서_렌더_panic_전에_바뀐_본문은_dirty로_보존된다() {
+        let mut document = stub_open_document("/tmp/drop.md", "수정됨", "저장본", false);
+
+        document.quarantine_render_failure();
+
+        assert!(document.render_failed);
+        assert!(
+            document.dirty,
+            "panic 직전 편집이 저장본과 다르면 dirty여야 한다"
+        );
+        assert_eq!(
+            document_close_disposition(Some(&document)),
+            DocumentCloseDisposition::ConfirmDirty,
+            "실패한 문서를 닫을 때도 저장 여부를 확인해야 한다"
         );
     }
 

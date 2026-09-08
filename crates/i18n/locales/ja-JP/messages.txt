@@ -398,6 +398,7 @@ document.limit.view_only = 読み取り専用 — {bytes} バイト(1 MiB超)
 document.limit.refused = このドキュメントは8 MiBを超えているため開けません({bytes} バイト)。OS標準アプリで開いてください。
 document.limit.binary = テキストとして読み込めないファイルです({bytes} バイト)。OS標準アプリで開いてください。
 document.error.load_failed = ドキュメントを読み込めませんでした({code})。
+document.error.render_failed = このドキュメントを安全に表示できませんでした。既定のアプリで開くか、タブを閉じてください。
 document.error.save_failed = 保存できませんでした({code})。
 document.confirm_discard.title = 保存されていない変更があります
 document.confirm_discard.body = 「{name}」に保存されていない変更があります。

@@ -2645,3 +2645,8 @@
 - 최종 app 전체2089PASS/14ignored, 관련5crate all-targets strictClippyPASS(`/private/tmp/deppy-resize-clippy-reviewed.log`,9.13초), boundaryPASS(`/private/tmp/deppy-resize-boundary-reviewed.log`), fmt/diffPASS. runtime301/Session63/terminal91+4ignored/web-remote270+1ignored는 해당 core 최종 소스에서 실행한 전체 결과이며 이후 core 변경은 optional Ghostty 실제 getter 교정뿐이다. optional Ghostty는 Zig 부재로 검증되지 않았다.
 - 다음 명령: `git add crates/app/src/app.rs crates/app/src/ui/workspace.rs crates/runtime/src/command.rs crates/runtime/src/event.rs crates/runtime/src/in_process.rs crates/runtime/src/lib.rs crates/runtime/src/protocol.rs crates/runtime/src/remote.rs crates/runtime/src/resize.rs crates/session/src/session.rs crates/terminal/src/alacritty_backend.rs crates/terminal/src/ghostty_backend.rs crates/web-remote/src/dashboard.rs docs/CODEX_HANDOFF.md docs/superpowers/plans/2026-09-08-resize-applied-generation.md docs/superpowers/specs/2026-09-08-resize-applied-generation-design.md` → 한국어 commit → `git push -u origin fix/resize-applied-generation` → `/private/tmp/deppy-resize-pr-body.md`로 base=`feat/scrollback-live-policy` PR 생성.
 - 앱 GUI build/launch, rebase, force-push는 하지 않았다. PR SHA/URL 및 원격 CI 사실은 게시 후 바로 기록한다.
+
+### PR E 최종 독립 리뷰 및 게시 승인
+- 최종 source commit은 `5f31d5ea4682a2ecd5b80453e6e8cf7dc2345389`이며 worktree clean을 확인했다. 전체 source CLI 리뷰3와 좁은 재리뷰 프로세스는 모두 exit0을 수집했다. timeout review2/실제 codex review 명령의 wrapper exit0은 종료 처리 성공일 뿐 리뷰 성공이 아니다.
+- 부모가 별도 독립 리뷰자에게 최종 retry 변경만 재검토시켰으며 추가 확정 결함 없음으로 종료했다. 부모는 일반 push 및 #165 base stacked PR 생성/Ready를 승인했다. source 변경 없이 이 기록을 보완하며 rebase/force/merge/앱build/launch는 하지 않는다.
+- 최신 gate: app2089PASS/14ignored; strictClippyPASS9.13초; boundary/fmt/diffPASS. 로그와 optional Ghostty Zig 부재는 앞 절대로 유지한다.

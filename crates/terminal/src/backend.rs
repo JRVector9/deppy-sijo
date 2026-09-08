@@ -47,6 +47,14 @@ pub struct TerminalCacheFootprint {
     pub estimated_bytes: usize,
 }
 
+/// 아카이브 실패를 미지원과 구분해 지원 backend의 화면이 버려지지 않게 한다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollbackSerializeError {
+    Unsupported,
+    LimitExceeded,
+    Unavailable,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalCacheEventKind {
     ScrollbackLimitApplied,
@@ -231,6 +239,21 @@ pub trait TerminalBackend {
     /// 미지원 백엔드는 None (아카이브 대신 기존 drop 동작).
     fn serialize_scrollback(&self) -> Option<Vec<u8>> {
         None
+    }
+
+    /// 출력 상한이 있는 아카이브용 직렬화. 미지원 backend의 기존 detach 계약은 유지한다.
+    fn serialize_scrollback_bounded(
+        &self,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, ScrollbackSerializeError> {
+        let dump = self
+            .serialize_scrollback()
+            .ok_or(ScrollbackSerializeError::Unsupported)?;
+        if dump.len() > max_bytes {
+            Err(ScrollbackSerializeError::LimitExceeded)
+        } else {
+            Ok(dump)
+        }
     }
 
     /// scrollback+화면 전체에서 query를 부분 문자열로(대소문자 무시) 찾는다 (T3).

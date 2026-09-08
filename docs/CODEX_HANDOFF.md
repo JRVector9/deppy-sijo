@@ -1,3 +1,70 @@
+## PR C 공유 완료 — PR #160 (2026-09-08)
+
+- 목표 완료: 압축 streaming resize·bounded scratch·출력 보존 한도·cold 재압축·preflight·회귀/벤치·Codex 리뷰/수정·관련 gate·커밋/push/main 대상 PR 생성.
+- PR: https://github.com/JRVector9/deppy-sijo/pull/160 ; source commit 1e88de09c7e4199fc2a0c41c92849ed31aa469a3; branch perf/terminal-streaming-reflow, base origin/main45e66cc. 테스트/벤치는 이 source 내용에 해당한다. 이후 변경은 문서뿐이다.
+- Codex 전체 리뷰 P2 1건을 실제 RED→GREEN으로 수정. 제한 재리뷰 확정 finding0. 최종 vendor152unit+45ref+1memory+1doc, terminal87/session55 PASS; ignored4+benchmark1(benchmark 별도 실행PASS). strict vendor/terminal/session clippy, workspace fmt/new vendor rustfmt/boundary/diff PASS.
+- 최종 실측100k 추가heap5.61~7.99MB, scratch280~1440cells(10k와 동일), release44~1100ms. allocator net live heap 측정이며 전체 RSS/전역 예산/OOM 복구 보장 아님. CPU O(N), 극단적으로 좁은 폭의 지연은 후속 범위.
+- 일지: ~/Library/CloudStorage/SynologyDrive-sync_data/Obsidian-Vault/프로젝트 일지/deppy-sijo/2026-09-08 터미널 압축 스트리밍 리플로 PR C.md
+- 수정 파일: vendor grid/term/Row/codec 테스트 및 memory test 등록, terminal backend 회귀, plan/handoff. app/runtime/UI/protocol 변경 및 앱 빌드/실행 없음. rebase/force 없음.
+- 남음: PR 검토·main 착지는 부모 작업에서 진행. 이 하위 작업은 PR 생성까지 완료. 다음 명령: gh pr view 160 --json state,headRefOid,baseRefName,mergeable,statusCheckRollup; 필요 시 일반 main merge 후 관련 gate 재실행. CI PASS를 주장하지 않는다.
+
+## PR C 최종 리뷰·gate 완료 (2026-09-08)
+
+- 전체 Codex 리뷰 P2 1건을 실제 RED→GREEN으로 수정, preflight 제한 재리뷰 exit0·남은 확정 finding0. /private/tmp/deppy-streaming-review-preflight.log. 리뷰 정상 종료, 프로세스 강제 종료 없음.
+- final source vendor152 unit+45 reference+1 memory+1 doc PASS(benchmark 기본 ignored1, 명시 release 실행PASS). terminal87/session55 PASS(ignored4). vendor/terminal/session strict all-target clippy, workspace fmt/new vendor rustfmt/diff PASS. /private/tmp/deppy-streaming-final-results.json은 모든 exit0.
+- final source release100k행: 80→12044ms/5,608,024B;200→10093ms/6,811,032B;500→80292ms/7,651,808B;200→21100ms/7,991,800B. scratch280/400/1440/594 cells는10k와 동일. /private/tmp/deppy-streaming-release-final.log. 10k200→100 stock11ms/71,098,240B vs streaming10ms/691,032B.
+- 최신 origin/main45e66cc 재확인. scope app/runtime/UI/protocol 수정 없음, 앱 빌드/실행 없음. git diff check 깨끗함.
+- 남음: source commit/push/PR 생성, PR URL·최종HEAD를 handoff와 Obsidian 일지에 기록하고 전달. 계획 Task4 공유 단계만 남음.
+
+## PR C Codex P2 수정 (2026-09-08)
+
+- Codex CLI 리뷰 정상 종료: P2 1건, Term::resize가 grid preflight 전에 vi cursor를 옮겨 잘못된 공개 크기 입력의 panic 뒤 부분 변경을 남김. /private/tmp/deppy-streaming-review.log; process93482 정상 종료(강제 종료 없음).
+- 실제 RED: streaming_resize_preflight_rejects_before_term_mutation에서 vi cursor Line0→Line-12 관찰, exit101. /private/tmp/deppy-streaming-preflight-red.log.
+- 수정: Grid::preflight_resize를 공유하고 Term의 vi cursor 및 두 grid 변경 전에 양쪽 모두 검증한다. active/inactive 중 두 번째 grid가 잘못된 경우도 첫 grid가 바뀌지 않는 회귀 포함.
+- 다음: vendor/terminal/session tests 및 clippy 재검증, preflight만 제한된 read-only Codex 재리뷰, handoff/일지/commit/push/PR.
+
+## PR C source checkpoint / release 측정 (2026-09-08)
+
+- source: streaming 입력/출력, 보존 한도 deque, cold 압축 유지, ReflowMetrics, differential/실제 allocator 회귀 완료. origin/main fetch 결과45e66cc로 base와 같음(추가 merge 불필요).
+- release benchmark 실제 PASS: 100k 80→12044ms;200→10096ms;500→80293ms;200→21098ms. 추가 heap peak5.61/6.81/7.65/7.99MB, scratch280/400/1440/594 cells. /private/tmp/deppy-streaming-release-benchmark.log. 10k baseline stock200→100은11ms/71,098,240B, streaming9ms/691,032B.
+- strict vendor all-target clippy와 terminal/session all-target clippy PASS. workspace fmt, 신규 vendor 파일 rustfmt, git diff check, xtask boundary PASS. terminal87/session55 PASS, ignored4. 앱/workspace전체 빌드·실행 안 함.
+- 범위: grid/term/terminal tests와 vendor memory test 등록만. app/runtime/UI/protocol 없음. 전역 RAM hard budget/OOM 복구/CPU 분할은 구현하지 않음.
+- 남음: 마지막 vendor 전체 tests, Codex 리뷰 결론 및 지적 수정, final docs/commit/push/main PR. 리뷰 process93482, log /private/tmp/deppy-streaming-review.log. force/rebase 없음.
+- 다음 명령: CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-streaming-target-20260908 cargo test --manifest-path third_party/alacritty_terminal-0.26.0/Cargo.toml --locked -- --test-threads=1; codex review 결과 확인; git push -u origin perf/terminal-streaming-reflow; gh pr create --base main --head perf/terminal-streaming-reflow --body-file /private/tmp/deppy-streaming-reflow-pr.md.
+
+## PR C 측정·통합 GREEN (2026-09-08)
+
+- vendor 151 unit +45 reference +1 memory test +1 doc PASS(benchmark 기본 ignored1). terminal87 PASS/4 ignored, session55 PASS. /private/tmp/deppy-streaming-vendor-2.log, /private/tmp/deppy-streaming-focused.log.
+- 명시 실행 benchmark2 PASS: 100k행 80→120/200→100/500→80/200→2에서 추가 heap peak 5,608,024 /6,811,032 /7,651,808 /7,991,800 bytes. 관찰 scratch280/400/1440/594 cells는 10k와 동일. debug resize848/1906/2996/5710ms. /private/tmp/deppy-streaming-benchmark.log. CPU O(N) 지연은 남는다.
+- 새로운 regression: 좁은 출력의 보존 한도, 작은 history limit differential, resize 뒤 backend 검색/직렬화/viewport/new output.
+- 실패 접근: vendor 전체 cargo fmt가 기존 상류 파일까지 넓게 포맷했다. 해당 포맷 변경만 모두 회수하고 원본 스타일 보존. workspace fmt + 새 파일 rustfmt만 gate로 사용한다.
+- vendor strict clippy에서 기존 codec 테스트의 needless_range_loop 4개 실패. 동등한 iter_mut로 최소 수정 중. codex CLI source-only read-only review 진행 중.
+- 다음: strict clippy 재실행, release 측정, 최종 main 반영/검사/리뷰/commit/push/PR. 앱 빌드·실행 없음.
+
+## PR C 추가 메모리 RED (2026-09-08)
+
+- 첫 구현 vendor 전체: 149 unit +45 reference +1 doc PASS. Unicode/링크/커서/스크롤 differential와 잘못된 크기 focused 3 PASS.
+- 좁은 폭 출력 적재 결함을 실제 allocator로 재현: 10k행 200→2에서 peak 추가 95,623,738 bytes, 회귀 exit101. /private/tmp/deppy-streaming-memory-red.log.
+- 원인: 출력 history를 전부 압축한 후 마지막에 truncate하여 압축 행 metadata/내용 자체가 폭 비율만큼 증가.
+- 수정: PackedRows를 보존 한도 bounded VecDeque로 변경, 오래된 완성 출력을 즉시 버림. 이력 한도/커서 의미는 기존 마지막 truncate와 동일. GREEN 검증 다음.
+- 실패 접근: 첫 compile에서 잔여 generic T와 테스트 Processor 타입 추론 오류, 각각 Cell/default Processor 타입 명시로 수정.
+
+## PR C RED 확인·첫 구현 (2026-09-08)
+
+- 실제 vendor focused test exit101: streaming_resize_keeps_cold_history_compressed가 resize 후 압축 행 소멸 assertion으로 실패. /private/tmp/deppy-streaming-red.log.
+- 첫 구현: Cell 전용 streaming_resize.rs, Storage 슬롯 소유권 iterator/압축 설치/visible 복원, Term 연결. generic 알고리즘 cursor 계산 유지. 원시 전체 inflate 제거, 완성 출력 즉시 압축.
+- preflight는 좌표/checked 산술 검증이며 allocator OOM 복구를 보장하지 않는다. output/input 압축 데이터와 O(history) 메타데이터는 남는다.
+- 다음: focused GREEN 컴파일 → vendor 전체 → differential 및 측정. 아직 GREEN 주장 없음.
+
+## PR C 시작 — 압축 streaming reflow (2026-09-08)
+
+- 목표: resize 전체 inflate 제거, bounded raw scratch, 기존 primary/alt/cursor 의미 보존. base 45e66cc; worktree /private/tmp/deppy-streaming-reflow-20260908; branch perf/terminal-streaming-reflow.
+- 완료: 기존 resize/storage/codec/event 흐름 읽기, 전용 plan 작성. 코드/테스트 실행 전.
+- 변경 파일: docs/superpowers/plans/2026-09-08-terminal-streaming-reflow.md, 본 handoff.
+- 결정: generic resize는 동등성 oracle; Cell streaming 경로는 기존 grow/shrink 계산을 보존하며 완성 출력 즉시 압축. UI/runtime/protocol 변경 및 앱 빌드/실행 제외.
+- 테스트: 아직 실행 없음. 실패 접근 없음.
+- 다음: 실제 Term의 resize 후 압축 유지 RED; 전용 target와 jobs2로 vendor focused 실행. 계획의 Task 1 명령 사용.
+
 ## ureq3 migration validated / PR landing next (2026-09-07)
 
 - Objective: replace dependency-only PR141 with native ureq3.4 migration, preserving OAuth/MCP status/body/redaction and SSE idle semantics.
@@ -2481,6 +2548,38 @@
 - 남은 작업: root의 stacked PR 검토/통합, 계정 billing/spending 복구 뒤 CI 재실행, 별도 E 후속 PR. 앱 실화면/IME와 Ghostty·네이티브 TLS·Linux/Windows 검증은 대기 상태다.
 - 다음 에이전트 명령: `cd /private/tmp/deppy-scrollback-live-20260908`; `git status --short`; `git rev-parse HEAD`; `gh pr view 165 --json url,headRefOid,baseRefName,statusCheckRollup`; `gh run view 34215008968`; `gh run view 34215008991`. 최종 문서 커밋도 일반 push해 원격 HEAD를 맞춘다.
 
+### PR D 최종 독립 리뷰 후 안전성 보완 시작
+- 목표: #165 단독 그래프의 대형 resize 전체 inflate 및 32MiB serializer 초과를 미지원으로 오인해 pane을 detach하는 두 결함을 수정한다. root가 이전 PR C 비포함 결정을 교정하여 #160을 필수 의존으로 포함하도록 승인했다.
+- #160 exact head `18a06f1a15df555ddbd22569d2d4cf7042db2b21`을 일반 merge commit `75b8dcf`로 병합했다. 코드/문서 충돌 없음. rebase/force-push 없음. bounded streaming reflow가 이제 #165 그래프에 포함된다.
+- 원인: Alacritty bounded serializer의 초과와 미지원이 같은 None이며 archive_over_cap은 None이면 Session 제거와 pane detach를 실행한다. 초과/미지원/리소스 실패를 구분하고 최신 tail 아카이브 성공 이후에만 지원 backend를 제거하도록 보완한다.
+- 100k 컬러 이력 fixture로 실제 archive_over_cap RED 작성 중. 첫 10열 fixture는 ANSI가 32MiB보다 작아 fixture assertion에서 실패했으므로 결함 RED로 계산하지 않는다. 20열로 조정해 실제 초과 경로를 검증한다.
+- 계획: typed bounded serializer → Session의 유계 history 축소 후 재시도 → memory/disk 공통 아카이브 경로 → focused/gate → 두 수정만 좁은 Codex 리뷰 → handoff/일지/PR 본문 갱신 및 일반 push. 앱 build/relaunch 금지.
+
+### PR D 아카이브 초과 RED/GREEN
+- 실제 100k×20열 컬러 이력의 serializer 초과 후 archive_over_cap이 archive 없이 제거되는 RED를 확인했다(`/private/tmp/deppy-live-archive-tail-red.log`). `ScrollbackSerializeError::{Unsupported,LimitExceeded,Unavailable}`로 분리하고 Session이 초과 때 history를 절반씩 줄여 최대 18회 안에 tail을 직렬화하도록 수정했다. 같은 회귀 GREEN(3.65초, `/private/tmp/deppy-live-archive-tail-green.log`).
+- 메모리 아카이브의 기존 압축 예산 16MiB를 새 entry 혼자 넘으면 즉시 LRU 축출되는 연관 경계도 작은 예산의 실제 RED로 확인했다(`/private/tmp/deppy-live-archive-compressed-red.log`). 압축 후에도 history 절반 축소를 적용해 새 entry가 그 예산 안에 들도록 보완했다. 실제 history 감소를 검사하므로 중첩 시도도 유계다.
+- 화면 자체가 상한을 넘거나 리소스 실패면 지원 Session을 제거/detach하지 않는다. 변하지 않는 exited 실패는 SessionId 집합으로 한 번만 기억해 매 pump 반복 직렬화를 막고 Session 제거 시 정리한다. Ghostty 등 Unsupported만 기존 detach 동작을 유지한다. disk serializer도 같은 bounded Session 경로를 사용하고 audit ANSI는 수정하지 않는다.
+- Session 2개(최신 화면 보존/화면만 초과시 보존), runtime 2개(100k tail/압축 예산) focused PASS(`/private/tmp/deppy-live-archive-focused-green.log`). 실제 100k fixture의 disk write→read/finish와 audit 미변경 검증을 추가해 terminal/session/runtime 전체 검사 중이다(`/private/tmp/deppy-live-archive-core-full.log`). 좁은 읽기 전용 Codex 리뷰도 300초 상한으로 실행 중(`/private/tmp/deppy-live-archive-codex-review.log`).
+
+### PR D 두 보완의 최종 실행 증거
+- `CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-deps-target-20260907 cargo test -p terminal -p session -p runtime --locked -- --test-threads=2` → runtime 289, Session 60, terminal 91 PASS/4 ignored, doc 0 (`/private/tmp/deppy-live-archive-core-full.log`). 실제 disk write→read/finish·32MiB 이내·최신 marker·audit 미변경도 통과했다.
+- vendor manifest의 `cargo test ... --locked streaming_resize -- --test-threads=2` → streaming 4 + bounded-memory 1 PASS, 수동 benchmark 1 ignored (`/private/tmp/deppy-live-reflow-merged-focused.log`). 이어 `--test streaming_memory streaming_resize_memory_benchmark -- --ignored --nocapture`를 실제 실행해 1 PASS (`/private/tmp/deppy-live-reflow-100k-memory.log`).
+- 100k history의 debug 측정: 80→120 추가 heap peak 5,608,024B/466ms, 200→100 6,811,032B/1101ms, 500→80 7,651,808B/2880ms, 200→2 7,991,800B/5749ms. scratch는 각각 280/400/1440/594 cells로 10k와 동일했다. 이 수치는 테스트 allocator가 측정한 추가 heap이며 전체 process RSS·OS allocator 내부 순간 피크 보장이 아니다.
+- 최종 core strict all-targets Clippy PASS(3.31초, `/private/tmp/deppy-live-archive-clippy.log`), workspace fmt/diff check PASS. `git merge-base --is-ancestor 18a06f1 HEAD` PASS. 앱 build/relaunch는 실행하지 않았다.
+
+### PR D 좁은 CLI 추가 P1 — 자동 exit 보존 경로
+- 최초 좁은 CLI는 300초 안에 결론이 없어 exact PID 85848을 종료했다. 같은 세션 `01a08097-d871-7f32-b9a2-7fad9463c63e`에 추가 도구 금지로 결론만 요청해 exit 0으로 P1 하나를 받았다(`/private/tmp/deppy-live-archive-codex-conclusion.log`): disk archive 실패 뒤 자동 close_pane이 지원 Session을 제거한다. streaming merge는 코드상 확인됐다.
+- work-history resume는 `agent_resume::resume_plan`이 provider/native binding을 CLI 인자로 바꾸는 별도 기능이며 모든 provider/바인딩에서 terminal tail 복원을 보장하지 않는다. 독립 recovery ANSI의 존재만으로 전체 무손실이라고 주장하지 않는다.
+- root 승인으로 자동 exit 경계만 보완했다. disk marker가 없으면 유계 memory tail을 먼저 확보하고 정상 pane close를 유지한다. 둘 다 실패할 때만 backend/pane을 유지하며 명시적 ClosePane은 기존대로 폐기한다. memory LRU는 16MiB와 RUNTIME_SESSION_CAP 개수 둘 다 제한한다.
+- 실제 자동 exit helper의 archive 누락 RED(`/private/tmp/deppy-live-autoexit-red.log`) 후 archive 생성→close_pane→remove_session에서도 새 archive가 남고 pane은 닫히는 GREEN을 확인했다. 보존 실패 시 pane 유지/실패 재시도 억제/명시적 close 정리와 개수·바이트 LRU도 확인했다. archive focused 5 PASS(`/private/tmp/deppy-live-autoexit-green.log`).
+- 최종 전체 관련 gate 재실행 중(`/private/tmp/deppy-live-autoexit-core-full.log`). 같은 CLI 세션에 실제 최신 close_exited_pane/make_archive_entry/remove_session/trim 코드를 직접 제공하고 도구 없이 두 번째 좁은 재리뷰를 120초 상한으로 요청했다(`/private/tmp/deppy-live-autoexit-codex-review.log`).
+
+### PR D 자동 exit 포함 최종 검증 완료
+- 같은 CLI 세션의 제한 재리뷰가 exit 0으로 “남은 확정 P1/P2 없음”을 반환했다(`/private/tmp/deppy-live-autoexit-codex-review.log`). 자동 exit의 disk/memory 성공 후 제거, 실패 보존, Unsupported 기존 동작, remove_session의 archive 유지와 개수/바이트 LRU를 확인했다.
+- 최종 관련 전체 runtime 292 PASS(32.10초), Session 60 PASS, terminal 91 PASS/4 ignored, doc 0 (`/private/tmp/deppy-live-autoexit-core-full.log`). 최종 core all-targets strict Clippy PASS(`/private/tmp/deppy-live-autoexit-clippy.log`), workspace fmt/diff PASS. 앱 build/relaunch는 하지 않았고 app18/Settings21/i18n8은 앞선 앱 단계의 실행 결과다.
+- 일지: `~/Library/CloudStorage/SynologyDrive-sync_data/Obsidian-Vault/프로젝트 일지/deppy-sijo/2026-09-08 PR165 대형 스크롤백 안전성 보완.md`. 소스 커밋/push 후 SHA를 일지에 반영한다.
+- #165는 root가 Draft로 전환한 상태임을 확인했다. 이제 #160 merge와 아카이브/자동 exit 보완을 일반 commit/push하고 PR 본문·원격 상태 확인 후 ready로 전환한다. 원격 CI billing/spending 차단과 실환경 미검증은 PASS로 바꾸지 않는다.
+
 ## 2026-09-08 PR E 실제 resize 적용 세대 시작
 - 목표: queue 수락/실제 backend+PTY 적용/화면 승격 구분과 stale resize 차단. D #165 final 1dfef2a 위 독립 worktree `/private/tmp/deppy-resize-applied-generation-20260908`, branch `fix/resize-applied-generation`.
 - 완료: 최종 D 코드와 승인 설계 대조, spec/plan 작성. D protocol13→E append-only14. 최초 tracked 전 legacy viewport 유지, 이후 epoch/token/실제 크기 stamp. C reflow/#159 geometry/font/IME 배치 변경 금지.
@@ -2495,3 +2594,7 @@
 - 부모 지시: #165의100k resize P1 및32MiB archive P2 보완과 #160 bounded reflow 통합을 기다려 terminal/runtime 생산 코드 편집을 중단했다. 모든 Cargo 프로세스는 종료됐다. 새 #165 HEAD를 rebase/force 없이 일반 merge로 받은 뒤 재개한다.
 - 남은 작업: 기반 업데이트→현재 RED를 실제 checked resize/token/stamp로 GREEN→계획의worker/wire/UI/focused/full/review/게시. 지금 테스트 PASS나 구현 완료로 보고하지 않는다.
 - 다음 명령: `git status --short`; `git diff --stat`; 부모가 전달한 새D HEAD와 충돌범위 확인 후 작업보존 커밋과 `git merge <새D_HEAD>`; 이후 session focused부터 재개.
+
+### PR E 기반 갱신 및 구현 재개
+- 부모가확정한D exactHEAD `9af1b807e89202a4c45626259af3687a7e229a7a`를 일반merge했다. Session 테스트 삽입과handoff append충돌은양쪽회귀/기록을모두보존해해결했다. #160 스트리밍reflow는D에서인수하며중복수정하지않는다.
+- E RED scaffold는047cf8a로보존했으며queue수락1개/Session실제크기·invalid2개RED증거는유효하다. 이제checkedresize구현과typedwire로GREEN진행한다. 아직E gatePASS가아니다.

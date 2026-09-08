@@ -300,6 +300,7 @@ impl InProcessRuntimeClient {
                     archived: std::collections::HashMap::new(),
                     archived_order: std::collections::VecDeque::new(),
                     archived_on_disk: std::collections::HashMap::new(),
+                    archive_failed: std::collections::HashSet::new(),
                     archive_disk_bytes,
                     archive_root_identity,
                     hidden_scrollback: std::collections::HashSet::new(),
@@ -737,6 +738,8 @@ struct Worker {
     /// 디스크 아카이브(scrollback.zlib)가 있는 세션들 (PR-A1) — 메모리 아카이브가
     /// 예산 축출돼도 디스크에서 복원 가능함을 fs stat 없이 판정한다.
     archived_on_disk: std::collections::HashMap<SessionId, usize>,
+    /// 변하지 않는 exited 화면의 실패를 매 pump마다 재직렬화하지 않는다.
+    archive_failed: std::collections::HashSet<SessionId>,
     /// 디스크 아카이브 총 바이트의 증분 캐시 (A1 리뷰 P2). 워커 시작 시 1회 스캔으로
     /// 시드하고, 기록 성공마다 그 파일 크기만 더한다. 예산 초과가 확정될 때만 gc를
     /// 호출(그때만 전체 디렉터리 스캔+제거)해 매 exit 전체 스캔 비용을 없앤다.
@@ -1173,6 +1176,7 @@ impl Worker {
 
     fn remove_session(&mut self, session: SessionId) -> Option<Session> {
         self.scrollback_results.remove(&session);
+        self.archive_failed.remove(&session);
         self.session_redaction_leases.remove(&session);
         let removed = self.sessions.remove(&session);
         if removed.is_some() {
@@ -3741,17 +3745,52 @@ impl Worker {
         // MuxUpdated로 pane 제거를 본다 (채널 FIFO). close_pane의 세션 정리는 위
         // exited 처리와 겹쳐도 멱등(no-op)이다.
         for session in exited_sessions {
-            let pane = self
-                .mux
-                .panes
-                .values()
-                .find(|p| p.session_id == Some(session))
-                .map(|p| p.id.clone());
-            if let Some(pane) = pane {
-                self.close_pane(pane);
-            }
+            self.close_exited_pane(session);
         }
         activity
+    }
+
+    fn close_exited_pane(&mut self, session: SessionId) {
+        self.close_exited_pane_with_budget(session, ARCHIVED_SCROLLBACK_BUDGET_BYTES);
+    }
+
+    fn close_exited_pane_with_budget(&mut self, session: SessionId, compressed_budget: usize) {
+        let pane = self
+            .mux
+            .panes
+            .values()
+            .find(|p| p.session_id == Some(session))
+            .map(|p| p.id.clone());
+        if let Some(pane) = pane {
+            if !self.archived_on_disk.contains_key(&session) {
+                if self.archive_failed.contains(&session) {
+                    return;
+                }
+                if let Some(live) = self.sessions.get_mut(&session) {
+                    match Self::make_archive_entry_with_budget(live, compressed_budget) {
+                        Ok(entry) => {
+                            self.archived_order.retain(|id| *id != session);
+                            self.archived_order.push_back(session);
+                            self.archived.insert(session, entry);
+                            self.trim_archived_budget();
+                        }
+                        Err(terminal::ScrollbackSerializeError::Unsupported) => {}
+                        Err(error) => {
+                            // 자동 exit의 보존 수단이 모두 실패한 경우만 화면을 남긴다.
+                            // 명시적 ClosePane은 이 경로를 거치지 않고 기존대로 폐기한다.
+                            self.archive_failed.insert(session);
+                            tracing::warn!(
+                                session = session.0,
+                                ?error,
+                                "자동 종료 아카이브 실패 — 화면 보존"
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
+            self.close_pane(pane);
+        }
     }
 
     fn session_status_view(&self, session: SessionId) -> session::SessionStatusView {
@@ -3866,12 +3905,28 @@ impl Worker {
         }
         let mut detached_any = false;
         for session in to_archive {
-            let Some(live) = self.sessions.get(&session) else {
+            if self.archive_failed.contains(&session) {
+                continue;
+            }
+            let Some(live) = self.sessions.get_mut(&session) else {
                 continue;
             };
             let estimated_bytes = live.cache_footprint().estimated_bytes;
             // 압축 아카이브 시도 — 성공하면 pane을 유지하고 다시 보일 때 복원한다
-            let entry = self.make_archive_entry(live);
+            let entry = match Self::make_archive_entry(live) {
+                Ok(entry) => Some(entry),
+                Err(terminal::ScrollbackSerializeError::Unsupported) => None,
+                Err(error) => {
+                    // 지원 backend는 완전한 최신 tail이 보존되기 전에 제거하지 않는다.
+                    self.archive_failed.insert(session);
+                    tracing::warn!(
+                        session = session.0,
+                        ?error,
+                        "아카이브 실패 — 최신 화면 보존"
+                    );
+                    continue;
+                }
+            };
             let restorable = entry.is_some();
             if let Some(entry) = entry {
                 self.archived_order.push_back(session);
@@ -3986,35 +4041,62 @@ impl Worker {
     }
 
     /// exited 세션의 scrollback을 zlib 압축 아카이브 항목으로 만든다.
-    /// 직렬화 미지원 백엔드(예: experimental ghostty)는 None.
-    fn make_archive_entry(&self, live: &Session) -> Option<ArchivedScrollback> {
-        let dump = live.serialize_scrollback()?;
-        if dump.len() > MAX_ARCHIVED_SCROLLBACK_RESTORE_BYTES {
-            return None;
+    /// 미지원과 보존 실패를 구분해 지원 backend의 최신 화면을 버리지 않는다.
+    fn make_archive_entry(
+        live: &mut Session,
+    ) -> Result<ArchivedScrollback, terminal::ScrollbackSerializeError> {
+        Self::make_archive_entry_with_budget(live, ARCHIVED_SCROLLBACK_BUDGET_BYTES)
+    }
+
+    fn make_archive_entry_with_budget(
+        live: &mut Session,
+        compressed_budget: usize,
+    ) -> Result<ArchivedScrollback, terminal::ScrollbackSerializeError> {
+        // 압축률이 낮아도 새 entry 자체가 LRU 예산을 넘지 않게 한다. 매 실패마다
+        // 실제 history가 절반 이하로 줄어들어 중첩 직렬화/압축 재시도도 유계다.
+        for _ in 0..=terminal::policy::SCROLLBACK_LINES_MAX.ilog2() + 1 {
+            let dump =
+                live.serialize_scrollback_for_archive(MAX_ARCHIVED_SCROLLBACK_RESTORE_BYTES)?;
+            let footprint = live.cache_footprint();
+            let exit_code = match live.lifecycle() {
+                session::SessionLifecycle::Exited { exit_code } => exit_code,
+                session::SessionLifecycle::Running => None,
+            };
+            let mut encoder =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            std::io::Write::write_all(&mut encoder, &dump)
+                .map_err(|_| terminal::ScrollbackSerializeError::Unavailable)?;
+            let compressed = encoder
+                .finish()
+                .map_err(|_| terminal::ScrollbackSerializeError::Unavailable)?;
+            if compressed.len() > compressed_budget {
+                let history = live.cache_footprint().history_lines;
+                if history == 0 {
+                    return Err(terminal::ScrollbackSerializeError::LimitExceeded);
+                }
+                live.trim_scrollback(history / 2);
+                if live.cache_footprint().history_lines >= history {
+                    return Err(terminal::ScrollbackSerializeError::LimitExceeded);
+                }
+                continue;
+            }
+            return Ok(ArchivedScrollback {
+                kind: live.kind(),
+                cols: footprint.columns as u16,
+                rows: footprint.screen_lines as u16,
+                scrollback_lines: footprint.scrollback_limit_lines,
+                exit_code,
+                compressed,
+            });
         }
-        let footprint = live.cache_footprint();
-        let exit_code = match live.lifecycle() {
-            session::SessionLifecycle::Exited { exit_code } => exit_code,
-            session::SessionLifecycle::Running => None,
-        };
-        let mut encoder =
-            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-        std::io::Write::write_all(&mut encoder, &dump).ok()?;
-        let compressed = encoder.finish().ok()?;
-        Some(ArchivedScrollback {
-            kind: live.kind(),
-            cols: footprint.columns as u16,
-            rows: footprint.screen_lines as u16,
-            scrollback_lines: footprint.scrollback_limit_lines,
-            exit_code,
-            compressed,
-        })
+        Err(terminal::ScrollbackSerializeError::LimitExceeded)
     }
 
     /// 아카이브 총 바이트가 예산을 넘으면 오래된 것부터 제거한다 (LRU).
     fn trim_archived_budget(&mut self) {
         let mut total: usize = self.archived.values().map(|a| a.compressed.len()).sum();
-        while total > ARCHIVED_SCROLLBACK_BUDGET_BYTES {
+        while total > ARCHIVED_SCROLLBACK_BUDGET_BYTES || self.archived.len() > RUNTIME_SESSION_CAP
+        {
             let Some(oldest) = self.archived_order.pop_front() else {
                 break;
             };
@@ -4057,7 +4139,7 @@ impl Worker {
             self.archived_on_disk.entry(session).or_insert(limit);
             return;
         }
-        let Some(live) = self.sessions.get(&session) else {
+        let Some(live) = self.sessions.get_mut(&session) else {
             return;
         };
         // 빈 grid는 기록 생략 (VS Code v1.69 노이즈 억제 차용)
@@ -4065,9 +4147,12 @@ impl Worker {
         if footprint.history_lines == 0 && live.screen_text().trim().is_empty() {
             return;
         }
-        let Some(dump) = live.serialize_scrollback() else {
-            return; // 직렬화 미지원 백엔드 (experimental ghostty)
+        let Ok(dump) = live.serialize_scrollback_for_archive(
+            storage::scrollback_archive::MAX_UNCOMPRESSED_BYTES as usize,
+        ) else {
+            return; // 미지원/리소스 실패는 여기서 backend를 제거하지 않는다.
         };
+        let footprint = live.cache_footprint();
         if dump.len() > storage::scrollback_archive::MAX_UNCOMPRESSED_BYTES as usize {
             return;
         }
@@ -4729,6 +4814,268 @@ mod tests {
     }
 
     #[test]
+    fn archive_limit_자동_exit의_보존실패만_pane을_남기고_명시적_close는_폐기한다() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, _) = admission_worker(resolver, "archive-auto-exit-failed");
+        let id = SessionId(1);
+        worker.sessions.insert(
+            id,
+            Session::restore_archived(
+                id,
+                session::SessionKind::Shell,
+                20,
+                5,
+                100,
+                Some(0),
+                &mut &b"LATEST"[..],
+            ),
+        );
+        worker.attach_in_new_tab(id, SHELL_TITLE_ID);
+        worker.close_exited_pane_with_budget(id, 0);
+        assert!(worker.sessions[&id].screen_text().contains("LATEST"));
+        assert!(worker.archive_failed.contains(&id));
+        let pane = worker
+            .mux
+            .panes
+            .values()
+            .find(|pane| pane.session_id == Some(id))
+            .unwrap()
+            .id
+            .clone();
+        worker.close_exited_pane(id);
+        assert!(
+            worker.sessions.contains_key(&id),
+            "실패한 불변 화면은 매 pump 재시도하지 않는다"
+        );
+        worker.close_pane(pane);
+        assert!(!worker.sessions.contains_key(&id));
+        assert!(!worker.archive_failed.contains(&id));
+    }
+
+    #[test]
+    fn archive_limit_닫힌_pane의_memory_tail도_개수와_바이트_lru를_따른다() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, _) = admission_worker(resolver, "archive-auto-exit-lru");
+        for index in 0..=RUNTIME_SESSION_CAP {
+            let id = SessionId(index as u64);
+            worker.archived_order.push_back(id);
+            worker.archived.insert(
+                id,
+                ArchivedScrollback {
+                    kind: session::SessionKind::Shell,
+                    cols: 20,
+                    rows: 5,
+                    scrollback_lines: 100,
+                    exit_code: Some(0),
+                    compressed: vec![0],
+                },
+            );
+        }
+        worker.trim_archived_budget();
+        assert_eq!(worker.archived.len(), RUNTIME_SESSION_CAP);
+        assert!(!worker.archived.contains_key(&SessionId(0)));
+        let newest = SessionId(RUNTIME_SESSION_CAP as u64 + 1);
+        worker.archived_order.push_back(newest);
+        worker.archived.insert(
+            newest,
+            ArchivedScrollback {
+                kind: session::SessionKind::Shell,
+                cols: 20,
+                rows: 5,
+                scrollback_lines: 100,
+                exit_code: Some(0),
+                compressed: vec![0; ARCHIVED_SCROLLBACK_BUDGET_BYTES],
+            },
+        );
+        worker.trim_archived_budget();
+        assert_eq!(worker.archived.len(), 1);
+        assert!(
+            worker.archived.contains_key(&newest),
+            "최신 tail을 남기고 가장 오래된 entry부터 제거한다"
+        );
+    }
+
+    #[test]
+    fn archive_limit_자동_exit도_disk가_없으면_memory_tail을_먼저_보존한다() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, _) = admission_worker(resolver, "archive-auto-exit");
+        let id = SessionId(1);
+        let text = (0..1000)
+            .map(|i| format!("line{i}\r\n"))
+            .collect::<String>()
+            + "LATEST";
+        worker.sessions.insert(
+            id,
+            Session::restore_archived(
+                id,
+                session::SessionKind::Shell,
+                20,
+                5,
+                5000,
+                Some(0),
+                &mut text.as_bytes(),
+            ),
+        );
+        worker.attach_in_new_tab(id, SHELL_TITLE_ID);
+        worker.close_exited_pane(id);
+        assert!(
+            worker.archived.contains_key(&id),
+            "자동 close도 보존 성공 전에 supported backend를 버리면 안 된다"
+        );
+        assert!(!worker.sessions.contains_key(&id));
+        assert!(
+            !worker
+                .mux
+                .panes
+                .values()
+                .any(|pane| pane.session_id == Some(id)),
+            "정상 exit의 pane 닫힘 계약은 유지한다"
+        );
+        let dump = inflate_archived_bounded(
+            &worker.archived[&id].compressed,
+            MAX_ARCHIVED_SCROLLBACK_RESTORE_BYTES,
+        )
+        .unwrap();
+        assert!(dump.windows(6).any(|window| window == b"LATEST"));
+    }
+
+    #[test]
+    fn archive_limit_압축후_예산도_맞춰_새_archive가_즉시_축출되지_않는다() {
+        let text = (0..1000)
+            .map(|i| format!("row{i:04}-{}\r\n", i * 7919))
+            .collect::<String>()
+            + "LATEST";
+        let mut live = Session::restore_archived(
+            SessionId(1),
+            session::SessionKind::Shell,
+            30,
+            5,
+            5000,
+            Some(0),
+            &mut text.as_bytes(),
+        );
+        let entry = Worker::make_archive_entry_with_budget(&mut live, 512).unwrap();
+        assert!(entry.compressed.len() <= 512);
+        let dump =
+            inflate_archived_bounded(&entry.compressed, MAX_ARCHIVED_SCROLLBACK_RESTORE_BYTES)
+                .unwrap();
+        assert!(dump.windows(6).any(|window| window == b"LATEST"));
+    }
+
+    #[test]
+    fn archive_limit_초과한_100k_이력도_pane과_최신_tail을_보존한다() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, _) = admission_worker(resolver, "archive-oversize-tail");
+        let id = SessionId(1);
+        // 셀마다 색이 바뀌어 정상 100k 이력의 ANSI만 32MiB를 초과한다.
+        let line = "\x1b[38;2;1;2;3mA\x1b[38;2;4;5;6mB".repeat(10) + "\r\n";
+        let text = line.repeat(100_000) + "\x1b[0mLATEST-END";
+        let live = Session::restore_archived(
+            id,
+            session::SessionKind::Shell,
+            20,
+            5,
+            100_000,
+            Some(0),
+            &mut text.as_bytes(),
+        );
+        assert!(
+            live.serialize_scrollback().is_none(),
+            "실제 32MiB 초과 fixture"
+        );
+        worker.sessions.insert(id, live);
+        worker.attach_in_new_tab(id, SHELL_TITLE_ID);
+        worker.attach_in_new_tab(SessionId(2), SHELL_TITLE_ID);
+        worker.exited_order.push_back(id);
+        worker.max_exited_backends = 0;
+        worker.archive_over_cap();
+        assert!(
+            worker.archived.contains_key(&id),
+            "초과는 미지원처럼 버리면 안 된다"
+        );
+        assert!(
+            worker
+                .mux
+                .panes
+                .values()
+                .any(|pane| pane.session_id == Some(id))
+        );
+        assert!(!worker.sessions.contains_key(&id));
+        let entry = &worker.archived[&id];
+        let dump =
+            inflate_archived_bounded(&entry.compressed, MAX_ARCHIVED_SCROLLBACK_RESTORE_BYTES)
+                .unwrap();
+        assert!(
+            dump.windows(b"LATEST-END".len())
+                .any(|window| window == b"LATEST-END")
+        );
+        worker.inflate_archived(id);
+        assert!(worker.sessions[&id].screen_text().contains("LATEST-END"));
+
+        // 같은 초과 fixture를 디스크 경로에도 넣고 독립 감사 로그가 바뀌지 않는지 확인한다.
+        let db_path = worker.logs_root.join("metadata.sqlite3");
+        create_persist_db(&db_path, "archive-tail");
+        let mut pipe = crate::persistence::PersistPipe::open(&crate::persistence::PersistConfig {
+            db_path,
+            workspace_id: "archive-tail".to_owned(),
+        })
+        .unwrap();
+        pipe.session_spawned(
+            id,
+            "shell",
+            None,
+            "archive-tail",
+            "/bin/sh",
+            &[],
+            "/tmp",
+            None,
+            None,
+            None,
+            None,
+        );
+        let key = pipe.session_log_key(id).unwrap().to_owned();
+        worker.persist = Some(pipe);
+        let audit = SessionLogWriter::ansi_path(&worker.logs_root, &key).unwrap();
+        std::fs::create_dir_all(audit.parent().unwrap()).unwrap();
+        std::fs::write(&audit, b"AUDIT-UNCHANGED").unwrap();
+        worker.sessions.insert(
+            id,
+            Session::restore_archived(
+                id,
+                session::SessionKind::Shell,
+                20,
+                5,
+                100_000,
+                Some(0),
+                &mut text.as_bytes(),
+            ),
+        );
+        worker.write_scrollback_archive(id);
+        assert!(worker.archived_on_disk.contains_key(&id));
+        let mut archive = storage::scrollback_archive::open(&worker.logs_root, &key)
+            .unwrap()
+            .unwrap();
+        let mut disk_dump = Vec::new();
+        std::io::Read::read_to_end(&mut archive, &mut disk_dump).unwrap();
+        assert!(archive.finish());
+        assert!(disk_dump.len() <= MAX_ARCHIVED_SCROLLBACK_RESTORE_BYTES);
+        assert!(disk_dump.windows(10).any(|window| window == b"LATEST-END"));
+        assert_eq!(std::fs::read(audit).unwrap(), b"AUDIT-UNCHANGED");
+    }
+
+    #[test]
     fn live_scrollback_증가후_새세션의_archive를_이전최소값으로_자르지_않는다() {
         let resolver = Arc::new(RecordingResolver {
             calls: Mutex::new(Vec::new()),
@@ -4739,7 +5086,7 @@ mod tests {
         worker.apply_scrollback_policy(2, 5000);
         let id = SessionId(1);
         let text = (0..1000).map(|i| format!("new{i}\r\n")).collect::<String>();
-        let session = Session::restore_archived(
+        let mut session = Session::restore_archived(
             id,
             session::SessionKind::Shell,
             20,
@@ -4749,7 +5096,7 @@ mod tests {
             &mut text.as_bytes(),
         );
         let history = session.cache_footprint().history_lines;
-        let entry = worker.make_archive_entry(&session).unwrap();
+        let entry = Worker::make_archive_entry(&mut session).unwrap();
         worker.archived.insert(id, entry);
         worker.inflate_archived(id);
         assert_eq!(
@@ -5143,6 +5490,7 @@ mod tests {
                 archived: std::collections::HashMap::new(),
                 archived_order: std::collections::VecDeque::new(),
                 archived_on_disk: std::collections::HashMap::new(),
+                archive_failed: std::collections::HashSet::new(),
                 archive_disk_bytes: 0,
                 archive_root_identity,
                 hidden_scrollback: std::collections::HashSet::new(),

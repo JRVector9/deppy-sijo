@@ -37,7 +37,7 @@ pub fn new_default_backend(
     Box::new(AlacrittyBackend::new(cols, rows, scrollback_lines))
 }
 pub use backend::{
-    ScrollbackApplyResult, ScrollbackMatch, ScrollbackSearchResult,
+    ScrollbackApplyResult, ScrollbackMatch, ScrollbackSearchResult, ScrollbackSerializeError,
     TERMINAL_GLOBAL_CACHE_BUDGET_BYTES, TerminalBackend, TerminalCacheBudget, TerminalCacheClass,
     TerminalCacheEvent, TerminalCacheEventKind, TerminalCacheFootprint,
     TerminalExternalSurfaceHandle, TerminalRenderModel, fold_char, substring_matches,

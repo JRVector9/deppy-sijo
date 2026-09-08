@@ -120,3 +120,7 @@ features = [
     "Win32_System_Threading",
     "Win32_System_WindowsProgramming",
 ]
+
+[[test]]
+name = "streaming_memory"
+path = "tests/streaming_memory.rs"

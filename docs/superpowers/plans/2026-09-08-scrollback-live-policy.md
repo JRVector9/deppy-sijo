@@ -8,6 +8,8 @@
 
 **Tech Stack:** Rust 1.96.1, Alacritty vendored backend, serde/postcard protocol, egui 0.36.
 
+**안전 의존성 교정:** 최종 독립 리뷰 후 #160의 bounded streaming reflow가 100k 설정의 필수 의존임을 확인했다. root 승인으로 #160 exact head `18a06f1`을 일반 merge `75b8dcf`로 포함한다. 아래의 과거 “PR C 비포함” 실행 기록보다 이 최종 결정이 우선한다.
+
 ---
 
 ### Task 1: backend live setter와 숨김 보존
@@ -68,3 +70,13 @@
 - [x] terminal90+session58 전체PASS, runtime287 전체PASS(--test-threads=2). 앱 실화면/IME는 실행하지 않았으므로 대기.
 - [x] TLS 포함 app18 PASS. Settings21, i18n8, core/app strictclippy, boundary/fmt/diff의 기존 PASS 후 마지막 TLS 보완 소스에서 관련 gate를 재확인한다.
 - [x] 최종 gate 기록, 커밋/push/stacked PR #165. 원격 CI와 앱 시각/플랫폼 검증은 미완료로 구분한다.
+
+### 게시 후 독립 리뷰 보완: 대형 resize와 tail 아카이브
+- [x] #160 exact head를 일반 merge하고 Term의 두 grid가 streaming reflow를 사용함을 확인한다.
+- [x] 실제 100k 컬러 이력의 32MiB 초과에서 archive 없이 pane을 detach하는 RED를 먼저 확인한다.
+- [x] serializer의 Unsupported/LimitExceeded/Unavailable을 구분하고 Session이 history를 절반씩 줄여 최대 18회 안에 최신 tail을 보존한다. 화면 자체가 초과하면 삭제하지 않는다.
+- [x] 압축 후 메모리 16MiB 예산도 확인한다. 새 archive가 자기 크기 때문에 즉시 축출되는 RED 후 유계 축소를 적용한다.
+- [x] 지원 backend는 보존 성공 후에만 제거한다. 실패한 exited SessionId는 한 번 기억해 반복 pump 직렬화를 막고 제거 시 정리한다. Ghostty 미지원 detach와 독립 ANSI 로그 보존은 유지한다.
+- [x] 실제 memory restore와 disk write/read/finish 및 audit 미변경, 화면만 초과하는 회귀를 검증한다. 최종 terminal91/Session60/runtime289 전체, vendor streaming4+memory1, core strict Clippy/fmt/diff PASS.
+- [x] 100k 메모리 측정 PASS 및 좁은 CLI 재리뷰 잔여 확정 P1/P2 없음(exit 0)을 기록했다. 최종 runtime292/Session60/terminal91, strict Clippy/fmt/diff PASS. handoff/일지/PR 본문 갱신 후 일반 commit/push한다.
+- [x] CLI 추가 P1인 자동 exit→close_pane 경로도 RED 후 보완한다. disk marker 또는 bounded memory tail을 먼저 확보한 뒤 정상 pane close, 둘 다 실패만 fail-closed. 명시적 ClosePane은 폐기를 유지한다. 새 memory tail이 remove_session 이후 남으며 개수/바이트 LRU를 따르는 회귀를 검증한다.

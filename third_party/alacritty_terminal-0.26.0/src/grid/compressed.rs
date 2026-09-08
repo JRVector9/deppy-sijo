@@ -14,7 +14,8 @@
 //! 원시 `Index<Line>`(및 이를 쓰는 상류 `Term::bounds_to_string`/`Term::search`/
 //! selection-to-string)로 접근하면 OOB 패닉한다. 압축 히스토리는 반드시 `read_line`
 //! (읽기)·`reset_row`/`inflate_all`(변경 전 복원)로만 접근해야 한다. 현재 앱은
-//! 스크롤백을 전적으로 `read_line`으로 순회하고 resize 전 `inflate_all`하므로 안전하다.
+//! 스크롤백을 `read_line`으로 순회하고 resize는 슬롯을 한 행씩 복원하는 streaming
+//! 경로를 사용한다. `inflate_all`은 원시 접근이 필요한 명시적 호출자만 사용한다.
 
 // 대부분의 codec 표면이 crates/terminal 경로에서 쓰이지만, vendored 포크를 독립
 // (`--manifest-path`) 빌드할 때는 일부가 미사용으로 보여 경고가 난다.
@@ -222,9 +223,9 @@ mod tests {
     #[test]
     fn 여러_색구간_왕복() {
         let mut cells = blank_row();
-        for i in 0..columns() {
-            cells[i].c = 'x';
-            cells[i].fg = if i < 5 {
+        for (i, cell) in cells.iter_mut().enumerate() {
+            cell.c = 'x';
+            cell.fg = if i < 5 {
                 Color::Named(NamedColor::Red)
             } else if i < 10 {
                 Color::Spec(Rgb { r: 1, g: 2, b: 3 })
@@ -232,7 +233,7 @@ mod tests {
                 Color::Indexed(42)
             };
             if i % 2 == 0 {
-                cells[i].flags.insert(Flags::BOLD);
+                cell.flags.insert(Flags::BOLD);
             }
         }
         roundtrip(cells);
@@ -270,8 +271,8 @@ mod tests {
     #[test]
     fn wrapline_플래그_왕복() {
         let mut cells = blank_row();
-        for i in 0..columns() {
-            cells[i].c = 'a';
+        for cell in &mut cells {
+            cell.c = 'a';
         }
         // WRAPLINE은 보통 마지막 셀에 걸린다.
         cells[columns() - 1].flags.insert(Flags::WRAPLINE);
@@ -282,8 +283,8 @@ mod tests {
     fn 압축률이_원셀_배열보다_작다() {
         // 일반 로그류 라인(80자 상당을 20폭으로 축소): 텍스트 + 소수 run.
         let mut cells = blank_row();
-        for i in 0..12 {
-            cells[i].c = 'x';
+        for cell in cells.iter_mut().take(12) {
+            cell.c = 'x';
         }
         let row = Row::from_vec(cells, columns());
         let compressed = CompressedRow::encode(&row, columns());
@@ -303,9 +304,9 @@ mod tests {
         // 회피, 리뷰 B-M1), 왕복은 무손실이어야 한다. heap_bytes는 커진 크기를 정직히
         // 보고한다.
         let mut cells = blank_row();
-        for i in 0..columns() {
-            cells[i].c = 'x';
-            cells[i].set_hyperlink(Some(Hyperlink::new(
+        for (i, cell) in cells.iter_mut().enumerate() {
+            cell.c = 'x';
+            cell.set_hyperlink(Some(Hyperlink::new(
                 Some(format!("id{i}")),
                 format!("https://example.com/{i}"),
             )));

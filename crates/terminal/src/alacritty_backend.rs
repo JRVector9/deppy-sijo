@@ -610,7 +610,14 @@ impl TerminalBackend for AlacrittyBackend {
     /// wrapped 행은 개행 없이 이어붙여 복원 시 reflow가 자연스럽다.
     fn serialize_scrollback(&self) -> Option<Vec<u8>> {
         // 복원/압축 archive의32MiB상한을직렬화할때부터지킨다.
-        serialize_scrollback_bounded(self, 32 * 1024 * 1024)
+        serialize_scrollback_bounded(self, 32 * 1024 * 1024).ok()
+    }
+
+    fn serialize_scrollback_bounded(
+        &self,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, crate::ScrollbackSerializeError> {
+        serialize_scrollback_bounded(self, max_bytes)
     }
 
     /// scrollback+화면 전체에서 query를 부분 문자열로(대소문자 무시) 찾는다 (T3).
@@ -898,10 +905,14 @@ struct BoundedAnsiDump {
 }
 
 impl BoundedAnsiDump {
-    fn append(&mut self, bytes: &[u8]) -> Option<()> {
-        let next = self.bytes.len().checked_add(bytes.len())?;
+    fn append(&mut self, bytes: &[u8]) -> Result<(), crate::ScrollbackSerializeError> {
+        let next = self
+            .bytes
+            .len()
+            .checked_add(bytes.len())
+            .ok_or(crate::ScrollbackSerializeError::LimitExceeded)?;
         if next > self.limit {
-            return None;
+            return Err(crate::ScrollbackSerializeError::LimitExceeded);
         }
         if next > self.bytes.capacity() {
             // 기하급수 확장으로 복사 비용은 선형으로 유지하되 상한은 넘지 않는다.
@@ -914,14 +925,17 @@ impl BoundedAnsiDump {
                 .max(next);
             self.bytes
                 .try_reserve_exact(capacity - self.bytes.len())
-                .ok()?;
+                .map_err(|_| crate::ScrollbackSerializeError::Unavailable)?;
         }
         self.bytes.extend_from_slice(bytes);
-        Some(())
+        Ok(())
     }
 }
 
-fn serialize_scrollback_bounded(backend: &AlacrittyBackend, max_bytes: usize) -> Option<Vec<u8>> {
+fn serialize_scrollback_bounded(
+    backend: &AlacrittyBackend,
+    max_bytes: usize,
+) -> Result<Vec<u8>, crate::ScrollbackSerializeError> {
     let grid = backend.term.grid();
     let cols = backend.term.columns();
     let rows = backend.term.screen_lines();
@@ -1000,7 +1014,7 @@ fn serialize_scrollback_bounded(backend: &AlacrittyBackend, max_bytes: usize) ->
         }
     }
     out.append(b"\x1b[0m")?;
-    Some(out.bytes)
+    Ok(out.bytes)
 }
 
 #[cfg(test)]
@@ -1182,8 +1196,14 @@ mod tests {
             serialize_scrollback_bounded(&backend, expected.len()).unwrap(),
             expected
         );
-        assert!(serialize_scrollback_bounded(&backend, expected.len() - 1).is_none());
-        assert!(serialize_scrollback_bounded(&backend, 0).is_none());
+        assert_eq!(
+            serialize_scrollback_bounded(&backend, expected.len() - 1),
+            Err(crate::ScrollbackSerializeError::LimitExceeded)
+        );
+        assert_eq!(
+            serialize_scrollback_bounded(&backend, 0),
+            Err(crate::ScrollbackSerializeError::LimitExceeded)
+        );
     }
 
     #[test]
@@ -1716,6 +1736,29 @@ mod tests {
             "HOT 밖 히스토리가 압축되지 않았다"
         );
         a
+    }
+
+    #[test]
+    fn streaming_resize_뒤_검색_직렬화_출력이_압축_상태에서_동작한다() {
+        let mut a = backend_with_compressed_history();
+        a.resize(20, 8).unwrap();
+        assert_eq!(
+            a.term.grid().compressed_row_count(),
+            a.term.grid().history_size()
+        );
+        assert!(!a.search_scrollback("line30", 1000).matches.is_empty());
+        a.scroll(30);
+        let compressed_snapshot = a.viewport_snapshot().unwrap();
+        let compressed_archive = a.serialize_scrollback().unwrap();
+        a.term.grid_mut().inflate_all();
+        assert_eq!(compressed_archive, a.serialize_scrollback().unwrap());
+        assert_eq!(
+            compressed_snapshot.visible_cells,
+            a.viewport_snapshot().unwrap().visible_cells
+        );
+        feed(&mut a, "리사이즈 뒤 새 출력\r\n".as_bytes());
+        a.resize(60, 4).unwrap();
+        assert!(!a.search_scrollback("새 출력", 1000).matches.is_empty());
     }
 
     /// 압축된 히스토리를 직렬화한 결과가, 전부 복원(inflate)한 뒤 직렬화한 것과 동일.

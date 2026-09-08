@@ -223,6 +223,30 @@ impl Session {
         self.backend.serialize_scrollback()
     }
 
+    /// 초과 시 오래된 history만 절반씩 줄인다. 100k 상한에서 최대 18회이며 화면은
+    /// 지우지 않는다. 화면만으로도 초과하거나 리소스가 부족하면 호출자가 backend를 보존한다.
+    pub fn serialize_scrollback_for_archive(
+        &mut self,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, terminal::ScrollbackSerializeError> {
+        for _ in 0..=terminal::policy::SCROLLBACK_LINES_MAX.ilog2() + 1 {
+            match self.backend.serialize_scrollback_bounded(max_bytes) {
+                Err(terminal::ScrollbackSerializeError::LimitExceeded) => {
+                    let history = self.backend.cache_footprint().history_lines;
+                    if history == 0 {
+                        return Err(terminal::ScrollbackSerializeError::LimitExceeded);
+                    }
+                    self.trim_scrollback(history / 2);
+                    if self.backend.cache_footprint().history_lines >= history {
+                        return Err(terminal::ScrollbackSerializeError::LimitExceeded);
+                    }
+                }
+                result => return result,
+            }
+        }
+        Err(terminal::ScrollbackSerializeError::LimitExceeded)
+    }
+
     pub fn id(&self) -> SessionId {
         self.id
     }
@@ -710,6 +734,47 @@ mod tests {
             80, 24, 1000, Some(0), &mut &b""[..]);
         assert_eq!(session.resize_checked(0, 24).unwrap_err(), ResizeError::InvalidSize);
         assert_eq!(session.cache_footprint().columns, 80);
+    }
+
+    #[test]
+    fn archive_limit_이력만_줄이고_최신_화면을_보존한다() {
+        let text = (0..1000)
+            .map(|i| format!("row{i:04}\r\n"))
+            .collect::<String>()
+            + "LATEST";
+        let mut live = Session::restore_archived(
+            SessionId(1),
+            SessionKind::Shell,
+            20,
+            5,
+            5000,
+            Some(0),
+            &mut text.as_bytes(),
+        );
+        let screen = live.screen_text();
+        let dump = live.serialize_scrollback_for_archive(512).unwrap();
+        assert!(dump.len() <= 512);
+        assert_eq!(live.screen_text(), screen);
+        assert!(String::from_utf8(dump).unwrap().contains("LATEST"));
+        assert!(live.cache_footprint().history_lines < 996);
+    }
+
+    #[test]
+    fn archive_limit_화면만_초과하면_화면을_삭제하지_않는다() {
+        let mut live = Session::restore_archived(
+            SessionId(1),
+            SessionKind::Shell,
+            20,
+            5,
+            100,
+            Some(0),
+            &mut &b"LATEST"[..],
+        );
+        assert_eq!(
+            live.serialize_scrollback_for_archive(0),
+            Err(terminal::ScrollbackSerializeError::LimitExceeded)
+        );
+        assert!(live.screen_text().contains("LATEST"));
     }
 
     #[test]

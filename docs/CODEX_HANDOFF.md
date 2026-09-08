@@ -2650,3 +2650,9 @@
 - 최종 source commit은 `5f31d5ea4682a2ecd5b80453e6e8cf7dc2345389`이며 worktree clean을 확인했다. 전체 source CLI 리뷰3와 좁은 재리뷰 프로세스는 모두 exit0을 수집했다. timeout review2/실제 codex review 명령의 wrapper exit0은 종료 처리 성공일 뿐 리뷰 성공이 아니다.
 - 부모가 별도 독립 리뷰자에게 최종 retry 변경만 재검토시켰으며 추가 확정 결함 없음으로 종료했다. 부모는 일반 push 및 #165 base stacked PR 생성/Ready를 승인했다. source 변경 없이 이 기록을 보완하며 rebase/force/merge/앱build/launch는 하지 않는다.
 - 최신 gate: app2089PASS/14ignored; strictClippyPASS9.13초; boundary/fmt/diffPASS. 로그와 optional Ghostty Zig 부재는 앞 절대로 유지한다.
+
+### PR E #167 게시 완료
+- PR: https://github.com/JRVector9/deppy-sijo/pull/167 — `fix/resize-applied-generation` → `feat/scrollback-live-policy`(#165), OPEN/Ready(`isDraft=false`). 최초 게시 HEAD `9c77e9ac88ceea2bc4987b5b00331495cdcf404e`의 로컬/원격 일치와 clean을 확인했다. 실제 테스트한 최종 source commit은 `5f31d5ea4682a2ecd5b80453e6e8cf7dc2345389`이며 이후 변경은 handoff/plan 문서뿐이다.
+- 원격 초기 검사: GitGuardian SUCCESS. Actions 5개(format/boundary/diff, macOS build/clippy/test, Linux Relay, RustSec, licenses/sources/duplicates)는 각 check-run annotation에서 계정 결제 실패/지출 한도로 job이 시작되지 않았음을 직접 확인했다. 로컬 PASS를 원격 PASS 또는 Linux Relay 실행 결과로 바꾸지 않는다. CI failure의 원인은 테스트 실패가 아니라 hosted job 미실행이다.
+- 변경/검증/리뷰/일지는 완료했고 이 게시 기록을 문서 commit/push한 뒤 최종 원격 HEAD·checks·clean을 다시 확인한다. merge/rebase/force/앱build/launch는 하지 않았다.
+- 다음 담당자: `gh pr view 167 --json headRefOid,baseRefName,isDraft,statusCheckRollup`; `git status --short`; 필요 시 source gate 명령은 위 로그/plan을 따른다. optional Ghostty의 Zig 설치 및 GUI 화면 검증은 수행되지 않았다. PR #165 착지 이후 base 변경/merge는 부모가 별도로 결정한다.

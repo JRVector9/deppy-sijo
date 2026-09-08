@@ -90,7 +90,7 @@ assert!(view.applied_at.is_none());
 
 - [x] 관련 전체 terminal/session/runtime/web-remote/app 테스트와 `cargo clippy -p terminal -p session -p runtime -p web-remote -p deppy-sijo --locked --all-targets -- -D warnings`, `cargo fmt --all --check`, `cargo run --locked -p xtask -- check-boundary`, `git diff --check`를 실행한다.
 - [x] `codex exec --sandbox read-only`로 코드 diff만 읽는 5분 유계 리뷰를 수행한다. 테스트/빌드/편집 금지 프롬프트를 사용하고 중단 시 정확한 PID만 종료한다. 확정 finding은 RED→GREEN으로 고친다.
-- [ ] 실제 결과/실패 접근/남은 플랫폼 제한을 handoff와 일지에 쓴다. 한국어 커밋 후 일반 push, `gh pr create --base feat/scrollback-live-policy --head fix/resize-applied-generation --body-file <준비한 본문>`으로 stacked PR을 만든다. rebase/force-push/앱 실행은 하지 않는다.
+- [x] 실제 결과/실패 접근/남은 플랫폼 제한을 handoff와 일지에 쓴다. 한국어 커밋 후 일반 push, `gh pr create --base feat/scrollback-live-policy --head fix/resize-applied-generation --body-file <준비한 본문>`으로 stacked PR을 만든다. rebase/force-push/앱 실행은 하지 않는다.
 
 ## 실행 중 확정한 계약 보완
 
@@ -98,3 +98,7 @@ assert!(view.applied_at.is_none());
 - Backend/PTY 일부 실패는 같은 token으로 다시 실제 적용한다. 성공한 token만 멱등 ACK를 재발행한다. UI 자동 재확인은2초 간격 최대2회이고 실패/소진 뒤 안정 화면을 남긴 채 fence/요청을 종료한다.
 - 큐 coalesce는 payload token과rollback token을 함께 갱신한다. 큐완료에서는수락만기록하고Applied와동일stamp viewport를받은뒤최종표식을해제한다. 선택해제는실제화면승격의기존공통경로를따른다.
 - 구형 v12/v13 peer는 exact-version handshake에서 명확히 거부한다. legacy Resize 자체의 byte/API는 유지하지만 실제 적용 보장으로 조용히 fallback하지 않는다.
+
+## 게시 결과
+
+PR #167: https://github.com/JRVector9/deppy-sijo/pull/167 (base `feat/scrollback-live-policy`, Ready). 최종 source commit `5f31d5e`. 원격 Actions는 각 annotation에서 계정 결제/지출 한도로 job 미시작을 확인했으며 GitGuardian은 SUCCESS였다. 선택 Ghostty는 Zig 실행 파일 부재로 check 실패, GUI 실행/시각 검증은 미수행이다. 전체 source Codex 리뷰 P2 수정 및 좁은 재리뷰·독립 재리뷰를 완료했다.

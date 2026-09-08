@@ -107,7 +107,7 @@ CARGO_BUILD_JOBS=2 cargo clippy -p deppy-sijo --all-targets --locked -- -D warni
 workspace 경계 검사 명령은 저장소 CI/xtask 정의를 확인해 동일하게 실행한다. 앱 번들 생성·GUI 실행은 하지 않는다.
 
 - [x] **Step 3: 실제 명령 결과, 실패 접근, 리뷰 반영, 남은 항목을 handoff와 프로젝트 일지에 기록한다.**
-- [ ] **Step 4: 한국어 Conventional Commit을 만들고 push·PR 생성한다.**
+- [x] **Step 4: 한국어 Conventional Commit을 만들고 push·PR 생성한다.**
 
 ```sh
 git add crates/app/src/app.rs crates/app/src/ui/file_tree.rs crates/i18n/locales docs/CODEX_HANDOFF.md docs/superpowers/plans/2026-09-08-workspace-open-intent.md
@@ -117,3 +117,7 @@ gh pr create --base main --head fix/workspace-open-intent --title 'fix(app): 워
 ```
 
 PR 본문에는 메뉴/선택 배경 동작, 충돌 시 보존, 실행 전 재검증, 실제 게이트 결과를 적는다. PR merge는 이 작업 범위에 포함하지 않는다.
+
+## 완료 결과
+
+계획 a47b00c, 구현 e114180, PR #156. App 2,080 tests/i18n 8 tests/Clippy/fmt/diff/boundary PASS, Codex 소스 리뷰 확정 결함 없음. GUI 번들 생성·실행 및 PR merge는 수행하지 않았다.

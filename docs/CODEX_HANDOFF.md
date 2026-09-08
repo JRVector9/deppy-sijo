@@ -2358,3 +2358,6 @@
 
 - PR A Codex 최종 리뷰: source/locale diff에서 실제 재현 가능한 correctness 결함 없음. SyncDotenv 선행 순서, 정확한 workspace ID/유계 재시도, 거부 시 오실행 방지 유지라는 결론을 받았다. 리뷰가 약 10분까지 확장되어 정확한 PID에 SIGINT로 추가 탐색 중지를 요청했으며, 프로세스가 최종 결론을 출력하고 종료했다. 재시작/추가 리뷰는 하지 않았다. 로그: /private/tmp/deppy-session-intent-review.txt.
 - PR A 구현 완료: source 7개 파일과 계획/handoff 변경만 포함한다. product 수정 없이 모든 로컬 게이트를 통과했다. 다음: 한국어 커밋, push, main PR 생성, PR 번호/최종 SHA 기록. GitHub CI 결과는 아직 없다.
+
+- PR A 완료: 구현 e114180 및 계획 a47b00c를 push했고 main 대상 PR #156(https://github.com/JRVector9/deppy-sijo/pull/156)을 생성했다. merge는 수행하지 않았다. source는 검증 완료한 상태 그대로이며 이 마감 커밋은 문서만 바꾼다.
+- PR A 남은 작업/다음 명령: 부모 통합 lane에서 PR #156의 CI와 병렬 PR 간 docs 충돌을 확인한다. `gh pr view 156 --json headRefOid,mergeStateStatus,statusCheckRollup`; `git log origin/main..fix/workspace-open-intent --oneline`. CARGO 실행/GUI 실행 중인 작업 없음. force push/rebase 없음.

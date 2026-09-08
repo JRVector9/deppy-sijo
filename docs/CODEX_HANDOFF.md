@@ -1,3 +1,15 @@
+## CJK 폴백 2셀 폭 main 이관 준비 완료 (2026-09-08)
+
+- 현재 목표: PR #146에만 남은 `cell_matched_cjk` 기능을 exact `origin/main` `45e66ccae313e653fc5dc6df46b80f791f231fc4`에서 독립 PR로 이관한다.
+- 완료 작업: `fix/cjk-cell-fallback-main`에서 선택한 모노 폰트의 `M` advance와 시스템 CJK 폰트의 `가` advance를 epaint 경로로 실측하고, 터미널 Monospace 및 bold 폴백만 정확한 2셀 폭으로 보정했다. Proportional UI는 원본 폰트 비율을 유지한다. 프로세스 수명 캐시의 시스템 폰트 바이트는 `Cow::Borrowed`로 공유해 보정 사본이 대형 버퍼를 복제하지 않는다.
+- 변경 파일: `crates/app/src/fonts.rs`, 이 handoff. 기존 터미널 레이아웃·IME·렌더러 파일은 수정하지 않았다.
+- TDD: 새 회귀 테스트를 먼저 추가한 상태에서 JetBrains Mono Light 11pt의 한글 8자 폭이 `88`, 기대 2셀 폭이 `105.6`으로 실패(exit 101)하는 RED를 확인했다. 구현 후 모든 JetBrains Mono 굵기, 11/13.5/16/20pt, Monospace/bold 조합이 GREEN이다.
+- 실제 검증: `CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-cjk-cell-target-20260908 cargo test -p deppy-sijo --bin deppy-sijo --locked fonts::tests -- --test-threads=1`은 8 passed; 같은 target의 `cargo clippy -p deppy-sijo --all-targets --locked -- -D warnings` 통과; `cargo run --locked -p xtask -- check-boundary` 통과; `cargo fmt --all -- --check`와 `git diff --check` 통과.
+- 코드 리뷰: 첫 `codex review --uncommitted`는 rustfmt 불일치 1건만 찾았다. `cargo fmt --all` 적용과 관련 테스트 재실행 뒤 두 번째 리뷰는 추가 actionable defect 없음으로 종료했다. 범위 제한 prompt와 `--uncommitted`를 함께 주는 두 시도는 Codex CLI 인자 상호 배타 오류(exit 2)여서 기본 uncommitted 리뷰로 재실행했다.
+- 설계 결정: 폭 보정은 폴백 face의 `FontTweak::scale`에만 적용하고 셀 크기나 자간을 바꾸지 않는다. 원본 #146 전체 cherry-pick 없이 `fonts.rs` hunk만 egui 0.36 API에 맞췄다.
+- 남은 작업: 한국어 커밋, push, `main` 대상 Ready PR 생성, exact-head GitHub 상태 분류. 앱 빌드·실행은 금지되어 수행하지 않았고 실제 화면에서 한글 정렬·가독성 검증은 대기 상태다. hosted Actions가 runner 미배정/무단계로 실패하면 BLOCKED로 기록하고 PASS로 간주하지 않는다.
+- 다음 명령: `git add crates/app/src/fonts.rs docs/CODEX_HANDOFF.md`; 한국어 커밋; `git push -u origin fix/cjk-cell-fallback-main`; `gh pr create --base main --head fix/cjk-cell-fallback-main --title 'fix(font): CJK 폴백을 터미널 2셀 폭에 맞춘다' --body-file <body>`; `gh pr view <PR> --json headRefOid,statusCheckRollup,url`.
+
 ## ureq3 migration validated / PR landing next (2026-09-07)
 
 - Objective: replace dependency-only PR141 with native ureq3.4 migration, preserving OAuth/MCP status/body/redaction and SSE idle semantics.

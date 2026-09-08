@@ -168,14 +168,59 @@ fn cjk_font_data() -> Option<CachedFontData> {
                 read_font_file_bounded(Path::new(path), FONT_FILE_BYTES_MAX)
                     .ok()
                     .map(|bytes| {
+                        // OnceLock이 프로세스 수명 동안 보관하는 바이트를 정적으로 빌려
+                        // 격자 정합 사본도 큰 폰트 버퍼를 함께 쓰게 한다.
+                        let bytes = Box::leak(bytes.into_boxed_slice());
                         (
                             *path,
-                            std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+                            std::sync::Arc::new(egui::FontData::from_static(bytes)),
                         )
                     })
             })
         })
         .clone()
+}
+
+/// 터미널 셀 폭을 재는 기준 문자와 두 칸짜리 한글 기준 문자.
+const CELL_WIDTH_REFERENCE: char = 'M';
+const WIDE_REFERENCE: char = '가';
+const CJK_MONO_FONT: &str = "cjk_mono";
+
+/// epaint가 실제 레이아웃에 쓰는 경로로 글리프 advance를 em 단위에서 잰다.
+fn advance_em(font_data: std::sync::Arc<egui::FontData>, ch: char) -> Option<f32> {
+    let family = egui::FontFamily::Monospace;
+    let mut definitions = egui::FontDefinitions::empty();
+    definitions.font_data.insert("probe".to_owned(), font_data);
+    definitions
+        .families
+        .insert(family.clone(), vec!["probe".to_owned()]);
+    let mut fonts = egui::epaint::text::FontsImpl::new(Default::default(), definitions);
+    let width = fonts.font(&family).glyph_width(ch, 1.0);
+    (width > 0.0).then_some(width)
+}
+
+/// 선택한 모노 폰트의 두 셀 폭에 맞춘 CJK 폴백을 만든다.
+fn cell_matched_cjk(
+    mono_font: &str,
+    mono_weight: &str,
+    cjk: &std::sync::Arc<egui::FontData>,
+) -> Option<egui::FontData> {
+    let mono = std::sync::Arc::new(egui::FontData::from_static(mono_bytes(
+        mono_font,
+        mono_weight,
+    )));
+    let cell_em = advance_em(mono, CELL_WIDTH_REFERENCE)?;
+    let wide_em = advance_em(cjk.clone(), WIDE_REFERENCE)?;
+    let scale = 2.0 * cell_em / wide_em;
+
+    (scale.is_finite() && (scale - 1.0).abs() > 1e-4).then(|| egui::FontData {
+        font: cjk.font.clone(),
+        index: cjk.index,
+        tweak: egui::FontTweak {
+            scale,
+            ..cjk.tweak.clone()
+        },
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -293,18 +338,31 @@ fn build_font_definitions(
     let mut cjk_font_path = None;
     if let Some((path, font_data)) = cjk_font_data() {
         cjk_font_path = Some(path);
+        // 터미널 가족만 선택한 모노 셀 폭에 맞춘 폴백을 쓴다. UI는 원본 비율을 유지한다.
+        let mono_cjk = match cell_matched_cjk(mono_font, mono_weight, &font_data) {
+            Some(matched) => {
+                fonts
+                    .font_data
+                    .insert(CJK_MONO_FONT.to_owned(), matched.into());
+                CJK_MONO_FONT
+            }
+            None => "cjk",
+        };
         fonts.font_data.insert("cjk".to_owned(), font_data);
-        for family in [
-            egui::FontFamily::Monospace,
-            egui::FontFamily::Proportional,
+        for (family, name) in [
+            (egui::FontFamily::Monospace, mono_cjk),
+            (egui::FontFamily::Proportional, "cjk"),
             // bold 셀도 한글이 깨지지 않게 같은 폴백을 붙인다 (B-1).
-            egui::FontFamily::Name(terminal::MONO_BOLD_FAMILY.into()),
+            (
+                egui::FontFamily::Name(terminal::MONO_BOLD_FAMILY.into()),
+                mono_cjk,
+            ),
         ] {
             fonts
                 .families
                 .entry(family)
                 .or_default()
-                .push("cjk".to_owned());
+                .push(name.to_owned());
         }
         tracing::info!(kind = "cjk_fallback", "font registered");
     } else {
@@ -573,6 +631,52 @@ mod tests {
             super::mono_bytes("D2Coding", "Regular"),
             super::mono_bytes("D2Coding", "Bold")
         ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn jetbrains_mono의_한글은_정확히_두_셀을_차지한다() {
+        use terminal::renderer_egui::{CellMetrics, cell_size};
+
+        const RUN_LEN: usize = 8;
+        const ROUNDING_SLACK: f32 = 0.05;
+
+        for weight in super::mono_weights_for("JetBrainsMono") {
+            let ctx = egui::Context::default();
+            ctx.set_fonts(super::build_font_definitions(None, "JetBrainsMono", weight));
+            let mut output = ctx.run_ui(egui::RawInput::default(), |_| {});
+            output.textures_delta.clear();
+
+            for font_size in [11.0_f32, 13.5, 16.0, 20.0] {
+                let cell = cell_size(
+                    &ctx,
+                    CellMetrics {
+                        font_size,
+                        line_height: 1.0,
+                    },
+                );
+                for family in [
+                    egui::FontFamily::Monospace,
+                    egui::FontFamily::Name(terminal::MONO_BOLD_FAMILY.into()),
+                ] {
+                    let width = ctx.fonts_mut(|fonts| {
+                        fonts
+                            .layout_no_wrap(
+                                "가".repeat(RUN_LEN),
+                                egui::FontId::new(font_size, family.clone()),
+                                egui::Color32::WHITE,
+                            )
+                            .rect
+                            .width()
+                    });
+                    let expected = cell.x * 2.0 * RUN_LEN as f32;
+                    assert!(
+                        (width - expected).abs() < ROUNDING_SLACK,
+                        "JetBrainsMono/{weight} {family} @{font_size}: 한글 폭 {width}가 2셀 폭 {expected}와 다르다"
+                    );
+                }
+            }
+        }
     }
 
     #[cfg(target_os = "macos")]

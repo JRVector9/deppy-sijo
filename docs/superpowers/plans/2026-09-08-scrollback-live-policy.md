@@ -53,9 +53,9 @@
 - [x] 앱 재빌드/재실행·시각 검증과 Linux/Windows/Ghostty 실환경 검증은 실행하지 않았으면 대기로 남긴다.
 
 ### Task 7: stacked PR 게시
-- [ ] 한국어 구현 커밋 후 `git push -u origin feat/scrollback-live-policy`.
-- [ ] `gh pr create --base feat/scrollback-policy-contract --head feat/scrollback-live-policy --body-file ...`로 PR #157 의존성을 명시한다. PR C vendor reflow는 선병합하지 않는다.
-- [ ] handoff에 head/PR/테스트/리뷰/잔여 외부 검증과 다음 명령을 기록한다. force-push/rebase 없음.
+- [x] 한국어 구현 커밋 `4ca0ef7` 후 `git push -u origin feat/scrollback-live-policy`.
+- [x] `gh pr create --base feat/scrollback-policy-contract --head feat/scrollback-live-policy --body-file ...`로 PR #165를 생성하고 PR #157 의존성을 명시했다. PR C vendor reflow는 선병합하지 않았다.
+- [x] handoff에 head/PR/테스트/리뷰/잔여 외부 검증과 다음 명령을 기록했다. force-push/rebase 없음. 원격 Actions는 계정 결제/spending 제한으로 job 미시작 BLOCKED다.
 
 ### 최종 복원 계약 (2026-09-08 root 확정)
 - [x] 독립 감사/복구 ANSI 로그는 설정 변경으로 삭제하거나 재작성하지 않는다. storage manifest/ceiling diff는 제거한다.
@@ -67,4 +67,4 @@
 - [x] 초기 HostConfig 정책은 client를 반환하기 전 첫 명령으로 admitted되므로 RestoreWorkspace가 앞지르지 않는다.
 - [x] terminal90+session58 전체PASS, runtime287 전체PASS(--test-threads=2). 앱 실화면/IME는 실행하지 않았으므로 대기.
 - [x] TLS 포함 app18 PASS. Settings21, i18n8, core/app strictclippy, boundary/fmt/diff의 기존 PASS 후 마지막 TLS 보완 소스에서 관련 gate를 재확인한다.
-- [ ] 최종 gate 기록, 커밋/push/stacked PR.
+- [x] 최종 gate 기록, 커밋/push/stacked PR #165. 원격 CI와 앱 시각/플랫폼 검증은 미완료로 구분한다.

@@ -2474,3 +2474,9 @@
 - 앞선 묶음 RED에서 빠졌던 압박 floor 회귀의 민감도를 별도 확인했다. 수정 한 줄을 임시 제거하면 실제 `100 != 5000` RED(exit 101), 원본 소스를 즉시 복원하면 해당 회귀 GREEN(exit 0)이다(`/private/tmp/deppy-live-pressure-regression-{red,green}.log`). 최종 파일은 전체 gate 당시 소스와 같다.
 - 최종 결과: terminal 90 PASS/4 ignored, Session 58 PASS, runtime 287 PASS, TLS 포함 app 18 PASS, Settings 21 PASS, i18n 8 PASS. runtime 전체는 `--test-threads=2`로 실행했다. CLI 확정 세 건과 GUI wake 회귀를 수정했으며 이후 직접 검토에서 추가 확정 결함은 없었다.
 - 앱 재빌드·재실행/실화면·IME, 네이티브 TLS 암호화/Ghostty 및 Linux/Windows 실행은 미실행·대기다. 독립 복구 로그 미삭제와 재시작 시 과거 재표시 경계를 유지한다. 다음은 지정 파일 커밋 → 일반 push → #157 기반 stacked PR 게시다.
+
+### PR D 게시 완료 및 외부 CI 차단
+- 구현 커밋 `4ca0ef7aa5ae7116c7d9c347f3f8687745f0a6bf` (`feat(runtime): 스크롤백 정책을 현재와 복원 세션에 실시간 적용한다`), 일반 push 완료. PR: https://github.com/JRVector9/deppy-sijo/pull/165 . base는 `feat/scrollback-policy-contract`이며 #157 통합이 선행되어야 한다. rebase/force-push/merge는 하지 않았다.
+- PR #165 자체 실행을 확인했다. Actions `34215008968`(Dependency security)과 `34215008991`(Build and test)의 모든 job annotation은 계정 결제 실패 또는 spending limit 때문에 job이 시작되지 않았다고 명시한다. 원격 CI는 BLOCKED이며 코드 검사 PASS가 아니다. GitGuardian은 최초 조회 당시 진행 중이었다.
+- 남은 작업: root의 stacked PR 검토/통합, 계정 billing/spending 복구 뒤 CI 재실행, 별도 E 후속 PR. 앱 실화면/IME와 Ghostty·네이티브 TLS·Linux/Windows 검증은 대기 상태다.
+- 다음 에이전트 명령: `cd /private/tmp/deppy-scrollback-live-20260908`; `git status --short`; `git rev-parse HEAD`; `gh pr view 165 --json url,headRefOid,baseRefName,statusCheckRollup`; `gh run view 34215008968`; `gh run view 34215008991`. 최종 문서 커밋도 일반 push해 원격 HEAD를 맞춘다.

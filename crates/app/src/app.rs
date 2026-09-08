@@ -1551,6 +1551,31 @@ fn runtime_command_creates_session(command: &runtime::RuntimeCommand) -> bool {
     )
 }
 
+/// 같은 runtime에 전달한 env가 그대로인 셸/분할은 worker 왕복을 생략한다.
+/// 에이전트의 승인/lease와 startup 복원 순서는 기존 continuation 경로로 보존한다.
+fn session_spawn_skips_dotenv_worker(
+    command: &runtime::RuntimeCommand,
+    delivered: Option<DotenvState>,
+    current: DotenvState,
+    creation_blocked: bool,
+) -> bool {
+    !creation_blocked
+        && matches!(
+            command,
+            runtime::RuntimeCommand::SpawnShell { .. } | runtime::RuntimeCommand::SplitPane { .. }
+        )
+        && delivered == Some(current)
+}
+
+/// 전환 성공 후 이 workspace용 런처가 없을 때만 기본 셸을 하나 만든다.
+fn should_bootstrap_created_workspace_shell(
+    created: bool,
+    switched: bool,
+    launcher_open: bool,
+) -> bool {
+    created && switched && !launcher_open
+}
+
 fn startup_catalog_blocks_session_creation(
     recovery: &CatalogStartupRecovery,
     restore_lifecycle: WorkspaceRestoreLifecycle,
@@ -18021,8 +18046,10 @@ impl App {
                 if let runtime::RuntimeCommand::WriteInput { session, .. } = &command {
                     self.active.workspace_ui.clear_selection(*session);
                 }
-                if runtime_command_requires_dotenv(&command) {
-                    let runtime_instance = self.active.runtime_instance;
+                let runtime_instance = self.active.runtime_instance;
+                if runtime_command_requires_dotenv(&command)
+                    && !self.session_spawn_skips_dotenv_worker(runtime_instance, &command)
+                {
                     if self
                         .stage_dotenv_continuation(
                             runtime_instance,
@@ -18161,6 +18188,29 @@ impl App {
         }
     }
 
+    fn session_spawn_skips_dotenv_worker(
+        &self,
+        runtime_instance: u64,
+        command: &runtime::RuntimeCommand,
+    ) -> bool {
+        let Some(runtime) = self.runtime_by_instance(runtime_instance) else {
+            return false;
+        };
+        let creation_blocked = startup_catalog_blocks_session_creation(
+            &self.catalog_startup_recovery,
+            runtime.restore_lifecycle,
+            command,
+            self.bench.is_some() || self.perf_harness_next.is_some(),
+        );
+        let root = self.workspace_tree_root(&runtime.id);
+        session_spawn_skips_dotenv_worker(
+            command,
+            runtime.dotenv_state,
+            dotenv_state_for_root(root.as_deref()),
+            creation_blocked,
+        )
+    }
+
     fn drain_workspace_protocol_intents(&mut self, runtime_instance: u64) {
         while let Some(intent) = self
             .runtime_by_instance_mut(runtime_instance)
@@ -18176,7 +18226,9 @@ impl App {
                 self.cancel_terminal_focus_intents();
                 self.active.workspace_ui.arm_terminal_focus(pane.clone());
             }
-            if runtime_command_requires_dotenv(&command) {
+            if runtime_command_requires_dotenv(&command)
+                && !self.session_spawn_skips_dotenv_worker(runtime_instance, &command)
+            {
                 let continuation = PendingDotenvContinuation::WorkspaceProtocol {
                     operation,
                     generation,
@@ -23504,7 +23556,14 @@ impl App {
                             if workspace_id != self.active.id {
                                 self.switch_workspace(&workspace_id);
                             }
-                            if created {
+                            // 전환 거부 시 active는 이전 workspace이므로 거기에 셸을 만들지 않는다.
+                            let switched = workspace_id == self.active.id;
+                            let launcher_open = self.agent_launcher_ui.is_open_for(&self.active.id);
+                            if should_bootstrap_created_workspace_shell(
+                                created,
+                                switched,
+                                launcher_open,
+                            ) {
                                 self.active
                                     .workspace_ui
                                     .spawn_shell(self.config.terminal.scrollback_lines as usize);
@@ -31843,6 +31902,121 @@ mod tests {
             true,
             WorkspaceRestoreLifecycle::Delivered
         ));
+    }
+
+    #[test]
+    fn launcher_spawn_shell_and_split_skip_only_delivered_unchanged_env() {
+        let shell = runtime::RuntimeCommand::SpawnShell {
+            cols: 80,
+            rows: 24,
+            scrollback_lines: 1000,
+        };
+        let split = runtime::RuntimeCommand::SplitPane {
+            pane: runtime::MuxPaneId("pane".to_owned()),
+            direction: runtime::SplitDirection::Horizontal,
+            scrollback_lines: 1000,
+        };
+        let fresh = (true, Some(std::time::UNIX_EPOCH));
+        let changed = (
+            true,
+            Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1)),
+        );
+        for command in [&shell, &split] {
+            assert!(session_spawn_skips_dotenv_worker(
+                command,
+                Some(fresh),
+                fresh,
+                false
+            ));
+            assert!(session_spawn_skips_dotenv_worker(
+                command,
+                Some((false, None)),
+                (false, None),
+                false
+            ));
+            assert!(!session_spawn_skips_dotenv_worker(
+                command, None, fresh, false
+            ));
+            assert!(!session_spawn_skips_dotenv_worker(
+                command,
+                Some(fresh),
+                changed,
+                false
+            ));
+            assert!(!session_spawn_skips_dotenv_worker(
+                command,
+                Some(fresh),
+                (false, None),
+                false
+            ));
+            assert!(!session_spawn_skips_dotenv_worker(
+                command,
+                Some((false, None)),
+                fresh,
+                false
+            ));
+            assert!(!session_spawn_skips_dotenv_worker(
+                command,
+                Some(fresh),
+                fresh,
+                true
+            ));
+        }
+    }
+
+    #[test]
+    fn launcher_spawn_agent_and_restore_keep_approval_and_restore_paths() {
+        let agent = runtime::RuntimeCommand::SpawnAgent {
+            cols: 80,
+            rows: 24,
+            scrollback_lines: 1000,
+            agent_config_id: None,
+            command: "claude".to_owned(),
+            args: Vec::new(),
+            env_plain: Vec::new(),
+            env_secrets: Vec::new(),
+            waiting_regex: None,
+            approval_regex: None,
+            error_regex: None,
+            done_regex: None,
+        };
+        let fresh = (false, None);
+        for command in [agent, runtime::RuntimeCommand::RestoreWorkspace] {
+            assert!(!session_spawn_skips_dotenv_worker(
+                &command,
+                Some(fresh),
+                fresh,
+                false
+            ));
+        }
+    }
+
+    #[test]
+    fn launcher_spawn_created_workspace_waits_for_its_launcher() {
+        let mut launcher = ui::agent_launcher::AgentLauncherUi::new();
+        launcher.open_for("new".to_owned(), "Project".to_owned());
+        assert!(!should_bootstrap_created_workspace_shell(
+            true,
+            true,
+            launcher.is_open_for("new")
+        ));
+        assert!(should_bootstrap_created_workspace_shell(
+            true,
+            true,
+            launcher.is_open_for("other")
+        ));
+        assert!(!should_bootstrap_created_workspace_shell(
+            false, true, false
+        ));
+    }
+
+    #[test]
+    fn launcher_spawn_failed_workspace_switch_does_not_create_shell_in_previous_workspace() {
+        assert!(!should_bootstrap_created_workspace_shell(
+            true, false, false
+        ));
+        assert!(!should_bootstrap_created_workspace_shell(true, false, true));
+        assert!(should_bootstrap_created_workspace_shell(true, true, false));
     }
 
     #[test]

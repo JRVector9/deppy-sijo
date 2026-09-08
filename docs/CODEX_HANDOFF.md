@@ -2333,3 +2333,27 @@
 - Failed approaches: an initial unbounded `codex review --uncommitted` ran extensive checks but never produced a final review and was stopped by exact PID; it also attempted the invalid `cargo test -p deppy-sijo --lib` command even though the app has no library target. The first RED-test draft used unavailable `Context::run`, then captured `WorkspaceUi` too broadly; both compile-only mistakes were corrected before the intended RED assertion was observed. The first final format check found one line-wrap difference; `cargo fmt --all` corrected it and the rerun passed.
 - Remaining work: push this clean landing branch, create a PR to `main`, wait for required checks, merge only if green, close superseded PRs #147 and #148, and preserve PRs #146 and #149 plus their dependent remote branches for further development.
 - Exact next commands: `git push -u origin land/ime-resize-ready-20260906`; create a `main` PR for commits `4903b39` and `bbead4f`; run `gh pr checks <new-pr> --watch`; merge the new PR after all required checks pass; close #147 and #148 without deleting the `fix/window-resize-flicker` branch because PR #149 still targets it.
+
+## 2026-09-08 #146 launcher latency/spawn race 독립 이관
+- 목표: exact main45e66cc 기반 `/private/tmp/deppy-dotenv-shell-spawn-main-20260908`, branch `perf/dotenv-shell-spawn-main`에서 #146의 dotenv shell fast-path와 workspace bootstrap race만 완성한다.
+- 완료: clean worktree 생성, #146 source75bf2c9 관련 hunk 조사, writing-plans 계획 작성. production code는 아직 수정하지 않았다.
+- 설계: delivered/current dotenv 상태가 같은 shell/split만 worker를 생략하되 기존 startup/restore admission gate를 그대로 보존한다. 새 workspace는 전환 성공 및 자기 workspace의 launcher 상태를 모두 확인한다. agent approval/lease 경로는 기존대로 유지한다.
+- 수정 예정: app.rs, ui/agent_launcher.rs, 계획/handoff만. 다른 worktree/Relay/Fleet/terminal/layout은 변경하지 않는다.
+- 테스트: 아직 실행 전. 다음은 false/기존 created stub와 회귀로 실제 RED를 확보한다. 명령: `CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-deps-target-20260907 cargo test -p deppy-sijo --bin deppy-sijo --locked launcher_spawn -- --test-threads=1`.
+- 남은 작업: RED→최소 hunk 이관→관련/full gate→Codex 리뷰/수정→일지/commit/push/main Ready PR. 앱 build/launch 금지.
+
+### 런처 분리 이관 RED→GREEN 및 gate
+- `session_spawn_skips_dotenv_worker`, bootstrap predicate, `AgentLauncherUi::is_open_for`의 기존 동작/false stub에서 실제 RED4개를 확인했다(`/private/tmp/deppy-dotenv-shell-spawn-red.log`,2PASS/4FAIL). 동일 runtime에 전달한 env가 현재 상태와 같고 startup gate가 허용할 때 shell/split만 worker를 생략하도록 구현했다. metadata 상태가 달라짐/생성/삭제/아직 미전달/agent/restore는 기존 경로로 유지한다.
+- App controller Runtime와 workspace protocol drain 두 곳에 같은 helper를 연결했다. `WorkspaceMutationPurpose::SwitchRuntime`는 switch 호출 뒤 actual active ID 일치와 해당 workspace launcher 상태를 함께 확인한다. 새 workspace용 launcher가 있거나 전환이 거부되면 기본 셸을 만들지 않는다.
+- 실행 결과: focused6PASS(`/private/tmp/deppy-dotenv-shell-spawn-green.log`), app 전체2041PASS/14ignored(`/private/tmp/deppy-dotenv-shell-spawn-app-full.log`,16.56초), app all-targets strictClippyPASS(`/private/tmp/deppy-dotenv-shell-spawn-clippy.log`,19.61초). boundary/fmt/diff 검사도 실행했다.
+- 현재 readonly `codex review --uncommitted` PID25150(300초 상한)가 실제 소스 diff를 검토 중이다(`/private/tmp/deppy-dotenv-shell-spawn-review.log`). source 변경은 app.rs 및 ui/agent_launcher.rs뿐이다. 아직 commit/push/PR 전이며 GUI build/launch는 실행하지 않았다.
+- 다음: 리뷰 확정 finding이면 RED→GREEN 후 관련 재검증, 없으면 handoff/일지 확정→한국어 commit→일반 push→main Ready PR→원격 HEAD/CI/clean 확인.
+
+### 런처 최종 리뷰 범위 제한
+- 기본 `codex review --uncommitted`는 실제 실행했으나 git history/다른 ref까지 탐색한 뒤 300초 안에 결론을 내지 못했다. 정확 processgroup25150을 종료했으며 wrapper exit0을 리뷰 PASS로 세지 않는다. readonly sandbox에서 git/xcrun 임시 캐시 경고도 있었으나 앱을 빌드하거나 실행하지 않았다.
+- app.rs/agent_launcher.rs 두 변경 Rust 파일의 diff를 직접 전달한 `codex exec --sandbox read-only` 제한 리뷰 PID24416(240초상한)을 실행 중이다(`/private/tmp/deppy-dotenv-shell-spawn-review-focused.log`,결론`...-final.txt`). source는 focused6/app2041/strict/boundary/fmt/diff PASS 상태로 동결했다.
+
+### 런처 최종 리뷰 완료 및 게시 준비
+- 두 Rust 파일의 실제 diff를 대상으로 한 제한 Codex CLI 리뷰가 exit0으로 완료됐고 확신도 80% 이상 P1/P2 확정 finding 없음으로 결론냈다. shell/split 제한, startup/restore 차단 보존, agent approval/lease 유지, switch 실패 및 workspace별 launcher 판정을 확인했다. 최종 로그: `/private/tmp/deppy-dotenv-shell-spawn-review-focused-final.txt`. 기본 리뷰의 300초 timeout은 이 완료 리뷰와 구분한다.
+- 최종 실행 결과: focused 6 PASS, app 전체 2041 PASS/14 ignored, app all-targets strict Clippy PASS, boundary PASS, fmt/diff PASS. 리뷰 이후 Rust 변경은 없으며 앱 GUI build/launch 및 latency 실측은 하지 않았다.
+- 남은 작업: 한국어 커밋, `git push -u origin perf/dotenv-shell-spawn-main`, main Ready PR 생성, 원격 HEAD/checks/clean 확인과 일지 최종 갱신.

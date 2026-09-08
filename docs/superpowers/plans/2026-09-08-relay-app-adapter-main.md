@@ -6,7 +6,7 @@
 
 **Architecture:** UI는 typed intent를 생성하고 controller logic/Relay worker가 DB·키·네트워크를 소유한다. Tailscale과 Relay는 독립 토글과 공유 SessionCore를 사용한다. Relay 식별키는 single-instance lock을 소유한 lazy supplier를 통해 필요할 때만 읽고 DB에는 verifier만 저장한다.
 
-**Tech Stack:** Rust/egui controller, web-remote RelayWorker/handshake, SQLite v38, SecretStore spy, 5 locale catalog.
+**Tech Stack:** Rust/egui controller, web-remote RelayWorker/handshake, SQLite v39, SecretStore spy, 5 locale catalog.
 
 ---
 
@@ -36,13 +36,13 @@ DAG: main → R1 #161 → R2 #162 → R3 `feat/relay-app-adapter-main`.
 
 ### Task 1: adapter 실제 RED와 hunk 지도
 
-- [ ] **Step 1: 원본 reconnect verifier 회귀만 먼저 이관하고 현재 open 시그니처에 맞춘다.**
+- [x] **Step 1: 원본 reconnect verifier 회귀만 먼저 이관하고 현재 open 시그니처에 맞춘다.**
 
 ```rust
 assert!(repository.store_reconnect_verifier(paired.device_id, &paired.public_key, &[6; 32], ISSUED_AT + 2).unwrap());
 ```
 
-- [ ] **Step 2: 실제 assertion/runtime failure를 실행한다.**
+- [x] **Step 2: 실제 assertion/runtime failure를 실행한다.**
 
 ```sh
 CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-relay-app-adapter-main-20260908/target cargo test -p deppy-sijo --bin deppy-sijo --locked relay_reconnect_verifier_survives_adapter_restart_and_revocation_erases_it -- --test-threads=1
@@ -50,7 +50,7 @@ CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-relay-app-adapter-main-20
 
 예상: R1 trait 기본 메서드의 Relay reconnect storage unavailable로 FAIL. compile 실패는 RED로 세지 않는다.
 
-- [ ] **Step 3: 원본 diff를 hunk별로 분류하고 exact file boundary를 확인한다.**
+- [x] **Step 3: 원본 diff를 hunk별로 분류하고 exact file boundary를 확인한다.**
 
 ```sh
 git diff 12ee4c7 75bf2c9 -- crates/app/src/app.rs crates/app/src/ui/settings.rs
@@ -59,9 +59,9 @@ git diff --exit-code HEAD -- crates/secret crates/terminal crates/app/src/fonts.
 
 ### Task 2: 최소 앱 연결과 startup/OFF spy
 
-- [ ] **Step 1: 위 hunk만 git apply --check 후 적용한다.** 기존 app #155/egui0.36 코드를 보존하며 원본 파일 통째로 checkout하지 않는다. 큰 혼합 hunk는 Relay 구간만 재구성한다.
-- [ ] **Step 2: 실제 lazy identity supplier/worker 경로를 counting SecretStore로 검사한다.** Relay sink 생성과 worker OFF에서 has/get/set/delete/list 횟수0을 확인하고, 명시적으로 공급자를 호출한 경우에만 키 생성/조회가 발생하는 양성 대조를 둔다. UI 생성/렌더에는 공급자 호출을 넣지 않는다.
-- [ ] **Step 3: focused GREEN을 직렬 실행한다.**
+- [x] **Step 1: 위 hunk만 git apply --check 후 적용한다.** 기존 app #155/egui0.36 코드를 보존하며 원본 파일 통째로 checkout하지 않는다. 큰 혼합 hunk는 Relay 구간만 재구성한다.
+- [x] **Step 2: 실제 lazy identity supplier/worker 경로를 counting SecretStore로 검사한다.** Relay sink 생성과 worker OFF에서 has/get/set/delete/list 횟수0을 확인하고, 명시적으로 공급자를 호출한 경우에만 키 생성/조회가 발생하는 양성 대조를 둔다. UI 생성/렌더에는 공급자 호출을 넣지 않는다.
+- [x] **Step 3: focused GREEN을 직렬 실행한다.**
 
 ```sh
 CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-relay-app-adapter-main-20260908/target cargo test -p deppy-sijo --bin deppy-sijo --locked relay -- --test-threads=1
@@ -74,8 +74,8 @@ CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-relay-app-adapter-main-20
 
 ### Task 3: bounded 리뷰·전체 영향 검사
 
-- [ ] **Step 1: 실제 source diff에 Codex CLI read-only 리뷰를 실행한다.** 최대 도구 횟수를 정해 신뢰 경계/키 호출 위치/controller 의도 유실/권한·회수/worker 종료를 검토한다. 확정 finding은 RED→최소수정→GREEN한다.
-- [ ] **Step 2: 앱·의존 계약을 검증한다.**
+- [x] **Step 1: 실제 source diff에 Codex CLI read-only 리뷰를 실행한다.** 최대 도구 횟수를 정해 신뢰 경계/키 호출 위치/controller 의도 유실/권한·회수/worker 종료를 검토한다. 확정 finding은 RED→최소수정→GREEN한다.
+- [x] **Step 2: 앱·의존 계약을 검증한다.**
 
 ```sh
 CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-relay-app-adapter-main-20260908/target cargo test -p deppy-sijo --locked -- --test-threads=1
@@ -88,7 +88,7 @@ git diff --exit-code origin/feat/relay-shell-main -- crates/secret crates/termin
 
 ### Task 4: handoff·일지·stacked 게시
 
-- [ ] **Step 1: 실제 결과/실패 접근/수정/외부BLOCKED를 기록한다.** 다른 lane handoff는 보존한다. GitGuardian R2 공개 fixture 상태를 제품secret과 구분한다.
+- [x] **Step 1: 실제 결과/실패 접근/수정/외부BLOCKED를 기록한다.** 다른 lane handoff는 보존한다. GitGuardian R2 공개 fixture 상태를 제품secret과 구분한다.
 - [ ] **Step 2: 한국어 commit/push/R2 base PR을 게시한다.**
 
 ```sh
@@ -99,3 +99,12 @@ gh pr create --base feat/relay-shell-main --head feat/relay-app-adapter-main --t
 ```
 
 R3 게시 후 부모가 지시한 별도 R4를 최신 main에서 시작한다. DNS/TLS/credentials/외부 배포/실기기/24h soak는 BLOCKED이며 PASS로 대체하지 않는다.
+
+## 승인된 리뷰 추가 수정: authorization epoch
+
+- HIGH: 같은기기를동일키/권한으로재승인하면기존principal이발급세대를비교하지않는다. 부모가v39 opaque16byte generation과backfill/rollback/ABA검증을승인했다.
+- 추가파일범위: web-remote/src/relay/repository.rs의RelayDeviceRecord epoch필드/getter/builder, storage/db.rs v39/backfill/승인SQL/row조회, app relay_repository row변환, app principal 비교및회귀. secret/grant저장은아니다.
+- [x] 동일초재승인과삭제후재생성의기존Row동일성RED, 기존API의발급시각변경principal거절RED를확인한다.
+- [x] 승인마다새UUID epoch, 레거시backfill, 기존기기의승인/권한/만료/verifier보존을구현한다.
+- [x] currentprincipal epoch/발급기간비교, 같은clock의세대변경/rollback·conflict/restart회귀를검증한다.
+- [x] 좁은Codex재리뷰와최종전체gate를다시마감한다.

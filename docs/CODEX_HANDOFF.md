@@ -2340,3 +2340,24 @@
 - 원인: App::new의 reconcile_startup_secrets_best_effort가 모든 ledger/legacy 자격증명 get/has/delete를 즉시 수행한다. native store 등록 자체는 로컬 라이브러리에서 구조체 생성뿐임을 확인했다.
 - 계획: docs/superpowers/plans/2026-09-08-keychain-startup-lazy.md. 실제 App::new + keyring-core counting mock RED, explicit credential/connector 작업으로 bounded migration을 지연하고 기존 OAuth 물리슬롯/오류계약을 보존한다. 아직 제품변경·테스트 실행 없음.
 - 다음: test-only keyring store spy와 실제 생성 회귀를 추가하고 CARGO_BUILD_JOBS2·독립target으로 RED를 실행한다. 앱실행/빌드/배포/다른lane 변경 금지.
+
+- R4 실제 App::new+native KeyringSecretStore 경계 mock 테스트가 startup_calls=2로 RED였다. 첫 컴파일은 App에 없는 redaction 필드를 사용해 실패했고 별도 RedactionService로 교정했다(컴파일 실패는 RED 아님). 현재 신규 Staging cleanup 회귀의 actual RED를 실행 중이며 초기 test helper private/Path borrow 컴파일 오류를 수정했다.
+- 부모 승인 추가 설계: startup DB-only exact candidate snapshot + v38 ledger generation(opaque row ID)을 사용한다. 명시적 작업에서 generation/state를 IMMEDIATE transaction으로 CAS하고 cleanup/ack까지 보호해 현재 Staging 및 삭제재생성 ABA를 보존한다. 시간 추정은 금지. app/secret 외 storage/db.rs가 추가 경계다. 독립 R4 v38은 R1/R3 v38/v39와 번호 충돌하므로 착지 뒤 다른 lane은 일반 main merge+번호 재배치·migration 재검증 필요, rebase/force-push 금지.
+
+- R4 추가 actual RED: OAuth eager 제거 후에도 App::new가 Codex LLM API key has_secret 1회를 수행했다. 식별자/값 없는 spy backtrace로 app.rs AgentSessionsSecretsSnapshot 초기화를 확인하고 deferred(미조회) 상태로 바꿨다. unavailable는 저장버튼을 비활성화하므로 쓰지 않았다. AgentSessions snapshot/명시적 삭제버튼이 승인된 추가 파일 경계다.
+- 현재 focused Keychain6 PASS(실제 App 생성/RelayOFF/Settings+AgentSessions 렌더0, saved/delete controller 양성대조, explicit legacy 실패 후 재시도, current Staging 보존, 실제 save/delete 버튼 intent), storage recovery3 PASS(ABA/publish경합, callback실패rollback/retry, v37backfill/reopen). source 변경 뒤 전체 app/storage/secret test→strictClippy/boundary/fmt 체인 exec66150, source Codex리뷰 exec6957 진행 중이다.
+- 초기 테스트 컴파일 실수(private helper/Path borrow/query label borrow/미사용unavailable)는 교정했고 실제 동작RED와 구분한다. 현재 source는 main독립v38이며 Relay R1/R3 migration 번호 충돌을 PR에서 명시할 예정이다.
+
+- R4 수정 전 전체 app/storage/secret2467 PASS·17ignored와 strictClippy/boundary/fmt가 정상종료했으나 이후 아래 추가 변경이 있어 최종 결과로 재사용하지 않는다.
+- Codex HIGH: lazy migration 자신이 만든 slot의 staging/legacy cleanup 실패 의무가 다음 명시적 시도에서 누락됐다. 실제 legacy삭제 실패→허용 후 같은실행재시도 테스트는 legacy가 남아 RED였다. 이제 migration이 직접 등록한 exact slot+generation만 pending 후보에 추가하고 실패 시 유지한다. 재시도 시 같은generation의현재상태만 재확인하며 다른worker신규슬롯은 후보로 확대하지 않는다.
+- 부모 승인 Connector 추가 범위: connector-service/src/ports.rs + coordinator.rs. 최초 load_mcp_target이 자체migration으로 revision을 올려 요청을 stale 처리하는 actual RED(discover_calls0)를 확인했다. app adapter는 시작revision + 성공한 legacy publish CAS 개수 == 종료revision 및 현재revision 일치를 한 번만 증명한다. coordinator는 그 증명일 때만 overview갱신+동일target을1회재조회하고 기존stale검사를유지한다. 다른writer가migration중/재조회중개입한회귀도추가했다.
+- 현재 focused exec53860. 첫GREEN 시도는 test가overview갱신직후비동기backend시작전count를읽는race가있어 실제backend호출을boundedwait한후검증하도록교정했다. 이후 connector/app focused와전체영향gate 및좁은재리뷰를다시실행해야한다.
+
+## 2026-09-08 R4 최종 검증 완료 / 게시 직전
+
+- 최신 source 전체 app/storage/secret/connector-service 2550 PASS·19 ignored, 4crate strict Clippy, fmt, boundary, diff 및 secret/terminal/font/file-tree/fleet/package/root manifest 제외경계 PASS(exit0, exec44196). /private/tmp/deppy-keychain-r4-full-tests-final2.txt, clippy-final2.txt, boundary-final2.txt. 앱 빌드·재실행 없음.
+- focused Keychain9(storage 실제 App 생성·RelayOFF·Settings/Agent Sessions show0/저장삭제 양성대조/legacy retry/자기 partial slot1개 유지/실DB 다른writer revision증분), recovery3, Connector2(정상첫클릭1, writer3시점개입0) PASS. OAuth 기존 migration 전체 테스트도 전체gate에서 실행했다.
+- Codex HIGH1은 자체 미완료slot을boundedpending으로 보존하는 실제RED→GREEN으로 해소, 좁은 재리뷰CLEAN. 추가 자체검토의 receipt소비→reload 경합은 backend1기대0 actualRED→reloadrevision검사GREEN, 마지막 Codex좁은재리뷰도CLEAN(/private/tmp/deppy-keychain-r4-reload-review.txt).
+- 실패 접근: eager 호출을 한 번 제거해도 Codex API key has가1회남아 실제spybacktrace로 추가제거했다. naive지연전체ledger정리는새Staging을삭제해RED였다. test의중간revision2대기는discovery완료revision3을놓치는race였으므로실제backend호출로검증했다. 신규test파일boundary는파일내cfg(test)모듈로 명시하고xtask규칙은변경하지않았다.
+- 수정파일: app.rs/새keychain_startup_tests.rs/agent_sessions.rs, appdevCargo+lock, storage/db.rs v38generation/CAS, connector-service ports/coordinator, 계획/계약/handoff. 다음 명령: git commit -m 'fix(secret): 시작 Keychain 접근을 명시적 사용으로 지연한다'; git push -u origin fix/keychain-startup-lazy; gh pr create --base main --head fix/keychain-startup-lazy --body-file /private/tmp/deppy-keychain-startup-pr-body.md.
+- 착지주의: 독립main v38은 #161 v38/#163 v39와번호충돌한다. 먼저착지한PR을기준으로나머지는git merge origin/main 후migration을새끝번호로재배치·전체migration재검증한다. rebase/force-push금지. 다른lane상태는보존했다.

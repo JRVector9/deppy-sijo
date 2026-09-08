@@ -1144,6 +1144,7 @@ dependencies = [
  "http-client",
  "i18n",
  "image",
+ "keyring-core",
  "libc",
  "libmimalloc-sys",
  "mcp",

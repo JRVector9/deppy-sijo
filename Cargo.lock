@@ -4401,7 +4401,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",
+ "core-foundation 0.10.1",
  "keyring-core",
+ "security-framework",
  "serde_json",
  "uuid",
  "windows-native-keyring-store",

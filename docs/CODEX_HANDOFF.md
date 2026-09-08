@@ -2333,3 +2333,27 @@
 - Failed approaches: an initial unbounded `codex review --uncommitted` ran extensive checks but never produced a final review and was stopped by exact PID; it also attempted the invalid `cargo test -p deppy-sijo --lib` command even though the app has no library target. The first RED-test draft used unavailable `Context::run`, then captured `WorkspaceUi` too broadly; both compile-only mistakes were corrected before the intended RED assertion was observed. The first final format check found one line-wrap difference; `cargo fmt --all` corrected it and the rerun passed.
 - Remaining work: push this clean landing branch, create a PR to `main`, wait for required checks, merge only if green, close superseded PRs #147 and #148, and preserve PRs #146 and #149 plus their dependent remote branches for further development.
 - Exact next commands: `git push -u origin land/ime-resize-ready-20260906`; create a `main` PR for commits `4903b39` and `bbead4f`; run `gh pr checks <new-pr> --watch`; merge the new PR after all required checks pass; close #147 and #148 without deleting the `fix/window-resize-flicker` branch because PR #149 still targets it.
+
+## 2026-09-08 Keychain 비대화형 정책 독립 이관
+- 목표: exact main45e66cc 기반 `/private/tmp/deppy-keychain-noninteractive-main-20260908`, branch `fix/keychain-noninteractive-main`, #146 source75bf2c9의 secret 정책만 이관.
+- 완료: 소스/공식 Apple API/의존성 조사, 계획 작성. 기존 User keychain 검색 범위를 유지하고 inventory UISkip의 조용한 누락을 UIFail 오류로 대체한다. #166 startup 및 settings/storage는 미변경.
+- 아직 테스트/production 구현 전. 다음: macos query/status RED→GREEN, secret 전체/strict/boundary/fmt/diff, 실제 CLI 리뷰, handoff/일지/commit/push/main Ready PR. 앱 build/launch 금지.
+
+### Keychain RED→GREEN
+- query/status 회귀 3개에서 실제 assertion RED(0PASS/3FAIL)를 확인하고 UIFail·User keychain scope·errSecItemNotFound만 부재 처리로 GREEN3을 확인했다. 로그 `/private/tmp/deppy-keychain-red.log`, `/private/tmp/deppy-keychain-green.log`. 최초 테스트 scaffold의 CFArray generic downcast/임시 borrow 컴파일 오류는 assertion RED와 구분한다.
+- 새 `crates/secret/src/macos.rs`가 CRUD/전체 inventory에 UIFail을 공통 적용한다. Add는 User keychain에만 추가하고 duplicate만 같은 scope Update, 조회/삭제/inventory는 User keychain search list를 고정한다. 기존 mock/타 플랫폼/전역 serial lock/init API는 유지한다.
+- 변경: secret Cargo.toml/lib.rs/macos.rs 및 Cargo.lock의 이미 존재한 두 macOS 직접 의존성 연결. 새로운 패키지/버전 변경 없음. 임시 평문 Vec 생성 없이 CFData UTF-8 검증 후 SecretString으로 복사한다. 실제 사용자 Keychain 접근은 테스트하지 않는다.
+- 다음: 전체 secret/strict/boundary/fmt/diff, Codex CLI 리뷰와 필요 수정, 일지/commit/push/main Ready PR.
+
+### Keychain 전체 gate 및 리뷰
+- 최종 secret 전체 65 PASS/0 ignored(`/private/tmp/deppy-keychain-full.log`), secret all-targets strict Clippy PASS(`/private/tmp/deppy-keychain-clippy.log`), boundary PASS(`/private/tmp/deppy-keychain-boundary.log`), fmt/diff PASS. Clippy의 needless borrow/cmp_owned 3개와 후속 format 한 줄은 수정 후 재실행했다.
+- 표준 `codex review --uncommitted` PID26511(300초 상한) 및 actual macos.rs+lib.rs/Cargo diff만 전달한 readonly CLI PID59762(240초 상한)를 실행 중이다. 검증은 OS query DTO/분류와 기존 mock suite이며 실제 ACL/잠긴 사용자 Keychain 및 UI 동작 PASS를 주장하지 않는다.
+- 기본 CFData 소유권은 프레임워크 반환값 create rule로 회수한다. UI 금지는 전역 SecKeychainSetUserInteractionAllowed 토글이 아닌 operation별 query 정책이라 다른 호출자의 전역 상태를 바꾸지 않는다.
+
+### Keychain 제한 리뷰 및 오탐 검증
+- actual source 제한 CLI는 `CFDictionary::find`가 &CFString만 받는다는 P1을 제시했으나 실제 잠긴 core-foundation0.10.1의 `find<T: ToVoid<K>>(key:T)` 원문과 production strict Clippy exit0 증거로 오탐임을 확인했다. API 원문/현재 소스 재리뷰는 이 지적을 명시적으로 철회하고 P1/P2 확정 finding 없음으로 exit0 종료했다(`/private/tmp/deppy-keychain-review-narrow-final.txt`). 코드 변경을 하지 않았으며 검증된 소스는 유지한다.
+- 사용자가 지정한 UIFail 정책은 현재 Apple SDK에서 deprecated이지만 legacy login Keychain 지원을 유지하기 위해 요청된 상수를 사용한다. 새 Data Protection keychain이나 LAContext migration을 추가하지 않는다. 표준 리뷰는 300초 상한 내 최종 확인 중이다.
+
+### Keychain 리뷰 완료 및 게시 준비
+- 표준 `codex review --uncommitted`는 legacy keychain/의존성 소스를 읽었지만 300초 내 결론이 없어 정확 process group26511을 종료했다. wrapper exit0은 cleanup 결과이며 리뷰 PASS가 아니다. 별도 actual source 제한 리뷰와 오탐 증거 재리뷰는 완료했으며 남은 확정 P1/P2 없음이다.
+- 소스는 전체65/strict/boundary/fmt/diff PASS 상태와 동일하다. 다음은 한국어 commit, `git push -u origin fix/keychain-noninteractive-main`, `gh pr create --base main --head fix/keychain-noninteractive-main --body-file /private/tmp/deppy-keychain-noninteractive-pr.md`, 정확 원격 HEAD/check-run annotations와 clean 확인이다.

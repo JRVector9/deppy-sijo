@@ -272,6 +272,8 @@ impl InProcessRuntimeClient {
                         .unwrap_or_default(),
                     next_id: 1,
                     sessions: std::collections::HashMap::new(),
+                    resize_epoch: 0,
+                    resize_records: std::collections::HashMap::new(),
                     session_redaction_leases: std::collections::HashMap::new(),
                     seed_redaction_lease: None,
                     logs: std::collections::HashMap::new(),
@@ -683,6 +685,8 @@ struct Worker {
     /// Checked redaction leases are retained for exactly as long as their live/readable session.
     /// A session may need more than one lease when restored dotenv values supplement the resolved
     /// default credential set. Removal/archive drops the complete set and starts grace expiry.
+    resize_epoch: u64,
+    resize_records: std::collections::HashMap<SessionId, crate::resize::ResizeRecord>,
     session_redaction_leases: std::collections::HashMap<SessionId, Vec<RedactionLease>>,
     /// Wire compatibility for `SeedRedaction`: one latest-only checked lease replaces the legacy
     /// permanent corpus registration. Production composition no longer sends this command.
@@ -1174,7 +1178,141 @@ impl Worker {
         }
     }
 
+    fn emit_resize_result(
+        &self,
+        session: SessionId,
+        token: crate::ResizeToken,
+        result: Result<crate::ResizeStamp, crate::ResizeFailure>,
+    ) {
+        self.emit(match result {
+            Ok(stamp) => RuntimeEvent::ResizeApplied { session, stamp },
+            Err(reason) => RuntimeEvent::ResizeFailed {
+                session,
+                token,
+                reason,
+            },
+        });
+    }
+
+    fn invalidate_resize(&mut self, session: SessionId) {
+        let Some(record) = self.resize_records.get_mut(&session) else {
+            return;
+        };
+        record.result = Err(crate::ResizeFailure::Superseded);
+        let Some(epoch) = self.resize_epoch.checked_add(1) else {
+            record.stamp = None;
+            return;
+        };
+        self.resize_epoch = epoch;
+        record.stamp = self
+            .sessions
+            .get(&session)
+            .and_then(Session::grid_dimensions)
+            .map(|(cols, rows)| crate::ResizeStamp {
+                epoch,
+                owner_epoch: record.token.owner_epoch,
+                token: None,
+                cols,
+                rows,
+            });
+    }
+
+    fn apply_tracked_resize(
+        &mut self,
+        session: SessionId,
+        token: crate::ResizeToken,
+        cols: u16,
+        rows: u16,
+    ) {
+        use crate::resize::{ResizeDecision, ResizeRecord};
+        use crate::{ResizeFailure, ResizeStamp};
+        if !self.sessions.contains_key(&session) {
+            self.emit_resize_result(session, token, Err(ResizeFailure::MissingSession));
+            return;
+        }
+        if !self.resize_records.contains_key(&session) && token.owner_epoch != 1 {
+            self.emit_resize_result(session, token, Err(ResizeFailure::Superseded));
+            return;
+        }
+        if let Some(record) = self.resize_records.get(&session)
+            && let ResizeDecision::Replay(result) = record.classify(token, (cols, rows))
+        {
+            self.emit_resize_result(session, token, result);
+            if result.is_ok()
+                || matches!(
+                    result,
+                    Err(ResizeFailure::Conflict | ResizeFailure::Superseded)
+                )
+            {
+                if let Some(active) = self.sessions.get_mut(&session) {
+                    active.mark_full_dirty();
+                }
+                self.push_watched_viewports();
+            }
+            return;
+        }
+        let Some(epoch) = self.resize_epoch.checked_add(1) else {
+            self.emit_resize_result(session, token, Err(ResizeFailure::CounterExhausted));
+            return;
+        };
+        self.resize_epoch = epoch;
+        let active = self
+            .sessions
+            .get_mut(&session)
+            .expect("위에서 세션 존재 확인");
+        let applied = active.resize_checked(cols, rows);
+        let actual = active.grid_dimensions();
+        let result = match applied {
+            Ok(applied) => {
+                if let Some(event) = applied.cache_event {
+                    trace_terminal_cache_event(session, event);
+                }
+                Ok(ResizeStamp {
+                    epoch,
+                    owner_epoch: token.owner_epoch,
+                    token: Some(token),
+                    cols: applied.cols,
+                    rows: applied.rows,
+                })
+            }
+            Err(error) => Err(match error {
+                session::ResizeError::InvalidSize => ResizeFailure::SizeMismatch,
+                session::ResizeError::Backend => ResizeFailure::Backend,
+                session::ResizeError::Pty => ResizeFailure::Pty,
+                session::ResizeError::Dimensions => ResizeFailure::Dimensions,
+                session::ResizeError::SizeMismatch => ResizeFailure::SizeMismatch,
+            }),
+        };
+        let stamp = actual.map(|(cols, rows)| ResizeStamp {
+            epoch,
+            owner_epoch: token.owner_epoch,
+            token: result.is_ok().then_some(token),
+            cols,
+            rows,
+        });
+        let mut record = self
+            .resize_records
+            .get(&session)
+            .copied()
+            .unwrap_or_else(|| ResizeRecord::new(token, (cols, rows), result, stamp));
+        if let Err(reason) = record.change_owner(token) {
+            self.emit_resize_result(session, token, Err(reason));
+            return;
+        }
+        record.target = (cols, rows);
+        record.result = result;
+        record.stamp = stamp;
+        self.resize_records.insert(session, record);
+        if result.is_ok() {
+            self.save_terminal_size(session, cols, rows);
+        }
+        crate::signal_memory_released();
+        self.emit_resize_result(session, token, result);
+        self.push_watched_viewports();
+    }
+
     fn remove_session(&mut self, session: SessionId) -> Option<Session> {
+        self.invalidate_resize(session);
         self.scrollback_results.remove(&session);
         self.archive_failed.remove(&session);
         self.session_redaction_leases.remove(&session);
@@ -1206,6 +1344,7 @@ impl Worker {
             self.record_scrollback_result(id, result);
         }
         self.sessions.insert(id, session);
+        self.invalidate_resize(id);
         // 여러 pane을 한 명령으로 복원해도 다음 backend를 만들기 전에 예산을 적용한다.
         if self.terminal_cache_bytes() > self.cache_budget_bytes {
             let mut visible = self.mux.watched_sessions();
@@ -1472,6 +1611,34 @@ impl Worker {
     /// slot 기록은 유지해 탭 전환/Active 복귀 시 따라잡는다 (P5 리뷰 P1).
     /// Viewport 외 이벤트에는 무의미(항상 true로 호출).
     fn emit_gated(&self, event: RuntimeEvent, gui_viewport: bool) {
+        let event = match event {
+            RuntimeEvent::Viewport {
+                session,
+                snapshot,
+                bracketed_paste,
+            } if self
+                .resize_records
+                .get(&session)
+                .and_then(|record| record.stamp)
+                .is_some() =>
+            {
+                let mut stamp = self.resize_records[&session]
+                    .stamp
+                    .expect("위에서 stamp 확인");
+                if (stamp.cols, stamp.rows) != (snapshot.cols, snapshot.rows) {
+                    stamp.token = None;
+                    stamp.cols = snapshot.cols;
+                    stamp.rows = snapshot.rows;
+                }
+                RuntimeEvent::ViewportTracked {
+                    session,
+                    snapshot,
+                    bracketed_paste,
+                    stamp,
+                }
+            }
+            event => event,
+        };
         // Viewport는 최신본 slot 덮어쓰기 (누적/유실/blocking 없음 — 느린 소비자도
         // 재개 시 항상 최종 화면을 본다), 상태 이벤트는 채널 send.
         // receiver가 drop된 구독자는 제거: slot 경로는 Arc strong_count로 판별
@@ -1482,17 +1649,17 @@ impl Worker {
         {
             let mut subscribers = self.subscribers.lock().expect("subscribers lock");
             subscribers.retain(|subscriber| {
-                if let RuntimeEvent::Viewport { session, .. } = &event {
+                if let Some((session, _, _, _)) = event.viewport() {
                     if Arc::strong_count(&subscriber.viewports) <= 1 {
                         return false;
                     }
                     {
                         let mut slot = subscriber.viewports.lock().expect("viewport slot lock");
-                        let prev = slot.insert(*session, event.clone());
+                        let prev = slot.insert(session, event.clone());
                         // 미소비 이전 스냅샷의 dirty 델타를 합친다 — 안 그러면 그 행들이
                         // renderer 재shaping에서 빠져 stale로 남는다 (event.rs 헬퍼 주석).
                         if let Some(prev) = prev
-                            && let Some(current) = slot.get_mut(session)
+                            && let Some(current) = slot.get_mut(&session)
                         {
                             crate::event::merge_unconsumed_viewport_dirty(&prev, current);
                         }
@@ -1938,6 +2105,14 @@ impl Worker {
                     view: self.session_status_view(session),
                 });
             }
+            RuntimeCommand::ResizeTracked {
+                session,
+                token,
+                cols,
+                rows,
+            } => {
+                self.apply_tracked_resize(session, token, cols, rows);
+            }
             RuntimeCommand::Resize {
                 session,
                 cols,
@@ -1954,6 +2129,7 @@ impl Worker {
                         TerminalCacheClass::Hidden | TerminalCacheClass::Exited
                     );
                     self.save_terminal_size(session, cols, rows);
+                    self.invalidate_resize(session);
                     if freed_scrollback {
                         crate::signal_memory_released();
                     }
@@ -3394,6 +3570,17 @@ impl Worker {
     /// "slot에 Viewport가 있으면 그 세션의 Spawned가 같은 drain에 포함"이라는
     /// RuntimeEventReceiver::drain의 happens-before 계약이 유지된다 (codex 리뷰).
     fn emit_mux_snapshot(&mut self) {
+        // 활성/보관 세션 소유 범위를 벗어난 token/owner 이력을 누적하지 않는다.
+        self.resize_records.retain(|id, _| {
+            self.sessions.contains_key(id)
+                || self.archived.contains_key(id)
+                || self.archived_on_disk.contains_key(id)
+                || self
+                    .mux
+                    .panes
+                    .values()
+                    .any(|pane| pane.session_id == Some(*id))
+        });
         // mux 구조가 바뀐 지점 — 가시성 전이에 맞춰 scrollback cap 조정 (§14.3)
         self.reconcile_visibility();
         if self.lazy_restore.is_some() {
@@ -5462,6 +5649,8 @@ mod tests {
                 workspace_id: "workspace".to_owned(),
                 next_id: 1,
                 sessions: std::collections::HashMap::new(),
+                resize_epoch: 0,
+                resize_records: std::collections::HashMap::new(),
                 session_redaction_leases: std::collections::HashMap::new(),
                 seed_redaction_lease: None,
                 secret_resolver: resolver,
@@ -10968,6 +11157,96 @@ mod tests {
     /// 저장 layout이 새 세션 위에 덧붙는 hybrid 상태를 만들지 않는다.
     /// §14.1 wake: 상태 이벤트가 채널에 들어갈 때 subscribe_with_wake의 콜백이
     /// 호출된다 — UI가 숨겨져도 worker가 깨워 알림을 처리하게 하는 핵심.
+    #[cfg(unix)]
+    #[test]
+    fn tracked_resize_worker는_실제크기_ack과_멱등_stamp를_반환한다() {
+        init_mock_store();
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("resize-tracked"),
+            RedactionService::new(),
+            spec("/bin/sh", &["-c", "sleep 30"]),
+            None,
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        let session = probe.wait_for(Duration::from_secs(3), |event| match event {
+            RuntimeEvent::ShellSpawned { session } => Some(*session),
+            _ => None,
+        });
+        let token = crate::ResizeToken {
+            owner: [1; 16],
+            generation: 1,
+            owner_epoch: 1,
+        };
+        let command = RuntimeCommand::ResizeTracked {
+            session,
+            token,
+            cols: 101,
+            rows: 31,
+        };
+        client.send_command(command.clone()).unwrap();
+        let first = probe.wait_for(Duration::from_secs(2), |event| match event {
+            RuntimeEvent::ResizeApplied { session: id, stamp } if *id == session => Some(*stamp),
+            _ => None,
+        });
+        assert_eq!(
+            (first.cols, first.rows, first.token),
+            (101, 31, Some(token))
+        );
+        client.send_command(command).unwrap();
+        let retry = probe.wait_for(Duration::from_secs(2), |event| match event {
+            RuntimeEvent::ResizeApplied { session: id, stamp } if *id == session => Some(*stamp),
+            _ => None,
+        });
+        assert_eq!(first, retry);
+        let next = crate::ResizeToken {
+            owner: [2; 16],
+            generation: 1,
+            owner_epoch: 2,
+        };
+        client
+            .send_command(RuntimeCommand::ResizeTracked {
+                session,
+                token: next,
+                cols: 110,
+                rows: 40,
+            })
+            .unwrap();
+        let applied = probe.wait_for(Duration::from_secs(2), |event| match event {
+            RuntimeEvent::ResizeApplied { stamp, .. } if stamp.token == Some(next) => Some(*stamp),
+            _ => None,
+        });
+        client
+            .send_command(RuntimeCommand::ResizeTracked {
+                session,
+                token,
+                cols: 101,
+                rows: 31,
+            })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(2), |event| matches!(event,
+            RuntimeEvent::ResizeFailed { token: rejected, reason: crate::ResizeFailure::Superseded, .. } if *rejected == token).then_some(()));
+        let actual = probe.wait_for(Duration::from_secs(2), |event| match event {
+            RuntimeEvent::ViewportTracked {
+                snapshot, stamp, ..
+            } if *stamp == applied => Some((snapshot.cols, snapshot.rows)),
+            _ => None,
+        });
+        assert_eq!(
+            actual,
+            (110, 40),
+            "늦은 이전 owner는 실제 backend도 되돌리지 않는다"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn subscribe_with_wake는_상태이벤트에_깨운다() {

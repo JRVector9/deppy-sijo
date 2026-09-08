@@ -171,6 +171,10 @@ pub enum ScrollbackApplyResult {
 pub trait TerminalBackend {
     fn feed(&mut self, bytes: &[u8]) -> anyhow::Result<TerminalChangeSet>;
     fn resize(&mut self, cols: u16, rows: u16) -> anyhow::Result<()>;
+    /// 셀 snapshot을 만들지 않고 backend에 실제 적용된 grid 크기를 읽는다.
+    fn grid_dimensions(&self) -> anyhow::Result<(u16, u16)> {
+        anyhow::bail!("실제 grid 크기 조회 미지원")
+    }
     fn render_model(&self) -> TerminalRenderModel;
 
     fn viewport_snapshot(&self) -> Option<TerminalViewportSnapshot>;

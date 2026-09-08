@@ -94,3 +94,6 @@ mod memory_release_hook_tests {
         );
     }
 }
+
+mod resize;
+pub use resize::{ResizeFailure, ResizeStamp, ResizeToken};

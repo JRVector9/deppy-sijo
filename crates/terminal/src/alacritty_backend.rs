@@ -365,6 +365,13 @@ impl TerminalBackend for AlacrittyBackend {
         Ok(())
     }
 
+    fn grid_dimensions(&self) -> anyhow::Result<(u16, u16)> {
+        Ok((
+            self.term.columns().try_into()?,
+            self.term.screen_lines().try_into()?,
+        ))
+    }
+
     fn render_model(&self) -> TerminalRenderModel {
         TerminalRenderModel::CellGrid
     }

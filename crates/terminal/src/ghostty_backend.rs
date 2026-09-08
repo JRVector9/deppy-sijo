@@ -218,6 +218,19 @@ impl TerminalBackend for GhosttyBackend {
         Ok(())
     }
 
+    fn grid_dimensions(&self) -> anyhow::Result<(u16, u16)> {
+        // 렌더 갱신은 dirty 상태를 소비하므로 실제 terminal 메타데이터만 조회한다.
+        let cols = self
+            .term
+            .cols()
+            .map_err(|_| anyhow::anyhow!("ghostty 실제 열 조회 실패"))?;
+        let rows = self
+            .term
+            .rows()
+            .map_err(|_| anyhow::anyhow!("ghostty 실제 행 조회 실패"))?;
+        Ok((cols, rows))
+    }
+
     fn render_model(&self) -> TerminalRenderModel {
         TerminalRenderModel::CellGrid
     }

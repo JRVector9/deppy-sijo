@@ -966,6 +966,12 @@ impl DashboardHandle {
                 session,
                 snapshot,
                 bracketed_paste,
+            }
+            | RuntimeEvent::ViewportTracked {
+                session,
+                snapshot,
+                bracketed_paste,
+                ..
             } = &event
                 && let Some(uuid) = ids.uuid(session.0)
                 && watchers.contains_key(uuid)
@@ -1090,6 +1096,12 @@ fn run(shared: &Arc<Shared>) {
                         session,
                         snapshot,
                         bracketed_paste,
+                    }
+                    | RuntimeEvent::ViewportTracked {
+                        session,
+                        snapshot,
+                        bracketed_paste,
+                        ..
                     } => {
                         if let Some(uuid) = ids.uuid(session.0)
                             && watchers.contains_key(uuid)

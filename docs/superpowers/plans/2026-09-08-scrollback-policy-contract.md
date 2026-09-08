@@ -42,7 +42,7 @@
 **Files:** Modify `docs/CODEX_HANDOFF.md`; Create PR.
 - [x] `codex review`의 소스 전용 프롬프트로 소스 diff를 읽기 전용 리뷰한다. 지적을 수정하고 해당 테스트를 재실행한다.
 - [x] `cargo fmt --all --check`, `git diff --check`, `CARGO_BUILD_JOBS=2 cargo clippy -p terminal -p runtime -p deppy-sijo --all-targets --locked -- -D warnings`를 실행한다. 결과를 실제 실행 여부와 함께 기록한다.
-- [ ] 한국어 Conventional Commit으로 커밋하고 `git push -u origin feat/scrollback-policy-contract`, `gh pr create --base main --head feat/scrollback-policy-contract --body-file ...`로 PR을 생성한다. rebase/force-push는 하지 않는다.
+- [x] 한국어 Conventional Commit으로 커밋하고 `git push -u origin feat/scrollback-policy-contract`, `gh pr create --base main --head feat/scrollback-policy-contract --body-file ...`로 PR을 생성한다. rebase/force-push는 하지 않는다.
 
 
 ### 추가 회귀: 소수 직접 입력의 저장 신호
@@ -55,3 +55,10 @@
 - [x] Linux sysconf와 Windows GlobalMemoryStatusEx를 기존 의존성으로 연결하고 config focused40 GREEN을 확인했다.
 - [x] wire1..99 거부 지적은 합의된 기존0..100000 wire 호환을 깨므로 미수용 사유를 handoff에 기록했다.
 - [x] 후속 코드 리뷰 결과(잔여 확정 결함 없음)와 마지막 gate를 기록했다. Windows/Linux 네이티브 실행과 실화면 검증은 미실행으로 유지한다.
+
+## 완료 기록
+- 구현 커밋: `862a894`.
+- PR: https://github.com/JRVector9/deppy-sijo/pull/157 (base main).
+- focused89 tests 통과: settings20 + config40 + policy1 + i18n8 + runtime18 + wire1 + postcard1.
+- 최종 strict clippy(all-targets), fmt/diff 통과; codex 후속 리뷰 잔여 확정 결함 없음.
+- 앱 재빌드/재실행·실화면/IME 검증과 Windows/Linux 네이티브 실행/cross-target 검증은 미실행 상태로 유지한다.

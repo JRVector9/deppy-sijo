@@ -2386,3 +2386,12 @@
 ### PR B 후속 리뷰 완료
 - 후속 codex review(exit0)는 설정100..100000 / wire0..100000·protocol 유지, Linux/Windows RAM 조회, f32 정확 비교에서 남은 확정 결함 없음으로 종료했다(`/private/tmp/deppy-policy-codex-followup.log`).
 - 최종 소스 strict clippy, fmt, diff gate PASS. 구현 커밋과 PR 생성 단계로 진행한다.
+
+### PR B 게시 완료
+- 구현 커밋: `862a894` (`feat(settings): 숫자 직접 입력과 스크롤백 예산 정책을 통합한다`).
+- 원격 브랜치: `origin/feat/scrollback-policy-contract`, 일반 push 성공. rebase/force-push 없음.
+- main 대상 PR 생성: https://github.com/JRVector9/deppy-sijo/pull/157 .
+- 코드 범위: app config/settings/예산 소비1줄, terminal policy/lib export, runtime command/remote 최대값 import, 5개 locale. session/Markdown/backend/reflow/live scrollback 코드는 변경하지 않았다.
+- 검증 완료: focused89(20+40+1+8+18+1+1), strict clippy(all-targets), fmt/diff; 후속 codex 리뷰 잔여 확정 결함 없음. 로그는 `/private/tmp/deppy-{settings-final,config-final,policy-green,policy-i18n,policy-runtime,policy-wire,policy-postcard,policy-clippy-final,policy-codex-followup}.log`.
+- 남은 작업: root의 PR 통합 검토와 별도 core/live apply PR. 실화면/IME 검증 및 Windows/Linux 네이티브/cross-target 검증은 대기이며 실행했다고 보고하지 않는다.
+- 다음 에이전트 명령: `cd /private/tmp/deppy-scrollback-policy-20260908`; `git status --short`; `gh pr view 157 --json url,headRefOid,mergeStateStatus,statusCheckRollup`; `git show 862a894 --stat`; `cat crates/terminal/src/policy.rs`.

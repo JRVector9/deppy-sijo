@@ -548,6 +548,7 @@ fn agent_kind_id(kind: crate::agent_detect::AgentKind) -> &'static str {
         crate::agent_detect::AgentKind::Claude => "claude",
         crate::agent_detect::AgentKind::Codex => "codex",
         crate::agent_detect::AgentKind::Kimi => "kimi",
+        crate::agent_detect::AgentKind::Grok => "grok",
     }
 }
 
@@ -9746,23 +9747,48 @@ fn carry_forward_agent_activity(
     }
 }
 
-/// 새로 넣는 항목은 `RunningAgent`가 **argv에서 뽑아둔** model/effort를 그대로 쓴다 —
-/// 런처가 넘긴 값이라 실행 순간의 진실이고, `--model`/`--effort` 파싱은 provider와
-/// 무관하게 일반적이라 Kimi의 `--model kimi-code/k3`도 그대로 잡힌다.
+/// 저장된 표시와 현재 실행 프로세스를 합친다. 현재 provider가 달라졌으면 이전
+/// provider의 모델·강도·컨텍스트·요약을 버리고 현재 argv 값만 사용한다.
+fn display_for(
+    kind: crate::agent_detect::AgentKind,
+    stored: Option<&crate::agent_detect::AgentDisplay>,
+    running: Option<&crate::agent_detect::RunningAgent>,
+) -> crate::agent_detect::AgentDisplay {
+    let mut display = match stored {
+        Some(display) if display.kind == kind => display.clone(),
+        _ => crate::agent_detect::AgentDisplay {
+            kind,
+            model: running.and_then(|agent| agent.model.clone()),
+            effort: running.and_then(|agent| agent.effort.clone()),
+            context_pct: None,
+            last_agent_summary: None,
+            user_instruction: None,
+        },
+    };
+    if let Some(running) = running.filter(|running| running.kind == kind) {
+        if display.model.is_none() {
+            display.model.clone_from(&running.model);
+        }
+        if display.effort.is_none() {
+            display.effort.clone_from(&running.effort);
+        }
+    }
+    display
+}
+
+/// 프로세스로 감지한 에이전트 종류를 표시 정보에 반영한다.
 fn merge_detected_kinds(
     info: &mut std::collections::HashMap<runtime::SessionId, crate::agent_detect::AgentDisplay>,
     kinds: &std::collections::HashMap<runtime::SessionId, crate::agent_detect::RunningAgent>,
+    bindings: &std::collections::HashMap<runtime::SessionId, crate::agent_detect::AgentBinding>,
 ) {
     for (session, running) in kinds {
-        info.entry(*session)
-            .or_insert_with(|| crate::agent_detect::AgentDisplay {
-                kind: running.kind,
-                model: running.model.clone(),
-                effort: running.effort.clone(),
-                context_pct: None,
-                last_agent_summary: None,
-                user_instruction: None,
-            });
+        let kind = bindings
+            .get(session)
+            .map_or(running.kind, |binding| binding.kind);
+        let running = (running.kind == kind).then_some(running);
+        let display = display_for(kind, info.get(session), running);
+        info.insert(*session, display);
     }
 }
 
@@ -9985,6 +10011,10 @@ enum AutoResumeDecision {
     Resume,
     /// 에이전트나 다른 foreground 작업이 있으므로 자동 주입 없이 처리 완료.
     MarkHandled,
+}
+
+fn persisted_agent_kind_is_resumable(kind: &str) -> bool {
+    matches!(kind, "claude" | "codex" | "grok")
 }
 
 fn auto_resume_decision(
@@ -15657,6 +15687,7 @@ impl App {
                     result.identity.session_id
                 ),
                 "codex" => format!("{cd_prefix}codex resume {}\n", result.identity.session_id),
+                "grok" => format!("{cd_prefix}grok --resume {}\n", result.identity.session_id),
                 _ => continue,
             };
             self.active.workspace_ui.clear_selection(result.session);
@@ -16147,7 +16178,7 @@ impl App {
             .filter(|((rt, _), _)| *rt == instance)
             .map(|((_, session), running)| (*session, running.clone()))
             .collect();
-        merge_detected_kinds(&mut merged, &kinds_for_active);
+        merge_detected_kinds(&mut merged, &kinds_for_active, &self.agent_bindings);
         for (session, display) in merged.iter_mut() {
             apply_claude_statusline(display, self.statuslines.get(&(instance, *session)));
         }
@@ -16342,18 +16373,8 @@ impl App {
                 // 사이드바(`push_agent_display`)와 **같은 병합**을 거쳐야 한다. claude는
                 // transcript에 effort가 아예 없고 statusLine에만 있어서, 병합을 건너뛰면
                 // effort가 영영 None이고 강도 단축키가 조용히 아무것도 안 한다.
-                let mut display = self
-                    .agent_info
-                    .get(&(instance, session_id))
-                    .cloned()
-                    .unwrap_or(crate::agent_detect::AgentDisplay {
-                        kind,
-                        model: None,
-                        effort: None,
-                        context_pct: None,
-                        last_agent_summary: None,
-                        user_instruction: None,
-                    });
+                let mut display =
+                    display_for(kind, self.agent_info.get(&(instance, session_id)), running);
                 apply_claude_statusline(
                     &mut display,
                     self.statuslines.get(&(instance, session_id)),
@@ -16492,6 +16513,7 @@ impl App {
                     crate::agent_detect::AgentKind::Claude => "claude",
                     crate::agent_detect::AgentKind::Codex => "codex",
                     crate::agent_detect::AgentKind::Kimi => "kimi",
+                    crate::agent_detect::AgentKind::Grok => "grok",
                 };
                 Some((
                     pane.0.clone(),
@@ -16570,6 +16592,10 @@ impl App {
                     }
                     AutoResumeDecision::Resume => {}
                 }
+                if !persisted_agent_kind_is_resumable(&saved.kind) {
+                    self.resumed_panes.insert(pane_key);
+                    continue;
+                }
                 let identity = storage::AgentSessionIdentity {
                     pane_id: saved.pane_id.clone(),
                     kind: saved.kind.clone(),
@@ -16631,6 +16657,9 @@ impl App {
         let Some(saved) = self.restore_agents.get(pane_key).cloned() else {
             return false;
         };
+        if !persisted_agent_kind_is_resumable(&saved.kind) {
+            return false;
+        }
         let source_state = dotenv_state_for_root(self.active_tree_root().as_deref());
         if self.active.session_dotenv_states.get(&session) != Some(&source_state) {
             tracing::warn!(
@@ -21967,6 +21996,13 @@ impl App {
 
         let plan = match plan {
             Ok(plan) => plan,
+            Err(EffortBlocked::Unsupported) => {
+                self.show_agent_shortcut_feedback(
+                    crate::ui::agent_terminal::AgentShortcutFeedback::Unsupported,
+                );
+                tracing::info!(?kind, provider = ?surface.provider, "PTY 조정: 이 provider는 지원하지 않는다");
+                return;
+            }
             Err(EffortBlocked::UnknownCurrentEffort) => {
                 self.show_agent_shortcut_feedback(
                     crate::ui::agent_terminal::AgentShortcutFeedback::CurrentValueUnknown,
@@ -27668,6 +27704,7 @@ impl App {
                                 crate::agent_detect::AgentKind::Claude => "claude".to_owned(),
                                 crate::agent_detect::AgentKind::Codex => "codex".to_owned(),
                                 crate::agent_detect::AgentKind::Kimi => "kimi".to_owned(),
+                                crate::agent_detect::AgentKind::Grok => "grok".to_owned(),
                             },
                             session_id: binding.session_id.clone(),
                         })
@@ -28677,8 +28714,11 @@ impl eframe::App for App {
         );
         // 저장된 에이전트가 있고 지금 실행 중이 아닌 pane — 컨텍스트 메뉴 '이어가기' 노출.
         for entry in &mut terminal_sessions {
-            entry.resumable =
-                entry.agent_line.is_none() && self.restore_agents.contains_key(&entry.pane.0);
+            entry.resumable = entry.agent_line.is_none()
+                && self
+                    .restore_agents
+                    .get(&entry.pane.0)
+                    .is_some_and(|saved| persisted_agent_kind_is_resumable(&saved.kind));
             // 워크트리 메뉴 노출 조건 — 프레임마다 도는 경로라 lsof fallback 없이
             // 감지 캐시만 본다 (실제 조회는 dispatch의 session_cwd_lookup, PR-W).
             entry.has_cwd = entry
@@ -35100,7 +35140,7 @@ mod tests {
             ),
         ]);
 
-        merge_detected_kinds(&mut info, &kinds);
+        merge_detected_kinds(&mut info, &kinds, &HashMap::new());
 
         let added = info.get(&detected_only).expect("빈칸이 채워져야 한다");
         assert_eq!(added.kind, AgentKind::Kimi);
@@ -35129,7 +35169,9 @@ mod tests {
             .map(|(body, _)| body)
             .expect("push_agent_display 본문을 찾지 못했다");
         assert!(
-            body.contains("merge_detected_kinds(&mut merged, &kinds_for_active)"),
+            body.contains(
+                "merge_detected_kinds(&mut merged, &kinds_for_active, &self.agent_bindings)"
+            ),
             "병합을 부르지 않으면 프로세스로만 감지된 에이전트가 카드에서 셸로 강등된다"
         );
     }
@@ -35437,6 +35479,149 @@ mod tests {
             !body.contains("agent_model_catalog::") && !body.contains("paths::home_dir"),
             "render-time PTY surface projection must consume worker snapshots, not read config files"
         );
+    }
+
+    #[test]
+    fn merge_detected_kinds는_provider가_바뀌면_이전_표시를_폐기한다() {
+        use crate::agent_detect::{AgentDisplay, AgentKind, RunningAgent};
+
+        let session = runtime::SessionId(7);
+        let mut info = HashMap::from([(
+            session,
+            AgentDisplay {
+                kind: AgentKind::Codex,
+                model: Some("gpt-5.6-sol".to_owned()),
+                effort: Some("high".to_owned()),
+                context_pct: Some(69),
+                last_agent_summary: Some("이전 응답".to_owned()),
+                user_instruction: Some("이전 요청".to_owned()),
+            },
+        )]);
+        let kinds = HashMap::from([(
+            session,
+            RunningAgent {
+                kind: AgentKind::Grok,
+                model: Some("grok-4.6".to_owned()),
+                effort: Some("xhigh".to_owned()),
+            },
+        )]);
+
+        merge_detected_kinds(&mut info, &kinds, &HashMap::new());
+
+        let shown = info.get(&session).expect("현재 표시가 있어야 한다");
+        assert_eq!(shown.kind, AgentKind::Grok);
+        assert_eq!(shown.model.as_deref(), Some("grok-4.6"));
+        assert_eq!(shown.effort.as_deref(), Some("xhigh"));
+        assert_eq!(shown.context_pct, None);
+        assert_eq!(shown.last_agent_summary, None);
+        assert_eq!(shown.user_instruction, None);
+    }
+
+    #[test]
+    fn merge_detected_kinds는_첫_자손보다_선택된_binding을_우선한다() {
+        use crate::agent_detect::{AgentBinding, AgentDisplay, AgentKind, RunningAgent};
+
+        let session = runtime::SessionId(7);
+        let mut info = HashMap::from([(
+            session,
+            AgentDisplay {
+                kind: AgentKind::Grok,
+                model: Some("grok-4.6".to_owned()),
+                effort: Some("xhigh".to_owned()),
+                context_pct: None,
+                last_agent_summary: Some("현재 Grok 응답".to_owned()),
+                user_instruction: Some("현재 Grok 요청".to_owned()),
+            },
+        )]);
+        let kinds = HashMap::from([(
+            session,
+            RunningAgent {
+                kind: AgentKind::Codex,
+                model: Some("중단된 예전 모델".to_owned()),
+                effort: Some("low".to_owned()),
+            },
+        )]);
+        let bindings = HashMap::from([(
+            session,
+            AgentBinding {
+                kind: AgentKind::Grok,
+                session_id: "grok-session".to_owned(),
+                transcript: PathBuf::from("/tmp/grok/chat_history.jsonl"),
+            },
+        )]);
+
+        merge_detected_kinds(&mut info, &kinds, &bindings);
+
+        let shown = info.get(&session).expect("현재 표시가 있어야 한다");
+        assert_eq!(shown.kind, AgentKind::Grok);
+        assert_eq!(shown.model.as_deref(), Some("grok-4.6"));
+        assert_eq!(shown.effort.as_deref(), Some("xhigh"));
+        assert_eq!(shown.last_agent_summary.as_deref(), Some("현재 Grok 응답"));
+    }
+
+    #[test]
+    fn display_for는_표면에서도_현재_provider만_보존한다() {
+        use crate::agent_detect::{AgentDisplay, AgentKind, RunningAgent};
+
+        let stale_grok = AgentDisplay {
+            kind: AgentKind::Grok,
+            model: Some("grok-4.6".to_owned()),
+            effort: Some("xhigh".to_owned()),
+            context_pct: Some(12),
+            last_agent_summary: Some("이전 Grok 응답".to_owned()),
+            user_instruction: Some("이전 Grok 요청".to_owned()),
+        };
+        let direct_claude = RunningAgent {
+            kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+        };
+        let shown = display_for(AgentKind::Claude, Some(&stale_grok), Some(&direct_claude));
+        assert_eq!(shown.kind, AgentKind::Claude);
+        assert_eq!(shown.model, None);
+        assert_eq!(shown.effort, None);
+        assert_eq!(shown.context_pct, None);
+        assert_eq!(shown.last_agent_summary, None);
+        assert_eq!(shown.user_instruction, None);
+
+        let incomplete_grok = AgentDisplay {
+            kind: AgentKind::Grok,
+            model: None,
+            effort: None,
+            context_pct: None,
+            last_agent_summary: Some("진행 중".to_owned()),
+            user_instruction: Some("계속".to_owned()),
+        };
+        let running_grok = RunningAgent {
+            kind: AgentKind::Grok,
+            model: Some("grok-4.6".to_owned()),
+            effort: Some("xhigh".to_owned()),
+        };
+        let shown = display_for(AgentKind::Grok, Some(&incomplete_grok), Some(&running_grok));
+        assert_eq!(shown.model.as_deref(), Some("grok-4.6"));
+        assert_eq!(shown.effort.as_deref(), Some("xhigh"));
+        assert_eq!(shown.last_agent_summary.as_deref(), Some("진행 중"));
+        assert_eq!(shown.user_instruction.as_deref(), Some("계속"));
+
+        let source = include_str!("app.rs");
+        let surface = source
+            .split_once("    fn pty_agent_surfaces(")
+            .and_then(|(_, tail)| tail.split_once("    fn update_session_alerts("))
+            .map(|(body, _)| body)
+            .expect("PTY 표면 투영 본문이 있어야 한다");
+        assert!(
+            surface.contains("display_for(kind,"),
+            "사이드바와 PTY 표면이 같은 provider 전환 규칙을 써야 한다"
+        );
+    }
+
+    #[test]
+    fn 복원가능한_바인딩은_실제_resume명령이_있는_provider로_제한한다() {
+        assert!(persisted_agent_kind_is_resumable("claude"));
+        assert!(persisted_agent_kind_is_resumable("codex"));
+        assert!(persisted_agent_kind_is_resumable("grok"));
+        assert!(!persisted_agent_kind_is_resumable("kimi"));
+        assert!(!persisted_agent_kind_is_resumable("unknown"));
     }
 
     #[test]
@@ -45377,7 +45562,7 @@ mod tests {
     }
 
     #[test]
-    fn archived_resume은_확인중_미설치_미지원을_dispatch와_구분한다() {
+    fn archived_resume은_확인중_미설치_최근_미지원을_dispatch와_구분한다() {
         let mux = archived_resume_test_mux("persistent-agent");
         let claude_rows = HashMap::from([(
             "persistent-agent".to_owned(),
@@ -45398,13 +45583,22 @@ mod tests {
         assert_eq!(target.presentation, ArchivedResumePresentation::Unavailable);
         assert_eq!(target.extra_args, None);
 
-        let unsupported_rows = HashMap::from([(
+        let recent_rows = HashMap::from([(
             "persistent-agent".to_owned(),
             archived_resume_row("persistent-agent", "deppy-builtin-grok", None),
         )]);
         let installed = crate::agent_launcher::DetectionSnapshot::from_test_agents([(
             crate::agent_launcher::AgentKind::Grok,
             PathBuf::from("/opt/grok"),
+        )]);
+        let recent = archived_resume_targets_from_mux(&mux, &recent_rows, Some(&installed));
+        let target = recent.get(&runtime::SessionId(9)).unwrap();
+        assert_eq!(target.presentation, ArchivedResumePresentation::RecentInCwd);
+        assert_eq!(target.extra_args, Some(vec!["-c".to_owned()]));
+
+        let unsupported_rows = HashMap::from([(
+            "persistent-agent".to_owned(),
+            archived_resume_row("persistent-agent", "custom-agent", None),
         )]);
         let unsupported =
             archived_resume_targets_from_mux(&mux, &unsupported_rows, Some(&installed));

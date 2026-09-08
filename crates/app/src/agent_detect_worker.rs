@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use runtime::SessionId;
 
-use crate::agent_detect::{self, AgentBinding, AgentDisplay, RunningAgent};
+use crate::agent_detect::{self, AgentBinding, AgentDisplay, AgentKind, RunningAgent};
 use crate::agent_transcript::{self, AgentActivity, MAX_RECENT_TRANSCRIPT_TURNS, TranscriptTurn};
 
 const BINDING_INTERVAL: Duration = Duration::from_millis(2500);
@@ -447,14 +447,55 @@ struct ProductionBackend {
     transcript_cache: TranscriptStateCache,
 }
 
-/// transcript 파싱 캐시 한 항목. `len`/`modified`는 hit 판정용 stat 스냅샷이다.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct TranscriptFileStamp {
+    len: u64,
+    modified: SystemTime,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct TranscriptCacheStamp {
+    transcript: TranscriptFileStamp,
+    grok_summary: Option<TranscriptFileStamp>,
+    grok_events: Option<TranscriptFileStamp>,
+}
+
+fn transcript_file_stamp(path: &std::path::Path) -> Option<TranscriptFileStamp> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_file() {
+        return None;
+    }
+    Some(TranscriptFileStamp {
+        len: metadata.len(),
+        modified: metadata.modified().ok()?,
+    })
+}
+
+fn transcript_cache_stamp(binding: &AgentBinding) -> Option<TranscriptCacheStamp> {
+    let transcript = transcript_file_stamp(&binding.transcript)?;
+    let (grok_summary, grok_events) = if binding.kind == AgentKind::Grok {
+        let directory = binding.transcript.parent()?;
+        (
+            transcript_file_stamp(&directory.join("summary.json")),
+            transcript_file_stamp(&directory.join("events.jsonl")),
+        )
+    } else {
+        (None, None)
+    };
+    Some(TranscriptCacheStamp {
+        transcript,
+        grok_summary,
+        grok_events,
+    })
+}
+
+/// transcript 파싱 캐시 한 항목. `stamp`는 hit 판정용 파일 스냅샷이다.
 /// `transcript`는 같은 세션이 **다른 transcript로 재바인딩**된 직후, 새 파일의
-/// `(len, modified)`가 옛 파일과 우연히 일치해 낡은 파싱 결과가 나가는 것을 막는다
+/// stamp가 옛 파일과 우연히 일치해 낡은 파싱 결과가 나가는 것을 막는다
 /// (리뷰 후속 2026-08-15 — 확률은 낮지만 방어 비용이 경로 비교 한 번뿐).
 struct TranscriptCacheEntry {
     transcript: std::path::PathBuf,
-    len: u64,
-    modified: SystemTime,
+    stamp: TranscriptCacheStamp,
     state: Arc<agent_transcript::TranscriptState>,
 }
 
@@ -464,10 +505,9 @@ struct TranscriptCacheEntry {
 /// 소스 레벨에서 강제한다) — 그래서 캐시는 파싱 결과를 `Arc`로 감싸 공유하고, hit 시
 /// `Arc::clone`(refcount 증가)만 하지 구조체 전체를 복제하지 않는다.
 ///
-/// 검증 키는 `std::fs::metadata` 한 번(stat 1회)의 `len()`+`modified()`다. transcript는
-/// append-only JSONL이라 **len 변화가 주 신호**이고, mtime 해상도 문제(같은 초 안 재작성)는
-/// append만 하는 파일에서 len이 함께 늘어나므로 실질 위험이 없다. stat이 실패하면(파일
-/// 삭제/교체) 캐시를 버리고 다시 파싱한다.
+/// 검증 키는 일반 transcript의 `len()`+`modified()`다. Grok은 활동·모델 메타데이터를
+/// 형제 `events.jsonl`·`summary.json`에 따로 쓰므로 두 파일의 존재와 stamp도 함께 묶는다.
+/// 어느 파일이든 append/교체되면 다음 poll에서 다시 파싱한다.
 #[derive(Default)]
 struct TranscriptStateCache {
     entries: HashMap<SessionId, TranscriptCacheEntry>,
@@ -483,26 +523,22 @@ impl TranscriptStateCache {
         binding: &AgentBinding,
         fetch: impl FnOnce(&AgentBinding) -> Option<agent_transcript::TranscriptState>,
     ) -> Option<Arc<agent_transcript::TranscriptState>> {
-        let stat = std::fs::metadata(&binding.transcript)
-            .ok()
-            .and_then(|m| m.modified().ok().map(|modified| (m.len(), modified)));
-        if let Some((len, modified)) = stat
+        let stamp = transcript_cache_stamp(binding);
+        if let Some(stamp) = stamp.as_ref()
             && let Some(entry) = self.entries.get(&sid)
             && entry.transcript == binding.transcript
-            && entry.len == len
-            && entry.modified == modified
+            && &entry.stamp == stamp
         {
             return Some(Arc::clone(&entry.state));
         }
         let state = Arc::new(fetch(binding)?);
-        match stat {
-            Some((len, modified)) => {
+        match stamp {
+            Some(stamp) => {
                 self.entries.insert(
                     sid,
                     TranscriptCacheEntry {
                         transcript: binding.transcript.clone(),
-                        len,
-                        modified,
+                        stamp,
                         state: Arc::clone(&state),
                     },
                 );
@@ -1000,6 +1036,43 @@ mod tests {
             calls.load(AtomicOrdering::SeqCst),
             2,
             "append 후에는 다음 호출이 즉시 재파싱해야 한다"
+        );
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn grok_transcript_cache는_sidecar가_바뀌면_즉시_재파싱한다() {
+        let dir = transcript_cache_temp_dir("grok-sidecar");
+        let path = dir.join("chat_history.jsonl");
+        std::fs::write(&path, b"line-1\n").unwrap();
+        let binding = AgentBinding {
+            kind: AgentKind::Grok,
+            session_id: "s".to_owned(),
+            transcript: path,
+        };
+        let sid = SessionId(1);
+        let mut cache = TranscriptStateCache::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let _ = cache.get(sid, &binding, counting_fetch(Arc::clone(&calls)));
+        let _ = cache.get(sid, &binding, counting_fetch(Arc::clone(&calls)));
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+
+        std::fs::write(dir.join("events.jsonl"), b"{\"type\":\"turn_ended\"}\n").unwrap();
+        let _ = cache.get(sid, &binding, counting_fetch(Arc::clone(&calls)));
+        assert_eq!(
+            calls.load(AtomicOrdering::SeqCst),
+            2,
+            "chat 본문이 그대로여도 이벤트 종료는 즉시 다시 읽어야 한다"
+        );
+
+        std::fs::write(dir.join("summary.json"), b"{\"reasoning_effort\":\"high\"}").unwrap();
+        let _ = cache.get(sid, &binding, counting_fetch(Arc::clone(&calls)));
+        assert_eq!(
+            calls.load(AtomicOrdering::SeqCst),
+            3,
+            "모델·강도 sidecar 변경도 캐시를 무효화해야 한다"
         );
 
         std::fs::remove_dir_all(dir).unwrap();

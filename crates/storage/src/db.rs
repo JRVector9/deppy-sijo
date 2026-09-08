@@ -1252,9 +1252,9 @@ pub struct AgentStateSnapshot {
     /// 기록. waiting처럼 전역(모든 워크스페이스)이며 2분 stale 창으로 자기치유된다.
     pub working_sessions: Vec<String>,
     pub agent_sessions: Vec<AgentSessionRow>,
-    /// 전 워크스페이스 스코프의 `(workspace_id, pane_id)` 존재 여부 — warm(비활성)
-    /// 워크스페이스 사이드바 행의 「이어가기」 노출 판정용. `include_global_agent_sessions`가
-    /// false면 비어 있다.
+    /// 전 워크스페이스 스코프에서 실제 resume 명령이 있는 provider의
+    /// `(workspace_id, pane_id)` 존재 여부 — warm(비활성) 워크스페이스 사이드바 행의
+    /// 「이어가기」 노출 판정용. `include_global_agent_sessions`가 false면 비어 있다.
     pub global_agent_sessions: Vec<(String, String)>,
     pub archived_agent_resume: Vec<ArchivedAgentResumeRow>,
     pub structured_threads: Vec<StructuredThreadRow>,
@@ -1883,12 +1883,13 @@ const AGENT_SESSIONS_BOUNDED_SELECT: &str = "SELECT pane_id, kind, session_id
     ORDER BY updated_at DESC, substr(CAST(pane_id AS BLOB), 1, ?3), rowid LIMIT ?2";
 
 // 전 워크스페이스 스코프 — warm(비활성) 사이드바 행의 「이어가기」 노출 판정에는
-// pane_id 존재 여부만 있으면 된다(실제 kind/session_id는 전환 후 stage_agent_resume가
-// 새로 로드된 활성 workspace의 restore_agents에서 다시 읽는다). ACTIVITY_PANES_BOUNDED_*
+// 실제 live-pane resume 명령이 있는 Claude/Codex/Grok의 pane_id만 있으면 된다. kind/session_id는
+// 전환 후 stage_agent_resume가 새 활성 workspace의 restore_agents에서 다시 읽는다.
+// ACTIVITY_PANES_BOUNDED_*
 // (전 워크스페이스, LIMIT+tie-breaker)와 동일한 패턴 — 전 워크스페이스로 넓힐수록
 // 상한이 더 중요해진다는 원칙을 그대로 따른다.
 const AGENT_SESSIONS_GLOBAL_BOUNDED_PREFLIGHT: &str = "WITH selected AS MATERIALIZED (
-    SELECT rowid FROM agent_sessions
+    SELECT rowid FROM agent_sessions WHERE kind IN ('claude', 'codex', 'grok')
      ORDER BY updated_at DESC,
               substr(CAST(workspace_id AS BLOB), 1, ?2),
               substr(CAST(pane_id AS BLOB), 1, ?2), rowid LIMIT ?1
@@ -1904,7 +1905,7 @@ SELECT COUNT(*), COALESCE(SUM(CASE WHEN
     OR row_bytes > ?3 THEN 1 ELSE 0 END), 0),
     COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0) FROM sized";
 const AGENT_SESSIONS_GLOBAL_BOUNDED_SELECT: &str = "SELECT workspace_id, pane_id
-    FROM agent_sessions
+    FROM agent_sessions WHERE kind IN ('claude', 'codex', 'grok')
     ORDER BY updated_at DESC,
              substr(CAST(workspace_id AS BLOB), 1, ?2),
              substr(CAST(pane_id AS BLOB), 1, ?2), rowid LIMIT ?1";
@@ -14646,6 +14647,31 @@ mod tests {
         ];
         expected.sort();
         assert_eq!(global, expected);
+    }
+
+    #[test]
+    fn agent_state_global_agent_sessions는_실제_resume명령이_없는_kind를_제외한다() {
+        let db = Db::open_in_memory().unwrap();
+        let active = db.create_workspace("agent-state-global-resumable").unwrap();
+        db.upsert_agent_session(&active, "claude-pane", "claude", "claude-session")
+            .unwrap();
+        db.upsert_agent_session(&active, "grok-pane", "grok", "grok-session")
+            .unwrap();
+        db.upsert_agent_session(&active, "kimi-pane", "kimi", "kimi-session")
+            .unwrap();
+
+        let mut job = AgentStateJob::projection(&active);
+        job.include_global_agent_sessions = true;
+        let snapshot = db.apply_agent_state_job(&job).unwrap();
+
+        let mut actual = snapshot.global_agent_sessions;
+        actual.sort();
+        let mut expected = vec![
+            (active.clone(), "claude-pane".to_owned()),
+            (active, "grok-pane".to_owned()),
+        ];
+        expected.sort();
+        assert_eq!(actual, expected);
     }
 
     #[test]

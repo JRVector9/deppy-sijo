@@ -2357,3 +2357,8 @@
 ### Keychain 리뷰 완료 및 게시 준비
 - 표준 `codex review --uncommitted`는 legacy keychain/의존성 소스를 읽었지만 300초 내 결론이 없어 정확 process group26511을 종료했다. wrapper exit0은 cleanup 결과이며 리뷰 PASS가 아니다. 별도 actual source 제한 리뷰와 오탐 증거 재리뷰는 완료했으며 남은 확정 P1/P2 없음이다.
 - 소스는 전체65/strict/boundary/fmt/diff PASS 상태와 동일하다. 다음은 한국어 commit, `git push -u origin fix/keychain-noninteractive-main`, `gh pr create --base main --head fix/keychain-noninteractive-main --body-file /private/tmp/deppy-keychain-noninteractive-pr.md`, 정확 원격 HEAD/check-run annotations와 clean 확인이다.
+
+### Keychain main Ready PR 게시
+- PR #172 https://github.com/JRVector9/deppy-sijo/pull/172 , base main, Ready. 검증한 소스 커밋 `169be872b340c58e0152799398f4aac43ce7404d`를 일반 push했고 GitHub HEAD 일치를 확인했다. 이후 게시 기록은 문서만 변경한다.
+- 최초 소스 HEAD의 Actions5개 check-run102091858476/102091858616/102091858390/102091859060/102091858046에서 각각 billing/spending limit으로 job 미시작 annotation을 확인했다. BLOCKED이며 CI PASS가 아니다. GitGuardian은 첫 조회에서 IN_PROGRESS였으므로 성공을 추정하지 않는다.
+- 남은 코드 작업 없음. 최종 문서 push 뒤 `git rev-parse HEAD origin/fix/keychain-noninteractive-main`; `git status --short`; `gh pr view 172 --json headRefOid,statusCheckRollup,isDraft,baseRefName`; `gh api repos/JRVector9/deppy-sijo/commits/HEAD_SHA/check-runs`로 다시 확인하고 PR 본문/Obsidian 일지에 final HEAD와 실제 checks를 기록한다. main merge와 앱 build/launch는 수행하지 않는다.

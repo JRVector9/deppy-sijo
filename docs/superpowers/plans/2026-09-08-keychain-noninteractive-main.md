@@ -35,6 +35,6 @@ pairs.push((cf(kSecUseAuthenticationUI), cf(kSecUseAuthenticationUIFail).into_CF
 ### Task 3: 최종 검증·리뷰·게시
 - [x] CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-deps-target-20260907로 secret 전체 test, `cargo clippy -p secret --locked --all-targets -- -D warnings`, `cargo run -p xtask --locked -- check-boundary`, `cargo fmt --all --check`, `git diff --check`를 실행한다. 실제 keychain/GUI build/launch는 하지 않는다.
 - [x] 실제 source diff로 `codex review --uncommitted`를 300초 유계 실행한다. 결론이 없으면 정확 PID 종료 후 좁은 readonly CLI 리뷰로 결론을 확보한다. 확정 finding은 RED→GREEN 및 재검증한다.
-- [ ] handoff와 Obsidian 일지에 결과 기록, 한국어 commit/push, `gh pr create --base main --head fix/keychain-noninteractive-main --body-file /private/tmp/deppy-keychain-noninteractive-pr.md`로 Ready PR 생성. exact HEAD/check annotations를 확인해 Actions 미실행은 BLOCKED로 기록한다.
+- [x] handoff와 Obsidian 일지에 결과 기록, 한국어 commit/push, `gh pr create --base main --head fix/keychain-noninteractive-main --body-file /private/tmp/deppy-keychain-noninteractive-pr.md`로 Ready PR 생성. exact HEAD/check annotations를 확인해 Actions 미실행은 BLOCKED로 기록한다.
 
 공식 근거: https://developer.apple.com/documentation/security/ksecmatchsearchlist , https://developer.apple.com/documentation/security/ksecusekeychain , https://developer.apple.com/documentation/security/ksecuseauthenticationuifail

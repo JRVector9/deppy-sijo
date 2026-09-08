@@ -2367,3 +2367,38 @@
 
 - R1 최종 source archive50e48d73d6 완료: macOS protocol/server/storage/web-remote strict Clippy/fmt/718 PASS·2 ignored, Linux rust:1.96 protocol/server strict Clippy72 PASS/release PASS. 마지막 서버 수정 이후 전체를 다시 실행했다. xtask boundary와 제외 파일 diff도 PASS. staged 제품 bytes가 검증 archive와 동일함을 확인했다. bounded 최종 source 재리뷰 확정 결함 없음.
 - R1 게시 직전: 제품+R1 문서만 stage하며 R2 shell/shared/assets/CI/fixture와 handshake fixture 테스트 hunk는 unstaged로 보존한다. 다음 명령: git commit -m 'feat(relay): 비UI 재접속 코어를 main에 이관한다'; git push -u origin feat/relay-reconnect-core-main; gh pr create --base main --head feat/relay-reconnect-core-main --body-file /private/tmp/deppy-relay-core-pr-body.md. 이후 git switch -c feat/relay-shell-main 후 별도 R2 계획을 실행한다. DNS/TLS/자격증명/외부 배포/실기기/24h soak는 BLOCKED다.
+
+## 2026-09-08 R1 게시 / R2 브라우저 셸 분기
+
+- R1 PR https://github.com/JRVector9/deppy-sijo/pull/161, base main, HEAD6ee7eb4c3427a289d7f2c120cf5e403af74b213f. source gate/review 완료 후 게시했으며 merge하지 않았다.
+- R2 feat/relay-shell-main을 그 정확한 HEAD에서 생성했다. 남은 shell/shared/assets/static route/Chrome·Node fixture/CI hunk만 이관하며 별도 writing-plans 계획을 작성했다.
+- 현재 R2 Node와 web-remote 전체→headless Chrome3→strict Clippy/fmt 실행 중이다. 제품 제외 경계와 diff check PASS. 기존 원본 #146은 그대로다.
+- 다음: 실제 결과 기록, R2 scoped Codex source 리뷰 결과 확인, Obsidian 일지, R1 base stacked PR 게시. GitGuardian 공개 fixture 근거는 유지하며 DNS/TLS/배포/실기기/24h soak는 BLOCKED다.
+
+- R2 독립 web-remote336 PASS·4 ignored, Node16 PASS, 로컬 artifact build/verify PASS. Chrome 실제실행은 pairing/WebCrypto2 PASS, viewer-core는60초report timeout FAIL이었다. ps로 정확한 child 상태 확인했으며 테스트 helper가 해당 child를 정리했다. viewer runner/RAF/report 원인 조사 중, 전체 Chrome PASS로 세지 않는다. 뒤에 체인된 Clippy/fmt는 아직 미실행이다. R1 Actions5개는 모두 runner_id0/steps[] FAILURE, GitGuardian SUCCESS 확인.
+
+- R2 Chrome timeout RCA: 동일 viewer JS/fixture는 임시 Node/CDP에서 status=ok,91frames,errors=[]이고 원래 테스트 재시도도 PASS였다. Rust helper에 분할 요청을 보내는 새 chrome_support_contract 테스트는 received=Ok(0)으로 실제 RED. accepted socket 비차단 상속을 serve_one에서 해제하고2초 write idle을 추가했다. 제품JS는 변경하지 않았다. 최종 web-remote 전체/Chrome3/strict Clippy와 좁은 helper 재리뷰 실행 중이다.
+
+- R2 최종 gate 완료: web-remote337 PASS·4 ignored(생성helper1+별도Chrome3), 이어 Chrome3 모두 실제PASS, Node16 PASS, web-remote all-target strict Clippy/fmt/diff/제외 경계 PASS. Chrome helper 수정 뒤 전체를 다시 검증했다. R2 scoped Codex 및 helper 좁은 재리뷰 모두 확정 결함 없음.
+- R2 로컬 artifact build+verify PASS: /private/tmp/deppy-relay-r2-artifact-20260908, shell_version=e89480c33d67082a, archive digest617faa69677d4e598f86da5861e3f371fc12481033ca5c7a48416893c88124c5. 실제 배포가 아니다.
+- R2 게시 직전: shell/static/assets/browser test·fixture/CI 및 한 handshake fixture 테스트 hunk만 commit한다. 다음 명령: git push -u origin feat/relay-shell-main; gh pr create --base feat/relay-reconnect-core-main --head feat/relay-shell-main --body-file /private/tmp/deppy-relay-shell-pr-body.md. R1 먼저 착지 후 R2를 최신main과 일반 merge/retarget하고 재검증한다. force-push/rebase는 하지 않는다.
+
+## 2026-09-08 Relay R1/R2 stacked 게시 완료
+
+- 완료: R1 https://github.com/JRVector9/deppy-sijo/pull/161 (base main), HEAD6ee7eb4c3427a289d7f2c120cf5e403af74b213f. R2 https://github.com/JRVector9/deppy-sijo/pull/162 (base feat/relay-reconnect-core-main), 제품commitce9309068cfc84601098e48be7b8f7f1365b5360. 이 checkpoint는 문서만 추가한다.
+- 실제 로컬 결과: R1 macOS718/2 ignored 및4crate strict Clippy/fmt/boundary, Linux72/strict Clippy/release PASS. R2 web337/4 ignored 뒤 Chrome3 실제PASS, Node16, strict Clippy/fmt/경계 및 artifact build/verify PASS. Codex source 리뷰와 지적 수정 후 좁은 재리뷰 완료. 앱 빌드·재실행 없이 완료했다.
+- 외부 checks: R1 Actions5개, R2 제품HEAD Actions6개 모두 runner_id=0, steps=[]인 FAILURE다. 실행 PASS로 대체하지 않는다. R1 GitGuardian SUCCESS. R2 check102012043287 FAILURE는 incident37016215의 tests/fixtures/relay-hello-v1.json:35 공개 순차0x00..0x1f 벡터를 정확히 지목한다. 운영 credential 없음, fixture 배포 제외, 탐지 문자열 분할/억제 우회 없음.
+- 일지: Obsidian 프로젝트 일지/deppy-sijo/2026-09-08 Relay 비UI 재접속 코어 main 이관.md 및 2026-09-08 Relay 브라우저 셸 stacked 이관.md.
+- 남은 일: 부모의 R1→R2 착지 단계에서 hosted checks와 공개 fixture 판정을 별도로 해결하고 exact head를 검증한다. R1 squash 착지 후 R2에서 git fetch origin; git merge origin/main; gh pr edit 162 --base main 순서로 일반 merge/retarget하고 적정 게이트를 재검증한다. 기존146/149 수정·닫기, rebase/force-push, merge/배포는 이 lane에서 하지 않았다.
+- 후속 app adapter: AppRelayRepository reconnect methods와 native pairing/lifecycle/UI 연결, Conflict/pending/재승인 정책을 별도 PR로 검증한다. DNS/TLS/자격증명/외부 배포/실기기/24h soak는 BLOCKED다.
+
+## 2026-09-08 PR162 공개 fixture 탐지 수정 및 PR163 동기화
+- 목표: GitGuardian check102012638591이 commit ce930906의 relay-hello-v1.json:35를 지목한 유일 탐지를 해결하고 #163에 일반 merge한다. 실제 credential 회전이나 탐지 억제 설정은 하지 않는다.
+- 근거: 기존 secret_hex는 공개 bytes(0..31)와 같으며 Python 표준 hmac/sha256으로 proof와49바이트 record를 독립 재계산해 일치를 확인했다. Rust cfg(test)와 headless Chrome fixture가 소비하고 relay-shell build.sh 배포 파일 목록에는 포함되지 않는다. 운영 key/외부 서비스 credential이 아니다.
+- 변경 계획: 같은32바이트 hex 형식의 명백한 영벡터를 사용하고 HMAC proof·record·1바이트 짧은 거절 벡터만 함께 재계산한다. Rust golden에서 영벡터 계약 RED→GREEN, 실제 Chrome/Node 관련 검사, strict web-remote Clippy/fmt/diff와 좁은 CLI 리뷰 후 commit/push한다.
+- 첫 shared target 실행은 현재 protocol 소스에 존재하는 Reconnect enum을 이전 artifact에서 찾지 못해 E0599 컴파일 실패했다. 제품 RED가 아니며 기존 lane 전용 target `/private/tmp/deppy-relay-core-main-20260908/target`으로 재실행한다. 소스/의존성 우회 수정은 하지 않았다.
+- 다음: #162 게시 후 #163 worktree에서 새 HEAD 일반 merge, 충돌·관련 gate 확인, commit/push 및 두 PR의 GitGuardian과 Actions billing 차단을 별도로 보고한다. 앱 build/launch/deploy 금지, DNS/TLS/배포는 BLOCKED 유지.
+
+- 영벡터 assertion의 실제 RED(exit101, 기존0..31과0×32 불일치)를 확인했다(`/private/tmp/deppy-relay-fixture-red.log`). fixture secret32바이트/record49바이트/reject48바이트 형식은 유지하며 독립 Python HMAC-SHA256으로 종속값을 재계산했다. 제품 crypto/credential 발급 코드는 변경하지 않았다.
+- #162 최종 web-remote 전체337 PASS/4 ignored(`/private/tmp/deppy-relay-fixture-web-tests.log`), Node16 PASS(`...fixture-node-tests.log`), 실제 headless Chrome pairing1 PASS(`...fixture-chrome.log`). web-remote strict all-targets Clippy, fmt/diff PASS(`...fixture-clippy.log`). 전용 target과 CARGO_BUILD_JOBS=2를 사용했다.
+- 좁은 Codex 리뷰 exit0: 남은 확정 P1/P2/계약 누락 없음(`/private/tmp/deppy-relay-fixture-codex-review.log`). 다음은 한국어 commit/일반 push 후 GitGuardian 최신 head 결과 확인 및 #163 일반 merge다. 과거 commit에 대한 서버 측 incident가 남으면 이를 최신 소스 탐지와 구분한다.

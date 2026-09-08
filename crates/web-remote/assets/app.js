@@ -1,6 +1,11 @@
 // Deppy Sijo 모바일 대시보드 (P2) — 프레임워크 없음, CSP(default-src 'self') 준수.
 // WS로 승인/상태를 받아 렌더하고, Allow/Deny를 되보낸다. 신뢰경계: 서버가 보낸 문자열
 // (preview/title/server/tool)은 전부 textContent로만 삽입한다 — innerHTML 절대 금지.
+//
+// 서빙되는 `/app.js`는 `web/shared/viewer-core.js` + 이 파일을 이어 붙인 **하나의 ES
+// 모듈**이다(static_srv가 합친다 — index.html은 type="module"로 로드). 그래서 여기서
+// `createViewer`를 import 없이 바로 쓴다. 읽기 전용 전체화면 뷰어 수명주기는 그 공용
+// 모듈이 소유하고, 이 셸은 작성기·특수키·첨부·승인 같은 쓰기 경로만 hooks로 얹는다.
 (() => {
   'use strict';
   const TOKEN_KEY = 'deppy.webToken';
@@ -193,12 +198,8 @@
         }
         setStatus('ok', '연결됨');
         setViewerConnection('connected');
-        // 재연결이면 서버 접속 상태(시청)가 초기화됐다 — 보던 세션을 다시 watch한다.
-        // 식별자가 영속 UUID라 재시작 뒤에도 같은 세션이 잡힌다 (I1).
-        if (viewer.watching) {
-          viewer.screen = null;
-          send({ type: 'watch', session: viewer.watching });
-        }
+        // 재연결이면 서버 접속 상태(시청)가 초기화됐다 — 뷰어 코어가 다시 watch한다.
+        rewatch();
         break;
       case 'dashboard':
         // 오프라인 폴백 화면이 "마지막 상태 시각"을 보여줄 수 있게 수신 시각을 저장한다.
@@ -248,103 +249,17 @@
   }
 
   // ── 터미널 뷰어 (P5d) — 읽기 전용 canvas + 최소 제어(Ctrl-C/Enter) ──
-  // 서버 프레임(P5c): keyframe=전체 행, delta=바뀐 행만. 클라는 행별 run 배열을
-  // 화면 모델로 유지하고 매 프레임 전체를 다시 그린다(80×24 fillText는 ~ms — 단순 우선).
+  // 서버 프레임(P5c): keyframe=전체 행, delta=바뀐 행만. 읽기 전용 수명주기(화면 모델·
+  // canvas 렌더·팬/핀치·Back·프라이버시 커튼·재연결 표시)는 공용 모듈
+  // web/shared/viewer-core.js가 소유한다. 이 셸은 그 위에 쓰기 경로(특수키·작성기·첨부)만
+  // hooks로 얹는다 — 시청 전용 Relay 셸이 같은 코어를 hooks 없이 쓸 수 있어야 한다.
   const dashboardShell = document.getElementById('dashboard-shell');
   const sessionsTitle = document.getElementById('sessions-title');
-
-  function clearStaleViewerHistory() {
-    if (!(history.state && history.state.deppyViewer)) return;
-    const cleanState = { ...history.state };
-    delete cleanState.deppyViewer;
-    history.replaceState(Object.keys(cleanState).length ? cleanState : null, '', location.href);
-  }
-
-  clearStaleViewerHistory();
-
-  const viewer = {
-    el: document.getElementById('viewer'),
-    label: document.getElementById('viewer-session'),
-    canvas: document.getElementById('viewer-canvas'),
-    wrap: document.querySelector('#viewer .viewer-wrap'),
-    back: document.getElementById('viewer-back'),
-    keys: Array.from(document.querySelectorAll('.viewer-keys button')),
-    watching: null,
-    returnSession: null,
-    screen: null,
-    closing: false,
-    pendingClose: null,
-    connection: 'connecting',
-    connectionStatus: document.getElementById('viewer-connection'),
-    connectionLabel: document.getElementById('viewer-connection-label'),
-    connectionDetail: document.getElementById('viewer-connection-detail'),
-    overlay: document.getElementById('viewer-connection-overlay'),
-    overlayTitle: document.getElementById('viewer-overlay-title'),
-    overlayDetail: document.getElementById('viewer-overlay-detail'),
-    privacy: document.getElementById('viewer-privacy-curtain'),
-  };
-
-  const VIEWER_CONNECTION_COPY = {
-    connecting: ['연결 중', '터미널 화면을 준비하고 있습니다.'],
-    reconnecting: ['재연결 중', '마지막 화면을 유지합니다. 연결되기 전에는 입력할 수 없습니다.'],
-    paused: ['일시정지', '앱으로 돌아오면 다시 연결합니다.'],
-  };
 
   const keyRepeatCancels = [];
 
   function stopAllKeyRepeats() {
     for (const cancel of keyRepeatCancels) cancel();
-  }
-
-  function setViewerClosing(closing) {
-    viewer.closing = closing;
-    viewer.back.disabled = closing;
-    inputBlocked = closing;
-    for (const button of viewer.keys) button.disabled = closing;
-    updateComposerEnabled();
-  }
-
-  function setViewerConnection(state) {
-    viewer.connection = state;
-    const connected = state === 'connected';
-    const copy = connected ? ['연결됨', ''] : VIEWER_CONNECTION_COPY[state];
-    viewer.connectionLabel.textContent = copy[0];
-    viewer.connectionDetail.textContent = copy[1];
-    viewer.connectionStatus.className = 'viewer-connection ' + state;
-    viewer.overlay.hidden = connected;
-    if (!connected) {
-      viewer.overlayTitle.textContent = copy[0];
-      viewer.overlayDetail.textContent = copy[1];
-      stopAllKeyRepeats();
-      resetScroll();
-      cancelActiveUpload();
-      for (const sessionId of Array.from(recentSentBySession.keys())) {
-        restoreDraft(
-          sessionId === viewer.watching
-            ? '연결이 바뀌어 최근 입력을 복원했습니다 — 중복 여부를 확인하세요'
-            : '',
-          sessionId,
-        );
-      }
-      inputBlocked = false; // reset per connection generation
-    }
-    updateComposerEnabled();
-    if (connected) consumePendingUploadSelection();
-  }
-
-  function clearViewerCanvas() {
-    const canvas = viewer.canvas;
-    const context = canvas.getContext('2d');
-    context.setTransform(1, 0, 0, 1, 0, 0);
-    context.fillStyle = '#000000';
-    context.fillRect(0, 0, canvas.width, canvas.height);
-  }
-
-  function activateViewerShell() {
-    dashboardShell.inert = true;
-    dashboardShell.setAttribute('aria-hidden', 'true');
-    document.body.classList.add('viewer-open');
-    viewer.el.hidden = false;
   }
 
   function restoreViewerFocus(sessionId) {
@@ -355,137 +270,110 @@
     });
   }
 
-  function finishCloseViewer({ rerender = true, notice = '', discardDraft = false } = {}) {
-    if (!viewer.watching) return;
-    setViewerClosing(true);
-    stopAllKeyRepeats();
-    cancelScheduledViewerRender(); // central viewer close
-    const returnSession = viewer.returnSession;
-    if (discardDraft) discardSessionDraft(returnSession);
-    else saveComposerDraft();
-    cancelActiveUpload();
-    cancelPendingUploadSelection();
-    send({ type: 'unwatch' });
-    viewer.watching = null;
-    viewer.returnSession = null;
-    viewer.screen = null;
-    viewer.pendingClose = null;
-    composerRecoveryWarningSession = null;
-    composerSession = null;
-    composerText.value = '';
-    autoGrow();
-    resetScroll();
-    updateScrollNote();
-    inputBlocked = false;
-    setComposerNote('');
-    viewer.el.hidden = true;
-    document.body.classList.remove('viewer-open');
-    dashboardShell.inert = false;
-    dashboardShell.removeAttribute('aria-hidden');
-    if (rerender) renderWorkspaces(lastWorkspaces, lastResource);
-    const closeNotices = [notice, draftCacheNotice].filter(Boolean);
-    draftCacheNotice = '';
-    if (closeNotices.length) showNotice(closeNotices.join(' '));
-    setViewerClosing(false);
-    restoreViewerFocus(returnSession);
-    queueMicrotask(() => consumePendingWatch(lastSessions));
-  }
-
-  function mergeViewerCloseOptions(current = {}, incoming = {}) {
-    return {
-      rerender: current.rerender !== false && incoming.rerender !== false,
-      notice: [current.notice, incoming.notice].filter(Boolean).join(' '),
-      discardDraft: !!(current.discardDraft || incoming.discardDraft),
-    };
-  }
-
-  function requestCloseViewer(options = {}) {
-    if (!viewer.watching) return;
-    if (viewer.closing) {
-      viewer.pendingClose = mergeViewerCloseOptions(viewer.pendingClose, options); // merge while awaiting popstate
-      return;
-    }
-    cancelActiveUpload();
-    cancelPendingUploadSelection();
-    const ownsHistory = !!(history.state && history.state.deppyViewer);
-    if (ownsHistory) {
-      setViewerClosing(true);
-      viewer.pendingClose = options;
-      stopAllKeyRepeats();
-      resetScroll();
-      history.back();
-      return;
-    }
-    finishCloseViewer(options);
-  }
-
-  /// `sessionId`는 영속 UUID 문자열이다 (I1).
-  function openViewer(sessionId, title) {
-    if (!sessionId || viewer.closing || viewer.watching === sessionId) return false;
-    stopAllKeyRepeats();
-    preserveComposerDraftForTransition();
-    cancelActiveUpload();
-    cancelPendingUploadSelection();
-    setViewerClosing(false);
-    viewer.watching = sessionId;
-    viewer.returnSession = sessionId;
-    viewer.screen = null;
-    clearViewerCanvas();
-    resetScroll();
-    updateScrollNote();
-    inputBlocked = false;
-    setComposerNote('');
-    loadComposerDraft(sessionId);
-    viewer.label.textContent = title || '세션';
-    activateViewerShell();
-    if (!(history.state && history.state.deppyViewer)) {
-      history.pushState({ ...(history.state || {}), deppyViewer: true }, '', location.href);
-    }
-    updateComposerEnabled();
-    viewer.back.focus();
-    scheduleViewerRender(); // first full-screen frame
-    if (viewer.connection === 'connected') {
-      send({ type: 'watch', session: sessionId });
-    }
-    return true;
-  }
-
-  viewer.back.addEventListener('click', () => requestCloseViewer());
-  window.addEventListener('popstate', () => {
-    if (viewer.watching && !(history.state && history.state.deppyViewer)) {
-      finishCloseViewer(viewer.pendingClose || {});
-    } else if (!viewer.watching && history.state && history.state.deppyViewer) {
-      clearStaleViewerHistory();
-    }
+  const viewer = createViewer({
+    send,
+    backdrop: dashboardShell,
+    hooks: {
+      closingChanged: (closing) => {
+        if (closing) stopAllKeyRepeats();
+        inputBlocked = closing;
+        for (const button of viewer.keys) button.disabled = closing;
+        updateComposerEnabled();
+      },
+      connectionChanged: (state, connected) => {
+        if (!connected) {
+          stopAllKeyRepeats();
+          cancelActiveUpload();
+          for (const sessionId of Array.from(recentSentBySession.keys())) {
+            restoreDraft(
+              sessionId === viewer.watching
+                ? '연결이 바뀌어 최근 입력을 복원했습니다 — 중복 여부를 확인하세요'
+                : '',
+              sessionId,
+            );
+          }
+          inputBlocked = false; // reset per connection generation
+        }
+        updateComposerEnabled();
+        if (connected) consumePendingUploadSelection();
+      },
+      // 컨트롤/작성기 높이 상한은 이 셸만의 것이다(시청 전용 셸에는 컨트롤이 없다).
+      viewportSynced: (width, height) => {
+        const controlsMaxHeightPx = Math.max(88, Math.floor(height * 0.45)) + 'px';
+        const composerMaxHeightPx = height <= 500 ? '66px' : '130px';
+        if (viewer.el.style.getPropertyValue('--viewer-controls-max-height')
+            !== controlsMaxHeightPx) {
+          viewer.el.style.setProperty('--viewer-controls-max-height', controlsMaxHeightPx);
+        }
+        if (viewer.el.style.getPropertyValue('--viewer-composer-max-height')
+            !== composerMaxHeightPx) {
+          viewer.el.style.setProperty('--viewer-composer-max-height', composerMaxHeightPx);
+        }
+      },
+      pan: queueScroll,
+      resetPan: resetScroll,
+      beforeOpen: () => {
+        stopAllKeyRepeats();
+        preserveComposerDraftForTransition();
+        cancelActiveUpload();
+        cancelPendingUploadSelection();
+      },
+      sessionChanged: (sessionId) => {
+        inputBlocked = false;
+        setComposerNote('');
+        loadComposerDraft(sessionId);
+      },
+      afterOpen: () => updateComposerEnabled(),
+      beforeRequestClose: () => {
+        cancelActiveUpload();
+        cancelPendingUploadSelection();
+      },
+      beforeClose: ({ discardDraft = false } = {}, returnSession) => {
+        stopAllKeyRepeats();
+        if (discardDraft) discardSessionDraft(returnSession);
+        else saveComposerDraft();
+        cancelActiveUpload();
+        cancelPendingUploadSelection();
+      },
+      beforeHide: () => {
+        composerRecoveryWarningSession = null;
+        composerSession = null;
+        composerText.value = '';
+        autoGrow();
+        inputBlocked = false;
+        setComposerNote('');
+      },
+      afterHide: ({ rerender = true, notice = '' } = {}) => {
+        if (rerender) renderWorkspaces(lastWorkspaces, lastResource);
+        const closeNotices = [notice, draftCacheNotice].filter(Boolean);
+        draftCacheNotice = '';
+        if (closeNotices.length) showNotice(closeNotices.join(' '));
+      },
+      afterClose: (options, returnSession) => {
+        restoreViewerFocus(returnSession);
+        queueMicrotask(() => consumePendingWatch(lastSessions));
+      },
+    },
   });
+  // 특수키 행은 쓰기 경로라 코어가 아니라 이 셸이 소유한다.
+  viewer.keys = Array.from(document.querySelectorAll('.viewer-keys button'));
+  const {
+    openViewer,
+    requestCloseViewer,
+    setViewerConnection,
+    setPrivacyCurtain,
+    handleViewport,
+    rewatch,
+    resetPan,
+    scheduleViewerRender,
+    scheduleViewerRenderForLayoutChange,
+  } = viewer;
 
-  function handleViewport(msg) {
-    if (msg.session !== viewer.watching) return; // 전환 직후 이전 세션의 잔여 프레임
-    if (!msg.keyframe && !viewer.screen) {
-      // delta인데 기준 화면이 없다 — 재동기화 요청 (P5c RequestKeyframe)
-      send({ type: 'request_keyframe' });
-      return;
-    }
-    if (msg.keyframe || viewer.screen.cols !== msg.cols || viewer.screen.rows !== msg.rows) {
-      viewer.screen = { cols: msg.cols, rows: msg.rows, lines: new Array(msg.rows).fill(null) };
-    }
-    for (const line of msg.lines || []) {
-      if (line.row < viewer.screen.rows) viewer.screen.lines[line.row] = line.runs || [];
-    }
-    viewer.screen.cursor = msg.cursor || null;
-    viewer.screen.alt = !!msg.alt;
-    viewer.screen.offset = msg.offset | 0;
-    updateScrollNote();
-    viewerScreenRevision += 1;
-    scheduleViewerRender();
-  }
-
-  // ── 스크롤백 열람 — 터치/휠을 줄 단위 delta로 바꿔 보낸다 (양수 = 과거로).
+  // ── 스크롤백 열람 — 코어가 해석한 팬 제스처를 줄 단위 delta로 바꿔 보낸다 (양수 = 과거로).
   // 스크롤 상태는 세션당 하나(데스크톱과 공유 — tmux 관례). 60ms 코얼레싱으로
   // 빠른 스와이프가 메시지 폭주를 만들지 않게 한다.
   let scrollAcc = 0;
   let scrollTimer = null;
-  let lastTouchY = null;
 
   function queueScroll(lines) {
     if (!remoteInputReady()) return;
@@ -503,218 +391,19 @@
 
   function resetScroll() {
     scrollAcc = 0;
-    lastTouchY = null;
     if (scrollTimer) {
       clearTimeout(scrollTimer);
       scrollTimer = null;
     }
   }
 
-  function updateScrollNote() {
-    const note = document.getElementById('viewer-scroll-note');
-    const text = document.getElementById('viewer-offset-text');
-    const offset = (viewer.screen && viewer.screen.offset) || 0;
-    note.hidden = offset <= 0;
-    if (offset > 0) text.textContent = '↑ ' + offset + '줄 위 (과거 열람 중)';
-  }
-
-  viewer.canvas.addEventListener('touchstart', (e) => {
-    if (e.touches.length === 1) lastTouchY = e.touches[0].clientY;
-  }, { passive: true });
-  viewer.canvas.addEventListener('touchmove', (e) => {
-    if (window.visualViewport && window.visualViewport.scale > 1.01) {
-      lastTouchY = null;
-      return; // native pan while zoomed
-    }
-    if (lastTouchY == null || e.touches.length !== 1) return;
-    e.preventDefault(); // 페이지 스크롤 대신 터미널 스크롤백
-    const y = e.touches[0].clientY;
-    const dy = y - lastTouchY;
-    lastTouchY = y;
-    // 손가락을 아래로 끌면(dy>0) 과거로 — 콘텐츠가 손가락을 따라온다.
-    queueScroll(dy / (viewer.cellH || 16));
-  }, { passive: false });
-  viewer.canvas.addEventListener('touchend', () => { lastTouchY = null; }, { passive: true });
-  viewer.canvas.addEventListener('wheel', (e) => {
-    if (e.ctrlKey) return; // preserve browser pinch zoom
-    e.preventDefault();
-    // 휠 위(deltaY<0) = 과거로(양수 delta).
-    queueScroll(-e.deltaY / (viewer.cellH || 16));
-  }, { passive: false });
   document.getElementById('viewer-bottom').addEventListener('click', () => {
     const offset = (viewer.screen && viewer.screen.offset) || 0;
-    resetScroll();
+    resetPan();
     if (offset > 0 && remoteInputReady()) {
       send({ type: 'scroll', session: viewer.watching, delta: -offset });
     }
   });
-
-  const CELL_ASPECT_RATIO = 2;
-  const MAX_CANVAS_PIXELS = 8 * 1024 * 1024;
-  let viewerRenderFrame = 0;
-  let viewerViewportSettleTimer = 0;
-  let viewerScreenRevision = 0;
-  let lastViewerRenderKey = '';
-
-  function syncViewerViewport() {
-    const visualViewport = window.visualViewport;
-    const pinched = !!(visualViewport && visualViewport.scale > 1.01);
-    // Pinch zoom is accessibility magnification. Use current layout geometry instead of
-    // stale inline vars or the narrower visual viewport, then let native zoom/pan own it.
-    const top = pinched ? 0 : (visualViewport ? visualViewport.offsetTop : 0);
-    const left = pinched ? 0 : (visualViewport ? visualViewport.offsetLeft : 0);
-    const width = pinched
-      ? document.documentElement.clientWidth
-      : (visualViewport ? visualViewport.width : window.innerWidth);
-    const height = pinched
-      ? document.documentElement.clientHeight
-      : (visualViewport ? visualViewport.height : window.innerHeight);
-    const topPx = Math.max(0, Math.round(top)) + 'px';
-    const leftPx = Math.max(0, Math.round(left)) + 'px';
-    const widthPx = Math.max(1, Math.round(width)) + 'px';
-    const heightPx = Math.max(1, Math.round(height)) + 'px';
-    const controlsMaxHeightPx = Math.max(88, Math.floor(height * 0.45)) + 'px';
-    const composerMaxHeightPx = height <= 500 ? '66px' : '130px';
-    if (viewer.el.style.getPropertyValue('--viewer-top') !== topPx) {
-      viewer.el.style.setProperty('--viewer-top', topPx);
-    }
-    if (viewer.el.style.getPropertyValue('--viewer-height') !== heightPx) {
-      viewer.el.style.setProperty('--viewer-height', heightPx);
-    }
-    if (viewer.el.style.getPropertyValue('--viewer-left') !== leftPx) {
-      viewer.el.style.setProperty('--viewer-left', leftPx);
-    }
-    if (viewer.el.style.getPropertyValue('--viewer-width') !== widthPx) {
-      viewer.el.style.setProperty('--viewer-width', widthPx);
-    }
-    if (viewer.el.style.getPropertyValue('--viewer-controls-max-height')
-        !== controlsMaxHeightPx) {
-      viewer.el.style.setProperty('--viewer-controls-max-height', controlsMaxHeightPx);
-    }
-    if (viewer.el.style.getPropertyValue('--viewer-composer-max-height')
-        !== composerMaxHeightPx) {
-      viewer.el.style.setProperty('--viewer-composer-max-height', composerMaxHeightPx);
-    }
-  }
-
-  function scheduleViewerRender() {
-    if (!viewer.watching || viewerRenderFrame) return;
-    viewerRenderFrame = requestAnimationFrame(() => {
-      viewerRenderFrame = 0;
-      syncViewerViewport();
-      drawScreenNow();
-    });
-  }
-
-  function scheduleViewportSettle() {
-    if (!viewer.watching) return; // do not arm settle after close
-    scheduleViewerRender();
-    if (viewerViewportSettleTimer) clearTimeout(viewerViewportSettleTimer);
-    viewerViewportSettleTimer = setTimeout(() => {
-      viewerViewportSettleTimer = 0;
-      scheduleViewerRender();
-    }, 64);
-  }
-
-  function cancelScheduledViewerRender() {
-    if (viewerRenderFrame) cancelAnimationFrame(viewerRenderFrame);
-    if (viewerViewportSettleTimer) clearTimeout(viewerViewportSettleTimer);
-    viewerRenderFrame = 0;
-    viewerViewportSettleTimer = 0;
-  }
-
-  function drawScreenNow() {
-    const screen = viewer.screen;
-    if (!screen || viewer.el.hidden) return;
-    const canvas = viewer.canvas;
-    const availableWidth = viewer.wrap.clientWidth;
-    const availableHeight = viewer.wrap.clientHeight;
-    if (availableWidth <= 0 || availableHeight <= 0 || screen.cols <= 0 || screen.rows <= 0) return;
-    const cellW = Math.min(
-      availableWidth / screen.cols,
-      availableHeight / (screen.rows * CELL_ASPECT_RATIO),
-    );
-    const cellH = cellW * CELL_ASPECT_RATIO;
-    viewer.cellH = cellH;
-    const cssWidth = cellW * screen.cols;
-    const cssHeight = cellH * screen.rows;
-    const visualScale = window.visualViewport ? window.visualViewport.scale : 1;
-    const requestedDpr = (window.devicePixelRatio || 1) * Math.max(1, visualScale || 1);
-    const pixelBudgetDpr = Math.sqrt(MAX_CANVAS_PIXELS / Math.max(1, cssWidth * cssHeight));
-    const dpr = Math.min(requestedDpr, pixelBudgetDpr);
-    const renderKey = [
-      viewerScreenRevision,
-      availableWidth.toFixed(2),
-      availableHeight.toFixed(2),
-      dpr.toFixed(3),
-    ].join(':');
-    if (renderKey === lastViewerRenderKey) return;
-    lastViewerRenderKey = renderKey;
-    const pixelWidth = Math.max(1, Math.round(cssWidth * dpr));
-    const pixelHeight = Math.max(1, Math.round(cssHeight * dpr));
-    if (canvas.width !== pixelWidth) canvas.width = pixelWidth;
-    if (canvas.height !== pixelHeight) canvas.height = pixelHeight;
-    canvas.style.width = cssWidth + 'px';
-    canvas.style.height = cssHeight + 'px';
-    const ctx = canvas.getContext('2d');
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.fillStyle = '#000000';
-    ctx.fillRect(0, 0, cssWidth, cssHeight);
-    const A_BOLD = 1;
-    const A_ITALIC = 2;
-    const A_UNDERLINE = 4;
-    const A_STRIKE = 8;
-    const A_DIM = 16;
-    const fontPx = (cellH * 0.82).toFixed(2);
-    const fontFor = (attrs) => {
-      const style = attrs & A_ITALIC ? 'italic ' : '';
-      const weight = attrs & A_BOLD ? '700 ' : '';
-      return style + weight + fontPx + 'px ui-monospace, Menlo, monospace';
-    };
-    const dimmed = (hex) => {
-      const match = /^#?([0-9a-f]{6})$/i.exec(hex || '');
-      if (!match) return hex;
-      const value = parseInt(match[1], 16);
-      const fade = (channel) => Math.round(channel * 0.6);
-      return `rgb(${fade((value >> 16) & 255)},${fade((value >> 8) & 255)},${fade(value & 255)})`;
-    };
-    ctx.font = fontFor(0);
-    ctx.textBaseline = 'middle';
-    for (let row = 0; row < screen.rows; row++) {
-      const runs = screen.lines[row];
-      if (!runs) continue;
-      const y = row * cellH;
-      for (const run of runs) {
-        const advance = run.w ? cellW * 2 : cellW;
-        const chars = Array.from(run.t || '');
-        const attrs = run.a || 0;
-        ctx.fillStyle = run.bg || '#000000';
-        ctx.fillRect(run.s * cellW, y, chars.length * advance, cellH);
-        const foreground = attrs & A_DIM
-          ? dimmed(run.fg || '#d4d4d4')
-          : (run.fg || '#d4d4d4');
-        ctx.fillStyle = foreground;
-        ctx.font = fontFor(attrs);
-        for (let index = 0; index < chars.length; index++) {
-          if (chars[index] === ' ') continue;
-          ctx.fillText(chars[index], run.s * cellW + index * advance, y + cellH / 2, advance);
-        }
-        if (attrs & (A_UNDERLINE | A_STRIKE)) {
-          const x = run.s * cellW;
-          const width = chars.length * advance;
-          ctx.fillStyle = foreground;
-          if (attrs & A_UNDERLINE) ctx.fillRect(x, y + cellH - 1.5, width, 1);
-          if (attrs & A_STRIKE) ctx.fillRect(x, y + cellH / 2, width, 1);
-        }
-      }
-    }
-    ctx.font = fontFor(0);
-    const cursor = screen.cursor;
-    if (cursor && cursor.visible) {
-      ctx.fillStyle = 'rgba(212, 212, 212, 0.45)';
-      ctx.fillRect(cursor.col * cellW, cursor.row * cellH, cellW, cellH);
-    }
-  }
 
   function sendKey(key) {
     if (!remoteInputReady()) return;
@@ -1234,20 +923,6 @@
     }
   }
 
-  window.addEventListener('resize', scheduleViewerRender);
-  if (window.visualViewport) {
-    window.visualViewport.addEventListener('resize', scheduleViewportSettle);
-    window.visualViewport.addEventListener('scroll', scheduleViewerRender);
-  }
-  const hasViewerResizeObserver = 'ResizeObserver' in window;
-  if (hasViewerResizeObserver) {
-    new ResizeObserver(scheduleViewerRender).observe(viewer.wrap);
-  }
-
-  function scheduleViewerRenderForLayoutChange(previousWrapHeight) {
-    if (viewer.wrap.clientHeight !== previousWrapHeight) scheduleViewerRender();
-  }
-
   function renderApprovals(pending) {
     approvalsCount.textContent = String(pending.length);
     approvalsEmpty.hidden = pending.length > 0;
@@ -1652,12 +1327,12 @@
   // 탭 백그라운드 시 스트림 정지(서버 접속 종료 → 0연결 예산 준수). 포그라운드 복귀 시 재연결.
   function projectVisibility() {
     if (document.hidden) {
-      if (viewer.watching) viewer.privacy.hidden = false;
+      setPrivacyCurtain(true);
       setViewerConnection('paused');
       disconnect();
       setStatus('', '일시정지(백그라운드)');
     } else {
-      viewer.privacy.hidden = true;
+      setPrivacyCurtain(false);
       setViewerConnection('connecting');
       connect();
     }

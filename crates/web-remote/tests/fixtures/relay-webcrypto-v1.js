@@ -1,137 +1,120 @@
-(() => {
-  "use strict";
+// Task 1 고정 벡터를 **실제 브라우저 WebCrypto**로 재현하는 러너.
+//
+// 계획 Task 6 Step 5의 규정: transcript·ECDSA/ECDH·HKDF·SAS·nonce/AAD·AES-GCM은 배포되는
+// 브라우저 크립토 모듈 **하나**에만 있고, 이 하네스는 그 모듈을 그대로 import한다. 복사본을
+// 두면 셸이 틀려도 벡터가 초록으로 남는다 — 그건 게이트가 아니라 장식이다.
+//
+// 그래서 이 파일에는 도메인 분리 문자열도, `crypto.subtle`의 계약 연산 호출도 없다.
+// 픽스처 JWK를 CryptoKey로 바꾸는 `importKey`만 러너의 몫이다: 실제 기기 신원키는
+// 추출 불가능하게 만들어지므로 프로덕션 모듈이 JWK를 볼 일이 애초에 없다.
+import {
+  DIRECTION,
+  RelaySecureChannel,
+  buildTranscript,
+  bytesFromHex,
+  deriveSessionMaterial,
+  deriveSharedSecret,
+  envelopeAad,
+  envelopeNonce,
+  fixedBytes,
+  hexFromBytes,
+  importGcmKey,
+  sha256,
+  signTranscript,
+  transcriptSalt,
+  verifyPeerSignature,
+} from "./relay-crypto.js";
 
-  const fixture = JSON.parse(document.getElementById("relay-fixture").textContent);
-  const encoder = new TextEncoder();
+const fixture = JSON.parse(document.getElementById("relay-fixture").textContent);
 
-  function bytesFromHex(value) {
-    if (
-      typeof value !== "string" ||
-      value.length % 2 !== 0 ||
-      !/^(?:[0-9a-fA-F]{2})*$/.test(value)
-    ) {
-      throw new Error("invalid fixture hex");
-    }
-    return Uint8Array.from(value.match(/.{2}/g) ?? [], (byte) => Number.parseInt(byte, 16));
+function assertEqual(actual, expected, label) {
+  if (actual !== expected) {
+    throw new Error(`${label}: expected ${expected}, got ${actual}`);
   }
+}
 
-  function hexFromBytes(value) {
-    return Array.from(new Uint8Array(value), (byte) => byte.toString(16).padStart(2, "0")).join("");
-  }
+/// 픽스처 JWK → CryptoKey. 오직 테스트 배선이다.
+function importJwk(jwk, algorithm, usages) {
+  return crypto.subtle.importKey("jwk", jwk, algorithm, false, usages);
+}
 
-  function assertEqual(actual, expected, label) {
-    if (actual !== expected) {
-      throw new Error(`${label}: expected ${expected}, got ${actual}`);
-    }
-  }
+const ECDSA_P256 = { name: "ECDSA", namedCurve: "P-256" };
+const ECDH_P256 = { name: "ECDH", namedCurve: "P-256" };
 
-  function concatBytes(...parts) {
-    const output = new Uint8Array(parts.reduce((length, part) => length + part.length, 0));
-    let offset = 0;
-    for (const part of parts) {
-      output.set(part, offset);
-      offset += part.length;
-    }
-    return output;
-  }
+function peerContract(peer) {
+  return {
+    identitySec1: fixedBytes(bytesFromHex(peer.identity_public_sec1_hex), 65, `${peer.role} 신원키`),
+    ephemeralSec1: fixedBytes(
+      bytesFromHex(peer.ephemeral_public_sec1_hex),
+      65,
+      `${peer.role} 임시키`,
+    ),
+  };
+}
 
-  function fixedBytes(value, byteLength, label) {
-    const bytes = bytesFromHex(value);
-    if (bytes.length !== byteLength) {
-      throw new Error(`${label}: expected ${byteLength} bytes, got ${bytes.length}`);
-    }
-    return bytes;
-  }
+/// 봉투 한 방향. nonce/AAD는 프로덕션 함수로 직접 대조하고, 실제 봉인/해제는 프로덕션
+/// `RelaySecureChannel`로 왕복시킨다 — 셸이 실제로 쓰는 바로 그 경로다.
+async function verifyEnvelope(vector, sender, receiver, label) {
+  const ciphertext = bytesFromHex(vector.ciphertext_and_tag_hex);
+  const sequence = BigInt(vector.sequence);
+  assertEqual(
+    hexFromBytes(envelopeNonce(vector.direction, sequence)),
+    vector.nonce_hex,
+    `${label} nonce`,
+  );
+  assertEqual(
+    hexFromBytes(
+      envelopeAad({
+        protocolVersion: fixture.protocol_version,
+        connectionId: bytesFromHex(fixture.connection_id_hex),
+        direction: vector.direction,
+        sequence,
+        senderFingerprint: sender.fingerprint,
+        recipientFingerprint: receiver.fingerprint,
+        ciphertextLength: ciphertext.length,
+      }),
+    ),
+    vector.aad_hex,
+    `${label} AAD`,
+  );
 
-  function u32be(value) {
-    if (!Number.isSafeInteger(value) || value < 0 || value > 0xffffffff) {
-      throw new Error("u32 value is out of range");
-    }
-    const bytes = new Uint8Array(4);
-    new DataView(bytes.buffer).setUint32(0, value, false);
-    return bytes;
-  }
+  const sealed = await sender.channel.seal(bytesFromHex(vector.plaintext_hex));
+  assertEqual(sealed.direction, vector.direction, `${label} 봉인 방향`);
+  assertEqual(String(sealed.sequence), String(sequence), `${label} 봉인 시퀀스`);
+  assertEqual(hexFromBytes(sealed.ciphertext), vector.ciphertext_and_tag_hex, `${label} encrypt`);
 
-  function u64be(value) {
-    let remaining = BigInt(value);
-    if (remaining < 0n || remaining > 0xffffffffffffffffn) {
-      throw new Error("u64 value is out of range");
-    }
-    const bytes = new Uint8Array(8);
-    for (let index = bytes.length - 1; index >= 0; index -= 1) {
-      bytes[index] = Number(remaining & 0xffn);
-      remaining >>= 8n;
-    }
-    return bytes;
-  }
-
-  function roleCode(role) {
-    if (role === "desktop") return 1;
-    if (role === "device") return 2;
-    throw new Error(`unsupported Relay role: ${role}`);
-  }
-
-  function directionContract(direction) {
-    if (direction === "desktop-to-device") return { code: 1, nonceDomain: "D2DV" };
-    if (direction === "device-to-desktop") return { code: 2, nonceDomain: "V2DS" };
-    throw new Error(`unsupported Relay direction: ${direction}`);
-  }
-
-  function buildTranscript(contract) {
-    return concatBytes(
-      encoder.encode("deppy-relay-handshake-v1\0"),
-      u32be(contract.protocol_version),
-      fixedBytes(contract.connection_id_hex, 16, "connection id"),
-      Uint8Array.of(roleCode(contract.desktop.role)),
-      fixedBytes(contract.desktop.identity_public_sec1_hex, 65, "desktop identity"),
-      fixedBytes(contract.desktop.ephemeral_public_sec1_hex, 65, "desktop ephemeral"),
-      Uint8Array.of(roleCode(contract.device.role)),
-      fixedBytes(contract.device.identity_public_sec1_hex, 65, "device identity"),
-      fixedBytes(contract.device.ephemeral_public_sec1_hex, 65, "device ephemeral"),
-    );
-  }
-
-  function buildEnvelopeNonce(direction, sequence) {
-    const contract = directionContract(direction);
-    return concatBytes(encoder.encode(contract.nonceDomain), u64be(sequence));
-  }
-
-  function buildEnvelopeAad(
-    protocolVersion,
-    connectionId,
-    direction,
+  const opened = await receiver.channel.open({
     sequence,
-    senderFingerprint,
-    recipientFingerprint,
-    ciphertextLength,
-  ) {
-    return concatBytes(
-      encoder.encode("deppy-relay-envelope-aad-v1\0"),
-      u32be(protocolVersion),
-      connectionId,
-      senderFingerprint,
-      recipientFingerprint,
-      Uint8Array.of(directionContract(direction).code),
-      u64be(sequence),
-      u32be(ciphertextLength),
-    );
+    direction: vector.direction,
+    ciphertext,
+  });
+  assertEqual(hexFromBytes(opened), vector.plaintext_hex, `${label} decrypt`);
+}
+
+async function run() {
+  if (!globalThis.crypto?.subtle) {
+    throw new Error("WebCrypto SubtleCrypto is unavailable");
   }
 
-  async function sha256(value) {
-    return new Uint8Array(await crypto.subtle.digest("SHA-256", value));
-  }
+  const connectionId = bytesFromHex(fixture.connection_id_hex);
+  const transcript = buildTranscript({
+    protocolVersion: fixture.protocol_version,
+    connectionId,
+    desktop: peerContract(fixture.desktop),
+    device: peerContract(fixture.device),
+  });
+  assertEqual(hexFromBytes(transcript), fixture.transcript_hex, "handshake transcript");
 
-  async function verifySignature(peer, transcript) {
-    const key = await crypto.subtle.importKey(
-      "raw",
+  // 신원 지문 — 프로덕션 sha256으로 뽑는다.
+  const [desktopFingerprint, deviceFingerprint] = await Promise.all([
+    sha256(bytesFromHex(fixture.desktop.identity_public_sec1_hex)),
+    sha256(bytesFromHex(fixture.device.identity_public_sec1_hex)),
+  ]);
+
+  // 양쪽 고정 서명이 프로덕션 검증기를 통과하는가.
+  for (const peer of [fixture.desktop, fixture.device]) {
+    const verified = await verifyPeerSignature(
       bytesFromHex(peer.identity_public_sec1_hex),
-      { name: "ECDSA", namedCurve: "P-256" },
-      false,
-      ["verify"],
-    );
-    const verified = await crypto.subtle.verify(
-      { name: "ECDSA", hash: "SHA-256" },
-      key,
       bytesFromHex(peer.signature_raw_hex),
       transcript,
     );
@@ -140,186 +123,83 @@
     }
   }
 
-  async function signTranscript(peer, transcript) {
-    const privateKey = await crypto.subtle.importKey(
-      "jwk",
-      peer.identity_private_jwk,
-      { name: "ECDSA", namedCurve: "P-256" },
-      false,
-      ["sign"],
-    );
-    const signature = new Uint8Array(
-      await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, privateKey, transcript),
-    );
-    if (signature.length !== 64) {
-      throw new Error(`browser ECDSA signature is ${signature.length} bytes, expected raw r||s`);
-    }
-    return signature;
-  }
+  // 그리고 브라우저가 **새로** 만든 서명을 Rust가 되검증한다(하네스 바깥에서).
+  const deviceIdentity = {
+    privateKey: await importJwk(fixture.device.identity_private_jwk, ECDSA_P256, ["sign"]),
+  };
+  const browserSignature = await signTranscript(deviceIdentity, transcript);
 
-  async function deriveSharedSecret(privatePeer, publicPeer) {
-    const privateKey = await crypto.subtle.importKey(
-      "jwk",
-      privatePeer.ephemeral_private_jwk,
-      { name: "ECDH", namedCurve: "P-256" },
-      false,
-      ["deriveBits"],
-    );
-    const publicKey = await crypto.subtle.importKey(
-      "raw",
-      bytesFromHex(publicPeer.ephemeral_public_sec1_hex),
-      { name: "ECDH", namedCurve: "P-256" },
-      false,
-      [],
-    );
-    return crypto.subtle.deriveBits({ name: "ECDH", public: publicKey }, privateKey, 256);
-  }
+  const [desktopEphemeral, deviceEphemeral] = await Promise.all([
+    importJwk(fixture.desktop.ephemeral_private_jwk, ECDH_P256, ["deriveBits"]),
+    importJwk(fixture.device.ephemeral_private_jwk, ECDH_P256, ["deriveBits"]),
+  ]);
+  const [desktopShared, deviceShared] = await Promise.all([
+    deriveSharedSecret(desktopEphemeral, bytesFromHex(fixture.device.ephemeral_public_sec1_hex)),
+    deriveSharedSecret(deviceEphemeral, bytesFromHex(fixture.desktop.ephemeral_public_sec1_hex)),
+  ]);
+  assertEqual(hexFromBytes(desktopShared), fixture.shared_secret_hex, "desktop ECDH");
+  assertEqual(hexFromBytes(deviceShared), fixture.shared_secret_hex, "device ECDH");
 
-  async function deriveHkdf(sharedSecret, salt, info, bitLength) {
-    const key = await crypto.subtle.importKey("raw", sharedSecret, "HKDF", false, ["deriveBits"]);
-    return crypto.subtle.deriveBits(
-      {
-        name: "HKDF",
-        hash: "SHA-256",
-        salt,
-        info: encoder.encode(info),
-      },
-      key,
-      bitLength,
-    );
-  }
+  assertEqual(
+    hexFromBytes(await transcriptSalt(transcript)),
+    fixture.hkdf_salt_hex,
+    "HKDF salt",
+  );
 
-  async function verifyEnvelope(vector, keyHex, senderFingerprint, recipientFingerprint) {
-    const connectionId = fixedBytes(fixture.connection_id_hex, 16, "connection id");
-    const ciphertext = bytesFromHex(vector.ciphertext_and_tag_hex);
-    const sequence = BigInt(vector.sequence);
-    const nonce = buildEnvelopeNonce(vector.direction, sequence);
-    const aad = buildEnvelopeAad(
-      fixture.protocol_version,
+  const material = await deriveSessionMaterial(desktopShared, transcript);
+  assertEqual(hexFromBytes(material.salt), fixture.hkdf_salt_hex, "세션 재료의 HKDF salt");
+  assertEqual(
+    hexFromBytes(material.desktopToDeviceKeyBytes),
+    fixture.desktop_to_device_key_hex,
+    "desktop-to-device HKDF",
+  );
+  assertEqual(
+    hexFromBytes(material.deviceToDesktopKeyBytes),
+    fixture.device_to_desktop_key_hex,
+    "device-to-desktop HKDF",
+  );
+  assertEqual(material.sas, fixture.sas, "SAS");
+
+  // 양쪽 채널을 프로덕션 클래스로 세운다. 같은 키를 두 역할이 반대 방향으로 잡는다.
+  const [desktopToDeviceKey, deviceToDesktopKey] = await Promise.all([
+    importGcmKey(material.desktopToDeviceKeyBytes),
+    importGcmKey(material.deviceToDesktopKeyBytes),
+  ]);
+  const desktop = {
+    fingerprint: desktopFingerprint,
+    channel: new RelaySecureChannel({
+      protocolVersion: fixture.protocol_version,
       connectionId,
-      vector.direction,
-      sequence,
-      senderFingerprint,
-      recipientFingerprint,
-      ciphertext.length,
-    );
-    assertEqual(hexFromBytes(nonce), vector.nonce_hex, `${vector.direction} nonce`);
-    assertEqual(hexFromBytes(aad), vector.aad_hex, `${vector.direction} AAD`);
+      sendKey: desktopToDeviceKey,
+      receiveKey: deviceToDesktopKey,
+      sendDirection: DIRECTION.DESKTOP_TO_DEVICE,
+      receiveDirection: DIRECTION.DEVICE_TO_DESKTOP,
+      ownFingerprint: desktopFingerprint,
+      peerFingerprint: deviceFingerprint,
+    }),
+  };
+  const device = {
+    fingerprint: deviceFingerprint,
+    channel: new RelaySecureChannel({
+      protocolVersion: fixture.protocol_version,
+      connectionId,
+      sendKey: deviceToDesktopKey,
+      receiveKey: desktopToDeviceKey,
+      sendDirection: DIRECTION.DEVICE_TO_DESKTOP,
+      receiveDirection: DIRECTION.DESKTOP_TO_DEVICE,
+      ownFingerprint: deviceFingerprint,
+      peerFingerprint: desktopFingerprint,
+    }),
+  };
 
-    const key = await crypto.subtle.importKey(
-      "raw",
-      bytesFromHex(keyHex),
-      { name: "AES-GCM" },
-      false,
-      ["encrypt", "decrypt"],
-    );
-    const algorithm = {
-      name: "AES-GCM",
-      iv: nonce,
-      additionalData: aad,
-      tagLength: 128,
-    };
-    const plaintext = await crypto.subtle.decrypt(
-      algorithm,
-      key,
-      ciphertext,
-    );
-    assertEqual(hexFromBytes(plaintext), vector.plaintext_hex, `${vector.direction} decrypt`);
-    const encrypted = await crypto.subtle.encrypt(
-      algorithm,
-      key,
-      bytesFromHex(vector.plaintext_hex),
-    );
-    assertEqual(
-      hexFromBytes(encrypted),
-      vector.ciphertext_and_tag_hex,
-      `${vector.direction} encrypt`,
-    );
-  }
+  await verifyEnvelope(fixture.desktop_to_device, desktop, device, "desktop-to-device");
+  await verifyEnvelope(fixture.device_to_desktop, device, desktop, "device-to-desktop");
 
-  async function run() {
-    if (!globalThis.crypto?.subtle) {
-      throw new Error("WebCrypto SubtleCrypto is unavailable");
-    }
+  document.body.dataset.status = "ok";
+  document.body.textContent = `RELAY_WEBCRYPTO_OK:${hexFromBytes(browserSignature)}`;
+}
 
-    const transcript = buildTranscript(fixture);
-    assertEqual(hexFromBytes(transcript), fixture.transcript_hex, "handshake transcript");
-    const [desktopFingerprint, deviceFingerprint] = await Promise.all([
-      sha256(fixedBytes(fixture.desktop.identity_public_sec1_hex, 65, "desktop identity")),
-      sha256(fixedBytes(fixture.device.identity_public_sec1_hex, 65, "device identity")),
-    ]);
-    await Promise.all([
-      verifySignature(fixture.desktop, transcript),
-      verifySignature(fixture.device, transcript),
-    ]);
-    const browserSignature = await signTranscript(fixture.device, transcript);
-
-    const [desktopShared, deviceShared] = await Promise.all([
-      deriveSharedSecret(fixture.desktop, fixture.device),
-      deriveSharedSecret(fixture.device, fixture.desktop),
-    ]);
-    assertEqual(hexFromBytes(desktopShared), fixture.shared_secret_hex, "desktop ECDH");
-    assertEqual(hexFromBytes(deviceShared), fixture.shared_secret_hex, "device ECDH");
-
-    const transcriptSaltInput = new Uint8Array([
-      ...encoder.encode("deppy-relay-hkdf-salt-v1\0"),
-      ...transcript,
-    ]);
-    const transcriptSalt = await sha256(transcriptSaltInput);
-    assertEqual(hexFromBytes(transcriptSalt), fixture.hkdf_salt_hex, "HKDF salt");
-
-    const desktopToDevice = await deriveHkdf(
-      desktopShared,
-      transcriptSalt,
-      "deppy-relay-desktop-to-device-v1\0",
-      256,
-    );
-    const deviceToDesktop = await deriveHkdf(
-      desktopShared,
-      transcriptSalt,
-      "deppy-relay-device-to-desktop-v1\0",
-      256,
-    );
-    assertEqual(
-      hexFromBytes(desktopToDevice),
-      fixture.desktop_to_device_key_hex,
-      "desktop-to-device HKDF",
-    );
-    assertEqual(
-      hexFromBytes(deviceToDesktop),
-      fixture.device_to_desktop_key_hex,
-      "device-to-desktop HKDF",
-    );
-
-    const sasBytes = new Uint8Array(
-      await deriveHkdf(desktopShared, transcriptSalt, "deppy-relay-sas-v1\0", 32),
-    );
-    const sasNumber =
-      (((sasBytes[0] << 24) >>> 0) |
-        (sasBytes[1] << 16) |
-        (sasBytes[2] << 8) |
-        sasBytes[3]) >>>
-      0;
-    assertEqual(String(sasNumber % 1_000_000).padStart(6, "0"), fixture.sas, "SAS");
-
-    await verifyEnvelope(
-      fixture.desktop_to_device,
-      fixture.desktop_to_device_key_hex,
-      desktopFingerprint,
-      deviceFingerprint,
-    );
-    await verifyEnvelope(
-      fixture.device_to_desktop,
-      fixture.device_to_desktop_key_hex,
-      deviceFingerprint,
-      desktopFingerprint,
-    );
-    document.body.dataset.status = "ok";
-    document.body.textContent = `RELAY_WEBCRYPTO_OK:${hexFromBytes(browserSignature)}`;
-  }
-
-  run().catch((error) => {
-    document.body.dataset.status = "error";
-    document.body.textContent = `RELAY_WEBCRYPTO_ERROR:${error?.stack ?? error}`;
-  });
-})();
+run().catch((error) => {
+  document.body.dataset.status = "error";
+  document.body.textContent = `RELAY_WEBCRYPTO_ERROR:${error?.stack ?? error}`;
+});

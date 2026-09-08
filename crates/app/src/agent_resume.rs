@@ -45,6 +45,7 @@ enum ResumeProvider {
     Claude,
     Codex,
     Kimi,
+    Grok,
     QwenCode,
 }
 
@@ -54,6 +55,7 @@ impl ResumeProvider {
             "deppy-builtin-claude" => Some(Self::Claude),
             "deppy-builtin-codex" => Some(Self::Codex),
             "deppy-builtin-kimi" => Some(Self::Kimi),
+            "deppy-builtin-grok" => Some(Self::Grok),
             "deppy-builtin-qwen-code" => Some(Self::QwenCode),
             _ => None,
         }
@@ -64,6 +66,7 @@ impl ResumeProvider {
             "claude" => Some(Self::Claude),
             "codex" => Some(Self::Codex),
             "kimi" => Some(Self::Kimi),
+            "grok" => Some(Self::Grok),
             "qwen-code" | "qwen" => Some(Self::QwenCode),
             _ => None,
         }
@@ -71,7 +74,8 @@ impl ResumeProvider {
 
     fn recent_args(self) -> Vec<String> {
         match self {
-            Self::Claude | Self::Kimi => vec!["-c".to_owned()],
+            // Grok 1.0.13 `--help` 실측: `-c, --continue`는 현재 cwd의 최근 세션.
+            Self::Claude | Self::Kimi | Self::Grok => vec!["-c".to_owned()],
             Self::Codex => vec!["resume".to_owned(), "--last".to_owned()],
             Self::QwenCode => vec!["--continue".to_owned()],
         }
@@ -79,7 +83,9 @@ impl ResumeProvider {
 
     fn exact_args(self, session_id: &str) -> Vec<String> {
         match self {
-            Self::Claude | Self::QwenCode => {
+            // Grok 1.0.13 `--help` 실측: `--resume <SESSION_ID_OR_TITLE>`에서 UUID는
+            // 항상 세션 ID로 해석한다.
+            Self::Claude | Self::Grok | Self::QwenCode => {
                 vec!["--resume".to_owned(), session_id.to_owned()]
             }
             Self::Codex => vec!["resume".to_owned(), session_id.to_owned()],
@@ -147,6 +153,11 @@ mod tests {
                 vec!["--session", "kimi-session"],
             ),
             (
+                "deppy-builtin-grok",
+                "grok",
+                vec!["--resume", "grok-session"],
+            ),
+            (
                 "deppy-builtin-qwen-code",
                 "qwen-code",
                 vec!["--resume", "qwen-session"],
@@ -170,6 +181,7 @@ mod tests {
             ("deppy-builtin-claude", vec!["-c"]),
             ("deppy-builtin-codex", vec!["resume", "--last"]),
             ("deppy-builtin-kimi", vec!["-c"]),
+            ("deppy-builtin-grok", vec!["-c"]),
             ("deppy-builtin-qwen-code", vec!["--continue"]),
         ];
 

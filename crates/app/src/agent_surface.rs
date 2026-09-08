@@ -17,6 +17,7 @@ pub enum AgentProvider {
     Codex,
     Claude,
     Kimi,
+    Grok,
 }
 
 impl AgentProvider {
@@ -25,6 +26,7 @@ impl AgentProvider {
             Self::Codex => "Codex",
             Self::Claude => "Claude",
             Self::Kimi => "Kimi",
+            Self::Grok => "Grok",
         }
     }
 }
@@ -35,6 +37,7 @@ impl From<AgentKind> for AgentProvider {
             AgentKind::Codex => Self::Codex,
             AgentKind::Claude => Self::Claude,
             AgentKind::Kimi => Self::Kimi,
+            AgentKind::Grok => Self::Grok,
         }
     }
 }

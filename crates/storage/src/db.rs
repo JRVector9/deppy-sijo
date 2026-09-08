@@ -2,7 +2,7 @@ use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use sha2::{Digest as _, Sha256};
 
 const RESOLVED_APPROVAL_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
@@ -216,6 +216,8 @@ impl std::fmt::Debug for ActivePendingApprovalOwner {
 ///     기존 행은 NULL이고 NULL이면 instruction+agent_summary만 보여주는 기존 렌더로 떨어진다.
 /// 37: Relay public device metadata and verified pending approvals. Private identities, pairing
 ///     secrets, transport credentials, and terminal payloads are intentionally absent.
+/// 38: Relay reconnect verifier, 39: Relay authorization epoch.
+/// 40: physical secret recovery generation for startup cleanup ABA protection.
 /// 4~6은 각 crate가 소유한 DDL 상수를 그대로 붙인다 (스키마 정의는 한 곳에서만).
 pub(crate) const MIGRATIONS: &[&str] = &[
     "
@@ -793,6 +795,26 @@ CREATE TABLE relay_devices (
 CREATE INDEX idx_relay_devices_recency
     ON relay_devices(revoked_at, last_seen_at DESC, issued_at DESC, device_id);
 ",
+    // v38: 재접속 raw grant는 브라우저에만 있고 DB는 검증자만 보존한다.
+    "ALTER TABLE relay_devices ADD COLUMN reconnect_verifier BLOB
+        CHECK (reconnect_verifier IS NULL OR
+            (typeof(reconnect_verifier) = 'blob' AND length(reconnect_verifier) = 32));",
+    // v39: 승인마다 바뀌는 공개 세대 표식. 기기 키·권한·만료·검증자는 그대로 보존한다.
+    "ALTER TABLE relay_devices ADD COLUMN authorization_epoch BLOB NOT NULL
+        DEFAULT X'00000000000000000000000000000000'
+        CHECK (typeof(authorization_epoch) = 'blob' AND length(authorization_epoch) = 16);
+     UPDATE relay_devices SET authorization_epoch = randomblob(16);",
+    // v40: 지연 복구 후보를 행 재생성과 구분한다. 비밀이나 시각 기반 cutoff가 아니다.
+    "ALTER TABLE physical_secret_slot_ledger ADD COLUMN recovery_generation BLOB NOT NULL
+        DEFAULT X'00000000000000000000000000000000'
+        CHECK(typeof(recovery_generation) = 'blob' AND length(recovery_generation) = 16);
+     UPDATE physical_secret_slot_ledger SET recovery_generation = randomblob(16);
+     CREATE TRIGGER physical_secret_slot_fresh_recovery_generation
+     AFTER INSERT ON physical_secret_slot_ledger
+     BEGIN
+       UPDATE physical_secret_slot_ledger SET recovery_generation = randomblob(16)
+       WHERE physical_slot = NEW.physical_slot;
+     END;",
 ];
 
 /// 옵션2: 저장된 에이전트 세션 한 행 — 재시작 복원 시 native resume에 쓴다.
@@ -1243,9 +1265,9 @@ pub struct AgentStateSnapshot {
     /// 기록. waiting처럼 전역(모든 워크스페이스)이며 2분 stale 창으로 자기치유된다.
     pub working_sessions: Vec<String>,
     pub agent_sessions: Vec<AgentSessionRow>,
-    /// 전 워크스페이스 스코프의 `(workspace_id, pane_id)` 존재 여부 — warm(비활성)
-    /// 워크스페이스 사이드바 행의 「이어가기」 노출 판정용. `include_global_agent_sessions`가
-    /// false면 비어 있다.
+    /// 전 워크스페이스 스코프에서 실제 resume 명령이 있는 provider의
+    /// `(workspace_id, pane_id)` 존재 여부 — warm(비활성) 워크스페이스 사이드바 행의
+    /// 「이어가기」 노출 판정용. `include_global_agent_sessions`가 false면 비어 있다.
     pub global_agent_sessions: Vec<(String, String)>,
     pub archived_agent_resume: Vec<ArchivedAgentResumeRow>,
     pub structured_threads: Vec<StructuredThreadRow>,
@@ -1874,12 +1896,13 @@ const AGENT_SESSIONS_BOUNDED_SELECT: &str = "SELECT pane_id, kind, session_id
     ORDER BY updated_at DESC, substr(CAST(pane_id AS BLOB), 1, ?3), rowid LIMIT ?2";
 
 // 전 워크스페이스 스코프 — warm(비활성) 사이드바 행의 「이어가기」 노출 판정에는
-// pane_id 존재 여부만 있으면 된다(실제 kind/session_id는 전환 후 stage_agent_resume가
-// 새로 로드된 활성 workspace의 restore_agents에서 다시 읽는다). ACTIVITY_PANES_BOUNDED_*
+// 실제 live-pane resume 명령이 있는 Claude/Codex/Grok의 pane_id만 있으면 된다. kind/session_id는
+// 전환 후 stage_agent_resume가 새 활성 workspace의 restore_agents에서 다시 읽는다.
+// ACTIVITY_PANES_BOUNDED_*
 // (전 워크스페이스, LIMIT+tie-breaker)와 동일한 패턴 — 전 워크스페이스로 넓힐수록
 // 상한이 더 중요해진다는 원칙을 그대로 따른다.
 const AGENT_SESSIONS_GLOBAL_BOUNDED_PREFLIGHT: &str = "WITH selected AS MATERIALIZED (
-    SELECT rowid FROM agent_sessions
+    SELECT rowid FROM agent_sessions WHERE kind IN ('claude', 'codex', 'grok')
      ORDER BY updated_at DESC,
               substr(CAST(workspace_id AS BLOB), 1, ?2),
               substr(CAST(pane_id AS BLOB), 1, ?2), rowid LIMIT ?1
@@ -1895,7 +1918,7 @@ SELECT COUNT(*), COALESCE(SUM(CASE WHEN
     OR row_bytes > ?3 THEN 1 ELSE 0 END), 0),
     COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0) FROM sized";
 const AGENT_SESSIONS_GLOBAL_BOUNDED_SELECT: &str = "SELECT workspace_id, pane_id
-    FROM agent_sessions
+    FROM agent_sessions WHERE kind IN ('claude', 'codex', 'grok')
     ORDER BY updated_at DESC,
              substr(CAST(workspace_id AS BLOB), 1, ?2),
              substr(CAST(pane_id AS BLOB), 1, ?2), rowid LIMIT ?1";
@@ -3218,6 +3241,8 @@ impl PhysicalSecretSlotState {
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct PhysicalSecretSlotLedgerRow {
+    /// 행 재생성마다 바뀌는 공개 복구 세대. startup snapshot의 ABA 방지용이다.
+    pub recovery_generation: [u8; 16],
     pub logical_credential_id: String,
     pub physical_slot: String,
     pub state: PhysicalSecretSlotState,
@@ -3426,6 +3451,7 @@ pub struct RelayDeviceRow {
     pub device_expires_at: i64,
     pub last_seen_at: Option<i64>,
     pub revoked_at: Option<i64>,
+    pub authorization_epoch: [u8; 16],
 }
 
 impl std::fmt::Debug for RelayDeviceRow {
@@ -3441,6 +3467,9 @@ impl std::fmt::Debug for RelayDeviceRow {
 pub enum RelayPendingInsert {
     Stored,
     LimitReached,
+    /// 다른 주체의 미완 의식과 id 또는 키가 겹친다. 같은 기기의 재시도는 대체되므로
+    /// 여기 오지 않는다.
+    Conflict,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -5195,6 +5224,7 @@ fn relay_device_from_row(row: &rusqlite::Row<'_>) -> anyhow::Result<RelayDeviceR
         device_expires_at: row.get(8)?,
         last_seen_at: row.get(9)?,
         revoked_at: row.get(10)?,
+        authorization_epoch: relay_blob(row, 11)?,
     };
     anyhow::ensure!(
         device.identity_public_sec1[0] == 0x04
@@ -5211,11 +5241,70 @@ fn relay_device_from_row(row: &rusqlite::Row<'_>) -> anyhow::Result<RelayDeviceR
     Ok(device)
 }
 
+fn sqlite_column_exists(
+    conn: &Connection,
+    table: &'static str,
+    column: &str,
+) -> anyhow::Result<bool> {
+    let query = match table {
+        "relay_devices" => {
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('relay_devices') WHERE name = ?1)"
+        }
+        "physical_secret_slot_ledger" => {
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('physical_secret_slot_ledger') WHERE name = ?1)"
+        }
+        _ => anyhow::bail!("지원하지 않는 SQLite 테이블 검사입니다"),
+    };
+    Ok(conn.query_row(query, [column], |row| row.get(0))?)
+}
+
+/// 서로 다른 개발 브랜치가 같은 migration 번호를 사용했던 DB를 정식 원장으로
+/// 오인하면 뒤 migration이 잘못된 스키마에 적용된다. v38/v39만 읽기 snapshot에서
+/// 지문을 확인하고, 정식 Relay 원장과 다른 형태는 데이터 변경 전에 중단한다.
+pub(crate) fn reject_noncanonical_development_schema(path: &Path) -> anyhow::Result<()> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("SQLite metadata 확인 실패: {}", path.display()));
+        }
+    };
+    if !metadata.is_file() {
+        return Ok(());
+    }
+
+    let mut conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("SQLite schema 확인 실패: {}", path.display()))?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    let tx = conn.transaction()?;
+    let version = storage_core::read_user_version(&tx)?;
+    if !(38..=39).contains(&version) {
+        return Ok(());
+    }
+
+    let has_reconnect = sqlite_column_exists(&tx, "relay_devices", "reconnect_verifier")?;
+    let has_epoch = sqlite_column_exists(&tx, "relay_devices", "authorization_epoch")?;
+    let has_recovery =
+        sqlite_column_exists(&tx, "physical_secret_slot_ledger", "recovery_generation")?;
+    let canonical = match version {
+        38 => has_reconnect && !has_epoch && !has_recovery,
+        39 => has_reconnect && has_epoch && !has_recovery,
+        _ => unreachable!("v38/v39만 검사한다"),
+    };
+    anyhow::ensure!(
+        canonical,
+        "지원하지 않는 개발용 v{version} SQLite 스키마입니다 — 정식 migration으로 자동 변환하지 않았습니다"
+    );
+    Ok(())
+}
+
 impl Db {
     /// DB 열기 + 마이그레이션. infra(PRAGMA/백업/IMMEDIATE 러너)는 storage-core가 담당하고
     /// (v2.8 §6.1), 이 crate는 **마이그레이션 원장(MIGRATIONS, v1..vN 순서 불변)** 조립과
     /// 앱 수준 store/facade만 소유한다.
     pub fn open(path: &Path) -> anyhow::Result<Self> {
+        reject_noncanonical_development_schema(path)?;
         let conn = storage_core::open_with_migrations(path, MIGRATIONS)?;
         let authorization_db_identity = physical_db_identity(path)?;
         Ok(Self {
@@ -5601,6 +5690,71 @@ impl Db {
             .context("physical secret slot staging 등록 commit 실패")
     }
 
+    /// startup에 DB만 읽어 캡처한 후보의 세대·상태를 다시 확인한다.
+    /// cleanup은 이 트랜잭션 안에서 실행하여 삭제/재생성·publish와 키 삭제의 ABA를 막는다.
+    /// UI에서 호출하지 않으며 callback은 이 Db에 재진입하면 안 된다.
+    pub fn recover_physical_secret_slot_cas(
+        &self,
+        candidate: &PhysicalSecretSlotLedgerRow,
+        cleanup: impl FnOnce() -> anyhow::Result<()>,
+    ) -> anyhow::Result<bool> {
+        validate_owned_physical_secret_slot(
+            &candidate.logical_credential_id,
+            &candidate.physical_slot,
+        )?;
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let current = tx
+            .query_row(
+                "SELECT logical_credential_id, state, legacy_cleanup_username, recovery_generation
+             FROM physical_secret_slot_ledger WHERE physical_slot = ?1",
+                [&candidate.physical_slot],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((logical, state, legacy, generation)) = current else {
+            return Ok(false);
+        };
+        if logical != candidate.logical_credential_id
+            || state != candidate.state.as_str()
+            || legacy != candidate.legacy_cleanup_username
+            || generation != candidate.recovery_generation
+        {
+            return Ok(false);
+        }
+        let references: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM credentials WHERE keyring_username = ?1",
+            [&candidate.physical_slot],
+            |row| row.get(0),
+        )?;
+        if candidate.state == PhysicalSecretSlotState::Published {
+            // 현재 access 슬롯을 읽거나 지우지 않는다. 남은 이전 username만 정리한다.
+            if legacy.is_none() {
+                return Ok(false);
+            }
+            anyhow::ensure!(
+                references == 1,
+                "secret recovery published reference invalid"
+            );
+        } else {
+            anyhow::ensure!(references == 0, "secret recovery candidate referenced");
+        }
+        cleanup()?;
+        if candidate.state == PhysicalSecretSlotState::Published {
+            tx.execute("UPDATE physical_secret_slot_ledger SET legacy_cleanup_username = NULL WHERE physical_slot = ?1 AND recovery_generation = ?2", rusqlite::params![candidate.physical_slot, candidate.recovery_generation.as_slice()])?;
+        } else {
+            tx.execute("DELETE FROM physical_secret_slot_ledger WHERE physical_slot = ?1 AND recovery_generation = ?2", rusqlite::params![candidate.physical_slot, candidate.recovery_generation.as_slice()])?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// Acknowledge that an exact staging/orphan keyring bundle is absent or was deleted. Published
     /// slots are never acknowledged away because they are still a live credential capability.
     pub fn acknowledge_physical_secret_slot_deleted(
@@ -5702,7 +5856,8 @@ impl Db {
                          WHERE c.keyring_username = ledger.physical_slot),
                         (SELECT COUNT(*) FROM credentials c
                          WHERE c.id = ledger.logical_credential_id
-                           AND c.keyring_username = ledger.physical_slot)
+                           AND c.keyring_username = ledger.physical_slot),
+                        ledger.recovery_generation
                  FROM physical_secret_slot_ledger ledger
                  ORDER BY ledger.created_at, ledger.physical_slot LIMIT ?1",
             )?;
@@ -5714,6 +5869,7 @@ impl Db {
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, i64>(4)?,
                     row.get::<_, i64>(5)?,
+                    row.get::<_, Vec<u8>>(6)?,
                 ))
             })?;
             let mut rows = Vec::with_capacity(row_count);
@@ -5725,6 +5881,7 @@ impl Db {
                     legacy_cleanup_username,
                     any_refs,
                     exact_refs,
+                    recovery_generation,
                 ) = row?;
                 validate_owned_physical_secret_slot(&logical_credential_id, &physical_slot)?;
                 if let Some(username) = legacy_cleanup_username.as_deref() {
@@ -5744,6 +5901,9 @@ impl Db {
                     }
                 }
                 rows.push(PhysicalSecretSlotLedgerRow {
+                    recovery_generation: recovery_generation
+                        .try_into()
+                        .map_err(|_| anyhow::anyhow!("secret recovery generation invalid"))?,
                     logical_credential_id,
                     physical_slot,
                     state,
@@ -9915,7 +10075,19 @@ impl Db {
             [trusted_now],
         )
         .context("relay pending device expiry cleanup failed")?;
-        let duplicate: bool = tx.query_row(
+        // 같은 기기(device_id **그리고** 공개키가 모두 같음)가 미완의 의식을 버리고 다시
+        // 페어링하는 경우는 새 검증 승인이 옛것을 대체한다 — 5분을 기다리게 할 이유가 없다.
+        // 그 밖의 부분 겹침(id만 같거나 키만 같음)은 다른 주체가 끼어든 것이므로 결정적으로
+        // 거절한다. 불투명 오류가 아니라 호출자가 분기할 수 있는 값이다.
+        let superseded = tx.execute(
+            "DELETE FROM relay_pending_devices
+             WHERE device_id = ?1 AND identity_public_sec1 = ?2",
+            rusqlite::params![
+                pending.device_id.as_slice(),
+                pending.identity_public_sec1.as_slice(),
+            ],
+        )?;
+        let conflict: bool = tx.query_row(
             "SELECT EXISTS(
                  SELECT 1 FROM relay_pending_devices
                  WHERE pairing_id = ?1 OR device_id = ?2 OR identity_public_sec1 = ?3
@@ -9927,7 +10099,11 @@ impl Db {
             ],
             |row| row.get(0),
         )?;
-        anyhow::ensure!(!duplicate, "relay pending device already exists");
+        if conflict {
+            // 대체로 지운 행이 있었더라도 롤백된다 — 트랜잭션이 커밋되지 않는다.
+            let _ = superseded;
+            return Ok(RelayPendingInsert::Conflict);
+        }
         let count: i64 = tx.query_row("SELECT COUNT(*) FROM relay_pending_devices", [], |row| {
             row.get(0)
         })?;
@@ -10012,22 +10188,56 @@ impl Db {
             [pending.device_id.as_slice()],
             |row| row.get(0),
         )?;
+        // 같은 공개키를 가진 옛 행(다른 device_id)은 같은 폰의 이전 페어링이다. 취소된 뒤
+        // 새 device_id로 다시 페어링하는 정상 경로이므로 옛 행을 지우고 새로 발행한다 —
+        // 그러지 않으면 identity UNIQUE에 걸려 불투명하게 실패하고 pending 행만 남는다.
+        tx.execute(
+            "DELETE FROM relay_devices
+             WHERE identity_public_sec1 = ?1 AND device_id != ?2",
+            rusqlite::params![
+                pending.identity_public_sec1.as_slice(),
+                pending.device_id.as_slice(),
+            ],
+        )?;
         if !existing {
-            let count: i64 =
-                tx.query_row("SELECT COUNT(*) FROM relay_devices", [], |row| row.get(0))?;
-            if usize::try_from(count).context("relay device count invalid")?
+            // 상한은 **살아 있는** 기기 수다. 취소된 행까지 세면 64대를 페어링하고 전부
+            // 취소한 뒤 65번째부터 영영 막힌다. 표 자체의 크기도 상한을 지키도록, 자리가
+            // 없으면 가장 오래전에 취소된 행부터 필요한 만큼만 지운다.
+            let active: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM relay_devices WHERE revoked_at IS NULL",
+                [],
+                |row| row.get(0),
+            )?;
+            if usize::try_from(active).context("relay device count invalid")?
                 >= RELAY_DEVICE_ROWS_MAX
             {
                 return Ok(RelayDeviceApproval::DeviceLimitReached);
             }
+            let total: i64 =
+                tx.query_row("SELECT COUNT(*) FROM relay_devices", [], |row| row.get(0))?;
+            let total = usize::try_from(total).context("relay device count invalid")?;
+            if total >= RELAY_DEVICE_ROWS_MAX {
+                let reclaim = i64::try_from(total - RELAY_DEVICE_ROWS_MAX + 1)?;
+                tx.execute(
+                    "DELETE FROM relay_devices WHERE device_id IN (
+                         SELECT device_id FROM relay_devices
+                         WHERE revoked_at IS NOT NULL
+                         ORDER BY revoked_at ASC, device_id ASC
+                         LIMIT ?1
+                     )",
+                    [reclaim],
+                )?;
+            }
         }
 
+        // 시각과 별개인 세대라 같은 초의 재승인·삭제 후 재생성도 이전 채널과 구분된다.
+        let authorization_epoch = *uuid::Uuid::new_v4().as_bytes();
         tx.execute(
             "INSERT INTO relay_devices (
                  device_id, identity_public_sec1, display_name,
                  permission_view, permission_input, permission_upload, permission_approval,
-                 issued_at, device_expires_at, last_seen_at, revoked_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL)
+                 issued_at, device_expires_at, last_seen_at, revoked_at, authorization_epoch
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL, ?10)
              ON CONFLICT(device_id) DO UPDATE SET
                  identity_public_sec1 = excluded.identity_public_sec1,
                  display_name = excluded.display_name,
@@ -10038,7 +10248,9 @@ impl Db {
                  issued_at = excluded.issued_at,
                  device_expires_at = excluded.device_expires_at,
                  last_seen_at = NULL,
-                 revoked_at = NULL",
+                 revoked_at = NULL,
+                 reconnect_verifier = NULL,
+                 authorization_epoch = excluded.authorization_epoch",
             rusqlite::params![
                 pending.device_id.as_slice(),
                 pending.identity_public_sec1.as_slice(),
@@ -10049,6 +10261,7 @@ impl Db {
                 pending.permission_approval,
                 approved_at,
                 pending.device_expires_at,
+                authorization_epoch.as_slice(),
             ],
         )
         .context("relay device approval publish failed")?;
@@ -10071,6 +10284,7 @@ impl Db {
             device_expires_at: pending.device_expires_at,
             last_seen_at: None,
             revoked_at: None,
+            authorization_epoch,
         }))
     }
 
@@ -10119,12 +10333,50 @@ impl Db {
         let mut statement = self.conn.prepare_cached(
             "SELECT device_id, identity_public_sec1, display_name,
                     permission_view, permission_input, permission_upload, permission_approval,
-                    issued_at, device_expires_at, last_seen_at, revoked_at
+                    issued_at, device_expires_at, last_seen_at, revoked_at, authorization_epoch
              FROM relay_devices WHERE device_id = ?1",
         )?;
         let mut rows = statement.query([device_id.as_slice()])?;
         match rows.next()? {
             Some(row) => Ok(Some(relay_device_from_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// 승인된 동일 신원에만 검증자를 처음 저장하거나 같은 값으로 재시도한다.
+    pub fn store_relay_reconnect_verifier(
+        &self,
+        device_id: &[u8; 16],
+        identity: &[u8; 65],
+        verifier: &[u8; 32],
+        now: i64,
+    ) -> anyhow::Result<bool> {
+        anyhow::ensure!(now >= 0, "relay reconnect timestamp invalid");
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE relay_devices SET reconnect_verifier = ?3
+             WHERE device_id = ?1 AND identity_public_sec1 = ?2 AND revoked_at IS NULL
+               AND issued_at <= ?4 AND device_expires_at > ?4 AND permission_view = 1
+               AND (reconnect_verifier IS NULL OR reconnect_verifier = ?3)",
+            rusqlite::params![
+                device_id.as_slice(),
+                identity.as_slice(),
+                verifier.as_slice(),
+                now
+            ],
+        )?;
+        tx.commit()?;
+        Ok(changed == 1)
+    }
+
+    pub fn relay_reconnect_verifier(
+        &self,
+        device_id: &[u8; 16],
+    ) -> anyhow::Result<Option<[u8; 32]>> {
+        let mut statement = self.conn.prepare_cached("SELECT reconnect_verifier FROM relay_devices WHERE device_id = ?1 AND reconnect_verifier IS NOT NULL")?;
+        let mut rows = statement.query([device_id.as_slice()])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(relay_blob(row, 0)?)),
             None => Ok(None),
         }
     }
@@ -10153,7 +10405,7 @@ impl Db {
             let mut statement = tx.prepare_cached(
                 "SELECT device_id, identity_public_sec1, display_name,
                         permission_view, permission_input, permission_upload, permission_approval,
-                        issued_at, device_expires_at, last_seen_at, revoked_at
+                        issued_at, device_expires_at, last_seen_at, revoked_at, authorization_epoch
                  FROM relay_devices
                  ORDER BY revoked_at, last_seen_at DESC, issued_at DESC, device_id
                  LIMIT ?1",
@@ -10191,7 +10443,7 @@ impl Db {
         );
         if existing_revocation.is_none() {
             tx.execute(
-                "UPDATE relay_devices SET revoked_at = ?2
+                "UPDATE relay_devices SET revoked_at = ?2, reconnect_verifier = NULL
                  WHERE device_id = ?1 AND revoked_at IS NULL",
                 rusqlite::params![device_id.as_slice(), revoked_at],
             )?;
@@ -11781,6 +12033,248 @@ mod tests {
         }
     }
 
+    fn assert_relay_authorization_changes_without_clock_advance(recreate: bool) {
+        let (dir, _, db) = file_db("relay-authorization-generation");
+        let first = relay_pending_row(1, 2, 3);
+        let approve = |pending: &RelayPendingDeviceRow| {
+            db.insert_relay_pending_device(pending, pending.issued_at)
+                .unwrap();
+            let RelayDeviceApproval::Approved(row) = db
+                .approve_relay_pending_device(
+                    &pending.pairing_id,
+                    &pending.identity_public_sec1,
+                    pending.issued_at + 1,
+                )
+                .unwrap()
+            else {
+                panic!("승인 실패")
+            };
+            row
+        };
+        let before = approve(&first);
+        if recreate {
+            db.conn
+                .execute(
+                    "DELETE FROM relay_devices WHERE device_id = ?1",
+                    [first.device_id.as_slice()],
+                )
+                .unwrap();
+        }
+        let after = approve(&relay_pending_row(4, 2, 3));
+        assert_ne!(
+            before, after,
+            "같은 시각의 재승인/재생성도 새 인가여야 한다"
+        );
+        assert_eq!(before.issued_at, after.issued_at);
+        assert_eq!(before.identity_public_sec1, after.identity_public_sec1);
+        drop(db);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn relay_reapproval_changes_authorization_without_clock_advance() {
+        assert_relay_authorization_changes_without_clock_advance(false);
+    }
+
+    #[test]
+    fn relay_recreated_device_does_not_reuse_its_authorization() {
+        assert_relay_authorization_changes_without_clock_advance(true);
+    }
+
+    #[test]
+    fn relay_authorization_epoch_survives_conflict_and_publish_rollback() {
+        let (dir, _, db) = file_db("relay-epoch-rollback");
+        let first = relay_pending_row(1, 2, 3);
+        db.insert_relay_pending_device(&first, first.issued_at)
+            .unwrap();
+        let RelayDeviceApproval::Approved(before) = db
+            .approve_relay_pending_device(
+                &first.pairing_id,
+                &first.identity_public_sec1,
+                first.issued_at + 1,
+            )
+            .unwrap()
+        else {
+            panic!("승인 실패")
+        };
+        db.store_relay_reconnect_verifier(
+            &first.device_id,
+            &first.identity_public_sec1,
+            &[6; 32],
+            first.issued_at + 2,
+        )
+        .unwrap();
+        let pending = relay_pending_row(4, 2, 3);
+        db.insert_relay_pending_device(&pending, pending.issued_at + 2)
+            .unwrap();
+        assert_eq!(
+            db.insert_relay_pending_device(&relay_pending_row(5, 2, 9), pending.issued_at + 2)
+                .unwrap(),
+            RelayPendingInsert::Conflict
+        );
+        assert_eq!(
+            db.relay_device(&first.device_id).unwrap(),
+            Some(before.clone())
+        );
+        // 새 epoch UPDATE 이후 pending 소비가 실패해도 이전 승인과 verifier가 복원돼야 한다.
+        db.conn.execute_batch("CREATE TRIGGER reject_pending_consume BEFORE DELETE ON relay_pending_devices BEGIN SELECT RAISE(ABORT, 'test rollback'); END;").unwrap();
+        assert!(
+            db.approve_relay_pending_device(
+                &pending.pairing_id,
+                &pending.identity_public_sec1,
+                pending.issued_at + 3
+            )
+            .is_err()
+        );
+        assert_eq!(db.relay_device(&first.device_id).unwrap(), Some(before));
+        assert_eq!(
+            db.relay_reconnect_verifier(&first.device_id).unwrap(),
+            Some([6; 32])
+        );
+        assert!(
+            db.relay_pending_device(&pending.pairing_id)
+                .unwrap()
+                .is_some()
+        );
+        drop(db);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn relay_v38_epoch_backfill_preserves_approved_devices_and_reconnect_verifiers() {
+        let (dir, path, db) = file_db("relay-epoch-backfill");
+        drop(db);
+        // 별도 빈 DB에 v38까지 설치해 기존 승인 행을 직접 만든다.
+        let legacy_path = dir.join("v38.sqlite3");
+        let legacy = storage_core::open_with_migrations(&legacy_path, &MIGRATIONS[..38]).unwrap();
+        let pending = relay_pending_row(1, 2, 3);
+        legacy.execute("INSERT INTO relay_devices (device_id, identity_public_sec1, display_name, permission_view, permission_input, permission_upload, permission_approval, issued_at, device_expires_at, last_seen_at, revoked_at, reconnect_verifier) VALUES (?1, ?2, ?3, 1, 0, 0, 0, ?4, ?5, NULL, NULL, ?6)", rusqlite::params![pending.device_id.as_slice(), pending.identity_public_sec1.as_slice(), pending.display_name, pending.issued_at, pending.device_expires_at, [6u8; 32].as_slice()]).unwrap();
+        let logical = secret::LogicalCredentialId::new("relay-v38-secret").unwrap();
+        let slot = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+        legacy.execute("INSERT INTO physical_secret_slot_ledger (physical_slot,logical_credential_id,state,created_at,updated_at) VALUES (?1,?2,'staging',1,1)", (slot.as_str(),logical.as_str())).unwrap();
+        drop(legacy);
+        let migrated = Db::open(&legacy_path).unwrap();
+        assert_eq!(Db::read_user_version(&migrated.conn).unwrap(), 40);
+        let row = migrated.relay_device(&pending.device_id).unwrap().unwrap();
+        assert_ne!(row.authorization_epoch, [0; 16]);
+        assert_eq!(row.identity_public_sec1, pending.identity_public_sec1);
+        assert_eq!(
+            (row.issued_at, row.device_expires_at),
+            (pending.issued_at, pending.device_expires_at)
+        );
+        assert!(
+            row.permission_view
+                && !row.permission_input
+                && !row.permission_upload
+                && !row.permission_approval
+        );
+        assert_eq!(row.revoked_at, None);
+        assert_eq!(
+            migrated
+                .relay_reconnect_verifier(&pending.device_id)
+                .unwrap(),
+            Some([6; 32])
+        );
+        let recovery = migrated
+            .physical_secret_slots_for_reconciliation(1)
+            .unwrap();
+        assert_eq!(recovery[0].physical_slot, slot.as_str());
+        assert_ne!(recovery[0].recovery_generation, [0; 16]);
+        drop(migrated);
+        let reopened = Db::open(&legacy_path).unwrap();
+        assert_eq!(
+            reopened.relay_device(&pending.device_id).unwrap(),
+            Some(row)
+        );
+        drop(reopened);
+        assert!(path.is_file());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn relay_reconnect_verifier_persists_and_revocation_prevents_reregistration() {
+        let (dir, path, db) = file_db("relay-reconnect");
+        let pending = relay_pending_row(1, 2, 3);
+        db.insert_relay_pending_device(&pending, pending.issued_at)
+            .unwrap();
+        db.approve_relay_pending_device(
+            &pending.pairing_id,
+            &pending.identity_public_sec1,
+            pending.issued_at + 1,
+        )
+        .unwrap();
+        assert!(
+            db.store_relay_reconnect_verifier(
+                &pending.device_id,
+                &pending.identity_public_sec1,
+                &[7; 32],
+                pending.issued_at + 2
+            )
+            .unwrap()
+        );
+        assert!(
+            !db.store_relay_reconnect_verifier(
+                &pending.device_id,
+                &pending.identity_public_sec1,
+                &[8; 32],
+                pending.issued_at + 2
+            )
+            .unwrap()
+        );
+        assert!(
+            !db.store_relay_reconnect_verifier(
+                &pending.device_id,
+                &[9; 65],
+                &[7; 32],
+                pending.issued_at + 2
+            )
+            .unwrap()
+        );
+        assert!(
+            !db.store_relay_reconnect_verifier(
+                &pending.device_id,
+                &pending.identity_public_sec1,
+                &[7; 32],
+                pending.device_expires_at
+            )
+            .unwrap()
+        );
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(
+            db.relay_reconnect_verifier(&pending.device_id).unwrap(),
+            Some([7; 32])
+        );
+        db.revoke_relay_device(&pending.device_id, pending.issued_at + 3)
+            .unwrap();
+        assert_eq!(
+            db.relay_reconnect_verifier(&pending.device_id).unwrap(),
+            None
+        );
+        assert!(
+            !db.store_relay_reconnect_verifier(
+                &pending.device_id,
+                &pending.identity_public_sec1,
+                &[7; 32],
+                pending.issued_at + 4
+            )
+            .unwrap()
+        );
+        drop(db);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn relay_reconnect_schema_stores_only_a_bounded_verifier() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(
+            db.conn
+                .prepare("SELECT reconnect_verifier FROM relay_devices")
+                .is_ok(),
+            "재접속 verifier migration이 필요하다"
+        );
+    }
+
     /// 페어링 마감(5분)과 기기 만료(장기)는 서로 다른 수명이다. 한 컬럼으로 합치면
     /// 5분짜리 승인 창이 24시간으로 늘어나거나 기기가 5분 만에 죽는다.
     #[test]
@@ -11920,11 +12414,17 @@ mod tests {
             db.relay_pending_device_count().unwrap(),
             RELAY_PENDING_DEVICE_ROWS_MAX
         );
-        // 중복(pairing/device/공개키)은 상한과 무관하게 항상 거절이며 조용한 교체가 아니다.
-        let duplicate = relay_filler_row(0);
-        assert!(
-            db.insert_relay_pending_device(&duplicate, duplicate.issued_at)
-                .is_err()
+        // 같은 기기(device_id·공개키 동일)의 재시도는 옛 pending 행을 대체한다 — 행 수는
+        // 그대로다. 상한에 닿아 있어도 대체는 새 행을 늘리지 않으므로 통과한다.
+        let retry = relay_filler_row(0);
+        assert_eq!(
+            db.insert_relay_pending_device(&retry, retry.issued_at)
+                .unwrap(),
+            RelayPendingInsert::Stored
+        );
+        assert_eq!(
+            db.relay_pending_device_count().unwrap(),
+            RELAY_PENDING_DEVICE_ROWS_MAX
         );
 
         for index in 0..RELAY_DEVICE_ROWS_MAX {
@@ -12010,6 +12510,176 @@ mod tests {
             .unwrap(),
             RelayDeviceApproval::Approved(_)
         ));
+        drop(db);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 취소된 기기는 상한을 차지하지 않는다. 64대를 페어링하고 전부 취소한 뒤에도 65번째가
+    /// 들어오고, 표 크기는 상한을 지킨다(가장 오래전 취소된 행이 회수된다).
+    #[test]
+    fn relay_revoked_devices_do_not_hold_the_device_limit() {
+        let (dir, _path, db) = file_db("relay-revoked-reclaim");
+        for index in 0..RELAY_DEVICE_ROWS_MAX {
+            let row = relay_filler_row(index);
+            db.insert_relay_pending_device(&row, row.issued_at).unwrap();
+            db.approve_relay_pending_device(
+                &row.pairing_id,
+                &row.identity_public_sec1,
+                row.issued_at + 1,
+            )
+            .unwrap();
+            db.revoke_relay_device(&row.device_id, row.issued_at + 2 + index as i64)
+                .unwrap();
+        }
+        let next = relay_filler_row(RELAY_DEVICE_ROWS_MAX);
+        db.insert_relay_pending_device(&next, next.issued_at)
+            .unwrap();
+        assert!(matches!(
+            db.approve_relay_pending_device(
+                &next.pairing_id,
+                &next.identity_public_sec1,
+                next.issued_at + 1,
+            )
+            .unwrap(),
+            RelayDeviceApproval::Approved(_)
+        ));
+        let rows = db
+            .list_relay_devices_bounded(RELAY_DEVICE_ROWS_MAX)
+            .unwrap();
+        assert_eq!(rows.len(), RELAY_DEVICE_ROWS_MAX, "표 크기는 상한을 지킨다");
+        assert!(
+            rows.iter().any(|row| row.device_id == next.device_id),
+            "새 기기가 발행됐다"
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.device_id == relay_filler_row(0).device_id),
+            "가장 오래전에 취소된 행이 회수된다"
+        );
+
+        // 살아 있는 기기가 상한이면 여전히 거절한다.
+        let (dir2, _path2, db2) = file_db("relay-active-limit");
+        for index in 0..RELAY_DEVICE_ROWS_MAX {
+            let row = relay_filler_row(index);
+            db2.insert_relay_pending_device(&row, row.issued_at)
+                .unwrap();
+            db2.approve_relay_pending_device(
+                &row.pairing_id,
+                &row.identity_public_sec1,
+                row.issued_at + 1,
+            )
+            .unwrap();
+        }
+        let extra = relay_filler_row(RELAY_DEVICE_ROWS_MAX);
+        db2.insert_relay_pending_device(&extra, extra.issued_at)
+            .unwrap();
+        assert_eq!(
+            db2.approve_relay_pending_device(
+                &extra.pairing_id,
+                &extra.identity_public_sec1,
+                extra.issued_at + 1,
+            )
+            .unwrap(),
+            RelayDeviceApproval::DeviceLimitReached
+        );
+        drop(db);
+        drop(db2);
+        fs::remove_dir_all(dir).unwrap();
+        fs::remove_dir_all(dir2).unwrap();
+    }
+
+    /// 같은 폰(같은 공개키)이 새 device_id로 다시 페어링하면 옛 행이 대체된다 —
+    /// identity UNIQUE에 걸려 불투명하게 실패하지 않는다.
+    #[test]
+    fn relay_repairing_the_same_phone_under_a_new_device_id_replaces_the_old_row() {
+        let (dir, _path, db) = file_db("relay-repair");
+        let first = relay_pending_row(21, 21, 21);
+        db.insert_relay_pending_device(&first, first.issued_at)
+            .unwrap();
+        db.approve_relay_pending_device(
+            &first.pairing_id,
+            &first.identity_public_sec1,
+            first.issued_at + 1,
+        )
+        .unwrap();
+        db.revoke_relay_device(&first.device_id, first.issued_at + 2)
+            .unwrap();
+
+        let mut again = relay_pending_row(22, 22, 21); // 같은 키, 새 device_id
+        again.display_name = "same phone".to_owned();
+        db.insert_relay_pending_device(&again, again.issued_at)
+            .unwrap();
+        assert!(matches!(
+            db.approve_relay_pending_device(
+                &again.pairing_id,
+                &again.identity_public_sec1,
+                again.issued_at + 3,
+            )
+            .unwrap(),
+            RelayDeviceApproval::Approved(_)
+        ));
+        assert!(db.relay_device(&first.device_id).unwrap().is_none());
+        let current = db.relay_device(&again.device_id).unwrap().unwrap();
+        assert_eq!(current.display_name, "same phone");
+        assert_eq!(current.revoked_at, None);
+        assert_eq!(db.relay_pending_device_count().unwrap(), 0);
+        drop(db);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 미완의 의식을 버리고 다시 시도하는 같은 기기는 대체되고, 다른 주체의 부분 겹침은
+    /// 결정적으로 거절된다.
+    #[test]
+    fn relay_pending_retry_supersedes_and_partial_overlap_conflicts() {
+        let (dir, _path, db) = file_db("relay-pending-retry");
+        let abandoned = relay_pending_row(31, 31, 31);
+        db.insert_relay_pending_device(&abandoned, abandoned.issued_at)
+            .unwrap();
+
+        // 같은 기기의 새 의식(새 pairing_id) → 대체.
+        let retry = relay_pending_row(32, 31, 31);
+        assert_eq!(
+            db.insert_relay_pending_device(&retry, retry.issued_at)
+                .unwrap(),
+            RelayPendingInsert::Stored
+        );
+        assert_eq!(db.relay_pending_device_count().unwrap(), 1);
+        assert!(
+            db.relay_pending_device(&abandoned.pairing_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.relay_pending_device(&retry.pairing_id)
+                .unwrap()
+                .is_some()
+        );
+
+        // 키만 같은 다른 device_id → 충돌.
+        let key_clash = relay_pending_row(33, 34, 31);
+        assert_eq!(
+            db.insert_relay_pending_device(&key_clash, key_clash.issued_at)
+                .unwrap(),
+            RelayPendingInsert::Conflict
+        );
+        // device_id만 같은 다른 키 → 충돌.
+        let id_clash = relay_pending_row(35, 31, 36);
+        assert_eq!(
+            db.insert_relay_pending_device(&id_clash, id_clash.issued_at)
+                .unwrap(),
+            RelayPendingInsert::Conflict
+        );
+        assert_eq!(
+            db.relay_pending_device_count().unwrap(),
+            1,
+            "충돌은 아무것도 바꾸지 않는다"
+        );
+        assert!(
+            db.relay_pending_device(&retry.pairing_id)
+                .unwrap()
+                .is_some()
+        );
         drop(db);
         fs::remove_dir_all(dir).unwrap();
     }
@@ -12170,8 +12840,8 @@ mod tests {
     }
 
     #[test]
-    fn relay_v36_file_migrates_to_v37_and_reopens() {
-        assert_eq!(MIGRATIONS.len(), 37);
+    fn relay_v36_file_migrates_to_v40_and_reopens() {
+        assert_eq!(MIGRATIONS.len(), 40);
         let dir = std::env::temp_dir().join(format!(
             "deppy-relay-v36-migration-{}-{}",
             std::process::id(),
@@ -12184,7 +12854,7 @@ mod tests {
         drop(legacy);
 
         let migrated = Db::open(&path).unwrap();
-        assert_eq!(Db::read_user_version(&migrated.conn).unwrap(), 37);
+        assert_eq!(Db::read_user_version(&migrated.conn).unwrap(), 40);
         for table in ["relay_pending_devices", "relay_devices"] {
             let present: bool = migrated
                 .conn
@@ -12198,7 +12868,7 @@ mod tests {
         }
         drop(migrated);
         let reopened = Db::open(&path).unwrap();
-        assert_eq!(Db::read_user_version(&reopened.conn).unwrap(), 37);
+        assert_eq!(Db::read_user_version(&reopened.conn).unwrap(), 40);
         drop(reopened);
         fs::remove_dir_all(dir).unwrap();
     }
@@ -12241,7 +12911,7 @@ mod tests {
     }
 
     #[test]
-    fn relay_approval_unique_conflict_rolls_back_pending_and_existing_device() {
+    fn relay_approval_with_a_known_key_replaces_the_previous_device_row() {
         let (dir, _path, db) = file_db("relay-approval-conflict");
         let first = relay_pending_row(2, 2, 2);
         db.insert_relay_pending_device(&first, first.issued_at)
@@ -12256,28 +12926,31 @@ mod tests {
             RelayDeviceApproval::Approved(_)
         ));
 
-        let mut conflicting = relay_pending_row(3, 3, 3);
-        conflicting.identity_public_sec1 = first.identity_public_sec1;
-        db.insert_relay_pending_device(&conflicting, conflicting.issued_at)
+        // 같은 공개키의 새 device_id는 **같은 폰의 재페어링**이다 — pending 행은 검증된
+        // 승인(키 보유 증명) 뒤에만 존재하므로 옛 행을 대체한다. 결과는 언제나 기기 하나.
+        let mut repaired = relay_pending_row(3, 3, 3);
+        repaired.identity_public_sec1 = first.identity_public_sec1;
+        db.insert_relay_pending_device(&repaired, repaired.issued_at)
             .unwrap();
-        assert!(
+        assert!(matches!(
             db.approve_relay_pending_device(
-                &conflicting.pairing_id,
-                &conflicting.identity_public_sec1,
-                conflicting.issued_at + 1
+                &repaired.pairing_id,
+                &repaired.identity_public_sec1,
+                repaired.issued_at + 1
             )
-            .is_err()
-        );
-        assert_eq!(db.relay_pending_device_count().unwrap(), 1);
-        assert!(db.relay_device(&conflicting.device_id).unwrap().is_none());
-        let unchanged = db.relay_device(&first.device_id).unwrap().unwrap();
-        assert_eq!(unchanged.identity_public_sec1, first.identity_public_sec1);
-        assert_eq!(unchanged.display_name, first.display_name);
+            .unwrap(),
+            RelayDeviceApproval::Approved(_)
+        ));
+        assert_eq!(db.relay_pending_device_count().unwrap(), 0);
+        assert!(db.relay_device(&first.device_id).unwrap().is_none());
+        let current = db.relay_device(&repaired.device_id).unwrap().unwrap();
+        assert_eq!(current.identity_public_sec1, first.identity_public_sec1);
         assert_eq!(
             db.list_relay_devices_bounded(RELAY_DEVICE_ROWS_MAX)
                 .unwrap()
                 .len(),
-            1
+            1,
+            "같은 키는 언제나 기기 하나로만 존재한다"
         );
         drop(db);
         fs::remove_dir_all(dir).unwrap();
@@ -14128,6 +14801,31 @@ mod tests {
         ];
         expected.sort();
         assert_eq!(global, expected);
+    }
+
+    #[test]
+    fn agent_state_global_agent_sessions는_실제_resume명령이_없는_kind를_제외한다() {
+        let db = Db::open_in_memory().unwrap();
+        let active = db.create_workspace("agent-state-global-resumable").unwrap();
+        db.upsert_agent_session(&active, "claude-pane", "claude", "claude-session")
+            .unwrap();
+        db.upsert_agent_session(&active, "grok-pane", "grok", "grok-session")
+            .unwrap();
+        db.upsert_agent_session(&active, "kimi-pane", "kimi", "kimi-session")
+            .unwrap();
+
+        let mut job = AgentStateJob::projection(&active);
+        job.include_global_agent_sessions = true;
+        let snapshot = db.apply_agent_state_job(&job).unwrap();
+
+        let mut actual = snapshot.global_agent_sessions;
+        actual.sort();
+        let mut expected = vec![
+            (active.clone(), "claude-pane".to_owned()),
+            (active, "grok-pane".to_owned()),
+        ];
+        expected.sort();
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -17598,6 +18296,125 @@ mod tests {
     }
 
     #[test]
+    fn secret_recovery_generation_rejects_aba_and_newly_published_candidates() {
+        let db = Db::open_in_memory().unwrap();
+        let logical = secret::LogicalCredentialId::new("recovery-aba").unwrap();
+        let slot = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+        stage_slot(&db, &logical, &slot);
+        let old = db
+            .physical_secret_slots_for_reconciliation(8)
+            .unwrap()
+            .remove(0);
+        db.acknowledge_physical_secret_slot_deleted(logical.as_str(), slot.as_str())
+            .unwrap();
+        stage_slot(&db, &logical, &slot);
+        let current = db
+            .physical_secret_slots_for_reconciliation(8)
+            .unwrap()
+            .remove(0);
+        assert_ne!(old.recovery_generation, current.recovery_generation);
+        assert!(
+            !db.recover_physical_secret_slot_cas(&old, || panic!(
+                "재생성된 행의 비밀을 삭제하면 안 된다"
+            ))
+            .unwrap()
+        );
+        db.insert_credential_with_secret_slot(&sample(logical.as_str()), slot.as_str(), None)
+            .unwrap();
+        assert!(
+            !db.recover_physical_secret_slot_cas(&current, || panic!(
+                "승인된 physical 슬롯을 삭제하면 안 된다"
+            ))
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn secret_recovery_callback_failure_rolls_back_and_can_retry() {
+        let db = Db::open_in_memory().unwrap();
+        let logical = secret::LogicalCredentialId::new("recovery-retry").unwrap();
+        let slot = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+        stage_slot(&db, &logical, &slot);
+        let candidate = db
+            .physical_secret_slots_for_reconciliation(8)
+            .unwrap()
+            .remove(0);
+        assert!(
+            db.recover_physical_secret_slot_cas(&candidate, || anyhow::bail!("test-denied"))
+                .is_err()
+        );
+        assert_eq!(
+            db.physical_secret_slots_for_reconciliation(8).unwrap(),
+            vec![candidate.clone()]
+        );
+        assert!(
+            db.recover_physical_secret_slot_cas(&candidate, || Ok(()))
+                .unwrap()
+        );
+        assert!(
+            !db.recover_physical_secret_slot_cas(&candidate, || panic!("이미 정리된 후보"))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn secret_recovery_v39_backfill_preserves_slots_and_generation_on_reopen() {
+        let (dir, _, initial) = file_db("secret-recovery-backfill");
+        drop(initial);
+        let path = dir.join("legacy.sqlite3");
+        let legacy = storage_core::open_with_migrations(&path, &MIGRATIONS[..39]).unwrap();
+        assert_eq!(storage_core::read_user_version(&legacy).unwrap(), 39);
+        let logical = secret::LogicalCredentialId::new("recovery-backfill").unwrap();
+        let slot = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+        legacy.execute("INSERT INTO physical_secret_slot_ledger (physical_slot,logical_credential_id,state,created_at,updated_at) VALUES (?1,?2,'staging',1,1)", (slot.as_str(),logical.as_str())).unwrap();
+        drop(legacy);
+        let migrated = Db::open(&path).unwrap();
+        assert_eq!(Db::read_user_version(&migrated.conn).unwrap(), 40);
+        let rows = migrated
+            .physical_secret_slots_for_reconciliation(8)
+            .unwrap();
+        assert_eq!(rows[0].physical_slot, slot.as_str());
+        assert_eq!(rows[0].state, PhysicalSecretSlotState::Staging);
+        assert_ne!(rows[0].recovery_generation, [0; 16]);
+        drop(migrated);
+        let reopened = Db::open(&path).unwrap();
+        assert_eq!(Db::read_user_version(&reopened.conn).unwrap(), 40);
+        assert_eq!(
+            rows,
+            reopened
+                .physical_secret_slots_for_reconciliation(8)
+                .unwrap()
+        );
+        drop(reopened);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn keychain개발판_v38은_canonical_relay_v38로_오인하지_않는다() {
+        let (dir, _, initial) = file_db("forked-secret-v38");
+        drop(initial);
+        let path = dir.join("forked-v38.sqlite3");
+        let forked = storage_core::open_with_migrations(&path, &MIGRATIONS[..37]).unwrap();
+        forked
+            .execute_batch(
+                "ALTER TABLE physical_secret_slot_ledger ADD COLUMN recovery_generation BLOB NOT NULL
+                    DEFAULT X'00000000000000000000000000000000'
+                    CHECK(typeof(recovery_generation) = 'blob' AND length(recovery_generation) = 16);
+                 UPDATE physical_secret_slot_ledger SET recovery_generation = randomblob(16);
+                 PRAGMA user_version = 38;",
+            )
+            .unwrap();
+        drop(forked);
+
+        let error = Db::open(&path).err().expect("forked v38은 거부해야 한다");
+        assert!(
+            error.to_string().contains("지원하지 않는 개발용 v38"),
+            "예상하지 못한 오류: {error}"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn physical_slot_ledger는_crash_windows_restart와_exact_ack를_보존한다() {
         let (dir, path, db) = file_db("physical-slot-ledger-restart");
         let logical = secret::LogicalCredentialId::new("ledger-restart").unwrap();
@@ -17613,6 +18430,8 @@ mod tests {
         assert_eq!(
             db.physical_secret_slots_for_reconciliation(1).unwrap(),
             vec![PhysicalSecretSlotLedgerRow {
+                recovery_generation: db.physical_secret_slots_for_reconciliation(1).unwrap()[0]
+                    .recovery_generation,
                 logical_credential_id: logical.as_str().to_owned(),
                 physical_slot: missing.as_str().to_owned(),
                 state: PhysicalSecretSlotState::Staging,
@@ -18267,6 +19086,8 @@ mod tests {
             assert_eq!(
                 db.physical_secret_slots_for_reconciliation(1).unwrap(),
                 vec![PhysicalSecretSlotLedgerRow {
+                    recovery_generation: db.physical_secret_slots_for_reconciliation(1).unwrap()[0]
+                        .recovery_generation,
                     logical_credential_id: logical.as_str().to_owned(),
                     physical_slot: slot.as_str().to_owned(),
                     state: PhysicalSecretSlotState::Published,

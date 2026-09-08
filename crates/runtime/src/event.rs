@@ -204,6 +204,71 @@ pub enum RuntimeEvent {
     UnattachedSessionsKilled {
         count: u16,
     },
+    /// worker가 실제 적용한 고정 크기 집계. unsupported는 재생성 없이 남겨 둔 세션 수다.
+    /// **variant는 끝에만 추가** (postcard discriminant — wire 호환).
+    ScrollbackLimitApplied {
+        /// false는 별도 감사/복구 로그의 영속 삭제를 보장하지 않음을 뜻한다.
+        durable: bool,
+        /// 초기 복원 명령의 처리를 마친 뒤 집계한 결과인가.
+        restored: bool,
+        generation: u64,
+        requested: u32,
+        applied: u16,
+        unsupported: u16,
+        trimmed: u64,
+        effective_min: u32,
+    },
+    /// 실제 적용 성공. viewport stamp 자체도 같은 성공의 증거다.
+    ResizeApplied {
+        session: SessionId,
+        stamp: crate::ResizeStamp,
+    },
+    ResizeFailed {
+        session: SessionId,
+        token: crate::ResizeToken,
+        reason: crate::ResizeFailure,
+    },
+    /// 최초 tracked 요청 이후 해당 세션의 모든 viewport. 기존 variant bytes는 유지한다.
+    ViewportTracked {
+        session: SessionId,
+        snapshot: Arc<TerminalViewportSnapshot>,
+        bracketed_paste: bool,
+        stamp: crate::ResizeStamp,
+    },
+}
+
+impl RuntimeEvent {
+    pub fn viewport(
+        &self,
+    ) -> Option<(
+        SessionId,
+        &Arc<TerminalViewportSnapshot>,
+        bool,
+        Option<crate::ResizeStamp>,
+    )> {
+        match self {
+            Self::Viewport {
+                session,
+                snapshot,
+                bracketed_paste,
+            } => Some((*session, snapshot, *bracketed_paste, None)),
+            Self::ViewportTracked {
+                session,
+                snapshot,
+                bracketed_paste,
+                stamp,
+            } => Some((*session, snapshot, *bracketed_paste, Some(*stamp))),
+            _ => None,
+        }
+    }
+    fn viewport_snapshot_mut(&mut self) -> Option<&mut Arc<TerminalViewportSnapshot>> {
+        match self {
+            Self::Viewport { snapshot, .. } | Self::ViewportTracked { snapshot, .. } => {
+                Some(snapshot)
+            }
+            _ => None,
+        }
+    }
 }
 
 /// 최신값 슬롯에서 Viewport를 교체할 때, **아직 소비되지 않은** 이전 이벤트의
@@ -219,15 +284,27 @@ pub enum RuntimeEvent {
 /// shape 변화(cols/rows/scroll/alt) 시 캐시를 통째로 버리므로 과잉 무효화만
 /// 생길 뿐 유실은 없다 — 무조건 합쳐도 안전하다.
 pub fn merge_unconsumed_viewport_dirty(prev: &RuntimeEvent, next: &mut RuntimeEvent) {
-    if let (
-        RuntimeEvent::Viewport {
-            snapshot: prev_snapshot,
-            ..
-        },
-        RuntimeEvent::Viewport { snapshot, .. },
-    ) = (prev, next)
-        && !prev_snapshot.dirty_ranges.is_empty()
-    {
+    let Some((prev_session, prev_snapshot, _, prev_stamp)) = prev.viewport() else {
+        return;
+    };
+    let Some((next_session, _, _, next_stamp)) = next.viewport() else {
+        return;
+    };
+    if prev_session != next_session {
+        return;
+    }
+    let Some(snapshot) = next.viewport_snapshot_mut() else {
+        return;
+    };
+    if prev_stamp != next_stamp {
+        let full = Arc::make_mut(snapshot);
+        full.dirty_ranges = vec![terminal::CellRange {
+            start: 0,
+            end: usize::from(full.cols) * usize::from(full.rows),
+        }];
+        return;
+    }
+    if !prev_snapshot.dirty_ranges.is_empty() {
         // visible_cells는 Arc 공유라 make_mut의 스냅샷 클론은 저렴하다(셀 복사 없음).
         let merged = Arc::make_mut(snapshot);
         merged
@@ -419,6 +496,10 @@ mod tests {
                 "DurableEventBarrierReached",
                 "UnattachedSessionsInspected",
                 "UnattachedSessionsKilled",
+                "ScrollbackLimitApplied",
+                "ResizeApplied",
+                "ResizeFailed",
+                "ViewportTracked",
             ]
         );
     }

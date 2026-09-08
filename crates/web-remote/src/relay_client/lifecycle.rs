@@ -16,8 +16,45 @@ use std::time::Duration;
 /// 좌표가 실제로 생길 때까지 비워 둔다. 그때 이 상수 하나만 채우면 된다.
 pub const PRODUCTION_RELAY_ENDPOINT: Option<&str> = None;
 
+/// 이 Mac의 Relay 라우트 핸들. Mac 승인 자격증명과 함께 provisioning되며, 그 주체가 아직
+/// 정해지지 않았으므로 엔드포인트와 같은 이유로 비어 있다.
+pub const PRODUCTION_RELAY_ROUTE: Option<relay_protocol::RouteId> = None;
+
+/// 이 Mac이 라우트를 소유하겠다고 제시하는 32바이트 승인 자격증명.
+///
+/// **페어링 비밀이 아니다** — Relay는 페어링 비밀을 절대 보지 않는다. 이 값은 큐/라우트 자원을
+/// 할당하기 전 입장만 통제하며, 신원 증명은 그 뒤 종단 간 핸드셰이크가 한다. 라우트 핸들과
+/// 함께 provisioning되므로 같은 이유로 아직 비어 있다.
+pub const PRODUCTION_RELAY_ADMISSION: Option<relay_protocol::AdmissionCredential> = None;
+
 /// 엔드포인트 최대 길이. 파싱 전에 먼저 자른다.
 pub const MAX_ENDPOINT_BYTES: usize = 255;
+
+/// 디버그 빌드 전용 개발 override. 릴리스 빌드에서는 항상 `None`이다 — 환경변수로 프로덕션
+/// 앱의 Relay 목적지를 바꿀 수 있으면 그것이 곧 중간자 경로다.
+pub fn dev_override(name: &str) -> Option<String> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty() && value.len() <= MAX_ENDPOINT_BYTES)
+}
+
+/// 디버그 빌드 전용: 16진 환경변수를 고정 길이 바이트로 읽는다. 길이가 다르면 `None`.
+pub fn dev_override_bytes<const N: usize>(name: &str) -> Option<[u8; N]> {
+    let value = dev_override(name)?;
+    if value.len() != N * 2 {
+        return None;
+    }
+    let mut bytes = [0u8; N];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let text = std::str::from_utf8(pair).ok()?;
+        bytes[index] = u8::from_str_radix(text, 16).ok()?;
+    }
+    Some(bytes)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EndpointError {
@@ -72,7 +109,15 @@ pub struct RelayEndpoint {
 
 impl RelayEndpoint {
     /// 릴리스 상수에서 만든다. 좌표가 아직 없으면 실패한다 — 기본 엔드포인트는 없다.
+    ///
+    /// **디버그 빌드에서만** `DEPPY_RELAY_DEV_ENDPOINT`가 상수를 대신할 수 있다(계획: "테스트와
+    /// 비영속 개발 빌드만 override 가능"). 값은 저장되지 않고, 같은 정책(`wss://` + DNS 이름)을
+    /// 그대로 통과해야 한다 — 스테이징 Relay를 Tailscale Serve 같은 실제 인증서 뒤에 두고
+    /// 붙어 보는 용도다. 릴리스 빌드는 이 환경변수를 읽지 않는다.
     pub fn production() -> Result<Self, EndpointError> {
+        if let Some(dev) = dev_override("DEPPY_RELAY_DEV_ENDPOINT") {
+            return Self::parse(&dev);
+        }
         Self::parse(PRODUCTION_RELAY_ENDPOINT.ok_or(EndpointError::NotAssigned)?)
     }
 
@@ -367,7 +412,49 @@ mod tests {
     #[test]
     fn there_is_no_default_production_endpoint_yet() {
         assert_eq!(PRODUCTION_RELAY_ENDPOINT, None);
+        assert_eq!(PRODUCTION_RELAY_ROUTE, None);
         assert_eq!(RelayEndpoint::production(), Err(EndpointError::NotAssigned));
+    }
+
+    /// 개발 override는 정책을 우회하지 못한다 — 같은 파서를 지난다.
+    #[test]
+    fn the_dev_override_is_policy_checked_and_never_persisted() {
+        // 환경변수는 프로세스 전역이라 테스트 간 간섭을 피하려고 직렬화한다.
+        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // SAFETY: 이 테스트 안에서만 설정/해제하며 위 뮤텍스로 직렬화한다.
+        unsafe { std::env::set_var("DEPPY_RELAY_DEV_ENDPOINT", "ws://127.0.0.1:9443") };
+        let result = RelayEndpoint::production();
+        unsafe { std::env::remove_var("DEPPY_RELAY_DEV_ENDPOINT") };
+        if cfg!(debug_assertions) {
+            assert_eq!(
+                result,
+                Err(EndpointError::NotWss),
+                "override도 wss만 통과한다"
+            );
+        } else {
+            assert_eq!(
+                result,
+                Err(EndpointError::NotAssigned),
+                "릴리스는 override를 읽지 않는다"
+            );
+        }
+        assert_eq!(
+            RelayEndpoint::production(),
+            Err(EndpointError::NotAssigned),
+            "override가 어디에도 남지 않는다"
+        );
+
+        let production = include_str!("lifecycle.rs")
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap();
+        assert!(
+            production.contains("if !cfg!(debug_assertions) {\n        return None;"),
+            "릴리스 빌드에서 override를 읽으면 그것이 곧 중간자 경로다"
+        );
     }
 
     #[test]

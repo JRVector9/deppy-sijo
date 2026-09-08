@@ -38,6 +38,23 @@ pub enum SessionKind {
     Agent,
 }
 
+/// 실제 resize 실패 경계. backend/PTY 오류 내용을 wire나 로그로 복사하지 않는다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResizeError {
+    InvalidSize,
+    Backend,
+    Pty,
+    Dimensions,
+    SizeMismatch,
+}
+
+#[derive(Debug)]
+pub struct ResizeApplied {
+    pub cols: u16,
+    pub rows: u16,
+    pub cache_event: Option<TerminalCacheEvent>,
+}
+
 /// pump() 결과 — 호출측(runtime worker)이 이벤트 발행 여부를 결정한다.
 #[derive(Debug, PartialEq)]
 pub struct PumpResult {
@@ -204,6 +221,30 @@ impl Session {
     /// scrollback+화면을 ANSI로 직렬화 (압축 아카이브용 — 미지원 백엔드는 None).
     pub fn serialize_scrollback(&self) -> Option<Vec<u8>> {
         self.backend.serialize_scrollback()
+    }
+
+    /// 초과 시 오래된 history만 절반씩 줄인다. 100k 상한에서 최대 18회이며 화면은
+    /// 지우지 않는다. 화면만으로도 초과하거나 리소스가 부족하면 호출자가 backend를 보존한다.
+    pub fn serialize_scrollback_for_archive(
+        &mut self,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, terminal::ScrollbackSerializeError> {
+        for _ in 0..=terminal::policy::SCROLLBACK_LINES_MAX.ilog2() + 1 {
+            match self.backend.serialize_scrollback_bounded(max_bytes) {
+                Err(terminal::ScrollbackSerializeError::LimitExceeded) => {
+                    let history = self.backend.cache_footprint().history_lines;
+                    if history == 0 {
+                        return Err(terminal::ScrollbackSerializeError::LimitExceeded);
+                    }
+                    self.trim_scrollback(history / 2);
+                    if self.backend.cache_footprint().history_lines >= history {
+                        return Err(terminal::ScrollbackSerializeError::LimitExceeded);
+                    }
+                }
+                result => return result,
+            }
+        }
+        Err(terminal::ScrollbackSerializeError::LimitExceeded)
     }
 
     pub fn id(&self) -> SessionId {
@@ -418,6 +459,24 @@ impl Session {
         Ok(())
     }
 
+    /// 새 PTY의 빈 backend와 이전 종료 세션의 backend를 교환한다.
+    /// 호출자는 새 PTY spawn 성공을 확인한 뒤에만 사용한다.
+    pub fn inherit_terminal_from(&mut self, previous: &mut Session) {
+        let target = self.backend.cache_footprint();
+        std::mem::swap(&mut self.backend, &mut previous.backend);
+        // 새 세션은 이전 visibility 전이에 묶인 압박 상한을 이어받지 않는다.
+        self.backend.clear_pressure_trim();
+        // PTY는 이미 새 크기로 생성되어 있다. 기존 grid만 같은 크기로 맞춘다.
+        let _ = self
+            .backend
+            .resize(target.columns as u16, target.screen_lines as u16);
+        self.backend.set_cache_class(self.cache_class);
+        self.backend
+            .set_scrollback_limit(target.scrollback_limit_lines);
+        self.mark_full_dirty();
+        previous.mark_full_dirty();
+    }
+
     /// 입력 큐가 비었는가 — backpressure 해소 판정(2026-07-09). PTY가 이미 닫혔으면
     /// 더 쌓일 것도 없으니 idle로 본다.
     pub fn input_queue_idle(&self) -> bool {
@@ -435,6 +494,39 @@ impl Session {
             }
         }
         None
+    }
+
+    pub fn resize_checked(&mut self, cols: u16, rows: u16) -> Result<ResizeApplied, ResizeError> {
+        if cols == 0 || rows == 0 {
+            return Err(ResizeError::InvalidSize);
+        }
+        let applied = self
+            .backend
+            .resize(cols, rows)
+            .map_err(|_| ResizeError::Backend)
+            .and_then(|()| {
+                if let Some(pty) = self.pty.as_mut() {
+                    pty.resize(cols, rows).map_err(|_| ResizeError::Pty)?;
+                }
+                Ok(())
+            });
+        // 일부 적용 후 실패해도 이전 화면을 dirty로 만들고 압축/예산 계약을 지킨다.
+        self.mark_full_dirty();
+        let cache_event = self.set_cache_class(self.cache_class);
+        applied?;
+        let actual = self.grid_dimensions().ok_or(ResizeError::Dimensions)?;
+        if actual != (cols, rows) {
+            return Err(ResizeError::SizeMismatch);
+        }
+        Ok(ResizeApplied {
+            cols: actual.0,
+            rows: actual.1,
+            cache_event,
+        })
+    }
+
+    pub fn grid_dimensions(&self) -> Option<(u16, u16)> {
+        self.backend.grid_dimensions().ok()
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) -> Option<TerminalCacheEvent> {
@@ -547,6 +639,15 @@ impl Session {
         self.backend.set_cache_class(class)
     }
 
+    /// 사용자의 보관 한도를 backend에 전달한다. PTY와 세션 정체성은 유지한다.
+    pub fn set_scrollback_limit(&mut self, requested: usize) -> terminal::ScrollbackApplyResult {
+        let result = self.backend.set_scrollback_limit(requested);
+        if matches!(result, terminal::ScrollbackApplyResult::Applied { .. }) {
+            self.mark_full_dirty();
+        }
+        result
+    }
+
     /// 메모리 압박 하에서 스크롤백을 클래스 예산 아래로 강제 축소한다(전역 예산이
     /// exited 아카이브만으로 안 맞을 때 live 세션 트림용). 이미 그 이하면 None.
     pub fn trim_scrollback(&mut self, max_lines: usize) -> Option<TerminalCacheEvent> {
@@ -570,7 +671,8 @@ impl Session {
         self.pending_dirty_rows.extend_from_slice(rows);
     }
 
-    fn mark_full_dirty(&mut self) {
+    /// 다음 viewport를 전체 dirty로 재발행한다. resize나 PTY 신호를 반복하지 않는다.
+    pub fn mark_full_dirty(&mut self) {
         self.dirty = true;
         self.pending_full_dirty = true;
         self.pending_dirty_rows.clear();
@@ -639,6 +741,214 @@ fn dirty_rows_to_ranges(dirty_rows: &mut Vec<u16>, cols: u16, rows: u16) -> Vec<
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    struct ResizeFailingPty;
+    impl PtySession for ResizeFailingPty {
+        fn take_output(&mut self) -> Option<PtyOutputReceiver> {
+            None
+        }
+        fn process_identity(&self) -> ProcessIdentity {
+            unreachable!()
+        }
+        fn write_input(&mut self, _: &[u8]) -> anyhow::Result<PtyInputEnqueueResult> {
+            anyhow::bail!("입력 미사용")
+        }
+        fn input_queue_idle(&self) -> bool {
+            true
+        }
+        fn resize(&mut self, _: u16, _: u16) -> anyhow::Result<()> {
+            anyhow::bail!("fixture resize 실패")
+        }
+        fn try_exit_code(&mut self) -> anyhow::Result<Option<u32>> {
+            Ok(Some(0))
+        }
+        fn kill(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn resize_checked는_pty_실패를_적용성공으로_반환하지_않는다() {
+        let mut session = Session::restore_archived(
+            SessionId(1),
+            SessionKind::Agent,
+            80,
+            24,
+            1000,
+            Some(0),
+            &mut &b""[..],
+        );
+        session.pty = Some(Box::new(ResizeFailingPty));
+        assert_eq!(
+            session.resize_checked(100, 30).unwrap_err(),
+            ResizeError::Pty
+        );
+    }
+
+    #[test]
+    fn resize_checked는_hidden에서_실제_크기를_확인하고_full_dirty를_유지한다() {
+        let mut session = Session::restore_archived(
+            SessionId(1),
+            SessionKind::Agent,
+            80,
+            24,
+            1000,
+            Some(0),
+            &mut &b"stable"[..],
+        );
+        session.set_visible(false);
+        let result = session.resize_checked(101, 31).expect("backend 실제 적용");
+        assert_eq!((result.cols, result.rows), (101, 31));
+        assert_eq!(session.grid_dimensions(), Some((101, 31)));
+        assert_eq!(session.cache_class(), TerminalCacheClass::Hidden);
+        assert!(!session.take_snapshot().unwrap().dirty_ranges.is_empty());
+    }
+
+    #[test]
+    fn resize_checked는_유효하지_않은_크기를_적용하지_않는다() {
+        let mut session = Session::restore_archived(
+            SessionId(1),
+            SessionKind::Agent,
+            80,
+            24,
+            1000,
+            Some(0),
+            &mut &b""[..],
+        );
+        assert_eq!(
+            session.resize_checked(0, 24).unwrap_err(),
+            ResizeError::InvalidSize
+        );
+        assert_eq!(session.cache_footprint().columns, 80);
+    }
+
+    #[test]
+    fn archive_limit_이력만_줄이고_최신_화면을_보존한다() {
+        let text = (0..1000)
+            .map(|i| format!("row{i:04}\r\n"))
+            .collect::<String>()
+            + "LATEST";
+        let mut live = Session::restore_archived(
+            SessionId(1),
+            SessionKind::Shell,
+            20,
+            5,
+            5000,
+            Some(0),
+            &mut text.as_bytes(),
+        );
+        let screen = live.screen_text();
+        let dump = live.serialize_scrollback_for_archive(512).unwrap();
+        assert!(dump.len() <= 512);
+        assert_eq!(live.screen_text(), screen);
+        assert!(String::from_utf8(dump).unwrap().contains("LATEST"));
+        assert!(live.cache_footprint().history_lines < 996);
+    }
+
+    #[test]
+    fn archive_limit_화면만_초과하면_화면을_삭제하지_않는다() {
+        let mut live = Session::restore_archived(
+            SessionId(1),
+            SessionKind::Shell,
+            20,
+            5,
+            100,
+            Some(0),
+            &mut &b"LATEST"[..],
+        );
+        assert_eq!(
+            live.serialize_scrollback_for_archive(0),
+            Err(terminal::ScrollbackSerializeError::LimitExceeded)
+        );
+        assert!(live.screen_text().contains("LATEST"));
+    }
+
+    #[test]
+    fn live_scrollback_검토_새pty는_이전_압박상한을_이어받지_않는다() {
+        let text = (0..1000)
+            .map(|i| format!("kept{i}\r\n"))
+            .collect::<String>();
+        let mut previous = Session::restore_archived(
+            SessionId(1),
+            SessionKind::Agent,
+            20,
+            5,
+            5000,
+            Some(0),
+            &mut text.as_bytes(),
+        );
+        previous.trim_scrollback(100).unwrap();
+        let mut next = Session::restore_archived(
+            SessionId(2),
+            SessionKind::Agent,
+            20,
+            5,
+            5000,
+            Some(0),
+            &mut &b""[..],
+        );
+        next.inherit_terminal_from(&mut previous);
+        assert_eq!(next.cache_footprint().scrollback_limit_lines, 5000);
+        assert_eq!(next.cache_footprint().history_lines, 100);
+    }
+
+    #[test]
+    fn live_scrollback_새pty에_이전_backend를_복사없이_이어준다() {
+        let text = (0..1000)
+            .map(|i| format!("kept{i}\r\n"))
+            .collect::<String>();
+        let mut previous = Session::restore_archived(
+            SessionId(1),
+            SessionKind::Agent,
+            20,
+            5,
+            5000,
+            Some(0),
+            &mut text.as_bytes(),
+        );
+        let expected = previous.serialize_scrollback().unwrap();
+        let mut next = Session::restore_archived(
+            SessionId(2),
+            SessionKind::Agent,
+            20,
+            5,
+            5000,
+            Some(0),
+            &mut &b""[..],
+        );
+        let _ = next.take_snapshot();
+        next.inherit_terminal_from(&mut previous);
+        assert_eq!(next.serialize_scrollback().unwrap(), expected);
+        assert_eq!(previous.cache_footprint().history_lines, 0);
+        assert!(!next.take_snapshot().unwrap().dirty_ranges.is_empty());
+    }
+
+    #[test]
+    fn live_scrollback_설정은_추가출력없이_full_dirty를_발행한다() {
+        let text = (0..500)
+            .map(|i| format!("line-{i}\r\n"))
+            .collect::<String>();
+        let mut session = Session::restore_archived(
+            SessionId(77),
+            SessionKind::Shell,
+            20,
+            5,
+            1000,
+            Some(0),
+            &mut text.as_bytes(),
+        );
+        session.take_snapshot().unwrap();
+        assert!(matches!(
+            session.set_scrollback_limit(100),
+            terminal::ScrollbackApplyResult::Applied { .. }
+        ));
+        let snapshot = session.take_snapshot().unwrap();
+        assert!(
+            !snapshot.dirty_ranges.is_empty(),
+            "변경된 보관 정책은 full snapshot을 다시 발행해야 한다"
+        );
+        assert_eq!(session.cache_footprint().history_lines, 100);
+    }
 
     #[test]
     fn 아카이브_복원_세션은_스크롤백을_보존한다() {
@@ -1119,7 +1429,7 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn cache_class_전이와_trim_event_추적() {
+    fn cache_class_숨김_전환은_삭제없이_압축한다() {
         let spec = CommandSpec {
             program: "/bin/sh".into(),
             args: vec![
@@ -1138,12 +1448,12 @@ mod tests {
             (session.cache_footprint().history_lines > 400).then_some(())
         });
 
-        let event = session
-            .set_visible(false)
-            .expect("hidden 전환은 scrollback trim event를 남겨야 함");
+        let before = session.cache_footprint();
+        assert!(session.set_visible(false).is_none());
         assert_eq!(session.cache_class(), TerminalCacheClass::Hidden);
-        assert_eq!(session.cache_footprint().class, TerminalCacheClass::Hidden);
-        assert!(event.dropped_history_lines() > 0);
-        assert!(event.freed_estimated_bytes() > 0);
+        let after = session.cache_footprint();
+        assert_eq!(after.class, TerminalCacheClass::Hidden);
+        assert_eq!(after.history_lines, before.history_lines);
+        assert!(after.estimated_bytes <= before.estimated_bytes);
     }
 }

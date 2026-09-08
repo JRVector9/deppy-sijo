@@ -3,6 +3,11 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use terminal::policy::{
+    CACHE_BUDGET_FALLBACK_MIB, CACHE_BUDGET_MANUAL_MAX_MIB, CACHE_BUDGET_MANUAL_MIN_MIB,
+    CacheBudgetMode, SCROLLBACK_DEFAULT, SCROLLBACK_LINES_MAX, SCROLLBACK_SETTING_MIN,
+    auto_cache_budget_mib,
+};
 
 const MIN_OUTPUT_BATCH_MS: u64 = 16;
 /// `config.toml` is human-authored control data, not a bulk storage surface.
@@ -81,7 +86,15 @@ pub fn recommended_max_live_warm() -> u32 {
     // RAM은 프로세스 수명 동안 불변이라 sysctl을 1회만 하고 캐시한다 — 설정(성능) 페이지가
     // 힌트용으로 매 프레임 호출해도(리뷰 P3) 이후엔 원자 로드 한 번이다.
     static CACHE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| max_live_warm_for_ram_gb(ram_bytes() / (1024 * 1024 * 1024)))
+    *CACHE.get_or_init(|| {
+        // warm 권장 기본값은 기존 정책(macOS 조회, 나머지 16GiB 가정)을 유지한다.
+        let ram = if cfg!(target_os = "macos") {
+            ram_bytes()
+        } else {
+            None
+        };
+        max_live_warm_for_ram_gb(ram.unwrap_or(16 * 1024 * 1024 * 1024) / (1024 * 1024 * 1024))
+    })
 }
 
 /// 순수 함수(테스트 용이) — RAM(GB)에서 권장 live warm 상한. 1슬롯당 4GB 예산, 3~8 클램프.
@@ -89,8 +102,22 @@ fn max_live_warm_for_ram_gb(ram_gb: u64) -> u32 {
     ((ram_gb / 4) as u32).clamp(3, 8)
 }
 
-/// 물리 메모리 바이트. 조회 실패 시 16GB로 가정(보수적 기본 4 유도).
-fn ram_bytes() -> u64 {
+/// 자동 예산 힌트가 매 프레임 OS를 호출하지 않도록 계산 결과를 한 번만 저장한다.
+pub fn automatic_cache_budget_mib() -> u32 {
+    static CACHE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| auto_cache_budget_mib(ram_bytes()))
+}
+
+/// Linux의 페이지 수·크기를 바이트로 바꾸는 경계. 음수/0/overflow는 조회 실패다.
+#[cfg(any(target_os = "linux", test))]
+fn ram_bytes_from_pages(pages: impl TryInto<u64>, page_size: impl TryInto<u64>) -> Option<u64> {
+    let pages: u64 = pages.try_into().ok()?;
+    let page_size: u64 = page_size.try_into().ok()?;
+    pages.checked_mul(page_size).filter(|bytes| *bytes > 0)
+}
+
+/// 물리 메모리 바이트. 실패 여부를 보존하여 각 정책이 자신의 기본값을 적용한다.
+fn ram_bytes() -> Option<u64> {
     #[cfg(target_os = "macos")]
     {
         // sysctl hw.memsize — 실패하면 폴백.
@@ -108,10 +135,32 @@ fn ram_bytes() -> u64 {
             )
         };
         if ok == 0 && size > 0 {
-            return size;
+            return Some(size);
         }
     }
-    16 * 1024 * 1024 * 1024
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: sysconf는 상수 이름만 받아 값을 반환하고 포인터를 요구하지 않는다.
+        let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        ram_bytes_from_pages(pages, page_size)
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        let mut status = MEMORYSTATUSEX {
+            dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: 크기를 설정한 유효한 구조체를 호출 동안 독점 대여한다.
+        if unsafe { GlobalMemoryStatusEx(&mut status) } != 0 && status.ullTotalPhys > 0 {
+            return Some(status.ullTotalPhys);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
 }
 
 /// config.toml 루트. 각 항목의 소비처는 설계문서 v2.5 참조.
@@ -201,6 +250,15 @@ pub struct UiConfig {
     /// DB 행은 보존하고, 사용자가 워크스페이스 선택기로 다시 열 때까지 목록에서 숨긴다.
     #[serde(default)]
     pub closed_workspace_ids: BTreeSet<String>,
+    /// 사이드바 워크스페이스 표시 순서 — 사용자가 드래그로 정한 결과. 순서는 워크스페이스의
+    /// 속성이 아니라 **이 기기의 표시 취향**이라 DB가 아니라 config에 산다. 목록에 없는 id는
+    /// 생성순으로 뒤에 붙으므로, 새로 만든 워크스페이스는 자연히 맨 아래로 간다.
+    /// 드래그 결과는 **덮어쓰기가 아니라 병합**이다 — 사이드바가 넘겨주는 목록은 그때 보이던
+    /// 행뿐이라, 종료(숨김)한 워크스페이스까지 통째로 덮어쓰면 그 자리를 영영 잃는다.
+    /// 숨긴 id는 저장된 상대 순서를 지킨 채 뒤에 남고, 실제로 **삭제된** id만
+    /// `refresh_workspaces`의 정리에서 빠진다(2026-09-03 리뷰 defect 1·5).
+    #[serde(default)]
+    pub workspace_order: Vec<String>,
     /// 환경 및 API 프로젝트 목록에서 사용자가 `X`로 닫은 workspace ID. 이 상태는
     /// sidebar의 workspace 종료/실행 상태와 독립이며 `+`로 같은 폴더를 다시 고르면 해제된다.
     #[serde(default)]
@@ -280,6 +338,7 @@ impl Default for UiConfig {
             last_workspace_id: None,
             confirm_workspace_close: false,
             closed_workspace_ids: BTreeSet::new(),
+            workspace_order: Vec::new(),
             hidden_env_project_ids: BTreeSet::new(),
             ui_font: None,
             ui_scale: 1.0,
@@ -349,8 +408,11 @@ pub struct TerminalConfig {
     pub scrollback_lines: u32,
     /// 종료 세션 백엔드 LRU 상한 — 초과분은 압축 아카이브 (§14.3 확장, 2026-07-11)
     pub exited_backend_cap: u32,
-    /// 전역 터미널 캐시 예산 (MB) — 초과 시 exited부터 아카이브
+    /// 수동 전역 터미널 캐시 예산 (MiB) — 모드 전환 시에도 마지막 입력값을 보존
     pub cache_budget_mb: u32,
+    /// 기존 설정에서 모드가 없으면 저장된 수동 예산을 그대로 사용한다.
+    #[serde(default)]
+    pub cache_budget_mode: CacheBudgetMode,
     /// 터미널 모노 폰트 가족 (2026-07-13): [`crate::fonts::MONO_FONTS`] 중 하나 —
     /// 기본 D2Coding(한글 2:1 폭 정합), 대안 JetBrainsMono. 미지값은 기본으로 폴백.
     #[serde(default = "default_mono_font")]
@@ -364,14 +426,27 @@ fn default_mono_font() -> String {
     crate::fonts::DEFAULT_MONO_FONT.to_owned()
 }
 
+impl TerminalConfig {
+    /// 자동 모드에서도 수동 입력값은 보존하고 실제 전파할 예산만 계산한다.
+    pub fn effective_cache_budget_mib(&self) -> u32 {
+        match self.cache_budget_mode {
+            CacheBudgetMode::Auto => automatic_cache_budget_mib(),
+            CacheBudgetMode::Manual => self
+                .cache_budget_mb
+                .clamp(CACHE_BUDGET_MANUAL_MIN_MIB, CACHE_BUDGET_MANUAL_MAX_MIB),
+        }
+    }
+}
+
 impl Default for TerminalConfig {
     fn default() -> Self {
         Self {
             font_size: 11.0,
             line_height: 1.0,
-            scrollback_lines: 10_000,
+            scrollback_lines: SCROLLBACK_DEFAULT,
             exited_backend_cap: 64,
-            cache_budget_mb: 128,
+            cache_budget_mb: CACHE_BUDGET_FALLBACK_MIB,
+            cache_budget_mode: CacheBudgetMode::Auto,
             mono_font: default_mono_font(),
             mono_weight: crate::fonts::DEFAULT_MONO_WEIGHT.to_owned(),
         }
@@ -505,9 +580,13 @@ impl Config {
         } else {
             TerminalConfig::default().line_height
         };
-        t.scrollback_lines = t.scrollback_lines.clamp(100, 100_000);
+        t.scrollback_lines = t
+            .scrollback_lines
+            .clamp(SCROLLBACK_SETTING_MIN, SCROLLBACK_LINES_MAX as u32);
         t.exited_backend_cap = t.exited_backend_cap.clamp(4, 512);
-        t.cache_budget_mb = t.cache_budget_mb.clamp(32, 2048);
+        t.cache_budget_mb = t
+            .cache_budget_mb
+            .clamp(CACHE_BUDGET_MANUAL_MIN_MIB, CACHE_BUDGET_MANUAL_MAX_MIB);
         if !crate::fonts::MONO_FONTS.contains(&t.mono_font.as_str()) {
             t.mono_font = crate::fonts::DEFAULT_MONO_FONT.to_owned();
         }
@@ -595,7 +674,7 @@ mod tests {
 
         // 저장 형식에 전송 모드 열거형이 끼어들지 않는다.
         let serialized = toml::to_string(&config).unwrap();
-        for forbidden in ["transport =", "transport=", "\"Both\"", "mode ="] {
+        for forbidden in ["transport =", "transport=", "\"Both\"", "\nmode ="] {
             assert!(!serialized.contains(forbidden), "{forbidden}");
         }
         assert!(serialized.contains("[relay]"));
@@ -611,6 +690,61 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn ram_페이지_조회는_오류와_오버플로를_실패로_보존한다() {
+        assert_eq!(
+            ram_bytes_from_pages(4_194_304, 4096),
+            Some(16 * 1024 * 1024 * 1024)
+        );
+        for (pages, size) in [(-1, 4096), (1, -1), (0, 4096), (1, 0), (i64::MAX, 3)] {
+            assert_eq!(ram_bytes_from_pages(pages, size), None);
+        }
+    }
+
+    #[test]
+    fn 캐시_예산_신규기본은_auto이고_기존_수동값은_보존한다() {
+        let fresh = serde_json::to_value(TerminalConfig::default()).unwrap();
+        assert_eq!(fresh["cache_budget_mode"], "auto");
+        let legacy: Config = toml::from_str("[terminal]\ncache_budget_mb = 320\n").unwrap();
+        assert_eq!(legacy.terminal.cache_budget_mb, 320);
+        let serialized = serde_json::to_value(&legacy.terminal).unwrap();
+        assert_eq!(serialized["cache_budget_mode"], "manual");
+        let roundtrip: Config = toml::from_str(&toml::to_string(&legacy).unwrap()).unwrap();
+        assert_eq!(roundtrip.terminal, legacy.terminal);
+    }
+
+    #[test]
+    fn 캐시_예산_모드_왕복은_수동값과_실제_예산을_구분한다() {
+        let mut config: Config =
+            toml::from_str("[terminal]\ncache_budget_mb = 320\ncache_budget_mode = 'auto'\n")
+                .unwrap();
+        assert_eq!(
+            config.terminal.effective_cache_budget_mib(),
+            automatic_cache_budget_mib()
+        );
+        assert_eq!(config.terminal.cache_budget_mb, 320);
+        let roundtrip: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(roundtrip.terminal, config.terminal);
+        config.terminal.cache_budget_mode = CacheBudgetMode::Manual;
+        assert_eq!(config.terminal.effective_cache_budget_mib(), 320);
+    }
+
+    #[test]
+    fn 스크롤백_설정은_100과_999를_보존하고_범위밖만_고정한다() {
+        for (input, expected) in [
+            (0, 100),
+            (99, 100),
+            (100, 100),
+            (999, 999),
+            (100_001, 100_000),
+        ] {
+            let mut config = Config::default();
+            config.terminal.scrollback_lines = input;
+            config.normalize();
+            assert_eq!(config.terminal.scrollback_lines, expected);
+        }
+    }
 
     fn temp_path(tag: &str) -> PathBuf {
         let nonce = std::time::SystemTime::now()
@@ -885,6 +1019,20 @@ mod tests {
         assert_eq!(parsed.ui.last_workspace_id, None);
         assert!(parsed.ui.closed_workspace_ids.is_empty());
         assert!(parsed.ui.hidden_env_project_ids.is_empty());
+        assert!(parsed.ui.workspace_order.is_empty());
+    }
+
+    /// 드래그로 바꾼 사이드바 순서는 앱을 다시 켜도 그대로여야 한다(2026-09-03 사용자).
+    /// 리스트라 **순서 자체가 값**이다 — BTreeSet처럼 정렬되면 의미가 사라지므로 넣은
+    /// 순서 그대로 돌아오는지 본다.
+    #[test]
+    fn 워크스페이스_순서는_넣은_그대로_roundtrip된다() {
+        let mut c = Config::default();
+        assert!(c.ui.workspace_order.is_empty());
+        c.ui.workspace_order = vec!["ws-c".to_owned(), "ws-a".to_owned(), "ws-b".to_owned()];
+        let text = toml::to_string_pretty(&c).unwrap();
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert_eq!(parsed.ui.workspace_order, ["ws-c", "ws-a", "ws-b"]);
     }
 
     #[test]

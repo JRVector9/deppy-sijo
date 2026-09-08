@@ -21,6 +21,9 @@ pub const PROTOCOL_VERSION: u16 = 1;
 pub const ROUTE_ID_BYTES: usize = 16;
 pub const CONNECTION_ID_BYTES: usize = 16;
 pub const ADMISSION_CREDENTIAL_BYTES: usize = 32;
+/// 라우트별 재접속 검증자 수와 절대 수명 상한.
+pub const MAX_RECONNECT_GRANTS: usize = 64;
+pub const MAX_RECONNECT_LIFETIME_SECS: u64 = 30 * 24 * 60 * 60;
 
 const MAGIC_OFFSET: usize = 0;
 const VERSION_OFFSET: usize = 4;
@@ -121,6 +124,16 @@ pub enum FrameType {
     TicketPublish = 0x12,
     /// Mac이 등록한 입장 핸들을 즉시 무효화한다.
     TicketRevoke = 0x13,
+    /// 재접속 검증자와 절대 만료를 게시한다. 페어링 티켓과 별개다.
+    ReconnectPublish = 0x14,
+    /// 재접속 검증자를 회수한다.
+    ReconnectRevoke = 0x15,
+    /// 불투명 재접속 grant로 자원 입장만 요청한다.
+    ReconnectAdmission = 0x16,
+    /// Mac이 저장된 검증자 복원을 끝냈다.
+    ReconnectSync = 0x17,
+    /// 검증자 게시 완료.
+    ReconnectPublished = 0x24,
     /// 서버 → 클라이언트 입장 허가.
     Admitted = 0x20,
     /// 서버 → 클라이언트 거절 코드 하나.
@@ -142,6 +155,11 @@ impl FrameType {
             0x11 => Self::DeviceAdmission,
             0x12 => Self::TicketPublish,
             0x13 => Self::TicketRevoke,
+            0x14 => Self::ReconnectPublish,
+            0x15 => Self::ReconnectRevoke,
+            0x16 => Self::ReconnectAdmission,
+            0x17 => Self::ReconnectSync,
+            0x24 => Self::ReconnectPublished,
             0x20 => Self::Admitted,
             0x21 => Self::Rejected,
             0x22 => Self::PeerJoined,
@@ -155,8 +173,14 @@ impl FrameType {
         match self {
             Self::Hello => (1, MAX_HELLO_BYTES),
             Self::Ciphertext => (1, MAX_CIPHERTEXT_BYTES),
-            Self::Heartbeat | Self::Admitted | Self::PeerJoined | Self::PeerLeft => (0, 0),
+            Self::Heartbeat
+            | Self::Admitted
+            | Self::PeerJoined
+            | Self::PeerLeft
+            | Self::ReconnectSync => (0, 0),
             Self::Close | Self::Rejected => (2, 2),
+            Self::ReconnectPublish => (40, 40),
+            Self::ReconnectRevoke | Self::ReconnectAdmission | Self::ReconnectPublished => (32, 32),
             Self::DesktopAdmission
             | Self::DeviceAdmission
             | Self::TicketPublish
@@ -347,6 +371,7 @@ impl<'a> RelayFrame<'a> {
     pub fn admission_credential(&self) -> Option<AdmissionCredential> {
         match self.frame_type {
             FrameType::DesktopAdmission
+            | FrameType::ReconnectAdmission
             | FrameType::DeviceAdmission
             | FrameType::TicketPublish
             | FrameType::TicketRevoke => Some(AdmissionCredential::from_bytes(
@@ -620,6 +645,7 @@ mod tests {
             (FrameType::Hello, vec![1usize, MAX_HELLO_BYTES], vec![0]),
             (FrameType::Ciphertext, vec![1], vec![0]),
             (FrameType::Heartbeat, vec![0], vec![1]),
+            (FrameType::ReconnectSync, vec![0], vec![1]),
             (FrameType::Close, vec![2], vec![0, 1, 3]),
             (FrameType::Admitted, vec![0], vec![1]),
             (FrameType::Rejected, vec![2], vec![0, 1]),
@@ -781,6 +807,29 @@ mod tests {
                 !production.to_lowercase().contains(forbidden),
                 "the relay must never learn about {forbidden}"
             );
+        }
+    }
+
+    #[test]
+    fn reconnect_wire_accepts_only_the_new_fixed_record_sizes() {
+        for (tag, length) in [(0x14, 40), (0x15, 32), (0x16, 32), (0x24, 32)] {
+            let mut bytes = RelayFrame::new(
+                FrameType::Hello,
+                RouteId::from_bytes([1; 16]),
+                ConnectionId::from_bytes([2; 16]),
+                0,
+                &vec![3; length],
+            )
+            .unwrap()
+            .to_vec();
+            bytes[6] = tag;
+            assert!(RelayFrame::decode(&bytes).is_ok(), "reconnect tag {tag:#x}");
+            bytes[51] = (length + 1) as u8;
+            bytes.push(3);
+            assert!(matches!(
+                RelayFrame::decode(&bytes),
+                Err(DecodeError::PayloadTooLarge { .. })
+            ));
         }
     }
 

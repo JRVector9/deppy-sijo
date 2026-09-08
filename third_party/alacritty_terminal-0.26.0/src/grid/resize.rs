@@ -48,7 +48,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
     /// Alacritty keeps the cursor at the bottom of the terminal as long as there
     /// is scrollback available. Once scrollback is exhausted, new lines are
     /// simply added to the bottom of the screen.
-    fn grow_lines<D>(&mut self, target: usize)
+    pub(super) fn grow_lines<D>(&mut self, target: usize)
     where
         T: ResetDiscriminant<D>,
         D: PartialEq,
@@ -83,7 +83,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
     /// of the terminal window.
     ///
     /// Alacritty takes the same approach.
-    fn shrink_lines<D>(&mut self, target: usize)
+    pub(super) fn shrink_lines<D>(&mut self, target: usize)
     where
         T: ResetDiscriminant<D>,
         D: PartialEq,

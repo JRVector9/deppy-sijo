@@ -62,7 +62,7 @@ const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1
 /// 대형 붙여넣기(수 MB)와 큰 viewport 스냅샷이 여유 있게 들어간다.
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 /// 원격 명령의 scrollback 상한 — 무제한 usize로 과대 할당을 요구하지 못하게.
-const MAX_SCROLLBACK_LINES: usize = 100_000;
+use terminal::policy::SCROLLBACK_LINES_MAX as MAX_SCROLLBACK_LINES;
 /// 인증 프레임 대기 상한 — 접속만 열고 침묵하는 peer가 서버를 잡아두지 못하게.
 const AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// 클라이언트 최초 TCP connect 상한 — OS 기본 connect timeout에 의존하지 않는다.
@@ -457,9 +457,43 @@ fn validate_command(command: &RuntimeCommand) -> Result<(), &'static str> {
 
 /// 클라이언트가 수신한 이벤트의 와이어 값 검증 — 기형 스냅샷이 렌더러에
 /// 닿기 전에 거른다 (cols=0 나눗셈, 셀 수 불일치, 비정상 ratio).
+type ViewportBaseline = (
+    u64,
+    Arc<TerminalViewportSnapshot>,
+    Option<crate::ResizeStamp>,
+);
+
 fn validate_event(event: &RuntimeEvent) -> Result<(), &'static str> {
+    let valid_stamp = |stamp: &crate::ResizeStamp| {
+        stamp.epoch > 0
+            && stamp.owner_epoch > 0
+            && stamp.cols > 0
+            && stamp.rows > 0
+            && stamp
+                .token
+                .is_none_or(|token| token.is_valid() && token.owner_epoch == stamp.owner_epoch)
+    };
     match event {
-        RuntimeEvent::Viewport { snapshot, .. } => {
+        RuntimeEvent::ResizeApplied { stamp, .. }
+            if !valid_stamp(stamp) || stamp.token.is_none() =>
+        {
+            return Err("resize 적용 stamp 무효");
+        }
+        RuntimeEvent::ResizeFailed { token, .. } if !token.is_valid() => {
+            return Err("resize 실패 token 무효");
+        }
+        _ => {}
+    }
+    if let RuntimeEvent::ViewportTracked {
+        snapshot, stamp, ..
+    } = event
+        && (!valid_stamp(stamp) || (snapshot.cols, snapshot.rows) != (stamp.cols, stamp.rows))
+    {
+        return Err("viewport resize stamp 불일치");
+    }
+    match event {
+        RuntimeEvent::Viewport { snapshot, .. }
+        | RuntimeEvent::ViewportTracked { snapshot, .. } => {
             if snapshot.cols == 0 || snapshot.rows == 0 {
                 return Err("viewport cols/rows가 0");
             }
@@ -528,7 +562,9 @@ impl OutboundEventQueue {
     }
 
     fn enqueue(&mut self, event: RuntimeEvent) -> Result<(), OutboundOverflow> {
-        if let RuntimeEvent::Viewport { session, .. } = &event {
+        if let RuntimeEvent::Viewport { session, .. }
+        | RuntimeEvent::ViewportTracked { session, .. } = &event
+        {
             let session = *session;
             if self.viewport_cap == 0 {
                 return Ok(());
@@ -671,7 +707,7 @@ fn drain_receiver_into_outbound(
 fn encode_next_outbound_frame(
     outbound: &mut OutboundEventQueue,
     codec: Codec,
-    last_sent: &mut HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)>,
+    last_sent: &mut HashMap<SessionId, ViewportBaseline>,
     exited_sessions: &mut ExitedSessionTombstones,
     visible_sessions: &mut Option<HashSet<SessionId>>,
 ) -> anyhow::Result<Option<Vec<u8>>> {
@@ -1002,8 +1038,7 @@ fn serve_connection(
             let mut last_activity = std::time::Instant::now();
             // 접속별 last_sent: 세션마다 (마지막 송신 seq, 그 스냅샷). Delta diff의 기준선.
             // Plain 접속에서는 사용되지 않는다(viewport도 encode_event 경로).
-            let mut last_sent: HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)> =
-                HashMap::new();
+            let mut last_sent: HashMap<SessionId, ViewportBaseline> = HashMap::new();
             let mut visible_sessions: Option<HashSet<SessionId>> = None;
             let mut exited_sessions = ExitedSessionTombstones::new();
             let mut outbound = OutboundEventQueue::new();
@@ -1167,7 +1202,7 @@ fn serve_connection_tls(
 
     // Phase 2: 명령/이벤트 루프. last_sent/keyframe_requests는 이 스레드 단독 소유(락 불필요).
     let receiver = backend.subscribe();
-    let mut last_sent: HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)> = HashMap::new();
+    let mut last_sent: HashMap<SessionId, ViewportBaseline> = HashMap::new();
     let mut visible_sessions: Option<HashSet<SessionId>> = None;
     let mut exited_sessions = ExitedSessionTombstones::new();
     let mut keyframe_requests: Vec<SessionId> = Vec::new();
@@ -1397,7 +1432,7 @@ fn tls_server_handshake(
 /// `last_sent`가 hidden snapshot Arc를 다시 잡지 않게 한다.
 fn encode_pump_frame(
     codec: Codec,
-    last_sent: &mut HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)>,
+    last_sent: &mut HashMap<SessionId, ViewportBaseline>,
     exited_sessions: &mut ExitedSessionTombstones,
     visible_sessions: &mut Option<HashSet<SessionId>>,
     event: &RuntimeEvent,
@@ -1415,6 +1450,12 @@ fn encode_pump_frame(
                 session,
                 snapshot,
                 bracketed_paste,
+            }
+            | RuntimeEvent::ViewportTracked {
+                session,
+                snapshot,
+                bracketed_paste,
+                ..
             },
         ) => {
             if exited_sessions.contains(session)
@@ -1425,7 +1466,16 @@ fn encode_pump_frame(
                 // 종료됐거나 현재 active tab 밖인 세션 — baseline을 만들지 않고 전체 스냅샷을 그대로.
                 codec.encode_event(event)
             } else {
-                encode_viewport_frame(last_sent, *session, snapshot, *bracketed_paste)
+                match event.viewport().and_then(|(_, _, _, stamp)| stamp) {
+                    Some(stamp) => encode_viewport_frame_stamped(
+                        last_sent,
+                        *session,
+                        snapshot,
+                        *bracketed_paste,
+                        Some(stamp),
+                    ),
+                    None => encode_viewport_frame(last_sent, *session, snapshot, *bracketed_paste),
+                }
             }
         }
         (Codec::Delta, RuntimeEvent::SessionExited { session, .. }) => {
@@ -1452,15 +1502,30 @@ fn visible_session_set(snapshot: &MuxSnapshot) -> HashSet<SessionId> {
 /// 갱신한다 (§4.4/§4.7). keyframe 조건: baseline 없음(신규/재구독/RequestKeyframe로 제거됨),
 /// 또는 diff가 폴백(차원·alt-screen 변경/heavy repaint)을 반환. seq는 (접속,세션)마다 단조 증가.
 fn encode_viewport_frame(
-    last_sent: &mut HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)>,
+    last_sent: &mut HashMap<SessionId, ViewportBaseline>,
     session: SessionId,
     snapshot: &Arc<TerminalViewportSnapshot>,
     bracketed_paste: bool,
 ) -> anyhow::Result<Vec<u8>> {
+    encode_viewport_frame_stamped(last_sent, session, snapshot, bracketed_paste, None)
+}
+
+fn encode_viewport_frame_stamped(
+    last_sent: &mut HashMap<SessionId, ViewportBaseline>,
+    session: SessionId,
+    snapshot: &Arc<TerminalViewportSnapshot>,
+    bracketed_paste: bool,
+    stamp: Option<crate::ResizeStamp>,
+) -> anyhow::Result<Vec<u8>> {
     let (wire, new_seq) = match last_sent.get(&session) {
-        Some((prev_seq, prev_snap)) => {
-            let seq = prev_seq + 1;
-            match diff_viewport(prev_snap, snapshot) {
+        Some((prev_seq, prev_snap, prev_stamp)) => {
+            let seq = prev_seq
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("viewport sequence 소진"))?;
+            match (*prev_stamp == stamp)
+                .then(|| diff_viewport(prev_snap, snapshot))
+                .flatten()
+            {
                 Some(delta) => (
                     WireMsg::ViewportDelta {
                         session,
@@ -1494,8 +1559,43 @@ fn encode_viewport_frame(
             0,
         ),
     };
+    let wire = match (stamp, wire) {
+        (
+            Some(stamp),
+            WireMsg::ViewportKeyframe {
+                session,
+                seq,
+                snapshot,
+                bracketed_paste,
+            },
+        ) => WireMsg::ViewportKeyframeTracked {
+            session,
+            seq,
+            snapshot,
+            bracketed_paste,
+            stamp,
+        },
+        (
+            Some(stamp),
+            WireMsg::ViewportDelta {
+                session,
+                seq,
+                base_seq,
+                delta,
+                bracketed_paste,
+            },
+        ) => WireMsg::ViewportDeltaTracked {
+            session,
+            seq,
+            base_seq,
+            delta,
+            bracketed_paste,
+            stamp,
+        },
+        (_, wire) => wire,
+    };
     let payload = encode_wire_msg(&wire)?;
-    last_sent.insert(session, (new_seq, Arc::clone(snapshot)));
+    last_sent.insert(session, (new_seq, Arc::clone(snapshot), stamp));
     Ok(payload)
 }
 
@@ -1608,8 +1708,7 @@ impl RemoteRuntimeClient {
                 // 접속별 재구성 상태 (§4.3): 세션마다 (마지막 적용 seq, 현재 재구성본).
                 // reader가 TCP를 UI 소비와 무관하게 완전히 드레인하므로 delta는 여기서 유실되지 않고,
                 // slot에는 항상 "재구성된 전체 스냅샷"만 담긴다 — UI 계약(전체 Viewport)은 불변.
-                let mut recon: HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)> =
-                    HashMap::new();
+                let mut recon: HashMap<SessionId, ViewportBaseline> = HashMap::new();
                 // seq gap으로 keyframe을 이미 요청한 세션 — keyframe 도착 전까지 delta를 조용히 버려
                 // RequestKeyframe 폭주를 막는다.
                 let mut pending_keyframe: HashSet<SessionId> = HashSet::new();
@@ -1932,7 +2031,7 @@ fn client_tls_io_loop(
     connected: Arc<AtomicBool>,
     commands: std::sync::mpsc::Receiver<Vec<u8>>,
 ) {
-    let mut recon: HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)> = HashMap::new();
+    let mut recon: HashMap<SessionId, ViewportBaseline> = HashMap::new();
     let mut pending_keyframe: HashSet<SessionId> = HashSet::new();
     let mut out: VecDeque<Vec<u8>> = VecDeque::new();
     let mut liveness =
@@ -2092,10 +2191,29 @@ struct ReconOutcome {
 /// 디코드된 이벤트 하나를 재구성해 항상 전체 Viewport를 slot에 dispatch한다 (§4.3/§4.4).
 /// transport 무관 코어 — 평문([`handle_decoded_event`])과 TLS IO 루프가 공유한다.
 /// keyframe 요청은 여기서 보내지 않고 [`ReconOutcome`]로 돌려 호출측이 자기 transport로 보낸다.
+fn attach_viewport_stamp(event: RuntimeEvent, stamp: Option<crate::ResizeStamp>) -> RuntimeEvent {
+    match (event, stamp) {
+        (
+            RuntimeEvent::Viewport {
+                session,
+                snapshot,
+                bracketed_paste,
+            },
+            Some(stamp),
+        ) => RuntimeEvent::ViewportTracked {
+            session,
+            snapshot,
+            bracketed_paste,
+            stamp,
+        },
+        (event, _) => event,
+    }
+}
+
 fn reconstruct_and_dispatch(
     decoded: DecodedEvent,
     subscribers: &Arc<Mutex<Vec<RemoteSubscriber>>>,
-    recon: &mut HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)>,
+    recon: &mut HashMap<SessionId, ViewportBaseline>,
     pending_keyframe: &mut HashSet<SessionId>,
 ) -> ReconOutcome {
     let cont = ReconOutcome {
@@ -2106,7 +2224,45 @@ fn reconstruct_and_dispatch(
         disconnect: true,
         request_keyframe: None,
     };
+    let (decoded, stamp) = match decoded {
+        DecodedEvent::KeyframeTracked {
+            session,
+            seq,
+            snapshot,
+            bracketed_paste,
+            stamp,
+        } => (
+            DecodedEvent::Keyframe {
+                session,
+                seq,
+                snapshot,
+                bracketed_paste,
+            },
+            Some(stamp),
+        ),
+        DecodedEvent::DeltaTracked {
+            session,
+            seq,
+            base_seq,
+            delta,
+            bracketed_paste,
+            stamp,
+        } => (
+            DecodedEvent::Delta {
+                session,
+                seq,
+                base_seq,
+                delta,
+                bracketed_paste,
+            },
+            Some(stamp),
+        ),
+        decoded => (decoded, None),
+    };
     match decoded {
+        DecodedEvent::KeyframeTracked { .. } | DecodedEvent::DeltaTracked { .. } => {
+            unreachable!("위에서 정규화")
+        }
         DecodedEvent::Event(event) => {
             if let Err(reason) = validate_event(&event) {
                 tracing::warn!("remote 이벤트 검증 실패({reason}) — 접속 종료");
@@ -2154,11 +2310,12 @@ fn reconstruct_and_dispatch(
                 snapshot: Arc::clone(&snapshot),
                 bracketed_paste,
             };
+            let event = attach_viewport_stamp(event, stamp);
             if let Err(reason) = validate_event(&event) {
                 tracing::warn!("remote keyframe 검증 실패({reason}) — 접속 종료");
                 return disconnect;
             }
-            recon.insert(session, (seq, snapshot));
+            recon.insert(session, (seq, snapshot, stamp));
             pending_keyframe.remove(&session);
             dispatch(subscribers, event);
             cont
@@ -2174,7 +2331,9 @@ fn reconstruct_and_dispatch(
             // 적용 전에 차원/row-index/cells-len을 검증하므로(codex P1) 기형 delta도
             // 패닉 없이 Err를 돌려준다. get으로 owned 결과만 뽑아 recon 재빌림 충돌을 피한다.
             let applied = match recon.get(&session) {
-                Some((cur_seq, snap)) if *cur_seq == base_seq => {
+                Some((cur_seq, snap, base_stamp))
+                    if *cur_seq == base_seq && *base_stamp == stamp =>
+                {
                     Some(try_apply_delta(snap, &delta))
                 }
                 _ => None, // seq gap(신뢰 TCP라 이론상 없지만 방어, §4.4)
@@ -2188,11 +2347,12 @@ fn reconstruct_and_dispatch(
                         snapshot: Arc::clone(&reconstructed),
                         bracketed_paste,
                     };
+                    let event = attach_viewport_stamp(event, stamp);
                     if let Err(reason) = validate_event(&event) {
                         tracing::warn!("remote delta 재구성 검증 실패({reason}) — 접속 종료");
                         return disconnect;
                     }
-                    recon.insert(session, (seq, reconstructed));
+                    recon.insert(session, (seq, reconstructed, stamp));
                     dispatch(subscribers, event);
                     cont
                 }
@@ -2221,7 +2381,7 @@ fn handle_decoded_event(
     decoded: DecodedEvent,
     subscribers: &Arc<Mutex<Vec<RemoteSubscriber>>>,
     writer: &Mutex<TcpStream>,
-    recon: &mut HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)>,
+    recon: &mut HashMap<SessionId, ViewportBaseline>,
     pending_keyframe: &mut HashSet<SessionId>,
 ) -> bool {
     let outcome = reconstruct_and_dispatch(decoded, subscribers, recon, pending_keyframe);
@@ -2257,7 +2417,9 @@ fn dispatch(subscribers: &Arc<Mutex<Vec<RemoteSubscriber>>>, event: RuntimeEvent
         .lock()
         .expect("remote subscribers lock")
         .retain(|subscriber| {
-            if let RuntimeEvent::Viewport { session, .. } = &event {
+            if let RuntimeEvent::Viewport { session, .. }
+            | RuntimeEvent::ViewportTracked { session, .. } = &event
+            {
                 if Arc::strong_count(&subscriber.viewports) <= 1 {
                     return false;
                 }
@@ -2727,15 +2889,17 @@ mod tests {
     }
 
     #[test]
-    fn v10_peer_is_rejected_at_hello_before_event_decode() {
-        let old = ClientHello {
-            magic: PROTO_MAGIC,
-            proto_version: 10,
-            features: CLIENT_FEATURES,
-            token: b"irrelevant".to_vec(),
-        };
-        assert_eq!(PROTO_VERSION, 12);
-        assert!(!client_hello_matches_protocol(&old));
+    fn v12_v13_peer_is_rejected_at_hello_before_event_decode() {
+        for version in [10, 12, 13] {
+            let old = ClientHello {
+                magic: PROTO_MAGIC,
+                proto_version: version,
+                features: CLIENT_FEATURES,
+                token: b"irrelevant".to_vec(),
+            };
+            assert_eq!(PROTO_VERSION, 14);
+            assert!(!client_hello_matches_protocol(&old));
+        }
     }
 
     /// 단계 A off-path 불변 (§3.2, §8 #1): delta 미협상(Plain 코덱)에서 이벤트/명령
@@ -3577,6 +3741,10 @@ mod tests {
             RuntimeEvent::DurableEventBarrierReached { .. } => "DurableEventBarrierReached",
             RuntimeEvent::UnattachedSessionsInspected { .. } => "UnattachedSessionsInspected",
             RuntimeEvent::UnattachedSessionsKilled { .. } => "UnattachedSessionsKilled",
+            RuntimeEvent::ScrollbackLimitApplied { .. } => "ScrollbackLimitApplied",
+            RuntimeEvent::ResizeApplied { .. } => "ResizeApplied",
+            RuntimeEvent::ResizeFailed { .. } => "ResizeFailed",
+            RuntimeEvent::ViewportTracked { .. } => "ViewportTracked",
         }
     }
 
@@ -3634,8 +3802,8 @@ mod tests {
     /// 네트워크 없이 서버 encode(last_sent) → 클라이언트 reconstruct(recon) 파이프라인을 돈다.
     /// round_trip은 매 tick의 재구성된 전체 스냅샷을 돌려준다 — source와 == 여야 한다(§4.8).
     struct DeltaPipe {
-        last_sent: HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)>,
-        recon: HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)>,
+        last_sent: HashMap<SessionId, ViewportBaseline>,
+        recon: HashMap<SessionId, ViewportBaseline>,
         keyframes: usize,
         deltas: usize,
         last_frame_len: usize,
@@ -3667,7 +3835,8 @@ mod tests {
                     ..
                 } => {
                     self.keyframes += 1;
-                    self.recon.insert(session, (seq, Arc::clone(&snapshot)));
+                    self.recon
+                        .insert(session, (seq, Arc::clone(&snapshot), None));
                     (*snapshot).clone()
                 }
                 DecodedEvent::Delta {
@@ -3678,13 +3847,14 @@ mod tests {
                     ..
                 } => {
                     self.deltas += 1;
-                    let (cur_seq, prev) = self.recon.get(&session).expect("baseline 있어야 함");
+                    let (cur_seq, prev, _) = self.recon.get(&session).expect("baseline 있어야 함");
                     assert_eq!(*cur_seq, base_seq, "base_seq가 recon seq와 일치해야 한다");
                     let new = try_apply_delta(prev, &delta).expect("정상 delta는 적용돼야 한다");
-                    self.recon.insert(session, (seq, Arc::new(new.clone())));
+                    self.recon
+                        .insert(session, (seq, Arc::new(new.clone()), None));
                     new
                 }
-                DecodedEvent::Event(_) => panic!("viewport가 Event 봉투로 인코딩됨"),
+                _ => panic!("legacy viewport codec fixture의 예상 밖 event"),
             }
         }
     }
@@ -3790,14 +3960,104 @@ mod tests {
         assert_eq!(pipe.keyframes, 2, "80% 변경은 keyframe 폴백");
     }
 
+    fn resize_stamp(epoch: u64) -> crate::ResizeStamp {
+        let token = crate::ResizeToken {
+            owner: [1; 16],
+            generation: epoch,
+            owner_epoch: 1,
+        };
+        crate::ResizeStamp {
+            epoch,
+            owner_epoch: 1,
+            token: Some(token),
+            cols: 20,
+            rows: 5,
+        }
+    }
+
+    #[test]
+    fn tracked_resize_plain_delta_왕복은_stamp를_그대로_보존한다() {
+        let session = SessionId(1);
+        let stamp = resize_stamp(1);
+        let snapshot = make_snapshot(20, 5, &["a"], false);
+        let event = RuntimeEvent::ViewportTracked {
+            session,
+            snapshot: snapshot.clone(),
+            bracketed_paste: true,
+            stamp,
+        };
+        let frame = Codec::Plain.encode_event(&event).unwrap();
+        let DecodedEvent::Event(decoded) = Codec::Plain.decode_event(&frame).unwrap() else {
+            panic!("plain event");
+        };
+        assert_eq!(decoded.viewport().unwrap().3, Some(stamp));
+        let subscribers = Arc::default();
+        let mut sent = HashMap::new();
+        let mut recon = HashMap::new();
+        let mut pending = HashSet::new();
+        for snapshot in [snapshot, make_snapshot(20, 5, &["ab"], false)] {
+            let frame =
+                encode_viewport_frame_stamped(&mut sent, session, &snapshot, true, Some(stamp))
+                    .unwrap();
+            let decoded = Codec::Delta.decode_event(&frame).unwrap();
+            let outcome = reconstruct_and_dispatch(decoded, &subscribers, &mut recon, &mut pending);
+            assert!(!outcome.disconnect);
+            assert_eq!(recon[&session].2, Some(stamp));
+            assert_eq!(recon[&session].1.visible_cells, snapshot.visible_cells);
+        }
+    }
+
+    #[test]
+    fn tracked_resize_stamp가_달라지면_같은크기여도_keyframe이다() {
+        let session = SessionId(1);
+        let snapshot = make_snapshot(20, 5, &["a"], false);
+        let mut sent = HashMap::new();
+        encode_viewport_frame_stamped(&mut sent, session, &snapshot, false, Some(resize_stamp(1)))
+            .unwrap();
+        let frame = encode_viewport_frame_stamped(
+            &mut sent,
+            session,
+            &snapshot,
+            false,
+            Some(resize_stamp(2)),
+        )
+        .unwrap();
+        assert!(
+            matches!(Codec::Delta.decode_event(&frame).unwrap(), DecodedEvent::KeyframeTracked { stamp, .. } if stamp == resize_stamp(2))
+        );
+    }
+
+    #[test]
+    fn tracked_resize_delta의_stamp가_기준선과_다르면_한번만_재동기화한다() {
+        let session = SessionId(1);
+        let before = make_snapshot(20, 5, &["a"], false);
+        let after = make_snapshot(20, 5, &["ab"], false);
+        let mut recon = HashMap::from([(session, (0, before.clone(), Some(resize_stamp(1))))]);
+        let mut pending = HashSet::new();
+        let subscribers = Arc::default();
+        for expected in [Some(session), None] {
+            let decoded = DecodedEvent::DeltaTracked {
+                session,
+                seq: 1,
+                base_seq: 0,
+                delta: diff_viewport(&before, &after).unwrap(),
+                bracketed_paste: false,
+                stamp: resize_stamp(2),
+            };
+            let outcome = reconstruct_and_dispatch(decoded, &subscribers, &mut recon, &mut pending);
+            assert!(!outcome.disconnect);
+            assert_eq!(outcome.request_keyframe, expected);
+            assert!(recon.is_empty());
+        }
+    }
+
     /// gap 복구(§4.4): delta 유실로 base_seq가 앞서면 클라이언트가 keyframe을 요청하고,
     /// 서버는 baseline을 버려 다음 프레임을 keyframe으로 보내 재구성이 복구된다.
     #[test]
     fn delta_gap_복구() {
         let s = SessionId(1);
-        let mut last_sent: HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)> =
-            HashMap::new();
-        let mut recon: HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)> = HashMap::new();
+        let mut last_sent: HashMap<SessionId, ViewportBaseline> = HashMap::new();
+        let mut recon: HashMap<SessionId, ViewportBaseline> = HashMap::new();
 
         // keyframe(seq 0) — 클라이언트 baseline 세팅
         let s0 = make_snapshot(20, 5, &["a"], false);
@@ -3806,7 +4066,7 @@ mod tests {
         else {
             panic!("첫 프레임은 keyframe");
         };
-        recon.insert(s, (seq, snapshot));
+        recon.insert(s, (seq, snapshot, None));
 
         // 서버가 delta(seq 1)를 보내지만 유실됐다고 가정 — 클라이언트는 못 받는다.
         let s1 = make_snapshot(20, 5, &["ab"], false);
@@ -3818,7 +4078,7 @@ mod tests {
         let DecodedEvent::Delta { base_seq, .. } = Codec::Delta.decode_event(&f2).unwrap() else {
             panic!("seq 2는 delta");
         };
-        let (cur_seq, _) = recon.get(&s).unwrap();
+        let (cur_seq, _, _) = recon.get(&s).unwrap();
         assert_ne!(*cur_seq, base_seq, "base_seq 불일치(gap) 감지");
 
         // 클라이언트가 keyframe 요청 → 서버가 baseline 제거(RequestKeyframe 처리와 동일).
@@ -3853,8 +4113,8 @@ mod tests {
         let s = SessionId(7);
         // 클라이언트 recon seq를 5로 세팅.
         let base = make_snapshot(10, 3, &["x"], false);
-        let mut recon: HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)> = HashMap::new();
-        recon.insert(s, (5, base.clone()));
+        let mut recon: HashMap<SessionId, ViewportBaseline> = HashMap::new();
+        recon.insert(s, (5, base.clone(), None));
         let mut pending: HashSet<SessionId> = HashSet::new();
 
         // base_seq 3 ≠ recon seq 5 → gap.
@@ -3976,8 +4236,8 @@ mod tests {
         let s = SessionId(3);
         // recon seq 0으로 baseline 세팅 — base_seq는 일치시키되 delta 내용만 기형으로.
         let base = make_snapshot(10, 3, &["x"], false);
-        let mut recon: HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)> = HashMap::new();
-        recon.insert(s, (0, base));
+        let mut recon: HashMap<SessionId, ViewportBaseline> = HashMap::new();
+        recon.insert(s, (0, base, None));
         let mut pending: HashSet<SessionId> = HashSet::new();
 
         // base_seq 0(일치)이지만 row가 범위 밖 + cells 수 불일치 → try_apply_delta가 Err.
@@ -4027,8 +4287,7 @@ mod tests {
     #[test]
     fn session_exited는_서버_last_sent_정리() {
         let s = SessionId(5);
-        let mut last_sent: HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)> =
-            HashMap::new();
+        let mut last_sent: HashMap<SessionId, ViewportBaseline> = HashMap::new();
         let snap = make_snapshot(10, 3, &["a"], false);
         encode_viewport_frame(&mut last_sent, s, &snap, false).unwrap();
         assert!(last_sent.contains_key(&s), "keyframe이 baseline을 남긴다");
@@ -4062,8 +4321,7 @@ mod tests {
         let visible_session = SessionId(22);
         let hidden_snap = make_snapshot(10, 3, &["hidden"], false);
         let visible_snap = make_snapshot(10, 3, &["visible"], false);
-        let mut last_sent: HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)> =
-            HashMap::new();
+        let mut last_sent: HashMap<SessionId, ViewportBaseline> = HashMap::new();
         encode_viewport_frame(&mut last_sent, hidden, &hidden_snap, false).unwrap();
         encode_viewport_frame(&mut last_sent, visible_session, &visible_snap, false).unwrap();
         assert!(last_sent.contains_key(&hidden));
@@ -4123,11 +4381,11 @@ mod tests {
         let hidden = SessionId(31);
         let visible_session = SessionId(32);
         let subscribers: Arc<Mutex<Vec<RemoteSubscriber>>> = Arc::default();
-        let mut recon: HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)> = HashMap::new();
-        recon.insert(hidden, (0, make_snapshot(10, 3, &["hidden"], false)));
+        let mut recon: HashMap<SessionId, ViewportBaseline> = HashMap::new();
+        recon.insert(hidden, (0, make_snapshot(10, 3, &["hidden"], false), None));
         recon.insert(
             visible_session,
-            (0, make_snapshot(10, 3, &["visible"], false)),
+            (0, make_snapshot(10, 3, &["visible"], false), None),
         );
         let mut pending = HashSet::new();
         pending.insert(hidden);
@@ -4167,8 +4425,7 @@ mod tests {
     fn 종료_배치의_trailing_viewport는_baseline_되살리지_않는다() {
         let s = SessionId(8);
         // 이전 tick의 keyframe으로 양쪽에 baseline이 있었다고 가정.
-        let mut last_sent: HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)> =
-            HashMap::new();
+        let mut last_sent: HashMap<SessionId, ViewportBaseline> = HashMap::new();
         let snap0 = make_snapshot(10, 3, &["a"], false);
         encode_viewport_frame(&mut last_sent, s, &snap0, false).unwrap();
         assert!(last_sent.contains_key(&s));
@@ -4229,8 +4486,8 @@ mod tests {
                 viewports: Arc::clone(&slot),
                 input_pressures: Arc::default(),
             }]));
-        let mut recon: HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)> = HashMap::new();
-        recon.insert(s, (0, snap0)); // 클라도 baseline이 있었음
+        let mut recon: HashMap<SessionId, ViewportBaseline> = HashMap::new();
+        recon.insert(s, (0, snap0, None)); // 클라도 baseline이 있었음
         let mut pending: HashSet<SessionId> = HashSet::new();
 
         let dec_exit = Codec::Delta.decode_event(&exit_frame).unwrap();
@@ -4269,8 +4526,8 @@ mod tests {
         let subscribers: Arc<Mutex<Vec<RemoteSubscriber>>> = Arc::default();
 
         let s = SessionId(6);
-        let mut recon: HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)> = HashMap::new();
-        recon.insert(s, (2, make_snapshot(10, 3, &["a"], false)));
+        let mut recon: HashMap<SessionId, ViewportBaseline> = HashMap::new();
+        recon.insert(s, (2, make_snapshot(10, 3, &["a"], false), None));
         let mut pending: HashSet<SessionId> = HashSet::new();
         pending.insert(s);
 

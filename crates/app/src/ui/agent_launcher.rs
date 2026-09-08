@@ -224,6 +224,11 @@ impl AgentLauncherUi {
         self.open
     }
 
+    /// 다른 workspace의 런처를 이 workspace에 예정된 세션으로 세지 않는다.
+    pub(crate) fn is_open_for(&self, workspace_id: &str) -> bool {
+        self.open && self.workspace_id == workspace_id
+    }
+
     pub(crate) fn launch_succeeded(&mut self) {
         self.launch_pending = false;
         self.error = None;
@@ -1066,6 +1071,16 @@ const fn effort_message_key(effort: ReasoningEffort) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn launcher_spawn_is_open_for_tracks_only_own_workspace_and_closure() {
+        let mut ui = super::AgentLauncherUi::new();
+        assert!(!ui.is_open_for("a"));
+        ui.open_for("a".to_owned(), "Project".to_owned());
+        assert!(ui.is_open_for("a"));
+        assert!(!ui.is_open_for("b"));
+        ui.launch_succeeded();
+        assert!(!ui.is_open_for("a"));
+    }
     use super::*;
     use std::path::PathBuf;
 

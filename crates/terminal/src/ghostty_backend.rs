@@ -218,6 +218,19 @@ impl TerminalBackend for GhosttyBackend {
         Ok(())
     }
 
+    fn grid_dimensions(&self) -> anyhow::Result<(u16, u16)> {
+        // 렌더 갱신은 dirty 상태를 소비하므로 실제 terminal 메타데이터만 조회한다.
+        let cols = self
+            .term
+            .cols()
+            .map_err(|_| anyhow::anyhow!("ghostty 실제 열 조회 실패"))?;
+        let rows = self
+            .term
+            .rows()
+            .map_err(|_| anyhow::anyhow!("ghostty 실제 행 조회 실패"))?;
+        Ok((cols, rows))
+    }
+
     fn render_model(&self) -> TerminalRenderModel {
         TerminalRenderModel::CellGrid
     }
@@ -358,7 +371,7 @@ impl TerminalBackend for GhosttyBackend {
     }
 
     fn set_cache_class(&mut self, class: TerminalCacheClass) -> Option<TerminalCacheEvent> {
-        // libghostty-vt 0.1에는 scrollback 상한 런타임 변경 API가 없다 —
+        // libghostty-vt 0.2에는 scrollback 상한 런타임 변경 API가 없다 —
         // class만 기록하고 trim 이벤트는 내지 않는다 (§14.3 편차, 파일 헤더 참조).
         self.cache_class = class;
         None

@@ -272,6 +272,8 @@ impl InProcessRuntimeClient {
                         .unwrap_or_default(),
                     next_id: 1,
                     sessions: std::collections::HashMap::new(),
+                    resize_epoch: 0,
+                    resize_records: std::collections::HashMap::new(),
                     session_redaction_leases: std::collections::HashMap::new(),
                     seed_redaction_lease: None,
                     logs: std::collections::HashMap::new(),
@@ -290,9 +292,17 @@ impl InProcessRuntimeClient {
                     exited_order: std::collections::VecDeque::new(),
                     max_exited_backends: DEFAULT_MAX_EXITED_BACKENDS,
                     cache_budget_bytes: TERMINAL_GLOBAL_CACHE_BUDGET_BYTES,
+                    scrollback_policy: None,
+                    scrollback_results: std::collections::HashMap::new(),
+                    scrollback_trimmed: 0,
+                    pending_scrollback_ceilings: std::collections::HashMap::new(),
+                    scrollback_batching: false,
+                    scrollback_ack_pending: false,
+                    scrollback_restored: false,
                     archived: std::collections::HashMap::new(),
                     archived_order: std::collections::VecDeque::new(),
-                    archived_on_disk: std::collections::HashSet::new(),
+                    archived_on_disk: std::collections::HashMap::new(),
+                    archive_failed: std::collections::HashSet::new(),
                     archive_disk_bytes,
                     archive_root_identity,
                     hidden_scrollback: std::collections::HashSet::new(),
@@ -675,6 +685,8 @@ struct Worker {
     /// Checked redaction leases are retained for exactly as long as their live/readable session.
     /// A session may need more than one lease when restored dotenv values supplement the resolved
     /// default credential set. Removal/archive drops the complete set and starts grace expiry.
+    resize_epoch: u64,
+    resize_records: std::collections::HashMap<SessionId, crate::resize::ResizeRecord>,
     session_redaction_leases: std::collections::HashMap<SessionId, Vec<RedactionLease>>,
     /// Wire compatibility for `SeedRedaction`: one latest-only checked lease replaces the legacy
     /// permanent corpus registration. Production composition no longer sends this command.
@@ -713,6 +725,15 @@ struct Worker {
     max_exited_backends: usize,
     /// 이 runtime에 배정된 프로세스 전역 터미널 캐시 바이트 예산의 share.
     cache_budget_bytes: usize,
+    /// 최신 정책 한 개와 현재 세션 수로 제한한 적용 결과만 보관한다.
+    scrollback_policy: Option<(u64, u32)>,
+    scrollback_results: std::collections::HashMap<SessionId, terminal::ScrollbackApplyResult>,
+    scrollback_trimmed: u64,
+    // 시작 시 bounded catalog(최대256 pane)에 있던 영속 identity만 추적한다.
+    pending_scrollback_ceilings: std::collections::HashMap<String, usize>,
+    scrollback_batching: bool,
+    scrollback_ack_pending: bool,
+    scrollback_restored: bool,
     /// 압축 아카이브 — 백엔드를 내린 exited 세션의 zlib(ANSI) 덤프. pane이 다시
     /// 보이면 복원(inflate)한다 (§14.3 확장, 2026-07-11).
     archived: std::collections::HashMap<SessionId, ArchivedScrollback>,
@@ -720,7 +741,9 @@ struct Worker {
     archived_order: std::collections::VecDeque<SessionId>,
     /// 디스크 아카이브(scrollback.zlib)가 있는 세션들 (PR-A1) — 메모리 아카이브가
     /// 예산 축출돼도 디스크에서 복원 가능함을 fs stat 없이 판정한다.
-    archived_on_disk: std::collections::HashSet<SessionId>,
+    archived_on_disk: std::collections::HashMap<SessionId, usize>,
+    /// 변하지 않는 exited 화면의 실패를 매 pump마다 재직렬화하지 않는다.
+    archive_failed: std::collections::HashSet<SessionId>,
     /// 디스크 아카이브 총 바이트의 증분 캐시 (A1 리뷰 P2). 워커 시작 시 1회 스캔으로
     /// 시드하고, 기록 성공마다 그 파일 크기만 더한다. 예산 초과가 확정될 때만 gc를
     /// 호출(그때만 전체 디렉터리 스캔+제거)해 매 exit 전체 스캔 비용을 없앤다.
@@ -1155,12 +1178,275 @@ impl Worker {
         }
     }
 
+    fn emit_resize_result(
+        &self,
+        session: SessionId,
+        token: crate::ResizeToken,
+        result: Result<crate::ResizeStamp, crate::ResizeFailure>,
+    ) {
+        self.emit(match result {
+            Ok(stamp) => RuntimeEvent::ResizeApplied { session, stamp },
+            Err(reason) => RuntimeEvent::ResizeFailed {
+                session,
+                token,
+                reason,
+            },
+        });
+    }
+
+    fn invalidate_resize(&mut self, session: SessionId) {
+        let Some(record) = self.resize_records.get_mut(&session) else {
+            return;
+        };
+        record.result = Err(crate::ResizeFailure::Superseded);
+        let Some(epoch) = self.resize_epoch.checked_add(1) else {
+            record.stamp = None;
+            return;
+        };
+        self.resize_epoch = epoch;
+        record.stamp = self
+            .sessions
+            .get(&session)
+            .and_then(Session::grid_dimensions)
+            .map(|(cols, rows)| crate::ResizeStamp {
+                epoch,
+                owner_epoch: record.token.owner_epoch,
+                token: None,
+                cols,
+                rows,
+            });
+    }
+
+    fn apply_tracked_resize(
+        &mut self,
+        session: SessionId,
+        token: crate::ResizeToken,
+        cols: u16,
+        rows: u16,
+    ) {
+        use crate::resize::{ResizeDecision, ResizeRecord};
+        use crate::{ResizeFailure, ResizeStamp};
+        if !self.sessions.contains_key(&session) {
+            self.emit_resize_result(session, token, Err(ResizeFailure::MissingSession));
+            return;
+        }
+        if !self.resize_records.contains_key(&session) && token.owner_epoch != 1 {
+            self.emit_resize_result(session, token, Err(ResizeFailure::Superseded));
+            return;
+        }
+        if let Some(record) = self.resize_records.get(&session)
+            && let ResizeDecision::Replay(result) = record.classify(token, (cols, rows))
+        {
+            self.emit_resize_result(session, token, result);
+            if result.is_ok()
+                || matches!(
+                    result,
+                    Err(ResizeFailure::Conflict | ResizeFailure::Superseded)
+                )
+            {
+                if let Some(active) = self.sessions.get_mut(&session) {
+                    active.mark_full_dirty();
+                }
+                self.push_watched_viewports();
+            }
+            return;
+        }
+        let Some(epoch) = self.resize_epoch.checked_add(1) else {
+            self.emit_resize_result(session, token, Err(ResizeFailure::CounterExhausted));
+            return;
+        };
+        self.resize_epoch = epoch;
+        let active = self
+            .sessions
+            .get_mut(&session)
+            .expect("위에서 세션 존재 확인");
+        let applied = active.resize_checked(cols, rows);
+        let actual = active.grid_dimensions();
+        let result = match applied {
+            Ok(applied) => {
+                if let Some(event) = applied.cache_event {
+                    trace_terminal_cache_event(session, event);
+                }
+                Ok(ResizeStamp {
+                    epoch,
+                    owner_epoch: token.owner_epoch,
+                    token: Some(token),
+                    cols: applied.cols,
+                    rows: applied.rows,
+                })
+            }
+            Err(error) => Err(match error {
+                session::ResizeError::InvalidSize => ResizeFailure::SizeMismatch,
+                session::ResizeError::Backend => ResizeFailure::Backend,
+                session::ResizeError::Pty => ResizeFailure::Pty,
+                session::ResizeError::Dimensions => ResizeFailure::Dimensions,
+                session::ResizeError::SizeMismatch => ResizeFailure::SizeMismatch,
+            }),
+        };
+        let stamp = actual.map(|(cols, rows)| ResizeStamp {
+            epoch,
+            owner_epoch: token.owner_epoch,
+            token: result.is_ok().then_some(token),
+            cols,
+            rows,
+        });
+        let mut record = self
+            .resize_records
+            .get(&session)
+            .copied()
+            .unwrap_or_else(|| ResizeRecord::new(token, (cols, rows), result, stamp));
+        if let Err(reason) = record.change_owner(token) {
+            self.emit_resize_result(session, token, Err(reason));
+            return;
+        }
+        record.target = (cols, rows);
+        record.result = result;
+        record.stamp = stamp;
+        self.resize_records.insert(session, record);
+        if result.is_ok() {
+            self.save_terminal_size(session, cols, rows);
+        }
+        crate::signal_memory_released();
+        self.emit_resize_result(session, token, result);
+        self.push_watched_viewports();
+    }
+
     fn remove_session(&mut self, session: SessionId) -> Option<Session> {
+        self.invalidate_resize(session);
+        self.scrollback_results.remove(&session);
+        self.archive_failed.remove(&session);
         self.session_redaction_leases.remove(&session);
-        self.sessions.remove(&session)
+        let removed = self.sessions.remove(&session);
+        if removed.is_some() {
+            self.emit_scrollback_result();
+        }
+        removed
+    }
+
+    fn requested_scrollback(&self, fallback: usize) -> usize {
+        self.scrollback_policy
+            .map_or(fallback, |(_, requested)| requested as usize)
+    }
+
+    /// 보관 중인 archive의 낮아진 한도는 이후 증가 요청으로 되살리지 않는다.
+    fn restored_scrollback(&self, session: SessionId, stored: usize) -> usize {
+        self.requested_scrollback(stored).min(stored).min(
+            self.archived_on_disk
+                .get(&session)
+                .copied()
+                .unwrap_or(usize::MAX),
+        )
+    }
+
+    fn insert_session(&mut self, id: SessionId, mut session: Session) {
+        if let Some((_, requested)) = self.scrollback_policy {
+            let result = session.set_scrollback_limit(requested as usize);
+            self.record_scrollback_result(id, result);
+        }
+        self.sessions.insert(id, session);
+        self.invalidate_resize(id);
+        // 여러 pane을 한 명령으로 복원해도 다음 backend를 만들기 전에 예산을 적용한다.
+        if self.terminal_cache_bytes() > self.cache_budget_bytes {
+            let mut visible = self.mux.watched_sessions();
+            visible.extend(self.remote_viewing.keys().copied());
+            if self.trim_live_over_budget(&visible) {
+                crate::signal_memory_released();
+            }
+        }
+        self.emit_scrollback_result();
+    }
+
+    fn record_scrollback_result(&mut self, id: SessionId, result: terminal::ScrollbackApplyResult) {
+        if let terminal::ScrollbackApplyResult::Applied { trimmed, .. } = result {
+            self.scrollback_trimmed = self.scrollback_trimmed.saturating_add(trimmed as u64);
+        }
+        self.scrollback_results.insert(id, result);
+    }
+
+    fn emit_scrollback_result(&mut self) {
+        if self.scrollback_batching {
+            self.scrollback_ack_pending = true;
+            return;
+        }
+        let Some((generation, requested)) = self.scrollback_policy else {
+            return;
+        };
+        let mut applied = 0u16;
+        let mut unsupported = 0u16;
+        let mut effective_min = usize::MAX;
+        for (id, result) in &self.scrollback_results {
+            match result {
+                terminal::ScrollbackApplyResult::Applied { effective, .. } => {
+                    applied = applied.saturating_add(1);
+                    let current = self.sessions.get(id).map_or(*effective, |session| {
+                        session.cache_footprint().scrollback_limit_lines
+                    });
+                    effective_min = effective_min.min(current);
+                }
+                terminal::ScrollbackApplyResult::Unsupported => {
+                    unsupported = unsupported.saturating_add(1)
+                }
+            }
+        }
+        self.emit(RuntimeEvent::ScrollbackLimitApplied {
+            generation,
+            requested,
+            applied,
+            unsupported,
+            trimmed: self.scrollback_trimmed,
+            // 감사/복구 로그를 삭제하지 않으므로 재시작 후 영속 삭제를 보장하지 않는다.
+            durable: false,
+            restored: self.scrollback_restored,
+            effective_min: if applied == 0 {
+                0
+            } else {
+                effective_min as u32
+            },
+        });
+    }
+
+    fn apply_scrollback_policy(&mut self, generation: u64, requested: u32) {
+        if let Some((current, value)) = self.scrollback_policy
+            && (generation < current || (generation == current && requested != value))
+        {
+            return;
+        }
+        if self.scrollback_policy != Some((generation, requested)) {
+            if let Some(pipe) = &self.persist {
+                for key in pipe.pending_session_ids() {
+                    self.pending_scrollback_ceilings
+                        .entry(key.to_owned())
+                        .or_insert(requested as usize);
+                }
+            }
+            for limit in self.pending_scrollback_ceilings.values_mut() {
+                *limit = (*limit).min(requested as usize);
+            }
+            self.scrollback_policy = Some((generation, requested));
+            self.scrollback_results.clear();
+            self.scrollback_trimmed = 0;
+            let results = self
+                .sessions
+                .iter_mut()
+                .map(|(id, session)| (*id, session.set_scrollback_limit(requested as usize)))
+                .collect::<Vec<_>>();
+            for (id, result) in results {
+                self.record_scrollback_result(id, result);
+            }
+            for entry in self.archived.values_mut() {
+                entry.scrollback_lines = entry.scrollback_lines.min(requested as usize);
+            }
+            for limit in self.archived_on_disk.values_mut() {
+                *limit = (*limit).min(requested as usize);
+            }
+            self.push_watched_viewports();
+        }
+        // ACK 유실 후 같은 요청을 재전송해도 다시 압축하거나 기록을 추가 삭제하지 않는다.
+        self.emit_scrollback_result();
     }
 
     fn spawn_session(
+        &self,
         id: SessionId,
         kind: session::SessionKind,
         spec: &CommandSpec,
@@ -1188,7 +1474,7 @@ impl Worker {
             spec,
             cols,
             rows,
-            scrollback_lines,
+            self.requested_scrollback(scrollback_lines),
             output_wake,
         )
     }
@@ -1325,6 +1611,34 @@ impl Worker {
     /// slot 기록은 유지해 탭 전환/Active 복귀 시 따라잡는다 (P5 리뷰 P1).
     /// Viewport 외 이벤트에는 무의미(항상 true로 호출).
     fn emit_gated(&self, event: RuntimeEvent, gui_viewport: bool) {
+        let event = match event {
+            RuntimeEvent::Viewport {
+                session,
+                snapshot,
+                bracketed_paste,
+            } if self
+                .resize_records
+                .get(&session)
+                .and_then(|record| record.stamp)
+                .is_some() =>
+            {
+                let mut stamp = self.resize_records[&session]
+                    .stamp
+                    .expect("위에서 stamp 확인");
+                if (stamp.cols, stamp.rows) != (snapshot.cols, snapshot.rows) {
+                    stamp.token = None;
+                    stamp.cols = snapshot.cols;
+                    stamp.rows = snapshot.rows;
+                }
+                RuntimeEvent::ViewportTracked {
+                    session,
+                    snapshot,
+                    bracketed_paste,
+                    stamp,
+                }
+            }
+            event => event,
+        };
         // Viewport는 최신본 slot 덮어쓰기 (누적/유실/blocking 없음 — 느린 소비자도
         // 재개 시 항상 최종 화면을 본다), 상태 이벤트는 채널 send.
         // receiver가 drop된 구독자는 제거: slot 경로는 Arc strong_count로 판별
@@ -1335,17 +1649,17 @@ impl Worker {
         {
             let mut subscribers = self.subscribers.lock().expect("subscribers lock");
             subscribers.retain(|subscriber| {
-                if let RuntimeEvent::Viewport { session, .. } = &event {
+                if let Some((session, _, _, _)) = event.viewport() {
                     if Arc::strong_count(&subscriber.viewports) <= 1 {
                         return false;
                     }
                     {
                         let mut slot = subscriber.viewports.lock().expect("viewport slot lock");
-                        let prev = slot.insert(*session, event.clone());
+                        let prev = slot.insert(session, event.clone());
                         // 미소비 이전 스냅샷의 dirty 델타를 합친다 — 안 그러면 그 행들이
                         // renderer 재shaping에서 빠져 stale로 남는다 (event.rs 헬퍼 주석).
                         if let Some(prev) = prev
-                            && let Some(current) = slot.get_mut(session)
+                            && let Some(current) = slot.get_mut(&session)
                         {
                             crate::event::merge_unconsumed_viewport_dirty(&prev, current);
                         }
@@ -1462,7 +1776,18 @@ impl Worker {
         }
     }
 
-    fn handle_command(&mut self, mut command: RuntimeCommand) {
+    fn handle_command(&mut self, command: RuntimeCommand) {
+        // 하나의 복원 명령이 만든 세션 전체를 집계한 뒤 완료를 알린다.
+        self.scrollback_batching = true;
+        self.handle_command_inner(command);
+        self.scrollback_batching = false;
+        if self.scrollback_ack_pending {
+            self.scrollback_ack_pending = false;
+            self.emit_scrollback_result();
+        }
+    }
+
+    fn handle_command_inner(&mut self, mut command: RuntimeCommand) {
         // All production senders already use this primitive before queue retention. Reapplying it
         // here is an idempotent defense for direct/internal producers and preserves fail-closed
         // worker semantics without duplicating validation or canonicalization rules.
@@ -1501,7 +1826,7 @@ impl Worker {
                         return;
                     }
                 };
-                match Self::spawn_session(
+                match self.spawn_session(
                     id,
                     session::SessionKind::Shell,
                     &spec, // 테스트 주입 가능해야 하므로 default_shell 헬퍼 대신 spec 직접
@@ -1510,7 +1835,7 @@ impl Worker {
                     scrollback_lines,
                 ) {
                     Ok(new_session) => {
-                        self.sessions.insert(id, new_session);
+                        self.insert_session(id, new_session);
                         self.retain_session_redaction_leases(id, leases);
                         // 셸도 status detector 설치 — regex 패턴은 없지만 idle heuristic
                         // (3단)이 Running/Idle을 감지해 레일에 상태가 반영된다(#2). agent와
@@ -1612,7 +1937,7 @@ impl Worker {
                     // 에이전트도 워크스페이스 폴더에서 실행 — 셸과 동일 cwd(agent 이어가기).
                     cwd: self.shell.cwd.clone(),
                 };
-                match Self::spawn_session(
+                match self.spawn_session(
                     id,
                     session::SessionKind::Agent,
                     &spec,
@@ -1621,7 +1946,7 @@ impl Worker {
                     scrollback_lines,
                 ) {
                     Ok(new_session) => {
-                        self.sessions.insert(id, new_session);
+                        self.insert_session(id, new_session);
                         self.retain_session_redaction_leases(id, redaction_leases);
                         let patterns = StatusPatterns::compile(
                             waiting_regex.as_deref(),
@@ -1693,6 +2018,10 @@ impl Worker {
                     pipe.update_session_cwd(session, &cwd);
                 }
             }
+            RuntimeCommand::SetScrollbackLimit {
+                generation,
+                requested,
+            } => self.apply_scrollback_policy(generation, requested),
             RuntimeCommand::SetTerminalCachePolicy {
                 max_exited_backends,
                 cache_budget_bytes,
@@ -1714,7 +2043,7 @@ impl Worker {
                     // id는 무시한다 (stale 커맨드가 유령 lease를 만들지 않게).
                     let known = self.sessions.contains_key(&session)
                         || self.archived.contains_key(&session)
-                        || self.archived_on_disk.contains(&session);
+                        || self.archived_on_disk.contains_key(&session);
                     if known {
                         let ttl =
                             Duration::from_millis(u64::from(ttl_ms)).min(REMOTE_VIEWING_TTL_CAP);
@@ -1776,6 +2105,14 @@ impl Worker {
                     view: self.session_status_view(session),
                 });
             }
+            RuntimeCommand::ResizeTracked {
+                session,
+                token,
+                cols,
+                rows,
+            } => {
+                self.apply_tracked_resize(session, token, cols, rows);
+            }
             RuntimeCommand::Resize {
                 session,
                 cols,
@@ -1792,6 +2129,7 @@ impl Worker {
                         TerminalCacheClass::Hidden | TerminalCacheClass::Exited
                     );
                     self.save_terminal_size(session, cols, rows);
+                    self.invalidate_resize(session);
                     if freed_scrollback {
                         crate::signal_memory_released();
                     }
@@ -1955,11 +2293,15 @@ impl Worker {
                 if !self.suspended && (self.sessions.is_empty() || self.lazy_restore.is_some()) {
                     self.restore_saved_layout();
                 }
+                self.scrollback_restored = true;
+                self.emit_scrollback_result();
             }
             RuntimeCommand::RestoreWorkspacePane { pane } => {
                 if !self.suspended {
                     self.restore_saved_pane(&pane);
                 }
+                self.scrollback_restored = true;
+                self.emit_scrollback_result();
             }
             RuntimeCommand::DurableEventBarrier { correlation_id } => {
                 self.emit(RuntimeEvent::DurableEventBarrierReached { correlation_id });
@@ -2103,15 +2445,31 @@ impl Worker {
 
     /// pane이 가리키는 이전 영속 세션의 redacted ANSI를 새 terminal backend에
     /// 스트리밍 재생한다. 파일이 없는 최초/legacy 세션은 정상적인 빈 복원이다.
-    fn replay_saved_ansi(logs_root: &std::path::Path, persistent_id: &str, session: &mut Session) {
-        Self::replay_saved_ansi_ext(logs_root, persistent_id, session, true);
+    fn replay_saved_ansi(&mut self, persistent_id: &str, session: &mut Session) {
+        self.replay_saved_ansi_ext(persistent_id, session, true);
     }
 
-    /// `finish_boundary`: 재생 후 모드 경계(alt-screen 종료 등)를 리셋할지.
-    /// 셸 respawn 복원은 새 PTY가 붙기 전 정리가 필요해 true. **agent 열람 전용
-    /// 복원(PR-A2 폴백)은 false** — PTY가 안 붙으므로, alt-screen을 강제 종료하면
-    /// "종료 순간 화면 보존" 정책(PR-A1 §8)을 어기고 primary 빈 버퍼가 보인다.
     fn replay_saved_ansi_ext(
+        &mut self,
+        persistent_id: &str,
+        session: &mut Session,
+        finish_boundary: bool,
+    ) {
+        let future = self.requested_scrollback(session.cache_footprint().scrollback_limit_lines);
+        // 이 실행에서 낮춘 뒤 아직 복원하지 않은 로그도 낮은 한도로 딱 한 번 재생한다.
+        session.set_scrollback_limit(
+            future.min(
+                self.pending_scrollback_ceilings
+                    .get(persistent_id)
+                    .copied()
+                    .unwrap_or(future),
+            ),
+        );
+        Self::replay_saved_ansi_raw(&self.logs_root, persistent_id, session, finish_boundary);
+        session.set_scrollback_limit(future);
+    }
+
+    fn replay_saved_ansi_raw(
         logs_root: &std::path::Path,
         persistent_id: &str,
         session: &mut Session,
@@ -2290,6 +2648,12 @@ impl Worker {
                 panes,
             } = tab;
             for pane_state in panes {
+                if let Some(key) = &pane_state.session_id {
+                    let requested = self.requested_scrollback(Self::RESTORE_SCROLLBACK_LINES);
+                    self.pending_scrollback_ceilings
+                        .entry(key.clone())
+                        .or_insert(requested);
+                }
                 self.mux.panes.insert(
                     pane_state.id.clone(),
                     MuxPane::new(pane_state.id.clone(), pane_state.title.clone()),
@@ -2485,7 +2849,7 @@ impl Worker {
             .as_deref()
             .map(|persistent_id| Self::restored_terminal_size(&self.logs_root, persistent_id))
             .unwrap_or((DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS));
-        let restored_session = match Self::spawn_session(
+        let restored_session = match self.spawn_session(
             id,
             session::SessionKind::Shell,
             &spec,
@@ -2495,9 +2859,9 @@ impl Worker {
         ) {
             Ok(mut new_session) => {
                 if let Some(persistent_id) = pane_state.session_id.as_deref() {
-                    Self::replay_saved_ansi(&self.logs_root, persistent_id, &mut new_session);
+                    self.replay_saved_ansi(persistent_id, &mut new_session);
                 }
-                self.sessions.insert(id, new_session);
+                self.insert_session(id, new_session);
                 self.retain_session_redaction_leases(id, redaction_leases);
                 // 복원된 셸도 status detector 설치 — 없으면 상태 감지가 아예 안 됐다
                 // (셸 135가 복원 셸이라 built-in 프롬프트 감지도 무동작, #92/#93).
@@ -2576,7 +2940,14 @@ impl Worker {
                     archive_kind_from_u8(meta.kind),
                     meta.cols,
                     meta.rows,
-                    meta.scrollback_lines as usize,
+                    self.requested_scrollback(meta.scrollback_lines as usize)
+                        .min(meta.scrollback_lines as usize)
+                        .min(
+                            self.pending_scrollback_ceilings
+                                .get(persistent_id)
+                                .copied()
+                                .unwrap_or(usize::MAX),
+                        ),
                     meta.exit_code,
                     &mut stream,
                 );
@@ -2596,12 +2967,12 @@ impl Worker {
                     session::SessionKind::Agent,
                     cols,
                     rows,
-                    Self::RESTORE_SCROLLBACK_LINES,
+                    self.requested_scrollback(Self::RESTORE_SCROLLBACK_LINES),
                     None,
                     &mut std::io::empty(),
                 );
                 // 열람 전용 — 모드 경계 리셋 생략(alt-screen 화면 보존, codex 리뷰 P2)
-                Self::replay_saved_ansi_ext(&self.logs_root, persistent_id, &mut session, false);
+                self.replay_saved_ansi_ext(persistent_id, &mut session, false);
                 (session, false)
             }
         };
@@ -2610,9 +2981,10 @@ impl Worker {
         {
             return false;
         }
-        self.sessions.insert(id, restored);
+        let restored_limit = restored.cache_footprint().scrollback_limit_lines;
+        self.insert_session(id, restored);
         if restored_from_disk {
-            self.archived_on_disk.insert(id);
+            self.archived_on_disk.insert(id, restored_limit);
         }
         self.exited_order.push_back(id);
         let mut pane = MuxPane::new(pane_state.id.clone(), pane_state.title.clone());
@@ -2739,7 +3111,7 @@ impl Worker {
             env,
             cwd,
         };
-        match Self::spawn_session(
+        match self.spawn_session(
             id,
             session::SessionKind::Agent,
             &spec,
@@ -2751,8 +3123,20 @@ impl Worker {
                 // 이전(열람 전용) 화면을 잃지 않는다 — 셸 respawn 복원(restore_pane)과
                 // 같은 연속성 패턴: 새 세션의 scrollback에 이전 redacted ANSI를 먼저
                 // 재생한 뒤, 이번 tick부터 도착하는 라이브 PTY 출력이 그 뒤를 잇는다.
-                Self::replay_saved_ansi(&self.logs_root, &persistent_id, &mut new_session);
-                self.sessions.insert(id, new_session);
+                if let Some(previous) = self.sessions.get_mut(&session) {
+                    let had_output = previous.cache_footprint().history_lines > 0
+                        || !previous.screen_text().trim().is_empty();
+                    // 직렬화 미지원/출력상한과 무관하게 현재 backend 소유권을 이어받는다.
+                    new_session.inherit_terminal_from(previous);
+                    if had_output && let Err(error) = new_session.finish_ansi_replay() {
+                        trace_runtime_failure(
+                            "respawn_replay",
+                            "respawn_replay_finish_failed",
+                            error,
+                        );
+                    }
+                }
+                self.insert_session(id, new_session);
                 self.retain_session_redaction_leases(id, redaction_leases);
                 // 세션 행에 함께 저장해둔 spawn 시점 regex를 그대로 복원한다 —
                 // agent_configs를 다시 조회하지 않는다(그 사이 설정이 바뀌었거나
@@ -2858,7 +3242,7 @@ impl Worker {
                 return;
             }
         };
-        match Self::spawn_session(
+        match self.spawn_session(
             id,
             session::SessionKind::Shell,
             &spec,
@@ -2867,7 +3251,7 @@ impl Worker {
             scrollback_lines,
         ) {
             Ok(new_session) => {
-                self.sessions.insert(id, new_session);
+                self.insert_session(id, new_session);
                 self.retain_session_redaction_leases(id, redaction_leases);
                 // 분할로 만든 셸도 status detector 설치 (감지 누락 방지, #92/#93).
                 self.detectors.insert(
@@ -3186,6 +3570,17 @@ impl Worker {
     /// "slot에 Viewport가 있으면 그 세션의 Spawned가 같은 drain에 포함"이라는
     /// RuntimeEventReceiver::drain의 happens-before 계약이 유지된다 (codex 리뷰).
     fn emit_mux_snapshot(&mut self) {
+        // 활성/보관 세션 소유 범위를 벗어난 token/owner 이력을 누적하지 않는다.
+        self.resize_records.retain(|id, _| {
+            self.sessions.contains_key(id)
+                || self.archived.contains_key(id)
+                || self.archived_on_disk.contains_key(id)
+                || self
+                    .mux
+                    .panes
+                    .values()
+                    .any(|pane| pane.session_id == Some(*id))
+        });
         // mux 구조가 바뀐 지점 — 가시성 전이에 맞춰 scrollback cap 조정 (§14.3)
         self.reconcile_visibility();
         if self.lazy_restore.is_some() {
@@ -3224,7 +3619,8 @@ impl Worker {
         // dirty라 아래 루프가 같은 tick에 Viewport를 push한다 ("연결 중…" 공백 없음).
         for session in &targets {
             if !self.sessions.contains_key(session)
-                && (self.archived.contains_key(session) || self.archived_on_disk.contains(session))
+                && (self.archived.contains_key(session)
+                    || self.archived_on_disk.contains_key(session))
             {
                 self.inflate_archived(*session);
             }
@@ -3536,17 +3932,52 @@ impl Worker {
         // MuxUpdated로 pane 제거를 본다 (채널 FIFO). close_pane의 세션 정리는 위
         // exited 처리와 겹쳐도 멱등(no-op)이다.
         for session in exited_sessions {
-            let pane = self
-                .mux
-                .panes
-                .values()
-                .find(|p| p.session_id == Some(session))
-                .map(|p| p.id.clone());
-            if let Some(pane) = pane {
-                self.close_pane(pane);
-            }
+            self.close_exited_pane(session);
         }
         activity
+    }
+
+    fn close_exited_pane(&mut self, session: SessionId) {
+        self.close_exited_pane_with_budget(session, ARCHIVED_SCROLLBACK_BUDGET_BYTES);
+    }
+
+    fn close_exited_pane_with_budget(&mut self, session: SessionId, compressed_budget: usize) {
+        let pane = self
+            .mux
+            .panes
+            .values()
+            .find(|p| p.session_id == Some(session))
+            .map(|p| p.id.clone());
+        if let Some(pane) = pane {
+            if !self.archived_on_disk.contains_key(&session) {
+                if self.archive_failed.contains(&session) {
+                    return;
+                }
+                if let Some(live) = self.sessions.get_mut(&session) {
+                    match Self::make_archive_entry_with_budget(live, compressed_budget) {
+                        Ok(entry) => {
+                            self.archived_order.retain(|id| *id != session);
+                            self.archived_order.push_back(session);
+                            self.archived.insert(session, entry);
+                            self.trim_archived_budget();
+                        }
+                        Err(terminal::ScrollbackSerializeError::Unsupported) => {}
+                        Err(error) => {
+                            // 자동 exit의 보존 수단이 모두 실패한 경우만 화면을 남긴다.
+                            // 명시적 ClosePane은 이 경로를 거치지 않고 기존대로 폐기한다.
+                            self.archive_failed.insert(session);
+                            tracing::warn!(
+                                session = session.0,
+                                ?error,
+                                "자동 종료 아카이브 실패 — 화면 보존"
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
+            self.close_pane(pane);
+        }
     }
 
     fn session_status_view(&self, session: SessionId) -> session::SessionStatusView {
@@ -3661,12 +4092,28 @@ impl Worker {
         }
         let mut detached_any = false;
         for session in to_archive {
-            let Some(live) = self.sessions.get(&session) else {
+            if self.archive_failed.contains(&session) {
+                continue;
+            }
+            let Some(live) = self.sessions.get_mut(&session) else {
                 continue;
             };
             let estimated_bytes = live.cache_footprint().estimated_bytes;
             // 압축 아카이브 시도 — 성공하면 pane을 유지하고 다시 보일 때 복원한다
-            let entry = self.make_archive_entry(live);
+            let entry = match Self::make_archive_entry(live) {
+                Ok(entry) => Some(entry),
+                Err(terminal::ScrollbackSerializeError::Unsupported) => None,
+                Err(error) => {
+                    // 지원 backend는 완전한 최신 tail이 보존되기 전에 제거하지 않는다.
+                    self.archive_failed.insert(session);
+                    tracing::warn!(
+                        session = session.0,
+                        ?error,
+                        "아카이브 실패 — 최신 화면 보존"
+                    );
+                    continue;
+                }
+            };
             let restorable = entry.is_some();
             if let Some(entry) = entry {
                 self.archived_order.push_back(session);
@@ -3781,35 +4228,62 @@ impl Worker {
     }
 
     /// exited 세션의 scrollback을 zlib 압축 아카이브 항목으로 만든다.
-    /// 직렬화 미지원 백엔드(예: experimental ghostty)는 None.
-    fn make_archive_entry(&self, live: &Session) -> Option<ArchivedScrollback> {
-        let dump = live.serialize_scrollback()?;
-        if dump.len() > MAX_ARCHIVED_SCROLLBACK_RESTORE_BYTES {
-            return None;
+    /// 미지원과 보존 실패를 구분해 지원 backend의 최신 화면을 버리지 않는다.
+    fn make_archive_entry(
+        live: &mut Session,
+    ) -> Result<ArchivedScrollback, terminal::ScrollbackSerializeError> {
+        Self::make_archive_entry_with_budget(live, ARCHIVED_SCROLLBACK_BUDGET_BYTES)
+    }
+
+    fn make_archive_entry_with_budget(
+        live: &mut Session,
+        compressed_budget: usize,
+    ) -> Result<ArchivedScrollback, terminal::ScrollbackSerializeError> {
+        // 압축률이 낮아도 새 entry 자체가 LRU 예산을 넘지 않게 한다. 매 실패마다
+        // 실제 history가 절반 이하로 줄어들어 중첩 직렬화/압축 재시도도 유계다.
+        for _ in 0..=terminal::policy::SCROLLBACK_LINES_MAX.ilog2() + 1 {
+            let dump =
+                live.serialize_scrollback_for_archive(MAX_ARCHIVED_SCROLLBACK_RESTORE_BYTES)?;
+            let footprint = live.cache_footprint();
+            let exit_code = match live.lifecycle() {
+                session::SessionLifecycle::Exited { exit_code } => exit_code,
+                session::SessionLifecycle::Running => None,
+            };
+            let mut encoder =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            std::io::Write::write_all(&mut encoder, &dump)
+                .map_err(|_| terminal::ScrollbackSerializeError::Unavailable)?;
+            let compressed = encoder
+                .finish()
+                .map_err(|_| terminal::ScrollbackSerializeError::Unavailable)?;
+            if compressed.len() > compressed_budget {
+                let history = live.cache_footprint().history_lines;
+                if history == 0 {
+                    return Err(terminal::ScrollbackSerializeError::LimitExceeded);
+                }
+                live.trim_scrollback(history / 2);
+                if live.cache_footprint().history_lines >= history {
+                    return Err(terminal::ScrollbackSerializeError::LimitExceeded);
+                }
+                continue;
+            }
+            return Ok(ArchivedScrollback {
+                kind: live.kind(),
+                cols: footprint.columns as u16,
+                rows: footprint.screen_lines as u16,
+                scrollback_lines: footprint.scrollback_limit_lines,
+                exit_code,
+                compressed,
+            });
         }
-        let footprint = live.cache_footprint();
-        let exit_code = match live.lifecycle() {
-            session::SessionLifecycle::Exited { exit_code } => exit_code,
-            session::SessionLifecycle::Running => None,
-        };
-        let mut encoder =
-            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-        std::io::Write::write_all(&mut encoder, &dump).ok()?;
-        let compressed = encoder.finish().ok()?;
-        Some(ArchivedScrollback {
-            kind: live.kind(),
-            cols: footprint.columns as u16,
-            rows: footprint.screen_lines as u16,
-            scrollback_lines: footprint.scrollback_limit_lines,
-            exit_code,
-            compressed,
-        })
+        Err(terminal::ScrollbackSerializeError::LimitExceeded)
     }
 
     /// 아카이브 총 바이트가 예산을 넘으면 오래된 것부터 제거한다 (LRU).
     fn trim_archived_budget(&mut self) {
         let mut total: usize = self.archived.values().map(|a| a.compressed.len()).sum();
-        while total > ARCHIVED_SCROLLBACK_BUDGET_BYTES {
+        while total > ARCHIVED_SCROLLBACK_BUDGET_BYTES || self.archived.len() > RUNTIME_SESSION_CAP
+        {
             let Some(oldest) = self.archived_order.pop_front() else {
                 break;
             };
@@ -3844,10 +4318,15 @@ impl Worker {
             return;
         }
         if storage::scrollback_archive::exists(&self.logs_root, &key) {
-            self.archived_on_disk.insert(session);
+            let limit = self
+                .sessions
+                .get(&session)
+                .map(|live| live.cache_footprint().scrollback_limit_lines)
+                .unwrap_or(self.requested_scrollback(terminal::policy::SCROLLBACK_LINES_MAX));
+            self.archived_on_disk.entry(session).or_insert(limit);
             return;
         }
-        let Some(live) = self.sessions.get(&session) else {
+        let Some(live) = self.sessions.get_mut(&session) else {
             return;
         };
         // 빈 grid는 기록 생략 (VS Code v1.69 노이즈 억제 차용)
@@ -3855,9 +4334,12 @@ impl Worker {
         if footprint.history_lines == 0 && live.screen_text().trim().is_empty() {
             return;
         }
-        let Some(dump) = live.serialize_scrollback() else {
-            return; // 직렬화 미지원 백엔드 (experimental ghostty)
+        let Ok(dump) = live.serialize_scrollback_for_archive(
+            storage::scrollback_archive::MAX_UNCOMPRESSED_BYTES as usize,
+        ) else {
+            return; // 미지원/리소스 실패는 여기서 backend를 제거하지 않는다.
         };
+        let footprint = live.cache_footprint();
         if dump.len() > storage::scrollback_archive::MAX_UNCOMPRESSED_BYTES as usize {
             return;
         }
@@ -3904,7 +4386,12 @@ impl Worker {
                 }
             };
         if accounted && current {
-            self.archived_on_disk.insert(session);
+            let limit = self
+                .sessions
+                .get(&session)
+                .map(|live| live.cache_footprint().scrollback_limit_lines)
+                .unwrap_or(self.requested_scrollback(terminal::policy::SCROLLBACK_LINES_MAX));
+            self.archived_on_disk.insert(session, limit);
         } else {
             if !current {
                 self.archive_disk_bytes = storage::scrollback_archive::ARCHIVE_DISK_USAGE_UNKNOWN;
@@ -4047,7 +4534,7 @@ impl Worker {
                     archive_kind_from_u8(meta.kind),
                     meta.cols,
                     meta.rows,
-                    meta.scrollback_lines as usize,
+                    self.restored_scrollback(session, meta.scrollback_lines as usize),
                     meta.exit_code,
                     &mut stream,
                 );
@@ -4098,7 +4585,8 @@ impl Worker {
             kind,
             cols,
             rows,
-            scrollback_lines,
+            self.requested_scrollback(scrollback_lines)
+                .min(scrollback_lines),
             exit_code,
             &mut reader,
         );
@@ -4110,7 +4598,7 @@ impl Worker {
         if !self.session_capacity_available() {
             return;
         }
-        self.sessions.insert(session, restored);
+        self.insert_session(session, restored);
         self.exited_order.push_back(session);
     }
 
@@ -4432,6 +4920,527 @@ mod tests {
     }
 
     #[test]
+    fn live_scrollback_시작시_한도로_복원하고_증가후_새출력을_보존한다() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, _) = admission_worker(resolver, "live-startup-ceiling");
+        let path = SessionLogWriter::ansi_path(&worker.logs_root, "persistent-session").unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            (0..1000).map(|i| format!("old{i}\r\n")).collect::<String>(),
+        )
+        .unwrap();
+        worker.apply_scrollback_policy(1, 100);
+        let id = SessionId(1);
+        let mut session = Session::restore_archived(
+            id,
+            session::SessionKind::Shell,
+            20,
+            5,
+            100,
+            Some(0),
+            &mut &b""[..],
+        );
+        worker.replay_saved_ansi("persistent-session", &mut session);
+        assert!(session.cache_footprint().history_lines <= 100);
+        worker.insert_session(id, session);
+        worker.apply_scrollback_policy(2, 5000);
+        assert!(worker.sessions[&id].cache_footprint().history_lines <= 100);
+        let new = (0..1000).map(|i| format!("new{i}\r\n")).collect::<String>();
+        worker
+            .sessions
+            .get_mut(&id)
+            .unwrap()
+            .replay_ansi(&mut new.as_bytes())
+            .unwrap();
+        assert!(worker.sessions[&id].cache_footprint().history_lines >= 1000);
+        let dump = String::from_utf8(worker.sessions[&id].serialize_scrollback().unwrap()).unwrap();
+        assert!(dump.contains("new100"));
+        assert!(!dump.contains("old100\r"));
+        std::fs::remove_dir_all(&worker.logs_root).unwrap();
+    }
+
+    #[test]
+    fn live_scrollback_독립로그는_재시작시_현재설정으로_재생하며_영속삭제를_약속하지_않는다() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, _) = admission_worker(resolver.clone(), "live-restart-boundary");
+        let path = SessionLogWriter::ansi_path(&worker.logs_root, "persistent-session").unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let text = (0..1000).map(|i| format!("old{i}\r\n")).collect::<String>();
+        std::fs::write(&path, &text).unwrap();
+        worker.apply_scrollback_policy(1, 100);
+        worker.apply_scrollback_policy(2, 5000);
+        let root = worker.logs_root.clone();
+        drop(worker);
+        let (mut restarted, events) = admission_worker(resolver, "live-restarted-boundary");
+        restarted.logs_root = root.clone();
+        restarted.apply_scrollback_policy(1, 5000);
+        let mut session = Session::restore_archived(
+            SessionId(1),
+            session::SessionKind::Shell,
+            20,
+            5,
+            5000,
+            Some(0),
+            &mut &b""[..],
+        );
+        restarted.replay_saved_ansi("persistent-session", &mut session);
+        assert!(session.cache_footprint().history_lines > 100);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), text);
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            RuntimeEvent::ScrollbackLimitApplied { durable: false, .. }
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn archive_limit_자동_exit의_보존실패만_pane을_남기고_명시적_close는_폐기한다() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, _) = admission_worker(resolver, "archive-auto-exit-failed");
+        let id = SessionId(1);
+        worker.sessions.insert(
+            id,
+            Session::restore_archived(
+                id,
+                session::SessionKind::Shell,
+                20,
+                5,
+                100,
+                Some(0),
+                &mut &b"LATEST"[..],
+            ),
+        );
+        worker.attach_in_new_tab(id, SHELL_TITLE_ID);
+        worker.close_exited_pane_with_budget(id, 0);
+        assert!(worker.sessions[&id].screen_text().contains("LATEST"));
+        assert!(worker.archive_failed.contains(&id));
+        let pane = worker
+            .mux
+            .panes
+            .values()
+            .find(|pane| pane.session_id == Some(id))
+            .unwrap()
+            .id
+            .clone();
+        worker.close_exited_pane(id);
+        assert!(
+            worker.sessions.contains_key(&id),
+            "실패한 불변 화면은 매 pump 재시도하지 않는다"
+        );
+        worker.close_pane(pane);
+        assert!(!worker.sessions.contains_key(&id));
+        assert!(!worker.archive_failed.contains(&id));
+    }
+
+    #[test]
+    fn archive_limit_닫힌_pane의_memory_tail도_개수와_바이트_lru를_따른다() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, _) = admission_worker(resolver, "archive-auto-exit-lru");
+        for index in 0..=RUNTIME_SESSION_CAP {
+            let id = SessionId(index as u64);
+            worker.archived_order.push_back(id);
+            worker.archived.insert(
+                id,
+                ArchivedScrollback {
+                    kind: session::SessionKind::Shell,
+                    cols: 20,
+                    rows: 5,
+                    scrollback_lines: 100,
+                    exit_code: Some(0),
+                    compressed: vec![0],
+                },
+            );
+        }
+        worker.trim_archived_budget();
+        assert_eq!(worker.archived.len(), RUNTIME_SESSION_CAP);
+        assert!(!worker.archived.contains_key(&SessionId(0)));
+        let newest = SessionId(RUNTIME_SESSION_CAP as u64 + 1);
+        worker.archived_order.push_back(newest);
+        worker.archived.insert(
+            newest,
+            ArchivedScrollback {
+                kind: session::SessionKind::Shell,
+                cols: 20,
+                rows: 5,
+                scrollback_lines: 100,
+                exit_code: Some(0),
+                compressed: vec![0; ARCHIVED_SCROLLBACK_BUDGET_BYTES],
+            },
+        );
+        worker.trim_archived_budget();
+        assert_eq!(worker.archived.len(), 1);
+        assert!(
+            worker.archived.contains_key(&newest),
+            "최신 tail을 남기고 가장 오래된 entry부터 제거한다"
+        );
+    }
+
+    #[test]
+    fn archive_limit_자동_exit도_disk가_없으면_memory_tail을_먼저_보존한다() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, _) = admission_worker(resolver, "archive-auto-exit");
+        let id = SessionId(1);
+        let text = (0..1000)
+            .map(|i| format!("line{i}\r\n"))
+            .collect::<String>()
+            + "LATEST";
+        worker.sessions.insert(
+            id,
+            Session::restore_archived(
+                id,
+                session::SessionKind::Shell,
+                20,
+                5,
+                5000,
+                Some(0),
+                &mut text.as_bytes(),
+            ),
+        );
+        worker.attach_in_new_tab(id, SHELL_TITLE_ID);
+        worker.close_exited_pane(id);
+        assert!(
+            worker.archived.contains_key(&id),
+            "자동 close도 보존 성공 전에 supported backend를 버리면 안 된다"
+        );
+        assert!(!worker.sessions.contains_key(&id));
+        assert!(
+            !worker
+                .mux
+                .panes
+                .values()
+                .any(|pane| pane.session_id == Some(id)),
+            "정상 exit의 pane 닫힘 계약은 유지한다"
+        );
+        let dump = inflate_archived_bounded(
+            &worker.archived[&id].compressed,
+            MAX_ARCHIVED_SCROLLBACK_RESTORE_BYTES,
+        )
+        .unwrap();
+        assert!(dump.windows(6).any(|window| window == b"LATEST"));
+    }
+
+    #[test]
+    fn archive_limit_압축후_예산도_맞춰_새_archive가_즉시_축출되지_않는다() {
+        let text = (0..1000)
+            .map(|i| format!("row{i:04}-{}\r\n", i * 7919))
+            .collect::<String>()
+            + "LATEST";
+        let mut live = Session::restore_archived(
+            SessionId(1),
+            session::SessionKind::Shell,
+            30,
+            5,
+            5000,
+            Some(0),
+            &mut text.as_bytes(),
+        );
+        let entry = Worker::make_archive_entry_with_budget(&mut live, 512).unwrap();
+        assert!(entry.compressed.len() <= 512);
+        let dump =
+            inflate_archived_bounded(&entry.compressed, MAX_ARCHIVED_SCROLLBACK_RESTORE_BYTES)
+                .unwrap();
+        assert!(dump.windows(6).any(|window| window == b"LATEST"));
+    }
+
+    #[test]
+    fn archive_limit_초과한_100k_이력도_pane과_최신_tail을_보존한다() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, _) = admission_worker(resolver, "archive-oversize-tail");
+        let id = SessionId(1);
+        // 셀마다 색이 바뀌어 정상 100k 이력의 ANSI만 32MiB를 초과한다.
+        let line = "\x1b[38;2;1;2;3mA\x1b[38;2;4;5;6mB".repeat(10) + "\r\n";
+        let text = line.repeat(100_000) + "\x1b[0mLATEST-END";
+        let live = Session::restore_archived(
+            id,
+            session::SessionKind::Shell,
+            20,
+            5,
+            100_000,
+            Some(0),
+            &mut text.as_bytes(),
+        );
+        assert!(
+            live.serialize_scrollback().is_none(),
+            "실제 32MiB 초과 fixture"
+        );
+        worker.sessions.insert(id, live);
+        worker.attach_in_new_tab(id, SHELL_TITLE_ID);
+        worker.attach_in_new_tab(SessionId(2), SHELL_TITLE_ID);
+        worker.exited_order.push_back(id);
+        worker.max_exited_backends = 0;
+        worker.archive_over_cap();
+        assert!(
+            worker.archived.contains_key(&id),
+            "초과는 미지원처럼 버리면 안 된다"
+        );
+        assert!(
+            worker
+                .mux
+                .panes
+                .values()
+                .any(|pane| pane.session_id == Some(id))
+        );
+        assert!(!worker.sessions.contains_key(&id));
+        let entry = &worker.archived[&id];
+        let dump =
+            inflate_archived_bounded(&entry.compressed, MAX_ARCHIVED_SCROLLBACK_RESTORE_BYTES)
+                .unwrap();
+        assert!(
+            dump.windows(b"LATEST-END".len())
+                .any(|window| window == b"LATEST-END")
+        );
+        worker.inflate_archived(id);
+        assert!(worker.sessions[&id].screen_text().contains("LATEST-END"));
+
+        // 같은 초과 fixture를 디스크 경로에도 넣고 독립 감사 로그가 바뀌지 않는지 확인한다.
+        let db_path = worker.logs_root.join("metadata.sqlite3");
+        create_persist_db(&db_path, "archive-tail");
+        let mut pipe = crate::persistence::PersistPipe::open(&crate::persistence::PersistConfig {
+            db_path,
+            workspace_id: "archive-tail".to_owned(),
+        })
+        .unwrap();
+        pipe.session_spawned(
+            id,
+            "shell",
+            None,
+            "archive-tail",
+            "/bin/sh",
+            &[],
+            "/tmp",
+            None,
+            None,
+            None,
+            None,
+        );
+        let key = pipe.session_log_key(id).unwrap().to_owned();
+        worker.persist = Some(pipe);
+        let audit = SessionLogWriter::ansi_path(&worker.logs_root, &key).unwrap();
+        std::fs::create_dir_all(audit.parent().unwrap()).unwrap();
+        std::fs::write(&audit, b"AUDIT-UNCHANGED").unwrap();
+        worker.sessions.insert(
+            id,
+            Session::restore_archived(
+                id,
+                session::SessionKind::Shell,
+                20,
+                5,
+                100_000,
+                Some(0),
+                &mut text.as_bytes(),
+            ),
+        );
+        worker.write_scrollback_archive(id);
+        assert!(worker.archived_on_disk.contains_key(&id));
+        let mut archive = storage::scrollback_archive::open(&worker.logs_root, &key)
+            .unwrap()
+            .unwrap();
+        let mut disk_dump = Vec::new();
+        std::io::Read::read_to_end(&mut archive, &mut disk_dump).unwrap();
+        assert!(archive.finish());
+        assert!(disk_dump.len() <= MAX_ARCHIVED_SCROLLBACK_RESTORE_BYTES);
+        assert!(disk_dump.windows(10).any(|window| window == b"LATEST-END"));
+        assert_eq!(std::fs::read(audit).unwrap(), b"AUDIT-UNCHANGED");
+    }
+
+    #[test]
+    fn live_scrollback_증가후_새세션의_archive를_이전최소값으로_자르지_않는다() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, _) = admission_worker(resolver, "live-new-archive");
+        worker.apply_scrollback_policy(1, 100);
+        worker.apply_scrollback_policy(2, 5000);
+        let id = SessionId(1);
+        let text = (0..1000).map(|i| format!("new{i}\r\n")).collect::<String>();
+        let mut session = Session::restore_archived(
+            id,
+            session::SessionKind::Shell,
+            20,
+            5,
+            5000,
+            Some(0),
+            &mut text.as_bytes(),
+        );
+        let history = session.cache_footprint().history_lines;
+        let entry = Worker::make_archive_entry(&mut session).unwrap();
+        worker.archived.insert(id, entry);
+        worker.inflate_archived(id);
+        assert_eq!(
+            worker.sessions[&id].cache_footprint().history_lines,
+            history
+        );
+    }
+
+    #[test]
+    fn live_scrollback_세션삭제는_동일세대_ack_집계를_갱신한다() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, events) = admission_worker(resolver, "live-remove-count");
+        worker.apply_scrollback_policy(1, 100);
+        let id = SessionId(1);
+        worker.insert_session(
+            id,
+            Session::restore_archived(
+                id,
+                session::SessionKind::Shell,
+                20,
+                5,
+                100,
+                Some(0),
+                &mut &b""[..],
+            ),
+        );
+        while events.try_recv().is_ok() {}
+        worker.remove_session(id);
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            RuntimeEvent::ScrollbackLimitApplied {
+                generation: 1,
+                applied: 0,
+                unsupported: 0,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn live_scrollback_새_spawn은_최신값을_쓰고_pending_identity만_낮은값을_유지한다() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, _) = admission_worker(resolver, "live-future-spawn");
+        worker.shell = spec("/bin/sh", &["-c", "true"]);
+        worker
+            .pending_scrollback_ceilings
+            .insert("old".to_owned(), 100);
+        worker.apply_scrollback_policy(1, 5000);
+        assert_eq!(worker.pending_scrollback_ceilings["old"], 100);
+        let (spec, _leases) = worker.shell_with_session(SessionId(1)).unwrap();
+        let new = worker
+            .spawn_session(SessionId(1), session::SessionKind::Shell, &spec, 20, 5, 100)
+            .unwrap();
+        assert_eq!(new.cache_footprint().scrollback_limit_lines, 5000);
+    }
+
+    #[test]
+    fn live_scrollback_검토_세션편입마다_전역_예산을_확인한다() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, _) = admission_worker(resolver, "live-incremental-budget");
+        let text = (0..10000)
+            .map(|i| format!("line{i:05}-abcdefghijk\r\n"))
+            .collect::<String>();
+        for index in 1..=3 {
+            let id = SessionId(index);
+            let session = Session::restore_archived(
+                id,
+                session::SessionKind::Shell,
+                40,
+                5,
+                50000,
+                Some(0),
+                &mut text.as_bytes(),
+            );
+            if index == 1 {
+                worker.cache_budget_bytes = session.cache_footprint().estimated_bytes * 3 / 2;
+            }
+            worker.insert_session(id, session);
+            assert!(
+                worker.terminal_cache_bytes() <= worker.cache_budget_bytes,
+                "다음세션복원전에예산을맞춰야한다"
+            );
+        }
+    }
+
+    #[test]
+    fn live_scrollback_낡은세대와_동일세대_충돌을_무시한다() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, _) = admission_worker(resolver, "live-generation");
+        worker.apply_scrollback_policy(2, 5000);
+        worker.apply_scrollback_policy(1, 100);
+        assert_eq!(worker.requested_scrollback(1000), 5000);
+        worker.apply_scrollback_policy(2, 100);
+        assert_eq!(worker.requested_scrollback(1000), 5000);
+    }
+
+    #[test]
+    fn live_scrollback_현재_세션에_적용한_뒤_ack한다() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, events) = admission_worker(resolver, "live-scrollback");
+        let id = SessionId(1);
+        let text = (0..500).map(|i| format!("line{i}\r\n")).collect::<String>();
+        worker.sessions.insert(
+            id,
+            Session::restore_archived(
+                id,
+                session::SessionKind::Shell,
+                20,
+                5,
+                1000,
+                Some(0),
+                &mut text.as_bytes(),
+            ),
+        );
+        worker.handle_command(RuntimeCommand::SetScrollbackLimit {
+            generation: 7,
+            requested: 100,
+        });
+        assert_eq!(worker.sessions[&id].cache_footprint().history_lines, 100);
+        let mut found = false;
+        while let Ok(event) = events.try_recv() {
+            if let RuntimeEvent::ScrollbackLimitApplied {
+                generation,
+                requested,
+                applied,
+                unsupported,
+                trimmed,
+                ..
+            } = event
+            {
+                assert_eq!(
+                    (generation, requested, applied, unsupported),
+                    (7, 100, 1, 0)
+                );
+                assert!(trimmed > 0);
+                found = true;
+            }
+        }
+        assert!(found, "실제 적용 결과 ACK가 필요하다");
+    }
+
+    #[test]
     fn memory_archive_inflate_accepts_exact_cap_and_rejects_plus_one() {
         let exact = vec![b'x'; 4 * 1024];
         assert_eq!(
@@ -4640,6 +5649,8 @@ mod tests {
                 workspace_id: "workspace".to_owned(),
                 next_id: 1,
                 sessions: std::collections::HashMap::new(),
+                resize_epoch: 0,
+                resize_records: std::collections::HashMap::new(),
                 session_redaction_leases: std::collections::HashMap::new(),
                 seed_redaction_lease: None,
                 secret_resolver: resolver,
@@ -4658,9 +5669,17 @@ mod tests {
                 exited_order: std::collections::VecDeque::new(),
                 max_exited_backends: DEFAULT_MAX_EXITED_BACKENDS,
                 cache_budget_bytes: TERMINAL_GLOBAL_CACHE_BUDGET_BYTES,
+                scrollback_policy: None,
+                scrollback_results: std::collections::HashMap::new(),
+                scrollback_trimmed: 0,
+                pending_scrollback_ceilings: std::collections::HashMap::new(),
+                scrollback_batching: false,
+                scrollback_ack_pending: false,
+                scrollback_restored: false,
                 archived: std::collections::HashMap::new(),
                 archived_order: std::collections::VecDeque::new(),
-                archived_on_disk: std::collections::HashSet::new(),
+                archived_on_disk: std::collections::HashMap::new(),
+                archive_failed: std::collections::HashSet::new(),
                 archive_disk_bytes: 0,
                 archive_root_identity,
                 hidden_scrollback: std::collections::HashSet::new(),
@@ -6461,7 +7480,7 @@ mod tests {
             queue_preparation
                 .contains("prepare_runtime_command_for_retention_internal(&mut command)")
         );
-        let worker_handler = production.split("fn handle_command").nth(1).unwrap();
+        let worker_handler = production.split("fn handle_command_inner").nth(1).unwrap();
         let worker_handler_prefix = worker_handler.split("match command").next().unwrap();
         assert!(
             worker_handler_prefix
@@ -7449,6 +8468,7 @@ mod tests {
         let mut host = crate::RuntimeHostFactory::create(
             &factory,
             crate::RuntimeHostConfig {
+                scrollback_policy: None,
                 output_batch_ms: 5,
                 logs_root: test_logs_root("factory-secret-set-fail-closed"),
                 persist: None,
@@ -7514,6 +8534,7 @@ mod tests {
         let mut host = crate::RuntimeHostFactory::create(
             &factory,
             crate::RuntimeHostConfig {
+                scrollback_policy: None,
                 output_batch_ms: 5,
                 logs_root: test_logs_root("factory-secret-session-lease"),
                 persist: None,
@@ -8657,7 +9678,7 @@ mod tests {
             "fresh GC must account the replacement root"
         );
         assert!(storage::scrollback_archive::exists(&worker.logs_root, key));
-        assert!(worker.archived_on_disk.contains(&session));
+        assert!(worker.archived_on_disk.contains_key(&session));
         assert_eq!(worker.archive_disk_bytes, written);
         assert_eq!(
             worker.archive_root_identity,
@@ -8736,7 +9757,7 @@ mod tests {
         .unwrap();
         assert!(!storage::scrollback_archive::exists(&worker.logs_root, key));
         assert!(
-            !worker.archived_on_disk.contains(&session),
+            !worker.archived_on_disk.contains_key(&session),
             "a GC-evicted triggering archive must not leave a false disk marker"
         );
     }
@@ -9303,7 +10324,7 @@ mod tests {
         assert!(!worker.exited_order.contains(&failed_session));
         assert!(!worker.mux.panes.contains_key(&pane_state.id));
         assert!(
-            !worker.archived_on_disk.contains(&failed_session),
+            !worker.archived_on_disk.contains_key(&failed_session),
             "failed rebind must not leave a disk archive marker without a session"
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -10136,6 +11157,96 @@ mod tests {
     /// 저장 layout이 새 세션 위에 덧붙는 hybrid 상태를 만들지 않는다.
     /// §14.1 wake: 상태 이벤트가 채널에 들어갈 때 subscribe_with_wake의 콜백이
     /// 호출된다 — UI가 숨겨져도 worker가 깨워 알림을 처리하게 하는 핵심.
+    #[cfg(unix)]
+    #[test]
+    fn tracked_resize_worker는_실제크기_ack과_멱등_stamp를_반환한다() {
+        init_mock_store();
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("resize-tracked"),
+            RedactionService::new(),
+            spec("/bin/sh", &["-c", "sleep 30"]),
+            None,
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        let session = probe.wait_for(Duration::from_secs(3), |event| match event {
+            RuntimeEvent::ShellSpawned { session } => Some(*session),
+            _ => None,
+        });
+        let token = crate::ResizeToken {
+            owner: [1; 16],
+            generation: 1,
+            owner_epoch: 1,
+        };
+        let command = RuntimeCommand::ResizeTracked {
+            session,
+            token,
+            cols: 101,
+            rows: 31,
+        };
+        client.send_command(command.clone()).unwrap();
+        let first = probe.wait_for(Duration::from_secs(2), |event| match event {
+            RuntimeEvent::ResizeApplied { session: id, stamp } if *id == session => Some(*stamp),
+            _ => None,
+        });
+        assert_eq!(
+            (first.cols, first.rows, first.token),
+            (101, 31, Some(token))
+        );
+        client.send_command(command).unwrap();
+        let retry = probe.wait_for(Duration::from_secs(2), |event| match event {
+            RuntimeEvent::ResizeApplied { session: id, stamp } if *id == session => Some(*stamp),
+            _ => None,
+        });
+        assert_eq!(first, retry);
+        let next = crate::ResizeToken {
+            owner: [2; 16],
+            generation: 1,
+            owner_epoch: 2,
+        };
+        client
+            .send_command(RuntimeCommand::ResizeTracked {
+                session,
+                token: next,
+                cols: 110,
+                rows: 40,
+            })
+            .unwrap();
+        let applied = probe.wait_for(Duration::from_secs(2), |event| match event {
+            RuntimeEvent::ResizeApplied { stamp, .. } if stamp.token == Some(next) => Some(*stamp),
+            _ => None,
+        });
+        client
+            .send_command(RuntimeCommand::ResizeTracked {
+                session,
+                token,
+                cols: 101,
+                rows: 31,
+            })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(2), |event| matches!(event,
+            RuntimeEvent::ResizeFailed { token: rejected, reason: crate::ResizeFailure::Superseded, .. } if *rejected == token).then_some(()));
+        let actual = probe.wait_for(Duration::from_secs(2), |event| match event {
+            RuntimeEvent::ViewportTracked {
+                snapshot, stamp, ..
+            } if *stamp == applied => Some((snapshot.cols, snapshot.rows)),
+            _ => None,
+        });
+        assert_eq!(
+            actual,
+            (110, 40),
+            "늦은 이전 owner는 실제 backend도 되돌리지 않는다"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn subscribe_with_wake는_상태이벤트에_깨운다() {

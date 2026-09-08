@@ -171,6 +171,7 @@ pub struct RelayDeviceRecord {
     device_expires_at: u64,
     last_seen_at: Option<u64>,
     revoked_at: Option<u64>,
+    authorization_epoch: [u8; 16],
 }
 
 impl RelayDeviceRecord {
@@ -207,11 +208,22 @@ impl RelayDeviceRecord {
             device_expires_at,
             last_seen_at,
             revoked_at,
+            authorization_epoch: [0; 16],
         })
     }
 
     pub const fn device_id(&self) -> DeviceId {
         self.device_id
+    }
+
+    /// 저장소의 공개 인가 세대. grant나 키 재료가 아니며 재승인 때 이전 채널을 구분한다.
+    pub fn with_authorization_epoch(mut self, epoch: [u8; 16]) -> Self {
+        self.authorization_epoch = epoch;
+        self
+    }
+
+    pub const fn authorization_epoch(&self) -> &[u8; 16] {
+        &self.authorization_epoch
     }
 
     pub const fn identity_public_sec1(&self) -> &[u8; 65] {
@@ -269,6 +281,8 @@ impl std::fmt::Debug for RelayDeviceRecord {
 pub enum PendingInsert {
     Stored,
     PendingLimitReached,
+    /// 다른 주체의 미완 의식과 id 또는 키가 겹친다.
+    Conflict,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -304,6 +318,19 @@ pub trait RelayRepository: Send + Sync {
         device_id: DeviceId,
         revoked_at: u64,
     ) -> anyhow::Result<RevocationResult>;
+    /// raw grant는 이 포트에 들어오지 않는다. 미구현 어댑터는 닫힌 상태로 실패한다.
+    fn store_reconnect_verifier(
+        &self,
+        _device_id: DeviceId,
+        _identity: &[u8; 65],
+        _verifier: &[u8; 32],
+        _now: u64,
+    ) -> anyhow::Result<bool> {
+        anyhow::bail!("Relay reconnect storage unavailable")
+    }
+    fn reconnect_verifier(&self, _device_id: DeviceId) -> anyhow::Result<Option<[u8; 32]>> {
+        anyhow::bail!("Relay reconnect storage unavailable")
+    }
     fn touch_device(&self, device_id: DeviceId, seen_at: u64) -> anyhow::Result<bool>;
 }
 
@@ -312,6 +339,8 @@ pub trait RelayRepository: Send + Sync {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdmissionRejection {
     PendingLimitReached,
+    /// 다른 주체의 미완 의식과 겹친다 — 그쪽이 끝나거나 만료돼야 한다.
+    PendingConflict,
     PendingNotFound,
     PairingDeadlinePassed,
     DeviceLimitReached,
@@ -386,6 +415,9 @@ impl PendingAdmission {
             PendingInsert::PendingLimitReached => Ok(AdmissionStart::Rejected(
                 AdmissionRejection::PendingLimitReached,
             )),
+            PendingInsert::Conflict => Ok(AdmissionStart::Rejected(
+                AdmissionRejection::PendingConflict,
+            )),
         }
     }
 
@@ -399,21 +431,32 @@ impl PendingAdmission {
         handshake: AuthenticatedHandshake,
         approved_at: u64,
     ) -> anyhow::Result<AdmissionOutcome> {
-        let device = match repository.approve_pending(self.pending.pairing_id(), approved_at)? {
-            ApprovalResult::Approved(device) => device,
-            ApprovalResult::NotFound => {
+        // 저장소 오류는 커밋 **뒤**(행 → 레코드 변환 등)에서도 날 수 있다. 그때 그냥 올리면
+        // 승인된 기기가 취소 없이 남는다. 취소는 멱등이고 발행된 것이 없으면 NotFound라서,
+        // 실패 시 무조건 보상해도 안전하다.
+        let device = match repository.approve_pending(self.pending.pairing_id(), approved_at) {
+            Ok(ApprovalResult::Approved(device)) => device,
+            Ok(ApprovalResult::NotFound) => {
                 return Ok(AdmissionOutcome::Rejected(
                     AdmissionRejection::PendingNotFound,
                 ));
             }
-            ApprovalResult::Expired => {
+            Ok(ApprovalResult::Expired) => {
                 return Ok(AdmissionOutcome::Rejected(
                     AdmissionRejection::PairingDeadlinePassed,
                 ));
             }
-            ApprovalResult::DeviceLimitReached => {
+            Ok(ApprovalResult::DeviceLimitReached) => {
                 return Ok(AdmissionOutcome::Rejected(
                     AdmissionRejection::DeviceLimitReached,
+                ));
+            }
+            Err(error) => {
+                return Err(self.compensate(
+                    repository,
+                    self.pending.device_id(),
+                    approved_at,
+                    error,
                 ));
             }
         };

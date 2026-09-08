@@ -1,8 +1,11 @@
 #!/bin/sh
 # PR-20: macOS app bundle 생성 (설계문서 PR-20 — 기본안: 수동 macOS bundle).
-# release 바이너리를 .app 구조로 감싼다. 서명/공증은 배포 단계 소관(후속).
+# release 바이너리를 .app 구조로 감싸고, production 산출물은 Developer ID 서명 후
+# Apple 공증과 ticket staple까지 완료한다.
 #
 # 사용(배포, 기본 fail-closed): scripts/package-macos.sh
+#   DEPPY_NOTARY_KEYCHAIN_PROFILE 또는 DEPPY_NOTARY_KEY + DEPPY_NOTARY_KEY_ID
+#   (Team API key는 DEPPY_NOTARY_ISSUER도 함께 지정)가 필요하다.
 # 사용(명시적 로컬 개발): DEPPY_REQUIRE_TRUSTED_SIGNING=0 \
 #   DEPPY_ALLOW_UNTRUSTED_SIGNING=1 scripts/package-macos.sh
 # 산출: target/bundle/Deppy Sijo.app, target/bundle/Deppy Sijo.zip
@@ -27,6 +30,11 @@ SIGN_ID="${DEPPY_SIGN_IDENTITY:-}"
 [ -z "$SIGN_ID" ] && SIGN_ID=$(pick_identity "deppy-sijo-dev")
 REQUIRE_TRUSTED=${DEPPY_REQUIRE_TRUSTED_SIGNING:-1}
 ALLOW_UNTRUSTED=${DEPPY_ALLOW_UNTRUSTED_SIGNING:-0}
+NOTARY_PROFILE=${DEPPY_NOTARY_KEYCHAIN_PROFILE:-}
+NOTARY_KEY=${DEPPY_NOTARY_KEY:-}
+NOTARY_KEY_ID=${DEPPY_NOTARY_KEY_ID:-}
+NOTARY_ISSUER=${DEPPY_NOTARY_ISSUER:-}
+NOTARY_TIMEOUT=${DEPPY_NOTARY_TIMEOUT:-20m}
 case "$REQUIRE_TRUSTED:$ALLOW_UNTRUSTED" in
     1:0 | 1:1 | 0:1) ;;
     *)
@@ -42,6 +50,21 @@ if [ "$REQUIRE_TRUSTED" = "1" ]; then
             exit 1
             ;;
     esac
+    if [ -n "$NOTARY_PROFILE" ]; then
+        if [ -n "$NOTARY_KEY$NOTARY_KEY_ID$NOTARY_ISSUER" ]; then
+            echo "choose either DEPPY_NOTARY_KEYCHAIN_PROFILE or API-key notarization variables" >&2
+            exit 1
+        fi
+    else
+        if [ -z "$NOTARY_KEY" ] || [ -z "$NOTARY_KEY_ID" ]; then
+            echo "production package requires DEPPY_NOTARY_KEYCHAIN_PROFILE or DEPPY_NOTARY_KEY + DEPPY_NOTARY_KEY_ID" >&2
+            exit 1
+        fi
+        if [ ! -f "$NOTARY_KEY" ]; then
+            echo "notary API key does not exist: $NOTARY_KEY" >&2
+            exit 1
+        fi
+    fi
 fi
 
 cargo build --release -p deppy-sijo -p mcp-proxy
@@ -114,6 +137,48 @@ else
 fi
 
 ditto -c -k --sequesterRsrc --keepParent "$BUNDLE" "$ARCHIVE"
+
+if [ "$REQUIRE_TRUSTED" = "1" ]; then
+    NOTARY_RESULT=$(mktemp /tmp/deppy-notary-result.XXXXXX)
+    trap 'rm -f "$NOTARY_RESULT"' EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    NOTARY_SUBMIT_EXIT=0
+    if [ -n "$NOTARY_PROFILE" ]; then
+        xcrun notarytool submit "$ARCHIVE" \
+            --wait --timeout "$NOTARY_TIMEOUT" --output-format plist \
+            --keychain-profile "$NOTARY_PROFILE" >"$NOTARY_RESULT" || NOTARY_SUBMIT_EXIT=$?
+    elif [ -n "$NOTARY_ISSUER" ]; then
+        xcrun notarytool submit "$ARCHIVE" \
+            --wait --timeout "$NOTARY_TIMEOUT" --output-format plist \
+            --key "$NOTARY_KEY" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER" \
+            >"$NOTARY_RESULT" || NOTARY_SUBMIT_EXIT=$?
+    else
+        xcrun notarytool submit "$ARCHIVE" \
+            --wait --timeout "$NOTARY_TIMEOUT" --output-format plist \
+            --key "$NOTARY_KEY" --key-id "$NOTARY_KEY_ID" >"$NOTARY_RESULT" || NOTARY_SUBMIT_EXIT=$?
+    fi
+    if [ "$NOTARY_SUBMIT_EXIT" -ne 0 ]; then
+        echo "notarization request failed: exit=$NOTARY_SUBMIT_EXIT" >&2
+        /usr/bin/plutil -p "$NOTARY_RESULT" >&2 || true
+        exit "$NOTARY_SUBMIT_EXIT"
+    fi
+    NOTARY_STATUS=$(/usr/bin/plutil -extract status raw -o - "$NOTARY_RESULT" 2>/dev/null || true)
+    if [ "$NOTARY_STATUS" != "Accepted" ]; then
+        echo "notarization failed: status=${NOTARY_STATUS:-missing}" >&2
+        /usr/bin/plutil -p "$NOTARY_RESULT" >&2 || true
+        exit 1
+    fi
+    NOTARY_ID=$(/usr/bin/plutil -extract id raw -o - "$NOTARY_RESULT" 2>/dev/null || true)
+    echo "공증: Accepted (${NOTARY_ID:-submission id unavailable})"
+    xcrun stapler staple "$BUNDLE"
+
+    # 업로드용 ZIP은 staple 전에 만들었다. ticket을 포함한 배포 ZIP으로 다시 만든다.
+    rm -f "$ARCHIVE"
+    ditto -c -k --sequesterRsrc --keepParent "$BUNDLE" "$ARCHIVE"
+fi
+
 sh scripts/verify-macos-package.sh "$BUNDLE" "$ARCHIVE"
 
 echo "bundle: $BUNDLE"

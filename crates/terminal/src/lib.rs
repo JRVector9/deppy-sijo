@@ -8,6 +8,7 @@ mod change_set;
 #[cfg(feature = "ghostty-backend")]
 mod ghostty_backend;
 pub mod input_mapper;
+pub mod policy;
 pub mod renderer_egui;
 mod viewport_snapshot;
 
@@ -36,10 +37,10 @@ pub fn new_default_backend(
     Box::new(AlacrittyBackend::new(cols, rows, scrollback_lines))
 }
 pub use backend::{
-    ScrollbackMatch, ScrollbackSearchResult, TERMINAL_GLOBAL_CACHE_BUDGET_BYTES, TerminalBackend,
-    TerminalCacheBudget, TerminalCacheClass, TerminalCacheEvent, TerminalCacheEventKind,
-    TerminalCacheFootprint, TerminalExternalSurfaceHandle, TerminalRenderModel, fold_char,
-    substring_matches,
+    ScrollbackApplyResult, ScrollbackMatch, ScrollbackSearchResult, ScrollbackSerializeError,
+    TERMINAL_GLOBAL_CACHE_BUDGET_BYTES, TerminalBackend, TerminalCacheBudget, TerminalCacheClass,
+    TerminalCacheEvent, TerminalCacheEventKind, TerminalCacheFootprint,
+    TerminalExternalSurfaceHandle, TerminalRenderModel, fold_char, substring_matches,
 };
 pub use change_set::TerminalChangeSet;
 pub use renderer_egui::MONO_BOLD_FAMILY;

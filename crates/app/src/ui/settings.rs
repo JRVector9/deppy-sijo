@@ -1,6 +1,10 @@
 use crate::config::{Config, Theme};
 use crate::shortcuts::{self, ShortcutAction, ShortcutGroup};
 use crate::ui::designall::mix;
+use terminal::policy::{
+    CACHE_BUDGET_MANUAL_MAX_MIB, CACHE_BUDGET_MANUAL_MIN_MIB, CacheBudgetMode,
+    SCROLLBACK_LINES_MAX, SCROLLBACK_SETTING_MIN,
+};
 
 /// `SettingsDetailShell`/`SettingsRow`/control 목업이 공유하는 타이포 토큰.
 /// 참조 화면의 Settings Detail Font Map(15/14/13/14px)을 한 곳에서 강제한다.
@@ -80,6 +84,7 @@ pub struct RemoteView<'a> {
 }
 
 /// 모바일 웹(PWA) 섹션이 App에 돌려주는 동작 (RemoteAction 관례 — 의도만 전달).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WebRemoteAction {
     None,
     /// 토글 on — 웹서버 기동 요청.
@@ -96,6 +101,85 @@ pub enum WebRemoteAction {
     ConfigureServe,
     /// tailnet Serve 승인 페이지를 브라우저로 연다 (O1 — CLI가 준 URL).
     OpenApproveUrl(String),
+}
+
+/// Relay 섹션이 App에 돌려주는 동작. Tailscale 섹션의 `WebRemoteAction`과 **완전히 별개**다 —
+/// 한 섹션의 동작이 다른 섹션의 상태를 바꾸는 경로는 타입 수준에서 존재하지 않는다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelayAction {
+    None,
+    Start,
+    Stop,
+    BeginPairing,
+    CancelPairing,
+    ApprovePairing,
+    RejectPairing,
+    /// 승인된 기기 즉시 취소. 값은 App이 뷰에 넣어 준 불투명 기기 id(16진).
+    RevokeDevice(String),
+}
+
+/// Relay 연결 상태 표시.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayConnectionView<'a> {
+    Disabled,
+    /// 엔드포인트/라우트가 아직 배정되지 않았다(BLOCKED). 메시지는 App이 준다.
+    Blocked(&'a str),
+    Connecting,
+    Connected,
+    Backoff {
+        seconds: u64,
+    },
+    HaltedAuth,
+    HaltedRevoked,
+}
+
+/// 페어링 의식 표시. **비밀은 여기 없다** — 화면에 보이는 것은 transcript 유도 확인 코드뿐이다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelayPairingView<'a> {
+    /// Relay가 연결돼 있지 않아 시작 버튼이 비활성이다.
+    NotReady,
+    Idle,
+    Waiting {
+        remaining_secs: u64,
+        /// 접근성 안내 문구. App이 경계(1분·30초·10초·만료)에서만 갈아 끼우므로 매초 바뀌지
+        /// 않는다 — 스크린 리더가 매초 읽는 사고를 막는다.
+        announcement: Option<&'a str>,
+        /// 폰에 줄 페어링 링크(1회용 재료만 실린다). 셸 오리진이 아직 배정되지 않았으면 `None`.
+        link: Option<&'a str>,
+    },
+    Confirm {
+        code: &'a str,
+        remaining_secs: u64,
+        announcement: Option<&'a str>,
+        /// 확인 단계에 들어설 때마다 App이 올리는 값. 처음 보는 값이면 **거부** 버튼에
+        /// 초점을 둔다 — 실수로 Enter를 눌러 승인하는 일이 없도록.
+        generation: u64,
+    },
+    Failed(&'a str),
+}
+
+/// 승인된 기기 한 행.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayDeviceView {
+    /// 불투명 기기 id(16진). 취소 동작에 그대로 실린다.
+    pub id: String,
+    pub name: String,
+    pub last_seen_at: Option<u64>,
+    pub expires_at: u64,
+    pub revoked_at: Option<u64>,
+}
+
+/// Relay 섹션 렌더 상태. App이 채워 넘긴다 — UI는 워커·저장소·keyring을 직접 만지지 않는다.
+pub struct RelayView<'a> {
+    /// 토글 상태의 진실 소스(워커 존재 여부).
+    pub running: bool,
+    pub connection: RelayConnectionView<'a>,
+    /// Relay 시작 실패 등. **Tailscale 섹션의 에러와 별개**다.
+    pub error: Option<&'a str>,
+    pub pairing: RelayPairingView<'a>,
+    pub devices: &'a [RelayDeviceView],
+    /// 상대 시간 계산용 현재 시각(unix 초).
+    pub now: u64,
 }
 
 /// ts.net 호스트명 자동 감지 표시 상태 (App이 감지 스레드 결과를 매핑해 넘긴다).
@@ -164,6 +248,9 @@ pub enum Category {
     Performance,
     RemoteTls,
     MobileWeb,
+    /// Relay(외부 중계). MobileWeb과 **독립된 평면 섹션**이다 — 「둘 다」는 두 스위치에서
+    /// 파생될 뿐, 저장되는 전송 모드는 없다.
+    Relay,
     // ── 관리 (App이 render_management로 렌더) ──
     Credentials,
     Connectors,
@@ -178,10 +265,14 @@ pub enum Category {
 pub struct SettingsOutput {
     /// config 값이 바뀌어 저장이 필요한가 (테마/터미널/성능/포트).
     pub config_changed: bool,
+    /// 현재 정책의 전달 재시도 의도. UI는 runtime을 직접 호출하지 않는다.
+    pub scrollback_retry: bool,
     /// Remote 섹션 동작 요청.
     pub remote_action: RemoteAction,
     /// 모바일 웹 섹션 동작 요청.
     pub web_action: WebRemoteAction,
+    /// Relay 섹션 동작 요청 — 모바일 웹과 별개 채널.
+    pub relay_action: RelayAction,
 }
 
 /// 통합 설정 창 (2026-07-06 — 흩어진 툴바 기능을 좌측 네비 한 창으로).
@@ -199,21 +290,28 @@ pub fn show(
     web: &WebRemoteView,
     web_reveal_url: &mut bool,
     web_qr: &mut WebQrCache,
+    relay: &RelayView,
+    relay_qr: &mut WebQrCache,
     notif_unread: u32,
     search_query: &mut String,
     catalog: &i18n::Catalog,
+    scrollback_view: crate::scrollback_policy::View,
     mut render_management: impl FnMut(&mut egui::Ui, Category),
 ) -> SettingsOutput {
     let mut changed = false;
+    let mut scrollback_retry = false;
     let mut remote_action = RemoteAction::None;
     let mut web_action = WebRemoteAction::None;
+    let mut relay_action = RelayAction::None;
 
     // title_bar(false)라 기본 open 처리가 없다 — 닫힘이면 창 자체를 만들지 않는다.
     if !*open {
         return SettingsOutput {
             config_changed: false,
+            scrollback_retry: false,
             remote_action,
             web_action,
+            relay_action,
         };
     }
     if *category == Category::Credentials {
@@ -239,8 +337,10 @@ pub fn show(
             let win_frame = egui::Frame::default()
                 .inner_margin(egui::Margin::ZERO)
                 .fill(root.visuals().window_fill);
-            if root.input(|i| i.viewport().close_requested()) {
-                *open = false;
+            let close_requested = root.input(|i| i.viewport().close_requested());
+            if close_requested && let Some(focused) = root.memory(|memory| memory.focused()) {
+                // 현재 숫자 입력칸을 한 번 더 렌더해 lost_focus 확정 경로를 거친다.
+                root.memory_mut(|memory| memory.surrender_focus(focused));
             }
             egui::CentralPanel::default()
                 .frame(win_frame)
@@ -254,13 +354,14 @@ pub fn show(
                             top: 10,
                             bottom: 10,
                         });
-                    egui::Panel::left("settings_nav")
+                    let requested_category = egui::Panel::left("settings_nav")
                         .resizable(false)
                         .exact_size(190.0)
                         .frame(nav_frame)
                         .show(ui, |ui| {
-                            nav(ui, category, notif_unread, search_query, catalog);
-                        });
+                            nav(ui, *category, notif_unread, search_query, catalog)
+                        })
+                        .inner;
                     let inline_detail = is_inline_settings_category(*category);
                     let detail_frame = egui::Frame::default()
                         .fill(if inline_detail {
@@ -280,7 +381,14 @@ pub fn show(
                                     language_page(ui, config, &mut changed, catalog)
                                 }
                                 Category::Terminal => {
-                                    terminal_page(ui, config, &mut changed, catalog)
+                                    terminal_page(
+                                        ui,
+                                        config,
+                                        &mut changed,
+                                        catalog,
+                                        scrollback_view,
+                                        &mut scrollback_retry,
+                                    );
                                 }
                                 Category::Shortcuts => {
                                     shortcuts_page(ui, config, &mut changed, catalog)
@@ -307,6 +415,14 @@ pub fn show(
                                     &mut web_action,
                                     catalog,
                                 ),
+                                Category::Relay => relay_page(
+                                    ui,
+                                    config,
+                                    relay,
+                                    relay_qr,
+                                    &mut relay_action,
+                                    catalog,
+                                ),
                                 other => render_management(ui, other),
                             };
 
@@ -330,14 +446,23 @@ pub fn show(
                                     });
                             }
                         });
+                    if let Some(requested) = requested_category {
+                        // 현재 상세 화면이 포커스 이탈을 처리한 뒤 다음 프레임부터 전환한다.
+                        *category = requested;
+                    }
                 });
+            if close_requested {
+                *open = false;
+            }
         },
     );
 
     SettingsOutput {
         config_changed: changed,
+        scrollback_retry,
         remote_action,
         web_action,
+        relay_action,
     }
 }
 
@@ -351,6 +476,7 @@ fn is_inline_settings_category(category: Category) -> bool {
             | Category::Performance
             | Category::RemoteTls
             | Category::MobileWeb
+            | Category::Relay
     )
 }
 
@@ -475,11 +601,12 @@ fn apply_component_style(ui: &mut egui::Ui) {
 
 fn nav(
     ui: &mut egui::Ui,
-    category: &mut Category,
+    category: Category,
     notif_unread: u32,
     search_query: &mut String,
     catalog: &i18n::Catalog,
-) {
+) -> Option<Category> {
+    let mut requested_category = None;
     ui.add_space(4.0);
     ui.add(
         egui::TextEdit::singleline(search_query)
@@ -539,6 +666,12 @@ fn nav(
                     catalog.t("settings.mobile_web", &[]),
                     "mobile web pwa phone qr pairing tailscale 모바일 웹 페어링",
                 ),
+                (
+                    Category::Relay,
+                    Icon::Link,
+                    catalog.t("settings.relay", &[]),
+                    "relay external remote device pairing revoke 릴레이 외부 중계 기기",
+                ),
             ];
             let visible_settings: Vec<_> = settings
                 .into_iter()
@@ -548,7 +681,9 @@ fn nav(
                 nav_group_label(ui, &catalog.t("settings.group.settings", &[]));
                 for (cat, icon, label, _) in visible_settings {
                     rendered += 1;
-                    nav_item(ui, category, cat, icon, &label, None);
+                    if nav_item(ui, category, cat, icon, &label, None) {
+                        requested_category = Some(cat);
+                    }
                 }
             }
 
@@ -581,7 +716,9 @@ fn nav(
                 nav_group_label(ui, &catalog.t("settings.group.manage", &[]));
                 for (cat, icon, label, _) in visible_manage {
                     rendered += 1;
-                    nav_item(ui, category, cat, icon, &label, None);
+                    if nav_item(ui, category, cat, icon, &label, None) {
+                        requested_category = Some(cat);
+                    }
                 }
             }
 
@@ -612,7 +749,9 @@ fn nav(
                     let item_badge = (cat == Category::Notifications)
                         .then(|| badge.clone())
                         .flatten();
-                    nav_item(ui, category, cat, icon, &label, item_badge);
+                    if nav_item(ui, category, cat, icon, &label, item_badge) {
+                        requested_category = Some(cat);
+                    }
                 }
             }
 
@@ -620,6 +759,7 @@ fn nav(
                 nav_group_label(ui, &catalog.t("settings.search.no_results", &[]));
             }
         });
+    requested_category
 }
 
 fn nav_group_label(ui: &mut egui::Ui, label: &str) {
@@ -632,15 +772,13 @@ fn nav_group_label(ui: &mut egui::Ui, label: &str) {
 
 fn nav_item(
     ui: &mut egui::Ui,
-    current: &mut Category,
+    current: Category,
     cat: Category,
     icon: Icon,
     label: &str,
     badge: Option<String>,
-) {
-    if nav_row(ui, *current == cat, icon, label, badge) {
-        *current = cat;
-    }
+) -> bool {
+    nav_row(ui, current == cat, icon, label, badge)
 }
 
 /// 전체폭 네비 항목 — 아이콘 + 라벨, 선택/hover 배경이 행 전체를 덮는다 (목업 §설정).
@@ -700,6 +838,9 @@ fn nav_row(
             egui::Color32::WHITE,
         );
     }
+    resp.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), selected, label)
+    });
     resp.clicked()
 }
 
@@ -899,7 +1040,16 @@ fn detail_block(ui: &mut egui::Ui, label: &str, value: impl Into<String>) {
 
 /// 토글 스위치 (checkbox 대체 — 목업 스타일). 값이 바뀌면 true.
 fn toggle_switch(ui: &mut egui::Ui, on: &mut bool) -> bool {
+    toggle_switch_labeled(ui, on, "")
+}
+
+/// 접근성 라벨이 있는 토글. 스크린 리더와 kittest가 이 스위치를 행 라벨로 찾는다 —
+/// 그림만 그리는 토글은 접근성 트리에서 이름 없는 상자다.
+fn toggle_switch_labeled(ui: &mut egui::Ui, on: &mut bool, label: &str) -> bool {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(46.0, 26.0), egui::Sense::click());
+    resp.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), *on, label)
+    });
     let mut changed = false;
     if resp.clicked() {
         *on = !*on;
@@ -1273,14 +1423,56 @@ fn settings_select_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
 }
 
 /// 사용자 입력 스텝퍼 — [값] │ [−] │ [+], 경계선 박스. 반환: 변경 여부.
-fn stepper(ui: &mut egui::Ui, value: &mut i64, step: i64, min: i64, max: i64, unit: &str) -> bool {
+fn parse_stepper_i64(input: &str, min: i64, max: i64) -> Option<i64> {
+    input
+        .trim()
+        .replace(',', "")
+        .parse::<i64>()
+        .ok()
+        .map(|value| value.clamp(min, max))
+}
+
+fn parse_stepper_f32(input: &str, min: f32, max: f32) -> Option<f32> {
+    let value = input.trim().parse::<f32>().ok()?;
+    value.is_finite().then(|| value.clamp(min, max))
+}
+
+#[derive(Clone)]
+struct NumericStepperEditState {
+    buffer: String,
+    select_all: bool,
+}
+
+enum NumericStepperAction {
+    None,
+    Commit(String),
+    Adjust {
+        direction: i8,
+        buffer: Option<String>,
+    },
+}
+
+/// 정수와 소수 스텝퍼가 공유하는 226×34px 외형과 직접 입력 상태.
+fn numeric_stepper_control(
+    ui: &mut egui::Ui,
+    shown: &str,
+    raw: &str,
+    accessible_name: &str,
+) -> NumericStepperAction {
     let h = CONTROL_HEIGHT;
     let btn_w = 44.0;
     let val_w = 138.0;
     let total = val_w + btn_w * 2.0;
     let hair = settings_input_border(ui);
     let input = ui.visuals().panel_fill;
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(total, h), egui::Sense::hover());
+    let (rect, shell_response) = ui.allocate_exact_size(egui::vec2(total, h), egui::Sense::hover());
+    let control_id = shell_response.id;
+    let edit_state_id = control_id.with("numeric_edit_state");
+    let text_edit_id = control_id.with("numeric_text_edit");
+    let mut edit_state = ui
+        .ctx()
+        .data_mut(|data| data.get_temp::<NumericStepperEditState>(edit_state_id));
+
     ui.painter().rect(
         rect,
         0.0,
@@ -1288,142 +1480,254 @@ fn stepper(ui: &mut egui::Ui, value: &mut i64, step: i64, min: i64, max: i64, un
         egui::Stroke::new(1.0, hair),
         egui::StrokeKind::Inside,
     );
+
+    let x1 = rect.left() + val_w;
+    let x2 = x1 + btn_w;
+    let value_rect = egui::Rect::from_min_max(rect.min, egui::pos2(x1, rect.bottom()));
+    ui.painter()
+        .vline(x1, rect.y_range(), egui::Stroke::new(1.0, hair));
+    ui.painter()
+        .vline(x2, rect.y_range(), egui::Stroke::new(1.0, hair));
+    let minus = egui::Rect::from_min_size(egui::pos2(x1, rect.top()), egui::vec2(btn_w, h));
+    let plus = egui::Rect::from_min_size(egui::pos2(x2, rect.top()), egui::vec2(btn_w, h));
+    let mr = ui.interact(minus, control_id.with("minus"), egui::Sense::click());
+    let pr = ui.interact(plus, control_id.with("plus"), egui::Sense::click());
+    mr.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            format!("{accessible_name} −"),
+        )
+    });
+    pr.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            format!("{accessible_name} +"),
+        )
+    });
+
+    if mr.hovered() {
+        ui.painter()
+            .rect_filled(minus, 0.0, ui.visuals().widgets.hovered.weak_bg_fill);
+    }
+    if pr.hovered() {
+        ui.painter()
+            .rect_filled(plus, 0.0, ui.visuals().widgets.hovered.weak_bg_fill);
+    }
+    let fc = ui.visuals().weak_text_color();
+    ui.painter().text(
+        minus.center(),
+        egui::Align2::CENTER_CENTER,
+        "−",
+        egui::FontId::proportional(15.0),
+        fc,
+    );
+    ui.painter().text(
+        plus.center(),
+        egui::Align2::CENTER_CENTER,
+        "+",
+        egui::FontId::proportional(15.0),
+        fc,
+    );
+
+    let mut text_response = None;
+    if let Some(state) = edit_state.as_mut() {
+        let response = ui.place(
+            value_rect,
+            egui::TextEdit::singleline(&mut state.buffer)
+                .id(text_edit_id)
+                .font(egui::FontId::monospace(CONTROL_TEXT_SIZE))
+                .frame(egui::Frame::NONE)
+                .margin(egui::Margin::ZERO)
+                .horizontal_align(egui::Align::Center)
+                .vertical_align(egui::Align::Center)
+                .desired_width(value_rect.width())
+                .min_size(value_rect.size())
+                .char_limit(32),
+        );
+        response.widget_info(|| {
+            let mut info = egui::WidgetInfo::text_edit(
+                ui.is_enabled(),
+                state.buffer.as_str(),
+                state.buffer.as_str(),
+                "",
+            );
+            info.label = Some(accessible_name.to_owned());
+            info
+        });
+        if state.select_all {
+            response.request_focus();
+            let mut text_state =
+                egui::text_edit::TextEditState::load(ui.ctx(), text_edit_id).unwrap_or_default();
+            text_state
+                .cursor
+                .set_char_range(Some(egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(0),
+                    egui::text::CCursor::new(state.buffer.chars().count()),
+                )));
+            text_state.store(ui.ctx(), text_edit_id);
+            state.select_all = false;
+        }
+        text_response = Some(response);
+    } else {
+        ui.painter().text(
+            value_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            shown,
+            egui::FontId::monospace(CONTROL_TEXT_SIZE),
+            ui.visuals().text_color(),
+        );
+        let value_response = ui
+            .interact(value_rect, control_id.with("value"), egui::Sense::click())
+            .on_hover_cursor(egui::CursorIcon::Text);
+        value_response.widget_info(|| {
+            let mut info = egui::WidgetInfo::text_edit(ui.is_enabled(), shown, shown, "");
+            info.label = Some(accessible_name.to_owned());
+            info
+        });
+        if value_response.clicked() {
+            edit_state = Some(NumericStepperEditState {
+                buffer: raw.to_owned(),
+                select_all: true,
+            });
+            ui.ctx().request_repaint();
+        }
+    }
+
+    if mr.clicked() || pr.clicked() {
+        let buffer = edit_state.as_ref().map(|state| state.buffer.clone());
+        ui.ctx().data_mut(|data| {
+            data.remove::<NumericStepperEditState>(edit_state_id);
+            data.remove::<egui::text_edit::TextEditState>(text_edit_id);
+        });
+        return NumericStepperAction::Adjust {
+            direction: if pr.clicked() { 1 } else { -1 },
+            buffer,
+        };
+    }
+
+    if let Some(response) = text_response {
+        // 단일행 TextEdit은 Escape를 처리하며 같은 프레임에 포커스를 놓을 수 있다.
+        // 편집 상태가 살아 있는 동안에는 포커스 이탈 확정보다 취소를 먼저 판정한다.
+        let escape = ui.input(|input| input.key_pressed(egui::Key::Escape));
+        let commit = response.lost_focus()
+            || (response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)));
+        if escape || commit {
+            let buffer = edit_state.as_ref().map(|state| state.buffer.clone());
+            ui.ctx().data_mut(|data| {
+                data.remove::<NumericStepperEditState>(edit_state_id);
+                data.remove::<egui::text_edit::TextEditState>(text_edit_id);
+            });
+            return if escape {
+                NumericStepperAction::None
+            } else {
+                NumericStepperAction::Commit(buffer.unwrap_or_default())
+            };
+        }
+    }
+
+    if let Some(state) = edit_state {
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(edit_state_id, state));
+    }
+    NumericStepperAction::None
+}
+
+/// 사용자 입력 스텝퍼 — [값] │ [−] │ [+], 경계선 박스. 반환: 변경 여부.
+fn stepper(
+    ui: &mut egui::Ui,
+    value: &mut i64,
+    step: i64,
+    min: i64,
+    max: i64,
+    unit: &str,
+    accessible_name: &str,
+) -> bool {
     let shown = if unit.is_empty() {
         comma(*value)
     } else {
         format!("{} {unit}", comma(*value))
     };
-    ui.painter().text(
-        egui::pos2(rect.left() + val_w / 2.0, rect.center().y),
-        egui::Align2::CENTER_CENTER,
-        shown,
-        egui::FontId::monospace(CONTROL_TEXT_SIZE),
-        ui.visuals().text_color(),
-    );
-    let x1 = rect.left() + val_w;
-    let x2 = x1 + btn_w;
-    ui.painter()
-        .vline(x1, rect.y_range(), egui::Stroke::new(1.0, hair));
-    ui.painter()
-        .vline(x2, rect.y_range(), egui::Stroke::new(1.0, hair));
-    let minus = egui::Rect::from_min_size(egui::pos2(x1, rect.top()), egui::vec2(btn_w, h));
-    let plus = egui::Rect::from_min_size(egui::pos2(x2, rect.top()), egui::vec2(btn_w, h));
-    let mr = ui.interact(
-        minus,
-        ui.id().with(("minus", min, max, unit)),
-        egui::Sense::click(),
-    );
-    let pr = ui.interact(
-        plus,
-        ui.id().with(("plus", min, max, unit)),
-        egui::Sense::click(),
-    );
-    if mr.hovered() {
-        ui.painter()
-            .rect_filled(minus, 0.0, ui.visuals().widgets.hovered.weak_bg_fill);
+
+    match numeric_stepper_control(ui, &shown, &value.to_string(), accessible_name) {
+        NumericStepperAction::None => false,
+        NumericStepperAction::Commit(buffer) => {
+            let Some(next) = parse_stepper_i64(&buffer, min, max) else {
+                return false;
+            };
+            let changed = *value != next;
+            *value = next;
+            changed
+        }
+        NumericStepperAction::Adjust { direction, buffer } => {
+            let base = buffer
+                .as_deref()
+                .and_then(|input| parse_stepper_i64(input, min, max))
+                .unwrap_or(*value);
+            *value = if direction < 0 {
+                base.saturating_sub(step)
+            } else {
+                base.saturating_add(step)
+            }
+            .clamp(min, max);
+            true
+        }
     }
-    if pr.hovered() {
-        ui.painter()
-            .rect_filled(plus, 0.0, ui.visuals().widgets.hovered.weak_bg_fill);
-    }
-    let fc = ui.visuals().weak_text_color();
-    ui.painter().text(
-        minus.center(),
-        egui::Align2::CENTER_CENTER,
-        "−",
-        egui::FontId::proportional(15.0),
-        fc,
-    );
-    ui.painter().text(
-        plus.center(),
-        egui::Align2::CENTER_CENTER,
-        "+",
-        egui::FontId::proportional(15.0),
-        fc,
-    );
-    let mut changed = false;
-    if mr.clicked() {
-        *value = (*value - step).clamp(min, max);
-        changed = true;
-    }
-    if pr.clicked() {
-        *value = (*value + step).clamp(min, max);
-        changed = true;
-    }
-    changed
 }
 
-/// stepper의 f32 변형 — 소수 step(폰트 0.5px 등). 정수값은 정수로, 아니면 소수 1자리 표시.
-fn stepper_f32(ui: &mut egui::Ui, value: &mut f32, step: f32, min: f32, max: f32) -> bool {
-    let h = CONTROL_HEIGHT;
-    let btn_w = 44.0;
-    let val_w = 138.0;
-    let total = val_w + btn_w * 2.0;
-    let hair = settings_input_border(ui);
-    let input = ui.visuals().panel_fill;
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(total, h), egui::Sense::hover());
-    ui.painter().rect(
-        rect,
-        0.0,
-        input,
-        egui::Stroke::new(1.0, hair),
-        egui::StrokeKind::Inside,
-    );
-    let shown = if (*value - value.round()).abs() < 1e-3 {
-        format!("{}", value.round() as i64)
-    } else {
-        format!("{value:.1}")
-    };
-    ui.painter().text(
-        egui::pos2(rect.left() + val_w / 2.0, rect.center().y),
-        egui::Align2::CENTER_CENTER,
-        shown,
-        egui::FontId::monospace(CONTROL_TEXT_SIZE),
-        ui.visuals().text_color(),
-    );
-    let x1 = rect.left() + val_w;
-    let x2 = x1 + btn_w;
-    ui.painter()
-        .vline(x1, rect.y_range(), egui::Stroke::new(1.0, hair));
-    ui.painter()
-        .vline(x2, rect.y_range(), egui::Stroke::new(1.0, hair));
-    let minus = egui::Rect::from_min_size(egui::pos2(x1, rect.top()), egui::vec2(btn_w, h));
-    let plus = egui::Rect::from_min_size(egui::pos2(x2, rect.top()), egui::vec2(btn_w, h));
-    let mr = ui.interact(minus, ui.id().with("fstep_minus"), egui::Sense::click());
-    let pr = ui.interact(plus, ui.id().with("fstep_plus"), egui::Sense::click());
-    if mr.hovered() {
-        ui.painter()
-            .rect_filled(minus, 0.0, ui.visuals().widgets.hovered.weak_bg_fill);
+fn format_stepper_f32(value: f32) -> String {
+    value.to_string()
+}
+
+fn stepper_f32_decimal_places(value: f32) -> i32 {
+    value
+        .to_string()
+        .split_once('.')
+        .map_or(0, |(_, fraction)| fraction.len() as i32)
+}
+
+fn adjust_stepper_f32(base: f32, direction: i8, step: f32, min: f32, max: f32) -> f32 {
+    // f32 덧셈의 1.5500001 같은 노이즈만 없앤다. 직접 입력값과 step 중 더 긴
+    // 소수 자릿수를 쓰므로 1.25 + 0.1은 1.35, 1.200005 + 0.1은 1.300005가 된다.
+    let decimal_places = stepper_f32_decimal_places(base).max(stepper_f32_decimal_places(step));
+    let factor = 10_f64.powi(decimal_places);
+    let adjusted = (f64::from(base) + f64::from(direction) * f64::from(step))
+        .clamp(f64::from(min), f64::from(max));
+    ((adjusted * factor).round() / factor) as f32
+}
+
+/// stepper의 f32 변형 — 소수 step(폰트 0.5px 등). 직접 입력한 정밀도를 유지한다.
+fn stepper_f32(
+    ui: &mut egui::Ui,
+    value: &mut f32,
+    step: f32,
+    min: f32,
+    max: f32,
+    accessible_name: &str,
+) -> bool {
+    let shown = format_stepper_f32(*value);
+
+    match numeric_stepper_control(ui, &shown, &value.to_string(), accessible_name) {
+        NumericStepperAction::None => false,
+        NumericStepperAction::Commit(buffer) => {
+            let Some(next) = parse_stepper_f32(&buffer, min, max) else {
+                return false;
+            };
+            // 직접 입력에서 한 단계의 f32 변화도 표시·설정 저장과 일치시킨다.
+            let changed = *value != next;
+            *value = next;
+            changed
+        }
+        NumericStepperAction::Adjust { direction, buffer } => {
+            let base = buffer
+                .as_deref()
+                .and_then(|input| parse_stepper_f32(input, min, max))
+                .unwrap_or(*value);
+            *value = adjust_stepper_f32(base, direction, step, min, max);
+            true
+        }
     }
-    if pr.hovered() {
-        ui.painter()
-            .rect_filled(plus, 0.0, ui.visuals().widgets.hovered.weak_bg_fill);
-    }
-    let fc = ui.visuals().weak_text_color();
-    ui.painter().text(
-        minus.center(),
-        egui::Align2::CENTER_CENTER,
-        "−",
-        egui::FontId::proportional(15.0),
-        fc,
-    );
-    ui.painter().text(
-        plus.center(),
-        egui::Align2::CENTER_CENTER,
-        "+",
-        egui::FontId::proportional(15.0),
-        fc,
-    );
-    let mut changed = false;
-    if mr.clicked() {
-        *value = (*value - step).clamp(min, max);
-        changed = true;
-    }
-    if pr.clicked() {
-        *value = (*value + step).clamp(min, max);
-        changed = true;
-    }
-    changed
 }
 
 fn comma(n: i64) -> String {
@@ -1513,9 +1817,16 @@ fn general_page(
         Some(&catalog.t("settings.ui_scale.hint", &[])),
         |ui| {
             let mut v = config.ui.ui_scale;
-            // 스텝 0.1 + 0.1 격자 스냅 — 1.0→1.1처럼 한 번에 0.1씩, 부동소수 드리프트 방지.
-            if stepper_f32(ui, &mut v, 0.1, 0.7, 1.5) {
-                config.ui.ui_scale = (v * 10.0).round() / 10.0;
+            // +/-는 0.1씩 움직이고, 직접 입력한 값은 step 격자로 반올림하지 않는다.
+            if stepper_f32(
+                ui,
+                &mut v,
+                0.1,
+                0.7,
+                1.5,
+                &catalog.t("settings.ui_scale", &[]),
+            ) {
+                config.ui.ui_scale = v;
                 *changed = true;
             }
         },
@@ -1651,7 +1962,15 @@ fn general_page(
         Some(&catalog.t("settings.fleet_batch_spawn_max.hint", &[])),
         |ui| {
             let mut v = config.ui.fleet_batch_spawn_max as i64;
-            if stepper(ui, &mut v, 1, 1, 16, "") {
+            if stepper(
+                ui,
+                &mut v,
+                1,
+                1,
+                16,
+                "",
+                &catalog.t("settings.fleet_batch_spawn_max", &[]),
+            ) {
                 config.ui.fleet_batch_spawn_max = v as u32;
                 *changed = true;
             }
@@ -1766,16 +2085,61 @@ fn current_locale_label(locale: &str, catalog: &i18n::Catalog) -> String {
     catalog.t(key, &[])
 }
 
+/// 정책 상태는 고정 크기 DTO로만 받으며 재시도 클릭만 호출부에 돌려준다.
+fn scrollback_policy_status(
+    ui: &mut egui::Ui,
+    view: crate::scrollback_policy::View,
+    catalog: &i18n::Catalog,
+) -> bool {
+    use crate::scrollback_policy::Status;
+    let key = match view.status {
+        Status::Pending => "settings.scrollback.pending",
+        Status::Applied => "settings.scrollback.applied",
+        Status::Partial => "settings.scrollback.partial",
+        Status::Failed => "settings.scrollback.failed",
+    };
+    detail_text(
+        ui,
+        catalog.t(
+            key,
+            &[
+                ("applied", &view.applied.to_string()),
+                ("unsupported", &view.unsupported.to_string()),
+                ("trimmed", &view.trimmed.to_string()),
+                ("effective", &comma(i64::from(view.effective_min))),
+            ],
+        ),
+        false,
+    );
+    if !view.durable && matches!(view.status, Status::Applied | Status::Partial) {
+        detail_text(ui, catalog.t("settings.scrollback.memory_only", &[]), false);
+    }
+    view.status == Status::Failed
+        && ui
+            .button(catalog.t("settings.scrollback.retry", &[]))
+            .clicked()
+}
+
 fn terminal_page(
     ui: &mut egui::Ui,
     config: &mut Config,
     changed: &mut bool,
     catalog: &i18n::Catalog,
+    scrollback_view: crate::scrollback_policy::View,
+    scrollback_retry: &mut bool,
 ) {
+    let requested_before = config.terminal.scrollback_lines;
     page_title(ui, &catalog.t("settings.terminal", &[]));
     row(ui, &catalog.t("settings.font_size", &[]), None, |ui| {
         let mut v = config.terminal.font_size;
-        if stepper_f32(ui, &mut v, 0.5, 8.0, 32.0) {
+        if stepper_f32(
+            ui,
+            &mut v,
+            0.5,
+            8.0,
+            32.0,
+            &catalog.t("settings.font_size", &[]),
+        ) {
             config.terminal.font_size = v;
             *changed = true;
         }
@@ -1786,9 +2150,16 @@ fn terminal_page(
         Some(&catalog.t("settings.line_height.hint", &[])),
         |ui| {
             let mut v = config.terminal.line_height;
-            // ui_scale과 동일 — 스텝 0.1(10%) + 0.1 격자 스냅으로 부동소수 드리프트 방지.
-            if stepper_f32(ui, &mut v, 0.1, 0.8, 2.0) {
-                config.terminal.line_height = (v * 10.0).round() / 10.0;
+            // ui_scale과 동일 — +/-는 0.1씩, 직접 입력한 값은 그대로 유지한다.
+            if stepper_f32(
+                ui,
+                &mut v,
+                0.1,
+                0.8,
+                2.0,
+                &catalog.t("settings.line_height", &[]),
+            ) {
+                config.terminal.line_height = v;
                 *changed = true;
             }
         },
@@ -1837,22 +2208,81 @@ fn terminal_page(
         Some(&catalog.t("settings.scrollback.hint", &[])),
         |ui| {
             let mut v = config.terminal.scrollback_lines as i64;
-            if stepper(ui, &mut v, 500, 1_000, 100_000, "") {
+            if stepper(
+                ui,
+                &mut v,
+                500,
+                i64::from(SCROLLBACK_SETTING_MIN),
+                SCROLLBACK_LINES_MAX as i64,
+                "",
+                &catalog.t("settings.scrollback_lines", &[]),
+            ) {
                 config.terminal.scrollback_lines = v as u32;
                 *changed = true;
             }
         },
     );
+    detail_text(
+        ui,
+        catalog.t(
+            "settings.scrollback.limits",
+            &[
+                (
+                    "visible",
+                    &comma(terminal::TerminalCacheBudget::VISIBLE.max_scrollback_lines as i64),
+                ),
+                (
+                    "hidden",
+                    &comma(terminal::TerminalCacheBudget::HIDDEN.max_scrollback_lines as i64),
+                ),
+            ],
+        ),
+        false,
+    );
+    let scrollback_view = if requested_before != config.terminal.scrollback_lines {
+        // 같은 render pass에서 편집했으면 이전 설정의 완료 ACK를 새 값 옆에 표시하지 않는다.
+        crate::scrollback_policy::View::default()
+    } else {
+        scrollback_view
+    };
+    *scrollback_retry |= scrollback_policy_status(ui, scrollback_view, catalog);
     row(
         ui,
         &catalog.t("settings.exited_cap", &[]),
         Some(&catalog.t("settings.exited_cap.hint", &[])),
         |ui| {
             let mut v = config.terminal.exited_backend_cap as i64;
-            if stepper(ui, &mut v, 4, 4, 512, "") {
+            if stepper(
+                ui,
+                &mut v,
+                4,
+                4,
+                512,
+                "",
+                &catalog.t("settings.exited_cap", &[]),
+            ) {
                 config.terminal.exited_backend_cap = v as u32;
                 *changed = true;
             }
+        },
+    );
+    // 선택한 모드는 기존 숫자 입력의 포커스 이탈을 처리한 뒤 반영한다.
+    let mut requested_mode = config.terminal.cache_budget_mode;
+    row(
+        ui,
+        &catalog.t("settings.cache_budget.mode", &[]),
+        None,
+        |ui| {
+            ui.selectable_value(
+                &mut requested_mode,
+                CacheBudgetMode::Manual,
+                catalog.t("settings.cache_budget.manual", &[]),
+            );
+            ui.selectable_value(
+                &mut requested_mode,
+                CacheBudgetMode::Auto,
+                catalog.t("settings.cache_budget.auto", &[]),
+            );
         },
     );
     row(
@@ -1860,13 +2290,29 @@ fn terminal_page(
         &catalog.t("settings.cache_budget", &[]),
         Some(&catalog.t("settings.cache_budget.hint", &[])),
         |ui| {
-            let mut v = config.terminal.cache_budget_mb as i64;
-            if stepper(ui, &mut v, 32, 32, 2_048, "MB") {
-                config.terminal.cache_budget_mb = v as u32;
-                *changed = true;
-            }
+            let manual = config.terminal.cache_budget_mode == CacheBudgetMode::Manual;
+            let mut v = i64::from(config.terminal.effective_cache_budget_mib());
+            ui.add_enabled_ui(manual, |ui| {
+                if stepper(
+                    ui,
+                    &mut v,
+                    32,
+                    i64::from(CACHE_BUDGET_MANUAL_MIN_MIB),
+                    i64::from(CACHE_BUDGET_MANUAL_MAX_MIB),
+                    "MiB",
+                    &catalog.t("settings.cache_budget", &[]),
+                ) {
+                    config.terminal.cache_budget_mb = v as u32;
+                    *changed = true;
+                }
+            });
         },
     );
+    if config.terminal.cache_budget_mode != requested_mode {
+        config.terminal.cache_budget_mode = requested_mode;
+        *changed = true;
+    }
+    detail_text(ui, catalog.t("settings.cache_budget.help", &[]), false);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -2172,7 +2618,15 @@ fn performance_page(
         Some(&catalog.t("settings.output_batch.hint", &[])),
         |ui| {
             let mut v = config.performance.output_batch_ms as i64;
-            if stepper(ui, &mut v, 1, 16, 50, "ms") {
+            if stepper(
+                ui,
+                &mut v,
+                1,
+                16,
+                50,
+                "ms",
+                &catalog.t("settings.output_batch_ms", &[]),
+            ) {
                 config.performance.output_batch_ms = v as u64;
                 *changed = true;
             }
@@ -2189,7 +2643,15 @@ fn performance_page(
         )),
         |ui| {
             let mut v = config.performance.max_live_warm as i64;
-            if stepper(ui, &mut v, 1, 1, 12, "") {
+            if stepper(
+                ui,
+                &mut v,
+                1,
+                1,
+                12,
+                "",
+                &catalog.t("settings.max_live_warm", &[]),
+            ) {
                 config.performance.max_live_warm = v as u32;
                 *changed = true;
             }
@@ -2201,7 +2663,15 @@ fn performance_page(
         Some(&catalog.t("settings.max_warm.hint", &[])),
         |ui| {
             let mut v = config.performance.max_warm as i64;
-            if stepper(ui, &mut v, 1, 0, 8, "") {
+            if stepper(
+                ui,
+                &mut v,
+                1,
+                0,
+                8,
+                "",
+                &catalog.t("settings.max_warm", &[]),
+            ) {
                 config.performance.max_warm = v as u32;
                 *changed = true;
             }
@@ -2213,7 +2683,15 @@ fn performance_page(
         Some(&catalog.t("settings.max_cross_workspace_panes.hint", &[])),
         |ui| {
             let mut v = config.performance.max_cross_workspace_panes as i64;
-            if stepper(ui, &mut v, 1, 1, 6, "") {
+            if stepper(
+                ui,
+                &mut v,
+                1,
+                1,
+                6,
+                "",
+                &catalog.t("settings.max_cross_workspace_panes", &[]),
+            ) {
                 config.performance.max_cross_workspace_panes = v as u32;
                 *changed = true;
             }
@@ -2469,6 +2947,297 @@ fn mobile_web_page(
     hint_text(ui, catalog.t("settings.mobile_web.cert_note", &[]));
 }
 
+/// Relay(외부 중계) 페이지. Tailscale 페이지와 **같은 모양의 독립 섹션**이다 — 토글·상태·
+/// 에러가 각자 있고, 어느 쪽 동작도 다른 쪽 상태를 건드리지 않는다.
+fn relay_page(
+    ui: &mut egui::Ui,
+    config: &mut Config,
+    relay: &RelayView,
+    relay_qr: &mut WebQrCache,
+    relay_action: &mut RelayAction,
+    catalog: &i18n::Catalog,
+) {
+    page_title(ui, &catalog.t("settings.relay", &[]));
+    // 토글 = 실행 중 OR 저장된 자동시작 의도 (mobile_web_page와 동일 규칙).
+    let mut enabled = relay.running || config.relay.enabled;
+    let enabled_label = catalog.t("settings.relay_enabled", &[]);
+    row(
+        ui,
+        &enabled_label,
+        Some(&catalog.t("settings.relay_enabled.hint", &[])),
+        |ui| {
+            if toggle_switch_labeled(ui, &mut enabled, &enabled_label) {
+                *relay_action = if enabled {
+                    RelayAction::Start
+                } else {
+                    RelayAction::Stop
+                };
+            }
+        },
+    );
+    row(ui, &catalog.t("settings.relay.status", &[]), None, |ui| {
+        let text = match relay.connection {
+            RelayConnectionView::Disabled => catalog.t("settings.relay.status.disabled", &[]),
+            RelayConnectionView::Blocked(_) => catalog.t("settings.relay.status.blocked", &[]),
+            RelayConnectionView::Connecting => catalog.t("settings.relay.status.connecting", &[]),
+            RelayConnectionView::Connected => catalog.t("settings.relay.status.connected", &[]),
+            RelayConnectionView::Backoff { seconds } => catalog.t(
+                "settings.relay.status.backoff",
+                &[("seconds", &seconds.to_string())],
+            ),
+            RelayConnectionView::HaltedAuth => catalog.t("settings.relay.status.halted_auth", &[]),
+            RelayConnectionView::HaltedRevoked => {
+                catalog.t("settings.relay.status.halted_revoked", &[])
+            }
+        };
+        detail_text(ui, text, false);
+    });
+    if let Some(err) = relay.error {
+        ui.add_space(7.0);
+        ui.colored_label(
+            ui.visuals().error_fg_color,
+            egui::RichText::new(catalog.t("settings.start_failed", &[("message", err)]))
+                .size(SETTINGS_TYPE.row_description),
+        );
+        ui.add_space(7.0);
+        settings_hairline(ui);
+    }
+
+    // ── 페어링 ──
+    ui.add_space(14.0);
+    row(
+        ui,
+        &catalog.t("settings.relay.pairing", &[]),
+        Some(&catalog.t("settings.relay.pairing.hint", &[])),
+        |ui| {
+            let ready = matches!(
+                relay.pairing,
+                RelayPairingView::Idle | RelayPairingView::Failed(_)
+            );
+            // Relay 준비 전에는 시작 자체가 비활성이다 — 붙을 곳이 없는 티켓은 5분짜리
+            // 비밀만 흘리는 셈이다.
+            if ui
+                .add_enabled(
+                    ready,
+                    egui::Button::new(catalog.t("settings.relay.pairing.begin", &[])),
+                )
+                .clicked()
+            {
+                *relay_action = RelayAction::BeginPairing;
+            }
+        },
+    );
+    match &relay.pairing {
+        RelayPairingView::NotReady => {
+            hint_text(ui, catalog.t("settings.relay.pairing.not_ready", &[]));
+        }
+        RelayPairingView::Idle => {}
+        RelayPairingView::Waiting {
+            remaining_secs,
+            announcement,
+            link,
+        } => {
+            hint_text(ui, catalog.t("settings.relay.pairing.waiting", &[]));
+            pairing_countdown(ui, *remaining_secs, *announcement);
+            match link {
+                Some(link) => {
+                    // 페어링 링크 — 1회용 재료(입장 핸들·페어링 id·비밀)가 조각에 실리므로
+                    // 화면에는 조각을 가리고, 복사와 QR은 전체 링크다. 5분이 지나면 무용하다.
+                    row(
+                        ui,
+                        &catalog.t("settings.relay.pairing.link", &[]),
+                        Some(&catalog.t("settings.relay.pairing.link.hint", &[])),
+                        |ui| {
+                            if ui.button(catalog.t("action.copy", &[])).clicked() {
+                                ui.ctx().copy_text((*link).to_owned());
+                            }
+                        },
+                    );
+                    detail_text(ui, masked_fragment(link), true);
+                    ui.add_space(8.0);
+                    show_qr(ui, relay_qr, link);
+                    ui.add_space(6.0);
+                }
+                None => hint_text(ui, catalog.t("settings.relay.pairing.link.blocked", &[])),
+            }
+            if ui
+                .button(catalog.t("settings.relay.pairing.cancel", &[]))
+                .clicked()
+            {
+                *relay_action = RelayAction::CancelPairing;
+            }
+        }
+        RelayPairingView::Confirm {
+            code,
+            remaining_secs,
+            announcement,
+            generation,
+        } => {
+            row(
+                ui,
+                &catalog.t("settings.relay.pairing.code", &[]),
+                Some(&catalog.t("settings.relay.pairing.code.hint", &[])),
+                |ui| {
+                    // 코드는 선택 가능한 큰 글씨 — 폰 화면과 대조하는 값이다.
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(*code).size(28.0).monospace())
+                            .selectable(true),
+                    );
+                },
+            );
+            pairing_countdown(ui, *remaining_secs, *announcement);
+            ui.horizontal(|ui| {
+                // 거부·취소가 먼저, 승인이 마지막 — 그리고 **초점은 거부에** 둔다. 확인
+                // 단계에 막 들어선 순간 Enter가 승인으로 떨어지면 코드를 대조하지 않은
+                // 승인이 된다.
+                let reject = ui.button(catalog.t("settings.relay.pairing.reject", &[]));
+                let focus_id = egui::Id::new("relay_pairing_focused_generation");
+                let focused: Option<u64> = ui.data(|d| d.get_temp(focus_id));
+                if focused != Some(*generation) {
+                    reject.request_focus();
+                    ui.data_mut(|d| d.insert_temp(focus_id, *generation));
+                }
+                if reject.clicked() {
+                    *relay_action = RelayAction::RejectPairing;
+                }
+                if ui
+                    .button(catalog.t("settings.relay.pairing.cancel", &[]))
+                    .clicked()
+                {
+                    *relay_action = RelayAction::CancelPairing;
+                }
+                if ui
+                    .button(catalog.t("settings.relay.pairing.approve", &[]))
+                    .clicked()
+                {
+                    *relay_action = RelayAction::ApprovePairing;
+                }
+            });
+        }
+        RelayPairingView::Failed(message) => {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                egui::RichText::new(*message).size(SETTINGS_TYPE.row_description),
+            );
+        }
+    }
+
+    // ── 승인된 기기 ──
+    ui.add_space(14.0);
+    settings_hairline(ui);
+    row(ui, &catalog.t("settings.relay.devices", &[]), None, |_| {});
+    if relay.devices.is_empty() {
+        hint_text(ui, catalog.t("settings.relay.devices.empty", &[]));
+    }
+    for device in relay.devices {
+        ui.push_id(&device.id, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(&device.name).strong());
+                ui.label(
+                    egui::RichText::new(catalog.t("settings.relay.devices.view_only", &[]))
+                        .size(SETTINGS_TYPE.row_description),
+                );
+                if device.revoked_at.is_some() {
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        catalog.t("settings.relay.devices.revoked", &[]),
+                    );
+                }
+            });
+            ui.horizontal(|ui| {
+                let last_seen = match device.last_seen_at {
+                    Some(at) => relative_past(relay.now, at, catalog),
+                    None => catalog.t("settings.relay.devices.never", &[]),
+                };
+                hint_text(
+                    ui,
+                    format!(
+                        "{}: {} · {}: {}",
+                        catalog.t("settings.relay.devices.last_seen", &[]),
+                        last_seen,
+                        catalog.t("settings.relay.devices.expires", &[]),
+                        relative_future(relay.now, device.expires_at, catalog),
+                    ),
+                );
+                if device.revoked_at.is_none()
+                    && ui
+                        .button(catalog.t("settings.relay.devices.revoke", &[]))
+                        .on_hover_text(catalog.t("settings.relay.devices.revoke.hint", &[]))
+                        .clicked()
+                {
+                    *relay_action = RelayAction::RevokeDevice(device.id.clone());
+                }
+            });
+        });
+    }
+}
+
+/// 남은 시간 표시. 숫자 타이머는 **painter로 그린다** — 위젯이 아니므로 접근성 트리에 매초
+/// 바뀌는 노드가 생기지 않는다. 접근성 안내는 App이 경계에서만 갈아 끼우는 문구 하나뿐이다.
+fn pairing_countdown(ui: &mut egui::Ui, remaining_secs: u64, announcement: Option<&str>) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(120.0, 24.0), egui::Sense::hover());
+    let text = format!("{}:{:02}", remaining_secs / 60, remaining_secs % 60);
+    ui.painter().text(
+        rect.left_center(),
+        egui::Align2::LEFT_CENTER,
+        text,
+        egui::FontId::monospace(18.0),
+        ui.visuals().text_color(),
+    );
+    if let Some(announcement) = announcement {
+        ui.label(
+            egui::RichText::new(announcement)
+                .size(SETTINGS_TYPE.row_description)
+                .weak(),
+        );
+    }
+}
+
+fn relative_past(now: u64, at: u64, catalog: &i18n::Catalog) -> String {
+    let elapsed = now.saturating_sub(at);
+    if elapsed < 60 {
+        catalog.t("settings.relay.time.just_now", &[])
+    } else if elapsed < 3_600 {
+        catalog.t(
+            "settings.relay.time.minutes_ago",
+            &[("minutes", &(elapsed / 60).to_string())],
+        )
+    } else if elapsed < 86_400 {
+        catalog.t(
+            "settings.relay.time.hours_ago",
+            &[("hours", &(elapsed / 3_600).to_string())],
+        )
+    } else {
+        catalog.t(
+            "settings.relay.time.days_ago",
+            &[("days", &(elapsed / 86_400).to_string())],
+        )
+    }
+}
+
+fn relative_future(now: u64, at: u64, catalog: &i18n::Catalog) -> String {
+    if at <= now {
+        return catalog.t("settings.relay.time.expired", &[]);
+    }
+    let left = at - now;
+    if left < 3_600 {
+        catalog.t(
+            "settings.relay.time.in_minutes",
+            &[("minutes", &(left / 60).max(1).to_string())],
+        )
+    } else if left < 86_400 {
+        catalog.t(
+            "settings.relay.time.in_hours",
+            &[("hours", &(left / 3_600).to_string())],
+        )
+    } else {
+        catalog.t(
+            "settings.relay.time.in_days",
+            &[("days", &(left / 86_400).to_string())],
+        )
+    }
+}
+
 /// serve 온보딩 행 (O1) — 진단 상태 + 다음 한 걸음 버튼.
 fn serve_row(
     ui: &mut egui::Ui,
@@ -2568,6 +3337,14 @@ fn serve_row(
 }
 
 /// 접속 URL의 token 값 부분을 마스킹한다 (표시 전용 — 복사/QR는 전체를 쓴다).
+/// URL 조각(`#…`)을 가린다 — 페어링 링크의 1회용 재료는 조각에 실린다.
+fn masked_fragment(url: &str) -> String {
+    match url.split_once('#') {
+        Some((head, _)) => format!("{head}#…"),
+        None => url.to_owned(),
+    }
+}
+
 fn masked_url(url: &str) -> String {
     match url.split_once("token=") {
         Some((head, _)) => format!("{head}token=…"),
@@ -2627,10 +3404,466 @@ fn truncate_fingerprint(fp: &str, keep: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn 스크롤백_실제_설정페이지는_상태를_표시하고_실패만_재시도_의도를_반환한다() {
+        use crate::scrollback_policy::{Status, View};
+        use egui_kittest::kittest::Queryable as _;
+        for (status, key) in [
+            (Status::Pending, "settings.scrollback.pending"),
+            (Status::Applied, "settings.scrollback.applied"),
+            (Status::Partial, "settings.scrollback.partial"),
+            (Status::Failed, "settings.scrollback.failed"),
+        ] {
+            let catalog = i18n::Catalog::load("ko-KR").unwrap();
+            let label = catalog.t(
+                key,
+                &[
+                    ("applied", "2"),
+                    ("unsupported", "1"),
+                    ("trimmed", "12"),
+                    ("effective", "100"),
+                ],
+            );
+            let retry_label = catalog.t("settings.scrollback.retry", &[]);
+            let memory_only_label = catalog.t("settings.scrollback.memory_only", &[]);
+            let view = View {
+                status,
+                durable: false,
+                restored: true,
+                applied: 2,
+                unsupported: 1,
+                trimmed: 12,
+                effective_min: 100,
+            };
+            let initial_limit = super::Config::default().terminal.scrollback_lines;
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(1100.0, 1800.0))
+                .build_ui_state(
+                    move |ui, state: &mut (super::Config, bool)| {
+                        super::terminal_page(
+                            ui,
+                            &mut state.0,
+                            &mut false,
+                            &catalog,
+                            view,
+                            &mut state.1,
+                        );
+                    },
+                    (super::Config::default(), false),
+                );
+            harness.run();
+            assert!(
+                harness.query_by_label(&label).is_some(),
+                "실제 설정 페이지에 {key} 표시가 필요하다"
+            );
+            assert_eq!(
+                harness.query_by_label(&memory_only_label).is_some(),
+                matches!(status, Status::Applied | Status::Partial),
+                "완료/일부 적용에서는 독립 복구 로그의 경계를 알려야 한다"
+            );
+            if status == Status::Failed {
+                harness
+                    .get_by_role_and_label(egui::accesskit::Role::Button, &retry_label)
+                    .click();
+                harness.run();
+                assert!(harness.state().1);
+            } else {
+                assert!(harness.query_by_label(&retry_label).is_none());
+                assert!(!harness.state().1);
+            }
+            assert_eq!(harness.state().0.terminal.scrollback_lines, initial_limit);
+        }
+    }
+
     use super::{
-        SETTINGS_DETAIL, SETTINGS_TYPE, masked_url, nav_matches, qr_color_image,
-        truncate_fingerprint,
+        SETTINGS_DETAIL, SETTINGS_TYPE, masked_url, nav_matches, parse_stepper_f32,
+        parse_stepper_i64, qr_color_image, stepper, stepper_f32, truncate_fingerprint,
     };
+    // kittest 조회(get_by_label 등)는 트레이트 메서드다.
+    use egui_kittest::kittest::Queryable as _;
+
+    #[test]
+    fn 숫자_직접입력은_범위안_값을_그대로_쓰고_범위밖은_고정한다() {
+        assert_eq!(parse_stepper_i64("12,345", 1_000, 100_000), Some(12_345));
+        assert_eq!(parse_stepper_i64("999999", 1_000, 100_000), Some(100_000));
+        assert_eq!(parse_stepper_i64("잘못", 1_000, 100_000), None);
+        assert_eq!(parse_stepper_f32("1.25", 0.8, 2.0), Some(1.25));
+        assert_eq!(parse_stepper_f32("NaN", 0.8, 2.0), None);
+    }
+
+    #[test]
+    fn kittest_숫자영역은_직접입력을_받고_다른_stepper와_섞이지_않는다() {
+        use egui_kittest::kittest::Queryable as _;
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, state: &mut (i64, i64)| {
+                stepper(ui, &mut state.0, 500, 1_000, 100_000, "", "첫 값");
+                stepper(ui, &mut state.1, 1, 1, 12, "", "둘째 값");
+            },
+            (10_000, 6),
+        );
+
+        harness.run();
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::TextInput, "첫 값")
+            .click();
+        harness.run();
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::TextInput, "첫 값")
+            .type_text("12345");
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+
+        assert_eq!(*harness.state(), (12_345, 6));
+    }
+
+    #[test]
+    fn kittest_소수_숫자영역도_직접입력을_받는다() {
+        use egui_kittest::kittest::Queryable as _;
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, value: &mut f32| {
+                stepper_f32(ui, value, 0.1, 0.8, 2.0, "소수 값");
+            },
+            1.0,
+        );
+
+        harness.run();
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::TextInput, "소수 값")
+            .click();
+        harness.run();
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::TextInput, "소수 값")
+            .type_text("1.25");
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+
+        assert_eq!(*harness.state(), 1.25);
+    }
+
+    #[test]
+    fn kittest_소수_최소_변경도_저장_신호를_보낸다() {
+        use egui_kittest::kittest::Queryable as _;
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, state: &mut (f32, bool)| {
+                let changed = stepper_f32(ui, &mut state.0, 0.1, 0.8, 2.0, "소수 값");
+                state.1 |= changed;
+            },
+            (1.0, false),
+        );
+        harness.run();
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::TextInput, "소수 값")
+            .click();
+        harness.run();
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::TextInput, "소수 값")
+            .type_text("1.0000001");
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+        assert_eq!(harness.state().0, 1.000_000_1);
+        assert!(
+            harness.state().1,
+            "실제로 변경된 직접 입력은 저장되어야 한다"
+        );
+    }
+
+    #[test]
+    fn 소수_표시는_step_격자에_가까운_직접입력도_숨기지_않는다() {
+        assert_eq!(super::format_stepper_f32(1.200_005), "1.200005");
+    }
+
+    #[test]
+    fn kittest_ui배율_직접입력은_step_격자로_반올림하지_않고_그대로_표시한다() {
+        use egui_kittest::kittest::Queryable as _;
+
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        let label = catalog.t("settings.ui_scale", &[]);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(900.0, 900.0))
+            .build_ui_state(
+                move |ui, config: &mut super::Config| {
+                    let mut changed = false;
+                    super::general_page(ui, config, &mut changed, &catalog);
+                },
+                super::Config::default(),
+            );
+
+        harness.run();
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::TextInput, &label)
+            .click();
+        harness.run();
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::TextInput, &label)
+            .type_text("1.25");
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+
+        assert_eq!(harness.state().ui.ui_scale, 1.25);
+        assert_eq!(
+            harness
+                .get_by_role_and_label(egui::accesskit::Role::TextInput, &label)
+                .value()
+                .as_deref(),
+            Some("1.25")
+        );
+    }
+
+    #[test]
+    fn kittest_행간_직접입력은_step_격자로_반올림하지_않고_그대로_표시한다() {
+        use egui_kittest::kittest::Queryable as _;
+
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        let label = catalog.t("settings.line_height", &[]);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(900.0, 900.0))
+            .build_ui_state(
+                move |ui, config: &mut super::Config| {
+                    let mut changed = false;
+                    super::terminal_page(
+                        ui,
+                        config,
+                        &mut changed,
+                        &catalog,
+                        crate::scrollback_policy::View::default(),
+                        &mut false,
+                    );
+                },
+                super::Config::default(),
+            );
+
+        harness.run();
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::TextInput, &label)
+            .click();
+        harness.run();
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::TextInput, &label)
+            .type_text("1.25");
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+
+        assert_eq!(harness.state().terminal.line_height, 1.25);
+        assert_eq!(
+            harness
+                .get_by_role_and_label(egui::accesskit::Role::TextInput, &label)
+                .value()
+                .as_deref(),
+            Some("1.25")
+        );
+
+        let plus_label = format!("{label} +");
+        for _ in 0..3 {
+            harness
+                .get_by_role_and_label(egui::accesskit::Role::Button, &plus_label)
+                .click();
+            harness.run();
+        }
+        assert_eq!(harness.state().terminal.line_height, 1.55);
+        assert_eq!(
+            harness
+                .get_by_role_and_label(egui::accesskit::Role::TextInput, &label)
+                .value()
+                .as_deref(),
+            Some("1.55"),
+            "직접 입력 뒤 증감해도 부동소수 오차 문자열을 노출하면 안 된다"
+        );
+    }
+
+    #[test]
+    fn kittest_직접입력중_escape는_취소하고_plus는_기존_step을_유지한다() {
+        use egui_kittest::kittest::Queryable as _;
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, value: &mut i64| {
+                stepper(ui, value, 500, 1_000, 100_000, "", "스크롤백");
+            },
+            10_000,
+        );
+
+        harness.run();
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::TextInput, "스크롤백")
+            .click();
+        harness.run();
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::TextInput, "스크롤백")
+            .type_text("30000");
+        harness.key_press(egui::Key::Escape);
+        harness.run();
+        assert_eq!(*harness.state(), 10_000);
+
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, "스크롤백 +")
+            .click();
+        harness.run();
+        assert_eq!(*harness.state(), 10_500);
+
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::TextInput, "스크롤백")
+            .click();
+        harness.run();
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::TextInput, "스크롤백")
+            .type_text("20000");
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, "스크롤백 +")
+            .click();
+        harness.run();
+        assert_eq!(*harness.state(), 20_500);
+    }
+
+    #[test]
+    fn kittest_카테고리_전환은_현재_숫자입력을_확정한_뒤_페이지를_바꾼다() {
+        use egui_kittest::kittest::Queryable as _;
+
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        let terminal_label = catalog.t("settings.terminal", &[]);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(900.0, 520.0))
+            .build_ui_state(
+                move |ui, state: &mut (super::Category, i64, String)| {
+                    let (category, value, query) = state;
+                    let requested_category = egui::Panel::left("test_settings_nav")
+                        .resizable(false)
+                        .exact_size(190.0)
+                        .show(ui, |ui| super::nav(ui, *category, 0, query, &catalog))
+                        .inner;
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        if *category == super::Category::General {
+                            stepper(ui, value, 500, 1_000, 100_000, "", "테스트 숫자");
+                        }
+                    });
+                    if let Some(requested) = requested_category {
+                        *category = requested;
+                    }
+                },
+                (super::Category::General, 10_000, String::new()),
+            );
+
+        harness.run();
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::TextInput, "테스트 숫자")
+            .click();
+        harness.run();
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::TextInput, "테스트 숫자")
+            .type_text("12345");
+        harness.run();
+        assert_eq!(harness.state().1, 10_000);
+
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, &terminal_label)
+            .click();
+        harness.run();
+        assert_eq!(harness.state().0, super::Category::Terminal);
+        assert_eq!(harness.state().1, 12_345);
+    }
+
+    #[test]
+    fn kittest_터미널_스크롤백은_100줄을_직접_입력한다() {
+        use egui_kittest::kittest::Queryable as _;
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        let label = catalog.t("settings.scrollback_lines", &[]);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1000.0, 1000.0))
+            .build_ui_state(
+                move |ui, config: &mut crate::config::Config| {
+                    super::terminal_page(
+                        ui,
+                        config,
+                        &mut false,
+                        &catalog,
+                        crate::scrollback_policy::View::default(),
+                        &mut false,
+                    );
+                },
+                crate::config::Config::default(),
+            );
+        harness.run();
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::TextInput, &label)
+            .click();
+        harness.run();
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::TextInput, &label)
+            .type_text("100");
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+        assert_eq!(harness.state().terminal.scrollback_lines, 100);
+    }
+
+    #[test]
+    fn kittest_캐시_모드_전환은_수동_직접입력과_증감을_보존한다() {
+        use egui_kittest::kittest::Queryable as _;
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        let label = catalog.t("settings.cache_budget", &[]);
+        let mut config: crate::config::Config =
+            toml::from_str("[terminal]\ncache_budget_mb = 320\n").unwrap();
+        config.terminal.cache_budget_mode = terminal::policy::CacheBudgetMode::Manual;
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1000.0, 1400.0))
+            .build_ui_state(
+                move |ui, config: &mut crate::config::Config| {
+                    super::terminal_page(
+                        ui,
+                        config,
+                        &mut false,
+                        &catalog,
+                        crate::scrollback_policy::View::default(),
+                        &mut false,
+                    );
+                },
+                config,
+            );
+        harness.run();
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::TextInput, &label)
+            .click();
+        harness.run();
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::TextInput, &label)
+            .type_text("352");
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+        assert_eq!(harness.state().terminal.cache_budget_mb, 352);
+        harness.get_by_label(&format!("{label} +")).click();
+        harness.run();
+        assert_eq!(harness.state().terminal.cache_budget_mb, 384);
+        harness.get_by_label(&format!("{label} −")).click();
+        harness.run();
+        assert_eq!(harness.state().terminal.cache_budget_mb, 352);
+        harness.get_by_label("Automatic").click();
+        harness.run();
+        assert_eq!(
+            harness.state().terminal.cache_budget_mode,
+            terminal::policy::CacheBudgetMode::Auto
+        );
+        assert_eq!(harness.state().terminal.cache_budget_mb, 352);
+        harness.get_by_label("Manual").click();
+        harness.run();
+        assert_eq!(
+            harness.state().terminal.cache_budget_mode,
+            terminal::policy::CacheBudgetMode::Manual
+        );
+        assert_eq!(harness.state().terminal.cache_budget_mb, 352);
+        // Enter 없이 모드를 바꿔도 마지막 직접 입력은 포커스 이탈 시 보존한다.
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::TextInput, &label)
+            .click();
+        harness.run();
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::TextInput, &label)
+            .type_text("416");
+        harness.run();
+        assert_eq!(harness.state().terminal.cache_budget_mb, 352);
+        harness.get_by_label("Automatic").click();
+        harness.run();
+        assert_eq!(harness.state().terminal.cache_budget_mb, 416);
+        assert_eq!(
+            harness.state().terminal.cache_budget_mode,
+            terminal::policy::CacheBudgetMode::Auto
+        );
+    }
 
     /// egui `check_for_id_clash`가 그리는 "🔥 … use of … ID" 경고 텍스트 수집
     /// (env_profiles.rs 테스트의 동명 헬퍼와 같은 판정 — 그쪽 발화 테스트가 이 판정이
@@ -2659,7 +3892,10 @@ mod tests {
     /// 환경 변수 표 — env_profiles.rs 테스트 참조.)
     #[test]
     fn kittest_설정_인라인_페이지에_widget_id_충돌이_없다() {
-        use super::{Category, RemoteAction, RemoteView, WebRemoteAction, WebRemoteView};
+        use super::{
+            Category, RelayAction, RelayConnectionView, RelayDeviceView, RelayPairingView,
+            RelayView, RemoteAction, RemoteView, WebRemoteAction, WebRemoteView,
+        };
         use crate::config::Config;
         for locale in [i18n::FALLBACK_LOCALE, "ko-KR"] {
             let catalog = i18n::Catalog::load(locale).unwrap();
@@ -2671,6 +3907,7 @@ mod tests {
                 Category::Performance,
                 Category::RemoteTls,
                 Category::MobileWeb,
+                Category::Relay,
             ] {
                 let mut config = Config::default();
                 config.ui.agent_send_presets = vec!["preset-a".to_owned(), "preset-b".to_owned()];
@@ -2702,15 +3939,45 @@ mod tests {
                             let mut changed = false;
                             let mut remote_action = RemoteAction::None;
                             let mut web_action = WebRemoteAction::None;
+                            let mut relay_action = RelayAction::None;
                             let mut reveal = true;
                             let mut qr: super::WebQrCache = None;
+                            let mut relay_qr: super::WebQrCache = None;
+                            let devices = vec![
+                                RelayDeviceView {
+                                    id: "aa".repeat(16),
+                                    name: "phone-a".to_owned(),
+                                    last_seen_at: Some(1_800_000_000),
+                                    expires_at: 1_800_086_400,
+                                    revoked_at: None,
+                                },
+                                RelayDeviceView {
+                                    id: "bb".repeat(16),
+                                    name: "phone-b".to_owned(),
+                                    last_seen_at: None,
+                                    expires_at: 1_800_000_000,
+                                    revoked_at: Some(1_800_000_100),
+                                },
+                            ];
+                            let relay = RelayView {
+                                running: true,
+                                connection: RelayConnectionView::Connected,
+                                error: Some("boom"),
+                                pairing: RelayPairingView::Confirm {
+                                    code: "123456",
+                                    remaining_secs: 299,
+                                    announcement: Some("announce"),
+                                    generation: 1,
+                                },
+                                devices: &devices,
+                                now: 1_800_000_500,
+                            };
                             super::apply_settings_palette(ui);
-                            egui::Panel::left("settings_nav")
+                            let requested_category = egui::Panel::left("settings_nav")
                                 .resizable(false)
                                 .exact_size(190.0)
-                                .show(ui, |ui| {
-                                    super::nav(ui, cat, 3, query, catalog_ref);
-                                });
+                                .show(ui, |ui| super::nav(ui, *cat, 3, query, catalog_ref))
+                                .inner;
                             egui::CentralPanel::default().show(ui, |ui| {
                                 super::apply_component_style(ui);
                                 egui::ScrollArea::vertical()
@@ -2736,6 +4003,8 @@ mod tests {
                                                 config,
                                                 &mut changed,
                                                 catalog_ref,
+                                                crate::scrollback_policy::View::default(),
+                                                &mut false,
                                             ),
                                             Category::Shortcuts => super::shortcuts_page(
                                                 ui,
@@ -2768,10 +4037,21 @@ mod tests {
                                                 &mut web_action,
                                                 catalog_ref,
                                             ),
+                                            Category::Relay => super::relay_page(
+                                                ui,
+                                                config,
+                                                &relay,
+                                                &mut relay_qr,
+                                                &mut relay_action,
+                                                catalog_ref,
+                                            ),
                                             _ => {}
                                         });
                                     });
                             });
+                            if let Some(requested) = requested_category {
+                                *cat = requested;
+                            }
                         },
                         (config, category, String::new()),
                     );
@@ -2786,6 +4066,269 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Relay 페이지 하나를 kittest로 띄우고 방출된 동작을 돌려주는 헬퍼.
+    fn relay_harness<'a>(
+        catalog: &'a i18n::Catalog,
+        view: impl Fn() -> super::RelayView<'a> + 'a,
+    ) -> egui_kittest::Harness<
+        'a,
+        (
+            crate::config::Config,
+            super::RelayAction,
+            super::WebRemoteAction,
+        ),
+    > {
+        egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(
+                move |ui,
+                      state: &mut (
+                    crate::config::Config,
+                    super::RelayAction,
+                    super::WebRemoteAction,
+                )| {
+                    let (config, relay_action, _web_action) = state;
+                    *relay_action = super::RelayAction::None;
+                    let view = view();
+                    let mut relay_qr: super::WebQrCache = None;
+                    super::relay_page(ui, config, &view, &mut relay_qr, relay_action, catalog);
+                },
+                (
+                    crate::config::Config::default(),
+                    super::RelayAction::None,
+                    super::WebRemoteAction::None,
+                ),
+            )
+    }
+
+    fn confirm_view<'a>(generation: u64, remaining: u64) -> super::RelayView<'a> {
+        super::RelayView {
+            running: true,
+            connection: super::RelayConnectionView::Connected,
+            error: None,
+            pairing: super::RelayPairingView::Confirm {
+                code: "482913",
+                remaining_secs: remaining,
+                announcement: Some("남은 시간 1분"),
+                generation,
+            },
+            devices: &[],
+            now: 1_800_000_000,
+        }
+    }
+
+    /// 다섯 로케일 모두에서 Relay 페이지의 모든 문구가 키가 아니라 번역으로 렌더된다.
+    #[test]
+    fn relay_페이지는_다섯_로케일_모두에서_키를_노출하지_않는다() {
+        for locale in ["en-US", "ko-KR", "ja-JP", "zh-Hans", "zh-Hant"] {
+            let catalog = i18n::Catalog::load(locale).unwrap();
+            let catalog_ref = &catalog;
+            let devices = vec![super::RelayDeviceView {
+                id: "cc".repeat(16),
+                name: "phone".to_owned(),
+                last_seen_at: Some(1_799_999_000),
+                expires_at: 1_800_090_000,
+                revoked_at: None,
+            }];
+            let devices_ref = &devices;
+            let mut harness = relay_harness(catalog_ref, move || super::RelayView {
+                running: true,
+                connection: super::RelayConnectionView::Backoff { seconds: 7 },
+                error: Some("boom"),
+                pairing: super::RelayPairingView::Waiting {
+                    remaining_secs: 61,
+                    announcement: Some("x"),
+                    link: Some("https://shell.example.test/#AAAA"),
+                },
+                devices: devices_ref,
+                now: 1_800_000_000,
+            });
+            harness.step();
+            let texts: Vec<String> = harness
+                .output()
+                .shapes
+                .iter()
+                .filter_map(|clipped| match &clipped.shape {
+                    egui::Shape::Text(text) => Some(text.galley.text().to_owned()),
+                    _ => None,
+                })
+                .collect();
+            for text in &texts {
+                assert!(
+                    !text.starts_with("settings.relay"),
+                    "[{locale}] 번역되지 않은 키가 화면에 노출됐다: {text}"
+                );
+            }
+        }
+    }
+
+    /// 확인 단계에 들어서면 초점은 **거부**에 있다. Enter가 승인으로 떨어지면 코드를 대조하지
+    /// 않은 승인이 된다.
+    #[test]
+    fn 확인_단계의_초기_초점은_승인이_아니라_거부에_있다() {
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        let catalog_ref = &catalog;
+        let mut harness = relay_harness(catalog_ref, || confirm_view(1, 280));
+        harness.step();
+        harness.step();
+        let reject_label = catalog.t("settings.relay.pairing.reject", &[]);
+        let approve_label = catalog.t("settings.relay.pairing.approve", &[]);
+        let reject = harness.get_by_label(&reject_label);
+        assert!(reject.is_focused(), "거부 버튼에 초점이 있어야 한다");
+        let approve = harness.get_by_label(&approve_label);
+        assert!(!approve.is_focused(), "승인 버튼에 초점이 있으면 안 된다");
+    }
+
+    /// 매초 바뀌는 타이머는 접근성 트리에 없다. 안내 문구만 있고, 그것은 App이 경계에서만
+    /// 바꾼다.
+    #[test]
+    fn 카운트다운_숫자는_접근성_트리에_없고_안내만_있다() {
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        let catalog_ref = &catalog;
+        let mut harness = relay_harness(catalog_ref, || confirm_view(1, 299));
+        harness.step();
+        assert!(
+            harness.query_by_label("4:59").is_none(),
+            "초 단위 타이머가 접근성 노드로 노출되면 스크린 리더가 매초 읽는다"
+        );
+        assert!(harness.query_by_label("남은 시간 1분").is_some());
+    }
+
+    /// 확인 단계에서만 승인/거부가 방출된다. 기다리는 중에는 승인 버튼 자체가 없다.
+    #[test]
+    fn 승인과_거부는_확인_단계에서만_방출된다() {
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        let catalog_ref = &catalog;
+        let mut waiting = relay_harness(catalog_ref, || super::RelayView {
+            running: true,
+            connection: super::RelayConnectionView::Connected,
+            error: None,
+            pairing: super::RelayPairingView::Waiting {
+                remaining_secs: 100,
+                announcement: None,
+                link: None,
+            },
+            devices: &[],
+            now: 0,
+        });
+        waiting.step();
+        assert!(
+            waiting
+                .query_by_label(&catalog.t("settings.relay.pairing.approve", &[]))
+                .is_none(),
+            "기기가 붙기 전에는 승인 버튼이 없다"
+        );
+
+        let mut confirm = relay_harness(catalog_ref, || confirm_view(2, 200));
+        confirm.step();
+        confirm
+            .get_by_label(&catalog.t("settings.relay.pairing.approve", &[]))
+            .click();
+        confirm.step();
+        assert_eq!(confirm.state().1, super::RelayAction::ApprovePairing);
+    }
+
+    /// Relay 토글은 Relay 동작만 방출한다 — 모바일 웹 동작 채널은 손대지 않는다.
+    #[test]
+    fn relay_토글은_모바일_웹_동작을_방출하지_않는다() {
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        let catalog_ref = &catalog;
+        let mut harness = relay_harness(catalog_ref, || super::RelayView {
+            running: false,
+            connection: super::RelayConnectionView::Disabled,
+            error: None,
+            pairing: super::RelayPairingView::NotReady,
+            devices: &[],
+            now: 0,
+        });
+        harness.step();
+        // 행 라벨(텍스트)과 스위치(CheckBox)가 같은 이름을 가진다 — 역할로 스위치를 고른다.
+        let label = catalog.t("settings.relay_enabled", &[]);
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::CheckBox, &label)
+            .click();
+        harness.step();
+        let (config, relay_action, web_action) = harness.state();
+        assert_eq!(*relay_action, super::RelayAction::Start);
+        assert_eq!(*web_action, super::WebRemoteAction::None);
+        assert!(
+            !config.web.enabled,
+            "Relay 토글이 web 설정을 바꾸면 안 된다"
+        );
+    }
+
+    /// Relay 준비 전에는 페어링 시작이 비활성이다.
+    #[test]
+    fn relay_준비_전에는_페어링_시작이_비활성이다() {
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        let catalog_ref = &catalog;
+        let mut harness = relay_harness(catalog_ref, || super::RelayView {
+            running: true,
+            connection: super::RelayConnectionView::Connecting,
+            error: None,
+            pairing: super::RelayPairingView::NotReady,
+            devices: &[],
+            now: 0,
+        });
+        harness.step();
+        harness
+            .get_by_label(&catalog.t("settings.relay.pairing.begin", &[]))
+            .click();
+        harness.step();
+        assert_eq!(harness.state().1, super::RelayAction::None);
+        assert!(
+            harness
+                .query_by_label(&catalog.t("settings.relay.pairing.not_ready", &[]))
+                .is_some()
+        );
+    }
+
+    /// 취소 버튼은 취소된 기기에는 없고, 살아 있는 기기에서만 그 기기의 id를 실어 방출한다.
+    #[test]
+    fn 기기_취소는_살아_있는_기기의_id만_방출한다() {
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        let catalog_ref = &catalog;
+        let devices = vec![
+            super::RelayDeviceView {
+                id: "dd".repeat(16),
+                name: "alive".to_owned(),
+                last_seen_at: None,
+                expires_at: 1_800_090_000,
+                revoked_at: None,
+            },
+            super::RelayDeviceView {
+                id: "ee".repeat(16),
+                name: "gone".to_owned(),
+                last_seen_at: None,
+                expires_at: 1_800_090_000,
+                revoked_at: Some(1_800_000_000),
+            },
+        ];
+        let devices_ref = &devices;
+        let mut harness = relay_harness(catalog_ref, move || super::RelayView {
+            running: true,
+            connection: super::RelayConnectionView::Connected,
+            error: None,
+            pairing: super::RelayPairingView::Idle,
+            devices: devices_ref,
+            now: 1_800_000_000,
+        });
+        harness.step();
+        let revoke_label = catalog.t("settings.relay.devices.revoke", &[]);
+        let buttons = harness.get_all_by_label(&revoke_label);
+        assert_eq!(
+            buttons.count(),
+            1,
+            "취소된 기기에는 취소 버튼이 없어야 한다"
+        );
+        harness.get_by_label(&revoke_label).click();
+        harness.step();
+        assert_eq!(
+            harness.state().1,
+            super::RelayAction::RevokeDevice("dd".repeat(16))
+        );
     }
 
     #[test]

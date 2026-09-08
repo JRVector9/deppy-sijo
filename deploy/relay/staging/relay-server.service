@@ -11,6 +11,12 @@ EnvironmentFile=/etc/deppy-relay/staging.env
 ExecStart=/usr/local/bin/relay-server
 Restart=on-failure
 RestartSec=2
+# SIGTERM 뒤 이 시간 안에 연결을 닫고 join하지 못하면 SIGKILL. 서버는 정지 깃발을 보고
+# 모든 연결을 한 번씩 닫는다 — 이 값은 그 정리에 주는 여유다.
+TimeoutStopSec=15
+# 접속 스레드는 코어의 연결 상한 이전에 이 값으로 먼저 막힌다(코드 상한 512 + 여유).
+TasksMax=640
+LimitNOFILE=4096
 
 # 최소 권한. Relay는 디스크에 아무것도 쓰지 않는다.
 DynamicUser=yes
@@ -27,6 +33,11 @@ RestrictNamespaces=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+CapabilityBoundingSet=
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
 ReadWritePaths=
 
 [Install]

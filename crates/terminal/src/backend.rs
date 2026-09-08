@@ -18,17 +18,14 @@ pub struct TerminalCacheBudget {
 
 impl TerminalCacheBudget {
     pub const VISIBLE: Self = Self {
-        max_scrollback_lines: 10_000,
-        max_bytes: 16 * 1024 * 1024,
+        max_scrollback_lines: crate::policy::SCROLLBACK_LINES_MAX,
+        // 실제 압축 footprint에 대한 runtime 전역 예산이 메모리를 제한한다.
+        max_bytes: usize::MAX,
     };
-    pub const HIDDEN: Self = Self {
-        max_scrollback_lines: 1_000,
-        max_bytes: 2 * 1024 * 1024,
-    };
-    pub const EXITED: Self = Self {
-        max_scrollback_lines: 1_000,
-        max_bytes: 2 * 1024 * 1024,
-    };
+    // 숨김은 보관량이 아니라 압축 상태를 바꾼다. 삭제는 전역 예산 압박에서 결정한다.
+    pub const HIDDEN: Self = Self::VISIBLE;
+    // 종료 직후 archive 쓰기보다 먼저 이력을 삭제하지 않는다.
+    pub const EXITED: Self = Self::VISIBLE;
 
     pub fn for_class(class: TerminalCacheClass) -> Self {
         match class {
@@ -48,6 +45,14 @@ pub struct TerminalCacheFootprint {
     pub columns: usize,
     pub bytes_per_line: usize,
     pub estimated_bytes: usize,
+}
+
+/// 아카이브 실패를 미지원과 구분해 지원 backend의 화면이 버려지지 않게 한다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollbackSerializeError {
+    Unsupported,
+    LimitExceeded,
+    Unavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,12 +154,27 @@ pub enum TerminalRenderModel {
 /// v0에서는 사용처가 없다 — LibGhosttyBackend Mode B에서 구체화.
 pub struct TerminalExternalSurfaceHandle;
 
+/// 보관 정책의 실제 적용 결과. 증가하더라도 삭제된 이력이 복원된다는 뜻은 아니다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollbackApplyResult {
+    Applied {
+        requested: usize,
+        effective: usize,
+        trimmed: usize,
+    },
+    Unsupported,
+}
+
 /// 설계문서 4.2 TerminalBackend trait.
 /// `bracketed_paste`는 설계 trait에 없지만 PR-05 완료 기준(bracketed paste)이
 /// 입력 경로에서 모드 조회를 요구해 추가했다.
 pub trait TerminalBackend {
     fn feed(&mut self, bytes: &[u8]) -> anyhow::Result<TerminalChangeSet>;
     fn resize(&mut self, cols: u16, rows: u16) -> anyhow::Result<()>;
+    /// 셀 snapshot을 만들지 않고 backend에 실제 적용된 grid 크기를 읽는다.
+    fn grid_dimensions(&self) -> anyhow::Result<(u16, u16)> {
+        anyhow::bail!("실제 grid 크기 조회 미지원")
+    }
     fn render_model(&self) -> TerminalRenderModel;
 
     fn viewport_snapshot(&self) -> Option<TerminalViewportSnapshot>;
@@ -183,6 +203,11 @@ pub trait TerminalBackend {
     }
 
     fn set_cache_class(&mut self, class: TerminalCacheClass) -> Option<TerminalCacheEvent>;
+
+    /// 사용자 보관 한도를 갱신한다. 미지원 엔진은 세션을 재생성하지 않고 명시적으로 거부한다.
+    fn set_scrollback_limit(&mut self, _requested: usize) -> ScrollbackApplyResult {
+        ScrollbackApplyResult::Unsupported
+    }
 
     /// 메모리 압박 하에서 스크롤백을 클래스 예산 **아래로** 강제 축소한다 — 가장 오래된
     /// 히스토리를 `max_lines`까지 드롭하고 남은 것을 전부 압축한다. 전역 예산이 exited
@@ -214,6 +239,21 @@ pub trait TerminalBackend {
     /// 미지원 백엔드는 None (아카이브 대신 기존 drop 동작).
     fn serialize_scrollback(&self) -> Option<Vec<u8>> {
         None
+    }
+
+    /// 출력 상한이 있는 아카이브용 직렬화. 미지원 backend의 기존 detach 계약은 유지한다.
+    fn serialize_scrollback_bounded(
+        &self,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, ScrollbackSerializeError> {
+        let dump = self
+            .serialize_scrollback()
+            .ok_or(ScrollbackSerializeError::Unsupported)?;
+        if dump.len() > max_bytes {
+            Err(ScrollbackSerializeError::LimitExceeded)
+        } else {
+            Ok(dump)
+        }
     }
 
     /// scrollback+화면 전체에서 query를 부분 문자열로(대소문자 무시) 찾는다 (T3).

@@ -429,6 +429,7 @@ impl WriteBatch {
 }
 
 fn open_worker_connection(path: &Path) -> anyhow::Result<Connection> {
+    crate::db::reject_noncanonical_development_schema(path)?;
     storage_core::open_with_migrations(path, crate::db::MIGRATIONS)
 }
 

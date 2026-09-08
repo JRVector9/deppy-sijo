@@ -13,7 +13,7 @@ mod status;
 
 pub use agent_session::spawn_agent;
 pub use lifecycle::SessionLifecycle;
-pub use session::{PumpResult, Session, SessionKind};
+pub use session::{PumpResult, ResizeApplied, ResizeError, Session, SessionKind};
 pub use shell_session::spawn_shell;
 pub use status::{
     AGENT_EXIT_SENTINEL_PREFIX, SessionStatus, SessionStatusView, StatusConfidence, StatusDetector,

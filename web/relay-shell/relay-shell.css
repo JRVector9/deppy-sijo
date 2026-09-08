@@ -1,0 +1,211 @@
+/* Deppy Relay 신뢰 셸 스타일.
+ *
+ * 인라인 스타일을 쓰지 않는다 — CSP의 style-src가 'self'만 허용하므로, 이 파일이 셸의 모든
+ * 표현을 소유한다. 색은 데스크톱 앱과 같은 팔레트를 쓴다. */
+
+:root {
+  color-scheme: dark;
+  --bg: #181b20;
+  --surface: #20242a;
+  --surface-2: #0f1115;
+  --border: #32363e;
+  --text: #dcdee2;
+  --muted: #828893;
+  --cyan: #39b8e8;
+  --green: #56d364;
+  --amber: #e0a43a;
+  --red: #ef6671;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom)
+    env(safe-area-inset-left);
+}
+
+.shell {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  margin: 0 auto;
+  max-width: 720px;
+  padding: 16px;
+}
+
+.shell-header {
+  align-items: center;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  gap: 8px;
+  padding-bottom: 12px;
+}
+
+.title {
+  font-weight: 600;
+}
+
+.badge {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--muted);
+  font-size: 13px;
+  padding: 2px 8px;
+}
+
+.badge-view {
+  border-color: var(--amber);
+  color: var(--amber);
+}
+
+.badge-e2ee {
+  border-color: var(--green);
+  color: var(--green);
+}
+
+/* 화면 전환 — 한 순간에 정확히 하나만 보인다. */
+.screen {
+  display: none;
+  flex-direction: column;
+  gap: 12px;
+}
+
+body[data-screen="boot"] #screen-boot,
+body[data-screen="link"] #screen-link,
+body[data-screen="identity"] #screen-identity,
+body[data-screen="connect"] #screen-connect,
+body[data-screen="verify"] #screen-verify,
+body[data-screen="revoked"] #screen-revoked,
+body[data-screen="recovery"] #screen-recovery {
+  display: flex;
+}
+
+h1 {
+  font-size: 20px;
+  font-weight: 600;
+  margin: 0;
+}
+
+h2 {
+  font-size: 15px;
+  font-weight: 600;
+  margin: 0 0 4px;
+}
+
+p {
+  margin: 0;
+}
+
+.note {
+  color: var(--muted);
+  font-size: 14px;
+  min-height: 1.55em;
+}
+
+.warn {
+  color: var(--amber);
+  font-size: 14px;
+}
+
+.wait {
+  color: var(--cyan);
+  font-size: 14px;
+}
+
+.progress {
+  color: var(--muted);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.code {
+  color: var(--cyan);
+  font-family: "D2Coding", "SFMono-Regular", Menlo, monospace;
+  font-size: 40px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.12em;
+}
+
+.control {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--text);
+  font: inherit;
+  min-height: 44px;
+  padding: 0 16px;
+}
+
+.control.danger {
+  border-color: var(--red);
+  color: var(--red);
+}
+
+/* 세션 화면은 relay-shell.js가 활성화 이후에만 만든다. 부품 스타일은 공용
+   web/shared/mobile-theme.css가 소유하고(`m-` 접두사), 여기에는 그 화면을 셸 안에 앉히는
+   규칙만 둔다. */
+.session-host {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+}
+
+/* 세션에 들어서면 셸 크롬(헤더·안내·푸터)을 걷고 화면 전체를 쓴다 — deppy-mux 모바일과 같다. */
+body[data-screen="session"] {
+  padding: 0;
+}
+
+body[data-screen="session"] .shell {
+  gap: 0;
+  height: 100dvh;
+  max-width: none;
+  padding: 0;
+}
+
+body[data-screen="session"] .shell-header,
+body[data-screen="session"] .shell-footer,
+body[data-screen="session"] .note {
+  display: none;
+}
+
+body[data-stage="open"] {
+  overflow: hidden;
+}
+
+.shell-footer {
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 13px;
+  padding-top: 12px;
+}
+
+/* 프라이버시 커튼 — 앱이 뒤로 가면 내용을 즉시 가린다. */
+.curtain {
+  background: var(--bg);
+  display: none;
+  inset: 0;
+  position: fixed;
+  z-index: 200;
+}
+
+body[data-curtain="on"] .curtain {
+  display: block;
+}

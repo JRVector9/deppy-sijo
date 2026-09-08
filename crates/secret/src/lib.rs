@@ -1,6 +1,9 @@
 mod bundle;
 mod diagnostic_scan;
 pub mod hex;
+#[cfg(target_os = "macos")]
+#[cfg_attr(feature = "test-keyring-core", allow(dead_code))]
+mod macos;
 mod redaction;
 pub mod token;
 
@@ -166,6 +169,7 @@ pub struct KeyringSecretStore;
 static KEYRING_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 impl KeyringSecretStore {
+    #[cfg(any(not(target_os = "macos"), test, feature = "test-keyring-core"))]
     fn entry(&self, id: &str) -> anyhow::Result<keyring_core::Entry> {
         keyring_core::Entry::new(KEYRING_SERVICE, id)
             .with_context(|| format!("keyring entry 생성 실패: {id}"))
@@ -175,37 +179,65 @@ impl KeyringSecretStore {
 impl SecretStore for KeyringSecretStore {
     fn set_secret(&self, id: &str, secret: &SecretString) -> anyhow::Result<()> {
         let _serial = KEYRING_SERIAL.lock().expect("keyring serial lock");
-        self.entry(id)?
-            .set_password(secret.expose())
-            .with_context(|| format!("keyring 저장 실패: {id}"))
+        #[cfg(all(target_os = "macos", not(any(test, feature = "test-keyring-core"))))]
+        {
+            macos::set(id, secret).context("keyring 저장 실패")
+        }
+        #[cfg(any(not(target_os = "macos"), test, feature = "test-keyring-core"))]
+        {
+            self.entry(id)?
+                .set_password(secret.expose())
+                .with_context(|| format!("keyring 저장 실패: {id}"))
+        }
     }
 
     fn get_secret(&self, id: &str) -> anyhow::Result<SecretString> {
         let _serial = KEYRING_SERIAL.lock().expect("keyring serial lock");
-        let password = self
-            .entry(id)?
-            .get_password()
-            .with_context(|| format!("keyring 조회 실패: {id}"))?;
-        Ok(SecretString::new(password))
+        #[cfg(all(target_os = "macos", not(any(test, feature = "test-keyring-core"))))]
+        {
+            macos::get(id).context("keyring 조회 실패")
+        }
+        #[cfg(any(not(target_os = "macos"), test, feature = "test-keyring-core"))]
+        {
+            let password = self
+                .entry(id)?
+                .get_password()
+                .with_context(|| format!("keyring 조회 실패: {id}"))?;
+            Ok(SecretString::new(password))
+        }
     }
 
     fn delete_secret(&self, id: &str) -> anyhow::Result<()> {
         let _serial = KEYRING_SERIAL.lock().expect("keyring serial lock");
-        match self.entry(id)?.delete_credential() {
-            Ok(()) => Ok(()),
-            // 이미 없는 entry 삭제는 성공으로 취급 (metadata/keyring drift 복구 허용)
-            Err(keyring_core::Error::NoEntry) => Ok(()),
-            Err(e) => Err(e).with_context(|| format!("keyring 삭제 실패: {id}")),
+        #[cfg(all(target_os = "macos", not(any(test, feature = "test-keyring-core"))))]
+        {
+            macos::delete(id).context("keyring 삭제 실패")
+        }
+        #[cfg(any(not(target_os = "macos"), test, feature = "test-keyring-core"))]
+        {
+            match self.entry(id)?.delete_credential() {
+                Ok(()) => Ok(()),
+                // 이미 없는 entry 삭제는 성공으로 취급 (metadata/keyring drift 복구 허용)
+                Err(keyring_core::Error::NoEntry) => Ok(()),
+                Err(e) => Err(e).with_context(|| format!("keyring 삭제 실패: {id}")),
+            }
         }
     }
 
     fn has_secret(&self, id: &str) -> anyhow::Result<bool> {
         let _serial = KEYRING_SERIAL.lock().expect("keyring serial lock");
-        match self.entry(id)?.get_password() {
-            Ok(_) => Ok(true),
-            // 확인된 부재만 false — 그 외 오류는 "없음"으로 오인하면 안 된다 (키 덮어쓰기 방지)
-            Err(keyring_core::Error::NoEntry) => Ok(false),
-            Err(e) => Err(e).with_context(|| format!("keyring 존재 확인 실패: {id}")),
+        #[cfg(all(target_os = "macos", not(any(test, feature = "test-keyring-core"))))]
+        {
+            macos::has(id).context("keyring 존재 확인 실패")
+        }
+        #[cfg(any(not(target_os = "macos"), test, feature = "test-keyring-core"))]
+        {
+            match self.entry(id)?.get_password() {
+                Ok(_) => Ok(true),
+                // 확인된 부재만 false — 그 외 오류는 "없음"으로 오인하면 안 된다 (키 덮어쓰기 방지)
+                Err(keyring_core::Error::NoEntry) => Ok(false),
+                Err(e) => Err(e).with_context(|| format!("keyring 존재 확인 실패: {id}")),
+            }
         }
     }
 
@@ -215,18 +247,25 @@ impl SecretStore for KeyringSecretStore {
 
     fn list_secret_ids_bounded(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
         let _serial = KEYRING_SERIAL.lock().expect("keyring serial lock");
-        let spec = std::collections::HashMap::from([("service", KEYRING_SERVICE)]);
-        // `Entry::search` returns a platform-owned Vec, so its source allocation cannot be bounded
-        // without a streaming keyring-core API. From the first iterator stage available to us,
-        // nonmatching service/prefix rows are dropped immediately and only limit+1 matching
-        // usernames are retained. The +1 probe proves overflow without retaining the full flood.
-        let matching_users = keyring_core::Entry::search(&spec)
-            .context("keyring entry inventory 조회 실패")?
-            .into_iter()
-            .filter_map(|entry| entry.get_specifiers())
-            .filter_map(|(service, user)| (service == KEYRING_SERVICE).then_some(user))
-            .filter(|user| user.starts_with(prefix));
-        collect_bounded_secret_ids(matching_users)
+        #[cfg(all(target_os = "macos", not(any(test, feature = "test-keyring-core"))))]
+        {
+            macos::list(prefix).context("keyring inventory 조회 실패")
+        }
+        #[cfg(any(not(target_os = "macos"), test, feature = "test-keyring-core"))]
+        {
+            let spec = std::collections::HashMap::from([("service", KEYRING_SERVICE)]);
+            // `Entry::search` returns a platform-owned Vec, so its source allocation cannot be bounded
+            // without a streaming keyring-core API. From the first iterator stage available to us,
+            // nonmatching service/prefix rows are dropped immediately and only limit+1 matching
+            // usernames are retained. The +1 probe proves overflow without retaining the full flood.
+            let matching_users = keyring_core::Entry::search(&spec)
+                .context("keyring entry inventory 조회 실패")?
+                .into_iter()
+                .filter_map(|entry| entry.get_specifiers())
+                .filter_map(|(service, user)| (service == KEYRING_SERVICE).then_some(user))
+                .filter(|user| user.starts_with(prefix));
+            collect_bounded_secret_ids(matching_users)
+        }
     }
 }
 

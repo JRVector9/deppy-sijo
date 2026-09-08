@@ -102,6 +102,13 @@ impl PersistPipe {
 
     /// 이전 실행에서 저장된 tab/pane 구조를 반환한다 — worker 시작 시 정확히
     /// 한 번 소비된다(재호출 시 빈 결과). 저장된 window/tab이 없으면 (빈 Vec, None).
+    pub(crate) fn pending_session_ids(&self) -> impl Iterator<Item = &str> {
+        self.restored_tabs
+            .iter()
+            .flat_map(|tab| tab.panes.iter())
+            .filter_map(|pane| pane.session_id.as_deref())
+    }
+
     pub(crate) fn take_saved_layout(&mut self) -> (Vec<TabState>, Option<MuxTabId>) {
         (
             std::mem::take(&mut self.restored_tabs),

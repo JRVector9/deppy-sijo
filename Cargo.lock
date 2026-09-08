@@ -1144,6 +1144,7 @@ dependencies = [
  "http-client",
  "i18n",
  "image",
+ "keyring-core",
  "libc",
  "libmimalloc-sys",
  "mcp",
@@ -1159,6 +1160,7 @@ dependencies = [
  "pty",
  "pulldown-cmark",
  "qrcode",
+ "relay-protocol",
  "quick-xml 0.42.0",
  "regex",
  "rfd",
@@ -4136,7 +4138,9 @@ name = "relay-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
  "relay-protocol",
+ "sha2 0.11.0",
  "tracing",
  "tracing-subscriber",
  "tungstenite",
@@ -4401,7 +4405,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",
+ "core-foundation 0.10.1",
  "keyring-core",
+ "security-framework",
  "serde_json",
  "uuid",
  "windows-native-keyring-store",

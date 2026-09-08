@@ -1,3 +1,70 @@
+## PR C 공유 완료 — PR #160 (2026-09-08)
+
+- 목표 완료: 압축 streaming resize·bounded scratch·출력 보존 한도·cold 재압축·preflight·회귀/벤치·Codex 리뷰/수정·관련 gate·커밋/push/main 대상 PR 생성.
+- PR: https://github.com/JRVector9/deppy-sijo/pull/160 ; source commit 1e88de09c7e4199fc2a0c41c92849ed31aa469a3; branch perf/terminal-streaming-reflow, base origin/main45e66cc. 테스트/벤치는 이 source 내용에 해당한다. 이후 변경은 문서뿐이다.
+- Codex 전체 리뷰 P2 1건을 실제 RED→GREEN으로 수정. 제한 재리뷰 확정 finding0. 최종 vendor152unit+45ref+1memory+1doc, terminal87/session55 PASS; ignored4+benchmark1(benchmark 별도 실행PASS). strict vendor/terminal/session clippy, workspace fmt/new vendor rustfmt/boundary/diff PASS.
+- 최종 실측100k 추가heap5.61~7.99MB, scratch280~1440cells(10k와 동일), release44~1100ms. allocator net live heap 측정이며 전체 RSS/전역 예산/OOM 복구 보장 아님. CPU O(N), 극단적으로 좁은 폭의 지연은 후속 범위.
+- 일지: ~/Library/CloudStorage/SynologyDrive-sync_data/Obsidian-Vault/프로젝트 일지/deppy-sijo/2026-09-08 터미널 압축 스트리밍 리플로 PR C.md
+- 수정 파일: vendor grid/term/Row/codec 테스트 및 memory test 등록, terminal backend 회귀, plan/handoff. app/runtime/UI/protocol 변경 및 앱 빌드/실행 없음. rebase/force 없음.
+- 남음: PR 검토·main 착지는 부모 작업에서 진행. 이 하위 작업은 PR 생성까지 완료. 다음 명령: gh pr view 160 --json state,headRefOid,baseRefName,mergeable,statusCheckRollup; 필요 시 일반 main merge 후 관련 gate 재실행. CI PASS를 주장하지 않는다.
+
+## PR C 최종 리뷰·gate 완료 (2026-09-08)
+
+- 전체 Codex 리뷰 P2 1건을 실제 RED→GREEN으로 수정, preflight 제한 재리뷰 exit0·남은 확정 finding0. /private/tmp/deppy-streaming-review-preflight.log. 리뷰 정상 종료, 프로세스 강제 종료 없음.
+- final source vendor152 unit+45 reference+1 memory+1 doc PASS(benchmark 기본 ignored1, 명시 release 실행PASS). terminal87/session55 PASS(ignored4). vendor/terminal/session strict all-target clippy, workspace fmt/new vendor rustfmt/diff PASS. /private/tmp/deppy-streaming-final-results.json은 모든 exit0.
+- final source release100k행: 80→12044ms/5,608,024B;200→10093ms/6,811,032B;500→80292ms/7,651,808B;200→21100ms/7,991,800B. scratch280/400/1440/594 cells는10k와 동일. /private/tmp/deppy-streaming-release-final.log. 10k200→100 stock11ms/71,098,240B vs streaming10ms/691,032B.
+- 최신 origin/main45e66cc 재확인. scope app/runtime/UI/protocol 수정 없음, 앱 빌드/실행 없음. git diff check 깨끗함.
+- 남음: source commit/push/PR 생성, PR URL·최종HEAD를 handoff와 Obsidian 일지에 기록하고 전달. 계획 Task4 공유 단계만 남음.
+
+## PR C Codex P2 수정 (2026-09-08)
+
+- Codex CLI 리뷰 정상 종료: P2 1건, Term::resize가 grid preflight 전에 vi cursor를 옮겨 잘못된 공개 크기 입력의 panic 뒤 부분 변경을 남김. /private/tmp/deppy-streaming-review.log; process93482 정상 종료(강제 종료 없음).
+- 실제 RED: streaming_resize_preflight_rejects_before_term_mutation에서 vi cursor Line0→Line-12 관찰, exit101. /private/tmp/deppy-streaming-preflight-red.log.
+- 수정: Grid::preflight_resize를 공유하고 Term의 vi cursor 및 두 grid 변경 전에 양쪽 모두 검증한다. active/inactive 중 두 번째 grid가 잘못된 경우도 첫 grid가 바뀌지 않는 회귀 포함.
+- 다음: vendor/terminal/session tests 및 clippy 재검증, preflight만 제한된 read-only Codex 재리뷰, handoff/일지/commit/push/PR.
+
+## PR C source checkpoint / release 측정 (2026-09-08)
+
+- source: streaming 입력/출력, 보존 한도 deque, cold 압축 유지, ReflowMetrics, differential/실제 allocator 회귀 완료. origin/main fetch 결과45e66cc로 base와 같음(추가 merge 불필요).
+- release benchmark 실제 PASS: 100k 80→12044ms;200→10096ms;500→80293ms;200→21098ms. 추가 heap peak5.61/6.81/7.65/7.99MB, scratch280/400/1440/594 cells. /private/tmp/deppy-streaming-release-benchmark.log. 10k baseline stock200→100은11ms/71,098,240B, streaming9ms/691,032B.
+- strict vendor all-target clippy와 terminal/session all-target clippy PASS. workspace fmt, 신규 vendor 파일 rustfmt, git diff check, xtask boundary PASS. terminal87/session55 PASS, ignored4. 앱/workspace전체 빌드·실행 안 함.
+- 범위: grid/term/terminal tests와 vendor memory test 등록만. app/runtime/UI/protocol 없음. 전역 RAM hard budget/OOM 복구/CPU 분할은 구현하지 않음.
+- 남음: 마지막 vendor 전체 tests, Codex 리뷰 결론 및 지적 수정, final docs/commit/push/main PR. 리뷰 process93482, log /private/tmp/deppy-streaming-review.log. force/rebase 없음.
+- 다음 명령: CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-streaming-target-20260908 cargo test --manifest-path third_party/alacritty_terminal-0.26.0/Cargo.toml --locked -- --test-threads=1; codex review 결과 확인; git push -u origin perf/terminal-streaming-reflow; gh pr create --base main --head perf/terminal-streaming-reflow --body-file /private/tmp/deppy-streaming-reflow-pr.md.
+
+## PR C 측정·통합 GREEN (2026-09-08)
+
+- vendor 151 unit +45 reference +1 memory test +1 doc PASS(benchmark 기본 ignored1). terminal87 PASS/4 ignored, session55 PASS. /private/tmp/deppy-streaming-vendor-2.log, /private/tmp/deppy-streaming-focused.log.
+- 명시 실행 benchmark2 PASS: 100k행 80→120/200→100/500→80/200→2에서 추가 heap peak 5,608,024 /6,811,032 /7,651,808 /7,991,800 bytes. 관찰 scratch280/400/1440/594 cells는 10k와 동일. debug resize848/1906/2996/5710ms. /private/tmp/deppy-streaming-benchmark.log. CPU O(N) 지연은 남는다.
+- 새로운 regression: 좁은 출력의 보존 한도, 작은 history limit differential, resize 뒤 backend 검색/직렬화/viewport/new output.
+- 실패 접근: vendor 전체 cargo fmt가 기존 상류 파일까지 넓게 포맷했다. 해당 포맷 변경만 모두 회수하고 원본 스타일 보존. workspace fmt + 새 파일 rustfmt만 gate로 사용한다.
+- vendor strict clippy에서 기존 codec 테스트의 needless_range_loop 4개 실패. 동등한 iter_mut로 최소 수정 중. codex CLI source-only read-only review 진행 중.
+- 다음: strict clippy 재실행, release 측정, 최종 main 반영/검사/리뷰/commit/push/PR. 앱 빌드·실행 없음.
+
+## PR C 추가 메모리 RED (2026-09-08)
+
+- 첫 구현 vendor 전체: 149 unit +45 reference +1 doc PASS. Unicode/링크/커서/스크롤 differential와 잘못된 크기 focused 3 PASS.
+- 좁은 폭 출력 적재 결함을 실제 allocator로 재현: 10k행 200→2에서 peak 추가 95,623,738 bytes, 회귀 exit101. /private/tmp/deppy-streaming-memory-red.log.
+- 원인: 출력 history를 전부 압축한 후 마지막에 truncate하여 압축 행 metadata/내용 자체가 폭 비율만큼 증가.
+- 수정: PackedRows를 보존 한도 bounded VecDeque로 변경, 오래된 완성 출력을 즉시 버림. 이력 한도/커서 의미는 기존 마지막 truncate와 동일. GREEN 검증 다음.
+- 실패 접근: 첫 compile에서 잔여 generic T와 테스트 Processor 타입 추론 오류, 각각 Cell/default Processor 타입 명시로 수정.
+
+## PR C RED 확인·첫 구현 (2026-09-08)
+
+- 실제 vendor focused test exit101: streaming_resize_keeps_cold_history_compressed가 resize 후 압축 행 소멸 assertion으로 실패. /private/tmp/deppy-streaming-red.log.
+- 첫 구현: Cell 전용 streaming_resize.rs, Storage 슬롯 소유권 iterator/압축 설치/visible 복원, Term 연결. generic 알고리즘 cursor 계산 유지. 원시 전체 inflate 제거, 완성 출력 즉시 압축.
+- preflight는 좌표/checked 산술 검증이며 allocator OOM 복구를 보장하지 않는다. output/input 압축 데이터와 O(history) 메타데이터는 남는다.
+- 다음: focused GREEN 컴파일 → vendor 전체 → differential 및 측정. 아직 GREEN 주장 없음.
+
+## PR C 시작 — 압축 streaming reflow (2026-09-08)
+
+- 목표: resize 전체 inflate 제거, bounded raw scratch, 기존 primary/alt/cursor 의미 보존. base 45e66cc; worktree /private/tmp/deppy-streaming-reflow-20260908; branch perf/terminal-streaming-reflow.
+- 완료: 기존 resize/storage/codec/event 흐름 읽기, 전용 plan 작성. 코드/테스트 실행 전.
+- 변경 파일: docs/superpowers/plans/2026-09-08-terminal-streaming-reflow.md, 본 handoff.
+- 결정: generic resize는 동등성 oracle; Cell streaming 경로는 기존 grow/shrink 계산을 보존하며 완성 출력 즉시 압축. UI/runtime/protocol 변경 및 앱 빌드/실행 제외.
+- 테스트: 아직 실행 없음. 실패 접근 없음.
+- 다음: 실제 Term의 resize 후 압축 유지 RED; 전용 target와 jobs2로 vendor focused 실행. 계획의 Task 1 명령 사용.
+
 ## ureq3 migration validated / PR landing next (2026-09-07)
 
 - Objective: replace dependency-only PR141 with native ureq3.4 migration, preserving OAuth/MCP status/body/redaction and SSE idle semantics.
@@ -2333,3 +2400,99 @@
 - Failed approaches: an initial unbounded `codex review --uncommitted` ran extensive checks but never produced a final review and was stopped by exact PID; it also attempted the invalid `cargo test -p deppy-sijo --lib` command even though the app has no library target. The first RED-test draft used unavailable `Context::run`, then captured `WorkspaceUi` too broadly; both compile-only mistakes were corrected before the intended RED assertion was observed. The first final format check found one line-wrap difference; `cargo fmt --all` corrected it and the rerun passed.
 - Remaining work: push this clean landing branch, create a PR to `main`, wait for required checks, merge only if green, close superseded PRs #147 and #148, and preserve PRs #146 and #149 plus their dependent remote branches for further development.
 - Exact next commands: `git push -u origin land/ime-resize-ready-20260906`; create a `main` PR for commits `4903b39` and `bbead4f`; run `gh pr checks <new-pr> --watch`; merge the new PR after all required checks pass; close #147 and #148 without deleting the `fix/window-resize-flicker` branch because PR #149 still targets it.
+## Ready PR 19개 main 통합 시작 (2026-09-09)
+
+### 통합 checkpoint — 18개 PR 및 migration v40 결합 완료
+
+- #157, #160, #165, #167, #159, #156, #173, #158, #164, #170, #171,
+  #161, #168, #169, #175, #172, #176, #166을 원본 이력을 보존하는 merge
+  commit으로 통합했다. 남은 원본 PR은 #174 하나다.
+- 의미 충돌은 터미널 cell 상한과 scrollback 정책, resize tracked generation,
+  워크스페이스 open/reorder action, 파일 트리 선택 밝기, App scrollback/Relay view,
+  다섯 locale의 합집합을 모두 보존해 해결했다.
+- Relay가 사용하는 정식 v38 reconnect verifier와 v39 authorization epoch 뒤에
+  Keychain `recovery_generation`을 v40으로 배치했다. 과거 Keychain 개발판 v38을
+  정식 Relay v38로 오인하지 않도록 읽기 snapshot의 schema fingerprint를 `Db`와
+  background writer 양쪽 open 경로에서 검사하고, 불일치하면 쓰기 전에 거부한다.
+- migration 결함은 먼저 실제 RED로 확인했다. v40 추가 전 `secret_recovery` 검사는
+  `no such column: ledger.recovery_generation`으로 실패했고, 개발판 v38 거부 및 정식
+  v38→v40 기대 검사도 2건 실패했다.
+- 실제 GREEN: `cargo test -p storage --locked 'v38' -- --test-threads=1` 2 PASS,
+  이어서 storage 전체 338 PASS / doc 0, exit 0. terminal/runtime/file-tree focused 결과는
+  앞선 통합 checkpoint에서 각각 runtime 301, terminal 95(4 ignored), file-tree 151,
+  workspace unavailable 회귀 1 PASS다.
+- 수정 파일: `crates/storage/src/db.rs`, `crates/storage/src/write_worker.rs`, 이 handoff.
+- 다음: #174를 병합하고 19개 head 포함 여부를 확인한 뒤 전체 gate와 Codex 리뷰,
+  통합 PR/main merge, 새 main package와 앱 재실행을 진행한다. 외부 DNS/TLS/배포는
+  자격증명 부재로 계속 BLOCKED다.
+
+### 통합 checkpoint — 19개 PR 전체 결합 및 workspace gate 완료
+
+- #174 macOS 공증까지 merge했고, 원격 19개 원본 브랜치의 현재 head를 각각
+  `git merge-base --is-ancestor`로 검사해 모두 통합 HEAD에 포함됨을 확인했다.
+- 첫 workspace 실행은 app test 컴파일에서 `App::new`의 `run_lock`과
+  `settings::show`의 Relay/scrollback 인자가 빠져 exit 101이었다. 인자를 보존해
+  다시 컴파일한 뒤, macOS 비대화형 Security.framework 경로 때문에 기존
+  `keyring-core` counting store가 보이지 않는 테스트 결합 문제를 실제 assertion
+  실패로 확인했다.
+- 해결: `secret/test-keyring-core`를 app dev-dependency에서만 활성화했다. 앱 테스트는
+  실제 login Keychain을 건드리지 않고 기존 접근 횟수 계약을 검증하며, 일반·패키지
+  빌드는 feature를 활성화하지 않아 `kSecUseAuthenticationUIFail` 경로를 그대로 쓴다.
+- 실제 검증: 해당 Keychain 회귀 1 PASS. 이어서
+  `cargo test --workspace --locked -- --test-threads=1` 전체 exit 0(app 2,209 PASS /
+  14 ignored, storage 338, runtime 301, terminal 95 / 4 ignored, web-remote 317 /
+  1 ignored 등). `cargo clippy --workspace --all-targets --locked -- -D warnings` PASS.
+  통합 뒤 `cargo fmt --all -- --check`, `git diff --check`, `xtask check-boundary`,
+  `xtask check-deps`도 모두 PASS했다.
+- 현재 수정 파일: `crates/app/Cargo.toml`, `crates/app/src/keychain_startup_tests.rs`,
+  `crates/secret/Cargo.toml`, `crates/secret/src/lib.rs`, 이 handoff와 계획 문서.
+- 다음: 변경을 checkpoint commit하고 `origin/main...HEAD` 전체 Codex CLI 리뷰를
+  실행한다. 지적을 반영해 gate를 필요한 범위만 재검증한 뒤 통합 PR을 만들고 merge한다.
+
+### 통합 checkpoint — 리뷰 완료, 착지 대기
+
+- 현재 목표: 검증을 끝낸 통합 HEAD `2e92888`을 단일 PR로 `main`에 merge한 뒤 새
+  `main`에서 macOS bundle을 만들고 앱을 재실행한다.
+- 작업 트리: `/private/tmp/deppy-ready-prs-integration-20260909`, 브랜치
+  `integrate/ready-prs-20260909`, 기준 `origin/main`
+  `45e66ccae313e653fc5dc6df46b80f791f231fc4`. 원래
+  `/Users/jr/Desktop/projects/deppy-sijo`의 `feat/fleet-one-list-and-relay-wip`는
+  건드리지 않았다.
+- 병렬 읽기 전용 감사 세 갈래를 완료했다. 터미널 감사에서 resize debounce 테스트의
+  잘못된 즉시 전송 기대를 찾아 수정했다. App/UI 감사에서
+  `OpenWorkspaceSession`/`ReorderWorkspaces` 동시 보존과 파일 트리 밝기 테스트 인자를
+  확인해 수정했다. storage 감사에서 서로 다른 v38 migration 충돌을 찾아 Relay
+  v38·v39 뒤 Keychain v40 배치와 비정식 개발 v38 fail-closed 검사를 추가했다.
+- Codex CLI 전체 diff 리뷰와 통합 전용 집중 리뷰를 각각 실행했지만, 약 45,000줄의
+  병합 diff 및 macOS read-only sandbox의 임시 object/cache 생성 실패를 반복하며 최종
+  보고서를 만들지 못했다. 첫 프로세스는 PID로, 두 번째 세션은 interrupt로 종료했다.
+  두 실행 모두 소스는 수정하지 않았다. 병렬 감사 지적은 전부 반영했고 그 뒤 전체
+  workspace test와 strict Clippy를 통과했다.
+- 실제 최종 검증: `cargo test --workspace --locked -- --test-threads=1` exit 0
+  (app 2,209 PASS / 14 ignored, storage 338, runtime 301, terminal 95 / 4 ignored,
+  web-remote 317 / 1 ignored 등),
+  `cargo clippy --workspace --all-targets --locked -- -D warnings` PASS,
+  `cargo fmt --all -- --check`, `git diff --check`, `xtask check-boundary`,
+  `xtask check-deps` PASS.
+- 실패 접근: #174 병합 직후 전체 테스트는 누락된 `App::new`/`settings::show` 인자로
+  컴파일 실패했고, 보정 뒤 Keychain counting store assertion이 실패했다. 앱 테스트에서만
+  `secret/test-keyring-core`를 켜도록 고쳐 회귀를 통과시켰다. Codex CLI 리뷰 두 번은
+  위 사유로 최종 결과가 없으므로 PASS로 기록하지 않는다.
+- 통합 PR #177을 만들었다. GitGuardian은 통합 HEAD에서 PASS했다. 빨간 GitHub
+  Actions 6개는 모두 `runner_id=0`, `steps=[]`, 결제/지출 한도로 작업이 시작되지
+  않았다는 annotation을 확인했다. 실제 코드 실패로 분류하지 않았다. private 저장소의
+  branch protection/rulesets API는 GitHub Pro가 없어 HTTP 403을 반환했으며, PR 자체는
+  `MERGEABLE`이다.
+- 미실행 Actions의 로컬 대체 검증도 완료했다. Relay JavaScript 16 PASS,
+  `cargo audit` exit 0(허용된 yanked 경고 2개),
+  `cargo deny check bans licenses sources` exit 0(세 항목 모두 ok), Linux 대상
+  `cargo build --locked --release -p relay-server --bin relay-server` PASS다.
+- 남은 일: 이 문서 commit으로 고정된 PR head의 Actions 비실행 여부를 다시 확인하고,
+  merge commit 방식으로 `main`에 반영한 뒤 새
+  `origin/main`의 bundle build 및 정확한 기존 PID 종료 후 재실행, 프로세스 확인.
+  DNS·TLS·배포 자격증명이 없어 외부 Relay 배포 검증은 계속 BLOCKED다.
+- 정확한 다음 명령: `git push -u origin integrate/ready-prs-20260909`; `gh pr create
+  --base main --head integrate/ready-prs-20260909`; merge 후 `git fetch origin main`과
+  `git merge-base --is-ancestor 2e92888 origin/main`; 새 main worktree에서
+  `scripts/package-macos.sh`를 실행하고 `pgrep -x deppy-sijo`로 찾은 정확한 PID만
+  종료한 뒤 `open 'target/bundle/Deppy Sijo.app'`.

@@ -14,3 +14,11 @@ node_modules/
 /deppy-sijo.log
 /Deppy-Sijo-*.zip
 /.codex/
+
+# Relay 셸의 로컬 불변 아카이브와 매니페스트는 추적하지 않는다.
+/web/relay-shell/dist/
+
+# 개발용 Relay 자격증명 및 소유 프로세스/serve 상태
+/.relay-dev.env
+/.relay-dev/
+/scripts/tests/__pycache__/

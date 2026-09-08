@@ -10,7 +10,7 @@
 //! 기동 배선(App 부팅 경로 연결)은 Task 4의 몫이다 — 여기서는 어댑터만 제공한다.
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Context as _;
 use secret::SecretStore;
@@ -29,7 +29,10 @@ impl AppRelayRepository {
     /// 앱 데이터 디렉터리의 메타데이터 DB를 열고, 이전 프로세스가 남긴 pending 행을
     /// 전부 지운다. 검증된 메모리 승인(`PairingApproval`)은 프로세스와 함께 사라지므로
     /// 살아남은 pending 행은 페어링 증거가 될 수 없다 — 되살아나기 전에 지운다.
-    pub fn open(metadata_db_path: &Path) -> anyhow::Result<Self> {
+    ///
+    /// 단일 인스턴스 lock을 요구한다. 두 프로세스가 동시에 pending을 지우고 쓰면 한쪽의
+    /// 진행 중인 의식이 다른 쪽에 지워진다. 식별키 생성과 같은 이유로 타입으로 강제한다.
+    pub fn open(metadata_db_path: &Path, _run_lock: &persist::LockFile) -> anyhow::Result<Self> {
         let db = storage::Db::open(metadata_db_path).context("Relay 저장소 열기 실패")?;
         let purged = db
             .delete_all_relay_pending_devices()
@@ -59,6 +62,15 @@ pub fn create_relay_identity_after_single_instance_lock(
     get_or_create_relay_identity(store)
 }
 
+/// 공급자 생성 자체는 Keychain을 읽지 않는다. 명시적으로 켠 Relay의 기기 핸드셰이크가
+/// 호출할 때만 접근하며, 앱 시작/OFF 경로도 같은 공급자를 사용해 이 경계를 검증한다.
+pub fn relay_identity_supplier(
+    run_lock: Arc<persist::LockFile>,
+    store: Arc<dyn SecretStore>,
+) -> web_remote::relay_client::RelayIdentitySupplier {
+    Box::new(move || create_relay_identity_after_single_instance_lock(&run_lock, store.as_ref()))
+}
+
 impl RelayRepository for AppRelayRepository {
     fn insert_pending(
         &self,
@@ -86,6 +98,7 @@ impl RelayRepository for AppRelayRepository {
             {
                 storage::RelayPendingInsert::Stored => PendingInsert::Stored,
                 storage::RelayPendingInsert::LimitReached => PendingInsert::PendingLimitReached,
+                storage::RelayPendingInsert::Conflict => PendingInsert::Conflict,
             },
         )
     }
@@ -158,6 +171,34 @@ impl RelayRepository for AppRelayRepository {
         )
     }
 
+    fn store_reconnect_verifier(
+        &self,
+        device_id: DeviceId,
+        identity: &[u8; 65],
+        verifier: &[u8; 32],
+        now: u64,
+    ) -> anyhow::Result<bool> {
+        let db = self.locked()?;
+        let Some(row) = db.relay_device(device_id.as_bytes())? else {
+            return Ok(false);
+        };
+        let device = device_from_row(row)?;
+        if !device.is_admitted(identity, now) {
+            return Ok(false);
+        }
+        db.store_relay_reconnect_verifier(
+            device_id.as_bytes(),
+            identity,
+            verifier,
+            i64::try_from(now)?,
+        )
+    }
+
+    fn reconnect_verifier(&self, device_id: DeviceId) -> anyhow::Result<Option<[u8; 32]>> {
+        self.locked()?
+            .relay_reconnect_verifier(device_id.as_bytes())
+    }
+
     fn touch_device(&self, device_id: DeviceId, seen_at: u64) -> anyhow::Result<bool> {
         self.locked()?
             .touch_relay_device(device_id.as_bytes(), i64::try_from(seen_at)?)
@@ -182,6 +223,7 @@ fn device_from_row(row: storage::RelayDeviceRow) -> anyhow::Result<RelayDeviceRe
         row.last_seen_at.map(u64::try_from).transpose()?,
         row.revoked_at.map(u64::try_from).transpose()?,
     )
+    .map(|device| device.with_authorization_epoch(row.authorization_epoch))
     .context("Relay 기기 행이 유효한 레코드가 아니다")
 }
 
@@ -201,7 +243,7 @@ mod tests {
     const PAIRING_EXPIRES_AT: u64 = ISSUED_AT + PAIRING_WINDOW_SECS;
     const DEVICE_EXPIRES_AT: u64 = ISSUED_AT + 86_400;
 
-    struct TempDir(std::path::PathBuf);
+    struct TempDir(std::path::PathBuf, std::sync::OnceLock<persist::LockFile>);
 
     impl TempDir {
         fn new(name: &str) -> Self {
@@ -211,11 +253,18 @@ mod tests {
                 uuid::Uuid::new_v4()
             ));
             std::fs::create_dir_all(&path).unwrap();
-            Self(path)
+            Self(path, std::sync::OnceLock::new())
         }
 
         fn db_path(&self) -> std::path::PathBuf {
             self.0.join("metadata.sqlite3")
+        }
+
+        /// 디렉터리당 lock 하나. 같은 경로를 두 번 잡으면 "이미 실행 중" 오류다 — 실제 앱과
+        /// 같은 규칙이다.
+        fn lock(&self) -> &persist::LockFile {
+            self.1
+                .get_or_init(|| persist::LockFile::acquire(&self.0.join("deppy.lock")).unwrap())
         }
     }
 
@@ -377,11 +426,54 @@ mod tests {
     }
 
     #[test]
+    fn relay_reconnect_verifier_survives_adapter_restart_and_revocation_erases_it() {
+        let dir = TempDir::new("reconnect");
+        let repository = AppRelayRepository::open(&dir.db_path(), dir.lock()).unwrap();
+        let paired = insert(&repository, 5, 0x51);
+        repository
+            .approve_pending(paired.pairing_id, ISSUED_AT + 1)
+            .unwrap();
+        assert!(
+            repository
+                .store_reconnect_verifier(
+                    paired.device_id,
+                    &paired.public_key,
+                    &[6; 32],
+                    ISSUED_AT + 2
+                )
+                .unwrap()
+        );
+        drop(repository);
+        let repository = AppRelayRepository::open(&dir.db_path(), dir.lock()).unwrap();
+        assert_eq!(
+            repository.reconnect_verifier(paired.device_id).unwrap(),
+            Some([6; 32])
+        );
+        repository
+            .revoke_device(paired.device_id, ISSUED_AT + 3)
+            .unwrap();
+        assert_eq!(
+            repository.reconnect_verifier(paired.device_id).unwrap(),
+            None
+        );
+        assert!(
+            !repository
+                .store_reconnect_verifier(
+                    paired.device_id,
+                    &paired.public_key,
+                    &[6; 32],
+                    ISSUED_AT + 4
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
     fn relay_repository_admits_publishes_and_revokes_across_restart() {
         let dir = TempDir::new("round-trip");
         let path = dir.db_path();
         let paired = {
-            let repository = AppRelayRepository::open(&path).unwrap();
+            let repository = AppRelayRepository::open(&path, dir.lock()).unwrap();
             let paired = insert(&repository, 3, 0x31);
             let ApprovalResult::Approved(device) = repository
                 .approve_pending(paired.pairing_id, ISSUED_AT + 1)
@@ -403,7 +495,7 @@ mod tests {
             paired
         };
 
-        let reopened = AppRelayRepository::open(&path).unwrap();
+        let reopened = AppRelayRepository::open(&path, dir.lock()).unwrap();
         let device = reopened.device(paired.device_id).unwrap().unwrap();
         assert!(device.is_admitted(&paired.public_key, ISSUED_AT + 3));
         assert_eq!(device.last_seen_at(), Some(ISSUED_AT + 2));
@@ -439,7 +531,7 @@ mod tests {
                 .unwrap()
         );
 
-        let after_revocation = AppRelayRepository::open(&path).unwrap();
+        let after_revocation = AppRelayRepository::open(&path, dir.lock()).unwrap();
         assert!(
             !after_revocation
                 .device(paired.device_id)
@@ -453,7 +545,7 @@ mod tests {
     #[test]
     fn pairing_deadline_and_device_expiry_stay_separate_through_the_adapter() {
         let dir = TempDir::new("split-expiry");
-        let repository = AppRelayRepository::open(&dir.db_path()).unwrap();
+        let repository = AppRelayRepository::open(&dir.db_path(), dir.lock()).unwrap();
 
         let late = insert(&repository, 10, 0x32);
         assert_eq!(
@@ -487,7 +579,7 @@ mod tests {
     fn off_curve_pending_row_is_rejected_before_any_approval_mutation() {
         let dir = TempDir::new("pending-corruption");
         let path = dir.db_path();
-        let repository = AppRelayRepository::open(&path).unwrap();
+        let repository = AppRelayRepository::open(&path, dir.lock()).unwrap();
         let paired = insert(&repository, 20, 0x34);
 
         tamper(&path, |connection| {
@@ -521,7 +613,7 @@ mod tests {
     fn off_curve_device_row_is_rejected_before_admission() {
         let dir = TempDir::new("device-corruption");
         let path = dir.db_path();
-        let repository = AppRelayRepository::open(&path).unwrap();
+        let repository = AppRelayRepository::open(&path, dir.lock()).unwrap();
         let paired = insert(&repository, 21, 0x35);
         repository
             .approve_pending(paired.pairing_id, ISSUED_AT + 1)
@@ -546,14 +638,14 @@ mod tests {
         let dir = TempDir::new("restart-purge");
         let path = dir.db_path();
         {
-            let repository = AppRelayRepository::open(&path).unwrap();
+            let repository = AppRelayRepository::open(&path, dir.lock()).unwrap();
             for (index, value) in (30..33u16).enumerate() {
                 insert(&repository, value, 0x40 + index as u8);
             }
             assert_eq!(repository.pending_count().unwrap(), 3);
         }
 
-        let reopened = AppRelayRepository::open(&path).unwrap();
+        let reopened = AppRelayRepository::open(&path, dir.lock()).unwrap();
         assert_eq!(
             reopened.pending_count().unwrap(),
             0,
@@ -568,7 +660,7 @@ mod tests {
     fn adapter_reports_pending_and_device_limits_without_evicting_rows() {
         let dir = TempDir::new("limits");
         let path = dir.db_path();
-        let repository = AppRelayRepository::open(&path).unwrap();
+        let repository = AppRelayRepository::open(&path, dir.lock()).unwrap();
 
         fill_pending(&path, MAX_PENDING_RELAY_DEVICES - 1);
         assert_eq!(
@@ -624,7 +716,7 @@ mod tests {
     #[test]
     fn a_future_dated_pending_row_is_rejected_against_the_trusted_clock() {
         let dir = TempDir::new("trusted-clock");
-        let repository = AppRelayRepository::open(&dir.db_path()).unwrap();
+        let repository = AppRelayRepository::open(&dir.db_path(), dir.lock()).unwrap();
         insert(&repository, 40, 0x60);
 
         let future = RelayPairingLifetime::new(
@@ -656,11 +748,11 @@ mod tests {
     #[test]
     fn relay_identity_creation_requires_the_single_instance_lock() {
         let dir = TempDir::new("identity-lock");
-        let run_lock = persist::LockFile::acquire(&dir.0.join("deppy.lock")).unwrap();
+        let run_lock = dir.lock();
         let store = MemStore::default();
 
-        let first = create_relay_identity_after_single_instance_lock(&run_lock, &store).unwrap();
-        let second = create_relay_identity_after_single_instance_lock(&run_lock, &store).unwrap();
+        let first = create_relay_identity_after_single_instance_lock(run_lock, &store).unwrap();
+        let second = create_relay_identity_after_single_instance_lock(run_lock, &store).unwrap();
         assert_eq!(first.public_key_sec1(), second.public_key_sec1());
         assert_eq!(store.0.lock().unwrap().len(), 1);
         assert!(
@@ -694,14 +786,14 @@ mod tests {
     #[test]
     fn keychain_denial_is_relay_scoped_and_names_no_transport_state() {
         let dir = TempDir::new("keychain-denial");
-        let run_lock = persist::LockFile::acquire(&dir.0.join("deppy.lock")).unwrap();
+        let run_lock = dir.lock();
         let error =
-            create_relay_identity_after_single_instance_lock(&run_lock, &DeniedStore).unwrap_err();
+            create_relay_identity_after_single_instance_lock(run_lock, &DeniedStore).unwrap_err();
         let rendered = format!("{error:#}");
         assert!(rendered.contains("Relay identity"), "{rendered}");
 
         // Relay 저장소는 Keychain이 거부돼도 독립적으로 계속 열린다.
-        let repository = AppRelayRepository::open(&dir.db_path()).unwrap();
+        let repository = AppRelayRepository::open(&dir.db_path(), dir.lock()).unwrap();
         assert_eq!(repository.pending_count().unwrap(), 0);
 
         // 앱의 다른 모듈을 하나도 import하지 않는다 — Tailscale·loopback 서버·App 상태에
@@ -728,11 +820,10 @@ mod tests {
         let dir = TempDir::new("plaintext-scan");
         let path = dir.db_path();
         let store = MemStore::default();
-        let run_lock = persist::LockFile::acquire(&dir.0.join("deppy.lock")).unwrap();
-        let _identity =
-            create_relay_identity_after_single_instance_lock(&run_lock, &store).unwrap();
+        let run_lock = dir.lock();
+        let _identity = create_relay_identity_after_single_instance_lock(run_lock, &store).unwrap();
         {
-            let repository = AppRelayRepository::open(&path).unwrap();
+            let repository = AppRelayRepository::open(&path, dir.lock()).unwrap();
             let paired = insert(&repository, 9, 0x70);
             repository
                 .approve_pending(paired.pairing_id, ISSUED_AT + 1)

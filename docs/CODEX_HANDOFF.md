@@ -1,3 +1,15 @@
+## macOS 공증·Gatekeeper main 이관 — PR 준비 (2026-09-08)
+
+- 목표: `origin/main`의 정확한 `45e66ccae313e653fc5dc6df46b80f791f231fc4`에서 #146의 macOS 공증 제출, ticket staple, Gatekeeper 검증만 clean PR로 이관한다. 작업 트리는 `/private/tmp/deppy-macos-notarization-main-20260908`, 브랜치는 `build/macos-notarization-main`이며 #146 전체 cherry-pick/rebase/force-push는 하지 않았다.
+- 완료한 구현: trusted production package가 Keychain profile 또는 App Store Connect API key 자격증명을 fail-closed로 검증하고, 서명된 ZIP을 `notarytool submit --wait`로 제출해 plist `status=Accepted`를 확인한다. 이후 앱에 ticket을 staple하고 배포 ZIP을 다시 만든다. verifier는 원본 앱과 ZIP에서 추출한 앱 모두 `stapler validate` 및 `spctl --assess --type execute`의 `source=Notarized Developer ID`를 요구한다. 명시적 untrusted 개발 경로는 기존 계약대로 공증을 건너뛴다.
+- 수정 파일: `scripts/package-macos.sh`, `scripts/verify-macos-package.sh`, `xtask/src/main.rs`, 본 handoff. 패키징 대상 앱/Relay/UI 소스와 workflow는 수정하지 않았다.
+- TDD: 새 xtask 계약 테스트를 먼저 추가한 뒤 focused 실행이 `macOS package gate missing required step: DEPPY_NOTARY_KEYCHAIN_PROFILE`로 **RED(exit 101)**였다. 구현 후 같은 focused 테스트 **1 PASS**, 전체 xtask **15 PASS**였다. trusted 모드에서 (1) 공증 자격증명 없음, (2) profile과 API key 혼용, (3) 없는 API key 경로의 세 가지 shell fail-fast 검증은 모두 cargo/build 전에 의도한 오류와 exit 1을 냈다.
+- 검증: `sh -n scripts/package-macos.sh && sh -n scripts/verify-macos-package.sh` PASS, `shellcheck -s sh scripts/package-macos.sh scripts/verify-macos-package.sh` PASS, `cargo clippy -p xtask --all-targets --locked -- -D warnings` PASS, `cargo run --locked -p xtask -- check-boundary` PASS. 로컬 Xcode 26.6 도움말로 notarytool profile/API key, plist, wait/timeout 및 stapler 명령 옵션을 확인했다. 최종 fmt/diff 확인은 문서 반영 뒤 한 번 더 수행한다.
+- Codex CLI 리뷰: `codex review --uncommitted` exit 0, actionable correctness defect 0건. 리뷰도 shell syntax, ShellCheck, fmt/diff와 xtask 15개를 확인했으며 실제 공증은 자격증명 부재로 실행하지 않았다고 명시했다.
+- BLOCKED: `DEPPY_NOTARY_KEYCHAIN_PROFILE`과 API key 환경 변수가 모두 없으므로 실제 Apple 제출, Accepted 판정, staple, Gatekeeper 검증 및 배포는 실행하지 않았다. 이 항목은 PASS가 아니다. 요청에 따라 앱 build/package/launch도 실행하지 않았다.
+- 남은 작업: 최종 fmt/diff/상태 확인, Obsidian 프로젝트 일지 작성, 한국어 커밋·일반 push, main 대상 Ready PR 생성, GitHub hosted Actions가 실행되지 않으면 runner 증거로 billing BLOCKED를 기록한다.
+- 다음 명령: `cargo fmt --all -- --check`; `git diff --check`; `git status --short`; commit/push/`gh pr create --base main --head build/macos-notarization-main`; PR check의 `runner_id`와 `steps`를 API로 확인한다.
+
 ## ureq3 migration validated / PR landing next (2026-09-07)
 
 - Objective: replace dependency-only PR141 with native ureq3.4 migration, preserving OAuth/MCP status/body/redaction and SSE idle semantics.

@@ -2449,11 +2449,40 @@
 - 다음: 변경을 checkpoint commit하고 `origin/main...HEAD` 전체 Codex CLI 리뷰를
   실행한다. 지적을 반영해 gate를 필요한 범위만 재검증한 뒤 통합 PR을 만들고 merge한다.
 
-- 현재 목표: #156~#176의 open Ready PR 19개를 의존 순서와 의미 보존 충돌 해결로 통합하고 단일 PR을 `main`에 merge한 뒤 앱을 최종 build/relaunch한다.
-- 작업 트리: `/private/tmp/deppy-ready-prs-integration-20260909`, 브랜치 `integrate/ready-prs-20260909`, 기준 `origin/main` `45e66ccae313e653fc5dc6df46b80f791f231fc4`. 원래 `/Users/jr/Desktop/projects/deppy-sijo`의 `feat/fleet-one-list-and-relay-wip`는 건드리지 않는다.
-- 확인된 충돌: 모든 PR의 `docs/CODEX_HANDOFF.md`; #157/#159 `runtime/src/command.rs`; #159/#167 `ui/workspace.rs`; #156/#173 `app.rs`와 `ui/file_tree.rs`; #161/#169 Relay v38/v39와 #166 Keychain v38 migration 번호. Relay 뒤 Keychain을 v40으로 옮긴다.
-- 통합 순서: #157→#160→#165→#167→#159; #156→#173→#158→#164→#170→#171; #161→#168→#169 및 #175; #166(v40)→#172→#174→#176.
-- 병렬 읽기 전용 감사: 터미널, App/UI, storage/migration 세 갈래가 진행 중이다. 파일 수정 권한은 root 통합 작업만 가진다.
-- 테스트: 이 통합 브랜치에서는 아직 실행하지 않았다. 각 원본 PR의 기존 테스트 결과를 통합 결과의 PASS로 대신하지 않는다.
-- 남은 일: 계획 `docs/superpowers/plans/2026-09-09-ready-prs-main-integration.md`의 Tasks 1~5 전체.
-- 다음 명령: 위 순서로 `git merge --no-ff`를 실행하고 각 충돌을 양쪽 계약을 보존해 해결한다. 새 동작 결함은 회귀 RED 뒤 수정한다.
+### 통합 checkpoint — 리뷰 완료, 착지 대기
+
+- 현재 목표: 검증을 끝낸 통합 HEAD `2e92888`을 단일 PR로 `main`에 merge한 뒤 새
+  `main`에서 macOS bundle을 만들고 앱을 재실행한다.
+- 작업 트리: `/private/tmp/deppy-ready-prs-integration-20260909`, 브랜치
+  `integrate/ready-prs-20260909`, 기준 `origin/main`
+  `45e66ccae313e653fc5dc6df46b80f791f231fc4`. 원래
+  `/Users/jr/Desktop/projects/deppy-sijo`의 `feat/fleet-one-list-and-relay-wip`는
+  건드리지 않았다.
+- 병렬 읽기 전용 감사 세 갈래를 완료했다. 터미널 감사에서 resize debounce 테스트의
+  잘못된 즉시 전송 기대를 찾아 수정했다. App/UI 감사에서
+  `OpenWorkspaceSession`/`ReorderWorkspaces` 동시 보존과 파일 트리 밝기 테스트 인자를
+  확인해 수정했다. storage 감사에서 서로 다른 v38 migration 충돌을 찾아 Relay
+  v38·v39 뒤 Keychain v40 배치와 비정식 개발 v38 fail-closed 검사를 추가했다.
+- Codex CLI 전체 diff 리뷰와 통합 전용 집중 리뷰를 각각 실행했지만, 약 45,000줄의
+  병합 diff 및 macOS read-only sandbox의 임시 object/cache 생성 실패를 반복하며 최종
+  보고서를 만들지 못했다. 첫 프로세스는 PID로, 두 번째 세션은 interrupt로 종료했다.
+  두 실행 모두 소스는 수정하지 않았다. 병렬 감사 지적은 전부 반영했고 그 뒤 전체
+  workspace test와 strict Clippy를 통과했다.
+- 실제 최종 검증: `cargo test --workspace --locked -- --test-threads=1` exit 0
+  (app 2,209 PASS / 14 ignored, storage 338, runtime 301, terminal 95 / 4 ignored,
+  web-remote 317 / 1 ignored 등),
+  `cargo clippy --workspace --all-targets --locked -- -D warnings` PASS,
+  `cargo fmt --all -- --check`, `git diff --check`, `xtask check-boundary`,
+  `xtask check-deps` PASS.
+- 실패 접근: #174 병합 직후 전체 테스트는 누락된 `App::new`/`settings::show` 인자로
+  컴파일 실패했고, 보정 뒤 Keychain counting store assertion이 실패했다. 앱 테스트에서만
+  `secret/test-keyring-core`를 켜도록 고쳐 회귀를 통과시켰다. Codex CLI 리뷰 두 번은
+  위 사유로 최종 결과가 없으므로 PASS로 기록하지 않는다.
+- 남은 일: 통합 브랜치 push, 통합 PR 생성·merge commit 방식의 `main` 반영, 새
+  `origin/main`의 bundle build 및 정확한 기존 PID 종료 후 재실행, 프로세스 확인.
+  DNS·TLS·배포 자격증명이 없어 외부 Relay 배포 검증은 계속 BLOCKED다.
+- 정확한 다음 명령: `git push -u origin integrate/ready-prs-20260909`; `gh pr create
+  --base main --head integrate/ready-prs-20260909`; merge 후 `git fetch origin main`과
+  `git merge-base --is-ancestor 2e92888 origin/main`; 새 main worktree에서
+  `scripts/package-macos.sh`를 실행하고 `pgrep -x deppy-sijo`로 찾은 정확한 PID만
+  종료한 뒤 `open 'target/bundle/Deppy Sijo.app'`.

@@ -46,8 +46,8 @@
 - [x] `cargo fmt --all -- --check`, `git diff --check`, `cargo xtask check-boundary`, `cargo xtask check-deps`를 실행한다.
 - [x] app/storage/runtime/terminal/relay/web-remote focused 테스트와 workspace 전체 테스트를 jobs=2·serial로 실행한다.
 - [x] workspace all-target strict Clippy를 실행한다.
-- [ ] `codex review --uncommitted` 또는 최종 통합 commit 리뷰를 실행하고 Critical/High/Medium을 반영한다.
-- [ ] `docs/CODEX_HANDOFF.md`와 Obsidian 작업 일지를 실제 결과로 갱신한다.
+- [x] 최종 통합 commit에 병렬 읽기 감사와 Codex CLI 리뷰를 실행하고 실제 지적을 반영한다. Codex CLI 두 실행은 sandbox 임시 object 오류와 대형 merge diff 반복 순회로 최종 보고서를 만들지 못한 사실을 기록한다.
+- [x] `docs/CODEX_HANDOFF.md`를 실제 결과로 갱신한다. Obsidian 작업 일지는 Task 5의 최종 main/build 결과와 함께 작성한다.
 
 ### Task 5: 통합 PR, main 반영, 최종 앱 실행
 

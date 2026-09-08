@@ -1718,6 +1718,29 @@ mod tests {
         a
     }
 
+    #[test]
+    fn streaming_resize_뒤_검색_직렬화_출력이_압축_상태에서_동작한다() {
+        let mut a = backend_with_compressed_history();
+        a.resize(20, 8).unwrap();
+        assert_eq!(
+            a.term.grid().compressed_row_count(),
+            a.term.grid().history_size()
+        );
+        assert!(!a.search_scrollback("line30", 1000).matches.is_empty());
+        a.scroll(30);
+        let compressed_snapshot = a.viewport_snapshot().unwrap();
+        let compressed_archive = a.serialize_scrollback().unwrap();
+        a.term.grid_mut().inflate_all();
+        assert_eq!(compressed_archive, a.serialize_scrollback().unwrap());
+        assert_eq!(
+            compressed_snapshot.visible_cells,
+            a.viewport_snapshot().unwrap().visible_cells
+        );
+        feed(&mut a, "리사이즈 뒤 새 출력\r\n".as_bytes());
+        a.resize(60, 4).unwrap();
+        assert!(!a.search_scrollback("새 출력", 1000).matches.is_empty());
+    }
+
     /// 압축된 히스토리를 직렬화한 결과가, 전부 복원(inflate)한 뒤 직렬화한 것과 동일.
     #[test]
     fn deppy_압축_serialize는_inflate와_동일() {

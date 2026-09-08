@@ -309,6 +309,48 @@ impl<T> Storage<T> {
 }
 
 impl Storage<Cell> {
+    /// resize 입력은 슬롯 쌍의 소유권을 옮기고, 소비하는 한 행만 복원한다.
+    pub(super) fn take_rows_streaming(
+        &mut self,
+        columns: usize,
+    ) -> impl DoubleEndedIterator<Item = Row<Cell>> + ExactSizeIterator + use<> {
+        self.truncate();
+        let rows = mem::take(&mut self.inner);
+        let mut compressed = mem::take(&mut self.compressed);
+        compressed.resize_with(rows.len(), || None);
+        self.len = 0;
+        rows.into_iter()
+            .zip(compressed)
+            .map(move |(raw, packed)| packed.map_or(raw, |packed| packed.decode(columns)))
+    }
+
+    /// 완성된 행을 최신→오래된 순서로 설치한다. 화면 밖은 끝까지 압축 상태다.
+    pub(super) fn replace_compressed(&mut self, rows: Vec<CompressedRow>, columns: usize) {
+        self.len = rows.len();
+        self.zero = 0;
+        self.inner = Vec::with_capacity(rows.len());
+        self.compressed = Vec::with_capacity(rows.len());
+        for (index, row) in rows.into_iter().enumerate() {
+            if index < self.visible_lines {
+                self.inner.push(row.decode(columns));
+                self.compressed.push(None);
+            } else {
+                self.inner.push(Row::from_vec(Vec::new(), 0));
+                self.compressed.push(Some(row));
+            }
+        }
+    }
+
+    /// 높이 변경으로 history에서 화면에 들어온 행만 복원한다.
+    pub(super) fn inflate_visible(&mut self, columns: usize) {
+        for line in 0..self.visible_lines {
+            let index = self.compute_index(Line(line as i32));
+            if let Some(Some(row)) = self.compressed.get_mut(index) {
+                self.inner[index] = row.decode(columns);
+                self.compressed[index] = None;
+            }
+        }
+    }
     /// `line`을 압축한다. 이미 압축됐거나 빈(placeholder) 행이면 `None`(=이 슬롯은
     /// 압축 frontier), 새로 압축했으면 `Some(회수 추정 힙 바이트)`. 회수량이 0이어도
     /// (거의 꽉 찬 행) 상태는 바뀌어 저장되므로 `Some(0)`이지 `None`이 아니다 — 이래야

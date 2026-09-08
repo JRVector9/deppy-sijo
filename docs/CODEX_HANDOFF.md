@@ -2382,3 +2382,12 @@
 - R2 최종 gate 완료: web-remote337 PASS·4 ignored(생성helper1+별도Chrome3), 이어 Chrome3 모두 실제PASS, Node16 PASS, web-remote all-target strict Clippy/fmt/diff/제외 경계 PASS. Chrome helper 수정 뒤 전체를 다시 검증했다. R2 scoped Codex 및 helper 좁은 재리뷰 모두 확정 결함 없음.
 - R2 로컬 artifact build+verify PASS: /private/tmp/deppy-relay-r2-artifact-20260908, shell_version=e89480c33d67082a, archive digest617faa69677d4e598f86da5861e3f371fc12481033ca5c7a48416893c88124c5. 실제 배포가 아니다.
 - R2 게시 직전: shell/static/assets/browser test·fixture/CI 및 한 handshake fixture 테스트 hunk만 commit한다. 다음 명령: git push -u origin feat/relay-shell-main; gh pr create --base feat/relay-reconnect-core-main --head feat/relay-shell-main --body-file /private/tmp/deppy-relay-shell-pr-body.md. R1 먼저 착지 후 R2를 최신main과 일반 merge/retarget하고 재검증한다. force-push/rebase는 하지 않는다.
+
+## 2026-09-08 Relay R1/R2 stacked 게시 완료
+
+- 완료: R1 https://github.com/JRVector9/deppy-sijo/pull/161 (base main), HEAD6ee7eb4c3427a289d7f2c120cf5e403af74b213f. R2 https://github.com/JRVector9/deppy-sijo/pull/162 (base feat/relay-reconnect-core-main), 제품commitce9309068cfc84601098e48be7b8f7f1365b5360. 이 checkpoint는 문서만 추가한다.
+- 실제 로컬 결과: R1 macOS718/2 ignored 및4crate strict Clippy/fmt/boundary, Linux72/strict Clippy/release PASS. R2 web337/4 ignored 뒤 Chrome3 실제PASS, Node16, strict Clippy/fmt/경계 및 artifact build/verify PASS. Codex source 리뷰와 지적 수정 후 좁은 재리뷰 완료. 앱 빌드·재실행 없이 완료했다.
+- 외부 checks: R1 Actions5개, R2 제품HEAD Actions6개 모두 runner_id=0, steps=[]인 FAILURE다. 실행 PASS로 대체하지 않는다. R1 GitGuardian SUCCESS. R2 check102012043287 FAILURE는 incident37016215의 tests/fixtures/relay-hello-v1.json:35 공개 순차0x00..0x1f 벡터를 정확히 지목한다. 운영 credential 없음, fixture 배포 제외, 탐지 문자열 분할/억제 우회 없음.
+- 일지: Obsidian 프로젝트 일지/deppy-sijo/2026-09-08 Relay 비UI 재접속 코어 main 이관.md 및 2026-09-08 Relay 브라우저 셸 stacked 이관.md.
+- 남은 일: 부모의 R1→R2 착지 단계에서 hosted checks와 공개 fixture 판정을 별도로 해결하고 exact head를 검증한다. R1 squash 착지 후 R2에서 git fetch origin; git merge origin/main; gh pr edit 162 --base main 순서로 일반 merge/retarget하고 적정 게이트를 재검증한다. 기존146/149 수정·닫기, rebase/force-push, merge/배포는 이 lane에서 하지 않았다.
+- 후속 app adapter: AppRelayRepository reconnect methods와 native pairing/lifecycle/UI 연결, Conflict/pending/재승인 정책을 별도 PR로 검증한다. DNS/TLS/자격증명/외부 배포/실기기/24h soak는 BLOCKED다.

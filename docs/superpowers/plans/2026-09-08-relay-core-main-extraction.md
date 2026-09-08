@@ -106,7 +106,7 @@ CARGO_BUILD_JOBS=2 cargo run --locked -p xtask -- check-boundary
 ```
 
 - [x] **Step 3: 한글 handoff/Obsidian 일지에 테스트·실패 접근·리뷰와 BLOCKED 항목을 기록한다.** 후속 app adapter 연결이 필요하므로 앱에서 기능이 켜졌다고 보고하지 않는다.
-- [ ] **Step 4: 한국어 커밋/push/main 대상 새 PR을 생성한다.**
+- [x] **Step 4: 한국어 커밋/push/main 대상 새 PR을 생성한다.**
 
 ```sh
 # R1 index는 선택 hunk로 구성한다. handshake.rs 끝의 R2 fixture test는 stage하지 않는다.
@@ -122,8 +122,8 @@ gh pr create --base main --head feat/relay-reconnect-core-main --title 'feat(rel
 
 - [x] R1 staged tree에서 셸/신규 fixture 부재와 Rust 독립 compile/test를 확인한다.
 - [x] R1 staged tree의 strict Clippy/fmt/boundary와 source 리뷰를 마감한다.
-- [ ] R1 source만 commit/push/main PR을 생성한다.
-- [ ] R2 브랜치로 남은 동일 hunk를 옮겨 Chrome/Node/artifact 검증과 stacked PR을 마감한다.
+- [x] R1 source만 commit/push/main PR을 생성한다.
+- [x] R2 브랜치로 남은 동일 hunk를 옮겨 Chrome/Node/artifact 검증과 stacked PR을 마감한다.
 
 초기 합친 working tree 검증은 732 Rust PASS/4 ignored, Node16 및 로컬 artifact build/verify PASS였으나 R1 독립 게이트를 대신하지 않는다.
 

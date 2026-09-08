@@ -84,7 +84,7 @@ CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-relay-core-main-20260908/
 git diff --exit-code feat/relay-reconnect-core-main -- crates/app crates/secret crates/terminal crates/i18n Cargo.toml Cargo.lock crates/relay-protocol crates/relay-server crates/storage crates/web-remote/src/push.rs xtask
 ```
 
-- [ ] **Step 3: handoff/Obsidian 일지에 실제 결과·GitGuardian 근거·BLOCKED를 기록하고 commit/push/PR한다.**
+- [x] **Step 3: handoff/Obsidian 일지에 실제 결과·GitGuardian 근거·BLOCKED를 기록하고 commit/push/PR한다.**
 
 ```sh
 git add web deploy/relay-shell .github/workflows .gitignore crates/web-remote/assets crates/web-remote/src/static_srv.rs crates/web-remote/src/relay_client/handshake.rs crates/web-remote/tests docs/CODEX_HANDOFF.md docs/superpowers/plans/2026-09-08-relay-shell-main-extraction.md

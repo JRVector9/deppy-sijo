@@ -7892,7 +7892,211 @@ struct WebRemoteState {
     token: String,
 }
 
-/// Relay에서 복호화된 프레임을 받아 공유 코어로 넘기는 싱크.
+/// 승인된 기기의 인가 기간. 1차 릴리스는 고정값이며 편집 UI가 없다.
+const RELAY_DEVICE_AUTHORIZATION_SECS: u64 = 30 * 24 * 60 * 60;
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+fn parse_relay_device_id(hex: &str) -> Option<web_remote::relay::contract::DeviceId> {
+    if hex.len() != 32 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut bytes = [0u8; 16];
+    for (index, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
+        let pair = std::str::from_utf8(chunk).ok()?;
+        bytes[index] = u8::from_str_radix(pair, 16).ok()?;
+    }
+    Some(web_remote::relay::contract::DeviceId::from_bytes(bytes))
+}
+
+/// 워커의 상태 변화를 받아 두는 관찰자. 설정 화면은 이 값만 읽는다.
+#[derive(Default)]
+struct RelayStateProbe {
+    state: std::sync::Mutex<Option<web_remote::relay_client::RelayState>>,
+}
+
+impl RelayStateProbe {
+    fn current(&self) -> Option<web_remote::relay_client::RelayState> {
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn is_connected(&self) -> bool {
+        matches!(
+            self.current(),
+            Some(web_remote::relay_client::RelayState::Connected)
+        )
+    }
+}
+
+impl web_remote::relay_client::RelayObserver for RelayStateProbe {
+    fn state_changed(&self, state: web_remote::relay_client::RelayState) {
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(state);
+    }
+}
+
+/// 싱크(워커 스레드)와 앱(UI 스레드) 사이의 우편함. 잠금 하나가 지키는 작은 슬롯들이다.
+///
+/// - 싱크 → 앱: 서명이 검증된 상대의 **새 페어링 주장**. 증명 검증과 사용자 승인은 페어링
+///   비밀을 가진 앱만 할 수 있다.
+/// - 앱 → 싱크: 승인이 끝나 **활성화할 채널**, 또는 거절.
+///
+/// 이미 페어링된 기기의 재접속은 우편함을 거치지 않는다 — 저장소 판정만으로 끝나므로 싱크가
+/// 직접 한다. 세션이 끝나면 슬롯은 전부 비운다: 죽은 세션의 주장을 다음 세션이 승인받아서는
+/// 안 된다.
+#[derive(Default)]
+struct RelayMailbox {
+    inner: std::sync::Mutex<RelayMailboxInner>,
+}
+
+#[derive(Default)]
+struct RelayMailboxInner {
+    claim: Option<web_remote::relay_client::PairingClaim>,
+    activation: Option<(
+        web_remote::relay::SecureChannel,
+        web_remote::relay::repository::RelayDeviceRecord,
+    )>,
+    rejected: bool,
+    /// 앱 → 싱크: 기기 입장 티켓 게시/회수. 세션이 끝나도 지우지 않는다 — 티켓은 의식의
+    /// 수명을 따르지 세션의 수명을 따르지 않는다.
+    ticket: RelayTicketCommands,
+}
+
+/// 앱이 싱크에 내린 결정.
+enum RelayDecision {
+    Activate(
+        web_remote::relay::SecureChannel,
+        // 공개 기기 기록만 간접 보관한다. 암호 채널의 비밀 키는 추가 힙 복사하지 않는다.
+        Box<web_remote::relay::repository::RelayDeviceRecord>,
+    ),
+    Reject,
+}
+
+/// 앱이 싱크에 내린 티켓 명령. 회수와 게시를 **따로** 담는다.
+///
+/// 슬롯 하나에 둘 중 하나만 담으면, 취소 직후 재시작(회수 → 게시)에서 나중 게시가 앞선
+/// 회수를 덮어쓴다. 싱크는 대략 1초에 한 번 꺼내 가는데 두 번의 클릭은 그보다 훨씬 가까워
+/// 실제로 그렇게 된다 — 그러면 취소된 핸들이 회수되지 않은 채 서버에서 TTL(5분)을 다
+/// 살아남고, 죽은 줄 알았던 링크로 기기가 그대로 입장한다.
+///
+/// 싱크는 **회수 먼저, 게시 나중**으로 적용한다.
+#[derive(Default)]
+struct RelayTicketCommands {
+    /// 아직 싱크에 닿지 않은 회수 요청. 절대 버리지 않는다.
+    revoke: bool,
+    /// 아직 싱크에 닿지 않은 게시 요청.
+    publish: Option<relay_protocol::AdmissionCredential>,
+}
+
+impl RelayMailbox {
+    fn lock(&self) -> std::sync::MutexGuard<'_, RelayMailboxInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// 싱크: 주장을 앱에 넘긴다. 세션당 하나다 — 이전 것이 남아 있으면 버린다.
+    fn post_claim(&self, claim: web_remote::relay_client::PairingClaim) {
+        let mut inner = self.lock();
+        inner.claim = Some(claim);
+        inner.rejected = false;
+    }
+
+    /// 앱: 주장을 꺼낸다.
+    fn take_claim(&self) -> Option<web_remote::relay_client::PairingClaim> {
+        self.lock().claim.take()
+    }
+
+    /// 앱: 승인된 채널을 싱크에 건넨다.
+    fn activate(
+        &self,
+        channel: web_remote::relay::SecureChannel,
+        device: web_remote::relay::repository::RelayDeviceRecord,
+    ) {
+        let mut inner = self.lock();
+        inner.rejected = false;
+        if let Some((mut stale, _)) = inner.activation.replace((channel, device)) {
+            stale.close();
+        }
+    }
+
+    /// 앱: 주장을 거절했다(증명 실패·사용자 거부·취소). 건네다 만 채널이 있으면 닫는다.
+    fn reject(&self) {
+        let mut inner = self.lock();
+        inner.rejected = true;
+        if let Some((mut channel, _)) = inner.activation.take() {
+            channel.close();
+        }
+    }
+
+    /// 싱크: 앱의 결정을 꺼낸다.
+    fn take_decision(&self) -> Option<RelayDecision> {
+        let mut inner = self.lock();
+        if let Some((channel, device)) = inner.activation.take() {
+            return Some(RelayDecision::Activate(channel, Box::new(device)));
+        }
+        std::mem::take(&mut inner.rejected).then_some(RelayDecision::Reject)
+    }
+
+    /// 앱: 페어링 의식이 시작됐다 — 기기 입장 티켓을 게시한다. 아직 전달되지 않은 회수는
+    /// 그대로 남는다(싱크가 회수를 먼저 적용한다).
+    fn publish_ticket(&self, handle: relay_protocol::AdmissionCredential) {
+        self.lock().ticket.publish = Some(handle);
+    }
+
+    /// 앱: 의식이 끝났다 — 티켓을 회수한다. 아직 전달되지 않은 게시는 함께 버린다(서버가
+    /// 본 적 없는 핸들이라 회수할 것도 없다). **회수 자체는 절대 버리지 않는다.**
+    fn revoke_ticket(&self) {
+        let mut inner = self.lock();
+        inner.ticket.publish = None;
+        inner.ticket.revoke = true;
+    }
+
+    /// 싱크: 티켓 명령을 꺼낸다.
+    fn take_ticket_commands(&self) -> RelayTicketCommands {
+        std::mem::take(&mut self.lock().ticket)
+    }
+
+    /// 세션이 끝났다 — 이 세션의 주장과 결정은 전부 무효다.
+    fn clear(&self) {
+        let mut inner = self.lock();
+        inner.claim = None;
+        inner.rejected = false;
+        if let Some((mut channel, _)) = inner.activation.take() {
+            channel.close();
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "relay_reconnect_tests.rs"]
+mod relay_reconnect_tests;
+
+fn relay_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn relay_unhex<const N: usize>(text: &str) -> Option<[u8; N]> {
+    if text.len() != N * 2 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = [0; N];
+    for (index, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// Relay 세션 하나를 끝까지 책임지는 싱크 — 핸드셰이크, 채널 게이트, 권한 강제, 화면 송신.
 ///
 /// **모든 명령이 권한 어댑터를 먼저 지난다.** 브라우저에서 버튼을 숨기는 것은 강제가 아니고,
 /// 위조된 메시지는 UI를 거치지 않기 때문이다. 1차 릴리스의 기기는 view-only이므로 입력·키·
@@ -7902,24 +8106,277 @@ struct WebRemoteState {
 /// `auth` 프레임 자체를 이 전송에서 거부한다.
 struct RelayDashboardSink {
     core: Arc<web_remote::session_core::SessionCore>,
+    /// **활성화된 E2EE 채널 없이는 어떤 바이트도 명령이 되지 않는다.** 워커가 넘기는 것은
+    /// 신뢰하지 않는 Relay를 거친 원시 바이트다. 게이트가 DRLY 프레임을 풀고 채널로 연
+    /// 평문만 아래 어댑터로 내려보낸다. 나가는 화면도 같은 게이트로 봉인한다.
+    gate: web_remote::relay_client::RelaySessionGate,
+    /// 채널이 서기까지의 순서를 강제하는 상태 기계. 게이트는 hello를 해석하지 않는다.
+    handshake: web_remote::relay_client::RelayHandshake,
+    mailbox: Arc<RelayMailbox>,
+    /// 이미 페어링된 기기의 재접속 판정. 승인·취소는 앱이 하고 싱크는 읽기만 한다.
+    repository: Arc<dyn web_remote::relay::repository::RelayRepository>,
     permissions: web_remote::relay_client::RelayMessageAdapter,
+    /// 기기가 시청 중인 세션과 baseline — web 전송의 접속 스레드가 드는 것과 같은 상태다.
+    watched: Option<String>,
+    viewport_seq: u64,
+    baseline: Option<Arc<runtime::TerminalViewportSnapshot>>,
+    last_dash: u64,
+    route: relay_protocol::RouteId,
+    principal: Option<web_remote::relay::repository::RelayDeviceRecord>,
+    control_outbound: Vec<Vec<u8>>,
+    pending_verifier: Option<[u8; 32]>,
+    registration_deadline: Option<u64>,
+    registration_ready: bool,
+    active_connection: Option<web_remote::relay::contract::ConnectionId>,
 }
 
 impl RelayDashboardSink {
-    fn new(core: Arc<web_remote::session_core::SessionCore>) -> Self {
+    fn new(
+        core: Arc<web_remote::session_core::SessionCore>,
+        route: relay_protocol::RouteId,
+        admission: relay_protocol::AdmissionCredential,
+        identity: web_remote::relay_client::RelayIdentitySupplier,
+        mailbox: Arc<RelayMailbox>,
+        repository: Arc<dyn web_remote::relay::repository::RelayRepository>,
+    ) -> Self {
         Self {
             core,
+            gate: web_remote::relay_client::RelaySessionGate::new(route),
+            handshake: web_remote::relay_client::RelayHandshake::new(
+                route,
+                admission,
+                identity,
+                Box::new(unix_now_secs),
+            ),
+            mailbox,
+            repository,
             // 1차 릴리스는 고정 view-only다. 입력·승인·업로드는 휴면 상태의 미래 권한이다.
             permissions: web_remote::relay_client::RelayMessageAdapter::new(
                 web_remote::relay::contract::RelayPermissions::default(),
             ),
+            watched: None,
+            viewport_seq: 0,
+            baseline: None,
+            last_dash: 0,
+            route,
+            principal: None,
+            control_outbound: Vec::new(),
+            pending_verifier: None,
+            registration_deadline: None,
+            registration_ready: false,
+            active_connection: None,
         }
     }
-}
 
-impl web_remote::relay_client::RelayFrameSink for RelayDashboardSink {
-    fn accept(&mut self, frame: &[u8]) -> web_remote::relay_client::SinkOutcome {
-        let Ok(text) = std::str::from_utf8(frame) else {
+    /// 채널을 건 뒤 암호 제어 메시지로 승인을 알린다. 최초 등록은 게시 ACK까지 화면을 막는다.
+    fn activate(
+        &mut self,
+        channel: web_remote::relay::SecureChannel,
+        device: web_remote::relay::repository::RelayDeviceRecord,
+        known: bool,
+    ) {
+        self.active_connection = Some(channel.connection_id());
+        self.baseline = None;
+        self.gate.activate(channel);
+        self.handshake.activated();
+        self.last_dash = 0;
+        self.viewport_seq = 0;
+        self.registration_ready = known;
+        self.registration_deadline = (!known).then(|| unix_now_secs().saturating_add(30));
+        self.pending_verifier = None;
+        let message = serde_json::json!({
+            "type": if known { "relay_ready" } else { "relay_registered" },
+            "version": 2,
+            "device_id": relay_hex(device.device_id().as_bytes()),
+            "route_id": relay_hex(self.route.as_bytes()),
+            "expires_at": device.device_expires_at(),
+        });
+        self.principal = Some(device);
+        if !self.queue_control(&message) {
+            self.gate.deactivate();
+        }
+    }
+
+    /// 인증한 신원·수명·권한은 수신과 송신 경계에서 다시 읽는다.
+    fn principal_is_current(&self) -> bool {
+        let Some(principal) = &self.principal else {
+            return false;
+        };
+        matches!(self.repository.device(principal.device_id()), Ok(Some(current))
+            if current.is_admitted(principal.identity_public_sec1(), unix_now_secs())
+                && current.authorization_epoch() == principal.authorization_epoch()
+                && current.issued_at() == principal.issued_at()
+                && current.device_expires_at() == principal.device_expires_at()
+                && current.permissions() == principal.permissions()
+                && current.permissions().allows(web_remote::relay::contract::RelayAction::View))
+    }
+
+    fn queue_control(&mut self, message: &serde_json::Value) -> bool {
+        if self.control_outbound.len() >= relay_protocol::MAX_RECONNECT_GRANTS + 2 {
+            return false;
+        }
+        let Some(frame) = self.gate.seal(message.to_string().as_bytes()) else {
+            return false;
+        };
+        self.control_outbound.push(frame);
+        true
+    }
+
+    fn queue_grant(
+        &mut self,
+        verifier: [u8; 32],
+        expires_at: u64,
+        connection: relay_protocol::ConnectionId,
+    ) -> bool {
+        if self.control_outbound.len() >= relay_protocol::MAX_RECONNECT_GRANTS + 2 {
+            return false;
+        }
+        let mut payload = verifier.to_vec();
+        payload.extend_from_slice(&expires_at.to_be_bytes());
+        let Ok(frame) = relay_protocol::RelayFrame::new(
+            relay_protocol::FrameType::ReconnectPublish,
+            self.route,
+            connection,
+            0,
+            &payload,
+        ) else {
+            return false;
+        };
+        self.control_outbound.push(frame.to_vec());
+        true
+    }
+
+    /// 재시작한 Relay에는 유효한 DB 검증자만 다시 게시한다. raw grant는 없다.
+    fn republish_grants(&mut self) -> bool {
+        let Ok(devices) = self
+            .repository
+            .list_devices(web_remote::relay::repository::MAX_RELAY_DEVICES)
+        else {
+            return false;
+        };
+        for device in devices {
+            if !device.is_admitted(device.identity_public_sec1(), unix_now_secs()) {
+                continue;
+            }
+            match self.repository.reconnect_verifier(device.device_id()) {
+                Ok(Some(verifier)) => {
+                    if !self.queue_grant(
+                        verifier,
+                        device.device_expires_at(),
+                        relay_protocol::ConnectionId::from_bytes([0; 16]),
+                    ) {
+                        return false;
+                    }
+                }
+                Ok(None) => {}
+                Err(_) => return false,
+            }
+        }
+        if self.control_outbound.len() >= relay_protocol::MAX_RECONNECT_GRANTS + 2 {
+            return false;
+        }
+        // 같은 소켓의 게시 프레임 뒤에 놓아 복원 중 입장을 회수로 오인하지 않게 한다.
+        self.control_outbound.push(
+            relay_protocol::RelayFrame::new(
+                relay_protocol::FrameType::ReconnectSync,
+                self.route,
+                relay_protocol::ConnectionId::from_bytes([0; 16]),
+                0,
+                &[],
+            )
+            .expect("빈 복원 완료 프레임")
+            .to_vec(),
+        );
+        true
+    }
+
+    /// 이미 페어링된 기기의 주장. 저장소 기록이 **지금** 이 신원을 허가할 때만 채널이 선다 —
+    /// 취소·만료·다른 키는 `confirm_admitted`가 거절한다.
+    fn admit_known(
+        &mut self,
+        claim: web_remote::relay_client::KnownDeviceClaim,
+    ) -> web_remote::relay_client::SinkOutcome {
+        let now = unix_now_secs();
+        let record = match self.repository.device(claim.device_id) {
+            Ok(Some(record)) => record,
+            Ok(None) => {
+                tracing::info!("Relay: 알 수 없는 기기 id — 세션을 끝낸다");
+                return web_remote::relay_client::SinkOutcome::CloseChannel;
+            }
+            Err(error) => {
+                tracing::warn!("Relay 기기 조회 실패: {error:#}");
+                return web_remote::relay_client::SinkOutcome::CloseChannel;
+            }
+        };
+        let channel = match claim.peer.handshake.confirm_admitted(&record, now) {
+            Ok(channel) => channel,
+            Err(error) => {
+                tracing::info!("Relay: 기기 인가 거절 — {error:#}");
+                return web_remote::relay_client::SinkOutcome::CloseChannel;
+            }
+        };
+        // 마지막 접속 시각은 표시용이다 — 기록 실패가 채널을 막지는 않는다.
+        if let Err(error) = self.repository.touch_device(claim.device_id, now) {
+            tracing::warn!("Relay 기기 접속 시각 기록 실패: {error:#}");
+        }
+        self.activate(channel, record, true);
+        web_remote::relay_client::SinkOutcome::Continue
+    }
+
+    /// 채널을 통과한 평문 하나. 권한 어댑터를 지난 것만 코어로 간다.
+    fn command(&mut self, plaintext: &[u8]) -> web_remote::relay_client::SinkOutcome {
+        use web_remote::relay_client::SinkOutcome;
+        if !self.principal_is_current() {
+            return SinkOutcome::CloseChannel;
+        }
+        if !self.registration_ready {
+            if self.pending_verifier.is_some() || plaintext.len() > 256 {
+                return SinkOutcome::CloseChannel;
+            }
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Registration {
+                r#type: String,
+                version: u8,
+                verifier: String,
+            }
+            let Ok(request) = serde_json::from_slice::<Registration>(plaintext) else {
+                return SinkOutcome::CloseChannel;
+            };
+            if request.r#type != "relay_register" || request.version != 2 {
+                return SinkOutcome::CloseChannel;
+            }
+            let Some(verifier) = relay_unhex::<32>(&request.verifier) else {
+                return SinkOutcome::CloseChannel;
+            };
+            let Some(device) = self.principal.clone() else {
+                return SinkOutcome::CloseChannel;
+            };
+            if !matches!(
+                self.repository.store_reconnect_verifier(
+                    device.device_id(),
+                    device.identity_public_sec1(),
+                    &verifier,
+                    unix_now_secs()
+                ),
+                Ok(true)
+            ) {
+                return SinkOutcome::CloseChannel;
+            }
+            let Some(connection) = self.active_connection else {
+                return SinkOutcome::CloseChannel;
+            };
+            self.pending_verifier = Some(verifier);
+            if !self.queue_grant(
+                verifier,
+                device.device_expires_at(),
+                relay_protocol::ConnectionId::from_bytes(*connection.as_bytes()),
+            ) {
+                return SinkOutcome::CloseChannel;
+            }
+            return SinkOutcome::Continue;
+        }
+        let Ok(text) = std::str::from_utf8(plaintext) else {
             return web_remote::relay_client::SinkOutcome::Continue;
         };
         let Some(message) = web_remote::protocol::ClientMsg::parse(text) else {
@@ -7929,11 +8386,29 @@ impl web_remote::relay_client::RelayFrameSink for RelayDashboardSink {
             web_remote::relay_client::RelayAdmission::Allow(message) => {
                 // 허용된 것만 코어로 넘어간다. 현재 view-only 집합은 시청 제어뿐이다.
                 match message {
+                    // `rebind_watch`는 refcount 이전이다 — **이전 값을 from으로 넘겨야**
+                    // 옛 세션의 lease가 반납된다. None을 넘기면 시청이 바뀔 때마다 lease가
+                    // 하나씩 영구히 쌓이고, watchers 표도 상한 없이 자란다.
                     web_remote::protocol::ClientMsg::Watch { session } => {
-                        self.core.dashboard().rebind_watch(None, Some(&session));
+                        self.core
+                            .dashboard()
+                            .rebind_watch(self.watched.as_deref(), Some(&session));
+                        self.watched = Some(session);
+                        self.viewport_seq = 0;
+                        self.baseline = None;
                     }
                     web_remote::protocol::ClientMsg::Unwatch => {
-                        self.core.dashboard().rebind_watch(None, None);
+                        let previous = self.watched.take();
+                        self.core
+                            .dashboard()
+                            .rebind_watch(previous.as_deref(), None);
+                        self.viewport_seq = 0;
+                        self.baseline = None;
+                    }
+                    // 클라 렌더 상태 파손 — baseline을 버려 다음 프레임을 keyframe으로.
+                    web_remote::protocol::ClientMsg::RequestKeyframe => {
+                        self.viewport_seq = 0;
+                        self.baseline = None;
                     }
                     _ => {}
                 }
@@ -7954,8 +8429,205 @@ impl web_remote::relay_client::RelayFrameSink for RelayDashboardSink {
         }
     }
 
+    /// 활성 채널로 나갈 화면. web 전송과 같은 스냅샷·같은 인코더이며, 봉인만 다르다.
+    fn push_view(&mut self, frames: &mut Vec<Vec<u8>>) {
+        if !self.principal_is_current() {
+            self.gate.deactivate();
+            return;
+        }
+        if !self.registration_ready {
+            return;
+        }
+        if let Some((version, json)) = self.core.dashboard().dashboard_if_newer(self.last_dash) {
+            let Some(frame) = self.gate.seal(json.as_bytes()) else {
+                return;
+            };
+            frames.push(frame);
+            self.last_dash = version;
+        }
+        if let Some(session) = self.watched.clone()
+            && let Some((seq, snapshot)) = self
+                .core
+                .dashboard()
+                .viewport_if_newer(&session, self.viewport_seq)
+        {
+            let message = web_remote::protocol::encode_viewport(
+                &session,
+                seq,
+                &snapshot,
+                self.baseline.as_deref(),
+            )
+            .encode();
+            let Some(frame) = self.gate.seal(message.as_bytes()) else {
+                return;
+            };
+            frames.push(frame);
+            self.viewport_seq = seq;
+            self.baseline = Some(snapshot);
+        }
+    }
+}
+
+impl web_remote::relay_client::RelayFrameSink for RelayDashboardSink {
+    fn accept(&mut self, frame: &[u8]) -> web_remote::relay_client::SinkOutcome {
+        if let Ok((decoded, consumed)) = relay_protocol::RelayFrame::decode(frame)
+            && consumed == frame.len()
+            && decoded.route_id() == self.route
+            && decoded.frame_type() == relay_protocol::FrameType::ReconnectPublished
+        {
+            if self
+                .pending_verifier
+                .as_ref()
+                .is_some_and(|verifier| decoded.payload() == verifier)
+                && self
+                    .active_connection
+                    .is_some_and(|id| id.as_bytes() == decoded.connection_id().as_bytes())
+            {
+                if !self.principal_is_current() {
+                    return web_remote::relay_client::SinkOutcome::CloseChannel;
+                }
+                self.pending_verifier = None;
+                self.registration_deadline = None;
+                self.registration_ready = true;
+                let device = self.principal.as_ref().expect("principal 확인");
+                let message = serde_json::json!({"type":"relay_ready", "version":2,
+                        "device_id":relay_hex(device.device_id().as_bytes()), "expires_at":device.device_expires_at(),
+                        "route_id":relay_hex(self.route.as_bytes())});
+                if !self.queue_control(&message) {
+                    return web_remote::relay_client::SinkOutcome::CloseChannel;
+                }
+            }
+            return web_remote::relay_client::SinkOutcome::Continue;
+        }
+        // 원시 바이트 → 게이트. 평문으로 나온 것만 명령 후보고, 나머지는 핸드셰이크의 몫이다.
+        let step = match self.gate.receive(frame) {
+            web_remote::relay_client::GateOutcome::Plaintext(plaintext) => {
+                return self.command(&plaintext);
+            }
+            web_remote::relay_client::GateOutcome::Close => {
+                return web_remote::relay_client::SinkOutcome::CloseChannel;
+            }
+            web_remote::relay_client::GateOutcome::Dropped(_) => {
+                return web_remote::relay_client::SinkOutcome::Continue;
+            }
+            web_remote::relay_client::GateOutcome::Control {
+                frame_type,
+                connection_id,
+            } => {
+                let step = self.handshake.control(frame_type, connection_id);
+                if frame_type == relay_protocol::FrameType::Admitted && !self.republish_grants() {
+                    return web_remote::relay_client::SinkOutcome::CloseChannel;
+                }
+                step
+            }
+            web_remote::relay_client::GateOutcome::Hello {
+                connection_id,
+                record,
+            } => self.handshake.hello(connection_id, &record),
+        };
+        match step {
+            web_remote::relay_client::HandshakeStep::Continue => {
+                web_remote::relay_client::SinkOutcome::Continue
+            }
+            web_remote::relay_client::HandshakeStep::Fail(failure) => {
+                tracing::info!(?failure, "Relay 핸드셰이크 실패 — 세션을 끝낸다");
+                web_remote::relay_client::SinkOutcome::CloseChannel
+            }
+            // 새 페어링 — 증명 검증과 승인은 비밀을 가진 앱이 한다.
+            web_remote::relay_client::HandshakeStep::Pairing(claim) => {
+                self.mailbox.post_claim(*claim);
+                web_remote::relay_client::SinkOutcome::Continue
+            }
+            web_remote::relay_client::HandshakeStep::Known(claim) => self.admit_known(*claim),
+        }
+    }
+
+    fn session_started(&mut self) {
+        self.handshake.session_started();
+        // 위반 계수는 **상대별**이다. 이월하면 예산을 소진한 기기 뒤에 붙은 다른 기기가
+        // 첫 거부에서 곧바로 채널을 잃는다.
+        self.permissions = web_remote::relay_client::RelayMessageAdapter::new(
+            web_remote::relay::contract::RelayPermissions::default(),
+        );
+        self.watched = None;
+        self.viewport_seq = 0;
+        self.baseline = None;
+        self.last_dash = 0;
+    }
+
     fn session_ended(&mut self) {
-        self.core.dashboard().rebind_watch(None, None);
+        self.gate.deactivate();
+        self.handshake.session_ended();
+        self.mailbox.clear();
+        self.principal = None;
+        self.control_outbound.clear();
+        self.pending_verifier = None;
+        self.registration_deadline = None;
+        self.registration_ready = false;
+        self.active_connection = None;
+        if let Some(session) = self.watched.take() {
+            self.core.dashboard().rebind_watch(Some(&session), None);
+        }
+    }
+
+    fn poll(&mut self) -> web_remote::relay_client::SinkOutcome {
+        if self
+            .registration_deadline
+            .is_some_and(|deadline| unix_now_secs() >= deadline)
+            || (self.gate.is_active() && !self.principal_is_current())
+        {
+            return web_remote::relay_client::SinkOutcome::CloseChannel;
+        }
+        // 게이트가 스스로 채널을 닫았는데(봉인 실패) 상태 기계는 살아 있다면 그 세션은 이미
+        // 죽은 것이다 — 기기의 암호문이 조용히 버려지는 상태로 두지 않는다.
+        if self.handshake.is_active() && !self.gate.is_active() {
+            tracing::info!("Relay: 채널이 닫혔는데 세션이 남아 있다 — 세션을 끝낸다");
+            return web_remote::relay_client::SinkOutcome::CloseChannel;
+        }
+        match self.handshake.tick() {
+            web_remote::relay_client::HandshakeStep::Fail(failure) => {
+                tracing::info!(?failure, "Relay 세션 종료");
+                web_remote::relay_client::SinkOutcome::CloseChannel
+            }
+            _ => web_remote::relay_client::SinkOutcome::Continue,
+        }
+    }
+
+    fn drain_outbound(&mut self) -> Vec<Vec<u8>> {
+        // 회수가 먼저다. 순서가 뒤집히면 방금 게시한 핸들이 곧바로 회수되고, 앞선 의식의
+        // 핸들은 서버에 그대로 남는다.
+        let ticket = self.mailbox.take_ticket_commands();
+        if ticket.revoke {
+            self.handshake.revoke_ticket();
+        }
+        if let Some(handle) = ticket.publish {
+            self.handshake.publish_ticket(handle);
+        }
+        match self.mailbox.take_decision() {
+            Some(RelayDecision::Activate(channel, device)) => {
+                // 승인된 채널은 그 주장을 낸 세션에만 걸린다. 그 사이 세션이 바뀌었으면 죽은
+                // 세션의 채널이다 — 기기는 다음 접속에서 기존 기기로 바로 들어온다.
+                if self.handshake.proposed_connection() == Some(channel.connection_id()) {
+                    self.activate(channel, *device, false);
+                } else {
+                    let mut channel = channel;
+                    channel.close();
+                    tracing::info!("Relay: 승인된 채널이 현재 세션의 것이 아니라 버린다");
+                }
+            }
+            Some(RelayDecision::Reject) => self.handshake.rejected(),
+            None => {}
+        }
+        if self.gate.is_active() && !self.principal_is_current() {
+            self.gate.deactivate();
+            self.control_outbound.clear();
+        }
+        let mut frames = self.handshake.take_outbound();
+        frames.append(&mut self.control_outbound);
+        if self.gate.is_active() {
+            self.push_view(&mut frames);
+        }
+        frames
     }
 }
 
@@ -8822,9 +9494,44 @@ pub struct App {
     /// Relay 시작 실패 시 settings에 표시할 에러. `web_error`와 **별개**다 — 한 전송의
     /// 실패가 다른 전송의 표시를 덮어쓰면 사용자가 무엇이 꺼졌는지 알 수 없다.
     ///
-    /// 읽는 쪽(설정 화면)은 계획 Task 5가 붙인다. 지금은 쓰기만 한다.
-    #[allow(dead_code)]
     relay_error: Option<String>,
+    /// 단일 인스턴스 lock. Relay 저장소 열기와 식별키 생성이 이 lock **이후**라는 순서를
+    /// 타입으로 요구한다.
+    run_lock: Arc<persist::LockFile>,
+    /// Relay 영속 어댑터(Task 2). 처음 필요할 때 연다 — 열 때 이전 프로세스의 pending을 지운다.
+    relay_repository: Option<Arc<crate::relay_repository::AppRelayRepository>>,
+    /// 싱크(워커 스레드)와 이 앱 사이의 우편함. 워커가 살아 있을 때만 Some.
+    relay_mailbox: Option<Arc<RelayMailbox>>,
+    /// 진행 중인 의식의 페어링 링크(폰에 줄 1회용 재료). 기다리는 동안만 Some.
+    /// 셸 오리진이 아직 배정되지 않았으면 티켓은 게시돼도 링크는 없다 — 그래서 티켓 회수는
+    /// 이 값이 아니라 `relay_ticket_published`가 판정한다.
+    relay_pairing_link: Option<String>,
+    /// 기기 입장 티켓을 싱크에 게시했는가. 의식이 끝나면 이 값으로 회수를 판정한다.
+    relay_ticket_published: bool,
+    /// 싱크가 **결정을 못 받은 주장**을 붙들고 있는가. 우편함에서 주장을 꺼내는 순간 참이
+    /// 되고, 결정(활성화 또는 거절)을 실제로 건넨 뒤에만 거짓이 된다.
+    ///
+    /// 주장을 꺼내는 것과 무관하게 싱크의 핸드셰이크는 이미 `Proposed`로 옮겨져 있다. 그
+    /// 단계에는 **마감이 없고**(`handshake::expired`) 생존 신호가 세션을 계속 살려 두므로,
+    /// 거절을 한 번이라도 빠뜨리면 그 라우트는 앱을 껐다 켤 때까지 막힌다. 그래서 "사용자가
+    /// 확인 화면을 보고 있는가"가 아니라 "싱크가 답을 기다리는가"가 이 값의 뜻이다.
+    ///
+    /// 거짓이면 취소는 거절을 보내지 않는다 — 붙지도 않은 기기 때문에 살아 있는 세션의
+    /// 핸드셰이크를 죽이지 않기 위해서다.
+    relay_claim_outstanding: bool,
+    /// 페어링 링크 QR 텍스처 캐시. 링크가 바뀔 때만 재생성.
+    relay_qr: ui::settings::WebQrCache,
+    /// Relay 페어링 의식 상태 기계(Task 5).
+    relay_pairing: crate::relay_pairing::RelayPairingCeremony,
+    /// 확인 단계에 들어선 횟수. 설정 화면이 처음 보는 값에서만 거부 버튼에 초점을 둔다.
+    relay_pairing_generation: u64,
+    /// 카운트다운 접근성 안내. 경계(1분·30초·10초·만료)에서만 갈아 끼운다.
+    relay_announcement: Option<String>,
+    /// Relay 연결 상태 관찰자 — 워커가 갱신하고 설정 화면이 읽는다.
+    relay_state: Arc<RelayStateProbe>,
+    /// 승인된 기기 목록 캐시. 설정 화면이 열려 있을 때 스로틀해 갱신한다.
+    relay_devices: Vec<ui::settings::RelayDeviceView>,
+    last_relay_devices_sync: Option<std::time::Instant>,
     /// settings의 접속 URL 표시(reveal) 토글 — URL에 페어링 토큰이 실리므로 기본 마스킹.
     web_reveal_url: bool,
     /// 접속 URL QR 텍스처 캐시 — URL이 바뀔 때만 재생성, 설정창 닫으면 반환.
@@ -10161,6 +10868,13 @@ enum AppControllerAction {
     DetectHostname,
     CheckServe,
     ConfigureServe,
+    RelayStart,
+    RelayStop,
+    RelayBeginPairing,
+    RelayCancelPairing,
+    RelayApprovePairing,
+    RelayRejectPairing,
+    RelayRevokeDevice(String),
 }
 
 /// Capacity-one high-level terminal/workspace action emitted by the render pass. Runtime
@@ -12686,6 +13400,7 @@ impl App {
         data_dir: PathBuf,
         egui_ctx: egui::Context,
         bench: Option<crate::bench::Bench>,
+        run_lock: Arc<persist::LockFile>,
     ) -> anyhow::Result<Self> {
         if secret::init_platform_store().is_err() {
             tracing::warn!(
@@ -12727,6 +13442,7 @@ impl App {
             db_path,
             egui_ctx,
             bench,
+            run_lock,
         ))
     }
 
@@ -12740,6 +13456,7 @@ impl App {
         db_path: PathBuf,
         egui_ctx: egui::Context,
         bench: Option<crate::bench::Bench>,
+        run_lock: Arc<persist::LockFile>,
     ) -> Self {
         // output_batch_ms는 시작 시 고정, scrollback_lines는 세션 spawn 시점에 전달
         config.ui.last_workspace_id = Some(workspace_id.clone());
@@ -13290,6 +14007,19 @@ impl App {
             session_core: None,
             relay_worker: None,
             relay_error: None,
+            run_lock,
+            relay_repository: None,
+            relay_mailbox: None,
+            relay_pairing_link: None,
+            relay_ticket_published: false,
+            relay_claim_outstanding: false,
+            relay_qr: None,
+            relay_pairing: crate::relay_pairing::RelayPairingCeremony::new(),
+            relay_pairing_generation: 0,
+            relay_announcement: None,
+            relay_state: Arc::new(RelayStateProbe::default()),
+            relay_devices: Vec::new(),
+            last_relay_devices_sync: None,
             web_reveal_url: false,
             web_qr: None,
             worktree_rx: None,
@@ -17608,6 +18338,10 @@ impl App {
     /// 않았으므로(`deploy/relay/README.md`의 BLOCKED 상태표) 현재는 여기서 실패하며, 그
     /// 실패는 Relay 범위로만 표시된다.
     fn relay_enable(&mut self) {
+        // 이미 켜져 있으면 두 번째 워커를 만들지 않는다 — 소유 스레드와 바깥 연결이 둘이 된다.
+        if self.relay_worker.is_some() {
+            return;
+        }
         let endpoint = match web_remote::relay_client::RelayEndpoint::production() {
             Ok(endpoint) => endpoint,
             Err(error) => {
@@ -17615,6 +18349,27 @@ impl App {
                 self.relay_error = Some(format!("{error}"));
                 return;
             }
+        };
+        // 이 Mac의 라우트 핸들과 승인 자격증명은 함께 provisioning된다 — 그 주체가 아직
+        // 정해지지 않았다(deploy/relay/README.md). 디버그 빌드에서만 개발용 환경변수로
+        // 대신할 수 있다(릴리스 빌드는 항상 None).
+        let route = web_remote::relay_client::PRODUCTION_RELAY_ROUTE.or_else(|| {
+            web_remote::relay_client::lifecycle::dev_override_bytes("DEPPY_RELAY_DEV_ROUTE")
+                .map(relay_protocol::RouteId::from_bytes)
+        });
+        let Some(route) = route else {
+            self.relay_error =
+                Some("Relay 라우트 핸들이 아직 배정되지 않았다 (BLOCKED)".to_owned());
+            return;
+        };
+        let admission = web_remote::relay_client::PRODUCTION_RELAY_ADMISSION.or_else(|| {
+            web_remote::relay_client::lifecycle::dev_override_bytes("DEPPY_RELAY_DEV_ADMISSION")
+                .map(relay_protocol::AdmissionCredential::from_bytes)
+        });
+        let Some(admission) = admission else {
+            self.relay_error =
+                Some("Relay 승인 자격증명이 아직 배정되지 않았다 (BLOCKED)".to_owned());
+            return;
         };
         let repository: Arc<dyn web_remote::repository::WebRemoteRepository> =
             match AppWebRemoteRepository::open(&self.db_path) {
@@ -17625,16 +18380,40 @@ impl App {
                     return;
                 }
             };
+        // 기기 인가 저장소 — 싱크가 기존 기기의 재접속을 판정하는 데 쓴다.
+        let relay_repository = match self.relay_repository() {
+            Ok(repository) => repository,
+            Err(error) => {
+                tracing::warn!("Relay 기기 저장소 열기 실패: {error:#}");
+                self.relay_error = Some(format!("{error:#}"));
+                return;
+            }
+        };
+        // 세션마다 새 신원 값이 필요하다(핸드셰이크가 소비한다). Keychain 슬롯은 하나이며,
+        // 단일 인스턴스 lock 이후라는 순서를 타입으로 요구한다.
+        let identity = crate::relay_repository::relay_identity_supplier(
+            Arc::clone(&self.run_lock),
+            Arc::new(KeyringSecretStore),
+        );
+        let mailbox = Arc::new(RelayMailbox::default());
         // 코어는 web과 공유한다. web이 이미 켜져 있으면 그 코어를 그대로 쓴다.
         let core = self.shared_session_core(Some(repository), None);
         let worker = web_remote::relay_client::RelayWorker::spawn(
             endpoint,
             Box::new(web_remote::relay_client::TlsRelayTransport),
-            Box::new(RelayDashboardSink::new(Arc::clone(&core))),
-            Arc::new(web_remote::relay_client::worker::IgnoreObserver),
+            Box::new(RelayDashboardSink::new(
+                Arc::clone(&core),
+                route,
+                admission,
+                identity,
+                Arc::clone(&mailbox),
+                relay_repository,
+            )),
+            Arc::clone(&self.relay_state) as Arc<dyn web_remote::relay_client::RelayObserver>,
             web_remote::relay_client::RelayDeadlines::default(),
             web_remote::relay_client::BackoffPolicy::default(),
         );
+        self.relay_mailbox = Some(mailbox);
         worker.enable();
         self.relay_worker = Some(worker);
         self.relay_error = None;
@@ -17649,13 +18428,18 @@ impl App {
 
     /// Relay를 끈다. Tailscale 서버·토큰·리스너에는 손대지 않는다.
     ///
-    /// 호출부(설정 화면의 Relay 스위치)는 계획 Task 5가 붙인다. 종료 경로는 워커를 직접
-    /// 정지하므로 이 함수에 의존하지 않는다.
-    #[allow(dead_code)]
     fn relay_disable(&mut self) {
         if let Some(mut worker) = self.relay_worker.take() {
             worker.shutdown();
         }
+        self.relay_mailbox = None;
+        self.relay_pairing_link = None;
+        self.relay_ticket_published = false;
+        self.relay_claim_outstanding = false;
+        self.relay_qr = None;
+        // 진행 중이던 의식은 붙을 곳이 없어졌다 — 티켓을 무효화한다.
+        let _ = self.relay_pairing.cancel(unix_now_secs());
+        self.relay_announcement = None;
         self.relay_error = None;
         self.release_session_core_if_idle();
         self.config.relay.enabled = false;
@@ -17664,6 +18448,345 @@ impl App {
             self.relay_error = Some(format!(
                 "Relay는 껐지만 설정 저장 실패 — 다음 실행에 다시 켜질 수 있습니다: {error:#}"
             ));
+        }
+    }
+
+    /// Relay 영속 어댑터. 처음 필요할 때 연다 — 단일 인스턴스 lock 이후라는 순서를 타입으로
+    /// 요구하므로 `run_lock`을 함께 넘긴다.
+    fn relay_repository(
+        &mut self,
+    ) -> anyhow::Result<Arc<crate::relay_repository::AppRelayRepository>> {
+        if self.relay_repository.is_none() {
+            let repository =
+                crate::relay_repository::AppRelayRepository::open(&self.db_path, &self.run_lock)?;
+            self.relay_repository = Some(Arc::new(repository));
+        }
+        Ok(Arc::clone(
+            self.relay_repository
+                .as_ref()
+                .expect("relay repository opened above"),
+        ))
+    }
+
+    fn relay_begin_pairing(&mut self) {
+        let now = unix_now_secs();
+        let connected = self.relay_state.is_connected();
+        self.relay_end_ticket();
+        if let Err(failure) = self.relay_pairing.begin(now, connected) {
+            tracing::info!(?failure, "Relay 페어링 시작 불가");
+            self.relay_announcement = None;
+            return;
+        }
+        self.relay_announcement = None;
+        // 기기 입장 핸들 — 서버가 1회 소비하는 32바이트 난수. uuid v4 둘을 이어 붙인다
+        // (앱은 getrandom을 직접 들지 않는다).
+        let mut handle = [0u8; 32];
+        handle[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        handle[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        let handle = relay_protocol::AdmissionCredential::from_bytes(handle);
+        if let Some(mailbox) = &self.relay_mailbox {
+            mailbox.publish_ticket(handle);
+            self.relay_ticket_published = true;
+        }
+        // 링크 = 고정 셸 오리진 + 1회용 재료. 오리진이 아직 배정되지 않았으면(BLOCKED) 링크도
+        // 없다 — 티켓은 게시되지만 폰이 갈 곳이 없다는 사실을 화면이 그대로 말한다.
+        self.relay_pairing_link = web_remote::relay_client::shell_origin().and_then(|origin| {
+            let (pairing_id, secret) = self.relay_pairing.ticket_for_device()?;
+            Some(web_remote::relay_client::encode_pairing_link(
+                &origin, &handle, pairing_id, secret,
+            ))
+        });
+        self.relay_qr = None;
+    }
+
+    /// 의식이 끝났다(취소·거부·만료·승인) — 티켓을 회수하고 링크를 버린다.
+    fn relay_end_ticket(&mut self) {
+        self.relay_pairing_link = None;
+        self.relay_qr = None;
+        if !std::mem::take(&mut self.relay_ticket_published) {
+            return;
+        }
+        if let Some(mailbox) = &self.relay_mailbox {
+            mailbox.revoke_ticket();
+        }
+    }
+
+    fn relay_cancel_pairing(&mut self) {
+        let _ = self.relay_pairing.cancel(unix_now_secs());
+        self.relay_announcement = None;
+        self.relay_reject_claim();
+        self.relay_end_ticket();
+    }
+
+    fn relay_reject_pairing(&mut self) {
+        let _ = self.relay_pairing.reject(unix_now_secs());
+        self.relay_announcement = None;
+        self.relay_reject_claim();
+        self.relay_end_ticket();
+    }
+
+    /// 싱크에 "이 주장은 끝났다"를 알린다. 붙어 있던 기기의 세션은 다음 프레임에서 끝난다.
+    fn relay_reject_claim(&mut self) {
+        if !std::mem::take(&mut self.relay_claim_outstanding) {
+            // 붙은 기기가 없다. 거절을 보내면 살아 있는 세션의 상태 기계가 죽어, 바로 이어
+            // 시작한 페어링의 티켓이 게시되지 못한다.
+            return;
+        }
+        if let Some(mailbox) = &self.relay_mailbox {
+            mailbox.reject();
+        }
+    }
+
+    /// 싱크가 넘긴 새 페어링 주장. 증명이 이 의식의 티켓과 맞으면 확인 단계로 간다 —
+    /// 화면에 코드가 뜨고 사용자가 폰과 대조한다. 틀리면 싱크에 거절을 알린다.
+    fn relay_device_presented(&mut self, claim: web_remote::relay_client::PairingClaim) {
+        let now = unix_now_secs();
+        let binding = claim.peer.handshake.pairing_binding();
+        let fingerprint: String = binding.peer_identity_fingerprint()[..4]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let display_name = self.i18n.t(
+            "settings.relay.devices.default_name",
+            &[("fingerprint", &fingerprint)],
+        );
+        let introduction = crate::relay_pairing::DeviceIntroduction {
+            handshake: claim.peer.handshake,
+            identity_public_sec1: claim.peer.identity_public_sec1,
+            display_name,
+        };
+        match self.relay_pairing.device_presented(
+            now,
+            claim.pairing_id,
+            &claim.proof,
+            binding,
+            introduction,
+        ) {
+            Ok(()) => {
+                self.relay_announcement = None;
+                // `relay_claim_outstanding`은 여기서 세우지 않는다 — 주장을 꺼낸 쪽
+                // (`tick_relay_pairing`)이 이미 세웠다. 여기서 세우면 `Err` 경로에서는
+                // 거짓인 채라 거절이 싱크에 닿지 않는다.
+                // 확인 단계에 막 들어섰다 — 설정 화면이 처음 보는 값이면 거부 버튼에 초점을 둔다.
+                self.relay_pairing_generation = self.relay_pairing_generation.wrapping_add(1);
+            }
+            Err(failure) => {
+                tracing::info!(?failure, "Relay 기기 주장 거절");
+                self.relay_reject_claim();
+            }
+        }
+    }
+
+    /// 사용자가 코드를 대조하고 승인했다. 검증 승인 → pending 행 → DB 승인 → 채널 확정의
+    /// 순서는 Task 2 조정자(`PendingAdmission`)가 강제한다. 실패는 전부 fail-closed다.
+    fn relay_approve_pairing(&mut self) {
+        let now = unix_now_secs();
+        let (approval, introduction) = match self.relay_pairing.approve(now) {
+            Ok(pair) => pair,
+            Err(stale) => {
+                // 오래된 행동 — 기다리는 중이거나 이미 만료됐다. 아무것도 소비되지 않았다.
+                tracing::info!(?stale, "Relay 승인 무시(오래된 행동)");
+                self.relay_announcement = None;
+                return;
+            }
+        };
+        self.relay_announcement = None;
+        // `relay_claim_outstanding`은 아직 내리지 않는다 — 아래 DB 작업이 깨지면 싱크는
+        // 여전히 마감 없는 `Proposed`를 붙들고 있어 거절을 받아야 한다.
+        // 기기는 이미 입장했다(티켓은 소비됐다). 남은 링크는 더 이상 아무것도 열지 못한다.
+        self.relay_end_ticket();
+        let permissions = crate::relay_pairing::RelayPairingCeremony::first_release_permissions();
+        let lifetime = match web_remote::relay::repository::RelayPairingLifetime::new(
+            now,
+            now + web_remote::relay::pairing::PAIRING_TTL_SECS,
+            now + RELAY_DEVICE_AUTHORIZATION_SECS,
+        ) {
+            Ok(lifetime) => lifetime,
+            Err(error) => {
+                self.relay_error = Some(format!("{error:#}"));
+                self.relay_reject_claim();
+                return;
+            }
+        };
+        // 불투명 기기 id — uuid v4의 128비트 난수를 그대로 쓴다(앱은 getrandom을 직접 안 든다).
+        let device_id = *uuid::Uuid::new_v4().as_bytes();
+        let proposal = web_remote::relay::repository::RelayDeviceProposal {
+            device_id: web_remote::relay::contract::DeviceId::from_bytes(device_id),
+            identity_public_sec1: introduction.identity_public_sec1,
+            display_name: introduction.display_name,
+            permissions,
+            lifetime,
+        };
+        let mailbox = self.relay_mailbox.clone();
+        let outcome = (|| -> anyhow::Result<()> {
+            let repository = self.relay_repository()?;
+            let repository: &dyn web_remote::relay::repository::RelayRepository = &*repository;
+            let start = web_remote::relay::repository::PendingAdmission::begin(
+                repository, approval, proposal, now,
+            )?;
+            let admission = match start {
+                web_remote::relay::repository::AdmissionStart::Pending(admission) => admission,
+                web_remote::relay::repository::AdmissionStart::Rejected(rejection) => {
+                    anyhow::bail!("Relay 페어링 거절: {rejection:?}");
+                }
+            };
+            match admission.approve(repository, introduction.handshake, now)? {
+                web_remote::relay::repository::AdmissionOutcome::Admitted { channel, device } => {
+                    tracing::info!(device = ?device.device_id(), "Relay 기기 승인");
+                    // 살아 있는 채널을 워커의 세션 게이트에 건넨다. 워커가 그 사이 죽었으면
+                    // 닫는다 — 기기 행은 이미 발행됐으므로 다음 접속에서 기존 기기로 들어온다.
+                    match &mailbox {
+                        Some(mailbox) => mailbox.activate(channel, device),
+                        None => {
+                            let mut channel = channel;
+                            channel.close();
+                        }
+                    }
+                    Ok(())
+                }
+                web_remote::relay::repository::AdmissionOutcome::Rejected(rejection) => {
+                    anyhow::bail!("Relay 페어링 거절: {rejection:?}")
+                }
+            }
+        })();
+        match outcome {
+            // 결정을 싱크에 건넸다(활성화). 이제 주장은 해소됐다.
+            Ok(()) => self.relay_claim_outstanding = false,
+            Err(error) => {
+                tracing::warn!("Relay 페어링 승인 실패: {error:#}");
+                self.relay_error = Some(format!("{error:#}"));
+                // `PendingAdmission`이 거절했거나 DB가 깨졌다. 여기서 멈추면 싱크는 답을
+                // 못 받은 `Proposed`로 남고, 그 단계에는 마감이 없어 라우트가 영영 막힌다.
+                self.relay_reject_claim();
+            }
+        }
+        self.last_relay_devices_sync = None;
+    }
+
+    /// 기기 취소 — 즉시 차단. 다음 접속에서만이 아니라 **살아 있는 채널도** 끊는다: 워커를
+    /// 재시작해 세션 게이트가 비워지게 한다.
+    fn relay_revoke_device(&mut self, id_hex: &str) {
+        let Some(device_id) = parse_relay_device_id(id_hex) else {
+            return;
+        };
+        let now = unix_now_secs();
+        let result = self.relay_repository().and_then(|repository| {
+            use web_remote::relay::repository::RelayRepository as _;
+            repository.revoke_device(device_id, now)
+        });
+        match result {
+            Ok(_) => {
+                // 취소된 기기가 붙어 있었을 수 있다 — 세션을 끊는다. 워커를 껐다 켜면 게이트가
+                // 비워지고, 재접속 시 이 기기는 admission에서 거부된다.
+                if let Some(mut worker) = self.relay_worker.take() {
+                    // 진행 중이던 의식은 옛 세션에 묶여 있다 — 라우트와 티켓이 함께 사라지므로
+                    // 화면만 카운트다운을 계속하는 상태로 두지 않는다.
+                    let _ = self.relay_pairing.cancel(now);
+                    self.relay_claim_outstanding = false;
+                    self.relay_pairing_link = None;
+                    self.relay_ticket_published = false;
+                    self.relay_qr = None;
+                    self.relay_announcement = None;
+                    worker.shutdown();
+                    self.relay_worker = None;
+                    self.relay_mailbox = None;
+                    self.config.relay.enabled = true;
+                    self.relay_enable();
+                }
+            }
+            Err(error) => {
+                tracing::warn!("Relay 기기 취소 실패: {error:#}");
+                self.relay_error = Some(format!("{error:#}"));
+            }
+        }
+        self.last_relay_devices_sync = None;
+    }
+
+    /// 승인된 기기 목록을 스로틀해 갱신한다(설정 화면이 열려 있을 때만).
+    fn sync_relay_devices(&mut self, now: std::time::Instant) {
+        const RELAY_DEVICES_SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+        if let Some(last) = self.last_relay_devices_sync
+            && now.duration_since(last) < RELAY_DEVICES_SYNC_INTERVAL
+        {
+            return;
+        }
+        self.last_relay_devices_sync = Some(now);
+        // Relay를 한 번도 켠 적이 없으면 저장소를 열지 않는다 — 열면 pending 정리 부수효과가 있다.
+        if self.relay_repository.is_none() && self.relay_worker.is_none() {
+            return;
+        }
+        let listed = self.relay_repository().and_then(|repository| {
+            use web_remote::relay::repository::RelayRepository as _;
+            repository.list_devices(web_remote::relay::repository::MAX_RELAY_DEVICES)
+        });
+        match listed {
+            Ok(devices) => {
+                self.relay_devices = devices
+                    .into_iter()
+                    .map(|device| ui::settings::RelayDeviceView {
+                        id: device
+                            .device_id()
+                            .as_bytes()
+                            .iter()
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect(),
+                        name: device.display_name().to_owned(),
+                        last_seen_at: device.last_seen_at(),
+                        expires_at: device.device_expires_at(),
+                        revoked_at: device.revoked_at(),
+                    })
+                    .collect();
+            }
+            Err(error) => tracing::warn!("Relay 기기 목록 실패: {error:#}"),
+        }
+    }
+
+    /// 페어링 시계를 흘리고, 경계에서만 접근성 안내를 갈아 끼운다.
+    fn tick_relay_pairing(&mut self, ctx: &egui::Context) {
+        // 의식이 도는 동안에는 프레임을 예약한다. 사용자가 폰으로 QR을 찍는 사이 마우스가
+        // 멎으면 egui는 프레임을 돌리지 않는다 — 그러면 카운트다운이 멈추고, 기기가 붙어도
+        // 확인 코드 화면이 뜨지 않는다.
+        if self.relay_pairing.is_active() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        }
+        // 싱크가 넘긴 주장을 소화한다. 확인 단계 진입(=세대 증가)은 이 안에서 일어난다 —
+        // 여기서 전후를 비교하면 이미 전이가 끝난 뒤라 어떤 경로로도 성립하지 않는다.
+        let claim = self
+            .relay_mailbox
+            .as_ref()
+            .and_then(|mailbox| mailbox.take_claim());
+        if let Some(claim) = claim {
+            // 주장을 꺼낸 이 순간부터 싱크는 답을 기다린다 — 싱크의 핸드셰이크는 주장을
+            // 우편함에 넣을 때 이미 마감 없는 `Proposed`로 옮겨져 있다. 검증이 어떻게
+            // 끝나든 결정을 되돌려 줘야 하므로, 표시는 검증 **전에** 세운다.
+            self.relay_claim_outstanding = true;
+            self.relay_device_presented(claim);
+        }
+        let now = unix_now_secs();
+        let was_active = self.relay_pairing.is_active();
+        self.relay_pairing.tick(now);
+        if was_active && !self.relay_pairing.is_active() {
+            // 만료 — 티켓을 회수한다(서버 TTL도 같은 5분이지만 기다릴 이유가 없다).
+            // 확인 단계에서 만료됐다면 싱크는 아직 `Proposed`다. 표시만 내리면 그 세션이
+            // 생존 신호를 타고 살아남아 라우트를 막는다 — 거절을 실제로 건넨다.
+            self.relay_reject_claim();
+            self.relay_end_ticket();
+        }
+        if let Some(boundary) = self.relay_pairing.announcement(now) {
+            let text = &self.i18n;
+            self.relay_announcement = Some(if boundary == 0 {
+                text.t("settings.relay.pairing.expired", &[])
+            } else if boundary >= 60 {
+                text.t(
+                    "settings.relay.pairing.announce.minutes",
+                    &[("minutes", &(boundary / 60).to_string())],
+                )
+            } else {
+                text.t(
+                    "settings.relay.pairing.announce.seconds",
+                    &[("seconds", &boundary.to_string())],
+                )
+            });
         }
     }
 
@@ -18751,6 +19874,13 @@ impl App {
                 AppControllerAction::WebStart => self.web_enable(),
                 AppControllerAction::WebStop => self.web_disable(),
                 AppControllerAction::RotateWebToken => self.web_rotate_token(),
+                AppControllerAction::RelayStart => self.relay_enable(),
+                AppControllerAction::RelayStop => self.relay_disable(),
+                AppControllerAction::RelayBeginPairing => self.relay_begin_pairing(),
+                AppControllerAction::RelayCancelPairing => self.relay_cancel_pairing(),
+                AppControllerAction::RelayApprovePairing => self.relay_approve_pairing(),
+                AppControllerAction::RelayRejectPairing => self.relay_reject_pairing(),
+                AppControllerAction::RelayRevokeDevice(id) => self.relay_revoke_device(&id),
                 AppControllerAction::DetectHostname => {
                     if self.ts_detect_rx.is_none() {
                         self.ts_detect_overwrite = true;
@@ -26659,6 +27789,12 @@ impl eframe::App for App {
         // ui()가 아닌 logic()에서 — 창이 숨겨져도 폰에는 최신 구성이 보여야 한다.
         // 브리지가 변화 없으면 무시하므로(값 비교) 유휴 프레임 비용은 사실상 0이다.
         self.sync_web_workspaces(std::time::Instant::now());
+        // Relay 페어링 시계와 기기 목록. 시계는 항상 흘리고(만료는 화면과 무관), 목록은 설정
+        // 창이 열려 있을 때만 스로틀해 읽는다.
+        self.tick_relay_pairing(ctx);
+        if self.settings_open {
+            self.sync_relay_devices(std::time::Instant::now());
+        }
 
         // 렌더러 A/B 실측 드라이버 (B1) — env 미설정이면 즉시 반환한다.
         self.bench_step(ctx);
@@ -29536,6 +30672,84 @@ impl eframe::App for App {
         // .env 라이브 반영 토글(E5 ⑨) — 클로저 안에서 편집하고 밖에서 저장/적용.
         let mut env_live_reload_toggle = self.config.ui.env_live_reload;
         // #3 워크스페이스 이름 편집 캡처 (클로저 밖에서 db/refresh 처리 — self 전체 &mut).
+        // Relay 뷰모델 — web_view와 **독립**이다. 상태·에러·페어링·기기 목록이 각자 있다.
+        let relay_now = unix_now_secs();
+        let relay_pairing_failed_text;
+        let relay_pairing_view = match self.relay_pairing.projection(relay_now) {
+            crate::relay_pairing::PairingProjection::Idle => {
+                if self.relay_state.is_connected() {
+                    ui::settings::RelayPairingView::Idle
+                } else {
+                    ui::settings::RelayPairingView::NotReady
+                }
+            }
+            crate::relay_pairing::PairingProjection::Waiting { remaining_secs } => {
+                ui::settings::RelayPairingView::Waiting {
+                    remaining_secs,
+                    announcement: self.relay_announcement.as_deref(),
+                    link: self.relay_pairing_link.as_deref(),
+                }
+            }
+            crate::relay_pairing::PairingProjection::Confirm {
+                code,
+                remaining_secs,
+            } => ui::settings::RelayPairingView::Confirm {
+                code,
+                remaining_secs,
+                announcement: self.relay_announcement.as_deref(),
+                generation: self.relay_pairing_generation,
+            },
+            crate::relay_pairing::PairingProjection::Failed(failure) => {
+                use crate::relay_pairing::PairingFailure as F;
+                relay_pairing_failed_text = match failure {
+                    F::RelayNotReady => text.t("settings.relay.pairing.not_ready", &[]),
+                    F::Expired => text.t("settings.relay.pairing.expired", &[]),
+                    F::Rejected => text.t("settings.relay.pairing.rejected", &[]),
+                    F::Cancelled => text.t("settings.relay.pairing.cancelled", &[]),
+                    // 사용자에게 Rust Debug 문자열을 보이지 않는다 — 로그가 그 자리다.
+                    F::InvalidSecret => text.t("settings.relay.pairing.invalid_secret", &[]),
+                    F::Registry(error) => {
+                        tracing::info!(?error, "Relay 페어링 레지스트리 실패");
+                        text.t("settings.relay.pairing.registry_failed", &[])
+                    }
+                };
+                ui::settings::RelayPairingView::Failed(&relay_pairing_failed_text)
+            }
+        };
+        let relay_connection = match (self.relay_worker.is_some(), self.relay_state.current()) {
+            (false, _) if self.relay_error.is_some() => {
+                ui::settings::RelayConnectionView::Blocked("")
+            }
+            (false, _) => ui::settings::RelayConnectionView::Disabled,
+            (true, None) | (true, Some(web_remote::relay_client::RelayState::Connecting)) => {
+                ui::settings::RelayConnectionView::Connecting
+            }
+            (true, Some(web_remote::relay_client::RelayState::Connected)) => {
+                ui::settings::RelayConnectionView::Connected
+            }
+            (true, Some(web_remote::relay_client::RelayState::Backoff { until, .. })) => {
+                ui::settings::RelayConnectionView::Backoff {
+                    seconds: until.saturating_sub(relay_now),
+                }
+            }
+            (true, Some(web_remote::relay_client::RelayState::Halted(reason))) => match reason {
+                web_remote::relay_client::HaltReason::AuthenticationFailed => {
+                    ui::settings::RelayConnectionView::HaltedAuth
+                }
+                web_remote::relay_client::HaltReason::Revoked => {
+                    ui::settings::RelayConnectionView::HaltedRevoked
+                }
+                _ => ui::settings::RelayConnectionView::Disabled,
+            },
+        };
+        let relay_view = ui::settings::RelayView {
+            running: self.relay_worker.is_some(),
+            connection: relay_connection,
+            error: self.relay_error.as_deref(),
+            pairing: relay_pairing_view,
+            devices: &self.relay_devices,
+            now: relay_now,
+        };
         let out = ui::settings::show(
             ui.ctx(),
             &mut self.settings_open,
@@ -29546,6 +30760,8 @@ impl eframe::App for App {
             &web_view,
             &mut self.web_reveal_url,
             &mut self.web_qr,
+            &relay_view,
+            &mut self.relay_qr,
             notif_unread,
             &mut self.settings_search,
             &text,
@@ -30157,6 +31373,26 @@ impl eframe::App for App {
             }
             ui::settings::WebRemoteAction::None => None,
         });
+        // Relay 섹션은 별개 채널이다 — 같은 프레임에 두 섹션이 동작을 내면 먼저 온 것이 이긴다.
+        let relay_controller_action = match out.relay_action {
+            ui::settings::RelayAction::Start => Some(AppControllerAction::RelayStart),
+            ui::settings::RelayAction::Stop => Some(AppControllerAction::RelayStop),
+            ui::settings::RelayAction::BeginPairing => Some(AppControllerAction::RelayBeginPairing),
+            ui::settings::RelayAction::CancelPairing => {
+                Some(AppControllerAction::RelayCancelPairing)
+            }
+            ui::settings::RelayAction::ApprovePairing => {
+                Some(AppControllerAction::RelayApprovePairing)
+            }
+            ui::settings::RelayAction::RejectPairing => {
+                Some(AppControllerAction::RelayRejectPairing)
+            }
+            ui::settings::RelayAction::RevokeDevice(id) if id.len() == 32 => {
+                Some(AppControllerAction::RelayRevokeDevice(id))
+            }
+            ui::settings::RelayAction::RevokeDevice(_) | ui::settings::RelayAction::None => None,
+        };
+        let controller_action = controller_action.or(relay_controller_action);
         if self.pending_app_controller_action.is_none()
             && let Some(action) = controller_action
         {
@@ -30169,6 +31405,7 @@ impl eframe::App for App {
             self.remote_reveal_token = false;
             self.web_reveal_url = false;
             self.web_qr = None;
+            self.relay_qr = None;
         }
         if self.pending_agent_launcher_intent.is_none()
             && let Some(intent) = self.agent_launcher_ui.show(
@@ -31653,6 +32890,157 @@ mod tests {
             outcome < 400,
             "CloseChannel 분기가 닫기 신호를 돌려주지 않는다"
         );
+    }
+
+    /// 주장을 꺼낸 **모든** 경로가 싱크에 결정을 돌려줘야 한다.
+    ///
+    /// 주장이 우편함에 들어온 시점에 싱크의 핸드셰이크는 이미 `Proposed`다. 그 단계에는
+    /// 마감이 없고(`relay_client::handshake`의 `expired`가 `None`을 준다) 생존 신호가
+    /// 세션을 계속 살려 두므로, 예전처럼 서버 유휴 상한이 스스로 치워 주지 않는다. 표시를
+    /// "사용자가 확인 화면을 보고 있는가"로 두면 (1) 증명 실패 (2) 의식 만료 (3) 승인 중
+    /// DB 실패 — 셋 다 거절이 싱크에 닿지 않아 그 라우트가 앱 재시작까지 막힌다.
+    /// 취소 버튼조차 같은 표시를 보므로 손으로도 풀 수 없다.
+    #[test]
+    fn relay_주장은_어느_경로로_끝나도_싱크에_결정을_돌려준다() {
+        let source = include_str!("app.rs");
+
+        // (0) 표시는 주장을 **꺼낸 쪽**에서 세운다.
+        let tick = source
+            .split_once("    fn tick_relay_pairing(&mut self, ctx: &egui::Context) {")
+            .expect("tick_relay_pairing")
+            .1
+            .split_once("\n    /// ")
+            .expect("함수 끝")
+            .0;
+        let took = tick.find("mailbox.take_claim()").expect("주장 꺼내기");
+        let raised = tick
+            .find("self.relay_claim_outstanding = true;")
+            .expect("주장을 꺼낸 쪽이 표시를 세워야 한다");
+        assert!(took < raised, "표시는 주장을 꺼낸 직후에 세워야 한다");
+
+        // (2) 만료 — 표시만 내리면 싱크는 답을 못 받은 채 남는다.
+        assert!(
+            !tick.contains("self.relay_claim_outstanding = false"),
+            "만료가 표시만 내리면 마감 없는 Proposed가 라우트를 영영 막는다"
+        );
+        assert!(
+            tick.contains("self.relay_reject_claim();"),
+            "만료도 거절을 실제로 건네야 한다"
+        );
+
+        // (1) 증명 실패 — Ok에서만 표시를 세우면 Err의 거절이 조용히 사라진다.
+        let presented = source
+            .split_once(
+                "    fn relay_device_presented(&mut self, claim: web_remote::relay_client::PairingClaim) {",
+            )
+            .expect("relay_device_presented")
+            .1
+            .split_once("\n    /// ")
+            .expect("함수 끝")
+            .0;
+        assert!(
+            !presented.contains("self.relay_claim_outstanding = true"),
+            "Ok 분기에서 표시를 세우면 Err 분기의 거절이 싱크에 닿지 않는다"
+        );
+        assert!(
+            presented.contains("self.relay_reject_claim();"),
+            "증명이 틀린 주장도 거절을 돌려줘야 한다"
+        );
+
+        // (3) 승인 실패 — 표시는 DB 작업이 끝난 뒤에만 내린다.
+        let approve = source
+            .split_once("    fn relay_approve_pairing(&mut self) {")
+            .expect("relay_approve_pairing")
+            .1
+            .split_once("\n    /// ")
+            .expect("함수 끝")
+            .0;
+        let admission = approve
+            .find("PendingAdmission::begin(")
+            .expect("DB 승인 시작");
+        let cleared = approve
+            .find("self.relay_claim_outstanding = false")
+            .expect("활성화에 성공하면 표시를 내려야 한다");
+        assert!(
+            admission < cleared,
+            "DB 작업 전에 표시를 내리면 실패 경로의 거절이 싱크에 닿지 않는다"
+        );
+        assert_eq!(
+            approve.matches("self.relay_reject_claim();").count(),
+            2,
+            "lifetime 실패와 조정자 실패 두 경로 모두 거절을 건네야 한다"
+        );
+
+        // 반대 방향의 성질은 그대로다 — 붙은 기기가 없으면 거절을 보내지 않는다.
+        // (보내면 살아 있는 세션의 상태 기계가 죽어 바로 이어 시작한 의식의 티켓이
+        // 게시되지 못한다.)
+        let reject = source
+            .split_once("    fn relay_reject_claim(&mut self) {")
+            .expect("relay_reject_claim")
+            .1
+            .split_once("\n    }")
+            .expect("함수 끝")
+            .0;
+        assert!(
+            reject.contains("if !std::mem::take(&mut self.relay_claim_outstanding)"),
+            "표시가 없으면 거절을 보내지 않는다는 성질을 유지해야 한다"
+        );
+    }
+
+    /// 취소 직후 재시작(회수 → 게시)에서 **회수가 사라지면 안 된다.**
+    ///
+    /// 싱크는 대략 1초에 한 번 우편함을 비우는데 두 번의 클릭은 그보다 훨씬 가깝다.
+    /// 슬롯 하나에 마지막 명령만 담던 시절에는 나중 게시가 앞선 회수를 덮어써, 취소된
+    /// 핸들이 회수되지 않은 채 서버에서 5분 TTL을 다 살아남았다 — 죽은 줄 알았던 링크로
+    /// 기기가 그대로 입장한다.
+    #[test]
+    fn 티켓_우편함은_게시가_회수를_덮어쓰지_않는다() {
+        let first = relay_protocol::AdmissionCredential::from_bytes([1u8; 32]);
+        let second = relay_protocol::AdmissionCredential::from_bytes([2u8; 32]);
+        let mailbox = RelayMailbox::default();
+
+        // 첫 의식의 티켓은 싱크가 이미 가져갔다.
+        mailbox.publish_ticket(first);
+        let drained = mailbox.take_ticket_commands();
+        assert!(!drained.revoke);
+        assert!(drained.publish.is_some_and(|handle| handle.matches(&first)));
+
+        // 취소 → 곧바로 재시작. 싱크는 그 사이에 한 번도 비우지 못했다.
+        mailbox.revoke_ticket();
+        mailbox.publish_ticket(second);
+        let drained = mailbox.take_ticket_commands();
+        assert!(
+            drained.revoke,
+            "회수가 게시에 덮이면 취소된 핸들이 서버에서 TTL을 다 살아남는다"
+        );
+        assert!(
+            drained
+                .publish
+                .is_some_and(|handle| handle.matches(&second)),
+            "재시작한 의식의 티켓도 함께 전달돼야 한다"
+        );
+
+        // 아직 전달되지 않은 게시는 회수가 삼킨다 — 서버가 본 적 없는 핸들이라 회수할
+        // 것도 없다. 회수 자체는 남아 앞선 의식의 핸들을 치운다.
+        mailbox.publish_ticket(first);
+        mailbox.revoke_ticket();
+        let drained = mailbox.take_ticket_commands();
+        assert!(drained.revoke);
+        assert!(drained.publish.is_none());
+
+        // 싱크는 **회수를 먼저** 적용해야 한다. 뒤집히면 방금 게시한 핸들이 곧바로 회수된다.
+        let source = include_str!("app.rs");
+        let body = source
+            .split_once("    fn drain_outbound(&mut self) -> Vec<Vec<u8>> {")
+            .expect("drain_outbound")
+            .1;
+        let revoke = body
+            .find("self.handshake.revoke_ticket()")
+            .expect("회수 적용");
+        let publish = body
+            .find("self.handshake.publish_ticket(")
+            .expect("게시 적용");
+        assert!(revoke < publish, "회수를 게시보다 먼저 적용해야 한다");
     }
 
     /// 공유 코어는 두 전송 중 하나라도 켜져 있으면 살아 있어야 한다.

@@ -2398,3 +2398,27 @@
 - 현재 main은 App::new에서 기존 OAuth reconcile_startup_secrets_best_effort가 eager keychain list/get/has/delete를 수행한다. 부모는 R3에서 Relay 신규경로 startup/OFF 접근0만 고정하고 기존 OAuth/secret는 변경하지 말라고 확정했다. 전체 앱 시작 팝업은 R3 게시 후 별도 R4 fix/keychain-startup-lazy를 최신main에서 진행한다.
 - 제외: config 원본diff는 workspace_order뿐이라 제외, package/verify/xtask 원본diff는 일반 공증이어서 제외. secret crate/root manifest 확대도 제외. app render는 typed intent만, logic/worker에서 I/O.
 - 다음: adapter reconnect 기본메서드 FAIL을 실제RED로 확인한 뒤 repository/storage Conflict hunk와 app/setting/locale Relay hunk를 수술적으로 이관한다. 앱실행/배포/force-push/rebase 금지.
+
+- R3 plan commit8dae223. 현재 제품수정은 relay_repository.rs의 reconnect 회귀 test 하나뿐이고 CARGO_BUILD_JOBS2·독립 target에서 actual RED 실행 중(/private/tmp/deppy-relay-r3-adapter-red.txt, exec session17272). API 변경 전에 실행을 끝내야 한다.
+- 준비 patch: /private/tmp/deppy-relay-r3-patches. app.rs의 Relay22개hunk, settings Relay 전체관련hunk, storage 미룬정책8개hunk, web repository Conflict3개hunk, main/appmanifest/newpairing/newreconnect/5locale추가만 선택했다. git apply --check는 test를 먼저삽입한 relay_repository.rs 하나만 실패했고 나머지모두PASS. 아직 제품patch를 적용하지 않았다.
+- 부모가 확정한 다음작업 R4: R3 게시후 최신main 독립 fix/keychain-startup-lazy, eager startup OAuth reconciliation을 명시적 credential/connector/Relay controller action으로 지연하고 앱생성/Relay OFF/Settings단순열기 접근0을 spy RED→GREEN으로검증. R3에서그기존경로/secretcrate를수정하지않는다.
+
+- R3 adapter 실제RED(exit101): reconnect 테스트가 Relay reconnect storage unavailable로 FAIL했다. 이후 선택 patch14개를 모두 check→apply했고 초기 app relay focused38 PASS. config/secret/font/fleet/filetree/HTTP/package/xtask 제외 diff PASS.
+- Relay identity supplier를 production factory로 추출해 app과 spy가 같은경로를 사용한다. 새 실제spy는 supplier생성/sink시작/workerOFF의 Keychain·네트워크0과 명시적 supplier호출 양성대조를 검사한다. 지금 app/relay/storage/web/i18n focused와 boundedCodex source리뷰 진행 중이다. source수정은 계획경계만이며 앱실행은 하지않았다.
+
+- 새 spy 테스트 첫 컴파일은 존재하지 않는 RelayState::Disabled 사용으로 실패했다(기능RED 아님). 실제 enum인 Halted(HaltReason::Disabled)로 수정해 focused 체인을 다시 실행한다. 기존 adapter 실제RED와 구분한다.
+
+- R3 app focused39 PASS(새 실제 relay_startup_and_off_never_access_the_keychain 포함). 공급자/sink route시작/OFF worker에서 Keychain0·네트워크0, 동일 공급자 명시적호출에서 spy>0을 실제검증했다. core storage/web focused와 i18n은 이어서실행중(exec4668), Codex리뷰 exec2571 진행중이다.
+
+- R3 focused 최종완료: app Relay39 PASS, storage18 + web146unit/3integration=167 PASS·2 ignored, i18n8 PASS. 이제 app/storage/web 전체test→strictClippy→boundary→fmt 체인 exec26322 실행중, /private/tmp/deppy-relay-r3-full-tests.txt. 원본패치1430줄App Relay와Settings약700줄·storage정책만이관, supplier factory+spy만추가개발했다.
+
+- R3 인가세대 수정 전 전체app/storage/web 테스트와 strictClippy/boundary/fmt 체인은 정상종료했다. 하지만 Codex HIGH는 동일device_id/키/권한의 재승인에서 기존principal이 계속유효함을지적했고 부모가수정승인했다.
+- 추가설계: v39 opaque authorization epoch(16byte,grant/secret아님)를 승인마다새로발급해 동일초재승인·삭제후재생성ABA도구분한다. 기존v38기기는backfill만수행하고 revoke/권한/발급시각/만료/verifier를보존한다. 앱DBmigration은Relayworker생성이전이므로 기존기기의재페어링을요구하지않는다. activeprincipal이현재epoch와다르면송수신모두닫는다.
+- 현재RED: storage동일초재승인이동일RelayDeviceRow로돌아와assert_ne FAIL. 삭제후재생성ABA와기존API의새발급시각principal거절RED를이어실행중. rollback/conflict기존epoch보존과v38backfill재접속보존을추가검증한다.
+
+- R3 epoch 실제RED3개완료: 동일초재승인Row가동일, 삭제후재생성ABA Row가동일, 발급기간이갱신된동일신원에도기존채널Continue가나와각assertion FAIL. 이제v39/RelayDeviceRow·RelayDeviceRecord epoch/승인UUID/백필/currentprincipal비교를구현했다. 키·권한·만료·reconnect_verifier는백필에서보존된다.
+- 추가검증: sameclock epoch변경시채널폐기, conflict 및 UPDATE후pending DELETE실패trigger의transactionrollback이이전epoch/verifier를보존, v38기기백필후재시작에동일epoch/verifier유지를검사한다. storage/app relay focused exec64724와좁은epoch리뷰 exec10473 진행중. 수정전전체2768 PASS/21ignored·strictClippy/boundary/fmt PASS는신규epoch최종결과로대체하지않는다.
+
+- R3 epoch 최종 focused storage22/app41 PASS. 최종 전체 app/storage/web2774 PASS·21 ignored, strict Clippy/fmt/boundary/diff 및 제외 파일 경계 PASS(exit0). 신규 epoch 이후 전체를 다시 실행했다. i18n8 PASS는 카탈로그 변경 뒤 실행된 결과다. 첫 epoch 재리뷰는 경로 배열 조회 오류와 도구예산 소진으로 BLOCKED였으므로 성공으로 세지 않고 명시 경로로 재실행 중(exec51496). 계약 문서 docs/relay-app-adapter-main.md에 legacy backfill 보존/R3·R4 Keychain 경계를 기록했다.
+
+- R3 좁은 epoch Codex 재리뷰가 지정5경로를 실제 읽은 후 CLEAN으로 종료했다. HIGH1건은 실제 RED3개→epoch 수정→GREEN 및 전체 재검증으로 해소했다. 제품커밋·stacked PR 게시 단계다. 다음: git push -u origin feat/relay-app-adapter-main; gh pr create --base feat/relay-shell-main --head feat/relay-app-adapter-main --body-file /private/tmp/deppy-relay-app-adapter-pr-body.md. 이후 R4 최신main 독립 lazy Keychain 계획/RED부터 진행한다.

@@ -171,6 +171,7 @@ pub struct RelayDeviceRecord {
     device_expires_at: u64,
     last_seen_at: Option<u64>,
     revoked_at: Option<u64>,
+    authorization_epoch: [u8; 16],
 }
 
 impl RelayDeviceRecord {
@@ -207,11 +208,22 @@ impl RelayDeviceRecord {
             device_expires_at,
             last_seen_at,
             revoked_at,
+            authorization_epoch: [0; 16],
         })
     }
 
     pub const fn device_id(&self) -> DeviceId {
         self.device_id
+    }
+
+    /// 저장소의 공개 인가 세대. grant나 키 재료가 아니며 재승인 때 이전 채널을 구분한다.
+    pub fn with_authorization_epoch(mut self, epoch: [u8; 16]) -> Self {
+        self.authorization_epoch = epoch;
+        self
+    }
+
+    pub const fn authorization_epoch(&self) -> &[u8; 16] {
+        &self.authorization_epoch
     }
 
     pub const fn identity_public_sec1(&self) -> &[u8; 65] {
@@ -269,6 +281,8 @@ impl std::fmt::Debug for RelayDeviceRecord {
 pub enum PendingInsert {
     Stored,
     PendingLimitReached,
+    /// 다른 주체의 미완 의식과 id 또는 키가 겹친다.
+    Conflict,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -325,6 +339,8 @@ pub trait RelayRepository: Send + Sync {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdmissionRejection {
     PendingLimitReached,
+    /// 다른 주체의 미완 의식과 겹친다 — 그쪽이 끝나거나 만료돼야 한다.
+    PendingConflict,
     PendingNotFound,
     PairingDeadlinePassed,
     DeviceLimitReached,
@@ -398,6 +414,9 @@ impl PendingAdmission {
             }))),
             PendingInsert::PendingLimitReached => Ok(AdmissionStart::Rejected(
                 AdmissionRejection::PendingLimitReached,
+            )),
+            PendingInsert::Conflict => Ok(AdmissionStart::Rejected(
+                AdmissionRejection::PendingConflict,
             )),
         }
     }

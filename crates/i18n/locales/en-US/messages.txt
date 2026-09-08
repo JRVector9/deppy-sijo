@@ -32,6 +32,7 @@ sidebar.menu.remove_worktree = Delete worktree
 sidebar.menu.resume_agent = Resume agent
 sidebar.resume_failed = Resume failed - try again: {title}
 sidebar.menu.close_pane = Close session
+sidebar.menu.open_session = Open session
 sidebar.menu.close_workspace = Close workspace sessions
 sidebar.menu.rename_workspace = Rename workspace
 sidebar.empty.start_workspace = Start a workspace

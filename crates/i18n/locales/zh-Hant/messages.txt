@@ -32,6 +32,7 @@ sidebar.menu.remove_worktree = 刪除工作樹
 sidebar.menu.resume_agent = 恢復代理
 sidebar.resume_failed = 繼續失敗 - 請重試：{title}
 sidebar.menu.close_pane = 關閉工作階段
+sidebar.menu.open_session = 開啟工作階段
 sidebar.menu.close_workspace = 關閉工作區工作階段
 sidebar.menu.rename_workspace = 重新命名
 sidebar.empty.start_workspace = 開始一個工作區

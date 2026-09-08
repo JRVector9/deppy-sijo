@@ -32,6 +32,7 @@ sidebar.menu.remove_worktree = ワークツリーを削除
 sidebar.menu.resume_agent = エージェントを再開
 sidebar.resume_failed = 再開に失敗しました - もう一度お試しください: {title}
 sidebar.menu.close_pane = セッションを閉じる
+sidebar.menu.open_session = セッションを開く
 sidebar.menu.close_workspace = ワークスペースのセッションを終了
 sidebar.menu.rename_workspace = 名前を変更
 sidebar.empty.start_workspace = ワークスペースを始めましょう

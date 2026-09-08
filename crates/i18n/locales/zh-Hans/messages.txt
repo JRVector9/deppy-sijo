@@ -32,6 +32,7 @@ sidebar.menu.remove_worktree = 删除工作树
 sidebar.menu.resume_agent = 恢复智能体
 sidebar.resume_failed = 继续失败 - 请重试：{title}
 sidebar.menu.close_pane = 关闭会话
+sidebar.menu.open_session = 打开会话
 sidebar.menu.close_workspace = 关闭工作区会话
 sidebar.menu.rename_workspace = 重命名
 sidebar.empty.start_workspace = 开始一个工作区

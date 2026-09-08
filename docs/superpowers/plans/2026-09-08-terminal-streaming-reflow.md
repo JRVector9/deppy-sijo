@@ -55,7 +55,7 @@
 - [x] **Step 1: 정적 Codex 리뷰.** `codex review --uncommitted` 또는 source commit을 대상으로 실행한다. 실제 소스만 리뷰하며 앱 실행/빌드/편집을 금지하는 prompt를 전달한다. 지적을 수정하고 해당 회귀를 실행한다.
 - [x] **Step 2: 최종 gate.** vendor 전체 tests 및 strict clippy, `cargo test -p terminal -p session --locked -- --test-threads=1`, 해당 crate strict clippy, `cargo fmt --all -- --check`, 신규 vendor 파일 rustfmt check(기존 상류 포맷 보존), `git diff --check`. jobs=2, 앱 빌드 없음. 빌드 정체는 ps로 정확 PID를 먼저 확인한다.
 - [x] **Step 3: 최신 main 반영.** 필요하면 일반 merge만 사용하고 소스 영향에 맞춰 gate를 재실행한다. rebase/force push 금지.
-- [ ] **Step 4: 한국어 커밋/push/PR.** `git push -u origin perf/terminal-streaming-reflow`; `gh pr create --base main --head perf/terminal-streaming-reflow --title 'perf(terminal): 압축 이력의 리사이즈 메모리 피크 제한' --body-file /private/tmp/deppy-streaming-reflow-pr.md`. 실제 결과와 한계를 PR/handoff에 기록한다.
+- [x] **Step 4: 한국어 커밋/push/PR.** `git push -u origin perf/terminal-streaming-reflow`; `gh pr create --base main --head perf/terminal-streaming-reflow --title 'perf(terminal): 압축 이력의 리사이즈 메모리 피크 제한' --body-file /private/tmp/deppy-streaming-reflow-pr.md`. 실제 결과와 한계를 PR/handoff에 기록한다.
 
 ## 실행 결정 및 실제 측정
 
@@ -66,3 +66,5 @@
 - vendor 전체 formatter는 기존 upstream 포맷을 대량 변경하므로 그 변경만 회수했다. workspace fmt와 새 vendor 파일 rustfmt check를 적용한다. codec 기존 테스트의 clippy needless_range_loop4개는 동등한 iterator로 최소 수정했다.
 
 - 최종 Codex 리뷰 P2(상위 Term preflight 이전 vi cursor 변경)는 실제 RED→GREEN으로 수정했다. Term이 양쪽 grid를 먼저 검증하도록 공유 API를 추가했고 제한 재리뷰에서 남은 확정 결함0. 최종 vendor152 unit+45 ref+1 memory+1 doc, terminal87/session55 및 strict clippy PASS.
+
+- 공유 완료: source commit 1e88de09c7e4199fc2a0c41c92849ed31aa469a3; PR https://github.com/JRVector9/deppy-sijo/pull/160 . 이후 handoff/완료 체크 변경만 문서 커밋한다.

@@ -1,3 +1,13 @@
+## PR C 공유 완료 — PR #160 (2026-09-08)
+
+- 목표 완료: 압축 streaming resize·bounded scratch·출력 보존 한도·cold 재압축·preflight·회귀/벤치·Codex 리뷰/수정·관련 gate·커밋/push/main 대상 PR 생성.
+- PR: https://github.com/JRVector9/deppy-sijo/pull/160 ; source commit 1e88de09c7e4199fc2a0c41c92849ed31aa469a3; branch perf/terminal-streaming-reflow, base origin/main45e66cc. 테스트/벤치는 이 source 내용에 해당한다. 이후 변경은 문서뿐이다.
+- Codex 전체 리뷰 P2 1건을 실제 RED→GREEN으로 수정. 제한 재리뷰 확정 finding0. 최종 vendor152unit+45ref+1memory+1doc, terminal87/session55 PASS; ignored4+benchmark1(benchmark 별도 실행PASS). strict vendor/terminal/session clippy, workspace fmt/new vendor rustfmt/boundary/diff PASS.
+- 최종 실측100k 추가heap5.61~7.99MB, scratch280~1440cells(10k와 동일), release44~1100ms. allocator net live heap 측정이며 전체 RSS/전역 예산/OOM 복구 보장 아님. CPU O(N), 극단적으로 좁은 폭의 지연은 후속 범위.
+- 일지: ~/Library/CloudStorage/SynologyDrive-sync_data/Obsidian-Vault/프로젝트 일지/deppy-sijo/2026-09-08 터미널 압축 스트리밍 리플로 PR C.md
+- 수정 파일: vendor grid/term/Row/codec 테스트 및 memory test 등록, terminal backend 회귀, plan/handoff. app/runtime/UI/protocol 변경 및 앱 빌드/실행 없음. rebase/force 없음.
+- 남음: PR 검토·main 착지는 부모 작업에서 진행. 이 하위 작업은 PR 생성까지 완료. 다음 명령: gh pr view 160 --json state,headRefOid,baseRefName,mergeable,statusCheckRollup; 필요 시 일반 main merge 후 관련 gate 재실행. CI PASS를 주장하지 않는다.
+
 ## PR C 최종 리뷰·gate 완료 (2026-09-08)
 
 - 전체 Codex 리뷰 P2 1건을 실제 RED→GREEN으로 수정, preflight 제한 재리뷰 exit0·남은 확정 finding0. /private/tmp/deppy-streaming-review-preflight.log. 리뷰 정상 종료, 프로세스 강제 종료 없음.

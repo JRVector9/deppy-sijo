@@ -4301,7 +4301,8 @@ impl WorkspaceUi {
                 // not terminal rendering state. The app consumes this event before forwarding the
                 // same batch here, so the workspace leaf intentionally performs no action.
                 RuntimeEvent::AgentSpawned { .. } | RuntimeEvent::AgentSpawnResolved { .. } => {}
-                RuntimeEvent::ResourceUsage { .. } => {}
+                RuntimeEvent::ResourceUsage { .. }
+                | RuntimeEvent::ScrollbackLimitApplied { .. } => {}
                 // 유지보수 결과의 count와 후속 UI는 App controller가 소유한다. 터미널
                 // leaf는 세션/mux/오류 상태를 바꾸지 않고 이벤트를 소비만 한다.
                 RuntimeEvent::UnattachedSessionsInspected { .. }

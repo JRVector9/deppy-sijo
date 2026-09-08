@@ -7110,6 +7110,8 @@ struct WorkspaceRuntime {
     /// Monotonic identity for one concrete worker lifetime. Workspace IDs can be reused after a
     /// suspend/recreate, so async freshness checks must never key only by workspace ID.
     runtime_instance: u64,
+    /// 이 worker 수명의 최신 스크롤백 요청과 실제 ACK만 보관한다.
+    scrollback_delivery: crate::scrollback_policy::Delivery,
     /// Source stamp whose default env was accepted by this exact runtime lifetime.
     dotenv_state: Option<DotenvState>,
     runtime: InProcessRuntimeClient,
@@ -7882,6 +7884,48 @@ impl LiveSessionTracker {
 struct RemoteTlsState {
     server: runtime::RemoteRuntimeServer,
     fingerprint: String,
+    policy: RemoteScrollbackPolicy,
+}
+
+/// 서버로 worker 소유권을 옮겨도 정책 명령과 ACK는 앱 logic에서 계속 관측한다.
+struct RemoteScrollbackPolicy {
+    runtime_instance: u64,
+    dispatcher: runtime::RuntimeCommandDispatcher,
+    events: runtime::RuntimeEventReceiver,
+    delivery: crate::scrollback_policy::Delivery,
+}
+
+impl RemoteScrollbackPolicy {
+    fn pump(&mut self, requested: u32, retry: bool, now: std::time::Instant, ctx: &egui::Context) {
+        self.delivery.set_requested(requested, now);
+        if retry {
+            self.delivery.retry(now);
+        }
+        let events = self.events.drain();
+        App::observe_scrollback_delivery(&mut self.delivery, self.runtime_instance, &events);
+        if self.events.has_backlog() {
+            ctx.request_repaint();
+        }
+        let dispatcher = &self.dispatcher;
+        if let Some(after) = self.delivery.poll(now, |request| {
+            dispatcher(runtime::RuntimeCommand::SetScrollbackLimit {
+                generation: request.generation,
+                requested: request.requested,
+            })
+            .is_ok()
+        }) {
+            ctx.request_repaint_after(after);
+        }
+    }
+}
+
+impl RemoteTlsState {
+    fn shutdown(self) {
+        let Self { server, policy, .. } = self;
+        // 재시도 상태와 송신 핸들을 먼저 없애 worker 종료에 잔여 공급자를 남기지 않는다.
+        drop(policy);
+        server.shutdown();
+    }
 }
 
 /// 실행 중인 모바일 웹(PWA) 서버 + 페어링 토큰(접속 URL/QR 표시용) — mobile-pwa v3.3 P1.
@@ -8465,6 +8509,8 @@ pub struct App {
     pending_turn_done_clear: Option<(String, i64)>,
     /// 설정 전체 변경과 단순 config 저장은 각각 latest-only bit로 합쳐 backlog를 막는다.
     pending_settings_config_apply: bool,
+    /// 설정 렌더가 반환한 재시도 의도. 다음 logic tick에서만 처리한다.
+    pending_scrollback_policy_retry: bool,
     pending_config_save: bool,
     /// 활성 워크스페이스에 저장된 메모(사이드바 「메모」 탭이 읽는 값).
     workspace_note: Option<String>,
@@ -12741,7 +12787,7 @@ impl App {
         egui_ctx: egui::Context,
         bench: Option<crate::bench::Bench>,
     ) -> Self {
-        // output_batch_ms는 시작 시 고정, scrollback_lines는 세션 spawn 시점에 전달
+        // output_batch_ms는 시작 시 고정, scrollback_lines는 초기 정책과 live 전달로 반영
         config.ui.last_workspace_id = Some(workspace_id.clone());
         let persisted_closed_workspaces = config.ui.closed_workspace_ids.clone();
         // 벤치(B1): DEPPY_BENCH_WORKSPACES=N개가 실제로 상주해야 RSS 비교가 성립한다.
@@ -13144,6 +13190,7 @@ impl App {
             pending_workspace_controller_action: None,
             pending_turn_done_clear: None,
             pending_settings_config_apply: false,
+            pending_scrollback_policy_retry: false,
             pending_config_save: false,
             workspace_note: None,
             workspace_note_loaded_for: None,
@@ -13324,7 +13371,10 @@ impl App {
         // config는 그대로 두어 다음 실행에 재시도). 자동 시작은 config 저장을 유발하지 않는다.
         if app.config.remote.tls_enabled {
             match app.start_remote() {
-                Ok(state) => app.remote = Some(state),
+                Ok(state) => {
+                    app.remote = Some(state);
+                    app.broadcast_terminal_cache_policy();
+                }
                 Err(e) => {
                     tracing::warn!("remote TLS 자동 시작 실패: {e:#}");
                     app.remote_error = Some(format!("{e:#}"));
@@ -13386,6 +13436,7 @@ impl App {
         let runtime = runtime_host_factory
             .create_client(runtime::RuntimeHostConfig {
                 output_batch_ms: config.performance.output_batch_ms,
+                scrollback_policy: Some((1, config.terminal.scrollback_lines)),
                 logs_root,
                 persist: Some(runtime::PersistConfig {
                     db_path: db_path.to_path_buf(),
@@ -13403,6 +13454,11 @@ impl App {
         WorkspaceRuntime {
             id: workspace_id.to_owned(),
             runtime_instance,
+            scrollback_delivery: crate::scrollback_policy::Delivery::new(
+                runtime_instance,
+                config.terminal.scrollback_lines,
+                std::time::Instant::now(),
+            ),
             dotenv_state: None,
             runtime,
             events: runtime_events,
@@ -17415,7 +17471,7 @@ impl App {
     /// remote TLS 서버를 기동한다: 신원 로드/생성 → 전용 원격 worker(비영속) → loopback bind.
     /// **원격 worker는 fresh empty 런타임**(원격 클라가 스스로 세션을 만든다) + PersistConfig=None
     /// (원격 세션은 영속하지 않는다). 실패는 Err — 호출측이 표시하고 앱은 계속(크래시 금지).
-    fn start_remote(&self) -> anyhow::Result<RemoteTlsState> {
+    fn start_remote(&mut self) -> anyhow::Result<RemoteTlsState> {
         let identity =
             runtime::tls_identity::get_or_create_identity(&self.secret_store, &self.cert_path())?;
         let fingerprint = identity.fingerprint();
@@ -17424,11 +17480,32 @@ impl App {
             .runtime_host_factory
             .create_client(runtime::RuntimeHostConfig {
                 output_batch_ms: self.config.performance.output_batch_ms,
+                scrollback_policy: Some((1, self.config.terminal.scrollback_lines)),
                 logs_root: self.logs_base.join("remote"),
                 persist: None,
                 cwd: None,
                 extra_env: Vec::new(),
             })?;
+        let runtime_instance = self.next_runtime_instance;
+        self.next_runtime_instance = runtime_instance
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("runtime 수명 번호 소진"))?;
+        let dispatcher = runtime::RuntimeHost::command_dispatcher(&worker)
+            .ok_or_else(|| anyhow::anyhow!("원격 worker 정책 송신기 없음"))?;
+        let wake_ctx = self.egui_ctx.clone();
+        let events = worker.subscribe_with_wake(Arc::new(move || {
+            wake_ctx.request_repaint();
+        }));
+        let policy = RemoteScrollbackPolicy {
+            runtime_instance,
+            dispatcher,
+            events,
+            delivery: crate::scrollback_policy::Delivery::new(
+                runtime_instance,
+                self.config.terminal.scrollback_lines,
+                std::time::Instant::now(),
+            ),
+        };
         let addr =
             std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, self.config.remote.port));
         // loopback 전용(allow_non_loopback=false) — 비-loopback 개방은 후속 UI(C-4 가드 유지).
@@ -17436,6 +17513,7 @@ impl App {
         Ok(RemoteTlsState {
             server,
             fingerprint,
+            policy,
         })
     }
 
@@ -17444,6 +17522,7 @@ impl App {
         match self.start_remote() {
             Ok(state) => {
                 self.remote = Some(state);
+                self.broadcast_terminal_cache_policy();
                 self.remote_error = None;
                 self.config.remote.tls_enabled = true;
                 if let Err(e) = self.config.save(&self.config_path) {
@@ -17464,8 +17543,9 @@ impl App {
     /// settings 체크 off: 서버를 정지(Drop이 accept/접속/worker 정리)하고 config에 영속한다.
     fn remote_disable(&mut self) {
         if let Some(state) = self.remote.take() {
-            state.server.shutdown();
+            state.shutdown();
         }
+        self.broadcast_terminal_cache_policy();
         self.remote_error = None;
         self.config.remote.tls_enabled = false;
         if let Err(e) = self.config.save(&self.config_path) {
@@ -20734,6 +20814,7 @@ impl App {
             // 마지막으로 큐에 남은 이벤트를 처리해 방금 끝난 background 작업의 완료/오류
             // 알림을 놓치지 않는다 (codex 리뷰 — 축출 시 receiver drop으로 유실되던 것).
             let events = rt.events.drain();
+            Self::observe_scrollback_policy(&mut rt, &events);
             let approval_events_overflowed = rt.events.take_overflowed();
             if approval_events_overflowed {
                 self.runtime_stream_warning = true;
@@ -20765,7 +20846,11 @@ impl App {
                 // drain한 lifecycle 이벤트를 replay 큐에 보존 — 버리면 재활성 시
                 // exit/status 상태가 UI에 재구성되지 않는다 (codex Medium).
                 rt.pending_events.extend(events.into_iter().filter(|event| {
-                    !matches!(event, runtime::RuntimeEvent::AgentSpawnResolved { .. })
+                    !matches!(
+                        event,
+                        runtime::RuntimeEvent::AgentSpawnResolved { .. }
+                            | runtime::RuntimeEvent::ScrollbackLimitApplied { .. }
+                    )
                 }));
                 self.warm.insert(workspace_id.to_owned(), rt);
                 push_warm_order_unique(&mut self.warm_order, workspace_id.to_owned());
@@ -22156,25 +22241,128 @@ impl App {
         }
     }
 
+    /// 모든 상주 worker에 최신 요청을 전달한다. 새 worker의 첫 정책은 factory가
+    /// 반환 전에 입장시켜 RestoreWorkspace보다 앞선다. 여기서는 같은 세대로 ACK를
+    /// 확인한다. 수락 실패/ACK 유실은 한 슬롯에서 유계 재시도하며 PTY를 재생성하지 않는다.
+    fn pump_scrollback_policy(&mut self, ctx: &egui::Context) {
+        let now = std::time::Instant::now();
+        let retry = std::mem::take(&mut self.pending_scrollback_policy_retry);
+        let requested = self.config.terminal.scrollback_lines;
+        for rt in std::iter::once(&mut self.active).chain(self.warm.values_mut()) {
+            rt.scrollback_delivery.set_requested(requested, now);
+            rt.scrollback_delivery.require_restore(
+                rt.restore_lifecycle == WorkspaceRestoreLifecycle::Delivered,
+                now,
+            );
+            if retry {
+                rt.scrollback_delivery.retry(now);
+            }
+            let runtime = &rt.runtime;
+            if let Some(after) = rt.scrollback_delivery.poll(now, |request| {
+                runtime
+                    .send_command(runtime::RuntimeCommand::SetScrollbackLimit {
+                        generation: request.generation,
+                        requested: request.requested,
+                    })
+                    .is_ok()
+            }) {
+                ctx.request_repaint_after(after);
+            }
+        }
+        if let Some(remote) = self.remote.as_mut() {
+            remote.policy.pump(requested, retry, now, ctx);
+        }
+    }
+
+    fn observe_scrollback_policy(rt: &mut WorkspaceRuntime, events: &[runtime::RuntimeEvent]) {
+        Self::observe_scrollback_delivery(&mut rt.scrollback_delivery, rt.runtime_instance, events);
+    }
+
+    fn observe_scrollback_delivery(
+        delivery: &mut crate::scrollback_policy::Delivery,
+        runtime_instance: u64,
+        events: &[runtime::RuntimeEvent],
+    ) {
+        for event in events {
+            if let runtime::RuntimeEvent::ScrollbackLimitApplied {
+                generation,
+                requested,
+                applied,
+                unsupported,
+                trimmed,
+                effective_min,
+                durable,
+                restored,
+            } = event
+            {
+                delivery.observe(
+                    runtime_instance,
+                    crate::scrollback_policy::Applied {
+                        request: crate::scrollback_policy::Request {
+                            generation: *generation,
+                            requested: *requested,
+                        },
+                        applied: *applied,
+                        unsupported: *unsupported,
+                        trimmed: *trimmed,
+                        effective_min: *effective_min,
+                        durable: *durable,
+                        restored: *restored,
+                    },
+                    std::time::Instant::now(),
+                );
+            }
+        }
+    }
+
+    fn scrollback_policy_view(&self) -> crate::scrollback_policy::View {
+        crate::scrollback_policy::aggregate(
+            std::iter::once(&self.active)
+                .chain(self.warm.values())
+                .map(|rt| {
+                    let mut view = rt.scrollback_delivery.view_after_restore(
+                        self.config.terminal.scrollback_lines,
+                        rt.restore_lifecycle == WorkspaceRestoreLifecycle::Delivered,
+                    );
+                    // 아직 입장하지 않은 복원이 있으면 빈 worker의 ACK로 전체 완료라 표시하지 않는다.
+                    if rt.restore_lifecycle == WorkspaceRestoreLifecycle::AwaitingDelivery
+                        && view.status != crate::scrollback_policy::Status::Failed
+                    {
+                        view.status = crate::scrollback_policy::Status::Pending;
+                    }
+                    view
+                })
+                .chain(self.remote.iter().map(|remote| {
+                    remote
+                        .policy
+                        .delivery
+                        .view(self.config.terminal.scrollback_lines)
+                })),
+        )
+    }
+
     /// 설정의 exited cap / **프로세스 전역** 캐시 예산을 워커 정책 명령으로 만든다.
-    /// 각 runtime은 자기 세션만 볼 수 있으므로 active+warm resident 수로 균등 분배해
+    /// 각 runtime은 자기 세션만 볼 수 있으므로 active+warm+TLS 수로 균등 분배해
     /// 합산 허용량이 설정값을 넘지 않게 한다(§14.3 확장).
     fn terminal_cache_policy_command(&self) -> runtime::RuntimeCommand {
         runtime::RuntimeCommand::SetTerminalCachePolicy {
             max_exited_backends: self.config.terminal.exited_backend_cap as usize,
             cache_budget_bytes: per_runtime_cache_budget_bytes(
                 self.config.terminal.effective_cache_budget_mib(),
-                1 + self.warm.len(),
+                1 + self.warm.len() + usize::from(self.remote.is_some()),
             ),
         }
     }
 
-    /// 캐시 정책을 활성 + warm 워커 전체에 반영한다 (설정 또는 resident 수 변경 시).
+    /// 캐시 정책을 활성 + warm + TLS 워커 전체에 반영한다 (설정 또는 resident 수 변경 시).
     fn broadcast_terminal_cache_policy(&mut self) {
         let command = self.terminal_cache_policy_command();
         let _ = self.active.runtime.send_command(command.clone());
         for rt in self.warm.values() {
             let _ = rt.runtime.send_command(command.clone());
+        }
+        if let Some(remote) = &self.remote {
+            let _ = (remote.policy.dispatcher)(command);
         }
     }
 
@@ -26065,7 +26253,7 @@ impl App {
         }
         // remote TLS 서버를 먼저 정지 — accept 루프·접속·전용 worker(그 세션들 reap)를 정리한다.
         if let Some(state) = self.remote.take() {
-            state.server.shutdown();
+            state.shutdown();
         }
         // worker join까지 동기 대기 — 셸 자식 프로세스 정리(reap) 보장.
         self.active.runtime.shutdown();
@@ -26097,6 +26285,7 @@ impl eframe::App for App {
     // 스킵 판단에 쓰는 바로 그 신호(minimized OR occluded — macOS는 occluded로 갱신되어
     // minimized 미갱신 문제를 피한다). None(미보고)이면 안전하게 Active 유지.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.pump_scrollback_policy(ctx);
         // 메모 자동 저장 디바운스. 타건이 멎으면 입력 이벤트도 멎으므로 만료 시점을
         // **한 번** 예약해 깨운다 — 폴링이 아니라 밀린 편집이 있을 때만 거는 one-shot이라
         // 유휴 프레임을 만들지 않는다. render 경로가 아닌 여기 두는 이유는
@@ -26381,6 +26570,7 @@ impl eframe::App for App {
         let mut warm_restore_outcome = None;
         for rt in self.warm.values_mut() {
             let events = rt.events.drain();
+            Self::observe_scrollback_policy(rt, &events);
             resource_maintenance_changed |=
                 apply_unattached_events(&mut self.unattached_counts, &rt.id, &events);
             if let Some((workspace_id, runtime_instance, correlation_id)) =
@@ -26437,7 +26627,11 @@ impl eframe::App for App {
                     // App에 붙어 실제로 보이는 warm runtime은 자기 WorkspaceUi surface가
                     // 이벤트를 소비한다. A의 UI나 warm projection에 대신 적용하지 않는다.
                     rt.pending_events.extend(events.into_iter().filter(|event| {
-                        !matches!(event, runtime::RuntimeEvent::AgentSpawnResolved { .. })
+                        !matches!(
+                            event,
+                            runtime::RuntimeEvent::AgentSpawnResolved { .. }
+                                | runtime::RuntimeEvent::ScrollbackLimitApplied { .. }
+                        )
                     }));
                 } else {
                     // 표시 상태(mux 구조·세션 status·종료 결과)와 shell spawn 완료는
@@ -26494,6 +26688,7 @@ impl eframe::App for App {
         // ui()가 스킵돼도 승인/완료/실패 알림은 유지). worker의 wake가 숨겨진 UI를
         // 깨워 이 logic()을 돌린다. 렌더용으로는 pending_events에 쌓아 ui()가 소비한다.
         let new_events = self.active.events.drain();
+        Self::observe_scrollback_policy(&mut self.active, &new_events);
         let primary_activation_post_render_tick = primary_activation_needs_post_render_tick(
             self.pending_primary_pane_activation.as_ref(),
             &new_events,
@@ -26565,7 +26760,11 @@ impl eframe::App for App {
                 self.active
                     .pending_events
                     .extend(new_events.into_iter().filter(|event| {
-                        !matches!(event, runtime::RuntimeEvent::AgentSpawnResolved { .. })
+                        !matches!(
+                            event,
+                            runtime::RuntimeEvent::AgentSpawnResolved { .. }
+                                | runtime::RuntimeEvent::ScrollbackLimitApplied { .. }
+                        )
                     }));
             }
             // 여기서 리페인트를 재요청하지 않는다 — 이벤트를 여기까지 실어나른 모든 경로
@@ -29536,6 +29735,7 @@ impl eframe::App for App {
         // .env 라이브 반영 토글(E5 ⑨) — 클로저 안에서 편집하고 밖에서 저장/적용.
         let mut env_live_reload_toggle = self.config.ui.env_live_reload;
         // #3 워크스페이스 이름 편집 캡처 (클로저 밖에서 db/refresh 처리 — self 전체 &mut).
+        let scrollback_view = self.scrollback_policy_view();
         let out = ui::settings::show(
             ui.ctx(),
             &mut self.settings_open,
@@ -29549,6 +29749,7 @@ impl eframe::App for App {
             notif_unread,
             &mut self.settings_search,
             &text,
+            scrollback_view,
             |ui, cat| {
                 use ui::settings::Category as C;
                 match cat {
@@ -30120,6 +30321,10 @@ impl eframe::App for App {
                     .send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
                 ui.ctx().request_repaint();
             }
+        }
+        if out.scrollback_retry {
+            self.pending_scrollback_policy_retry = true;
+            ui.ctx().request_repaint();
         }
         if out.config_changed {
             self.pending_settings_config_apply = true;
@@ -31253,6 +31458,7 @@ fn warm_replay_event(event: &runtime::RuntimeEvent) -> bool {
     !matches!(
         event,
         runtime::RuntimeEvent::AgentSpawnResolved { .. }
+            | runtime::RuntimeEvent::ScrollbackLimitApplied { .. }
             | runtime::RuntimeEvent::ShellSpawned { .. }
             | runtime::RuntimeEvent::SpawnFailed {
                 kind: runtime::SpawnKind::Shell,
@@ -31515,6 +31721,62 @@ fn pty_shortcut_missing_feedback(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tls_scrollback_policy는_서버_소유_worker의_실제_ack을_반영한다() {
+        use crate::scrollback_policy::{Delivery, Status};
+        let dir = unique_temp_dir("tls-scrollback");
+        let factory = runtime::InProcessRuntimeHostFactory::new(
+            std::sync::Arc::new(super::AppRuntimeSecretResolver::new(dir.join("unused.db"))),
+            secret::RedactionService::new(),
+        );
+        let worker = factory
+            .create_client(runtime::RuntimeHostConfig {
+                scrollback_policy: Some((1, 5000)),
+                output_batch_ms: 10,
+                logs_root: dir.join("logs"),
+                persist: None,
+                cwd: None,
+                extra_env: Vec::new(),
+            })
+            .unwrap();
+        let dispatcher = runtime::RuntimeHost::command_dispatcher(&worker).unwrap();
+        let events = worker.subscribe_with_wake(std::sync::Arc::new(|| {}));
+        let policy = super::RemoteScrollbackPolicy {
+            runtime_instance: 7,
+            dispatcher,
+            events,
+            delivery: Delivery::new(7, 5000, std::time::Instant::now()),
+        };
+        let server = runtime::RemoteRuntimeServer::serve(worker, 0).unwrap();
+        let mut state = super::RemoteTlsState {
+            server,
+            fingerprint: String::new(),
+            policy,
+        };
+        let ctx = egui::Context::default();
+        // factory 초기 ACK가 이미 나갔어도 동일 요청 재확인으로 완료해야 한다.
+        for requested in [5000, 100, 5000] {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                state
+                    .policy
+                    .pump(requested, false, std::time::Instant::now(), &ctx);
+                if state.policy.delivery.view(requested).status == Status::Applied {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "실제 worker ACK 대기 만료"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(!state.policy.delivery.view(requested).durable);
+        }
+        // 앱 State가 dispatcher/receiver를 먼저 버리고 서버의 worker join을 끝낸다.
+        state.shutdown();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// Relay는 loopback/Tailscale 경로와 **완전히 독립**이다. 프로덕션 엔드포인트가 아직
     /// 배정되지 않았으므로 Relay 시작은 지금 실패하는 것이 정상인데, 그 실패가 web 서버·
     /// 토큰·Host 허용 목록·리스너 중 무엇도 건드리면 안 된다.

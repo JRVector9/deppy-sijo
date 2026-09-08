@@ -2734,7 +2734,7 @@ mod tests {
             features: CLIENT_FEATURES,
             token: b"irrelevant".to_vec(),
         };
-        assert_eq!(PROTO_VERSION, 12);
+        assert_eq!(PROTO_VERSION, 13);
         assert!(!client_hello_matches_protocol(&old));
     }
 
@@ -3577,6 +3577,7 @@ mod tests {
             RuntimeEvent::DurableEventBarrierReached { .. } => "DurableEventBarrierReached",
             RuntimeEvent::UnattachedSessionsInspected { .. } => "UnattachedSessionsInspected",
             RuntimeEvent::UnattachedSessionsKilled { .. } => "UnattachedSessionsKilled",
+            RuntimeEvent::ScrollbackLimitApplied { .. } => "ScrollbackLimitApplied",
         }
     }
 

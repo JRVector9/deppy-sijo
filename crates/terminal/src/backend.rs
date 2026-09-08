@@ -18,17 +18,14 @@ pub struct TerminalCacheBudget {
 
 impl TerminalCacheBudget {
     pub const VISIBLE: Self = Self {
-        max_scrollback_lines: 10_000,
-        max_bytes: 16 * 1024 * 1024,
+        max_scrollback_lines: crate::policy::SCROLLBACK_LINES_MAX,
+        // 실제 압축 footprint에 대한 runtime 전역 예산이 메모리를 제한한다.
+        max_bytes: usize::MAX,
     };
-    pub const HIDDEN: Self = Self {
-        max_scrollback_lines: 1_000,
-        max_bytes: 2 * 1024 * 1024,
-    };
-    pub const EXITED: Self = Self {
-        max_scrollback_lines: 1_000,
-        max_bytes: 2 * 1024 * 1024,
-    };
+    // 숨김은 보관량이 아니라 압축 상태를 바꾼다. 삭제는 전역 예산 압박에서 결정한다.
+    pub const HIDDEN: Self = Self::VISIBLE;
+    // 종료 직후 archive 쓰기보다 먼저 이력을 삭제하지 않는다.
+    pub const EXITED: Self = Self::VISIBLE;
 
     pub fn for_class(class: TerminalCacheClass) -> Self {
         match class {
@@ -149,6 +146,17 @@ pub enum TerminalRenderModel {
 /// v0에서는 사용처가 없다 — LibGhosttyBackend Mode B에서 구체화.
 pub struct TerminalExternalSurfaceHandle;
 
+/// 보관 정책의 실제 적용 결과. 증가하더라도 삭제된 이력이 복원된다는 뜻은 아니다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollbackApplyResult {
+    Applied {
+        requested: usize,
+        effective: usize,
+        trimmed: usize,
+    },
+    Unsupported,
+}
+
 /// 설계문서 4.2 TerminalBackend trait.
 /// `bracketed_paste`는 설계 trait에 없지만 PR-05 완료 기준(bracketed paste)이
 /// 입력 경로에서 모드 조회를 요구해 추가했다.
@@ -183,6 +191,11 @@ pub trait TerminalBackend {
     }
 
     fn set_cache_class(&mut self, class: TerminalCacheClass) -> Option<TerminalCacheEvent>;
+
+    /// 사용자 보관 한도를 갱신한다. 미지원 엔진은 세션을 재생성하지 않고 명시적으로 거부한다.
+    fn set_scrollback_limit(&mut self, _requested: usize) -> ScrollbackApplyResult {
+        ScrollbackApplyResult::Unsupported
+    }
 
     /// 메모리 압박 하에서 스크롤백을 클래스 예산 **아래로** 강제 축소한다 — 가장 오래된
     /// 히스토리를 `max_lines`까지 드롭하고 남은 것을 전부 압축한다. 전역 예산이 exited

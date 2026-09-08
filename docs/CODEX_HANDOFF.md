@@ -2401,3 +2401,76 @@
 - 원격 실행 링크: https://github.com/JRVector9/deppy-sijo/actions/runs/34206142020 , https://github.com/JRVector9/deppy-sijo/actions/runs/34206142022 .
 - workflow의 추가 경계 게이트도 로컬 실행했다: `CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-deps-target-20260907 cargo run --locked -p xtask -- check-boundary` → `check-boundary OK — UI leaf boundary guard passed; zero allowlist capability` (exit0, `/private/tmp/deppy-policy-boundary.log`).
 - 남은 외부 작업: GitHub 계정 billing/spending 한도 복구 후 CI 재실행. 이 PR에서 계정 설정 변경이나 merge는 수행하지 않는다.
+
+## 2026-09-08 PR D live scrollback 시작
+- 목표: PR #157 d0d1e66 위에서 live setter→Session→runtime wire/worker→app ACK 상태를 연결한다.
+- 전용 worktree `/private/tmp/deppy-scrollback-live-20260908`, branch `feat/scrollback-live-policy`. PR C vendor reflow는 포함하지 않는다.
+- 완료: backend hidden 감소 원인, runtime spawn/restore/inflate 경로, app active/warm 수명과 이벤트 흐름 조사. 계획 `docs/superpowers/plans/2026-09-08-scrollback-live-policy.md` 작성.
+- 결정: hidden은 Visible과 같은 보관 상한+전체 cold 압축; 삭제는 명시적 축소/전역 예산 압박. 기존 hidden-first trim 재사용. SetTerminalCachePolicy 필드 유지, 새 append-only 명령/ACK 및 v13.
+- 테스트: 아직 실행하지 않음. UI rebuild/relaunch 금지, 시각 검증 대기.
+- 남은 작업: backend RED/GREEN부터 계획 순서대로 구현·리뷰·gate·stacked PR 생성.
+- 다음 명령: `CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-deps-target-20260907 cargo test -p terminal hidden --locked`; `git diff --check`.
+
+### PR D backend/runtime 초기 GREEN 및 영속 계약 보완
+- backend live setter, Session full-dirty, append-only command/event와 protocol v13, current/future/memory archive 적용을 구현 중이다. hidden은 가시성만으로 history를 삭제하지 않으며 기존 hidden-first 압박 trim은 유지한다.
+- 실제 검증: terminal live RED(Unsupported), hidden RED(1000vs1996) 후 terminal 전체88 passed/4 ignored. Session dirty RED 확인 후 수정(GREEN 재실행 대기). runtime 세션 적용 RED(496vs100) 후 focused2 passed. 로그 `/private/tmp/deppy-live-{backend-red,hidden-red,terminal-green,session-red,runtime-red,runtime-green}.log`.
+- durable ceiling RED: 새로 열면1000이 복원되어 기대100 실패(`/private/tmp/deppy-live-durable-red.log`). workspace 단일 bounded 원자 manifest(최대4096 entries) 구현 중. archive별 sidecar+fsync는 저사양 비용 때문에 채택하지 않는다.
+- 설계 교정: 낮춤→재시작→높임에서도 min(header,manifest,current policy)로 복원. 초기 runtime 생성 인자로 정책을 전달해 RestoreWorkspace가 정책을 앞지르지 못하도록 고정한다. 성공 표시는 복원 후 ACK 집계까지 대기한다.
+- 독립 리뷰: runtime stale generation 및 동일세대 다른값 수용 결함 확인. 별도 RED 후 수정 예정. app delivery/status, 최종 review/gate/PR은 미완료. UI 재빌드/재실행하지 않았으며 시각 검증 대기.
+
+### PR D 영속 최소값 설계 한계 — 공개 전 필수 해결
+- 현재 manifest 초안은 한 파일·SHA-256 digest·최대4096 entries·root/session descriptor 검증을 사용하고 worker가 snapshot을 캐시한다. archive 재열기/증가, malformed/symlink/oversize, prune3개 GREEN.
+- 추가 runtime focused4 GREEN: generation 역전/동일세대 충돌, 현재세션 ACK, ANSI축소→재시작→증가(새출력없음).
+- **미해결 RED**: `cargo test -p runtime live_scrollback_증가_뒤 --locked`는 축소100→증가5000→새1000줄→재시작에서 새출력까지100줄로 잘려 실패. `/private/tmp/deppy-live-postgrowth-red.log`. 최소값 manifest만으로 no-resurrection과 증가뒤새출력보존을 동시에 만족할 수 없다.
+- root에 대안 보고: 축소 시 redacted terminal snapshot immutable checkpoint + ANSI identity/offset 원자 manifest, 복원은 checkpoint+suffix. 단일offset만 추가해도 반복축소에서 부활하므로 snapshot 또는 bounded timeline+compaction 필요. 현재 manifest를 완료/안전이라고 보고하거나 PR 게시하지 않는다.
+- Visible/Hidden 고정10000줄/16MiB가100000요청을2332줄로 제한하는 RED 확인후 고정cap제거. Exited도 archive쓰기 전1000으로삭제하는경로가있어동일사용자상한으로변경.
+- terminal/session/storage 전체묶음은 Session 기존hidden-trim기대테스트1실패(55passed)로중단. 새보존계약으로테스트수정,재검사대기. 첫 batching patch는 handle_command 시그니처(mut command) 불일치로 Python assertion 실패하여 적용되지않았다. 로그개설초기상한과 ACK batching은 아직구현되지않음.
+
+### PR D 최종 범위 확정: 실행 중 정책, 독립 복구 로그 보존
+- root 결정: redacted ANSI는 감사/복구 독립 로그이며 설정 변경으로 파괴적 재작성하지 않는다. 단일 min manifest/storage diff는 전부 제거했다. SHA dependency 변경도 없다. 이전 durable 최소값 설계와 checkpoint 대안은 폐기된 접근이다.
+- 최종 계약: 현재 프로세스 lifetime 내 축소→증가에서 과거 재복원 없음. 시작 시 저장된 설정으로 로그를한번재생. 재시작전낮춤→높임이면 독립로그의과거가다시보일수있고 ACK durable=false로경계를명시한다. durable=false는실패/재시도사유가아니다. non-Unix도backendApplied와별개로false.
+- 아직복원하지않은기존archive는runtime restore ceiling으로보호. respawn은원본ANSI를다시읽지않고이미materialize한Session snapshot을이어받아증가후새출력도보존. 한restore명령의ACK는모든세션편입후집계하도록batching.
+- app담당결과: 순수delivery11 GREEN(독립rustc); app focused 첫컴파일에서새event exhaustive누락확인후workspace.rs에no-oparm추가. 실제Settings/locale검증진행중.
+- terminal89passed/4ignored, Session56passed 전체GREEN(`/private/tmp/deppy-live-terminal-session-full.log`). Host초기정책은factory가client반환전첫명령으로admit. 최신runtimefocused/full·review/gate아직대기.
+
+### PR D core 최종 GREEN 및 남은 게이트
+- global restore ceiling도 새세션archive의996줄을100줄로자르는RED가확인되어제거했다(`/private/tmp/deppy-live-new-archive-red.log`). 시작catalog의최대256 pending persistent identity만개별상한추적, memory archive 자체limit과disk SessionId별limit분리.
+- 현재새회귀9개포함runtime전체286passed,0failed(--test-threads=2,28.39초), `/private/tmp/deppy-live-runtime-full-bounded.log`. 초기factoryFIFO, 이전gen/동일gen다른값거부, 삭제후같은gen count감소, 시작100cap, 증가후새출력보존, 새세션archive보존, 독립로그재시작경계가포함된다.
+- 전체1차283passed/3failed는wrapper이름기반기존소스검사, 신규fixture내부env, 빈Session24줄respawn재생회귀였다. 수정했다. 2차default병렬은다수remote/knownhosts실패후join대기하여cargo32717/test33521을TERM으로종료했다. sample `/private/tmp/deppy-live-runtime-sample.txt`; 실제최종bounded전체가PASS이며정체실행을PASS라고표현하지않는다. 새spawnfixture의/bin/true는macOS에없어서/bin/sh -c true로교정했다.
+- `codex review --uncommitted`가요청하지않은전체cargo check를새target에시작하여review205/cargo23953및그자식만종료했다. 이후`codex exec --sandbox read-only`로테스트/빌드/편집금지명시정적리뷰를진행중이다(`/private/tmp/deppy-live-codex-static-review.log`).
+- ACK restored필드와batching으로초기빈worker결과와복원완료집계를구분. app담당은순수13GREEN, settings21GREEN후최종소스재검사/i18n/clippy진행중.
+- 다음명령: `cargo fmt --all`; app담당완료후 `CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-deps-target-20260907 cargo clippy -p terminal -p session -p runtime --all-targets --locked -- -D warnings`; `cargo run --locked -p xtask -- check-boundary`; review결과반영; commit/push/base feat/scrollback-policy-contract PR. UI재실행금지, 시각검증대기.
+
+### PR D 최종 게이트와 앱 담당 인수
+- app 순수delivery 최종14passed(`/private/tmp/deppy-scrollback-app-final.log`), 실제Settings21passed(`/private/tmp/deppy-scrollback-settings-final.log`), i18n8passed(`/private/tmp/deppy-scrollback-i18n-final.log`). restoredACK미도착/유실, 활성·warm·축출취소드레인관측,같은gen집계갱신,staleidentity/gen거부,6회유계재시도/수동재시도포함.
+- core `cargo clippy -p terminal -p session -p runtime --all-targets --locked -- -D warnings` PASS(`/private/tmp/deppy-live-core-clippy.log`). app동일strictall-targets PASS(`/private/tmp/deppy-scrollback-app-clippy-final.log`).
+- `cargo run --locked -p xtask -- check-boundary` PASS(`/private/tmp/deppy-live-boundary.log`). `cargo fmt --all --check`, `git diff --check` PASS. CARGO_BUILD_JOBS=2, 공통target `/private/tmp/deppy-deps-target-20260907`.
+- app담당파일동결: scrollback_policy.rs/main.rs/app.rs/settings.rs/5locale. finalACK restored=false는큐입장후에도Pending이며복원후true결과나한도내재전송으로해결한다. durable=false는실패가아니라로그영속삭제미보장안내다.
+- PR #157은OPEN,head d0d1e66,base main임을gh로확인했다. 이PR은feat/scrollback-policy-contract를base로stack한다. reflow PR C는미포함.
+- 현재정적CLI리뷰진행중. 완료후확정finding수정·필요한재검증→한국어commit→일반push→stacked PR. 앱재실행/실화면/IME와Ghostty네이티브/Linux/Windows실행은하지않았고대기로남긴다.
+
+### PR D 최종 메모리·respawn 보완
+- 100k설정에서ANSI직렬화가먼저큰Vec를할당하던경로를자체검토로발견했다. 실제serializer의exact/+1/0상한RED→GREEN후출력전32MiB한도검사와기하급수boundedreserve로수정했다. terminal전체90passed/4ignored(`/private/tmp/deppy-live-terminal-final.log`),최종serializer1passed(`/private/tmp/deppy-live-serialize-final.log`).
+- respawn은현재Session을ANSI로직렬화/재생하는대신새PTYspawn성공후기존backend소유권을이동한다. 새크기/한도/dirty만맞추므로32MiB직렬화상한이나Ghostty직렬화미지원에도현재grid를잃지않고큰임시복사도없다. 빈화면에는추가개행을넣지않는다.
+- Session backend이동stub의RED확인(`/private/tmp/deppy-live-inherit-red.log`). 구현후Session57+runtime286전체PASS(--test-threads=2, `/private/tmp/deppy-live-inherit-full.log`). 최신core/app strictclippy재검사중(`/private/tmp/deppy-live-final-clippy2.log`).
+- 최종소스독립CLI정적리뷰는계속진행중. 이후소스확정finding없으면문서최종검사→한국어commit/push/stacked PR. UI·네이티브대기상태변경없음.
+
+### PR D CLI 최종 리뷰 3건 반영
+- 읽기 전용 CLI 리뷰가 결론 없이 장기 실행되어 정확한 PID 51815, 후속 12492를 SIGINT로 종료했다. 같은 세션 `01a0805e-bfca-7001-8f46-45f2ec74ca07`의 수집 증거로 최종 결론을 요청했고 P2 세 건을 받았다(`/private/tmp/deppy-live-codex-review-conclusion.log`). 리뷰가 깨끗하게 종료됐다는 주장은 하지 않는다.
+- respawn backend 소유권 이동이 이전 압박 floor까지 보존하던 문제는 `Session::inherit_terminal_from`에서 압박 상한을 먼저 해제해 수정했다. 삭제된 기록은 다시 생기지 않고 새 출력 용량만 요청값으로 회복한다. 해당 회귀 GREEN을 확인했다. 묶음 RED 실행은 runtime에서 먼저 실패해 Session 회귀의 RED를 실행하지 못했다.
+- 여러 pane 복원 중 전역 예산 적용이 늦던 문제는 `Worker::insert_session`마다 실제 footprint를 확인하고 기존 hidden-first trim을 적용해 수정했다. 실제 RED(`/private/tmp/deppy-live-review-red.log`) 후 GREEN이며 집계 ACK의 effective_min도 현재 footprint를 반영한다. 최소 화면 메모리와 trim 미지원 backend까지 RSS 절대 상한을 보장한다는 뜻은 아니다.
+- 별도 원격 TLS worker 누락은 기존 RuntimeHost dispatcher와 background receiver를 앱 State에 함께 보관해 보완했다. active/warm/TLS 모두 같은 세대·ACK·유계 재시도와 전역 캐시 예산 분배를 사용하며 TLS 시작/종료 때 예산을 재분배한다. 새 네트워크 API나 Relay 변경은 없다.
+- 최신 core 전체: `CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-deps-target-20260907 cargo test -p session -p runtime --locked -- --test-threads=2` → runtime 287 passed, Session 58 passed, doc 0 (`/private/tmp/deppy-live-review-core-full.log`, exit 0).
+- 앱 담당은 TLS 배선/예산 누락을 실제 RED 후 수정, 순수 17 passed를 확인했다. 실제 server 소유 worker ACK 검증은 plaintext loopback fixture이므로 네이티브 TLS 암호화나 앱 시각 검증으로 표현하지 않는다. 최종 app/Settings/i18n/strict clippy 실행 중이다.
+- storage/Cargo dependency diff 없음. 단일 min manifest는 폐기 상태이며 최종 계약은 실행 중 no-resurrection + 독립 복구 로그 보존이다. 다음: 앱 gate 인수 → core strict clippy/format/boundary → 문서 확정 → 한국어 commit/push/#157 기반 PR.
+
+### PR D TLS 최종 회귀
+- 앱의 기존 dev dependency에 없는 tempfile을 새 fixture가 참조해 첫 컴파일 E0433이 발생했다. 기존 unique_temp_dir fixture로 바꿨고 dependency 추가 없이 실제 앱 scrollback 18 tests PASS다(`/private/tmp/deppy-scrollback-tls-final.log`). Settings 21 PASS(`/private/tmp/deppy-scrollback-settings-tls-final.log`), i18n 8 PASS(`/private/tmp/deppy-scrollback-i18n-tls-final.log`).
+- 정적 검토에서 정책 전용 GUI receiver가 background 구독을 쓰면 원격 전용 Viewport마다 불필요하게 repaint된다는 회귀를 확인했다. render_bound 일반 `subscribe_with_wake`로 바꿨고 실제 배선 RED 후 app 18 tests GREEN을 재확인했다. 정책 ACK는 일반 상태 이벤트라 계속 wake되며 기존 원격 화면 전용 wake gate는 유지한다.
+- 최종 app all-targets strict Clippy 진행 중이다. 이후 core all-targets strict Clippy와 format/boundary를 확인하고 게시한다. CLI 후속 무결함 판정은 실행하지 않았으며, 확인된 세 건을 수정하고 관련 전체/집중 테스트로 재검증한 상태다.
+
+### PR D 게시 전 최종 게이트 확정
+- 최종 app strict all-targets Clippy PASS(exit 0, 14.67초, `/private/tmp/deppy-scrollback-app-tls-clippy-final.log`), core terminal/session/runtime strict all-targets Clippy PASS(exit 0, 1.89초, `/private/tmp/deppy-live-review-core-clippy.log`). `cargo fmt --all --check`, `git diff --check`, xtask check-boundary PASS(`/private/tmp/deppy-live-final-boundary.log`).
+- 앞선 묶음 RED에서 빠졌던 압박 floor 회귀의 민감도를 별도 확인했다. 수정 한 줄을 임시 제거하면 실제 `100 != 5000` RED(exit 101), 원본 소스를 즉시 복원하면 해당 회귀 GREEN(exit 0)이다(`/private/tmp/deppy-live-pressure-regression-{red,green}.log`). 최종 파일은 전체 gate 당시 소스와 같다.
+- 최종 결과: terminal 90 PASS/4 ignored, Session 58 PASS, runtime 287 PASS, TLS 포함 app 18 PASS, Settings 21 PASS, i18n 8 PASS. runtime 전체는 `--test-threads=2`로 실행했다. CLI 확정 세 건과 GUI wake 회귀를 수정했으며 이후 직접 검토에서 추가 확정 결함은 없었다.
+- 앱 재빌드·재실행/실화면·IME, 네이티브 TLS 암호화/Ghostty 및 Linux/Windows 실행은 미실행·대기다. 독립 복구 로그 미삭제와 재시작 시 과거 재표시 경계를 유지한다. 다음은 지정 파일 커밋 → 일반 push → #157 기반 stacked PR 게시다.

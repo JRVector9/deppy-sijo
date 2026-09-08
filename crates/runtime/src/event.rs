@@ -204,6 +204,20 @@ pub enum RuntimeEvent {
     UnattachedSessionsKilled {
         count: u16,
     },
+    /// worker가 실제 적용한 고정 크기 집계. unsupported는 재생성 없이 남겨 둔 세션 수다.
+    /// **variant는 끝에만 추가** (postcard discriminant — wire 호환).
+    ScrollbackLimitApplied {
+        /// false는 별도 감사/복구 로그의 영속 삭제를 보장하지 않음을 뜻한다.
+        durable: bool,
+        /// 초기 복원 명령의 처리를 마친 뒤 집계한 결과인가.
+        restored: bool,
+        generation: u64,
+        requested: u32,
+        applied: u16,
+        unsupported: u16,
+        trimmed: u64,
+        effective_min: u32,
+    },
 }
 
 /// 최신값 슬롯에서 Viewport를 교체할 때, **아직 소비되지 않은** 이전 이벤트의
@@ -419,6 +433,7 @@ mod tests {
                 "DurableEventBarrierReached",
                 "UnattachedSessionsInspected",
                 "UnattachedSessionsKilled",
+                "ScrollbackLimitApplied",
             ]
         );
     }

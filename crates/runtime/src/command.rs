@@ -453,6 +453,7 @@ pub(crate) fn runtime_command_retained_bytes(
         | RuntimeCommand::FreezeSession { .. }
         | RuntimeCommand::ResumeSession { .. }
         | RuntimeCommand::NoteTurnStart { .. }
+        | RuntimeCommand::SetScrollbackLimit { .. }
         | RuntimeCommand::DurableEventBarrier { .. }
         | RuntimeCommand::InspectUnattachedSessions
         | RuntimeCommand::KillUnattachedSessions => {}
@@ -573,6 +574,7 @@ pub(crate) fn canonicalize_host_command(command: &mut RuntimeCommand) {
         | RuntimeCommand::FreezeSession { .. }
         | RuntimeCommand::ResumeSession { .. }
         | RuntimeCommand::NoteTurnStart { .. }
+        | RuntimeCommand::SetScrollbackLimit { .. }
         | RuntimeCommand::DurableEventBarrier { .. }
         | RuntimeCommand::InspectUnattachedSessions
         | RuntimeCommand::KillUnattachedSessions => {}
@@ -730,6 +732,17 @@ pub(crate) fn validate_host_command(command: &RuntimeCommand) -> Result<(), Runt
         RuntimeCommand::SearchScrollback { query, .. } => {
             if query.len() > SEARCH_QUERY_BYTES_MAX {
                 return Err(admission_error("runtime_command_search_invalid"));
+            }
+        }
+        RuntimeCommand::SetScrollbackLimit {
+            generation,
+            requested,
+        } => {
+            if *generation == 0
+                || !(terminal::policy::SCROLLBACK_SETTING_MIN..=SCROLLBACK_LINES_MAX as u32)
+                    .contains(requested)
+            {
+                return Err(admission_error("runtime_scrollback_policy_invalid"));
             }
         }
         RuntimeCommand::DurableEventBarrier { correlation_id } => {
@@ -1007,6 +1020,12 @@ pub enum RuntimeCommand {
         rows: u16,
         scrollback_lines: usize,
     },
+    /// 기존·향후 세션의 사용자 보관 한도. generation은 호출자가 결과를 연결하는 식별자다.
+    /// **variant는 끝에만 추가** (postcard discriminant — wire 호환).
+    SetScrollbackLimit {
+        generation: u64,
+        requested: u32,
+    },
 }
 
 impl std::fmt::Debug for RuntimeCommand {
@@ -1160,6 +1179,14 @@ impl std::fmt::Debug for RuntimeCommand {
                 .debug_struct("DurableEventBarrier")
                 .field("correlation_id", correlation_id)
                 .finish(),
+            RuntimeCommand::SetScrollbackLimit {
+                generation,
+                requested,
+            } => f
+                .debug_struct("SetScrollbackLimit")
+                .field("generation", generation)
+                .field("requested", requested)
+                .finish(),
             RuntimeCommand::InspectUnattachedSessions => f.write_str("InspectUnattachedSessions"),
             RuntimeCommand::KillUnattachedSessions => f.write_str("KillUnattachedSessions"),
             RuntimeCommand::RespawnArchivedAgent {
@@ -1238,6 +1265,29 @@ mod tests {
             approval_regex: None,
             error_regex: None,
             done_regex: None,
+        }
+    }
+
+    #[test]
+    fn live_scrollback_명령은_설정범위와_세대번호를_검증한다() {
+        for requested in [100, 999, 100_000] {
+            let command = RuntimeCommand::SetScrollbackLimit {
+                generation: 7,
+                requested,
+            };
+            assert!(validate_host_command(&command).is_ok());
+            let bytes = postcard::to_allocvec(&command).unwrap();
+            let decoded: RuntimeCommand = postcard::from_bytes(&bytes).unwrap();
+            assert_eq!(decoded, command);
+        }
+        for (generation, requested) in [(0, 100), (1, 0), (1, 99), (1, 100_001)] {
+            assert!(
+                validate_host_command(&RuntimeCommand::SetScrollbackLimit {
+                    generation,
+                    requested
+                })
+                .is_err()
+            );
         }
     }
 
@@ -1955,6 +2005,7 @@ mod tests {
                 "InspectUnattachedSessions",
                 "KillUnattachedSessions",
                 "RespawnArchivedAgent",
+                "SetScrollbackLimit",
             ]
         );
     }

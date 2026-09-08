@@ -1,9 +1,9 @@
-//! 에이전트(claude/codex) transcript(JSONL) 파서 — 세션 ID + 활동 상태(working/idle)를
+//! 에이전트(claude/codex/grok) transcript(JSONL) 파서 — 세션 ID + 활동 상태(working/idle)를
 //! 구조화 로그에서 파생한다(옵션2, cmux 참고). 화면 스크래핑(regex)은 TUI 문구/레이아웃에
 //! 의존해 불안정했다(#92/#93) — transcript는 구조화 로그라 정확하다.
 //!
-//! - 세션 ID: claude는 파일명, codex는 파일명 내 UUID. → 복원 시 native resume에 그대로 씀.
-//! - cwd: claude는 매 이벤트, codex는 session_meta(첫 줄)에 기록 → pane 바인딩 앵커.
+//! - 세션 ID: claude/codex는 파일명, grok은 세션 디렉터리명. → native resume에 그대로 씀.
+//! - cwd: claude는 매 이벤트, codex는 session_meta, grok은 summary에 기록 → pane 바인딩 앵커.
 //! - 활동: 마지막 의미있는 이벤트로 working/idle 판정.
 //! - 작업 설명: 최신 agent 응답/진행 메시지를 한 줄로 축약해 사이드바에 표시.
 //! - 승인(needsInput)은 transcript에 없다 → regex fallback(status detector)이 담당.
@@ -848,6 +848,278 @@ pub fn parse_claude(path: &Path) -> Option<TranscriptState> {
 /// codex rollout(`~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl`) 파싱.
 /// 세션 ID는 파일명 내 UUID, cwd는 session_meta(첫 줄). 상태는 마지막 event_msg로:
 /// `task_complete`/`turn_aborted` → Idle, 그 외(task_started/agent_message 등) → Working.
+/// Grok 세션 파서 (1.0.13 실측, 2026-09-04). 경로는 `<sessionDir>/chat_history.jsonl`이고
+/// sessionDir 이름이 세션 id다. 모델·강도는 형제 `summary.json`의 `current_model_id`·
+/// `reasoning_effort`에서 읽는다 — argv 플래그가 없거나 세션 중 `/model`로 바꿔도 여기엔
+/// 남는다(2026-09-04 사용자: 세션 행에 강도가 안 보였다). 활동은 형제 `events.jsonl`의
+/// `turn_started`/`turn_ended`를 우선한다. assistant가 도구 호출 전에 기록되는 형식이라
+/// `turn_ended`가 없으면 완료로 추측하지 않는다.
+///
+/// 2026-09-01엔 `sessions/<cwd>/prompt_history.jsonl` 하나뿐이라 세션 단위 파일이 없다고
+/// 실측했는데, 지금 버전은 세션 디렉터리를 따로 만든다 — 그 측정은 더 이상 유효하지 않다.
+pub fn parse_grok(path: &Path) -> Option<TranscriptState> {
+    let session_dir = path.parent()?;
+    let session_id = session_dir.file_name()?.to_str()?.to_owned();
+    let summary = read_small_json(&session_dir.join("summary.json"), GROK_SUMMARY_MAX_BYTES);
+    let model = summary
+        .as_ref()
+        .and_then(|summary| summary.get("current_model_id"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .and_then(|value| bounded_owned(value, MAX_MODEL_BYTES));
+    let effort = summary
+        .as_ref()
+        .and_then(|summary| summary.get("reasoning_effort"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .and_then(|value| bounded_owned(value, MAX_EFFORT_BYTES));
+    let cwd = summary
+        .as_ref()
+        .and_then(|summary| summary.pointer("/info/cwd"))
+        .and_then(Value::as_str)
+        .and_then(bounded_path_owned);
+    let snapshot = tail_snapshot(path, TAIL_BYTES).ok()?;
+    let mut activity = None;
+    let mut last_agent_summary = None;
+    let mut user_instruction = None;
+    visit_grok_records(&snapshot, |_, value| {
+        match value.get("type").and_then(Value::as_str) {
+            Some("user") => {
+                let Some(summary) = grok_user_summary(&value) else {
+                    return;
+                };
+                activity = Some(AgentActivity::Working);
+                last_agent_summary = None;
+                user_instruction = Some(summary);
+            }
+            Some("assistant") => {
+                // 최신 Grok은 events의 턴 경계가 우선이다. events가 없는 구버전에서는
+                // tool_calls가 있는 중간 응답만 Working, 최종 본문은 Idle로 본다.
+                activity = Some(
+                    if value
+                        .get("tool_calls")
+                        .and_then(Value::as_array)
+                        .is_some_and(|calls| !calls.is_empty())
+                    {
+                        AgentActivity::Working
+                    } else {
+                        AgentActivity::Idle
+                    },
+                );
+                if let Some(summary) = value
+                    .get("content")
+                    .and_then(message_content_summary)
+                    .and_then(|text| clean_agent_summary(&text))
+                {
+                    last_agent_summary = Some(summary);
+                }
+            }
+            Some("reasoning" | "tool_result" | "backend_tool_call") => {
+                activity = Some(AgentActivity::Working);
+            }
+            _ => {}
+        }
+    })?;
+    let activity = grok_event_activity(session_dir)
+        .or(activity)
+        .unwrap_or(AgentActivity::Idle);
+    let mut recent_turns = grok_recent_turns(&snapshot)?;
+    if recent_turns.is_empty()
+        && snapshot.base_offset != 0
+        && let Ok(deep_snapshot) = tail_snapshot(path, CONVERSATION_TAIL_BYTES)
+        && let Some(deep_turns) = grok_recent_turns(&deep_snapshot)
+        && !deep_turns.is_empty()
+    {
+        user_instruction = deep_turns
+            .first()
+            .map(|turn| turn.instruction.clone())
+            .or(user_instruction);
+        recent_turns = deep_turns;
+    }
+    if let Some(current) = recent_turns.first_mut() {
+        current.activity = activity;
+    }
+    Some(TranscriptState {
+        session_id,
+        cwd,
+        activity,
+        model,
+        effort,
+        context_pct: None,
+        last_agent_summary,
+        user_instruction,
+        recent_turns,
+    })
+}
+
+/// `summary.json`은 몇백 바이트다 — 그 이상이면 우리가 아는 파일이 아니다.
+const GROK_SUMMARY_MAX_BYTES: u64 = 64 * 1024;
+
+/// 열린 일반 파일의 고정 snapshot만 읽는다. symlink·교체·증가와 상한 초과는 `None`.
+pub(crate) fn read_small_json(path: &Path, max_bytes: u64) -> Option<Value> {
+    let (mut file, snapshot_len) = open_regular_file(path).ok()?;
+    if snapshot_len > max_bytes {
+        return None;
+    }
+    let retained = usize::try_from(snapshot_len).ok()?;
+    let mut bytes = vec![0_u8; retained];
+    file.read_exact(&mut bytes).ok()?;
+    if file.metadata().ok()?.len() != snapshot_len {
+        return None;
+    }
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Grok은 정상적인 `tool_result` 한 줄이 64KiB를 넘길 수 있다. 전체 snapshot과 줄 수는
+/// 계속 유계로 두되, 큰 개별 레코드는 JSON materialize 전에 건너뛴다. 사용자 지시·응답도
+/// 같은 상한을 적용하므로 표시/저장 payload가 커지지 않는다.
+fn visit_grok_records(snapshot: &TailSnapshot, mut visit: impl FnMut(u64, Value)) -> Option<()> {
+    for (index, (offset, line)) in snapshot_lines(snapshot).enumerate() {
+        if index >= MAX_TAIL_LINES {
+            return None;
+        }
+        if line.len() > MAX_TRANSCRIPT_LINE_BYTES {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<Value>(line) {
+            visit(offset, value);
+        }
+    }
+    Some(())
+}
+
+fn grok_query_body(text: &str) -> Option<&str> {
+    let start = text.find("<user_query>")? + "<user_query>".len();
+    let rest = text.get(start..)?;
+    let end = rest.find("</user_query>")?;
+    let query = rest.get(..end)?.trim();
+    (!query.is_empty()).then_some(query)
+}
+
+fn grok_harness_text(text: &str) -> bool {
+    let text = text.trim_start();
+    is_noise_prefix(text)
+        || text.starts_with("<user_info")
+        || text.starts_with("<image_files")
+        || text.starts_with("This session is being continued from a previous conversation")
+}
+
+/// Grok은 실제 사용자 요청과 하네스 제어 메시지를 모두 `type: user`로 쓴다. 명시적인
+/// `<user_query>`는 태그 안쪽만 반환하고, synthetic 레코드는 interjection 안의 실제
+/// query를 제외하고 모두 버린다. 예전 CLI의 태그 없는 사용자 본문도 유계로 보존한다.
+fn grok_user_text(value: &Value) -> Option<String> {
+    let synthetic = value.get("synthetic_reason").and_then(Value::as_str);
+    if synthetic.is_some() && synthetic != Some("interjection") {
+        return None;
+    }
+    let content = value.get("content")?;
+    let mut plain = String::new();
+    let mut append = |text: &str| -> Option<Option<String>> {
+        if let Some(query) = grok_query_body(text) {
+            return Some(Some(bounded_owned(query, MAX_TRANSCRIPT_LINE_BYTES)?));
+        }
+        if synthetic == Some("interjection") || grok_harness_text(text) {
+            return Some(None);
+        }
+        let text = text.trim();
+        if text.is_empty() {
+            return Some(None);
+        }
+        let extra = usize::from(!plain.is_empty()).checked_add(text.len())?;
+        if plain.len().checked_add(extra)? > MAX_TRANSCRIPT_LINE_BYTES {
+            return None;
+        }
+        if !plain.is_empty() {
+            plain.push('\n');
+        }
+        plain.push_str(text);
+        Some(None)
+    };
+    if let Some(text) = content.as_str() {
+        if let Some(query) = append(text)? {
+            return Some(query);
+        }
+    } else {
+        let items = content.as_array()?;
+        if items.len() > MAX_MESSAGE_CONTENT_ITEMS {
+            return None;
+        }
+        for item in items {
+            if item.get("type").and_then(Value::as_str) != Some("text") {
+                continue;
+            }
+            let Some(text) = item.get("text").and_then(Value::as_str) else {
+                continue;
+            };
+            if let Some(query) = append(text)? {
+                return Some(query);
+            }
+        }
+    }
+    (!plain.is_empty()).then_some(plain)
+}
+
+fn grok_user_summary(value: &Value) -> Option<String> {
+    grok_user_text(value).and_then(|text| clean_agent_summary(&text))
+}
+
+fn grok_event_activity(session_dir: &Path) -> Option<AgentActivity> {
+    let snapshot = tail_snapshot(&session_dir.join("events.jsonl"), TAIL_BYTES).ok()?;
+    validate_tail_text(&snapshot.text)?;
+    let mut activity = None;
+    for (_, line) in snapshot_lines(&snapshot) {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        activity = match value.get("type").and_then(Value::as_str) {
+            Some("turn_started" | "interjected") => Some(AgentActivity::Working),
+            Some("turn_ended") => Some(AgentActivity::Idle),
+            _ => activity,
+        };
+    }
+    activity
+}
+
+fn grok_recent_turns(snapshot: &TailSnapshot) -> Option<Vec<TranscriptTurn>> {
+    let mut turns = Vec::with_capacity(MAX_RECENT_TRANSCRIPT_TURNS);
+    let mut pending: Option<PendingTurn> = None;
+    visit_grok_records(snapshot, |source_offset, value| {
+        match value.get("type").and_then(Value::as_str) {
+            Some("user") => {
+                let Some(instruction) = grok_user_summary(&value) else {
+                    return;
+                };
+                complete_pending(&mut turns, &mut pending);
+                pending = Some(PendingTurn::new(
+                    "grok",
+                    source_offset,
+                    instruction,
+                    snapshot.modified_at,
+                    None,
+                ));
+            }
+            Some("assistant") => {
+                let Some(turn) = pending.as_mut() else {
+                    return;
+                };
+                if let Some(summary) = value.get("content").and_then(message_content_summary) {
+                    turn.push_message(TurnRole::Assistant, summary.clone(), None);
+                    turn.agent_summary = Some(summary);
+                }
+                turn.activity = AgentActivity::Working;
+            }
+            Some("reasoning" | "tool_result" | "backend_tool_call") => {
+                if let Some(turn) = pending.as_mut() {
+                    turn.activity = AgentActivity::Working;
+                }
+            }
+            _ => {}
+        }
+    })?;
+    finish_recent_turns(&mut turns, pending);
+    Some(turns)
+}
+
 /// Kimi `wire.jsonl` 파서 (0.34.0 실측).
 ///
 /// Claude/Codex와 달리 레코드가 **명시적 타입 태그**를 달고 있어 추측할 게 없다:
@@ -1089,35 +1361,6 @@ mod kimi_tests {
     }
 
     #[test]
-    fn parse_grok은_summary와_마지막_레코드로_상태를_만든다() {
-        let dir = temp_root("grok-red").join("01a06c06-0a9e-7ed1-bae5-908c9b49ee97");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("summary.json"),
-            r#"{"info":{"cwd":"/Users/jr/work"},"current_model_id":"grok-4.6","reasoning_effort":"xhigh"}"#,
-        )
-        .unwrap();
-        let path = dir.join("chat_history.jsonl");
-        std::fs::write(
-            &path,
-            concat!(
-                r#"{"type":"user","content":[{"type":"text","text":"수정해"}]}"#,
-                "\n",
-                r#"{"type":"assistant","content":"완료"}"#,
-                "\n"
-            ),
-        )
-        .unwrap();
-
-        let state = parse_grok(&path).expect("Grok transcript를 파싱해야 한다");
-        assert_eq!(state.model.as_deref(), Some("grok-4.6"));
-        assert_eq!(state.effort.as_deref(), Some("xhigh"));
-        assert_eq!(state.activity, AgentActivity::Idle);
-        assert_eq!(state.user_instruction.as_deref(), Some("수정해"));
-        assert_eq!(state.last_agent_summary.as_deref(), Some("완료"));
-    }
-
-    #[test]
     fn kimi_transcript에서_모델_강도_활동_컨텍스트를_읽는다() {
         let path = fixture(
             "full",
@@ -1321,6 +1564,254 @@ mod kimi_tests {
                 }
             }
         }
+    }
+
+    /// Grok `summary.json` + `chat_history.jsonl` fixture(2026-09-04 실측 모양). 강도·모델은
+    /// summary에서, 활동은 `events.jsonl`의 턴 경계에서 판정한다. 하네스가 주입한 사용자
+    /// 레코드는 버리고 실제 `<user_query>` 본문만 남긴다.
+    #[test]
+    fn parse_grok은_summary와_마지막_레코드로_상태를_만든다() {
+        let dir = temp_root("grok-parse").join("01a06c06-0a9e-7ed1-bae5-908c9b49ee97");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("summary.json"),
+            r#"{"info":{"id":"01a06c06-0a9e-7ed1-bae5-908c9b49ee97","cwd":"/Users/jr/Desktop/projects/colon35/Design"},"current_model_id":"grok-4.6","reasoning_effort":"xhigh"}"#,
+        )
+        .unwrap();
+        let path = dir.join("chat_history.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(file, r#"{{"type":"system","content":"sys"}}"#).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"user","synthetic_reason":"system_reminder","content":[{{"type":"text","text":"<system-reminder>내부 지시</system-reminder>"}}]}}"#
+        )
+        .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"user","content":[{{"type":"text","text":"<user_info>OS Version: macos</user_info>"}}]}}"#
+        )
+        .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"user","content":[{{"type":"text","text":"<user_query>\n매거진 디자인이 별도로 있어?\n</user_query>"}}]}}"#
+        )
+        .unwrap();
+        writeln!(file, r#"{{"type":"reasoning","content":"..."}}"#).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"assistant","content":"별도 매거진 디자인은 없습니다."}}"#
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("events.jsonl"),
+            concat!(
+                "{\"type\":\"turn_started\",\"ts\":\"2026-09-08T01:00:00Z\"}\n",
+                "{\"type\":\"turn_ended\",\"outcome\":\"completed\",\"ts\":\"2026-09-08T01:01:00Z\"}\n",
+            ),
+        )
+        .unwrap();
+
+        let state = parse_grok(&path).expect("파싱돼야 한다");
+        assert_eq!(state.session_id, "01a06c06-0a9e-7ed1-bae5-908c9b49ee97");
+        assert_eq!(
+            state.cwd.as_deref(),
+            Some("/Users/jr/Desktop/projects/colon35/Design")
+        );
+        assert_eq!(state.model.as_deref(), Some("grok-4.6"));
+        assert_eq!(state.effort.as_deref(), Some("xhigh"));
+        assert_eq!(state.activity, AgentActivity::Idle, "assistant로 끝났다");
+        assert_eq!(
+            state.user_instruction.as_deref(),
+            Some("매거진 디자인이 별도로 있어?"),
+            "system-reminder는 걸러진다"
+        );
+        assert!(state.last_agent_summary.is_some());
+        assert_eq!(state.recent_turns.len(), 1);
+        assert_eq!(
+            state.recent_turns[0].instruction,
+            "매거진 디자인이 별도로 있어?"
+        );
+        assert_eq!(state.recent_turns[0].activity, AgentActivity::Idle);
+
+        let conversation = read_conversation(&path, agent_detect::AgentKind::Grok)
+            .expect("Grok 원문 대화도 읽혀야 한다");
+        assert_eq!(conversation.messages.len(), 2, "하네스 레코드는 제외한다");
+        assert_eq!(conversation.messages[0].role, ConversationRole::User);
+        assert_eq!(
+            conversation.messages[0].text,
+            "매거진 디자인이 별도로 있어?"
+        );
+        assert_eq!(conversation.messages[1].role, ConversationRole::Assistant);
+        assert_eq!(
+            conversation.messages[1].text,
+            "별도 매거진 디자인은 없습니다."
+        );
+
+        // 사용자 턴이 마지막이면 일하는 중이다.
+        writeln!(
+            file,
+            r#"{{"type":"user","content":[{{"type":"text","text":"<user_query>고마워</user_query>"}}]}}"#
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("events.jsonl"),
+            r#"{"type":"turn_started","ts":"2026-09-08T01:02:00Z"}
+"#,
+        )
+        .unwrap();
+        let state = parse_grok(&path).expect("파싱돼야 한다");
+        assert_eq!(state.activity, AgentActivity::Working);
+        assert_eq!(state.user_instruction.as_deref(), Some("고마워"));
+        assert_eq!(state.recent_turns[0].instruction, "고마워");
+        assert_eq!(state.recent_turns[0].activity, AgentActivity::Working);
+
+        // summary는 보조 메타데이터다. 없어도 JSONL의 세션·활동·본문은 살린다.
+        std::fs::remove_file(dir.join("summary.json")).unwrap();
+        let state = parse_grok(&path).expect("summary 없이도 대화는 파싱돼야 한다");
+        assert_eq!(state.model, None);
+        assert_eq!(state.effort, None);
+        assert_eq!(state.cwd, None);
+        assert_eq!(state.user_instruction.as_deref(), Some("고마워"));
+        std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn grok은_중간_assistant를_turn_end_전까지_working으로_유지한다() {
+        let dir = temp_root("grok-progress").join("01a06c06-0a9e-7ed1-bae5-908c9b49ee98");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("chat_history.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"<user_query>수정해</user_query>\"}]}\n",
+                "{\"type\":\"assistant\",\"content\":\"파일을 확인하겠습니다.\"}\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("events.jsonl"),
+            concat!(
+                "{\"type\":\"turn_started\"}\n",
+                "{\"type\":\"tool_started\"}\n",
+            ),
+        )
+        .unwrap();
+
+        let state = parse_grok(&path).expect("중간 응답도 파싱돼야 한다");
+        assert_eq!(state.activity, AgentActivity::Working);
+        assert_eq!(state.recent_turns[0].activity, AgentActivity::Working);
+
+        std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn grok은_큰_tool_result를_건너뛰고_먼_사용자_지시를_복원한다() {
+        let dir = temp_root("grok-large-tool").join("01a06c06-0a9e-7ed1-bae5-908c9b49ee99");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("chat_history.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"user","content":[{{"type":"text","text":"<user_query>긴 작업도 기억해</user_query>"}}]}}"#
+        )
+        .unwrap();
+        writeln!(file, r#"{{"type":"assistant","content":"처리 중"}}"#).unwrap();
+        for bytes in [70_000, 60_000, 60_000, 60_000, 60_000] {
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({"type": "tool_result", "content": "x".repeat(bytes)})
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            dir.join("events.jsonl"),
+            r#"{"type":"turn_ended","outcome":"completed"}
+"#,
+        )
+        .unwrap();
+
+        let state = parse_grok(&path).expect("큰 도구 결과가 세션 전체를 지우면 안 된다");
+        assert_eq!(state.activity, AgentActivity::Idle);
+        assert_eq!(state.user_instruction.as_deref(), Some("긴 작업도 기억해"));
+        assert_eq!(state.recent_turns.len(), 1);
+        assert_eq!(state.recent_turns[0].instruction, "긴 작업도 기억해");
+
+        std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn grok_summary의_과대_model과_effort는_필드만_버린다() {
+        let dir = temp_root("grok-metadata-bound").join("01a06c06-0a9e-7ed1-bae5-908c9b49ee9a");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("chat_history.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"type":"user","content":[{"type":"text","text":"계속"}]}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("summary.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "current_model_id": "m".repeat(MAX_MODEL_BYTES + 1),
+                "reasoning_effort": "e".repeat(MAX_EFFORT_BYTES + 1),
+                "info": {"cwd": "/tmp"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let state = parse_grok(&path).expect("본문은 보존해야 한다");
+        assert_eq!(state.model, None);
+        assert_eq!(state.effort, None);
+        assert_eq!(state.cwd.as_deref(), Some("/tmp"));
+        assert_eq!(state.user_instruction.as_deref(), Some("계속"));
+
+        std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn grok_user는_하네스_레코드를_버리고_query만_푼다() {
+        let synthetic: Value = serde_json::from_str(
+            r#"{"type":"user","synthetic_reason":"compaction_meta","content":[{"type":"text","text":"This session is being continued from a previous conversation"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(grok_user_text(&synthetic), None);
+
+        let interjection: Value = serde_json::from_str(
+            r#"{"type":"user","synthetic_reason":"interjection","content":[{"type":"text","text":"The user sent a message while you were working:\n<user_query>계속 진행해</user_query>"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            grok_user_text(&interjection).as_deref(),
+            Some("계속 진행해")
+        );
+
+        let info: Value = serde_json::from_str(
+            r#"{"type":"user","content":[{"type":"text","text":"<user_info>OS Version: macos</user_info>"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(grok_user_text(&info), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grok_summary는_symlink와_상한초과를_거부한다() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_root("grok-summary-bound");
+        std::fs::create_dir_all(&dir).unwrap();
+        let oversized = dir.join("oversized.json");
+        std::fs::write(&oversized, vec![b'x'; GROK_SUMMARY_MAX_BYTES as usize + 1]).unwrap();
+        assert!(read_small_json(&oversized, GROK_SUMMARY_MAX_BYTES).is_none());
+
+        let target = dir.join("target.json");
+        let link = dir.join("link.json");
+        std::fs::write(&target, b"{}").unwrap();
+        symlink(&target, &link).unwrap();
+        assert!(read_small_json(&link, GROK_SUMMARY_MAX_BYTES).is_none());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// 경로 모양이 다르면 세션 id를 못 만든다 — 엉뚱한 id로 바인딩하면 안 된다.
@@ -1839,6 +2330,29 @@ fn codex_conversation_messages(snapshot: &TailSnapshot, builder: &mut Conversati
 /// kimi `wire.jsonl`에서 user/assistant 메시지만 뽑는다. `turn.prompt`가 사용자,
 /// `context.append_message`가 에이전트다 — hook_result/system 기원과 user role은 버린다
 /// (`kimi_recent_turns`와 같은 판정).
+/// Grok `chat_history.jsonl`의 대화 — `user`(text 항목 배열, 하네스가 넣은 system-reminder
+/// 는 걸러냄)와 `assistant`(문자열)만. 시각 필드가 없어 `at`은 비운다(2026-09-04 실측).
+fn grok_conversation_messages(snapshot: &TailSnapshot, builder: &mut ConversationBuilder) {
+    let _ = visit_grok_records(snapshot, |offset, value| {
+        match value.get("type").and_then(Value::as_str) {
+            Some("user") => {
+                if let Some(text) = grok_user_text(&value) {
+                    builder.push(ConversationRole::User, text, None, offset);
+                }
+            }
+            Some("assistant") => {
+                let Some(content) = value.get("content") else {
+                    return;
+                };
+                if let Some(text) = conversation_content_text(content) {
+                    builder.push(ConversationRole::Assistant, text, None, offset);
+                }
+            }
+            _ => {}
+        }
+    });
+}
+
 fn kimi_conversation_messages(snapshot: &TailSnapshot, builder: &mut ConversationBuilder) {
     for (offset, line) in snapshot_lines(snapshot) {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
@@ -1907,6 +2421,7 @@ pub fn read_conversation(
         agent_detect::AgentKind::Claude => claude_conversation_messages(&snapshot, &mut builder),
         agent_detect::AgentKind::Codex => codex_conversation_messages(&snapshot, &mut builder),
         agent_detect::AgentKind::Kimi => kimi_conversation_messages(&snapshot, &mut builder),
+        agent_detect::AgentKind::Grok => grok_conversation_messages(&snapshot, &mut builder),
     }
     let (messages, truncated) = builder.finish();
     Ok(TranscriptConversation {

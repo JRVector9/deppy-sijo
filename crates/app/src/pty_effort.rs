@@ -69,6 +69,9 @@ pub enum EffortBlocked {
     ///
     /// "사다리 끝" 변형은 없다 — 끝에서 순환하므로 막힐 일이 없다.
     UnknownCurrentEffort,
+    /// 이 provider에는 강도/모델을 옮기는 알려진 경로가 없다. `supports*`가 UI를 먼저
+    /// 막지만, 계약을 함수 자신이 지키게 하려고 값으로도 남긴다.
+    Unsupported,
 }
 
 /// Claude `/effort`가 받는 단계. `agent_launcher::CLAUDE_EFFORTS`와 같은 순서다.
@@ -163,6 +166,10 @@ pub fn plan(
                 level,
             })
         }
+        // Grok CLI는 강도를 기동 인자(`--reasoning-effort`)로 받는다. 세션 도중 옮기는
+        // 슬래시 명령이나 키맵 액션은 실측으로 확인된 것이 없어, 짐작해서 프롬프트를
+        // 흘려보내지 않는다(Codex `/model`이 토큰만 태웠던 것과 같은 이유).
+        AgentProvider::Grok => Err(EffortBlocked::Unsupported),
     }
 }
 
@@ -173,6 +180,8 @@ pub const fn supports(provider: AgentProvider) -> bool {
         // 2026-08-09 실측: `/thinking <level>`이 인자를 받고 즉시 반영된다. transcript에
         // `{"type":"config.update","thinkingEffort":"max"}`가 남는 것으로 확인했다.
         AgentProvider::Kimi => true,
+        // 위 `plan`의 주석 참고 — 기동 인자로만 정해진다.
+        AgentProvider::Grok => false,
     }
 }
 
@@ -191,7 +200,7 @@ const CLAUDE_MODEL_LADDER: &[&str] = &["sonnet", "opus", "fable"];
 pub const fn supports_model(provider: AgentProvider) -> bool {
     match provider {
         AgentProvider::Claude => true,
-        AgentProvider::Codex | AgentProvider::Kimi => false,
+        AgentProvider::Codex | AgentProvider::Kimi | AgentProvider::Grok => false,
     }
 }
 

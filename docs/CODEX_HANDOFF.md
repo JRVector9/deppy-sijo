@@ -2409,3 +2409,32 @@
 - 새 `feat/relay-shell-main-clean`은 #161 exact6ee7eb4에서 생성했다. updated #162의65d807e를 squash 이관한 source commit ab0dbfc는 그 최종 tree와 전체 diff가 비어 있다. `git merge-base HEAD ce930906`은6ee7eb4이며 `git merge-base --is-ancestor ce930906 HEAD`는 exit1, 추가 이력은 새 source commit 하나뿐이다.
 - 새 Ready PR https://github.com/JRVector9/deppy-sijo/pull/168 , base feat/relay-reconnect-core-main. source head ab0dbfc의 GitGuardian SUCCESS를 직접 확인했다. 새 worktree golden1 PASS(`/private/tmp/deppy-relay-shell-clean-fixture.log`), 나머지 gate는 동일 tree의 #162 실행 증거를 그대로 구분해 기록한다.
 - 다음: 이 최종 clean shell 위에 `feat/relay-app-adapter-main-clean`을 만들고 adapter-only8dae223/5452873/fbb807f를 이관한다. 새 두 PR GitGuardian 성공 후 old162/163을 대체 링크와 함께 close하되 branch는 보존한다. Actions billing/spending과 DNS/TLS/배포/실기기/soak BLOCKED 유지.
+
+## 2026-09-08 Relay local runner 독립 이관
+- 목표: #168 exact850b7a8 위 `/private/tmp/deppy-relay-local-runner-main-20260908`, branch dev/relay-local-runner-main, PR base feat/relay-shell-main-clean. #146 runner 필요한 기능만 재구현하며 #169에 의존하지 않음.
+- 완료: 원본/AGENTS/CLAUDE/기존 shell build 조사, 작성 계획. shellcheck 설치 확인. 코드 및 tests 아직 작성 전.
+- 설계: env 데이터 파싱/0600/no-follow, private0700 상태, PID+start+nonce identity supervisor, 소유한 child만 cleanup, Tailscale port 소유권 확인, app 명시 옵션 및 기존 앱 무종료.
+- 다음: 순수/임시fixture RED→GREEN, shellcheck/sh/Python/boundary/fmt/diff, 실제CLI리뷰, 문서/일지/commit/push/ReadyPR. 실제 앱/Tailscale/DNS/TLS/배포는 미실행이며 외부검증BLOCKED.
+
+### Relay runner RED→GREEN 및 fixture 보완
+- 순수 env/0600/host·port·path/nonce identity4 tests에서 실제 RED, private 생성/위조PID/실제 자체supervisor 종료3 tests RED를 확인하고 GREEN7로 전환했다. 로그 `/private/tmp/deppy-relay-runner-red.log`, `...-lifecycle-red.log`, `...-lifecycle-green.log`. 최초 env stub의 ValueError는 정리 후 assertion RED로 재실행했다.
+- 재실행 자산 디렉터리, child에 상속된 signal mask(종료3초), 빌드 KeyboardInterrupt cleanup, 기존env주석 호환 문제를 각각 regression RED로 확인하고 보완했다. 현재 계약14 tests PASS(`/private/tmp/deppy-relay-runner-full.log`). 기존 한글 주석은 데이터로 무시하고 key/hex는 엄격 검증한다. app 명령은 실제/fixture에서도 실행하지 않았으며 AST로 opt-in/무종료 정책만 확인했다.
+- fixture는 실제 임시 supervisor/무관 sleep 프로세스 보존을 실행하며 fake build/serve 응답으로 partial serve 실패 cleanup을 검증한다. 외부 Tailscale/실제 relay cargo build/실제앱/DNS/TLS/배포는 실행하지 않았다. 외부조건 자격 부재로 BLOCKED이다. shellcheck와 sh -n 및 diff PASS.
+- 수정파일: scripts/relay-dev.sh(embeddedPython 표준라이브러리), scripts/tests/test_relay_dev.py, .gitignore, 계획/handoff. 다음: boundary/fmt/CLI 리뷰 후 확정finding 수정·재검증/일지/commit/push/stackedReadyPR.
+
+### Relay runner CLI 리뷰 보완
+- 표준 codex review --uncommitted는 실제 source/다른ref를 읽었지만300초 내 결론이 없어 정확process group76277을 종료했다. 완료 리뷰 PASS로 세지 않는다. 실제소스 제한CLI(PID81370)는 P1 2개/P2 3개를 확인했다.
+- 리뷰 지적5개와 interrupt회귀 총6 failures를 `/private/tmp/deppy-relay-runner-review-red.log`에서 확인했다: 빌드 중 외부포트편입, serve성공/status실패 기록누락, 첫변경포트 뒤 다른자체포트잔존, 새tar중간실패로 기존자산유실, nonzero build의backgroundchild잔존, interruptedbuildgroup정리.
+- 구현: 적용직전 포트재검사, 적용전 expected+pending journal, port별오류수집/나머지cleanup, staging완전검증후이전디렉터리복구가능교체, waitid(WNOWAIT)로leaderPID를회수하기전에자체group정리. macOS 종료zombie group SIGKILL은EPERM을줄수있음을직접확인했고성공으로숨기지않고RunnerError로전달한다.
+- 추가 local review: PID JSON 공개구간은5초유계재시도, 기존serve journal을새up이덮어쓰지않도록 차단. 별도RED(`/private/tmp/deppy-relay-runner-publication-red.log`)후22 tests 재검증 중(`/private/tmp/deppy-relay-runner-full.log`): 새 mock identity의 /var→/private/var 정규화 불일치를 고친 뒤 결과를 확정한다. 원본env주석한글호환/CLI env의secret및prefix비출력도fixture로검증했다.
+- 외부 Tailscale CLI는원자CAS를제공한다고가정하지않는다. 전용포트와적용직전/후정확설정비교를사용하며unknownschema/외부동시변경은pending으로보존한다. 실서비스/TLS검증은여전히BLOCKED. 다음: 최신source좁은재리뷰/게이트확정/일지/commit/push/ReadyPR.
+
+### Relay runner 준비상태 후속 리뷰 보완
+- 첫 좁은 재리뷰가 기존5개수정은수용했지만 PID만있고서버child가종료/미바인딩이어도up완료될수있는P1을확인했다. 실제fixturechild종료/미바인딩2RED(`/private/tmp/deppy-relay-runner-ready-red.log`)와다른PIDlistener오인1RED(`...-listener-red.log`)후 childPID+birth/command, 해당child의lsof LISTEN, loopback연결, 성공출력직전재확인을추가했다.
+- 최종25 tests PASS(`/private/tmp/deppy-relay-runner-full.log`,1.748초). 앞22회귀의mock /var와/private/var 경로정규화오류는fixture를수정하고실제22PASS를확인한뒤진행했다. shellcheck/sh-n/boundary/fmt/diff도최신source에서실행했다.
+- 최종 readiness 수정만 CLI 제한재리뷰 PID99571(180초 상한)중이다. 외부Tailscale/DNS/TLS/실앱/배포검증은여전히BLOCKED. 사용법/보안경계는 docs/relay-local-runner.md에정리했다. 남은작업: 최종리뷰결론→일지/커밋/push/ReadyPR/checks.
+
+### Relay runner 최종 재리뷰 완료
+- readiness 수정 최종 제한CLI는exit0, 신뢰80%이상확정P1/P2없음으로종료(`/private/tmp/deppy-relay-runner-review-ready-final.txt`). 앞5개리뷰finding도첫재리뷰에서추가지적없이수용됐고후속readiness까지해결했다.
+- 현재25fixture/shellcheck/sh-n/boundary/fmt/diff PASS. 실제앱명령/build/relaunch및TS/DNS/TLS/배포는실행하지않았으며외부검증BLOCKED.
+- 남은작업은한국어커밋과일반push, `gh pr create --base feat/relay-shell-main-clean --head dev/relay-local-runner-main --body-file /private/tmp/deppy-relay-runner-pr.md`, finalHEAD/CI annotations/clean확인과일지확정이다.

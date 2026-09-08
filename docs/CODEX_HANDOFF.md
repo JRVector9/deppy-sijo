@@ -2422,3 +2422,8 @@
 - R3 epoch 최종 focused storage22/app41 PASS. 최종 전체 app/storage/web2774 PASS·21 ignored, strict Clippy/fmt/boundary/diff 및 제외 파일 경계 PASS(exit0). 신규 epoch 이후 전체를 다시 실행했다. i18n8 PASS는 카탈로그 변경 뒤 실행된 결과다. 첫 epoch 재리뷰는 경로 배열 조회 오류와 도구예산 소진으로 BLOCKED였으므로 성공으로 세지 않고 명시 경로로 재실행 중(exec51496). 계약 문서 docs/relay-app-adapter-main.md에 legacy backfill 보존/R3·R4 Keychain 경계를 기록했다.
 
 - R3 좁은 epoch Codex 재리뷰가 지정5경로를 실제 읽은 후 CLEAN으로 종료했다. HIGH1건은 실제 RED3개→epoch 수정→GREEN 및 전체 재검증으로 해소했다. 제품커밋·stacked PR 게시 단계다. 다음: git push -u origin feat/relay-app-adapter-main; gh pr create --base feat/relay-shell-main --head feat/relay-app-adapter-main --body-file /private/tmp/deppy-relay-app-adapter-pr-body.md. 이후 R4 최신main 독립 lazy Keychain 계획/RED부터 진행한다.
+
+## 2026-09-08 R3 게시 완료
+
+- PR https://github.com/JRVector9/deppy-sijo/pull/163, base feat/relay-shell-main, 제품 HEAD54528735760afa4c3bf6ad4fe1606ef641c6298a. GitGuardian SUCCESS. Actions6개는 run34214191542/34214191585의 runner_id0·steps[] FAILURE로 실제 미실행이며 PASS가 아니다. 제품게이트2774 PASS·21ignored와 구분한다.
+- 이 checkpoint는 문서만 추가한다. Obsidian Relay 앱 어댑터 stacked 이관 일지 작성 완료. 다음 작업 R4는 git fetch origin으로 확인한 최신main45e66cc 기준 별도 fix/keychain-startup-lazy worktree에서 계획부터 시작한다. R1→R2→R3 merge는 부모 lane에 남기며 이 lane은 merge하지 않았다.

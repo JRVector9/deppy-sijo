@@ -89,7 +89,7 @@ git diff --exit-code origin/feat/relay-shell-main -- crates/secret crates/termin
 ### Task 4: handoff·일지·stacked 게시
 
 - [x] **Step 1: 실제 결과/실패 접근/수정/외부BLOCKED를 기록한다.** 다른 lane handoff는 보존한다. GitGuardian R2 공개 fixture 상태를 제품secret과 구분한다.
-- [ ] **Step 2: 한국어 commit/push/R2 base PR을 게시한다.**
+- [x] **Step 2: 한국어 commit/push/R2 base PR을 게시한다.**
 
 ```sh
 git diff --name-only

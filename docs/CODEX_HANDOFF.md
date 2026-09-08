@@ -2598,3 +2598,50 @@
 ### PR E 기반 갱신 및 구현 재개
 - 부모가확정한D exactHEAD `9af1b807e89202a4c45626259af3687a7e229a7a`를 일반merge했다. Session 테스트 삽입과handoff append충돌은양쪽회귀/기록을모두보존해해결했다. #160 스트리밍reflow는D에서인수하며중복수정하지않는다.
 - E RED scaffold는047cf8a로보존했으며queue수락1개/Session실제크기·invalid2개RED증거는유효하다. 이제checkedresize구현과typedwire로GREEN진행한다. 아직E gatePASS가아니다.
+
+### PR E Session 실제 적용 GREEN
+- `grid_dimensions`는 Alacritty의 실제 Term 크기/Ghostty render snapshot의 메타데이터만 읽는다. 셀 Vec를 만들지 않는다. Session checked resize는 invalid/backend/PTY/dimensions/mismatch를 구분하고 일부 실패에도 full dirty/cache class 재적용을 보존한다. legacy resize wrapper는 유지했다.
+- PTY 실패 fake 회귀도 추가해stub의Dimensions와기대Pty가다른RED를실제확인했다(`/private/tmp/deppy-resize-session-pty-red.log`). 실제구현후session focused3 PASS(`/private/tmp/deppy-resize-session-green.log`,exit0). Ghostty feature의네이티브컴파일은아직검증하지않았다.
+- 다음단계: runtime 최신요청/실제stamp 판정RED→wire append-only14 및worker연결. UI admission은아직RED다.
+
+### PR E worker/wire 중간 GREEN 및 owner 설계 교정
+- runtime ResizeToken/Stamp/Failure 및 append-only ResizeTracked/ResizeApplied/ResizeFailed/ViewportTracked와v14 선언을추가했다. 실제worker 적용후ACK/멱등retry, 최신값slotstamp,backend교체/legacyresize의proof무효화를연결했다. remote는plain/stampedkeyframe/delta와baseline stamp를보존하며stamp변경이면keyframe,불일치delta는유계재동기화다.
+- transient backend/PTY/dimensions 실패는같은token으로유계재적용가능하고성공만멱등replay한다. partialfailure RED후GREEN. 부모리뷰의이전owner복귀를막기위해처음16개retired배열을시도했으나장수명재접속을막는다는지적을받아폐기했다. 현재는O(1) owner_epoch CAS: 같은owner/epoch는generation,다른owner는정확히current+1만전환,이전epoch거부,overflow fail-closed.100회전환/경쟁owner/이전epoch RED→GREEN.
+- 실제검증: Session checked3 PASS; runtime tracked_resize8 PASS(`/private/tmp/deppy-resize-worker-green.log`5개, `/private/tmp/deppy-resize-wire-focused.log`8개). 최초worker stub은ACK없음으로실제2초RED(`/private/tmp/deppy-resize-worker-red.log`),ownerepoch100회는16개상한에서RED(`/private/tmp/deppy-resize-owner-epoch-red.log`).
+- 컴파일교정: test Worker literal의새필드누락,기존private mark_full_dirty의runtime 재발행API노출,remote테스트2tuple→3tuple2곳을수정했다. 이컴파일실패는RED증거로세지않았다.
+- 아직미완료: WorkspaceUi는새variant를수용하는adapter만붙인상태이며실제generation/fence/재시도연결은아직없다. UI admission회귀는여전히RED다. app전체/finalgate/review/PR은미완료. web-remote lib.rs의Viewport는현재testfixture뿐이므로불필요한파일수정없이dashboard 두production소비자만연결했다.
+- 다음: ui/workspace_resize.rs 순수상태기계RED→WorkspaceUi의queue/completion/fence/cleanup연결→wiregolden/remote전체→관련전체gate·boundedreview·일지·게시. 앱build/launch금지.
+
+### PR E Workspace 적용 세대 및 경합 GREEN
+- Task5 구현: App이 runtime UI 수명 UUID owner를 주입한다. SessionView는 요청/수락/실제 적용/검증 viewport를 구분하고 최신 목표 1개, 같은 token 2초 재확인 최대2회, 기존 Busy 유계 backoff를 유지한다. 실제 proof 전에는250ms deadline이 작동하지 않으며 기존 안정 화면/120ms debounce/IME 및 geometry 수치는 보존했다.
+- 독립 리뷰3건을 실제 RED→GREEN: admission에서 최종 표식/rollback 보존, A1→B2→A3의 이전 delivery failure 차단, 실패/재시도 소진 뒤 영구 fence 해제(`/private/tmp/deppy-resize-ui-races-red.log`3실패→`...-green.log`3PASS). rollback에 exact token을 추가해 큐 coalescing의 operation 재사용과 일치시켰다. actual matching viewport를 받아야 최종 표식을 해제한다.
+- 추가 회귀: Applied(B)→Viewport(A) 거부, 같은 크기 A→B→A 토큰 구분, runtime owner 교체, hidden 뒤 늦은 ACK/viewport 무효, split 동일 admitted 목표 보류, owner collision 최신epoch로 최대2회 회복. 실패 시 검증되지 않은 중간 후보는 버리고 마지막 stable snapshot을 유지한다.
+- 실제 테스트: Workspace 전체243PASS(`/private/tmp/deppy-resize-workspace-full2.log`,0.61초). 초기전체239PASS/4실패는 기존테스트의 queue수락=Applied 가정3건과실패시검증안된후보승격1건이었다. 해당계약을 실제ACK/안정화면보존으로교정해GREEN했다. compile단계testpattern token누락은컴파일오류로분리기록한다.
+- 현재 core 관련전체terminal/session/runtime/web-remote 검사 실행중(`/private/tmp/deppy-resize-core-full.log`). 코드전용Codex readonly리뷰 PID30354,300초상한(`/private/tmp/deppy-resize-review.log`,최종`...-final.txt`). 앱build/launch는실행하지않았으며화면PASS주장없음.
+- 남은 작업: core/app전체 결과교정→strict/fmt/boundary→CLI리뷰결과반영→docs/일지/Koreancommit/push/stackedPR(basefeat/scrollback-live-policy). 재시작시현재로그와gitdiff를먼저읽는다.
+
+### PR E 전체 gate 및 독립 리뷰 후속 보완
+- core 전체: runtime301PASS,Session63PASS,terminal91PASS/4ignored,web-remote270PASS/1ignored(`/private/tmp/deppy-resize-core-full2.log`). 첫 runtime전체299PASS/2실패는append-only source-order 기대목록갱신누락이었으며기존순서를그대로유지하고새끝variant만추가해GREEN했다. legacyResize/ShellSpawned/WireMsg.Event golden bytes와v12/v13 handshake거부회귀도포함한다. doc tests4crate각0PASS(`/private/tmp/deppy-resize-doc-tests.log`).
+- 부모HIGH: Presentable 뒤성공request가남아tokenless/foreign새epoch출력을막음→실제RED(`/private/tmp/deppy-resize-presentable-red.log`)후승격종료·watermark유지로수정. 부모MEDIUM:debounce가desired를미리덮어retry예산초기화실패/새externalactual뒤sent_sizes불변→2RED(`/private/tmp/deppy-resize-recovery-red.log`)후공통setter및sent_sizes무효화로수정.
+- 자체후속: 로컬큐거부가미수락request/fence를남김→RED(`/private/tmp/deppy-resize-local-queue-red.log`)후prepare prior상태복원. 더최신externalACK뒤oldquiet후보승격→RED(`/private/tmp/deppy-resize-candidate-red.log`)후이전후보/요청취소.
+- 부모splitfinal+localqueuefull지적→RED(`/private/tmp/deppy-resize-split-queue-red.log`). generation/desired/ownerretry/recovery까지완전히복원했다. 기존성공세션gen7에서도marker가사라지는더일반적인heuristic경로를추가RED(`/private/tmp/deppy-resize-split-existing-red.log`)로고정했고generation>0만보는일괄정리를삭제했다. 최종표식은실제timeout/failure/hidden/exit전환에서만정리한다.
+- 최신 app 전체2086PASS/14ignored(`/private/tmp/deppy-resize-app-gate2.log`,19.04초),관련5crate all-targets strictClippyPASS(`/private/tmp/deppy-resize-clippy-gate.log`,7.47초). 최종boundary/fmt/diff검사도실행했다. Git worktree변경은아직미커밋이다.
+- Ghostty optional API는설치된libghostty-vt0.2.1 terminal.rs의실제cols()/rows()로직접조회한다.RenderState.update는dirty를소비/할당할수있어사용하지않도록교정했다. nativeGhosttyfeature빌드/앱실행은수행하지않았다.
+- CLI리뷰1 PID30354와리뷰2 PID68107은각300초상한에서정확processgroup을종료했으며결론/PASS로취급하지않았다. 리뷰2는전체Rustdiff+신규resize.rs를직접입력했으나xhigh응답이완료되지않았다. 최신소스리뷰3은동일모델의medium reasoning으로전체diff를직접입력했고PID66661/240초상한(`/private/tmp/deppy-resize-review3.log`,최종`...-final.txt`)이다. 확정finding이오면RED/GREEN및좁은재리뷰후게시한다.
+
+### PR E optional Ghostty 및 최종 리뷰 상태
+- `CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-deps-target-20260907 cargo check -p terminal --locked --features ghostty-backend`를 실제 실행했다. `libghostty-vt-sys 0.2.1/build.rs:365`의 `failed to execute zig build: No such file or directory`로 실패했다(`/private/tmp/deppy-resize-ghostty-check.log`). Rust Ghostty 모듈 타입 검사 전 dependency build 단계가 막혔으므로 optional gate PASS가 아니다. 설치된 upstream terminal.rs:557/561의 `cols()/rows() -> Result<u16>` API와 현재 코드는 정적으로 일치한다.
+- workstep의 실제 명령 `codex --sandbox read-only -c model_reasoning_effort="medium" review --uncommitted`도 PID91139/300초 상한으로 시작했다(`/private/tmp/deppy-resize-codex-review-uncommitted.log`). 기존 CLI timeout을 성공한 리뷰로 대체하지 않는다.
+
+### PR E Codex 확정 P2 수정 및 최신 gate
+- 전체 source diff를 직접 전달한 CLI 리뷰3가 정상 결론을 반환했다(`/private/tmp/deppy-resize-review3-final.txt`). 확정 P2 1건: ACK 재확인 retry가 실제 host 수락 전에 횟수를 소비하고 retry completion을 추적하지 않아 queue pressure가 예산을 소진한다. 다른 actual ACK/CAS/stale/remote 범위에서는 확정 finding 없음이라고 보고했다.
+- P2를 실제 RED로 고정했다(`/private/tmp/deppy-resize-retry-admission-red.log`,횟수1 != 기대0). retry_pending에 operation/generation을 두고 token별 ack_retry rollback으로 초기 전달과 재확인을 구분했다. completion Ok에서만 횟수와 다음2초를 시작하고 로컬 큐 거부/Busy/DeliveryFailed는 기존 최대6회 backoff로 미래 시각을 예약한다. pending retry는 중복 enqueue하지 않고 stale completion은 최신 token을 건드리지 않는다.
+- 구현 중 확인한 queued retry→새 target coalesce의 initial/retry 구분도 실제 RED(`/private/tmp/deppy-resize-retry-coalesce-red.log`) 후 flag와 previous 크기를 함께 갱신했다. 최종 app 전체2089PASS/14ignored(`/private/tmp/deppy-resize-app-retry-gate.log`,16.51초). 최신 strict Clippy 재실행중이다.
+- workstep `codex review --uncommitted`도 실제 실행했으나 300초 결론 없이 정확 processgroup91139를 종료했다. 이 명령을 PASS 리뷰로 주장하지 않는다(`/private/tmp/deppy-resize-codex-review-uncommitted.log`). 완료된 전체소스CLI리뷰3의P2는위와같이수정했다.
+- 최신 retry 함수/flush/complete/coalesce/회귀만 전달한 좁은 readonly CLI 재리뷰 PID9457(240초상한), `/private/tmp/deppy-resize-review-narrow.log` 및 `...-final.txt`를 기다린다. 남은 것은 재리뷰 결론·최종strict/boundary/fmt/diff 기록 후 commit/push/stackedPR이다.
+
+### PR E 게시 직전 최종 검증 완료
+- 좁은 Codex CLI 재리뷰가 정상 종료하고 현재 retry/flush/complete/coalesce 및 회귀 범위의 남은 확정 P1/P2가 없다고 결론냈다(`/private/tmp/deppy-resize-review-narrow-final.txt`). 완료된 전체 source 리뷰3 → 확정 P2 실제 RED/GREEN → 좁은 재리뷰 순서를 마쳤다. 앞선 무응답 timeout은 별도의 실패 사실로 보존한다.
+- 최종 app 전체2089PASS/14ignored, 관련5crate all-targets strictClippyPASS(`/private/tmp/deppy-resize-clippy-reviewed.log`,9.13초), boundaryPASS(`/private/tmp/deppy-resize-boundary-reviewed.log`), fmt/diffPASS. runtime301/Session63/terminal91+4ignored/web-remote270+1ignored는 해당 core 최종 소스에서 실행한 전체 결과이며 이후 core 변경은 optional Ghostty 실제 getter 교정뿐이다. optional Ghostty는 Zig 부재로 검증되지 않았다.
+- 다음 명령: `git add crates/app/src/app.rs crates/app/src/ui/workspace.rs crates/runtime/src/command.rs crates/runtime/src/event.rs crates/runtime/src/in_process.rs crates/runtime/src/lib.rs crates/runtime/src/protocol.rs crates/runtime/src/remote.rs crates/runtime/src/resize.rs crates/session/src/session.rs crates/terminal/src/alacritty_backend.rs crates/terminal/src/ghostty_backend.rs crates/web-remote/src/dashboard.rs docs/CODEX_HANDOFF.md docs/superpowers/plans/2026-09-08-resize-applied-generation.md docs/superpowers/specs/2026-09-08-resize-applied-generation-design.md` → 한국어 commit → `git push -u origin fix/resize-applied-generation` → `/private/tmp/deppy-resize-pr-body.md`로 base=`feat/scrollback-live-policy` PR 생성.
+- 앱 GUI build/launch, rebase, force-push는 하지 않았다. PR SHA/URL 및 원격 CI 사실은 게시 후 바로 기록한다.

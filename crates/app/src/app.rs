@@ -13462,7 +13462,9 @@ impl App {
             dotenv_state: None,
             runtime,
             events: runtime_events,
-            workspace_ui: ui::workspace::WorkspaceUi::new(),
+            workspace_ui: ui::workspace::WorkspaceUi::with_resize_owner(
+                *uuid::Uuid::new_v4().as_bytes(),
+            ),
             restore_lifecycle: WorkspaceRestoreLifecycle::Idle,
             render_active: true,
             pending_events: Vec::new(),
@@ -31501,6 +31503,9 @@ fn event_session(event: &runtime::RuntimeEvent) -> Option<runtime::SessionId> {
         runtime::RuntimeEvent::ShellSpawned { session }
         | runtime::RuntimeEvent::AgentSpawned { session }
         | runtime::RuntimeEvent::Viewport { session, .. }
+        | runtime::RuntimeEvent::ViewportTracked { session, .. }
+        | runtime::RuntimeEvent::ResizeApplied { session, .. }
+        | runtime::RuntimeEvent::ResizeFailed { session, .. }
         | runtime::RuntimeEvent::SessionExited { session, .. }
         | runtime::RuntimeEvent::SessionStatusChanged { session, .. }
         | runtime::RuntimeEvent::PtyInputPressure { session, .. }
@@ -31560,7 +31565,9 @@ fn coalesce_mux_updated(events: &mut Vec<runtime::RuntimeEvent>) -> ReplayCompac
         if let runtime::RuntimeEvent::PtyInputPressure { session, .. } = e {
             latest_input_pressure_idx.insert(*session, i);
         }
-        if let runtime::RuntimeEvent::Viewport { session, .. } = e {
+        if let runtime::RuntimeEvent::Viewport { session, .. }
+        | runtime::RuntimeEvent::ViewportTracked { session, .. } = e
+        {
             latest_viewport_idx.insert(*session, i);
         }
     }
@@ -31582,7 +31589,8 @@ fn coalesce_mux_updated(events: &mut Vec<runtime::RuntimeEvent>) -> ReplayCompac
             runtime::RuntimeEvent::PtyInputPressure { session, .. } => {
                 latest_input_pressure_idx.get(session) == Some(&idx)
             }
-            runtime::RuntimeEvent::Viewport { session, .. } => {
+            runtime::RuntimeEvent::Viewport { session, .. }
+            | runtime::RuntimeEvent::ViewportTracked { session, .. } => {
                 latest_viewport_idx.get(session) == Some(&idx)
             }
             _ => true,

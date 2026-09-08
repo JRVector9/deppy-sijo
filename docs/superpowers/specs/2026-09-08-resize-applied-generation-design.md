@@ -33,3 +33,10 @@ v14로 기존 enum 뒤에만 variant를 추가한다. legacy Resize/Viewport와 
 ## 검증
 
 실제 RED 후 GREEN: admission≠Applied; A→B→A 및 승격 후 late B 거부; 같은 token 재시도 멱등/충돌; 실제 backend/PTY 실패; backend 교체 epoch; legacy bytes; plain+delta stamp 및 keyframe 전환; runtime/session 경계; hidden/exit cleanup; 기존 debounce/split/blank deadline. terminal/session/runtime/web-remote/app 관련 focused와 full relevant 검사, strict clippy, fmt, boundary, bounded Codex 코드 리뷰를 수행한다. 앱 재빌드/재실행 및 화면 PASS 주장은 금지한다.
+
+## 실행 중 확정한 계약 보완
+
+- 다른 owner는 정확히 현재 owner_epoch+1에서만 CAS 전환한다. 같은 owner/epoch는 generation으로 비교하고, 이전 owner epoch는 실제 backend 적용 전에 거부한다. O(1) 상태이며 100회 이상 정상 소유자 교체를 허용한다. 랜덤 nonce 대소 비교 및16개 retired owner 제한은 폐기했다.
+- Backend/PTY 일부 실패는 같은 token으로 다시 실제 적용한다. 성공한 token만 멱등 ACK를 재발행한다. UI 자동 재확인은2초 간격 최대2회이고 실패/소진 뒤 안정 화면을 남긴 채 fence/요청을 종료한다.
+- 큐 coalesce는 payload token과rollback token을 함께 갱신한다. 큐완료에서는수락만기록하고Applied와동일stamp viewport를받은뒤최종표식을해제한다. 선택해제는실제화면승격의기존공통경로를따른다.
+- 구형 v12/v13 peer는 exact-version handshake에서 명확히 거부한다. legacy Resize 자체의 byte/API는 유지하지만 실제 적용 보장으로 조용히 fallback하지 않는다.

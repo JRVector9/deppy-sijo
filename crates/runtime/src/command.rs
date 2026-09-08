@@ -439,6 +439,7 @@ pub(crate) fn runtime_command_retained_bytes(
         }
         RuntimeCommand::SpawnShell { .. }
         | RuntimeCommand::Resize { .. }
+        | RuntimeCommand::ResizeTracked { .. }
         | RuntimeCommand::Scroll { .. }
         | RuntimeCommand::KillSession { .. }
         | RuntimeCommand::RestoreWorkspace
@@ -560,6 +561,7 @@ pub(crate) fn canonicalize_host_command(command: &mut RuntimeCommand) {
         | RuntimeCommand::SearchScrollback { query: cwd, .. } => canonicalize_string(cwd),
         RuntimeCommand::SpawnShell { .. }
         | RuntimeCommand::Resize { .. }
+        | RuntimeCommand::ResizeTracked { .. }
         | RuntimeCommand::Scroll { .. }
         | RuntimeCommand::KillSession { .. }
         | RuntimeCommand::RestoreWorkspace
@@ -665,6 +667,13 @@ pub(crate) fn validate_host_command(command: &RuntimeCommand) -> Result<(), Runt
         RuntimeCommand::WriteInput { bytes, .. } => {
             if bytes.len() > WRITE_INPUT_BYTES_MAX {
                 return Err(admission_error("runtime_command_input_invalid"));
+            }
+        }
+        RuntimeCommand::ResizeTracked {
+            token, cols, rows, ..
+        } => {
+            if !token.is_valid() || !dimensions_are_valid(*cols, *rows) {
+                return Err(admission_error("runtime_command_resize_invalid"));
             }
         }
         RuntimeCommand::Resize { cols, rows, .. } => {
@@ -1026,6 +1035,13 @@ pub enum RuntimeCommand {
         generation: u64,
         requested: u32,
     },
+    /// 실제 backend/PTY 적용 결과를 요청 token과 연결한다. append-only wire 계약.
+    ResizeTracked {
+        session: SessionId,
+        token: crate::ResizeToken,
+        cols: u16,
+        rows: u16,
+    },
 }
 
 impl std::fmt::Debug for RuntimeCommand {
@@ -1096,6 +1112,18 @@ impl std::fmt::Debug for RuntimeCommand {
                 .debug_struct("WriteInput")
                 .field("session", session)
                 .field("bytes_len", &bytes.len())
+                .finish(),
+            RuntimeCommand::ResizeTracked {
+                session,
+                token,
+                cols,
+                rows,
+            } => f
+                .debug_struct("ResizeTracked")
+                .field("session", session)
+                .field("generation", &token.generation)
+                .field("cols", cols)
+                .field("rows", rows)
                 .finish(),
             RuntimeCommand::Resize {
                 session,
@@ -2006,6 +2034,7 @@ mod tests {
                 "KillUnattachedSessions",
                 "RespawnArchivedAgent",
                 "SetScrollbackLimit",
+                "ResizeTracked",
             ]
         );
     }

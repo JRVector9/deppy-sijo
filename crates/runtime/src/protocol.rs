@@ -47,7 +47,9 @@ pub(crate) const PROTO_MAGIC: [u8; 4] = *b"DPRT";
 /// 끝에 append. v11 피어가 미지 variant를 스트림에서 받기 전에 handshake에서 거부한다.
 /// **v13**: SetScrollbackLimit/ScrollbackLimitApplied 추가. 기존 메시지 바이트는 유지하고
 /// 새 variant를 이해하지 못하는 피어는 handshake에서 명확하게 거부한다.
-pub(crate) const PROTO_VERSION: u16 = 13;
+/// **v14**: 실제 resize token/owner epoch/적용 stamp 및 tracked viewport를 끝에 append.
+/// 구버전에는 실제 적용 보장을 흉내 내지 않고 기존 exact-version handshake로 거부한다.
+pub(crate) const PROTO_VERSION: u16 = 14;
 
 /// delta viewport 스트리밍 기능 비트 (§3.1).
 pub(crate) const FEAT_DELTA_VIEWPORT: u32 = 1 << 0;
@@ -101,6 +103,21 @@ pub(crate) enum WireMsg {
         base_seq: u64,
         delta: ViewportDelta,
         bracketed_paste: bool,
+    },
+    ViewportKeyframeTracked {
+        session: SessionId,
+        seq: u64,
+        snapshot: Arc<TerminalViewportSnapshot>,
+        bracketed_paste: bool,
+        stamp: crate::ResizeStamp,
+    },
+    ViewportDeltaTracked {
+        session: SessionId,
+        seq: u64,
+        base_seq: u64,
+        delta: ViewportDelta,
+        bracketed_paste: bool,
+        stamp: crate::ResizeStamp,
     },
 }
 
@@ -169,6 +186,21 @@ pub(crate) enum DecodedEvent {
         delta: ViewportDelta,
         bracketed_paste: bool,
     },
+    KeyframeTracked {
+        session: SessionId,
+        seq: u64,
+        snapshot: Arc<TerminalViewportSnapshot>,
+        bracketed_paste: bool,
+        stamp: crate::ResizeStamp,
+    },
+    DeltaTracked {
+        session: SessionId,
+        seq: u64,
+        base_seq: u64,
+        delta: ViewportDelta,
+        bracketed_paste: bool,
+        stamp: crate::ResizeStamp,
+    },
 }
 
 /// 접속별 와이어 코덱 — 협상된 기능이 결정한다 (§3.2). 접속 단위로 확정되므로
@@ -207,6 +239,34 @@ impl Codec {
             Codec::Plain => Ok(DecodedEvent::Event(postcard::from_bytes(frame)?)),
             Codec::Delta => Ok(match postcard::from_bytes::<WireMsg>(frame)? {
                 WireMsg::Event(event) => DecodedEvent::Event(event),
+                WireMsg::ViewportKeyframeTracked {
+                    session,
+                    seq,
+                    snapshot,
+                    bracketed_paste,
+                    stamp,
+                } => DecodedEvent::KeyframeTracked {
+                    session,
+                    seq,
+                    snapshot,
+                    bracketed_paste,
+                    stamp,
+                },
+                WireMsg::ViewportDeltaTracked {
+                    session,
+                    seq,
+                    base_seq,
+                    delta,
+                    bracketed_paste,
+                    stamp,
+                } => DecodedEvent::DeltaTracked {
+                    session,
+                    seq,
+                    base_seq,
+                    delta,
+                    bracketed_paste,
+                    stamp,
+                },
                 WireMsg::ViewportKeyframe {
                     session,
                     seq,
@@ -402,6 +462,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tracked_resize_append_preserves_legacy_command_event_and_envelope_bytes() {
+        let command = RuntimeCommand::Resize {
+            session: SessionId(7),
+            cols: 80,
+            rows: 24,
+        };
+        assert_eq!(postcard::to_allocvec(&command).unwrap(), [3, 7, 80, 24]);
+        let event = RuntimeEvent::ShellSpawned {
+            session: SessionId(7),
+        };
+        assert_eq!(postcard::to_allocvec(&event).unwrap(), [0, 7]);
+        assert_eq!(
+            postcard::to_allocvec(&WireMsg::Event(event)).unwrap(),
+            [0, 0, 7]
+        );
+    }
+
+    #[test]
     fn protocol_version_tracks_live_scrollback_wire_variants() {
         let protocol_source = include_str!("protocol.rs");
         let command_source = include_str!("command.rs");
@@ -414,6 +492,6 @@ mod tests {
         assert!(command_source.contains("SetScrollbackLimit"));
         assert!(event_source.contains("ScrollbackLimitApplied"));
         assert!(protocol_source.contains("**v13**"));
-        assert_eq!(PROTO_VERSION, 13);
+        assert_eq!(PROTO_VERSION, 14);
     }
 }

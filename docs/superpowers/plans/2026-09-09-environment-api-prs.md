@@ -58,7 +58,7 @@
 
 ## PR 5 — Agent 적용 상태
 
-- 구현·리뷰 반영·로직 검증 완료, draft PR 생성 단계. 화면 검증 대기. 실제 spawn ACK와 기본환경 처리 ACK를 구분하고, 비밀값 대신 physical slot 세대를 버전에 포함한다.
+- 구현 완료: #183 (draft), commit `2868f25`. 소스 리뷰 반영·로직 검증 완료. 화면 검증 대기. 실제 spawn ACK와 기본환경 처리 ACK를 구분하고, 비밀값 대신 physical slot 세대를 버전에 포함한다.
 
 - 브랜치: `feat/environment-application-status`, base PR 4.
 - 파일: `runtime/src/command.rs`, `runtime/src/event.rs`, `in_process.rs`, `app.rs`, 환경 설정 snapshot/UI, 로케일 5개.

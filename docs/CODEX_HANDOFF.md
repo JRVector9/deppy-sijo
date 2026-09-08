@@ -2633,3 +2633,13 @@
 - 검증 한계: 전체 runtime 307 PASS 이후 app 재실행 routing/취소 처리와 테스트 assertion을 보완했고 app 6/runtime 2 targeted로 재검증했다. 최신 UI 콜백 scope guard는 소스 확인과 all-targets clippy로 확인했으며 화면 확인은 남았다. 버전은 runtime 수명의 metadata 표식이며 재시작 전 아카이브는 실제 실행 증거가 없어 미확인으로 표시한다. 원본 파일 여러 개의 rename 전체가 원자적이라는 보장은 제공하지 않는다.
 - 남은 작업: 이 변경을 commit/push하고 #182를 base로 draft PR 생성. main 머지·앱 재빌드/재실행·사용자 화면 확인은 이번 구현 단계에서 하지 않는다. 이전 UI dirty worktree는 보존한다.
 - 다음 명령: `git diff --check`; `git add crates/app/src/app.rs crates/app/src/environment_application.rs crates/app/src/env_reload.rs crates/app/src/main.rs crates/app/src/ui/env_profiles.rs crates/app/src/ui/workspace.rs crates/runtime/src crates/i18n/locales docs/CODEX_HANDOFF.md docs/superpowers/plans/2026-09-09-environment-api-prs.md`; `git commit -m "feat: 프로젝트 환경의 실제 실행 적용 상태를 추적"`; `git push -u origin feat/environment-application-status`; `gh pr create --draft --base feat/workspace-env-sources --head feat/environment-application-status --title "feat: Agent 환경 적용 상태와 비밀값 세대 일치 확인" --body-file /tmp/deppy-application-pr.md`.
+
+
+## 2026-09-09 환경·API 5개 PR 구현 종료
+
+- 현재 목표 완료: 승인된 PR 1~5를 순서대로 구현·검증하고 draft PR로 올렸다. 마지막 구현 commit `2868f25`, PR #183 https://github.com/JRVector9/deppy-sijo/pull/183.
+- GitHub에서 확인한 의존 순서: main ← #179 조회 상태 ← #180 파일 일관성 ← #181 API 환경 연결 ← #182 파일 선택/출처 ← #183 실제 실행 적용 상태. 모두 OPEN/draft다. main 머지나 앱 재빌드/재실행은 하지 않았다.
+- 최신 작업 위치: `/private/tmp/deppy-env-application-20260909`, branch `feat/environment-application-status`. 이 branch가 5개 PR의 누적 구현을 담는다. 앞선 worktree 위치는 각 절에 기록했다.
+- 사용자 작업 보존: `/private/tmp/deppy-settings-session-background-20260909`의 file_tree/settings/workspace/renderer_egui/handoff 미커밋 수정은 그대로 있다. 통합 시 이 화면 수정이 빠져 이전 화면으로 돌아가지 않도록 먼저 diff를 확인한다.
+- 남은 확인: 승인된 시점에 5개 PR과 별도 화면 변경을 함께 통합하고 패키징/재실행 후 사용자 화면을 확인한다. 조회 오류 해제, 파일 선택·편집/삭제, API 연결·해제, 새 Agent 적용 상태, workspace 전환을 확인한다. 화면 미검증은 PASS가 아니다.
+- 다음 에이전트 시작 명령: `cd /private/tmp/deppy-env-application-20260909`; `cat AGENTS.md`; `cat CLAUDE.md`; `tail -n 75 docs/CODEX_HANDOFF.md`; `git status --short`; `git diff`; `gh pr view 183`; `git -C /private/tmp/deppy-settings-session-background-20260909 diff --stat`. 승인 없이 기존 앱을 종료하거나 main에 머지하지 않는다.

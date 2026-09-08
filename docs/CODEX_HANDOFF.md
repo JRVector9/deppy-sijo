@@ -2402,3 +2402,10 @@
 - 영벡터 assertion의 실제 RED(exit101, 기존0..31과0×32 불일치)를 확인했다(`/private/tmp/deppy-relay-fixture-red.log`). fixture secret32바이트/record49바이트/reject48바이트 형식은 유지하며 독립 Python HMAC-SHA256으로 종속값을 재계산했다. 제품 crypto/credential 발급 코드는 변경하지 않았다.
 - #162 최종 web-remote 전체337 PASS/4 ignored(`/private/tmp/deppy-relay-fixture-web-tests.log`), Node16 PASS(`...fixture-node-tests.log`), 실제 headless Chrome pairing1 PASS(`...fixture-chrome.log`). web-remote strict all-targets Clippy, fmt/diff PASS(`...fixture-clippy.log`). 전용 target과 CARGO_BUILD_JOBS=2를 사용했다.
 - 좁은 Codex 리뷰 exit0: 남은 확정 P1/P2/계약 누락 없음(`/private/tmp/deppy-relay-fixture-codex-review.log`). 다음은 한국어 commit/일반 push 후 GitGuardian 최신 head 결과 확인 및 #163 일반 merge다. 과거 commit에 대한 서버 측 incident가 남으면 이를 최신 소스 탐지와 구분한다.
+
+## 2026-09-08 Relay clean replacement stack
+- #162 새65d807e에서도 GitGuardian은 새 영벡터가 아니라 과거 ce930906의 incident37016215를 계속 보고했다(check102063131517). history를 재작성하지 않고 root 승인으로 대체 clean stack을 만든다.
+- 기존 #163의 merge 진행 작업은 doc append 충돌을 양쪽 보존해 해결하고 로컬 merge commit eee3ed1로 안전하게 보존했다. 해당 tree에서 web337/Chrome1/Node16/strict Clippy/fmt/diff PASS. reset --hard, force-push, rebase는 하지 않았다.
+- 새 `feat/relay-shell-main-clean`은 #161 exact6ee7eb4에서 생성했다. updated #162의65d807e를 squash 이관한 source commit ab0dbfc는 그 최종 tree와 전체 diff가 비어 있다. `git merge-base HEAD ce930906`은6ee7eb4이며 `git merge-base --is-ancestor ce930906 HEAD`는 exit1, 추가 이력은 새 source commit 하나뿐이다.
+- 새 Ready PR https://github.com/JRVector9/deppy-sijo/pull/168 , base feat/relay-reconnect-core-main. source head ab0dbfc의 GitGuardian SUCCESS를 직접 확인했다. 새 worktree golden1 PASS(`/private/tmp/deppy-relay-shell-clean-fixture.log`), 나머지 gate는 동일 tree의 #162 실행 증거를 그대로 구분해 기록한다.
+- 다음: 이 최종 clean shell 위에 `feat/relay-app-adapter-main-clean`을 만들고 adapter-only8dae223/5452873/fbb807f를 이관한다. 새 두 PR GitGuardian 성공 후 old162/163을 대체 링크와 함께 close하되 branch는 보존한다. Actions billing/spending과 DNS/TLS/배포/실기기/soak BLOCKED 유지.

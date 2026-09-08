@@ -864,7 +864,7 @@ file_tree.listing_folders = Listing folders...
 file_tree.new_file_label = New file
 file_tree.macos_access_denied = macOS does not have permission to access this folder.
 env.var_delete_confirm.title = Delete variable
-env.var_delete_confirm.body_dotenv = Delete '{key}'? The line is also removed from the .env file.
+env.var_delete_confirm.body_dotenv = Delete '{key}'? Its definitions will be removed from the files selected below.
 credentials.delete_confirm.title = Delete API key
 credentials.delete_confirm.body = Delete '{name}'? The secret stored in the keychain is deleted as well.
 env.no_project_path_note = Environment variables are stored in the project folder's .env file. Choose a project folder first.
@@ -1197,3 +1197,7 @@ settings.relay.time.in_minutes = in {minutes} min
 settings.relay.time.in_hours = in {hours} h
 settings.relay.time.in_days = in {days} d
 settings.relay.time.expired = expired
+
+env.source_missing = The source environment files are missing. The values below are retained copies and will not be passed to new sessions.
+env.delete_all_sources = Delete from all files
+env.source_read_failed = The environment files could not be read. The retained values below may differ from the source files.

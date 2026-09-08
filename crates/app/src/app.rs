@@ -3083,6 +3083,7 @@ enum SettingsJobAction {
         key: String,
     },
     WriteDotenv {
+        file: Option<String>,
         key: String,
         value: Option<String>,
     },
@@ -3497,12 +3498,25 @@ fn load_environment_snapshots(
     db: &Db,
     revision: u64,
     workspace_id: &str,
-    project_root_configured: bool,
+    project_root: Option<&Path>,
 ) -> (
     ui::env_profiles::EnvProfilesSnapshot,
     ui::credentials::CredentialsSnapshot,
 ) {
     let loaded = (|| -> anyhow::Result<_> {
+        let sources = project_root.map(|root| {
+            crate::dotenv_sync::load_dotenv_sources(root).unwrap_or_else(|_| {
+                tracing::warn!(
+                    kind = "settings",
+                    phase = "dotenv_sources",
+                    error_code = "source_read_failed"
+                );
+                crate::dotenv_sync::DotenvSources {
+                    read_failed: true,
+                    ..Default::default()
+                }
+            })
+        });
         let rows = db.settings_environment_snapshot_rows(workspace_id)?;
         let credential_ids = rows
             .credentials
@@ -3577,13 +3591,14 @@ fn load_environment_snapshots(
         let env = ui::env_profiles::EnvProfilesSnapshot::try_new(
             revision,
             workspace_id,
-            project_root_configured,
+            project_root.is_some(),
             dotenv_profile_id,
             legacy_profile_count,
             dotenv_vars,
             legacy_vars,
         )
-        .map_err(anyhow::Error::from)?;
+        .map_err(anyhow::Error::from)?
+        .with_sources(sources)?;
         let credentials = ui::credentials::CredentialsSnapshot::try_new(revision, credentials)
             .map_err(anyhow::Error::from)?;
         Ok((env, credentials))
@@ -3599,7 +3614,7 @@ fn load_environment_snapshots(
             ui::env_profiles::EnvProfilesSnapshot::unavailable(
                 revision,
                 workspace_id,
-                project_root_configured,
+                project_root.is_some(),
             ),
             ui::credentials::CredentialsSnapshot::unavailable(revision),
         )
@@ -3610,10 +3625,9 @@ fn load_settings_snapshots(
     db: &Db,
     revision: u64,
     workspace_id: &str,
-    project_root_configured: bool,
+    project_root: Option<&Path>,
 ) -> SettingsSnapshots {
-    let (env, credentials) =
-        load_environment_snapshots(db, revision, workspace_id, project_root_configured);
+    let (env, credentials) = load_environment_snapshots(db, revision, workspace_id, project_root);
     SettingsSnapshots {
         agents: load_agents_snapshot(db, revision, workspace_id),
         env,
@@ -4372,13 +4386,21 @@ fn execute_settings_job_with_repair(
             refresh = result.is_ok();
             SettingsOutcomeKind::LegacyVarDeleted(result)
         }
-        SettingsJobAction::WriteDotenv { key, value } => {
+        SettingsJobAction::WriteDotenv { key, value, file } => {
             let result = project_root
                 .as_deref()
                 .context("settings_dotenv_root_missing")
-                .and_then(|root| crate::dotenv_sync::write_env_var(root, &key, value.as_deref()))
+                .and_then(|root| {
+                    crate::dotenv_sync::write_env_var_in_file(
+                        root,
+                        file.as_deref(),
+                        &key,
+                        value.as_deref(),
+                    )
+                })
                 .map_err(|_| SettingsErrorCode::DotenvWrite);
-            refresh = result.is_ok();
+            // 일부 파일만 반영된 실패도 현재 원본을 다시 읽어 표시한다.
+            refresh = true;
             SettingsOutcomeKind::DotenvWritten(result)
         }
         SettingsJobAction::ResyncDotenv => {
@@ -4489,7 +4511,7 @@ fn execute_settings_job_with_repair(
         }
     };
     let snapshots = (refresh || matches!(kind, SettingsOutcomeKind::Loaded))
-        .then(|| load_settings_snapshots(db, revision, &workspace_id, project_root.is_some()));
+        .then(|| load_settings_snapshots(db, revision, &workspace_id, project_root.as_deref()));
     SettingsOutcome {
         generation,
         revision,
@@ -25301,13 +25323,13 @@ impl App {
                     }
                 }
                 SettingsOutcomeKind::DotenvWritten(result) => {
+                    self.sync_settings_workspace_dotenv(&outcome.workspace_id);
                     if result.is_err() {
                         self.env_profiles_ui
                             .report_error(ui::env_profiles::EnvUiErrorCode::DotenvWriteFailed);
                     } else {
                         self.env_profiles_ui
                             .clear_error(ui::env_profiles::EnvUiErrorCode::DotenvWriteFailed);
-                        self.sync_settings_workspace_dotenv(&outcome.workspace_id);
                         self.invalidate_env_api_projects();
                     }
                 }
@@ -32006,11 +32028,11 @@ impl eframe::App for App {
                         }
                         queued
                     }
-                    ui::env_profiles::EnvAction::DotenvWrite { key, value } => self
+                    ui::env_profiles::EnvAction::DotenvWrite { key, value, file } => self
                         .queue_settings_action(
                             &settings_wsid,
                             env_project_root.clone(),
-                            SettingsJobAction::WriteDotenv { key, value },
+                            SettingsJobAction::WriteDotenv { key, value, file },
                         ),
                     ui::env_profiles::EnvAction::DeleteLegacyVar { profile_id, key } => self
                         .queue_settings_action(
@@ -42795,21 +42817,34 @@ mod tests {
     }
 
     #[test]
+    fn env_files_원본읽기실패는_정상_api목록을_막지_않는다() {
+        let db = Db::open(&temp_db_path("env-source-failure")).unwrap();
+        let workspace = db.create_workspace("env-source-failure").unwrap();
+        let dir = std::env::temp_dir().join(format!("deppy-source-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".env"), [0xff]).unwrap();
+        let (env, credentials) = load_environment_snapshots(&db, 1, &workspace, Some(&dir));
+        assert!(credentials.is_available());
+        assert!(env.is_available());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn settings_load_일부_snapshot_실패도_재시도하고_정상이면_멈춘다() {
         let path = temp_db_path("settings-load-retry");
         let db = Db::open(&path).unwrap();
         let workspace = db.create_workspace("settings-load-retry").unwrap();
-        let mut snapshots = load_settings_snapshots(&db, 1, &workspace, true);
+        let mut snapshots = load_settings_snapshots(&db, 1, &workspace, None);
         assert_eq!(settings_snapshot_retry_delay(&snapshots), None);
         snapshots.env = ui::env_profiles::EnvProfilesSnapshot::unavailable(1, &*workspace, true);
         assert_eq!(
             settings_snapshot_retry_delay(&snapshots),
             Some(std::time::Duration::from_secs(1))
         );
-        let mut snapshots = load_settings_snapshots(&db, 2, &workspace, true);
+        let mut snapshots = load_settings_snapshots(&db, 2, &workspace, None);
         snapshots.credentials = ui::credentials::CredentialsSnapshot::unavailable(2);
         assert!(settings_snapshot_retry_delay(&snapshots).is_some());
-        let snapshots = load_settings_snapshots(&db, 3, &workspace, true);
+        let snapshots = load_settings_snapshots(&db, 3, &workspace, None);
         assert_eq!(settings_snapshot_retry_delay(&snapshots), None);
     }
 

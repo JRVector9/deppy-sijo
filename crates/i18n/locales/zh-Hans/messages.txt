@@ -864,7 +864,7 @@ file_tree.listing_folders = 正在列出文件夹...
 file_tree.new_file_label = 新建文件
 file_tree.macos_access_denied = macOS 没有访问此文件夹的权限。
 env.var_delete_confirm.title = 删除环境变量
-env.var_delete_confirm.body_dotenv = 删除 '{key}' 吗？.env 文件中的对应行也会被删除。
+env.var_delete_confirm.body_dotenv = 删除 '{key}'？将删除下方所选文件中的定义。
 credentials.delete_confirm.title = 删除 API 密钥
 credentials.delete_confirm.body = 删除 '{name}' 吗？钥匙串中保存的密钥也会一并删除。
 env.no_project_path_note = 环境变量保存在项目文件夹的 .env 文件中。请先指定项目文件夹。
@@ -1197,3 +1197,7 @@ settings.relay.time.in_minutes = {minutes} 分钟后
 settings.relay.time.in_hours = {hours} 小时后
 settings.relay.time.in_days = {days} 天后
 settings.relay.time.expired = 已到期
+
+env.source_missing = 源环境文件不存在。以下为保留值，不会传递给新会话。
+env.delete_all_sources = 从所有文件中删除
+env.source_read_failed = 无法读取环境文件。下方保留值可能与源文件不同。

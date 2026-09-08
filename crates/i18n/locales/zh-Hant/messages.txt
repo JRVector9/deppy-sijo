@@ -864,7 +864,7 @@ file_tree.listing_folders = 正在列出資料夾...
 file_tree.new_file_label = 新增檔案
 file_tree.macos_access_denied = macOS 沒有存取此資料夾的權限。
 env.var_delete_confirm.title = 刪除環境變數
-env.var_delete_confirm.body_dotenv = 刪除 '{key}' 嗎？.env 檔案中的對應行也會被刪除。
+env.var_delete_confirm.body_dotenv = 刪除 '{key}'？將刪除下方所選檔案中的定義。
 credentials.delete_confirm.title = 刪除 API 金鑰
 credentials.delete_confirm.body = 刪除 '{name}' 嗎？鑰匙圈中儲存的密鑰也會一併刪除。
 env.no_project_path_note = 環境變數保存在專案資料夾的 .env 檔案中。請先指定專案資料夾。
@@ -1197,3 +1197,7 @@ settings.relay.time.in_minutes = {minutes} 分鐘後
 settings.relay.time.in_hours = {hours} 小時後
 settings.relay.time.in_days = {days} 天後
 settings.relay.time.expired = 已到期
+
+env.source_missing = 來源環境檔案不存在。以下為保留值，不會傳遞給新工作階段。
+env.delete_all_sources = 從所有檔案中刪除
+env.source_read_failed = 無法讀取環境檔案。下方保留值可能與來源檔案不同。

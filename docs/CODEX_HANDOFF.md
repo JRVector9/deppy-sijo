@@ -2543,3 +2543,19 @@
 - 최종 checkpoint: 두 리뷰 지적을 반영한 재리뷰는 새 발견 사항 없음으로 종료했다(`/tmp/deppy-env-state-rereview.txt`). app all-targets clippy 재검증 PASS, 수정 후 fmt/diff 검사 PASS. 첫 PR은 코드/로직 검증 완료, 사용자 화면 확인 대기로 draft 생성한다. PR 2~5는 아직 구현 전이다.
 
 - PR 생성 완료: https://github.com/JRVector9/deppy-sijo/pull/179 (draft), 구현 commit `7f3fb81`. main 머지와 앱 재빌드/재실행은 하지 않았다. 다음 구현 대상은 계획의 PR 2 파일 일관성이다. 분리 명령: `git worktree add -b fix/environment-file-consistency /private/tmp/deppy-env-files-20260909 origin/fix/environment-snapshot-state`; 실제 작성 전에 PR 2의 원본 변경/부분 실패 및 보관값 표시 계약을 확인한다.
+
+
+## 2026-09-09 환경파일 일관성 PR 2 진행
+
+- 목표: 사용자가 승인한 순서에 따라 PR 2~5를 계속 구현한다. 현재 `/private/tmp/deppy-env-files-20260909`, `fix/environment-file-consistency`, base #179 `44076d6`.
+- 완료: 병합 키 삭제는 `.env`/`.env.local` 전체 중복을 제거한다. 명시한 파일만 삭제하는 선택을 UI 확인창에 연결했다. 각 파일의 임시파일을 모두 준비하고 원본 내용을 재검증한 뒤 순차 rename한다. 도중 실패/외부 변경은 오류로 반환하고 성공으로 취급하지 않는다. 외부 원본을 덮는 rollback은 없다. 변경 실패도 snapshot 갱신과 dotenv 재동기화를 요청한다.
+- source 정보는 파일 존재/키별 파일명만 포함하며 실제 값은 포함하지 않는다. 파일 둘 다 없지만 DB 보관값이 있으면 새 실행에 전달되지 않는 보관값임을 표시한다. snapshot 바이트 상한에는 출처 메타데이터도 합산한다. 5개 locale에 동일 안내·삭제 범위 키를 추가했다.
+- 수정 파일: `app.rs`, `dotenv_sync.rs`, `ui/env_profiles.rs`, 로케일 5개, 이 handoff. 주석/문자열 순서 보존 및 기존 nofollow/바이트·항목 상한은 유지한다. 줄 단위 editor가 보존할 수 없는 개행 값은 저장 전에 거부한다.
+- 테스트: 두 파일 중복 삭제 테스트를 먼저 FAIL로 확인했다. 수정 뒤 dotenv_sync 전체 41 PASS, 외부 수정/부분 교체 충돌/선택 파일 삭제/원본 없음과 빈 파일 차이/개행 거부 추가 후 45 PASS(`/tmp/deppy-env-files-test.log`). UI 화면 검증·패키징·앱 재실행은 하지 않았다.
+- 현재: Codex CLI 소스 리뷰 진행(`/tmp/deppy-env-files-review.txt`). 다음은 리뷰 반영, fmt/clippy/i18n/diff 게이트 1회, commit 및 #179를 base로 draft PR 생성이다. 이후 PR 3의 workspace credential 연결 테이블/원자적 저장/실행 전달로 진행한다.
+- 제한: 여러 파일 rename 전체는 원자적 트랜잭션이 아니다. 내용 비교와 마지막 재검증으로 감지된 충돌을 실패로 보고한다. 사용자 파일과 Keychain은 테스트에서 사용하지 않는다.
+- 다음 명령: `cat /tmp/deppy-env-files-review.txt`; `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo clippy --locked -p deppy-sijo --all-targets -- -D warnings`; `cargo run --locked -p xtask -- i18n-check`(동일 env/target 사용). 실제 리뷰·게이트 결과를 확인한 뒤 commit한다.
+
+- 리뷰 반영: Medium 1건(원본 파일 읽기 오류가 정상 Credential snapshot까지 실패시키는 문제)을 재현 테스트 FAIL로 확인했다. 출처 읽기 실패를 별도 메타데이터로 분리해 보관값에 경고만 표시하고 API 관리는 유지한다. 수정 후 env_files 필터 6 PASS. clippy는 새 테스트 이름의 대문자 API 때문에 실패해 소문자로 수정했다. 재실행 중이며 성공 전 PASS로 기록하지 않는다.
+
+- PR 2 최종 검증: clippy all-targets PASS(테스트 이름 수정 후 10.83초), fmt/diff PASS, i18n-check PASS(키 1128건/5 locale). dotenv_sync 45 PASS 및 리뷰 반영 env_files 6 PASS. 리뷰의 파일 읽기/API 관리 결합 문제는 수정했고 실제 재현 실패→성공을 확인했다. 코드 완성, 화면 미검증으로 draft PR 생성한다.

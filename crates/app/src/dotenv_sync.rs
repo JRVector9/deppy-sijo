@@ -619,7 +619,40 @@ impl Drop for TempFileGuard {
     }
 }
 
+struct PreparedEnvFile {
+    path: std::path::PathBuf,
+    temp: std::path::PathBuf,
+    guard: TempFileGuard,
+}
+
+impl PreparedEnvFile {
+    fn commit(mut self, expected: Option<Option<&str>>) -> anyhow::Result<()> {
+        if let Some(expected) = expected {
+            let mut budget = DOTENV_TOTAL_BYTES_MAX;
+            let current = read_dotenv_file_app_bounded(&self.path, &mut budget)?;
+            anyhow::ensure!(current.as_deref() == expected, "dotenv_source_changed");
+        }
+        atomic_replace(&self.temp, &self.path)
+            .map_err(|_| anyhow::anyhow!("dotenv_replace_failed"))?;
+        self.guard.disarm();
+        #[cfg(unix)]
+        std::fs::File::open(
+            self.path
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("dotenv_parent_missing"))?,
+        )
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| anyhow::anyhow!("dotenv_directory_sync_failed"))?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 fn atomic_write_env(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+    prepare_env_file(path, contents)?.commit(None)
+}
+
+fn prepare_env_file(path: &Path, contents: &[u8]) -> anyhow::Result<PreparedEnvFile> {
     anyhow::ensure!(contents.len() <= DOTENV_TOTAL_BYTES_MAX, ERROR_DOTENV_BYTES);
     let parent = path
         .parent()
@@ -644,7 +677,7 @@ fn atomic_write_env(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
     let mut file = options
         .open(&temp)
         .map_err(|_| anyhow::anyhow!("dotenv_temp_create_failed"))?;
-    let mut guard = TempFileGuard(Some(temp.clone()));
+    let guard = TempFileGuard(Some(temp.clone()));
 
     // 기존 파일의 접근 권한을 유지한다. 새 파일은 OpenOptions의 0600(Unix) 기본을 쓴다.
     match std::fs::symlink_metadata(path) {
@@ -665,14 +698,11 @@ fn atomic_write_env(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
         .map_err(|_| anyhow::anyhow!("dotenv_temp_sync_failed"))?;
     drop(file);
 
-    atomic_replace(&temp, path).map_err(|_| anyhow::anyhow!("dotenv_replace_failed"))?;
-    guard.disarm();
-
-    #[cfg(unix)]
-    std::fs::File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|_| anyhow::anyhow!("dotenv_directory_sync_failed"))?;
-    Ok(())
+    Ok(PreparedEnvFile {
+        path: path.to_owned(),
+        temp,
+        guard,
+    })
 }
 
 #[cfg(unix)]
@@ -708,64 +738,128 @@ fn atomic_replace(temp: &Path, target: &Path) -> std::io::Result<()> {
     std::fs::rename(temp, target)
 }
 
-/// UI 편집을 `.env` 파일에 **라인 단위**로 반영한다(7·8번, 2026-07-10). 주석·순서 보존.
-/// - 대상 파일: 키가 이미 있는 파일(.env.local 우선순위 역순으로 탐색), 없으면 `.env`
-///   (파일이 없으면 생성). value=None이면 해당 라인 삭제.
-/// - 반영 후 mtime 폴링/명시 sync가 DB를 따라 갱신한다(.env가 단일 진실).
-pub fn write_env_var(root: &std::path::Path, key: &str, value: Option<&str>) -> anyhow::Result<()> {
+/// 병합 목록의 삭제는 모든 정의를 제거한다. 값 수정은 실효 값을 가진 파일을 사용한다.
+pub fn write_env_var(root: &Path, key: &str, value: Option<&str>) -> anyhow::Result<()> {
+    write_env_var_in_file(root, None, key, value)
+}
+
+/// 명시한 파일만 수정한다. None은 병합 목록의 수정/전체 삭제다.
+pub fn write_env_var_in_file(
+    root: &Path,
+    target: Option<&str>,
+    key: &str,
+    value: Option<&str>,
+) -> anyhow::Result<()> {
     anyhow::ensure!(
         key.len() <= DOTENV_KEY_BYTES_MAX,
         "dotenv_key_bytes_exceeded"
     );
+    let valid = parse_dotenv_bounded(&format!("{key}="), 1)?;
+    anyhow::ensure!(valid.len() == 1 && valid[0].0 == key, "dotenv_key_invalid");
     if let Some(value) = value {
         anyhow::ensure!(
             value.len() <= DOTENV_VALUE_BYTES_MAX,
             "dotenv_value_bytes_exceeded"
         );
+        // 줄 단위 편집기가 보존할 수 없는 값을 기록해 다른 키로 해석시키지 않는다.
+        anyhow::ensure!(
+            !value.contains(['\n', '\r']),
+            "dotenv_multiline_value_unsupported"
+        );
     }
-    let key_probe = format!("{key}=");
-    let valid_key = parse_dotenv_bounded(&key_probe, 1)?;
-    anyhow::ensure!(
-        valid_key.len() == 1 && valid_key[0].0 == key,
-        "dotenv_key_invalid"
-    );
-
-    let mut remaining_bytes = DOTENV_TOTAL_BYTES_MAX;
-    let mut contents: [Option<String>; DOTENV_FILE_NAMES.len()] = std::array::from_fn(|_| None);
-    for (index, name) in DOTENV_FILE_NAMES.iter().enumerate() {
-        contents[index] = read_dotenv_file_app_bounded(&root.join(name), &mut remaining_bytes)?;
+    let selected = target
+        .map(|name| {
+            DOTENV_FILE_NAMES
+                .iter()
+                .position(|file| *file == name)
+                .ok_or_else(|| anyhow::anyhow!("dotenv_target_invalid"))
+        })
+        .transpose()?;
+    let originals = read_env_file_set(root)?;
+    let mut remaining = DOTENV_ENTRIES_MAX;
+    let mut contains_key = Vec::new();
+    for content in &originals {
+        let parsed = parse_dotenv_bounded(content.as_deref().unwrap_or_default(), remaining)?;
+        remaining -= parsed.len();
+        contains_key.push(parsed.iter().any(|(existing, _)| existing == key));
     }
-    let total_input_bytes = DOTENV_TOTAL_BYTES_MAX - remaining_bytes;
-
-    let mut remaining_entries = DOTENV_ENTRIES_MAX;
-    let mut contains_key = [false; DOTENV_FILE_NAMES.len()];
-    for (index, content) in contents.iter().enumerate() {
-        let Some(content) = content.as_deref() else {
-            continue;
-        };
-        let parsed = parse_dotenv_bounded(content, remaining_entries)?;
-        remaining_entries -= parsed.len();
-        contains_key[index] = parsed.iter().any(|(existing, _)| existing == key);
+    let effective = contains_key.iter().rposition(|found| *found).unwrap_or(0);
+    let mut candidates = originals.clone();
+    for (index, candidate) in candidates.iter_mut().enumerate() {
+        let edit = selected.map_or_else(
+            || value.is_none() || index == effective,
+            |selected| selected == index,
+        );
+        if edit && (value.is_some() || contains_key[index]) {
+            *candidate = Some(edit_env_text(
+                candidate.as_deref().unwrap_or_default(),
+                key,
+                value,
+            )?);
+        }
     }
+    let total: usize = candidates.iter().flatten().map(String::len).sum();
+    anyhow::ensure!(total <= DOTENV_TOTAL_BYTES_MAX, ERROR_DOTENV_BYTES);
+    let mut remaining = DOTENV_ENTRIES_MAX;
+    for content in candidates.iter().flatten() {
+        remaining -= parse_dotenv_bounded(content, remaining)?.len();
+    }
+    commit_env_file_set(root, &originals, &candidates)?;
+    if ensure_env_gitignored(root).is_err() {
+        tracing::warn!(
+            kind = "dotenv_file",
+            phase = "gitignore",
+            error_code = "dotenv_gitignore_failed"
+        );
+    }
+    Ok(())
+}
 
-    // 키가 존재하는 파일 찾기 — 병합 우선순위가 높은 파일(.env.local)부터.
-    let target_index = contains_key
+fn read_env_file_set(root: &Path) -> anyhow::Result<Vec<Option<String>>> {
+    let mut budget = DOTENV_TOTAL_BYTES_MAX;
+    DOTENV_FILE_NAMES
         .iter()
-        .rposition(|contains| *contains)
-        .unwrap_or(0);
-    let path = root.join(DOTENV_FILE_NAMES[target_index]);
-    // NotFound만 새 파일로 취급한다. 권한 오류/잘못된 UTF-8/일시적 I/O 실패를 빈 파일로
-    // 오인해 기존 .env 전체를 덮어쓰는 데이터 손실을 막는다.
-    let content = contents[target_index].take().unwrap_or_default();
+        .map(|name| read_dotenv_file_app_bounded(&root.join(name), &mut budget))
+        .collect()
+}
 
-    // 값 직렬화 — 파서가 이스케이프를 해석하지 않으므로(codex Med) 이스케이프 금지:
-    // 내부에 "가 있으면 '…'로 감싸고, "와 '를 둘 다 포함하면 라운드트립 불가라 거부.
+fn commit_env_file_set(
+    root: &Path,
+    originals: &[Option<String>],
+    candidates: &[Option<String>],
+) -> anyhow::Result<()> {
+    // 모든 임시파일을 준비한 뒤 교체한다. 도중 실패를 성공으로 보고하지 않는다.
+    let mut staged = Vec::new();
+    for (index, (original, candidate)) in originals.iter().zip(candidates).enumerate() {
+        if original != candidate {
+            let content = candidate
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("dotenv_candidate_missing"))?;
+            staged.push((
+                index,
+                prepare_env_file(&root.join(DOTENV_FILE_NAMES[index]), content.as_bytes())?,
+            ));
+        }
+    }
+    anyhow::ensure!(
+        read_env_file_set(root)? == originals,
+        "dotenv_source_changed"
+    );
+    for (index, prepared) in staged {
+        prepared.commit(Some(originals[index].as_deref()))?;
+    }
+    // 파일 여러 개의 rename은 하나의 트랜잭션이 아니다. 마지막에도 외부 변경을 감지한다.
+    anyhow::ensure!(
+        read_env_file_set(root)? == candidates,
+        "dotenv_source_changed"
+    );
+    Ok(())
+}
+
+fn edit_env_text(content: &str, key: &str, value: Option<&str>) -> anyhow::Result<String> {
     let render = |v: &str| -> anyhow::Result<String> {
         if v.contains('"') {
-            anyhow::ensure!(
-                !v.contains('\''),
-                "큰따옴표와 작은따옴표를 모두 포함한 값은 .env에 기록할 수 없습니다"
-            );
+            anyhow::ensure!(!v.contains('\''), "dotenv_quotes_unsupported");
             return Ok(format!("{key}='{v}'"));
         }
         if v.is_empty()
@@ -777,77 +871,63 @@ pub fn write_env_var(root: &std::path::Path, key: &str, value: Option<&str>) -> 
             Ok(format!("{key}={v}"))
         }
     };
-
-    let mut lines = collect_dotenv_lines_bounded(&content)?;
-    let matches_key = |line: &str| -> bool {
-        let t = line.trim();
-        let t = t.strip_prefix("export ").unwrap_or(t).trim_start();
-        t.split_once('=')
-            .map(|(k, _)| k.trim() == key)
-            .unwrap_or(false)
+    let matches_key = |line: &str| {
+        let text = line.trim();
+        let text = text.strip_prefix("export ").unwrap_or(text).trim_start();
+        text.split_once('=')
+            .is_some_and(|(existing, _)| existing.trim() == key)
     };
-    let existing: Vec<usize> = lines
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, line)| matches_key(line).then_some(idx))
-        .collect();
-    match (existing.last().copied(), value) {
-        (Some(last), Some(v)) => {
-            // dotenv의 실효 값은 마지막 중복 정의다. 마지막 행을 갱신하고 앞선 중복은
-            // 제거해 UI 편집 직후에도 파서/셸에서 동일한 단일 값이 보이게 한다.
-            lines[last] = render(v)?;
-            for idx in existing[..existing.len() - 1].iter().rev() {
-                lines.remove(*idx);
+    let mut lines = collect_dotenv_lines_bounded(content)?;
+    let last = lines.iter().rposition(|line| matches_key(line));
+    if let Some(value) = value {
+        let rendered = render(value)?;
+        if let Some(last) = last {
+            lines[last] = rendered;
+            lines = lines
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, line)| (index == last || !matches_key(&line)).then_some(line))
+                .collect();
+        } else {
+            anyhow::ensure!(lines.len() < DOTENV_LINES_MAX, "dotenv_lines_exceeded");
+            lines.push(rendered);
+        }
+    } else {
+        lines.retain(|line| !matches_key(line));
+    }
+    let mut output = lines.join("\n");
+    if !output.is_empty() {
+        output.push('\n');
+    }
+    Ok(output)
+}
+
+/// 값 없이 원본 파일의 존재 여부와 키별 출처만 전달한다.
+#[derive(Default)]
+pub struct DotenvSources {
+    pub read_failed: bool,
+    pub files: Vec<String>,
+    pub keys: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+pub fn load_dotenv_sources(root: &Path) -> anyhow::Result<DotenvSources> {
+    let contents = read_env_file_set(root)?;
+    let mut sources = DotenvSources::default();
+    let mut remaining = DOTENV_ENTRIES_MAX;
+    for (name, content) in DOTENV_FILE_NAMES.iter().zip(contents) {
+        if let Some(content) = content {
+            sources.files.push((*name).to_owned());
+            let entries = parse_dotenv_bounded(&content, remaining)?;
+            remaining -= entries.len();
+            for (key, _) in entries {
+                let files = sources.keys.entry(key).or_default();
+                if !files.iter().any(|file| file == name) {
+                    files.push((*name).to_owned());
+                }
             }
         }
-        (Some(_), None) => {
-            // 하나만 지우면 뒤의 중복 정의가 살아나 삭제가 무효화되므로 전부 제거한다.
-            lines.retain(|line| !matches_key(line));
-        }
-        (None, Some(v)) => {
-            anyhow::ensure!(lines.len() < DOTENV_LINES_MAX, "dotenv_lines_exceeded");
-            lines.push(render(v)?);
-        }
-        (None, None) => return Ok(()), // 지울 것 없음
     }
-    let mut out = lines.join("\n");
-    if !out.is_empty() {
-        out.push('\n');
-    }
-    let next_total_bytes = total_input_bytes
-        .checked_sub(content.len())
-        .and_then(|bytes| bytes.checked_add(out.len()))
-        .ok_or_else(|| static_secret_error(ERROR_DOTENV_BYTES))?;
-    anyhow::ensure!(
-        next_total_bytes <= DOTENV_TOTAL_BYTES_MAX,
-        ERROR_DOTENV_BYTES
-    );
-
-    // Validate the exact post-write two-file aggregate before replacing either file.
-    let mut remaining_entries = DOTENV_ENTRIES_MAX;
-    for (index, existing) in contents.iter().enumerate() {
-        let candidate = if index == target_index {
-            Some(out.as_str())
-        } else {
-            existing.as_deref()
-        };
-        if let Some(candidate) = candidate {
-            let parsed = parse_dotenv_bounded(candidate, remaining_entries)?;
-            remaining_entries -= parsed.len();
-        }
-    }
-    atomic_write_env(&path, out.as_bytes())?;
-    // 유출 방지(E2): deppy가 .env를 기록하는 유일한 지점 — git 저장소면 .gitignore
-    // 보호를 함께 보장한다. best-effort(경고만) — 파일 기록 자체는 실패시키지 않는다.
-    if ensure_env_gitignored(root).is_err() {
-        tracing::warn!(
-            kind = "dotenv_file",
-            phase = "gitignore",
-            error_code = "dotenv_gitignore_failed",
-            "dotenv file protection failed"
-        );
-    }
-    Ok(())
+    Ok(sources)
 }
 
 /// `.env`/`.env.local`이 git에 커밋되지 않게 `.gitignore`를 보장한다 (E2, 2026-07-13).
@@ -2626,6 +2706,104 @@ mod tests {
         };
         apply_workspace_dotenv_plan(repository, secret_store, redaction, workspace_id, plan)
             .map(Some)
+    }
+
+    fn env_files_test_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("deppy-env-files-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn env_files_선택한_파일만_지우면_다른_파일은_보존한다() {
+        let dir = env_files_test_dir();
+        std::fs::write(dir.join(".env"), "PORT=1000\n").unwrap();
+        std::fs::write(dir.join(".env.local"), "PORT=2000\n").unwrap();
+        write_env_var_in_file(&dir, Some(".env.local"), "PORT", None).unwrap();
+        assert_eq!(
+            read_merged_dotenv(&dir).unwrap().unwrap(),
+            vec![("PORT".to_owned(), "1000".to_owned())]
+        );
+        assert!(write_env_var_in_file(&dir, Some("../.env"), "PORT", None).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn env_files_외부_수정은_교체전에_거부하고_원본을_보존한다() {
+        let dir = env_files_test_dir();
+        std::fs::write(dir.join(".env"), "PORT=1000\n").unwrap();
+        let originals = read_env_file_set(&dir).unwrap();
+        let candidates = vec![Some("PORT=2000\n".to_owned()), None];
+        std::fs::write(dir.join(".env"), "PORT=3000\n").unwrap();
+        assert!(commit_env_file_set(&dir, &originals, &candidates).is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".env")).unwrap(),
+            "PORT=3000\n"
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn env_files_교체중_충돌은_실패로_남고_다른_원본을_되돌리지_않는다() {
+        let dir = env_files_test_dir();
+        for file in DOTENV_FILE_NAMES {
+            std::fs::write(dir.join(file), "PORT=1000\n").unwrap();
+        }
+        let first = prepare_env_file(&dir.join(".env"), b"KEEP=1\n").unwrap();
+        let second = prepare_env_file(&dir.join(".env.local"), b"").unwrap();
+        first.commit(Some(Some("PORT=1000\n"))).unwrap();
+        std::fs::write(dir.join(".env.local"), "PORT=3000\n").unwrap();
+        assert!(second.commit(Some(Some("PORT=1000\n"))).is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".env")).unwrap(),
+            "KEEP=1\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".env.local")).unwrap(),
+            "PORT=3000\n"
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn env_files_원본없음과_빈파일을_구분하고_출처에는_값을_넣지_않는다() {
+        let dir = env_files_test_dir();
+        assert!(load_dotenv_sources(&dir).unwrap().files.is_empty());
+        std::fs::write(dir.join(".env"), "").unwrap();
+        let empty = load_dotenv_sources(&dir).unwrap();
+        assert_eq!(empty.files, vec![".env"]);
+        assert!(empty.keys.is_empty());
+        std::fs::write(dir.join(".env"), "PORT=1000\nPORT=2000\n").unwrap();
+        std::fs::write(dir.join(".env.local"), "PORT=3000\n").unwrap();
+        assert_eq!(
+            load_dotenv_sources(&dir).unwrap().keys["PORT"],
+            vec![".env", ".env.local"]
+        );
+        assert!(write_env_var(&dir, "PORT", Some("1000\nOTHER=1")).is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".env")).unwrap(),
+            "PORT=1000\nPORT=2000\n"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn env_files_삭제는_두_파일의_중복값을_모두_제거한다() {
+        let dir = std::env::temp_dir().join(format!("deppy-env-delete-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".env"), "PORT=1000\nKEEP=1\n").unwrap();
+        std::fs::write(dir.join(".env.local"), "PORT=2000\nPORT=3000\n").unwrap();
+        write_env_var(&dir, "PORT", None).unwrap();
+        let merged = read_merged_dotenv(&dir).unwrap().unwrap();
+        assert!(!merged.iter().any(|(key, _)| key == "PORT"));
+        assert!(
+            merged
+                .iter()
+                .any(|(key, value)| key == "KEEP" && value == "1")
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

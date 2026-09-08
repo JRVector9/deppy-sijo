@@ -14,30 +14,30 @@
 
 **Files:** `crates/runtime/src/command.rs`, `crates/app/src/ui/workspace.rs`, `crates/terminal/`, `third_party/alacritty_terminal-0.26.0/`
 
-- [ ] #157 → #160 → #165 → #167 순으로 merge한다.
-- [ ] #159를 merge하고 `TERMINAL_CELL_COUNT_MAX` 공개 계약과 공용 `SCROLLBACK_LINES_MAX`를 함께 보존한다.
-- [ ] 리사이즈 tracked-generation과 화면 폭/pending resize 검증을 함께 보존한다.
-- [ ] focused runtime/terminal/workspace 테스트를 실행한다.
+- [x] #157 → #160 → #165 → #167 순으로 merge한다.
+- [x] #159를 merge하고 `TERMINAL_CELL_COUNT_MAX` 공개 계약과 공용 `SCROLLBACK_LINES_MAX`를 함께 보존한다.
+- [x] 리사이즈 tracked-generation과 화면 폭/pending resize 검증을 함께 보존한다.
+- [x] focused runtime/terminal/workspace 테스트를 실행한다.
 
 ### Task 2: 워크스페이스·파일·Fleet·런처·폰트 통합
 
 **Files:** `crates/app/src/app.rs`, `crates/app/src/ui/file_tree.rs`, `crates/app/src/config.rs`, `crates/i18n/locales/*/messages.txt`, `crates/app/src/fonts.rs`
 
-- [ ] #156 → #173 → #158 → #164 → #170 → #171 순으로 merge한다.
-- [ ] `OpenWorkspaceSession`과 `ReorderWorkspaces` action을 모두 유지하고 match arm을 완전하게 만든다.
-- [ ] 현재 세션 선택면과 활성 워크스페이스 그룹의 밝기 계층을 모두 보존한다.
-- [ ] i18n 다섯 로케일을 합치고 제거 대상 Fleet 키만 제거됐는지 확인한다.
+- [x] #156 → #173 → #158 → #164 → #170 → #171 순으로 merge한다.
+- [x] `OpenWorkspaceSession`과 `ReorderWorkspaces` action을 모두 유지하고 match arm을 완전하게 만든다.
+- [x] 현재 세션 선택면과 활성 워크스페이스 그룹의 밝기 계층을 모두 보존한다.
+- [x] i18n 다섯 로케일을 합치고 제거 대상 Fleet 키만 제거됐는지 확인한다.
 - [ ] focused file-tree, Markdown drop, Fleet, launcher, font 테스트를 실행한다.
 
 ### Task 3: Relay·Keychain·Grok·패키징 통합
 
 **Files:** `crates/storage/src/db.rs`, `crates/app/src/app.rs`, `crates/web-remote/`, `crates/relay-*`, `scripts/package-macos.sh`, `.github/workflows/`
 
-- [ ] #161 → #168 → #169 순으로 merge하고 #168 뒤의 독립 runner #175를 merge한다.
-- [ ] #166을 merge하면서 `recovery_generation` migration을 Relay v38/v39 뒤의 v40으로 재번호한다.
+- [x] #161 → #168 → #169 순으로 merge하고 #168 뒤의 독립 runner #175를 merge한다.
+- [x] #166을 merge하면서 `recovery_generation` migration을 Relay v38/v39 뒤의 v40으로 재번호한다.
 - [ ] #172 → #174 → #176 순으로 merge한다.
-- [ ] migration 37→40 및 Relay/Keychain/Grok storage 결합 회귀 테스트를 먼저 추가하거나 기존 테스트를 조정해 실패를 확인한 뒤 수정한다.
-- [ ] 실제 DNS·TLS·배포 자격증명 부재는 BLOCKED로 유지한다.
+- [x] migration 37→40 및 Relay/Keychain/Grok storage 결합 회귀 테스트를 먼저 추가하거나 기존 테스트를 조정해 실패를 확인한 뒤 수정한다.
+- [x] 실제 DNS·TLS·배포 자격증명 부재는 BLOCKED로 유지한다.
 
 ### Task 4: 전체 검증과 코드 리뷰
 

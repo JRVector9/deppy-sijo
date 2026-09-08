@@ -2,7 +2,7 @@ use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use sha2::{Digest as _, Sha256};
 
 const RESOLVED_APPROVAL_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
@@ -216,6 +216,8 @@ impl std::fmt::Debug for ActivePendingApprovalOwner {
 ///     기존 행은 NULL이고 NULL이면 instruction+agent_summary만 보여주는 기존 렌더로 떨어진다.
 /// 37: Relay public device metadata and verified pending approvals. Private identities, pairing
 ///     secrets, transport credentials, and terminal payloads are intentionally absent.
+/// 38: Relay reconnect verifier, 39: Relay authorization epoch.
+/// 40: physical secret recovery generation for startup cleanup ABA protection.
 /// 4~6은 각 crate가 소유한 DDL 상수를 그대로 붙인다 (스키마 정의는 한 곳에서만).
 pub(crate) const MIGRATIONS: &[&str] = &[
     "
@@ -802,6 +804,17 @@ CREATE INDEX idx_relay_devices_recency
         DEFAULT X'00000000000000000000000000000000'
         CHECK (typeof(authorization_epoch) = 'blob' AND length(authorization_epoch) = 16);
      UPDATE relay_devices SET authorization_epoch = randomblob(16);",
+    // v40: 지연 복구 후보를 행 재생성과 구분한다. 비밀이나 시각 기반 cutoff가 아니다.
+    "ALTER TABLE physical_secret_slot_ledger ADD COLUMN recovery_generation BLOB NOT NULL
+        DEFAULT X'00000000000000000000000000000000'
+        CHECK(typeof(recovery_generation) = 'blob' AND length(recovery_generation) = 16);
+     UPDATE physical_secret_slot_ledger SET recovery_generation = randomblob(16);
+     CREATE TRIGGER physical_secret_slot_fresh_recovery_generation
+     AFTER INSERT ON physical_secret_slot_ledger
+     BEGIN
+       UPDATE physical_secret_slot_ledger SET recovery_generation = randomblob(16)
+       WHERE physical_slot = NEW.physical_slot;
+     END;",
 ];
 
 /// 옵션2: 저장된 에이전트 세션 한 행 — 재시작 복원 시 native resume에 쓴다.
@@ -5228,11 +5241,70 @@ fn relay_device_from_row(row: &rusqlite::Row<'_>) -> anyhow::Result<RelayDeviceR
     Ok(device)
 }
 
+fn sqlite_column_exists(
+    conn: &Connection,
+    table: &'static str,
+    column: &str,
+) -> anyhow::Result<bool> {
+    let query = match table {
+        "relay_devices" => {
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('relay_devices') WHERE name = ?1)"
+        }
+        "physical_secret_slot_ledger" => {
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('physical_secret_slot_ledger') WHERE name = ?1)"
+        }
+        _ => anyhow::bail!("지원하지 않는 SQLite 테이블 검사입니다"),
+    };
+    Ok(conn.query_row(query, [column], |row| row.get(0))?)
+}
+
+/// 서로 다른 개발 브랜치가 같은 migration 번호를 사용했던 DB를 정식 원장으로
+/// 오인하면 뒤 migration이 잘못된 스키마에 적용된다. v38/v39만 읽기 snapshot에서
+/// 지문을 확인하고, 정식 Relay 원장과 다른 형태는 데이터 변경 전에 중단한다.
+pub(crate) fn reject_noncanonical_development_schema(path: &Path) -> anyhow::Result<()> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("SQLite metadata 확인 실패: {}", path.display()));
+        }
+    };
+    if !metadata.is_file() {
+        return Ok(());
+    }
+
+    let mut conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("SQLite schema 확인 실패: {}", path.display()))?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    let tx = conn.transaction()?;
+    let version = storage_core::read_user_version(&tx)?;
+    if !(38..=39).contains(&version) {
+        return Ok(());
+    }
+
+    let has_reconnect = sqlite_column_exists(&tx, "relay_devices", "reconnect_verifier")?;
+    let has_epoch = sqlite_column_exists(&tx, "relay_devices", "authorization_epoch")?;
+    let has_recovery =
+        sqlite_column_exists(&tx, "physical_secret_slot_ledger", "recovery_generation")?;
+    let canonical = match version {
+        38 => has_reconnect && !has_epoch && !has_recovery,
+        39 => has_reconnect && has_epoch && !has_recovery,
+        _ => unreachable!("v38/v39만 검사한다"),
+    };
+    anyhow::ensure!(
+        canonical,
+        "지원하지 않는 개발용 v{version} SQLite 스키마입니다 — 정식 migration으로 자동 변환하지 않았습니다"
+    );
+    Ok(())
+}
+
 impl Db {
     /// DB 열기 + 마이그레이션. infra(PRAGMA/백업/IMMEDIATE 러너)는 storage-core가 담당하고
     /// (v2.8 §6.1), 이 crate는 **마이그레이션 원장(MIGRATIONS, v1..vN 순서 불변)** 조립과
     /// 앱 수준 store/facade만 소유한다.
     pub fn open(path: &Path) -> anyhow::Result<Self> {
+        reject_noncanonical_development_schema(path)?;
         let conn = storage_core::open_with_migrations(path, MIGRATIONS)?;
         let authorization_db_identity = physical_db_identity(path)?;
         Ok(Self {
@@ -12077,8 +12149,12 @@ mod tests {
         let legacy = storage_core::open_with_migrations(&legacy_path, &MIGRATIONS[..38]).unwrap();
         let pending = relay_pending_row(1, 2, 3);
         legacy.execute("INSERT INTO relay_devices (device_id, identity_public_sec1, display_name, permission_view, permission_input, permission_upload, permission_approval, issued_at, device_expires_at, last_seen_at, revoked_at, reconnect_verifier) VALUES (?1, ?2, ?3, 1, 0, 0, 0, ?4, ?5, NULL, NULL, ?6)", rusqlite::params![pending.device_id.as_slice(), pending.identity_public_sec1.as_slice(), pending.display_name, pending.issued_at, pending.device_expires_at, [6u8; 32].as_slice()]).unwrap();
+        let logical = secret::LogicalCredentialId::new("relay-v38-secret").unwrap();
+        let slot = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+        legacy.execute("INSERT INTO physical_secret_slot_ledger (physical_slot,logical_credential_id,state,created_at,updated_at) VALUES (?1,?2,'staging',1,1)", (slot.as_str(),logical.as_str())).unwrap();
         drop(legacy);
         let migrated = Db::open(&legacy_path).unwrap();
+        assert_eq!(Db::read_user_version(&migrated.conn).unwrap(), 40);
         let row = migrated.relay_device(&pending.device_id).unwrap().unwrap();
         assert_ne!(row.authorization_epoch, [0; 16]);
         assert_eq!(row.identity_public_sec1, pending.identity_public_sec1);
@@ -12099,6 +12175,11 @@ mod tests {
                 .unwrap(),
             Some([6; 32])
         );
+        let recovery = migrated
+            .physical_secret_slots_for_reconciliation(1)
+            .unwrap();
+        assert_eq!(recovery[0].physical_slot, slot.as_str());
+        assert_ne!(recovery[0].recovery_generation, [0; 16]);
         drop(migrated);
         let reopened = Db::open(&legacy_path).unwrap();
         assert_eq!(
@@ -12759,8 +12840,8 @@ mod tests {
     }
 
     #[test]
-    fn relay_v36_file_migrates_to_v39_and_reopens() {
-        assert_eq!(MIGRATIONS.len(), 39);
+    fn relay_v36_file_migrates_to_v40_and_reopens() {
+        assert_eq!(MIGRATIONS.len(), 40);
         let dir = std::env::temp_dir().join(format!(
             "deppy-relay-v36-migration-{}-{}",
             std::process::id(),
@@ -12773,7 +12854,7 @@ mod tests {
         drop(legacy);
 
         let migrated = Db::open(&path).unwrap();
-        assert_eq!(Db::read_user_version(&migrated.conn).unwrap(), 39);
+        assert_eq!(Db::read_user_version(&migrated.conn).unwrap(), 40);
         for table in ["relay_pending_devices", "relay_devices"] {
             let present: bool = migrated
                 .conn
@@ -12787,7 +12868,7 @@ mod tests {
         }
         drop(migrated);
         let reopened = Db::open(&path).unwrap();
-        assert_eq!(Db::read_user_version(&reopened.conn).unwrap(), 39);
+        assert_eq!(Db::read_user_version(&reopened.conn).unwrap(), 40);
         drop(reopened);
         fs::remove_dir_all(dir).unwrap();
     }
@@ -18277,16 +18358,18 @@ mod tests {
     }
 
     #[test]
-    fn secret_recovery_v37_backfill_preserves_slots_and_generation_on_reopen() {
+    fn secret_recovery_v39_backfill_preserves_slots_and_generation_on_reopen() {
         let (dir, _, initial) = file_db("secret-recovery-backfill");
         drop(initial);
         let path = dir.join("legacy.sqlite3");
-        let legacy = storage_core::open_with_migrations(&path, &MIGRATIONS[..37]).unwrap();
+        let legacy = storage_core::open_with_migrations(&path, &MIGRATIONS[..39]).unwrap();
+        assert_eq!(storage_core::read_user_version(&legacy).unwrap(), 39);
         let logical = secret::LogicalCredentialId::new("recovery-backfill").unwrap();
         let slot = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
         legacy.execute("INSERT INTO physical_secret_slot_ledger (physical_slot,logical_credential_id,state,created_at,updated_at) VALUES (?1,?2,'staging',1,1)", (slot.as_str(),logical.as_str())).unwrap();
         drop(legacy);
         let migrated = Db::open(&path).unwrap();
+        assert_eq!(Db::read_user_version(&migrated.conn).unwrap(), 40);
         let rows = migrated
             .physical_secret_slots_for_reconciliation(8)
             .unwrap();
@@ -18295,6 +18378,7 @@ mod tests {
         assert_ne!(rows[0].recovery_generation, [0; 16]);
         drop(migrated);
         let reopened = Db::open(&path).unwrap();
+        assert_eq!(Db::read_user_version(&reopened.conn).unwrap(), 40);
         assert_eq!(
             rows,
             reopened
@@ -18302,6 +18386,31 @@ mod tests {
                 .unwrap()
         );
         drop(reopened);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn keychain개발판_v38은_canonical_relay_v38로_오인하지_않는다() {
+        let (dir, _, initial) = file_db("forked-secret-v38");
+        drop(initial);
+        let path = dir.join("forked-v38.sqlite3");
+        let forked = storage_core::open_with_migrations(&path, &MIGRATIONS[..37]).unwrap();
+        forked
+            .execute_batch(
+                "ALTER TABLE physical_secret_slot_ledger ADD COLUMN recovery_generation BLOB NOT NULL
+                    DEFAULT X'00000000000000000000000000000000'
+                    CHECK(typeof(recovery_generation) = 'blob' AND length(recovery_generation) = 16);
+                 UPDATE physical_secret_slot_ledger SET recovery_generation = randomblob(16);
+                 PRAGMA user_version = 38;",
+            )
+            .unwrap();
+        drop(forked);
+
+        let error = Db::open(&path).err().expect("forked v38은 거부해야 한다");
+        assert!(
+            error.to_string().contains("지원하지 않는 개발용 v38"),
+            "예상하지 못한 오류: {error}"
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 

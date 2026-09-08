@@ -2402,6 +2402,30 @@
 - Exact next commands: `git push -u origin land/ime-resize-ready-20260906`; create a `main` PR for commits `4903b39` and `bbead4f`; run `gh pr checks <new-pr> --watch`; merge the new PR after all required checks pass; close #147 and #148 without deleting the `fix/window-resize-flicker` branch because PR #149 still targets it.
 ## Ready PR 19개 main 통합 시작 (2026-09-09)
 
+### 통합 checkpoint — 18개 PR 및 migration v40 결합 완료
+
+- #157, #160, #165, #167, #159, #156, #173, #158, #164, #170, #171,
+  #161, #168, #169, #175, #172, #176, #166을 원본 이력을 보존하는 merge
+  commit으로 통합했다. 남은 원본 PR은 #174 하나다.
+- 의미 충돌은 터미널 cell 상한과 scrollback 정책, resize tracked generation,
+  워크스페이스 open/reorder action, 파일 트리 선택 밝기, App scrollback/Relay view,
+  다섯 locale의 합집합을 모두 보존해 해결했다.
+- Relay가 사용하는 정식 v38 reconnect verifier와 v39 authorization epoch 뒤에
+  Keychain `recovery_generation`을 v40으로 배치했다. 과거 Keychain 개발판 v38을
+  정식 Relay v38로 오인하지 않도록 읽기 snapshot의 schema fingerprint를 `Db`와
+  background writer 양쪽 open 경로에서 검사하고, 불일치하면 쓰기 전에 거부한다.
+- migration 결함은 먼저 실제 RED로 확인했다. v40 추가 전 `secret_recovery` 검사는
+  `no such column: ledger.recovery_generation`으로 실패했고, 개발판 v38 거부 및 정식
+  v38→v40 기대 검사도 2건 실패했다.
+- 실제 GREEN: `cargo test -p storage --locked 'v38' -- --test-threads=1` 2 PASS,
+  이어서 storage 전체 338 PASS / doc 0, exit 0. terminal/runtime/file-tree focused 결과는
+  앞선 통합 checkpoint에서 각각 runtime 301, terminal 95(4 ignored), file-tree 151,
+  workspace unavailable 회귀 1 PASS다.
+- 수정 파일: `crates/storage/src/db.rs`, `crates/storage/src/write_worker.rs`, 이 handoff.
+- 다음: #174를 병합하고 19개 head 포함 여부를 확인한 뒤 전체 gate와 Codex 리뷰,
+  통합 PR/main merge, 새 main package와 앱 재실행을 진행한다. 외부 DNS/TLS/배포는
+  자격증명 부재로 계속 BLOCKED다.
+
 - 현재 목표: #156~#176의 open Ready PR 19개를 의존 순서와 의미 보존 충돌 해결로 통합하고 단일 PR을 `main`에 merge한 뒤 앱을 최종 build/relaunch한다.
 - 작업 트리: `/private/tmp/deppy-ready-prs-integration-20260909`, 브랜치 `integrate/ready-prs-20260909`, 기준 `origin/main` `45e66ccae313e653fc5dc6df46b80f791f231fc4`. 원래 `/Users/jr/Desktop/projects/deppy-sijo`의 `feat/fleet-one-list-and-relay-wip`는 건드리지 않는다.
 - 확인된 충돌: 모든 PR의 `docs/CODEX_HANDOFF.md`; #157/#159 `runtime/src/command.rs`; #159/#167 `ui/workspace.rs`; #156/#173 `app.rs`와 `ui/file_tree.rs`; #161/#169 Relay v38/v39와 #166 Keychain v38 migration 번호. Relay 뒤 Keychain을 v40으로 옮긴다.

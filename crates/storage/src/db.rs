@@ -793,6 +793,10 @@ CREATE TABLE relay_devices (
 CREATE INDEX idx_relay_devices_recency
     ON relay_devices(revoked_at, last_seen_at DESC, issued_at DESC, device_id);
 ",
+    // v38: 재접속 raw grant는 브라우저에만 있고 DB는 검증자만 보존한다.
+    "ALTER TABLE relay_devices ADD COLUMN reconnect_verifier BLOB
+        CHECK (reconnect_verifier IS NULL OR
+            (typeof(reconnect_verifier) = 'blob' AND length(reconnect_verifier) = 32));",
 ];
 
 /// 옵션2: 저장된 에이전트 세션 한 행 — 재시작 복원 시 native resume에 쓴다.
@@ -10038,7 +10042,8 @@ impl Db {
                  issued_at = excluded.issued_at,
                  device_expires_at = excluded.device_expires_at,
                  last_seen_at = NULL,
-                 revoked_at = NULL",
+                 revoked_at = NULL,
+                 reconnect_verifier = NULL",
             rusqlite::params![
                 pending.device_id.as_slice(),
                 pending.identity_public_sec1.as_slice(),
@@ -10129,6 +10134,44 @@ impl Db {
         }
     }
 
+    /// 승인된 동일 신원에만 검증자를 처음 저장하거나 같은 값으로 재시도한다.
+    pub fn store_relay_reconnect_verifier(
+        &self,
+        device_id: &[u8; 16],
+        identity: &[u8; 65],
+        verifier: &[u8; 32],
+        now: i64,
+    ) -> anyhow::Result<bool> {
+        anyhow::ensure!(now >= 0, "relay reconnect timestamp invalid");
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE relay_devices SET reconnect_verifier = ?3
+             WHERE device_id = ?1 AND identity_public_sec1 = ?2 AND revoked_at IS NULL
+               AND issued_at <= ?4 AND device_expires_at > ?4 AND permission_view = 1
+               AND (reconnect_verifier IS NULL OR reconnect_verifier = ?3)",
+            rusqlite::params![
+                device_id.as_slice(),
+                identity.as_slice(),
+                verifier.as_slice(),
+                now
+            ],
+        )?;
+        tx.commit()?;
+        Ok(changed == 1)
+    }
+
+    pub fn relay_reconnect_verifier(
+        &self,
+        device_id: &[u8; 16],
+    ) -> anyhow::Result<Option<[u8; 32]>> {
+        let mut statement = self.conn.prepare_cached("SELECT reconnect_verifier FROM relay_devices WHERE device_id = ?1 AND reconnect_verifier IS NOT NULL")?;
+        let mut rows = statement.query([device_id.as_slice()])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(relay_blob(row, 0)?)),
+            None => Ok(None),
+        }
+    }
+
     pub fn list_relay_devices_bounded(&self, limit: usize) -> anyhow::Result<Vec<RelayDeviceRow>> {
         anyhow::ensure!(limit <= RELAY_DEVICE_ROWS_MAX, "relay device limit invalid");
         let probe_limit = i64::try_from(limit.saturating_add(1))?;
@@ -10191,7 +10234,7 @@ impl Db {
         );
         if existing_revocation.is_none() {
             tx.execute(
-                "UPDATE relay_devices SET revoked_at = ?2
+                "UPDATE relay_devices SET revoked_at = ?2, reconnect_verifier = NULL
                  WHERE device_id = ?1 AND revoked_at IS NULL",
                 rusqlite::params![device_id.as_slice(), revoked_at],
             )?;
@@ -11781,6 +11824,90 @@ mod tests {
         }
     }
 
+    #[test]
+    fn relay_reconnect_verifier_persists_and_revocation_prevents_reregistration() {
+        let (dir, path, db) = file_db("relay-reconnect");
+        let pending = relay_pending_row(1, 2, 3);
+        db.insert_relay_pending_device(&pending, pending.issued_at)
+            .unwrap();
+        db.approve_relay_pending_device(
+            &pending.pairing_id,
+            &pending.identity_public_sec1,
+            pending.issued_at + 1,
+        )
+        .unwrap();
+        assert!(
+            db.store_relay_reconnect_verifier(
+                &pending.device_id,
+                &pending.identity_public_sec1,
+                &[7; 32],
+                pending.issued_at + 2
+            )
+            .unwrap()
+        );
+        assert!(
+            !db.store_relay_reconnect_verifier(
+                &pending.device_id,
+                &pending.identity_public_sec1,
+                &[8; 32],
+                pending.issued_at + 2
+            )
+            .unwrap()
+        );
+        assert!(
+            !db.store_relay_reconnect_verifier(
+                &pending.device_id,
+                &[9; 65],
+                &[7; 32],
+                pending.issued_at + 2
+            )
+            .unwrap()
+        );
+        assert!(
+            !db.store_relay_reconnect_verifier(
+                &pending.device_id,
+                &pending.identity_public_sec1,
+                &[7; 32],
+                pending.device_expires_at
+            )
+            .unwrap()
+        );
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(
+            db.relay_reconnect_verifier(&pending.device_id).unwrap(),
+            Some([7; 32])
+        );
+        db.revoke_relay_device(&pending.device_id, pending.issued_at + 3)
+            .unwrap();
+        assert_eq!(
+            db.relay_reconnect_verifier(&pending.device_id).unwrap(),
+            None
+        );
+        assert!(
+            !db.store_relay_reconnect_verifier(
+                &pending.device_id,
+                &pending.identity_public_sec1,
+                &[7; 32],
+                pending.issued_at + 4
+            )
+            .unwrap()
+        );
+        drop(db);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn relay_reconnect_schema_stores_only_a_bounded_verifier() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(
+            db.conn
+                .prepare("SELECT reconnect_verifier FROM relay_devices")
+                .is_ok(),
+            "재접속 verifier migration이 필요하다"
+        );
+    }
+
     /// 페어링 마감(5분)과 기기 만료(장기)는 서로 다른 수명이다. 한 컬럼으로 합치면
     /// 5분짜리 승인 창이 24시간으로 늘어나거나 기기가 5분 만에 죽는다.
     #[test]
@@ -12170,8 +12297,8 @@ mod tests {
     }
 
     #[test]
-    fn relay_v36_file_migrates_to_v37_and_reopens() {
-        assert_eq!(MIGRATIONS.len(), 37);
+    fn relay_v36_file_migrates_to_v38_and_reopens() {
+        assert_eq!(MIGRATIONS.len(), 38);
         let dir = std::env::temp_dir().join(format!(
             "deppy-relay-v36-migration-{}-{}",
             std::process::id(),
@@ -12184,7 +12311,7 @@ mod tests {
         drop(legacy);
 
         let migrated = Db::open(&path).unwrap();
-        assert_eq!(Db::read_user_version(&migrated.conn).unwrap(), 37);
+        assert_eq!(Db::read_user_version(&migrated.conn).unwrap(), 38);
         for table in ["relay_pending_devices", "relay_devices"] {
             let present: bool = migrated
                 .conn
@@ -12198,7 +12325,7 @@ mod tests {
         }
         drop(migrated);
         let reopened = Db::open(&path).unwrap();
-        assert_eq!(Db::read_user_version(&reopened.conn).unwrap(), 37);
+        assert_eq!(Db::read_user_version(&reopened.conn).unwrap(), 38);
         drop(reopened);
         fs::remove_dir_all(dir).unwrap();
     }

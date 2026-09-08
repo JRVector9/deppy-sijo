@@ -9,16 +9,20 @@
 //! - 대기는 전부 **취소 가능**하다. 백오프 도중 꺼도 그 시간을 다 기다리지 않는다.
 //! - `shutdown`은 정지 신호를 올리고 스레드를 join한다. Drop도 같은 일을 한다.
 
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use super::lifecycle::{BackoffPolicy, RelayEndpoint, RelayLifecycle, RelayState};
 
 /// 대기 중인 명령 상한. 이 이상은 거절한다 — UI 클릭이 큐를 무한정 밀어 넣지 못하게 한다.
 pub const MAX_PENDING_COMMANDS: usize = 32;
+/// 한 번의 소켓 읽기가 막을 수 있는 최대 시간. 소켓 읽기는 취소할 수 없으므로 이 값이 곧
+/// 끄기·종료가 관측되기까지의 최악 지연이다.
+pub const MAX_RECEIVE_SLICE: Duration = Duration::from_secs(1);
 
 /// 전송 실패의 종류. **재시도해도 되는가**를 여기서 가른다.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,8 +65,22 @@ pub enum SinkOutcome {
 /// 워커가 받은 프레임을 넘길 곳. 권한 강제 어댑터가 이 자리에 들어온다.
 pub trait RelayFrameSink: Send {
     fn accept(&mut self, frame: &[u8]) -> SinkOutcome;
+    /// 세션이 열렸다. 핸드셰이크 상태 기계가 라우트 입장 프레임을 큐에 넣을 기회다.
+    fn session_started(&mut self) {}
     /// 세션이 끝났다. 어댑터가 세션 상태를 버릴 기회다.
     fn session_ended(&mut self) {}
+    /// 나갈 프레임을 꺼낸다. 워커는 세션 시작 직후와 매 수신 뒤에 한 번씩 비운다 —
+    /// 싱크가 직접 소켓을 들지 않아야 "소유 스레드 하나"가 유지된다.
+    fn drain_outbound(&mut self) -> Vec<Vec<u8>> {
+        Vec::new()
+    }
+
+    /// 프레임이 오지 않는 동안에도 워커가 부르는 주기 점검. 마감·생존 신호·조정자의 거절처럼
+    /// **시간으로만 판정되는 것**이 여기서 다뤄진다. 이 훅이 없으면 그런 판정은 상대가 말을
+    /// 걸어야만 이뤄지는데, 정확히 그 상대가 문제인 경우를 놓친다.
+    fn poll(&mut self) -> SinkOutcome {
+        SinkOutcome::Continue
+    }
 }
 
 /// 상태 변화를 관찰한다. UI와 테스트가 같은 창으로 본다.
@@ -294,6 +312,13 @@ fn pump(
     wake: &Wake,
     stop: &AtomicBool,
 ) {
+    // 세션이 열리자마자 싱크가 라우트 입장 자격증명을 낸다. 이 프레임이 나가지 못하면
+    // 이 세션에서는 아무것도 일어나지 않으므로, 실패는 곧 세션 실패다.
+    sink.session_started();
+    if !flush(session.as_mut(), sink, lifecycle, observer, wake) {
+        return;
+    }
+
     loop {
         if stop.load(Ordering::SeqCst) {
             session.close();
@@ -309,7 +334,27 @@ fn pump(
             return;
         }
 
-        match session.receive(deadlines.read) {
+        // 주기 점검은 **매 바퀴** 돈다. 수신 시한 만료 분기에만 걸어 두면 읽기 조각(1초)보다
+        // 자주 말을 거는 상대 하나가 생존 신호·마감 판정·조정자의 거절을 통째로 멈춰 세운다 —
+        // 정확히 그 상대가 문제인 경우를 놓친다. 자리는 명령·수명주기 확인 **뒤**(끄기와 종료가
+        // 싱크의 사정보다 앞선다. 이미 닫기로 한 세션에 싱크를 더 돌리지 않는다)이고
+        // 수신 **앞**이다(여기서 큐에 든 생존 신호가 읽기 대기 뒤로 밀리지 않는다).
+        // 바쁜 대기는 생기지 않는다 — 이 바퀴의 대기는 여전히 아래 `receive`가 맡는다.
+        if sink.poll() == SinkOutcome::CloseChannel {
+            session.close();
+            record_failure(lifecycle, TransportError::Unavailable, observer);
+            wake.signal();
+            return;
+        }
+        // 싱크가 큐에 넣은 것(생존 신호, 승인된 채널의 첫 화면, 갱신된 대시보드)을 내보낸다 —
+        // 상대가 말을 걸어야만 우리가 보낼 수 있다면 view-only 기기는 영원히 첫 화면을 못 받는다.
+        if !flush(session.as_mut(), sink, lifecycle, observer, wake) {
+            return;
+        }
+
+        // 소켓 읽기는 취소할 수 없다 — 취소 가능한 것은 조건 변수 대기뿐이다. 그래서 읽기
+        // 시한을 짧게 잘라, 끄기·종료 신호를 이 주기 안에 반드시 보게 한다.
+        match session.receive(deadlines.read.min(MAX_RECEIVE_SLICE)) {
             Ok(Some(frame)) => {
                 if sink.accept(&frame) == SinkOutcome::CloseChannel {
                     // 정책 위반으로 닫는다. 전송 실패와 같은 경로로 물러나므로 즉시
@@ -319,8 +364,11 @@ fn pump(
                     wake.signal();
                     return;
                 }
+                if !flush(session.as_mut(), sink, lifecycle, observer, wake) {
+                    return;
+                }
             }
-            // 시한만 지났다. 명령을 다시 확인하고 계속 기다린다.
+            // 시한만 지났다. 다음 바퀴의 주기 점검과 비우기가 곧바로 이어진다.
             Ok(None) => {}
             Err(error) => {
                 session.close();
@@ -330,6 +378,26 @@ fn pump(
             }
         }
     }
+}
+
+/// 싱크가 큐에 넣은 프레임을 모두 내보낸다. 하나라도 실패하면 세션을 끝낸다 — 반쯤 나간
+/// 핸드셰이크를 이어 가면 상대는 영원히 기다린다.
+fn flush(
+    session: &mut dyn RelaySession,
+    sink: &mut dyn RelayFrameSink,
+    lifecycle: &mut RelayLifecycle,
+    observer: &dyn RelayObserver,
+    wake: &Wake,
+) -> bool {
+    for frame in sink.drain_outbound() {
+        if let Err(error) = session.send(&frame) {
+            session.close();
+            record_failure(lifecycle, error, observer);
+            wake.signal();
+            return false;
+        }
+    }
+    true
 }
 
 /// 실패 종류에 따라 수명주기를 옮긴다. 자동 재시도가 허용되는 것은 일시적 실패뿐이다.
@@ -378,14 +446,17 @@ fn idle_wait(lifecycle: &RelayLifecycle, now: u64) -> Duration {
         RelayState::Backoff { until, .. } => {
             Duration::from_millis(until.saturating_sub(now).saturating_mul(1_000).min(1_000))
         }
-        _ => Duration::from_millis(500),
+        // 멈춰 있을 때는 길게 잔다. 이 대기는 취소 가능하므로 명령이 오면 즉시 깨어난다 —
+        // 짧게 잡으면 인증 실패 뒤에도 소유 스레드가 영원히 2Hz로 깨어난다.
+        _ => Duration::from_secs(60),
     }
 }
 
+/// 수명주기가 쓰는 단조 시계(프로세스 시작 기준 초). 벽시계를 쓰면 NTP가 시각을 뒤로
+/// 돌렸을 때 `may_connect`가 영영 거짓이 되어 Relay가 조용히 죽어 있는다.
 fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs())
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_secs()
 }
 
 /// 백오프 지터용 0.0..1.0. 실패하면 지터 없이(0.0) 진행한다 — 엔트로피 부족이
@@ -508,6 +579,41 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .contains(&RelayState::Halted(reason))
+        }
+
+        fn saw_backoff(&self) -> bool {
+            self.states
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .any(|state| matches!(state, RelayState::Backoff { .. }))
+        }
+    }
+
+    /// 프레임 하나를 **끊임없이** 흘려보내는 세션 — 수신 시한이 만료되는 일이 없다.
+    struct TalkingSession;
+
+    impl RelaySession for TalkingSession {
+        fn receive(&mut self, _timeout: Duration) -> Result<Option<Vec<u8>>, TransportError> {
+            Ok(Some(b"frame".to_vec()))
+        }
+
+        fn send(&mut self, _frame: &[u8]) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn close(&mut self) {}
+    }
+
+    struct TalkingTransport;
+
+    impl RelayTransport for TalkingTransport {
+        fn connect(
+            &mut self,
+            _endpoint: &RelayEndpoint,
+            _deadline: Duration,
+        ) -> Result<Box<dyn RelaySession>, TransportError> {
+            Ok(Box::new(TalkingSession))
         }
     }
 
@@ -709,33 +815,6 @@ mod tests {
             }
         }
 
-        /// 프레임 하나를 계속 흘려보내는 세션.
-        struct TalkingSession;
-
-        impl RelaySession for TalkingSession {
-            fn receive(&mut self, _timeout: Duration) -> Result<Option<Vec<u8>>, TransportError> {
-                Ok(Some(b"frame".to_vec()))
-            }
-
-            fn send(&mut self, _frame: &[u8]) -> Result<(), TransportError> {
-                Ok(())
-            }
-
-            fn close(&mut self) {}
-        }
-
-        struct TalkingTransport;
-
-        impl RelayTransport for TalkingTransport {
-            fn connect(
-                &mut self,
-                _endpoint: &RelayEndpoint,
-                _deadline: Duration,
-            ) -> Result<Box<dyn RelaySession>, TransportError> {
-                Ok(Box::new(TalkingSession))
-            }
-        }
-
         let closed = Arc::new(AtomicUsize::new(0));
         let mut worker = RelayWorker::spawn(
             endpoint(),
@@ -753,6 +832,168 @@ mod tests {
             "싱크가 닫으라고 했는데 세션이 끝나지 않았다"
         );
         worker.shutdown();
+    }
+
+    /// 주기 점검은 상대가 쉬지 않고 말을 걸어도 돈다. 수신 시한 만료에만 걸어 두면 1초보다
+    /// 자주 오는 상대 하나가 생존 신호·마감 판정·조정자의 거절을 통째로 멈춰 세운다 —
+    /// 정확히 그 상대가 문제인 경우다.
+    #[test]
+    fn the_periodic_poll_runs_even_when_frames_never_stop_arriving() {
+        struct CountingSink {
+            polls: Arc<AtomicUsize>,
+        }
+
+        impl RelayFrameSink for CountingSink {
+            fn accept(&mut self, _frame: &[u8]) -> SinkOutcome {
+                SinkOutcome::Continue
+            }
+
+            fn poll(&mut self) -> SinkOutcome {
+                self.polls.fetch_add(1, Ordering::SeqCst);
+                SinkOutcome::Continue
+            }
+        }
+
+        let polls = Arc::new(AtomicUsize::new(0));
+        let mut worker = RelayWorker::spawn(
+            endpoint(),
+            Box::new(TalkingTransport),
+            Box::new(CountingSink {
+                polls: Arc::clone(&polls),
+            }),
+            Arc::new(IgnoreObserver),
+            deadlines(),
+            fast_backoff(),
+        );
+        worker.enable();
+        assert!(
+            wait_until(Duration::from_secs(5), || polls.load(Ordering::SeqCst) >= 3),
+            "유휴 분기가 오지 않는 세션에서도 주기 점검은 돌아야 한다"
+        );
+        worker.shutdown();
+    }
+
+    /// 주기 점검이 닫으라고 하면 세션이 끝나고 전송 실패로 기록된다 — 프레임이 끊이지 않는
+    /// 중에도 그렇다. 봉인 실패와 조정자의 거절이 이 경로로만 관측된다.
+    #[test]
+    fn a_poll_that_asks_to_close_ends_the_session_and_backs_off() {
+        struct PollClosingSink {
+            ended: Arc<AtomicUsize>,
+        }
+
+        impl RelayFrameSink for PollClosingSink {
+            fn accept(&mut self, _frame: &[u8]) -> SinkOutcome {
+                SinkOutcome::Continue
+            }
+
+            fn poll(&mut self) -> SinkOutcome {
+                SinkOutcome::CloseChannel
+            }
+
+            fn session_ended(&mut self) {
+                self.ended.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let ended = Arc::new(AtomicUsize::new(0));
+        let observer = Arc::new(RecordingObserver::default());
+        let mut worker = RelayWorker::spawn(
+            endpoint(),
+            Box::new(TalkingTransport),
+            Box::new(PollClosingSink {
+                ended: Arc::clone(&ended),
+            }),
+            Arc::clone(&observer) as Arc<dyn RelayObserver>,
+            deadlines(),
+            fast_backoff(),
+        );
+        worker.enable();
+        assert!(
+            wait_until(Duration::from_secs(5), || ended.load(Ordering::SeqCst) > 0),
+            "주기 점검이 닫으라고 했는데 세션이 끝나지 않았다"
+        );
+        assert!(
+            observer.saw_backoff(),
+            "전송 실패로 기록되어야 즉시 다시 붙지 않는다"
+        );
+        worker.shutdown();
+    }
+
+    /// 소켓 읽기는 취소할 수 없다. 워커가 준 읽기 시한이 아무리 길어도 한 번의 읽기는
+    /// `MAX_RECEIVE_SLICE`를 넘지 않아야 끄기·종료가 그 안에 관측된다.
+    #[test]
+    fn a_single_receive_never_blocks_longer_than_the_slice() {
+        struct SlowSession {
+            observed: Arc<Mutex<Vec<Duration>>>,
+        }
+
+        impl RelaySession for SlowSession {
+            fn receive(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>, TransportError> {
+                self.observed
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(timeout);
+                std::thread::sleep(Duration::from_millis(2));
+                Ok(None)
+            }
+
+            fn send(&mut self, _frame: &[u8]) -> Result<(), TransportError> {
+                Ok(())
+            }
+
+            fn close(&mut self) {}
+        }
+
+        struct SlowTransport {
+            observed: Arc<Mutex<Vec<Duration>>>,
+        }
+
+        impl RelayTransport for SlowTransport {
+            fn connect(
+                &mut self,
+                _endpoint: &RelayEndpoint,
+                _deadline: Duration,
+            ) -> Result<Box<dyn RelaySession>, TransportError> {
+                Ok(Box::new(SlowSession {
+                    observed: Arc::clone(&self.observed),
+                }))
+            }
+        }
+
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let mut worker = RelayWorker::spawn(
+            endpoint(),
+            Box::new(SlowTransport {
+                observed: Arc::clone(&observed),
+            }),
+            Box::new(RecordingSink::default()),
+            Arc::new(IgnoreObserver),
+            RelayDeadlines {
+                connect: Duration::from_millis(50),
+                // 워커가 30초를 줘도…
+                read: Duration::from_secs(30),
+            },
+            fast_backoff(),
+        );
+        worker.enable();
+        assert!(wait_until(Duration::from_secs(3), || !observed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty()));
+        let started = Instant::now();
+        worker.shutdown();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "종료가 읽기 시한에 묶이면 안 된다"
+        );
+        // …실제 소켓 읽기는 조각 상한을 넘지 않는다.
+        for timeout in observed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+        {
+            assert!(*timeout <= MAX_RECEIVE_SLICE, "{timeout:?}");
+        }
     }
 
     /// 명령 큐는 유계다 — UI 클릭이 큐를 무한정 밀어 넣지 못한다.
@@ -773,5 +1014,82 @@ mod tests {
         );
         drop(inbox);
         drop(transport);
+    }
+
+    /// 상대가 아무것도 보내지 않아도 싱크가 큐에 넣은 프레임은 유휴 tick에 나간다.
+    #[test]
+    fn queued_outbound_frames_leave_on_an_idle_tick_without_any_inbound_frame() {
+        struct RecordingSession {
+            sent: Arc<Mutex<Vec<Vec<u8>>>>,
+        }
+        impl RelaySession for RecordingSession {
+            fn receive(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>, TransportError> {
+                std::thread::sleep(timeout.min(Duration::from_millis(5)));
+                Ok(None)
+            }
+            fn send(&mut self, frame: &[u8]) -> Result<(), TransportError> {
+                self.sent
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(frame.to_vec());
+                Ok(())
+            }
+            fn close(&mut self) {}
+        }
+        struct RecordingTransport {
+            sent: Arc<Mutex<Vec<Vec<u8>>>>,
+        }
+        impl RelayTransport for RecordingTransport {
+            fn connect(
+                &mut self,
+                _endpoint: &RelayEndpoint,
+                _deadline: Duration,
+            ) -> Result<Box<dyn RelaySession>, TransportError> {
+                Ok(Box::new(RecordingSession {
+                    sent: Arc::clone(&self.sent),
+                }))
+            }
+        }
+        /// 세션 시작 뒤 한참 있다가(수신 없이) 프레임 하나를 큐에 넣는 싱크.
+        struct LateSink {
+            drains: usize,
+        }
+        impl RelayFrameSink for LateSink {
+            fn accept(&mut self, _frame: &[u8]) -> SinkOutcome {
+                SinkOutcome::Continue
+            }
+            fn drain_outbound(&mut self) -> Vec<Vec<u8>> {
+                self.drains += 1;
+                // 첫 번째 비우기는 세션 시작 직후다. 그 뒤의 비우기는 주기 tick뿐이다.
+                if self.drains == 3 {
+                    vec![b"late-frame".to_vec()]
+                } else {
+                    Vec::new()
+                }
+            }
+        }
+
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut worker = RelayWorker::spawn(
+            endpoint(),
+            Box::new(RecordingTransport {
+                sent: Arc::clone(&sent),
+            }),
+            Box::new(LateSink { drains: 0 }),
+            Arc::new(RecordingObserver::default()) as Arc<dyn RelayObserver>,
+            deadlines(),
+            fast_backoff(),
+        );
+        worker.enable();
+        assert!(
+            wait_until(Duration::from_millis(500), || {
+                sent.lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .iter()
+                    .any(|frame| frame == b"late-frame")
+            }),
+            "유휴 tick에서 큐가 비워져야 한다"
+        );
+        worker.shutdown();
     }
 }

@@ -2496,3 +2496,30 @@
   `git merge-base --is-ancestor 2e92888 origin/main`; 새 main worktree에서
   `scripts/package-macos.sh`를 실행하고 `pgrep -x deppy-sijo`로 찾은 정확한 PID만
   종료한 뒤 `open 'target/bundle/Deppy Sijo.app'`.
+
+### 통합 checkpoint — main 착지와 최종 앱 실행 완료
+
+- 현재 목표는 완료했다. PR #177을 merge commit 방식으로 반영했고 `origin/main`은
+  `0d28e843d6dc2b182a4f4d95e98ac8a23730b03a`이다. 통합 HEAD `cd9c97f`가
+  `origin/main`의 조상임을 확인했다.
+- 스택 구조 때문에 열린 채로 남은 #165, #167, #168, #169, #175는 #177로 대체된
+  사실을 comment하고 닫았다. 원격 브랜치는 이력 보존을 위해 삭제하지 않았다. 열린
+  PR은 0개다.
+- `main` push의 Build and test 4개와 Dependency security 2개도 모두
+  `runner_id=0`, `steps=[]`로 종료됐다. 별도 deploy workflow는 저장소에 없어서 merge로
+  배포가 시작되지 않았다.
+- `/private/tmp/deppy-main-final-20260909`의 위 main commit에서 로컬 개발 package를
+  만들었다. `Developer ID Application: VectorNine INC (ZDTU5LS35K)`로 앱과 helper를
+  서명했고 bundle/ZIP plist·architecture·서명·hash 검증이 PASS했다. 공증 자격증명이
+  없어 notarization과 Gatekeeper 공증 검증은 실행하지 않았다.
+- 이전 앱 PID `14088`만 종료하고 새 bundle을 실행했다. 새 PID는 `63974`, 실행 경로는
+  `/private/tmp/deppy-main-final-20260909/target/bundle/Deppy Sijo.app/Contents/MacOS/deppy-sijo`다.
+- 수정 파일: 이 handoff와 통합 계획 문서뿐이다. 최종 결과는 Obsidian
+  `프로젝트 일지/deppy-sijo/2026-09-09 Ready PR main 통합.md`에도 기록했다.
+- 남은 작업: 코드·PR 통합 작업은 없다. DNS·TLS·배포 자격증명이 없으므로 production
+  Relay 배포 검증만 BLOCKED다. 사용자가 실행 중인 앱에서 화면·한글 입력·리사이즈·
+  scrollback을 직접 확인한다.
+- 다음 명령: 앱 상태 확인은 `pgrep -x deppy-sijo`와
+  `ps -o pid=,ppid=,pgid=,state=,etime=,command= -p 63974`; production Relay 검증은
+  자격증명 확보 뒤 `docs/CODEX_HANDOFF.md`의 Relay Task 2 절에 적힌 staging 명령부터
+  재개한다.

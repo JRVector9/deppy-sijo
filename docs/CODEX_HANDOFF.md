@@ -2333,3 +2333,13 @@
 - Failed approaches: an initial unbounded `codex review --uncommitted` ran extensive checks but never produced a final review and was stopped by exact PID; it also attempted the invalid `cargo test -p deppy-sijo --lib` command even though the app has no library target. The first RED-test draft used unavailable `Context::run`, then captured `WorkspaceUi` too broadly; both compile-only mistakes were corrected before the intended RED assertion was observed. The first final format check found one line-wrap difference; `cargo fmt --all` corrected it and the rerun passed.
 - Remaining work: push this clean landing branch, create a PR to `main`, wait for required checks, merge only if green, close superseded PRs #147 and #148, and preserve PRs #146 and #149 plus their dependent remote branches for further development.
 - Exact next commands: `git push -u origin land/ime-resize-ready-20260906`; create a `main` PR for commits `4903b39` and `bbead4f`; run `gh pr checks <new-pr> --watch`; merge the new PR after all required checks pass; close #147 and #148 without deleting the `fix/window-resize-flicker` branch because PR #149 still targets it.
+
+
+## 2026-09-08 검증된 터미널 너비 맞춤 main 독립 이관
+
+- 목표: base origin/main 45e66cc의 fix/preserve-terminal-layout-main에서 #149 제품 commit 16e642a만 이관해 새 main PR을 만든다. 원본 #149와 다른 lane은 건드리지 않는다.
+- 완료: writing-plans 계획을 docs/superpowers/plans/2026-09-08-preserve-terminal-layout-main.md에 작성하고 원본 제품 diff 및 main #150/#154 계약을 확인했다.
+- 설계 결정: 부모가 사용자의 #149 화면 확인을 전달했다. 따라서 scale<=1과 논리 열 보존을 그대로 유지하며, 넓은 pane을 채우려 폰트를 확대하는 해석은 적용하지 않는다. cols/geometry 개선은 별도 체인이다.
+- 수정 파일: 계획과 이 handoff 섹션만. 제품 수정/테스트 아직 없음.
+- 남은 작업: 정확한 4개 제품 파일 hunk 이식, focused tests·strict Clippy·fmt·diff·boundary, Codex 리뷰/수정, 한국어 커밋/push/새 PR. GUI 빌드·실행 금지, 이 main 조합의 시각 검증 대기.
+- 다음 명령: git diff 16e642a^ 16e642a -- crates/app/src/ui/workspace.rs crates/terminal/src/renderer_egui.rs crates/runtime/src/command.rs crates/runtime/src/lib.rs; git apply --check /private/tmp/deppy-preserve-layout-product.patch.

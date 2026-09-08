@@ -143,6 +143,7 @@ impl AlacrittyBackend {
             TerminalCacheClass::Hidden | TerminalCacheClass::Exited
         ) {
             self.term.grid_mut().compress_history(0);
+            self.term.inactive_grid_mut().compress_history(0);
         }
         let after = self.cache_footprint();
         let limit_reduced = target < before.scrollback_limit_lines;
@@ -503,6 +504,21 @@ impl TerminalBackend for AlacrittyBackend {
         self.apply_cache_class(class)
     }
 
+    fn set_scrollback_limit(&mut self, requested: usize) -> crate::ScrollbackApplyResult {
+        let bounded = requested.min(crate::policy::SCROLLBACK_LINES_MAX);
+        let before = self.term.grid().history_size() + self.term.inactive_grid().history_size();
+        if self.scrollback_lines != bounded {
+            self.scrollback_lines = bounded;
+            self.apply_cache_class(self.cache_class);
+        }
+        let after = self.term.grid().history_size() + self.term.inactive_grid().history_size();
+        crate::ScrollbackApplyResult::Applied {
+            requested,
+            effective: self.active_scrollback_limit,
+            trimmed: before.saturating_sub(after),
+        }
+    }
+
     fn trim_scrollback(&mut self, max_lines: usize) -> Option<TerminalCacheEvent> {
         let target = self.active_scrollback_limit.min(max_lines);
         if target >= self.active_scrollback_limit {
@@ -593,82 +609,15 @@ impl TerminalBackend for AlacrittyBackend {
     /// 그대로 feed하면 스크롤백·색·wide char가 복원된다 (압축 아카이브 왕복용).
     /// wrapped 행은 개행 없이 이어붙여 복원 시 reflow가 자연스럽다.
     fn serialize_scrollback(&self) -> Option<Vec<u8>> {
-        let grid = self.term.grid();
-        let cols = self.term.columns();
-        let rows = self.term.screen_lines();
-        let history = self.term.history_size();
-        let colors = self.term.colors();
-        let mut out: Vec<u8> = Vec::with_capacity((history + rows) * cols);
-        // 현재 SGR 상태 — 색이 바뀔 때만 시퀀스를 낸다
-        let mut current: Option<([u8; 3], [u8; 3])> = None;
-        let total = history as i32 + rows as i32;
-        // deppy-sijo(D): 압축된 히스토리 행은 read_line이 scratch로 복원해 준다.
-        let mut scratch = Row::<AlacrittyCell>::new(cols);
-        for (emitted, line_idx) in (-(history as i32)..rows as i32).enumerate() {
-            let line = grid.read_line(alacritty_terminal::index::Line(line_idx), &mut scratch);
-            let wrapped = line[alacritty_terminal::index::Column(cols - 1)]
-                .flags
-                .contains(Flags::WRAPLINE);
-            // trailing 기본 빈칸 trim (wrapped 행은 전체 폭 보존 — 이어붙는 내용)
-            let mut end = cols;
-            if !wrapped {
-                while end > 0 {
-                    let cell = &line[alacritty_terminal::index::Column(end - 1)];
-                    let plain = cell.c == ' '
-                        && cell.zerowidth().is_none()
-                        && resolve_color(cell.bg, colors, DEFAULT_BG) == DEFAULT_BG
-                        && !cell.flags.contains(Flags::INVERSE);
-                    if plain {
-                        end -= 1;
-                    } else {
-                        break;
-                    }
-                }
-            }
-            for col in 0..end {
-                let cell = &line[alacritty_terminal::index::Column(col)];
-                if cell
-                    .flags
-                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
-                {
-                    continue;
-                }
-                let (mut fg, mut bg) = (
-                    resolve_color(cell.fg, colors, DEFAULT_FG),
-                    resolve_color(cell.bg, colors, DEFAULT_BG),
-                );
-                if cell.flags.contains(Flags::INVERSE) {
-                    std::mem::swap(&mut fg, &mut bg);
-                }
-                if current != Some((fg, bg)) {
-                    if (fg, bg) == (DEFAULT_FG, DEFAULT_BG) {
-                        out.extend_from_slice(b"\x1b[0m");
-                    } else {
-                        out.extend_from_slice(
-                            format!(
-                                "\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m",
-                                fg[0], fg[1], fg[2], bg[0], bg[1], bg[2]
-                            )
-                            .as_bytes(),
-                        );
-                    }
-                    current = Some((fg, bg));
-                }
-                let mut buf = [0u8; 4];
-                out.extend_from_slice(cell.c.encode_utf8(&mut buf).as_bytes());
-                if let Some(zerowidth) = cell.zerowidth() {
-                    for zw in zerowidth {
-                        out.extend_from_slice(zw.encode_utf8(&mut buf).as_bytes());
-                    }
-                }
-            }
-            // wrapped면 개행 없이 이어붙임, 마지막 행 뒤에는 개행 없음(화면 밀림 방지)
-            if !wrapped && (emitted as i32) < total - 1 {
-                out.extend_from_slice(b"\r\n");
-            }
-        }
-        out.extend_from_slice(b"\x1b[0m");
-        Some(out)
+        // 복원/압축 archive의32MiB상한을직렬화할때부터지킨다.
+        serialize_scrollback_bounded(self, 32 * 1024 * 1024).ok()
+    }
+
+    fn serialize_scrollback_bounded(
+        &self,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, crate::ScrollbackSerializeError> {
+        serialize_scrollback_bounded(self, max_bytes)
     }
 
     /// scrollback+화면 전체에서 query를 부분 문자열로(대소문자 무시) 찾는다 (T3).
@@ -949,6 +898,125 @@ fn named_default(named: NamedColor, default: [u8; 3]) -> [u8; 3] {
     }
 }
 
+// 큰 history를 ANSI로 펼치는 중에도 출력 상한을 넘는 임시 할당을 만들지 않는다.
+struct BoundedAnsiDump {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl BoundedAnsiDump {
+    fn append(&mut self, bytes: &[u8]) -> Result<(), crate::ScrollbackSerializeError> {
+        let next = self
+            .bytes
+            .len()
+            .checked_add(bytes.len())
+            .ok_or(crate::ScrollbackSerializeError::LimitExceeded)?;
+        if next > self.limit {
+            return Err(crate::ScrollbackSerializeError::LimitExceeded);
+        }
+        if next > self.bytes.capacity() {
+            // 기하급수 확장으로 복사 비용은 선형으로 유지하되 상한은 넘지 않는다.
+            let capacity = self
+                .bytes
+                .capacity()
+                .max(32 * 1024)
+                .saturating_mul(2)
+                .min(self.limit)
+                .max(next);
+            self.bytes
+                .try_reserve_exact(capacity - self.bytes.len())
+                .map_err(|_| crate::ScrollbackSerializeError::Unavailable)?;
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(())
+    }
+}
+
+fn serialize_scrollback_bounded(
+    backend: &AlacrittyBackend,
+    max_bytes: usize,
+) -> Result<Vec<u8>, crate::ScrollbackSerializeError> {
+    let grid = backend.term.grid();
+    let cols = backend.term.columns();
+    let rows = backend.term.screen_lines();
+    let history = backend.term.history_size();
+    let colors = backend.term.colors();
+    let mut out = BoundedAnsiDump {
+        bytes: Vec::new(),
+        limit: max_bytes,
+    };
+    // 현재 SGR 상태 — 색이 바뀔 때만 시퀀스를 낸다
+    let mut current: Option<([u8; 3], [u8; 3])> = None;
+    let total = history as i32 + rows as i32;
+    // deppy-sijo(D): 압축된 히스토리 행은 read_line이 scratch로 복원해 준다.
+    let mut scratch = Row::<AlacrittyCell>::new(cols);
+    for (emitted, line_idx) in (-(history as i32)..rows as i32).enumerate() {
+        let line = grid.read_line(alacritty_terminal::index::Line(line_idx), &mut scratch);
+        let wrapped = line[alacritty_terminal::index::Column(cols - 1)]
+            .flags
+            .contains(Flags::WRAPLINE);
+        // trailing 기본 빈칸 trim (wrapped 행은 전체 폭 보존 — 이어붙는 내용)
+        let mut end = cols;
+        if !wrapped {
+            while end > 0 {
+                let cell = &line[alacritty_terminal::index::Column(end - 1)];
+                let plain = cell.c == ' '
+                    && cell.zerowidth().is_none()
+                    && resolve_color(cell.bg, colors, DEFAULT_BG) == DEFAULT_BG
+                    && !cell.flags.contains(Flags::INVERSE);
+                if plain {
+                    end -= 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        for col in 0..end {
+            let cell = &line[alacritty_terminal::index::Column(col)];
+            if cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                continue;
+            }
+            let (mut fg, mut bg) = (
+                resolve_color(cell.fg, colors, DEFAULT_FG),
+                resolve_color(cell.bg, colors, DEFAULT_BG),
+            );
+            if cell.flags.contains(Flags::INVERSE) {
+                std::mem::swap(&mut fg, &mut bg);
+            }
+            if current != Some((fg, bg)) {
+                if (fg, bg) == (DEFAULT_FG, DEFAULT_BG) {
+                    out.append(b"\x1b[0m")?;
+                } else {
+                    out.append(
+                        format!(
+                            "\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m",
+                            fg[0], fg[1], fg[2], bg[0], bg[1], bg[2]
+                        )
+                        .as_bytes(),
+                    )?;
+                }
+                current = Some((fg, bg));
+            }
+            let mut buf = [0u8; 4];
+            out.append(cell.c.encode_utf8(&mut buf).as_bytes())?;
+            if let Some(zerowidth) = cell.zerowidth() {
+                for zw in zerowidth {
+                    out.append(zw.encode_utf8(&mut buf).as_bytes())?;
+                }
+            }
+        }
+        // wrapped면 개행 없이 이어붙임, 마지막 행 뒤에는 개행 없음(화면 밀림 방지)
+        if !wrapped && (emitted as i32) < total - 1 {
+            out.append(b"\r\n")?;
+        }
+    }
+    out.append(b"\x1b[0m")?;
+    Ok(out.bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1120,37 +1188,80 @@ mod tests {
     }
 
     #[test]
+    fn live_scrollback_직렬화는_출력상한_직전부터_할당을_제한한다() {
+        let mut backend = AlacrittyBackend::new(20, 5, 100);
+        backend.feed(b"\x1b[31mhello\r\nworld").unwrap();
+        let expected = backend.serialize_scrollback().unwrap();
+        assert_eq!(
+            serialize_scrollback_bounded(&backend, expected.len()).unwrap(),
+            expected
+        );
+        assert_eq!(
+            serialize_scrollback_bounded(&backend, expected.len() - 1),
+            Err(crate::ScrollbackSerializeError::LimitExceeded)
+        );
+        assert_eq!(
+            serialize_scrollback_bounded(&backend, 0),
+            Err(crate::ScrollbackSerializeError::LimitExceeded)
+        );
+    }
+
+    #[test]
+    fn live_scrollback_사용자_십만줄은_고정_바이트상한으로_줄이지_않는다() {
+        for class in [TerminalCacheClass::Visible, TerminalCacheClass::Hidden] {
+            assert_eq!(
+                effective_scrollback_limit(100_000, 500, 100, class),
+                100_000
+            );
+        }
+    }
+
+    #[test]
     fn hidden_visible_scrollback_cap() {
-        // 5000 scrollback으로 생성 후 ~2000줄 출력 → history 축적
         let mut b = AlacrittyBackend::new(20, 5, 5000);
         for i in 0..2000 {
             feed(&mut b, format!("line{i}\r\n").as_bytes());
         }
-        // 과거로 크게 스크롤하면 history 크기만큼만 (scroll_offset = display_offset)
-        b.scroll(10_000);
-        let visible_offset = b.viewport_snapshot().unwrap().scroll_offset;
-        assert!(
-            visible_offset > 1000,
-            "visible은 1000 넘게 스크롤 가능: {visible_offset}"
-        );
-
-        // hidden 전환 → scrollback 1,000 cap (§14.3)
+        let before = b.serialize_scrollback().unwrap();
+        let history = b.cache_footprint().history_lines;
+        assert!(history > 1000);
         b.set_visible(false);
-        b.scroll(10_000);
-        let hidden_offset = b.viewport_snapshot().unwrap().scroll_offset;
-        assert!(
-            hidden_offset <= 1000,
-            "hidden은 1000 이하로 제한: {hidden_offset}"
-        );
-
-        // visible 복귀 → cap 해제(잘린 내용은 복구 안 됨). 새 출력으로 다시 늘어난다
+        assert_eq!(b.cache_footprint().history_lines, history);
+        assert_eq!(b.serialize_scrollback().unwrap(), before);
         b.set_visible(true);
+        assert_eq!(b.serialize_scrollback().unwrap(), before);
+    }
+
+    #[test]
+    fn live_scrollback_축소후_증가는_삭제한_기록을_복원하지_않는다() {
+        let mut b = AlacrittyBackend::new(20, 5, 5000);
         for i in 0..2000 {
+            feed(&mut b, format!("line{i}\r\n").as_bytes());
+        }
+        let before = b.cache_footprint().history_lines;
+        assert_eq!(
+            b.set_scrollback_limit(100),
+            crate::ScrollbackApplyResult::Applied {
+                requested: 100,
+                effective: 100,
+                trimmed: before - 100,
+            }
+        );
+        let shrunk = b.serialize_scrollback().unwrap();
+        assert_eq!(
+            b.set_scrollback_limit(5000),
+            crate::ScrollbackApplyResult::Applied {
+                requested: 5000,
+                effective: 5000,
+                trimmed: 0,
+            }
+        );
+        assert_eq!(b.cache_footprint().history_lines, 100);
+        assert_eq!(b.serialize_scrollback().unwrap(), shrunk);
+        for i in 0..200 {
             feed(&mut b, format!("new{i}\r\n").as_bytes());
         }
-        b.scroll(10_000);
-        let regrown = b.viewport_snapshot().unwrap().scroll_offset;
-        assert!(regrown > 1000, "visible 복귀 후 다시 1000 넘게: {regrown}");
+        assert!(b.cache_footprint().history_lines > 100);
     }
 
     #[test]
@@ -1165,34 +1276,18 @@ mod tests {
     }
 
     #[test]
-    fn hidden_byte_budget이_scrollback을_trim한다() {
-        let cols = 240;
-        let rows = 5;
-        let mut b = AlacrittyBackend::new(cols as u16, rows as u16, 10_000);
-        let hidden_limit =
-            effective_scrollback_limit(10_000, cols, rows, TerminalCacheClass::Hidden);
-        assert!(
-            hidden_limit < TerminalCacheBudget::HIDDEN.max_scrollback_lines,
-            "넓은 terminal에서는 2MB byte cap이 1,000 line cap보다 먼저 적용돼야 함"
-        );
-
-        for i in 0..hidden_limit + 400 {
+    fn hidden_byte_budget은_가시성만으로_이력을_삭제하지_않는다() {
+        let mut b = AlacrittyBackend::new(240, 5, 10_000);
+        for i in 0..2500 {
             feed(&mut b, format!("line-{i}\r\n").as_bytes());
         }
         let before = b.cache_footprint();
-        assert!(
-            before.history_lines > hidden_limit,
-            "테스트가 trim 대상 history를 충분히 만들지 못함: {before:?}"
-        );
-
-        let event = b
-            .set_cache_class(TerminalCacheClass::Hidden)
-            .expect("hidden 전환은 cache trim event를 남겨야 함");
-        assert_eq!(event.class, TerminalCacheClass::Hidden);
-        assert!(event.dropped_history_lines() > 0);
-        assert!(event.freed_estimated_bytes() > 0);
-        assert_eq!(event.after.scrollback_limit_lines, hidden_limit);
-        assert!(event.after.estimated_bytes <= TerminalCacheBudget::HIDDEN.max_bytes);
+        assert!(before.history_lines > 1000);
+        assert!(b.set_cache_class(TerminalCacheClass::Hidden).is_none());
+        let after = b.cache_footprint();
+        assert_eq!(after.history_lines, before.history_lines);
+        assert_eq!(after.scrollback_limit_lines, before.scrollback_limit_lines);
+        assert!(after.estimated_bytes <= before.estimated_bytes);
     }
 
     // ── 압축 인지 스크롤백 예산 ──────────────────────────────────────────────
@@ -1215,8 +1310,8 @@ mod tests {
                 .min(budget.max_scrollback_lines);
             let new_cap = effective_scrollback_limit(usize::MAX, cols, rows, class);
             assert!(
-                new_cap > old_cap,
-                "{class:?} cols={cols}: 새 캡 {new_cap} 이 이전 {old_cap} 보다 커야 함",
+                new_cap >= old_cap,
+                "{class:?} cols={cols}: 새 캡 {new_cap} 이 이전 {old_cap} 보다 작으면 안 됨",
             );
             assert!(
                 new_cap <= budget.max_scrollback_lines,

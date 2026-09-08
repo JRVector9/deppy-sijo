@@ -46,6 +46,8 @@ pub trait RuntimeSecretResolver: Send + Sync + 'static {
 /// Arguments needed to create one workspace runtime. This is inert data: merely
 /// constructing it or a factory starts no thread, process, timer, or polling.
 pub struct RuntimeHostConfig {
+    /// 생성한 client를 외부에 노출하기 전에 첫 명령으로 입장시키는 정책.
+    pub scrollback_policy: Option<(u64, u32)>,
     pub output_batch_ms: u64,
     pub logs_root: PathBuf,
     pub persist: Option<PersistConfig>,
@@ -76,6 +78,12 @@ pub(crate) fn validate_runtime_worker_config(
 }
 
 fn validate_runtime_host_config(config: &RuntimeHostConfig) -> anyhow::Result<()> {
+    if let Some((generation, requested)) = config.scrollback_policy {
+        crate::command::validate_host_command(&RuntimeCommand::SetScrollbackLimit {
+            generation,
+            requested,
+        })?;
+    }
     validate_runtime_worker_config(
         config.output_batch_ms,
         &config.logs_root,
@@ -132,7 +140,7 @@ impl InProcessRuntimeHostFactory {
         config: RuntimeHostConfig,
     ) -> anyhow::Result<crate::InProcessRuntimeClient> {
         validate_runtime_host_config(&config)?;
-        crate::InProcessRuntimeClient::try_new_with_resolver(
+        let client = crate::InProcessRuntimeClient::try_new_with_resolver(
             config.output_batch_ms,
             Arc::clone(&self.resolver),
             config.logs_root,
@@ -140,7 +148,15 @@ impl InProcessRuntimeHostFactory {
             config.persist,
             config.cwd,
             config.extra_env,
-        )
+        )?;
+        // 반환 전에는 다른 명령 공급자가 없다. 실패 시 client drop이 worker를 정리한다.
+        if let Some((generation, requested)) = config.scrollback_policy {
+            client.submit(RuntimeCommand::SetScrollbackLimit {
+                generation,
+                requested,
+            })?;
+        }
+        Ok(client)
     }
 }
 
@@ -166,6 +182,7 @@ mod tests {
 
     fn valid_host_config() -> RuntimeHostConfig {
         RuntimeHostConfig {
+            scrollback_policy: None,
             output_batch_ms: 5,
             logs_root: std::path::PathBuf::from("logs"),
             persist: None,
@@ -218,6 +235,44 @@ mod tests {
     }
 
     #[test]
+    fn live_scrollback_생성정책은_외부_첫명령보다_먼저_적용된다() {
+        let resolver = Arc::new(CountingResolver(AtomicUsize::new(0)));
+        let factory = InProcessRuntimeHostFactory::new(resolver, secret::RedactionService::new());
+        let mut config = valid_host_config();
+        config.logs_root =
+            std::env::temp_dir().join(format!("deppy-initial-policy-{}", uuid::Uuid::new_v4()));
+        config.scrollback_policy = Some((1, 100));
+        let mut client = factory.create_client(config).unwrap();
+        let events = client.subscribe();
+        client
+            .submit(RuntimeCommand::SetScrollbackLimit {
+                generation: 1,
+                requested: 5000,
+            })
+            .unwrap();
+        client
+            .submit(RuntimeCommand::SetScrollbackLimit {
+                generation: 1,
+                requested: 100,
+            })
+            .unwrap();
+        let event = events
+            .events
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert!(matches!(
+            event,
+            crate::RuntimeEvent::ScrollbackLimitApplied {
+                generation: 1,
+                requested: 100,
+                durable: false,
+                ..
+            }
+        ));
+        client.shutdown();
+    }
+
+    #[test]
     fn runtime_secret_debug_is_always_redacted() {
         let secret = RuntimeSecret::new("unique-plaintext-marker".to_owned());
         let debug = format!("{secret:?}");
@@ -247,6 +302,7 @@ mod tests {
 
         let mut host = factory
             .create_client(RuntimeHostConfig {
+                scrollback_policy: None,
                 output_batch_ms: 5,
                 logs_root: std::env::temp_dir()
                     .join(format!("deppy-runtime-host-test-{}", std::process::id())),

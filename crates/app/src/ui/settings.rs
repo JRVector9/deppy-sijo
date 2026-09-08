@@ -182,6 +182,8 @@ pub enum Category {
 pub struct SettingsOutput {
     /// config 값이 바뀌어 저장이 필요한가 (테마/터미널/성능/포트).
     pub config_changed: bool,
+    /// 현재 정책의 전달 재시도 의도. UI는 runtime을 직접 호출하지 않는다.
+    pub scrollback_retry: bool,
     /// Remote 섹션 동작 요청.
     pub remote_action: RemoteAction,
     /// 모바일 웹 섹션 동작 요청.
@@ -206,9 +208,11 @@ pub fn show(
     notif_unread: u32,
     search_query: &mut String,
     catalog: &i18n::Catalog,
+    scrollback_view: crate::scrollback_policy::View,
     mut render_management: impl FnMut(&mut egui::Ui, Category),
 ) -> SettingsOutput {
     let mut changed = false;
+    let mut scrollback_retry = false;
     let mut remote_action = RemoteAction::None;
     let mut web_action = WebRemoteAction::None;
 
@@ -216,6 +220,7 @@ pub fn show(
     if !*open {
         return SettingsOutput {
             config_changed: false,
+            scrollback_retry: false,
             remote_action,
             web_action,
         };
@@ -287,7 +292,14 @@ pub fn show(
                                     language_page(ui, config, &mut changed, catalog)
                                 }
                                 Category::Terminal => {
-                                    terminal_page(ui, config, &mut changed, catalog)
+                                    terminal_page(
+                                        ui,
+                                        config,
+                                        &mut changed,
+                                        catalog,
+                                        scrollback_view,
+                                        &mut scrollback_retry,
+                                    );
                                 }
                                 Category::Shortcuts => {
                                     shortcuts_page(ui, config, &mut changed, catalog)
@@ -350,6 +362,7 @@ pub fn show(
 
     SettingsOutput {
         config_changed: changed,
+        scrollback_retry,
         remote_action,
         web_action,
     }
@@ -1958,12 +1971,50 @@ fn current_locale_label(locale: &str, catalog: &i18n::Catalog) -> String {
     catalog.t(key, &[])
 }
 
+/// 정책 상태는 고정 크기 DTO로만 받으며 재시도 클릭만 호출부에 돌려준다.
+fn scrollback_policy_status(
+    ui: &mut egui::Ui,
+    view: crate::scrollback_policy::View,
+    catalog: &i18n::Catalog,
+) -> bool {
+    use crate::scrollback_policy::Status;
+    let key = match view.status {
+        Status::Pending => "settings.scrollback.pending",
+        Status::Applied => "settings.scrollback.applied",
+        Status::Partial => "settings.scrollback.partial",
+        Status::Failed => "settings.scrollback.failed",
+    };
+    detail_text(
+        ui,
+        catalog.t(
+            key,
+            &[
+                ("applied", &view.applied.to_string()),
+                ("unsupported", &view.unsupported.to_string()),
+                ("trimmed", &view.trimmed.to_string()),
+                ("effective", &comma(i64::from(view.effective_min))),
+            ],
+        ),
+        false,
+    );
+    if !view.durable && matches!(view.status, Status::Applied | Status::Partial) {
+        detail_text(ui, catalog.t("settings.scrollback.memory_only", &[]), false);
+    }
+    view.status == Status::Failed
+        && ui
+            .button(catalog.t("settings.scrollback.retry", &[]))
+            .clicked()
+}
+
 fn terminal_page(
     ui: &mut egui::Ui,
     config: &mut Config,
     changed: &mut bool,
     catalog: &i18n::Catalog,
+    scrollback_view: crate::scrollback_policy::View,
+    scrollback_retry: &mut bool,
 ) {
+    let requested_before = config.terminal.scrollback_lines;
     page_title(ui, &catalog.t("settings.terminal", &[]));
     row(ui, &catalog.t("settings.font_size", &[]), None, |ui| {
         let mut v = config.terminal.font_size;
@@ -2074,6 +2125,13 @@ fn terminal_page(
         ),
         false,
     );
+    let scrollback_view = if requested_before != config.terminal.scrollback_lines {
+        // 같은 render pass에서 편집했으면 이전 설정의 완료 ACK를 새 값 옆에 표시하지 않는다.
+        crate::scrollback_policy::View::default()
+    } else {
+        scrollback_view
+    };
+    *scrollback_retry |= scrollback_policy_status(ui, scrollback_view, catalog);
     row(
         ui,
         &catalog.t("settings.exited_cap", &[]),
@@ -2933,6 +2991,77 @@ fn truncate_fingerprint(fp: &str, keep: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn 스크롤백_실제_설정페이지는_상태를_표시하고_실패만_재시도_의도를_반환한다() {
+        use crate::scrollback_policy::{Status, View};
+        use egui_kittest::kittest::Queryable as _;
+        for (status, key) in [
+            (Status::Pending, "settings.scrollback.pending"),
+            (Status::Applied, "settings.scrollback.applied"),
+            (Status::Partial, "settings.scrollback.partial"),
+            (Status::Failed, "settings.scrollback.failed"),
+        ] {
+            let catalog = i18n::Catalog::load("ko-KR").unwrap();
+            let label = catalog.t(
+                key,
+                &[
+                    ("applied", "2"),
+                    ("unsupported", "1"),
+                    ("trimmed", "12"),
+                    ("effective", "100"),
+                ],
+            );
+            let retry_label = catalog.t("settings.scrollback.retry", &[]);
+            let memory_only_label = catalog.t("settings.scrollback.memory_only", &[]);
+            let view = View {
+                status,
+                durable: false,
+                restored: true,
+                applied: 2,
+                unsupported: 1,
+                trimmed: 12,
+                effective_min: 100,
+            };
+            let initial_limit = super::Config::default().terminal.scrollback_lines;
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(1100.0, 1800.0))
+                .build_ui_state(
+                    move |ui, state: &mut (super::Config, bool)| {
+                        super::terminal_page(
+                            ui,
+                            &mut state.0,
+                            &mut false,
+                            &catalog,
+                            view,
+                            &mut state.1,
+                        );
+                    },
+                    (super::Config::default(), false),
+                );
+            harness.run();
+            assert!(
+                harness.query_by_label(&label).is_some(),
+                "실제 설정 페이지에 {key} 표시가 필요하다"
+            );
+            assert_eq!(
+                harness.query_by_label(&memory_only_label).is_some(),
+                matches!(status, Status::Applied | Status::Partial),
+                "완료/일부 적용에서는 독립 복구 로그의 경계를 알려야 한다"
+            );
+            if status == Status::Failed {
+                harness
+                    .get_by_role_and_label(egui::accesskit::Role::Button, &retry_label)
+                    .click();
+                harness.run();
+                assert!(harness.state().1);
+            } else {
+                assert!(harness.query_by_label(&retry_label).is_none());
+                assert!(!harness.state().1);
+            }
+            assert_eq!(harness.state().0.terminal.scrollback_lines, initial_limit);
+        }
+    }
+
     use super::{
         SETTINGS_DETAIL, SETTINGS_TYPE, masked_url, nav_matches, parse_stepper_f32,
         parse_stepper_i64, qr_color_image, stepper, stepper_f32, truncate_fingerprint,
@@ -3076,7 +3205,14 @@ mod tests {
             .build_ui_state(
                 move |ui, config: &mut super::Config| {
                     let mut changed = false;
-                    super::terminal_page(ui, config, &mut changed, &catalog);
+                    super::terminal_page(
+                        ui,
+                        config,
+                        &mut changed,
+                        &catalog,
+                        crate::scrollback_policy::View::default(),
+                        &mut false,
+                    );
                 },
                 super::Config::default(),
             );
@@ -3217,7 +3353,14 @@ mod tests {
             .with_size(egui::vec2(1000.0, 1000.0))
             .build_ui_state(
                 move |ui, config: &mut crate::config::Config| {
-                    super::terminal_page(ui, config, &mut false, &catalog);
+                    super::terminal_page(
+                        ui,
+                        config,
+                        &mut false,
+                        &catalog,
+                        crate::scrollback_policy::View::default(),
+                        &mut false,
+                    );
                 },
                 crate::config::Config::default(),
             );
@@ -3246,7 +3389,14 @@ mod tests {
             .with_size(egui::vec2(1000.0, 1400.0))
             .build_ui_state(
                 move |ui, config: &mut crate::config::Config| {
-                    super::terminal_page(ui, config, &mut false, &catalog);
+                    super::terminal_page(
+                        ui,
+                        config,
+                        &mut false,
+                        &catalog,
+                        crate::scrollback_policy::View::default(),
+                        &mut false,
+                    );
                 },
                 config,
             );
@@ -3403,6 +3553,8 @@ mod tests {
                                                 config,
                                                 &mut changed,
                                                 catalog_ref,
+                                                crate::scrollback_policy::View::default(),
+                                                &mut false,
                                             ),
                                             Category::Shortcuts => super::shortcuts_page(
                                                 ui,

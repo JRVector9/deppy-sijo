@@ -2333,3 +2333,14 @@
 - Failed approaches: an initial unbounded `codex review --uncommitted` ran extensive checks but never produced a final review and was stopped by exact PID; it also attempted the invalid `cargo test -p deppy-sijo --lib` command even though the app has no library target. The first RED-test draft used unavailable `Context::run`, then captured `WorkspaceUi` too broadly; both compile-only mistakes were corrected before the intended RED assertion was observed. The first final format check found one line-wrap difference; `cargo fmt --all` corrected it and the rerun passed.
 - Remaining work: push this clean landing branch, create a PR to `main`, wait for required checks, merge only if green, close superseded PRs #147 and #148, and preserve PRs #146 and #149 plus their dependent remote branches for further development.
 - Exact next commands: `git push -u origin land/ime-resize-ready-20260906`; create a `main` PR for commits `4903b39` and `bbead4f`; run `gh pr checks <new-pr> --watch`; merge the new PR after all required checks pass; close #147 and #148 without deleting the `fix/window-resize-flicker` branch because PR #149 still targets it.
+
+
+## 2026-09-08 Relay 비UI 코어 main 독립 이관
+
+- 목표: main 45e66cc의 feat/relay-reconnect-core-main에서 #146 head 75bf2c9의 Relay 비UI 코어와 알려진 기기 재접속을 독립 PR로 추출한다.
+- 완료: 전용 worktree 생성, writing-plans 계획과 파일 경계 작성. root/기존 #146은 읽기만 했다.
+- 설계: app 무변경 우선. Conflict enum 추가가 main AppRelayRepository::insert_pending exhaustive match를 깨므로 부모 승인대로 그 storage/repository hunk와 기존 pairing-policy 변경을 후속 adapter PR로 미룬다. reconnect 기본 repository 메서드는 fail-closed여서 코어 분리가 가능하다.
+- 제외: secret keychain, 앱 packaging/notarization/관련 xtask, app 실행을 포함한 relay-dev.sh. shared viewer 합성에 필요한 web-remote assets/static_srv와 relay-shell artifact CI는 포함한다. main #155 push.rs/HTTP 의존성 버전 유지.
+- 현재 수정: 계획과 handoff만. 테스트 미실행.
+- BLOCKED: DNS/TLS/자격증명/외부 배포/실기기/24h soak. 앱 빌드·실행 금지.
+- 다음: protocol raw tag/SQLite column 계약 테스트만 이관해 실제 RED, 선택 hunk 이관, core/Node/로컬 artifact GREEN, bounded Codex 리뷰와 gate, 일지/commit/push/main PR.

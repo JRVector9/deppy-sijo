@@ -1207,3 +1207,9 @@ credentials.env_name = Environment variable name (optional)
 credentials.env_overrides_dotenv = This API binding overrides the environment file value with the same name.
 
 env.source_api_only = Environment files could not be read. Only linked APIs are passed to new runs; file synchronization will retry.
+
+env.sources_title = Environment files and order
+env.sources_hint = Enter one filename per line in the project root (up to 16). Later files override earlier keys. Supports KEY=value, export, and quotes; no variable expansion, commands, or multiline values. Custom lists apply to new runs.
+env.sources_reset = Restore default files
+env.sources_disabled = Environment file injection is off. API bindings remain active.
+env.source_effective = Save to: effective source file

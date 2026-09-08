@@ -189,7 +189,12 @@ impl EnvProfilesSnapshot {
         sources: Option<crate::dotenv_sync::DotenvSources>,
     ) -> Result<Self, EnvSnapshotError> {
         let source_bytes = sources.as_ref().map_or(0, |sources| {
-            sources.files.iter().map(String::len).sum::<usize>()
+            sources
+                .selected_files
+                .iter()
+                .map(String::len)
+                .sum::<usize>()
+                + sources.files.iter().map(String::len).sum::<usize>()
                 + sources
                     .keys
                     .iter()
@@ -336,6 +341,9 @@ impl std::error::Error for EnvRevealError {}
 /// Environment UI intent. User-entered values may be sensitive, therefore this enum deliberately
 /// has no Clone/Debug/Display/Serialize implementation.
 pub enum EnvAction {
+    SetSources {
+        files: Option<Vec<String>>,
+    },
     ChooseProjectFolder,
     SetProjectPath(PathBuf),
     Resync,
@@ -357,6 +365,7 @@ pub enum EnvAction {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnvUiErrorCode {
+    SourcesSaveFailed,
     SnapshotUnavailable,
     RevealFailed,
     RevealCapacityExceeded,
@@ -370,6 +379,7 @@ pub enum EnvUiErrorCode {
 impl EnvUiErrorCode {
     const fn message(self) -> &'static str {
         match self {
+            Self::SourcesSaveFailed => "환경파일 선택을 저장하지 못했습니다.",
             Self::SnapshotUnavailable => "환경 설정을 불러오지 못했습니다.",
             Self::RevealFailed => "Secret 값을 불러오지 못했습니다.",
             Self::RevealCapacityExceeded => "동시에 표시할 수 있는 secret 상한을 초과했습니다.",
@@ -383,6 +393,9 @@ impl EnvUiErrorCode {
 }
 
 pub struct EnvProfilesUi {
+    source_draft: Option<String>,
+    source_pending: bool,
+    write_source: Option<String>,
     var_key: String,
     var_plain_value: String,
     error: Option<EnvUiErrorCode>,
@@ -400,6 +413,9 @@ pub struct EnvProfilesUi {
 impl EnvProfilesUi {
     pub fn new() -> Self {
         Self {
+            source_draft: None,
+            source_pending: false,
+            write_source: None,
             var_key: String::new(),
             var_plain_value: String::new(),
             error: None,
@@ -458,7 +474,14 @@ impl EnvProfilesUi {
     }
 
     pub fn report_error(&mut self, code: EnvUiErrorCode) {
+        self.source_pending = false;
         self.error = Some(code);
+    }
+
+    pub fn sources_saved(&mut self) {
+        self.source_pending = false;
+        self.source_draft = None;
+        self.write_source = None;
     }
 
     /// 성공한 작업에 해당하는 오류만 해제한다.
@@ -527,6 +550,78 @@ impl EnvProfilesUi {
             return intent;
         }
 
+        if let Some(sources) = snapshot.sources.as_ref() {
+            ui.collapsing(catalog.t("env.sources_title", &[]), |ui| {
+                ui.label(catalog.t("env.sources_hint", &[]));
+                let draft = self
+                    .source_draft
+                    .get_or_insert_with(|| sources.selected_files.join("\n"));
+                ui.add_enabled(
+                    !self.source_pending,
+                    egui::TextEdit::multiline(draft)
+                        .desired_rows(3)
+                        .desired_width(f32::INFINITY)
+                        .char_limit(8192),
+                );
+                truncate_utf8(draft, 8192);
+                let files: Vec<String> = draft
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                let valid = storage::Db::validate_env_source_files(&files).is_ok();
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(
+                            valid && !self.source_pending,
+                            egui::Button::new(catalog.t("action.save", &[])),
+                        )
+                        .clicked()
+                    {
+                        self.source_pending = true;
+                        intent = Some(EnvAction::SetSources { files: Some(files) });
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.source_pending,
+                            egui::Button::new(catalog.t("env.sources_reset", &[])),
+                        )
+                        .clicked()
+                    {
+                        self.source_pending = true;
+                        intent = Some(EnvAction::SetSources { files: None });
+                    }
+                });
+            });
+            if sources.selected_files.is_empty() {
+                ui.label(catalog.t("env.sources_disabled", &[]));
+            }
+            if self
+                .write_source
+                .as_ref()
+                .is_some_and(|file| !sources.selected_files.contains(file))
+            {
+                self.write_source = None;
+            }
+            egui::ComboBox::from_id_salt("env_write_source")
+                .selected_text(
+                    self.write_source
+                        .as_deref()
+                        .unwrap_or(&catalog.t("env.source_effective", &[])),
+                )
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.write_source,
+                        None,
+                        catalog.t("env.source_effective", &[]),
+                    );
+                    for file in &sources.selected_files {
+                        ui.selectable_value(&mut self.write_source, Some(file.clone()), file);
+                    }
+                });
+        }
+
         let profile_id = snapshot.dotenv_profile_id().unwrap_or_default();
         let add_label = format!("+ {}", catalog.t("action.add", &[]));
         if super::section_header(
@@ -563,6 +658,11 @@ impl EnvProfilesUi {
                             self.revealed.get(&id).map(SensitiveDisplay::expose),
                             self.masked.contains(&id) || self.reveal_pending.contains(&id),
                             catalog,
+                            snapshot
+                                .sources
+                                .as_ref()
+                                .and_then(|sources| sources.keys.get(var.key()))
+                                .map(Vec::as_slice),
                         );
                         if response.delete {
                             row_action = Some(EnvRowAction::ConfirmDelete {
@@ -606,6 +706,7 @@ impl EnvProfilesUi {
             self.snapshot_workspace = Some(snapshot.workspace_id().to_owned());
             self.snapshot_revision = None;
             self.reset_var_form();
+            self.sources_saved();
             self.masked.clear();
             self.reveal_pending.clear();
             self.clear_revealed();
@@ -820,6 +921,7 @@ impl EnvProfilesUi {
                             self.revealed.get(&id).map(SensitiveDisplay::expose),
                             self.masked.contains(&id) || self.reveal_pending.contains(&id),
                             catalog,
+                            None,
                         );
                         if response.delete {
                             action = Some(EnvRowAction::ConfirmDelete {
@@ -923,6 +1025,7 @@ fn env_table_row(
     revealed_value: Option<&str>,
     is_masked: bool,
     catalog: &i18n::Catalog,
+    source: Option<&[String]>,
 ) -> EnvRowResponse {
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), ENV_ROW_HEIGHT),
@@ -932,13 +1035,21 @@ fn env_table_row(
         ui.painter()
             .rect_filled(rect, 0.0, ui.visuals().widgets.hovered.weak_bg_fill);
     }
+    let response = if let Some(source) = source {
+        response.on_hover_text(source.join(" → "))
+    } else {
+        response
+    };
     let columns = env_table_columns(rect);
     let painter = ui.painter();
     let y = rect.center().y;
     painter.with_clip_rect(columns[0]).text(
         egui::pos2(columns[0].left() + 2.0, y),
         egui::Align2::LEFT_CENTER,
-        var.key(),
+        source.and_then(|files| files.last()).map_or_else(
+            || var.key().to_owned(),
+            |file| format!("{} · {}", var.key(), file),
+        ),
         egui::FontId::monospace(14.0),
         ui.visuals().hyperlink_color,
     );
@@ -1160,7 +1271,7 @@ fn compact_env_var_form(
             state.remove_local_value(&id.0, &id.1);
             state.var_key.clear();
             written = Some(EnvAction::DotenvWrite {
-                file: None,
+                file: state.write_source.clone(),
                 key,
                 value: Some(value),
             });
@@ -1468,8 +1579,8 @@ mod tests {
             EnvValueView::plain("x", false),
         );
         let mut harness = egui_kittest::Harness::new_ui(|ui| {
-            env_table_row(ui, &first, None, false, &catalog);
-            env_table_row(ui, &second, None, false, &catalog);
+            env_table_row(ui, &first, None, false, &catalog, None);
+            env_table_row(ui, &second, None, false, &catalog, None);
         });
         harness
             .ctx

@@ -1207,3 +1207,9 @@ credentials.env_name = 环境变量名（可选）
 credentials.env_overrides_dotenv = 此 API 连接优先于环境文件中的同名值。
 
 env.source_api_only = 无法读取环境文件。仅将已关联的 API 传递给新运行，并重试文件同步。
+
+env.sources_title = 环境文件及应用顺序
+env.sources_hint = 每行输入一个项目根目录文件名（最多16个）。后面的文件覆盖同名键。支持 KEY=value、export 和引号，不支持变量展开、命令或多行值。自定义列表从新运行开始生效。
+env.sources_reset = 恢复默认文件
+env.sources_disabled = 已停用环境文件注入。API 关联保持有效。
+env.source_effective = 保存到：当前值的来源文件

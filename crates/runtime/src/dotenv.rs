@@ -12,6 +12,13 @@ pub const DOTENV_KEY_BYTES_MAX: usize = 1024;
 pub const DOTENV_VALUE_BYTES_MAX: usize = 64 * 1024;
 pub const DOTENV_FILE_NAMES: [&str; 2] = [".env", ".env.local"];
 
+/// 앱에서 선택한 프로젝트 루트와 순서. 값은 포함하지 않는다.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DotenvSourceSelection {
+    pub root: Option<std::path::PathBuf>,
+    pub files: Vec<String>,
+}
+
 const ERROR_INPUT_BYTES: &str = "dotenv_input_bytes_exceeded";
 const ERROR_TOTAL_BYTES: &str = "dotenv_total_bytes_exceeded";
 const ERROR_ENTRY_BUDGET: &str = "dotenv_entry_budget_invalid";
@@ -97,11 +104,40 @@ pub fn read_dotenv_file_bounded(
         *remaining_bytes <= DOTENV_TOTAL_BYTES_MAX,
         ERROR_TOTAL_BYTES
     );
-    let file = match std::fs::File::open(path) {
-        Ok(file) => file,
+    let before = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => anyhow::bail!(ERROR_READ),
     };
+    anyhow::ensure!(
+        before.is_file() && !before.file_type().is_symlink(),
+        "dotenv_file_type_invalid"
+    );
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        options.custom_flags(0x0020_0000);
+    }
+    let file = options
+        .open(path)
+        .map_err(|_| anyhow::anyhow!(ERROR_READ))?;
+    let opened = file.metadata().map_err(|_| anyhow::anyhow!(ERROR_READ))?;
+    anyhow::ensure!(opened.is_file(), ERROR_READ);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        anyhow::ensure!(
+            before.dev() == opened.dev() && before.ino() == opened.ino(),
+            ERROR_READ
+        );
+    }
     let probe = remaining_bytes
         .checked_add(1)
         .ok_or_else(|| anyhow::anyhow!(ERROR_TOTAL_BYTES))?;
@@ -120,13 +156,25 @@ pub fn read_dotenv_file_bounded(
 /// Read and merge `.env` then `.env.local` under one byte, occurrence, and unique-entry budget.
 /// Later files replace values in-place without changing first-seen order.
 pub fn read_dotenv_merged_bounded(root: &Path) -> anyhow::Result<Option<Vec<(String, String)>>> {
+    read_dotenv_files_bounded(root, &deppy_core::env_sources::default_files())
+}
+
+/// 명시한 순서대로 루트 파일을 읽는다. 빈 목록은 파일 사용 중지다.
+pub fn read_dotenv_files_bounded(
+    root: &Path,
+    files: &[String],
+) -> anyhow::Result<Option<Vec<(String, String)>>> {
+    anyhow::ensure!(
+        deppy_core::env_sources::valid_files(files),
+        "env_source_name_invalid"
+    );
     let mut merged: Vec<(String, String)> = Vec::new();
     let mut positions: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut remaining_bytes = DOTENV_TOTAL_BYTES_MAX;
     let mut remaining_entries = DOTENV_ENTRIES_MAX;
     let mut found = false;
 
-    for name in DOTENV_FILE_NAMES {
+    for name in files {
         let Some(content) = read_dotenv_file_bounded(&root.join(name), &mut remaining_bytes)?
         else {
             continue;

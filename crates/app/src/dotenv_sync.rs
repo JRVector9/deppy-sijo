@@ -20,6 +20,7 @@ pub const DOTENV_PROFILE_KIND: &str = "dotenv";
 /// dotenv 자동 profile 이름.
 pub const DOTENV_PROFILE_NAME: &str = ".env";
 /// 스캔·병합할 dotenv 파일 이름(관례 순서 — 뒤 파일이 같은 키를 덮어씀).
+#[cfg(test)]
 pub const DOTENV_FILE_NAMES: [&str; 2] = runtime::dotenv::DOTENV_FILE_NAMES;
 
 pub use runtime::dotenv::is_secret_key;
@@ -132,32 +133,9 @@ fn read_dotenv_file_app_bounded(
         .map_err(|_| anyhow::anyhow!("dotenv_utf8_invalid"))
 }
 
+#[cfg(test)]
 fn read_dotenv_merged_app_bounded(root: &Path) -> anyhow::Result<Option<Vec<(String, String)>>> {
-    let mut merged: Vec<(String, String)> = Vec::new();
-    let mut positions = std::collections::HashMap::<String, usize>::new();
-    let mut remaining_bytes = DOTENV_TOTAL_BYTES_MAX;
-    let mut remaining_entries = DOTENV_ENTRIES_MAX;
-    let mut found = false;
-
-    for name in DOTENV_FILE_NAMES {
-        let Some(content) = read_dotenv_file_app_bounded(&root.join(name), &mut remaining_bytes)?
-        else {
-            continue;
-        };
-        found = true;
-        let parsed = parse_dotenv_bounded(&content, remaining_entries)?;
-        remaining_entries -= parsed.len();
-        for (key, value) in parsed {
-            if let Some(index) = positions.get(&key).copied() {
-                merged[index].1 = value;
-            } else {
-                anyhow::ensure!(merged.len() < DOTENV_ENTRIES_MAX, "dotenv_entries_exceeded");
-                positions.insert(key.clone(), merged.len());
-                merged.push((key, value));
-            }
-        }
-    }
-    Ok(found.then_some(merged))
+    runtime::dotenv::read_dotenv_merged_bounded(root)
 }
 
 fn collect_dotenv_lines_bounded(content: &str) -> anyhow::Result<Vec<String>> {
@@ -657,15 +635,8 @@ fn prepare_env_file(path: &Path, contents: &[u8]) -> anyhow::Result<PreparedEnvF
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("dotenv_parent_missing"))?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(".env");
-    let temp = parent.join(format!(
-        ".{file_name}.deppy-tmp-{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
+    // 원본이 최대 길이 파일명이어도 같은 디렉터리의 짧은 임시 이름으로 준비한다.
+    let temp = parent.join(format!(".deppy-tmp-{}", uuid::Uuid::new_v4()));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -750,6 +721,27 @@ pub fn write_env_var_in_file(
     key: &str,
     value: Option<&str>,
 ) -> anyhow::Result<()> {
+    write_env_var_in_sources(
+        root,
+        &deppy_core::env_sources::default_files(),
+        target,
+        key,
+        value,
+    )
+}
+
+pub fn write_env_var_in_sources(
+    root: &Path,
+    files: &[String],
+    target: Option<&str>,
+    key: &str,
+    value: Option<&str>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        deppy_core::env_sources::valid_files(files),
+        "env_source_name_invalid"
+    );
+    anyhow::ensure!(!files.is_empty(), "dotenv_sources_empty");
     anyhow::ensure!(
         key.len() <= DOTENV_KEY_BYTES_MAX,
         "dotenv_key_bytes_exceeded"
@@ -769,13 +761,13 @@ pub fn write_env_var_in_file(
     }
     let selected = target
         .map(|name| {
-            DOTENV_FILE_NAMES
+            files
                 .iter()
-                .position(|file| *file == name)
+                .position(|file| file == name)
                 .ok_or_else(|| anyhow::anyhow!("dotenv_target_invalid"))
         })
         .transpose()?;
-    let originals = read_env_file_set(root)?;
+    let originals = read_env_file_set_for_sources(root, files)?;
     let mut remaining = DOTENV_ENTRIES_MAX;
     let mut contains_key = Vec::new();
     for content in &originals {
@@ -804,8 +796,8 @@ pub fn write_env_var_in_file(
     for content in candidates.iter().flatten() {
         remaining -= parse_dotenv_bounded(content, remaining)?.len();
     }
-    commit_env_file_set(root, &originals, &candidates)?;
-    if ensure_env_gitignored(root).is_err() {
+    commit_env_file_set_for_sources(root, files, &originals, &candidates)?;
+    if ensure_sources_gitignored(root, files).is_err() {
         tracing::warn!(
             kind = "dotenv_file",
             phase = "gitignore",
@@ -815,16 +807,43 @@ pub fn write_env_var_in_file(
     Ok(())
 }
 
+#[cfg(test)]
 fn read_env_file_set(root: &Path) -> anyhow::Result<Vec<Option<String>>> {
+    read_env_file_set_for_sources(root, &deppy_core::env_sources::default_files())
+}
+
+fn read_env_file_set_for_sources(
+    root: &Path,
+    files: &[String],
+) -> anyhow::Result<Vec<Option<String>>> {
+    anyhow::ensure!(
+        deppy_core::env_sources::valid_files(files),
+        "env_source_name_invalid"
+    );
     let mut budget = DOTENV_TOTAL_BYTES_MAX;
-    DOTENV_FILE_NAMES
+    files
         .iter()
         .map(|name| read_dotenv_file_app_bounded(&root.join(name), &mut budget))
         .collect()
 }
 
+#[cfg(test)]
 fn commit_env_file_set(
     root: &Path,
+    originals: &[Option<String>],
+    candidates: &[Option<String>],
+) -> anyhow::Result<()> {
+    commit_env_file_set_for_sources(
+        root,
+        &deppy_core::env_sources::default_files(),
+        originals,
+        candidates,
+    )
+}
+
+fn commit_env_file_set_for_sources(
+    root: &Path,
+    files: &[String],
     originals: &[Option<String>],
     candidates: &[Option<String>],
 ) -> anyhow::Result<()> {
@@ -837,12 +856,12 @@ fn commit_env_file_set(
                 .ok_or_else(|| anyhow::anyhow!("dotenv_candidate_missing"))?;
             staged.push((
                 index,
-                prepare_env_file(&root.join(DOTENV_FILE_NAMES[index]), content.as_bytes())?,
+                prepare_env_file(&root.join(&files[index]), content.as_bytes())?,
             ));
         }
     }
     anyhow::ensure!(
-        read_env_file_set(root)? == originals,
+        read_env_file_set_for_sources(root, files)? == originals,
         "dotenv_source_changed"
     );
     for (index, prepared) in staged {
@@ -850,7 +869,7 @@ fn commit_env_file_set(
     }
     // 파일 여러 개의 rename은 하나의 트랜잭션이 아니다. 마지막에도 외부 변경을 감지한다.
     anyhow::ensure!(
-        read_env_file_set(root)? == candidates,
+        read_env_file_set_for_sources(root, files)? == candidates,
         "dotenv_source_changed"
     );
     Ok(())
@@ -905,24 +924,36 @@ fn edit_env_text(content: &str, key: &str, value: Option<&str>) -> anyhow::Resul
 /// 값 없이 원본 파일의 존재 여부와 키별 출처만 전달한다.
 #[derive(Default)]
 pub struct DotenvSources {
+    pub selected_files: Vec<String>,
     pub read_failed: bool,
     pub files: Vec<String>,
     pub keys: std::collections::BTreeMap<String, Vec<String>>,
 }
 
+#[cfg(test)]
 pub fn load_dotenv_sources(root: &Path) -> anyhow::Result<DotenvSources> {
-    let contents = read_env_file_set(root)?;
-    let mut sources = DotenvSources::default();
+    load_dotenv_sources_for_files(root, &deppy_core::env_sources::default_files())
+}
+
+pub fn load_dotenv_sources_for_files(
+    root: &Path,
+    files: &[String],
+) -> anyhow::Result<DotenvSources> {
+    let contents = read_env_file_set_for_sources(root, files)?;
+    let mut sources = DotenvSources {
+        selected_files: files.to_vec(),
+        ..Default::default()
+    };
     let mut remaining = DOTENV_ENTRIES_MAX;
-    for (name, content) in DOTENV_FILE_NAMES.iter().zip(contents) {
+    for (name, content) in files.iter().zip(contents) {
         if let Some(content) = content {
-            sources.files.push((*name).to_owned());
+            sources.files.push(name.to_owned());
             let entries = parse_dotenv_bounded(&content, remaining)?;
             remaining -= entries.len();
             for (key, _) in entries {
                 let files = sources.keys.entry(key).or_default();
                 if !files.iter().any(|file| file == name) {
-                    files.push((*name).to_owned());
+                    files.push(name.to_owned());
                 }
             }
         }
@@ -936,7 +967,12 @@ pub fn load_dotenv_sources(root: &Path) -> anyhow::Result<DotenvSources> {
 /// 비밀값을 .env에 기록하는 순간이 유출 방지의 마지막 지점이다. git 저장소가
 /// 아니면(루트에 .git 없음 — 워크트리 gitfile 포함) 아무것도 하지 않는다.
 /// 이미 커버하는 패턴(.env / /.env / .env* / .env.*)이 있으면 추가하지 않는다.
+#[cfg(test)]
 fn ensure_env_gitignored(root: &Path) -> anyhow::Result<()> {
+    ensure_sources_gitignored(root, &deppy_core::env_sources::default_files())
+}
+
+fn ensure_sources_gitignored(root: &Path, files: &[String]) -> anyhow::Result<()> {
     if !root.join(".git").exists() {
         return Ok(());
     }
@@ -1016,13 +1052,13 @@ fn ensure_env_gitignored(root: &Path) -> anyhow::Result<()> {
         content.lines().map(str::trim).any(|line| {
             line == name
                 || line == rooted
-                || line == ".env*"
+                || (name.starts_with(".env") && line == ".env*")
                 || (name.starts_with(".env.") && line == ".env.*")
         })
     };
-    let missing: Vec<&str> = DOTENV_FILE_NAMES
+    let missing: Vec<&str> = files
         .iter()
-        .copied()
+        .map(String::as_str)
         .filter(|name| !covers(name))
         .collect();
     if missing.is_empty() {
@@ -1187,6 +1223,7 @@ pub fn remove_workspace_dotenv(
 /// 존재하는 파일의 권한/UTF-8/I/O 오류는 반드시 호출자에 전달한다. 한 파일의 읽기 실패를
 /// "파일 없음"으로 취급하면 다른 파일의 부분 결과로 동기화가 진행되어, 읽지 못한 파일의
 /// 키를 DB/keyring에서 삭제된 것으로 오판할 수 있다.
+#[cfg(test)]
 fn read_merged_dotenv(root: &Path) -> anyhow::Result<Option<Vec<(String, String)>>> {
     read_dotenv_merged_app_bounded(root)
 }
@@ -1194,8 +1231,16 @@ fn read_merged_dotenv(root: &Path) -> anyhow::Result<Option<Vec<(String, String)
 /// Performs only bounded dotenv source I/O + parsing and returns a redacted plan. No DB or keyring
 /// operation occurs here. A missing pair of dotenv files remains `None`, preserving the existing
 /// rule that a transient checkout difference must not erase persisted environment state.
+#[cfg(test)]
 pub fn load_workspace_dotenv_plan(root: &Path) -> anyhow::Result<Option<DotenvSyncPlan>> {
-    let Some(entries) = read_merged_dotenv(root)? else {
+    load_workspace_dotenv_plan_for_files(root, &deppy_core::env_sources::default_files())
+}
+
+pub fn load_workspace_dotenv_plan_for_files(
+    root: &Path,
+    files: &[String],
+) -> anyhow::Result<Option<DotenvSyncPlan>> {
+    let Some(entries) = runtime::dotenv::read_dotenv_files_bounded(root, files)? else {
         return Ok(None);
     };
     let value_bytes = entries.iter().try_fold(0usize, |total, (_, value)| {
@@ -2165,6 +2210,86 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+    }
+
+    #[test]
+    fn workspace_sources_최대파일명도_편집할수있다() {
+        let dir = std::env::temp_dir().join(format!("deppy-long-source-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let files = vec!["x".repeat(255)];
+        std::fs::write(dir.join(&files[0]), "PORT=old\n").unwrap();
+        write_env_var_in_sources(&dir, &files, None, "PORT", Some("new")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join(&files[0])).unwrap(),
+            "PORT=new\n"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn workspace_sources_선택순서_편집_전체삭제와_출처가_일치한다() {
+        let dir = std::env::temp_dir().join(format!("deppy-source-edit-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir(dir.join(".git")).unwrap();
+        std::fs::write(dir.join(".env"), "PORT=ignored\n").unwrap();
+        std::fs::write(dir.join(".env.dev"), "PORT=first\n").unwrap();
+        std::fs::write(dir.join("service.env"), "PORT=second\n").unwrap();
+        let files = vec![".env.dev".into(), "service.env".into()];
+        let read = || {
+            runtime::dotenv::read_dotenv_files_bounded(&dir, &files)
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(read(), vec![("PORT".into(), "second".into())]);
+        let sources = load_dotenv_sources_for_files(&dir, &files).unwrap();
+        assert_eq!(sources.keys.get("PORT").unwrap(), &files);
+        write_env_var_in_sources(&dir, &files, Some(".env.dev"), "PORT", Some("edited")).unwrap();
+        assert_eq!(read()[0].1, "second");
+        let reversed: Vec<_> = files.iter().rev().cloned().collect();
+        assert_eq!(
+            runtime::dotenv::read_dotenv_files_bounded(&dir, &reversed)
+                .unwrap()
+                .unwrap()[0]
+                .1,
+            "edited"
+        );
+        write_env_var_in_sources(&dir, &files, None, "PORT", None).unwrap();
+        assert!(read().is_empty());
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".env")).unwrap(),
+            "PORT=ignored\n"
+        );
+        assert!(
+            std::fs::read_to_string(dir.join(".gitignore"))
+                .unwrap()
+                .lines()
+                .any(|line| line == "service.env")
+        );
+        assert!(
+            runtime::dotenv::read_dotenv_files_bounded(&dir, &[])
+                .unwrap()
+                .is_none()
+        );
+        assert!(write_env_var_in_sources(&dir, &[], None, "PORT", Some("bad")).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn workspace_sources_심볼릭링크와_합산예산_초과는_전체읽기를_거부한다() {
+        let dir = std::env::temp_dir().join(format!("deppy-source-bound-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("outside"), "PORT=outside\n").unwrap();
+        std::os::unix::fs::symlink(dir.join("outside"), dir.join(".env.dev")).unwrap();
+        let files = vec![".env.dev".into(), "service.env".into()];
+        assert!(runtime::dotenv::read_dotenv_files_bounded(&dir, &files).is_err());
+        assert!(write_env_var_in_sources(&dir, &files, None, "PORT", Some("bad")).is_err());
+        std::fs::remove_file(dir.join(".env.dev")).unwrap();
+        std::fs::write(dir.join(".env.dev"), "#".repeat(DOTENV_TOTAL_BYTES_MAX)).unwrap();
+        std::fs::write(dir.join("service.env"), " ").unwrap();
+        assert!(runtime::dotenv::read_dotenv_files_bounded(&dir, &files).is_err());
+        assert!(write_env_var_in_sources(&dir, &files, None, "PORT", Some("bad")).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

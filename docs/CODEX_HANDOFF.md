@@ -2333,3 +2333,14 @@
 - Failed approaches: an initial unbounded `codex review --uncommitted` ran extensive checks but never produced a final review and was stopped by exact PID; it also attempted the invalid `cargo test -p deppy-sijo --lib` command even though the app has no library target. The first RED-test draft used unavailable `Context::run`, then captured `WorkspaceUi` too broadly; both compile-only mistakes were corrected before the intended RED assertion was observed. The first final format check found one line-wrap difference; `cargo fmt --all` corrected it and the rerun passed.
 - Remaining work: push this clean landing branch, create a PR to `main`, wait for required checks, merge only if green, close superseded PRs #147 and #148, and preserve PRs #146 and #149 plus their dependent remote branches for further development.
 - Exact next commands: `git push -u origin land/ime-resize-ready-20260906`; create a `main` PR for commits `4903b39` and `bbead4f`; run `gh pr checks <new-pr> --watch`; merge the new PR after all required checks pass; close #147 and #148 without deleting the `fix/window-resize-flicker` branch because PR #149 still targets it.
+
+
+## 2026-09-08 PR A: 워크스페이스 세션 열기 요청 보존
+
+- 목표: origin/main 45e66cc 기반 fix/workspace-open-intent에서 메뉴/현재 세션 배경만 이관하고 capacity-one controller 충돌 시 정확한 대상 요청을 보존한다. Markdown panic과 숫자 설정은 제외한다.
+- 완료: writing-plans 계획을 docs/superpowers/plans/2026-09-08-workspace-open-intent.md에 작성했다. 전용 worktree는 부모가 이미 생성해 두었으므로 재생성 실패 후 branch/base/clean 상태를 확인해 기존 전용 worktree를 사용한다.
+- 수정 파일: 계획서와 이 handoff의 새 섹션. 기존 다른 lane 기록은 유지한다.
+- 설계: SyncDotenv 순서 유지, 별도 Option<String>의 최신 세션 열기 대상 보존, controller 소비 후 재입장, 실행 직전 존재/busy/active 검증.
+- 검증: git diff --check 통과. 테스트/빌드 아직 실행하지 않았다.
+- 남은 작업: 원본 커밋에서 대상 hunk만 이관, focused RED/GREEN, codex 소스 리뷰, 앱/i18n/Clippy/경계 게이트, 한국어 커밋/push/PR. GUI 재빌드/재실행 금지.
+- 다음 명령: git show 6ec8377 -- crates/app/src/app.rs crates/app/src/ui/file_tree.rs crates/i18n/locales; git show f0bd342 -- crates/app/src/ui/file_tree.rs; CARGO_BUILD_JOBS=2 cargo test -p deppy-sijo --bin deppy-sijo --locked 세션열기 -- --test-threads=1.

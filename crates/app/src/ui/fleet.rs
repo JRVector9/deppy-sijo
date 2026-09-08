@@ -126,13 +126,16 @@ pub struct StructuredApproval {
 /// 않는다. 정렬 키는 `blocked_since` 하나뿐이고 그 값이 카드에 그대로 보인다.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BlockedItem {
-    /// 건너뛰기 추적용 안정 키.
+    /// 안정 키 — 정렬 동률을 가르고 테스트가 항목을 집는 데 쓴다.
     pub key: String,
     pub title: String,
     /// "워크스페이스 · 세션" 맥락 줄.
     pub context: String,
     pub blocked_since: i64,
     pub kind: BlockedKind,
+    /// 가리키는 세션 — 세션 카드와 이어 붙여 같은 막힘을 두 번 그리지 않는다.
+    /// 승인의 세션 키를 못 읽으면 None.
+    pub session: Option<BlockedRef>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -148,6 +151,19 @@ pub enum BlockedKind {
     /// PTY 입력 대기 — 기존 대기 카드 위젯에 그대로 위임한다(자유 응답·로그 미리보기를
     /// 잃지 않으려고 y/n 버튼을 새로 만들지 않는다). 값은 넘겨받은 카드 슬라이스의 인덱스.
     NeedsInput { card_index: usize },
+}
+
+/// 큐 항목이 가리키는 세션 — `FleetSession`과 같은 식별자로 맞춰 본다.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BlockedRef {
+    /// `SessionId`는 워크스페이스마다 재사용될 수 있어 쌍으로만 식별한다.
+    Pty {
+        workspace_id: String,
+        session: runtime::SessionId,
+    },
+    Structured {
+        session_id: String,
+    },
 }
 
 /// 승인·입력 대기를 하나의 큐로 합치고 **오래 막힌 순**으로 세운다.
@@ -167,6 +183,12 @@ pub fn blocked_queue(
         let parsed = row
             .session_key()
             .and_then(crate::ui::inbox_waiting::parse_session_key);
+        let session = parsed
+            .as_ref()
+            .map(|(workspace_id, session)| BlockedRef::Pty {
+                workspace_id: workspace_id.clone(),
+                session: *session,
+            });
         let context = match parsed {
             Some((workspace_id, session)) => {
                 let ws = workspace_names.get(&workspace_id).cloned();
@@ -190,6 +212,7 @@ pub fn blocked_queue(
                 tool_name: row.tool_name().to_owned(),
                 arguments_preview: row.arguments_preview().to_owned(),
             },
+            session,
         });
     }
     for row in structured {
@@ -204,6 +227,9 @@ pub fn blocked_queue(
             kind: BlockedKind::StructuredApproval {
                 session_id: row.session_id.clone(),
             },
+            session: Some(BlockedRef::Structured {
+                session_id: row.session_id.clone(),
+            }),
         });
     }
     for (index, (card, since)) in waiting.iter().enumerate() {
@@ -216,6 +242,10 @@ pub fn blocked_queue(
             context: format!("{} · {}", card.workspace_name, card.session_title),
             blocked_since: *since,
             kind: BlockedKind::NeedsInput { card_index: index },
+            session: Some(BlockedRef::Pty {
+                workspace_id: card.workspace_id.clone(),
+                session: card.session,
+            }),
         });
     }
     // 오래 막힌 순 — 굶는 항목이 없고, 정렬 키가 화면에 보여 순서가 자명하다.
@@ -225,6 +255,80 @@ pub fn blocked_queue(
             .then(a.key.cmp(&b.key))
     });
     items
+}
+
+fn session_matches_ref(session: &FleetSession, wanted: &BlockedRef) -> bool {
+    match (&session.target, wanted) {
+        (
+            FleetTarget::Pty { session: id, .. },
+            BlockedRef::Pty {
+                workspace_id,
+                session: wanted_id,
+            },
+        ) => session.workspace_id == *workspace_id && id == wanted_id,
+        (
+            FleetTarget::Structured { session_id },
+            BlockedRef::Structured {
+                session_id: wanted_id,
+            },
+        ) => session_id == wanted_id,
+        _ => false,
+    }
+}
+
+fn queue_links_session(queue: &[BlockedItem], session: &FleetSession) -> bool {
+    queue
+        .iter()
+        .filter_map(|item| item.session.as_ref())
+        .any(|wanted| session_matches_ref(session, wanted))
+}
+
+/// 「막힌 것」 묶음의 한 줄. 값은 큐(`Expanded`·`Compact`) 또는 세션 슬라이스(`Card`)의
+/// 인덱스다.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockedRow {
+    /// 가장 오래 막힌 큐 항목 — 그 자리에서 펼쳐 결정 UI를 그린다.
+    Expanded(usize),
+    /// 세션 카드 — 막힌 시간이 카드에 이미 있어 큐 항목을 대신한다.
+    Card(usize),
+    /// 세션 카드가 없는 결정(세션 키를 못 읽은 승인 등) — 제목·맥락·시간 한 줄.
+    Compact(usize),
+}
+
+/// 큐(결정할 것)와 막힌 세션 카드를 **한 묶음**으로 잇는다.
+///
+/// 맨 앞 큐 항목은 펼치고 그 항목이 가리키는 세션 카드는 뺀다 — 같은 막힘이 두 번
+/// 보이면 화면을 둘로 나누던 때와 다를 게 없다(2026-09-05). 뒤 항목은 세션 카드로
+/// 대신하고, 카드가 없는 결정만 요약 줄로 남긴다. 큐에 없는 막힌 세션은 뒤에 붙는다.
+pub fn blocked_rows(queue: &[BlockedItem], sessions: &[FleetSession]) -> Vec<BlockedRow> {
+    let mut rows = Vec::with_capacity(queue.len() + sessions.len());
+    let mut used = vec![false; sessions.len()];
+    for (index, item) in queue.iter().enumerate() {
+        let matched = item
+            .session
+            .as_ref()
+            .and_then(|wanted| {
+                sessions
+                    .iter()
+                    .position(|session| session_matches_ref(session, wanted))
+            })
+            .filter(|&slot| !used[slot]);
+        if let Some(slot) = matched {
+            used[slot] = true;
+        }
+        rows.push(match (index, matched) {
+            (0, _) => BlockedRow::Expanded(0),
+            (_, Some(slot)) => BlockedRow::Card(slot),
+            (_, None) => BlockedRow::Compact(index),
+        });
+    }
+    rows.extend(
+        used.iter()
+            .enumerate()
+            .filter(|(_, taken)| !**taken)
+            .map(|(slot, _)| BlockedRow::Card(slot)),
+    );
+    rows
 }
 
 /// 페이지가 App에 돌려주는 intent 묶음. 그리드·승인·대기가 각각 독립적으로 발생할 수 있다.
@@ -246,9 +350,6 @@ pub struct FleetUi {
     batch_spawn: Option<BatchSpawnState>,
     /// Some이면 다음 단계 예약 패널이 열려 있다.
     followup: Option<FollowUpState>,
-    /// 「다음」으로 넘긴 항목들. 매 프레임 현재 큐와 대조해 사라진 키는 지우고,
-    /// 전부 건너뛴 상태면 비워서 앞으로 되돌아간다(막힌 것을 영영 못 보면 안 된다).
-    skipped: HashSet<String>,
 }
 
 impl FleetUi {
@@ -324,47 +425,129 @@ impl FleetUi {
                 let plain_cards: Vec<crate::ui::inbox_waiting::WaitingCard> =
                     waiting_cards.iter().map(|(card, _)| card.clone()).collect();
 
-                // 2컬럼 — 좌측은 "지금 뭘 할까", 우측은 "다 뭐하고 있나". 두 질문이 달라
-                // 화면을 나눈다(2026-08-08 목업).
-                let full = ui.available_width();
-                // 하한(300)이 available과 무관하면 좁은 창에서 우측 컬럼이 화면 밖으로
-                // 밀린다 — 창 최소 크기 제한이 없고 사이드바가 680px까지 넓어진다
-                // (2026-08-08 리뷰). 우측에 최소 절반은 남긴다.
-                let hero_width = (full * 0.42).clamp(300.0, 460.0).min(full * 0.5);
-                ui.horizontal_top(|ui| {
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(hero_width, ui.available_height()),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| {
-                            ui.set_width(hero_width);
-                            egui::ScrollArea::vertical()
-                                .id_salt("fleet_hero")
-                                .auto_shrink([false, false])
-                                .show(ui, |ui| {
-                                    let hero = render_hero(
-                                        ui,
-                                        catalog,
-                                        &queue,
-                                        &plain_cards,
-                                        waiting_ui,
-                                        &mut self.skipped,
-                                        now,
-                                    );
-                                    out.approval_decision = hero.approval_decision;
-                                    out.waiting_action = hero.waiting_action;
-                                    out.goto = hero.goto;
-                                    out.structured_decision = hero.structured_decision;
-                                });
-                        },
-                    );
-                    ui.separator();
-                    ui.vertical(|ui| {
-                        ui.label(
-                            egui::RichText::new(catalog.t("fleet.hero.sessions", &[]))
-                                .small()
-                                .weak(),
-                        );
-                        ui.add_space(4.0);
+                // 한 목록 — 막힌 것은 맨 위 묶음이고, 그중 가장 오래 막힌 하나만 그 자리에서
+                // 펼쳐 바로 결정한다. 「지금 처리」 컬럼을 따로 두면 같은 막힘이 두 곳에 보여
+                // 화면을 둘로 나눌 이유가 없었다(2026-09-05 사용자 지적).
+                if queue.is_empty() {
+                    // 빈 입력이어도 반드시 호출 — 안에서 stale 입력버퍼를 정리한다(2026-07-17 P2).
+                    out.waiting_action = waiting_ui.render(ui, catalog, &[]);
+                }
+                // 묶음별 섹션 — 막힌 것이 맨 위다. 정렬은 순수 함수가 하고 여기서는 그리기만
+                // 한다(순서 계약을 UI 없이 테스트하려고).
+                let mut grouped = crate::fleet::group_sessions(sessions.to_vec());
+                // 승인과 상태 스냅샷의 도착 순서가 달라도 큐에 연결된 세션은 모두 막힌
+                // 묶음으로 모은다. 그래야 뒤 큐 항목도 Compact 행과 다른 묶음의 카드로
+                // 갈라지지 않고, `blocked_rows`가 큐 순서대로 카드 하나에 대응시킨다.
+                for slot in 1..grouped.len() {
+                    let (mut linked, retained): (Vec<_>, Vec<_>) =
+                        std::mem::take(&mut grouped[slot])
+                            .into_iter()
+                            .partition(|session| queue_links_session(&queue, session));
+                    grouped[0].append(&mut linked);
+                    grouped[slot] = retained;
+                }
+                egui::ScrollArea::vertical()
+                    .id_salt("fleet_sessions")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for (group, members) in SessionGroup::ORDER.into_iter().zip(grouped) {
+                            // 막힌 묶음만 큐와 잇는다 — 펼칠 항목 하나, 카드 없는 결정은 요약 줄.
+                            let mut expanded: Option<&BlockedItem> = None;
+                            let mut compact: Vec<&BlockedItem> = Vec::new();
+                            let mut cards: Vec<&FleetSession> = Vec::new();
+                            if group == SessionGroup::Blocked {
+                                for row in blocked_rows(&queue, &members) {
+                                    match row {
+                                        BlockedRow::Expanded(i) => expanded = Some(&queue[i]),
+                                        BlockedRow::Compact(i) => compact.push(&queue[i]),
+                                        BlockedRow::Card(slot) => cards.push(&members[slot]),
+                                    }
+                                }
+                            } else {
+                                cards.extend(members.iter());
+                            }
+                            let count =
+                                usize::from(expanded.is_some()) + compact.len() + cards.len();
+                            if count == 0 {
+                                continue;
+                            }
+                            section_header(ui, group, count, catalog);
+                            if let Some(item) = expanded {
+                                let decided = render_expanded(
+                                    ui,
+                                    catalog,
+                                    item,
+                                    &plain_cards,
+                                    waiting_ui,
+                                    now,
+                                );
+                                out.approval_decision = decided.approval_decision;
+                                out.waiting_action = decided.waiting_action;
+                                out.goto = decided.goto;
+                                out.structured_decision = decided.structured_decision;
+                                ui.add_space(6.0);
+                            }
+                            for item in compact {
+                                compact_row(ui, item, now);
+                            }
+                            ui.horizontal_wrapped(|ui| {
+                                for session in cards {
+                                    match card(ui, session, catalog, now) {
+                                        Some(CardClick::Open) => {
+                                            *action = Some(match &session.target {
+                                                FleetTarget::Pty { tab, pane, .. } => {
+                                                    FleetAction::Focus {
+                                                        workspace_id: session.workspace_id.clone(),
+                                                        tab: tab.clone(),
+                                                        pane: pane.clone(),
+                                                    }
+                                                }
+                                                FleetTarget::Structured { session_id } => {
+                                                    FleetAction::OpenStructured {
+                                                        session_id: session_id.clone(),
+                                                    }
+                                                }
+                                            });
+                                        }
+                                        Some(CardClick::ScheduleFollowUp) => {
+                                            if let FleetTarget::Pty { session: id, .. } =
+                                                &session.target
+                                            {
+                                                // 이미 예약된 세션이면 그 원문으로
+                                                // 열어 고쳐 쓰게 한다.
+                                                self.followup = Some(FollowUpState {
+                                                    workspace_id: session.workspace_id.clone(),
+                                                    session: *id,
+                                                    title: session.title.clone(),
+                                                    text: session
+                                                        .followup
+                                                        .clone()
+                                                        .unwrap_or_default(),
+                                                });
+                                            }
+                                        }
+                                        Some(CardClick::CancelFollowUp) => {
+                                            if let FleetTarget::Pty { session: id, .. } =
+                                                &session.target
+                                            {
+                                                // 빈 프롬프트 = 해제(App이 같은 경로로
+                                                // 지운다 — 액션을 하나 더 만들지 않는다).
+                                                *action = Some(FleetAction::ScheduleFollowUp {
+                                                    workspace_id: session.workspace_id.clone(),
+                                                    session: *id,
+                                                    prompt: String::new(),
+                                                });
+                                            }
+                                        }
+                                        None => {}
+                                    }
+                                }
+                            });
+                            ui.add_space(10.0);
+                        }
+                        // 세션 빈 상태 안내는 목록 **끝**에 — 세션을 전부 닫았는데 승인만 남으면
+                        // 막힌 묶음과 안내가 함께 보여야 한다(둘 중 하나만 그리면 안 된다,
+                        // 2026-08-08 리뷰).
                         if sessions.is_empty() {
                             ui.add_space(24.0);
                             ui.vertical_centered(|ui| {
@@ -380,88 +563,8 @@ impl FleetUi {
                                     *action = Some(FleetAction::LaunchAgent);
                                 }
                             });
-                            return;
                         }
-                        // 묶음별 섹션 — 막힌 것이 맨 위다. 정렬은 순수 함수가 하고
-                        // 여기서는 그리기만 한다(순서 계약을 UI 없이 테스트하려고).
-                        let grouped = crate::fleet::group_sessions(sessions.to_vec());
-                        egui::ScrollArea::vertical()
-                            .id_salt("fleet_sessions")
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                for (group, members) in SessionGroup::ORDER.into_iter().zip(grouped)
-                                {
-                                    if members.is_empty() {
-                                        continue;
-                                    }
-                                    section_header(ui, group, members.len(), catalog);
-                                    ui.horizontal_wrapped(|ui| {
-                                        for session in &members {
-                                            match card(ui, session, catalog, now) {
-                                                Some(CardClick::Open) => {
-                                                    *action = Some(match &session.target {
-                                                        FleetTarget::Pty { tab, pane, .. } => {
-                                                            FleetAction::Focus {
-                                                                workspace_id: session
-                                                                    .workspace_id
-                                                                    .clone(),
-                                                                tab: tab.clone(),
-                                                                pane: pane.clone(),
-                                                            }
-                                                        }
-                                                        FleetTarget::Structured { session_id } => {
-                                                            FleetAction::OpenStructured {
-                                                                session_id: session_id.clone(),
-                                                            }
-                                                        }
-                                                    });
-                                                }
-                                                Some(CardClick::ScheduleFollowUp) => {
-                                                    if let FleetTarget::Pty {
-                                                        session: id, ..
-                                                    } = &session.target
-                                                    {
-                                                        // 이미 예약된 세션이면 그 원문으로
-                                                        // 열어 고쳐 쓰게 한다.
-                                                        self.followup = Some(FollowUpState {
-                                                            workspace_id: session
-                                                                .workspace_id
-                                                                .clone(),
-                                                            session: *id,
-                                                            title: session.title.clone(),
-                                                            text: session
-                                                                .followup
-                                                                .clone()
-                                                                .unwrap_or_default(),
-                                                        });
-                                                    }
-                                                }
-                                                Some(CardClick::CancelFollowUp) => {
-                                                    if let FleetTarget::Pty {
-                                                        session: id, ..
-                                                    } = &session.target
-                                                    {
-                                                        // 빈 프롬프트 = 해제(App이 같은 경로로
-                                                        // 지운다 — 액션을 하나 더 만들지 않는다).
-                                                        *action =
-                                                            Some(FleetAction::ScheduleFollowUp {
-                                                                workspace_id: session
-                                                                    .workspace_id
-                                                                    .clone(),
-                                                                session: *id,
-                                                                prompt: String::new(),
-                                                            });
-                                                    }
-                                                }
-                                                None => {}
-                                            }
-                                        }
-                                    });
-                                    ui.add_space(10.0);
-                                }
-                            });
                     });
-                });
             });
         // 브로드캐스트 창은 떠 있는 Window라 중앙 패널과 독립적으로 그린다.
         if let Some(sent) = self.broadcast_window(ui.ctx(), sessions, catalog, library) {
@@ -938,51 +1041,24 @@ struct AttentionOutput {
     structured_decision: Option<(String, bool)>,
 }
 
-/// 「지금 처리」 — 가장 오래 막힌 항목 하나를 크게, 나머지는 요약 줄로.
+/// 막힌 묶음 맨 위 — 가장 오래 막힌 항목 하나를 그 자리에서 펼쳐 바로 결정한다.
 ///
-/// 목록을 훑고 고르는 대신 분류(triage)하듯 처리한다. 승인이면 실행할 도구와 인자를
-/// **여기서 바로** 보여줘 터미널로 이동하지 않고 판단할 수 있게 한다 — 지금까지 승인이
-/// 밀린 실제 원인이 그 왕복이었다(2026-08-08).
-#[allow(clippy::too_many_arguments)]
-fn render_hero(
+/// 승인은 실행할 인자를 그대로 보여 주고(가서 보지 않고 판단), 입력 대기는 기존 대기
+/// 카드 위젯에 통째로 위임한다(자유 응답·로그 미리보기를 잃지 않으려고 y/n 버튼을 새로
+/// 만들지 않는다). 「건너뛰기」는 없다 — 다음 항목이 바로 아래 카드로 보인다.
+fn render_expanded(
     ui: &mut egui::Ui,
     catalog: &i18n::Catalog,
-    queue: &[BlockedItem],
+    item: &BlockedItem,
     waiting_cards: &[crate::ui::inbox_waiting::WaitingCard],
     waiting_ui: &mut crate::ui::inbox_waiting::InboxWaitingUi,
-    skipped: &mut HashSet<String>,
     now: i64,
 ) -> AttentionOutput {
     let mut out = AttentionOutput::default();
-    ui.label(
-        egui::RichText::new(catalog.t("fleet.hero.now", &[]))
-            .small()
-            .weak(),
-    );
-    ui.add_space(4.0);
-    if queue.is_empty() {
-        skipped.clear();
-        // 빈 입력이어도 반드시 호출 — 안에서 stale 입력버퍼를 정리한다(2026-07-17 P2).
-        out.waiting_action = waiting_ui.render(ui, catalog, &[]);
-        ui.label(
-            egui::RichText::new(catalog.t("fleet.hero.clear", &[]))
-                .weak()
-                .small(),
-        );
-        return out;
-    }
-    // 사라진 항목의 건너뛰기 기록은 버린다. 전부 건너뛴 상태면 앞으로 되돌아간다.
-    let live: HashSet<&str> = queue.iter().map(|item| item.key.as_str()).collect();
-    skipped.retain(|key| live.contains(key.as_str()));
-    if skipped.len() >= queue.len() {
-        skipped.clear();
-    }
-    let Some(hero) = queue.iter().find(|item| !skipped.contains(&item.key)) else {
-        out.waiting_action = waiting_ui.render(ui, catalog, &[]);
-        return out;
-    };
-    // 히어로가 승인이면 대기 위젯은 빈 입력으로 호출해 정리만 시킨다.
-    let hero_card: &[crate::ui::inbox_waiting::WaitingCard] = match &hero.kind {
+    // 승인이면 대기 위젯은 빈 입력으로 호출해 정리만 시킨다. 입력 대기는 이 한 장만
+    // 넘기므로 나머지 카드의 입력 버퍼는 정리 대상이 된다(보이지도 않는 카드의 초안이라
+    // 잃어도 무해하다).
+    let own_card: &[crate::ui::inbox_waiting::WaitingCard] = match &item.kind {
         BlockedKind::NeedsInput { card_index } => &waiting_cards[*card_index..=*card_index],
         _ => &[],
     };
@@ -990,7 +1066,7 @@ fn render_hero(
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
-            let badge = match &hero.kind {
+            let badge = match &item.kind {
                 BlockedKind::NeedsInput { .. } => catalog.t("fleet.hero.needs_input", &[]),
                 BlockedKind::Approval { .. } | BlockedKind::StructuredApproval { .. } => {
                     catalog.t("fleet.hero.approval", &[])
@@ -1007,7 +1083,7 @@ fn render_hero(
                         "fleet.blocked_for",
                         &[(
                             "value",
-                            &crate::fleet::format_blocked_duration(now, hero.blocked_since),
+                            &crate::fleet::format_blocked_duration(now, item.blocked_since),
                         )],
                     ))
                     .small()
@@ -1016,13 +1092,13 @@ fn render_hero(
                 );
             });
         });
-        ui.add(egui::Label::new(egui::RichText::new(&hero.title).strong().size(15.0)).truncate());
-        ui.add(egui::Label::new(egui::RichText::new(&hero.context).small().weak()).truncate());
+        ui.add(egui::Label::new(egui::RichText::new(&item.title).strong().size(15.0)).truncate());
+        ui.add(egui::Label::new(egui::RichText::new(&item.context).small().weak()).truncate());
         ui.add_space(6.0);
         // 승인이면 실행할 인자를 그대로 — 가서 보지 않고 판단하는 게 핵심이다.
         if let BlockedKind::Approval {
             arguments_preview, ..
-        } = &hero.kind
+        } = &item.kind
             && !arguments_preview.is_empty()
         {
             ui.add(
@@ -1036,85 +1112,61 @@ fn render_hero(
             );
             ui.add_space(6.0);
         }
-        // 입력 대기는 기존 카드 위젯에 위임 — 자유 응답·로그 미리보기를 잃지 않는다.
-        // 히어로 한 장만 넘기므로 나머지 카드의 입력 버퍼는 정리 대상이 된다(보이지도
-        // 않는 카드의 초안이라 잃어도 무해하다).
-        out.waiting_action = waiting_ui.render(ui, catalog, hero_card);
-        ui.horizontal(|ui| {
-            match &hero.kind {
-                BlockedKind::Approval { id, .. } => {
-                    if ui
-                        .button(catalog.t("inbox.approval.approve", &[]))
-                        .clicked()
-                    {
-                        out.approval_decision = Some(crate::ui::approvals::ApprovalDecision {
-                            id: id.clone(),
-                            allowed: true,
-                            remember: false,
-                        });
-                    }
-                    if ui.button(catalog.t("inbox.approval.deny", &[])).clicked() {
-                        out.approval_decision = Some(crate::ui::approvals::ApprovalDecision {
-                            id: id.clone(),
-                            allowed: false,
-                            remember: false,
-                        });
-                    }
-                }
-                BlockedKind::StructuredApproval { session_id } => {
-                    if ui
-                        .button(catalog.t("inbox.approval.approve", &[]))
-                        .clicked()
-                    {
-                        out.structured_decision = Some((session_id.clone(), true));
-                    }
-                    if ui.button(catalog.t("inbox.approval.deny", &[])).clicked() {
-                        out.structured_decision = Some((session_id.clone(), false));
-                    }
-                }
-                // 입력 대기는 기존 카드 위젯이 통째로 그린다(자유 응답·로그 미리보기 포함).
-                BlockedKind::NeedsInput { .. } => {}
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // 큐가 하나뿐이면 건너뛸 곳이 없다 — 막다른 버튼을 만들지 않는다.
-                if queue.len() > 1
-                    && ui
-                        .button(catalog.t("fleet.hero.skip", &[]))
-                        .on_hover_text(catalog.t("fleet.hero.next", &[]))
-                        .clicked()
+        out.waiting_action = waiting_ui.render(ui, catalog, own_card);
+        ui.horizontal(|ui| match &item.kind {
+            BlockedKind::Approval { id, .. } => {
+                if ui
+                    .button(catalog.t("inbox.approval.approve", &[]))
+                    .clicked()
                 {
-                    skipped.insert(hero.key.clone());
+                    out.approval_decision = Some(crate::ui::approvals::ApprovalDecision {
+                        id: id.clone(),
+                        allowed: true,
+                        remember: false,
+                    });
                 }
-            });
+                if ui.button(catalog.t("inbox.approval.deny", &[])).clicked() {
+                    out.approval_decision = Some(crate::ui::approvals::ApprovalDecision {
+                        id: id.clone(),
+                        allowed: false,
+                        remember: false,
+                    });
+                }
+            }
+            BlockedKind::StructuredApproval { session_id } => {
+                if ui
+                    .button(catalog.t("inbox.approval.approve", &[]))
+                    .clicked()
+                {
+                    out.structured_decision = Some((session_id.clone(), true));
+                }
+                if ui.button(catalog.t("inbox.approval.deny", &[])).clicked() {
+                    out.structured_decision = Some((session_id.clone(), false));
+                }
+            }
+            // 입력 대기는 기존 카드 위젯이 통째로 그린다(자유 응답·로그 미리보기 포함).
+            BlockedKind::NeedsInput { .. } => {}
         });
     });
-
-    // 나머지 대기 — 제목과 막힌 시간만.
-    let rest: Vec<&BlockedItem> = queue.iter().filter(|item| item.key != hero.key).collect();
-    if !rest.is_empty() {
-        ui.add_space(8.0);
-        ui.label(
-            egui::RichText::new(catalog.t("fleet.hero.next", &[]))
-                .small()
-                .weak(),
-        );
-        for item in rest {
-            ui.horizontal(|ui| {
-                ui.add(egui::Label::new(egui::RichText::new(&item.title).small()).truncate());
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        egui::RichText::new(crate::fleet::format_blocked_duration(
-                            now,
-                            item.blocked_since,
-                        ))
-                        .small()
-                        .color(status_color(AgentVisualState::Waiting)),
-                    );
-                });
-            });
-        }
-    }
     out
+}
+
+/// 세션 카드가 없는 결정(세션 키를 못 읽은 승인 등) — 제목·맥락·막힌 시간 한 줄.
+fn compact_row(ui: &mut egui::Ui, item: &BlockedItem, now: i64) {
+    ui.horizontal(|ui| {
+        ui.add(egui::Label::new(egui::RichText::new(&item.title).small()).truncate());
+        ui.add(egui::Label::new(egui::RichText::new(&item.context).small().weak()).truncate());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(
+                egui::RichText::new(crate::fleet::format_blocked_duration(
+                    now,
+                    item.blocked_since,
+                ))
+                .small()
+                .color(status_color(AgentVisualState::Waiting)),
+            );
+        });
+    });
 }
 
 /// 상단 헤더: 제목 + 총계 + (우측) 배치 스폰·브로드캐스트·새 에이전트 버튼 + 묶음별 칩.
@@ -1493,7 +1545,7 @@ mod tests {
         let library = crate::prompt_library::PromptLibrary::default();
         let summary = FleetSummary::from_states(sessions.iter().map(|s| s.state));
         let mut out = FleetPageOutput::default();
-        ctx.run_ui(egui::RawInput::default(), |ui| {
+        let mut frame = ctx.run_ui(egui::RawInput::default(), |ui| {
             out = ui_fleet.render(
                 ui,
                 sessions,
@@ -1513,8 +1565,9 @@ mod tests {
                     structured: &[],
                 },
             );
-        })
-        .drop_without_applying_deltas();
+        });
+        // 테스트 하네스에는 텍스처 업로더가 없으므로 생성된 델타를 명시적으로 비운다.
+        frame.textures_delta.clear();
         out
     }
 
@@ -1587,14 +1640,14 @@ mod tests {
         assert!(second.waiting_action.is_none());
     }
 
-    /// 히어로는 **가장 오래 막힌 항목 하나**를 보여준다. 막힌 게 없으면 안내 문구로
-    /// 바뀐다 — 이 화면은 비어 있는 게 정상이다(2026-08-08).
+    /// 막힌 것이 있으면 「막힌 것」 묶음 맨 위에 그 항목이 펼쳐지고, 없으면 묶음 자체가
+    /// 없다 — 이 화면은 비어 있는 게 정상이라 빈 안내 카드로 자리를 차지하지 않는다.
     #[test]
-    fn 히어로는_막힌_것이_있을_때만_항목을_보여준다() {
+    fn 막힌_것이_있을_때만_펼친_항목이_보인다() {
         use egui_kittest::kittest::Queryable;
 
         let cat = catalog();
-        let clear = cat.t("fleet.hero.clear", &[]);
+        let blocked_label = cat.t("fleet.group.blocked", &[]);
         for (pending, has_item) in [(Vec::new(), false), (vec![approval("a1", None)], true)] {
             let mut harness = egui_kittest::Harness::builder()
                 .with_size(egui::vec2(1100.0, 600.0))
@@ -1626,17 +1679,18 @@ mod tests {
                     );
                 });
             harness.run();
-            // 승인이 있으면 그 도구 이름이 히어로 제목으로 보이고, 없으면 안내 문구가 뜬다.
+            // 승인이 있으면 그 도구 이름이 펼친 항목 제목으로 보이고, 세션은 진행 중
+            // 하나뿐이라 「막힌 것」 묶음은 오직 큐 때문에 생긴다.
             assert_eq!(
                 harness.query_by_label("read_file").is_some(),
                 has_item,
-                "승인 {}건일 때 히어로 항목 표시가 기대와 다르다",
+                "승인 {}건일 때 펼친 항목 표시가 기대와 다르다",
                 pending.len()
             );
             assert_eq!(
-                harness.query_by_label(&clear).is_some(),
-                !has_item,
-                "승인 {}건일 때 「{clear}」 표시가 기대와 다르다",
+                harness.query_by_label(&blocked_label).is_some(),
+                has_item,
+                "승인 {}건일 때 「{blocked_label}」 묶음 표시가 기대와 다르다",
                 pending.len()
             );
         }
@@ -1721,105 +1775,33 @@ mod tests {
         );
     }
 
-    /// 「건너뛰기」는 그 항목을 넘기고 **다음으로 오래 막힌** 항목을 히어로로 올린다.
-    /// 건너뛰기 상태가 프레임을 넘어 유지되는지까지 봐야 해서 FleetUi를 상태로 든다.
+    /// 가장 오래 막힌 항목 **하나만** 펼쳐진다 — 승인 버튼은 그 카드에만 있고, 뒤 항목은
+    /// 요약 줄이라 버튼이 없다. 「건너뛰기」는 없앴다: 한 목록에서 다음 항목이 바로 아래
+    /// 보이니 넘길 이유가 없다(2026-09-05).
     #[test]
-    fn 건너뛰기는_다음_항목을_히어로로_올린다() {
+    fn 가장_오래_막힌_항목만_펼쳐지고_건너뛰기는_없다() {
         use egui_kittest::kittest::Queryable;
 
-        struct State {
-            fleet: FleetUi,
-            waiting: InboxWaitingUi,
-        }
         let outer = catalog();
-        let skip_label = outer.t("fleet.hero.skip", &[]);
+        let approve = outer.t("inbox.approval.approve", &[]);
+        // 삭제된 버튼의 예전 문구를 고정해 번역 키 없이도 재등장을 검사한다.
+        let skip_label = "Skip";
         let mut harness = egui_kittest::Harness::builder()
             .with_size(egui::vec2(1100.0, 600.0))
-            .build_ui_state(
-                |ui, state: &mut State| {
-                    let catalog = catalog();
-                    let library = crate::prompt_library::PromptLibrary::default();
-                    // 오래 막힌 순: older(100) → newer(200).
-                    let pending = [
-                        approval_at("a1", "older_tool", 100),
-                        approval_at("a2", "newer_tool", 200),
-                    ];
-                    let _ = state.fleet.render(
-                        ui,
-                        &[],
-                        FleetSummary::default(),
-                        &catalog,
-                        &library,
-                        BatchSpawnInput {
-                            agents: &[],
-                            max: 4,
-                        },
-                        AttentionInput {
-                            pending: &pending,
-                            workspace_names: &HashMap::new(),
-                            session_titles: &HashMap::new(),
-                            waiting_cards: &[],
-                            waiting_ui: &mut state.waiting,
-                            structured: &[],
-                        },
-                    );
-                },
-                State {
-                    fleet: FleetUi::default(),
-                    waiting: InboxWaitingUi::new(),
-                },
-            );
-        harness.run();
-        // 히어로는 오래 막힌 쪽. 두 도구명이 모두 화면에 있지만(뒤쪽은 요약 줄)
-        // 승인 버튼은 히어로에만 있으므로 그것으로 어느 쪽이 히어로인지 가른다.
-        let approve = outer.t("inbox.approval.approve", &[]);
-        assert!(
-            harness.query_by_label(&approve).is_some(),
-            "히어로에 승인 버튼이 있어야 한다"
-        );
-        let hero_before = harness.get_by_label("older_tool").rect();
-        let next_before = harness.get_by_label("newer_tool").rect();
-        assert!(
-            hero_before.top() < next_before.top(),
-            "오래 막힌 쪽이 위(히어로)여야 한다"
-        );
-
-        harness.get_by_label(&skip_label).click();
-        harness.run();
-
-        // 건너뛴 뒤에는 순서가 뒤집힌다 — newer가 히어로 자리로 올라온다.
-        let hero_after = harness.get_by_label("newer_tool").rect();
-        let skipped_after = harness.get_by_label("older_tool").rect();
-        assert!(
-            hero_after.top() < skipped_after.top(),
-            "건너뛴 뒤에도 같은 항목이 히어로면 건너뛰기가 안 먹은 것이다"
-        );
-    }
-
-    /// 좁은 창에서도 우측 세션 컬럼이 화면 안에 있어야 한다. 창 최소 크기 제한이 없고
-    /// 사이드바가 680px까지 넓어져 available이 아주 작아질 수 있다(2026-08-08 리뷰).
-    #[test]
-    fn 좁은_폭에서도_우측_컬럼이_화면_안에_있다() {
-        use egui_kittest::kittest::Queryable;
-
-        // 300 하한이 실제로 넘치는 폭이어야 결함을 잡는다 — 프레임 여백(좌우 16)을
-        // 빼면 available이 하한보다 작아진다.
-        const NARROW: f32 = 300.0;
-        let outer = catalog();
-        let sessions_label = outer.t("fleet.hero.sessions", &[]);
-        let mut harness = egui_kittest::Harness::builder()
-            .with_size(egui::vec2(NARROW, 500.0))
             .build_ui(|ui| {
                 let catalog = catalog();
                 let library = crate::prompt_library::PromptLibrary::default();
                 let mut fleet = FleetUi::default();
                 let mut waiting = InboxWaitingUi::new();
-                let sessions = [pty_session("ws-1", 7, AgentVisualState::Active)];
-                let summary = FleetSummary::from_states(sessions.iter().map(|s| s.state));
+                // 오래 막힌 순: older(100) → newer(200).
+                let pending = [
+                    approval_at("a1", "older_tool", 100),
+                    approval_at("a2", "newer_tool", 200),
+                ];
                 let _ = fleet.render(
                     ui,
-                    &sessions,
-                    summary,
+                    &[],
+                    FleetSummary::default(),
                     &catalog,
                     &library,
                     BatchSpawnInput {
@@ -1827,7 +1809,7 @@ mod tests {
                         max: 4,
                     },
                     AttentionInput {
-                        pending: &[],
+                        pending: &pending,
                         workspace_names: &HashMap::new(),
                         session_titles: &HashMap::new(),
                         waiting_cards: &[],
@@ -1837,15 +1819,69 @@ mod tests {
                 );
             });
         harness.run();
-        let sessions_header = harness
-            .query_by_label(&sessions_label)
-            .expect("좁은 폭에서 우측 컬럼 헤더가 사라졌다")
-            .rect();
-        assert!(
-            sessions_header.left() < NARROW,
-            "우측 컬럼이 화면 밖({})에서 시작한다 — 좌측 폭 하한이 available을 무시했다",
-            sessions_header.left()
+        assert_eq!(
+            harness.query_all_by_label(&approve).count(),
+            1,
+            "승인 버튼은 펼친 항목 하나에만 있어야 한다"
         );
+        let older = harness.get_by_label("older_tool").rect();
+        let newer = harness.get_by_label("newer_tool").rect();
+        assert!(
+            older.top() < newer.top(),
+            "오래 막힌 쪽이 위(펼침)여야 한다"
+        );
+        assert!(
+            harness.query_by_label(skip_label).is_none(),
+            "「{skip_label}」 버튼은 없어야 한다"
+        );
+    }
+
+    /// 좁은 창에서도 펼친 카드가 화면 안에 있어야 한다. 창 최소 크기 제한이 없고
+    /// 사이드바가 680px까지 넓어져 available이 아주 작아질 수 있다(2026-08-08 리뷰).
+    #[test]
+    fn 좁은_폭에서도_펼친_카드가_화면_안에_있다() {
+        use egui_kittest::kittest::Queryable;
+
+        const NARROW: f32 = 300.0;
+        let outer = catalog();
+        let approve = outer.t("inbox.approval.approve", &[]);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(NARROW, 500.0))
+            .build_ui(|ui| {
+                let catalog = catalog();
+                let library = crate::prompt_library::PromptLibrary::default();
+                let mut fleet = FleetUi::default();
+                let mut waiting = InboxWaitingUi::new();
+                let pending = [approval_at("a1", "older_tool", 100)];
+                let _ = fleet.render(
+                    ui,
+                    &[],
+                    FleetSummary::default(),
+                    &catalog,
+                    &library,
+                    BatchSpawnInput {
+                        agents: &[],
+                        max: 4,
+                    },
+                    AttentionInput {
+                        pending: &pending,
+                        workspace_names: &HashMap::new(),
+                        session_titles: &HashMap::new(),
+                        waiting_cards: &[],
+                        waiting_ui: &mut waiting,
+                        structured: &[],
+                    },
+                );
+            });
+        harness.run();
+        for label in ["older_tool", approve.as_str()] {
+            let rect = harness.get_by_label(label).rect();
+            assert!(
+                rect.right() <= NARROW,
+                "「{label}」이 화면 밖({})까지 나간다 — 펼친 카드가 available을 무시했다",
+                rect.right()
+            );
+        }
     }
 
     fn structured(id: &str, title: &str, since: i64) -> StructuredApproval {
@@ -1875,6 +1911,153 @@ mod tests {
         assert!(
             matches!(queue[0].kind, BlockedKind::StructuredApproval { .. }),
             "가장 오래 막힌 구조화 승인이 맨 앞이어야 한다"
+        );
+    }
+
+    /// 「막힌 것」 묶음은 큐와 세션 카드를 **한 번씩만** 잇는다 — 맨 앞 항목은 펼치고 그
+    /// 세션 카드는 빼며, 뒤 항목은 세션 카드로 대신하고, 카드가 없는 결정만 요약 줄로
+    /// 남긴다. 큐에 없는 막힌 세션은 뒤에 카드로 붙는다.
+    #[test]
+    fn 막힌_묶음은_같은_막힘을_두_번_그리지_않는다() {
+        let sessions = [
+            pty_session("ws-1", 7, AgentVisualState::Waiting),
+            pty_session("ws-1", 9, AgentVisualState::Waiting),
+            pty_session("ws-2", 3, AgentVisualState::Waiting),
+            pty_session("ws-3", 5, AgentVisualState::Waiting),
+        ];
+        let queue = blocked_queue(
+            &[
+                // created_at=0 → 가장 오래 막힘 → 펼침. 세션 키로 ws-2:3 카드를 대신한다.
+                approval("a0", Some("ws-2:3")),
+                // 세션 키 없음 → 카드가 없어 요약 줄.
+                approval_at("a1", "orphan_tool", 300),
+            ],
+            &[],
+            &[
+                (waiting_card("ws-1", 7), 100),
+                (waiting_card("ws-1", 9), 200),
+            ],
+            &HashMap::new(),
+            &HashMap::new(),
+            "unknown",
+        );
+        let rows = blocked_rows(&queue, &sessions);
+        assert_eq!(
+            rows,
+            vec![
+                BlockedRow::Expanded(0),
+                BlockedRow::Card(0),
+                BlockedRow::Card(1),
+                BlockedRow::Compact(3),
+                BlockedRow::Card(3),
+            ],
+            "큐 순서대로 잇고, 펼친 항목의 세션(ws-2:3)은 카드로 다시 나오면 안 된다"
+        );
+    }
+
+    /// MCP 승인 스냅샷과 에이전트 상태는 서로 다른 경로에서 도착한다. 승인 쪽이 먼저
+    /// 도착해 세션이 아직 Active여도 펼친 승인의 세션 카드를 다른 묶음에 다시 그리면 안 된다.
+    #[test]
+    fn 펼친_승인의_세션은_상태가_아직_active여도_중복하지_않는다() {
+        use egui_kittest::kittest::Queryable;
+
+        let sessions = [pty_session("ws-1", 7, AgentVisualState::Active)];
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(900.0, 600.0))
+            .build_ui(|ui| {
+                let catalog = catalog();
+                let library = crate::prompt_library::PromptLibrary::default();
+                let mut fleet = FleetUi::default();
+                let mut waiting = InboxWaitingUi::new();
+                let pending = [approval("a1", Some("ws-1:7"))];
+                let _ = fleet.render(
+                    ui,
+                    &sessions,
+                    FleetSummary::from_states(sessions.iter().map(|s| s.state)),
+                    &catalog,
+                    &library,
+                    BatchSpawnInput {
+                        agents: &[],
+                        max: 4,
+                    },
+                    AttentionInput {
+                        pending: &pending,
+                        workspace_names: &HashMap::new(),
+                        session_titles: &HashMap::new(),
+                        waiting_cards: &[],
+                        waiting_ui: &mut waiting,
+                        structured: &[],
+                    },
+                );
+            });
+        harness.run();
+        assert!(
+            harness.query_by_label("read_file").is_some(),
+            "승인 카드는 펼쳐져야 한다"
+        );
+        assert!(
+            harness.query_by_label("session-7").is_none(),
+            "펼친 승인이 가리키는 Active 세션 카드를 다시 그렸다"
+        );
+    }
+
+    /// 뒤 큐 항목도 대상 세션 상태가 늦게 도착하면 Compact 행과 Active 카드로 갈라질 수
+    /// 있다. 큐에 연결된 세션은 모두 막힌 묶음으로 모아 한 번만 그린다.
+    #[test]
+    fn 뒤_승인의_active_세션도_막힌_묶음에서_한번만_그린다() {
+        use egui_kittest::kittest::Queryable;
+
+        let sessions = [pty_session("ws-1", 7, AgentVisualState::Active)];
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(900.0, 600.0))
+            .build_ui(|ui| {
+                let catalog = catalog();
+                let library = crate::prompt_library::PromptLibrary::default();
+                let mut fleet = FleetUi::default();
+                let mut waiting = InboxWaitingUi::new();
+                let linked = PendingApprovalItem::try_new(
+                    "a1".to_owned(),
+                    "srv".to_owned(),
+                    "linked_tool".to_owned(),
+                    "{}".to_owned(),
+                    Some("ws-1:7".to_owned()),
+                    None,
+                    300,
+                )
+                .unwrap();
+                let pending = [approval_at("a0", "older_tool", 100), linked];
+                let _ = fleet.render(
+                    ui,
+                    &sessions,
+                    FleetSummary::from_states(sessions.iter().map(|s| s.state)),
+                    &catalog,
+                    &library,
+                    BatchSpawnInput {
+                        agents: &[],
+                        max: 4,
+                    },
+                    AttentionInput {
+                        pending: &pending,
+                        workspace_names: &HashMap::new(),
+                        session_titles: &HashMap::new(),
+                        waiting_cards: &[],
+                        waiting_ui: &mut waiting,
+                        structured: &[],
+                    },
+                );
+            });
+        harness.run();
+        assert!(
+            harness.query_by_label("older_tool").is_some(),
+            "가장 오래된 승인은 펼쳐져야 한다"
+        );
+        assert!(
+            harness.query_by_label("linked_tool").is_none(),
+            "세션 카드가 있는 뒤 승인을 Compact 행으로도 그렸다"
+        );
+        assert!(
+            harness.query_by_label("session-7").is_some(),
+            "뒤 승인은 연결된 세션 카드 하나로 보여야 한다"
         );
     }
 

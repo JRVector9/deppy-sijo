@@ -53,8 +53,8 @@
 
 **Files:** GitHub PR, macOS app bundle
 
-- [ ] 통합 브랜치를 push하고 `main` 대상 Ready PR을 만든다.
-- [ ] GitGuardian과 Actions의 실제 runner/steps를 구분해 기록한다.
+- [x] 통합 브랜치를 push하고 `main` 대상 Ready PR #177을 만든다.
+- [x] GitGuardian PASS와 Actions 6개의 `runner_id=0`/빈 steps/결제 한도 annotation을 구분해 기록하고 로컬 대체 gate를 통과한다.
 - [ ] 사용자 승인 범위에 따라 통합 PR을 merge commit으로 `main`에 반영하고 원격 `main`을 확인한다.
 - [ ] 새 `main`을 빌드·패키징하고 기존 앱의 정확한 PID만 종료한 뒤 새 bundle을 실행한다.
 - [ ] 프로세스와 bundle commit을 확인하고 사용자가 화면·입력·스크롤백을 직접 검증할 수 있게 인계한다.

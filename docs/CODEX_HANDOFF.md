@@ -2478,7 +2478,17 @@
   컴파일 실패했고, 보정 뒤 Keychain counting store assertion이 실패했다. 앱 테스트에서만
   `secret/test-keyring-core`를 켜도록 고쳐 회귀를 통과시켰다. Codex CLI 리뷰 두 번은
   위 사유로 최종 결과가 없으므로 PASS로 기록하지 않는다.
-- 남은 일: 통합 브랜치 push, 통합 PR 생성·merge commit 방식의 `main` 반영, 새
+- 통합 PR #177을 만들었다. GitGuardian은 통합 HEAD에서 PASS했다. 빨간 GitHub
+  Actions 6개는 모두 `runner_id=0`, `steps=[]`, 결제/지출 한도로 작업이 시작되지
+  않았다는 annotation을 확인했다. 실제 코드 실패로 분류하지 않았다. private 저장소의
+  branch protection/rulesets API는 GitHub Pro가 없어 HTTP 403을 반환했으며, PR 자체는
+  `MERGEABLE`이다.
+- 미실행 Actions의 로컬 대체 검증도 완료했다. Relay JavaScript 16 PASS,
+  `cargo audit` exit 0(허용된 yanked 경고 2개),
+  `cargo deny check bans licenses sources` exit 0(세 항목 모두 ok), Linux 대상
+  `cargo build --locked --release -p relay-server --bin relay-server` PASS다.
+- 남은 일: 이 문서 commit으로 고정된 PR head의 Actions 비실행 여부를 다시 확인하고,
+  merge commit 방식으로 `main`에 반영한 뒤 새
   `origin/main`의 bundle build 및 정확한 기존 PID 종료 후 재실행, 프로세스 확인.
   DNS·TLS·배포 자격증명이 없어 외부 Relay 배포 검증은 계속 BLOCKED다.
 - 정확한 다음 명령: `git push -u origin integrate/ready-prs-20260909`; `gh pr create

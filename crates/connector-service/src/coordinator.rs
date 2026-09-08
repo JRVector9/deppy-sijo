@@ -2212,6 +2212,28 @@ impl Worker {
         self.publish();
     }
 
+    fn load_explicit_mcp_target(
+        &mut self,
+        server_id: &ServerId,
+    ) -> Result<Observed<crate::RepositoryMcpTarget>, ServiceError> {
+        let target = self.repository.load_mcp_target(server_id)?;
+        if target.revision != self.snapshot.config_revision
+            && self
+                .repository
+                .accept_secret_migration_revision(self.snapshot.config_revision, target.revision)
+        {
+            // 외부 부수효과 전에 내부 migration만 증명된 경우 같은 의도를 한 번만 재평가한다.
+            // reload 뒤 다른 writer가 개입하면 호출부의 기존 revision 비교가 그대로 거절한다.
+            self.reload_overview();
+            if self.snapshot.config_revision != target.revision {
+                // 증명 소비와 reload 사이 다른 writer가 끼었으면 새 revision으로 의도를 승인하지 않는다.
+                return Ok(target);
+            }
+            return self.repository.load_mcp_target(server_id);
+        }
+        Ok(target)
+    }
+
     fn start_discover(&mut self, server_id: ServerId) {
         let operation_id = self.new_operation_id();
         self.start_discover_with_id(operation_id, server_id);
@@ -2222,7 +2244,7 @@ impl Worker {
             self.reject_backpressure(OperationKind::Discover);
             return;
         }
-        let observed_target = match self.repository.load_mcp_target(&server_id) {
+        let observed_target = match self.load_explicit_mcp_target(&server_id) {
             Ok(target) if target.revision == self.snapshot.config_revision => target,
             Ok(_) => {
                 self.reload_overview();
@@ -2367,7 +2389,7 @@ impl Worker {
             self.metrics.backpressure.fetch_add(1, Ordering::AcqRel);
             return;
         }
-        let observed_target = match self.repository.load_mcp_target(&server_id) {
+        let observed_target = match self.load_explicit_mcp_target(&server_id) {
             Ok(target) if target.revision == self.snapshot.config_revision => target,
             Ok(_) => {
                 self.reload_overview();
@@ -2762,7 +2784,7 @@ impl Worker {
             self.reject_backpressure(OperationKind::OAuth);
             return;
         }
-        let observed_target = match self.repository.load_mcp_target(&server_id) {
+        let observed_target = match self.load_explicit_mcp_target(&server_id) {
             Ok(observed) if observed.revision == self.snapshot.config_revision => observed,
             Ok(_) => {
                 self.reload_overview();
@@ -5739,6 +5761,11 @@ mod tests {
         preflight_subject_override: Mutex<Option<audit::AuthorizationSubject>>,
         preflight_subjects: Mutex<Vec<audit::AuthorizationSubject>>,
         mcp_target_error_once: AtomicBool,
+        secret_migration_once: AtomicBool,
+        secret_migration_receipt: AtomicBool,
+        secret_migration_other_writer: AtomicBool,
+        secret_writer_during_recheck: AtomicBool,
+        secret_writer_during_reload: AtomicBool,
         authorization_ledger: audit::InMemoryAuthorizationLedger,
         oauth_slot: Mutex<Option<secret::PhysicalSecretSlot>>,
         http_auth: Mutex<Option<crate::HttpAuthBinding>>,
@@ -5774,6 +5801,11 @@ mod tests {
                 preflight_subject_override: Mutex::new(None),
                 preflight_subjects: Mutex::new(Vec::new()),
                 mcp_target_error_once: AtomicBool::new(false),
+                secret_migration_once: AtomicBool::new(false),
+                secret_migration_receipt: AtomicBool::new(false),
+                secret_migration_other_writer: AtomicBool::new(false),
+                secret_writer_during_recheck: AtomicBool::new(false),
+                secret_writer_during_reload: AtomicBool::new(false),
                 authorization_ledger: audit::InMemoryAuthorizationLedger::new(
                     "connector-service-test",
                 )
@@ -5830,7 +5862,27 @@ mod tests {
     }
 
     impl ConnectorRepository for FakeRepository {
+        fn accept_secret_migration_revision(
+            &mut self,
+            expected: Revision,
+            observed: Revision,
+        ) -> bool {
+            self.state
+                .secret_migration_receipt
+                .swap(false, Ordering::AcqRel)
+                && expected == Revision(1)
+                && observed == Revision(2)
+                && self.revision() == observed
+        }
+
         fn load_overview(&mut self) -> Result<crate::OverviewData, ServiceError> {
+            if self
+                .state
+                .secret_writer_during_reload
+                .swap(false, Ordering::AcqRel)
+            {
+                self.mutate();
+            }
             let slack = self
                 .state
                 .slack_projection_override
@@ -5882,6 +5934,29 @@ mod tests {
             &mut self,
             server_id: &ServerId,
         ) -> Result<Observed<crate::RepositoryMcpTarget>, ServiceError> {
+            if self
+                .state
+                .secret_migration_once
+                .swap(false, Ordering::AcqRel)
+            {
+                self.mutate();
+                self.state
+                    .secret_migration_receipt
+                    .store(true, Ordering::Release);
+                if self
+                    .state
+                    .secret_migration_other_writer
+                    .load(Ordering::Acquire)
+                {
+                    self.mutate();
+                }
+            } else if self
+                .state
+                .secret_writer_during_recheck
+                .swap(false, Ordering::AcqRel)
+            {
+                self.mutate();
+            }
             if self
                 .state
                 .mcp_target_error_once
@@ -8523,6 +8598,89 @@ mod tests {
             fixture.coordinator.metrics().active_mcp_operations == 0
                 && fixture.coordinator.metrics().active_oauth_flows == 0
         });
+    }
+
+    #[test]
+    fn lazy_secret_migration_rechecks_the_first_discover_without_a_second_click() {
+        let fixture = fixture(
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::Activate)
+            .unwrap();
+        wait_until(|| fixture.coordinator.current_snapshot().config_revision == Revision(1));
+        fixture
+            .repo
+            .secret_migration_once
+            .store(true, Ordering::Release);
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::Discover(ServerId::new("server-1")))
+            .unwrap();
+        wait_until(|| fixture.mcp.discover_calls.load(Ordering::Acquire) == 1);
+        assert_eq!(
+            fixture.mcp.discover_calls.load(Ordering::Acquire),
+            1,
+            "내부 이관만 발생한 첫 클릭은 실행돼야 한다"
+        );
+    }
+
+    #[test]
+    fn lazy_secret_migration_preserves_stale_rejection_for_other_writers() {
+        for writer_phase in 0..3 {
+            let fixture = fixture(
+                Arc::new(Gate::opened()),
+                Arc::new(Gate::opened()),
+                Arc::new(Gate::opened()),
+                Arc::new(SystemCoordinatorClock::default()),
+            );
+            fixture
+                .coordinator
+                .dispatch(ConnectorIntent::Activate)
+                .unwrap();
+            wait_until(|| fixture.coordinator.current_snapshot().config_revision == Revision(1));
+            fixture
+                .repo
+                .secret_migration_once
+                .store(true, Ordering::Release);
+            fixture
+                .repo
+                .secret_migration_other_writer
+                .store(writer_phase == 0, Ordering::Release);
+            fixture
+                .repo
+                .secret_writer_during_recheck
+                .store(writer_phase == 1, Ordering::Release);
+            fixture
+                .repo
+                .secret_writer_during_reload
+                .store(writer_phase == 2, Ordering::Release);
+            fixture
+                .coordinator
+                .dispatch(ConnectorIntent::Discover(ServerId::new("server-1")))
+                .unwrap();
+            wait_until(|| {
+                fixture.mcp.discover_calls.load(Ordering::Acquire) > 0
+                    || fixture
+                        .coordinator
+                        .current_snapshot()
+                        .diagnostics
+                        .transitions
+                        .last()
+                        .is_some_and(|transition| {
+                            transition.error_code == Some(ErrorCode::StaleResult)
+                        })
+            });
+            assert_eq!(fixture.mcp.discover_calls.load(Ordering::Acquire), 0);
+            assert!(
+                fixture.repo.server_loads.load(Ordering::Acquire) <= 2,
+                "재평가는 한 번만 허용한다"
+            );
+        }
     }
 
     #[test]

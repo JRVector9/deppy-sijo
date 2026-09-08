@@ -799,6 +799,16 @@ pub trait ConnectorRepositoryFactory: Send + Sync + 'static {
 /// Storage-neutral repository DTO boundary. Implementations must use atomic repository
 /// transactions for mutating methods and return the committed configuration revision.
 pub trait ConnectorRepository: Send + 'static {
+    /// 현재 요청 자체의 credential migration만 만든 revision 증가를 한 번 소비한다.
+    /// 구현은 다른 writer 증가가 없었고 observed가 여전히 현재임을 증명해야 한다.
+    fn accept_secret_migration_revision(
+        &mut self,
+        _expected: Revision,
+        _observed: Revision,
+    ) -> bool {
+        false
+    }
+
     fn load_overview(&mut self) -> Result<OverviewData, ServiceError>;
     fn load_server(&mut self, server_id: &ServerId) -> Result<Observed<ServerDraft>, ServiceError>;
     fn load_mcp_target(

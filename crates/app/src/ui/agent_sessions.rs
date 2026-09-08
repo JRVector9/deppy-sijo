@@ -38,6 +38,7 @@ pub struct AgentSessionsSecretsSnapshot {
     available: bool,
     controls_enabled: bool,
     api_key_present: bool,
+    presence_known: bool,
 }
 
 impl AgentSessionsSecretsSnapshot {
@@ -47,16 +48,23 @@ impl AgentSessionsSecretsSnapshot {
             available: true,
             controls_enabled: true,
             api_key_present,
+            presence_known: true,
         }
     }
 
-    pub const fn unavailable(revision: u64) -> Self {
+    /// 시작 때 저장소를 조회하지 않은 상태다. 명시적 저장·삭제 작업은 허용한다.
+    pub const fn deferred(revision: u64) -> Self {
         Self {
             revision,
-            available: false,
+            available: true,
             controls_enabled: true,
             api_key_present: false,
+            presence_known: false,
         }
+    }
+
+    pub const fn can_delete_api_key(self) -> bool {
+        self.api_key_present || !self.presence_known
     }
 
     pub const fn revision(self) -> u64 {
@@ -2679,7 +2687,7 @@ impl AgentSessionsUi {
                     }
                 }
             }
-            if snapshot.api_key_present()
+            if snapshot.can_delete_api_key()
                 && ui
                     .add_enabled(
                         self.api_key_pending.is_none() && snapshot.is_available(),
@@ -4310,6 +4318,57 @@ mod tests {
         );
         for bad in ["", "   ", "sk a", "sk\nb"] {
             assert!(SensitiveInput::try_api_key(bad.to_owned()).is_err());
+        }
+    }
+
+    #[test]
+    fn deferred_keychain_snapshot_keeps_explicit_save_and_delete_buttons_enabled() {
+        use egui_kittest::kittest::Queryable;
+        let catalog = catalog();
+        let snapshot = AgentSessionsSecretsSnapshot::deferred(9);
+        for save in [true, false] {
+            let mut state = AgentSessionsUi::new();
+            if save {
+                state.api_key_input = "explicit-key-test".into();
+            }
+            let mut harness =
+                egui_kittest::Harness::new_ui_state(
+                    |ui,
+                     (state, captured): &mut (
+                        AgentSessionsUi,
+                        Option<AgentSessionsSecretIntent>,
+                    )| {
+                        let mut ids = Vec::new();
+                        let mut intent = None;
+                        state.render_llm_api_key_controls(
+                            ui,
+                            &mut ids,
+                            &snapshot,
+                            &mut intent,
+                            &catalog,
+                        );
+                        if intent.is_some() {
+                            *captured = intent;
+                        }
+                    },
+                    (state, None),
+                );
+            assert!(harness.state().1.is_none());
+            harness
+                .get_by_label(&catalog.t(if save { "action.save" } else { "action.delete" }, &[]))
+                .click();
+            harness.run();
+            if save {
+                assert!(matches!(
+                    harness.state().1,
+                    Some(AgentSessionsSecretIntent::SaveApiKey { revision: 9, .. })
+                ));
+            } else {
+                assert!(matches!(
+                    harness.state().1,
+                    Some(AgentSessionsSecretIntent::DeleteApiKey { revision: 9 })
+                ));
+            }
         }
     }
 

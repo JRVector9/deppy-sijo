@@ -3228,6 +3228,8 @@ impl PhysicalSecretSlotState {
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct PhysicalSecretSlotLedgerRow {
+    /// 행 재생성마다 바뀌는 공개 복구 세대. startup snapshot의 ABA 방지용이다.
+    pub recovery_generation: [u8; 16],
     pub logical_credential_id: String,
     pub physical_slot: String,
     pub state: PhysicalSecretSlotState,
@@ -5616,6 +5618,71 @@ impl Db {
             .context("physical secret slot staging 등록 commit 실패")
     }
 
+    /// startup에 DB만 읽어 캡처한 후보의 세대·상태를 다시 확인한다.
+    /// cleanup은 이 트랜잭션 안에서 실행하여 삭제/재생성·publish와 키 삭제의 ABA를 막는다.
+    /// UI에서 호출하지 않으며 callback은 이 Db에 재진입하면 안 된다.
+    pub fn recover_physical_secret_slot_cas(
+        &self,
+        candidate: &PhysicalSecretSlotLedgerRow,
+        cleanup: impl FnOnce() -> anyhow::Result<()>,
+    ) -> anyhow::Result<bool> {
+        validate_owned_physical_secret_slot(
+            &candidate.logical_credential_id,
+            &candidate.physical_slot,
+        )?;
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let current = tx
+            .query_row(
+                "SELECT logical_credential_id, state, legacy_cleanup_username, recovery_generation
+             FROM physical_secret_slot_ledger WHERE physical_slot = ?1",
+                [&candidate.physical_slot],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((logical, state, legacy, generation)) = current else {
+            return Ok(false);
+        };
+        if logical != candidate.logical_credential_id
+            || state != candidate.state.as_str()
+            || legacy != candidate.legacy_cleanup_username
+            || generation != candidate.recovery_generation
+        {
+            return Ok(false);
+        }
+        let references: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM credentials WHERE keyring_username = ?1",
+            [&candidate.physical_slot],
+            |row| row.get(0),
+        )?;
+        if candidate.state == PhysicalSecretSlotState::Published {
+            // 현재 access 슬롯을 읽거나 지우지 않는다. 남은 이전 username만 정리한다.
+            if legacy.is_none() {
+                return Ok(false);
+            }
+            anyhow::ensure!(
+                references == 1,
+                "secret recovery published reference invalid"
+            );
+        } else {
+            anyhow::ensure!(references == 0, "secret recovery candidate referenced");
+        }
+        cleanup()?;
+        if candidate.state == PhysicalSecretSlotState::Published {
+            tx.execute("UPDATE physical_secret_slot_ledger SET legacy_cleanup_username = NULL WHERE physical_slot = ?1 AND recovery_generation = ?2", rusqlite::params![candidate.physical_slot, candidate.recovery_generation.as_slice()])?;
+        } else {
+            tx.execute("DELETE FROM physical_secret_slot_ledger WHERE physical_slot = ?1 AND recovery_generation = ?2", rusqlite::params![candidate.physical_slot, candidate.recovery_generation.as_slice()])?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// Acknowledge that an exact staging/orphan keyring bundle is absent or was deleted. Published
     /// slots are never acknowledged away because they are still a live credential capability.
     pub fn acknowledge_physical_secret_slot_deleted(
@@ -5717,7 +5784,8 @@ impl Db {
                          WHERE c.keyring_username = ledger.physical_slot),
                         (SELECT COUNT(*) FROM credentials c
                          WHERE c.id = ledger.logical_credential_id
-                           AND c.keyring_username = ledger.physical_slot)
+                           AND c.keyring_username = ledger.physical_slot),
+                        ledger.recovery_generation
                  FROM physical_secret_slot_ledger ledger
                  ORDER BY ledger.created_at, ledger.physical_slot LIMIT ?1",
             )?;
@@ -5729,6 +5797,7 @@ impl Db {
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, i64>(4)?,
                     row.get::<_, i64>(5)?,
+                    row.get::<_, Vec<u8>>(6)?,
                 ))
             })?;
             let mut rows = Vec::with_capacity(row_count);
@@ -5740,6 +5809,7 @@ impl Db {
                     legacy_cleanup_username,
                     any_refs,
                     exact_refs,
+                    recovery_generation,
                 ) = row?;
                 validate_owned_physical_secret_slot(&logical_credential_id, &physical_slot)?;
                 if let Some(username) = legacy_cleanup_username.as_deref() {
@@ -5759,6 +5829,9 @@ impl Db {
                     }
                 }
                 rows.push(PhysicalSecretSlotLedgerRow {
+                    recovery_generation: recovery_generation
+                        .try_into()
+                        .map_err(|_| anyhow::anyhow!("secret recovery generation invalid"))?,
                     logical_credential_id,
                     physical_slot,
                     state,
@@ -18142,6 +18215,97 @@ mod tests {
     }
 
     #[test]
+    fn secret_recovery_generation_rejects_aba_and_newly_published_candidates() {
+        let db = Db::open_in_memory().unwrap();
+        let logical = secret::LogicalCredentialId::new("recovery-aba").unwrap();
+        let slot = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+        stage_slot(&db, &logical, &slot);
+        let old = db
+            .physical_secret_slots_for_reconciliation(8)
+            .unwrap()
+            .remove(0);
+        db.acknowledge_physical_secret_slot_deleted(logical.as_str(), slot.as_str())
+            .unwrap();
+        stage_slot(&db, &logical, &slot);
+        let current = db
+            .physical_secret_slots_for_reconciliation(8)
+            .unwrap()
+            .remove(0);
+        assert_ne!(old.recovery_generation, current.recovery_generation);
+        assert!(
+            !db.recover_physical_secret_slot_cas(&old, || panic!(
+                "재생성된 행의 비밀을 삭제하면 안 된다"
+            ))
+            .unwrap()
+        );
+        db.insert_credential_with_secret_slot(&sample(logical.as_str()), slot.as_str(), None)
+            .unwrap();
+        assert!(
+            !db.recover_physical_secret_slot_cas(&current, || panic!(
+                "승인된 physical 슬롯을 삭제하면 안 된다"
+            ))
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn secret_recovery_callback_failure_rolls_back_and_can_retry() {
+        let db = Db::open_in_memory().unwrap();
+        let logical = secret::LogicalCredentialId::new("recovery-retry").unwrap();
+        let slot = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+        stage_slot(&db, &logical, &slot);
+        let candidate = db
+            .physical_secret_slots_for_reconciliation(8)
+            .unwrap()
+            .remove(0);
+        assert!(
+            db.recover_physical_secret_slot_cas(&candidate, || anyhow::bail!("test-denied"))
+                .is_err()
+        );
+        assert_eq!(
+            db.physical_secret_slots_for_reconciliation(8).unwrap(),
+            vec![candidate.clone()]
+        );
+        assert!(
+            db.recover_physical_secret_slot_cas(&candidate, || Ok(()))
+                .unwrap()
+        );
+        assert!(
+            !db.recover_physical_secret_slot_cas(&candidate, || panic!("이미 정리된 후보"))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn secret_recovery_v37_backfill_preserves_slots_and_generation_on_reopen() {
+        let (dir, _, initial) = file_db("secret-recovery-backfill");
+        drop(initial);
+        let path = dir.join("legacy.sqlite3");
+        let legacy = storage_core::open_with_migrations(&path, &MIGRATIONS[..37]).unwrap();
+        let logical = secret::LogicalCredentialId::new("recovery-backfill").unwrap();
+        let slot = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+        legacy.execute("INSERT INTO physical_secret_slot_ledger (physical_slot,logical_credential_id,state,created_at,updated_at) VALUES (?1,?2,'staging',1,1)", (slot.as_str(),logical.as_str())).unwrap();
+        drop(legacy);
+        let migrated = Db::open(&path).unwrap();
+        let rows = migrated
+            .physical_secret_slots_for_reconciliation(8)
+            .unwrap();
+        assert_eq!(rows[0].physical_slot, slot.as_str());
+        assert_eq!(rows[0].state, PhysicalSecretSlotState::Staging);
+        assert_ne!(rows[0].recovery_generation, [0; 16]);
+        drop(migrated);
+        let reopened = Db::open(&path).unwrap();
+        assert_eq!(
+            rows,
+            reopened
+                .physical_secret_slots_for_reconciliation(8)
+                .unwrap()
+        );
+        drop(reopened);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn physical_slot_ledger는_crash_windows_restart와_exact_ack를_보존한다() {
         let (dir, path, db) = file_db("physical-slot-ledger-restart");
         let logical = secret::LogicalCredentialId::new("ledger-restart").unwrap();
@@ -18157,6 +18321,8 @@ mod tests {
         assert_eq!(
             db.physical_secret_slots_for_reconciliation(1).unwrap(),
             vec![PhysicalSecretSlotLedgerRow {
+                recovery_generation: db.physical_secret_slots_for_reconciliation(1).unwrap()[0]
+                    .recovery_generation,
                 logical_credential_id: logical.as_str().to_owned(),
                 physical_slot: missing.as_str().to_owned(),
                 state: PhysicalSecretSlotState::Staging,
@@ -18811,6 +18977,8 @@ mod tests {
             assert_eq!(
                 db.physical_secret_slots_for_reconciliation(1).unwrap(),
                 vec![PhysicalSecretSlotLedgerRow {
+                    recovery_generation: db.physical_secret_slots_for_reconciliation(1).unwrap()[0]
+                        .recovery_generation,
                     logical_credential_id: logical.as_str().to_owned(),
                     physical_slot: slot.as_str().to_owned(),
                     state: PhysicalSecretSlotState::Published,

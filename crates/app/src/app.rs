@@ -1,3 +1,7 @@
+#[cfg(test)]
+#[path = "keychain_startup_tests.rs"]
+mod keychain_startup_tests;
+
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
@@ -2965,6 +2969,7 @@ type DotenvSyncWorker =
 const SETTINGS_WORKER_IDLE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 struct SettingsSnapshotWorker {
+    secret_repair: Arc<DeferredSecretRepair>,
     db_path: PathBuf,
     redaction: secret::RedactionService,
     ctx: egui::Context,
@@ -3942,50 +3947,82 @@ fn delete_legacy_secret_bundle(
     Ok(())
 }
 
-fn reconcile_physical_secret_ledger(
-    db: &Db,
-    store: &dyn secret::SecretStore,
-) -> anyhow::Result<()> {
-    let rows =
-        db.physical_secret_slots_for_reconciliation(secret::VERSIONED_SECRET_BUNDLE_SLOT_CEILING)?;
-    for row in rows {
-        let logical = secret::LogicalCredentialId::new(row.logical_credential_id)?;
-        let slot = secret::PhysicalSecretSlot::parse(row.physical_slot)?;
-        anyhow::ensure!(
-            slot.belongs_to(&logical),
-            "startup_secret_slot_owner_invalid"
-        );
-        match row.state {
-            storage::PhysicalSecretSlotState::Staging
-            | storage::PhysicalSecretSlotState::Orphan => {
-                secret::delete_secret_bundle(store, &slot)?;
-                let _ =
-                    db.acknowledge_physical_secret_slot_deleted(logical.as_str(), slot.as_str())?;
-            }
-            storage::PhysicalSecretSlotState::Published => {
-                if let Some(legacy) = row.legacy_cleanup_username {
-                    anyhow::ensure!(
-                        legacy == logical.as_str(),
-                        "startup_legacy_cleanup_owner_invalid"
-                    );
-                    delete_legacy_secret_bundle(store, &legacy)?;
-                    let _ = db.acknowledge_legacy_secret_source_deleted(
-                        logical.as_str(),
-                        slot.as_str(),
-                        &legacy,
-                    )?;
-                }
-                anyhow::ensure!(
-                    secret::inspect_secret_bundle(store, &slot)?.access,
-                    "startup_published_secret_missing"
-                );
-            }
-        }
-    }
-    Ok(())
+/// 시작에는 DB 메타데이터만 캡처한다. 후보는 현재 실행의 신규 슬롯으로 확대하지 않는다.
+#[derive(Default)]
+struct DeferredSecretRepair {
+    candidates: std::sync::Mutex<Option<Vec<storage::PhysicalSecretSlotLedgerRow>>>,
 }
 
-fn migrate_legacy_secret_pointers(db: &Db, store: &dyn secret::SecretStore) -> anyhow::Result<()> {
+impl DeferredSecretRepair {
+    fn capture(db: &Db) -> Self {
+        Self {
+            candidates: std::sync::Mutex::new(
+                db.physical_secret_slots_for_reconciliation(
+                    secret::VERSIONED_SECRET_BUNDLE_SLOT_CEILING,
+                )
+                .ok(),
+            ),
+        }
+    }
+
+    #[cfg(test)]
+    fn empty() -> Self {
+        Self {
+            candidates: std::sync::Mutex::new(Some(Vec::new())),
+        }
+    }
+
+    fn reconcile(&self, db: &Db, store: &dyn secret::SecretStore) -> anyhow::Result<()> {
+        self.reconcile_counted(db, store, &mut 0)
+    }
+
+    fn reconcile_counted(
+        &self,
+        db: &Db,
+        store: &dyn secret::SecretStore,
+        publications: &mut u64,
+    ) -> anyhow::Result<()> {
+        // 두 controller의 legacy CAS 이관도 동시에 실행하지 않는다.
+        let mut guard = self
+            .candidates
+            .lock()
+            .map_err(|_| anyhow::anyhow!("secret recovery lock unavailable"))?;
+        let candidates = guard
+            .as_mut()
+            .context("secret recovery snapshot unavailable")?;
+        let current = db.physical_secret_slots_for_reconciliation(
+            secret::VERSIONED_SECRET_BUNDLE_SLOT_CEILING,
+        )?;
+        for candidate in candidates.iter() {
+            // 같은 generation 안에서만 현재 상태를 읽는다. 새로 publish된 access는 삭제하지 않는다.
+            let Some(row) = current.iter().find(|row| {
+                row.physical_slot == candidate.physical_slot
+                    && row.recovery_generation == candidate.recovery_generation
+            }) else {
+                continue;
+            };
+            let slot = secret::PhysicalSecretSlot::parse(row.physical_slot.clone())?;
+            db.recover_physical_secret_slot_cas(row, || {
+                if let Some(legacy) = &row.legacy_cleanup_username {
+                    delete_legacy_secret_bundle(store, legacy)?;
+                }
+                if row.state != storage::PhysicalSecretSlotState::Published {
+                    secret::delete_secret_bundle(store, &slot)?;
+                }
+                Ok(())
+            })?;
+        }
+        candidates.clear();
+        migrate_legacy_secret_pointers(db, store, candidates, publications)
+    }
+}
+
+fn migrate_legacy_secret_pointers(
+    db: &Db,
+    store: &dyn secret::SecretStore,
+    pending: &mut Vec<storage::PhysicalSecretSlotLedgerRow>,
+    publications: &mut u64,
+) -> anyhow::Result<()> {
     let records =
         db.list_credential_secret_records(secret::VERSIONED_SECRET_BUNDLE_SLOT_CEILING)?;
     for record in records {
@@ -4022,53 +4059,72 @@ fn migrate_legacy_secret_pointers(db: &Db, store: &dyn secret::SecretStore) -> a
             .map_err(|_| anyhow::anyhow!("startup_legacy_dcr_read_failed"))?;
         let plan = secret::SecretBundleStagePlan::allocate(logical.clone(), None)?;
         db.register_physical_secret_slot_staging(logical.as_str(), plan.new_slot().as_str())?;
-        if let Err(error) = secret::stage_secret_bundle(
-            store,
-            &plan,
-            secret::SecretBundleRef::new(&access, refresh.as_ref(), dcr.as_ref()),
-        ) {
-            if secret::inspect_secret_bundle(store, plan.new_slot())
-                .is_ok_and(|state| state.is_empty())
-            {
+        let owned = db
+            .physical_secret_slots_for_reconciliation(secret::VERSIONED_SECRET_BUNDLE_SLOT_CEILING)?
+            .into_iter()
+            .find(|row| row.physical_slot == plan.new_slot().as_str())
+            .context("migration staging generation missing")?;
+        anyhow::ensure!(
+            pending.len() < secret::VERSIONED_SECRET_BUNDLE_SLOT_CEILING,
+            "migration retry candidate limit"
+        );
+        pending.push(owned);
+        let result = (|| -> anyhow::Result<()> {
+            if let Err(error) = secret::stage_secret_bundle(
+                store,
+                &plan,
+                secret::SecretBundleRef::new(&access, refresh.as_ref(), dcr.as_ref()),
+            ) {
+                if secret::inspect_secret_bundle(store, plan.new_slot())
+                    .is_ok_and(|state| state.is_empty())
+                {
+                    let _ = db.acknowledge_physical_secret_slot_deleted(
+                        logical.as_str(),
+                        plan.new_slot().as_str(),
+                    );
+                }
+                return Err(error);
+            }
+            let published = db.publish_legacy_credential_secret_slot_cas(
+                logical.as_str(),
+                logical.as_str(),
+                plan.new_slot().as_str(),
+                record.oauth_json.as_deref(),
+                record.meta.masked_hint.as_deref(),
+            )?;
+            if published {
+                *publications = publications
+                    .checked_add(1)
+                    .context("secret migration revision overflow")?;
+                delete_legacy_secret_bundle(store, logical.as_str())?;
+                let _ = db.acknowledge_legacy_secret_source_deleted(
+                    logical.as_str(),
+                    plan.new_slot().as_str(),
+                    logical.as_str(),
+                )?;
+            } else {
+                secret::delete_secret_bundle(store, plan.new_slot())?;
                 let _ = db.acknowledge_physical_secret_slot_deleted(
                     logical.as_str(),
                     plan.new_slot().as_str(),
-                );
+                )?;
             }
-            return Err(error);
+            Ok(())
+        })();
+        if result.is_ok() {
+            pending.retain(|row| row.physical_slot != plan.new_slot().as_str());
         }
-        let published = db.publish_legacy_credential_secret_slot_cas(
-            logical.as_str(),
-            logical.as_str(),
-            plan.new_slot().as_str(),
-            record.oauth_json.as_deref(),
-            record.meta.masked_hint.as_deref(),
-        )?;
-        if published {
-            delete_legacy_secret_bundle(store, logical.as_str())?;
-            let _ = db.acknowledge_legacy_secret_source_deleted(
-                logical.as_str(),
-                plan.new_slot().as_str(),
-                logical.as_str(),
-            )?;
-        } else {
-            secret::delete_secret_bundle(store, plan.new_slot())?;
-            let _ = db.acknowledge_physical_secret_slot_deleted(
-                logical.as_str(),
-                plan.new_slot().as_str(),
-            )?;
-        }
+        result?;
     }
     Ok(())
 }
 
+#[cfg(test)]
 fn reconcile_and_migrate_startup_secrets(
     db: &Db,
     store: &dyn secret::SecretStore,
 ) -> anyhow::Result<()> {
-    reconcile_physical_secret_ledger(db, store)?;
-    migrate_legacy_secret_pointers(db, store)?;
-    reconcile_physical_secret_ledger(db, store)?;
+    DeferredSecretRepair::capture(db).reconcile(db, store)?;
     let published = db
         .physical_secret_slots_for_reconciliation(secret::VERSIONED_SECRET_BUNDLE_SLOT_CEILING)?
         .into_iter()
@@ -4101,31 +4157,50 @@ fn reconcile_and_migrate_startup_secrets(
     Ok(())
 }
 
-/// Best-effort startup repair must never make the whole application depend on an interactive
-/// system keychain dialog. The runtime remains fail-closed when reconciliation did not converge:
-/// legacy logical pointers are rejected by `AppRuntimeSecretResolver`, and incomplete physical
-/// slots retain their durable ledger rows for a later retry.
+#[cfg(test)]
 fn reconcile_startup_secrets_best_effort(db: &Db, store: &dyn secret::SecretStore) -> bool {
-    match reconcile_and_migrate_startup_secrets(db, store) {
-        Ok(()) => true,
-        Err(_) => {
-            tracing::warn!(
-                kind = "secret_store",
-                phase = "startup_reconciliation",
-                error_code = "keychain_unavailable",
-                "startup secret reconciliation deferred"
-            );
-            false
-        }
-    }
+    DeferredSecretRepair::capture(db)
+        .reconcile(db, store)
+        .is_ok()
 }
 
+#[cfg(test)]
 fn execute_settings_job(
     db: &mut Db,
     db_path: &std::path::Path,
     redaction: &secret::RedactionService,
     job: SettingsJob,
 ) -> SettingsOutcome {
+    execute_settings_job_with_repair(db, db_path, redaction, &DeferredSecretRepair::empty(), job)
+}
+
+fn execute_settings_job_with_repair(
+    db: &mut Db,
+    db_path: &std::path::Path,
+    redaction: &secret::RedactionService,
+    secret_repair: &DeferredSecretRepair,
+    job: SettingsJob,
+) -> SettingsOutcome {
+    if matches!(
+        job.action,
+        SettingsJobAction::AddCredential { .. }
+            | SettingsJobAction::DeleteCredential { .. }
+            | SettingsJobAction::RevealCredential { .. }
+            | SettingsJobAction::ScanOrphanCredentials
+            | SettingsJobAction::PurgeOrphanCredentials { .. }
+            | SettingsJobAction::PrepareAgentLaunch { .. }
+            | SettingsJobAction::PrepareQuickAgentLaunch { .. }
+    ) {
+        // 명시적 기능 작업에서만 정리한다. 실패해도 이미 유효한 physical credential은 사용할 수 있다.
+        if secret_repair.reconcile(db, &KeyringSecretStore).is_err() {
+            tracing::warn!(
+                kind = "secret_store",
+                phase = "explicit_reconciliation",
+                error_code = "keychain_unavailable",
+                "secret reconciliation deferred"
+            );
+        }
+    }
     let SettingsJob {
         generation,
         revision,
@@ -4504,8 +4579,14 @@ fn settings_open_failed_outcome(job: SettingsJob) -> SettingsOutcome {
 }
 
 impl SettingsSnapshotWorker {
-    fn new(db_path: PathBuf, redaction: secret::RedactionService, ctx: egui::Context) -> Self {
+    fn new(
+        db_path: PathBuf,
+        redaction: secret::RedactionService,
+        ctx: egui::Context,
+        secret_repair: Arc<DeferredSecretRepair>,
+    ) -> Self {
         Self {
+            secret_repair,
             db_path,
             redaction,
             ctx,
@@ -4526,6 +4607,7 @@ impl SettingsSnapshotWorker {
         let ctx = self.ctx.clone();
         let lifecycle = Arc::new(std::sync::Mutex::new(SettingsWorkerLifecycle::Running));
         let thread_lifecycle = Arc::clone(&lifecycle);
+        let secret_repair = Arc::clone(&self.secret_repair);
         let handle = std::thread::Builder::new()
             .name("settings-snapshot".to_owned())
             .spawn(move || {
@@ -4570,7 +4652,13 @@ impl SettingsSnapshotWorker {
                             }
                         },
                     };
-                    let outcome = execute_settings_job(db, &db_path, &redaction, job);
+                    let outcome = execute_settings_job_with_repair(
+                        db,
+                        &db_path,
+                        &redaction,
+                        &secret_repair,
+                        job,
+                    );
                     if results.send(outcome).is_err() {
                         return;
                     }
@@ -5931,6 +6019,7 @@ fn connector_slack_projection(
 }
 
 struct AppConnectorRepositoryFactory {
+    secret_repair: Arc<DeferredSecretRepair>,
     db_path: PathBuf,
     redaction: secret::RedactionService,
 }
@@ -5953,6 +6042,8 @@ impl connector_service::ConnectorRepositoryFactory for AppConnectorRepositoryFac
             )
         })?;
         Ok(Box::new(AppConnectorRepository {
+            secret_migration_revision: None,
+            secret_repair: Arc::clone(&self.secret_repair),
             db,
             redaction: self.redaction.clone(),
             authorization_owner: Some(authorization_owner),
@@ -5961,6 +6052,8 @@ impl connector_service::ConnectorRepositoryFactory for AppConnectorRepositoryFac
 }
 
 struct AppConnectorRepository {
+    secret_migration_revision: Option<(connector_contract::Revision, connector_contract::Revision)>,
+    secret_repair: Arc<DeferredSecretRepair>,
     db: Db,
     redaction: secret::RedactionService,
     authorization_owner: Option<storage::ActiveAuthorizationOwner>,
@@ -6051,6 +6144,18 @@ impl AppConnectorRepository {
 }
 
 impl connector_service::ConnectorRepository for AppConnectorRepository {
+    fn accept_secret_migration_revision(
+        &mut self,
+        expected: connector_contract::Revision,
+        observed: connector_contract::Revision,
+    ) -> bool {
+        self.secret_migration_revision.take() == Some((expected, observed))
+            && self
+                .db
+                .connector_config_revision()
+                .is_ok_and(|revision| connector_revision(revision) == observed)
+    }
+
     fn load_overview(
         &mut self,
     ) -> Result<connector_service::OverviewData, connector_service::ServiceError> {
@@ -6103,6 +6208,37 @@ impl connector_service::ConnectorRepository for AppConnectorRepository {
         connector_service::Observed<connector_service::RepositoryMcpTarget>,
         connector_service::ServiceError,
     > {
+        self.secret_migration_revision = None;
+        let before = self
+            .db
+            .connector_config_revision()
+            .ok()
+            .map(connector_revision);
+        let mut publications = 0;
+        if self
+            .secret_repair
+            .reconcile_counted(&self.db, &KeyringSecretStore, &mut publications)
+            .is_err()
+        {
+            tracing::warn!(
+                kind = "secret_store",
+                phase = "explicit_connector_reconciliation",
+                error_code = "keychain_unavailable",
+                "secret reconciliation deferred"
+            );
+        }
+        let after = self
+            .db
+            .connector_config_revision()
+            .ok()
+            .map(connector_revision);
+        if let (Some(before), Some(after)) = (before, after)
+            && publications > 0
+            && before.0.checked_add(publications) == Some(after.0)
+        {
+            // publish CAS 하나는 revision을 정확히 한 번 올린다. 다른 writer의 증가가 있으면 증명하지 않는다.
+            self.secret_migration_revision = Some((before, after));
+        }
         let read = self
             .db
             .mcp_request_target_versioned(server_id.as_str())
@@ -6530,6 +6666,19 @@ impl connector_service::ConnectorRepository for AppConnectorRepository {
         connector_service::Observed<Option<connector_service::HttpAuthBinding>>,
         connector_service::ServiceError,
     > {
+        // overview/설정 조회에는 도달하지 않는 명시적 Connector 실행 경계다.
+        if self
+            .secret_repair
+            .reconcile(&self.db, &KeyringSecretStore)
+            .is_err()
+        {
+            tracing::warn!(
+                kind = "secret_store",
+                phase = "explicit_connector_reconciliation",
+                error_code = "keychain_unavailable",
+                "secret reconciliation deferred"
+            );
+        }
         let read = self
             .db
             .credential_oauth_bindings_for_server_versioned(server_id.as_str())
@@ -6562,6 +6711,19 @@ impl connector_service::ConnectorRepository for AppConnectorRepository {
         connector_service::Observed<Option<secret::PhysicalSecretSlot>>,
         connector_service::ServiceError,
     > {
+        // overview/설정 조회에는 도달하지 않는 명시적 Connector 실행 경계다.
+        if self
+            .secret_repair
+            .reconcile(&self.db, &KeyringSecretStore)
+            .is_err()
+        {
+            tracing::warn!(
+                kind = "secret_store",
+                phase = "explicit_connector_reconciliation",
+                error_code = "keychain_unavailable",
+                "secret reconciliation deferred"
+            );
+        }
         let read = self
             .db
             .credential_secret_location_versioned(logical_id.as_str())
@@ -13662,11 +13824,8 @@ impl App {
         }
         let redaction = secret::RedactionService::new();
         let i18n = load_catalog(&config.i18n.locale);
-        // Try crash reconciliation and one-time logical→physical migration before any runtime,
-        // dotenv, Connector, or settings worker can resolve a credential. A locked or foreign-ACL
-        // login keychain must not open a password dialog or abort the app; unresolved legacy
-        // pointers remain fail-closed and the durable ledger preserves exact retry state.
-        reconcile_startup_secrets_best_effort(&db, &KeyringSecretStore);
+        // Keychain 접근 없이 이전 실행의 복구 후보만 캡처한다.
+        let secret_repair = Arc::new(DeferredSecretRepair::capture(&db));
         let pending_approval_owner = Arc::new(
             db.acquire_pending_approval_owner()
                 .expect("pending approval owner acquire failed"),
@@ -13739,6 +13898,7 @@ impl App {
                 idle_ttl: CONNECTOR_IDLE_TTL,
                 initial_overview: Some(connector_initial_overview),
                 repository_factory: Arc::new(AppConnectorRepositoryFactory {
+                    secret_repair: Arc::clone(&secret_repair),
                     db_path: db_path.clone(),
                     redaction: redaction.clone(),
                 }),
@@ -13765,8 +13925,12 @@ impl App {
             new_env_project_rows_worker(db_path.clone(), egui_ctx.clone());
         let env_secret_reveal_worker =
             new_env_secret_reveal_worker(db_path.clone(), egui_ctx.clone());
-        let settings_snapshot_worker =
-            SettingsSnapshotWorker::new(db_path.clone(), redaction.clone(), egui_ctx.clone());
+        let settings_snapshot_worker = SettingsSnapshotWorker::new(
+            db_path.clone(),
+            redaction.clone(),
+            egui_ctx.clone(),
+            secret_repair,
+        );
         let launcher_ctx = egui_ctx.clone();
         let launcher_excluded_directory = crate::agent_shim::shim_path();
         let agent_launcher_worker = crate::lazy_worker::LazyBoundedWorker::new(
@@ -13892,13 +14056,9 @@ impl App {
         let last_mono_font = config.terminal.mono_font.clone();
         let last_mono_weight = config.terminal.mono_weight.clone();
         let initial_project_name_style = config.ui.session_name_style;
-        let agent_sessions_secrets_snapshot = match secret::SecretStore::has_secret(
-            &KeyringSecretStore,
-            CODEX_LLM_API_KEY_ENTRY_ID,
-        ) {
-            Ok(present) => ui::agent_sessions::AgentSessionsSecretsSnapshot::new(0, present),
-            Err(_) => ui::agent_sessions::AgentSessionsSecretsSnapshot::unavailable(0),
-        };
+        // 저장 여부를 알기 위해 시작 시 Keychain을 열지 않는다. 저장/삭제는 명시적 작업이다.
+        let agent_sessions_secrets_snapshot =
+            ui::agent_sessions::AgentSessionsSecretsSnapshot::deferred(0);
         let mut app = Self {
             config,
             config_path,
@@ -42613,7 +42773,12 @@ mod tests {
     fn settings_snapshot_worker는_요청전까지_thread를_만들지_않는다() {
         let path = temp_db_path("settings-lazy");
         let ctx = egui::Context::default();
-        let worker = SettingsSnapshotWorker::new(path, secret::RedactionService::new(), ctx);
+        let worker = SettingsSnapshotWorker::new(
+            path,
+            secret::RedactionService::new(),
+            ctx,
+            Arc::new(DeferredSecretRepair::empty()),
+        );
         assert!(worker.slot.is_none());
     }
 
@@ -42974,6 +43139,7 @@ mod tests {
             path.clone(),
             secret::RedactionService::new(),
             egui::Context::default(),
+            Arc::new(DeferredSecretRepair::empty()),
         );
 
         for index in 0..24u64 {

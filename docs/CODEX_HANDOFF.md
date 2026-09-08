@@ -2333,3 +2333,20 @@
 - Failed approaches: an initial unbounded `codex review --uncommitted` ran extensive checks but never produced a final review and was stopped by exact PID; it also attempted the invalid `cargo test -p deppy-sijo --lib` command even though the app has no library target. The first RED-test draft used unavailable `Context::run`, then captured `WorkspaceUi` too broadly; both compile-only mistakes were corrected before the intended RED assertion was observed. The first final format check found one line-wrap difference; `cargo fmt --all` corrected it and the rerun passed.
 - Remaining work: push this clean landing branch, create a PR to `main`, wait for required checks, merge only if green, close superseded PRs #147 and #148, and preserve PRs #146 and #149 plus their dependent remote branches for further development.
 - Exact next commands: `git push -u origin land/ime-resize-ready-20260906`; create a `main` PR for commits `4903b39` and `bbead4f`; run `gh pr checks <new-pr> --watch`; merge the new PR after all required checks pass; close #147 and #148 without deleting the `fix/window-resize-flicker` branch because PR #149 still targets it.
+## 2026-09-08 작업 화면 한 목록 main 독립 이관
+
+- 목표: PR #146에 Relay와 섞인 작업 화면 한 목록 변경만 최신 `origin/main`에서 독립 PR로 다시 만든다.
+- worktree/branch: `/private/tmp/deppy-fleet-one-list-main-20260908`, `feat/fleet-one-list-main`, base `45e66cc`.
+- 현재 변경: `crates/app/src/ui/fleet.rs`를 `75bf2c9`에서 hunk 이관했고, 다섯 로케일의 미사용 `fleet.hero.now/next/clear/skip/sessions`를 삭제했다. Relay/App composition/다른 UI는 변경하지 않았다.
+- 보존 계약: 빈 큐에서도 waiting renderer 호출, 세션 0+승인 1일 때 펼친 카드와 빈 안내 동시 표시, 가장 오래 막힌 하나만 펼침, 연결된 세션 카드 중복 제거, 좁은 폭 수용.
+- 시각 증거: #146 실행본에서 사용자가 중복 없음, 승인 단독 빈 상태, 좁은 창 표시를 확인했다. 실제 막힌 항목이 없어 첫 항목 하나 펼침은 실화면 미확인이다. 이번 이관 중 앱 빌드·재실행은 하지 않는다.
+- 남은 작업: fleet/i18n 집중 검사, strict Clippy/fmt/diff/boundary, 읽기 전용 리뷰, 커밋/push/main PR, 일지.
+- 다음 명령: `CARGO_BUILD_JOBS=2 cargo test -p deppy-sijo --bin deppy-sijo ui::fleet::tests --locked -- --test-threads=1`; `cargo run -p xtask --locked -- i18n-check`; `git diff --check`.
+- 검증 갱신: Fleet 집중 테스트는 첫 실행에서 11/12 통과 후 테스트 하네스가 `run_ui`의 폰트 텍스처 델타를 적용하지 않고 버려 egui drop guard에서 실패했다. 제품 단언 실패가 아님을 같은 저장소의 하네스 패턴과 비교해 확인하고, 업로더가 없는 하네스에서 델타를 명시적으로 비우도록 수정한 뒤 12/12 통과했다. `xtask i18n-check`는 i18n 8건과 정적 키 검사를 통과했고, app strict all-target Clippy, 전체 rustfmt check, agent-state boundary 4건, diff/Relay·storage 경계 및 제거 키 0참조 검사도 통과했다.
+- 남은 작업 갱신: 읽기 전용 최종 리뷰에서 확인된 결함만 수정·재검증한 뒤 커밋, 작업 일지, push, main 대상 PR을 게시한다. 앱 빌드·재실행과 실제 막힌 첫 항목 화면 확인은 사용자 요청대로 보류한다.
+- 다음 명령 갱신: `codex exec --sandbox read-only`로 변경 diff만 검토; `git diff --check`; `git status --short`; 커밋 후 `git push -u origin feat/fleet-one-list-main`; `gh pr create --base main`.
+- 리뷰 수정: 읽기 전용 Codex 리뷰가 MCP 승인과 PTY 상태 스냅샷이 독립이라 대상 세션이 아직 Active/Idle이면 펼친 승인과 다른 묶음의 세션 카드가 중복되는 P2를 확인했다. 해당 상태를 실제 UI 하네스에서 RED로 재현했고, 펼친 항목의 세션 참조를 모든 묶음에서 제외하도록 수정해 단독 GREEN 및 Fleet 전체 13/13을 확인했다. 영향 후 app strict all-target Clippy도 다시 통과했고 rustfmt가 지적한 한 줄 배치만 적용했다.
+- 최종 남은 작업: 수정 diff 재리뷰, 최종 fmt/diff/경계 확인, 커밋·작업 일지·push·main PR 게시. 첫 막힌 항목의 실제 화면 확인과 앱 빌드·재실행은 계속 보류한다.
+- 최종 리뷰: 첫 수정 재리뷰가 뒤 큐 항목의 Active/Idle 세션도 Compact 행과 카드로 중복될 수 있는 두 번째 P2를 확인했다. 뒤 승인 재현도 RED로 확인한 뒤 큐에 연결된 모든 비막힘 세션을 막힌 묶음으로 승격해 `blocked_rows`가 큐 순서대로 한 번만 대응하게 수정했다. Fleet 전체 14/14, app strict all-target Clippy, rustfmt/diff 검사를 다시 통과했고 같은 Codex 세션의 최종 좁은 재리뷰는 `No findings`로 종료됐다.
+- 현재 남은 작업: 커밋·옵시디언 작업 일지·push·main PR 게시와 GitHub 상태 확인. 실제 화면 확인 및 앱 빌드·재실행은 보류 상태다.
+- 다음 에이전트 명령: `git status --short`; `git log -1 --oneline`; `gh pr view --json number,url,state,headRefName,baseRefName,statusCheckRollup`; 사용자 승인 뒤에만 앱을 재빌드·재실행해 실제 막힌 항목 하나 펼침을 화면으로 확인한다.

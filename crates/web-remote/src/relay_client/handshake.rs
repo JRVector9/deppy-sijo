@@ -1555,4 +1555,176 @@ mod tests {
             "게이트는 hello를 해석하지 않는다 — 해석은 이 상태 기계만 한다"
         );
     }
+
+    // ---------------------------------------------------------------- 고정 벡터
+
+    /// `tests/fixtures/relay-hello-v1.json`은 Rust와 독립적으로 쓴 인코더가 만든 벡터다 —
+    /// 코드가 아니라 명세를 고정한다. 브라우저 셸은 같은 파일로 자기 인코더를 검증한다.
+    #[test]
+    fn the_v1_hello_fixture_matches_this_implementation() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/relay-hello-v1.json")).unwrap();
+        fn hex(value: &serde_json::Value) -> Vec<u8> {
+            let text = value.as_str().unwrap();
+            (0..text.len())
+                .step_by(2)
+                .map(|at| u8::from_str_radix(&text[at..at + 2], 16).unwrap())
+                .collect()
+        }
+        fn fixed<const N: usize>(bytes: &[u8]) -> [u8; N] {
+            bytes.try_into().unwrap()
+        }
+        let desktop = &fixture["desktop"];
+        let device = &fixture["device"];
+        assert_eq!(fixture["protocol_version"], RELAY_PROTOCOL_VERSION);
+        assert_eq!(fixture["record_bytes"]["offer"], OFFER_RECORD_BYTES);
+        assert_eq!(
+            fixture["record_bytes"]["identity_hello"],
+            IDENTITY_HELLO_BYTES
+        );
+        assert_eq!(
+            fixture["record_bytes"]["pairing_proof"],
+            PAIRING_PROOF_RECORD_BYTES
+        );
+        assert_eq!(
+            fixture["record_bytes"]["known_device"],
+            KNOWN_DEVICE_RECORD_BYTES
+        );
+        assert_eq!(fixture["tags"]["identity_hello"], HELLO_TAG_IDENTITY);
+        assert_eq!(fixture["tags"]["pairing_proof"], HELLO_TAG_PAIRING_PROOF);
+        assert_eq!(fixture["tags"]["known_device"], HELLO_TAG_KNOWN_DEVICE);
+        assert_eq!(fixture["roles"]["desktop"], ROLE_DESKTOP);
+        assert_eq!(fixture["roles"]["device"], ROLE_DEVICE);
+
+        let connection = ConnectionId::from_bytes(fixed(&hex(&fixture["connection_id_hex"])));
+        let desktop_identity = RelayIdentity::from_private_scalar(fixed(&hex(
+            &desktop["identity_private_scalar_hex"],
+        )))
+        .unwrap();
+        let device_identity =
+            RelayIdentity::from_private_scalar(fixed(&hex(&device["identity_private_scalar_hex"])))
+                .unwrap();
+        assert_eq!(
+            desktop_identity.public_key_sec1().to_vec(),
+            hex(&desktop["identity_public_sec1_hex"])
+        );
+        assert_eq!(
+            device_identity.fingerprint().to_vec(),
+            hex(&device["identity_fingerprint_hex"])
+        );
+        let device_fingerprint = device_identity.fingerprint();
+        let desktop_public = desktop_identity.public_key_sec1().to_vec();
+        let device_public = device_identity.public_key_sec1().to_vec();
+        let desktop_pending = PendingHandshake::begin_with_ephemeral_for_test(
+            desktop_identity,
+            device_public,
+            RelayRole::Desktop,
+            RELAY_PROTOCOL_VERSION,
+            connection,
+            fixed(&hex(&desktop["ephemeral_private_scalar_hex"])),
+        )
+        .unwrap();
+        let device_pending = PendingHandshake::begin_with_ephemeral_for_test(
+            device_identity,
+            desktop_public,
+            RelayRole::Device,
+            RELAY_PROTOCOL_VERSION,
+            connection,
+            fixed(&hex(&device["ephemeral_private_scalar_hex"])),
+        )
+        .unwrap();
+        assert_eq!(
+            encode_offer(desktop_pending.offer()).to_vec(),
+            hex(&desktop["offer_record_hex"])
+        );
+        assert_eq!(
+            encode_offer(device_pending.offer()).to_vec(),
+            hex(&device["offer_record_hex"])
+        );
+
+        // 서명은 RFC 6979 결정적이므로 바이트까지 같다.
+        let desktop_hello = desktop_pending
+            .sign_peer_offer(device_pending.offer())
+            .unwrap();
+        let device_hello = device_pending
+            .sign_peer_offer(desktop_pending.offer())
+            .unwrap();
+        assert_eq!(
+            encode_identity_hello(&desktop_hello).to_vec(),
+            hex(&desktop["identity_hello_record_hex"])
+        );
+        assert_eq!(
+            encode_identity_hello(&device_hello).to_vec(),
+            hex(&device["identity_hello_record_hex"])
+        );
+
+        // fixture의 레코드가 그대로 상대를 인증시킨다.
+        let HelloRecord::Identity(fixture_desktop_hello) =
+            decode_hello_record(&hex(&desktop["identity_hello_record_hex"])).unwrap()
+        else {
+            panic!("desktop identity hello");
+        };
+        let HelloRecord::Identity(fixture_device_hello) =
+            decode_hello_record(&hex(&device["identity_hello_record_hex"])).unwrap()
+        else {
+            panic!("device identity hello");
+        };
+        let desktop_auth = desktop_pending.finish(fixture_device_hello).unwrap();
+        let device_auth = device_pending.finish(fixture_desktop_hello).unwrap();
+        assert_eq!(
+            desktop_auth.confirmation_code(),
+            fixture["confirmation_code"].as_str().unwrap()
+        );
+        assert_eq!(
+            device_auth.confirmation_code(),
+            desktop_auth.confirmation_code()
+        );
+        let transcript_hash: [u8; 32] = fixed(&hex(&fixture["transcript_hash_hex"]));
+        assert_eq!(
+            desktop_auth.pairing_binding().transcript_hash(),
+            transcript_hash
+        );
+
+        // 소유 증명: HMAC-SHA256(secret, transcript_hash || connection || device_fingerprint).
+        let proof_fixture = &fixture["pairing_proof"];
+        let mut message = transcript_hash.to_vec();
+        message.extend_from_slice(connection.as_bytes());
+        message.extend_from_slice(&device_fingerprint);
+        assert_eq!(message, hex(&proof_fixture["message_hex"]));
+        let mut secret_bytes: [u8; 32] = fixed(&hex(&proof_fixture["secret_hex"]));
+        let secret = PairingSecret::take_from_bytes(&mut secret_bytes);
+        let binding = PairingBinding::new(connection, device_fingerprint, transcript_hash);
+        assert_eq!(binding, desktop_auth.pairing_binding());
+        let proof = pairing_proof(&secret, &binding);
+        assert_eq!(proof.to_vec(), hex(&proof_fixture["proof_hex"]));
+        let pairing_id = PairingId::from_bytes(fixed(&hex(&proof_fixture["pairing_id_hex"])));
+        assert_eq!(
+            encode_pairing_proof(pairing_id, &proof).to_vec(),
+            hex(&proof_fixture["record_hex"])
+        );
+        assert_eq!(
+            decode_hello_record(&hex(&proof_fixture["record_hex"])).unwrap(),
+            HelloRecord::PairingProof { pairing_id, proof }
+        );
+
+        let known = &fixture["known_device"];
+        let device_id = DeviceId::from_bytes(fixed(&hex(&known["device_id_hex"])));
+        assert_eq!(
+            encode_known_device(device_id).to_vec(),
+            hex(&known["record_hex"])
+        );
+        assert_eq!(
+            decode_hello_record(&hex(&known["record_hex"])).unwrap(),
+            HelloRecord::KnownDevice { device_id }
+        );
+
+        for reject in fixture["reject"].as_array().unwrap() {
+            let record = hex(&reject["record_hex"]);
+            assert!(
+                decode_hello_record(&record).is_err(),
+                "{} must be rejected",
+                reject["name"]
+            );
+        }
+    }
 }

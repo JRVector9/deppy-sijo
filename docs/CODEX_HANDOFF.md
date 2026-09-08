@@ -2367,3 +2367,18 @@
 
 - R1 최종 source archive50e48d73d6 완료: macOS protocol/server/storage/web-remote strict Clippy/fmt/718 PASS·2 ignored, Linux rust:1.96 protocol/server strict Clippy72 PASS/release PASS. 마지막 서버 수정 이후 전체를 다시 실행했다. xtask boundary와 제외 파일 diff도 PASS. staged 제품 bytes가 검증 archive와 동일함을 확인했다. bounded 최종 source 재리뷰 확정 결함 없음.
 - R1 게시 직전: 제품+R1 문서만 stage하며 R2 shell/shared/assets/CI/fixture와 handshake fixture 테스트 hunk는 unstaged로 보존한다. 다음 명령: git commit -m 'feat(relay): 비UI 재접속 코어를 main에 이관한다'; git push -u origin feat/relay-reconnect-core-main; gh pr create --base main --head feat/relay-reconnect-core-main --body-file /private/tmp/deppy-relay-core-pr-body.md. 이후 git switch -c feat/relay-shell-main 후 별도 R2 계획을 실행한다. DNS/TLS/자격증명/외부 배포/실기기/24h soak는 BLOCKED다.
+
+## 2026-09-08 R1 게시 / R2 브라우저 셸 분기
+
+- R1 PR https://github.com/JRVector9/deppy-sijo/pull/161, base main, HEAD6ee7eb4c3427a289d7f2c120cf5e403af74b213f. source gate/review 완료 후 게시했으며 merge하지 않았다.
+- R2 feat/relay-shell-main을 그 정확한 HEAD에서 생성했다. 남은 shell/shared/assets/static route/Chrome·Node fixture/CI hunk만 이관하며 별도 writing-plans 계획을 작성했다.
+- 현재 R2 Node와 web-remote 전체→headless Chrome3→strict Clippy/fmt 실행 중이다. 제품 제외 경계와 diff check PASS. 기존 원본 #146은 그대로다.
+- 다음: 실제 결과 기록, R2 scoped Codex source 리뷰 결과 확인, Obsidian 일지, R1 base stacked PR 게시. GitGuardian 공개 fixture 근거는 유지하며 DNS/TLS/배포/실기기/24h soak는 BLOCKED다.
+
+- R2 독립 web-remote336 PASS·4 ignored, Node16 PASS, 로컬 artifact build/verify PASS. Chrome 실제실행은 pairing/WebCrypto2 PASS, viewer-core는60초report timeout FAIL이었다. ps로 정확한 child 상태 확인했으며 테스트 helper가 해당 child를 정리했다. viewer runner/RAF/report 원인 조사 중, 전체 Chrome PASS로 세지 않는다. 뒤에 체인된 Clippy/fmt는 아직 미실행이다. R1 Actions5개는 모두 runner_id0/steps[] FAILURE, GitGuardian SUCCESS 확인.
+
+- R2 Chrome timeout RCA: 동일 viewer JS/fixture는 임시 Node/CDP에서 status=ok,91frames,errors=[]이고 원래 테스트 재시도도 PASS였다. Rust helper에 분할 요청을 보내는 새 chrome_support_contract 테스트는 received=Ok(0)으로 실제 RED. accepted socket 비차단 상속을 serve_one에서 해제하고2초 write idle을 추가했다. 제품JS는 변경하지 않았다. 최종 web-remote 전체/Chrome3/strict Clippy와 좁은 helper 재리뷰 실행 중이다.
+
+- R2 최종 gate 완료: web-remote337 PASS·4 ignored(생성helper1+별도Chrome3), 이어 Chrome3 모두 실제PASS, Node16 PASS, web-remote all-target strict Clippy/fmt/diff/제외 경계 PASS. Chrome helper 수정 뒤 전체를 다시 검증했다. R2 scoped Codex 및 helper 좁은 재리뷰 모두 확정 결함 없음.
+- R2 로컬 artifact build+verify PASS: /private/tmp/deppy-relay-r2-artifact-20260908, shell_version=e89480c33d67082a, archive digest617faa69677d4e598f86da5861e3f371fc12481033ca5c7a48416893c88124c5. 실제 배포가 아니다.
+- R2 게시 직전: shell/static/assets/browser test·fixture/CI 및 한 handshake fixture 테스트 hunk만 commit한다. 다음 명령: git push -u origin feat/relay-shell-main; gh pr create --base feat/relay-reconnect-core-main --head feat/relay-shell-main --body-file /private/tmp/deppy-relay-shell-pr-body.md. R1 먼저 착지 후 R2를 최신main과 일반 merge/retarget하고 재검증한다. force-push/rebase는 하지 않는다.

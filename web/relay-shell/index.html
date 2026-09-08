@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>시조새 원격 · 보기 전용</title>
+    <!--
+      고정 신뢰 오리진의 셸 문서. 빌드(build.sh)가 아래 두 자리표시자를 릴리스 상수로 바꾼다.
+      바뀌지 않은 상태로 열리면 relay-shell.js가 "설정이 올바르지 않다"로 닫힌 채 멈춘다 —
+      빌드되지 않은 소스 트리가 실수로 서비스되는 일을 막는다.
+
+      실행 가능한 코드는 전부 외부 파일이다. 인라인 스크립트도, 인라인 스타일도 없다.
+      CSP는 응답 헤더로 전달한다(README.md의 헤더 표가 유일한 출처다).
+    -->
+    <meta name="relay-origin" content="__RELAY_ORIGIN__" />
+    <meta name="shell-origin" content="__SHELL_ORIGIN__" />
+    <meta name="referrer" content="no-referrer" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" content="#181b20" />
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <link rel="stylesheet" href="./mobile-theme.css" />
+    <link rel="stylesheet" href="./relay-shell.css" />
+    <script type="module" src="./relay-shell.js"></script>
+  </head>
+  <body data-screen="boot" data-stage="closed" data-curtain="off">
+    <div class="curtain" aria-hidden="true"></div>
+
+    <main id="relay-shell-root" class="shell">
+      <header class="shell-header">
+        <span class="title">시조새 원격</span>
+        <span class="badge badge-view">보기 전용</span>
+      </header>
+
+      <section id="screen-boot" class="screen" aria-live="polite">
+        <h1>준비 중</h1>
+        <p>이 기기의 신원을 확인하고 있습니다.</p>
+      </section>
+
+      <section id="screen-link" class="screen">
+        <h1>페어링 링크가 필요합니다</h1>
+        <p>
+          Mac의 설정에서 Relay 페어링 QR을 다시 연 뒤 이 화면을 그 QR로 다시 여세요. 링크는
+          5분 동안 한 번만 쓸 수 있습니다.
+        </p>
+      </section>
+
+      <section id="screen-identity" class="screen">
+        <h1>기기 신원을 쓸 수 없습니다</h1>
+        <p>
+          이 브라우저에 저장된 기기 키가 손상됐거나 이 셸이 만든 키가 아닙니다. 안전을 위해
+          연결하지 않았습니다.
+        </p>
+        <p class="warn">
+          신원을 초기화하면 이 기기는 Mac에서 새 기기로 보입니다. Mac에서 다시 승인해야 합니다.
+        </p>
+        <button id="reset-identity" class="control danger" type="button">신원 초기화</button>
+      </section>
+
+      <section id="screen-connect" class="screen" aria-live="polite">
+        <h1>릴레이에 연결하는 중</h1>
+        <ol class="progress">
+          <li>인터넷 연결 확인</li>
+          <li>Deppy 보안 릴레이 입장</li>
+          <li>종단 간 암호화 채널 준비</li>
+        </ol>
+      </section>
+
+      <section id="screen-verify" class="screen">
+        <h1>Mac에서 이 코드를 확인하세요</h1>
+        <p id="verify-code" class="code" data-digits="">— —</p>
+        <p>
+          Mac 화면에 같은 여섯 자리가 떠 있어야 합니다. 숫자가 다르면 승인하지 말고 이 화면을
+          닫으세요.
+        </p>
+        <p class="wait">Mac에서 승인할 때까지 기다리는 중입니다. 이 기기에서는 승인할 수 없습니다.</p>
+      </section>
+
+      <section id="screen-revoked" class="screen">
+        <h1>접근이 해제됐습니다</h1>
+        <p>Mac에서 이 기기의 접근이 해제됐습니다. 계속하려면 처음부터 다시 페어링해야 합니다.</p>
+        <button id="restart-pairing" class="control" type="button" data-restart>처음부터</button>
+      </section>
+
+      <section id="screen-recovery" class="screen">
+        <h1>연결이 끊겼습니다</h1>
+        <p>
+          페어링 링크는 한 번만 쓸 수 있습니다. Mac에서 QR을 다시 연 뒤 그 링크로 이 화면을 다시
+          여세요.
+        </p>
+        <button id="restart-pairing-2" class="control" type="button" data-restart>처음부터</button>
+      </section>
+
+      <!-- 세션/뷰포트 마크업은 여기 없다. 채널이 활성화된 뒤 relay-shell.js가 만든다. -->
+      <div id="session-mount"></div>
+
+      <p id="shell-note" class="note" role="status"></p>
+
+      <footer class="shell-footer">
+        <p>
+          이 기기는 화면을 보기만 합니다. 입력·승인·파일 전송 기능은 이 셸에 존재하지 않으며,
+          Mac이 독립적으로 다시 거절합니다.
+        </p>
+      </footer>
+    </main>
+  </body>
+</html>

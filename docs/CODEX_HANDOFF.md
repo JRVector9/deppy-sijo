@@ -2333,3 +2333,10 @@
 - Failed approaches: an initial unbounded `codex review --uncommitted` ran extensive checks but never produced a final review and was stopped by exact PID; it also attempted the invalid `cargo test -p deppy-sijo --lib` command even though the app has no library target. The first RED-test draft used unavailable `Context::run`, then captured `WorkspaceUi` too broadly; both compile-only mistakes were corrected before the intended RED assertion was observed. The first final format check found one line-wrap difference; `cargo fmt --all` corrected it and the rerun passed.
 - Remaining work: push this clean landing branch, create a PR to `main`, wait for required checks, merge only if green, close superseded PRs #147 and #148, and preserve PRs #146 and #149 plus their dependent remote branches for further development.
 - Exact next commands: `git push -u origin land/ime-resize-ready-20260906`; create a `main` PR for commits `4903b39` and `bbead4f`; run `gh pr checks <new-pr> --watch`; merge the new PR after all required checks pass; close #147 and #148 without deleting the `fix/window-resize-flicker` branch because PR #149 still targets it.
+
+## 2026-09-08 R4 Keychain startup lazy 시작
+
+- 목표: 반복 시작 Keychain 팝업을 최신main45e66cc의 독립 fix/keychain-startup-lazy에서 해결한다. R3 #163은 별도 stacked PR로 게시 완료이며 여기로 이관하지 않는다.
+- 원인: App::new의 reconcile_startup_secrets_best_effort가 모든 ledger/legacy 자격증명 get/has/delete를 즉시 수행한다. native store 등록 자체는 로컬 라이브러리에서 구조체 생성뿐임을 확인했다.
+- 계획: docs/superpowers/plans/2026-09-08-keychain-startup-lazy.md. 실제 App::new + keyring-core counting mock RED, explicit credential/connector 작업으로 bounded migration을 지연하고 기존 OAuth 물리슬롯/오류계약을 보존한다. 아직 제품변경·테스트 실행 없음.
+- 다음: test-only keyring store spy와 실제 생성 회귀를 추가하고 CARGO_BUILD_JOBS2·독립target으로 RED를 실행한다. 앱실행/빌드/배포/다른lane 변경 금지.

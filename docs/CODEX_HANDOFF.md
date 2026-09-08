@@ -2480,3 +2480,10 @@
 - PR #165 자체 실행을 확인했다. Actions `34215008968`(Dependency security)과 `34215008991`(Build and test)의 모든 job annotation은 계정 결제 실패 또는 spending limit 때문에 job이 시작되지 않았다고 명시한다. 원격 CI는 BLOCKED이며 코드 검사 PASS가 아니다. GitGuardian은 최초 조회 당시 진행 중이었다.
 - 남은 작업: root의 stacked PR 검토/통합, 계정 billing/spending 복구 뒤 CI 재실행, 별도 E 후속 PR. 앱 실화면/IME와 Ghostty·네이티브 TLS·Linux/Windows 검증은 대기 상태다.
 - 다음 에이전트 명령: `cd /private/tmp/deppy-scrollback-live-20260908`; `git status --short`; `git rev-parse HEAD`; `gh pr view 165 --json url,headRefOid,baseRefName,statusCheckRollup`; `gh run view 34215008968`; `gh run view 34215008991`. 최종 문서 커밋도 일반 push해 원격 HEAD를 맞춘다.
+
+## 2026-09-08 PR E 실제 resize 적용 세대 시작
+- 목표: queue 수락/실제 backend+PTY 적용/화면 승격 구분과 stale resize 차단. D #165 final 1dfef2a 위 독립 worktree `/private/tmp/deppy-resize-applied-generation-20260908`, branch `fix/resize-applied-generation`.
+- 완료: 최종 D 코드와 승인 설계 대조, spec/plan 작성. D protocol13→E append-only14. 최초 tracked 전 legacy viewport 유지, 이후 epoch/token/실제 크기 stamp. C reflow/#159 geometry/font/IME 배치 변경 금지.
+- 테스트: E 테스트 아직 실행하지 않음. D의 PASS를 E PASS로 대체하지 않는다. 앱 재빌드/실행 금지.
+- 남은 작업: admission RED→checked Session/worker→wire slots/delta→UI fence→관련 gate/유계 리뷰/일지/commit/push/stacked PR.
+- 다음 명령: `CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-deps-target-20260907 cargo test -p deppy-sijo --bin deppy-sijo --locked resize_admission -- --test-threads=1`.

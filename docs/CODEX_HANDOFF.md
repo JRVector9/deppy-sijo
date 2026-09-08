@@ -2426,6 +2426,29 @@
   통합 PR/main merge, 새 main package와 앱 재실행을 진행한다. 외부 DNS/TLS/배포는
   자격증명 부재로 계속 BLOCKED다.
 
+### 통합 checkpoint — 19개 PR 전체 결합 및 workspace gate 완료
+
+- #174 macOS 공증까지 merge했고, 원격 19개 원본 브랜치의 현재 head를 각각
+  `git merge-base --is-ancestor`로 검사해 모두 통합 HEAD에 포함됨을 확인했다.
+- 첫 workspace 실행은 app test 컴파일에서 `App::new`의 `run_lock`과
+  `settings::show`의 Relay/scrollback 인자가 빠져 exit 101이었다. 인자를 보존해
+  다시 컴파일한 뒤, macOS 비대화형 Security.framework 경로 때문에 기존
+  `keyring-core` counting store가 보이지 않는 테스트 결합 문제를 실제 assertion
+  실패로 확인했다.
+- 해결: `secret/test-keyring-core`를 app dev-dependency에서만 활성화했다. 앱 테스트는
+  실제 login Keychain을 건드리지 않고 기존 접근 횟수 계약을 검증하며, 일반·패키지
+  빌드는 feature를 활성화하지 않아 `kSecUseAuthenticationUIFail` 경로를 그대로 쓴다.
+- 실제 검증: 해당 Keychain 회귀 1 PASS. 이어서
+  `cargo test --workspace --locked -- --test-threads=1` 전체 exit 0(app 2,209 PASS /
+  14 ignored, storage 338, runtime 301, terminal 95 / 4 ignored, web-remote 317 /
+  1 ignored 등). `cargo clippy --workspace --all-targets --locked -- -D warnings` PASS.
+  통합 뒤 `cargo fmt --all -- --check`, `git diff --check`, `xtask check-boundary`,
+  `xtask check-deps`도 모두 PASS했다.
+- 현재 수정 파일: `crates/app/Cargo.toml`, `crates/app/src/keychain_startup_tests.rs`,
+  `crates/secret/Cargo.toml`, `crates/secret/src/lib.rs`, 이 handoff와 계획 문서.
+- 다음: 변경을 checkpoint commit하고 `origin/main...HEAD` 전체 Codex CLI 리뷰를
+  실행한다. 지적을 반영해 gate를 필요한 범위만 재검증한 뒤 통합 PR을 만들고 merge한다.
+
 - 현재 목표: #156~#176의 open Ready PR 19개를 의존 순서와 의미 보존 충돌 해결로 통합하고 단일 PR을 `main`에 merge한 뒤 앱을 최종 build/relaunch한다.
 - 작업 트리: `/private/tmp/deppy-ready-prs-integration-20260909`, 브랜치 `integrate/ready-prs-20260909`, 기준 `origin/main` `45e66ccae313e653fc5dc6df46b80f791f231fc4`. 원래 `/Users/jr/Desktop/projects/deppy-sijo`의 `feat/fleet-one-list-and-relay-wip`는 건드리지 않는다.
 - 확인된 충돌: 모든 PR의 `docs/CODEX_HANDOFF.md`; #157/#159 `runtime/src/command.rs`; #159/#167 `ui/workspace.rs`; #156/#173 `app.rs`와 `ui/file_tree.rs`; #161/#169 Relay v38/v39와 #166 Keychain v38 migration 번호. Relay 뒤 Keychain을 v40으로 옮긴다.

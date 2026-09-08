@@ -2,6 +2,7 @@ mod bundle;
 mod diagnostic_scan;
 pub mod hex;
 #[cfg(target_os = "macos")]
+#[cfg_attr(feature = "test-keyring-core", allow(dead_code))]
 mod macos;
 mod redaction;
 pub mod token;
@@ -168,7 +169,7 @@ pub struct KeyringSecretStore;
 static KEYRING_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 impl KeyringSecretStore {
-    #[cfg(any(not(target_os = "macos"), test))]
+    #[cfg(any(not(target_os = "macos"), test, feature = "test-keyring-core"))]
     fn entry(&self, id: &str) -> anyhow::Result<keyring_core::Entry> {
         keyring_core::Entry::new(KEYRING_SERVICE, id)
             .with_context(|| format!("keyring entry 생성 실패: {id}"))
@@ -178,11 +179,11 @@ impl KeyringSecretStore {
 impl SecretStore for KeyringSecretStore {
     fn set_secret(&self, id: &str, secret: &SecretString) -> anyhow::Result<()> {
         let _serial = KEYRING_SERIAL.lock().expect("keyring serial lock");
-        #[cfg(all(target_os = "macos", not(test)))]
+        #[cfg(all(target_os = "macos", not(any(test, feature = "test-keyring-core"))))]
         {
             macos::set(id, secret).context("keyring 저장 실패")
         }
-        #[cfg(any(not(target_os = "macos"), test))]
+        #[cfg(any(not(target_os = "macos"), test, feature = "test-keyring-core"))]
         {
             self.entry(id)?
                 .set_password(secret.expose())
@@ -192,11 +193,11 @@ impl SecretStore for KeyringSecretStore {
 
     fn get_secret(&self, id: &str) -> anyhow::Result<SecretString> {
         let _serial = KEYRING_SERIAL.lock().expect("keyring serial lock");
-        #[cfg(all(target_os = "macos", not(test)))]
+        #[cfg(all(target_os = "macos", not(any(test, feature = "test-keyring-core"))))]
         {
             macos::get(id).context("keyring 조회 실패")
         }
-        #[cfg(any(not(target_os = "macos"), test))]
+        #[cfg(any(not(target_os = "macos"), test, feature = "test-keyring-core"))]
         {
             let password = self
                 .entry(id)?
@@ -208,11 +209,11 @@ impl SecretStore for KeyringSecretStore {
 
     fn delete_secret(&self, id: &str) -> anyhow::Result<()> {
         let _serial = KEYRING_SERIAL.lock().expect("keyring serial lock");
-        #[cfg(all(target_os = "macos", not(test)))]
+        #[cfg(all(target_os = "macos", not(any(test, feature = "test-keyring-core"))))]
         {
             macos::delete(id).context("keyring 삭제 실패")
         }
-        #[cfg(any(not(target_os = "macos"), test))]
+        #[cfg(any(not(target_os = "macos"), test, feature = "test-keyring-core"))]
         {
             match self.entry(id)?.delete_credential() {
                 Ok(()) => Ok(()),
@@ -225,11 +226,11 @@ impl SecretStore for KeyringSecretStore {
 
     fn has_secret(&self, id: &str) -> anyhow::Result<bool> {
         let _serial = KEYRING_SERIAL.lock().expect("keyring serial lock");
-        #[cfg(all(target_os = "macos", not(test)))]
+        #[cfg(all(target_os = "macos", not(any(test, feature = "test-keyring-core"))))]
         {
             macos::has(id).context("keyring 존재 확인 실패")
         }
-        #[cfg(any(not(target_os = "macos"), test))]
+        #[cfg(any(not(target_os = "macos"), test, feature = "test-keyring-core"))]
         {
             match self.entry(id)?.get_password() {
                 Ok(_) => Ok(true),
@@ -246,11 +247,11 @@ impl SecretStore for KeyringSecretStore {
 
     fn list_secret_ids_bounded(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
         let _serial = KEYRING_SERIAL.lock().expect("keyring serial lock");
-        #[cfg(all(target_os = "macos", not(test)))]
+        #[cfg(all(target_os = "macos", not(any(test, feature = "test-keyring-core"))))]
         {
             macos::list(prefix).context("keyring inventory 조회 실패")
         }
-        #[cfg(any(not(target_os = "macos"), test))]
+        #[cfg(any(not(target_os = "macos"), test, feature = "test-keyring-core"))]
         {
             let spec = std::collections::HashMap::from([("service", KEYRING_SERVICE)]);
             // `Entry::search` returns a platform-owned Vec, so its source allocation cannot be bounded

@@ -27,7 +27,7 @@
 - [x] `OpenWorkspaceSession`과 `ReorderWorkspaces` action을 모두 유지하고 match arm을 완전하게 만든다.
 - [x] 현재 세션 선택면과 활성 워크스페이스 그룹의 밝기 계층을 모두 보존한다.
 - [x] i18n 다섯 로케일을 합치고 제거 대상 Fleet 키만 제거됐는지 확인한다.
-- [ ] focused file-tree, Markdown drop, Fleet, launcher, font 테스트를 실행한다.
+- [x] focused file-tree와 전체 workspace에서 Markdown drop, Fleet, launcher, font 테스트를 실행한다.
 
 ### Task 3: Relay·Keychain·Grok·패키징 통합
 
@@ -35,7 +35,7 @@
 
 - [x] #161 → #168 → #169 순으로 merge하고 #168 뒤의 독립 runner #175를 merge한다.
 - [x] #166을 merge하면서 `recovery_generation` migration을 Relay v38/v39 뒤의 v40으로 재번호한다.
-- [ ] #172 → #174 → #176 순으로 merge한다.
+- [x] #172, #174, #176을 모두 merge한다.
 - [x] migration 37→40 및 Relay/Keychain/Grok storage 결합 회귀 테스트를 먼저 추가하거나 기존 테스트를 조정해 실패를 확인한 뒤 수정한다.
 - [x] 실제 DNS·TLS·배포 자격증명 부재는 BLOCKED로 유지한다.
 
@@ -43,9 +43,9 @@
 
 **Files:** 통합으로 변경된 전체 코드, `docs/CODEX_HANDOFF.md`
 
-- [ ] `cargo fmt --all -- --check`, `git diff --check`, `cargo xtask check-boundary`, `cargo xtask check-deps`를 실행한다.
-- [ ] app/storage/runtime/terminal/relay/web-remote focused 테스트와 workspace 전체 테스트를 jobs=2·serial로 실행한다.
-- [ ] workspace all-target strict Clippy를 실행한다.
+- [x] `cargo fmt --all -- --check`, `git diff --check`, `cargo xtask check-boundary`, `cargo xtask check-deps`를 실행한다.
+- [x] app/storage/runtime/terminal/relay/web-remote focused 테스트와 workspace 전체 테스트를 jobs=2·serial로 실행한다.
+- [x] workspace all-target strict Clippy를 실행한다.
 - [ ] `codex review --uncommitted` 또는 최종 통합 commit 리뷰를 실행하고 Critical/High/Medium을 반영한다.
 - [ ] `docs/CODEX_HANDOFF.md`와 Obsidian 작업 일지를 실제 결과로 갱신한다.
 

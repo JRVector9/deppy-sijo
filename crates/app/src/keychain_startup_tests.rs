@@ -100,6 +100,7 @@ mod tests {
         config.ui.agent_status_hooks = false;
         config.web.enabled = false;
         config.relay.enabled = false;
+        let run_lock = Arc::new(persist::LockFile::acquire(&dir.join("deppy.lock")).unwrap());
         let mut app = App::new(
             config,
             dir.join("config.toml"),
@@ -109,6 +110,7 @@ mod tests {
             path.clone(),
             egui::Context::default(),
             None,
+            run_lock,
         );
         let startup_calls = spy.calls();
         assert!(app.agent_sessions_secrets_snapshot.is_available());
@@ -162,6 +164,15 @@ mod tests {
                         ts_detect: ui::settings::TsDetectView::Idle,
                         serve: ui::settings::ServeView::Idle,
                     };
+                    let relay = ui::settings::RelayView {
+                        running: false,
+                        connection: ui::settings::RelayConnectionView::Disabled,
+                        error: None,
+                        pairing: ui::settings::RelayPairingView::Idle,
+                        devices: &[],
+                        now: 0,
+                    };
+                    let mut relay_qr = None;
                     app.settings_open = true;
                     ui::settings::show(
                         &context,
@@ -173,9 +184,12 @@ mod tests {
                         &web,
                         &mut app.web_reveal_url,
                         &mut app.web_qr,
+                        &relay,
+                        &mut relay_qr,
                         0,
                         &mut app.settings_search,
                         &app.i18n,
+                        crate::scrollback_policy::View::default(),
                         |_, _| {},
                     );
                 })

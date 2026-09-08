@@ -61,6 +61,8 @@ secret = { path = "../secret" }
 storage = { path = "../storage" }
 terminal = { path = "../terminal" }
 web-remote = { path = "../web-remote" }
+# Relay 라우트 핸들 타입 — Mac 클라이언트의 세션 게이트가 데이터 평면과 같은 id를 쓴다.
+relay-protocol = { path = "../relay-protocol" }
 
 # 파일 트리 사이드바 (docs/file-tree-design.md)
 trash = { workspace = true }

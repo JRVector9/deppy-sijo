@@ -2357,3 +2357,9 @@
 - 두 Rust 파일의 실제 diff를 대상으로 한 제한 Codex CLI 리뷰가 exit0으로 완료됐고 확신도 80% 이상 P1/P2 확정 finding 없음으로 결론냈다. shell/split 제한, startup/restore 차단 보존, agent approval/lease 유지, switch 실패 및 workspace별 launcher 판정을 확인했다. 최종 로그: `/private/tmp/deppy-dotenv-shell-spawn-review-focused-final.txt`. 기본 리뷰의 300초 timeout은 이 완료 리뷰와 구분한다.
 - 최종 실행 결과: focused 6 PASS, app 전체 2041 PASS/14 ignored, app all-targets strict Clippy PASS, boundary PASS, fmt/diff PASS. 리뷰 이후 Rust 변경은 없으며 앱 GUI build/launch 및 latency 실측은 하지 않았다.
 - 남은 작업: 한국어 커밋, `git push -u origin perf/dotenv-shell-spawn-main`, main Ready PR 생성, 원격 HEAD/checks/clean 확인과 일지 최종 갱신.
+
+### 런처 main PR 게시
+- Ready PR #170: https://github.com/JRVector9/deppy-sijo/pull/170 , base main, branch `perf/dotenv-shell-spawn-main`. 검증된 소스 커밋 `ada32ba5cd68e37b802731334eb1dc2c29a9fa42`를 일반 push했고 GitHub HEAD 일치를 확인했다. 이후 이 게시 기록은 문서만 변경한다.
+- 최초 게시 시 Actions 5개는 QUEUED였다. 실행 전 상태를 PASS 또는 billing BLOCKED로 추정하지 않는다. 최종 문서 커밋 push 뒤 정확 HEAD의 check-runs/annotations를 조회하고 실제 결과를 PR 본문 및 Obsidian 일지에 기록한다.
+- 구현/관련 테스트/제한 코드 리뷰는 완료했으며 남은 코드 작업은 없다. 앱 build/launch, main merge, 기존 #146 종료는 수행하지 않았다.
+- 다음 확인 명령: `git status --short`; `git rev-parse HEAD origin/perf/dotenv-shell-spawn-main`; `gh pr view 170 --json headRefOid,statusCheckRollup,isDraft,baseRefName`; `gh api repos/JRVector9/deppy-sijo/commits/HEAD_SHA/check-runs`.

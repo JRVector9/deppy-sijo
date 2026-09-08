@@ -45,5 +45,5 @@ assert!(should_bootstrap_created_workspace_shell(true, true, false));
 
 - [x] app 전체 테스트, app all-targets strict Clippy, boundary, fmt, diff check를 실행한다.
 - [x] source diff의 bounded Codex CLI 리뷰를 실제 실행한다. 확정 finding은 RED→GREEN으로 수정하고 좁은 재리뷰한다. 300초 제한에 결론이 없으면 정확 PID만 종료하고 미완료 리뷰 사실을 기록한다.
-- [ ] handoff와 Obsidian `프로젝트 일지/deppy-sijo/`에 실제 결과를 기록하고 한국어 commit·일반 push한다.
-- [ ] `gh pr create --base main --head perf/dotenv-shell-spawn-main --body-file /private/tmp/deppy-dotenv-shell-spawn-pr.md`로 Ready PR을 생성한다. 원격 HEAD, checks, worktree clean을 확인한다. Actions billing 차단은 BLOCKED로 기록한다.
+- [x] handoff와 Obsidian `프로젝트 일지/deppy-sijo/`에 실제 결과를 기록하고 한국어 commit·일반 push한다.
+- [x] `gh pr create --base main --head perf/dotenv-shell-spawn-main --body-file /private/tmp/deppy-dotenv-shell-spawn-pr.md`로 Ready PR을 생성한다. 원격 HEAD, checks, worktree clean을 확인한다. Actions billing 차단은 BLOCKED로 기록한다.

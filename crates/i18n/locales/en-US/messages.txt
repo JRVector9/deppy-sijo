@@ -392,6 +392,7 @@ document.limit.view_only = Read-only — {bytes} bytes (over 1 MiB)
 document.limit.refused = This document is larger than 8 MiB ({bytes} bytes) and can't be opened here. Try opening it with the OS default app.
 document.limit.binary = This file can't be read as text ({bytes} bytes). Try opening it with the OS default app.
 document.error.load_failed = Couldn't load the document ({code}).
+document.error.render_failed = This document couldn't be rendered safely. Open it with the default app or close the tab.
 document.error.save_failed = Couldn't save ({code}).
 document.confirm_discard.title = You have unsaved changes
 document.confirm_discard.body = "{name}" has unsaved changes.

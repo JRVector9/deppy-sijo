@@ -392,6 +392,7 @@ document.limit.view_only = 읽기 전용 — {bytes} 바이트(1 MiB 초과)
 document.limit.refused = 이 문서는 8 MiB보다 커서 열 수 없습니다({bytes} 바이트). OS 기본 앱으로 열어보세요.
 document.limit.binary = 텍스트로 읽을 수 없는 파일입니다({bytes} 바이트). OS 기본 앱으로 열어보세요.
 document.error.load_failed = 문서를 불러오지 못했습니다({code}).
+document.error.render_failed = 이 문서를 안전하게 표시하지 못했습니다. 기본 앱으로 열거나 탭을 닫아 주세요.
 document.error.save_failed = 저장하지 못했습니다({code}).
 document.confirm_discard.title = 저장하지 않은 변경 사항이 있습니다
 document.confirm_discard.body = "{name}"에 저장하지 않은 변경 사항이 있습니다.

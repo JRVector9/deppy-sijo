@@ -2445,3 +2445,13 @@
 
 - PR https://github.com/JRVector9/deppy-sijo/pull/163, base feat/relay-shell-main, 제품 HEAD54528735760afa4c3bf6ad4fe1606ef641c6298a. GitGuardian SUCCESS. Actions6개는 run34214191542/34214191585의 runner_id0·steps[] FAILURE로 실제 미실행이며 PASS가 아니다. 제품게이트2774 PASS·21ignored와 구분한다.
 - 이 checkpoint는 문서만 추가한다. Obsidian Relay 앱 어댑터 stacked 이관 일지 작성 완료. 다음 작업 R4는 git fetch origin으로 확인한 최신main45e66cc 기준 별도 fix/keychain-startup-lazy worktree에서 계획부터 시작한다. R1→R2→R3 merge는 부모 lane에 남기며 이 lane은 merge하지 않았다.
+
+## 2026-09-08 공개 fixture clean stack 대체 완료
+- 최종 의존 그래프는 #161 → #168 → #169다. shell Ready PR https://github.com/JRVector9/deppy-sijo/pull/168 , head850b7a8747bd71d74d7858a5d95f6c257a076857. adapter Ready PR https://github.com/JRVector9/deppy-sijo/pull/169 , source headd7f7f96518a49fb232e7af4f20e06e5c672b2638; 이 checkpoint는 문서만 추가한다.
+- clean adapter는 shell 위에 adapter-only8dae223/5452873/fbb807f를 cherry-pick했다(새24c04f6/5071c98/d7f7f96). handoff append 충돌만 양쪽 보존해 해결했다. 기존 #163 merge 보존 eee3ed1과 handoff 외 모든 파일의 tree diff가 비어 있으며 새 PR diff는 기존 adapter18파일 범위 그대로다.
+- 양 clean branch에서 ce930906은 ancestor가 아니다(exit1), 그 커밋과 merge-base는 #161의6ee7eb4다. 기존 branch history는 수정하지 않았다. old162/163은 새 PR 두 GitGuardian SUCCESS를 확인한 뒤 대체 링크를 body/comment에 남기고 CLOSED로 전환했다. 브랜치 삭제·force-push·rebase 없음.
+- 최신 source GitGuardian: #168 head850b7a8 SUCCESS, #169 sourced7f7f96 SUCCESS. 기존 #162의 마지막65d807e는 과거 incident37016215 때문에 FAILURE였고 #163의 과거 GitGuardian은 SUCCESS였다. 이 차이를 Actions 미실행과 섞지 않는다.
+- 실제 fixture 수정 gate: old updated shell/adapter 동일 tree에서 각각 web337 PASS/4 ignored, Chrome pairing1 PASS, Node16 PASS, web strict Clippy/fmt/diff PASS. 새 clean shell golden1 PASS, clean adapter golden1/Node16/strict relevant Clippy/fmt/diff PASS. 최종 source 동일성으로 기존 전체검증을 재사용했으며 앱 build/launch는 실행하지 않았다. fixture 좁은 CLI 리뷰는 잔여 확정 P1/P2 없음(exit0).
+- Actions: #168 runs34227198318/34227198282, #169 runs34227495241/34227495385의 모든 job annotation을 읽어 billing/spending 때문에 job 미시작 BLOCKED를 확인했다. DNS/TLS/자격증명/외부 배포/실기기/24h soak도 BLOCKED다.
+- 일지: `~/Library/CloudStorage/SynologyDrive-sync_data/Obsidian-Vault/프로젝트 일지/deppy-sijo/2026-09-08 Relay 공개 fixture와 clean stack 이관.md`.
+- 다음 명령: `gh pr view 168 --json headRefOid,baseRefName,isDraft,statusCheckRollup`; `gh pr view 169 --json headRefOid,baseRefName,isDraft,statusCheckRollup`; `git merge-base --is-ancestor origin/feat/relay-shell-main-clean origin/feat/relay-app-adapter-main-clean`; 부모가 #161→#168→#169 순서로 통합 검토한다. 이 lane에서는 merge/deploy하지 않는다.

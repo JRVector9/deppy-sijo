@@ -2391,3 +2391,14 @@
 - 일지: Obsidian 프로젝트 일지/deppy-sijo/2026-09-08 Relay 비UI 재접속 코어 main 이관.md 및 2026-09-08 Relay 브라우저 셸 stacked 이관.md.
 - 남은 일: 부모의 R1→R2 착지 단계에서 hosted checks와 공개 fixture 판정을 별도로 해결하고 exact head를 검증한다. R1 squash 착지 후 R2에서 git fetch origin; git merge origin/main; gh pr edit 162 --base main 순서로 일반 merge/retarget하고 적정 게이트를 재검증한다. 기존146/149 수정·닫기, rebase/force-push, merge/배포는 이 lane에서 하지 않았다.
 - 후속 app adapter: AppRelayRepository reconnect methods와 native pairing/lifecycle/UI 연결, Conflict/pending/재승인 정책을 별도 PR로 검증한다. DNS/TLS/자격증명/외부 배포/실기기/24h soak는 BLOCKED다.
+
+## 2026-09-08 PR162 공개 fixture 탐지 수정 및 PR163 동기화
+- 목표: GitGuardian check102012638591이 commit ce930906의 relay-hello-v1.json:35를 지목한 유일 탐지를 해결하고 #163에 일반 merge한다. 실제 credential 회전이나 탐지 억제 설정은 하지 않는다.
+- 근거: 기존 secret_hex는 공개 bytes(0..31)와 같으며 Python 표준 hmac/sha256으로 proof와49바이트 record를 독립 재계산해 일치를 확인했다. Rust cfg(test)와 headless Chrome fixture가 소비하고 relay-shell build.sh 배포 파일 목록에는 포함되지 않는다. 운영 key/외부 서비스 credential이 아니다.
+- 변경 계획: 같은32바이트 hex 형식의 명백한 영벡터를 사용하고 HMAC proof·record·1바이트 짧은 거절 벡터만 함께 재계산한다. Rust golden에서 영벡터 계약 RED→GREEN, 실제 Chrome/Node 관련 검사, strict web-remote Clippy/fmt/diff와 좁은 CLI 리뷰 후 commit/push한다.
+- 첫 shared target 실행은 현재 protocol 소스에 존재하는 Reconnect enum을 이전 artifact에서 찾지 못해 E0599 컴파일 실패했다. 제품 RED가 아니며 기존 lane 전용 target `/private/tmp/deppy-relay-core-main-20260908/target`으로 재실행한다. 소스/의존성 우회 수정은 하지 않았다.
+- 다음: #162 게시 후 #163 worktree에서 새 HEAD 일반 merge, 충돌·관련 gate 확인, commit/push 및 두 PR의 GitGuardian과 Actions billing 차단을 별도로 보고한다. 앱 build/launch/deploy 금지, DNS/TLS/배포는 BLOCKED 유지.
+
+- 영벡터 assertion의 실제 RED(exit101, 기존0..31과0×32 불일치)를 확인했다(`/private/tmp/deppy-relay-fixture-red.log`). fixture secret32바이트/record49바이트/reject48바이트 형식은 유지하며 독립 Python HMAC-SHA256으로 종속값을 재계산했다. 제품 crypto/credential 발급 코드는 변경하지 않았다.
+- #162 최종 web-remote 전체337 PASS/4 ignored(`/private/tmp/deppy-relay-fixture-web-tests.log`), Node16 PASS(`...fixture-node-tests.log`), 실제 headless Chrome pairing1 PASS(`...fixture-chrome.log`). web-remote strict all-targets Clippy, fmt/diff PASS(`...fixture-clippy.log`). 전용 target과 CARGO_BUILD_JOBS=2를 사용했다.
+- 좁은 Codex 리뷰 exit0: 남은 확정 P1/P2/계약 누락 없음(`/private/tmp/deppy-relay-fixture-codex-review.log`). 다음은 한국어 commit/일반 push 후 GitGuardian 최신 head 결과 확인 및 #163 일반 merge다. 과거 commit에 대한 서버 측 incident가 남으면 이를 최신 소스 탐지와 구분한다.

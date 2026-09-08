@@ -1692,6 +1692,8 @@ mod tests {
         message.extend_from_slice(&device_fingerprint);
         assert_eq!(message, hex(&proof_fixture["message_hex"]));
         let mut secret_bytes: [u8; 32] = fixed(&hex(&proof_fixture["secret_hex"]));
+        // 공개 fixture는 32바이트 영벡터를 사용한다. 운영 credential이 아니다.
+        assert_eq!(secret_bytes, [0; 32]);
         let secret = PairingSecret::take_from_bytes(&mut secret_bytes);
         let binding = PairingBinding::new(connection, device_fingerprint, transcript_hash);
         assert_eq!(binding, desktop_auth.pairing_binding());

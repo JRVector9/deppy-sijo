@@ -678,6 +678,10 @@ impl<T> Term<T> {
 
         debug!("New num_cols is {num_cols} and num_lines is {num_lines}");
 
+        // 어느 grid도 변경하기 전에 두 grid의 좌표/크기 범위를 모두 검증한다.
+        self.grid.preflight_resize(num_lines, num_cols);
+        self.inactive_grid.preflight_resize(num_lines, num_cols);
+
         // Move vi mode cursor with the content.
         let history_size = self.history_size();
         let mut delta = num_lines as i32 - old_lines as i32;
@@ -685,15 +689,10 @@ impl<T> Term<T> {
         delta = cmp::min(cmp::max(delta, min_delta), history_size as i32);
         self.vi_mode_cursor.point.line += delta;
 
-        // deppy-sijo(D): resize/reflow는 히스토리 전체를 원시 인덱싱으로 훑으므로 압축
-        // 상태에선 깨진다. 양쪽 그리드를 먼저 stock으로 되돌린다(비압축이면 무비용).
-        // primary가 alt 화면 동안 inactive로 밀려 있어도 압축돼 있을 수 있으므로 둘 다.
-        self.grid.inflate_all();
-        self.inactive_grid.inflate_all();
-
+        // 압축 이력을 한 행씩 처리한다. primary만 reflow하고 alt는 기존 격자를 보존한다.
         let is_alt = self.mode.contains(TermMode::ALT_SCREEN);
-        self.grid.resize(!is_alt, num_lines, num_cols);
-        self.inactive_grid.resize(is_alt, num_lines, num_cols);
+        self.grid.resize_streaming(!is_alt, num_lines, num_cols);
+        self.inactive_grid.resize_streaming(is_alt, num_lines, num_cols);
 
         // Invalidate selection and tabs only when necessary.
         if old_cols != num_cols {
@@ -2909,6 +2908,56 @@ mod tests {
 
         term.linefeed();
         assert_eq!(term.vi_mode_cursor.point.line, Line(-12));
+    }
+
+    #[test]
+    fn streaming_resize_preflight_rejects_before_term_mutation() {
+        for invalid_inactive in [false, true] {
+            let size = TermSize::new(80, 24);
+            let mut term = Term::new(Config::default(), &size, VoidListener);
+            for _ in 0..40 {
+                term.newline();
+            }
+            if invalid_inactive {
+                term.inactive_grid.update_history(usize::MAX);
+            }
+            let before_vi = term.vi_mode_cursor.point;
+            let before_cursor = term.grid.cursor.clone();
+            let before_inactive_cursor = term.inactive_grid.cursor.clone();
+            let target = if invalid_inactive {
+                TermSize::new(81, 24)
+            } else {
+                TermSize::new(65536, 12)
+            };
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                term.resize(target);
+            }));
+            assert!(result.is_err());
+            assert_eq!(term.vi_mode_cursor.point, before_vi, "검증 전에 vi 커서 변경");
+            assert_eq!(term.grid.cursor, before_cursor, "검증 전에 primary 커서 변경");
+            assert_eq!(term.inactive_grid.cursor, before_inactive_cursor);
+            assert_eq!(term.grid.columns(), 80, "다른 grid 검증 전에 primary 변경");
+            assert_eq!(term.grid.screen_lines(), 24);
+            assert_eq!(term.inactive_grid.columns(), 80);
+            assert_eq!(term.inactive_grid.screen_lines(), 24);
+        }
+    }
+
+    #[test]
+    fn streaming_resize_keeps_cold_history_compressed() {
+        let size = TermSize::new(80, 24);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        for _ in 0..2024 {
+            term.input('가');
+            term.newline();
+        }
+        term.grid_mut().compress_history(0);
+        assert!(term.grid().compressed_row_count() > 1000);
+        term.resize(TermSize::new(120, 30));
+        assert!(
+            term.grid().compressed_row_count() > 1000,
+            "리사이즈 뒤 cold history를 원시 셀 전체로 남기면 안 된다"
+        );
     }
 
     #[test]

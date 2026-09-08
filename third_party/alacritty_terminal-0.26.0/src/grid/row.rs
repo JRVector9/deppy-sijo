@@ -55,6 +55,11 @@ impl<T: Default> Row<T> {
         Row { inner, occ: 0 }
     }
 
+    /// 리플로 작업 버퍼 계측용 실제 셀 할당 용량.
+    pub(crate) fn capacity(&self) -> usize {
+        self.inner.capacity()
+    }
+
     /// Increase the number of columns in the row.
     #[inline]
     pub fn grow(&mut self, columns: usize) {

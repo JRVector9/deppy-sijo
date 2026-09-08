@@ -15,10 +15,12 @@ mod compressed;
 pub mod resize;
 mod row;
 mod storage;
+mod streaming_resize;
 #[cfg(test)]
 mod tests;
 
 pub use self::row::Row;
+pub use self::streaming_resize::ReflowMetrics;
 use self::storage::Storage;
 
 pub trait GridCell: Sized {
@@ -495,9 +497,8 @@ impl Grid<crate::term::cell::Cell> {
         self.raw.compressed_row_count()
     }
 
-    /// 모든 압축 스크롤백을 복원해 stock 상태로 되돌린다. resize처럼 히스토리 전체를
-    /// 원시 인덱싱으로 훑는 연산 직전에 호출해야 한다(그렇지 않으면 압축 placeholder를
-    /// 읽어 깨진다).
+    /// 모든 압축 스크롤백을 복원한다. generic resize를 비교 기준으로 쓰거나 원시
+    /// 인덱싱이 필요한 명시적 호출자용이다. 실제 Term resize는 streaming을 사용한다.
     pub fn inflate_all(&mut self) {
         let columns = self.columns;
         self.raw.inflate_all(columns);

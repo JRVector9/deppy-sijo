@@ -610,7 +610,14 @@ impl TerminalBackend for AlacrittyBackend {
     /// wrapped 행은 개행 없이 이어붙여 복원 시 reflow가 자연스럽다.
     fn serialize_scrollback(&self) -> Option<Vec<u8>> {
         // 복원/압축 archive의32MiB상한을직렬화할때부터지킨다.
-        serialize_scrollback_bounded(self, 32 * 1024 * 1024)
+        serialize_scrollback_bounded(self, 32 * 1024 * 1024).ok()
+    }
+
+    fn serialize_scrollback_bounded(
+        &self,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, crate::ScrollbackSerializeError> {
+        serialize_scrollback_bounded(self, max_bytes)
     }
 
     /// scrollback+화면 전체에서 query를 부분 문자열로(대소문자 무시) 찾는다 (T3).
@@ -898,10 +905,14 @@ struct BoundedAnsiDump {
 }
 
 impl BoundedAnsiDump {
-    fn append(&mut self, bytes: &[u8]) -> Option<()> {
-        let next = self.bytes.len().checked_add(bytes.len())?;
+    fn append(&mut self, bytes: &[u8]) -> Result<(), crate::ScrollbackSerializeError> {
+        let next = self
+            .bytes
+            .len()
+            .checked_add(bytes.len())
+            .ok_or(crate::ScrollbackSerializeError::LimitExceeded)?;
         if next > self.limit {
-            return None;
+            return Err(crate::ScrollbackSerializeError::LimitExceeded);
         }
         if next > self.bytes.capacity() {
             // 기하급수 확장으로 복사 비용은 선형으로 유지하되 상한은 넘지 않는다.
@@ -914,14 +925,17 @@ impl BoundedAnsiDump {
                 .max(next);
             self.bytes
                 .try_reserve_exact(capacity - self.bytes.len())
-                .ok()?;
+                .map_err(|_| crate::ScrollbackSerializeError::Unavailable)?;
         }
         self.bytes.extend_from_slice(bytes);
-        Some(())
+        Ok(())
     }
 }
 
-fn serialize_scrollback_bounded(backend: &AlacrittyBackend, max_bytes: usize) -> Option<Vec<u8>> {
+fn serialize_scrollback_bounded(
+    backend: &AlacrittyBackend,
+    max_bytes: usize,
+) -> Result<Vec<u8>, crate::ScrollbackSerializeError> {
     let grid = backend.term.grid();
     let cols = backend.term.columns();
     let rows = backend.term.screen_lines();
@@ -1000,7 +1014,7 @@ fn serialize_scrollback_bounded(backend: &AlacrittyBackend, max_bytes: usize) ->
         }
     }
     out.append(b"\x1b[0m")?;
-    Some(out.bytes)
+    Ok(out.bytes)
 }
 
 #[cfg(test)]
@@ -1182,8 +1196,14 @@ mod tests {
             serialize_scrollback_bounded(&backend, expected.len()).unwrap(),
             expected
         );
-        assert!(serialize_scrollback_bounded(&backend, expected.len() - 1).is_none());
-        assert!(serialize_scrollback_bounded(&backend, 0).is_none());
+        assert_eq!(
+            serialize_scrollback_bounded(&backend, expected.len() - 1),
+            Err(crate::ScrollbackSerializeError::LimitExceeded)
+        );
+        assert_eq!(
+            serialize_scrollback_bounded(&backend, 0),
+            Err(crate::ScrollbackSerializeError::LimitExceeded)
+        );
     }
 
     #[test]

@@ -2547,3 +2547,35 @@
 - PR #165 자체 실행을 확인했다. Actions `34215008968`(Dependency security)과 `34215008991`(Build and test)의 모든 job annotation은 계정 결제 실패 또는 spending limit 때문에 job이 시작되지 않았다고 명시한다. 원격 CI는 BLOCKED이며 코드 검사 PASS가 아니다. GitGuardian은 최초 조회 당시 진행 중이었다.
 - 남은 작업: root의 stacked PR 검토/통합, 계정 billing/spending 복구 뒤 CI 재실행, 별도 E 후속 PR. 앱 실화면/IME와 Ghostty·네이티브 TLS·Linux/Windows 검증은 대기 상태다.
 - 다음 에이전트 명령: `cd /private/tmp/deppy-scrollback-live-20260908`; `git status --short`; `git rev-parse HEAD`; `gh pr view 165 --json url,headRefOid,baseRefName,statusCheckRollup`; `gh run view 34215008968`; `gh run view 34215008991`. 최종 문서 커밋도 일반 push해 원격 HEAD를 맞춘다.
+
+### PR D 최종 독립 리뷰 후 안전성 보완 시작
+- 목표: #165 단독 그래프의 대형 resize 전체 inflate 및 32MiB serializer 초과를 미지원으로 오인해 pane을 detach하는 두 결함을 수정한다. root가 이전 PR C 비포함 결정을 교정하여 #160을 필수 의존으로 포함하도록 승인했다.
+- #160 exact head `18a06f1a15df555ddbd22569d2d4cf7042db2b21`을 일반 merge commit `75b8dcf`로 병합했다. 코드/문서 충돌 없음. rebase/force-push 없음. bounded streaming reflow가 이제 #165 그래프에 포함된다.
+- 원인: Alacritty bounded serializer의 초과와 미지원이 같은 None이며 archive_over_cap은 None이면 Session 제거와 pane detach를 실행한다. 초과/미지원/리소스 실패를 구분하고 최신 tail 아카이브 성공 이후에만 지원 backend를 제거하도록 보완한다.
+- 100k 컬러 이력 fixture로 실제 archive_over_cap RED 작성 중. 첫 10열 fixture는 ANSI가 32MiB보다 작아 fixture assertion에서 실패했으므로 결함 RED로 계산하지 않는다. 20열로 조정해 실제 초과 경로를 검증한다.
+- 계획: typed bounded serializer → Session의 유계 history 축소 후 재시도 → memory/disk 공통 아카이브 경로 → focused/gate → 두 수정만 좁은 Codex 리뷰 → handoff/일지/PR 본문 갱신 및 일반 push. 앱 build/relaunch 금지.
+
+### PR D 아카이브 초과 RED/GREEN
+- 실제 100k×20열 컬러 이력의 serializer 초과 후 archive_over_cap이 archive 없이 제거되는 RED를 확인했다(`/private/tmp/deppy-live-archive-tail-red.log`). `ScrollbackSerializeError::{Unsupported,LimitExceeded,Unavailable}`로 분리하고 Session이 초과 때 history를 절반씩 줄여 최대 18회 안에 tail을 직렬화하도록 수정했다. 같은 회귀 GREEN(3.65초, `/private/tmp/deppy-live-archive-tail-green.log`).
+- 메모리 아카이브의 기존 압축 예산 16MiB를 새 entry 혼자 넘으면 즉시 LRU 축출되는 연관 경계도 작은 예산의 실제 RED로 확인했다(`/private/tmp/deppy-live-archive-compressed-red.log`). 압축 후에도 history 절반 축소를 적용해 새 entry가 그 예산 안에 들도록 보완했다. 실제 history 감소를 검사하므로 중첩 시도도 유계다.
+- 화면 자체가 상한을 넘거나 리소스 실패면 지원 Session을 제거/detach하지 않는다. 변하지 않는 exited 실패는 SessionId 집합으로 한 번만 기억해 매 pump 반복 직렬화를 막고 Session 제거 시 정리한다. Ghostty 등 Unsupported만 기존 detach 동작을 유지한다. disk serializer도 같은 bounded Session 경로를 사용하고 audit ANSI는 수정하지 않는다.
+- Session 2개(최신 화면 보존/화면만 초과시 보존), runtime 2개(100k tail/압축 예산) focused PASS(`/private/tmp/deppy-live-archive-focused-green.log`). 실제 100k fixture의 disk write→read/finish와 audit 미변경 검증을 추가해 terminal/session/runtime 전체 검사 중이다(`/private/tmp/deppy-live-archive-core-full.log`). 좁은 읽기 전용 Codex 리뷰도 300초 상한으로 실행 중(`/private/tmp/deppy-live-archive-codex-review.log`).
+
+### PR D 두 보완의 최종 실행 증거
+- `CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-deps-target-20260907 cargo test -p terminal -p session -p runtime --locked -- --test-threads=2` → runtime 289, Session 60, terminal 91 PASS/4 ignored, doc 0 (`/private/tmp/deppy-live-archive-core-full.log`). 실제 disk write→read/finish·32MiB 이내·최신 marker·audit 미변경도 통과했다.
+- vendor manifest의 `cargo test ... --locked streaming_resize -- --test-threads=2` → streaming 4 + bounded-memory 1 PASS, 수동 benchmark 1 ignored (`/private/tmp/deppy-live-reflow-merged-focused.log`). 이어 `--test streaming_memory streaming_resize_memory_benchmark -- --ignored --nocapture`를 실제 실행해 1 PASS (`/private/tmp/deppy-live-reflow-100k-memory.log`).
+- 100k history의 debug 측정: 80→120 추가 heap peak 5,608,024B/466ms, 200→100 6,811,032B/1101ms, 500→80 7,651,808B/2880ms, 200→2 7,991,800B/5749ms. scratch는 각각 280/400/1440/594 cells로 10k와 동일했다. 이 수치는 테스트 allocator가 측정한 추가 heap이며 전체 process RSS·OS allocator 내부 순간 피크 보장이 아니다.
+- 최종 core strict all-targets Clippy PASS(3.31초, `/private/tmp/deppy-live-archive-clippy.log`), workspace fmt/diff check PASS. `git merge-base --is-ancestor 18a06f1 HEAD` PASS. 앱 build/relaunch는 실행하지 않았다.
+
+### PR D 좁은 CLI 추가 P1 — 자동 exit 보존 경로
+- 최초 좁은 CLI는 300초 안에 결론이 없어 exact PID 85848을 종료했다. 같은 세션 `01a08097-d871-7f32-b9a2-7fad9463c63e`에 추가 도구 금지로 결론만 요청해 exit 0으로 P1 하나를 받았다(`/private/tmp/deppy-live-archive-codex-conclusion.log`): disk archive 실패 뒤 자동 close_pane이 지원 Session을 제거한다. streaming merge는 코드상 확인됐다.
+- work-history resume는 `agent_resume::resume_plan`이 provider/native binding을 CLI 인자로 바꾸는 별도 기능이며 모든 provider/바인딩에서 terminal tail 복원을 보장하지 않는다. 독립 recovery ANSI의 존재만으로 전체 무손실이라고 주장하지 않는다.
+- root 승인으로 자동 exit 경계만 보완했다. disk marker가 없으면 유계 memory tail을 먼저 확보하고 정상 pane close를 유지한다. 둘 다 실패할 때만 backend/pane을 유지하며 명시적 ClosePane은 기존대로 폐기한다. memory LRU는 16MiB와 RUNTIME_SESSION_CAP 개수 둘 다 제한한다.
+- 실제 자동 exit helper의 archive 누락 RED(`/private/tmp/deppy-live-autoexit-red.log`) 후 archive 생성→close_pane→remove_session에서도 새 archive가 남고 pane은 닫히는 GREEN을 확인했다. 보존 실패 시 pane 유지/실패 재시도 억제/명시적 close 정리와 개수·바이트 LRU도 확인했다. archive focused 5 PASS(`/private/tmp/deppy-live-autoexit-green.log`).
+- 최종 전체 관련 gate 재실행 중(`/private/tmp/deppy-live-autoexit-core-full.log`). 같은 CLI 세션에 실제 최신 close_exited_pane/make_archive_entry/remove_session/trim 코드를 직접 제공하고 도구 없이 두 번째 좁은 재리뷰를 120초 상한으로 요청했다(`/private/tmp/deppy-live-autoexit-codex-review.log`).
+
+### PR D 자동 exit 포함 최종 검증 완료
+- 같은 CLI 세션의 제한 재리뷰가 exit 0으로 “남은 확정 P1/P2 없음”을 반환했다(`/private/tmp/deppy-live-autoexit-codex-review.log`). 자동 exit의 disk/memory 성공 후 제거, 실패 보존, Unsupported 기존 동작, remove_session의 archive 유지와 개수/바이트 LRU를 확인했다.
+- 최종 관련 전체 runtime 292 PASS(32.10초), Session 60 PASS, terminal 91 PASS/4 ignored, doc 0 (`/private/tmp/deppy-live-autoexit-core-full.log`). 최종 core all-targets strict Clippy PASS(`/private/tmp/deppy-live-autoexit-clippy.log`), workspace fmt/diff PASS. 앱 build/relaunch는 하지 않았고 app18/Settings21/i18n8은 앞선 앱 단계의 실행 결과다.
+- 일지: `~/Library/CloudStorage/SynologyDrive-sync_data/Obsidian-Vault/프로젝트 일지/deppy-sijo/2026-09-08 PR165 대형 스크롤백 안전성 보완.md`. 소스 커밋/push 후 SHA를 일지에 반영한다.
+- #165는 root가 Draft로 전환한 상태임을 확인했다. 이제 #160 merge와 아카이브/자동 exit 보완을 일반 commit/push하고 PR 본문·원격 상태 확인 후 ready로 전환한다. 원격 CI billing/spending 차단과 실환경 미검증은 PASS로 바꾸지 않는다.

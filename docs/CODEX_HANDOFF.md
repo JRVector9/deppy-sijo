@@ -2333,3 +2333,13 @@
 - Failed approaches: an initial unbounded `codex review --uncommitted` ran extensive checks but never produced a final review and was stopped by exact PID; it also attempted the invalid `cargo test -p deppy-sijo --lib` command even though the app has no library target. The first RED-test draft used unavailable `Context::run`, then captured `WorkspaceUi` too broadly; both compile-only mistakes were corrected before the intended RED assertion was observed. The first final format check found one line-wrap difference; `cargo fmt --all` corrected it and the rerun passed.
 - Remaining work: push this clean landing branch, create a PR to `main`, wait for required checks, merge only if green, close superseded PRs #147 and #148, and preserve PRs #146 and #149 plus their dependent remote branches for further development.
 - Exact next commands: `git push -u origin land/ime-resize-ready-20260906`; create a `main` PR for commits `4903b39` and `bbead4f`; run `gh pr checks <new-pr> --watch`; merge the new PR after all required checks pass; close #147 and #148 without deleting the `fix/window-resize-flicker` branch because PR #149 still targets it.
+## Ready PR 19개 main 통합 시작 (2026-09-09)
+
+- 현재 목표: #156~#176의 open Ready PR 19개를 의존 순서와 의미 보존 충돌 해결로 통합하고 단일 PR을 `main`에 merge한 뒤 앱을 최종 build/relaunch한다.
+- 작업 트리: `/private/tmp/deppy-ready-prs-integration-20260909`, 브랜치 `integrate/ready-prs-20260909`, 기준 `origin/main` `45e66ccae313e653fc5dc6df46b80f791f231fc4`. 원래 `/Users/jr/Desktop/projects/deppy-sijo`의 `feat/fleet-one-list-and-relay-wip`는 건드리지 않는다.
+- 확인된 충돌: 모든 PR의 `docs/CODEX_HANDOFF.md`; #157/#159 `runtime/src/command.rs`; #159/#167 `ui/workspace.rs`; #156/#173 `app.rs`와 `ui/file_tree.rs`; #161/#169 Relay v38/v39와 #166 Keychain v38 migration 번호. Relay 뒤 Keychain을 v40으로 옮긴다.
+- 통합 순서: #157→#160→#165→#167→#159; #156→#173→#158→#164→#170→#171; #161→#168→#169 및 #175; #166(v40)→#172→#174→#176.
+- 병렬 읽기 전용 감사: 터미널, App/UI, storage/migration 세 갈래가 진행 중이다. 파일 수정 권한은 root 통합 작업만 가진다.
+- 테스트: 이 통합 브랜치에서는 아직 실행하지 않았다. 각 원본 PR의 기존 테스트 결과를 통합 결과의 PASS로 대신하지 않는다.
+- 남은 일: 계획 `docs/superpowers/plans/2026-09-09-ready-prs-main-integration.md`의 Tasks 1~5 전체.
+- 다음 명령: 위 순서로 `git merge --no-ff`를 실행하고 각 충돌을 양쪽 계약을 보존해 해결한다. 새 동작 결함은 회귀 RED 뒤 수정한다.

@@ -6106,23 +6106,41 @@ impl WorkspaceUi {
             font_size: config.font_size / self.ui_scale,
             line_height: config.line_height,
         };
-        // pane 크기 → cols/rows. visible pane 전부 대상 — split 직후 기존 pane의
-        // PTY 크기가 틀어지는 문제 방지 (runtime도 visible 세션을 모두 push한다)
         let cell = renderer_egui::cell_size(ui.ctx(), metrics);
         let avail = ui.available_size();
-        let cols =
-            ((renderer_egui::grid_width_for_available(avail.x) / cell.x) as u16).clamp(10, 500);
-        let rows = renderer_egui::grid_rows_for_available(avail.y, cell.y);
-        // 창 드래그로 avail이 프레임마다 바뀌는 동안 cols/rows도 매 프레임 바뀐다 — 그대로
-        // 보내면 드래그 내내 PTY가 매번 reflow하며 화면이 깜빡인다. 디바운스 래퍼가 목표가
-        // 안정될 때까지 기다렸다가 한 번만 보낸다(최종 크기는 request_repaint_after로 보장).
-        self.stage_terminal_resize_for_pass(
-            ui.ctx().cumulative_pass_nr(),
-            ui.is_sizing_pass(),
-            session,
-            cols,
-            rows,
-        );
+        // 창 폭으로 논리 열 수를 바꾸면 기존 표/줄이 다시 줄바꿈된다. 이미 표시한 폭을
+        // 유지하고 좁은 pane에서는 renderer가 그리드 전체를 같은 비율로 축소한다.
+        // 전송 직후에는 snapshot이 옛 크기일 수 있어 이미 보낸 크기를 우선한다.
+        // MuxUpdated만 먼저 온 복원 세션에는 폭을 추측해 보내지 않는다. 첫 snapshot은
+        // Resize 없이도 runtime이 발행하므로 그 실제 폭을 받은 뒤 크기를 조정한다.
+        let preserved_cols = self
+            .sent_sizes
+            .get(&session)
+            .map(|&(cols, _)| cols)
+            .or_else(|| {
+                self.sessions
+                    .get(&session)
+                    .and_then(|view| view.snapshot.as_ref())
+                    .map(|snapshot| snapshot.cols)
+            });
+        if let Some(cols) = preserved_cols {
+            let scale = renderer_egui::fit_width_scale(avail.x, cell.x, cols);
+            let rows = renderer_egui::grid_rows_for_available(avail.y, cell.y * scale);
+            // 넓게 복원한 열 수를 유지한 채 축소하면 행 수가 늘어난다. 전체 셀 수가
+            // 런타임 입장 상한을 넘지 않도록 같은 상수로 행 목표를 제한한다.
+            let rows = u32::from(rows)
+                .min(runtime::TERMINAL_CELL_COUNT_MAX / u32::from(cols.max(1)))
+                as u16;
+            // 표시 셀 높이에 따라 행 수는 바뀔 수 있다. 기존 디바운스/fence 경로로 보내
+            // 드래그 중의 잦은 PTY 재그리기와 최종 clear→redraw 중간 화면을 억제한다.
+            self.stage_terminal_resize_for_pass(
+                ui.ctx().cumulative_pass_nr(),
+                ui.is_sizing_pass(),
+                session,
+                cols,
+                rows,
+            );
+        }
 
         if let Some(after) =
             self.settle_session_resize_presentation(session, std::time::Instant::now())
@@ -6160,6 +6178,12 @@ impl WorkspaceUi {
                 snapshot,
             )
         };
+
+        if preserved_cols.is_none() {
+            // 위 initial gate/catch-up이 지금 첫 snapshot을 설치했다면 다음 프레임에
+            // 행 크기를 예약한다. 새 출력이 없어도 최초 Resize가 누락되지 않게 한다.
+            ui.ctx().request_repaint();
+        }
 
         // 런타임의 focused pane과 현재 native UI의 논리적 키보드 소유 상태를 draw 전에
         // 확정한다. renderer가 이 값을 바탕으로 같은 프레임에 egui 공식 IME 소유권까지
@@ -6398,7 +6422,8 @@ impl WorkspaceUi {
                 // 오토스크롤한다 (iTerm2 관례 — T4). cell_at의 clamp가 끝점을
                 // 마지막/첫 행(좌우는 열 경계)에 붙잡아 선택이 계속 확장된다.
                 let rect = output.response.rect;
-                let rate = drag_autoscroll_rate(pos.y, rect.top(), rect.bottom(), cell.y);
+                let rate =
+                    drag_autoscroll_rate(pos.y, rect.top(), rect.bottom(), output.cell_size.y);
                 if rate != 0.0 {
                     // 속도(행/초)×dt 누적 → 정수 행만 전송. dt는 정지 프레임 폭주 대비 clamp.
                     let dt = ui.input(|i| i.stable_dt).min(0.1);
@@ -6726,7 +6751,7 @@ impl WorkspaceUi {
         // push되지 않아(14.4) 스크롤해도 화면이 안 바뀐다)
         if input_enabled && surface_focused && output.response.hovered() {
             let scroll_y = ui.input(|i| i.smooth_scroll_delta.y);
-            self.scroll_residual += scroll_y / cell.y;
+            self.scroll_residual += scroll_y / output.cell_size.y;
             let whole_rows = self.scroll_residual.trunc() as i32;
             if whole_rows != 0 {
                 self.scroll_residual -= whole_rows as f32;
@@ -13122,6 +13147,16 @@ mod tests {
 
         assert!(harness.query_by_label(&unavailable).is_some());
         assert!(harness.query_by_label(&connecting).is_none());
+        assert!(harness.state().staged_terminal_resizes.is_empty());
+        assert!(drain_protocol(harness.state_mut()).is_empty());
+
+        // 이미 크기를 전송한 세션이 viewport만 기다리는 경우에는 그 폭을 유지해
+        // 행 크기를 조정한다. 연결 안내가 보여도 기존 크기 조정 경로는 살아 있다.
+        harness
+            .state_mut()
+            .sent_sizes
+            .insert(SessionId(7), (80, 24));
+        harness.run();
         let ctx = harness.ctx.clone();
         let pass = harness
             .state()
@@ -13132,10 +13167,10 @@ mod tests {
         harness
             .state_mut()
             .flush_render_side_effects_for_pass(&ctx, pass, false);
-        assert!(
-            drain_protocol(harness.state_mut())
-                .iter()
-                .any(|command| matches!(command, RuntimeCommand::Resize { .. }))
+        assert_eq!(
+            harness.state().pending_resize_target[&SessionId(7)].0,
+            80,
+            "viewport가 없어도 이미 전송한 폭으로 행 크기 변경을 예약해야 한다"
         );
     }
 
@@ -14116,6 +14151,172 @@ mod tests {
             active_tab: Some(tab_id(active)),
             focused_pane: Some(pane_id(focused)),
         })
+    }
+
+    #[test]
+    fn 기존_출력_너비는_pane을_좁히거나_넓혀도_다시_줄바꿈하지_않는다() {
+        let config = TerminalConfig::default();
+        let catalog = catalog();
+        let session = SessionId(71);
+        // 전송 직후에는 표시 snapshot이 옛 크기일 수 있다. 이미 보낸 폭을 되돌리지 않는다.
+        for (has_snapshot, sent_cols) in [(true, None), (true, Some(100)), (false, Some(100))] {
+            let mut workspace = WorkspaceUi::new();
+            workspace.mux = Some(mux(
+                "t",
+                vec![tab(
+                    "t",
+                    vec![pane("p", session)],
+                    LayoutNode::Pane(pane_id("p")),
+                )],
+                "p",
+            ));
+            let original =
+                shaped_snapshot(80, 24, "| 기존 표 | 오른쪽 경계 | 기존 줄바꿈을 유지한다 |");
+            if has_snapshot {
+                workspace
+                    .sessions
+                    .entry(session)
+                    .or_default()
+                    .install_snapshot(Arc::clone(&original));
+            }
+            if let Some(cols) = sent_cols {
+                workspace.sent_sizes.insert(session, (cols, 24));
+            }
+            let ctx = egui::Context::default();
+            for width in [300.0, 900.0, 240.0, 900.0] {
+                ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 500.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        workspace.show_with_input(ui, &config, &[], &catalog, false);
+                    },
+                )
+                .textures_delta
+                .clear();
+                let target = workspace
+                    .staged_terminal_resizes
+                    .get(&session)
+                    .expect("크기 요청이 staging되어야 한다");
+                assert_eq!(
+                    target.cols,
+                    sent_cols.unwrap_or(80),
+                    "창 폭 {width}에서 기존 출력의 논리 폭이 바뀌었다"
+                );
+                if has_snapshot {
+                    assert!(Arc::ptr_eq(
+                        workspace.sessions[&session].snapshot.as_ref().unwrap(),
+                        &original
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn 복원_화면이_늦어도_추측한_폭을_먼저_보내지_않는다() {
+        let config = TerminalConfig::default();
+        let catalog = catalog();
+        let session = SessionId(72);
+        let mut workspace = WorkspaceUi::new();
+        workspace.mux = Some(mux(
+            "t",
+            vec![tab(
+                "t",
+                vec![pane("p", session)],
+                LayoutNode::Pane(pane_id("p")),
+            )],
+            "p",
+        ));
+        let ctx = egui::Context::default();
+        let render = |workspace: &mut WorkspaceUi| {
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(300.0, 500.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    workspace.show_with_input(ui, &config, &[], &catalog, false);
+                },
+            )
+            .textures_delta
+            .clear();
+        };
+
+        // MuxUpdated와 Viewport는 서로 다른 프레임에 도착할 수 있다. 복원 폭을
+        // 알기 전에 자연 폭을 전송하면 그 폭이 sent_sizes에 남아 원본을 재줄바꿈한다.
+        render(&mut workspace);
+        assert!(
+            !workspace.staged_terminal_resizes.contains_key(&session),
+            "첫 snapshot 없이 추측한 폭으로 Resize를 예약하면 안 된다"
+        );
+        workspace
+            .sessions
+            .entry(session)
+            .or_default()
+            .install_snapshot(shaped_snapshot(120, 24, "| 복원한 표의 원래 폭 |"));
+        render(&mut workspace);
+        assert_eq!(workspace.staged_terminal_resizes[&session].cols, 120);
+    }
+
+    #[test]
+    fn 넓게_복원한_출력을_축소해도_resize_셀_상한을_넘지_않는다() {
+        let config = TerminalConfig::default();
+        let catalog = catalog();
+        let session = SessionId(73);
+        for cols in [1, 80, 328, 360, 500] {
+            let mut workspace = WorkspaceUi::new();
+            workspace.mux = Some(mux(
+                "t",
+                vec![tab(
+                    "t",
+                    vec![pane("p", session)],
+                    LayoutNode::Pane(pane_id("p")),
+                )],
+                "p",
+            ));
+            workspace
+                .sessions
+                .entry(session)
+                .or_default()
+                .install_snapshot(shaped_snapshot(cols, 24, "| 넓게 저장된 기존 표 |"));
+            let ctx = egui::Context::default();
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(240.0, 900.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    workspace.show_with_input(ui, &config, &[], &catalog, false);
+                },
+            )
+            .textures_delta
+            .clear();
+            let target = &workspace.staged_terminal_resizes[&session];
+            assert_eq!(target.cols as usize, cols, "원래 표의 폭은 유지해야 한다");
+            // 숫자를 테스트에 복사하지 않고 실제 런타임 명령 입장 검사를 통과해야 한다.
+            let mut command = RuntimeCommand::Resize {
+                session,
+                cols: target.cols,
+                rows: target.rows,
+            };
+            assert!(
+                runtime::prepare_runtime_command_for_retention(&mut command).is_ok(),
+                "축소 화면의 Resize {}×{}가 런타임 상한에 거부됐다",
+                target.cols,
+                target.rows
+            );
+        }
     }
 
     fn snapshot(text: &str) -> Arc<TerminalViewportSnapshot> {

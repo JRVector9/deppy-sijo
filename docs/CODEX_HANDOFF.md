@@ -2343,3 +2343,18 @@
 - 수정 파일: 계획과 이 handoff 섹션만. 제품 수정/테스트 아직 없음.
 - 남은 작업: 정확한 4개 제품 파일 hunk 이식, focused tests·strict Clippy·fmt·diff·boundary, Codex 리뷰/수정, 한국어 커밋/push/새 PR. GUI 빌드·실행 금지, 이 main 조합의 시각 검증 대기.
 - 다음 명령: git diff 16e642a^ 16e642a -- crates/app/src/ui/workspace.rs crates/terminal/src/renderer_egui.rs crates/runtime/src/command.rs crates/runtime/src/lib.rs; git apply --check /private/tmp/deppy-preserve-layout-product.patch.
+
+- 너비 이관 진행: 4개 제품 파일 hunk 적용 완료. 전체 patch check는 renderer IMEOutput에 main #154가 추가한 purpose 필드 때문에 실패했다. 처음 removed-field로 추정한 문맥 수정도 적용에 실패했고, 실제 목적 필드를 확인해 purpose: Terminal을 보존한 정확한 hunk로 적용했다. #150 debounce/fence 함수는 변경하지 않았다. 첫 terminal 테스트는 마지막 hunk 적용 전 실행되었으므로 완료된 이식의 검증으로 사용하지 않고 최종 소스로 재실행한다.
+
+- 너비 호환성 RED: terminal --lib에서 87 PASS/3 FAIL/4 ignored. 이관된 draw_in_pane helper가 egui 0.36 TexturesDelta를 미처리 drop하여 세 신규 shape 테스트가 panic했다. 기존 main의 headless 검사 패턴처럼 textures_delta.clear()를 추가하고, 동일한 신규 workspace run_ui 세 곳에도 적용했다. 제품 렌더 동작은 바꾸지 않았다. 다음: terminal GREEN 및 workspace 전체 focused.
+
+- 너비 terminal GREEN: terminal --lib 90 PASS/4 ignored(exit 0). 실제 축소 셀·last-column·선택·IME·인접 shape·캐시 재사용과 기존 한글 조합 회귀가 통과했다. 다음: workspace focused(현재 실행 중), runtime 명령 입장, strict Clippy/fmt/diff/boundary, 리뷰 결론.
+
+- 너비 workspace GREEN: ui::workspace::tests 전체 236 PASS(exit 0). #150의 같은 격자 viewport 움직임·후속 120ms 디바운스·초기 즉시 전송·resize fence 및 split 수명주기/롤백 회귀 포함. 관련 제품 함수는 원본 이관 외 변경 없음. runtime command focused 검사 시작, Codex 정적 리뷰 진행 중.
+
+- 너비 추가 게이트: runtime command::tests 18 PASS, fmt/diff PASS. terminal/runtime/app all-targets strict Clippy 시작. 제품 변경은 없음. 기존 workspace 전체 검사에 main resize 회귀가 포함되므로 동일 필터의 중복 실행은 생략한다.
+
+- 너비 최종 리뷰: Codex CLI가 4개 제품 파일의 diff/관련 함수만 읽고 경합·좌표 변환·런타임 상한 범위에 실제 재현 가능한 correctness 결함 없음으로 정상 종료(exit 0). 로그 /private/tmp/deppy-preserve-layout-review.txt. 지적 수용/미수용 없음.
+- 너비 최종 게이트: terminal/runtime/app all-targets strict Clippy PASS. terminal 90, workspace 236, runtime command 18 PASS, ignored는 terminal 4. fmt/diff PASS. 시각 검증은 이 main 조합에서 미실행 상태다. 다음: 경계 검사 결과 기록 후 제품 커밋/push/main 새 PR.
+
+- 너비 경계 게이트 PASS: cargo run --locked -p xtask -- check-boundary, zero allowlist. 계획된 로컬 검증을 모두 완료했다. 다음: 한국어 구현 커밋과 push, main 대상 새 PR, 최종 PR 번호/SHA 기록.

@@ -1,6 +1,6 @@
 # 검증된 터미널 너비 맞춤 main 이관 Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** 사용자가 화면을 확인한 PR #149 제품 commit 16e642a의 논리 폭 보존·균일 축소를 main 45e66cc에 독립 이관한다.
 
@@ -21,14 +21,14 @@
 
 ### Task 1: 정확한 제품 hunk 이관
 
-- [ ] **Step 1: 원본 제품 patch를 생성하고 main에 적용 가능한지 확인한다.**
+- [x] **Step 1: 원본 제품 patch를 생성하고 main에 적용 가능한지 확인한다.**
 
 ```sh
 git diff 16e642a^ 16e642a -- crates/app/src/ui/workspace.rs crates/terminal/src/renderer_egui.rs crates/runtime/src/command.rs crates/runtime/src/lib.rs > /private/tmp/deppy-preserve-layout-product.patch
 git apply --check /private/tmp/deppy-preserve-layout-product.patch
 ```
 
-- [ ] **Step 2: 제품 hunk만 적용한다.** 적용 문맥이 달라졌다면 충돌 hunk만 현재 main의 동일 함수에 옮긴다. #150의 4항 pending_resize_target, viewport 안정 검사, arm_or_retarget_resize_presentation, frame_has_active_preedit와 #154의 IMEOutput 필드는 현재 main을 유지한다.
+- [x] **Step 2: 제품 hunk만 적용한다.** 적용 문맥이 달라졌다면 충돌 hunk만 현재 main의 동일 함수에 옮긴다. #150의 4항 pending_resize_target, viewport 안정 검사, arm_or_retarget_resize_presentation, frame_has_active_preedit와 #154의 IMEOutput 필드는 현재 main을 유지한다.
 
 ```sh
 git apply /private/tmp/deppy-preserve-layout-product.patch
@@ -36,7 +36,7 @@ git diff --stat
 git diff --check
 ```
 
-- [ ] **Step 3: 이관된 기존 회귀를 확인한다.** 이식 자체는 이미 RED/GREEN을 거친 코드 재사용이다. 새 호환성 결함을 찾으면 구현 수정 전에 회귀를 추가해 실패를 확인한다.
+- [x] **Step 3: 이관된 기존 회귀를 확인한다.** 이식 자체는 이미 RED/GREEN을 거친 코드 재사용이다. 새 호환성 결함을 찾으면 구현 수정 전에 회귀를 추가해 실패를 확인한다.
 
 ```sh
 CARGO_BUILD_JOBS=2 cargo test -p terminal --lib --locked -- --test-threads=1
@@ -47,7 +47,7 @@ CARGO_BUILD_JOBS=2 cargo test -p deppy-sijo --bin deppy-sijo --locked ui::worksp
 
 ### Task 2: main resize 계약과 split 배선 검증
 
-- [ ] **Step 1: 단일/분할 pane에서 실제 staged Resize와 반환 셀 좌표를 검사한다.** 기존 `기존_출력_너비는_pane을_좁히거나_넓혀도_다시_줄바꿈하지_않는다`와 terminal draw_in_pane 검사를 이용한다. 원본 텍스트에 명시적 줄바꿈/공백이 남고 snapshot Arc가 바뀌지 않아야 한다. 각 pane의 fit 계산은 그 pane ui.available_size에만 의존해야 한다.
+- [x] **Step 1: 단일/분할 pane에서 실제 staged Resize와 반환 셀 좌표를 검사한다.** 기존 `기존_출력_너비는_pane을_좁히거나_넓혀도_다시_줄바꿈하지_않는다`와 terminal draw_in_pane 검사를 이용한다. 원본 텍스트에 명시적 줄바꿈/공백이 남고 snapshot Arc가 바뀌지 않아야 한다. 각 pane의 fit 계산은 그 pane ui.available_size에만 의존해야 한다.
 
 ```rust
 assert_eq!(target.cols, sent_cols.unwrap_or(80));
@@ -55,7 +55,7 @@ assert!(Arc::ptr_eq(workspace.sessions[&session].snapshot.as_ref().unwrap(), &or
 assert!((drawn.cell.x * cols as f32 - grid_width_for_available(pane_width)).abs() < 0.05);
 ```
 
-- [ ] **Step 2: main #150 계약 회귀를 함께 실행한다.** 원본 제품 patch가 debounce/fence 함수를 수정하지 않았는지 diff로 확인한다. 동일 격자 안 viewport 움직임, 첫 Resize 즉시 전송, 후속 변경 120ms 안정, deadline 연장 금지와 실패 rollback은 현재 테스트 그대로 유지한다.
+- [x] **Step 2: main #150 계약 회귀를 함께 실행한다.** 원본 제품 patch가 debounce/fence 함수를 수정하지 않았는지 diff로 확인한다. 동일 격자 안 viewport 움직임, 첫 Resize 즉시 전송, 후속 변경 120ms 안정, deadline 연장 금지와 실패 rollback은 현재 테스트 그대로 유지한다.
 
 ```sh
 CARGO_BUILD_JOBS=2 cargo test -p deppy-sijo --bin deppy-sijo --locked 리사이즈 -- --test-threads=1
@@ -64,8 +64,8 @@ CARGO_BUILD_JOBS=2 cargo test -p runtime --lib --locked command::tests -- --test
 
 ### Task 3: 리뷰·게이트·PR
 
-- [ ] **Step 1: Codex CLI로 source diff만 읽기 전용 리뷰한다.** 테스트/빌드/수정/서브에이전트를 금지하고 4개 제품 파일의 resize/shape/cache/IME 경계를 검토한다. 추가 탐색이 길어지면 정확한 PID를 확인하고 중지를 요청해 실제 결론 유무를 기록한다. 결함을 발견하면 RED→최소 수정→focused GREEN 순서로 처리한다.
-- [ ] **Step 2: 최종 적정 게이트를 직렬 실행한다.** CARGO_BUILD_JOBS=2, 전용 캐시는 이전 PR A가 사용을 마친 `/private/tmp/deppy-ureq3-20260907/target`을 재사용한다. 다른 lane과 동시 사용하지 않는다.
+- [x] **Step 1: Codex CLI로 source diff만 읽기 전용 리뷰한다.** 테스트/빌드/수정/서브에이전트를 금지하고 4개 제품 파일의 resize/shape/cache/IME 경계를 검토한다. 추가 탐색이 길어지면 정확한 PID를 확인하고 중지를 요청해 실제 결론 유무를 기록한다. 결함을 발견하면 RED→최소 수정→focused GREEN 순서로 처리한다.
+- [x] **Step 2: 최종 적정 게이트를 직렬 실행한다.** CARGO_BUILD_JOBS=2, 전용 캐시는 이전 PR A가 사용을 마친 `/private/tmp/deppy-ureq3-20260907/target`을 재사용한다. 다른 lane과 동시 사용하지 않는다.
 
 ```sh
 cargo fmt --all -- --check
@@ -74,7 +74,7 @@ CARGO_BUILD_JOBS=2 cargo clippy -p terminal -p runtime -p deppy-sijo --all-targe
 CARGO_BUILD_JOBS=2 cargo run --locked -p xtask -- check-boundary
 ```
 
-- [ ] **Step 3: 실제 테스트 결과·리뷰·수정·시각 검증 대기를 handoff와 한국어 프로젝트 일지에 기록한다.** 기존 lane 기록은 보존한다.
+- [x] **Step 3: 실제 테스트 결과·리뷰·수정·시각 검증 대기를 handoff와 한국어 프로젝트 일지에 기록한다.** 기존 lane 기록은 보존한다.
 - [ ] **Step 4: 한국어 커밋, push, main 대상 새 PR을 만든다.** 원본 #149는 그대로 둔다. 새 PR 본문은 승인된 scale<=1 제품 동작의 main 이관, 실제 로컬 게이트, 이 main 조합의 시각 검증 대기를 명시한다.
 
 ```sh

@@ -7,8 +7,9 @@
 - 실제 검증: `CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-cjk-cell-target-20260908 cargo test -p deppy-sijo --bin deppy-sijo --locked fonts::tests -- --test-threads=1`은 8 passed; 같은 target의 `cargo clippy -p deppy-sijo --all-targets --locked -- -D warnings` 통과; `cargo run --locked -p xtask -- check-boundary` 통과; `cargo fmt --all -- --check`와 `git diff --check` 통과.
 - 코드 리뷰: 첫 `codex review --uncommitted`는 rustfmt 불일치 1건만 찾았다. `cargo fmt --all` 적용과 관련 테스트 재실행 뒤 두 번째 리뷰는 추가 actionable defect 없음으로 종료했다. 범위 제한 prompt와 `--uncommitted`를 함께 주는 두 시도는 Codex CLI 인자 상호 배타 오류(exit 2)여서 기본 uncommitted 리뷰로 재실행했다.
 - 설계 결정: 폭 보정은 폴백 face의 `FontTweak::scale`에만 적용하고 셀 크기나 자간을 바꾸지 않는다. 원본 #146 전체 cherry-pick 없이 `fonts.rs` hunk만 egui 0.36 API에 맞췄다.
-- 남은 작업: 한국어 커밋, push, `main` 대상 Ready PR 생성, exact-head GitHub 상태 분류. 앱 빌드·실행은 금지되어 수행하지 않았고 실제 화면에서 한글 정렬·가독성 검증은 대기 상태다. hosted Actions가 runner 미배정/무단계로 실패하면 BLOCKED로 기록하고 PASS로 간주하지 않는다.
-- 다음 명령: `git add crates/app/src/fonts.rs docs/CODEX_HANDOFF.md`; 한국어 커밋; `git push -u origin fix/cjk-cell-fallback-main`; `gh pr create --base main --head fix/cjk-cell-fallback-main --title 'fix(font): CJK 폴백을 터미널 2셀 폭에 맞춘다' --body-file <body>`; `gh pr view <PR> --json headRefOid,statusCheckRollup,url`.
+- 전달 상태: 제품/검증 문서 커밋 `1eae5a2ca8ab833a3a80c892dc524435222caf06`을 push하고 `main` 대상 Ready PR #171을 만들었다: https://github.com/JRVector9/deppy-sijo/pull/171. 최초 exact-head Actions run `34233814171`, `34233814236`의 5개 job은 모두 `runner_id=0`, `steps=[]`라 실제 실행되지 않은 billing BLOCKED이며 PASS가 아니다. 독립 GitGuardian은 SUCCESS다.
+- 남은 작업: 이 handoff 갱신 커밋을 push한 뒤 최종 PR HEAD와 동일한 hosted 상태를 다시 분류한다. 앱 빌드·실행은 금지되어 수행하지 않았고 실제 화면에서 한글 정렬·가독성 검증은 대기 상태다. 시각 확인 뒤 부모 lane이 병합 여부를 결정한다.
+- 다음 명령: `git push`; `gh pr view 171 --json headRefOid,statusCheckRollup,url`; Actions run jobs API에서 `runner_id`와 `steps`를 확인한다. 앱은 실행하지 않는다.
 
 ## ureq3 migration validated / PR landing next (2026-09-07)
 

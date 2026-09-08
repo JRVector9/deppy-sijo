@@ -24,7 +24,13 @@ path = "src/main.rs"
 [dependencies]
 relay-protocol = { path = "../relay-protocol" }
 anyhow = { workspace = true }
+sha2 = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 # sync WebSocket 종단. handshake feature만 — TLS는 배포 edge가 맡는다.
 tungstenite = { workspace = true, features = ["handshake"] }
+
+# SIGTERM/SIGINT를 정지 깃발로 바꾼다. `systemctl stop`이 프레임 중간에 프로세스를 죽이는
+# 대신 모든 연결을 정확히 한 번씩 닫고 join하기 위해서다. 다른 용도로는 쓰지 않는다.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }

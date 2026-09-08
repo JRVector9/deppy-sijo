@@ -2344,3 +2344,26 @@
 - 현재 수정: 계획과 handoff만. 테스트 미실행.
 - BLOCKED: DNS/TLS/자격증명/외부 배포/실기기/24h soak. 앱 빌드·실행 금지.
 - 다음: protocol raw tag/SQLite column 계약 테스트만 이관해 실제 RED, 선택 hunk 이관, core/Node/로컬 artifact GREEN, bounded Codex 리뷰와 gate, 일지/commit/push/main PR.
+
+- Relay RED: protocol raw tag 계약 테스트는 reconnect tag 0x14 assertion으로 FAIL(exit101), storage column 계약은 reconnect_verifier SELECT 준비 assertion으로 FAIL(exit101)을 확인했다. 문법/컴파일 실패가 아니다.
+- Relay 이관: 계획의 코어 52개 파일 patch와 선택 storage/schema/method/v38 테스트 hunk, relay-server lock 의존성 2개, dist ignore를 적용했다. Conflict/pairing 재발행 정책·app·secret·packaging·xtask는 제외했다.
+- GitGuardian 근거: 현재 #146 check-run 101599401791 output.text가 incident 37016215와 tests/fixtures/relay-hello-v1.json:35를 정확히 지목한다(Generic High Entropy Secret). pairing proof의 0x00..0x1f 순차 32바이트 공개 테스트 벡터이며 note에 독립 인코더·production key 없음이 명시된다. 소비자는 cfg(test) handshake/vector Chrome fixture뿐이고 배포 build.sh 파일 목록에 fixture가 없다. 실제 credential은 복사하지 않고 문자열 분할·억제 설정 없이 근거를 PR에 남긴다.
+
+- Relay Node 16 tests PASS. `.test` 오리진으로 로컬 artifact build PASS(실제 배포 아님), dist=/private/tmp/deppy-relay-core-artifact-20260908. Rust core 전체 테스트는 protocol/server/storage까지 통과했고 web-remote 진행 중이다. bounded Codex 리뷰도 진행 중이다.
+
+- Relay core GREEN: cargo test -p relay-protocol -p relay-server -p storage -p web-remote --locked -- --test-threads=1 정상 종료, 732 PASS/4 ignored(Chrome 3+fixture 생성 helper 1). Node16 PASS. 로컬 artifact build+verify PASS이며 deployment remains BLOCKED를 명시했다. 다음: 로컬 headless Chrome 가능 여부 확인, strict Clippy/fmt/diff/boundary, Codex 리뷰 결론.
+
+- Relay 범위 재분리: 부모가 제품 커밋 전 52개 파일의 두 stacked PR 분리를 지시했다. R1=Rust core/storage/deploy-relay/minimal lock, R2=shell/shared/static assets/browser fixtures·tests/Node·shell-release CI. working tree hunk는 보존한다.
+- R1 fixture 의존: handshake.rs::the_v1_hello_fixture_matches_this_implementation만 새 JSON을 include하므로 그 테스트 hunk를 R2에 둔다. R1 staged tree를 별도 archive로 꺼내 R2 파일 없이 검증한 후 R1→R2 순으로 게시한다. 기존 합친 working-tree PASS를 R1 독립 PASS로 대체하지 않는다.
+
+- R1 독립 archive: /private/tmp/deppy-relay-r1-verify-65f39010a6에는 web/relay-shell과 신규 hello JSON이 없음을 확인했다. 독립 4 crate 테스트 실행 중. 첫 fmt 검사는 fixture 테스트 제거 뒤 빈 줄 1개를 지적했고 staged R1 source와 검증 archive에서 동일하게 정리했다(제품 의미 변경 없음).
+
+- R1 독립 4 crate 전체 검증은 716 PASS/2 ignored로 정상 종료했다. Codex 리뷰는 pre-handshake socket의 SIGTERM shutdown 누락 후보 P1을 지적했다. 실제 느린 HTTP 핸드셰이크/자식 relay-server 종료 테스트를 추가했으나 macOS에서 두 번 정상 종료하여 아직 RED가 아니다. Linux 배포 플랫폼에서 확인 중이며 미재현 가설을 확정 수정으로 취급하지 않는다.
+
+- R1 리뷰 실제 RED→GREEN: macOS 정상 분할 HTTP 헤더가 accepted socket 비차단 상속으로 EOF FAIL, Linux 느린 헤더 중 SIGTERM은 2초 종료 assertion FAIL을 확인했다. serve의 명시적 차단 모드와 bounded worker 목록의 TCP 종료 handle 보존/전체 shutdown 후 join으로 수정했고 macOS relay-server 전체54 tests PASS. Linux·전체 R1 gate와 제한 재리뷰는 진행 중. 초기20ms tiny packet 재현은 tungstenite 방어가 먼저 종료해 유효하지 않아100ms로 교정했다.
+
+- R1 첫 최종 archive(e0279b0a3e) 검증: macOS 4 crate strict Clippy/fmt/전체718 PASS·2 ignored/xtask boundary PASS. Linux rust:1.96 protocol+server strict Clippy/72 tests/release PASS.
+- 재리뷰의 rejection 전송 순서 결함은 실제 malformed admission 테스트가 ResetWithoutClosingHandshake로 RED였다. pump 두 closing 경로의 flush_self를 dispatch 앞에 옮기고, 실행 순서를 검증하지 못하던 source-string 테스트를 실제 프로세스 회귀로 교체했다. core.shutdown은 원래 Send 없이 Disconnect만 내므로 SIGTERM 알림 전송이라는 잘못된 확대는 적용하지 않았다. 변경은 서버만이므로 수정 후 서버 host/Linux gate와 좁은 재리뷰를 실행한다.
+
+- R1 최종 source archive50e48d73d6 완료: macOS protocol/server/storage/web-remote strict Clippy/fmt/718 PASS·2 ignored, Linux rust:1.96 protocol/server strict Clippy72 PASS/release PASS. 마지막 서버 수정 이후 전체를 다시 실행했다. xtask boundary와 제외 파일 diff도 PASS. staged 제품 bytes가 검증 archive와 동일함을 확인했다. bounded 최종 source 재리뷰 확정 결함 없음.
+- R1 게시 직전: 제품+R1 문서만 stage하며 R2 shell/shared/assets/CI/fixture와 handshake fixture 테스트 hunk는 unstaged로 보존한다. 다음 명령: git commit -m 'feat(relay): 비UI 재접속 코어를 main에 이관한다'; git push -u origin feat/relay-reconnect-core-main; gh pr create --base main --head feat/relay-reconnect-core-main --body-file /private/tmp/deppy-relay-core-pr-body.md. 이후 git switch -c feat/relay-shell-main 후 별도 R2 계획을 실행한다. DNS/TLS/자격증명/외부 배포/실기기/24h soak는 BLOCKED다.

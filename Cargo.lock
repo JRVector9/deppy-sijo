@@ -4136,7 +4136,9 @@ name = "relay-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
  "relay-protocol",
+ "sha2 0.11.0",
  "tracing",
  "tracing-subscriber",
  "tungstenite",

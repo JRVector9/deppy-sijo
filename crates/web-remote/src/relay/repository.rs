@@ -304,6 +304,19 @@ pub trait RelayRepository: Send + Sync {
         device_id: DeviceId,
         revoked_at: u64,
     ) -> anyhow::Result<RevocationResult>;
+    /// raw grant는 이 포트에 들어오지 않는다. 미구현 어댑터는 닫힌 상태로 실패한다.
+    fn store_reconnect_verifier(
+        &self,
+        _device_id: DeviceId,
+        _identity: &[u8; 65],
+        _verifier: &[u8; 32],
+        _now: u64,
+    ) -> anyhow::Result<bool> {
+        anyhow::bail!("Relay reconnect storage unavailable")
+    }
+    fn reconnect_verifier(&self, _device_id: DeviceId) -> anyhow::Result<Option<[u8; 32]>> {
+        anyhow::bail!("Relay reconnect storage unavailable")
+    }
     fn touch_device(&self, device_id: DeviceId, seen_at: u64) -> anyhow::Result<bool>;
 }
 
@@ -399,21 +412,32 @@ impl PendingAdmission {
         handshake: AuthenticatedHandshake,
         approved_at: u64,
     ) -> anyhow::Result<AdmissionOutcome> {
-        let device = match repository.approve_pending(self.pending.pairing_id(), approved_at)? {
-            ApprovalResult::Approved(device) => device,
-            ApprovalResult::NotFound => {
+        // 저장소 오류는 커밋 **뒤**(행 → 레코드 변환 등)에서도 날 수 있다. 그때 그냥 올리면
+        // 승인된 기기가 취소 없이 남는다. 취소는 멱등이고 발행된 것이 없으면 NotFound라서,
+        // 실패 시 무조건 보상해도 안전하다.
+        let device = match repository.approve_pending(self.pending.pairing_id(), approved_at) {
+            Ok(ApprovalResult::Approved(device)) => device,
+            Ok(ApprovalResult::NotFound) => {
                 return Ok(AdmissionOutcome::Rejected(
                     AdmissionRejection::PendingNotFound,
                 ));
             }
-            ApprovalResult::Expired => {
+            Ok(ApprovalResult::Expired) => {
                 return Ok(AdmissionOutcome::Rejected(
                     AdmissionRejection::PairingDeadlinePassed,
                 ));
             }
-            ApprovalResult::DeviceLimitReached => {
+            Ok(ApprovalResult::DeviceLimitReached) => {
                 return Ok(AdmissionOutcome::Rejected(
                     AdmissionRejection::DeviceLimitReached,
+                ));
+            }
+            Err(error) => {
+                return Err(self.compensate(
+                    repository,
+                    self.pending.device_id(),
+                    approved_at,
+                    error,
                 ));
             }
         };

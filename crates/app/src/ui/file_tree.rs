@@ -285,6 +285,8 @@ pub struct SidebarSnapshot<'a> {
 /// 사이드바에서 App으로 올라가는 액션.
 pub enum SidebarAction {
     SwitchWorkspace(String),
+    /// 워크스페이스 행 메뉴에서 이 워크스페이스를 대상으로 세션 시작 창을 연다.
+    OpenWorkspaceSession(String),
     ActivatePersistedSession {
         workspace_id: String,
         pane: runtime::MuxPaneId,
@@ -4234,8 +4236,9 @@ fn disclosure_chevron_points(center: egui::Pos2, expanded: bool) -> [egui::Pos2;
     }
 }
 
-/// 워크스페이스 행 우클릭 메뉴 — 「이름 바꾸기」(별칭 편집)는 세션이 없어도 항상,
-/// 「워크스페이스 종료」(세션 일괄 닫기, 선택적 확인은 App)는 닫을 세션이 있는 비 Idle만.
+/// 워크스페이스 행 우클릭 메뉴 — 「세션 열기」와 「이름 바꾸기」(별칭 편집)는 세션이
+/// 없어도 항상, 「워크스페이스 종료」(세션 일괄 닫기, 선택적 확인은 App)는 닫을
+/// 세션이 있는 비 Idle만.
 fn workspace_context_menu(
     resp: &egui::Response,
     workspace: &SidebarWorkspaceEntry,
@@ -4254,23 +4257,32 @@ fn workspace_context_menu_items(
     catalog: &i18n::Catalog,
     action: &mut Option<SidebarAction>,
 ) {
+    let open_session_label = catalog.t("sidebar.menu.open_session", &[]);
     let rename_label = catalog.t("sidebar.menu.rename_workspace", &[]);
     let close_label = catalog.t("sidebar.menu.close_workspace", &[]);
     // 메뉴 폭이 좁으면 「워크스페이스 종료」가 두 줄로 접혀 잘렸다(2026-07-18 사용자
     // 스샷). 가장 긴 항목의 no-wrap 폭으로 최소 폭을 강제해(max_rect까지 확장된다)
     // 어느 로케일에서도 모든 항목이 항상 한 줄로 그려지게 한다. Idle이라 종료 항목이
-    // 빠져도 두 항목 모두 재서 메뉴 폭이 상태에 따라 널뛰지 않게 한다.
+    // 빠져도 세 항목 모두 재서 메뉴 폭이 상태에 따라 널뛰지 않게 한다.
     let font = egui::TextStyle::Button.resolve(ui.style());
-    let widest = [rename_label.as_str(), close_label.as_str()]
-        .into_iter()
-        .map(|label| {
-            ui.painter()
-                .layout_no_wrap(label.to_owned(), font.clone(), egui::Color32::WHITE)
-                .size()
-                .x
-        })
-        .fold(0.0_f32, f32::max);
+    let widest = [
+        open_session_label.as_str(),
+        rename_label.as_str(),
+        close_label.as_str(),
+    ]
+    .into_iter()
+    .map(|label| {
+        ui.painter()
+            .layout_no_wrap(label.to_owned(), font.clone(), egui::Color32::WHITE)
+            .size()
+            .x
+    })
+    .fold(0.0_f32, f32::max);
     ui.set_min_width(widest + ui.spacing().button_padding.x * 2.0 + 2.0);
+    if ui.button(open_session_label).clicked() {
+        *action = Some(SidebarAction::OpenWorkspaceSession(workspace.id.clone()));
+        ui.close();
+    }
     if ui.button(rename_label).clicked() {
         *action = Some(SidebarAction::RenameWorkspace(workspace.id.clone()));
         ui.close();
@@ -4877,19 +4889,10 @@ fn session_drag_payload_matches(ctx: &egui::Context, target: &SessionRowTarget) 
 /// 행 배경의 모서리. 각진 면은 패널 폭을 가로지르는 띠로 보여 「이 행」이 어디서
 /// 끊기는지 흐렸다 — 둥근 면은 목록 안의 한 덩어리로 읽힌다(2026-08-11 사용자).
 const SESSION_ROW_CORNER_RADIUS: f32 = 6.0;
-/// 주목이 필요한 행에 까는 상태색 면의 알파. 색을 알아볼 만큼은 진하고, 그 위의
-/// 글자 대비를 해치지 않을 만큼은 옅다.
-const SESSION_ATTENTION_FILL_ALPHA: f32 = 0.13;
-
-/// 행 배경 — 「면은 주목이 필요할 때만」이 주안의 규칙이다. **선택은 면을 쓰지
-/// 않는다**(2026-08-11 사용자: 주안 — 면 없음으로). 면을 선택에도 내주면 승인 필요
-/// 행의 신호가 「혼자만 면을 가졌다」에서 「면 색이 다르다」로 약해진다.
-/// 선택은 `session_title_color`가 **글자 밝기**로 나른다 — 자리를 안 밀고 면과
-/// 경쟁하지도 않는다.
-///
-/// hover만 예외로 옅은 면을 쓴다. 마우스가 있는 동안만 존재하는 일시적 상태라
-/// 목록을 훑을 때 승인 신호와 다투지 않는다. attention보다 뒤에 둬서, 마우스가
-/// 지나갔다는 이유로 회색 면이 상태색을 덮지 않게 한다.
+/// 행 배경은 **현재 화면에 떠 있는 세션**만 선택색으로 표시한다. 승인·입력 대기 같은
+/// 상태는 점·링·문구가 나르며 배경을 바꾸지 않는다. 그래야 다른 워크스페이스의
+/// attention 세션도 현재 워크스페이스의 비선택 세션과 같은 바탕으로 보인다.
+/// hover는 포인터가 있는 동안만 일시적으로 별도 면을 쓴다.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct SessionRowFill {
     color: egui::Color32,
@@ -4904,21 +4907,13 @@ struct SessionRowFill {
 fn session_row_fill(
     tokens: crate::ui::designall::Tokens,
     hovered: bool,
-    attention: bool,
     focused: bool,
-    status: egui::Color32,
 ) -> Option<SessionRowFill> {
-    if attention {
-        return Some(SessionRowFill {
-            color: status.gamma_multiply(SESSION_ATTENTION_FILL_ALPHA),
-            full_bleed: false,
-        });
-    }
     // **지금 화면에 떠 있는 세션**은 면을 유지한다(2026-08-20 사용자) — 선택된
     // 워크스페이스만 배경이 있고 그 안에서 실제로 보고 있는 세션은 표시가 없어,
     // 목록에서 "어느 것을 보고 있는지"를 제목 색(session_title_color) 하나로만
     // 구분해야 했다. hover보다 우선한다 — 마우스를 다른 행에 얹어도 지금 보고 있는
-    // 곳이 사라지면 안 된다. attention(내 입력을 기다림)은 더 급한 신호라 그대로 이긴다.
+    // 곳이 사라지면 안 된다.
     // 워크스페이스 행처럼 accent를 섞지는 않는다 — 부모(워크스페이스)와 자식(세션)이
     // 같은 색이면 계층이 뭉개진다.
     if focused {
@@ -5160,9 +5155,7 @@ fn session_row_impl(
             drag_style.stroke,
             egui::StrokeKind::Inside,
         );
-    } else if let Some(fill) =
-        session_row_fill(tokens, resp.hovered(), entry.attention, entry.focused, dot)
-    {
+    } else if let Some(fill) = session_row_fill(tokens, resp.hovered(), entry.focused) {
         // 면은 **점까지 덮는다**. 예전엔 좌측 레일이 배경 위에 얹힌 별도 요소라
         // 배경을 레일 다음부터 시작했는데, 점이 된 지금 그 규칙을 남기면 점만 면
         // 바깥에 떠서 행이 둘로 갈라져 보인다(2026-08-11 사용자).
@@ -7290,19 +7283,17 @@ mod tests {
     }
 
     #[test]
-    fn 보고있는_세션은_면을_갖고_승인은_그보다_우선한다() {
+    fn 보고있는_세션만_선택면을_갖는다() {
         let tokens = crate::ui::designall::DARK;
-        let status =
-            crate::ui::agent_visuals::status_color(crate::agent_surface::AgentVisualState::Waiting);
 
-        // 평상시(hover·승인·보고있음 아님) 행엔 면이 없다 — 목록이 면으로 뒤덮이면
+        // 평상시(hover·보고있음 아님) 행엔 면이 없다 — 목록이 면으로 뒤덮이면
         // 어느 것이 특별한지 알 수 없다.
-        assert_eq!(session_row_fill(tokens, false, false, false, status), None);
+        assert_eq!(session_row_fill(tokens, false, false), None);
         // 2026-08-20 갱신: **지금 보고 있는 세션**은 면을 갖는다. 예전엔 글자 밝기로만
         // 날라서, 선택된 워크스페이스만 배경이 있고 그 안에서 실제로 보고 있는 세션은
         // 표시가 없었다(사용자 보고).
         assert_eq!(
-            session_row_fill(tokens, false, false, true, status),
+            session_row_fill(tokens, false, true),
             Some(SessionRowFill {
                 color: tokens.selected_background,
                 full_bleed: true,
@@ -7310,34 +7301,15 @@ mod tests {
         );
         // hover보다 우선한다 — 마우스를 다른 행에 얹어도 보고 있는 곳이 사라지면 안 된다.
         assert_eq!(
-            session_row_fill(tokens, true, false, true, status)
+            session_row_fill(tokens, true, true)
                 .expect("보고있는 행에 면이 없다")
                 .color,
             tokens.selected_background,
             "hover 면이 '보고 있는 세션' 표시를 덮었다"
         );
-        // 승인·입력 대기만 면을 가진다 — 「혼자만 면을 가져」 최대로 튄다.
-        let attention_fill = Some(SessionRowFill {
-            color: status.gamma_multiply(SESSION_ATTENTION_FILL_ALPHA),
-            full_bleed: false,
-        });
-        assert_eq!(
-            session_row_fill(tokens, false, true, false, status),
-            attention_fill
-        );
-        assert_eq!(
-            session_row_fill(tokens, true, true, false, status),
-            attention_fill,
-            "hover 회색 면이 승인 상태색을 덮었다"
-        );
-        assert_eq!(
-            session_row_fill(tokens, true, true, true, status),
-            attention_fill,
-            "'보고 있음' 면이 승인 상태색을 덮었다 — 내 입력을 기다리는 쪽이 더 급하다"
-        );
-        // hover는 패널 폭을 다 쓰고, 승인 면은 둥근 카드로 남는다.
+        // hover는 패널 폭을 다 쓴다. 승인·입력 대기는 배경 대신 점·링·문구로 표시한다.
         assert!(
-            session_row_fill(tokens, true, false, false, status)
+            session_row_fill(tokens, true, false)
                 .expect("hover 면이 없다")
                 .full_bleed,
             "hover 면이 여백을 남겼다"
@@ -9324,6 +9296,38 @@ mod tests {
         );
     }
 
+    /// 워크스페이스 상태와 관계없이 대상 워크스페이스에서 새 세션을 시작할 수 있어야
+    /// 한다. App은 이 id를 받아 필요하면 먼저 워크스페이스를 전환한다.
+    #[test]
+    fn kittest_세션열기_클릭이_대상_workspace_액션을_낸다() {
+        use egui_kittest::kittest::Queryable;
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let workspace = SidebarWorkspaceEntry {
+            id: "ws-session".to_owned(),
+            name: "session-target".to_owned(),
+            state: SidebarWorkspaceState::Idle,
+            summary: SidebarSessionSummary::inactive(0),
+        };
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, action: &mut Option<SidebarAction>| {
+                workspace_context_menu_items(ui, &workspace, &catalog, action);
+            },
+            None,
+        );
+
+        harness.run();
+        harness.get_by_label("Open session").click();
+        harness.run();
+
+        assert!(
+            matches!(
+                harness.state(),
+                Some(SidebarAction::OpenWorkspaceSession(id)) if id == "ws-session"
+            ),
+            "세션 열기 클릭이 대상 워크스페이스 id를 보존하지 않음"
+        );
+    }
+
     /// 「이름 바꾸기」 클릭 → RenameWorkspace(id) 액션 방출. Idle이어도 노출된다 —
     /// 세션이 없어도 이름은 바꿀 수 있다.
     #[test]
@@ -9354,8 +9358,8 @@ mod tests {
         );
     }
 
-    /// Idle(비활성) 워크스페이스 메뉴에는 「이름 바꾸기」만 있고 종료 항목은 없다 —
-    /// 닫을 세션이 없다.
+    /// Idle(비활성) 워크스페이스 메뉴에도 「세션 열기」와 「이름 바꾸기」는 있고 종료
+    /// 항목만 없다 — 닫을 세션이 없다.
     #[test]
     fn kittest_비활성_워크스페이스에는_종료메뉴가_없다() {
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
@@ -9984,7 +9988,7 @@ mod tests {
     /// 좁은 폭에서도 워크스페이스 메뉴 항목은 한 줄로 그려진다 — 이전에는 메뉴가
     /// 좁은 폭을 물려받아 「워크스페이스 종료」가 두 줄로 잘렸다(2026-07-18 스샷).
     /// 메뉴 본문이 가장 긴 항목의 no-wrap 폭으로 최소 폭을 강제하므로 100px 제약
-    /// 안에서도 버튼이 제약 밖으로 확장되고(줄바꿈 없음) 두 항목의 행 높이가 같다.
+    /// 안에서도 버튼이 제약 밖으로 확장되고(줄바꿈 없음) 세 항목의 행 높이가 같다.
     #[test]
     fn kittest_좁은_폭에서도_워크스페이스_메뉴가_한줄로_그려진다() {
         use egui_kittest::kittest::Queryable;
@@ -10004,6 +10008,7 @@ mod tests {
             None,
         );
         harness.run();
+        let open = harness.get_by_label("Open session").rect();
         let close = harness.get_by_label("Close workspace sessions").rect();
         let rename = harness.get_by_label("Rename workspace").rect();
         assert!(
@@ -10012,8 +10017,10 @@ mod tests {
             close.width()
         );
         assert!(
-            (close.height() - rename.height()).abs() < 0.5,
-            "종료 항목이 여러 줄로 접힘 (close={}, rename={})",
+            (close.height() - rename.height()).abs() < 0.5
+                && (open.height() - rename.height()).abs() < 0.5,
+            "메뉴 항목이 여러 줄로 접힘 (open={}, close={}, rename={})",
+            open.height(),
             close.height(),
             rename.height()
         );

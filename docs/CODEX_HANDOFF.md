@@ -2344,3 +2344,17 @@
 - 검증: git diff --check 통과. 테스트/빌드 아직 실행하지 않았다.
 - 남은 작업: 원본 커밋에서 대상 hunk만 이관, focused RED/GREEN, codex 소스 리뷰, 앱/i18n/Clippy/경계 게이트, 한국어 커밋/push/PR. GUI 재빌드/재실행 금지.
 - 다음 명령: git show 6ec8377 -- crates/app/src/app.rs crates/app/src/ui/file_tree.rs crates/i18n/locales; git show f0bd342 -- crates/app/src/ui/file_tree.rs; CARGO_BUILD_JOBS=2 cargo test -p deppy-sijo --bin deppy-sijo --locked 세션열기 -- --test-threads=1.
+
+- PR A 진행: 메뉴/현재 세션 배경 및 5개 locale hunk만 이관했다. 기존 focused 세션열기 테스트 2개 PASS. 새 보존/정확한 대상/병합/삭제·busy·전환거부 테스트는 미구현 helper에 대한 E0425/E0432 16개로 RED(exit 101)를 확인했다.
+- PR A 구현: App에 최신 대상 Option<String> 하나, 소비 직후 재입장, 실제 실행 전/전환 후 대상 상태 검증을 연결했다. 거부된 요청은 화면을 변경하지 않고, 활성 숨김 대상도 유효한 열기 시 해제한다. 다음: focused GREEN, 정적 리뷰, 전체 게이트.
+
+- PR A GREEN: 같은 focused 명령으로 6 tests PASS(0 failed). Codex CLI 정적 리뷰 진행 중이며, 이제 App 전체 unit/integration 테스트를 실행한다. CARGO_TARGET_DIR=/private/tmp/deppy-ureq3-20260907/target, CARGO_BUILD_JOBS=2를 사용한다. GUI 생성/실행은 하지 않았다.
+
+- PR A 전체 App 검증: cargo test -p deppy-sijo --locked -- --test-threads=1 PASS — unit 2042, integration 4+5+14+15=38; 명시적 ignored 17. cargo fmt --all -- --check 및 git diff --check PASS. 로그 /private/tmp/deppy-session-intent-app-test.txt. Codex 리뷰는 아직 진행 중이다.
+
+- PR A 추가 게이트: i18n 8 PASS, cargo clippy -p deppy-sijo --all-targets --locked -- -D warnings PASS. xtask check-boundary 실행 중, Codex 정적 리뷰 결론 대기 중이다.
+
+- PR A 최종 로컬 게이트: cargo run --locked -p xtask -- check-boundary PASS(zero allowlist). source 테스트 이후 product 변경 없음. Codex 리뷰가 최초 예상 5분을 넘겨 기존 launcher/입력 경로를 읽는 중이며, 아직 결과를 PASS로 표기하지 않는다.
+
+- PR A Codex 최종 리뷰: source/locale diff에서 실제 재현 가능한 correctness 결함 없음. SyncDotenv 선행 순서, 정확한 workspace ID/유계 재시도, 거부 시 오실행 방지 유지라는 결론을 받았다. 리뷰가 약 10분까지 확장되어 정확한 PID에 SIGINT로 추가 탐색 중지를 요청했으며, 프로세스가 최종 결론을 출력하고 종료했다. 재시작/추가 리뷰는 하지 않았다. 로그: /private/tmp/deppy-session-intent-review.txt.
+- PR A 구현 완료: source 7개 파일과 계획/handoff 변경만 포함한다. product 수정 없이 모든 로컬 게이트를 통과했다. 다음: 한국어 커밋, push, main PR 생성, PR 번호/최종 SHA 기록. GitHub CI 결과는 아직 없다.

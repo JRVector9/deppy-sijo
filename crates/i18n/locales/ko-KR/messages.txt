@@ -32,6 +32,7 @@ sidebar.menu.remove_worktree = 워크트리 삭제
 sidebar.menu.resume_agent = 에이전트 이어가기
 sidebar.resume_failed = 이어가기 실패 - 다시 시도해 주세요: {title}
 sidebar.menu.close_pane = 세션 닫기
+sidebar.menu.open_session = 세션 열기
 sidebar.menu.close_workspace = 워크스페이스 종료
 sidebar.menu.rename_workspace = 이름 바꾸기
 sidebar.empty.start_workspace = 워크스페이스를 시작하세요

@@ -8460,6 +8460,8 @@ pub struct App {
     pending_app_controller_action: Option<AppControllerAction>,
     /// Render가 반환한 workspace/runtime action 한 건. 다음 logic tick에서만 실행한다.
     pending_workspace_controller_action: Option<WorkspaceControllerAction>,
+    // controller가 사용 중이어도 명시적 세션 열기 대상 하나는 다음 tick까지 보존한다.
+    pending_workspace_session_open: Option<String>,
     /// Focused completion acknowledgement. Render removes the in-memory generation and stages at
     /// most one durable clear; SQLite is touched only by the following logic tick.
     pending_turn_done_clear: Option<(String, i64)>,
@@ -10168,6 +10170,7 @@ enum AppControllerAction {
 /// when `logic` drains this slot on the next tick.
 enum WorkspaceControllerAction {
     OpenAgentLauncher,
+    OpenAgentLauncherForWorkspace(String),
     SwitchWorkspace(String),
     ActivatePersistedSession {
         workspace_id: String,
@@ -10215,6 +10218,55 @@ enum WorkspaceControllerAction {
         prompt: Arc<str>,
     },
     SyncDotenv,
+}
+
+// 기존 controller 요청(특히 현재 workspace의 dotenv 동기화)을 덮어쓰거나 앞지르지 않는다.
+fn retry_workspace_session_open(
+    slot: &mut Option<WorkspaceControllerAction>,
+    pending: &mut Option<String>,
+) -> bool {
+    if slot.is_some() {
+        return false;
+    }
+    let Some(workspace_id) = pending.take() else {
+        return false;
+    };
+    *slot = Some(WorkspaceControllerAction::OpenAgentLauncherForWorkspace(
+        workspace_id,
+    ));
+    true
+}
+
+fn queue_workspace_session_open(
+    slot: &mut Option<WorkspaceControllerAction>,
+    pending: &mut Option<String>,
+    workspace_id: String,
+) -> bool {
+    // 아직 입장하지 못한 창 열기는 최신 대상 하나로 병합한다. 세션 생성은 하지 않는다.
+    *pending = Some(workspace_id);
+    retry_workspace_session_open(slot, pending)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum WorkspaceSessionOpenStep {
+    Reject,
+    Switch,
+    Open,
+}
+
+fn workspace_session_open_step(
+    target_id: &str,
+    active_id: &str,
+    target_exists: bool,
+    launcher_busy: bool,
+) -> WorkspaceSessionOpenStep {
+    if !target_exists || launcher_busy {
+        WorkspaceSessionOpenStep::Reject
+    } else if target_id == active_id {
+        WorkspaceSessionOpenStep::Open
+    } else {
+        WorkspaceSessionOpenStep::Switch
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13142,6 +13194,7 @@ impl App {
             file_tree_watcher: None,
             pending_app_controller_action: None,
             pending_workspace_controller_action: None,
+            pending_workspace_session_open: None,
             pending_turn_done_clear: None,
             pending_settings_config_apply: false,
             pending_config_save: false,
@@ -17961,6 +18014,24 @@ impl App {
         true
     }
 
+    fn stage_workspace_session_open(&mut self, workspace_id: String) {
+        queue_workspace_session_open(
+            &mut self.pending_workspace_controller_action,
+            &mut self.pending_workspace_session_open,
+            workspace_id,
+        );
+        self.egui_ctx.request_repaint();
+    }
+
+    fn poll_pending_workspace_session_open(&mut self) {
+        if retry_workspace_session_open(
+            &mut self.pending_workspace_controller_action,
+            &mut self.pending_workspace_session_open,
+        ) {
+            self.egui_ctx.request_repaint();
+        }
+    }
+
     fn poll_workspace_controller(&mut self) {
         let Some(action) = self.pending_workspace_controller_action.take() else {
             return;
@@ -17968,6 +18039,9 @@ impl App {
         match action {
             WorkspaceControllerAction::OpenAgentLauncher => {
                 self.open_agent_launcher_for_active();
+            }
+            WorkspaceControllerAction::OpenAgentLauncherForWorkspace(workspace_id) => {
+                self.open_agent_launcher_for_workspace(&workspace_id);
             }
             WorkspaceControllerAction::SwitchWorkspace(workspace_id) => {
                 self.switch_workspace(&workspace_id);
@@ -22419,6 +22493,31 @@ impl App {
         self.egui_ctx.request_repaint();
     }
 
+    fn workspace_session_open_step(&self, workspace_id: &str) -> WorkspaceSessionOpenStep {
+        workspace_session_open_step(
+            workspace_id,
+            &self.active.id,
+            self.workspaces
+                .iter()
+                .any(|workspace| workspace.id == workspace_id),
+            self.pending_agent_launcher_launch.is_some(),
+        )
+    }
+
+    fn open_agent_launcher_for_workspace(&mut self, workspace_id: &str) {
+        match self.workspace_session_open_step(workspace_id) {
+            WorkspaceSessionOpenStep::Reject => return,
+            WorkspaceSessionOpenStep::Switch => self.switch_workspace(workspace_id),
+            WorkspaceSessionOpenStep::Open => {}
+        }
+        // live warm 상한으로 전환이 거부되거나 대상이 사라지면 다른 workspace에서 열지 않는다.
+        if self.workspace_session_open_step(workspace_id) == WorkspaceSessionOpenStep::Open {
+            self.reveal_closed_workspace(workspace_id);
+            self.reveal_terminal_session();
+            self.open_agent_launcher_for_active();
+        }
+    }
+
     fn offer_agent_launcher_for_active(&mut self) {
         if self.pending_agent_launcher_launch.is_some() {
             return;
@@ -26245,6 +26344,7 @@ impl eframe::App for App {
             self.handle_work_history_action(ctx, action);
         }
         self.poll_workspace_controller();
+        self.poll_pending_workspace_session_open();
         self.poll_pending_workspace_focus();
         self.poll_pending_resume_agent();
         self.poll_pending_document_open();
@@ -27443,6 +27543,9 @@ impl eframe::App for App {
                     self.stage_workspace_controller_action(
                         WorkspaceControllerAction::SwitchWorkspace(workspace_id),
                     );
+                }
+                Some(ui::file_tree::SidebarAction::OpenWorkspaceSession(workspace_id)) => {
+                    self.stage_workspace_session_open(workspace_id);
                 }
                 Some(ui::file_tree::SidebarAction::ActivatePersistedSession {
                     workspace_id,
@@ -42768,6 +42871,158 @@ mod tests {
                 runtime::SessionId(42),
             ))
         );
+    }
+
+    #[test]
+    fn 세션열기_선점된_요청을_보존하고_정확한_대상으로_한번만_재시도한다() {
+        let mut slot = Some(WorkspaceControllerAction::SyncDotenv);
+        let mut pending = None;
+        assert!(!queue_workspace_session_open(
+            &mut slot,
+            &mut pending,
+            "workspace-b".to_owned()
+        ));
+        for _ in 0..3 {
+            assert!(!retry_workspace_session_open(&mut slot, &mut pending));
+            assert!(matches!(slot, Some(WorkspaceControllerAction::SyncDotenv)));
+            assert_eq!(pending.as_deref(), Some("workspace-b"));
+        }
+        // 기존 동기화를 먼저 소비해야 요청한 workspace의 세션 열기를 입장시킨다.
+        assert!(matches!(
+            slot.take(),
+            Some(WorkspaceControllerAction::SyncDotenv)
+        ));
+        assert!(retry_workspace_session_open(&mut slot, &mut pending));
+        assert!(
+            matches!(slot.take(), Some(WorkspaceControllerAction::OpenAgentLauncherForWorkspace(id)) if id == "workspace-b")
+        );
+        assert!(pending.is_none());
+        assert!(!retry_workspace_session_open(&mut slot, &mut pending));
+        assert!(slot.is_none());
+    }
+
+    #[test]
+    fn 세션열기_입력과_composer_요청도_덮어쓰지_않는다() {
+        let original = [
+            WorkspaceControllerAction::Runtime(runtime::RuntimeCommand::WriteInput {
+                session: runtime::SessionId(7),
+                bytes: b"echo keep\n".to_vec(),
+            }),
+            WorkspaceControllerAction::ComposerPrompt {
+                target: AppTerminalInputTarget::Primary {
+                    workspace_id: "workspace-a".to_owned(),
+                    runtime_instance: 3,
+                    session: runtime::SessionId(7),
+                },
+                prompt: Arc::from("보존할 입력"),
+            },
+        ];
+        for original in original {
+            let mut slot = Some(original);
+            let mut pending = None;
+            assert!(!queue_workspace_session_open(
+                &mut slot,
+                &mut pending,
+                "workspace-b".to_owned()
+            ));
+            match slot.take().expect("선점 요청은 남아 있어야 한다") {
+                WorkspaceControllerAction::Runtime(runtime::RuntimeCommand::WriteInput {
+                    session,
+                    bytes,
+                }) => {
+                    assert_eq!(session, runtime::SessionId(7));
+                    assert_eq!(bytes, b"echo keep\n");
+                }
+                WorkspaceControllerAction::ComposerPrompt { target, prompt } => {
+                    assert!(
+                        matches!(target, AppTerminalInputTarget::Primary { workspace_id, runtime_instance: 3, session: runtime::SessionId(7) } if workspace_id == "workspace-a")
+                    );
+                    assert_eq!(prompt.as_ref(), "보존할 입력");
+                }
+                _ => panic!("기존 요청이 다른 요청으로 바뀜"),
+            }
+            assert!(retry_workspace_session_open(&mut slot, &mut pending));
+            assert!(
+                matches!(slot, Some(WorkspaceControllerAction::OpenAgentLauncherForWorkspace(ref id)) if id == "workspace-b")
+            );
+        }
+    }
+
+    #[test]
+    fn 세션열기_대기는_최신_대상_하나로_병합된다() {
+        let mut slot = Some(WorkspaceControllerAction::SyncDotenv);
+        let mut pending = None;
+        for id in ["workspace-b", "workspace-b", "workspace-c"] {
+            assert!(!queue_workspace_session_open(
+                &mut slot,
+                &mut pending,
+                id.to_owned()
+            ));
+        }
+        assert_eq!(pending.as_deref(), Some("workspace-c"));
+        slot.take();
+        assert!(retry_workspace_session_open(&mut slot, &mut pending));
+        assert!(
+            matches!(slot.take(), Some(WorkspaceControllerAction::OpenAgentLauncherForWorkspace(id)) if id == "workspace-c")
+        );
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn 세션열기_삭제_busy_전환거부는_다른_workspace를_열지_않는다() {
+        use WorkspaceSessionOpenStep::{Open, Reject, Switch};
+        assert_eq!(workspace_session_open_step("b", "a", false, false), Reject);
+        assert_eq!(workspace_session_open_step("b", "b", false, false), Reject);
+        assert_eq!(workspace_session_open_step("b", "a", true, true), Reject);
+        assert_eq!(workspace_session_open_step("b", "b", true, true), Reject);
+        assert_eq!(workspace_session_open_step("b", "a", true, false), Switch);
+        // warm 한도로 전환을 거부하면 active=a가 유지된다. Open이 되면 오실행이다.
+        assert_ne!(workspace_session_open_step("b", "a", true, false), Open);
+        // active, warm 재사용, idle 생성 모두 실제 b로 전환된 뒤에만 열린다.
+        assert_eq!(workspace_session_open_step("b", "b", true, false), Open);
+    }
+
+    #[test]
+    fn 워크스페이스_세션열기는_대상을_검증하고_전환된_경우에만_창을_연다() {
+        let source = include_str!("app.rs");
+        let route = source
+            .split_once("SidebarAction::OpenWorkspaceSession(workspace_id)")
+            .expect("사이드바 세션 열기 액션을 받아야 한다")
+            .1
+            .split_once("Some(ui::file_tree::SidebarAction::")
+            .expect("다음 사이드바 액션")
+            .0;
+        assert!(
+            route.contains("stage_workspace_session_open(workspace_id)"),
+            "대상 id를 controller 액션까지 보존해야 한다"
+        );
+
+        let body = source
+            .split_once("fn open_agent_launcher_for_workspace(&mut self, workspace_id: &str)")
+            .expect("대상 워크스페이스 세션 열기 함수")
+            .1
+            .split_once("\n    fn ")
+            .expect("함수 끝")
+            .0;
+        let compact = body.split_whitespace().collect::<String>();
+        let validate = compact
+            .find("matchself.workspace_session_open_step(workspace_id)")
+            .expect("존재하는 대상인지 먼저 검증해야 한다");
+        let switch = compact
+            .find("self.switch_workspace(workspace_id)")
+            .expect("비활성 워크스페이스면 먼저 전환해야 한다");
+        let revalidate = compact
+            .find(
+                "ifself.workspace_session_open_step(workspace_id)==WorkspaceSessionOpenStep::Open",
+            )
+            .expect("전환 거부 뒤 잘못된 워크스페이스에서 열면 안 된다");
+        let open = compact
+            .find("self.open_agent_launcher_for_active()")
+            .expect("정확한 대상에서 세션 시작 창을 열어야 한다");
+        assert!(validate < switch && switch < revalidate && revalidate < open);
+        assert!(source.contains(
+            "self.poll_workspace_controller();\n        self.poll_pending_workspace_session_open();"
+        ));
     }
 
     #[test]

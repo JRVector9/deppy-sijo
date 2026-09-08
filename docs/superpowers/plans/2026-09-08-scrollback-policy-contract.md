@@ -62,3 +62,6 @@
 - focused89 tests 통과: settings20 + config40 + policy1 + i18n8 + runtime18 + wire1 + postcard1.
 - 최종 strict clippy(all-targets), fmt/diff 통과; codex 후속 리뷰 잔여 확정 결함 없음.
 - 앱 재빌드/재실행·실화면/IME 검증과 Windows/Linux 네이티브 실행/cross-target 검증은 미실행 상태로 유지한다.
+
+- 추가 로컬 `cargo run --locked -p xtask -- check-boundary` PASS.
+- GitHub Actions는 계정 billing/spending 제한으로 job 시작 전 차단됨(BLOCKED). 실행34206142020/34206142022 annotation 확인; CI PASS로 보고하지 않는다.

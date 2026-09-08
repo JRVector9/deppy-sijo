@@ -2395,3 +2395,9 @@
 - 검증 완료: focused89(20+40+1+8+18+1+1), strict clippy(all-targets), fmt/diff; 후속 codex 리뷰 잔여 확정 결함 없음. 로그는 `/private/tmp/deppy-{settings-final,config-final,policy-green,policy-i18n,policy-runtime,policy-wire,policy-postcard,policy-clippy-final,policy-codex-followup}.log`.
 - 남은 작업: root의 PR 통합 검토와 별도 core/live apply PR. 실화면/IME 검증 및 Windows/Linux 네이티브/cross-target 검증은 대기이며 실행했다고 보고하지 않는다.
 - 다음 에이전트 명령: `cd /private/tmp/deppy-scrollback-policy-20260908`; `git status --short`; `gh pr view 157 --json url,headRefOid,mergeStateStatus,statusCheckRollup`; `git show 862a894 --stat`; `cat crates/terminal/src/policy.rs`.
+
+### PR B 원격 CI 차단 확인
+- PR #157의 GitHub Actions는 코드 검사를 실행하지 못했다. `gh run view 34206142020`, `gh run view 34206142022`의 모든 작업 annotation이 계정 결제 실패 또는 spending limit로 job이 시작되지 않았다고 보고한다. CI 상태는 BLOCKED이며 PASS가 아니다.
+- 원격 실행 링크: https://github.com/JRVector9/deppy-sijo/actions/runs/34206142020 , https://github.com/JRVector9/deppy-sijo/actions/runs/34206142022 .
+- workflow의 추가 경계 게이트도 로컬 실행했다: `CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-deps-target-20260907 cargo run --locked -p xtask -- check-boundary` → `check-boundary OK — UI leaf boundary guard passed; zero allowlist capability` (exit0, `/private/tmp/deppy-policy-boundary.log`).
+- 남은 외부 작업: GitHub 계정 billing/spending 한도 복구 후 CI 재실행. 이 PR에서 계정 설정 변경이나 merge는 수행하지 않는다.

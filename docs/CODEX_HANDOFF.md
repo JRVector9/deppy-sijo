@@ -2669,3 +2669,60 @@
 - 최종 빌드 PASS: 코드 기준 main `16505ea`, release 5분 14초, package script exit 0(`/tmp/deppy-env-main-package.log`). Developer ID Application: VectorNine INC (ZDTU5LS35K), bundle identifier app.vector9.deppy-sijo 유지. 서명/ZIP 재추출 검증 및 별도 codesign --verify --deep --strict 모두 PASS. 로컬 개발 패키지이며 Apple 공증은 이번에 수행하지 않았다.
 - 산출물: `/private/tmp/deppy-env-main-20260909/target/bundle/Deppy Sijo.app` 및 `.zip`(실제 target `/private/tmp/deppy-ready-prs-integration-target`). 실행한 바이너리와 혼동하지 않는다. 기존 앱은 `/private/tmp/deppy-settings-session-background-20260909/target/bundle/Deppy Sijo.app/Contents/MacOS/deppy-sijo`, PID 99747 그대로다. 새 앱 실행/기존 앱 종료는 하지 않았다.
 - 남은 작업은 사용자 재실행 요청 대기 및 이후 실제 화면 확인이다. 구현/머지/재빌드는 완료했다. 후속 요청 전 재빌드 반복·재실행 불필요. 재실행 승인 시 먼저 `pgrep -x deppy-sijo`와 `ps -o pid=,etime=,command= -p <확인한PID>`로 현 앱을 식별한 뒤 정확한 PID만 종료하고 위 새 bundle을 open한다.
+
+
+## 2026-09-09 머지 상태 코드 리뷰
+
+- 요청: main에 머지한 환경/API #179~183과 화면 보존 #184를 리뷰한다. 기준 main 50df4bd, 비교 ea587b6..50df4bd. 앱 재실행 보류를 유지한다.
+- 발견 H1(소스 확인, 신뢰 8/10): app.rs:23501~23507의 foreground dotenv 결과 검증은 workspace/root/runtime/파일 stamp만 확인한다. SetCredentialEnv/SetEnvSources 성공의 workspace_environment_changed(23107)는 pending continuation을 폐기하거나 설정 generation을 갱신하지 않는다. worker가 이전 API 연결/파일 목록을 읽은 뒤 설정 저장이 완료되고, 결과를 뒤늦게 수신하면 23801/23808/23819~23820에서 이전 payload·선택 목록·stamp를 다시 인정할 수 있다. 비밀 physical slot 검증은 값 회전만 검사하므로 연결 해제/파일 선택 변경을 검출하지 못한다. workspace 설정 generation을 pending/result에 연결하고 변경 후 늦은 결과는 다시 조회해야 한다. 동시성 종단 간 재현 테스트는 이번에 실행하지 않았다.
+- 발견 M1(소스 확인, 신뢰 10/10): app.rs:25523~25534의 CredentialAdded 완료는 projection_current가 아니면 add_succeeded/report_error를 건너뛴다. credentials.rs:798에서 true로 만든 add_pending은 성공/실패 처리 외에는 해제되지 않고 sync_snapshot(552)에서도 초기화되지 않는다. A에서 API 추가 중 B로 바꾸면 완료 결과가 버려져 이후 모든 프로젝트의 추가 버튼이 비활성 상태로 남는다. 초안 정리와 작업 완료 상태 해제를 분리하거나 workspace별 pending을 사용해야 한다.
+- 발견 M2(임시 zsh 실행 재현, 신뢰 10/10): env_reload.rs:302~309에서 높은 우선순위 파일의 민감값을 continue로 건너뛸 때 낮은 우선순위 일반값이 __deppy_next_env에 남는다. 실제 소스 ZSHRC를 추출한 임시 파일만 사용해 `.env: PUBLIC=base-value`, `.env.local: PUBLIC=Bearer fake-local-secret`, 기존 PUBLIC=Bearer fake-local-secret으로 시작했다. hook 이후 PUBLIC=base-value가 출력돼 새 실행의 올바른 민감값이 낮은 우선순위 값으로 덮이는 것을 확인했다. 민감값을 만나면 해당 키의 하위 정의도 적용 대상에서 제외하고 기존 주입값을 보존해야 한다. 로그 `/tmp/deppy-merged-review-hook-repro.txt`.
+- 기각한 가설: 환경파일 전체 삭제 시 일반 키가 남는다는 초기 의심은 동일 zsh 재현에서 REMOVE_ME=0/PUBLIC=0으로 정상 제거를 확인해 지적에서 제외했다. storage 연결 256개 상한은 migration v41 trigger로 보호됨을 확인했다.
+- 검증 범위: 소스/diff 추적과 가짜 값만 쓰는 임시 zsh 재현 1회(exit 0). cargo 테스트·빌드·UI 회귀·실제 사용자 Keychain/환경파일 접근·앱 재실행은 하지 않았다. 구현 소스는 수정하지 않았고 이 handoff만 갱신했다. 기존 빌드는 발견 사항 수정 전 16505ea 코드이므로 위 세 건을 포함한다.
+- 도구 제한: review SKILL.md의 필수 checklist.md가 설치 경로/대체 skill 경로에 없어 해당 workflow는 중단하고 직접 리뷰했다. 스킬 기준 전체 절차 통과를 주장하지 않는다.
+- 다음 작업: 사용자 수정 요청 시 현재 main에서 별도 수정 branch를 만들고 H1 설정 세대 경쟁, M1 추가 pending 수명, M2 우선순위 민감값 회귀를 먼저 재현한다. 코드 리뷰 요청만으로 수정/새 빌드/재실행을 하지 않는다. 시작 명령 `cd /private/tmp/deppy-env-main-20260909`; `git status --short`; `tail -n 18 docs/CODEX_HANDOFF.md`; `sed -n '23497,23510p' crates/app/src/app.rs`; `sed -n '25523,25535p' crates/app/src/app.rs`; `sed -n '298,320p' crates/app/src/env_reload.rs`.
+
+## 2026-09-09 리뷰 후속 수정 착수
+
+- 사용자 세 지적 수정 승인. branch fix/environment-review-followup, worktree /private/tmp/deppy-env-main-20260909, 기준 main 50df4bd. 앱 재빌드/재실행 보류 유지.
+- 테스트 먼저 추가: 설정 세대 판별 및 다른 프로젝트 추가 완료 API가 없어 compile RED를 확인했다. 해당 상태 API 도입 후 2 PASS, 라이브 훅 우선순위 테스트는 실제 잘못된 출력으로 FAIL(`/tmp/deppy-env-review-hook-red.log`).
+- 구현: EnvironmentApplication 설정 세대를 pending 실행 요청에 캡처해 완료 시 비교한다. 설정 변경은 세대를 올리되 단순 조회 취소는 올리지 않는다. 오래된 요청은 기존 실패 정리로 차단하고 환경 없는 spawn fallback도 금지한다. 새 설정 상태는 오래된 요청 실패로 덮지 않는다. 사용자 다음 실행에서 최신 환경을 조회한다. API 추가는 완료/실패마다 pending을 해제하되 현재 프로젝트가 다르면 초안/오류를 보존한다. zsh 훅은 높은 우선순위 민감값을 보호 집합으로 기록해 하위 일반값 및 삭제 적용에서 제외한다.
+- 남은 작업: 실제 worker/새 세대 재조회 회귀 보강, 관련 상태·훅 테스트, 코드 재검토와 커밋 전 게이트. 아직 수정 최종 PASS가 아니다.
+
+- 최종 검증 PASS: `cargo test --locked -p deppy-sijo --bin deppy-sijo -- environment_review_ environment_application_ env_reload::tests settings_load_ --test-threads=1` 32 PASS(3.35초, `/tmp/deppy-env-review-final-tests.log`). 포함: 설정 변경 세대/조회 취소 구분, 실제 임시 DB worker의 API 해제·파일 선택 중지, 다른 프로젝트 추가 성공/실패 완료, zsh 민감/일반 값 우선순위 전환.
+- 최종 게이트 PASS: workspace clippy all-targets(18.90초), xtask check-boundary, i18n-check(1150 literal keys/5 locale), fmt/diff. 로그 `/tmp/deppy-env-review-{clippy,boundary,i18n}.log`. 전체 런타임/UI 렌더 테스트와 앱 release 패키징·재실행은 하지 않았다. 기존 PID 99747 유지.
+- 수정 파일: app.rs(설정 세대 캡처/완료 검증, stale fallback 차단, 추가 완료 연결, worker 회귀), environment_application.rs(조회 취소와 설정 변경 분리), ui/credentials.rs(초안과 pending 수명 분리), env_reload.rs(민감값 보호 및 항목/바이트 상한), handoff. 소스 재검토에서 stale 요청의 기존 승인/restore/placeholder 실패 정리를 유지함을 확인했다.
+- 동작 결정: 설정 변경과 경합한 실행은 실패 알림을 내고 종료하며, 자동 재시작/무한 재조회는 하지 않는다. 사용자가 다음 실행을 요청하면 최신 환경을 읽는다.
+- 남은 작업: commit/push 및 main 대상 수정 PR. 이번 수정 요청으로 main 자동 머지·앱 빌드·재실행은 하지 않는다. 다음 명령 `git diff --check`; `git push -u origin fix/environment-review-followup`; `gh pr create --base main --head fix/environment-review-followup --title "fix: 환경 설정 변경 경합과 API 추가 대기 상태 수정" --body-file /tmp/deppy-env-review-fix-pr.md`.
+
+- 수정 PR 생성 완료: #185 https://github.com/JRVector9/deppy-sijo/pull/185, 구현 commit ba6c897, base main 50df4bd. 세 리뷰 지적은 코드 수정과 관련 로직 검증까지 완료했다. main 머지와 앱 재빌드/재실행은 대기다. 현재 worktree는 main 자체가 아니라 fix/environment-review-followup branch이므로 다음 작업 전 `git branch --show-current`로 확인한다.
+
+
+## 2026-09-09 PR #185 두 번째 코드 리뷰
+
+- 요청/범위: 사용자 “한번더 코드 리뷰해봐”. main 50df4bd 대비 fix/environment-review-followup HEAD 629600b(구현 ba6c897)의 소스 4개와 호출부를 다시 검토했다. 구현 수정/머지/앱 재빌드/재실행은 하지 않았다. 이번 변경 파일은 이 handoff뿐이다.
+- 발견 Medium 1(실제 zsh 재현, 신뢰 10/10): env_reload.rs:309~310/319/326. 일반 키 PUBLIC을 훅이 관리하던 중 값을 Bearer 패턴으로 바꾸면 현재 값은 보호되지만 __deppy_next_env에서 빠져 다음 __deppy_env_keys에서도 제거된다. 그 뒤 파일에서 PUBLIC을 완전히 삭제해도 삭제 루프가 해당 키를 검사하지 않아 이전 ordinary-initial 값이 셸과 이후 자식 프로세스에 계속 남는다. 기존 관리 키 중 일시 보호한 키는 삭제 추적에 유지해야 한다. 원래 훅이 관리하지 않았던 초기 민감 키까지 새로 삭제 대상으로 등록하지는 않아야 한다.
+- 검증: 실제 main/HEAD의 ZSHRC를 git show로 추출해 임시 HOME/ZDOTDIR/프로젝트 파일 및 가짜 값만 사용했다. `python3 /tmp/deppy-env-review2-repro.py` 실행: main 일반→삭제 PASS, main 일반→민감→삭제 PASS, HEAD 일반→삭제 PASS, HEAD 일반→민감→삭제 FAIL(expected unset, actual ordinary-initial). 셸/스크립트 exit 0은 재현 실행 완료이며 네 시나리오 전체 PASS가 아니다. 결과 `/tmp/deppy-env-review2-comparison.log`, 최초 추적 목록 확인 `/tmp/deppy-env-review2-deletion-repro.log`.
+- 나머지 검토: settings_generation 캡처/검증과 stale 실패 시 승인·restore·placeholder 정리, API 추가 완료의 pending 해제/초안 보존 호출을 추적했다. 이 경로에서 추가로 확정한 결함은 없다. 설정 worker 완료와 dotenv worker 소비의 전후 순서도 읽었으나 전체 App 동시성 재현은 실행하지 않았으므로 완전한 경합 검증을 주장하지 않는다. 이전 32개 테스트/게이트 결과는 앞 절의 실행 결과이며 이번 리뷰에서 반복하지 않았다.
+- 남은 작업: 위 삭제 추적 회귀 수정 및 일반→민감→삭제/파일 전체 삭제 회귀 보강. 현재 요청은 리뷰이므로 구현은 대기한다. PR #185는 아직 main 미반영이고 이전 main 빌드에도 이번 수정은 포함되지 않는다.
+- 다음 명령: `cd /private/tmp/deppy-env-main-20260909`; `git status --short`; `git diff`; `python3 /tmp/deppy-env-review2-repro.py`; `sed -n '302,328p' crates/app/src/env_reload.rs`. 수정 승인 시 로직 회귀부터 추가하고 관련 env_reload 테스트만 재검증한다. 앱 재실행 보류를 유지한다.
+
+
+## 2026-09-09 PR #185 삭제 추적 수정·재빌드 착수
+
+- 사용자 코드 수정/재빌드 승인. 재실행은 계속 보류한다. 현재 branch fix/environment-review-followup, 기준 629600b. 기존 리뷰 handoff 변경을 보존한다.
+- 회귀 추가: 일반값→민감값 두 번 변경→키 삭제/파일 삭제 두 경로를 실제 임시 zsh로 확인한다. 처음부터 주입된 민감 키는 훅이 관리하지 않았으므로 삭제하지 않아야 한다. 현재 RED 실행 중(`/tmp/deppy-env-review2-red.log`), 성공/실패를 아직 확정하지 않는다.
+- 계획: 기존 관리 키 중 현재 보호된 키만 다음 삭제 추적에 남기고, env_reload 관련 회귀/커밋 전 게이트 후 PR #185를 갱신한다. 그 commit으로 Developer ID 서명 로컬 release package를 만들고 실행은 하지 않는다. 현재 실행 앱 PID 99747은 별도 settings-session-background bundle이다.
+- 다음 명령: `tail -n 25 /tmp/deppy-env-review2-red.log`; 멈춤 의심 시 `ps -axo pid,ppid,%cpu,state,etime,comm`. 앱 kill/open/dev-run.sh 금지.
+
+
+- 삭제 추적 수정 완료: env_reload.rs에서 기존 관리 키 중 현재 민감값으로 보호된 키를 별도 배열에 유지하고, 다음 삭제 추적 목록에 합친다. 일반 적용 목록과 보호 목록은 서로 배타적이므로 중복/누적 증가하지 않으며 기존 4096항목 파싱 상한 안에 있다. 초기 민감 키는 새로 관리 대상으로 등록하지 않는다.
+- 검증: 새 회귀에서 deleted:1로 실제 RED 확인(`/tmp/deppy-env-review2-red.log`). 수정 뒤 `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo test --locked -p deppy-sijo --bin deppy-sijo -- env_reload::tests --test-threads=1` 14 PASS(3.04초, `/tmp/deppy-env-review2-green.log`). 키 삭제와 파일 삭제, 연속 보호, 초기 민감값 보존을 포함한다.
+- 커밋 전 게이트 PASS: fmt/diff, workspace clippy all-targets(15.45초), check-boundary, i18n-check(1150 literal keys/5 locales). 로그 `/tmp/deppy-env-review2-{clippy,boundary,i18n}.log`. 소스 재검토에서 보호 해제 후 일반값 우선순위와 관리 키 수명도 확인했다. 전체 테스트/화면 확인은 수행하지 않았다.
+- 남은 작업: 코드와 handoff를 commit/push해 #185 갱신 후 같은 commit으로 로컬 release 패키징. main merge는 요청 범위 밖이라 진행하지 않는다. 기존 실행 앱은 유지한다. 패키징 명령: `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target DEPPY_SIGN_IDENTITY='Developer ID Application: VectorNine INC (ZDTU5LS35K)' DEPPY_REQUIRE_TRUSTED_SIGNING=0 DEPPY_ALLOW_UNTRUSTED_SIGNING=1 sh scripts/package-macos.sh > /tmp/deppy-env-review2-package.log 2>&1`. Apple 공증 없는 로컬 개발 패키지이며 서명/ZIP 검증까지 성공 후에만 빌드 PASS로 기록한다.
+
+
+- 최종 완료: 구현 commit 89ff9db를 #185 branch에 push했다. 같은 commit 기준 release 빌드 57.20초 및 package script exit 0(`/tmp/deppy-env-review2-package.log`). 앱/helper 서명, bundle plist/아키텍처, ZIP 재추출 후 서명·바이너리 일치 검증 모두 PASS. Developer ID Application: VectorNine INC (ZDTU5LS35K), identifier app.vector9.deppy-sijo, hardened runtime 유지. Apple 공증은 하지 않은 로컬 개발 패키지다.
+- 새 산출물: `/private/tmp/deppy-env-main-20260909/target/bundle/Deppy Sijo.app` 및 `.zip`(실제 target `/private/tmp/deppy-ready-prs-integration-target`). 이 경로의 이전 main 빌드는 이번 #185 수정 포함 빌드로 교체됐다. 디렉터리 이름과 달리 현재 빌드/branch는 main이 아니며, main merge는 하지 않았다.
+- 재실행 보류 유지: PID 99747의 `/private/tmp/deppy-settings-session-background-20260909/target/bundle/Deppy Sijo.app/Contents/MacOS/deppy-sijo`가 계속 실행 중임을 확인했다. kill/open/dev-run.sh는 실행하지 않았다. 이번 요청의 코드 수정·검증·재빌드는 완료했고, 남은 작업은 사용자 요청에 따른 main 머지 또는 새 앱 실행/화면 확인이다.
+- 다음 시작 명령: `cd /private/tmp/deppy-env-main-20260909`; `git status --short`; `gh pr view 185`; `tail -n 12 docs/CODEX_HANDOFF.md`. 재실행 요청 시 먼저 `pgrep -x deppy-sijo` 및 `ps -o pid=,etime=,command= -p <확인한PID>`로 대상을 재확인한 뒤 위 새 bundle을 사용한다. 이 마지막 문서 갱신은 실행 코드 변경이 아니므로 재빌드를 반복하지 않는다.

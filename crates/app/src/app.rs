@@ -1539,6 +1539,7 @@ enum PendingDotenvContinuation {
 }
 
 struct PendingDotenvOperation {
+    settings_generation: u64,
     correlation: crate::dotenv_sync::DotenvWorkerCorrelation,
     workspace_id: String,
     root: Option<PathBuf>,
@@ -23257,7 +23258,7 @@ impl App {
         ) else {
             return Err(Box::new(continuation));
         };
-        let Some((workspace_id, previous_state)) =
+        let Some((workspace_id, previous_state, settings_generation)) =
             self.runtime_by_instance(runtime_instance).map(|runtime| {
                 (
                     runtime.id.clone(),
@@ -23266,6 +23267,7 @@ impl App {
                     } else {
                         runtime.dotenv_state
                     },
+                    runtime.environment_application.settings_generation(),
                 )
             })
         else {
@@ -23290,6 +23292,7 @@ impl App {
         self.dotenv_pending_operations.insert(
             operation_id,
             PendingDotenvOperation {
+                settings_generation,
                 correlation,
                 workspace_id: workspace_id.clone(),
                 root: root.clone(),
@@ -23498,8 +23501,20 @@ impl App {
         );
         let restore_lifetime = full_restore_continuation || primary_activation_current;
         let current_root = self.workspace_tree_root(&pending.workspace_id);
+        // 실행 요청의 설정 세대는 성공한 환경/API 변경 이전 결과를 차단한다.
+        // 파일 stamp와 비밀 슬롯 세대만으로는 연결 해제·파일 선택 변경을 알 수 없다.
+        let settings_current = self
+            .runtime_by_instance(pending.runtime_instance)
+            .is_some_and(|runtime| {
+                runtime
+                    .environment_application
+                    .accepts_settings_generation(pending.settings_generation)
+            });
+        let allow_environment_fallback =
+            settings_current && dotenv_failure_allows_session(&pending.continuation);
         let outcome = outcome.ok().filter(|outcome| {
-            outcome.workspace_id == pending.workspace_id
+            settings_current
+                && outcome.workspace_id == pending.workspace_id
                 && outcome.root == pending.root
                 && outcome.runtime_instance == pending.runtime_instance
                 && current_root == pending.root
@@ -23524,15 +23539,19 @@ impl App {
             _ => None,
         };
         let Some(outcome) = outcome else {
-            if matches!(
-                &pending.continuation,
-                PendingDotenvContinuation::RuntimeCommand(
-                    runtime::RuntimeCommand::RespawnArchivedAgent { .. }
+            if !settings_current
+                || matches!(
+                    &pending.continuation,
+                    PendingDotenvContinuation::RuntimeCommand(
+                        runtime::RuntimeCommand::RespawnArchivedAgent { .. }
+                    )
                 )
-            ) {
+            {
                 platform::notify(&self.i18n.t("env.apply_failed", &[]), "");
             }
-            if let Some(runtime) = self.runtime_by_instance_mut(pending.runtime_instance) {
+            if settings_current
+                && let Some(runtime) = self.runtime_by_instance_mut(pending.runtime_instance)
+            {
                 runtime.environment_application.fail();
                 runtime.dotenv_state = None;
             }
@@ -23542,7 +23561,7 @@ impl App {
             // 기록하면 execute_dotenv_sync_job이 다음 요청을 "변한 게 없다"며 건너뛰어
             // (`job.previous_state == Some(baseline)`) 재시도가 영영 막힌다. 동기화는
             // 여전히 실패한 상태로 남겨두고 세션만 통과시킨다.
-            if dotenv_failure_allows_session(&pending.continuation) {
+            if allow_environment_fallback {
                 // 에이전트면 승인 티켓을 성공 경로와 **동일하게** 소비한다. 빼먹으면
                 // 티켓이 미소비로 남아 승인 추적이 어긋나고 런처 요청이 매달린다.
                 if let Some(ticket_id) = agent_ticket
@@ -23566,7 +23585,7 @@ impl App {
             }
             // runtime을 mut로 빌리기 전에 만들어 둔다 — 안에서 self를 다시 못 빌린다.
             let fallback_cache_policy = self.terminal_cache_policy_command();
-            if dotenv_failure_allows_session(&pending.continuation)
+            if allow_environment_fallback
                 && let Some(runtime) = self.runtime_by_instance_mut(pending.runtime_instance)
             {
                 let defaults_cleared = runtime
@@ -25520,19 +25539,14 @@ impl App {
                             .report_error(ui::credentials::CredentialsUiErrorCode::BindingFailed);
                     }
                 }
-                SettingsOutcomeKind::CredentialAdded(result) => match result {
-                    Ok(()) => {
-                        if projection_current {
-                            self.credentials_ui.add_succeeded();
-                        }
+                SettingsOutcomeKind::CredentialAdded(result) => {
+                    self.credentials_ui
+                        .complete_add(projection_current, result.is_ok());
+                    if result.is_ok() {
                         self.workspace_environment_changed(&outcome.workspace_id);
                         self.invalidate_env_api_projects();
                     }
-                    Err(_) if projection_current => self
-                        .credentials_ui
-                        .report_error(ui::credentials::CredentialsUiErrorCode::AddFailed),
-                    Err(_) => {}
-                },
+                }
                 SettingsOutcomeKind::CredentialDeleted {
                     credential_id,
                     result,
@@ -43261,6 +43275,56 @@ mod tests {
                 .is_some()
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn environment_review_worker의_이전_연결과_파일선택은_설정변경후_인정하지_않는다() {
+        let path = temp_db_path("environment-review-stale");
+        let db = Db::open(&path).unwrap();
+        let workspace = db.create_workspace("generation").unwrap();
+        db.insert_credential(&storage::CredentialMeta {
+            id: "review-key".into(),
+            provider: "service".into(),
+            label: "test".into(),
+            credential_kind: "api_key".into(),
+            masked_hint: None,
+            workspace_id: Some(workspace.clone()),
+        })
+        .unwrap();
+        db.set_credential_env_binding(&workspace, "review-key", Some("SERVICE_TOKEN"))
+            .unwrap();
+        let mut resource = AppDotenvResource {
+            db_path: path,
+            db: Some(db),
+            redaction: secret::RedactionService::new(),
+        };
+        let mut state = crate::environment_application::EnvironmentApplication::default();
+        let job = || DotenvSyncJob {
+            workspace_id: workspace.clone(),
+            root: None,
+            runtime_instance: 1,
+            previous_state: None,
+            force: false,
+            migrate_legacy: false,
+        };
+        let captured = state.settings_generation();
+        let late = execute_dotenv_sync_job(&mut resource, job()).unwrap();
+        assert_eq!(late.payload.as_ref().unwrap().api_secrets.len(), 1);
+        let db = resource.db.as_ref().unwrap();
+        db.set_credential_env_binding(&workspace, "review-key", None)
+            .unwrap();
+        db.set_env_source_files(&workspace, Some(&[])).unwrap();
+        state.changed();
+        let fresh = execute_dotenv_sync_job(&mut resource, job()).unwrap();
+        assert_eq!(
+            late.baseline, fresh.baseline,
+            "파일 stamp만으로는 변경을 구분하지 못한다"
+        );
+        assert!(!state.accepts_settings_generation(captured));
+        assert!(state.accepts_settings_generation(state.settings_generation()));
+        let payload = fresh.payload.unwrap();
+        assert!(payload.api_secrets.is_empty());
+        assert!(payload.dotenv_source.unwrap().files.is_empty());
     }
 
     #[test]

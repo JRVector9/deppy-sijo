@@ -2694,3 +2694,5 @@
 - 수정 파일: app.rs(설정 세대 캡처/완료 검증, stale fallback 차단, 추가 완료 연결, worker 회귀), environment_application.rs(조회 취소와 설정 변경 분리), ui/credentials.rs(초안과 pending 수명 분리), env_reload.rs(민감값 보호 및 항목/바이트 상한), handoff. 소스 재검토에서 stale 요청의 기존 승인/restore/placeholder 실패 정리를 유지함을 확인했다.
 - 동작 결정: 설정 변경과 경합한 실행은 실패 알림을 내고 종료하며, 자동 재시작/무한 재조회는 하지 않는다. 사용자가 다음 실행을 요청하면 최신 환경을 읽는다.
 - 남은 작업: commit/push 및 main 대상 수정 PR. 이번 수정 요청으로 main 자동 머지·앱 빌드·재실행은 하지 않는다. 다음 명령 `git diff --check`; `git push -u origin fix/environment-review-followup`; `gh pr create --base main --head fix/environment-review-followup --title "fix: 환경 설정 변경 경합과 API 추가 대기 상태 수정" --body-file /tmp/deppy-env-review-fix-pr.md`.
+
+- 수정 PR 생성 완료: #185 https://github.com/JRVector9/deppy-sijo/pull/185, 구현 commit ba6c897, base main 50df4bd. 세 리뷰 지적은 코드 수정과 관련 로직 검증까지 완료했다. main 머지와 앱 재빌드/재실행은 대기다. 현재 worktree는 main 자체가 아니라 fix/environment-review-followup branch이므로 다음 작업 전 `git branch --show-current`로 확인한다.

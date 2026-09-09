@@ -72,6 +72,14 @@ pub fn grid_width_for_available(available_width: f32) -> f32 {
     (available_width.max(0.0) - HORIZONTAL_PADDING * 2.0).max(0.0)
 }
 
+/// 단일·분할 pane의 실제 가용 폭으로 열 수를 계산한다. 남는 폭은 한 셀 미만이다.
+pub fn grid_cols_for_available(available_width: f32, cell_width: f32) -> u16 {
+    if !available_width.is_finite() || !cell_width.is_finite() || cell_width <= 0.0 {
+        return 10;
+    }
+    ((grid_width_for_available(available_width) / cell_width).floor() as u16).clamp(10, 500)
+}
+
 /// 보존된 `cols`를 pane 폭 안에 담기 위한 균일 축소 배율(0 < scale ≤ 1).
 ///
 /// 리사이즈로 pane이 좁아져도 **기존 출력의 줄바꿈 형태를 그대로 유지**하려면 PTY를
@@ -88,7 +96,8 @@ pub fn grid_width_for_available(available_width: f32) -> f32 {
 /// 하한 clamp는 **의도적으로 없다** — 임의의 최소 배율에서 멈추면 그 아래에서 다시
 /// 우측 열이 잘려 "한 화면에 전부 보인다"는 요구가 깨진다.
 ///
-/// 호출측(workspace)은 이 배율로 축소된 `cell.y`를 계산해 PTY 행 수를 정한다.
+/// Resize 적용 대기 중인 넓은 snapshot도 임시로 화면 안에 담는다. 최종 PTY 크기는
+/// 호출측에서 pane의 실제 가용 크기로 정한다.
 pub fn fit_width_scale(available_width: f32, cell_width: f32, cols: u16) -> f32 {
     if !available_width.is_finite() || !cell_width.is_finite() || cell_width <= 0.0 || cols == 0 {
         return 1.0;
@@ -482,17 +491,13 @@ pub fn draw(
     // 방지). font_size·cell·font_id는 **원래 값 그대로** 두고 마지막에 shape 구간만
     // 변환하므로 행 갤리 캐시와 글리프 아틀라스가 재사용된다.
     let scale = fit_width_scale(avail.x, cell.x, snapshot.cols);
-    // 그리드 폭은 셀 단위로 떨어지므로 pane 우측에 최대 한 셀만큼 남는다. 그 자리는
-    // **호출부가** 작업면 색으로 미리 덮는다(pane 폭을 아는 쪽은 거기다) — 여기서
-    // avail.x를 그대로 쓰면 무제한 ui에서 터미널이 화면 전체를 차지한다.
-    // 축소 배율이 곱해진 폭은 정의상 가용 폭을 넘지 않으므로, 축소가 정의되지 않는
-    // 경우(scale == 1)를 위해 기존 clamp를 그대로 남긴다.
-    let size = egui::vec2(
-        ((cell.x * snapshot.cols as f32 * scale).min(grid_width_for_available(avail.x))
-            + HORIZONTAL_PADDING * 2.0)
-            .min(avail.x.max(0.0)),
-        render_height,
-    );
+    // Resize 적용 전 snapshot이 좁더라도 배경과 입력 영역은 pane 전체를 사용한다.
+    let render_width = if avail.x.is_finite() {
+        avail.x.max(0.0)
+    } else {
+        cell.x * snapshot.cols as f32 + HORIZONTAL_PADDING * 2.0
+    };
+    let size = egui::vec2(render_width, render_height);
     // click_and_drag: 클릭=포커스, 드래그=선택 (2026-07-05 복사 지원)
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
     // 조합이 없을 때만 공식 소유권을 즉시 되찾는다. egui의 request_focus는 현재 조합을

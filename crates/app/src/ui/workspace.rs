@@ -6674,31 +6674,19 @@ impl WorkspaceUi {
         };
         let cell = renderer_egui::cell_size(ui.ctx(), metrics);
         let avail = ui.available_size();
-        // 창 폭으로 논리 열 수를 바꾸면 기존 표/줄이 다시 줄바꿈된다. 이미 표시한 폭을
-        // 유지하고 좁은 pane에서는 renderer가 그리드 전체를 같은 비율로 축소한다.
-        // 전송 직후에는 snapshot이 옛 크기일 수 있어 이미 보낸 크기를 우선한다.
-        // MuxUpdated만 먼저 온 복원 세션에는 폭을 추측해 보내지 않는다. 첫 snapshot은
-        // Resize 없이도 runtime이 발행하므로 그 실제 폭을 받은 뒤 크기를 조정한다.
-        let preserved_cols = self
-            .sent_sizes
-            .get(&session)
-            .map(|&(cols, _)| cols)
-            .or_else(|| {
-                self.sessions
-                    .get(&session)
-                    .and_then(|view| view.snapshot.as_ref())
-                    .map(|snapshot| snapshot.cols)
-            });
-        if let Some(cols) = preserved_cols {
-            let scale = renderer_egui::fit_width_scale(avail.x, cell.x, cols);
-            let rows = renderer_egui::grid_rows_for_available(avail.y, cell.y * scale);
-            // 넓게 복원한 열 수를 유지한 채 축소하면 행 수가 늘어난다. 전체 셀 수가
-            // 런타임 입장 상한을 넘지 않도록 같은 상수로 행 목표를 제한한다.
-            let rows = u32::from(rows)
-                .min(runtime::TERMINAL_CELL_COUNT_MAX / u32::from(cols.max(1)))
-                as u16;
-            // 표시 셀 높이에 따라 행 수는 바뀔 수 있다. 기존 디바운스/fence 경로로 보내
-            // 드래그 중의 잦은 PTY 재그리기와 최종 clear→redraw 중간 화면을 억제한다.
+        // 복원 화면이 도착하기 전에는 크기를 먼저 보내지 않는다. 화면이 준비되면
+        // 이전 열 수에 고정하지 않고 단일·분할 pane 각각의 실제 가용 폭을 사용한다.
+        let layout_ready = self.sent_sizes.contains_key(&session)
+            || self
+                .sessions
+                .get(&session)
+                .is_some_and(|view| view.snapshot.is_some());
+        if layout_ready {
+            let cols = renderer_egui::grid_cols_for_available(avail.x, cell.x);
+            let rows = renderer_egui::grid_rows_for_available(avail.y, cell.y);
+            let rows =
+                u32::from(rows).min(runtime::TERMINAL_CELL_COUNT_MAX / u32::from(cols)) as u16;
+            // 기존 디바운스와 실제 적용 세대 확인을 거쳐 최종 크기만 표시한다.
             self.stage_terminal_resize_for_pass(
                 ui.ctx().cumulative_pass_nr(),
                 ui.is_sizing_pass(),
@@ -6745,7 +6733,7 @@ impl WorkspaceUi {
             )
         };
 
-        if preserved_cols.is_none() {
+        if !layout_ready {
             // 위 initial gate/catch-up이 지금 첫 snapshot을 설치했다면 다음 프레임에
             // 행 크기를 예약한다. 새 출력이 없어도 최초 Resize가 누락되지 않게 한다.
             ui.ctx().request_repaint();
@@ -15432,11 +15420,11 @@ mod tests {
     }
 
     #[test]
-    fn 기존_출력_너비는_pane을_좁히거나_넓혀도_다시_줄바꿈하지_않는다() {
+    fn pane_너비가_바뀌면_열수도_따라가고_적용전_snapshot은_보존한다() {
         let config = TerminalConfig::default();
         let catalog = catalog();
         let session = SessionId(71);
-        // 전송 직후에는 표시 snapshot이 옛 크기일 수 있다. 이미 보낸 폭을 되돌리지 않는다.
+        // 이전 전송 폭이나 snapshot 폭에 고정되지 않고 현재 pane 폭을 따른다.
         for (has_snapshot, sent_cols) in [(true, None), (true, Some(100)), (false, Some(100))] {
             let mut workspace = WorkspaceUi::new();
             workspace.mux = Some(mux(
@@ -15461,6 +15449,7 @@ mod tests {
                 workspace.sent_sizes.insert(session, (cols, 24));
             }
             let ctx = egui::Context::default();
+            let mut previous = None;
             for width in [300.0, 900.0, 240.0, 900.0] {
                 ctx.run_ui(
                     egui::RawInput {
@@ -15480,11 +15469,15 @@ mod tests {
                     .staged_terminal_resizes
                     .get(&session)
                     .expect("크기 요청이 staging되어야 한다");
-                assert_eq!(
-                    target.cols,
-                    sent_cols.unwrap_or(80),
-                    "창 폭 {width}에서 기존 출력의 논리 폭이 바뀌었다"
-                );
+                if let Some((previous_width, previous_cols)) = previous {
+                    assert_eq!(
+                        target.cols > previous_cols,
+                        width > previous_width,
+                        "pane 폭이 바뀌면 열 수도 같은 방향으로 바뀌어야 한다"
+                    );
+                    assert_ne!(target.cols, previous_cols);
+                }
+                previous = Some((width, target.cols));
                 if has_snapshot {
                     assert!(Arc::ptr_eq(
                         workspace.sessions[&session].snapshot.as_ref().unwrap(),
@@ -15528,8 +15521,8 @@ mod tests {
             .clear();
         };
 
-        // MuxUpdated와 Viewport는 서로 다른 프레임에 도착할 수 있다. 복원 폭을
-        // 알기 전에 자연 폭을 전송하면 그 폭이 sent_sizes에 남아 원본을 재줄바꿈한다.
+        // MuxUpdated와 Viewport가 서로 다른 프레임에 도착해도 첫 화면을 받은 뒤
+        // 현재 pane 크기에 맞춘 Resize를 예약한다.
         render(&mut workspace);
         assert!(
             !workspace.staged_terminal_resizes.contains_key(&session),
@@ -15541,14 +15534,15 @@ mod tests {
             .or_default()
             .install_snapshot(shaped_snapshot(120, 24, "| 복원한 표의 원래 폭 |"));
         render(&mut workspace);
-        assert_eq!(workspace.staged_terminal_resizes[&session].cols, 120);
+        assert!(workspace.staged_terminal_resizes[&session].cols < 120);
     }
 
     #[test]
-    fn 넓게_복원한_출력을_축소해도_resize_셀_상한을_넘지_않는다() {
+    fn 복원_열수와_무관하게_pane에_맞추고_resize_셀_상한을_지킨다() {
         let config = TerminalConfig::default();
         let catalog = catalog();
         let session = SessionId(73);
+        let mut pane_cols = None;
         for cols in [1, 80, 328, 360, 500] {
             let mut workspace = WorkspaceUi::new();
             workspace.mux = Some(mux(
@@ -15581,7 +15575,13 @@ mod tests {
             .textures_delta
             .clear();
             let target = &workspace.staged_terminal_resizes[&session];
-            assert_eq!(target.cols as usize, cols, "원래 표의 폭은 유지해야 한다");
+            if let Some(expected) = pane_cols {
+                assert_eq!(
+                    target.cols, expected,
+                    "같은 pane 폭은 복원 열 수와 무관해야 한다"
+                );
+            }
+            pane_cols = Some(target.cols);
             // 숫자를 테스트에 복사하지 않고 실제 런타임 명령 입장 검사를 통과해야 한다.
             let mut command = RuntimeCommand::Resize {
                 session,

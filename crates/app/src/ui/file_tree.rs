@@ -2224,9 +2224,6 @@ impl FileTreeUi {
                             }
                             let active_color =
                                 workspace_accent(sidebar.workspaces, sidebar.active_workspace_id);
-                            // 활성 그룹 배경 자리. 내용보다 **먼저** painter에 넣어 두고
-                            // 크기가 정해진 뒤 실제 도형으로 바꾼다 — 나중에 그리면 글자를 덮는다.
-                            let active_background = ui.painter().add(egui::Shape::Noop);
                             let active_inner = ui.scope(|ui| {
                                 if let Some(active) = active {
                                     let expanded = self
@@ -2540,15 +2537,6 @@ impl FileTreeUi {
                                         });
                                 }
                             });
-                            if active.is_some() {
-                                paint_active_group_background(
-                                    ui,
-                                    ui.ctx().pixels_per_point(),
-                                    active_background,
-                                    active_inner.response.rect,
-                                    active_color,
-                                );
-                            }
                             paint_workspace_group_separator(ui, active_inner.response.rect);
                             if active.is_some() {
                                 group_rects.push((
@@ -5144,52 +5132,10 @@ fn collapsed_status_dot(
     }
 }
 
-/// 지금 작업 중인 워크스페이스 **그룹 전체**(헤더 + 세션 목록)에 배경을 깐다.
-///
-/// 예전에는 29px 헤더 한 줄만 칠했다. 그런데 비활성 행의 hover 색과 밝기가 거의 같아,
-/// 워크스페이스 두 곳이 함께 펼쳐지면 어느 쪽에서 일하고 있는지 화면이 말해주지 못했다
-/// (2026-09-03 신고 → 2026-09-04에 원인 확정). 헤더보다 **약하게** 칠해 헤더가 여전히
-/// 그룹의 머리로 읽히게 하고, 워크스페이스 고유색을 옅게 섞어 "이 색의 작업 공간"임을 잇는다.
-fn paint_active_group_background(
-    ui: &egui::Ui,
-    ppp: f32,
-    slot: egui::layers::ShapeIdx,
-    rect: egui::Rect,
-    accent: egui::Color32,
-) {
-    if rect.height() <= 0.0 || rect.width() <= 0.0 {
-        return;
-    }
-    let fill = active_group_fill(crate::ui::designall::tokens(ui.visuals()), accent);
-    ui.painter().set(
-        slot,
-        egui::Shape::rect_filled(crate::ui::snap_rect_to_pixel(ppp, rect), 3.0, fill),
-    );
-}
-
-/// 활성 그룹 배경색. 사다리(`사이드바_밝기_사다리는_보고_있는_것을_가장_밝게_둔다`)가
-/// 이 값을 직접 재기 때문에 그리기와 분리해 둔다.
-fn active_group_fill(tokens: crate::ui::designall::Tokens, accent: egui::Color32) -> egui::Color32 {
-    let base = crate::ui::designall::mix(
-        tokens.workspace_background,
-        tokens.selected_background,
-        ACTIVE_GROUP_LIFT,
-    );
-    crate::ui::designall::mix(base, accent, ACTIVE_GROUP_ACCENT_TINT)
-}
-
-/// 활성 그룹 배경이 사이드바 바탕에서 얼마나 들리는지. 헤더의 틴트보다 낮아야 헤더가
-/// 그룹 안에서 여전히 구분된다.
-const ACTIVE_GROUP_LIFT: f32 = 0.55;
-/// 그 위에 섞는 워크스페이스 고유색의 양. 색을 알아볼 수 있되 글자 대비를 해치지 않는 선.
-const ACTIVE_GROUP_ACCENT_TINT: f32 = 0.05;
-
 /// 활성 워크스페이스가 바뀌었을 때 사이드바의 세션 펼침 상태를 정리한다.
 ///
-/// **떠나는 워크스페이스는 접지 않는다.** 실행 중인 세션은 다른 곳으로 옮겨가도 계속 보여야
-/// 한다(2026-09-04 사용자). 두 곳이 동시에 펼쳐지는 것 자체는 문제가 아니었다 — 2026-09-03에
-/// 신고된 "어느 쪽을 보고 있는지 모르겠다"의 원인은 펼침이 아니라 **배경색**이었고, 그건
-/// 활성 그룹 전체를 칠하는 것으로 따로 고쳤다(`paint_active_group_background`).
+/// 떠나는 워크스페이스도 펼침 상태를 유지한다. 현재 세션은 행의 선택 배경으로 구분하고,
+/// 선택하지 않은 세션은 소속 워크스페이스와 관계없이 같은 바탕을 쓴다.
 ///
 /// 활성이 **바뀌는 순간에만** 돈다 — 전환 사이에 사용자가 직접 접거나 편 것은 그대로 산다.
 fn sync_workspace_expansion_on_switch(
@@ -5924,13 +5870,7 @@ struct SessionRowFill {
     full_bleed: bool,
 }
 
-/// 「보고 있는 세션」 면이 `selected_background`에서 글자색 쪽으로 더 들리는 양.
-///
-/// **활성 그룹 배경보다 확실히 밝아야 한다.** 2026-09-04에 활성 그룹 배경을 넣으면서
-/// 그 값(L 38.5)이 `selected_background`(L 35.9)를 **넘어서**, 보고 있는 세션 행이
-/// 오히려 주변보다 어두운 얼룩이 됐다 — 2026-08-20에 이 표시를 넣은 이유가 그대로
-/// 되살아났다(사용자: 어느 것을 보고 있는지 화면이 말해주지 않는다). 사다리는
-/// `사이드바_밝기_사다리는_보고_있는_것을_가장_밝게_둔다`가 8색 accent 전부에서 고정한다.
+/// 현재 세션 선택면을 기본 바탕보다 밝게 표시한다. 워크스페이스 색은 섞지 않는다.
 const SESSION_FOCUSED_LIFT: f32 = 0.06;
 
 fn session_row_fill(
@@ -8316,13 +8256,7 @@ mod tests {
         assert_eq!(fill.bottom(), rect.bottom(), "면이 행 아래에 여백을 남겼다");
     }
 
-    /// 사이드바 밝기 사다리 — **지금 보고 있는 것이 가장 밝다**.
-    ///
-    /// 바탕 < 비활성 hover < 활성 그룹 배경 < 보고 있는 세션 행 < 활성 워크스페이스 헤더.
-    /// 2026-09-04에 활성 그룹 배경을 넣으면서 이 순서가 뒤집혀(그룹 38.5 > 포커스 행 35.9)
-    /// 보고 있는 세션이 화면에서 사라졌다. 사람 눈으로는 "좀 칙칙하네" 정도라 놓치기
-    /// 쉬우므로 숫자로 고정한다. accent 8색 **전부**에서 성립해야 한다 — 그룹 배경과
-    /// 헤더는 워크스페이스 고유색을 섞으므로 색마다 밝기가 다르다.
+    /// 선택 세션은 바탕·hover보다 밝고, 워크스페이스 헤더와 구분된다.
     #[test]
     fn 사이드바_밝기_사다리는_보고_있는_것을_가장_밝게_둔다() {
         fn luminance(color: egui::Color32) -> f32 {
@@ -8344,7 +8278,6 @@ mod tests {
 
         for (index, (r, g, b)) in WORKSPACE_ACCENT_PALETTE.iter().enumerate() {
             let accent = egui::Color32::from_rgb(*r, *g, *b);
-            let group = luminance(active_group_fill(tokens, accent));
             let header = luminance(
                 workspace_row_style(tokens, accent, true, false)
                     .fill
@@ -8352,12 +8285,8 @@ mod tests {
             );
 
             assert!(
-                hover < group,
-                "accent {index}: 활성 그룹({group})이 비활성 hover({hover})와 구분되지 않는다"
-            );
-            assert!(
-                group + 4.0 < focused,
-                "accent {index}: 보고 있는 세션({focused})이 활성 그룹({group}) 위로 충분히 뜨지 않는다"
+                hover < focused,
+                "accent {index}: 선택 세션({focused})은 hover({hover})보다 밝아야 한다"
             );
             assert!(
                 focused < header,

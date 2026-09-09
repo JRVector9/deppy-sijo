@@ -2743,3 +2743,22 @@
 - 재실행 완료: 기존 PID 99747의 정확한 경로를 재확인한 뒤 SIGTERM으로 종료됨을 확인했다. `open '/private/tmp/deppy-env-main-20260909/target/bundle/Deppy Sijo.app'` 성공. 새 PID 38141이 실제 `/private/tmp/deppy-ready-prs-integration-target/bundle/Deppy Sijo.app/Contents/MacOS/deppy-sijo` 경로에서 실행 중임을 11초 후 확인했다. 이전 빌드 앱 대신 main 수정 포함 빌드가 실행 중이다.
 - merge 후 실행 목록에는 Build and test/Dependency security만 있었다. relay-release/relay-shell-release는 workflow_dispatch 전용임을 확인했고 배포를 실행하지 않았다. 현재 사용자 요청인 main 머지·빌드·재실행 모두 완료했다. 화면과 사용 중 동작 확인은 사용자가 진행하며 자동 화면 검증 PASS로 기록하지 않는다.
 - 수정 파일은 이 handoff뿐이며 문서 commit은 실행 코드가 같아 재빌드를 반복하지 않는다. 다음 에이전트는 `cd /private/tmp/deppy-env-main-20260909`; `git status --short`; `git log -2 --oneline`; `pgrep -x deppy-sijo`; `ps -o pid=,etime=,command= -p <현재PID>`로 현재 main/실행 상태를 확인한다. 새 버그 피드백 없으면 추가 수정·빌드·재실행이 필요하지 않다.
+
+## 2026-09-09 Cursor 사용량 상태바 착수
+
+- 목표: 설치·활성화된 Cursor CLI 계정의 실제 사용량을 Claude/Grok/Codex/Kimi와 같은
+  터미널 하단 provider 영역에 표시한다. Cursor 개인 Pro+ 계정은 주간 창 대신 월간
+  결제 주기 Included 사용률을 제공하므로 `월 N%`로 명시한다.
+- 현재 branch/worktree: `feat/cursor-usage-status`,
+  `/private/tmp/deppy-env-main-20260909`, base main `b698ca7`.
+- 설계: `docs/superpowers/specs/2026-09-09-cursor-usage-status-design.md`.
+  구현 계획: `docs/superpowers/plans/2026-09-09-cursor-usage-status.md`.
+- 보안 경계: 런처가 감지한 공식 `cursor-agent`를 격리 PTY에서 실행해 `/usage` 화면만
+  읽는다. Cursor 토큰·SQLite·설정 파일·비공개 RPC는 읽지 않는다. 100 KiB 출력,
+  25초 timeout, 5분 갱신을 적용한다.
+- 실측 근거: 별도 진단 PTY에서 Pro+, Included 13%, Auto 14%, API 3%, Oct 4 reset,
+  On-Demand Disabled를 확인했다. 진단 프로세스는 정확한 PID로 종료했다.
+- 현재 실행 앱 PID 38141은 main `ccb7afd` package이며 변경하지 않는다. 사용자 규칙에
+  따라 구현·리뷰·PR을 먼저 완료하고 재빌드·재실행은 별도 승인 전 수행하지 않는다.
+- 다음 명령: parser RED 테스트를 추가하고
+  `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo test --locked -p deppy-sijo --bin deppy-sijo cursor_usage::tests -- --test-threads=1`.

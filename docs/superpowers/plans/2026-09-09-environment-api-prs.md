@@ -6,11 +6,13 @@
 
 **기술:** Rust, egui, SQLite, macOS Keychain, 기존 bounded settings/dotenv worker.
 
-**권한/범위:** 사용자가 PR 단위 정리와 구현 착수를 요청했다. PR 1부터 순차 구현한다. 이번 단계에서 앱을 패키징하거나 재실행하지 않는다. 기존 `fix/settings-copy-session-background` 미커밋 화면 수정은 별도로 유지한다. main 자동 머지는 하지 않는다.
+**현재 상태(2026-09-09):** #179~183 main 머지 완료. 기존 화면 보존 #184도 머지했다. 최신 사용자 지시에 따라 재빌드까지만 수행하고 재실행은 대기한다.
+
+**초기 권한/범위:** 사용자가 PR 단위 정리와 구현 착수를 요청했다. PR 1부터 순차 구현한다. 이번 단계에서 앱을 패키징하거나 재실행하지 않는다. 기존 `fix/settings-copy-session-background` 미커밋 화면 수정은 별도로 유지한다. main 자동 머지는 하지 않는다.
 
 ## PR 1 — 설정 조회 상태와 오류 수명 수정
 
-- GitHub PR: #179 (draft), 구현 commit `7f3fb81`.
+- GitHub PR: #179 (main 머지 완료), 구현 commit `7f3fb81`.
 - 브랜치: `fix/environment-snapshot-state`, base `main`.
 - 파일: `crates/app/src/settings_snapshot.rs`, `main.rs`, `app.rs`, `ui/env_profiles.rs`, `ui/credentials.rs`.
 - [x] 기존 코드에서 정상 snapshot 수신 후 오류가 남는 상태 전이 테스트를 실패시킨다.
@@ -23,7 +25,7 @@
 
 ## PR 2 — 파일 삭제와 동기화 상태 일관성
 
-- 구현 완료: #180 (draft), commit `49ad36f`. 화면 검증 대기.
+- 구현 완료: #180 (main 머지 완료), commit `49ad36f`. 화면 검증 대기.
 
 - 브랜치: `fix/environment-file-consistency`, base PR 1.
 - 파일: `crates/app/src/dotenv_sync.rs`, `app.rs`, `ui/env_profiles.rs`, 로케일 5개.
@@ -34,7 +36,7 @@
 
 ## PR 3 — API credential과 Agent 환경 연결
 
-- 구현 완료: #181 (draft), commit `b21aec5`. API 연결이 있는 프로젝트는 eval 기반 셸 라이브 반영을 끄며 새 실행부터 적용한다.
+- 구현 완료: #181 (main 머지 완료), commit `b21aec5`. API 연결이 있는 프로젝트는 eval 기반 셸 라이브 반영을 끄며 새 실행부터 적용한다.
 
 - 브랜치: `feat/workspace-credential-env`, base PR 2.
 - 파일: `crates/storage/src/db.rs` 및 기존 migration 체계, `crates/app/src/app.rs`, `ui/credentials.rs`, `crates/runtime/src/in_process.rs`, 로케일 5개.
@@ -46,7 +48,7 @@
 
 ## PR 4 — 환경파일 선택과 출처
 
-- 구현 완료: #182 (draft), commit `2b2c6c8`. 첫 범위는 루트의 영문·숫자·._- 파일명 16개까지다. 하위 경로는 지원하지 않는다. 빈 목록과 루트 연결 해제는 복원에서도 파일을 주입하지 않는다.
+- 구현 완료: #182 (main 머지 완료), commit `2b2c6c8`. 첫 범위는 루트의 영문·숫자·._- 파일명 16개까지다. 하위 경로는 지원하지 않는다. 빈 목록과 루트 연결 해제는 복원에서도 파일을 주입하지 않는다.
 
 - 브랜치: `feat/workspace-env-sources`, base PR 3.
 - 파일: storage migration, `runtime/src/dotenv.rs`, `app/src/dotenv_sync.rs`, `app.rs`, `ui/env_profiles.rs`, watcher 연결, 로케일 5개.
@@ -58,7 +60,7 @@
 
 ## PR 5 — Agent 적용 상태
 
-- 구현 완료: #183 (draft), commit `2868f25`. 소스 리뷰 반영·로직 검증 완료. 화면 검증 대기. 실제 spawn ACK와 기본환경 처리 ACK를 구분하고, 비밀값 대신 physical slot 세대를 버전에 포함한다.
+- 구현 완료: #183 (main 머지 완료), commit `2868f25`. 소스 리뷰 반영·로직 검증 완료. 화면 검증 대기. 실제 spawn ACK와 기본환경 처리 ACK를 구분하고, 비밀값 대신 physical slot 세대를 버전에 포함한다.
 
 - 브랜치: `feat/environment-application-status`, base PR 4.
 - 파일: `runtime/src/command.rs`, `runtime/src/event.rs`, `in_process.rs`, `app.rs`, 환경 설정 snapshot/UI, 로케일 5개.

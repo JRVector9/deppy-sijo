@@ -2654,3 +2654,18 @@
 - main 통합 사전 검사 보완: xtask check-boundary가 UI의 storage::Db 정적 검증 호출을 발견했다. 이름 검증을 deppy_core::credential_env의 순수 함수로 옮겨 UI/저장소가 같은 규칙을 사용한다. 기존 문자/길이 계약은 그대로다. 이전 fmt/clippy/i18n 통과가 boundary 통과를 의미하지 않았으며 이 누락을 수정 중이다.
 
 - PR 3 경계 보완은 storage 연결 회귀 3 PASS와 check-boundary PASS 뒤 ee52883으로 기록했다. PR 4는 해당 commit을 merge로 받아 core 모듈 선언/handoff 충돌에서 양쪽 내용을 모두 보존했다. 파일 선택 UI도 기존 core 순수 함수 직접 호출로 변경했다. rebase/force-push는 사용하지 않았다.
+
+## 2026-09-09 main 머지 완료 · 재실행 보류
+
+- 최신 사용자 지시: 머지와 재빌드까지만 완료하고 재실행은 대기한다. 기존 앱 PID 99747을 종료하지 않는다. 이전 재실행 승인은 이번 지시로 보류되었다.
+- #179~183 및 기존 화면 보존 #184 모두 merge commit 방식으로 main에 반영했다. 코드 기준 `16505ea`, 실제 main worktree `/private/tmp/deppy-env-main-20260909`. 로컬 main도 origin/main까지 fast-forward했다. 원본 `/Users/jr/Desktop/projects/deppy-sijo`의 Relay 작업 branch와 기존 UI dirty worktree는 변경하지 않았다.
+- 경계 보완: #181 ee52883에서 API 환경 이름 검증을 core 순수 함수로 옮겼고, #182 4a5409a에서 파일 목록 검증 UI 호출도 순수 core 함수로 통일했다. #183 502f71c로 전파했다. core 모듈 선언과 handoff의 merge 충돌은 양쪽 내용 보존으로 해결했으며 rebase/force-push는 하지 않았다.
+- 검증: storage credential_env 3 PASS, 최종 통합 workspace clippy all-targets PASS(15.13초), check-boundary PASS, fmt/diff PASS. 기존 환경 구현의 runtime 307 및 관련 targeted 결과는 앞 절 참조. UI 회귀/전체 테스트는 반복하지 않았다. audit 취약점 0(기존 yanked 경고), deny bans/licenses/sources PASS. 변경 없는 Relay Linux/WebCrypto 테스트를 이번에 실행했다고 주장하지 않는다.
+- GitHub 실패는 초기 30개, 변경된 PR 3개 18개, #184 6개 모두 runner_id=0/steps=0/billing annotation으로 미실행 확인했다. 증거 `/tmp/deppy-env-merge-ci-evidence.json`, `/tmp/deppy-env-merge-ci-updated.json`, `/tmp/deppy-env-merge-ci-184.json`. main 보호 상세 API는 플랜 403, branch protected=false 확인. 일반 merge로 진행했고 관리자 우회는 없다. 실행 목록에 배포 workflow는 없으며 별도 배포는 하지 않았다.
+- 실패 접근: 최초 #179 merge에서 수동 SHA 조합이 잘못돼 expectedHeadOid 검증으로 거부되었다. 어떤 merge도 실행되지 않았고, git rev-parse의 실제 전체 SHA로 재실행해 성공했다.
+- 현재 빌드: main에서 Developer ID 서명 로컬 release package 진행(`/tmp/deppy-env-main-package.log`). `target`은 `/private/tmp/deppy-ready-prs-integration-target`을 가리키며 기존 실행 앱의 bundle 위치와 다르다. 성공 전 빌드 PASS를 기록하지 않는다.
+- 다음 명령: `tail -n 30 /tmp/deppy-env-main-package.log`; 정지 의심 시 `ps -axo pid,ppid,%cpu,state,etime,comm`; 성공 후 `codesign --verify --deep --strict --verbose=2 'target/bundle/Deppy Sijo.app'`; `pgrep -x deppy-sijo`. 사용자 후속 재실행 요청 전 kill/open/dev-run.sh 실행 금지.
+
+- 최종 빌드 PASS: 코드 기준 main `16505ea`, release 5분 14초, package script exit 0(`/tmp/deppy-env-main-package.log`). Developer ID Application: VectorNine INC (ZDTU5LS35K), bundle identifier app.vector9.deppy-sijo 유지. 서명/ZIP 재추출 검증 및 별도 codesign --verify --deep --strict 모두 PASS. 로컬 개발 패키지이며 Apple 공증은 이번에 수행하지 않았다.
+- 산출물: `/private/tmp/deppy-env-main-20260909/target/bundle/Deppy Sijo.app` 및 `.zip`(실제 target `/private/tmp/deppy-ready-prs-integration-target`). 실행한 바이너리와 혼동하지 않는다. 기존 앱은 `/private/tmp/deppy-settings-session-background-20260909/target/bundle/Deppy Sijo.app/Contents/MacOS/deppy-sijo`, PID 99747 그대로다. 새 앱 실행/기존 앱 종료는 하지 않았다.
+- 남은 작업은 사용자 재실행 요청 대기 및 이후 실제 화면 확인이다. 구현/머지/재빌드는 완료했다. 후속 요청 전 재빌드 반복·재실행 불필요. 재실행 승인 시 먼저 `pgrep -x deppy-sijo`와 `ps -o pid=,etime=,command= -p <확인한PID>`로 현 앱을 식별한 뒤 정확한 PID만 종료하고 위 새 bundle을 open한다.

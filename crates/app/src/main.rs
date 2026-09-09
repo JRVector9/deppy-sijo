@@ -52,6 +52,7 @@ mod scrollback_policy;
 // Relay 페어링 의식 상태 기계(Task 5). 설정 화면이 투영을 읽고, 데이터 평면 배선(Task 6)이
 // 기기 제시 경로를 부른다.
 mod relay_pairing;
+mod settings_snapshot;
 mod shortcuts;
 mod status_feed;
 mod tailscale;

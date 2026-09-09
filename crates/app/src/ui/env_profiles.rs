@@ -1,3 +1,4 @@
+use crate::settings_snapshot::SnapshotLoadState;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -132,7 +133,7 @@ impl std::error::Error for EnvSnapshotError {}
 /// Bounded immutable render input. Secret plaintext is never part of this snapshot.
 pub struct EnvProfilesSnapshot {
     revision: u64,
-    available: bool,
+    state: SnapshotLoadState,
     workspace_id: Arc<str>,
     project_root_configured: bool,
     dotenv_profile_id: Option<Arc<str>>,
@@ -172,13 +173,24 @@ impl EnvProfilesSnapshot {
         }
         Ok(Self {
             revision,
-            available: true,
+            state: SnapshotLoadState::Ready,
             workspace_id,
             project_root_configured,
             dotenv_profile_id,
             dotenv_vars: dotenv_vars.into(),
             legacy_vars: legacy_vars.into(),
         })
+    }
+
+    pub fn loading(
+        revision: u64,
+        workspace_id: impl Into<Arc<str>>,
+        project_root_configured: bool,
+    ) -> Self {
+        Self {
+            state: SnapshotLoadState::Loading,
+            ..Self::unavailable(revision, workspace_id, project_root_configured)
+        }
     }
 
     pub fn unavailable(
@@ -188,7 +200,7 @@ impl EnvProfilesSnapshot {
     ) -> Self {
         Self {
             revision,
-            available: false,
+            state: SnapshotLoadState::Failed,
             workspace_id: workspace_id.into(),
             project_root_configured,
             dotenv_profile_id: None,
@@ -202,7 +214,7 @@ impl EnvProfilesSnapshot {
     }
 
     pub const fn is_available(&self) -> bool {
-        self.available
+        matches!(self.state, SnapshotLoadState::Ready)
     }
 
     pub fn workspace_id(&self) -> &str {
@@ -318,6 +330,10 @@ pub enum EnvUiErrorCode {
     RevealFailed,
     RevealCapacityExceeded,
     LegacyDeleteFailed,
+    DotenvWriteFailed,
+    DotenvSyncFailed,
+    ProjectPathFailed,
+    ActionQueueBusy,
 }
 
 impl EnvUiErrorCode {
@@ -327,6 +343,10 @@ impl EnvUiErrorCode {
             Self::RevealFailed => "Secret 값을 불러오지 못했습니다.",
             Self::RevealCapacityExceeded => "동시에 표시할 수 있는 secret 상한을 초과했습니다.",
             Self::LegacyDeleteFailed => "레거시 환경 변수 삭제에 실패했습니다.",
+            Self::DotenvWriteFailed => "환경파일 변경을 저장하지 못했습니다.",
+            Self::DotenvSyncFailed => "환경파일을 동기화하지 못했습니다.",
+            Self::ProjectPathFailed => "프로젝트 경로를 저장하지 못했습니다.",
+            Self::ActionQueueBusy => "다른 설정 작업을 처리 중입니다. 잠시 후 다시 시도하세요.",
         }
     }
 }
@@ -408,6 +428,13 @@ impl EnvProfilesUi {
         self.error = Some(code);
     }
 
+    /// 성공한 작업에 해당하는 오류만 해제한다.
+    pub fn clear_error(&mut self, code: EnvUiErrorCode) {
+        if self.error == Some(code) {
+            self.error = None;
+        }
+    }
+
     /// Pure render path: consumes no service and returns at most one intent.
     pub fn contents_compact(
         &mut self,
@@ -421,7 +448,11 @@ impl EnvProfilesUi {
         let mut intent = None;
 
         if !snapshot.is_available() {
-            self.error = Some(EnvUiErrorCode::SnapshotUnavailable);
+            if snapshot.state == SnapshotLoadState::Loading {
+                ui.spinner();
+            }
+            self.render_error(ui);
+            return None;
         }
         if !snapshot.project_root_configured() {
             super::section_header(ui, &catalog.t("env.env_vars", &[]), None, None);
@@ -514,6 +545,9 @@ impl EnvProfilesUi {
     }
 
     fn sync_snapshot_state(&mut self, snapshot: &EnvProfilesSnapshot) {
+        snapshot
+            .state
+            .reconcile_error(&mut self.error, EnvUiErrorCode::SnapshotUnavailable);
         let workspace_changed = self.snapshot_workspace.as_deref() != Some(snapshot.workspace_id());
         if workspace_changed {
             self.snapshot_workspace = Some(snapshot.workspace_id().to_owned());
@@ -1111,6 +1145,121 @@ mod tests {
             )
             .unwrap()
         }
+    }
+
+    #[test]
+    fn settings_load_파일작업_실패는_정상목록에도_남고_해당작업_성공때만_지운다() {
+        let ready = EnvProfilesSnapshot::try_new(
+            8,
+            "workspace",
+            true,
+            None::<String>,
+            0,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        for failure in [
+            EnvUiErrorCode::DotenvWriteFailed,
+            EnvUiErrorCode::DotenvSyncFailed,
+            EnvUiErrorCode::ProjectPathFailed,
+            EnvUiErrorCode::ActionQueueBusy,
+        ] {
+            let mut view = EnvProfilesUi::new();
+            view.report_error(failure);
+            view.sync_snapshot_state(&ready);
+            assert_eq!(view.error, Some(failure));
+            view.clear_error(EnvUiErrorCode::SnapshotUnavailable);
+            assert_eq!(view.error, Some(failure));
+            view.clear_error(failure);
+            assert_eq!(view.error, None);
+        }
+    }
+
+    #[test]
+    fn settings_load_로딩과_빈_정상목록은_오류가_아니다() {
+        let mut view = EnvProfilesUi::new();
+        view.report_error(EnvUiErrorCode::SnapshotUnavailable);
+        let loading = EnvProfilesSnapshot::loading(8, "workspace", true);
+        view.sync_snapshot_state(&loading);
+        assert!(!loading.is_available());
+        assert_eq!(view.error, None);
+        let ready = EnvProfilesSnapshot::try_new(
+            8,
+            "workspace",
+            true,
+            None::<String>,
+            0,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        view.sync_snapshot_state(&ready);
+        assert!(ready.is_available());
+        assert_eq!(view.error, None);
+    }
+
+    #[test]
+    fn settings_load_실제실패는_오류를_남기고_재조회성공으로_복구한다() {
+        let mut view = EnvProfilesUi::new();
+        let failed = EnvProfilesSnapshot::unavailable(8, "workspace", true);
+        view.sync_snapshot_state(&failed);
+        assert_eq!(view.error, Some(EnvUiErrorCode::SnapshotUnavailable));
+        let ready = EnvProfilesSnapshot::try_new(
+            8,
+            "workspace",
+            true,
+            None::<String>,
+            0,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        view.sync_snapshot_state(&ready);
+        assert_eq!(view.error, None);
+    }
+
+    #[test]
+    fn settings_load_조회상태변경은_별도_작업오류를_지우지_않는다() {
+        let mut view = EnvProfilesUi::new();
+        view.report_error(EnvUiErrorCode::LegacyDeleteFailed);
+        for snapshot in [
+            EnvProfilesSnapshot::loading(8, "workspace", true),
+            EnvProfilesSnapshot::unavailable(8, "workspace", true),
+            EnvProfilesSnapshot::try_new(
+                8,
+                "workspace",
+                true,
+                None::<String>,
+                0,
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap(),
+        ] {
+            view.sync_snapshot_state(&snapshot);
+            assert_eq!(view.error, Some(EnvUiErrorCode::LegacyDeleteFailed));
+        }
+    }
+
+    #[test]
+    fn settings_load_성공하면_이전_조회_오류를_지운다() {
+        let mut view = EnvProfilesUi::new();
+        let ready = EnvProfilesSnapshot::try_new(
+            7,
+            "workspace",
+            true,
+            None::<String>,
+            0,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        view.sync_snapshot_state(&ready);
+        view.report_error(EnvUiErrorCode::SnapshotUnavailable);
+        // 같은 revision에서도 정상 결과를 반영하면 오래된 조회 오류가 남지 않는다.
+        view.sync_snapshot_state(&ready);
+        assert_eq!(view.error, None);
     }
 
     #[test]

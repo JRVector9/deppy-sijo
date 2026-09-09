@@ -3589,6 +3589,12 @@ fn load_environment_snapshots(
         Ok((env, credentials))
     })();
     loaded.unwrap_or_else(|_| {
+        // DB 오류 문자열에는 원본 값이 포함될 수 있어 고정 코드만 기록한다.
+        tracing::warn!(
+            kind = "settings",
+            phase = "environment_snapshot",
+            error_code = "snapshot_load_failed"
+        );
         (
             ui::env_profiles::EnvProfilesSnapshot::unavailable(
                 revision,
@@ -3613,6 +3619,14 @@ fn load_settings_snapshots(
         env,
         credentials,
     }
+}
+
+/// 정상 결과 객체 안의 실패 snapshot도 DB 열기 실패와 동일하게 재시도한다.
+fn settings_snapshot_retry_delay(snapshots: &SettingsSnapshots) -> Option<std::time::Duration> {
+    (!(snapshots.agents.is_available()
+        && snapshots.env.is_available()
+        && snapshots.credentials.is_available()))
+    .then_some(std::time::Duration::from_secs(1))
 }
 
 fn validate_settings_registration(
@@ -14116,12 +14130,12 @@ impl App {
             settings_snapshot_retry_at: None,
             settings_snapshot_workspace_id: None,
             agents_snapshot: ui::agents::AgentsSnapshot::unavailable(0),
-            env_profiles_snapshot: ui::env_profiles::EnvProfilesSnapshot::unavailable(
+            env_profiles_snapshot: ui::env_profiles::EnvProfilesSnapshot::loading(
                 0,
                 workspace_id.clone(),
                 false,
             ),
-            credentials_snapshot: ui::credentials::CredentialsSnapshot::unavailable(0),
+            credentials_snapshot: ui::credentials::CredentialsSnapshot::loading(0),
             agent_sessions_secrets_snapshot,
             db,
             secret_store: KeyringSecretStore,
@@ -24548,13 +24562,13 @@ impl App {
             .as_deref()
             .unwrap_or(&self.active.id)
             .to_owned();
-        self.env_profiles_snapshot = ui::env_profiles::EnvProfilesSnapshot::unavailable(
+        self.env_profiles_snapshot = ui::env_profiles::EnvProfilesSnapshot::loading(
             self.settings_snapshot_revision,
             workspace_id,
             false,
         );
         self.credentials_snapshot =
-            ui::credentials::CredentialsSnapshot::unavailable(self.settings_snapshot_revision);
+            ui::credentials::CredentialsSnapshot::loading(self.settings_snapshot_revision);
         self.credentials_ui.clear_revealed_secrets();
         self.env_secret_generation = self.env_secret_generation.wrapping_add(1);
     }
@@ -24583,13 +24597,13 @@ impl App {
             self.env_profiles_ui.invalidate_cache();
             self.agents_snapshot =
                 ui::agents::AgentsSnapshot::unavailable(self.settings_snapshot_revision);
-            self.env_profiles_snapshot = ui::env_profiles::EnvProfilesSnapshot::unavailable(
+            self.env_profiles_snapshot = ui::env_profiles::EnvProfilesSnapshot::loading(
                 self.settings_snapshot_revision,
                 workspace_id,
                 project_root.is_some(),
             );
             self.credentials_snapshot =
-                ui::credentials::CredentialsSnapshot::unavailable(self.settings_snapshot_revision);
+                ui::credentials::CredentialsSnapshot::loading(self.settings_snapshot_revision);
         }
         if self.settings_snapshot_pending {
             return;
@@ -25123,12 +25137,14 @@ impl App {
             let is_load = matches!(&outcome.kind, SettingsOutcomeKind::Loaded);
             if projection_current {
                 if let Some(snapshots) = outcome.snapshots {
+                    let retry = settings_snapshot_retry_delay(&snapshots);
                     self.agents_snapshot = snapshots.agents;
                     self.env_profiles_snapshot = snapshots.env;
                     self.credentials_snapshot = snapshots.credentials;
-                    if is_load {
-                        self.settings_snapshot_retry_at = None;
-                    }
+                    self.settings_snapshot_retry_at = retry.map(|delay| {
+                        self.egui_ctx.request_repaint_after(delay);
+                        std::time::Instant::now() + delay
+                    });
                 } else if is_load {
                     self.agents_snapshot =
                         ui::agents::AgentsSnapshot::unavailable(outcome.revision);
@@ -25287,8 +25303,10 @@ impl App {
                 SettingsOutcomeKind::DotenvWritten(result) => {
                     if result.is_err() {
                         self.env_profiles_ui
-                            .report_error(ui::env_profiles::EnvUiErrorCode::SnapshotUnavailable);
+                            .report_error(ui::env_profiles::EnvUiErrorCode::DotenvWriteFailed);
                     } else {
+                        self.env_profiles_ui
+                            .clear_error(ui::env_profiles::EnvUiErrorCode::DotenvWriteFailed);
                         self.sync_settings_workspace_dotenv(&outcome.workspace_id);
                         self.invalidate_env_api_projects();
                     }
@@ -25296,8 +25314,10 @@ impl App {
                 SettingsOutcomeKind::DotenvResynced(result) => {
                     if result.is_err() {
                         self.env_profiles_ui
-                            .report_error(ui::env_profiles::EnvUiErrorCode::SnapshotUnavailable);
+                            .report_error(ui::env_profiles::EnvUiErrorCode::DotenvSyncFailed);
                     } else {
+                        self.env_profiles_ui
+                            .clear_error(ui::env_profiles::EnvUiErrorCode::DotenvSyncFailed);
                         self.credentials_ui.invalidate_cache();
                         self.invalidate_env_api_projects();
                     }
@@ -25305,9 +25325,11 @@ impl App {
                 SettingsOutcomeKind::ProjectPathSet(result) => {
                     let Ok(row) = result else {
                         self.env_profiles_ui
-                            .report_error(ui::env_profiles::EnvUiErrorCode::SnapshotUnavailable);
+                            .report_error(ui::env_profiles::EnvUiErrorCode::ProjectPathFailed);
                         continue;
                     };
+                    self.env_profiles_ui
+                        .clear_error(ui::env_profiles::EnvUiErrorCode::ProjectPathFailed);
                     let path = PathBuf::from(&row.path);
                     self.upsert_workspace_projection(row);
                     self.dismissed_renames.remove(&outcome.workspace_id);
@@ -32006,7 +32028,10 @@ impl eframe::App for App {
                 };
                 if !queued {
                     self.env_profiles_ui
-                        .report_error(ui::env_profiles::EnvUiErrorCode::SnapshotUnavailable);
+                        .report_error(ui::env_profiles::EnvUiErrorCode::ActionQueueBusy);
+                } else {
+                    self.env_profiles_ui
+                        .clear_error(ui::env_profiles::EnvUiErrorCode::ActionQueueBusy);
                 }
             }
         }
@@ -42767,6 +42792,25 @@ mod tests {
         );
         assert_eq!(tracker.denial_retries.len(), 1);
         assert_eq!(tracker.live.len(), 1);
+    }
+
+    #[test]
+    fn settings_load_일부_snapshot_실패도_재시도하고_정상이면_멈춘다() {
+        let path = temp_db_path("settings-load-retry");
+        let db = Db::open(&path).unwrap();
+        let workspace = db.create_workspace("settings-load-retry").unwrap();
+        let mut snapshots = load_settings_snapshots(&db, 1, &workspace, true);
+        assert_eq!(settings_snapshot_retry_delay(&snapshots), None);
+        snapshots.env = ui::env_profiles::EnvProfilesSnapshot::unavailable(1, &*workspace, true);
+        assert_eq!(
+            settings_snapshot_retry_delay(&snapshots),
+            Some(std::time::Duration::from_secs(1))
+        );
+        let mut snapshots = load_settings_snapshots(&db, 2, &workspace, true);
+        snapshots.credentials = ui::credentials::CredentialsSnapshot::unavailable(2);
+        assert!(settings_snapshot_retry_delay(&snapshots).is_some());
+        let snapshots = load_settings_snapshots(&db, 3, &workspace, true);
+        assert_eq!(settings_snapshot_retry_delay(&snapshots), None);
     }
 
     #[test]

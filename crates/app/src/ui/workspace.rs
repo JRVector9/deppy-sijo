@@ -4860,6 +4860,7 @@ impl WorkspaceUi {
                         search.scroll_to_current = !search.matches.is_empty();
                     }
                 }
+                RuntimeEvent::EnvironmentApplied { .. } => {}
                 RuntimeEvent::LastOutputExtracted {
                     session,
                     text,

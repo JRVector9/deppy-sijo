@@ -235,6 +235,12 @@ pub enum RuntimeEvent {
         bracketed_paste: bool,
         stamp: crate::ResizeStamp,
     },
+    /// None 세션은 기본환경 처리 ACK, Some은 실제 새 프로세스에 전달한 버전이다.
+    /// 값은 없으며 이전 variant의 wire 번호를 보존하려고 끝에 추가한다.
+    EnvironmentApplied {
+        session: Option<SessionId>,
+        revision: Option<u64>,
+    },
 }
 
 impl RuntimeEvent {
@@ -500,6 +506,7 @@ mod tests {
                 "ResizeApplied",
                 "ResizeFailed",
                 "ViewportTracked",
+                "EnvironmentApplied",
             ]
         );
     }

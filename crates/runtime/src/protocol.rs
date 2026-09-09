@@ -51,7 +51,8 @@ pub(crate) const PROTO_MAGIC: [u8; 4] = *b"DPRT";
 /// 구버전에는 실제 적용 보장을 흉내 내지 않고 기존 exact-version handshake로 거부한다.
 /// v15: 워크스페이스 API 환경 연결을 기본 env 명령에 함께 전달한다.
 /// v16: 프로젝트별 dotenv 선택 목록과 루트를 기본 환경에 포함한다.
-pub(crate) const PROTO_VERSION: u16 = 16;
+/// v17: 기본환경 버전과 실제 프로세스 적용 ACK를 전달한다.
+pub(crate) const PROTO_VERSION: u16 = 17;
 
 /// delta viewport 스트리밍 기능 비트 (§3.1).
 pub(crate) const FEAT_DELTA_VIEWPORT: u32 = 1 << 0;
@@ -494,6 +495,6 @@ mod tests {
         assert!(command_source.contains("SetScrollbackLimit"));
         assert!(event_source.contains("ScrollbackLimitApplied"));
         assert!(protocol_source.contains("**v13**"));
-        assert_eq!(PROTO_VERSION, 16);
+        assert_eq!(PROTO_VERSION, 17);
     }
 }

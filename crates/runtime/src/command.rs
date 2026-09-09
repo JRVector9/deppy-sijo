@@ -423,6 +423,8 @@ pub(crate) fn runtime_command_retained_bytes(
             retained_string(&mut total, title)?;
         }
         RuntimeCommand::SetSessionDefaultEnv {
+            secret_versions,
+            environment_revision: _,
             dotenv_source,
             api_secrets,
             env_plain,
@@ -440,6 +442,7 @@ pub(crate) fn runtime_command_retained_bytes(
                     retained_string(&mut total, file)?;
                 }
             }
+            retained_env(&mut total, secret_versions)?;
             retained_env(&mut total, env_plain)?;
             retained_env(&mut total, env_secrets)?;
             retained_env(&mut total, api_secrets)?;
@@ -562,6 +565,8 @@ pub(crate) fn canonicalize_host_command(command: &mut RuntimeCommand) {
             canonicalize_string(title);
         }
         RuntimeCommand::SetSessionDefaultEnv {
+            secret_versions,
+            environment_revision: _,
             dotenv_source,
             api_secrets,
             env_plain,
@@ -578,6 +583,7 @@ pub(crate) fn canonicalize_host_command(command: &mut RuntimeCommand) {
                     .into_boxed_slice()
                     .into_vec();
             }
+            canonicalize_env(secret_versions);
             canonicalize_env(env_plain);
             canonicalize_env(env_secrets);
             canonicalize_env(api_secrets);
@@ -759,6 +765,8 @@ pub(crate) fn validate_host_command(command: &RuntimeCommand) -> Result<(), Runt
             }
         }
         RuntimeCommand::SetSessionDefaultEnv {
+            secret_versions,
+            environment_revision: _,
             dotenv_source,
             api_secrets,
             env_plain,
@@ -770,6 +778,14 @@ pub(crate) fn validate_host_command(command: &RuntimeCommand) -> Result<(), Runt
                 }
                 storage::Db::validate_env_source_files(&source.files)
                     .map_err(|_| admission_error("runtime_env_sources_invalid"))?;
+            }
+            if secret_versions.len() > ENV_ITEMS_MAX
+                || secret_versions.iter().any(|(id, generation)| {
+                    !bounded_identifier(id, SEED_CREDENTIAL_ID_BYTES_MAX)
+                        || !bounded_identifier(generation, 4096)
+                })
+            {
+                return Err(admission_error("runtime_env_secret_versions_invalid"));
             }
             validate_env_entries_with_base(env_plain, api_secrets, env_secrets)?;
             validate_env_entries(&[], api_secrets)?;
@@ -952,6 +968,8 @@ pub enum RuntimeCommand {
     /// secret은 credential_id 참조로만 전달되고 worker가 spawn 직전에 resolve한다(6.3).
     /// **wire 계약**: postcard enum discriminant라 variant는 항상 끝에만 추가한다(codex High).
     SetSessionDefaultEnv {
+        secret_versions: Vec<(String, String)>,
+        environment_revision: Option<u64>,
         dotenv_source: Option<crate::dotenv::DotenvSourceSelection>,
         api_secrets: Vec<(String, String)>,
         env_plain: Vec<(String, String)>,
@@ -1130,12 +1148,15 @@ impl std::fmt::Debug for RuntimeCommand {
                 .field("done_regex_set", &done_regex.is_some())
                 .finish(),
             RuntimeCommand::SetSessionDefaultEnv {
+                secret_versions,
+                environment_revision: _,
                 dotenv_source,
                 api_secrets,
                 env_plain,
                 env_secrets,
             } => f
                 .debug_struct("SetSessionDefaultEnv")
+                .field("secret_version_count", &secret_versions.len())
                 .field(
                     "source_file_count",
                     &dotenv_source.as_ref().map(|s| s.files.len()),
@@ -1994,6 +2015,8 @@ mod tests {
             spare_string("value", 64 * 1024),
         ));
         let mut command = RuntimeCommand::SetSessionDefaultEnv {
+            secret_versions: Vec::new(),
+            environment_revision: None,
             dotenv_source: None,
             api_secrets: Vec::new(),
             env_plain: defaults,
@@ -2001,6 +2024,8 @@ mod tests {
         };
         canonicalize_host_command(&mut command);
         let RuntimeCommand::SetSessionDefaultEnv {
+            secret_versions: _,
+            environment_revision: _,
             dotenv_source: _,
             api_secrets,
             env_plain,

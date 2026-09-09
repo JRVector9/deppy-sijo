@@ -2602,6 +2602,47 @@
 - PR 4 리뷰 반영 재검증 PASS: app 선택/파일회귀 4, runtime 선택 복원 1(`/tmp/deppy-sources-review-fixed.log`). workspace clippy all-targets PASS(20.02초), fmt/diff PASS. i18n-check 진행 중. 선택 규칙 공용화와 Option root를 포함한 새 protocol v16은 기존 v15와 혼용하지 않는다. 화면 검증·패키징·재시작은 미실행이다.
 
 - PR 4 최종 게이트 모두 PASS: i18n-check 1142 literal keys/5 locale도 완료했다(`/tmp/deppy-sources-i18n.log`). 다음 명령은 commit/push와 #181 base draft PR 생성, 이어서 `git worktree add -b feat/environment-application-status /private/tmp/deppy-env-application-20260909 HEAD`로 PR 5를 구현한다.
+
+
+## 2026-09-09 Agent 환경 적용 상태 PR 5 착수
+
+- PR 4는 #182 https://github.com/JRVector9/deppy-sijo/pull/182, commit 2b2c6c8, draft(base #181). 현재 worktree `/private/tmp/deppy-env-application-20260909`, branch `feat/environment-application-status`.
+- 목표: 프로젝트 환경 버전과 런타임 기본값 처리 ACK, 실제 새 프로세스가 받은 버전을 구분한다. 기존 Agent 환경을 변경했다고 표시하지 않고 자동 종료/재시작하지 않는다. 복원 아카이브처럼 실행 증거가 없는 세션은 버전 미확인이다.
+- 설계: 값 없는 source metadata/연결 ID 기반 버전 표식, 기본환경 명령의 버전, 실제 spawn 성공 시 환경 적용 이벤트를 추가한다. 설정 worker 실패/성공 및 active/warm 세션 이동을 같은 상태기계로 표시한다. 실험적 zsh 훅의 삭제/문법 차이도 검증한다.
+- 현재: 순수 적용 상태의 미조회/미확인 회귀를 추가했고 RED 실행 전이다. 다음은 상태기계와 runtime 이벤트/앱 연결, 셸 라이브 반영 계약 보완, 리뷰/게이트/PR이다. 앱 패키징/재시작/머지는 하지 않는다.
+
+- PR 5 구현 checkpoint: source metadata/연결 ID만 해시한 버전 표식(비밀값 해시 없음), SetSessionDefaultEnv의 버전 및 EnvironmentApplied 이벤트를 추가(protocol v17). 기본값 처리 ACK와 실제 spawn 성공 ACK를 구분하며 archive 재생에는 실행 버전을 만들지 않는다. 복원은 버전이 있는 worker snapshot을 그대로 사용해 파일 재조회로 실행값/표식이 갈라지지 않게 한다. active/warm 상태와 세션별 실행 버전을 환경 설정에서 표시한다. 비활성 workspace 변경은 다음 실행 상태이며 무한 준비 중으로 표시하지 않는다.
+- 테스트: 미조회 상태를 준비됨으로 잘못 판단하는 RED 후 상태 2 PASS. zsh 훅 테스트는 비밀값 재주입/삭제 미반영을 실제 FAIL로 확인했다. eval을 단일 행 대입 parser로 교체하고 일반 키 삭제를 반영하며 민감 키는 새 실행으로 한정했다. 수정 후 env_reload 전체 12 PASS(`/tmp/deppy-application-hook-test.log`). 이후 큰 주석 행 파싱 최적화와 실제 spawn ACK 테스트를 추가했다.
+- compile 단계에서는 SessionId에 Ord가 없어 HashMap으로 수정하고 새 이벤트의 workspace 소비 분기를 명시했다. UI 화면/패키지 빌드/재시작은 미실행이다. 다음은 새 실제 spawn/상태/버전회귀, 소스 리뷰, 최종 게이트/PR이다.
+
+- 추가 검증 경로: spawn ACK가 pane 연결 전 MuxUpdated에 의해 지워질 수 있어 연결 전 세션은 보존하고 실제 연결/제거 때 정리하도록 수정했다. 기본환경/실제 spawn 이벤트 및 API 연결 변경 시 표식 변화 테스트를 추가했다. runtime remote 테스트의 exhaustive event-name match에 새 이벤트가 빠져 compile이 실패해 명시했고, app 테스트에서 직접 mux crate 대신 runtime 재노출 타입을 사용하도록 수정했다. 전체 runtime 검증 진행 중이며 이 중간 실패는 PASS가 아니다.
+
+- 최종 리뷰에서 High 1/Medium 3을 발견했다. (1) 일반 키의 값이 Bearer/token이면 라이브 주입되는 것을 RED로 재현해 값 패턴도 제외했다. (2) logical ID만으로는 실제 비밀 세대가 바뀔 수 있어, worker가 physical slot을 캡처해 버전에 포함하고 resolver가 실제 읽은 slot과 함께 반환하도록 변경했다. runtime은 일치하지 않으면 spawn 전에 실패하며 다음 실행에서 새 metadata를 캡처한다. pin 없는 legacy resolver의 비밀 실행은 버전 미확인이다. (3) background 실패/폐기를 현재 active가 아니라 원래 runtime에 적용하고 전환으로 취소된 준비 상태를 해제한다. (4) 실행 secret 실패를 파일 동기화 실패와 분리하고 실제 성공한 spawn ACK만 실행 실패를 해제한다.
+- 이전 PASS: runtime 전체 306, 적용/실제spawn targeted, API revision 1, env_reload 12(주석 조기 건너뛰기 후 2.10초). 위 리뷰 수정은 새 테스트/check 진행 중이며 아직 최종 PASS로 기록하지 않는다. 다음은 pin 경쟁 검증·상태 재검증·재리뷰·게이트/PR이다.
+
+- 리뷰 수정 검증 PASS: 상태/라이브 적용 app 5와 실제 spawn/비밀 회전 runtime 2(`/tmp/deppy-application-pins-test.log`), API 연결 worker/revision 1(`/tmp/deppy-application-pins-worker.log`). ordinary 키의 Bearer 값 RED 뒤 값 패턴 제외로 회귀를 통과했다. 비밀이 있는 workspace는 새 실행마다 worker에서 physical slot을 다시 캡처해 정상 token 회전이 항상 첫 실행 실패로 이어지지 않게 한다. capture→resolve 사이 회전만 spawn 전 차단한다. SeedRedaction은 새 세대 등록을 허용하며 launch pin 검증과 분리했다.
+- 중간 compile 누락: 테스트 생성자 2곳의 secret_versions와 테스트 Ordering 경로를 수정했다. 실제 앱/Keychain 사용자 값은 테스트에서 접근하지 않았다. 최종 재리뷰와 fmt/clippy/i18n/diff 게이트, runtime 전체 재검증 뒤 commit/PR한다.
+
+- 집중 재리뷰 추가 Medium 2건을 반영했다. 보관 Agent의 다시 실행도 dotenv continuation으로 보내 슬롯 회전을 재조회한다. source 실패 시 기존 아카이브는 유지하고 실패를 알린다. workspace context 변경은 이미 확정된 버전을 보존하며, 실제 취소된 pending만 지우고 runtime dotenv stamp를 무효화해 다음 실행에서 재조회한다. 완료→전환/진행중→취소 상태 회귀를 추가했다.
+- 최신 전체 회귀 PASS: runtime 307(`/tmp/deppy-application-runtime-final.log`), env_reload 12(`/tmp/deppy-application-hook-reviewed.log`), workspace_sources app 4(`/tmp/deppy-application-sources-final.log`). 위 마지막 routing/취소 변경은 targeted 재검증과 최종 게이트 전이다.
+
+
+- PR 5 최종 검증: 마지막 재실행/취소 수정 후 적용 상태 app 6/runtime 2 PASS(`/tmp/deppy-application-final-targeted.log`). workspace clippy가 중첩 if 2곳을 지적해 let chain으로 정리했고 최종 workspace all-targets clippy PASS(18.63초, `/tmp/deppy-application-clippy-final.log`). i18n-check PASS(1152 literal keys/5 locale, `/tmp/deppy-application-i18n.log`), fmt/diff PASS. 화면 회귀 테스트·앱 패키징·재실행은 수행하지 않았다.
+- 마지막 소스 확인: 새 파일선택/credential 연결/추가 완료 콜백은 해당 workspace와 generation이 현재 화면에 맞을 때만 편집 UI를 정리한다. originating workspace의 runtime 무효화는 화면 이동과 무관하게 유지한다. 이미 지적된 재실행 우회·확정 버전 삭제는 continuation/cancel_pending으로 수정했다. 이전 실패 경로 주석도 실제 stamp 무효화 동작에 맞췄다.
+- PR 5 수정 파일: app.rs, environment_application.rs(신규), env_reload.rs, main.rs, ui/env_profiles.rs, ui/workspace.rs; runtime command/event/host/in_process/protocol/remote; 로케일 5개; 계획과 handoff.
+- 검증 한계: 전체 runtime 307 PASS 이후 app 재실행 routing/취소 처리와 테스트 assertion을 보완했고 app 6/runtime 2 targeted로 재검증했다. 최신 UI 콜백 scope guard는 소스 확인과 all-targets clippy로 확인했으며 화면 확인은 남았다. 버전은 runtime 수명의 metadata 표식이며 재시작 전 아카이브는 실제 실행 증거가 없어 미확인으로 표시한다. 원본 파일 여러 개의 rename 전체가 원자적이라는 보장은 제공하지 않는다.
+- 남은 작업: 이 변경을 commit/push하고 #182를 base로 draft PR 생성. main 머지·앱 재빌드/재실행·사용자 화면 확인은 이번 구현 단계에서 하지 않는다. 이전 UI dirty worktree는 보존한다.
+- 다음 명령: `git diff --check`; `git add crates/app/src/app.rs crates/app/src/environment_application.rs crates/app/src/env_reload.rs crates/app/src/main.rs crates/app/src/ui/env_profiles.rs crates/app/src/ui/workspace.rs crates/runtime/src crates/i18n/locales docs/CODEX_HANDOFF.md docs/superpowers/plans/2026-09-09-environment-api-prs.md`; `git commit -m "feat: 프로젝트 환경의 실제 실행 적용 상태를 추적"`; `git push -u origin feat/environment-application-status`; `gh pr create --draft --base feat/workspace-env-sources --head feat/environment-application-status --title "feat: Agent 환경 적용 상태와 비밀값 세대 일치 확인" --body-file /tmp/deppy-application-pr.md`.
+
+
+## 2026-09-09 환경·API 5개 PR 구현 종료
+
+- 현재 목표 완료: 승인된 PR 1~5를 순서대로 구현·검증하고 draft PR로 올렸다. 마지막 구현 commit `2868f25`, PR #183 https://github.com/JRVector9/deppy-sijo/pull/183.
+- GitHub에서 확인한 의존 순서: main ← #179 조회 상태 ← #180 파일 일관성 ← #181 API 환경 연결 ← #182 파일 선택/출처 ← #183 실제 실행 적용 상태. 모두 OPEN/draft다. main 머지나 앱 재빌드/재실행은 하지 않았다.
+- 최신 작업 위치: `/private/tmp/deppy-env-application-20260909`, branch `feat/environment-application-status`. 이 branch가 5개 PR의 누적 구현을 담는다. 앞선 worktree 위치는 각 절에 기록했다.
+- 사용자 작업 보존: `/private/tmp/deppy-settings-session-background-20260909`의 file_tree/settings/workspace/renderer_egui/handoff 미커밋 수정은 그대로 있다. 통합 시 이 화면 수정이 빠져 이전 화면으로 돌아가지 않도록 먼저 diff를 확인한다.
+- 남은 확인: 승인된 시점에 5개 PR과 별도 화면 변경을 함께 통합하고 패키징/재실행 후 사용자 화면을 확인한다. 조회 오류 해제, 파일 선택·편집/삭제, API 연결·해제, 새 Agent 적용 상태, workspace 전환을 확인한다. 화면 미검증은 PASS가 아니다.
+- 다음 에이전트 시작 명령: `cd /private/tmp/deppy-env-application-20260909`; `cat AGENTS.md`; `cat CLAUDE.md`; `tail -n 75 docs/CODEX_HANDOFF.md`; `git status --short`; `git diff`; `gh pr view 183`; `git -C /private/tmp/deppy-settings-session-background-20260909 diff --stat`. 승인 없이 기존 앱을 종료하거나 main에 머지하지 않는다.
 - main 통합 사전 검사 보완: xtask check-boundary가 UI의 storage::Db 정적 검증 호출을 발견했다. 이름 검증을 deppy_core::credential_env의 순수 함수로 옮겨 UI/저장소가 같은 규칙을 사용한다. 기존 문자/길이 계약은 그대로다. 이전 fmt/clippy/i18n 통과가 boundary 통과를 의미하지 않았으며 이 누락을 수정 중이다.
 
 - PR 3 경계 보완은 storage 연결 회귀 3 PASS와 check-boundary PASS 뒤 ee52883으로 기록했다. PR 4는 해당 commit을 merge로 받아 core 모듈 선언/handoff 충돌에서 양쪽 내용을 모두 보존했다. 파일 선택 UI도 기존 core 순수 함수 직접 호출로 변경했다. rebase/force-push는 사용하지 않았다.

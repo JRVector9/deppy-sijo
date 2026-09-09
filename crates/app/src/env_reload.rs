@@ -3,8 +3,8 @@
 //! 프로세스 환경변수는 spawn 시점에 고정되므로, .env를 나중에 고쳐도 이미 떠 있는
 //! 셸에는 반영되지 않는다. 이 모듈은 VS Code shell-integration과 같은 **ZDOTDIR
 //! 주입** 방식으로 deppy 셸(zsh)에 precmd 훅을 심어, 다음 프롬프트마다 프로젝트
-//! `.env`/`.env.local`의 mtime을 확인하고 바뀌었으면 `set -a; source`로 현재 셸에
-//! 다시 export한다 — 세션 재시작 없이 다음 명령부터 최신 env가 적용된다.
+//! `.env`/`.env.local`의 mtime을 확인하고 바뀌었으면 유계 snapshot을 파싱해 현재 셸에
+//! 일반 단일 행 값을 다시 설정한다. 민감값은 새 실행에만 적용하고 이미 실행 중인 Agent는 변경하지 않는다.
 //!
 //! 안전 장치:
 //! - 훅은 `DEPPY_ENV_LIVE_RELOAD=1` + `DEPPY_PROJECT_ROOT` 가 있을 때만 활성 —
@@ -161,13 +161,14 @@ if [[ "$DEPPY_ENV_LIVE_RELOAD" == "1" && -n "$DEPPY_PROJECT_ROOT" ]]; then
   # 둘 다 builtin 모듈이다. 어느 쪽이든 없으면 외부 stat/cat/dd로 폴백하지 않고 비활성화한다.
   if zmodload -F zsh/stat b:zstat 2>/dev/null &&
      zmodload -F zsh/system b:sysopen b:sysread 2>/dev/null; then
+    typeset -ga __deppy_env_keys=()
     typeset -g __deppy_env_sig=""
     typeset -g __deppy_env_capture=""
     typeset -gi __deppy_env_capture_bytes=0
 
     # nofollow로 고정한 regular-file descriptor를 최대 limit+1까지 builtin sysread한다.
-    # source path를 다시 열지 않고 이 bounded snapshot만 eval하므로 검사 뒤 파일이 커져도
-    # 셸이 1MiB를 넘는 dotenv를 읽거나 실행하지 않는다.
+    # source path를 다시 열지 않고 유계 snapshot만 파싱하므로 검사 뒤 파일이 커져도
+    # 셸이 1MiB를 넘는 dotenv를 읽지 않는다.
     __deppy_env_capture_bounded() {
       local capture_path="$1" chunk=""
       local -i capture_limit="$2" fd=-1 count=0 read_status=0 total=0
@@ -206,6 +207,8 @@ if [[ "$DEPPY_ENV_LIVE_RELOAD" == "1" && -n "$DEPPY_PROJECT_ROOT" ]]; then
     }
 
     __deppy_env_reload() {
+      setopt localoptions extendedglob
+      local LC_ALL=C
       local -a env_files env_present env_contents
       env_files=("$DEPPY_PROJECT_ROOT/.env" "$DEPPY_PROJECT_ROOT/.env.local")
       env_present=()
@@ -265,18 +268,57 @@ if [[ "$DEPPY_ENV_LIVE_RELOAD" == "1" && -n "$DEPPY_PROJECT_ROOT" ]]; then
         fi
       done
 
-      # 배열 순서가 .env → .env.local 우선순위를 보존한다. eval 대상은 위에서 확보한
-      # bounded descriptor snapshot뿐이며 path를 다시 source하지 않는다.
+      # 배열 순서가 .env → .env.local 우선순위를 보존한다. 셸 코드를 실행하지 않고
+      # 지원되는 단일 행 대입만 파싱한다. 비밀값은 redaction 준비가 있는 새 실행에 맡긴다.
+      local -A __deppy_next_env
+      local __deppy_line __deppy_key __deppy_value __deppy_upper
+      local -i __deppy_count=0
       for content in "${env_contents[@]}"; do
-        [[ -z "$content" ]] && continue
-        set -a
-        if ! builtin eval -- "$content" 2>/dev/null; then
-          set +a
-          env_contents=()
-          return
-        fi
-        set +a
+        for __deppy_line in "${(@f)content}"; do
+          [[ -z "$__deppy_line" || "$__deppy_line" == '#'* ]] && continue
+          __deppy_line="${__deppy_line##[[:space:]]#}"
+          __deppy_line="${__deppy_line%%[[:space:]]#}"
+          [[ -z "$__deppy_line" || "$__deppy_line" == '#'* ]] && continue
+          __deppy_line="${__deppy_line#export }"
+          [[ "$__deppy_line" != *'='* ]] && continue
+          __deppy_key="${__deppy_line%%=*}"
+          __deppy_key="${__deppy_key##[[:space:]]#}"
+          __deppy_key="${__deppy_key%%[[:space:]]#}"
+          [[ "$__deppy_key" != [A-Za-z_][A-Za-z0-9_]# ]] && continue
+          __deppy_upper="${(U)__deppy_key}"
+          case "$__deppy_upper" in
+            *SECRET*|*TOKEN*|*KEY*|*PASSWORD*|*PASSWD*|*PWD*|*CREDENTIAL*|*AUTH*|DATABASE_URL|DB_URL|*_DATABASE_URL|*_DB_URL|__DEPPY_*|DEPPY_ENV_LIVE_RELOAD|DEPPY_PROJECT_ROOT|DEPPY_SESSION_ID) continue ;;
+          esac
+          [[ "${parameters[$__deppy_key]}" == *readonly* ]] && continue
+          __deppy_value="${__deppy_line#*=}"
+          __deppy_value="${__deppy_value##[[:space:]]#}"
+          __deppy_value="${__deppy_value%%[[:space:]]#}"
+          case "${__deppy_value[1]}" in
+            '"') __deppy_value="${__deppy_value[2,-1]}"; __deppy_value="${__deppy_value%%\"*}" ;;
+            "'") __deppy_value="${__deppy_value[2,-1]}"; __deppy_value="${__deppy_value%%\'*}" ;;
+            *) __deppy_value="${__deppy_value%%' #'*}"; __deppy_value="${__deppy_value%%[[:space:]]#}" ;;
+          esac
+          # 이름이 일반적이어도 인증 헤더/토큰/자격증명 URL은 새 실행에서만 해석한다.
+          case "${(L)__deppy_value}" in
+            *'bearer '*|*'database_url='*|*'sk-'*|*'ghp_'*|*'github_pat_'*|*'xoxb-'*|*'xoxp-'*|*'://'*':'*'@'*) continue ;;
+          esac
+          (( ++__deppy_count ))
+          if (( __deppy_count > 4096 || ${#__deppy_key} > 1024 || ${#__deppy_value} > 65536 )); then
+            return
+          fi
+          __deppy_next_env[$__deppy_key]="$__deppy_value"
+        done
       done
+      # 두 파일 파싱을 마친 뒤 이전에 관리했던 일반 키의 삭제도 반영한다.
+      for __deppy_key in "${__deppy_env_keys[@]}"; do
+        if (( ! ${+__deppy_next_env[$__deppy_key]} )); then
+          builtin unset -- "$__deppy_key"
+        fi
+      done
+      for __deppy_key in "${(@k)__deppy_next_env}"; do
+        builtin typeset -gx -- "$__deppy_key=${__deppy_next_env[$__deppy_key]}"
+      done
+      __deppy_env_keys=("${(@k)__deppy_next_env}")
       env_contents=()
       __deppy_env_sig="$sig"
     }
@@ -402,6 +444,50 @@ echo "value:$DEPPY_BOUND"
     }
 
     #[test]
+    fn environment_application_라이브훅은_리터럴과_삭제를_반영하고_비밀은_보존한다() {
+        if !Path::new("/bin/zsh").exists() {
+            return;
+        }
+        let dir = temp_path("literal-delete");
+        let user = dir.join("user");
+        let project = dir.join("project");
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        let zshrc = dir.join("test.zshrc");
+        std::fs::write(&zshrc, ZSHRC).unwrap();
+        std::fs::write(project.join(".env"), "PLAIN=first\nREMOVE_ME=old\nAPI_TOKEN=unregistered-value\nPUBLIC=Bearer sk-unregistered-value\nLITERAL=$(printf executed)\n").unwrap();
+        let output = std::process::Command::new("/bin/zsh")
+            .arg("-fc")
+            .arg(
+                r#"
+export DEPPY_USER_ZDOTDIR="$HOME"
+export DEPPY_ENV_LIVE_RELOAD=1
+export API_TOKEN=initial-protected-value
+export PUBLIC=initial-public-value
+builtin source "$TEST_RC"
+print -r -- "literal:$LITERAL"
+print -r -- "token:$API_TOKEN"
+print -r -- "public:$PUBLIC"
+print -r -- 'PLAIN=second-value' > "$DEPPY_PROJECT_ROOT/.env"
+__deppy_env_reload
+print -r -- "value:$PLAIN deleted:${+REMOVE_ME}"
+"#,
+            )
+            .env("HOME", &user)
+            .env("ZDOTDIR", &user)
+            .env("TEST_RC", &zshrc)
+            .env("DEPPY_PROJECT_ROOT", &project)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(text.contains("literal:$(printf executed)"), "{text}");
+        assert!(text.contains("token:initial-protected-value"), "{text}");
+        assert!(text.contains("public:initial-public-value"), "{text}");
+        assert!(text.contains("value:second-value deleted:0"), "{text}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn generated_hook_reader_is_bounded_and_byte_exact() {
         let path = temp_path("bytes");
         std::fs::write(&path, vec![b'x'; 64]).unwrap();
@@ -458,8 +544,9 @@ echo "value:$DEPPY_BOUND"
         let apply_start = ZSHRC.find("# 배열 순서가 .env").unwrap();
         assert!(!ZSHRC[capture_start..apply_start].contains("__deppy_env_sig=\"$sig\""));
         let final_commit = ZSHRC.rfind("__deppy_env_sig=\"$sig\"").unwrap();
-        let eval = ZSHRC.rfind("builtin eval -- \"$content\"").unwrap();
-        assert!(final_commit > eval);
+        let apply = ZSHRC.rfind("builtin typeset -gx --").unwrap();
+        assert!(final_commit > apply);
+        assert!(!ZSHRC.contains("builtin eval"));
     }
 
     #[test]

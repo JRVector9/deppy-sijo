@@ -1309,6 +1309,53 @@ fn clear_sensitive_string(value: &mut String) {
     value.clear();
 }
 
+/// 저장/전달 ACK와 실행 당시 환경을 분리해서 표시한다.
+pub fn render_application_status(
+    ui: &mut egui::Ui,
+    view: &crate::environment_application::ApplicationView,
+    catalog: &i18n::Catalog,
+) {
+    let message = if view.failed {
+        catalog.t("env.apply_failed", &[])
+    } else if view.pending {
+        catalog.t("env.apply_pending", &[])
+    } else if view.ready {
+        catalog.t("env.apply_ready", &[])
+    } else {
+        catalog.t("env.apply_next_run", &[])
+    };
+    ui.label(message);
+    ui.label(
+        egui::RichText::new(catalog.t("env.apply_existing", &[]))
+            .small()
+            .color(ui.visuals().weak_text_color()),
+    );
+    if !view.sessions.is_empty() {
+        ui.collapsing(catalog.t("env.apply_sessions", &[]), |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("env_applied_sessions")
+                .max_height(180.0)
+                .show(ui, |ui| {
+                    for (name, revision) in &view.sessions {
+                        let state = match revision {
+                            None => catalog.t("env.apply_unknown", &[]),
+                            Some(version) => {
+                                let version_text = format!("{version:016x}");
+                                if Some(*version) == view.current && view.ready {
+                                    catalog.t("env.apply_current", &[("version", &version_text)])
+                                } else {
+                                    catalog.t("env.apply_previous", &[("version", &version_text)])
+                                }
+                            }
+                        };
+                        ui.label(format!("{name} · {state}"));
+                    }
+                });
+        });
+    }
+    ui.separator();
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;

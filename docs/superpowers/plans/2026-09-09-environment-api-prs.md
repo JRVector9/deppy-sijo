@@ -46,7 +46,7 @@
 
 ## PR 4 — 환경파일 선택과 출처
 
-- 구현 완료, 최종 게이트/PR 생성 중. 첫 범위는 루트의 영문·숫자·._- 파일명 16개까지다. 하위 경로는 지원하지 않는다. 빈 목록과 루트 연결 해제는 복원에서도 파일을 주입하지 않는다.
+- 구현 완료: #182 (draft), commit `2b2c6c8`. 첫 범위는 루트의 영문·숫자·._- 파일명 16개까지다. 하위 경로는 지원하지 않는다. 빈 목록과 루트 연결 해제는 복원에서도 파일을 주입하지 않는다.
 
 - 브랜치: `feat/workspace-env-sources`, base PR 3.
 - 파일: storage migration, `runtime/src/dotenv.rs`, `app/src/dotenv_sync.rs`, `app.rs`, `ui/env_profiles.rs`, watcher 연결, 로케일 5개.
@@ -57,6 +57,8 @@
 - 검증: 순서 변경, 명시적 활성화, 경로 이탈/심볼릭 링크, 파일 삭제, 예산 초과, 선택 파일 편집/재실행. 명령 `cargo test -p runtime dotenv` 및 `cargo test -p deppy-sijo --bin deppy-sijo dotenv_sync`.
 
 ## PR 5 — Agent 적용 상태
+
+- 구현 완료: #183 (draft), commit `2868f25`. 소스 리뷰 반영·로직 검증 완료. 화면 검증 대기. 실제 spawn ACK와 기본환경 처리 ACK를 구분하고, 비밀값 대신 physical slot 세대를 버전에 포함한다.
 
 - 브랜치: `feat/environment-application-status`, base PR 4.
 - 파일: `runtime/src/command.rs`, `runtime/src/event.rs`, `in_process.rs`, `app.rs`, 환경 설정 snapshot/UI, 로케일 5개.

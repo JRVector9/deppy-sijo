@@ -270,7 +270,7 @@ if [[ "$DEPPY_ENV_LIVE_RELOAD" == "1" && -n "$DEPPY_PROJECT_ROOT" ]]; then
 
       # 배열 순서가 .env → .env.local 우선순위를 보존한다. 셸 코드를 실행하지 않고
       # 지원되는 단일 행 대입만 파싱한다. 비밀값은 redaction 준비가 있는 새 실행에 맡긴다.
-      local -A __deppy_next_env
+      local -A __deppy_next_env __deppy_protected_env
       local __deppy_line __deppy_key __deppy_value __deppy_upper
       local -i __deppy_count=0
       for content in "${env_contents[@]}"; do
@@ -298,20 +298,25 @@ if [[ "$DEPPY_ENV_LIVE_RELOAD" == "1" && -n "$DEPPY_PROJECT_ROOT" ]]; then
             "'") __deppy_value="${__deppy_value[2,-1]}"; __deppy_value="${__deppy_value%%\'*}" ;;
             *) __deppy_value="${__deppy_value%%' #'*}"; __deppy_value="${__deppy_value%%[[:space:]]#}" ;;
           esac
-          # 이름이 일반적이어도 인증 헤더/토큰/자격증명 URL은 새 실행에서만 해석한다.
-          case "${(L)__deppy_value}" in
-            *'bearer '*|*'database_url='*|*'sk-'*|*'ghp_'*|*'github_pat_'*|*'xoxb-'*|*'xoxp-'*|*'://'*':'*'@'*) continue ;;
-          esac
           (( ++__deppy_count ))
           if (( __deppy_count > 4096 || ${#__deppy_key} > 1024 || ${#__deppy_value} > 65536 )); then
             return
           fi
+          # 이름이 일반적이어도 인증 헤더/토큰/자격증명 URL은 새 실행에서만 해석한다.
+          case "${(L)__deppy_value}" in
+            *'bearer '*|*'database_url='*|*'sk-'*|*'ghp_'*|*'github_pat_'*|*'xoxb-'*|*'xoxp-'*|*'://'*':'*'@'*)
+              # 상위 민감값은 하위 일반값과 삭제 대상 모두를 가린다. 기존 주입값을 유지한다.
+              builtin unset "__deppy_next_env[$__deppy_key]"
+              __deppy_protected_env[$__deppy_key]=1
+              continue ;;
+          esac
+          builtin unset "__deppy_protected_env[$__deppy_key]"
           __deppy_next_env[$__deppy_key]="$__deppy_value"
         done
       done
       # 두 파일 파싱을 마친 뒤 이전에 관리했던 일반 키의 삭제도 반영한다.
       for __deppy_key in "${__deppy_env_keys[@]}"; do
-        if (( ! ${+__deppy_next_env[$__deppy_key]} )); then
+        if (( ! ${+__deppy_next_env[$__deppy_key]} && ! ${+__deppy_protected_env[$__deppy_key]} )); then
           builtin unset -- "$__deppy_key"
         fi
       done
@@ -484,6 +489,48 @@ print -r -- "value:$PLAIN deleted:${+REMOVE_ME}"
         assert!(text.contains("token:initial-protected-value"), "{text}");
         assert!(text.contains("public:initial-public-value"), "{text}");
         assert!(text.contains("value:second-value deleted:0"), "{text}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn environment_review_높은_우선순위_민감값은_하위_일반값으로_덮지_않는다() {
+        if !Path::new("/bin/zsh").exists() {
+            return;
+        }
+        let dir = temp_path("secret-precedence");
+        std::fs::create_dir_all(&dir).unwrap();
+        let rc = dir.join("test.zshrc");
+        std::fs::write(&rc, ZSHRC).unwrap();
+        std::fs::write(dir.join(".env"), "PUBLIC=base-value\n").unwrap();
+        std::fs::write(dir.join(".env.local"), "PUBLIC=Bearer fake-local-secret\n").unwrap();
+        let output = std::process::Command::new("/bin/zsh")
+            .arg("-fc")
+            .arg(
+                r#"
+export DEPPY_USER_ZDOTDIR="$HOME"
+export DEPPY_ENV_LIVE_RELOAD=1
+export PUBLIC='Bearer fake-local-secret'
+builtin source "$TEST_RC"
+print -r -- "initial:$PUBLIC"
+print -r -- 'PUBLIC=ordinary-later' > "$DEPPY_PROJECT_ROOT/.env.local"
+__deppy_env_reload
+print -r -- "ordinary:$PUBLIC"
+print -r -- 'PUBLIC=Bearer fake-secret-rotated-long' > "$DEPPY_PROJECT_ROOT/.env.local"
+__deppy_env_reload
+print -r -- "protected:$PUBLIC"
+"#,
+            )
+            .env("HOME", &dir)
+            .env("ZDOTDIR", &dir)
+            .env("TEST_RC", &rc)
+            .env("DEPPY_PROJECT_ROOT", &dir)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{text}");
+        assert!(text.contains("initial:Bearer fake-local-secret"), "{text}");
+        assert!(text.contains("ordinary:ordinary-later"), "{text}");
+        assert!(text.contains("protected:ordinary-later"), "{text}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

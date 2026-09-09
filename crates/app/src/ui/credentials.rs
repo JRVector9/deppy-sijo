@@ -398,6 +398,18 @@ impl CredentialsUi {
         }
     }
 
+    /// 작업 완료는 화면 이동과 무관하게 처리하고, 현재 초안과 오류는 보존한다.
+    pub fn complete_add(&mut self, projection_current: bool, success: bool) {
+        self.add_pending = false;
+        if projection_current {
+            if success {
+                self.add_succeeded();
+            } else {
+                self.report_error(CredentialsUiErrorCode::AddFailed);
+            }
+        }
+    }
+
     pub fn add_succeeded(&mut self) {
         self.env_name.clear();
         self.provider.clear();
@@ -1183,6 +1195,23 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+
+    #[test]
+    fn environment_review_다른_프로젝트의_추가완료도_대기를_해제한다() {
+        for success in [true, false] {
+            let mut view = CredentialsUi::new();
+            view.add_pending = true;
+            view.provider = "현재 프로젝트 초안".into();
+            view.env_name = "CURRENT_TOKEN".into();
+            view.error = Some(CredentialsUiErrorCode::BindingFailed);
+            view.complete_add(false, success);
+            view.sync_snapshot(&CredentialsSnapshot::try_new(2, Vec::new()).unwrap());
+            assert!(!view.add_pending);
+            assert_eq!(view.provider, "현재 프로젝트 초안");
+            assert_eq!(view.env_name, "CURRENT_TOKEN");
+            assert_eq!(view.error, Some(CredentialsUiErrorCode::BindingFailed));
+        }
+    }
 
     struct FakePort {
         calls: Cell<usize>,

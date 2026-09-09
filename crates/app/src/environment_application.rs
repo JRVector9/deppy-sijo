@@ -3,6 +3,7 @@ use std::collections::HashMap;
 
 #[derive(Default)]
 pub struct EnvironmentApplication {
+    settings_generation: u64,
     pub current: Option<u64>,
     pub delivered: Option<u64>,
     pub pending: bool,
@@ -30,7 +31,20 @@ impl EnvironmentApplication {
             && !self.launch_failed
     }
 
+    pub fn settings_generation(&self) -> u64 {
+        self.settings_generation
+    }
+
+    pub fn accepts_settings_generation(&self, captured: u64) -> bool {
+        captured == self.settings_generation
+    }
+
     pub fn changed(&mut self) {
+        self.settings_generation = self.settings_generation.wrapping_add(1);
+        self.clear_prepared();
+    }
+
+    fn clear_prepared(&mut self) {
         self.current = None;
         self.delivered = None;
         self.failed = false;
@@ -41,7 +55,7 @@ impl EnvironmentApplication {
     pub fn cancel_pending(&mut self) -> bool {
         let pending = self.pending;
         if pending {
-            self.changed();
+            self.clear_prepared();
         }
         pending
     }
@@ -140,6 +154,24 @@ impl EnvironmentApplication {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn environment_review_설정변경은_늦은_실행준비_결과를_거부한다() {
+        let mut workspace = EnvironmentApplication::default();
+        let before = workspace.settings_generation();
+        assert!(workspace.accepts_settings_generation(before));
+        workspace.changed();
+        assert!(!workspace.accepts_settings_generation(before));
+        let after = workspace.settings_generation();
+        workspace.begin();
+        workspace.cancel_pending();
+        assert!(
+            workspace.accepts_settings_generation(after),
+            "조회 취소는 설정 변경이 아니다"
+        );
+        workspace.changed();
+        assert!(!workspace.accepts_settings_generation(after));
+    }
+
     #[test]
     fn environment_application_완료후_전환은_확정버전을_보존한다() {
         let mut state = EnvironmentApplication::default();

@@ -2651,3 +2651,6 @@
 - 코드 확인과 fmt/diff, workspace clippy all-targets PASS(34.18초, `/tmp/deppy-env-ui-integration-clippy.log`). 경계 검사에서 새 환경 UI가 storage 타입의 순수 검증 메서드를 호출하는 문제가 발견돼 #181/#182에서 순수 core 함수로 수정 중이다. 이전 구현 보고에는 이 별도 게이트가 누락되어 있었다.
 - GitHub 실패 30개는 각 runner_id=0, steps=0 및 billing annotation으로 미실행 확인(`/tmp/deppy-env-merge-ci-evidence.json`). GitGuardian 성공. main protected=false, 보호/ruleset 상세 API는 계정 플랜 403으로 조회 불가. 우회 옵션은 사용하지 않는다. 변경되지 않은 Relay Linux/WebCrypto는 이번 재검증 대상이 아니다. dependency audit 취약점 0, deny bans/licenses/sources PASS.
 - 남은 작업: #181/#182 경계 수정 전파 및 재검증, 5개 PR 순차 merge, 기존 화면 수정 PR merge, 최종 main의 Developer ID 서명 release 패키징 후 정확한 앱 PID 종료/새 bundle 실행. 배포 workflow는 수동 트리거뿐이며 실행하지 않는다.
+- main 통합 사전 검사 보완: xtask check-boundary가 UI의 storage::Db 정적 검증 호출을 발견했다. 이름 검증을 deppy_core::credential_env의 순수 함수로 옮겨 UI/저장소가 같은 규칙을 사용한다. 기존 문자/길이 계약은 그대로다. 이전 fmt/clippy/i18n 통과가 boundary 통과를 의미하지 않았으며 이 누락을 수정 중이다.
+
+- PR 3 경계 보완은 storage 연결 회귀 3 PASS와 check-boundary PASS 뒤 ee52883으로 기록했다. PR 4는 해당 commit을 merge로 받아 core 모듈 선언/handoff 충돌에서 양쪽 내용을 모두 보존했다. 파일 선택 UI도 기존 core 순수 함수 직접 호출로 변경했다. rebase/force-push는 사용하지 않았다.

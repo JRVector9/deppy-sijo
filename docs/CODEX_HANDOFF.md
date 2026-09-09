@@ -2762,3 +2762,19 @@
   따라 구현·리뷰·PR을 먼저 완료하고 재빌드·재실행은 별도 승인 전 수행하지 않는다.
 - 다음 명령: parser RED 테스트를 추가하고
   `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo test --locked -p deppy-sijo --bin deppy-sijo cursor_usage::tests -- --test-threads=1`.
+
+- 구현 checkpoint: 새 `cursor_usage.rs`가 런처 감지 실행 파일/PATH만 사용하고
+  `~/.deppy-sijo/usage-probe`에서 `cursor-agent --trust`의 `/usage`를 실행한다. 전체 child
+  예산 25초, 출력 100 KiB, 갱신 5분, 마지막 성공값 15분 상한을 적용했다. 월간 Included,
+  Auto, API, 플랜, reset, On-Demand를 유계 구조체로 읽는다.
+- 상태바 checkpoint: 설치/활성화된 Cursor만 background probe하고, 전체 폭은 locale별
+  `월 N%`, compact는 `N%`, hover는 상세 항목을 표시하도록 연결했다. 감지됐지만 값이
+  없으면 `—`, 런처에서 끄면 칸 자체가 사라진다. 다섯 locale에 같은 키 집합을 추가했다.
+- TDD 검증: `parse_usage`/`CursorUsage`가 없는 compile RED를 확인했다. 최소 구현 첫
+  실행은 plan 추출 조기 반환으로 1 FAIL/3 PASS였고 수정 후 최종 unit 7 PASS, ignored
+  1개다. 실제 설치 Cursor CLI를 앱과 같은 PTY로 실행한 ignored test도 1 PASS,
+  5.53초다. 명령은 구현 계획의 Task 1 Step 4와 같다. 사용자 Deppy 앱 PID 38141은
+  종료·재실행하지 않았다.
+- 수정 파일: `crates/app/src/cursor_usage.rs`, `main.rs`, `app.rs`,
+  `ui/agent_terminal.rs`, locale 5개와 이 handoff. 다음은 소스 diff 자체 검토와
+  `codex review --uncommitted`, 발견 반영 후 커밋 전 gate 1회, commit/push/PR이다.

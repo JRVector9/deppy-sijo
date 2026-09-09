@@ -2802,3 +2802,7 @@
 - 현재 요청의 구현·리뷰·PR 생성은 완료했다. main 머지와 새 package 빌드, 기존 앱 PID
   38141 종료, 새 앱 실행은 하지 않았다. 다음 단계는 사용자에게 재빌드·재실행 승인을
   받아 PR branch 화면에서 Cursor `월 N%`/compact `N%`/hover를 직접 확인하는 것이다.
+- PR #186 GitHub Actions 6건은 모두 `steps: []`, `runner_id: 0`으로 실행되지 않았다.
+  Format job annotation에서 최근 결제 실패 또는 spending limit 증액 필요 메시지를 직접
+  확인했다. 따라서 GitHub failure는 코드 테스트 실패가 아니며 CI PASS로 기록하지 않는다.
+  GitGuardian은 SUCCESS, PR은 OPEN/non-draft/MERGEABLE이다.

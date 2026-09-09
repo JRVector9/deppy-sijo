@@ -1693,41 +1693,43 @@ fn paint_terminal_toolbar_icon(
     icon: TerminalToolbarIcon,
     color: egui::Color32,
 ) {
+    // 클릭 영역과 헤더 높이는 유지하고, 네 도형의 가로·세로 외곽만 기존보다 2pt
+    // 키운다. 좁은 pane에서 버튼 수가 줄어드는 기준은 바뀌지 않는다.
     let stroke = egui::Stroke::new(1.25, color);
     let center = rect.center();
     match icon {
         TerminalToolbarIcon::Search => {
             let lens = center + egui::vec2(-0.9, -0.9);
-            painter.circle_stroke(lens, 3.2, stroke);
+            painter.circle_stroke(lens, 4.2, stroke);
             painter.line_segment(
-                [lens + egui::vec2(2.3, 2.3), lens + egui::vec2(4.5, 4.5)],
+                [lens + egui::vec2(3.0, 3.0), lens + egui::vec2(5.5, 5.5)],
                 stroke,
             );
         }
         TerminalToolbarIcon::NewTerminal => {
-            let body = egui::Rect::from_center_size(center, egui::vec2(9.0, 7.0));
+            let body = egui::Rect::from_center_size(center, egui::vec2(11.0, 9.0));
             painter.rect_stroke(body, 0.75, stroke, egui::StrokeKind::Inside);
             painter.line_segment(
                 [
-                    center + egui::vec2(-2.8, -1.5),
-                    center + egui::vec2(-1.2, 0.0),
+                    center + egui::vec2(-3.5, -2.0),
+                    center + egui::vec2(-1.5, 0.0),
                 ],
                 stroke,
             );
             painter.line_segment(
                 [
-                    center + egui::vec2(-1.2, 0.0),
-                    center + egui::vec2(-2.8, 1.5),
+                    center + egui::vec2(-1.5, 0.0),
+                    center + egui::vec2(-3.5, 2.0),
                 ],
                 stroke,
             );
             painter.line_segment(
-                [center + egui::vec2(0.0, 2.0), center + egui::vec2(2.7, 2.0)],
+                [center + egui::vec2(0.0, 2.8), center + egui::vec2(3.4, 2.8)],
                 stroke,
             );
         }
         TerminalToolbarIcon::SplitColumns | TerminalToolbarIcon::SplitRows => {
-            let body = egui::Rect::from_center_size(center, egui::vec2(9.0, 9.0));
+            let body = egui::Rect::from_center_size(center, egui::vec2(11.0, 11.0));
             painter.rect_stroke(body, 0.75, stroke, egui::StrokeKind::Inside);
             match icon {
                 TerminalToolbarIcon::SplitColumns => {

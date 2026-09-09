@@ -7773,7 +7773,7 @@ fn relative_reset_label(resets_at: i64, now: i64) -> Option<String> {
 /// 충분했다. 이제 감지되고 켜진 Grok도 독립 칸으로 붙어 칸 수가 0~4까지 늘었으므로, 그 두 상수(칸 2개→430,
 /// 칸 3개→620, 칸당 +190)를 그대로 외삽해 순수 함수로 뽑았다 — 폭은 egui 컨테이너의
 /// 크기 힌트일 뿐이라 정확한 픽셀보다 "칸 수에 비례해 줄어든다"가 중요하다. 값으로
-/// 테스트한다(0·1·2·3·4칸). 0칸은 상자 자체를 그리지 않으므로(`top_provider_usage`) 0.0 —
+/// 테스트한다(0·1·2·3·4·5칸). 0칸은 상자 자체를 그리지 않으므로(`top_provider_usage`) 0.0 —
 /// 50.0을 남기면 빈 상자가 폭만큼 자리를 차지해 버린다.
 fn provider_usage_bar_width(visible_count: usize) -> f32 {
     if visible_count == 0 {
@@ -7837,6 +7837,47 @@ fn grok_usage_labels(
     (visible, accessibility, hover)
 }
 
+fn cursor_usage_labels(
+    usage: &crate::cursor_usage::CursorUsage,
+    catalog: &i18n::Catalog,
+) -> (String, String, String) {
+    let value = usage.included_percent_used.to_string();
+    let visible = catalog.t("status_bar.cursor.monthly_short", &[("value", &value)]);
+    let accessibility = catalog.t(
+        "status_bar.cursor.accessibility",
+        &[("value", value.as_str())],
+    );
+    let mut details = Vec::with_capacity(6);
+    if let Some(plan) = usage.plan_name.as_deref() {
+        details.push(catalog.t("status_bar.cursor.plan", &[("value", plan)]));
+    }
+    details.push(catalog.t("status_bar.cursor.monthly", &[("value", value.as_str())]));
+    if let Some(auto) = usage.auto_percent_used {
+        let auto = auto.to_string();
+        details.push(catalog.t("status_bar.cursor.auto", &[("value", auto.as_str())]));
+    }
+    if let Some(api) = usage.api_percent_used {
+        let api = api.to_string();
+        details.push(catalog.t("status_bar.cursor.api", &[("value", api.as_str())]));
+    }
+    if let Some(reset) = usage.reset_label.as_deref() {
+        details.push(catalog.t("status_bar.cursor.reset", &[("value", reset)]));
+    }
+    if let Some(enabled) = usage.on_demand_enabled {
+        details.push(catalog.t(
+            if enabled {
+                "status_bar.cursor.on_demand_enabled"
+            } else {
+                "status_bar.cursor.on_demand_disabled"
+            },
+            &[],
+        ));
+    }
+    let details = details.join(" · ");
+    let hover = catalog.t("status_bar.cursor.hover", &[("values", details.as_str())]);
+    (visible, accessibility, hover)
+}
+
 pub(crate) struct ProviderUsageInputs<'a> {
     pub(crate) claude: Option<ProviderUsage>,
     pub(crate) codex: Option<ProviderUsage>,
@@ -7847,6 +7888,9 @@ pub(crate) struct ProviderUsageInputs<'a> {
     /// 바깥 `Option`은 설치 감지, 안쪽 `Option`은 숫자 조회 결과다. 감지됐지만 아직
     /// 값이 없으면 `Some(None)`으로 Codex 옆의 자리표시자를 유지한다.
     pub(crate) grok: Option<Option<crate::grok_usage::GrokUsage>>,
+    /// Cursor 개인 플랜은 주간 창이 아니라 월간 결제 주기 사용률을 준다. 바깥
+    /// `Option`은 설치 감지, 안쪽 `Option`은 숫자 조회 결과다.
+    pub(crate) cursor: Option<Option<crate::cursor_usage::CursorUsage>>,
 }
 
 fn grok_status_visible(disabled: &[String], detected: bool) -> bool {
@@ -7899,6 +7943,7 @@ pub(crate) fn top_provider_usage(
         codex_meta,
         kimi: kimi_usage,
         grok: grok_usage,
+        cursor: cursor_usage,
     } = usage;
     let sidebar_font = crate::fonts::sidebar_font(ui.ctx(), 13.0);
     for text_style in [
@@ -7918,6 +7963,16 @@ pub(crate) fn top_provider_usage(
             rect.y_range(),
             egui::Stroke::new(1.0, ui.visuals().weak_text_color().gamma_multiply(0.55)),
         );
+    }
+
+    fn provider_separator(ui: &mut egui::Ui, density: ProviderUsageDensity) {
+        if density == ProviderUsageDensity::Full {
+            ui.add_space(4.0);
+        }
+        separator(ui, 18.0);
+        if density == ProviderUsageDensity::Full {
+            ui.add_space(4.0);
+        }
     }
 
     fn provider(
@@ -8077,6 +8132,40 @@ pub(crate) fn top_provider_usage(
         });
     }
 
+    fn cursor_provider(
+        ui: &mut egui::Ui,
+        usage: Option<&crate::cursor_usage::CursorUsage>,
+        catalog: &i18n::Catalog,
+        density: ProviderUsageDensity,
+    ) {
+        let (logo, _) = ui.allocate_exact_size(egui::vec2(14.5, 14.5), egui::Sense::hover());
+        crate::ui::agent_terminal::paint_announcement_provider_logo(ui, logo, "Cursor");
+        let (full_visible, accessibility, hover) = usage.map_or_else(
+            || {
+                (
+                    "—".to_owned(),
+                    catalog.t("status_bar.cursor.unavailable", &[]),
+                    catalog.t("status_bar.cursor.unavailable_hover", &[]),
+                )
+            },
+            |usage| cursor_usage_labels(usage, catalog),
+        );
+        let visible = if density == ProviderUsageDensity::Compact {
+            usage
+                .map(|usage| format!("{}%", usage.included_percent_used))
+                .unwrap_or_else(|| "—".to_owned())
+        } else {
+            full_visible
+        };
+        let response = ui
+            .label(egui::RichText::new(visible).size(13.0).strong())
+            .on_hover_text(hover);
+        let enabled = ui.is_enabled();
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Label, enabled, accessibility.as_str())
+        });
+    }
+
     use crate::agent_launcher::{AgentKind, agent_is_enabled};
     // 꺼진 provider는 칸 자체가 사라진다(사용자 요청) — 모든 provider에 같은
     // 규칙이다. Claude/Codex는 이 앱의 1급 provider라 켜져 있으면 값이 없어도 「—」로
@@ -8086,10 +8175,12 @@ pub(crate) fn top_provider_usage(
     let codex_shown = agent_is_enabled(disabled, AgentKind::Codex);
     let kimi_shown = agent_is_enabled(disabled, AgentKind::Kimi) && kimi_usage.is_some();
     let grok_shown = grok_status_visible(disabled, grok_usage.is_some());
+    let cursor_shown = agent_is_enabled(disabled, AgentKind::Cursor) && cursor_usage.is_some();
     let visible_count = usize::from(claude_shown)
         + usize::from(codex_shown)
         + usize::from(kimi_shown)
-        + usize::from(grok_shown);
+        + usize::from(grok_shown)
+        + usize::from(cursor_shown);
     if visible_count == 0 {
         // 그릴 칸이 없으면 상자 자체를 할당하지 않는다 — 빈 50px 상자가 남으면
         // 호출부가 그 오른쪽에 붙이는 구분선도 아무것도 안 나누는 채로 남는다.
@@ -8122,9 +8213,7 @@ pub(crate) fn top_provider_usage(
             }
             if codex_shown {
                 if drawn {
-                    ui.add_space(4.0);
-                    separator(ui, 18.0);
-                    ui.add_space(4.0);
+                    provider_separator(ui, density);
                 }
                 provider(
                     ui,
@@ -8138,18 +8227,26 @@ pub(crate) fn top_provider_usage(
             }
             if grok_shown {
                 if drawn {
-                    ui.add_space(4.0);
-                    separator(ui, 18.0);
-                    ui.add_space(4.0);
+                    provider_separator(ui, density);
                 }
                 grok_provider(ui, grok_usage.flatten(), catalog, density);
                 drawn = true;
             }
+            if cursor_shown {
+                if drawn {
+                    provider_separator(ui, density);
+                }
+                cursor_provider(
+                    ui,
+                    cursor_usage.as_ref().and_then(Option::as_ref),
+                    catalog,
+                    density,
+                );
+                drawn = true;
+            }
             if kimi_shown {
                 if drawn {
-                    ui.add_space(4.0);
-                    separator(ui, 18.0);
-                    ui.add_space(4.0);
+                    provider_separator(ui, density);
                 }
                 provider(
                     ui,
@@ -29654,6 +29751,16 @@ impl eframe::App for App {
                 // 미설치 상태는 `None`이라 칸 자체를 만들지 않는다.
                 let grok_status = grok_agent.map(|_| grok_usage);
                 let kimi_status = kimi_agent.map(|_| kimi_usage);
+                let cursor_agent = launcher_snapshot
+                    .and_then(|snapshot| snapshot.find(crate::agent_launcher::AgentKind::Cursor));
+                let cursor_usage = provider_probe_enabled(
+                    &self.config.agents.disabled,
+                    crate::agent_launcher::AgentKind::Cursor,
+                    cursor_agent.is_some(),
+                )
+                .then(|| crate::cursor_usage::current(ui.ctx(), cursor_agent))
+                .flatten();
+                let cursor_status = cursor_agent.map(|_| cursor_usage);
                 status_intent = self.agent_terminal_ui.status_bar_with_managers(
                     ui,
                     claude_usage,
@@ -29661,6 +29768,7 @@ impl eframe::App for App {
                     self.agent_sessions_ui.codex_usage_meta(),
                     kimi_status,
                     grok_status,
+                    cursor_status,
                     // 런처에서 끈 에이전트는 사용량 바에서도 권하지 않는다 — usage 값은
                     // 그대로 넘기고 「꺼짐」만 별도 신호로 보내, top_provider_usage가
                     // "켜짐인데 값 없음"(—로 자리 유지)과 "꺼짐"(칸 자체 없음)을
@@ -46686,6 +46794,7 @@ mod tests {
             "codex".to_owned(),
             "kimi".to_owned(),
             "grok".to_owned(),
+            "cursor".to_owned(),
         ];
         let ctx = egui::Context::default();
         let mut drew_nothing = true;
@@ -46698,6 +46807,7 @@ mod tests {
                     codex_meta: None,
                     kimi: None,
                     grok: None,
+                    cursor: None,
                 },
                 &all_disabled,
                 &i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap(),
@@ -46719,6 +46829,7 @@ mod tests {
                     codex_meta: None,
                     kimi: None,
                     grok: None,
+                    cursor: None,
                 },
                 &[],
                 &i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap(),

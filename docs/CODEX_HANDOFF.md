@@ -2778,3 +2778,19 @@
 - 수정 파일: `crates/app/src/cursor_usage.rs`, `main.rs`, `app.rs`,
   `ui/agent_terminal.rs`, locale 5개와 이 handoff. 다음은 소스 diff 자체 검토와
   `codex review --uncommitted`, 발견 반영 후 커밋 전 gate 1회, commit/push/PR이다.
+
+- 첫 Codex 리뷰에서 세 가지를 찾았다. `cursor_usage.rs`가 rustfmt 전이었고,
+  `Included` 값이 없으면 다음 `Auto`의 비율을 잘못 가져왔으며, 430pt compact 상태에서
+  다섯 provider 뒤의 Sessions/MCP가 잘렸다. 섹션 경계를 만나면 값 탐색을 중단하도록
+  회귀 테스트를 RED로 확인한 뒤 수정했고, compact에서 provider 구분선 양쪽의 4pt
+  여백을 없애 네 경계 합계 32px을 확보했다. 제목이 없는 늦은 TUI 프레임도
+  `Included`와 `used`로 완료 감지하도록 별도 RED/회귀를 추가했다.
+- 최종 검증 PASS: Cursor unit 9 PASS/실측 1 ignored, 실제 Cursor CLI probe 1 PASS
+  5.53초, `cargo fmt --all -- --check`, workspace all-targets clippy `-D warnings`,
+  `xtask check-boundary`, `xtask i18n-check`(literal key 1160건/locale 5개),
+  `git diff --check`. 재실행한 `codex review --uncommitted`는 추가 actionable defect가
+  없다고 보고했고 기존 provider 상태바 테스트와 i18n 테스트도 독립 재확인했다.
+- 현재 수정 파일: `crates/app/src/cursor_usage.rs`, `main.rs`, `app.rs`,
+  `ui/agent_terminal.rs`, locale 5개, 구현 계획과 이 handoff. 다음은 구현 commit/push,
+  Obsidian 프로젝트 일지, main 대상 PR 생성이다. 앱 PID 38141은 기존 main 빌드 그대로며
+  패키징·재실행·화면 PASS는 아직 수행하지 않았다.

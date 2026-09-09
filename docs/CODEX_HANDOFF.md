@@ -2580,3 +2580,5 @@
 - PR 3 최종 로직 검증: storage 전체 341 PASS(`/tmp/deppy-api-storage-final.log`), runtime 전체 304 PASS(모의 Keychain feature, `/tmp/deppy-api-runtime-mock.log`). 재리뷰의 복원 제어키 경로 수정 뒤 targeted app 1/runtime 3 PASS(`/tmp/deppy-api-final-targeted.log`). 재리뷰 2건은 컴파일 오류 참조 처리와 복원 필터로 모두 반영했다. 전체 runtime 뒤 수정한 것은 복원 필터이며 해당 테스트로 재검증했다.
 
 - PR 3 최종 게이트 PASS: workspace clippy all-targets 16.77초, fmt/diff, i18n-check(1135 literal keys/5 locale). `/tmp/deppy-api-clippy-final.log`, `/tmp/deppy-api-i18n-final.log`. 변경 파일과 테스트는 위 checkpoint를 따른다. 화면 검증은 미실행이므로 draft PR로 제출한다. 다음은 `feat/workspace-env-sources` worktree를 이 commit 위에 생성하고 PR 4를 구현한다.
+
+- main 통합 사전 검사 보완: xtask check-boundary가 UI의 storage::Db 정적 검증 호출을 발견했다. 이름 검증을 deppy_core::credential_env의 순수 함수로 옮겨 UI/저장소가 같은 규칙을 사용한다. 기존 문자/길이 계약은 그대로다. 이전 fmt/clippy/i18n 통과가 boundary 통과를 의미하지 않았으며 이 누락을 수정 중이다.

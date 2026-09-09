@@ -11,13 +11,8 @@ pub struct CredentialEnvBinding {
 
 impl Db {
     pub fn validate_credential_env_name(name: &str) -> anyhow::Result<()> {
-        let mut bytes = name.bytes();
         anyhow::ensure!(
-            name.len() <= 256
-                && bytes
-                    .next()
-                    .is_some_and(|c| c.is_ascii_alphabetic() || c == b'_')
-                && bytes.all(|c| c.is_ascii_alphanumeric() || c == b'_'),
+            deppy_core::credential_env::valid_name(name),
             "credential_env_name_invalid"
         );
         Ok(())

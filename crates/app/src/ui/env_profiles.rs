@@ -139,6 +139,7 @@ pub struct EnvProfilesSnapshot {
     dotenv_profile_id: Option<Arc<str>>,
     dotenv_vars: Arc<[EnvVarItem]>,
     legacy_vars: Arc<[EnvVarItem]>,
+    sources: Option<Arc<crate::dotenv_sync::DotenvSources>>,
 }
 
 impl EnvProfilesSnapshot {
@@ -179,7 +180,35 @@ impl EnvProfilesSnapshot {
             dotenv_profile_id,
             dotenv_vars: dotenv_vars.into(),
             legacy_vars: legacy_vars.into(),
+            sources: None,
         })
+    }
+
+    pub fn with_sources(
+        mut self,
+        sources: Option<crate::dotenv_sync::DotenvSources>,
+    ) -> Result<Self, EnvSnapshotError> {
+        let source_bytes = sources.as_ref().map_or(0, |sources| {
+            sources.files.iter().map(String::len).sum::<usize>()
+                + sources
+                    .keys
+                    .iter()
+                    .map(|(key, files)| key.len() + files.iter().map(String::len).sum::<usize>())
+                    .sum::<usize>()
+        });
+        let retained = self.workspace_id.len()
+            + self.dotenv_profile_id.as_ref().map_or(0, |id| id.len())
+            + self
+                .dotenv_vars
+                .iter()
+                .chain(self.legacy_vars.iter())
+                .map(EnvVarItem::retained_bytes)
+                .sum::<usize>();
+        if retained.saturating_add(source_bytes) > ENV_SNAPSHOT_MAX_BYTES {
+            return Err(EnvSnapshotError::ByteBudgetExceeded);
+        }
+        self.sources = sources.map(Arc::new);
+        Ok(self)
     }
 
     pub fn loading(
@@ -206,6 +235,7 @@ impl EnvProfilesSnapshot {
             dotenv_profile_id: None,
             dotenv_vars: Arc::from([]),
             legacy_vars: Arc::from([]),
+            sources: None,
         }
     }
 
@@ -310,6 +340,7 @@ pub enum EnvAction {
     SetProjectPath(PathBuf),
     Resync,
     DotenvWrite {
+        file: Option<String>,
         key: String,
         value: Option<String>,
     },
@@ -357,6 +388,7 @@ pub struct EnvProfilesUi {
     error: Option<EnvUiErrorCode>,
     show_add_form: bool,
     delete_confirm: Option<(String, String)>,
+    delete_source: Option<String>,
     revealed: HashMap<(String, String), SensitiveDisplay>,
     revealed_bytes: usize,
     reveal_pending: HashSet<(String, String)>,
@@ -373,6 +405,7 @@ impl EnvProfilesUi {
             error: None,
             show_add_form: false,
             delete_confirm: None,
+            delete_source: None,
             revealed: HashMap::new(),
             revealed_bytes: 0,
             reveal_pending: HashSet::new(),
@@ -453,6 +486,26 @@ impl EnvProfilesUi {
             }
             self.render_error(ui);
             return None;
+        }
+        if snapshot
+            .sources
+            .as_ref()
+            .is_some_and(|sources| sources.read_failed)
+        {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                catalog.t("env.source_read_failed", &[]),
+            );
+        } else if snapshot
+            .sources
+            .as_ref()
+            .is_some_and(|sources| sources.files.is_empty())
+            && !snapshot.dotenv_vars().is_empty()
+        {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                catalog.t("env.source_missing", &[]),
+            );
         }
         if !snapshot.project_root_configured() {
             super::section_header(ui, &catalog.t("env.env_vars", &[]), None, None);
@@ -538,7 +591,7 @@ impl EnvProfilesUi {
         {
             intent = Some(action);
         }
-        self.render_delete_confirmation(ui.ctx(), profile_id, catalog, &mut intent);
+        self.render_delete_confirmation(ui.ctx(), snapshot, catalog, &mut intent);
         self.render_legacy_vars(ui, snapshot, catalog, &mut intent);
         self.render_error(ui);
         intent
@@ -600,6 +653,7 @@ impl EnvProfilesUi {
     ) {
         match action {
             EnvRowAction::ConfirmDelete { profile_id, key } => {
+                self.delete_source = None;
                 self.delete_confirm = Some((profile_id, key));
             }
             EnvRowAction::Toggle { profile_id, key } => {
@@ -652,10 +706,11 @@ impl EnvProfilesUi {
     fn render_delete_confirmation(
         &mut self,
         ctx: &egui::Context,
-        profile_id: &str,
+        snapshot: &EnvProfilesSnapshot,
         catalog: &i18n::Catalog,
         intent: &mut Option<EnvAction>,
     ) {
+        let profile_id = snapshot.dotenv_profile_id().unwrap_or_default();
         if self
             .delete_confirm
             .as_ref()
@@ -676,6 +731,32 @@ impl EnvProfilesUi {
                     "env.var_delete_confirm.body_dotenv",
                     &[("key", pending_key.as_str())],
                 ));
+                egui::ComboBox::from_id_salt("dotenv_delete_source")
+                    .selected_text(
+                        self.delete_source
+                            .as_deref()
+                            .unwrap_or(&catalog.t("env.delete_all_sources", &[])),
+                    )
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.delete_source,
+                            None,
+                            catalog.t("env.delete_all_sources", &[]),
+                        );
+                        if let Some(files) = snapshot
+                            .sources
+                            .as_ref()
+                            .and_then(|sources| sources.keys.get(pending_key))
+                        {
+                            for file in files {
+                                ui.selectable_value(
+                                    &mut self.delete_source,
+                                    Some(file.clone()),
+                                    file,
+                                );
+                            }
+                        }
+                    });
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.button(catalog.t("action.delete", &[])).clicked() {
@@ -690,7 +771,11 @@ impl EnvProfilesUi {
             Some(true) if intent.is_none() => {
                 let (_, key) = self.delete_confirm.take().expect("pending checked");
                 self.remove_local_value(profile_id, &key);
-                *intent = Some(EnvAction::DotenvWrite { key, value: None });
+                *intent = Some(EnvAction::DotenvWrite {
+                    key,
+                    value: None,
+                    file: self.delete_source.take(),
+                });
             }
             Some(false) => self.delete_confirm = None,
             _ => {}
@@ -1075,6 +1160,7 @@ fn compact_env_var_form(
             state.remove_local_value(&id.0, &id.1);
             state.var_key.clear();
             written = Some(EnvAction::DotenvWrite {
+                file: None,
                 key,
                 value: Some(value),
             });

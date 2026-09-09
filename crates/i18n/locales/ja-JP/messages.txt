@@ -864,7 +864,7 @@ file_tree.listing_folders = フォルダ一覧取得中...
 file_tree.new_file_label = 新規ファイル
 file_tree.macos_access_denied = macOS にこのフォルダへのアクセス権限がありません。
 env.var_delete_confirm.title = 環境変数の削除
-env.var_delete_confirm.body_dotenv = '{key}' を削除しますか？.env ファイルの該当行も削除されます。
+env.var_delete_confirm.body_dotenv = '{key}' を削除しますか？以下で選択したファイルの定義を削除します。
 credentials.delete_confirm.title = API キーの削除
 credentials.delete_confirm.body = '{name}' を削除しますか？キーチェーンのシークレットも削除されます。
 env.no_project_path_note = 環境変数はプロジェクトフォルダの .env ファイルに保存されます。先にプロジェクトフォルダを指定してください。
@@ -1197,3 +1197,7 @@ settings.relay.time.in_minutes = {minutes} 分後
 settings.relay.time.in_hours = {hours} 時間後
 settings.relay.time.in_days = {days} 日後
 settings.relay.time.expired = 期限切れ
+
+env.source_missing = 元の環境ファイルがありません。以下は保管された値で、新しいセッションには渡されません。
+env.delete_all_sources = すべてのファイルから削除
+env.source_read_failed = 環境ファイルを読み取れません。以下の保管値が元のファイルと一致するか確認できません。

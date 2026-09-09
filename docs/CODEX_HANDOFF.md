@@ -2726,3 +2726,20 @@
 - 새 산출물: `/private/tmp/deppy-env-main-20260909/target/bundle/Deppy Sijo.app` 및 `.zip`(실제 target `/private/tmp/deppy-ready-prs-integration-target`). 이 경로의 이전 main 빌드는 이번 #185 수정 포함 빌드로 교체됐다. 디렉터리 이름과 달리 현재 빌드/branch는 main이 아니며, main merge는 하지 않았다.
 - 재실행 보류 유지: PID 99747의 `/private/tmp/deppy-settings-session-background-20260909/target/bundle/Deppy Sijo.app/Contents/MacOS/deppy-sijo`가 계속 실행 중임을 확인했다. kill/open/dev-run.sh는 실행하지 않았다. 이번 요청의 코드 수정·검증·재빌드는 완료했고, 남은 작업은 사용자 요청에 따른 main 머지 또는 새 앱 실행/화면 확인이다.
 - 다음 시작 명령: `cd /private/tmp/deppy-env-main-20260909`; `git status --short`; `gh pr view 185`; `tail -n 12 docs/CODEX_HANDOFF.md`. 재실행 요청 시 먼저 `pgrep -x deppy-sijo` 및 `ps -o pid=,etime=,command= -p <확인한PID>`로 대상을 재확인한 뒤 위 새 bundle을 사용한다. 이 마지막 문서 갱신은 실행 코드 변경이 아니므로 재빌드를 반복하지 않는다.
+
+
+## 2026-09-09 PR #185 main 머지·빌드·재실행
+
+- 최신 사용자 요청: main 머지, 앱 빌드와 재실행 모두 승인. 이전 재실행 보류 지시는 해제됐다.
+- #185 c767f5f를 expected head 고정한 일반 merge로 main ccb7afd에 반영했다. worktree /private/tmp/deppy-env-main-20260909는 실제 main branch로 전환하고 origin/main까지 fast-forward했다. merge 결과 tree와 검증한 PR tree가 같음을 git diff로 확인했다. 원본 Relay branch/다른 worktree는 보존한다.
+- GitHub 실패 6건은 각각 runner_id=0, steps=0, payment/spending annotation으로 미실행 확인(`/tmp/deppy-pr185-merge-ci-evidence.json`). GitGuardian SUCCESS. main protected=false, 보호/ruleset 상세 API는 계정 플랜 403으로 조회 불가. 관리자 우회 없이 merge 성공했다.
+- 검증 근거: 앞 단계 32개 관련 환경 로직 및 후속 env_reload 14개 회귀, fmt/clippy/check-boundary/i18n 통과 결과를 재사용한다. 이후 코드 변경은 없고 최종 PR tree와 main tree가 동일하다. 변경 없는 Relay Linux/WebCrypto 및 전체 workspace 테스트를 이번에 실행했다고 주장하지 않는다. 의존성 manifest/lock 및 workflow 변경도 없다.
+- main release 패키징 시작(`/tmp/deppy-pr185-main-package.log`). Developer ID Application: VectorNine INC (ZDTU5LS35K) 및 bundle identifier 유지, 로컬 개발 패키지이므로 Apple 공증은 이번에도 하지 않는다. 성공 후 실행 중 PID를 재확인하고 기존 앱을 종료한 뒤 정확한 새 bundle을 실행한다. 아직 빌드/재실행 완료로 기록하지 않는다.
+- merge 직후 main Actions에는 Build and test/Dependency security만 있으며 배포 실행은 없었다. workflow 파일 탐색의 zsh glob에 일치 파일이 없어 명령이 중단됐으며 `rg --files .github/workflows`로 재확인한다. 이 중단은 merge나 build 실패가 아니다.
+- 다음 명령: `tail -n 15 /tmp/deppy-pr185-main-package.log`; `pgrep -x deppy-sijo`; `ps -o pid=,etime=,command= -p <확인한PID>`. 새 bundle 경로 `/private/tmp/deppy-env-main-20260909/target/bundle/Deppy Sijo.app`.
+
+
+- 완료: #185 main merge ccb7afd 기준 release 재빌드 57.34초, 패키징 exit 0(`/tmp/deppy-pr185-main-package.log`). Developer ID 서명, bundle/helper/plist/아키텍처 및 ZIP 재추출 검증 PASS. 로컬 개발 패키지이며 Apple 공증은 미실행이다.
+- 재실행 완료: 기존 PID 99747의 정확한 경로를 재확인한 뒤 SIGTERM으로 종료됨을 확인했다. `open '/private/tmp/deppy-env-main-20260909/target/bundle/Deppy Sijo.app'` 성공. 새 PID 38141이 실제 `/private/tmp/deppy-ready-prs-integration-target/bundle/Deppy Sijo.app/Contents/MacOS/deppy-sijo` 경로에서 실행 중임을 11초 후 확인했다. 이전 빌드 앱 대신 main 수정 포함 빌드가 실행 중이다.
+- merge 후 실행 목록에는 Build and test/Dependency security만 있었다. relay-release/relay-shell-release는 workflow_dispatch 전용임을 확인했고 배포를 실행하지 않았다. 현재 사용자 요청인 main 머지·빌드·재실행 모두 완료했다. 화면과 사용 중 동작 확인은 사용자가 진행하며 자동 화면 검증 PASS로 기록하지 않는다.
+- 수정 파일은 이 handoff뿐이며 문서 commit은 실행 코드가 같아 재빌드를 반복하지 않는다. 다음 에이전트는 `cd /private/tmp/deppy-env-main-20260909`; `git status --short`; `git log -2 --oneline`; `pgrep -x deppy-sijo`; `ps -o pid=,etime=,command= -p <현재PID>`로 현재 main/실행 상태를 확인한다. 새 버그 피드백 없으면 추가 수정·빌드·재실행이 필요하지 않다.

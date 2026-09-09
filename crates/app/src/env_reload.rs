@@ -315,15 +315,20 @@ if [[ "$DEPPY_ENV_LIVE_RELOAD" == "1" && -n "$DEPPY_PROJECT_ROOT" ]]; then
         done
       done
       # 두 파일 파싱을 마친 뒤 이전에 관리했던 일반 키의 삭제도 반영한다.
+      local -a __deppy_retained_env
+      __deppy_retained_env=()
       for __deppy_key in "${__deppy_env_keys[@]}"; do
-        if (( ! ${+__deppy_next_env[$__deppy_key]} && ! ${+__deppy_protected_env[$__deppy_key]} )); then
+        if (( ${+__deppy_protected_env[$__deppy_key]} )); then
+          # 일시 보호한 기존 관리 키만 남겨, 이후 삭제를 놓치지 않는다.
+          __deppy_retained_env+=("$__deppy_key")
+        elif (( ! ${+__deppy_next_env[$__deppy_key]} )); then
           builtin unset -- "$__deppy_key"
         fi
       done
       for __deppy_key in "${(@k)__deppy_next_env}"; do
         builtin typeset -gx -- "$__deppy_key=${__deppy_next_env[$__deppy_key]}"
       done
-      __deppy_env_keys=("${(@k)__deppy_next_env}")
+      __deppy_env_keys=("${(@k)__deppy_next_env}" "${__deppy_retained_env[@]}")
       env_contents=()
       __deppy_env_sig="$sig"
     }
@@ -532,6 +537,65 @@ print -r -- "protected:$PUBLIC"
         assert!(text.contains("ordinary:ordinary-later"), "{text}");
         assert!(text.contains("protected:ordinary-later"), "{text}");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn environment_review_일시보호한_일반키는_키나_파일_삭제후_남지_않는다() {
+        if !Path::new("/bin/zsh").exists() {
+            return;
+        }
+        for delete_file in [false, true] {
+            let dir = temp_path("protected-delete");
+            std::fs::create_dir_all(&dir).unwrap();
+            let rc = dir.join("test.zshrc");
+            std::fs::write(&rc, ZSHRC).unwrap();
+            std::fs::write(
+                dir.join(".env"),
+                "PUBLIC=ordinary-initial\nINHERITED=Bearer fake-initial\n",
+            )
+            .unwrap();
+            let output = std::process::Command::new("/bin/zsh")
+                .arg("-fc")
+                .arg(
+                    r#"
+export DEPPY_USER_ZDOTDIR="$HOME"
+export DEPPY_ENV_LIVE_RELOAD=1
+export INHERITED='Bearer fake-initial'
+builtin source "$TEST_RC"
+print -r -- "initial:$PUBLIC"
+print -r -- 'PUBLIC=Bearer fake-rotated-long' > "$DEPPY_PROJECT_ROOT/.env"
+__deppy_env_reload
+print -r -- "protected:$PUBLIC"
+print -r -- 'PUBLIC=Bearer fake-rotated-even-longer' > "$DEPPY_PROJECT_ROOT/.env"
+__deppy_env_reload
+print -r -- "protected-again:$PUBLIC"
+if [[ "$TEST_DELETE_FILE" == "1" ]]; then
+  /bin/rm -- "$DEPPY_PROJECT_ROOT/.env"
+else
+  print -r -- '# PUBLIC removed' > "$DEPPY_PROJECT_ROOT/.env"
+fi
+__deppy_env_reload
+print -r -- "deleted:${+PUBLIC} inherited:$INHERITED"
+"#,
+                )
+                .env("HOME", &dir)
+                .env("ZDOTDIR", &dir)
+                .env("TEST_RC", &rc)
+                .env("TEST_DELETE_FILE", if delete_file { "1" } else { "0" })
+                .env("DEPPY_PROJECT_ROOT", &dir)
+                .output()
+                .unwrap();
+            let text = String::from_utf8_lossy(&output.stdout);
+            std::fs::remove_dir_all(dir).unwrap();
+            assert!(output.status.success(), "{text}");
+            assert!(text.contains("initial:ordinary-initial"), "{text}");
+            assert!(text.contains("protected:ordinary-initial"), "{text}");
+            assert!(text.contains("protected-again:ordinary-initial"), "{text}");
+            assert!(
+                text.contains("deleted:0 inherited:Bearer fake-initial"),
+                "delete_file={delete_file}: {text}"
+            );
+        }
     }
 
     #[test]

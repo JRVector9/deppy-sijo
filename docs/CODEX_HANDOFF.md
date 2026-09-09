@@ -2696,3 +2696,27 @@
 - 남은 작업: commit/push 및 main 대상 수정 PR. 이번 수정 요청으로 main 자동 머지·앱 빌드·재실행은 하지 않는다. 다음 명령 `git diff --check`; `git push -u origin fix/environment-review-followup`; `gh pr create --base main --head fix/environment-review-followup --title "fix: 환경 설정 변경 경합과 API 추가 대기 상태 수정" --body-file /tmp/deppy-env-review-fix-pr.md`.
 
 - 수정 PR 생성 완료: #185 https://github.com/JRVector9/deppy-sijo/pull/185, 구현 commit ba6c897, base main 50df4bd. 세 리뷰 지적은 코드 수정과 관련 로직 검증까지 완료했다. main 머지와 앱 재빌드/재실행은 대기다. 현재 worktree는 main 자체가 아니라 fix/environment-review-followup branch이므로 다음 작업 전 `git branch --show-current`로 확인한다.
+
+
+## 2026-09-09 PR #185 두 번째 코드 리뷰
+
+- 요청/범위: 사용자 “한번더 코드 리뷰해봐”. main 50df4bd 대비 fix/environment-review-followup HEAD 629600b(구현 ba6c897)의 소스 4개와 호출부를 다시 검토했다. 구현 수정/머지/앱 재빌드/재실행은 하지 않았다. 이번 변경 파일은 이 handoff뿐이다.
+- 발견 Medium 1(실제 zsh 재현, 신뢰 10/10): env_reload.rs:309~310/319/326. 일반 키 PUBLIC을 훅이 관리하던 중 값을 Bearer 패턴으로 바꾸면 현재 값은 보호되지만 __deppy_next_env에서 빠져 다음 __deppy_env_keys에서도 제거된다. 그 뒤 파일에서 PUBLIC을 완전히 삭제해도 삭제 루프가 해당 키를 검사하지 않아 이전 ordinary-initial 값이 셸과 이후 자식 프로세스에 계속 남는다. 기존 관리 키 중 일시 보호한 키는 삭제 추적에 유지해야 한다. 원래 훅이 관리하지 않았던 초기 민감 키까지 새로 삭제 대상으로 등록하지는 않아야 한다.
+- 검증: 실제 main/HEAD의 ZSHRC를 git show로 추출해 임시 HOME/ZDOTDIR/프로젝트 파일 및 가짜 값만 사용했다. `python3 /tmp/deppy-env-review2-repro.py` 실행: main 일반→삭제 PASS, main 일반→민감→삭제 PASS, HEAD 일반→삭제 PASS, HEAD 일반→민감→삭제 FAIL(expected unset, actual ordinary-initial). 셸/스크립트 exit 0은 재현 실행 완료이며 네 시나리오 전체 PASS가 아니다. 결과 `/tmp/deppy-env-review2-comparison.log`, 최초 추적 목록 확인 `/tmp/deppy-env-review2-deletion-repro.log`.
+- 나머지 검토: settings_generation 캡처/검증과 stale 실패 시 승인·restore·placeholder 정리, API 추가 완료의 pending 해제/초안 보존 호출을 추적했다. 이 경로에서 추가로 확정한 결함은 없다. 설정 worker 완료와 dotenv worker 소비의 전후 순서도 읽었으나 전체 App 동시성 재현은 실행하지 않았으므로 완전한 경합 검증을 주장하지 않는다. 이전 32개 테스트/게이트 결과는 앞 절의 실행 결과이며 이번 리뷰에서 반복하지 않았다.
+- 남은 작업: 위 삭제 추적 회귀 수정 및 일반→민감→삭제/파일 전체 삭제 회귀 보강. 현재 요청은 리뷰이므로 구현은 대기한다. PR #185는 아직 main 미반영이고 이전 main 빌드에도 이번 수정은 포함되지 않는다.
+- 다음 명령: `cd /private/tmp/deppy-env-main-20260909`; `git status --short`; `git diff`; `python3 /tmp/deppy-env-review2-repro.py`; `sed -n '302,328p' crates/app/src/env_reload.rs`. 수정 승인 시 로직 회귀부터 추가하고 관련 env_reload 테스트만 재검증한다. 앱 재실행 보류를 유지한다.
+
+
+## 2026-09-09 PR #185 삭제 추적 수정·재빌드 착수
+
+- 사용자 코드 수정/재빌드 승인. 재실행은 계속 보류한다. 현재 branch fix/environment-review-followup, 기준 629600b. 기존 리뷰 handoff 변경을 보존한다.
+- 회귀 추가: 일반값→민감값 두 번 변경→키 삭제/파일 삭제 두 경로를 실제 임시 zsh로 확인한다. 처음부터 주입된 민감 키는 훅이 관리하지 않았으므로 삭제하지 않아야 한다. 현재 RED 실행 중(`/tmp/deppy-env-review2-red.log`), 성공/실패를 아직 확정하지 않는다.
+- 계획: 기존 관리 키 중 현재 보호된 키만 다음 삭제 추적에 남기고, env_reload 관련 회귀/커밋 전 게이트 후 PR #185를 갱신한다. 그 commit으로 Developer ID 서명 로컬 release package를 만들고 실행은 하지 않는다. 현재 실행 앱 PID 99747은 별도 settings-session-background bundle이다.
+- 다음 명령: `tail -n 25 /tmp/deppy-env-review2-red.log`; 멈춤 의심 시 `ps -axo pid,ppid,%cpu,state,etime,comm`. 앱 kill/open/dev-run.sh 금지.
+
+
+- 삭제 추적 수정 완료: env_reload.rs에서 기존 관리 키 중 현재 민감값으로 보호된 키를 별도 배열에 유지하고, 다음 삭제 추적 목록에 합친다. 일반 적용 목록과 보호 목록은 서로 배타적이므로 중복/누적 증가하지 않으며 기존 4096항목 파싱 상한 안에 있다. 초기 민감 키는 새로 관리 대상으로 등록하지 않는다.
+- 검증: 새 회귀에서 deleted:1로 실제 RED 확인(`/tmp/deppy-env-review2-red.log`). 수정 뒤 `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo test --locked -p deppy-sijo --bin deppy-sijo -- env_reload::tests --test-threads=1` 14 PASS(3.04초, `/tmp/deppy-env-review2-green.log`). 키 삭제와 파일 삭제, 연속 보호, 초기 민감값 보존을 포함한다.
+- 커밋 전 게이트 PASS: fmt/diff, workspace clippy all-targets(15.45초), check-boundary, i18n-check(1150 literal keys/5 locales). 로그 `/tmp/deppy-env-review2-{clippy,boundary,i18n}.log`. 소스 재검토에서 보호 해제 후 일반값 우선순위와 관리 키 수명도 확인했다. 전체 테스트/화면 확인은 수행하지 않았다.
+- 남은 작업: 코드와 handoff를 commit/push해 #185 갱신 후 같은 commit으로 로컬 release 패키징. main merge는 요청 범위 밖이라 진행하지 않는다. 기존 실행 앱은 유지한다. 패키징 명령: `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target DEPPY_SIGN_IDENTITY='Developer ID Application: VectorNine INC (ZDTU5LS35K)' DEPPY_REQUIRE_TRUSTED_SIGNING=0 DEPPY_ALLOW_UNTRUSTED_SIGNING=1 sh scripts/package-macos.sh > /tmp/deppy-env-review2-package.log 2>&1`. Apple 공증 없는 로컬 개발 패키지이며 서명/ZIP 검증까지 성공 후에만 빌드 PASS로 기록한다.

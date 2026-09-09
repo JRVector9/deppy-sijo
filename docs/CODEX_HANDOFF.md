@@ -2769,3 +2769,8 @@
   i18n-check는 실행하지 않았고 UI 회귀 테스트도 CLAUDE.md 지침에 따라 실행하지 않았다.
 - 다음 명령: `git add crates/app/src/ui/workspace.rs docs/CODEX_HANDOFF.md`; 구현 commit 후
   push/PR 생성과 Obsidian 프로젝트 일지 기록. 재빌드·재실행은 계속 보류한다.
+- 구현 commit `5f0bbc1`을 push하고 main 대상 PR #187을 생성했다:
+  https://github.com/JRVector9/deppy-sijo/pull/187. Obsidian 프로젝트 일지
+  `프로젝트 일지/deppy-sijo/2026-09-09 터미널 상단 아이콘 확대.md`도 기록했다.
+- 구현·리뷰·PR 생성은 완료했다. 앱 PID 38141은 기존 main 빌드 그대로다. 다음 단계는
+  사용자 승인 후 #186/#187을 통합한 빌드로 재실행하고 실제 크기·정렬을 화면 확인한다.

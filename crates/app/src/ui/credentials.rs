@@ -710,7 +710,7 @@ impl CredentialsUi {
                         );
                         truncate_utf8(draft, 256);
                         let valid = draft.trim().is_empty()
-                            || storage::Db::validate_credential_env_name(draft.trim()).is_ok();
+                            || deppy_core::credential_env::valid_name(draft.trim());
                         if ui
                             .add_enabled(
                                 valid && !self.binding_pending && intent.is_none(),
@@ -786,7 +786,7 @@ impl CredentialsUi {
                 && !self.add_pending
                 && snapshot.is_available()
                 && (self.env_name.trim().is_empty()
-                    || storage::Db::validate_credential_env_name(self.env_name.trim()).is_ok());
+                    || deppy_core::credential_env::valid_name(self.env_name.trim()));
             if ui
                 .add_enabled(filled, egui::Button::new(catalog.t("action.add", &[])))
                 .clicked()

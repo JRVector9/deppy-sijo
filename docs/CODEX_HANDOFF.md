@@ -2643,3 +2643,6 @@
 - 사용자 작업 보존: `/private/tmp/deppy-settings-session-background-20260909`의 file_tree/settings/workspace/renderer_egui/handoff 미커밋 수정은 그대로 있다. 통합 시 이 화면 수정이 빠져 이전 화면으로 돌아가지 않도록 먼저 diff를 확인한다.
 - 남은 확인: 승인된 시점에 5개 PR과 별도 화면 변경을 함께 통합하고 패키징/재실행 후 사용자 화면을 확인한다. 조회 오류 해제, 파일 선택·편집/삭제, API 연결·해제, 새 Agent 적용 상태, workspace 전환을 확인한다. 화면 미검증은 PASS가 아니다.
 - 다음 에이전트 시작 명령: `cd /private/tmp/deppy-env-application-20260909`; `cat AGENTS.md`; `cat CLAUDE.md`; `tail -n 75 docs/CODEX_HANDOFF.md`; `git status --short`; `git diff`; `gh pr view 183`; `git -C /private/tmp/deppy-settings-session-background-20260909 diff --stat`. 승인 없이 기존 앱을 종료하거나 main에 머지하지 않는다.
+- main 통합 사전 검사 보완: xtask check-boundary가 UI의 storage::Db 정적 검증 호출을 발견했다. 이름 검증을 deppy_core::credential_env의 순수 함수로 옮겨 UI/저장소가 같은 규칙을 사용한다. 기존 문자/길이 계약은 그대로다. 이전 fmt/clippy/i18n 통과가 boundary 통과를 의미하지 않았으며 이 누락을 수정 중이다.
+
+- PR 3 경계 보완은 storage 연결 회귀 3 PASS와 check-boundary PASS 뒤 ee52883으로 기록했다. PR 4는 해당 commit을 merge로 받아 core 모듈 선언/handoff 충돌에서 양쪽 내용을 모두 보존했다. 파일 선택 UI도 기존 core 순수 함수 직접 호출로 변경했다. rebase/force-push는 사용하지 않았다.

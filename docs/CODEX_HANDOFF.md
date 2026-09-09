@@ -2794,3 +2794,11 @@
   `ui/agent_terminal.rs`, locale 5개, 구현 계획과 이 handoff. 다음은 구현 commit/push,
   Obsidian 프로젝트 일지, main 대상 PR 생성이다. 앱 PID 38141은 기존 main 빌드 그대로며
   패키징·재실행·화면 PASS는 아직 수행하지 않았다.
+
+- 구현 commit `5a3ba98`을 push하고 main 대상 PR #186을 생성했다:
+  https://github.com/JRVector9/deppy-sijo/pull/186. Obsidian 프로젝트 일지
+  `프로젝트 일지/deppy-sijo/2026-09-09 Cursor 사용량 상태바.md`에도 설계, 보안 경계,
+  리뷰 수정과 검증 결과를 기록했다.
+- 현재 요청의 구현·리뷰·PR 생성은 완료했다. main 머지와 새 package 빌드, 기존 앱 PID
+  38141 종료, 새 앱 실행은 하지 않았다. 다음 단계는 사용자에게 재빌드·재실행 승인을
+  받아 PR branch 화면에서 Cursor `월 N%`/compact `N%`/hover를 직접 확인하는 것이다.

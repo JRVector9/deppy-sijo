@@ -97,13 +97,13 @@ Run fmt check, workspace clippy all-targets with warnings denied, `xtask i18n-ch
 
 Expected: all commands exit 0.
 
-- [ ] **Step 3: Commit and create the PR**
+- [x] **Step 3: Commit and create the PR**
 
 Commit the implementation with a Korean conventional message, push
 `feat/cursor-usage-status`, and create a PR against `main` describing that Cursor supplies a
 monthly billing-cycle percentage rather than a weekly window.
 
-- [ ] **Step 4: Wait before rebuilding or restarting**
+- [x] **Step 4: Wait before rebuilding or restarting**
 
 Do not replace the running app. Report the concrete PR and ask for the explicit rebuild/restart
 approval required by the session rule.

@@ -840,6 +840,10 @@ CREATE INDEX idx_relay_devices_recency
      WHEN NEW.workspace_id IS NOT NULL AND EXISTS(SELECT 1 FROM workspace_credential_env
        WHERE credential_id=OLD.id AND workspace_id<>NEW.workspace_id)
      BEGIN SELECT RAISE(ABORT, 'credential_env_owner_invalid'); END;",
+    // v42: 프로젝트가 명시적으로 선택한 dotenv 파일과 적용 순서다. 빈 배열은 사용 중지다.
+    "CREATE TABLE workspace_env_sources (
+       workspace_id TEXT PRIMARY KEY REFERENCES workspaces(id) ON DELETE CASCADE,
+       files_json TEXT NOT NULL CHECK(typeof(files_json)='text' AND length(CAST(files_json AS BLOB)) <= 8192));",
 
 ];
 
@@ -3599,6 +3603,7 @@ pub struct SettingsAgentsSnapshotRows {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SettingsEnvironmentSnapshotRows {
     pub credential_env: Vec<CredentialEnvBinding>,
+    pub env_source_files: Vec<String>,
     pub credentials: Vec<CredentialMeta>,
     pub profiles: Vec<EnvProfileRow>,
     pub env_vars: Vec<SettingsWorkspaceEnvVarRow>,
@@ -11537,13 +11542,17 @@ impl Db {
             "settings_environment_snapshot_retained_bytes_limit"
         );
 
+        let env_source_files = Self::env_source_files_in_snapshot(&tx, workspace_id)?;
         let credential_env = Self::credential_env_bindings_in_snapshot(&tx, workspace_id)?;
         let binding_bytes: usize = credential_env
             .iter()
             .map(|binding| binding.env_name.len() + binding.credential_id.len())
             .sum();
         anyhow::ensure!(
-            retained_bytes.saturating_add(binding_bytes) <= SETTINGS_SNAPSHOT_BYTES_MAX,
+            retained_bytes
+                .saturating_add(binding_bytes)
+                .saturating_add(env_source_files.iter().map(String::len).sum::<usize>())
+                <= SETTINGS_SNAPSHOT_BYTES_MAX,
             "settings_environment_snapshot_retained_bytes_limit"
         );
         let credentials = {
@@ -11607,6 +11616,7 @@ impl Db {
             .context("settings environment snapshot transaction commit failed")?;
         Ok(SettingsEnvironmentSnapshotRows {
             credential_env,
+            env_source_files,
             credentials,
             profiles,
             env_vars,

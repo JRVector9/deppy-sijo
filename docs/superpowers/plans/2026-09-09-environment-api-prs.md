@@ -34,7 +34,7 @@
 
 ## PR 3 — API credential과 Agent 환경 연결
 
-- 구현 완료, 최종 게이트/PR 생성 중. API 연결이 있는 프로젝트는 eval 기반 셸 라이브 반영을 끄며 새 실행부터 적용한다.
+- 구현 완료: #181 (draft), commit `b21aec5`. API 연결이 있는 프로젝트는 eval 기반 셸 라이브 반영을 끄며 새 실행부터 적용한다.
 
 - 브랜치: `feat/workspace-credential-env`, base PR 2.
 - 파일: `crates/storage/src/db.rs` 및 기존 migration 체계, `crates/app/src/app.rs`, `ui/credentials.rs`, `crates/runtime/src/in_process.rs`, 로케일 5개.
@@ -45,6 +45,8 @@
 - 검증: workspace 격리, env 이름 검증, 중복 충돌, 변경/해제/삭제, Keychain 실패, spawn 주입. 명령 `cargo test -p storage credential_env` 및 `cargo test -p runtime credential_env`와 app 연결 테스트.
 
 ## PR 4 — 환경파일 선택과 출처
+
+- 구현 완료, 최종 게이트/PR 생성 중. 첫 범위는 루트의 영문·숫자·._- 파일명 16개까지다. 하위 경로는 지원하지 않는다. 빈 목록과 루트 연결 해제는 복원에서도 파일을 주입하지 않는다.
 
 - 브랜치: `feat/workspace-env-sources`, base PR 3.
 - 파일: storage migration, `runtime/src/dotenv.rs`, `app/src/dotenv_sync.rs`, `app.rs`, `ui/env_profiles.rs`, watcher 연결, 로케일 5개.

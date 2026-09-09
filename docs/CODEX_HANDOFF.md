@@ -2581,4 +2581,27 @@
 
 - PR 3 최종 게이트 PASS: workspace clippy all-targets 16.77초, fmt/diff, i18n-check(1135 literal keys/5 locale). `/tmp/deppy-api-clippy-final.log`, `/tmp/deppy-api-i18n-final.log`. 변경 파일과 테스트는 위 checkpoint를 따른다. 화면 검증은 미실행이므로 draft PR로 제출한다. 다음은 `feat/workspace-env-sources` worktree를 이 commit 위에 생성하고 PR 4를 구현한다.
 
+
+## 2026-09-09 환경파일 선택 PR 4 착수
+
+- PR 3은 #181 https://github.com/JRVector9/deppy-sijo/pull/181, commit b21aec5, draft(base #180). 현재 worktree `/private/tmp/deppy-env-sources-20260909`, branch `feat/workspace-env-sources`.
+- 목표: 프로젝트별 dotenv 파일 목록·순서·출처를 저장하고 편집/동기화/새 실행/복원에서 일치시킨다. 명시하지 않으면 `.env`, `.env.local`. 빈 선택은 파일 주입 중지다.
+- 범위 결정: 첫 지원은 루트 안의 파일명(최대 16개, 이름 255바이트)이다. 하위 디렉터리/절대경로/..와 symlink를 허용하지 않는다. 디렉터리 교체 공격면과 UI 복잡도를 줄이고 .env.development/production 등의 명시 선택을 제공한다. 발견만으로 자동 활성화하지 않는다.
+- 현재: 선택 테이블 존재 회귀를 먼저 추가했다. 다음은 migration v42/저장 API, 유계 파일목록 reader/editor, settings intent 및 watcher/복원 연결이다. 테스트·화면·앱 재시작은 아직 수행하지 않았다.
+
+- PR 4 구현 checkpoint: storage v42 선택목록 CRUD/검증/빈 배열 중지, snapshot에서 같은 transaction으로 목록을 읽는다. 파일 reader/editor/출처/ignore 보강은 같은 목록과 합산 예산을 사용한다. 런타임 기본 env에 선택 root/files를 포함(protocol v16)하고 복원도 pane cwd 대신 지정 프로젝트 파일을 읽는다. 프레임 캐시는 선택 목록으로 stamp를 계산하며 watcher 루트 파일 이벤트를 선택 목록으로 거른다. UI는 파일명/순서 편집, 저장 대상, 행별 실제 출처와 우선순위 툴팁을 제공한다.
+- 검증: 선택 테이블 RED 확인 뒤 storage 2 PASS. 파일 편집/중복삭제/출처/순서/심볼릭링크/합산예산 테스트 app 2 PASS(추가 worker 검증 전). compile check에서 hover Response 이동 오류를 찾아 반환값을 보존하도록 수정했다. 기존 앱은 계속 실행 중이며 화면 검증은 미실행이다.
+- 다음: workspace_sources 필터 app/runtime/storage, dotenv_sync 및 runtime dotenv 회귀, 소스 리뷰와 게이트 뒤 commit/PR #181 base. 이후 PR 5 적용 revision/실행 상태.
+
+- 검증 보완: dotenv contract 테스트가 구체 `storage::Db` 의존을 발견했다. 선택 규칙을 새 `crates/core/src/env_sources.rs`의 순수 함수로 옮겨 app dotenv 모듈의 DB 무접근 계약을 보존했다. 잘못된 문자열 앵커로 사용자 목록의 라이브 훅 비활성화 조건이 누락되어 실제 worker 테스트에서 FAIL했고 직접 위치를 수정했다. runtime 파일 타입 오류 코드도 기존 계약과 맞췄다.
+- 현재 PASS: workspace_sources app 3/runtime 1/storage 2(`/tmp/deppy-sources-worker-final.log`), dotenv_sync 전체 47(`/tmp/deppy-sources-dotenv-final.log`), runtime dotenv 7(`/tmp/deppy-sources-runtime-test.log`). 소스 리뷰 `/tmp/deppy-sources-review.txt` 진행 중. 다음은 리뷰 수정과 최종 게이트, commit/draft PR이다.
+
+- 소스 리뷰에서 High 1(루트 해제 시 명시적 빈 선택이 None으로 소실되어 복원 fallback으로 .env 재주입), Medium 1(255바이트 파일명에 긴 suffix를 붙인 임시파일 생성 실패)을 발견했다. app worker와 실제 파일 편집 테스트에서 둘 다 FAIL을 확인한 뒤, 선택 DTO의 root를 Option으로 보존하고 임시파일명을 짧은 UUID 이름으로 변경했다. root None 선택은 런타임에서 빈 파일 환경으로 처리한다.
+- 추가 PASS: storage 전체 343, runtime command 19/protocol 2. 위 리뷰 수정 뒤 targeted/게이트 재실행 중이며 아직 최종 PASS로 기록하지 않는다.
+
+- PR 4 리뷰 반영 재검증 PASS: app 선택/파일회귀 4, runtime 선택 복원 1(`/tmp/deppy-sources-review-fixed.log`). workspace clippy all-targets PASS(20.02초), fmt/diff PASS. i18n-check 진행 중. 선택 규칙 공용화와 Option root를 포함한 새 protocol v16은 기존 v15와 혼용하지 않는다. 화면 검증·패키징·재시작은 미실행이다.
+
+- PR 4 최종 게이트 모두 PASS: i18n-check 1142 literal keys/5 locale도 완료했다(`/tmp/deppy-sources-i18n.log`). 다음 명령은 commit/push와 #181 base draft PR 생성, 이어서 `git worktree add -b feat/environment-application-status /private/tmp/deppy-env-application-20260909 HEAD`로 PR 5를 구현한다.
 - main 통합 사전 검사 보완: xtask check-boundary가 UI의 storage::Db 정적 검증 호출을 발견했다. 이름 검증을 deppy_core::credential_env의 순수 함수로 옮겨 UI/저장소가 같은 규칙을 사용한다. 기존 문자/길이 계약은 그대로다. 이전 fmt/clippy/i18n 통과가 boundary 통과를 의미하지 않았으며 이 누락을 수정 중이다.
+
+- PR 3 경계 보완은 storage 연결 회귀 3 PASS와 check-boundary PASS 뒤 ee52883으로 기록했다. PR 4는 해당 commit을 merge로 받아 core 모듈 선언/handoff 충돌에서 양쪽 내용을 모두 보존했다. 파일 선택 UI도 기존 core 순수 함수 직접 호출로 변경했다. rebase/force-push는 사용하지 않았다.

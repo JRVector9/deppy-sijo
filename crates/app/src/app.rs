@@ -1121,7 +1121,8 @@ fn sync_workspace_dotenv_at_root(
     workspace_id: &str,
     root: &Path,
 ) -> anyhow::Result<Option<crate::dotenv_sync::DotenvSyncReport>> {
-    let Some(plan) = crate::dotenv_sync::load_workspace_dotenv_plan(root)? else {
+    let files = db.env_source_files(workspace_id)?;
+    let Some(plan) = crate::dotenv_sync::load_workspace_dotenv_plan_for_files(root, &files)? else {
         return Ok(None);
     };
     crate::dotenv_sync::apply_workspace_dotenv_plan(
@@ -1436,6 +1437,7 @@ struct DotenvSyncJob {
 }
 
 struct DotenvSyncPayload {
+    dotenv_source: Option<runtime::dotenv::DotenvSourceSelection>,
     source_failed: bool,
     api_secrets: EnvPairs,
     report: Option<crate::dotenv_sync::DotenvSyncReport>,
@@ -1449,8 +1451,14 @@ fn configure_dotenv_live_reload(
     enabled: bool,
     root: Option<&std::path::Path>,
 ) {
-    let enabled =
-        enabled && !payload.source_failed && payload.api_secrets.is_empty() && root.is_some();
+    let enabled = enabled
+        && !payload.source_failed
+        && payload.api_secrets.is_empty()
+        && root.is_some()
+        && payload
+            .dotenv_source
+            .as_ref()
+            .is_none_or(|source| source.files == Db::default_env_source_files());
     payload
         .env_plain
         .retain(|(key, _)| key != "DEPPY_ENV_LIVE_RELOAD" && key != "DEPPY_PROJECT_ROOT");
@@ -1466,6 +1474,7 @@ fn configure_dotenv_live_reload(
 }
 
 struct DotenvSyncOutcome {
+    source_files: Vec<String>,
     workspace_id: String,
     root: Option<PathBuf>,
     runtime_instance: u64,
@@ -3063,6 +3072,9 @@ enum WorkspaceMutationPurpose {
 }
 
 enum SettingsJobAction {
+    SetEnvSources {
+        files: Option<Vec<String>>,
+    },
     Load,
     SetCredentialEnv {
         credential_id: String,
@@ -3166,6 +3178,7 @@ impl SettingsOperationKey {
 }
 
 enum SettingsOutcomeKind {
+    EnvSourcesSet(Result<(), SettingsErrorCode>),
     Loaded,
     CredentialEnvSet(Result<(), SettingsErrorCode>),
     CredentialAdded(Result<(), SettingsErrorCode>),
@@ -3216,6 +3229,7 @@ enum SettingsOutcomeKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsErrorCode {
+    EnvSources,
     CredentialBinding,
     CredentialAdd,
     CredentialDelete,
@@ -3278,14 +3292,20 @@ struct PreparedProxyLaunch {
     config_flag: String,
 }
 
+#[cfg(test)]
 fn dotenv_state_for_root(root: Option<&std::path::Path>) -> DotenvState {
+    dotenv_state_for_sources(root, &Db::default_env_source_files())
+}
+
+fn dotenv_state_for_sources(root: Option<&std::path::Path>, files: &[String]) -> DotenvState {
     let Some(root) = root else {
         return (false, None);
     };
     use std::hash::{Hash, Hasher};
     let mut hasher = std::hash::DefaultHasher::new();
     let mut exists = false;
-    for name in crate::dotenv_sync::DOTENV_FILE_NAMES {
+    files.hash(&mut hasher);
+    for name in files {
         match std::fs::metadata(root.join(name)) {
             Ok(meta) => {
                 exists = true;
@@ -3301,7 +3321,10 @@ fn dotenv_state_for_root(root: Option<&std::path::Path>) -> DotenvState {
     }
     let digest = hasher.finish();
     let surrogate = std::time::UNIX_EPOCH + std::time::Duration::from_nanos(digest >> 1);
-    (exists, exists.then_some(surrogate))
+    (
+        exists,
+        (exists || files != Db::default_env_source_files()).then_some(surrogate),
+    )
 }
 
 fn load_dotenv_default_env(db: &Db, workspace_id: &str) -> anyhow::Result<(EnvPairs, EnvPairs)> {
@@ -3327,17 +3350,25 @@ fn execute_dotenv_sync_job(
     resource: &mut AppDotenvResource,
     job: DotenvSyncJob,
 ) -> Result<DotenvSyncOutcome, crate::dotenv_sync::DotenvWorkerErrorCode> {
-    // Capture the source immediately before reading. A change during the read differs from the
-    // next event-driven request and cannot make an old result current.
-    let baseline = dotenv_state_for_root(job.root.as_deref());
-    let mut execute = || -> anyhow::Result<Option<DotenvSyncPayload>> {
+    let db = match &mut resource.db {
+        Some(db) => db,
+        slot @ None => slot.insert(
+            Db::open(&resource.db_path)
+                .map_err(|_| crate::dotenv_sync::DotenvWorkerErrorCode::ExecuteFailed)?,
+        ),
+    };
+    let source_files = db
+        .env_source_files(&job.workspace_id)
+        .map_err(|_| crate::dotenv_sync::DotenvWorkerErrorCode::ExecuteFailed)?;
+    let baseline = dotenv_state_for_sources(job.root.as_deref(), &source_files);
+    let selection = Some(runtime::dotenv::DotenvSourceSelection {
+        root: job.root.clone(),
+        files: source_files.clone(),
+    });
+    let execute = || -> anyhow::Result<Option<DotenvSyncPayload>> {
         if !job.force && job.previous_state == Some(baseline) {
             return Ok(None);
         }
-        let db = match &mut resource.db {
-            Some(db) => db,
-            slot @ None => slot.insert(Db::open(&resource.db_path)?),
-        };
         let api_secrets = db
             .list_credential_env_bindings(&job.workspace_id)?
             .into_iter()
@@ -3345,6 +3376,7 @@ fn execute_dotenv_sync_job(
             .collect();
         let Some(root) = job.root.as_deref() else {
             return Ok(Some(DotenvSyncPayload {
+                dotenv_source: selection.clone(),
                 source_failed: false,
                 api_secrets,
                 report: None,
@@ -3354,7 +3386,7 @@ fn execute_dotenv_sync_job(
         };
         // API 조회 성공과 파일 동기화 실패를 분리한다. 보관된 dotenv 값은 주입하지 않는다.
         let source = (|| -> anyhow::Result<_> {
-            if job.migrate_legacy {
+            if job.migrate_legacy && source_files == Db::default_env_source_files() {
                 let mut repository = AppDotenvRepository(db);
                 crate::dotenv_sync::migrate_legacy_profiles_to_dotenv(
                     &mut repository,
@@ -3388,6 +3420,7 @@ fn execute_dotenv_sync_job(
             }
         };
         Ok(Some(DotenvSyncPayload {
+            dotenv_source: selection,
             source_failed,
             api_secrets,
             report,
@@ -3396,8 +3429,12 @@ fn execute_dotenv_sync_job(
         }))
     };
     match execute() {
-        Ok(payload) if dotenv_state_for_root(job.root.as_deref()) == baseline => {
+        Ok(payload)
+            if dotenv_state_for_sources(job.root.as_deref(), &source_files) == baseline
+                && db.env_source_files(&job.workspace_id).ok().as_ref() == Some(&source_files) =>
+        {
             Ok(DotenvSyncOutcome {
+                source_files,
                 workspace_id: job.workspace_id,
                 root: job.root,
                 runtime_instance: job.runtime_instance,
@@ -3557,20 +3594,18 @@ fn load_environment_snapshots(
     ui::credentials::CredentialsSnapshot,
 ) {
     let loaded = (|| -> anyhow::Result<_> {
-        let sources = project_root.map(|root| {
-            crate::dotenv_sync::load_dotenv_sources(root).unwrap_or_else(|_| {
-                tracing::warn!(
-                    kind = "settings",
-                    phase = "dotenv_sources",
-                    error_code = "source_read_failed"
-                );
-                crate::dotenv_sync::DotenvSources {
-                    read_failed: true,
-                    ..Default::default()
-                }
-            })
-        });
         let rows = db.settings_environment_snapshot_rows(workspace_id)?;
+        let sources = project_root.map(|root| {
+            crate::dotenv_sync::load_dotenv_sources_for_files(root, &rows.env_source_files)
+                .unwrap_or_else(|_| {
+                    tracing::warn!(error_code = "source_read_failed", "환경파일 출처 조회 실패");
+                    crate::dotenv_sync::DotenvSources {
+                        selected_files: rows.env_source_files.clone(),
+                        read_failed: true,
+                        ..Default::default()
+                    }
+                })
+        });
         let bindings = rows
             .credential_env
             .iter()
@@ -4312,6 +4347,13 @@ fn execute_settings_job_with_repair(
     let mut refresh = false;
     let kind = match action {
         SettingsJobAction::Load => SettingsOutcomeKind::Loaded,
+        SettingsJobAction::SetEnvSources { files } => {
+            let result = db
+                .set_env_source_files(&workspace_id, files.as_deref())
+                .map_err(|_| SettingsErrorCode::EnvSources);
+            refresh = result.is_ok();
+            SettingsOutcomeKind::EnvSourcesSet(result)
+        }
         SettingsJobAction::SetCredentialEnv {
             credential_id,
             env_name,
@@ -4474,8 +4516,10 @@ fn execute_settings_job_with_repair(
                 .as_deref()
                 .context("settings_dotenv_root_missing")
                 .and_then(|root| {
-                    crate::dotenv_sync::write_env_var_in_file(
+                    let sources = db.env_source_files(&workspace_id)?;
+                    crate::dotenv_sync::write_env_var_in_sources(
                         root,
+                        &sources,
                         file.as_deref(),
                         &key,
                         value.as_deref(),
@@ -4491,7 +4535,7 @@ fn execute_settings_job_with_repair(
                 .as_deref()
                 .context("settings_dotenv_root_missing")
                 .and_then(|root| {
-                    {
+                    if db.env_source_files(&workspace_id)? == Db::default_env_source_files() {
                         let mut repository = AppDotenvRepository(db);
                         crate::dotenv_sync::migrate_legacy_profiles_to_dotenv(
                             &mut repository,
@@ -4607,6 +4651,9 @@ fn execute_settings_job_with_repair(
 fn settings_open_failed_outcome(job: SettingsJob) -> SettingsOutcome {
     let kind = match job.action {
         SettingsJobAction::Load => SettingsOutcomeKind::Loaded,
+        SettingsJobAction::SetEnvSources { .. } => {
+            SettingsOutcomeKind::EnvSourcesSet(Err(SettingsErrorCode::EnvSources))
+        }
         SettingsJobAction::SetCredentialEnv { .. } => {
             SettingsOutcomeKind::CredentialEnvSet(Err(SettingsErrorCode::CredentialBinding))
         }
@@ -7427,6 +7474,7 @@ struct WorkspaceRuntime {
     scrollback_delivery: crate::scrollback_policy::Delivery,
     /// Source stamp whose default env was accepted by this exact runtime lifetime.
     dotenv_state: Option<DotenvState>,
+    dotenv_files: Vec<String>,
     runtime: InProcessRuntimeClient,
     events: RuntimeEventReceiver,
     workspace_ui: ui::workspace::WorkspaceUi,
@@ -12319,7 +12367,8 @@ impl AppFileTreeWatcher {
             {
                 continue;
             }
-            let env_file = app_file_tree_env_candidate(&path);
+            let env_file =
+                path.parent() == Some(self.root.as_path()) || app_file_tree_env_candidate(&path);
             if !self.show_hidden && app_file_tree_hidden_component(&self.root, &path) && !env_file {
                 continue;
             }
@@ -14618,6 +14667,7 @@ impl App {
                 std::time::Instant::now(),
             ),
             dotenv_state: None,
+            dotenv_files: Db::default_env_source_files(),
             runtime,
             events: runtime_events,
             workspace_ui: ui::workspace::WorkspaceUi::with_resize_owner(
@@ -15940,7 +15990,10 @@ impl App {
                 }
                 continue;
             }
-            let source_state = dotenv_state_for_root(self.active_tree_root().as_deref());
+            let source_state = dotenv_state_for_sources(
+                self.active_tree_root().as_deref(),
+                &self.active.dotenv_files,
+            );
             if self.active.session_dotenv_states.get(&result.session) != Some(&source_state) {
                 continue;
             }
@@ -16942,7 +16995,10 @@ impl App {
         if !persisted_agent_kind_is_resumable(&saved.kind) {
             return false;
         }
-        let source_state = dotenv_state_for_root(self.active_tree_root().as_deref());
+        let source_state = dotenv_state_for_sources(
+            self.active_tree_root().as_deref(),
+            &self.active.dotenv_files,
+        );
         if self.active.session_dotenv_states.get(&session) != Some(&source_state) {
             tracing::warn!(
                 kind = "agent_resume",
@@ -19904,7 +19960,7 @@ impl App {
         session_spawn_skips_dotenv_worker(
             command,
             runtime.dotenv_state,
-            dotenv_state_for_root(root.as_deref()),
+            dotenv_state_for_sources(root.as_deref(), &runtime.dotenv_files),
             creation_blocked,
         )
     }
@@ -22978,7 +23034,7 @@ impl App {
     /// 설정 창에서 선택한 workspace의 `.env` 동기화를 bounded worker에 제출한다.
     /// 활성 workspace는 runtime 기본 env 갱신까지 수행하는 기존 dotenv worker를 쓰고,
     /// 비활성 workspace는 Settings worker가 DB/keyring/file I/O를 전담한다.
-    fn credential_environment_changed(&mut self, workspace_id: &str) {
+    fn workspace_environment_changed(&mut self, workspace_id: &str) {
         if workspace_id == self.active.id {
             self.active.dotenv_state = None;
             self.last_dotenv_state = None;
@@ -23359,7 +23415,8 @@ impl App {
                 && outcome.root == pending.root
                 && outcome.runtime_instance == pending.runtime_instance
                 && current_root == pending.root
-                && dotenv_state_for_root(pending.root.as_deref()) == outcome.baseline
+                && dotenv_state_for_sources(pending.root.as_deref(), &outcome.source_files)
+                    == outcome.baseline
         });
         let is_agent_launch = matches!(
             pending.continuation,
@@ -23415,6 +23472,7 @@ impl App {
                 let defaults_cleared = runtime
                     .runtime
                     .send_command(runtime::RuntimeCommand::SetSessionDefaultEnv {
+                        dotenv_source: None,
                         api_secrets: Vec::new(),
                         env_plain: Vec::new(),
                         env_secrets: Vec::new(),
@@ -23637,6 +23695,7 @@ impl App {
             Some(payload) => runtime
                 .runtime
                 .send_command(runtime::RuntimeCommand::SetSessionDefaultEnv {
+                    dotenv_source: payload.dotenv_source,
                     api_secrets: payload.api_secrets,
                     env_plain: payload.env_plain,
                     env_secrets: payload.env_secrets,
@@ -23644,6 +23703,7 @@ impl App {
                 .is_ok(),
             None => true,
         };
+        runtime.dotenv_files = outcome.source_files;
         runtime.dotenv_state = (env_delivered && !source_failed).then_some(baseline);
         let policy_delivered = env_delivered && runtime.runtime.send_command(cache_policy).is_ok();
         let (delivered, restore_delivery, queue_full_restore) = match pending.continuation {
@@ -23887,7 +23947,9 @@ impl App {
             if !current {
                 continue;
             }
-            if dotenv_state_for_root(outcome.root.as_deref()) != outcome.baseline {
+            if dotenv_state_for_sources(outcome.root.as_deref(), &outcome.source_files)
+                != outcome.baseline
+            {
                 self.last_dotenv_state = None;
                 tracing::warn!(
                     kind = "dotenv",
@@ -23922,11 +23984,13 @@ impl App {
                         .active
                         .runtime
                         .send_command(runtime::RuntimeCommand::SetSessionDefaultEnv {
+                            dotenv_source: payload.dotenv_source,
                             api_secrets: payload.api_secrets,
                             env_plain: payload.env_plain,
                             env_secrets: payload.env_secrets,
                         })
                         .is_ok();
+                    self.active.dotenv_files = outcome.source_files;
                     self.invalidate_env_profile_ui();
                     self.credentials_ui.invalidate_cache();
                     self.invalidate_env_api_projects();
@@ -25288,10 +25352,21 @@ impl App {
             }
             match outcome.kind {
                 SettingsOutcomeKind::Loaded => {}
+                SettingsOutcomeKind::EnvSourcesSet(result) => {
+                    if result.is_ok() {
+                        self.env_profiles_ui.sources_saved();
+                        self.env_profiles_ui
+                            .clear_error(ui::env_profiles::EnvUiErrorCode::SourcesSaveFailed);
+                        self.workspace_environment_changed(&outcome.workspace_id);
+                    } else {
+                        self.env_profiles_ui
+                            .report_error(ui::env_profiles::EnvUiErrorCode::SourcesSaveFailed);
+                    }
+                }
                 SettingsOutcomeKind::CredentialEnvSet(result) => {
                     if result.is_ok() {
                         self.credentials_ui.binding_succeeded();
-                        self.credential_environment_changed(&outcome.workspace_id);
+                        self.workspace_environment_changed(&outcome.workspace_id);
                     } else {
                         self.credentials_ui
                             .report_error(ui::credentials::CredentialsUiErrorCode::BindingFailed);
@@ -25300,7 +25375,7 @@ impl App {
                 SettingsOutcomeKind::CredentialAdded(result) => match result {
                     Ok(()) => {
                         self.credentials_ui.add_succeeded();
-                        self.credential_environment_changed(&outcome.workspace_id);
+                        self.workspace_environment_changed(&outcome.workspace_id);
                         self.invalidate_env_api_projects();
                     }
                     Err(_) => self
@@ -29451,10 +29526,21 @@ impl eframe::App for App {
             // 워처의 .env* 변경 신호 → 활성 워크스페이스에서 .env가 바뀌거나 사라져도
             // 즉시 재동기화 + 기본 env 재전송 — 시작/전환 시에만 동기화하면 삭제된
             // .env의 secret이 새 셸에 계속 주입된다(codex High).
-            let env_changed = self
-                .file_tree
-                .as_mut()
-                .is_some_and(|tree| !tree.take_env_warning_candidates().is_empty());
+            let selected_paths: Vec<_> = self
+                .active_tree_root()
+                .into_iter()
+                .flat_map(|root| {
+                    self.active
+                        .dotenv_files
+                        .iter()
+                        .map(move |name| root.join(name))
+                })
+                .collect();
+            let env_changed = self.file_tree.as_mut().is_some_and(|tree| {
+                tree.take_env_warning_candidates()
+                    .iter()
+                    .any(|path| selected_paths.contains(path))
+            });
             if env_changed {
                 self.stage_workspace_controller_action(WorkspaceControllerAction::SyncDotenv);
             }
@@ -32153,6 +32239,12 @@ impl eframe::App for App {
                         }
                         queued
                     }
+                    ui::env_profiles::EnvAction::SetSources { files } => self
+                        .queue_settings_action(
+                            &settings_wsid,
+                            env_project_root.clone(),
+                            SettingsJobAction::SetEnvSources { files },
+                        ),
                     ui::env_profiles::EnvAction::DotenvWrite { key, value, file } => self
                         .queue_settings_action(
                             &settings_wsid,
@@ -42939,6 +43031,63 @@ mod tests {
         );
         assert_eq!(tracker.denial_retries.len(), 1);
         assert_eq!(tracker.live.len(), 1);
+    }
+
+    #[test]
+    fn workspace_sources_worker는_명시한_파일과_중지만_전달한다() {
+        let path = temp_db_path("sources-worker");
+        let db = Db::open(&path).unwrap();
+        let workspace = db.create_workspace("sources-worker").unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("deppy-sources-worker-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".env"), "PORT=ignored\n").unwrap();
+        std::fs::write(dir.join("service.env"), "PORT=selected\n").unwrap();
+        db.set_env_source_files(&workspace, Some(&["service.env".into()]))
+            .unwrap();
+        let mut resource = AppDotenvResource {
+            db_path: path,
+            db: Some(db),
+            redaction: secret::RedactionService::new(),
+        };
+        let job = || DotenvSyncJob {
+            workspace_id: workspace.clone(),
+            root: Some(dir.clone()),
+            runtime_instance: 1,
+            previous_state: None,
+            force: true,
+            migrate_legacy: false,
+        };
+        let outcome = execute_dotenv_sync_job(&mut resource, job()).unwrap();
+        assert_eq!(outcome.source_files, vec!["service.env"]);
+        let mut payload = outcome.payload.unwrap();
+        assert_eq!(payload.env_plain, vec![("PORT".into(), "selected".into())]);
+        assert!(!payload.source_failed);
+        configure_dotenv_live_reload(&mut payload, true, Some(&dir));
+        assert_eq!(payload.env_plain.last().unwrap().1, "0");
+        resource
+            .db
+            .as_ref()
+            .unwrap()
+            .set_env_source_files(&workspace, Some(&[]))
+            .unwrap();
+        let stopped = execute_dotenv_sync_job(&mut resource, job()).unwrap();
+        assert_ne!(outcome.baseline, stopped.baseline);
+        let stopped = stopped.payload.unwrap();
+        assert!(stopped.env_plain.is_empty());
+        assert!(stopped.env_secrets.is_empty());
+        assert!(stopped.dotenv_source.unwrap().files.is_empty());
+        let mut no_root = job();
+        no_root.root = None;
+        assert!(
+            execute_dotenv_sync_job(&mut resource, no_root)
+                .unwrap()
+                .payload
+                .unwrap()
+                .dotenv_source
+                .is_some()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

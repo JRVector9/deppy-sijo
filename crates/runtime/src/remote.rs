@@ -2897,7 +2897,7 @@ mod tests {
                 features: CLIENT_FEATURES,
                 token: b"irrelevant".to_vec(),
             };
-            assert_eq!(PROTO_VERSION, 15);
+            assert_eq!(PROTO_VERSION, 16);
             assert!(!client_hello_matches_protocol(&old));
         }
     }

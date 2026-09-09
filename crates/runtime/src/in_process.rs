@@ -265,6 +265,7 @@ impl InProcessRuntimeClient {
                     default_env_plain: Vec::new(),
                     default_env_secrets: Vec::new(),
                     default_api_secrets: Vec::new(),
+                    dotenv_source: None,
                     // needsInput hook 키를 워크스페이스 스코프로 만들기 위해 workspace_id를
                     // 워커에 보관한다(SessionId는 워커마다 1부터라 전역 유일하지 않음 — codex High).
                     workspace_id: persist
@@ -679,6 +680,7 @@ struct Worker {
     default_env_plain: Vec<(String, String)>,
     default_env_secrets: Vec<(String, String)>,
     default_api_secrets: Vec<(String, String)>,
+    dotenv_source: Option<crate::dotenv::DotenvSourceSelection>,
     /// 이 워커의 workspace id — needsInput hook 키(`{workspace_id}:{session_id}`)에 쓴다.
     workspace_id: String,
     next_id: u64,
@@ -2003,6 +2005,7 @@ impl Worker {
                 }
             }
             RuntimeCommand::SetSessionDefaultEnv {
+                dotenv_source,
                 api_secrets,
                 env_plain,
                 env_secrets,
@@ -2011,6 +2014,7 @@ impl Worker {
                 self.default_env_plain = env_plain;
                 self.default_env_secrets = env_secrets;
                 self.default_api_secrets = api_secrets;
+                self.dotenv_source = dotenv_source;
             }
             RuntimeCommand::SetShellCwd(cwd) => {
                 // 프로젝트 폴더 live 변경 — 이후 SpawnShell/SpawnAgent가 이 cwd에서 뜬다.
@@ -2783,7 +2787,19 @@ impl Worker {
     /// Bounded dotenv projection for restored panes. Any missing/invalid/over-limit input is an
     /// empty fail-closed projection; restoration never applies a partial first-file result.
     fn restored_dotenv_for_session(&self, dir: &std::path::Path) -> Vec<(String, String)> {
-        Self::restored_dotenv(dir)
+        let entries = match &self.dotenv_source {
+            Some(source) => source
+                .root
+                .as_ref()
+                .and_then(|root| {
+                    crate::dotenv::read_dotenv_files_bounded(root, &source.files)
+                        .ok()
+                        .flatten()
+                })
+                .unwrap_or_default(),
+            None => Self::restored_dotenv(dir),
+        };
+        entries
             .into_iter()
             .filter(|(key, _)| {
                 // 앱이 확정한 라이브 반영 제어값은 복원 파일로 덮어쓰지 않는다.
@@ -5670,6 +5686,7 @@ mod tests {
                 default_env_plain: Vec::new(),
                 default_env_secrets: Vec::new(),
                 default_api_secrets: Vec::new(),
+                dotenv_source: None,
                 workspace_id: "workspace".to_owned(),
                 next_id: 1,
                 sessions: std::collections::HashMap::new(),
@@ -6055,6 +6072,7 @@ mod tests {
         let mut probe = Probe::new(client.subscribe());
         client
             .send_command(RuntimeCommand::SetSessionDefaultEnv {
+                dotenv_source: None,
                 env_plain: Vec::new(),
                 env_secrets: Vec::new(),
                 api_secrets: vec![("SERVICE_KEY".into(), "api-test-credential".into())],
@@ -6090,6 +6108,33 @@ mod tests {
     }
 
     #[test]
+    fn workspace_sources_복원은_pane_cwd보다_프로젝트_선택파일을_사용한다() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, _events) = admission_worker(resolver, "source-restore");
+        let dir =
+            std::env::temp_dir().join(format!("deppy-source-restore-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".env"), "PORT=default\n").unwrap();
+        std::fs::write(dir.join(".env.dev"), "PORT=selected\n").unwrap();
+        worker.dotenv_source = Some(crate::dotenv::DotenvSourceSelection {
+            root: Some(dir.clone()),
+            files: vec![".env.dev".into()],
+        });
+        assert_eq!(
+            worker.restored_dotenv_for_session(&dir.join("other")),
+            vec![("PORT".into(), "selected".into())]
+        );
+        worker.dotenv_source.as_mut().unwrap().files.clear();
+        assert!(worker.restored_dotenv_for_session(&dir).is_empty());
+        worker.dotenv_source.as_mut().unwrap().root = None;
+        assert!(worker.restored_dotenv_for_session(&dir).is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn credential_env_새_셸과_agent는_api연결을_주입하고_launch가_우선한다() {
         let resolver = Arc::new(RecordingResolver {
             calls: Mutex::new(Vec::new()),
@@ -6097,6 +6142,7 @@ mod tests {
         });
         let (mut worker, _events) = admission_worker(resolver, "credential-env-precedence");
         worker.handle_command(RuntimeCommand::SetSessionDefaultEnv {
+            dotenv_source: None,
             env_plain: vec![("SERVICE_KEY".into(), "file-value".into())],
             env_secrets: Vec::new(),
             api_secrets: vec![("SERVICE_KEY".into(), "bound-credential".into())],
@@ -6152,6 +6198,7 @@ mod tests {
         );
         std::fs::remove_dir_all(dir).unwrap();
         worker.handle_command(RuntimeCommand::SetSessionDefaultEnv {
+            dotenv_source: None,
             env_plain: Vec::new(),
             env_secrets: Vec::new(),
             api_secrets: Vec::new(),
@@ -6173,6 +6220,7 @@ mod tests {
         });
         let (mut worker, _events) = admission_worker(resolver, "credential-env-failed");
         worker.handle_command(RuntimeCommand::SetSessionDefaultEnv {
+            dotenv_source: None,
             env_plain: vec![("PORT".into(), "1000".into())],
             env_secrets: Vec::new(),
             api_secrets: vec![("SERVICE_KEY".into(), "missing".into())],
@@ -6195,6 +6243,7 @@ mod tests {
         value.push_str("value");
         env_plain.push((key, value));
         worker.handle_command(RuntimeCommand::SetSessionDefaultEnv {
+            dotenv_source: None,
             api_secrets: Vec::new(),
             env_plain,
             env_secrets: Vec::with_capacity(4_096),
@@ -8593,6 +8642,7 @@ mod tests {
         let mut probe = Probe::new(client.subscribe());
         client
             .send_command(RuntimeCommand::SetSessionDefaultEnv {
+                dotenv_source: None,
                 api_secrets: Vec::new(),
                 env_plain: vec![
                     ("WORKSPACE_ONLY".into(), "workspace".into()),

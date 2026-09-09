@@ -1,6 +1,7 @@
 //! 공유 id 타입 + 최소 공용 유틸(time/fs) (설계문서 9장 core, 10장 의존 방향의 최하층).
 
 pub mod credential_env;
+pub mod env_sources;
 pub mod fs;
 pub mod time;
 

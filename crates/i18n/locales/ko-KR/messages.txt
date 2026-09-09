@@ -1207,3 +1207,9 @@ credentials.env_name = 환경변수 이름 (선택)
 credentials.env_overrides_dotenv = 같은 이름의 환경파일 값보다 이 API 연결이 우선합니다.
 
 env.source_api_only = 환경파일을 읽지 못했습니다. 연결된 API만 새 실행에 전달하며, 파일 동기화는 다시 시도합니다.
+
+env.sources_title = 환경파일과 적용 순서
+env.sources_hint = 프로젝트 루트의 파일명을 한 줄에 하나씩 입력하세요(최대 16개). 뒤 파일이 같은 키를 덮어씁니다. KEY=value, export, 따옴표를 지원하며 변수 치환·명령·여러 줄 값은 지원하지 않습니다. 기본 목록 외에는 새 실행부터 적용됩니다.
+env.sources_reset = 기본 파일로 되돌리기
+env.sources_disabled = 환경파일 주입이 꺼져 있습니다. API 연결은 유지됩니다.
+env.source_effective = 저장 위치: 현재 값을 제공한 파일

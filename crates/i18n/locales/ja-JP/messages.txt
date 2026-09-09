@@ -1207,3 +1207,9 @@ credentials.env_name = 環境変数名（任意）
 credentials.env_overrides_dotenv = 同名の環境ファイルの値より、この API 接続が優先されます。
 
 env.source_api_only = 環境ファイルを読み込めません。連携済みAPIのみ新しい実行に渡し、同期を再試行します。
+
+env.sources_title = 環境ファイルと適用順序
+env.sources_hint = プロジェクト直下のファイル名を1行に1つ入力（最大16個）。後のファイルが同じキーを上書きします。KEY=value、export、引用符に対応。変数展開、コマンド、複数行の値は非対応です。独自の一覧は新しい実行に適用されます。
+env.sources_reset = 既定のファイルに戻す
+env.sources_disabled = 環境ファイルの注入は無効です。API連携は維持されます。
+env.source_effective = 保存先: 現在値の提供元

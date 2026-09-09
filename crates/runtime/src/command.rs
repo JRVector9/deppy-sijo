@@ -423,10 +423,23 @@ pub(crate) fn runtime_command_retained_bytes(
             retained_string(&mut total, title)?;
         }
         RuntimeCommand::SetSessionDefaultEnv {
+            dotenv_source,
             api_secrets,
             env_plain,
             env_secrets,
         } => {
+            if let Some(source) = dotenv_source {
+                if let Some(root) = &source.root {
+                    retained_add(&mut total, root.capacity())?;
+                }
+                retained_add(
+                    &mut total,
+                    source.files.capacity() * std::mem::size_of::<String>(),
+                )?;
+                for file in &source.files {
+                    retained_string(&mut total, file)?;
+                }
+            }
             retained_env(&mut total, env_plain)?;
             retained_env(&mut total, env_secrets)?;
             retained_env(&mut total, api_secrets)?;
@@ -549,10 +562,22 @@ pub(crate) fn canonicalize_host_command(command: &mut RuntimeCommand) {
             canonicalize_string(title);
         }
         RuntimeCommand::SetSessionDefaultEnv {
+            dotenv_source,
             api_secrets,
             env_plain,
             env_secrets,
         } => {
+            if let Some(source) = dotenv_source {
+                if let Some(root) = &mut source.root {
+                    *root = std::mem::take(root).into_boxed_path().into_path_buf();
+                }
+                for file in &mut source.files {
+                    canonicalize_string(file);
+                }
+                source.files = std::mem::take(&mut source.files)
+                    .into_boxed_slice()
+                    .into_vec();
+            }
             canonicalize_env(env_plain);
             canonicalize_env(env_secrets);
             canonicalize_env(api_secrets);
@@ -734,10 +759,18 @@ pub(crate) fn validate_host_command(command: &RuntimeCommand) -> Result<(), Runt
             }
         }
         RuntimeCommand::SetSessionDefaultEnv {
+            dotenv_source,
             api_secrets,
             env_plain,
             env_secrets,
         } => {
+            if let Some(source) = dotenv_source {
+                if let Some(root) = &source.root {
+                    validate_runtime_path(root)?;
+                }
+                storage::Db::validate_env_source_files(&source.files)
+                    .map_err(|_| admission_error("runtime_env_sources_invalid"))?;
+            }
             validate_env_entries_with_base(env_plain, api_secrets, env_secrets)?;
             validate_env_entries(&[], api_secrets)?;
         }
@@ -919,6 +952,7 @@ pub enum RuntimeCommand {
     /// secret은 credential_id 참조로만 전달되고 worker가 spawn 직전에 resolve한다(6.3).
     /// **wire 계약**: postcard enum discriminant라 variant는 항상 끝에만 추가한다(codex High).
     SetSessionDefaultEnv {
+        dotenv_source: Option<crate::dotenv::DotenvSourceSelection>,
         api_secrets: Vec<(String, String)>,
         env_plain: Vec<(String, String)>,
         /// (env key, credential_id)
@@ -1096,11 +1130,16 @@ impl std::fmt::Debug for RuntimeCommand {
                 .field("done_regex_set", &done_regex.is_some())
                 .finish(),
             RuntimeCommand::SetSessionDefaultEnv {
+                dotenv_source,
                 api_secrets,
                 env_plain,
                 env_secrets,
             } => f
                 .debug_struct("SetSessionDefaultEnv")
+                .field(
+                    "source_file_count",
+                    &dotenv_source.as_ref().map(|s| s.files.len()),
+                )
                 .field("env_plain_count", &env_plain.len())
                 .field("env_secret_count", &env_secrets.len())
                 .field("api_secret_count", &api_secrets.len())
@@ -1955,12 +1994,14 @@ mod tests {
             spare_string("value", 64 * 1024),
         ));
         let mut command = RuntimeCommand::SetSessionDefaultEnv {
+            dotenv_source: None,
             api_secrets: Vec::new(),
             env_plain: defaults,
             env_secrets: Vec::with_capacity(4_096),
         };
         canonicalize_host_command(&mut command);
         let RuntimeCommand::SetSessionDefaultEnv {
+            dotenv_source: _,
             api_secrets,
             env_plain,
             env_secrets,

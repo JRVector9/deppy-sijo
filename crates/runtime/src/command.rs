@@ -423,11 +423,13 @@ pub(crate) fn runtime_command_retained_bytes(
             retained_string(&mut total, title)?;
         }
         RuntimeCommand::SetSessionDefaultEnv {
+            api_secrets,
             env_plain,
             env_secrets,
         } => {
             retained_env(&mut total, env_plain)?;
             retained_env(&mut total, env_secrets)?;
+            retained_env(&mut total, api_secrets)?;
         }
         RuntimeCommand::SetShellCwd(cwd) => {
             if let Some(cwd) = cwd {
@@ -547,11 +549,13 @@ pub(crate) fn canonicalize_host_command(command: &mut RuntimeCommand) {
             canonicalize_string(title);
         }
         RuntimeCommand::SetSessionDefaultEnv {
+            api_secrets,
             env_plain,
             env_secrets,
         } => {
             canonicalize_env(env_plain);
             canonicalize_env(env_secrets);
+            canonicalize_env(api_secrets);
         }
         RuntimeCommand::SetShellCwd(cwd) => {
             if let Some(cwd) = cwd {
@@ -730,9 +734,13 @@ pub(crate) fn validate_host_command(command: &RuntimeCommand) -> Result<(), Runt
             }
         }
         RuntimeCommand::SetSessionDefaultEnv {
+            api_secrets,
             env_plain,
             env_secrets,
-        } => validate_env_entries(env_plain, env_secrets)?,
+        } => {
+            validate_env_entries_with_base(env_plain, api_secrets, env_secrets)?;
+            validate_env_entries(&[], api_secrets)?;
+        }
         RuntimeCommand::SetShellCwd(Some(cwd)) => validate_runtime_path(cwd)?,
         RuntimeCommand::UpdateSessionCwd { cwd, .. } => {
             if !bounded_nul_free(cwd, PATH_BYTES_MAX, true) {
@@ -911,6 +919,7 @@ pub enum RuntimeCommand {
     /// secret은 credential_id 참조로만 전달되고 worker가 spawn 직전에 resolve한다(6.3).
     /// **wire 계약**: postcard enum discriminant라 variant는 항상 끝에만 추가한다(codex High).
     SetSessionDefaultEnv {
+        api_secrets: Vec<(String, String)>,
         env_plain: Vec<(String, String)>,
         /// (env key, credential_id)
         env_secrets: Vec<(String, String)>,
@@ -1087,12 +1096,14 @@ impl std::fmt::Debug for RuntimeCommand {
                 .field("done_regex_set", &done_regex.is_some())
                 .finish(),
             RuntimeCommand::SetSessionDefaultEnv {
+                api_secrets,
                 env_plain,
                 env_secrets,
             } => f
                 .debug_struct("SetSessionDefaultEnv")
                 .field("env_plain_count", &env_plain.len())
                 .field("env_secret_count", &env_secrets.len())
+                .field("api_secret_count", &api_secrets.len())
                 .finish(),
             RuntimeCommand::SetShellCwd(cwd) => {
                 f.debug_tuple("SetShellCwd").field(&cwd.is_some()).finish()
@@ -1944,11 +1955,13 @@ mod tests {
             spare_string("value", 64 * 1024),
         ));
         let mut command = RuntimeCommand::SetSessionDefaultEnv {
+            api_secrets: Vec::new(),
             env_plain: defaults,
             env_secrets: Vec::with_capacity(4_096),
         };
         canonicalize_host_command(&mut command);
         let RuntimeCommand::SetSessionDefaultEnv {
+            api_secrets,
             env_plain,
             env_secrets,
         } = command
@@ -1959,6 +1972,7 @@ mod tests {
         assert_eq!(env_plain[0].0.capacity(), env_plain[0].0.len());
         assert_eq!(env_plain[0].1.capacity(), env_plain[0].1.len());
         assert_eq!(env_secrets.capacity(), 0);
+        assert_eq!(api_secrets.capacity(), 0);
 
         let mut cwd = std::path::PathBuf::with_capacity(64 * 1024);
         cwd.push("cwd");

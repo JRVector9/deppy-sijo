@@ -23,6 +23,8 @@
 
 ## PR 2 — 파일 삭제와 동기화 상태 일관성
 
+- 구현 완료: #180 (draft), commit `49ad36f`. 화면 검증 대기.
+
 - 브랜치: `fix/environment-file-consistency`, base PR 1.
 - 파일: `crates/app/src/dotenv_sync.rs`, `app.rs`, `ui/env_profiles.rs`, 로케일 5개.
 - 동일 키가 `.env`와 `.env.local` 모두에 있을 때 병합 목록의 삭제 의미를 명시한다. 파일별 값 제거를 선택할 수 있게 하고 전체 제거는 모든 정의를 대상으로 한다.
@@ -31,6 +33,8 @@
 - 검증: 같은 파일 중복, 두 파일 중복, 파일 부재, 읽기/쓰기 실패, 작업 중 외부 수정, workspace 전환. 실행 명령 `cargo test -p deppy-sijo --bin deppy-sijo dotenv_sync -- --test-threads=1`.
 
 ## PR 3 — API credential과 Agent 환경 연결
+
+- 구현 완료, 최종 게이트/PR 생성 중. API 연결이 있는 프로젝트는 eval 기반 셸 라이브 반영을 끄며 새 실행부터 적용한다.
 
 - 브랜치: `feat/workspace-credential-env`, base PR 2.
 - 파일: `crates/storage/src/db.rs` 및 기존 migration 체계, `crates/app/src/app.rs`, `ui/credentials.rs`, `crates/runtime/src/in_process.rs`, 로케일 5개.

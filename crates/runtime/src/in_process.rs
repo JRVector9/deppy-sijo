@@ -264,6 +264,7 @@ impl InProcessRuntimeClient {
                     shell,
                     default_env_plain: Vec::new(),
                     default_env_secrets: Vec::new(),
+                    default_api_secrets: Vec::new(),
                     // needsInput hook 키를 워크스페이스 스코프로 만들기 위해 workspace_id를
                     // 워커에 보관한다(SessionId는 워커마다 1부터라 전역 유일하지 않음 — codex High).
                     workspace_id: persist
@@ -677,6 +678,7 @@ struct Worker {
     /// secret은 (key, credential_id)로 들고 spawn 직전에만 resolve한다(6.3).
     default_env_plain: Vec<(String, String)>,
     default_env_secrets: Vec<(String, String)>,
+    default_api_secrets: Vec<(String, String)>,
     /// 이 워커의 workspace id — needsInput hook 키(`{workspace_id}:{session_id}`)에 쓴다.
     workspace_id: String,
     next_id: u64,
@@ -1123,8 +1125,9 @@ impl Worker {
         launch_plain: Vec<(String, String)>,
         launch_secrets: Vec<(String, String)>,
     ) -> anyhow::Result<PreparedSecretEnv> {
-        let default_secret_count = self.default_env_secrets.len();
+        let default_secret_count = self.default_env_secrets.len() + self.default_api_secrets.len();
         let mut all_secrets = self.default_env_secrets.clone();
+        all_secrets.extend(self.default_api_secrets.iter().cloned());
         all_secrets.extend(launch_secrets);
         crate::command::validate_env_entries_with_base(
             &self.default_env_plain,
@@ -2000,12 +2003,14 @@ impl Worker {
                 }
             }
             RuntimeCommand::SetSessionDefaultEnv {
+                api_secrets,
                 env_plain,
                 env_secrets,
             } => {
                 // 이후 SpawnShell/SpawnAgent부터 적용 — 기존 세션은 건드리지 않는다.
                 self.default_env_plain = env_plain;
                 self.default_env_secrets = env_secrets;
+                self.default_api_secrets = api_secrets;
             }
             RuntimeCommand::SetShellCwd(cwd) => {
                 // 프로젝트 폴더 live 변경 — 이후 SpawnShell/SpawnAgent가 이 cwd에서 뜬다.
@@ -2583,10 +2588,12 @@ impl Worker {
         &self,
         id: SessionId,
     ) -> anyhow::Result<(CommandSpec, Vec<RedactionLease>)> {
+        let mut secrets = self.default_env_secrets.clone();
+        secrets.extend(self.default_api_secrets.iter().cloned());
         crate::command::validate_env_entries_with_base(
             &self.shell.env,
             &self.default_env_plain,
-            &self.default_env_secrets,
+            &secrets,
         )?;
         let mut spec = self.shell.clone();
         spec.env
@@ -2594,7 +2601,7 @@ impl Worker {
         // 워크스페이스 기본 env(.env 자동 주입). The complete secret set is resolved and
         // protected before spawn; partial injection would silently change command semantics.
         spec.env.extend(self.default_env_plain.iter().cloned());
-        let (secret_env, leases) = self.resolve_secret_env(self.default_env_secrets.clone())?;
+        let (secret_env, leases) = self.resolve_secret_env(secrets)?;
         spec.env.extend(secret_env);
         Ok((spec, leases))
     }
@@ -2775,6 +2782,21 @@ impl Worker {
 
     /// Bounded dotenv projection for restored panes. Any missing/invalid/over-limit input is an
     /// empty fail-closed projection; restoration never applies a partial first-file result.
+    fn restored_dotenv_for_session(&self, dir: &std::path::Path) -> Vec<(String, String)> {
+        Self::restored_dotenv(dir)
+            .into_iter()
+            .filter(|(key, _)| {
+                // 앱이 확정한 라이브 반영 제어값은 복원 파일로 덮어쓰지 않는다.
+                key != "DEPPY_ENV_LIVE_RELOAD"
+                    && key != "DEPPY_PROJECT_ROOT"
+                    && !self
+                        .default_api_secrets
+                        .iter()
+                        .any(|(binding, _)| binding == key)
+            })
+            .collect()
+    }
+
     fn restored_dotenv(dir: &std::path::Path) -> Vec<(String, String)> {
         match crate::dotenv::read_dotenv_merged_bounded(dir) {
             Ok(Some(dotenv)) => dotenv,
@@ -2830,7 +2852,7 @@ impl Worker {
             .filter(|p| p.is_dir());
         if let Some(dir) = &restored_cwd {
             spec.cwd = Some(dir.clone());
-            let dotenv = Self::restored_dotenv(dir);
+            let dotenv = self.restored_dotenv_for_session(dir);
             match self.acquire_dotenv_redaction_lease(&dotenv) {
                 Ok(Some(lease)) => redaction_leases.push(lease),
                 Ok(None) => {}
@@ -2841,6 +2863,7 @@ impl Worker {
                 }
             }
             // 워크스페이스 기본 env보다 뒤에 붙어 pane 폴더 값이 이긴다.
+            // API와 충돌하는 값은 redaction 준비 전에 제외했다.
             spec.env.extend(dotenv);
         }
         let spawn_cwd = Self::spawn_cwd_string(&spec.cwd);
@@ -5646,6 +5669,7 @@ mod tests {
                 shell: spec("/bin/true", &[]),
                 default_env_plain: Vec::new(),
                 default_env_secrets: Vec::new(),
+                default_api_secrets: Vec::new(),
                 workspace_id: "workspace".to_owned(),
                 next_id: 1,
                 sessions: std::collections::HashMap::new(),
@@ -6013,6 +6037,151 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn credential_env_실제_agent_프로세스에_연결한_키를_전달한다() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: Some("api-test-secret-value".into()),
+        });
+        let client = InProcessRuntimeClient::try_with_shell_and_resolver(
+            5,
+            resolver,
+            test_logs_root("credential-env-spawn"),
+            RedactionService::new(),
+            pty::default_shell(),
+            None,
+        )
+        .unwrap();
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::SetSessionDefaultEnv {
+                env_plain: Vec::new(),
+                env_secrets: Vec::new(),
+                api_secrets: vec![("SERVICE_KEY".into(), "api-test-credential".into())],
+            })
+            .unwrap();
+        client
+            .send_command(RuntimeCommand::SpawnAgent {
+                agent_config_id: None,
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+                command: "/bin/sh".into(),
+                args: vec![
+                    "-c".into(),
+                    "test \"$SERVICE_KEY\" = api-test-secret-value && printf API_BINDING_OK".into(),
+                ],
+                env_plain: Vec::new(),
+                env_secrets: Vec::new(),
+                waiting_regex: None,
+                approval_regex: None,
+                error_regex: None,
+                done_regex: None,
+            })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::Viewport { snapshot, .. }
+                if snapshot_text(snapshot, 0).contains("API_BINDING_OK") =>
+            {
+                Some(())
+            }
+            _ => None,
+        });
+    }
+
+    #[test]
+    fn credential_env_새_셸과_agent는_api연결을_주입하고_launch가_우선한다() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: Some("bound-secret-value".into()),
+        });
+        let (mut worker, _events) = admission_worker(resolver, "credential-env-precedence");
+        worker.handle_command(RuntimeCommand::SetSessionDefaultEnv {
+            env_plain: vec![("SERVICE_KEY".into(), "file-value".into())],
+            env_secrets: Vec::new(),
+            api_secrets: vec![("SERVICE_KEY".into(), "bound-credential".into())],
+        });
+        let (env, _leases) = worker.prepare_agent_env(Vec::new(), Vec::new()).unwrap();
+        assert_eq!(
+            env.iter()
+                .rev()
+                .find(|(key, _)| key == "SERVICE_KEY")
+                .unwrap()
+                .1,
+            "bound-secret-value"
+        );
+        let (env, _leases) = worker
+            .prepare_agent_env(
+                vec![("SERVICE_KEY".into(), "launch-value".into())],
+                Vec::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            env.iter()
+                .rev()
+                .find(|(key, _)| key == "SERVICE_KEY")
+                .unwrap()
+                .1,
+            "launch-value"
+        );
+        let (shell, _leases) = worker.shell_with_session(SessionId(1)).unwrap();
+        assert_eq!(
+            shell
+                .env
+                .iter()
+                .rev()
+                .find(|(key, _)| key == "SERVICE_KEY")
+                .unwrap()
+                .1,
+            "bound-secret-value"
+        );
+        let dir = std::env::temp_dir().join(format!("deppy-api-restore-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(".env"),
+            "SERVICE_KEY=x\nPORT=1000\nDEPPY_ENV_LIVE_RELOAD=1\nDEPPY_PROJECT_ROOT=/tmp\n",
+        )
+        .unwrap();
+        let restored = worker.restored_dotenv_for_session(&dir);
+        assert_eq!(restored, vec![("PORT".into(), "1000".into())]);
+        assert!(
+            worker
+                .acquire_dotenv_redaction_lease(&restored)
+                .unwrap()
+                .is_none()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+        worker.handle_command(RuntimeCommand::SetSessionDefaultEnv {
+            env_plain: Vec::new(),
+            env_secrets: Vec::new(),
+            api_secrets: Vec::new(),
+        });
+        assert!(
+            worker
+                .prepare_agent_env(Vec::new(), Vec::new())
+                .unwrap()
+                .0
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn credential_env_키를_읽지못하면_agent_환경을_부분반환하지_않는다() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, _events) = admission_worker(resolver, "credential-env-failed");
+        worker.handle_command(RuntimeCommand::SetSessionDefaultEnv {
+            env_plain: vec![("PORT".into(), "1000".into())],
+            env_secrets: Vec::new(),
+            api_secrets: vec![("SERVICE_KEY".into(), "missing".into())],
+        });
+        assert!(worker.prepare_agent_env(Vec::new(), Vec::new()).is_err());
+        assert!(worker.shell_with_session(SessionId(1)).is_err());
+    }
+
+    #[test]
     fn default_env_and_cwd_are_canonicalized_before_worker_storage() {
         let resolver = Arc::new(RecordingResolver {
             calls: Mutex::new(Vec::new()),
@@ -6026,6 +6195,7 @@ mod tests {
         value.push_str("value");
         env_plain.push((key, value));
         worker.handle_command(RuntimeCommand::SetSessionDefaultEnv {
+            api_secrets: Vec::new(),
             env_plain,
             env_secrets: Vec::with_capacity(4_096),
         });
@@ -8423,6 +8593,7 @@ mod tests {
         let mut probe = Probe::new(client.subscribe());
         client
             .send_command(RuntimeCommand::SetSessionDefaultEnv {
+                api_secrets: Vec::new(),
                 env_plain: vec![
                     ("WORKSPACE_ONLY".into(), "workspace".into()),
                     ("ENV_PRIORITY".into(), "workspace".into()),

@@ -1436,9 +1436,33 @@ struct DotenvSyncJob {
 }
 
 struct DotenvSyncPayload {
+    source_failed: bool,
+    api_secrets: EnvPairs,
     report: Option<crate::dotenv_sync::DotenvSyncReport>,
     env_plain: Vec<(String, String)>,
     env_secrets: Vec<(String, String)>,
+}
+
+// 제어 값은 파일 값보다 뒤에 전달한다. API 연결을 덮는 셸 eval 훅은 활성화하지 않는다.
+fn configure_dotenv_live_reload(
+    payload: &mut DotenvSyncPayload,
+    enabled: bool,
+    root: Option<&std::path::Path>,
+) {
+    let enabled =
+        enabled && !payload.source_failed && payload.api_secrets.is_empty() && root.is_some();
+    payload
+        .env_plain
+        .retain(|(key, _)| key != "DEPPY_ENV_LIVE_RELOAD" && key != "DEPPY_PROJECT_ROOT");
+    payload.env_plain.push((
+        "DEPPY_ENV_LIVE_RELOAD".into(),
+        if enabled { "1" } else { "0" }.into(),
+    ));
+    if enabled && let Some(root) = root {
+        payload
+            .env_plain
+            .push(("DEPPY_PROJECT_ROOT".into(), root.display().to_string()));
+    }
 }
 
 struct DotenvSyncOutcome {
@@ -3040,6 +3064,10 @@ enum WorkspaceMutationPurpose {
 
 enum SettingsJobAction {
     Load,
+    SetCredentialEnv {
+        credential_id: String,
+        env_name: Option<String>,
+    },
     AddCredential {
         credential: ui::credentials::NewCredential,
     },
@@ -3139,6 +3167,7 @@ impl SettingsOperationKey {
 
 enum SettingsOutcomeKind {
     Loaded,
+    CredentialEnvSet(Result<(), SettingsErrorCode>),
     CredentialAdded(Result<(), SettingsErrorCode>),
     CredentialDeleted {
         credential_id: String,
@@ -3187,6 +3216,7 @@ enum SettingsOutcomeKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsErrorCode {
+    CredentialBinding,
     CredentialAdd,
     CredentialDelete,
     CredentialReveal,
@@ -3304,39 +3334,62 @@ fn execute_dotenv_sync_job(
         if !job.force && job.previous_state == Some(baseline) {
             return Ok(None);
         }
+        let db = match &mut resource.db {
+            Some(db) => db,
+            slot @ None => slot.insert(Db::open(&resource.db_path)?),
+        };
+        let api_secrets = db
+            .list_credential_env_bindings(&job.workspace_id)?
+            .into_iter()
+            .map(|binding| (binding.env_name, binding.credential_id))
+            .collect();
         let Some(root) = job.root.as_deref() else {
             return Ok(Some(DotenvSyncPayload {
+                source_failed: false,
+                api_secrets,
                 report: None,
                 env_plain: Vec::new(),
                 env_secrets: Vec::new(),
             }));
         };
-        let db = match &mut resource.db {
-            Some(db) => db,
-            slot @ None => slot.insert(Db::open(&resource.db_path)?),
-        };
-        if job.migrate_legacy {
-            let mut repository = AppDotenvRepository(db);
-            crate::dotenv_sync::migrate_legacy_profiles_to_dotenv(
-                &mut repository,
+        // API 조회 성공과 파일 동기화 실패를 분리한다. 보관된 dotenv 값은 주입하지 않는다.
+        let source = (|| -> anyhow::Result<_> {
+            if job.migrate_legacy {
+                let mut repository = AppDotenvRepository(db);
+                crate::dotenv_sync::migrate_legacy_profiles_to_dotenv(
+                    &mut repository,
+                    &KeyringSecretStore,
+                    &job.workspace_id,
+                    root,
+                )?;
+            }
+            let report = sync_workspace_dotenv_at_root(
+                db,
                 &KeyringSecretStore,
+                &resource.redaction,
                 &job.workspace_id,
                 root,
             )?;
-        }
-        let report = sync_workspace_dotenv_at_root(
-            db,
-            &KeyringSecretStore,
-            &resource.redaction,
-            &job.workspace_id,
-            root,
-        )?;
-        let (env_plain, env_secrets) = if report.is_some() {
-            load_dotenv_default_env(db, &job.workspace_id)?
-        } else {
-            (Vec::new(), Vec::new())
+            let (env_plain, env_secrets) = if report.is_some() {
+                load_dotenv_default_env(db, &job.workspace_id)?
+            } else {
+                (Vec::new(), Vec::new())
+            };
+            Ok((report, env_plain, env_secrets))
+        })();
+        let (source_failed, report, env_plain, env_secrets) = match source {
+            Ok((report, plain, secrets)) => (false, report, plain, secrets),
+            Err(_) => {
+                tracing::warn!(
+                    error_code = "dotenv_source_failed",
+                    "환경파일 동기화 실패; API 연결만 유지"
+                );
+                (true, None, Vec::new(), Vec::new())
+            }
         };
         Ok(Some(DotenvSyncPayload {
+            source_failed,
+            api_secrets,
             report,
             env_plain,
             env_secrets,
@@ -3518,6 +3571,16 @@ fn load_environment_snapshots(
             })
         });
         let rows = db.settings_environment_snapshot_rows(workspace_id)?;
+        let bindings = rows
+            .credential_env
+            .iter()
+            .map(|binding| (binding.credential_id.as_str(), binding.env_name.as_str()))
+            .collect::<std::collections::HashMap<_, _>>();
+        let dotenv_keys = rows
+            .env_vars
+            .iter()
+            .map(|row| row.key.as_str())
+            .collect::<std::collections::HashSet<_>>();
         let credential_ids = rows
             .credentials
             .iter()
@@ -3553,6 +3616,12 @@ fn load_environment_snapshots(
             .into_iter()
             .filter(|credential| !dotenv_referenced_credentials.contains(&credential.id))
             .map(|credential| {
+                let env_name = bindings
+                    .get(credential.id.as_str())
+                    .map(|name| (*name).to_owned());
+                let overrides_dotenv = env_name
+                    .as_deref()
+                    .is_some_and(|name| dotenv_keys.contains(name));
                 ui::credentials::CredentialListItem::new(
                     credential.id,
                     credential.provider,
@@ -3560,6 +3629,7 @@ fn load_environment_snapshots(
                     credential.credential_kind,
                     credential.masked_hint,
                 )
+                .with_env_binding(env_name, overrides_dotenv)
             })
             .collect();
         for row in rows.env_vars {
@@ -3832,7 +3902,10 @@ fn add_settings_credential(
     workspace_id: &str,
     credential: ui::credentials::NewCredential,
 ) -> anyhow::Result<()> {
-    let (provider, label, credential_kind, input) = credential.into_parts();
+    let (provider, label, credential_kind, input, env_name) = credential.into_parts();
+    if let Some(name) = env_name.as_deref() {
+        Db::validate_credential_env_name(name)?;
+    }
     let access = secret::SecretString::new(input.into_inner());
     let logical = secret::LogicalCredentialId::new(uuid::Uuid::new_v4().to_string())?;
     let plan = secret::SecretBundleStagePlan::allocate(logical.clone(), None)?;
@@ -3861,7 +3934,7 @@ fn add_settings_credential(
     };
     // A commit error has an indeterminate outcome. Keep the exact staged bundle and ledger row;
     // startup reconciliation decides from durable state and never guesses by deleting it here.
-    db.insert_credential_with_secret_slot(&meta, plan.new_slot().as_str(), None)
+    db.insert_credential_with_env_slot(&meta, plan.new_slot().as_str(), env_name.as_deref())
 }
 
 fn settings_credential_slot(
@@ -4239,6 +4312,16 @@ fn execute_settings_job_with_repair(
     let mut refresh = false;
     let kind = match action {
         SettingsJobAction::Load => SettingsOutcomeKind::Loaded,
+        SettingsJobAction::SetCredentialEnv {
+            credential_id,
+            env_name,
+        } => {
+            let result = db
+                .set_credential_env_binding(&workspace_id, &credential_id, env_name.as_deref())
+                .map_err(|_| SettingsErrorCode::CredentialBinding);
+            refresh = result.is_ok();
+            SettingsOutcomeKind::CredentialEnvSet(result)
+        }
         SettingsJobAction::AddCredential { credential } => {
             let result =
                 add_settings_credential(db, &KeyringSecretStore, &workspace_id, credential)
@@ -4524,6 +4607,9 @@ fn execute_settings_job_with_repair(
 fn settings_open_failed_outcome(job: SettingsJob) -> SettingsOutcome {
     let kind = match job.action {
         SettingsJobAction::Load => SettingsOutcomeKind::Loaded,
+        SettingsJobAction::SetCredentialEnv { .. } => {
+            SettingsOutcomeKind::CredentialEnvSet(Err(SettingsErrorCode::CredentialBinding))
+        }
         SettingsJobAction::AddCredential { .. } => {
             SettingsOutcomeKind::CredentialAdded(Err(SettingsErrorCode::CredentialAdd))
         }
@@ -22892,6 +22978,17 @@ impl App {
     /// 설정 창에서 선택한 workspace의 `.env` 동기화를 bounded worker에 제출한다.
     /// 활성 workspace는 runtime 기본 env 갱신까지 수행하는 기존 dotenv worker를 쓰고,
     /// 비활성 workspace는 Settings worker가 DB/keyring/file I/O를 전담한다.
+    fn credential_environment_changed(&mut self, workspace_id: &str) {
+        if workspace_id == self.active.id {
+            self.active.dotenv_state = None;
+            self.last_dotenv_state = None;
+        } else if let Some(runtime) = self.warm.get_mut(workspace_id) {
+            runtime.dotenv_state = None;
+        }
+        self.sync_settings_workspace_dotenv(workspace_id);
+        self.invalidate_env_api_projects();
+    }
+
     fn sync_settings_workspace_dotenv(&mut self, workspace_id: &str) -> bool {
         if workspace_id == self.active.id {
             self.sync_dotenv_env();
@@ -23315,16 +23412,25 @@ impl App {
             if dotenv_failure_allows_session(&pending.continuation)
                 && let Some(runtime) = self.runtime_by_instance_mut(pending.runtime_instance)
             {
+                let defaults_cleared = runtime
+                    .runtime
+                    .send_command(runtime::RuntimeCommand::SetSessionDefaultEnv {
+                        api_secrets: Vec::new(),
+                        env_plain: Vec::new(),
+                        env_secrets: Vec::new(),
+                    })
+                    .is_ok();
                 let delivered = match pending.continuation {
                     PendingDotenvContinuation::AgentLaunch { command, .. } => {
-                        runtime.runtime.send_command(command).is_ok()
+                        defaults_cleared && runtime.runtime.send_command(command).is_ok()
                     }
                     PendingDotenvContinuation::WorkspaceProtocol {
                         operation,
                         generation,
                         command,
                     } => {
-                        let delivered = runtime.runtime.send_command(command).is_ok();
+                        let delivered =
+                            defaults_cleared && runtime.runtime.send_command(command).is_ok();
                         runtime.workspace_ui.complete_protocol(
                             ui::workspace::WorkspaceProtocolCompletion {
                                 operation,
@@ -23337,7 +23443,7 @@ impl App {
                         delivered
                     }
                     PendingDotenvContinuation::RuntimeCommand(command) => {
-                        runtime.runtime.send_command(command).is_ok()
+                        defaults_cleared && runtime.runtime.send_command(command).is_ok()
                     }
                     _ => unreachable!("dotenv_failure_allows_session이 세션 생성만 통과시킨다"),
                 };
@@ -23426,6 +23532,12 @@ impl App {
         };
         let baseline = outcome.baseline;
         let mut payload = outcome.payload;
+        let source_failed = payload
+            .as_ref()
+            .is_some_and(|payload| payload.source_failed);
+        if source_failed {
+            platform::notify(&self.i18n.t("env.source_api_only", &[]), "");
+        }
         if let Some(ticket_id) = agent_ticket
             && !self
                 .approval_launch_tracker
@@ -23464,14 +23576,7 @@ impl App {
                     skipped_env_keys = report.skipped_keys.clone();
                 }
             }
-            if live_reload && let Some(root) = pending.root.as_deref() {
-                payload
-                    .env_plain
-                    .push(("DEPPY_ENV_LIVE_RELOAD".to_owned(), "1".to_owned()));
-                payload
-                    .env_plain
-                    .push(("DEPPY_PROJECT_ROOT".to_owned(), root.display().to_string()));
-            }
+            configure_dotenv_live_reload(payload, live_reload, pending.root.as_deref());
         }
         if !skipped_env_keys.is_empty() {
             // 제외된 키를 사용자에게 알린다. 로그만 남기면 "이 환경변수가 왜 세션에
@@ -23532,15 +23637,14 @@ impl App {
             Some(payload) => runtime
                 .runtime
                 .send_command(runtime::RuntimeCommand::SetSessionDefaultEnv {
+                    api_secrets: payload.api_secrets,
                     env_plain: payload.env_plain,
                     env_secrets: payload.env_secrets,
                 })
                 .is_ok(),
             None => true,
         };
-        if env_delivered {
-            runtime.dotenv_state = Some(baseline);
-        }
+        runtime.dotenv_state = (env_delivered && !source_failed).then_some(baseline);
         let policy_delivered = env_delivered && runtime.runtime.send_command(cache_policy).is_ok();
         let (delivered, restore_delivery, queue_full_restore) = match pending.continuation {
             PendingDotenvContinuation::WorkspaceProtocol {
@@ -23797,7 +23901,7 @@ impl App {
             match outcome.payload {
                 None => {}
                 Some(payload) => {
-                    if let Some(report) = payload.report
+                    if let Some(ref report) = payload.report
                         && report.upserted + report.removed > 0
                     {
                         tracing::info!(
@@ -23808,28 +23912,28 @@ impl App {
                     }
                     // .env 라이브 반영(E5 ⑨) 활성 조건 — 새 셸의 precmd 훅이 이
                     // 두 값으로 깨어난다. 토글/경로 변경이 다음 동기화에 반영된다.
-                    let mut env_plain = payload.env_plain;
-                    if self.config.ui.env_live_reload
-                        && let Some(root) = outcome.root.as_deref()
-                    {
-                        env_plain.push(("DEPPY_ENV_LIVE_RELOAD".to_owned(), "1".to_owned()));
-                        env_plain
-                            .push(("DEPPY_PROJECT_ROOT".to_owned(), root.display().to_string()));
-                    }
+                    let mut payload = payload;
+                    configure_dotenv_live_reload(
+                        &mut payload,
+                        self.config.ui.env_live_reload,
+                        outcome.root.as_deref(),
+                    );
                     let env_ready = self
                         .active
                         .runtime
                         .send_command(runtime::RuntimeCommand::SetSessionDefaultEnv {
-                            env_plain,
+                            api_secrets: payload.api_secrets,
+                            env_plain: payload.env_plain,
                             env_secrets: payload.env_secrets,
                         })
                         .is_ok();
                     self.invalidate_env_profile_ui();
                     self.credentials_ui.invalidate_cache();
                     self.invalidate_env_api_projects();
-                    if env_ready {
+                    if env_ready && !payload.source_failed {
                         self.active.dotenv_state = Some(outcome.baseline);
                     } else {
+                        self.active.dotenv_state = None;
                         // Never acknowledge the source stamp until the exact runtime instance has
                         // accepted its default environment.
                         self.last_dotenv_state = None;
@@ -25184,9 +25288,19 @@ impl App {
             }
             match outcome.kind {
                 SettingsOutcomeKind::Loaded => {}
+                SettingsOutcomeKind::CredentialEnvSet(result) => {
+                    if result.is_ok() {
+                        self.credentials_ui.binding_succeeded();
+                        self.credential_environment_changed(&outcome.workspace_id);
+                    } else {
+                        self.credentials_ui
+                            .report_error(ui::credentials::CredentialsUiErrorCode::BindingFailed);
+                    }
+                }
                 SettingsOutcomeKind::CredentialAdded(result) => match result {
                     Ok(()) => {
                         self.credentials_ui.add_succeeded();
+                        self.credential_environment_changed(&outcome.workspace_id);
                         self.invalidate_env_api_projects();
                     }
                     Err(_) => self
@@ -31907,6 +32021,9 @@ impl eframe::App for App {
         if let Some(intent) = credentials_intent {
             let current_revision = self.credentials_snapshot.revision();
             let failure = match &intent {
+                ui::credentials::CredentialsIntent::SetEnvBinding { .. } => {
+                    ui::credentials::CredentialsUiErrorCode::BindingFailed
+                }
                 ui::credentials::CredentialsIntent::Add { .. } => {
                     ui::credentials::CredentialsUiErrorCode::AddFailed
                 }
@@ -31924,6 +32041,14 @@ impl eframe::App for App {
                 }
             };
             let action = match intent {
+                ui::credentials::CredentialsIntent::SetEnvBinding {
+                    revision,
+                    credential_id,
+                    env_name,
+                } if revision == current_revision => Some(SettingsJobAction::SetCredentialEnv {
+                    credential_id,
+                    env_name,
+                }),
                 ui::credentials::CredentialsIntent::Add {
                     revision,
                     credential,
@@ -42814,6 +42939,84 @@ mod tests {
         );
         assert_eq!(tracker.denial_retries.len(), 1);
         assert_eq!(tracker.live.len(), 1);
+    }
+
+    #[test]
+    fn credential_env_환경파일_없이도_실행참조를_읽고_연결해제를_반영한다() {
+        let path = temp_db_path("credential-env-payload");
+        let db = Db::open(&path).unwrap();
+        let workspace = db.create_workspace("credential-env-payload").unwrap();
+        db.insert_credential(&storage::CredentialMeta {
+            id: "api-credential".into(),
+            provider: "service".into(),
+            label: "test".into(),
+            credential_kind: "api_key".into(),
+            masked_hint: None,
+            workspace_id: Some(workspace.clone()),
+        })
+        .unwrap();
+        db.set_credential_env_binding(&workspace, "api-credential", Some("SERVICE_KEY"))
+            .unwrap();
+        let mut resource = AppDotenvResource {
+            db_path: path,
+            db: Some(db),
+            redaction: secret::RedactionService::new(),
+        };
+        let job = || DotenvSyncJob {
+            workspace_id: workspace.clone(),
+            root: None,
+            runtime_instance: 1,
+            previous_state: None,
+            force: true,
+            migrate_legacy: false,
+        };
+        let mut payload = execute_dotenv_sync_job(&mut resource, job())
+            .unwrap()
+            .payload
+            .unwrap();
+        assert_eq!(
+            payload.api_secrets,
+            vec![("SERVICE_KEY".into(), "api-credential".into())]
+        );
+        assert!(payload.env_plain.is_empty());
+        assert!(payload.env_secrets.is_empty());
+        payload
+            .env_plain
+            .push(("DEPPY_ENV_LIVE_RELOAD".into(), "1".into()));
+        configure_dotenv_live_reload(&mut payload, true, Some(std::path::Path::new("/tmp")));
+        assert_eq!(
+            payload.env_plain,
+            vec![("DEPPY_ENV_LIVE_RELOAD".into(), "0".into())]
+        );
+        // 파일만 읽지 못해도 검증된 API 연결은 새 실행에 전달한다.
+        let dir = std::env::temp_dir().join(format!("deppy-api-source-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".env"), [0xff]).unwrap();
+        let mut source_job = job();
+        source_job.root = Some(dir.clone());
+        let source_payload = execute_dotenv_sync_job(&mut resource, source_job)
+            .unwrap()
+            .payload
+            .unwrap();
+        assert!(source_payload.source_failed);
+        assert_eq!(source_payload.api_secrets, payload.api_secrets);
+        assert!(source_payload.env_plain.is_empty());
+        assert!(source_payload.env_secrets.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+        resource
+            .db
+            .as_ref()
+            .unwrap()
+            .set_credential_env_binding(&workspace, "api-credential", None)
+            .unwrap();
+        assert!(
+            execute_dotenv_sync_job(&mut resource, job())
+                .unwrap()
+                .payload
+                .unwrap()
+                .api_secrets
+                .is_empty()
+        );
     }
 
     #[test]

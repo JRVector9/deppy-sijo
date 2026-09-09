@@ -1201,3 +1201,9 @@ settings.relay.time.expired = 期限切れ
 env.source_missing = 元の環境ファイルがありません。以下は保管された値で、新しいセッションには渡されません。
 env.delete_all_sources = すべてのファイルから削除
 env.source_read_failed = 環境ファイルを読み取れません。以下の保管値が元のファイルと一致するか確認できません。
+credentials.env_bindings = Agent 環境変数の接続
+credentials.env_binding_hint = 環境変数名を保存すると新しいシェル・Agentに渡します。空欄で保存すると接続を解除します。 API連携のあるプロジェクトではシェルのライブ反映は無効です。変更は新しい実行に適用されます。
+credentials.env_name = 環境変数名（任意）
+credentials.env_overrides_dotenv = 同名の環境ファイルの値より、この API 接続が優先されます。
+
+env.source_api_only = 環境ファイルを読み込めません。連携済みAPIのみ新しい実行に渡し、同期を再試行します。

@@ -1201,3 +1201,9 @@ settings.relay.time.expired = 已到期
 env.source_missing = 源环境文件不存在。以下为保留值，不会传递给新会话。
 env.delete_all_sources = 从所有文件中删除
 env.source_read_failed = 无法读取环境文件。下方保留值可能与源文件不同。
+credentials.env_bindings = Agent 环境连接
+credentials.env_binding_hint = 保存环境变量名后将此密钥传递给新的 shell 和 Agent。保存空名称可解除连接。 关联 API 的项目会禁用 Shell 实时更新。更改从新运行开始生效。
+credentials.env_name = 环境变量名（可选）
+credentials.env_overrides_dotenv = 此 API 连接优先于环境文件中的同名值。
+
+env.source_api_only = 无法读取环境文件。仅将已关联的 API 传递给新运行，并重试文件同步。

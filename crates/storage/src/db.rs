@@ -1,3 +1,7 @@
+#[path = "workspace_env.rs"]
+mod workspace_env;
+pub use workspace_env::CredentialEnvBinding;
+
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 
@@ -815,6 +819,28 @@ CREATE INDEX idx_relay_devices_recency
        UPDATE physical_secret_slot_ledger SET recovery_generation = randomblob(16)
        WHERE physical_slot = NEW.physical_slot;
      END;",
+    // v41: 비밀값은 Keychain에 유지하고 workspace별 실행 환경 연결만 저장한다.
+    "CREATE TABLE workspace_credential_env (
+       workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+       env_name TEXT NOT NULL CHECK(typeof(env_name)='text' AND length(CAST(env_name AS BLOB)) BETWEEN 1 AND 256
+         AND env_name NOT GLOB '*[^A-Za-z0-9_]*' AND substr(env_name,1,1) GLOB '[A-Za-z_]'),
+       credential_id TEXT NOT NULL REFERENCES credentials(id),
+       PRIMARY KEY(workspace_id, env_name), UNIQUE(workspace_id, credential_id));
+     CREATE TRIGGER workspace_credential_env_insert_guard BEFORE INSERT ON workspace_credential_env
+     BEGIN
+       SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM credentials WHERE id=NEW.credential_id
+         AND (workspace_id IS NULL OR workspace_id=NEW.workspace_id))
+         THEN RAISE(ABORT, 'credential_env_owner_invalid') END;
+       SELECT CASE WHEN (SELECT COUNT(*) FROM workspace_credential_env WHERE workspace_id=NEW.workspace_id) >= 256
+         THEN RAISE(ABORT, 'credential_env_limit') END;
+     END;
+     CREATE TRIGGER workspace_credential_env_update_guard BEFORE UPDATE ON workspace_credential_env
+     BEGIN SELECT RAISE(ABORT, 'credential_env_use_replace'); END;
+     CREATE TRIGGER credential_env_owner_guard BEFORE UPDATE OF workspace_id ON credentials
+     WHEN NEW.workspace_id IS NOT NULL AND EXISTS(SELECT 1 FROM workspace_credential_env
+       WHERE credential_id=OLD.id AND workspace_id<>NEW.workspace_id)
+     BEGIN SELECT RAISE(ABORT, 'credential_env_owner_invalid'); END;",
+
 ];
 
 /// 옵션2: 저장된 에이전트 세션 한 행 — 재시작 복원 시 native resume에 쓴다.
@@ -3572,6 +3598,7 @@ pub struct SettingsAgentsSnapshotRows {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SettingsEnvironmentSnapshotRows {
+    pub credential_env: Vec<CredentialEnvBinding>,
     pub credentials: Vec<CredentialMeta>,
     pub profiles: Vec<EnvProfileRow>,
     pub env_vars: Vec<SettingsWorkspaceEnvVarRow>,
@@ -6506,6 +6533,7 @@ impl Db {
             .execute(
                 "DELETE FROM credentials WHERE id = ?1
                    AND NOT EXISTS (SELECT 1 FROM env_vars WHERE credential_id = ?1)
+                   AND NOT EXISTS (SELECT 1 FROM workspace_credential_env WHERE credential_id = ?1)
                    AND NOT EXISTS (
                        SELECT 1
                        FROM mcp_servers, json_each(COALESCE(mcp_servers.env_credentials_json, '{}'))
@@ -6536,6 +6564,7 @@ impl Db {
             .execute(
                 "DELETE FROM credentials WHERE id = ?1 AND keyring_username = ?2
                    AND NOT EXISTS (SELECT 1 FROM env_vars WHERE credential_id = ?1)
+                   AND NOT EXISTS (SELECT 1 FROM workspace_credential_env WHERE credential_id = ?1)
                    AND NOT EXISTS (
                        SELECT 1
                        FROM mcp_servers, json_each(COALESCE(mcp_servers.env_credentials_json, '{}'))
@@ -6638,6 +6667,8 @@ impl Db {
             .conn
             .query_row(
                 "SELECT 1 FROM env_vars WHERE credential_id = ?1
+                 UNION ALL
+                 SELECT 1 FROM workspace_credential_env WHERE credential_id = ?1
                  UNION ALL
                  SELECT 1
                  FROM mcp_servers, json_each(COALESCE(mcp_servers.env_credentials_json, '{}'))
@@ -11506,6 +11537,15 @@ impl Db {
             "settings_environment_snapshot_retained_bytes_limit"
         );
 
+        let credential_env = Self::credential_env_bindings_in_snapshot(&tx, workspace_id)?;
+        let binding_bytes: usize = credential_env
+            .iter()
+            .map(|binding| binding.env_name.len() + binding.credential_id.len())
+            .sum();
+        anyhow::ensure!(
+            retained_bytes.saturating_add(binding_bytes) <= SETTINGS_SNAPSHOT_BYTES_MAX,
+            "settings_environment_snapshot_retained_bytes_limit"
+        );
         let credentials = {
             let mut stmt = tx.prepare(
                 "SELECT id, provider, label, credential_kind, masked_hint, workspace_id
@@ -11566,6 +11606,7 @@ impl Db {
         tx.commit()
             .context("settings environment snapshot transaction commit failed")?;
         Ok(SettingsEnvironmentSnapshotRows {
+            credential_env,
             credentials,
             profiles,
             env_vars,
@@ -12154,7 +12195,10 @@ mod tests {
         legacy.execute("INSERT INTO physical_secret_slot_ledger (physical_slot,logical_credential_id,state,created_at,updated_at) VALUES (?1,?2,'staging',1,1)", (slot.as_str(),logical.as_str())).unwrap();
         drop(legacy);
         let migrated = Db::open(&legacy_path).unwrap();
-        assert_eq!(Db::read_user_version(&migrated.conn).unwrap(), 40);
+        assert_eq!(
+            Db::read_user_version(&migrated.conn).unwrap(),
+            MIGRATIONS.len()
+        );
         let row = migrated.relay_device(&pending.device_id).unwrap().unwrap();
         assert_ne!(row.authorization_epoch, [0; 16]);
         assert_eq!(row.identity_public_sec1, pending.identity_public_sec1);
@@ -12840,8 +12884,8 @@ mod tests {
     }
 
     #[test]
-    fn relay_v36_file_migrates_to_v40_and_reopens() {
-        assert_eq!(MIGRATIONS.len(), 40);
+    fn relay_v36_file_migrates_to_current_and_reopens() {
+        assert!(MIGRATIONS.len() >= 40);
         let dir = std::env::temp_dir().join(format!(
             "deppy-relay-v36-migration-{}-{}",
             std::process::id(),
@@ -12854,7 +12898,10 @@ mod tests {
         drop(legacy);
 
         let migrated = Db::open(&path).unwrap();
-        assert_eq!(Db::read_user_version(&migrated.conn).unwrap(), 40);
+        assert_eq!(
+            Db::read_user_version(&migrated.conn).unwrap(),
+            MIGRATIONS.len()
+        );
         for table in ["relay_pending_devices", "relay_devices"] {
             let present: bool = migrated
                 .conn
@@ -12868,7 +12915,10 @@ mod tests {
         }
         drop(migrated);
         let reopened = Db::open(&path).unwrap();
-        assert_eq!(Db::read_user_version(&reopened.conn).unwrap(), 40);
+        assert_eq!(
+            Db::read_user_version(&reopened.conn).unwrap(),
+            MIGRATIONS.len()
+        );
         drop(reopened);
         fs::remove_dir_all(dir).unwrap();
     }
@@ -17945,6 +17995,20 @@ mod tests {
     }
 
     #[test]
+    fn credential_env_연결은_워크스페이스별로_저장되고_사용중인_키는_삭제할수없다() {
+        let db = Db::open_in_memory().unwrap();
+        let workspace = db.create_workspace("credential-env").unwrap();
+        db.insert_credential(&sample("env-key")).unwrap();
+        let inserted = db.conn.execute(
+            "INSERT INTO workspace_credential_env(workspace_id, env_name, credential_id) VALUES (?1, 'SERVICE_TOKEN', 'env-key')",
+            [&workspace],
+        );
+        assert!(inserted.is_ok(), "환경 연결을 영속할 테이블이 필요하다");
+        assert!(db.credential_in_use("env-key").unwrap());
+        assert!(!db.delete_credential_if_unused("env-key").unwrap());
+    }
+
+    #[test]
     fn credential_crud_roundtrip() {
         let db = Db::open_in_memory().unwrap();
         db.insert_credential(&sample("cred-1")).unwrap();
@@ -18369,7 +18433,10 @@ mod tests {
         legacy.execute("INSERT INTO physical_secret_slot_ledger (physical_slot,logical_credential_id,state,created_at,updated_at) VALUES (?1,?2,'staging',1,1)", (slot.as_str(),logical.as_str())).unwrap();
         drop(legacy);
         let migrated = Db::open(&path).unwrap();
-        assert_eq!(Db::read_user_version(&migrated.conn).unwrap(), 40);
+        assert_eq!(
+            Db::read_user_version(&migrated.conn).unwrap(),
+            MIGRATIONS.len()
+        );
         let rows = migrated
             .physical_secret_slots_for_reconciliation(8)
             .unwrap();
@@ -18378,7 +18445,10 @@ mod tests {
         assert_ne!(rows[0].recovery_generation, [0; 16]);
         drop(migrated);
         let reopened = Db::open(&path).unwrap();
-        assert_eq!(Db::read_user_version(&reopened.conn).unwrap(), 40);
+        assert_eq!(
+            Db::read_user_version(&reopened.conn).unwrap(),
+            MIGRATIONS.len()
+        );
         assert_eq!(
             rows,
             reopened

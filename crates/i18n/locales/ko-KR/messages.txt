@@ -1201,3 +1201,9 @@ settings.relay.time.expired = 만료됨
 env.source_missing = 원본 환경파일이 없습니다. 아래는 보관된 값이며 새 실행에는 전달되지 않습니다.
 env.delete_all_sources = 모든 파일에서 삭제
 env.source_read_failed = 환경파일을 읽지 못했습니다. 아래 보관값이 원본과 일치하는지 확인할 수 없습니다.
+credentials.env_bindings = Agent 환경 연결
+credentials.env_binding_hint = 환경변수 이름을 저장하면 새 셸·Agent에 전달합니다. 비우고 저장하면 연결을 해제합니다. API 연결이 있는 프로젝트에서는 셸 라이브 반영을 사용하지 않습니다. 변경한 값은 새 실행부터 적용됩니다.
+credentials.env_name = 환경변수 이름 (선택)
+credentials.env_overrides_dotenv = 같은 이름의 환경파일 값보다 이 API 연결이 우선합니다.
+
+env.source_api_only = 환경파일을 읽지 못했습니다. 연결된 API만 새 실행에 전달하며, 파일 동기화는 다시 시도합니다.

@@ -2643,6 +2643,14 @@
 - 사용자 작업 보존: `/private/tmp/deppy-settings-session-background-20260909`의 file_tree/settings/workspace/renderer_egui/handoff 미커밋 수정은 그대로 있다. 통합 시 이 화면 수정이 빠져 이전 화면으로 돌아가지 않도록 먼저 diff를 확인한다.
 - 남은 확인: 승인된 시점에 5개 PR과 별도 화면 변경을 함께 통합하고 패키징/재실행 후 사용자 화면을 확인한다. 조회 오류 해제, 파일 선택·편집/삭제, API 연결·해제, 새 Agent 적용 상태, workspace 전환을 확인한다. 화면 미검증은 PASS가 아니다.
 - 다음 에이전트 시작 명령: `cd /private/tmp/deppy-env-application-20260909`; `cat AGENTS.md`; `cat CLAUDE.md`; `tail -n 75 docs/CODEX_HANDOFF.md`; `git status --short`; `git diff`; `gh pr view 183`; `git -C /private/tmp/deppy-settings-session-background-20260909 diff --stat`. 승인 없이 기존 앱을 종료하거나 main에 머지하지 않는다.
+
+## 2026-09-09 main 통합 및 재실행 착수
+
+- 사용자 승인: #179~183 main 머지와 재빌드·재실행. 기존 실행 화면의 가로폭/세션 배경/설정 안내 수정을 빠뜨리지 않도록 원본 dirty worktree에서 코드 4개 파일만 별도 통합했다. 원본 worktree는 수정하지 않았다.
+- 작업 위치 `/private/tmp/deppy-env-main-20260909`, branch `integrate/environment-ui-main-20260909`. 기준 #183 `1653cbf`에 기존 UI 변경을 추가했다. 전체 가용 pane 폭, 선택 세션만 배경, 스크롤백 상세 설명 숨김을 보존한다. UI 회귀 테스트는 실행하지 않는다.
+- 코드 확인과 fmt/diff, workspace clippy all-targets PASS(34.18초, `/tmp/deppy-env-ui-integration-clippy.log`). 경계 검사에서 새 환경 UI가 storage 타입의 순수 검증 메서드를 호출하는 문제가 발견돼 #181/#182에서 순수 core 함수로 수정 중이다. 이전 구현 보고에는 이 별도 게이트가 누락되어 있었다.
+- GitHub 실패 30개는 각 runner_id=0, steps=0 및 billing annotation으로 미실행 확인(`/tmp/deppy-env-merge-ci-evidence.json`). GitGuardian 성공. main protected=false, 보호/ruleset 상세 API는 계정 플랜 403으로 조회 불가. 우회 옵션은 사용하지 않는다. 변경되지 않은 Relay Linux/WebCrypto는 이번 재검증 대상이 아니다. dependency audit 취약점 0, deny bans/licenses/sources PASS.
+- 남은 작업: #181/#182 경계 수정 전파 및 재검증, 5개 PR 순차 merge, 기존 화면 수정 PR merge, 최종 main의 Developer ID 서명 release 패키징 후 정확한 앱 PID 종료/새 bundle 실행. 배포 workflow는 수동 트리거뿐이며 실행하지 않는다.
 - main 통합 사전 검사 보완: xtask check-boundary가 UI의 storage::Db 정적 검증 호출을 발견했다. 이름 검증을 deppy_core::credential_env의 순수 함수로 옮겨 UI/저장소가 같은 규칙을 사용한다. 기존 문자/길이 계약은 그대로다. 이전 fmt/clippy/i18n 통과가 boundary 통과를 의미하지 않았으며 이 누락을 수정 중이다.
 
 - PR 3 경계 보완은 storage 연결 회귀 3 PASS와 check-boundary PASS 뒤 ee52883으로 기록했다. PR 4는 해당 commit을 merge로 받아 core 모듈 선언/handoff 충돌에서 양쪽 내용을 모두 보존했다. 파일 선택 UI도 기존 core 순수 함수 직접 호출로 변경했다. rebase/force-push는 사용하지 않았다.

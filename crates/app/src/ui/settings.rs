@@ -2094,7 +2094,7 @@ fn scrollback_policy_status(
     use crate::scrollback_policy::Status;
     let key = match view.status {
         Status::Pending => "settings.scrollback.pending",
-        Status::Applied => "settings.scrollback.applied",
+        Status::Applied => return false,
         Status::Partial => "settings.scrollback.partial",
         Status::Failed => "settings.scrollback.failed",
     };
@@ -2111,9 +2111,6 @@ fn scrollback_policy_status(
         ),
         false,
     );
-    if !view.durable && matches!(view.status, Status::Applied | Status::Partial) {
-        detail_text(ui, catalog.t("settings.scrollback.memory_only", &[]), false);
-    }
     view.status == Status::Failed
         && ui
             .button(catalog.t("settings.scrollback.retry", &[]))
@@ -2221,23 +2218,6 @@ fn terminal_page(
                 *changed = true;
             }
         },
-    );
-    detail_text(
-        ui,
-        catalog.t(
-            "settings.scrollback.limits",
-            &[
-                (
-                    "visible",
-                    &comma(terminal::TerminalCacheBudget::VISIBLE.max_scrollback_lines as i64),
-                ),
-                (
-                    "hidden",
-                    &comma(terminal::TerminalCacheBudget::HIDDEN.max_scrollback_lines as i64),
-                ),
-            ],
-        ),
-        false,
     );
     let scrollback_view = if requested_before != config.terminal.scrollback_lines {
         // 같은 render pass에서 편집했으면 이전 설정의 완료 ACK를 새 값 옆에 표시하지 않는다.
@@ -3405,7 +3385,7 @@ fn truncate_fingerprint(fp: &str, keep: usize) -> String {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn 스크롤백_실제_설정페이지는_상태를_표시하고_실패만_재시도_의도를_반환한다() {
+    fn 스크롤백_설정페이지는_완료안내를_숨기고_실패만_재시도_의도를_반환한다() {
         use crate::scrollback_policy::{Status, View};
         use egui_kittest::kittest::Queryable as _;
         for (status, key) in [
@@ -3452,14 +3432,14 @@ mod tests {
                     (super::Config::default(), false),
                 );
             harness.run();
-            assert!(
-                harness.query_by_label(&label).is_some(),
-                "실제 설정 페이지에 {key} 표시가 필요하다"
-            );
             assert_eq!(
-                harness.query_by_label(&memory_only_label).is_some(),
-                matches!(status, Status::Applied | Status::Partial),
-                "완료/일부 적용에서는 독립 복구 로그의 경계를 알려야 한다"
+                harness.query_by_label(&label).is_some(),
+                status != Status::Applied,
+                "적용 완료 안내는 숨기고 진행 중·일부 적용·실패 상태는 표시한다"
+            );
+            assert!(
+                harness.query_by_label(&memory_only_label).is_none(),
+                "독립 복구 로그 설명은 설정 화면에 표시하지 않는다"
             );
             if status == Status::Failed {
                 harness

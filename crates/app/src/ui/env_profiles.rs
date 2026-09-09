@@ -570,7 +570,7 @@ impl EnvProfilesUi {
                     .filter(|line| !line.is_empty())
                     .map(str::to_owned)
                     .collect();
-                let valid = storage::Db::validate_env_source_files(&files).is_ok();
+                let valid = deppy_core::env_sources::valid_files(&files);
                 ui.horizontal_wrapped(|ui| {
                     if ui
                         .add_enabled(

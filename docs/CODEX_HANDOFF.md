@@ -2602,3 +2602,6 @@
 - PR 4 리뷰 반영 재검증 PASS: app 선택/파일회귀 4, runtime 선택 복원 1(`/tmp/deppy-sources-review-fixed.log`). workspace clippy all-targets PASS(20.02초), fmt/diff PASS. i18n-check 진행 중. 선택 규칙 공용화와 Option root를 포함한 새 protocol v16은 기존 v15와 혼용하지 않는다. 화면 검증·패키징·재시작은 미실행이다.
 
 - PR 4 최종 게이트 모두 PASS: i18n-check 1142 literal keys/5 locale도 완료했다(`/tmp/deppy-sources-i18n.log`). 다음 명령은 commit/push와 #181 base draft PR 생성, 이어서 `git worktree add -b feat/environment-application-status /private/tmp/deppy-env-application-20260909 HEAD`로 PR 5를 구현한다.
+- main 통합 사전 검사 보완: xtask check-boundary가 UI의 storage::Db 정적 검증 호출을 발견했다. 이름 검증을 deppy_core::credential_env의 순수 함수로 옮겨 UI/저장소가 같은 규칙을 사용한다. 기존 문자/길이 계약은 그대로다. 이전 fmt/clippy/i18n 통과가 boundary 통과를 의미하지 않았으며 이 누락을 수정 중이다.
+
+- PR 3 경계 보완은 storage 연결 회귀 3 PASS와 check-boundary PASS 뒤 ee52883으로 기록했다. PR 4는 해당 commit을 merge로 받아 core 모듈 선언/handoff 충돌에서 양쪽 내용을 모두 보존했다. 파일 선택 UI도 기존 core 순수 함수 직접 호출로 변경했다. rebase/force-push는 사용하지 않았다.

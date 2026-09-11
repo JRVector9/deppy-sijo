@@ -3251,3 +3251,71 @@
 - 현재 실행: **PID 30263**, `/private/tmp/deppy-agent-attention-build-h7vj5ob8/Deppy Sijo.app/Contents/MacOS/deppy-sijo`. 기존 PID 종료 및 새 프로세스 유지/실행 경로를 재확인했다. 적용 코드 커밋은 **7442a8f**다.
 - build-manifest.json에 app_restarted=true와 실행 PID/시각을 기록했다. main 머지는 하지 않았다. 실제 에이전트 질문/승인 화면 검증은 사용자가 진행할 차례다.
 - 다음 확인 명령: `ps -o pid,etime,command -p 30263`. 이제 PID 25095를 현재 실행 앱으로 사용하면 안 된다.
+## 2026-09-11 환경 및 API · 터미널 우클릭 HTML 시안
+
+- 목표: 사용자 요청대로 앱 구현 전에 환경 및 API 추가 화면과 터미널 선택 텍스트를 이름/값으로 넣는 흐름을 HTML로 보여준다.
+- 작업 위치: `/Users/jr/Desktop/projects/deppy-sijo-env-api-preview`, branch `design/environment-api-preview`, base main `9432d33`. 기존 앱과 원본 Relay branch는 변경하지 않는다.
+- 작성 파일: `docs/previews/environment-api-20260911.html`, `docs/superpowers/specs/2026-09-11-environment-api-preview-design.md`, 이 handoff.
+- 설계: 프로젝트 맥락과 목록을 유지하는 오른쪽 입력 패널. 서비스 → 이름 → 값 순서, API/일반 변수 전환, 마스킹, 저장할 환경파일, 선택 표시 이름. 우클릭의 이름/값/단일 NAME=value 채우기, 기존 이름 변경 안내, 새 세션부터 사용한다는 상태를 포함한다.
+- HTML의 모든 데이터는 브라우저 메모리의 가짜 예제다. 실제 파일/Keychain/API/Agent와 연결하지 않는다. 앱 구현·재빌드·재실행은 하지 않았다.
+- 실패 접근: 첫 apply_patch 호출은 JS 템플릿 문자열과 문서 backtick 충돌로 실행 전 파싱 실패했다. 파일은 변경되지 않았으며 HTML과 문서 패치를 분리해 작성했다. brainstorming 보조 visual-companion.md는 설치 경로에 없어 독립 HTML/브라우저 방식을 사용한다.
+- 현재 확인: 브라우저 화면과 클릭 흐름은 아직 확인 전이다. 다음은 로컬 HTML을 열어 설정/우클릭/좁은 창을 확인하고 결과를 이 절에 추가한다. Rust 회귀/빌드 게이트는 시안 범위 밖이다.
+- 화면 확인 완료: Chrome에서 설정 추가 패널, 터미널 우클릭, 값 채우기 패널, 좁은 창 screenshot을 직접 확인했다. 기존 변수 선택은 접어 두어 이름/값 입력이 먼저 보이게 조정했다. 선택값은 메뉴에 반복 노출하지 않고 글자 수만 표시한다.
+- 시안 동작 확인: `node /tmp/deppy-env-api-preview-walkthrough.cjs` exit 0. API 추가와 마스킹 목록, 이름 채우기/값 포커스, 값 채우기/이름 포커스, 기존 값 변경 안내와 중복 없는 저장, NAME=value 분리, 실제 마우스 드래그→우클릭, 일반 변수의 선택 파일 표시, 프로젝트 격리를 확인했다. 1440/1024/768/390px에서 가로 넘침과 패널 이탈 없음. 브라우저 JS 오류 0, 외부 요청 0. 이는 HTML 시안 확인이며 Rust 앱이나 실제 저장 기능 검증이 아니다.
+- 로컬 서버: 8765는 기존 서버가 사용 중이어서 종료하지 않고 8779로 변경했다. 실행 명령 `python3 -m http.server 8779 --bind 127.0.0.1 --directory /Users/jr/Desktop/projects/deppy-sijo-env-api-preview/docs/previews`. URL `http://127.0.0.1:8779/environment-api-20260911.html`, 터미널 바로가기 끝에 `#terminal`. 서버가 없어도 HTML 파일을 브라우저에서 직접 열 수 있다.
+- 시안 기본 URL을 브라우저로 열었다. 앱 코드는 수정하지 않았고 재빌드/재실행도 하지 않았다. 현재 남은 단계는 사용자 시안 피드백이다. 승인 전에 Rust 구현을 시작하지 않는다.
+- 다음 에이전트 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-env-api-preview`; `git status --short`; `tail -n 18 docs/CODEX_HANDOFF.md`; `open docs/previews/environment-api-20260911.html`. 시안 수정은 HTML과 설계 문서에 한정하고 앱 구현 요청과 구분한다.
+
+## 2026-09-11 승인한 설정 시안 구현 착수
+
+- 사용자: 1번 설정 시안 구현 승인, 언제든 기존 화면 복구 요구. 2번은 API 이름/키 처리 질문이며 앱 우클릭 구현 승인이 아니다.
+- branch/worktree: feat/environment-api-modern-view, /Users/jr/Desktop/projects/deppy-sijo-env-api-ui, main 9432d33 + 시안 기록 9c28f73. 계획 docs/superpowers/plans/2026-09-11-environment-api-modern-view.md.
+- 설계: 기존 renderer를 보존하고 ui.environment_classic_view 토글로 즉시 복귀한다. snapshot/secret/worker/DB 계약은 공유하며 새 렌더링만 별도 모듈에 둔다.
+- 2번 HTML은 API 이름/API 키 값과 환경변수 이름/값으로 메뉴를 나누었다. 실제 터미널 소스는 수정하지 않는다.
+- 앱 재빌드/재실행은 새 구현이 준비된 뒤 별도 승인 대상이다. UI 회귀 테스트는 실행하지 않으며 config persistence 단일 검증과 코드 게이트를 수행한다.
+- 구현 checkpoint: 새 EnvironmentUi가 전체/API/변수/파일 목록과 입력 패널을 표시한다. credentials/modern.rs와 env_profiles/modern.rs는 기존 초안·snapshot·intent를 재사용한다. 기존 contents_compact는 남아 있고 화면 상단 전환이 config로 저장된다. 좁은 영역은 입력 패널만 표시한다. 새 API는 이름 없는 연결을 강제하지 않고, 환경변수 이름을 비워 키만 보관하는 기존 기능도 유지한다.
+- config RED: 추가한 environment_view_config_roundtrip이 없는 필드 E0609로 실패했다(/tmp/deppy-env-modern-config-red.log). 필드 구현 뒤 같은 단일 테스트 1 PASS(/tmp/deppy-env-modern-config-green.log), 앱 test target compile 31.84초. UI 회귀/실제 앱 화면/패키징/재실행은 수행하지 않았다.
+- HTML 2번은 Chrome에서 API 이름 선택이 display-name에만 채워지고, API 키 선택이 비밀값 필드에 password로 채워짐을 확인했다. 시안 서버 8779의 preview worktree에는 design commit 9c28f73이 반영되어 있다.
+- 현재: cargo fmt 실행 후 실제 코드 diff를 codex review --uncommitted로 리뷰 중(/tmp/deppy-env-modern-review.log). 남은 것은 지적 반영, 커밋 직전 게이트, PR/일지, 사용자 실제 화면 확인용 빌드·재실행 승인이다.
+- 첫 게이트 PASS: fmt/diff, workspace clippy all-targets(28.94초), check-boundary, i18n-check(1210 literal calls/5 locale). 로그 /tmp/deppy-env-modern-{clippy,boundary,i18n}.log.
+- Codex 리뷰에서 Medium 두 건 확인: background snapshot invalidate가 입력 초안을 지우는 문제, 전환 전 secret reveal 응답이 다시 값을 노출하는 문제. background invalidate의 새 reset 호출은 제거하고 실제 닫기/프로젝트 선택/화면 전환만 reset_environment_view_state를 호출하게 했다. 이 경로는 env reveal generation도 올리고 pending 요청을 버린다.
+- 같은 원인의 API reveal도 보완: 실제 worker 완료가 accept_requested_reveal을 거치도록 하고, 현재 공개 요청이 없으면 응답을 버린다. modern_view_late_secret_reply_is_discarded는 fake 값만 사용하며 수정 전 1 FAIL로 재현했다(/tmp/deppy-env-modern-reveal-red.log). 수정 뒤 단일 재검증 실행 중으로 아직 GREEN을 확정하지 않는다.
+- 수정 중 painter 배경 위치 패치의 범용 앵커가 다른 horizontal 블록에 맞는 것을 rg/git diff로 바로 확인했고, 해당 변경을 제거한 뒤 environment_classic_view가 포함된 고유 문맥으로 다시 적용했다. 앱의 다른 화면 변경은 남아 있지 않다.
+- reveal 수정 GREEN: modern_view_late_secret_reply_is_discarded 1 PASS(compile 10.76초, /tmp/deppy-env-modern-reveal-green.log). 화면을 닫은 후 도착한 fake old value는 버리고 다시 명시적으로 요청한 fake current value만 표시하는 상태 경로를 검증했다. UI 렌더 테스트가 아니다.
+- 후속 게이트: app all-targets clippy PASS(23.54초), fmt/diff PASS, check-boundary PASS. i18n은 locale 변경 후 통과한 1210 literal calls/5개 결과를 재사용한다. 독립 xtask 바이너리를 바로 실행한 첫 시도는 CARGO_MANIFEST_DIR 없음으로 실패해 cargo run -p xtask -- check-boundary로 재실행했다.
+- 최종 코드 확인 범위: env reveal은 reset_environment_view_state에서 generation 갱신/대기 취소, API reveal은 실제 settings 완료의 accept_requested_reveal에서 요청 집합 확인. reset 호출은 닫기/프로젝트 선택/화면 전환에만 있으며 background invalidate에서 제거됐다. 후속 Codex 리뷰는 이 경로만 확인 중(/tmp/deppy-env-modern-review-followup.log).
+- 후속 Codex 리뷰는 늦은 reveal 수정은 확인했고, 목록 재조회 중 선택 B가 None→활성 A로 바뀌어 초안이 지워지는 추가 경로를 찾았다. resolve_settings_env_project_during_refresh가 미수신 목록(None)과 실제 빈 목록(Some([]))을 구분하도록 수정했고 snapshot 요청/화면 선택의 두 호출 모두 연결했다. 실제 목록에서 선택 프로젝트가 삭제된 경우만 폴백한다.
+- 선택 수명 테스트: environment_project_selection_survives_refresh는 수정 전 None 대 Some(editing)으로 1 FAIL(/tmp/deppy-env-modern-project-red.log), 수정 뒤 1 PASS(/tmp/deppy-env-modern-project-green.log, compile 16.14초). 실제 빈 목록과 선택 프로젝트 삭제도 포함한다. 이번 작업의 상태 검증은 config/reveal/selection 각 1개이며 앱 화면 검증과 구분한다.
+- 현재 수정 파일은 app.rs/config.rs, UI 모듈 선언과 기존 credentials/env_profiles 확장, 신규 environment.rs와 두 modern.rs, locale 5개, HTML 시안/계획/handoff다. DB migration, runtime 저장 계약, 실제 터미널 우클릭 코드는 변경하지 않았다.
+- 최종 소스 검증: 선택 보존 수정 뒤 app all-targets clippy 13.15초 PASS, fmt/diff/check-boundary PASS. 기존 workspace clippy와 locale 5개/i18n 결과도 앞 절과 같다. 리뷰에서 확인한 세 경로는 수정했으며 마지막 선택 보존 변경은 단일 회귀와 소스 호출부 확인으로 검증했다. 전체 앱 테스트나 실제 UI 화면 PASS를 주장하지 않는다.
+- 구현과 리뷰 수정은 완료되어 commit/push 및 main 대상 draft PR을 생성한다. 이후 사용자 승인이 필요한 것은 새 앱 패키징·재실행과 실제 화면 확인이다. 이전 main 앱은 이번 작업에서 종료하지 않았다.
+- 구현 commit `1eb291e`, main 대상 draft PR #188 생성 완료: https://github.com/JRVector9/deppy-sijo/pull/188. main에는 아직 반영하지 않았고 앱 패키징·재실행도 하지 않았다. 새 화면/기존 화면 전환은 같은 데이터와 기존 worker를 사용하며 `ui.environment_classic_view=true`로 수동 복구할 수도 있다.
+- 2번 우클릭은 수정한 HTML 시안만 제공한다. API 이름·API 키 값·선택 환경변수 이름을 구분한다. 실제 터미널 코드 변경은 없다. 현재 시안은 localhost:8779의 preview worktree design commit 3606ffc로 열 수 있다.
+- 다음 단계: 사용자 재빌드/재실행 승인 후 이 PR worktree의 `target`이 있는지 확인하고 없으면 `ln -s /private/tmp/deppy-ready-prs-integration-target target`을 만든다. `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target DEPPY_SIGN_IDENTITY='Developer ID Application: VectorNine INC (ZDTU5LS35K)' DEPPY_REQUIRE_TRUSTED_SIGNING=0 DEPPY_ALLOW_UNTRUSTED_SIGNING=1 sh scripts/package-macos.sh`. 성공 전 앱 종료 금지. 승인된 재실행 시 `pgrep -x deppy-sijo`/`ps -o pid=,etime=,command= -p <PID>`로 확인한 PID만 종료하고 `open 'target/bundle/Deppy Sijo.app'`. 실제 새 화면과 기존 화면 전환을 사용자가 확인하기 전 UI PASS 또는 PR ready로 바꾸지 않는다.
+
+## 2026-09-11 PR #188 사용자 요청 코드 리뷰
+
+- 목표: 사용자 `코드리뷰해` 요청에 따라 `04cdef6`을 최신 fetch한 base main `9432d33`과 대조한다. 이번 단계는 리뷰이며 앱 코드 수정·패키징·재실행·머지는 하지 않았다.
+- review 스킬의 필수 checklist.md가 설치 경로와 저장소에 없어서 스킬 실행은 적용하지 못했다. 실제 diff, 기존 worker/초안 처리, Cargo.lock의 egui 0.36.1 소스를 직접 추적했다. 별도 에이전트나 세 번째 Codex CLI 리뷰를 실행했다고 주장하지 않는다.
+- 미해결 high: `crates/app/src/ui/credentials/modern.rs:10`의 reset은 입력 String만 제로화한다. `:225`의 TextEdit는 자동 ID로 TextEditState를 재사용하고 egui 실행 취소 기록에는 비밀값 String 사본이 남는다. 취소 후 동일한 추가 입력란을 다시 열어 실행 취소하면 이전 키가 복원될 수 있다. env 입력 초기화에도 같은 기록 정리 누락이 있다. 초안별 입력 ID와 TextEditState/undo 기록을 함께 정리해야 한다.
+- 미해결 medium: 같은 파일 `:203`에서 직접 입력 여부를 provider 문자열과 프리셋의 일치 여부로 판정한다. 직접 입력에서 `openai-compatible` 또는 `google-cloud`를 한 글자씩 입력하면 `openai`/`google`에 도달한 다음 프레임에 입력란이 사라진다. 선택한 서비스 모드와 직접 입력 문자열을 분리해야 한다.
+- 미해결 medium: `crates/app/src/ui/environment.rs:89`에서 가용 폭 700pt 이상일 때 목록 자식 UI 높이를 0으로 전달한다. egui allocate_ui_with_layout은 그 높이를 max_rect로 사용하며 내부 ScrollArea는 남은 높이가 없어 기본 min_scrolled_height 64pt로 축소된다. 추가 패널과 함께 기존 목록을 확인하기 어렵다. 가용 높이를 먼저 캡처해 목록 영역에 전달해야 한다. 실제 앱 화면 재현은 아직 수행하지 않았다.
+- 상태 재현: `/tmp/deppy-pr188-secret-state-probe.rs`를 기존 target의 egui rlib에 링크해 별도 rustc 실행 파일을 만들었다. 앱 빌드나 UI 렌더 테스트가 아니다. 가짜 문자열만 사용했고 `/tmp/deppy-pr188-secret-state-probe` exit 0, `CLEARED_INPUT_UNDO_RESTORES_FAKE_SECRET=true`, `CLEAR_UNDOER_PREVENTS_RESTORE=true`. 로그 `/tmp/deppy-pr188-secret-state-probe.log`. 실제 App reset 호출을 자동 실행한 것은 아니며 reset 소스와 라이브러리 상태 실험을 대조한 결과다.
+- 제외한 의심: 목록 삭제가 추가 패널을 닫는다는 가설은 삭제 확인창이 editor 뒤에서 처리되므로 해당 경로로 성립하지 않는다. 기존 main의 저장 실패 시 값 소진 같은 문제를 새 PR 회귀로 중복 보고하지 않는다.
+- 이번 수정 파일은 이 handoff뿐이다. 게이트·전체 테스트·실제 앱 화면 검증을 재실행하지 않았다. PR #188은 OPEN/draft 상태를 유지한다.
+- 다음 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-env-api-ui`; `git status --short`; `git diff -- docs/CODEX_HANDOFF.md`; `sed -n '1,28p;178,240p' crates/app/src/ui/credentials/modern.rs`; `sed -n '84,104p' crates/app/src/ui/environment.rs`; `/tmp/deppy-pr188-secret-state-probe`. 사용자 수정 요청 시 세 건을 수정하고 비화면 상태 로직은 먼저 회귀 재현한다. UI 확인용 패키징·재실행은 기존 승인 규칙을 계속 따른다.
+
+## 2026-09-11 PR #188 리뷰 세 건 수정
+
+- 사용자 `코드리뷰한거 반영해서 수정해` 승인으로 위 세 건을 수정 중이다. branch/worktree는 동일하며 재빌드·패키징·재실행 승인은 새로 받지 않았다.
+- 입력 기록: 신규 ui/draft_text_edit.rs가 입력값 위젯의 Context/Id 한 쌍만 추적한다. clear는 공유 undo 버퍼를 먼저 비우고 TextEditState와 포커스를 제거한다. API 키와 환경변수 값의 기존/새 화면에 고정 ID를 연결하고 취소/화면 전환/저장, API 용량 초과에서 정리한다. Drop도 정리한다. 메타데이터나 입력 중의 정상 실행 취소는 유지한다.
+- 서비스: 직접 입력 여부를 별도 bool로 보관하고 프리셋/직접 입력 선택 핸들러를 공유한다. 문자열이 openai/google 등과 같아져도 사용자가 고른 직접 입력 모드를 유지한다.
+- 목록: 가용 폭 700pt 이상에서 목록과 추가 패널을 함께 표시할 때 가용 높이를 미리 캡처해 목록 자식 UI에 전달한다. 화면 회귀 테스트는 추가하지 않는다.
+- TDD 상태 3건: API 초안 reset / env 초안 reset에서 실제 egui TextEditState와 공유 undo 사본의 폐기를 확인하고, 직접 입력에서는 네 프리셋으로 시작하는 문자열을 한 글자씩 입력한다. 기록 추적용 골격과 기존 문자열 판정 함수를 준비한 뒤 수정 전 3 FAIL을 실제 확인했다(/tmp/deppy-pr188-review-fix-red.log, compile 18.33초). 수정 뒤 같은 명령 3 PASS(/tmp/deppy-pr188-review-fix-green.log). 이 테스트는 화면을 렌더하지 않는다.
+- 명령: `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo test -p deppy-sijo --bins pr188_ -- --nocapture`.
+- 수정 파일: credentials.rs/credentials/modern.rs, env_profiles.rs/env_profiles/modern.rs, environment.rs, UI 모듈 등록, 신규 draft_text_edit.rs, 이 handoff. 첫 패치의 테스트 모듈 앵커가 달라 적용이 거절됐고 변경 없음 확인 후 정확한 문맥으로 다시 적용했다.
+- 남은 단계: 소스 Codex CLI 리뷰, 지적 반영, 커밋 직전 게이트, 기존 PR #188 갱신 및 Obsidian 기록. 실제 앱 화면 확인은 사용자 재빌드·재실행 승인 뒤 진행한다.
+- 수정 후 상태 테스트 compile 10.92초/3 PASS. 커밋 전 fmt/diff PASS, workspace all-targets clippy `-D warnings` 15.51초 PASS, check-boundary PASS(zero allowlist capability), i18n-check PASS(1210 literal calls/5 locale, i18n unit 8 PASS). 로그 `/tmp/deppy-pr188-fixes-{clippy,boundary,i18n}.log`. 사용자 앱 PID 25095는 기존 main 패키지로 계속 실행 중이다.
+- Codex CLI는 실제 미커밋 UI 소스와 신규 draft_text_edit.rs만 대상으로 후속 리뷰 중(`/tmp/deppy-pr188-fixes-codex-review.log`). 아직 완료 결과를 확정하지 않는다.
+- 후속 Codex CLI 리뷰 exit 0 완료: 변경 소스와 호출 경로에서 새로 도입한 실제 동작 버그를 확인하지 못했다고 보고했다. 문서·HTML·일지는 제외했으며 reviewer는 테스트·빌드·파일 변경을 실행하지 않았다. 위 사용자 리뷰의 세 미해결 지점은 이번 수정으로 반영 완료했고, 실제 화면 확인만 남아 있다.
+- 다음 에이전트: `cd /Users/jr/Desktop/projects/deppy-sijo-env-api-ui`; `git status --short`; `git log -2 --oneline`; `gh pr view 188 --json headRefOid,isDraft,state`; `tail -n 22 docs/CODEX_HANDOFF.md`. PR은 화면 확인 전 draft로 유지한다. 사용자 재빌드·재실행 승인을 받으면 앞 절의 package 명령을 사용하고, 성공 및 서명 확인 전 기존 앱을 종료하지 않는다. 터미널 우클릭 기능은 여전히 HTML 시안만 있다.

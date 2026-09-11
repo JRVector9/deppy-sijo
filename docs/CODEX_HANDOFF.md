@@ -2883,3 +2883,18 @@
 - merge 직후 main에는 Build and test/Dependency security만 실행됐고 배포 실행은 없다.
   `relay-release.yml`과 `relay-shell-release.yml`은 `workflow_dispatch` 전용이다. 현재 요청의
   두 PR main 반영, 최종 빌드, 재실행은 모두 완료했다.
+
+## 2026-09-11 환경 및 API · 터미널 우클릭 HTML 시안
+
+- 목표: 사용자 요청대로 앱 구현 전에 환경 및 API 추가 화면과 터미널 선택 텍스트를 이름/값으로 넣는 흐름을 HTML로 보여준다.
+- 작업 위치: `/Users/jr/Desktop/projects/deppy-sijo-env-api-preview`, branch `design/environment-api-preview`, base main `9432d33`. 기존 앱과 원본 Relay branch는 변경하지 않는다.
+- 작성 파일: `docs/previews/environment-api-20260911.html`, `docs/superpowers/specs/2026-09-11-environment-api-preview-design.md`, 이 handoff.
+- 설계: 프로젝트 맥락과 목록을 유지하는 오른쪽 입력 패널. 서비스 → 이름 → 값 순서, API/일반 변수 전환, 마스킹, 저장할 환경파일, 선택 표시 이름. 우클릭의 이름/값/단일 NAME=value 채우기, 기존 이름 변경 안내, 새 세션부터 사용한다는 상태를 포함한다.
+- HTML의 모든 데이터는 브라우저 메모리의 가짜 예제다. 실제 파일/Keychain/API/Agent와 연결하지 않는다. 앱 구현·재빌드·재실행은 하지 않았다.
+- 실패 접근: 첫 apply_patch 호출은 JS 템플릿 문자열과 문서 backtick 충돌로 실행 전 파싱 실패했다. 파일은 변경되지 않았으며 HTML과 문서 패치를 분리해 작성했다. brainstorming 보조 visual-companion.md는 설치 경로에 없어 독립 HTML/브라우저 방식을 사용한다.
+- 현재 확인: 브라우저 화면과 클릭 흐름은 아직 확인 전이다. 다음은 로컬 HTML을 열어 설정/우클릭/좁은 창을 확인하고 결과를 이 절에 추가한다. Rust 회귀/빌드 게이트는 시안 범위 밖이다.
+- 화면 확인 완료: Chrome에서 설정 추가 패널, 터미널 우클릭, 값 채우기 패널, 좁은 창 screenshot을 직접 확인했다. 기존 변수 선택은 접어 두어 이름/값 입력이 먼저 보이게 조정했다. 선택값은 메뉴에 반복 노출하지 않고 글자 수만 표시한다.
+- 시안 동작 확인: `node /tmp/deppy-env-api-preview-walkthrough.cjs` exit 0. API 추가와 마스킹 목록, 이름 채우기/값 포커스, 값 채우기/이름 포커스, 기존 값 변경 안내와 중복 없는 저장, NAME=value 분리, 실제 마우스 드래그→우클릭, 일반 변수의 선택 파일 표시, 프로젝트 격리를 확인했다. 1440/1024/768/390px에서 가로 넘침과 패널 이탈 없음. 브라우저 JS 오류 0, 외부 요청 0. 이는 HTML 시안 확인이며 Rust 앱이나 실제 저장 기능 검증이 아니다.
+- 로컬 서버: 8765는 기존 서버가 사용 중이어서 종료하지 않고 8779로 변경했다. 실행 명령 `python3 -m http.server 8779 --bind 127.0.0.1 --directory /Users/jr/Desktop/projects/deppy-sijo-env-api-preview/docs/previews`. URL `http://127.0.0.1:8779/environment-api-20260911.html`, 터미널 바로가기 끝에 `#terminal`. 서버가 없어도 HTML 파일을 브라우저에서 직접 열 수 있다.
+- 시안 기본 URL을 브라우저로 열었다. 앱 코드는 수정하지 않았고 재빌드/재실행도 하지 않았다. 현재 남은 단계는 사용자 시안 피드백이다. 승인 전에 Rust 구현을 시작하지 않는다.
+- 다음 에이전트 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-env-api-preview`; `git status --short`; `tail -n 18 docs/CODEX_HANDOFF.md`; `open docs/previews/environment-api-20260911.html`. 시안 수정은 HTML과 설계 문서에 한정하고 앱 구현 요청과 구분한다.

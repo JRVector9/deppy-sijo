@@ -2744,6 +2744,37 @@
 - merge 후 실행 목록에는 Build and test/Dependency security만 있었다. relay-release/relay-shell-release는 workflow_dispatch 전용임을 확인했고 배포를 실행하지 않았다. 현재 사용자 요청인 main 머지·빌드·재실행 모두 완료했다. 화면과 사용 중 동작 확인은 사용자가 진행하며 자동 화면 검증 PASS로 기록하지 않는다.
 - 수정 파일은 이 handoff뿐이며 문서 commit은 실행 코드가 같아 재빌드를 반복하지 않는다. 다음 에이전트는 `cd /private/tmp/deppy-env-main-20260909`; `git status --short`; `git log -2 --oneline`; `pgrep -x deppy-sijo`; `ps -o pid=,etime=,command= -p <현재PID>`로 현재 main/실행 상태를 확인한다. 새 버그 피드백 없으면 추가 수정·빌드·재실행이 필요하지 않다.
 
+## 2026-09-09 터미널 상단 도구 아이콘 확대
+
+- 목표: 터미널 pane 상단의 검색, 새 터미널, 세로 분할, 가로 분할 아이콘을 각각
+  가로·세로 기준 2pt 키운다.
+- 작업 위치: `/private/tmp/deppy-toolbar-icons-20260909`, branch
+  `fix/terminal-toolbar-icon-size`, base `origin/main` `b698ca7`. Cursor 사용량 PR #186과
+  무관한 UI 조정이라 별도 브랜치로 분리했다.
+- 구현: `crates/app/src/ui/workspace.rs`의 직접 그리는 네 glyph만 확대했다. 20pt 클릭
+  영역, 29pt 헤더 높이, 2pt 버튼 간격과 좁은 pane에서 도구를 숨기는 기준은 그대로다.
+- 사용자 지시에 따라 앱 재빌드·재실행은 별도 승인 전 보류한다. UI 변경이라 회귀
+  테스트는 추가하지 않으며 소스 리뷰와 커밋 전 fmt/diff 게이트 뒤 별도 PR로 올린다.
+- 다음 명령: `git diff -- crates/app/src/ui/workspace.rs`; `codex review --uncommitted`;
+  `cargo fmt --all -- --check`; `git diff --check`.
+
+- `codex review --uncommitted` 완료: 확대된 glyph가 기존 20pt 클릭 영역 안에 유지되며
+  기능 회귀나 blocking issue가 없다고 확인했다. 리뷰 과정의 `cargo fmt --all -- --check`와
+  `git diff --check`도 PASS했다. 앱 빌드·재실행·화면 확인은 수행하지 않았다.
+- 남은 작업: 최소 커밋 게이트를 확정하고 코드/문서를 commit·push한 뒤 main 대상 별도
+  PR을 생성한다. 이후 사용자 승인 시 Cursor PR #186과 함께 통합 빌드해 화면에서 실제
+  2pt 확대를 확인한다.
+- 커밋 전 게이트 PASS: app all-targets clippy `-D warnings` 24.23초,
+  `xtask check-boundary`, `cargo fmt --all -- --check`, `git diff --check`. 로케일 변경이 없어
+  i18n-check는 실행하지 않았고 UI 회귀 테스트도 CLAUDE.md 지침에 따라 실행하지 않았다.
+- 다음 명령: `git add crates/app/src/ui/workspace.rs docs/CODEX_HANDOFF.md`; 구현 commit 후
+  push/PR 생성과 Obsidian 프로젝트 일지 기록. 재빌드·재실행은 계속 보류한다.
+- 구현 commit `5f0bbc1`을 push하고 main 대상 PR #187을 생성했다:
+  https://github.com/JRVector9/deppy-sijo/pull/187. Obsidian 프로젝트 일지
+  `프로젝트 일지/deppy-sijo/2026-09-09 터미널 상단 아이콘 확대.md`도 기록했다.
+- 구현·리뷰·PR 생성은 완료했다. 앱 PID 38141은 기존 main 빌드 그대로다. 다음 단계는
+  사용자 승인 후 #186/#187을 통합한 빌드로 재실행하고 실제 크기·정렬을 화면 확인한다.
+
 ## 2026-09-09 Cursor 사용량 상태바 착수
 
 - 목표: 설치·활성화된 Cursor CLI 계정의 실제 사용량을 Claude/Grok/Codex/Kimi와 같은

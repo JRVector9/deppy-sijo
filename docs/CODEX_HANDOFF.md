@@ -3140,3 +3140,106 @@
   `rg 'COMMAND|EXIT' /tmp/deppy-attention-fix7-final-gates.log`
   `ps -o pid,etime,command -p 25095`
   새 사용자 요청이 적용 단계라면 현재 main과 두 수정 커밋의 관계를 먼저 확인한다. 임의로 rebase/force-push하거나 실행 중 앱을 재기동하지 않는다.
+
+## 2026-09-11 f46b168 독립 재리뷰 진행
+
+- 사용자 최신 요청 `한번더 리뷰해`. 커밋 f46b168의 변경 코드와 실제 provider 흐름을 재검토한다. 소스 수정/커밋/main 머지/앱 재빌드·재실행은 하지 않는다.
+- Codex CLI 독립 리뷰 실행 중: exec session 73848, `/tmp/deppy-attention-f46b168-review.log`. 6개 Rust 소스만 대상이며 기존 PASS에 의존하지 않고 빠진 경로를 재현하도록 요청했다.
+- 자체 후보: 동일 인자·ID 없는 병렬 승인 충돌, 큰 도구 결과가 hook 입력/로그 행 한도로 탈락하는 경우, 자식 transcript 결과에서 승인 별칭 해제 누락. 실제 계약·재현을 대조 중이며 아직 최종 지적으로 확정하지 않았다.
+- 임시 하네스 경로는 `/tmp/deppy-f46-review-harness-path`, 실행 로그는 `/tmp/deppy-f46-review-repros.log`. 운영 DB나 실제 대화 로그 대신 임시 SQLite와 합성 jsonl만 사용한다.
+- 다음 명령: `cat /tmp/deppy-f46-review-repros.log`; `tail -n 60 /tmp/deppy-attention-f46b168-review.log`; `git diff --stat`. 동일 승인에 대한 notification은 공식 계약상 약 6초 뒤 발생하므로 notification이 없는 초기 구간도 검토한다.
+
+### f46b168 재리뷰 checkpoint
+
+- 자체 하네스는 현재 실제 proxy/status 모듈과 storage crate를 직접 참조한다. 정상 기대 assertion 3건이 실패해 기존 PASS가 덮지 못한 경계를 확인했다(`/tmp/deppy-f46-review-repros-final.log`):
+  1. 같은 입력의 ID 없는 병렬 승인 2건에서 한 건만 PostToolUse가 와도 waiting=0.
+  2. 300KiB tool_result를 가진 답변은 256KiB hook 입력 한도로 이벤트가 빠지고, Stop의 64KiB 로그 행 한도에도 걸려 질문 ID가 남음.
+  3. 자식 tool_result만 있고 배치 결과가 없는 경로에서 정확한 ID를 해제해도 승인 fingerprint 별칭은 남음.
+- 3번은 실제 배치 생략 조건을 확인해야 최종 지적이 된다. 1번은 공식 PermissionRequest가 tool_use_id를 제공하지 않으며 permission_prompt notification은 약 6초 후라는 계약을 대조했다. 2번은 합성 큰 답변을 사용한 경계 재현이며 실제 CLI에서 큰 답변을 제출한 검증은 아니다.
+- 최초 임시 하네스 의존성 해결은 offline/yanked chacha20 때문에 실패했다. 이미 검증된 임시 하네스 Cargo.lock을 복사하여 저장소 의존성을 바꾸지 않고 재현 실행에 성공했다. 저장소 Cargo.lock/소스는 변경하지 않았다.
+- CLI 독립 리뷰가 실제 설치된 Claude 코드와 화면 소유권 경로까지 확인 중이다. 중복 원인을 합치고 실제 발생 조건이 확인된 항목만 최종 보고한다.
+
+### f46b168 재리뷰 완료 — 추가 수정 5건
+
+- Codex CLI 리뷰는 exit 0으로 완료했고 P2 3건을 확인했다: 자식 중단 후 승인 고착, 취소 후 늦은 익명 결과의 음수 잔액, 이력 정리 이후 음수 잔액. 부모 fc9bd03과 같은 입력을 비교하여 회귀를 재현했다.
+- 자체 후보 중 자식 transcript 별칭 미해제는 외부 지적과 합쳤다. 동일 입력 병렬 승인 충돌(기존부터 남은 처리) 및 큰 결과의 메타데이터 유실 경계 2건을 더해 최종 **5건, 모두 medium**이다.
+- 상세 위치·실제 조건·공식 계약·재현은 `docs/investigations/2026-09-11-agent-attention-f46b168-review.md`에 기록했다. 자체 정상 기대 3개가 실패하고 대조군 2개가 통과했다. 큰 답변은 합성 300KiB이고 실제 CLI 화면 검증은 아니다.
+- 수정된 저장소 파일은 인계 문서와 새 리뷰 보고서뿐이다. 소스, Cargo.lock, 운영 DB, 사용자 설정, release bundle, 실행 앱 PID 25095는 변경하지 않았다. 이번 리뷰에서는 커밋/머지/앱 빌드·재기동을 하지 않는다.
+- 실패 접근: 새 임시 하네스 lock 없이 offline 의존성 해결 시 yanked chacha20이 거부됐다. 기존 lock 복사 후 실행했다. 외부 하네스의 첫 경로 검사도 Path::starts_with와 문자열 prefix를 혼동해 실패했고 문자열 비교로 고친 후 실제 회귀를 재현했다. 이 하네스 오류들을 제품 결함으로 보고하지 않는다.
+- 다음 명령:
+  `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`
+  `git status --short`
+  `cat docs/investigations/2026-09-11-agent-attention-f46b168-review.md`
+  `sh /private/tmp/deppy-f46b-independent.vDGj5o/run.sh`
+  `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo test --manifest-path /var/folders/5g/tm96jknx43n8r04kl5j12kvm0000gn/T/deppy-f46-review-da2e0ca1/Cargo.toml repros:: -- --nocapture --test-threads=1`
+  위 재현은 현재 결함을 확인하므로 수정 PASS로 세지 않는다. 수정 요청이 오면 두 익명 경계를 먼저 고치고 자식 종료·승인 ID 연결·큰 결과 메타데이터 보존을 보완한다.
+
+## 2026-09-11 재리뷰 5건 수정 착수
+
+- 최신 사용자 요청: 코드 수정, 재검증, 재빌드까지. 앱 재실행은 요청되지 않았으므로 실행 앱은 유지한다.
+- 작업 worktree/branch: deppy-sijo-agent-wait-audit / investigate/agent-wait-classification, 기준 f46b168.
+- 원인과 재현은 f46b168-review 보고서 및 임시 하네스를 확인했다. storage 익명 취소/이력 정리 회귀를 저장소 테스트로 옮겼다.
+- 설계: 익명 이벤트는 발생 시각 순서로 재계산하고 정리 경계의 양수 잔여만 유지한다. ID 없는 승인은 같은 소유자/도구의 실제 실행 호출이 모두 끝났다는 근거로 해제한다. 부모 훅에서도 알려진 자식의 정확한 transcript 결과를 확인한다. 본문은 제한하며 결과 메타데이터는 별도 파싱한다.
+- DB v42 attention_json의 additive serde 필드를 사용한다. 운영 DB/사용자 훅은 수정하지 않는다. 원래 작업 폴더의 Relay WIP는 범위 밖이다.
+- 다음: 새 회귀 RED 확인 → 구현 → 관련 suite/CLI 코드 리뷰 → gate → 한국어 커밋/일지 → 앱과 proxy 재빌드. 실제 화면 검증/재실행/main 머지는 하지 않는다.
+
+### 5건 수정 checkpoint 1
+
+- RED: storage 익명 경계 2건 실패, 외부 proxy 하네스 3건 실패/대조군 2건 통과를 실제 재실행했다. 로그 `/tmp/deppy-attention-fix5-{storage,proxy}-red.log`.
+- 익명 질문은 baseline + 시각 정렬 이력으로 계산한다. 결과가 먼저 저장돼도 그 결과보다 나중에 발생한 질문은 상쇄하지 않는다. 정리 경계의 양수 잔여만 보존한다. storage agent_attention 21 PASS (`storage-green.log`).
+- 승인 별칭은 입력 fingerprint 대신 도구별 실제 실행 ID 그룹을 근거로 해제한다. 동일 도구의 병렬 호출은 마지막 결과까지 대기를 유지한다. 입력 변경이 연관관계를 깨뜨리지 않는다. 자식 ID를 요청 JSON에 저장해 부모의 후속 훅에서도 해당 자식 transcript의 정확한 결과 ID를 조회한다. 살아 있는 다른 자식은 보존한다. 공식 경로는 `https://code.claude.com/docs/en/sub-agents`의 `{sessionId}/subagents/agent-{id}.jsonl`과 대조했다.
+- hook 메타데이터 파서 추가: 결과/도구 입력 본문은 IgnoredAny로 건너뛰며 최대 8MiB 입력을 스캔, 메타데이터 256KiB, 배열 64개, 문자열 4096바이트 상한. stdout `{}` 및 나머지 stdin drain 유지. transcript는 기존 512KiB tail 안에서 64KiB 행 폐기 대신 결과 ID만 파싱한다.
+- proxy agent_attention 19 PASS (`/tmp/deppy-attention-fix5-proxy-green.log`), 이 단계 unused variable 경고 1건을 바로 수정했다. 신규 파서 API 부재 RED는 `metadata-red.log`에 기록했다. 전체 suite/gate/재빌드는 아직 안 했다.
+- 변경 코드: storage agent_attention, proxy agent_attention/main, 새 hook_payload, serde 직접 의존성 및 lock. 실제 DB 스키마 추가 변경 없음. 앱 PID 25095 유지.
+- 다음: 소스 diff 실제 Codex CLI 리뷰와 자체 경계 검토 → 관련 suite/gate → 커밋/일지 → 앱+proxy 빌드. package는 실행 중 bundle을 덮지 않는 별도 산출물로 준비한다.
+
+### 5건 수정 checkpoint 2 — 후속 경계 검토
+
+- 결과가 먼저 저장된 과거 PermissionRequest가 다시 열리는 경계를 추가했다. 새 회귀 RED 후 실제 실행 그룹의 완료 근거를 보존해 PASS했다 (`/tmp/deppy-attention-fix5-alias-{red,green}.log`). 새 동일 도구 호출이 진행 중이면 과거 배치 결과가 이를 닫지 않는 assertion도 포함한다.
+- 자체 소비자 추적에서 Grok 완료 로그 조회에 필요한 cwd가 새 메타데이터 whitelist에서 빠진 것을 발견했다. 회귀 RED (`cwd-red.log`)를 확인하고 cwd 보존을 추가했다. 이때의 전체 관련 suite는 507 PASS/1 ignored이며 cwd 수정 후 proxy 재검증이 필요하다. 후속 proxy 전체 76 PASS/1 ignored로 최종 합계 508 PASS/1 ignored를 확인했다 (`proxy-final.log`).
+- Codex CLI 소스 리뷰 실행 중 (`/tmp/deppy-attention-fix5-codex-review.log`, exec session 92034). 초기 리뷰 snapshot 이후 위 경계 수정도 diff에 포함되어 있으며 최종 지적과 대조해야 한다.
+- 빌드 서명은 실행 중 앱의 Developer ID Application: VectorNine INC (ZDTU5LS35K)를 동일하게 사용한다. shared target의 실행 중 bundle은 덮지 않고 새 bundle 경로를 만든다. 재실행은 하지 않는다.
+
+### 5건 수정 checkpoint 3 — 독립 리뷰 2건 반영
+
+- Codex CLI 리뷰 exit 0, P2 2건: 취소된 턴의 늦은 Working이 공통 등록 블록을 우회하여 부활; 자동 승인된 다른 입력의 동일 도구가 승인 별칭을 붙잡음. `/tmp/deppy-attention-fix5-codex-review.log`. 독립 임시 재현 `/private/tmp/deppy-attention-review.vwrD16`.
+- 두 재현을 저장소 회귀로 옮겨 RED 2건을 확인하고 수정했다 (`review-red.log`). proxy agent_attention 22 PASS (`review-green.log`).
+- 종료 경계를 Working에도 먼저 적용하고 실행 ID/그룹 등록 경로를 한 곳으로 합쳤다. 입력은 bounded 구조 해시로 추출한다(최대 깊이 32, 객체 필드 64개; 본문 저장 없음). 동일 입력 후보는 마지막 실제 결과까지 유지하고 다른 입력의 자동 실행은 승인과 분리한다. 입력을 바꾸는 다른 훅 때문에 해시가 맞지 않는 경우에만 동일 도구의 남은 실행으로 보완한다. 이 모호한 경우는 호출 ID가 없는 provider 계약의 제한이다.
+- 해시의 객체 키 순서/직접 Value 경로/stream 파싱 경로 일치 테스트 추가. 결과 본문은 계속 IgnoredAny로 건너뛴다. 큰 입력 문자열은 serde의 제한된 전체 입력 창(8MiB) 안에서 해시되며 저장 상태에는 16자리 해시만 남긴다.
+- 연결된 승인이 해제됐는데 notification만 다른 자동 실행 때문에 남는 경계도 RED (`notification-red.log`) 후 수정했다. 다른 구체적 승인은 보존하고 해당 알림만 닫는다.
+- 첫 gate는 fmt/clippy/boundary/i18n/diff 모두 exit 0 (`gates.log`). 그 뒤 독립 리뷰 반영으로 소스가 바뀌었으므로 최종 gate를 다시 실행해야 한다.
+- 최신 관련 전체 suite 실행 중: `/tmp/deppy-attention-fix5-final-related.log`, exec session 97757. 아직 이 실행의 PASS를 주장하지 않는다. 다음은 최신 gate → release 앱+proxy 빌드 → 임시 DB에서 실제 hooks stdin smoke → 동일 Developer ID로 별도 bundle 서명 → 커밋/일지. 재실행/main 머지 안 함.
+
+### 최종 검증 checkpoint
+
+- 최신 관련 suite 완료: storage 364 + session 68 + proxy 80 = **512 PASS, 1 ignored** (`final-related.log`). 독립 리뷰 2건과 notification 후속 회귀를 포함한다.
+- 최종 strict clippy가 새 종료 경계의 중첩 if를 `collapsible_if`로 지적했다 (`final-gates.log`, exit 101). 조건을 동일한 단일 if로 정리했으며 동작 변경은 없다. 이 이후 gate를 다시 실행한다.
+- 최초 리뷰 지적 5건과 구현 후 독립 리뷰 2건의 반영 내용을 `docs/investigations/2026-09-11-agent-attention-f46b168-review.md`에 추가했다. 앱 PID 25095와 실행 binary hash를 빌드 전에 확인했다.
+
+### 최종 gate 통과 / 재빌드 진행
+
+- 최신 gate 5개 모두 exit 0: fmt check, strict workspace/all-target clippy, boundary, i18n, diff check. `/tmp/deppy-attention-fix5-final-gates-clean.log`. i18n 키 호출 1160건/locale 5개. 앞선 중첩 if 지적은 동작 변화 없이 정리했다.
+- 관련 테스트 최종 512 PASS/1 ignored 이후 의미 변경 없음. 전체 workspace 테스트 PASS나 실제 GUI 확인을 뜻하지 않는다.
+- release 재빌드 실행: `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo build --locked --release -p deppy-sijo -p mcp-proxy`, `/tmp/deppy-attention-fix5-release-build.log`.
+- 코드 파일 SHA256은 `/tmp/deppy-attention-fix5-source-hashes.json`에 기록했다. 빌드 후 실제 proxy stdin 검증 스크립트 `/tmp/deppy-attention-fix5-smoke.py`를 임시 DB로 실행한다. 이후 동일 Developer ID로 별도 bundle을 서명한다. 실행 앱 PID 25095는 유지한다.
+
+## 2026-09-11 재리뷰 5건 수정·검증·재빌드 완료
+
+- 사용자 요청 완료: 기존 리뷰 5건, 구현 중 독립 Codex CLI 리뷰 P2 2건 및 연결된 notification 경계를 반영했다. 코드 변경은 storage/proxy 요청 추적과 bounded hook 메타데이터 파서에 한정했다. app UI/fleet 렌더 계약은 변경하지 않았다.
+- 최종 관련 테스트 **512 PASS, 1 ignored**: storage 364, session 68, proxy 80. `/tmp/deppy-attention-fix5-final-related.log`. 중첩 if clippy 수정은 조건을 합친 동등 변환이며 이후 release 바이너리 검증도 통과했다.
+- 최종 gate 모두 exit 0: `cargo fmt --all -- --check`, `cargo clippy --locked --workspace --all-targets -- -D warnings`, `cargo run --locked -p xtask -- check-boundary`, `cargo run --locked -p xtask -- i18n-check`, `git diff --check`. `/tmp/deppy-attention-fix5-final-gates-clean.log`.
+- 앱 + proxy release 빌드 exit 0, **2분 36초**. 공통 환경은 `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target`, 명령은 `cargo build --locked --release -p deppy-sijo -p mcp-proxy`. `/tmp/deppy-attention-fix5-release-build.log`.
+- 빌드된 proxy의 실제 `hooks --db <임시 DB> --event observe` stdin 경로 **7개 시나리오 PASS**: 큰 결과, 동일 입력 병렬 승인, 자동 실행/승인 notification 분리, 취소 후 익명 질문, 부모→자식 결과 보완/살아 있는 자식 보존, 9MiB stdin drain/상태 보존, DB에 결과 본문 미저장. `/tmp/deppy-attention-fix5-binary-smoke.log`, 재현 스크립트 `/tmp/deppy-attention-fix5-smoke.py`. 위 512 unit/integration suite 개수에 합산하지 않는다.
+- 새 앱 번들: `/private/tmp/deppy-agent-attention-build-h7vj5ob8/Deppy Sijo.app`. 같은 Developer ID Application: VectorNine INC (ZDTU5LS35K)로 앱/동봉 proxy 서명, hardened runtime 및 timestamp 적용. codesign strict verify와 plist lint 모두 exit 0 (`/tmp/deppy-attention-fix5-package.log`). 로컬 실행 준비이며 공증/배포를 했다는 뜻은 아니다.
+- 실행 앱은 여전히 **PID 25095**, 기존 `/private/tmp/deppy-ready-prs-integration-target/bundle/Deppy Sijo.app`이다. 실행 파일 SHA256이 빌드 전과 같음을 확인했다. 새 앱을 실행하지 않았다. 사용자 DB/훅 설정 갱신, main 머지, push는 하지 않았다.
+- 실제 GUI/Claude·Codex·Grok 대화 화면은 미검증이다. 큰 본문은 합성 데이터로 확인했다. ID 없는 승인에서 타 훅의 입력 변경으로 해시가 불일치하면 동일 도구 실행 ID 후보가 끝날 때까지 보수적으로 보존한다. 한도를 넘는 임의 크기 로그/모든 버전의 무제한 지원은 아니다.
+- 수정 파일: `crates/storage/src/agent_attention.rs`, `crates/mcp-proxy/src/{agent_attention,hook_payload,main}.rs`, `crates/mcp-proxy/Cargo.toml`, `Cargo.lock`, 본 인계 문서 및 `docs/investigations/2026-09-11-agent-attention-f46b168-review.md`. serde 직접 의존성만 추가했고 라이브러리 버전 변경은 없다.
+- 실패 접근: 도구 이름만으로 그룹을 묶으면 다른 입력의 자동 실행까지 승인을 붙잡았다. bounded 입력 해시와 실제 호출 ID를 함께 사용하도록 교체했다. 익명 단순 signed balance 이월과 큰 hook 전체 폐기는 폐기했다. RED 로그 및 clippy 실패/수정 이력은 위 checkpoint에 보존했다.
+- 다음 명령:
+  `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`
+  `git status --short`
+  `git log -1 --oneline`
+  `cat /tmp/deppy-attention-fix5-bundle-path`
+  `cat /tmp/deppy-attention-fix5-binary-smoke.log`
+  `ps -o pid,etime,command -p 25095`
+  다음 작업은 사용자 재실행 또는 main 통합 요청 대기다. 요청 전 현재 앱을 종료하거나 원래 프로젝트 폴더의 Relay WIP에 손대지 않는다.

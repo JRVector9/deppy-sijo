@@ -25,6 +25,9 @@ pub struct AgentAttentionEvent {
     pub request_id: String,
     pub kind: AttentionEventKind,
     pub at_micros: i64,
+    pub tool_group: Option<String>,
+    pub tool_input_hash: Option<String>,
+    pub child_id: Option<String>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -42,6 +45,8 @@ struct AttentionState {
     #[serde(default)]
     active_tools: Vec<(String, Option<String>)>,
     #[serde(default)]
+    tool_groups: Vec<(String, String, Option<String>)>,
+    #[serde(default)]
     request_floor: i64,
     #[serde(default)]
     terminated_turns: Vec<TurnTermination>,
@@ -53,7 +58,7 @@ struct AttentionState {
 
 impl AttentionState {
     fn prune_anonymous_history(&mut self) {
-        // 개수는 유지하고 중복 판별 이력만 세션 전체 예산 안에서 오래된 순서로 줄인다.
+        // 정리한 경계까지의 양수 잔여만 이월한다. 짝이 없는 과거 결과는 이월하지 않는다.
         while self
             .requests
             .iter()
@@ -78,9 +83,9 @@ impl AttentionState {
                 .min_by_key(|(_, _, at)| *at);
             let Some((r, i, at)) = oldest else { break };
             if let Some(counts) = self.requests[r].anonymous.as_mut() {
-                counts.seen.remove(i);
-                counts.floor = counts.floor.max(at);
+                counts.fold_oldest(i, at);
             }
+            self.requests[r].refresh_anonymous();
         }
     }
 }
@@ -108,6 +113,47 @@ struct AnonymousRequests {
     balance: i16,
     seen: Vec<(i64, u8)>,
     floor: i64,
+    #[serde(default)]
+    baseline: Option<u8>,
+}
+
+impl AnonymousRequests {
+    fn baseline(&mut self) -> u8 {
+        *self.baseline.get_or_insert_with(|| {
+            // 이전 버전의 창 밖 양수 잔여는 보존하고 음수 부채는 버린다.
+            let delta: i16 = self
+                .seen
+                .iter()
+                .map(|(_, k)| if *k == 0 { -1 } else { 1 })
+                .sum();
+            (self.balance - delta).clamp(0, REQUESTS_MAX as i16) as u8
+        })
+    }
+
+    fn recount(&mut self) {
+        let mut pending = self.baseline() as i16;
+        self.seen.sort_unstable();
+        for (_, kind) in &self.seen {
+            pending = if *kind == 0 {
+                (pending - 1).max(0)
+            } else {
+                pending + 1
+            };
+        }
+        self.balance = pending;
+    }
+
+    fn fold_oldest(&mut self, index: usize, at: i64) {
+        let baseline = self.baseline();
+        let (_, kind) = self.seen.remove(index);
+        self.baseline = Some(if kind == 0 {
+            baseline.saturating_sub(1)
+        } else {
+            baseline.saturating_add(1)
+        });
+        self.floor = self.floor.max(at);
+        self.recount();
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -122,9 +168,23 @@ struct RequestState {
     pending_count: u8,
     #[serde(default)]
     anonymous: Option<AnonymousRequests>,
+    #[serde(default)]
+    tool_group: Option<String>,
+    #[serde(default)]
+    tool_input_hash: Option<String>,
+    #[serde(default)]
+    child_id: Option<String>,
 }
 
 impl RequestState {
+    fn refresh_anonymous(&mut self) {
+        if let Some(counts) = &mut self.anonymous {
+            counts.recount();
+            self.kind = u8::from(counts.balance > 0);
+            self.pending_count = counts.balance.max(0) as u8;
+        }
+    }
+
     fn observe_anonymous(&mut self, kind: u8, at: i64) -> anyhow::Result<()> {
         let counts = self.anonymous.get_or_insert_with(|| AnonymousRequests {
             balance: if self.kind == 0 {
@@ -132,31 +192,28 @@ impl RequestState {
             } else {
                 self.pending_count as i16
             },
-            seen: vec![(self.at, self.kind)],
-            floor: 0,
+            seen: Vec::new(),
+            floor: self.at,
+            baseline: Some(if self.kind == 0 {
+                0
+            } else {
+                self.pending_count
+            }),
         });
         if at <= counts.floor || counts.seen.contains(&(at, kind)) {
             return Ok(());
         }
-        let balance = counts.balance + if kind == 0 { -1 } else { 1 };
+        counts.baseline();
+        counts.seen.push((at, kind));
+        counts.recount();
         anyhow::ensure!(
-            balance.unsigned_abs() <= REQUESTS_MAX as u16,
+            counts.balance <= REQUESTS_MAX as i16,
             "agent attention anonymous request limit"
         );
-        if counts.seen.len() >= REQUESTS_MAX * 2 {
-            let oldest = counts
-                .seen
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, e)| e.0)
-                .map(|(i, _)| i)
-                .unwrap();
-            counts.floor = counts.floor.max(counts.seen.remove(oldest).0);
+        if counts.seen.len() > REQUESTS_MAX * 2 {
+            counts.fold_oldest(0, counts.seen[0].0);
         }
-        counts.seen.push((at, kind));
-        counts.balance = balance;
-        self.kind = u8::from(balance > 0);
-        self.pending_count = balance.max(0) as u8;
+        self.refresh_anonymous();
         self.at = self.at.max(at);
         Ok(())
     }
@@ -181,6 +238,18 @@ impl Db {
             valid_id(&event.native_session_id)
                 && event.turn_id.as_deref().is_none_or(valid_id)
                 && (event.request_id.is_empty() || valid_id(&event.request_id))
+                && event.tool_group.as_deref().is_none_or(valid_id)
+                && event
+                    .tool_input_hash
+                    .as_deref()
+                    .is_none_or(|s| s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+                && event.child_id.as_deref().is_none_or(|id| {
+                    id.len() <= 128
+                        && !id.is_empty()
+                        && id
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                })
                 && event.at_micros > 0,
             "agent attention input invalid"
         );
@@ -239,24 +308,46 @@ impl Db {
                 || event.turn_id == state.current_turn);
         let latest = current && event.at_micros >= state.last_activity;
         let mut new_completion = false;
+        if matches!(
+            event.kind,
+            K::Working | K::ResponseRequired | K::ApprovalRequired | K::Resolved
+        ) && (event.at_micros <= state.termination_floor
+            || state.terminated_turns.iter().any(|end| {
+                end.owner.as_deref() == owner
+                    && (end.turn.is_none() || end.turn == event.turn_id)
+                    && (event.at_micros <= end.at
+                        || (end.turn.is_some()
+                            && (end.turn != state.current_turn || state.turn_cancelled)))
+            }))
+        {
+            return Ok(());
+        }
         match event.kind {
             K::ResponseRequired | K::ApprovalRequired | K::Resolved => {
-                if event.at_micros <= state.termination_floor
-                    || state.terminated_turns.iter().any(|end| {
-                        end.owner.as_deref() == owner
-                            && (end.turn.is_none() || end.turn == event.turn_id)
-                            && (event.at_micros <= end.at
-                                || (end.turn.is_some()
-                                    && (end.turn != state.current_turn || state.turn_cancelled)))
-                    })
-                {
-                    return Ok(());
-                }
                 let kind = match event.kind {
                     K::ResponseRequired => 1,
                     K::ApprovalRequired => 2,
                     _ => 0,
                 };
+                if kind == 2
+                    && let Some(group) = &event.tool_group
+                    && !state.tool_groups.iter().any(|(_, active, input)| {
+                        active == group
+                            && (event.tool_input_hash.is_none() || input == &event.tool_input_hash)
+                    })
+                    && state.requests.iter().any(|r| {
+                        r.kind == 0
+                            && r.tool_group.as_ref() == Some(group)
+                            && r.at >= event.at_micros
+                    })
+                {
+                    // 결과보다 늦게 저장된 과거 승인 훅은 이미 끝난 실행을 다시 열지 않는다.
+                    return Ok(());
+                }
+                let mut finished_approval = kind == 0
+                    && state.requests.iter().any(|r| {
+                        r.id == event.request_id && r.kind == 2 && r.at <= event.at_micros
+                    });
                 let finished_request = kind == 0
                     && state.requests.iter().any(|r| {
                         r.id == event.request_id && r.kind != 0 && r.at <= event.at_micros
@@ -273,6 +364,13 @@ impl Db {
                         request.pending_count = u8::from(kind != 0);
                         request.turn.clone_from(&event.turn_id);
                         request.at = event.at_micros;
+                        if kind != 0 || event.tool_group.is_some() {
+                            request.tool_group.clone_from(&event.tool_group);
+                            request.tool_input_hash.clone_from(&event.tool_input_hash);
+                        }
+                        if kind != 0 || event.child_id.is_some() {
+                            request.child_id.clone_from(&event.child_id);
+                        }
                     }
                 } else {
                     if event.at_micros <= state.request_floor {
@@ -298,11 +396,15 @@ impl Db {
                         at: event.at_micros,
                         kind,
                         pending_count: u8::from(kind != 0),
+                        tool_group: event.tool_group.clone(),
+                        tool_input_hash: event.tool_input_hash.clone(),
+                        child_id: event.child_id.clone(),
                         anonymous: anonymous_request(&event.request_id).then(|| {
                             AnonymousRequests {
-                                balance: if kind == 0 { -1 } else { 1 },
+                                balance: i16::from(kind != 0),
                                 seen: vec![(event.at_micros, kind)],
                                 floor: 0,
+                                baseline: Some(0),
                             }
                         }),
                     });
@@ -313,17 +415,60 @@ impl Db {
                             .active_tools
                             .iter()
                             .any(|(id, _)| id == &event.request_id);
+                    let finished_group = state
+                        .tool_groups
+                        .iter()
+                        .find(|(id, _, _)| id == &event.request_id)
+                        .map(|(_, group, input)| (group.clone(), input.clone()));
                     state.active_tools.retain(|(id, _)| id != &event.request_id);
+                    state
+                        .tool_groups
+                        .retain(|(id, _, _)| id != &event.request_id);
+                    if let Some((group, input)) = &finished_group
+                        && let Some(result) =
+                            state.requests.iter_mut().find(|r| r.id == event.request_id)
+                    {
+                        result.tool_group = Some(group.clone());
+                        result.tool_input_hash = input.clone();
+                    }
+                    // 동일 입력의 병렬 호출은 모두 결과가 있어야 닫는다. 다른 입력의
+                    // 자동 승인 호출은 붙잡지 않으며, 입력이 바뀐 훅은 도구 그룹으로 보완한다.
+                    if let Some((group, input)) = finished_group {
+                        for request in &mut state.requests {
+                            let base = request_owner(&request.id)
+                                .map_or(request.id.as_str(), |o| &request.id[o.len() + 1..]);
+                            let matching_input = request.tool_input_hash.is_some()
+                                && (request.tool_input_hash == input
+                                    || state.tool_groups.iter().any(|(_, g, h)| {
+                                        *g == group && *h == request.tool_input_hash
+                                    }));
+                            let remaining = state.tool_groups.iter().any(|(_, g, h)| {
+                                *g == group && (!matching_input || *h == request.tool_input_hash)
+                            });
+                            if base.starts_with("tool:")
+                                && request.tool_group.as_ref() == Some(&group)
+                                && !remaining
+                                && request.at <= event.at_micros
+                            {
+                                finished_approval |= request.kind == 2;
+                                request.kind = 0;
+                                request.pending_count = 0;
+                                request.at = event.at_micros;
+                            }
+                        }
+                    }
                     let notification = owner.map_or_else(
                         || "notification:permission".to_owned(),
                         |owner| format!("{owner}:notification:permission"),
                     );
-                    // 같은 부모/자식의 도구와 승인이 모두 끝난 뒤 해당 알림만 해제한다.
+                    // 구체적인 승인을 해제했다면 무관한 자동 실행이 알림을 붙잡지 않는다.
+                    // 알림만 있던 경로는 기존처럼 해당 소유자의 모든 실행 결과를 기다린다.
                     if finished
-                        && !state
-                            .active_tools
-                            .iter()
-                            .any(|(id, _)| request_owner(id) == owner)
+                        && (finished_approval
+                            || !state
+                                .active_tools
+                                .iter()
+                                .any(|(id, _)| request_owner(id) == owner))
                         && !state.requests.iter().any(|r| {
                             r.kind == 2 && r.id != notification && request_owner(&r.id) == owner
                         })
@@ -354,20 +499,6 @@ impl Db {
                     state.completed_turn = None;
                     working = true;
                     done = false;
-                }
-                if !event.request_id.is_empty()
-                    && !state
-                        .active_tools
-                        .iter()
-                        .any(|(id, _)| id == &event.request_id)
-                {
-                    anyhow::ensure!(
-                        state.active_tools.len() < REQUESTS_MAX,
-                        "agent attention active tool limit"
-                    );
-                    state
-                        .active_tools
-                        .push((event.request_id.clone(), event.turn_id.clone()));
                 }
             }
             K::Completed if latest && !state.turn_cancelled => {
@@ -453,6 +584,43 @@ impl Db {
             }
             _ => {}
         }
+        if ((event.kind == K::ResponseRequired && event.tool_group.is_some())
+            || (event.kind == K::Working && (latest || owner.is_some())))
+            && !event.request_id.is_empty()
+            && !state
+                .requests
+                .iter()
+                .any(|r| r.id == event.request_id && r.kind == 0 && r.at >= event.at_micros)
+        {
+            if !state
+                .active_tools
+                .iter()
+                .any(|(id, _)| id == &event.request_id)
+            {
+                anyhow::ensure!(
+                    state.active_tools.len() < REQUESTS_MAX,
+                    "agent attention active tool limit"
+                );
+                state
+                    .active_tools
+                    .push((event.request_id.clone(), event.turn_id.clone()));
+            }
+            if let Some(group) = &event.tool_group
+                && !state
+                    .tool_groups
+                    .iter()
+                    .any(|(id, _, _)| id == &event.request_id)
+            {
+                state.tool_groups.push((
+                    event.request_id.clone(),
+                    group.clone(),
+                    event.tool_input_hash.clone(),
+                ));
+            }
+        }
+        state
+            .tool_groups
+            .retain(|(id, _, _)| state.active_tools.iter().any(|(active, _)| active == id));
         if current {
             state.last_activity = state.last_activity.max(event.at_micros);
         }
@@ -501,27 +669,9 @@ impl Db {
         native: &str,
         include_tools: bool,
     ) -> anyhow::Result<Vec<String>> {
-        bounded_session_key_prefix(key)?;
-        anyhow::ensure!(
-            !native.is_empty() && native.len() <= 256,
-            "agent attention native id invalid"
-        );
-        let json: Option<Option<String>>=self.conn.query_row(
-            "SELECT CASE WHEN typeof(attention_json)='text' AND length(CAST(attention_json AS BLOB))<=?2
-                THEN attention_json ELSE NULL END FROM agent_needs_input WHERE session_key=?1",
-            (key,STATE_BYTES_MAX as i64),|r|r.get(0)).optional()?;
-        let Some(json) = json.flatten() else {
+        let Some(state) = self.agent_attention_state(key, native)? else {
             return Ok(Vec::new());
         };
-        let state: AttentionState = serde_json::from_str(&json)
-            .map_err(|_| anyhow::anyhow!("agent attention state invalid"))?;
-        anyhow::ensure!(
-            state.requests.len() <= REQUESTS_MAX && state.active_tools.len() <= REQUESTS_MAX,
-            "agent attention request limit"
-        );
-        if state.native_session_id != native {
-            return Ok(Vec::new());
-        }
         let mut ids: Vec<String> = state
             .requests
             .into_iter()
@@ -538,6 +688,51 @@ impl Db {
         Ok(ids)
     }
 
+    fn agent_attention_state(
+        &self,
+        key: &str,
+        native: &str,
+    ) -> anyhow::Result<Option<AttentionState>> {
+        bounded_session_key_prefix(key)?;
+        anyhow::ensure!(
+            !native.is_empty() && native.len() <= 256,
+            "agent attention native id invalid"
+        );
+        let json: Option<Option<String>>=self.conn.query_row(
+            "SELECT CASE WHEN typeof(attention_json)='text' AND length(CAST(attention_json AS BLOB))<=?2
+                THEN attention_json ELSE NULL END FROM agent_needs_input WHERE session_key=?1",
+            (key,STATE_BYTES_MAX as i64),|r|r.get(0)).optional()?;
+        let Some(json) = json.flatten() else {
+            return Ok(None);
+        };
+        let state: AttentionState = serde_json::from_str(&json)
+            .map_err(|_| anyhow::anyhow!("agent attention state invalid"))?;
+        anyhow::ensure!(
+            state.requests.len() <= REQUESTS_MAX && state.active_tools.len() <= REQUESTS_MAX,
+            "agent attention request limit"
+        );
+        if state.native_session_id != native {
+            return Ok(None);
+        }
+        Ok(Some(state))
+    }
+
+    /// 부모 훅에서 결과를 확인할 미응답 자식만 반환한다. 경로와 대화 본문은 저장하지 않는다.
+    pub fn pending_agent_children(&self, key: &str, native: &str) -> anyhow::Result<Vec<String>> {
+        let Some(state) = self.agent_attention_state(key, native)? else {
+            return Ok(Vec::new());
+        };
+        let mut children = Vec::new();
+        for r in state.requests.iter().filter(|r| r.kind != 0) {
+            if let Some(id) = &r.child_id
+                && !children.contains(id)
+            {
+                children.push(id.clone());
+            }
+        }
+        Ok(children)
+    }
+
     #[cfg(test)]
     fn list_response_sessions(&self) -> anyhow::Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
@@ -551,6 +746,54 @@ impl Db {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fix5_취소_후_늦은_익명_결과가_다음_질문을_삼키지_않는다() {
+        let db = Db::open_in_memory().unwrap();
+        for (kind, at) in [
+            (AttentionEventKind::ResponseRequired, 1),
+            (AttentionEventKind::Cancelled, 2),
+            (AttentionEventKind::Resolved, 3),
+            (AttentionEventKind::TurnStart, 4),
+            (AttentionEventKind::ResponseRequired, 5),
+        ] {
+            let mut e = event(kind, "elicitation:s", at);
+            e.turn_id = None;
+            db.record_agent_attention(KEY, &e).unwrap();
+        }
+        assert_eq!(db.list_waiting_sessions().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn fix5_정리된_익명_결과는_새_질문을_상쇄하지_않는다() {
+        let db = Db::open_in_memory().unwrap();
+        db.record_agent_attention(
+            KEY,
+            &event(AttentionEventKind::Resolved, "elicitation:a", 2),
+        )
+        .unwrap();
+        for i in 0..128 {
+            let id = format!("elicitation:{}", i / 64);
+            db.record_agent_attention(
+                KEY,
+                &event(AttentionEventKind::ResponseRequired, &id, 10 + i * 2),
+            )
+            .unwrap();
+            db.record_agent_attention(KEY, &event(AttentionEventKind::Resolved, &id, 11 + i * 2))
+                .unwrap();
+        }
+        db.record_agent_attention(
+            KEY,
+            &event(AttentionEventKind::ResponseRequired, "elicitation:a", 1),
+        )
+        .unwrap();
+        db.record_agent_attention(
+            KEY,
+            &event(AttentionEventKind::ResponseRequired, "elicitation:a", 1000),
+        )
+        .unwrap();
+        assert_eq!(db.list_waiting_sessions().unwrap().len(), 1);
+    }
+
     #[test]
     fn fix7_자식의_도구와_승인_알림은_부모_상태를_바꾸지_않고_해제한다() {
         let db = Db::open_in_memory().unwrap();
@@ -835,6 +1078,9 @@ mod tests {
             turn_id: Some("turn-1".into()),
             kind,
             at_micros: at,
+            tool_group: None,
+            tool_input_hash: None,
+            child_id: None,
         }
     }
 

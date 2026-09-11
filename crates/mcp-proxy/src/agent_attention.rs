@@ -7,12 +7,18 @@ use std::hash::{Hash, Hasher};
 fn tool_fingerprint(v: &Value, tool: &str) -> String {
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     tool.hash(&mut hash);
-    v.get("tool_input")
-        .or_else(|| v.get("toolInput"))
-        .unwrap_or(&Value::Null)
-        .to_string()
-        .hash(&mut hash);
+    tool_input_hash(v).hash(&mut hash);
     format!("tool:{:016x}", hash.finish())
+}
+
+fn tool_input_hash(v: &Value) -> Option<String> {
+    if v.get("tool_input_hash").is_some() {
+        field(v, &["tool_input_hash"]).map(str::to_owned)
+    } else {
+        v.get("tool_input")
+            .or_else(|| v.get("toolInput"))
+            .and_then(crate::hook_payload::input_hash)
+    }
 }
 
 fn field<'a>(v: &'a Value, names: &[&str]) -> Option<&'a str> {
@@ -106,13 +112,21 @@ pub fn normalize(v: &Value, at_micros: i64) -> Option<AgentAttentionEvent> {
         kind
     };
     let request = scoped_request_id(v, &request);
-    let turn_id = field(v, &["turn_id", "turnId", "promptId"]).map(str::to_owned);
+    let turn_id = field(v, &["turn_id", "turnId", "promptId", "prompt_id"]).map(str::to_owned);
+    let tool_group = (!tool.is_empty()).then(|| {
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        tool.hash(&mut hash);
+        scoped_request_id(v, &format!("group:{:016x}", hash.finish()))
+    });
     Some(AgentAttentionEvent {
         native_session_id: native.into(),
         turn_id,
         request_id: request,
         kind,
         at_micros,
+        tool_group,
+        tool_input_hash: tool_input_hash(v),
+        child_id: field(v, &["agent_id"]).map(str::to_owned),
     })
 }
 
@@ -126,28 +140,13 @@ fn scoped_request_id(v: &Value, id: &str) -> String {
     }
 }
 
-/// PermissionRequest는 도구 ID를 생략하기도 한다. 결과의 도구 이름 별칭도 함께 닫는다.
-/// 다른 질문 ID나 도구 이름은 건드리지 않는다.
-pub fn resolved_alias(v: &Value, at_micros: i64) -> Option<AgentAttentionEvent> {
-    let mut event = normalize(v, at_micros)?;
-    if event.kind != K::Resolved {
-        return None;
-    }
-    event.request_id = scoped_request_id(
-        v,
-        &tool_fingerprint(v, field(v, &["tool_name", "toolName"])?),
-    );
-    Some(event)
-}
-
 /// 실행 전 거절·실행 중 취소는 결과 훅 대신 tool_result에 남는다.
 fn claude_finished_requests(text: &str, pending: &[String], context: &Value) -> Vec<String> {
     let rows: Vec<Value> = text
         .lines()
         .rev()
         .take(512)
-        .filter(|line| line.len() <= 64 * 1024)
-        .filter_map(|line| serde_json::from_str(line).ok())
+        .filter_map(crate::hook_payload::transcript_row)
         .collect();
     let mut result_ids = Vec::new();
     for row in &rows {
@@ -195,12 +194,6 @@ pub fn reconcile_claude_results(db: &storage::Db, key: &str, v: &Value, at: i64)
                 if pending.contains(&id) && !done.contains(&id) {
                     done.push(id);
                 }
-                if let Some(tool) = field(call, &["tool_name"]) {
-                    let alias = scoped_request_id(v, &tool_fingerprint(call, tool));
-                    if pending.contains(&alias) && !done.contains(&alias) {
-                        done.push(alias);
-                    }
-                }
             }
         }
     }
@@ -219,6 +212,35 @@ pub fn reconcile_claude_results(db: &storage::Db, key: &str, v: &Value, at: i64)
             }
         }
     }
+    if field(v, &["agent_id"]).is_none()
+        && let Some(path) = path
+        && path.file_stem().and_then(|s| s.to_str()) == Some(native)
+        && path.extension().and_then(|s| s.to_str()) == Some("jsonl")
+        && let Ok(children) = db.pending_agent_children(key, native)
+    {
+        for child in children {
+            if child.is_empty()
+                || child.len() > 128
+                || !child
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            {
+                continue;
+            }
+            let child_path = path
+                .with_extension("")
+                .join("subagents")
+                .join(format!("agent-{child}.jsonl"));
+            if let Some(text) = bounded_tail(&child_path) {
+                let context = serde_json::json!({"agent_id":child});
+                for id in claude_finished_requests(&text, &pending, &context) {
+                    if !done.contains(&id) {
+                        done.push(id);
+                    }
+                }
+            }
+        }
+    }
     for id in done {
         let _ = db.record_agent_attention(
             key,
@@ -228,6 +250,9 @@ pub fn reconcile_claude_results(db: &storage::Db, key: &str, v: &Value, at: i64)
                 request_id: id,
                 kind: K::Resolved,
                 at_micros: at,
+                tool_group: None,
+                tool_input_hash: None,
+                child_id: None,
             },
         );
     }
@@ -316,6 +341,9 @@ pub fn reconcile_codex_results(db: &storage::Db, key: &str, v: &Value, at: i64) 
                 request_id: id,
                 kind: K::Resolved,
                 at_micros: at,
+                tool_group: None,
+                tool_input_hash: None,
+                child_id: None,
             },
         );
     }
@@ -390,6 +418,317 @@ mod tests {
     use serde_json::json;
     use storage::AttentionEventKind as K;
 
+    const KEY: &str = "00000000-0000-0000-0000-000000000001:1";
+    fn db() -> storage::Db {
+        let dir = std::env::temp_dir().join(format!("deppy-review-db-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        storage::Db::open(&dir.join("metadata.sqlite3")).unwrap()
+    }
+    fn hook(db: &storage::Db, v: Value, at: i64) {
+        let v = crate::hook_payload::read(v.to_string().as_bytes()).unwrap();
+        if let Some(e) = super::normalize(&v, at) {
+            db.record_agent_attention(KEY, &e).unwrap();
+        }
+        super::reconcile_claude_results(db, KEY, &v, at);
+    }
+
+    #[test]
+    fn fix5_응답한_승인의_알림도_다른_자동_호출과_분리한다() {
+        let d = db();
+        for (v, t) in [
+            (
+                json!({"session_id":"native","hook_event_name":"PreToolUse","tool_use_id":"slow","tool_name":"Bash","tool_input":{"command":"sleep 100"}}),
+                1,
+            ),
+            (
+                json!({"session_id":"native","hook_event_name":"PreToolUse","tool_use_id":"q","tool_name":"Bash","tool_input":{"command":"rm x"}}),
+                2,
+            ),
+            (
+                json!({"session_id":"native","hook_event_name":"PermissionRequest","tool_name":"Bash","tool_input":{"command":"rm x"}}),
+                3,
+            ),
+            (
+                json!({"session_id":"native","hook_event_name":"Notification","notification_type":"permission_prompt"}),
+                4,
+            ),
+            (
+                json!({"session_id":"native","hook_event_name":"PostToolUse","tool_use_id":"q","tool_name":"Bash","tool_input":{"command":"rm x"}}),
+                5,
+            ),
+        ] {
+            hook(&d, v, t);
+        }
+        assert!(d.list_waiting_sessions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn fix5_자동_승인된_다른_호출은_응답한_승인을_붙잡지_않는다() {
+        let d = db();
+        for (v, t) in [
+            (
+                json!({"session_id":"native","hook_event_name":"PreToolUse","tool_use_id":"slow","tool_name":"Bash","tool_input":{"command":"sleep 100"}}),
+                1,
+            ),
+            (
+                json!({"session_id":"native","hook_event_name":"PreToolUse","tool_use_id":"q","tool_name":"Bash","tool_input":{"command":"rm x"}}),
+                2,
+            ),
+            (
+                json!({"session_id":"native","hook_event_name":"PermissionRequest","tool_name":"Bash","tool_input":{"command":"rm x"}}),
+                3,
+            ),
+            (
+                json!({"session_id":"native","hook_event_name":"PostToolUse","tool_use_id":"q","tool_name":"Bash","tool_input":{"command":"rm x"}}),
+                4,
+            ),
+        ] {
+            hook(&d, v, t);
+        }
+        assert!(d.list_waiting_sessions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn fix5_취소된_턴의_늦은_시작은_새_승인을_붙잡지_않는다() {
+        let d = db();
+        for (v, t) in [
+            (
+                json!({"session_id":"native","hook_event_name":"UserPromptSubmit","prompt_id":"old"}),
+                1,
+            ),
+            (
+                json!({"session_id":"native","hook_event_name":"StopFailure","prompt_id":"old"}),
+                3,
+            ),
+            (
+                json!({"session_id":"native","hook_event_name":"UserPromptSubmit","prompt_id":"new"}),
+                4,
+            ),
+            (
+                json!({"session_id":"native","hook_event_name":"PreToolUse","prompt_id":"old","tool_use_id":"old","tool_name":"Bash"}),
+                2,
+            ),
+            (
+                json!({"session_id":"native","hook_event_name":"PreToolUse","prompt_id":"new","tool_use_id":"q","tool_name":"Bash"}),
+                5,
+            ),
+            (
+                json!({"session_id":"native","hook_event_name":"PermissionRequest","prompt_id":"new","tool_name":"Bash"}),
+                6,
+            ),
+            (
+                json!({"session_id":"native","hook_event_name":"PostToolUse","prompt_id":"new","tool_use_id":"q","tool_name":"Bash"}),
+                7,
+            ),
+        ] {
+            hook(&d, v, t);
+        }
+        assert!(d.list_waiting_sessions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn fix5_결과_뒤_저장된_과거_승인은_다시_열리지_않는다() {
+        let d = db();
+        hook(
+            &d,
+            json!({"session_id":"native","hook_event_name":"PreToolUse","tool_use_id":"q","tool_name":"Bash"}),
+            1,
+        );
+        hook(
+            &d,
+            json!({"session_id":"native","hook_event_name":"PostToolBatch","tool_calls":[{"tool_use_id":"q","tool_name":"Bash"}]}),
+            3,
+        );
+        // 대기 요청이 없는 배치는 조회하지 않으므로 직접 결과도 기록한다.
+        hook(
+            &d,
+            json!({"session_id":"native","hook_event_name":"PostToolUse","tool_use_id":"q","tool_name":"Bash"}),
+            3,
+        );
+        hook(
+            &d,
+            json!({"session_id":"native","hook_event_name":"PermissionRequest","tool_name":"Bash"}),
+            2,
+        );
+        assert!(d.list_waiting_sessions().unwrap().is_empty());
+        hook(
+            &d,
+            json!({"session_id":"native","hook_event_name":"PreToolUse","tool_use_id":"next","tool_name":"Bash"}),
+            4,
+        );
+        hook(
+            &d,
+            json!({"session_id":"native","hook_event_name":"PermissionRequest","tool_name":"Bash"}),
+            5,
+        );
+        // 과거 동일 입력 결과를 다시 읽어도 새 승인은 유지한다.
+        hook(
+            &d,
+            json!({"session_id":"native","hook_event_name":"PostToolBatch","tool_calls":[{"tool_use_id":"q","tool_name":"Bash"}]}),
+            6,
+        );
+        assert_eq!(d.list_waiting_sessions().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn fix5_identical_parallel_permissions_remain_independent() {
+        let d = db();
+        for (i, id) in ["q1", "q2"].iter().enumerate() {
+            hook(
+                &d,
+                json!({"session_id":"native","hook_event_name":"PreToolUse","tool_use_id":id,"tool_name":"Bash","tool_input":{"command":"ls"}}),
+                i as i64 * 2 + 1,
+            );
+            hook(
+                &d,
+                json!({"session_id":"native","hook_event_name":"PermissionRequest","tool_name":"Bash","tool_input":{"command":"ls"}}),
+                i as i64 * 2 + 2,
+            );
+        }
+        hook(
+            &d,
+            json!({"session_id":"native","hook_event_name":"PostToolUse","tool_use_id":"q1","tool_name":"Bash","tool_input":{"command":"ls"}}),
+            5,
+        );
+        assert_eq!(
+            d.list_waiting_sessions().unwrap().len(),
+            1,
+            "q2 has no result"
+        );
+    }
+    #[test]
+    fn fix5_large_question_result_is_reconciled_by_stop() {
+        let d = db();
+        hook(
+            &d,
+            json!({"session_id":"native","hook_event_name":"PreToolUse","tool_use_id":"q","tool_name":"AskUserQuestion","tool_input":{"questions":[]}}),
+            1,
+        );
+        let dir = std::env::temp_dir().join(format!("deppy-f46-large-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("native.jsonl");
+        let result = json!({"message":{"content":[{"type":"tool_result","tool_use_id":"q","content":"x".repeat(300*1024)}]}});
+        std::fs::write(&path, result.to_string() + "\n").unwrap();
+        // 직접 결과 훅이 없는 경우에도 큰 transcript 결과의 ID로 해제한다.
+        hook(
+            &d,
+            json!({"session_id":"native","hook_event_name":"Stop","transcript_path":path}),
+            3,
+        );
+        assert!(
+            d.list_waiting_sessions().unwrap().is_empty(),
+            "answered question still pending: {:?}",
+            d.pending_agent_request_ids(KEY, "native").unwrap()
+        );
+    }
+    #[test]
+    fn fix5_child_transcript_result_must_clear_permission_alias() {
+        let d = db();
+        hook(
+            &d,
+            json!({"session_id":"native","agent_id":"a","hook_event_name":"PreToolUse","tool_use_id":"q","tool_name":"Bash","tool_input":{"command":"ls"}}),
+            1,
+        );
+        hook(
+            &d,
+            json!({"session_id":"native","agent_id":"a","hook_event_name":"PermissionRequest","tool_name":"Bash","tool_input":{"command":"ls"}}),
+            2,
+        );
+        let dir = std::env::temp_dir().join(format!("deppy-f46-cancel-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent-a.jsonl");
+        std::fs::write(&path,json!({"message":{"content":[{"type":"tool_result","tool_use_id":"q","is_error":true}]}}).to_string()+"\n").unwrap();
+        hook(
+            &d,
+            json!({"session_id":"native","agent_id":"a","hook_event_name":"SubagentStop","agent_transcript_path":path}),
+            3,
+        );
+        hook(
+            &d,
+            json!({"session_id":"native","hook_event_name":"Stop"}),
+            4,
+        );
+        assert!(d.list_waiting_sessions().unwrap().is_empty());
+    }
+    #[test]
+    fn fix5_different_permissions_remain_independent_control() {
+        let d = db();
+        for (i, (id, command)) in [("q1", "ls"), ("q2", "pwd")].iter().enumerate() {
+            hook(
+                &d,
+                json!({"session_id":"native","hook_event_name":"PreToolUse","tool_use_id":id,"tool_name":"Bash","tool_input":{"command":command}}),
+                i as i64 * 2 + 1,
+            );
+            hook(
+                &d,
+                json!({"session_id":"native","hook_event_name":"PermissionRequest","tool_name":"Bash","tool_input":{"command":command}}),
+                i as i64 * 2 + 2,
+            );
+        }
+        hook(
+            &d,
+            json!({"session_id":"native","hook_event_name":"PostToolUse","tool_use_id":"q1","tool_name":"Bash","tool_input":{"command":"ls"}}),
+            5,
+        );
+        assert_eq!(d.list_waiting_sessions().unwrap().len(), 1);
+    }
+    #[test]
+    fn fix5_small_question_result_is_reconciled_control() {
+        let d = db();
+        hook(
+            &d,
+            json!({"session_id":"native","hook_event_name":"PreToolUse","tool_use_id":"q","tool_name":"AskUserQuestion","tool_input":{"questions":[]}}),
+            1,
+        );
+        let dir = std::env::temp_dir().join(format!("deppy-f46-small-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("native.jsonl");
+        std::fs::write(&path,json!({"message":{"content":[{"type":"tool_result","tool_use_id":"q","content":"answered"}]}}).to_string()+"\n").unwrap();
+        hook(
+            &d,
+            json!({"session_id":"native","hook_event_name":"Stop","transcript_path":path}),
+            3,
+        );
+        assert!(d.list_waiting_sessions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn fix5_부모의_다음_훅은_중단된_자식만_해제한다() {
+        let d = db();
+        let dir =
+            std::env::temp_dir().join(format!("deppy-child-followup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("native/subagents")).unwrap();
+        for child in ["a", "background"] {
+            hook(
+                &d,
+                json!({"session_id":"native","agent_id":child,"hook_event_name":"PreToolUse","tool_use_id":"q","tool_name":"Bash"}),
+                1,
+            );
+            hook(
+                &d,
+                json!({"session_id":"native","agent_id":child,"hook_event_name":"PermissionRequest","tool_name":"Bash"}),
+                2,
+            );
+        }
+        std::fs::write(dir.join("native/subagents/agent-a.jsonl"), json!({"message":{"content":[{"type":"tool_result","tool_use_id":"q","is_error":true}]}}).to_string()+"\n").unwrap();
+        hook(
+            &d,
+            json!({"session_id":"native","hook_event_name":"UserPromptSubmit","transcript_path":dir.join("native.jsonl")}),
+            3,
+        );
+        let pending = d.pending_agent_request_ids(KEY, "native").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].starts_with(&scoped_request_id(&json!({"agent_id":"background"}), "")));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn fix5_큰_훅_결과는_메타데이터를_유지한다() {
+        let raw = json!({"session_id":"native","hook_event_name":"PostToolUse","tool_use_id":"q","tool_response":"가".repeat(300*1024)}).to_string();
+        let metadata = super::super::hook_payload::read(raw.as_bytes()).unwrap();
+        assert_eq!(normalize(&metadata, 1).unwrap().request_id, "q");
+        assert!(metadata.to_string().len() < 1024);
+    }
     #[test]
     fn fix7_자식_도구의_수동_거절_배치는_승인_알림까지_해제한다() {
         let path = std::env::temp_dir().join(format!(
@@ -442,7 +781,7 @@ mod tests {
         reconcile_claude_results(&db, key, &parent, 4);
         let pending = db.pending_agent_request_ids(key, "native").unwrap();
         assert!(!pending.contains(&"q".to_owned()));
-        assert!(pending.contains(&alias.request_id));
+        assert!(!pending.contains(&alias.request_id));
         assert!(pending.contains(&normalize(&child, 2).unwrap().request_id));
         // 배치 결과는 transcript 없이도 거절된 질문과 승인 별칭을 함께 해제한다.
         let batch = json!({"session_id":"native","hook_event_name":"PostToolBatch","tool_calls":[{"tool_name":"ExitPlanMode","tool_input":{"plan":"draft"},"tool_use_id":"q","tool_response":"User denied"}]});
@@ -583,19 +922,12 @@ mod tests {
     }
 
     #[test]
-    fn agent_attention_같은_도구의_서로_다른_승인은_섞이지_않는다() {
+    fn fix5_동일_도구는_입력이_수정되어도_실행_그룹을_유지한다() {
         let a = json!({"session_id":"s","hook_event_name":"PermissionRequest","tool_name":"Bash","tool_input":{"command":"echo a"}});
-        let b = json!({"session_id":"s","hook_event_name":"PermissionRequest","tool_name":"Bash","tool_input":{"command":"echo b"}});
-        assert_ne!(
-            normalize(&a, 1).unwrap().request_id,
-            normalize(&b, 2).unwrap().request_id
-        );
-        let mut result = a.clone();
-        result["hook_event_name"] = json!("PostToolUse");
-        result["tool_use_id"] = json!("id");
+        let b = json!({"session_id":"s","hook_event_name":"PreToolUse","tool_name":"Bash","tool_use_id":"q","tool_input":{"command":"echo b"}});
         assert_eq!(
-            normalize(&a, 1).unwrap().request_id,
-            resolved_alias(&result, 3).unwrap().request_id
+            normalize(&a, 1).unwrap().tool_group,
+            normalize(&b, 2).unwrap().tool_group
         );
     }
 }

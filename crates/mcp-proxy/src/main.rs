@@ -12,6 +12,7 @@ mod approval_notify;
 mod cli;
 mod forwarder;
 mod hook;
+mod hook_payload;
 mod session;
 
 use std::sync::{Arc, Mutex};
@@ -294,18 +295,10 @@ fn run_hooks(args: &[String]) -> anyhow::Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_micros().min(i64::MAX as u128) as i64)
         .unwrap_or(1);
-    let mut payload = String::new();
-    // 도구 결과가 커도 메모리는 256 KiB로 제한하고 남은 stdin은 버린다.
     let mut input = std::io::stdin().lock();
-    let read = std::io::Read::read_to_string(
-        &mut std::io::Read::take(std::io::Read::by_ref(&mut input), 256 * 1024 + 1),
-        &mut payload,
-    );
+    let parsed = hook_payload::read(&mut input);
+    // 파싱 상한을 넘겨도 writer가 broken pipe로 실패하지 않도록 끝까지 비운다.
     let _ = std::io::copy(&mut input, &mut std::io::sink());
-    if read.is_err() || payload.len() > 256 * 1024 {
-        println!("{{}}");
-        return Ok(());
-    }
     // codex는 hook stdout이 유효 JSON이길 기대 — 무슨 일이 있어도 '{}' 출력.
     println!("{{}}");
     let Some(session_key) = std::env::var("DEPPY_SESSION_ID")
@@ -317,17 +310,12 @@ fn run_hooks(args: &[String]) -> anyhow::Result<()> {
     let (Some(db_path), Some(event)) = (db_path, event) else {
         return Ok(());
     };
-    // payload는 아래 바인딩 기록에도 쓰이므로 한 번만 파싱한다.
-    let parsed = serde_json::from_str::<serde_json::Value>(&payload).ok();
     if let Ok(db) = storage::Db::open(&db_path) {
         // 새 관찰기는 요청별 상태를 갱신하고 기존 이벤트는 구버전 훅을 지원한다.
         if event == "observe" {
             if let Some(v) = parsed.as_ref() {
                 if let Some(mut event) = agent_attention::normalize(v, at_micros) {
                     agent_attention::confirm_grok_completion(v, &mut event);
-                    let _ = db.record_agent_attention(&session_key, &event);
-                }
-                if let Some(event) = agent_attention::resolved_alias(v, at_micros) {
                     let _ = db.record_agent_attention(&session_key, &event);
                 }
                 agent_attention::reconcile_codex_results(&db, &session_key, v, at_micros);

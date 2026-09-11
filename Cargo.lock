@@ -2751,6 +2751,7 @@ dependencies = [
  "mcp-store",
  "rusqlite",
  "secret",
+ "serde",
  "serde_json",
  "storage",
  "tracing",

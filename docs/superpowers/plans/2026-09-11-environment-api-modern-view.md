@@ -25,7 +25,7 @@
 - [x] 새 화면 문구를 locale 5개에 같은 키 집합으로 추가한다. API 이름/환경변수 이름/API 키 값을 구분한다.
 - [ ] 사용자 이전 규칙에 따라 앱 패키징·재실행은 구현이 준비된 뒤 승인받는다. UI 회귀 테스트를 추가하지 않는다. config 저장 동작은 해당 단일 테스트로 확인한다.
 - [x] 커밋 전 fmt, workspace clippy all-targets, check-boundary, i18n, diff 게이트를 한 번 수행한다. 실패를 수정한 경우에만 필요한 검사를 재실행한다.
-- [ ] 실제 코드 diff를 codex CLI로 리뷰하고 지적을 반영한다. 한국어 commit, main 대상 PR, Obsidian 프로젝트 일지와 handoff를 기록한다.
+- [x] 실제 코드 diff를 codex CLI로 리뷰하고 지적을 반영한다. 한국어 commit, main 대상 PR, Obsidian 프로젝트 일지와 handoff를 기록한다.
 
 ## 4. 우클릭 시안만 보완
 

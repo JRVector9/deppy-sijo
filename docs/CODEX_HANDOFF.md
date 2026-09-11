@@ -2743,3 +2743,66 @@
 - 재실행 완료: 기존 PID 99747의 정확한 경로를 재확인한 뒤 SIGTERM으로 종료됨을 확인했다. `open '/private/tmp/deppy-env-main-20260909/target/bundle/Deppy Sijo.app'` 성공. 새 PID 38141이 실제 `/private/tmp/deppy-ready-prs-integration-target/bundle/Deppy Sijo.app/Contents/MacOS/deppy-sijo` 경로에서 실행 중임을 11초 후 확인했다. 이전 빌드 앱 대신 main 수정 포함 빌드가 실행 중이다.
 - merge 후 실행 목록에는 Build and test/Dependency security만 있었다. relay-release/relay-shell-release는 workflow_dispatch 전용임을 확인했고 배포를 실행하지 않았다. 현재 사용자 요청인 main 머지·빌드·재실행 모두 완료했다. 화면과 사용 중 동작 확인은 사용자가 진행하며 자동 화면 검증 PASS로 기록하지 않는다.
 - 수정 파일은 이 handoff뿐이며 문서 commit은 실행 코드가 같아 재빌드를 반복하지 않는다. 다음 에이전트는 `cd /private/tmp/deppy-env-main-20260909`; `git status --short`; `git log -2 --oneline`; `pgrep -x deppy-sijo`; `ps -o pid=,etime=,command= -p <현재PID>`로 현재 main/실행 상태를 확인한다. 새 버그 피드백 없으면 추가 수정·빌드·재실행이 필요하지 않다.
+
+## 2026-09-09 Cursor 사용량 상태바 착수
+
+- 목표: 설치·활성화된 Cursor CLI 계정의 실제 사용량을 Claude/Grok/Codex/Kimi와 같은
+  터미널 하단 provider 영역에 표시한다. Cursor 개인 Pro+ 계정은 주간 창 대신 월간
+  결제 주기 Included 사용률을 제공하므로 `월 N%`로 명시한다.
+- 현재 branch/worktree: `feat/cursor-usage-status`,
+  `/private/tmp/deppy-env-main-20260909`, base main `b698ca7`.
+- 설계: `docs/superpowers/specs/2026-09-09-cursor-usage-status-design.md`.
+  구현 계획: `docs/superpowers/plans/2026-09-09-cursor-usage-status.md`.
+- 보안 경계: 런처가 감지한 공식 `cursor-agent`를 격리 PTY에서 실행해 `/usage` 화면만
+  읽는다. Cursor 토큰·SQLite·설정 파일·비공개 RPC는 읽지 않는다. 100 KiB 출력,
+  25초 timeout, 5분 갱신을 적용한다.
+- 실측 근거: 별도 진단 PTY에서 Pro+, Included 13%, Auto 14%, API 3%, Oct 4 reset,
+  On-Demand Disabled를 확인했다. 진단 프로세스는 정확한 PID로 종료했다.
+- 현재 실행 앱 PID 38141은 main `ccb7afd` package이며 변경하지 않는다. 사용자 규칙에
+  따라 구현·리뷰·PR을 먼저 완료하고 재빌드·재실행은 별도 승인 전 수행하지 않는다.
+- 다음 명령: parser RED 테스트를 추가하고
+  `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo test --locked -p deppy-sijo --bin deppy-sijo cursor_usage::tests -- --test-threads=1`.
+
+- 구현 checkpoint: 새 `cursor_usage.rs`가 런처 감지 실행 파일/PATH만 사용하고
+  `~/.deppy-sijo/usage-probe`에서 `cursor-agent --trust`의 `/usage`를 실행한다. 전체 child
+  예산 25초, 출력 100 KiB, 갱신 5분, 마지막 성공값 15분 상한을 적용했다. 월간 Included,
+  Auto, API, 플랜, reset, On-Demand를 유계 구조체로 읽는다.
+- 상태바 checkpoint: 설치/활성화된 Cursor만 background probe하고, 전체 폭은 locale별
+  `월 N%`, compact는 `N%`, hover는 상세 항목을 표시하도록 연결했다. 감지됐지만 값이
+  없으면 `—`, 런처에서 끄면 칸 자체가 사라진다. 다섯 locale에 같은 키 집합을 추가했다.
+- TDD 검증: `parse_usage`/`CursorUsage`가 없는 compile RED를 확인했다. 최소 구현 첫
+  실행은 plan 추출 조기 반환으로 1 FAIL/3 PASS였고 수정 후 최종 unit 7 PASS, ignored
+  1개다. 실제 설치 Cursor CLI를 앱과 같은 PTY로 실행한 ignored test도 1 PASS,
+  5.53초다. 명령은 구현 계획의 Task 1 Step 4와 같다. 사용자 Deppy 앱 PID 38141은
+  종료·재실행하지 않았다.
+- 수정 파일: `crates/app/src/cursor_usage.rs`, `main.rs`, `app.rs`,
+  `ui/agent_terminal.rs`, locale 5개와 이 handoff. 다음은 소스 diff 자체 검토와
+  `codex review --uncommitted`, 발견 반영 후 커밋 전 gate 1회, commit/push/PR이다.
+
+- 첫 Codex 리뷰에서 세 가지를 찾았다. `cursor_usage.rs`가 rustfmt 전이었고,
+  `Included` 값이 없으면 다음 `Auto`의 비율을 잘못 가져왔으며, 430pt compact 상태에서
+  다섯 provider 뒤의 Sessions/MCP가 잘렸다. 섹션 경계를 만나면 값 탐색을 중단하도록
+  회귀 테스트를 RED로 확인한 뒤 수정했고, compact에서 provider 구분선 양쪽의 4pt
+  여백을 없애 네 경계 합계 32px을 확보했다. 제목이 없는 늦은 TUI 프레임도
+  `Included`와 `used`로 완료 감지하도록 별도 RED/회귀를 추가했다.
+- 최종 검증 PASS: Cursor unit 9 PASS/실측 1 ignored, 실제 Cursor CLI probe 1 PASS
+  5.53초, `cargo fmt --all -- --check`, workspace all-targets clippy `-D warnings`,
+  `xtask check-boundary`, `xtask i18n-check`(literal key 1160건/locale 5개),
+  `git diff --check`. 재실행한 `codex review --uncommitted`는 추가 actionable defect가
+  없다고 보고했고 기존 provider 상태바 테스트와 i18n 테스트도 독립 재확인했다.
+- 현재 수정 파일: `crates/app/src/cursor_usage.rs`, `main.rs`, `app.rs`,
+  `ui/agent_terminal.rs`, locale 5개, 구현 계획과 이 handoff. 다음은 구현 commit/push,
+  Obsidian 프로젝트 일지, main 대상 PR 생성이다. 앱 PID 38141은 기존 main 빌드 그대로며
+  패키징·재실행·화면 PASS는 아직 수행하지 않았다.
+
+- 구현 commit `5a3ba98`을 push하고 main 대상 PR #186을 생성했다:
+  https://github.com/JRVector9/deppy-sijo/pull/186. Obsidian 프로젝트 일지
+  `프로젝트 일지/deppy-sijo/2026-09-09 Cursor 사용량 상태바.md`에도 설계, 보안 경계,
+  리뷰 수정과 검증 결과를 기록했다.
+- 현재 요청의 구현·리뷰·PR 생성은 완료했다. main 머지와 새 package 빌드, 기존 앱 PID
+  38141 종료, 새 앱 실행은 하지 않았다. 다음 단계는 사용자에게 재빌드·재실행 승인을
+  받아 PR branch 화면에서 Cursor `월 N%`/compact `N%`/hover를 직접 확인하는 것이다.
+- PR #186 GitHub Actions 6건은 모두 `steps: []`, `runner_id: 0`으로 실행되지 않았다.
+  Format job annotation에서 최근 결제 실패 또는 spending limit 증액 필요 메시지를 직접
+  확인했다. 따라서 GitHub failure는 코드 테스트 실패가 아니며 CI PASS로 기록하지 않는다.
+  GitGuardian은 SUCCESS, PR은 OPEN/non-draft/MERGEABLE이다.

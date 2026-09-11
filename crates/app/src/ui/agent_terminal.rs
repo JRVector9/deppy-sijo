@@ -304,6 +304,9 @@ impl AgentTerminalUi {
         // 바깥 `Option`은 Grok 설치 감지, 안쪽 `Option`은 숫자 조회 결과다.
         // `Some(None)`이면 조회 중/실패 자리표시자를 유지하고 `None`이면 칸을 숨긴다.
         grok_usage: Option<Option<crate::grok_usage::GrokUsage>>,
+        // Cursor는 주간 창 대신 월간 결제 주기 사용률을 준다. 바깥 `Option`은 설치
+        // 감지, 안쪽 `Option`은 숫자 조회 결과다.
+        cursor_usage: Option<Option<crate::cursor_usage::CursorUsage>>,
         // `disabled_agents`: 런처 카드 스위치로 끈 에이전트 id 목록. usage 값과는
         // 분리된 신호다 — "켜짐인데 값 없음"(Claude·Codex·감지된 Grok은 「—」로 자리를 지킨다)과
         // "꺼짐"(모든 칸이 사라진다)을 값 하나로는 구분할 수 없기 때문이다
@@ -349,6 +352,7 @@ impl AgentTerminalUi {
                         codex_meta: codex_meta.as_ref(),
                         kimi: kimi_usage,
                         grok: grok_usage,
+                        cursor: cursor_usage,
                     },
                     disabled_agents,
                     catalog,
@@ -990,6 +994,22 @@ pub(crate) fn paint_announcement_provider_logo(ui: &mut egui::Ui, rect: egui::Re
                 stroke,
             );
         }
+        "Cursor" => {
+            let color = egui::Color32::from_rgb(0x5e, 0xd6, 0xc3);
+            let stroke = egui::Stroke::new(1.7 * scale, color);
+            let tip = center + egui::vec2(-5.8 * scale, -7.0 * scale);
+            let inner = center + egui::vec2(-3.3 * scale, 6.7 * scale);
+            let notch = center + egui::vec2(0.2 * scale, 2.5 * scale);
+            let outer = center + egui::vec2(6.5 * scale, 2.7 * scale);
+            painter.add(egui::Shape::line(
+                vec![tip, inner, notch, outer, tip],
+                stroke,
+            ));
+            painter.line_segment(
+                [notch, center + egui::vec2(4.8 * scale, 7.0 * scale)],
+                stroke,
+            );
+        }
         "Hugging Face" => {
             let yellow = egui::Color32::from_rgb(0xf4, 0xc4, 0x30);
             let ink = egui::Color32::from_rgb(0x4a, 0x3b, 0x16);
@@ -1375,6 +1395,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                     &[],
                     &[],
                     2,
@@ -1457,6 +1478,7 @@ mod tests {
                         None,
                         kimi,
                         grok,
+                        None,
                         &disabled,
                         &[],
                         0,
@@ -1664,6 +1686,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                     &[],
                     &[],
                     0,
@@ -1716,6 +1739,7 @@ mod tests {
                 let mut terminal = shared.lock().unwrap();
                 let intent = terminal.status_bar_with_managers(
                     ui,
+                    None,
                     None,
                     None,
                     None,
@@ -1803,6 +1827,7 @@ mod tests {
                         None,
                         None,
                         None,
+                        None,
                         &[],
                         &[],
                         approvals,
@@ -1855,6 +1880,7 @@ mod tests {
                 }
                 shared.lock().unwrap().status_bar_with_managers(
                     ui,
+                    None,
                     None,
                     None,
                     None,
@@ -1922,6 +1948,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                     &[],
                     &[],
                     0,
@@ -1983,6 +2010,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                     &[],
                     &[],
                     0,
@@ -2034,6 +2062,7 @@ mod tests {
                     }
                     if let Some(intent) = terminal.status_bar_with_managers(
                         ui,
+                        None,
                         None,
                         None,
                         None,
@@ -2115,6 +2144,7 @@ mod tests {
                 }
                 if let Some(intent) = terminal.status_bar_with_managers(
                     ui,
+                    None,
                     None,
                     None,
                     None,

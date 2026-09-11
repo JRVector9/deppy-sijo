@@ -1,7 +1,53 @@
 //! 환경 및 API의 새 화면. 저장 작업은 기존 UI intent와 App worker가 맡는다.
 
+use super::credentials::{CREDENTIAL_SENSITIVE_ITEM_MAX_BYTES, SensitiveInput};
 use super::credentials::{CredentialsIntent, CredentialsSnapshot, CredentialsUi};
 use super::env_profiles::{EnvAction, EnvProfilesSnapshot, EnvProfilesUi};
+
+/// 선택 원문을 저장하기 전에 어느 필드에 넣을지 명시한다.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnvironmentSelectionKind {
+    ApiName,
+    ApiValue,
+    VariableName,
+    VariableValue,
+}
+
+impl EnvironmentSelectionKind {
+    pub fn accepts(self, text: &str) -> bool {
+        if text.is_empty() || text.contains(['\0', '\r', '\n']) {
+            return false;
+        }
+        match self {
+            Self::ApiName => !text.trim().is_empty() && text.len() <= 4096,
+            Self::VariableName => text.len() <= 256 && deppy_core::credential_env::valid_name(text),
+            Self::ApiValue | Self::VariableValue => {
+                text.len() <= CREDENTIAL_SENSITIVE_ITEM_MAX_BYTES
+            }
+        }
+    }
+}
+
+/// 설정 저장과 별개인 한 번만 소비하는 초안. 값은 Debug/Clone/직렬화에 노출하지 않는다.
+pub struct EnvironmentPrefill {
+    kind: EnvironmentSelectionKind,
+    value: SensitiveInput,
+}
+
+impl EnvironmentPrefill {
+    pub fn from_selection(kind: EnvironmentSelectionKind, text: &str) -> Option<Self> {
+        kind.accepts(text).then(|| Self {
+            kind,
+            value: SensitiveInput::try_new(text.to_owned()).expect("선택 입력 한도 확인됨"),
+        })
+    }
+}
+
+/// 워크스페이스는 이 요청을 소비하는 App이 원본 runtime에서 붙인다.
+pub struct EnvironmentOpenRequest {
+    pub cwd: Option<String>,
+    pub prefill: Option<EnvironmentPrefill>,
+}
 
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -24,17 +70,87 @@ pub struct EnvironmentUi {
     search: String,
     drawer: Option<EntryKind>,
     workspace: Option<String>,
+    pending_prefill: Option<EnvironmentPrefill>,
 }
 
 impl EnvironmentUi {
     /// 화면을 닫거나 이전 화면으로 돌아가면 공개값과 초안도 정리한다.
     pub fn reset(&mut self, env: &mut EnvProfilesUi, credentials: &mut CredentialsUi) {
         self.drawer = None;
+        self.pending_prefill = None;
         self.search.clear();
         env.reset_modern_draft();
         credentials.reset_modern_draft();
         env.invalidate_cache();
         credentials.clear_revealed_secrets();
+    }
+
+    fn cancel_editor(&mut self, env: &mut EnvProfilesUi, credentials: &mut CredentialsUi) {
+        self.pending_prefill = None;
+        self.drawer = None;
+        env.reset_modern_draft();
+        credentials.reset_modern_draft();
+    }
+
+    fn start_editor(&mut self, env: &mut EnvProfilesUi, credentials: &mut CredentialsUi) {
+        self.cancel_editor(env, credentials);
+        self.drawer = Some(if self.tab == Tab::Variables {
+            EntryKind::Variable
+        } else {
+            EntryKind::Api
+        });
+        if self.drawer == Some(EntryKind::Api) {
+            credentials.begin_modern_add();
+        }
+    }
+
+    pub fn queue_prefill(&mut self, workspace_id: String, prefill: EnvironmentPrefill) {
+        self.workspace = Some(workspace_id);
+        self.pending_prefill = Some(prefill);
+    }
+
+    fn prepare_view(
+        &mut self,
+        env: &mut EnvProfilesUi,
+        snapshot: &EnvProfilesSnapshot,
+        credentials: &mut CredentialsUi,
+        credential_snapshot: &CredentialsSnapshot,
+    ) -> Option<egui::Id> {
+        if self.workspace.as_deref() != Some(snapshot.workspace_id()) {
+            self.reset(env, credentials);
+            self.workspace = Some(snapshot.workspace_id().to_owned());
+        }
+        // 숨은 탭도 snapshot 정리를 거쳐 오래된 공개값이나 오류를 남기지 않는다.
+        env.prepare_modern(snapshot);
+        credentials.prepare_modern(credential_snapshot);
+        self.apply_pending_prefill(env, snapshot, credentials, credential_snapshot)
+    }
+
+    /// 두 snapshot이 준비된 다음에만 채워 첫 로딩의 초안 초기화에 지워지지 않는다.
+    fn apply_pending_prefill(
+        &mut self,
+        env: &mut EnvProfilesUi,
+        snapshot: &EnvProfilesSnapshot,
+        credentials: &mut CredentialsUi,
+        credential_snapshot: &CredentialsSnapshot,
+    ) -> Option<egui::Id> {
+        if !snapshot.is_available() || !credential_snapshot.is_available() {
+            return None;
+        }
+        let prefill = self.pending_prefill.take()?;
+        self.search.clear();
+        match prefill.kind {
+            EnvironmentSelectionKind::ApiName | EnvironmentSelectionKind::ApiValue => {
+                self.tab = Tab::Api;
+                self.drawer = Some(EntryKind::Api);
+                Some(credentials.prefill_modern(prefill.kind, prefill.value))
+            }
+            EnvironmentSelectionKind::VariableName | EnvironmentSelectionKind::VariableValue => {
+                self.tab = Tab::Variables;
+                self.drawer = Some(EntryKind::Variable);
+                Some(env.prefill_modern(prefill.kind, prefill.value))
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -49,13 +165,7 @@ impl EnvironmentUi {
         catalog: &i18n::Catalog,
         live_reload: &mut bool,
     ) -> (Option<EnvAction>, Option<CredentialsIntent>) {
-        if self.workspace.as_deref() != Some(snapshot.workspace_id()) {
-            self.reset(env, credentials);
-            self.workspace = Some(snapshot.workspace_id().to_owned());
-        }
-        // 숨은 탭도 snapshot 정리를 거쳐 오래된 공개값이나 오류를 남기지 않는다.
-        env.prepare_modern(snapshot);
-        credentials.prepare_modern(credential_snapshot);
+        let prefill_focus = self.prepare_view(env, snapshot, credentials, credential_snapshot);
         let mut env_intent = None;
         let mut credential_intent = None;
         ui.spacing_mut().item_spacing = egui::vec2(8.0, 10.0);
@@ -73,12 +183,7 @@ impl EnvironmentUi {
                 .button(format!("+ {}", catalog.t("action.add", &[])))
                 .clicked()
             {
-                self.drawer = Some(if self.tab == Tab::Variables {
-                    EntryKind::Variable
-                } else {
-                    EntryKind::Api
-                });
-                credentials.begin_modern_add();
+                self.start_editor(env, credentials);
             }
         });
         ui.separator();
@@ -143,6 +248,9 @@ impl EnvironmentUi {
                 &mut env_intent,
                 &mut credential_intent,
             );
+        }
+        if let Some(id) = prefill_focus {
+            ui.memory_mut(|memory| memory.request_focus(id));
         }
         env.finish_modern(ui, snapshot, catalog, &mut env_intent);
         credentials.finish_modern(ui, credential_snapshot, catalog, &mut credential_intent);
@@ -225,8 +333,7 @@ impl EnvironmentUi {
             }
         });
         if self.drawer.is_none() {
-            env.reset_modern_draft();
-            credentials.reset_modern_draft();
+            self.cancel_editor(env, credentials);
             return;
         }
         ui.horizontal_wrapped(|ui| {
@@ -261,4 +368,115 @@ impl EnvironmentUi {
 pub(super) fn field_label(ui: &mut egui::Ui, catalog: &i18n::Catalog, key: &str) {
     ui.add_space(4.0);
     ui.label(egui::RichText::new(catalog.t(key, &[])).strong());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn environment_context_selection_limits_preserve_values_without_truncating() {
+        use EnvironmentSelectionKind as K;
+        assert!(EnvironmentPrefill::from_selection(K::VariableName, "MY_API_KEY").is_some());
+        assert!(EnvironmentPrefill::from_selection(K::VariableName, "내 API").is_none());
+        assert!(EnvironmentPrefill::from_selection(K::ApiName, "내 API").is_some());
+        for invalid in ["", "abc\nvalue", "abc\0value", "abc\rvalue"] {
+            assert!(EnvironmentPrefill::from_selection(K::ApiValue, invalid).is_none());
+        }
+        let value = "가".repeat(CREDENTIAL_SENSITIVE_ITEM_MAX_BYTES / 3);
+        let prefill = EnvironmentPrefill::from_selection(K::ApiValue, &value).unwrap();
+        assert_eq!(prefill.value.into_inner(), value);
+        assert!(EnvironmentPrefill::from_selection(K::ApiValue, &(value + "가")).is_none());
+        let prefill = EnvironmentPrefill::from_selection(K::VariableValue, " value ").unwrap();
+        assert_eq!(prefill.value.into_inner(), " value ");
+    }
+
+    fn ready(workspace: &str) -> EnvProfilesSnapshot {
+        EnvProfilesSnapshot::try_new(2, workspace, true, Some("profile"), 0, vec![], vec![])
+            .unwrap()
+    }
+
+    #[test]
+    fn environment_context_cancel_or_replace_discards_delayed_prefill() {
+        let mut view = EnvironmentUi::default();
+        let mut env = EnvProfilesUi::new();
+        let mut credentials = CredentialsUi::new();
+        let prefill = || {
+            EnvironmentPrefill::from_selection(
+                EnvironmentSelectionKind::ApiValue,
+                "cancelled-fake-value",
+            )
+            .unwrap()
+        };
+        let loaded = CredentialsSnapshot::try_new(2, vec![]).unwrap();
+        view.queue_prefill("origin".into(), prefill());
+        view.start_editor(&mut env, &mut credentials);
+        assert!(view.pending_prefill.is_none());
+        assert!(
+            view.prepare_view(&mut env, &ready("origin"), &mut credentials, &loaded)
+                .is_none()
+        );
+        view.queue_prefill("origin".into(), prefill());
+        view.cancel_editor(&mut env, &mut credentials);
+        assert!(view.pending_prefill.is_none());
+        assert!(view.drawer.is_none());
+        assert!(
+            view.prepare_view(&mut env, &ready("origin"), &mut credentials, &loaded)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn environment_context_pending_prefill_survives_loading_but_not_navigation() {
+        let mut view = EnvironmentUi::default();
+        let mut env = EnvProfilesUi::new();
+        let mut credentials = CredentialsUi::new();
+        let loading = EnvProfilesSnapshot::loading(1, "origin", true);
+        let credential_loading = CredentialsSnapshot::loading(1);
+        let credential_ready = CredentialsSnapshot::try_new(2, vec![]).unwrap();
+        let prefill = || {
+            EnvironmentPrefill::from_selection(EnvironmentSelectionKind::ApiValue, "fake-value")
+                .unwrap()
+        };
+        view.queue_prefill("origin".into(), prefill());
+        assert!(
+            view.prepare_view(&mut env, &loading, &mut credentials, &credential_loading)
+                .is_none()
+        );
+        assert!(view.pending_prefill.is_some());
+        assert!(
+            view.prepare_view(
+                &mut env,
+                &ready("origin"),
+                &mut credentials,
+                &credential_ready
+            )
+            .is_some()
+        );
+        assert!(view.pending_prefill.is_none());
+        assert!(
+            view.prepare_view(
+                &mut env,
+                &ready("origin"),
+                &mut credentials,
+                &credential_ready
+            )
+            .is_none()
+        );
+        view.queue_prefill("origin".into(), prefill());
+        assert!(
+            view.prepare_view(
+                &mut env,
+                &ready("other"),
+                &mut credentials,
+                &credential_ready
+            )
+            .is_none()
+        );
+        assert!(view.pending_prefill.is_none());
+        assert!(view.drawer.is_none());
+        view.queue_prefill("origin".into(), prefill());
+        view.reset(&mut env, &mut credentials);
+        assert!(view.pending_prefill.is_none());
+    }
 }

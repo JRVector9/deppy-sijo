@@ -3,6 +3,27 @@ use super::*;
 use crate::ui::environment::field_label;
 
 impl CredentialsUi {
+    pub(crate) fn prefill_modern(
+        &mut self,
+        kind: crate::ui::environment::EnvironmentSelectionKind,
+        value: SensitiveInput,
+    ) -> egui::Id {
+        self.reset_modern_draft();
+        self.select_modern_service(None);
+        self.kind = "api_key";
+        match kind {
+            crate::ui::environment::EnvironmentSelectionKind::ApiName => {
+                self.label = value.into_inner();
+                credential_secret_input_id()
+            }
+            crate::ui::environment::EnvironmentSelectionKind::ApiValue => {
+                self.secret_input = value.into_inner();
+                egui::Id::new("modern_api_name")
+            }
+            _ => unreachable!("API 입력 필드만 전달한다"),
+        }
+    }
+
     pub(super) fn select_modern_service(&mut self, service: Option<(&str, &str)>) {
         self.modern_custom_service = service.is_none();
         let (provider, variable) = service.unwrap_or(("", ""));
@@ -221,6 +242,13 @@ impl CredentialsUi {
                     .desired_width(f32::INFINITY),
             );
         }
+        field_label(ui, catalog, "env.modern.api_name_optional");
+        ui.add(
+            egui::TextEdit::singleline(&mut self.label)
+                .id(egui::Id::new("modern_api_name"))
+                .hint_text(catalog.t("env.modern.api_name_hint", &[]))
+                .desired_width(f32::INFINITY),
+        );
         field_label(ui, catalog, "env.modern.variable_name");
         ui.add(
             egui::TextEdit::singleline(&mut self.env_name)
@@ -259,20 +287,13 @@ impl CredentialsUi {
                 .small()
                 .weak(),
         );
-        ui.collapsing(catalog.t("env.modern.api_name_optional", &[]), |ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut self.label)
-                    .hint_text(catalog.t("env.modern.api_name_hint", &[]))
-                    .desired_width(f32::INFINITY),
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(
+                &mut self.kind,
+                "api_key",
+                catalog.t("credentials.api_keys", &[]),
             );
-            ui.horizontal_wrapped(|ui| {
-                ui.selectable_value(
-                    &mut self.kind,
-                    "api_key",
-                    catalog.t("credentials.api_keys", &[]),
-                );
-                ui.selectable_value(&mut self.kind, "token", "Token");
-            });
+            ui.selectable_value(&mut self.kind, "token", "Token");
         });
         truncate_utf8(&mut self.env_name, 256);
         truncate_utf8(&mut self.provider, CREDENTIAL_TEXT_INPUT_MAX_BYTES);

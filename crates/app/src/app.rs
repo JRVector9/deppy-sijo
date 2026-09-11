@@ -10446,6 +10446,17 @@ fn initial_workspace_id(
         .unwrap_or(fallback))
 }
 
+/// 새 진입만 현재 화면을 따르고 설정 내부에서 직접 고른 프로젝트는 유지한다.
+fn settings_environment_entry(
+    was_open: bool,
+    open: bool,
+    visible_workspace: &str,
+    origin_workspace: Option<&str>,
+) -> Option<String> {
+    (open && (!was_open || origin_workspace.is_some()))
+        .then(|| origin_workspace.unwrap_or(visible_workspace).to_owned())
+}
+
 /// 로딩 중인 목록은 빈 목록과 구분해 편집하던 프로젝트를 보존한다.
 fn resolve_settings_env_project_during_refresh(
     projects: Option<&[ui::env_project_list::EnvProjectRow]>,
@@ -24593,16 +24604,6 @@ impl App {
         self.workspace_tree_root(&self.active.id)
     }
 
-    /// T1: focused pane 세션의 현재 작업 폴더 — agent_detect 워커(lsof)가 채운
-    /// `session_cwds`를 재사용한다 (새 감지 메커니즘 없음).
-    fn focused_session_cwd(&self) -> Option<String> {
-        self.active
-            .workspace_ui
-            .focused_session()
-            .and_then(|sid| self.session_cwds.get(&sid))
-            .cloned()
-    }
-
     /// T1: pane 우클릭 → 환경설정 진입 시점에 focused 세션 cwd를 감지해 배너 상태를
     /// 만든다. cwd가 없거나 폴더가 아니면 None. 비교는 canonicalize 기준
     /// (macOS `/var`↔`/private/var`, 심링크 등)으로 하되 실패 시 원경로로 폴백.
@@ -31392,22 +31393,22 @@ impl eframe::App for App {
         if let Some(session) = self.active.workspace_ui.take_respawn_archived_request() {
             let _ = self.dispatch_respawn_archived_agent(session);
         }
-        // pane 우클릭 → 환경변수·API 설정 (E4 ⑥) — 프로젝트 화면에서 바로 진입.
-        if self.active.workspace_ui.take_open_environment() {
+        // 원본 runtime과 요청을 함께 소비해 다른 pane의 설정으로 들어가지 않는다.
+        let mut environment_request = self
+            .active
+            .workspace_ui
+            .take_open_environment()
+            .map(|request| (self.active.id.clone(), request));
+        for (workspace_id, runtime) in &mut self.warm {
+            if let Some(request) = runtime.workspace_ui.take_open_environment()
+                && environment_request.is_none()
+            {
+                environment_request = Some((workspace_id.clone(), request));
+            }
+        }
+        if environment_request.is_some() {
             self.settings_category = ui::settings::Category::Environment;
             self.settings_open = true;
-            // T1: 우클릭 진입 시에만 focused 세션 cwd를 감지 — env 페이지 상단에
-            // "새 프로젝트로 등록"/"이 폴더를 프로젝트 폴더로 지정" 배너를 띄운다.
-            // App-owned workspace projection과 비교하므로 render-time DB refresh가 없다.
-            if self.pending_app_controller_action.is_none()
-                && let Some(cwd) = self.focused_session_cwd()
-                && cwd.len() <= APP_HOST_PATH_MAX_BYTES
-                && !cwd.as_bytes().contains(&0)
-            {
-                self.pending_app_controller_action =
-                    Some(AppControllerAction::DetectEnvSessionBanner { cwd });
-                ui.ctx().request_repaint();
-            }
         }
         // pane 우클릭 → 세션 폴더 동선 (2026-07-18): 파일 트리 이동은 사이드바 트리의
         // set_root(브레드크럼·'..'과 같은 탐색 메커니즘), Finder는 사이드바
@@ -31859,6 +31860,51 @@ impl eframe::App for App {
             }
         }
 
+        // 설정 overlay가 이번 프레임의 터미널 입력을 막아도 마지막 pane 선택은 유지된다.
+        let settings_owner = match self.cross_workspace_pane.focused() {
+            ui::cross_workspace::FocusedSurface::Primary => FrameTerminalOwner::Primary,
+            ui::cross_workspace::FocusedSurface::Attached(id) => FrameTerminalOwner::Attached(id),
+        };
+        let visible_workspace = owner_attached_target(settings_owner, &self.cross_workspace_pane)
+            .map(|target| target.workspace_id.as_str())
+            .unwrap_or(&self.active.id);
+        if let Some(selected) = settings_environment_entry(
+            self.settings_was_open,
+            self.settings_open,
+            visible_workspace,
+            environment_request
+                .as_ref()
+                .map(|(workspace, _)| workspace.as_str()),
+        ) {
+            self.settings_workspace_id = Some(selected.clone());
+            self.reset_environment_view_state();
+            self.invalidate_env_profile_ui();
+            self.env_session_banner = None;
+            if self.config.ui.hidden_env_project_ids.remove(&selected) {
+                self.pending_config_save = true;
+                self.invalidate_env_api_projects();
+            }
+            ui::env_project_list::request_reveal_selected(ui.ctx());
+            if let Some((origin_workspace, request)) = environment_request {
+                if let Some(prefill) = request.prefill {
+                    self.environment_ui.queue_prefill(selected, prefill);
+                    if self.config.ui.environment_classic_view {
+                        self.config.ui.environment_classic_view = false;
+                        self.pending_config_save = true;
+                    }
+                }
+                // 폴더 등록 배너는 기존 활성 프로젝트 전용 동선을 유지한다.
+                if origin_workspace == self.active.id
+                    && self.pending_app_controller_action.is_none()
+                    && let Some(cwd) = request.cwd
+                    && cwd.len() <= APP_HOST_PATH_MAX_BYTES
+                    && !cwd.as_bytes().contains(&0)
+                {
+                    self.pending_app_controller_action =
+                        Some(AppControllerAction::DetectEnvSessionBanner { cwd });
+                }
+            }
+        }
         // A prior infrastructure failure retries only on an explicit closed→open Settings edge;
         // there is no TTL or frame retry. This mutation only invalidates bounded memory state.
         if !self.settings_was_open && self.settings_open && self.env_project_rows_failed {
@@ -32492,6 +32538,14 @@ impl eframe::App for App {
         // T1: 설정 창이 닫히면 세션 폴더 배너를 버린다 — 다음 우클릭 진입에서 재감지.
         if !self.settings_open {
             self.env_session_banner = None;
+            // 닫힌 뒤 프레임이 쉬어도 다음 진입을 새 열기로 인식하고 초안을 즉시 비운다.
+            if self.settings_was_open {
+                self.reset_environment_view_state();
+                self.invalidate_env_profile_ui();
+                self.settings_was_open = false;
+            }
+        } else if is_environment && self.settings_category != ui::settings::Category::Environment {
+            self.reset_environment_view_state();
         }
         if settings_folder_picker_requested && self.pending_app_host_action.is_none() {
             self.pending_app_host_action = Some(AppHostIoAction::FolderPicker(
@@ -32755,6 +32809,7 @@ impl eframe::App for App {
                         self.invalidate_env_api_projects();
                         ui.ctx().request_repaint();
                     }
+                    self.reset_environment_view_state();
                     self.invalidate_env_profile_ui();
                     self.env_project_close_confirm = None;
                 }
@@ -45330,6 +45385,32 @@ mod tests {
         assert!(
             closed.contains_key("closed"),
             "설정 선택은 sidebar 숨김 표식을 해제하지 않는다"
+        );
+    }
+
+    #[test]
+    fn environment_context_reopen_uses_visible_project_and_keeps_manual_selection() {
+        // 닫았다 다시 열 때만 현재 화면으로 돌아가며 로딩 중 수동 선택은 유지한다.
+        assert_eq!(
+            settings_environment_entry(false, true, "visible", None).as_deref(),
+            Some("visible")
+        );
+        assert_eq!(
+            settings_environment_entry(true, true, "visible", None),
+            None
+        );
+        assert_eq!(
+            settings_environment_entry(true, false, "visible", None),
+            None
+        );
+        assert_eq!(
+            settings_environment_entry(false, true, "visible", Some("origin")).as_deref(),
+            Some("origin")
+        );
+        assert_eq!(
+            resolve_settings_env_project_during_refresh(None, Some("editing"), "visible")
+                .as_deref(),
+            Some("editing")
         );
     }
 

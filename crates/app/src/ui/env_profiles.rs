@@ -1374,6 +1374,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn environment_context_variable_prefill_replaces_entire_draft() {
+        use crate::ui::credentials::SensitiveInput;
+        use crate::ui::environment::EnvironmentSelectionKind as K;
+        let mut view = EnvProfilesUi::new();
+        view.var_key = "OLD_KEY".into();
+        view.var_plain_value = "old-value".into();
+        view.prefill_modern(
+            K::VariableName,
+            SensitiveInput::try_new("NEW_KEY".into()).unwrap(),
+        );
+        assert_eq!(view.var_key, "NEW_KEY");
+        assert!(view.var_plain_value.is_empty());
+        view.prefill_modern(
+            K::VariableValue,
+            SensitiveInput::try_new("new-value".into()).unwrap(),
+        );
+        assert!(view.var_key.is_empty());
+        assert_eq!(view.var_plain_value, "new-value");
+        view.reset_modern_draft();
+        assert!(view.var_plain_value.is_empty());
+    }
+
+    #[test]
     fn pr188_environment_draft_reset_discards_widget_history() {
         let mut view = EnvProfilesUi::new();
         let (tracked, ctx, id, shared) = crate::ui::draft_text_edit::recorded_fake_input();

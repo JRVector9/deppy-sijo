@@ -94,6 +94,10 @@ fn tok_nav_active(ui: &egui::Ui) -> egui::Color32 {
     super::settings::settings_nav_active(ui)
 }
 
+pub fn request_reveal_selected(ctx: &egui::Context) {
+    ctx.data_mut(|data| data.insert_temp(egui::Id::new("env_project_reveal_selected"), true));
+}
+
 pub fn render_with_style(
     ui: &mut egui::Ui,
     projects: &[EnvProjectRow],
@@ -143,6 +147,17 @@ pub fn render_with_style(
     // 행/divider/선택 배경 폭은 전부 panel_rect(=패널 배경·헤더와 동일) 기준으로
     // 통일한다. ui.available_width()는 ScrollArea 유무/레이아웃에 따라 달라져
     // 우측 경계선 침범 또는 빈 여백 띠의 원인이 됐다(2026-07-10).
+    let reveal_id = egui::Id::new("env_project_reveal_selected");
+    let reveal_index = projects
+        .iter()
+        .position(|project| project.id == active_id)
+        .filter(|_| {
+            ui.ctx()
+                .data(|data| data.get_temp::<bool>(reveal_id).unwrap_or(false))
+        });
+    if reveal_index.is_some() {
+        ui.ctx().data_mut(|data| data.remove::<bool>(reveal_id));
+    }
     let row_width = list_rect.width();
     let content_height = projects.len() as f32 * style.row_height;
     if content_height <= list_rect.height() {
@@ -160,6 +175,13 @@ pub fn render_with_style(
             .id_salt("env_project_list_scroll")
             .auto_shrink([false, false])
             .show(&mut list_ui, |ui| {
+                if let Some(index) = reveal_index {
+                    let top = ui.cursor().min + egui::vec2(0.0, index as f32 * style.row_height);
+                    ui.scroll_to_rect(
+                        egui::Rect::from_min_size(top, egui::vec2(row_width, style.row_height)),
+                        Some(egui::Align::Center),
+                    );
+                }
                 render_rows(
                     ui,
                     projects,

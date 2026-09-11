@@ -3319,3 +3319,48 @@
 - Codex CLI는 실제 미커밋 UI 소스와 신규 draft_text_edit.rs만 대상으로 후속 리뷰 중(`/tmp/deppy-pr188-fixes-codex-review.log`). 아직 완료 결과를 확정하지 않는다.
 - 후속 Codex CLI 리뷰 exit 0 완료: 변경 소스와 호출 경로에서 새로 도입한 실제 동작 버그를 확인하지 못했다고 보고했다. 문서·HTML·일지는 제외했으며 reviewer는 테스트·빌드·파일 변경을 실행하지 않았다. 위 사용자 리뷰의 세 미해결 지점은 이번 수정으로 반영 완료했고, 실제 화면 확인만 남아 있다.
 - 다음 에이전트: `cd /Users/jr/Desktop/projects/deppy-sijo-env-api-ui`; `git status --short`; `git log -2 --oneline`; `gh pr view 188 --json headRefOid,isDraft,state`; `tail -n 22 docs/CODEX_HANDOFF.md`. PR은 화면 확인 전 draft로 유지한다. 사용자 재빌드·재실행 승인을 받으면 앞 절의 package 명령을 사용하고, 성공 및 서명 확인 전 기존 앱을 종료하지 않는다. 터미널 우클릭 기능은 여전히 HTML 시안만 있다.
+
+## 2026-09-11 환경 API 적용 누락 / 현재 프로젝트 선택 수정 착수
+
+- 최신 요청: 새 환경 API 화면과 터미널 우클릭 추가가 미적용으로 보임. 설정을 열면 현재 보고 있는 워크스페이스가 선택되어야 함.
+- 확인: 실행 PID 30263은 attention 7442a8f이고 #188 d301882가 빠져 있었다. 우클릭은 HTML 시안만 있고 Rust 연결이 없었다. 사용자에게 원인과 통합/수정 방침 설명 완료.
+- 새 브랜치 fix/environment-api-context-integration, 작업 폴더 deppy-sijo-agent-wait-audit. 일반 merge 96cd1ff로 #188과 attention 통합. handoff만 충돌했고 양쪽 기록 보존. main/원래 Relay 작업 폴더 미변경.
+- 설계/명령: docs/superpowers/plans/2026-09-11-environment-context-integration.md. 재빌드/재기동 미실행, GUI 미검증. 현재 새 테스트/수정은 아직 진행 전.
+- 다음: 설정 재진입과 선택 prefill 경계 회귀 → 구현 → 소스 리뷰/지적 수정 → 최종 gate/커밋/일지.
+
+### 환경 통합 checkpoint — 구현/상태 검증 완료, 소스 리뷰 중
+
+- 설정 closed→open 전이에서 현재 pane 워크스페이스를 선택하고 숨김 해제/선택 행 스크롤을 요청한다. 설정 내부 수동 프로젝트 선택은 유지한다. immediate viewport 닫힘 프레임에서 즉시 정리해 다음 프레임 전에 다시 열어도 이전 선택이 남지 않는다.
+- primary/attached 터미널 선택 → API 이름/키 값 또는 env 이름/값 메뉴 연결. 원본 runtime ID와 세션을 함께 소비해 전역 활성 workspace로 잘못 저장하지 않는다. 새 화면 토글을 선택하고 기존 저장 양식만 채우며 확인 전 DB/.env 변경은 없다. 기존 화면 복귀 토글 보존.
+- prefill은 SensitiveInput 한도 32KiB, API 이름 4KiB, 환경 이름 256byte/valid_name. 한도를 넘거나 여러 줄/NUL은 메뉴 비활성화하며 조용히 자르지 않는다. 로딩 후 한 번 소비, 탐색/취소/닫기에서 정리. API 이름은 접지 않고 표시, env 연결과 별도 필드 유지.
+- 신규 상태 테스트 5 PASS (`/tmp/deppy-env-context-final-tests.log`): 재진입/수동 선택, API 이름과 binding 분리·과거 secret 정리, 변수 초안 전체 교체, UTF-8 한도/무손실 값 전달, 로딩/프로젝트 전환/닫힘 수명. 처음 함수/필드 부재 RED는 context-red.log 및 prefill-red.log. 실제 화면 검증은 아님.
+- 실제 Codex CLI 소스 리뷰 진행: `/tmp/deppy-env-context-codex-review.log` (exec 49941). 운영 DB/설정/앱 수정 금지, cargo 중복 실행 금지. 다음: 리뷰 지적 반영, 관련 기존 상태 테스트, 최종 gate, 커밋/일지. 앱 PID 30263 유지, 새 GUI 빌드·재실행/main 머지 미실행.
+
+- 최종 자체 상태 확인: 신규 5 PASS (`/tmp/deppy-env-context-verified.log`) + 기존 pr188 초안/undo/서비스 입력 3 PASS + refresh 선택 1 PASS + 프로젝트 닫기 격리 1 PASS (`/tmp/deppy-env-context-compat.log`) = 관련 10 PASS. 전체 앱/GUI 테스트를 실행했다는 뜻은 아니다. fmt 적용 완료, 최종 gate는 독립 리뷰 후 1회 실행 예정.
+- 제약: viewport에는 soft wrap 메타데이터가 없어 여러 화면 행 선택을 API 값으로 임의 결합하지 않는다. 이번 입력 메뉴는 단일 행만 활성화한다. 기존 renderer/복사/scrollback 계약과 Fleet 회귀는 그대로다.
+
+### 환경 통합 checkpoint — 독립 리뷰 3건 반영
+
+- 실제 Codex CLI 리뷰 exit 0, P2 3건: attached cwd가 active cache를 참조, 메뉴 클릭 프레임에 PTY owner가 None이 되어 팝업 처리 생략, 로딩 중 +추가/취소 후 pending prefill 재등장. `/tmp/deppy-env-context-codex-review.log`. 소스 검토이며 독립 리뷰에서 cargo/GUI는 실행하지 않았다.
+- 모두 반영: 원본 WorkspaceUi에서 cwd를 캡처한다(SessionId는 runtime마다 재사용). 메뉴는 PTY 입력 게이트와 분리하고 로컬의 기존 우클릭 메뉴도 동일하게 처리한다. 명시적 새 초안과 취소는 pending값도 정리한다. 폴더 등록 배너는 기존 활성 프로젝트 전용 조건을 유지해 attached의 경로가 다른 프로젝트 CTA에 쓰이지 않게 한다.
+- 새 경계 회귀 2건은 API 부재 RED 확인 후 신규 environment_context 7 PASS (`/tmp/deppy-env-context-review-{red,green}.log`; cwd 단독 RED는 cwd-red.log). 메뉴 클릭은 소스 경로를 확인했으며 실제 GUI 클릭 PASS로 주장하지 않는다.
+- 다음은 최종 gate/커밋/일지. 앱 PID 30263 유지, main/PR 머지나 새 앱 빌드/재실행은 아직 하지 않았다.
+
+## 2026-09-11 환경 API 통합/선택/우클릭 구현 완료
+
+- 구현 완료: attention 7442a8f와 #188 d301882를 로컬 통합 브랜치에 함께 포함(merge 96cd1ff). 새 환경/API 화면과 기존 화면 복귀 토글 유지. 설정 새 진입은 현재 pane의 프로젝트를 선택/숨김 해제/선택 행 표시한다. 내부 수동 선택은 유지한다.
+- 터미널 우클릭 → 환경·API에 넣기 → API 이름/키 값 또는 환경변수 이름/값. 원본 runtime의 프로젝트를 대상으로 기존 양식에 채우며 저장 클릭 전에는 DB/파일에 반영하지 않는다. API 이름은 바로 보이는 독립 필드이며 env 연결은 선택 사항이다.
+- 리뷰 지적 P2 3건 전부 반영. 최종 관련 테스트 **12 PASS**: 신규 environment_context 7 + pr188 3 + refresh 선택 1 + 프로젝트 닫기 격리 1. 최종 코드로 다시 실행한 로그 `/tmp/deppy-env-context-final-related.log`. 이 테스트들은 화면 밖 상태/입력 계약이며 실제 GUI 검증이 아니다.
+- gate 5개 모두 exit 0: fmt check, strict workspace/all-target clippy, check-boundary, i18n-check(리터럴 1211건, locale 5개), diff check. `/tmp/deppy-env-context-final-gates.log`. i18n 필터로 0건 실행된 타 suite를 PASS 테스트 수에 합산하지 않았다.
+- 수정 파일: app.rs, ui/{environment,workspace,env_project_list,credentials,env_profiles}.rs, ui/{credentials,env_profiles}/modern.rs, locale 5개, 본 인계 및 integration plan. DB 스키마/저장 worker/터미널 renderer/wire/Fleet 계약 변경 없음.
+- 실패/보완: 처음에는 active cwd cache를 재사용하고 팝업 처리를 input_enabled로 묶었다. source review로 오류를 확인해 원본 pane cwd 캡처/팝업과 PTY 입력 분리로 교체했다. pending값은 로딩만 기다리게 두면 취소 후 재등장하므로 새 초안/취소에도 정리한다. API 값의 여러 화면 행은 무조건 결합하지 않는다(soft wrap 메타데이터 없음); 단일 행 선택만 활성화하며 한도 초과를 잘라 저장하지 않는다.
+- **미적용 상태:** 실행 앱은 PID 30263, `/private/tmp/deppy-agent-attention-build-h7vj5ob8/Deppy Sijo.app`, 코드 7442a8f 그대로. 새 GUI 빌드/재실행, main 머지, push, 배포는 하지 않았다. 사용자 원래 규칙 `재빌드·재실행은 승인받고 해라`에 따라 실행 변경 전 요청이 필요하다. 실제 화면 PASS를 주장하지 않는다.
+- 다음 에이전트 명령:
+  `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`
+  `git status --short`
+  `git log -3 --oneline`
+  `git branch --show-current`
+  `cat /tmp/deppy-env-context-final-related.log`
+  `rg 'COMMAND|^EXIT' /tmp/deppy-env-context-final-gates.log`
+  `ps -o pid,etime,comm -p 30263`
+  사용자 빌드 승인 후 `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo build --locked --release -p deppy-sijo -p mcp-proxy`. 실행 중 bundle을 덮지 않는 새 디렉터리에 stage하고 기존 Developer ID로 서명/manifest source hash를 남긴다. 재실행 승인 시 PID 30263의 정확한 경로를 다시 확인하고 종료한 뒤 새 bundle을 연다. `pkill -f` 금지. main/원본 Relay 브랜치에 임의 merge/rebase/force-push하지 않는다.

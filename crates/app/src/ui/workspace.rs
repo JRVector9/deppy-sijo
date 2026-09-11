@@ -1937,7 +1937,7 @@ pub struct WorkspaceUi {
     agent_send_presets: Vec<String>,
     /// pane 우클릭 → "환경변수·API 설정" 요청 (E4 ⑥). App이 프레임에서 take해
     /// 설정 창을 Environment 카테고리로 연다.
-    open_environment_requested: bool,
+    open_environment_requested: Option<super::environment::EnvironmentOpenRequest>,
     new_session_requested: bool,
     /// pane 우클릭 → 세션 폴더 요청(파일 트리 이동/Finder 열기, 2026-07-18). cwd
     /// 해석(lsof 폴백 포함)과 트리·Finder 라우팅은 App 몫이라 요청만 쌓는다 — E4 ⑥
@@ -2810,7 +2810,7 @@ impl WorkspaceUi {
             staged_split_commit_pass: None,
             confirm_close: None,
             agent_send_presets: Vec::new(),
-            open_environment_requested: false,
+            open_environment_requested: None,
             new_session_requested: false,
             session_folder_request: None,
             note_append_request: None,
@@ -7072,8 +7072,26 @@ impl WorkspaceUi {
             }
         }
         // 터미널 위 우클릭도 같은 메뉴 (터미널 위젯이 topmost라 배경 interact가 못 받음)
-        if mode.is_local() && input_enabled {
+        // 팝업 항목의 클릭 프레임은 PTY 입력 소유권이 일시 해제된다. 메뉴는 계속 처리한다.
+        if mode.is_local() {
             self.pane_context_menu(&output.response, pane_id, config, catalog);
+        } else {
+            output.response.context_menu(|ui| {
+                if let Some((selected, a, b)) = self.selection
+                    && selected == session
+                {
+                    let text = renderer_egui::selection_text(&snapshot, a.min(b), a.max(b));
+                    self.environment_selection_menu(ui, session, &text, catalog);
+                }
+                if ui
+                    .button(catalog.t("workspace.open_environment", &[]))
+                    .clicked()
+                {
+                    self.open_environment_requested =
+                        Some(self.environment_open_request(Some(session), None));
+                    ui.close();
+                }
+            });
         }
 
         // 터미널 텍스트 검색 (T3): 매치 하이라이트 + 우상단 검색 바 + 스크롤 이동.
@@ -7666,6 +7684,47 @@ impl WorkspaceUi {
         ui.painter().rect_filled(bar, 1.0, accent);
     }
 
+    /// 세션 번호는 runtime마다 재사용하므로 원본 pane의 캐시에서 경로도 함께 캡처한다.
+    fn environment_open_request(
+        &self,
+        session: Option<SessionId>,
+        prefill: Option<super::environment::EnvironmentPrefill>,
+    ) -> super::environment::EnvironmentOpenRequest {
+        super::environment::EnvironmentOpenRequest {
+            cwd: session.and_then(|session| self.session_cwds.get(&session).cloned()),
+            prefill,
+        }
+    }
+
+    fn environment_selection_menu(
+        &mut self,
+        ui: &mut egui::Ui,
+        session: SessionId,
+        text: &str,
+        catalog: &i18n::Catalog,
+    ) {
+        use super::environment::{EnvironmentPrefill, EnvironmentSelectionKind as K};
+        ui.menu_button(catalog.t("workspace.menu.add_to_environment", &[]), |ui| {
+            for (kind, key) in [
+                (K::ApiName, "workspace.menu.use_as_api_name"),
+                (K::ApiValue, "workspace.menu.use_as_api_value"),
+                (K::VariableName, "workspace.menu.use_as_env_name"),
+                (K::VariableValue, "workspace.menu.use_as_env_value"),
+            ] {
+                if ui
+                    .add_enabled(kind.accepts(text), egui::Button::new(catalog.t(key, &[])))
+                    .clicked()
+                {
+                    self.open_environment_requested = Some(self.environment_open_request(
+                        Some(session),
+                        EnvironmentPrefill::from_selection(kind, text),
+                    ));
+                    ui.close();
+                }
+            }
+        });
+    }
+
     fn pane_context_menu(
         &mut self,
         resp: &egui::Response,
@@ -7755,6 +7814,7 @@ impl WorkspaceUi {
                     // 대상은 **실행 중으로 감지된 에이전트 pane**(등록 목록이 아니라
                     // agent_info) — 없으면 이 메뉴 자체가 안 보인다.
                     self.send_to_agent_menu(ui, &text, catalog);
+                    self.environment_selection_menu(ui, sel_session, &text, catalog);
                 }
             }
             // 마지막 명령 출력 복사/전송 (셸 통합 2단계) — 드래그 선택 없이도 세션이
@@ -7826,15 +7886,16 @@ impl WorkspaceUi {
                 .button(catalog.t("workspace.open_environment", &[]))
                 .clicked()
             {
-                self.open_environment_requested = true;
+                self.open_environment_requested =
+                    Some(self.environment_open_request(session, None));
                 ui.close();
             }
         });
     }
 
     /// pane 우클릭의 환경설정 진입 요청을 소비한다 (E4 ⑥ — App이 프레임마다 확인).
-    pub fn take_open_environment(&mut self) -> bool {
-        std::mem::take(&mut self.open_environment_requested)
+    pub fn take_open_environment(&mut self) -> Option<super::environment::EnvironmentOpenRequest> {
+        self.open_environment_requested.take()
     }
 
     pub fn take_new_session_requested(&mut self) -> bool {
@@ -16122,6 +16183,25 @@ mod tests {
                 "workspace production title path contains filesystem lookup: {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn environment_context_same_session_number_keeps_original_runtime_cwd() {
+        let session = SessionId(7);
+        let mut primary = WorkspaceUi::new();
+        let mut attached = WorkspaceUi::new();
+        primary.session_cwds.insert(session, "/primary".into());
+        attached.session_cwds.insert(session, "/attached".into());
+        let first = primary.environment_open_request(Some(session), None);
+        let second = attached.environment_open_request(Some(session), None);
+        assert_eq!(first.cwd.as_deref(), Some("/primary"));
+        assert_eq!(second.cwd.as_deref(), Some("/attached"));
+        assert!(
+            attached
+                .environment_open_request(Some(SessionId(999)), None)
+                .cwd
+                .is_none()
+        );
     }
 
     #[test]

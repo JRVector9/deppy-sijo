@@ -3,6 +3,25 @@ use super::*;
 use crate::ui::environment::field_label;
 
 impl EnvProfilesUi {
+    pub(crate) fn prefill_modern(
+        &mut self,
+        kind: crate::ui::environment::EnvironmentSelectionKind,
+        value: crate::ui::credentials::SensitiveInput,
+    ) -> egui::Id {
+        self.reset_var_form();
+        match kind {
+            crate::ui::environment::EnvironmentSelectionKind::VariableName => {
+                self.var_key = value.into_inner();
+                env_var_value_input_id()
+            }
+            crate::ui::environment::EnvironmentSelectionKind::VariableValue => {
+                self.var_plain_value = value.into_inner();
+                env_var_key_input_id()
+            }
+            _ => unreachable!("환경변수 입력 필드만 전달한다"),
+        }
+    }
+
     pub(crate) fn prepare_modern(&mut self, snapshot: &EnvProfilesSnapshot) {
         self.sync_snapshot_state(snapshot);
         if let Some(sources) = snapshot.sources.as_ref()

@@ -1224,6 +1224,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn environment_context_api_prefill_keeps_name_separate_from_binding_and_clears_old_value() {
+        use crate::ui::environment::EnvironmentSelectionKind as K;
+        let mut view = CredentialsUi::new();
+        view.begin_modern_add();
+        view.secret_input = "old-fake-secret".into();
+        view.prefill_modern(
+            K::ApiName,
+            SensitiveInput::try_new("내 API".into()).unwrap(),
+        );
+        assert_eq!(view.label, "내 API");
+        assert!(view.env_name.is_empty());
+        assert!(view.secret_input.is_empty());
+        view.prefill_modern(
+            K::ApiValue,
+            SensitiveInput::try_new("new-fake-secret".into()).unwrap(),
+        );
+        assert_eq!(view.secret_input, "new-fake-secret");
+        assert!(view.label.is_empty());
+        assert!(view.env_name.is_empty());
+        assert!(!view.modern_secret_visible);
+        view.reset_modern_draft();
+        assert!(view.secret_input.is_empty());
+    }
+
+    #[test]
     fn pr188_api_draft_reset_discards_widget_history() {
         let mut view = CredentialsUi::new();
         let (tracked, ctx, id, shared) = crate::ui::draft_text_edit::recorded_fake_input();

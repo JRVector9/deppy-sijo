@@ -3031,3 +3031,112 @@
   `git show --stat HEAD`
   `cat docs/investigations/2026-09-11-agent-attention-review.md`
   구현과 코드 리뷰 요청은 완료했다. main 머지/배포/앱 재기동은 다음 사용자 요청 범위로 진행한다.
+
+### 2026-09-11 commit fc9bd03 독립 리뷰
+
+- 목표: `fc9bd03`에서 새로 생긴 실행·대기 상태 회귀만 검토하고 우선순위별 결과를 보고한다. 앱 코드 수정, 설정 설치, 운영 DB 변경, 앱 재실행은 하지 않는다.
+- 완료: 전체 commit diff, 적용 AGENTS 지침, hook 정규화/저장/화면 병합/알림 소비와 provider 공식 hook 계약을 확인했다.
+- 실행 검증: `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo test --locked -p storage -p session -p mcp-proxy -- --test-threads=1`은 exit 0, 482 PASS와 1 ignored다. 로그 `/tmp/fc9bd03-review-tests.log`. 앱 전체 테스트 및 실제 CLI 화면 검증은 실행하지 않았다.
+- 독립 재현: `/tmp/fc9bd03-screen-compare`는 동일한 y/n 응답 이후 parent=Running, commit=NeedsApproval을 확인했다. `/tmp/fc9bd03-review-repro`는 취소 후 이전 시각의 요청 시작이 저장되면 pending이 재생성됨을 확인했다. 실제 소스 모듈과 현재 storage rlib를 사용했고 DB는 임시 경로에만 만들었다.
+- 실패/배제: 독립 rustc 첫 실행은 tracing extern 누락으로 실패했고 추가 후 성공했다. ElicitationResult만 보낸 재현은 실제 `elicitation_response` 알림을 누락했으므로 정상 provider 흐름의 결함 근거로 사용하지 않는다.
+- 수정 파일: 인계용 `docs/CODEX_HANDOFF.md`만 수정했다. 후보별 종료/취소 경로 검증과 최종 보고가 남아 있으며 PR fix는 만들지 않는다.
+- 다음 명령: `git status --short`; `git show fc9bd03 -- crates/storage/src/agent_attention.rs crates/session/src/status.rs crates/app/src/agent_shim.rs`; `/tmp/fc9bd03-screen-compare`; `rg 'test result:' /tmp/fc9bd03-review-tests.log`.
+- 최종 검증: 같은 환경의 `cargo clippy --locked --workspace --all-targets -- -D warnings`, `cargo fmt --all -- --check`, `git diff --check`도 exit 0이다. Clippy 로그 `/tmp/fc9bd03-review-clippy.log`.
+- 최종 재현/보고: 수동 거절된 Claude ExitPlanMode는 정상 Stop과 다음 완료 턴 뒤에도 요청 ID가 남았다(공식 계약상 수동 permission denial에는 결과 hook이 오지 않음). 최종 보고 대상은 이 누락, y/n 제출 후 화면 상태 고착, 취소보다 늦게 저장된 이전 요청의 재생성 세 건이다. 리뷰와 검증은 완료했으며 수정은 다음 사용자 요청 범위다. 실제 CLI 대화 실행에 성공했다고 주장하지 않는다.
+
+## 2026-09-11 최종 커밋 재리뷰 — 완료, 추가 수정 7건
+
+- 최신 요청: `전부 수정했어? 더 수정할거 없는지 검토해봐`.
+  fc9bd03을 기준으로 재리뷰한다. 앱 재빌드·재실행, main 머지, 구현 변경은 아직 하지 않았다.
+- Codex CLI `review --commit fc9bd03` 진행: exec session 20745,
+  `/tmp/deppy-attention-second-review.log`. 이전 리뷰의 수정 주장과 별개로 새 증거를 확인한다.
+- 저장소의 현행 storage/session 라이브러리를 링크한 별도 진단을 임시 경로에서 실행해
+  다음 결함을 재현했다. 이는 실패 동작 재현 assertion 성공이며 수정 후 PASS가 아니다.
+  1. 질문 시작(at 2)이 취소(at 3) 뒤 DB에 저장되면 취소된 질문이 다시 waiting이 된다.
+  2. ID 없는 같은 서버 질문 두 건에서 두 번째 시작(at 2)이 첫 결과(at 3) 뒤 저장되면
+     답변하지 않은 두 번째 질문이 사라진다.
+  3. TurnStart→Completed→ResponseRequired→Resolved→Completed는 마지막 done이 누락된다.
+  4. Enter your name / Paste your token / Type yes to continue는 제출 후 셸로 돌아와도
+     예전 프롬프트가 마지막 5줄에 남으면 Waiting이 계속된다.
+- 재현 명령: `/tmp/deppy-attention-second-repros`,
+  `/tmp/deppy-attention-line-prompt-repro`. 소스는 같은 경로의 `.rs`, 로그는 `.log`.
+  rustc 컴파일 로그도 각각 `-compile.log`에 있다. 운영 DB 대신 임시 SQLite만 사용했다.
+- 추가 소스 검토: App::update_session_alerts의 viewed는 pane 포커스와 앱 포커스만 본다.
+  Home/Fleet/History/문서/설정 등 실제 터미널 가시성과 분리되어 있어 확인하지 않은 완료가
+  소비될 가능성이 있다. central_view/terminal_visible 실제 분기를 읽어 증거를 확인 중이다.
+- 다음: CLI 재리뷰 결과 수신 → 중복 원인 정리 및 재현/소스 증거 대조 → 최종 리뷰 보고.
+  앞 절의 구현 완료는 당시 1차 리뷰 범위이며 이 재리뷰에서 추가 미해결 사항이 확인됐다.
+
+### 재리뷰 최종 결과
+
+- 중복 제외 7건이 남았다. 상세·위치·재현·수정 방향은
+  `docs/investigations/2026-09-11-agent-attention-second-review.md`.
+- 저장 순서 문제 2건, 질문 재개 후 완료 누락, 한 줄 제출 고착, 서브에이전트 승인 신호
+  폐기, Claude 계획 수동 거절 미해제, 실제 터미널 가시성 없는 읽음 판정이다.
+- CLI 외부 리뷰는 exit 0으로 완료했고 지적 3건 중 2건이 자체 검토와 중복이다.
+  `/tmp/deppy-attention-second-review.log`. 외부 검증 482 PASS/1 ignored와 strict
+  clippy/fmt/diff exit 0은 추가 결함을 덮지 못하는 기존 검증 범위다.
+- 서브에이전트 승인 무시는 `/tmp/deppy-attention-subagent-repro`에서 재현했다.
+  CLI 소스와 공식 문서 계약도 대조했다. 실제 화면/실제 CLI 대화를 실행한 것은 아니다.
+- 구현 파일은 수정하지 않았고 HEAD는 fc9bd03 그대로다. 문서 변경만 미커밋 상태다.
+  실행 앱 PID 25095, 운영 DB, release bundle, 사용자 설정 모두 그대로다.
+- 다음 명령: `git status --short`; `cat docs/investigations/2026-09-11-agent-attention-second-review.md`;
+  `/tmp/deppy-attention-second-repros`; `/tmp/deppy-attention-line-prompt-repro`;
+  `/tmp/deppy-attention-subagent-repro`; `/tmp/fc9bd03-review-repro`.
+  수정 작업 시 재현을 회귀 테스트로 먼저 옮기고 요청 수명/완료/입력 순으로 보완한다.
+
+### 2026-09-11 재리뷰 7건 수정 진행
+
+- 최신 요청 `수정해`에 따라 위 7건을 수정 중이다. 작업 경로/브랜치는 이 worktree 그대로이며 main 및 실행 앱 PID 25095는 변경하지 않는다.
+- storage에 owner별 취소 턴 경계와 익명 질문의 부호 있는 잔여 개수·중복 이벤트 기록을 추가했다. 자식 질문은 별도 ID 공간에서 유지하고 부모 완료로 해제하지 않는다. 질문/승인 재개는 완료 토큰을 새로 만들 수 있게 한다.
+- storage 회귀 4건 수정 전 RED, 수정 후 agent_attention 16 PASS (`/tmp/deppy-attention-fix7-storage-{red,green}.log`).
+- Claude 자식 질문/승인/해제만 부모 세션으로 모으고 자식 작업/완료는 부모 활동을 덮지 않는다. PostToolBatch와 bounded transcript의 정확한 tool_result ID로 수동 거절 및 실행 중 취소를 해제한다. SubagentStop은 종료로 단정하지 않고 결과 근거만 읽는다.
+- 한 줄 질문 제출은 소비하고 선택창 이동/확인 화면은 화면 변경으로 해제를 확인한다. proxy 회귀 2건과 session 회귀 1건 PASS (`/tmp/deppy-attention-fix7-proxy-session-green.log`).
+- 수정 소스: storage/agent_attention.rs, mcp-proxy/agent_attention.rs 및 main.rs, session/status.rs, app/agent_shim.rs. app.rs의 실제 터미널 가시성 검증은 테스트 먼저 추가했고 진행 중이다.
+- 남은 일: 터미널 가시성 수정, Claude 결과 경로 통합 검증, 관련 suite 및 실제 Codex CLI 코드 리뷰, 지적 반영, 최종 gate 1회, handoff/일지/커밋. 화면 및 실제 CLI 대화는 미검증이며 package/restart 요청은 없다.
+- 다음 명령: `git diff --stat`; `tail -n 50 /tmp/deppy-attention-fix7-visibility-red.log`; `rg 'second_review|reconcile_claude_results' crates/mcp-proxy/src/agent_attention.rs`; `git diff -- crates/storage/src/agent_attention.rs`.
+
+### 수정 checkpoint — 관련 검증 완료, 독립 리뷰 진행
+
+- 가시성 수정 완료: Home/Fleet, 비활성 창, 설정/보조 탭, 다른 workspace pane 입력 소유권에서는 primary 완료를 읽음으로 소비하지 않는다. 실제 활성 mux 탭도 확인한다. 앱 회귀는 함수 부재 RED 후 1 PASS (`/tmp/deppy-attention-fix7-visibility-{red,green}.log`).
+- Claude 결과 처리의 초기 fingerprint-only transcript 별칭 해제는 폐기했다. 이전 동일 도구/인자의 결과가 새 승인을 닫을 수 있기 때문이다. 과거 transcript는 정확한 tool_use_id만 대조하고, 현재 PostToolBatch의 tool_input으로만 별칭을 해제한다. 공식 PostToolBatch input 계약과 대조했다.
+- 임시 SQLite + 부모/자식 jsonl 파일 통합 회귀로 부모 수동 거절, 배치 별칭 해제, 자식 SubagentStop 결과만 해제하고 부모 완료 미생성을 확인했다.
+- 관련 전체 suite 490 PASS, 1 ignored (storage 359/session 67/proxy 64). `/tmp/deppy-attention-fix7-related-tests.log`. 앱 가시성 1 PASS는 별도다. fmt 적용 완료이며 최종 gate는 리뷰 반영 뒤 실행한다.
+- 실제 Codex CLI 리뷰 시작: `/tmp/deppy-attention-fix7-review.log`. 명시한 6개 Rust 소스의 미커밋 diff만 대상이다. 앱 빌드/설정 설치/운영 DB 접근/파일 수정 금지로 지시했다.
+- 남은 일: 리뷰 결과 반영, 최종 gate, 수정 보고서/일지/커밋. 실행 앱 PID 25095 유지 확인.
+
+- 독립 리뷰 대기 중 추가 자체 경계 진단(`/tmp/deppy-attention-fix7-own-audit{.rs,.log}`)에서 자식 permission 알림 별칭이 결과 후 남는 문제와 익명 서버 12개가 반복 질문하면 32KiB 상태 한도에 걸리는 문제를 재현했다. 현재 수정판의 보완 대상으로 포함한다. 과거 결과에서 fingerprint만 추정해 지우는 접근은 다시 사용하지 않는다.
+- 후속 설계: 자식 도구 활동은 부모 working/done과 분리해 해제 근거로만 추적하고, ID 없는 승인 알림은 같은 owner의 도구/승인이 모두 해제된 때에만 닫는다. 익명 이벤트 dedup 기록은 서버별뿐 아니라 세션 전체 예산도 적용해 장기 사용 중 커지지 않게 한다.
+- 앱 shim 4 + 완료 세대 1 + 가시성 1 = 6 PASS. 테스트 바이너리 실행만 했고 GUI 앱 빌드/재기동은 하지 않았다.
+
+### 수정 checkpoint — 독립 리뷰 반영 완료
+
+- Codex CLI 리뷰 exit 0. 진행 중 발견한 자식 알림/익명 턴 재사용/붙여넣기 문제를 반영했고, 최종 지적은 수동 거절 배치가 일반 도구 active_tools ID를 제외하는 1건(P2)이었다. `/tmp/deppy-attention-fix7-review.log`.
+- 마지막 지적도 반영했다. 대기 요청이 있을 때만 실행 중 도구 ID까지 결과 후보로 조회한다. 부모/자식 transcript와 배치 결과 모두 정확한 ID로 해제하며, 관련 없는 요청은 남긴다. 새 통합 회귀는 RED 후 1 PASS (`/tmp/deppy-attention-fix7-batch-{red,green}.log`).
+- 자체 경계 수정: 익명 dedup 이력을 세션 전체 256개로 제한하고 잔여 개수를 보존한다. 새 턴에서 익명 ID를 재사용하면 소유 턴도 갱신한다. 자식 Working은 해제 근거만 저장하고 부모 working/done에 영향이 없다. 같은 owner의 도구/승인이 모두 해제되면 permission 알림을 닫는다.
+- 추가 storage 3건 RED 후 agent_attention suite 19 PASS, proxy 11 PASS (`/tmp/deppy-attention-fix7-extra-green.log`). 자식 회귀의 첫 테스트 입력은 native ID를 잘못 썼고 수정 후 실제 고착 assertion RED를 재확인했다(`extra-child-red.log`).
+- 붙여넣기 시작/끝 표식을 청크 경계에 걸쳐 해석한다. 붙여넣은 개행은 제출로 소비하지 않고 실제 Enter만 소비한다. 회귀 RED 후 session status 32 PASS (`/tmp/deppy-attention-fix7-paste-{red,green}.log`).
+- 최종 관련 suite와 앱 상태/hook 검사, 외부 리뷰 재현 4건을 재실행 중이다. `/tmp/deppy-attention-fix7-final-{related,app}.log`, `/tmp/deppy-attention-fix7-external-repros-green.log`. 이 시점 최종 PASS 주장은 아직 하지 않는다.
+
+### 7건 수정 — 최종 검증 결과
+
+- 관련 최종 suite: storage 362 + session 68 + proxy 65 = **495 PASS, 1 ignored**. 앱 완료 세대 1 + 숨은 터미널 1 + shim 4 = **6 PASS**. 합계 **501 PASS, 1 ignored**이며 전체 workspace 테스트를 실행했다는 뜻은 아니다.
+- 외부 리뷰의 임시 재현 4건도 모두 PASS: 익명 질문의 새 턴 취소, 자식 알림 해제, bracketed paste, 자식 도구 수동 거절 배치. `/tmp/deppy-attention-fix7-external-repros-green.log`. 외부 재현은 위 501개에 중복 합산하지 않았다.
+- 정확한 검증 명령(공통 환경: `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target`):
+  - `cargo test --locked -p storage -p session -p mcp-proxy -- --test-threads=1`
+  - `cargo test --locked -p deppy-sijo --bin deppy-sijo agent_attention_ -- --test-threads=1`
+  - `/private/tmp/deppy-ready-prs-integration-target/debug/deps/deppy_sijo-6bc9214bfdc29fa6 second_review_숨은 --test-threads=1`
+  - `/private/tmp/deppy-ready-prs-integration-target/debug/deps/deppy_sijo-6bc9214bfdc29fa6 agent_shim::tests --test-threads=1`
+  - `cargo test --manifest-path /private/tmp/deppy-attention-review.gvWlDK/Cargo.toml regression_ -- --test-threads=1`
+- 최종 gate 5개 모두 exit 0: `cargo fmt --all -- --check`, `cargo clippy --locked --workspace --all-targets -- -D warnings`, `cargo run --locked -p xtask -- check-boundary`, `cargo run --locked -p xtask -- i18n-check`, `git diff --check`. 로그 `/tmp/deppy-attention-fix7-final-gates.log`. i18n은 키 호출 1160건/5 locale를 확인했다. 이번 7건 및 독립 리뷰에서 확인한 추가 경계 문제의 구현·검증은 완료했다.
+- 수정된 소스 6개: `crates/storage/src/agent_attention.rs`, `crates/session/src/status.rs`, `crates/mcp-proxy/src/agent_attention.rs`, `crates/mcp-proxy/src/main.rs`, `crates/app/src/agent_shim.rs`, `crates/app/src/app.rs`. DB 스키마 추가 변경 없이 기존 JSON 상태에 serde 기본값을 가진 필드를 추가했다. 문서는 본 인계 및 `docs/investigations/2026-09-11-agent-attention-second-review.md`.
+- 미완료 적용 작업: main 머지/앱 package·restart/실제 Claude·Codex·Grok 대화 화면 확인은 이번 수정 요청에서 실행하지 않는다. 운영 DB/사용자 훅/실행 앱 PID 25095/release bundle 그대로다. 실제 화면 PASS 주장은 없다. fleet의 매 프레임 waiting render와 세션 0+승인 1 계약은 건드리지 않았다.
+- 다음 에이전트 명령:
+  `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`
+  `git status --short`
+  `git log -2 --oneline`
+  `git show --stat HEAD`
+  `cat docs/investigations/2026-09-11-agent-attention-second-review.md`
+  `rg 'COMMAND|EXIT' /tmp/deppy-attention-fix7-final-gates.log`
+  `ps -o pid,etime,command -p 25095`
+  새 사용자 요청이 적용 단계라면 현재 main과 두 수정 커밋의 관계를 먼저 확인한다. 임의로 rebase/force-push하거나 실행 중 앱을 재기동하지 않는다.

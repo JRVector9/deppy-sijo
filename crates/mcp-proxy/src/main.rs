@@ -331,6 +331,7 @@ fn run_hooks(args: &[String]) -> anyhow::Result<()> {
                     let _ = db.record_agent_attention(&session_key, &event);
                 }
                 agent_attention::reconcile_codex_results(&db, &session_key, v, at_micros);
+                agent_attention::reconcile_claude_results(&db, &session_key, v, at_micros);
             }
         } else if event == "needs-input" || event == "clear" {
             // claude Notification hook은 payload.message에 대기 사유를 싣는다

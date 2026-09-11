@@ -286,6 +286,9 @@ pub struct StatusDetector {
     screen_derived: bool,
     /// 출력이 없어도 다음 tick에 화면 스캔이 필요함 (입력 직후 — worker가 소비)
     screen_scan_requested: bool,
+    /// bracketed paste의 개행을 제출로 오인하지 않는다. 분할된 시작/끝 표식도 이어 읽는다.
+    bracketed_paste: bool,
+    paste_marker_matched: usize,
     source: StatusSource,
     stats: StatusDetectorStats,
 }
@@ -304,6 +307,8 @@ impl StatusDetector {
             idle_waiting: false,
             screen_derived: false,
             screen_scan_requested: false,
+            bracketed_paste: false,
+            paste_marker_matched: 0,
             source: StatusSource::IdleHeuristic,
             stats: StatusDetectorStats::default(),
         }
@@ -345,18 +350,35 @@ impl StatusDetector {
     pub fn on_user_input(&mut self, bytes: &[u8]) {
         self.screen_scan_requested = true;
         self.last_output = Instant::now();
-        // 한 줄짜리 Enter 안내는 제출 뒤 스크롤백에 남는다. 선택창과 별도로 소비한다.
-        let simple_continue = self.last_screen_matches.iter().any(|(status, line)| {
-            *status == SessionStatus::Waiting
-                && line
-                    .to_ascii_lowercase()
-                    .contains("press enter to continue")
-        });
-        if simple_continue && bytes.iter().any(|b| matches!(b, b'\r' | b'\n')) {
-            self.on_input();
-            return;
+        let mut submitted = false;
+        for &byte in bytes {
+            let marker = if self.bracketed_paste {
+                b"\x1b[201~"
+            } else {
+                b"\x1b[200~"
+            };
+            if byte == marker[self.paste_marker_matched] {
+                self.paste_marker_matched += 1;
+                if self.paste_marker_matched == marker.len() {
+                    self.bracketed_paste = !self.bracketed_paste;
+                    self.paste_marker_matched = 0;
+                }
+            } else {
+                self.paste_marker_matched = usize::from(byte == 0x1b);
+                submitted |= !self.bracketed_paste && matches!(byte, b'\r' | b'\n' | 3);
+            }
         }
-        if self.screen_derived
+        // 선택창은 화면 변경으로 완료를 확인하고, 한 줄 질문은 Enter 제출을 소비한다.
+        let choice_screen = self.last_screen_matches.iter().any(|(_, line)| {
+            let line = line.to_ascii_lowercase();
+            line.contains("enter to select")
+                || line.contains("press enter to confirm")
+                || line.contains("❯")
+                || line.contains("↑")
+                || line.contains("↓")
+        });
+        if choice_screen
+            && self.screen_derived
             && matches!(
                 self.status,
                 SessionStatus::Waiting | SessionStatus::NeedsApproval
@@ -364,7 +386,7 @@ impl StatusDetector {
         {
             return;
         }
-        if bytes.iter().any(|b| matches!(b, b'\r' | b'\n' | 3)) {
+        if submitted {
             self.on_input();
         }
     }
@@ -577,6 +599,43 @@ fn status_source_reason(source: StatusSource) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fix7_여러_줄_붙여넣기는_실제_enter_전까지_제출이_아니다() {
+        for chunks in [
+            vec![b"\x1b[200~my\nanswer\x1b[201~".as_slice()],
+            vec![b"\x1b[20".as_slice(), b"0~my\nanswer\x1b[2", b"01~"],
+        ] {
+            let mut d = StatusDetector::new(StatusPatterns::compile(None, None, None, None));
+            d.evaluate(Some("Enter your name:"));
+            for chunk in chunks {
+                d.on_user_input(chunk);
+            }
+            assert_eq!(d.status(), SessionStatus::Waiting);
+            d.on_user_input(b"\r");
+            assert_eq!(d.status(), SessionStatus::Running);
+        }
+    }
+
+    #[test]
+    fn second_review_한_줄_질문은_답변_후_이전_출력에_남아도_해제한다() {
+        for prompt in [
+            "Enter your name:",
+            "Paste your token:",
+            "Type yes to continue",
+            "Continue? [y/n]",
+        ] {
+            let mut d = StatusDetector::new(StatusPatterns::compile(None, None, None, None));
+            d.on_output(prompt.as_bytes());
+            d.evaluate(Some(prompt));
+            d.on_user_input(b"y\r");
+            d.on_output(b"y\r\nFinished\r\n$ ");
+            d.evaluate(Some(&format!("{prompt} y\nFinished\n$ ")));
+            assert_eq!(d.status(), SessionStatus::Running, "{prompt}");
+            d.evaluate(Some("$ "));
+            assert_eq!(d.status(), SessionStatus::Running, "{prompt}");
+        }
+    }
 
     #[test]
     fn review_단순_enter_안내는_응답_후_스크롤백에_남아도_해제한다() {

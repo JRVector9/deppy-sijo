@@ -23,7 +23,7 @@ fn field<'a>(v: &'a Value, names: &[&str]) -> Option<&'a str> {
 }
 
 pub fn normalize(v: &Value, at_micros: i64) -> Option<AgentAttentionEvent> {
-    if field(v, &["subagentType", "agent_id"]).is_some() {
+    if field(v, &["subagentType"]).is_some() {
         return None;
     }
     let native = field(v, &["session_id", "sessionId"])?;
@@ -96,6 +96,16 @@ pub fn normalize(v: &Value, at_micros: i64) -> Option<AgentAttentionEvent> {
         "sessionend" => K::SessionEnd,
         _ => return None,
     };
+    let kind = if field(v, &["agent_id"]).is_some() {
+        match kind {
+            K::ResponseRequired | K::ApprovalRequired | K::Resolved | K::Working => kind,
+            K::Cancelled | K::SessionEnd => K::Cancelled,
+            _ => return None,
+        }
+    } else {
+        kind
+    };
+    let request = scoped_request_id(v, &request);
     let turn_id = field(v, &["turn_id", "turnId", "promptId"]).map(str::to_owned);
     Some(AgentAttentionEvent {
         native_session_id: native.into(),
@@ -106,6 +116,16 @@ pub fn normalize(v: &Value, at_micros: i64) -> Option<AgentAttentionEvent> {
     })
 }
 
+fn scoped_request_id(v: &Value, id: &str) -> String {
+    if let Some(agent) = field(v, &["agent_id"]) {
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        agent.hash(&mut hash);
+        format!("child:{:016x}:{id}", hash.finish())
+    } else {
+        id.to_owned()
+    }
+}
+
 /// PermissionRequest는 도구 ID를 생략하기도 한다. 결과의 도구 이름 별칭도 함께 닫는다.
 /// 다른 질문 ID나 도구 이름은 건드리지 않는다.
 pub fn resolved_alias(v: &Value, at_micros: i64) -> Option<AgentAttentionEvent> {
@@ -113,8 +133,104 @@ pub fn resolved_alias(v: &Value, at_micros: i64) -> Option<AgentAttentionEvent> 
     if event.kind != K::Resolved {
         return None;
     }
-    event.request_id = tool_fingerprint(v, field(v, &["tool_name", "toolName"])?);
+    event.request_id = scoped_request_id(
+        v,
+        &tool_fingerprint(v, field(v, &["tool_name", "toolName"])?),
+    );
     Some(event)
+}
+
+/// 실행 전 거절·실행 중 취소는 결과 훅 대신 tool_result에 남는다.
+fn claude_finished_requests(text: &str, pending: &[String], context: &Value) -> Vec<String> {
+    let rows: Vec<Value> = text
+        .lines()
+        .rev()
+        .take(512)
+        .filter(|line| line.len() <= 64 * 1024)
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    let mut result_ids = Vec::new();
+    for row in &rows {
+        if let Some(content) = row.pointer("/message/content").and_then(Value::as_array) {
+            for item in content {
+                if item.get("type").and_then(Value::as_str) == Some("tool_result")
+                    && let Some(id) = field(item, &["tool_use_id"])
+                {
+                    result_ids.push(id);
+                }
+            }
+        }
+    }
+    let mut done = Vec::new();
+    let mut add = |id: String| {
+        if pending.contains(&id) && !done.contains(&id) {
+            done.push(id);
+        }
+    };
+    for id in &result_ids {
+        add(scoped_request_id(context, id));
+    }
+    done
+}
+
+pub fn reconcile_claude_results(db: &storage::Db, key: &str, v: &Value, at: i64) {
+    let Some(native) = field(v, &["session_id"]) else {
+        return;
+    };
+    if v.get("hookEventName").is_some() {
+        return;
+    }
+    let Ok(pending) = db.agent_result_candidate_ids(key, native) else {
+        return;
+    };
+    if pending.is_empty() {
+        return;
+    }
+    let mut done = Vec::new();
+    // 배치 결과를 먼저 확인하여 transcript flush 지연에도 정확한 ID를 해제한다.
+    if let Some(calls) = v.get("tool_calls").and_then(Value::as_array) {
+        for call in calls.iter().take(64) {
+            if let Some(id) = field(call, &["tool_use_id"]) {
+                let id = scoped_request_id(v, id);
+                if pending.contains(&id) && !done.contains(&id) {
+                    done.push(id);
+                }
+                if let Some(tool) = field(call, &["tool_name"]) {
+                    let alias = scoped_request_id(v, &tool_fingerprint(call, tool));
+                    if pending.contains(&alias) && !done.contains(&alias) {
+                        done.push(alias);
+                    }
+                }
+            }
+        }
+    }
+    let path = field(v, &["agent_transcript_path", "transcript_path"]).map(std::path::Path::new);
+    if let Some(path) = path {
+        let expected =
+            field(v, &["agent_id"]).map_or_else(|| native.to_owned(), |id| format!("agent-{id}"));
+        if path.file_stem().and_then(|s| s.to_str()) == Some(expected.as_str())
+            && path.extension().and_then(|s| s.to_str()) == Some("jsonl")
+            && let Some(text) = bounded_tail(path)
+        {
+            for id in claude_finished_requests(&text, &pending, v) {
+                if !done.contains(&id) {
+                    done.push(id);
+                }
+            }
+        }
+    }
+    for id in done {
+        let _ = db.record_agent_attention(
+            key,
+            &AgentAttentionEvent {
+                native_session_id: native.into(),
+                turn_id: field(v, &["turn_id"]).map(str::to_owned),
+                request_id: id,
+                kind: K::Resolved,
+                at_micros: at,
+            },
+        );
+    }
 }
 
 /// 훅이 없는 실패 결과도 정확한 call_id로 확인한다. 답변 대기 중인 호출은 남긴다.
@@ -273,6 +389,110 @@ mod tests {
     use super::*;
     use serde_json::json;
     use storage::AttentionEventKind as K;
+
+    #[test]
+    fn fix7_자식_도구의_수동_거절_배치는_승인_알림까지_해제한다() {
+        let path = std::env::temp_dir().join(format!(
+            "deppy-child-batch-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let db = storage::Db::open(&path).unwrap();
+        let key = "315f68b6-333f-409f-a2c5-922b9eacfd7e:1";
+        let mut v = json!({"session_id":"native","agent_id":"a","hook_event_name":"PreToolUse","tool_use_id":"q","tool_name":"Bash","tool_input":{"command":"ls"}});
+        db.record_agent_attention(key, &normalize(&v, 1).unwrap())
+            .unwrap();
+        v.as_object_mut().unwrap().remove("tool_use_id");
+        v["hook_event_name"] = json!("PermissionRequest");
+        db.record_agent_attention(key, &normalize(&v, 2).unwrap())
+            .unwrap();
+        v["hook_event_name"] = json!("Notification");
+        v["notification_type"] = json!("permission_prompt");
+        db.record_agent_attention(key, &normalize(&v, 3).unwrap())
+            .unwrap();
+        let batch = json!({"session_id":"native","agent_id":"a","hook_event_name":"PostToolBatch","tool_calls":[{"tool_use_id":"q","tool_name":"Bash","tool_input":{"command":"ls"},"tool_response":"User denied"}]});
+        reconcile_claude_results(&db, key, &batch, 4);
+        assert!(db.list_waiting_sessions().unwrap().is_empty());
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn second_review_claude_실제_결과_경로는_부모와_자식을_분리한다() {
+        let dir =
+            std::env::temp_dir().join(format!("deppy-claude-result-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = storage::Db::open(&dir.join("metadata.sqlite3")).unwrap();
+        let key = "315f68b6-333f-409f-a2c5-922b9eacfd7e:1";
+        let mut parent = json!({"session_id":"native","hook_event_name":"PreToolUse","tool_name":"ExitPlanMode","tool_input":{"plan":"draft"},"tool_use_id":"q"});
+        db.record_agent_attention(key, &normalize(&parent, 1).unwrap())
+            .unwrap();
+        let mut child = parent.clone();
+        child["agent_id"] = json!("agent-a");
+        db.record_agent_attention(key, &normalize(&child, 2).unwrap())
+            .unwrap();
+        let mut approval = parent.clone();
+        approval.as_object_mut().unwrap().remove("tool_use_id");
+        approval["hook_event_name"] = json!("PermissionRequest");
+        let alias = normalize(&approval, 3).unwrap();
+        db.record_agent_attention(key, &alias).unwrap();
+        let path = dir.join("native.jsonl");
+        std::fs::write(&path,"{\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"q\",\"is_error\":true}]}}\n").unwrap();
+        parent["transcript_path"] = json!(path);
+        parent["hook_event_name"] = json!("Stop");
+        reconcile_claude_results(&db, key, &parent, 4);
+        let pending = db.pending_agent_request_ids(key, "native").unwrap();
+        assert!(!pending.contains(&"q".to_owned()));
+        assert!(pending.contains(&alias.request_id));
+        assert!(pending.contains(&normalize(&child, 2).unwrap().request_id));
+        // 배치 결과는 transcript 없이도 거절된 질문과 승인 별칭을 함께 해제한다.
+        let batch = json!({"session_id":"native","hook_event_name":"PostToolBatch","tool_calls":[{"tool_name":"ExitPlanMode","tool_input":{"plan":"draft"},"tool_use_id":"q","tool_response":"User denied"}]});
+        reconcile_claude_results(&db, key, &batch, 5);
+        assert_eq!(
+            db.pending_agent_request_ids(key, "native").unwrap(),
+            vec![normalize(&child, 2).unwrap().request_id]
+        );
+        let child_path = dir.join("agent-agent-a.jsonl");
+        std::fs::copy(path, &child_path).unwrap();
+        child["agent_transcript_path"] = json!(child_path);
+        child["hook_event_name"] = json!("SubagentStop");
+        reconcile_claude_results(&db, key, &child, 6);
+        assert!(
+            db.pending_agent_request_ids(key, "native")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(db.list_turn_done_sessions().unwrap().is_empty());
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn second_review_자식_승인은_추적하지만_부모의_완료로_취급하지_않는다() {
+        let mut v = json!({"session_id":"parent","agent_id":"a","hook_event_name":"PermissionRequest","tool_name":"Bash","tool_use_id":"q"});
+        let a = normalize(&v, 1).expect("자식 승인");
+        assert_eq!(a.kind, K::ApprovalRequired);
+        v["agent_id"] = json!("b");
+        assert_ne!(a.request_id, normalize(&v, 2).unwrap().request_id);
+        v["agent_id"] = json!("a");
+        v["hook_event_name"] = json!("PostToolUse");
+        assert_eq!(a.request_id, normalize(&v, 3).unwrap().request_id);
+        v["hook_event_name"] = json!("Stop");
+        assert!(normalize(&v, 4).is_none());
+    }
+
+    #[test]
+    fn second_review_claude_과거_거절_결과는_정확한_요청만_닫는다() {
+        let text = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"q","name":"ExitPlanMode","input":{"plan":"draft"}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"q","is_error":true,"content":"User denied"}]}}
+"#;
+        let value = json!({"session_id":"s"});
+        let alias = tool_fingerprint(&json!({"tool_input":{"plan":"draft"}}), "ExitPlanMode");
+        let result =
+            claude_finished_requests(text, &["q".into(), alias.clone(), "other".into()], &value);
+        assert!(result.contains(&"q".to_owned()));
+        assert!(!result.contains(&alias));
+        assert!(!result.contains(&"other".to_owned()));
+    }
 
     #[test]
     fn review_grok_완료는_최신_실제_턴의_성공_결과로만_확인한다() {

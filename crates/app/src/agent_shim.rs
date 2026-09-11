@@ -81,12 +81,15 @@ fn observer_settings(command: &str, grok: bool) -> serde_json::Value {
             "PreToolUse",
             "PostToolUse",
             "PostToolUseFailure",
+            "PostToolBatch",
             "PermissionRequest",
+            "PermissionDenied",
             "Notification",
             "Elicitation",
             "ElicitationResult",
             "Stop",
             "StopFailure",
+            "SubagentStop",
             "SessionEnd",
         ]
     };

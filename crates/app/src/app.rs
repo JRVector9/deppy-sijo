@@ -9342,6 +9342,18 @@ impl SessionAlert {
     }
 }
 
+fn terminal_attention_visible(
+    view: ui::agent_terminal::AgentTerminalView,
+    app_focused: bool,
+    covered: bool,
+    owner: FrameTerminalOwner,
+) -> bool {
+    view == ui::agent_terminal::AgentTerminalView::Terminal
+        && app_focused
+        && !covered
+        && owner == FrameTerminalOwner::Primary
+}
+
 /// (env key, 값 또는 credential_id) 쌍 목록 — SetSessionDefaultEnv용.
 type EnvPairs = Vec<(String, String)>;
 
@@ -16965,10 +16977,25 @@ impl App {
     ) {
         use runtime::SessionStatus as S;
         const PULSE_SECS: f32 = 0.9;
+        // mux 포커스는 홈·작업·문서·설정 뒤에도 남으므로 실제 터미널 확인과 구분한다.
+        let visible = terminal_attention_visible(
+            self.agent_terminal_ui.view(),
+            app_focused,
+            self.settings_open
+                || self.work_history_tab.is_active()
+                || self.git_tab.is_active()
+                || self.document_tab.is_active(),
+            self.frame_terminal_owner,
+        );
+        let active_tab = self
+            .active
+            .workspace_ui
+            .mux()
+            .and_then(|mux| mux.active_tab.as_ref());
         let mut any_pulse = false;
         for entry in entries.iter_mut() {
             let Some(sid) = entry.session else { continue };
-            let viewed = entry.focused && app_focused;
+            let viewed = visible && entry.focused && active_tab == Some(&entry.tab);
             let alert_status = match entry.status {
                 Some(s @ (S::Done | S::Waiting | S::NeedsApproval)) => Some(s),
                 _ => None,
@@ -29441,7 +29468,11 @@ impl eframe::App for App {
         }
         // 완료/입력대기 주목(6px 레일·펄스) 갱신 + 확인 시 완료 소비. Agents 패널도
         // 같은 상태 원천을 사용하므로 사이드바가 꺼져 있어도 계산한다.
-        self.update_session_alerts(&mut terminal_sessions, ui.ctx().input(|i| i.focused));
+        self.update_session_alerts(
+            &mut terminal_sessions,
+            ui.ctx()
+                .input(|i| i.focused && i.viewport().visible() != Some(false)),
+        );
         let pty_agent_surfaces = self.pty_agent_surfaces(&terminal_sessions);
         // 단축키 처리(`handle_configured_shortcut`)는 이 지점보다 **앞서** 돈다. 그때
         // `agent_sessions_ui.pty_surfaces`를 읽으면 패널이 아직 렌더되지 않은 프레임에서
@@ -34147,6 +34178,36 @@ fn pty_shortcut_missing_feedback(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn second_review_숨은_터미널의_완료는_읽음_처리하지_않는다() {
+        use ui::agent_terminal::AgentTerminalView as V;
+        for (view, focused, covered, owner) in [
+            (V::Home, true, false, FrameTerminalOwner::Primary),
+            (V::Fleet, true, false, FrameTerminalOwner::Primary),
+            (V::Terminal, false, false, FrameTerminalOwner::Primary),
+            (V::Terminal, true, true, FrameTerminalOwner::Primary),
+            (V::Terminal, true, false, FrameTerminalOwner::None),
+        ] {
+            let mut alert = SessionAlert {
+                status: runtime::SessionStatus::Done,
+                completion: Some(1),
+                seen: false,
+                pulse_started: None,
+            };
+            alert.observe(
+                runtime::SessionStatus::Done,
+                Some(1),
+                terminal_attention_visible(view, focused, covered, owner),
+            );
+            assert!(!alert.seen);
+            alert.observe(
+                runtime::SessionStatus::Done,
+                Some(1),
+                terminal_attention_visible(V::Terminal, true, false, FrameTerminalOwner::Primary),
+            );
+            assert!(alert.seen);
+        }
+    }
     #[test]
     fn agent_attention_새_완료는_이전_포커스로_읽음_처리하지_않는다() {
         let mut alert = SessionAlert {

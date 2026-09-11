@@ -3243,3 +3243,11 @@
   `cat /tmp/deppy-attention-fix5-binary-smoke.log`
   `ps -o pid,etime,command -p 25095`
   다음 작업은 사용자 재실행 또는 main 통합 요청 대기다. 요청 전 현재 앱을 종료하거나 원래 프로젝트 폴더의 Relay WIP에 손대지 않는다.
+
+### 사용자 요청으로 재실행 완료
+
+- 후속 사용자 요청 `재실행해`에 따라 기존 PID 25095의 정확한 실행 경로를 확인하고 SIGTERM으로 종료했다.
+- 기존 빌드 manifest의 앱/proxy SHA256을 대조한 뒤 `open -n`으로 새 번들을 실행했다. 재빌드는 반복하지 않았다.
+- 현재 실행: **PID 30263**, `/private/tmp/deppy-agent-attention-build-h7vj5ob8/Deppy Sijo.app/Contents/MacOS/deppy-sijo`. 기존 PID 종료 및 새 프로세스 유지/실행 경로를 재확인했다. 적용 코드 커밋은 **7442a8f**다.
+- build-manifest.json에 app_restarted=true와 실행 PID/시각을 기록했다. main 머지는 하지 않았다. 실제 에이전트 질문/승인 화면 검증은 사용자가 진행할 차례다.
+- 다음 확인 명령: `ps -o pid,etime,command -p 30263`. 이제 PID 25095를 현재 실행 앱으로 사용하면 안 된다.

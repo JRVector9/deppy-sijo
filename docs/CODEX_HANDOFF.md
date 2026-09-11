@@ -2925,3 +2925,30 @@
 - 구현 commit `1eb291e`, main 대상 draft PR #188 생성 완료: https://github.com/JRVector9/deppy-sijo/pull/188. main에는 아직 반영하지 않았고 앱 패키징·재실행도 하지 않았다. 새 화면/기존 화면 전환은 같은 데이터와 기존 worker를 사용하며 `ui.environment_classic_view=true`로 수동 복구할 수도 있다.
 - 2번 우클릭은 수정한 HTML 시안만 제공한다. API 이름·API 키 값·선택 환경변수 이름을 구분한다. 실제 터미널 코드 변경은 없다. 현재 시안은 localhost:8779의 preview worktree design commit 3606ffc로 열 수 있다.
 - 다음 단계: 사용자 재빌드/재실행 승인 후 이 PR worktree의 `target`이 있는지 확인하고 없으면 `ln -s /private/tmp/deppy-ready-prs-integration-target target`을 만든다. `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target DEPPY_SIGN_IDENTITY='Developer ID Application: VectorNine INC (ZDTU5LS35K)' DEPPY_REQUIRE_TRUSTED_SIGNING=0 DEPPY_ALLOW_UNTRUSTED_SIGNING=1 sh scripts/package-macos.sh`. 성공 전 앱 종료 금지. 승인된 재실행 시 `pgrep -x deppy-sijo`/`ps -o pid=,etime=,command= -p <PID>`로 확인한 PID만 종료하고 `open 'target/bundle/Deppy Sijo.app'`. 실제 새 화면과 기존 화면 전환을 사용자가 확인하기 전 UI PASS 또는 PR ready로 바꾸지 않는다.
+
+## 2026-09-11 PR #188 사용자 요청 코드 리뷰
+
+- 목표: 사용자 `코드리뷰해` 요청에 따라 `04cdef6`을 최신 fetch한 base main `9432d33`과 대조한다. 이번 단계는 리뷰이며 앱 코드 수정·패키징·재실행·머지는 하지 않았다.
+- review 스킬의 필수 checklist.md가 설치 경로와 저장소에 없어서 스킬 실행은 적용하지 못했다. 실제 diff, 기존 worker/초안 처리, Cargo.lock의 egui 0.36.1 소스를 직접 추적했다. 별도 에이전트나 세 번째 Codex CLI 리뷰를 실행했다고 주장하지 않는다.
+- 미해결 high: `crates/app/src/ui/credentials/modern.rs:10`의 reset은 입력 String만 제로화한다. `:225`의 TextEdit는 자동 ID로 TextEditState를 재사용하고 egui 실행 취소 기록에는 비밀값 String 사본이 남는다. 취소 후 동일한 추가 입력란을 다시 열어 실행 취소하면 이전 키가 복원될 수 있다. env 입력 초기화에도 같은 기록 정리 누락이 있다. 초안별 입력 ID와 TextEditState/undo 기록을 함께 정리해야 한다.
+- 미해결 medium: 같은 파일 `:203`에서 직접 입력 여부를 provider 문자열과 프리셋의 일치 여부로 판정한다. 직접 입력에서 `openai-compatible` 또는 `google-cloud`를 한 글자씩 입력하면 `openai`/`google`에 도달한 다음 프레임에 입력란이 사라진다. 선택한 서비스 모드와 직접 입력 문자열을 분리해야 한다.
+- 미해결 medium: `crates/app/src/ui/environment.rs:89`에서 가용 폭 700pt 이상일 때 목록 자식 UI 높이를 0으로 전달한다. egui allocate_ui_with_layout은 그 높이를 max_rect로 사용하며 내부 ScrollArea는 남은 높이가 없어 기본 min_scrolled_height 64pt로 축소된다. 추가 패널과 함께 기존 목록을 확인하기 어렵다. 가용 높이를 먼저 캡처해 목록 영역에 전달해야 한다. 실제 앱 화면 재현은 아직 수행하지 않았다.
+- 상태 재현: `/tmp/deppy-pr188-secret-state-probe.rs`를 기존 target의 egui rlib에 링크해 별도 rustc 실행 파일을 만들었다. 앱 빌드나 UI 렌더 테스트가 아니다. 가짜 문자열만 사용했고 `/tmp/deppy-pr188-secret-state-probe` exit 0, `CLEARED_INPUT_UNDO_RESTORES_FAKE_SECRET=true`, `CLEAR_UNDOER_PREVENTS_RESTORE=true`. 로그 `/tmp/deppy-pr188-secret-state-probe.log`. 실제 App reset 호출을 자동 실행한 것은 아니며 reset 소스와 라이브러리 상태 실험을 대조한 결과다.
+- 제외한 의심: 목록 삭제가 추가 패널을 닫는다는 가설은 삭제 확인창이 editor 뒤에서 처리되므로 해당 경로로 성립하지 않는다. 기존 main의 저장 실패 시 값 소진 같은 문제를 새 PR 회귀로 중복 보고하지 않는다.
+- 이번 수정 파일은 이 handoff뿐이다. 게이트·전체 테스트·실제 앱 화면 검증을 재실행하지 않았다. PR #188은 OPEN/draft 상태를 유지한다.
+- 다음 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-env-api-ui`; `git status --short`; `git diff -- docs/CODEX_HANDOFF.md`; `sed -n '1,28p;178,240p' crates/app/src/ui/credentials/modern.rs`; `sed -n '84,104p' crates/app/src/ui/environment.rs`; `/tmp/deppy-pr188-secret-state-probe`. 사용자 수정 요청 시 세 건을 수정하고 비화면 상태 로직은 먼저 회귀 재현한다. UI 확인용 패키징·재실행은 기존 승인 규칙을 계속 따른다.
+
+## 2026-09-11 PR #188 리뷰 세 건 수정
+
+- 사용자 `코드리뷰한거 반영해서 수정해` 승인으로 위 세 건을 수정 중이다. branch/worktree는 동일하며 재빌드·패키징·재실행 승인은 새로 받지 않았다.
+- 입력 기록: 신규 ui/draft_text_edit.rs가 입력값 위젯의 Context/Id 한 쌍만 추적한다. clear는 공유 undo 버퍼를 먼저 비우고 TextEditState와 포커스를 제거한다. API 키와 환경변수 값의 기존/새 화면에 고정 ID를 연결하고 취소/화면 전환/저장, API 용량 초과에서 정리한다. Drop도 정리한다. 메타데이터나 입력 중의 정상 실행 취소는 유지한다.
+- 서비스: 직접 입력 여부를 별도 bool로 보관하고 프리셋/직접 입력 선택 핸들러를 공유한다. 문자열이 openai/google 등과 같아져도 사용자가 고른 직접 입력 모드를 유지한다.
+- 목록: 가용 폭 700pt 이상에서 목록과 추가 패널을 함께 표시할 때 가용 높이를 미리 캡처해 목록 자식 UI에 전달한다. 화면 회귀 테스트는 추가하지 않는다.
+- TDD 상태 3건: API 초안 reset / env 초안 reset에서 실제 egui TextEditState와 공유 undo 사본의 폐기를 확인하고, 직접 입력에서는 네 프리셋으로 시작하는 문자열을 한 글자씩 입력한다. 기록 추적용 골격과 기존 문자열 판정 함수를 준비한 뒤 수정 전 3 FAIL을 실제 확인했다(/tmp/deppy-pr188-review-fix-red.log, compile 18.33초). 수정 뒤 같은 명령 3 PASS(/tmp/deppy-pr188-review-fix-green.log). 이 테스트는 화면을 렌더하지 않는다.
+- 명령: `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo test -p deppy-sijo --bins pr188_ -- --nocapture`.
+- 수정 파일: credentials.rs/credentials/modern.rs, env_profiles.rs/env_profiles/modern.rs, environment.rs, UI 모듈 등록, 신규 draft_text_edit.rs, 이 handoff. 첫 패치의 테스트 모듈 앵커가 달라 적용이 거절됐고 변경 없음 확인 후 정확한 문맥으로 다시 적용했다.
+- 남은 단계: 소스 Codex CLI 리뷰, 지적 반영, 커밋 직전 게이트, 기존 PR #188 갱신 및 Obsidian 기록. 실제 앱 화면 확인은 사용자 재빌드·재실행 승인 뒤 진행한다.
+- 수정 후 상태 테스트 compile 10.92초/3 PASS. 커밋 전 fmt/diff PASS, workspace all-targets clippy `-D warnings` 15.51초 PASS, check-boundary PASS(zero allowlist capability), i18n-check PASS(1210 literal calls/5 locale, i18n unit 8 PASS). 로그 `/tmp/deppy-pr188-fixes-{clippy,boundary,i18n}.log`. 사용자 앱 PID 25095는 기존 main 패키지로 계속 실행 중이다.
+- Codex CLI는 실제 미커밋 UI 소스와 신규 draft_text_edit.rs만 대상으로 후속 리뷰 중(`/tmp/deppy-pr188-fixes-codex-review.log`). 아직 완료 결과를 확정하지 않는다.
+- 후속 Codex CLI 리뷰 exit 0 완료: 변경 소스와 호출 경로에서 새로 도입한 실제 동작 버그를 확인하지 못했다고 보고했다. 문서·HTML·일지는 제외했으며 reviewer는 테스트·빌드·파일 변경을 실행하지 않았다. 위 사용자 리뷰의 세 미해결 지점은 이번 수정으로 반영 완료했고, 실제 화면 확인만 남아 있다.
+- 다음 에이전트: `cd /Users/jr/Desktop/projects/deppy-sijo-env-api-ui`; `git status --short`; `git log -2 --oneline`; `gh pr view 188 --json headRefOid,isDraft,state`; `tail -n 22 docs/CODEX_HANDOFF.md`. PR은 화면 확인 전 draft로 유지한다. 사용자 재빌드·재실행 승인을 받으면 앞 절의 package 명령을 사용하고, 성공 및 서명 확인 전 기존 앱을 종료하지 않는다. 터미널 우클릭 기능은 여전히 HTML 시안만 있다.

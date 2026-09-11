@@ -85,9 +85,11 @@ impl EnvironmentUi {
         let available = ui.available_width();
         if self.drawer.is_some() && available >= 700.0 {
             let editor_width = 320.0;
+            // 목록의 스크롤 영역이 최소 높이로 축소되지 않도록 높이도 전달한다.
+            let list_height = ui.available_height();
             ui.horizontal_top(|ui| {
                 ui.allocate_ui_with_layout(
-                    egui::vec2((available - editor_width - 20.0).max(0.0), 0.0),
+                    egui::vec2((available - editor_width - 20.0).max(0.0), list_height),
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
                         self.list(

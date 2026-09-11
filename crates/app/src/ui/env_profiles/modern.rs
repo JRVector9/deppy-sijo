@@ -150,16 +150,19 @@ impl EnvProfilesUi {
         field_label(ui, catalog, "env.modern.variable_name");
         ui.add(
             egui::TextEdit::singleline(&mut self.var_key)
+                .id(env_var_key_input_id())
                 .font(egui::TextStyle::Monospace)
                 .hint_text("APP_ENV")
                 .desired_width(f32::INFINITY),
         );
         field_label(ui, catalog, "common.value");
-        ui.add(
+        let response = ui.add(
             egui::TextEdit::singleline(&mut self.var_plain_value)
+                .id(env_var_value_input_id())
                 .hint_text("development")
                 .desired_width(f32::INFINITY),
         );
+        self.var_value_input_state.track(ui.ctx(), response.id);
         field_label(ui, catalog, "env.modern.save_file");
         let files = snapshot
             .sources
@@ -206,6 +209,7 @@ impl EnvProfilesUi {
             .clicked()
         {
             let key = key.to_owned();
+            self.var_value_input_state.clear();
             let value = std::mem::take(&mut self.var_plain_value);
             self.remove_local_value(snapshot.dotenv_profile_id().unwrap_or_default(), &key);
             self.var_key.clear();

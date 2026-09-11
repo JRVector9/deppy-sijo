@@ -337,8 +337,10 @@ pub struct CredentialsUi {
     label: String,
     kind: &'static str,
     secret_input: String,
+    secret_input_state: super::draft_text_edit::DraftTextEditState,
     secret_input_overflowed: bool,
     modern_secret_visible: bool,
+    modern_custom_service: bool,
     error: Option<CredentialsUiErrorCode>,
     show_add_form: bool,
     delete_confirm: Option<(String, String)>,
@@ -364,8 +366,10 @@ impl CredentialsUi {
             label: String::new(),
             kind: "api_key",
             secret_input: String::new(),
+            secret_input_state: Default::default(),
             secret_input_overflowed: false,
             modern_secret_visible: false,
+            modern_custom_service: false,
             error: None,
             show_add_form: false,
             delete_confirm: None,
@@ -417,6 +421,7 @@ impl CredentialsUi {
         self.env_name.clear();
         self.provider.clear();
         self.label.clear();
+        self.modern_custom_service = false;
         self.add_pending = false;
         self.error = None;
     }
@@ -792,14 +797,17 @@ impl CredentialsUi {
             truncate_utf8(&mut self.env_name, 256);
             let response = ui.add(
                 egui::TextEdit::singleline(&mut self.secret_input)
+                    .id(credential_secret_input_id())
                     .password(true)
                     .hint_text(catalog.t("credentials.secret", &[]))
                     .desired_width(220.0),
             );
+            self.secret_input_state.track(ui.ctx(), response.id);
             truncate_utf8(&mut self.provider, CREDENTIAL_TEXT_INPUT_MAX_BYTES);
             truncate_utf8(&mut self.label, CREDENTIAL_TEXT_INPUT_MAX_BYTES);
             if self.secret_input.len() > CREDENTIAL_SENSITIVE_ITEM_MAX_BYTES {
                 clear_sensitive_string(&mut self.secret_input);
+                self.secret_input_state.clear();
                 self.secret_input_overflowed = true;
                 self.error = Some(CredentialsUiErrorCode::DraftLimitExceeded);
             } else if response.changed() {
@@ -818,6 +826,7 @@ impl CredentialsUi {
                 .clicked()
                 && intent.is_none()
             {
+                self.secret_input_state.clear();
                 let secret = std::mem::take(&mut self.secret_input);
                 match SensitiveInput::try_new(secret) {
                     Ok(secret) => {
@@ -953,6 +962,10 @@ impl Drop for CredentialsUi {
 
 fn credential_provider_input_id() -> egui::Id {
     egui::Id::new("credentials_provider_input")
+}
+
+fn credential_secret_input_id() -> egui::Id {
+    egui::Id::new("credentials_secret_input")
 }
 
 fn credentials_table_header(ui: &mut egui::Ui, columns: &[String]) {
@@ -1209,6 +1222,43 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+
+    #[test]
+    fn pr188_api_draft_reset_discards_widget_history() {
+        let mut view = CredentialsUi::new();
+        let (tracked, ctx, id, shared) = crate::ui::draft_text_edit::recorded_fake_input();
+        view.secret_input_state = tracked;
+        view.secret_input = "fake-review-secret".into();
+        view.reset_modern_draft();
+        assert!(view.secret_input.is_empty());
+        assert!(egui::text_edit::TextEditState::load(&ctx, id).is_none());
+        let cursor = egui::text::CCursorRange::one(egui::text::CCursor::new(0));
+        assert!(shared.undoer().undo(&(cursor, String::new())).is_none());
+    }
+
+    #[test]
+    fn pr188_custom_service_mode_survives_builtin_prefix() {
+        let mut view = CredentialsUi::new();
+        for name in [
+            "openai-compatible",
+            "google-cloud",
+            "anthropic-proxy",
+            "supabase-dev",
+        ] {
+            view.select_modern_service(None);
+            for letter in name.chars() {
+                view.provider.push(letter);
+                assert!(
+                    view.modern_service_is_custom(),
+                    "직접 입력 유지: {}",
+                    view.provider
+                );
+            }
+        }
+        view.select_modern_service(Some(("openai", "OPENAI_API_KEY")));
+        assert!(!view.modern_service_is_custom());
+        assert_eq!(view.env_name, "OPENAI_API_KEY");
+    }
 
     #[test]
     fn modern_view_late_secret_reply_is_discarded() {

@@ -399,6 +399,7 @@ pub struct EnvProfilesUi {
     write_source: Option<String>,
     var_key: String,
     var_plain_value: String,
+    var_value_input_state: super::draft_text_edit::DraftTextEditState,
     error: Option<EnvUiErrorCode>,
     show_add_form: bool,
     delete_confirm: Option<(String, String)>,
@@ -419,6 +420,7 @@ impl EnvProfilesUi {
             write_source: None,
             var_key: String::new(),
             var_plain_value: String::new(),
+            var_value_input_state: Default::default(),
             error: None,
             show_add_form: false,
             delete_confirm: None,
@@ -971,6 +973,7 @@ impl EnvProfilesUi {
         self.delete_confirm = None;
         self.var_key.clear();
         clear_sensitive_string(&mut self.var_plain_value);
+        self.var_value_input_state.clear();
     }
 
     fn clear_revealed(&mut self) {
@@ -1252,11 +1255,13 @@ fn compact_env_var_form(
                 .id_source(env_var_key_input_id())
                 .desired_width(180.0),
         );
-        ui.add(
+        let response = ui.add(
             egui::TextEdit::singleline(&mut state.var_plain_value)
+                .id(env_var_value_input_id())
                 .hint_text(catalog.t("common.value", &[]))
                 .desired_width(240.0),
         );
+        state.var_value_input_state.track(ui.ctx(), response.id);
         // Bound same-frame paste input before validation or intent construction.
         truncate_utf8(&mut state.var_key, ENV_KEY_INPUT_MAX_BYTES);
         truncate_utf8(&mut state.var_plain_value, ENV_VALUE_INPUT_MAX_BYTES);
@@ -1267,6 +1272,7 @@ fn compact_env_var_form(
             .clicked()
         {
             let key = key.to_owned();
+            state.var_value_input_state.clear();
             let value = std::mem::take(&mut state.var_plain_value);
             let id = (profile_id.to_owned(), key.clone());
             state.remove_local_value(&id.0, &id.1);
@@ -1287,6 +1293,10 @@ fn row_id(var: &EnvVarItem) -> (String, String) {
 
 fn env_var_key_input_id() -> egui::Id {
     egui::Id::new("env_var_key_input_compact")
+}
+
+fn env_var_value_input_id() -> egui::Id {
+    egui::Id::new("env_var_value_input")
 }
 
 fn truncate_utf8(value: &mut String, max_bytes: usize) {
@@ -1362,6 +1372,19 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+
+    #[test]
+    fn pr188_environment_draft_reset_discards_widget_history() {
+        let mut view = EnvProfilesUi::new();
+        let (tracked, ctx, id, shared) = crate::ui::draft_text_edit::recorded_fake_input();
+        view.var_value_input_state = tracked;
+        view.var_plain_value = "fake-review-secret".into();
+        view.reset_modern_draft();
+        assert!(view.var_plain_value.is_empty());
+        assert!(egui::text_edit::TextEditState::load(&ctx, id).is_none());
+        let cursor = egui::text::CCursorRange::one(egui::text::CCursor::new(0));
+        assert!(shared.undoer().undo(&(cursor, String::new())).is_none());
+    }
 
     struct FakeAdapter {
         calls: Cell<usize>,

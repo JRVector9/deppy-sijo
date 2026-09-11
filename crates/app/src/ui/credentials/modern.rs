@@ -3,25 +3,37 @@ use super::*;
 use crate::ui::environment::field_label;
 
 impl CredentialsUi {
+    pub(super) fn select_modern_service(&mut self, service: Option<(&str, &str)>) {
+        self.modern_custom_service = service.is_none();
+        let (provider, variable) = service.unwrap_or(("", ""));
+        self.provider = provider.into();
+        self.env_name = variable.into();
+    }
+
+    pub(super) fn modern_service_is_custom(&self) -> bool {
+        self.modern_custom_service
+    }
+
     pub(crate) fn prepare_modern(&mut self, snapshot: &CredentialsSnapshot) {
         self.sync_snapshot(snapshot);
     }
 
     pub(crate) fn reset_modern_draft(&mut self) {
         clear_sensitive_string(&mut self.secret_input);
+        self.secret_input_state.clear();
         self.env_name.clear();
         self.provider.clear();
         self.label.clear();
         self.modern_secret_visible = false;
+        self.modern_custom_service = false;
         self.secret_input_overflowed = false;
         self.show_add_form = false;
         // 작업 중 여부는 화면 전환으로 풀지 않고 기존 완료 ACK가 정리한다.
     }
 
     pub(crate) fn begin_modern_add(&mut self) {
-        if self.provider.is_empty() {
-            self.provider = "openai".into();
-            self.env_name = "OPENAI_API_KEY".into();
+        if self.provider.is_empty() && !self.modern_service_is_custom() {
+            self.select_modern_service(Some(("openai", "OPENAI_API_KEY")));
         }
     }
 
@@ -177,32 +189,34 @@ impl CredentialsUi {
         let direct = catalog.t("env.modern.direct", &[]);
         let display = services
             .iter()
-            .find(|(id, _, _)| *id == self.provider)
+            .find(|(id, _, _)| !self.modern_service_is_custom() && *id == self.provider)
             .map_or(direct.as_str(), |(_, name, _)| *name);
         egui::ComboBox::from_id_salt("modern_api_service")
             .width(ui.available_width())
             .selected_text(display)
             .show_ui(ui, |ui| {
                 for (id, name, variable) in services {
-                    if ui.selectable_label(self.provider == id, name).clicked() {
-                        self.provider = id.into();
-                        self.env_name = variable.into();
+                    if ui
+                        .selectable_label(
+                            !self.modern_service_is_custom() && self.provider == id,
+                            name,
+                        )
+                        .clicked()
+                    {
+                        self.select_modern_service(Some((id, variable)));
                     }
                 }
                 if ui
-                    .selectable_label(
-                        !services.iter().any(|(id, _, _)| *id == self.provider),
-                        direct,
-                    )
+                    .selectable_label(self.modern_service_is_custom(), direct)
                     .clicked()
                 {
-                    self.provider.clear();
-                    self.env_name.clear();
+                    self.select_modern_service(None);
                 }
             });
-        if !services.iter().any(|(id, _, _)| *id == self.provider) {
+        if self.modern_service_is_custom() {
             ui.add(
                 egui::TextEdit::singleline(&mut self.provider)
+                    .id(credential_provider_input_id())
                     .hint_text(catalog.t("credentials.provider", &[]))
                     .desired_width(f32::INFINITY),
             );
@@ -220,19 +234,20 @@ impl CredentialsUi {
                 .weak(),
         );
         field_label(ui, catalog, "env.modern.api_value");
-        let changed = ui
-            .add(
-                egui::TextEdit::singleline(&mut self.secret_input)
-                    .password(!self.modern_secret_visible)
-                    .hint_text(catalog.t("env.modern.paste_key", &[]))
-                    .desired_width(f32::INFINITY),
-            )
-            .changed();
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut self.secret_input)
+                .id(credential_secret_input_id())
+                .password(!self.modern_secret_visible)
+                .hint_text(catalog.t("env.modern.paste_key", &[]))
+                .desired_width(f32::INFINITY),
+        );
+        self.secret_input_state.track(ui.ctx(), response.id);
         if self.secret_input.len() > CREDENTIAL_SENSITIVE_ITEM_MAX_BYTES {
             clear_sensitive_string(&mut self.secret_input);
+            self.secret_input_state.clear();
             self.secret_input_overflowed = true;
             self.error = Some(CredentialsUiErrorCode::DraftLimitExceeded);
-        } else if changed {
+        } else if response.changed() {
             self.secret_input_overflowed = false;
         }
         ui.checkbox(
@@ -293,6 +308,7 @@ impl CredentialsUi {
             .add_enabled(filled, egui::Button::new(catalog.t("action.save", &[])))
             .clicked()
         {
+            self.secret_input_state.clear();
             let secret = std::mem::take(&mut self.secret_input);
             match SensitiveInput::try_new(secret) {
                 Ok(secret) => {

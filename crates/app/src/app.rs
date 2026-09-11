@@ -9722,6 +9722,7 @@ pub struct App {
     pending_folder_picker_completion: Option<(FolderPickerPurpose, PathBuf)>,
     credentials_ui: ui::credentials::CredentialsUi,
     env_profiles_ui: ui::env_profiles::EnvProfilesUi,
+    environment_ui: ui::environment::EnvironmentUi,
     activity_ui: ui::activity::ActivityUi,
     /// 목업 기반 홈/터미널 전환과 전체 워크스페이스 대시보드 상태.
     agent_terminal_ui: ui::agent_terminal::AgentTerminalUi,
@@ -10417,8 +10418,19 @@ fn initial_workspace_id(
         .unwrap_or(fallback))
 }
 
-/// Environment & API 목록 안에서만 설정 context를 결정한다. sidebar visibility와
-/// runtime active는 후보 우선순위에만 쓰고 수정하지 않는다.
+/// 로딩 중인 목록은 빈 목록과 구분해 편집하던 프로젝트를 보존한다.
+fn resolve_settings_env_project_during_refresh(
+    projects: Option<&[ui::env_project_list::EnvProjectRow]>,
+    current: Option<&str>,
+    active_id: &str,
+) -> Option<String> {
+    match projects {
+        None => current.map(str::to_owned),
+        Some(projects) => resolve_settings_env_project_id(projects, None, current, active_id),
+    }
+}
+
+/// Environment & API 목록 안에서만 선택하고 sidebar와 runtime active는 수정하지 않는다.
 fn resolve_settings_env_project_id(
     projects: &[ui::env_project_list::EnvProjectRow],
     requested: Option<&str>,
@@ -14552,6 +14564,7 @@ impl App {
             pending_folder_picker_completion: None,
             credentials_ui: ui::credentials::CredentialsUi::new(),
             env_profiles_ui: ui::env_profiles::EnvProfilesUi::new(),
+            environment_ui: ui::environment::EnvironmentUi::default(),
             activity_ui: ui::activity::ActivityUi::new(),
             agent_terminal_ui: ui::agent_terminal::AgentTerminalUi::new(),
             fleet_ui: ui::fleet::FleetUi::default(),
@@ -24995,6 +25008,14 @@ impl App {
         self.env_project_rows_failed = false;
     }
 
+    /// 탐색이나 닫기에서만 초안과 이전 화면의 공개 요청을 정리한다.
+    fn reset_environment_view_state(&mut self) {
+        self.environment_ui
+            .reset(&mut self.env_profiles_ui, &mut self.credentials_ui);
+        self.pending_env_secret_reveal = None;
+        self.env_secret_generation = self.env_secret_generation.wrapping_add(1);
+    }
+
     fn invalidate_env_profile_ui(&mut self) {
         self.pending_settings_job = None;
         self.pending_env_secret_reveal = None;
@@ -25661,7 +25682,7 @@ impl App {
                     result,
                 } => match result {
                     Ok(revealed) => {
-                        let _ = self.credentials_ui.accept_revealed(revealed);
+                        let _ = self.credentials_ui.accept_requested_reveal(revealed);
                     }
                     Err(_) => self.credentials_ui.reject_reveal(&credential_id),
                 },
@@ -31758,6 +31779,7 @@ impl eframe::App for App {
         // 기본 노출로 상주하는 평문의 수명을 설정창 열림 동안으로 한정). remote_view가
         // self 일부를 immutable 차용하기 전에 처리한다.
         if self.settings_was_open && !self.settings_open {
+            self.reset_environment_view_state();
             self.invalidate_env_profile_ui();
         }
         self.settings_was_open = self.settings_open;
@@ -31771,9 +31793,8 @@ impl eframe::App for App {
         {
             let active_id = self.active.id.clone();
             let selected = if self.settings_category == ui::settings::Category::Environment {
-                resolve_settings_env_project_id(
-                    env_api_projects,
-                    None,
+                resolve_settings_env_project_during_refresh(
+                    env_api_projects_snapshot.as_deref(),
                     self.settings_workspace_id.as_deref(),
                     &active_id,
                 )
@@ -31897,9 +31918,8 @@ impl eframe::App for App {
         let is_environment = self.settings_category == ui::settings::Category::Environment;
         let settings_env_wsid = is_environment
             .then(|| {
-                resolve_settings_env_project_id(
-                    env_api_projects,
-                    None,
+                resolve_settings_env_project_during_refresh(
+                    env_api_projects_snapshot.as_deref(),
                     self.settings_workspace_id.as_deref(),
                     &wsid,
                 )
@@ -31971,6 +31991,7 @@ impl eframe::App for App {
         let mut connector_intent: Option<connector_contract::ConnectorIntent> = None;
         // .env 라이브 반영 토글(E5 ⑨) — 클로저 안에서 편집하고 밖에서 저장/적용.
         let mut env_live_reload_toggle = self.config.ui.env_live_reload;
+        let mut environment_classic_view = self.config.ui.environment_classic_view;
         // #3 워크스페이스 이름 편집 캡처 (클로저 밖에서 db/refresh 처리 — self 전체 &mut).
         let scrollback_view = self.scrollback_policy_view();
         // Relay 뷰모델 — web_view와 **독립**이다. 상태·에러·페어링·기기 목록이 각자 있다.
@@ -32089,9 +32110,33 @@ impl eframe::App for App {
                         style
                             .text_styles
                             .insert(egui::TextStyle::Small, egui::FontId::monospace(12.0));
-                        // 상세 surface=#242424, 프로젝트 rail은 renderer가 #1e1e1e로 덮는다.
+                        if !environment_classic_view {
+                            style
+                                .text_styles
+                                .insert(egui::TextStyle::Body, egui::FontId::proportional(14.0));
+                            style
+                                .text_styles
+                                .insert(egui::TextStyle::Button, egui::FontId::proportional(13.0));
+                            style
+                                .text_styles
+                                .insert(egui::TextStyle::Small, egui::FontId::proportional(12.0));
+                        }
+                        // 배경은 전환 버튼보다 먼저 그려 버튼을 덮지 않는다.
                         ui.painter()
                             .rect_filled(ui.clip_rect(), 0.0, ui.visuals().panel_fill);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.selectable_value(
+                                &mut environment_classic_view,
+                                false,
+                                text.t("env.modern.new_view", &[]),
+                            );
+                            ui.selectable_value(
+                                &mut environment_classic_view,
+                                true,
+                                text.t("env.modern.classic_view", &[]),
+                            );
+                        });
+                        // 프로젝트 rail은 전용 renderer가 배경을 그린다.
                         // T1: 우클릭 진입 시 감지한 세션 폴더 배너 — cwd가 어떤 워크스페이스에도
                         // 속하지 않으면 새 프로젝트 등록, 활성 워크스페이스가 경로 미설정이면
                         // 이 폴더 지정 CTA. 클릭 시 기존 ws_create/SetProjectPath 흐름 재사용.
@@ -32239,35 +32284,55 @@ impl eframe::App for App {
                                                     );
                                                 }
 
-                                                ui::env_profiles::render_application_status(
-                                                    ui,
-                                                    &application_view,
-                                                    &text,
-                                                );
-                                                if let Some(action) =
-                                                    self.env_profiles_ui.contents_compact(
+                                                if !environment_classic_view {
+                                                    let (next_env, next_credential) =
+                                                        self.environment_ui.contents(
+                                                            ui,
+                                                            &mut self.env_profiles_ui,
+                                                            &self.env_profiles_snapshot,
+                                                            &mut self.credentials_ui,
+                                                            &self.credentials_snapshot,
+                                                            &application_view,
+                                                            &text,
+                                                            &mut env_live_reload_toggle,
+                                                        );
+                                                    if next_env.is_some() {
+                                                        env_action = next_env;
+                                                    }
+                                                    credentials_intent = next_credential;
+                                                } else {
+                                                    ui::env_profiles::render_application_status(
                                                         ui,
-                                                        &self.env_profiles_snapshot,
-                                                        &text,
-                                                    )
-                                                {
-                                                    env_action = Some(action);
-                                                }
-
-                                                credentials_intent =
-                                                    self.credentials_ui.contents_compact(
-                                                        ui,
-                                                        &self.credentials_snapshot,
+                                                        &application_view,
                                                         &text,
                                                     );
+                                                    if let Some(action) =
+                                                        self.env_profiles_ui.contents_compact(
+                                                            ui,
+                                                            &self.env_profiles_snapshot,
+                                                            &text,
+                                                        )
+                                                    {
+                                                        env_action = Some(action);
+                                                    }
 
-                                                // .env 라이브 반영 토글(E5 ⑨ — 옵트인).
-                                                ui.add_space(14.0);
-                                                ui.checkbox(
-                                                    &mut env_live_reload_toggle,
-                                                    text.t("env.live_reload", &[]),
-                                                )
-                                                .on_hover_text(text.t("env.live_reload_hint", &[]));
+                                                    credentials_intent =
+                                                        self.credentials_ui.contents_compact(
+                                                            ui,
+                                                            &self.credentials_snapshot,
+                                                            &text,
+                                                        );
+
+                                                    // .env 라이브 반영 토글(E5 ⑨ — 옵트인).
+                                                    ui.add_space(14.0);
+                                                    ui.checkbox(
+                                                        &mut env_live_reload_toggle,
+                                                        text.t("env.live_reload", &[]),
+                                                    )
+                                                    .on_hover_text(
+                                                        text.t("env.live_reload_hint", &[]),
+                                                    );
+                                                }
                                             });
                                     });
                             });
@@ -32353,6 +32418,7 @@ impl eframe::App for App {
             )
         {
             self.settings_workspace_id = Some(selected);
+            self.reset_environment_view_state();
             self.invalidate_env_profile_ui();
         }
         if let Some(intent) = agents_intent {
@@ -32470,6 +32536,12 @@ impl eframe::App for App {
             }
         }
         // 관리/모니터 액션 처리 (클로저 밖 — self 전체 &mut 필요한 것들)
+        if environment_classic_view != self.config.ui.environment_classic_view {
+            self.config.ui.environment_classic_view = environment_classic_view;
+            self.pending_config_save = true;
+            self.reset_environment_view_state();
+            ui.ctx().request_repaint();
+        }
         if env_live_reload_toggle != self.config.ui.env_live_reload {
             self.config.ui.env_live_reload = env_live_reload_toggle;
             self.pending_config_save = true;
@@ -45125,6 +45197,44 @@ mod tests {
         assert!(
             closed.contains_key("closed"),
             "설정 선택은 sidebar 숨김 표식을 해제하지 않는다"
+        );
+    }
+
+    #[test]
+    fn environment_project_selection_survives_refresh() {
+        let rows: Vec<_> = ["active", "editing"]
+            .into_iter()
+            .map(|id| ui::env_project_list::EnvProjectRow {
+                id: id.into(),
+                name: id.into(),
+                alias: String::new(),
+                path: format!("/projects/{id}"),
+                path_missing: false,
+                env_count: 0,
+                key_count: 0,
+            })
+            .collect();
+        let mut selected = Some("editing".to_owned());
+        for snapshot in [Some(rows.as_slice()), None, Some(rows.as_slice())] {
+            selected = resolve_settings_env_project_during_refresh(
+                snapshot,
+                selected.as_deref(),
+                "active",
+            );
+            assert_eq!(selected.as_deref(), Some("editing"));
+        }
+        assert_eq!(
+            resolve_settings_env_project_during_refresh(Some(&[]), selected.as_deref(), "active"),
+            None
+        );
+        assert_eq!(
+            resolve_settings_env_project_during_refresh(
+                Some(&rows[..1]),
+                selected.as_deref(),
+                "active"
+            )
+            .as_deref(),
+            Some("active")
         );
     }
 

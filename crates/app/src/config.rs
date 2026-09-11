@@ -231,6 +231,9 @@ pub struct UiConfig {
     /// 변경을 이미 떠 있는 셸에도 다음 프롬프트부터 반영한다. OFF면 새 세션부터만.
     #[serde(default)]
     pub env_live_reload: bool,
+    /// 환경 및 API의 이전 화면으로 즉시 복귀하는 표시 설정이다.
+    #[serde(default)]
+    pub environment_classic_view: bool,
     /// 터미널 선택 → "에이전트로 보내기" 프리셋 프롬프트 (2026-07-17 시나리오 ①).
     /// 선택 텍스트 앞에 붙는 지시문 목록 — 비우면 "그대로 보내기"만 뜬다.
     /// 사용자가 config.toml에서 자유롭게 편집한다(설정 UI는 후속).
@@ -333,6 +336,7 @@ impl Default for UiConfig {
             auto_resume_agents: true,
             agent_status_hooks: true,
             env_live_reload: false,
+            environment_classic_view: false,
             agent_send_presets: default_agent_send_presets(),
             session_name_style: SessionNameStyle::default(),
             last_workspace_id: None,
@@ -690,6 +694,19 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn environment_view_config_roundtrip() {
+        let mut config: Config = toml::from_str("[ui]\ntheme = \"dark\"\n").unwrap();
+        assert!(!config.ui.environment_classic_view);
+        for classic in [true, false] {
+            config.ui.environment_classic_view = classic;
+            let saved = toml::to_string(&config).unwrap();
+            let restored: Config = toml::from_str(&saved).unwrap();
+            assert_eq!(restored.ui.environment_classic_view, classic);
+            assert_eq!(restored.ui.theme, config.ui.theme);
+        }
+    }
 
     #[test]
     fn ram_페이지_조회는_오류와_오버플로를_실패로_보존한다() {

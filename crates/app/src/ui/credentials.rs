@@ -1,4 +1,5 @@
 use crate::settings_snapshot::SnapshotLoadState;
+mod modern;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -337,6 +338,7 @@ pub struct CredentialsUi {
     kind: &'static str,
     secret_input: String,
     secret_input_overflowed: bool,
+    modern_secret_visible: bool,
     error: Option<CredentialsUiErrorCode>,
     show_add_form: bool,
     delete_confirm: Option<(String, String)>,
@@ -363,6 +365,7 @@ impl CredentialsUi {
             kind: "api_key",
             secret_input: String::new(),
             secret_input_overflowed: false,
+            modern_secret_visible: false,
             error: None,
             show_add_form: false,
             delete_confirm: None,
@@ -465,6 +468,17 @@ impl CredentialsUi {
         self.reveal_pending.remove(&credential_id);
         self.error = None;
         Ok(())
+    }
+
+    /// 현재 화면에서 요청한 공개 결과만 받아들인다.
+    pub fn accept_requested_reveal(
+        &mut self,
+        revealed: RevealedCredential,
+    ) -> Result<(), CredentialSensitiveError> {
+        if !self.reveal_pending.contains(&revealed.credential_id) {
+            return Ok(());
+        }
+        self.accept_revealed(revealed)
     }
 
     pub fn reject_reveal(&mut self, credential_id: &str) {
@@ -1195,6 +1209,27 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+
+    #[test]
+    fn modern_view_late_secret_reply_is_discarded() {
+        let mut view = CredentialsUi::new();
+        view.reveal_pending.insert("api-key".into());
+        view.clear_revealed_secrets();
+        view.accept_requested_reveal(
+            RevealedCredential::new("api-key", "fake-old-value".into()).unwrap(),
+        )
+        .unwrap();
+        assert!(!view.revealed.contains_key("api-key"));
+        view.reveal_pending.insert("api-key".into());
+        view.accept_requested_reveal(
+            RevealedCredential::new("api-key", "fake-current-value".into()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            view.revealed.get("api-key").unwrap().expose(),
+            "fake-current-value"
+        );
+    }
 
     #[test]
     fn environment_review_다른_프로젝트의_추가완료도_대기를_해제한다() {

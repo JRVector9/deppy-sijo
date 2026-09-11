@@ -16,6 +16,7 @@ pub mod diff_viewer;
 pub mod document;
 pub mod env_profiles;
 pub mod env_project_list;
+pub mod environment;
 pub mod file_drop;
 pub mod file_tree;
 pub mod fleet;

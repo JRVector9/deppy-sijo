@@ -2898,3 +2898,27 @@
 - 로컬 서버: 8765는 기존 서버가 사용 중이어서 종료하지 않고 8779로 변경했다. 실행 명령 `python3 -m http.server 8779 --bind 127.0.0.1 --directory /Users/jr/Desktop/projects/deppy-sijo-env-api-preview/docs/previews`. URL `http://127.0.0.1:8779/environment-api-20260911.html`, 터미널 바로가기 끝에 `#terminal`. 서버가 없어도 HTML 파일을 브라우저에서 직접 열 수 있다.
 - 시안 기본 URL을 브라우저로 열었다. 앱 코드는 수정하지 않았고 재빌드/재실행도 하지 않았다. 현재 남은 단계는 사용자 시안 피드백이다. 승인 전에 Rust 구현을 시작하지 않는다.
 - 다음 에이전트 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-env-api-preview`; `git status --short`; `tail -n 18 docs/CODEX_HANDOFF.md`; `open docs/previews/environment-api-20260911.html`. 시안 수정은 HTML과 설계 문서에 한정하고 앱 구현 요청과 구분한다.
+
+## 2026-09-11 승인한 설정 시안 구현 착수
+
+- 사용자: 1번 설정 시안 구현 승인, 언제든 기존 화면 복구 요구. 2번은 API 이름/키 처리 질문이며 앱 우클릭 구현 승인이 아니다.
+- branch/worktree: feat/environment-api-modern-view, /Users/jr/Desktop/projects/deppy-sijo-env-api-ui, main 9432d33 + 시안 기록 9c28f73. 계획 docs/superpowers/plans/2026-09-11-environment-api-modern-view.md.
+- 설계: 기존 renderer를 보존하고 ui.environment_classic_view 토글로 즉시 복귀한다. snapshot/secret/worker/DB 계약은 공유하며 새 렌더링만 별도 모듈에 둔다.
+- 2번 HTML은 API 이름/API 키 값과 환경변수 이름/값으로 메뉴를 나누었다. 실제 터미널 소스는 수정하지 않는다.
+- 앱 재빌드/재실행은 새 구현이 준비된 뒤 별도 승인 대상이다. UI 회귀 테스트는 실행하지 않으며 config persistence 단일 검증과 코드 게이트를 수행한다.
+- 구현 checkpoint: 새 EnvironmentUi가 전체/API/변수/파일 목록과 입력 패널을 표시한다. credentials/modern.rs와 env_profiles/modern.rs는 기존 초안·snapshot·intent를 재사용한다. 기존 contents_compact는 남아 있고 화면 상단 전환이 config로 저장된다. 좁은 영역은 입력 패널만 표시한다. 새 API는 이름 없는 연결을 강제하지 않고, 환경변수 이름을 비워 키만 보관하는 기존 기능도 유지한다.
+- config RED: 추가한 environment_view_config_roundtrip이 없는 필드 E0609로 실패했다(/tmp/deppy-env-modern-config-red.log). 필드 구현 뒤 같은 단일 테스트 1 PASS(/tmp/deppy-env-modern-config-green.log), 앱 test target compile 31.84초. UI 회귀/실제 앱 화면/패키징/재실행은 수행하지 않았다.
+- HTML 2번은 Chrome에서 API 이름 선택이 display-name에만 채워지고, API 키 선택이 비밀값 필드에 password로 채워짐을 확인했다. 시안 서버 8779의 preview worktree에는 design commit 9c28f73이 반영되어 있다.
+- 현재: cargo fmt 실행 후 실제 코드 diff를 codex review --uncommitted로 리뷰 중(/tmp/deppy-env-modern-review.log). 남은 것은 지적 반영, 커밋 직전 게이트, PR/일지, 사용자 실제 화면 확인용 빌드·재실행 승인이다.
+- 첫 게이트 PASS: fmt/diff, workspace clippy all-targets(28.94초), check-boundary, i18n-check(1210 literal calls/5 locale). 로그 /tmp/deppy-env-modern-{clippy,boundary,i18n}.log.
+- Codex 리뷰에서 Medium 두 건 확인: background snapshot invalidate가 입력 초안을 지우는 문제, 전환 전 secret reveal 응답이 다시 값을 노출하는 문제. background invalidate의 새 reset 호출은 제거하고 실제 닫기/프로젝트 선택/화면 전환만 reset_environment_view_state를 호출하게 했다. 이 경로는 env reveal generation도 올리고 pending 요청을 버린다.
+- 같은 원인의 API reveal도 보완: 실제 worker 완료가 accept_requested_reveal을 거치도록 하고, 현재 공개 요청이 없으면 응답을 버린다. modern_view_late_secret_reply_is_discarded는 fake 값만 사용하며 수정 전 1 FAIL로 재현했다(/tmp/deppy-env-modern-reveal-red.log). 수정 뒤 단일 재검증 실행 중으로 아직 GREEN을 확정하지 않는다.
+- 수정 중 painter 배경 위치 패치의 범용 앵커가 다른 horizontal 블록에 맞는 것을 rg/git diff로 바로 확인했고, 해당 변경을 제거한 뒤 environment_classic_view가 포함된 고유 문맥으로 다시 적용했다. 앱의 다른 화면 변경은 남아 있지 않다.
+- reveal 수정 GREEN: modern_view_late_secret_reply_is_discarded 1 PASS(compile 10.76초, /tmp/deppy-env-modern-reveal-green.log). 화면을 닫은 후 도착한 fake old value는 버리고 다시 명시적으로 요청한 fake current value만 표시하는 상태 경로를 검증했다. UI 렌더 테스트가 아니다.
+- 후속 게이트: app all-targets clippy PASS(23.54초), fmt/diff PASS, check-boundary PASS. i18n은 locale 변경 후 통과한 1210 literal calls/5개 결과를 재사용한다. 독립 xtask 바이너리를 바로 실행한 첫 시도는 CARGO_MANIFEST_DIR 없음으로 실패해 cargo run -p xtask -- check-boundary로 재실행했다.
+- 최종 코드 확인 범위: env reveal은 reset_environment_view_state에서 generation 갱신/대기 취소, API reveal은 실제 settings 완료의 accept_requested_reveal에서 요청 집합 확인. reset 호출은 닫기/프로젝트 선택/화면 전환에만 있으며 background invalidate에서 제거됐다. 후속 Codex 리뷰는 이 경로만 확인 중(/tmp/deppy-env-modern-review-followup.log).
+- 후속 Codex 리뷰는 늦은 reveal 수정은 확인했고, 목록 재조회 중 선택 B가 None→활성 A로 바뀌어 초안이 지워지는 추가 경로를 찾았다. resolve_settings_env_project_during_refresh가 미수신 목록(None)과 실제 빈 목록(Some([]))을 구분하도록 수정했고 snapshot 요청/화면 선택의 두 호출 모두 연결했다. 실제 목록에서 선택 프로젝트가 삭제된 경우만 폴백한다.
+- 선택 수명 테스트: environment_project_selection_survives_refresh는 수정 전 None 대 Some(editing)으로 1 FAIL(/tmp/deppy-env-modern-project-red.log), 수정 뒤 1 PASS(/tmp/deppy-env-modern-project-green.log, compile 16.14초). 실제 빈 목록과 선택 프로젝트 삭제도 포함한다. 이번 작업의 상태 검증은 config/reveal/selection 각 1개이며 앱 화면 검증과 구분한다.
+- 현재 수정 파일은 app.rs/config.rs, UI 모듈 선언과 기존 credentials/env_profiles 확장, 신규 environment.rs와 두 modern.rs, locale 5개, HTML 시안/계획/handoff다. DB migration, runtime 저장 계약, 실제 터미널 우클릭 코드는 변경하지 않았다.
+- 최종 소스 검증: 선택 보존 수정 뒤 app all-targets clippy 13.15초 PASS, fmt/diff/check-boundary PASS. 기존 workspace clippy와 locale 5개/i18n 결과도 앞 절과 같다. 리뷰에서 확인한 세 경로는 수정했으며 마지막 선택 보존 변경은 단일 회귀와 소스 호출부 확인으로 검증했다. 전체 앱 테스트나 실제 UI 화면 PASS를 주장하지 않는다.
+- 구현과 리뷰 수정은 완료되어 commit/push 및 main 대상 draft PR을 생성한다. 이후 사용자 승인이 필요한 것은 새 앱 패키징·재실행과 실제 화면 확인이다. 이전 main 앱은 이번 작업에서 종료하지 않았다.

@@ -1,6 +1,9 @@
 #[path = "workspace_env.rs"]
 mod workspace_env;
 pub use workspace_env::CredentialEnvBinding;
+#[path = "agent_attention.rs"]
+mod agent_attention;
+pub use agent_attention::{AgentAttentionEvent, AttentionEventKind};
 
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -845,6 +848,10 @@ CREATE INDEX idx_relay_devices_recency
        workspace_id TEXT PRIMARY KEY REFERENCES workspaces(id) ON DELETE CASCADE,
        files_json TEXT NOT NULL CHECK(typeof(files_json)='text' AND length(CAST(files_json AS BLOB)) <= 8192));",
 
+    // v42: 실행 상태와 별개인 질문/승인 요청 및 종료된 요청의 세대를 보관한다.
+    "ALTER TABLE agent_needs_input ADD COLUMN response_required INTEGER NOT NULL DEFAULT 0;
+     ALTER TABLE agent_needs_input ADD COLUMN attention_json TEXT;
+     ALTER TABLE agent_needs_input ADD COLUMN attention_revision INTEGER NOT NULL DEFAULT 0;",
 ];
 
 /// 옵션2: 저장된 에이전트 세션 한 행 — 재시작 복원 시 native resume에 쓴다.
@@ -1290,6 +1297,8 @@ pub struct AgentStateSnapshot {
     pub hook_sessions: Vec<HookSessionRow>,
     pub statuslines: Vec<StatuslineRow>,
     pub waiting_sessions: Vec<(String, Option<String>)>,
+    /// 질문 응답이 필요한 전역 세션. 승인만 남은 세션과 구분한다.
+    pub response_sessions: Vec<String>,
     pub turn_done_sessions: Vec<(String, i64)>,
     /// hook 기반 "작업 중" 세션 키(v32) — clear 이벤트(UserPromptSubmit/PreToolUse)가
     /// 기록. waiting처럼 전역(모든 워크스페이스)이며 2분 stale 창으로 자기치유된다.
@@ -1314,6 +1323,7 @@ impl std::fmt::Debug for AgentStateSnapshot {
             .field("hook_session_count", &self.hook_sessions.len())
             .field("statusline_count", &self.statuslines.len())
             .field("waiting_session_count", &self.waiting_sessions.len())
+            .field("response_session_count", &self.response_sessions.len())
             .field("turn_done_session_count", &self.turn_done_sessions.len())
             .field("working_session_count", &self.working_sessions.len())
             .field("agent_session_count", &self.agent_sessions.len())
@@ -1825,7 +1835,7 @@ const STATUSLINES_PREFIX_SELECT: &str = "SELECT session_key, effort, model, cont
 // HOOK_STATE_ROWS_MAX eviction이 정리한다. 창은 그 뒤의 마지막 상한일 뿐이다.
 const TURN_DONE_PREFIX_PREFLIGHT: &str = "WITH selected AS MATERIALIZED (
     SELECT rowid FROM agent_needs_input
-     WHERE turn_done = 1 AND updated_at > ?5 - 86400
+     WHERE turn_done = 1 AND (attention_json IS NOT NULL OR updated_at > ?5 - 86400)
        AND substr(CAST(session_key AS BLOB), 1, length(CAST(?1 AS BLOB))) = CAST(?1 AS BLOB)
      ORDER BY updated_at DESC, substr(CAST(session_key AS BLOB), 1, ?3), rowid LIMIT ?2
 ), sized AS MATERIALIZED (
@@ -1835,16 +1845,17 @@ const TURN_DONE_PREFIX_PREFLIGHT: &str = "WITH selected AS MATERIALIZED (
 SELECT COUNT(*), COALESCE(SUM(CASE WHEN
        typeof(session_key) != 'text' OR length(CAST(session_key AS BLOB)) NOT BETWEEN 1 AND ?3
     OR typeof(updated_at) != 'integer' OR typeof(turn_done) != 'integer' OR turn_done != 1
+    OR typeof(attention_revision) != 'integer' OR attention_revision < 0
     OR row_bytes > ?4 THEN 1 ELSE 0 END), 0),
     COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0) FROM sized";
-const TURN_DONE_PREFIX_SELECT: &str = "SELECT session_key, updated_at FROM agent_needs_input
-    WHERE turn_done = 1 AND updated_at > ?4 - 86400
+const TURN_DONE_PREFIX_SELECT: &str = "SELECT session_key, CASE WHEN attention_json IS NULL THEN updated_at ELSE attention_revision END FROM agent_needs_input
+    WHERE turn_done = 1 AND (attention_json IS NOT NULL OR updated_at > ?4 - 86400)
       AND substr(CAST(session_key AS BLOB), 1, length(CAST(?1 AS BLOB))) = CAST(?1 AS BLOB)
     ORDER BY updated_at DESC, substr(CAST(session_key AS BLOB), 1, ?3), rowid LIMIT ?2";
 
 const WAITING_SESSIONS_PREFLIGHT: &str = "WITH selected AS MATERIALIZED (
     SELECT rowid FROM agent_needs_input
-     WHERE waiting = 1 AND updated_at > ?5 - 86400
+     WHERE waiting = 1 AND (attention_json IS NOT NULL OR updated_at > ?5 - 86400)
      ORDER BY updated_at DESC, substr(CAST(session_key AS BLOB), 1, ?2), rowid LIMIT ?1
 ), sized AS MATERIALIZED (
     SELECT state.*, length(CAST(state.session_key AS BLOB))
@@ -1856,10 +1867,12 @@ SELECT COUNT(*), COALESCE(SUM(CASE WHEN
     OR typeof(message) NOT IN ('null', 'text')
        OR (typeof(message) = 'text' AND length(CAST(message AS BLOB)) > ?3)
     OR typeof(updated_at) != 'integer' OR typeof(waiting) != 'integer' OR waiting != 1
+    OR typeof(response_required) != 'integer' OR response_required NOT IN (0,1)
     OR row_bytes > ?4 THEN 1 ELSE 0 END), 0),
     COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0) FROM sized";
-const WAITING_SESSIONS_SELECT: &str = "SELECT session_key, message FROM agent_needs_input
-    WHERE waiting = 1 AND updated_at > ?3 - 86400
+const WAITING_SESSIONS_SELECT: &str =
+    "SELECT session_key, message, response_required FROM agent_needs_input
+    WHERE waiting = 1 AND (attention_json IS NOT NULL OR updated_at > ?3 - 86400)
     ORDER BY updated_at DESC, substr(CAST(session_key AS BLOB), 1, ?2), rowid LIMIT ?1";
 
 // 턴 완료(Stop) 세션 — 전역 스코프(warm turn_done 격차, 감사 발견). 기존
@@ -1868,7 +1881,7 @@ const WAITING_SESSIONS_SELECT: &str = "SELECT session_key, message FROM agent_ne
 // 에이전트의 "완료"도 보인다. stale 창은 waiting과 동일하게 24시간(위 주석).
 const TURN_DONE_SESSIONS_PREFLIGHT: &str = "WITH selected AS MATERIALIZED (
     SELECT rowid FROM agent_needs_input
-     WHERE turn_done = 1 AND updated_at > ?4 - 86400
+     WHERE turn_done = 1 AND (attention_json IS NOT NULL OR updated_at > ?4 - 86400)
      ORDER BY updated_at DESC, substr(CAST(session_key AS BLOB), 1, ?2), rowid LIMIT ?1
 ), sized AS MATERIALIZED (
     SELECT state.*, length(CAST(state.session_key AS BLOB)) AS row_bytes
@@ -1877,10 +1890,11 @@ const TURN_DONE_SESSIONS_PREFLIGHT: &str = "WITH selected AS MATERIALIZED (
 SELECT COUNT(*), COALESCE(SUM(CASE WHEN
        typeof(session_key) != 'text' OR length(CAST(session_key AS BLOB)) NOT BETWEEN 1 AND ?2
     OR typeof(updated_at) != 'integer' OR typeof(turn_done) != 'integer' OR turn_done != 1
+    OR typeof(attention_revision) != 'integer' OR attention_revision < 0
     OR row_bytes > ?3 THEN 1 ELSE 0 END), 0),
     COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0) FROM sized";
-const TURN_DONE_SESSIONS_SELECT: &str = "SELECT session_key, updated_at FROM agent_needs_input
-    WHERE turn_done = 1 AND updated_at > ?3 - 86400
+const TURN_DONE_SESSIONS_SELECT: &str = "SELECT session_key, CASE WHEN attention_json IS NULL THEN updated_at ELSE attention_revision END FROM agent_needs_input
+    WHERE turn_done = 1 AND (attention_json IS NOT NULL OR updated_at > ?3 - 86400)
     ORDER BY updated_at DESC, substr(CAST(session_key AS BLOB), 1, ?2), rowid LIMIT ?1";
 
 // hook 기반 "작업 중"(v32). stale 창은 2분 — Stop이 유실되면(Ctrl-C 등 훅 미발화)
@@ -2803,6 +2817,10 @@ fn agent_state_snapshot_retained_bytes(
     for (session_key, message) in &snapshot.waiting_sessions {
         checked_agent_state_string_capacity(&mut total, session_key)?;
         checked_agent_state_optional_string_capacity(&mut total, message)?;
+    }
+    checked_agent_state_vec_allocation(&mut total, &snapshot.response_sessions)?;
+    for key in &snapshot.response_sessions {
+        checked_agent_state_string_capacity(&mut total, key)?;
     }
     checked_agent_state_vec_allocation(&mut total, &snapshot.turn_done_sessions)?;
     for (session_key, _) in &snapshot.turn_done_sessions {
@@ -7231,7 +7249,7 @@ impl Db {
             [],
         )?;
         self.conn.execute(
-            "DELETE FROM agent_needs_input WHERE updated_at < strftime('%s','now') - 604800",
+            "DELETE FROM agent_needs_input WHERE updated_at < strftime('%s','now') - 604800 AND NOT (attention_json IS NOT NULL AND (waiting=1 OR turn_done=1))",
             [],
         )?;
         self.conn.execute(
@@ -7434,7 +7452,7 @@ impl Db {
         let mut stmt = self.conn.prepare(
             "SELECT session_key, message FROM agent_needs_input
              WHERE waiting = 1
-               AND updated_at > CAST(strftime('%s','now') AS INTEGER) - 86400",
+               AND (attention_json IS NOT NULL OR updated_at > CAST(strftime('%s','now') AS INTEGER) - 86400)",
         )?;
         let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -7522,7 +7540,7 @@ impl Db {
             .map_err(|_| anyhow::anyhow!(BOUNDED_WRITE_FAILED))?;
         tx.execute(
             "UPDATE agent_needs_input SET turn_done = 0
-                 WHERE session_key = ?1 AND updated_at <= ?2",
+                 WHERE session_key = ?1 AND (CASE WHEN attention_json IS NULL THEN updated_at ELSE attention_revision END) <= ?2",
             (session_key, seen_at),
         )
         .map_err(|_| anyhow::anyhow!(BOUNDED_WRITE_FAILED))?;
@@ -7656,12 +7674,12 @@ impl Db {
     }
 
     /// 턴 완료(미확인) 세션 (key, updated_at) 목록. waiting과 같은 24시간 stale 컷오프.
-    /// updated_at은 소비 시 조건부 clear의 세대 기준으로 쓴다.
+    /// 두 번째 값은 조건부 clear의 세대 토큰이며 표시용 시각이 아니다.
     pub fn list_turn_done_sessions(&self) -> anyhow::Result<Vec<(String, i64)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT session_key, updated_at FROM agent_needs_input
+            "SELECT session_key, CASE WHEN attention_json IS NULL THEN updated_at ELSE attention_revision END FROM agent_needs_input
              WHERE turn_done = 1
-               AND updated_at > CAST(strftime('%s','now') AS INTEGER) - 86400",
+               AND (attention_json IS NOT NULL OR updated_at > CAST(strftime('%s','now') AS INTEGER) - 86400)",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
@@ -7849,7 +7867,7 @@ impl Db {
         for clear in &job.turn_done_clears {
             tx.execute(
                 "UPDATE agent_needs_input SET turn_done = 0
-                  WHERE session_key = ?1 AND updated_at <= ?2",
+                  WHERE session_key = ?1 AND (CASE WHEN attention_json IS NULL THEN updated_at ELSE attention_revision END) <= ?2",
                 rusqlite::params![clear.session_key, clear.seen_at],
             )
             .map_err(|_| anyhow::anyhow!(AGENT_STATE_PERSIST_FAILED))?;
@@ -8398,6 +8416,7 @@ impl Db {
         } else {
             Vec::new()
         };
+        let mut response_sessions = Vec::new();
         let waiting_sessions = if let Some((waiting_probe, _, _, sql_limit, snapshot_epoch)) =
             &attention_probes
         {
@@ -8416,6 +8435,11 @@ impl Db {
                 .next()
                 .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?
             {
+                if bounded_integer(row, 2)? == 1 {
+                    response_sessions.push(
+                        bounded_required_text(row, 0, BOUNDED_ID_BYTES_MAX, true, true)?.to_owned(),
+                    );
+                }
                 result.push((
                     bounded_required_text(row, 0, BOUNDED_ID_BYTES_MAX, true, true)?.to_owned(),
                     bounded_optional_text(row, 1, BOUNDED_MESSAGE_BYTES_MAX)?.map(str::to_owned),
@@ -8700,6 +8724,7 @@ impl Db {
             hook_sessions,
             statuslines,
             waiting_sessions,
+            response_sessions,
             turn_done_sessions,
             working_sessions,
             agent_sessions,
@@ -15883,6 +15908,7 @@ mod tests {
                 context_pct: Some(99),
             }],
             waiting_sessions: vec![(marker.to_owned(), Some(marker.to_owned()))],
+            response_sessions: vec![marker.to_owned()],
             turn_done_sessions: vec![(marker.to_owned(), i64::MAX)],
             working_sessions: vec![marker.to_owned()],
             agent_sessions: reconcile.desired_bindings.clone(),

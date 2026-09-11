@@ -1454,7 +1454,8 @@ fn group_count(summary: FleetSummary, group: SessionGroup) -> usize {
 
 fn state_label(state: AgentVisualState, catalog: &i18n::Catalog) -> String {
     let key = match state {
-        AgentVisualState::Waiting => "fleet.state.waiting",
+        AgentVisualState::Waiting => "status.needs_approval",
+        AgentVisualState::NeedsResponse => "status.waiting",
         AgentVisualState::Error => "fleet.state.error",
         AgentVisualState::Complete => "fleet.state.done",
         AgentVisualState::Active => "fleet.state.working",

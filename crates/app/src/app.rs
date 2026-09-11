@@ -9322,10 +9322,24 @@ impl web_remote::repository::WebRemoteRepository for AppWebRemoteRepository {
 /// 세션 알림(완료/입력대기) 주목 상태 — 레일 폭(6px)·1회 펄스 추적 (2026-07-07).
 struct SessionAlert {
     status: runtime::SessionStatus,
+    completion: Option<i64>,
     /// 사용자가 확인(포커스)했는가 — false면 레일 6px 유지.
     seen: bool,
     /// 알림 도착 시 이미 포커스 중이던 pane의 1회 펄스 시작 시각.
     pulse_started: Option<std::time::Instant>,
+}
+
+impl SessionAlert {
+    fn observe(&mut self, status: runtime::SessionStatus, completion: Option<i64>, viewed: bool) {
+        // 같은 Done 표시 사이에 새 턴이 끝나도 이전 읽음 이력을 재사용하지 않는다.
+        if self.status != status || completion.is_some_and(|token| self.completion != Some(token)) {
+            self.status = status;
+            self.completion = completion;
+            self.seen = false;
+            self.pulse_started = viewed.then(std::time::Instant::now);
+        }
+        self.seen |= viewed;
+    }
 }
 
 /// (env key, 값 또는 credential_id) 쌍 목록 — SetSessionDefaultEnv용.
@@ -9909,6 +9923,8 @@ pub struct App {
     archived_agent_resume: std::collections::HashMap<String, storage::ArchivedAgentResumeRow>,
     /// hook이 보고한 입력 대기(needsInput) 세션들 — DB에서 주기적으로 읽어 레일 주황 반영.
     agent_needs_input: std::collections::HashSet<runtime::SessionId>,
+    agent_responses: std::collections::HashSet<runtime::SessionId>,
+    global_responses: std::collections::HashSet<(String, runtime::SessionId)>,
     /// v3.9 N3: 전역(모든 워크스페이스) 입력 대기 — 벨 팝오버 PTY 카드의 소스.
     /// (workspace_id, SessionId, hook이 보고한 대기 사유 문구). 제목/미리보기 등 나머지
     /// 표시 데이터는 팝오버가 열렸을 때만 지연 해석한다(idle 비용 0).
@@ -14643,6 +14659,8 @@ impl App {
             persisted_agents: std::collections::HashMap::new(),
             archived_agent_resume: std::collections::HashMap::new(),
             agent_needs_input: std::collections::HashSet::new(),
+            agent_responses: std::collections::HashSet::new(),
+            global_responses: std::collections::HashSet::new(),
             global_waiting: Vec::new(),
             blocked_since: std::collections::HashMap::new(),
             structured_blocked_since: std::collections::HashMap::new(),
@@ -15908,6 +15926,19 @@ impl App {
                     .iter()
                     .filter_map(|(key, _)| session_id(key))
                     .collect();
+                self.agent_responses = snapshot
+                    .response_sessions
+                    .iter()
+                    .filter_map(|key| session_id(key))
+                    .collect();
+                self.global_responses = snapshot
+                    .response_sessions
+                    .iter()
+                    .filter_map(|key| {
+                        let (ws, sid) = ui::inbox_waiting::parse_session_key(key)?;
+                        self.attention_session_alive(&ws, sid).then_some((ws, sid))
+                    })
+                    .collect();
                 self.global_waiting = snapshot
                     .waiting_sessions
                     .iter()
@@ -16927,39 +16958,37 @@ impl App {
     /// 완료/입력대기 주목(attention) 추적 — 세션 엔트리에 attention/pulse를 채운다.
     /// 규칙(2026-07-07): 알림 발생 시 그 pane이 비포커스면 확인할 때까지 레일 6px 유지,
     /// 이미 포커스 중이면 6px 대신 1회 펄스. 완료는 확인 시 소비(DB clear → 유휴로 복귀).
-    fn update_session_alerts(&mut self, entries: &mut [ui::file_tree::SessionEntry]) {
+    fn update_session_alerts(
+        &mut self,
+        entries: &mut [ui::file_tree::SessionEntry],
+        app_focused: bool,
+    ) {
         use runtime::SessionStatus as S;
         const PULSE_SECS: f32 = 0.9;
         let mut any_pulse = false;
         for entry in entries.iter_mut() {
             let Some(sid) = entry.session else { continue };
+            let viewed = entry.focused && app_focused;
             let alert_status = match entry.status {
-                Some(s @ (S::Done | S::NeedsApproval)) => Some(s),
+                Some(s @ (S::Done | S::Waiting | S::NeedsApproval)) => Some(s),
                 _ => None,
             };
             match alert_status {
                 Some(status) => {
-                    let is_new = self
+                    let completion = (status == S::Done)
+                        .then(|| self.agent_turn_done.get(&sid).copied())
+                        .flatten();
+                    let alert = self
                         .session_alerts
-                        .get(&sid)
-                        .is_none_or(|a| a.status != status);
-                    if is_new {
-                        // 새 알림: 보고 있으면 펄스 1회, 아니면 미확인(6px)으로 시작.
-                        self.session_alerts.insert(
-                            sid,
-                            SessionAlert {
-                                status,
-                                seen: entry.focused,
-                                pulse_started: entry.focused.then(std::time::Instant::now),
-                            },
-                        );
-                    }
-                    let alert = self.session_alerts.get_mut(&sid).expect("방금 삽입/존재");
-                    // 확인: 포커스가 오면 seen 처리. 완료는 소비해 유휴로 되돌린다.
-                    if entry.focused && !alert.seen {
-                        alert.seen = true;
-                    }
-                    if alert.seen
+                        .entry(sid)
+                        .or_insert_with(|| SessionAlert {
+                            status,
+                            completion,
+                            seen: false,
+                            pulse_started: viewed.then(std::time::Instant::now),
+                        });
+                    alert.observe(status, completion, viewed);
+                    if viewed
                         && status == S::Done
                         && let Some(&seen_at) = self.agent_turn_done.get(&sid)
                         && self.pending_turn_done_clear.is_none()
@@ -19654,6 +19683,7 @@ impl App {
                             &self.i18n,
                             &empty_activity,
                             &empty_needs_input,
+                            &empty_needs_input,
                             &empty_turn_done,
                             &empty_working,
                         )
@@ -21740,6 +21770,12 @@ impl App {
             .iter()
             .filter(|(ws, _, _)| ws == target_id)
             .map(|(_, session, _)| *session)
+            .collect();
+        self.agent_responses = self
+            .global_responses
+            .iter()
+            .filter(|(ws, _)| ws == target_id)
+            .map(|(_, sid)| *sid)
             .collect();
         self.agent_turn_done = self
             .global_turn_done
@@ -26908,6 +26944,7 @@ impl App {
                         &self.i18n,
                         &self.agent_activity,
                         &self.agent_needs_input,
+                        &self.agent_responses,
                         &self.agent_turn_done,
                         &self.agent_working,
                     );
@@ -27396,6 +27433,12 @@ impl App {
             let Some(runtime) = runtime else {
                 continue; // idle 워크스페이스 — 라이브 세션 없음.
             };
+            let responses: std::collections::HashSet<_> = self
+                .global_responses
+                .iter()
+                .filter(|(ws, _)| ws == &workspace.id)
+                .map(|(_, sid)| *sid)
+                .collect();
             let needs_input: std::collections::HashSet<runtime::SessionId> = self
                 .global_waiting
                 .iter()
@@ -27423,6 +27466,7 @@ impl App {
                     text,
                     &self.agent_activity,
                     &self.agent_needs_input,
+                    &self.agent_responses,
                     &self.agent_turn_done,
                     &self.agent_working,
                 )
@@ -27431,6 +27475,7 @@ impl App {
                     text,
                     &empty_activity,
                     &needs_input,
+                    &responses,
                     &turn_done,
                     &working,
                 )
@@ -27476,13 +27521,16 @@ impl App {
                         .pty_followup
                         .get(&(workspace.id.clone(), session))
                         .map(|queued| queued.prompt.clone()),
-                    blocked_since: (state == AgentVisualState::Waiting)
-                        .then(|| {
-                            self.blocked_since
-                                .get(&(workspace.id.clone(), session))
-                                .copied()
-                        })
-                        .flatten(),
+                    blocked_since: matches!(
+                        state,
+                        AgentVisualState::Waiting | AgentVisualState::NeedsResponse
+                    )
+                    .then(|| {
+                        self.blocked_since
+                            .get(&(workspace.id.clone(), session))
+                            .copied()
+                    })
+                    .flatten(),
                     workspace_id: workspace.id.clone(),
                     workspace_name: workspace_name.clone(),
                     target: crate::fleet::FleetTarget::Pty {
@@ -27524,9 +27572,13 @@ impl App {
                 None => format!("[{badge}] Codex"),
             });
             // 승인 대기 중일 때만 막힌 시각을 붙인다 — 다른 상태는 나를 막고 있지 않다.
-            let blocked_since = (row.state == crate::agent_surface::AgentVisualState::Waiting)
-                .then(|| self.structured_blocked_since.get(&row.session_id).copied())
-                .flatten();
+            let blocked_since = matches!(
+                row.state,
+                crate::agent_surface::AgentVisualState::Waiting
+                    | crate::agent_surface::AgentVisualState::NeedsResponse
+            )
+            .then(|| self.structured_blocked_since.get(&row.session_id).copied())
+            .flatten();
             out.push(crate::fleet::FleetSession {
                 active_workspace: row.workspace_id.as_deref() == Some(self.active.id.as_str()),
                 workspace_id,
@@ -29364,6 +29416,7 @@ impl eframe::App for App {
             &text,
             &self.agent_activity,
             &self.agent_needs_input,
+            &self.agent_responses,
             &self.agent_turn_done,
             &self.agent_working,
         );
@@ -29388,7 +29441,7 @@ impl eframe::App for App {
         }
         // 완료/입력대기 주목(6px 레일·펄스) 갱신 + 확인 시 완료 소비. Agents 패널도
         // 같은 상태 원천을 사용하므로 사이드바가 꺼져 있어도 계산한다.
-        self.update_session_alerts(&mut terminal_sessions);
+        self.update_session_alerts(&mut terminal_sessions, ui.ctx().input(|i| i.focused));
         let pty_agent_surfaces = self.pty_agent_surfaces(&terminal_sessions);
         // 단축키 처리(`handle_configured_shortcut`)는 이 지점보다 **앞서** 돈다. 그때
         // `agent_sessions_ui.pty_surfaces`를 읽으면 패널이 아직 렌더되지 않은 프레임에서
@@ -29506,6 +29559,12 @@ impl eframe::App for App {
                 continue;
             };
             let runtime_instance = warm_runtime.runtime_instance;
+            let responses: std::collections::HashSet<_> = self
+                .global_responses
+                .iter()
+                .filter(|(ws, _)| ws == &workspace.id)
+                .map(|(_, sid)| *sid)
+                .collect();
             let needs_input: std::collections::HashSet<_> = self
                 .global_waiting
                 .iter()
@@ -29531,6 +29590,7 @@ impl eframe::App for App {
                 &text,
                 &no_activity,
                 &needs_input,
+                &responses,
                 &turn_done,
                 &working,
             );
@@ -30282,7 +30342,13 @@ impl eframe::App for App {
             self.agent_sessions_ui
                 .fleet_rows()
                 .into_iter()
-                .filter(|row| row.state == crate::agent_surface::AgentVisualState::Waiting)
+                .filter(|row| {
+                    matches!(
+                        row.state,
+                        crate::agent_surface::AgentVisualState::Waiting
+                            | crate::agent_surface::AgentVisualState::NeedsResponse
+                    )
+                })
                 .filter_map(|row| {
                     let blocked_since = self
                         .structured_blocked_since
@@ -33494,18 +33560,8 @@ fn shortcut_targets_primary_terminal(action: crate::shortcuts::ShortcutAction) -
 /// 사이드바 표시와 PTY 표면이 **같은 함수**를 쓰게 묶어둔 이유는, 한쪽만 병합하면
 /// 화면에는 강도가 보이는데 단축키는 "현재 강도를 모른다"며 아무것도 안 하는 상태가
 /// 되기 때문이다 (2026-08-02 실제 증상).
-/// 지금 이 표면에 슬래시 명령을 써 넣어도 되는가.
-///
-/// `AgentVisualState`만 보면 안 된다 — `Waiting`이 두 가지를 뭉개기 때문이다:
-/// **입력 대기**(프롬프트에서 사용자를 기다림 → 보내기 딱 좋은 순간)와
-/// **승인 대기**(질문 중 → 보내면 그 텍스트가 답으로 들어감)가 같은 값이다.
-/// 2026-08-02에 이걸 구분하지 않아 "작업 중"으로 뭉뚱그려 막는 바람에, 프롬프트에서
-/// 놀고 있는 claude에 강도 단축키가 전혀 반응하지 않았다.
-/// hook needsInput의 문구로 유휴 프롬프트와 승인 프롬프트를 가른다.
-///
-/// Claude Code의 Notification hook은 두 경우 모두에 오고 `merge_agent_status`는 둘 다
-/// `NeedsApproval`로 접는다. 위 주석이 말하는 두 가지가 여기서 다시 뭉개지는 것이다.
-/// 아는 문구만 통과시켜(화이트리스트) 모르는 문구는 막는 쪽으로 닫힌다.
+/// 기존 훅이 NeedsApproval로 기록한 유휴 프롬프트만 문구로 구분한다.
+/// 새 관찰기의 질문·승인에는 이 문구가 없으므로 임의 명령을 답으로 보내지 않는다.
 fn waiting_is_idle_prompt(message: Option<&str>) -> bool {
     const IDLE_PROMPT_MARKERS: &[&str] = &["waiting for your input"];
     message.is_some_and(|message| {
@@ -33523,7 +33579,8 @@ fn slash_input_is_safe(
     use runtime::SessionStatus as Status;
     match surface.pty_status {
         // 원본이 있으면 그게 정확하다.
-        Some(Status::Idle | Status::Waiting | Status::Done) => true,
+        Some(Status::Idle | Status::Done) => true,
+        Some(Status::Waiting) => false,
         // 승인 대기는 문구로 갈린다 — hook이 보고한 유휴 프롬프트면 오히려 최적기다.
         Some(Status::NeedsApproval) => waiting_is_idle_prompt(waiting_message),
         Some(Status::Running | Status::Error) => false,
@@ -34090,6 +34147,21 @@ fn pty_shortcut_missing_feedback(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn agent_attention_새_완료는_이전_포커스로_읽음_처리하지_않는다() {
+        let mut alert = SessionAlert {
+            status: runtime::SessionStatus::Done,
+            completion: Some(1),
+            seen: false,
+            pulse_started: None,
+        };
+        alert.observe(runtime::SessionStatus::Done, Some(1), true);
+        assert!(alert.seen);
+        alert.observe(runtime::SessionStatus::Done, Some(2), false);
+        assert!(!alert.seen);
+        alert.observe(runtime::SessionStatus::Done, Some(2), true);
+        assert!(alert.seen);
+    }
     #[test]
     fn tls_scrollback_policy는_서버_소유_worker의_실제_ack을_반영한다() {
         use crate::scrollback_policy::{Delivery, Status};
@@ -41235,7 +41307,7 @@ mod tests {
     /// 시각 상태만 보고 막으면 프롬프트에서 놀고 있는 에이전트에 단축키가 전혀
     /// 반응하지 않고(2026-08-02 실증), 허용하면 승인 질문에 엉뚱한 답이 들어간다.
     #[test]
-    fn 입력_대기는_보내고_승인_대기는_막는다() {
+    fn 응답과_승인_대기에는_슬래시_명령을_보내지_않는다() {
         use crate::agent_surface::{
             AgentProvider, AgentSurfaceId, AgentSurfaceSnapshot, AgentTransport, AgentVisualState,
         };
@@ -41257,12 +41329,12 @@ mod tests {
             pty_status: status,
         };
 
-        // 둘 다 시각 상태로는 Waiting이지만 결과가 반대여야 한다.
-        assert_eq!(
+        // 질문과 승인은 구분해서 표시하며 둘 다 임의 명령을 답으로 보내지 않는다.
+        assert_ne!(
             surface(Some(Status::Waiting)).state,
             surface(Some(Status::NeedsApproval)).state
         );
-        assert!(slash_input_is_safe(&surface(Some(Status::Waiting)), None));
+        assert!(!slash_input_is_safe(&surface(Some(Status::Waiting)), None));
         // 사유를 모르면 승인으로 보고 막는다.
         assert!(!slash_input_is_safe(
             &surface(Some(Status::NeedsApproval)),

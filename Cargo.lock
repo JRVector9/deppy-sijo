@@ -4838,6 +4838,7 @@ dependencies = [
  "persist",
  "rusqlite",
  "secret",
+ "serde",
  "serde_json",
  "sha2 0.11.0",
  "storage-core",

@@ -67,6 +67,7 @@ pub enum AgentVisualState {
     Idle,
     Active,
     Waiting,
+    NeedsResponse,
     Complete,
     Error,
 }
@@ -80,7 +81,8 @@ impl AgentVisualState {
             None => Self::Off,
             Some(Status::Idle) => Self::Idle,
             Some(Status::Running) => Self::Active,
-            Some(Status::Waiting | Status::NeedsApproval) => Self::Waiting,
+            Some(Status::Waiting) => Self::NeedsResponse,
+            Some(Status::NeedsApproval) => Self::Waiting,
             Some(Status::Done) => Self::Complete,
             Some(Status::Error) => Self::Error,
         }
@@ -200,10 +202,8 @@ pub struct AgentSurfaceSnapshot {
     pub effort: Option<String>,
     pub context_pct: Option<u8>,
     pub state: AgentVisualState,
-    /// PTY 원본 상태. `state`는 `Waiting`(프롬프트에서 사용자 입력 대기)과
-    /// `NeedsApproval`(승인 질문 중)을 하나로 뭉개는데, 슬래시 명령을 보내도 되는지는
-    /// 이 둘이 정반대다 — 전자는 보내기 딱 좋은 순간이고, 후자에 보내면 그 텍스트가
-    /// **승인 질문의 답으로** 들어간다. 구조화 세션은 `None`이다.
+    /// PTY 원본 상태. 질문과 승인 중에는 슬래시 명령이 답으로 들어가지 않도록 막는다.
+    /// 구조화 세션은 `None`이다.
     pub pty_status: Option<runtime::SessionStatus>,
 }
 
@@ -224,7 +224,7 @@ mod tests {
             (None, AgentVisualState::Off),
             (Some(Status::Idle), AgentVisualState::Idle),
             (Some(Status::Running), AgentVisualState::Active),
-            (Some(Status::Waiting), AgentVisualState::Waiting),
+            (Some(Status::Waiting), AgentVisualState::NeedsResponse),
             (Some(Status::NeedsApproval), AgentVisualState::Waiting),
             (Some(Status::Done), AgentVisualState::Complete),
             (Some(Status::Error), AgentVisualState::Error),

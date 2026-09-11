@@ -161,7 +161,7 @@ impl SessionGroup {
 
 pub fn session_group(state: AgentVisualState) -> SessionGroup {
     match state {
-        AgentVisualState::Waiting => SessionGroup::Blocked,
+        AgentVisualState::Waiting | AgentVisualState::NeedsResponse => SessionGroup::Blocked,
         AgentVisualState::Active | AgentVisualState::Idle => SessionGroup::Active,
         AgentVisualState::Error => SessionGroup::Errored,
         AgentVisualState::Complete | AgentVisualState::Off => SessionGroup::Finished,

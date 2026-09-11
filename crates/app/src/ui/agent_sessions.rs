@@ -2797,7 +2797,9 @@ impl AgentSessionsUi {
             }
             if matches!(
                 surface.state,
-                AgentVisualState::Active | AgentVisualState::Waiting
+                AgentVisualState::Active
+                    | AgentVisualState::Waiting
+                    | AgentVisualState::NeedsResponse
             ) && ui
                 .button(catalog.t("agent_sessions.interrupt_ctrl_c", &[]))
                 .clicked()

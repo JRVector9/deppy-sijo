@@ -2116,7 +2116,7 @@ impl Worker {
                         Some(pty::PtyInputEnqueueResult::Accepted) => {
                             // 사용자 입력 = 화면 프롬프트에 대한 응답 신호 (status detector)
                             if let Some(detector) = self.detectors.get_mut(&session) {
-                                detector.on_input();
+                                detector.on_user_input(&bytes);
                             }
                         }
                         Some(pty::PtyInputEnqueueResult::Backpressured { pressure }) => {

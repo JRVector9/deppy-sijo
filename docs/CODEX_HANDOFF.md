@@ -2883,3 +2883,151 @@
 - merge 직후 main에는 Build and test/Dependency security만 실행됐고 배포 실행은 없다.
   `relay-release.yml`과 `relay-shell-release.yml`은 `workflow_dispatch` 전용이다. 현재 요청의
   두 PR main 반영, 최종 빌드, 재실행은 모두 완료했다.
+
+## 2026-09-11 Grok·Claude·Codex 응답 대기와 유휴 분류 조사
+
+- 현재 목표: 입력·선택을 기다리는 에이전트가 유휴로 표시돼 프로젝트를 놓치는 원인을
+  세 CLI 모두 확인한다. 이번 요청은 조사이며 앱 동작 변경은 아직 하지 않았다.
+- 조사 기준 main `9432d33`. 독립 worktree
+  `/Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`, branch
+  `investigate/agent-wait-classification`. 기존 PR #188 및 Relay 브랜치를 수정하지 않았다.
+- 완료: 세 provider parser, 훅 생성/수신, 상태 병합, 비활성 workspace 표시 경로, PTY 입력
+  소비와 idle 타이머를 추적했다. 설치 버전 Claude 2.1.268/Codex 0.154.0/Grok 1.0.25,
+  로컬 훅 이벤트 집합과 읽기 전용 DB 집계, 공식 문서/Codex 동일 태그 소스를 확인했다.
+- 발견: 일반 문장 질문 종료는 세 파서 모두 Idle. Claude 질문 도구는 Working으로 읽고
+  최신 needs_input도 Working에 가려질 수 있다. Codex 질문 전용 처리가 없고 Grok의
+  Deppy 훅은 미연결이다. 비활성 workspace에는 transcript activity를 전달하지 않는다.
+  화면 마지막 5줄만 검사하며 모든 키 입력이 프롬프트를 소비해 10초 후 Idle로 갈 수 있다.
+- 설계 방향: 활동과 attention 사유 분리, 질문 ID/세대에 따른 해제, provider별 질문/승인
+  이벤트 정규화, workspace 전환 후 대기 보존. 자유 문장 질문은 의미를 확정하지 않고
+  새 최종 응답의 `완료·확인 필요` 표시로 보완한다. 상세 근거와 경계는
+  `docs/investigations/2026-09-11-agent-awaiting-response.md`.
+- 수정 파일은 조사 문서와 이 handoff뿐이다. 앱 코드, CLI 설정, 운영 DB, 실행 앱을
+  변경하지 않았다. 앱 빌드·재실행 승인도 이번 요청에서 받지 않았다.
+- 검증: main 소스를 사용하는 독립 Rust 진단을 rustc로 컴파일(exit 0)한 뒤 합성 fixture
+  9개 분류 조건을 재현(assertion 성공, exit 0). 실제 CLI 대화/화면 및 전체 테스트 PASS가
+  아니다. 로그 `/tmp/deppy-agent-wait-audit-20260911/{compile,reproduction}.log`.
+- 실패/접근 수정: Grok 실행 파일을 텍스트로 읽으려다 UTF-8 오류가 나 네이티브 바이너리임을
+  확인했다. 공개 Codex 소스 일부 옛 경로는 404였으며 같은 태그의 실제 도구 구현과
+  registry를 확인했다. 큰 병렬 소스 출력은 잘려 좁은 범위로 다시 읽었다.
+- 잔여: 수정 요청 후 provider 실제 질문/응답/취소 이벤트를 관찰하고 상태 모델 및
+  회귀 테스트를 먼저 구현한다. Codex TUI 자체 선택창, 비동기 질문과 다른 작업 공존,
+  Grok 질문 timeout/취소를 포함한다. UI 검증은 사용자 승인 후 앱 빌드·재실행으로 한다.
+- 다음 명령:
+  `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`
+  `git status --short`
+  `cat docs/investigations/2026-09-11-agent-awaiting-response.md`
+  `/tmp/deppy-agent-wait-audit-20260911/audit`
+
+### 구현 진행 — 사용자 승인 후
+
+- 최신 요청은 제안대로 구현하고 코드 리뷰 후 보고하는 것이다. 조사 worktree에서 계속하며
+  앱 패키징·재실행은 하지 않는다. 계획은 `docs/superpowers/plans/2026-09-11-agent-attention.md`.
+- 완료된 첫 검증: storage 요청 수명/이전 세션/병렬 요청 테스트 3 PASS, session 방향키·작성
+  유지와 선택 푸터 감지 2 PASS. 각각 API 미구현 RED를 먼저 확인했다. 상태 병합은 main
+  함수 본문으로 독립 테스트해 Working이 대기를 가리는 assertion RED(exit 101)를 확인했다.
+- 진행 중: 요청 ID/시각/세션에 따른 SQLite 상태 보존, provider hook 정규화, Grok 훅 설치,
+  response_sessions 전역 projection, sidebar/fleet 대기 종류 분리, locale 5개 문구 수정.
+- 추가 경계 테스트 두 건(같은 초의 이전 완료 확인, ID 없는 승인과 병렬 도구)이 RED다.
+  완료 세대 토큰과 익명 승인 해제 조건을 보완한 뒤 다시 검증한다.
+- 실패한 중간 시도: storage helper 함수명을 잘못 적어 컴파일 실패 후 실제
+  `bounded_session_key_prefix`로 수정했다. proxy package 이름은 `mcp-proxy`이며 실행 파일명
+  `deppy-mcp-proxy`를 `cargo -p`에 넣은 첫 명령은 실패했다. `Read::take` trait 범위와
+  App에 없는 `self.ctx` 접근도 중간 컴파일에서 발견해 호출 인자 전달로 수정 중이다.
+- 현재 테스트 로그: `/tmp/deppy-attention-{storage,proxy,screen,app}-*.log`,
+  `/tmp/deppy-attention-storage-races-red.log`, `/tmp/deppy-attention-merge-red.log`.
+- 다음: 남은 경계 수정 → 관련 테스트 → Codex CLI 코드 리뷰 및 지적 반영 → 커밋 전 gate
+  → handoff/프로젝트 일지/한국어 커밋. UI 화면 PASS는 사용자 검증 전 기록하지 않는다.
+
+### 구현 checkpoint 2 — 앱 컴파일 및 리뷰 진행
+
+- storage 새 테스트 5 PASS(요청 ID/병렬 도구/완료 보존/이전 세션/같은 초의 완료 소비),
+  proxy 정규화 3 PASS, session 입력·선택 감지 2 PASS, 앱 새 상태 병합 1 PASS.
+  앱의 기존 merge 테스트 1 PASS, shim 4 PASS, surface 4 PASS도 실행했다.
+  `slash_input` 필터는 매칭 테스트 0개였으므로 해당 검증 PASS로 계산하지 않는다.
+- 같은 이름의 도구 승인이 섞이는 proxy 별칭 테스트도 RED를 확인했고 도구 인자의
+  fingerprint를 별칭에 포함했다. 최종 관련 suite에서 재검증 중이다.
+- SQLite v42는 response_required/attention_json/attention_revision을 추가한다. 시간 기반
+  정리와 완료 확인 세대는 분리했고, 명시적 미응답과 미확인 완료는 24시간 경과만으로
+  사라지지 않는다. 각 request 및 JSON/행 수/전체 snapshot 메모리 상한은 유지한다.
+- Codex 설치 버전 0.154.0의 공식 hook_config.rs를 대조해 지원하지 않는 PostToolUseFailure
+  대신 Interrupt를 연결했다. timeout 단위는 초이므로 새 훅은 10초로 설정했다.
+  Grok은 Stop gate의 중간 발화를 완료로 오인하지 않도록 정착 알림으로 완료를 받는다.
+- 현재 관련 suite 실행: exec session 93750,
+  `/tmp/deppy-attention-related-tests.log` (`cargo test --locked -p storage -p session -p mcp-proxy -- --test-threads=1`).
+- 현재 Codex CLI 리뷰: exec session 84331, `/tmp/deppy-attention-codex-review.log`.
+  `env -u DEPPY_SESSION_ID /Users/jr/.local/bin/codex review --uncommitted`로 실행했다.
+  새 코드 파일은 intent-to-add하여 리뷰 diff에 포함시켰다. 리뷰 도중 앱 코드는 수정하지 않는다.
+- 앱 테스트 binary `/private/tmp/deppy-ready-prs-integration-target/debug/deps/deppy_sijo-6bc9214bfdc29fa6`.
+  실제 실행 앱 PID 25095와 release bundle은 그대로다. 패키징/재실행/화면 검증은 안 했다.
+- 남은 확인: 과거 턴의 늦은 취소/완료가 현재 턴 활동을 바꾸지 않는지, bounded projection의
+  새 세대 값이 소비자에서 timestamp로 쓰이지 않는지 리뷰 결과와 함께 점검한다.
+
+### 구현 checkpoint 3 — 코드 리뷰 지적 반영
+
+- Codex CLI `review --uncommitted`가 exit 0으로 완료됐다. 중복 출력 제외 지적은
+  **11건(P1 1, P2 10)**이다. 초기 진행 설명의 10건은 집계 오류였다.
+  로그 `/tmp/deppy-attention-codex-review.log`. 완료 토큰, 늦은 취소/요청 재사용,
+  Stop 후 작업 재개, Grok 성공 오인, ID 없는 MCP 질문, Codex 실패 결과,
+  한 줄 Enter 안내 소비, 응답 필요 세션 중단 버튼, 슬래시 회귀, clippy를 수정했다.
+- 리뷰 경계 테스트 9건은 수정 전 RED 후 수정 후 PASS했다.
+  `/tmp/deppy-attention-review-green.log` (proxy 3, session 1, storage 5).
+  리뷰 전 관련 전체 suite는 470 PASS, 1 ignored였고 최신 변경 후 전체 suite는 재실행 중이다.
+- 추가로 동일 서버의 ID 없는 동시 질문, 다시 열린 질문에 늦게 도착한 취소,
+  완료 직후 선택창이 완료에 가려지는 세 가지 assertion RED를 확인해 수정했다.
+  `/tmp/deppy-attention-{anonymous,late-cancel,popup}-red.log`.
+- Grok idle 알림 자체는 IdleObserved이고, 512KiB/512행 한도의 실제 events.jsonl에서
+  최신 turn_ended outcome=completed를 확인해야 완료로 승격한다. 실제 로컬 25개 세션의
+  이벤트 종류/필드명/결과만 읽어 해당 스키마를 확인했다. 대화 내용은 출력하지 않았다.
+- Codex는 대기 요청이 있을 때만 bounded rollout tail의 function_call_output call_id를
+  대조해 실패 질문도 해제한다. 파일은 regular file 및 O_NOFOLLOW/O_NONBLOCK로 연다.
+- 현재 재검증 로그 `/tmp/deppy-attention-final-related-tests.log`,
+  `/tmp/deppy-attention-final-app-tests.log`, exec session 47093.
+- 남은 일: 완료 알림의 새 세대를 포커스 이력과 별개로 유지하는 마지막 자체 검토,
+  관련 앱 검사 및 gate, 최종 handoff/일지/한국어 커밋. 운영 DB·사용자 훅 파일·앱
+  PID 25095 및 release bundle은 변경하지 않았다. 실제 CLI 화면은 미검증이다.
+
+### 구현 완료 — 최종 검증과 인계
+
+- 목표 완료: Claude/Codex/Grok의 명시적 질문·승인·완료를 별도 신호로 저장하고
+  사이드바/작업 목록에서 `응답 필요`, `승인 필요`, `완료 · 확인 필요`, `다음 지시 대기`로
+  구분한다. 다른 workspace에서도 미응답을 유지하며 작성·선택 이동은 답변으로 소비하지 않는다.
+- 최종 자체 검토에서 SessionAlert에 완료 토큰을 추가했다. 동일 Done 사이에 새 완료가
+  와도 이전 포커스 이력으로 읽음 처리하지 않는다. 새 regression은 API 부재 RED 후
+  실제 앱 test binary에서 1 PASS였다(`/tmp/deppy-attention-{focus-red,final-app-attention}.log`).
+- 수정 소스: storage/agent_attention.rs, db.rs, lib.rs 및 serde 의존성; mcp-proxy의
+  agent_attention.rs/main.rs; session/status.rs, runtime/in_process.rs; app의 agent_shim,
+  agent_surface, app, fleet, ui/agent_sessions·agent_visuals·fleet·workspace; locale 5개.
+  수정 문서는 본 handoff, 조사, 구현 계획, 코드 리뷰 보고서다. 전체 목록은 커밋 stat 기준이다.
+- Codex CLI 코드 리뷰 11건 전부 반영. 보고서는
+  `docs/investigations/2026-09-11-agent-attention-review.md`.
+- 최종 관련 테스트 **496 PASS, 1 ignored**: storage 355 + session 66 + proxy 61 + 앱 14.
+  앱 14는 shim 4, surface 4, merge 2, 미응답 병합 1, 슬래시 1, 새 완료 포커스 1,
+  legacy 유휴 프롬프트 1이다. 필터 0개 결과는 계산하지 않았다.
+- 실행 로그: `/tmp/deppy-attention-final-related-tests.log`, `final-proxy.log`,
+  `final-app-regressions.log`, `final-app-attention.log`, `final-legacy-idle.log`
+  (뒤의 파일에도 `/tmp/deppy-attention-` 접두사가 붙는다).
+- 최종 gate 명령은 다음과 같고 모두 exit 0이다. cargo 명령에는
+  `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target`를 지정했다.
+  - `cargo fmt --all -- --check`
+  - `cargo clippy --locked --workspace --all-targets -- -D warnings`
+  - `cargo run --locked -p xtask -- check-boundary`
+  - `cargo run --locked -p xtask -- i18n-check` (키 호출 1160건/5 locale)
+  - `git diff --check`
+  로그 `/tmp/deppy-attention-final-gates.log`. 전체 workspace 테스트나 CI PASS 주장이 아니다.
+- 최종 설계 제한: 자유 문장의 의미를 추측하지 않고 미확인 완료로 보완한다. Grok 완료는
+  실제 최신 턴 결과가 확인된 정착 알림 때 표시되어 지연될 수 있다. 훅/근거 로그가 없는
+  선택 화면은 알려진 화면 패턴으로 보완하며 모든 CLI 버전의 임의 화면을 보장하지 않는다.
+- 적용 상태: main 머지, 앱 package/restart, 운영 DB v42 migration, 사용자 훅 갱신을
+  하지 않았다. 실행 앱 PID 25095와 release bundle은 그대로다. 최신 앱을 적용한 후 새로
+  시작한 Claude/Codex/Grok에서 질문→선택 이동→답변/취소→완료→workspace 전환을 직접 확인해야 한다.
+  UI 화면 PASS는 기록하지 않는다. fleet waiting render/세션 0 계약은 수정하거나 삭제하지 않았다.
+- 실패한 접근 및 수정 이력은 checkpoint 1~3와 리뷰 보고서에 남겼다. 기존 단순 Enter 안내를
+  무조건 유지하는 접근, Grok idle=성공 접근, 관찰마다 완료 토큰을 올리는 접근은 폐기했다.
+- 다음 에이전트 명령:
+  `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`
+  `git status --short`
+  `git log -1 --oneline`
+  `git show --stat HEAD`
+  `cat docs/investigations/2026-09-11-agent-attention-review.md`
+  구현과 코드 리뷰 요청은 완료했다. main 머지/배포/앱 재기동은 다음 사용자 요청 범위로 진행한다.

@@ -7,6 +7,7 @@
 //!
 //! 로그는 반드시 **stderr**로만 나간다 — stdout은 JSON-RPC 전용이라 오염되면 안 된다.
 
+mod agent_attention;
 mod approval_notify;
 mod cli;
 mod forwarder;
@@ -289,8 +290,22 @@ fn run_hooks(args: &[String]) -> anyhow::Result<()> {
     // hook payload(claude/codex가 stdin으로 보냄)를 끝까지 읽는다 — 안 읽고 종료하면
     // 에이전트의 write가 broken pipe로 막힐 수 있고(codex 지적), payload에 세션 바인딩
     // (session_id/transcript_path)이 들어 있어 결정적 바인딩 소스로 기록한다.
+    let at_micros = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros().min(i64::MAX as u128) as i64)
+        .unwrap_or(1);
     let mut payload = String::new();
-    let _ = std::io::Read::read_to_string(&mut std::io::stdin().lock(), &mut payload);
+    // 도구 결과가 커도 메모리는 256 KiB로 제한하고 남은 stdin은 버린다.
+    let mut input = std::io::stdin().lock();
+    let read = std::io::Read::read_to_string(
+        &mut std::io::Read::take(std::io::Read::by_ref(&mut input), 256 * 1024 + 1),
+        &mut payload,
+    );
+    let _ = std::io::copy(&mut input, &mut std::io::sink());
+    if read.is_err() || payload.len() > 256 * 1024 {
+        println!("{{}}");
+        return Ok(());
+    }
     // codex는 hook stdout이 유효 JSON이길 기대 — 무슨 일이 있어도 '{}' 출력.
     println!("{{}}");
     let Some(session_key) = std::env::var("DEPPY_SESSION_ID")
@@ -305,8 +320,19 @@ fn run_hooks(args: &[String]) -> anyhow::Result<()> {
     // payload는 아래 바인딩 기록에도 쓰이므로 한 번만 파싱한다.
     let parsed = serde_json::from_str::<serde_json::Value>(&payload).ok();
     if let Ok(db) = storage::Db::open(&db_path) {
-        // needsInput 이벤트만 대기 상태를 바꾼다. session-start 등은 바인딩만 기록.
-        if event == "needs-input" || event == "clear" {
+        // 새 관찰기는 요청별 상태를 갱신하고 기존 이벤트는 구버전 훅을 지원한다.
+        if event == "observe" {
+            if let Some(v) = parsed.as_ref() {
+                if let Some(mut event) = agent_attention::normalize(v, at_micros) {
+                    agent_attention::confirm_grok_completion(v, &mut event);
+                    let _ = db.record_agent_attention(&session_key, &event);
+                }
+                if let Some(event) = agent_attention::resolved_alias(v, at_micros) {
+                    let _ = db.record_agent_attention(&session_key, &event);
+                }
+                agent_attention::reconcile_codex_results(&db, &session_key, v, at_micros);
+            }
+        } else if event == "needs-input" || event == "clear" {
             // claude Notification hook은 payload.message에 대기 사유를 싣는다
             // ("Claude needs your permission to use Bash"). 벨 인박스가 이 문구를
             // 헤드라인으로 쓴다 — 로그 tail은 TUI 재그리기라 상태줄이 섞인다(2026-07-17).
@@ -324,8 +350,14 @@ fn run_hooks(args: &[String]) -> anyhow::Result<()> {
         }
         // 어떤 이벤트든 payload에 (session_id, transcript_path)가 오면 최신 바인딩으로 갱신.
         if let Some(v) = parsed.as_ref() {
-            let sid = v.get("session_id").and_then(|x| x.as_str());
-            let path = v.get("transcript_path").and_then(|x| x.as_str());
+            let sid = v
+                .get("session_id")
+                .or_else(|| v.get("sessionId"))
+                .and_then(|x| x.as_str());
+            let path = v
+                .get("transcript_path")
+                .or_else(|| v.get("transcriptPath"))
+                .and_then(|x| x.as_str());
             // transcript_path를 **안 싣는** 에이전트가 있다. Kimi(0.34.0)가 그렇다 —
             // 페이로드는 hook_event_name/session_id/cwd뿐이다(바이너리의 triggerInner가
             // camelCase로 만들고 toHookInputData가 snake_case로 바꿔 보낸다). 그래서
@@ -333,6 +365,7 @@ fn run_hooks(args: &[String]) -> anyhow::Result<()> {
             // 경로가 없을 때만 세션 id로 인덱스를 뒤진다 — 인덱스가 풀어주지 못하면
             // 바인딩하지 않는다(추측 경로로 묶으면 엉뚱한 세션 상태를 보여준다).
             if path.is_none()
+                && v.get("hookEventName").is_none()
                 && let Some(sid) = sid
                 && let Some(resolved) = kimi_transcript_path(sid)
             {
@@ -343,6 +376,8 @@ fn run_hooks(args: &[String]) -> anyhow::Result<()> {
                 // 안 넣으면 **전부 claude로 기록**돼 카드가 거짓말을 한다.
                 let kind = if path.contains("/.codex/") {
                     "codex"
+                } else if path.contains("/.grok/") {
+                    "grok"
                 } else if path.contains("/.kimi-code/") {
                     "kimi"
                 } else {

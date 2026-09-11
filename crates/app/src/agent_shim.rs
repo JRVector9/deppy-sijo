@@ -58,6 +58,48 @@ export DEPPY_SHIM_GUARD=1
 "#
 }
 
+/// 질문/승인/응답을 같은 관찰기로 보낸다. 알림 종류는 수신기가 구분한다.
+fn observer_settings(command: &str, grok: bool) -> serde_json::Value {
+    let events = if grok {
+        // Grok Stop은 다른 훅이 턴을 계속시킬 수 있어 완료 근거로 쓰지 않는다.
+        // task_complete 알림과 idle_prompt가 실제 턴 정착을 보고한다.
+        vec![
+            "SessionStart",
+            "UserPromptSubmit",
+            "PreToolUse",
+            "PostToolUse",
+            "PostToolUseFailure",
+            "Notification",
+            "StopFailure",
+            "StopCancelled",
+            "SessionEnd",
+        ]
+    } else {
+        vec![
+            "SessionStart",
+            "UserPromptSubmit",
+            "PreToolUse",
+            "PostToolUse",
+            "PostToolUseFailure",
+            "PermissionRequest",
+            "Notification",
+            "Elicitation",
+            "ElicitationResult",
+            "Stop",
+            "StopFailure",
+            "SessionEnd",
+        ]
+    };
+    let mut hooks = serde_json::Map::new();
+    for event in events {
+        hooks.insert(
+            event.into(),
+            serde_json::json!([{ "hooks":[{"type":"command","command":command}]}]),
+        );
+    }
+    serde_json::json!({"hooks":hooks})
+}
+
 /// shim/hook 스크립트/claude 설정을 (재)생성한다. 매 시작 호출 — idempotent.
 pub fn install(db_path: &std::path::Path, proxy_bin: &str) -> anyhow::Result<()> {
     let Some(root) = root() else { return Ok(()) };
@@ -75,6 +117,7 @@ pub fn install(db_path: &std::path::Path, proxy_bin: &str) -> anyhow::Result<()>
     // ── hook 이벤트 스크립트 (codex TOML command로 공백 없는 경로가 필요) ──
     // (스크립트명, proxy --event 값)
     const EVENTS: &[(&str, &str)] = &[
+        ("observe", "observe"),
         ("session-start", "session-start"),
         ("needs-input", "needs-input"),
         ("clear", "clear"),
@@ -92,18 +135,9 @@ pub fn install(db_path: &std::path::Path, proxy_bin: &str) -> anyhow::Result<()>
     };
 
     // ── claude: --settings 오버레이 파일 (사용자 settings.json 무변경) ──
-    let claude_settings = serde_json::json!({
-        "hooks": {
-            "SessionStart":     [ { "hooks": [ { "type": "command", "command": hook("session-start") } ] } ],
-            "Notification":     [ { "hooks": [ { "type": "command", "command": hook("needs-input") } ] } ],
-            "UserPromptSubmit": [ { "hooks": [ { "type": "command", "command": hook("clear") } ] } ],
-            "PreToolUse":       [ { "hooks": [ { "type": "command", "command": hook("clear") } ] } ],
-            // Stop = 턴 완료 → 상태 레일 '완료' 트랜지언트 (clear가 아니라 turn-done).
-            "Stop":             [ { "hooks": [ { "type": "command", "command": hook("turn-done") } ] } ],
-        },
-        // statusLine = effort/model/남은 context% 캡처 + 사용자 원래 statusLine 체이닝.
-        "statusLine": { "type": "command", "command": statusline_command(proxy_bin, db_path) }
-    });
+    let mut claude_settings = observer_settings(&hook("observe"), false);
+    claude_settings["statusLine"] =
+        serde_json::json!({ "type":"command", "command":statusline_command(proxy_bin,db_path) });
     let settings_path = root.join("claude-hook-settings.json");
     std::fs::write(
         &settings_path,
@@ -122,12 +156,14 @@ pub fn install(db_path: &std::path::Path, proxy_bin: &str) -> anyhow::Result<()>
 
     // codex shim — cmux와 동일한 per-invocation hook 주입 + bypass(프롬프트 없음).
     let codex_events: &[(&str, &str, u32)] = &[
-        ("SessionStart", "session-start", 10_000),
-        ("PermissionRequest", "needs-input", 120_000),
-        ("UserPromptSubmit", "clear", 10_000),
-        ("PreToolUse", "clear", 10_000),
-        // Stop = 턴 완료 → '완료' 트랜지언트.
-        ("Stop", "turn-done", 10_000),
+        ("SessionStart", "observe", 10),
+        ("PermissionRequest", "observe", 10),
+        ("UserPromptSubmit", "observe", 10),
+        ("PreToolUse", "observe", 10),
+        ("PostToolUse", "observe", 10),
+        ("Interrupt", "observe", 10),
+        ("Stop", "observe", 10),
+        ("SessionEnd", "observe", 10),
     ];
     let mut codex_args = String::from("--enable hooks --dangerously-bypass-hook-trust");
     for (event, name, timeout) in codex_events {
@@ -140,6 +176,17 @@ pub fn install(db_path: &std::path::Path, proxy_bin: &str) -> anyhow::Result<()>
         "{strip}REAL_AGENT=\"${{DEPPY_AGENT_EXECUTABLE:-codex}}\"\nunset DEPPY_AGENT_EXECUTABLE\nexec \"$REAL_AGENT\" {codex_args} \"$@\"\n"
     );
     write_executable(&shims.join("codex"), &codex_shim)?;
+
+    // Grok은 공식 전역 훅 디렉터리의 Deppy 파일만 관리한다. 다른 앱의 훅은 보존한다.
+    if let Some(home) = crate::paths::home_dir() {
+        let dir = home.join(".grok/hooks");
+        std::fs::create_dir_all(&dir)?;
+        let file = dir.join("deppy-status.json");
+        let staged = dir.join("deppy-status.json.tmp");
+        let settings = observer_settings(&hook("observe"), true);
+        std::fs::write(&staged, serde_json::to_vec_pretty(&settings)?)?;
+        std::fs::rename(staged, file)?;
+    }
 
     // ── kimi: 런치별 주입 수단이 없어 전역 config를 고친다(install_kimi_hooks 주석) ──
     // 실패해도 설치 전체를 되돌리지 않는다 — claude/codex shim은 이미 유효하고,
@@ -155,6 +202,12 @@ pub fn remove() -> anyhow::Result<()> {
     // 우리 디렉터리를 지우기 **전에** 남의 config에서 우리 흔적을 걷어낸다.
     if let Err(error) = remove_kimi_hooks() {
         tracing::warn!("kimi hook 제거 실패: {error:#}");
+    }
+    if let Some(home) = crate::paths::home_dir() {
+        let file = home.join(".grok/hooks/deppy-status.json");
+        if file.exists() {
+            std::fs::remove_file(file)?;
+        }
     }
     if let Some(root) = root()
         && root.exists()

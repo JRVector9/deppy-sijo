@@ -14,7 +14,9 @@ pub(crate) const fn status_color(state: AgentVisualState) -> egui::Color32 {
         // Active(L 67%) 아래로 내려 신호를 가리지 않게 한다.
         AgentVisualState::Idle => egui::Color32::from_rgb(0xa1, 0xa8, 0xb0),
         AgentVisualState::Active => egui::Color32::from_rgb(0x58, 0xa6, 0xff),
-        AgentVisualState::Waiting => egui::Color32::from_rgb(0xff, 0xbf, 0x69),
+        AgentVisualState::Waiting | AgentVisualState::NeedsResponse => {
+            egui::Color32::from_rgb(0xff, 0xbf, 0x69)
+        }
         AgentVisualState::Complete => egui::Color32::from_rgb(0x56, 0xd3, 0x64),
         AgentVisualState::Error => egui::Color32::from_rgb(0xff, 0x7b, 0x72),
     }

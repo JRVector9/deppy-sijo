@@ -220,7 +220,7 @@ static BUILTIN: std::sync::LazyLock<BuiltinPatterns> = std::sync::LazyLock::new(
         .expect("built-in approval regex"),
         // 그 외 입력 대기: "Press Enter", "type ... to continue", "waiting for input".
         waiting: regex::Regex::new(
-            r"(?i)(press enter to continue|type\s+.{0,24}\s+to continue|waiting for (your )?(input|response)|paste your|enter your\s)",
+            r"(?i)(press enter to continue|type\s+.{0,24}\s+to continue|waiting for (your )?(input|response)|paste your|enter your\s|enter to select[^\n]{0,120}esc[^\n]{0,30}(cancel|dismiss|back))",
         )
         .expect("built-in waiting regex"),
     }
@@ -339,6 +339,34 @@ impl StatusDetector {
             }),
             user_override,
         )
+    }
+
+    /// 선택 이동과 답변 작성은 제출이 아니다. 화면 프롬프트는 사라짐을 확인해야 해제한다.
+    pub fn on_user_input(&mut self, bytes: &[u8]) {
+        self.screen_scan_requested = true;
+        self.last_output = Instant::now();
+        // 한 줄짜리 Enter 안내는 제출 뒤 스크롤백에 남는다. 선택창과 별도로 소비한다.
+        let simple_continue = self.last_screen_matches.iter().any(|(status, line)| {
+            *status == SessionStatus::Waiting
+                && line
+                    .to_ascii_lowercase()
+                    .contains("press enter to continue")
+        });
+        if simple_continue && bytes.iter().any(|b| matches!(b, b'\r' | b'\n')) {
+            self.on_input();
+            return;
+        }
+        if self.screen_derived
+            && matches!(
+                self.status,
+                SessionStatus::Waiting | SessionStatus::NeedsApproval
+            )
+        {
+            return;
+        }
+        if bytes.iter().any(|b| matches!(b, b'\r' | b'\n' | 3)) {
+            self.on_input();
+        }
     }
 
     /// 사용자 입력 수신 — 현재 화면의 매치 프롬프트를 "응답됨"으로 소비한다.
@@ -549,6 +577,38 @@ fn status_source_reason(source: StatusSource) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_단순_enter_안내는_응답_후_스크롤백에_남아도_해제한다() {
+        let mut d = StatusDetector::new(StatusPatterns::compile(None, None, None, None));
+        d.evaluate(Some("Press enter to continue"));
+        d.on_user_input(b"\r");
+        d.on_output(b"\r\nFinished\r\n$ ");
+        d.evaluate(Some("Press enter to continue\nFinished\n$ "));
+        assert_ne!(d.status(), SessionStatus::Waiting);
+    }
+
+    #[test]
+    fn 응답대기_방향키와_작성중인_문자는_대기를_소비하지_않는다() {
+        let mut d = StatusDetector::new(StatusPatterns::compile(None, None, None, None));
+        let screen = "Press enter to confirm";
+        d.evaluate(Some(screen));
+        for bytes in [b"\x1b[B".as_slice(), "아직 작성 중".as_bytes(), b"\r"] {
+            d.on_user_input(bytes);
+            d.last_output = Instant::now() - Duration::from_secs(11);
+            d.evaluate(Some(screen));
+            assert_eq!(d.status(), SessionStatus::NeedsApproval);
+        }
+        d.evaluate(Some("작업을 계속합니다"));
+        assert_ne!(d.status(), SessionStatus::NeedsApproval);
+    }
+
+    #[test]
+    fn 응답대기_계획_선택창은_긴_푸터에도_질문으로_감지한다() {
+        let mut d = StatusDetector::new(StatusPatterns::compile(None, None, None, None));
+        let screen = "Implement this plan?\n  1. Yes\n> 2. No\n설명\n설명\n설명\nEnter to select · Tab to navigate · Esc to cancel";
+        assert_eq!(d.evaluate(Some(screen)), Some(SessionStatus::Waiting));
+    }
 
     fn patterns() -> StatusPatterns {
         StatusPatterns::compile(

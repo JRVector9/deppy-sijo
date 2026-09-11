@@ -7912,6 +7912,7 @@ impl WorkspaceUi {
             crate::agent_transcript::AgentActivity,
         >,
         needs_input: &std::collections::HashSet<runtime::SessionId>,
+        responses: &std::collections::HashSet<runtime::SessionId>,
         turn_done: &std::collections::HashMap<runtime::SessionId, i64>,
         hook_working: &std::collections::HashSet<runtime::SessionId>,
     ) -> Vec<crate::ui::file_tree::SessionEntry> {
@@ -7936,7 +7937,14 @@ impl WorkspaceUi {
                 let done = pane.session_id.is_some_and(|s| turn_done.contains_key(&s));
                 // hook이 보고한 "작업 중"(v32) — transcript보다 즉시·정확(턴 경계).
                 let working = pane.session_id.is_some_and(|s| hook_working.contains(&s));
-                let merged = merge_agent_status(regex_status, activity, waiting, done, working);
+                let merged = merge_agent_status(
+                    regex_status,
+                    activity,
+                    waiting,
+                    done,
+                    working,
+                    pane.session_id.is_some_and(|id| responses.contains(&id)),
+                );
                 // U17b: 수동 오버라이드가 있으면 최우선(status view의 user_override).
                 let view = pane
                     .session_id
@@ -8581,7 +8589,8 @@ fn session_status_label(status: Option<runtime::SessionStatus>, catalog: &i18n::
     let key = match status {
         Some(s) => match s {
             S::Running => "status.running",
-            S::Waiting | S::NeedsApproval => "status.needs_approval",
+            S::Waiting => "status.waiting",
+            S::NeedsApproval => "status.needs_approval",
             S::Done => "status.done",
             S::Error => "status.error",
             S::Idle => "status.idle",
@@ -8617,7 +8626,8 @@ fn agent_activity_line(
     use runtime::SessionStatus as S;
     let key = match status {
         Some(S::Running) => "session.activity.running",
-        Some(S::Waiting | S::NeedsApproval) => "session.activity.waiting",
+        Some(S::Waiting) => "session.activity.waiting",
+        Some(S::NeedsApproval) => "status.needs_approval",
         Some(S::Done) => "session.activity.done",
         Some(S::Error) => "session.activity.error",
         Some(S::Idle) => "session.activity.idle",
@@ -8813,17 +8823,22 @@ fn merge_agent_status(
     needs_input: bool,
     turn_done: bool,
     hook_working: bool,
+    needs_response: bool,
 ) -> Option<runtime::SessionStatus> {
     use crate::agent_transcript::AgentActivity;
     use runtime::SessionStatus as S;
-    // hook needsInput은 가장 신뢰도 높은 승인 대기 신호 — 단, transcript가 Working이면
-    // 에이전트가 재개된 것이라(clear hook 지연 대비) 대기로 보지 않는다.
-    if needs_input && activity != Some(AgentActivity::Working) {
-        return Some(S::NeedsApproval);
+    // 확정된 미응답 요청은 오래된 Working 레코드나 병렬 작업으로 해제하지 않는다.
+    if needs_input {
+        return Some(if needs_response {
+            S::Waiting
+        } else {
+            S::NeedsApproval
+        });
     }
     // 명시적 오류는 완료보다 우선 — Stop은 모든 턴 종료에 오므로 turn_done이 error를
     // 가리면 실패한 턴이 '완료(바이올렛)'로 위장된다(codex 리뷰).
-    if matches!(regex, Some(S::Error)) {
+    // 완료 직후 계획 선택창을 여는 CLI도 있으므로 현재 화면의 요청을 먼저 보인다.
+    if matches!(regex, Some(S::Error | S::Waiting | S::NeedsApproval)) {
         return regex;
     }
     // Stop hook = 턴 완료. UserPromptSubmit/PreToolUse가 clear하므로 재개 시 즉시 해제.
@@ -8831,11 +8846,8 @@ fn merge_agent_status(
     if turn_done {
         return Some(S::Done);
     }
-    match regex {
-        // 대기(Waiting)는 입력대기(주황)로 통합 — 별도 팔레트 없음 (2026-07-07 결정).
-        Some(S::Waiting) => return Some(S::NeedsApproval),
-        Some(S::NeedsApproval | S::Done) => return regex,
-        _ => {}
+    if matches!(regex, Some(S::Done)) {
+        return regex;
     }
     // hook "작업 중"(v32, cmux식): UserPromptSubmit/PreToolUse가 턴 경계에서 즉시 기록 —
     // transcript(1.5s 폴링 + 활성 전용)보다 빠르고 warm에서도 동작한다. 화면 regex의
@@ -9171,6 +9183,26 @@ mod tests {
     use terminal::{CursorShape, CursorSnapshot, TerminalCell};
 
     #[test]
+    fn 응답대기_최신_대기는_작업중_기록으로_지우지_않는다() {
+        use crate::agent_transcript::AgentActivity;
+        use runtime::SessionStatus as S;
+        assert_eq!(
+            merge_agent_status(
+                Some(S::Idle),
+                Some(AgentActivity::Working),
+                true,
+                false,
+                true,
+                false
+            ),
+            Some(S::NeedsApproval)
+        );
+        assert_eq!(
+            merge_agent_status(Some(S::Waiting), None, false, false, false, false),
+            Some(S::Waiting)
+        );
+    }
+    #[test]
     fn pane_render_output_merge는_document_drop_경로_순서를_보존한다() {
         let mut merged = PaneRenderOutput {
             document_drop_paths: vec![PathBuf::from("/tmp/first.rs")],
@@ -9202,35 +9234,46 @@ mod tests {
         use runtime::SessionStatus as S;
         // hook working 단독 → Running (transcript 없음/유휴여도)
         assert_eq!(
-            merge_agent_status(None, None, false, false, true),
+            merge_agent_status(None, None, false, false, true, false),
             Some(S::Running)
         );
         assert_eq!(
-            merge_agent_status(None, Some(AgentActivity::Idle), false, false, true),
+            merge_agent_status(None, Some(AgentActivity::Idle), false, false, true, false),
             Some(S::Running)
         );
         // 확정 상태가 우선: needs_input / regex Error / turn_done / 화면 대기(regex)
         assert_eq!(
-            merge_agent_status(None, None, true, false, true),
+            merge_agent_status(None, None, true, false, true, false),
             Some(S::NeedsApproval)
         );
         assert_eq!(
-            merge_agent_status(Some(S::Error), None, false, false, true),
+            merge_agent_status(Some(S::Error), None, false, false, true, false),
             Some(S::Error)
         );
         assert_eq!(
-            merge_agent_status(None, None, false, true, true),
+            merge_agent_status(None, None, false, true, true, false),
             Some(S::Done)
         );
         assert_eq!(
-            merge_agent_status(Some(S::Waiting), None, false, false, true),
-            Some(S::NeedsApproval)
+            merge_agent_status(Some(S::Waiting), None, false, false, true, false),
+            Some(S::Waiting)
         );
         // hook working 없으면 기존과 동일(transcript 폴백)
         assert_eq!(
-            merge_agent_status(None, Some(AgentActivity::Idle), false, false, false),
+            merge_agent_status(None, Some(AgentActivity::Idle), false, false, false, false),
             Some(S::Idle)
         );
+    }
+
+    #[test]
+    fn merge_agent_status_완료_후_선택창은_응답을_요청한다() {
+        use runtime::SessionStatus as S;
+        for status in [S::Waiting, S::NeedsApproval] {
+            assert_eq!(
+                merge_agent_status(Some(status), None, false, true, false, false),
+                Some(status)
+            );
+        }
     }
 
     fn drain_protocol(ui: &mut WorkspaceUi) -> Vec<RuntimeCommand> {

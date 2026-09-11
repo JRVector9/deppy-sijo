@@ -2837,3 +2837,49 @@
   Format job annotation에서 최근 결제 실패 또는 spending limit 증액 필요 메시지를 직접
   확인했다. 따라서 GitHub failure는 코드 테스트 실패가 아니며 CI PASS로 기록하지 않는다.
   GitGuardian은 SUCCESS, PR은 OPEN/non-draft/MERGEABLE이다.
+
+## 2026-09-11 PR #186·#187 main 통합 및 재빌드
+
+- 최신 사용자 요청: 남아 있던 Cursor 사용량 PR #186과 터미널 상단 아이콘 확대 PR
+  #187을 main에 머지하고, 최종 main을 재빌드한 뒤 앱을 재실행한다. 이전 재실행 보류는
+  이번 요청으로 해제됐다.
+- #186은 고정 head `d66d0d7`을 squash merge해 main merge commit `7d82009`로
+  반영했다. #187은 #186 병합 뒤 handoff 문서에만 충돌이 생겨 양쪽 기록을 모두 보존하는
+  일반 merge commit `78e72ee`로 main을 반영한 뒤, 그 고정 head를 squash merge해 main
+  merge commit `763f8b6`으로 반영했다. rebase와 force-push는 사용하지 않았다.
+- 최종 #187 GitHub 실패 6건은 각각 `runner_id=0`, 실행 단계 0개, 결제 실패 또는
+  spending limit 증액 필요 annotation을 확인했다. GitGuardian은 SUCCESS였다. #186의
+  실패 6건도 같은 세 조건을 확인했다. 따라서 Actions PASS로 기록하지 않는다.
+- 로컬 대체 검증: Relay WebCrypto JS 16 PASS, fmt/diff/check-boundary PASS, workspace
+  all-targets clippy `-D warnings` PASS, i18n-check 1160키/5 locale PASS, cargo audit
+  취약점 0(기존 yanked 경고), cargo deny bans/licenses/sources PASS. macOS에서 Linux 전용
+  Relay build를 재현하거나 PASS로 기록하지 않는다.
+- 전체 workspace 테스트는 2249 PASS, 1 FAIL, 15 ignored였다. 실패는
+  `ui::workspace::tests::attached_without_snapshot은_workspace_specific_unavailable을_표시한다`
+  (actual 116, expected 80)이며 #186, #187, 변경 전 clean main `b698ca7`에서 단독으로
+  동일 실패해 이번 두 PR 이전부터 존재한 기준선 문제임을 확인했다. 전체 테스트 PASS로
+  기록하지 않는다.
+- 현재 clean main worktree는 `/private/tmp/deppy-main-b698-test-20260911`, HEAD
+  `763f8b6`이다. 기존 앱 PID 38141은 아직 이전 main bundle로 실행 중이며, 새 package가
+  성공하고 서명 검증이 끝나기 전에는 종료하지 않는다.
+- 다음 명령: 최종 main에서 `scripts/package-macos.sh`를 Developer ID로 실행하고
+  `codesign --verify --deep --strict`로 검증한다. 성공 후 `pgrep -x deppy-sijo`와
+  `ps -o pid=,etime=,command= -p <PID>`로 기존 앱을 재확인하고 정확한 PID만 종료한 뒤
+  새 bundle을 `open`한다. 빌드·재실행 결과는 완료 후 이 절에 추가한다.
+- 첫 패키징 시 release 컴파일은 1분 17초 만에 성공했지만 clean worktree의 상대
+  `target`이 공유 `CARGO_TARGET_DIR`에 연결되지 않아 `cp target/release/deppy-sijo`
+  단계에서 exit 1로 중단됐다. 불완전한 생성물만 든 ignored `target`을 정리하고
+  `/private/tmp/deppy-ready-prs-integration-target` symlink를 복구한 뒤 같은 명령을 다시
+  실행했다. 이는 코드·컴파일 실패가 아니며 기존 앱은 이때 종료하지 않았다.
+- 최종 빌드 완료: main `763f8b6`, release compile 결과를 재사용한 package script
+  exit 0. Developer ID Application: VectorNine INC (ZDTU5LS35K)로 앱과 helper를 서명했고,
+  bundle 및 ZIP 재추출 검증과 별도 `codesign --verify --deep --strict`가 PASS했다. 로컬
+  개발 패키지이며 Apple 공증은 수행하지 않았다.
+- 재실행 완료: 기존 PID 38141이 공유 bundle 경로에서 실행 중임을 재확인한 뒤 해당
+  PID만 SIGTERM으로 종료했다. 새 bundle을 열었고 PID 25095가
+  `/private/tmp/deppy-ready-prs-integration-target/bundle/Deppy Sijo.app/Contents/MacOS/deppy-sijo`
+  에서 실행 중임을 확인했다. 화면 동작은 사용자 직접 확인 대상이며 자동 화면 PASS로
+  기록하지 않는다.
+- merge 직후 main에는 Build and test/Dependency security만 실행됐고 배포 실행은 없다.
+  `relay-release.yml`과 `relay-shell-release.yml`은 `workflow_dispatch` 전용이다. 현재 요청의
+  두 PR main 반영, 최종 빌드, 재실행은 모두 완료했다.

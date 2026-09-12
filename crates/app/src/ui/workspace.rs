@@ -7691,6 +7691,7 @@ impl WorkspaceUi {
         prefill: Option<super::environment::EnvironmentPrefill>,
     ) -> super::environment::EnvironmentOpenRequest {
         super::environment::EnvironmentOpenRequest {
+            session,
             cwd: session.and_then(|session| self.session_cwds.get(&session).cloned()),
             prefill,
         }

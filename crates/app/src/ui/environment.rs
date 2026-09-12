@@ -45,8 +45,20 @@ impl EnvironmentPrefill {
 
 /// 워크스페이스는 이 요청을 소비하는 App이 원본 runtime에서 붙인다.
 pub struct EnvironmentOpenRequest {
+    pub session: Option<runtime::SessionId>,
     pub cwd: Option<String>,
     pub prefill: Option<EnvironmentPrefill>,
+}
+
+impl EnvironmentOpenRequest {
+    /// primary 전환 때 비워지는 App 캐시와 일치할 때만 폴더 등록 안내에 쓴다.
+    pub fn current_cwd(
+        &self,
+        current: &std::collections::HashMap<runtime::SessionId, String>,
+    ) -> Option<&str> {
+        let captured = self.cwd.as_deref()?;
+        (current.get(&self.session?)?.as_str() == captured).then_some(captured)
+    }
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
@@ -352,6 +364,8 @@ impl EnvironmentUi {
         ui.separator();
         match kind {
             EntryKind::Api => {
+                // 변수 추가에서 API로 전환한 경우도 서비스 기본 선택을 준비한다.
+                credentials.begin_modern_add();
                 credentials.modern_form(ui, credential_snapshot, catalog, credential_intent)
             }
             EntryKind::Variable => env.modern_form(ui, snapshot, catalog, env_intent),
@@ -373,6 +387,24 @@ pub(super) fn field_label(ui: &mut egui::Ui, catalog: &i18n::Catalog, key: &str)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn environment_context_reactivated_cwd_requires_current_detection() {
+        let session = runtime::SessionId(7);
+        let request = EnvironmentOpenRequest {
+            session: Some(session),
+            cwd: Some("/old-project".into()),
+            prefill: None,
+        };
+        let mut detected = std::collections::HashMap::new();
+        assert_eq!(request.current_cwd(&detected), None);
+        detected.insert(session, "/new-project".into());
+        assert_eq!(request.current_cwd(&detected), None);
+        detected.insert(session, "/old-project".into());
+        assert_eq!(request.current_cwd(&detected), Some("/old-project"));
+        detected.clear();
+        assert_eq!(request.current_cwd(&detected), None);
+    }
 
     #[test]
     fn environment_context_selection_limits_preserve_values_without_truncating() {

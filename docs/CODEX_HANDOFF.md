@@ -3364,3 +3364,36 @@
   `rg 'COMMAND|^EXIT' /tmp/deppy-env-context-final-gates.log`
   `ps -o pid,etime,comm -p 30263`
   사용자 빌드 승인 후 `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo build --locked --release -p deppy-sijo -p mcp-proxy`. 실행 중 bundle을 덮지 않는 새 디렉터리에 stage하고 기존 Developer ID로 서명/manifest source hash를 남긴다. 재실행 승인 시 PID 30263의 정확한 경로를 다시 확인하고 종료한 뒤 새 bundle을 연다. `pkill -f` 금지. main/원본 Relay 브랜치에 임의 merge/rebase/force-push하지 않는다.
+
+## 2026-09-12 환경 API 독립 재리뷰 및 재빌드 착수
+
+- 사용자 최신 승인: 한 번 더 코드 리뷰, 발견 문제 수정, 재빌드. 재실행은 요청하지 않아 현재 PID 30263 / attention 7442a8f 앱을 유지한다. main 머지도 범위 밖.
+- 시작 HEAD 1dd86ba, clean, branch fix/environment-api-context-integration, 작업 폴더 deppy-sijo-agent-wait-audit.
+- 실제 Codex CLI 독립 재리뷰 진행(`/tmp/deppy-env-context-rereview-20260912.log`, exec 82506): 코드 1dd86ba 대 96cd1ff 및 현재 호출부만 대상으로 하고 운영 DB/설정/앱 접근, cargo/파일 수정 금지.
+- 자체 소스 확인: 이미 열린 설정 창을 둔 채 workspace를 바꾸고 macOS 메뉴/사이드바 설정을 다시 누르면 settings_open=true만 반복하여 이전 설정 프로젝트가 남는다. 명시적 진입 의도와 프레임 유지 상태를 분리하고 같은 프로젝트 초안은 유지하도록 보완한다.
+- 빌드는 app+proxy release, 별도 새 bundle에 stage하여 같은 Developer ID Application: VectorNine INC (ZDTU5LS35K)로 서명한다. 현재 bundle/서명 identity/파일 hash를 확인했고 실행 앱을 덮지 않는다.
+- 다음: 신규 재진입 회귀 RED/수정 → 독립 리뷰 결과 보완 → 관련 검사 및 커밋 → release build/별도 서명 bundle/manifest/일지. 실제 GUI는 재실행 승인 뒤 확인한다.
+
+### 재리뷰 checkpoint — 자체 확인 2건 보완
+
+- 명시적 설정 재진입 의도를 별도 bool로 기록하고 6개 진입 경로를 request_settings_open으로 모았다. 이미 열려 있어도 현재 화면이 다른 프로젝트면 재선택한다. 같은 프로젝트에서는 기존 초안을 유지한다.
+- 회귀는 입력 인자 추가 컴파일 RED 뒤, 기존 판정 본문을 둔 채 실제 assertion `None != Some(visible)` 실패를 확인했다(`/tmp/deppy-env-rereview-reentry-behavior-red.log`). 판정 수정 후 environment_context 8 PASS(`/tmp/deppy-env-rereview-reentry-green.log`).
+- 변수 추가에서 API로 전환하는 경로는 provider가 빈 채 직접 입력 표시만 나오고 실제 입력칸은 없는 상태가 될 수 있었다. API editor 진입 때 기존 begin_modern_add를 호출해 기본 서비스를 준비한다. 직접 입력/우클릭 prefill의 custom 상태는 기존 메서드가 보존한다. 화면 회귀 테스트는 추가하지 않으며 실제 GUI는 미검증이다.
+- 새 패키징 스크립트 `/tmp/deppy-env-rereview-package-20260912.py` 준비(구문 검사 완료). 실행 bundle 복사 대신 새 디렉터리에 release app/proxy만 stage, 동일 identity 서명과 소스/바이너리 SHA256 manifest. 빌드/패키징은 독립 리뷰 후 실행한다.
+
+### 재리뷰 checkpoint — 독립 리뷰 P2 3건 반영
+
+- Codex CLI exit 0, 추가 P2 3건 확인. 자체 2건을 합쳐 현재 수정 5건이며 리뷰에서 확인한 미반영 항목은 없다.
+- 재활성화 cwd: EnvironmentOpenRequest가 session도 캡처하고 App에서 최신 활성 session_cwds와 일치하는지 확인한다. active 전환 직후 캐시가 비어 있거나 갱신된 경로가 다르면 폴더 등록 안내를 생략한다. attached 경로를 active 프로젝트 CTA로 쓰지 않는 기존 가드도 유지한다.
+- 외부 카테고리 변경: 벨/홈/단축키/우클릭을 set_settings_category로 모아 Environment를 떠날 때 reset_environment_view_state를 호출한다. 내부 nav의 기존 정리도 유지해 pending prefill·공개값·초안/undo를 폐기한다.
+- API 이름 undo: 새/기존 화면의 label 입력에 고정 ID와 DraftTextEditState 추적을 연결했다. 저장 요청과 성공 ACK, 취소/전환/prefill 교체에서 label 실행 취소 기록도 제거한다.
+- 신규 cwd와 API 이름 undo 회귀는 기존 판정/정리 코드에서 실제 2 FAIL(`/tmp/deppy-env-rereview-review3-red.log`), 수정 후 environment_context 10 PASS(`review3-green.log`). 외부 nav는 실제 setter 호출 경로를 소스로 확인했고 기존 pending reset 상태 회귀를 재사용한다. 실제 GUI 클릭 검증은 수행하지 않는다.
+- 다음: 최종 관련 상태 검사/gate 한 번 → 코드/보고서/인계 커밋 → release app+proxy 빌드 → 별도 bundle 서명/manifest → 일지와 인계 업데이트. 재실행/main 머지는 안 한다.
+
+### 재리뷰 최종 검증 / 재빌드 진행
+
+- 확인한 5건 수정 완료. 보고서 `docs/investigations/2026-09-12-environment-api-rereview.md`. 실제 독립 리뷰 P2 3건과 자체 재진입/서비스 전환 2건을 구분해 기록했다. 미반영 지적 없음.
+- 최종 관련 테스트 **15 PASS** (`/tmp/deppy-env-rereview-final-related.log`): environment_context 10 + pr188 3 + refresh/닫기 각 1. 외부 nav와 화면 배치는 source-only 확인이며 GUI PASS가 아니다.
+- 최종 gate 5개 모두 exit 0 (`/tmp/deppy-env-rereview-final-gates.log`): fmt check, strict workspace/all-target clippy, check-boundary, i18n-check, diff check. source 변경은 이후 하지 않는다.
+- 사용자 승인된 release 재빌드를 진행한다. 공통 환경 CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target. 명령 cargo build --locked --release -p deppy-sijo -p mcp-proxy. 로그 `/tmp/deppy-env-rereview-release-build.log`.
+- 빌드 전 소스와 실행 bundle hash는 `/tmp/deppy-env-rereview-build-source.json`에 기록한다. 패키징은 `/tmp/deppy-env-rereview-package-20260912.py`로 새 경로에만 생성한다. 다음은 빌드 exit/서명/소스 hash/기존 PID 30263 유지 확인 후 최종 인계/일지 업데이트다. 재실행하지 않는다.

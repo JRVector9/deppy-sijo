@@ -9452,11 +9452,12 @@ pub struct App {
     settings_open: bool,
     /// 직전 프레임의 설정창 열림 상태 — 닫힘 전이에서 env 평문 캐시를 비운다(보안).
     settings_was_open: bool,
+    /// 이미 열린 창을 설정 버튼/메뉴로 다시 여는 명시적 진입 의도.
+    settings_open_requested: bool,
     /// 통합 설정 창의 선택된 카테고리.
     settings_category: ui::settings::Category,
     /// 설정 창 안에서만 선택된 workspace. 사이드바 표시/활성 runtime/terminal focus와
-    /// 독립이며 「환경 및 API」 화면의 대상만 바꾼다 — 그 화면의 프로젝트 목록이
-    /// 유일한 입력원이다(2026-08-10, 설정→워크스페이스 화면 삭제).
+    /// 독립이며 「환경 및 API」의 대상만 바꾼다. 명시적 설정 진입과 프로젝트 목록에서 갱신한다.
     settings_workspace_id: Option<String>,
     settings_search: String,
     env_api_project_edit: EnvApiProjectEditState,
@@ -10452,8 +10453,11 @@ fn settings_environment_entry(
     open: bool,
     visible_workspace: &str,
     origin_workspace: Option<&str>,
+    explicit_open: bool,
+    current_workspace: Option<&str>,
 ) -> Option<String> {
-    (open && (!was_open || origin_workspace.is_some()))
+    let retarget_requested = explicit_open && current_workspace != Some(visible_workspace);
+    (open && (!was_open || origin_workspace.is_some() || retarget_requested))
         .then(|| origin_workspace.unwrap_or(visible_workspace).to_owned())
 }
 
@@ -14472,6 +14476,7 @@ impl App {
             dismissed_renames: std::collections::HashSet::new(),
             settings_open: false,
             settings_was_open: false,
+            settings_open_requested: false,
             settings_category: ui::settings::Category::default(),
             settings_workspace_id: None,
             settings_search: String::new(),
@@ -22040,12 +22045,12 @@ impl App {
             // 팝오버의 「전체 보기」가 설정→알림으로 연결한다.
             A::OpenNotifications => egui::Popup::toggle_id(ctx, Self::inbox_popup_id()),
             A::OpenEnvironment | A::OpenActivity => {
-                self.settings_category = match action {
+                self.set_settings_category(match action {
                     A::OpenEnvironment => ui::settings::Category::Environment,
                     A::OpenActivity => ui::settings::Category::Activity,
                     _ => unreachable!(),
-                };
-                self.settings_open = true;
+                });
+                self.request_settings_open();
                 self.refresh_workspaces();
             }
             A::OpenAgents => self.handle_agent_shortcut(action, ctx),
@@ -25070,6 +25075,21 @@ impl App {
         self.env_api_projects_cache = None;
         self.env_project_rows_generation = self.env_project_rows_generation.wrapping_add(1);
         self.env_project_rows_failed = false;
+    }
+
+    /// 설정 창 내부 nav 외에 벨/홈/단축키로 나갈 때도 대기 중인 초안을 폐기한다.
+    fn set_settings_category(&mut self, category: ui::settings::Category) {
+        if self.settings_category == ui::settings::Category::Environment
+            && category != ui::settings::Category::Environment
+        {
+            self.reset_environment_view_state();
+        }
+        self.settings_category = category;
+    }
+
+    fn request_settings_open(&mut self) {
+        self.settings_open = true;
+        self.settings_open_requested = true;
     }
 
     /// 탐색이나 닫기에서만 초안과 이전 화면의 공개 요청을 정리한다.
@@ -28237,8 +28257,8 @@ impl App {
                     });
             });
         if open_full {
-            self.settings_category = ui::settings::Category::Notifications;
-            self.settings_open = true;
+            self.set_settings_category(ui::settings::Category::Notifications);
+            self.request_settings_open();
             egui::Popup::close_id(&self.egui_ctx, Self::inbox_popup_id());
         }
         // [N3] 카드 액션 처리 — Popup::show 클로저 밖에서 한다(클로저 내부 빌림 단순화).
@@ -28770,7 +28790,7 @@ impl eframe::App for App {
         #[cfg(target_os = "macos")]
         while let Ok(event) = muda::MenuEvent::receiver().try_recv() {
             if event.id() == "settings" {
-                self.settings_open = true;
+                self.request_settings_open();
             }
         }
 
@@ -30074,7 +30094,7 @@ impl eframe::App for App {
                     ));
                 }
                 Some(ui::file_tree::SidebarAction::OpenSettings) => {
-                    self.settings_open = true;
+                    self.request_settings_open();
                 }
                 // Git은 2026-08-15 2차부터 pane 보조 탭이다 — 새로고침/원격 열기/파일
                 // diff는 이제 git 패널이 보조 본문 안에서 App에 직접 올린다.
@@ -31294,8 +31314,8 @@ impl eframe::App for App {
         }
         match home_action {
             Some(ui::agent_terminal::HomeAction::Connectors) => {
-                self.settings_category = ui::settings::Category::Connectors;
-                self.settings_open = true;
+                self.set_settings_category(ui::settings::Category::Connectors);
+                self.request_settings_open();
             }
             Some(ui::agent_terminal::HomeAction::RefreshNotices) => {
                 // 워커를 즉시 깨워 상태+공지 강제 재조회 — 결과는 기존 스냅샷
@@ -31407,8 +31427,8 @@ impl eframe::App for App {
             }
         }
         if environment_request.is_some() {
-            self.settings_category = ui::settings::Category::Environment;
-            self.settings_open = true;
+            self.set_settings_category(ui::settings::Category::Environment);
+            self.request_settings_open();
         }
         // pane 우클릭 → 세션 폴더 동선 (2026-07-18): 파일 트리 이동은 사이드바 트리의
         // set_root(브레드크럼·'..'과 같은 탐색 메커니즘), Finder는 사이드바
@@ -31875,6 +31895,8 @@ impl eframe::App for App {
             environment_request
                 .as_ref()
                 .map(|(workspace, _)| workspace.as_str()),
+            std::mem::take(&mut self.settings_open_requested),
+            self.settings_workspace_id.as_deref(),
         ) {
             self.settings_workspace_id = Some(selected.clone());
             self.reset_environment_view_state();
@@ -31886,6 +31908,7 @@ impl eframe::App for App {
             }
             ui::env_project_list::request_reveal_selected(ui.ctx());
             if let Some((origin_workspace, request)) = environment_request {
+                let current_cwd = request.current_cwd(&self.session_cwds).map(str::to_owned);
                 if let Some(prefill) = request.prefill {
                     self.environment_ui.queue_prefill(selected, prefill);
                     if self.config.ui.environment_classic_view {
@@ -31896,7 +31919,7 @@ impl eframe::App for App {
                 // 폴더 등록 배너는 기존 활성 프로젝트 전용 동선을 유지한다.
                 if origin_workspace == self.active.id
                     && self.pending_app_controller_action.is_none()
-                    && let Some(cwd) = request.cwd
+                    && let Some(cwd) = current_cwd
                     && cwd.len() <= APP_HOST_PATH_MAX_BYTES
                     && !cwd.as_bytes().contains(&0)
                 {
@@ -45389,22 +45412,54 @@ mod tests {
     }
 
     #[test]
+    fn environment_context_explicit_reentry_retargets_only_a_different_project() {
+        assert_eq!(
+            settings_environment_entry(true, true, "visible", None, true, Some("editing"))
+                .as_deref(),
+            Some("visible"),
+        );
+        assert_eq!(
+            settings_environment_entry(true, true, "visible", None, true, Some("visible")),
+            None,
+            "같은 프로젝트에서 설정을 다시 앞에 띄워도 초안은 지우지 않는다",
+        );
+        assert_eq!(
+            settings_environment_entry(true, true, "visible", None, false, Some("editing")),
+            None,
+            "설정 내부에서 선택한 프로젝트는 명시적 재진입 전까지 유지한다",
+        );
+        assert_eq!(
+            settings_environment_entry(
+                true,
+                true,
+                "visible",
+                Some("origin"),
+                true,
+                Some("editing")
+            )
+            .as_deref(),
+            Some("origin"),
+        );
+    }
+
+    #[test]
     fn environment_context_reopen_uses_visible_project_and_keeps_manual_selection() {
         // 닫았다 다시 열 때만 현재 화면으로 돌아가며 로딩 중 수동 선택은 유지한다.
         assert_eq!(
-            settings_environment_entry(false, true, "visible", None).as_deref(),
+            settings_environment_entry(false, true, "visible", None, false, None).as_deref(),
             Some("visible")
         );
         assert_eq!(
-            settings_environment_entry(true, true, "visible", None),
+            settings_environment_entry(true, true, "visible", None, false, None),
             None
         );
         assert_eq!(
-            settings_environment_entry(true, false, "visible", None),
+            settings_environment_entry(true, false, "visible", None, false, None),
             None
         );
         assert_eq!(
-            settings_environment_entry(false, true, "visible", Some("origin")).as_deref(),
+            settings_environment_entry(false, true, "visible", Some("origin"), false, None)
+                .as_deref(),
             Some("origin")
         );
         assert_eq!(

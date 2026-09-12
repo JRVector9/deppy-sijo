@@ -335,6 +335,7 @@ pub struct CredentialsUi {
     binding_pending: bool,
     provider: String,
     label: String,
+    label_input_state: super::draft_text_edit::DraftTextEditState,
     kind: &'static str,
     secret_input: String,
     secret_input_state: super::draft_text_edit::DraftTextEditState,
@@ -364,6 +365,7 @@ impl CredentialsUi {
             binding_pending: false,
             provider: String::new(),
             label: String::new(),
+            label_input_state: Default::default(),
             kind: "api_key",
             secret_input: String::new(),
             secret_input_state: Default::default(),
@@ -421,6 +423,7 @@ impl CredentialsUi {
         self.env_name.clear();
         self.provider.clear();
         self.label.clear();
+        self.label_input_state.clear();
         self.modern_custom_service = false;
         self.add_pending = false;
         self.error = None;
@@ -781,11 +784,13 @@ impl CredentialsUi {
                     .hint_text(catalog.t("credentials.provider", &[]))
                     .desired_width(120.0),
             );
-            ui.add(
+            let name_response = ui.add(
                 egui::TextEdit::singleline(&mut self.label)
+                    .id(credential_label_input_id())
                     .hint_text(catalog.t("credentials.label", &[]))
                     .desired_width(160.0),
             );
+            self.label_input_state.track(ui.ctx(), name_response.id);
             for kind in ["api_key", "token"] {
                 ui.selectable_value(&mut self.kind, kind, kind);
             }
@@ -827,6 +832,7 @@ impl CredentialsUi {
                 && intent.is_none()
             {
                 self.secret_input_state.clear();
+                self.label_input_state.clear();
                 let secret = std::mem::take(&mut self.secret_input);
                 match SensitiveInput::try_new(secret) {
                     Ok(secret) => {
@@ -962,6 +968,10 @@ impl Drop for CredentialsUi {
 
 fn credential_provider_input_id() -> egui::Id {
     egui::Id::new("credentials_provider_input")
+}
+
+fn credential_label_input_id() -> egui::Id {
+    egui::Id::new("modern_api_name")
 }
 
 fn credential_secret_input_id() -> egui::Id {
@@ -1246,6 +1256,30 @@ mod tests {
         assert!(!view.modern_secret_visible);
         view.reset_modern_draft();
         assert!(view.secret_input.is_empty());
+    }
+
+    #[test]
+    fn environment_context_api_name_reset_and_prefill_discard_previous_undo() {
+        for transition in 0..3 {
+            let mut view = CredentialsUi::new();
+            let (tracked, ctx, id, shared) = crate::ui::draft_text_edit::recorded_fake_input();
+            view.label_input_state = tracked;
+            view.label = "previous-api".into();
+            match transition {
+                0 => view.reset_modern_draft(),
+                1 => {
+                    view.prefill_modern(
+                        crate::ui::environment::EnvironmentSelectionKind::ApiValue,
+                        SensitiveInput::try_new("new-fake-value".into()).unwrap(),
+                    );
+                }
+                _ => view.add_succeeded(),
+            }
+            assert!(view.label.is_empty());
+            assert!(egui::text_edit::TextEditState::load(&ctx, id).is_none());
+            let cursor = egui::text::CCursorRange::one(egui::text::CCursor::new(0));
+            assert!(shared.undoer().undo(&(cursor, String::new())).is_none());
+        }
     }
 
     #[test]

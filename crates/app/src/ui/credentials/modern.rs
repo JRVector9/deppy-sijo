@@ -18,7 +18,7 @@ impl CredentialsUi {
             }
             crate::ui::environment::EnvironmentSelectionKind::ApiValue => {
                 self.secret_input = value.into_inner();
-                egui::Id::new("modern_api_name")
+                credential_label_input_id()
             }
             _ => unreachable!("API 입력 필드만 전달한다"),
         }
@@ -45,6 +45,7 @@ impl CredentialsUi {
         self.env_name.clear();
         self.provider.clear();
         self.label.clear();
+        self.label_input_state.clear();
         self.modern_secret_visible = false;
         self.modern_custom_service = false;
         self.secret_input_overflowed = false;
@@ -243,12 +244,13 @@ impl CredentialsUi {
             );
         }
         field_label(ui, catalog, "env.modern.api_name_optional");
-        ui.add(
+        let name_response = ui.add(
             egui::TextEdit::singleline(&mut self.label)
-                .id(egui::Id::new("modern_api_name"))
+                .id(credential_label_input_id())
                 .hint_text(catalog.t("env.modern.api_name_hint", &[]))
                 .desired_width(f32::INFINITY),
         );
+        self.label_input_state.track(ui.ctx(), name_response.id);
         field_label(ui, catalog, "env.modern.variable_name");
         ui.add(
             egui::TextEdit::singleline(&mut self.env_name)
@@ -330,6 +332,7 @@ impl CredentialsUi {
             .clicked()
         {
             self.secret_input_state.clear();
+            self.label_input_state.clear();
             let secret = std::mem::take(&mut self.secret_input);
             match SensitiveInput::try_new(secret) {
                 Ok(secret) => {

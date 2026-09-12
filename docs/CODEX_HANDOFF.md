@@ -3397,3 +3397,22 @@
 - 최종 gate 5개 모두 exit 0 (`/tmp/deppy-env-rereview-final-gates.log`): fmt check, strict workspace/all-target clippy, check-boundary, i18n-check, diff check. source 변경은 이후 하지 않는다.
 - 사용자 승인된 release 재빌드를 진행한다. 공통 환경 CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target. 명령 cargo build --locked --release -p deppy-sijo -p mcp-proxy. 로그 `/tmp/deppy-env-rereview-release-build.log`.
 - 빌드 전 소스와 실행 bundle hash는 `/tmp/deppy-env-rereview-build-source.json`에 기록한다. 패키징은 `/tmp/deppy-env-rereview-package-20260912.py`로 새 경로에만 생성한다. 다음은 빌드 exit/서명/소스 hash/기존 PID 30263 유지 확인 후 최종 인계/일지 업데이트다. 재실행하지 않는다.
+
+## 2026-09-12 재리뷰 수정·재빌드 완료
+
+- 코드 커밋 **73cc041**. 환경 API 통합 1dd86ba에서 확인한 5건을 보완했다. 소스 5개(app.rs, UI credentials/modern/environment/workspace)와 리뷰 보고서/인계를 커밋했다. 원래 Relay 작업 폴더와 main은 변경하지 않았다.
+- 최종 관련 상태 테스트 **15 PASS**, 필수 gate 5개 모두 PASS. 상세 명령/범위/RED와 결과는 바로 위 절 및 `docs/investigations/2026-09-12-environment-api-rereview.md`. 전체 workspace 테스트나 실제 GUI PASS는 아니다.
+- 승인된 release app+proxy 빌드 exit 0, **1분 16초**(`/tmp/deppy-env-rereview-release-build.log`). 소스 commit/hash 285개를 빌드 전 저장하고 패키징 때 일치를 확인했다.
+- 새 번들: `/private/tmp/deppy-env-api-rereview-20260912-nznzrap4/Deppy Sijo.app`. manifest: 같은 상위 폴더의 `build-manifest.json`. pointer `/tmp/deppy-env-rereview-bundle-path`. source commit, source/binary SHA256, review/gate 결과, app_restarted=false, main_merged=false 포함.
+- Developer ID Application: VectorNine INC (ZDTU5LS35K)로 app/helper/bundle 서명, strict codesign 검증 및 plist lint 모두 통과(`/tmp/deppy-env-rereview-package.log`). app과 helper의 designated requirement가 기존 실행 bundle과 동일함을 추가 확인했다. 공증/배포를 했다는 뜻은 아니다.
+- **재실행하지 않았다.** 현재 PID **30263**은 기존 `/private/tmp/deppy-agent-attention-build-h7vj5ob8/Deppy Sijo.app/Contents/MacOS/deppy-sijo`, 코드 **7442a8f**다. 실행 파일 SHA256이 빌드 전과 일치하고 PID/경로가 유지됨을 확인했다. 사용자 DB/키체인 항목/설정/훅은 변경하지 않았다.
+- 남은 적용: 사용자 재실행 요청 후 새 번들을 실행하고 현재 프로젝트 선택, 우클릭 4개 입력 경로, 새/기존 화면 전환을 직접 확인한다. main 머지/push도 이번 요청에서는 하지 않았다.
+- 다음 명령:
+  `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`
+  `git status --short`
+  `git log -3 --oneline`
+  `cat /tmp/deppy-env-rereview-bundle-path`
+  `cat /tmp/deppy-env-rereview-final-related.log`
+  `rg 'COMMAND|^EXIT' /tmp/deppy-env-rereview-final-gates.log`
+  `ps -o pid,etime,comm -p 30263`
+  재실행 요청을 받으면 먼저 manifest의 binary hash와 현재 PID 실행 경로를 대조한다. 확인한 PID만 종료한 뒤 `open -n '/private/tmp/deppy-env-api-rereview-20260912-nznzrap4/Deppy Sijo.app'`으로 연다. 재빌드는 다시 필요하지 않다. 실행한 새 PID/경로와 manifest를 업데이트한다.

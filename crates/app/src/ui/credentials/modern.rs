@@ -25,6 +25,8 @@ impl CredentialsUi {
     }
 
     pub(super) fn select_modern_service(&mut self, service: Option<(&str, &str)>) {
+        self.provider_input_state.clear();
+        self.env_name_input_state.clear();
         self.modern_custom_service = service.is_none();
         let (provider, variable) = service.unwrap_or(("", ""));
         self.provider = provider.into();
@@ -45,7 +47,8 @@ impl CredentialsUi {
         self.env_name.clear();
         self.provider.clear();
         self.label.clear();
-        self.label_input_state.clear();
+        self.clear_add_metadata_history();
+        self.add_pending_for_draft = false;
         self.modern_secret_visible = false;
         self.modern_custom_service = false;
         self.secret_input_overflowed = false;
@@ -236,28 +239,35 @@ impl CredentialsUi {
                 }
             });
         if self.modern_service_is_custom() {
-            ui.add(
+            let response = ui.add(
                 egui::TextEdit::singleline(&mut self.provider)
                     .id(credential_provider_input_id())
+                    .char_limit(CREDENTIAL_TEXT_INPUT_MAX_BYTES)
                     .hint_text(catalog.t("credentials.provider", &[]))
                     .desired_width(f32::INFINITY),
             );
+            self.provider_input_state.track(ui.ctx(), response.id);
         }
         field_label(ui, catalog, "env.modern.api_name_optional");
         let name_response = ui.add(
             egui::TextEdit::singleline(&mut self.label)
                 .id(credential_label_input_id())
+                .char_limit(CREDENTIAL_TEXT_INPUT_MAX_BYTES)
                 .hint_text(catalog.t("env.modern.api_name_hint", &[]))
                 .desired_width(f32::INFINITY),
         );
         self.label_input_state.track(ui.ctx(), name_response.id);
         field_label(ui, catalog, "env.modern.variable_name");
-        ui.add(
+        let binding_response = ui.add(
             egui::TextEdit::singleline(&mut self.env_name)
+                .id(credential_env_name_input_id())
+                .char_limit(256)
                 .font(egui::TextStyle::Monospace)
                 .hint_text("OPENAI_API_KEY")
                 .desired_width(f32::INFINITY),
         );
+        self.env_name_input_state
+            .track(ui.ctx(), binding_response.id);
         ui.label(
             egui::RichText::new(catalog.t("env.modern.binding_optional", &[]))
                 .small()
@@ -332,12 +342,11 @@ impl CredentialsUi {
             .clicked()
         {
             self.secret_input_state.clear();
-            self.label_input_state.clear();
+            self.clear_add_metadata_history();
             let secret = std::mem::take(&mut self.secret_input);
             match SensitiveInput::try_new(secret) {
                 Ok(secret) => {
-                    self.add_pending = true;
-                    self.error = None;
+                    self.begin_add();
                     self.modern_secret_visible = false;
                     *intent = Some(CredentialsIntent::Add {
                         revision: snapshot.revision(),

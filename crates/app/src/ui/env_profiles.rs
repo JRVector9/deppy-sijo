@@ -398,6 +398,7 @@ pub struct EnvProfilesUi {
     source_pending: bool,
     write_source: Option<String>,
     var_key: String,
+    var_key_input_state: super::draft_text_edit::DraftTextEditState,
     var_plain_value: String,
     var_value_input_state: super::draft_text_edit::DraftTextEditState,
     error: Option<EnvUiErrorCode>,
@@ -419,6 +420,7 @@ impl EnvProfilesUi {
             source_pending: false,
             write_source: None,
             var_key: String::new(),
+            var_key_input_state: Default::default(),
             var_plain_value: String::new(),
             var_value_input_state: Default::default(),
             error: None,
@@ -972,6 +974,7 @@ impl EnvProfilesUi {
         self.show_add_form = false;
         self.delete_confirm = None;
         self.var_key.clear();
+        self.var_key_input_state.clear();
         clear_sensitive_string(&mut self.var_plain_value);
         self.var_value_input_state.clear();
     }
@@ -1249,14 +1252,17 @@ fn compact_env_var_form(
     let mut written = None;
     ui.add_space(8.0);
     ui.horizontal(|ui| {
-        ui.add(
+        let key_response = ui.add(
             egui::TextEdit::singleline(&mut state.var_key)
+                .char_limit(ENV_KEY_INPUT_MAX_BYTES)
                 .hint_text(catalog.t("common.key", &[]))
-                .id_source(env_var_key_input_id())
+                .id(env_var_key_input_id())
                 .desired_width(180.0),
         );
+        state.var_key_input_state.track(ui.ctx(), key_response.id);
         let response = ui.add(
             egui::TextEdit::singleline(&mut state.var_plain_value)
+                .char_limit(ENV_VALUE_INPUT_MAX_BYTES)
                 .id(env_var_value_input_id())
                 .hint_text(catalog.t("common.value", &[]))
                 .desired_width(240.0),
@@ -1273,6 +1279,7 @@ fn compact_env_var_form(
         {
             let key = key.to_owned();
             state.var_value_input_state.clear();
+            state.var_key_input_state.clear();
             let value = std::mem::take(&mut state.var_plain_value);
             let id = (profile_id.to_owned(), key.clone());
             state.remove_local_value(&id.0, &id.1);
@@ -1317,7 +1324,8 @@ fn clear_sensitive_string(value: &mut String) {
         unsafe { std::ptr::write_volatile(byte, 0) };
     }
     std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
-    value.clear();
+    // 초안이 끝나면 다음 입력을 위해 이전 값의 할당을 계속 잡아두지 않는다.
+    *value = String::new();
 }
 
 /// 저장/전달 ACK와 실행 당시 환경을 분리해서 표시한다.
@@ -1397,6 +1405,29 @@ mod tests {
     }
 
     #[test]
+    fn environment_memory_variable_name_history_is_discarded_with_draft() {
+        for prefill in [true, false] {
+            let mut view = EnvProfilesUi::new();
+            let (tracked, ctx, id, shared) = crate::ui::draft_text_edit::recorded_fake_input();
+            view.var_key_input_state = tracked;
+            view.var_key = "OLD_KEY".into();
+            if prefill {
+                view.prefill_modern(
+                    crate::ui::environment::EnvironmentSelectionKind::VariableValue,
+                    crate::ui::credentials::SensitiveInput::try_new("new-fake-value".into())
+                        .unwrap(),
+                );
+            } else {
+                view.reset_modern_draft();
+            }
+            assert!(view.var_key.is_empty());
+            assert!(egui::text_edit::TextEditState::load(&ctx, id).is_none());
+            let cursor = egui::text::CCursorRange::one(egui::text::CCursor::new(0));
+            assert!(shared.undoer().undo(&(cursor, String::new())).is_none());
+        }
+    }
+
+    #[test]
     fn pr188_environment_draft_reset_discards_widget_history() {
         let mut view = EnvProfilesUi::new();
         let (tracked, ctx, id, shared) = crate::ui::draft_text_edit::recorded_fake_input();
@@ -1407,6 +1438,14 @@ mod tests {
         assert!(egui::text_edit::TextEditState::load(&ctx, id).is_none());
         let cursor = egui::text::CCursorRange::one(egui::text::CCursor::new(0));
         assert!(shared.undoer().undo(&(cursor, String::new())).is_none());
+    }
+
+    #[test]
+    fn environment_memory_discarded_variable_input_releases_allocation() {
+        let mut view = EnvProfilesUi::new();
+        view.var_plain_value = "x".repeat(ENV_VALUE_INPUT_MAX_BYTES);
+        view.reset_modern_draft();
+        assert_eq!(view.var_plain_value.capacity(), 0);
     }
 
     struct FakeAdapter {

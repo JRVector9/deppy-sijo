@@ -328,12 +328,21 @@ enum OrphanStatus {
     Purged { purged: usize, remaining: usize },
 }
 
+/// 연결 초안과 위젯 기록을 함께 소유해 행이 사라질 때 같이 해제한다.
+#[derive(Default)]
+struct BindingDraft {
+    value: String,
+    input_state: super::draft_text_edit::DraftTextEditState,
+}
+
 /// Credential settings draft and bounded reveal state. All external work belongs to App.
 pub struct CredentialsUi {
     env_name: String,
-    binding_drafts: HashMap<String, String>,
+    binding_drafts: HashMap<String, BindingDraft>,
     binding_pending: bool,
     provider: String,
+    provider_input_state: super::draft_text_edit::DraftTextEditState,
+    env_name_input_state: super::draft_text_edit::DraftTextEditState,
     label: String,
     label_input_state: super::draft_text_edit::DraftTextEditState,
     kind: &'static str,
@@ -350,6 +359,7 @@ pub struct CredentialsUi {
     orphan_scan_pending: bool,
     orphan_purge_pending: bool,
     add_pending: bool,
+    add_pending_for_draft: bool,
     delete_pending: HashSet<String>,
     reveal_pending: HashSet<String>,
     revealed: HashMap<String, SensitiveDisplay>,
@@ -364,6 +374,8 @@ impl CredentialsUi {
             binding_drafts: HashMap::new(),
             binding_pending: false,
             provider: String::new(),
+            provider_input_state: Default::default(),
+            env_name_input_state: Default::default(),
             label: String::new(),
             label_input_state: Default::default(),
             kind: "api_key",
@@ -380,6 +392,7 @@ impl CredentialsUi {
             orphan_scan_pending: false,
             orphan_purge_pending: false,
             add_pending: false,
+            add_pending_for_draft: false,
             delete_pending: HashSet::new(),
             reveal_pending: HashSet::new(),
             revealed: HashMap::new(),
@@ -390,6 +403,7 @@ impl CredentialsUi {
 
     pub fn invalidate_cache(&mut self) {
         self.snapshot_revision = None;
+        self.binding_drafts.clear();
         self.clear_revealed_secrets();
     }
 
@@ -407,10 +421,24 @@ impl CredentialsUi {
         }
     }
 
+    fn begin_add(&mut self) {
+        self.add_pending = true;
+        self.add_pending_for_draft = true;
+        self.error = None;
+    }
+
+    fn clear_add_metadata_history(&mut self) {
+        self.provider_input_state.clear();
+        self.env_name_input_state.clear();
+        self.label_input_state.clear();
+    }
+
     /// 작업 완료는 화면 이동과 무관하게 처리하고, 현재 초안과 오류는 보존한다.
     pub fn complete_add(&mut self, projection_current: bool, success: bool) {
         self.add_pending = false;
-        if projection_current {
+        // 같은 프로젝트여도 새 초안이면 이전 저장 응답으로 입력을 지우지 않는다.
+        let same_draft = std::mem::take(&mut self.add_pending_for_draft);
+        if projection_current && same_draft {
             if success {
                 self.add_succeeded();
             } else {
@@ -423,9 +451,10 @@ impl CredentialsUi {
         self.env_name.clear();
         self.provider.clear();
         self.label.clear();
-        self.label_input_state.clear();
+        self.clear_add_metadata_history();
         self.modern_custom_service = false;
         self.add_pending = false;
+        self.add_pending_for_draft = false;
         self.error = None;
     }
 
@@ -438,7 +467,10 @@ impl CredentialsUi {
     pub fn report_error(&mut self, code: CredentialsUiErrorCode) {
         match code {
             CredentialsUiErrorCode::BindingFailed => self.binding_pending = false,
-            CredentialsUiErrorCode::AddFailed => self.add_pending = false,
+            CredentialsUiErrorCode::AddFailed => {
+                self.add_pending = false;
+                self.add_pending_for_draft = false;
+            }
             CredentialsUiErrorCode::DeleteFailed => self.delete_pending.clear(),
             CredentialsUiErrorCode::OrphanScanFailed => self.orphan_scan_pending = false,
             CredentialsUiErrorCode::OrphanPurgeFailed => self.orphan_purge_pending = false,
@@ -733,18 +765,21 @@ impl CredentialsUi {
                         let draft = self
                             .binding_drafts
                             .entry(item.id().to_owned())
-                            .or_insert_with(|| {
-                                item.env_name.as_deref().unwrap_or_default().to_owned()
+                            .or_insert_with(|| BindingDraft {
+                                value: item.env_name.as_deref().unwrap_or_default().to_owned(),
+                                ..Default::default()
                             });
-                        ui.add_enabled(
+                        let response = ui.add_enabled(
                             !self.binding_pending,
-                            egui::TextEdit::singleline(draft)
+                            egui::TextEdit::singleline(&mut draft.value)
+                                .char_limit(256)
                                 .hint_text(catalog.t("credentials.env_name", &[]))
                                 .desired_width(200.0),
                         );
-                        truncate_utf8(draft, 256);
-                        let valid = draft.trim().is_empty()
-                            || deppy_core::credential_env::valid_name(draft.trim());
+                        draft.input_state.track(ui.ctx(), response.id);
+                        truncate_utf8(&mut draft.value, 256);
+                        let valid = draft.value.trim().is_empty()
+                            || deppy_core::credential_env::valid_name(draft.value.trim());
                         if ui
                             .add_enabled(
                                 valid && !self.binding_pending && intent.is_none(),
@@ -755,8 +790,8 @@ impl CredentialsUi {
                             *intent = Some(CredentialsIntent::SetEnvBinding {
                                 revision: snapshot.revision(),
                                 credential_id: item.id().to_owned(),
-                                env_name: (!draft.trim().is_empty())
-                                    .then(|| draft.trim().to_owned()),
+                                env_name: (!draft.value.trim().is_empty())
+                                    .then(|| draft.value.trim().to_owned()),
                             });
                             self.binding_pending = true;
                         }
@@ -778,15 +813,19 @@ impl CredentialsUi {
     ) {
         ui.add_space(8.0);
         ui.horizontal_wrapped(|ui| {
-            ui.add(
+            let provider_response = ui.add(
                 egui::TextEdit::singleline(&mut self.provider)
-                    .id_source(credential_provider_input_id())
+                    .id(credential_provider_input_id())
+                    .char_limit(CREDENTIAL_TEXT_INPUT_MAX_BYTES)
                     .hint_text(catalog.t("credentials.provider", &[]))
                     .desired_width(120.0),
             );
+            self.provider_input_state
+                .track(ui.ctx(), provider_response.id);
             let name_response = ui.add(
                 egui::TextEdit::singleline(&mut self.label)
                     .id(credential_label_input_id())
+                    .char_limit(CREDENTIAL_TEXT_INPUT_MAX_BYTES)
                     .hint_text(catalog.t("credentials.label", &[]))
                     .desired_width(160.0),
             );
@@ -794,11 +833,15 @@ impl CredentialsUi {
             for kind in ["api_key", "token"] {
                 ui.selectable_value(&mut self.kind, kind, kind);
             }
-            ui.add(
+            let binding_response = ui.add(
                 egui::TextEdit::singleline(&mut self.env_name)
+                    .id(credential_env_name_input_id())
+                    .char_limit(256)
                     .hint_text(catalog.t("credentials.env_name", &[]))
                     .desired_width(200.0),
             );
+            self.env_name_input_state
+                .track(ui.ctx(), binding_response.id);
             truncate_utf8(&mut self.env_name, 256);
             let response = ui.add(
                 egui::TextEdit::singleline(&mut self.secret_input)
@@ -832,12 +875,11 @@ impl CredentialsUi {
                 && intent.is_none()
             {
                 self.secret_input_state.clear();
-                self.label_input_state.clear();
+                self.clear_add_metadata_history();
                 let secret = std::mem::take(&mut self.secret_input);
                 match SensitiveInput::try_new(secret) {
                     Ok(secret) => {
-                        self.add_pending = true;
-                        self.error = None;
+                        self.begin_add();
                         *intent = Some(CredentialsIntent::Add {
                             revision: snapshot.revision(),
                             credential: NewCredential {
@@ -968,6 +1010,10 @@ impl Drop for CredentialsUi {
 
 fn credential_provider_input_id() -> egui::Id {
     egui::Id::new("credentials_provider_input")
+}
+
+fn credential_env_name_input_id() -> egui::Id {
+    egui::Id::new("credential_env_name_input")
 }
 
 fn credential_label_input_id() -> egui::Id {
@@ -1224,7 +1270,8 @@ fn clear_sensitive_string(value: &mut String) {
         unsafe { std::ptr::write_volatile(byte, 0) };
     }
     std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
-    value.clear();
+    // 내용 삭제 후 큰 붙여넣기로 할당된 용량도 반환한다.
+    *value = String::new();
 }
 
 #[cfg(test)]
@@ -1232,6 +1279,142 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+
+    #[test]
+    fn environment_memory_discarded_api_input_releases_oversized_allocation() {
+        let mut view = CredentialsUi::new();
+        view.secret_input = "x".repeat(CREDENTIAL_SENSITIVE_ITEM_MAX_BYTES * 64);
+        view.reset_modern_draft();
+        assert_eq!(view.secret_input.capacity(), 0);
+    }
+
+    #[test]
+    fn environment_memory_repeated_credential_changes_do_not_accumulate_widget_states() {
+        let ctx = egui::Context::default();
+        let unrelated_id = egui::Id::new("unrelated-editor");
+        egui::text_edit::TextEditState::default().store(&ctx, unrelated_id);
+        let mut view = CredentialsUi::new();
+        let cursor = egui::text::CCursorRange::one(egui::text::CCursor::new(0));
+        for revision in 1..=128 {
+            for row in 0..4 {
+                let credential_id = format!("credential-{revision}-{row}");
+                let id = egui::Id::new(&credential_id);
+                let mut state = egui::text_edit::TextEditState::default();
+                let mut undoer = state.undoer();
+                undoer.feed_state(0.0, &(cursor, "FAKE_TOKEN".into()));
+                state.set_undoer(undoer);
+                state.store(&ctx, id);
+                let mut draft = BindingDraft::default();
+                draft.input_state.track(&ctx, id);
+                view.binding_drafts.insert(credential_id, draft);
+            }
+            view.sync_snapshot(&CredentialsSnapshot::try_new(revision, vec![]).unwrap());
+            assert_eq!(
+                ctx.data(|data| data.count::<egui::text_edit::TextEditState>()),
+                1
+            );
+            assert!(egui::text_edit::TextEditState::load(&ctx, unrelated_id).is_some());
+        }
+    }
+
+    #[test]
+    fn environment_memory_binding_history_is_released_on_refresh_close_and_save() {
+        for transition in 0..3 {
+            let mut view = CredentialsUi::new();
+            let (tracked, ctx, id, shared) = crate::ui::draft_text_edit::recorded_fake_input();
+            view.binding_drafts.insert(
+                "old-credential".into(),
+                BindingDraft {
+                    value: "OLD_TOKEN".into(),
+                    input_state: tracked,
+                },
+            );
+            match transition {
+                0 => view.sync_snapshot(&CredentialsSnapshot::try_new(2, vec![]).unwrap()),
+                1 => view.invalidate_cache(),
+                _ => view.binding_succeeded(),
+            }
+            assert!(view.binding_drafts.is_empty());
+            assert!(egui::text_edit::TextEditState::load(&ctx, id).is_none());
+            let cursor = egui::text::CCursorRange::one(egui::text::CCursor::new(0));
+            assert!(shared.undoer().undo(&(cursor, String::new())).is_none());
+        }
+    }
+
+    #[test]
+    fn environment_memory_api_metadata_history_is_discarded_with_draft() {
+        for provider_field in [true, false] {
+            for prefill in [true, false] {
+                let mut view = CredentialsUi::new();
+                let (tracked, ctx, id, shared) = crate::ui::draft_text_edit::recorded_fake_input();
+                if provider_field {
+                    view.provider_input_state = tracked;
+                } else {
+                    view.env_name_input_state = tracked;
+                }
+                if prefill {
+                    view.prefill_modern(
+                        crate::ui::environment::EnvironmentSelectionKind::ApiValue,
+                        SensitiveInput::try_new("new-fake-value".into()).unwrap(),
+                    );
+                } else {
+                    view.reset_modern_draft();
+                }
+                assert!(egui::text_edit::TextEditState::load(&ctx, id).is_none());
+                let cursor = egui::text::CCursorRange::one(egui::text::CCursor::new(0));
+                assert!(shared.undoer().undo(&(cursor, String::new())).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn environment_memory_late_add_ack_preserves_replacement_draft() {
+        for success in [true, false] {
+            let mut view = CredentialsUi::new();
+            view.begin_add();
+            view.reset_modern_draft();
+            view.select_modern_service(None);
+            view.provider = "next-service".into();
+            view.env_name = "NEXT_TOKEN".into();
+            view.label = "다음 API".into();
+            view.secret_input = "next-fake-secret".into();
+            view.error = Some(CredentialsUiErrorCode::BindingFailed);
+            let (tracked, ctx, id, shared) = crate::ui::draft_text_edit::recorded_fake_input();
+            view.label_input_state = tracked;
+            view.complete_add(true, success);
+            assert!(!view.add_pending);
+            assert_eq!(view.provider, "next-service");
+            assert_eq!(view.env_name, "NEXT_TOKEN");
+            assert_eq!(view.label, "다음 API");
+            assert_eq!(view.secret_input, "next-fake-secret");
+            assert!(view.modern_service_is_custom());
+            assert_eq!(view.error, Some(CredentialsUiErrorCode::BindingFailed));
+            assert!(egui::text_edit::TextEditState::load(&ctx, id).is_some());
+            let cursor = egui::text::CCursorRange::one(egui::text::CCursor::new(0));
+            assert!(shared.undoer().undo(&(cursor, String::new())).is_some());
+        }
+    }
+
+    #[test]
+    fn environment_memory_current_add_ack_still_completes_success_and_failure() {
+        for success in [true, false] {
+            let mut view = CredentialsUi::new();
+            view.provider = "current-service".into();
+            view.label = "현재 API".into();
+            view.begin_add();
+            view.complete_add(true, success);
+            assert!(!view.add_pending);
+            if success {
+                assert!(view.provider.is_empty());
+                assert!(view.label.is_empty());
+                assert!(view.error.is_none());
+            } else {
+                assert_eq!(view.provider, "current-service");
+                assert_eq!(view.label, "현재 API");
+                assert_eq!(view.error, Some(CredentialsUiErrorCode::AddFailed));
+            }
+        }
+    }
 
     #[test]
     fn environment_context_api_prefill_keeps_name_separate_from_binding_and_clears_old_value() {

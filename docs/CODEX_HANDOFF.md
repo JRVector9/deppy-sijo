@@ -3416,3 +3416,52 @@
   `rg 'COMMAND|^EXIT' /tmp/deppy-env-rereview-final-gates.log`
   `ps -o pid,etime,comm -p 30263`
   재실행 요청을 받으면 먼저 manifest의 binary hash와 현재 PID 실행 경로를 대조한다. 확인한 PID만 종료한 뒤 `open -n '/private/tmp/deppy-env-api-rereview-20260912-nznzrap4/Deppy Sijo.app'`으로 연다. 재빌드는 다시 필요하지 않다. 실행한 새 PID/경로와 manifest를 업데이트한다.
+
+## 2026-09-12 메모리 수명 및 코드 재리뷰 착수
+
+- 사용자 최신 요청: 한 번 더 코드 리뷰하고 특히 메모리 누수와 잘못된 코드 수정. 시작 HEAD f16d4e9(소스 73cc041), clean, fix/environment-api-context-integration 작업 폴더.
+- 입력 초안/undo/egui Context 소유권, 환경/API 전환 및 저장/오류의 정리 경로, 캐시 상한, 오래된 비동기 응답을 검토한다. 실제 Codex CLI 소스 리뷰도 진행 중: /tmp/deppy-env-memory-review-20260912.log. 운영 DB/비밀값/사용자 앱은 리뷰에 사용하지 않는다.
+- 이번 요청은 리뷰/수정이며 재빌드·재실행은 새로 실행하지 않는다. 직전 승인 빌드는 소스 73cc041의 /private/tmp/deppy-env-api-rereview-20260912-nznzrap4/Deppy Sijo.app에 완료되어 있다. 실행 앱은 별도 기존 attention 7442a8f bundle이다. 새 소스 수정이 생기면 이 빌드에 포함되지 않는다.
+- 다음: 소스로 확정한 문제를 화면 밖 상태 테스트로 재현한 뒤 수정, 독립 리뷰 반영, 관련 검사 및 커밋/일지. GUI 화면/장시간 RSS 실측 PASS를 주장하지 않는다.
+
+### 메모리 재리뷰 checkpoint — 실제 지적 및 재현 준비
+
+- 독립 Codex CLI 소스 리뷰 완료: P2 2건(같은 프로젝트 새 API 초안을 이전 저장 ACK가 초기화, 변수 이름의 egui undo 정리 누락). 로그 /tmp/deppy-env-memory-review-20260912.log. 실제 Cargo.lock/의존성은 egui 0.36.1이며 구버전 0.35.0을 참고한 초기 탐색 뒤 올바른 버전에서 소유권/IdTypeMap/undoer 구현을 재확인했다.
+- 자체 확인: credential별 binding 위젯 ID는 동적이고 String 초안만 clear해 egui TextEditState가 프로젝트/credential 변경마다 남는다. 현행 egui의 직렬화 예산은 실행 중 map의 자동 삭제를 보장하지 않는다. 연결 초안과 위젯 기록을 한 소유 객체로 묶어 삭제/갱신/닫힘에 함께 해제한다. 고정 ID의 API 서비스명/연결 변수명도 reset 이후 undo 혼입이 있어 변수 이름과 같은 원인으로 수정한다.
+- 비동기 ACK와 위젯 수명 상태 회귀 5건을 추가했다. 첫 실행은 필요한 타입/메서드 부재로 compile RED. scaffold 편집에서 provider 필드 앵커가 NewCredential에도 일치한 오류가 컴파일에 잡혔고 정확한 CredentialsUi로 옮겼다(요청 타입/저장 모델 변경 없음). 실제 assertion RED를 이어서 확인 중: /tmp/deppy-env-memory-behavior-red-20260912.log.
+- 검토 중인 Context clone은 고정 개수이고 상태가 Context에 역참조를 저장하지 않는다. 알려진 순환 누수라고 단정하지 않는다. 레이아웃 Galley 캐시는 프레임별 정리 경로가 있다. 장시간 GUI/RSS 프로파일링은 실행하지 않았다.
+
+### 메모리 재리뷰 checkpoint — 원인 3건 수정
+
+- 실제 상태 RED: 5건 중 1 PASS/4 FAIL(닫힘의 binding 초안 잔류, metadata undo 2종, 이전 Add ACK에 새 provider가 빈 문자열로 바뀜). 수정 뒤 동일 5 PASS(/tmp/deppy-env-memory-green-20260912.log). 중간 컴파일에서 classic provider 위젯의 id_source 앵커 차이를 잡아 .id와 실제 응답 변수로 바로잡았다.
+- 원인별 3건: (1) 동적 binding 초안이 DraftTextEditState를 함께 소유하도록 변경하고 갱신/저장/닫힘에 해제, (2) 변수 이름·API 서비스/연결 이름 위젯을 기존 helper로 추적해 reset/prefill/저장/Drop 시 undo 정리, (3) 현재 초안이 저장 요청의 주체인지 bool로 구분해 새 초안으로 이동한 후 ACK가 입력/오류를 지우지 않도록 함. 대기 중 중복 저장 방지와 현재 요청 성공/실패 처리는 유지한다.
+- 기존에 사후 truncate하던 metadata/환경값 TextEdit에는 char_limit도 추가해 대형 paste 원문이 undo에 무제한 남지 않게 한다. API secret은 한도 초과 거절 계약을 그대로 유지한다. 값/이름의 기존 byte 한도, DB/worker/renderer 스키마 변경 없음.
+- 128회 credential 변경(동적 ID 512개) 후 egui TextEditState가 늘지 않고 무관한 editor 상태는 보존되는 상태 회귀를 추가해 검증 중: /tmp/deppy-env-memory-verified-20260912.log. 실제 GUI/RSS 장시간 테스트와는 구분한다.
+- 수정 소스 5개 대상으로 실제 Codex CLI 후속 리뷰 진행: /tmp/deppy-env-memory-fix-review-20260912.log. 다음은 지적 반영/관련 상태 검사/커밋 직전 gate/보고서·일지. 재빌드·재실행/main 머지는 실행하지 않는다.
+
+### 메모리 재리뷰 checkpoint — 큰 입력 할당 반환 및 최종 검사
+
+- 수정 후 독립 소스 리뷰 완료, 새 확실한 문제 없음: /tmp/deppy-env-memory-fix-review-20260912.log.
+- 추가 자체 확인: clear_sensitive_string의 String::clear가 내용만 비우고 capacity는 유지해 거절된 대형 API paste가 창을 닫아도 계속 할당되어 있었다. 상태 테스트 실제 RED는 API 2,097,152byte, env 65,536byte가 reset 이후 잔류(/tmp/deppy-env-memory-capacity-red-20260912.log). volatile 0 덮기와 compiler_fence 뒤 String::new로 교체해 할당도 반환했다. 이 마지막 두 함수 변경은 범위를 제한한 Codex CLI 재확인 중(/tmp/deppy-env-memory-capacity-review-20260912.log).
+- 신규 최종 상태 회귀 8 PASS(/tmp/deppy-env-memory-final-tests-20260912.log), 128회/512개 동적 ID 정리 및 큰 입력 allocation 반환 포함. 원인별 지적은 4건으로 정리한다. 현재 같은 코드에서 기존 관련 17건과 커밋 직전 gate 5개를 실행 중: /tmp/deppy-env-memory-final-related-20260912.log, /tmp/deppy-env-memory-final-gates-20260912.log.
+- 수정 소스는 UI 상태 5파일. release 빌드/실행 bundle/main 변경 없음. 결과를 PASS로 확정하기 전에 각 exit와 실제 test count를 확인한다.
+
+## 2026-09-12 메모리/코드 재리뷰 수정 완료
+
+- 확인한 원인별 4건 모두 수정: 동적 연결 위젯 undo 누적, 큰 입력 폐기 후 allocation 유지, 고정 이름 필드의 과거 undo 혼입, 같은 프로젝트의 늦은 저장 ACK가 새 초안을 초기화. 상세 증거/의존성/한계는 docs/investigations/2026-09-12-environment-api-memory-review.md.
+- 최종 소스: ui/credentials.rs 및 credentials/modern.rs, ui/env_profiles.rs 및 env_profiles/modern.rs, ui/environment.rs. DB/worker/터미널 renderer/wire/Fleet 변경 없음. 두 기존 Fleet 회귀 계약도 변경하지 않았다.
+- 최종 상태 테스트 **25 PASS** = 신규 메모리/ACK 회귀 8 + 기존 관련 상태 17. 실제 egui state/undo 공유 사본과 128회/512 ID 누적, 2MiB 입력 allocation 반환을 검사했다. /tmp/deppy-env-memory-final-tests-20260912.log 및 /tmp/deppy-env-memory-final-related-20260912.log. GUI 클릭/장시간 RSS 프로파일링/전체 workspace 테스트 PASS는 아니다.
+- 필수 gate 5개 모두 exit 0: cargo fmt --all -- --check; cargo clippy --locked --workspace --all-targets -- -D warnings; cargo run --locked -p xtask -- check-boundary; cargo run --locked -p xtask -- i18n-check; git diff --check. /tmp/deppy-env-memory-final-gates-20260912.log.
+- 실제 수정 후 Codex CLI 리뷰 두 번 모두 추가 확실한 지적 없음: 전체 수정 소스 5개는 fix-review 로그, 마지막 allocation 해제 두 함수는 capacity-review 로그. 모두 운영 데이터/앱 접근 없이 소스만 확인했으며 테스트는 주 에이전트가 실행했다. 확인한 미반영 지적 없음.
+- **적용 상태:** 이번 요청에서 release 재빌드/패키징/재실행/main 머지/push는 하지 않았다. PID 30263이 /private/tmp/deppy-agent-attention-build-h7vj5ob8/Deppy Sijo.app의 attention 7442a8f 앱으로 유지됨을 확인했다. 직전 준비 bundle /private/tmp/deppy-env-api-rereview-20260912-nznzrap4/Deppy Sijo.app는 73cc041 소스이며 이번 수정은 포함하지 않는다.
+- 최종 소스 및 보고서는 `fix(env): 입력 메모리 회수와 저장 응답 수명 보완` 커밋으로 저장한다. Obsidian 프로젝트 일지에도 실제 커밋/검증/미적용 상태를 기록한다.
+- 다음 에이전트 명령:
+  `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`
+  `git status --short`
+  `git log -3 --oneline`
+  `git show --stat HEAD`
+  `cat docs/investigations/2026-09-12-environment-api-memory-review.md`
+  `rg 'test result:' /tmp/deppy-env-memory-final-tests-20260912.log /tmp/deppy-env-memory-final-related-20260912.log`
+  `rg 'COMMAND:|^EXIT:' /tmp/deppy-env-memory-final-gates-20260912.log`
+  `ps -o pid,etime,comm -p 30263`
+  사용자 재빌드 승인 후에만 `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo build --locked --release -p deppy-sijo -p mcp-proxy` 실행. 새 소스 hash manifest와 별도 bundle을 생성하고 기존 Developer ID/지정 요구사항으로 서명 확인한다. 예전 package 스크립트는 이전 manifest를 고정 참조하므로 새 source hash로 준비해야 한다. 재실행 승인 전 기존 PID/bundle을 변경하지 않는다.

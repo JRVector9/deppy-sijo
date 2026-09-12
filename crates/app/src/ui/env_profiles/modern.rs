@@ -167,16 +167,19 @@ impl EnvProfilesUi {
             return;
         }
         field_label(ui, catalog, "env.modern.variable_name");
-        ui.add(
+        let key_response = ui.add(
             egui::TextEdit::singleline(&mut self.var_key)
+                .char_limit(ENV_KEY_INPUT_MAX_BYTES)
                 .id(env_var_key_input_id())
                 .font(egui::TextStyle::Monospace)
                 .hint_text("APP_ENV")
                 .desired_width(f32::INFINITY),
         );
+        self.var_key_input_state.track(ui.ctx(), key_response.id);
         field_label(ui, catalog, "common.value");
         let response = ui.add(
             egui::TextEdit::singleline(&mut self.var_plain_value)
+                .char_limit(ENV_VALUE_INPUT_MAX_BYTES)
                 .id(env_var_value_input_id())
                 .hint_text("development")
                 .desired_width(f32::INFINITY),
@@ -229,6 +232,7 @@ impl EnvProfilesUi {
         {
             let key = key.to_owned();
             self.var_value_input_state.clear();
+            self.var_key_input_state.clear();
             let value = std::mem::take(&mut self.var_plain_value);
             self.remove_local_value(snapshot.dotenv_profile_id().unwrap_or_default(), &key);
             self.var_key.clear();

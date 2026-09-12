@@ -94,7 +94,7 @@ impl EnvironmentUi {
         env.reset_modern_draft();
         credentials.reset_modern_draft();
         env.invalidate_cache();
-        credentials.clear_revealed_secrets();
+        credentials.invalidate_cache();
     }
 
     fn cancel_editor(&mut self, env: &mut EnvProfilesUi, credentials: &mut CredentialsUi) {

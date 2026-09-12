@@ -3465,3 +3465,20 @@
   `rg 'COMMAND:|^EXIT:' /tmp/deppy-env-memory-final-gates-20260912.log`
   `ps -o pid,etime,comm -p 30263`
   사용자 재빌드 승인 후에만 `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo build --locked --release -p deppy-sijo -p mcp-proxy` 실행. 새 소스 hash manifest와 별도 bundle을 생성하고 기존 Developer ID/지정 요구사항으로 서명 확인한다. 예전 package 스크립트는 이전 manifest를 고정 참조하므로 새 source hash로 준비해야 한다. 재실행 승인 전 기존 PID/bundle을 변경하지 않는다.
+
+## 2026-09-12 최신 메모리 수정본 적용 준비
+
+- 사용자 `다음작업해봐` 요청의 후속 단계로 최신 소스 4840c2a release 앱+proxy 빌드 및 별도 서명 bundle 준비를 진행한다. 확인된 미반영 코드 지적은 없으므로 같은 리뷰/테스트를 반복하지 않는다. 현재 실행 앱은 PID 30263/attention 7442a8f이고 유지한다.
+- HEAD/branch/추적 소스 hash/기존 바이너리 hash를 /tmp/deppy-env-memory-build-source-20260912.json에 저장했다. docs와 markdown은 build hash에서 제외한다.
+- 빌드: CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo build --locked --release -p deppy-sijo -p mcp-proxy. /tmp/deppy-env-memory-release-build-20260912.log.
+- 패키징 스크립트는 /tmp/deppy-env-memory-package-20260912.py. 예전 manifest를 덮지 않고 새 source manifest/pointer/별도 stage 디렉터리를 사용한다. 현재 실행 bundle과 동일 Developer ID 및 designated requirement를 확인한다.
+- main 머지와 앱 재실행은 이번 적용 준비와 별개로 유지한다. 재실행은 사용 중인 앱을 종료하므로 기존 대기 지시를 유지한다. 다음: 빌드 exit/서명/plist/source hash 대조/현재 실행 PID 유지 → 인계 및 일지.
+
+### 최신 메모리 수정본 빌드 완료 / 재실행 대기
+
+- 소스 **4840c2a**, release app+proxy 빌드 exit 0, **54.26초**. 이전 상태 테스트 25 PASS/gate 5개 PASS 이후 소스 변경 없이 빌드했고 같은 검사는 반복하지 않았다. 로그 /tmp/deppy-env-memory-release-build-20260912.log.
+- 새 bundle: `/private/tmp/deppy-env-api-memory-20260912-8ay35h6f/Deppy Sijo.app`. manifest: `/private/tmp/deppy-env-api-memory-20260912-8ay35h6f/build-manifest.json`. pointer: /tmp/deppy-env-memory-bundle-path. 추적 입력 파일 790개의 hash와 HEAD 일치를 패키징 직전에 확인했고 실제 패키지의 app/helper SHA256을 기록·대조했다.
+- Developer ID Application: VectorNine INC (ZDTU5LS35K)로 서명. app/helper/bundle의 strict codesign 검증, plist lint PASS. 두 바이너리의 designated requirement가 기존 실행본과 동일함을 자동 대조했다. /tmp/deppy-env-memory-package-20260912.log. 공증/배포를 실행했다는 뜻은 아니다.
+- 현재 실행 PID 30263/attention 7442a8f bundle 유지, 기존 app/helper hash 불변. **재실행/main 머지/push 미실행**. 새 bundle에 환경/API 통합·현재 프로젝트 선택·우클릭 prefill·메모리/ACK 수정까지 포함되어 있지만 아직 실행 중인 앱에는 미반영이다.
+- 구현/필수 검사의 미완료 항목은 없음. 다음은 사용자 재실행 요청 후 현재 PID 경로와 새 manifest hash를 다시 확인하고 새 bundle 실행, 실제 화면 및 사용 중 메모리 확인이다.
+- 다음 명령: `cat /tmp/deppy-env-memory-bundle-path`; `ps -o pid,etime,comm -p 30263`; `git log -2 --oneline`. 재실행 요청 시 검증된 PID만 종료하고 `open -n '/private/tmp/deppy-env-api-memory-20260912-8ay35h6f/Deppy Sijo.app'`으로 실행한다. `pkill -f` 금지. 새 소스 변경이 없으면 재빌드는 불필요하다.

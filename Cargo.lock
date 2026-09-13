@@ -5660,7 +5660,7 @@ dependencies = [
  "aes",
  "aes-gcm",
  "anyhow",
- "base64 0.22.1",
+ "base64 0.23.1",
  "deppy-core",
  "getrandom 0.4.3",
  "ghash",

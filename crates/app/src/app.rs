@@ -31911,10 +31911,6 @@ impl eframe::App for App {
                 let current_cwd = request.current_cwd(&self.session_cwds).map(str::to_owned);
                 if let Some(prefill) = request.prefill {
                     self.environment_ui.queue_prefill(selected, prefill);
-                    if self.config.ui.environment_classic_view {
-                        self.config.ui.environment_classic_view = false;
-                        self.pending_config_save = true;
-                    }
                 }
                 // 폴더 등록 배너는 기존 활성 프로젝트 전용 동선을 유지한다.
                 if origin_workspace == self.active.id
@@ -32467,6 +32463,13 @@ impl eframe::App for App {
                                                     }
                                                     credentials_intent = next_credential;
                                                 } else {
+                                                    let prefill_focus =
+                                                        self.environment_ui.prepare_classic(
+                                                            &mut self.env_profiles_ui,
+                                                            &self.env_profiles_snapshot,
+                                                            &mut self.credentials_ui,
+                                                            &self.credentials_snapshot,
+                                                        );
                                                     ui::env_profiles::render_application_status(
                                                         ui,
                                                         &application_view,
@@ -32488,6 +32491,11 @@ impl eframe::App for App {
                                                             &self.credentials_snapshot,
                                                             &text,
                                                         );
+                                                    if let Some(id) = prefill_focus {
+                                                        ui.memory_mut(|memory| {
+                                                            memory.request_focus(id)
+                                                        });
+                                                    }
 
                                                     // .env 라이브 반영 토글(E5 ⑨ — 옵트인).
                                                     ui.add_space(14.0);

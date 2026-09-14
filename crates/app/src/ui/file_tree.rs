@@ -6078,7 +6078,14 @@ fn session_row_impl(
     // 텍스트는 행 폭(좌 11 + 우 여백 16) 안으로 잘라 '…' 처리 — 고정 글자수 truncate는
     // 좁은 사이드바에서 박스 밖으로 삐져나갔다(#91 사용자).
     let max_w = (rect.width() - text_inset - SESSION_CONTENT_RIGHT_INSET).max(10.0);
-    let (title_galley, status_galley) = session_title_lines(ui, entry, dot, sub_color, max_w);
+    let status_text_color = crate::ui::agent_visuals::status_text_color(
+        crate::agent_surface::AgentVisualState::from_pty_with_agent(
+            entry.status,
+            entry.agent_line.is_some(),
+        ),
+    );
+    let (title_galley, status_galley) =
+        session_title_lines(ui, entry, status_text_color, sub_color, max_w);
     // 2행/3행: 에이전트면 agent_line/status_line, 아니면 요약(2행)만.
     // 에이전트: 1행 = 지금 하는 일(status_line), 2행 = 에이전트·모델·강도(agent_line).
     // 셸: 기존대로 제목 + 요약.

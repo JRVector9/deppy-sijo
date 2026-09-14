@@ -3496,3 +3496,36 @@
 - 결과: /tmp/deppy-env-memory-restart-20260914.json; 로그: 같은 이름 .log. bundle 상위 build-manifest.json의 app_restarted=true, running_pid=90452, restarted_at를 갱신했다. main 머지/push 미실행.
 - 새 환경/API 화면, 현재 프로젝트 선택, 우클릭 입력, 메모리/초안 수명 수정이 실행본에 포함된다. 실제 화면 동작과 장시간 메모리 개선은 아직 사용자 사용 확인 전이며 PASS로 단정하지 않는다.
 - 다음 에이전트: `git status --short`; `git log -2 --oneline`; `cat /tmp/deppy-env-memory-restart-20260914.json`; `ps -o pid,etime,comm -p 90452`. 새 코드 변경이 없다면 추가 재빌드/재실행은 필요 없다.
+
+## 2026-09-14 상태 문구 강조 및 환경/API 기존 화면 복귀 착수
+
+- 사용자: 다음 지시 대기 문구가 제목과 같은 회색이라 구분되지 않음, 환경/API 디자인은 이전으로 복귀 요청. 이어서 진행 승인. 현재 소스 4840c2a / 문서 HEAD 78562b6, 실행 PID 90452.
+- 원인: Sidebar session_title_lines가 점 색을 문구에도 쓰고 Idle 점 색은 과거 요청대로 회색이다. 상태 판정을 바꾸지 않고 문구 전용 색(Idle 청록, 나머지 기존 의미색)을 분리한다. 제목/행 배경/점 크기/애니메이션은 유지한다.
+- 환경/API는 기존 보기 설정을 기본으로 복원하고 우클릭 prefill이 새 보기로 강제 전환하던 경로를 제거한다. 기존 양식에서도 snapshot 로딩 후 초안을 한 번 채우고 입력칸을 열도록 연결해 기존 UI로 돌아가도 기능을 유지한다. 저장/메모리 수명 개선은 되돌리지 않는다.
+- 화면 복귀를 기존 토글로 시도했으나 다른 앱과 화면 포커스가 바뀌어 확정하지 못했다. 좌표 입력을 더 반복하지 않으며 다른 앱 내용이 캡처된 임시 파일은 즉시 삭제했다. 사용자 설정/데이터는 아직 수정하지 않았다.
+- UI 색상/배치 테스트는 추가하거나 실행하지 않는다. prefill 수명/설정값은 화면 밖 로직이므로 관련 상태 회귀로 검증한다. 새 빌드/재실행은 기존 승인 규칙에 맞춰 실제 적용 전에 확인한다.
+
+### 2026-09-14 기존 화면 복귀 / 지시 대기 문구·색상 수정
+
+- 사용자 추가 요청에 따라 한국어 상태 표기 5개(status.idle, session.activity.idle, workspace.summary.idle 및 idle_count, fleet.state.idle)를 `지시 대기`로 통일했다. 상태 판정 자체는 변경하지 않았다.
+- 실행 중인 PID 90452의 설정 창을 대상으로 기존 보기 토글을 전환했다. 초기 다른 앱 포커스 문제 이후 PID/창/전면 앱 확인을 붙인 Swift 도우미로 전환했고, 저장된 ui.environment_classic_view=true를 확인했다. 이후 특정 창 스크린샷은 해당 창을 캡처하지 못해 화면 검증 PASS로 기록하지 않는다. 앱 재실행은 하지 않았다.
+- 소스 변경: app.rs의 강제 새 보기 전환 제거 및 기존 양식 prefill 연결; config.rs 기본값 true; ui/environment.rs prepare_classic; ui/credentials.rs·env_profiles.rs 기존 양식 열기; ui/agent_visuals.rs 문구 전용 Idle 청록 #70D7C7; ui/file_tree.rs·agent_sessions.rs 적용; ko-KR/messages.txt 표기 단축.
+- 상태/config 회귀 23 PASS = 새 classic prefill 1 + config roundtrip 1 + environment_context_ 10 + environment_memory_ 8 + pr188_ 3. 실제 로그 /tmp/deppy-classic-prefill-green-20260914.log 및 /tmp/deppy-classic-state-checks-20260914.log. 색상/레이아웃 UI 회귀 검사는 실행하지 않았다.
+- RED 증거: prepare_classic scaffold에서 drawer 잔류 assertion FAIL, 구 설정 기본값에서 roundtrip assertion FAIL. 첫 컴파일 중 scaffold를 추가했으므로 missing method compile RED라고 보고하지 않는다. 실수로 추가 실행한 broad environment_ cargo는 lock 대기 PID 72691만 SIGTERM으로 취소했고 PASS로 계산하지 않았다.
+- 독립 Codex CLI 실제 소스 리뷰: 기존 보기 prefill/config 수명 추가 지적 없음. P2 1건은 구조화 세션의 `● 문구`가 하나의 색을 공유해 점까지 바뀌는 문제였으며, 하나의 LayoutJob 안에서 점과 문구의 색을 분리해 수정했다. 간격과 하나의 label 구조는 유지한다. /tmp/deppy-classic-status-review-20260914.log.
+- 최종 게이트를 커밋 직전에 한 번 실행한다. 로그 /tmp/deppy-classic-status-final-gates-20260914.log. 결과는 완료 후 기록한다. release 빌드/패키징/재실행/main 머지/push는 미실행이며 현재 PID 90452는 4840c2a 소스다. 문구/색상 및 classic 우클릭 개선 적용은 새 빌드·재실행 승인 후 진행한다.
+
+### 2026-09-14 최종 검사 완료 / 새 UI 적용 대기
+
+- 커밋 직전 필수 gate **5개 모두 exit 0**: fmt --check, workspace/all-targets clippy -D warnings, check-boundary, i18n-check, git diff --check. /tmp/deppy-classic-status-final-gates-20260914.log. i18n-check가 실행한 번역/config 검사도 통과했으며 전체 앱 테스트나 새 UI 화면 검증을 했다는 뜻은 아니다.
+- 코드 리뷰에서 확인한 점 색상 변경 1건은 수정 완료. 상태 점/레일은 기존 팔레트, `지시 대기` 문구만 청록색이다. 원래 워크트리 feat/fleet-one-list-and-relay-wip / 75bf2c9는 변경하지 않았다.
+- 이번 변경은 fix/environment-api-context-integration에서 `fix(ui): 지시 대기 강조와 환경 API 기존 보기 복원` 커밋으로 저장한다. main merge/push/새 PR 생성/앱 release 재빌드/재실행은 실행하지 않는다. 사용자 기존 규칙대로 새 앱 적용 전 재빌드·재실행 승인을 확인한다.
+- 다음 에이전트 명령:
+  `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`
+  `git status --short`
+  `git log -2 --oneline`
+  `git show --stat HEAD`
+  `rg 'COMMAND:|^EXIT:' /tmp/deppy-classic-status-final-gates-20260914.log`
+  `ps -o pid,etime,comm -p 90452`
+- 승인 후 빌드 명령: `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo build --locked --release -p deppy-sijo -p mcp-proxy`. 현재 source hash로 새 manifest와 별도 bundle을 만들고 기존 Developer ID / designated requirement 동일성을 확인한다. 기존 4840c2a bundle/manifest를 덮어쓰지 않는다. 승인된 재실행은 현재 PID/경로를 재확인해 정상 종료부터 요청한다.
+- 새 화면 확인 항목: 사이드바/구조화 세션에 `지시 대기` 청록 문구 + 회색 점, 기존 환경/API 화면 유지, 우클릭 4종 입력이 기존 양식에 한 번만 채워짐. 아직 새 빌드 화면은 미확인이다.

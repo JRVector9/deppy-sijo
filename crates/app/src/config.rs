@@ -232,7 +232,7 @@ pub struct UiConfig {
     #[serde(default)]
     pub env_live_reload: bool,
     /// 환경 및 API의 이전 화면으로 즉시 복귀하는 표시 설정이다.
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub environment_classic_view: bool,
     /// 터미널 선택 → "에이전트로 보내기" 프리셋 프롬프트 (2026-07-17 시나리오 ①).
     /// 선택 텍스트 앞에 붙는 지시문 목록 — 비우면 "그대로 보내기"만 뜬다.
@@ -336,7 +336,7 @@ impl Default for UiConfig {
             auto_resume_agents: true,
             agent_status_hooks: true,
             env_live_reload: false,
-            environment_classic_view: false,
+            environment_classic_view: true,
             agent_send_presets: default_agent_send_presets(),
             session_name_style: SessionNameStyle::default(),
             last_workspace_id: None,
@@ -698,7 +698,7 @@ mod tests {
     #[test]
     fn environment_view_config_roundtrip() {
         let mut config: Config = toml::from_str("[ui]\ntheme = \"dark\"\n").unwrap();
-        assert!(!config.ui.environment_classic_view);
+        assert!(config.ui.environment_classic_view);
         for classic in [true, false] {
             config.ui.environment_classic_view = classic;
             let saved = toml::to_string(&config).unwrap();

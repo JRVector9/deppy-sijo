@@ -5,6 +5,14 @@
 
 use crate::agent_surface::AgentVisualState;
 
+/// 다음 지시를 기다리는 문구는 점/레일보다 선명하게 표시한다.
+pub(crate) const fn status_text_color(state: AgentVisualState) -> egui::Color32 {
+    match state {
+        AgentVisualState::Idle => egui::Color32::from_rgb(0x70, 0xd7, 0xc7),
+        _ => status_color(state),
+    }
+}
+
 pub(crate) const fn status_color(state: AgentVisualState) -> egui::Color32 {
     match state {
         AgentVisualState::Off => egui::Color32::from_rgb(0x8b, 0x94, 0x9e),

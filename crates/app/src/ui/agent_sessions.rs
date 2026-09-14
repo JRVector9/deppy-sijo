@@ -2895,11 +2895,26 @@ impl AgentSessionsUi {
             .iter()
             .any(|pending| pending.session_id() == session.id);
         ui.horizontal(|ui| {
-            let color = status_color(session.status);
-            ui.colored_label(
-                color,
-                format!("● {}", structured_status_label(session.status, catalog)),
+            let state = crate::agent_surface::AgentVisualState::from_structured(session.status);
+            let font_id = egui::FontSelection::Default.resolve(ui.style());
+            let mut label = egui::text::LayoutJob::default();
+            label.append(
+                "● ",
+                0.0,
+                egui::TextFormat::simple(
+                    font_id.clone(),
+                    crate::ui::agent_visuals::status_color(state),
+                ),
             );
+            label.append(
+                &structured_status_label(session.status, catalog),
+                0.0,
+                egui::TextFormat::simple(
+                    font_id,
+                    crate::ui::agent_visuals::status_text_color(state),
+                ),
+            );
+            ui.label(label);
             if let Some(thread_id) = &session.thread_id {
                 ui.weak(catalog.t("agent_sessions.thread", &[]));
                 ui.monospace(short_id(thread_id));
@@ -3969,12 +3984,6 @@ fn one_line_title(value: &str, catalog: &i18n::Catalog) -> String {
     } else {
         title.chars().take(80).collect()
     }
-}
-
-fn status_color(status: AgentSessionStatus) -> egui::Color32 {
-    crate::ui::agent_visuals::status_color(crate::agent_surface::AgentVisualState::from_structured(
-        status,
-    ))
 }
 
 fn api_key_error_message(code: AgentSessionsSecretErrorCode, catalog: &i18n::Catalog) -> String {

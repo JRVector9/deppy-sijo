@@ -138,6 +138,23 @@ impl EnvironmentUi {
         self.apply_pending_prefill(env, snapshot, credentials, credential_snapshot)
     }
 
+    /// 기존 보기에서도 같은 로딩/초안 수명 경계를 사용한다.
+    pub(crate) fn prepare_classic(
+        &mut self,
+        env: &mut EnvProfilesUi,
+        snapshot: &EnvProfilesSnapshot,
+        credentials: &mut CredentialsUi,
+        credential_snapshot: &CredentialsSnapshot,
+    ) -> Option<egui::Id> {
+        let focus = self.prepare_view(env, snapshot, credentials, credential_snapshot)?;
+        match self.drawer.take() {
+            Some(EntryKind::Api) => credentials.open_prefilled_form(),
+            Some(EntryKind::Variable) => env.open_prefilled_form(),
+            None => {}
+        }
+        Some(focus)
+    }
+
     /// 두 snapshot이 준비된 다음에만 채워 첫 로딩의 초안 초기화에 지워지지 않는다.
     fn apply_pending_prefill(
         &mut self,
@@ -387,6 +404,45 @@ pub(super) fn field_label(ui: &mut egui::Ui, catalog: &i18n::Catalog, key: &str)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn environment_classic_prefill_waits_for_snapshots_and_is_consumed_once() {
+        for kind in [
+            EnvironmentSelectionKind::ApiName,
+            EnvironmentSelectionKind::ApiValue,
+            EnvironmentSelectionKind::VariableName,
+            EnvironmentSelectionKind::VariableValue,
+        ] {
+            let mut view = EnvironmentUi::default();
+            let mut env = EnvProfilesUi::new();
+            let mut credentials = CredentialsUi::new();
+            view.queue_prefill(
+                "origin".into(),
+                EnvironmentPrefill::from_selection(kind, "FAKE_VALUE").unwrap(),
+            );
+            assert!(
+                view.prepare_classic(
+                    &mut env,
+                    &EnvProfilesSnapshot::loading(1, "origin", true),
+                    &mut credentials,
+                    &CredentialsSnapshot::loading(1)
+                )
+                .is_none()
+            );
+            assert!(view.pending_prefill.is_some());
+            let loaded = CredentialsSnapshot::try_new(2, vec![]).unwrap();
+            assert!(
+                view.prepare_classic(&mut env, &ready("origin"), &mut credentials, &loaded)
+                    .is_some()
+            );
+            assert!(view.pending_prefill.is_none());
+            assert!(view.drawer.is_none());
+            assert!(
+                view.prepare_classic(&mut env, &ready("origin"), &mut credentials, &loaded)
+                    .is_none()
+            );
+        }
+    }
 
     #[test]
     fn environment_context_reactivated_cwd_requires_current_detection() {

@@ -368,6 +368,10 @@ pub struct CredentialsUi {
 }
 
 impl CredentialsUi {
+    pub(crate) fn open_prefilled_form(&mut self) {
+        self.show_add_form = true;
+    }
+
     pub fn new() -> Self {
         Self {
             env_name: String::new(),

@@ -414,6 +414,10 @@ pub struct EnvProfilesUi {
 }
 
 impl EnvProfilesUi {
+    pub(crate) fn open_prefilled_form(&mut self) {
+        self.show_add_form = true;
+    }
+
     pub fn new() -> Self {
         Self {
             source_draft: None,

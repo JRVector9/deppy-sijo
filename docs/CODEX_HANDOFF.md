@@ -3529,3 +3529,24 @@
   `ps -o pid,etime,comm -p 90452`
 - 승인 후 빌드 명령: `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo build --locked --release -p deppy-sijo -p mcp-proxy`. 현재 source hash로 새 manifest와 별도 bundle을 만들고 기존 Developer ID / designated requirement 동일성을 확인한다. 기존 4840c2a bundle/manifest를 덮어쓰지 않는다. 승인된 재실행은 현재 PID/경로를 재확인해 정상 종료부터 요청한다.
 - 새 화면 확인 항목: 사이드바/구조화 세션에 `지시 대기` 청록 문구 + 회색 점, 기존 환경/API 화면 유지, 우클릭 4종 입력이 기존 양식에 한 번만 채워짐. 아직 새 빌드 화면은 미확인이다.
+
+## 2026-09-14 지시 대기 / 기존 환경 API 보기 재빌드·재실행 착수
+
+- 사용자 `재빌드하고 재실행해` 승인. 소스 3ffe476, 현재 실행 PID 90452 / 4840c2a bundle을 확인했다. 승인된 빌드와 재실행만 진행하며 이미 통과한 검사/리뷰를 반복하지 않는다.
+- 현재 추적 소스 hash와 이전 실행 바이너리 hash는 /tmp/deppy-classic-status-build-source-20260914.json. 빌드 로그 /tmp/deppy-classic-status-release-build-20260914.log. 패키징 스크립트 /tmp/deppy-classic-status-package-20260914.py는 새 별도 디렉터리를 사용하고 기존 Developer ID 및 designated requirement를 보존·대조한다.
+- 임시 패키징 스크립트 생성 시 경로 prefix 치환이 2곳에 일치해 assertion으로 중단했다. 생성 코드만 구체적인 변수/prefix 앵커로 수정했고 기존 bundle/소스에는 영향 없다. 빌드는 단 한 번 실행 중이며 별도 패키징은 빌드 성공 후 실행한다.
+- 재실행 직전 현재 PID/경로와 새 bundle hash/서명을 대조하고 정상 종료 후 새 bundle을 연다. 완료 전 재실행 PASS로 기록하지 않는다. main 머지/push는 요청 범위에 없다.
+
+### 2026-09-14 새 빌드 준비 완료 / 승인된 재실행 시작
+
+- 소스 **3ffe476**, release 앱+proxy 빌드 exit 0 / **269.35초**. 기존 통과 검사를 반복하지 않았다.
+- 새 bundle: `/private/tmp/deppy-classic-status-20260914-uriwbafq/Deppy Sijo.app`. manifest: `/private/tmp/deppy-classic-status-20260914-uriwbafq/build-manifest.json`. 추적 입력 790개 hash/HEAD 확인, 기존 bundle hash 보존, Developer ID 서명 및 앱/helper designated requirement 동일성, strict codesign, plist lint 모두 확인했다. 패키징 로그 /tmp/deppy-classic-status-package-20260914.log.
+- 사용자 승인된 정상 종료/재실행은 /tmp/deppy-classic-status-restart-20260914.py를 독립 프로세스로 실행한다. 종료 대상 PID 90452 / 기존 4840c2a bundle. 로그 /tmp/deppy-classic-status-restart-20260914.log, 결과 /tmp/deppy-classic-status-restart-20260914.json. 도중 연결이 끊기면 이 결과 JSON과 실제 PID/실행 경로를 확인하고, 이미 성공한 재실행을 반복하지 않는다.
+
+### 2026-09-14 지시 대기 / 기존 환경 API 보기 재빌드·재실행 완료
+
+- 최신 소스 **3ffe476**으로 release 앱+proxy 재빌드(269.35초), 새 bundle 서명/소스 hash 대조 후 재실행 완료. 기존 PID 90452는 정상 종료 요청으로 종료됐으며 SIGTERM fallback은 사용하지 않았다.
+- 현재 PID **56307**, 실행 경로 `/private/tmp/deppy-classic-status-20260914-uriwbafq/Deppy Sijo.app/Contents/MacOS/deppy-sijo`. 재실행 결과 verified=true와 실행 후 생존/정확한 경로를 별도로 재확인했다. 기존 보기 저장값 environment_classic_view=true.
+- 적용 소스에는 한국어 `지시 대기` 단축, Idle 문구 청록 강조, 점/레일 기존 팔레트 유지, 환경/API 기존 보기 기본값 및 우클릭 prefill 연결이 포함된다. 실제 화면은 사용자 사용 확인 대상이며 자동 UI 검증 PASS로 보고하지 않는다.
+- 인계/일지 외 추가 소스 변경, 테스트 재실행, main 머지/push 없음. 다음은 사용자 화면 피드백 대응이다.
+- 다음 에이전트: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git log -2 --oneline`; `cat /tmp/deppy-classic-status-restart-20260914.json`; `ps -o pid,etime,comm -p 56307`. 같은 소스 재빌드·재실행은 반복할 필요 없다.

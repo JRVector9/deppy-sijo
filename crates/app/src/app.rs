@@ -32153,7 +32153,8 @@ impl eframe::App for App {
         let mut connector_intent: Option<connector_contract::ConnectorIntent> = None;
         // .env 라이브 반영 토글(E5 ⑨) — 클로저 안에서 편집하고 밖에서 저장/적용.
         let mut env_live_reload_toggle = self.config.ui.env_live_reload;
-        let mut environment_classic_view = self.config.ui.environment_classic_view;
+        // 저장된 보기 선택과 무관하게 기존 화면을 사용한다. 새 화면 코드는 복구용으로 보관한다.
+        let environment_classic_view = true;
         // #3 워크스페이스 이름 편집 캡처 (클로저 밖에서 db/refresh 처리 — self 전체 &mut).
         let scrollback_view = self.scrollback_policy_view();
         // Relay 뷰모델 — web_view와 **독립**이다. 상태·에러·페어링·기기 목록이 각자 있다.
@@ -32283,21 +32284,8 @@ impl eframe::App for App {
                                 .text_styles
                                 .insert(egui::TextStyle::Small, egui::FontId::proportional(12.0));
                         }
-                        // 배경은 전환 버튼보다 먼저 그려 버튼을 덮지 않는다.
                         ui.painter()
                             .rect_filled(ui.clip_rect(), 0.0, ui.visuals().panel_fill);
-                        ui.horizontal_wrapped(|ui| {
-                            ui.selectable_value(
-                                &mut environment_classic_view,
-                                false,
-                                text.t("env.modern.new_view", &[]),
-                            );
-                            ui.selectable_value(
-                                &mut environment_classic_view,
-                                true,
-                                text.t("env.modern.classic_view", &[]),
-                            );
-                        });
                         // 프로젝트 rail은 전용 renderer가 배경을 그린다.
                         // T1: 우클릭 진입 시 감지한 세션 폴더 배너 — cwd가 어떤 워크스페이스에도
                         // 속하지 않으면 새 프로젝트 등록, 활성 워크스페이스가 경로 미설정이면
@@ -32718,12 +32706,6 @@ impl eframe::App for App {
             }
         }
         // 관리/모니터 액션 처리 (클로저 밖 — self 전체 &mut 필요한 것들)
-        if environment_classic_view != self.config.ui.environment_classic_view {
-            self.config.ui.environment_classic_view = environment_classic_view;
-            self.pending_config_save = true;
-            self.reset_environment_view_state();
-            ui.ctx().request_repaint();
-        }
         if env_live_reload_toggle != self.config.ui.env_live_reload {
             self.config.ui.env_live_reload = env_live_reload_toggle;
             self.pending_config_save = true;

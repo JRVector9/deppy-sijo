@@ -3550,3 +3550,29 @@
 - 적용 소스에는 한국어 `지시 대기` 단축, Idle 문구 청록 강조, 점/레일 기존 팔레트 유지, 환경/API 기존 보기 기본값 및 우클릭 prefill 연결이 포함된다. 실제 화면은 사용자 사용 확인 대상이며 자동 UI 검증 PASS로 보고하지 않는다.
 - 인계/일지 외 추가 소스 변경, 테스트 재실행, main 머지/push 없음. 다음은 사용자 화면 피드백 대응이다.
 - 다음 에이전트: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git log -2 --oneline`; `cat /tmp/deppy-classic-status-restart-20260914.json`; `ps -o pid,etime,comm -p 56307`. 같은 소스 재빌드·재실행은 반복할 필요 없다.
+
+## 2026-09-14 환경/API 화면 전환 버튼 제거 및 기존 화면 고정
+
+- 사용자: 새 화면/기존 화면 전환 버튼 자체 제거, 기존 화면 기본 적용 후 재빌드·재실행 승인. 현재 HEAD 66cc4e1 / 실행 PID 56307.
+- app.rs: 화면 전환 행과 선택 저장/초안 초기화 처리 제거. 기존 보기 여부는 true로 고정해 과거 설정 false여도 기존 UI를 사용한다. 새 화면 구현은 복구용으로 보관하고 기존 양식의 우클릭 prefill 연결은 유지한다. 5개 로케일에서 사라진 버튼 키 2개씩만 함께 삭제했다.
+- UI 변경이므로 별도 UI 회귀 검사 없이 먼저 빌드·재실행한다. 소스 리뷰와 커밋 직전 gate는 이후 완료한다. 빌드는 아직 미커밋 소스이며 /tmp/deppy-classic-only-build-source-20260914.json에 base HEAD와 실제 입력 hash를 기록했다. 최종 커밋 후 hash 동일성을 확인해 실행 manifest에 source commit을 연결한다.
+- 빌드 로그 /tmp/deppy-classic-only-release-build-20260914.log. 패키징 스크립트 /tmp/deppy-classic-only-package-20260914.py. 이전 bundle을 덮지 않고 동일 Developer ID / designated requirement를 대조한다.
+
+### 전환 버튼 제거 빌드 완료 / 재실행 시작
+
+- release 앱+proxy 빌드 exit 0 / 46.13초. 별도 bundle `/private/tmp/deppy-classic-only-20260914-nd32mv_w/Deppy Sijo.app` 생성, 소스 입력 hash 및 기존 서명 요구사항 일치, strict codesign/plist lint 확인 완료.
+- PID 56307 정상 종료 후 새 bundle 실행을 /tmp/deppy-classic-only-restart-20260914.py로 독립 실행한다. 로그 /tmp/deppy-classic-only-restart-20260914.log, 결과 /tmp/deppy-classic-only-restart-20260914.json. 완료 여부는 JSON과 실제 PID 경로로 확인한다.
+
+### 전환 버튼 제거 재실행 완료 / 커밋 전 검사
+
+- 이전 PID 56307 정상 종료 후 새 PID 5277 / `/private/tmp/deppy-classic-only-20260914-nd32mv_w/Deppy Sijo.app/Contents/MacOS/deppy-sijo` 실행 및 생존 확인. SIGTERM fallback 미사용. 아직 미커밋 입력으로 빌드했으므로 result.source_commit은 build base 66cc4e1이며 최종 커밋 후 실제 hash를 대조해 보정한다.
+- 실제 Codex CLI 소스 리뷰 추가 지적 없음: /tmp/deppy-classic-only-review-20260914.log. 기존 prefill/현재 프로젝트 선택/프로젝트 변경 정리는 유지되고 삭제한 키의 잔여 참조가 없음을 확인했다.
+- 앱 설정 창의 캡처는 성공했으나 터미널 설정 탭이어서 요청 화면 검증 증거가 아니다. 환경/API 탭 전환 전에 해당 설정 창이 window 목록에서 사라져 추가 좌표 클릭은 중단했다. UI 화면 검증 PASS라고 기록하지 않으며 사용자 화면 확인 대상이다. 새 앱에 명시된 소스가 포함되는 것은 hash로 확인했다.
+- 별도 UI 회귀 검사를 실행하지 않았다. 커밋 직전 gate는 /tmp/deppy-classic-only-final-gates-20260914.log에 한 번 실행한다.
+
+### 전환 버튼 제거 완료
+
+- 커밋 직전 fmt --check, workspace/all-targets clippy -D warnings, check-boundary, i18n-check, diff --check **5개 모두 exit 0**. /tmp/deppy-classic-only-final-gates-20260914.log. 추가 리뷰 지적 없음. 새 UI 회귀 테스트는 실행하지 않았다.
+- 실제 실행 bundle의 빌드 입력 790개 hash가 최종 소스와 같은지 다시 확인했다. `fix(ui): 환경 API 화면 전환 버튼 제거`로 커밋하고 manifest/result의 source_commit을 해당 커밋에 연결한다. build_base_commit 및 source_dirty_at_build 기록은 그대로 보존한다.
+- 현재 PID 5277 / `/private/tmp/deppy-classic-only-20260914-nd32mv_w/Deppy Sijo.app/Contents/MacOS/deppy-sijo`. 기존 화면 고정·전환 버튼 제거가 포함된 앱을 이미 실행 중이다. 우클릭 API/env 입력 및 상태 문구 강조는 유지한다. main 머지/push 없음.
+- 다음 에이전트: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git log -2 --oneline`; `cat /tmp/deppy-classic-only-restart-20260914.json`; `ps -o pid,etime,comm -p 5277`. 사용자가 보고 피드백하면 그 항목부터 대응하며 동일 소스 재빌드·재실행을 반복하지 않는다.

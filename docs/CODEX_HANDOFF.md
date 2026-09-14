@@ -3482,3 +3482,17 @@
 - 현재 실행 PID 30263/attention 7442a8f bundle 유지, 기존 app/helper hash 불변. **재실행/main 머지/push 미실행**. 새 bundle에 환경/API 통합·현재 프로젝트 선택·우클릭 prefill·메모리/ACK 수정까지 포함되어 있지만 아직 실행 중인 앱에는 미반영이다.
 - 구현/필수 검사의 미완료 항목은 없음. 다음은 사용자 재실행 요청 후 현재 PID 경로와 새 manifest hash를 다시 확인하고 새 bundle 실행, 실제 화면 및 사용 중 메모리 확인이다.
 - 다음 명령: `cat /tmp/deppy-env-memory-bundle-path`; `ps -o pid,etime,comm -p 30263`; `git log -2 --oneline`. 재실행 요청 시 검증된 PID만 종료하고 `open -n '/private/tmp/deppy-env-api-memory-20260912-8ay35h6f/Deppy Sijo.app'`으로 실행한다. `pkill -f` 금지. 새 소스 변경이 없으면 재빌드는 불필요하다.
+
+## 2026-09-14 검증된 최신 빌드 재실행 착수
+
+- 사용자 `재빌드한 버전으로 재실행해` 승인. 준비된 4840c2a bundle /private/tmp/deppy-env-api-memory-20260912-8ay35h6f/Deppy Sijo.app의 app/helper SHA256과 strict codesign 서명을 재확인했다. 재빌드/테스트는 반복하지 않는다.
+- 교체 대상 PID 30263, 이전 bundle /private/tmp/deppy-agent-attention-build-h7vj5ob8/Deppy Sijo.app 경로 확인. PID를 다시 대조하고 정상 종료를 먼저 요청한 뒤 새 bundle을 연다. 재실행 전/후 상태는 /tmp/deppy-env-memory-restart-20260914.log 및 같은 이름 .json에 기록한다.
+- 분리 실행 스크립트 /tmp/deppy-env-memory-restart-20260914.py는 앱이 터미널 세션을 정리해도 재실행을 마치도록 별도 process session에서 실행한다. 성공 전에는 재실행 완료로 기록하지 않는다. 재개 시 해당 로그/JSON/manifest와 실행 PID를 먼저 확인한다.
+
+### 2026-09-14 최신 빌드 재실행 완료
+
+- 사용자 승인대로 이전 PID 30263에 정상 종료를 요청했고 성공했다(SIGTERM fallback 미사용). 최신 소스 **4840c2a**의 기존 준비 bundle로 재실행 완료. 새 PID **90452**, 실행 경로 `/private/tmp/deppy-env-api-memory-20260912-8ay35h6f/Deppy Sijo.app/Contents/MacOS/deppy-sijo`.
+- app/helper SHA256과 strict codesign을 실행 전에 확인했고 새 PID의 정확한 bundle 경로/재실행 후 생존을 확인했다. 재빌드/테스트를 반복하거나 소스를 변경하지 않았다.
+- 결과: /tmp/deppy-env-memory-restart-20260914.json; 로그: 같은 이름 .log. bundle 상위 build-manifest.json의 app_restarted=true, running_pid=90452, restarted_at를 갱신했다. main 머지/push 미실행.
+- 새 환경/API 화면, 현재 프로젝트 선택, 우클릭 입력, 메모리/초안 수명 수정이 실행본에 포함된다. 실제 화면 동작과 장시간 메모리 개선은 아직 사용자 사용 확인 전이며 PASS로 단정하지 않는다.
+- 다음 에이전트: `git status --short`; `git log -2 --oneline`; `cat /tmp/deppy-env-memory-restart-20260914.json`; `ps -o pid,etime,comm -p 90452`. 새 코드 변경이 없다면 추가 재빌드/재실행은 필요 없다.

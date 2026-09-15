@@ -3686,3 +3686,9 @@
 - 소스 리뷰: `ctx.open_url(new_tab)`은 기존 외부 링크가 쓰던 동일 경로이고, 새 Link interaction이 child hover widget 뒤에 있어 클릭 hit를 받는다. row_index는 show_rows의 절대 인덱스여서 같은 URL이어도 다른 Id. Link 접근성 라벨은 유지, 원제목 hover 내용은 overlay에서도 제공. 새 URL 처리, feed parser, 번역 캐시, storage/App 변경 없음. Codex CLI 소스 리뷰는 이번 요청에서 실행하지 않았으며 CLI PASS라고 주장하지 않는다.
 - 수정 파일: crates/app/src/ui/agent_terminal.rs 및 docs/CODEX_HANDOFF.md. 앞선 메모 리뷰 기록은 이 문서의 미커밋 수정으로 함께 보존. 한국어 Conventional 커밋 `fix(home): 공지 행 전체에서 원문 링크 열기` 예정. 화면/OS 브라우저 전환은 실행 앱 949fc72에 아직 반영 전이며 사용자 직접 확인 대상. 앱 재빌드·재실행은 이 새 수정에 대해 별도 승인을 받지 않았다. main merge/push 없음.
 - 다음 에이전트 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git log -3 --oneline`; `git show --stat HEAD`; `tail -n 12 /tmp/deppy-home-notice-click-final-hover-green-20260915.log`; `ps -o pid,etime,comm -p 51078`. 새 bundle 적용 승인 후 앞선 메모 aeb3162 및 공지 HEAD를 함께 입력으로 재빌드하고 실행 PID 경로/source hash 검증 후 직접 화면 클릭 피드백을 받는다.
+
+### 홈 공지 클릭 수정 커밋 완료 / 앱 적용 대기
+
+- 실제 소스 커밋 **10d3b564d0f5224ef6c5875ebdc3ac6caa20be1d** `fix(home): 공지 행 전체에서 원문 링크 열기`. 소스·인계 문서 포함, 코드 커밋 뒤 작업 트리 clean 확인. 사용자 공지 증상의 링크 클릭 명령은 검사 1 PASS로 확인했지만 실제 실행 앱/OS 브라우저는 이 소스로 아직 재빌드·재기동되지 않았다.
+- 옵시디언 일지 `~/Library/CloudStorage/SynologyDrive-sync_data/Obsidian-Vault/프로젝트 일지/deppy-sijo/2026-09-15 홈 공지 행 링크 클릭 복구.md` 기록. 본 인계 문단은 커밋 뒤 source commit/적용 상태를 보존하는 docs-only 후속 커밋이다. 실행 PID 51078 / 949fc72 기존 bundle은 그대로 유지했다.
+- 다음 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git log -3 --oneline`; `git show --stat 10d3b56`; `ps -o pid,etime,comm -p 51078`. 적용 승인 시 최신 HEAD와 build input hash를 연결한 별도 signed release bundle을 준비하고 지금 실행 앱만 정상 종료한 뒤 새 PID/경로를 검증한다. main merge/push 및 공지 실제 화면 검증은 아직 하지 않았다.

@@ -1080,6 +1080,10 @@ pub struct FileTreeUi {
     /// 워크스페이스별 세션 트리 펼침 상태. 포커스 전환과 독립적이어서 다른 workspace를
     /// 선택해도 기존 트리는 사용자가 직접 접기 전까지 유지된다.
     workspace_sessions_expanded: HashMap<String, bool>,
+    /// 워크스페이스 그룹 경계 드래그로 정한 높이. 순서가 바뀌어도 id를 따라간다.
+    workspace_group_heights: HashMap<String, f32>,
+    /// 직전 프레임 그룹의 실제 높이. 첫 드래그에서 인접 두 그룹의 합을 보존한다.
+    workspace_group_measured_heights: HashMap<String, f32>,
     /// 활성 변경을 감지해 이전 활성의 기본-open 상태를 map에 고정한다. 이 기록이 없으면
     /// 명시값이 없던 이전 workspace가 inactive가 되는 순간 default false로 닫힌다.
     last_sidebar_active_workspace: Option<String>,
@@ -1170,6 +1174,8 @@ impl FileTreeUi {
             env_warning_candidates: BTreeSet::new(),
             session_name_edit: None,
             workspace_sessions_expanded: HashMap::new(),
+            workspace_group_heights: HashMap::new(),
+            workspace_group_measured_heights: HashMap::new(),
             last_sidebar_active_workspace: None,
             selected: BTreeSet::new(),
             select_anchor: None,
@@ -2062,6 +2068,72 @@ impl FileTreeUi {
         resp.dragged()
     }
 
+    /// 인접한 워크스페이스 그룹의 경계만 잡는다. 행 드래그(순서 변경)와 hit 영역을
+    /// 겹치지 않게 분리하고, 두 그룹 높이의 합은 그대로 유지한다.
+    fn workspace_group_resize_handle(
+        &mut self,
+        ui: &mut egui::Ui,
+        upper_id: &str,
+        lower_id: &str,
+        upper_rect: egui::Rect,
+        sessions_by_workspace: &HashMap<String, Vec<SidebarSessionRow>>,
+        active_workspace_id: &str,
+    ) {
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), WORKSPACE_GROUP_SPLIT_HEIGHT),
+            egui::Sense::hover(),
+        );
+        let response = ui
+            .interact(
+                rect,
+                ui.id().with(("workspace_group_split", upper_id, lower_id)),
+                egui::Sense::drag(),
+            )
+            .on_hover_cursor(egui::CursorIcon::ResizeVertical);
+        if response.dragged()
+            && let Some(lower_height) = self.workspace_group_measured_heights.get(lower_id).copied()
+        {
+            let upper_height = upper_rect.height();
+            let total = upper_height + lower_height;
+            let upper_min = workspace_group_min_height(
+                upper_id,
+                active_workspace_id,
+                &self.workspace_sessions_expanded,
+                sessions_by_workspace,
+            );
+            let lower_min = workspace_group_min_height(
+                lower_id,
+                active_workspace_id,
+                &self.workspace_sessions_expanded,
+                sessions_by_workspace,
+            );
+            if total >= upper_min + lower_min {
+                let upper =
+                    (upper_height + response.drag_delta().y).clamp(upper_min, total - lower_min);
+                self.workspace_group_heights
+                    .insert(upper_id.to_owned(), upper);
+                self.workspace_group_heights
+                    .insert(lower_id.to_owned(), total - upper);
+                ui.ctx().request_repaint();
+            }
+        }
+        let color = if response.hovered() || response.dragged() {
+            ui.visuals().selection.bg_fill
+        } else {
+            crate::ui::designall::separator_stroke(ui.visuals()).color
+        };
+        let y = crate::ui::snap_line_to_pixel(
+            rect.center().y,
+            crate::ui::designall::SEPARATOR_WIDTH,
+            ui.ctx().pixels_per_point(),
+        );
+        ui.painter().hline(
+            rect.x_range(),
+            y,
+            egui::Stroke::new(crate::ui::designall::SEPARATOR_WIDTH, color),
+        );
+    }
+
     fn contents(
         &mut self,
         ui: &mut egui::Ui,
@@ -2095,6 +2167,19 @@ impl FileTreeUi {
                         .iter()
                         .any(|workspace| workspace.id == *workspace_id)
                 });
+                self.workspace_group_heights.retain(|workspace_id, _| {
+                    sidebar
+                        .workspaces
+                        .iter()
+                        .any(|workspace| workspace.id == *workspace_id)
+                });
+                self.workspace_group_measured_heights
+                    .retain(|workspace_id, _| {
+                        sidebar
+                            .workspaces
+                            .iter()
+                            .any(|workspace| workspace.id == *workspace_id)
+                    });
                 sync_workspace_expansion_on_switch(
                     &mut self.workspace_sessions_expanded,
                     &mut self.last_sidebar_active_workspace,
@@ -2138,9 +2223,6 @@ impl FileTreeUi {
                         sidebar.workspaces,
                         sidebar.active_workspace_id,
                     );
-                    // 세션 블록 상한은 스크롤 진입 **전** 실제 패널 높이로 계산한다 — ScrollArea
-                    // 내부의 available_height는 사실상 무한이라 비례 계산이 무의미해진다.
-                    let session_max_h = (ui.available_height() * 0.34).clamp(70.0, 230.0);
                     let active_sessions = sessions_by_workspace
                         .get(sidebar.active_workspace_id)
                         .map(Vec::as_slice)
@@ -2153,6 +2235,9 @@ impl FileTreeUi {
                     // 최악 높이를 유지하면서 before 행들만 스크롤로 흡수한다.
                     // 순서 변경 드래그는 세 구간(활성 앞/활성/활성 뒤)이 상태를 공유한다.
                     // 그룹 rect는 그린 순서 그대로 쌓여 그대로 드롭 위치 계산의 기준이 된다.
+                    // 경계 드래그가 같은 프레임에서 아래쪽 그룹만 새 높이로 그리면
+                    // 전체 목록 길이가 한 프레임 튄다. 이번 프레임 높이를 먼저 고정한다.
+                    let rendered_group_heights = self.workspace_group_heights.clone();
                     let mut group_rects: Vec<(String, egui::Rect)> = Vec::new();
                     let mut drag_released = false;
                     egui::ScrollArea::vertical()
@@ -2164,7 +2249,13 @@ impl FileTreeUi {
                             // 가르므로 여백이 따로 필요 없다 — 목업의 .ws border-top과 같다.
                             ui.spacing_mut().item_spacing.y = 0.0;
                             for workspace in before_active {
+                                let group_height =
+                                    rendered_group_heights.get(&workspace.id).copied();
                                 let inner = ui.scope(|ui| {
+                                    if let Some(height) = group_height {
+                                        ui.set_min_height(height);
+                                        ui.set_max_height(height);
+                                    }
                                     let color = workspace_accent(sidebar.workspaces, &workspace.id);
                                     let expanded = self
                                         .workspace_sessions_expanded
@@ -2210,7 +2301,9 @@ impl FileTreeUi {
                                             workspace,
                                             sidebar.active_workspace_id,
                                             sessions,
-                                            session_max_h,
+                                            group_height.map(|height| {
+                                                (height - WORKSPACE_GROUP_HEADER_HEIGHT).max(0.0)
+                                            }),
                                             color,
                                             catalog,
                                         );
@@ -2219,13 +2312,33 @@ impl FileTreeUi {
                                         }
                                     }
                                 });
-                                paint_workspace_group_separator(ui, inner.response.rect);
                                 group_rects.push((workspace.id.clone(), inner.response.rect));
+                                self.workspace_group_measured_heights
+                                    .insert(workspace.id.clone(), inner.response.rect.height());
+                                if let Some(next) = sidebar.workspaces.get(group_rects.len()) {
+                                    self.workspace_group_resize_handle(
+                                        ui,
+                                        &workspace.id,
+                                        &next.id,
+                                        inner.response.rect,
+                                        sessions_by_workspace,
+                                        sidebar.active_workspace_id,
+                                    );
+                                } else {
+                                    paint_workspace_group_separator(ui, inner.response.rect);
+                                }
                             }
                             let active_color =
                                 workspace_accent(sidebar.workspaces, sidebar.active_workspace_id);
+                            let active_group_height = active.and_then(|workspace| {
+                                rendered_group_heights.get(&workspace.id).copied()
+                            });
                             let active_inner = ui.scope(|ui| {
                                 if let Some(active) = active {
+                                    if let Some(height) = active_group_height {
+                                        ui.set_min_height(height);
+                                        ui.set_max_height(height);
+                                    }
                                     let expanded = self
                                         .workspace_sessions_expanded
                                         .get(&active.id)
@@ -2268,10 +2381,12 @@ impl FileTreeUi {
                                     .unwrap_or(true)
                                     && !active_sessions.is_empty();
                                 if active_sessions_visible {
-                                    // 세션이 많으면 목록이 패널을 다 먹고 아래로 넘쳐 잘렸다 (2026-07-05
-                                    // 사용자 보고). 세션 목록은 자기 상한 안에서만 스크롤하고, 나머지는
-                                    // 파일 트리가 갖는다. auto_shrink[_, true]로 세션이 적으면 줄어든다.
-                                    egui::ScrollArea::vertical()
+                                    // 기본 그룹은 전체 워크스페이스 목록 스크롤이 책임진다.
+                                    // 경계 드래그로 그룹 높이를 정한 경우에만 세션이 그룹
+                                    // 내부에서 스크롤한다. auto_shrink로 적은 세션은 줄어든다.
+                                    workspace_session_scroll(active_group_height.map(|height| {
+                                        (height - WORKSPACE_GROUP_HEADER_HEIGHT).max(0.0)
+                                    }))
                                         .id_salt("session_list_scroll")
                                         .auto_shrink([false, true])
                                         .show(ui, |ui| {
@@ -2537,15 +2652,36 @@ impl FileTreeUi {
                                         });
                                 }
                             });
-                            paint_workspace_group_separator(ui, active_inner.response.rect);
                             if active.is_some() {
                                 group_rects.push((
                                     sidebar.active_workspace_id.to_owned(),
                                     active_inner.response.rect,
                                 ));
+                                self.workspace_group_measured_heights.insert(
+                                    sidebar.active_workspace_id.to_owned(),
+                                    active_inner.response.rect.height(),
+                                );
+                                if let Some(next) = sidebar.workspaces.get(group_rects.len()) {
+                                    self.workspace_group_resize_handle(
+                                        ui,
+                                        sidebar.active_workspace_id,
+                                        &next.id,
+                                        active_inner.response.rect,
+                                        sessions_by_workspace,
+                                        sidebar.active_workspace_id,
+                                    );
+                                } else {
+                                    paint_workspace_group_separator(ui, active_inner.response.rect);
+                                }
                             }
                             for workspace in after_active {
+                                let group_height =
+                                    rendered_group_heights.get(&workspace.id).copied();
                                 let inner = ui.scope(|ui| {
+                                    if let Some(height) = group_height {
+                                        ui.set_min_height(height);
+                                        ui.set_max_height(height);
+                                    }
                                     let color = workspace_accent(sidebar.workspaces, &workspace.id);
                                     let expanded = self
                                         .workspace_sessions_expanded
@@ -2591,7 +2727,9 @@ impl FileTreeUi {
                                             workspace,
                                             sidebar.active_workspace_id,
                                             sessions,
-                                            session_max_h,
+                                            group_height.map(|height| {
+                                                (height - WORKSPACE_GROUP_HEADER_HEIGHT).max(0.0)
+                                            }),
                                             color,
                                             catalog,
                                         );
@@ -2600,8 +2738,21 @@ impl FileTreeUi {
                                         }
                                     }
                                 });
-                                paint_workspace_group_separator(ui, inner.response.rect);
                                 group_rects.push((workspace.id.clone(), inner.response.rect));
+                                self.workspace_group_measured_heights
+                                    .insert(workspace.id.clone(), inner.response.rect.height());
+                                if let Some(next) = sidebar.workspaces.get(group_rects.len()) {
+                                    self.workspace_group_resize_handle(
+                                        ui,
+                                        &workspace.id,
+                                        &next.id,
+                                        inner.response.rect,
+                                        sessions_by_workspace,
+                                        sidebar.active_workspace_id,
+                                    );
+                                } else {
+                                    paint_workspace_group_separator(ui, inner.response.rect);
+                                }
                             }
                             // ── 순서 변경 드래그: 놓일 자리 표시, 놓는 순간 확정 ──
                             if let Some(dragged) = self.workspace_drag.clone() {
@@ -4746,7 +4897,7 @@ fn workspace_row(
     // 축소는 기존 값에 0.9를 곱해 처리돼 29.19가 됐는데, 그 값은 물리 픽셀에 안 맞아
     // 행이 쌓일수록 원점이 밀렸다(2x에서 행마다 0.38px 누적 → 행마다 선명도가 달랐다).
     // 축소 의도는 유지하면서 가장 가까운 정렬값으로 내린다(29.0 × 2 = 58px 정수).
-    let row_height = 29.0;
+    let row_height = WORKSPACE_GROUP_HEADER_HEIGHT;
     // 클릭(전환/펼침)에 더해 드래그도 받는다 — 사이드바에서 워크스페이스를 끌어 순서를
     // 바꾼다(2026-09-03 사용자). egui는 드래그 임계값을 넘으면 clicked()를 내지 않으므로
     // 두 제스처가 서로를 삼키지 않는다.
@@ -4994,7 +5145,39 @@ const NAV_HELP_MENU_MIN_WIDTH: f32 = 170.0;
 const PROJECT_SECTION_MIN_HEIGHT: f32 = 84.0;
 const FILE_SECTION_MIN_HEIGHT: f32 = 50.0;
 const PROJECT_FILE_SPLIT_HEIGHT: f32 = 6.0;
+const WORKSPACE_GROUP_SPLIT_HEIGHT: f32 = 6.0;
+const WORKSPACE_GROUP_HEADER_HEIGHT: f32 = 29.0;
 const WORKSPACE_CARD_HORIZONTAL_INSET: f32 = 6.0;
+
+fn workspace_group_min_height(
+    workspace_id: &str,
+    active_workspace_id: &str,
+    expanded: &HashMap<String, bool>,
+    sessions_by_workspace: &HashMap<String, Vec<SidebarSessionRow>>,
+) -> f32 {
+    let sessions_visible = expanded
+        .get(workspace_id)
+        .copied()
+        .unwrap_or(workspace_id == active_workspace_id)
+        && sessions_by_workspace
+            .get(workspace_id)
+            .is_some_and(|sessions| !sessions.is_empty());
+    WORKSPACE_GROUP_HEADER_HEIGHT
+        + if sessions_visible {
+            SESSION_ROW_HEIGHT + 4.0
+        } else {
+            0.0
+        }
+}
+
+fn workspace_session_scroll(max_height: Option<f32>) -> egui::ScrollArea {
+    let scroll = egui::ScrollArea::vertical();
+    if let Some(height) = max_height {
+        scroll.max_height(height).min_scrolled_height(0.0)
+    } else {
+        scroll
+    }
+}
 
 fn project_file_section_heights(available: f32, requested_project: f32) -> (f32, f32) {
     let usable = (available - PROJECT_FILE_SPLIT_HEIGHT).max(0.0);
@@ -5523,7 +5706,7 @@ fn inactive_workspace_sessions(
     workspace: &SidebarWorkspaceEntry,
     active_workspace_id: &str,
     sessions: &[SidebarSessionRow],
-    _max_height: f32,
+    max_height: Option<f32>,
     accent_color: egui::Color32,
     catalog: &i18n::Catalog,
 ) -> (Option<SidebarAction>, Option<egui::Rect>) {
@@ -5532,7 +5715,7 @@ fn inactive_workspace_sessions(
     }
     let mut action = None;
     let mut session_rows_rect = None;
-    egui::ScrollArea::vertical()
+    workspace_session_scroll(max_height)
         .id_salt(("inactive_session_list_scroll", &workspace.id))
         .auto_shrink([false, true])
         .show(ui, |ui| {
@@ -12287,7 +12470,7 @@ mod tests {
                         &workspace,
                         "workspace-a",
                         std::slice::from_ref(&entry),
-                        120.0,
+                        None,
                         egui::Color32::LIGHT_BLUE,
                         &catalog,
                     );
@@ -12576,7 +12759,7 @@ mod tests {
                         &workspace,
                         "workspace-a",
                         std::slice::from_ref(&entry),
-                        120.0,
+                        None,
                         egui::Color32::LIGHT_BLUE,
                         &catalog,
                     );

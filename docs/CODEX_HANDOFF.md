@@ -3692,3 +3692,15 @@
 - 실제 소스 커밋 **10d3b564d0f5224ef6c5875ebdc3ac6caa20be1d** `fix(home): 공지 행 전체에서 원문 링크 열기`. 소스·인계 문서 포함, 코드 커밋 뒤 작업 트리 clean 확인. 사용자 공지 증상의 링크 클릭 명령은 검사 1 PASS로 확인했지만 실제 실행 앱/OS 브라우저는 이 소스로 아직 재빌드·재기동되지 않았다.
 - 옵시디언 일지 `~/Library/CloudStorage/SynologyDrive-sync_data/Obsidian-Vault/프로젝트 일지/deppy-sijo/2026-09-15 홈 공지 행 링크 클릭 복구.md` 기록. 본 인계 문단은 커밋 뒤 source commit/적용 상태를 보존하는 docs-only 후속 커밋이다. 실행 PID 51078 / 949fc72 기존 bundle은 그대로 유지했다.
 - 다음 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git log -3 --oneline`; `git show --stat 10d3b56`; `ps -o pid,etime,comm -p 51078`. 적용 승인 시 최신 HEAD와 build input hash를 연결한 별도 signed release bundle을 준비하고 지금 실행 앱만 정상 종료한 뒤 새 PID/경로를 검증한다. main merge/push 및 공지 실제 화면 검증은 아직 하지 않았다.
+
+## 2026-09-16 워크스페이스 그룹 사이 높이 조절 구현 중
+
+- 현재 목표: 왼쪽 목록에서 인접한 워크스페이스 그룹 사이 구분선을 세로로 끌어 두 그룹의 높이를 나누고, 줄어든 그룹의 세션을 그룹 안에서 스크롤하게 한다. 사용자가 설명된 동작을 확인하고 `맞아 구현해`라고 승인했다.
+- 완료: `crates/app/src/ui/file_tree.rs`에 그룹 id별 조절 높이와 직전 실제 높이 상태, 독립된 6pt 경계 drag response, 인접 두 그룹 높이 합 보존, 사용자가 높이를 정한 펼친 세션 목록의 `max_height` 제한을 추가했다. 그룹 헤더는 계속 보이고, 세션이 있으면 최소 한 행 높이를 남긴다. 기존 전체 워크스페이스 목록 스크롤 및 행 드래그 순서 변경은 유지한다. 삭제된 workspace id의 두 높이 맵을 매 프레임 정리한다. 같은 프레임에서 아래 그룹만 먼저 바뀌어 목록 길이가 튀는 현상은 프레임 시작 높이 스냅샷으로 막는다.
+- 수정 파일: `crates/app/src/ui/file_tree.rs`, `docs/CODEX_HANDOFF.md`.
+- 설계 결정: 높이는 별도 저장 스키마 없이 실행 중 `FileTreeUi`의 workspace id에 둔다. 첫 drag는 직전 프레임에 잰 양쪽 자연 높이에서 시작한다. 헤더/그룹 경계는 독립된 hit 영역을 사용해 순서 변경 drag와 분리한다. 기본 세션 높이는 기존대로 자연 크기와 전체 목록 스크롤에 맡기고, 사용자가 높이를 정한 그룹에만 내부 세션 스크롤 상한을 둔다.
+- 검사/실행 상태: `cargo fmt --all -- --check` exit 0; `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo clippy --locked -p deppy-sijo --bin deppy-sijo -- -D warnings` exit 0; `cargo run -p xtask -- check-boundary` exit 0(allowlist 0); `cargo run -p xtask -- i18n-check` exit 0(i18n 8/8, app 선택 검사 각 1/1, 로케일 5개 리터럴 호출 1209건 대조); `git diff --check` exit 0. UI 회귀 테스트는 추가/실행하지 않았다. release 빌드, 앱 재실행, 실제 화면 확인은 실행하지 않았다. 사용자의 별도 승인 없이 실행 중인 PID 51078 앱을 재기동하지 않는다.
+- 실패 접근: 초안에서 기본 세션 그룹도 패널 높이의 34%로 제한하려 했으나 기존 화면에서 세션 행이 불필요하게 잘리므로 최종 소스에서는 제거했다.
+- 남은 작업: 최종 소스 변경분 확인과 한국어 커밋, 사용자가 빌드·재실행을 승인한 뒤 실제 화면에서 경계/세션 스크롤 확인. 앞선 메모·홈 공지 수정도 현재 PID 51078 앱에 미적용이다. main merge/push 없음.
+- 다음 에이전트 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git diff -- crates/app/src/ui/file_tree.rs docs/CODEX_HANDOFF.md`; `rg -n 'workspace_group_resize_handle|workspace_group_min_height|workspace_group_heights' crates/app/src/ui/file_tree.rs`; `ps -o pid,etime,comm -p 51078`. 정적 검사 통과로 새 변경/실패 없이 반복 실행하지 않는다. 앱 재빌드/재실행은 별도 사용자 승인 이후에만 한다.
+- 최종 소스 검토에서 기본 그룹까지 높이를 제한하면 기존 세션이 잘려 보여, 제한은 조절한 그룹에만 둔다. active/inactive 세션 스크롤의 같은 조건은 `workspace_session_scroll(Option<f32>)` 헬퍼로 묶어 기존 세션 행 렌더를 그대로 유지했다. 이 마지막 소스 변경 후 `cargo fmt --all -- --check`, 앱 bin strict clippy, `git diff --check` 재확인 모두 exit 0. i18n/경계 검사는 헬퍼 수정 전 실행했으며 로케일/leaf 경계 계약은 마지막 수정에서 변경하지 않았다.

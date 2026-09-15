@@ -3651,3 +3651,9 @@
 - 고정 DB 메모 row의 분리와 메모 Editor state의 분리는 서로 다른 책임. 이전 워크스페이스의 undo 기록을 잃지 않도록 편집 상태를 전환 때 무조건 지우지 않는다. egui 기본 최대 undo100/워크스페이스에 따른 장기 메모리 예산은 후속 프로파일링 가능하지만 이 요청을 벗어나는 eviction 도입은 하지 않는다.
 - 커밋 예정: `fix(notes): 워크스페이스별 메모 실행 취소 분리`; 수정 파일 crates/app/src/ui/notes.rs, docs/CODEX_HANDOFF.md. Obsidian 일지 기록. 새 코드 release 앱 미빌드/미적용, 새 재기동 별도 승인 필요. main merge/push 없음.
 - 다음 에이전트 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git log -2 --oneline`; `git show --stat HEAD`; `ps -o pid,etime,comm -p 51078`. 새 수정 앱 적용 승인 시 `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo build --locked --release -p deppy-sijo -p mcp-proxy`; 현재 bundle은 949fc72 입력이므로 덮어쓰지 말고 새 별도 bundle·source hash·동일 서명 요구사항 검증 후 재실행한다. 이전 /tmp/deppy-scroll-preserve-* 패키징/재기동 스크립트는 old commit/PID를 고정 참조하므로 그대로 쓰지 않는다.
+
+### 메모 실행 취소 수정 완료 / 앱 적용 승인 대기
+
+- 실제 수정 커밋 **aeb31628040134401ff63830fcca7a80e5254877** `fix(notes): 워크스페이스별 메모 실행 취소 분리`. 소스와 인계 문서 포함. 작업 트리 clean 확인.
+- 일지 `~/Library/CloudStorage/SynologyDrive-sync_data/Obsidian-Vault/프로젝트 일지/deppy-sijo/2026-09-15 워크스페이스 메모 실행 취소 분리.md` 작성. 현재 실행 PID 51078은 **949fc72** 릴리스 bundle 유지; aeb3162 메모 수정은 아직 빌드/재기동 미승인·미적용.
+- 이 문단은 커밋 뒤 사실을 반영하는 후속 인계 기록이다. 다음 에이전트는 `git log -3 --oneline`으로 코드 커밋 및 이 기록 커밋을 함께 확인한다. 새 앱 적용 후 화면에서 해당 워크스페이스 메모의 되돌리기/저장 확인을 받는다.

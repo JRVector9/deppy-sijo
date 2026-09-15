@@ -3704,3 +3704,10 @@
 - 남은 작업: 최종 소스 변경분 확인과 한국어 커밋, 사용자가 빌드·재실행을 승인한 뒤 실제 화면에서 경계/세션 스크롤 확인. 앞선 메모·홈 공지 수정도 현재 PID 51078 앱에 미적용이다. main merge/push 없음.
 - 다음 에이전트 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git diff -- crates/app/src/ui/file_tree.rs docs/CODEX_HANDOFF.md`; `rg -n 'workspace_group_resize_handle|workspace_group_min_height|workspace_group_heights' crates/app/src/ui/file_tree.rs`; `ps -o pid,etime,comm -p 51078`. 정적 검사 통과로 새 변경/실패 없이 반복 실행하지 않는다. 앱 재빌드/재실행은 별도 사용자 승인 이후에만 한다.
 - 최종 소스 검토에서 기본 그룹까지 높이를 제한하면 기존 세션이 잘려 보여, 제한은 조절한 그룹에만 둔다. active/inactive 세션 스크롤의 같은 조건은 `workspace_session_scroll(Option<f32>)` 헬퍼로 묶어 기존 세션 행 렌더를 그대로 유지했다. 이 마지막 소스 변경 후 `cargo fmt --all -- --check`, 앱 bin strict clippy, `git diff --check` 재확인 모두 exit 0. i18n/경계 검사는 헬퍼 수정 전 실행했으며 로케일/leaf 경계 계약은 마지막 수정에서 변경하지 않았다.
+
+### 그룹 높이 조절 소스 커밋 완료 / 실행 앱 적용 대기
+
+- 구현 커밋 **0260d77e7fc1086db3bfbc081aafe9fe672b04fc** `feat(sidebar): 워크스페이스 그룹 높이 드래그 조절`. 소스와 인계 문서를 함께 커밋했고 직후 `git status --short` 출력은 비어 있다. 이 단락은 커밋 SHA 및 실제 적용 상태를 기록하는 docs-only 후속 기록이다.
+- 현재 실행 앱 PID 51078은 `/private/tmp/deppy-scroll-preserve-20260915-3351ruxh/Deppy Sijo.app`의 이전 949fc72 입력 빌드다. 새 그룹 조절, 앞선 메모/홈 공지 수정은 여기에 적용되지 않았으며 실제 화면 확인도 아직 하지 않았다. 사용자 지시 때문에 새 release 빌드/재기동은 승인 전 대기한다.
+- 남은 작업: 사용자 승인 후 최신 HEAD 소스 hash를 고정한 새 signed bundle을 별도로 빌드하고 이전 앱 정상 종료·새 실행 경로/PID 확인, 사용자 화면 피드백에서 그룹 경계 드래그·인접 세션 스크롤 확인. main merge/push 없음.
+- 다음 에이전트 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git log -3 --oneline`; `git show --stat 0260d77`; `ps -o pid,etime,comm -p 51078`. 앱 빌드·재실행 승인 후에만 `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo build --locked --release -p deppy-sijo -p mcp-proxy`와 별도 bundle 서명/manifest/PID 경로 대조를 진행한다. 완료된 정적 검사는 새 소스 변경이나 실패 없이 반복하지 않는다.

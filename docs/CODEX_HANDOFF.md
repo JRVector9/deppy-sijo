@@ -3576,3 +3576,33 @@
 - 실제 실행 bundle의 빌드 입력 790개 hash가 최종 소스와 같은지 다시 확인했다. `fix(ui): 환경 API 화면 전환 버튼 제거`로 커밋하고 manifest/result의 source_commit을 해당 커밋에 연결한다. build_base_commit 및 source_dirty_at_build 기록은 그대로 보존한다.
 - 현재 PID 5277 / `/private/tmp/deppy-classic-only-20260914-nd32mv_w/Deppy Sijo.app/Contents/MacOS/deppy-sijo`. 기존 화면 고정·전환 버튼 제거가 포함된 앱을 이미 실행 중이다. 우클릭 API/env 입력 및 상태 문구 강조는 유지한다. main 머지/push 없음.
 - 다음 에이전트: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git log -2 --oneline`; `cat /tmp/deppy-classic-only-restart-20260914.json`; `ps -o pid,etime,comm -p 5277`. 사용자가 보고 피드백하면 그 항목부터 대응하며 동일 소스 재빌드·재실행을 반복하지 않는다.
+
+## 2026-09-15 직접 입력 후 CLI 재그리기의 이전 출력 삭제 수정 착수
+
+- 사용자: Claude/Codex 터미널에서 직접 입력해 이어서 실행할 때 위에 있던 출력이 삭제되지 않도록 요청. 추가 지시: 테스트 절차를 많이 만들지 말고 그 상황만 바로 재현·수정한다.
+- 현재 worktree fix/environment-api-context-integration / HEAD 082b65a, 실행 PID 5277. 재빌드·재실행은 이번 요청에 포함되지 않아 실행 중 앱은 유지한다.
+- 코드 확인: 입력 전송 경로는 PTY write+상태 알림만 수행한다. AlacrittyBackend.feed가 넘긴 CSI 2J는 viewport를 history에 옮기지만 뒤따르는 CSI 3J(ClearMode::Saved)는 vendored Term.clear_screen에서 history를 실제 삭제한다. Codex 공식 custom_terminal.rs에도 화면 clear와 scrollback purge 조합이 있고 Claude 공식 이슈 #16310/#15974에 같은 삭제가 보고되어 있다. 참고 https://github.com/openai/codex/blob/main/codex-rs/tui/src/custom_terminal.rs 및 https://github.com/anthropics/claude-code/issues/16310.
+- 별도 절차/대규모 테스트를 추가하지 않고 terminal backend에 agent_redraw_다음입력후_이전출력을_보존한다 재현 1건을 추가했다. 2J/3J 순서와 분할 수신 뒤 이전 답변 및 현재 실행 문구 보존을 확인한다. 먼저 실제 RED 실행 중: /tmp/deppy-agent-redraw-red-20260915.log.
+- 다음: 재현 실패 확인 → vendored terminal의 scrollback clear 보존 옵션을 앱 backend에서 켜되 화면 지우기/커서/보관 한도는 유지 → 같은 재현 1건 재확인. 현재 적용 소스 수정은 테스트만이며 구현 전이다.
+
+### 직접 입력 재그리기: 삭제 재현 확인 및 수정
+
+- 단일 재현 테스트 실제 RED 확인: 1 FAIL, 이전 답변 검색 결과 0(기대 1). /tmp/deppy-agent-redraw-red-20260915.log. 컴파일 오류가 아닌 history 삭제 assertion이다.
+- vendored alacritty_terminal Config에 preserve_scrollback_on_clear(default false)를 추가하고 clear_screen의 Saved(CSI 3J)만 보존 설정 시 건너뛴다. AlacrittyBackend 생성/보관 한도 재적용/압박 트림 3곳에서 true를 넣어 옵션 재설정 뒤에도 보존이 유지되도록 했다.
+- 2J의 기존 viewport→history 이동, 화면 새로 그리기, 커서, 메모리/줄 수 cap 및 명시적 backend.reset 처리는 변경하지 않았다. 별도 history 복사/무제한 저장 구조는 추가하지 않았다.
+- 같은 재현 1건만 GREEN 실행 중: /tmp/deppy-agent-redraw-green-20260915.log. 사용자 요청대로 테스트 절차를 확장하지 않는다. 소스는 crates/terminal/src/alacritty_backend.rs(테스트 포함)와 vendor term/mod.rs만 수정했다.
+
+### 직접 입력 재그리기: 해당 재현 수정 확인
+
+- 같은 재현 **1 PASS**(2J→3J 및 3J→2J를 1byte씩 수신, 이전 답변/화면의 입력 대기 문구 보존 + 새 작업 출력 확인). /tmp/deppy-agent-redraw-green-20260915.log. 다른 테스트나 전체 workspace suite는 실행하지 않았다.
+- 실제 수정 소스 2개만 Codex CLI 검토 중: /tmp/deppy-agent-redraw-review-20260915.log. 새 기능/절차/테스트 확대는 제외한다. 커밋 전에는 fmt 및 변경 terminal crate clippy와 diff 검사만 확인한다. i18n/UI/DB는 변경하지 않았다.
+- 배포/앱 재빌드/재실행 미실행. 현재 PID 5277의 082b65a 앱은 유지되며 이번 기록 보존 변경은 적용 전이다.
+
+### 직접 입력 후 기록 삭제 수정 완료
+
+- 구현 소스 2개만 수정했고 실제 소스 Codex CLI 리뷰에서 Config 재적용 누락/확실한 회귀 추가 지적 없음. /tmp/deppy-agent-redraw-review-20260915.log.
+- 해당 재현 **1건 RED → GREEN**만 실행했다. 수정 후 1 PASS / 0 FAIL. fmt --all --check, terminal crate만 clippy --all-targets -D warnings, diff --check 모두 exit 0(/tmp/deppy-agent-redraw-static-checks-20260915.log). 전체 앱 테스트/추가 UI 검사/i18n 검사는 실행하지 않았다.
+- 원인과 수정: CLI의 화면 재그리기에서 CSI 3J가 스크롤백을 삭제하던 경로만 앱 backend에서 차단한다. CSI 2J는 기존대로 화면을 비우고 이전 viewport를 스크롤백에 옮긴다. 보관 줄 수/메모리 압박 트림/backend 초기화는 유지한다. 이미 삭제된 과거 기록을 복원했다는 의미는 아니다.
+- 현재 PID 5277 / 소스 082b65a 앱 유지. 이번 요청은 수정 요청이며 새 빌드·재실행은 아직 승인되지 않아 실행하지 않았다. `fix(terminal): 입력 후 재그리기에서 스크롤백 보존`으로 커밋한다. main merge/push 없음.
+- 다음 에이전트 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git log -2 --oneline`; `git show --stat HEAD`; `cat /tmp/deppy-agent-redraw-green-20260915.log`; `ps -o pid,etime,comm -p 5277`.
+- 사용자 재빌드·재실행 승인 시 `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo build --locked --release -p deppy-sijo -p mcp-proxy`. 현재 소스 hash와 새로운 manifest/별도 bundle로 준비하고 기존 Developer ID/지정 요구사항을 보존한다. /tmp/deppy-classic-only-* 스크립트는 이전 HEAD/PID를 고정 참조하므로 그대로 재실행하지 않는다. 동일 테스트를 또 확장/반복하지 말고 사용자가 직접 입력해 확인하도록 한다.

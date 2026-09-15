@@ -130,6 +130,7 @@ impl AlacrittyBackend {
         if target != self.active_scrollback_limit {
             self.term.set_options(Config {
                 scrolling_history: target,
+                preserve_scrollback_on_clear: true,
                 ..Config::default()
             });
             self.active_scrollback_limit = target;
@@ -166,6 +167,7 @@ fn new_term(
 ) -> Term<CollectingListener> {
     let config = Config {
         scrolling_history: scrollback_lines,
+        preserve_scrollback_on_clear: true,
         ..Config::default()
     };
     let mut term = Term::new(
@@ -535,6 +537,7 @@ impl TerminalBackend for AlacrittyBackend {
         // 스크롤백 상한을 낮춰 가장 오래된 히스토리를 드롭한다.
         self.term.set_options(Config {
             scrolling_history: target,
+            preserve_scrollback_on_clear: true,
             ..Config::default()
         });
         self.active_scrollback_limit = target;
@@ -1402,6 +1405,33 @@ mod tests {
             fp.estimated_bytes,
             baseline,
         );
+    }
+
+    #[test]
+    fn agent_redraw_다음입력후_이전출력을_보존한다() {
+        for redraw in [b"\x1b[H\x1b[2J\x1b[3J".as_slice(), b"\x1b[3J\x1b[H\x1b[2J"] {
+            let mut backend = AlacrittyBackend::new(40, 4, 100);
+            feed(
+                &mut backend,
+                "이전 답변\r\n출력 2\r\n출력 3\r\n출력 4\r\n입력 대기".as_bytes(),
+            );
+            assert_eq!(backend.search_scrollback("이전 답변", 10).matches.len(), 1);
+
+            // 다음 입력 뒤 CLI가 화면과 스크롤백을 지우고 다시 그리는 상황이다.
+            // PTY 읽기 경계에서 제어 문자가 나뉘어 도착해도 같은 동작이어야 한다.
+            for byte in redraw {
+                feed(&mut backend, std::slice::from_ref(byte));
+            }
+            feed(&mut backend, "다음 작업 실행 중".as_bytes());
+
+            assert_eq!(row_text(&backend, 0), "다음 작업 실행 중");
+            assert_eq!(
+                backend.search_scrollback("이전 답변", 10).matches.len(),
+                1,
+                "다음 입력 후 화면을 다시 그리면서 이전 답변까지 삭제됐다"
+            );
+            assert_eq!(backend.search_scrollback("입력 대기", 10).matches.len(), 1);
+        }
     }
 
     #[test]

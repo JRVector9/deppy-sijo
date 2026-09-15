@@ -335,6 +335,9 @@ pub struct Config {
     /// The maximum amount of scrolling history.
     pub scrolling_history: usize,
 
+    /// 화면 재그리기의 CSI 3J가 사용자의 스크롤백을 삭제하지 않도록 한다.
+    pub preserve_scrollback_on_clear: bool,
+
     /// Default cursor style to reset the cursor to.
     pub default_cursor_style: CursorStyle,
 
@@ -357,6 +360,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             scrolling_history: 10000,
+            preserve_scrollback_on_clear: false,
             semantic_escape_chars: SEMANTIC_ESCAPE_CHARS.to_owned(),
             default_cursor_style: Default::default(),
             vi_mode_cursor_style: Default::default(),
@@ -1819,6 +1823,8 @@ impl<T: EventListener> Handler for Term<T> {
 
                 self.selection = None;
             },
+            // 기록 보존을 켠 호스트는 명시적인 보관 한도/초기화로만 기록을 정리한다.
+            ansi::ClearMode::Saved if self.config.preserve_scrollback_on_clear => return,
             ansi::ClearMode::Saved if self.history_size() > 0 => {
                 self.grid.clear_history();
 

@@ -682,8 +682,15 @@ impl AgentTerminalUi {
                         .min_scrolled_height(viewport_height)
                         .auto_shrink([false, false])
                         .show_rows(ui, ANNOUNCEMENT_ROW_HEIGHT, cards.len(), |ui, range| {
-                            for card in &cards[range] {
-                                announcement_row(ui, card, translations, locale, catalog);
+                            for (index, card) in cards[range.clone()].iter().enumerate() {
+                                announcement_row(
+                                    ui,
+                                    range.start + index,
+                                    card,
+                                    translations,
+                                    locale,
+                                    catalog,
+                                );
                             }
                         });
                 });
@@ -1088,6 +1095,7 @@ fn paint_external_link_icon(painter: &egui::Painter, center: egui::Pos2, color: 
 /// 공지 리스트 행 1개 — `날짜 | 공급자 로고 | 제목 | 외부 링크` 구조.
 fn announcement_row(
     ui: &mut egui::Ui,
+    row_index: usize,
     card: &AnnouncementCard<'_>,
     translations: &crate::notice_translate::TranslationCache,
     locale: &str,
@@ -1135,23 +1143,26 @@ fn announcement_row(
         title.on_hover_text(title_text);
     }
     let link_label = catalog.t("home.notices.original_link", &[]);
-    let link = ui
-        .interact(
-            columns.link,
-            ui.id().with(("home-announcement-link", &card.incident.url)),
-            egui::Sense::click(),
-        )
-        .on_hover_text(&link_label);
-    link.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Link, ui.is_enabled(), &link_label)
-    });
-    let link_color = if link.hovered() {
+    let link_color = if row_response.hovered() {
         ui.visuals().text_color()
     } else {
         ui.visuals().hyperlink_color
     };
     paint_external_link_icon(ui.painter(), columns.link.center(), link_color);
-    if link.clicked() {
+    // 셀과 로고의 hover 위젯보다 나중에 행 전체의 링크를 등록해야 클릭이 막히지 않는다.
+    let row_link = ui
+        .interact(
+            row_rect,
+            ui.id()
+                .with(("home-announcement-link", row_index, &card.incident.url)),
+            egui::Sense::click(),
+        )
+        .on_hover_text(format!("{}\n{}", card.incident.title, link_label))
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    row_link.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Link, ui.is_enabled(), &link_label)
+    });
+    if row_link.clicked() {
         ui.ctx()
             .open_url(egui::OpenUrl::new_tab(&card.incident.url));
     }
@@ -2408,6 +2419,126 @@ mod tests {
         );
         let viewport_height = ANNOUNCEMENT_ROW_HEIGHT * ANNOUNCEMENT_VISIBLE_ROWS as f32;
         assert!(sixth_top - first_top >= viewport_height - 0.5);
+    }
+
+    #[test]
+    fn kittest_home_공지_제목을_클릭하면_원문_링크를_연다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let url = "https://status.claude.com/incidents/notice-click";
+        let feed = StatusFeedSnapshot {
+            claude: Some(ProviderStatus {
+                indicator: ServiceIndicator::Operational,
+                description: "Operational".to_owned(),
+                incidents: vec![
+                    crate::status_feed::IncidentNotice {
+                        title: "Clickable announcement".to_owned(),
+                        status: "resolved".to_owned(),
+                        date: "2026-09-15".to_owned(),
+                        url: url.to_owned(),
+                    },
+                    crate::status_feed::IncidentNotice {
+                        title: "Same URL announcement".to_owned(),
+                        status: "resolved".to_owned(),
+                        date: "2026-09-14".to_owned(),
+                        url: url.to_owned(),
+                    },
+                ],
+            }),
+            ..StatusFeedSnapshot::default()
+        };
+        let translations = crate::notice_translate::TranslationCache::default();
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, home: &mut AgentTerminalUi| {
+                home.home(
+                    ui,
+                    &feed,
+                    NoticeTranslations {
+                        cache: &translations,
+                        locale: i18n::FALLBACK_LOCALE,
+                    },
+                    &connector_contract::SlackProjection::default(),
+                    &catalog,
+                );
+            },
+            AgentTerminalUi::new(),
+        );
+        harness.run();
+
+        harness.get_all_by_label("Source →").next().unwrap().click();
+        harness.step();
+        assert!(
+            harness
+                .output()
+                .platform_output
+                .commands
+                .iter()
+                .any(|command| {
+                    matches!(command, egui::OutputCommand::OpenUrl(open) if open.url == url)
+                }),
+            "공지 링크 클릭 명령이 나와야 한다"
+        );
+
+        harness.get_by_label("Clickable announcement").click();
+        harness.step();
+        assert!(
+            harness
+                .output()
+                .platform_output
+                .commands
+                .iter()
+                .any(|command| {
+                    matches!(command, egui::OutputCommand::OpenUrl(open) if open.url == url)
+                }),
+            "공지 제목 클릭은 원문 URL을 새 탭으로 열어야 한다"
+        );
+
+        harness.get_by_label("2026-09-15").click();
+        harness.step();
+        assert!(
+            harness
+                .output()
+                .platform_output
+                .commands
+                .iter()
+                .any(|command| {
+                    matches!(command, egui::OutputCommand::OpenUrl(open) if open.url == url)
+                }),
+            "공지 날짜 클릭도 같은 원문 URL을 열어야 한다"
+        );
+
+        harness
+            .get_all_by_label("Anthropic logo")
+            .next()
+            .unwrap()
+            .click();
+        harness.step();
+        assert!(
+            harness
+                .output()
+                .platform_output
+                .commands
+                .iter()
+                .any(|command| {
+                    matches!(command, egui::OutputCommand::OpenUrl(open) if open.url == url)
+                }),
+            "공지 로고 클릭도 같은 원문 URL을 열어야 한다"
+        );
+
+        harness.get_by_label("Same URL announcement").click();
+        harness.step();
+        assert!(
+            harness
+                .output()
+                .platform_output
+                .commands
+                .iter()
+                .any(|command| {
+                    matches!(command, egui::OutputCommand::OpenUrl(open) if open.url == url)
+                }),
+            "같은 URL을 가진 다른 공지 행도 클릭할 수 있어야 한다"
+        );
     }
 
     #[test]

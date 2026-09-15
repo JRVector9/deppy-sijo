@@ -59,6 +59,7 @@ impl NotesUi {
         catalog: &i18n::Catalog,
     ) -> Option<NotesAction> {
         self.sync(&input);
+        let edit_id = text_id(input.workspace_id);
 
         // ⌘⇧D — 커서 위치에 오늘 날짜 줄을 삽입한다. 반드시 메모 TextEdit이
         // 포커스를 쥐고 있을 때만 반응해야 한다(다른 곳에서 눌렀는데 메모가
@@ -69,10 +70,10 @@ impl NotesUi {
         // 버퍼/커서를 바꿔야 같은 프레임에 반영된다(composer.rs의
         // consume-before-draw 관례와 동일).
         let mut date_inserted = false;
-        if ui.ctx().memory(|memory| memory.has_focus(text_id()))
+        if ui.ctx().memory(|memory| memory.has_focus(edit_id))
             && consume_key_exact(ui.ctx(), NOTE_DATE_MODIFIERS, NOTE_DATE_KEY)
         {
-            let char_cursor: usize = egui::text_edit::TextEditState::load(ui.ctx(), text_id())
+            let char_cursor: usize = egui::text_edit::TextEditState::load(ui.ctx(), edit_id)
                 .and_then(|state| state.cursor.char_range())
                 .map(|range| range.primary.index.into())
                 .unwrap_or_else(|| self.buffer.chars().count());
@@ -88,13 +89,13 @@ impl NotesUi {
                 self.buffer = new_buffer;
                 let new_char_cursor = self.buffer[..new_byte_cursor].chars().count();
                 let mut state =
-                    egui::text_edit::TextEditState::load(ui.ctx(), text_id()).unwrap_or_default();
+                    egui::text_edit::TextEditState::load(ui.ctx(), edit_id).unwrap_or_default();
                 state
                     .cursor
                     .set_char_range(Some(egui::text::CCursorRange::one(
                         egui::text::CCursor::new(new_char_cursor),
                     )));
-                state.store(ui.ctx(), text_id());
+                state.store(ui.ctx(), edit_id);
                 date_inserted = true;
             }
         }
@@ -139,7 +140,7 @@ impl NotesUi {
                     .show(ui, |ui| {
                         ui.add(
                             egui::TextEdit::multiline(&mut self.buffer)
-                                .id(text_id())
+                                .id(edit_id)
                                 .hint_text(catalog.t("notes.placeholder", &[]))
                                 .frame(borderless)
                                 // 내용에 따라 세로로 자란다 — 스크롤은 바깥 ScrollArea가 맡는다.
@@ -181,9 +182,10 @@ impl NotesUi {
     }
 }
 
-/// 메모 TextEdit 위젯 id — 포커스/커서 판정과 위젯 자신이 같은 값을 써야 한다.
-fn text_id() -> egui::Id {
-    egui::Id::new("sidebar_notes_edit")
+/// 워크스페이스마다 다른 메모 TextEdit id. 포커스·커서·실행 취소가 같은
+/// 워크스페이스 안에서만 이어지도록 모든 판정과 위젯이 이 값을 쓴다.
+fn text_id(workspace_id: &str) -> egui::Id {
+    egui::Id::new(("sidebar_notes_edit", workspace_id))
 }
 
 /// 날짜 삽입 단축키 — ⌘⇧D. `shortcuts.rs`의 두 플랫폼 기본값 표(unix/windows) 어디에도
@@ -347,6 +349,57 @@ mod tests {
             stored: Some("저장된 값"),
         });
         assert_eq!(notes.buffer, "저장된 값 + 방금 친 글자");
+    }
+
+    #[test]
+    fn 다른_워크스페이스의_실행취소_기록은_메모에_적용되지_않는다() {
+        let catalog = catalog();
+        let catalog_ref = &catalog;
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(220.0, 300.0))
+            .build_ui_state(
+                move |ui, state: &mut (NotesUi, &'static str, &'static str)| {
+                    let (notes, workspace, stored) = state;
+                    notes.render(
+                        ui,
+                        NotesInput {
+                            workspace_id: workspace,
+                            stored: Some(stored),
+                        },
+                        catalog_ref,
+                    );
+                },
+                (NotesUi::new(), "ws-a", "A 현재 메모"),
+            );
+        harness.run();
+
+        // A의 위젯에 실제 실행 취소 기록을 남긴 뒤 B로 이동한다.
+        let cursor = egui::text::CCursorRange::one(egui::text::CCursor::new(0));
+        let mut edit_state =
+            egui::text_edit::TextEditState::load(&harness.ctx, text_id("ws-a")).unwrap_or_default();
+        let mut undoer = edit_state.undoer();
+        undoer.feed_state(0.0, &(cursor, "A 이전 메모".to_owned()));
+        undoer.feed_state(2.0, &(cursor, "A 현재 메모".to_owned()));
+        edit_state.set_undoer(undoer);
+        edit_state.store(&harness.ctx, text_id("ws-a"));
+
+        harness.state_mut().1 = "ws-b";
+        harness.state_mut().2 = "B 현재 메모";
+        harness.state_mut().0.request_focus();
+        harness.run();
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+        harness.run();
+
+        assert_eq!(harness.state().0.buffer, "B 현재 메모");
+
+        // A로 돌아오면 A의 이전 본문만 되돌릴 수 있어야 한다.
+        harness.state_mut().1 = "ws-a";
+        harness.state_mut().2 = "A 현재 메모";
+        harness.state_mut().0.request_focus();
+        harness.run();
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+        harness.run();
+        assert_eq!(harness.state().0.buffer, "A 이전 메모");
     }
 
     /// 탭에 들어오면 커서가 잡혀야 하고, 요청은 **한 번만** 소비돼야 한다.

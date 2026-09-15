@@ -3606,3 +3606,48 @@
 - 현재 PID 5277 / 소스 082b65a 앱 유지. 이번 요청은 수정 요청이며 새 빌드·재실행은 아직 승인되지 않아 실행하지 않았다. `fix(terminal): 입력 후 재그리기에서 스크롤백 보존`으로 커밋한다. main merge/push 없음.
 - 다음 에이전트 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git log -2 --oneline`; `git show --stat HEAD`; `cat /tmp/deppy-agent-redraw-green-20260915.log`; `ps -o pid,etime,comm -p 5277`.
 - 사용자 재빌드·재실행 승인 시 `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo build --locked --release -p deppy-sijo -p mcp-proxy`. 현재 소스 hash와 새로운 manifest/별도 bundle로 준비하고 기존 Developer ID/지정 요구사항을 보존한다. /tmp/deppy-classic-only-* 스크립트는 이전 HEAD/PID를 고정 참조하므로 그대로 재실행하지 않는다. 동일 테스트를 또 확장/반복하지 말고 사용자가 직접 입력해 확인하도록 한다.
+
+## 2026-09-15 스크롤백 보존 수정본 재빌드·재실행 착수
+
+- 사용자 `재빌드 재실행해` 승인(두 번 요청됨). 최종 수정 소스 949fc72, 작업 트리 clean, 현재 실행 PID 5277 / 기존 082b65a bundle 확인. 중단된 cargo/rustc/별도 재실행 없음.
+- 이미 실제 RED→GREEN 1건, 변경 terminal crate 정적 검사와 소스 리뷰가 완료돼 반복하지 않는다. 새 release 앱+proxy 빌드 로그 /tmp/deppy-scroll-preserve-release-build-20260915.log.
+- 추적 빌드 입력의 hash와 이전 실행 앱/helper hash를 /tmp/deppy-scroll-preserve-source-20260915.json에 기록. 새 별도 bundle 패키징 스크립트 /tmp/deppy-scroll-preserve-package-20260915.py는 이전 서명 ID/지정 요구사항을 대조하고 실행 bundle을 덮지 않는다.
+- 빌드와 패키징 완료 후 기존 PID/경로를 재확인해 정상 종료·새 앱 실행한다. 재실행 성공은 새 PID의 경로와 생존을 확인한 후에만 기록한다.
+
+### 스크롤백 보존 새 앱 빌드·서명 완료 / 재실행 시작
+
+- 소스 949fc72로 release 앱+proxy 빌드 exit 0 / 67.55초. 입력 790개 hash 및 HEAD 재검증, 별도 bundle `/private/tmp/deppy-scroll-preserve-20260915-3351ruxh/Deppy Sijo.app` 준비.
+- 기존 Developer ID Application: VectorNine INC (ZDTU5LS35K)로 앱/helper/bundle 서명. strict codesign/plist lint 및 기존 실행본과 지정 요구사항 동일성 확인. /tmp/deppy-scroll-preserve-package-20260915.log, `/private/tmp/deppy-scroll-preserve-20260915-3351ruxh/build-manifest.json`. 공증/배포/main 머지는 이번 요청이 아니다.
+- 분리 실행 재실행 스크립트 /tmp/deppy-scroll-preserve-restart-20260915.py로 현재 PID 5277 종료·새 bundle 실행 시작. 로그 /tmp/deppy-scroll-preserve-restart-20260915.log, 결과 /tmp/deppy-scroll-preserve-restart-20260915.json. 성공 전에는 완료로 주장하지 않는다. 중단되면 먼저 결과 JSON과 실행 PID 경로를 확인하고 중복 재실행하지 않는다.
+
+### 2026-09-15 기록 보존 앱 적용 완료 / 워크스페이스 메모 실행 취소 조사
+
+- 이전 사용자 승인대로 949fc72 release 앱+proxy 빌드 67.55초, 동일 Developer ID/지정 요구사항 서명, 별도 bundle /private/tmp/deppy-scroll-preserve-20260915-3351ruxh/Deppy Sijo.app 재실행 완료. 기존 PID 5277은 정상 종료(SIGTERM fallback 미사용). 새 PID 51078 / 정확한 bundle 경로와 실행 후 생존 확인. /tmp/deppy-scroll-preserve-restart-20260915.json, package/build 로그.
+- 사용자 새 요청: 파일 트리 옆 메모의 `Alt+Z`에서 다른 워크스페이스 메모가 드러남. 두 요구: 워크스페이스 간 저장 분리, 되돌리기는 해당 워크스페이스 본문만 대상.
+- 저장은 이미 DB workspace_notes(workspace_id TEXT PRIMARY KEY, FK cascade) 및 load/save WHERE workspace_id 경계로 분리되어 있다. App도 pending note에 workspace_id를 싣고 전환 전 flush한다. 이번 증상은 NotesUi의 버퍼가 전환 시 올바르게 교체되는데 egui TextEditState/Undoer가 모든 워크스페이스에서 고정 ID sidebar_notes_edit 하나를 공유하는 데서 발생한다. egui 0.36.1은 TextEdit의 Command+Z 실행 취소에서 이 Undoer를 읽는다.
+- 메모에 A의 실제 Undoer 기록을 넣고 B에서 Z 되돌리기 후 B 본문이 그대로인지 검증하는 재현 테스트 1건을 작성했다. 초기 cargo 명령에 `--exact`을 무자격 함수명으로 주었으므로 컴파일은 진행돼도 실행은 0건 필터링될 수 있다. 테스트 PASS/RED라고 단정하지 않는다. 컴파일 완료 후 모듈 완전 이름으로 새 바이너리에서 해당 1건만 실행한다: /tmp/deppy-notes-undo-red-20260915.log.
+- 요구사항 해결 방향: 메모 위젯 ID를 워크스페이스 ID로 분리해 실행 취소가 서로 섞이지 않게 하고, 반환 시 같은 워크스페이스 이전 기록은 유지한다. 저장 스키마/worker는 변경하지 않는다. UI widget-state 수명/메모리 예산은 검토한다. 새 변경은 현재 실행 앱에 반영 전이며 재빌드/재실행은 새 요청 범위에서 아직 하지 않는다.
+
+### 메모 워크스페이스 간 실행 취소 혼입 실제 재현
+
+- 초기 Cargo 호출은 `--exact`에 무자격 함수명이라 0건 실행(컴파일 성공). 새 컴파일 바이너리를 모듈 완전 이름으로 직접 실행해 재현 **1 FAIL**: B 본문 기대 `B 현재 메모`, 실제 `A 이전 메모`. /tmp/deppy-notes-undo-red-actual-20260915.log. 이 결과만 RED로 계산한다.
+- 첫 수정: NotesUi.render에서 TextEdit id를 `(sidebar_notes_edit, workspace_id)`로 묶고 날짜 단축키의 포커스/커서 판정도 같은 id를 쓰게 했다. DB/worker/저장 스키마 변경 없음. 같은 재현 1건 GREEN 확인 중: /tmp/deppy-notes-undo-green-20260915.log.
+- `Alt+Z`의 실제 egui TextEdit 경로는 Mac 기본 Command+Z 실행 취소(egui 0.36.1 widgets/text_edit/builder.rs). 사용자 표기는 Alt+Z이므로 실제 키 입력이 별도로 해석되는지/추가 Alt 단축키가 필요한지는 소스와 해당 재현 결과로 확인한다. 테스트 절차 확대 대신 현재 케이스를 사용한다.
+
+### 메모 실행 취소 분리 재현 GREEN / 적용 대기
+
+- 같은 모듈 완전 이름 테스트 1건에서 수정 뒤 **1 PASS, 0 FAIL**: B에서 Z를 눌러도 B 본문 유지, 다시 A로 돌아와 Z를 누르면 A 이전 본문만 복원. 첫 GREEN /tmp/deppy-notes-undo-green-20260915.log, 반환 검증까지 확장한 1건 cargo test 실행도 exit 0 (2026-09-15 11시대). 여러 회귀 검사로 확대하지 않았다.
+- 수정 파일: crates/app/src/ui/notes.rs (TextEdit 절대 ID에 workspace_id 포함, 같은 ID로 날짜 단축키 포커스·커서 로드/저장, 단일 재현 테스트), 이 인계 문서. storage/App 변경 없음. DB 메모는 이미 workspace_id로 격리된다.
+- 기존 949fc72 앱은 앞선 승인으로 PID 51078에 재실행 완료. **새 메모 수정은 소스에만 있고 앱에는 아직 미적용**. 사용자 앱 재기동은 보고 있는 앱을 종료하므로 이 변경의 별도 재빌드·재실행 승인은 받지 않았다.
+- 첫 Codex CLI 리뷰 호출은 지나치게 넓은 저장소·egui 내부 조사로 2분 넘게 결과 없이 진행해 해당 CLI PID 16728만 종료(exit 143). 소스 리뷰 결과로 주장하지 않는다. 표준 `codex review --uncommitted`을 /tmp/deppy-notes-undo-review-20260915.log에 별도 실행 중이며 결과 확인 후 수정한다.
+- 메모 위젯 상태는 egui IdTypeMap의 persisted TextEditState이고 기본 Undoer는 워크스페이스당 최대 100 snapshots. 워크스페이스별 ID로 서로 섞이지 않는다. 장기 실행 시 더 많은 상태가 남는지 리뷰 중; 현재 수정에 임의의 최근 워크스페이스 개수 제한을 넣어 되돌리기 기록을 잃게 하지는 않는다.
+- 다음 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git diff -- crates/app/src/ui/notes.rs docs/CODEX_HANDOFF.md`; `tail -n 30 /tmp/deppy-notes-undo-review-20260915.log`; `ps -o pid,etime,comm -p 51078`. 이어서 리뷰 finding 반영, 변경 코드 fmt/clippy/diff gate 직전 1회, 커밋·일지. 재빌드·재실행은 별도 승인 후 새 source hash로 준비한다.
+
+### 메모 실행 취소 수정 커밋 직전 검사
+
+- 단일 재현 검사의 최종 소스 실행: `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo test --locked -p deppy-sijo --bin deppy-sijo ui::notes::tests::다른_워크스페이스의_실행취소_기록은_메모에_적용되지_않는다 -- --exact --nocapture` → **1 PASS, 0 FAIL**, 나머지 2294 filtered. A→B에서 오염 없음, B→A에서 A의 이전 본문 복원. 첫 수정 직후 1 PASS도 /tmp/deppy-notes-undo-green-20260915.log.
+- `cargo fmt --all -- --check` 첫 실행은 테스트의 한 줄 배치 차이 때문에 exit 1; 그 한 줄을 rustfmt 형식으로 고친 후 재실행 **exit 0**. `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo clippy --locked -p deppy-sijo --bin deppy-sijo -- -D warnings` **exit 0** (1m05s). `git diff --check` exit 0. fmt 첫 실패를 PASS로 주장하지 않는다.
+- 표준 Codex CLI `codex review --uncommitted`은 1분 이상 egui·대형 주변 소스 조사를 진행하다 이미 통과한 메모 검사 1건을 다른 target dir로 다시 빌드하기 시작했다. 사용자 요청한 최소 검사 범위와 기계의 메모리 압박을 지켜 해당 CLI PID 52919 및 그 자식 cargo PID 67240만 종료. CLI 확정 finding/종합 PASS는 **없다**. 소스는 직접 기존 ui/document.rs의 절대 문서 ID·undo 분리 방식과 대조, 변경 포커스/커서/위젯이 전부 같은 새 ID를 쓰는 것을 확인. Storage/App 저장 ID 흐름은 변경하지 않는다.
+- 고정 DB 메모 row의 분리와 메모 Editor state의 분리는 서로 다른 책임. 이전 워크스페이스의 undo 기록을 잃지 않도록 편집 상태를 전환 때 무조건 지우지 않는다. egui 기본 최대 undo100/워크스페이스에 따른 장기 메모리 예산은 후속 프로파일링 가능하지만 이 요청을 벗어나는 eviction 도입은 하지 않는다.
+- 커밋 예정: `fix(notes): 워크스페이스별 메모 실행 취소 분리`; 수정 파일 crates/app/src/ui/notes.rs, docs/CODEX_HANDOFF.md. Obsidian 일지 기록. 새 코드 release 앱 미빌드/미적용, 새 재기동 별도 승인 필요. main merge/push 없음.
+- 다음 에이전트 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git log -2 --oneline`; `git show --stat HEAD`; `ps -o pid,etime,comm -p 51078`. 새 수정 앱 적용 승인 시 `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo build --locked --release -p deppy-sijo -p mcp-proxy`; 현재 bundle은 949fc72 입력이므로 덮어쓰지 말고 새 별도 bundle·source hash·동일 서명 요구사항 검증 후 재실행한다. 이전 /tmp/deppy-scroll-preserve-* 패키징/재기동 스크립트는 old commit/PID를 고정 참조하므로 그대로 쓰지 않는다.

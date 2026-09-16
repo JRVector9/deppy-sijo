@@ -3711,3 +3711,15 @@
 - 현재 실행 앱 PID 51078은 `/private/tmp/deppy-scroll-preserve-20260915-3351ruxh/Deppy Sijo.app`의 이전 949fc72 입력 빌드다. 새 그룹 조절, 앞선 메모/홈 공지 수정은 여기에 적용되지 않았으며 실제 화면 확인도 아직 하지 않았다. 사용자 지시 때문에 새 release 빌드/재기동은 승인 전 대기한다.
 - 남은 작업: 사용자 승인 후 최신 HEAD 소스 hash를 고정한 새 signed bundle을 별도로 빌드하고 이전 앱 정상 종료·새 실행 경로/PID 확인, 사용자 화면 피드백에서 그룹 경계 드래그·인접 세션 스크롤 확인. main merge/push 없음.
 - 다음 에이전트 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git log -3 --oneline`; `git show --stat 0260d77`; `ps -o pid,etime,comm -p 51078`. 앱 빌드·재실행 승인 후에만 `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo build --locked --release -p deppy-sijo -p mcp-proxy`와 별도 bundle 서명/manifest/PID 경로 대조를 진행한다. 완료된 정적 검사는 새 소스 변경이나 실패 없이 반복하지 않는다.
+
+## 2026-09-16 그룹 높이 조절 앱 재빌드·재실행 완료
+
+- 현재 목표: 사용자가 승인한 새 빌드/재실행을 적용하고, 직접 화면에서 워크스페이스 경계 드래그와 좁아진 그룹의 세션 스크롤을 확인받는다.
+- 완료: 사용자 `재빌드하고 재실행해` 승인 후 clean 소스 커밋 **7216bb59ec16f506463c33c879a1d1a86327079f**의 추적 파일 1068개 해시를 `/tmp/deppy-workspace-group-source-20260916.json`에 고정했다. `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo build --locked --release -p deppy-sijo -p mcp-proxy` exit 0, release 빌드 1m 31s. 기존 실행 번들은 덮지 않고 `/private/tmp/deppy-workspace-group-20260916-m2soufrz/Deppy Sijo.app`에 앱/helper 바이너리를 복사·strip·기존 Developer ID로 서명했다. 앱/helper strict codesign 및 Info.plist lint exit 0, 이전 앱/helper/번들의 지정 요구사항과 동일함을 확인했다. 전체 build 입력/바이너리 해시는 `/private/tmp/deppy-workspace-group-20260916-m2soufrz/build-manifest.json`에 기록했다.
+- 적용: 기존 PID **51078**의 정확한 실행 경로를 확인해 macOS 정상 종료 요청으로 종료했다(SIGTERM fallback 미사용). `open -n`으로 새 번들을 실행했고 새 PID **94358**, 정확한 새 실행 경로 및 25초 후 생존 확인. `/tmp/deppy-workspace-group-restart-20260916.json`에서 verified true. 매니페스트 app_restarted true, signature_verified true. 이 앱에는 앞선 워크스페이스 메모/홈 공지 수정과 그룹 높이 조절 소스가 함께 적용됐다.
+- 수정 파일: 이 인계 상태만 `docs/CODEX_HANDOFF.md` 후속 갱신. 제품 소스 파일 변경 없음. 새 docs-only 후속 커밋은 빌드 입력 7216bb5보다 뒤에 생기므로, 실행 앱 소스 커밋은 build manifest의 7216bb5로 판정해야 한다.
+- 설계 결정: 이전 앱의 서명 ID/지정 요구사항을 보존한 별도 bundle로 전환했다. UI 회귀 테스트/정적 게이트를 새 소스 변경 없이 반복하지 않았다. 공증/배포/main merge/push 없음.
+- 테스트 명령과 결과: 위 release cargo build exit 0; 새 bundle 앱/helper `codesign --verify --strict` exit 0; `plutil -lint` exit 0; source/binary SHA256 및 designated requirement 대조 PASS; 실행 PID 경로/생존 검증 PASS. 실제 경계 drag/세션 스크롤 화면 확인은 사용자가 아직 하지 않아 PASS로 기록하지 않는다.
+- 실패 접근: 없음.
+- 남은 작업: 사용자 화면 피드백을 받아 경계선을 위·아래로 끌 때 인접 그룹 높이 변화, 줄어든 그룹의 세션 스크롤, 기존 워크스페이스 순서 변경 드래그가 정상인지 확인. 피드백으로 UI를 수정하면 새 release 빌드/재실행 전에 다시 사용자 승인받는다.
+- 다음 에이전트 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git log -3 --oneline`; `ps -o pid,etime,comm -p 94358`; `cat /tmp/deppy-workspace-group-restart-20260916.json`; `python3 -c 'import json; m=json.load(open("/private/tmp/deppy-workspace-group-20260916-m2soufrz/build-manifest.json")); print(m["commit"],m["app_restarted"],m["running_pid"])'`. 새 빌드/재실행이 필요한 변경 전까지 현재 앱을 유지한다.

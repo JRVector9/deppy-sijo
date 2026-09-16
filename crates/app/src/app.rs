@@ -24922,6 +24922,64 @@ impl App {
         }
     }
 
+    fn sort_sessions_for_sidebar(
+        sessions: &mut [ui::file_tree::SidebarSessionRow],
+        order: &[String],
+    ) {
+        let mut ranks = std::collections::HashMap::new();
+        for (rank, pane) in order.iter().enumerate() {
+            ranks.entry(pane.as_str()).or_insert(rank);
+        }
+        // 안정 정렬이므로 새 세션끼리는 원래 순서를 유지한 채 뒤에 붙는다.
+        sessions.sort_by_key(|row| {
+            ranks
+                .get(row.target.pane().0.as_str())
+                .copied()
+                .unwrap_or(usize::MAX)
+        });
+    }
+
+    fn sidebar_session_order_matches(
+        workspace_id: &str,
+        order: &[String],
+        sessions: &[ui::file_tree::SidebarSessionRow],
+    ) -> bool {
+        if sessions.is_empty()
+            || order.len() != sessions.len()
+            || sessions
+                .iter()
+                .any(|row| row.target.workspace_id() != workspace_id)
+        {
+            return false;
+        }
+        let expected: std::collections::HashSet<_> = sessions
+            .iter()
+            .map(|row| row.target.pane().0.as_str())
+            .collect();
+        let received: std::collections::HashSet<_> = order.iter().map(String::as_str).collect();
+        expected.len() == sessions.len() && received.len() == order.len() && received == expected
+    }
+
+    fn apply_sidebar_session_order(
+        &mut self,
+        workspace_id: String,
+        order: Vec<String>,
+        sessions: &[ui::file_tree::SidebarSessionRow],
+    ) {
+        if !Self::sidebar_session_order_matches(&workspace_id, &order, sessions)
+            || self.config.ui.workspace_session_order.get(&workspace_id) == Some(&order)
+        {
+            return;
+        }
+        self.config
+            .ui
+            .workspace_session_order
+            .insert(workspace_id, order);
+        if let Err(error) = self.config.save(&self.config_path) {
+            tracing::warn!("워크스페이스 세션 순서 저장 실패: {error:#}");
+        }
+    }
+
     /// 사이드바에 저장된 순서(config)를 앞세워 워크스페이스를 정렬한다.
     ///
     /// 저장된 목록에 있는 것끼리는 그 순서대로, 목록에 없는 것은 그 뒤에 생성순으로 붙는다 —
@@ -26300,9 +26358,15 @@ impl App {
         // 실제로 삭제된 워크스페이스 ID만 저장 순서에서 정리한다.
         let order_before = self.config.ui.workspace_order.len();
         Self::prune_workspace_order(&mut self.config.ui.workspace_order, &known_workspace_ids);
+        let session_order_before = self.config.ui.workspace_session_order.len();
+        self.config
+            .ui
+            .workspace_session_order
+            .retain(|id, _| known_workspace_ids.contains(id.as_str()));
         if (self.config.ui.closed_workspace_ids.len() != persisted_before
             || self.config.ui.hidden_env_project_ids != hidden_env_before
-            || self.config.ui.workspace_order.len() != order_before)
+            || self.config.ui.workspace_order.len() != order_before
+            || self.config.ui.workspace_session_order.len() != session_order_before)
             && let Err(error) = self.config.save(&self.config_path)
         {
             tracing::warn!("삭제 워크스페이스 UI 숨김 표식 정리 저장 실패: {error:#}");
@@ -29721,6 +29785,11 @@ impl eframe::App for App {
             })
             .collect();
         sidebar_sessions.insert(active_workspace_id.clone(), active_sidebar_sessions);
+        for (workspace_id, sessions) in &mut sidebar_sessions {
+            if let Some(order) = self.config.ui.workspace_session_order.get(workspace_id) {
+                Self::sort_sessions_for_sidebar(sessions, order);
+            }
+        }
         // Home을 보고 있는 동안 도착했거나 이미 표시 중인 공지는 읽음이다. sidebar
         // snapshot을 만들기 전에 반영해 같은 프레임에 Home 배지가 사라지게 한다.
         if self.agent_terminal_ui.view() == ui::agent_terminal::AgentTerminalView::Home {
@@ -29995,6 +30064,14 @@ impl eframe::App for App {
                 }
                 Some(ui::file_tree::SidebarAction::ReorderWorkspaces(order)) => {
                     self.apply_workspace_order(order);
+                }
+                Some(ui::file_tree::SidebarAction::ReorderSessions {
+                    workspace_id,
+                    order,
+                }) => {
+                    if let Some(sessions) = sidebar_sessions.get(&workspace_id) {
+                        self.apply_sidebar_session_order(workspace_id, order, sessions);
+                    }
                 }
                 Some(ui::file_tree::SidebarAction::ActivatePersistedSession {
                     workspace_id,
@@ -47430,6 +47507,69 @@ mod tests {
         App::sort_workspaces_for_sidebar(&mut workspaces, &stale);
         let ids: Vec<&str> = workspaces.iter().map(|w| w.id.as_str()).collect();
         assert_eq!(ids, ["c", "a", "b", "new", "newer"]);
+    }
+
+    #[test]
+    fn sidebar_session_order_저장순서를_복원하고_새_세션을_뒤에_붙인다() {
+        let mut sessions: Vec<_> = ["pane-1", "pane-2", "pane-3", "pane-4"]
+            .into_iter()
+            .map(|id| {
+                ui::file_tree::SidebarSessionRow::from_persisted_parts(
+                    "workspace-a",
+                    runtime::MuxPaneId(id.to_owned()),
+                    id.to_owned(),
+                    String::new(),
+                )
+            })
+            .collect();
+        App::sort_sessions_for_sidebar(
+            &mut sessions,
+            &["deleted".into(), "pane-3".into(), "pane-1".into()],
+        );
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|row| row.target.pane().0.as_str())
+                .collect::<Vec<_>>(),
+            ["pane-3", "pane-1", "pane-2", "pane-4"],
+        );
+    }
+
+    #[test]
+    fn sidebar_session_order_현재_워크스페이스_세션만_한번씩_허용한다() {
+        let sessions: Vec<_> = ["pane-1", "pane-2"]
+            .into_iter()
+            .map(|id| {
+                ui::file_tree::SidebarSessionRow::from_persisted_parts(
+                    "workspace-a",
+                    runtime::MuxPaneId(id.to_owned()),
+                    id.to_owned(),
+                    String::new(),
+                )
+            })
+            .collect();
+        let valid = ["pane-2".into(), "pane-1".into()];
+        assert!(App::sidebar_session_order_matches(
+            "workspace-a",
+            &valid,
+            &sessions
+        ));
+        assert!(!App::sidebar_session_order_matches(
+            "workspace-b",
+            &valid,
+            &sessions
+        ));
+        for invalid in [
+            vec!["pane-1".into(), "pane-1".into()],
+            vec!["pane-1".into(), "foreign".into()],
+            vec!["pane-1".into()],
+        ] {
+            assert!(!App::sidebar_session_order_matches(
+                "workspace-a",
+                &invalid,
+                &sessions
+            ));
+        }
     }
 
     /// 저장된 순서가 없을 때의 정렬은 DB의 `ORDER BY created_at, id`

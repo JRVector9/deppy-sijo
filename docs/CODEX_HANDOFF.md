@@ -3723,3 +3723,34 @@
 - 실패 접근: 없음.
 - 남은 작업: 사용자 화면 피드백을 받아 경계선을 위·아래로 끌 때 인접 그룹 높이 변화, 줄어든 그룹의 세션 스크롤, 기존 워크스페이스 순서 변경 드래그가 정상인지 확인. 피드백으로 UI를 수정하면 새 release 빌드/재실행 전에 다시 사용자 승인받는다.
 - 다음 에이전트 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git log -3 --oneline`; `ps -o pid,etime,comm -p 94358`; `cat /tmp/deppy-workspace-group-restart-20260916.json`; `python3 -c 'import json; m=json.load(open("/private/tmp/deppy-workspace-group-20260916-m2soufrz/build-manifest.json")); print(m["commit"],m["app_restarted"],m["running_pid"])'`. 새 빌드/재실행이 필요한 변경 전까지 현재 앱을 유지한다.
+
+
+## 2026-09-16 사용자 피드백: 그룹 높이 조절 롤백 / 세션 행 순서 드래그 구현 중
+
+- 현재 목표: 사용자가 그룹 높이 드래그의 기능/UX를 거절했다. 해당 기능을 되돌리고 펼친 워크스페이스 높이를 모든 세션 행에 맞춰 자연 확장한다. 같은 워크스페이스 안에서 세션 행을 드래그해 표시 순서를 바꾸고 재시작 후에도 유지한다.
+- 완료: 0260d77 이전 file_tree.rs로 높이 조절 소스를 복구했다(해당 파일 후속 소스 변경 없음 확인, 다른 제품 수정은 보존). 저장 설정은 ui.workspace_session_order의 workspace id → pane id 순서로 설계했다. App이 드래그 결과의 소유 workspace/중복/누락을 검증하고 config에 저장하며, 다음 프레임의 active/warm/persisted 세션 스냅샷에 정렬을 적용한다. pane 실제 배치/세션 소유권은 바꾸지 않는다.
+- 수정 파일: crates/app/src/ui/file_tree.rs, crates/app/src/app.rs, crates/app/src/config.rs, docs/CODEX_HANDOFF.md.
+- 검사: `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo test --locked -p deppy-sijo --bin deppy-sijo sidebar_session_order_ -- --nocapture` RED **0 PASS / 3 FAIL**, exit 101. config에 알 수 없는 순서 필드가 사라짐, 원래 순서가 정렬되지 않음, permutation 판정 미구현 때문에 예상 assertion 실패. 로그 /tmp/deppy-session-order-red-20260916.log. 스키마/정렬/검증 구현 후 GREEN은 아직 실행 전이다. 새 UI 회귀 테스트는 작성하지 않는다.
+- 설계 결정: 각 그룹의 내부 ScrollArea를 제거해 전체 workspace_list_scroll 하나로 스크롤한다. 기존 SessionRowDragPayload는 재사용하되 그룹 내부에 놓을 때만 순서 변경으로 소비해 기존 터미널로 드래그하는 동작을 보존한다. 삭제한 워크스페이스 순서 map은 기존 refresh 정리 경로에서 함께 제거한다.
+- 실패 접근: 앞선 그룹별 고정 높이/경계 분할 UX는 사용자 화면 피드백으로 폐기한다.
+- 남은 작업: 세션 전체 표시 레이아웃, active/inactive 행 드래그와 삽입선 및 목록 가장자리 자동 스크롤, 순서 로직 3건 GREEN, 자체 소스 검토, 커밋 직전 게이트, 커밋. 실행 중인 앱은 PID 94358 / 이전 7216bb5 빌드라 새 수정 미적용. 새 빌드/재실행은 이번 수정 완료 후 사용자 승인 대상으로 유지한다.
+- 다음 에이전트 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git diff --stat`; `tail -n 45 /tmp/deppy-session-order-red-20260916.log`; `rg -n 'ReorderSessions|sort_sessions_for_sidebar|workspace_session_order' crates/app/src/{app,config}.rs crates/app/src/ui/file_tree.rs`.
+
+
+### 세션 전체 표시 및 순서 드래그 구현 / 저장 로직 GREEN
+
+- 그룹 높이 상태/핸들/6pt 추가 간격을 제거했고 active/inactive 세션 목록을 일반 push_id 레이아웃으로 바꿨다. 펼친 그룹은 세션 수만큼 늘어나며 목록 전체만 스크롤한다. 새 SessionRowDragPayload를 추가하지 않고 기존 payload를 공유하며, active 행도 같은 drag source로 연결했다. 같은 workspace의 실제 target이 존재하고 포인터가 현재 보이는 세션 영역 안에 있을 때만 삽입선/순서 변경을 처리한다. 밖에 놓기와 Escape는 순서를 바꾸지 않고, 터미널 영역의 기존 드롭 경로는 그대로 남는다.
+- 목록 상하단 24pt 가장자리에서 세션 드래그 중 자동 스크롤을 추가했다. ReorderSessions 액션은 App에서 현재 workspace 세션 id의 정확한 permutation인지 검증한 뒤 ui.workspace_session_order에 저장한다. active/warm/persisted 행 전체에 표시 순서를 적용하고 새 세션은 뒤에 붙인다. 워크스페이스 삭제 시 해당 설정 키도 제거한다.
+- GREEN: `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo test --locked -p deppy-sijo --bin deppy-sijo sidebar_session_order_ -- --nocapture` **3 PASS / 0 FAIL**, exit 0. 로그 `/tmp/deppy-session-order-green-20260916.log`. 저장/복원, 새 행·삭제된 id 처리, workspace·중복·누락 검증의 세 검사만 실행했다. UI 회귀/전체 suite는 실행하지 않았다.
+- 자체 소스 검토: 첫/끝/중간 삽입 위치는 기존 workspace 순서 계산을 공용 helper로 이름만 바꿔 사용한다. 드롭 payload의 전체 target 일치 검사로 재시작/다른 runtime으로 바뀐 드래그를 거부한다. 그룹 위에 별도 interaction overlay를 만들지 않아 원래 클릭/우클릭/닫기 버튼의 hit 판정은 유지한다. 실제 화면 확인은 아직 미실행이라 PASS 주장 금지.
+- 남은 작업: 커밋 직전 fmt/strict clippy/boundary/i18n/diff 검사 1회, 커밋, 사용자 승인 후 앱 적용·화면 피드백. 현재 앱 PID 94358에는 여전히 폐기한 그룹 높이 드래그가 있으며 이번 변경은 미적용이다.
+
+
+### 그룹 높이 조절 롤백·세션 순서 드래그 소스 완료 / 앱 적용 대기
+
+- 구현 완료 파일: `crates/app/src/ui/file_tree.rs`(그룹 고정 높이 제거, 자연 확장, 한 목록 스크롤, active/inactive 세션 drag/drop·삽입선·자동 스크롤), `crates/app/src/app.rs`(워크스페이스별 순서 정렬/검증/저장·삭제 workspace 설정 정리), `crates/app/src/config.rs`(호환되는 기본 빈 workspace_session_order map, 저장 roundtrip 검사), 이 인계 문서.
+- 최종 검사: 저장/정렬/검증 선택 3건 RED→GREEN **3 PASS / 0 FAIL**(`/tmp/deppy-session-order-green-20260916.log`). `cargo fmt --all -- --check`, `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo clippy --locked -p deppy-sijo --bin deppy-sijo -- -D warnings`, 같은 환경의 `cargo run --locked -p xtask -- check-boundary`, `cargo run --locked -p xtask -- i18n-check` 모두 exit 0. i18n 로그 `/tmp/deppy-session-order-i18n-20260916.log`에 로케일 5개/리터럴 참조1209건 대조 OK. 마지막 리뷰에서 드롭 후 다음 프레임에 저장된 새 순서와 드래그 표시 해제가 바로 반영되도록 `request_repaint` 한 줄 추가했고 fmt/strict clippy를 이 변경에 한해서 재확인 exit 0. UI 회귀/전체 suite를 확장 실행하지 않았다.
+- 자체 검토 결과: workspace 구분+정확한 target 확인으로 다른 workspace/재시작된 runtime의 드롭을 소비하지 않고, App에서도 중복·누락·다른 workspace 순서 저장을 거부한다. 표시 순서는 세션 실행·포커스·terminal pane의 실제 배치를 바꾸지 않는다. 새 드롭 결과는 현재 행 전체로 저장해 이전에 닫힌 pane 순서가 계속 누적되지 않는다. workspace 삭제 시 map 키도 정리한다. 드래그 외 원래 행 클릭/우클릭/닫기 영역은 overlay 없이 유지한다.
+- 사용자 화면 피드백에서 실패한 이전 높이 드래그 UX는 이번 소스에서 완전히 제거했다. 실패한 새 접근/미해결 컴파일 오류는 없다. 기존 실행 PID **94358** / 7216bb5 번들에는 이번 롤백·순서 드래그가 아직 미적용이다. 실제 화면 확인은 하지 않아 PASS 주장 금지.
+- 남은 작업: 이 소스/인계 문서 커밋 후 사용자에게 새 빌드·재실행 승인 요청. 승인 시 최신 소스를 별도 signed bundle로 적용하고, 그룹 전체 세션 표시 및 세션 행 위·아래 재정렬을 사용자 화면에서 확인한다. 이전 사용자 규칙상 실행 앱 종료는 승인 후에만 한다. main merge/push 없음.
+- 다음 에이전트 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git log -3 --oneline`; `git show --stat HEAD`; `tail -n 15 /tmp/deppy-session-order-green-20260916.log`; `tail -n 5 /tmp/deppy-session-order-i18n-20260916.log`; `ps -o pid,etime,comm -p 94358`. 빌드·재실행 승인 후 `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo build --locked --release -p deppy-sijo -p mcp-proxy`. 이전 `/tmp/deppy-workspace-group-*-20260916.py`는 옛 HEAD/기존 PID 51078을 고정 참조하므로 그대로 재실행하지 말고, 현재 PID94358/이전 bundle 경로로 새 스냅샷·패키징·재실행 스크립트를 준비한다.

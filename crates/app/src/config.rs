@@ -262,6 +262,10 @@ pub struct UiConfig {
     /// `refresh_workspaces`의 정리에서 빠진다(2026-09-03 리뷰 defect 1·5).
     #[serde(default)]
     pub workspace_order: Vec<String>,
+    /// 사이드바 세션 표시 순서. 재시작에도 유지되는 pane id를 워크스페이스별로 저장한다.
+    /// 터미널 pane의 실제 배치나 세션 소유 워크스페이스를 바꾸지는 않는다.
+    #[serde(default)]
+    pub workspace_session_order: BTreeMap<String, Vec<String>>,
     /// 환경 및 API 프로젝트 목록에서 사용자가 `X`로 닫은 workspace ID. 이 상태는
     /// sidebar의 workspace 종료/실행 상태와 독립이며 `+`로 같은 폴더를 다시 고르면 해제된다.
     #[serde(default)]
@@ -343,6 +347,7 @@ impl Default for UiConfig {
             confirm_workspace_close: false,
             closed_workspace_ids: BTreeSet::new(),
             workspace_order: Vec::new(),
+            workspace_session_order: BTreeMap::new(),
             hidden_env_project_ids: BTreeSet::new(),
             ui_font: None,
             ui_scale: 1.0,
@@ -1050,6 +1055,20 @@ mod tests {
         let text = toml::to_string_pretty(&c).unwrap();
         let parsed: Config = toml::from_str(&text).unwrap();
         assert_eq!(parsed.ui.workspace_order, ["ws-c", "ws-a", "ws-b"]);
+    }
+
+    #[test]
+    fn sidebar_session_order_워크스페이스별_순서를_저장하고_다시_읽는다() {
+        let source = "[ui.workspace_session_order]\nworkspace_a = ['pane-3', 'pane-1']\nworkspace_b = ['pane-1', 'pane-2']\n";
+        let parsed: Config = toml::from_str(source).unwrap();
+        let restored: toml::Value =
+            toml::from_str(&toml::to_string_pretty(&parsed).unwrap()).unwrap();
+        let expected: toml::Value = toml::from_str(source).unwrap();
+        assert_eq!(
+            restored["ui"].get("workspace_session_order"),
+            expected["ui"].get("workspace_session_order"),
+        );
+        assert!(toml::from_str::<Config>("[ui]\n").is_ok());
     }
 
     #[test]

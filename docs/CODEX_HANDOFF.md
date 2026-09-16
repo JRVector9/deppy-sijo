@@ -3754,3 +3754,15 @@
 - 사용자 화면 피드백에서 실패한 이전 높이 드래그 UX는 이번 소스에서 완전히 제거했다. 실패한 새 접근/미해결 컴파일 오류는 없다. 기존 실행 PID **94358** / 7216bb5 번들에는 이번 롤백·순서 드래그가 아직 미적용이다. 실제 화면 확인은 하지 않아 PASS 주장 금지.
 - 남은 작업: 이 소스/인계 문서 커밋 후 사용자에게 새 빌드·재실행 승인 요청. 승인 시 최신 소스를 별도 signed bundle로 적용하고, 그룹 전체 세션 표시 및 세션 행 위·아래 재정렬을 사용자 화면에서 확인한다. 이전 사용자 규칙상 실행 앱 종료는 승인 후에만 한다. main merge/push 없음.
 - 다음 에이전트 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git log -3 --oneline`; `git show --stat HEAD`; `tail -n 15 /tmp/deppy-session-order-green-20260916.log`; `tail -n 5 /tmp/deppy-session-order-i18n-20260916.log`; `ps -o pid,etime,comm -p 94358`. 빌드·재실행 승인 후 `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo build --locked --release -p deppy-sijo -p mcp-proxy`. 이전 `/tmp/deppy-workspace-group-*-20260916.py`는 옛 HEAD/기존 PID 51078을 고정 참조하므로 그대로 재실행하지 말고, 현재 PID94358/이전 bundle 경로로 새 스냅샷·패키징·재실행 스크립트를 준비한다.
+
+
+## 2026-09-16 자연 높이 복구·세션 순서 드래그 앱 적용 완료
+
+- 현재 목표: 사용자 `재빌드하고 재실행해` 승인에 따라 소스 **486839efc232a25fd6aca68455aafddd751b2931**의 높이 조절 롤백/세션 전체 표시/세션 행 순서 드래그를 실행 앱에 적용했다. 이제 실제 화면 피드백을 받는다.
+- 완료: clean 작업 트리와 추적 파일 1068개 SHA256을 `/tmp/deppy-session-order-source-20260916.json`에 고정했다. `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo build --locked --release -p deppy-sijo -p mcp-proxy` exit 0, **54.22초**. 로그 `/tmp/deppy-session-order-release-build-20260916.log`. 빌드 후 같은 HEAD/모든 소스 hash를 대조했다.
+- 패키징: 별도 `/private/tmp/deppy-session-order-20260916-b_cpu9w0/Deppy Sijo.app`에 앱/helper를 복사·strip·기존 Developer ID Application: VectorNine INC (ZDTU5LS35K)로 서명했다. 앱/helper/bundle strict codesign 및 Info.plist lint exit 0, 이전 번들과 지정 요구사항 동일. `/tmp/deppy-session-order-package-20260916.log`, `/private/tmp/deppy-session-order-20260916-b_cpu9w0/build-manifest.json`에 기록. 기존 bundle의 hash가 변경되지 않았음을 확인했다.
+- 재실행: 기존 PID **94358**의 정확한 실행 경로 확인 후 정상 종료 요청으로 종료(SIGTERM fallback 미사용). 새 PID **95838**, 실행 경로 `/private/tmp/deppy-session-order-20260916-b_cpu9w0/Deppy Sijo.app/Contents/MacOS/deppy-sijo`, 26초 후 생존 확인. `/tmp/deppy-session-order-restart-20260916.json` verified true; build manifest app_restarted/signature_verified/designated_requirements_match_previous true. 이 실행본에 486839e 제품 수정이 적용됐다.
+- 수정 파일: 제품 소스 변경 없음. `docs/CODEX_HANDOFF.md`의 적용 상태만 후속 docs-only 커밋한다. 실행 앱의 소스 commit은 후속 docs HEAD 대신 manifest의 486839e로 판정한다.
+- 검사: 이번 요청에서 release build/서명·hash·PID 경로·생존만 확인했다. 이전에 통과한 저장 로직 3건 및 정적 게이트는 반복하지 않았다. 실제 세션 드래그/자동 확장 화면 검증은 사용자가 아직 하지 않았으므로 PASS로 기록하지 않는다. 공증/배포/main merge/push 없음.
+- 실패 접근: 없음. 남은 작업은 사용자 화면 피드백 확인이다. 펼친 그룹이 세션 수만큼 늘어나는지와 같은 워크스페이스 내 세션 행 위·아래 재정렬을 확인받는다.
+- 다음 에이전트 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git log -3 --oneline`; `ps -o pid,etime,comm -p 95838`; `cat /tmp/deppy-session-order-restart-20260916.json`; `tail -n 5 /tmp/deppy-session-order-release-build-20260916.log`. `/tmp/deppy-session-order-{release,restart}-20260916.py`는 이전 종료 PID 94358을 고정 참조하므로 다음 재실행에 그대로 쓰지 않는다. 새 변경이 없으면 빌드/검사를 반복하지 않는다.

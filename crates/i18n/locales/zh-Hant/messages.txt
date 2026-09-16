@@ -1274,3 +1274,7 @@ workspace.menu.use_as_api_name = 用作 API 名稱
 workspace.menu.use_as_api_value = 用作 API 金鑰值
 workspace.menu.use_as_env_name = 用作環境變數名稱
 workspace.menu.use_as_env_value = 用作環境變數值
+
+credentials.edit.title = 編輯 API 金鑰
+credentials.edit.keep_secret = 留空以保留目前金鑰
+credentials.edit.retry_secret = 請重新輸入新金鑰

@@ -1274,3 +1274,7 @@ workspace.menu.use_as_api_name = Use as API name
 workspace.menu.use_as_api_value = Use as API key value
 workspace.menu.use_as_env_name = Use as variable name
 workspace.menu.use_as_env_value = Use as variable value
+
+credentials.edit.title = Edit API key
+credentials.edit.keep_secret = Leave blank to keep the current key
+credentials.edit.retry_secret = Re-enter the new key

@@ -1274,3 +1274,7 @@ workspace.menu.use_as_api_name = API名として使う
 workspace.menu.use_as_api_value = APIキーの値として使う
 workspace.menu.use_as_env_name = 環境変数名として使う
 workspace.menu.use_as_env_value = 環境変数の値として使う
+
+credentials.edit.title = APIキーを編集
+credentials.edit.keep_secret = 空欄の場合は現在のキーを保持
+credentials.edit.retry_secret = 新しいキーを再入力してください

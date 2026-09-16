@@ -42,6 +42,7 @@ impl CredentialsUi {
     }
 
     pub(crate) fn reset_modern_draft(&mut self) {
+        self.edit = None;
         clear_sensitive_string(&mut self.secret_input);
         self.secret_input_state.clear();
         self.env_name.clear();
@@ -335,6 +336,7 @@ impl CredentialsUi {
             && !self.secret_input.is_empty()
             && !self.secret_input_overflowed
             && !self.add_pending
+            && !self.operations_pending
             && snapshot.is_available()
             && intent.is_none();
         if ui

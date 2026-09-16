@@ -3122,6 +3122,9 @@ enum SettingsJobAction {
     AddCredential {
         credential: ui::credentials::NewCredential,
     },
+    EditCredential {
+        credential: ui::credentials::EditedCredential,
+    },
     DeleteCredential {
         credential_id: String,
     },
@@ -3221,6 +3224,10 @@ enum SettingsOutcomeKind {
     Loaded,
     CredentialEnvSet(Result<(), SettingsErrorCode>),
     CredentialAdded(Result<(), SettingsErrorCode>),
+    CredentialEdited {
+        credential_id: String,
+        result: Result<(), SettingsErrorCode>,
+    },
     CredentialDeleted {
         credential_id: String,
         result: Result<(), SettingsErrorCode>,
@@ -3271,6 +3278,7 @@ enum SettingsErrorCode {
     EnvSources,
     CredentialBinding,
     CredentialAdd,
+    CredentialEdit,
     CredentialDelete,
     CredentialReveal,
     OrphanScan,
@@ -3700,6 +3708,8 @@ fn load_environment_snapshots(
             .into_iter()
             .filter(|credential| !dotenv_referenced_credentials.contains(&credential.id))
             .map(|credential| {
+                let editable = credential.workspace_id.as_deref() == Some(workspace_id)
+                    && matches!(credential.credential_kind.as_str(), "api_key" | "token");
                 let env_name = bindings
                     .get(credential.id.as_str())
                     .map(|name| (*name).to_owned());
@@ -3714,6 +3724,7 @@ fn load_environment_snapshots(
                     credential.masked_hint,
                 )
                 .with_env_binding(env_name, overrides_dotenv)
+                .with_editable(editable)
             })
             .collect();
         for row in rows.env_vars {
@@ -4019,6 +4030,67 @@ fn add_settings_credential(
     // A commit error has an indeterminate outcome. Keep the exact staged bundle and ledger row;
     // startup reconciliation decides from durable state and never guesses by deleting it here.
     db.insert_credential_with_env_slot(&meta, plan.new_slot().as_str(), env_name.as_deref())
+}
+
+fn edit_settings_credential(
+    db: &Db,
+    store: &dyn secret::SecretStore,
+    workspace_id: &str,
+    credential: ui::credentials::EditedCredential,
+) -> anyhow::Result<()> {
+    let (mut meta, location) =
+        db.workspace_api_credential(workspace_id, &credential.credential_id)?;
+    let logical = secret::LogicalCredentialId::new(meta.id.clone())?;
+    let previous = secret::PhysicalSecretSlot::parse(location.keyring_username)?;
+    anyhow::ensure!(
+        previous.belongs_to(&logical),
+        "credential_edit_slot_owner_invalid"
+    );
+    if let Some(name) = credential.env_name.as_deref() {
+        Db::validate_credential_env_name(name)?;
+    }
+    meta.provider = credential.provider;
+    meta.label = credential.label;
+    meta.credential_kind = credential.credential_kind;
+    let plan = if let Some(input) = credential.secret {
+        let access = secret::SecretString::new(input.into_inner());
+        anyhow::ensure!(!access.expose().is_empty(), "credential_edit_empty_secret");
+        let plan =
+            secret::SecretBundleStagePlan::allocate(logical.clone(), Some(previous.clone()))?;
+        db.register_physical_secret_slot_staging(logical.as_str(), plan.new_slot().as_str())?;
+        if let Err(error) = secret::stage_secret_bundle(
+            store,
+            &plan,
+            secret::SecretBundleRef::new(&access, None, None),
+        ) {
+            if secret::inspect_secret_bundle(store, plan.new_slot())
+                .is_ok_and(|state| state.is_empty())
+            {
+                let _ = db.acknowledge_physical_secret_slot_deleted(
+                    logical.as_str(),
+                    plan.new_slot().as_str(),
+                );
+            }
+            return Err(error);
+        }
+        meta.masked_hint = Some(secret::masked_hint(access.expose()));
+        Some(plan)
+    } else {
+        None
+    };
+    // 커밋 오류는 결과가 불확실할 수 있어 stage/ledger를 보존하고 기존 복구 절차에 맡긴다.
+    db.update_credential_with_env_slot(
+        workspace_id,
+        &meta,
+        previous.as_str(),
+        plan.as_ref().map(|plan| plan.new_slot().as_str()),
+        credential.env_name.as_deref(),
+    )?;
+    // 이전 키 정리 실패는 이미 성공한 저장을 실패로 바꾸지 않는다.
+    if plan.is_some() && secret::delete_secret_bundle(store, &previous).is_ok() {
+        let _ = db.acknowledge_physical_secret_slot_deleted(logical.as_str(), previous.as_str());
+    }
+    Ok(())
 }
 
 fn settings_credential_slot(
@@ -4366,16 +4438,18 @@ fn execute_settings_job_with_repair(
     secret_repair: &DeferredSecretRepair,
     job: SettingsJob,
 ) -> SettingsOutcome {
-    if matches!(
-        job.action,
-        SettingsJobAction::AddCredential { .. }
-            | SettingsJobAction::DeleteCredential { .. }
-            | SettingsJobAction::RevealCredential { .. }
-            | SettingsJobAction::ScanOrphanCredentials
-            | SettingsJobAction::PurgeOrphanCredentials { .. }
-            | SettingsJobAction::PrepareAgentLaunch { .. }
-            | SettingsJobAction::PrepareQuickAgentLaunch { .. }
-    ) {
+    if matches!(&job.action, SettingsJobAction::EditCredential { credential } if credential.secret.is_some())
+        || matches!(
+            job.action,
+            SettingsJobAction::AddCredential { .. }
+                | SettingsJobAction::DeleteCredential { .. }
+                | SettingsJobAction::RevealCredential { .. }
+                | SettingsJobAction::ScanOrphanCredentials
+                | SettingsJobAction::PurgeOrphanCredentials { .. }
+                | SettingsJobAction::PrepareAgentLaunch { .. }
+                | SettingsJobAction::PrepareQuickAgentLaunch { .. }
+        )
+    {
         // 명시적 기능 작업에서만 정리한다. 실패해도 이미 유효한 physical credential은 사용할 수 있다.
         if secret_repair.reconcile(db, &KeyringSecretStore).is_err() {
             tracing::warn!(
@@ -4419,6 +4493,17 @@ fn execute_settings_job_with_repair(
                     .map_err(|_| SettingsErrorCode::CredentialAdd);
             refresh = result.is_ok();
             SettingsOutcomeKind::CredentialAdded(result)
+        }
+        SettingsJobAction::EditCredential { credential } => {
+            let credential_id = credential.credential_id.clone();
+            let result =
+                edit_settings_credential(db, &KeyringSecretStore, &workspace_id, credential)
+                    .map_err(|_| SettingsErrorCode::CredentialEdit);
+            refresh = result.is_ok();
+            SettingsOutcomeKind::CredentialEdited {
+                credential_id,
+                result,
+            }
         }
         SettingsJobAction::DeleteCredential { credential_id } => {
             let result = delete_settings_credential(db, &KeyringSecretStore, &credential_id)
@@ -4709,6 +4794,10 @@ fn settings_open_failed_outcome(job: SettingsJob) -> SettingsOutcome {
         SettingsJobAction::AddCredential { .. } => {
             SettingsOutcomeKind::CredentialAdded(Err(SettingsErrorCode::CredentialAdd))
         }
+        SettingsJobAction::EditCredential { credential } => SettingsOutcomeKind::CredentialEdited {
+            credential_id: credential.credential_id,
+            result: Err(SettingsErrorCode::CredentialEdit),
+        },
         SettingsJobAction::DeleteCredential { credential_id } => {
             SettingsOutcomeKind::CredentialDeleted {
                 credential_id,
@@ -9464,6 +9553,8 @@ pub struct App {
     /// Event-invalidated environment project snapshot. Every production mutation path calls
     /// `invalidate_env_api_projects`; render only clones this Arc and no periodic TTL read exists.
     env_api_projects_cache: Option<Arc<[ui::env_project_list::EnvProjectRow]>>,
+    /// 재조회 중에도 마지막 목록과 상세 화면을 유지한다.
+    env_api_projects_dirty: bool,
     /// T1: pane 우클릭 → 환경설정 진입 시 감지한 focused 세션 폴더 배너.
     /// 우클릭 진입 시점에만 계산하고, 버튼 클릭 또는 설정 창 닫힘에 버린다.
     env_session_banner: Option<EnvSessionCwdBanner>,
@@ -9494,6 +9585,8 @@ pub struct App {
     settings_snapshot_pending: bool,
     settings_pending_operation: Option<SettingsOperationKey>,
     settings_snapshot_retry_at: Option<std::time::Instant>,
+    /// 같은 프로젝트의 재조회는 현재 목록·초안을 유지한 채 예약한다.
+    settings_snapshot_refresh_requested: bool,
     settings_snapshot_workspace_id: Option<String>,
     agents_snapshot: ui::agents::AgentsSnapshot,
     env_profiles_snapshot: ui::env_profiles::EnvProfilesSnapshot,
@@ -14482,6 +14575,7 @@ impl App {
             settings_search: String::new(),
             env_api_project_edit: EnvApiProjectEditState::default(),
             env_api_projects_cache: None,
+            env_api_projects_dirty: true,
             env_session_banner: None,
             storm_banner_dismissed: false,
             pending_storm_action: None,
@@ -14499,6 +14593,7 @@ impl App {
             settings_snapshot_pending: false,
             settings_pending_operation: None,
             settings_snapshot_retry_at: None,
+            settings_snapshot_refresh_requested: false,
             settings_snapshot_workspace_id: None,
             agents_snapshot: ui::agents::AgentsSnapshot::unavailable(0),
             env_profiles_snapshot: ui::env_profiles::EnvProfilesSnapshot::loading(
@@ -24134,7 +24229,7 @@ impl App {
             activation.phase = PrimaryPaneActivationPhase::TargetRestore;
         }
         if delivered || full_restore_queued {
-            self.invalidate_env_profile_ui();
+            self.refresh_env_profile_ui(&pending.workspace_id);
             self.credentials_ui.invalidate_cache();
             self.invalidate_env_api_projects();
             if is_agent_launch {
@@ -24337,7 +24432,7 @@ impl App {
                         })
                         .is_ok();
                     self.active.dotenv_files = outcome.source_files;
-                    self.invalidate_env_profile_ui();
+                    self.refresh_env_profile_ui(&outcome.workspace_id);
                     self.credentials_ui.invalidate_cache();
                     self.invalidate_env_api_projects();
                     if env_ready && !payload.source_failed {
@@ -25130,7 +25225,20 @@ impl App {
     }
 
     fn invalidate_env_api_projects(&mut self) {
-        self.env_api_projects_cache = None;
+        self.env_api_projects_dirty = true;
+        // 숨기거나 삭제한 프로젝트는 오래된 화면에도 남겨두지 않는다.
+        if let Some(rows) = &self.env_api_projects_cache {
+            let visible = |row: &&ui::env_project_list::EnvProjectRow| {
+                !self.config.ui.hidden_env_project_ids.contains(&row.id)
+                    && self
+                        .workspaces
+                        .iter()
+                        .any(|workspace| workspace.id == row.id)
+            };
+            if rows.iter().any(|row| !visible(&row)) {
+                self.env_api_projects_cache = Some(rows.iter().filter(visible).cloned().collect());
+            }
+        }
         self.env_project_rows_generation = self.env_project_rows_generation.wrapping_add(1);
         self.env_project_rows_failed = false;
     }
@@ -25158,6 +25266,13 @@ impl App {
         self.env_secret_generation = self.env_secret_generation.wrapping_add(1);
     }
 
+    fn refresh_env_profile_ui(&mut self, workspace_id: &str) {
+        if self.settings_snapshot_workspace_id.as_deref() == Some(workspace_id) {
+            self.settings_snapshot_refresh_requested = true;
+            self.egui_ctx.request_repaint();
+        }
+    }
+
     fn invalidate_env_profile_ui(&mut self) {
         self.pending_settings_job = None;
         self.pending_env_secret_reveal = None;
@@ -25167,6 +25282,7 @@ impl App {
         self.settings_snapshot_pending = false;
         self.settings_pending_operation = None;
         self.settings_snapshot_retry_at = None;
+        self.settings_snapshot_refresh_requested = false;
         self.settings_snapshot_workspace_id = None;
         self.agents_snapshot =
             ui::agents::AgentsSnapshot::unavailable(self.settings_snapshot_revision);
@@ -25193,14 +25309,20 @@ impl App {
     ) {
         let now = std::time::Instant::now();
         if self.settings_snapshot_workspace_id.as_deref() == Some(workspace_id) {
-            match self.settings_snapshot_retry_at {
-                Some(retry_at) if retry_at <= now && !self.settings_snapshot_pending => {
-                    self.settings_snapshot_retry_at = None;
-                }
-                _ => return,
+            let retry_due = self
+                .settings_snapshot_retry_at
+                .is_some_and(|retry_at| retry_at <= now);
+            if self.settings_snapshot_pending
+                || (!self.settings_snapshot_refresh_requested && !retry_due)
+            {
+                return;
             }
         }
-        if self.settings_snapshot_workspace_id.is_some() {
+        if self
+            .settings_snapshot_workspace_id
+            .as_deref()
+            .is_some_and(|current| current != workspace_id)
+        {
             self.settings_snapshot_generation = self.settings_snapshot_generation.wrapping_add(1);
             self.settings_snapshot_pending = false;
             self.settings_pending_operation = None;
@@ -25227,6 +25349,8 @@ impl App {
         if self.settings_snapshot_generation == 0 {
             self.settings_snapshot_generation = 1;
         }
+        self.settings_snapshot_refresh_requested = false;
+        self.settings_snapshot_retry_at = None;
         self.settings_snapshot_revision = self.settings_snapshot_revision.wrapping_add(1);
         let job = SettingsJob {
             generation: self.settings_snapshot_generation,
@@ -25804,7 +25928,19 @@ impl App {
                         .complete_add(projection_current, result.is_ok());
                     if result.is_ok() {
                         self.workspace_environment_changed(&outcome.workspace_id);
-                        self.invalidate_env_api_projects();
+                    }
+                }
+                SettingsOutcomeKind::CredentialEdited {
+                    credential_id,
+                    result,
+                } => {
+                    self.credentials_ui.complete_edit(
+                        projection_current,
+                        &credential_id,
+                        result.is_ok(),
+                    );
+                    if result.is_ok() {
+                        self.workspace_environment_changed(&outcome.workspace_id);
                     }
                 }
                 SettingsOutcomeKind::CredentialDeleted {
@@ -26149,6 +26285,7 @@ impl App {
                         "settings auxiliary worker failed"
                     );
                     self.env_project_rows_failed = true;
+                    self.env_api_projects_dirty = false;
                     self.env_api_projects_cache
                         .get_or_insert_with(|| Arc::from([]));
                     continue;
@@ -26157,6 +26294,7 @@ impl App {
             if outcome.generation != self.env_project_rows_generation {
                 continue;
             }
+            self.env_api_projects_dirty = false;
             match outcome.rows {
                 Ok(rows) => {
                     self.env_project_rows_failed = false;
@@ -26183,7 +26321,7 @@ impl App {
         }
         if self.settings_open
             && self.settings_category == ui::settings::Category::Environment
-            && self.env_api_projects_cache.is_none()
+            && self.env_api_projects_dirty
             && self.env_project_rows_in_flight.is_none()
         {
             let generation = self.env_project_rows_generation;
@@ -26196,9 +26334,7 @@ impl App {
                     self.env_project_rows_failed = false;
                 }
                 Err(error) if error.error_code().is_none() => {
-                    // 일시적 backpressure다. 여기서 캐시를 빈 값으로 채우면 재시도 조건
-                    // (`env_api_projects_cache.is_none()`)이 영구히 닫혀 목록이 빈 채로
-                    // 굳는다. 아무것도 바꾸지 않고 다음 폴에서 다시 시도한다.
+                    // 일시적 backpressure에서는 갱신 요청을 남겨 다음 폴에서 재시도한다.
                 }
                 Err(error) => {
                     let error_code = error
@@ -26211,6 +26347,7 @@ impl App {
                         "settings auxiliary worker rejected work"
                     );
                     self.env_project_rows_failed = true;
+                    self.env_api_projects_dirty = false;
                     self.env_api_projects_cache
                         .get_or_insert_with(|| Arc::from([]));
                 }
@@ -32033,7 +32170,9 @@ impl eframe::App for App {
             let active_id = self.active.id.clone();
             let selected = if self.settings_category == ui::settings::Category::Environment {
                 resolve_settings_env_project_during_refresh(
-                    env_api_projects_snapshot.as_deref(),
+                    env_api_projects_snapshot
+                        .as_deref()
+                        .filter(|_| !self.env_api_projects_dirty),
                     self.settings_workspace_id.as_deref(),
                     &active_id,
                 )
@@ -32158,7 +32297,9 @@ impl eframe::App for App {
         let settings_env_wsid = is_environment
             .then(|| {
                 resolve_settings_env_project_during_refresh(
-                    env_api_projects_snapshot.as_deref(),
+                    env_api_projects_snapshot
+                        .as_deref()
+                        .filter(|_| !self.env_api_projects_dirty),
                     self.settings_workspace_id.as_deref(),
                     &wsid,
                 )
@@ -32227,6 +32368,9 @@ impl eframe::App for App {
         let mut env_action: Option<ui::env_profiles::EnvAction> = None;
         let mut agents_intent: Option<ui::agents::AgentsIntent> = None;
         let mut credentials_intent: Option<ui::credentials::CredentialsIntent> = None;
+        self.credentials_ui.set_operations_pending(
+            self.settings_snapshot_pending || self.pending_settings_job.is_some(),
+        );
         let mut connector_intent: Option<connector_contract::ConnectorIntent> = None;
         // .env 라이브 반영 토글(E5 ⑨) — 클로저 안에서 편집하고 밖에서 저장/적용.
         let mut env_live_reload_toggle = self.config.ui.env_live_reload;
@@ -32721,6 +32865,9 @@ impl eframe::App for App {
                 ui::credentials::CredentialsIntent::Add { .. } => {
                     ui::credentials::CredentialsUiErrorCode::AddFailed
                 }
+                ui::credentials::CredentialsIntent::Edit { .. } => {
+                    ui::credentials::CredentialsUiErrorCode::EditFailed
+                }
                 ui::credentials::CredentialsIntent::Delete { .. } => {
                     ui::credentials::CredentialsUiErrorCode::DeleteFailed
                 }
@@ -32754,6 +32901,12 @@ impl eframe::App for App {
                     credential_id,
                 } if revision == current_revision => {
                     Some(SettingsJobAction::DeleteCredential { credential_id })
+                }
+                ui::credentials::CredentialsIntent::Edit {
+                    revision,
+                    credential,
+                } if revision == current_revision => {
+                    Some(SettingsJobAction::EditCredential { credential })
                 }
                 ui::credentials::CredentialsIntent::Reveal {
                     revision,
@@ -43231,6 +43384,66 @@ mod tests {
         fn has_secret(&self, id: &str) -> anyhow::Result<bool> {
             Ok(self.contains(id))
         }
+    }
+
+    #[test]
+    fn credential_edit_키를_비우면_유지하고_교체하면_원래_id로_읽는다() {
+        let path = temp_db_path("credential-edit");
+        let db = Db::open(&path).unwrap();
+        let workspace = db.create_workspace("edit").unwrap();
+        let store = MemSecretStore::new();
+        let logical = secret::LogicalCredentialId::new(uuid::Uuid::new_v4().to_string()).unwrap();
+        let old = secret::SecretBundleStagePlan::allocate(logical.clone(), None).unwrap();
+        db.register_physical_secret_slot_staging(logical.as_str(), old.new_slot().as_str())
+            .unwrap();
+        let access = secret::SecretString::new("fake-original-key".into());
+        secret::stage_secret_bundle(
+            &store,
+            &old,
+            secret::SecretBundleRef::new(&access, None, None),
+        )
+        .unwrap();
+        let meta = storage::CredentialMeta {
+            id: logical.as_str().into(),
+            provider: "test".into(),
+            label: "original".into(),
+            credential_kind: "api_key".into(),
+            masked_hint: Some(secret::masked_hint(access.expose())),
+            workspace_id: Some(workspace.clone()),
+        };
+        db.insert_credential_with_env_slot(&meta, old.new_slot().as_str(), Some("API_KEY"))
+            .unwrap();
+        for replacement in [None, Some("fake-replacement-key")] {
+            edit_settings_credential(
+                &db,
+                &store,
+                &workspace,
+                ui::credentials::EditedCredential {
+                    credential_id: meta.id.clone(),
+                    provider: "test".into(),
+                    label: "renamed".into(),
+                    credential_kind: "api_key".into(),
+                    env_name: Some("API_KEY".into()),
+                    secret: replacement
+                        .map(|s| ui::credentials::SensitiveInput::try_new(s.into()).unwrap()),
+                },
+            )
+            .unwrap();
+            let (_, slot) = settings_credential_slot(&db, &meta.id).unwrap();
+            let (value, _, _) = secret::read_secret_bundle(&store, &slot)
+                .unwrap()
+                .into_parts();
+            assert_eq!(value.expose(), replacement.unwrap_or("fake-original-key"));
+            assert_eq!(db.list_credentials().unwrap().len(), 1);
+            assert_eq!(db.list_credentials().unwrap()[0].label, "renamed");
+            assert_eq!(
+                db.list_credential_env_bindings(&workspace).unwrap()[0].credential_id,
+                meta.id
+            );
+            assert_eq!(slot == *old.new_slot(), replacement.is_none());
+        }
+        drop(db);
+        remove_sqlite_files(&path);
     }
 
     #[test]

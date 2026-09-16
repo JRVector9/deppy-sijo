@@ -1,5 +1,7 @@
 use crate::settings_snapshot::SnapshotLoadState;
+mod edit;
 mod modern;
+pub use edit::EditedCredential;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -26,6 +28,7 @@ pub struct CredentialListItem {
     masked_hint: Option<Arc<str>>,
     env_name: Option<Arc<str>>,
     overrides_dotenv: bool,
+    editable: bool,
 }
 
 impl CredentialListItem {
@@ -44,6 +47,7 @@ impl CredentialListItem {
             masked_hint: masked_hint.map(Into::into),
             env_name: None,
             overrides_dotenv: false,
+            editable: false,
         }
     }
 
@@ -55,6 +59,11 @@ impl CredentialListItem {
 
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    pub fn with_editable(mut self, editable: bool) -> Self {
+        self.editable = editable;
+        self
     }
 
     pub fn provider(&self) -> &str {
@@ -275,6 +284,10 @@ pub enum CredentialsIntent {
         revision: u64,
         credential: NewCredential,
     },
+    Edit {
+        revision: u64,
+        credential: EditedCredential,
+    },
     Delete {
         revision: u64,
         credential_id: String,
@@ -298,6 +311,7 @@ pub enum CredentialsUiErrorCode {
     SnapshotUnavailable,
     DraftLimitExceeded,
     AddFailed,
+    EditFailed,
     DeleteFailed,
     RevealFailed,
     RevealCapacityExceeded,
@@ -314,6 +328,9 @@ impl CredentialsUiErrorCode {
             Self::SnapshotUnavailable => "Credential 목록을 불러오지 못했습니다.",
             Self::DraftLimitExceeded => "입력 크기 상한을 초과했습니다.",
             Self::AddFailed => "Credential 저장에 실패했습니다.",
+            Self::EditFailed => {
+                "API 수정을 저장하지 못했습니다. 환경변수 이름의 중복을 확인하세요."
+            }
             Self::DeleteFailed => "Credential 삭제에 실패했습니다.",
             Self::RevealFailed => "Secret 값을 불러오지 못했습니다.",
             Self::RevealCapacityExceeded => "동시에 표시할 수 있는 secret 상한을 초과했습니다.",
@@ -337,6 +354,8 @@ struct BindingDraft {
 
 /// Credential settings draft and bounded reveal state. All external work belongs to App.
 pub struct CredentialsUi {
+    edit: Option<edit::CredentialEditDraft>,
+    operations_pending: bool,
     env_name: String,
     binding_drafts: HashMap<String, BindingDraft>,
     binding_pending: bool,
@@ -374,6 +393,8 @@ impl CredentialsUi {
 
     pub fn new() -> Self {
         Self {
+            edit: None,
+            operations_pending: false,
             env_name: String::new(),
             binding_drafts: HashMap::new(),
             binding_pending: false,
@@ -409,6 +430,10 @@ impl CredentialsUi {
         self.snapshot_revision = None;
         self.binding_drafts.clear();
         self.clear_revealed_secrets();
+    }
+
+    pub fn set_operations_pending(&mut self, pending: bool) {
+        self.operations_pending = pending;
     }
 
     pub fn clear_revealed_secrets(&mut self) {
@@ -474,6 +499,11 @@ impl CredentialsUi {
             CredentialsUiErrorCode::AddFailed => {
                 self.add_pending = false;
                 self.add_pending_for_draft = false;
+            }
+            CredentialsUiErrorCode::EditFailed => {
+                if let Some(edit) = self.edit.as_mut() {
+                    edit.pending = false;
+                }
             }
             CredentialsUiErrorCode::DeleteFailed => self.delete_pending.clear(),
             CredentialsUiErrorCode::OrphanScanFailed => self.orphan_scan_pending = false,
@@ -607,6 +637,7 @@ impl CredentialsUi {
             ],
         );
         self.render_rows(ui, snapshot, catalog, &mut intent);
+        self.render_edit_form(ui.ctx(), snapshot, catalog, &mut intent);
         self.render_delete_confirmation(ui.ctx(), snapshot.revision(), catalog, &mut intent);
         if self.show_add_form {
             self.render_add_form(ui, snapshot, catalog, &mut intent);
@@ -634,6 +665,13 @@ impl CredentialsUi {
             .iter()
             .map(CredentialListItem::id)
             .collect::<HashSet<_>>();
+        if self
+            .edit
+            .as_ref()
+            .is_some_and(|edit| !live.contains(edit.credential_id.as_str()))
+        {
+            self.edit = None;
+        }
         self.reveal_pending.retain(|id| live.contains(id.as_str()));
         self.delete_pending.retain(|id| live.contains(id.as_str()));
         let removed = self
@@ -674,7 +712,9 @@ impl CredentialsUi {
                             self.reveal_pending.contains(meta.id()),
                             catalog,
                         );
-                        if row.delete {
+                        if row.edit {
+                            self.begin_edit(meta);
+                        } else if row.delete {
                             let name = if meta.label().is_empty() {
                                 meta.provider()
                             } else {
@@ -870,6 +910,7 @@ impl CredentialsUi {
                 && !self.secret_input.is_empty()
                 && !self.secret_input_overflowed
                 && !self.add_pending
+                && !self.operations_pending
                 && snapshot.is_available()
                 && (self.env_name.trim().is_empty()
                     || deppy_core::credential_env::valid_name(self.env_name.trim()));
@@ -1048,6 +1089,7 @@ fn credentials_table_header(ui: &mut egui::Ui, columns: &[String]) {
 }
 
 struct CredentialRowResponse {
+    edit: bool,
     delete: bool,
     toggle_reveal: bool,
 }
@@ -1059,9 +1101,14 @@ fn credential_table_row(
     reveal_pending: bool,
     catalog: &i18n::Catalog,
 ) -> CredentialRowResponse {
-    let (rect, response) = ui.allocate_exact_size(
+    let (rect, _) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), CREDENTIAL_ROW_HEIGHT),
         egui::Sense::hover(),
+    );
+    let response = ui.interact(
+        rect,
+        ui.id().with(("credential_row", meta.id())),
+        egui::Sense::click(),
     );
     if response.hovered() {
         ui.painter()
@@ -1209,6 +1256,7 @@ fn credential_table_row(
     super::hairline_row(ui, rect.top());
     super::hairline_row(ui, rect.bottom());
     CredentialRowResponse {
+        edit: meta.editable && response.double_clicked(),
         delete: delete.clicked(),
         toggle_reveal: reveal.clicked(),
     }

@@ -1274,3 +1274,7 @@ workspace.menu.use_as_api_name = API 이름으로 넣기
 workspace.menu.use_as_api_value = API 키 값으로 넣기
 workspace.menu.use_as_env_name = 환경변수 이름으로 넣기
 workspace.menu.use_as_env_value = 환경변수 값으로 넣기
+
+credentials.edit.title = API 키 수정
+credentials.edit.keep_secret = 비워두면 기존 키 유지
+credentials.edit.retry_secret = 새 키를 다시 입력해 주세요

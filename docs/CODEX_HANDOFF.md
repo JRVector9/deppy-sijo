@@ -3766,3 +3766,35 @@
 - 검사: 이번 요청에서 release build/서명·hash·PID 경로·생존만 확인했다. 이전에 통과한 저장 로직 3건 및 정적 게이트는 반복하지 않았다. 실제 세션 드래그/자동 확장 화면 검증은 사용자가 아직 하지 않았으므로 PASS로 기록하지 않는다. 공증/배포/main merge/push 없음.
 - 실패 접근: 없음. 남은 작업은 사용자 화면 피드백 확인이다. 펼친 그룹이 세션 수만큼 늘어나는지와 같은 워크스페이스 내 세션 행 위·아래 재정렬을 확인받는다.
 - 다음 에이전트 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git log -3 --oneline`; `ps -o pid,etime,comm -p 95838`; `cat /tmp/deppy-session-order-restart-20260916.json`; `tail -n 5 /tmp/deppy-session-order-release-build-20260916.log`. `/tmp/deppy-session-order-{release,restart}-20260916.py`는 이전 종료 PID 94358을 고정 참조하므로 다음 재실행에 그대로 쓰지 않는다. 새 변경이 없으면 빌드/검사를 반복하지 않는다.
+
+
+## 2026-09-16 환경/API 추가 깜빡임·더블클릭 편집 진행
+
+- 목표: 사용자가 API 추가 때마다 상세 화면이 깜빡인다고 보고. 저장된 API 행을 더블클릭해 수정하도록 요청.
+- 원인: CredentialAdded → workspace_environment_changed → invalidate_env_api_projects가 마지막 Arc 목록을 None으로 비워 async 재조회 동안 settings_env_api_project도 None이 되고 상세 전체가 return한다. 동일 성공 경로에서 중복 invalidation도 있었다. 기존 credential UI/worker에는 추가·삭제·공개·환경 연결만 있고 메타/키 수정 액션은 없다.
+- 완료/진행: app.rs의 목록 cache와 dirty flag를 분리해 기존 화면을 유지하고 최신 generation 완료 때 교체한다. credentials/edit.rs에 별도 수정 초안/화면을 연결 중. 새 키 공란은 기존 키 유지, 평문 자동 조회 없음. workspace_env.rs에 같은 logical ID의 메타/환경 연결/선택적 physical slot 교체를 한 SQLite transaction으로 처리하는 메서드 추가. workspace 소유권·api_key/token·OAuth 아닌 행·slot 기대값을 검증한다.
+- 테스트: 저장 로직 2건을 먼저 작성. 최초 /tmp/deppy-api-edit-storage-red-20260916.log는 미구현 메서드 3곳 E0599로 컴파일 실패(실행된 assertion 실패로 주장하지 않음). 구현 후 `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo test --locked -p storage credential_edit_ -- --nocapture` 2 PASS / 0 FAIL. /tmp/deppy-api-edit-storage-green-20260916.log. 앱 fake SecretStore의 유지/교체 검사는 작성했고 첫 컴파일 진행 중 /tmp/deppy-api-edit-app-red-20260916.log.
+- 수정 파일: crates/app/src/app.rs, ui/credentials.rs, ui/credentials/modern.rs, 새 ui/credentials/edit.rs, crates/storage/src/workspace_env.rs, 이 문서. 로케일 키는 5개 함께 추가 예정.
+- 남음: worker/result/intent 편집 연결, 키 저장 검사, 자체 리뷰, 커밋 직전 gate 한 번, 커밋. 새 재빌드/재실행 승인은 아직 없음. 기존 앱 PID95838 / 486839e는 유지. 실제 UI 깜빡임/더블클릭 검증 미실행이라 PASS 주장 금지.
+- 다음 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git diff --stat`; `tail -n 30 /tmp/deppy-api-edit-app-red-20260916.log`; `tail -n 12 /tmp/deppy-api-edit-storage-green-20260916.log`. 앱 적용은 사용자의 새 승인 후 기존 서명/별도 bundle 절차로 한다.
+
+
+### API 수정 소스 검토·추가 갱신 경로 보완
+
+- 저장/backend와 편집 초안 검사: app `credential_edit_` 2 PASS(/tmp/deppy-api-edit-app-final-20260916.log), storage `credential_edit_` 2 PASS(/tmp/deppy-api-edit-storage-final-20260916.log). 총 4건이며 storage에는 slot publish 강제 실패 trigger를 넣어 메타/연결까지 원자 롤백함을 확인했다. 최초 앱 RED 로그는 미구현 helper와 intent 분기 E0425/E0004 컴파일 실패; 초안 정리 검사 작성 중 Undoer에 없는 lock 호출(E0599)을 발견해 기존 undo API로 고쳐 PASS. 실제 UI 테스트는 수행하지 않음.
+- 첫 정적 게이트 fmt/diff, app strict clippy, storage strict clippy, boundary, i18n 모두 exit0. 이후 자체 리뷰에서 API 추가→활성 dotenv 동기화 완료가 invalidate_env_profile_ui로 환경/API snapshots를 Loading으로 다시 비우는 두 번째 깜빡임 경로를 발견했다. 같은 workspace의 동기화/실행 뒤에는 refresh 요청 flag만 남기며 진행 중 작업 완료 후 기존 화면/초안을 유지한 채 재조회하도록 변경 중. navigation/close의 강제 초기화는 그대로다. 초기 캐시 수정만으로 완료했다고 하지 않는다.
+- 추가 자체 리뷰: 프로젝트 목록은 dirty 중 이전 Arc를 보여주되 선택 ID 판정은 재조회 상태로 처리해 새로 추가한 프로젝트 선택을 빼앗지 않는다. 숨김/삭제된 프로젝트는 retained Arc에서도 즉시 걸러낸다. 편집 저장 실패 후 새 키가 이미 worker로 이동한 경우 공란 재저장이 키 교체 의도를 조용히 버리지 않도록 재입력 안내/저장 게이트를 넣었다. 다시 필요한 관련 검사만 실행할 예정이다.
+- 현재 앱 PID95838은 유지. release 재빌드/재실행/main merge/push는 하지 않았다.
+
+- 재조회 동안 화면을 유지하면서 저장까지 활성화하면 capacity-one settings worker가 요청을 거부해 입력된 키만 소비할 수 있음을 추가 검토했다. 재조회/기존 작업 중에는 추가·수정의 저장 버튼만 잠시 비활성화하며 입력과 기존 화면은 유지한다. classic/modern 공통 CredentialsUi busy projection으로 연결했다. 이 보완 뒤 최종 app 컴파일/관련 검사와 fmt/clippy/i18n만 재확인한다.
+
+
+### API 추가 깜빡임·더블클릭 편집 소스 완료 / 앱 적용 승인 대기
+
+- 구현 완료: (1) 프로젝트 목록 재조회는 기존 Arc를 유지하고 최신 generation만 교체, 숨김/삭제 행은 즉시 제거. (2) 활성 dotenv 동기화/실행 완료 후 같은 workspace의 Settings 재조회는 refresh_requested로 예약해 화면/초안을 유지. 기존 작업 ACK를 무효화하지 않으며 프로젝트 전환/닫기는 원래 초기화 유지. (3) 수동 API 행의 안정된 ID에 double-click을 연결하고 modal에서 공급자·이름·종류·환경변수·선택적 새 키 수정. 키 공란은 기존 값 유지, 실패한 교체는 새 키 재입력 전 재저장 금지. 조회/작업 중에는 저장만 잠깐 막고 입력은 유지. (4) worker가 기존 logical credential ID를 유지하고 meta/binding/slot을 같은 DB transaction으로 확정, plaintext 자동 조회 없음. 닫기/탐색에서 초안과 undo 기록 해제. 새 UI 문구는 5개 locale 모두 추가.
+- 최종 실제 검사: `cargo fmt --all -- --check` exit0 (/tmp/deppy-api-edit-fmt-final-20260916.log). `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo test --locked -p deppy-sijo --bin deppy-sijo credential_edit_ -- --nocapture` **2 PASS / 0 FAIL** (/tmp/deppy-api-edit-app-final-20260916.log); 같은 환경 `cargo test --locked -p storage credential_edit_ -- --nocapture` **2 PASS / 0 FAIL** (/tmp/deppy-api-edit-storage-final-20260916.log). 테스트 범위는 fake store의 키 유지/교체·ID/연결 보존, 초안/undo/늦은 ACK, storage 소유권/충돌/stale/강제 publish 실패의 원자 롤백이다. UI 회귀/전체 suite는 별도 실행하지 않았다.
+- 정적 게이트: 앱 bin strict clippy exit0 (/tmp/deppy-api-edit-clippy-final-20260916.log), storage lib strict clippy exit0 (/tmp/deppy-api-edit-storage-clippy-20260916.log), xtask check-boundary exit0 (/tmp/deppy-api-edit-boundary-20260916.log), xtask i18n-check exit0 (/tmp/deppy-api-edit-i18n-final-20260916.log; 1216 literal key calls/5 locales), git diff --check exit0. 최초 gate 이후 자체 리뷰로 바뀐 앱/로케일만 관련 gate 재확인했고 storage/boundary는 소스 경계 변경이 없어 반복하지 않았다.
+- 최종 수정 파일: crates/app/src/app.rs, crates/app/src/ui/credentials.rs, crates/app/src/ui/credentials/modern.rs, 새 crates/app/src/ui/credentials/edit.rs, crates/storage/src/workspace_env.rs, crates/i18n/locales/{en-US,ko-KR,ja-JP,zh-Hans,zh-Hant}/messages.txt, docs/CODEX_HANDOFF.md. 소스 자체 검토 완료, 별도 서브에이전트/외부 리뷰 실행 없음.
+- 실행 상태: 기존 PID **95838**, /private/tmp/deppy-session-order-20260916-b_cpu9w0/Deppy Sijo.app, 제품 소스486839e 유지. **이번 수정의 release 재빌드·재실행·실제 화면 확인은 미실행**이다. 이전 사용자의 승인 후 재기동 규칙에 따라 적용 승인을 기다린다. main merge/push/배포 없음.
+- 남은 작업: 사용자 적용 승인 후 새 signed release bundle 빌드·재실행. 활성/비활성 프로젝트에서 API를 연속 추가해 화면이 유지되는지, 저장 행 더블클릭에서 이름만 변경/새 키 교체가 작동하는지 사용자 화면 피드백을 받는다. 실제 시각 검증을 PASS로 적지 않는다.
+- 다음 에이전트 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git log -3 --oneline`; `git show --stat HEAD`; `tail -n 10 /tmp/deppy-api-edit-app-final-20260916.log`; `tail -n 10 /tmp/deppy-api-edit-storage-final-20260916.log`; `ps -o pid,etime,comm -p 95838`. 적용 승인 후 `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo build --locked --release -p deppy-sijo -p mcp-proxy`. 새 source hash/별도 bundle/동일 Developer ID 서명과 지정 요구사항 확인 후 PID95838의 정확한 실행 경로를 확인해 정상 종료·새 bundle open. 이전 /tmp/deppy-session-order-*-20260916.py는 PID94358이 하드코딩되어 그대로 재사용 금지.

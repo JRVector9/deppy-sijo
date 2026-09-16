@@ -156,6 +156,104 @@ impl Db {
         Ok(bindings)
     }
 
+    /// 해당 워크스페이스의 수동 API 메타와 slot만 읽는다. 비밀키 본문은 조회하지 않는다.
+    pub fn workspace_api_credential(
+        &self,
+        workspace: &str,
+        credential_id: &str,
+    ) -> anyhow::Result<(CredentialMeta, CredentialSecretLocation)> {
+        let tx = self.conn.unchecked_transaction()?;
+        let location = Self::credential_secret_location_in_snapshot(&tx, credential_id)?
+            .context("credential_edit_missing")?;
+        let meta = Self::editable_api_credential(
+            &tx,
+            workspace,
+            credential_id,
+            &location.keyring_username,
+        )?;
+        tx.commit()?;
+        Ok((meta, location))
+    }
+
+    fn editable_api_credential(
+        conn: &Connection,
+        workspace: &str,
+        credential_id: &str,
+        expected_slot: &str,
+    ) -> anyhow::Result<CredentialMeta> {
+        let meta = settings_credential_for_publish(conn, credential_id, expected_slot)?
+            .context("credential_edit_stale_or_missing")?;
+        anyhow::ensure!(
+            meta.workspace_id.as_deref() == Some(workspace),
+            "credential_edit_owner_invalid"
+        );
+        anyhow::ensure!(
+            matches!(meta.credential_kind.as_str(), "api_key" | "token"),
+            "credential_edit_kind_invalid"
+        );
+        let plain: bool = conn.query_row(
+            "SELECT oauth_json IS NULL AND keyring_service=?2 FROM credentials WHERE id=?1",
+            (credential_id, secret::KEYRING_SERVICE),
+            |row| row.get(0),
+        )?;
+        anyhow::ensure!(plain, "credential_edit_oauth_or_service_invalid");
+        Ok(meta)
+    }
+
+    /// 기존 ID를 유지하고 메타·환경 연결·선택적 키 교체를 원자적으로 확정한다.
+    pub fn update_credential_with_env_slot(
+        &self,
+        workspace: &str,
+        meta: &CredentialMeta,
+        expected_slot: &str,
+        replacement_slot: Option<&str>,
+        env_name: Option<&str>,
+    ) -> anyhow::Result<()> {
+        validate_owned_physical_secret_slot(&meta.id, expected_slot)?;
+        anyhow::ensure!(
+            meta.workspace_id.as_deref() == Some(workspace),
+            "credential_edit_owner_invalid"
+        );
+        anyhow::ensure!(
+            !meta.provider.trim().is_empty()
+                && meta.provider.len() <= 4096
+                && !meta.label.trim().is_empty()
+                && meta.label.len() <= 4096
+                && matches!(meta.credential_kind.as_str(), "api_key" | "token"),
+            "credential_edit_metadata_invalid"
+        );
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let original = Self::editable_api_credential(&tx, workspace, &meta.id, expected_slot)?;
+        let mut candidate = meta.clone();
+        if replacement_slot.is_none() {
+            candidate.masked_hint = original.masked_hint;
+        }
+        settings_credential_candidate_write_admission(&tx, &candidate)?;
+        Self::write_credential_env_in_transaction(&tx, workspace, &meta.id, env_name)?;
+        tx.execute(
+            "UPDATE credentials SET provider=?2, label=?3, credential_kind=?4,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?1",
+            (&meta.id, &meta.provider, &meta.label, &meta.credential_kind),
+        )?;
+        if let Some(slot) = replacement_slot {
+            validate_owned_physical_secret_slot(&meta.id, slot)?;
+            anyhow::ensure!(slot != expected_slot, "credential_edit_slot_reused");
+            anyhow::ensure!(
+                Self::publish_credential_secret_slot_in_transaction(
+                    &tx,
+                    &meta.id,
+                    expected_slot,
+                    slot,
+                    None,
+                    candidate.masked_hint.as_deref(),
+                )?,
+                "credential_edit_stale"
+            );
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// 메타데이터·slot 공개와 환경 연결을 같은 SQLite 트랜잭션으로 확정한다.
     pub fn insert_credential_with_env_slot(
         &self,
@@ -184,6 +282,171 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_edit_원래_id를_유지하고_메타와_연결과_slot을_함께_변경한다() {
+        let db = Db::open_in_memory().unwrap();
+        let workspace = db.create_workspace("edit").unwrap();
+        let logical = secret::LogicalCredentialId::new(uuid::Uuid::new_v4().to_string()).unwrap();
+        let old = secret::SecretBundleStagePlan::allocate(logical.clone(), None).unwrap();
+        db.register_physical_secret_slot_staging(logical.as_str(), old.new_slot().as_str())
+            .unwrap();
+        let mut meta = CredentialMeta {
+            id: logical.as_str().into(),
+            provider: "test".into(),
+            label: "before".into(),
+            credential_kind: "api_key".into(),
+            masked_hint: Some("old".into()),
+            workspace_id: Some(workspace.clone()),
+        };
+        db.insert_credential_with_env_slot(&meta, old.new_slot().as_str(), Some("OLD_KEY"))
+            .unwrap();
+        meta.label = "renamed".into();
+        db.update_credential_with_env_slot(
+            &workspace,
+            &meta,
+            old.new_slot().as_str(),
+            None,
+            Some("NEW_KEY"),
+        )
+        .unwrap();
+        assert_eq!(
+            db.credential_secret_location(&meta.id)
+                .unwrap()
+                .unwrap()
+                .keyring_username,
+            old.new_slot().as_str()
+        );
+        let next =
+            secret::SecretBundleStagePlan::allocate(logical.clone(), Some(old.new_slot().clone()))
+                .unwrap();
+        db.register_physical_secret_slot_staging(logical.as_str(), next.new_slot().as_str())
+            .unwrap();
+        meta.masked_hint = Some("new".into());
+        db.update_credential_with_env_slot(
+            &workspace,
+            &meta,
+            old.new_slot().as_str(),
+            Some(next.new_slot().as_str()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(db.list_credentials().unwrap(), vec![meta.clone()]);
+        assert!(
+            db.list_credential_env_bindings(&workspace)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            db.credential_secret_location(&meta.id)
+                .unwrap()
+                .unwrap()
+                .keyring_username,
+            next.new_slot().as_str()
+        );
+    }
+
+    #[test]
+    fn credential_edit_충돌과_다른_워크스페이스와_stale은_원본을_보존한다() {
+        let db = Db::open_in_memory().unwrap();
+        let workspace = db.create_workspace("edit").unwrap();
+        let other = db.create_workspace("other").unwrap();
+        key(&db, "taken", Some(&workspace));
+        db.set_credential_env_binding(&workspace, "taken", Some("TAKEN"))
+            .unwrap();
+        let logical = secret::LogicalCredentialId::new(uuid::Uuid::new_v4().to_string()).unwrap();
+        let old = secret::SecretBundleStagePlan::allocate(logical.clone(), None).unwrap();
+        db.register_physical_secret_slot_staging(logical.as_str(), old.new_slot().as_str())
+            .unwrap();
+        let original = CredentialMeta {
+            id: logical.as_str().into(),
+            provider: "test".into(),
+            label: "before".into(),
+            credential_kind: "api_key".into(),
+            masked_hint: Some("old".into()),
+            workspace_id: Some(workspace.clone()),
+        };
+        db.insert_credential_with_env_slot(&original, old.new_slot().as_str(), Some("ORIGINAL"))
+            .unwrap();
+        let next =
+            secret::SecretBundleStagePlan::allocate(logical.clone(), Some(old.new_slot().clone()))
+                .unwrap();
+        db.register_physical_secret_slot_staging(logical.as_str(), next.new_slot().as_str())
+            .unwrap();
+        let mut changed = original.clone();
+        changed.label = "after".into();
+        changed.masked_hint = Some("new".into());
+        for (owner, expected, name) in [
+            (workspace.as_str(), old.new_slot().as_str(), "TAKEN"),
+            (other.as_str(), old.new_slot().as_str(), "OTHER"),
+            (workspace.as_str(), next.new_slot().as_str(), "OTHER"),
+        ] {
+            assert!(
+                db.update_credential_with_env_slot(
+                    owner,
+                    &changed,
+                    expected,
+                    Some(next.new_slot().as_str()),
+                    Some(name)
+                )
+                .is_err()
+            );
+            assert_eq!(
+                db.list_credentials()
+                    .unwrap()
+                    .into_iter()
+                    .find(|m| m.id == original.id)
+                    .unwrap(),
+                original
+            );
+            assert_eq!(
+                db.credential_secret_location(&original.id)
+                    .unwrap()
+                    .unwrap()
+                    .keyring_username,
+                old.new_slot().as_str()
+            );
+            assert!(
+                db.list_credential_env_bindings(&workspace)
+                    .unwrap()
+                    .iter()
+                    .any(|b| b.credential_id == original.id && b.env_name == "ORIGINAL")
+            );
+        }
+        // 메타와 환경 연결을 쓴 뒤 slot 공개가 실패해도 트랜잭션 전체가 복구된다.
+        db.conn.execute_batch("CREATE TRIGGER reject_api_edit BEFORE UPDATE OF keyring_username ON credentials BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
+        assert!(
+            db.update_credential_with_env_slot(
+                &workspace,
+                &changed,
+                old.new_slot().as_str(),
+                Some(next.new_slot().as_str()),
+                Some("NEW_KEY")
+            )
+            .is_err()
+        );
+        assert_eq!(
+            db.list_credentials()
+                .unwrap()
+                .into_iter()
+                .find(|m| m.id == original.id)
+                .unwrap(),
+            original
+        );
+        assert_eq!(
+            db.credential_secret_location(&original.id)
+                .unwrap()
+                .unwrap()
+                .keyring_username,
+            old.new_slot().as_str()
+        );
+        assert!(
+            db.list_credential_env_bindings(&workspace)
+                .unwrap()
+                .iter()
+                .any(|b| b.credential_id == original.id && b.env_name == "ORIGINAL")
+        );
+    }
     fn key(db: &Db, id: &str, workspace: Option<&str>) -> CredentialMeta {
         let meta = CredentialMeta {
             id: id.to_owned(),

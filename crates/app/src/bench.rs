@@ -77,7 +77,7 @@ mod counting_alloc {
 static GLOBAL_ALLOC: counting_alloc::Counting = counting_alloc::Counting;
 
 /// 현재 스레드의 (alloc 횟수, alloc 바이트). feature가 없으면 None — **0을 지어내지 않는다**.
-fn thread_alloc_stats() -> Option<(u64, u64)> {
+pub(crate) fn thread_alloc_stats() -> Option<(u64, u64)> {
     #[cfg(feature = "bench-alloc")]
     {
         Some(counting_alloc::thread_stats())

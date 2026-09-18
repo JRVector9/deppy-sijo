@@ -29,7 +29,8 @@ const RESIZE_VIEWPORT_QUIET: std::time::Duration = std::time::Duration::from_mil
 const RESIZE_VIEWPORT_HARD_DEADLINE: std::time::Duration = std::time::Duration::from_millis(250);
 const PROTOCOL_RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(16);
 const PROTOCOL_RETRY_LIMIT: u8 = 6;
-const WORKSPACE_IO_QUEUE_CAP: usize = 1;
+// 사용자 요청은 고정 상한으로 보관하고, 경로 미리보기는 별도의 최신 한 건만 둔다.
+const WORKSPACE_IO_QUEUE_CAP: usize = 8;
 const WORKSPACE_PATH_MAX_BYTES: usize = 32 * 1024;
 const WORKSPACE_URL_MAX_BYTES: usize = 32 * 1024;
 const TERMINAL_CLIPBOARD_PATH_MAX_ITEMS: usize = 16;
@@ -1987,15 +1988,16 @@ pub struct WorkspaceUi {
     archived_resume_presentation:
         std::collections::HashMap<SessionId, crate::agent_resume::ArchivedResumePresentation>,
     /// App host가 수행 중인 terminal clipboard 요청. completion은 operation/generation을
-    /// 모두 맞춘 뒤 정확히 한 번만 적용한다. 새 요청은 이전 요청을 stale로 만든다.
-    pending_paste: Option<PendingPaste>,
+    /// 모두 맞춘 뒤 정확히 한 번만 적용한다. 이전 요청은 다음 붙여넣기가 와도 보존한다.
+    pending_pastes: VecDeque<PendingPaste>,
+    native_error: Option<WorkspaceNativeError>,
     error: Option<String>,
-    /// 현재 error 배너가 input backpressure 경고인지 — 해소 이벤트(queued=0)가
+    /// 현재 미전달 오류가 input backpressure 경고인지 — 해소 이벤트(queued=0)가
     /// 무관한 오류(spawn 실패 등)를 지우지 않게 구분한다(codex 2026-07-09).
     error_is_pressure: bool,
     /// 프로토콜 요청이 실제로 유실됐음을 표시하는 플래그(2026-08-18, "terminal protocol
     /// request rejected" 배너 버그 수정). send/send_keep_selection/spawn_shell_at은 catalog가
-    /// 없어 문구를 미리 만들 수 없다 — 여기 플래그만 세우고 show_with_input이 렌더 시점에
+    /// 없어 문구를 미리 만들 수 없다 — 여기 플래그만 세우고 take_error_notice가
     /// catalog로 채운다. Busy(큐 포화)·InvalidCommand(내부 계약 위반)는 사용자가 어찌할 수
     /// 없는 신호라 이 플래그를 쓰지 않고 tracing으로만 남긴다 — PayloadTooLarge/DeliveryFailed
     /// 처럼 정말 되돌릴 수 없이 사라진 요청만 여기로 온다.
@@ -2200,6 +2202,15 @@ pub struct TerminalClipboardPayload {
 }
 
 impl TerminalClipboardPayload {
+    /// 파일/이미지 경로가 있으면 사용하지 않을 텍스트 flavor를 읽지 않는다.
+    pub fn read_with(
+        paths: Vec<PathBuf>,
+        read_text: impl FnOnce() -> Option<String>,
+    ) -> Result<Self, WorkspaceIoErrorCode> {
+        let text = paths.is_empty().then(read_text).flatten();
+        Self::try_new(paths, text)
+    }
+
     pub fn try_new(
         paths: Vec<PathBuf>,
         text: Option<String>,
@@ -2269,6 +2280,9 @@ pub enum WorkspaceIoCompletion {
         generation: u64,
         result: Result<TerminalClipboardPayload, WorkspaceIoErrorCode>,
     },
+    /// OS가 경로/URL 열기를 거부했거나 host worker를 시작하지 못했다.
+    OpenPathFailed,
+    OpenUrlFailed,
 }
 
 struct PendingPathResolution {
@@ -2290,6 +2304,35 @@ struct PendingPaste {
     /// 요청 시각 — 워크스페이스가 warm으로 물러났다 돌아온 뒤 도착한 옛 paste가
     /// 살아있는 세션(바뀐 프롬프트)에 뒤늦게 꽂히지 않게 만료시킨다(codex Medium).
     requested_at: std::time::Instant,
+}
+
+#[derive(Clone, Copy)]
+enum WorkspaceNativeError {
+    Busy,
+    ClipboardFailed,
+    ClipboardTooLarge,
+    ClipboardExpired,
+    PathRejected,
+    UrlRejected,
+}
+
+/// 알림 센터가 같은 원인의 반복 오류를 합칠 수 있게 하는 안정적인 분류다.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkspaceErrorKind {
+    NativeBusy,
+    ClipboardFailed,
+    ClipboardTooLarge,
+    ClipboardExpired,
+    PathRejected,
+    UrlRejected,
+    ProtocolRequestLost,
+    InputPressure,
+    Other,
+}
+
+pub struct WorkspaceErrorNotice {
+    pub kind: WorkspaceErrorKind,
+    pub message: String,
 }
 
 /// App host paste 결과의 수명 — 이보다 오래된 완료는 버린다.
@@ -2839,7 +2882,8 @@ impl WorkspaceUi {
             session_project_names: SessionProjectNameSnapshot::default(),
             agent_info: std::collections::HashMap::new(),
             archived_resume_presentation: std::collections::HashMap::new(),
-            pending_paste: None,
+            pending_pastes: VecDeque::new(),
+            native_error: None,
             error: None,
             error_is_pressure: false,
             protocol_request_lost: false,
@@ -2959,17 +3003,99 @@ impl WorkspaceUi {
     }
 
     fn queue_io_intent(&mut self, intent: WorkspaceIoIntent) -> Result<(), WorkspaceIoErrorCode> {
-        if self.io_intents.len() >= WORKSPACE_IO_QUEUE_CAP {
+        if matches!(intent, WorkspaceIoIntent::ResolvePath { .. }) {
+            // 마우스가 움직이며 만든 조회는 최신 위치만 필요하다. 사용자 작업은 보존한다.
+            self.io_intents
+                .retain(|queued| !matches!(queued, WorkspaceIoIntent::ResolvePath { .. }));
+        } else if self
+            .io_intents
+            .iter()
+            .filter(|queued| !matches!(queued, WorkspaceIoIntent::ResolvePath { .. }))
+            .count()
+            >= WORKSPACE_IO_QUEUE_CAP
+        {
             return Err(WorkspaceIoErrorCode::Busy);
         }
         self.io_intents.push_back(intent);
         Ok(())
     }
 
-    /// App host가 실행할 다음 native I/O intent. 큐는 최대 8개이며 render는 이 API로
+    /// 사용자 작업 최대 8개와 미리보기 1개를 보관하며, 사용자 작업부터 실행한다.
     /// 실행 권한만 넘긴다. 큐가 비면 idle thread/network/polling이 생기지 않는다.
     pub fn take_io_intent(&mut self) -> Option<WorkspaceIoIntent> {
-        self.io_intents.pop_front()
+        self.expire_pending_pastes();
+        let index = self
+            .io_intents
+            .iter()
+            .position(|intent| !matches!(intent, WorkspaceIoIntent::ResolvePath { .. }))
+            .unwrap_or(0);
+        self.io_intents.remove(index)
+    }
+
+    fn expire_pending_pastes(&mut self) {
+        let before = self.pending_pastes.len();
+        self.pending_pastes
+            .retain(|pending| pending.requested_at.elapsed() <= PASTE_TASK_TTL);
+        if self.pending_pastes.len() != before {
+            self.native_error = Some(WorkspaceNativeError::ClipboardExpired);
+            self.io_intents.retain(|intent| match intent {
+                WorkspaceIoIntent::ReadTerminalClipboard {
+                    operation,
+                    generation,
+                } => self.pending_pastes.iter().any(|pending| {
+                    pending.operation == *operation && pending.generation == *generation
+                }),
+                _ => true,
+            });
+        }
+    }
+
+    /// 상단 배너 대신 App의 알림 센터가 오류를 한 번씩 가져간다. warm 작업도 동일하다.
+    pub fn take_error_notice(&mut self, catalog: &i18n::Catalog) -> Option<WorkspaceErrorNotice> {
+        self.expire_pending_pastes();
+        if let Some(error) = self.native_error.take() {
+            let (kind, key) = match error {
+                WorkspaceNativeError::Busy => {
+                    (WorkspaceErrorKind::NativeBusy, "workspace.native_busy")
+                }
+                WorkspaceNativeError::ClipboardFailed => (
+                    WorkspaceErrorKind::ClipboardFailed,
+                    "workspace.clipboard_failed",
+                ),
+                WorkspaceNativeError::ClipboardTooLarge => (
+                    WorkspaceErrorKind::ClipboardTooLarge,
+                    "workspace.clipboard_too_large",
+                ),
+                WorkspaceNativeError::ClipboardExpired => (
+                    WorkspaceErrorKind::ClipboardExpired,
+                    "workspace.clipboard_expired",
+                ),
+                WorkspaceNativeError::PathRejected => {
+                    (WorkspaceErrorKind::PathRejected, "workspace.path_rejected")
+                }
+                WorkspaceNativeError::UrlRejected => {
+                    (WorkspaceErrorKind::UrlRejected, "workspace.url_rejected")
+                }
+            };
+            return Some(WorkspaceErrorNotice {
+                kind,
+                message: catalog.t(key, &[]),
+            });
+        }
+        if std::mem::take(&mut self.protocol_request_lost) {
+            return Some(WorkspaceErrorNotice {
+                kind: WorkspaceErrorKind::ProtocolRequestLost,
+                message: catalog.t("workspace.protocol_request_lost", &[]),
+            });
+        }
+        self.error.take().map(|message| WorkspaceErrorNotice {
+            kind: if self.error_is_pressure {
+                WorkspaceErrorKind::InputPressure
+            } else {
+                WorkspaceErrorKind::Other
+            },
+            message,
+        })
     }
 
     fn next_protocol_operation(&mut self) -> (WorkspaceProtocolOperation, u64) {
@@ -3943,32 +4069,39 @@ impl WorkspaceUi {
                 generation,
                 result,
             } => {
-                let Some(pending) = self.pending_paste.as_ref() else {
+                let Some(index) = self.pending_pastes.iter().position(|pending| {
+                    pending.operation == operation && pending.generation == generation
+                }) else {
                     return;
                 };
-                if pending.operation != operation
-                    || pending.generation != generation
-                    || generation != self.io_generation
-                    || pending.requested_at.elapsed() > PASTE_TASK_TTL
-                {
+                let pending = self
+                    .pending_pastes
+                    .remove(index)
+                    .expect("exact pending checked");
+                // cwd 세대는 경로 조회의 수명이다. 붙여넣기는 원래 요청 세션과 토큰으로 검증한다.
+                if pending.requested_at.elapsed() > PASTE_TASK_TTL {
+                    self.native_error = Some(WorkspaceNativeError::ClipboardExpired);
                     return;
                 }
-                let pending = self.pending_paste.take().expect("exact pending checked");
                 let payload = match result {
                     Ok(payload) => payload,
+                    Err(WorkspaceIoErrorCode::ClipboardTooLarge) => {
+                        self.native_error = Some(WorkspaceNativeError::ClipboardTooLarge);
+                        return;
+                    }
                     Err(code) => {
-                        self.error_is_pressure = false;
-                        self.error = Some(format!("terminal clipboard operation failed: {code:?}"));
+                        tracing::warn!(error_code = ?code, "terminal clipboard operation failed");
+                        self.native_error = Some(WorkspaceNativeError::ClipboardFailed);
                         return;
                     }
                 };
                 let (paths, text) = payload.into_parts();
-                let text = text
-                    .map(|value| terminal_text_paste_bytes(&value, pending.bracketed))
-                    .or(pending.text_fallback);
                 let bytes = clipboard_terminal_paste_bytes(
                     (!paths.is_empty()).then_some(paths.as_slice()),
-                    text,
+                    || {
+                        text.map(|value| terminal_text_paste_bytes(&value, pending.bracketed))
+                            .or(pending.text_fallback)
+                    },
                     pending.shell_kind,
                     pending.bracketed,
                 );
@@ -3978,6 +4111,12 @@ impl WorkspaceUi {
                         bytes,
                     });
                 }
+            }
+            WorkspaceIoCompletion::OpenPathFailed => {
+                self.native_error = Some(WorkspaceNativeError::PathRejected);
+            }
+            WorkspaceIoCompletion::OpenUrlFailed => {
+                self.native_error = Some(WorkspaceNativeError::UrlRejected);
             }
         }
     }
@@ -3993,8 +4132,13 @@ impl WorkspaceUi {
             .as_ref()
             .is_some_and(|text| text.len() > TERMINAL_CLIPBOARD_TEXT_MAX_BYTES)
         {
-            self.error_is_pressure = false;
-            self.error = Some("terminal clipboard input exceeded limit".to_owned());
+            self.native_error = Some(WorkspaceNativeError::ClipboardTooLarge);
+            return;
+        }
+        self.expire_pending_pastes();
+        // 실행 중인 요청도 예산에 포함한다. 새 요청으로 이전 paste 컨텍스트를 덮지 않는다.
+        if self.pending_pastes.len() >= WORKSPACE_IO_QUEUE_CAP {
+            self.native_error = Some(WorkspaceNativeError::Busy);
             return;
         }
         let operation = self.next_io_operation();
@@ -4006,11 +4150,10 @@ impl WorkspaceUi {
             })
             .is_err()
         {
-            self.error_is_pressure = false;
-            self.error = Some("native operation queue is busy".to_owned());
+            self.native_error = Some(WorkspaceNativeError::Busy);
             return;
         }
-        self.pending_paste = Some(PendingPaste {
+        self.pending_pastes.push_back(PendingPaste {
             operation,
             generation,
             session,
@@ -4023,23 +4166,21 @@ impl WorkspaceUi {
 
     fn request_open_path(&mut self, path: PathBuf) {
         let intent = WorkspacePathPayload::try_new(path).map(WorkspaceIoIntent::OpenPath);
-        if intent
-            .and_then(|intent| self.queue_io_intent(intent))
-            .is_err()
-        {
-            self.error_is_pressure = false;
-            self.error = Some("native path operation rejected".to_owned());
+        if let Err(code) = intent.and_then(|intent| self.queue_io_intent(intent)) {
+            self.native_error = Some(match code {
+                WorkspaceIoErrorCode::Busy => WorkspaceNativeError::Busy,
+                _ => WorkspaceNativeError::PathRejected,
+            });
         }
     }
 
     fn request_open_url(&mut self, url: &str) {
         let intent = WorkspaceUrlPayload::try_new(url.to_owned()).map(WorkspaceIoIntent::OpenUrl);
-        if intent
-            .and_then(|intent| self.queue_io_intent(intent))
-            .is_err()
-        {
-            self.error_is_pressure = false;
-            self.error = Some("native URL operation rejected".to_owned());
+        if let Err(code) = intent.and_then(|intent| self.queue_io_intent(intent)) {
+            self.native_error = Some(match code {
+                WorkspaceIoErrorCode::Busy => WorkspaceNativeError::Busy,
+                _ => WorkspaceNativeError::UrlRejected,
+            });
         }
     }
 
@@ -4770,7 +4911,7 @@ impl WorkspaceUi {
                         if let Some(entry) = self.sessions.get_mut(session) {
                             entry.input_pressure = None;
                         }
-                        // 압력 경고일 때만 배너를 걷는다 — spawn 실패 등 무관 오류 보존.
+                        // 압력 경고일 때만 알림 대기를 걷는다 — spawn 실패 등 무관 오류 보존.
                         if self.error_is_pressure {
                             self.error = None;
                             self.error_is_pressure = false;
@@ -4781,14 +4922,18 @@ impl WorkspaceUi {
                         self.sessions.entry(*session).or_default().input_pressure =
                             Some(pressure.clone());
                     }
-                    self.error_is_pressure = true;
-                    self.error = Some(catalog.t(
-                        "workspace.input_pressure",
-                        &[
-                            ("queued", &format_bytes(pressure.queued_bytes as u64)),
-                            ("max", &format_bytes(pressure.max_bytes as u64)),
-                        ],
-                    ));
+                    // 같은 압박 에피소드의 수치 갱신은 세션 상태에만 반영한다. 알림 문자열을
+                    // 매 이벤트마다 다시 만들면 값이 달라질 때마다 새 알림이 쌓인다.
+                    if !self.error_is_pressure && self.error.is_none() {
+                        self.error_is_pressure = true;
+                        self.error = Some(catalog.t(
+                            "workspace.input_pressure",
+                            &[
+                                ("queued", &format_bytes(pressure.queued_bytes as u64)),
+                                ("max", &format_bytes(pressure.max_bytes as u64)),
+                            ],
+                        ));
+                    }
                 }
                 RuntimeEvent::ShellSpawned { session } => {
                     if self
@@ -5327,31 +5472,8 @@ impl WorkspaceUi {
         // 탭바 제거 (2026-07-05): 셸 전환은 좌측 사이드바 세션 목록이 담당하고,
         // 새 셸/분할/닫기는 각 pane 헤더가 담당한다 — 셸 수만큼 탭이 늘어나
         // 상단이 넘치던 문제 해소.
-        // 에러 바가 있을 때만 pane과 분리하는 헤어라인을 둔다 — 평소엔 top_bar 하단
-        // 헤어라인이 이미 구분선이라 여기 무조건 그리면 라인이 두 줄로 겹쳤다(#64 사용자).
-        // protocol_request_lost는 catalog 없는 지점(send_keep_selection 등)에서 세운 플래그다
-        // — 여기서만 catalog가 있어 렌더 시점에 한국어(등 로케일) 문구로 채운다. self.error와
-        // 동시에 있을 순 있지만 배너 한 줄만 그리면 충분해 우선순위만 준다(2026-08-18).
-        if self.protocol_request_lost {
-            ui.horizontal(|ui| {
-                ui.colored_label(
-                    ui.visuals().error_fg_color,
-                    catalog.t("workspace.protocol_request_lost", &[]),
-                );
-                if ui.small_button("×").clicked() {
-                    self.protocol_request_lost = false;
-                }
-            });
-            crate::ui::hairline(ui);
-        } else if let Some(error) = self.error.clone() {
-            ui.horizontal(|ui| {
-                ui.colored_label(ui.visuals().error_fg_color, error);
-                if ui.small_button("×").clicked() {
-                    self.error = None;
-                }
-            });
-            crate::ui::hairline(ui);
-        }
+        // 오류는 App logic이 take_error_notice로 알림 센터에 전달한다.
+        // 이 위치에는 배너를 만들지 않아 터미널 높이와 출력 배치를 유지한다.
 
         let Some(mux) = self.mux.clone() else {
             self.reconcile_active_split_drag(ui.ctx(), input_enabled, None);
@@ -7924,8 +8046,7 @@ impl WorkspaceUi {
     }
 
     /// "메모에 추가"가 상한 초과로 거부됐음을 사용자에게 알린다. 판정 자체는 App
-    /// 몫이지만(leaf는 storage 상수를 못 본다) 배너 표시는 이 leaf의 self.error가
-    /// 이미 하는 일이라 그대로 위임한다(PR-4).
+    /// 몫이지만(leaf는 storage 상수를 못 본다) 전달은 다른 오류와 같은 알림 경로를 쓴다.
     pub fn report_note_append_rejected(&mut self, message: String) {
         self.error_is_pressure = false;
         self.error = Some(message);
@@ -8328,7 +8449,7 @@ impl WorkspaceUi {
     /// 배너 버그 수정)를 공통 처리한다. Busy(자연히 풀리는 큐 포화)와 InvalidCommand(사용자가
     /// 만들 수 없는 내부 계약 위반)는 배너를 띄워도 대응할 수 없어 tracing만 남긴다.
     /// PayloadTooLarge/DeliveryFailed만 정말 되돌릴 수 없이 사라진 요청이라
-    /// protocol_request_lost를 세워 show_with_input이 catalog로 배너를 채우게 한다.
+    /// protocol_request_lost를 세워 take_error_notice가 알림 문구를 만들게 한다.
     fn report_protocol_queue_rejection(
         &mut self,
         code: WorkspaceProtocolErrorCode,
@@ -8711,14 +8832,14 @@ fn terminal_primary_pointer_clicked(response: &egui::Response) -> bool {
 
 fn clipboard_terminal_paste_bytes(
     paths: Option<&[std::path::PathBuf]>,
-    text_paste_bytes: Option<Vec<u8>>,
+    text_paste_bytes: impl FnOnce() -> Option<Vec<u8>>,
     shell_kind: crate::ui::file_tree::ShellKind,
     bracketed_paste: bool,
 ) -> Option<Vec<u8>> {
     if let Some(paths) = paths {
         Some(paths_insert_paste_bytes(paths, shell_kind, bracketed_paste))
     } else {
-        text_paste_bytes
+        text_paste_bytes()
     }
 }
 
@@ -9351,6 +9472,10 @@ mod tests {
             });
         }
         commands
+    }
+
+    fn take_error_message(ui: &mut WorkspaceUi, catalog: &i18n::Catalog) -> Option<String> {
+        ui.take_error_notice(catalog).map(|notice| notice.message)
     }
 
     fn split_mux_snapshot(ratio: f32) -> Arc<MuxSnapshot> {
@@ -17462,7 +17587,7 @@ mod tests {
         let text = Some(b"images/sample image.png".to_vec());
 
         assert_eq!(
-            clipboard_terminal_paste_bytes(Some(&paths), text, ShellKind::Posix, false),
+            clipboard_terminal_paste_bytes(Some(&paths), || text, ShellKind::Posix, false),
             Some(paths_insert_paste_bytes(&paths, ShellKind::Posix, false))
         );
     }
@@ -17474,7 +17599,7 @@ mod tests {
         let text = input_mapper::paste_bytes("plain text".as_bytes(), true);
 
         assert_eq!(
-            clipboard_terminal_paste_bytes(None, Some(text.clone()), ShellKind::Posix, true),
+            clipboard_terminal_paste_bytes(None, || Some(text.clone()), ShellKind::Posix, true),
             Some(text)
         );
     }
@@ -17493,6 +17618,268 @@ mod tests {
         assert_eq!(payload.bytes, expected);
         let clipboard = TerminalClipboardPayload::try_new(vec![path], None).unwrap();
         assert_eq!(clipboard.path_bytes, expected);
+    }
+
+    #[test]
+    fn native_io_상한과_만료가_붙여넣기_컨텍스트를_해제한다() {
+        let mut ui = WorkspaceUi::new();
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        ui.resolve_path_cached(SessionId(77), "src/main.rs");
+        for _ in 0..=WORKSPACE_IO_QUEUE_CAP {
+            ui.request_terminal_clipboard(
+                SessionId(77),
+                false,
+                crate::ui::file_tree::ShellKind::Posix,
+                None,
+            );
+        }
+        assert_eq!(ui.pending_pastes.len(), WORKSPACE_IO_QUEUE_CAP);
+        assert_eq!(ui.io_intents.len(), WORKSPACE_IO_QUEUE_CAP + 1);
+        assert_eq!(
+            take_error_message(&mut ui, &catalog),
+            Some(catalog.t("workspace.native_busy", &[]))
+        );
+        assert!(take_error_message(&mut ui, &catalog).is_none());
+        for pending in &mut ui.pending_pastes {
+            pending.requested_at =
+                std::time::Instant::now() - PASTE_TASK_TTL - std::time::Duration::from_secs(1);
+        }
+        assert!(matches!(
+            ui.take_io_intent(),
+            Some(WorkspaceIoIntent::ResolvePath { .. })
+        ));
+        assert!(ui.pending_pastes.is_empty());
+        assert!(ui.io_intents.is_empty());
+        assert_eq!(
+            take_error_message(&mut ui, &catalog),
+            Some(catalog.t("workspace.clipboard_expired", &[]))
+        );
+        ui.error = Some("기존 작업 오류".to_owned());
+        ui.protocol_request_lost = true;
+        assert_eq!(
+            take_error_message(&mut ui, &catalog),
+            Some(catalog.t("workspace.protocol_request_lost", &[]))
+        );
+        assert_eq!(
+            take_error_message(&mut ui, &catalog).as_deref(),
+            Some("기존 작업 오류")
+        );
+        assert!(take_error_message(&mut ui, &catalog).is_none());
+    }
+
+    #[test]
+    fn native_io_경로_미리보기가_붙여넣기를_막지_않는다() {
+        let mut ui = WorkspaceUi::new();
+        let session = SessionId(77);
+        ui.resolve_path_cached(session, "src/main.rs");
+        ui.request_terminal_clipboard(session, false, crate::ui::file_tree::ShellKind::Posix, None);
+        assert!(matches!(
+            ui.take_io_intent(),
+            Some(WorkspaceIoIntent::ReadTerminalClipboard { .. })
+        ));
+        assert!(ui.error.is_none());
+        assert!(matches!(
+            ui.take_io_intent(),
+            Some(WorkspaceIoIntent::ResolvePath { .. })
+        ));
+    }
+
+    #[test]
+    fn native_io_파일_클립보드는_텍스트_읽기와_변환을_생략한다() {
+        use crate::ui::file_tree::ShellKind;
+
+        let paths = vec![PathBuf::from("/tmp/clipboard image.png")];
+        let payload = TerminalClipboardPayload::read_with(paths.clone(), || {
+            panic!("파일이 있으면 OS 텍스트를 읽으면 안 된다")
+        })
+        .unwrap();
+        let (returned_paths, text) = payload.into_parts();
+        assert_eq!(returned_paths, paths);
+        assert!(text.is_none());
+        assert_eq!(
+            clipboard_terminal_paste_bytes(
+                Some(&returned_paths),
+                || panic!("파일이 있으면 텍스트 버퍼를 만들면 안 된다"),
+                ShellKind::Posix,
+                true,
+            ),
+            Some(paths_insert_paste_bytes(&paths, ShellKind::Posix, true))
+        );
+
+        let payload =
+            TerminalClipboardPayload::read_with(Vec::new(), || Some("한글 text".to_owned()))
+                .unwrap();
+        let (paths, text) = payload.into_parts();
+        assert!(paths.is_empty());
+        assert_eq!(
+            clipboard_terminal_paste_bytes(
+                None,
+                || text.map(|value| terminal_text_paste_bytes(&value, true)),
+                ShellKind::Posix,
+                true,
+            ),
+            Some(terminal_text_paste_bytes("한글 text", true))
+        );
+    }
+
+    #[test]
+    fn native_io_연속_붙여넣기는_각_요청의_세션을_보존한다() {
+        let mut ui = WorkspaceUi::new();
+        let mut requests = Vec::new();
+        for session in [SessionId(77), SessionId(78)] {
+            ui.request_terminal_clipboard(
+                session,
+                false,
+                crate::ui::file_tree::ShellKind::Posix,
+                None,
+            );
+            let Some(WorkspaceIoIntent::ReadTerminalClipboard {
+                operation,
+                generation,
+            }) = ui.take_io_intent()
+            else {
+                panic!("붙여넣기 요청이 사라졌다");
+            };
+            requests.push((operation, generation));
+        }
+        // cwd 갱신은 경로 조회만 무효화해야 하며 붙여넣기 결과는 버리면 안 된다.
+        ui.invalidate_path_resolution();
+        for (operation, generation) in requests {
+            ui.complete_io(WorkspaceIoCompletion::TerminalClipboardRead {
+                operation,
+                generation,
+                result: TerminalClipboardPayload::try_new(Vec::new(), Some("text".to_owned())),
+            });
+        }
+        let commands = drain_protocol(&mut ui);
+        assert_eq!(commands.len(), 2);
+        for (command, expected) in commands.iter().zip([SessionId(77), SessionId(78)]) {
+            assert!(
+                matches!(command, RuntimeCommand::WriteInput { session, bytes }
+                if *session == expected && bytes == b"text")
+            );
+        }
+    }
+
+    #[test]
+    fn native_io_열기_실패는_원인에_맞는_알림으로_전달한다() {
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+
+        let mut busy = WorkspaceUi::new();
+        for n in 0..WORKSPACE_IO_QUEUE_CAP {
+            busy.request_open_url(&format!("https://example.com/{n}"));
+        }
+        busy.request_open_url("https://example.com/overflow");
+        assert_eq!(
+            take_error_message(&mut busy, &catalog),
+            Some(catalog.t("workspace.native_busy", &[]))
+        );
+
+        let mut rejected = WorkspaceUi::new();
+        rejected.request_open_url("file:///tmp/not-allowed");
+        assert_eq!(
+            take_error_message(&mut rejected, &catalog),
+            Some(catalog.t("workspace.url_rejected", &[]))
+        );
+
+        let mut completed = WorkspaceUi::new();
+        completed.complete_io(WorkspaceIoCompletion::OpenUrlFailed);
+        assert_eq!(
+            take_error_message(&mut completed, &catalog),
+            Some(catalog.t("workspace.url_rejected", &[]))
+        );
+        completed.complete_io(WorkspaceIoCompletion::OpenPathFailed);
+        assert_eq!(
+            take_error_message(&mut completed, &catalog),
+            Some(catalog.t("workspace.path_rejected", &[]))
+        );
+
+        let mut clipboard = WorkspaceUi::new();
+        clipboard.request_terminal_clipboard(
+            SessionId(77),
+            false,
+            crate::ui::file_tree::ShellKind::Posix,
+            None,
+        );
+        let Some(WorkspaceIoIntent::ReadTerminalClipboard {
+            operation,
+            generation,
+        }) = clipboard.take_io_intent()
+        else {
+            panic!("clipboard intent가 있어야 한다");
+        };
+        clipboard.complete_io(WorkspaceIoCompletion::TerminalClipboardRead {
+            operation,
+            generation,
+            result: Err(WorkspaceIoErrorCode::ClipboardTooLarge),
+        });
+        assert_eq!(
+            take_error_message(&mut clipboard, &catalog),
+            Some(catalog.t("workspace.clipboard_too_large", &[]))
+        );
+    }
+
+    #[test]
+    fn native_io_입력압박은_한_에피소드에_알림_한번만_만든다() {
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        let session = SessionId(77);
+        let snapshot = mux(
+            "a",
+            vec![tab(
+                "a",
+                vec![pane("pa", session)],
+                LayoutNode::Pane(pane_id("pa")),
+            )],
+            "pa",
+        );
+        let mut ui = WorkspaceUi::new();
+        ui.handle_events(&[RuntimeEvent::MuxUpdated { snapshot }], &catalog);
+        let pressure = |queued_bytes: usize, queued_messages: usize| runtime::PtyInputPressure {
+            attempted_bytes: queued_bytes.saturating_add(1),
+            queued_bytes,
+            queued_messages,
+            max_bytes: 1024,
+            max_messages: 8,
+            reason: runtime::PtyInputRejectReason::QueueFull,
+        };
+
+        ui.handle_events(
+            &[RuntimeEvent::PtyInputPressure {
+                session,
+                pressure: pressure(128, 1),
+            }],
+            &catalog,
+        );
+        let first = ui.take_error_notice(&catalog).expect("첫 압박 알림");
+        assert_eq!(first.kind, WorkspaceErrorKind::InputPressure);
+
+        ui.handle_events(
+            &[RuntimeEvent::PtyInputPressure {
+                session,
+                pressure: pressure(256, 2),
+            }],
+            &catalog,
+        );
+        assert!(ui.take_error_notice(&catalog).is_none());
+
+        ui.handle_events(
+            &[RuntimeEvent::PtyInputPressure {
+                session,
+                pressure: pressure(0, 0),
+            }],
+            &catalog,
+        );
+        ui.handle_events(
+            &[RuntimeEvent::PtyInputPressure {
+                session,
+                pressure: pressure(64, 1),
+            }],
+            &catalog,
+        );
+        assert_eq!(
+            ui.take_error_notice(&catalog).map(|notice| notice.kind),
+            Some(WorkspaceErrorKind::InputPressure)
+        );
     }
 
     #[test]

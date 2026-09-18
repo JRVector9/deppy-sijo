@@ -12097,6 +12097,14 @@ enum AppHostIoFallback {
         operation: ui::workspace::WorkspaceIoOperation,
         generation: u64,
     },
+    WorkspaceOpenPath {
+        workspace_id: String,
+        runtime_instance: u64,
+    },
+    WorkspaceOpenUrl {
+        workspace_id: String,
+        runtime_instance: u64,
+    },
     FileTree {
         operation: ui::file_tree::FileTreeIoOperation,
         generation: u64,
@@ -12176,7 +12184,22 @@ impl AppHostIoFallback {
                 operation: *operation,
                 generation: *generation,
             },
-            AppHostIoAction::Workspace { .. } => Self::None,
+            AppHostIoAction::Workspace {
+                workspace_id,
+                runtime_instance,
+                intent: ui::workspace::WorkspaceIoIntent::OpenPath(_),
+            } => Self::WorkspaceOpenPath {
+                workspace_id: workspace_id.clone(),
+                runtime_instance: *runtime_instance,
+            },
+            AppHostIoAction::Workspace {
+                workspace_id,
+                runtime_instance,
+                intent: ui::workspace::WorkspaceIoIntent::OpenUrl(_),
+            } => Self::WorkspaceOpenUrl {
+                workspace_id: workspace_id.clone(),
+                runtime_instance: *runtime_instance,
+            },
             AppHostIoAction::FileTree(intent) => Self::FileTree {
                 operation: intent.operation,
                 generation: intent.generation,
@@ -12261,6 +12284,22 @@ impl AppHostIoFallback {
                     generation,
                     result: Err(ui::workspace::WorkspaceIoErrorCode::NativeFailure),
                 },
+            },
+            Self::WorkspaceOpenPath {
+                workspace_id,
+                runtime_instance,
+            } => AppHostIoCompletion::Workspace {
+                workspace_id,
+                runtime_instance,
+                completion: ui::workspace::WorkspaceIoCompletion::OpenPathFailed,
+            },
+            Self::WorkspaceOpenUrl {
+                workspace_id,
+                runtime_instance,
+            } => AppHostIoCompletion::Workspace {
+                workspace_id,
+                runtime_instance,
+                completion: ui::workspace::WorkspaceIoCompletion::OpenUrlFailed,
             },
             Self::FileTree {
                 operation,
@@ -13555,35 +13594,48 @@ fn run_app_host_io(
                 .ok()
                 .flatten()
                 .unwrap_or_default();
-            let text = ui::clipboard_image::read_clipboard_text();
+            let result = ui::workspace::TerminalClipboardPayload::read_with(
+                paths,
+                ui::clipboard_image::read_clipboard_text,
+            );
             AppHostIoCompletion::Workspace {
                 workspace_id,
                 runtime_instance,
                 completion: ui::workspace::WorkspaceIoCompletion::TerminalClipboardRead {
                     operation,
                     generation,
-                    result: ui::workspace::TerminalClipboardPayload::try_new(paths, text),
+                    result,
                 },
             }
         }
         AppHostIoAction::Workspace {
+            workspace_id,
+            runtime_instance,
             intent: ui::workspace::WorkspaceIoIntent::OpenPath(path),
-            ..
         } => {
             if app_host_open_path_reaped(path.as_path()) {
                 AppHostIoCompletion::Complete
             } else {
-                AppHostIoCompletion::ExternalLinkFailed
+                AppHostIoCompletion::Workspace {
+                    workspace_id,
+                    runtime_instance,
+                    completion: ui::workspace::WorkspaceIoCompletion::OpenPathFailed,
+                }
             }
         }
         AppHostIoAction::Workspace {
+            workspace_id,
+            runtime_instance,
             intent: ui::workspace::WorkspaceIoIntent::OpenUrl(url),
-            ..
         } => {
             if auth::open_in_browser_reaped(url.as_str()).is_ok() {
                 AppHostIoCompletion::Complete
             } else {
-                AppHostIoCompletion::ExternalLinkFailed
+                AppHostIoCompletion::Workspace {
+                    workspace_id,
+                    runtime_instance,
+                    completion: ui::workspace::WorkspaceIoCompletion::OpenUrlFailed,
+                }
             }
         }
         AppHostIoAction::FileTree(intent) => {
@@ -28934,6 +28986,45 @@ impl eframe::App for App {
         if let Some(intent) = self.active.workspace_ui.take_notice_intent() {
             platform::notify(intent.summary(), intent.body());
         }
+        // 오류는 렌더 위치와 무관하게 수집한다. 비활성/붙여온 pane의 오류도 유실하지 않는다.
+        // 가시 프레임은 logic 직후 ui가 이 상태를 그린다. 중복/새 알림을 이유로 다음
+        // 프레임까지 추가 요청하지 않는다. 숨긴 창도 다음 표시 때 최신 상태를 읽는다.
+        if let Some(first_notice) = self.active.workspace_ui.take_error_notice(&self.i18n) {
+            let active_workspace_name = self.active_workspace_display_name();
+            let mut notice = Some(first_notice);
+            while let Some(current) = notice {
+                self.notifications_ui.on_workspace_error(
+                    &self.active.id,
+                    &active_workspace_name,
+                    current.kind,
+                    &current.message,
+                    &self.i18n,
+                );
+                notice = self.active.workspace_ui.take_error_notice(&self.i18n);
+            }
+        }
+        let workspaces = &self.workspaces;
+        let notifications_ui = &mut self.notifications_ui;
+        for (workspace_id, runtime) in &mut self.warm {
+            if let Some(first_notice) = runtime.workspace_ui.take_error_notice(&self.i18n) {
+                let workspace_name = workspaces
+                    .iter()
+                    .find(|workspace| workspace.id == *workspace_id)
+                    .map(Self::workspace_display_name)
+                    .unwrap_or_else(|| workspace_id.clone());
+                let mut notice = Some(first_notice);
+                while let Some(current) = notice {
+                    notifications_ui.on_workspace_error(
+                        workspace_id,
+                        &workspace_name,
+                        current.kind,
+                        &current.message,
+                        &self.i18n,
+                    );
+                    notice = runtime.workspace_ui.take_error_notice(&self.i18n);
+                }
+            }
+        }
         if let Some(action) = self.pending_work_history_action.take() {
             self.handle_work_history_action(ctx, action);
         }
@@ -42207,6 +42298,28 @@ mod tests {
                     error_code: connector_contract::ErrorCode::HostUnavailable,
                 }
             ) if failed_operation == operation_id
+        ));
+    }
+
+    #[test]
+    fn native_io_워크스페이스_url_worker_failure는_원래_runtime으로_돌아간다() {
+        let completion = AppHostIoFallback::for_action(&AppHostIoAction::Workspace {
+            workspace_id: "workspace-a".to_owned(),
+            runtime_instance: 42,
+            intent: ui::workspace::WorkspaceIoIntent::OpenUrl(
+                ui::workspace::WorkspaceUrlPayload::try_new("https://example.com".to_owned())
+                    .unwrap(),
+            ),
+        })
+        .into_completion();
+
+        assert!(matches!(
+            completion,
+            AppHostIoCompletion::Workspace {
+                workspace_id,
+                runtime_instance: 42,
+                completion: ui::workspace::WorkspaceIoCompletion::OpenUrlFailed,
+            } if workspace_id == "workspace-a"
         ));
     }
 

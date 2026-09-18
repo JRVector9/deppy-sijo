@@ -9,6 +9,7 @@ use runtime::{SessionId, SessionStatus};
 
 use crate::agent_session::AgentSessionStatus;
 use crate::agent_surface::AgentProvider;
+use crate::ui::workspace::WorkspaceErrorKind;
 
 const MAX_NOTIFICATION_HISTORY: usize = 100;
 const MAX_NATIVE_INTENTS: usize = 8;
@@ -63,6 +64,8 @@ impl fmt::Debug for NativeNotificationIntent {
 /// are application-owned and likewise retain their workspace for pruning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentNotificationTarget {
+    /// 세션 상태와 무관한 워크스페이스 작업 오류. 목록에 남기되 세션 이동은 하지 않는다.
+    Workspace { workspace_id: String },
     Pty {
         workspace_id: String,
         session: SessionId,
@@ -76,13 +79,16 @@ pub enum AgentNotificationTarget {
 impl AgentNotificationTarget {
     fn workspace_id(&self) -> &str {
         match self {
-            Self::Pty { workspace_id, .. } | Self::Structured { workspace_id, .. } => workspace_id,
+            Self::Workspace { workspace_id }
+            | Self::Pty { workspace_id, .. }
+            | Self::Structured { workspace_id, .. } => workspace_id,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AgentNotificationSource {
+    Workspace(WorkspaceErrorKind),
     Pty(Option<AgentProvider>),
     App(AgentProvider),
 }
@@ -90,6 +96,7 @@ enum AgentNotificationSource {
 impl AgentNotificationSource {
     fn badge(self) -> &'static str {
         match self {
+            Self::Workspace(_) => "[Deppy Sijo]",
             Self::Pty(Some(AgentProvider::Codex)) => "[Codex PTY]",
             Self::Pty(Some(AgentProvider::Claude)) => "[Claude PTY]",
             Self::Pty(Some(AgentProvider::Kimi)) => "[Kimi PTY]",
@@ -115,7 +122,7 @@ struct NotificationItem {
     source: AgentNotificationSource,
     status: SessionStatus,
     title: String,
-    message_id: String,
+    message_id: &'static str,
     read: bool,
     /// 생성 시각(unix 초) — 작업함 전체 페이지의 「N분 전」 표시용 (2026-07-18).
     /// 알림이 만들어진 시각. 2026-08-08 작업함 페이지를 「작업」에 합치면서 이 값을
@@ -152,6 +159,68 @@ impl NotificationsUi {
     /// 안 읽은 항목 수 — 항목별 read 플래그에서 파생 (pruning에 자동 정합).
     pub fn unread(&self) -> usize {
         self.items.iter().filter(|item| !item.read).count()
+    }
+
+    /// 오류 배너를 대신하는 기록. 같은 워크스페이스의 반복 신호는 10초간 합친다.
+    pub fn on_workspace_error(
+        &mut self,
+        workspace_id: &str,
+        workspace_name: &str,
+        kind: WorkspaceErrorKind,
+        message: &str,
+        catalog: &i18n::Catalog,
+    ) {
+        if !bounded_text(workspace_id, MAX_WORKSPACE_ID_BYTES) {
+            return;
+        }
+        let now = deppy_core::time::unix_secs_i64();
+        // 원인이 정해진 반복 알림은 표시명·메시지·대상 ID를 복사하기 전에 버린다.
+        let recent_same_kind = |item: &NotificationItem| {
+            matches!(&item.target, AgentNotificationTarget::Workspace { workspace_id: id } if id == workspace_id)
+                && item.source == AgentNotificationSource::Workspace(kind)
+                && now.saturating_sub(item.created_at_secs) < 10
+        };
+        if kind != WorkspaceErrorKind::Other && self.items.iter().rev().any(recent_same_kind) {
+            return;
+        }
+        // 외부 오류 문자열과 사용자 지정 이름도 알림 예산 안에 들어오게 제한한다.
+        // warm 워크스페이스 오류도 어느 프로젝트에서 났는지 알 수 있게 제목에 이름을 붙인다.
+        let title_capacity = workspace_name
+            .len()
+            .min(256)
+            .saturating_add(2)
+            .saturating_add(message.len())
+            .min(MAX_NATIVE_BODY_BYTES);
+        let mut title = String::with_capacity(title_capacity);
+        push_nul_free_prefix(&mut title, workspace_name, 256);
+        if title.is_empty() {
+            return;
+        }
+        title.push_str(": ");
+        let message_start = title.len();
+        push_nul_free_prefix(&mut title, message, MAX_NATIVE_BODY_BYTES);
+        if title.len() == message_start {
+            return;
+        }
+        if kind == WorkspaceErrorKind::Other
+            && self
+                .items
+                .iter()
+                .rev()
+                .any(|item| recent_same_kind(item) && item.title == title)
+        {
+            return;
+        }
+        self.push_status_with_dedupe(
+            AgentNotificationTarget::Workspace {
+                workspace_id: workspace_id.to_owned(),
+            },
+            AgentNotificationSource::Workspace(kind),
+            SessionStatus::Error,
+            &title,
+            catalog,
+            false,
+        );
     }
 
     /// 상태 변경을 알림으로 만든다. Running 복귀는 알리지 않는다.
@@ -317,7 +386,6 @@ impl NotificationsUi {
         if !bounded_text(title, MAX_NATIVE_BODY_BYTES) || !bounded_target(&target) {
             return;
         }
-        let rendered = catalog.t(message_id, &[("title", title)]);
         match status {
             SessionStatus::Running => return, // 진행 재개는 알림 아님
             SessionStatus::Idle => return,    // 쉬는 중 — 알림 아님
@@ -338,6 +406,7 @@ impl NotificationsUi {
         if duplicate {
             return;
         }
+        let rendered = catalog.t(message_id, &[("title", title)]);
         let Some(native_intent) = NativeNotificationIntent::new(rendered, title) else {
             return;
         };
@@ -350,7 +419,7 @@ impl NotificationsUi {
             source,
             status,
             title: title.to_owned(),
-            message_id: message_id.to_owned(),
+            message_id,
             // 생성 시엔 항상 안 읽음. on_status는 창이 숨겨져(minimized/occluded) ui()가
             // 스킵돼도 logic()에서 호출되므로, 여기서 self.open으로 읽음 처리하면 사용자가
             // 보지 못한 background 알림이 읽음이 돼 unread 신호를 잃는다. 실제 읽음은
@@ -446,7 +515,8 @@ impl NotificationsUi {
                     AgentNotificationTarget::Pty { session, .. } => alive.contains(session),
                     // Structured liveness is owned by AgentSessionsUi rather
                     // than the active PTY mux and is pruned separately.
-                    AgentNotificationTarget::Structured { .. } => true,
+                    AgentNotificationTarget::Structured { .. }
+                    | AgentNotificationTarget::Workspace { .. } => true,
                 }
         });
     }
@@ -458,7 +528,8 @@ impl NotificationsUi {
                     AgentNotificationTarget::Structured { session_id, .. } => {
                         alive.contains(session_id)
                     }
-                    AgentNotificationTarget::Pty { .. } => true,
+                    AgentNotificationTarget::Pty { .. }
+                    | AgentNotificationTarget::Workspace { .. } => true,
                 }
         });
     }
@@ -488,7 +559,14 @@ impl NotificationsUi {
         // 최신 항목이 위로 — 팝오버는 최근 max_items개만 보여준다.
         for item in self.items.iter().rev().take(max_items) {
             let icon = status_icon(item.status);
-            let label = catalog.t(&item.message_id, &[("title", &item.title)]);
+            let label = catalog.t(item.message_id, &[("title", &item.title)]);
+            if matches!(item.target, AgentNotificationTarget::Workspace { .. }) {
+                ui.label(
+                    egui::RichText::new(format!("{} {icon} {label}", item.source.badge()))
+                        .color(notification_status_color(item.status)),
+                );
+                continue;
+            }
             ui.horizontal(|ui| {
                 ui.colored_label(notification_status_color(item.status), "●");
                 if ui
@@ -523,7 +601,14 @@ impl NotificationsUi {
         // 최신 항목이 위로
         for item in self.items.iter().rev() {
             let icon = status_icon(item.status);
-            let label = catalog.t(&item.message_id, &[("title", &item.title)]);
+            let label = catalog.t(item.message_id, &[("title", &item.title)]);
+            if matches!(item.target, AgentNotificationTarget::Workspace { .. }) {
+                ui.label(
+                    egui::RichText::new(format!("{} {icon} {label}", item.source.badge()))
+                        .color(notification_status_color(item.status)),
+                );
+                continue;
+            }
             ui.horizontal(|ui| {
                 ui.colored_label(notification_status_color(item.status), "●");
                 if ui
@@ -543,9 +628,19 @@ fn bounded_text(value: &str, max_bytes: usize) -> bool {
     !value.is_empty() && value.len() <= max_bytes && !value.as_bytes().contains(&0)
 }
 
+fn push_nul_free_prefix(output: &mut String, value: &str, max_bytes: usize) {
+    for ch in value.chars().filter(|ch| *ch != '\0') {
+        if output.len().saturating_add(ch.len_utf8()) > max_bytes {
+            break;
+        }
+        output.push(ch);
+    }
+}
+
 fn bounded_target(target: &AgentNotificationTarget) -> bool {
     match target {
-        AgentNotificationTarget::Pty { workspace_id, .. } => {
+        AgentNotificationTarget::Workspace { workspace_id }
+        | AgentNotificationTarget::Pty { workspace_id, .. } => {
             bounded_text(workspace_id, MAX_WORKSPACE_ID_BYTES)
         }
         AgentNotificationTarget::Structured {
@@ -638,6 +733,121 @@ mod tests {
         i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap()
     }
 
+    #[cfg(feature = "bench-alloc")]
+    #[test]
+    fn native_io_중복_알림은_문자열을_다시_할당하지_않는다() {
+        let mut notices = NotificationsUi::new();
+        let catalog = catalog();
+        notices.on_workspace_error(
+            WS,
+            "Project A",
+            WorkspaceErrorKind::ClipboardFailed,
+            "clipboard failed",
+            &catalog,
+        );
+        let before = crate::bench::thread_alloc_stats().unwrap();
+        for _ in 0..1_000 {
+            notices.on_workspace_error(
+                WS,
+                "Project A",
+                WorkspaceErrorKind::ClipboardFailed,
+                "clipboard failed",
+                &catalog,
+            );
+        }
+        let after = crate::bench::thread_alloc_stats().unwrap();
+        let delta = (after.0 - before.0, after.1 - before.1);
+        eprintln!(
+            "중복 알림 1000건: {} allocations, {} bytes",
+            delta.0, delta.1
+        );
+        assert_eq!(notices.items.len(), 1);
+        assert_eq!(notices.native_intents.len(), 1);
+        assert_eq!(delta, (0, 0));
+    }
+
+    #[test]
+    fn native_io_오류_알림은_중복을_합치고_보관량을_제한한다() {
+        let mut notices = NotificationsUi::new();
+        let catalog = catalog();
+        notices.on_workspace_error(
+            WS,
+            "Project A",
+            WorkspaceErrorKind::ClipboardFailed,
+            "clipboard failed",
+            &catalog,
+        );
+        notices.on_workspace_error(
+            WS,
+            "Project A",
+            WorkspaceErrorKind::ClipboardFailed,
+            "clipboard failed",
+            &catalog,
+        );
+        assert_eq!(notices.unread(), 1);
+        assert_eq!(notices.native_intents.len(), 1);
+        notices.on_workspace_error(
+            "ws-2",
+            "Project B",
+            WorkspaceErrorKind::ClipboardFailed,
+            "clipboard failed",
+            &catalog,
+        );
+        assert_eq!(notices.unread(), 2);
+        notices.mark_all_read();
+        assert_eq!(notices.unread(), 0);
+        notices.prune_workspace("ws-2");
+        assert_eq!(notices.items.len(), 1);
+        // 세션 알림 상태와 혼동하지 않고 오류 기록을 유지한다.
+        notices.retain_sessions(WS, &[]);
+        assert_eq!(notices.items.len(), 1);
+        for n in 0..120 {
+            notices.on_workspace_error(
+                WS,
+                "Project A",
+                WorkspaceErrorKind::Other,
+                &format!("failed {n}"),
+                &catalog,
+            );
+        }
+        assert_eq!(notices.items.len(), MAX_NOTIFICATION_HISTORY);
+        assert_eq!(notices.native_intents.len(), MAX_NATIVE_INTENTS);
+        assert_eq!(notices.items.last().unwrap().title, "Project A: failed 119");
+
+        notices.native_intents.clear();
+        notices.on_workspace_error(
+            WS,
+            "Project A",
+            WorkspaceErrorKind::InputPressure,
+            "queued 1 MiB",
+            &catalog,
+        );
+        notices.on_workspace_error(
+            WS,
+            "Project A",
+            WorkspaceErrorKind::InputPressure,
+            "queued 2 MiB",
+            &catalog,
+        );
+        assert_eq!(notices.items.len(), MAX_NOTIFICATION_HISTORY);
+        assert_eq!(notices.native_intents.len(), 1);
+        assert_eq!(
+            notices.items.last().unwrap().title,
+            "Project A: queued 1 MiB"
+        );
+
+        let mut bounded = NotificationsUi::new();
+        bounded.on_workspace_error(
+            WS,
+            &"🦀".repeat(100),
+            WorkspaceErrorKind::Other,
+            &"한".repeat(1_000),
+            &catalog,
+        );
+        assert_eq!(bounded.items.len(), 1);
+        assert!(bounded.items[0].title.len() <= MAX_NATIVE_BODY_BYTES);
+    }
+
     fn is_pty(item: &NotificationItem, workspace_id: &str, session: SessionId) -> bool {
         matches!(
             &item.target,
@@ -672,7 +882,7 @@ mod tests {
         let item = n.items.first().unwrap();
         assert_eq!(item.message_id, "notification.session.needs_approval");
         assert_eq!(
-            catalog.t(&item.message_id, &[("title", &item.title)]),
+            catalog.t(item.message_id, &[("title", &item.title)]),
             "Approval needed: review"
         );
     }
@@ -939,7 +1149,8 @@ mod tests {
             .iter()
             .filter_map(|item| match item.target {
                 AgentNotificationTarget::Pty { session, .. } => Some(session),
-                AgentNotificationTarget::Structured { .. } => None,
+                AgentNotificationTarget::Structured { .. }
+                | AgentNotificationTarget::Workspace { .. } => None,
             })
             .collect();
         assert!(sessions.contains(&SessionId(1)));

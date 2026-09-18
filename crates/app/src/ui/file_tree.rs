@@ -953,12 +953,17 @@ enum PendingFileTreeMaintenance {
         operation: FileTreeMaintenanceOperation,
         generation: u64,
         path: PathBuf,
-        preserve_expanded: Arc<HashSet<PathBuf>>,
     },
     WatchSet {
         operation: FileTreeMaintenanceOperation,
         generation: u64,
     },
+}
+
+/// 펼친 하위 목록의 순회 위치만 보관한다. 전체 경로 목록을 대기열에 복제하지 않는다.
+struct ListingWalk {
+    root: PathBuf,
+    after: PathBuf,
 }
 
 /// 삭제 대상 — **행에서 한 번 확정한 값**을 확인 문구까지 그대로 들고 간다.
@@ -1061,6 +1066,7 @@ pub struct FileTreeUi {
     pending_maintenance: Option<PendingFileTreeMaintenance>,
     /// Watch burst와 mutation refresh를 조상 경로 축약하는 bounded backlog.
     pending_refresh_dirs: BTreeSet<PathBuf>,
+    listing_walk: Option<ListingWalk>,
     watch_plan_dirty: bool,
     last_watch_revision: u64,
     watch_ignore: Vec<PathBuf>,
@@ -1165,6 +1171,7 @@ impl FileTreeUi {
             maintenance_intent: None,
             pending_maintenance: None,
             pending_refresh_dirs: BTreeSet::new(),
+            listing_walk: None,
             watch_plan_dirty: false,
             last_watch_revision: 0,
             watch_ignore: Vec::new(),
@@ -1343,13 +1350,9 @@ impl FileTreeUi {
             .expect("exact maintenance checked");
         match (pending, completion.result) {
             (
-                PendingFileTreeMaintenance::Listing {
-                    path,
-                    preserve_expanded,
-                    ..
-                },
+                PendingFileTreeMaintenance::Listing { path, .. },
                 Ok(FileTreeMaintenanceResult::Listing(snapshot)),
-            ) => self.apply_listing_snapshot(path, snapshot, &preserve_expanded),
+            ) => self.apply_listing_snapshot(path, snapshot),
             (
                 PendingFileTreeMaintenance::WatchSet { .. },
                 Ok(FileTreeMaintenanceResult::WatchSetApplied),
@@ -1446,7 +1449,7 @@ impl FileTreeUi {
         if self.maintenance_intent.is_some() || self.pending_maintenance.is_some() {
             return;
         }
-        while let Some(path) = self.pending_refresh_dirs.pop_first() {
+        while let Some(path) = self.next_refresh_directory() {
             let Some(root) = self.root.clone() else {
                 continue;
             };
@@ -1479,7 +1482,6 @@ impl FileTreeUi {
                 operation,
                 generation,
                 path,
-                preserve_expanded: Arc::new(self.collect_expanded_paths()),
             });
             return;
         }
@@ -1539,35 +1541,102 @@ impl FileTreeUi {
             .is_some_and(|node| node.is_dir && node.expanded)
     }
 
-    fn apply_listing_snapshot(
-        &mut self,
-        path: PathBuf,
-        snapshot: FileTreeListingSnapshot,
-        preserve_expanded: &HashSet<PathBuf>,
-    ) {
-        let (retained_items, retained_bytes) = self.retained_usage_without(&path);
-        if retained_items.saturating_add(snapshot.items().len()) > FILE_TREE_RETAINED_MAX_ITEMS
-            || retained_bytes.saturating_add(snapshot.bytes()) > FILE_TREE_RETAINED_MAX_BYTES
+    fn next_refresh_directory(&mut self) -> Option<PathBuf> {
+        if let Some(path) = self.pending_refresh_dirs.pop_first() {
+            return Some(path);
+        }
+        let walk = self.listing_walk.as_mut()?;
+        let next = self
+            .flat
+            .iter()
+            .filter(|row| {
+                row.is_dir
+                    && row.expanded
+                    && row.path.starts_with(&walk.root)
+                    && row.path > walk.after
+            })
+            .map(|row| &row.path)
+            .min()
+            .cloned();
+        if let Some(path) = &next {
+            walk.after.clone_from(path);
+        } else {
+            self.listing_walk = None;
+        }
+        next
+    }
+
+    fn schedule_listing_walk(&mut self, path: &Path) {
+        if !self
+            .listing_children(path)
+            .is_some_and(|children| children.iter().any(|node| node.is_dir && node.expanded))
         {
-            self.error =
-                Some("파일 트리 메모리 상한을 초과해 추가 항목을 보관하지 않습니다".to_owned());
             return;
+        }
+        let root = match &self.listing_walk {
+            Some(walk) if path != walk.root && path.starts_with(&walk.root) => return,
+            Some(walk) if !walk.root.starts_with(path) => self.root.clone(),
+            _ => Some(path.to_path_buf()),
+        };
+        if let Some(root) = root {
+            self.listing_walk = Some(ListingWalk {
+                after: root.clone(),
+                root,
+            });
+        }
+    }
+
+    fn apply_listing_snapshot(&mut self, path: PathBuf, snapshot: FileTreeListingSnapshot) {
+        if !self.should_list_directory(&path) {
+            return;
+        }
+        let unchanged = self.listing_children(&path).is_some_and(|children| {
+            children.len() == snapshot.items().len()
+                && children
+                    .iter()
+                    .zip(snapshot.items())
+                    .all(|(node, item)| node.name == item.name() && node.is_dir == item.is_dir())
+        });
+        if !unchanged {
+            let (mut retained_items, mut retained_bytes) = self.retained_usage_without(&path);
+            // 이월할 하위 캐시도 예산에 포함한다. 지워졌거나 파일로 바뀐 폴더는 제외한다.
+            let directories: HashSet<&OsStr> = snapshot
+                .items()
+                .iter()
+                .filter(|item| item.is_dir())
+                .map(|item| item.name())
+                .collect();
+            for node in self.listing_children(&path).unwrap_or(&[]) {
+                if node.is_dir && node.expanded && directories.contains(node.name.as_os_str()) {
+                    let (items, bytes) = tree_node_usage(node.children.as_deref().unwrap_or(&[]));
+                    retained_items = retained_items.saturating_add(items);
+                    retained_bytes = retained_bytes.saturating_add(bytes);
+                }
+            }
+            if retained_items.saturating_add(snapshot.items().len()) > FILE_TREE_RETAINED_MAX_ITEMS
+                || retained_bytes.saturating_add(snapshot.bytes()) > FILE_TREE_RETAINED_MAX_BYTES
+            {
+                self.error =
+                    Some("파일 트리 메모리 상한을 초과해 추가 항목을 보관하지 않습니다".to_owned());
+                return;
+            }
+            let nodes = snapshot
+                .items()
+                .iter()
+                .map(|item| TreeNode::new(item.name().to_owned(), item.is_dir()))
+                .collect();
+            if !self.replace_listing_children(&path, nodes) {
+                return;
+            }
         }
         self.inaccessible_paths.remove(&path);
-        let nodes = snapshot
-            .items()
-            .iter()
-            .map(|item| TreeNode::new(item.name().to_owned(), item.is_dir()))
-            .collect();
-        let prepared = prepare_listing_nodes(&path, nodes, preserve_expanded);
-        if !self.replace_listing_children(&path, prepared) {
-            return;
-        }
         self.invalidate_stale_delete_confirm(&path);
         self.root_error = None;
-        self.rebuild_flat();
-        for child in self.expanded_direct_child_paths(&path) {
-            self.enqueue_refresh_dir(child);
+        // 자식을 한꺼번에 큐에 넣으면 64건 초과 → 루트 축약 → 같은 조회가 반복된다.
+        // 순회 위치만 남기고 다음 가시 폴더를 한 건씩 읽은 뒤 watch 집합을 적용한다.
+        self.schedule_listing_walk(&path);
+        if !unchanged {
+            self.rebuild_flat();
         }
     }
 
@@ -1678,9 +1747,6 @@ impl FileTreeUi {
         }
     }
 
-    /// 루트 교체 (workspace 전환/경로 변경). 캐시를 버리고 루트만 다시 나열한다.
-    /// 루트는 canonicalize해 보관한다 — 트리의 모든 행 경로가 canonical 기준이 되어
-    /// 이동 가드(§9-4)·부분 재나열의 경로 비교가 일관된다.
     /// 워처 무시 prefix 설정 (앱 data dir 등). set_root 이전에 호출.
     pub fn set_watch_ignore(&mut self, prefixes: Vec<PathBuf>) {
         let bytes = prefixes.iter().try_fold(0usize, |total, path| {
@@ -1713,6 +1779,18 @@ impl FileTreeUi {
     }
 
     pub fn set_root(&mut self, root: Option<PathBuf>) {
+        // 이미 펼쳐 읽은 하위 폴더로 진입하면 그 목록만 이동한다. 다른 폴더의 행을
+        // 새 루트에 보여주거나 전체 트리를 복제하지 않고 빈 중간 프레임도 피한다.
+        let children = root
+            .as_deref()
+            .zip(self.root.as_deref())
+            .and_then(|(next, current)| next.strip_prefix(current).ok())
+            .and_then(|relative| {
+                self.children
+                    .as_mut()
+                    .and_then(|children| node_mut(children, relative))
+                    .and_then(|node| node.children.take())
+            });
         self.io_generation = self.io_generation.wrapping_add(1).max(1);
         self.io_intent = None;
         self.pending_io = None;
@@ -1721,13 +1799,13 @@ impl FileTreeUi {
         self.maintenance_intent = None;
         self.pending_maintenance = None;
         self.pending_refresh_dirs.clear();
+        self.listing_walk = None;
         self.last_watch_revision = 0;
         // App snapshot의 bounded root를 그대로 사용한다. canonicalize/metadata는 host
         // repository가 listing 결과를 만들 때 수행하며 render leaf는 filesystem을 읽지 않는다.
         self.root = root;
         self.root_error = None;
-        self.children = None;
-        self.flat.clear();
+        self.children = children;
         self.error = None;
         self.inaccessible_paths.clear();
         self.edit = None;
@@ -1744,7 +1822,7 @@ impl FileTreeUi {
         if let Some(root) = self.root.clone() {
             self.enqueue_refresh_dir(root);
         }
-        self.drive_maintenance();
+        self.rebuild_flat();
     }
 
     /// 펼친 노드 전체를 재나열한다 (수동 새로고침 — 펼침 상태는 이월).
@@ -2703,6 +2781,10 @@ impl FileTreeUi {
 
         let mut create_folder = false;
         let mut create_file = false;
+        let status_listing = matches!(
+            self.pending_maintenance,
+            Some(PendingFileTreeMaintenance::Listing { .. })
+        );
         let (header_rect, _) =
             ui.allocate_exact_size(egui::vec2(ui.available_width(), 38.0), egui::Sense::hover());
         let tabs = SIDEBAR_TOOLS.map(|tool| (tool, catalog.t(sidebar_tool_label_key(tool), &[])));
@@ -2759,6 +2841,8 @@ impl FileTreeUi {
             });
             if toggle_hidden {
                 self.show_hidden = !self.show_hidden;
+                // 다시 드러난 펼친 폴더도 순회 대상에 포함해 숨겨져 있던 캐시를 갱신한다.
+                self.refresh();
                 self.rebuild_flat();
             }
             tool_right -= 20.0;
@@ -2777,10 +2861,23 @@ impl FileTreeUi {
                 FileToolbarIcon::Refresh,
                 false,
             )
-            .on_hover_text(refresh_label)
+            .on_hover_text(if status_listing {
+                catalog.t("file_tree.listing_folders", &[])
+            } else {
+                refresh_label
+            })
             .clicked()
             {
                 self.refresh();
+            }
+            if status_listing {
+                // 조회 중임은 고정된 도구 영역에서만 표시한다. 행 삽입이나 스피너의
+                // 연속 repaint로 목록 위치와 더블클릭 대상을 흔들지 않는다.
+                ui.painter().circle_filled(
+                    rect.right_bottom() - egui::vec2(3.0, 3.0),
+                    2.0,
+                    ui.visuals().selection.stroke.color,
+                );
             }
             tool_right -= 20.0;
         }
@@ -2898,12 +2995,9 @@ impl FileTreeUi {
             crate::fonts::sidebar_font(ui.ctx(), 12.5),
             parent_color,
         );
-        if parent_response.clicked()
-            && let Some(parent) = parent_root
-        {
-            self.set_root(Some(parent));
-            return action;
-        }
+        // 상위 이동도 기존 목록을 끝까지 그린 뒤 반영한다. 여기서 반환하면 클릭한
+        // 프레임의 본문만 통째로 비어 보인다.
+        let parent_navigation = parent_response.clicked().then_some(parent_root).flatten();
         if let Some(root) = self.root.clone() {
             if create_file {
                 self.edit = Some(EditState::NewFile {
@@ -2957,6 +3051,10 @@ impl FileTreeUi {
                         action = Some(SidebarAction::OpenMacosFileAccessSettings);
                     }
                 }
+            }
+            if let Some(parent) = parent_navigation {
+                self.set_root(Some(parent));
+                ui.ctx().request_repaint();
             }
             return action;
         }
@@ -3061,8 +3159,6 @@ impl FileTreeUi {
         // 더 요청한다(`status_*` 스냅샷).
         let status_error = self.error.clone();
         let status_busy = self.in_flight > 0;
-        let status_listing =
-            self.pending_maintenance.is_some() || self.maintenance_intent.is_some();
         if let Some(err) = status_error.clone() {
             ui.horizontal(|ui| {
                 ui.colored_label(ui.visuals().error_fg_color, err);
@@ -3079,12 +3175,6 @@ impl FileTreeUi {
                 ui.weak(catalog.t("file_tree.file_operation_running", &[]));
             });
         }
-        if status_listing {
-            ui.horizontal(|ui| {
-                ui.add(egui::Spinner::new().size(12.0));
-                ui.weak(catalog.t("file_tree.listing_folders", &[]));
-            });
-        }
 
         // 가상화: 고정 행높이 + path 기반 explicit Id (§9-6).
         // 행높이는 실측 자기보정 — 선언값과 실제가 어긋나면 클릭 대상이 밀린다(필드 주석).
@@ -3095,7 +3185,7 @@ impl FileTreeUi {
         let ppp = ui.ctx().pixels_per_point();
         let total = self.flat.len();
         let mut toggle: Option<PathBuf> = None;
-        let mut navigate_root: Option<PathBuf> = None;
+        let mut navigate_root: Option<PathBuf> = parent_navigation;
         let mut open_file: Option<PathBuf> = None; // 파일 더블클릭 → 연결 프로그램 열기
         // 문서 대상(md·txt 등) 더블클릭 → 문서 탭. open_file과 같은 이유로 루프 밖에서 처리.
         let mut open_document: Option<(PathBuf, DocumentTargetKind)> = None;
@@ -3132,6 +3222,7 @@ impl FileTreeUi {
         // 빈 영역을 클릭했다 — 선택 해제.
         let mut clear_selection = false;
         let scroll_output = egui::ScrollArea::vertical()
+            .id_salt("file_tree_rows")
             .auto_shrink([false, false])
             .show_rows(ui, row_height, total, |ui, range| {
                 // 빈 영역 배경. 행보다 **먼저** 등록해 행이 있는 자리에서는 행이 이긴다.
@@ -3580,6 +3671,7 @@ impl FileTreeUi {
         }
         if let Some(path) = navigate_root {
             self.set_root(Some(path));
+            ui.ctx().request_repaint();
             return action;
         }
         if let Some(path) = toggle {
@@ -3801,7 +3893,10 @@ impl FileTreeUi {
         if status_error != self.error
             || status_busy != (self.in_flight > 0)
             || status_listing
-                != (self.pending_maintenance.is_some() || self.maintenance_intent.is_some())
+                != matches!(
+                    self.pending_maintenance,
+                    Some(PendingFileTreeMaintenance::Listing { .. })
+                )
         {
             ui.ctx().request_repaint();
         }
@@ -4299,7 +4394,7 @@ impl FileTreeUi {
             return false;
         };
         if path == root {
-            self.children = Some(nodes);
+            self.children = Some(merge_listing_nodes(self.children.take(), nodes));
             return true;
         }
         let Ok(rel) = path.strip_prefix(&root) else {
@@ -4311,39 +4406,19 @@ impl FileTreeUi {
         if !node.expanded {
             return false;
         }
-        node.children = Some(nodes);
+        node.children = Some(merge_listing_nodes(node.children.take(), nodes));
         true
     }
 
-    fn collect_expanded_paths(&self) -> HashSet<PathBuf> {
-        let mut expanded = HashSet::new();
-        if let (Some(root), Some(children)) = (&self.root, &self.children) {
-            collect_expanded_paths(children, root, &mut expanded);
+    fn listing_children(&self, path: &Path) -> Option<&[TreeNode]> {
+        let root = self.root.as_ref()?;
+        if path == root {
+            return self.children.as_deref();
         }
-        expanded
-    }
-
-    fn expanded_direct_child_paths(&self, path: &Path) -> Vec<PathBuf> {
-        let Some(root) = self.root.as_ref() else {
-            return Vec::new();
-        };
-        let children = if path == root {
-            self.children.as_ref()
-        } else {
-            let Ok(rel) = path.strip_prefix(root) else {
-                return Vec::new();
-            };
-            self.children
-                .as_ref()
-                .and_then(|c| node_ref(c, rel))
-                .and_then(|node| node.children.as_ref())
-        };
-        children
-            .into_iter()
-            .flat_map(|children| children.iter())
-            .filter(|node| node.is_dir && node.expanded)
-            .map(|node| path.join(&node.name))
-            .collect()
+        let relative = path.strip_prefix(root).ok()?;
+        node_ref(self.children.as_deref()?, relative)?
+            .children
+            .as_deref()
     }
 }
 
@@ -7600,18 +7675,21 @@ fn read_children(path: &Path, _root: Option<&Path>) -> std::io::Result<Vec<TreeN
     Ok(nodes)
 }
 
-fn prepare_listing_nodes(
-    parent: &Path,
-    mut nodes: Vec<TreeNode>,
-    expanded_paths: &HashSet<PathBuf>,
-) -> Vec<TreeNode> {
+fn merge_listing_nodes(old: Option<Vec<TreeNode>>, mut nodes: Vec<TreeNode>) -> Vec<TreeNode> {
+    // 살아 있는 동일 폴더의 하위 버퍼를 이동한다. 갱신 중 빈 목록을 끼우지 않으며,
+    // 완료 시점의 펼침 상태를 사용해 조회 이후 사용자가 연 폴더도 보존한다.
+    let mut expanded: HashMap<OsString, Option<Vec<TreeNode>>> = old
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|node| node.is_dir && node.expanded)
+        .map(|node| (node.name, node.children))
+        .collect();
     for node in &mut nodes {
-        if !node.is_dir {
-            continue;
-        }
-        if expanded_paths.contains(&parent.join(&node.name)) {
+        if node.is_dir
+            && let Some(children) = expanded.remove(&node.name)
+        {
             node.expanded = true;
-            node.children = Some(Vec::new());
+            node.children = children;
         }
     }
     nodes
@@ -7698,19 +7776,6 @@ fn node_ref<'a>(mut nodes: &'a [TreeNode], rel: &Path) -> Option<&'a TreeNode> {
         nodes = node.children.as_deref()?;
     }
     None
-}
-
-fn collect_expanded_paths(nodes: &[TreeNode], base: &Path, out: &mut HashSet<PathBuf>) {
-    for node in nodes {
-        if !node.is_dir || !node.expanded {
-            continue;
-        }
-        let path = base.join(&node.name);
-        out.insert(path.clone());
-        if let Some(children) = &node.children {
-            collect_expanded_paths(children, &path, out);
-        }
-    }
 }
 
 /// 디렉터리를 다시 나열하되, 이전 트리의 펼침 상태를 이월한다 (펼친 하위만 재귀 —
@@ -9149,6 +9214,234 @@ mod tests {
     }
 
     #[test]
+    fn folder_navigation_상위_갱신_중에도_펼친_내용과_선택을_유지한다() {
+        let root = PathBuf::from("/folder-navigation");
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.root = Some(root.clone());
+        let mut open = dir("open");
+        open.expanded = true;
+        open.children = Some(vec![file("child.txt")]);
+        tree.children = Some(vec![open]);
+        tree.selected.insert(root.join("open/child.txt"));
+        tree.rebuild_flat();
+        // 갱신 결과의 도착 직후, 하위 listing 완료 전에도 기존 행이 살아 있어야 한다.
+        tree.apply_listing_snapshot(
+            root.clone(),
+            FileTreeListingSnapshot::try_new(vec![
+                FileTreeListingItem::try_new(OsString::from("open"), true).unwrap(),
+                FileTreeListingItem::try_new(OsString::from("new.txt"), false).unwrap(),
+            ])
+            .unwrap(),
+        );
+        assert!(
+            tree.flat
+                .iter()
+                .any(|row| row.path == root.join("open/child.txt"))
+        );
+        assert!(tree.selected.contains(&root.join("open/child.txt")));
+        assert!(tree.flat.iter().any(|row| row.path == root.join("new.txt")));
+    }
+
+    #[test]
+    fn folder_navigation_같은_목록은_행_버퍼와_감시계획을_다시_만들지_않는다() {
+        let root = PathBuf::from("/folder-navigation");
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.set_root(Some(root.clone()));
+        let snapshot = || {
+            FileTreeListingSnapshot::try_new(vec![
+                FileTreeListingItem::try_new(OsString::from("same.txt"), false).unwrap(),
+            ])
+            .unwrap()
+        };
+        let listing = tree.take_maintenance_intent().unwrap();
+        tree.complete_maintenance(FileTreeMaintenanceCompletion {
+            operation: listing.operation,
+            generation: listing.generation,
+            result: Ok(FileTreeMaintenanceResult::Listing(snapshot())),
+        });
+        let watch = tree.take_maintenance_intent().unwrap();
+        tree.complete_maintenance(FileTreeMaintenanceCompletion {
+            operation: watch.operation,
+            generation: watch.generation,
+            result: Ok(FileTreeMaintenanceResult::WatchSetApplied),
+        });
+        let path_buffer = tree.flat[0].path.as_os_str().as_encoded_bytes().as_ptr();
+        tree.refresh();
+        let listing = tree.take_maintenance_intent().unwrap();
+        tree.complete_maintenance(FileTreeMaintenanceCompletion {
+            operation: listing.operation,
+            generation: listing.generation,
+            result: Ok(FileTreeMaintenanceResult::Listing(snapshot())),
+        });
+        assert!(
+            tree.take_maintenance_intent().is_none(),
+            "동일한 감시 집합 재등록 금지"
+        );
+        assert_eq!(
+            tree.flat[0].path.as_os_str().as_encoded_bytes().as_ptr(),
+            path_buffer
+        );
+    }
+
+    #[test]
+    fn folder_navigation_진입한_폴더의_기존_목록만_옮기고_늦은_결과를_버린다() {
+        let root = PathBuf::from("/folder-navigation");
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.set_root(Some(root.clone()));
+        let stale = tree.take_maintenance_intent().unwrap();
+        let mut open = dir("open");
+        open.expanded = true;
+        open.children = Some(vec![file("child.txt")]);
+        let child_buffer = open.children.as_ref().unwrap().as_ptr();
+        tree.children = Some(vec![open, dir("other")]);
+        tree.selected.insert(root.join("open/child.txt"));
+        tree.set_root(Some(root.join("open")));
+        assert_eq!(tree.flat.len(), 1, "진입 순간에도 해당 폴더 내용 유지");
+        assert_eq!(tree.flat[0].path, root.join("open/child.txt"));
+        assert_eq!(
+            tree.children.as_ref().unwrap().as_ptr(),
+            child_buffer,
+            "하위 트리를 복제하지 않고 이동"
+        );
+        assert!(tree.selected.is_empty(), "이전 루트의 선택은 이월하지 않음");
+        tree.complete_maintenance(FileTreeMaintenanceCompletion {
+            operation: stale.operation,
+            generation: stale.generation,
+            result: Ok(FileTreeMaintenanceResult::Listing(
+                FileTreeListingSnapshot::try_new(vec![
+                    FileTreeListingItem::try_new(OsString::from("other"), true).unwrap(),
+                ])
+                .unwrap(),
+            )),
+        });
+        assert_eq!(tree.flat.len(), 1);
+        assert_eq!(tree.flat[0].path, root.join("open/child.txt"));
+    }
+
+    #[test]
+    fn folder_navigation_이월_캐시도_보관_상한에_포함하고_종류가_바뀌면_해제한다() {
+        let root = PathBuf::from("/folder-navigation-budget");
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.root = Some(root.clone());
+        tree.children = Some(
+            (0..4)
+                .map(|i| {
+                    let mut node = dir(&format!("dir-{i}"));
+                    node.expanded = true;
+                    node.children = Some(
+                        (0..FILE_TREE_LISTING_MAX_ITEMS - 1)
+                            .map(|j| file(&format!("file-{j}")))
+                            .collect(),
+                    );
+                    node
+                })
+                .collect(),
+        );
+        assert_eq!(
+            tree_node_usage(tree.children.as_deref().unwrap()).0,
+            FILE_TREE_RETAINED_MAX_ITEMS
+        );
+        tree.rebuild_flat();
+        let snapshot = |replace_directory: bool| {
+            let mut items: Vec<_> = (0..4)
+                .map(|i| {
+                    FileTreeListingItem::try_new(
+                        OsString::from(format!("dir-{i}")),
+                        i != 0 || !replace_directory,
+                    )
+                    .unwrap()
+                })
+                .collect();
+            items.push(FileTreeListingItem::try_new(OsString::from("new.txt"), false).unwrap());
+            FileTreeListingSnapshot::try_new(items).unwrap()
+        };
+        tree.apply_listing_snapshot(root.clone(), snapshot(false));
+        assert!(
+            tree.error.is_some(),
+            "기존 하위 캐시와 합산해 상한 초과를 거절"
+        );
+        assert!(!tree.flat.iter().any(|row| row.path == root.join("new.txt")));
+        tree.apply_listing_snapshot(root.clone(), snapshot(true));
+        assert!(tree.flat.iter().any(|row| row.path == root.join("new.txt")));
+        assert!(
+            !tree
+                .flat
+                .iter()
+                .any(|row| row.path == root.join("dir-0/file-0")),
+            "파일로 바뀐 폴더의 하위 캐시 해제"
+        );
+        assert!(
+            tree_node_usage(tree.children.as_deref().unwrap()).0 <= FILE_TREE_RETAINED_MAX_ITEMS
+        );
+    }
+
+    #[test]
+    fn folder_navigation_많은_하위폴더도_상위를_무한히_재조회하지_않는다() {
+        let root = PathBuf::from("/folder-navigation-wide");
+        let count = FILE_TREE_REFRESH_BACKLOG_CAP + 1;
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.set_root(Some(root.clone()));
+        tree.children = Some(
+            (0..count)
+                .map(|i| {
+                    let mut node = dir(&format!("dir-{i:03}"));
+                    node.expanded = true;
+                    node.children = Some(Vec::new());
+                    node
+                })
+                .collect(),
+        );
+        tree.rebuild_flat();
+        let mut listed = HashSet::new();
+        for _ in 0..count + 3 {
+            let Some(intent) = tree.take_maintenance_intent() else {
+                break;
+            };
+            let result = match intent.request {
+                FileTreeMaintenanceRequest::ListDirectory { directory, .. } => {
+                    let path = directory.as_path().to_path_buf();
+                    assert!(
+                        listed.insert(path.clone()),
+                        "같은 폴더를 반복 조회: {path:?}"
+                    );
+                    let items = if path == root {
+                        (0..count)
+                            .map(|i| {
+                                FileTreeListingItem::try_new(
+                                    OsString::from(format!("dir-{i:03}")),
+                                    true,
+                                )
+                                .unwrap()
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    FileTreeMaintenanceResult::Listing(
+                        FileTreeListingSnapshot::try_new(items).unwrap(),
+                    )
+                }
+                FileTreeMaintenanceRequest::ReplaceWatchSet(_) => {
+                    FileTreeMaintenanceResult::WatchSetApplied
+                }
+            };
+            tree.complete_maintenance(FileTreeMaintenanceCompletion {
+                operation: intent.operation,
+                generation: intent.generation,
+                result: Ok(result),
+            });
+            assert!(tree.pending_refresh_dirs.len() <= FILE_TREE_REFRESH_BACKLOG_CAP);
+        }
+        assert_eq!(
+            listed.len(),
+            count + 1,
+            "모든 펼친 하위 폴더를 한 번씩 갱신"
+        );
+        assert!(tree.pending_maintenance.is_none());
+        assert!(tree.take_maintenance_intent().is_none());
+    }
+
+    #[test]
     fn set_root은_listing을_background로_요청하고_stale_root를_버린다() {
         let base = temp_root("async-root-stale");
         let root_a = base.join("root-a");
@@ -9282,6 +9575,38 @@ mod tests {
         button.click();
         harness.run();
         assert!(harness.state().open_settings);
+
+        // 오류 화면도 상위 이동 입력을 소비해야 한다. 모양 비교가 아니라 실제 클릭 후
+        // 루트/오류 상태의 전이를 검증한다.
+        let parent_pos = harness
+            .output()
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == ".." => {
+                    Some(text.pos + text.galley.size() * 0.5)
+                }
+                _ => None,
+            })
+            .expect("상위 이동 행");
+        harness.hover_at(parent_pos);
+        harness.step();
+        harness.event(egui::Event::PointerButton {
+            pos: parent_pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.step();
+        harness.event(egui::Event::PointerButton {
+            pos: parent_pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run();
+        assert_eq!(harness.state().tree.root.as_deref(), Some(Path::new("/")));
+        assert!(harness.state().tree.root_error.is_none());
     }
 
     #[test]

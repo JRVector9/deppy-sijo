@@ -3800,6 +3800,109 @@
 - 다음 에이전트 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git log -3 --oneline`; `git show --stat HEAD`; `tail -n 10 /tmp/deppy-api-edit-app-final-20260916.log`; `tail -n 10 /tmp/deppy-api-edit-storage-final-20260916.log`; `ps -o pid,etime,comm -p 95838`. 적용 승인 후 `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo build --locked --release -p deppy-sijo -p mcp-proxy`. 새 source hash/별도 bundle/동일 Developer ID 서명과 지정 요구사항 확인 후 PID95838의 정확한 실행 경로를 확인해 정상 종료·새 bundle open. 이전 /tmp/deppy-session-order-*-20260916.py는 PID94358이 하드코딩되어 그대로 재사용 금지.
 
 
+## 2026-09-18 네이티브 큐 경합 및 터미널 상단 오류 배너 수정 진행
+
+- 목표: `native operation queue is busy` 원인을 해결하고 터미널 상단의 오류 배너를 없애 기존 알림 센터에 보낸다. 사용자에게 발생 직전 동작을 비동기로 물었고 응답은 아직 없다.
+- 확인: request_terminal_clipboard는 경로 hover와 공유하는 capacity-one io_intents 큐가 차면 이 문자열을 self.error에 저장한다. 기존 8월 수정은 protocol completion의 배너만 제거해 native 오류 배너는 남아 있다. pending_paste 단일 슬롯은 후속 paste가 이전 결과를 무효화하며, cwd 갱신의 io_generation도 paste까지 무효화한다.
+- 계획: 추측성 ResolvePath는 최신 한 건만 유지하고 명시적 사용자 요청을 먼저 실행한다. 사용자 요청과 paste 컨텍스트는 작은 고정 상한으로 따로 보존하며 만료/완료 때 해제한다. 경로 generation 변경은 paste에 영향을 주지 않는다. show_with_input의 상단 배너를 제거하고 App logic이 활성/warm workspace의 오류를 기존 알림 센터에 전달한다. 알림은 workspace별 동일 메시지 반복을 억제하고 기존 history/native 상한을 유지한다.
+- 검사: workspace.rs에 native_io_ 접두사 두 회귀 검사(경로 hover와 paste 경합, 연속 paste 및 cwd 무효화)를 먼저 작성. `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo test --locked -p deppy-sijo --bin deppy-sijo native_io_ -- --nocapture` 진행 중, /tmp/deppy-native-io-red-20260918.log. 결과 미확정, PASS 주장 금지. 수정 전 공지 links 설정 때문에 webbrowser 의존 컴파일도 포함된다.
+- 보존: 앞선 Cargo.toml/Cargo.lock의 links 수정과 이 문서의 감사/정리 기록은 미커밋이다. 제품 release 빌드/재실행 승인 없음, PID85155 유지. 다음은 위 RED 결과 확인 후 최소 구현/관련 검사만 진행한다.
+
+### 네이티브 큐·알림 소스 수정 완료 / 실행 앱 적용 대기
+
+- 구현: workspace.rs의 사용자 I/O 대기열은 최대 8건, 추측성 ResolvePath는 최신 한 건만 유지하며 사용자 요청부터 drain한다. 총 대기 intent 최대 9건, host 실행은 기존처럼 하나뿐이다. pending_pastes는 실행 중 포함 최대 8건으로 각 operation/generation/대상 세션을 보존한다. cwd 경로 조회 세대가 바뀌어도 paste 완료는 자기 토큰으로 처리한다. 기존 10초 만료 시 컨텍스트와 아직 대기 중인 read intent를 함께 해제하고 재시도 안내를 알림으로 보낸다. 영문 내부 오류 대신 5개 locale의 6개 문구를 추가했다.
+- 표시: show_with_input의 상단 오류/프로토콜 유실 배너와 그 구분선을 제거했다. take_error_notice가 native/실제 유실/기타 오류를 한 번씩 반환한다. App logic이 활성 및 warm workspace 모두에서 이를 수집하고 기존 NotificationsUi에 전달한다. Workspace 대상은 세션 상태로 가장하지 않으며 알림 센터/벨 최근 알림에 기록한다. 같은 workspace·문구는 10초 중복 억제, 기존 이력100건/native8건 상한 유지, 메시지는 최대512 Unicode 문자로 제한한다. 세션 없는 오류도 보관하며 workspace 삭제 시 함께 제거한다.
+- 수정 파일: crates/app/src/{app.rs,ui/workspace.rs,ui/notifications.rs}, crates/i18n/locales/{ko-KR,en-US,ja-JP,zh-Hans,zh-Hant}/messages.txt, 이 문서. 앞선 Cargo.toml/Cargo.lock links 수정은 그대로 미커밋 보존.
+- 실제 검증: native_io_ RED는 **1 PASS / 2 FAIL**(기존 file-tree 검사1건 포함), /tmp/deppy-native-io-red-20260918.log. 수정 후 최종 동일 필터 **5 PASS / 0 FAIL**(신규4건+기존1건), /tmp/deppy-native-io-final-20260918.log. 경합 우선순위, 연속 paste 대상/경로 generation 독립성, 큐 상한·만료·오류 drain, 알림 중복·읽음·pruning·상한을 검사했다. 기존 `terminal_clipboard_completion은_요청_세션에_정확히_한번만_전송된다` 선택 검사 **1 PASS / 0 FAIL**, /tmp/deppy-native-io-existing-20260918.log. 총 최종6건. 명령 환경은 `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo test --locked -p deppy-sijo --bin deppy-sijo <필터> -- --nocapture`. git diff --check exit0. scoped rustfmt만 적용했고 전체 suite/UI 회귀/clippy/i18n gate는 실행하지 않았다.
+- 자체 검토: 큐에 있는 사용자 요청을 경로 미리보기가 덮지 않고, 완료/만료는 정확한 요청만 제거한다. 외부 raw URL/clipboard 내용은 tracing에 남기지 않는다. 새 enum은 기존 세션 알림 dedupe와 분리되며 새 worker/timer를 만들지 않는다. 직접 코드 재현으로 원인을 확인했지만 사용자 발생 직전 조작 응답은 아직 없어 그 특정 순간의 동작은 단정하지 않는다.
+- 남음: 사용자 승인 후 공지 links 수정과 이번 큐/알림 변경을 함께 별도 signed release bundle로 빌드·재실행하고, 실제 화면에서 상단 배너 부재·알림 기록·제목 원문 열림을 확인한다. 현재 PID85155는 이전92859ff 빌드라 **새 수정 미적용**. 새 제품 빌드/재시작/화면검증/커밋/main merge/push 없음. 인계 문서까지 포함해 모든 변경은 미커밋이며 이를 다른 작업으로 덮지 않는다.
+- 다음 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git diff --stat`; `tail -n 12 /tmp/deppy-native-io-final-20260918.log`; `ps -o pid,etime,comm -p 85155`. 재빌드 승인 없이는 앱을 종료하지 않는다. 커밋 시 프로젝트 규칙의 정적 게이트를 그 직전에 한 번 실행한다.
+
+### 2026-09-18 네이티브 큐 변경 재리뷰 및 보완 완료
+
+- 목표: 사용자 `한번더 체크해봐. 코드리뷰해`에 따라 위 미커밋 네이티브 큐/알림/링크 변경을 다시 검토하고 확인된 결함을 즉시 수정했다. `/Users/jr/.agents/skills/review/SKILL.md`는 읽었으나 필수 보조 파일로 지목된 `/Users/jr/.codex/skills/gstack/review/checklist.md`가 설치돼 있지 않아 그 자동 절차는 중단하고 diff·호출부·수명주기를 직접 추적했다.
+- 리뷰 수정 1: 유효한 OpenPath/OpenUrl이 큐 포화로 거절돼도 `path/url rejected`로 오인되던 분기를 `native_busy`와 입력 검증 실패로 분리했다. OS 열기 실행 실패와 host worker spawn/panic/disconnect는 예전 `ExternalLinkFailed` 로그에서 사라졌으나, 이제 원래 workspace id/runtime instance로 `OpenPathFailed`/`OpenUrlFailed` completion을 돌려 알림 센터에 남긴다. raw 경로/URL은 completion과 로그에 싣지 않는다.
+- 리뷰 수정 2: clipboard payload가 실제로 `ClipboardTooLarge`를 반환해도 일반 읽기 실패로 표시하던 매핑을 크기 초과 안내로 바로잡았다. 붙여넣기 요청별 operation/generation/세션 보존과 10초 만료는 유지한다.
+- 리뷰 수정 3: warm workspace 오류는 어느 프로젝트에서 발생했는지 알 수 없었다. 알림 제목에 bounded 표시명을 넣되, 표시명 조회/문자열 할당은 오류가 실제로 존재하는 프레임에만 수행해 정상 렌더 주기에 비용을 추가하지 않는다. 표시명+메시지는 Unicode 경계를 보존하면서 총 2KiB byte 예산 안에서 잘라 CJK/emoji 입력도 알림 생성 단계에서 조용히 탈락하지 않는다.
+- 리뷰 수정 4: `workspace.input_pressure`의 queued 수치가 이벤트마다 바뀌면 서로 다른 오류 문자열이 되어 알림 이력/OS 알림을 계속 만들 수 있었다. `WorkspaceErrorKind`를 추가해 원인별 dedupe를 하고, WorkspaceUi는 압박 시작~queued=0 해소를 한 에피소드로 보아 첫 알림만 만든다. 일반 오류는 같은 문구, typed 오류는 같은 원인을 workspace별 10초간 합친다. 알림 이력100건/native intent8건 상한은 유지한다.
+- 수정 파일: `crates/app/src/{app.rs,ui/workspace.rs,ui/notifications.rs}`와 이 문서. 앞선 Cargo/locale 변경은 그대로 보존했다.
+- 실제 검증: scoped rustfmt와 `git diff --check` exit0. `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo test --locked -p deppy-sijo --bin deppy-sijo native_io_ -- --nocapture` 최종 **8 PASS / 0 FAIL**(2300 filtered). 첫 실행은 새 pressure 테스트 closure 인자 타입 추론 E0282로 컴파일 실패했고 `usize`를 명시한 뒤 같은 명령을 재실행해 통과했다. 전체 suite/clippy/i18n gate/release build/UI 검증은 실행하지 않았다.
+- 남음/적용 상태: 제품 변경은 모두 미커밋이다. 실행 중 PID85155는 92859ff 기반 이전 bundle이라 이번 변경이 적용되지 않았다. 사용자 승인 없이 재빌드·재실행하지 않았다. 공지 링크의 OS 브라우저 실제 도달, 상단 배너 부재, 벨 알림 문맥은 새 signed release 실행 후 화면으로 확인해야 한다.
+- 다음 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git diff --check`; `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo test --locked -p deppy-sijo --bin deppy-sijo native_io_ -- --nocapture`; 적용 승인 시에만 release build/sign/restart 절차를 진행한다.
+
+### 2026-09-18 재그리기·메모리 비용 집중 재리뷰 완료
+
+- 목표/범위: 사용자 추가 리뷰 요청에 따라 현재 미커밋 알림/큐 변경과 인접 렌더·클립보드 호출부의 중복 repaint, 반복 할당, 불필요 복사를 점검하고 확인된 세 항목을 수정했다. 실제 작업 트리는 `/Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`, 브랜치는 `fix/environment-api-context-integration`, HEAD는 cc2362d다. 원래 deppy-sijo 경로의 오래된 브랜치는 수정하지 않았다.
+- 수정 1: 로컬 eframe 0.36.1 `native/epi_integration.rs:296`에서 가시 프레임은 App::logic 직후 App::ui를 호출함을 확인했다. 오류 drain은 중복 억제된 알림에도 `workspace_error_added=true`로 다음 repaint를 요청했으므로 이 플래그와 추가 요청을 제거했다. 렌더 후 읽음 뱃지 갱신·worker 완료·입력 backlog 등에 필요한 repaint는 유지한다. 숨긴 창은 다음 표시 프레임에 최신 상태를 읽는다. 실제 전체 앱 프레임 수를 계측한 결과는 아니다.
+- 수정 2: typed 오류 중복을 borrowed workspace id/원인으로 먼저 판정해 버리는 알림의 문자열 할당을 없앴다. 수용하는 오류 제목은 Unicode/NUL/2KiB 상한을 유지하면서 하나의 버퍼에 만든다. 정적 번역 키 message_id는 &'static str로 공유하고, 공통 상태 알림의 번역도 중복 판정 뒤로 이동했다. 새 캐시·worker·timer는 추가하지 않았다.
+- 수정 3: 파일/이미지 경로가 있는 클립보드는 사용하지 않는 텍스트 flavor를 OS에서 조회하지 않으며, completion도 텍스트 paste 바이트를 필요할 때만 생성한다. 경로 우선순위, 셸 quoting, bracketed paste, 텍스트 fallback 동작은 유지한다.
+- 메모리 수명 확인: 이번 관련 경로에서 무제한으로 쌓이는 새 보관소는 발견하지 않았다. 사용자 intent 8건+최신 미리보기 1건, 실행 중 포함 paste 8건과 10초 만료, 알림 이력100건/native8건 상한을 유지한다. 이는 전체 앱의 메모리 누수 부재나 실사용 RSS 개선을 증명한 것은 아니다.
+- 수정 파일: `crates/app/src/app.rs`, `crates/app/src/ui/notifications.rs`, `crates/app/src/ui/workspace.rs`, 기존 할당 카운터 접근을 연 `crates/app/src/bench.rs`, 이 문서. 앞선 Cargo/locale 변경은 보존했다.
+- 실제 검증: 기존 bench-alloc의 스레드별 할당 카운터로 중복 알림 수신부를 1,000회 호출했다. 수정 전 **6,000회 / 누적 92,000 bytes** 할당으로 새 회귀 검사가 의도대로 실패했고(`/tmp/deppy-native-perf-red-20260918.log`), 수정 후 **0회 / 0 bytes**였다. 이 수치는 on_workspace_error 수신부만의 결과이며 호출 전 번역/표시명 생성이나 프로세스 RSS까지 포함하지 않는다. 파일 경로가 있을 때 텍스트 조회·변환 closure가 호출되지 않는 검사와 기존 텍스트 붙여넣기도 통과했다.
+- 최종 명령/결과: `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo test --locked -p deppy-sijo --bin deppy-sijo --features bench-alloc native_io_ -- --nocapture` → **10 PASS / 0 FAIL / 2298 filtered**, `/tmp/deppy-native-perf-final-20260918.log`. 네 수정 Rust 파일에 scoped rustfmt 적용, `git diff --check` exit0. 의도한 RED 외 새 실패/폐기한 접근은 없다. 전체 suite/clippy/i18n gate/release build/UI 검증은 실행하지 않았다.
+- 남음/적용 상태: 제품 변경은 미커밋이며 실행 앱에는 아직 미적용이다. 현재 실행 앱은 이전 92859ff 기반 bundle을 유지했다. 사용자 승인 후 signed release 빌드·재실행 및 실제 화면의 공지 링크/상단 배너 부재/알림 기록을 확인한다. 이번 리뷰에서 전 앱 FPS/RSS 장시간 계측은 수행하지 않았다.
+- 다음 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git diff --check`; `tail -n 18 /tmp/deppy-native-perf-final-20260918.log`. 제품 코드에 추가 변경이 없으면 검사를 반복하지 않는다. 적용 승인 시에만 현재 PID/경로를 새로 확인하고 release build/sign/restart 절차를 진행한다.
+
+### 2026-09-18 폴더 탐색 깜빡임 소스 수정 완료 / 화면 적용 대기
+
+- 목표: 폴더 클릭/진입 시 다른 행이 잠깐 보이는 듯한 깜빡임과 불필요한 작업을 제거한다. 기존 작업 트리와 실행 앱을 유지하며 이전 미커밋 수정도 보존한다.
+- 조사: file_tree.rs는 모든 maintenance(목록뿐 아니라 watch 등록) 동안 목록 위에 Spinner 행을 삽입해 스크롤 영역과 클릭 대상 위치를 움직인다. 상위 listing completion은 prepare_listing_nodes에서 펼친 하위 children을 빈 Vec로 바꾼 뒤 순차 재조회한다. 내용이 같아도 전체 flat 문자열을 재생성하고 watch_plan_dirty를 켠다. 이는 단순 색/배치 변경 외에 비동기 상태 로직의 문제다.
+- 계획: 로딩 표시는 고정된 도구 영역 안에서 표시하고 watch 등록은 로딩 표시에서 제외한다. listing 갱신은 같은 이름/종류의 펼친 자식을 복사하지 않고 이월하며 보관 상한을 함께 검사한다. 내용이 같은 스냅샷은 행 버퍼/감시 집합을 재생성하지 않는다. 직접 관련 상태 검사만 실행하며 화면 검증을 테스트 통과로 대체하지 않는다.
+- 구현: 상위 갱신의 동일 폴더 children을 이동으로 보존하고, 동일 listing은 flat/watch 재생성을 생략한다. 매 listing 요청에서 전체 펼침 경로 HashSet을 복제하던 preserve_expanded도 제거했다. 결과 도착 시점의 실제 펼침 상태를 따른다. 하위 폴더 진입은 해당 캐시만 이동하고 세대/선택/삭제 대기 초기화는 유지한다. `..` 클릭의 본문 렌더 전 조기 반환을 제거하고, 목록 스크롤 ID를 고정했다. 로딩은 새로고침 아이콘 안의 정적 점과 tooltip으로 표시해 행 삽입/Spinner repaint를 제거했다.
+- 검증/실패 접근: 상위 갱신/동일 목록 검사2건은 RED **0 PASS / 2 FAIL**(`/tmp/deppy-folder-navigation-red-20260918.log`), 폴더 진입 캐시 검사1건은 RED **0 PASS / 1 FAIL**(`/tmp/deppy-folder-navigation-entry-red-20260918.log`). 구현 후 해당3건 **3 PASS / 0 FAIL**(`/tmp/deppy-folder-navigation-green-20260918.log`). 보관 한도/종류 변경 검사 추가 후 첫 실행은 closure 매개변수 타입 추론 E0282로 컴파일 실패했고 bool 명시 후 최종 **9 PASS / 0 FAIL / 2303 filtered**(`/tmp/deppy-folder-navigation-final-20260918.log`, test compile 13.06초, 실행0.04초). 새4건+기존5건으로 늦은 완료/접힘/부분 재나열/삭제 확인/루트 전환 정리를 확인했다. 이 결과는 화면 검증이 아니다.
+- 실제 명령: `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo test --locked -p deppy-sijo --bin deppy-sijo --features bench-alloc -- --nocapture folder_navigation_ set_root은_listing을_background로_요청하고_stale_root를_버린다 collapse_후_도착한_listing_result는_폐기된다 워처_이벤트_경로의_부모만_부분_재나열된다 영구삭제_확인은_나열에서_사라지면_닫히고_접기로는_닫히지_않는다 루트가_바뀌면_선택과_삭제_대기열을_버린다`. file_tree.rs만 scoped rustfmt, `git diff --check` exit0. 전체 suite/UI 회귀/clippy/i18n gate/release 빌드는 실행하지 않았다.
+- 관찰: CUA에서 실행 앱 상태만 확인했고 사용자 파일을 열거나 바꾸지 않았다. 앱 이름 deppy-sijo 조회는 실패했으나 기존 bundle 경로로 조회 성공. PID85155 기존 실행본 유지 확인.
+- 수정 파일: 이번 요청에서는 `crates/app/src/ui/file_tree.rs`와 이 문서만 변경했다. 이전 Cargo/app/bench/workspace/notifications/locale 미커밋 수정은 그대로 유지했다. 새 커밋/머지/push 없음.
+- 남음: 실행 앱에는 이번 수정도 미적용이다. 사용자 승인 후 이전 공지 링크/알림 수정과 함께 signed release 빌드·재실행하고 폴더 펼침/더블클릭 진입/`..`/워처 갱신의 화면을 확인한다. 처음 읽는 폴더는 여전히 비동기 조회가 필요하며, 이전 다른 폴더의 행을 새 경로 아래에 대신 표시하지 않는다. 현재 버전의 실제 깜빡임 해소는 화면으로 아직 검증하지 않았다.
+- 다음 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git diff -- crates/app/src/ui/file_tree.rs`; `tail -n 18 /tmp/deppy-folder-navigation-final-20260918.log`; `ps -o pid,etime,comm -p 85155`. 코드 추가 변경이 없으면 통과한 검사는 반복하지 않는다. 새 앱 빌드/재실행은 사용자 승인 전 수행하지 않는다.
+
+### 2026-09-18 폴더 수정 재리뷰 완료 / 후속 세션 상태 확인 착수
+
+- 현재 목표: 사용자가 폴더 수정 완료 여부를 재검토하도록 요청했다. 추가 보완을 완료했고, 이제 뒤이어 요청한 Codex/Claude/Grok의 실행 중·지시 대기·승인/선택 대기 분류를 확인한다.
+- 재리뷰 발견: `..` 이동을 렌더 끝으로 미룬 변경이 PermissionDenied 조기 반환 경로에서 유실된다. 기존 권한 오류 검사에 실제 상위 행 클릭→루트 전이 확인을 추가해 RED 1 FAIL(`/tmp/deppy-folder-review-red-20260918.log`)로 재현했다. 상위 이동 반영을 오류 화면 반환 직전에도 처리해야 한다.
+- 추가 재현: 64건 제한의 외부 갱신 큐에 모든 펼친 자식 목록을 한꺼번에 넣으면 65개 이상에서 root로 축약되고, root 완료가 다시 65개를 넣는 무한 재조회가 있었다. 65개 fixture RED **1 FAIL**(`/tmp/deppy-folder-review-wide-red-20260918.log`)로 동일 루트 반복을 확인했다.
+- 완료/설계: PermissionDenied 화면을 그린 뒤에도 대기한 상위 이동을 반영한다. 루트 이동은 화면을 그린 뒤 상태가 바뀌므로 다음 프레임을 한 번 요청한다. 하위 재조회는 ListingWalk의 범위/마지막 경로 두 개만 보관하고 기존 flat에서 다음 펼친 가시 폴더를 한 건씩 고른다. 별도 전체 경로 목록 복제 없이 외부 이벤트 대기열64건과 host slot1을 유지한다. 루트 전환은 순회 위치를 버리고, 숨김 토글은 다시 드러난 폴더 캐시도 갱신한다. 새 타이머/스레드 없음.
+- 최종 검증: scoped rustfmt, `git diff --check` exit0. `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo test --locked -p deppy-sijo --bin deppy-sijo --features bench-alloc -- --nocapture folder_navigation_ kittest_root_권한거부는_가운데_버튼으로_설정열기_action을_낸다 set_root은_listing을_background로_요청하고_stale_root를_버린다 collapse_후_도착한_listing_result는_폐기된다 워처_이벤트_경로의_부모만_부분_재나열된다 영구삭제_확인은_나열에서_사라지면_닫히고_접기로는_닫히지_않는다 루트가_바뀌면_선택과_삭제_대기열을_버린다` → **11 PASS / 0 FAIL / 2302 filtered**(`/tmp/deppy-folder-review-final-20260918.log`). 권한 검사는 실제 입력 전달 후 상태 전이를 검사한 것이며 시각적 깜빡임 검증을 대체하지 않는다. 이번 재리뷰는 의도된 RED 외 실패 없음.
+- 변경 파일/실행 상태: file_tree.rs와 이 문서만 추가 수정했다. 모든 제품 변경은 미커밋·실행 앱 미적용. release 빌드/재실행 승인 없음. review 스킬 필수 checklist 파일이 여전히 없어 자동 파이프라인 대신 diff·호출부 직접 검토를 수행했다.
+- 다음: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `tail -n 20 /tmp/deppy-folder-review-final-20260918.log`; `rg -n 'AwaitingInput|Ready|Idle|NeedsApproval|status_label' crates/agent-detect crates/runtime crates/app/src/ui/file_tree.rs`. 세션 상태 분류의 실제 타입/위치는 검색으로 확인한다. 사용자 원문에 없는 전체 UI 재설계나 임의 빌드/재실행은 하지 않는다.
+
+### 2026-09-18 Claude/Codex/Grok 상태 판정 확인 완료
+
+- 목표/완료: 폴더 트리 보완 완료 후 사용자 스크린샷의 실행 중/지시 대기 구분을 코드·설치된 훅·읽기 전용 DB 메타데이터로 검토했다. 상세 결과는 `docs/investigations/2026-09-18-agent-running-idle-audit.md`.
+- 확인된 공통 결함: warm 세션에는 transcript activity가 전달되지 않고, working DB 투영은 120초 후 만료된다. 출력 10초 정지 PTY Idle 추정과 결합하면 실제로는 긴 사고/도구 실행 중인데 지시 대기로 표시될 수 있다. 실제 병합 함수/SQL을 추출해 active Working→Running, warm 무근거→Idle, working=1인데121초 경과→조회 제외를 재현했다. `/tmp/deppy-agent-status-proof-20260918/result.log`, 진단 컴파일/실행 exit0. 특정 스크린샷 행에서 실제 발생했다고 단정하지 않는다.
+- 정상 경로: Claude end_turn, Codex task_complete/turn_aborted, Grok turn_ended의 파싱과 세 CLI 질문/승인 정규화 연결을 확인했다. 설치된 Claude invocation 설정, Codex wrapper hooks 활성/이벤트 목록, Grok 전역 Deppy 설정이 존재한다. 전역 Claude/Codex config에 훅이 없는 것은 wrapper 방식이라 미설치 근거가 아니다. attention_json이 있는 질문/승인/완료는24시간 만료 예외가 있음을 확인해 추가 결함으로 오인하지 않았다.
+- 실제 검사: 기존 세 파서/병합 우선순위 선택8건 **8 PASS / 0 FAIL / 2305 filtered**, `/tmp/deppy-agent-status-audit-20260918.log`. 정확한 cargo 명령은 위 조사 문서에 기록했다. 사용자 대화/도구 인자/secret 값은 출력하지 않고 플래그·이벤트 종류·시각만 확인했다. 사용자 세션에 입력하지 않았다.
+- 변경 파일: 상태 제품 소스는 변경하지 않았다. 새 조사 문서와 이 인계 문서만 추가 갱신. 앞선 file_tree.rs 및 다른 미커밋 제품 수정은 보존했고 실행 앱은 이전 bundle 그대로다.
+- 남음: 폴더 수정은 소스/관련 검사 완료, 실제 화면은 빌드 승인 후 확인. 상태 판정은 위 warm 오분류를 추가 개발해야 한다. 단순 timeout 연장/무기한 Running 고정 대신 workspace/runtime/session 격리된 유계 최신 근거를 warm에도 제공하고 완료/취소/생존을 함께 판정하도록 설계해야 한다. 이번 사용자 요청은 상태 확인이라 이 추가 개발은 착수하지 않았다.
+- 다음 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `cat docs/investigations/2026-09-18-agent-running-idle-audit.md`; `cat /tmp/deppy-agent-status-proof-20260918/result.log`; `tail -n 20 /tmp/deppy-folder-review-final-20260918.log`. 새 제품 빌드/재실행은 승인 전 하지 않는다.
+
+## 2026-09-18 홈 공지 링크의 네이티브 브라우저 연결 누락 수정
+
+- 목표: 사용자 스크린샷의 공지 제목을 클릭하면 해당 원문 페이지가 열려야 한다. 현재 앱 PID85155와 소스 92859ff에는 앞선 10d3b56의 행 전체 클릭 수정이 이미 포함돼 있다.
+- 원인: Cargo.toml에서 eframe default-features=false로 필요한 feature만 켰지만 `links`가 빠져 있었다. egui-winit 0.36.1은 OpenUrl 명령을 받더라도 webbrowser feature가 없으면 경고만 출력한다. 실행 바이너리의 strings에서 `Cannot open url - feature "links" not enabled.` 확인. 이전 kittest는 OutputCommand 생성까지만 확인해서 OS 브라우저 연결 누락을 검출하지 못했다.
+- 완료/수정 파일: Cargo.toml에 eframe `links` feature와 한국어 설명 추가, Cargo.lock에 webbrowser 1.2.4 한 패키지 및 egui-winit 의존 연결 추가. UI 행/URL/parser는 변경하지 않았다. 이 docs/CODEX_HANDOFF.md에는 앞선 정리 기록도 미커밋 상태로 유지한다.
+- 검증: 수정 전 `CARGO_NET_OFFLINE=true cargo tree --locked -p egui-winit --depth 0 --format '{p} [{f}]' | rg 'webbrowser'` exit1(브라우저 feature 부재). 수정 후 같은 명령 exit0, links/webbrowser 활성 확인. 오프라인 lock 해석에서 추가 패키지는 webbrowser 1.2.4 하나뿐. git diff --check exit0. 앱 빌드·새 바이너리·실제 수정 후 브라우저 열림은 미검증이며 PASS 주장 금지.
+- UI 조사: CUA로 실행 앱 공지 제목 요소를 클릭했고 앱 AX 변화는 상태바 수치뿐. Chrome 현재 페이지는 공지가 아니었고 Safari AX 조회는 timeoutReached로 실패했다. 이 관찰만으로 모든 브라우저 미열림을 확정하지 않고, 실제 의존 그래프·egui-winit 소스·실행 바이너리의 비활성 분기로 원인을 특정했다.
+- 남은 작업: 사용자 승인 후 최신 소스의 서명 release 재빌드/재실행 및 공지 제목 클릭→기본 브라우저의 실제 원문 페이지 도달 확인. 기존 빌드·재실행 승인 규칙 때문에 현재 PID85155 유지. 이번 변경은 미커밋, main merge/push 없음. 불필요한 전체 테스트/게이트는 실행하지 않았다.
+- 다음 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git diff -- Cargo.toml Cargo.lock docs/CODEX_HANDOFF.md`; `CARGO_NET_OFFLINE=true cargo tree --locked -p egui-winit --depth 0 --format '{p} [{f}]'`. 빌드 승인이 있으면 기존 별도 signed bundle 절차를 사용하고 원문 페이지까지 확인한다. 과거 재실행 스크립트의 PID95838은 재사용 금지, 현재 실행 경로/PID를 새로 확인한다.
+
+## 2026-09-18 IME·Relay·Resize 미커밋 작업본 반영 여부 감사
+
+- 목표: 정리에서 보존한 네 worktree의 미커밋 코드가 main/실행 앱에 빠져 있는지 확인. 제품 수정·머지·폴더 삭제·빌드·재실행 없음. 수정 파일은 이 문서뿐이다.
+- 기준: fetch 후 ls-remote로 원격 main **9432d33d65290046db517fb49a0c3a48a6305434** 확인. 현재 소스 cc2362d, PID85155의 bundle manifest 입력 **92859ff**는 main 후손이며 92859ff→cc2362d는 문서만 다르다.
+- IME: ime-20260906의 두 제품 파일 패치는 PR **#150 / c4d662c**에 포함됐다. 임시 index에서 해당 커밋에 역방향 apply --check 성공. main/현재 소스에서 조합 시작 프레임 허용, 포커스 강제 중단 방지 및 관련 네 테스트를 확인했다. workspace 추가 hunk 11개는 공백 정규화 대조로 모두 확인.
+- Resize: resize-20260906의 workspace.rs는 **50d195f** 파일과 바이트 동일. #150은 viewport 크기도 debounce 조건에 넣는 보완을 추가했고 이후 **5f31d5e**의 실제 적용 세대 추적도 main/현재 소스에 포함됐다. 안정 화면 fence, 느린 드래그 debounce, 관련 세 테스트 유지. 옛 파일 덮어쓰기는 후속 보완을 되돌린다.
+- Relay: relay-20260906 및 relay-channel-20260906의 암호 채널 변경은 **3db4952**에서 커밋됐고 **ab0dbfc**를 포함한 PR **#177 / 0d28e84** 통합을 통해 main에 반영됐다. 배포 workflow, 고정 벡터 fixture/Rust 검사, 배포 검사, deploy/relay-shell 5개 파일, channel-concurrency.test.mjs는 main/현재 소스와 바이트 동일. RelaySecureChannel 클래스부터 파일 끝까지도 동일. 현재 파일에는 재접속 등록 기능이 추가됐고 CI는 단일 검사에서 모든 *.test.mjs로 확장됐다. 옛 파일 복사는 후속 기능을 제거한다. 두 Relay 작업본의 채널 변경도 서로 중복이다.
+- 검증: Git 원격 SHA·조상 관계·diff·파일 바이트 대조, 실행 PID/manifest 확인. 새 Rust/Node 기능 테스트·화면 검증 미실행. 문서 편집 후 git diff --check exit 0. 제품 동작 PASS 주장 없음.
+- 실패 접근: Resize 패치의 #150 역적용 검사는 viewport tuple 보완 때문에 문맥 불일치. 50d195f의 파일 완전 일치 및 50d195f→c4d662c diff를 직접 확인해 통합 후 개선됐음을 판정. 문서 최초 패치도 문맥 오류로 적용 실패하여 정확한 제목 앵커로 재작성했다.
+- 결론/남음: 네 폴더의 미커밋 상태는 옛 복사본의 상태이며, 이번 변경에서 새로 이관할 누락 제품 코드는 발견되지 않았다. 재적용 불필요. Relay 외부 배포 검증은 deploy/relay-shell/README.md의 DNS·TLS·호스트·자격증명 미확정으로 **BLOCKED**. 이번 요청에서 폴더는 삭제하지 않았다.
+- 다음 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git diff -- docs/CODEX_HANDOFF.md`; `git log -1 origin/main`; `ps -o pid,etime,comm -p 85155`. 추가 정리 요청 시 deppy-sijo-{ime,relay,relay-channel,resize}-20260906 각각의 최신 status/diff/untracked가 감사 이후 바뀌지 않았는지 다시 확인한다.
+
+### 2026-09-18 사용자 승인 후 중복 작업 폴더 정리 완료
+
+- 사용자 `다 반영된거면 정리해야지?` 지시에 따라 위 네 worktree를 정리했다. 각 HEAD e960004 및 미커밋 파일 목록을 재확인했고 staged 변경은 없었다. 미커밋 파일·인계 문서·untracked/ignored 파일·binary diff를 원본 저장소 `.git/worktree-cleanup-backups/merged-wip-20260918-102335.tar.gz`에 보관했다(1,879,412바이트). 압축본의 모든 파일 SHA256과 제거 직전 원본 SHA256을 대조한 뒤 명시한 네 경로에만 `git worktree remove --force`를 실행했다. 네 명령 exit 0, 각 경로 부재 확인. branch ref는 유지했다.
+- 제품 코드·현재 개발 worktree·실행 앱은 변경하지 않았다. 이 문서의 감사/정리 기록은 미커밋 상태다. 복구가 필요하면 유지한 해당 branch로 새 worktree를 만든 후 압축본의 `<종류>/files/`를 작업 루트에 복사한다. 일반 tar 전체를 작업 루트에 풀면 종류별 보관 구조가 생기므로 복구 경로를 먼저 확인한다.
+
 ## 2026-09-16 API 추가 깜빡임·더블클릭 편집 릴리스 적용 완료
 
 - 현재 목표/완료: 사용자 `재빌드하고 재실행` 승인에 따라 **92859ffba1f1e657c6e163a2c6ec412794aa0cfd** 제품 소스로 릴리스 빌드·서명·앱 교체 완료. API 추가/동기화 시 화면 유지와 기존 API 더블클릭 편집을 사용자 실행본에 적용했다.
@@ -3810,3 +3913,14 @@
 - 검사 범위: 이번 요청은 release build/서명/source hash/실행 PID·경로·생존만 확인. 앞서 통과한 관련4건/정적게이트는 반복하지 않았다. 실제 API 연속 추가의 깜빡임과 더블클릭 편집 화면은 사용자 관찰 대기이며 시각검증 PASS로 주장하지 않는다. 실패한 접근 없음. main merge/push/공증/배포 없음.
 - 남은 작업: 사용자 화면 피드백 확인. 활성·비활성 프로젝트에 API 추가 후 화면이 유지되는지, API 행 더블클릭에서 이름 변경/키 교체/공란 키 유지가 작동하는지 확인받는다.
 - 다음 에이전트 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git log -3 --oneline`; `ps -o pid,etime,comm -p 85155`; `cat /tmp/deppy-api-editor-restart-20260916.json`; `tail -n 5 /tmp/deppy-api-editor-release-build-20260916.log`. /tmp/deppy-api-editor-{release,restart}-20260916.py는 이전 PID95838을 하드코딩하므로 다음 작업에서 그대로 재사용하지 않는다. 새 변경/요청 없으면 빌드/검사를 반복하지 않는다.
+
+
+## 2026-09-18 누적 수정 커밋·푸시 준비 완료
+
+- 현재 목표: 사용자 `커밋하고 푸시해` 요청으로 실제 개발 worktree `/Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`, 브랜치 `fix/environment-api-context-integration`의 누적 변경과 조사 문서를 함께 커밋하고 일반 push한다. 기존 cwd `/Users/jr/Desktop/projects/deppy-sijo`는 과거 브랜치이므로 그곳에서 커밋하지 않는다. 이 기록 시점은 검사 완료·커밋 직전이며 원격 SHA는 아래 명령으로 확인한다.
+- 완료 범위/수정 파일: Cargo.toml/Cargo.lock의 공지 links 연결, app.rs·ui/workspace.rs의 네이티브 큐 분리/오류 전달, ui/notifications.rs·bench.rs의 유계 알림/중복 할당 억제, ui/file_tree.rs의 목록 캐시 유지/순회 재조회, 로케일 5개, 이 인계 문서, docs/investigations/2026-09-18-agent-running-idle-audit.md. 앞선 폴더 정리 감사 기록도 보존한다.
+- 커밋 전 실패/보완: 최초 앱 strict clippy에서 `push_status_with_dedupe`의 인자 8개가 too_many_arguments로 실패했다(`/tmp/deppy-commit-clippy-20260918.log`, exit101). allow로 숨기지 않고 `AgentNotificationSource::Workspace(WorkspaceErrorKind)`에 오류 종류를 담아 별도 필드·인자를 제거했다. 중복 알림 비교도 같은 출처를 사용하며 기존 동작은 유지한다. 새 기능·타이머·스레드 없음.
+- 실제 최종 게이트: `cargo fmt --all -- --check`, `cargo clippy --locked -p deppy-sijo --bin deppy-sijo -- -D warnings`, `cargo run --locked -p xtask -- check-boundary`, `cargo run --locked -p xtask -- i18n-check`, `git diff --check` 모두 exit0. Cargo 실행 환경은 `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target`. 로그 `/tmp/deppy-commit-{fmt-final,clippy-final,boundary,i18n,diff}-20260918.log`. i18n은 1216개 리터럴 키를 5개 로케일과 대조했고 동적 호출78건은 정적 검증 범위 밖이다.
+- 보완 후 집중 검사: 같은 환경에서 `cargo test --locked -p deppy-sijo --bin deppy-sijo --features bench-alloc ui::notifications::tests:: -- --nocapture` **25 PASS / 0 FAIL / 2288 filtered**(`/tmp/deppy-commit-notifications-20260918.log`). 중복1000건 추가 할당0, 연속 MCP 승인, 세션/워크스페이스별 중복 판정 및 보관 상한을 기존 검사로 확인했다. 이전 폴더11건/상태8건은 로그를 다시 확인했고 반복 실행하지 않았다. 전체 suite·실제 화면 검증은 별도 수행하지 않았다.
+- 남은 작업: 비활성 세션의 장시간 작업→지시 대기 오분류는 조사만 완료했고 제품 수정은 아직 없다. 현재 앱 PID85155/92859ff bundle에는 이번 누적 수정이 미적용이다. 이번 요청에서는 release 재빌드·재실행·main 머지·배포를 하지 않는다. 앱 적용과 화면 확인은 새 승인 후 진행한다.
+- 다음 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git log -1 --oneline`; `git rev-parse HEAD`; `git ls-remote --heads origin fix/environment-api-context-integration`; `cat docs/investigations/2026-09-18-agent-running-idle-audit.md`. 예정 push 명령은 `git push -u origin fix/environment-api-context-integration`이며 force-push는 사용하지 않는다. 새 변경이 없으면 통과한 검사를 반복하지 않는다.

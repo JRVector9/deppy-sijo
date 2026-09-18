@@ -50,6 +50,8 @@ license = "MIT OR Apache-2.0"
 eframe = { version = "0.36", default-features = false, features = [
     "accesskit",
     "default_fonts",
+    # 공지 등 ctx.open_url 요청을 OS 기본 브라우저로 전달한다.
+    "links",
     "wgpu",
 ] }
 egui = "0.36"

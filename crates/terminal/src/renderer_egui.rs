@@ -182,6 +182,9 @@ pub struct TerminalRenderCache {
     scroll_offset: i32,
     is_alt_screen: bool,
     font_size_bits: u32,
+    /// egui의 빈 갤리 캐시를 글꼴 저장소 세대 표식으로 쓴다. 배율·폰트·atlas가
+    /// 바뀌면 새 Arc가 반환되므로 오래된 글리프 UV/크기를 재사용하지 않는다.
+    font_cache_key: Option<Arc<egui::Galley>>,
     rows_cache: Vec<Option<RowRenderCache>>,
     counters: RenderCounters,
     /// 마지막으로 dirty를 소비한 스냅샷 세대. `snapshot.dirty_ranges`는 "그 스냅샷이
@@ -199,6 +202,7 @@ impl TerminalRenderCache {
         self.scroll_offset = 0;
         self.is_alt_screen = false;
         self.font_size_bits = 0;
+        self.font_cache_key = None;
         self.counters = RenderCounters::default();
         self.last_gen = None;
     }
@@ -213,7 +217,13 @@ impl TerminalRenderCache {
         self.last_gen != Some(generation)
     }
 
-    fn prepare(&mut self, snapshot: &TerminalViewportSnapshot, font_size: f32, generation: u64) {
+    fn prepare(
+        &mut self,
+        snapshot: &TerminalViewportSnapshot,
+        font_size: f32,
+        generation: u64,
+        font_cache_key: Arc<egui::Galley>,
+    ) {
         self.counters = RenderCounters::default();
         self.last_gen = Some(generation);
         let font_size_bits = font_size.to_bits();
@@ -222,6 +232,10 @@ impl TerminalRenderCache {
             || self.scroll_offset != snapshot.scroll_offset
             || self.is_alt_screen != snapshot.is_alt_screen
             || self.font_size_bits != font_size_bits
+            || self
+                .font_cache_key
+                .as_ref()
+                .is_none_or(|key| !Arc::ptr_eq(key, &font_cache_key))
             || self.rows_cache.len() != snapshot.rows as usize;
         if shape_changed {
             self.cols = snapshot.cols;
@@ -229,6 +243,7 @@ impl TerminalRenderCache {
             self.scroll_offset = snapshot.scroll_offset;
             self.is_alt_screen = snapshot.is_alt_screen;
             self.font_size_bits = font_size_bits;
+            self.font_cache_key = Some(font_cache_key);
             self.rows_cache.clear();
             self.rows_cache.resize_with(snapshot.rows as usize, || None);
         }
@@ -557,7 +572,10 @@ pub fn draw(
     let dirty_fresh = cache.dirty_is_fresh(snapshot_gen);
     // line_height는 갤리 shaping에 영향을 주지 않는다(글자를 그리는 y 위치만 바뀐다) —
     // 캐시 무효화 기준은 font_size 그대로다.
-    cache.prepare(snapshot, metrics.font_size, snapshot_gen);
+    // 빈 job은 문자열/섹션 버퍼를 할당하지 않고, egui가 같은 배율에서 같은 Arc를
+    // 재사용한다. 글자 atlas 재생성도 감지하되 정상 idle 프레임은 행을 다시 만들지 않는다.
+    let font_cache_key = painter.layout_job(egui::text::LayoutJob::default());
+    cache.prepare(snapshot, metrics.font_size, snapshot_gen, font_cache_key);
     cache.counters.shapes += 1; // 위 배경 rect_filled
     for row in 0..snapshot.rows as usize {
         let dirty = dirty_fresh && row_is_dirty(snapshot, row);
@@ -578,6 +596,7 @@ pub fn draw(
                 &font_id,
                 SNAPSHOT_DEFAULT_BG,
                 bold_family_ready,
+                cell.x,
             );
             if let Some(slot) = cache.rows_cache.get_mut(row) {
                 *slot = Some(row_cache);
@@ -796,6 +815,7 @@ fn build_row_cache(
     font_id: &egui::FontId,
     default_bg: egui::Color32,
     bold_family_ready: bool,
+    cell_width: f32,
 ) -> RowRenderCache {
     let cols = snapshot.cols as usize;
     let row_start = row * cols;
@@ -828,29 +848,56 @@ fn build_row_cache(
     let mut pending = PendingTextRun::default();
     for (col, term_cell) in cells.iter().enumerate() {
         if term_cell.wide_spacer || term_cell.c == ' ' {
-            pending.flush(&mut text_runs, painter, font_id, bold_family_ready);
+            pending.flush(
+                &mut text_runs,
+                painter,
+                font_id,
+                bold_family_ready,
+                cell_width,
+            );
             continue;
         }
 
         let fg = rgb(term_cell.fg);
         let attrs = term_cell.attrs;
         if term_cell.wide {
-            pending.flush(&mut text_runs, painter, font_id, bold_family_ready);
+            pending.flush(
+                &mut text_runs,
+                painter,
+                font_id,
+                bold_family_ready,
+                cell_width,
+            );
             let text = display_char(term_cell.c).to_string();
             text_runs.push(RowTextRun {
                 col,
-                galley: layout_attr_text(painter, text, font_id, fg, attrs, bold_family_ready),
+                galley: fit_galley_to_cells(
+                    layout_attr_text(painter, text, font_id, fg, attrs, bold_family_ready),
+                    cell_width * 2.0,
+                ),
                 color: fg,
                 scaled: None,
             });
         } else {
             if pending.needs_flush(col, fg, attrs) {
-                pending.flush(&mut text_runs, painter, font_id, bold_family_ready);
+                pending.flush(
+                    &mut text_runs,
+                    painter,
+                    font_id,
+                    bold_family_ready,
+                    cell_width,
+                );
             }
             pending.push(col, display_char(term_cell.c), fg, attrs);
         }
     }
-    pending.flush(&mut text_runs, painter, font_id, bold_family_ready);
+    pending.flush(
+        &mut text_runs,
+        painter,
+        font_id,
+        bold_family_ready,
+        cell_width,
+    );
 
     RowRenderCache {
         bg_runs,
@@ -893,6 +940,7 @@ impl PendingTextRun {
         painter: &egui::Painter,
         font_id: &egui::FontId,
         bold_family_ready: bool,
+        cell_width: f32,
     ) {
         let Some(color) = self.color.take() else {
             return;
@@ -904,11 +952,78 @@ impl PendingTextRun {
         let attrs = std::mem::take(&mut self.attrs);
         text_runs.push(RowTextRun {
             col: self.start_col,
-            galley: layout_attr_text(painter, text, font_id, color, attrs, bold_family_ready),
+            galley: fit_galley_to_cells(
+                layout_attr_text(painter, text, font_id, color, attrs, bold_family_ready),
+                cell_width,
+            ),
             color,
             scaled: None,
         });
     }
+}
+
+/// 폰트의 advance 대신 backend가 정한 셀 폭으로 배치한다. D2Coding의 ① 같은
+/// 기호는 1셀 문자지만 폰트에서는 2셀 폭이라 뒤의 한글이나 다음 run을 침범한다.
+/// 폭이 맞는 run은 원본 Arc를 그대로 쓰고, 보정은 행 캐시 생성 때 한 번만 한다.
+/// 이 갤리는 painter 전용이며 선택·커서·복사는 원래 snapshot의 셀 좌표를 사용한다.
+fn fit_galley_to_cells(mut galley: Arc<egui::Galley>, glyph_cell_width: f32) -> Arc<egui::Galley> {
+    if !glyph_cell_width.is_finite()
+        || glyph_cell_width <= 0.0
+        || !galley.rows.iter().any(|row| {
+            row.glyphs
+                .iter()
+                .any(|glyph| (glyph.advance_width - glyph_cell_width).abs() > 0.01)
+        })
+    {
+        return galley;
+    }
+
+    let fitted = Arc::make_mut(&mut galley);
+    fitted.mesh_bounds = egui::Rect::NOTHING;
+    fitted.rect.max.x = fitted.rect.min.x;
+    for placed in &mut fitted.rows {
+        let row = Arc::make_mut(&mut placed.row);
+        for (index, glyph) in row.glyphs.iter_mut().enumerate() {
+            let old_pos = glyph.pos;
+            let new_x = index as f32 * glyph_cell_width;
+            if !glyph.uv_rect.is_nothing() {
+                // epaint는 글리프 하나에 네 꼭짓점을 둔다. UV와 색은 유지한다.
+                let start = glyph.first_vertex as usize;
+                if let Some(vertices) = row.visuals.mesh.vertices.get_mut(start..start + 4) {
+                    let mut left = 0.0_f32;
+                    let mut right = glyph.advance_width;
+                    for vertex in vertices.iter() {
+                        left = left.min(vertex.pos.x - old_pos.x);
+                        right = right.max(vertex.pos.x - old_pos.x);
+                    }
+                    // 넘치는 글자만 종횡비를 유지해 줄인다. 정상 글자는 위치만 맞춘다.
+                    let scale = if glyph.advance_width > glyph_cell_width + 0.01 {
+                        (glyph_cell_width / (right - left)).min(1.0)
+                    } else {
+                        1.0
+                    };
+                    let inset = if scale < 1.0 { -left * scale } else { 0.0 };
+                    let center_y = old_pos.y - glyph.font_ascent * 0.5;
+                    for vertex in vertices {
+                        vertex.pos.x = new_x + inset + (vertex.pos.x - old_pos.x) * scale;
+                        vertex.pos.y = center_y + (vertex.pos.y - center_y) * scale;
+                    }
+                    glyph.pos.y = center_y + (old_pos.y - center_y) * scale;
+                    glyph.font_ascent *= scale;
+                    glyph.font_height *= scale;
+                    glyph.font_face_ascent *= scale;
+                    glyph.font_face_height *= scale;
+                }
+            }
+            glyph.pos.x = new_x;
+            glyph.advance_width = glyph_cell_width;
+        }
+        row.size.x = row.glyphs.len() as f32 * glyph_cell_width;
+        row.visuals.mesh_bounds = row.visuals.mesh.calc_bounds();
+        fitted.mesh_bounds |= row.visuals.mesh_bounds.translate(placed.pos.to_vec2());
+        fitted.rect.max.x = fitted.rect.max.x.max(placed.pos.x + row.size.x);
+    }
+    galley
 }
 
 /// 밑줄·취소선 런을 만든다(2026-08-21). 공백 셀도 SGR 속성을 물고 있으므로 함께 이어
@@ -1340,19 +1455,20 @@ mod tests {
     }
 
     fn draw_for_test(
+        ctx: &egui::Context,
         cache: &mut TerminalRenderCache,
         snapshot: &TerminalViewportSnapshot,
     ) -> usize {
-        draw_gen_for_test(cache, snapshot, next_gen())
+        draw_gen_for_test(ctx, cache, snapshot, next_gen())
     }
 
     /// 세대를 명시해 draw — 같은 세대 재draw(= 같은 스냅샷 repaint)를 재현한다.
     fn draw_gen_for_test(
+        ctx: &egui::Context,
         cache: &mut TerminalRenderCache,
         snapshot: &TerminalViewportSnapshot,
         generation: u64,
     ) -> usize {
-        let ctx = egui::Context::default();
         ctx.run_ui(egui::RawInput::default(), |ui| {
             ui.set_min_size(egui::vec2(500.0, 200.0));
             draw(
@@ -1884,27 +2000,28 @@ mod tests {
 
     #[test]
     fn render_cache는_dirty_row만_재구성한다() {
+        let ctx = egui::Context::default();
         let mut cache = TerminalRenderCache::default();
         let first = snap(4, 3, &["aaaa", "bbbb", "cccc"]);
-        assert_eq!(draw_for_test(&mut cache, &first), 3);
+        assert_eq!(draw_for_test(&ctx, &mut cache, &first), 3);
 
         let mut second = snap(4, 3, &["aaaa", "bbxb", "cccc"]);
         second.dirty_ranges = vec![CellRange { start: 4, end: 8 }];
-        assert_eq!(draw_for_test(&mut cache, &second), 1);
+        assert_eq!(draw_for_test(&ctx, &mut cache, &second), 1);
 
         let mut cursor_only = second.clone();
         cursor_only.cursor.col = 2;
         cursor_only.dirty_ranges.clear();
-        assert_eq!(draw_for_test(&mut cache, &cursor_only), 0);
+        assert_eq!(draw_for_test(&ctx, &mut cache, &cursor_only), 0);
     }
 
     #[test]
     fn render_counters는_dirty_painted_shapes를_집계한다() {
         fn counters(
+            ctx: &egui::Context,
             cache: &mut TerminalRenderCache,
             snapshot: &TerminalViewportSnapshot,
         ) -> RenderCounters {
-            let ctx = egui::Context::default();
             let mut out = RenderCounters::default();
             ctx.run_ui(egui::RawInput::default(), |ui| {
                 ui.set_min_size(egui::vec2(500.0, 200.0));
@@ -1924,9 +2041,10 @@ mod tests {
             out
         }
 
+        let ctx = egui::Context::default();
         let mut cache = TerminalRenderCache::default();
         let first = snap(4, 3, &["aaaa", "bbbb", "cccc"]);
-        let c = counters(&mut cache, &first);
+        let c = counters(&ctx, &mut cache, &first);
         // 첫 프레임: dirty_ranges는 비었지만 캐시 미스로 3행 전부 재구성 + 3행 전부 페인트.
         assert_eq!(c.dirty_rows, 0);
         assert_eq!(c.rows_rebuilt, 3);
@@ -1937,7 +2055,7 @@ mod tests {
         // 2프레임: 1행만 dirty → 재구성 1행, 페인트는 여전히 전체 행(shape 발행은 매 프레임).
         let mut second = snap(4, 3, &["aaaa", "bbxb", "cccc"]);
         second.dirty_ranges = vec![CellRange { start: 4, end: 8 }];
-        let c = counters(&mut cache, &second);
+        let c = counters(&ctx, &mut cache, &second);
         assert_eq!(c.dirty_rows, 1);
         assert_eq!(c.rows_rebuilt, 1);
         assert_eq!(c.rows_painted, 3);
@@ -2115,6 +2233,7 @@ mod tests {
     /// 세대가 같으면 dirty는 이미 소비된 것으로 보고 재빌드하지 않아야 한다.
     #[test]
     fn 같은_스냅샷_재draw는_행을_재구성하지_않는다() {
+        let ctx = egui::Context::default();
         let mut snapshot = snap(6, 3, &["one", "two", "three"]);
         // 전 행 dirty인 스냅샷(대량 출력 직후 상태)
         snapshot.dirty_ranges = vec![CellRange {
@@ -2124,15 +2243,21 @@ mod tests {
         let mut cache = TerminalRenderCache::default();
         let generation = 7;
         // 첫 draw: 전 행 빌드(캐시 비어 있음)
-        assert_eq!(draw_gen_for_test(&mut cache, &snapshot, generation), 3);
+        assert_eq!(
+            draw_gen_for_test(&ctx, &mut cache, &snapshot, generation),
+            3
+        );
         // 같은 세대 재draw(= 같은 스냅샷 repaint): 재구성 0
         assert_eq!(
-            draw_gen_for_test(&mut cache, &snapshot, generation),
+            draw_gen_for_test(&ctx, &mut cache, &snapshot, generation),
             0,
             "같은 스냅샷 repaint가 전 행을 재-shaping했다 (idle 낭비 회귀)"
         );
         // 새 세대(새 스냅샷): dirty를 다시 신뢰해 재구성
-        assert_eq!(draw_gen_for_test(&mut cache, &snapshot, generation + 1), 3);
+        assert_eq!(
+            draw_gen_for_test(&ctx, &mut cache, &snapshot, generation + 1),
+            3
+        );
     }
 
     /// 2026-07-14 실측 회귀: 선택 하이라이트가 셀마다 rect를 발행해 전체 선택 시

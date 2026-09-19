@@ -3924,3 +3924,51 @@
 - 보완 후 집중 검사: 같은 환경에서 `cargo test --locked -p deppy-sijo --bin deppy-sijo --features bench-alloc ui::notifications::tests:: -- --nocapture` **25 PASS / 0 FAIL / 2288 filtered**(`/tmp/deppy-commit-notifications-20260918.log`). 중복1000건 추가 할당0, 연속 MCP 승인, 세션/워크스페이스별 중복 판정 및 보관 상한을 기존 검사로 확인했다. 이전 폴더11건/상태8건은 로그를 다시 확인했고 반복 실행하지 않았다. 전체 suite·실제 화면 검증은 별도 수행하지 않았다.
 - 남은 작업: 비활성 세션의 장시간 작업→지시 대기 오분류는 조사만 완료했고 제품 수정은 아직 없다. 현재 앱 PID85155/92859ff bundle에는 이번 누적 수정이 미적용이다. 이번 요청에서는 release 재빌드·재실행·main 머지·배포를 하지 않는다. 앱 적용과 화면 확인은 새 승인 후 진행한다.
 - 다음 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git log -1 --oneline`; `git rev-parse HEAD`; `git ls-remote --heads origin fix/environment-api-context-integration`; `cat docs/investigations/2026-09-18-agent-running-idle-audit.md`. 예정 push 명령은 `git push -u origin fix/environment-api-context-integration`이며 force-push는 사용하지 않는다. 새 변경이 없으면 통과한 검사를 반복하지 않는다.
+
+
+## 2026-09-19 Claude 터미널 원문자 숫자 겹침 수정 진행
+
+- 목표: 사용자 스크린샷의 `③의` 겹침 수정. 현재 HEAD e5e6614는 origin/fix/environment-api-context-integration에 푸시돼 있고 작업 시작 시 clean이었다. 실제 작업 경로는 /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit.
+- 원인 확인: 설정의 터미널 항목만 읽어 D2Coding Regular/14pt/line_height1.1 확인. 실제 AlacrittyBackend와 renderer_egui::draw를 독립 진단에서 실행했다. `③`은 backend wide=false(1셀), 셀 폭7pt인데 폰트 advance14pt다. `③의`에서 ③ 시작549/end563, 의 시작556으로 겹친다. 같은 narrow run의 `②(`도 괄호가 셀 격자보다7pt 밀린다. 반복 프레임/Claude 내용 중복 문제가 아니라 폰트 폭과 backend 셀 폭의 불일치다.
+- 진단: 임시 crates/terminal/examples/circled_width_probe.rs를 `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo run --locked -p terminal --example circled_width_probe`로 실행 exit0. /tmp/deppy-circled-width-20260919/before.log, before.html에 실제 셀/글리프 좌표와 atlas/mesh 재현을 보관했다. 앱 release 빌드·재실행은 하지 않았다. CUA 브라우저는 No browser is available이어서 격리된 WebKit 스냅샷으로 재현 화면을 확인 중이다.
+- 설계: backend 문자/셀 수·선택/복사 계약을 유지하고, 폰트 advance가 셀 폭과 다른 run만 캐시 생성 때 한 번 정렬/크기 보정한다. ASCII 묶음과 한글 2셀 배치, 기존 행/축소 캐시를 보존한다. 글리프 크기는 비율을 유지해 셀에 맞추며 새 타이머/프레임 반복 보정은 추가하지 않는다.
+- 참고: Unicode UAX #11의 ambiguous 폭 설명(https://www.unicode.org/reports/tr11/tr11-43.html) 및 Ghostty 유지보수자의 폰트 폭/셀 내 기호 축소 설명(https://github.com/ghostty-org/ghostty/discussions/9161). 원인 판정은 외부 사례가 아니라 위 로컬 실제 좌표에 근거한다.
+- 남음: renderer 수정 및 같은 진단으로 전후 좌표/화면 비교, 기존 리사이즈·선택/캐시 경로 검토. UI 수정이라 새 회귀 테스트/전체 게이트를 확장하지 않는다. 임시 진단 소스는 /tmp에 보존한 뒤 작업 트리에서 제거한다. 사용자 재빌드·재실행 승인은 아직 없음. 정확한 재개 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git diff -- crates/terminal/src/renderer_egui.rs`; `cat /tmp/deppy-circled-width-20260919/before.log`.
+
+
+### 2026-09-19 원문자 숫자 겹침 소스 수정·재현 화면 확인 완료
+
+- 완료 파일: `crates/terminal/src/renderer_egui.rs`, 이 인계 문서. `fit_galley_to_cells`로 glyph advance와 backend 셀 폭이 불일치하는 run만 행 캐시 생성 시 정렬한다. 같은 run 뒤의 괄호/영문 위치도 셀 기준으로 바로잡는다. 넘치는 기호는 종횡비를 유지해 축소하고, 한글은 기존2셀 폭을 사용한다. UV/색/문자/PTY 내용/선택·복사 좌표는 그대로이며 기본 ASCII run·그리기 호출 수·행/축소 캐시 구조도 유지한다. glyph bounds도 보정해 옆 셀을 침범하지 않는다.
+- 실제 검증: 수정 전 `/tmp/deppy-circled-width-20260919/before.log`의 `③의`에서 ③ origin549/end563, 의 origin556. 수정 후 after.log에서 ③ origin549/end556, 의 origin556로 비중첩. `②(` 괄호 x14→7, 연속①②③④⑤의 advance14→7 확인. 같은 실제 backend+renderer 진단 명령은 exit0였고 WebKit으로 실제 atlas/mesh를 그린 before.png/after.png를 직접 확인해 원문자+한글/괄호/영문·bold 사례의 겹침 해소를 확인했다. 사용자 앱 화면을 검증한 것은 아니다.
+- 좁은 pane 확인: 최초 진단의 RawInput.screen_rect만 바꾼 시도는 run_ui의 가용 폭을 제한하지 않아 축소되지 않았다(narrow.log/narrow.png는 축소 검증 근거가 아님). 실제 workspace 호출과 같은 max_rect의 자식 Ui를 쓰도록 진단만 수정했다. 최종430pt pane에서 effective_cell 4.2pt, 재현 이미지는 narrow-final.png. 축소 상태에서도 중첩 없이 한 화면에 표시됨을 확인했다. 같은 snapshot의 첫 draw는4행 생성, 다음 idle draw는0행 재생성. narrow-final.log에 기록. D2Coding의 선/박스·화살표·그리스·악센트 문자 등 진단16종은 advance7pt 그대로이고 보정 경로에 진입하지 않는다.
+- 범위/실행 상태: scoped rustfmt와 git diff --check exit0. 새 UI 회귀 테스트·전체 suite·clippy/i18n 커밋 게이트는 실행하지 않았다. terminal 진단 바이너리만 컴파일했으며 제품 release 빌드·앱 재실행·커밋·push는 하지 않았다. 임시 example은 `/tmp/deppy-circled-width-20260919/circled_width_probe.rs`에 보존한 뒤 작업 트리에서 제거했다. 기존 실행 PID85155/92859ff에는 이번 수정 및 e5e6614 수정이 아직 미적용이다.
+- 남음/최신 사용자 지시: `재빌드 재실행은 내가 요청할때 해`. 별도 요청 전에는 빌드·재실행하지 않고 소스 수정 상태로 대기한다. 적용 승인 질문을 반복하지 않는다. 사용자가 적용을 요청하면 이전 누적 수정과 함께 새 signed release bundle을 만들고 정확한 현재 PID/경로를 확인해 재실행한 뒤 사용자 Claude 출력에서 확인한다. 원문자 크기는 한 셀에 맞게 작아지는 것이 의도된 동작이다. 비활성 세션 상태 오분류 후속 개발은 별도 미완료로 유지한다.
+- 다음 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git diff -- crates/terminal/src/renderer_egui.rs`; `cat /tmp/deppy-circled-width-20260919/after.log`; `cat /tmp/deppy-circled-width-20260919/narrow-final.log`; `ps -o pid,etime,comm -p 85155`. 진단 재실행이 꼭 필요하면 `/tmp/deppy-circled-width-20260919/circled_width_probe.rs`를 `crates/terminal/examples/circled_width_probe.rs`로 복사하고 위 cargo run 명령을 사용한다(앱 재실행 없음). 통과한 진단은 새 변경이 없으면 반복하지 않는다.
+
+
+## 2026-09-19 유사 표시 오류 추가 점검 진행
+
+- 목표: 원문자 폭 수정 주변의 style/문자/폰트 배율/축소/선택·복사 경로를 점검. 사용자 `재빌드 재실행은 내가 요청할때 해` 유지, 앱 적용 질문도 반복하지 않는다.
+- 발견1/보완 중: TerminalRenderCache는 font_size/snapshot 크기만 확인해 DPI·글꼴 정의·atlas 재생성 뒤에도 이전 galley UV를 재사용한다. 독립 진단 `/tmp/deppy-render-related-20260919/before.log`에서 DPI2→1인데 cached galley_ppp2/rebuild0, fresh ppp1/rebuild8; 폰트 변경/atlas 재생성도 cached mesh가 초기와 같고 새 draw와 다르다. font-cached.png에서 글자 소실을 확인했다. atlas 재생성은 font_hinting 옵션 변경으로 동일한 Fonts::begin_pass 재생성 경로를 호출한 것이며 실제 저장소80% 포화까지 부하를 건 검사는 아니다.
+- 설계: 같은 빈 LayoutJob의 Arc를 egui 글꼴 캐시 세대 표식으로 저장한다. egui0.36의 job 캐시는 DPI를 키에 포함하고 정의/atlas 재생성 때 비워진다. 빈 job은 문자열·sections 힙 버퍼를 만들지 않으며 같은 프레임/idle에서 Arc가 재사용됨을 진단에서 확인했다. 표식이 달라질 때만 기존 행/축소 캐시를 버리고 새 galley를 만든다. 기존 cache 검사 helper가 매 draw마다 Context를 새로 만들던 부분은 실제 앱처럼 두 기존 검사 안에서 같은 Context를 넘기도록 정정한다. 회귀 검사 삭제/새 UI 테스트 추가 없음.
+- 발견2/남음: composed_char/compose_cluster와 TerminalCell.c 단일 char 계약 때문에 NFC 한 문자로 합쳐지지 않는 결합 문자는 base만 남는다. 실제 backend+renderer selection 진단에서 `x + U+0301`→`x`, `1 + VS16 + U+20E3`→`1`, `👩 + ZWJ + 💻`→`👩💻`. 기본 NFD 한글→가, e+acute→é는 정상이다. 셀 snapshot/선택 복사·wire/양 backend 계약 변경이 필요한 별도 결함으로 기록하며 이번 폭 보정으로 해결됐다고 주장하지 않는다.
+- 진단 실행: `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo run --locked -p terminal --example render_related_audit` exit0. terminal 독립 예제만 컴파일, 제품 앱 빌드/재실행 없음. 제한된 글꼴 fixture의 미보유 emoji가 네모로 나온 것은 실제 앱의 fallback 설치 결함으로 판정하지 않는다. 다음은 같은 진단의 cached/fresh 좌표·화면 비교, 이후 임시 예제 제거와 최종 기록이다.
+
+
+### 2026-09-19 유사 표시 오류 점검 완료 / 캐시 보완 완료
+
+- 완료: renderer_egui.rs의 TerminalRenderCache에 빈 galley Arc 한 개를 보관해 egui 글꼴 캐시의 실제 교체를 감지한다. DPI·폰트 정의·atlas 재생성이 있어야 행/축소 cache를 교체하고, 정상 idle과 pane 축소에서는 기존 cache를 재사용한다. 타이머/스레드/전역 무제한 캐시 추가 없음. 관련 기존 검사3개의 helper가 같은 Context를 공유하도록 수정했고 검사/assertion은 보존했다. 이전 기록의 '두 기존 검사'에서 별도 counters helper 한 곳을 추가 발견해 총3개로 정정한다.
+- 수정 후 실제 독립 진단: 같은 cargo run 명령 exit0(`/tmp/deppy-render-related-20260919/after.log`). DPI cached/fresh 모두 ppp1·mesh a430372874f40780, font 변경 둘 다766210785a38274b, atlas 재생성 둘 다a2ff710ffa11274b로 일치. 자원 변경 직후에만8행 재생성, 초기 idle 및 좁은 pane/좁은 pane idle은0행 재생성. 전체 앱 RSS/성능 수치를 측정한 것은 아니다.
+- 재현 화면 확인: 글자가 사라졌던 font-cached.png와 수정 후 font-cached-after.png, atlas-cached-after.png를 직접 확인했다. 기본 D2Coding 원문자+한글·영문·괄호, bold/italic, 밑줄/취소선, 박스·선·화살표, 선택 강조 사례에서 추가 겹침을 발견하지 못했다. 재현 화면은 실제 egui atlas와 mesh를 격리된 WebKit에서 그린 것으로 사용자 실행 앱의 GPU/실제 Claude 세션 검증을 대신하지 않는다. 제한된 폰트 fixture의 미보유 glyph 네모는 앱 fallback 버그로 판정하지 않았다.
+- 미해결 확인 사항: `crates/terminal/src/alacritty_backend.rs::composed_char`, ghostty_backend.rs::compose_cluster와 TerminalCell.c 단일 scalar 표현 때문에 NFC 단일자로 합쳐지지 않는 accent/키캡/ZWJ 결합 문자가 viewport와 renderer selection_text에서 손실된다. x+acute→x, 1+VS16+keycap→1, woman+ZWJ+laptop→woman+laptop. 이 경로는 앱의 선택 복사/선택 저장에서도 사용된다. 입력 원문을 지우는 backend 저장소 손실로 단정하지 않고, 화면/선택 투영의 손실로 기록한다. 양 backend·snapshot/wire·그리기·복사에 grapheme 보존을 설계해야 하므로 이번 renderer 폭·캐시 보완에 섞어 변경하지 않았다.
+- 변경 파일/검사 범위: 제품 수정은 renderer_egui.rs, 기록은 docs/CODEX_HANDOFF.md. scoped rustfmt와 git diff --check exit0. 새 UI 회귀 테스트·전체 suite·clippy/i18n 게이트·제품 release 빌드·앱 재실행·커밋·push 미실행. 임시 예제는 `/tmp/deppy-render-related-20260919/render_related_audit.rs`로 보존 후 저장소에서 제거했다. 마지막 제품 컴파일은 독립 terminal 진단 실행이며 테스트 통과로 바꿔 말하지 않는다.
+- 다음: 사용자가 재빌드·재실행을 요청할 때만 앱 적용. 남은 결합 문자 보존은 별도 추가 개발 사항이다. 정확한 확인 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git diff -- crates/terminal/src/renderer_egui.rs`; `cat /tmp/deppy-render-related-20260919/after.log`; `ps -o pid,etime,comm -p 85155`. 새 변경이 없으면 통과한 진단을 반복하지 않는다. 커밋 요청 시 필수 gate를 한 번 실행한다.
+
+
+## 2026-09-19 렌더 수정 커밋 / 세션 드래그 후속 작업
+
+- 사용자 요청: 현재 수정을 커밋하고 세션을 드래그로 옮길 수 있게 보완한 뒤 다시 코드 리뷰한다. 앱 재빌드·재실행은 새 요청이 있을 때만 한다. 기본 대상은 왼쪽 워크스페이스의 세션 행 순서이며 선택적 확인 질문을 보냈다.
+- 렌더 수정 커밋 전 gate: 공통 환경 `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target`. `cargo fmt --all -- --check`, `cargo clippy --locked -p terminal --all-targets -- -D warnings`, `cargo run --locked -p xtask -- check-boundary`, `cargo run --locked -p xtask -- i18n-check`, `git diff --check` 모두 실제 실행 exit0. 로그 `/tmp/deppy-render-commit-{fmt,clippy,boundary,i18n,diff}-20260919.log`. i18n은 리터럴1216건/로케일5개/동적78건 정적 범위 밖. 전체 기능 suite를 실행한 것은 아니다.
+- 완료 파일: crates/terminal/src/renderer_egui.rs와 이 문서. 이전 독립 진단의 겹침 해소·DPI/폰트/atlas 갱신 검증 결과는 위 절을 따른다. 앱 release 빌드·재실행·push 없음.
+- 후속 조사: file_tree.rs의 draggable_session_row/session_reorder_drop 및 app.rs의 ReorderSessions, config의 workspace_session_order가 이미 있다. 새 방식으로 중복 구현하지 않고 실제 입력·드롭·저장 연결을 검토한다. 세션 UI 코드는 아직 변경하지 않았다.
+- 다음 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git log -1 --oneline`; `rg -n 'draggable_session_row|session_reorder_drop|ReorderSessions|workspace_session_order' crates/app/src`. 원문자 수정의 통과한 gate는 새 renderer 변경이 없으면 반복하지 않는다.

@@ -44,7 +44,7 @@ pub struct SessionEntry {
     pub last_output_at: Option<i64>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum SessionRowTarget {
     Live {
         workspace_id: String,
@@ -2765,6 +2765,7 @@ impl FileTreeUi {
                 }
             },
         );
+        finish_session_row_drag_frame(ui.ctx());
         let resizing_workspace_split = self.workspace_split_handle(
             ui,
             workspace_section.response.rect.bottom(),
@@ -5861,11 +5862,79 @@ fn draggable_session_row(
     entry: &SidebarSessionRow,
     accent_color: egui::Color32,
 ) -> egui::Response {
-    let response = session_row_impl(ui, entry, None, accent_color, egui::Sense::click_and_drag());
-    if response.drag_started_by(egui::PointerButton::Primary) {
-        response.dnd_set_drag_payload(SessionRowDragPayload::new(entry.target.clone()));
-    }
+    let response = session_row_impl(ui, entry, None, accent_color, egui::Sense::click_and_drag())
+        .on_hover_cursor(egui::CursorIcon::Grab);
+    session_row_drag_source(&response, &entry.target);
     response
+}
+
+/// 클릭 판정 중 이동·해제가 한 프레임에 도착하면 egui의 drag_started가 생략된다.
+/// 눌린 행의 정확한 ID와 시작점 한 개만 보관해 빠른 드롭도 같은 경로로 처리한다.
+#[derive(Clone, Copy)]
+struct SessionRowPress {
+    row_id: egui::Id,
+    origin: egui::Pos2,
+}
+
+fn session_row_drag_source(response: &egui::Response, target: &SessionRowTarget) {
+    let ctx = &response.ctx;
+    let key = egui::Id::new("sidebar_session_press");
+    let threshold = ctx.options(|options| options.input_options.max_click_dist);
+    let (press_origin, released, cancelled, pointer) = ctx.input(|input| {
+        (
+            input
+                .pointer
+                .button_pressed(egui::PointerButton::Primary)
+                .then(|| input.pointer.press_origin())
+                .flatten(),
+            input.pointer.button_released(egui::PointerButton::Primary),
+            input.key_pressed(egui::Key::Escape) || !input.focused,
+            input.pointer.interact_pos(),
+        )
+    });
+    if cancelled {
+        ctx.data_mut(|data| data.remove::<SessionRowPress>(key));
+        return;
+    }
+    if !response.enabled() {
+        return;
+    }
+    if response.is_pointer_button_down_on()
+        && let Some(origin) = press_origin
+    {
+        ctx.data_mut(|data| {
+            data.insert_temp(
+                key,
+                SessionRowPress {
+                    row_id: response.id,
+                    origin,
+                },
+            )
+        });
+    }
+    let fast_drop = released
+        && !egui::DragAndDrop::has_any_payload(ctx)
+        && ctx
+            .data(|data| data.get_temp::<SessionRowPress>(key))
+            .is_some_and(|press| {
+                press.row_id == response.id
+                    && pointer.is_some_and(|pos| pos.distance(press.origin) > threshold)
+            });
+    if response.drag_started_by(egui::PointerButton::Primary) || fast_drop {
+        egui::DragAndDrop::set_payload(ctx, SessionRowDragPayload::new(target.clone()));
+        ctx.data_mut(|data| data.remove::<SessionRowPress>(key));
+    }
+}
+
+fn finish_session_row_drag_frame(ctx: &egui::Context) {
+    if ctx.input(|input| {
+        !input.pointer.button_down(egui::PointerButton::Primary)
+            || input.key_pressed(egui::Key::Escape)
+            || !input.focused
+    }) {
+        // 원래 행이 닫히거나 그룹이 접혀도 버튼 해제 뒤 후보를 남기지 않는다.
+        ctx.data_mut(|data| data.remove::<SessionRowPress>(egui::Id::new("sidebar_session_press")));
+    }
 }
 
 /// 이름 인라인 편집 중인 행 — 레일/보조 행(2·3행)은 그대로 유지하고 **제목 자리만**
@@ -6183,7 +6252,10 @@ fn session_row_impl(
     // (2026-08-11 사용자: 「arteawiki 아래 arteawiki 셋」이 서로 구분이 안 된다).
     // 그 줄을 빼고 **하는 일**을 1행으로 올린다.
     let row_h = SESSION_ROW_HEIGHT;
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), sense);
+    let (_, rect) = ui.allocate_space(egui::vec2(ui.available_width(), row_h));
+    // 행의 위치가 바뀌거나 앞 세션이 닫혀도 입력 대상은 같은 runtime/tab/pane이다.
+    let id = egui::Id::new(("sidebar_session_row", &entry.target));
+    let resp = ui.interact(rect, id, sense);
     // 제목은 painter galley로 그리므로 별도 접근성 라벨이 없으면 키보드/스크린리더와
     // kittest가 세션 행을 식별할 수 없다. 클릭 행 자체를 제목이 있는 버튼으로 노출한다.
     resp.widget_info(|| {

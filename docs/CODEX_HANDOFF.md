@@ -3972,3 +3972,29 @@
 - 완료 파일: crates/terminal/src/renderer_egui.rs와 이 문서. 이전 독립 진단의 겹침 해소·DPI/폰트/atlas 갱신 검증 결과는 위 절을 따른다. 앱 release 빌드·재실행·push 없음.
 - 후속 조사: file_tree.rs의 draggable_session_row/session_reorder_drop 및 app.rs의 ReorderSessions, config의 workspace_session_order가 이미 있다. 새 방식으로 중복 구현하지 않고 실제 입력·드롭·저장 연결을 검토한다. 세션 UI 코드는 아직 변경하지 않았다.
 - 다음 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git log -1 --oneline`; `rg -n 'draggable_session_row|session_reorder_drop|ReorderSessions|workspace_session_order' crates/app/src`. 원문자 수정의 통과한 gate는 새 renderer 변경이 없으면 반복하지 않는다.
+
+
+### 2026-09-19 렌더 커밋 완료 / 세션 빠른 드래그 보완 중
+
+- 기존 renderer·캐시 수정과 handoff를 **7c8636b**로 커밋했다. push 없음.
+- 실제 앱 조사: CUA로 PID85155의 기존 세션 목록을 확인하고 Design 행을 두 차례 드래그했다. 목록/설정의 workspace_session_order가 바뀌지 않았으나 CUA 관찰만으로 프레임 합침을 실제 원인이라고 단정하지 않는다. 앱 재기동이나 세션 입력은 하지 않았다.
+- 독립 입력 재현: 실제 draggable_session_row/session_reorder_drop/순서 함수를 추출한 egui 진단에서 보통 press→move→release는 [A,B,C]→[B,C,A], move+release가 같은 프레임이면 기존 drag_started가 생략되어 [A,B,C] 그대로였다. `/tmp/deppy-session-drag-20260919/before.log`. 원래 행 painter는 진단용 사각형으로 대체했으므로 전체 앱 시각 검증은 아니다.
+- 구현: file_tree.rs에서 눌린 행 ID·시작점 하나만 임시 보관하고, 실제 버튼 해제 때 임계 거리 이상 이동했다면 기존 typed payload/drop 경로에 전달한다. UI 입력 ID를 위치가 아닌 정확한 workspace/runtime/tab/pane/session target으로 고정한다. hover Grab 커서를 제공하며 세션 실행/pane배치/저장스키마는 유지한다. 해제/Escape/포커스 이탈에 후보를 정리한다.
+- 수정 후 동일 진단에서 보통/합쳐진 해제 둘 다 [B,C,A]로 변경됨을 확인했다(`/tmp/deppy-session-drag-20260919/after.log`, cargo run exit0). 초기 임시 예제 컴파일은 남은 Target 별칭과 InputState 비공개 options 접근 때문에 실패했고, 별칭 수정 및 Context::options 공개 접근자로 보완했다. 제품 최종 컴파일/코드리뷰는 아직 진행 중이다.
+- 다음: 취소/클릭/소스 소멸/빠른 드롭 입력 및 저장 호출부 리뷰, 불필요한 후보 복제/무한 상태 여부 확인. 임시 crates/terminal/examples/session_drag_probe.rs는 /tmp에 보존 후 제거한다. 이후 커밋 직전 gate를 한 번 실행한다. 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git diff -- crates/app/src/ui/file_tree.rs`; `cat /tmp/deppy-session-drag-20260919/after.log`. 앱 재빌드·재실행은 별도 요청 전 하지 않는다.
+
+
+### 2026-09-19 세션 드래그 입력 검증·재리뷰 완료 / 커밋 gate 진행
+
+- 독립 진단 최종 명령: `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo run --locked -p terminal --example session_drag_probe` exit0. `/tmp/deppy-session-drag-20260919/final.log`에 일반/빠른 드래그의 [B,C,A], 클릭/Escape의 [A,B,C] 유지, 드래그 시작 행 삭제 후 [B,C] 유지와 모든 후보 정리를 확인했다. 실제 renderer/전체 앱 UI 검증이나 제품 테스트 suite 실행으로 표현하지 않는다. 진단 소스는 같은 /tmp 디렉터리에 보존하고 저장소 임시 examples 디렉터리를 제거했다.
+- 코드리뷰/수정: 같은 프레임에 press+move가 묶이는 경우 시작점을 마지막 포인터가 아닌 PointerState::press_origin으로 기록하도록 정정했다. 입력 ID에는 정확한 SessionRowTarget의 runtime/tab/pane/session까지 포함해 삭제/정렬 뒤 다른 행에 후보가 붙지 않는다. 빠른 드롭은 primary 해제+거리 초과+기존 payload 부재 조건이며 일반 클릭은 기존 활성화 경로를 유지한다. UI 비활성/Escape/포커스 이탈 및 source 제거의 후보 정리, 같은 workspace의 exact target 확인, typed payload 단일 소비, App의 순열 검증·저장/새 세션 추가/삭제 workspace 정리를 직접 리뷰했다. 새 스레드·타이머·전체 세션 내용 복제는 없고 후보는 ID+좌표 하나로 제한된다.
+- 리뷰 도구 범위: review 스킬의 필수 gstack checklist가 설치돼 있지 않아 자동 파이프라인 실행으로 주장하지 않는다. 변경 diff와 관련 호출부를 직접 검토했다. 이번 수정 범위에서 추가 확정 결함은 발견하지 못했다. 이전 grapheme 투영 손실과 warm 상태 오분류는 별도 미해결로 유지한다.
+- 남음: file_tree.rs 제품 compile/lint 및 commit gate. 새 앱 적용/실제 화면 검증은 사용자의 재빌드·재실행 요청 때 한다. 사용자 세션 드래그 대상 질문에 답은 없으므로 승인돼 있던 왼쪽 workspace 내부 세션 순서로 진행했다.
+
+
+### 2026-09-19 세션 드래그 보완·리뷰·커밋 준비 완료
+
+- 최종 gate 모두 실제 실행 exit0: `cargo fmt --all -- --check`; `cargo clippy --locked -p deppy-sijo --bin deppy-sijo --features bench-alloc -- -D warnings`; `cargo run --locked -p xtask -- check-boundary`; `cargo run --locked -p xtask -- i18n-check`; `git diff --check`. 공통 환경 `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target`. 로그 `/tmp/deppy-session-drag-{fmt,clippy,boundary,i18n,diff}-20260919.log`. clippy는 앱 target 검사1m01s, i18n은1216리터럴/5로케일/동적78건 정적 범위 밖. 전체 제품 suite나 앱 release 빌드/재실행은 하지 않았다.
+- 수정 범위는 `crates/app/src/ui/file_tree.rs`와 이 문서. renderer 수정은 이미7c8636b에 커밋됐다. 세션 보완은 별도 커밋으로 저장하며 push/main merge는 요청받지 않아 하지 않는다. 코드리뷰 범위에서 추가 확정 문제 없음. 새 세션 순서는 기존 config 경로로 저장한다.
+- 남음: 실행 중인 PID85155의 앱은 수정 전 bundle이다. 사용자 요청이 있을 때만 누적 수정으로 새 signed release bundle을 빌드·재실행해 실제 세션 행 드래그(위/아래), 삽입선, 클릭/닫기/우클릭을 화면에서 확인한다. 현재 UI 적용 완료라고 보고하지 않는다. 기존 grapheme/비활성 세션 상태 후속 개발은 이번 범위 밖 미완료다.
+- 다음 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git log -3 --oneline`; `cat /tmp/deppy-session-drag-20260919/final.log`; `tail -n 10 /tmp/deppy-session-drag-clippy-20260919.log`. 새 코드 변경이 없으면 통과한 gate를 반복하지 않는다.

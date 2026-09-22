@@ -1,5 +1,41 @@
 # Codex handoff
 
+## 재빌드 완료·재실행 차단 — 로컬 DB가 현재 브랜치보다 앞섬 (2026-09-23)
+
+- Current objective: 사용자의 요청대로 현재 체크아웃된
+  `feat/fleet-one-list-and-relay-wip`를 재빌드하고 재실행한다.
+- Completed work: 프로젝트의 필수 개발 실행 경로인 `sh scripts/dev-run.sh`로
+  `deppy-sijo`와 `mcp-proxy`를 함께 빌드했다. Cargo dev 빌드는 실제로 exit 0
+  (`Finished ... in 28.94s`)이었고, 앱 바이너리는
+  `Developer ID Application: VectorNine INC (ZDTU5LS35K)` 및 고정 identifier
+  `app.vector9.deppy-sijo`로 다시 서명됐다.
+- Runtime result: 바이너리 실행은 app creation 단계에서 exit 1로 종료됐다. 현재 브랜치의
+  `MIGRATIONS.len()`은 소스/회귀에서 38인데, 실제 사용자 DB
+  `~/Library/Application Support/app.vector9.deppy-sijo/metadata.sqlite3`의
+  `PRAGMA user_version`은 43이다. `PRAGMA integrity_check`는 실제 `ok`였다. 손상이 아니라
+  forward-only guard가 더 새 앱이 만든 DB의 다운그레이드 실행을 의도대로 거부한 것이다.
+  앱 프로세스는 현재 실행 중이지 않다.
+- Key design decision: 실제 DB의 `user_version`을 낮추거나 DB를 교체/삭제하지 않았다.
+  그렇게 하면 이후 v39~v43 마이그레이션이 중복 적용되어 사용자 데이터가 손상될 수 있다.
+  기존 DB와 `metadata.sqlite3.bak`도 수정하지 않았다.
+- Modified files: 제품 소스 변경 없음. 이번 기록을 위한 `docs/CODEX_HANDOFF.md`만 수정.
+- Tests: 테스트는 실행하지 않았다. 실행한 검증은 Cargo dev build exit 0, 코드서명 성공,
+  SQLite `user_version=43`, `integrity_check=ok`이다. 앱 launch는 실패했으므로 PASS가 아니다.
+- Failed approaches: 처음 `nohup sh scripts/dev-run.sh`를 비대화형 셸에서 분리 실행했지만
+  셸 종료와 함께 PID가 사라져 빌드 자체가 시작되지 않았다(빈 로그, 제품/DB 변경 없음).
+  지속 PTY 세션에서 같은 공식 스크립트를 다시 실행해 실제 빌드는 완료했다.
+- Latest-source resolution: 사용자가 로컬 최신 소스로 실행하라고 지시했다. 로컬 worktree
+  `/Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`의
+  `fix/environment-api-context-integration`가 v43까지 포함하고, 작업 트리가 깨끗하며 추적 원격과
+  같은 HEAD `b3de43d919541e571d1483a5f1ca54888408675e`임을 확인했다.
+- Remaining work: 이 기록을 커밋·푸시한 뒤 위 v43 worktree에서 공식
+  `sh scripts/dev-run.sh`로 재빌드·서명·실행하고 실제 PID와 시작 로그를 확인한다. 현재 v38
+  브랜치를 실제 DB에 강제로 여는 우회는 하지 않는다.
+- Exact commands for the next agent:
+  `git status --short --branch`;
+  `sqlite3 "$HOME/Library/Application Support/app.vector9.deppy-sijo/metadata.sqlite3" 'PRAGMA user_version; PRAGMA integrity_check;'`;
+  `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit && sh scripts/dev-run.sh`.
+
 ## 구현 push·PR 갱신 완료 — known-device 재접속 (2026-09-07, 추가 검사 중단)
 
 - Objective: PR #146의 URL 없는 재접속, 별도 admission grant, Mac key pin, verifier 영속화 구현.

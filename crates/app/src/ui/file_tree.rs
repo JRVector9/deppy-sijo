@@ -17,6 +17,10 @@ pub struct SessionEntry {
     /// pane의 세션 id — App의 alert(주목) 추적 키.
     pub session: Option<runtime::SessionId>,
     pub title: String,
+    /// 프로젝트/OSC 자동 제목과 구분한 사용자 지정 이름 여부.
+    pub title_is_custom: bool,
+    /// 모델은 표시 문자열을 다시 파싱하지 않고 감지 원본에서 전달한다.
+    pub agent_model: Option<String>,
     /// agent 감지 상태 (Running/NeedsApproval/Done/Error/Idle). 셸은 항상 None —
     /// status 감지는 agent만(§PR-12). 세션 행 좌측 상태 레일 색으로 그린다.
     pub status: Option<runtime::SessionStatus>,
@@ -27,9 +31,9 @@ pub struct SessionEntry {
     pub attention: bool,
     /// 알림 도착 시 이미 포커스 중이던 pane의 1회 펄스 — (진행 0..1, 알림 색).
     pub pulse: Option<(f32, egui::Color32)>,
-    /// 에이전트 2행: "Codex · gpt-5.5 · xhigh" (에이전트일 때만 Some → 3줄 렌더).
+    /// 에이전트 정보: "Codex · gpt-5.5 · xhigh". 이름 미지정 행의 둘째 줄에 쓴다.
     pub agent_line: Option<String>,
-    /// 에이전트 제목 옆 상태: "실행 중"/"유휴"/"승인 필요" 등.
+    /// 에이전트 둘째 줄 앞 상태: "실행 중"/"지시 대기"/"승인 필요" 등.
     pub status_label: Option<String>,
     /// 저장된 에이전트 세션이 있고 지금 실행 중이 아님 — 컨텍스트 메뉴 '이어가기' 노출.
     pub resumable: bool,
@@ -38,7 +42,7 @@ pub struct SessionEntry {
     /// 세션 cwd가 `.deppy/worktrees/` 하위 — 「워크트리 삭제」 메뉴 노출 조건.
     /// App이 채운다(2026-07-18).
     pub in_worktree: bool,
-    /// 에이전트 3행: 최신 에이전트 응답/진행 메시지, 없으면 터미널 현재 줄/일반 활동 설명.
+    /// 현재 작업. 이름 미지정이면 첫 줄, 지정했으면 둘째 줄에 표시한다.
     pub status_line: Option<String>,
     /// 마지막으로 새 출력이 온 시각(unix 초) — 「작업 중」인데 멈춘 세션 판별용.
     pub last_output_at: Option<i64>,
@@ -130,9 +134,30 @@ impl SessionRowDragPayload {
     }
 }
 
+/// 이름 입력 이력과 편집 대상은 목록 순서가 아닌 세션의 전체 식별자에 귀속된다.
+struct SessionNameEdit {
+    target: SessionRowTarget,
+    text: String,
+    request_focus: bool,
+}
+
+impl SessionNameEdit {
+    fn input_id(&self) -> egui::Id {
+        egui::Id::new(("session_name_editor", &self.target))
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SessionNameEditResult {
+    Submit,
+    Cancel,
+}
+
 pub(crate) struct SidebarSessionRow {
     pub target: SessionRowTarget,
     pub title: String,
+    pub title_is_custom: bool,
+    pub agent_model: Option<String>,
     pub status: Option<runtime::SessionStatus>,
     pub summary: String,
     pub focused: bool,
@@ -166,6 +191,8 @@ impl SidebarSessionRow {
         Self {
             target,
             title: entry.title,
+            title_is_custom: entry.title_is_custom,
+            agent_model: entry.agent_model,
             status: entry.status,
             summary: entry.summary,
             focused: entry.focused,
@@ -190,6 +217,8 @@ impl SidebarSessionRow {
         Self {
             target: SessionRowTarget::persisted(workspace_id, pane),
             title,
+            title_is_custom: false,
+            agent_model: None,
             status: None,
             summary: cwd,
             focused: false,
@@ -265,10 +294,8 @@ pub struct SidebarSnapshot<'a> {
     pub view: super::agent_terminal::AgentTerminalView,
     /// 마지막 Home 열람 뒤 새로 도착한 공지 수 — Home 행에 작업함과 같은 배지로 표시.
     pub home_notice_count: usize,
-    /// 「작업」 nav 배지 — **나를 막고 있는 세션 수**(승인 대기 + 입력 대기). 0이면 숨김.
-    /// 2026-08-08까지 작업함·플릿 배지가 둘 다 global_waiting을 세어 같은 사실로 두 개가
-    /// 함께 올랐다(사용자 지적). 이제 의미가 하나다.
-    pub fleet_count: usize,
+    /// 작업 메뉴의 상태별 건수. 가장 우선하는 상태의 색과 건수를 배지에 표시한다.
+    pub fleet_summary: crate::fleet::FleetNavSummary,
     /// 현재 세션 pane 헤더 옆의 이력 보조 탭이 **활성**인지 — 레일 「이력」 선택 표시.
     /// 탭이 열려 있어도 비활성(터미널을 보는 중)이면 false다.
     pub history_tab_active: bool,
@@ -982,6 +1009,7 @@ struct DeleteTarget {
 struct PendingFileTreeIo {
     operation: FileTreeIoOperation,
     generation: u64,
+    edit_generation: u64,
     refresh: Vec<PathBuf>,
     trash_target: Option<DeleteTarget>,
     retry_edit: Option<EditState>,
@@ -1075,6 +1103,8 @@ pub struct FileTreeUi {
     /// 백그라운드 완료 시 UI를 깨우기 위한 컨텍스트.
     /// 인라인 편집 상태 (이름 변경/새 폴더, FT-3).
     edit: Option<EditState>,
+    /// 같은 탐색 루트에서도 새 편집/취소는 이전 실패 결과의 입력 복원을 무효화한다.
+    edit_generation: u64,
     /// 휴지통 이동 실패 → 영구삭제 확인 대기 중인 대상 (§9-7). 경로가 아니라
     /// `DeleteTarget`을 들고 있어야 확인 문구와 실제 삭제 경로가 같은 값에서 나온다.
     confirm_delete: Option<DeleteTarget>,
@@ -1086,8 +1116,8 @@ pub struct FileTreeUi {
     measured_row_height: Option<f32>,
     /// `.env*` 파일 변경 후보. 숨김 파일 필터와 무관하게 기록해 env-warning 후보로 쓸 수 있다.
     env_warning_candidates: BTreeSet<PathBuf>,
-    /// 세션 목록 이름 인라인 편집 중 (pane, 편집 버퍼). 우클릭/더블클릭으로 시작.
-    session_name_edit: Option<(runtime::MuxPaneId, String)>,
+    /// 우클릭으로 시작한 세션 이름 편집. 전환/숨김/종료 시 취소한다.
+    session_name_edit: Option<SessionNameEdit>,
     /// 워크스페이스별 세션 트리 펼침 상태. 포커스 전환과 독립적이어서 다른 workspace를
     /// 선택해도 기존 트리는 사용자가 직접 접기 전까지 유지된다.
     workspace_sessions_expanded: HashMap<String, bool>,
@@ -1177,6 +1207,7 @@ impl FileTreeUi {
             watch_ignore: Vec::new(),
             in_flight: 0,
             edit: None,
+            edit_generation: 0,
             confirm_delete: None,
             measured_row_height: None,
             env_warning_candidates: BTreeSet::new(),
@@ -1244,6 +1275,7 @@ impl FileTreeUi {
         self.pending_io = Some(PendingFileTreeIo {
             operation,
             generation,
+            edit_generation: self.edit_generation,
             refresh,
             trash_target,
             retry_edit,
@@ -1304,11 +1336,19 @@ impl FileTreeUi {
                     file_tree_io_error_message(FileTreeIoErrorCode::TrashUnavailable).to_owned(),
                 );
                 self.confirm_delete = pending.trash_target;
-                self.edit = pending.retry_edit;
+                if pending.edit_generation == self.edit_generation
+                    && let Some(edit) = pending.retry_edit
+                {
+                    self.edit = Some(edit);
+                }
             }
             Err(code) => {
                 self.trash_queue.clear();
-                self.edit = pending.retry_edit;
+                if pending.edit_generation == self.edit_generation
+                    && let Some(edit) = pending.retry_edit
+                {
+                    self.edit = Some(edit);
+                }
                 self.reject_io(code);
             }
         }
@@ -1808,7 +1848,7 @@ impl FileTreeUi {
         self.children = children;
         self.error = None;
         self.inaccessible_paths.clear();
-        self.edit = None;
+        self.cancel_edit();
         self.confirm_delete = None;
         // 루트가 바뀌면 선택과 삭제 대기열도 함께 버린다. generation 검사는 **옛 완료**만
         // 막을 뿐 큐 자체는 살아남아서, 새 워크스페이스에서 아무 IO나 성공하는 순간
@@ -1919,6 +1959,15 @@ impl FileTreeUi {
         self.notes.apply_external_edit(workspace_id, body);
     }
 
+    fn take_session_name_edit(&mut self, ctx: &egui::Context) -> Option<SessionNameEdit> {
+        let edit = self.session_name_edit.take()?;
+        let id = edit.input_id();
+        ctx.memory_mut(|memory| memory.surrender_focus(id));
+        ctx.data_mut(|data| data.remove::<egui::text_edit::TextEditState>(id));
+        ctx.request_repaint();
+        Some(edit)
+    }
+
     pub fn panel(
         &mut self,
         ui: &mut egui::Ui,
@@ -1928,7 +1977,12 @@ impl FileTreeUi {
     ) -> Option<SidebarAction> {
         let navigation_action = self.navigation_rail_panel(ui, sidebar, catalog);
         let project_action = self.project_file_panel(ui, sessions_by_workspace, sidebar, catalog);
-        project_action.or(navigation_action)
+        let action = project_action.or(navigation_action);
+        if action.is_some() {
+            // 다른 세션/워크스페이스/도구로 이동한 뒤 숨은 초안을 확정하지 않는다.
+            let _ = self.take_session_name_edit(ui.ctx());
+        }
+        action
     }
 
     fn navigation_rail_panel(
@@ -2029,6 +2083,26 @@ impl FileTreeUi {
         sidebar: &SidebarSnapshot<'_>,
         catalog: &i18n::Catalog,
     ) -> Option<SidebarAction> {
+        let invalid_edit = self.session_name_edit.as_ref().is_some_and(|edit| {
+            self.collapsed
+                || !ui.is_enabled()
+                || edit.target.workspace_id() != sidebar.active_workspace_id
+                || !sidebar
+                    .workspaces
+                    .iter()
+                    .any(|workspace| workspace.id == sidebar.active_workspace_id)
+                || !self
+                    .workspace_sessions_expanded
+                    .get(sidebar.active_workspace_id)
+                    .copied()
+                    .unwrap_or(true)
+                || !sessions_by_workspace
+                    .get(sidebar.active_workspace_id)
+                    .is_some_and(|rows| rows.iter().any(|row| row.target == edit.target))
+        });
+        if invalid_edit {
+            let _ = self.take_session_name_edit(ui.ctx());
+        }
         let status_bar_top = ui.ctx().content_rect().bottom() - 26.0;
         if self.collapsed {
             let frame = crate::ui::designall::structural_frame(ui.visuals());
@@ -2357,56 +2431,33 @@ impl FileTreeUi {
                                                     ui.vertical(|ui| {
                                                         let editing = matches!(
                                                             &self.session_name_edit,
-                                                            Some((p, _)) if p == entry.target.pane()
+                                                            Some(edit) if edit.target == entry.target
                                                         );
                                                         if editing {
                                                             // 인라인 이름 편집 — Enter 확정(RenameSession), Esc 취소.
                                                             // 행(레일/상태줄) 레이아웃은 유지하고 제목 자리만 편집기로.
-                                                            let buf = &mut self
-                                                                .session_name_edit
-                                                                .as_mut()
-                                                                .unwrap()
-                                                                .1;
-                                                            let resp = session_row_editing(
-                                                                ui,
-                                                                entry,
-                                                                buf,
-                                                                active_color,
-                                                            );
+                                                            let edit = self.session_name_edit.as_mut().unwrap();
+                                                            let (resp, result) = session_row_editing(ui, entry, edit, active_color);
+                                                            session_row_rects.push(resp.rect);
+                                                            if let Some(result) = result
+                                                                && let Some(edit) = self.take_session_name_edit(ui.ctx())
+                                                                && result == SessionNameEditResult::Submit
                                                             {
-                                                                let row_rect = resp.rect;
-                                                                session_row_rects.push(row_rect);
-                                                            }
-                                                            let (enter, esc) = ui.input(|i| {
-                                                                (
-                                                                    i.key_pressed(egui::Key::Enter),
-                                                                    i.key_pressed(
-                                                                        egui::Key::Escape,
-                                                                    ),
-                                                                )
-                                                            });
-                                                            if enter {
-                                                                if let Some((pane, title)) =
-                                                                    self.session_name_edit.take()
-                                                                {
-                                                                    let title =
-                                                                        title.trim().to_owned();
-                                                                    if !title.is_empty() {
-                                                                        action = Some(
-                                                                    SidebarAction::RenameSession {
-                                                                        pane,
-                                                                        title,
-                                                                    },
-                                                                );
-                                                                    }
-                                                                }
-                                                            } else if esc {
-                                                                self.session_name_edit = None;
+                                                                let title = edit.text.trim().to_owned();
+                                                                // 이름을 비우면 기존 자동 제목 형식으로 돌린다.
+                                                                let title = if title.is_empty() {
+                                                                    format!("workspace.spawn.shell {}", entry.target.session().map_or(0, |s| s.0))
+                                                                } else {
+                                                                    title
+                                                                };
+                                                                action = Some(SidebarAction::RenameSession {
+                                                                    pane: edit.target.pane().clone(),
+                                                                    title,
+                                                                });
                                                             }
                                                         } else {
-                                                            // 세션 행 자체에는 hover tooltip을 띄우지 않는다.
-                                                            // 상태 감지 출처/신뢰도 같은 내부 진단과 이름 변경
-                                                            // 안내가 터미널 위를 가리는 문제(2026-07-19 사용자).
+                                                            // A1에서 생략된 작업·모델·강도만 hover로 보여 준다.
+                                                            // 상태 감지 출처/신뢰도 같은 내부 진단은 표시하지 않는다.
                                                             let resp =
                                                                 session_row(ui, entry, active_color);
                                                             {
@@ -2429,11 +2480,12 @@ impl FileTreeUi {
                                                                         ))
                                                                         .clicked()
                                                                     {
-                                                                        self.session_name_edit =
-                                                                            Some((
-                                                                                entry.target.pane().clone(),
-                                                                                entry.title.clone(),
-                                                                            ));
+                                                                        let _ = self.take_session_name_edit(ui.ctx());
+                                                                        self.session_name_edit = Some(SessionNameEdit {
+                                                                            target: entry.target.clone(),
+                                                                            text: if entry.title_is_custom { entry.title.clone() } else { String::new() },
+                                                                            request_focus: true,
+                                                                        });
                                                                         ui.close();
                                                                     }
                                                                     ui.separator();
@@ -2816,10 +2868,7 @@ impl FileTreeUi {
             let mut toggle_hidden = false;
             egui::Popup::menu(&more).show(|ui| {
                 ui.set_min_width(170.0);
-                if ui
-                    .button(catalog.t("file_tree.new_file_root", &[]))
-                    .clicked()
-                {
+                if ui.button(catalog.t("file_tree.new_file", &[])).clicked() {
                     create_file = true;
                     ui.close();
                 }
@@ -2832,10 +2881,7 @@ impl FileTreeUi {
                     toggle_hidden = true;
                     ui.close();
                 }
-                if ui
-                    .button(catalog.t("file_tree.new_folder_root", &[]))
-                    .clicked()
-                {
+                if ui.button(catalog.t("file_tree.new_folder", &[])).clicked() {
                     create_folder = true;
                     ui.close();
                 }
@@ -2999,16 +3045,18 @@ impl FileTreeUi {
         // 상위 이동도 기존 목록을 끝까지 그린 뒤 반영한다. 여기서 반환하면 클릭한
         // 프레임의 본문만 통째로 비어 보인다.
         let parent_navigation = parent_response.clicked().then_some(parent_root).flatten();
-        if let Some(root) = self.root.clone() {
+        if (create_file || create_folder)
+            && let Some(parent) = self.creation_parent()
+        {
             if create_file {
-                self.edit = Some(EditState::NewFile {
-                    parent: root,
+                self.start_edit(EditState::NewFile {
+                    parent,
                     buffer: String::new(),
                     focus: true,
                 });
             } else if create_folder {
-                self.edit = Some(EditState::NewFolder {
-                    parent: root,
+                self.start_edit(EditState::NewFolder {
+                    parent,
                     buffer: String::new(),
                     focus: true,
                 });
@@ -3129,14 +3177,13 @@ impl FileTreeUi {
             ));
         }
 
-        // 헤더 우클릭: 루트에 새 폴더 (FT-3)
-        if let Some(root) = self.root.clone() {
+        // 헤더 우클릭도 더보기와 같은 생성 위치를 사용한다.
+        if self.root.is_some() {
             header_drop.context_menu(|ui| {
-                if ui
-                    .button(catalog.t("file_tree.new_folder_root", &[]))
-                    .clicked()
+                if ui.button(catalog.t("file_tree.new_folder", &[])).clicked()
+                    && let Some(parent) = self.creation_parent()
                 {
-                    menu_action = Some(MenuAction::NewFolder(root.clone()));
+                    menu_action = Some(MenuAction::NewFolder(parent));
                     ui.close();
                 }
             });
@@ -3747,7 +3794,10 @@ impl FileTreeUi {
         // 인라인 편집은 검증 후 native mutation intent만 만든다. 실패 completion이면
         // PendingFileTreeIo가 보관한 편집 snapshot을 복원한다.
         match edit_done {
-            Some(false) => edit = None,
+            Some(false) => {
+                self.cancel_edit();
+                edit = None;
+            }
             Some(true) => match edit {
                 Some(EditState::Rename {
                     path,
@@ -3826,10 +3876,10 @@ impl FileTreeUi {
             None => {}
         }
         // 메뉴 동작 처리 (flat 순회 밖 — &mut self 필요 동작들)
-
+        self.edit = edit;
         match menu_action {
             Some(MenuAction::NewFolder(parent)) => {
-                edit = Some(EditState::NewFolder {
+                self.start_edit(EditState::NewFolder {
                     parent,
                     buffer: String::new(),
                     focus: true,
@@ -3837,7 +3887,7 @@ impl FileTreeUi {
             }
             Some(MenuAction::Rename(path)) => {
                 let name = super::path_file_name_display(&path);
-                edit = Some(EditState::Rename {
+                self.start_edit(EditState::Rename {
                     path,
                     buffer: name,
                     focus: true,
@@ -3885,8 +3935,6 @@ impl FileTreeUi {
             }
             None => {}
         }
-        self.edit = edit;
-
         // 상태 표시는 위(스크롤 영역 앞)에서 이미 그렸다. 행 클릭·메뉴 처리가 그 뒤에
         // 오류를 세우거나 작업을 큐에 넣었으면 이번 프레임 화면에는 없다 — 입력이
         // 끊기면 다음 프레임이 안 올 수 있으므로 한 번만 더 요청한다. 상태가 그대로면
@@ -3920,21 +3968,66 @@ impl FileTreeUi {
             NavIcon::Home,
             &catalog.t("sidebar.nav.home", &[]),
             sidebar.view == super::agent_terminal::AgentTerminalView::Home,
-            nav_badge_text(sidebar.home_notice_count).as_deref(),
+            nav_badge_text(sidebar.home_notice_count)
+                .as_deref()
+                .map(|text| NavBadge {
+                    text,
+                    fill: egui::Color32::from_rgb(0xed, 0x5b, 0x61),
+                    text_color: egui::Color32::WHITE,
+                }),
         )
         .clicked()
         {
             action = Some(SidebarAction::ShowHome);
         }
-        if nav_row(
+        let primary = sidebar.fleet_summary.primary();
+        let fleet_badge_text = primary.and_then(|(_, count)| nav_badge_text(count));
+        let mut fleet_response = nav_row(
             ui,
             NavIcon::Fleet,
             &catalog.t("sidebar.nav.fleet", &[]),
             sidebar.view == super::agent_terminal::AgentTerminalView::Fleet,
-            nav_badge_text(sidebar.fleet_count).as_deref(),
-        )
-        .clicked()
-        {
+            primary
+                .zip(fleet_badge_text.as_deref())
+                .map(|((state, _), text)| NavBadge {
+                    text,
+                    fill: super::agent_visuals::status_text_color(state),
+                    // 밝은 상태색 위에서도 작은 숫자를 읽을 수 있게 한다.
+                    text_color: egui::Color32::from_rgb(0x17, 0x1b, 0x22),
+                }),
+        );
+        if primary.is_some() {
+            fleet_response = fleet_response.on_hover_ui(|ui| {
+                for (state, count) in sidebar.fleet_summary.counts() {
+                    if count == 0 {
+                        continue;
+                    }
+                    let label = match state {
+                        crate::agent_surface::AgentVisualState::Waiting => {
+                            catalog.t("fleet.group.blocked", &[])
+                        }
+                        crate::agent_surface::AgentVisualState::Error => {
+                            catalog.t("fleet.state.error", &[])
+                        }
+                        crate::agent_surface::AgentVisualState::Active => {
+                            catalog.t("fleet.group.active", &[])
+                        }
+                        crate::agent_surface::AgentVisualState::Complete => {
+                            catalog.t("fleet.state.done", &[])
+                        }
+                        crate::agent_surface::AgentVisualState::Idle => {
+                            catalog.t("fleet.state.idle", &[])
+                        }
+                        _ => continue,
+                    };
+                    ui.colored_label(
+                        super::agent_visuals::status_text_color(state),
+                        format!("{label} · {count}"),
+                    );
+                }
+            });
+        }
+        if fleet_response.clicked() {
             action = Some(SidebarAction::ShowFleet);
         }
         if nav_row(
@@ -4205,6 +4298,66 @@ impl FileTreeUi {
                 // 기준점은 그대로 둔다 — Shift로 범위를 늘였다 줄였다 할 수 있어야 한다.
             }
         }
+    }
+
+    fn start_edit(&mut self, edit: EditState) {
+        self.edit_generation = self.edit_generation.wrapping_add(1);
+        if let EditState::NewFile { parent, .. } | EditState::NewFolder { parent, .. } = &edit {
+            // 생성 대상만 펼친다. 이미 펼친 목록은 유지하고 기존 비동기 나열을 재사용한다.
+            let collapsed = self
+                .root
+                .as_deref()
+                .and_then(|root| parent.strip_prefix(root).ok())
+                .and_then(|relative| {
+                    self.children
+                        .as_deref()
+                        .and_then(|children| node_ref(children, relative))
+                })
+                .is_some_and(|node| node.is_dir && !node.expanded);
+            if collapsed {
+                self.toggle_dir(parent);
+            }
+        }
+        self.edit = Some(edit);
+    }
+
+    fn cancel_edit(&mut self) {
+        self.edit_generation = self.edit_generation.wrapping_add(1);
+        self.edit = None;
+    }
+
+    /// 선택 기준 행 또는 남은 선택들의 공통 폴더에 생성한다. 가시 선택만 사용하며,
+    /// 공통 생성 위치도 없을 때 현재 탐색 루트를 쓴다.
+    fn creation_parent(&self) -> Option<PathBuf> {
+        let root = self.root.as_deref()?;
+        let anchor = self
+            .select_anchor
+            .as_ref()
+            .filter(|path| self.selected.contains(*path))
+            .and_then(|path| self.flat.iter().find(|row| &row.path == path));
+        if let Some(row) = anchor {
+            return Some(row_target_dir(row, Some(root)));
+        }
+        let mut selected = self
+            .flat
+            .iter()
+            .filter(|row| self.selected.contains(&row.path));
+        let Some(first) = selected.next() else {
+            return Some(root.to_path_buf());
+        };
+        let parent = row_target_dir(first, Some(root));
+        let common_parent = selected.all(|row| {
+            if row.is_dir {
+                row.path == parent
+            } else {
+                row.path.parent() == Some(parent.as_path())
+            }
+        });
+        Some(if common_parent {
+            parent
+        } else {
+            root.to_path_buf()
+        })
     }
 
     /// 선택 사각형을 시작·갱신·종료하고 그린다.
@@ -5863,6 +6016,7 @@ fn draggable_session_row(
     accent_color: egui::Color32,
 ) -> egui::Response {
     let response = session_row_impl(ui, entry, None, accent_color, egui::Sense::click_and_drag())
+        .0
         .on_hover_cursor(egui::CursorIcon::Grab);
     session_row_drag_source(&response, &entry.target);
     response
@@ -5943,10 +6097,10 @@ fn finish_session_row_drag_frame(ctx: &egui::Context) {
 fn session_row_editing(
     ui: &mut egui::Ui,
     entry: &SidebarSessionRow,
-    buf: &mut String,
+    edit: &mut SessionNameEdit,
     accent_color: egui::Color32,
-) -> egui::Response {
-    session_row_impl(ui, entry, Some(buf), accent_color, egui::Sense::click())
+) -> (egui::Response, Option<SessionNameEditResult>) {
+    session_row_impl(ui, entry, Some(edit), accent_color, egui::Sense::click())
 }
 
 // 워크스페이스 헤더의 우측 인셋(workspace_row 내부 rect =
@@ -6158,99 +6312,101 @@ fn session_highlight_rect(rect: egui::Rect) -> egui::Rect {
     )
 }
 
-fn session_title_lines(
+/// 사용자 이름은 자동 작업 문구가 바뀌어도 첫 줄에 고정한다.
+fn session_headline(entry: &SidebarSessionRow) -> &str {
+    if entry.title_is_custom || entry.agent_line.is_none() {
+        return &entry.title;
+    }
+    entry
+        .status_line
+        .as_deref()
+        .filter(|line| !line.trim().is_empty())
+        .unwrap_or(&entry.title)
+}
+
+/// 상태를 둘째 줄 앞에 고정하고, 이름을 지정한 행만 오른쪽 모델 공간을 확보한다.
+fn session_secondary_line(
     ui: &egui::Ui,
     entry: &SidebarSessionRow,
     status_color: egui::Color32,
-    separator_color: egui::Color32,
+    secondary_color: egui::Color32,
     max_width: f32,
-) -> (
-    std::sync::Arc<egui::Galley>,
-    Option<std::sync::Arc<egui::Galley>>,
-) {
-    let title_size = SESSION_TITLE_FONT_SIZE;
-    let title_font_id = crate::fonts::sidebar_font(ui.ctx(), title_size);
-    // 제목보다 상태를 1pt 작게 두어 `폴더명 · 상태`의 시각적 위계를 분리한다.
-    let status_size = 12.0;
-    let status_font_id = crate::fonts::sidebar_font(ui.ctx(), status_size);
-    let status_line_height = status_size * SESSION_LINE_HEIGHT_RATIO;
-    let status_galley = entry
+) -> (Arc<egui::Galley>, Option<Arc<egui::Galley>>) {
+    let font = crate::fonts::sidebar_font(ui.ctx(), SESSION_SUBLINE_FONT_SIZE);
+    let line_height = Some(SESSION_SUBLINE_FONT_SIZE * SESSION_LINE_HEIGHT_RATIO);
+    let Some(agent_line) = entry.agent_line.as_deref() else {
+        let summary = if entry.summary.is_empty() {
+            "~"
+        } else {
+            &entry.summary
+        };
+        return (
+            clipped_line(ui, summary, font, max_width, line_height),
+            None,
+        );
+    };
+    // 아주 좁을 때는 상태를 우선한다. 축약한 모델/강도 전체는 hover로 확인한다.
+    let model_galley = entry
+        .agent_model
+        .as_deref()
+        .filter(|model| entry.title_is_custom && max_width >= 96.0 && !model.trim().is_empty())
+        .map(|model| {
+            let model = model.trim();
+            let model = model
+                .strip_prefix("gpt-")
+                .or_else(|| model.strip_prefix("grok-"))
+                .unwrap_or(model);
+            clipped_line(ui, model, font.clone(), max_width * 0.27, line_height)
+        });
+    let model_width = model_galley.as_ref().map_or(0.0, |g| g.size().x + 6.0);
+    let details = if entry.title_is_custom {
+        entry.status_line.as_deref().unwrap_or("")
+    } else {
+        agent_line
+    };
+    let mut job = egui::text::LayoutJob::default();
+    let format = egui::TextFormat {
+        font_id: font,
+        color: secondary_color,
+        line_height,
+        ..Default::default()
+    };
+    if let Some(status) = entry
         .status_label
         .as_deref()
-        .filter(|status| !status.is_empty())
-        .map(|status| {
-            let mut job = egui::text::LayoutJob::default();
-            job.append(
-                " · ",
-                0.0,
-                egui::TextFormat {
-                    font_id: status_font_id.clone(),
-                    color: separator_color,
-                    line_height: Some(status_line_height),
-                    ..Default::default()
-                },
-            );
-            job.append(
-                status,
-                0.0,
-                egui::TextFormat {
-                    font_id: status_font_id,
-                    color: status_color,
-                    line_height: Some(status_line_height),
-                    ..Default::default()
-                },
-            );
-            ui.painter().layout_job(job)
-        });
-    let status_width = status_galley.as_ref().map_or(0.0, |galley| galley.size().x);
-    let title_width = (max_width - status_width).max(10.0);
-    // 에이전트 행의 1행은 **지금 하는 일**(status_line)이다. 예전엔 세션 제목이었는데
-    // 그게 워크스페이스 이름과 같은 경우가 많아 정보가 0이었다(2026-08-11 사용자).
-    // status_line이 아직 없으면(막 띄운 직후) 제목으로 떨어져 빈 줄을 만들지 않는다.
-    // 셸은 제목이 유일한 식별자라 그대로 둔다.
-    let headline = entry
-        .status_line
-        .as_deref()
-        .filter(|line| entry.agent_line.is_some() && !line.trim().is_empty())
-        .unwrap_or(entry.title.as_str());
-    let title_galley = clipped_line(
-        ui,
-        headline,
-        title_font_id,
-        title_width,
-        Some(title_size * SESSION_LINE_HEIGHT_RATIO),
-    );
-    (title_galley, status_galley)
+        .filter(|s| !s.trim().is_empty())
+    {
+        job.append(
+            status,
+            0.0,
+            egui::TextFormat {
+                color: status_color,
+                ..format.clone()
+            },
+        );
+        if !details.trim().is_empty() {
+            job.append(" · ", 0.0, format.clone());
+        }
+    }
+    job.append(details, 0.0, format);
+    job.wrap = egui::text::TextWrapping {
+        max_width: (max_width - model_width).max(0.0),
+        max_rows: 1,
+        break_anywhere: true,
+        overflow_character: Some('…'),
+    };
+    (ui.painter().layout_job(job), model_galley)
 }
 
 fn session_row_impl(
     ui: &mut egui::Ui,
     entry: &SidebarSessionRow,
-    edit_buf: Option<&mut String>,
+    edit: Option<&mut SessionNameEdit>,
     _accent_color: egui::Color32,
     sense: egui::Sense,
-) -> egui::Response {
-    // 에이전트면 3줄(제목/에이전트·모델·effort/상태·ctx%), 아니면 2줄(제목/요약).
-    // 요약이 없어도(유휴/시작 직후) 2행에 '~'를 표시해 행 높이를 유지한다(2026-07-07).
-    let agent = entry.agent_line.is_some();
-    let summary_text: &str = if entry.summary.is_empty() {
-        "~"
-    } else {
-        &entry.summary
-    };
-    // 46/34에서 레일·텍스트가 바닥 밖으로 삐져나와 51/39로 5px씩 늘렸다(2026-07-25
-    // 사용자 스샷). row_h는 여전히 고정값이라 폰트/언어별 실제 렌더 높이가 이 값을
-    // 넘으면 같은 문제가 재발할 수 있다 — 근본 해결은 행 높이를 실측 갤리 높이로
-    // 동적 계산하는 것이지만, 그러려면 지금 화면 밖 행에서 건너뛰는 텍스트
-    // 레이아웃(is_rect_visible 조기 리턴, 위 참고)을 모든 행에서 항상 해야 해서
-    // 스크롤 목록 성능과 맞바꿔야 한다(사용자 확인 대기).
-    // 줄 사이 간격을 1px씩 더 좁혀서(아래 gap 계산) 남는 줄 수만큼 그대로
-    // 줄인다(2026-07-25 사용자: "행간 간격을 1px 줄여도 돼") — 안 그러면 위/아래
-    // 여백 대칭(SESSION_TEXT_MARGIN)이 깨진다.
-    // 에이전트도 셸도 **2줄**이다. 예전엔 에이전트만 3줄(제목/에이전트/상태)이었는데,
-    // 제목이 워크스페이스 이름과 같은 경우가 많아 정보가 0인 줄이 하나 있었다
-    // (2026-08-11 사용자: 「arteawiki 아래 arteawiki 셋」이 서로 구분이 안 된다).
-    // 그 줄을 빼고 **하는 일**을 1행으로 올린다.
+) -> (egui::Response, Option<SessionNameEditResult>) {
+    // 이름 유무와 관계없이 두 줄과 기존 높이·간격을 유지한다.
+    let editing = edit.is_some();
     let row_h = SESSION_ROW_HEIGHT;
     let (_, rect) = ui.allocate_space(egui::vec2(ui.available_width(), row_h));
     // 행의 위치가 바뀌거나 앞 세션이 닫혀도 입력 대상은 같은 runtime/tab/pane이다.
@@ -6266,7 +6422,7 @@ fn session_row_impl(
         )
     });
     if !ui.is_rect_visible(rect) {
-        return resp;
+        return (resp, editing.then_some(SessionNameEditResult::Cancel));
     }
     // 색을 먼저 복사(Copy)해 visuals 차용을 끝낸 뒤 ui.fonts로 galley를 만든다.
     let dot = session_entry_status_color(entry);
@@ -6293,7 +6449,7 @@ fn session_row_impl(
         (dot, 1.0)
     };
     let text_inset = SESSION_TEXT_INSET;
-    // 2·3행(보조 정보): 다크는 기존 weak 톤, 라이트는 weak가 패널 위에서 너무 옅어
+    // 둘째 줄(보조 정보): 다크는 기존 weak 톤, 라이트는 weak가 패널 위에서 너무 옅어
     // textSecondary 수준으로 진하게 (라이트 테마 회색 흐림, 2026-07-10).
     // 참조하던 #444444는 무채색이라 색상축을 통일한 사이드바에서 혼자 튀었다 — 명도는
     // 그대로 두고 축만 맞춘다(2026-08-06). settings 보조색 라이트값과 같은 색이다.
@@ -6312,36 +6468,15 @@ fn session_row_impl(
             entry.agent_line.is_some(),
         ),
     );
-    let (title_galley, status_galley) =
-        session_title_lines(ui, entry, status_text_color, sub_color, max_w);
-    // 2행/3행: 에이전트면 agent_line/status_line, 아니면 요약(2행)만.
-    // 에이전트: 1행 = 지금 하는 일(status_line), 2행 = 에이전트·모델·강도(agent_line).
-    // 셸: 기존대로 제목 + 요약.
-    let (line2, line3) = if agent {
-        (entry.agent_line.as_deref(), None)
-    } else {
-        (Some(summary_text), None)
-    };
-    let subline_size = SESSION_SUBLINE_FONT_SIZE;
-    let subline_line_height = Some(subline_size * SESSION_LINE_HEIGHT_RATIO);
-    let line2_galley = line2.map(|t| {
-        clipped_line(
-            ui,
-            t,
-            crate::fonts::sidebar_font(ui.ctx(), subline_size),
-            max_w,
-            subline_line_height,
-        )
-    });
-    let line3_galley = line3.map(|t| {
-        clipped_line(
-            ui,
-            t,
-            crate::fonts::sidebar_font(ui.ctx(), subline_size),
-            max_w,
-            subline_line_height,
-        )
-    });
+    let title_galley = clipped_line(
+        ui,
+        session_headline(entry),
+        crate::fonts::sidebar_font(ui.ctx(), SESSION_TITLE_FONT_SIZE),
+        max_w,
+        Some(SESSION_TITLE_FONT_SIZE * SESSION_LINE_HEIGHT_RATIO),
+    );
+    let (line2_galley, model_galley) =
+        session_secondary_line(ui, entry, status_text_color, sub_color, max_w);
 
     // 행 배경·레일·텍스트 원점을 물리 픽셀 경계에 맞춘다 — 행 높이가 소수(49/36에
     // 소수 여백)라 행이 쌓일수록 원점이 밀려 선명도가 행마다 출렁였다. 자세한 이유는
@@ -6414,74 +6549,42 @@ fn session_row_impl(
             egui::Stroke::new(1.5, dot_color),
         );
     }
-    // 제목(1행) + 2행 + 3행 — 세로 위치는 행 수에 맞춰.
-    // 위/아래 여백은 면 안쪽 padding(6/6)이고, 남는 세로는 줄 사이에 배분한다.
-    // 실제 렌더된 줄 높이(galley.size().y)로 계산해야 고정 오프셋(9/23/37 등)처럼
-    // 가정한 줄 높이가 틀려서 어긋나는 일이 없다.
-    let line_heights = [
-        Some(title_galley.size().y),
-        line2_galley.as_ref().map(|g| g.size().y),
-        line3_galley.as_ref().map(|g| g.size().y),
-    ];
-    let heights: Vec<f32> = line_heights.into_iter().flatten().collect();
-    let content_h: f32 = heights.iter().sum();
-    let available = (row_h - 2.0 * SESSION_ROW_PADDING_Y).max(0.0);
-    let gap = if heights.len() > 1 {
-        ((available - content_h) / (heights.len() as f32 - 1.0)).max(0.0)
-    } else {
-        0.0
-    };
-    let mut y = rect.top() + SESSION_ROW_PADDING_Y;
-    let title_center = y + title_galley.size().y / 2.0;
-    y += title_galley.size().y + gap;
-    let line2_center = line2_galley.as_ref().map(|g| {
-        let c = y + g.size().y / 2.0;
-        y += g.size().y + gap;
-        c
-    });
-    let line3_center = line3_galley.as_ref().map(|g| y + g.size().y / 2.0);
-
-    // 편집 중에는 제목 갤리 대신 같은 자리에 TextEdit를 얹는다 (아래 edit_buf 분기).
-    if edit_buf.is_none() {
-        let title_pos = crate::ui::snap_pos_to_pixel(
-            ppp,
-            egui::pos2(
-                rect.left() + text_inset,
-                title_center - title_galley.size().y / 2.0,
+    // 두 줄 높이만 합산해 행마다 임시 Vec을 만들지 않는다.
+    let content_h = title_galley.size().y + line2_galley.size().y;
+    let gap = (row_h - 2.0 * SESSION_ROW_PADDING_Y - content_h).max(0.0);
+    let title_top = rect.top() + SESSION_ROW_PADDING_Y;
+    let title_center = title_top + title_galley.size().y / 2.0;
+    let line2_top = title_top + title_galley.size().y + gap;
+    // 한 글자보다도 좁은 폭에서는 말줄임표까지 행 밖으로 나가지 않도록 자른다.
+    let text_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + text_inset, rect.top()),
+        egui::pos2(rect.right() - SESSION_CONTENT_RIGHT_INSET, rect.bottom()),
+    );
+    let text_painter = painter.with_clip_rect(text_rect.intersect(ui.clip_rect()));
+    // 편집 중에는 첫 줄에 TextEdit를 얹고 둘째 줄 상태는 그대로 표시한다.
+    if !editing {
+        text_painter.galley(
+            crate::ui::snap_pos_to_pixel(ppp, egui::pos2(text_rect.left(), title_top)),
+            title_galley.clone(),
+            title_color,
+        );
+    }
+    text_painter.galley(
+        crate::ui::snap_pos_to_pixel(ppp, egui::pos2(text_rect.left(), line2_top)),
+        line2_galley,
+        sub_color,
+    );
+    if let Some(model) = model_galley {
+        text_painter.galley(
+            crate::ui::snap_pos_to_pixel(
+                ppp,
+                egui::pos2(text_rect.right() - model.size().x, line2_top),
             ),
+            model,
+            sub_color,
         );
-        painter.galley(title_pos, title_galley.clone(), title_color);
-        if let Some(status_galley) = status_galley {
-            painter.galley(
-                crate::ui::snap_pos_to_pixel(
-                    ppp,
-                    egui::pos2(
-                        title_pos.x + title_galley.size().x,
-                        title_center - status_galley.size().y / 2.0,
-                    ),
-                ),
-                status_galley,
-                egui::Color32::WHITE,
-            );
-        }
     }
-    // line2_center/line3_center는 line2_galley/line3_galley와 같은 Option에서
-    // 나왔으므로(위 계산부) 항상 함께 Some/None이다 — 튜플 매치로 그 관계를 드러낸다.
-    if let (Some(g), Some(center)) = (line2_galley, line2_center) {
-        let pos = crate::ui::snap_pos_to_pixel(
-            ppp,
-            egui::pos2(rect.left() + text_inset, center - g.size().y / 2.0),
-        );
-        painter.galley(pos, g, sub_color);
-    }
-    if let (Some(g), Some(center)) = (line3_galley, line3_center) {
-        let pos = crate::ui::snap_pos_to_pixel(
-            ppp,
-            egui::pos2(rect.left() + text_inset, center - g.size().y / 2.0),
-        );
-        painter.galley(pos, g, sub_color);
-    }
-    if let Some(buf) = edit_buf {
+    let edit_result = if let Some(edit) = edit {
         // 제목 1행 자리에 프레임 없는 TextEdit — 글꼴/x 위치를 제목 갤리와 맞춘다.
         // 세로는 title_center를 감싸는 title_galley 높이만큼의 박스로.
         let half_h = title_galley.size().y / 2.0;
@@ -6492,17 +6595,125 @@ fn session_row_impl(
                 title_center + half_h,
             ),
         );
-        let edit_resp = ui.put(
-            title_rect,
-            egui::TextEdit::singleline(buf)
-                .font(crate::fonts::sidebar_font(ui.ctx(), 13.0))
-                .frame(egui::Frame::NONE)
-                .margin(egui::Margin::ZERO)
-                .vertical_align(egui::Align::Center),
-        );
-        edit_resp.request_focus();
+        session_name_editor(ui, title_rect, edit)
+    } else {
+        None
+    };
+    let response = if !editing && entry.agent_line.is_some() {
+        resp.on_hover_ui(|ui| {
+            ui.set_max_width(360.0);
+            ui.label(session_headline(entry));
+            if let Some(status) = entry.status_label.as_deref() {
+                ui.colored_label(status_text_color, status);
+            }
+            if entry.title_is_custom
+                && let Some(activity) = entry.status_line.as_deref()
+            {
+                ui.label(activity);
+            }
+            if let Some(agent) = entry.agent_line.as_deref() {
+                ui.weak(agent);
+            }
+        })
+    } else {
+        resp
+    };
+    (response, edit_result)
+}
+
+/// 입력창에 귀속된 프레임만 처리한다. 다른 pane의 Enter를 편집 확정에 쓰지 않는다.
+fn session_name_editor(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    edit: &mut SessionNameEdit,
+) -> Option<SessionNameEditResult> {
+    let blocked = !ui.is_enabled()
+        || !ui.is_rect_visible(rect)
+        || !ui.input(|input| input.focused)
+        || ui.ctx().any_popup_open()
+        || ui.memory(|memory| {
+            !memory.allows_interaction(ui.layer_id())
+                || memory
+                    .areas()
+                    .visible_layer_ids()
+                    .iter()
+                    .any(super::workspace::is_blocking_terminal_window)
+        });
+    let clicked_outside = ui.input(|input| {
+        input.pointer.any_pressed()
+            && input
+                .pointer
+                .interact_pos()
+                .is_some_and(|pos| !rect.contains(pos))
+    });
+    if blocked || clicked_outside {
+        return Some(SessionNameEditResult::Cancel);
     }
-    resp
+    let id = edit.input_id();
+    if std::mem::take(&mut edit.request_focus) {
+        // 시작할 때 한 번만 요청한다. 매 프레임 터미널/다른 입력창의 포커스를 빼앗지 않는다.
+        ui.memory_mut(|memory| memory.request_focus(id));
+    }
+    let escape_pressed = ui.input(|input| input.key_pressed(egui::Key::Escape));
+    let owns_keys = ui.memory(|memory| {
+        memory.has_focus(id)
+            || (memory.focused().is_none() && memory.had_focus_last_frame(id) && escape_pressed)
+    });
+    let response = ui.put(
+        rect,
+        egui::TextEdit::singleline(&mut edit.text)
+            .id(id)
+            .return_key(None)
+            .font(crate::fonts::sidebar_font(
+                ui.ctx(),
+                SESSION_TITLE_FONT_SIZE,
+            ))
+            .frame(egui::Frame::NONE)
+            .margin(egui::Margin::ZERO)
+            .vertical_align(egui::Align::Center),
+    );
+    if owns_keys && !terminal::renderer_egui::frame_has_active_preedit(ui.ctx()) {
+        let result = ui.input(|input| {
+            let mut result = None;
+            for event in &input.events {
+                if let egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } = event
+                    && !modifiers.any()
+                {
+                    match key {
+                        egui::Key::Escape => return Some(SessionNameEditResult::Cancel),
+                        egui::Key::Enter => result = Some(SessionNameEditResult::Submit),
+                        _ => {}
+                    }
+                }
+            }
+            result
+        });
+        if result.is_some() {
+            // 확정 후 포커스를 해제해도 같은 프레임에 입력한 문자/Enter가 PTY로 새지 않는다.
+            ui.input_mut(|input| {
+                let keep = |event: &egui::Event| {
+                    !matches!(
+                        event,
+                        egui::Event::Key { .. }
+                            | egui::Event::Text(_)
+                            | egui::Event::Paste(_)
+                            | egui::Event::Copy
+                            | egui::Event::Cut
+                            | egui::Event::Ime(_)
+                    )
+                };
+                input.events.retain(keep);
+                input.raw.events.retain(keep);
+            });
+            return result;
+        }
+    }
+    (!response.has_focus()).then_some(SessionNameEditResult::Cancel)
 }
 
 /// 한 줄 텍스트를 max_width 안으로 잘라 '…'로 끝내는 galley (박스 밖 삐짐 방지, #91).
@@ -7175,6 +7386,12 @@ fn nav_row_layout(row: egui::Rect, show_label: bool) -> NavRowLayout {
     }
 }
 
+struct NavBadge<'a> {
+    text: &'a str,
+    fill: egui::Color32,
+    text_color: egui::Color32,
+}
+
 /// 내비게이션 레일 행 하나 — 외곽선 아이콘 + 라벨, 선택/hover 상태에서만 평면 배경.
 /// painter 텍스트라 접근성 라벨은 widget_info로 단다.
 fn nav_row(
@@ -7182,7 +7399,7 @@ fn nav_row(
     icon: NavIcon,
     label: &str,
     selected: bool,
-    badge: Option<&str>,
+    badge: Option<NavBadge<'_>>,
 ) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), SIDEBAR_NAV_ROW_HEIGHT),
@@ -7222,28 +7439,27 @@ fn nav_row(
             crate::fonts::sidebar_font(ui.ctx(), 12.0),
             color,
         );
-        if let Some(badge) = badge {
-            paint_nav_badge(ui, row, badge);
-        }
+    }
+    if let Some(badge) = badge {
+        paint_nav_badge(ui, row, badge);
     }
     response
 }
 
-/// 작업 카운트 배지 — 빨간 원형(두 자리부터는 알약꼴), 흰 숫자.
-fn paint_nav_badge(ui: &egui::Ui, row: egui::Rect, text: &str) {
+/// 상태별 카운트 배지 — 원형, 두 자리부터는 알약꼴.
+fn paint_nav_badge(ui: &egui::Ui, row: egui::Rect, badge: NavBadge<'_>) {
     let galley = ui.painter().layout_no_wrap(
-        text.to_owned(),
+        badge.text.to_owned(),
         crate::fonts::sidebar_font(ui.ctx(), 10.0),
-        egui::Color32::WHITE,
+        badge.text_color,
     );
     let h = 16.0;
     let w = (galley.size().x + 8.0).max(h);
     let center = egui::pos2(row.right() - 6.0 - w / 2.0, row.top() + 10.0);
     let rect = egui::Rect::from_center_size(center, egui::vec2(w, h));
+    ui.painter().rect_filled(rect, h / 2.0, badge.fill);
     ui.painter()
-        .rect_filled(rect, h / 2.0, egui::Color32::from_rgb(0xed, 0x5b, 0x61));
-    ui.painter()
-        .galley(center - galley.size() / 2.0, galley, egui::Color32::WHITE);
+        .galley(center - galley.size() / 2.0, galley, badge.text_color);
 }
 
 /// 레일 아이콘 — 이모지는 폰트 글리프가 없어 □로 깨진다(레포 관례: painter 직접
@@ -9286,6 +9502,212 @@ mod tests {
     }
 
     #[test]
+    fn creation_review_기준_선택을_해제해도_남은_공통_폴더를_사용한다() {
+        let root = PathBuf::from("/creation-review");
+        let folder = root.join("docs");
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.root = Some(root.clone());
+        let mut docs = dir("docs");
+        docs.expanded = true;
+        docs.children = Some(vec![file("a.md"), file("b.md"), file("c.md")]);
+        tree.children = Some(vec![docs, dir("other")]);
+        tree.rebuild_flat();
+        tree.apply_selection_click(&folder.join("a.md"), SelectionClick::Replace);
+        tree.apply_selection_click(&folder.join("b.md"), SelectionClick::Toggle);
+        tree.apply_selection_click(&folder.join("c.md"), SelectionClick::Toggle);
+        tree.apply_selection_click(&folder.join("c.md"), SelectionClick::Toggle);
+        assert_eq!(tree.selected.len(), 2);
+        assert_eq!(tree.creation_parent(), Some(folder));
+
+        // 공통 생성 위치가 없고 기준 행도 없으면 특정 폴더를 임의로 고르지 않는다.
+        tree.selected.insert(root.join("other"));
+        assert_eq!(tree.creation_parent(), Some(root));
+    }
+
+    #[test]
+    fn creation_review_접힌_대상을_펼치고_생성_완료_목록을_갱신한다() {
+        for is_dir in [false, true] {
+            let root = temp_root("creation-review-expand");
+            let folder = root.join("docs");
+            std::fs::create_dir(&folder).unwrap();
+            let mut tree = FileTreeUi::new(egui::Context::default());
+            tree.set_root(Some(root.clone()));
+            drain_listings(&mut tree);
+            let edit = if is_dir {
+                EditState::NewFolder {
+                    parent: folder.clone(),
+                    buffer: "new".to_owned(),
+                    focus: true,
+                }
+            } else {
+                EditState::NewFile {
+                    parent: folder.clone(),
+                    buffer: "new".to_owned(),
+                    focus: true,
+                }
+            };
+            tree.start_edit(edit);
+            assert!(tree.children.as_ref().unwrap()[0].expanded);
+            drain_listings(&mut tree);
+            let parent = FileTreePathPayload::try_new(folder.clone()).unwrap();
+            let request = if is_dir {
+                FileTreeIoRequest::CreateDirectory {
+                    parent,
+                    name: "new".to_owned(),
+                }
+            } else {
+                FileTreeIoRequest::CreateFile {
+                    parent,
+                    name: "new".to_owned(),
+                }
+            };
+            let retry = tree.edit.take();
+            tree.queue_io(request, vec![folder.clone()], None, retry)
+                .unwrap();
+            let intent = tree.take_io_intent().unwrap();
+            if is_dir {
+                std::fs::create_dir(folder.join("new")).unwrap();
+            } else {
+                std::fs::write(folder.join("new"), "").unwrap();
+            }
+            tree.complete_io(FileTreeIoCompletion {
+                operation: intent.operation,
+                generation: intent.generation,
+                result: Ok(()),
+            });
+            drain_listings(&mut tree);
+            assert!(
+                tree.flat
+                    .iter()
+                    .any(|row| row.path == folder.join("new") && row.is_dir == is_dir)
+            );
+            // 이미 펼친 대상에서 다시 시작해도 기존 목록을 접거나 비우지 않는다.
+            tree.start_edit(EditState::NewFile {
+                parent: folder,
+                buffer: String::new(),
+                focus: true,
+            });
+            assert!(
+                tree.flat
+                    .iter()
+                    .any(|row| row.path == root.join("docs/new"))
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn creation_review_실패_복원은_새_편집과_취소를_덮어쓰지_않는다() {
+        for action in ["unchanged", "new", "cancelled"] {
+            let root = PathBuf::from("/creation-review");
+            let mut tree = FileTreeUi::new(egui::Context::default());
+            tree.root = Some(root.clone());
+            tree.children = Some(vec![dir("docs"), dir("other")]);
+            tree.rebuild_flat();
+            let old_parent = root.join("docs");
+            tree.start_edit(EditState::NewFile {
+                parent: old_parent.clone(),
+                buffer: "old.md".to_owned(),
+                focus: true,
+            });
+            let retry = tree.edit.take();
+            tree.queue_io(
+                FileTreeIoRequest::CreateFile {
+                    parent: FileTreePathPayload::try_new(old_parent.clone()).unwrap(),
+                    name: "old.md".to_owned(),
+                },
+                vec![old_parent.clone()],
+                None,
+                retry,
+            )
+            .unwrap();
+            let intent = tree.take_io_intent().unwrap();
+            if action != "unchanged" {
+                tree.start_edit(EditState::NewFile {
+                    parent: root.join("other"),
+                    buffer: "new.md".to_owned(),
+                    focus: true,
+                });
+                if action == "cancelled" {
+                    tree.cancel_edit();
+                }
+            }
+            tree.complete_io(FileTreeIoCompletion {
+                operation: intent.operation,
+                generation: intent.generation,
+                result: Err(FileTreeIoErrorCode::Conflict),
+            });
+            if action == "cancelled" {
+                assert!(
+                    tree.edit.is_none(),
+                    "취소한 편집을 이전 실패가 되살리면 안 됨"
+                );
+            } else {
+                let Some(EditState::NewFile { parent, buffer, .. }) = tree.edit.as_ref() else {
+                    panic!("생성 편집기가 사라짐");
+                };
+                if action == "unchanged" {
+                    assert_eq!(parent, &old_parent);
+                    assert_eq!(buffer, "old.md", "새 편집이 없으면 재시도 입력을 복원");
+                } else {
+                    assert_eq!(parent, &root.join("other"));
+                    assert_eq!(buffer, "new.md", "새로 입력한 이름을 보존");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn toolbar_creation_선택한_폴더와_파일의_위치를_사용한다() {
+        let root = PathBuf::from("/toolbar-creation");
+        let folder = root.join("docs");
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.root = Some(root.clone());
+        let mut docs = dir("docs");
+        docs.expanded = true;
+        docs.children = Some(vec![file("existing.md")]);
+        tree.children = Some(vec![docs, dir("other")]);
+        tree.rebuild_flat();
+
+        assert_eq!(tree.creation_parent(), Some(root.clone()));
+        tree.apply_selection_click(&folder, SelectionClick::Replace);
+        assert_eq!(tree.creation_parent(), Some(folder.clone()));
+        tree.apply_selection_click(&folder.join("existing.md"), SelectionClick::Replace);
+        assert_eq!(tree.creation_parent(), Some(folder.clone()));
+        // 여러 행을 골라도 마지막으로 직접 선택한 행의 위치를 따른다.
+        tree.apply_selection_click(&root.join("other"), SelectionClick::Toggle);
+        assert_eq!(tree.creation_parent(), Some(root.join("other")));
+        tree.apply_selection_click(&root.join("other"), SelectionClick::Toggle);
+        assert_eq!(tree.creation_parent(), Some(folder));
+    }
+
+    #[test]
+    fn toolbar_creation_보이지_않는_선택과_이전_루트는_사용하지_않는다() {
+        let root = PathBuf::from("/toolbar-creation");
+        let folder = root.join("docs");
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        assert_eq!(tree.creation_parent(), None);
+        tree.root = Some(root.clone());
+        let mut docs = dir("docs");
+        docs.expanded = true;
+        docs.children = Some(vec![file("existing.md")]);
+        tree.children = Some(vec![docs]);
+        tree.rebuild_flat();
+        tree.apply_selection_click(&folder.join("existing.md"), SelectionClick::Replace);
+        tree.toggle_dir(&folder);
+        assert_eq!(tree.creation_parent(), Some(root));
+
+        // 더블클릭으로 진입하면 선택이 초기화되어도 새 탐색 위치를 사용한다.
+        tree.set_root(Some(folder.clone()));
+        assert_eq!(tree.creation_parent(), Some(folder));
+        tree.set_root(Some(PathBuf::from("/another-workspace")));
+        assert_eq!(
+            tree.creation_parent(),
+            Some(PathBuf::from("/another-workspace"))
+        );
+    }
+
+    #[test]
     fn folder_navigation_상위_갱신_중에도_펼친_내용과_선택을_유지한다() {
         let root = PathBuf::from("/folder-navigation");
         let mut tree = FileTreeUi::new(egui::Context::default());
@@ -9609,7 +10031,7 @@ mod tests {
                         workspaces: &workspaces,
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
-                        fleet_count: 0,
+                        fleet_summary: Default::default(),
                         history_tab_active: false,
                         git_tab_active: false,
                         agents_open: false,
@@ -9822,7 +10244,7 @@ mod tests {
             workspaces: &[],
             view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
             home_notice_count: 0,
-            fleet_count: 0,
+            fleet_summary: Default::default(),
             history_tab_active: false,
             git_tab_active: false,
             agents_open: false,
@@ -10209,6 +10631,8 @@ mod tests {
                     pane: runtime::MuxPaneId(format!("p{n}")),
                     session: Some(runtime::SessionId(n as u64)),
                     title: format!("세션 {n}"),
+                    title_is_custom: true,
+                    agent_model: None,
                     status: agent.then_some(runtime::SessionStatus::Running),
                     summary: "요약".to_owned(),
                     focused: n == 0,
@@ -10246,7 +10670,7 @@ mod tests {
                         workspaces: &workspaces,
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
-                        fleet_count: 0,
+                        fleet_summary: Default::default(),
                         history_tab_active: false,
                         git_tab_active: false,
                         agents_open: false,
@@ -10384,6 +10808,8 @@ mod tests {
                     pane: runtime::MuxPaneId(format!("pane-{workspace}")),
                     session: Some(runtime::SessionId(1)),
                     title: title.to_owned(),
+                    title_is_custom: true,
+                    agent_model: None,
                     status: None,
                     summary: String::new(),
                     focused: false,
@@ -10416,7 +10842,7 @@ mod tests {
                         workspaces: &workspaces,
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
-                        fleet_count: 0,
+                        fleet_summary: Default::default(),
                         history_tab_active: false,
                         git_tab_active: false,
                         agents_open: false,
@@ -10566,6 +10992,8 @@ mod tests {
                     pane: runtime::MuxPaneId(format!("pane-{workspace}")),
                     session: Some(runtime::SessionId(1)),
                     title: title.to_owned(),
+                    title_is_custom: true,
+                    agent_model: None,
                     status: None,
                     summary: String::new(),
                     focused: false,
@@ -10598,7 +11026,7 @@ mod tests {
                         workspaces: &workspaces,
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
-                        fleet_count: 0,
+                        fleet_summary: Default::default(),
                         history_tab_active: false,
                         git_tab_active: false,
                         agents_open: false,
@@ -10704,7 +11132,7 @@ mod tests {
                         workspaces: &workspaces,
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
-                        fleet_count: 0,
+                        fleet_summary: Default::default(),
                         history_tab_active: false,
                         git_tab_active: false,
                         agents_open: false,
@@ -10775,7 +11203,7 @@ mod tests {
                         workspaces: &[],
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
-                        fleet_count: 0,
+                        fleet_summary: Default::default(),
                         history_tab_active: false,
                         git_tab_active: false,
                         agents_open: false,
@@ -11041,7 +11469,7 @@ mod tests {
                         workspaces: &workspaces,
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
-                        fleet_count: 0,
+                        fleet_summary: Default::default(),
                         history_tab_active: false,
                         git_tab_active: false,
                         agents_open: false,
@@ -11676,7 +12104,7 @@ mod tests {
                         workspaces: &[],
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
-                        fleet_count: 0,
+                        fleet_summary: Default::default(),
                         history_tab_active: false,
                         git_tab_active: false,
                         agents_open: false,
@@ -11896,7 +12324,7 @@ mod tests {
                         workspaces: &[],
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
-                        fleet_count: 0,
+                        fleet_summary: Default::default(),
                         history_tab_active: false,
                         git_tab_active: false,
                         agents_open: false,
@@ -12039,7 +12467,7 @@ mod tests {
                         workspaces: &[],
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
-                        fleet_count: 0,
+                        fleet_summary: Default::default(),
                         history_tab_active: false,
                         git_tab_active: false,
                         agents_open: false,
@@ -12423,7 +12851,7 @@ mod tests {
                         workspaces: &[],
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
-                        fleet_count: 0,
+                        fleet_summary: Default::default(),
                         history_tab_active: false,
                         git_tab_active: false,
                         agents_open: false,
@@ -12558,7 +12986,7 @@ mod tests {
                         workspaces,
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
-                        fleet_count: 0,
+                        fleet_summary: Default::default(),
                         history_tab_active: false,
                         git_tab_active: false,
                         agents_open: false,
@@ -12739,6 +13167,8 @@ mod tests {
                 pane: runtime::MuxPaneId("pane-b".to_owned()),
                 session: Some(runtime::SessionId(42)),
                 title: "Session B".to_owned(),
+                title_is_custom: true,
+                agent_model: None,
                 status: None,
                 summary: String::new(),
                 focused: false,
@@ -12833,6 +13263,8 @@ mod tests {
                     pane: runtime::MuxPaneId("pane-a".to_owned()),
                     session: Some(runtime::SessionId(42)),
                     title: "Session A".to_owned(),
+                    title_is_custom: true,
+                    agent_model: None,
                     status: None,
                     summary: String::new(),
                     focused: false,
@@ -12860,7 +13292,7 @@ mod tests {
                         workspaces: &workspaces,
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
-                        fleet_count: 0,
+                        fleet_summary: Default::default(),
                         history_tab_active: false,
                         git_tab_active: false,
                         agents_open: false,
@@ -12916,6 +13348,8 @@ mod tests {
                         pane: runtime::MuxPaneId("pane-a".to_owned()),
                         session: Some(runtime::SessionId(1)),
                         title: "Session A".to_owned(),
+                        title_is_custom: true,
+                        agent_model: None,
                         status: None,
                         summary: String::new(),
                         focused: false,
@@ -12938,6 +13372,8 @@ mod tests {
                         pane: runtime::MuxPaneId("pane-b".to_owned()),
                         session: Some(runtime::SessionId(2)),
                         title: "Session B".to_owned(),
+                        title_is_custom: true,
+                        agent_model: None,
                         status: None,
                         summary: String::new(),
                         focused: false,
@@ -12966,7 +13402,7 @@ mod tests {
                         workspaces: &workspaces,
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
-                        fleet_count: 0,
+                        fleet_summary: Default::default(),
                         history_tab_active: false,
                         git_tab_active: false,
                         agents_open: false,
@@ -13027,6 +13463,8 @@ mod tests {
                 pane: runtime::MuxPaneId("pane-b".to_owned()),
                 session: Some(runtime::SessionId(42)),
                 title: "Session B".to_owned(),
+                title_is_custom: true,
+                agent_model: None,
                 status: None,
                 summary: String::new(),
                 focused: false,
@@ -13109,6 +13547,8 @@ mod tests {
                 pane: runtime::MuxPaneId("pane-b".to_owned()),
                 session: Some(runtime::SessionId(42)),
                 title: "Session B".to_owned(),
+                title_is_custom: true,
+                agent_model: None,
                 status: None,
                 summary: String::new(),
                 focused: false,
@@ -13285,6 +13725,8 @@ mod tests {
                     pane: runtime::MuxPaneId("pane".to_owned()),
                     session: Some(runtime::SessionId(1)),
                     title: "Session".to_owned(),
+                    title_is_custom: true,
+                    agent_model: None,
                     status: None,
                     summary: String::new(),
                     focused: false,
@@ -13385,7 +13827,7 @@ mod tests {
                         workspaces: &[],
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
-                        fleet_count: 0,
+                        fleet_summary: Default::default(),
                         history_tab_active: false,
                         git_tab_active: false,
                         agents_open: false,
@@ -13475,7 +13917,7 @@ mod tests {
                         workspaces: &[],
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
-                        fleet_count: 0,
+                        fleet_summary: Default::default(),
                         history_tab_active: false,
                         git_tab_active: false,
                         agents_open: false,
@@ -13533,7 +13975,7 @@ mod tests {
             workspaces: &[],
             view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
             home_notice_count: 0,
-            fleet_count: 0,
+            fleet_summary: Default::default(),
             history_tab_active: false,
             git_tab_active: false,
             agents_open: false,
@@ -13639,7 +14081,7 @@ mod tests {
                         workspaces: &[],
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 4,
-                        fleet_count: 0,
+                        fleet_summary: Default::default(),
                         history_tab_active: false,
                         git_tab_active: false,
                         agents_open: false,
@@ -13803,7 +14245,7 @@ mod tests {
                         workspaces: &[],
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
-                        fleet_count: 0,
+                        fleet_summary: Default::default(),
                         history_tab_active: false,
                         git_tab_active: false,
                         agents_open: false,
@@ -14015,6 +14457,8 @@ mod tests {
                 pane: runtime::MuxPaneId("pane-cold".to_owned()),
                 session: None,
                 title: "Saved shell".to_owned(),
+                title_is_custom: true,
+                agent_model: None,
                 status: None,
                 summary: String::new(),
                 focused: false,
@@ -14240,7 +14684,7 @@ mod tests {
                         workspaces: &workspaces,
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
-                        fleet_count: 0,
+                        fleet_summary: Default::default(),
                         history_tab_active: false,
                         git_tab_active: false,
                         agents_open: false,

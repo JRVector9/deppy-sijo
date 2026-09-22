@@ -16946,11 +16946,9 @@ impl App {
     /// 정확히 이어갈 수 있는지, 같은 폴더의 최근 작업만 이어갈 수 있는지, 또는 새 실행만
     /// 가능한지를 표시하고 실제 재실행 인자를 선택하는 단일 근거다.
     fn push_archived_resume_presentation(&mut self) {
-        let Some(mux) = self.active.workspace_ui.mux().cloned() else {
-            return;
-        };
-        let presentations = archived_resume_targets_from_mux(
-            &mux,
+        let presentations = archived_resume_targets_for_frame(
+            self.active.workspace_ui.mux().map(Arc::as_ref),
+            &self.active.pending_events,
             &self.archived_agent_resume,
             self.agent_launcher_snapshot.as_ref(),
         )
@@ -16965,8 +16963,8 @@ impl App {
     /// PR-3: pane 하단 「다시 실행」 클릭 배선. workspace.rs(leaf)는 요청만 쌓고
     /// (check-boundary: leaf UI must not execute runtime protocol commands directly),
     /// 실제 RuntimeCommand 전송은 여기서 한다. 클릭 시점의 durable session identity와
-    /// 설치 감지 결과로 전략을 다시 계산한다. 메타데이터가 없는 레거시 pane은 UI의
-    /// 「새로 실행」 의미대로 빈 인자로 재실행한다.
+    /// 설치 감지 결과로 전략을 다시 계산한다. 메타데이터가 아직 없으면 실행을 보류하고,
+    /// 지원하지 않는 것으로 확인된 agent만 빈 추가 인자로 새로 실행한다.
     fn dispatch_respawn_archived_agent(&mut self, session: runtime::SessionId) -> bool {
         let Some(mux) = self.active.workspace_ui.mux().cloned() else {
             return false;
@@ -24933,6 +24931,9 @@ impl App {
         self.agent_launcher_detection_requested = true;
         self.agent_model_refresh.request();
         self.agent_model_pending_requests = [None, None];
+        // 포인터 입력·팝업 때문에 적용이 미뤄진 이전 세대 결과를 새로고침 뒤에
+        // 다시 표시하지 않는다. 현재 화면의 확정 스냅샷은 새 감지가 끝날 때까지 유지한다.
+        self.agent_launcher_pending_snapshot = None;
     }
 
     fn poll_agent_launcher_detection(&mut self) {
@@ -24945,16 +24946,16 @@ impl App {
                 std::mem::take(&mut self.claude_direct_defaults_ignore_next_completion);
             match outcome.into_result() {
                 Ok((generation, mut snapshot)) => {
+                    // 이전 설치 감지가 새 열기의 외부 조회나 Claude 기본값을 소비하지 않는다.
+                    if generation != self.agent_model_refresh.generation() {
+                        continue;
+                    }
                     if !ignore_claude_defaults {
                         let (model, effort) = snapshot.claude_defaults();
                         self.claude_direct_defaults = ClaudeDirectDefaults {
                             model: model.map(str::to_owned),
                             effort: effort.map(str::to_owned),
                         };
-                    }
-                    // 이전 설치 감지가 새 열기의 외부 조회를 소비하거나 표시를 되돌리지 않는다.
-                    if generation != self.agent_model_refresh.generation() {
-                        continue;
                     }
                     if let Some(previous) = self
                         .agent_launcher_pending_snapshot
@@ -30141,14 +30142,40 @@ impl eframe::App for App {
         }
         // 워크스페이스가 바뀌었으면 밀린 편집을 쓰고 새 메모를 읽는다(스냅샷 조립 전).
         self.sync_workspace_note(&active_workspace_id);
+        // 이미 만든 사이드바 행으로 집계한다. 전체 Fleet 카드/제목을 다시 조립하지 않는다.
+        let fleet_summary = crate::fleet::FleetNavSummary::collect(
+            sidebar_sessions.values().flatten().filter_map(|row| {
+                Some((
+                    row.target.workspace_id(),
+                    row.target.session()?,
+                    crate::agent_surface::AgentVisualState::from_pty_with_agent(
+                        row.status,
+                        row.agent_line.is_some(),
+                    ),
+                ))
+            }),
+            self.global_waiting
+                .iter()
+                .filter(|(ws, _, _)| workspace_visible_after_close(&self.closed_workspaces, ws))
+                .map(|(ws, session, _)| (ws.as_str(), *session)),
+            self.approvals_ui.pending().iter().map(|approval| {
+                approval
+                    .session_key()
+                    .and_then(deppy_core::parse_session_key)
+            }),
+            self.agent_sessions_ui
+                .fleet_states()
+                .filter(|(ws, _)| {
+                    ws.is_none_or(|ws| workspace_visible_after_close(&self.closed_workspaces, ws))
+                })
+                .map(|(_, state)| state),
+        );
         let sidebar_snapshot = ui::file_tree::SidebarSnapshot {
             active_workspace_id: &active_workspace_id,
             workspaces: &sidebar_workspaces,
             view: self.agent_terminal_ui.view(),
             home_notice_count: self.home_notice_unread,
-            // 「작업」 배지 = **나를 막고 있는 세션 수**. 벨 라벨과 같은 식이라 둘이 어긋나면
-            // 안 된다. 매 프레임 build_fleet_sessions를 돌리지 않는 싼 프록시다.
-            fleet_count: self.approvals_ui.pending().len() + self.global_waiting.len(),
+            fleet_summary,
             history_tab_active: self.work_history_tab.is_active(),
             git_tab_active: self.git_tab.is_active(),
             agents_open: self.agent_sessions_ui.is_open(),
@@ -30794,6 +30821,16 @@ impl eframe::App for App {
 
         // Worktree job completions are drained by logic(); render only emits bounded actions.
         // ── 관리/모니터 패널 부수효과 (매 프레임 — 통합 설정 창 표시 여부와 무관) ──
+        // 재개 정보가 먼저 도착했어도 이번에 복원될 pane으로 버튼 상태를 다시 만든다.
+        // 출력/커서 이벤트만 있는 프레임에는 map을 재생성하지 않는다.
+        if self
+            .active
+            .pending_events
+            .iter()
+            .any(|event| matches!(event, runtime::RuntimeEvent::MuxUpdated { .. }))
+        {
+            self.push_archived_resume_presentation();
+        }
         let events = std::mem::take(&mut self.active.pending_events);
         let central_view = self.agent_terminal_ui.view();
         let home_visible = central_view == ui::agent_terminal::AgentTerminalView::Home;
@@ -30890,6 +30927,15 @@ impl eframe::App for App {
         };
 
         let terminal_visible = central_view == ui::agent_terminal::AgentTerminalView::Terminal;
+        // 첨부 pane을 먼저 그리므로 검색 키는 모든 터미널의 raw 입력 처리보다 앞서 소비한다.
+        if terminal_visible
+            && self
+                .active
+                .workspace_ui
+                .handle_terminal_search_keys(ui.ctx())
+        {
+            self.cross_workspace_pane.focus_primary();
+        }
         // 보조 탭(이력·Git) chrome은 **탭이 열려 있고** 작업면이 보일 때만 존재한다.
         // 닫힘 상태와 홈/작업 페이지에서는 세션 헤더가 예전 그대로다 — X가 실제로
         // 탭을 없앤다.
@@ -33665,6 +33711,25 @@ fn archived_resume_target(
         presentation,
         extra_args: Some(plan.into_extra_args()),
     }
+}
+
+/// 재개 정보와 pane 복원 이벤트가 어느 순서로 도착해도 같은 프레임의 대상을 쓴다.
+fn archived_resume_targets_for_frame(
+    current_mux: Option<&runtime::MuxSnapshot>,
+    events: &[runtime::RuntimeEvent],
+    rows: &std::collections::HashMap<String, storage::ArchivedAgentResumeRow>,
+    detection: Option<&crate::agent_launcher::DetectionSnapshot>,
+) -> std::collections::HashMap<runtime::SessionId, ArchivedResumeTarget> {
+    let mux = events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            runtime::RuntimeEvent::MuxUpdated { snapshot } => Some(snapshot.as_ref()),
+            _ => None,
+        })
+        .or(current_mux);
+    mux.map(|mux| archived_resume_targets_from_mux(mux, rows, detection))
+        .unwrap_or_default()
 }
 
 fn archived_resume_targets_from_mux(
@@ -37095,6 +37160,44 @@ mod tests {
             &HashMap::new(),
             &direct_codex
         ));
+    }
+
+    #[test]
+    fn launcher_새로고침은_보류된_이전_스냅샷을_버린다() {
+        let source = include_str!("app.rs");
+        let refresh = source
+            .split_once("    fn request_agent_launcher_refresh(&mut self) {")
+            .and_then(|(_, tail)| {
+                tail.split_once("    fn poll_agent_launcher_detection(&mut self)")
+            })
+            .map(|(body, _)| body)
+            .expect("런처 새로고침 함수가 있어야 한다");
+
+        assert!(
+            refresh.contains("self.agent_launcher_pending_snapshot = None;"),
+            "새 generation을 시작할 때 이전 generation의 보류 스냅샷을 폐기해야 한다"
+        );
+    }
+
+    #[test]
+    fn launcher_detection은_현재_세대만_claude_기본값에_반영한다() {
+        let source = include_str!("app.rs");
+        let poll = source
+            .split_once("    fn poll_agent_launcher_detection(&mut self) {")
+            .and_then(|(_, tail)| tail.split_once("    fn handle_agent_launcher_intent("))
+            .map(|(body, _)| body)
+            .expect("런처 감지 polling 함수가 있어야 한다");
+        let generation_check = poll
+            .find("if generation != self.agent_model_refresh.generation()")
+            .expect("감지 결과의 generation 검사가 있어야 한다");
+        let defaults_update = poll
+            .find("self.claude_direct_defaults = ClaudeDirectDefaults")
+            .expect("Claude 기본값 갱신이 있어야 한다");
+
+        assert!(
+            generation_check < defaults_update,
+            "폐기할 이전 generation은 Claude 기본값을 덮어쓰면 안 된다"
+        );
     }
 
     #[test]
@@ -47399,6 +47502,38 @@ mod tests {
         assert_eq!(
             target.extra_args.as_deref(),
             Some(["-c".to_owned()].as_slice())
+        );
+    }
+
+    #[test]
+    fn archived_resume_projection은_메타데이터_이후_도착한_mux를_같은_프레임에_반영한다() {
+        let rows = HashMap::from([(
+            "persistent-claude".to_owned(),
+            archived_resume_row(
+                "persistent-claude",
+                "deppy-builtin-claude",
+                Some(("claude", "native")),
+            ),
+        )]);
+        let installed = crate::agent_launcher::DetectionSnapshot::from_test_agents([(
+            crate::agent_launcher::AgentKind::Claude,
+            PathBuf::from("/opt/claude"),
+        )]);
+        let events = vec![runtime::RuntimeEvent::MuxUpdated {
+            snapshot: Arc::new(archived_resume_test_mux("persistent-claude")),
+        }];
+        let targets = archived_resume_targets_for_frame(None, &events, &rows, Some(&installed));
+        assert_eq!(
+            targets.get(&runtime::SessionId(9)).map(|t| t.presentation),
+            Some(ArchivedResumePresentation::Exact)
+        );
+        // 현재 mux가 이전 pane을 가리켜도 이번 이벤트의 새 pane이 우선한다.
+        let previous = archived_resume_test_mux("previous-session");
+        let targets =
+            archived_resume_targets_for_frame(Some(&previous), &events, &rows, Some(&installed));
+        assert_eq!(
+            targets.get(&runtime::SessionId(9)).map(|t| t.presentation),
+            Some(ArchivedResumePresentation::Exact)
         );
     }
 

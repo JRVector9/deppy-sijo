@@ -2032,6 +2032,35 @@ pub enum SessionFolderRequest {
     OpenInFinder(SessionId),
 }
 
+/// 검색 입력창이 직접 처리하는 키 동작.
+#[derive(Clone, Copy)]
+enum TerminalSearchKey {
+    Next,
+    Previous,
+    Close,
+}
+
+fn terminal_search_key(event: &egui::Event) -> Option<TerminalSearchKey> {
+    let egui::Event::Key {
+        key,
+        pressed: true,
+        modifiers,
+        ..
+    } = event
+    else {
+        return None;
+    };
+    if modifiers.ctrl || modifiers.alt || modifiers.command || modifiers.mac_cmd {
+        return None;
+    }
+    match key {
+        egui::Key::Enter if modifiers.shift => Some(TerminalSearchKey::Previous),
+        egui::Key::Enter => Some(TerminalSearchKey::Next),
+        egui::Key::Escape => Some(TerminalSearchKey::Close),
+        _ => None,
+    }
+}
+
 /// 터미널 텍스트 검색 세션 상태 (T3).
 struct TerminalSearch {
     /// 검색 대상 세션 — 이 세션의 pane에만 검색 바를 그린다.
@@ -2040,6 +2069,8 @@ struct TerminalSearch {
     query: String,
     /// worker에 마지막으로 요청한 쿼리 — 바뀔 때만 재검색한다(매 프레임 재검색 금지).
     requested: Option<String>,
+    /// 현재 검색의 전송 승인 추적. 이전 검색의 늦은 실패는 새 검색을 무효화하지 않는다.
+    delivery: Option<(WorkspaceProtocolOperation, u64)>,
     /// 최근 검색 결과(화면 최하단 우선 정렬).
     matches: Vec<terminal::ScrollbackMatch>,
     /// 검색 시점의 전체 라인 수 — 스크롤 목표 클램프에 쓴다.
@@ -2050,6 +2081,8 @@ struct TerminalSearch {
     current: usize,
     /// 이번 프레임에 입력창 포커스를 요청해야 하는지.
     focus_input: bool,
+    /// 직전 렌더의 입력 위젯. 터미널이 그려지기 전에 검색 키를 소비할 때 사용한다.
+    input_id: Option<egui::Id>,
     /// 다음 렌더에서 current 매치가 화면에 보이도록 스크롤해야 하는지.
     scroll_to_current: bool,
 }
@@ -3889,6 +3922,14 @@ impl WorkspaceUi {
         let Some(pending) = self.protocol_inflight.remove(&key) else {
             return;
         };
+        if let Some(search) = self.search.as_mut()
+            && search.delivery == Some(key)
+        {
+            search.delivery = None;
+            if completion.result == Err(WorkspaceProtocolErrorCode::Busy) {
+                search.requested = None;
+            }
+        }
         let split_delivery_matches = self
             .split_drag
             .as_ref()
@@ -4203,11 +4244,13 @@ impl WorkspaceUi {
                     session,
                     query: String::new(),
                     requested: None,
+                    delivery: None,
                     matches: Vec::new(),
                     total_lines: 0,
                     capped: false,
                     current: 0,
                     focus_input: true,
+                    input_id: None,
                     scroll_to_current: false,
                 });
             }
@@ -4216,11 +4259,80 @@ impl WorkspaceUi {
 
     /// 검색 바를 닫고 원래 터미널로 포커스를 되돌린다 (T3).
     fn close_search(&mut self) {
-        self.search = None;
+        let Some(search) = self.search.take() else {
+            return;
+        };
         // 실제 refocus는 다음 프레임 render_pane에서 pending_focus로 소비된다.
-        if let Some(pane) = self.mux.as_ref().and_then(|mux| mux.focused_pane.clone()) {
-            self.begin_terminal_refocus(pane);
+        if let Some(pane) = self.mux.as_ref().and_then(|mux| {
+            mux.tabs
+                .iter()
+                .flat_map(|tab| &tab.panes)
+                .find(|pane| pane.session_id == Some(search.session))
+                .map(|pane| pane.id.clone())
+        }) {
+            self.request_pane_focus(pane);
         }
+    }
+
+    /// 다른 분할 pane이 PTY 이벤트를 읽기 전에 검색창 소유의 키를 소비한다.
+    /// Esc는 egui의 프레임 시작 때 포커스가 해제되므로 직전 소유자도 확인한다.
+    pub fn handle_terminal_search_keys(&mut self, ctx: &egui::Context) -> bool {
+        let Some(input_id) = self.search.as_ref().and_then(|search| search.input_id) else {
+            return false;
+        };
+        if ctx.any_popup_open()
+            || ctx.memory(|memory| {
+                memory
+                    .areas()
+                    .visible_layer_ids()
+                    .iter()
+                    .any(is_blocking_terminal_window)
+            })
+            || !ctx.memory(|memory| {
+                memory.has_focus(input_id)
+                    || (memory.focused().is_none() && memory.had_focus_last_frame(input_id))
+            })
+        {
+            return false;
+        }
+        let (next, previous, close) = ctx.input_mut(|input| {
+            let mut next = false;
+            let mut previous = false;
+            let mut close = false;
+            input.events.retain(|event| {
+                match terminal_search_key(event) {
+                    Some(TerminalSearchKey::Next) => next = true,
+                    Some(TerminalSearchKey::Previous) => previous = true,
+                    Some(TerminalSearchKey::Close) => close = true,
+                    None => return true,
+                }
+                false
+            });
+            if next || previous || close {
+                // PTY 매퍼는 egui의 소비 목록이 아닌 raw 사본을 읽는다.
+                input
+                    .raw
+                    .events
+                    .retain(|event| terminal_search_key(event).is_none());
+            }
+            (next, previous, close)
+        });
+        if close {
+            self.close_search();
+        } else if (next || previous)
+            && let Some(search) = self.search.as_mut()
+        {
+            let count = search.matches.len();
+            if count > 0 {
+                search.current = if previous {
+                    (search.current + count - 1) % count
+                } else {
+                    (search.current + 1) % count
+                };
+                search.scroll_to_current = true;
+            }
+        }
+        next || previous || close
     }
 
     /// 터미널 검색 UI (T3): 뷰포트에 보이는 매치 하이라이트 + 우상단 검색 바 + 이동 스크롤.
@@ -4235,10 +4347,10 @@ impl WorkspaceUi {
         cell_size: egui::Vec2,
         snapshot: &TerminalViewportSnapshot,
         catalog: &i18n::Catalog,
-    ) {
+    ) -> bool {
         // 이 pane의 세션에 대한 검색만 그린다.
         if self.search.as_ref().map(|s| s.session) != Some(session) {
-            return;
+            return false;
         }
 
         // 1) 뷰포트에 보이는 매치 하이라이트. 뷰포트 행 = scroll_offset + rows-1 - line_from_bottom
@@ -4267,7 +4379,7 @@ impl WorkspaceUi {
         // 2) current 매치가 화면에 보이도록 스크롤(Scroll delta 양수 = 과거로 = display_offset↑).
         let scroll_delta = {
             let Some(search) = self.search.as_mut() else {
-                return;
+                return false;
             };
             if search.scroll_to_current {
                 search.scroll_to_current = false;
@@ -4285,13 +4397,17 @@ impl WorkspaceUi {
             }
         };
         if let Some(delta) = scroll_delta {
-            self.send(RuntimeCommand::Scroll { session, delta });
+            if self.send_keep_selection(RuntimeCommand::Scroll { session, delta }) {
+                self.clear_selection(session);
+            } else if let Some(search) = self.search.as_mut() {
+                search.scroll_to_current = true;
+            }
         }
 
         // 3) 우상단 검색 바.
         let (mut query, focus_input, match_count, current, capped) = {
             let Some(search) = self.search.as_ref() else {
-                return;
+                return false;
             };
             (
                 search.query.clone(),
@@ -4304,13 +4420,17 @@ impl WorkspaceUi {
         let mut do_next = false;
         let mut do_prev = false;
         let mut do_close = false;
+        let input_id = ui.make_persistent_id(("terminal_search_input", session));
+        if let Some(search) = self.search.as_mut() {
+            search.input_id = Some(input_id);
+        }
 
         let bar_width = 280.0;
         let pos = egui::pos2(
             (term_rect.right() - bar_width - 8.0).max(term_rect.left() + 4.0),
             term_rect.top() + 8.0,
         );
-        egui::Area::new(egui::Id::new(("terminal_search", session)))
+        let bar = egui::Area::new(egui::Id::new(("terminal_search", session)))
             .order(egui::Order::Foreground)
             .fixed_pos(pos)
             .constrain_to(term_rect)
@@ -4320,6 +4440,8 @@ impl WorkspaceUi {
                     ui.horizontal(|ui| {
                         let resp = ui.add(
                             egui::TextEdit::singleline(&mut query)
+                                .id(input_id)
+                                .return_key(None)
                                 .desired_width(120.0)
                                 .hint_text(catalog.t("workspace.search.hint", &[])),
                         );
@@ -4359,38 +4481,31 @@ impl WorkspaceUi {
                         {
                             do_close = true;
                         }
-                        // 키 입력은 입력창이 포커스일 때만 소비(터미널로 안 흘러감).
-                        // Enter=다음, Shift+Enter=이전, Esc=닫기.
-                        if resp.has_focus() {
-                            let (enter, esc, shift) = ui.input(|i| {
-                                (
-                                    i.key_pressed(egui::Key::Enter),
-                                    i.key_pressed(egui::Key::Escape),
-                                    i.modifiers.shift,
-                                )
-                            });
-                            if esc {
-                                do_close = true;
-                            } else if enter {
-                                if shift {
-                                    do_prev = true;
-                                } else {
-                                    do_next = true;
-                                }
-                            }
-                        }
                     });
                 });
             });
+        let interacted = bar.response.contains_pointer()
+            && ui.input(|input| input.pointer.any_pressed() || input.pointer.any_released());
+        if !do_close && (do_next || do_prev) {
+            ui.memory_mut(|memory| memory.request_focus(input_id));
+        }
 
         // 4) 검색 바 조작 반영.
         {
             let Some(search) = self.search.as_mut() else {
-                return;
+                return false;
             };
             search.focus_input = false;
             if query != search.query {
                 search.query = query;
+                // 결과를 버렸으면 같은 문자열로 돌아와도 새 결과를 요청해야 한다.
+                search.requested = None;
+                search.delivery = None;
+                search.matches.clear();
+                search.total_lines = 0;
+                search.current = 0;
+                search.capped = false;
+                search.scroll_to_current = false;
             }
             let m = search.matches.len();
             if !do_close && m > 0 {
@@ -4406,30 +4521,52 @@ impl WorkspaceUi {
         }
         if do_close {
             self.close_search();
-            return;
+            return true;
         }
 
         // 5) 쿼리가 바뀌었을 때만 재검색을 요청한다(매 프레임 금지).
+        self.submit_terminal_search();
+        interacted
+    }
+
+    fn submit_terminal_search(&mut self) {
         let pending = self.search.as_ref().and_then(|s| {
             (s.requested.as_deref() != Some(s.query.as_str())).then(|| (s.session, s.query.clone()))
         });
         if let Some((sess, q)) = pending {
             let empty = q.trim().is_empty();
+            let delivery = if empty {
+                None
+            } else {
+                match self.queue_protocol_intent_tracked(RuntimeCommand::SearchScrollback {
+                    session: sess,
+                    query: q.clone(),
+                    max_matches: SEARCH_MAX_MATCHES,
+                }) {
+                    Ok(key) => Some(key),
+                    Err(code) => {
+                        self.report_protocol_queue_rejection(code, "terminal_search");
+                        // 크기 초과 등 영구 거절은 입력을 바꿀 때까지 다시 보내지 않는다.
+                        if code != WorkspaceProtocolErrorCode::Busy
+                            && let Some(search) = self.search.as_mut()
+                        {
+                            search.requested = Some(q);
+                            search.delivery = None;
+                        }
+                        return;
+                    }
+                }
+            };
             if let Some(s) = self.search.as_mut() {
-                s.requested = Some(q.clone());
+                // 큐에 들어간 쿼리만 기록한다. Busy이면 다음 completion 프레임에 재시도한다.
+                s.requested = Some(q);
+                s.delivery = delivery;
                 if empty {
                     s.matches.clear();
                     s.total_lines = 0;
                     s.capped = false;
                     s.current = 0;
                 }
-            }
-            if !empty {
-                self.send(RuntimeCommand::SearchScrollback {
-                    session: sess,
-                    query: q,
-                    max_matches: SEARCH_MAX_MATCHES,
-                });
             }
         }
     }
@@ -4664,8 +4801,8 @@ impl WorkspaceUi {
     /// 작업 설명이 아직 없는 에이전트 행에 표시할 안정적인 프로젝트 컨텍스트.
     /// App이 미리 계산한 프로젝트명을 우선하고, 없으면 현재 cwd의 폴더명을 쓴다.
     /// resolve_session_title과 같은 이유로 워크스페이스 자체 이름과 다르면 함께 밝힌다
-    /// (qualify_cwd_project_name 주석 참고) — 이 값이 실제로 에이전트 행 1행(헤드라인)에
-    /// 쓰이므로(session_title_lines의 status_line 우선 규칙) 착각은 주로 여기서 보인다.
+    /// (qualify_cwd_project_name 주석 참고). 사용자 이름이 있는 행에서는 이 컨텍스트가
+    /// 둘째 줄의 작업 설명 폴백으로 표시된다.
     fn session_project_context(&self, session: Option<SessionId>) -> Option<String> {
         session.and_then(|session| {
             let cwd = self.session_cwds.get(&session)?;
@@ -5456,6 +5593,8 @@ impl WorkspaceUi {
         catalog: &i18n::Catalog,
         input_enabled: bool,
     ) -> WorkspaceSurfaceOutput {
+        // App은 첨부 pane보다 먼저 호출한다. 독립 Workspace 렌더에서도 같은 경계를 지킨다.
+        self.handle_terminal_search_keys(ui.ctx());
         self.prepare_frame(ui.ctx(), events, catalog, input_enabled);
         request_terminal_os_drag_feedback_repaint(
             ui.ctx(),
@@ -6223,6 +6362,11 @@ impl WorkspaceUi {
                     output.focus_requested = true;
                     output.local_focus_claimed = Some(pane.id.clone());
                     self.request_pane_focus(pane.id.clone());
+                    // 분할 포커스 전환 중에도 검색은 첫 클릭에 연다. PTY 실행 도구는
+                    // 기존 입력 소유권 게이트를 유지한다.
+                    if matches!(icon, TerminalToolbarIcon::Search) {
+                        self.activate_terminal_toolbar(icon, &pane.id, config);
+                    }
                 }
             }
         }
@@ -6697,7 +6841,7 @@ impl WorkspaceUi {
                 .archived_resume_presentation
                 .get(&session)
                 .copied()
-                .unwrap_or(crate::agent_resume::ArchivedResumePresentation::Unsupported);
+                .unwrap_or(crate::agent_resume::ArchivedResumePresentation::Checking);
             let (message_key, button_key, action_enabled) = match presentation {
                 crate::agent_resume::ArchivedResumePresentation::Exact => (
                     "workspace.exited.app_restart",
@@ -6721,7 +6865,7 @@ impl WorkspaceUi {
                 ),
                 crate::agent_resume::ArchivedResumePresentation::Checking => (
                     "workspace.exited.resume_checking",
-                    "workspace.exited.respawn_new",
+                    "status.detecting",
                     false,
                 ),
             };
@@ -6741,7 +6885,7 @@ impl WorkspaceUi {
                 let mut notice_ui = ui.new_child(
                     egui::UiBuilder::new()
                         .max_rect(content_rect)
-                        .layout(egui::Layout::right_to_left(egui::Align::Center)),
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
                 );
                 notice_ui.set_clip_rect(content_rect.intersect(ui.clip_rect()));
                 notice_ui.spacing_mut().item_spacing.x = 12.0;
@@ -6868,6 +7012,12 @@ impl WorkspaceUi {
         // 동기화하므로, 기존 egui owner를 “요청할지”의 선행 조건으로 쓰지 않는다.
         let terminal_refocus_pending =
             mode.is_local() && self.pending_focus.as_ref() == Some(pane_id);
+        let search_input_focused = self.search.as_ref().is_some_and(|search| {
+            search.session == session
+                && ui.memory(|memory| {
+                    memory.has_focus(ui.make_persistent_id(("terminal_search_input", session)))
+                })
+        });
         let terminal_input_owner = input_enabled
             && if mode.is_local() {
                 terminal_input_owner(pane_id, focused, self.pending_focus.as_ref())
@@ -6881,6 +7031,7 @@ impl WorkspaceUi {
                 .any(is_blocking_terminal_window)
         });
         let terminal_keyboard_active = terminal_input_owner
+            && !search_input_focused
             && terminal_keyboard_input_allowed(
                 ui.ctx().text_edit_focused(),
                 ui.ctx().any_popup_open(),
@@ -6946,9 +7097,50 @@ impl WorkspaceUi {
             None => {}
         }
 
+        // 현재 표시 중인 스냅샷을 기준으로 하므로 리사이즈·복원 뒤의 과거 위치도 잡는다.
+        // 별도 행을 예약하지 않아 버튼 표시/숨김 때문에 PTY 크기가 다시 바뀌지 않는다.
+        let scroll_bottom_button = if snapshot.scroll_offset > 0 && !snapshot.is_alt_screen {
+            let mut bounds = pane_layout.content;
+            if exit_code.is_some() && !restored_readonly {
+                bounds.max.y -= 18.0; // 기존 종료 문구와 겹치지 않는다.
+            }
+            render_scroll_bottom_button(
+                ui,
+                bounds,
+                pane_interaction_id(mode, "scroll_bottom", pane_id),
+                catalog,
+            )
+        } else {
+            None
+        };
+        // 버튼이 처음 나타난 프레임에도 그 아래 URL 클릭/텍스트 선택으로 새지 않게 한다.
+        let over_scroll_bottom = scroll_bottom_button.as_ref().is_some_and(|button| {
+            ui.input(|input| {
+                input
+                    .pointer
+                    .latest_pos()
+                    .is_some_and(|pos| button.rect.contains(pos))
+            })
+        });
+        if scroll_bottom_button
+            .as_ref()
+            .is_some_and(egui::Response::clicked)
+        {
+            self.terminal_focus_claimed = true;
+            render_output.focus_requested |= !input_enabled || !mode.is_local();
+            if mode.is_local() {
+                render_output.local_focus_claimed = Some(pane_id.clone());
+                self.request_pane_focus(pane_id.clone());
+            }
+            self.scroll_session_to_bottom(session);
+            if input_enabled {
+                request_terminal_focus(&output.response);
+            }
+        }
+
         // 선택된 텍스트 위에서 시작한 드래그는 terminal-internal DnD payload가 된다.
         // 그 외의 마우스 드래그는 기존 셀 선택 동작을 유지한다.
-        if input_enabled && !egui::DragAndDrop::has_any_payload(ui.ctx()) {
+        if input_enabled && !over_scroll_bottom && !egui::DragAndDrop::has_any_payload(ui.ctx()) {
             let cell_at = |pos: egui::Pos2| -> usize {
                 let col = ((pos.x - output.origin.x) / output.cell_size.x)
                     .floor()
@@ -7146,9 +7338,12 @@ impl WorkspaceUi {
             self.explicit_pending_focus = None;
             self.explicit_pending_focus_observed = false;
             self.terminal_focus_claimed |= app_armed;
-            request_terminal_focus(&output.response);
+            // 검색을 클릭한 뒤 늦게 확정된 pane 포커스가 TextEdit 입력을 뺏지 않는다.
+            if !search_input_focused {
+                request_terminal_focus(&output.response);
+            }
         }
-        if terminal_primary_pointer_clicked(&output.response) {
+        if !over_scroll_bottom && terminal_primary_pointer_clicked(&output.response) {
             // Input ownership may still belong to a sibling primary/attached surface in this
             // frame. Report the click independently from `input_enabled` so App can surrender
             // any deferred Agents TextEdit focus before the next key event.
@@ -7217,8 +7412,10 @@ impl WorkspaceUi {
         }
 
         // 터미널 텍스트 검색 (T3): 매치 하이라이트 + 우상단 검색 바 + 스크롤 이동.
-        if mode.is_local() && input_enabled {
-            self.render_terminal_search(
+        // input_enabled는 PTY 키 전송 소유권이다. 분할 클릭의 press/release 때 false여도
+        // 검색창은 계속 등록해야 포커스·버튼 클릭과 Area 표시 수명이 유지된다.
+        if mode.is_local()
+            && self.render_terminal_search(
                 ui,
                 session,
                 output.response.rect,
@@ -7226,7 +7423,14 @@ impl WorkspaceUi {
                 output.cell_size,
                 &snapshot,
                 catalog,
-            );
+            )
+        {
+            self.terminal_focus_claimed = true;
+            render_output.focus_requested |= !input_enabled;
+            render_output.local_focus_claimed = Some(pane_id.clone());
+            if !focused {
+                self.request_pane_focus(pane_id.clone());
+            }
         }
 
         // 검색 TextEdit/팝업 같은 overlay가 renderer 뒤에서 포커스를 가져갈 수도 있으므로
@@ -7445,7 +7649,7 @@ impl WorkspaceUi {
 
         // 마우스 휠 → 스크롤백 (focused pane만 — 비활성 pane은 Viewport가
         // push되지 않아(14.4) 스크롤해도 화면이 안 바뀐다)
-        if input_enabled && surface_focused && output.response.hovered() {
+        if input_enabled && surface_focused && !over_scroll_bottom && output.response.hovered() {
             let scroll_y = ui.input(|i| i.smooth_scroll_delta.y);
             self.scroll_residual += scroll_y / output.cell_size.y;
             let whole_rows = self.scroll_residual.trunc() as i32;
@@ -7988,7 +8192,7 @@ impl WorkspaceUi {
                     .button(catalog.t("workspace.menu.scroll_bottom", &[]))
                     .clicked()
             {
-                self.send(RuntimeCommand::ScrollToBottom { session });
+                self.scroll_session_to_bottom(session);
                 ui.close();
             }
             // 세션 폴더 진입 동선 (2026-07-18 사용자): 파일 트리를 이 세션의 현재
@@ -8147,8 +8351,12 @@ impl WorkspaceUi {
                     .and_then(|v| v.last_output_at);
                 let osc = self.session_osc_title(pane.session_id);
                 let project_context = self.session_project_context(pane.session_id);
-                // 에이전트 정보(2/3행) — 있으면 3줄 렌더. codex/claude 병합본(App).
+                // 사용자 이름 판별은 자동 프로젝트/OSC 제목으로 바꾸기 전에 한다.
+                let title_is_custom = !is_default_session_title(&pane.title);
+                // 이름 유무에 따라 같은 두 줄 안에서 작업과 모델 정보의 위치를 바꾼다.
                 let info = pane.session_id.and_then(|s| self.agent_info.get(&s));
+                // 요약/요청이 없다는 이유로 새 세션으로 단정하지 않는다.
+                // transcript 미확인 세션도 기존 프로젝트/상태 설명을 유지한다.
                 let (agent_line, status_label, status_line) = match info {
                     Some(d) => (
                         Some(agent_info_line(d)),
@@ -8175,6 +8383,10 @@ impl WorkspaceUi {
                         osc.as_deref(),
                         catalog,
                     ),
+                    title_is_custom,
+                    agent_model: info
+                        .filter(|_| title_is_custom)
+                        .and_then(|d| d.model.clone()),
                     status,
                     summary,
                     focused: mux.focused_pane.as_ref() == Some(&pane.id),
@@ -8243,9 +8455,7 @@ impl WorkspaceUi {
         }
     }
 
-    /// 단축키(⌘↓)용 포커스된 pane을 스크롤백 맨 아래로 되돌린다. close_focused_pane과
-    /// 동일 구조 — 호출부(app crate의 단축키 처리부) 배선은 workspace.rs 밖이라 이 PR
-    /// 범위 밖이다 (호출부가 없어 현재는 미사용).
+    /// 앱의 단축키(⌘↓)가 지정한 포커스 pane을 스크롤백 맨 아래로 되돌린다.
     pub fn scroll_focused_to_bottom(&mut self) {
         let session = self.mux.as_ref().and_then(|mux| {
             mux.focused_pane.as_ref().and_then(|pane| {
@@ -8257,8 +8467,16 @@ impl WorkspaceUi {
             })
         });
         if let Some(session) = session {
-            self.send(RuntimeCommand::ScrollToBottom { session });
+            self.scroll_session_to_bottom(session);
         }
+    }
+
+    /// 클릭한 pane의 세션만 최신 출력으로 이동한다.
+    fn scroll_session_to_bottom(&mut self, session: SessionId) {
+        self.clear_selection(session);
+        self.scroll_residual = 0.0;
+        self.drag_autoscroll_residual = 0.0;
+        self.send(RuntimeCommand::ScrollToBottom { session });
     }
 
     /// 단축키(⌘⇧↑/↓)용 포커스된 pane을 이전/다음 프롬프트 마크(OSC 133)로 점프한다.
@@ -8826,6 +9044,46 @@ fn request_terminal_focus(response: &egui::Response) {
     });
 }
 
+/// pane 안에 떠 있는 버튼만 그린다. 터미널 레이아웃 커서와 가용 크기는 건드리지 않는다.
+fn render_scroll_bottom_button(
+    ui: &mut egui::Ui,
+    bounds: egui::Rect,
+    id: egui::Id,
+    catalog: &i18n::Catalog,
+) -> Option<egui::Response> {
+    let available = bounds.intersect(ui.clip_rect()).shrink(6.0);
+    if available.width() < 24.0 || available.height() < 28.0 {
+        return None;
+    }
+    let width = available.width().min(176.0);
+    let rect = egui::Rect::from_center_size(
+        egui::pos2(available.center().x, available.bottom() - 14.0),
+        egui::vec2(width, 28.0),
+    );
+    let label = catalog.t("workspace.menu.scroll_bottom", &[]);
+    let display = if width < 112.0 {
+        "↓".to_owned()
+    } else {
+        format!("↓ {label}")
+    };
+    let tokens = crate::ui::designall::tokens(ui.visuals());
+    let mut overlay = ui.new_child(egui::UiBuilder::new().id_salt(id).max_rect(rect).layout(
+        egui::Layout::centered_and_justified(egui::Direction::TopDown),
+    ));
+    overlay.set_clip_rect(available);
+    let response = overlay.add(
+        egui::Button::new(egui::RichText::new(display).size(12.0).color(tokens.text))
+            .fill(tokens.input_background)
+            .stroke(egui::Stroke::new(1.0, tokens.accent))
+            .corner_radius(egui::CornerRadius::same(14))
+            .truncate(),
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), &label)
+    });
+    Some(response.on_hover_text(label))
+}
+
 fn terminal_primary_pointer_clicked(response: &egui::Response) -> bool {
     response.clicked_by(egui::PointerButton::Primary)
 }
@@ -9097,7 +9355,7 @@ fn terminal_should_copy_selection(
 /// Agents and the diff review panel are floating but non-modal. A terminal
 /// click must be able to reclaim focus while they remain open;
 /// confirmation/error windows continue to block terminal input as before.
-fn is_blocking_terminal_window(layer: &egui::LayerId) -> bool {
+pub(super) fn is_blocking_terminal_window(layer: &egui::LayerId) -> bool {
     layer.order == egui::Order::Middle
         && layer.id != crate::ui::agent_sessions::agents_window_id()
         && layer.id != crate::ui::diff_panel::diff_window_id()
@@ -9472,6 +9730,77 @@ mod tests {
             });
         }
         commands
+    }
+
+    #[test]
+    fn scroll_bottom_action은_대상_선택과_잔여_스크롤을_해제한다() {
+        let mut ui = WorkspaceUi::new();
+        let session = SessionId(7);
+        ui.selection = Some((session, 1, 8));
+        ui.scroll_residual = 0.75;
+        ui.drag_autoscroll_residual = 0.5;
+        ui.scroll_session_to_bottom(session);
+        assert!(
+            ui.selection.is_none(),
+            "선택 freeze가 최신 화면 복귀를 막으면 안 됨"
+        );
+        assert_eq!(ui.scroll_residual, 0.0);
+        assert_eq!(ui.drag_autoscroll_residual, 0.0);
+        let commands = drain_protocol(&mut ui);
+        assert!(
+            matches!(commands.as_slice(), [RuntimeCommand::ScrollToBottom { session: id }] if *id == session)
+        );
+        // 다른 pane의 선택은 보존하며 포커스된 세션으로 대상을 바꾸지 않는다.
+        ui.selection = Some((SessionId(9), 2, 5));
+        ui.scroll_session_to_bottom(session);
+        assert_eq!(ui.selection, Some((SessionId(9), 2, 5)));
+        let commands = drain_protocol(&mut ui);
+        assert!(
+            matches!(commands.as_slice(), [RuntimeCommand::ScrollToBottom { session: id }] if *id == session)
+        );
+    }
+
+    #[test]
+    fn search_request는_큐_포화_뒤_최신_검색만_재전송한다() {
+        let mut ui = WorkspaceUi::new();
+        let session = SessionId(7);
+        ui.open_search_for_session(session);
+        ui.search.as_mut().unwrap().query = "api-key".to_owned();
+        for _ in 0..WORKSPACE_PROTOCOL_CAP {
+            ui.queue_protocol_intent(RuntimeCommand::FocusPane { pane: pane_id("p") })
+                .unwrap();
+        }
+        ui.submit_terminal_search();
+        assert_eq!(ui.search.as_ref().unwrap().requested, None);
+        drain_protocol(&mut ui);
+        ui.search.as_mut().unwrap().query = "api-key-new".to_owned();
+        ui.submit_terminal_search();
+        ui.submit_terminal_search();
+        let commands = drain_protocol(&mut ui);
+        assert!(
+            matches!(commands.as_slice(), [RuntimeCommand::SearchScrollback { session: target, query, .. }] if *target == session && query == "api-key-new")
+        );
+        ui.submit_terminal_search();
+        assert!(drain_protocol(&mut ui).is_empty());
+        ui.search.as_mut().unwrap().query = "delivery-retry".to_owned();
+        ui.submit_terminal_search();
+        let intent = ui.take_protocol_intent().unwrap();
+        ui.complete_protocol(WorkspaceProtocolCompletion {
+            operation: intent.operation(),
+            generation: intent.generation(),
+            result: Err(WorkspaceProtocolErrorCode::Busy),
+        });
+        assert_eq!(ui.search.as_ref().unwrap().requested, None);
+        ui.submit_terminal_search();
+        let commands = drain_protocol(&mut ui);
+        assert!(
+            matches!(commands.as_slice(), [RuntimeCommand::SearchScrollback { query, .. }] if query == "delivery-retry")
+        );
+        ui.search.as_mut().unwrap().query = "x".repeat(WORKSPACE_PROTOCOL_QUERY_MAX_BYTES + 1);
+        ui.submit_terminal_search();
+        let search = ui.search.as_ref().unwrap();
+        assert_eq!(search.requested.as_deref(), Some(search.query.as_str()));
+        assert!(drain_protocol(&mut ui).is_empty());
     }
 
     fn take_error_message(ui: &mut WorkspaceUi, catalog: &i18n::Catalog) -> Option<String> {
@@ -19156,7 +19485,13 @@ https://example.test/login \
                 harness.query_by_label(&message).is_some(),
                 "missing {message_key}"
             );
-            harness.get_by_label(&new_label).click();
+            let button_label =
+                if presentation == crate::agent_resume::ArchivedResumePresentation::Checking {
+                    catalog.t("status.detecting", &[])
+                } else {
+                    new_label.clone()
+                };
+            harness.get_by_label(&button_label).click();
             harness.step();
             assert_eq!(
                 harness.state_mut().take_respawn_archived_request(),

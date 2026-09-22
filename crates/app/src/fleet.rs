@@ -11,6 +11,73 @@
 
 use crate::agent_surface::AgentVisualState;
 
+/// 작업 메뉴의 상태별 건수. 상태 없는 셸·비활성 저장 행은 알림에서 제외한다.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FleetNavSummary {
+    pub blocked: usize,
+    pub errored: usize,
+    pub running: usize,
+    pub idle: usize,
+    pub complete: usize,
+}
+
+impl FleetNavSummary {
+    pub fn collect<'a>(
+        sessions: impl IntoIterator<Item = (&'a str, runtime::SessionId, AgentVisualState)>,
+        waiting: impl IntoIterator<Item = (&'a str, runtime::SessionId)>,
+        approvals: impl IntoIterator<Item = Option<(&'a str, runtime::SessionId)>>,
+        structured: impl IntoIterator<Item = AgentVisualState>,
+    ) -> Self {
+        // 대기가 없으면 힙 할당 없이 끝난다. 문자열·세션 행 전체는 복제하지 않는다.
+        let mut blocked: std::collections::HashSet<_> = waiting.into_iter().collect();
+        let mut summary = Self::default();
+        for approval in approvals {
+            if let Some(key) = approval {
+                blocked.insert(key);
+            } else {
+                // 세션이 없거나 연결 키를 모르는 승인도 사용자의 처리가 필요하다.
+                summary.blocked += 1;
+            }
+        }
+        summary.blocked += blocked.len();
+        for (workspace, session, state) in sessions {
+            if !blocked.contains(&(workspace, session)) {
+                summary.add(state);
+            }
+        }
+        for state in structured {
+            summary.add(state);
+        }
+        summary
+    }
+
+    fn add(&mut self, state: AgentVisualState) {
+        match state {
+            AgentVisualState::Waiting | AgentVisualState::NeedsResponse => self.blocked += 1,
+            AgentVisualState::Error => self.errored += 1,
+            AgentVisualState::Active => self.running += 1,
+            AgentVisualState::Idle => self.idle += 1,
+            AgentVisualState::Complete => self.complete += 1,
+            AgentVisualState::Off => {}
+        }
+    }
+
+    pub fn counts(self) -> [(AgentVisualState, usize); 5] {
+        [
+            (AgentVisualState::Waiting, self.blocked),
+            (AgentVisualState::Error, self.errored),
+            (AgentVisualState::Active, self.running),
+            (AgentVisualState::Complete, self.complete),
+            (AgentVisualState::Idle, self.idle),
+        ]
+    }
+
+    /// 여러 상태가 섞이면 사용자 조치가 필요한 상태부터 표시한다.
+    pub fn primary(self) -> Option<(AgentVisualState, usize)> {
+        self.counts().into_iter().find(|(_, count)| *count > 0)
+    }
+}
+
 /// fleet 그리드의 세션 행 하나. App이 active/warm 런타임의 여러 필드에서 조립한
 /// 읽기전용 스냅샷이다(leaf+intent+host I/O 경계: UI는 이 스냅샷만 그린다).
 #[derive(Debug, Clone, PartialEq)]
@@ -104,11 +171,11 @@ impl FleetSession {
     }
 }
 
-/// fleet 상태별 세션 수 총합. 상단 요약 스트립·배지에 쓴다.
+/// fleet 상태별 세션 수 총합. 작업 화면의 상단 요약 스트립에 쓴다.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FleetSummary {
     pub total: usize,
-    /// 나를 막고 있는 수 — 헤더 칩과 nav 배지가 같이 쓴다.
+    /// 나를 막고 있는 수 — 작업 화면의 헤더 칩에 쓴다.
     pub blocked: usize,
     pub active: usize,
     pub errored: usize,
@@ -208,6 +275,78 @@ pub fn format_blocked_duration(now: i64, since: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nav_summary_상태별_집계와_우선순위() {
+        use AgentVisualState::*;
+        let mut summary = FleetNavSummary::collect(
+            [Waiting, NeedsResponse, Error, Active, Idle, Complete, Off]
+                .into_iter()
+                .enumerate()
+                .map(|(id, state)| ("ws", runtime::SessionId(id as u64), state)),
+            [],
+            [],
+            [],
+        );
+        assert_eq!(
+            summary,
+            FleetNavSummary {
+                blocked: 2,
+                errored: 1,
+                running: 1,
+                idle: 1,
+                complete: 1,
+            }
+        );
+        assert_eq!(summary.primary(), Some((Waiting, 2)));
+        summary.blocked = 0;
+        assert_eq!(summary.primary(), Some((Error, 1)));
+        summary.errored = 0;
+        assert_eq!(summary.primary(), Some((Active, 1)));
+        summary.running = 0;
+        assert_eq!(summary.primary(), Some((Complete, 1)));
+        summary.complete = 0;
+        assert_eq!(summary.primary(), Some((Idle, 1)));
+        summary.idle = 0;
+        assert_eq!(summary.primary(), None);
+    }
+
+    #[test]
+    fn nav_summary_승인과_입력대기_중복제거는_워크스페이스별() {
+        use AgentVisualState::*;
+        let id = runtime::SessionId(1);
+        let summary = FleetNavSummary::collect(
+            [("a", id, Active), ("b", id, Active)],
+            [("a", id)],
+            [Some(("a", id)), Some(("a", id))],
+            [],
+        );
+        assert_eq!(summary.blocked, 1);
+        assert_eq!(
+            summary.running, 1,
+            "다른 프로젝트의 같은 세션 번호는 별개다"
+        );
+        assert_eq!(summary.primary(), Some((Waiting, 1)));
+    }
+
+    #[test]
+    fn nav_summary_세션_없는_승인과_구조화_상태를_포함한다() {
+        use AgentVisualState::*;
+        let summary = FleetNavSummary::collect(
+            [],
+            [],
+            [Some(("closed-pty", runtime::SessionId(7))), None],
+            [Waiting, Active, Off],
+        );
+        assert_eq!(summary.blocked, 3);
+        assert_eq!(summary.running, 1);
+        assert_eq!(summary.complete, 0);
+        assert_eq!(
+            FleetNavSummary::collect([], [], [None], []).primary(),
+            Some((Waiting, 1))
+        );
+        assert_eq!(FleetNavSummary::collect([], [], [], [Off]).primary(), None);
+    }
 
     fn session(workspace: &str, title: &str, state: AgentVisualState) -> FleetSession {
         FleetSession {

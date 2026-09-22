@@ -852,6 +852,18 @@ impl AgentSessionsUi {
             .map(|session| session.id.as_str())
     }
 
+    /// 작업 메뉴 집계에는 제목·모델·행 벡터를 복제하지 않고 상태만 빌려준다.
+    pub fn fleet_states(
+        &self,
+    ) -> impl Iterator<Item = (Option<&str>, crate::agent_surface::AgentVisualState)> {
+        self.sessions.iter().map(|session| {
+            (
+                session.workspace_id.as_deref(),
+                crate::agent_surface::AgentVisualState::from_structured(session.status),
+            )
+        })
+    }
+
     pub fn fleet_rows(&self) -> Vec<FleetStructuredRow> {
         self.sessions
             .iter()

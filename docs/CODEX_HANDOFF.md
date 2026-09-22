@@ -4058,3 +4058,382 @@
 - 수정 범위는 `crates/app/src/ui/file_tree.rs`와 이 문서. renderer 수정은 이미7c8636b에 커밋됐다. 세션 보완은 별도 커밋으로 저장하며 push/main merge는 요청받지 않아 하지 않는다. 코드리뷰 범위에서 추가 확정 문제 없음. 새 세션 순서는 기존 config 경로로 저장한다.
 - 남음: 실행 중인 PID85155의 앱은 수정 전 bundle이다. 사용자 요청이 있을 때만 누적 수정으로 새 signed release bundle을 빌드·재실행해 실제 세션 행 드래그(위/아래), 삽입선, 클릭/닫기/우클릭을 화면에서 확인한다. 현재 UI 적용 완료라고 보고하지 않는다. 기존 grapheme/비활성 세션 상태 후속 개발은 이번 범위 밖 미완료다.
 - 다음 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git log -3 --oneline`; `cat /tmp/deppy-session-drag-20260919/final.log`; `tail -n 10 /tmp/deppy-session-drag-clippy-20260919.log`. 새 코드 변경이 없으면 통과한 gate를 반복하지 않는다.
+
+
+## 2026-09-20 최신 렌더·세션 드래그 수정 재빌드 / 재실행 진행
+
+- 사용자 `재빌드하고 재실행해` 명시 승인으로 최신 **f042082df73288796690d1790e14d82ec9bfc0de**를 적용한다. 제품 소스 변경 없음. 7c8636b 문자 폭·폰트 cache 보완과 f042082 세션 빠른 드래그 보완 및 앞선 e5e6614 누적 수정이 포함된다.
+- 빌드 완료: clean 소스 추적1070개 SHA256을 `/tmp/deppy-render-drag-source-20260920.json`에 고정했다. `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo build --locked --release -p deppy-sijo -p mcp-proxy` 실제 exit0, **4분07초**. 로그 `/tmp/deppy-render-drag-release-build-20260920.log`. 스왑 사용35GiB 이상이지만 rustc CPU/로그 진행을 확인해 중단하지 않았다. 새 테스트/커밋 gate 반복 없음.
+- 패키징 완료: `/private/tmp/deppy-render-drag-20260920-gjpwi92t/Deppy Sijo.app`에 앱/helper를 별도 복사·strip·기존 Developer ID Application: VectorNine INC (ZDTU5LS35K)로 서명했다. strict codesign·Info.plist 검사 및 app/helper/bundle 지정 요구사항의 이전 버전과 동일성 확인 성공. 패키징 전에 HEAD/추적 입력1070개 해시가 그대로인지 대조했다. 이전 실행 bundle은 덮어쓰지 않았다. manifest는 새 bundle 상위 build-manifest.json, 패키징 로그 `/tmp/deppy-render-drag-package-20260920.log`.
+- 현재 다음 단계: PID85155의 실행 경로가 `/private/tmp/deppy-api-editor-20260916-gjonofid/Deppy Sijo.app/Contents/MacOS/deppy-sijo`임을 재확인하고 정상 종료 후 새 bundle을 실행한다. CUA로 종료/실행하고 새 PID/바이너리 해시/창 표시를 확인한다. 정상 종료 실패 시 경로가 같은 정확한 PID에만 신호를 고려한다. 구버전 restart 스크립트의 PID95838을 재사용하지 않는다.
+- 변경 파일: 이 인계 문서만 후속 갱신. 아직 새 앱 재실행/화면 표시 성공으로 기록하지 않는다. 정확한 다음 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `python3 /tmp/deppy-render-drag-verify-20260920.py ready`; 재실행 후 `python3 /tmp/deppy-render-drag-verify-20260920.py record`; `cat /tmp/deppy-render-drag-restart-20260920.json`.
+
+
+### 2026-09-20 최신 빌드 재실행 완료
+
+- 정상 종료·실행: 기존 PID85155를 CUA Command-Q로 정상 종료했고 신호 fallback은 쓰지 않았다. 새 bundle 경로를 지정해 실행했다. 새 PID **56565**, 실행 파일 `/private/tmp/deppy-render-drag-20260920-gjpwi92t/Deppy Sijo.app/Contents/MacOS/deppy-sijo`. 실행 후 01:23 생존 및 같은 정확한 바이너리 경로를 다시 확인했다. `/tmp/deppy-render-drag-restart-20260920.json` verified=true, source_commit=f042082df73288796690d1790e14d82ec9bfc0de. build-manifest.json에도 app_restarted/running_pid/restarted_at을 갱신했다.
+- 화면: CUA AX에서 새 창·사이드바·14개 세션 및 저장된 프로젝트 목록이 표시됨을 확인하고 스크린샷으로 터미널/파일 트리 화면 표시를 확인했다. 실제 사용자의 Claude 원문자 출력·세션 드래그 전후 모든 동작 검증을 완료했다는 의미는 아니다. 새 앱으로 사용자가 직접 확인할 수 있는 상태다.
+- 도구 접근 실패 기록: 첫 CUA 종료 명령은 기존 binding의 Computer Use 상태가 활성화되지 않았다는 오류로 미실행됐다. getAXState로 최신 상태를 조회한 뒤 Command-Q를 다시 보내 정상 종료했고, 뒤따른 App quit 오류와 ps 결과로 종료를 확인했다. 우회 강제 종료나 불필요한 재빌드는 하지 않았다.
+- 완료/범위: f042082까지 누적 소스가 새 실행본에 적용됐다. 빌드/서명·입력 hash/실행 PID/창 확인 완료, 추가 제품 코드 수정·테스트 반복·push/main merge 없음. 이번 작업의 수정 파일은 이 docs/CODEX_HANDOFF.md뿐이며 후속 기록은 미커밋이다. 기존 grapheme 투영 손실·warm 상태 오분류 후속 개발은 별도 미완료다.
+- 다음 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git log -3 --oneline`; `ps -o pid,etime,comm -p 56565`; `cat /tmp/deppy-render-drag-restart-20260920.json`. 다음 빌드/재실행은 사용자가 요청할 때만 한다. 이전 PID85155를 재사용하지 않는다.
+
+
+## 2026-09-20 이어서 실행/새로 실행 판정 및 안내 버튼 위치 수정 진행
+
+- 사용자 요청: 복원 터미널의 이어서 실행/새로 실행 판정 확인 및 버튼을 왼쪽·가운데로 배치. 선택적 위치 질문을 보냈고 응답 전 기본 해석은 하단 안내줄 왼쪽·세로 가운데다. 재빌드·재실행은 이번 요청에 포함되지 않아 PID56565/f042082를 유지한다.
+- 확인: nomorevibe의 실제 저장된 Claude/Codex agent_id와 native binding이 모두 존재한다. DB read-only에서 필요한 종류/ID 존재 여부와 재개 플래그만 확인했고 대화·환경값·토큰은 출력하지 않았다. archived SQL preflight는 nomorevibe2행/Design1행/weather1행 모두 invalid0이다.
+- 원인: App이 재개 메타데이터/설치 결과 도착 때만 현재 WorkspaceUi.mux로 presentation을 만들지만, 활성 mux는 ui()의 show_with_input에서 나중에 반영된다. metadata가 먼저 오면 빈 map을 저장하고 뒤의 MuxUpdated에서 갱신하지 않는다. renderer도 map 미존재를 Unsupported로 오인해 활성 새로실행을 보이지만 실제 dispatch는 map이 없으면 false다.
+- 계획/현재 수정: 기존 current mux 기반 계산을 archived_resume_targets_for_frame에 추출하고 입력 순서를 재현하는 상태 로직 검사1개를 추가했다. 아직 기존 계산을 유지해 RED를 확인하는 단계다. 이후 가장 최근 MuxUpdated 우선+UI 그리기 직전 이벤트 때만 presentation 갱신, 미확정 상태는 Checking으로 보완한다. UI 위치 변경에는 새 UI 회귀검사를 늘리지 않는다.
+- 다음 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git diff --stat`; `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo test --locked -p deppy-sijo --bin deppy-sijo --features bench-alloc archived_resume_projection은_메타데이터_이후_도착한_mux -- --nocapture`. 이전 렌더·드래그 수정은 커밋되어 실행 중이며 현재 docs의 재실행 기록은 미커밋으로 보존한다.
+
+
+### 2026-09-20 복원 순서에 따른 재개 표시 누락 RED 확인 / 보완 완료
+
+- RED: `cargo test --locked -p deppy-sijo --bin deppy-sijo --features bench-alloc archived_resume_projection은_메타데이터_이후_도착한_mux -- --nocapture` **1 FAIL**, 실제 출력 None vs Some(Exact). `/tmp/deppy-resume-projection-red-20260920.log`. 기존 current mux 기반 동작을 helper로 그대로 추출한 뒤 메타데이터가 먼저이고 MuxUpdated가 뒤인 상태를 재현했다. 단순 UI 스냅샷 검사가 아니라 재개 대상 투영 로직 검사다.
+- 구현: App::push_archived_resume_presentation은 이번 pending_events의 마지막 MuxUpdated를 우선 사용한다. ui()에서 이벤트를 소비하기 전에 MuxUpdated가 있을 때만 다시 투영한다. 기존 Restore/BindingSync/설치 결과 갱신도 같은 helper를 사용해 도착 순서에 의존하지 않는다. 출력/커서만 있는 프레임은 map 재생성이 없고, 추가 타이머/렌더 호출/전체 화면 캐시 복제 없음.
+- UI: metadata가 없는 map 기본값은 Unsupported 대신 Checking, 버튼도 비활성 status.detecting(확인 중)으로 변경. 확인 문구는 설치만이 아니라 재개 가능 여부를 확인한다고 로케일5개에 맞췄다. 안내줄 레이아웃은 left_to_right/Align::Center로 바꿔 버튼을 왼쪽·세로 가운데에 둔다. 기존 UI 검사 fixture의 Checking 버튼 lookup만 새 label로 조정했으며 UI 회귀 검사를 실행하지는 않았다.
+- CLI 확인: 현재 설치된 `claude --help`, `codex resume --help`, `grok --help` 모두 exit0. Claude/Grok --resume 및 -c/--continue, Codex resume SESSION_ID 및 --last 문법을 직접 확인했다. 실제 사용자 세션을 이어 실행하거나 새 에이전트에 입력하지 않았다. runtime은 저장된 base args를 재사용하고 추가 args만 이번 spawn에 합치며 session_respawned는 원래 spec을 유지하므로 이번 검토에서 반복 재개의 인자 누적은 발견하지 못했다.
+- 현재 검증: 순서 회귀1 + 기존 target 판정2 + provider계획4, 총7개 관련 상태/명령 판정만 실행 중(`/tmp/deppy-resume-projection-green-20260920.log`). 아직 GREEN 완료로 주장하지 않는다. 제품 수정은 app.rs/workspace.rs/로케일5개, 기록은 docs/CODEX_HANDOFF.md. 사용자 새 재빌드·재실행 요청이 없어 PID56565/f042082 유지.
+
+
+### 2026-09-20 재개 판정·버튼 배치 수정 완료 / 앱 적용 대기
+
+- GREEN 실제 결과: `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo test --locked -p deppy-sijo --bin deppy-sijo --features bench-alloc -- --nocapture archived_resume_projection은_메타데이터_이후_도착한_mux archived_resume은_확인중_미설치_최근_미지원을_dispatch와_구분한다 archived_resume은_persistent_session_id로_exact와_recent를_매핑한다 agent_resume::tests::` → **7 PASS / 0 FAIL / 2307 filtered**, `/tmp/deppy-resume-projection-green-20260920.log`. 새 순서 검사1개만 추가했고 나머지는 기존 검사다. 전체 suite/화면 회귀/커밋 gate는 실행하지 않았다.
+- 최종 소스 리뷰: 프레임에서 가장 마지막 MuxUpdated를 사용하고 없으면 이미 반영된 mux를 사용한다. 메타데이터→mux 순서와 이전 pane→새 pane 순서에서 Exact를 보존한다. map 생성은 mux/metadata/설치 정보가 바뀔 때만 하며 새 프레임 요청/타이머/스레드는 없다. 클릭 시 실제 실행 전략을 다시 검사하는 기존 guard와 Codex의 중복 writer 연결 처리, runtime의 원본 launch args 유지 및 spawn 성공 전 아카이브 보존을 확인했다. 기존 잘못된 dispatch 주석을 실제 동작대로 고쳤다.
+- 표시 계약: Exact는 저장 ID의 대화, RecentInCwd는 해당 폴더의 최근 대화(기존 별도 설명 유지), Unsupported만 활성 새로 실행, Checking은 비활성 확인 중, CLI Unavailable은 비활성 새로 실행과 에이전트 없음 안내다. map 미도착은 Checking이므로 지원하지 않는다고 오인하지 않는다. 실제 사용자 스크린샷의 발생 시점 자체를 계측한 것은 아니며 유효 DB metadata+기존 소스와 재현된 순서 결함으로 판정했다.
+- 위치 질문은 아직 응답이 없어 처음 안내한 하단 안내줄 왼쪽·줄 세로 가운데로 구현했다. 실제 화면 검증/배포·앱 release 재빌드/재실행·커밋·push는 하지 않았다. 실행 앱은 PID56565/f042082이며 이 변경은 미적용이다. docs의 직전 재실행 기록도 보존했다.
+- 남음/다음: 사용자가 적용을 요청하면 현재 미커밋 제품 소스까지 정확한 해시를 기록해 별도 signed release bundle로 빌드·재실행하고 시작 직후/워크스페이스 전환 후 버튼 및 좁은 pane의 정렬을 화면에서 확인한다. 현재 package 스크립트는 clean+f042082를 고정하므로 그대로 재사용하면 안 된다. 정확한 확인 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git diff -- crates/app/src/app.rs crates/app/src/ui/workspace.rs crates/i18n/locales`; `tail -n 20 /tmp/deppy-resume-projection-green-20260920.log`. 새 코드 변경이 없으면 통과 검사를 반복하지 않는다.
+
+
+## 2026-09-20 폴더 트리 더보기 생성 위치 수정 완료 / 앱 적용 대기
+
+- 현재 목표/완료: 사용자 요청에 따라 폴더 트리 상단 더보기의 새 파일·새 폴더 생성 위치를 선택한 폴더/파일의 위치에 맞췄다. 실제 작업 worktree는 `/Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`, 브랜치 `fix/environment-api-context-integration`, HEAD f042082다. 이전 재개 판정/버튼 배치의 미커밋 수정은 그대로 보존했다.
+- 원인: 폴더 단일 클릭은 선택과 펼침만 바꾸는데 더보기는 항상 `self.root`를 EditState.parent에 넣었다. 더블클릭 탐색은 set_root로 이미 이동하고 있었으므로 그 경로는 유지한다. App host의 CreateFile/CreateDirectory는 전달받은 parent를 그대로 사용하고 있어 host 루트 강제 문제가 아니다.
+- 수정 파일: `crates/app/src/ui/file_tree.rs`, 로케일5개의 `messages.txt`, 이 인계 문서. `creation_parent`는 선택 폴더 자신/선택 파일의 부모를 기존 flat 캐시에서 찾는다. 선택이 없으면 현재 탐색 루트를 사용한다. 다중 선택은 아직 선택된 기준 행을 우선하고, 기준이 없고 하나만 남았으면 그 행을 쓴다. 여러 선택의 기준이 없으면 현재 탐색 루트다. 접혀 보이지 않는 옛 선택은 사용하지 않는다. 헤더 우클릭 새 폴더도 같은 기준을 쓴다.
+- UI/자원 결정: 로케일5개에서 new_file_root/new_folder_root를 new_file/new_folder로 바꾸고 “(루트)” 표기를 제거했다. 기존 입력란의 위치 안내는 EditState.parent와 동일하다. 경로 선택은 메뉴 명령 클릭 때만 실행하므로 평상시 프레임에서 flat 탐색/경로 복제가 추가되지 않는다. filesystem metadata 조회·추가 타이머·스레드·재그리기 호출은 없다. 편집을 시작할 때 parent를 고정하고 기존 async I/O와 실패 시 편집 복원, create_new(true) 덮어쓰기 방지, 부분 목록 갱신을 유지한다.
+- RED 실제 실행: 기존 루트 선택 동작을 helper로 그대로 추출한 상태에서 `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo test --locked -p deppy-sijo --bin deppy-sijo --features bench-alloc toolbar_creation_ -- --nocapture` → **1 FAIL / 1 PASS**, 기대 `/toolbar-creation/docs`와 실제 `/toolbar-creation` 불일치. `/tmp/deppy-toolbar-create-red-20260920.log`, exit101. 다른 실패한 접근은 없다.
+- GREEN 실제 실행: 같은 환경에서 `cargo test --locked -p deppy-sijo --bin deppy-sijo --features bench-alloc -- --nocapture toolbar_creation_ folder_navigation_진입한_폴더의_기존_목록만_옮기고_늦은_결과를_버린다` → **3 PASS / 0 FAIL / 2313 filtered**, `/tmp/deppy-toolbar-create-green-20260920.log`, exit0. 신규 경로/선택 상태 검사2건과 기존 폴더 탐색 상태 검사1건만 실행했다. 전체 suite/UI 회귀/커밋 게이트는 실행하지 않았다. file_tree.rs만 rustfmt로 정렬했고 최종 diff와 메뉴→편집→host 요청 경로를 직접 검토했다.
+- 남음: 제품 변경은 미커밋이고 실행 앱에 미적용이다. 사용자의 “재빌드 재실행은 내가 요청할때” 지시에 따라 release 재빌드/재실행/실제 화면 확인은 하지 않았다. 앞서 기록한 실행 앱은 PID56565/f042082다. commit/push/main merge도 이번 요청에 포함되지 않았다.
+- 다음 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git diff -- crates/app/src/ui/file_tree.rs crates/i18n/locales`; `tail -n 20 /tmp/deppy-toolbar-create-green-20260920.log`. 새 변경 없으면 통과 검사를 반복하지 않는다. 사용자 적용 요청 후 이전 재개 수정도 포함한 입력 소스 hash를 기록해 별도 signed bundle로 빌드/재실행하고, 폴더를 선택/펼친 상태와 더블클릭 진입 상태에서 각각 생성 위치를 실제 화면으로 확인한다. 예전 package 스크립트는 clean f042082/옛 PID를 고정하므로 그대로 재사용하지 않는다.
+
+
+## 2026-09-20 폴더 생성 위치 코드 리뷰 / 추가 보완 2건 확인
+
+- 목표/범위: 사용자 “코드 리뷰해”에 따라 직전 file_tree.rs/로케일 변경과 생성 요청·완료·폴더 탐색 호출 경로를 검토했다. 앞선 재개 표시 변경을 다시 전면 리뷰한 것은 아니다. 제품 코드는 리뷰 전 상태로 유지하고 이 문서만 갱신했다.
+- medium: `creation_parent`(file_tree.rs:4207–4223)가 deselected select_anchor를 제외한 뒤 선택이 정확히1개일 때만 대체 행을 찾는다. docs/a.md,b.md,c.md를 차례로 선택한 뒤 c만 ⌘클릭 해제하면 docs의 a/b가 남았는데 생성 parent가 루트로 떨어진다. 직전 검사는 해제 후1개만 남는 경우를 다뤄 놓쳤다. 남은 가시 선택들의 생성 폴더가 같으면 그 공통 폴더를 사용하도록 보완할 필요가 있다. 여러 다른 폴더라면 임의 위치를 고르지 않는 정책을 유지해야 한다.
+- low: 더보기에서 접힌 폴더도 생성 parent로 사용하지만(2996–3011) EditState만 열고 부모를 펼치지 않는다. complete_io 성공은 reload_dir로 이어지며 reload_dir(4387–4406)은 펼친 노드만 나열한다. 접힌 docs를 ⌘클릭 선택→새 파일 생성 성공 후에도 폴더는 접혀 있고 새 파일 행/완료 안내가 없어 사용자가 결과를 바로 확인할 수 없다. 생성 명령 때 대상 폴더를 펼쳐 기존 유계 나열·부분 갱신 경로를 쓰는 보완이 필요하다. 기존 행 우클릭 생성에도 유사하게 존재한 UX 한계가 이번 더보기 경로로 확장됐다.
+- 실행 증거: 임시 상태 진단2개를 기존 file_tree 테스트 모듈에 넣어 `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo test --locked -p deppy-sijo --bin deppy-sijo --features bench-alloc toolbar_review_probe_ -- --nocapture`를 실행했다. 실제 exit0/2개 진단 assert 성공, 두 문제 상태를 재현했다는 뜻이지 제품 정상 PASS가 아니다. 두 번째는 host 성공 completion 뒤의 leaf 상태를 확인했고 실제 디스크 생성/화면 검증은 하지 않았다. `/tmp/deppy-toolbar-review-probes-20260920.log`, 진단 소스 `/tmp/deppy-toolbar-review-probes-20260920.rs`, 복원 보호 wrapper `/tmp/deppy-toolbar-review-run-20260920.py`.
+- 임시 변경 정리: wrapper가 실행 직전 원문과 진단 삽입본을 비교한 뒤 자신의 임시 코드만 제거했다(`temporary_probes_removed=true`). file_tree.rs의 diff numstat는 리뷰 전과 동일84+/17-, 제품 파일에 toolbar_review_probe_ 잔존0. 실제 사용자 파일 생성/삭제·release 재빌드·재실행·커밋·push는 하지 않았다.
+- 정상 경로 확인: 폴더 탐색은 set_root 후 즉시 return하여 지역 edit을 복원하지 않는다. 루트 교체가 io_generation/편집/선택/대기열을 초기화해 이전 결과를 거절한다. 생성 host는 parent를 그대로 사용하며 create_new(true)로 덮어쓰기를 막는다. 실패 completion은 같은 parent를 담은 retry_edit을 복원한다. 새 생성 위치 탐색은 클릭 때만 실행하고 새 장기 보관 상태/스레드/타이머가 없어 이번 diff에서 추가 누수 근거는 발견하지 못했다.
+- 도구 제한: review 스킬 `/Users/jr/.agents/skills/review/SKILL.md`는 “Read `.agents/skills/gstack/review/checklist.md`”, “If the file cannot be read, STOP and report the error.”를 요구하지만 해당 체크리스트가 프로젝트/설치된 스킬 경로에 없다. 정식 스킬 파이프라인을 완료했다고 주장하지 않고 직접 diff/호출 경로 검토와 위 집중 진단으로 리뷰했다. 사용자 작업을 중단하거나 설치 승인 질문을 추가하지 않았다.
+- 남음/다음: 위2건은 아직 수정하지 않았다. 다음 수정 요청 시 `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git diff -- crates/app/src/ui/file_tree.rs`; `cat /tmp/deppy-toolbar-review-probes-20260920.rs`; `cat /tmp/deppy-toolbar-review-probes-20260920.log`. 기존 원활한 단일 선택/폴더 이동 계약을 보존하면서 공통 생성 폴더 판정 및 생성 대상 펼침을 보완한다. 사용자 요청 전 재빌드/재실행은 하지 않는다.
+
+
+### 2026-09-20 두 번째 코드 리뷰 / 늦은 실패의 새 입력 덮어쓰기 추가 확인
+
+- 목표/범위: 사용자의 반복 코드 리뷰 요청에 따라 미커밋 file_tree.rs/로케일과 앞선 app.rs/workspace.rs 재개 표시 변경까지 다시 검토했다. 이전 두 지적은 소스가 바뀌지 않아 그대로 남아 있고 동일 진단은 반복하지 않았다. 제품 코드 변경은 없다.
+- 새 medium 지적: file_tree.rs:1311의 `self.edit = pending.retry_edit`는 현재 편집 세대와 무관하게 이전 요청의 편집을 복원한다. `docs/old.md` 생성 요청 후 완료를 기다리는 동안 other 폴더를 단일 선택하고 더보기→새 파일로 `new-work.md`를 입력하면, 옛 요청의 Conflict 실패가 도착하는 순간 편집 parent와 이름이 `docs/old.md`로 덮어써진다. 더보기는 in_flight 중에도 활성이고 단일 폴더 선택은 io_generation을 바꾸지 않아 exact operation/generation 검사로 방지되지 않는다. 연결된 기존 비동기 복원 경로의 문제이며 이번 생성 위치 수정에서 새로 도입된 코드라고 주장하지 않는다. 편집 세대를 기록해 사용자가 시작한 새 편집과 일치할 때만 실패 버퍼를 복원하도록 보완해야 한다.
+- 실제 재현: `/tmp/deppy-toolbar-review-retry-20260920.py`로 임시 상태 진단1개를 삽입, `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo test --locked -p deppy-sijo --bin deppy-sijo --features bench-alloc toolbar_review_retry_probe_ -- --nocapture` 실행. exit0/진단1개 assert 성공, 로그의 `REPRO: other/new-work.md 입력이 늦은 실패 후 docs/old.md로 덮어써짐` 확인. 오류 상태를 재현한 성공이며 제품 동작 정상 PASS가 아니다. host 실패 completion 이후의 실제 leaf 상태를 확인했고 실제 디스크 조작/UI 입력은 하지 않았다. 진단 소스 `.rs`와 로그 `.log`는 같은 /tmp basename에 보관했다.
+- 정리: finally의 원문 비교 보호를 거쳐 임시 진단을 제거(`temporary_probe_removed=true`), file_tree.rs diff84+/17-와 임시 심볼 잔존0 확인. 기존 제품 미커밋 변경을 덮어쓰지 않았다. 새 수정 파일은 이 인계 문서뿐이다. 자동 review 체크리스트 누락은 앞선 기록과 같아 정식 파이프라인 완료를 주장하지 않는다.
+- 추가 검토: 재개 표시 helper는 마지막 pending MuxUpdated를 우선하고 UI 이벤트 소비 전에 투영한다. AgentState 결과에는 workspace epoch/scope/id 검사가 존재하며 dispatch는 최신 mux/metadata로 재확인한다. map은 교체되며 무제한 누적되는 새 상태는 발견하지 못했다. split resize의 MuxUpdated 때도 재투영·임시 인자/map 할당은 발생하므로 무할당이라고 주장하지 않는다. 이번 검토에서 그 비용을 별도 벤치마크하거나 실제 렌더 화면을 확인하지 않았다. 추가 확정 결함으로 보고하지 않는다.
+- 남은 보완: (1) 다중 선택 마지막 해제 후 같은 부모의 남은 선택을 생성 위치로 사용, (2) 생성 대상이 접혔으면 펼쳐 결과 표시, (3) 이전 I/O 실패가 새로운 편집을 덮어쓰지 않도록 편집 세대 보호. 모두 아직 미수정. release 재빌드/재실행/커밋/push 없음.
+- 다음 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git diff -- crates/app/src/ui/file_tree.rs crates/app/src/app.rs crates/app/src/ui/workspace.rs`; `cat /tmp/deppy-toolbar-review-retry-20260920.rs`; `cat /tmp/deppy-toolbar-review-retry-20260920.log`. 수정 요청 시 실패 복원만 무조건 없애지 말고 원래 편집을 그대로 유지한 경우 재시도 계약은 보존한다. 사용자 요청 전 release 재빌드/재실행은 하지 않는다.
+
+
+## 2026-09-20 리뷰 지적 3건 모두 수정 완료 / 앱 적용 대기
+
+- 현재 목표/완료: 사용자 “수정해 3건다”에 따라 앞선 두 번의 리뷰에서 남긴 생성 위치·생성 결과 표시·비동기 실패의 입력 덮어쓰기3건을 모두 보완했다. 실제 작업 위치 `/Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`, HEAD f042082, `fix/environment-api-context-integration` 유지. 이번 수정 파일은 `crates/app/src/ui/file_tree.rs`와 이 인계 문서다. 이전 app.rs/workspace.rs/로케일5개의 미커밋 변경을 보존했다.
+- 생성 위치: `creation_parent`가 아직 선택된 가시 기준 행을 우선한다. 기준 행이 해제됐다면 남은 가시 선택들이 같은 생성 폴더를 가리키는지 확인해 그 위치를 사용한다. 선택 없음/서로 다른 생성 위치면 현재 탐색 루트 사용이라는 기존 정책을 유지한다. 전체 선택의 경로를 복제한 벡터를 만들지 않고 첫 후보 경로1개만 소유하여 비교한다. 숨겨진 옛 선택은 제외한다.
+- 생성 결과: `start_edit`로 더보기 새 파일/새 폴더와 헤더/행 우클릭 새 폴더·이름변경 진입을 모았다. NewFile/NewFolder만 대상 노드가 접혔으면 기존 toggle_dir의 비동기 나열 경로로 펼친다. 현재 루트/이미 펼친 노드는 변경하지 않아 기존 행·캐시를 보존한다. 생성 성공은 기존 complete_io→reload_dir 부분 갱신으로 결과를 표시한다. 가시 UI 회귀 검사를 추가하지 않고 목록·I/O 상태만 검사했다.
+- 입력 보호: FileTreeUi와 capacity-1 PendingFileTreeIo에 edit_generation을 두고 새 편집/취소/탐색 루트 교체 때 갱신한다. 요청 당시와 편집 세대가 같은 실패만 retry_edit을 복원하며, retry_edit 없는 다른 작업 실패는 편집을 비우지 않는다. 새 파일/새 폴더/이름변경 진입 모두 start_edit을 거치고 취소는 cancel_edit을 거친다. 같은 입력의 정상적인 실패 재시도 복원은 유지한다. 프레임마다 edit을 로컬로 take/복원하는 동작 자체는 세대를 바꾸지 않는다. 추가 스레드/타이머/상시 재렌더/무제한 캐시는 없다.
+- RED 실제 확인: 기존 동작을 start_edit/cancel_edit에 추출해 연결한 뒤 신규 상태 검사3개를 실행했다. `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo test --locked -p deppy-sijo --bin deppy-sijo --features bench-alloc creation_review_ -- --nocapture` → **0 PASS / 3 FAIL**, exit101. 루트/docs 불일치, 이전 docs/새 other 입력 불일치, 대상 expanded=false로 각각 실패. `/tmp/deppy-creation-three-red-20260920.log`. 다른 실패한 접근 없음.
+- GREEN 실제 확인: 같은 환경에서 `cargo test --locked -p deppy-sijo --bin deppy-sijo --features bench-alloc -- --nocapture creation_review_ toolbar_creation_ native_intent는_capacity_one이고_stale_completion을_버린다 folder_navigation_진입한_폴더의_기존_목록만_옮기고_늦은_결과를_버린다` → **7 PASS / 0 FAIL / 2312 filtered**, exit0. `/tmp/deppy-creation-three-green-20260920.log`. 신규3건+기존관련4건만 실행했다. 생성 목록 검사는 임시 디렉터리에서 파일/폴더 각각을 만든 후 성공 completion 및 실제 나열을 통해 flat에 결과가 반영되는 것을 확인했고 임시 디렉터리를 정리했다. 실패 복원 검사는 원래 편집 유지/새 편집/새 편집 취소의3상태를 확인했다.
+- 검토/서식: file_tree.rs만 rustfmt로 정렬. 직접 diff/호출부 확인으로 더보기·우클릭·이름변경이 같은 시작 경로를 타고, 메뉴 처리 전에 로컬 edit을 다시 저장하여 새 edit이 끝에서 덮어써지지 않음을 확인했다. 기존 operation/io_generation 가드와 루트 교체 즉시 반환도 유지한다. 전체 suite·UI 회귀·clippy/i18n 등의 커밋 게이트는 실행하지 않았다.
+- 현재 상태/남음: 앞선 리뷰의3건은 이제 미수정 항목이 아니다. 제품 변경은 미커밋이고 실행 앱에 미적용이다. release 재빌드/재실행·실제 화면 확인·커밋/push/main merge는 하지 않았다. 사용자가 빌드/실행을 요청하면 현재 누적 소스를 정확히 기록하여 적용하고 실제 폴더 생성 화면을 확인한다. 그 전에는 이전 실행 앱을 그대로 둔다.
+- 다음 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git diff -- crates/app/src/ui/file_tree.rs`; `tail -n 20 /tmp/deppy-creation-three-green-20260920.log`. 코드가 바뀌지 않으면 통과 검사를 반복하지 않는다. 옛 package 스크립트는 clean f042082와 이전 PID를 고정하므로 그대로 재사용하지 않는다.
+
+
+## 2026-09-21 사용자 승인 릴리스 빌드·서명 완료 / 재실행 진행
+
+- 목표/권한: 사용자 “재빌드하고 재실행해”에 따라 f042082 기반 현재 미커밋 제품 수정(폴더 생성3건 보완·생성 위치/로케일·세션 재개 표시/버튼)을 포함해 빌드하고 새 앱으로 교체한다. 커밋/main merge/push 요청은 없으므로 소스의 미커밋 상태를 보존한다.
+- 입력 고정: `/tmp/deppy-folder-resume-source-20260921.json`에 추적1070파일 SHA256/HEAD/branch/git status/source_dirty=true를 기록했다. package 직전 모든 입력 hash와 상태가 동일한지 확인했고 기존 PID56565 번들의 앱/helper hash도 이전 manifest와 일치했다. 이 인계 기록은 패키징 완료 뒤에만 추가했다.
+- 실제 빌드: `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo build --locked --release -p deppy-sijo -p mcp-proxy` exit0, **50.05초**. `/tmp/deppy-folder-resume-release-build-20260921.log`. 관련 테스트7건/재개7건은 이전 실제 통과 로그를 참조했고 이번에 반복하지 않았다. 전체 게이트 실행 없음.
+- 패키지/서명: 새 `/private/tmp/deppy-folder-resume-20260921-_5r_only/Deppy Sijo.app`에 앱/helper·기존 Info.plist/Resources를 복사하고 strip 후 Developer ID Application: VectorNine INC (ZDTU5LS35K)로 서명했다. 앱/helper/bundle strict codesign 및 Info.plist 검사 성공, 기존 버전과 지정 요구사항 동일성 확인. `/tmp/deppy-folder-resume-package-20260921.log`, bundle 상위 build-manifest.json. 기존 번들은 덮어쓰지 않았다. 공증/배포 없음.
+- 현재 단계: `python3 /tmp/deppy-folder-resume-verify-20260921.py ready`로 이전 PID56565의 정확한 실행 경로 및 새 binary hash/서명을 확인했다. 아직 재실행 완료를 주장하지 않는다. CUA Command-Q 정상 종료 후 새 절대 bundle 경로로 시작하고 새 PID/실행 경로/창을 확인한다.
+- 다음 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `python3 /tmp/deppy-folder-resume-verify-20260921.py record`; `cat /tmp/deppy-folder-resume-restart-20260921.json`. release/verify 스크립트는 이번 이전 PID56565·입력hash를 고정하므로 향후 빌드에서 재사용하기 전 갱신해야 한다.
+
+
+### 2026-09-21 새 빌드 재실행 완료
+
+- 완료: 기존 PID56565에 CUA Command-Q를 보내 정상 종료했고 ps로 종료 확인 후 새 절대 bundle 경로로 앱을 시작했다. 강제 종료는 사용하지 않았다. 새 PID **5440**, 실행 파일 `/private/tmp/deppy-folder-resume-20260921-_5r_only/Deppy Sijo.app/Contents/MacOS/deppy-sijo`. 실행14초 후 같은 경로/단일 PID 생존과 새 binary hash를 확인했다. `/tmp/deppy-folder-resume-restart-20260921.json` verified=true, source_dirty=true. bundle 상위 build-manifest.json app_restarted=true.
+- 적용 소스: f042082 커밋만으로 판정하면 안 된다. `/tmp/deppy-folder-resume-source-20260921.json`의 dirty 추적파일 hash가 이번 빌드 입력이다. 폴더 생성 위치·리뷰3건 보완·로케일과 이전 세션 재개 판정/버튼 수정이 포함됐다. 이후 바뀐 추적 파일은 이 인계 기록뿐이다.
+- 화면: CUA AX에서 새 창/사이드바/저장 세션14개를 확인하고 스크린샷에서 복원된 터미널·파일 트리·하단 상태 표시를 확인했다. 사용자 세션에 텍스트 입력/명령 전송이나 실제 프로젝트 파일 생성은 하지 않았다. 모든 수정의 상호작용 화면 검증 완료를 주장하지 않는다.
+- 남음: 사용자가 새 앱으로 실제 생성/재개 동작을 확인할 수 있다. 제품 소스는 미커밋이며 main merge/push/공증은 이번 작업에 포함되지 않았다. 빌드/재실행 중 실패한 접근 없음. 추가 테스트/전체 게이트 반복 없음.
+- 다음 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `ps -p 5440 -o pid,stat,etime,comm`; `cat /tmp/deppy-folder-resume-restart-20260921.json`; `tail -n 5 /tmp/deppy-folder-resume-release-build-20260921.log`. 다음 새 빌드 요청에서는 옛 PID56565와 이번 입력 고정값을 그대로 재사용하지 않는다.
+
+
+## 2026-09-21 작업 메뉴 상태 배지 구현 중
+
+- 목표: 사용자 스크린샷의 Home 알림처럼 작업 메뉴에도 진행 중/막힘 등의 상태 색상과 건수를 표시한다. 기존 `fleet_count`는 승인 수+입력 대기 수만 세고 모든 nav 배지를 빨강으로 칠해 진행 상태가 표시되지 않았다. 현재 작업 트리와 PID5440의 실행 앱을 유지한다. 이번 요청에 앱 재빌드·재실행은 포함되지 않았다.
+- 설계: Home과 같은 배지 하나를 기본으로 막힘→오류→진행 중→완료→지시 대기 순으로 표시한다. 숫자는 표시된 상태의 건수이고 hover에는 각 상태의 건수를 보여준다. 기존 공통 상태 색상을 재사용한다. 혼합 상태의 단일/복수 배지는 선택적 질문으로 보냈으며 답이 없어 안내한 기본안으로 진행한다.
+- 집계: 이미 만들어진 active/warm 사이드바 행을 재사용한다. 저장된 비활성 pane/일반 셸은 제외한다. 승인·입력 대기는 workspace+session 키로 중복 제거하며 세션0+승인1도 표시한다. 구조화 세션은 제목/모델/행 Vec 복제 없이 상태 iterator만 읽는다. 매 프레임 build_fleet_sessions 재호출이나 타이머/스레드/상시 repaint를 추가하지 않는다.
+- 현재: fleet.rs에 순수 집계 테스트3개와 기존 합산 동작을 추출한 초기 구현을 넣어 RED 확인 중이다. 명령 `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo test --locked -p deppy-sijo --bin deppy-sijo --features bench-alloc nav_summary_ -- --nocapture`; 로그 `/tmp/deppy-fleet-badge-red-20260921.log`. 아직 결과를 PASS로 기록하지 않는다.
+- 남음: RED 결과 확인→집계 및 UI 연결→같은3개 집중 검사→직접 diff/호출부 리뷰. 앱 재빌드·재실행/실제 화면 검증/커밋/push는 요청 전 하지 않는다. 이전 폴더·재개 변경은 보존한다. 인계 문서 첫 편집은 존재하지 않는 제목 앵커로 실패해 파일을 바꾸지 않았고 끝에 추가하는 방식으로 수정했다.
+- 다음 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git diff -- crates/app/src/fleet.rs`; `tail -n 35 /tmp/deppy-fleet-badge-red-20260921.log`.
+
+
+### 2026-09-21 작업 메뉴 상태 배지 소스 구현 완료
+
+- 완료 파일: `crates/app/src/fleet.rs`, `app.rs`, `ui/file_tree.rs`, `ui/agent_sessions.rs`, 이 문서. 다른 미커밋 폴더/재개 수정과 로케일5개는 보존했다. 이번 배지는 기존 locale 문구만 재사용하여 새 키를 추가하지 않았다.
+- 동작: 작업 메뉴 우상단에 Home과 같은 숫자 배지1개를 표시한다. 우선순위는 막힘(주황)→오류(빨강)→실제 진행 중(파랑)→완료(초록)→지시 대기(청록). 숫자는 그 상태의 건수이고 hover에 나머지 비어 있지 않은 상태별 건수도 표시한다. 0건이면 숨긴다. Home의 빨강/읽음 처리는 그대로다. 좁은 레일에서 텍스트 라벨이 사라져도 배지는 보인다.
+- 집계/성능: active/warm의 기존 SidebarSessionRow를 순회하고 PTY 상태는 `from_pty_with_agent`를 재사용한다. persisted pane은 session ID가 없어 제외되고 Off도 제외된다. **종료된 모든 세션을 제외한다는 앞선 설명은 정확하지 않다**: 기존 Fleet와 동일하게 완료/오류 결과는 집계한다. `FleetNavSummary`의 유일한 임시 집합은 대기 키의 borrowed (&str, SessionId) 집합이다. 같은 세션의 승인 여러 개+입력 대기를1회로 합치고 다른 workspace의 같은 숫자 ID는 독립적으로 센다. 키 없는 승인은 각각 유지한다. 구조화 상태는 borrowed iterator로 읽고 닫은 workspace를 기존 함수로 걸러낸다. Fleet 카드 재조립, 세션 내용 복제, 추가 IO/스레드/타이머/repaint 호출은 없다. 상태 감지기 자체는 변경하지 않았다.
+- 실제 검사: 기존 승인+대기 합산으로 추출한 RED 구현에서 같은 명령 `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo test --locked -p deppy-sijo --bin deppy-sijo --features bench-alloc nav_summary_ -- --nocapture` → 0 PASS/3 FAIL(exit101, `/tmp/deppy-fleet-badge-red-20260921.log`). 새 집계/UI 연결 뒤 → **3 PASS/0 FAIL/2319 filtered**, exit0, `/tmp/deppy-fleet-badge-green-20260921.log`. 상태별 우선순위/중복 및 workspace 격리/PTY 없는 승인과 구조화 상태를 검사했다. test 프로필에서 제품 코드의 타입검사·컴파일도 완료됐으며 UI 회귀 검사는 추가하거나 실행하지 않았다.
+- 검토: 직접 diff/호출부를 확인했다. Snapshot 초기화21곳은 기존 검사를 삭제하지 않고 필드 기본값만 바꿨다. 접근성의 메뉴 라벨·클릭 라우팅·Home 읽음 처리를 유지하며 hover 내용을 그릴 때만 문구를 만든다. 기존 Fleet 화면의 waiting_ui 매 프레임 호출/승인만 남은 빈 상태 계약은 건드리지 않았다. scoped rustfmt 실행, 전체 fmt/clippy/i18n/경계 등 커밋 게이트는 실행하지 않았다. 자동 review 스킬 파이프라인 수행으로 주장하지 않는다.
+- 현재 상태/남음: 소스 구현과 집중 로직 검증 완료, **앱 release 재빌드/재실행/실제 화면 검증은 미실행**. 실행 앱 PID5440에는 배지 변경이 없다. 커밋/push/main merge 없음. 사용자 적용 요청 전에는 실행 중인 앱을 바꾸지 않는다. 이후 요청 시 현재 dirty 소스 해시/현재 PID를 새로 기록하여 signed release bundle로 적용하고 실제 배지 및 hover를 확인한다. 기존 패키지 스크립트의 옛 PID/해시는 그대로 재사용하지 않는다.
+- 실패한 접근: 의도한 RED3건 외 제품 컴파일/검사 실패 없음. 문서 앵커1회 실패는 직전 절에 기록했다. 새 변경이 없으면 통과한3개 검사를 반복하지 않는다.
+- 다음 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git diff -- crates/app/src/fleet.rs crates/app/src/ui/agent_sessions.rs`; `tail -n 15 /tmp/deppy-fleet-badge-green-20260921.log`; `ps -p 5440 -o pid,stat,etime,comm`.
+
+
+## 2026-09-21 작업 메뉴 배지 코드 리뷰 / 보완 3건
+
+- 요청/범위: 사용자 “코드 리뷰해”에 따라 직전 배지 변경(fleet.rs, app.rs의 sidebar 집계, file_tree.rs의 navigation/배지, agent_sessions.rs의 상태 iterator)을 직접 검토했다. 이전 폴더/재개 수정은 변경하지 않았다. 제품 코드는 리뷰 전 그대로이며 이 인계 문서만 갱신했다.
+- medium — app.rs:30028: `sidebar_sessions.values()`에는 active workspace 행을 무조건 넣는30013행의 결과도 포함된다. 반면 visible workspace 목록과 실제 `build_fleet_sessions`는 `closed_workspaces`를 제외한다. 활성 workspace 종료는23110행에서 ClosingPanes 표식부터 세우고 close_pane_now는 비동기 명령만 보내므로 mux 갱신 전까지 옛 세션이 남는다. 이 구간에 목록/작업 화면에서는 이미 숨긴 세션을 새 배지의 진행/막힘/오류 수에는 계속 넣는다. waiting/structured처럼 PTY 순회에도 동일한 닫힘 필터가 필요하다. 지속적으로 남는다고 단정하지 않으며 ClosePane 완료 전 전이 구간의 결함이다.
+- medium — app.rs:30032: 배지는 `from_pty_with_agent` 결과만 사용하지만 실제 작업 카드는27826–27837행에서 broadcast_working의8초 마커를 반영해 Idle/Off를 Active로 바꾼다. 일괄 전송은31591행에서 마커를 넣는다. 감지기가 아직 Idle/Off인 전송 직후 카드에는 진행 중, 새 배지에는 지시 대기(또는0건으로 숨김)가 나와 사용자의 실행 결과가 일치하지 않는다. 전체 Fleet 카드 재조립 대신 저비용 상태 투영을 공유해야 한다.
+- low — file_tree.rs:7358–7360: 배지를 show_label 조건 밖으로 옮겨 모든 폭에서 그리지만 위치식은 기존 고정 여백을 유지한다. nav rail 최소 폭은 designall.rs:34의20pt이고 structural_frame의 inner margin은0이다. 행 좌우4pt 축소+우측6pt 여백+최소 배지16pt로 계산하면 최소 폭의 배지 x 범위는[-6,10]으로 레일 왼쪽을6pt 벗어난다(직접 Python 수식 계산 확인). 숫자가 길수록 더 벗어난다. 좁은 폭에서는 배지 위치/표시 방식을 바꿔야 한다. 실제 앱 화면을 확인한 결과로 표현하지 않는다.
+- 정상 검토/한계: 승인+입력대기의 workspace/session 중복 제거, 세션0+승인1 유지, 구조화 Stopped/Interrupted 제외, count0 숨김과 우선순위를 확인했다. 새 HashSet은 함수 종료 때 해제되고 문자열은 빌리며 tooltip 문구는 hover 때만 생성한다. 이번 diff에서 무한 누적/새 스레드·타이머/중복 Fleet 카드 조립은 발견하지 못했다. RSS 부하 측정이나 동적 누수 검사를 한 것은 아니다.
+- 검증 상태: 위3건은 소스 및 실제 호출 경로를 대조한 정적 리뷰 결과다. 기존 `/tmp/deppy-fleet-badge-green-20260921.log`의3 PASS는 유지하되 같은 검사를 다시 돌리지 않았고, 새 테스트/release 재빌드/재실행/UI 상호작용은 하지 않았다. 배지 순수 집계 테스트3개는 App의 닫힘/전송 마커 연결과 좁은 레일을 다루지 않으므로 이 지적을 반증하지 않는다.
+- 도구 제한: `/Users/jr/.agents/skills/review/SKILL.md`는 “Read `.agents/skills/gstack/review/checklist.md`”, “If the file cannot be read, STOP and report the error.”를 요구한다. repo 및 글로벌 두 후보 경로에 체크리스트가 없음을 재확인했으므로 해당 자동 절차는 실행하지 않았다. 사용자에게 제한을 알리고 직접 diff/호출 경로 리뷰로 마쳤다. 탐색 도중 없는 approval_inventory.rs/와일드카드 경로를 조회한 명령은 실패했으며 실제 approvals.rs와 관련 호출부로 추적했다.
+- 남음: 위3건은 아직 수정하지 않았다. 사용자 수정 요청 시 PTY 가시성 필터·공통 진행 상태 투영·좁은 배지 배치를 보완한다. 재빌드/재실행은 별도 요청 때만 한다. 정확한 다음 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `sed -n '30024,30053p' crates/app/src/app.rs`; `sed -n '27820,27842p' crates/app/src/app.rs`; `sed -n '7350,7364p' crates/app/src/ui/file_tree.rs`; `tail -n 15 /tmp/deppy-fleet-badge-green-20260921.log`.
+
+
+## 2026-09-21 터미널 하단 ‘맨 아래로’ 버튼 구현 중
+
+- 목표: 리사이즈/재시작 뒤를 포함해 표시 중인 터미널 snapshot.scroll_offset>0이면 해당 pane 하단 중앙에 최신 출력으로 이동하는 버튼을 표시한다. 맨 아래에서는 숨기고 실제 터미널 행/열 크기를 바꾸지 않는 overlay로 그린다. 분할·다른 workspace 첨부 pane도 정확한 session/runtime 소유 경로를 따른다.
+- 조사: backend/session/runtime에 ScrollToBottom 명령이 이미 있다. 기존 우클릭/단축키는 이 명령을 보내지만 WorkspaceUi::send의 선택 해제 조건은 WriteInput/Scroll만 포함해, 선택 freeze 상태라면 최신 viewport가 보류될 수 있다. 버튼에는 선택 해제와 휠/드래그의 소수 잔여량 초기화를 함께 적용하는 공통 helper를 사용한다. 기존 메뉴/단축키도 같은 helper를 사용한다. Alt screen/연결 전 snapshot 없음은 버튼 대상이 아니다.
+- 현재: workspace.rs에서 기존 명령 전송을 scroll_session_to_bottom에 추출하고 선택 freeze/잔여량/정확한 session 전송을 확인하는 순수 액션 검사1개를 RED 실행 중이다. 명령 `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo test --locked -p deppy-sijo --bin deppy-sijo --features bench-alloc scroll_bottom_action -- --nocapture`, 로그 `/tmp/deppy-scroll-bottom-red-20260921.log`. 아직 통과라고 주장하지 않는다.
+- 남음: RED 확인→helper 보완·버튼 연결→해당 액션 검사만 재실행→diff/입력 경로 검토. 앱 release 재빌드·재실행은 별도 요청 때만 한다. 직전 배지 리뷰의3건은 사용자 수정 요청이 없었으므로 이번 버튼 작업과 섞지 않고 미수정으로 유지한다.
+
+
+### 2026-09-21 ‘맨 아래로 스크롤’ 버튼 소스 구현 완료
+
+- 완료 파일: `crates/app/src/ui/workspace.rs`, 이 문서. 이전 폴더/재개/작업 배지 미커밋 수정과 로케일은 보존했다. 사용자에게 안내한 pane별 하단 중앙 버튼을 구현했고 제품 release 빌드/재실행은 하지 않았다.
+- 표시: 실제로 그린 snapshot.scroll_offset>0이고 일반 화면일 때만 표시한다. 맨 아래(0), alt screen, snapshot 없는 연결 중에는 숨긴다. pane content의 별도 자식 Ui에 overlay하므로 터미널 레이아웃 커서/가용 높이/행열 수를 바꾸지 않는다. 높이28pt·최대 폭176pt, clip 안쪽6pt 여백이고 폭이112pt보다 좁으면 ↓ 아이콘과 hover 설명을 표시한다. 버튼 공간조차 없는 극소 pane(여백 제외24×28pt 미만)에서는 숨긴다. 종료 문구가 있는 pane은 그 위에 배치한다. 기존5개 locale의 workspace.menu.scroll_bottom 문구를 재사용했다.
+- 입력: 버튼 ID는 기존 pane_interaction_id를 사용하여 local/attached workspace/session 식별을 따른다. 클릭한 pane의 Focus 요청 및 ScrollToBottom만 기존 유계 intent 경로에 넣는다. 다른 workspace 첨부 pane은 그 소유 WorkspaceUi에서 명령을 만들고 App의 기존 focus 라우팅을 따른다. 버튼 영역에서는 배경 URL/폴더 클릭·텍스트 선택·휠 처리를 막아 처음 나타난 프레임에도 클릭이 뒤로 새지 않게 했다. 새 스레드/타이머/추가 터미널 draw/상시 repaint는 없다.
+- 선택 freeze 보완: 공통 scroll_session_to_bottom helper가 대상 세션의 선택을 해제하고 휠/드래그 소수 잔여량을0으로 만든 다음 기존 ScrollToBottom을 보낸다. 다른 세션의 선택은 보존한다. 새 버튼뿐 아니라 기존 우클릭/⌘↓도 이 helper를 사용한다. 세션 worker가 backend.scroll_to_bottom 후 mark_full_dirty로 최신 viewport를 보내고, 선택 해제로 해당 viewport가 freeze 버퍼에 머물지 않는다.
+- 실제 검증: `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo test --locked -p deppy-sijo --bin deppy-sijo --features bench-alloc scroll_bottom_action -- --nocapture`. 기존 명령 전송만 추출한 RED에서 선택 freeze 미해제로 0 PASS/1 FAIL(exit101, `/tmp/deppy-scroll-bottom-red-20260921.log`). helper 보완+UI 연결 후 **1 PASS/0 FAIL/2322 filtered**, exit0(`/tmp/deppy-scroll-bottom-green-20260921.log`). UI 회귀 테스트가 아니라 선택/잔여량/정확한 세션 명령1회 전송을 검사한 것이다. test 프로필 컴파일로 UI 코드의 타입검사도 완료했다. scoped rustfmt 실행, 전체 gate/다른 통과 검사 반복 없음.
+- 직접 검토: 버튼은 기존 renderer draw 이후에1회 추가되어 그리드 크기를 바꾸지 않는다. 새 backend/wire/storage 계약을 만들지 않았고 기존 메뉴/단축키/worker의 ScrollToBottom 경로를 확인했다. 접근성 라벨과 hover에는 축약 전 현지화 문구를 제공한다. 연결 불가 첨부 pane은 기존 placeholder 분기로 빠져 클릭 대상이 생기지 않는다. 새 실패한 구현 접근은 없고 의도한 RED만 있었다.
+- 현재 상태/남음: 버튼 소스 구현 및 집중 액션 검증 완료. **실제 앱 화면/클릭 확인은 아직 하지 않았다**. PID5440의 실행 앱에는 이번 버튼과 직전 작업 배지가 미적용이다. 사용자 재빌드·재실행 요청이 오면 누적 dirty 소스 전체를 기록해 signed bundle로 적용하고 리사이즈/스크롤백/복원·분할 pane에서 확인한다. 커밋/push/main merge 없음. 직전 배지 리뷰3건은 별도 미수정 상태를 유지한다.
+- 다음 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git diff -- crates/app/src/ui/workspace.rs`; `tail -n 15 /tmp/deppy-scroll-bottom-green-20260921.log`; `ps -p 5440 -o pid,stat,etime,comm`. 새 변경이 없으면 통과한 검사를 반복하지 않는다.
+
+
+## 2026-09-21 ‘맨 아래로 스크롤’ 버튼 코드 리뷰 / 보완 1건
+
+- 요청/범위: 사용자 “코드 리뷰해”에 따라 직전 workspace.rs 버튼 diff와 renderer response, 선택 freeze, 명령 큐, local/attached 포커스 및 backend ScrollToBottom 경로를 직접 검토했다. 이번 리뷰로 제품 코드를 변경하지 않았고 이 문서만 갱신했다. 이전 배지 리뷰3건은 별도로 그대로 남아 있다.
+- medium — workspace.rs:6966,6992,7489: `over_scroll_bottom`은 클릭 여부/드래그 소유자와 관계없이 포인터가 버튼 사각형 안에 있으면 참이다. 이를 텍스트 선택 전체 블록과 휠 스크롤 조건에 동시에 적용했다. 포인터를 하단 중앙에 둔 채 과거로 스크롤하여 버튼이 그 아래 나타나면 이후 휠이 전달되지 않는다. 터미널에서 이미 시작한 선택 드래그도 버튼 영역에 들어오면 기존 끝점 갱신/pending snapshot 반영을 건너뛴다. 같은 원인의 입력 회귀이므로 지적1건으로 합친다. 실제 오토스크롤은 pane 밖에서 시작하므로 버튼 위에서 항상 오토스크롤이 멈춘다고 확대해 주장하지 않는다.
+- 수정 방향: URL/폴더 실행 및 선택 시작으로 클릭이 새는 것만 차단한다. 버튼 위 휠은 동일 pane의 스크롤 경로로 전달하고, 터미널 response가 이미 소유한 dragged 제스처는 버튼 위에서도 계속 처리한다. `!over_scroll_bottom`만 휠 조건에서 없애도 버튼이 terminal response.hovered()를 가리므로 해결되지 않는다. 버튼/터미널 hover를 함께 고려해야 한다.
+- 정상 검토: scroll_session_to_bottom은 클릭한 session 명령을 보내고 해당 선택만 지워 freeze를 해제한다. child Ui로 만든 버튼은 부모 레이아웃 커서를 진행시키지 않는다. local은 정확한 pane 포커스를 요청하고 attached는 소유 WorkspaceUi의 session 명령과 기존 App attachment focus 경로를 사용한다. Off/alt/snapshot 없음 조건과 제한된 버튼 크기, 기존유계 protocol queue, 추가 타이머/백그라운드 스레드/무한 cache 부재를 확인했다. 동적 RSS/누수 측정이나 실제 앱 클릭 검증은 아니다.
+- 검증 범위: 정적 diff/호출 경로 리뷰. 기존 `/tmp/deppy-scroll-bottom-green-20260921.log`의 액션 검사1 PASS는 참고만 했고 다시 실행하지 않았다. 해당 검사는 helper만 검사하므로 새 hover/휠/선택 드래그 경로의 정상 증거가 아니다. 이번에 새 UI 회귀 검사·전체 gate·release 빌드·재실행·커밋/push는 하지 않았다. review 스킬 필수 체크리스트 누락은 이전 절과 같아 자동 파이프라인 완료로 주장하지 않는다. 실패한 실행 접근 없음.
+- 남음: 위1건 미수정. 사용자 수정 요청 시 입력 소유권별 처리를 보완하고 필요 범위만 확인한다. 실제 앱 화면 확인은 새 재빌드·재실행 요청 후 수행한다. 다음 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `sed -n '6965,7000p' crates/app/src/ui/workspace.rs`; `sed -n '7485,7520p' crates/app/src/ui/workspace.rs`; `git diff -- crates/app/src/ui/workspace.rs`.
+
+
+## 2026-09-21 분할 터미널 검색 깜빡임·클릭 무응답 조사 중
+
+- 목표: 사용자 api-key 검색창 스크린샷의 분할 검색 깜빡임/무응답을 수정한다. 실제 작업 트리 agent-wait-audit와 기존 모든 dirty 수정을 보존한다. 앱 release 재빌드/재실행 권한은 없으며 PID5440은 유지한다.
+- 근거: app.rs suppress_terminal_owner_during_pointer_focus가 cross-workspace 분할의 포인터 press/release 프레임을 owner=None으로 만들고 primary show_with_input(false)를 호출한다. workspace.rs render_pane은 mode.local && input_enabled일 때만 검색 Area를 그리므로 클릭 시 검색창 자체가 사라진다. 헤더 Search 역시 false일 때는 포커스만 요청하고 검색을 열지 않는다. PTY 입력 차단은 유지하면서 검색 UI 수명/조작을 분리할 계획이다.
+- 추가 근거: render_terminal_search는 SearchScrollback이 capacity8 protocol queue에 들어가기 전에 requested를 기록한다. Busy 거절이면 같은 검색어를 재요청하지 않아 무응답이 지속된다. 큐 수락 후에만 기록하도록 보완할 계획이다.
+- 일회성 진단: /tmp/deppy-search-probe-20260921.py로 실제 WorkspaceUi의 좌/우 local split 1000→600pt, 입력 api-key, focus/Area geometry/query command를 추적. 일반 프레임은 안정적이고 정확한 session으로 검색1회 전송했다. 처음 실행은 진단에서 TexturesDelta.clear 누락으로 실패했고 바로 보완했다(제품 실패 아님). 두 번째 실행 exit0, 임시 코드 원문복원 확인. 로그 /tmp/deppy-search-probe-20260921.log. 지속 UI 회귀검사는 추가하지 않았다. 현재 false인 press/release 프레임을 넣은 진단을 실행한다.
+- 아직 제품 수정 없음. 다음 명령: cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit; git diff -- crates/app/src/ui/workspace.rs; tail -40 /tmp/deppy-search-pointer-red-20260921.log. 검색 실패/재시도만 집중검사하고 앱 화면 검증은 사용자 재빌드 요청 뒤 수행한다.
+
+
+### 2026-09-21 분할 검색 수정 완료 / 실제 앱 적용 대기
+
+- 완료 파일: `crates/app/src/ui/workspace.rs`, 이 인계 문서. 기존 폴더/재개/배지/스크롤 버튼 dirty 수정을 그대로 보존했다. HEAD f042082, 작업 경로 `/Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`, 브랜치 fix/environment-api-context-integration 유지. 사용자에게 분할 종류를 선택형으로 질문했으나 답은 아직 없으며, 실제 코드의 cross-workspace pointer suppression 경로를 근거로 수정했다.
+- 재현 근거: `/tmp/deppy-search-pointer-red-20260921.log`에서 input_enabled=false인 press/release 두 프레임 동안 검색 위젯이 등록되지 않고 focus=None이 됐다. 다음 프레임 터미널이 포커스를 가져가고 후속 `-extra`가 SearchScrollback 대신 WriteInput(bytes_len=6)으로 나갔다. 좌/우 pane 양쪽에서 재현했다. 실제 사용자 PTY에는 입력하지 않았으며 임시 egui 진단 안에서만 명령을 수집했다.
+- 수정: 검색 Area 렌더를 PTY input_enabled와 분리해 분할 클릭 중에도 계속 표시·조작한다. 검색창 클릭은 정확한 pane의 기존 App 포커스 경로로 전달한다. TextEdit에 pane/session 기반 고정 ID를 주고 그 입력창이 포커스를 소유하면 뒤늦은 pending terminal focus가 입력을 뺏지 않도록 한다. 이전/다음 클릭 뒤에는 검색 입력으로 포커스를 유지한다. Search 헤더 아이콘은 포커스 전환 프레임에도 첫 클릭에 열며, 새 셸/분할 등 나머지 실행 도구와 PTY 키 전송 게이트는 보존한다. 별도 타이머·스레드·매 프레임 강제 repaint를 추가하지 않았다.
+- 요청 보완: submit_terminal_search로 검색 명령 수락을 분리했다. capacity8 큐가 Busy면 requested를 완료로 기록하지 않아 다음 completion 프레임에 최신 쿼리를 재요청한다. 현재 검색의 operation/generation 1개만 보관해 host Busy 완료 시 재시도하고, 이전 요청의 늦은 실패는 새 요청을 초기화하지 않는다. 크기 초과 등 영구 거절은 입력 변경 전 재전송하지 않는다. 쿼리가 바뀌면 옛 결과/스크롤 목표를 비운다. 검색 결과 이동 Scroll도 로컬 큐 거절 시 목표를 유지하고, 수락된 경우 대상 선택 freeze를 해제한다. 매치 이동의 host delivery 재시도까지 새 계약을 만든 것은 아니다.
+- 순수 상태 검사 RED: `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo test --locked -p deppy-sijo --bin deppy-sijo --features bench-alloc search_request는_큐 -- --nocapture` → 0 PASS/1 FAIL, 큐 포화인데 requested=Some(api-key), `/tmp/deppy-search-request-red-20260921.log`. 이 상태 검사는 제품 테스트에 유지한다.
+- GREEN: 동일 환경의 `cargo test --locked -p deppy-sijo --bin deppy-sijo --features bench-alloc search_request -- --nocapture` → 1 PASS/0 FAIL/2323 filtered. `/tmp/deppy-search-request-green-20260921.log`. 큐 포화→최신 쿼리1회 전송→중복 없음→host Busy 재시도를 검사했다. 이후 영구 거절 방어 assertion을 추가하고 아래 최종 실행에 포함했다. 중간에 필터를 일본어 `search_requestは`로 잘못 써 0 tests가 된 실행은 통과 근거에서 제외하고 올바른 필터로 재실행했다.
+- 입력/포커스 일회성 진단: `/tmp/deppy-search-probe-20260921.py`를 수정 소스에서 실행, `/tmp/deppy-search-pointer-green-20260921.log` exit0. 실제 egui pointer press/release + App의 arm_terminal_focus 후속 동작을 모사했다. 좌/우 각각 검색 입력 유지, `-extra`가 검색 쿼리에 반영, WriteInput0, 1000→600pt 리사이즈 뒤 같은 input ID와 focus 유지 확인. 원문 비교 후 임시 코드를 제거했다. GPU/실제 앱 화면 검증은 아니다.
+- 마지막 집중 검증: `/tmp/deppy-search-buttons-probe-20260921.py`가 임시 검사1개만 삽입해 `cargo test --locked -p deppy-sijo --bin deppy-sijo --features bench-alloc -- --nocapture temporary_search_buttons_probe search_request` 실행 → **2 PASS/0 FAIL/2323 filtered**, exit0, `/tmp/deppy-search-final-20260921.log`. 순수 상태1개(영구 거절 포함)와 임시 입력 진단1개다. 분할 press/release에 input_enabled=false를 적용하면서 실제 egui 버튼 클릭으로 next=1, previous=0, close=true, 정확한 session Scroll, WriteInput0을 확인했다. 임시 진단은 finally에서 소스 원문 비교 후 제거(`temporary_probe_removed=true`). 상시 UI 회귀 검사를 추가하지 않았다.
+- 실패한 진단 접근: 첫 기하 probe의 TexturesDelta.clear 누락은 앞 절 참고. 마지막 버튼 probe에서 Harness::run은 기존 터미널 cursor repaint 때문에 max_steps4를 초과했다(`/tmp/deppy-search-buttons-probe-20260921.log`). 고정 run_steps4로 바꿔 입력 처리만 확인했고 위 최종 결과가 실제 통과 기록이다. 제품 런타임 실패로 과장하지 않는다.
+- 직접 리뷰: 검색 UI 생명주기를 유지하면서 PTY 키 소유권과 분할 타겟 검증을 완화하지 않았는지, 늦은 focus/검색 응답·큐 실패 처리, 새 유계 delivery 슬롯과 영구 거절의 반복 전송 방지를 확인했다. scoped rustfmt 실행, 전체 suite/clippy/i18n/커밋 게이트 반복 없음.
+- 현재 상태/남음: 소스 수정과 집중 진단 완료. **release 재빌드·재실행·실제 화면 검증·커밋/push/main merge 없음**. PID5440의 앱은 그대로다. 사용자 재빌드 요청 후 누적 dirty 소스를 기록하여 signed bundle로 적용하고 실제 분할 검색을 확인한다. 직전 배지 리뷰3건과 스크롤 버튼 hover 리뷰1건은 이번 검색 수정과 별개로 미수정 상태다.
+- 다음 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git diff -- crates/app/src/ui/workspace.rs`; `tail -15 /tmp/deppy-search-final-20260921.log`; `ps -p 5440 -o pid,stat,etime,comm`. 코드 변경 없이 통과 검사를 반복하지 않는다. 임시 probe 재실행은 제품 파일 삽입/원문복원 방식이므로 다른 편집과 병렬 실행하지 않는다.
+
+
+## 2026-09-21 분할 검색 코드 리뷰 / 재현된 보완 2건
+
+- 범위/상태: 사용자 “코드 리뷰해”에 따라 직전 검색 수정 diff 전체와 App 포커스/명령 전달, egui 0.36.1 TextEdit 경로를 직접 검토했다. 제품 코드를 수정하지 않았고 이 문서만 갱신했다. 실제 작업 트리 agent-wait-audit와 기존 dirty 수정 모두 유지. release 재빌드·재실행/커밋/push 없음.
+- high — `crates/app/src/ui/workspace.rs:4381`: Enter/Esc 처리를 TextEdit 렌더 뒤 resp.has_focus()에만 묶었다. egui singleline TextEdit은 Enter에서 먼저 surrender_focus하며 Esc도 프레임 포커스 처리에서 해제되므로 분기가 실행되지 않는다. 임시 실제 egui 이벤트 진단에서 Enter 뒤 current=0(변화 없음), text_focus=false, 다음 followup 입력이 WriteInput(bytes_len=8)으로 나갔다. Esc는 검색창을 닫지 못하고 같은 프레임 WriteInput(bytes_len=1)으로 터미널에 전달됐다. 기존에도 있던 검색 키 처리 결함이 이번 포커스 수정 범위에 남아 있는 것이며 새 회귀라고 표현하지 않는다. 검색이 소유한 키를 포커스 해제 전에 판정·소비하고 Enter 후 검색 포커스 유지/Esc 후 안전한 대상 refocus를 보장해야 한다.
+- medium — `workspace.rs:4414–4420,4445–4446`: 새 쿼리에서 결과를 비우면서 requested는 과거 쿼리로 남긴다. api-key 결과2개가 있는 상태에서 큐8칸이 찬 동안 api-keyx로 입력→Backspace로 api-key 복귀하면 matches=0/requested=api-key가 된다. 큐가 비어도 requested==query라 재검색하지 않아 일치 없음 상태가 유지된다. 이번 결과 초기화 변경과 요청 중복 방지 조건의 조합으로 생긴 회귀다. 결과 무효화 시 요청 상태도 함께 무효화하거나 쿼리 세대로 결과/요청을 구분해야 한다.
+- 실제 집중 진단: `/tmp/deppy-search-review-20260921.py`가 임시 검사1개를 workspace 테스트 모듈에 넣어 좌/우 분할 WorkspaceUi의 RawInput Enter/Escape/Text/Backspace를 처리했다. 초기 api-key 검색 요청 후 synthetic ScrollbackSearchResult(2개)를 넣고 각 상태/전송 명령을 관찰했다. query_revert는 실제 capacity8 큐를 채운 뒤 입력/지우기하고 drain 후 추가2프레임을 관찰했다. 최종 원문 비교 보호 후 임시 코드를 제거했다(`temporary_probe_removed=true`).
+- 명령/결과: `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo test --locked -p deppy-sijo --bin deppy-sijo --features bench-alloc temporary_search_review_probe -- --nocapture` exit0, 진단함수1개 실행/2324 filtered, 컴파일13.74초. `/tmp/deppy-search-review-20260921.log`. 진단 종료 성공이며 **제품 정상 통과를 뜻하지 않는다**. 로그에서 위2건을 재현했다. 새 영구 테스트나 전체 suite/gate를 추가·실행하지 않았다. 사용자 PTY에 입력하지 않았고 실제 GPU 화면 검증도 아니다. 실패한 도구 실행 접근 없음.
+- 검토 정상 범위: 마우스 클릭의 검색 UI 수명과 TextEdit 고정 ID, 정확한 pane 포커스 요청, 단일 delivery 슬롯과 stale completion 키 비교, 영구 payload 거절의 재전송 차단은 직접 대조했다. 새 스레드/타이머/무한 데이터 누적은 발견하지 못했으나 메모리 부하 측정은 수행하지 않았다. 이전 마우스/버튼 진단과 상태 검사 통과를 반복하지 않았고 해당 검사들은 이번 키보드/쿼리 원복 결함을 다루지 않았다.
+- 도구 제한: review 스킬(`/Users/jr/.agents/skills/review/SKILL.md:615`)은 `.agents/skills/gstack/review/checklist.md` 읽기를 요구하고 “If the file cannot be read, STOP and report the error.”라고 명시한다. repo·글로벌 후보 모두 missing 재확인, 사용자에게 알리고 자동 절차 대신 직접 리뷰했다. 자동 파이프라인 실행 완료로 주장하지 않는다.
+- 남음: 위2건 미수정. 직전 작업 배지3건/스크롤 하단 버튼 hover1건은 별개 미수정 상태로 보존. 다음 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `sed -n '4375,4484p' crates/app/src/ui/workspace.rs`; `cat /tmp/deppy-search-review-20260921.log`; `git diff -- crates/app/src/ui/workspace.rs`. 수정 요청 전 제품 코드 변경 없이 리뷰 결과를 보고한다. 재빌드·재실행은 별도 사용자 요청 때만 한다.
+
+
+## 2026-09-21 검색 리뷰 2건 수정·집중 재검증 중
+
+- 사용자 “수정해” 승인으로 직전 검색 리뷰 high/medium 2건을 보완 중. 작업 위치 agent-wait-audit/HEAD f042082, 기존 모든 dirty 수정 유지. 재빌드·재실행 요청은 없으며 실행 앱은 유지한다.
+- RED: 이전 리뷰 진단을 `/tmp/deppy-search-fix-check-20260921.py`로 복사해 기대 동작 assertion만 추가하고 수정 전 실행했다. `temporary_search_review_probe` **0 PASS/1 FAIL**, exit101, `/tmp/deppy-search-review-fix-red-20260921.log`. Enter 결과 이동 실패/후속 PTY 유출, Esc 닫기 실패/PTY 유출, 큐가 풀린 뒤 검색어 원복 재전송 누락을 함께 확인. 임시 코드 원문복원 완료.
+- 제품 수정: workspace.rs의 TerminalSearch에 마지막 input_id1개를 저장하고 handle_terminal_search_keys가 has_focus 또는 egui가 Esc로 비운 직전 focus를 확인한다. 검색 소유의 Enter/Shift+Enter/Esc만 egui events와 PTY가 읽는 raw.events 양쪽에서 소비한다. TextEdit 기본 Enter 포커스 종료는 return_key(None)로 끈다. App::ui는 첨부 pane 렌더보다 앞서 검색 키를 처리해 다른 pane으로도 새지 않도록 하며 Workspace 단독 렌더도 같은 helper를 호출한다(이미 소비된 이벤트는 재처리 없음). 검색 닫기는 search.session의 정확한 pane을 찾아 포커스를 요청한다. 쿼리 변경 시 matches뿐 아니라 requested/delivery도 초기화해 이전 문자열로 돌아와도 재검색한다.
+- 현재 검증: 같은 임시 진단을 수정 후 실행 중, `/tmp/deppy-search-review-fix-green-20260921.log`. 아직 완료 결과를 주장하지 않는다. 다음은 결과 확인→필요 시 Shift+Enter/정확한 pane 복귀/첨부 선행 렌더 입력 차단을 같은 진단으로 확인→직접 diff 검토/인계 갱신. 제품 파일은 app.rs/workspace.rs, 문서는 이 파일. scoped rustfmt 실행. release 빌드/재실행·전체 gate/커밋/push 없음.
+
+
+### 2026-09-21 검색 리뷰 2건 수정 완료 / 집중 확인 통과
+
+- 완료: 위 리뷰 high(Enter/Esc 및 후속 입력의 PTY 유출)와 medium(큐 포화 중 검색어 원복 후 재검색 누락)을 모두 수정했다. 제품 변경은 app.rs/workspace.rs, 기록은 이 문서. 이전 모든 dirty 수정/브랜치/HEAD 유지.
+- 최종 설계: 마지막 검색 입력 ID1개로 실제 포커스 소유자를 확인하며, egui가 Esc로 현재 focus를 비웠을 때만 직전 검색 owner를 인정한다. 다른 입력창/팝업/기존 blocking window가 소유한 키는 검색이 소비하지 않는다. App은 모든 attached/local terminal draw보다 먼저 helper를 호출하고, 소비한 검색 키가 있으면 primary 표면 소유권을 선택한다. Workspace 단독 호출도 렌더 전 동일 helper를 사용하되 이미 소비한 events/raw.events는 두 번 처리되지 않는다. Ctrl/Alt/Command 조합은 검색 동작으로 취급하지 않고 Enter/Shift+Enter/Esc의 눌림만 소비한다. 이벤트 사본 두 개 모두에서 제거하므로 터미널 raw 매퍼에도 새지 않는다. 닫기 후 refocus 대상은 mux의 임의 현재 pane이 아니라 검색 session의 pane이다.
+- 검색어 변경 시 requested/delivery/matches/current/total/capped/scroll 목표를 함께 초기화한다. Busy 상태에서 api-key→api-keyx→api-key로 원복해도 requested=None이 유지되어 큐가 비면 SearchScrollback이 다시 전송된다. 이전 delivery completion은 이미 초기화된 슬롯과 일치하지 않아 새 쿼리 상태를 바꾸지 않는다.
+- GREEN 1차: `/tmp/deppy-search-review-fix-green-20260921.log` exit0, 임시 기대동작 검사1 PASS. RED에서 실패한 Enter/Esc/PTY 유출/원복 재전송 assertion이 모두 통과했다.
+- 최종 집중 확인: `/tmp/deppy-search-fix-final-20260921.py`로 기존 진단에 Shift+Enter 및 App 선행 처리 시점의 raw 키 제거 assertion을 추가하고 기존 마우스 버튼 진단과 순수 요청 상태 검사도 같은 단일 cargo 실행에 포함했다. 명령 `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo test --locked -p deppy-sijo --bin deppy-sijo --features bench-alloc -- --nocapture temporary_search_review_probe temporary_search_buttons_probe search_request` → **3 PASS / 0 FAIL / 2323 filtered**, exit0. `/tmp/deppy-search-fix-final-20260921.log`. 마지막 blocking-window 키 소유권 가드를 추가한 뒤 같은 집중 범위를 다시 실행한 것이 최종 로그다.
+- 관찰: 3개 매치에서 Enter current0→1, Shift+Enter0→2, 각각 text_focus=true; Esc search=None 및 정확한 left pane FocusPane, WriteInput0. 원복 검색은 큐 배출 뒤 api-key 재전송. 기존 마우스 next/prev/close 및 로컬/host Busy 상태 검사를 유지했다. 합성 검색 결과를 주입한 입력/상태 검증이며 실제 backend/사용자 앱 화면 검증으로 과장하지 않는다. 임시2개 진단은 실행 후 원문 비교 보호를 거쳐 제거했고 `temporary_probe_removed=true`, 관련 임시 심볼0 확인. 새 상시 UI 회귀 테스트를 남기지 않았다.
+- 직접 검토: 기존 PTY 입력 gate/큐 상한과 다른 필드·팝업 입력 소유권을 유지하고, 새 비동기 worker/스레드/타이머/무한 캐시를 추가하지 않았음을 확인했다. scoped rustfmt 외 전체 suite/clippy/i18n/커밋 gate는 실행하지 않았다. 의도한 RED 외 실패한 구현 접근 없음.
+- 적용 상태: 제품 소스는 미커밋. **앱 release 재빌드·재실행/실제 화면 확인·커밋/push/main merge를 하지 않았다.** PID5440의 기존 signed bundle은 실행 중이며 이번 검색 수정은 아직 미적용. 사용자가 재빌드·재실행을 요청하면 누적 dirty 소스를 기록해 적용한다. 이전 배지 리뷰3건/스크롤 하단 hover1건은 이번 승인 범위 밖으로 그대로 미수정이며, 검색 리뷰2건은 이제 미수정 목록에서 제외한다.
+- 다음 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `git diff -- crates/app/src/app.rs crates/app/src/ui/workspace.rs`; `tail -12 /tmp/deppy-search-fix-final-20260921.log`; `ps -p 5440 -o pid,stat,comm`. 새 변경 없이 통과 검사를 반복하지 않는다.
+
+
+## 2026-09-21 세션 사용자 지정 이름 / 두 줄 레이아웃 HTML 시안 완료
+
+- 새 요청: 사용자 이름 변경이 목록에 보이지 않고 현재 작업/상태가 대신 보이는 문제에 대해, 이름은 첫 줄에 고정하고 현재 작업·상태를 모델/추론 강도가 있는 둘째 줄로 옮기는 방향 또는 대안을 시안으로 요청했다. **제품 구현 요청은 아직 없으며 이번 작업은 시안만이다.** 앞선 검색 수정 및 모든 dirty 제품 파일을 보존했다.
+- 코드 근거: workspace.rs resolve_session_title은 기본 이름이 아닌 사용자 제목을 우선 반환한다. App의 RenameSession도 RenamePane 경로로 전달한다. 반면 file_tree.rs session_title_lines는 agent_line이 있고 status_line이 비어 있지 않으면 entry.title보다 status_line을 우선해 사용자 제목을 가린다. 목록의 현재 1행은 작업 요약+상태, 2행은 agent_line이며 행은 실제로 두 줄이다. 저장 실패를 실증한 것이 아니므로 이름 저장 자체가 정상이라고 무조건 단정하지 않는다.
+- 산출물: `docs/previews/session-name-layout-20260921.html` 신규 standalone HTML/CSS/JS. 외부 리소스/실제 세션/저장소/API 사용 없음. A=제안하신 방향(이름 / 상태+작업+축약 모델), B=추천(이름+상태 / 작업+축약 모델), C=기존 모델 정보 유지(이름+상태 / Agent+모델+추론 강도). A/B의 추론 강도와 전체 정보는 native title hover 및 시안 하단 inspector에 제공한다. 좁은 폭의 정보 손실을 각 안의 설명에 명시했다. B는 상태의 위치를 유지하면서 작업 요약 폭을 확보하는 절충안이다.
+- 공통: 사용자 지정 이름만 고정하고 이름 없는 행은 작업 요약을 그대로 보여 준다. 선택한 세션만 중립 배경색, workspace 색은 아이콘에만 사용. 행 사이 추가 간격 없음, 2줄/41.2CSSpx 높이(현재 UI 상수와 동일), 제목13px/보조10.5px. 이름/상태/240–400px 폭을 바꾸는 입력과 세션 선택을 모든 비교안에 동시 반영한다. 데이터는 페이지 메모리에만 유지한다.
+- 표시/검증: `python3 -m http.server 8874 --bind 127.0.0.1 --directory docs/previews`로 localhost 서버를 실행(unified exec session27048). `open -a 'Google Chrome' http://127.0.0.1:8874/session-name-layout-20260921.html`로 새 탭을 열었다. CUA Chrome AX에서 세 안의 row/입력/모델 정보가 렌더됨을 확인하고 실제 스크린샷으로 세 열/두 줄 목록/선택 배경/말줄임을 확인했다. 확인 시 화면 폭 컨트롤은260px였으며 사용자 조작을 덮어쓰지 않았다. 직접 입력/상태 변경 자동화 검사는 하지 않았다. Rust 테스트/릴리스 재빌드/재실행 없음.
+- 접근 실패/대안: CUA getBrowser는 “No browser is available”, getState는 browsers=[]를 반환했다. 설치된 Chrome native app과 OS open을 사용해 실제 페이지 표시를 확인했다. 브라우저 연결 설치나 사용자 탭 교체는 하지 않았다. web-artifacts-builder 안내에 따라 단순 파일은 React/scaffold 없이 작성했다. brainstorming 스킬을 적용하되 사용자 명시적 시안 요청에 따라 추가 승인 대화 없이 HTML 비교물을 만들고 제품 구현은 보류한다.
+- 남음: 사용자가 A/B/C 또는 변형을 고르면 그 범위에 맞춰 실제 세션 제목/상태/모델 표시 우선순위를 변경한다. 사용자 지정 이름 여부를 명시적으로 전달하는 경로가 필요할 수 있으므로 기본 자동제목을 무조건 고정하지 않는다. 이번에 제품 수정/커밋/push/main merge 없음. 이전 검색 수정은 소스 완료·앱 미적용 상태이고 다른 리뷰 미수정 항목은 앞 절 참조.
+- 다음 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `open -a 'Google Chrome' http://127.0.0.1:8874/session-name-layout-20260921.html`; `rg -n 'fn session_title_lines|fn resolve_session_title' crates/app/src/ui/file_tree.rs crates/app/src/ui/workspace.rs`. 서버가 종료됐으면 위 http.server 명령으로 재실행하거나 HTML 파일 자체를 열어도 동작한다.
+
+
+## 2026-09-21 A안 선택 후 이름 미지정 세션 비교 시안 완료
+
+- 현재 목표: 사용자가 A안을 선택하고 사용자 지정 이름이 없는 경우의 표시 및 A안 변형을 추가 시안으로 요청했다. 이번에도 제품 구현 요청은 아니므로 Rust 코드/기존 dirty 변경/실행 앱을 건드리지 않았다.
+- 산출물: `docs/previews/session-name-a-variants-20260921.html` 신규 standalone HTML. 기존 A/B/C 비교는 그대로 보존하고 별도 페이지로 만들었다. A1(추천)은 이름이 없으면 현재 작업을 첫 줄, 상태·Agent·모델·추론 강도를 둘째 줄에 둔다. A2는 첫 요청을 첫 줄에 고정하고 둘째 줄에 상태·현재 작업·축약 모델을 둔다. A3는 Agent·고정 번호를 첫 줄에 두고 둘째 줄은 A2와 같다. 이름을 직접 붙이면 모든 안이 지정 이름 / 상태·현재 작업·축약 모델로 동일해진다.
+- 설계 결정: 이름 유무와 무관하게 상태는 둘째 줄에 고정한다(이전 A의 이름 없는 행은 첫 줄 상태였으므로 그 부분을 개선한 변형). 요청/출력이 없는 새 세션은 A1/A2에서 `Codex · 새 세션`, A3에서 `Codex · 04`. 행은 두 줄·41.2CSSpx, 추가 행 간격 없음, 선택 세션만 중립 배경. 첫 요청 고정 제목/A3 고정 번호는 제안 동작이며 기존 제품 구현으로 주장하지 않는다. 전체 정보는 hover/하단 정보 영역에 표시한다.
+- 상호작용: 이름 붙이기·지우기/직접 입력, 너비240–400px, 작업 진행3단계 전환, 세션 선택을 비교안에 함께 반영하는 컨트롤을 제공한다. A1 자동 제목 변화와 A2/A3 제목 유지를 비교할 수 있다. 예제 데이터만 페이지 메모리에 유지하며 실제 세션/저장/API 접근은 없다.
+- 실제 확인: 기존 localhost8874 서버에서 새 경로 HTTP200 확인. Chrome 새 탭으로 열었고 CUA native Chrome AX에서 세 안/이름 없는4개 및 지정2개/컨트롤이 렌더됨을 확인했다. 실제 스크린샷은 좁은 브라우저 창에서 세 안이 세로로 쌓이고 A1의 두 줄 행·선택 배경·상태 색 및 A2 상단이 표시됨을 확인했다. 확인 시 컨트롤 값320px, 이름 입력 비어 있음. 컨트롤을 직접 조작하는 자동 검사는 하지 않았다. 제품 테스트/release 빌드/재실행/커밋/push/merge 없음. 새 실패 접근 없음.
+- 남음: 사용자 시안 선택/구현 요청에 따라 제목/상태 표시를 실제 제품에 적용한다. 실제 사용자 지정 제목 여부 전달과 자동 제목의 구분 경로를 확인해야 한다. 이전 검색 수정은 소스 완료·실행 앱 미적용 상태이며 기존 리뷰 미수정 항목은 앞 절 그대로 유지한다.
+- 다음 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `open -a 'Google Chrome' http://127.0.0.1:8874/session-name-a-variants-20260921.html`; 서버가 종료됐다면 `python3 -m http.server 8874 --bind 127.0.0.1 --directory docs/previews`. HTML 파일 자체를 열어도 동작한다. 앱 재빌드/재실행은 명시적 요청 때만 진행한다.
+
+
+## 2026-09-21 세션 목록 A1 구현 착수
+
+- 사용자 “A1으로 진행해”로 시안 구현을 승인했다. 실제 작업 위치 agent-wait-audit, HEAD f042082 유지. 기존 dirty 변경은 보존한다.
+- 계획: docs/superpowers/plans/2026-09-21-session-sidebar-a1.md. 사용자 이름을 첫 줄에 고정하고 이름 없는 Agent는 현재 작업, 작업이 없는 초기 Agent는 Agent·새 세션을 표시한다. 상태는 둘째 줄 고정. 이름 있는 행은 작업·축약 모델, 없는 행은 기존 Agent·모델·강도를 함께 표시한다.
+- 현재 조사: runtime RenamePane이 pane.title을 갱신하고 저장하는 기존 경로는 유지한다. 목록의 status_line 우선 규칙만 사용자 이름 여부에 따라 바꾼다. 판별은 기존 is_default_session_title 규칙을 그대로 공유한다.
+- 검증 계획: UI 변경이므로 회귀 테스트를 새로 돌리지 않는다. 재빌드·재실행은 명시적 요청 때만 한다. 제품 화면 검증은 아직 수행하지 않았다. 이전 검색/배지/스크롤/폴더 수정 모두 보존.
+
+
+### 2026-09-21 세션 목록 A1 소스 구현 완료 / 앱 미적용
+
+- 완료: 사용자 승인 A1을 `crates/app/src/ui/file_tree.rs`, `crates/app/src/ui/workspace.rs`에 반영했다. 다섯 로케일에 `sidebar.session.new`를 추가했다. 계획 파일 `docs/superpowers/plans/2026-09-21-session-sidebar-a1.md` 및 이 문서를 갱신했다. 이전 검색·폴더·작업 배지·스크롤 버튼 dirty 수정은 보존했다.
+- 표시 규칙: 사용자 이름이 있으면 첫 줄 고정, 둘째 줄은 상태·현재 작업·축약 모델. 이름이 없으면 현재 작업이 첫 줄, 둘째 줄은 상태·기존 Agent/모델/강도 정보. 실제 작업 요약과 사용자 요청이 모두 아직 없으면 Agent·새 세션을 첫 줄에 표시한다. 상태 판정/상태 색은 기존 공통 경로를 그대로 쓴다. 셸은 기존 제목/요약을 유지한다.
+- 데이터: 자동 프로젝트/OSC 이름으로 변환하기 전 raw pane.title을 기존 is_default_session_title 규칙으로 판별해 title_is_custom을 전달한다. 모델은 감지 원본에서 전달하며 이름 지정 행에만 clone한다. 초기 Agent용 new_agent_title은 작업 정보가 없고 이름도 없을 때만 만든다. active/warm은 session_entries→from_live 공통 경로, cold 저장 행은 기존 제목/요약을 사용한다. 새 저장 컬럼/런타임 계약/스레드/타이머/캐시는 없다.
+- 이름 편집: 기존 우클릭 메뉴의 인라인 편집을 유지한다. 이름 미지정이면 빈 편집기로 시작한다. 이름을 비워 Enter로 확정하면 `workspace.spawn.shell <session id>` 기본 제목 형식을 기존 RenamePane 경로에 보내 자동 표시로 되돌린다. 사용자 지정 여부는 현재 저장 형식의 기존 예약 기본 제목 판별을 그대로 따르며, 별도 영속 플래그를 새로 도입하지 않았다.
+- 렌더: 제목·둘째 줄 두 줄과 기존 SESSION_ROW_HEIGHT/ROW_GAP/폰트·선택 배경·드래그 ID를 유지한다. 상태를 둘째 줄 첫 section에 색으로 표시하고 모델은 최대27% 폭으로 우측에 확보한다. 가용 텍스트 폭96pt 미만에서는 우측 모델을 생략해 상태를 우선한다. max_rows1 말줄임과 행 내부 clip을 적용한다. 생략한 정보는 hover 때만 전체 작업/Agent/모델/강도로 표시하며 내부 진단 정보는 넣지 않는다. 이전 3행용 분기/매 행 높이 Vec을 제거해 두 줄 계산으로 바꿨다.
+- 검증: 구현 전 `/tmp/deppy-a1-before-file_tree.rs`, `/tmp/deppy-a1-before-workspace.rs`로 원문을 보관하고 변경 diff·모든 SessionEntry 생성부·active/warm/cold 경로·기존 RenamePane 저장/선택/드래그 경로를 직접 정적 검토했다. 기존 테스트 fixture11곳은 새 필드만 채웠다. `rustfmt --edition 2024 --config skip_children=true crates/app/src/ui/file_tree.rs crates/app/src/ui/workspace.rs` exit0. 이는 포맷/구문 처리이며 타입검사나 테스트 통과로 주장하지 않는다. **UI 회귀 테스트/cargo check/전체 gate/release 재빌드/재실행/실제 앱 화면 검증은 실행하지 않았다.** 사용자 빌드·재실행 제한과 UI 검증 지침을 따른다.
+- 검토 중 보완: 불필요한 모델 clone을 이름 지정 행으로 제한하고, 기존 테스트의 사용자 제목 fixture11개에 true를 전달했다. 실패한 구현/테스트 결과는 없다. 탐색 중 존재하지 않는 crates/runtime/src/mux.rs 조회는 실패했으며 실제 RenamePane 처리(in_process.rs)와 App 호출부로 확인했다.
+- 현재/남음: A1 **소스 구현 완료·미커밋·실행 앱 미적용**. 실제 화면 확인과 컴파일 확인은 다음 명시적 재빌드 요청 때 남아 있다. 기존 기본 제목 형식 자체를 사용자 이름으로 쓰는 경우의 구분은 이번에 저장 모델을 바꾸지 않아 기존 규칙을 따른다. 이전 검색 리뷰2건은 소스 수정 완료, 별도 배지 리뷰3건/스크롤 하단 hover1건은 앞 절대로 미수정. 커밋/push/main merge 없음.
+- 정확한 다음 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `diff -u /tmp/deppy-a1-before-file_tree.rs crates/app/src/ui/file_tree.rs`; `diff -u /tmp/deppy-a1-before-workspace.rs crates/app/src/ui/workspace.rs`; `rg -n 'sidebar.session.new' crates/i18n/locales/*/messages.txt`. 사용자 재빌드 요청 후에만 기존 release 명령과 서명 bundle 절차를 수행한다. 화면 확인은 이름 지정/미지정/이름 비우기·좁은 폭·warm 전환을 실제 앱에서 확인하며, 확인 전 PASS라고 쓰지 않는다.
+
+
+## 2026-09-21 A1 구현 코드 리뷰 / 보완 1건
+
+- 범위: 사용자 “코드 리뷰해”에 따라 직전 A1의 pre-edit 원문(`/tmp/deppy-a1-before-file_tree.rs`, `/tmp/deppy-a1-before-workspace.rs`) 대비 전체 diff, 다섯 로케일 신규 키, SessionEntry 생성부, 이름 편집→RenamePane→snapshot 저장, Agent 표시정보 조립, active/warm/cold 목록과 egui0.36.1 painter/hover 경로를 직접 검토했다. 제품 코드는 변경하지 않았으며 이 인계만 갱신한다.
+- **medium — crates/app/src/ui/workspace.rs:8358–8373**: last_agent_summary와 user_instruction이 비었다는 이유만으로 `Agent · 새 세션`을 만든다. 이 둘이 None인 것은 최초 요청 전뿐 아니라 transcript 바인딩/파싱이 없는 상태도 뜻한다. 실제 `agent_detect.rs:848`의 Kimi 자동 바인딩은 None을 반환하고, `app.rs:10365–10404`의 display_for/merge_detected_kinds는 프로세스만 감지된 경우 두 값을 None으로 채운다. push_agent_display(app.rs:16895–16899)가 이를 WorkspaceUi로 넘기므로 이미 사용 중인 이름 미지정 Kimi도 계속 `Kimi · 새 세션`이 된다. Claude/Codex/Grok도 저장된 표시가 없는 재시작 직후 transcript 연결/파싱 실패 시 같은 잘못된 표기가 가능하다. file_tree.rs:6287–6300이 new_agent_title을 기존 status_line/프로젝트 컨텍스트보다 먼저 택하고, hover도 이름 미지정이면 status_line을 보여주지 않아 원래 구분 단서가 숨겨진다. 단일 원인으로 합쳐 기록한다.
+- 권장 보완: 메타데이터 없음과 실제 새 세션을 구분한다. 새 세션임을 확인할 수 없는 경우 기존 프로젝트/상태 설명을 유지하고, 확인된 최초 요청 전 상태에서만 새 세션 문구를 쓴다. 아직 수정하지 않았다.
+- 나머지 검토: 사용자 이름 우선/둘째 줄 상태 section, 모델 원본 전달과 이름 지정 행에만 clone하는 경로, max_rows1 및 row clip, 선택/드래그 ID·행 높이 유지, 모든 새 필드 생성부를 확인했다. 신규 무한 누적 컬렉션/스레드/타이머/강제 repaint는 없다. 동적 메모리 측정/컴파일 통과를 주장하지 않는다. 기존 예약 기본 제목(`셸 1` 등)을 직접 지정했을 때의 구분 한계는 이전 구현부터 있던 규칙이므로 이번 신규 리뷰 결함으로 중복 집계하지 않았다.
+- 검증 한계: 정적 소스 및 실제 호출 경로 대조다. 사용자 제한에 따라 테스트/cargo check/release 재빌드/재실행/UI 상호작용을 하지 않았다. 새로운 PASS 결과 없음. 이전 앱/모든 dirty 변경 유지.
+- 도구 제한: `/Users/jr/.agents/skills/review/SKILL.md:615–617`의 필수 `.agents/skills/gstack/review/checklist.md`가 repo/global 후보에 없음을 확인했다. “If the file cannot be read, STOP and report the error.” 지침에 따라 그 자동 절차는 실행하지 않고 사용자에게 제한을 알린 후 직접 리뷰로 마쳤다.
+- 다음 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `sed -n '8350,8386p' crates/app/src/ui/workspace.rs`; `sed -n '6285,6301p' crates/app/src/ui/file_tree.rs`; `sed -n '839,850p' crates/app/src/agent_detect.rs`; `sed -n '10365,10405p' crates/app/src/app.rs`. 사용자 수정 요청 시 위1건을 보완한다. 빌드/재실행은 별도 명시적 요청 때만 수행한다.
+
+
+## 2026-09-21 A1 영향 재리뷰 / 이름 편집 보완 2건 추가
+
+- 사용자 요청: 워크스페이스·세션·세션 드래그·이름 변경에 미치는 영향을 다시 검토. A1 pre-edit diff와 함께 active/warm/cold projection, 선택/드롭의 exact target, 순서 저장, RenamePane, inline TextEdit 및 실제 egui0.36.1 구현까지 정적으로 추적했다. 제품 파일은 변경하지 않았다. 전 리뷰의 자동 review 스킬 체크리스트 미설치 제한은 동일하며 직접 리뷰를 수행했다.
+- **medium — file_tree.rs:6576**(추가): 이름 TextEdit에 명시적 ID가 없고 row의 고정 ID(entry.target)는 ui.interact에만 쓴다(:6389). 세션 루프는 각 pane을 push_id로 감싸지 않는다(:2380–2383). egui0.36.1 TextEdit builder.rs:506–534는 이 경우 next_auto_id와 그 ID의 TextEditState를 재사용하고, :1202–1207은 저장된 undo 문자열을 실제 편집 버퍼에 덮어쓴다. 세션 A의 이름을 편집/확정한 뒤 A/B 위치를 드래그로 바꾸고 같은 목록 슬롯에 온 B의 이름을 편집하면 A의 실행 취소 이력이 B로 유입될 수 있다. 앞 세션을 닫아 슬롯이 당겨져도 같은 원인이다. 행 자체의 드래그 ID는 안전하더라도 입력창 ID는 따로 고정해야 한다. 권장: .id(egui::Id::new(("session_name_editor", &entry.target)))처럼 workspace/runtime/tab/pane/session을 포함한 정확한 target으로 editor 상태를 분리. 이 문제는 A1 이전에도 있던 이름 편집/정렬 상호작용이며 새로 발견한 보완이다.
+- **medium — file_tree.rs:2406–2426**(추가): 편집 확정/취소가 TextEdit 소유 포커스/응답을 확인하지 않고 전역 key_pressed Enter/Escape만 본다. session_row_impl은 행이 화면 밖이면 :6400에서 TextEdit 생성 전에 반환하지만 부모 루프는 계속 이 키 처리를 수행한다. 따라서 이름을 편집하다 목록을 스크롤해 그 행을 화면 밖으로 보낸 다음 터미널에서 Enter를 누르면 숨은 편집 버퍼가 RenameSession으로 확정될 수 있다. A1의 빈 이름 초기화까지 연결돼 있으면 지워 둔 이름이 의도치 않게 초기화된다. session_name_edit는 Enter take/Esc 이외에는 정리되지 않아 workspace 전환/돌아오기에도 남으며 editor는 :6582에서 매 프레임 focus를 요청한다. 권장: 실제 editor submit/cancel 결과로 확정하고 그 editor가 소유한 키만 소비; focus 요청은 진입 때1회; 세션/워크스페이스 변경·대상 소멸 시 편집을 취소하거나 명시적으로 정리. 전역 키 처리 자체는 기존 결함이고 A1의 빈 이름 초기화가 영향 범위를 넓힌다.
+- **medium — workspace.rs:8358**(기존 미수정): 작업 요약/요청 정보 없음과 실제 새 세션을 혼동하는 이전 리뷰1건 그대로다. 총 남은 A1/관련 입력 리뷰는3건(이번 추가2+이전1). unrelated Fleet 배지3건/scroll hover1건은 이전 절대로 별도 유지한다.
+- 영향 추적에서 확인한 계약: session_row의 interaction/드래그 payload는 SessionRowTarget(workspace/runtime/tab/pane/session)을 사용하고 제목을 키로 쓰지 않는다. session_reorder_drop(:5443)은 같은 workspace와 현재 exact target 존재를 확인하며 드롭은 pane ID 목록만 생성한다. App::sidebar_session_order_matches(:25087)는 workspace 귀속/중복/전체 ID집합을 검사하고 config.ui.workspace_session_order에 저장한다. sort_sessions_for_sidebar(:25070)는 pane ID로 안정 정렬해 이름 변경이 순서를 바꾸지 않는다. 세션 선택은 workspace/tab/pane으로 처리하고 App::poll_workspace_controller(:20165 이후)는 workspace 전환 뒤 현재 pane을 재검증한다. 다른 workspace의 옆에 열기/터미널 드롭은 try_open_session_beside(:21304)에서 runtime_instance와 exact pane을 다시 확인한다. A1의 title/status/model 필드는 그 식별 경로를 변경하지 않는다. 일반 RenamePane는 기존 worker(:2371)의 pane.title 변경→mux snapshot→영속 경로를 유지한다. 이들은 소스 확인이며 실제 상호작용 통과를 의미하지 않는다.
+- 메모리/렌더 검토: A1은 새 상시 캐시·스레드·타이머·중복 terminal render를 추가하지 않는다. tooltip 내용은 hover 때만 조립한다. 행의 두 줄 기하와 선택 배경은 유지됐다. 위 editor undo 혼입은 서로 다른 대상의 UI 상태 구분 결함이며 무한 메모리 누수로 주장하지 않는다.
+- 검증/한계: read-only 소스 및 로컬 egui0.36.1 코드 대조만 수행했다. 테스트·cargo check·빌드·재실행·실제 화면/키 입력 재현은 하지 않았다. 새 PASS 결과 없음. `/tmp/deppy-a1-review2-file-tree.diff`에 A1 비교 diff를 저장했다. 탐색 시 없는 workspace_controller.rs/renderer-egui 와일드카드는 실패했고 실제 App 내 enum/함수와 workspace 입력 경로로 추적했다.
+- 다음 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `sed -n '2380,2432p' crates/app/src/ui/file_tree.rs`; `sed -n '6383,6404p' crates/app/src/ui/file_tree.rs`; `sed -n '6563,6583p' crates/app/src/ui/file_tree.rs`; `sed -n '8354,8374p' crates/app/src/ui/workspace.rs`; `sed -n '25070,25126p' crates/app/src/app.rs`. 사용자 수정 요청 시 위3건을 함께 보완하며, 새 UI 검증은 재빌드·재실행 명시적 요청 후 화면으로 진행한다.
+
+
+## 2026-09-21 A1 리뷰 3건 수정 착수
+
+- 사용자 코드 수정 요청으로 세 건 보완을 승인받았다. 작업 위치/HEAD/이전 dirty 작업은 유지한다.
+- 결정: 이름 편집 상태와 TextEdit ID를 전체 SessionRowTarget으로 고정한다. 실제 보이는 입력창이 소유한 Enter/Esc만 처리하고 다른 pane의 raw 입력으로 중복 전달하지 않는다. focus 요청은 진입1회, 숨김/대상 소멸/워크스페이스 변경 때 취소한다.
+- 신규 세션 확증 정보가 현재 projection에 없으므로 메타데이터가 없을 때는 기존 agent_activity_line의 프로젝트/상태 폴백을 유지한다. 오판하는 new_agent_title 필드와 새 세션 전용 로케일 키를 제거한다. 실제 신규 여부 추적을 위해 runtime/storage를 확장하지 않는다.
+- 검증: 사용자 지시대로 재빌드/재실행하지 않는다. UI 변경이므로 상시 회귀 테스트/전체 gate를 새로 돌리지 않는다. 정적 diff/입력 소유·취소 경로 및 scoped rustfmt로 소스를 확인하고, 실제 화면 검증은 다음 명시적 재빌드 요청 때 수행한다. pre-edit 사본은 /tmp/deppy-a1-review-fix-before-{file_tree,workspace}.rs.
+
+
+### 2026-09-21 A1 리뷰 3건 소스 수정 완료 / 앱 미적용
+
+- 완료 범위: file_tree.rs, workspace.rs, 다섯 로케일에서 직전 A1 신규 키 제거, 기존 계획 문서 및 이 인계. 이전 검색/배지/스크롤/폴더 dirty 수정 보존. 재빌드·재실행/커밋/push/main merge 없음.
+- 이름 입력창 분리: SessionNameEdit가 전체 SessionRowTarget + text + request_focus를 가진다. input_id는 ("session_name_editor", target)이며 TextEdit.id에 명시한다. 목록 슬롯/이름 문자열을 ID로 쓰지 않는다. 기존 row interaction ID·drag payload·workspace별 pane 순서 저장 경로는 그대로다. 편집 확정/취소 때 해당 TextEditState를 remove하고 focus를 반납해 undo 초안을 남기지 않는다. 편집 상태는 동시에1개이며 별도 영속 저장/무한 맵은 없다.
+- 키 소유권: session_row_impl/session_row_editing은 row response와 편집 결과를 따로 반환한다. 전역 Enter/Escape 조회로 이름을 확정하던 부모 코드는 제거했다. 실제 보이는/활성/포커스 소유 입력창만 무수식 Enter/Escape를 처리한다. egui가 Esc 프레임 시작 시 focus를 비운 경우에만 had_focus_last_frame을 함께 본다. TextEdit.return_key(None)로 Enter 자체의 조기 focus 해제를 막고, 텍스트 반영 후 Submit을 만든다. 확정/취소 시 해당 편집 프레임의 키/문자/붙여넣기/IME 이벤트를 events와 raw.events 양쪽에서 제거하여 focus 해제 뒤 같은 프레임 PTY에 중복 전달하지 않는다. 진행 중 IME preedit가 있으면 확정하지 않는다.
+- 편집 수명: focus 요청은 진입 때1회. 행/입력창이 clip 밖이면 Cancel, 다른 곳 클릭/포커스 이동/앱 비활성/팝업/차단 창도 Cancel이다. 패널 접힘·workspace 변경/숨김·세션/runtime target 소멸을 매 프레임 현재 snapshot과 비교하고, sidebar 액션으로 다른 세션/도구로 이동할 때도 정리한다. 정리는 상태가 실제 있었을 때만 repaint를1회 요청한다. 중간 초안을 자동 저장하지 않는다. 기존 이름 비우기→기본 제목 복귀는 명시적 Submit에만 유지한다.
+- 차단 창은 workspace.rs의 기존 is_blocking_terminal_window를 pub(super)로 노출해 재사용한다. Agents/diff 비모달 창의 기존 예외와 확인/오류 창 우선권을 동일하게 유지했다. 입력/메모리 조회는 중첩 Context lock을 만들지 않게 분리했다.
+- 새 세션 오표시: new_agent_title 생성·전달·표시 필드를 제거했다. summary/instruction 부재가 새 세션을 증명하지 않으므로 agent_activity_line의 실제 작업→사용자 요청→프로젝트 컨텍스트→일반 상태 폴백을 그대로 사용한다. `sidebar.session.new`는 다섯 로케일에서 함께 제거했다. A1 시안의 초기 Agent·새 세션 예시는 더 이상 제품 규칙이 아니며 확증 없는 초기 표기를 추가하지 않는다. 사용자 이름 첫 줄 우선/상태 둘째 줄 규칙은 유지한다.
+- 실제 확인: `rustfmt --edition 2024 --config skip_children=true crates/app/src/ui/file_tree.rs crates/app/src/ui/workspace.rs` exit0. pre-edit 사본 대비 diff(`/tmp/deppy-a1-review-fix-final.diff`)와 모든 변경 호출부를 직접 검토했다. rg로 제품/로케일의 new_agent_title·sidebar.session.new·edit_buf·옛 tuple 참조가0인 것을 확인했다. 기존 이름 편집 진입점 source 검사의 우클릭1개 구조도 유지했다. 이는 구문/정적 확인이며 **타입검사·자동 테스트·실제 앱 화면 PASS를 의미하지 않는다.** 사용자 UI 절차/빌드 제한에 따라 cargo check/회귀 테스트/전체 gate/release 빌드/실행은 수행하지 않았다.
+- 실패 접근: 실행한 수정 스크립트와 rustfmt 실패 없음. 직접 검토 중 반환 Option의 명시적 무시, Context 조회 분리, 차단 창 공통 가드, 종료1회 repaint를 보완했다.
+- 남음: 이번 리뷰3건은 소스상 모두 수정 완료. 컴파일 및 실제 이름 편집→드래그→다른 세션 undo, 화면 밖 Enter/워크스페이스 전환/이름 비우기, 메타데이터 없는 Agent 표시는 다음 명시적 재빌드 요청 후 앱에서 확인해야 한다. 이전 별도 Fleet 배지3건/scroll hover1건은 이번 범위 밖으로 여전히 미수정이다.
+- 다음 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `git status --short`; `diff -u /tmp/deppy-a1-review-fix-before-file_tree.rs crates/app/src/ui/file_tree.rs`; `diff -u /tmp/deppy-a1-review-fix-before-workspace.rs crates/app/src/ui/workspace.rs`; `rg -n 'SessionNameEdit|session_name_editor|take_session_name_edit|fn session_headline' crates/app/src/ui/file_tree.rs`. 사용자 빌드 요청 전에는 기존 실행 앱을 유지한다.
+
+
+## 2026-09-22 사용자 요청 재빌드·재실행 착수
+
+- 사용자 명시 요청으로 최신 dirty 작업본을 release 빌드하고 서명 번들을 실행한다. 실제 작업 위치는 /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit, HEAD f042082이다. A1 및 직전 리뷰3건, 검색 등 누적 변경을 모두 포함한다. 커밋/push/merge는 범위 밖이다.
+- 시작 시 ps의 실제 실행 경로로 확인한 deppy-sijo 앱 프로세스는 없다. 이전 정상 번들 /private/tmp/deppy-folder-resume-20260921-_5r_only/Deppy Sijo.app을 리소스·Info.plist 템플릿으로만 사용한다.
+- 명령: CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo build --locked --release -p deppy-sijo -p mcp-proxy. 로그 /tmp/deppy-a1-release-20260922.log. 아직 성공 결과 없음. 전체 테스트/커밋 게이트 반복 없이 사용자 직접 화면 확인용 빌드를 진행한다.
+- 서명은 기존 Developer ID Application: VectorNine INC (ZDTU5LS35K)를 유지하고 두 실행 파일·번들의 designated requirement 일치를 확인한다. 재시작 전후 소스/바이너리 해시와 PID/실행 경로를 기록한다.
+- 다음: 빌드 결과 확인 → /tmp/deppy-a1-release-20260922.py package → 새 번들 실행/프로세스 확인 → 최종 인계 갱신.
+
+- 첫 release 빌드 실제 실패(exit101): file_tree.rs:6675의 renderer_egui 미해결(E0433). workspace.rs는 terminal::{..., renderer_egui}를 import하지만 새 file_tree 이름 편집 helper는 import 없이 줄인 경로를 쓴 것이 원인이다. 기존 terminal 모듈 구조와 대조한 뒤 terminal::renderer_egui::frame_has_active_preedit로 한 줄만 수정했다. 실패 로그 /tmp/deppy-a1-release-first-failure-20260922.log. 동일 release 명령으로 재검증하며 소스 스냅샷도 새로 고정한다. 별도 동작 변경/테스트 추가 없음.
+
+
+### 2026-09-22 최신 작업본 release 빌드·실행 완료
+
+- 완료: 경로 오류1건을 수정한 최종 소스에서 `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/deppy-ready-prs-integration-target cargo build --locked --release -p deppy-sijo -p mcp-proxy` 실제 exit0, 최적화 빌드41.94초. 로그 `/tmp/deppy-a1-release-20260922.log`. 첫 실패 로그와 한 줄 수정은 직전 기록 참고.
+- 번들: `/private/tmp/deppy-a1-20260922-g4jdk13h/Deppy Sijo.app`. 이전 정상 앱의 리소스/Info.plist를 사용하고 최신 deppy-sijo/deppy-mcp-proxy를 strip·Developer ID 서명했다. 두 바이너리와 번들 codesign --verify --strict, plutil lint 통과. 기존 앱과 지정 요구사항이 모두 동일함을 비교했다. notarization은 수행하지 않았다.
+- 실행: open으로 새 번들을 실행. 실제 PID 62185, `/private/tmp/deppy-a1-20260922-g4jdk13h/Deppy Sijo.app/Contents/MacOS/deppy-sijo` 하나만 실행됨과 바이너리 SHA256 일치를 확인했다. 시작 시 기존 앱이 없어 종료한 프로세스는 없다. manifest `/private/tmp/deppy-a1-20260922-g4jdk13h/build-manifest.json`, 실행 기록 `/tmp/deppy-a1-restart-20260922.json`. 빌드 전후 1070개 추적 파일/HEAD/상태 일치 검증 뒤 패키징했고 이후 이 인계 기록만 추가했다.
+- 화면: CUA로 실제 Deppy Sijo 창과 복구된 워크스페이스/세션, 지정 이름 첫 줄·지시 대기 둘째 줄을 확인했다. 사용자 터미널에 입력/명령 전송 없이 창과 렌더만 관찰했다. 이름 변경·드래그·undo·검색 전체 상호작용 PASS를 주장하지 않는다. 사용자 직접 사용 확인 가능 상태다.
+- 변경 파일: 이번 요청에서는 file_tree.rs 모듈 경로 한 줄과 이 인계 문서. 기존 dirty 변경 모두 포함/보존. 커밋/push/main merge 및 전체 테스트/게이트 반복 없음.
+- 남음: 사용자 화면 피드백. 별도 미해결 Fleet 배지3건/scroll hover1건은 이전 절대로 유지하며 이번 빌드 작업에서 처리했다고 주장하지 않는다.
+- 다음 확인 명령: `ps -p 62185 -o pid,stat,etime,comm`; `cat /tmp/deppy-a1-restart-20260922.json`; `tail -10 /tmp/deppy-a1-release-20260922.log`; `git -C /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit status --short`. 추가 재빌드/재시작은 다시 사용자 요청을 받은 뒤 수행한다.
+
+## 2026-09-22 Grok 신규 모델 자동 반영 조사
+
+- 현재 목표: Grok 4.7처럼 CLI에 새 모델이 추가되면 Deppy 에이전트 런처가 앱 업데이트나 수동 새로고침 없이 최신 목록을 반영하게 한다. 사용자 요청 시점에는 설계 확인 단계이며 제품 코드는 아직 수정하지 않았다.
+- 실제 근거: 설치된 `grok 1.0.40`의 `grok models`가 `grok-4.7`, `grok-4.7-build-fast`, `grok-4.6`, `grok-4.5`를 반환한다. `~/.grok/models_cache.json`에도 같은 두 신규 모델과 xhigh/high/medium/low 강도, high 기본값이 저장돼 있다. 실행 중 Grok 세션 화면에서도 Model · Grok 4.7을 확인했다.
+- 코드 경로: `agent_model_catalog::load`와 `parse_grok`은 `~/.grok/models_cache.json`의 현재 object/info 스키마를 이미 읽으며 신규 ID를 고정 목록 없이 `ModelChoice`로 만든다. `detect_installed_agents`도 이 동적 목록을 사용한다. 런처의 앱 상태는 `agent_launcher_snapshot` 한 벌이며, 시작 시 한 번 감지한 뒤 `open_agent_launcher_for_active`/`offer_agent_launcher_for_active`는 snapshot이 `None`일 때만 재감지를 요청한다. 따라서 실행 중 CLI 카탈로그가 바뀌어도 런처를 다시 열면 이전 snapshot을 계속 쓴다. 수동 Refresh만 다시 읽는다.
+- 권장 설계: 런처를 열 때마다 기존 snapshot은 즉시 표시하되 lazy bounded worker 재감지를 자동 요청한다. 완료되면 같은 기존 교체 경로로 모델 목록과 기본 강도를 갱신한다. 파일 I/O는 worker에만 남고, 매 프레임 stat/폴링·새 상시 스레드·네트워크 호출은 추가하지 않는다. 열려 있는 동안 바뀐 파일을 즉시 감시하는 watcher와 주기 폴링은 범위/자원 대비 과하다.
+- 필요한 TDD: open 경로가 snapshot 존재 여부와 무관하게 감지를 요청하는 실패 테스트를 먼저 추가하고 RED를 확인한다. 최소 제품 수정 후 해당 테스트와 기존 launcher/catalog 집중 테스트를 GREEN으로 확인한다. Grok 4.7 실제 fixture가 parser에서 자동 수용되는 회귀도 현재 계약을 재확인한다.
+- 미결정: 사용자가 원하는 “자동” 범위가 (권장) 런처를 열 때 최신 로컬 CLI 카탈로그를 재읽는 것인지, 앱이 열린 동안 파일 변경을 상시 감시해 열린 런처까지 즉시 바꾸는 것인지 확인이 필요하다. 재빌드·재실행은 별도 요청 전 수행하지 않는다.
+
+### 2026-09-22 모델 자동 갱신 설계 재검토 / 구현 전 보완 사항
+
+- 사용자 선택 확정: 직전 미결정 항목은 “권장방식으로 해”로 해소됐다. 런처를 열 때 비동기 갱신하는 방식 승인 완료. 현재 HEAD 881e94d에 설계 문서만 커밋됐다. 이번 요청은 문서를 실제 동작·깜빡임·전체 제공자 지원 관점에서 재검토하는 것이다. 제품 코드/원 설계 문서 수정, 추가 커밋, 빌드, 재시작은 하지 않았다. 기존 dirty 작업을 보존했다.
+- 검토 결론: 기본 갱신 시점은 유효하지만 현재 설계만으로 Cursor/Claude의 새 모델 전체 발견 및 화면 안정성을 보장할 수 없다. 다음 6건을 구현 전 설계에 반영해야 한다.
+- high — 제공자 누락(Cursor): agent_launcher.rs:311의 supports_model에 Cursor가 없고 내장 목록·agent_model_catalog.rs:36/52의 카탈로그 경로도 없다. 재탐지만 추가해도 Cursor 모델 선택은 생기지 않으며 build_launch_spec은 모델을 지정하면 UnsupportedModel로 거절한다. 설치된 cursor-agent --help와 cursor-agent models --help, 공식 https://cursor.com/docs/cli/reference/parameters 에서 models/--list-models/--model 지원을 확인했다. Cursor용 목록 수집·파싱·모델 지원 플래그·실행 검증을 함께 설계해야 한다. 외부 조회를 추가한다면 별도 bounded worker에서 timeout/출력 상한/실패 시 기존 목록 유지가 필요하다. 이번에는 실제 모델 조회/인증 접근은 하지 않았다.
+- medium — 제공자 누락(Claude): agent_launcher.rs:320의 sonnet/opus/fable 고정 별칭과 설정에 저장된 모델1개 채택이 전부다. 카탈로그 재읽기는 새 모델군/전체 버전 목록을 발견하지 않는다. 설치된 claude --help 및 https://code.claude.com/docs/en/model-config 에서 별칭은 provider/설정에 따라 최신 권장 모델을 해석하고 전체 ID는 특정 버전을 선택함을 확인했다. “기존 별칭의 최신 모델 사용”과 “새 목록 항목 자동 발견”을 구별하고 후자의 소스/가용성 검증을 별도로 정해야 한다.
+- medium — 갱신 중 레이아웃 이동: ui/agent_launcher.rs:558은 detecting 때만 spinner/설명 줄을 목록 위에 추가한다. 매 open 재탐지로 목록과 모달 기하가 갱신 시작/완료 때 달라질 수 있으므로 기존 snapshot 유지 만으로 깜빡임 없음은 보장되지 않는다. 기존 snapshot이 있으면 로딩을 고정 헤더 영역에 표시하거나 조용히 갱신하고, 목록/스크롤/위젯 ID를 유지해야 한다. 모델 드롭다운을 조작하는 중 적용 시점도 명시해야 한다. 실제 GPU 화면 재현은 이번 검토에서 수행하지 않았다.
+- medium — 읽기 실패 시 정상 목록 소실: agent_model_catalog::load는 읽기/파싱 실패를 빈 Vec로 반환하고 agent_launcher.rs:815는 이를 내장 목록으로 바꾼다. poll_agent_launcher_detection의 Ok(snapshot)는 이 폴백을 정상 완료로 받아 기존 snapshot을 덮어쓴다. 따라서 4.7을 고른 상태에서 캐시 손상/일시 읽기 실패가 나면 4.6으로 되돌아갈 수 있다. provider별 성공/실패/정상 빈 목록을 구분하고, 재갱신 실패 때 같은 설치/계정 범위의 마지막 정상 목록을 유지해야 한다. 최초 조회만 내장 폴백을 쓰되 로그아웃/계정 전환 때 이전 권한 목록을 무조건 유지해서는 안 된다.
+- medium — 오래된 기본값 고착: open_for(:194)는 model을 비우고 첫 렌더에서 옛 snapshot의 기본값을 채운다. 이후 새 snapshot에서 해당 모델이 유효하면 reconcile_model(:838)은 그대로 둔다. CLI 기본값을 4.6→4.7로 바꿔도 사용자가 아무 선택을 하지 않았는데 4.6이 남을 수 있다(강도도 동일). 자동 초기값과 사용자 명시 선택을 구별하여 새 기본값은 미조작 필드에만 적용해야 한다. 기존 테스트는 같은 공급자 재선택 보존을 다루지만 이 비동기 두 단계 기본값 사례는 다루지 않는다.
+- medium — 열기 경로 누락: app.rs:19069의 작업 이력 NewRun은 open_for_kind를 직접 호출한다. open_agent_launcher_for_active/offer_agent_launcher_for_active만 수정하면 이 경로는 갱신되지 않는다. 사용자 열기/자동 제안/이력 새로 실행 모두 공통 열기 갱신 계약에 연결해야 한다.
+- 제공자 범위: Grok·Codex는 CLI가 갱신한 로컬 캐시만 자동 수용 가능. CLI가 서버에서 아직 받지 않은 모델의 즉시 발견까지 보장하지 않는다. Kimi·Qwen은 로컬 설정에 등록된 모델 갱신이다. 나머지 supports_model 밖 제공자는 현재 설치 감지만 되고 모델 목록은 제공하지 않는다. 문서의 “모든 CLI” 효과로 확대 해석하지 않는다.
+- 실제 검증: 소스/설계 대조, cursor-agent --help, cursor-agent models --help, claude --help, 공식 문서 읽기. 제품 테스트/cargo check/화면 조작 실행 없음. 새 PASS 주장 없음. 원 설계 및 제품 수정은 아직 남아 있다. 불필요한 반복 승인 질문 없이 기존 권장안 승인을 유지하되, Cursor/Claude 전체 지원에 필요한 추가 설계 범위를 명확히 해야 한다.
+- 다음 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `cat docs/superpowers/specs/2026-09-22-agent-launcher-model-catalog-refresh-design.md`; `sed -n '19069,19088p' crates/app/src/app.rs`; `sed -n '24849,24945p' crates/app/src/app.rs`; `sed -n '518,625p' crates/app/src/ui/agent_launcher.rs`; `sed -n '762,860p' crates/app/src/ui/agent_launcher.rs`; `sed -n '803,855p' crates/app/src/agent_launcher.rs`. 검토 결과 보고 후 설계 보완/구현 범위를 이어 간다.
+
+## 2026-09-22 모델 갱신 세대 경합 리뷰 수정
+
+- 현재 목표: 커밋 `700a181` 직접 코드 리뷰에서 확인한 두 경합을 수정한다. 기존 미커밋 UI 변경은 보존하고 재빌드·재실행은 하지 않는다.
+- 완료: `request_agent_launcher_refresh`가 새 generation을 시작할 때 아직 화면에 적용하지 않은 이전 `agent_launcher_pending_snapshot`을 폐기한다. 확정된 `agent_launcher_snapshot`은 유지하므로 새 감지가 끝날 때까지 기존 화면이 비지 않는다. 설치 감지 완료는 generation 일치 여부를 먼저 검사하고, 현재 세대 결과만 `claude_direct_defaults`와 모델 probe에 반영한다.
+- 수정 파일: `crates/app/src/app.rs`, `docs/CODEX_HANDOFF.md`. 그 밖의 기존 dirty 파일은 건드리지 않았다.
+- 설계 결정: 보류 결과만 새로고침 경계에서 비우고 화면에 확정된 스냅샷은 유지한다. 별도 캐시·스레드·타이머·generation 자료구조는 추가하지 않았다. 직접 실행 Claude를 위한 `claude_direct_defaults_ignore_next_completion` 소비 시점은 기존 단일 감지 worker 계약을 유지했다.
+- TDD/검증: 신규 회귀 테스트 두 건을 먼저 추가했다. `cargo test -p deppy-sijo launcher_새로고침은_보류된_이전_스냅샷을_버린다 -- --nocapture`는 수정 전 assertion 실패, 수정 후 1 passed. `cargo test -p deppy-sijo launcher_detection은_현재_세대만_claude_기본값에_반영한다 -- --nocapture`도 수정 전 assertion 실패, 수정 후 1 passed. 인접 회귀 `cargo test -p deppy-sijo catalog_refresh -- --nocapture`는 12 passed. 전체 테스트 스위트는 실행하지 않았다.
+- 실패 접근: 첫 `cargo fmt --all -- --check`에서 신규 테스트의 긴 `and_then` 한 줄만 포맷 차이로 실패했다. rustfmt 제안 모양으로 고친 뒤 최종 `cargo fmt --all -- --check`와 `git diff --check`가 모두 exit 0이다. 구현 가설 실패나 빌드 정지는 없었다.
+- 남은 작업: 확인된 두 리뷰 결함의 코드 수정과 집중 검증은 완료됐다. 커밋·push·release 빌드·앱 재실행·화면 검증은 이번 요청 범위가 아니며 수행하지 않았다.
+- 다음 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `cargo fmt --all -- --check`; `git diff --check`; `git diff -- crates/app/src/app.rs`; 사용자 요청이 있으면 이후 커밋 또는 재빌드·재실행을 진행한다.

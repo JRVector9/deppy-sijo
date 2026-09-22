@@ -1127,6 +1127,7 @@ agent_launcher.none_detected_hint = 지원 CLI를 설치하거나 빈 터미널�
 agent_launcher.model = 모델
 agent_launcher.thinking = Thinking
 agent_launcher.effort = Reasoning Effort
+agent_launcher.effort.auto = CLI 기본값
 agent_launcher.effort.low = Low
 agent_launcher.effort.medium = Medium
 agent_launcher.effort.high = High

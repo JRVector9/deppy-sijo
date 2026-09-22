@@ -1127,6 +1127,7 @@ agent_launcher.none_detected_hint = 请安装受支持的 CLI，或启动空白�
 agent_launcher.model = 模型
 agent_launcher.thinking = 思考
 agent_launcher.effort = 推理强度
+agent_launcher.effort.auto = CLI 默认值
 agent_launcher.effort.low = 低
 agent_launcher.effort.medium = 中
 agent_launcher.effort.high = 高

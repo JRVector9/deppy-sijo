@@ -2,14 +2,14 @@
 //!
 //! Codex와 Kimi는 자기 모델 목록을 사용자 홈에 기계가 읽을 수 있는 형태로 남기고,
 //! 그 파일은 CLI가 서버에서 갱신한다. 그래서 새 모델이 나와도 이 앱을 고칠 필요가
-//! 없다. Claude Code는 카탈로그를 바이너리 안에만 갖고 있어 동적 소스가 없으므로
-//! `agent_launcher`의 내장 목록을 그대로 쓴다.
+//! 없다. Claude Code와 Cursor에는 여기서 읽는 디스크 카탈로그가 없으므로
+//! `agent_model_probe`가 별도 CLI 조회를 수행한다.
 //!
-//! 읽기는 전부 실패 허용이다. 파일이 없거나(로그아웃/새 설치) 깨졌거나 사용자가
-//! 손으로 편집해 형식이 어긋나면 빈 목록을 돌려주고, 호출자가 내장 목록으로
-//! 폴백한다. 파일 I/O를 하므로 렌더 스레드에서 호출하면 안 된다.
+//! 정상적인 빈 목록과 파일 삭제·읽기/파싱 실패를 구분한다. 호출자는 이 상태로
+//! 폴백 여부를 결정한다. 파일 I/O를 하므로 렌더 스레드에서 호출하면 안 된다.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::{self, Read};
 use std::path::Path;
 
 use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
@@ -32,7 +32,7 @@ const GROK_PARSED_EFFORT_ORDER: &[ReasoningEffort] = &[
     ReasoningEffort::Ultra,
 ];
 
-/// 이 종류의 에이전트가 디스크 카탈로그를 갖는지. 나머지는 내장 목록만 쓴다.
+/// 이 종류의 에이전트가 디스크 카탈로그를 갖는지. 외부 CLI 조회와는 별개다.
 pub(crate) const fn has_disk_catalog(kind: AgentKind) -> bool {
     matches!(
         kind,
@@ -40,29 +40,49 @@ pub(crate) const fn has_disk_catalog(kind: AgentKind) -> bool {
     )
 }
 
-/// 디스크 카탈로그를 읽어 모델 목록을 만든다. 읽지 못하면 빈 목록이다.
+/// 빈 목록도 정상 결과다. 실패와 구분해야 갱신 시 이전 목록의 보존 여부를 판단할 수 있다.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CatalogLoad {
+    Ready(Vec<ModelChoice>),
+    Missing,
+    Unavailable,
+    Unsupported,
+}
+
+/// 디스크 카탈로그를 한 번 읽고 파싱한다. 원문이나 읽기 오류의 경로는 결과에 담지 않는다.
 pub(crate) fn load(
     kind: AgentKind,
     home: Option<&Path>,
     configured_default: Option<&str>,
-) -> Vec<ModelChoice> {
+) -> CatalogLoad {
+    if !has_disk_catalog(kind) {
+        return CatalogLoad::Unsupported;
+    }
     let Some(home) = home else {
-        return Vec::new();
+        return CatalogLoad::Unavailable;
     };
-    match kind {
-        AgentKind::Codex => read_bounded(&home.join(".codex/models_cache.json"))
-            .map(|text| parse_codex(&text))
-            .unwrap_or_default(),
-        AgentKind::Kimi => read_bounded(&home.join(".kimi-code/config.toml"))
-            .map(|text| parse_kimi(&text))
-            .unwrap_or_default(),
-        AgentKind::Grok => read_bounded(&home.join(".grok/models_cache.json"))
-            .map(|text| parse_grok(&text, configured_default))
-            .unwrap_or_default(),
-        AgentKind::QwenCode => read_bounded(&home.join(".qwen/settings.json"))
-            .map(|text| parse_qwen(&text))
-            .unwrap_or_default(),
-        _ => Vec::new(),
+    let relative = match kind {
+        AgentKind::Codex => ".codex/models_cache.json",
+        AgentKind::Kimi => ".kimi-code/config.toml",
+        AgentKind::Grok => ".grok/models_cache.json",
+        AgentKind::QwenCode => ".qwen/settings.json",
+        _ => return CatalogLoad::Unsupported,
+    };
+    let text = match read_bounded_result(&home.join(relative)) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return CatalogLoad::Missing,
+        Err(_) => return CatalogLoad::Unavailable,
+    };
+    let models = match kind {
+        AgentKind::Codex => decode_codex(&text),
+        AgentKind::Kimi => decode_kimi(&text),
+        AgentKind::Grok => decode_grok(&text, configured_default),
+        AgentKind::QwenCode => decode_qwen(&text),
+        _ => return CatalogLoad::Unsupported,
+    };
+    match models {
+        Ok(models) => CatalogLoad::Ready(models),
+        Err(()) => CatalogLoad::Unavailable,
     }
 }
 
@@ -252,21 +272,44 @@ fn trimmed_non_empty(value: Option<String>) -> Option<String> {
 
 /// 상한 안의 UTF-8 일반 파일만 읽는다. 없음/과대/비UTF-8/권한 오류는 모두 `None`이다.
 fn read_bounded(path: &Path) -> Option<String> {
-    let metadata = std::fs::metadata(path).ok()?;
+    read_bounded_result(path).ok()
+}
+
+fn read_bounded_result(path: &Path) -> io::Result<String> {
+    let metadata = std::fs::metadata(path)?;
     if !metadata.is_file() || metadata.len() > CATALOG_MAX_BYTES {
-        return None;
+        return Err(io::ErrorKind::InvalidData.into());
     }
-    let text = std::fs::read_to_string(path).ok()?;
-    // CLI가 이 사이에 파일을 늘렸을 수 있다. 읽은 뒤 한 번 더 확인해야 상한이 실효한다.
-    (text.len() as u64 <= CATALOG_MAX_BYTES).then_some(text)
+    let file = std::fs::File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    read_limited(file)
+}
+
+fn read_limited(reader: impl Read) -> io::Result<String> {
+    let mut bytes = Vec::new();
+    // metadata 확인 뒤 파일이 커져도 상한보다 한 바이트만 더 읽고 중단한다.
+    reader.take(CATALOG_MAX_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > CATALOG_MAX_BYTES {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    String::from_utf8(bytes).map_err(|_| io::ErrorKind::InvalidData.into())
+}
+
+fn decode_json_object<'de, T: Deserialize<'de>>(text: &'de str) -> Result<T, ()> {
+    // serde 구조체는 배열 표현도 받지만 CLI 카탈로그의 루트 계약은 객체다.
+    if !text.trim_start().starts_with('{') {
+        return Err(());
+    }
+    serde_json::from_str(text).map_err(|_| ())
 }
 
 #[derive(Deserialize)]
 struct CodexCache {
     // `CodexModel`은 아니고 관대한 `serde_json::Value`로 받는다 — 항목 하나가 스키마에
     // 안 맞아도(예: `slug` 누락) 배열 전체의 역직렬화가 실패하지 않게 하기 위함이다.
-    // 개별 변환은 `parse_codex`에서 항목별로 시도하고 실패한 항목만 건너뛴다.
-    #[serde(default)]
+    // 개별 변환은 `decode_codex`에서 항목별로 시도하고 실패한 항목만 건너뛴다.
     models: Vec<serde_json::Value>,
 }
 
@@ -292,10 +335,8 @@ struct CodexReasoningLevel {
 
 /// `~/.codex/models_cache.json`. `visibility`는 서버가 정하는 열린 문자열이라
 /// 아는 값만 통과시킨다 — 모델 선택기에 새 내부 모델이 새는 것보다 안 보이는 쪽이 낫다.
-fn parse_codex(text: &str) -> Vec<ModelChoice> {
-    let Ok(cache) = serde_json::from_str::<CodexCache>(text) else {
-        return Vec::new();
-    };
+fn decode_codex(text: &str) -> Result<Vec<ModelChoice>, ()> {
+    let cache: CodexCache = decode_json_object(text)?;
     let mut models: Vec<(i64, ModelChoice)> = cache
         .models
         .into_iter()
@@ -324,14 +365,16 @@ fn parse_codex(text: &str) -> Vec<ModelChoice> {
     // 유지한다.
     models.sort_by_key(|(priority, _)| *priority);
     models.truncate(CATALOG_MODELS_MAX);
-    models.into_iter().map(|(_, choice)| choice).collect()
+    Ok(models.into_iter().map(|(_, choice)| choice).collect())
 }
 
 #[derive(Deserialize)]
 struct KimiConfigRaw {
+    #[serde(default)]
+    default_model: Option<String>,
     // `KimiModel`이 아니라 관대한 `toml::Value`로 받는다 — 항목 하나의 필드 타입이
     // 스키마와 안 맞아도(예: `support_efforts`가 배열이 아님) 테이블 전체의 역직렬화가
-    // 실패하지 않게 하기 위함이다. 개별 변환은 `parse_kimi`에서 항목별로 시도하고
+    // 실패하지 않게 하기 위함이다. 개별 변환은 `decode_kimi`에서 항목별로 시도하고
     // 실패한 항목만 건너뛴다.
     #[serde(default)]
     models: BTreeMap<String, toml::Value>,
@@ -352,16 +395,14 @@ struct KimiModel {
 
 /// `~/.kimi-code/config.toml`. `support_efforts`를 선언하지 않았지만 thinking을
 /// 지원하는 모델은 Kimi 자신이 boolean 모델로 다루며 값이 `on`/`off` 둘뿐이다.
-fn parse_kimi(text: &str) -> Vec<ModelChoice> {
-    let Ok(raw) = toml::from_str::<KimiConfigRaw>(text) else {
-        return Vec::new();
-    };
+fn decode_kimi(text: &str) -> Result<Vec<ModelChoice>, ()> {
+    let raw = toml::from_str::<KimiConfigRaw>(text).map_err(|_| ())?;
     // `models`는 `BTreeMap`이라 별칭 알파벳 순으로 나온다. 이 저장소가 쓰는 `toml`
     // 크레이트(1.1, 기본 feature)는 `preserve_order`가 꺼져 있어 `toml::Value::Table`도
     // 문서 순서를 보존하지 않는다 — 직접 확인함(별도 프로브 테스트로 뒤섞인 문서 순서가
     // 알파벳 순으로 나오는 것을 확인했다). 그래서 파일 순서를 복원할 방법이 없고, 대신
     // `default_model`이 가리키는 별칭만은 잘림 창 밖으로 밀려도 살려낸다.
-    let default_alias = parse_kimi_default_model(text);
+    let default_alias = trimmed_non_empty(raw.default_model);
     let models: Vec<ModelChoice> = raw
         .models
         .into_iter()
@@ -385,7 +426,7 @@ fn parse_kimi(text: &str) -> Vec<ModelChoice> {
             ModelChoice::new(&alias, label, efforts, default_effort)
         })
         .collect();
-    truncate_keeping_alias(models, default_alias.as_deref())
+    Ok(truncate_keeping_alias(models, default_alias.as_deref()))
 }
 
 /// 목록이 상한을 넘으면 자르되, `keep_value`로 지정된 항목이 잘림 창 밖에 있으면
@@ -587,10 +628,8 @@ fn push_unique_model(
 
 /// `~/.grok/models_cache.json`. Codex와 달리 `priority` 필드가 없으므로 정렬하지 않고
 /// 카탈로그 배열 순서를 그대로 쓴다.
-fn parse_grok(text: &str, configured_default: Option<&str>) -> Vec<ModelChoice> {
-    let Ok(cache) = serde_json::from_str::<GrokCache>(text) else {
-        return Vec::new();
-    };
+fn decode_grok(text: &str, configured_default: Option<&str>) -> Result<Vec<ModelChoice>, ()> {
+    let cache: GrokCache = decode_json_object(text)?;
     let mut seen = HashSet::new();
     let mut models = Vec::new();
     match cache.models {
@@ -630,7 +669,7 @@ fn parse_grok(text: &str, configured_default: Option<&str>) -> Vec<ModelChoice> 
             }
         }
     }
-    models
+    Ok(models)
 }
 
 /// `~/.qwen/settings.json`. Qwen은 서버 카탈로그를 내려받지 않고, 사용자가 손으로 등록한
@@ -673,12 +712,10 @@ const QWEN_KNOWN_PROVIDER_ORDER: [&str; 5] =
 /// 다섯 provider를 먼저 원래 순서대로, 그 외 커스텀 provider는 남은 키를 (BTreeMap
 /// 순회이므로) 알파벳 순으로 이어 붙여 훑는다. 진짜 중복은 `(id, baseUrl)` 쌍이 모두
 /// 같을 때뿐이다 — Qwen Code 문서상 같은 id라도 baseUrl이 다르면 별개 모델이다.
-fn parse_qwen(text: &str) -> Vec<ModelChoice> {
-    let Ok(settings) = serde_json::from_str::<QwenSettings>(text) else {
-        return Vec::new();
-    };
+fn decode_qwen(text: &str) -> Result<Vec<ModelChoice>, ()> {
+    let settings: QwenSettings = decode_json_object(text)?;
     let Some(mut providers) = settings.model_providers else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
     let mut ordered_entries: Vec<serde_json::Value> = Vec::new();
@@ -708,7 +745,7 @@ fn parse_qwen(text: &str) -> Vec<ModelChoice> {
         *id_counts.entry(model.id.clone()).or_insert(0) += 1;
     }
 
-    retained
+    Ok(retained
         .into_iter()
         .filter_map(|model| {
             let ambiguous = id_counts
@@ -718,7 +755,7 @@ fn parse_qwen(text: &str) -> Vec<ModelChoice> {
             ModelChoice::new(&model.id, &label, Vec::new(), None)
         })
         .take(CATALOG_MODELS_MAX)
-        .collect()
+        .collect())
 }
 
 /// 표시 라벨을 만든다. 같은 id가 여러 baseUrl로 남아 있을 때만(ambiguous) baseUrl의
@@ -766,7 +803,7 @@ fn collect_grok_efforts<'a>(values: impl Iterator<Item = &'a str>) -> Vec<Reason
         .collect()
 }
 
-fn effort_from_value(value: &str) -> Option<ReasoningEffort> {
+pub(crate) fn effort_from_value(value: &str) -> Option<ReasoningEffort> {
     match value.trim().to_ascii_lowercase().as_str() {
         "low" => Some(ReasoningEffort::Low),
         "medium" => Some(ReasoningEffort::Medium),
@@ -811,6 +848,125 @@ mod tests {
     }
 
     use super::*;
+
+    // 기존 항목 변환 fixture는 유지하고, 성공/실패 구분은 아래 load 회귀에서 따로 검증한다.
+    fn parse_codex(text: &str) -> Vec<ModelChoice> {
+        decode_codex(text).unwrap_or_default()
+    }
+
+    fn parse_kimi(text: &str) -> Vec<ModelChoice> {
+        decode_kimi(text).unwrap_or_default()
+    }
+
+    fn parse_grok(text: &str, configured: Option<&str>) -> Vec<ModelChoice> {
+        decode_grok(text, configured).unwrap_or_default()
+    }
+
+    fn parse_qwen(text: &str) -> Vec<ModelChoice> {
+        decode_qwen(text).unwrap_or_default()
+    }
+
+    #[test]
+    fn catalog_refresh_distinguishes_missing_invalid_and_empty_for_each_provider() {
+        let home = unique_temp_dir("catalog-refresh-states");
+        for (kind, relative, empty, malformed) in [
+            (
+                AgentKind::Codex,
+                ".codex/models_cache.json",
+                r#"{"models":[]}"#,
+                "{}",
+            ),
+            (
+                AgentKind::Grok,
+                ".grok/models_cache.json",
+                r#"{"models":{}}"#,
+                r#"{"models":null}"#,
+            ),
+            (
+                AgentKind::Kimi,
+                ".kimi-code/config.toml",
+                "[models]",
+                "models = 42",
+            ),
+            (
+                AgentKind::QwenCode,
+                ".qwen/settings.json",
+                r#"{"modelProviders":{}}"#,
+                r#"{"modelProviders":42}"#,
+            ),
+        ] {
+            let path = home.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            assert_eq!(
+                load(kind, Some(&home), None),
+                CatalogLoad::Missing,
+                "{kind:?}"
+            );
+            for broken in ["{", malformed, "[]", "[[]]", "null", "42"] {
+                std::fs::write(&path, broken).unwrap();
+                assert_eq!(
+                    load(kind, Some(&home), None),
+                    CatalogLoad::Unavailable,
+                    "{kind:?}"
+                );
+            }
+            std::fs::write(&path, empty).unwrap();
+            assert_eq!(
+                load(kind, Some(&home), None),
+                CatalogLoad::Ready(Vec::new()),
+                "{kind:?}"
+            );
+            std::fs::write(&path, [0xff, 0xfe]).unwrap();
+            assert_eq!(
+                load(kind, Some(&home), None),
+                CatalogLoad::Unavailable,
+                "{kind:?}"
+            );
+            std::fs::remove_file(path).unwrap();
+            assert_eq!(
+                load(kind, Some(&home), None),
+                CatalogLoad::Missing,
+                "{kind:?}"
+            );
+        }
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn catalog_refresh_accepts_new_grok_ids_with_declared_efforts() {
+        let home = unique_temp_dir("catalog-refresh-grok");
+        std::fs::create_dir_all(home.join(".grok")).unwrap();
+        std::fs::write(home.join(".grok/models_cache.json"), r#"{
+            "models": {
+                "grok-4.7": {"info": {"name":"Grok 4.7", "supported_in_api":true,
+                    "supports_reasoning_effort":true, "reasoning_efforts":[{"value":"high","default":true}]}},
+                "grok-4.7-build-fast": {"info": {"name":"Grok 4.7 Fast", "supported_in_api":true}}
+            }
+        }"#).unwrap();
+        let CatalogLoad::Ready(models) = load(AgentKind::Grok, Some(&home), Some("grok-4.7"))
+        else {
+            panic!("정상 카탈로그를 읽어야 한다");
+        };
+        assert_eq!(values(&models), ["grok-4.7", "grok-4.7-build-fast"]);
+        assert_eq!(models[0].efforts(), &[ReasoningEffort::High]);
+        assert_eq!(models[0].default_effort(), Some(ReasoningEffort::High));
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn catalog_refresh_limits_reads_even_when_input_exceeds_prior_metadata() {
+        let mut growing = io::repeat(b' ').take(CATALOG_MAX_BYTES * 2);
+        assert_eq!(
+            read_limited(&mut growing).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(growing.limit(), CATALOG_MAX_BYTES - 1);
+        let boundary = io::repeat(b' ').take(CATALOG_MAX_BYTES);
+        assert_eq!(
+            read_limited(boundary).unwrap().len() as u64,
+            CATALOG_MAX_BYTES
+        );
+    }
 
     const CODEX_FIXTURE: &str = r#"{
       "fetched_at": "2026-07-31T22:50:01.441741Z",
@@ -1328,32 +1484,17 @@ display_name = "Ok"
         assert!(parse_qwen(r#"{"modelProviders": "not-an-object"}"#).is_empty());
         // Qwen은 사용자가 설정을 한 번도 바꾸지 않으면 파일 자체가 없다 — 빈 목록으로 폴백한다.
         assert!(parse_qwen(r#"{"model": {"name": "qwen3-coder-plus"}}"#).is_empty());
-        assert!(load(AgentKind::Codex, None, None).is_empty());
-        assert!(load(AgentKind::Claude, Some(Path::new("/")), None).is_empty());
-        assert!(
-            load(
-                AgentKind::Codex,
-                Some(Path::new("/deppy-nonexistent-home")),
-                None
-            )
-            .is_empty()
+        assert_eq!(load(AgentKind::Codex, None, None), CatalogLoad::Unavailable);
+        assert_eq!(
+            load(AgentKind::Claude, Some(Path::new("/")), None),
+            CatalogLoad::Unsupported
         );
-        assert!(
-            load(
-                AgentKind::Grok,
-                Some(Path::new("/deppy-nonexistent-home")),
-                None
-            )
-            .is_empty()
-        );
-        assert!(
-            load(
-                AgentKind::QwenCode,
-                Some(Path::new("/deppy-nonexistent-home")),
-                None
-            )
-            .is_empty()
-        );
+        for kind in [AgentKind::Codex, AgentKind::Grok, AgentKind::QwenCode] {
+            assert_eq!(
+                load(kind, Some(Path::new("/deppy-nonexistent-home")), None),
+                CatalogLoad::Missing
+            );
+        }
     }
 
     #[test]
@@ -1594,7 +1735,10 @@ display_name = "K2.7 Coding"
         let padding = " ".repeat(usize::try_from(CATALOG_MAX_BYTES).unwrap_or(usize::MAX) + 1);
         std::fs::write(&path, format!("{padding}{{\"models\":[]}}")).unwrap();
         assert!(read_bounded(&path).is_none());
-        assert!(load(AgentKind::Codex, Some(dir.as_path()), None).is_empty());
+        assert_eq!(
+            load(AgentKind::Codex, Some(dir.as_path()), None),
+            CatalogLoad::Unavailable
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

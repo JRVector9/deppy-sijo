@@ -1,6 +1,103 @@
 use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// 설치 감지와 외부 모델 조회가 같은 런처 열기 요청에 속하도록 연결한다.
+#[derive(Default)]
+pub(crate) struct ModelCatalogRefresh {
+    generation: u64,
+    probes_requested: bool,
+}
+
+impl ModelCatalogRefresh {
+    pub(crate) fn request(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.probes_requested = true;
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn take_probe_generation(&mut self, detection_generation: u64) -> Option<u64> {
+        if detection_generation != self.generation {
+            return None;
+        }
+        std::mem::take(&mut self.probes_requested).then_some(self.generation)
+    }
+}
+
+#[derive(Clone, Default, PartialEq, Eq)]
+struct CatalogState {
+    executable_revision: Option<u64>,
+    scope: Option<u64>,
+    last_success: Option<Instant>,
+    unavailable: bool,
+}
+
+/// 실행 파일의 내용 교체를 작업 스레드에서 식별한다. 경로나 파일 내용은 결과에 남기지 않는다.
+pub(crate) fn executable_revision(path: &Path) -> Option<u64> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hash);
+    meta.len().hash(&mut hash);
+    meta.modified().ok()?.hash(&mut hash);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.dev().hash(&mut hash);
+        meta.ino().hash(&mut hash);
+        meta.ctime().hash(&mut hash);
+        meta.ctime_nsec().hash(&mut hash);
+    }
+    Some(hash.finish())
+}
+
+/// 인증 내용은 읽지 않고 설치·인증·설정 파일의 변경만 확인한다. 불명확하면 보존하지 않는다.
+fn catalog_scope(kind: AgentKind, executable: &Path, home: Option<&Path>) -> Option<u64> {
+    let home = home?;
+    let files: &[(&str, bool)] = match kind {
+        AgentKind::Codex => &[(".codex/auth.json", true), (".codex/config.toml", false)],
+        AgentKind::Grok => &[(".grok/auth.json", true), (".grok/config.toml", false)],
+        AgentKind::Kimi => &[(".kimi-code/config.toml", true)],
+        AgentKind::QwenCode => &[(".qwen/settings.json", true)],
+        _ => return None,
+    };
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    fn stamp(path: &Path, required: bool, hash: &mut impl Hasher) -> Option<()> {
+        path.hash(hash);
+        match std::fs::metadata(path) {
+            Ok(meta) if meta.is_file() => {
+                meta.len().hash(hash);
+                meta.modified().ok()?.hash(hash);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    meta.dev().hash(hash);
+                    meta.ino().hash(hash);
+                    meta.ctime().hash(hash);
+                    meta.ctime_nsec().hash(hash);
+                }
+                Some(())
+            }
+            Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => {
+                0u8.hash(hash);
+                Some(())
+            }
+            _ => None,
+        }
+    }
+    stamp(executable, true, &mut hash)?;
+    for (relative, required) in files {
+        stamp(&home.join(relative), *required, &mut hash)?;
+    }
+    Some(hash.finish())
+}
 
 const EXECUTABLE_PATH_MAX_BYTES: usize = 4 * 1024;
 const MODEL_MAX_BYTES: usize = 256;
@@ -311,7 +408,7 @@ impl AgentKind {
     pub(crate) const fn supports_model(self) -> bool {
         matches!(
             self,
-            Self::Claude | Self::Codex | Self::Kimi | Self::Grok | Self::QwenCode
+            Self::Claude | Self::Codex | Self::Kimi | Self::Grok | Self::QwenCode | Self::Cursor
         )
     }
 
@@ -575,6 +672,7 @@ pub(crate) struct DetectedAgent {
     /// 골라 두어, 앱으로 띄운 결과가 CLI를 그냥 실행한 것과 같게 유지한다.
     default_model: Option<String>,
     default_effort: Option<ReasoningEffort>,
+    catalog: CatalogState,
 }
 
 impl DetectedAgent {
@@ -609,7 +707,19 @@ impl DetectedAgent {
         self.default_effort
             .filter(|effort| choice.efforts().contains(effort))
             .or_else(|| choice.default_effort())
-            .or_else(|| choice.efforts().first().copied())
+            .or_else(|| {
+                if self.allows_cli_effort_default(model) {
+                    None
+                } else {
+                    choice.efforts().first().copied()
+                }
+            })
+    }
+
+    pub(crate) fn allows_cli_effort_default(&self, model: &str) -> bool {
+        self.kind == AgentKind::Claude
+            && find_model(&self.models, model)
+                .is_some_and(|choice| choice.default_effort().is_none())
     }
 
     pub(crate) fn supported_efforts(&self, model: &str) -> &[ReasoningEffort] {
@@ -655,6 +765,124 @@ pub(crate) struct DetectionSnapshot {
 }
 
 impl DetectionSnapshot {
+    pub(crate) fn retain_failed_catalogs(&mut self, previous: &Self, now: Instant) {
+        for agent in &mut self.agents {
+            let Some(old) = previous.find(agent.kind) else {
+                continue;
+            };
+            // 파일 감지는 외부 CLI 조회의 완료가 아니다. 새 probe 결과 전까지만 이전 표시를 쓴다.
+            if matches!(agent.kind, AgentKind::Cursor | AgentKind::Claude)
+                && agent.executable == old.executable
+                && agent.catalog.executable_revision == old.catalog.executable_revision
+                && old
+                    .catalog
+                    .last_success
+                    .is_some_and(|at| now.saturating_duration_since(at) < Duration::from_secs(600))
+            {
+                agent.models.clone_from(&old.models);
+                agent.catalog.clone_from(&old.catalog);
+                if agent.kind == AgentKind::Cursor {
+                    agent.default_model.clone_from(&old.default_model);
+                } else {
+                    adopt_dynamic_configured_model(
+                        agent.default_model.as_deref(),
+                        &mut agent.models,
+                    );
+                }
+                continue;
+            }
+            if agent.catalog.unavailable
+                && agent.catalog.scope.is_some()
+                && agent.catalog.scope == old.catalog.scope
+                && agent.executable == old.executable
+                && old
+                    .catalog
+                    .last_success
+                    .is_some_and(|at| now.saturating_duration_since(at) < Duration::from_secs(600))
+            {
+                agent.models.clone_from(&old.models);
+                agent.default_model.clone_from(&old.default_model);
+                agent.default_effort = old.default_effort;
+                agent.catalog.last_success = old.catalog.last_success;
+            }
+        }
+    }
+
+    pub(crate) fn probe_requests(
+        &self,
+        generation: u64,
+    ) -> [Option<crate::agent_model_probe::ProbeRequest>; 2] {
+        [AgentKind::Cursor, AgentKind::Claude].map(|kind| {
+            self.find(kind)
+                .map(|agent| crate::agent_model_probe::ProbeRequest {
+                    generation,
+                    kind,
+                    executable: agent.executable.clone(),
+                    launch_path: agent.launch_path.as_deref().map(str::to_owned),
+                    executable_revision: agent.catalog.executable_revision,
+                })
+        })
+    }
+
+    pub(crate) fn apply_model_probe(
+        &mut self,
+        result: crate::agent_model_probe::ProbeResult,
+        generation: u64,
+    ) {
+        if result.request.generation != generation {
+            return;
+        }
+        let Some(agent) = self.agents.iter_mut().find(|agent| {
+            agent.kind == result.request.kind
+                && agent.executable == result.request.executable
+                && agent.catalog.executable_revision == result.request.executable_revision
+        }) else {
+            return;
+        };
+        match result.catalog {
+            crate::agent_model_catalog::CatalogLoad::Ready(mut models) => {
+                if agent.kind == AgentKind::Claude {
+                    adopt_dynamic_configured_model(agent.default_model.as_deref(), &mut models);
+                }
+                agent.models = models;
+                if agent.kind == AgentKind::Cursor {
+                    agent.default_model = result.default_model;
+                }
+                agent.catalog = CatalogState {
+                    executable_revision: result.request.executable_revision,
+                    last_success: Some(Instant::now()),
+                    ..Default::default()
+                };
+            }
+            _ => {
+                // 외부 인증 범위를 독립적으로 증명하지 못하므로 실패 시 과거 계정 목록은 버린다.
+                agent.models = agent.kind.builtin_model_choices();
+                if let Some(configured) = agent.default_model.as_deref() {
+                    adopt_model(agent.kind, configured, &mut agent.models);
+                }
+                if agent.kind == AgentKind::Cursor {
+                    agent.default_model = None;
+                }
+                agent.catalog = CatalogState {
+                    executable_revision: result.request.executable_revision,
+                    ..Default::default()
+                };
+            }
+        }
+    }
+
+    pub(crate) fn same_presentation(&self, other: &Self) -> bool {
+        self.claude_defaults() == other.claude_defaults()
+            && self.agents.len() == other.agents.len()
+            && self.agents.iter().zip(&other.agents).all(|(a, b)| {
+                a.kind == b.kind
+                    && a.executable == b.executable
+                    && a.launch_path == b.launch_path
+                    && a.models == b.models
+                    && a.default_model == b.default_model
+                    && a.default_effort == b.default_effort
+            })
+    }
     pub(crate) fn agents(&self) -> &[DetectedAgent] {
         &self.agents
     }
@@ -680,6 +908,7 @@ impl DetectionSnapshot {
                     executable,
                     launch_path: None,
                     models: kind.builtin_model_choices(),
+                    catalog: CatalogState::default(),
                     default_model: None,
                     default_effort: None,
                 })
@@ -702,6 +931,7 @@ impl DetectionSnapshot {
                 executable,
                 launch_path: None,
                 models: kind.builtin_model_choices(),
+                catalog: CatalogState::default(),
                 default_model,
                 default_effort,
             }],
@@ -764,29 +994,51 @@ pub(crate) fn detect_installed_agents(excluded_directory: Option<&Path>) -> Dete
     let home = crate::paths::home_dir();
     let (claude_default_model, claude_default_effort) =
         crate::agent_model_catalog::claude_configured_defaults(home.as_deref());
-    let (grok_default_model, grok_default_effort) =
-        crate::agent_model_catalog::grok_configured_defaults(home.as_deref());
     let agents = AgentKind::ALL
         .into_iter()
         .filter_map(|kind| {
             resolve_executable(kind.detect_command(), &paths).map(|executable| {
+                let scope = catalog_scope(kind, &executable, home.as_deref());
                 // 설정 파일은 종류마다 한 번만 읽는다. 모델 목록과 초기 선택이 같은 값을
                 // 쓰므로 각각 읽으면 같은 파일을 두 번 열고 파싱하게 된다.
-                let configured = match kind {
-                    AgentKind::Claude => claude_default_model.clone(),
-                    AgentKind::Grok => grok_default_model.clone(),
-                    _ => {
-                        crate::agent_model_catalog::configured_default_model(kind, home.as_deref())
+                let (configured, default_effort) = match kind {
+                    AgentKind::Claude => (
+                        claude_default_model.clone(),
+                        claude_default_effort
+                            .as_deref()
+                            .and_then(crate::agent_model_catalog::effort_from_value),
+                    ),
+                    AgentKind::Grok => {
+                        crate::agent_model_catalog::grok_configured_defaults(home.as_deref())
                     }
+                    _ => (
+                        crate::agent_model_catalog::configured_default_model(kind, home.as_deref()),
+                        None,
+                    ),
                 };
-                let default_effort = (kind == AgentKind::Grok)
-                    .then_some(grok_default_effort)
-                    .flatten();
+                let loaded =
+                    crate::agent_model_catalog::load(kind, home.as_deref(), configured.as_deref());
+                let catalog = CatalogState {
+                    executable_revision: executable_revision(&executable),
+                    scope: scope.filter(|scope| {
+                        Some(*scope) == catalog_scope(kind, &executable, home.as_deref())
+                    }),
+                    last_success: matches!(
+                        &loaded,
+                        crate::agent_model_catalog::CatalogLoad::Ready(_)
+                    )
+                    .then(Instant::now),
+                    unavailable: matches!(
+                        &loaded,
+                        crate::agent_model_catalog::CatalogLoad::Unavailable
+                    ),
+                };
                 DetectedAgent {
                     kind,
                     executable,
                     launch_path: launch_path.clone(),
-                    models: resolve_models(kind, home.as_deref(), configured.as_deref()),
+                    models: models_from_load(kind, loaded, configured.as_deref()),
+                    catalog,
                     default_model: configured,
                     default_effort,
                 }
@@ -800,33 +1052,52 @@ pub(crate) fn detect_installed_agents(excluded_directory: Option<&Path>) -> Dete
     }
 }
 
-/// CLI가 디스크에 남긴 카탈로그를 우선하고, 없거나 못 읽으면 내장 목록으로 폴백한다.
-/// 폴백 덕분에 새 설치·로그아웃·손상된 파일에서도 런처가 빈 목록이 되지 않는다.
+/// 정상적인 빈 목록은 존중하고, 없거나 못 읽은 경우에만 내장 목록으로 폴백한다.
+#[cfg(test)]
 fn resolve_models(
     kind: AgentKind,
     home: Option<&Path>,
     configured: Option<&str>,
 ) -> Vec<ModelChoice> {
-    let mut models = if crate::agent_model_catalog::has_disk_catalog(kind) {
-        crate::agent_model_catalog::load(kind, home, configured)
-    } else {
-        Vec::new()
+    models_from_load(
+        kind,
+        crate::agent_model_catalog::load(kind, home, configured),
+        configured,
+    )
+}
+
+fn models_from_load(
+    kind: AgentKind,
+    loaded: crate::agent_model_catalog::CatalogLoad,
+    configured: Option<&str>,
+) -> Vec<ModelChoice> {
+    let mut models = match loaded {
+        crate::agent_model_catalog::CatalogLoad::Ready(models) => models,
+        crate::agent_model_catalog::CatalogLoad::Missing
+        | crate::agent_model_catalog::CatalogLoad::Unavailable
+        | crate::agent_model_catalog::CatalogLoad::Unsupported => kind.builtin_model_choices(),
     };
-    if models.is_empty() {
-        models = kind.builtin_model_choices();
-    }
     if let Some(configured) = configured {
         adopt_model(kind, configured, &mut models);
     }
     models
 }
 
-/// CLI 설정이 가리키는 모델이 목록에 없으면 그 모델을 목록 맨 앞에 넣는다.
-///
-/// 카탈로그가 모든 모델을 담지는 못한다 — Claude은 카탈로그 자체가 없어 내장 별칭만 갖고,
-/// `opus[1m]` 같은 변형이나 사용자가 직접 추가한 모델은 빠진다. 그 상태로 두면 런처가
-/// 사용자가 설정해 둔 모델 대신 목록 첫 항목을 조용히 띄우게 된다. CLI가 설정에 적어 둔
-/// 값은 그 CLI에서 유효한 값이므로, 모르는 값이어도 선택지로 인정한다.
+/// 지원 응답에 없는 사용자 지정 모델은 강도를 추측하지 않고 추가한다.
+fn adopt_dynamic_configured_model(configured: Option<&str>, models: &mut Vec<ModelChoice>) {
+    // 동적 응답이 모르는 설정 모델에 추론 강도를 추측해 붙이지 않는다.
+    if !models.is_empty()
+        && let Some(configured) = configured
+        && find_model(models, configured).is_none()
+        && let Some(choice) = ModelChoice::new(configured, configured, Vec::new(), None)
+    {
+        models.truncate(MODELS_PER_AGENT_MAX - 1);
+        models.insert(0, choice);
+    }
+}
+
+/// 디스크 목록/내장 폴백에 없는 CLI 설정 모델도 선택할 수 있게 한다.
+/// 실제 지원 정보를 조회하지 못했으므로 기존 제공자별 폴백 강도를 유지한다.
 fn adopt_model(kind: AgentKind, configured: &str, models: &mut Vec<ModelChoice>) {
     if models.is_empty() {
         return;
@@ -1152,6 +1423,233 @@ mod tests {
     use super::*;
 
     #[test]
+    fn catalog_refresh_older_detection_cannot_consume_reopen_probes() {
+        let mut refresh = ModelCatalogRefresh::default();
+        let startup_scan = refresh.generation();
+        refresh.request();
+        let first_open_scan = refresh.generation();
+        assert_eq!(refresh.take_probe_generation(startup_scan), None);
+        refresh.request();
+        let reopened_scan = refresh.generation();
+        assert_eq!(refresh.take_probe_generation(first_open_scan), None);
+        assert_eq!(
+            refresh.take_probe_generation(reopened_scan),
+            Some(reopened_scan)
+        );
+        // 같은 요청의 일반 파일 재감지는 외부 CLI 조회를 반복하지 않는다.
+        assert_eq!(refresh.take_probe_generation(reopened_scan), None);
+    }
+
+    #[test]
+    fn catalog_refresh_scope_changes_with_auth_settings_and_executable() {
+        let home = std::env::temp_dir().join(format!(
+            "deppy-model-scope-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(home.join(".grok")).unwrap();
+        let executable = home.join("grok");
+        std::fs::write(&executable, "cli").unwrap();
+        assert_eq!(
+            catalog_scope(AgentKind::Grok, &executable, Some(&home)),
+            None
+        );
+        let auth = home.join(".grok/auth.json");
+        std::fs::write(&auth, "test-account").unwrap();
+        let first = catalog_scope(AgentKind::Grok, &executable, Some(&home));
+        assert!(first.is_some());
+        assert_eq!(
+            first,
+            catalog_scope(AgentKind::Grok, &executable, Some(&home))
+        );
+        std::fs::write(&auth, "another-test-account").unwrap();
+        let second = catalog_scope(AgentKind::Grok, &executable, Some(&home));
+        assert_ne!(first, second);
+        std::fs::write(home.join(".grok/config.toml"), "[models]").unwrap();
+        let configured = catalog_scope(AgentKind::Grok, &executable, Some(&home));
+        assert_ne!(second, configured);
+        std::fs::write(&executable, "new-cli-version").unwrap();
+        assert_ne!(
+            configured,
+            catalog_scope(AgentKind::Grok, &executable, Some(&home))
+        );
+        std::fs::remove_file(auth).unwrap();
+        assert_eq!(
+            catalog_scope(AgentKind::Grok, &executable, Some(&home)),
+            None
+        );
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn catalog_refresh_cursor_probe_validates_generation_and_launch_model() {
+        use crate::agent_model_catalog::CatalogLoad;
+        use crate::agent_model_probe::{ProbeRequest, ProbeResult};
+        let mut snapshot = DetectionSnapshot::from_test_agents([(
+            AgentKind::Cursor,
+            PathBuf::from("/opt/cursor-agent"),
+        )]);
+        let result = |generation| ProbeResult {
+            request: ProbeRequest {
+                generation,
+                kind: AgentKind::Cursor,
+                executable: PathBuf::from("/opt/cursor-agent"),
+                launch_path: None,
+                executable_revision: None,
+            },
+            catalog: CatalogLoad::Ready(vec![
+                ModelChoice::new("grok-4.7-high", "Grok 4.7", vec![], None).unwrap(),
+            ]),
+            default_model: Some("grok-4.7-high".into()),
+        };
+        snapshot.apply_model_probe(result(1), 2);
+        assert!(snapshot.agents[0].models.is_empty());
+        snapshot.apply_model_probe(result(2), 2);
+        let agent = snapshot.find(AgentKind::Cursor).unwrap();
+        assert_eq!(agent.initial_model(), "grok-4.7-high");
+        let spec = build_launch_spec(
+            agent,
+            LaunchOptions {
+                model: "grok-4.7-high".into(),
+                effort: None,
+                yolo: false,
+            },
+            None,
+        )
+        .unwrap();
+        assert!(
+            spec.into_parts()
+                .2
+                .windows(2)
+                .any(|args| args == ["--model", "grok-4.7-high"])
+        );
+        let mut failed = result(2);
+        failed.catalog = CatalogLoad::Unavailable;
+        snapshot.apply_model_probe(failed, 2);
+        assert!(snapshot.agents[0].models.is_empty());
+    }
+
+    #[test]
+    fn catalog_refresh_claude_unknown_effort_default_is_left_to_cli() {
+        let mut agent = detected(AgentKind::Claude);
+        agent.models = vec![
+            ModelChoice::new(
+                "new-claude",
+                "New",
+                vec![ReasoningEffort::Low, ReasoningEffort::High],
+                None,
+            )
+            .unwrap(),
+        ];
+        assert_eq!(agent.initial_effort("new-claude"), None);
+        agent.default_effort = Some(ReasoningEffort::High);
+        assert_eq!(
+            agent.initial_effort("new-claude"),
+            Some(ReasoningEffort::High)
+        );
+    }
+
+    #[test]
+    fn catalog_refresh_retains_only_proven_unexpired_failures() {
+        let now = Instant::now();
+        let mut old =
+            DetectionSnapshot::from_test_agents([(AgentKind::Grok, PathBuf::from("/tmp/grok"))]);
+        old.agents[0].models = vec![ModelChoice::new("grok-new", "New", vec![], None).unwrap()];
+        old.agents[0].catalog = CatalogState {
+            executable_revision: None,
+            scope: Some(1),
+            last_success: Some(now),
+            unavailable: false,
+        };
+        for (scope, unavailable, elapsed, kept) in [
+            (Some(1), true, 20, true),
+            (None, true, 20, false),
+            (Some(2), true, 20, false),
+            (Some(1), false, 20, false),
+            (Some(1), true, 600, false),
+        ] {
+            let mut fresh = DetectionSnapshot::from_test_agents([(
+                AgentKind::Grok,
+                PathBuf::from("/tmp/grok"),
+            )]);
+            fresh.agents[0].catalog = CatalogState {
+                executable_revision: None,
+                scope,
+                unavailable,
+                last_success: None,
+            };
+            fresh.retain_failed_catalogs(&old, now + Duration::from_secs(elapsed));
+            assert_eq!(fresh.agents[0].models[0].value() == "grok-new", kept);
+            if kept {
+                assert_eq!(fresh.agents[0].catalog.last_success, Some(now));
+                fresh.retain_failed_catalogs(&old, now + Duration::from_secs(40));
+                assert_eq!(fresh.agents[0].catalog.last_success, Some(now));
+            }
+        }
+        let mut empty = old.clone();
+        empty.agents[0].models.clear();
+        empty.retain_failed_catalogs(&old, now);
+        assert!(empty.agents[0].models.is_empty());
+        let mut replaced = old.clone();
+        replaced.agents[0].executable = PathBuf::from("/tmp/new-grok");
+        replaced.agents[0].models.clear();
+        replaced.agents[0].catalog.unavailable = true;
+        replaced.retain_failed_catalogs(&old, now);
+        assert!(replaced.agents[0].models.is_empty());
+    }
+
+    #[test]
+    fn catalog_refresh_respects_a_valid_empty_catalog() {
+        let home = std::env::temp_dir().join(format!(
+            "deppy-catalog-refresh-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        for (kind, relative, content) in [
+            (
+                AgentKind::Codex,
+                ".codex/models_cache.json",
+                r#"{"models":[]}"#,
+            ),
+            (
+                AgentKind::Grok,
+                ".grok/models_cache.json",
+                r#"{"models":{}}"#,
+            ),
+            (AgentKind::Kimi, ".kimi-code/config.toml", "[models]"),
+            (
+                AgentKind::QwenCode,
+                ".qwen/settings.json",
+                r#"{"modelProviders":{}}"#,
+            ),
+        ] {
+            let path = home.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            assert_eq!(
+                resolve_models(kind, Some(&home), None),
+                kind.builtin_model_choices()
+            );
+            std::fs::write(&path, "{").unwrap();
+            assert_eq!(
+                resolve_models(kind, Some(&home), None),
+                kind.builtin_model_choices()
+            );
+            std::fs::write(path, content).unwrap();
+            let models = resolve_models(kind, Some(&home), None);
+            // 정상적인 빈 목록에는 과거 내장 모델을 되살리지 않는다.
+            assert!(models.is_empty(), "{kind:?}: {models:?}");
+            assert!(resolve_models(kind, Some(&home), Some("old-model")).is_empty());
+        }
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
     fn 거부_목록은_미지_id와_중복을_버린다() {
         let raw = vec![
             "kimi".into(),
@@ -1179,6 +1677,7 @@ mod tests {
 
     fn detected(kind: AgentKind) -> DetectedAgent {
         DetectedAgent {
+            catalog: CatalogState::default(),
             kind,
             executable: PathBuf::from(format!("/opt/deppy/{}", kind.detect_command())),
             launch_path: None,
@@ -1395,6 +1894,7 @@ mod tests {
         // 실행 계약도 이 값을 받아들여야 한다.
         let agent = DetectedAgent {
             kind: AgentKind::Claude,
+            catalog: CatalogState::default(),
             executable: PathBuf::from("/opt/deppy/claude"),
             launch_path: None,
             models,
@@ -1533,7 +2033,13 @@ mod tests {
     fn model_capabilities_expose_bounded_unique_selectable_values() {
         for kind in AgentKind::ALL {
             let choices = kind.builtin_model_choices();
-            assert_eq!(kind.supports_model(), !choices.is_empty(), "{}", kind.id());
+            // Cursor는 CLI가 확인한 모델만 사용하며 고정 내장 목록은 없다.
+            assert_eq!(
+                kind.supports_model(),
+                !choices.is_empty() || kind == AgentKind::Cursor,
+                "{}",
+                kind.id()
+            );
             assert!(choices.len() <= 16, "{}", kind.id());
             let mut values = HashSet::new();
             for choice in &choices {
@@ -1635,6 +2141,7 @@ mod tests {
     fn detected_launch_path_is_forwarded_to_the_agent() {
         let agent = DetectedAgent {
             kind: AgentKind::Kimi,
+            catalog: CatalogState::default(),
             executable: PathBuf::from("/home/test/.kimi-code/bin/kimi"),
             launch_path: Some(Arc::from(
                 "/home/test/.kimi-code/bin:/home/test/.nvm/versions/node/v24/bin:/usr/bin",

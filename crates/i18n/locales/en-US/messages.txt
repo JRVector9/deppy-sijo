@@ -1127,6 +1127,7 @@ agent_launcher.none_detected_hint = Install a supported CLI or start a blank ter
 agent_launcher.model = Model
 agent_launcher.thinking = Thinking
 agent_launcher.effort = Reasoning
+agent_launcher.effort.auto = CLI default
 agent_launcher.effort.low = Low
 agent_launcher.effort.medium = Medium
 agent_launcher.effort.high = High

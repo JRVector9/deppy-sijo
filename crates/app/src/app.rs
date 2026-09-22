@@ -9597,8 +9597,16 @@ pub struct App {
     agents_ui: ui::agents::AgentsUi,
     agent_launcher_ui: ui::agent_launcher::AgentLauncherUi,
     agent_launcher_worker:
-        crate::lazy_worker::LazyBoundedWorker<(), crate::agent_launcher::DetectionSnapshot>,
+        crate::lazy_worker::LazyBoundedWorker<u64, (u64, crate::agent_launcher::DetectionSnapshot)>,
     agent_launcher_snapshot: Option<crate::agent_launcher::DetectionSnapshot>,
+    agent_launcher_pending_snapshot: Option<crate::agent_launcher::DetectionSnapshot>,
+    agent_model_workers: [crate::lazy_worker::LazyBoundedWorker<
+        crate::agent_model_probe::ProbeRequest,
+        crate::agent_model_probe::ProbeResult,
+    >; 2],
+    agent_model_pending_requests: [Option<crate::agent_model_probe::ProbeRequest>; 2],
+    agent_model_in_flight: [Option<crate::agent_model_probe::ProbeRequest>; 2],
+    agent_model_refresh: crate::agent_launcher::ModelCatalogRefresh,
     /// 셸에서 직접 실행한 Claude는 argv에 model/effort가 없다. 설정 파일은
     /// lazy 런처 worker가 읽고, 렌더는 이 스냅샷만 본다.
     claude_direct_defaults: ClaudeDirectDefaults,
@@ -14461,14 +14469,32 @@ impl App {
             secret_repair,
         );
         let launcher_ctx = egui_ctx.clone();
+        let agent_model_workers = std::array::from_fn(|index| {
+            let ctx = egui_ctx.clone();
+            crate::lazy_worker::LazyBoundedWorker::new(
+                if index == 0 {
+                    "cursor-models"
+                } else {
+                    "claude-models"
+                },
+                std::time::Duration::from_secs(30),
+                || crate::agent_model_probe::probe,
+                move || ctx.request_repaint(),
+            )
+        });
         let launcher_excluded_directory = crate::agent_shim::shim_path();
         let agent_launcher_worker = crate::lazy_worker::LazyBoundedWorker::new(
             "agent-launch-detect",
             std::time::Duration::from_secs(30),
             move || {
                 let excluded_directory = launcher_excluded_directory.clone();
-                move |_| {
-                    crate::agent_launcher::detect_installed_agents(excluded_directory.as_deref())
+                move |generation| {
+                    (
+                        generation,
+                        crate::agent_launcher::detect_installed_agents(
+                            excluded_directory.as_deref(),
+                        ),
+                    )
                 }
             },
             move || launcher_ctx.request_repaint(),
@@ -14661,6 +14687,11 @@ impl App {
             agent_launcher_ui: ui::agent_launcher::AgentLauncherUi::new(),
             agent_launcher_worker,
             agent_launcher_snapshot: None,
+            agent_launcher_pending_snapshot: None,
+            agent_model_workers,
+            agent_model_pending_requests: [None, None],
+            agent_model_in_flight: [None, None],
+            agent_model_refresh: crate::agent_launcher::ModelCatalogRefresh::default(),
             claude_direct_defaults: ClaudeDirectDefaults::default(),
             claude_direct_defaults_ignore_next_completion: false,
             agent_launcher_detection_requested: true,
@@ -24856,9 +24887,6 @@ impl App {
             .insert(self.active.id.clone());
         self.agent_launcher_ui
             .open_for(self.active.id.clone(), self.active_workspace_display_name());
-        if self.agent_launcher_snapshot.is_none() {
-            self.agent_launcher_detection_requested = true;
-        }
         self.egui_ctx.request_repaint();
     }
 
@@ -24897,20 +24925,26 @@ impl App {
         {
             self.agent_launcher_ui
                 .open_for(self.active.id.clone(), self.active_workspace_display_name());
-            if self.agent_launcher_snapshot.is_none() {
-                self.agent_launcher_detection_requested = true;
-            }
             self.egui_ctx.request_repaint();
         }
     }
 
+    fn request_agent_launcher_refresh(&mut self) {
+        self.agent_launcher_detection_requested = true;
+        self.agent_model_refresh.request();
+        self.agent_model_pending_requests = [None, None];
+    }
+
     fn poll_agent_launcher_detection(&mut self) {
+        if self.agent_launcher_ui.take_refresh_request() {
+            self.request_agent_launcher_refresh();
+        }
         while let Some(outcome) = self.agent_launcher_worker.try_recv() {
             self.agent_launcher_detection_in_flight = false;
             let ignore_claude_defaults =
                 std::mem::take(&mut self.claude_direct_defaults_ignore_next_completion);
             match outcome.into_result() {
-                Ok(snapshot) => {
+                Ok((generation, mut snapshot)) => {
                     if !ignore_claude_defaults {
                         let (model, effort) = snapshot.claude_defaults();
                         self.claude_direct_defaults = ClaudeDirectDefaults {
@@ -24918,8 +24952,23 @@ impl App {
                             effort: effort.map(str::to_owned),
                         };
                     }
-                    self.agent_launcher_snapshot = Some(snapshot);
-                    self.push_archived_resume_presentation();
+                    // 이전 설치 감지가 새 열기의 외부 조회를 소비하거나 표시를 되돌리지 않는다.
+                    if generation != self.agent_model_refresh.generation() {
+                        continue;
+                    }
+                    if let Some(previous) = self
+                        .agent_launcher_pending_snapshot
+                        .as_ref()
+                        .or(self.agent_launcher_snapshot.as_ref())
+                    {
+                        snapshot.retain_failed_catalogs(previous, std::time::Instant::now());
+                    }
+                    if let Some(generation) =
+                        self.agent_model_refresh.take_probe_generation(generation)
+                    {
+                        self.agent_model_pending_requests = snapshot.probe_requests(generation);
+                    }
+                    self.agent_launcher_pending_snapshot = Some(snapshot);
                     self.agent_launcher_ui.detection_succeeded();
                 }
                 Err(_) if self.agent_launcher_ui.is_open() => self
@@ -24928,15 +24977,82 @@ impl App {
                 Err(_) => {}
             }
         }
+        for (index, worker) in self.agent_model_workers.iter_mut().enumerate() {
+            while let Some(outcome) = worker.try_recv() {
+                let request = self.agent_model_in_flight[index].take();
+                let result = match outcome.into_result() {
+                    Ok(result) => Some(result),
+                    // worker 실패도 조회 실패와 같게 처리하여 과거 계정 목록을 남기지 않는다.
+                    Err(_) => request.map(|request| crate::agent_model_probe::ProbeResult {
+                        request,
+                        catalog: crate::agent_model_catalog::CatalogLoad::Unavailable,
+                        default_model: None,
+                    }),
+                };
+                if let Some(result) = result
+                    && result.request.generation == self.agent_model_refresh.generation()
+                    && let Some(mut snapshot) = self
+                        .agent_launcher_pending_snapshot
+                        .take()
+                        .or_else(|| self.agent_launcher_snapshot.clone())
+                {
+                    snapshot.apply_model_probe(result, self.agent_model_refresh.generation());
+                    self.agent_launcher_pending_snapshot = Some(snapshot);
+                }
+            }
+            if let Some(request) = self.agent_model_pending_requests[index].take() {
+                let in_flight = request.clone();
+                match worker.try_request(request) {
+                    Ok(()) => self.agent_model_in_flight[index] = Some(in_flight),
+                    Err(crate::lazy_worker::LazyWorkerSubmitError::Full(request)) => {
+                        self.agent_model_pending_requests[index] = Some(request)
+                    }
+                    Err(crate::lazy_worker::LazyWorkerSubmitError::Unavailable { job, .. }) => {
+                        if let Some(mut snapshot) = self
+                            .agent_launcher_pending_snapshot
+                            .take()
+                            .or_else(|| self.agent_launcher_snapshot.clone())
+                        {
+                            snapshot.apply_model_probe(
+                                crate::agent_model_probe::ProbeResult {
+                                    request: job,
+                                    catalog: crate::agent_model_catalog::CatalogLoad::Unavailable,
+                                    default_model: None,
+                                },
+                                self.agent_model_refresh.generation(),
+                            );
+                            self.agent_launcher_pending_snapshot = Some(snapshot);
+                        }
+                    }
+                }
+            }
+        }
+        if self.agent_launcher_ui.can_apply_catalog(&self.egui_ctx)
+            && self.pending_agent_launcher_launch.is_none()
+            && let Some(snapshot) = self.agent_launcher_pending_snapshot.take()
+        {
+            let changed = self
+                .agent_launcher_snapshot
+                .as_ref()
+                .is_none_or(|old| !old.same_presentation(&snapshot));
+            // 표시가 같아도 성공 시각/범위는 갱신하되 파생 UI 재생성은 생략한다.
+            self.agent_launcher_snapshot = Some(snapshot);
+            if changed {
+                self.push_archived_resume_presentation();
+            }
+        }
         if !self.agent_launcher_detection_requested || self.agent_launcher_detection_in_flight {
             return;
         }
-        match self.agent_launcher_worker.try_request(()) {
+        match self
+            .agent_launcher_worker
+            .try_request(self.agent_model_refresh.generation())
+        {
             Ok(()) => {
                 self.agent_launcher_detection_requested = false;
                 self.agent_launcher_detection_in_flight = true;
             }
-            Err(crate::lazy_worker::LazyWorkerSubmitError::Full(())) => {}
+            Err(crate::lazy_worker::LazyWorkerSubmitError::Full(_)) => {}
             Err(crate::lazy_worker::LazyWorkerSubmitError::Unavailable { .. }) => {
                 self.agent_launcher_detection_requested = false;
                 if self.agent_launcher_ui.is_open() {
@@ -24950,7 +25066,7 @@ impl App {
     fn handle_agent_launcher_intent(&mut self, intent: ui::agent_launcher::AgentLauncherIntent) {
         match intent {
             ui::agent_launcher::AgentLauncherIntent::Refresh => {
-                self.agent_launcher_detection_requested = true;
+                self.request_agent_launcher_refresh();
             }
             ui::agent_launcher::AgentLauncherIntent::BlankTerminal { workspace_id } => {
                 if workspace_id == self.active.id {
@@ -33300,7 +33416,12 @@ impl eframe::App for App {
             && let Some(intent) = self.agent_launcher_ui.show(
                 ui.ctx(),
                 self.agent_launcher_snapshot.as_ref(),
-                self.agent_launcher_detection_in_flight,
+                self.agent_launcher_detection_in_flight
+                    || self.agent_model_in_flight.iter().any(Option::is_some)
+                    || self
+                        .agent_model_pending_requests
+                        .iter()
+                        .any(Option::is_some),
                 &text,
                 // 꺼진 카드도 화면에는 남는다(B안) — leaf가 흐리게 그리고 선택을 막는
                 // 판단 재료로만 거부 목록을 받는다. 탐지 결과 자체는 여기서 거르지 않는다.

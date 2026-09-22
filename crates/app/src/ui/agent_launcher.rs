@@ -112,13 +112,6 @@ fn launcher_hairline(ui: &mut egui::Ui, color: egui::Color32) {
     ui.painter().rect_filled(rect, 0.0, color);
 }
 
-/// 감지 스냅샷에서 이 종류의 모델 목록을 꺼낸다. 아직 감지 전이면 빈 목록이다.
-fn models_for(snapshot: Option<&DetectionSnapshot>, kind: AgentKind) -> &[ModelChoice] {
-    snapshot
-        .and_then(|snapshot| snapshot.find(kind))
-        .map_or(&[], DetectedAgent::models)
-}
-
 fn installed_list_height(agent_count: usize) -> f32 {
     let rows = agent_count.min(VISIBLE_AGENT_ROWS);
     if rows == 0 {
@@ -172,6 +165,9 @@ pub(crate) struct AgentLauncherUi {
     selected: Option<AgentKind>,
     model: String,
     effort: Option<ReasoningEffort>,
+    model_explicit: bool,
+    effort_explicit: bool,
+    refresh_requested: bool,
     yolo: bool,
     launch_pending: bool,
     error: Option<LauncherErrorCode>,
@@ -186,6 +182,9 @@ impl AgentLauncherUi {
             selected: None,
             model: String::new(),
             effort: None,
+            model_explicit: false,
+            effort_explicit: false,
+            refresh_requested: false,
             yolo: false,
             launch_pending: false,
             error: None,
@@ -197,6 +196,9 @@ impl AgentLauncherUi {
         self.workspace_name = workspace_name;
         self.model.clear();
         self.effort = None;
+        self.model_explicit = false;
+        self.effort_explicit = false;
+        self.refresh_requested = true;
         self.yolo = false;
         self.launch_pending = false;
         self.error = None;
@@ -224,6 +226,16 @@ impl AgentLauncherUi {
         self.open
     }
 
+    pub(crate) fn take_refresh_request(&mut self) -> bool {
+        std::mem::take(&mut self.refresh_requested)
+    }
+
+    pub(crate) fn can_apply_catalog(&self, ctx: &egui::Context) -> bool {
+        !self.launch_pending
+            && (!self.open
+                || (!egui::Popup::is_any_open(ctx) && !ctx.input(|input| input.pointer.any_down())))
+    }
+
     /// 다른 workspace의 런처를 이 workspace에 예정된 세션으로 세지 않는다.
     pub(crate) fn is_open_for(&self, workspace_id: &str) -> bool {
         self.open && self.workspace_id == workspace_id
@@ -242,7 +254,10 @@ impl AgentLauncherUi {
     }
 
     pub(crate) fn report_error(&mut self, error: LauncherErrorCode) {
-        self.launch_pending = false;
+        // 목록 갱신 실패는 이미 요청한 세션 실행을 취소하지 않는다.
+        if error != LauncherErrorCode::DetectionFailed {
+            self.launch_pending = false;
+        }
         self.error = Some(error);
     }
 
@@ -394,14 +409,10 @@ impl AgentLauncherUi {
                                     ui.vertical(|ui| {
                                         ui.set_width(LAUNCHER_WIDTH - AGENT_PANE_WIDTH - 32.0);
                                         ui.set_min_height(left_content_height);
-                                        if let Some(kind) = self.selected {
-                                            self.render_options(
-                                                ui,
-                                                kind,
-                                                models_for(snapshot, kind),
-                                                catalog,
-                                                palette,
-                                            );
+                                        if let Some(agent) = self.selected.and_then(|kind| {
+                                            snapshot.and_then(|snapshot| snapshot.find(kind))
+                                        }) {
+                                            self.render_options(ui, agent, catalog, palette);
                                         }
                                     });
                                 });
@@ -552,19 +563,13 @@ impl AgentLauncherUi {
                     {
                         intent = Some(AgentLauncherIntent::Refresh);
                     }
+                    if detecting {
+                        ui.add(egui::Spinner::new().size(12.0))
+                            .on_hover_text(catalog.t("agent_launcher.detecting", &[]));
+                    }
                 });
             },
         );
-        if detecting {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(
-                    egui::RichText::new(catalog.t("agent_launcher.detecting", &[]))
-                        .size(11.0)
-                        .weak(),
-                );
-            });
-        }
         ui.add_space(5.0);
 
         match snapshot {
@@ -631,11 +636,12 @@ impl AgentLauncherUi {
     fn render_options(
         &mut self,
         ui: &mut egui::Ui,
-        kind: AgentKind,
-        models: &[ModelChoice],
+        agent: &DetectedAgent,
         catalog: &i18n::Catalog,
         palette: LauncherPalette,
     ) {
+        let kind = agent.kind();
+        let models = agent.models();
         ui.spacing_mut().interact_size.y = CONTROL_HEIGHT;
         let mut rendered_field = false;
         if !models.is_empty() {
@@ -656,10 +662,19 @@ impl AgentLauncherUi {
                     .show_ui(ui, |ui| {
                         for choice in models {
                             if ui
-                                .selectable_label(self.model == choice.value(), choice.label())
-                                .clicked()
+                                .push_id((kind.id(), choice.value()), |ui| {
+                                    ui.selectable_label(
+                                        self.model == choice.value(),
+                                        choice.label(),
+                                    )
+                                    .clicked()
+                                })
+                                .inner
                             {
                                 self.model = choice.value().to_owned();
+                                self.model_explicit = true;
+                                self.effort_explicit = false;
+                                self.effort = agent.initial_effort(&self.model);
                                 self.reconcile_effort(models);
                             }
                         }
@@ -689,13 +704,24 @@ impl AgentLauncherUi {
             let selected = self
                 .effort
                 .map(|effort| catalog.t(effort_message_key(effort), &[]))
-                .unwrap_or_default();
+                .unwrap_or_else(|| catalog.t("agent_launcher.effort.auto", &[]));
             ui.add_enabled_ui(!self.launch_pending, |ui| {
-                egui::ComboBox::from_id_salt("agent-launcher-effort")
+                egui::ComboBox::from_id_salt(("agent-launcher-effort", kind.id()))
                     .selected_text(selected)
                     .width(ui.available_width())
                     .height(combo_popup_height(ui))
                     .show_ui(ui, |ui| {
+                        if agent.allows_cli_effort_default(&self.model)
+                            && ui
+                                .selectable_label(
+                                    self.effort.is_none(),
+                                    catalog.t("agent_launcher.effort.auto", &[]),
+                                )
+                                .clicked()
+                        {
+                            self.effort = None;
+                            self.effort_explicit = true;
+                        }
                         for effort in efforts {
                             if ui
                                 .selectable_label(
@@ -705,6 +731,7 @@ impl AgentLauncherUi {
                                 .clicked()
                             {
                                 self.effort = Some(*effort);
+                                self.effort_explicit = true;
                             }
                         }
                     });
@@ -782,6 +809,8 @@ impl AgentLauncherUi {
         if provider_changed {
             self.model.clear();
             self.effort = None;
+            self.model_explicit = false;
+            self.effort_explicit = false;
         }
         if let Some(agent) = self.selected.and_then(|kind| snapshot.find(kind)) {
             self.reconcile_options(agent, provider_changed);
@@ -813,6 +842,8 @@ impl AgentLauncherUi {
         if provider_changed {
             self.model.clear();
             self.effort = None;
+            self.model_explicit = false;
+            self.effort_explicit = false;
         }
         self.selected = Some(agent.kind());
         self.error = None;
@@ -821,10 +852,21 @@ impl AgentLauncherUi {
 
     /// 선택된 모델/강도/YOLO가 이 에이전트에서 여전히 유효한지 맞춘다.
     fn reconcile_options(&mut self, agent: &DetectedAgent, provider_changed: bool) {
+        let model_was_explicit = self.model_explicit;
         let model_replaced = self.reconcile_model(agent);
-        if provider_changed || model_replaced {
+        if provider_changed || (model_replaced && model_was_explicit) || !self.effort_explicit {
+            self.effort_explicit = false;
             self.effort = agent.initial_effort(&self.model);
         } else {
+            if self
+                .effort
+                .map_or(!agent.allows_cli_effort_default(&self.model), |effort| {
+                    !agent.supported_efforts(&self.model).contains(&effort)
+                })
+            {
+                self.effort_explicit = false;
+                self.effort = agent.initial_effort(&self.model);
+            }
             self.reconcile_effort(agent.models());
         }
         if !agent.kind().supports_yolo() {
@@ -836,16 +878,20 @@ impl AgentLauncherUi {
     /// 더 이상 제공하지 않는 모델이면, CLI가 자기 설정에 적어 둔 기본 모델로 되돌린다.
     /// 그래야 앱으로 띄운 결과가 CLI를 그냥 실행한 것과 같다.
     fn reconcile_model(&mut self, agent: &DetectedAgent) -> bool {
-        if crate::agent_launcher::find_model(agent.models(), &self.model).is_some() {
+        if self.model_explicit
+            && crate::agent_launcher::find_model(agent.models(), &self.model).is_some()
+        {
             return false;
         }
-        self.model = agent.initial_model().to_owned();
-        true
+        self.model_explicit = false;
+        let changed = self.model != agent.initial_model();
+        if changed {
+            self.model = agent.initial_model().to_owned();
+        }
+        changed
     }
 
-    /// 강도는 "기본값" 항목 없이 항상 하나가 선택돼 있다. 화면에 보이는 값이 곧
-    /// 실행에 전달되는 값이므로, 선택이 비었거나 현재 모델이 지원하지 않는 값이면
-    /// 카탈로그가 선언한 기본 강도(없으면 첫 단계)로 되돌린다.
+    /// 선언된 기본 강도를 우선한다. Claude 동적 응답에 기본값이 없으면 CLI가 결정한다.
     fn reconcile_effort(&mut self, models: &[ModelChoice]) {
         let Some(model) = crate::agent_launcher::find_model(models, &self.model) else {
             self.effort = None;
@@ -854,6 +900,11 @@ impl AgentLauncherUi {
         let efforts = model.efforts();
         if efforts.is_empty() {
             self.effort = None;
+        } else if self.selected == Some(AgentKind::Claude)
+            && model.default_effort().is_none()
+            && self.effort.is_none()
+        {
+            // None은 미확인 강도를 Low로 바꾸지 않고 CLI 기본값을 사용한다는 뜻이다.
         } else if self.effort.is_none_or(|effort| !efforts.contains(&effort)) {
             self.effort = model.default_effort().or_else(|| efforts.first().copied());
         }
@@ -1107,6 +1158,79 @@ mod tests {
     }
 
     #[test]
+    fn catalog_refresh_untouched_selection_follows_new_defaults() {
+        let first = DetectionSnapshot::from_test_agent_with_defaults(
+            AgentKind::Grok,
+            PathBuf::from("/tmp/grok"),
+            Some("grok-4.6".into()),
+            Some(ReasoningEffort::High),
+        );
+        let second = DetectionSnapshot::from_test_agent_with_defaults(
+            AgentKind::Grok,
+            PathBuf::from("/tmp/grok"),
+            Some("grok-4.5".into()),
+            Some(ReasoningEffort::Low),
+        );
+        let mut ui = AgentLauncherUi::new();
+        ui.open_for("w".into(), "W".into());
+        ui.reconcile_selection(Some(&first), &[]);
+        ui.reconcile_selection(Some(&second), &[]);
+        assert_eq!(ui.model, "grok-4.5");
+        assert_eq!(ui.effort, Some(ReasoningEffort::Low));
+    }
+
+    #[test]
+    fn catalog_refresh_waits_for_selection_and_does_not_cancel_a_launch() {
+        let ctx = egui::Context::default();
+        let mut ui = AgentLauncherUi::new();
+        ui.open_for("w".into(), "W".into());
+        assert!(ui.can_apply_catalog(&ctx));
+        egui::Popup::open_id(&ctx, egui::Id::new("model-choice"));
+        assert!(!ui.can_apply_catalog(&ctx));
+        egui::Popup::close_all(&ctx);
+        ui.launch_pending = true;
+        ui.report_error(LauncherErrorCode::DetectionFailed);
+        assert!(ui.launch_pending);
+        assert!(!ui.can_apply_catalog(&ctx));
+        ui.launch_succeeded();
+        assert!(ui.can_apply_catalog(&ctx));
+    }
+
+    #[test]
+    fn catalog_refresh_preserves_explicit_fields_and_covers_history_open() {
+        let first = DetectionSnapshot::from_test_agent_with_defaults(
+            AgentKind::Grok,
+            PathBuf::from("/tmp/grok"),
+            Some("grok-4.6".into()),
+            Some(ReasoningEffort::High),
+        );
+        let second = DetectionSnapshot::from_test_agent_with_defaults(
+            AgentKind::Grok,
+            PathBuf::from("/tmp/grok"),
+            Some("grok-4.5".into()),
+            Some(ReasoningEffort::Low),
+        );
+        let mut ui = AgentLauncherUi::new();
+        assert!(ui.open_for_kind("w".into(), "W".into(), AgentKind::Grok, &first));
+        assert!(ui.take_refresh_request());
+        assert!(!ui.take_refresh_request());
+        ui.model_explicit = true;
+        ui.effort_explicit = true;
+        ui.reconcile_selection(Some(&second), &[]);
+        assert_eq!(ui.model, "grok-4.6");
+        assert_eq!(ui.effort, Some(ReasoningEffort::High));
+        ui.model_explicit = false;
+        ui.reconcile_selection(Some(&second), &[]);
+        assert_eq!(ui.model, "grok-4.5");
+        assert_eq!(ui.effort, Some(ReasoningEffort::High));
+        assert!(!ui.open_for_kind("w".into(), "W".into(), AgentKind::Cursor, &first));
+        assert!(!ui.take_refresh_request());
+        ui.open_for("w".into(), "W".into());
+        assert!(ui.take_refresh_request());
+        assert!(!ui.model_explicit && !ui.effort_explicit);
+    }
+
+    #[test]
     fn history_new_run_preselects_only_an_installed_provider() {
         let detected = snapshot(&[AgentKind::Claude, AgentKind::Kimi]);
         let mut ui = AgentLauncherUi::new();
@@ -1202,6 +1326,7 @@ mod tests {
         assert_eq!(ui.effort, Some(ReasoningEffort::Medium));
 
         ui.effort = Some(ReasoningEffort::High);
+        ui.effort_explicit = true;
         ui.select(grok);
         assert_eq!(ui.effort, Some(ReasoningEffort::High));
 

@@ -1127,6 +1127,7 @@ agent_launcher.none_detected_hint = 対応CLIをインストールするか、�
 agent_launcher.model = モデル
 agent_launcher.thinking = 思考
 agent_launcher.effort = 推論強度
+agent_launcher.effort.auto = CLI の既定値
 agent_launcher.effort.low = 低
 agent_launcher.effort.medium = 中
 agent_launcher.effort.high = 高

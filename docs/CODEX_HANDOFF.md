@@ -1,3 +1,37 @@
+## 2026-09-23 최신 v43 재빌드·서명·재실행 완료
+
+- Current objective completed: 사용자의 지시에 따라 로컬 최신 소스를 커밋/원격 동기화
+  상태로 확인하고, 실제 DB `user_version=43`과 호환되는 브랜치로 앱을 재빌드·재실행했다.
+- Source: `/Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`, branch
+  `fix/environment-api-context-integration`, product HEAD
+  `b3de43d919541e571d1483a5f1ca54888408675e`. 시작 전 작업 트리는 clean이었고
+  `origin/fix/environment-api-context-integration`와 같은 HEAD였다. `git push` 결과도
+  `Everything up-to-date`였다.
+- Build/sign/run: `sh scripts/dev-run.sh`를 실제 실행했다. `deppy-sijo`와 `mcp-proxy`의
+  dev build는 exit 없이 16.01초에 완료됐고, 바이너리는
+  `Developer ID Application: VectorNine INC (ZDTU5LS35K)`, identifier
+  `app.vector9.deppy-sijo`로 서명됐다. 앱은 PID `95465`, 명령
+  `./target/debug/deppy-sijo`로 계속 실행 중이다.
+- Runtime evidence: 시작 로그 시각 `2026-09-22T23:58:47Z`(KST 2026-09-23
+  08:58:47). 폰트 등록, 세션 로그 예산 적용, web-remote `127.0.0.1:8737`, 보관 pane
+  복원을 확인했다. DB는 재확인 결과 `user_version=43`, `integrity_check=ok`다. 이전 v38
+  바이너리의 DB-ahead 오류는 재발하지 않았다.
+- Expected warnings: 외부 Relay 프로덕션 엔드포인트 미배정 경고는 기존 BLOCKED 상태다.
+  복원된 PTY process-group SIGHUP 한 건은 `Operation not permitted` 경고를 남겼으나 앱
+  프로세스와 초기화는 생존했다. 이번 재실행 요청에서 별도 수정하지 않았다.
+- Modified files: 제품 소스 변경 없음. 이번 실행 결과를 기록한
+  `docs/CODEX_HANDOFF.md`만 수정.
+- Tests: 테스트 suite는 실행하지 않았다. 실제 검증은 Cargo dev build 완료, codesign
+  identity/identifier 확인, 실행 PID 생존, 시작 로그 확인, SQLite version/integrity 확인이다.
+- Failed approach/root cause: 처음 cwd의 오래된 `feat/fleet-one-list-and-relay-wip`는
+  마이그레이션 v38까지만 알아 v43 DB를 forward-only guard가 거부했다. DB를 낮추거나
+  교체하지 않고 v43 원장을 가진 이 최신 브랜치를 식별해 해결했다.
+- Remaining work: 재빌드·재실행 요청에는 남은 작업이 없다. 외부 Relay 배포와 위 PTY 경고
+  조사는 별도 범위다.
+- Exact next commands: `pgrep -ax deppy-sijo`;
+  `tail -n 120 "$HOME/Library/Application Support/app.vector9.deppy-sijo/logs/app.log.2026-09-22"`;
+  `sqlite3 "$HOME/Library/Application Support/app.vector9.deppy-sijo/metadata.sqlite3" 'PRAGMA user_version; PRAGMA integrity_check;'`.
+
 ## 2026-09-22 런처 모델 자동 갱신 — 커밋 전 리뷰 보완
 
 - 목표: 사용자 `코드 리뷰하고 커밋해`. 모델 갱신 MC1~4만 리뷰·커밋하며 기존 sidebar/A1/Fleet/검색/파일 트리 dirty 변경을 섞지 않는다. 작업본 `/Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`, branch `fix/environment-api-context-integration`.

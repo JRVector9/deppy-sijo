@@ -1,0 +1,374 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Deppy Sijo · 로컬 프로젝트와 연결된 원격 작업</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --chrome: #181b20;
+      --well: #0f1115;
+      --terminal: #0b0d11;
+      --selected: #21242c;
+      --hover: #1d2026;
+      --line: #32363e;
+      --text: #dcdee2;
+      --muted: #828893;
+      --faint: #626a75;
+      --accent: #39b8e8;
+      --green: #4acb82;
+      --orange: #e0a43a;
+      --red: #ef6671;
+      --purple: #ab97df;
+      --font: -apple-system, BlinkMacSystemFont, "Pretendard", "Apple SD Gothic Neo", sans-serif;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+    }
+    * { box-sizing: border-box; }
+    html, body { min-height: 100%; margin: 0; background: #101317; color: var(--text); font-family: var(--font); }
+    button, input { font: inherit; }
+    button { cursor: pointer; }
+    button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .page { max-width: 1592px; margin: auto; padding: 28px 24px 34px; }
+    .page-head { display: flex; align-items: end; justify-content: space-between; gap: 20px; margin-bottom: 19px; }
+    .eyebrow { margin-bottom: 8px; color: var(--accent); letter-spacing: .15em; font-size: 11px; font-weight: 700; text-transform: uppercase; }
+    h1 { margin: 0; font-size: clamp(23px, 2.4vw, 31px); line-height: 1.2; letter-spacing: -.035em; }
+    .lede { margin: 9px 0 0; color: #a2a9b2; font-size: 13px; line-height: 1.6; }
+    .prototype-label { padding: 8px 10px; border: 1px solid #36566a; color: #9dd9ee; font-size: 11px; white-space: nowrap; }
+    .journey { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 5px; margin-bottom: 14px; }
+    .journey button { min-height: 62px; border: 1px solid #303842; background: #1a2027; color: #aeb8c1; text-align: left; padding: 10px 11px; transition: background .15s, border-color .15s; }
+    .journey button:hover { background: #222b34; }
+    .journey button[aria-current="step"] { background: #132733; border-color: #438bae; color: #e5f8ff; }
+    .journey b { display: block; margin-bottom: 5px; color: var(--accent); font: 700 11px var(--mono); }
+    .journey span { display: block; font-size: 12px; line-height: 1.3; }
+    .app { position: relative; height: 694px; min-width: 960px; overflow: hidden; border: 1px solid #505965; background: var(--chrome); box-shadow: 0 22px 60px #05060866; }
+    .titlebar { height: 44px; display: grid; grid-template-columns: 88px 302px minmax(0, 1fr) 108px; border-bottom: 1px solid var(--line); }
+    .traffic { display: flex; gap: 7px; align-items: center; padding-left: 20px; }
+    .traffic i { display: block; width: 10px; height: 10px; border-radius: 50%; background: #535861; }
+    .traffic i:first-child { background: #d96363; } .traffic i:nth-child(2) { background: #d8b356; } .traffic i:nth-child(3) { background: #5ba976; }
+    .title-workspace, .title-tabs, .title-account { display: flex; align-items: center; border-left: 1px solid var(--line); }
+    .title-workspace { justify-content: space-between; padding: 0 14px; font-size: 13px; font-weight: 650; }
+    .title-workspace small { color: var(--muted); font-size: 11px; font-weight: 400; }
+    .title-tabs { gap: 0; overflow: hidden; }
+    .tab { align-self: stretch; display: flex; align-items: center; gap: 7px; min-width: 150px; max-width: 230px; padding: 0 13px; border-right: 1px solid var(--line); font-size: 12px; overflow: hidden; white-space: nowrap; }
+    .tab.active { border-top: 2px solid var(--accent); background: #1c222a; }
+    .tab.remote-tab { border-top-color: var(--purple); }
+    .tab .tab-close { margin-left: auto; color: var(--muted); font-size: 16px; }
+    .title-account { justify-content: center; color: var(--muted); font-size: 12px; }
+    .shell { height: calc(100% - 72px); display: grid; grid-template-columns: 88px 302px minmax(0, 1fr); }
+    .rail { border-right: 1px solid var(--line); display: flex; flex-direction: column; gap: 3px; padding: 11px 8px; }
+    .rail-item { display: flex; flex-direction: column; justify-content: center; align-items: center; height: 53px; gap: 3px; color: var(--muted); font-size: 10px; }
+    .rail-item b { font-weight: 450; font-size: 20px; line-height: 1; }
+    .rail-item.active { color: var(--text); background: #242a33; }
+    .rail-fill { flex: 1; }
+    .sidebar { display: flex; flex-direction: column; min-width: 0; border-right: 1px solid var(--line); }
+    .side-head { height: 39px; flex: none; display: flex; align-items: center; justify-content: space-between; padding: 0 13px; border-bottom: 1px solid #292d34; color: #a6aab2; font-size: 11px; font-weight: 650; letter-spacing: .06em; }
+    .side-head span:last-child { font-size: 17px; color: var(--muted); font-weight: 400; }
+    .project-list { flex: none; padding: 8px 7px 10px; border-bottom: 1px solid var(--line); }
+    .workspace-row { height: 38px; width: 100%; border: 0; background: var(--selected); color: var(--text); display: flex; align-items: center; gap: 9px; padding: 0 8px; text-align: left; }
+    .workspace-mark { display: grid; place-items: center; width: 22px; height: 22px; background: #254e5e; color: #bde9f8; font-weight: 700; font-size: 12px; }
+    .workspace-row strong { flex: 1; font-size: 13px; }
+    .chevron { color: var(--muted); font-size: 12px; }
+    .section-label { display: flex; align-items: center; justify-content: space-between; margin: 14px 7px 5px 28px; color: #858f9a; font-size: 10px; font-weight: 700; letter-spacing: .07em; }
+    .section-label.remote-section { margin-top: 15px; }
+    .small-add { border: 0; color: var(--accent); background: none; font-size: 11px; letter-spacing: 0; font-weight: 600; padding: 2px 0 2px 5px; }
+    .small-add:hover { text-decoration: underline; }
+    .session-row, .server-row { width: 100%; min-height: 42px; display: flex; align-items: center; gap: 8px; padding: 5px 6px 5px 28px; border: 0; background: none; color: #c5cbd3; text-align: left; }
+    .session-row:hover, .server-row:hover { background: var(--hover); }
+    .session-row.selected { background: #222a32; }
+    .dot { width: 7px; height: 7px; flex: none; border-radius: 50%; background: var(--green); }
+    .dot.purple { background: var(--purple); }
+    .dot.warn { background: var(--orange); }
+    .item-copy { flex: 1; min-width: 0; }
+    .item-copy strong, .item-copy small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .item-copy strong { font-weight: 550; font-size: 12px; }
+    .item-copy small { margin-top: 3px; color: var(--muted); font-size: 10px; }
+    .row-icon { border: 1px solid #52606e; width: 24px; height: 23px; background: #26303a; color: #d8e0e8; font-size: 13px; }
+    .row-icon:hover { border-color: var(--accent); color: #fff; }
+    .empty-remote { margin: 6px 7px 2px 28px; padding: 10px 11px; background: #1c2229; border: 1px dashed #3a454e; }
+    .empty-remote p { margin: 0 0 9px; color: #9ca5ae; font-size: 11px; line-height: 1.5; }
+    .empty-remote button { border: 1px solid #407c98; background: #173644; color: #c4efff; padding: 6px 9px; font-size: 11px; }
+    .server-row { padding-left: 28px; min-height: 49px; }
+    .server-row .item-copy small { color: #818b97; }
+    .remote-session { padding-left: 44px; }
+    .workspace-other { margin-top: 10px; padding: 8px 8px 0; border-top: 1px solid #292d34; }
+    .other-row { display: flex; align-items: center; gap: 8px; height: 31px; color: #747d87; font-size: 12px; }
+    .other-mark { display: grid; place-items: center; width: 20px; height: 20px; background: #39404d; color: #a8acb3; font-size: 10px; }
+    .files { flex: 1; min-height: 0; overflow: hidden; padding: 0 10px; }
+    .files-head { display: flex; align-items: center; justify-content: space-between; gap: 5px; height: 44px; border-bottom: 1px solid #292d34; }
+    .files-head strong { font-size: 11px; }
+    .tree-switch { display: flex; gap: 2px; }
+    .tree-switch button { border: 1px solid transparent; background: none; color: var(--muted); padding: 4px 5px; font-size: 10px; }
+    .tree-switch button.active { border-color: #435361; background: #252d36; color: #e2ecf4; }
+    .tree-path { padding: 11px 4px 7px; color: #8896a3; font: 10px/1.4 var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .tree-line { height: 26px; padding-left: 5px; font-size: 11px; color: #b7bec6; }
+    .tree-line.indent { padding-left: 21px; }
+    .tree-line.folder { color: #8dcfe8; }
+    .main { min-width: 0; position: relative; display: flex; background: var(--terminal); }
+    .pane { min-width: 0; height: 100%; display: flex; flex-direction: column; }
+    .pane.local { flex: 1; }
+    .pane.remote { flex: 1; border-left: 1px solid #48515b; }
+    .pane-header { height: 42px; flex: none; display: flex; align-items: center; gap: 8px; padding: 0 13px; border-bottom: 1px solid #2e343c; font-size: 12px; }
+    .pane-header strong { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 620; }
+    .pane-header .path { color: var(--muted); font: 10px var(--mono); }
+    .pane-tag { border: 1px solid #3d5261; color: #a0cada; padding: 3px 5px; font-size: 10px; }
+    .pane-tag.remote-tag { color: #c4b6e7; border-color: #63577c; }
+    .pane-header button { background: transparent; border: 0; color: #9ca6b0; font-size: 17px; padding: 2px 3px; }
+    .terminal-body { flex: 1; overflow: hidden; padding: 17px 18px; font: 12px/1.68 var(--mono); color: #b9c1ca; white-space: pre-wrap; }
+    .terminal-body .prompt { color: var(--green); }
+    .terminal-body .cyan { color: #70c9ed; }
+    .terminal-body .faint { color: #69727d; }
+    .terminal-body .purple-text { color: #b8a7e6; }
+    .terminal-body .cursor { display: inline-block; width: 7px; height: 15px; vertical-align: -3px; background: #b4c4ce; animation: blink 1.2s step-end infinite; }
+    @keyframes blink { 50% { opacity: .15; } }
+    .local-guide { max-width: 490px; margin: 24px 0 0; padding: 14px 16px; border-left: 2px solid #2e728f; background: #121c23; color: #b4ced8; font: 12px/1.65 var(--font); white-space: normal; }
+    .local-guide b { color: #d5f2fc; }
+    .remote-body { position: relative; }
+    .remote-body.offline { background: #14141b; }
+    .remote-body.offline .cursor { display: none; }
+    .remote-disconnected { flex: none; display: flex; align-items: center; gap: 12px; padding: 10px 13px; border-bottom: 1px solid #715c40; background: #30271c; }
+    .remote-disconnected strong { display: block; color: #ffce8a; font-size: 11px; }
+    .remote-disconnected small { display: block; margin-top: 3px; color: #d3c3af; font-size: 10px; line-height: 1.45; }
+    .remote-disconnected button { flex: none; margin-left: auto; padding: 7px 9px; border: 1px solid #ba8140; background: #664523; color: #fff1dd; font-size: 10px; font-weight: 650; }
+    .state-button { position: absolute; right: 16px; bottom: 17px; z-index: 1; border: 1px solid #586578; background: #1d2a34; color: #b6d9e8; padding: 7px 10px; font-size: 10px; }
+    .state-button:hover { border-color: var(--accent); }
+    .bottom { height: 28px; display: flex; align-items: center; gap: 16px; padding: 0 11px; border-top: 1px solid var(--line); color: #8d949e; font-size: 10px; }
+    .bottom .push { margin-left: auto; }
+    .bottom .good { color: var(--green); }
+    .bottom .warn { color: var(--orange); }
+    .modal-backdrop { position: absolute; inset: 44px 0 28px; display: grid; place-items: center; background: #070a0dc9; z-index: 4; }
+    .modal { width: 445px; max-width: calc(100% - 32px); border: 1px solid #62707e; background: #20252c; box-shadow: 0 22px 50px #0009; }
+    .modal-head { display: flex; align-items: start; justify-content: space-between; gap: 12px; padding: 18px 20px 14px; border-bottom: 1px solid #38404a; }
+    .modal-head h2 { margin: 0 0 4px; font-size: 16px; }
+    .modal-head p { margin: 0; color: #a5adb6; font-size: 11px; line-height: 1.5; }
+    .modal-head button { border: 0; background: none; color: #a6aeb8; font-size: 19px; }
+    .modal form { padding: 18px 20px 20px; }
+    .modal label { display: block; margin-bottom: 13px; color: #d5dbe0; font-size: 11px; font-weight: 600; }
+    .modal input { display: block; width: 100%; height: 36px; margin-top: 6px; padding: 0 10px; border: 1px solid #4b555f; border-radius: 0; background: #11151a; color: #e1e7eb; font: 12px var(--mono); }
+    .modal input::placeholder { color: #6c7580; }
+    .modal .association { padding: 10px 11px; background: #17303b; border-left: 2px solid var(--accent); color: #b8dfef; font-size: 11px; line-height: 1.5; }
+    .modal-actions { display: flex; justify-content: end; gap: 8px; margin-top: 17px; }
+    .modal-actions button { border: 1px solid #53606c; background: #2b323b; color: #e0e4e9; padding: 8px 12px; font-size: 11px; }
+    .modal-actions .primary { border-color: #248ab4; background: #126080; color: #fff; font-weight: 650; }
+    .explain { display: grid; grid-template-columns: 220px minmax(0, 1fr) auto; align-items: center; gap: 20px; min-height: 84px; margin-top: 13px; padding: 16px 18px; border: 1px solid #343e49; background: #1a2027; }
+    .explain-kicker { color: var(--accent); font: 700 10px var(--mono); letter-spacing: .08em; }
+    .explain h2 { margin: 4px 0 0; font-size: 14px; }
+    .explain p { margin: 0; color: #b0bac4; font-size: 12px; line-height: 1.65; }
+    .explain-actions { display: flex; gap: 7px; }
+    .explain-actions button { min-width: 85px; padding: 8px 10px; border: 1px solid #47677a; background: #1a3746; color: #d2effc; font-size: 11px; }
+    .explain-actions button.secondary { background: #202831; color: #b9c5d0; border-color: #46515d; }
+    .note { margin-top: 12px; color: #818c97; font-size: 11px; line-height: 1.6; }
+    [hidden] { display: none !important; }
+    @media (max-width: 1050px) {
+      .page { overflow-x: auto; }
+      .journey { min-width: 960px; }
+      .explain { min-width: 960px; }
+    }
+    @media (max-width: 600px) { .page-head { align-items: start; flex-direction: column; } }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header class="page-head">
+      <div>
+        <div class="eyebrow">Deppy Sijo / Managed SSH UX proposal</div>
+        <h1>로컬 프로젝트에서 연결된 원격 작업 열기</h1>
+        <p class="lede">아래 단계를 누르거나 화면 속 버튼을 눌러, 로컬 작업 → 서버 연결 → 나란히 작업 → 연결 복구 흐름을 확인하세요.</p>
+      </div>
+      <div class="prototype-label">INTERACTIVE HTML · 기획 시안</div>
+    </header>
+
+    <nav class="journey" aria-label="시안 단계">
+      <button data-step="0" aria-current="step"><b>01</b><span>로컬 프로젝트</span></button>
+      <button data-step="1"><b>02</b><span>서버 연결 추가</span></button>
+      <button data-step="2"><b>03</b><span>연결된 서버</span></button>
+      <button data-step="3"><b>04</b><span>오른쪽에서 작업</span></button>
+      <button data-step="4"><b>05</b><span>연결이 끊김</span></button>
+      <button data-step="5"><b>06</b><span>기존 작업 복귀</span></button>
+    </nav>
+
+    <section class="app" id="app" aria-label="Deppy Sijo UI 시안">
+      <header class="titlebar">
+        <div class="traffic" aria-hidden="true"><i></i><i></i><i></i></div>
+        <div class="title-workspace"><span>프로젝트</span><small>−　＋</small></div>
+        <div class="title-tabs"><div class="tab active"><span class="dot"></span><span>deppy-sijo · 로컬</span><span class="tab-close">×</span></div><div class="tab remote-tab" id="remoteTab" hidden><span class="dot purple" id="tabDot"></span><span>개발 서버 · 원격</span><span class="tab-close">×</span></div></div>
+        <div class="title-account">◔ &nbsp; ko</div>
+      </header>
+
+      <div class="shell">
+        <nav class="rail" aria-label="앱 탐색">
+          <div class="rail-item active"><b>⌂</b><span>홈</span></div>
+          <div class="rail-item"><b>▣</b><span>작업함</span></div>
+          <div class="rail-item"><b>▦</b><span>플릿</span></div>
+          <div class="rail-item"><b>♧</b><span>AI</span></div>
+          <div class="rail-fill"></div>
+          <div class="rail-item"><b>?</b><span>도움말</span></div>
+          <div class="rail-item"><b>⚙</b><span>설정</span></div>
+        </nav>
+
+        <aside class="sidebar" aria-label="워크스페이스와 파일">
+          <div class="side-head"><span>WORKSPACES</span><span>＋</span></div>
+          <div class="project-list">
+            <button class="workspace-row" type="button" aria-label="deppy-sijo 워크스페이스"><span class="chevron">⌄</span><span class="workspace-mark">D</span><strong>deppy-sijo</strong><span class="chevron">⋯</span></button>
+            <div class="section-label"><span>내 컴퓨터</span></div>
+            <button class="session-row selected" type="button" id="localSession"><span class="dot"></span><span class="item-copy"><strong>로컬 작업</strong><small>~/Desktop/projects/deppy-sijo</small></span></button>
+            <div class="section-label remote-section"><span>연결된 서버</span><button type="button" class="small-add" id="addRemote">＋ 연결</button></div>
+            <div class="empty-remote" id="emptyRemote"><p>같은 프로젝트의 서버 작업을<br>여기에 연결할 수 있습니다.</p><button type="button" id="emptyAdd">SSH 서버 연결</button></div>
+            <div id="linkedRemote" hidden>
+              <button class="server-row" type="button" id="serverRow"><span class="dot purple" id="serverDot"></span><span class="item-copy"><strong id="serverAlias">개발 서버</strong><small id="serverSummary">100.78.219.124 · /srv/deppy-sijo</small></span><span class="chevron">⌄</span></button>
+              <div class="session-row remote-session" id="remoteSession"><span class="dot purple" id="remoteDot"></span><span class="item-copy"><strong>원격 작업</strong><small id="remoteStatus">연결됨 · 작업 유지 중</small></span><button type="button" class="row-icon" id="openBeside" title="현재 화면 오른쪽에 열기" aria-label="원격 작업을 오른쪽에 열기">↗</button></div>
+            </div>
+            <div class="workspace-other"><div class="other-row"><span class="chevron">›</span><span class="other-mark">S</span><span>Serenity</span></div><div class="other-row"><span class="chevron">›</span><span class="other-mark">V</span><span>VisionAI2</span></div></div>
+          </div>
+          <div class="files">
+            <div class="files-head"><strong>파일</strong><div class="tree-switch"><button type="button" class="active" id="treeLocal">로컬</button><button type="button" id="treeRemote" hidden>원격</button></div></div>
+            <div class="tree-path" id="treePath">~/Desktop/projects/deppy-sijo</div>
+            <div id="localTree"><div class="tree-line folder">⌄　crates</div><div class="tree-line folder indent">⌄　app</div><div class="tree-line indent">　src/app.rs</div><div class="tree-line folder">⌄　docs</div><div class="tree-line">　Cargo.toml</div><div class="tree-line">　README.md</div></div>
+            <div id="remoteTree" hidden><div class="tree-line folder">⌄　crates</div><div class="tree-line folder indent">⌄　app</div><div class="tree-line indent">　src/app.rs</div><div class="tree-line folder">⌄　logs</div><div class="tree-line">　.env.example</div><div class="tree-line">　Cargo.toml</div></div>
+          </div>
+        </aside>
+
+        <section class="main" aria-label="터미널 Pane">
+          <article class="pane local">
+            <header class="pane-header"><span class="dot"></span><strong>로컬 작업</strong><span class="pane-tag">내 컴퓨터</span></header>
+            <div class="terminal-body"><span class="prompt">deppy-sijo %</span> git status --short
+<span class="faint">working tree clean</span>
+<span class="prompt">deppy-sijo %</span> cargo test -p deppy-sijo
+<span class="cyan">test result: ok. 42 passed</span>
+<span class="prompt">deppy-sijo %</span> <span class="cursor"></span>
+<div class="local-guide" id="localGuide"><b>이 프로젝트에서 계속 작업하세요.</b><br>서버가 필요해지면 왼쪽 <b>연결된 서버 → ＋ 연결</b>을 누릅니다. 로컬 세션과 파일은 그대로 둡니다.</div></div>
+          </article>
+          <article class="pane remote" id="remotePane" hidden>
+            <header class="pane-header"><span class="dot purple" id="paneDot"></span><strong>원격 작업</strong><span class="pane-tag remote-tag" id="paneTag">개발 서버</span><button type="button" id="closeRemote" title="원격 Pane 닫기" aria-label="원격 Pane 닫기">×</button></header>
+            <div class="remote-disconnected" id="disconnected" hidden><div><strong>● 연결 끊김 · 마지막 원격 화면</strong><small>재접속 전에도 이전 출력과 스크롤을 읽을 수 있습니다. 입력은 재연결 후 가능합니다.</small></div><button type="button" id="reconnect">기존 작업에 재연결</button></div>
+            <div class="terminal-body remote-body" id="remoteTerminal"><span class="purple-text">SSH · 개발 서버</span>  <span class="faint" id="remotePathCaption">/srv/deppy-sijo</span>
+<span class="prompt">deppy@dev %</span> pwd
+<span class="faint" id="remotePwd">/srv/deppy-sijo</span>
+<span class="prompt">deppy@dev %</span> git pull
+<span class="cyan">Already up to date.</span>
+<span class="prompt">deppy@dev %</span> ./scripts/run-dev.sh
+<span class="cyan">dev server listening on :3000</span>
+<span class="prompt">deppy@dev %</span> <span class="cursor"></span></div>
+          </article>
+          <button type="button" class="state-button" id="disconnectButton" hidden>연결 끊김 상태 보기 →</button>
+        </section>
+      </div>
+      <footer class="bottom"><span>☀ 4%　5h | 이번 주 8%</span><span>세션 <span id="sessionCount">1</span></span><span id="connectionFooter" class="good">● 로컬 작업 중</span><span class="push">CPU 2.1%　메모리 592 MiB</span></footer>
+
+      <div class="modal-backdrop" id="modalBackdrop" hidden>
+        <div class="modal" role="dialog" aria-modal="true" aria-labelledby="dialogTitle">
+          <div class="modal-head"><div><h2 id="dialogTitle">이 프로젝트에 SSH 서버 연결</h2><p>원격에서 작업할 폴더를 로컬 프로젝트에 연결합니다.</p></div><button type="button" id="closeModal" aria-label="닫기">×</button></div>
+          <form id="connectForm">
+            <label>표시 이름<input id="aliasInput" value="개발 서버" required></label>
+            <label>SSH 접속 주소<input id="hostInput" value="deppy@100.78.219.124" required spellcheck="false"></label>
+            <label>원격 프로젝트 폴더<input id="pathInput" value="/srv/deppy-sijo" required spellcheck="false"></label>
+            <div class="association">연결 위치: <b>deppy-sijo → 연결된 서버</b><br>로컬 폴더와 원격 폴더의 파일은 자동으로 동기화되지 않습니다.</div>
+            <div class="modal-actions"><button type="button" id="cancelModal">취소</button><button type="submit" class="primary">연결하고 추가</button></div>
+          </form>
+        </div>
+      </div>
+    </section>
+
+    <section class="explain" aria-live="polite"><div><div class="explain-kicker" id="explainKicker">STEP 01 / LOCAL</div><h2 id="explainTitle">로컬 프로젝트에서 시작</h2></div><p id="explainText">기존처럼 deppy-sijo 워크스페이스의 로컬 세션과 파일을 사용합니다. 서버 작업이 필요할 때만 왼쪽의 “＋ 연결”을 누릅니다.</p><div class="explain-actions"><button type="button" class="secondary" id="prevStep">이전</button><button type="button" id="nextStep">다음 단계 →</button></div></section>
+    <p class="note">이 파일은 동작을 설명하는 HTML 시안입니다. 실제 SSH 연결이나 파일 동기화는 수행하지 않습니다. 상단 단계를 누르면 각 상태를 바로 비교할 수 있습니다.</p>
+  </main>
+
+  <script>
+    (() => {
+      const $ = (id) => document.getElementById(id);
+      const stepButtons = [...document.querySelectorAll('[data-step]')];
+      const content = [
+        ['STEP 01 / LOCAL', '로컬 프로젝트에서 시작', '기존처럼 deppy-sijo 워크스페이스의 로컬 세션과 파일을 사용합니다. 서버 작업이 필요할 때만 왼쪽의 “＋ 연결”을 누릅니다.'],
+        ['STEP 02 / SETUP', '현재 프로젝트에 서버 연결', 'SSH 주소와 원격 폴더를 입력합니다. 별도 최상위 프로젝트를 만들지 않고 deppy-sijo 아래에 연결됩니다.'],
+        ['STEP 03 / LINKED', '원격 작업이 같은 프로젝트에 표시', '서버와 원격 세션이 “연결된 서버” 아래에 나타납니다. 로컬 터미널은 계속 활성 상태입니다.'],
+        ['STEP 04 / SIDE BY SIDE', '원격 작업을 오른쪽에 열기', '원격 세션의 ↗ 버튼을 누르면 현재 로컬 작업 오른쪽에 원격 Pane이 열립니다. 파일 트리도 로컬·원격을 선택해 볼 수 있습니다.'],
+        ['STEP 05 / DISCONNECTED', '연결이 끊겨도 마지막 원격 화면 유지', '원격 Pane은 마지막 화면과 스크롤을 읽기 전용으로 보여줍니다. 로컬 Pane은 별도로 유지되며 복귀 버튼으로 같은 원격 작업에 다시 연결합니다.'],
+        ['STEP 06 / RESUMED', '재연결하면 기존 원격 작업으로 복귀', '같은 프로젝트의 원격 Pane이 복구됩니다. 사용자는 SSH나 tmux 재접속 명령을 직접 입력하지 않습니다.']
+      ];
+      let step = 0;
+      let tree = 'local';
+      const setTree = (value) => {
+        tree = value === 'remote' && step >= 2 ? 'remote' : 'local';
+        $('treeLocal').classList.toggle('active', tree === 'local');
+        $('treeRemote').classList.toggle('active', tree === 'remote');
+        $('localTree').hidden = tree !== 'local';
+        $('remoteTree').hidden = tree !== 'remote';
+        $('treePath').textContent = tree === 'local' ? '~/Desktop/projects/deppy-sijo' : $('pathInput').value.trim();
+      };
+      const render = () => {
+        const linked = step >= 2;
+        const open = step >= 3;
+        const lost = step === 4;
+        $('emptyRemote').hidden = linked;
+        $('linkedRemote').hidden = !linked;
+        $('treeRemote').hidden = !linked;
+        $('remotePane').hidden = !open;
+        $('remoteTab').hidden = !open;
+        $('modalBackdrop').hidden = step !== 1;
+        $('remoteTerminal').classList.toggle('offline', lost);
+        $('disconnected').hidden = !lost;
+        $('disconnectButton').hidden = !open || lost;
+        $('disconnectButton').textContent = step === 5 ? '다시 끊긴 상태 보기 →' : '연결 끊김 상태 보기 →';
+        $('localGuide').hidden = step >= 3;
+        $('sessionCount').textContent = linked ? '2' : '1';
+        $('serverDot').classList.toggle('warn', lost);
+        $('serverDot').classList.toggle('purple', !lost);
+        $('remoteDot').classList.toggle('warn', lost);
+        $('remoteDot').classList.toggle('purple', !lost);
+        $('paneDot').classList.toggle('warn', lost);
+        $('paneDot').classList.toggle('purple', !lost);
+        $('tabDot').classList.toggle('warn', lost);
+        $('tabDot').classList.toggle('purple', !lost);
+        $('remoteStatus').textContent = lost ? '연결 끊김 · 마지막 화면 보존' : step === 5 ? '재연결됨 · 기존 작업 복귀' : '연결됨 · 작업 유지 중';
+        $('connectionFooter').className = lost ? 'warn' : 'good';
+        $('connectionFooter').textContent = !linked ? '● 로컬 작업 중' : lost ? '● 원격 연결 끊김 · 로컬 정상' : '● 로컬 정상　● 원격 연결됨';
+        $('explainKicker').textContent = content[step][0];
+        $('explainTitle').textContent = content[step][1];
+        $('explainText').textContent = content[step][2];
+        $('prevStep').disabled = step === 0;
+        $('nextStep').disabled = step === 5;
+        $('prevStep').style.opacity = step === 0 ? '.45' : '1';
+        $('nextStep').style.opacity = step === 5 ? '.45' : '1';
+        stepButtons.forEach((button) => {
+          if (Number(button.dataset.step) === step) button.setAttribute('aria-current', 'step');
+          else button.removeAttribute('aria-current');
+        });
+        if (!linked) setTree('local');
+        if (step === 1) $('aliasInput').focus();
+      };
+      const go = (number) => { step = Math.max(0, Math.min(5, number)); render(); };
+      stepButtons.forEach((button) => button.addEventListener('click', () => go(Number(button.dataset.step))));
+      $('addRemote').addEventListener('click', () => go(1));
+      $('emptyAdd').addEventListener('click', () => go(1));
+      $('closeModal').addEventListener('click', () => go(0));
+      $('cancelModal').addEventListener('click', () => go(0));
+      $('connectForm').addEventListener('submit', (event) => {
+        event.preventDefault();
+        const alias = $('aliasInput').value.trim();
+        const host = $('hostInput').value.trim();
+        const path = $('pathInput').value.trim();
+        if (!alias || !host || !path) return;
+        $('serverAlias').textContent = alias;
+        $('serverSummary').textContent = host + ' · ' + path;
+        $('paneTag').textContent = alias;
+        $('remotePathCaption').textContent = path;
+        $('remotePwd').textContent = path;
+        go(2);
+      });
+      $('openBeside').addEventListener('click', () => go(3));
+      $('remoteSession').addEventListener('click', (event) => { if (event.target !== $('openBeside')) go(3); });
+      $('serverRow').addEventListener('click', () => go(3));
+      $('localSession').addEventListener('click', () => { setTree('local'); if (step >= 3) go(2); });
+      $('treeLocal').addEventListener('click', () => setTree('local'));
+      $('treeRemote').addEventListener('click', () => setTree('remote'));
+      $('closeRemote').addEventListener('click', () => go(2));
+      $('disconnectButton').addEventListener('click', () => go(4));
+      $('reconnect').addEventListener('click', () => go(5));
+      $('prevStep').addEventListener('click', () => go(step - 1));
+      $('nextStep').addEventListener('click', () => go(step + 1));
+      document.addEventListener('keydown', (event) => { if (event.key === 'Escape' && step === 1) go(0); });
+      render();
+    })();
+  </script>
+</body>
+</html>

@@ -1,5 +1,80 @@
 # Codex handoff
 
+## 파일 트리 Finder 동선 HTML 시안·SSH 기록 조사 (2026-09-24)
+
+- Current objective: 폴더 키보드 이동, 더보기 파일 검색, 넓은 새 파일·폴더 입력,
+  다중 선택 중 한 항목 제외, 상위 폴더 복사의 UI를 구현 전에 HTML로 제시한다.
+  사용자가 재실행 뒤 SSH 터미널 기록이 사라지는 이유도 설명한다.
+- Completed work: `docs/mockups/file-tree-finder-flow-20260924.html`을 만들고
+  6단계 시안(이동, 검색, 생성, 영역 선택, Shift로 제외, 상위 폴더 복사)을 열었다.
+  사용자 프로젝트 규칙을 `AGENTS.md`와 `CLAUDE.md`에 기록해 별도 명시 요청
+  없이는 Deppy를 재실행하지 않도록 했다. 이번 단계에서 앱을 재실행하지 않았다.
+  SSH 소스와 실제 로컬 로그/DB를 읽기 전용으로 조사했다.
+- Modified files: `AGENTS.md`, `CLAUDE.md`, 이 handoff, 위 새 HTML.
+  기존 관리형 SSH HTML과 기존 handoff 변경은 보존했다.
+- Key design decisions: HTML은 실제 파일 조작을 수행하지 않는다. Space 이동,
+  더보기 검색, 중앙 입력창, 선택 수와 복사 대상 미리보기, 충돌 시 덮어쓰기 방지를
+  명시한다. 사용자의 '스펠'은 시안에서 Space, 'Shift로 제거'는 Shift+클릭으로
+  해석했고 비동기 확인 질문은 아직 답이 없었다.
+- SSH findings: `restore_pane`은 SSH 프로세스를 이어 쓰지 않고 새 로컬 셸을
+  만들지만 `redacted.ansi.log`를 재생한다. 2026-09-23 UTC 앱 로그에서 최근
+  여러 shell/agent 세션의 ANSI 복원 성공을 확인했고, DB가 가리키는 셸 pane들의
+  ANSI 로그 파일도 수 MB 크기로 존재한다. 따라서 '모든 기록이 디스크에서
+  없어졌다'고 단정할 수 없다. 특정 사용자가 보는 pane과 시각적 소실 원인은
+  실앱 화면을 재실행/조작하지 않아 확정하지 못했다. 이전 alt-screen 소실
+  수정은 `docs/superpowers/specs/2026-08-19-shell-session-restore.md`에 있다.
+  로그는 세션당 16 MiB tail, 전체 256 MiB 예산, 복원 scrollback 10,000줄
+  제한이 있다. 이 조사에서 로그 내용은 표시하지 않았다.
+- Test commands/results: `curl -sI http://127.0.0.1:8767/file-tree-finder-flow-20260924.html`
+  200 OK. `agbrowse navigate`, `snapshot --interactive`로 단계·메뉴·대화상자를
+  확인했다. 브라우저에서 폴더 Space 이동과 더보기→검색을 클릭해 확인했다.
+  Playwright CDP로 Shift+Modal.tsx 클릭 뒤 선택 3개/Modal 미선택과 복사
+  미리보기에서 utils·Button.tsx·Card.tsx만 표시되는 것을 확인했다.
+  생성/복사 시안 스크린샷을 육안 확인했다. 브라우저 콘솔 출력은 없었다.
+  `git diff --check`는 통과했다. Cargo 테스트/빌드는 새 제품 코드가 없어
+  이번 단계에 실행하지 않았다.
+- Failed approaches: CUA의 iab/chrome 브라우저는 available 하지 않았다.
+  기존 로컬 HTTP 서버를 이용하고 `open http://127.0.0.1:8767/file-tree-finder-flow-20260924.html`
+  명령은 exit 0이었다. 시스템 기본 git은 Xcode 라이선스 오류가 있어 설치된
+  CommandLineTools git으로 diff 검사를 실행했다.
+- Remaining work: 사용자의 HTML 피드백을 받은 뒤 신규 파일 트리 기능을 제품에
+  구현한다. SSH 기록 소실이 계속되면 특정 워크스페이스/pane과 재시작 직전·직후
+  화면을 대조해 렌더링/복원 경로를 좁힌다. 관리형 SSH는 아직 제품 미구현이다.
+- Exact commands for the next agent:
+  `cd /Users/jr/Desktop/projects/deppy-sijo`;
+  `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git status --short`;
+  `open http://127.0.0.1:8767/file-tree-finder-flow-20260924.html`.
+  제품 소스 정렬/Finder 작업은 `/Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`에
+  있다. 사용자 허가 없이 `scripts/dev-run.sh` 실행이나 앱 재실행을 하지 않는다.
+
+## 관리형 SSH 연결 HTML 시안 완료 (2026-09-23)
+
+- Current objective: 현재 Deppy Sijo UI를 바탕으로 로컬 프로젝트에서 같은 프로젝트의
+  원격 작업을 연결하고 여는 흐름을 HTML로 보여준다.
+- Completed work: `docs/mockups/managed-ssh-linked-project-20260923.html`을 만들었다.
+  로컬 작업, 서버 연결 입력창, 연결된 서버 목록, 오른쪽 원격 Pane, 끊김,
+  기존 작업 복귀의 6단계를 화면 위에서 선택하거나 실제 버튼으로 따라갈 수 있다.
+- Modified files: 위 새 HTML 파일과 이 `docs/CODEX_HANDOFF.md`.
+- Key design decisions: `deppy-sijo` 프로젝트 워크스페이스 하나 아래에
+  `내 컴퓨터`와 `연결된 서버`를 둔다. 원격 세션의 `↗`는 로컬 Pane을 유지한 채
+  오른쪽 Pane을 연다. 파일 트리는 로컬/원격 경로를 명시적으로 전환하며
+  자동 파일 동기화는 제안하지 않는다. 연결이 끊겨도 로컬 Pane은 유지되고
+  원격 Pane에서 기존 작업 복귀를 제시한다. 이는 실제 SSH 구현이 아닌 UX 시안이다.
+- Tests and results: `agbrowse navigate file:///Users/jr/Desktop/projects/deppy-sijo/docs/mockups/managed-ssh-linked-project-20260923.html`
+  성공. `agbrowse snapshot --interactive`에서 6단계와 화면 버튼을 확인했다.
+  브라우저에서 `02`→`연결하고 추가`→원격 세션 `↗`→끊김 버튼→`기존 작업에 재연결`을
+  클릭해 각 상태를 확인했다. `agbrowse evaluate`로 복귀 단계 5,
+  원격 Pane 표시, 끊김 카드 숨김, 원격 파일 경로 `/srv/deppy-sijo`를 확인했다.
+  `git diff --check`는 통과했다. 앱 코드 변경이 없어 Cargo 빌드와 앱 재실행은 하지 않았다.
+- Failed approaches: `agbrowse click`의 파일 트리 `원격` ref 클릭은 브라우저 상태를
+  예상대로 바꾸지 않았다. 같은 버튼의 DOM click을 `agbrowse evaluate`로 실행해
+  경로와 활성 탭이 `/srv/deppy-sijo`/`원격`으로 바뀌는 것을 확인했다.
+- Remaining work: 사용자가 시안을 검토한 뒤 관리형 SSH의 실제 저장 모델과
+  세션 재연결 구현을 설계·개발한다. 이 HTML 자체의 추가 작업은 없다.
+- Exact commands for the next agent: `git status --short --branch`;
+  `open docs/mockups/managed-ssh-linked-project-20260923.html`;
+  `sed -n '1,80p' docs/CODEX_HANDOFF.md`.
+
 ## 재빌드 완료·재실행 차단 — 로컬 DB가 현재 브랜치보다 앞섬 (2026-09-23)
 
 - Current objective: 사용자의 요청대로 현재 체크아웃된

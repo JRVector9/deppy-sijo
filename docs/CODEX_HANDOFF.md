@@ -1,3 +1,14 @@
+## 2026-09-24 PR1 최종 리뷰 후 화면 크기 왕복 복원
+
+- Current objective: 복원한 SSH 셸 화면을 첫 입력 전까지 보여주고, 창 크기를 줄였다 다시 키워도 원본 내용을 복구한다. 사용자 허락 없이 앱 재실행 금지.
+- Completed work: `HeldViewport`가 원본 snapshot과 표시용 snapshot을 함께 보관한다. 리사이즈마다 원본에서 새 표시 화면을 계산하며 첫 입력/스크롤에서 둘 다 해제한다.
+- Modified files: `crates/session/src/session.rs`, `docs/CODEX_HANDOFF.md`.
+- Key design decisions: 원본 셀은 `Arc` clone으로 공유하므로 셀 배열을 두 번 복사하지 않는다. 축소 시 원본의 하단 행을 선택한다.
+- Tests actually run: 크기 축소→확대 회귀 테스트 수정 전 RED, 수정 후 1 passed. `cargo test -p session --locked` 74 passed, `cargo fmt --all -- --check`와 `git diff --check` exit 0.
+- Failed approaches: 기존 표시 snapshot을 직접 축소해 원본 열/행 정보가 사라졌다.
+- Remaining work: session 전체 테스트와 format/diff 검사 후 PR1 commit/push; PR2·PR3·PR4 rebase, 최종 검증·빌드·리뷰.
+- Exact next commands: `cd /private/tmp/deppy-ssh-screen-visible-20260924`; `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo test -p session --locked`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`.
+
 ## 2026-09-24 SSH 화면 복원과 파일 트리 PR 작업 진행
 
 - Final stack re-review follow-up: `codex review --base fix/environment-api-context-integration`가 고정된 화면을 24→10행처럼 줄일 때 상단을 복사해 아래쪽 프롬프트를 잃는 P2를 찾았다. 마지막 N행을 새 viewport에 복사하고 cursor 행을 잘린 상단 수만큼 보정했다. 새 shrink 회귀 테스트는 수정 전 RED, 수정 후 GREEN. `cargo test -p session --locked` 73 passed. 이 수정을 PR1에 추가한 뒤 PR2·PR3·PR4를 순서대로 rebase하고 최종 bundle을 다시 빌드해야 한다. 앱 재실행 금지.

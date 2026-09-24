@@ -95,8 +95,13 @@ pub struct Session {
     /// OSC 133 프롬프트 마크 (셸 통합 1단계) — pump의 출력 스트림에서 스캔한다.
     prompt_marks: PromptMarks,
     /// 새 로컬 PTY가 화면을 지워도 첫 입력 전에는 이전 화면을 그대로 보여준다.
-    /// 셀 한 화면만 보관해 복원된 전체 backend를 이중으로 유지하지 않는다.
-    held_viewport: Option<TerminalViewportSnapshot>,
+    /// 원본 셀은 첫 입력 전까지 보관해 pane 축소 후 확대에도 다시 보여준다.
+    held_viewport: Option<HeldViewport>,
+}
+
+struct HeldViewport {
+    original: TerminalViewportSnapshot,
+    display: TerminalViewportSnapshot,
 }
 
 impl Session {
@@ -382,7 +387,8 @@ impl Session {
     pub fn take_snapshot(&mut self) -> Option<TerminalViewportSnapshot> {
         let mut snapshot = self
             .held_viewport
-            .clone()
+            .as_ref()
+            .map(|held| held.display.clone())
             .or_else(|| self.backend.viewport_snapshot())?;
         if self.held_viewport.is_some() {
             // 검색 점프는 이 값을 기준으로 delta를 계산해 live backend에 적용한다.
@@ -477,7 +483,10 @@ impl Session {
             .map(|mut snapshot| {
                 snapshot.is_alt_screen = false;
                 snapshot.cursor.visible = false;
-                snapshot
+                HeldViewport {
+                    original: snapshot.clone(),
+                    display: snapshot,
+                }
             });
         self.mark_full_dirty();
         Ok(())
@@ -574,33 +583,36 @@ impl Session {
     }
 
     fn resize_held_viewport(&mut self, cols: u16, rows: u16) {
-        let Some(snapshot) = &mut self.held_viewport else {
+        let Some(held) = &mut self.held_viewport else {
             return;
         };
-        if snapshot.cols == cols && snapshot.rows == rows {
+        if held.display.cols == cols && held.display.rows == rows {
             return;
         }
-        let old_cols = usize::from(snapshot.cols);
+        let source = &held.original;
+        let old_cols = usize::from(source.cols);
         let new_cols = usize::from(cols);
         let mut cells = vec![TerminalCell::default(); new_cols * usize::from(rows)];
         // 줄어든 pane은 마지막 화면의 아래쪽(프롬프트/상태줄)을 남긴다.
-        let first_retained_row = snapshot.rows.saturating_sub(rows);
-        for row in 0..usize::from(snapshot.rows.min(rows)) {
+        let first_retained_row = source.rows.saturating_sub(rows);
+        for row in 0..usize::from(source.rows.min(rows)) {
             let count = old_cols.min(new_cols);
             let source_row = usize::from(first_retained_row) + row;
             cells[row * new_cols..row * new_cols + count].copy_from_slice(
-                &snapshot.visible_cells[source_row * old_cols..source_row * old_cols + count],
+                &source.visible_cells[source_row * old_cols..source_row * old_cols + count],
             );
         }
-        snapshot.cols = cols;
-        snapshot.rows = rows;
-        snapshot.visible_cells = cells.into();
-        snapshot.cursor.col = snapshot.cursor.col.min(cols.saturating_sub(1));
-        snapshot.cursor.row = snapshot
+        let mut display = source.clone();
+        display.cols = cols;
+        display.rows = rows;
+        display.visible_cells = cells.into();
+        display.cursor.col = source.cursor.col.min(cols.saturating_sub(1));
+        display.cursor.row = source
             .cursor
             .row
             .saturating_sub(first_retained_row)
             .min(rows.saturating_sub(1));
+        held.display = display;
     }
 
     pub fn scroll(&mut self, delta: i32) {
@@ -1345,6 +1357,31 @@ mod tests {
         assert!(rows[1].starts_with("ROW4"), "{rows:?}");
         assert!(rows[2].starts_with("PROMPT"), "{rows:?}");
         assert_eq!(resized.cursor.row, 2);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn 복원된_원격화면은_크기를_줄였다_늘려도_원본_셀을_복구한다() {
+        let spec = CommandSpec {
+            program: "/bin/cat".into(),
+            args: Vec::new(),
+            env: Vec::new(),
+            cwd: None,
+        };
+        let mut session =
+            Session::spawn_with_spec(SessionId(27), SessionKind::Shell, &spec, 20, 6, 100).unwrap();
+        session
+            .replay_ansi(&mut std::io::Cursor::new(
+                b"ROW0-LONG-TEXT\r\nROW1\r\nROW2\r\nROW3\r\nROW4\r\nPROMPT",
+            ))
+            .unwrap();
+        session.finish_ansi_replay().unwrap();
+        let original = session.take_snapshot().unwrap();
+        session.resize_checked(8, 3).unwrap();
+        session.resize_checked(20, 6).unwrap();
+        let restored = session.take_snapshot().unwrap();
+        assert_eq!(restored.visible_cells, original.visible_cells);
+        assert_eq!(restored.cursor, original.cursor);
     }
 
     #[test]

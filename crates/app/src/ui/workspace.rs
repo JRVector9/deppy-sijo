@@ -7343,6 +7343,7 @@ impl WorkspaceUi {
             && focused
             && !tree_keyboard_focused
             && !file_search_keyboard_active
+            && !any_blocking_window_visible
             && self.pending_focus.as_ref() == Some(pane_id)
         {
             let app_armed = self.explicit_pending_focus.as_ref() == Some(pane_id);
@@ -9365,12 +9366,14 @@ fn terminal_should_copy_selection(
 }
 
 /// Agents and the diff review panel are floating but non-modal. A terminal
-/// click must be able to reclaim focus while they remain open;
-/// confirmation/error windows continue to block terminal input as before.
+/// click must be able to reclaim focus while they remain open; confirmation/
+/// error windows and the file creation modal block terminal input.
 pub(super) fn is_blocking_terminal_window(layer: &egui::LayerId) -> bool {
-    layer.order == egui::Order::Middle
-        && layer.id != crate::ui::agent_sessions::agents_window_id()
-        && layer.id != crate::ui::diff_panel::diff_window_id()
+    (layer.order == egui::Order::Foreground
+        && layer.id == super::file_tree::file_tree_create_modal_id())
+        || (layer.order == egui::Order::Middle
+            && layer.id != crate::ui::agent_sessions::agents_window_id()
+            && layer.id != crate::ui::diff_panel::diff_window_id())
 }
 
 /// Pending focus가 있으면 runtime snapshot의 이전 focused pane 대신 그것이 유일한 입력
@@ -19438,6 +19441,78 @@ https://example.test/login \
         assert!(filter.horizontal_arrows);
         assert!(filter.vertical_arrows);
         assert!(filter.escape);
+    }
+
+    #[test]
+    fn 새_파일_폴더_모달이_열리면_터미널_키보드_입력을_막는다() {
+        let ctx = egui::Context::default();
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            let _ = egui::Modal::new(super::super::file_tree::file_tree_create_modal_id())
+                .show(ui.ctx(), |ui| ui.label("New folder"));
+            let blocked = ui.memory(|memory| {
+                memory
+                    .areas()
+                    .visible_layer_ids()
+                    .iter()
+                    .any(is_blocking_terminal_window)
+            });
+            assert!(blocked, "현재 프레임의 모달도 입력 차단 대상이어야 한다");
+            assert!(!terminal_keyboard_input_allowed(
+                false, false, blocked, true
+            ));
+        })
+        .drop_without_applying_deltas();
+        assert!(!is_blocking_terminal_window(&egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("unrelated_foreground"),
+        )));
+    }
+
+    #[test]
+    fn 생성_모달에서_tab으로_버튼에_이동해도_입력이_pty로_가지_않는다() {
+        let catalog = catalog();
+        let config = TerminalConfig::default();
+        let session = SessionId(87);
+        let target_pane = pane_id("pane");
+        let mut workspace = WorkspaceUi::new();
+        workspace.mux = Some(mux(
+            "primary",
+            vec![tab(
+                "primary",
+                vec![pane("pane", session)],
+                LayoutNode::Pane(target_pane.clone()),
+            )],
+            "pane",
+        ));
+        workspace.last_focused_pane = Some(target_pane.clone());
+        workspace.pending_focus = Some(target_pane.clone());
+        workspace.sessions.entry(session).or_default().snapshot = Some(snapshot("ready"));
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, state: &mut (WorkspaceUi, String, bool)| {
+                let _ = egui::Modal::new(super::super::file_tree::file_tree_create_modal_id())
+                    .show(ui.ctx(), |ui| {
+                        let name = ui.text_edit_singleline(&mut state.1);
+                        if state.2 {
+                            name.request_focus();
+                            state.2 = false;
+                        }
+                        let _ = ui.button("Create");
+                    });
+                state.0.show_with_input(ui, &config, &[], &catalog, true);
+            },
+            (workspace, String::new(), true),
+        );
+        harness.run();
+        assert_eq!(harness.state().0.pending_focus, Some(target_pane));
+        drain_protocol(&mut harness.state_mut().0);
+        harness.key_press(egui::Key::Tab);
+        harness.step();
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::Text("x".into()));
+        harness.step();
+        assert!(written_bytes(drain_protocol(&mut harness.state_mut().0)).is_empty());
     }
 
     // PR-3: SessionRestored(앱 재시작 후 열람 전용 복원)와 SessionExited(실제 종료)가

@@ -1,3 +1,14 @@
+## 2026-09-24 네 PR 최종 코드 리뷰와 새 탭 여백 기능 대기
+
+- Current objective: 분리된 네 draft PR의 최종 테스트·리뷰를 마치고, cmux 새 surface 흐름을 참고해 Deppy의 상단 pane 탭 여백을 누르면 현재 워크스페이스에 셸 세션이 바로 열리도록 별도 PR을 만든다. 사용자 허락 없이 앱 재실행 금지.
+- Completed work: PR1 캐시 회수 수정 위로 PR2→PR3→PR4를 재기반했다. 누적 열 번째 `codex review --base fix/environment-api-context-integration`에서 추가 actionable finding이 없었다. 기존 네 PR의 소스 코드는 확정됐고 PR4 handoff 커밋/푸시만 남았다.
+- Modified files: PR1 session/runtime/workspace, PR2 file tree/workspace, PR3 app/file tree/workspace/locales, PR4 file tree/workspace/locales; 이 worktree의 추가 미커밋 변경은 이 handoff 문서뿐이다.
+- Key design decisions: `Fold` 타입어헤드는 폴더 행만 선택해 화면에 보이게 하며 폴더를 열지 않는다. 파일 검색은 Unix handle-relative 순회를 사용한다. 생성 모달은 파일 드롭도 가린다. 다음 기능은 현재 pane 헤더 탭 뒤의 빈 영역에서 기존 `SpawnShellAt { cwd: None }` 경로로 새 셸을 연다.
+- Tests actually run: PR1 runtime lib 309 passed, session 79 passed(이전 단계). 최종 PR4 스택의 `folder_typeahead` 4 passed, `file_tree_search` 9 passed, `kittest_생성_모달` 4 passed. `cargo clippy -p deppy-sijo -p session -p runtime --all-targets --locked -- -D warnings`, `cargo fmt --all -- --check`, `git diff --check` exit 0. 넓은 `cargo test ... file_tree` 필터는 188 passed/4 failed(exit 101); 네 실패는 기존 부모 브랜치에서 재현된 UI 라벨/헤더 기대값이다. 이번 재기반 스택의 release 빌드와 패키징은 아직 실행 전이다.
+- Failed approaches: 넓은 `file_tree` 필터는 이 변경과 무관한 기존 실패 4개까지 포함하므로 기능별 필터로 다시 검증했다.
+- Remaining work: PR4 문서 커밋/푸시; 별도 branch에서 빈 탭 클릭 기능 구현·회귀 테스트·코드 리뷰; 최종 스택 release 빌드/패키징; PR 생성 및 handoff 갱신. 앱 재실행 금지.
+- Exact next commands: `cd /private/tmp/deppy-file-tree-create-modal-20260924`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git add docs/CODEX_HANDOFF.md`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git commit -m 'Document final stacked review and next tab feature'`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git push --force-with-lease origin feat/file-tree-create-modal`.
+
 ## 2026-09-24 PR1 최종 리뷰 후 보이는 복원 화면 우선 보존
 
 - Current objective: 전역 메모리 예산 초과 시 숨겨진 스크롤백을 먼저 회수해 현재 보이는 SSH 복원 화면을 불필요하게 잃지 않는다. 사용자 허락 없이 앱 재실행 금지.
@@ -19,6 +30,17 @@
 - Failed approaches: 현재 프레임의 `response.has_focus()`만 확인하면 Escape 이후 포커스가 이미 사라져 검색을 닫지 못했다. 테스트에서 `harness.key_press`는 press/release를 여러 프레임에 걸쳐 실행해 닫힌 다음 프레임의 신호를 검사하게 되어, 명시적 Key press 이벤트로 한 프레임을 검증했다.
 - Remaining work: PR3 commit/push, PR4 rebase/push, 최종 스택 테스트·코드 리뷰·release 재빌드와 handoff 갱신. 앱 재실행 금지.
 - Exact next commands: `cd /private/tmp/deppy-file-tree-search-20260924`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git add crates/app/src/ui/file_tree.rs docs/CODEX_HANDOFF.md`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git commit -m 'Close file search after Escape clears focus'`.
+
+## 2026-09-24 네 PR 최종 재기반·재빌드 후 리뷰 대기
+
+- Current objective: SSH 셸 마지막 화면 보존, `Fold` 폴더 행 선택·스크롤(폴더를 열지 않음), 파일 검색, 새 파일/폴더 모달을 각각 draft PR로 완료하고 최종 코드 리뷰한다. 사용자 허락 없이 앱 재실행 금지.
+- Completed work: PR #191 `fix/ssh-screen-stays-visible`에서 셸 즉시 종료/한글 wide 셀 경계를 포함한 리뷰 수정 완료. PR #192 `feat/file-tree-typeahead`, #193 `feat/file-tree-search`, #194 `feat/file-tree-create-modal`을 차례로 rebase했다. 최종 스택의 release 앱과 ZIP을 재생성하고 서명/패키지 검증을 통과했다. 앱은 실행하지 않았다.
+- Modified files: PR1 `crates/session/src/session.rs`, `crates/runtime/src/in_process.rs`, `crates/app/src/ui/workspace.rs`, 프로젝트 규칙/계획; PR2 `crates/app/src/ui/file_tree.rs`, workspace; PR3 app host/search UI/workspace 및 5개 locale; PR4 file tree/modal/workspace 및 5개 locale. 현재 추가 변경은 `docs/CODEX_HANDOFF.md`뿐이다.
+- Key design decisions: 보존한 셸 화면은 첫 입력/스크롤 또는 셸 종료 시 해제하고 캐시 예산에 포함한다. 축소 시 하단 행과 유효한 wide 셀 경계를 보존한다. 파일 검색은 Unix handle-relative 순회로 루트 밖 symlink를 따르지 않으며 non-Unix에서는 명시적으로 실패한다. 생성 모달은 터미널 입력·클립보드·Finder 파일 드롭을 가린다.
+- Tests actually run: PR1 최종 `cargo test -p session --locked` 79 passed; `cargo test -p runtime --lib --locked -- --test-threads=1` 308 passed. 최종 PR4 스택에서 host 파일 검색 9 passed, 폴더 타입어헤드 4 passed(화면 밖 `Fold` UI 포함), 생성 모달 4 passed, 검색 결과→트리 UI 1 passed, zero-scroll 전환 1 passed. `cargo clippy -p deppy-sijo -p session -p runtime --all-targets --locked -- -D warnings`, `cargo fmt --all -- --check`, base부터 `git diff --check` exit 0. 바로 전 스택에서 `cargo run --locked -p xtask -- i18n-check` 1227 키/5 locales 통과; 그 뒤 로케일 변경 없음. 최종 `cargo build --release -p deppy-sijo -p mcp-proxy --locked` 및 `scripts/package-macos.sh` exit 0, Developer ID 서명과 bundle/ZIP 검증 성공.
+- Failed approaches: 병렬 runtime 전체 실행에서 자원 경합 관련 3건 실패했고 단일 스레드 재실행에서 모두 통과했다. 누적 코드 리뷰가 보존 화면 캐시 계상, 링크 이름 검색, 셸 종료 출력, wide 셀 잘림을 찾아 각각 회귀 테스트 RED→GREEN으로 수정했다.
+- Remaining work: 진행 중인 여덟 번째 `codex review --base fix/environment-api-context-integration` 결과 확인, 필요한 수정/재검증 후 PR4 handoff commit/push 및 PR 상태 확인. 앱 재실행 금지.
+- Exact next commands: `tail -n 100 /private/tmp/deppy-stack-final-eighth-review-20260924.log`; `cd /private/tmp/deppy-file-tree-create-modal-20260924`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git status --short --branch`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`.
 
 ## 2026-09-24 PR1 최종 리뷰 후 셸 종료·한글 셀 경계
 
@@ -53,6 +75,28 @@
 - Remaining work: 최신 format/Clippy 확인 후 PR3 commit/push, PR4 rebase, 최종 통합 검증·리뷰·release 재빌드.
 - Exact next commands: `cd /private/tmp/deppy-file-tree-search-20260924`; `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo clippy -p deppy-sijo --all-targets --locked -- -D warnings`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`.
 
+## 2026-09-24 PR4 누적 리뷰 후 생성 모달 뒤 파일 드롭 차단
+
+- Current objective: 생성 모달이 열린 동안 Finder 파일 드롭이 트리 뒤에서 복사를 실행하지 않게 하고 네 PR을 재검증·재빌드한다. 사용자 허락 없이 앱 재실행 금지.
+- Completed work: `create_modal_open` 동안 OS 드롭 하이라이트와 복사 intent, 트리 내부 move intent를 막았다. 실제 egui dropped_files 회귀 테스트를 추가했다.
+- Modified files: `crates/app/src/ui/file_tree.rs`, `docs/CODEX_HANDOFF.md`.
+- Key design decisions: 생성 모달의 입력 소유권은 클립보드뿐 아니라 raw OS 드롭에도 적용한다. 모달을 닫으면 기존 트리 드롭 경로가 그대로 동작한다.
+- Tests actually run: 새 Finder 드롭 회귀 수정 전 RED, 수정 후 1 passed. 이전에 실행한 클립보드 모달 3 passed와 검색·타입어헤드 테스트는 PR1·PR3 새 수정 위로 rebase한 후 다시 실행해야 한다.
+- Failed approaches: egui 모달 레이어만으로는 raw `dropped_files` 이벤트를 차단하지 못했다.
+- Remaining work: PR1·PR3 commit/push 후 PR2→PR3→PR4 rebase, 통합 검증·최종 리뷰·release 재빌드.
+- Exact next commands: `cd /private/tmp/deppy-file-tree-create-modal-20260924`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git status --short --branch`.
+
+## 2026-09-24 PR3 리뷰 수정 반영 후 네 PR 재검증
+
+- Current objective: 네 개의 stacked draft PR을 최종 코드 리뷰하고, macOS 앱을 재빌드·패키징까지만 한다. 명시적 허락 없이 앱 재실행 금지.
+- Completed work: PR3 `a4f8e675`를 #193에 push하고 PR4를 그 위로 rebase해 `331169cb`를 #194에 force-with-lease로 push했다. 최종 스택의 release 앱/ZIP을 다시 생성하고 서명·패키지 검증을 통과했다. 앱을 실행하지 않았다.
+- Modified files: PR3의 `crates/app/src/app.rs`, `crates/app/src/ui/file_tree.rs`와 PR4의 handoff `docs/CODEX_HANDOFF.md`. PR1·PR2 소스는 변경 없음.
+- Key design decisions: 검색 UI는 실제 검색 컨트롤 포커스가 있을 때만 터미널 입력을 보류한다. 검색 중 휴지통 실패 확인을 표시한다. macOS는 Unix handle-relative 검색을 사용하며 non-Unix는 안전한 순회 구현 전까지 검색을 거절한다.
+- Tests actually run: 재기반 후 macOS host 검색 7 passed, 검색 결과·검색 중 삭제 확인·Fold 행 선택 kittest 각 1 passed, 생성 모달 3 passed, 검색/모달 Tab→PTY 차단 각 1 passed. `cargo clippy -p deppy-sijo -p session -p runtime --all-targets --locked -- -D warnings`, `cargo fmt --all -- --check`, base부터 `git diff --check` exit 0. `cargo build --release -p deppy-sijo -p mcp-proxy --locked` exit 0. `DEPPY_REQUIRE_TRUSTED_SIGNING=0 DEPPY_ALLOW_UNTRUSTED_SIGNING=1 sh scripts/package-macos.sh` exit 0, Developer ID 서명과 bundle/ZIP 검증 성공. 이전 스택의 session 74/runtime alt 1/i18n-check 1227키/5 locales는 PR3 수정 전에 실행했으며 관련 소스·로케일은 그 뒤 변경하지 않았다.
+- Failed approaches: 직전 누적 리뷰가 검색 포커스, 검색 중 영구삭제 확인, Windows directory-swap 경계 세 건을 찾았고 PR3에서 해결했다. 기존 전체 file-tree/workspace suite 실패는 부모에서도 재현된 상태다.
+- Remaining work: 실행 중인 다섯 번째 `codex review --base fix/environment-api-context-integration` 결과 확인, 발견 사항 있으면 수정/재검증/재빌드, 최종 handoff commit/push 및 PR 상태 확인.
+- Exact next commands: `tail -n 120 /private/tmp/deppy-stack-final-fifth-review-20260924.log`; `cd /private/tmp/deppy-file-tree-create-modal-20260924`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git status --short --branch`.
+
 ## 2026-09-24 PR3 누적 리뷰 후 검색 입력·삭제 확인·플랫폼 경계
 
 - Current objective: 파일 검색에서 검색 밖 포커스를 터미널에 돌려주고, 검색 중 휴지통 실패 확인을 보이며, 디렉터리 교체로 루트 밖을 순회하지 않게 한다. 앱 재실행 금지.
@@ -63,6 +107,17 @@
 - Failed approaches: 검색 화면이 보인다는 상태만으로 입력 차단을 결정해 검색 밖 포커스도 막았다. non-Unix 경로 기반 탐색은 교체 경쟁을 막을 수 없어 제거했다.
 - Remaining work: PR3 commit/push, PR4 rebase/push, 최종 통합 테스트·코드 리뷰·release 재빌드 및 handoff 갱신.
 - Exact next commands: `cd /private/tmp/deppy-file-tree-search-20260924`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git add crates/app/src/app.rs crates/app/src/ui/file_tree.rs docs/CODEX_HANDOFF.md`.
+
+## 2026-09-24 네 PR 재기반 후 통합 검증·재빌드
+
+- Current objective: SSH 복원, `Fold` 행 선택·스크롤, 파일 검색, 생성 모달의 분리된 PR 네 개를 최종 리뷰하고 재빌드한다. 앱 재실행은 사용자 허락 전까지 금지.
+- Completed work: PR1 `96a06d8e`, PR2 `61ac5433`, PR3 `86edbed9`, PR4 `aa20746b`로 스택을 다시 구성해 모두 push했다. release 빌드와 macOS 앱/ZIP 패키지 서명·구조 검증을 완료했다. 앱을 실행하지 않았다.
+- Modified files: PR별 변경은 각 커밋에 포함; 현재 추가 기록은 `docs/CODEX_HANDOFF.md`.
+- Key design decisions: 복원 화면은 첫 입력까지 원본 셀을 유지한다. `Fold` 키 탐색은 행을 선택하고 화면에 보이게 하며 폴더를 열지 않는다. 검색과 생성 모달은 각각 트리 뒤편의 터미널/클립보드 입력을 차단한다.
+- Tests actually run: 최종 스택에서 session 74 passed, runtime alt 복원 1 passed, host 파일 검색 7 passed, Fold kittest 1 passed, 검색 결과→트리 1 passed, 생성 모달 3 passed, 검색/모달의 Tab→PTY 차단 각 1 passed. `cargo clippy -p deppy-sijo -p session -p runtime --all-targets --locked -- -D warnings`, `cargo fmt --all -- --check`, `cargo run --locked -p xtask -- i18n-check`(1227 키/5 locales), `git diff --check fix/environment-api-context-integration...HEAD` 모두 exit 0. `cargo build --release -p deppy-sijo -p mcp-proxy --locked`와 `scripts/package-macos.sh` exit 0, bundle/ZIP 서명 검증 성공.
+- Failed approaches: 이전 PR 커밋을 새 PR2·PR3 위에 rebase할 때 중복 커밋은 건너뛰고 handoff 문서 충돌은 두 기록을 모두 보존했다. 전체 file-tree/workspace suite의 기존 실패는 부모 브랜치에서 별도로 재현된 상태다.
+- Remaining work: 실행 중인 `codex review --base fix/environment-api-context-integration` 결과 확인, 필요하면 해당 PR에 수정 후 스택·검증·빌드 갱신, 최종 handoff/PR 상태 기록.
+- Exact next commands: `tail -n 120 /private/tmp/deppy-stack-final-fourth-review-20260924.log`; `cd /private/tmp/deppy-file-tree-create-modal-20260924`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git status --short --branch`.
 
 ## 2026-09-24 PR1 최종 리뷰 후 화면 크기 왕복 복원
 
@@ -85,6 +140,32 @@
 - Failed approaches: 숨김 항목 필터를 탐색 카운터보다 먼저 처리해 상한을 우회했다.
 - Remaining work: 검색 집중 테스트와 format/diff 검사, PR2 rebase 후 PR3 rebase/commit/push, PR4 rebase, 최종 검증·빌드·리뷰.
 - Exact next commands: `cd /private/tmp/deppy-file-tree-search-20260924`; `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo test -p deppy-sijo --bin deppy-sijo --locked file_tree_search`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`.
+
+## 2026-09-24 PR4 최종 리뷰 후 모달 단축키 격리
+
+- Current objective: 파일·폴더 생성 모달이 열린 동안 트리의 클립보드 단축키를 막고, 네 개의 PR을 검증·재빌드·최종 리뷰한다. 사용자 허락 없이 앱 재실행 금지.
+- Completed work: 생성 모달이 열린 프레임에는 트리의 클립보드 shortcut handler를 호출하지 않는다. pointer가 트리 위이고 이름 입력 포커스가 없을 때의 붙여넣기 회귀 테스트를 추가했다.
+- Modified files: `crates/app/src/ui/file_tree.rs`, `docs/CODEX_HANDOFF.md`.
+- Key design decisions: 생성 편집 상태를 로컬로 꺼낸 직후 모달 표시 여부를 보존해, 모달 버튼으로 포커스가 옮겨가도 트리 뒤편의 ⌘C/⌘V가 처리되지 않게 한다.
+- Tests actually run: 회귀 테스트 첫 컴파일은 test trait import 누락으로 실패, 보정 후 수정 전 RED, 구현 후 1 passed. `cargo test -p deppy-sijo --bin deppy-sijo --locked kittest_생성_모달` 3 passed, `cargo fmt --all -- --check`와 `git diff --check` exit 0.
+- Failed approaches: `text_edit_focused()`만으로는 모달 버튼 포커스 상태를 가릴 수 없었다.
+- Remaining work: PR1·PR3 수정 사항을 PR2→PR3→PR4로 rebase, 집중 테스트/Clippy/최종 리뷰/재빌드/PR 갱신.
+- Exact next commands: `cd /private/tmp/deppy-file-tree-create-modal-20260924`; `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo test -p deppy-sijo --bin deppy-sijo --locked kittest_생성_모달`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`.
+
+## 2026-09-24 새 파일·폴더 생성 모달 PR4 진행
+
+- Second final review follow-up: 누적 재리뷰에서 SSH 고정 화면 축소의 하단 행 유실 1건과 파일 검색의 폴더 결과 누락·디렉터리 symlink 교체 경계 2건(P2)이 나왔다. PR1에 하단 행 보존 커밋 `39bbf9f8`, PR3에 폴더 이름 검색 및 Unix root fd/openat/fdopendir 기반 순회 커밋 `d3e2ec61`(rebase 전 `edcea21f`)을 넣었다. PR2는 새 PR1 위 `3a7541ba`, PR3는 새 PR2 위 `d3e2ec61`, PR4는 새 PR3 위 `955ff14e`로 rebase하고 해당 draft PR들을 force-with-lease로 갱신했다. PR4 rebase에서 과거 PR2의 동일 기능 커밋 `9757c7e6`이 다시 적용되어 충돌한 것은 이미 upstream의 새 PR2와 중복됨을 확인해 skip했다. 최종 HEAD에서 host 파일 검색 6 passed, 폴더 결과→트리 kittest 1 passed, 생성 모달 3 passed, Fold 행 typeahead 1 passed, session 73 passed, runtime alt-screen 복원 1 passed. 앱 재실행 금지.
+- Final stack review follow-up: 누적 코드 리뷰가 PR3 파일 검색 결과/버튼의 Tab 포커스에서 PTY 입력을 되찾는 P2를 발견했다. PR3 worktree에서 같은 프레임의 검색 소유권 신호와 workspace 입력/포커스 보류를 구현하고 커밋 `bfe3246f`를 #193에 push했다. PR4는 그 위에 rebase되어 HEAD `3ca6145d`가 되었다. rebase 중 파일 트리 ID 헬퍼와 workspace pending focus 가드 2곳의 충돌을 양쪽 조건 모두 보존해 해결했다. 기존 release/번들은 rebase 이전 HEAD 산출물이라 최종 재빌드가 필요하다. 앱 재실행 금지.
+- Current objective: 파일 트리의 좁은 인라인 생성 입력을 창 중앙 모달로 바꾸고, 생성 위치·이름·오류를 보여준다. 네 개의 분리된 PR을 완성한 뒤 전체 코드 리뷰와 재빌드까지 한다. 사용자의 명시적 허락 없이 앱 재실행 금지.
+- Completed work: PR3 `feat/file-tree-search` 커밋 `b8887b82`로 draft PR #193 생성 후 검색 포커스 수정 커밋 `bfe3246f`를 추가했다. 그 위 worktree `/private/tmp/deppy-file-tree-create-modal-20260924`, branch `feat/file-tree-create-modal` 생성. NewFile/NewFolder의 인라인 입력을 공통 `egui::Modal`로 교체했다. 이름 검증, Create/Cancel, Enter/Escape, 생성 위치, 생성 실패 메시지를 모달에 연결했다. 기존 IO 요청/실패 시 편집 복원 경로는 유지했다. 5개 로케일에 이름 오류 키를 추가했다. PR4는 #193 수정 위에 rebase되어 `3ca6145d`가 되고 draft PR #194를 갱신했다.
+- Modified files: `crates/app/src/ui/file_tree.rs`, `crates/app/src/ui/workspace.rs`, 5개 locale `messages.txt`, `docs/CODEX_HANDOFF.md`.
+- Key design decisions: 모달 너비는 창 content rect에 맞춰 최대 420px로 제한하며, 트리 행 너비와 무관하다. Rename은 기존 행 편집을 유지한다. 이름 검증 실패는 생성 버튼을 비활성화한다. 생성 요청은 기존 `edit_done` 처리로 전달한다.
+- Tests actually run: 모달 존재 테스트를 함수 부재로 컴파일 RED, 구현 후 1 passed. 버튼/잘못된 이름과 Enter/Escape 2 passed. 파일 패널→모달 통합 테스트 1 passed. 기존 `creation_review` 3 passed. review 수정 후 `생성_모달` 3 passed, Foreground layer 테스트 1 passed. PR3 검색 수정/rebase 후 PR4 HEAD에서 `file_search` 3 passed, `생성_모달` 3 passed, 검색 Tab→PTY 차단 1 passed, 검색 신호 만료 1 passed. `cargo run --locked -p xtask -- i18n-check` exit 0 (literal 1227/5 locales; locale 내용은 이후 변경되지 않음). 최신 PR4 HEAD의 `cargo clippy -p deppy-sijo --all-targets --locked -- -D warnings`, `cargo fmt --all -- --check`, `git diff --check` 모두 exit 0. 전체 `ui::workspace::tests`는 rebase 이전 269건 중 267 passed/2 failed. 두 실패는 PR3 부모 브랜치 고유 target에서 재현했다: `agent_info_line`의 `Awaiting instruction` vs `Idle`, `attached_without_snapshot`의 116 vs 80.
+- Review follow-up: `codex review --uncommitted`가 모달 이름 칸에서 Tab으로 버튼에 이동할 때 터미널이 키보드 입력을 되찾는 문제(P2)를 지적했다. 모달의 Foreground layer ID를 `is_blocking_terminal_window`에 추가하고, 모달이 보이는 동안 보류된 터미널 포커스 복구도 미뤘다. Foreground layer 단위 테스트 1 passed, 실제 workspace pane에서 Tab 이후 입력이 PTY에 가지 않고 pending focus가 유지되는 테스트 1 passed. 수정 후 `생성_모달` 필터 3 passed. 최신 Clippy는 진행 중이며 이후 누적 리뷰가 필요하다.
+- Failed approaches: `egui::Context::available_rect`는 이 프로젝트 egui 버전에 없어 `content_rect`로 변경했다. Enter 입력은 `TextEdit`가 포커스를 잃기 때문에 `has_focus`가 아니라 `lost_focus`와 Key::Enter를 같이 확인한다. Tab 통합 테스트 작성 중 포괄적 patch가 다른 harness의 tuple 타입을 바꾸어 컴파일 오류가 났고 정확한 두 위치만 수정했다. 테스트 버튼의 미사용 Response warning도 `let _ =`로 해결했다.
+- Build/package: rebase 전 `cargo build --release -p deppy-sijo -p mcp-proxy --locked` exit 0 (55.39s). rebase 후 최종 HEAD로 `DEPPY_REQUIRE_TRUSTED_SIGNING=0 DEPPY_ALLOW_UNTRUSTED_SIGNING=1 sh scripts/package-macos.sh`를 다시 실행해 exit 0. Developer ID Application 인증서로 앱/중첩 바이너리 서명, 앱 번들·추출 ZIP의 구조/서명 검증 통과. 이 로컬 개발 번들은 공증 제출/검증하지 않았다. 산출물: `/private/tmp/deppy-file-tree-create-modal-20260924/target/bundle/Deppy Sijo.app`, 같은 디렉터리의 `Deppy Sijo.zip`. 앱 실행은 하지 않았다.
+- Remaining work: rebase 후 `codex review --base fix/environment-api-context-integration` 누적 재리뷰가 진행 중이다. 지적 사항 수정·재검증, 인계 업데이트 커밋·push. 앱 재실행 금지.
+- Exact next commands: `cd /private/tmp/deppy-file-tree-create-modal-20260924`; `tail -n 80 /private/tmp/deppy-stack-final-review-20260924.log`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git status --short`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`.
 
 ## 2026-09-24 파일 검색 PR3 진행
 

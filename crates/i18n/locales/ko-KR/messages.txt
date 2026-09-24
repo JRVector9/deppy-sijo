@@ -850,6 +850,7 @@ file_tree.set_project_path = 프로젝트 경로를 설정하세요
 file_tree.edit_workspace_path_hint = 환경 메뉴 › 프로젝트 폴더에서 지정
 file_tree.new_folder_label = 새 폴더:
 file_tree.location = 위치: {path}
+file_tree.invalid_name = 슬래시가 없는 이름을 입력하세요. .과 ..은 사용할 수 없습니다.
 file_tree.new_folder = 새 폴더
 file_tree.new_file = 새 파일
 file_tree.search_files = 파일 검색

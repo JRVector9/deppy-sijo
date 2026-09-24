@@ -3332,73 +3332,23 @@ impl FileTreeUi {
             return action;
         }
 
-        // 인라인 편집 상태를 로컬로 꺼낸다 (flat 순회와 동시 &mut 회피, FT-3)
+        // 편집 상태를 로컬로 꺼낸다 (flat 순회와 동시 &mut 회피, FT-3)
         let mut edit = self.edit.take();
+        let create_modal_open = matches!(
+            edit.as_ref(),
+            Some(EditState::NewFile { .. } | EditState::NewFolder { .. })
+        );
         let mut edit_done: Option<bool> = None; // Some(true)=커밋, Some(false)=취소
         let mut menu_action: Option<MenuAction> = None;
 
-        // 새 폴더 인라인 편집기 (헤더 아래 고정 행 — 가상화 행높이를 흔들지 않는다)
-        if let Some(EditState::NewFolder {
-            parent,
-            buffer,
-            focus,
-        }) = &mut edit
+        if let Some(edit_state) = edit.as_mut()
+            && matches!(
+                edit_state,
+                EditState::NewFile { .. } | EditState::NewFolder { .. }
+            )
         {
-            ui.horizontal(|ui| {
-                ui.label(catalog.t("file_tree.new_folder_label", &[]));
-                let resp = ui.add(
-                    egui::TextEdit::singleline(buffer)
-                        .hint_text(catalog.t("common.name", &[]))
-                        .desired_width(120.0),
-                );
-                if *focus {
-                    resp.request_focus(); // §9-8 — 키가 터미널로 새지 않게 즉시 포커스
-                    *focus = false;
-                }
-                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if ui.small_button(catalog.t("action.new", &[])).clicked() || enter {
-                    edit_done = Some(true);
-                } else if ui.small_button(catalog.t("action.cancel", &[])).clicked()
-                    || ui.input(|i| i.key_pressed(egui::Key::Escape))
-                {
-                    edit_done = Some(false);
-                }
-            });
-            ui.weak(catalog.t(
-                "file_tree.location",
-                &[("path", &super::path_display(parent))],
-            ));
-        }
-        if let Some(EditState::NewFile {
-            parent,
-            buffer,
-            focus,
-        }) = &mut edit
-        {
-            ui.horizontal(|ui| {
-                ui.label(catalog.t("file_tree.new_file_label", &[]));
-                let resp = ui.add(
-                    egui::TextEdit::singleline(buffer)
-                        .hint_text(catalog.t("common.name", &[]))
-                        .desired_width(150.0),
-                );
-                if *focus {
-                    resp.request_focus();
-                    *focus = false;
-                }
-                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if ui.small_button(catalog.t("action.new", &[])).clicked() || enter {
-                    edit_done = Some(true);
-                } else if ui.small_button(catalog.t("action.cancel", &[])).clicked()
-                    || ui.input(|i| i.key_pressed(egui::Key::Escape))
-                {
-                    edit_done = Some(false);
-                }
-            });
-            ui.weak(catalog.t(
-                "file_tree.location",
-                &[("path", &super::path_display(parent))],
-            ));
+            edit_done =
+                render_file_tree_create_modal(ui.ctx(), edit_state, catalog, self.error.as_deref());
         }
 
         // 헤더 우클릭도 더보기와 같은 생성 위치를 사용한다.
@@ -3647,7 +3597,8 @@ impl FileTreeUi {
                     }
                     // Finder 드래그 대상: 폴더 행 하이라이트 + 드롭 대상 기록 (§과제①).
                     // 드래그 중엔 egui 포인터가 멎으므로 drag_pos(AppKit 위치)로 판정한다.
-                    if !inaccessible
+                    if !create_modal_open
+                        && !inaccessible
                         && let Some(pos) = drag_pos
                         && tree_area_owns_os_drop(hover_rect, pos)
                     {
@@ -3999,7 +3950,7 @@ impl FileTreeUi {
                 Err(code) => self.reject_io(code),
             }
         }
-        if let Some((src, dst_dir)) = drop_action {
+        if !create_modal_open && let Some((src, dst_dir)) = drop_action {
             self.start_move(src, dst_dir);
         }
 
@@ -4028,7 +3979,10 @@ impl FileTreeUi {
             tree_row_pitch(row_height, ui.spacing()),
         );
         let tree_area = header_rect.union(scroll_output.inner_rect);
-        if os_drag_active && drag_pos.is_some_and(|pos| tree_area_owns_os_drop(tree_area, pos)) {
+        if !create_modal_open
+            && os_drag_active
+            && drag_pos.is_some_and(|pos| tree_area_owns_os_drop(tree_area, pos))
+        {
             if !drag_row_highlighted {
                 // 행 위가 아니면 루트 반입 — 외곽선 대신 면으로 덮는다(2026-08-10 사용자:
                 // 외곽 테두리 제거). 폴더 행 강조와 같은 언어라 "이 영역이 받는다"로 읽힌다.
@@ -4042,14 +3996,17 @@ impl FileTreeUi {
             // 포인터를 따라온다. hovered_files가 비면 요청도 즉시 끝나며 timer는 남지 않는다.
             ui.ctx().request_repaint();
         }
-        if !os_dropped.is_empty()
+        if !create_modal_open
+            && !os_dropped.is_empty()
             && drag_pos.is_some_and(|pos| tree_area_owns_os_drop(tree_area, pos))
             && let Some(root) = self.root.clone()
         {
             let dst_dir = drop_target_dir.unwrap_or(root);
             self.start_copy_into(os_dropped, dst_dir);
         }
-        self.handle_clipboard_shortcuts(ui, tree_area, hover_target_dir, hover_row_path);
+        if !create_modal_open {
+            self.handle_clipboard_shortcuts(ui, tree_area, hover_target_dir, hover_row_path);
+        }
 
         // 인라인 편집은 검증 후 native mutation intent만 만든다. 실패 completion이면
         // PendingFileTreeIo가 보관한 편집 snapshot을 복원한다.
@@ -5163,6 +5120,10 @@ pub(super) fn file_tree_search_keyboard_active(ctx: &egui::Context) -> bool {
         == Some(ctx.cumulative_frame_nr())
 }
 
+pub(super) fn file_tree_create_modal_id() -> egui::Id {
+    egui::Id::new("file_tree_create_modal")
+}
+
 fn tree_typeahead_text_events(events: &[egui::Event]) -> Vec<String> {
     // macOS 입력기는 확정 문자를 Commit만 보낼 수도, 같은 Text와 함께 보낼 수도
     // 있다. 같은 프레임의 동일 Text 하나만 제외하고 Commit을 한 번 처리한다.
@@ -5337,6 +5298,79 @@ fn validate_name(name: &str) -> Result<String, String> {
         return Err("사용할 수 없는 이름입니다".to_owned());
     }
     Ok(name.to_owned())
+}
+
+/// 새 파일과 폴더는 좁은 트리 행 대신 창 중앙에서 이름과 생성 위치를 확인한다.
+/// 실제 생성 요청과 실패 시 편집 복원은 기존 `edit_done` 처리 경로를 공유한다.
+fn render_file_tree_create_modal(
+    ctx: &egui::Context,
+    edit: &mut EditState,
+    catalog: &i18n::Catalog,
+    error: Option<&str>,
+) -> Option<bool> {
+    let (parent, buffer, focus, title) = match edit {
+        EditState::NewFile {
+            parent,
+            buffer,
+            focus,
+        } => (parent, buffer, focus, "file_tree.new_file"),
+        EditState::NewFolder {
+            parent,
+            buffer,
+            focus,
+        } => (parent, buffer, focus, "file_tree.new_folder"),
+        EditState::Rename { .. } => return None,
+    };
+    let mut outcome = None;
+    let modal = egui::Modal::new(file_tree_create_modal_id()).show(ctx, |ui| {
+        let width = (ctx.content_rect().width() - 48.0).clamp(240.0, 420.0);
+        ui.set_width(width);
+        ui.heading(catalog.t(title, &[]));
+        ui.label(catalog.t(
+            "file_tree.location",
+            &[("path", &super::path_display(parent))],
+        ));
+        ui.add_space(8.0);
+        ui.label(catalog.t("common.name", &[]));
+        let name = ui.add(
+            egui::TextEdit::singleline(buffer)
+                .desired_width(width)
+                .id(ui.id().with("file_tree_create_name")),
+        );
+        if *focus {
+            name.request_focus();
+            *focus = false;
+        }
+        let valid = validate_name(buffer).is_ok();
+        if !buffer.is_empty() && !valid {
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                catalog.t("file_tree.invalid_name", &[]),
+            );
+        }
+        if let Some(error) = error {
+            ui.colored_label(ui.visuals().error_fg_color, error);
+        }
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(valid, egui::Button::new(catalog.t("action.new", &[])))
+                .clicked()
+            {
+                outcome = Some(true);
+            }
+            if ui.button(catalog.t("action.cancel", &[])).clicked() {
+                outcome = Some(false);
+            }
+        });
+        if valid && name.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+            outcome = Some(true);
+        }
+    });
+    if outcome.is_none() && modal.should_close() {
+        outcome = Some(false);
+    }
+    outcome
 }
 
 fn prepare_rename_request(
@@ -8605,6 +8639,141 @@ fn reread(base: &Path, old: &[TreeNode]) -> std::io::Result<Vec<TreeNode>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kittest_새폴더_입력은_별도_모달에_표시된다() {
+        use egui_kittest::kittest::Queryable as _;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, edit: &mut EditState| {
+                let _ = render_file_tree_create_modal(ui.ctx(), edit, &catalog, None);
+            },
+            EditState::NewFolder {
+                parent: PathBuf::from("/project/folder"),
+                buffer: String::new(),
+                focus: true,
+            },
+        );
+        harness.run();
+        assert!(harness.query_by_label("New folder").is_some());
+        assert!(
+            harness
+                .query_by_label("Location: /project/folder")
+                .is_some()
+        );
+        harness
+            .get_by_role(egui::accesskit::Role::TextInput)
+            .type_text("Fold");
+        harness.step();
+        assert!(matches!(
+            harness.state(),
+            EditState::NewFolder { buffer, .. } if buffer == "Fold"
+        ));
+    }
+
+    #[test]
+    fn kittest_생성_모달은_잘못된_이름을_막고_생성과_취소를_구분한다() {
+        use egui_kittest::kittest::Queryable as _;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, state: &mut (EditState, Option<bool>)| {
+                if let Some(outcome) =
+                    render_file_tree_create_modal(ui.ctx(), &mut state.0, &catalog, None)
+                {
+                    state.1 = Some(outcome);
+                }
+            },
+            (
+                EditState::NewFile {
+                    parent: PathBuf::from("/project"),
+                    buffer: "../invalid".to_owned(),
+                    focus: true,
+                },
+                None,
+            ),
+        );
+        harness.run();
+        assert!(harness.query_by_label("New file").is_some());
+        assert!(
+            harness
+                .query_by_label("Enter a name without slashes; . and .. are not allowed.")
+                .is_some()
+        );
+        harness.get_by_label("New").click();
+        harness.step();
+        assert_eq!(harness.state().1, None);
+
+        if let EditState::NewFile { buffer, .. } = &mut harness.state_mut().0 {
+            *buffer = "notes.md".to_owned();
+        }
+        harness.step();
+        harness.get_by_label("New").click();
+        harness.step();
+        assert_eq!(harness.state().1, Some(true));
+
+        harness.state_mut().1 = None;
+        harness.get_by_label("Cancel").click();
+        harness.step();
+        assert_eq!(harness.state().1, Some(false));
+    }
+
+    #[test]
+    fn kittest_생성_모달은_enter로_확인하고_escape로_취소한다() {
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, state: &mut (EditState, Option<bool>)| {
+                if let Some(outcome) =
+                    render_file_tree_create_modal(ui.ctx(), &mut state.0, &catalog, None)
+                {
+                    state.1 = Some(outcome);
+                }
+            },
+            (
+                EditState::NewFolder {
+                    parent: PathBuf::from("/project"),
+                    buffer: "Fold".to_owned(),
+                    focus: true,
+                },
+                None,
+            ),
+        );
+        harness.run();
+        harness.key_press(egui::Key::Enter);
+        harness.step();
+        assert_eq!(harness.state().1, Some(true));
+
+        harness.state_mut().1 = None;
+        harness.key_press(egui::Key::Escape);
+        harness.step();
+        assert_eq!(harness.state().1, Some(false));
+    }
+
+    #[test]
+    fn kittest_파일_패널의_생성_편집은_모달로_연결된다() {
+        use egui_kittest::kittest::Queryable as _;
+
+        let root = temp_root("create-modal-panel").canonicalize().unwrap();
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.set_root(Some(root.clone()));
+        drain_listings(&mut tree);
+        tree.start_edit(EditState::NewFolder {
+            parent: root.clone(),
+            buffer: String::new(),
+            focus: true,
+        });
+        let mut harness = drop_harness(&catalog, tree);
+        harness.run();
+        harness.run();
+        assert!(harness.query_by_label("New folder").is_some());
+        assert!(
+            harness
+                .query_by_label(&format!("Location: {}", root.display()))
+                .is_some()
+        );
+    }
 
     #[test]
     fn folder_typeahead는_폴더만_선택하고_연속_입력과_반복을_처리한다() {
@@ -15231,6 +15400,49 @@ mod tests {
         std::fs::remove_dir_all(&src_home).unwrap();
     }
 
+    #[test]
+    fn kittest_생성_모달_뒤로_finder_파일을_드롭해도_복사하지_않는다() {
+        use egui_kittest::kittest::Queryable;
+
+        let base = temp_root("modal-os-drop").canonicalize().unwrap();
+        std::fs::create_dir(base.join("dropdir")).unwrap();
+        let source_home = temp_root("modal-os-drop-src");
+        let source = source_home.join("payload.txt");
+        std::fs::write(&source, b"drop").unwrap();
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.set_root(Some(base.clone()));
+        drain_listings(&mut tree);
+        let mut harness = drop_harness(&catalog, tree);
+        for _ in 0..200 {
+            harness.step();
+            if harness.query_by_label("dropdir").is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let row_pos = harness.get_by_label("dropdir").rect().center();
+        harness.state_mut().0.start_edit(EditState::NewFolder {
+            parent: base.clone(),
+            buffer: String::new(),
+            focus: false,
+        });
+        harness.step();
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::PointerMoved(row_pos));
+        harness
+            .input_mut()
+            .dropped_files
+            .push(crate::test_dropped_file::handle(source.clone()));
+        harness.step();
+        assert!(harness.state_mut().0.take_io_intent().is_none());
+        assert!(source.exists());
+        std::fs::remove_dir_all(base).unwrap();
+        std::fs::remove_dir_all(source_home).unwrap();
+    }
+
     /// 클립보드 ⌘V 붙여넣기(§과제②): 트리 빈 영역(hover 행 없음)에서는 루트로 복사되고,
     /// 트리가 신호를 소비했음을 App에 알린다(터미널 이중 처리 억제 배선).
     #[test]
@@ -15282,6 +15494,50 @@ mod tests {
             harness.state().0.error
         );
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn kittest_생성_모달이_열리면_트리_클립보드_단축키를_받지_않는다() {
+        use egui_kittest::kittest::Queryable;
+
+        let base = temp_root("modal-paste-guard").canonicalize().unwrap();
+        std::fs::write(base.join("seed.txt"), b"x").unwrap();
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.set_root(Some(base.clone()));
+        drain_listings(&mut tree);
+        let mut harness = drop_harness(&catalog, tree);
+        for _ in 0..200 {
+            harness.step();
+            if harness.query_by_label("seed.txt").is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        harness.state_mut().0.start_edit(EditState::NewFolder {
+            parent: base.clone(),
+            buffer: String::new(),
+            focus: false,
+        });
+        harness.step();
+        harness
+            .ctx
+            .memory_mut(|memory| memory.request_focus(tree_keyboard_focus_id()));
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::PointerMoved(egui::pos2(200.0, 400.0)));
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::Paste(String::new()));
+        harness.step();
+        assert!(harness.state_mut().0.take_io_intent().is_none());
+        assert_eq!(
+            harness.state_mut().0.take_clipboard_shortcut_consumption(),
+            (false, false)
+        );
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

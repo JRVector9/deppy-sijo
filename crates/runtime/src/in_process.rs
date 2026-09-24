@@ -4250,6 +4250,37 @@ impl Worker {
     fn trim_live_over_budget(&mut self, visible: &[SessionId]) -> bool {
         let budget = self.cache_budget_bytes;
         let mut trimmed_any = false;
+        // 보존된 이전 화면은 backend scrollback 밖의 셀 버퍼다. 먼저 안 보이는
+        // 세션의 큰 버퍼부터 해제하고, 그래도 부족할 때만 보이는 세션을 풀어
+        // 사용자가 보는 최신 화면을 라이브 backend로 전환한다.
+        let mut held_candidates: Vec<(SessionId, usize, bool)> = self
+            .sessions
+            .iter()
+            .filter_map(|(id, session)| {
+                let bytes = session.retained_viewport_bytes();
+                (bytes > 0).then_some((*id, bytes, visible.contains(id)))
+            })
+            .collect();
+        held_candidates
+            .sort_by_key(|(_, bytes, is_visible)| (*is_visible, std::cmp::Reverse(*bytes)));
+        let mut cache_bytes = self.terminal_cache_bytes();
+        for (id, bytes, was_visible) in held_candidates {
+            if cache_bytes <= budget {
+                break;
+            }
+            if let Some(session) = self.sessions.get_mut(&id)
+                && session.release_held_viewport()
+            {
+                cache_bytes = cache_bytes.saturating_sub(bytes);
+                trimmed_any = true;
+                tracing::warn!(
+                    session = id.0,
+                    retained_bytes = bytes,
+                    visible = was_visible,
+                    "전역 터미널 캐시 예산 초과 — 복원 화면 보관 셀 해제"
+                );
+            }
+        }
         // 트림을 못 하는(불변식이 깨진) 세션은 제외하고 다른 세션 계속 — 한 세션 때문에
         // 전체를 포기하지 않는다(리뷰 A-L1). 실무상 도달 불가하나 방어적.
         let mut cannot_trim: std::collections::HashSet<SessionId> =
@@ -5455,6 +5486,52 @@ mod tests {
                 "다음세션복원전에예산을맞춰야한다"
             );
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn 복원_화면_보관_셀이_예산을_넘으면_라이브_화면으로_돌아간다() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, _) = admission_worker(resolver, "held-viewport-budget");
+        let id = SessionId(88);
+        let mut session = Session::spawn_with_spec(
+            id,
+            session::SessionKind::Shell,
+            &spec("/bin/cat", &[]),
+            20,
+            6,
+            100,
+        )
+        .unwrap();
+        session
+            .replay_ansi(&mut b"REMOTE-SCREEN".as_slice())
+            .unwrap();
+        session.finish_ansi_replay().unwrap();
+        session
+            .replay_ansi(&mut b"\x1b[2J\x1b[HLIVE-PROMPT".as_slice())
+            .unwrap();
+        let held_bytes = session.retained_viewport_bytes();
+        assert!(held_bytes > 0);
+        worker.cache_budget_bytes = session
+            .cache_footprint()
+            .estimated_bytes
+            .saturating_sub(held_bytes / 2);
+        worker.insert_session(id, session);
+        let retained = worker.sessions.get_mut(&id).unwrap();
+        assert_eq!(retained.retained_viewport_bytes(), 0);
+        assert!(
+            retained
+                .take_snapshot()
+                .unwrap()
+                .visible_cells
+                .iter()
+                .map(|cell| cell.c)
+                .collect::<String>()
+                .contains("LIVE-PROMPT")
+        );
     }
 
     #[test]

@@ -747,8 +747,38 @@ impl Session {
         self.cache_class
     }
 
+    /// 복원 화면 snapshot이 backend 밖에서 소유한 셀 버퍼만 센다. 원본과 표시용이
+    /// 같은 Arc를 공유하는 동안에는 한 번만 계상한다.
+    pub fn retained_viewport_bytes(&self) -> usize {
+        let Some(held) = self.held_viewport.as_ref() else {
+            return 0;
+        };
+        let cell_size = std::mem::size_of::<TerminalCell>();
+        let original = held.original.visible_cells.len().saturating_mul(cell_size);
+        let display =
+            if std::sync::Arc::ptr_eq(&held.original.visible_cells, &held.display.visible_cells) {
+                0
+            } else {
+                held.display.visible_cells.len().saturating_mul(cell_size)
+            };
+        original.saturating_add(display)
+    }
+
+    /// 전역 캐시 압박 시 보존 화면을 해제하고 라이브 backend를 다시 발행한다.
+    pub fn release_held_viewport(&mut self) -> bool {
+        if self.held_viewport.take().is_none() {
+            return false;
+        }
+        self.mark_full_dirty();
+        true
+    }
+
     pub fn cache_footprint(&self) -> TerminalCacheFootprint {
-        self.backend.cache_footprint()
+        let mut footprint = self.backend.cache_footprint();
+        footprint.estimated_bytes = footprint
+            .estimated_bytes
+            .saturating_add(self.retained_viewport_bytes());
+        footprint
     }
 
     fn mark_dirty_rows(&mut self, rows: &[u16]) {
@@ -1459,6 +1489,39 @@ mod tests {
         let restored = session.take_snapshot().unwrap();
         assert_eq!(restored.visible_cells, original.visible_cells);
         assert_eq!(restored.cursor, original.cursor);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn 복원된_화면의_보관_셀은_캐시_예산에_포함된다() {
+        let spec = CommandSpec {
+            program: "/bin/cat".into(),
+            args: Vec::new(),
+            env: Vec::new(),
+            cwd: None,
+        };
+        let mut session =
+            Session::spawn_with_spec(SessionId(30), SessionKind::Shell, &spec, 20, 6, 100).unwrap();
+        session
+            .replay_ansi(&mut std::io::Cursor::new(b"REMOTE-SCREEN"))
+            .unwrap();
+        session.finish_ansi_replay().unwrap();
+        let held_bytes = session
+            .cache_footprint()
+            .estimated_bytes
+            .saturating_sub(session.backend.cache_footprint().estimated_bytes);
+        assert!(held_bytes >= 20 * 6 * std::mem::size_of::<TerminalCell>());
+        session.resize_checked(10, 3).unwrap();
+        let resized_held_bytes = session
+            .cache_footprint()
+            .estimated_bytes
+            .saturating_sub(session.backend.cache_footprint().estimated_bytes);
+        assert!(resized_held_bytes > held_bytes);
+        session.scroll(0);
+        assert_eq!(
+            session.cache_footprint().estimated_bytes,
+            session.backend.cache_footprint().estimated_bytes
+        );
     }
 
     #[test]

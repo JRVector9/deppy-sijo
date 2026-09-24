@@ -4506,3 +4506,13 @@
 - 실패 접근: 첫 `cargo fmt --all -- --check`에서 신규 테스트의 긴 `and_then` 한 줄만 포맷 차이로 실패했다. rustfmt 제안 모양으로 고친 뒤 최종 `cargo fmt --all -- --check`와 `git diff --check`가 모두 exit 0이다. 구현 가설 실패나 빌드 정지는 없었다.
 - 남은 작업: 확인된 두 리뷰 결함의 코드 수정과 집중 검증은 완료됐다. 커밋·push·release 빌드·앱 재실행·화면 검증은 이번 요청 범위가 아니며 수행하지 않았다.
 - 다음 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `cargo fmt --all -- --check`; `git diff --check`; `git diff -- crates/app/src/app.rs`; 사용자 요청이 있으면 이후 커밋 또는 재빌드·재실행을 진행한다.
+## 2026-09-24 PR1 누적 리뷰 후 복원 화면 캐시 예산
+
+- Current objective: 저장된 SSH 셸 화면을 유지하면서 보존 셀 메모리를 전역 터미널 캐시 예산에 포함하고, 예산 초과 시 회수한다. 사용자 허락 없이 앱 재실행 금지.
+- Completed work: `Session::cache_footprint`가 `HeldViewport`의 고유 셀 버퍼를 계상한다. runtime은 예산 초과 시 숨겨진 세션의 큰 보존 화면부터 해제하고, 필요하면 보이는 세션을 라이브 화면으로 전환한 뒤 scrollback을 줄인다.
+- Modified files: `crates/session/src/session.rs`, `crates/runtime/src/in_process.rs`, `docs/CODEX_HANDOFF.md`.
+- Key design decisions: 원본과 표시 snapshot이 같은 `Arc` 셀 배열을 공유하면 한 번만 계상한다. 보존 화면 해제는 전체 화면을 dirty로 표시해 다음 viewport를 발행한다.
+- Tests actually run: 새 session·runtime 회귀 테스트 각각 수정 전 RED, 수정 후 GREEN. `cargo test -p session --locked` 77 passed. `cargo test -p runtime --lib --locked` 병렬 실행에서는 큐 압박/자원 감시 관련 3건 실패, `cargo test -p runtime --lib --locked -- --test-threads=1`에서는 308 passed. `cargo clippy -p session -p runtime -p deppy-sijo --all-targets --locked -- -D warnings` passed. `cargo fmt --all` 적용.
+- Failed approaches: 병렬 전체 runtime 실행은 자원 경합으로 3건 실패했다. 단일 스레드 재실행에서 모두 통과했다.
+- Remaining work: PR1 diff/format 확인·commit/push, PR2·PR3·PR4 rebase, 최종 통합 검증·코드 리뷰·release 재빌드. 앱 재실행 금지.
+- Exact next commands: `cd /private/tmp/deppy-ssh-screen-visible-20260924`; `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo fmt --all -- --check`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git add crates/session/src/session.rs crates/runtime/src/in_process.rs docs/CODEX_HANDOFF.md`.

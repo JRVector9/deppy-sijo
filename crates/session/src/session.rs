@@ -370,6 +370,8 @@ impl Session {
                 self.lifecycle = SessionLifecycle::Exited {
                     exit_code: self.exit_code,
                 };
+                // 더는 입력으로 이전 화면을 해제할 수 없으므로 새 셸의 마지막 출력 표시.
+                self.release_held_viewport();
                 just_exited = true;
             }
         }
@@ -607,6 +609,17 @@ impl Session {
             cells[row * new_cols..row * new_cols + count].copy_from_slice(
                 &source.visible_cells[source_row * old_cols..source_row * old_cols + count],
             );
+            if count < old_cols && count > 0 {
+                let last = &mut cells[row * new_cols + count - 1];
+                if last.wide {
+                    // 오른쪽 spacer가 잘린 wide 글자는 렌더러에 넘기지 않는다.
+                    let bg = last.bg;
+                    *last = TerminalCell {
+                        bg,
+                        ..TerminalCell::default()
+                    };
+                }
+            }
         }
         let mut display = source.clone();
         display.cols = cols;
@@ -1464,6 +1477,69 @@ mod tests {
         assert!(rows[1].starts_with("ROW4"), "{rows:?}");
         assert!(rows[2].starts_with("PROMPT"), "{rows:?}");
         assert_eq!(resized.cursor.row, 2);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn 복원된_화면을_좁혀도_잘린_한글_셀을_남기지_않는다() {
+        let spec = CommandSpec {
+            program: "/bin/cat".into(),
+            args: Vec::new(),
+            env: Vec::new(),
+            cwd: None,
+        };
+        let mut session =
+            Session::spawn_with_spec(SessionId(31), SessionKind::Shell, &spec, 8, 6, 100).unwrap();
+        session
+            .replay_ansi(&mut std::io::Cursor::new("AB가".as_bytes()))
+            .unwrap();
+        session.finish_ansi_replay().unwrap();
+        let original = session.take_snapshot().unwrap();
+        assert!(original.visible_cells[2].wide);
+        assert!(original.visible_cells[3].wide_spacer);
+        session.resize_checked(3, 6).unwrap();
+        let narrow = session.take_snapshot().unwrap();
+        assert!(!narrow.visible_cells[2].wide);
+        assert!(!narrow.visible_cells[2].wide_spacer);
+        session.resize_checked(8, 6).unwrap();
+        assert_eq!(
+            session.take_snapshot().unwrap().visible_cells,
+            original.visible_cells
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn 복원_후_새_셸이_바로_종료되면_실패_출력을_보인다() {
+        let spec = CommandSpec {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "printf 'NEW-SHELL-FAILED\\n'; exit 17".into()],
+            env: Vec::new(),
+            cwd: None,
+        };
+        let mut session =
+            Session::spawn_with_spec(SessionId(32), SessionKind::Shell, &spec, 40, 6, 100).unwrap();
+        session
+            .replay_ansi(&mut std::io::Cursor::new(b"OLD-REMOTE-SCREEN"))
+            .unwrap();
+        session.finish_ansi_replay().unwrap();
+        wait(Duration::from_secs(5), || {
+            session.pump(|_| {}).just_exited.then_some(())
+        });
+        assert_eq!(
+            session.lifecycle(),
+            SessionLifecycle::Exited {
+                exit_code: Some(17)
+            }
+        );
+        let visible = session
+            .take_snapshot()
+            .unwrap()
+            .visible_cells
+            .iter()
+            .map(|cell| cell.c)
+            .collect::<String>();
+        assert!(visible.contains("NEW-SHELL-FAILED"), "{visible:?}");
     }
 
     #[test]

@@ -1,3 +1,14 @@
+## 2026-09-24 PR1 최종 리뷰 후 셸 종료·한글 셀 경계
+
+- Current objective: 복원된 원격 셸 화면을 유지하되 새 셸이 종료하면 마지막 출력을 보이고, 창 폭 축소가 한글 wide 셀을 잘라도 유효한 화면을 발행한다. 사용자 허락 없이 앱 재실행 금지.
+- Completed work: `pump` 최종 종료 시 보존 화면을 해제해 라이브 backend의 오류/종료 출력을 표시한다. 좁은 화면 복사에서 오른쪽 spacer를 잃는 wide 선행 셀을 배경색을 유지한 공백 셀로 바꾼다. 확대 시 원본 화면은 복원한다.
+- Modified files: `crates/session/src/session.rs`, `docs/CODEX_HANDOFF.md`.
+- Key design decisions: 새 셸 출력 draining과 종료 코드 관찰을 마친 뒤에만 보존 화면을 해제한다. 잘린 글자 한 셀만 공백으로 바꾸어 인접 셀 및 행 배경을 유지한다.
+- Tests actually run: 두 새 회귀 테스트 각각 수정 전 RED, 수정 후 GREEN. `cargo test -p session --locked` 79 passed. `cargo test -p runtime --lib --locked -- --test-threads=1` 308 passed. `cargo clippy -p session -p runtime -p deppy-sijo --all-targets --locked -- -D warnings`, `cargo fmt --all -- --check`, `git diff --check` exit 0.
+- Failed approaches: 기존 구현은 셸 종료 후에도 보존 화면을 붙잡았고, 원본 셀을 단순 slice해 wide 선행 셀만 남겼다.
+- Remaining work: PR1 commit/push, PR2·PR3·PR4 rebase, 최종 스택 재검증·리뷰·release 재빌드. 앱 재실행 금지.
+- Exact next commands: `cd /private/tmp/deppy-ssh-screen-visible-20260924`; `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo fmt --all -- --check`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git add crates/session/src/session.rs docs/CODEX_HANDOFF.md`.
+
 ## 2026-09-24 PR1 누적 리뷰 후 빈 화면·검색 이동
 
 - Current objective: 저장된 SSH 셸 화면이 실제로 비어 있으면 새 프롬프트를 보이고, 보존 화면에서 현재 위치의 검색 결과로 이동하면 라이브 화면으로 전환한다. 사용자 허락 없이 앱 재실행 금지.

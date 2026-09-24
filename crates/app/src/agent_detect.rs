@@ -46,7 +46,7 @@ const PROCESS_TIMEOUT: Duration = Duration::from_secs(3);
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const PIPE_READER_STACK_BYTES: usize = 128 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AgentKind {
     Claude,
     Codex,
@@ -478,6 +478,8 @@ pub fn detect_cached(
             .map(|(sid, _)| (*sid, cache.entries[sid].binding.clone()))
             .collect();
         let kinds = kinds_from_cache(sessions, cache);
+        let mut bindings = bindings;
+        remove_ambiguous_heuristic_bindings(&mut bindings, cache);
         return DetectedAgents { bindings, kinds };
     }
     // 여기 도달하면 이번 tick은 전체 탐색이다 — 안전망 시각을 갱신한다.
@@ -589,9 +591,43 @@ pub fn detect_cached(
     // 더는 존재하지 않는 세션의 캐시 항목 정리(누수 방지).
     let alive: HashSet<SessionId> = sessions.iter().map(|(s, _)| *s).collect();
     cache.entries.retain(|sid, _| alive.contains(sid));
+    remove_ambiguous_heuristic_bindings(&mut out, cache);
     DetectedAgents {
         bindings: out,
         kinds,
+    }
+}
+
+/// cwd 기반 탐지가 같은 native 대화를 둘 이상의 PTY에 붙인 경우에는 그 추정값을
+/// 화면·저장 경로로 내보내지 않는다. argv/hook/lsof로 확인된 세션은 그대로 유지한다.
+fn remove_ambiguous_heuristic_bindings(
+    bindings: &mut HashMap<SessionId, AgentBinding>,
+    cache: &BindingCache,
+) {
+    let mut owners: HashMap<(AgentKind, String), Vec<SessionId>> = HashMap::new();
+    for (session, binding) in bindings.iter() {
+        owners
+            .entry((binding.kind, binding.session_id.clone()))
+            .or_default()
+            .push(*session);
+    }
+    for sessions in owners.values().filter(|sessions| sessions.len() > 1) {
+        let has_confirmed = sessions.iter().any(|session| {
+            cache
+                .entries
+                .get(session)
+                .is_some_and(|entry| entry.deterministic)
+        });
+        for session in sessions {
+            if !has_confirmed
+                || !cache
+                    .entries
+                    .get(session)
+                    .is_some_and(|entry| entry.deterministic)
+            {
+                bindings.remove(session);
+            }
+        }
     }
 }
 
@@ -2287,6 +2323,68 @@ mod tests {
             process_rows_untouched(&process_cache),
             "fast path에서 process_rows()가 호출됨"
         );
+    }
+
+    #[test]
+    fn 같은_transcript에_연결된_두_휴리스틱_세션은_둘_다_바인딩하지_않는다() {
+        let self_pid = std::process::id();
+        let Some(start) = crate::proc_info::pid_start_time(self_pid) else {
+            return;
+        };
+        let first = SessionId(1);
+        let second = SessionId(2);
+        let binding = test_binding("shared-transcript");
+        let mut first_entry = fresh_cache_entry(binding.clone(), self_pid, start);
+        first_entry.deterministic = false;
+        let mut second_entry = fresh_cache_entry(binding, self_pid, start);
+        second_entry.deterministic = false;
+        let mut cache = BindingCache {
+            entries: HashMap::from([(first, first_entry), (second, second_entry)]),
+            last_full_scan: Some(Instant::now()),
+        };
+        let mut process_cache = sentinel_process_cache();
+
+        let result = detect_cached(
+            &[(first, self_pid), (second, self_pid)],
+            &HashMap::new(),
+            &mut cache,
+            &mut process_cache,
+        );
+
+        assert!(
+            result.bindings.is_empty(),
+            "두 PTY가 같은 대화를 표시하면 안 된다"
+        );
+        assert_eq!(result.kinds.len(), 2, "실행 중인 에이전트 종류는 유지한다");
+    }
+
+    #[test]
+    fn 결정적_바인딩과_충돌한_휴리스틱만_제거한다() {
+        let self_pid = std::process::id();
+        let Some(start) = crate::proc_info::pid_start_time(self_pid) else {
+            return;
+        };
+        let first = SessionId(1);
+        let second = SessionId(2);
+        let binding = test_binding("shared-transcript");
+        let confirmed = fresh_cache_entry(binding.clone(), self_pid, start);
+        let mut heuristic = fresh_cache_entry(binding.clone(), self_pid, start);
+        heuristic.deterministic = false;
+        let mut cache = BindingCache {
+            entries: HashMap::from([(first, confirmed), (second, heuristic)]),
+            last_full_scan: Some(Instant::now()),
+        };
+        let mut process_cache = sentinel_process_cache();
+
+        let result = detect_cached(
+            &[(first, self_pid), (second, self_pid)],
+            &HashMap::new(),
+            &mut cache,
+            &mut process_cache,
+        );
+
+        assert_eq!(result.bindings.len(), 1);
+        assert_eq!(result.bindings.get(&first), Some(&binding));
     }
 
     /// 종류 tier도 같은 fast path를 탄다 — `detect_cached`가 채운 캐시를 읽기만 하고

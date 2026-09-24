@@ -7184,6 +7184,9 @@ struct WorkspaceRuntime {
     /// defaults does not retroactively mutate an existing shell environment, so programmatic
     /// resume may use WriteInput only while this exact session stamp is still current.
     session_dotenv_states: std::collections::HashMap<runtime::SessionId, DotenvState>,
+    /// 자동 이어가기 판단은 worker 수명에 속한다. 워크스페이스를 잠시 떠났다가 돌아와도
+    /// 실행 중이던 에이전트가 종료된 셸에 뒤늦게 명령을 넣지 않도록 보존한다.
+    resumed_panes: std::collections::HashSet<String>,
     /// Warm으로 내려간 시각. 일정 시간 이후 자동 Suspended(워커 shutdown)로 내린다.
     backgrounded_at: Option<std::time::Instant>,
     /// live 세션 추적 (suspend 보호 — 이벤트 스트림에서 갱신).
@@ -7769,6 +7772,16 @@ pub(crate) fn top_provider_usage(
 }
 
 impl WorkspaceRuntime {
+    fn mark_auto_resume_handled_for_session(&mut self, session: runtime::SessionId) {
+        if let Some(pane) = self
+            .workspace_ui
+            .mux()
+            .and_then(|mux| pane_of_session(mux, session))
+        {
+            self.resumed_panes.insert(pane.0);
+        }
+    }
+
     /// 아직 종료(Exited)되지 않은 세션이 pane에 하나라도 있으면 true — 셸이든
     /// 에이전트든 떠 있는 것 자체가 실행 중이다. 이런 workspace는 Suspended(워커
     /// shutdown = PTY kill)로 내리면 안 된다 (2026-07-05 사용자 요구: 진행 중인
@@ -9458,10 +9471,7 @@ pub struct App {
     /// `restore_agents`가 새 활성 워크스페이스로 다시 채워진 뒤에야 한다
     /// (`pending_resume_agent` 참고).
     global_resumable_panes: std::collections::HashSet<(String, String)>,
-    /// 이번 workspace 활성화에서 자동 resume 판단을 끝낸 pane. 명령을 보낸 경우뿐 아니라
-    /// 이미 에이전트/ssh 등 다른 작업이 있어 건너뛴 경우도 포함한다. 그래야 사용자가
-    /// 작업을 종료한 뒤 뒤늦게 resume 명령이 주입되지 않는다.
-    resumed_panes: std::collections::HashSet<String>,
+    /// 비동기 transcript probe가 진행 중인 pane.
     resume_probe_pending_panes: std::collections::HashSet<String>,
     /// 알림 클릭으로 다른 workspace 전환 후, mux 재구성되면 이동할 (workspace, session).
     pending_focus: Option<(String, u64, runtime::SessionId)>,
@@ -9966,11 +9976,15 @@ enum AutoResumeDecision {
 
 fn auto_resume_decision(
     already_handled: bool,
+    restored_shell: bool,
     agent_running: bool,
     live_process_count: Option<usize>,
 ) -> AutoResumeDecision {
     if already_handled {
         return AutoResumeDecision::Skip;
+    }
+    if !restored_shell {
+        return AutoResumeDecision::MarkHandled;
     }
     if agent_running {
         return AutoResumeDecision::MarkHandled;
@@ -9985,15 +9999,33 @@ fn auto_resume_decision(
 fn resume_probe_completion_allowed(
     manual: bool,
     already_handled: bool,
+    restored_shell: bool,
     agent_running: bool,
     live_process_count: Option<usize>,
 ) -> bool {
     if manual {
         !agent_running && live_process_count == Some(1)
     } else {
-        auto_resume_decision(already_handled, agent_running, live_process_count)
-            == AutoResumeDecision::Resume
+        auto_resume_decision(
+            already_handled,
+            restored_shell,
+            agent_running,
+            live_process_count,
+        ) == AutoResumeDecision::Resume
     }
+}
+
+fn saved_agent_identity_is_unique(
+    rows: &std::collections::HashMap<String, storage::AgentSessionRow>,
+    pane_id: &str,
+) -> bool {
+    rows.get(pane_id).is_some_and(|saved| {
+        !rows.values().any(|other| {
+            other.pane_id != saved.pane_id
+                && other.kind == saved.kind
+                && other.session_id == saved.session_id
+        })
+    })
 }
 
 fn read_connector_import_file(
@@ -14062,7 +14094,6 @@ impl App {
             restore_agents: std::collections::HashMap::new(),
             restore_loaded_for: None,
             global_resumable_panes: std::collections::HashSet::new(),
-            resumed_panes: std::collections::HashSet::new(),
             resume_probe_pending_panes: std::collections::HashSet::new(),
             pending_focus: None,
             pending_resume_agent: None,
@@ -14231,6 +14262,7 @@ impl App {
             input_pressure: None,
             session_input_pressure: std::collections::HashMap::new(),
             session_dotenv_states: std::collections::HashMap::new(),
+            resumed_panes: std::collections::HashSet::new(),
             backgrounded_at: None,
             live: LiveSessionTracker::default(),
             created: std::time::Instant::now(),
@@ -15383,7 +15415,6 @@ impl App {
                     self.agent_launcher_detection_requested = true;
                 }
                 self.restore_loaded_for = Some(self.active.id.clone());
-                self.resumed_panes.clear();
                 self.push_archived_resume_presentation();
             }
             crate::agent_state_worker::AgentStateSection::BindingSync => {
@@ -15547,7 +15578,9 @@ impl App {
                 .and_then(|usage| usage.pid.map(|_| usage.process_count));
             if !resume_probe_completion_allowed(
                 result.manual,
-                self.resumed_panes.contains(&result.pane_id),
+                self.active.resumed_panes.contains(&result.pane_id),
+                !self.active.live.session_kinds.contains_key(&result.session)
+                    && saved_agent_identity_is_unique(&self.restore_agents, &result.pane_id),
                 self.agent_bindings.contains_key(&result.session),
                 live_process_count,
             ) {
@@ -15576,7 +15609,7 @@ impl App {
                 })
                 .is_ok()
             {
-                self.resumed_panes.insert(result.pane_id.clone());
+                self.active.resumed_panes.insert(result.pane_id.clone());
             }
         }
     }
@@ -15628,7 +15661,6 @@ impl App {
                     {
                         self.restore_agents.remove(&identity.pane_id);
                         self.persisted_agents.remove(&identity.pane_id);
-                        self.resumed_panes.remove(&identity.pane_id);
                     }
                     if matches!(
                         &continuation.payload().kind,
@@ -16460,13 +16492,15 @@ impl App {
                     .find(|usage| usage.session == session)
                     .and_then(|usage| usage.pid.map(|_| usage.process_count));
                 match auto_resume_decision(
-                    self.resumed_panes.contains(&pane_key),
+                    self.active.resumed_panes.contains(&pane_key),
+                    !self.active.live.session_kinds.contains_key(&session)
+                        && saved_agent_identity_is_unique(&self.restore_agents, &pane_key),
                     bindings.contains_key(&session),
                     live_process_count,
                 ) {
                     AutoResumeDecision::Skip | AutoResumeDecision::Wait => continue,
                     AutoResumeDecision::MarkHandled => {
-                        self.resumed_panes.insert(pane_key);
+                        self.active.resumed_panes.insert(pane_key);
                         continue;
                     }
                     AutoResumeDecision::Resume => {}
@@ -16479,7 +16513,7 @@ impl App {
                 let Some(kind) = crate::agent_detect::kind_from_str(&saved.kind) else {
                     if self.stage_agent_state_exact(AppAgentStateExactKind::BindingDelete(identity))
                     {
-                        self.resumed_panes.insert(pane_key);
+                        self.active.resumed_panes.insert(pane_key);
                     }
                     continue;
                 };
@@ -16489,7 +16523,7 @@ impl App {
                 ) else {
                     if self.stage_agent_state_exact(AppAgentStateExactKind::BindingDelete(identity))
                     {
-                        self.resumed_panes.insert(pane_key);
+                        self.active.resumed_panes.insert(pane_key);
                     }
                     continue;
                 };
@@ -19221,6 +19255,7 @@ impl App {
             WorkspaceControllerAction::Runtime(command) => {
                 if let runtime::RuntimeCommand::WriteInput { session, .. } = &command {
                     self.active.workspace_ui.clear_selection(*session);
+                    self.active.mark_auto_resume_handled_for_session(*session);
                 }
                 let runtime_instance = self.active.runtime_instance;
                 if runtime_command_requires_dotenv(&command)
@@ -19263,7 +19298,7 @@ impl App {
             } => {
                 if workspace_id == self.active.id {
                     if self.stage_agent_resume(&pane_key, &title, session) {
-                        self.resumed_panes.insert(pane_key);
+                        self.active.resumed_panes.insert(pane_key);
                         self.reveal_terminal_session();
                     } else {
                         // 활성 워크스페이스인데도 실패 — 이미 재개할 게 없어졌다(pane
@@ -19393,6 +19428,11 @@ impl App {
                 .then(|| intent.focus_pane().cloned())
                 .flatten();
             let command = intent.into_command();
+            if let runtime::RuntimeCommand::WriteInput { session, .. } = &command
+                && let Some(runtime) = self.runtime_by_instance_mut(runtime_instance)
+            {
+                runtime.mark_auto_resume_handled_for_session(*session);
+            }
             if let Some(pane) = newer_local_focus.as_ref() {
                 self.cancel_terminal_focus_intents();
                 self.active.workspace_ui.arm_terminal_focus(pane.clone());
@@ -19595,7 +19635,7 @@ impl App {
             PendingResumeStep::Run => {
                 self.pending_resume_agent = None;
                 if self.stage_agent_resume(&pending.pane_key, &pending.title, pending.session) {
-                    self.resumed_panes.insert(pending.pane_key);
+                    self.active.resumed_panes.insert(pending.pane_key);
                     self.reveal_terminal_session();
                 } else {
                     // 데이터는 도착했는데 이미 재개할 게 없어졌다(그 사이 pane이 정리됐거나
@@ -26208,6 +26248,14 @@ impl App {
     fn record_activity_events(rt: &mut WorkspaceRuntime, events: &[runtime::RuntimeEvent]) {
         for event in events {
             if let runtime::RuntimeEvent::MuxUpdated { snapshot } = event {
+                let present_panes = snapshot
+                    .tabs
+                    .iter()
+                    .flat_map(|tab| &tab.panes)
+                    .map(|pane| pane.id.0.as_str())
+                    .collect::<std::collections::HashSet<_>>();
+                rt.resumed_panes
+                    .retain(|pane| present_panes.contains(pane.as_str()));
                 let present: std::collections::HashSet<runtime::SessionId> = snapshot
                     .tabs
                     .iter()
@@ -26229,6 +26277,11 @@ impl App {
             {
                 rt.resource_usage = Some(*snapshot);
                 rt.session_resource_usage = session_usage.clone();
+                for usage in session_usage {
+                    if usage.pid.is_some() && usage.process_count > 1 {
+                        rt.mark_auto_resume_handled_for_session(usage.session);
+                    }
+                }
                 update_storm_episodes(
                     &mut rt.storm_episodes,
                     &mut rt.storm_next_episode_id,
@@ -43936,22 +43989,27 @@ mod tests {
     #[test]
     fn 자동_resume은_비어있는_로컬_셸에만_허용한다() {
         assert_eq!(
-            auto_resume_decision(false, false, Some(1)),
+            auto_resume_decision(false, true, false, Some(1)),
             AutoResumeDecision::Resume,
-            "셸 프로세스 하나만 있을 때만 자동 이어가기"
+            "복원된 셸 프로세스 하나만 있을 때만 자동 이어가기"
         );
         assert_eq!(
-            auto_resume_decision(false, false, Some(2)),
+            auto_resume_decision(false, false, false, Some(1)),
+            AutoResumeDecision::MarkHandled,
+            "새로 생성한 셸에 저장된 에이전트 바인딩이 남아도 주입 금지"
+        );
+        assert_eq!(
+            auto_resume_decision(false, true, false, Some(2)),
             AutoResumeDecision::MarkHandled,
             "shell+ssh 같은 다른 작업이 있으면 주입 금지"
         );
         assert_eq!(
-            auto_resume_decision(false, false, None),
+            auto_resume_decision(false, true, false, None),
             AutoResumeDecision::Wait,
             "프로세스 스냅샷이 없으면 안전하게 대기"
         );
         assert_eq!(
-            auto_resume_decision(false, false, Some(0)),
+            auto_resume_decision(false, true, false, Some(0)),
             AutoResumeDecision::Wait,
             "불완전한 프로세스 스냅샷도 자동 주입 금지"
         );
@@ -43959,26 +44017,76 @@ mod tests {
 
     #[test]
     fn 실행중이던_agent가_끝나도_자동_resume하지_않는다() {
-        let initial = auto_resume_decision(false, true, Some(2));
+        let initial = auto_resume_decision(false, true, true, Some(2));
         assert_eq!(initial, AutoResumeDecision::MarkHandled);
 
         // 최초 관측에서 처리 완료로 표시한 뒤 agent가 종료돼 셸만 남더라도 재주입 금지.
-        let after_exit = auto_resume_decision(true, false, Some(1));
+        let after_exit = auto_resume_decision(true, true, false, Some(1));
         assert_eq!(after_exit, AutoResumeDecision::Skip);
     }
 
     #[test]
+    fn 같은_native_대화에_저장된_두_pane은_자동_resume_대상이_아니다() {
+        let rows = std::collections::HashMap::from([
+            (
+                "first".to_owned(),
+                storage::AgentSessionRow {
+                    pane_id: "first".to_owned(),
+                    kind: "claude".to_owned(),
+                    session_id: "shared".to_owned(),
+                },
+            ),
+            (
+                "second".to_owned(),
+                storage::AgentSessionRow {
+                    pane_id: "second".to_owned(),
+                    kind: "claude".to_owned(),
+                    session_id: "shared".to_owned(),
+                },
+            ),
+        ]);
+
+        assert!(!saved_agent_identity_is_unique(&rows, "first"));
+        assert!(!saved_agent_identity_is_unique(&rows, "second"));
+        assert!(!saved_agent_identity_is_unique(&rows, "missing"));
+        assert_eq!(
+            auto_resume_decision(false, false, false, Some(1)),
+            AutoResumeDecision::MarkHandled,
+        );
+    }
+
+    #[test]
     fn 수동_resume_완료도_현재_shell_only_상태만_허용한다() {
-        assert!(resume_probe_completion_allowed(true, true, false, Some(1)));
+        assert!(resume_probe_completion_allowed(
+            true,
+            true,
+            true,
+            false,
+            Some(1)
+        ));
         for process_count in [None, Some(0), Some(2), Some(3)] {
             assert!(!resume_probe_completion_allowed(
+                true,
                 true,
                 false,
                 false,
                 process_count
             ));
         }
-        assert!(!resume_probe_completion_allowed(true, false, true, Some(1)));
+        assert!(!resume_probe_completion_allowed(
+            true,
+            true,
+            false,
+            true,
+            Some(1)
+        ));
+        assert!(!resume_probe_completion_allowed(
+            false,
+            false,
+            false,
+            false,
+            Some(1)
+        ));
     }
 
     #[test]

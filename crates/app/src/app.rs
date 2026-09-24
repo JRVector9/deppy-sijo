@@ -11707,6 +11707,7 @@ enum WorkspaceControllerAction {
     SpawnShellTab {
         workspace_id: String,
         runtime_instance: u64,
+        request: ui::workspace::NewShellTabRequest,
     },
     ResumeAgent {
         /// 이 pane이 속한 워크스페이스. 활성 워크스페이스와 다르면 먼저 전환한다
@@ -20493,12 +20494,15 @@ impl App {
         if self.pending_workspace_controller_action.is_some() {
             return;
         }
-        if self.active.workspace_ui.take_new_shell_tab_requested() {
+        if let Some(request) = self.active.workspace_ui.take_new_shell_tab_requested() {
             if !self.stage_workspace_controller_action(WorkspaceControllerAction::SpawnShellTab {
                 workspace_id: self.active.id.clone(),
                 runtime_instance: self.active.runtime_instance,
+                request,
             }) {
-                self.active.workspace_ui.retry_new_shell_tab_request();
+                self.active
+                    .workspace_ui
+                    .retry_new_shell_tab_request(request);
             }
             return;
         }
@@ -20506,16 +20510,17 @@ impl App {
             runtime
                 .workspace_ui
                 .take_new_shell_tab_requested()
-                .then(|| (workspace_id.clone(), runtime.runtime_instance))
+                .map(|request| (workspace_id.clone(), runtime.runtime_instance, request))
         });
-        if let Some((workspace_id, runtime_instance)) = pending
+        if let Some((workspace_id, runtime_instance, request)) = pending
             && !self.stage_workspace_controller_action(WorkspaceControllerAction::SpawnShellTab {
                 workspace_id: workspace_id.clone(),
                 runtime_instance,
+                request,
             })
             && let Some(runtime) = self.warm.get_mut(&workspace_id)
         {
-            runtime.workspace_ui.retry_new_shell_tab_request();
+            runtime.workspace_ui.retry_new_shell_tab_request(request);
         }
     }
 
@@ -20618,6 +20623,7 @@ impl App {
             WorkspaceControllerAction::SpawnShellTab {
                 workspace_id,
                 runtime_instance,
+                request,
             } => {
                 let active_target = self.active.id == workspace_id
                     && self.active.runtime_instance == runtime_instance;
@@ -20625,7 +20631,11 @@ impl App {
                 let admission = self
                     .runtime_by_instance_mut(runtime_instance)
                     .filter(|runtime| runtime.id == workspace_id)
-                    .map(|runtime| runtime.workspace_ui.try_spawn_shell_tab(scrollback_lines));
+                    .map(|runtime| {
+                        runtime
+                            .workspace_ui
+                            .try_spawn_shell_tab(scrollback_lines, request)
+                    });
                 match admission {
                     Some(Ok(())) if active_target => {
                         self.reveal_active_workspace_for_new_session();
@@ -20635,16 +20645,15 @@ impl App {
                         self.reveal_closed_workspace(&workspace_id);
                     }
                     Some(Err(ui::workspace::WorkspaceProtocolErrorCode::Busy)) => {
-                        if let Some(runtime) = self
+                        let retry_after = self
                             .runtime_by_instance_mut(runtime_instance)
                             .filter(|runtime| runtime.id == workspace_id)
-                        {
-                            runtime
-                                .workspace_ui
-                                .defer_new_shell_tab_request(std::time::Duration::from_millis(50));
+                            .and_then(|runtime| {
+                                runtime.workspace_ui.defer_new_shell_tab_request(request)
+                            });
+                        if let Some(delay) = retry_after {
+                            self.egui_ctx.request_repaint_after(delay);
                         }
-                        self.egui_ctx
-                            .request_repaint_after(std::time::Duration::from_millis(50));
                     }
                     Some(Err(_)) | None => {}
                 }
@@ -23262,6 +23271,7 @@ impl App {
             Some(WorkspaceControllerAction::SpawnShellTab {
                 workspace_id: pending_workspace_id,
                 runtime_instance: pending_runtime_instance,
+                ..
             }) if pending_workspace_id == workspace_id && *pending_runtime_instance == runtime_instance
         )
     }
@@ -29987,13 +29997,22 @@ impl eframe::App for App {
         // Drain each resident runtime only in logic, returning exact operation/generation
         // completions so queue and in-flight slots cannot accumulate across frames.
         self.poll_workspace_protocol_intents();
-        if self.active.workspace_ui.has_new_shell_tab_request()
+        // The notice drain above has already run. A retry can exhaust during controller or
+        // protocol delivery in this tick, so wake once more to surface its failure notice.
+        if self.active.workspace_ui.has_pending_protocol_error()
             || self
                 .warm
                 .values()
-                .any(|runtime| runtime.workspace_ui.has_new_shell_tab_request())
+                .any(|runtime| runtime.workspace_ui.has_pending_protocol_error())
         {
-            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            ctx.request_repaint();
+        }
+        let next_shell_tab_retry = std::iter::once(&self.active.workspace_ui)
+            .chain(self.warm.values().map(|runtime| &runtime.workspace_ui))
+            .filter_map(|workspace| workspace.new_shell_tab_repaint_after())
+            .min();
+        if let Some(delay) = next_shell_tab_retry {
+            ctx.request_repaint_after(delay);
         }
         while let Some(intent) = self.notifications_ui.pop_native_intent() {
             platform::notify(intent.summary(), intent.body());
@@ -47938,6 +47957,26 @@ mod tests {
             .unwrap()
             .0;
         assert!(logic.contains("self.poll_pending_shell_tab_requests();"));
+    }
+
+    #[test]
+    fn exhausted_shell_tab_retry_wakes_error_notice_collection() {
+        let source = include_str!("app.rs");
+        let logic = source
+            .split_once(
+                "    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {",
+            )
+            .unwrap()
+            .1
+            .split_once("    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {")
+            .unwrap()
+            .0;
+        let after_protocol = logic
+            .split_once("self.poll_workspace_protocol_intents();")
+            .unwrap()
+            .1;
+        assert!(after_protocol.contains("has_pending_protocol_error()"));
+        assert!(after_protocol.contains("ctx.request_repaint();"));
     }
 
     #[test]

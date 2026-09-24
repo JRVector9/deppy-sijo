@@ -1,3 +1,25 @@
+## 2026-09-24 PR5 재리뷰 후 최종 실패 알림 깨우기
+
+- Current objective: 재시도 상한 도달 직후 유휴 앱에도 실패 알림을 표시한 뒤 최종 검증·리뷰·커밋을 완료한다. 앱 재실행 금지.
+- Completed work: `codex review --uncommitted`가 마지막 Busy에서 요청을 버린 뒤 알림 수집을 다시 깨우지 않는 P2를 찾았다. `WorkspaceUi::has_pending_protocol_error`로 protocol 요청 유실 알림 대기를 노출하고 `App::logic`의 protocol drain 직후 활성/warm 오류가 있으면 한 번 repaint를 예약한다.
+- Modified files: `crates/app/src/app.rs`, `crates/app/src/ui/workspace.rs`, `docs/CODEX_HANDOFF.md`.
+- Key design decisions: 알림 수집은 기존 logic 위치를 유지한다. 같은 tick에서 후발로 생긴 오류가 있으면 다음 tick을 한 번 깨워 기존 알림 경로가 수집하게 한다.
+- Tests actually run: 알림 깨우기 source 회귀는 `has_pending_protocol_error` 메서드 부재로 컴파일 RED 후 GREEN. 최신 코드 `새_셸` 9 passed, 세션 UI 6 passed, warm eviction 2 passed, app shell-tab 3 passed, dotenv Backpressure 1 passed. strict Clippy(app/session/runtime), format, diff, UI boundary 모두 exit 0. release app/proxy 빌드 exit 0, Developer ID 앱/ZIP package 검증 exit 0(`explicitly untrusted development bundle`). 앱은 실행하지 않았다. 두 번째 `codex review --uncommitted` 결과 actionable regression 없음; 리뷰어 자체 `새_셸` 9 passed.
+- Failed approaches: 오류 플래그만 세우고 후속 repaint를 예약하지 않으면 유휴 앱에서 알림이 다음 우연한 이벤트까지 보이지 않았다.
+- Remaining work: PR #195 수정 커밋·푸시, PR 설명 갱신, Obsidian 일지, 최종 상태 확인. GitHub Actions는 앞서 확인한 계정 결제/spending limit 문제로 실행 전 실패한다. 앱 재실행 금지.
+- Exact next commands: `cd /private/tmp/deppy-blank-tab-new-shell-20260924`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git add crates/app/src/app.rs crates/app/src/ui/workspace.rs docs/CODEX_HANDOFF.md`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git commit -m 'fix: 새 셸 클릭을 개별 재시도하고 상한을 둔다'`.
+
+## 2026-09-24 PR5 커밋 재리뷰 후 클릭별 재시도·상한 수정
+
+- Current objective: `79c4ec37` 기능 코드 재리뷰에서 발견한 두 P2(재시도 대기 중 클릭 합침, 50ms 무기한 재시도)를 수정하고 재검증·커밋한다. 앱 재실행 금지.
+- Completed work: 기본 작업 디렉터리의 기존 문서/HTML 다섯 파일은 별도 `feat/fleet-one-list-and-relay-wip` 브랜치에서 `331b78b3`으로 커밋했다. PR #195 기능 커밋을 `codex review --commit 79c4ec37`로 재리뷰해 두 P2를 확인했다. PR5 worktree에서는 각 클릭을 별도 `NewShellTabRequest`로 큐잉하고 controller/protocol/dotenv 전달을 지나도 요청 값을 유지한다. Busy 재시도는 50→100→200→400→800→1600ms로 증가하고 8회 뒤 알림과 함께 종료한다. logic repaint는 가장 이른 요청의 ready 시각에 맞춘다.
+- Modified files: `crates/app/src/app.rs`, `crates/app/src/ui/workspace.rs`, `docs/CODEX_HANDOFF.md`(PR5 worktree). 기본 작업 디렉터리 문서 커밋은 별도 브랜치.
+- Key design decisions: 새 클릭은 앞선 지연 요청과 합치지 않으며, 지연 중 새 클릭은 먼저 실행할 수 있다. 16개 요청 보관 상한을 두고 초과 시 기존 프로토콜 요청 유실 알림을 사용한다. Busy 재시도 초과도 같은 사용자 알림으로 종료해 warm runtime 보호와 repaint가 무기한 유지되지 않게 한다.
+- Tests actually run: 새 클릭 분리·재시도 상한 테스트는 새 타입/메서드 부재로 컴파일 RED, 구현 뒤 `새_셸` 9 passed, `kittest_세션` 6 passed, `warm_eviction` 2 passed, app shell-tab 2 passed, dotenv Backpressure 1 passed. strict Clippy(app), format, diff, UI boundary exit 0. release 빌드는 이 수정 후 아직 실행 전.
+- Failed approaches: bool 한 개가 두 클릭을 합쳤고 50ms 고정 delay가 영구 Backpressure 때 repaint/warm 보호를 끝내지 못했다. 구현 중 새 controller action 필드를 패턴에서 빠뜨려 컴파일 오류가 났고 `..`로 수정했다.
+- Remaining work: 진행 중인 `codex review --uncommitted` 결과 확인/수정, release 빌드·패키징, 커밋·푸시·PR 설명 갱신, Obsidian 일지. 기본 작업 디렉터리의 문서 커밋은 아직 push하지 않았다. 앱 재실행 금지.
+- Exact next commands: `tail -n 100 /private/tmp/deppy-shell-tab-retry-fix-review-20260924.log`; `cd /private/tmp/deppy-blank-tab-new-shell-20260924`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk cargo build --release -p deppy-sijo -p mcp-proxy --locked`.
+
 ## 2026-09-24 PR5 GitHub Actions 실행 전 실패 확인
 
 - Current objective: #191→#195 draft PR의 코드 작업 완료. PR #195의 Actions 실패 원인을 기록한다. 앱 재실행 금지.

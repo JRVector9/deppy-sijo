@@ -1,5 +1,6 @@
 ## 2026-09-24 SSH 화면 복원과 파일 트리 PR 작업 진행
 
+- Final stack re-review follow-up: `codex review --base fix/environment-api-context-integration`가 고정된 화면을 24→10행처럼 줄일 때 상단을 복사해 아래쪽 프롬프트를 잃는 P2를 찾았다. 마지막 N행을 새 viewport에 복사하고 cursor 행을 잘린 상단 수만큼 보정했다. 새 shrink 회귀 테스트는 수정 전 RED, 수정 후 GREEN. `cargo test -p session --locked` 73 passed. 이 수정을 PR1에 추가한 뒤 PR2·PR3·PR4를 순서대로 rebase하고 최종 bundle을 다시 빌드해야 한다. 앱 재실행 금지.
 - Current objective: SSH 원격 셸의 마지막 화면을 앱 복원 후 로컬 셸 전환 중에도 표시하고, 파일 트리 폴더 접두어 탐색·파일 검색·새 파일/폴더 모달을 각각 PR로 구현한 뒤 최종 코드 리뷰한다. 접두어 탐색은 폴더 행을 선택하고 화면에 보이게 할 뿐 폴더에 들어가지 않는다. 앱 재실행은 사용자 명시 요청 전까지 금지한다.
 - PR1 review follow-up: `codex review --uncommitted`가 alt-screen 하단 행 누락, agent respawn 출력 가림, 검색 스크롤 좌표 불일치를 지적했다. 경계 marker 전에 원본 viewport를 캡처하고 Shell에만 고정을 적용했다. 노출 snapshot의 scroll_offset은 live backend에서 읽는다. 각 문제에 회귀 테스트를 추가했다. 최신 revision에서 session 전체 72 passed, runtime 복원 집중 테스트 1 passed, Clippy/format/diff check exit 0.
 - Completed work: v43 HEAD `2a1583d`에서 별도 worktree `/private/tmp/deppy-ssh-screen-visible-20260924`와 branch `fix/ssh-screen-stays-visible`을 만들었다. 세션의 alt/primary 원격 마지막 화면을 첫 입력 전까지 viewport로 유지하고, 리사이즈에서도 셀을 보존한다. 앱 재실행 금지 규칙을 `AGENTS.md`와 `CLAUDE.md`에 반영했다. 후속 PR 경계를 계획 문서에 기록했다.

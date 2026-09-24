@@ -583,16 +583,24 @@ impl Session {
         let old_cols = usize::from(snapshot.cols);
         let new_cols = usize::from(cols);
         let mut cells = vec![TerminalCell::default(); new_cols * usize::from(rows)];
+        // 줄어든 pane은 마지막 화면의 아래쪽(프롬프트/상태줄)을 남긴다.
+        let first_retained_row = snapshot.rows.saturating_sub(rows);
         for row in 0..usize::from(snapshot.rows.min(rows)) {
             let count = old_cols.min(new_cols);
-            cells[row * new_cols..row * new_cols + count]
-                .copy_from_slice(&snapshot.visible_cells[row * old_cols..row * old_cols + count]);
+            let source_row = usize::from(first_retained_row) + row;
+            cells[row * new_cols..row * new_cols + count].copy_from_slice(
+                &snapshot.visible_cells[source_row * old_cols..source_row * old_cols + count],
+            );
         }
         snapshot.cols = cols;
         snapshot.rows = rows;
         snapshot.visible_cells = cells.into();
         snapshot.cursor.col = snapshot.cursor.col.min(cols.saturating_sub(1));
-        snapshot.cursor.row = snapshot.cursor.row.min(rows.saturating_sub(1));
+        snapshot.cursor.row = snapshot
+            .cursor
+            .row
+            .saturating_sub(first_retained_row)
+            .min(rows.saturating_sub(1));
     }
 
     pub fn scroll(&mut self, delta: i32) {
@@ -1307,6 +1315,36 @@ mod tests {
             .map(|cell| cell.c)
             .collect::<String>();
         assert!(visible.contains("LOCAL-PROMPT"), "{visible:?}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn 복원된_원격화면을_줄이면_프롬프트가_있는_아래쪽_행을_남긴다() {
+        let spec = CommandSpec {
+            program: "/bin/cat".into(),
+            args: Vec::new(),
+            env: Vec::new(),
+            cwd: None,
+        };
+        let mut session =
+            Session::spawn_with_spec(SessionId(26), SessionKind::Shell, &spec, 20, 6, 100).unwrap();
+        session
+            .replay_ansi(&mut std::io::Cursor::new(
+                b"ROW0\r\nROW1\r\nROW2\r\nROW3\r\nROW4\r\nPROMPT",
+            ))
+            .unwrap();
+        session.finish_ansi_replay().unwrap();
+        session.resize_checked(20, 3).unwrap();
+        let resized = session.take_snapshot().unwrap();
+        let rows = resized
+            .visible_cells
+            .chunks(20)
+            .map(|row| row.iter().map(|cell| cell.c).collect::<String>())
+            .collect::<Vec<_>>();
+        assert!(rows[0].starts_with("ROW3"), "{rows:?}");
+        assert!(rows[1].starts_with("ROW4"), "{rows:?}");
+        assert!(rows[2].starts_with("PROMPT"), "{rows:?}");
+        assert_eq!(resized.cursor.row, 2);
     }
 
     #[test]

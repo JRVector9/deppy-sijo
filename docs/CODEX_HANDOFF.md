@@ -42,6 +42,18 @@
 - Remaining work: session 전체 테스트와 format/diff 검사 후 PR1 commit/push; PR2·PR3·PR4 rebase, 최종 검증·빌드·리뷰.
 - Exact next commands: `cd /private/tmp/deppy-ssh-screen-visible-20260924`; `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo test -p session --locked`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`.
 
+## 2026-09-24 파일 트리 폴더 접두어 탐색 PR2 진행
+
+- Current objective: 사용자가 파일 트리에 포커스를 두고 `F`를 누르면 보이는 `Fold` 폴더 행을 선택하고 화면에 스크롤한다. 폴더는 열지 않는다. 파일 검색과 생성 모달은 뒤의 별도 PR이다.
+- PR2 review follow-up: `codex review --uncommitted`가 터미널의 자동 포커스 탈취, `self.edit.take()` 뒤 잘못된 편집 가드, IME Commit 누락을 지적했다. workspace 터미널 자동 포커스를 tree focus일 때 막고, 로컬 `edit`를 검사하며, Commit만 오거나 Text와 중복되는 입력을 한 번 처리하도록 수정했다. focused tests 4건과 workspace 포커스 통합 테스트 1건 모두 passed; 최신 Clippy, format, diff check exit 0.
+- Completed work: PR1 `fix/ssh-screen-stays-visible` 커밋 `0d56aff7`, draft PR #191 생성. 그 위에 worktree `/private/tmp/deppy-file-tree-typeahead-20260924`, branch `feat/file-tree-typeahead` 생성. 입력 접두어(0.8초 연속), 반복 글자 순환, 파일 제외, 포커스/편집/팝업 게이트, 가상화 목록 스크롤을 구현했다. 폴더 열기/루트 변경은 호출하지 않는다.
+- Modified files: `crates/app/src/ui/file_tree.rs`, `crates/app/src/ui/workspace.rs`, `docs/CODEX_HANDOFF.md`.
+- Key design decisions: 현재 `flat`에 표시된 폴더 행만 탐색한다. 키보드 입력은 tree_keyboard_focus_id가 포커스된 때의 `egui::Event::Text`만 받는다. 일치 행을 단독 선택하고 해당 index를 `ScrollArea::vertical_scroll_offset`으로 중앙에 가져온다. 기존 row rendering closure는 변경하지 않아 diff를 작게 유지했다.
+- Tests actually run: 신규 unit test 2건은 메서드 부재로 컴파일 RED, 구현 후 2 passed. 실제 egui kittest에서 화면 밖 `Fold`가 키 입력 후 표시되고 root가 유지됨 1 passed. `cargo clippy -p deppy-sijo --all-targets --locked -- -D warnings` passed. `cargo test -p deppy-sijo --bin deppy-sijo ui::file_tree::tests --locked`는 163건 중 159 passed, 4 failed. 실패한 헤더 팝업 1건과 상태 `Idle`→`Awaiting instruction` 기대 불일치 3건은 모두 PR1 baseline에서도 개별 재실행해 동일 실패를 확인했다.
+- Failed approaches: `cargo fmt --all`이 400줄 `show_rows` closure 들여쓰기를 바꾸어 diff가 945줄로 늘었다. scroll area 빌더를 작은 helper로 추출하고 원본 closure를 복원해 diff를 약 145줄로 줄였다. baseline 테스트 두 건은 PR2 변경 전부터 실패한다.
+- Remaining work: PR2 포맷/변경 검사, 코드 리뷰, 커밋·push·PR 생성. 파일 검색 PR3, 생성 모달 PR4, 최종 빌드·리뷰. 앱 재실행 금지.
+- Exact next commands: `cd /private/tmp/deppy-file-tree-typeahead-20260924`; `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo fmt --all -- --check`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git status --short`.
+
 ## 2026-09-24 SSH 화면 복원과 파일 트리 PR 작업 진행
 
 - Final stack re-review follow-up: `codex review --base fix/environment-api-context-integration`가 고정된 화면을 24→10행처럼 줄일 때 상단을 복사해 아래쪽 프롬프트를 잃는 P2를 찾았다. 마지막 N행을 새 viewport에 복사하고 cursor 행을 잘린 상단 수만큼 보정했다. 새 shrink 회귀 테스트는 수정 전 RED, 수정 후 GREEN. `cargo test -p session --locked` 73 passed. 이 수정을 PR1에 추가한 뒤 PR2·PR3·PR4를 순서대로 rebase하고 최종 bundle을 다시 빌드해야 한다. 앱 재실행 금지.

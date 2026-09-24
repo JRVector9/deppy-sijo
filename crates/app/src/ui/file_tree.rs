@@ -1129,6 +1129,9 @@ pub struct FileTreeUi {
     selected: BTreeSet<PathBuf>,
     /// Shift 범위 선택의 기준점 — 마지막으로 단독 선택하거나 토글한 행.
     select_anchor: Option<PathBuf>,
+    /// 파일 트리 포커스에서 연속 입력한 폴더 이름 접두어.
+    typeahead_prefix: String,
+    typeahead_last_at: Option<f64>,
     /// 선택 사각형 드래그 중 상태.
     marquee: Option<MarqueeDrag>,
     /// 다중 삭제 대기열. IO 큐가 capacity-1이라 완료될 때마다 하나씩 보낸다.
@@ -1216,6 +1219,8 @@ impl FileTreeUi {
             last_sidebar_active_workspace: None,
             selected: BTreeSet::new(),
             select_anchor: None,
+            typeahead_prefix: String::new(),
+            typeahead_last_at: None,
             marquee: None,
             trash_queue: Vec::new(),
             workspace_drag: None,
@@ -1856,6 +1861,8 @@ impl FileTreeUi {
         self.trash_queue.clear();
         self.selected.clear();
         self.select_anchor = None;
+        self.typeahead_prefix.clear();
+        self.typeahead_last_at = None;
         self.marquee = None;
         self.env_warning_candidates.clear();
         self.watch_plan_dirty = true;
@@ -3232,6 +3239,28 @@ impl FileTreeUi {
         // 재그리기를 요청하므로, 저장값을 반올림하면 무한 repaint가 된다.
         let ppp = ui.ctx().pixels_per_point();
         let total = self.flat.len();
+        let typeahead_reveal = if self.root.is_some()
+            && edit.is_none()
+            && !ui.ctx().text_edit_focused()
+            && !ui.ctx().any_popup_open()
+            && ui.memory(|memory| memory.has_focus(tree_keyboard_focus_id()))
+        {
+            let (now, text_events) = ui.input(|input| {
+                let texts =
+                    if input.modifiers.command || input.modifiers.ctrl || input.modifiers.alt {
+                        Vec::new()
+                    } else {
+                        tree_typeahead_text_events(&input.events)
+                    };
+                (input.time, texts)
+            });
+            text_events
+                .iter()
+                .filter_map(|text| self.handle_typeahead_text(text, now))
+                .last()
+        } else {
+            None
+        };
         let mut toggle: Option<PathBuf> = None;
         let mut navigate_root: Option<PathBuf> = parent_navigation;
         let mut open_file: Option<PathBuf> = None; // 파일 더블클릭 → 연결 프로그램 열기
@@ -3269,7 +3298,7 @@ impl FileTreeUi {
         let mut select_click: Option<(PathBuf, SelectionClick)> = None;
         // 빈 영역을 클릭했다 — 선택 해제.
         let mut clear_selection = false;
-        let scroll_output = egui::ScrollArea::vertical()
+        let scroll_output = file_tree_scroll_area(ui, row_height, typeahead_reveal)
             .id_salt("file_tree_rows")
             .auto_shrink([false, false])
             .show_rows(ui, row_height, total, |ui, range| {
@@ -3756,8 +3785,12 @@ impl FileTreeUi {
         if clear_selection {
             self.selected.clear();
             self.select_anchor = None;
+            self.typeahead_prefix.clear();
+            self.typeahead_last_at = None;
         }
         if let Some((path, kind)) = select_click {
+            self.typeahead_prefix.clear();
+            self.typeahead_last_at = None;
             self.apply_selection_click(&path, kind);
         }
         self.update_marquee(
@@ -4300,6 +4333,49 @@ impl FileTreeUi {
         }
     }
 
+    /// Finder처럼 입력 접두어로 현재 표시된 폴더 행만 찾는다. 반환값은 화면 이동용
+    /// flat index이며, 폴더 열기나 탐색 루트 변경은 이 경로에서 하지 않는다.
+    fn handle_typeahead_text(&mut self, text: &str, now: f64) -> Option<usize> {
+        if text.is_empty() || text.chars().any(char::is_control) || self.flat.is_empty() {
+            return None;
+        }
+        let fresh = self
+            .typeahead_last_at
+            .is_none_or(|last| !(0.0..=0.8).contains(&(now - last)));
+        let repeat = !fresh && self.typeahead_prefix.to_lowercase() == text.to_lowercase();
+        let mut query = if fresh || repeat {
+            text.to_owned()
+        } else {
+            format!("{}{text}", self.typeahead_prefix)
+        };
+        let current = self
+            .select_anchor
+            .as_ref()
+            .and_then(|path| self.flat.iter().position(|row| &row.path == path));
+        let find = |query: &str, include_current: bool| {
+            let needle = query.to_lowercase();
+            let len = self.flat.len();
+            let start = current.map_or(0, |index| (index + usize::from(!include_current)) % len);
+            (0..len)
+                .map(|offset| (start + offset) % len)
+                .find(|&index| {
+                    let row = &self.flat[index];
+                    row.is_dir && row.display_name.to_lowercase().starts_with(&needle)
+                })
+        };
+        let mut index = find(&query, !fresh && !repeat);
+        if index.is_none() && !fresh && !repeat {
+            query = text.to_owned();
+            index = find(&query, false);
+        }
+        self.typeahead_prefix = query;
+        self.typeahead_last_at = Some(now);
+        let index = index?;
+        let path = self.flat[index].path.clone();
+        self.apply_selection_click(&path, SelectionClick::Replace);
+        Some(index)
+    }
+
     fn start_edit(&mut self, edit: EditState) {
         self.edit_generation = self.edit_generation.wrapping_add(1);
         if let EditState::NewFile { parent, .. } | EditState::NewFolder { parent, .. } = &edit {
@@ -4694,8 +4770,35 @@ fn is_tree_delete_shortcut(event: &egui::Event) -> bool {
     )
 }
 
-fn tree_keyboard_focus_id() -> egui::Id {
+pub(crate) fn tree_keyboard_focus_id() -> egui::Id {
     egui::Id::new("file_tree_keyboard_focus")
+}
+
+fn tree_typeahead_text_events(events: &[egui::Event]) -> Vec<String> {
+    // macOS 입력기는 확정 문자를 Commit만 보낼 수도, 같은 Text와 함께 보낼 수도
+    // 있다. 같은 프레임의 동일 Text 하나만 제외하고 Commit을 한 번 처리한다.
+    let mut commits = events
+        .iter()
+        .filter_map(|event| match event {
+            egui::Event::Ime(egui::ImeEvent::Commit(text)) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    events
+        .iter()
+        .filter_map(|event| match event {
+            egui::Event::Text(text) => {
+                if let Some(index) = commits.iter().position(|commit| *commit == text) {
+                    commits.remove(index);
+                    None
+                } else {
+                    Some(text.clone())
+                }
+            }
+            egui::Event::Ime(egui::ImeEvent::Commit(text)) => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn register_tree_keyboard_focus_target(ui: &egui::Ui) {
@@ -4780,6 +4883,20 @@ fn marquee_row_range(
 /// 사각형이 감싸지 않은 행이 선택되고, 그대로 ⌘⌫를 누르면 지워진다(2026-09-04 리뷰).
 fn tree_row_pitch(row_height: f32, spacing: &egui::style::Spacing) -> f32 {
     row_height + spacing.item_spacing.y
+}
+
+fn file_tree_scroll_area(
+    ui: &egui::Ui,
+    row_height: f32,
+    reveal: Option<usize>,
+) -> egui::ScrollArea {
+    let area = egui::ScrollArea::vertical();
+    let Some(index) = reveal else {
+        return area;
+    };
+    let pitch = tree_row_pitch(row_height, ui.spacing());
+    let offset = ((index as f32 + 0.5) * pitch - ui.available_height() / 2.0).max(0.0);
+    area.vertical_scroll_offset(offset)
 }
 
 /// 정렬된 경로 목록에서 두 경로 사이 구간(양끝 포함). 어느 쪽이 앞인지는 보지 않는다.
@@ -8099,6 +8216,68 @@ fn reread(base: &Path, old: &[TreeNode]) -> std::io::Result<Vec<TreeNode>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folder_typeahead는_폴더만_선택하고_연속_입력과_반복을_처리한다() {
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.root = Some(PathBuf::from("/root"));
+        tree.flat = [
+            ("File", false),
+            ("Fold", true),
+            ("Foo", true),
+            ("Other", true),
+        ]
+        .into_iter()
+        .map(|(name, is_dir)| FlatRow {
+            path: PathBuf::from(format!("/root/{name}")),
+            display_name: name.to_owned(),
+            depth: 0,
+            is_dir,
+            expanded: false,
+        })
+        .collect();
+
+        assert_eq!(tree.handle_typeahead_text("f", 1.0), Some(1));
+        assert_eq!(tree.selected, BTreeSet::from([PathBuf::from("/root/Fold")]));
+        assert_eq!(tree.handle_typeahead_text("o", 1.1), Some(1));
+        assert_eq!(tree.handle_typeahead_text("f", 2.0), Some(2));
+        assert_eq!(tree.handle_typeahead_text("f", 2.1), Some(1));
+        assert_eq!(tree.root, Some(PathBuf::from("/root")));
+    }
+
+    #[test]
+    fn folder_typeahead는_일치하지_않는_접두어에서_마지막_글자로_재시도한다() {
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.flat = [("Alpha", true), ("Beta", true)]
+            .into_iter()
+            .map(|(name, is_dir)| FlatRow {
+                path: PathBuf::from(format!("/root/{name}")),
+                display_name: name.to_owned(),
+                depth: 0,
+                is_dir,
+                expanded: false,
+            })
+            .collect();
+        assert_eq!(tree.handle_typeahead_text("a", 1.0), Some(0));
+        assert_eq!(tree.handle_typeahead_text("b", 1.1), Some(1));
+        assert_eq!(tree.selected, BTreeSet::from([PathBuf::from("/root/Beta")]));
+    }
+
+    #[test]
+    fn folder_typeahead는_ime_commit을_한번만_사용한다() {
+        let events = [
+            egui::Event::Text("한".to_owned()),
+            egui::Event::Ime(egui::ImeEvent::Commit("한".to_owned())),
+            egui::Event::Text("글".to_owned()),
+        ];
+        assert_eq!(tree_typeahead_text_events(&events), ["한", "글"]);
+        assert_eq!(
+            tree_typeahead_text_events(&[egui::Event::Ime(egui::ImeEvent::Commit(
+                "폴더".to_owned()
+            ))]),
+            ["폴더"]
+        );
+    }
 
     #[test]
     fn file_tree_os_drop은_공유_오른쪽_경계를_소유하지_않는다() {
@@ -13013,6 +13192,63 @@ mod tests {
         harness.state_mut().2 = true;
         harness.step();
         harness
+    }
+
+    #[test]
+    fn kittest_folder_typeahead는_화면밖_폴더행을_보이고_열지_않는다() {
+        use egui_kittest::kittest::Queryable as _;
+
+        let base = temp_root("typeahead-reveal");
+        for index in 0..30 {
+            std::fs::create_dir(base.join(format!("A{index:02}"))).unwrap();
+        }
+        std::fs::create_dir(base.join("Fold")).unwrap();
+        let base = base.canonicalize().unwrap();
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let workspaces = vec![SidebarWorkspaceEntry {
+            id: "ws-typeahead".to_owned(),
+            name: "typeahead".to_owned(),
+            state: SidebarWorkspaceState::Active,
+            summary: SidebarSessionSummary::default(),
+        }];
+        let mut harness = close_menu_harness(&workspaces, "ws-typeahead", &catalog);
+        harness.state_mut().0.set_root(Some(base.clone()));
+        drain_listings(&mut harness.state_mut().0);
+        harness.step();
+        assert!(
+            harness.query_by_label("Fold").is_none(),
+            "처음엔 화면 밖이어야 한다"
+        );
+        harness
+            .ctx
+            .memory_mut(|memory| memory.request_focus(tree_keyboard_focus_id()));
+        harness.event(egui::Event::Text("F".to_owned()));
+        harness.step();
+        assert!(
+            harness.query_by_label("Fold").is_some(),
+            "Fold 행이 화면에 보여야 한다"
+        );
+        assert_eq!(
+            harness.state().0.selected,
+            BTreeSet::from([base.join("Fold")])
+        );
+        assert_eq!(harness.state().0.root.as_deref(), Some(base.as_path()));
+        harness.state_mut().0.selected.clear();
+        harness.state_mut().0.start_edit(EditState::NewFolder {
+            parent: base.clone(),
+            buffer: String::new(),
+            focus: false,
+        });
+        harness
+            .ctx
+            .memory_mut(|memory| memory.request_focus(tree_keyboard_focus_id()));
+        harness.event(egui::Event::Text("A".to_owned()));
+        harness.step();
+        assert!(
+            harness.state().0.selected.is_empty(),
+            "편집 중인 글자는 탐색하지 않는다"
+        );
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     /// 워크스페이스 행 우클릭 → 「워크스페이스 종료」 메뉴가 열린다 (실제 팝업 경로).

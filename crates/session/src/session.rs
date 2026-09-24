@@ -480,6 +480,12 @@ impl Session {
         self.held_viewport = (self.kind == SessionKind::Shell)
             .then_some(remote_viewport)
             .flatten()
+            .filter(|snapshot| {
+                snapshot
+                    .visible_cells
+                    .iter()
+                    .any(|cell| !cell.wide_spacer && !cell.c.is_whitespace())
+            })
             .map(|mut snapshot| {
                 snapshot.is_alt_screen = false;
                 snapshot.cursor.visible = false;
@@ -1327,6 +1333,77 @@ mod tests {
             .map(|cell| cell.c)
             .collect::<String>();
         assert!(visible.contains("LOCAL-PROMPT"), "{visible:?}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn 복원된_원격화면에서_검색_스크롤이_0이어도_라이브_화면으로_전환한다() {
+        let spec = CommandSpec {
+            program: "/bin/cat".into(),
+            args: Vec::new(),
+            env: Vec::new(),
+            cwd: None,
+        };
+        let mut session =
+            Session::spawn_with_spec(SessionId(28), SessionKind::Shell, &spec, 40, 6, 100).unwrap();
+        session
+            .replay_ansi(&mut std::io::Cursor::new(b"REMOTE-LAST-SCREEN"))
+            .unwrap();
+        session.finish_ansi_replay().unwrap();
+        session
+            .replay_ansi(&mut std::io::Cursor::new(b"\x1b[2J\x1b[HLOCAL-PROMPT"))
+            .unwrap();
+        assert!(
+            session
+                .take_snapshot()
+                .unwrap()
+                .visible_cells
+                .iter()
+                .map(|cell| cell.c)
+                .collect::<String>()
+                .contains("REMOTE-LAST-SCREEN")
+        );
+        session.scroll(0);
+        assert!(
+            session
+                .take_snapshot()
+                .unwrap()
+                .visible_cells
+                .iter()
+                .map(|cell| cell.c)
+                .collect::<String>()
+                .contains("LOCAL-PROMPT")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn 복원된_원격화면이_비어_있으면_새_셸_프롬프트를_가리지_않는다() {
+        let spec = CommandSpec {
+            program: "/bin/cat".into(),
+            args: Vec::new(),
+            env: Vec::new(),
+            cwd: None,
+        };
+        let mut session =
+            Session::spawn_with_spec(SessionId(29), SessionKind::Shell, &spec, 40, 6, 100).unwrap();
+        session
+            .replay_ansi(&mut std::io::Cursor::new(b"OLD\x1b[2J\x1b[H"))
+            .unwrap();
+        session.finish_ansi_replay().unwrap();
+        session
+            .replay_ansi(&mut std::io::Cursor::new(b"FRESH-PROMPT"))
+            .unwrap();
+        assert!(
+            session
+                .take_snapshot()
+                .unwrap()
+                .visible_cells
+                .iter()
+                .map(|cell| cell.c)
+                .collect::<String>()
+                .contains("FRESH-PROMPT")
+        );
     }
 
     #[test]

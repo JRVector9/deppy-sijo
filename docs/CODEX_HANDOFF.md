@@ -1,3 +1,14 @@
+## 2026-09-24 PR1 누적 리뷰 후 빈 화면·검색 이동
+
+- Current objective: 저장된 SSH 셸 화면이 실제로 비어 있으면 새 프롬프트를 보이고, 보존 화면에서 현재 위치의 검색 결과로 이동하면 라이브 화면으로 전환한다. 사용자 허락 없이 앱 재실행 금지.
+- Completed work: `finish_ansi_replay`가 비공백 셀이 있는 셸 화면만 고정한다. 터미널 검색 UI는 목표 스크롤 델타가 0이어도 Scroll 명령을 보내 세션의 보존 화면을 해제한다.
+- Modified files: `crates/session/src/session.rs`, `crates/app/src/ui/workspace.rs`, `docs/CODEX_HANDOFF.md`.
+- Key design decisions: 검색 결과를 탐색하는 사용자 동작은 복원 화면의 첫 입력과 같이 라이브 화면 전환으로 처리한다. 비어 있는 화면 판정은 wide spacer를 제외한 비공백 셀로 한다.
+- Tests actually run: 빈 화면 회귀와 zero-delta 검색 명령 회귀가 수정 전 RED, 수정 후 각각 passed. `cargo test -p session --locked` 76 passed. `cargo clippy -p session -p runtime -p deppy-sijo --all-targets --locked -- -D warnings`와 `cargo fmt --all -- --check` exit 0.
+- Failed approaches: 첫 Clippy 검사에서 `and_then(|_| Some(delta))`가 `bind_instead_of_map`으로 실패해 `map`으로 고쳤다.
+- Remaining work: PR1 commit/push, PR2·PR3·PR4 rebase, 최종 통합 검증·리뷰·release 재빌드.
+- Exact next commands: `cd /private/tmp/deppy-ssh-screen-visible-20260924`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git add crates/session/src/session.rs crates/app/src/ui/workspace.rs docs/CODEX_HANDOFF.md`.
+
 ## 2026-09-24 PR1 최종 리뷰 후 화면 크기 왕복 복원
 
 - Current objective: 복원한 SSH 셸 화면을 첫 입력 전까지 보여주고, 창 크기를 줄였다 다시 키워도 원본 내용을 복구한다. 사용자 허락 없이 앱 재실행 금지.

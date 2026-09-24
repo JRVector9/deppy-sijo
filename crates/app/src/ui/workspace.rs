@@ -4383,14 +4383,16 @@ impl WorkspaceUi {
             };
             if search.scroll_to_current {
                 search.scroll_to_current = false;
-                search.matches.get(search.current).and_then(|m| {
+                search.matches.get(search.current).map(|m| {
                     let rows = snapshot.rows as i32;
                     let total = search.total_lines as i32;
                     let b = m.line_from_bottom as i32;
                     // 매치를 화면 중앙 근처에 두되, 유효 범위 [0, history]로 클램프.
                     let desired = (b - rows / 2).clamp(0, (total - rows).max(0));
                     let delta = desired - snapshot.scroll_offset;
-                    (delta != 0).then_some(delta)
+                    // delta=0도 전송한다. 복원된 원격 화면을 고정해 보여주던 셸은
+                    // 이 명령에서 고정을 풀어야 live backend의 현재 매치가 보인다.
+                    delta
                 })
             } else {
                 None
@@ -9758,6 +9760,41 @@ mod tests {
         assert!(
             matches!(commands.as_slice(), [RuntimeCommand::ScrollToBottom { session: id }] if *id == session)
         );
+    }
+
+    #[test]
+    fn 검색_결과가_현재_스크롤_위치여도_고정_화면을_해제하도록_이동한다() {
+        let session = SessionId(701);
+        let mut workspace = WorkspaceUi::new();
+        workspace.open_search_for_session(session);
+        let search = workspace.search.as_mut().unwrap();
+        search.query = "LOCAL-PROMPT".to_owned();
+        search.requested = Some(search.query.clone());
+        search.matches = vec![terminal::ScrollbackMatch {
+            line_from_bottom: 0,
+            col_start: 0,
+            col_end: 12,
+        }];
+        search.total_lines = 6;
+        search.scroll_to_current = true;
+        let snapshot = shaped_snapshot(40, 6, "REMOTE-LAST-SCREEN");
+        egui::Context::default()
+            .run_ui(egui::RawInput::default(), |ui| {
+                workspace.render_terminal_search(
+                    ui,
+                    session,
+                    egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 120.0)),
+                    egui::Pos2::ZERO,
+                    egui::vec2(8.0, 16.0),
+                    &snapshot,
+                    &catalog(),
+                );
+            })
+            .drop_without_applying_deltas();
+        assert!(matches!(
+            drain_protocol(&mut workspace).as_slice(),
+            [RuntimeCommand::Scroll { session: target, delta: 0 }] if *target == session
+        ));
     }
 
     #[test]

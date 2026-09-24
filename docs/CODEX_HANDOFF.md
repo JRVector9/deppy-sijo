@@ -1,3 +1,15 @@
+## 2026-09-24 SSH 화면 복원과 파일 트리 PR 작업 진행
+
+- Current objective: SSH 원격 셸의 마지막 화면을 앱 복원 후 로컬 셸 전환 중에도 표시하고, 파일 트리 폴더 접두어 탐색·파일 검색·새 파일/폴더 모달을 각각 PR로 구현한 뒤 최종 코드 리뷰한다. 접두어 탐색은 폴더 행을 선택하고 화면에 보이게 할 뿐 폴더에 들어가지 않는다. 앱 재실행은 사용자 명시 요청 전까지 금지한다.
+- PR1 review follow-up: `codex review --uncommitted`가 alt-screen 하단 행 누락, agent respawn 출력 가림, 검색 스크롤 좌표 불일치를 지적했다. 경계 marker 전에 원본 viewport를 캡처하고 Shell에만 고정을 적용했다. 노출 snapshot의 scroll_offset은 live backend에서 읽는다. 각 문제에 회귀 테스트를 추가했다. 최신 revision에서 session 전체 72 passed, runtime 복원 집중 테스트 1 passed, Clippy/format/diff check exit 0.
+- Completed work: v43 HEAD `2a1583d`에서 별도 worktree `/private/tmp/deppy-ssh-screen-visible-20260924`와 branch `fix/ssh-screen-stays-visible`을 만들었다. 세션의 alt/primary 원격 마지막 화면을 첫 입력 전까지 viewport로 유지하고, 리사이즈에서도 셀을 보존한다. 앱 재실행 금지 규칙을 `AGENTS.md`와 `CLAUDE.md`에 반영했다. 후속 PR 경계를 계획 문서에 기록했다.
+- Modified files: `AGENTS.md`, `CLAUDE.md`, `crates/session/src/session.rs`, `crates/runtime/src/in_process.rs`, `docs/superpowers/plans/2026-09-24-file-tree-and-ssh-continuity.md`, `docs/CODEX_HANDOFF.md`.
+- Key design decisions: 기존 터미널 backend를 복제하지 않고 셀 한 화면의 snapshot만 붙잡는다. 라이브 PTY는 계속 실행되며 첫 입력 또는 스크롤 동작에서 라이브 화면으로 전환한다. alt screen은 기존처럼 scrollback에도 직렬화한다. 이 변경은 관리형 SSH 재접속 자체를 구현하지 않는다.
+- Tests actually run: 수정 전 session 회귀 두 건 RED; 최신 수정 후 `cargo test -p session --lib --locked` 72 passed; `cargo test -p runtime --lib 재시작시_alt_screen이었던_셸_pane도_화면이_보존된다 --locked` 1 passed; `cargo clippy -p session -p runtime --all-targets --locked -- -D warnings` passed; `cargo fmt --all -- --check` passed; `git diff --check` passed. macOS linker에는 `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk DEVELOPER_DIR=/Library/Developer/CommandLineTools`를 사용했다.
+- Failed approaches: SDKROOT 없이 session 테스트를 실행하면 Xcode license 때문에 linker exit 69가 났다. 기본 CLT SDK 변수를 설정해 통과했다. alt screen만 복원하면 실제 SSH primary 화면이 남지 않는다는 것을 기존 로그 조사로 확인했다.
+- Remaining work: PR1 포맷 확인·코드 리뷰·커밋·push·PR 생성. 그 다음 폴더 탐색, 파일 검색, 생성 모달 PR을 차례로 구현하고 최종 리뷰/빌드를 한다. 앱을 실행하지 않는다.
+- Exact next commands: `cd /private/tmp/deppy-ssh-screen-visible-20260924`; `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo fmt --all -- --check`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git status --short`.
+
 ## 2026-09-23 최신 v43 재빌드·서명·재실행 완료
 
 - Current objective completed: 사용자의 지시에 따라 로컬 최신 소스를 커밋/원격 동기화

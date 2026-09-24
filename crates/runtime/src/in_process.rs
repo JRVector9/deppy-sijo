@@ -11493,11 +11493,20 @@ mod tests {
         let restored_session = probe.wait_for(Duration::from_secs(15), |event| match event {
             RuntimeEvent::Viewport {
                 session, snapshot, ..
-            } if !snapshot.is_alt_screen => Some(*session),
+            } if !snapshot.is_alt_screen
+                && snapshot
+                    .visible_cells
+                    .iter()
+                    .map(|cell| cell.c)
+                    .collect::<String>()
+                    .contains("REMOTE-VIM-BUFFER") =>
+            {
+                Some(*session)
+            }
             _ => None,
         });
 
-        // 1) 화면 보존 — alt-screen 내용이 scrollback에서 찾아져야 한다(위로 스크롤하면 보임).
+        // 1) 화면 보존 — 재접속 없이도 마지막 화면이 보이고 검색도 가능해야 한다.
         client
             .send_command(RuntimeCommand::SearchScrollback {
                 session: restored_session,

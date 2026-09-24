@@ -1,3 +1,14 @@
+## 2026-09-24 PR5 GitHub Actions 실행 전 실패 확인
+
+- Current objective: #191→#195 draft PR의 코드 작업 완료. PR #195의 Actions 실패 원인을 기록한다. 앱 재실행 금지.
+- Completed work: PR #195를 #194 base로 게시하고 clean worktree를 확인했다. GitHub Actions 6개 작업이 2~5초 안에 실패했으나 각 job의 `steps`는 빈 배열이고 runner가 할당되지 않았다. check-run annotation은 최근 계정 결제 실패 또는 spending limit 증액 필요 때문에 job이 시작되지 않았다고 명시한다. #194에서도 같은 양상의 6개 실패가 확인됐다. GitGuardian은 pass.
+- Modified files: 이 상태 기록을 위한 `docs/CODEX_HANDOFF.md`만 추가 수정. 앱 소스·빌드 결과 변경 없음.
+- Key design decisions: GitHub Actions는 테스트 코드까지 도달하지 않았으므로 CI 실패를 코드 실패로 분류하지 않는다. 로컬에서 완료한 기능 테스트·Clippy·경계·릴리스 패키징 결과를 그대로 보고한다.
+- Tests actually run: `gh pr checks 195` exit 1, 6 fail/1 pass. `gh run view 35958502288 --json ...`은 모든 실패 job에 `steps: []` 확인. `gh run view 35958502288 --log-failed`는 로그 없음. `gh api repos/JRVector9/deppy-sijo/check-runs/107501809055/annotations`는 billing/spending limit로 job 미시작을 확인. 최종 로컬 검증은 바로 아래 섹션 참고.
+- Failed approaches: GitHub Actions가 runner 할당 전에 거부돼 원격 테스트 로그를 얻을 수 없다. 로컬 재검증은 이미 완료했다.
+- Remaining work: 이번 요청의 코드 구현·리뷰·PR 생성에는 남은 작업 없음. GitHub 계정 결제/spending limit를 해결한 뒤 PR 체크를 재실행해야 원격 검증을 받을 수 있다. 병합은 요청 시 #191→#195 순서로 진행. 앱 재실행 금지.
+- Exact next commands: `cd /private/tmp/deppy-blank-tab-new-shell-20260924`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools gh pr checks 195`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools gh api repos/JRVector9/deppy-sijo/check-runs/107501809055/annotations`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git status --short --branch`.
+
 ## 2026-09-24 PR5 draft PR 게시 완료
 
 - Current objective: #191→#195의 다섯 draft PR을 리뷰 가능한 상태로 유지한다. 이번 요청의 구현·재빌드·게시 완료. 앱 재실행 금지.

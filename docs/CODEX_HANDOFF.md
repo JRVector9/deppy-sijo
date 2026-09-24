@@ -44,6 +44,7 @@
 
 ## 2026-09-24 파일 검색 PR3 진행
 
+- Final stack review follow-up (2026-09-24): 누적 `codex review --base fix/environment-api-context-integration`가 검색 입력에서 결과/버튼으로 Tab 이동하면 PTY가 키보드 포커스를 되찾는 P2를 찾았다. 파일 트리 `panel`이 같은 egui 프레임의 검색 가시 상태를 context temp data로 게시하고 workspace가 터미널 입력 및 pending focus 복구를 보류하도록 수정했다. kittest 실제 검색 패널 신호 1 passed, workspace Tab→PTY 차단 테스트는 수정 전 pending focus가 소비되어 RED, 수정 후 1 passed. 패널이 사라진 다음 프레임의 stale 신호가 만료되는 테스트 1 passed. 수정 후 Clippy exit 0, rustfmt 실행. 이 follow-up을 PR3에 커밋한 뒤 PR4를 rebase하고 release bundle을 다시 빌드해야 한다. 앱 재실행 금지.
 - Current objective: 파일 트리 더보기의 파일 검색을 별도 PR로 구현한다. 접힌 폴더도 프로젝트 루트 전체에서 검색하고 결과를 트리에 표시한다. 앱 재실행 금지.
 - PR3 review follow-up: `codex review --uncommitted`가 superseded scan의 공유 I/O 점유, 검색 모드에서 상위 탐색/생성 버튼 무반응, 새로고침 결과 stale, 탐색 상한을 "Too many matches"로 오표시하는 네 문제를 지적했다. 요청별 `Arc<AtomicBool>` 취소 토큰을 host traversal에 전달해 쿼리 변경·닫기·루트 변경 시 중단하고, 취소된 동일 쿼리 결과도 적용하지 않는다. 검색 모드 상위 탐색/생성/새로고침을 연결했다. 결과 수 상한과 탐색 미완료를 별도 상태/번역으로 표시한다. 수정 후 host 검색 4건, 검색 상태 2건, 결과→트리 egui 1건 passed; 최신 Clippy, format, diff check, i18n-check exit 0.
 - Completed work: PR2 `feat/file-tree-typeahead` 커밋 `9757c7e6`, draft PR #192 생성. 그 위 worktree `/private/tmp/deppy-file-tree-search-20260924`, branch `feat/file-tree-search` 생성. 더보기 메뉴 검색, 별도 검색 UI, 백그라운드 Maintenance SearchFiles, 검색 결과의 `Show in tree` 경로를 구현했다. hidden 설정 적용, 파일 이름 부분 문자열 검색, symlink 미탐색, 50,000 엔트리/100 결과 상한을 둔다.

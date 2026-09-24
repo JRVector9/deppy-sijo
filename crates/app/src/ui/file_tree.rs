@@ -2153,6 +2153,10 @@ impl FileTreeUi {
     ) -> Option<SidebarAction> {
         let navigation_action = self.navigation_rail_panel(ui, sidebar, catalog);
         let project_action = self.project_file_panel(ui, sessions_by_workspace, sidebar, catalog);
+        mark_file_tree_search_keyboard_active(
+            ui.ctx(),
+            !self.collapsed && self.selected_tool == SidebarTool::Files && self.search.is_some(),
+        );
         let action = project_action.or(navigation_action);
         if action.is_some() {
             // 다른 세션/워크스페이스/도구로 이동한 뒤 숨은 초안을 확정하지 않는다.
@@ -5117,6 +5121,28 @@ fn is_tree_delete_shortcut(event: &egui::Event) -> bool {
 
 pub(crate) fn tree_keyboard_focus_id() -> egui::Id {
     egui::Id::new("file_tree_keyboard_focus")
+}
+
+fn file_tree_search_keyboard_owner_id() -> egui::Id {
+    egui::Id::new("file_tree_search_keyboard_owner")
+}
+
+/// 같은 프레임에 트리 다음으로 그리는 workspace만 읽는다. 프레임 번호를 함께 저장해
+/// 트리 패널이 그려지지 않은 다음 프레임의 오래된 신호가 터미널을 막지 않게 한다.
+pub(super) fn mark_file_tree_search_keyboard_active(ctx: &egui::Context, active: bool) {
+    let frame = ctx.cumulative_frame_nr();
+    ctx.data_mut(|data| {
+        if active {
+            data.insert_temp(file_tree_search_keyboard_owner_id(), frame);
+        } else {
+            data.remove::<u64>(file_tree_search_keyboard_owner_id());
+        }
+    });
+}
+
+pub(super) fn file_tree_search_keyboard_active(ctx: &egui::Context) -> bool {
+    ctx.data(|data| data.get_temp::<u64>(file_tree_search_keyboard_owner_id()))
+        == Some(ctx.cumulative_frame_nr())
 }
 
 fn tree_typeahead_text_events(events: &[egui::Event]) -> Vec<String> {
@@ -13711,6 +13737,14 @@ mod tests {
             focus: false,
         });
         harness.step();
+        // kittest의 step은 프레임을 완료한 뒤 반환하므로, 바로 이전 프레임 번호가
+        // 등록되어 있어야 한다. workspace는 같은 프레임 안에서 이 값을 읽는다.
+        assert_eq!(
+            harness
+                .ctx
+                .data(|data| { data.get_temp::<u64>(file_tree_search_keyboard_owner_id()) }),
+            Some(harness.ctx.cumulative_frame_nr() - 1)
+        );
         harness.get_by_label("nested/Fold-note.md").click();
         harness.step();
         assert_eq!(
@@ -13723,9 +13757,24 @@ mod tests {
         drain_listings(&mut harness.state_mut().0);
         harness.step();
         assert!(harness.state().0.search.is_none());
+        assert!(!file_tree_search_keyboard_active(&harness.ctx));
         assert_eq!(harness.state().0.root.as_deref(), found.parent());
         assert_eq!(harness.state().0.selected, BTreeSet::from([found]));
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn 파일검색_키보드_소유권은_패널이_없는_다음_프레임에_남지_않는다() {
+        let ctx = egui::Context::default();
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            mark_file_tree_search_keyboard_active(ui.ctx(), true);
+            assert!(file_tree_search_keyboard_active(ui.ctx()));
+        })
+        .drop_without_applying_deltas();
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            assert!(!file_tree_search_keyboard_active(ui.ctx()));
+        })
+        .drop_without_applying_deltas();
     }
 
     /// 워크스페이스 행 우클릭 → 「워크스페이스 종료」 메뉴가 열린다 (실제 팝업 경로).

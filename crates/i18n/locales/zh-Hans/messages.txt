@@ -850,6 +850,7 @@ file_tree.set_project_path = 请设置项目路径
 file_tree.edit_workspace_path_hint = 在 环境 › 项目文件夹 中设置
 file_tree.new_folder_label = 新建文件夹：
 file_tree.location = 位置：{path}
+file_tree.invalid_name = 请输入不含斜杠的名称；不能使用 . 或 ..。
 file_tree.new_folder = 新建文件夹
 file_tree.new_file = 新建文件
 file_tree.search_files = 搜索文件

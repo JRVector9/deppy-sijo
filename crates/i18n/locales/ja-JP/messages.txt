@@ -850,6 +850,7 @@ file_tree.set_project_path = プロジェクトパスを設定してください
 file_tree.edit_workspace_path_hint = 環境メニュー › プロジェクトフォルダで設定
 file_tree.new_folder_label = 新しいフォルダ:
 file_tree.location = 場所: {path}
+file_tree.invalid_name = スラッシュを含まない名前を入力してください。. と .. は使用できません。
 file_tree.new_folder = 新しいフォルダ
 file_tree.new_file = 新しいファイル
 file_tree.search_files = ファイルを検索

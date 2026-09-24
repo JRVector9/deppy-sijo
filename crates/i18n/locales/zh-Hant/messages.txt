@@ -850,6 +850,7 @@ file_tree.set_project_path = 請設定專案路徑
 file_tree.edit_workspace_path_hint = 在 環境 › 專案資料夾 中設定
 file_tree.new_folder_label = 新增資料夾：
 file_tree.location = 位置：{path}
+file_tree.invalid_name = 請輸入不含斜線的名稱；不能使用 . 或 ..。
 file_tree.new_folder = 新增資料夾
 file_tree.new_file = 新增檔案
 file_tree.search_files = 搜尋檔案

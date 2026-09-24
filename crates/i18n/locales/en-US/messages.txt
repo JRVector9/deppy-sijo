@@ -850,6 +850,7 @@ file_tree.set_project_path = Set a project path
 file_tree.edit_workspace_path_hint = Set it in Environment › Project folder
 file_tree.new_folder_label = New folder:
 file_tree.location = Location: {path}
+file_tree.invalid_name = Enter a name without slashes; . and .. are not allowed.
 file_tree.new_folder = New folder
 file_tree.new_file = New file
 file_tree.search_files = Search files

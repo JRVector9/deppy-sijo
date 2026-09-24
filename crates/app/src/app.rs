@@ -13798,13 +13798,13 @@ fn run_file_tree_search(
                 };
                 (entry.file_name(), file_type.is_dir(), file_type.is_file())
             };
-            if !show_hidden && name.as_encoded_bytes().first() == Some(&b'.') {
-                continue;
-            }
             visited += 1;
             if visited > max_entries {
                 traversal_incomplete = true;
                 break 'walk;
+            }
+            if !show_hidden && name.as_encoded_bytes().first() == Some(&b'.') {
+                continue;
             }
             let relative = relative_parent.join(&name);
             if is_dir {
@@ -39568,6 +39568,21 @@ mod tests {
         assert!(snapshot.paths().is_empty());
         assert!(snapshot.traversal_incomplete());
         assert!(!snapshot.result_limit_reached());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_tree_search는_숨김_항목도_탐색_상한에_포함한다() {
+        let root = unique_temp_dir("file-tree-search-hidden-cap")
+            .canonicalize()
+            .unwrap();
+        std::fs::write(root.join(".hidden-a"), b"a").unwrap();
+        std::fs::write(root.join(".hidden-b"), b"b").unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let snapshot =
+            run_file_tree_search(&root, "hidden", false, 1, 20, &cancel, &cancel).unwrap();
+        assert!(snapshot.paths().is_empty());
+        assert!(snapshot.traversal_incomplete());
         std::fs::remove_dir_all(root).unwrap();
     }
 

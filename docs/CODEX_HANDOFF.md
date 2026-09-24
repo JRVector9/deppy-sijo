@@ -42,6 +42,17 @@
 - Remaining work: session 전체 테스트와 format/diff 검사 후 PR1 commit/push; PR2·PR3·PR4 rebase, 최종 검증·빌드·리뷰.
 - Exact next commands: `cd /private/tmp/deppy-ssh-screen-visible-20260924`; `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo test -p session --locked`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`.
 
+## 2026-09-24 PR3 최종 리뷰 후 숨김 항목 탐색 상한
+
+- Current objective: 파일 트리 검색이 숨김 항목이 많아도 탐색 상한을 지키게 한다. 사용자 허락 없이 앱 재실행 금지.
+- Completed work: 파일 이름이 숨김인지 판단하기 전에 탐색 항목 수를 올리고 제한을 검사한다. 숨김 파일 두 개와 최대 1개 제한의 회귀 테스트를 추가했다.
+- Modified files: `crates/app/src/app.rs`, `docs/CODEX_HANDOFF.md`.
+- Key design decisions: UI에서는 숨김 결과를 여전히 표시하지 않되 실제로 읽은 디렉터리 항목을 모두 탐색 예산에 포함한다.
+- Tests actually run: 신규 회귀 테스트 수정 전 RED, 수정 후 1 passed. `cargo test -p deppy-sijo --bin deppy-sijo --locked file_tree_search` 7 passed, `cargo fmt --all -- --check`와 `git diff --check` exit 0.
+- Failed approaches: 숨김 항목 필터를 탐색 카운터보다 먼저 처리해 상한을 우회했다.
+- Remaining work: 검색 집중 테스트와 format/diff 검사, PR2 rebase 후 PR3 rebase/commit/push, PR4 rebase, 최종 검증·빌드·리뷰.
+- Exact next commands: `cd /private/tmp/deppy-file-tree-search-20260924`; `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo test -p deppy-sijo --bin deppy-sijo --locked file_tree_search`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`.
+
 ## 2026-09-24 파일 검색 PR3 진행
 
 - Second final stack review follow-up: 누적 재리뷰가 빈 폴더 이름 검색 누락(P2)과 대기 중인 디렉터리의 symlink 교체로 루트 밖을 읽을 수 있는 문제(P2)를 찾았다. 폴더·파일 이름 모두 결과에 넣고 디렉터리 탐색은 Unix에서 root fd를 고정한 뒤 상대 경로의 모든 성분을 `openat(O_NOFOLLOW|O_DIRECTORY)`로 열어 `fdopendir/readdir/fstatat(AT_SYMLINK_NOFOLLOW)`로 순회한다. 대기 경로가 symlink로 교체되면 탐색 미완료로 처리하고 밖으로 이동하지 않는다. host 검색 6 passed(빈 폴더, 교체 symlink 포함), 결과→트리 kittest에 폴더 결과를 추가해 passed. 최신 Clippy exit 0, rustfmt 실행. `/dev/fd/N`을 `std::fs::read_dir`로 여는 첫 시도는 macOS에서 ENOTDIR로 실패해 fdopendir로 변경했다. 테스트 중 한 번 잘못 입력한 `DEVELOPER_DIR=/Library/CommandLineTools`로 linker가 실패했고 올바른 CLT 경로로 재실행해 통과했다. PR2/3/4 rebase와 최종 재빌드가 남았다. 앱 재실행 금지.

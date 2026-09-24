@@ -1,13 +1,13 @@
-## 2026-09-24 PR5 최종 리뷰 완료·PR 게시 대기
+## 2026-09-24 PR5 draft PR 게시 완료
 
-- Current objective: 탭 여백 클릭으로 현재 워크스페이스에 셸을 바로 여는 PR5를 커밋·푸시하고 #194 위에 draft PR로 게시한다. 앱 재실행 금지.
-- Completed work: cmux surface 탭의 새 세션 진입을 참고한 `+`/여백 클릭 UI와 정확한 workspace/runtime 대상 지정, Busy 재시도, 숨김 상태 처리, warm 축출 방지, 종료 취소, primary 입력 소유권을 구현했다. 여덟 번째 `codex review --uncommitted` 결과는 actionable finding 없음. 기존 네 PR 누적 열 번째 리뷰도 actionable finding 없음.
+- Current objective: #191→#195의 다섯 draft PR을 리뷰 가능한 상태로 유지한다. 이번 요청의 구현·재빌드·게시 완료. 앱 재실행 금지.
+- Completed work: cmux surface 탭의 새 세션 진입을 참고한 `+`/여백 클릭 UI와 정확한 workspace/runtime 대상 지정, Busy 재시도, 숨김 상태 처리, warm 축출 방지, 종료 취소, primary 입력 소유권을 구현했다. 여덟 번째 `codex review --uncommitted` 결과는 actionable finding 없음. 기존 네 PR 누적 열 번째 리뷰도 actionable finding 없음. PR #195 `https://github.com/JRVector9/deppy-sijo/pull/195`를 #194 base로 draft 게시했고 GitHub에서 OPEN/draft 및 base/head를 확인했다. 커밋 `79c4ec37`.
 - Modified files: `crates/app/src/app.rs`, `crates/app/src/ui/workspace.rs`, `docs/CODEX_HANDOFF.md`.
 - Key design decisions: 새 셸 탭은 에이전트 런처와 별도이며, 클릭 당시 runtime에 연결한다. 헤더는 기존 pane의 FocusPane을 보내지 않고 primary 입력 소유권을 요청한다. controller/protocol/dotenv/runtime 큐의 Busy는 50ms 후 logic 루프에서 재시도한다. 닫힘 상태와 warm 이동을 보존한다.
 - Tests actually run: 최종 코드 `새_셸` 7 passed, `kittest_세션` 6 passed, `warm_eviction` 2 passed, app shell-tab 회귀 2 passed, dotenv Backpressure 1 passed. strict Clippy(app/session/runtime), format, diff, UI boundary exit 0. release app/proxy build exit 0. Developer ID 앱/ZIP 검증을 포함한 macOS package exit 0(`explicitly untrusted development bundle`). 앱은 실행하지 않았다.
 - Failed approaches: 이전 리뷰에서 controller 경합/대상 변경/전달 Busy/닫힘/포커스 경계/숨김 상태/primary 입력과 warm 노출 문제를 찾아 수정했다. 세부 경위는 아래 단계별 항목 참조.
-- Remaining work: handoff·PR body 최종 확인, `git diff --check`, 커밋·푸시·draft PR 생성 및 PR 상태 확인. 앱 재실행 금지.
-- Exact next commands: `cd /private/tmp/deppy-blank-tab-new-shell-20260924`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git add crates/app/src/app.rs crates/app/src/ui/workspace.rs docs/CODEX_HANDOFF.md`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git commit -m 'Open shell from empty session tab area'`.
+- Remaining work: 이번 요청의 구현·검증·게시에는 남은 작업 없음. 병합은 요청 시 #191→#195 순서로 진행한다. 앱 재실행 금지.
+- Exact next commands: `cd /private/tmp/deppy-blank-tab-new-shell-20260924`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git status --short --branch`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools gh pr view 195 --json number,isDraft,state,baseRefName,headRefName,url`.
 
 ## 2026-09-24 PR5 일곱 번째 리뷰 후 전달·포커스·노출 경계
 

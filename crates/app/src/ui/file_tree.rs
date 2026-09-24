@@ -3597,7 +3597,8 @@ impl FileTreeUi {
                     }
                     // Finder 드래그 대상: 폴더 행 하이라이트 + 드롭 대상 기록 (§과제①).
                     // 드래그 중엔 egui 포인터가 멎으므로 drag_pos(AppKit 위치)로 판정한다.
-                    if !inaccessible
+                    if !create_modal_open
+                        && !inaccessible
                         && let Some(pos) = drag_pos
                         && tree_area_owns_os_drop(hover_rect, pos)
                     {
@@ -3949,7 +3950,7 @@ impl FileTreeUi {
                 Err(code) => self.reject_io(code),
             }
         }
-        if let Some((src, dst_dir)) = drop_action {
+        if !create_modal_open && let Some((src, dst_dir)) = drop_action {
             self.start_move(src, dst_dir);
         }
 
@@ -3978,7 +3979,10 @@ impl FileTreeUi {
             tree_row_pitch(row_height, ui.spacing()),
         );
         let tree_area = header_rect.union(scroll_output.inner_rect);
-        if os_drag_active && drag_pos.is_some_and(|pos| tree_area_owns_os_drop(tree_area, pos)) {
+        if !create_modal_open
+            && os_drag_active
+            && drag_pos.is_some_and(|pos| tree_area_owns_os_drop(tree_area, pos))
+        {
             if !drag_row_highlighted {
                 // 행 위가 아니면 루트 반입 — 외곽선 대신 면으로 덮는다(2026-08-10 사용자:
                 // 외곽 테두리 제거). 폴더 행 강조와 같은 언어라 "이 영역이 받는다"로 읽힌다.
@@ -3992,7 +3996,8 @@ impl FileTreeUi {
             // 포인터를 따라온다. hovered_files가 비면 요청도 즉시 끝나며 timer는 남지 않는다.
             ui.ctx().request_repaint();
         }
-        if !os_dropped.is_empty()
+        if !create_modal_open
+            && !os_dropped.is_empty()
             && drag_pos.is_some_and(|pos| tree_area_owns_os_drop(tree_area, pos))
             && let Some(root) = self.root.clone()
         {
@@ -15393,6 +15398,49 @@ mod tests {
         );
         std::fs::remove_dir_all(&base).unwrap();
         std::fs::remove_dir_all(&src_home).unwrap();
+    }
+
+    #[test]
+    fn kittest_생성_모달_뒤로_finder_파일을_드롭해도_복사하지_않는다() {
+        use egui_kittest::kittest::Queryable;
+
+        let base = temp_root("modal-os-drop").canonicalize().unwrap();
+        std::fs::create_dir(base.join("dropdir")).unwrap();
+        let source_home = temp_root("modal-os-drop-src");
+        let source = source_home.join("payload.txt");
+        std::fs::write(&source, b"drop").unwrap();
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.set_root(Some(base.clone()));
+        drain_listings(&mut tree);
+        let mut harness = drop_harness(&catalog, tree);
+        for _ in 0..200 {
+            harness.step();
+            if harness.query_by_label("dropdir").is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let row_pos = harness.get_by_label("dropdir").rect().center();
+        harness.state_mut().0.start_edit(EditState::NewFolder {
+            parent: base.clone(),
+            buffer: String::new(),
+            focus: false,
+        });
+        harness.step();
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::PointerMoved(row_pos));
+        harness
+            .input_mut()
+            .dropped_files
+            .push(crate::test_dropped_file::handle(source.clone()));
+        harness.step();
+        assert!(harness.state_mut().0.take_io_intent().is_none());
+        assert!(source.exists());
+        std::fs::remove_dir_all(base).unwrap();
+        std::fs::remove_dir_all(source_home).unwrap();
     }
 
     /// 클립보드 ⌘V 붙여넣기(§과제②): 트리 빈 영역(hover 행 없음)에서는 루트로 복사되고,

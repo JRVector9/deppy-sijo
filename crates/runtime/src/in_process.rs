@@ -4250,21 +4250,19 @@ impl Worker {
     fn trim_live_over_budget(&mut self, visible: &[SessionId]) -> bool {
         let budget = self.cache_budget_bytes;
         let mut trimmed_any = false;
-        // 보존된 이전 화면은 backend scrollback 밖의 셀 버퍼다. 먼저 안 보이는
-        // 세션의 큰 버퍼부터 해제하고, 그래도 부족할 때만 보이는 세션을 풀어
-        // 사용자가 보는 최신 화면을 라이브 backend로 전환한다.
-        let mut held_candidates: Vec<(SessionId, usize, bool)> = self
+        // 보존된 이전 화면은 backend scrollback 밖의 셀 버퍼다. 숨긴 화면을
+        // 먼저 회수하고, 보이는 화면은 scrollback 트림으로도 부족할 때만 해제한다.
+        let mut hidden_held: Vec<(SessionId, usize)> = self
             .sessions
             .iter()
             .filter_map(|(id, session)| {
                 let bytes = session.retained_viewport_bytes();
-                (bytes > 0).then_some((*id, bytes, visible.contains(id)))
+                (bytes > 0 && !visible.contains(id)).then_some((*id, bytes))
             })
             .collect();
-        held_candidates
-            .sort_by_key(|(_, bytes, is_visible)| (*is_visible, std::cmp::Reverse(*bytes)));
+        hidden_held.sort_by_key(|(_, bytes)| std::cmp::Reverse(*bytes));
         let mut cache_bytes = self.terminal_cache_bytes();
-        for (id, bytes, was_visible) in held_candidates {
+        for (id, bytes) in hidden_held {
             if cache_bytes <= budget {
                 break;
             }
@@ -4276,7 +4274,7 @@ impl Worker {
                 tracing::warn!(
                     session = id.0,
                     retained_bytes = bytes,
-                    visible = was_visible,
+                    visible = false,
                     "전역 터미널 캐시 예산 초과 — 복원 화면 보관 셀 해제"
                 );
             }
@@ -4307,14 +4305,7 @@ impl Worker {
                 .filter(|e| !cannot_trim.contains(&e.id))
                 .collect();
             let Some((id, target)) = select_next_live_trim(&candidates, cache_bytes, budget) else {
-                if cache_bytes > budget {
-                    tracing::warn!(
-                        budget,
-                        actual = cache_bytes,
-                        "모든 세션을 최소 스크롤백까지 줄였으나 전역 예산 초과 지속"
-                    );
-                }
-                return trimmed_any;
+                break;
             };
             let over_bytes = cache_bytes.saturating_sub(budget);
             let was_visible = visible.contains(&id);
@@ -4335,6 +4326,41 @@ impl Worker {
                 "전역 터미널 캐시 예산 초과 — live 세션 스크롤백 트림"
             );
         }
+        let mut visible_held: Vec<(SessionId, usize)> = self
+            .sessions
+            .iter()
+            .filter_map(|(id, session)| {
+                let bytes = session.retained_viewport_bytes();
+                (bytes > 0 && visible.contains(id)).then_some((*id, bytes))
+            })
+            .collect();
+        visible_held.sort_by_key(|(_, bytes)| std::cmp::Reverse(*bytes));
+        let mut cache_bytes = self.terminal_cache_bytes();
+        for (id, bytes) in visible_held {
+            if cache_bytes <= budget {
+                break;
+            }
+            if let Some(session) = self.sessions.get_mut(&id)
+                && session.release_held_viewport()
+            {
+                cache_bytes = cache_bytes.saturating_sub(bytes);
+                trimmed_any = true;
+                tracing::warn!(
+                    session = id.0,
+                    retained_bytes = bytes,
+                    visible = true,
+                    "전역 터미널 캐시 예산 초과 — 복원 화면 보관 셀 해제"
+                );
+            }
+        }
+        if cache_bytes > budget {
+            tracing::warn!(
+                budget,
+                actual = cache_bytes,
+                "복원 화면과 스크롤백 트림 후 전역 예산 초과 지속"
+            );
+        }
+        trimmed_any
     }
 
     /// exited 세션의 scrollback을 zlib 압축 아카이브 항목으로 만든다.
@@ -5532,6 +5558,55 @@ mod tests {
                 .collect::<String>()
                 .contains("LIVE-PROMPT")
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn 숨긴_스크롤백으로_예산을_맞출_수_있으면_보이는_복원_화면을_남긴다() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, _) = admission_worker(resolver, "visible-held-priority");
+        let hidden_id = SessionId(89);
+        let visible_id = SessionId(90);
+        let mut hidden = Session::spawn_with_spec(
+            hidden_id,
+            session::SessionKind::Shell,
+            &spec("/bin/cat", &[]),
+            20,
+            6,
+            1000,
+        )
+        .unwrap();
+        let history = (0..500)
+            .map(|line| format!("history-{line}\r\n"))
+            .collect::<String>();
+        hidden.replay_ansi(&mut history.as_bytes()).unwrap();
+        let old_history = hidden.cache_footprint().history_lines;
+        assert!(old_history > LIVE_TRIM_FLOOR_LINES);
+        let mut visible = Session::spawn_with_spec(
+            visible_id,
+            session::SessionKind::Shell,
+            &spec("/bin/cat", &[]),
+            20,
+            6,
+            100,
+        )
+        .unwrap();
+        visible
+            .replay_ansi(&mut b"REMOTE-SCREEN".as_slice())
+            .unwrap();
+        visible.finish_ansi_replay().unwrap();
+        let held_bytes = visible.retained_viewport_bytes();
+        assert!(held_bytes > 0);
+        worker.insert_session(hidden_id, hidden);
+        worker.insert_session(visible_id, visible);
+        worker.cache_budget_bytes = worker.terminal_cache_bytes() - held_bytes / 2;
+        assert!(worker.trim_live_over_budget(&[visible_id]));
+        assert!(worker.sessions[&visible_id].retained_viewport_bytes() > 0);
+        assert!(worker.sessions[&hidden_id].cache_footprint().history_lines < old_history);
+        assert!(worker.terminal_cache_bytes() <= worker.cache_budget_bytes);
     }
 
     #[test]

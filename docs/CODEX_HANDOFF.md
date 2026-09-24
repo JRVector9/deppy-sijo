@@ -1,3 +1,14 @@
+## 2026-09-24 PR1 최종 리뷰 후 보이는 복원 화면 우선 보존
+
+- Current objective: 전역 메모리 예산 초과 시 숨겨진 스크롤백을 먼저 회수해 현재 보이는 SSH 복원 화면을 불필요하게 잃지 않는다. 사용자 허락 없이 앱 재실행 금지.
+- Completed work: 숨긴 세션의 보존 화면을 먼저 해제하고 기존 숨김 우선 scrollback 트림을 실행한다. 그 후에도 예산을 넘을 때만 보이는 복원 화면을 해제한다. 메모리 회수 순서를 확인하는 회귀 테스트를 추가했다.
+- Modified files: `crates/runtime/src/in_process.rs`, `docs/CODEX_HANDOFF.md`.
+- Key design decisions: 화면을 실제로 보고 있는 사용자의 복원 내용은 숨겨진 데이터와 scrollback보다 오래 보존한다. 기존 `select_next_live_trim`의 숨김 우선 정책을 유지한다.
+- Tests actually run: 새 회귀 테스트 수정 전 RED, 수정 후 GREEN. 기존 복원 화면 강제 회수 테스트도 GREEN. `cargo test -p runtime --lib --locked -- --test-threads=1` 309 passed; `cargo clippy -p runtime -p session -p deppy-sijo --all-targets --locked -- -D warnings`, `cargo fmt --all -- --check`, `git diff --check` exit 0.
+- Failed approaches: 보존 화면을 숨김/보임 순서로 모두 해제한 뒤 scrollback을 줄여 작은 초과에도 보이는 화면이 사라졌다.
+- Remaining work: PR1 commit/push, PR2·PR3·PR4 rebase, 최종 스택 검증·코드 리뷰·release 재빌드. 앱 재실행 금지.
+- Exact next commands: `cd /private/tmp/deppy-ssh-screen-visible-20260924`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git add crates/runtime/src/in_process.rs docs/CODEX_HANDOFF.md`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git commit -m 'Preserve visible restored screens during cache trimming'`.
+
 ## 2026-09-24 PR1 최종 리뷰 후 셸 종료·한글 셀 경계
 
 - Current objective: 복원된 원격 셸 화면을 유지하되 새 셸이 종료하면 마지막 출력을 보이고, 창 폭 축소가 한글 wide 셀을 잘라도 유효한 화면을 발행한다. 사용자 허락 없이 앱 재실행 금지.

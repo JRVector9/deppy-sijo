@@ -1,3 +1,14 @@
+## 2026-09-24 커밋·재리뷰·PR 갱신 완료
+
+- Current objective: 사용자가 요청한 커밋과 코드 리뷰를 완료했다. 앱 재실행 금지.
+- Completed work: 기본 작업 디렉터리 문서·HTML 시안 5개 파일을 `feat/fleet-one-list-and-relay-wip`의 `331b78b3`으로 커밋했다(로컬만, 원격 미푸시). PR #195 기능 커밋 재리뷰 P2 2건을 고치고 후속 리뷰 P2 1건도 고쳤다. 최종 `codex review --uncommitted`에서 actionable regression 없음. 수정 코드를 `47ba516d`로 커밋·푸시하고 PR #195 설명을 갱신했다. Obsidian `프로젝트 일지/deppy-sijo/2026-09-24 새 셸 탭 재리뷰와 문서 커밋.md`에 기록했다.
+- Modified files: PR #195의 `crates/app/src/app.rs`, `crates/app/src/ui/workspace.rs`; 이 handoff. 별도 기본 작업 디렉터리의 `AGENTS.md`, `CLAUDE.md`, handoff 및 HTML 시안 두 개.
+- Key design decisions: 클릭별 별도 요청, 지수 증가형 8회 재시도, 최종 실패 알림 wake. 문서 커밋은 현재 WIP 브랜치에 유지하고 PR #195 소스 수정은 별도 worktree/PR에만 넣었다.
+- Tests actually run: PR5 최신 소스 `새_셸` 9, 세션 UI 6, warm eviction 2, app shell-tab 3, dotenv Backpressure 1 passed. strict Clippy(app/session/runtime), format, diff, UI boundary exit 0. release app/proxy 빌드 및 Developer ID 앱/ZIP package 검증 exit 0. 앱은 실행하지 않았다. 문서 커밋의 staged diff check exit 0.
+- Failed approaches: 첫 코드 리뷰의 P2 두 건과 수정 diff 첫 재리뷰의 P2 한 건을 모두 수정했다. `codex review --commit`과 추가 prompt를 함께 주면 CLI가 exit 2로 거부해 `--commit 79c4ec37`만 사용했다. 리뷰어의 `cargo test --lib`는 앱에 library target이 없어 실패했으나 bin 포함 `cargo test -p deppy-sijo 새_셸 --locked`는 9 passed. GitHub Actions는 계정 billing/spending limit 때문에 job 실행 전 실패한다.
+- Remaining work: 이번 요청의 소스 수정·로컬 검증·PR 갱신은 완료. GitHub 계정 결제/한도 해결 후 PR #195 체크 재실행 필요. 로컬 문서 커밋 `331b78b3` push 여부는 별도 결정 가능. 앱 재실행 금지.
+- Exact next commands: `cd /private/tmp/deppy-blank-tab-new-shell-20260924`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git status --short --branch`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools gh pr view 195 --json number,isDraft,state,baseRefName,headRefName,url`; `cd /Users/jr/Desktop/projects/deppy-sijo`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git status --short --branch`.
+
 ## 2026-09-24 PR5 재리뷰 후 최종 실패 알림 깨우기
 
 - Current objective: 재시도 상한 도달 직후 유휴 앱에도 실패 알림을 표시한 뒤 최종 검증·리뷰·커밋을 완료한다. 앱 재실행 금지.

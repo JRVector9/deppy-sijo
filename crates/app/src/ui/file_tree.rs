@@ -671,6 +671,8 @@ pub struct FileTreeIoCompletion {
 const FILE_TREE_MAINTENANCE_QUEUE_CAP: usize = 1;
 pub const FILE_TREE_LISTING_MAX_ITEMS: usize = 4_096;
 pub const FILE_TREE_LISTING_MAX_BYTES: usize = 4 * 1024 * 1024;
+pub const FILE_TREE_SEARCH_MAX_ENTRIES: usize = 50_000;
+pub const FILE_TREE_SEARCH_MAX_RESULTS: usize = 100;
 const FILE_TREE_RETAINED_MAX_ITEMS: usize = 16_384;
 const FILE_TREE_RETAINED_MAX_BYTES: usize = 16 * 1024 * 1024;
 pub const FILE_TREE_WATCH_MAX_DIRECTORIES: usize = 256;
@@ -832,6 +834,14 @@ pub enum FileTreeMaintenanceRequest {
         max_items: usize,
         max_bytes: usize,
     },
+    SearchFiles {
+        root: FileTreePathPayload,
+        query: String,
+        show_hidden: bool,
+        max_entries: usize,
+        max_results: usize,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    },
     ReplaceWatchSet(FileTreeWatchPlan),
 }
 
@@ -848,6 +858,19 @@ impl std::fmt::Debug for FileTreeMaintenanceRequest {
                 .field("directory", &"REDACTED")
                 .field("max_items", max_items)
                 .field("max_bytes", max_bytes)
+                .finish(),
+            Self::SearchFiles {
+                show_hidden,
+                max_entries,
+                max_results,
+                ..
+            } => f
+                .debug_struct("SearchFiles")
+                .field("root", &"REDACTED")
+                .field("query", &"REDACTED")
+                .field("show_hidden", show_hidden)
+                .field("max_entries", max_entries)
+                .field("max_results", max_results)
                 .finish(),
             Self::ReplaceWatchSet(plan) => f.debug_tuple("ReplaceWatchSet").field(plan).finish(),
         }
@@ -882,7 +905,57 @@ pub enum FileTreeMaintenanceErrorCode {
 
 pub enum FileTreeMaintenanceResult {
     Listing(FileTreeListingSnapshot),
+    Search(FileTreeSearchSnapshot),
     WatchSetApplied,
+}
+
+pub struct FileTreeSearchSnapshot {
+    paths: Vec<PathBuf>,
+    result_limit_reached: bool,
+    traversal_incomplete: bool,
+}
+
+impl FileTreeSearchSnapshot {
+    pub fn try_new(
+        paths: Vec<PathBuf>,
+        result_limit_reached: bool,
+        traversal_incomplete: bool,
+    ) -> Result<Self, FileTreeMaintenanceErrorCode> {
+        if paths.len() > FILE_TREE_SEARCH_MAX_RESULTS {
+            return Err(FileTreeMaintenanceErrorCode::InvalidSnapshot);
+        }
+        let mut bytes = 0usize;
+        for path in &paths {
+            let encoded = path.as_os_str().as_encoded_bytes();
+            bytes = bytes
+                .checked_add(encoded.len())
+                .filter(|total| *total <= FILE_TREE_LISTING_MAX_BYTES)
+                .ok_or(FileTreeMaintenanceErrorCode::InvalidSnapshot)?;
+            if encoded.is_empty()
+                || encoded.contains(&0)
+                || encoded.len() > FILE_TREE_PATH_MAX_BYTES
+            {
+                return Err(FileTreeMaintenanceErrorCode::InvalidSnapshot);
+            }
+        }
+        Ok(Self {
+            paths,
+            result_limit_reached,
+            traversal_incomplete,
+        })
+    }
+
+    pub fn paths(&self) -> &[PathBuf] {
+        &self.paths
+    }
+
+    pub fn result_limit_reached(&self) -> bool {
+        self.result_limit_reached
+    }
+
+    pub fn traversal_incomplete(&self) -> bool {
+        self.traversal_incomplete
+    }
 }
 
 pub struct FileTreeMaintenanceCompletion {
@@ -985,6 +1058,23 @@ enum PendingFileTreeMaintenance {
         operation: FileTreeMaintenanceOperation,
         generation: u64,
     },
+    Search {
+        operation: FileTreeMaintenanceOperation,
+        generation: u64,
+        query: String,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    },
+}
+
+struct FileTreeSearch {
+    query: String,
+    results: Vec<PathBuf>,
+    selected: Option<PathBuf>,
+    busy: bool,
+    result_limit_reached: bool,
+    traversal_incomplete: bool,
+    focus: bool,
+    keyboard_focused_last_frame: bool,
 }
 
 /// 펼친 하위 목록의 순회 위치만 보관한다. 전체 경로 목록을 대기열에 복제하지 않는다.
@@ -1129,6 +1219,10 @@ pub struct FileTreeUi {
     selected: BTreeSet<PathBuf>,
     /// Shift 범위 선택의 기준점 — 마지막으로 단독 선택하거나 토글한 행.
     select_anchor: Option<PathBuf>,
+    search: Option<FileTreeSearch>,
+    search_requested: Option<String>,
+    search_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    reveal_path: Option<PathBuf>,
     /// 파일 트리 포커스에서 연속 입력한 폴더 이름 접두어.
     typeahead_prefix: String,
     typeahead_last_at: Option<f64>,
@@ -1219,6 +1313,10 @@ impl FileTreeUi {
             last_sidebar_active_workspace: None,
             selected: BTreeSet::new(),
             select_anchor: None,
+            search: None,
+            search_requested: None,
+            search_cancel: None,
+            reveal_path: None,
             typeahead_prefix: String::new(),
             typeahead_last_at: None,
             marquee: None,
@@ -1380,6 +1478,11 @@ impl FileTreeUi {
             | PendingFileTreeMaintenance::WatchSet {
                 operation,
                 generation,
+            }
+            | PendingFileTreeMaintenance::Search {
+                operation,
+                generation,
+                ..
             } => {
                 *operation == completion.operation
                     && *generation == completion.generation
@@ -1402,11 +1505,39 @@ impl FileTreeUi {
                 PendingFileTreeMaintenance::WatchSet { .. },
                 Ok(FileTreeMaintenanceResult::WatchSetApplied),
             ) => {}
+            (
+                PendingFileTreeMaintenance::Search { query, cancel, .. },
+                Ok(FileTreeMaintenanceResult::Search(snapshot)),
+            ) => {
+                if let (Some(root), Some(search)) = (self.root.as_ref(), self.search.as_mut())
+                    && search.query == query
+                    && !cancel.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    search.results = snapshot
+                        .paths()
+                        .iter()
+                        .filter(|path| path.starts_with(root))
+                        .cloned()
+                        .collect();
+                    search.result_limit_reached = snapshot.result_limit_reached();
+                    search.traversal_incomplete = snapshot.traversal_incomplete();
+                    search.busy = false;
+                }
+            }
             (PendingFileTreeMaintenance::Listing { path, .. }, Err(code)) => {
                 self.apply_maintenance_error(&path, code);
             }
             (PendingFileTreeMaintenance::WatchSet { .. }, Err(code)) => {
                 self.error = Some(file_tree_maintenance_error_message(code).to_owned());
+            }
+            (PendingFileTreeMaintenance::Search { query, cancel, .. }, Err(code)) => {
+                if let Some(search) = self.search.as_mut()
+                    && search.query == query
+                    && !cancel.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    search.busy = false;
+                    self.error = Some(file_tree_maintenance_error_message(code).to_owned());
+                }
             }
             _ => {
                 self.error = Some("파일 트리 host 결과 종류가 요청과 일치하지 않습니다".to_owned());
@@ -1492,6 +1623,39 @@ impl FileTreeUi {
     fn drive_maintenance(&mut self) {
         debug_assert_eq!(FILE_TREE_MAINTENANCE_QUEUE_CAP, 1);
         if self.maintenance_intent.is_some() || self.pending_maintenance.is_some() {
+            return;
+        }
+        if let Some(query) = self.search_requested.take()
+            && let Some(root) = self.root.clone()
+            && !query.is_empty()
+            && let Some(cancel) = self.search_cancel.clone()
+        {
+            let Ok(root) = FileTreePathPayload::try_new(root) else {
+                self.error = Some("파일 트리 루트 경로가 허용된 크기를 초과했습니다".to_owned());
+                return;
+            };
+            let operation = FileTreeMaintenanceOperation(self.next_maintenance_operation);
+            self.next_maintenance_operation =
+                self.next_maintenance_operation.wrapping_add(1).max(1);
+            let generation = self.maintenance_generation;
+            self.maintenance_intent = Some(FileTreeMaintenanceIntent {
+                operation,
+                generation,
+                request: FileTreeMaintenanceRequest::SearchFiles {
+                    root,
+                    query: query.clone(),
+                    show_hidden: self.show_hidden,
+                    max_entries: FILE_TREE_SEARCH_MAX_ENTRIES,
+                    max_results: FILE_TREE_SEARCH_MAX_RESULTS,
+                    cancel: cancel.clone(),
+                },
+            });
+            self.pending_maintenance = Some(PendingFileTreeMaintenance::Search {
+                operation,
+                generation,
+                query,
+                cancel,
+            });
             return;
         }
         while let Some(path) = self.next_refresh_directory() {
@@ -1861,6 +2025,12 @@ impl FileTreeUi {
         self.trash_queue.clear();
         self.selected.clear();
         self.select_anchor = None;
+        if let Some(cancel) = self.search_cancel.take() {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.search = None;
+        self.search_requested = None;
+        self.reveal_path = None;
         self.typeahead_prefix.clear();
         self.typeahead_last_at = None;
         self.marquee = None;
@@ -1982,6 +2152,7 @@ impl FileTreeUi {
         sidebar: &SidebarSnapshot<'_>,
         catalog: &i18n::Catalog,
     ) -> Option<SidebarAction> {
+        mark_file_tree_search_keyboard_active(ui.ctx(), false);
         let navigation_action = self.navigation_rail_panel(ui, sidebar, catalog);
         let project_action = self.project_file_panel(ui, sessions_by_workspace, sidebar, catalog);
         let action = project_action.or(navigation_action);
@@ -2841,6 +3012,7 @@ impl FileTreeUi {
 
         let mut create_folder = false;
         let mut create_file = false;
+        let mut open_search = false;
         let status_listing = matches!(
             self.pending_maintenance,
             Some(PendingFileTreeMaintenance::Listing { .. })
@@ -2879,6 +3051,13 @@ impl FileTreeUi {
                     create_file = true;
                     ui.close();
                 }
+                if ui
+                    .button(catalog.t("file_tree.search_files", &[]))
+                    .clicked()
+                {
+                    open_search = true;
+                    ui.close();
+                }
                 let hidden_label = if self.show_hidden {
                     catalog.t("file_tree.hide_hidden_files", &[])
                 } else {
@@ -2898,8 +3077,27 @@ impl FileTreeUi {
                 // 다시 드러난 펼친 폴더도 순회 대상에 포함해 숨겨져 있던 캐시를 갱신한다.
                 self.refresh();
                 self.rebuild_flat();
+                if let Some(query) = self.search.as_ref().map(|search| search.query.clone())
+                    && !query.is_empty()
+                {
+                    self.request_file_search(query);
+                }
             }
             tool_right -= 20.0;
+        }
+        if open_search {
+            self.close_file_search();
+            self.search = Some(FileTreeSearch {
+                query: String::new(),
+                results: Vec::new(),
+                selected: None,
+                busy: false,
+                result_limit_reached: false,
+                traversal_incomplete: false,
+                focus: true,
+                keyboard_focused_last_frame: false,
+            });
+            self.search_requested = None;
         }
         if visible_tools >= 2 {
             let rect = egui::Rect::from_min_size(
@@ -2923,6 +3121,11 @@ impl FileTreeUi {
             .clicked()
             {
                 self.refresh();
+                if let Some(query) = self.search.as_ref().map(|search| search.query.clone())
+                    && !query.is_empty()
+                {
+                    self.request_file_search(query);
+                }
             }
             if status_listing {
                 // 조회 중임은 고정된 도구 영역에서만 표시한다. 행 삽입이나 스피너의
@@ -2977,6 +3180,7 @@ impl FileTreeUi {
         // 파일 트리·에러 표시는 그리지 않는다 — 파일 오류는 「파일」 탭으로 돌아오면
         // `self.error`가 그대로 남아 있어 다시 보인다.
         if self.selected_tool == SidebarTool::Notes {
+            self.close_file_search();
             let note_action = self.notes.render(
                 ui,
                 super::notes::NotesInput {
@@ -3055,6 +3259,7 @@ impl FileTreeUi {
         if (create_file || create_folder)
             && let Some(parent) = self.creation_parent()
         {
+            self.close_file_search();
             if create_file {
                 self.start_edit(EditState::NewFile {
                     parent,
@@ -3110,6 +3315,18 @@ impl FileTreeUi {
             }
             if let Some(parent) = parent_navigation {
                 self.set_root(Some(parent));
+                ui.ctx().request_repaint();
+            }
+            return action;
+        }
+
+        if self.search.is_some() {
+            self.permanent_delete_confirm(ui, catalog);
+            let search_keyboard_focused = self.render_file_search(ui, catalog);
+            mark_file_tree_search_keyboard_active(ui.ctx(), search_keyboard_focused);
+            if let Some(parent) = parent_navigation {
+                self.set_root(Some(parent));
+                mark_file_tree_search_keyboard_active(ui.ctx(), false);
                 ui.ctx().request_repaint();
             }
             return action;
@@ -3261,6 +3478,16 @@ impl FileTreeUi {
         } else {
             None
         };
+        let pending_reveal = self
+            .reveal_path
+            .as_ref()
+            .and_then(|path| self.flat.iter().position(|row| &row.path == path));
+        if let Some(index) = pending_reveal {
+            let path = self.flat[index].path.clone();
+            self.apply_selection_click(&path, SelectionClick::Replace);
+            self.reveal_path = None;
+        }
+        let reveal = typeahead_reveal.or(pending_reveal);
         let mut toggle: Option<PathBuf> = None;
         let mut navigate_root: Option<PathBuf> = parent_navigation;
         let mut open_file: Option<PathBuf> = None; // 파일 더블클릭 → 연결 프로그램 열기
@@ -3298,7 +3525,7 @@ impl FileTreeUi {
         let mut select_click: Option<(PathBuf, SelectionClick)> = None;
         // 빈 영역을 클릭했다 — 선택 해제.
         let mut clear_selection = false;
-        let scroll_output = file_tree_scroll_area(ui, row_height, typeahead_reveal)
+        let scroll_output = file_tree_scroll_area(ui, row_height, reveal)
             .id_salt("file_tree_rows")
             .auto_shrink([false, false])
             .show_rows(ui, row_height, total, |ui, range| {
@@ -4376,6 +4603,146 @@ impl FileTreeUi {
         Some(index)
     }
 
+    fn render_file_search(&mut self, ui: &mut egui::Ui, catalog: &i18n::Catalog) -> bool {
+        let Some(root) = self.root.as_ref() else {
+            return false;
+        };
+        if let Some(error) = self.error.clone() {
+            ui.horizontal(|ui| {
+                ui.colored_label(ui.visuals().error_fg_color, error);
+                if ui.small_button("×").clicked() {
+                    self.error = None;
+                }
+            });
+        }
+        let mut changed_query = None;
+        let mut close = false;
+        let mut reveal = None;
+        let mut keyboard_focused = false;
+        if let Some(search) = self.search.as_mut() {
+            ui.horizontal(|ui| {
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut search.query)
+                        .hint_text(catalog.t("search.placeholder", &[]))
+                        .desired_width((ui.available_width() - 28.0).max(60.0)),
+                );
+                if search.focus {
+                    response.request_focus();
+                    search.focus = false;
+                }
+                keyboard_focused |= response.has_focus();
+                if response.changed() {
+                    while search.query.len() > 256 {
+                        search.query.pop();
+                    }
+                    changed_query = Some(search.query.clone());
+                }
+                let close_button = ui
+                    .small_button("×")
+                    .on_hover_text(catalog.t("search.close", &[]));
+                keyboard_focused |= close_button.has_focus();
+                close = close_button.clicked();
+            });
+            if search.busy {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new().size(12.0));
+                    ui.weak(catalog.t("file_tree.searching", &[]));
+                });
+            } else if !search.query.is_empty()
+                && search.results.is_empty()
+                && !search.traversal_incomplete
+            {
+                ui.weak(catalog.t("search.no_match", &[]));
+            }
+            if search.result_limit_reached {
+                ui.weak(catalog.t("search.truncated", &[]));
+            }
+            if search.traversal_incomplete {
+                ui.weak(catalog.t("file_tree.search_incomplete", &[]));
+            }
+            if let Some(path) = search.selected.as_ref() {
+                let show_in_tree = ui.button(catalog.t("file_tree.show_in_tree", &[]));
+                keyboard_focused |= show_in_tree.has_focus();
+                if show_in_tree.clicked() {
+                    reveal = Some(path.clone());
+                }
+            }
+            egui::ScrollArea::vertical()
+                .id_salt("file_tree_search_results")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for path in &search.results {
+                        let label = path.strip_prefix(root).unwrap_or(path);
+                        let result = ui
+                            .selectable_label(
+                                search.selected.as_ref() == Some(path),
+                                super::path_display(label),
+                            )
+                            .on_hover_text(super::path_display(path));
+                        keyboard_focused |= result.has_focus();
+                        if result.clicked() {
+                            search.selected = Some(path.clone());
+                        }
+                    }
+                });
+        }
+        // egui는 Escape를 위젯에 전달하기 전에 포커스를 해제할 수 있다. 직전
+        // 프레임에 검색이 키보드를 소유했다면 닫고, 같은 프레임의 PTY 입력도 막는다.
+        let escape_from_search = ui.input(|input| input.key_pressed(egui::Key::Escape))
+            && (keyboard_focused
+                || self
+                    .search
+                    .as_ref()
+                    .is_some_and(|search| search.keyboard_focused_last_frame));
+        close |= escape_from_search;
+        if close {
+            self.close_file_search();
+            return escape_from_search;
+        }
+        if let Some(search) = self.search.as_mut() {
+            search.keyboard_focused_last_frame = keyboard_focused;
+        }
+        if let Some(query) = changed_query {
+            self.request_file_search(query);
+        }
+        if let Some(path) = reveal
+            && let Some(parent) = path.parent()
+        {
+            self.set_root(Some(parent.to_path_buf()));
+            self.reveal_path = Some(path);
+            ui.ctx().request_repaint();
+            return false;
+        }
+        keyboard_focused
+    }
+
+    fn request_file_search(&mut self, query: String) {
+        if let Some(cancel) = self.search_cancel.take() {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let Some(search) = self.search.as_mut() else {
+            return;
+        };
+        search.query = query.clone();
+        search.results.clear();
+        search.selected = None;
+        search.result_limit_reached = false;
+        search.traversal_incomplete = false;
+        search.busy = !query.is_empty();
+        self.search_cancel =
+            (!query.is_empty()).then(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        self.search_requested = (!query.is_empty()).then_some(query);
+        self.drive_maintenance();
+    }
+
+    fn close_file_search(&mut self) {
+        if let Some(cancel) = self.search_cancel.take() {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.search = None;
+        self.search_requested = None;
+    }
+
     fn start_edit(&mut self, edit: EditState) {
         self.edit_generation = self.edit_generation.wrapping_add(1);
         if let EditState::NewFile { parent, .. } | EditState::NewFolder { parent, .. } = &edit {
@@ -4772,6 +5139,28 @@ fn is_tree_delete_shortcut(event: &egui::Event) -> bool {
 
 pub(crate) fn tree_keyboard_focus_id() -> egui::Id {
     egui::Id::new("file_tree_keyboard_focus")
+}
+
+fn file_tree_search_keyboard_owner_id() -> egui::Id {
+    egui::Id::new("file_tree_search_keyboard_owner")
+}
+
+/// 같은 프레임에 트리 다음으로 그리는 workspace만 읽는다. 프레임 번호를 함께 저장해
+/// 트리 패널이 그려지지 않은 다음 프레임의 오래된 신호가 터미널을 막지 않게 한다.
+pub(super) fn mark_file_tree_search_keyboard_active(ctx: &egui::Context, active: bool) {
+    let frame = ctx.cumulative_frame_nr();
+    ctx.data_mut(|data| {
+        if active {
+            data.insert_temp(file_tree_search_keyboard_owner_id(), frame);
+        } else {
+            data.remove::<u64>(file_tree_search_keyboard_owner_id());
+        }
+    });
+}
+
+pub(super) fn file_tree_search_keyboard_active(ctx: &egui::Context) -> bool {
+    ctx.data(|data| data.get_temp::<u64>(file_tree_search_keyboard_owner_id()))
+        == Some(ctx.cumulative_frame_nr())
 }
 
 fn tree_typeahead_text_events(events: &[egui::Event]) -> Vec<String> {
@@ -8280,6 +8669,89 @@ mod tests {
     }
 
     #[test]
+    fn file_search는_이전_질문의_늦은_결과를_버린다() {
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.root = Some(PathBuf::from("/root"));
+        tree.search = Some(FileTreeSearch {
+            query: String::new(),
+            results: Vec::new(),
+            selected: None,
+            busy: false,
+            result_limit_reached: false,
+            traversal_incomplete: false,
+            focus: false,
+            keyboard_focused_last_frame: false,
+        });
+        tree.request_file_search("fold".to_owned());
+        let first = tree.take_maintenance_intent().unwrap();
+        assert!(
+            matches!(first.request, FileTreeMaintenanceRequest::SearchFiles { ref query, .. } if query == "fold")
+        );
+        let FileTreeMaintenanceRequest::SearchFiles {
+            cancel: old_cancel, ..
+        } = &first.request
+        else {
+            unreachable!();
+        };
+        tree.request_file_search("note".to_owned());
+        assert!(old_cancel.load(std::sync::atomic::Ordering::Relaxed));
+        tree.complete_maintenance(FileTreeMaintenanceCompletion {
+            operation: first.operation,
+            generation: first.generation,
+            result: Ok(FileTreeMaintenanceResult::Search(
+                FileTreeSearchSnapshot::try_new(vec![PathBuf::from("/root/Fold.md")], false, false)
+                    .unwrap(),
+            )),
+        });
+        assert!(tree.search.as_ref().unwrap().results.is_empty());
+        let second = tree.take_maintenance_intent().unwrap();
+        assert!(
+            matches!(second.request, FileTreeMaintenanceRequest::SearchFiles { ref query, .. } if query == "note")
+        );
+        tree.complete_maintenance(FileTreeMaintenanceCompletion {
+            operation: second.operation,
+            generation: second.generation,
+            result: Ok(FileTreeMaintenanceResult::Search(
+                FileTreeSearchSnapshot::try_new(vec![PathBuf::from("/root/note.md")], false, false)
+                    .unwrap(),
+            )),
+        });
+        let search = tree.search.as_ref().unwrap();
+        assert_eq!(search.results, [PathBuf::from("/root/note.md")]);
+        assert!(!search.busy);
+        let active_cancel = tree.search_cancel.as_ref().unwrap().clone();
+        tree.close_file_search();
+        assert!(active_cancel.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn file_search_같은_질문_새로고침은_취소된_오류를_보이지_않는다() {
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.root = Some(PathBuf::from("/root"));
+        tree.search = Some(FileTreeSearch {
+            query: String::new(),
+            results: Vec::new(),
+            selected: None,
+            busy: false,
+            result_limit_reached: false,
+            traversal_incomplete: false,
+            focus: false,
+            keyboard_focused_last_frame: false,
+        });
+        tree.request_file_search("fold".to_owned());
+        let old = tree.take_maintenance_intent().unwrap();
+        tree.request_file_search("fold".to_owned());
+        tree.complete_maintenance(FileTreeMaintenanceCompletion {
+            operation: old.operation,
+            generation: old.generation,
+            result: Err(FileTreeMaintenanceErrorCode::NativeFailure),
+        });
+        assert!(tree.error.is_none());
+        assert!(tree.search.as_ref().unwrap().busy);
+        assert!(tree.take_maintenance_intent().is_some());
+    }
+
+    #[test]
     fn file_tree_os_drop은_공유_오른쪽_경계를_소유하지_않는다() {
         let tree_area = egui::Rect::from_min_max(egui::pos2(10.0, 20.0), egui::pos2(110.0, 120.0));
 
@@ -9218,6 +9690,9 @@ mod tests {
                 FileTreeMaintenanceRequest::ReplaceWatchSet(_) => {
                     Ok(FileTreeMaintenanceResult::WatchSetApplied)
                 }
+                FileTreeMaintenanceRequest::SearchFiles { .. } => {
+                    panic!("listing fixture must not start a search")
+                }
             };
             tree.complete_maintenance(FileTreeMaintenanceCompletion {
                 operation: intent.operation,
@@ -10096,6 +10571,9 @@ mod tests {
                 }
                 FileTreeMaintenanceRequest::ReplaceWatchSet(_) => {
                     FileTreeMaintenanceResult::WatchSetApplied
+                }
+                FileTreeMaintenanceRequest::SearchFiles { .. } => {
+                    panic!("listing fixture must not start a search")
                 }
             };
             tree.complete_maintenance(FileTreeMaintenanceCompletion {
@@ -12910,6 +13388,50 @@ mod tests {
         std::fs::remove_dir_all(&base).unwrap();
     }
 
+    #[test]
+    fn kittest_검색중_휴지통_실패의_영구삭제_확인을_보인다() {
+        use egui_kittest::kittest::Queryable as _;
+
+        let base = temp_root("search-trash-confirm");
+        std::fs::write(base.join("target.txt"), b"x").unwrap();
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.set_root(Some(base.clone()));
+        drain_listings(&mut tree);
+        let mut harness = delete_confirm_harness(tree, &catalog);
+        let target = DeleteTarget {
+            path: base.join("target.txt"),
+            label: "target.txt".to_owned(),
+            is_dir: false,
+        };
+        harness.state_mut().0.spawn_trash(target.clone());
+        let intent = harness.state_mut().0.take_io_intent().unwrap();
+        harness.state_mut().0.search = Some(FileTreeSearch {
+            query: String::new(),
+            results: Vec::new(),
+            selected: None,
+            busy: false,
+            result_limit_reached: false,
+            traversal_incomplete: false,
+            focus: false,
+            keyboard_focused_last_frame: false,
+        });
+        harness.state_mut().0.complete_io(FileTreeIoCompletion {
+            operation: intent.operation,
+            generation: intent.generation,
+            result: Err(FileTreeIoErrorCode::TrashUnavailable),
+        });
+        harness.step();
+        assert_eq!(harness.state().0.confirm_delete, Some(target));
+        assert!(
+            harness
+                .query_by_label(&catalog.t("file_tree.permanent_delete", &[]))
+                .is_some(),
+            "검색 중에도 삭제 확인 버튼이 보여야 한다"
+        );
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
     /// 회귀: 영구삭제 확인이 트리 갱신으로는 **한 번도** 무효화되지 않던 것(경로 TOCTOU).
     ///
     /// 확인은 사용자가 누를 때까지 남는다. 그 사이 브랜치 전환·빌드·외부 편집이 그
@@ -13249,6 +13771,160 @@ mod tests {
             "편집 중인 글자는 탐색하지 않는다"
         );
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn kittest_file_search_결과를_폴더트리에서_보인다() {
+        use egui_kittest::kittest::Queryable as _;
+
+        let base = temp_root("search-reveal").canonicalize().unwrap();
+        std::fs::create_dir_all(base.join("nested")).unwrap();
+        let found = base.join("nested/Fold-note.md");
+        std::fs::write(&found, b"note").unwrap();
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let workspaces = vec![SidebarWorkspaceEntry {
+            id: "ws-search".to_owned(),
+            name: "search".to_owned(),
+            state: SidebarWorkspaceState::Active,
+            summary: SidebarSessionSummary::default(),
+        }];
+        let mut harness = close_menu_harness(&workspaces, "ws-search", &catalog);
+        harness.state_mut().0.set_root(Some(base.clone()));
+        drain_listings(&mut harness.state_mut().0);
+        harness.state_mut().0.search = Some(FileTreeSearch {
+            query: "fold".to_owned(),
+            results: vec![found.clone()],
+            selected: None,
+            busy: false,
+            result_limit_reached: false,
+            traversal_incomplete: false,
+            focus: true,
+            keyboard_focused_last_frame: false,
+        });
+        harness.step();
+        // kittest의 step은 프레임을 완료한 뒤 반환하므로, 바로 이전 프레임 번호가
+        // 등록되어 있어야 한다. workspace는 같은 프레임 안에서 이 값을 읽는다.
+        assert_eq!(
+            harness
+                .ctx
+                .data(|data| { data.get_temp::<u64>(file_tree_search_keyboard_owner_id()) }),
+            Some(harness.ctx.cumulative_frame_nr() - 1)
+        );
+        harness
+            .ctx
+            .memory_mut(|memory| memory.request_focus(egui::Id::new("terminal_focus")));
+        harness.step();
+        assert!(harness.state().0.search.is_some());
+        assert_eq!(
+            harness
+                .ctx
+                .data(|data| data.get_temp::<u64>(file_tree_search_keyboard_owner_id())),
+            None,
+            "검색 창이 열려 있어도 다른 곳에 포커스하면 터미널 입력을 막지 않는다"
+        );
+        harness.get_by_label("nested/Fold-note.md").click();
+        harness.step();
+        assert_eq!(
+            harness.state().0.search.as_ref().unwrap().selected,
+            Some(found.clone())
+        );
+        harness.step();
+        harness.get_by_label("Show in tree").click();
+        harness.step();
+        drain_listings(&mut harness.state_mut().0);
+        harness.step();
+        assert!(harness.state().0.search.is_none());
+        assert!(!file_tree_search_keyboard_active(&harness.ctx));
+        assert_eq!(harness.state().0.root.as_deref(), found.parent());
+        assert_eq!(harness.state().0.selected, BTreeSet::from([found]));
+
+        let found_folder = base.join("nested/FoldFolder");
+        std::fs::create_dir(&found_folder).unwrap();
+        harness.state_mut().0.set_root(Some(base.clone()));
+        drain_listings(&mut harness.state_mut().0);
+        harness.state_mut().0.search = Some(FileTreeSearch {
+            query: "fold".to_owned(),
+            results: vec![found_folder.clone()],
+            selected: None,
+            busy: false,
+            result_limit_reached: false,
+            traversal_incomplete: false,
+            focus: false,
+            keyboard_focused_last_frame: false,
+        });
+        harness.step();
+        harness.get_by_label("nested/FoldFolder").click();
+        harness.step();
+        assert_eq!(
+            harness.state().0.search.as_ref().unwrap().selected,
+            Some(found_folder.clone())
+        );
+        harness.step();
+        harness.get_by_label("Show in tree").click();
+        harness.step();
+        drain_listings(&mut harness.state_mut().0);
+        harness.step();
+        assert_eq!(harness.state().0.root.as_deref(), found_folder.parent());
+        assert_eq!(harness.state().0.selected, BTreeSet::from([found_folder]));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn kittest_file_search는_입력창에서_escape를_누르면_닫힌다() {
+        let base = temp_root("search-escape").canonicalize().unwrap();
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let workspaces = vec![SidebarWorkspaceEntry {
+            id: "ws-search-escape".to_owned(),
+            name: "search".to_owned(),
+            state: SidebarWorkspaceState::Active,
+            summary: SidebarSessionSummary::default(),
+        }];
+        let mut harness = close_menu_harness(&workspaces, "ws-search-escape", &catalog);
+        harness.state_mut().0.set_root(Some(base.clone()));
+        drain_listings(&mut harness.state_mut().0);
+        harness.state_mut().0.search = Some(FileTreeSearch {
+            query: "fold".to_owned(),
+            results: Vec::new(),
+            selected: None,
+            busy: false,
+            result_limit_reached: false,
+            traversal_incomplete: false,
+            focus: true,
+            keyboard_focused_last_frame: false,
+        });
+        harness.step();
+        assert!(harness.state().0.search.is_some());
+        harness.event(egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.step();
+        assert!(harness.state().0.search.is_none());
+        assert_eq!(
+            harness
+                .ctx
+                .data(|data| data.get_temp::<u64>(file_tree_search_keyboard_owner_id())),
+            Some(harness.ctx.cumulative_frame_nr() - 1),
+            "Escape를 처리한 프레임에는 터미널로 키를 보내지 않는다"
+        );
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn 파일검색_키보드_소유권은_패널이_없는_다음_프레임에_남지_않는다() {
+        let ctx = egui::Context::default();
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            mark_file_tree_search_keyboard_active(ui.ctx(), true);
+            assert!(file_tree_search_keyboard_active(ui.ctx()));
+        })
+        .drop_without_applying_deltas();
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            assert!(!file_tree_search_keyboard_active(ui.ctx()));
+        })
+        .drop_without_applying_deltas();
     }
 
     /// 워크스페이스 행 우클릭 → 「워크스페이스 종료」 메뉴가 열린다 (실제 팝업 경로).

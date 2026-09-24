@@ -7036,8 +7036,11 @@ impl WorkspaceUi {
         // 소유하는 동안 renderer가 다시 터미널 포커스를 요청하지 않게 한다.
         let tree_keyboard_focused =
             ui.memory(|memory| memory.has_focus(super::file_tree::tree_keyboard_focus_id()));
+        let file_search_keyboard_active =
+            super::file_tree::file_tree_search_keyboard_active(ui.ctx());
         let terminal_keyboard_active = terminal_input_owner
             && !tree_keyboard_focused
+            && !file_search_keyboard_active
             && !search_input_focused
             && terminal_keyboard_input_allowed(
                 ui.ctx().text_edit_focused(),
@@ -7339,6 +7342,7 @@ impl WorkspaceUi {
             && mode.is_local()
             && focused
             && !tree_keyboard_focused
+            && !file_search_keyboard_active
             && self.pending_focus.as_ref() == Some(pane_id)
         {
             let app_armed = self.explicit_pending_focus.as_ref() == Some(pane_id);
@@ -14970,6 +14974,51 @@ mod tests {
             .memory_mut(|memory| memory.request_focus(tree_focus));
         harness.run();
         assert!(harness.ctx.memory(|memory| memory.has_focus(tree_focus)));
+    }
+
+    #[test]
+    fn 파일검색_결과에_포커스해도_키가_터미널로_가지_않는다() {
+        let catalog = catalog();
+        let config = TerminalConfig::default();
+        let session = SessionId(88);
+        let target_pane = pane_id("pane");
+        let mut workspace = WorkspaceUi::new();
+        workspace.mux = Some(mux(
+            "primary",
+            vec![tab(
+                "primary",
+                vec![pane("pane", session)],
+                LayoutNode::Pane(target_pane.clone()),
+            )],
+            "pane",
+        ));
+        workspace.last_focused_pane = Some(target_pane.clone());
+        workspace.pending_focus = Some(target_pane.clone());
+        workspace.sessions.entry(session).or_default().snapshot = Some(snapshot("ready"));
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, state: &mut (WorkspaceUi, String, bool)| {
+                super::super::file_tree::mark_file_tree_search_keyboard_active(ui.ctx(), true);
+                let name = ui.text_edit_singleline(&mut state.1);
+                if state.2 {
+                    name.request_focus();
+                    state.2 = false;
+                }
+                let _ = ui.button("Show in tree");
+                state.0.show_with_input(ui, &config, &[], &catalog, true);
+            },
+            (workspace, String::new(), true),
+        );
+        harness.run();
+        assert_eq!(harness.state().0.pending_focus, Some(target_pane));
+        drain_protocol(&mut harness.state_mut().0);
+        harness.key_press(egui::Key::Tab);
+        harness.step();
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::Text("x".into()));
+        harness.step();
+        assert!(written_bytes(drain_protocol(&mut harness.state_mut().0)).is_empty());
     }
 
     #[test]

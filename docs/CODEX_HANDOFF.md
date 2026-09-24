@@ -9,6 +9,17 @@
 - Remaining work: PR1 commit/push, PR2·PR3·PR4 rebase, 최종 스택 검증·코드 리뷰·release 재빌드. 앱 재실행 금지.
 - Exact next commands: `cd /private/tmp/deppy-ssh-screen-visible-20260924`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git add crates/runtime/src/in_process.rs docs/CODEX_HANDOFF.md`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git commit -m 'Preserve visible restored screens during cache trimming'`.
 
+## 2026-09-24 PR3 최종 리뷰 후 검색 Escape 포커스
+
+- Current objective: 파일 검색 입력이나 결과에 포커스한 채 Escape를 누르면 검색을 닫고 해당 프레임 키를 터미널로 보내지 않는다. 사용자 허락 없이 앱 재실행 금지.
+- Completed work: 검색 상태에 직전 프레임의 키보드 포커스를 보관한다. egui가 Escape 이벤트에서 포커스를 먼저 해제해도 검색을 닫고, 같은 프레임의 검색 키보드 소유 신호를 유지한다.
+- Modified files: `crates/app/src/ui/file_tree.rs`, `docs/CODEX_HANDOFF.md`.
+- Key design decisions: 검색 이외 영역에 포커스가 옮겨지면 이전 포커스를 매 프레임 갱신해 검색 창을 열어둔 동안 터미널 입력을 허용한다. Escape로 닫는 프레임만 터미널 입력을 차단한다.
+- Tests actually run: 새 egui kittest가 수정 전 RED, 수정 후 검색 닫기와 같은 프레임 키보드 소유 모두 GREEN. 최종 `kittest_file_search` 2 passed, workspace 검색 포커스 1 passed. `cargo clippy -p deppy-sijo --all-targets --locked -- -D warnings`, `cargo fmt --all -- --check`, `git diff --check` exit 0.
+- Failed approaches: 현재 프레임의 `response.has_focus()`만 확인하면 Escape 이후 포커스가 이미 사라져 검색을 닫지 못했다. 테스트에서 `harness.key_press`는 press/release를 여러 프레임에 걸쳐 실행해 닫힌 다음 프레임의 신호를 검사하게 되어, 명시적 Key press 이벤트로 한 프레임을 검증했다.
+- Remaining work: PR3 commit/push, PR4 rebase/push, 최종 스택 테스트·코드 리뷰·release 재빌드와 handoff 갱신. 앱 재실행 금지.
+- Exact next commands: `cd /private/tmp/deppy-file-tree-search-20260924`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git add crates/app/src/ui/file_tree.rs docs/CODEX_HANDOFF.md`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git commit -m 'Close file search after Escape clears focus'`.
+
 ## 2026-09-24 PR1 최종 리뷰 후 셸 종료·한글 셀 경계
 
 - Current objective: 복원된 원격 셸 화면을 유지하되 새 셸이 종료하면 마지막 출력을 보이고, 창 폭 축소가 한글 wide 셀을 잘라도 유효한 화면을 발행한다. 사용자 허락 없이 앱 재실행 금지.
@@ -31,6 +42,28 @@
 - Remaining work: PR1 commit/push, PR2·PR3·PR4 rebase, 최종 통합 검증·리뷰·release 재빌드.
 - Exact next commands: `cd /private/tmp/deppy-ssh-screen-visible-20260924`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git add crates/session/src/session.rs crates/app/src/ui/workspace.rs docs/CODEX_HANDOFF.md`.
 
+## 2026-09-24 PR3 누적 리뷰 후 루트 상위 경로 고정
+
+- Current objective: 파일 검색의 루트 상위 경로가 스캔 직전 심볼릭 링크로 교체되어도 프로젝트 밖을 읽지 않는다. 사용자 허락 없이 앱 재실행 금지.
+- Completed work: `/` 디렉터리 핸들부터 canonical 루트의 성분을 `openat(O_NOFOLLOW|O_DIRECTORY)`로 하나씩 열어 root handle을 만든다. 상위 폴더 교체 테스트를 추가했다.
+- Modified files: `crates/app/src/app.rs`, `docs/CODEX_HANDOFF.md`.
+- Key design decisions: `canonicalize`는 경로 선택에만 쓰고 실제 디렉터리 열기는 모든 성분의 symlink를 거부하는 핸들 순회로 한다.
+- Tests actually run: 새 테스트는 helper 부재로 컴파일 RED, 구현 후 passed. `cargo test -p deppy-sijo --bin deppy-sijo --locked file_tree_search` 8 passed; `cargo fmt --all -- --check`와 `cargo clippy -p deppy-sijo --all-targets --locked -- -D warnings` exit 0.
+- Failed approaches: canonical root 경로를 한 번에 `OpenOptions`로 열면 마지막 성분에만 O_NOFOLLOW가 적용된다.
+- Remaining work: 최신 format/Clippy 확인 후 PR3 commit/push, PR4 rebase, 최종 통합 검증·리뷰·release 재빌드.
+- Exact next commands: `cd /private/tmp/deppy-file-tree-search-20260924`; `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo clippy -p deppy-sijo --all-targets --locked -- -D warnings`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`.
+
+## 2026-09-24 PR3 누적 리뷰 후 검색 입력·삭제 확인·플랫폼 경계
+
+- Current objective: 파일 검색에서 검색 밖 포커스를 터미널에 돌려주고, 검색 중 휴지통 실패 확인을 보이며, 디렉터리 교체로 루트 밖을 순회하지 않게 한다. 앱 재실행 금지.
+- Completed work: 검색 컨트롤(TextEdit/닫기/결과/트리에서 보기)에 실제 포커스가 있을 때만 같은 프레임의 터미널 입력 차단 신호를 세운다. 검색 분기에서 영구삭제 확인을 검색 결과 목록 앞에 표시한다. Unix의 handle-relative 검색은 유지하고, 동등한 안전 순회가 없는 non-Unix에서는 검색을 명시적으로 거절한다.
+- Modified files: `crates/app/src/ui/file_tree.rs`, `crates/app/src/app.rs`, `docs/CODEX_HANDOFF.md`.
+- Key design decisions: 검색 창을 열어둔 상태에서도 다른 영역에 포커스를 옮기면 터미널 입력을 허용한다. Windows junction 교체 경쟁에는 경로 기반 `read_dir`/`canonicalize` 검증이 충분하지 않으므로 Windows 검색은 안전한 handle-relative 구현 전까지 실패로 반환한다. 이 앱의 현 배포 대상은 macOS다.
+- Tests actually run: 검색 밖 포커스 회귀와 검색 중 영구삭제 확인 회귀는 수정 전 RED, 수정 후 각 1 passed. 최종 수정 후 host 검색 7 passed, 기존 검색 결과 kittest 1 passed, 검색 Tab→PTY 차단 1 passed, `cargo clippy -p deppy-sijo --all-targets --locked -- -D warnings`, `cargo fmt --all -- --check`, `git diff --check` exit 0.
+- Failed approaches: 검색 화면이 보인다는 상태만으로 입력 차단을 결정해 검색 밖 포커스도 막았다. non-Unix 경로 기반 탐색은 교체 경쟁을 막을 수 없어 제거했다.
+- Remaining work: PR3 commit/push, PR4 rebase/push, 최종 통합 테스트·코드 리뷰·release 재빌드 및 handoff 갱신.
+- Exact next commands: `cd /private/tmp/deppy-file-tree-search-20260924`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git add crates/app/src/app.rs crates/app/src/ui/file_tree.rs docs/CODEX_HANDOFF.md`.
+
 ## 2026-09-24 PR1 최종 리뷰 후 화면 크기 왕복 복원
 
 - Current objective: 복원한 SSH 셸 화면을 첫 입력 전까지 보여주고, 창 크기를 줄였다 다시 키워도 원본 내용을 복구한다. 사용자 허락 없이 앱 재실행 금지.
@@ -41,6 +74,31 @@
 - Failed approaches: 기존 표시 snapshot을 직접 축소해 원본 열/행 정보가 사라졌다.
 - Remaining work: session 전체 테스트와 format/diff 검사 후 PR1 commit/push; PR2·PR3·PR4 rebase, 최종 검증·빌드·리뷰.
 - Exact next commands: `cd /private/tmp/deppy-ssh-screen-visible-20260924`; `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo test -p session --locked`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`.
+
+## 2026-09-24 PR3 최종 리뷰 후 숨김 항목 탐색 상한
+
+- Current objective: 파일 트리 검색이 숨김 항목이 많아도 탐색 상한을 지키게 한다. 사용자 허락 없이 앱 재실행 금지.
+- Completed work: 파일 이름이 숨김인지 판단하기 전에 탐색 항목 수를 올리고 제한을 검사한다. 숨김 파일 두 개와 최대 1개 제한의 회귀 테스트를 추가했다.
+- Modified files: `crates/app/src/app.rs`, `docs/CODEX_HANDOFF.md`.
+- Key design decisions: UI에서는 숨김 결과를 여전히 표시하지 않되 실제로 읽은 디렉터리 항목을 모두 탐색 예산에 포함한다.
+- Tests actually run: 신규 회귀 테스트 수정 전 RED, 수정 후 1 passed. `cargo test -p deppy-sijo --bin deppy-sijo --locked file_tree_search` 7 passed, `cargo fmt --all -- --check`와 `git diff --check` exit 0.
+- Failed approaches: 숨김 항목 필터를 탐색 카운터보다 먼저 처리해 상한을 우회했다.
+- Remaining work: 검색 집중 테스트와 format/diff 검사, PR2 rebase 후 PR3 rebase/commit/push, PR4 rebase, 최종 검증·빌드·리뷰.
+- Exact next commands: `cd /private/tmp/deppy-file-tree-search-20260924`; `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo test -p deppy-sijo --bin deppy-sijo --locked file_tree_search`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`.
+
+## 2026-09-24 파일 검색 PR3 진행
+
+- Second final stack review follow-up: 누적 재리뷰가 빈 폴더 이름 검색 누락(P2)과 대기 중인 디렉터리의 symlink 교체로 루트 밖을 읽을 수 있는 문제(P2)를 찾았다. 폴더·파일 이름 모두 결과에 넣고 디렉터리 탐색은 Unix에서 root fd를 고정한 뒤 상대 경로의 모든 성분을 `openat(O_NOFOLLOW|O_DIRECTORY)`로 열어 `fdopendir/readdir/fstatat(AT_SYMLINK_NOFOLLOW)`로 순회한다. 대기 경로가 symlink로 교체되면 탐색 미완료로 처리하고 밖으로 이동하지 않는다. host 검색 6 passed(빈 폴더, 교체 symlink 포함), 결과→트리 kittest에 폴더 결과를 추가해 passed. 최신 Clippy exit 0, rustfmt 실행. `/dev/fd/N`을 `std::fs::read_dir`로 여는 첫 시도는 macOS에서 ENOTDIR로 실패해 fdopendir로 변경했다. 테스트 중 한 번 잘못 입력한 `DEVELOPER_DIR=/Library/CommandLineTools`로 linker가 실패했고 올바른 CLT 경로로 재실행해 통과했다. PR2/3/4 rebase와 최종 재빌드가 남았다. 앱 재실행 금지.
+- Final stack review follow-up (2026-09-24): 누적 `codex review --base fix/environment-api-context-integration`가 검색 입력에서 결과/버튼으로 Tab 이동하면 PTY가 키보드 포커스를 되찾는 P2를 찾았다. 파일 트리 `panel`이 같은 egui 프레임의 검색 가시 상태를 context temp data로 게시하고 workspace가 터미널 입력 및 pending focus 복구를 보류하도록 수정했다. kittest 실제 검색 패널 신호 1 passed, workspace Tab→PTY 차단 테스트는 수정 전 pending focus가 소비되어 RED, 수정 후 1 passed. 패널이 사라진 다음 프레임의 stale 신호가 만료되는 테스트 1 passed. 수정 후 Clippy exit 0, rustfmt 실행. 이 follow-up을 PR3에 커밋한 뒤 PR4를 rebase하고 release bundle을 다시 빌드해야 한다. 앱 재실행 금지.
+- Current objective: 파일 트리 더보기의 파일 검색을 별도 PR로 구현한다. 접힌 폴더도 프로젝트 루트 전체에서 검색하고 결과를 트리에 표시한다. 앱 재실행 금지.
+- PR3 review follow-up: `codex review --uncommitted`가 superseded scan의 공유 I/O 점유, 검색 모드에서 상위 탐색/생성 버튼 무반응, 새로고침 결과 stale, 탐색 상한을 "Too many matches"로 오표시하는 네 문제를 지적했다. 요청별 `Arc<AtomicBool>` 취소 토큰을 host traversal에 전달해 쿼리 변경·닫기·루트 변경 시 중단하고, 취소된 동일 쿼리 결과도 적용하지 않는다. 검색 모드 상위 탐색/생성/새로고침을 연결했다. 결과 수 상한과 탐색 미완료를 별도 상태/번역으로 표시한다. 수정 후 host 검색 4건, 검색 상태 2건, 결과→트리 egui 1건 passed; 최신 Clippy, format, diff check, i18n-check exit 0.
+- Completed work: PR2 `feat/file-tree-typeahead` 커밋 `9757c7e6`, draft PR #192 생성. 그 위 worktree `/private/tmp/deppy-file-tree-search-20260924`, branch `feat/file-tree-search` 생성. 더보기 메뉴 검색, 별도 검색 UI, 백그라운드 Maintenance SearchFiles, 검색 결과의 `Show in tree` 경로를 구현했다. hidden 설정 적용, 파일 이름 부분 문자열 검색, symlink 미탐색, 50,000 엔트리/100 결과 상한을 둔다.
+- Modified files: `crates/app/src/app.rs`, `crates/app/src/ui/file_tree.rs`, 5개 locale `messages.txt`, `docs/CODEX_HANDOFF.md`.
+- Key design decisions: render leaf는 filesystem을 읽지 않고 기존 App host maintenance worker에 검색 intent를 보낸다. 쿼리가 바뀐 뒤 늦게 온 이전 결과는 적용하지 않는다. 결과 선택 후 트리에서 보기 버튼을 누르면 파일의 부모를 루트로 열고, listing 뒤 해당 파일 행을 선택/스크롤한다.
+- Tests actually run: 새 host 검색 테스트는 함수 부재로 컴파일 RED, 구현 후 하위 폴더·숨김 테스트 1 passed. 상한·루트 밖 symlink 추가 테스트 포함 `cargo test -p deppy-sijo --bin deppy-sijo file_tree_search --locked` 3 passed. 검색 쿼리 세대 테스트 1 passed, 결과→트리 egui kittest 1 passed. `cargo clippy -p deppy-sijo --all-targets --locked -- -D warnings` passed (그 뒤에 소규모 accessor/테스트 변경이 있어 최신 revision 재검사 필요). `cargo run --locked -p xtask -- i18n-check` passed, literal key 1231건/5 locales.
+- Failed approaches: 검색 결과 선택 직후 같은 테스트 프레임에서는 다음 프레임에 표시되는 `Show in tree` 버튼이 아직 없었다. kittest에 한 프레임을 더 진행시켜 실제 UI 상태 전이를 검증했다. 초기 `cargo fmt --all -- --check`는 새 코드 포맷 차이로 실패했고 `cargo fmt --all`을 실행했다. 앱 전체 파일 트리의 기존 4개 실패는 PR2에서 부모 브랜치에서도 재현됨을 기록했다.
+- Remaining work: 검색 PR3 최신 포맷/Clippy/관련 테스트 및 코드 리뷰, 커밋·push·PR 생성. 그 다음 새 파일/폴더 모달 PR4, 최종 빌드·리뷰. 앱 재실행 금지.
+- Exact next commands: `cd /private/tmp/deppy-file-tree-search-20260924`; `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo fmt --all -- --check`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git status --short`.
 
 ## 2026-09-24 파일 트리 폴더 접두어 탐색 PR2 진행
 
@@ -4550,3 +4608,14 @@
 - Failed approaches: 병렬 전체 runtime 실행은 자원 경합으로 3건 실패했다. 단일 스레드 재실행에서 모두 통과했다.
 - Remaining work: PR1 diff/format 확인·commit/push, PR2·PR3·PR4 rebase, 최종 통합 검증·코드 리뷰·release 재빌드. 앱 재실행 금지.
 - Exact next commands: `cd /private/tmp/deppy-ssh-screen-visible-20260924`; `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo fmt --all -- --check`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git add crates/session/src/session.rs crates/runtime/src/in_process.rs docs/CODEX_HANDOFF.md`.
+
+## 2026-09-24 PR3 누적 리뷰 후 심볼릭 링크 이름 검색
+
+- Current objective: 파일 트리 검색에서 심볼릭 링크의 이름도 찾되 대상 폴더는 탐색하지 않는다. 사용자 허락 없이 앱 재실행 금지.
+- Completed work: `fstatat(AT_SYMLINK_NOFOLLOW)`로 식별한 심볼릭 링크를 이름 일치 결과에 포함하고, 디렉터리 탐색 스택에는 넣지 않는다.
+- Modified files: `crates/app/src/app.rs`, `docs/CODEX_HANDOFF.md`.
+- Key design decisions: 링크 자체의 경로를 결과로 반환한다. 파일/폴더와 같은 숨김 필터 및 항목/결과 상한을 적용한다.
+- Tests actually run: 새 링크 이름/대상 미탐색 회귀는 수정 전 RED, 수정 후 GREEN. `cargo test -p deppy-sijo --bin deppy-sijo --locked file_tree_search` 9 passed. `cargo clippy -p deppy-sijo --all-targets --locked -- -D warnings`, `cargo fmt --all -- --check`, `git diff --check` exit 0.
+- Failed approaches: 이전 구현은 regular file과 directory만 결과에 포함해 트리에 보이는 링크를 찾지 못했다.
+- Remaining work: PR3 Clippy/diff/format 확인·commit/push, PR4 rebase, 최종 통합 검증·코드 리뷰·release 재빌드. 앱 재실행 금지.
+- Exact next commands: `cd /private/tmp/deppy-file-tree-search-20260924`; `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo clippy -p deppy-sijo --all-targets --locked -- -D warnings`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git add crates/app/src/app.rs docs/CODEX_HANDOFF.md`.

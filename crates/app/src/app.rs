@@ -13558,6 +13558,145 @@ fn run_file_tree_listing(
     ui::file_tree::FileTreeListingSnapshot::try_new(items)
 }
 
+#[cfg(unix)]
+fn open_file_tree_search_directory(
+    parent: &std::fs::File,
+    name: &std::ffi::OsStr,
+) -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    // 부모 handle에 고정해 여는 시점에만 자식을 결정한다. 이름이 symlink로 바뀌어도
+    // O_NOFOLLOW가 거절하므로 프로젝트 루트 밖의 디렉터리를 읽지 않는다.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: openat 성공 시 새 fd 소유권을 이 File로 한 번만 이전한다.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn open_file_tree_search_relative(
+    root: &std::fs::File,
+    relative: &Path,
+) -> std::io::Result<std::fs::File> {
+    let mut directory = root.try_clone()?;
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+        };
+        directory = open_file_tree_search_directory(&directory, name)?;
+    }
+    Ok(directory)
+}
+
+#[cfg(unix)]
+struct FileTreeSearchDirEntry {
+    name: std::ffi::OsString,
+    is_dir: bool,
+    is_file: bool,
+}
+
+#[cfg(unix)]
+struct FileTreeSearchDirEntries {
+    stream: *mut libc::DIR,
+    done: bool,
+}
+
+#[cfg(unix)]
+impl Drop for FileTreeSearchDirEntries {
+    fn drop(&mut self) {
+        // SAFETY: fdopendir가 소유한 DIR*는 이 wrapper가 정확히 한 번 닫는다.
+        unsafe { libc::closedir(self.stream) };
+    }
+}
+
+#[cfg(unix)]
+impl Iterator for FileTreeSearchDirEntries {
+    type Item = std::io::Result<FileTreeSearchDirEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        use std::os::unix::ffi::OsStringExt;
+
+        if self.done {
+            return None;
+        }
+        loop {
+            #[cfg(target_os = "macos")]
+            unsafe {
+                *libc::__error() = 0;
+            }
+            #[cfg(target_os = "linux")]
+            unsafe {
+                *libc::__errno_location() = 0;
+            }
+            // SAFETY: DIR*는 wrapper 수명 동안 유효하며 현재 iterator만 사용한다.
+            let entry = unsafe { libc::readdir(self.stream) };
+            if entry.is_null() {
+                self.done = true;
+                let error = std::io::Error::last_os_error();
+                return (error.raw_os_error() != Some(0)).then_some(Err(error));
+            }
+            // SAFETY: readdir가 반환한 이름은 다음 readdir 호출 전까지 NUL 종료다.
+            let raw_name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+            if raw_name.to_bytes() == b"." || raw_name.to_bytes() == b".." {
+                continue;
+            }
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: DIR*와 현재 dirent 이름은 유효하며 symlink를 따라가지 않는다.
+            let status = unsafe {
+                libc::fstatat(
+                    libc::dirfd(self.stream),
+                    raw_name.as_ptr(),
+                    stat.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if status < 0 {
+                return Some(Err(std::io::Error::last_os_error()));
+            }
+            // SAFETY: fstatat 성공 시 stat 전체가 초기화되었다.
+            let mode = unsafe { stat.assume_init().st_mode } & libc::S_IFMT;
+            return Some(Ok(FileTreeSearchDirEntry {
+                name: std::ffi::OsString::from_vec(raw_name.to_bytes().to_vec()),
+                is_dir: mode == libc::S_IFDIR,
+                is_file: mode == libc::S_IFREG,
+            }));
+        }
+    }
+}
+
+#[cfg(unix)]
+fn read_file_tree_search_directory(
+    directory: &std::fs::File,
+) -> std::io::Result<FileTreeSearchDirEntries> {
+    use std::os::fd::IntoRawFd;
+
+    // fdopendir에 복제한 descriptor를 넘겨 부모 handle은 openat에 계속 사용한다.
+    let fd = directory.try_clone()?.into_raw_fd();
+    // SAFETY: fd는 이 함수가 소유하며 성공하면 DIR*가 소유권을 가져간다.
+    let stream = unsafe { libc::fdopendir(fd) };
+    if stream.is_null() {
+        let error = std::io::Error::last_os_error();
+        // SAFETY: fdopendir 실패 시 fd 소유권은 여전히 이 함수에 있다.
+        unsafe { libc::close(fd) };
+        return Err(error);
+    }
+    Ok(FileTreeSearchDirEntries {
+        stream,
+        done: false,
+    })
+}
+
 fn run_file_tree_search(
     root: &Path,
     query: &str,
@@ -13588,20 +13727,46 @@ fn run_file_tree_search(
         return Err(Error::InvalidSnapshot);
     }
     let needle = query.to_lowercase();
-    let mut stack = vec![canonical_root.clone()];
+    #[cfg(unix)]
+    let root_handle = {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        options
+            .open(&canonical_root)
+            .map_err(|_| Error::NativeFailure)?
+    };
+    let mut stack = vec![PathBuf::new()];
     let mut paths = Vec::new();
     let mut visited = 0usize;
     let mut result_limit_reached = false;
     let mut traversal_incomplete = false;
-    'walk: while let Some(directory) = stack.pop() {
+    'walk: while let Some(relative_parent) = stack.pop() {
         if search_cancel.load(std::sync::atomic::Ordering::Relaxed)
             || shutdown_cancel.load(std::sync::atomic::Ordering::Relaxed)
         {
             return Err(Error::NativeFailure);
         }
-        let entries = match std::fs::read_dir(&directory) {
+        #[cfg(unix)]
+        let directory = match open_file_tree_search_relative(&root_handle, &relative_parent) {
+            Ok(directory) => directory,
+            Err(_) if !relative_parent.as_os_str().is_empty() => {
+                traversal_incomplete = true;
+                continue;
+            }
+            Err(_) => return Err(Error::NativeFailure),
+        };
+        #[cfg(not(unix))]
+        let directory = canonical_root.join(&relative_parent);
+        #[cfg(unix)]
+        let opened = read_file_tree_search_directory(&directory);
+        #[cfg(not(unix))]
+        let opened = std::fs::read_dir(&directory);
+        let entries = match opened {
             Ok(entries) => entries,
-            Err(_) if directory != canonical_root => {
+            Err(_) if !relative_parent.as_os_str().is_empty() => {
                 traversal_incomplete = true;
                 continue;
             }
@@ -13620,7 +13785,19 @@ fn run_file_tree_search(
                     continue;
                 }
             };
-            let name = entry.file_name();
+            #[cfg(unix)]
+            let (name, is_dir, is_file) = (entry.name, entry.is_dir, entry.is_file);
+            #[cfg(not(unix))]
+            let (name, is_dir, is_file) = {
+                let file_type = match entry.file_type() {
+                    Ok(file_type) => file_type,
+                    Err(_) => {
+                        traversal_incomplete = true;
+                        continue;
+                    }
+                };
+                (entry.file_name(), file_type.is_dir(), file_type.is_file())
+            };
             if !show_hidden && name.as_encoded_bytes().first() == Some(&b'.') {
                 continue;
             }
@@ -13629,24 +13806,11 @@ fn run_file_tree_search(
                 traversal_incomplete = true;
                 break 'walk;
             }
-            let file_type = match entry.file_type() {
-                Ok(file_type) => file_type,
-                Err(_) => {
-                    traversal_incomplete = true;
-                    continue;
-                }
-            };
-            if file_type.is_dir() {
-                stack.push(entry.path());
-            } else if file_type.is_file() && name.to_string_lossy().to_lowercase().contains(&needle)
-            {
-                let Ok(relative) = entry
-                    .path()
-                    .strip_prefix(&canonical_root)
-                    .map(Path::to_path_buf)
-                else {
-                    return Err(Error::InvalidSnapshot);
-                };
+            let relative = relative_parent.join(&name);
+            if is_dir {
+                stack.push(relative.clone());
+            }
+            if (is_dir || is_file) && name.to_string_lossy().to_lowercase().contains(&needle) {
                 paths.push(root.join(relative));
                 if paths.len() > max_results {
                     paths.pop();
@@ -39317,6 +39481,55 @@ mod tests {
         let all = run_file_tree_search(&root, "fold", true, 100, 20, &cancel, &cancel).unwrap();
         assert_eq!(all.paths().len(), 2);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_tree_search는_이름이_일치하는_빈_폴더도_찾는다() {
+        let root = unique_temp_dir("file-tree-search-folder")
+            .canonicalize()
+            .unwrap();
+        std::fs::create_dir(root.join("Fold")).unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let snapshot =
+            run_file_tree_search(&root, "fold", false, 100, 20, &cancel, &cancel).unwrap();
+        assert_eq!(snapshot.paths(), &[root.join("Fold")]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_tree_search는_대기중_폴더가_심볼릭링크로_교체돼도_루트밖을_읽지_않는다() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let root = unique_temp_dir("file-tree-search-swap-root")
+            .canonicalize()
+            .unwrap();
+        let outside = unique_temp_dir("file-tree-search-swap-outside")
+            .canonicalize()
+            .unwrap();
+        std::fs::create_dir(root.join("queued")).unwrap();
+        std::fs::write(root.join("queued/inside.txt"), b"x").unwrap();
+        std::fs::write(outside.join("private.txt"), b"x").unwrap();
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let root_handle = options.open(&root).unwrap();
+        let queued =
+            open_file_tree_search_directory(&root_handle, std::ffi::OsStr::new("queued")).unwrap();
+        std::fs::rename(root.join("queued"), root.join("moved")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("queued")).unwrap();
+        assert!(
+            open_file_tree_search_directory(&root_handle, std::ffi::OsStr::new("queued")).is_err()
+        );
+        assert!(open_file_tree_search_relative(&root_handle, Path::new("queued")).is_err());
+        let names = read_file_tree_search_directory(&queued)
+            .unwrap()
+            .map(|entry| entry.unwrap().name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, [std::ffi::OsString::from("inside.txt")]);
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
     }
 
     #[test]

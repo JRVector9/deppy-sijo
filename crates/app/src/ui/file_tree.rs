@@ -13760,6 +13760,34 @@ mod tests {
         assert!(!file_tree_search_keyboard_active(&harness.ctx));
         assert_eq!(harness.state().0.root.as_deref(), found.parent());
         assert_eq!(harness.state().0.selected, BTreeSet::from([found]));
+
+        let found_folder = base.join("nested/FoldFolder");
+        std::fs::create_dir(&found_folder).unwrap();
+        harness.state_mut().0.set_root(Some(base.clone()));
+        drain_listings(&mut harness.state_mut().0);
+        harness.state_mut().0.search = Some(FileTreeSearch {
+            query: "fold".to_owned(),
+            results: vec![found_folder.clone()],
+            selected: None,
+            busy: false,
+            result_limit_reached: false,
+            traversal_incomplete: false,
+            focus: false,
+        });
+        harness.step();
+        harness.get_by_label("nested/FoldFolder").click();
+        harness.step();
+        assert_eq!(
+            harness.state().0.search.as_ref().unwrap().selected,
+            Some(found_folder.clone())
+        );
+        harness.step();
+        harness.get_by_label("Show in tree").click();
+        harness.step();
+        drain_listings(&mut harness.state_mut().0);
+        harness.step();
+        assert_eq!(harness.state().0.root.as_deref(), found_folder.parent());
+        assert_eq!(harness.state().0.selected, BTreeSet::from([found_folder]));
         std::fs::remove_dir_all(base).unwrap();
     }
 

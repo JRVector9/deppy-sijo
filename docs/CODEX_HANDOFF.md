@@ -9,6 +9,17 @@
 - Remaining work: PR1 commit/push, PR2·PR3·PR4 rebase, 최종 스택 검증·코드 리뷰·release 재빌드. 앱 재실행 금지.
 - Exact next commands: `cd /private/tmp/deppy-ssh-screen-visible-20260924`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git add crates/runtime/src/in_process.rs docs/CODEX_HANDOFF.md`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git commit -m 'Preserve visible restored screens during cache trimming'`.
 
+## 2026-09-24 PR3 최종 리뷰 후 검색 Escape 포커스
+
+- Current objective: 파일 검색 입력이나 결과에 포커스한 채 Escape를 누르면 검색을 닫고 해당 프레임 키를 터미널로 보내지 않는다. 사용자 허락 없이 앱 재실행 금지.
+- Completed work: 검색 상태에 직전 프레임의 키보드 포커스를 보관한다. egui가 Escape 이벤트에서 포커스를 먼저 해제해도 검색을 닫고, 같은 프레임의 검색 키보드 소유 신호를 유지한다.
+- Modified files: `crates/app/src/ui/file_tree.rs`, `docs/CODEX_HANDOFF.md`.
+- Key design decisions: 검색 이외 영역에 포커스가 옮겨지면 이전 포커스를 매 프레임 갱신해 검색 창을 열어둔 동안 터미널 입력을 허용한다. Escape로 닫는 프레임만 터미널 입력을 차단한다.
+- Tests actually run: 새 egui kittest가 수정 전 RED, 수정 후 검색 닫기와 같은 프레임 키보드 소유 모두 GREEN. 최종 `kittest_file_search` 2 passed, workspace 검색 포커스 1 passed. `cargo clippy -p deppy-sijo --all-targets --locked -- -D warnings`, `cargo fmt --all -- --check`, `git diff --check` exit 0.
+- Failed approaches: 현재 프레임의 `response.has_focus()`만 확인하면 Escape 이후 포커스가 이미 사라져 검색을 닫지 못했다. 테스트에서 `harness.key_press`는 press/release를 여러 프레임에 걸쳐 실행해 닫힌 다음 프레임의 신호를 검사하게 되어, 명시적 Key press 이벤트로 한 프레임을 검증했다.
+- Remaining work: PR3 commit/push, PR4 rebase/push, 최종 스택 테스트·코드 리뷰·release 재빌드와 handoff 갱신. 앱 재실행 금지.
+- Exact next commands: `cd /private/tmp/deppy-file-tree-search-20260924`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git add crates/app/src/ui/file_tree.rs docs/CODEX_HANDOFF.md`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git commit -m 'Close file search after Escape clears focus'`.
+
 ## 2026-09-24 PR1 최종 리뷰 후 셸 종료·한글 셀 경계
 
 - Current objective: 복원된 원격 셸 화면을 유지하되 새 셸이 종료하면 마지막 출력을 보이고, 창 폭 축소가 한글 wide 셀을 잘라도 유효한 화면을 발행한다. 사용자 허락 없이 앱 재실행 금지.

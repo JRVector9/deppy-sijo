@@ -1074,6 +1074,7 @@ struct FileTreeSearch {
     result_limit_reached: bool,
     traversal_incomplete: bool,
     focus: bool,
+    keyboard_focused_last_frame: bool,
 }
 
 /// 펼친 하위 목록의 순회 위치만 보관한다. 전체 경로 목록을 대기열에 복제하지 않는다.
@@ -3094,6 +3095,7 @@ impl FileTreeUi {
                 result_limit_reached: false,
                 traversal_incomplete: false,
                 focus: true,
+                keyboard_focused_last_frame: false,
             });
             self.search_requested = None;
         }
@@ -4684,10 +4686,21 @@ impl FileTreeUi {
                     }
                 });
         }
-        close |= keyboard_focused && ui.input(|input| input.key_pressed(egui::Key::Escape));
+        // egui는 Escape를 위젯에 전달하기 전에 포커스를 해제할 수 있다. 직전
+        // 프레임에 검색이 키보드를 소유했다면 닫고, 같은 프레임의 PTY 입력도 막는다.
+        let escape_from_search = ui.input(|input| input.key_pressed(egui::Key::Escape))
+            && (keyboard_focused
+                || self
+                    .search
+                    .as_ref()
+                    .is_some_and(|search| search.keyboard_focused_last_frame));
+        close |= escape_from_search;
         if close {
             self.close_file_search();
-            return false;
+            return escape_from_search;
+        }
+        if let Some(search) = self.search.as_mut() {
+            search.keyboard_focused_last_frame = keyboard_focused;
         }
         if let Some(query) = changed_query {
             self.request_file_search(query);
@@ -8667,6 +8680,7 @@ mod tests {
             result_limit_reached: false,
             traversal_incomplete: false,
             focus: false,
+            keyboard_focused_last_frame: false,
         });
         tree.request_file_search("fold".to_owned());
         let first = tree.take_maintenance_intent().unwrap();
@@ -8722,6 +8736,7 @@ mod tests {
             result_limit_reached: false,
             traversal_incomplete: false,
             focus: false,
+            keyboard_focused_last_frame: false,
         });
         tree.request_file_search("fold".to_owned());
         let old = tree.take_maintenance_intent().unwrap();
@@ -13399,6 +13414,7 @@ mod tests {
             result_limit_reached: false,
             traversal_incomplete: false,
             focus: false,
+            keyboard_focused_last_frame: false,
         });
         harness.state_mut().0.complete_io(FileTreeIoCompletion {
             operation: intent.operation,
@@ -13783,6 +13799,7 @@ mod tests {
             result_limit_reached: false,
             traversal_incomplete: false,
             focus: true,
+            keyboard_focused_last_frame: false,
         });
         harness.step();
         // kittest의 step은 프레임을 완료한 뒤 반환하므로, 바로 이전 프레임 번호가
@@ -13833,6 +13850,7 @@ mod tests {
             result_limit_reached: false,
             traversal_incomplete: false,
             focus: false,
+            keyboard_focused_last_frame: false,
         });
         harness.step();
         harness.get_by_label("nested/FoldFolder").click();
@@ -13848,6 +13866,50 @@ mod tests {
         harness.step();
         assert_eq!(harness.state().0.root.as_deref(), found_folder.parent());
         assert_eq!(harness.state().0.selected, BTreeSet::from([found_folder]));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn kittest_file_search는_입력창에서_escape를_누르면_닫힌다() {
+        let base = temp_root("search-escape").canonicalize().unwrap();
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let workspaces = vec![SidebarWorkspaceEntry {
+            id: "ws-search-escape".to_owned(),
+            name: "search".to_owned(),
+            state: SidebarWorkspaceState::Active,
+            summary: SidebarSessionSummary::default(),
+        }];
+        let mut harness = close_menu_harness(&workspaces, "ws-search-escape", &catalog);
+        harness.state_mut().0.set_root(Some(base.clone()));
+        drain_listings(&mut harness.state_mut().0);
+        harness.state_mut().0.search = Some(FileTreeSearch {
+            query: "fold".to_owned(),
+            results: Vec::new(),
+            selected: None,
+            busy: false,
+            result_limit_reached: false,
+            traversal_incomplete: false,
+            focus: true,
+            keyboard_focused_last_frame: false,
+        });
+        harness.step();
+        assert!(harness.state().0.search.is_some());
+        harness.event(egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.step();
+        assert!(harness.state().0.search.is_none());
+        assert_eq!(
+            harness
+                .ctx
+                .data(|data| data.get_temp::<u64>(file_tree_search_keyboard_owner_id())),
+            Some(harness.ctx.cumulative_frame_nr() - 1),
+            "Escape를 처리한 프레임에는 터미널로 키를 보내지 않는다"
+        );
         std::fs::remove_dir_all(base).unwrap();
     }
 

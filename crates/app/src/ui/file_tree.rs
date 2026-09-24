@@ -3334,6 +3334,10 @@ impl FileTreeUi {
 
         // 편집 상태를 로컬로 꺼낸다 (flat 순회와 동시 &mut 회피, FT-3)
         let mut edit = self.edit.take();
+        let create_modal_open = matches!(
+            edit.as_ref(),
+            Some(EditState::NewFile { .. } | EditState::NewFolder { .. })
+        );
         let mut edit_done: Option<bool> = None; // Some(true)=커밋, Some(false)=취소
         let mut menu_action: Option<MenuAction> = None;
 
@@ -3995,7 +3999,9 @@ impl FileTreeUi {
             let dst_dir = drop_target_dir.unwrap_or(root);
             self.start_copy_into(os_dropped, dst_dir);
         }
-        self.handle_clipboard_shortcuts(ui, tree_area, hover_target_dir, hover_row_path);
+        if !create_modal_open {
+            self.handle_clipboard_shortcuts(ui, tree_area, hover_target_dir, hover_row_path);
+        }
 
         // 인라인 편집은 검증 후 native mutation intent만 만든다. 실패 completion이면
         // PendingFileTreeIo가 보관한 편집 snapshot을 복원한다.
@@ -15440,6 +15446,50 @@ mod tests {
             harness.state().0.error
         );
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn kittest_생성_모달이_열리면_트리_클립보드_단축키를_받지_않는다() {
+        use egui_kittest::kittest::Queryable;
+
+        let base = temp_root("modal-paste-guard").canonicalize().unwrap();
+        std::fs::write(base.join("seed.txt"), b"x").unwrap();
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.set_root(Some(base.clone()));
+        drain_listings(&mut tree);
+        let mut harness = drop_harness(&catalog, tree);
+        for _ in 0..200 {
+            harness.step();
+            if harness.query_by_label("seed.txt").is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        harness.state_mut().0.start_edit(EditState::NewFolder {
+            parent: base.clone(),
+            buffer: String::new(),
+            focus: false,
+        });
+        harness.step();
+        harness
+            .ctx
+            .memory_mut(|memory| memory.request_focus(tree_keyboard_focus_id()));
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::PointerMoved(egui::pos2(200.0, 400.0)));
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::Paste(String::new()));
+        harness.step();
+        assert!(harness.state_mut().0.take_io_intent().is_none());
+        assert_eq!(
+            harness.state_mut().0.take_clipboard_shortcut_consumption(),
+            (false, false)
+        );
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

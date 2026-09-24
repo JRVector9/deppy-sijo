@@ -7032,7 +7032,12 @@ impl WorkspaceUi {
                 .iter()
                 .any(is_blocking_terminal_window)
         });
+        // 파일 트리를 클릭해도 pane의 논리적 focused 값은 유지된다. 트리가 키보드를
+        // 소유하는 동안 renderer가 다시 터미널 포커스를 요청하지 않게 한다.
+        let tree_keyboard_focused =
+            ui.memory(|memory| memory.has_focus(super::file_tree::tree_keyboard_focus_id()));
         let terminal_keyboard_active = terminal_input_owner
+            && !tree_keyboard_focused
             && !search_input_focused
             && terminal_keyboard_input_allowed(
                 ui.ctx().text_edit_focused(),
@@ -7333,6 +7338,7 @@ impl WorkspaceUi {
         if input_enabled
             && mode.is_local()
             && focused
+            && !tree_keyboard_focused
             && self.pending_focus.as_ref() == Some(pane_id)
         {
             let app_armed = self.explicit_pending_focus.as_ref() == Some(pane_id);
@@ -14926,6 +14932,44 @@ mod tests {
                 .iter()
                 .all(|command| matches!(command, RuntimeCommand::ResizeTracked { .. }))
         );
+    }
+
+    #[test]
+    fn 파일트리_포커스는_터미널_자동_포커스에_덮이지_않는다() {
+        let catalog = catalog();
+        let config = TerminalConfig::default();
+        let session = SessionId(8);
+        let target_pane = pane_id("pane");
+        let mut workspace = WorkspaceUi::new();
+        workspace.mux = Some(mux(
+            "primary",
+            vec![tab(
+                "primary",
+                vec![pane("pane", session)],
+                LayoutNode::Pane(target_pane.clone()),
+            )],
+            "pane",
+        ));
+        workspace.last_focused_pane = Some(target_pane);
+        workspace.sessions.entry(session).or_default().snapshot = Some(snapshot("ready"));
+        let tree_focus = crate::ui::file_tree::tree_keyboard_focus_id();
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, workspace: &mut WorkspaceUi| {
+                ui.interact(
+                    egui::Rect::from_min_size(ui.cursor().min, egui::Vec2::ZERO),
+                    tree_focus,
+                    egui::Sense::focusable_noninteractive(),
+                );
+                workspace.show_with_input(ui, &config, &[], &catalog, true);
+            },
+            workspace,
+        );
+        harness.run();
+        harness
+            .ctx
+            .memory_mut(|memory| memory.request_focus(tree_focus));
+        harness.run();
+        assert!(harness.ctx.memory(|memory| memory.has_focus(tree_focus)));
     }
 
     #[test]

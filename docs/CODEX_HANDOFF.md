@@ -31,6 +31,17 @@
 - Remaining work: PR1 commit/push, PR2·PR3·PR4 rebase, 최종 통합 검증·리뷰·release 재빌드.
 - Exact next commands: `cd /private/tmp/deppy-ssh-screen-visible-20260924`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git add crates/session/src/session.rs crates/app/src/ui/workspace.rs docs/CODEX_HANDOFF.md`.
 
+## 2026-09-24 PR3 누적 리뷰 후 루트 상위 경로 고정
+
+- Current objective: 파일 검색의 루트 상위 경로가 스캔 직전 심볼릭 링크로 교체되어도 프로젝트 밖을 읽지 않는다. 사용자 허락 없이 앱 재실행 금지.
+- Completed work: `/` 디렉터리 핸들부터 canonical 루트의 성분을 `openat(O_NOFOLLOW|O_DIRECTORY)`로 하나씩 열어 root handle을 만든다. 상위 폴더 교체 테스트를 추가했다.
+- Modified files: `crates/app/src/app.rs`, `docs/CODEX_HANDOFF.md`.
+- Key design decisions: `canonicalize`는 경로 선택에만 쓰고 실제 디렉터리 열기는 모든 성분의 symlink를 거부하는 핸들 순회로 한다.
+- Tests actually run: 새 테스트는 helper 부재로 컴파일 RED, 구현 후 passed. `cargo test -p deppy-sijo --bin deppy-sijo --locked file_tree_search` 8 passed; `cargo fmt --all -- --check`와 `cargo clippy -p deppy-sijo --all-targets --locked -- -D warnings` exit 0.
+- Failed approaches: canonical root 경로를 한 번에 `OpenOptions`로 열면 마지막 성분에만 O_NOFOLLOW가 적용된다.
+- Remaining work: 최신 format/Clippy 확인 후 PR3 commit/push, PR4 rebase, 최종 통합 검증·리뷰·release 재빌드.
+- Exact next commands: `cd /private/tmp/deppy-file-tree-search-20260924`; `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo clippy -p deppy-sijo --all-targets --locked -- -D warnings`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`.
+
 ## 2026-09-24 PR3 누적 리뷰 후 검색 입력·삭제 확인·플랫폼 경계
 
 - Current objective: 파일 검색에서 검색 밖 포커스를 터미널에 돌려주고, 검색 중 휴지통 실패 확인을 보이며, 디렉터리 교체로 루트 밖을 순회하지 않게 한다. 앱 재실행 금지.

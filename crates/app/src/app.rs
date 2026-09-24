@@ -13585,6 +13585,32 @@ fn open_file_tree_search_directory(
 }
 
 #[cfg(unix)]
+fn open_file_tree_search_root(absolute: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    if !absolute.is_absolute() {
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    // '/' handle에서 한 성분씩 열어 canonicalize 이후 상위 경로가 symlink로
+    // 교체되어도 O_NOFOLLOW가 매 단계에서 거절하게 한다.
+    let mut directory = options.open("/")?;
+    for component in absolute.components() {
+        match component {
+            std::path::Component::RootDir => {}
+            std::path::Component::Normal(name) => {
+                directory = open_file_tree_search_directory(&directory, name)?;
+            }
+            _ => return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput)),
+        }
+    }
+    Ok(directory)
+}
+
+#[cfg(unix)]
 fn open_file_tree_search_relative(
     root: &std::fs::File,
     relative: &Path,
@@ -13743,16 +13769,8 @@ fn run_file_tree_search(
         return Err(Error::InvalidSnapshot);
     }
     let needle = query.to_lowercase();
-    let root_handle = {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut options = std::fs::OpenOptions::new();
-        options
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
-        options
-            .open(&canonical_root)
-            .map_err(|_| Error::NativeFailure)?
-    };
+    let root_handle =
+        open_file_tree_search_root(&canonical_root).map_err(|_| Error::NativeFailure)?;
     let mut stack = vec![PathBuf::new()];
     let mut paths = Vec::new();
     let mut visited = 0usize;
@@ -39529,6 +39547,21 @@ mod tests {
         assert_eq!(names, [std::ffi::OsString::from("inside.txt")]);
         std::fs::remove_dir_all(root).unwrap();
         std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_tree_search는_루트의_상위폴더가_심볼릭링크로_교체돼도_밖을_열지_않는다() {
+        let base = unique_temp_dir("file-tree-search-ancestor-swap")
+            .canonicalize()
+            .unwrap();
+        std::fs::create_dir_all(base.join("ancestor/project")).unwrap();
+        std::fs::create_dir_all(base.join("outside/project")).unwrap();
+        let canonical_root = base.join("ancestor/project").canonicalize().unwrap();
+        std::fs::rename(base.join("ancestor"), base.join("original-ancestor")).unwrap();
+        std::os::unix::fs::symlink(base.join("outside"), base.join("ancestor")).unwrap();
+        assert!(open_file_tree_search_root(&canonical_root).is_err());
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[cfg(unix)]

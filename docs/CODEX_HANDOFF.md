@@ -1,3 +1,113 @@
+## 2026-09-24 PR5 최종 리뷰 완료·PR 게시 대기
+
+- Current objective: 탭 여백 클릭으로 현재 워크스페이스에 셸을 바로 여는 PR5를 커밋·푸시하고 #194 위에 draft PR로 게시한다. 앱 재실행 금지.
+- Completed work: cmux surface 탭의 새 세션 진입을 참고한 `+`/여백 클릭 UI와 정확한 workspace/runtime 대상 지정, Busy 재시도, 숨김 상태 처리, warm 축출 방지, 종료 취소, primary 입력 소유권을 구현했다. 여덟 번째 `codex review --uncommitted` 결과는 actionable finding 없음. 기존 네 PR 누적 열 번째 리뷰도 actionable finding 없음.
+- Modified files: `crates/app/src/app.rs`, `crates/app/src/ui/workspace.rs`, `docs/CODEX_HANDOFF.md`.
+- Key design decisions: 새 셸 탭은 에이전트 런처와 별도이며, 클릭 당시 runtime에 연결한다. 헤더는 기존 pane의 FocusPane을 보내지 않고 primary 입력 소유권을 요청한다. controller/protocol/dotenv/runtime 큐의 Busy는 50ms 후 logic 루프에서 재시도한다. 닫힘 상태와 warm 이동을 보존한다.
+- Tests actually run: 최종 코드 `새_셸` 7 passed, `kittest_세션` 6 passed, `warm_eviction` 2 passed, app shell-tab 회귀 2 passed, dotenv Backpressure 1 passed. strict Clippy(app/session/runtime), format, diff, UI boundary exit 0. release app/proxy build exit 0. Developer ID 앱/ZIP 검증을 포함한 macOS package exit 0(`explicitly untrusted development bundle`). 앱은 실행하지 않았다.
+- Failed approaches: 이전 리뷰에서 controller 경합/대상 변경/전달 Busy/닫힘/포커스 경계/숨김 상태/primary 입력과 warm 노출 문제를 찾아 수정했다. 세부 경위는 아래 단계별 항목 참조.
+- Remaining work: handoff·PR body 최종 확인, `git diff --check`, 커밋·푸시·draft PR 생성 및 PR 상태 확인. 앱 재실행 금지.
+- Exact next commands: `cd /private/tmp/deppy-blank-tab-new-shell-20260924`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git add crates/app/src/app.rs crates/app/src/ui/workspace.rs docs/CODEX_HANDOFF.md`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git commit -m 'Open shell from empty session tab area'`.
+
+## 2026-09-24 PR5 일곱 번째 리뷰 후 전달·포커스·노출 경계
+
+- Current objective: dotenv 런타임 Backpressure 재시도와 primary 입력 소유권/닫힘 표시를 보정한 뒤 최종 검증·리뷰·PR을 완료한다. 앱 재실행 금지.
+- Completed work: 일곱 번째 `codex review --uncommitted`가 네 P2를 찾았다. dotenv 성공·fallback 경로에서 env/default/cache 정책/셸 전달 오류를 `Busy`와 영구 실패로 분류해 전달 완료에 보존한다. 기존 pane로 FocusPane을 보내지 않은 채 primary 입력 소유권만 요청한다. sessionless 헤더의 포커스 요청을 disabled body 렌더 결과와 OR로 합친다. 클릭 직후 workspace 전환으로 warm에서 셸이 열려도 해당 workspace의 닫힘 표시를 지운다.
+- Modified files: `crates/app/src/app.rs`, `crates/app/src/ui/workspace.rs`, `docs/CODEX_HANDOFF.md`.
+- Key design decisions: 전달 전제 명령의 Backpressure도 새 셸 클릭을 재시도해야 하므로 `deliver_workspace_protocol_after`가 첫 실패를 보존한다. 새 셸 클릭은 primary 작업면만 포커스하고 이전 pane의 로컬 포커스를 잠그지 않는다. 성공적으로 warm workspace에 입장한 셸은 목록에서 보이도록 닫힘 상태를 해제한다.
+- Tests actually run: 비활성 split pane과 sessionless 비활성 보조 탭의 primary 입력 테스트는 수정 전 RED, 수정 후 GREEN. `deliver_workspace_protocol_after` 테스트는 helper 부재로 컴파일 RED, 수정 후 GREEN. warm reveal 소스 회귀 GREEN(수정 후). 최신 코드 `새_셸` 7 passed, `kittest_세션` 6 passed, `warm_eviction` 2 passed, app shell-tab 회귀 2 passed, dotenv Backpressure 1 passed. strict Clippy(app/session/runtime), format, diff, UI boundary 모두 exit 0. release app/proxy build 및 Developer ID 앱/ZIP package 검증 exit 0. 앱은 실행하지 않았다.
+- Failed approaches: dotenv 단계의 실패를 bool로 줄이면서 Backpressure가 영구 실패로 바뀌었다. 보조 본문의 focus 할당이 헤더의 요청을 덮었다. active에서만 닫힘 표시를 해제하면 빠른 workspace 전환 뒤 셸이 숨었다.
+- Remaining work: 진행 중인 여덟 번째 코드 리뷰 결과 확인 및 필요 시 수정/재검증, handoff/PR body 최종 확인, 커밋·푸시·draft PR 생성. 앱 재실행 금지.
+- Exact next commands: `tail -n 100 /private/tmp/deppy-blank-tab-eighth-review-20260924.log`; `cd /private/tmp/deppy-blank-tab-new-shell-20260924`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git status --short`.
+
+## 2026-09-24 PR5 여섯 번째 리뷰 후 숨김 상태 재시도
+
+- Current objective: 창이 숨겨진 뒤에도 새 셸 탭 Busy 재시도가 logic 루프에서 진행되도록 하고 최종 검증·PR을 완료한다. 앱 재실행 금지.
+- Completed work: 여섯 번째 `codex review --uncommitted`가 active workspace의 지연 요청을 `ui()`에서만 소비해 숨김 상태에서 멈추는 P2를 찾았다. active/warm 요청을 `poll_pending_shell_tab_requests` 하나로 묶어 `logic()`에서 소비한다. 렌더 경로의 소비 코드는 제거했다.
+- Modified files: `crates/app/src/app.rs`, `crates/app/src/ui/workspace.rs`, `docs/CODEX_HANDOFF.md`.
+- Key design decisions: 입력 이벤트는 UI가 요청으로 기록하되 비동기 전달·재시도는 UI 표시 여부와 독립적인 logic 루프에서 진행한다. 공용 controller 슬롯이 차 있으면 active/warm 요청을 유지한다.
+- Tests actually run: 숨김 상태 logic 폴링 소스 회귀는 수정 전 RED, 수정 후 GREEN. 최종 변경 후 `새_셸` 6 passed, `kittest_세션` 5 passed, `warm_eviction` 2 passed, 숨김 루프 회귀 1 passed. strict Clippy(app/session/runtime), format, diff, UI boundary exit 0. release app/proxy build exit 0, Developer ID 앱/ZIP package 검증 exit 0. 앱은 실행하지 않았다.
+- Failed approaches: active 요청을 렌더 중에만 소비하면 window hidden/minimized 이후 Busy 재시도가 멈췄다.
+- Remaining work: 진행 중인 일곱 번째 코드 리뷰 결과 확인 및 필요 시 수정/재검증, handoff/PR body 최종 확인, 커밋·푸시·draft PR 생성. 앱 재실행 금지.
+- Exact next commands: `tail -n 100 /private/tmp/deppy-blank-tab-seventh-review-20260924.log`; `cd /private/tmp/deppy-blank-tab-new-shell-20260924`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git status --short`.
+
+## 2026-09-24 PR5 다섯 번째 리뷰 후 포커스 경계 수정
+
+- Current objective: 분할 pane의 비활성 헤더에서 `+` 클릭 후 새 셸이 바로 입력을 받도록 포커스 경계를 수정하고 최종 재검증·PR 생성을 완료한다. 앱 재실행 금지.
+- Completed work: 다섯 번째 `codex review --uncommitted`에서 새 셸 탭 클릭이 기존 pane의 `FocusPane`을 예약해 새 세션 위에 오래된 `explicit_pending_focus`가 남는 P2를 찾았다. 헤더 `+` 클릭은 셸 생성 요청만 기록하도록 바꾸고, 테스트를 비활성 split pane 클릭으로 강화했다.
+- Modified files: `crates/app/src/app.rs`, `crates/app/src/ui/workspace.rs`, `docs/CODEX_HANDOFF.md`.
+- Key design decisions: 새 탭 클릭에는 기존 pane 활성화가 필요하지 않다. runtime의 SpawnShell이 새 pane을 활성화하므로 헤더에서는 이전 pane 포커스 요청을 보내지 않는다.
+- Tests actually run: 포커스 없음 assertion은 수정 전 RED, 수정 후 GREEN. split pane이 비활성인 구성으로 바꾼 뒤 해당 UI 테스트 GREEN. 최종 변경 후 `새_셸` 6 passed, `kittest_세션` 5 passed, `warm_eviction` 2 passed. strict Clippy(app/session/runtime), format, diff, UI boundary 모두 exit 0. release app/proxy build exit 0, Developer ID 앱/ZIP 검증을 포함한 package exit 0. 앱은 실행하지 않았다.
+- Failed approaches: 첫 구현은 `+` 클릭을 기존 pane 클릭처럼 다뤄 FocusPane과 새 셸 생성이 경합했다.
+- Remaining work: 진행 중인 여섯 번째 코드 리뷰 결과 확인 및 필요 시 수정/재검증, PR body 최종 확인, 커밋·푸시·draft PR 생성. 앱 재실행 금지.
+- Exact next commands: `tail -n 100 /private/tmp/deppy-blank-tab-sixth-review-20260924.log`; `cd /private/tmp/deppy-blank-tab-new-shell-20260924`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git status --short`.
+
+## 2026-09-24 PR5 최신 검증·재빌드 후 최종 리뷰 대기
+
+- Current objective: 탭 여백 클릭으로 현재 워크스페이스에 셸을 바로 여는 별도 draft PR을 최종 리뷰하고 게시한다. 앱 재실행 금지.
+- Completed work: 새 탭 요청을 원래 workspace/runtime에 고정하고 controller/protocol/.env 전달 Busy 재시도를 구현했다. 종료 시 지연 요청을 취소한다. 기존 `cancel_workspace_restore_intents`가 `.env` 중 세션 생성 continuation까지 취소하는 것을 확인했다. 릴리스 앱·프록시를 재빌드하고 앱/ZIP을 패키지 검증했다. 앱은 실행하지 않았다.
+- Modified files: `crates/app/src/app.rs`, `crates/app/src/ui/workspace.rs`, `docs/CODEX_HANDOFF.md`.
+- Key design decisions: 탭 여백의 셸 생성은 툴바 에이전트 런처와 별도 요청이다. controller가 정확한 runtime을 찾아 protocol 입장을 시도하고, Busy이면 WorkspaceUi에서 50ms 후 재시도한다. 큐/전달 중 spawn은 warm 축출에서 보호한다.
+- Tests actually run: 최신 코드에서 `새_셸` 6 passed, `kittest_세션` 5 passed, `warm_eviction` 2 passed. `cargo clippy -p deppy-sijo -p session -p runtime --all-targets --locked -- -D warnings`, `cargo fmt --all --check`, `git diff --check`, `cargo run -p xtask -- check-boundary` 모두 exit 0. `cargo build --release -p deppy-sijo -p mcp-proxy --locked` exit 0. `scripts/package-macos.sh` exit 0, Developer ID 앱/ZIP 검증 성공(`explicitly untrusted development bundle`).
+- Failed approaches: 앞선 네 번의 리뷰에서 controller 슬롯 충돌, 전환 후 대상 변경, protocol Busy 유실, warm inflight 축출, 종료 후 재시도, 후속 전달 Busy 유실을 찾아 수정했다.
+- Remaining work: 진행 중인 다섯 번째 `codex review --uncommitted` 결과 확인 및 필요 시 반영/재검증, PR body 최종 갱신, 커밋·푸시·draft PR 생성 및 상태 확인. 앱 재실행 금지.
+- Exact next commands: `tail -n 100 /private/tmp/deppy-blank-tab-fifth-review-20260924.log`; `cd /private/tmp/deppy-blank-tab-new-shell-20260924`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git status --short`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`.
+
+## 2026-09-24 PR5 네 번째 리뷰 후 종료 취소·전달 재시도
+
+- Current objective: 새 셸 탭 클릭의 비동기 전달까지 Busy 재시도하고 워크스페이스 종료가 지연 클릭을 확실히 취소하도록 수정한 뒤 최종 리뷰·빌드·PR을 완료한다. 앱 재실행 금지.
+- Completed work: 네 번째 `codex review --uncommitted`가 close 이후 지연 생성과 dotenv/runtime 전달 Busy에서 클릭 유실 두 P2를 찾았다. WorkspaceUi가 새 탭 SpawnShell의 protocol operation/generation을 추적하고 `complete_protocol(Err(Busy))`에서 50ms 재시도를 예약한다. `close_workspace_sessions`는 해당 워크스페이스의 UI 요청·전달 추적·대기 controller 액션을 취소한다. logic은 active/warm의 지연 요청이 있으면 repaint를 예약한다.
+- Modified files: `crates/app/src/app.rs`, `crates/app/src/ui/workspace.rs`, `docs/CODEX_HANDOFF.md`.
+- Key design decisions: 로컬 큐 수락과 실제 runtime 전달을 구분한다. protocol completion의 exact operation/generation으로 새 탭 클릭만 재시도한다. 종료 시 재시도와 전달 추적을 함께 비워 늦은 Busy 완료가 클릭을 되살리지 못하게 한다.
+- Tests actually run: 전달 Busy 재시도 테스트는 수정 전 assertion RED, 수정 후 GREEN. 종료 취소 테스트는 메서드 부재로 컴파일 RED, 수정 후 GREEN. 직전 스택의 Clippy/format/boundary, warm eviction 2 passed 및 release/package 통과는 이 수정 전 결과라 재실행 필요.
+- Failed approaches: queue admission `Ok`만으로 클릭을 완료 처리하면 dotenv continuation·runtime 채널의 후속 Busy에서 유실됐다. 종료 시 UI bool을 지우지 않으면 다음 frame에서 닫힌 workspace에 셸을 만들었다.
+- Remaining work: 최신 포맷/Clippy/경계·기능 테스트, 다섯 번째 코드 리뷰, release 재빌드·패키지 검증, 문서/PR body 최종 갱신, 커밋·푸시·draft PR 생성. 앱 재실행 금지.
+- Exact next commands: `cd /private/tmp/deppy-blank-tab-new-shell-20260924`; `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo fmt --all --check`; `CARGO_TARGET_DIR=/private/tmp/deppy-file-tree-create-modal-20260924/target SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo clippy -p deppy-sijo --all-targets --locked -- -D warnings`.
+
+## 2026-09-24 PR5 세 번째 리뷰 후 비점유 재시도·inflight 보호
+
+- Current objective: 새 셸 클릭 재시도가 공용 controller 슬롯을 장시간 막지 않게 하고, `.env` 동기화 중인 warm 셸 생성을 보호한 뒤 최종 검증·PR 생성까지 끝낸다. 앱 재실행 금지.
+- Completed work: 세 번째 `codex review --uncommitted`가 Busy 재시도 슬롯 점유와 warm in-flight spawn 축출 두 P2를 찾았다. protocol Busy는 WorkspaceUi에 50ms 기한 요청으로 돌려 controller 슬롯을 비운다. `take_new_shell_tab_requested`는 기한 전 false를 반환한다. `inflight_spawns`를 추가해 queued→inflight→awaiting 전 단계가 warm liveness에 포함되도록 했다.
+- Modified files: `crates/app/src/app.rs`, `crates/app/src/ui/workspace.rs`, `docs/CODEX_HANDOFF.md`.
+- Key design decisions: controller action은 한 번의 admission만 시도한다. Busy 대기는 workspace별 UI 상태에 유지해 다른 controller 액션이 진행되게 한다. 전달 전후의 spawn은 모두 축출 보호에 포함한다.
+- Tests actually run: 50ms 대기 테스트는 메서드/필드 부재로 컴파일 RED 후 GREEN. queued→inflight→awaiting 회귀 테스트는 `inflight_spawns` 부재로 컴파일 RED 후 GREEN. 수정 전 warm eviction 2 passed, `kittest_세션` 5 passed, `새_셸` 4 passed. 이 수정 후 Clippy/format/boundary/release/package 재실행 필요.
+- Failed approaches: protocol Busy 때 `pending_workspace_controller_action`에 SpawnShellTab을 그대로 다시 넣으면 단일 슬롯을 매 프레임 점유해 다른 UI 액션을 떨어뜨렸다. queued와 awaiting만 세면 dotenv 비동기 전달 중 보호 공백이 생겼다.
+- Remaining work: 포맷·Clippy·경계·관련 테스트, 네 번째 코드 리뷰와 반영, 최종 release 빌드/패키징, handoff/PR body 갱신, 커밋·푸시·draft PR 생성. 앱 재실행 금지.
+- Exact next commands: `cd /private/tmp/deppy-blank-tab-new-shell-20260924`; `CARGO_TARGET_DIR=/private/tmp/deppy-file-tree-create-modal-20260924/target SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo clippy -p deppy-sijo --all-targets --locked -- -D warnings`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`.
+
+## 2026-09-24 PR5 두 번째 리뷰 후 워크스페이스 고정·큐 재시도
+
+- Current objective: 탭 여백 클릭을 반드시 클릭 당시 워크스페이스 실행 인스턴스에 적용하고, controller/protocol 두 큐가 바쁠 때도 요청을 보존한 뒤 PR·빌드까지만 완료한다. 앱 재실행 금지.
+- Completed work: 두 번째 `codex review --uncommitted`가 빠른 워크스페이스 전환에 따른 잘못된 대상과 protocol Busy에 따른 클릭 유실 두 P2를 찾았다. `SpawnShellTab { workspace_id, runtime_instance }` 전용 액션이 active/warm의 정확한 runtime에 `try_spawn_shell_tab`을 적용한다. Busy면 같은 액션을 50ms 후 재시도한다. controller 슬롯이 찬 클릭은 WorkspaceUi에 남고, warm으로 이동한 경우 logic이 다시 액션으로 올린다. warm 축출은 대기 액션·UI 요청·큐의 spawn·전달 후 spawn을 보호한다.
+- Modified files: `crates/app/src/app.rs`, `crates/app/src/ui/workspace.rs`, `docs/CODEX_HANDOFF.md`.
+- Key design decisions: 새 셸 입장 확인은 렌더가 아니라 logic의 workspace controller에서 한다. 새 세션으로의 UI 전환은 정확한 active runtime의 protocol 큐 입장 성공 뒤에만 한다. 사용자가 이미 다른 워크스페이스로 이동했다면 기존 화면을 빼앗지 않고 원래 workspace의 warm runtime에 셸을 연다.
+- Tests actually run: 새 protocol 큐 포화→비움→수락 테스트는 메서드 부재로 컴파일 RED 후 GREEN. 수정 후 `kittest_세션` 5 passed, `새_셸` 4 passed. 이전 수정의 Clippy/format/boundary/release/package는 통과했으나 이 아키텍처 변경 후 다시 실행해야 한다.
+- Failed approaches: controller 슬롯 재시도만으로는 runtime 대상 변경과 protocol 큐 Busy를 막지 못했다. `SpawnShellAt`가 다음 tick의 `self.active`를 사용해 다른 workspace에 열릴 수 있었다.
+- Remaining work: 수정 후 Clippy/format/boundary·관련 테스트, 세 번째 코드 리뷰, release 재빌드/패키징, handoff/PR body 갱신, 커밋·푸시·draft PR 생성. 앱 재실행 금지.
+- Exact next commands: `cd /private/tmp/deppy-blank-tab-new-shell-20260924`; `CARGO_TARGET_DIR=/private/tmp/deppy-file-tree-create-modal-20260924/target SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo clippy -p deppy-sijo --all-targets --locked -- -D warnings`; `CARGO_TARGET_DIR=/private/tmp/deppy-file-tree-create-modal-20260924/target SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo run --locked -p xtask -- check-boundary`.
+
+## 2026-09-24 PR5 리뷰 후 새 셸 클릭 재시도
+
+- Current objective: 탭 여백 클릭으로 새 셸을 여는 PR5에서 같은 프레임의 controller 슬롯 경합에도 클릭을 잃지 않게 하고, 보조 탭 전환 시점을 맞춘 뒤 최종 리뷰·빌드한다. 앱 재실행 금지.
+- Completed work: 첫 `codex review --uncommitted`가 `SyncDotenv` 등 선행 액션과 충돌하면 클릭이 사라지는 P2를 찾았다. App이 `SpawnShellAt` 예약 성공 시에만 `reveal_terminal_session`을 호출하고, 실패 시 WorkspaceUi의 요청을 다음 프레임에 다시 넣도록 수정했다. 세션/이력 헤더에서 새 셸 클릭을 해도 예약 전 보조 탭 intent를 올리지 않는다.
+- Modified files: `crates/app/src/app.rs`, `crates/app/src/ui/workspace.rs`, `docs/CODEX_HANDOFF.md`.
+- Key design decisions: controller 슬롯은 capacity one이므로 UI intent를 소비한 뒤 실패하면 보존해야 한다. 탭 표시 변화는 실제 예약 수락과 같은 시점에 한다. 기존 에이전트 런처 경로는 변경하지 않는다.
+- Tests actually run: 재시도 요청 테스트는 메서드 부재로 컴파일 RED 후 GREEN. 세션 없는 이력 탭 조기 숨김 테스트는 이전 동작으로 RED, 수정 후 GREEN. 기존 pane의 활성 이력 탭 여백 테스트 GREEN. 수정 전 release 빌드와 Developer ID 서명·bundle/ZIP 검증은 통과했으나 현재 소스 수정 후 다시 빌드해야 한다. 이전 PR5 Clippy와 `xtask check-boundary` exit 0, 수정 후 재실행 필요.
+- Failed approaches: 첫 구현은 요청을 즉시 `take`한 뒤 controller 슬롯이 찼을 때 버리고, 이력 탭을 생성 예약 전에 닫았다. 리뷰 발견 후 수정했다.
+- Remaining work: 수정 후 포맷/Clippy/경계·기능 테스트, 두 번째 코드 리뷰, release 재빌드/패키징, 커밋·PR 생성, 상태 확인. 앱 재실행 금지.
+- Exact next commands: `cd /private/tmp/deppy-blank-tab-new-shell-20260924`; `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo fmt --all --check`; `CARGO_TARGET_DIR=/private/tmp/deppy-file-tree-create-modal-20260924/target SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo test -p deppy-sijo --bin deppy-sijo --locked kittest_세션`.
+
+## 2026-09-24 PR5 탭 여백 클릭으로 새 셸 세션
+
+- Current objective: cmux의 새 surface 진입 방식을 참고해 Deppy의 pane 헤더에서 세션/보조 탭 뒤 빈 영역을 클릭하면 에이전트 런처를 거치지 않고 현재 워크스페이스에 새 셸을 연다. 사용자 허락 없이 앱 재실행 금지.
+- Completed work: PR4 위에 `feat/blank-tab-new-shell` worktree를 만들었다. 세션 헤더와 세션 없는 보조 탭 헤더 양쪽에 `+` 진입점을 렌더하고, 여백 클릭 요청을 App의 기존 `SpawnShellAt { cwd: None }` 액션으로 라우팅했다. 보조 탭은 세션 본문으로 전환한다.
+- Modified files: `crates/app/src/ui/workspace.rs`, `crates/app/src/app.rs`, `docs/CODEX_HANDOFF.md`.
+- Key design decisions: 새 요청은 툴바의 기존 `new_session_requested`(에이전트 런처)와 분리한다. 탭/닫기/우측 도구를 제외한 실제 빈 영역만 클릭 가능하게 하고, 28pt 미만의 좁은 여백에는 새 진입점을 그리지 않는다. 탭이 렌더되는 현재 워크스페이스로만 셸을 연다. 보조 탭 활성으로 터미널 입력이 잠긴 경우에도 명시적인 여백 클릭은 새 셸을 연다.
+- Tests actually run: 기존 세션 여백 클릭 테스트는 요청 메서드가 없어 컴파일 RED, 구현 후 클릭 요청까지 도달했으나 FocusPane 명령을 허용하지 않은 테스트 기대가 실패해 조정 후 GREEN. 세션 없는 활성 이력 헤더 테스트는 동작 RED→GREEN. 최종 `cargo test ... kittest_세션` 5 passed, `... kittest_이력` 2 passed, `cargo fmt --all --check` exit 0. PR5 Clippy/리뷰/빌드 미완료.
+- Failed approaches: 처음 테스트가 포커스 이동의 정상 `FocusPane` 프로토콜까지 금지했다. 새 세션 요청과 무관한 포커스 명령만 허용하도록 기대를 수정했다.
+- Remaining work: Clippy·경계 검사, PR5 코드 리뷰와 수정, 관련 테스트 재확인, release 빌드/패키징, 커밋/PR 생성·푸시. 앱 재실행 금지.
+- Exact next commands: `cd /private/tmp/deppy-blank-tab-new-shell-20260924`; `CARGO_TARGET_DIR=/private/tmp/deppy-file-tree-create-modal-20260924/target SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo clippy -p deppy-sijo --all-targets --locked -- -D warnings`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`.
+
 ## 2026-09-24 네 PR 최종 코드 리뷰와 새 탭 여백 기능 대기
 
 - Current objective: 분리된 네 draft PR의 최종 테스트·리뷰를 마치고, cmux 새 surface 흐름을 참고해 Deppy의 상단 pane 탭 여백을 누르면 현재 워크스페이스에 셸 세션이 바로 열리도록 별도 PR을 만든다. 사용자 허락 없이 앱 재실행 금지.

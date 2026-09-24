@@ -1594,6 +1594,13 @@ fn classify_workspace_protocol_delivery(
     })
 }
 
+fn deliver_workspace_protocol_after(
+    prerequisite: Result<(), ui::workspace::WorkspaceProtocolErrorCode>,
+    deliver: impl FnOnce() -> anyhow::Result<()>,
+) -> Result<(), ui::workspace::WorkspaceProtocolErrorCode> {
+    prerequisite.and_then(|()| classify_workspace_protocol_delivery(deliver()))
+}
+
 /// dotenv 동기화가 실패했을 때도 통과시킬 continuation인가(2026-08-21).
 ///
 /// **세션을 여는 일은 `.env`와 독립이어야 한다.** `.env` 한 줄이 문제라고 그
@@ -8366,7 +8373,10 @@ impl WorkspaceRuntime {
         workspace_is_live(
             self.live.has_live(),
             self.live.seen_mux,
-            self.workspace_ui.pending_spawns() + self.pending_agent_spawns,
+            self.workspace_ui.pending_spawns()
+                + self.workspace_ui.queued_spawns()
+                + self.workspace_ui.inflight_spawns()
+                + self.pending_agent_spawns,
             self.created.elapsed(),
         )
     }
@@ -8375,7 +8385,12 @@ impl WorkspaceRuntime {
     /// 에이전트/미분류 세션, 자식 프로세스, resource 샘플 부재는 모두 작업 중으로 보고
     /// 보호한다. 셸 자체는 layout/cwd에서 다시 spawn되므로 이 조건에서만 suspend 가능하다.
     fn can_auto_suspend_idle_shells(&self) -> bool {
-        if self.workspace_ui.pending_spawns() + self.pending_agent_spawns > 0 || !self.live.seen_mux
+        if self.workspace_ui.pending_spawns()
+            + self.workspace_ui.queued_spawns()
+            + self.workspace_ui.inflight_spawns()
+            + self.pending_agent_spawns
+            > 0
+            || !self.live.seen_mux
         {
             return false;
         }
@@ -11688,6 +11703,10 @@ enum WorkspaceControllerAction {
     Runtime(runtime::RuntimeCommand),
     SpawnShellAt {
         cwd: Option<String>,
+    },
+    SpawnShellTab {
+        workspace_id: String,
+        runtime_instance: u64,
     },
     ResumeAgent {
         /// 이 pane이 속한 워크스페이스. 활성 워크스페이스와 다르면 먼저 전환한다
@@ -20470,6 +20489,36 @@ impl App {
         }
     }
 
+    fn poll_pending_shell_tab_requests(&mut self) {
+        if self.pending_workspace_controller_action.is_some() {
+            return;
+        }
+        if self.active.workspace_ui.take_new_shell_tab_requested() {
+            if !self.stage_workspace_controller_action(WorkspaceControllerAction::SpawnShellTab {
+                workspace_id: self.active.id.clone(),
+                runtime_instance: self.active.runtime_instance,
+            }) {
+                self.active.workspace_ui.retry_new_shell_tab_request();
+            }
+            return;
+        }
+        let pending = self.warm.iter_mut().find_map(|(workspace_id, runtime)| {
+            runtime
+                .workspace_ui
+                .take_new_shell_tab_requested()
+                .then(|| (workspace_id.clone(), runtime.runtime_instance))
+        });
+        if let Some((workspace_id, runtime_instance)) = pending
+            && !self.stage_workspace_controller_action(WorkspaceControllerAction::SpawnShellTab {
+                workspace_id: workspace_id.clone(),
+                runtime_instance,
+            })
+            && let Some(runtime) = self.warm.get_mut(&workspace_id)
+        {
+            runtime.workspace_ui.retry_new_shell_tab_request();
+        }
+    }
+
     fn poll_workspace_controller(&mut self) {
         let Some(action) = self.pending_workspace_controller_action.take() else {
             return;
@@ -20565,6 +20614,40 @@ impl App {
                 self.active
                     .workspace_ui
                     .spawn_shell_at(self.config.terminal.scrollback_lines as usize, cwd);
+            }
+            WorkspaceControllerAction::SpawnShellTab {
+                workspace_id,
+                runtime_instance,
+            } => {
+                let active_target = self.active.id == workspace_id
+                    && self.active.runtime_instance == runtime_instance;
+                let scrollback_lines = self.config.terminal.scrollback_lines as usize;
+                let admission = self
+                    .runtime_by_instance_mut(runtime_instance)
+                    .filter(|runtime| runtime.id == workspace_id)
+                    .map(|runtime| runtime.workspace_ui.try_spawn_shell_tab(scrollback_lines));
+                match admission {
+                    Some(Ok(())) if active_target => {
+                        self.reveal_active_workspace_for_new_session();
+                        self.reveal_terminal_session();
+                    }
+                    Some(Ok(())) => {
+                        self.reveal_closed_workspace(&workspace_id);
+                    }
+                    Some(Err(ui::workspace::WorkspaceProtocolErrorCode::Busy)) => {
+                        if let Some(runtime) = self
+                            .runtime_by_instance_mut(runtime_instance)
+                            .filter(|runtime| runtime.id == workspace_id)
+                        {
+                            runtime
+                                .workspace_ui
+                                .defer_new_shell_tab_request(std::time::Duration::from_millis(50));
+                        }
+                        self.egui_ctx
+                            .request_repaint_after(std::time::Duration::from_millis(50));
+                    }
+                    Some(Err(_)) | None => {}
+                }
             }
             WorkspaceControllerAction::ResumeAgent {
                 workspace_id,
@@ -23169,6 +23252,20 @@ impl App {
     /// shutdown, 세션 종료 — §14.1 Suspended). background 스레드에서 정리하고 on_exit에서 join.
     /// **live 세션(미종료 셸/에이전트)이 있는 workspace는 축출하지 않는다** — 진행 중
     /// 작업을 경고 없이 kill하지 않기 위해 상한 초과를 허용한다 (메모리 < 작업 보호).
+    fn pending_shell_tab_protects_runtime(
+        &self,
+        workspace_id: &str,
+        runtime_instance: u64,
+    ) -> bool {
+        matches!(
+            self.pending_workspace_controller_action.as_ref(),
+            Some(WorkspaceControllerAction::SpawnShellTab {
+                workspace_id: pending_workspace_id,
+                runtime_instance: pending_runtime_instance,
+            }) if pending_workspace_id == workspace_id && *pending_runtime_instance == runtime_instance
+        )
+    }
+
     fn evict_warm(&mut self) {
         self.warm_eviction_deferred = false;
         let max_warm = self.config.performance.max_warm as usize;
@@ -23182,6 +23279,8 @@ impl App {
                         || self
                             .cross_workspace_restore
                             .protects_runtime(id, runtime.runtime_instance)
+                        || self.pending_shell_tab_protects_runtime(id, runtime.runtime_instance)
+                        || runtime.workspace_ui.has_new_shell_tab_request()
                 })
             },
             |id| self.warm.get(id).is_some_and(|rt| rt.has_live_sessions()),
@@ -23255,6 +23354,8 @@ impl App {
                         || self
                             .cross_workspace_restore
                             .protects_runtime(id, runtime.runtime_instance)
+                        || self.pending_shell_tab_protects_runtime(id, runtime.runtime_instance)
+                        || runtime.workspace_ui.has_new_shell_tab_request()
                 })
             },
             |id| self.warm.get(id).and_then(|rt| rt.backgrounded_at),
@@ -23391,6 +23492,20 @@ impl App {
     /// 워크스페이스의 세션(pane)을 전부 닫는다 — 사이드바 「워크스페이스 종료」 확정 경로.
     /// 워크스페이스 자체(경로·설정·DB 기록)는 보존한다(설정의 「프로젝트 삭제」와 구분).
     fn close_workspace_sessions(&mut self, workspace_id: &str) {
+        if matches!(
+            self.pending_workspace_controller_action.as_ref(),
+            Some(WorkspaceControllerAction::SpawnShellTab {
+                workspace_id: pending_workspace_id,
+                ..
+            }) if pending_workspace_id == workspace_id
+        ) {
+            self.pending_workspace_controller_action = None;
+        }
+        if workspace_id == self.active.id {
+            self.active.workspace_ui.cancel_new_shell_tab_requests();
+        } else if let Some(runtime) = self.warm.get_mut(workspace_id) {
+            runtime.workspace_ui.cancel_new_shell_tab_requests();
+        }
         // A Catalog/explicit restore can still be waiting behind dotenv or bounded command
         // delivery while the mux is empty. Drop every local restore owner before deriving the
         // panes to close, otherwise its late completion can recreate a just-closed workspace.
@@ -24260,17 +24375,18 @@ impl App {
             if allow_environment_fallback
                 && let Some(runtime) = self.runtime_by_instance_mut(pending.runtime_instance)
             {
-                let defaults_cleared = runtime
-                    .runtime
-                    .send_command(runtime::RuntimeCommand::SetSessionDefaultEnv {
-                        secret_versions: Vec::new(),
-                        environment_revision: None,
-                        dotenv_source: None,
-                        api_secrets: Vec::new(),
-                        env_plain: Vec::new(),
-                        env_secrets: Vec::new(),
-                    })
-                    .is_ok();
+                let defaults_delivery =
+                    classify_workspace_protocol_delivery(runtime.runtime.send_command(
+                        runtime::RuntimeCommand::SetSessionDefaultEnv {
+                            secret_versions: Vec::new(),
+                            environment_revision: None,
+                            dotenv_source: None,
+                            api_secrets: Vec::new(),
+                            env_plain: Vec::new(),
+                            env_secrets: Vec::new(),
+                        },
+                    ));
+                let defaults_cleared = defaults_delivery.is_ok();
                 let delivered = match pending.continuation {
                     PendingDotenvContinuation::AgentLaunch { command, .. } => {
                         defaults_cleared && runtime.runtime.send_command(command).is_ok()
@@ -24280,15 +24396,15 @@ impl App {
                         generation,
                         command,
                     } => {
-                        let delivered =
-                            defaults_cleared && runtime.runtime.send_command(command).is_ok();
+                        let delivery = deliver_workspace_protocol_after(defaults_delivery, || {
+                            runtime.runtime.send_command(command)
+                        });
+                        let delivered = delivery.is_ok();
                         runtime.workspace_ui.complete_protocol(
                             ui::workspace::WorkspaceProtocolCompletion {
                                 operation,
                                 generation,
-                                result: delivered.then_some(()).ok_or(
-                                    ui::workspace::WorkspaceProtocolErrorCode::DeliveryFailed,
-                                ),
+                                result: delivery,
                             },
                         );
                         delivered
@@ -24493,40 +24609,44 @@ impl App {
         } else {
             runtime.environment_application.unchanged();
         }
-        let env_delivered = match payload {
-            Some(payload) => runtime
-                .runtime
-                .send_command(runtime::RuntimeCommand::SetSessionDefaultEnv {
+        let env_delivery = match payload {
+            Some(payload) => classify_workspace_protocol_delivery(runtime.runtime.send_command(
+                runtime::RuntimeCommand::SetSessionDefaultEnv {
                     secret_versions: payload.secret_versions,
                     environment_revision: Some(payload.revision),
                     dotenv_source: payload.dotenv_source,
                     api_secrets: payload.api_secrets,
                     env_plain: payload.env_plain,
                     env_secrets: payload.env_secrets,
-                })
-                .is_ok(),
-            None => true,
+                },
+            )),
+            None => Ok(()),
         };
+        let env_delivered = env_delivery.is_ok();
         runtime.dotenv_files = outcome.source_files;
         runtime.dotenv_state = (env_delivered && !source_failed).then_some(baseline);
         if !env_delivered {
             runtime.environment_application.fail();
         }
-        let policy_delivered = env_delivered && runtime.runtime.send_command(cache_policy).is_ok();
+        let policy_delivery = deliver_workspace_protocol_after(env_delivery, || {
+            runtime.runtime.send_command(cache_policy)
+        });
+        let policy_delivered = policy_delivery.is_ok();
         let (delivered, restore_delivery, queue_full_restore) = match pending.continuation {
             PendingDotenvContinuation::WorkspaceProtocol {
                 operation,
                 generation,
                 command,
             } => {
-                let delivered = policy_delivered && runtime.runtime.send_command(command).is_ok();
+                let delivery = deliver_workspace_protocol_after(policy_delivery, || {
+                    runtime.runtime.send_command(command)
+                });
+                let delivered = delivery.is_ok();
                 runtime.workspace_ui.complete_protocol(
                     ui::workspace::WorkspaceProtocolCompletion {
                         operation,
                         generation,
-                        result: delivered
-                            .then_some(())
-                            .ok_or(ui::workspace::WorkspaceProtocolErrorCode::DeliveryFailed),
+                        result: delivery,
                     },
                 );
                 (delivered, None, false)
@@ -29454,6 +29574,7 @@ impl eframe::App for App {
         }
         self.poll_workspace_controller();
         self.poll_pending_workspace_session_open();
+        self.poll_pending_shell_tab_requests();
         self.poll_pending_workspace_focus();
         self.poll_pending_resume_agent();
         self.poll_pending_document_open();
@@ -29866,6 +29987,14 @@ impl eframe::App for App {
         // Drain each resident runtime only in logic, returning exact operation/generation
         // completions so queue and in-flight slots cannot accumulate across frames.
         self.poll_workspace_protocol_intents();
+        if self.active.workspace_ui.has_new_shell_tab_request()
+            || self
+                .warm
+                .values()
+                .any(|runtime| runtime.workspace_ui.has_new_shell_tab_request())
+        {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
         while let Some(intent) = self.notifications_ui.pop_native_intent() {
             platform::notify(intent.summary(), intent.body());
         }
@@ -43714,6 +43843,30 @@ mod tests {
         assert_eq!(classify_workspace_protocol_delivery(Ok(())), Ok(()));
     }
 
+    #[test]
+    fn workspace_protocol_dotenv_delivery_retries_backpressure() {
+        use ui::workspace::WorkspaceProtocolErrorCode::{Busy, DeliveryFailed};
+        assert_eq!(
+            deliver_workspace_protocol_after(Ok(()), || {
+                Err(runtime::RuntimeCommandSendError::Backpressure.into())
+            }),
+            Err(Busy)
+        );
+        let mut called = false;
+        assert_eq!(
+            deliver_workspace_protocol_after(Err(Busy), || {
+                called = true;
+                Ok(())
+            }),
+            Err(Busy)
+        );
+        assert!(!called);
+        assert_eq!(
+            deliver_workspace_protocol_after(Err(DeliveryFailed), || Ok(())),
+            Err(DeliveryFailed)
+        );
+    }
+
     fn overflow_spawn_replay(
         completion: runtime::RuntimeEvent,
     ) -> (
@@ -47770,6 +47923,41 @@ mod tests {
         assert!(source.contains(
             "self.poll_workspace_controller();\n        self.poll_pending_workspace_session_open();"
         ));
+    }
+
+    #[test]
+    fn hidden_window_still_polls_pending_shell_tab_requests() {
+        let source = include_str!("app.rs");
+        let logic = source
+            .split_once(
+                "    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {",
+            )
+            .unwrap()
+            .1
+            .split_once("    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {")
+            .unwrap()
+            .0;
+        assert!(logic.contains("self.poll_pending_shell_tab_requests();"));
+    }
+
+    #[test]
+    fn shell_tab_admission_reveals_original_workspace_after_switch() {
+        let source = include_str!("app.rs");
+        let controller = source
+            .split_once("    fn poll_workspace_controller(&mut self) {")
+            .unwrap()
+            .1
+            .split_once("    fn session_spawn_skips_dotenv_worker(")
+            .unwrap()
+            .0;
+        let shell_tab = controller
+            .split_once("WorkspaceControllerAction::SpawnShellTab {")
+            .unwrap()
+            .1
+            .split_once("WorkspaceControllerAction::ResumeAgent {")
+            .unwrap()
+            .0;
+        assert!(shell_tab.contains("self.reveal_closed_workspace(&workspace_id);"));
     }
 
     #[test]

@@ -672,6 +672,54 @@ fn pane_header_active_boundary(header: egui::Rect, close: egui::Rect) -> f32 {
     (close.right() + 6.0).min(header.right()).max(header.left())
 }
 
+fn pane_header_new_shell_tab_rect(
+    header: egui::Rect,
+    occupied_right: f32,
+    toolbar_left: f32,
+) -> Option<egui::Rect> {
+    let left = occupied_right.max(header.left());
+    let right = toolbar_left.min(header.right());
+    (right - left >= 28.0).then(|| {
+        egui::Rect::from_min_max(
+            egui::pos2(left, header.top()),
+            egui::pos2(right, header.bottom()),
+        )
+    })
+}
+
+fn render_new_shell_tab(
+    ui: &mut egui::Ui,
+    header: egui::Rect,
+    rect: egui::Rect,
+    id: egui::Id,
+    catalog: &i18n::Catalog,
+) -> bool {
+    let response = ui.interact(rect, id, egui::Sense::click());
+    let label = catalog.t("workspace.new_shell", &[]);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label));
+    paint_tab_divider(ui, header, rect.left());
+    if response.hovered() || response.has_focus() {
+        let icon_rect = egui::Rect::from_min_size(rect.min, egui::vec2(28.0, rect.height()));
+        ui.painter()
+            .rect_filled(icon_rect, 1.0, egui::Color32::from_rgb(0x21, 0x24, 0x2c));
+    }
+    ui.painter().text(
+        egui::pos2(rect.left() + 14.0, header.center().y),
+        egui::Align2::CENTER_CENTER,
+        "+",
+        egui::FontId::proportional(19.0),
+        if response.hovered() || response.has_focus() {
+            egui::Color32::from_rgb(0xf2, 0xf2, 0xf2)
+        } else {
+            egui::Color32::from_rgb(0xc8, 0xcc, 0xd2)
+        },
+    );
+    response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(label)
+        .clicked()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct TerminalPaneLayout {
     header: egui::Rect,
@@ -1940,6 +1988,10 @@ pub struct WorkspaceUi {
     /// 설정 창을 Environment 카테고리로 연다.
     open_environment_requested: Option<super::environment::EnvironmentOpenRequest>,
     new_session_requested: bool,
+    /// 탭 뒤 여백에서 즉시 새 셸을 열라는 요청. 툴바의 에이전트 런처 요청과 구분한다.
+    new_shell_tab_requested: bool,
+    new_shell_tab_retry_after: Option<std::time::Instant>,
+    new_shell_tab_delivery: HashSet<(WorkspaceProtocolOperation, u64)>,
     /// pane 우클릭 → 세션 폴더 요청(파일 트리 이동/Finder 열기, 2026-07-18). cwd
     /// 해석(lsof 폴백 포함)과 트리·Finder 라우팅은 App 몫이라 요청만 쌓는다 — E4 ⑥
     /// take_open_environment와 같은 프레임 소비 패턴.
@@ -2888,6 +2940,9 @@ impl WorkspaceUi {
             agent_send_presets: Vec::new(),
             open_environment_requested: None,
             new_session_requested: false,
+            new_shell_tab_requested: false,
+            new_shell_tab_retry_after: None,
+            new_shell_tab_delivery: HashSet::with_capacity(WORKSPACE_PROTOCOL_CAP),
             session_folder_request: None,
             note_append_request: None,
             respawn_archived_request: None,
@@ -3922,6 +3977,11 @@ impl WorkspaceUi {
         let Some(pending) = self.protocol_inflight.remove(&key) else {
             return;
         };
+        if self.new_shell_tab_delivery.remove(&key)
+            && completion.result == Err(WorkspaceProtocolErrorCode::Busy)
+        {
+            self.defer_new_shell_tab_request(std::time::Duration::from_millis(50));
+        }
         if let Some(search) = self.search.as_mut()
             && search.delivery == Some(key)
         {
@@ -6104,6 +6164,24 @@ impl WorkspaceUi {
                 output.aux_tab_intent = Some((placement.kind, intent));
             }
         }
+        let occupied_right = placements.last().map_or_else(
+            || pane_header_active_boundary(header, pseudo_close),
+            |placement| placement.geometry.tab.right() + PANE_AUX_TAB_RIGHT_PAD,
+        );
+        if let Some(rect) =
+            pane_header_new_shell_tab_rect(header, occupied_right, header.right() - 4.0)
+            && render_new_shell_tab(
+                ui,
+                header,
+                rect,
+                ui.id().with("workspace_session_less_new_shell_tab"),
+                catalog,
+            )
+        {
+            self.new_shell_tab_requested = true;
+            output.focus_requested = true;
+            output.aux_tab_intent = None;
+        }
 
         if any_active {
             output.aux_body_rect = Some(body);
@@ -6117,7 +6195,7 @@ impl WorkspaceUi {
             if input_enabled {
                 self.show_new_session_prompt(&mut child, catalog);
             } else {
-                output.focus_requested =
+                output.focus_requested |=
                     self.show_disabled_empty_surface(&mut child).focus_requested;
             }
         }
@@ -6389,6 +6467,24 @@ impl WorkspaceUi {
             ) {
                 output.aux_tab_intent = Some((placement.kind, intent));
             }
+        }
+        let occupied_right = placements.last().map_or_else(
+            || pane_header_active_boundary(header, close),
+            |placement| placement.geometry.tab.right() + PANE_AUX_TAB_RIGHT_PAD,
+        );
+        if let Some(rect) =
+            pane_header_new_shell_tab_rect(header, occupied_right, buttons.toolbar_left)
+            && render_new_shell_tab(
+                ui,
+                header,
+                rect,
+                egui::Id::new(("terminal_new_shell_tab", &pane.id)),
+                catalog,
+            )
+        {
+            self.new_shell_tab_requested = true;
+            output.aux_tab_intent = None;
+            output.focus_requested = true;
         }
         output
     }
@@ -8242,6 +8338,36 @@ impl WorkspaceUi {
         std::mem::take(&mut self.new_session_requested)
     }
 
+    pub fn take_new_shell_tab_requested(&mut self) -> bool {
+        if self
+            .new_shell_tab_retry_after
+            .is_some_and(|after| std::time::Instant::now() < after)
+        {
+            return false;
+        }
+        self.new_shell_tab_retry_after = None;
+        std::mem::take(&mut self.new_shell_tab_requested)
+    }
+
+    pub fn has_new_shell_tab_request(&self) -> bool {
+        self.new_shell_tab_requested
+    }
+
+    pub fn retry_new_shell_tab_request(&mut self) {
+        self.new_shell_tab_requested = true;
+    }
+
+    pub fn defer_new_shell_tab_request(&mut self, delay: std::time::Duration) {
+        self.new_shell_tab_requested = true;
+        self.new_shell_tab_retry_after = std::time::Instant::now().checked_add(delay);
+    }
+
+    pub fn cancel_new_shell_tab_requests(&mut self) {
+        self.new_shell_tab_requested = false;
+        self.new_shell_tab_retry_after = None;
+        self.new_shell_tab_delivery.clear();
+    }
+
     /// pane 우클릭의 세션 폴더 요청(트리 이동/Finder)을 소비한다 — App이 프레임마다
     /// 확인해 cwd 해석 후 라우팅한다(2026-07-18).
     pub fn take_session_folder_request(&mut self) -> Option<SessionFolderRequest> {
@@ -8423,12 +8549,56 @@ impl WorkspaceUi {
             .count() as u32
     }
 
+    pub fn queued_spawns(&self) -> u32 {
+        self.protocol_intents
+            .iter()
+            .filter(|intent| {
+                matches!(
+                    intent.command,
+                    RuntimeCommand::SpawnShell { .. } | RuntimeCommand::SplitPane { .. }
+                )
+            })
+            .count() as u32
+    }
+
+    pub fn inflight_spawns(&self) -> u32 {
+        self.protocol_inflight
+            .values()
+            .filter(|pending| pending.spawn)
+            .count() as u32
+    }
+
     pub fn spawn_shell(&mut self, scrollback_lines: usize) {
         self.send(RuntimeCommand::SpawnShell {
             cols: 80,
             rows: 24,
             scrollback_lines,
         });
+    }
+
+    /// 탭 여백 클릭은 큐가 바쁠 때 같은 요청을 재시도해야 하므로 입장 결과를 돌려준다.
+    pub fn try_spawn_shell_tab(
+        &mut self,
+        scrollback_lines: usize,
+    ) -> Result<(), WorkspaceProtocolErrorCode> {
+        let result = self.queue_protocol_intent_tracked_with_spawn_cwd(
+            RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines,
+            },
+            None,
+        );
+        match result {
+            Ok(key) => {
+                self.new_shell_tab_delivery.insert(key);
+                Ok(())
+            }
+            Err(code) => {
+                self.report_protocol_queue_rejection(code, "spawn_admission");
+                Err(code)
+            }
+        }
     }
 
     /// 새 셸 + 스폰 완료 시 해당 폴더로 cd 1회 주입 — 사이드바 '같은 폴더에서 새 셀'.
@@ -13402,6 +13572,278 @@ mod tests {
             ))),
             "세션 탭 클릭은 ShowSession 의도를 올려야 한다"
         );
+    }
+
+    #[test]
+    fn kittest_세션탭_뒤_여백을_누르면_새_셸을_요청한다() {
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let config = TerminalConfig::default();
+        let mut ws = WorkspaceUi::new();
+        ws.mux = Some(split_mux_snapshot(0.5));
+        let header = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(520.0, TERMINAL_PANE_HEADER_HEIGHT),
+        );
+        let snapshot = pane("right", SessionId(42));
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, state: &mut (WorkspaceUi, bool)| {
+                let output = state
+                    .0
+                    .render_pane_header(ui, header, &snapshot, false, &config, &catalog, true);
+                state.1 |= output.focus_requested;
+            },
+            (ws, false),
+        );
+        harness.run();
+        let blank = egui::pos2(header.center().x, header.center().y);
+        harness.hover_at(blank);
+        harness.run();
+        harness.drag_at(blank);
+        harness.run();
+        harness.drop_at(blank);
+        harness.run();
+
+        assert!(harness.state_mut().0.take_new_shell_tab_requested());
+        assert!(!harness.state_mut().0.take_new_session_requested());
+        assert!(harness.state().0.pending_focus.is_none());
+        assert!(!harness.state_mut().0.take_terminal_focus_claimed());
+        assert!(
+            harness.state().1,
+            "새 셸은 primary 입력 소유권을 가져야 한다"
+        );
+        assert!(
+            drain_protocol(&mut harness.state_mut().0).is_empty(),
+            "새 셸 탭 클릭은 기존 pane의 FocusPane 명령을 보내면 안 된다"
+        );
+
+        let title = egui::pos2(14.0, header.center().y);
+        harness.hover_at(title);
+        harness.run();
+        harness.drag_at(title);
+        harness.run();
+        harness.drop_at(title);
+        harness.run();
+        assert!(!harness.state_mut().0.take_new_shell_tab_requested());
+    }
+
+    #[test]
+    fn kittest_세션이_없고_이력이_열려도_탭_여백에서_새_셸을_요청한다() {
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let config = TerminalConfig::default();
+        let mut ws = WorkspaceUi::new();
+        ws.set_aux_tabs(vec![PaneAuxTab {
+            kind: PaneAuxTabKind::History,
+            label: "History".to_owned(),
+            active: true,
+        }]);
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, state: &mut (WorkspaceUi, Option<egui::Pos2>, bool)| {
+                let rect = ui.available_rect_before_wrap();
+                assert!(rect.width() > 360.0);
+                state.1 = Some(egui::pos2(rect.center().x, rect.top() + 12.0));
+                let output = state.0.show_with_input(ui, &config, &[], &catalog, false);
+                state.2 |= output.aux_tab_intent.is_some();
+            },
+            (ws, None, false),
+        );
+        harness.run();
+        let blank = harness.state().1.unwrap();
+        harness.hover_at(blank);
+        harness.run();
+        harness.drag_at(blank);
+        harness.run();
+        harness.drop_at(blank);
+        harness.run();
+
+        assert!(harness.state_mut().0.take_new_shell_tab_requested());
+        assert!(!harness.state_mut().0.take_new_session_requested());
+        assert!(
+            !harness.state().2,
+            "셸 생성이 수락되기 전에는 이력 탭을 숨기면 안 된다"
+        );
+    }
+
+    #[test]
+    fn kittest_세션없는_비활성_보조탭_뒤_새_셸이_primary_입력을_요청한다() {
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let config = TerminalConfig::default();
+        let mut ws = WorkspaceUi::new();
+        ws.set_aux_tabs(vec![PaneAuxTab {
+            kind: PaneAuxTabKind::History,
+            label: "History".to_owned(),
+            active: false,
+        }]);
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, state: &mut (WorkspaceUi, Option<egui::Pos2>, bool)| {
+                let rect = ui.available_rect_before_wrap();
+                state.1 = Some(egui::pos2(rect.center().x, rect.top() + 12.0));
+                let output = state.0.show_with_input(ui, &config, &[], &catalog, false);
+                state.2 |= output.focus_requested;
+            },
+            (ws, None, false),
+        );
+        harness.run();
+        let blank = harness.state().1.unwrap();
+        harness.hover_at(blank);
+        harness.run();
+        harness.drag_at(blank);
+        harness.run();
+        harness.drop_at(blank);
+        harness.run();
+
+        assert!(harness.state_mut().0.take_new_shell_tab_requested());
+        assert!(harness.state().2);
+    }
+
+    #[test]
+    fn kittest_이력_탭_옆_여백은_셸_생성_전_탭을_숨기지_않는다() {
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let config = TerminalConfig::default();
+        let mut ws = WorkspaceUi::new();
+        ws.mux = Some(mux(
+            "t",
+            vec![tab(
+                "t",
+                vec![pane("p", SessionId(7))],
+                LayoutNode::Pane(pane_id("p")),
+            )],
+            "p",
+        ));
+        ws.set_aux_tabs(vec![PaneAuxTab {
+            kind: PaneAuxTabKind::History,
+            label: "History".to_owned(),
+            active: true,
+        }]);
+        ws.aux_tab_pane = Some(pane_id("p"));
+        let header = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(520.0, TERMINAL_PANE_HEADER_HEIGHT),
+        );
+        let snapshot = pane("p", SessionId(7));
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, state: &mut (WorkspaceUi, bool)| {
+                let output = state
+                    .0
+                    .render_pane_header(ui, header, &snapshot, true, &config, &catalog, false);
+                state.1 |= output.aux_tab_intent.is_some();
+            },
+            (ws, false),
+        );
+        harness.run();
+        let blank = header.center();
+        harness.hover_at(blank);
+        harness.run();
+        harness.drag_at(blank);
+        harness.run();
+        harness.drop_at(blank);
+        harness.run();
+
+        assert!(harness.state_mut().0.take_new_shell_tab_requested());
+        assert!(
+            !harness.state().1,
+            "예약 전에는 활성 이력 탭을 유지해야 한다"
+        );
+    }
+
+    #[test]
+    fn 새_셸_예약이_막히면_클릭_요청을_다음_프레임에_재시도한다() {
+        let mut workspace = WorkspaceUi::new();
+        workspace.new_shell_tab_requested = true;
+
+        assert!(workspace.take_new_shell_tab_requested());
+        workspace.retry_new_shell_tab_request();
+        assert!(workspace.take_new_shell_tab_requested());
+        assert!(!workspace.take_new_shell_tab_requested());
+    }
+
+    #[test]
+    fn 프로토콜_busy_재시도는_대기중_컨트롤러_슬롯을_점유하지_않는다() {
+        let mut workspace = WorkspaceUi::new();
+        workspace.defer_new_shell_tab_request(std::time::Duration::from_millis(50));
+
+        assert!(workspace.has_new_shell_tab_request());
+        assert!(!workspace.take_new_shell_tab_requested());
+        workspace.new_shell_tab_retry_after = Some(std::time::Instant::now());
+        assert!(workspace.take_new_shell_tab_requested());
+        assert!(!workspace.has_new_shell_tab_request());
+    }
+
+    #[test]
+    fn 새_셸_탭은_프로토콜_큐가_비면_같은_요청을_수락한다() {
+        let mut workspace = WorkspaceUi::new();
+        for index in 0..WORKSPACE_PROTOCOL_CAP {
+            workspace
+                .queue_protocol_intent(RuntimeCommand::Scroll {
+                    session: SessionId(index as u64 + 1),
+                    delta: 1,
+                })
+                .unwrap();
+        }
+
+        assert_eq!(
+            workspace.try_spawn_shell_tab(1_000),
+            Err(WorkspaceProtocolErrorCode::Busy)
+        );
+        while let Some(intent) = workspace.take_protocol_intent() {
+            workspace.complete_protocol(WorkspaceProtocolCompletion {
+                operation: intent.operation(),
+                generation: intent.generation(),
+                result: Ok(()),
+            });
+        }
+
+        assert_eq!(workspace.try_spawn_shell_tab(1_000), Ok(()));
+        assert_eq!(workspace.queued_spawns(), 1);
+        assert!(
+            workspace
+                .protocol_intents
+                .iter()
+                .any(|intent| matches!(intent.command, RuntimeCommand::SpawnShell { .. }))
+        );
+        let intent = workspace.take_protocol_intent().unwrap();
+        assert_eq!(workspace.queued_spawns(), 0);
+        assert_eq!(workspace.inflight_spawns(), 1);
+        workspace.complete_protocol(WorkspaceProtocolCompletion {
+            operation: intent.operation(),
+            generation: intent.generation(),
+            result: Ok(()),
+        });
+        assert_eq!(workspace.inflight_spawns(), 0);
+        assert_eq!(workspace.pending_spawns(), 1);
+    }
+
+    #[test]
+    fn 새_셸_탭_전달이_busy면_원래_클릭을_재시도한다() {
+        let mut workspace = WorkspaceUi::new();
+        assert_eq!(workspace.try_spawn_shell_tab(1_000), Ok(()));
+        let intent = workspace.take_protocol_intent().unwrap();
+
+        workspace.complete_protocol(WorkspaceProtocolCompletion {
+            operation: intent.operation(),
+            generation: intent.generation(),
+            result: Err(WorkspaceProtocolErrorCode::Busy),
+        });
+
+        assert!(workspace.has_new_shell_tab_request());
+        assert_eq!(workspace.pending_spawns(), 0);
+    }
+
+    #[test]
+    fn 워크스페이스_종료는_지연된_새_셸_탭과_전달_재시도를_취소한다() {
+        let mut workspace = WorkspaceUi::new();
+        workspace.defer_new_shell_tab_request(std::time::Duration::from_millis(50));
+        workspace.cancel_new_shell_tab_requests();
+        assert!(!workspace.has_new_shell_tab_request());
+
+        assert_eq!(workspace.try_spawn_shell_tab(1_000), Ok(()));
+        let intent = workspace.take_protocol_intent().unwrap();
+        workspace.cancel_new_shell_tab_requests();
+        workspace.complete_protocol(WorkspaceProtocolCompletion {
+            operation: intent.operation(),
+            generation: intent.generation(),
+            result: Err(WorkspaceProtocolErrorCode::Busy),
+        });
+        assert!(!workspace.has_new_shell_tab_request());
     }
 
     /// 이력 탭이 비활성일 때 라벨을 누르면 활성화 의도가 올라간다.

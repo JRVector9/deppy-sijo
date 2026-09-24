@@ -4597,3 +4597,14 @@
 - Failed approaches: 병렬 전체 runtime 실행은 자원 경합으로 3건 실패했다. 단일 스레드 재실행에서 모두 통과했다.
 - Remaining work: PR1 diff/format 확인·commit/push, PR2·PR3·PR4 rebase, 최종 통합 검증·코드 리뷰·release 재빌드. 앱 재실행 금지.
 - Exact next commands: `cd /private/tmp/deppy-ssh-screen-visible-20260924`; `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo fmt --all -- --check`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git add crates/session/src/session.rs crates/runtime/src/in_process.rs docs/CODEX_HANDOFF.md`.
+
+## 2026-09-24 PR3 누적 리뷰 후 심볼릭 링크 이름 검색
+
+- Current objective: 파일 트리 검색에서 심볼릭 링크의 이름도 찾되 대상 폴더는 탐색하지 않는다. 사용자 허락 없이 앱 재실행 금지.
+- Completed work: `fstatat(AT_SYMLINK_NOFOLLOW)`로 식별한 심볼릭 링크를 이름 일치 결과에 포함하고, 디렉터리 탐색 스택에는 넣지 않는다.
+- Modified files: `crates/app/src/app.rs`, `docs/CODEX_HANDOFF.md`.
+- Key design decisions: 링크 자체의 경로를 결과로 반환한다. 파일/폴더와 같은 숨김 필터 및 항목/결과 상한을 적용한다.
+- Tests actually run: 새 링크 이름/대상 미탐색 회귀는 수정 전 RED, 수정 후 GREEN. `cargo test -p deppy-sijo --bin deppy-sijo --locked file_tree_search` 9 passed. `cargo clippy -p deppy-sijo --all-targets --locked -- -D warnings`, `cargo fmt --all -- --check`, `git diff --check` exit 0.
+- Failed approaches: 이전 구현은 regular file과 directory만 결과에 포함해 트리에 보이는 링크를 찾지 못했다.
+- Remaining work: PR3 Clippy/diff/format 확인·commit/push, PR4 rebase, 최종 통합 검증·코드 리뷰·release 재빌드. 앱 재실행 금지.
+- Exact next commands: `cd /private/tmp/deppy-file-tree-search-20260924`; `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo clippy -p deppy-sijo --all-targets --locked -- -D warnings`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git add crates/app/src/app.rs docs/CODEX_HANDOFF.md`.

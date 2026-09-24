@@ -13630,6 +13630,7 @@ struct FileTreeSearchDirEntry {
     name: std::ffi::OsString,
     is_dir: bool,
     is_file: bool,
+    is_symlink: bool,
 }
 
 #[cfg(unix)]
@@ -13696,6 +13697,7 @@ impl Iterator for FileTreeSearchDirEntries {
                 name: std::ffi::OsString::from_vec(raw_name.to_bytes().to_vec()),
                 is_dir: mode == libc::S_IFDIR,
                 is_file: mode == libc::S_IFREG,
+                is_symlink: mode == libc::S_IFLNK,
             }));
         }
     }
@@ -13812,7 +13814,8 @@ fn run_file_tree_search(
                     continue;
                 }
             };
-            let (name, is_dir, is_file) = (entry.name, entry.is_dir, entry.is_file);
+            let (name, is_dir, is_file, is_symlink) =
+                (entry.name, entry.is_dir, entry.is_file, entry.is_symlink);
             visited += 1;
             if visited > max_entries {
                 traversal_incomplete = true;
@@ -13825,7 +13828,9 @@ fn run_file_tree_search(
             if is_dir {
                 stack.push(relative.clone());
             }
-            if (is_dir || is_file) && name.to_string_lossy().to_lowercase().contains(&needle) {
+            if (is_dir || is_file || is_symlink)
+                && name.to_string_lossy().to_lowercase().contains(&needle)
+            {
                 paths.push(root.join(relative));
                 if paths.len() > max_results {
                     paths.pop();
@@ -39643,6 +39648,28 @@ mod tests {
         )
         .unwrap();
         assert!(snapshot.paths().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_tree_search는_심볼릭링크_이름을_찾되_대상은_탐색하지_않는다() {
+        let root = unique_temp_dir("file-tree-search-link-name")
+            .canonicalize()
+            .unwrap();
+        let outside = unique_temp_dir("file-tree-search-link-target")
+            .canonicalize()
+            .unwrap();
+        std::fs::write(outside.join("private-match.txt"), b"x").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("linked-match")).unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let by_name =
+            run_file_tree_search(&root, "linked-match", true, 100, 20, &cancel, &cancel).unwrap();
+        assert_eq!(by_name.paths(), &[root.join("linked-match")]);
+        let inside_target =
+            run_file_tree_search(&root, "private-match", true, 100, 20, &cancel, &cancel).unwrap();
+        assert!(inside_target.paths().is_empty());
         std::fs::remove_dir_all(root).unwrap();
         std::fs::remove_dir_all(outside).unwrap();
     }

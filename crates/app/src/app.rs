@@ -13558,6 +13558,112 @@ fn run_file_tree_listing(
     ui::file_tree::FileTreeListingSnapshot::try_new(items)
 }
 
+fn run_file_tree_search(
+    root: &Path,
+    query: &str,
+    show_hidden: bool,
+    max_entries: usize,
+    max_results: usize,
+    search_cancel: &std::sync::atomic::AtomicBool,
+    shutdown_cancel: &std::sync::atomic::AtomicBool,
+) -> Result<ui::file_tree::FileTreeSearchSnapshot, ui::file_tree::FileTreeMaintenanceErrorCode> {
+    use ui::file_tree::FileTreeMaintenanceErrorCode as Error;
+
+    if query.is_empty()
+        || query.len() > 256
+        || max_entries == 0
+        || max_entries > ui::file_tree::FILE_TREE_SEARCH_MAX_ENTRIES
+        || max_results == 0
+        || max_results > ui::file_tree::FILE_TREE_SEARCH_MAX_RESULTS
+    {
+        return Err(Error::InvalidSnapshot);
+    }
+    if search_cancel.load(std::sync::atomic::Ordering::Relaxed)
+        || shutdown_cancel.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err(Error::NativeFailure);
+    }
+    let canonical_root = std::fs::canonicalize(root).map_err(|_| Error::NativeFailure)?;
+    if !canonical_root.is_dir() {
+        return Err(Error::InvalidSnapshot);
+    }
+    let needle = query.to_lowercase();
+    let mut stack = vec![canonical_root.clone()];
+    let mut paths = Vec::new();
+    let mut visited = 0usize;
+    let mut result_limit_reached = false;
+    let mut traversal_incomplete = false;
+    'walk: while let Some(directory) = stack.pop() {
+        if search_cancel.load(std::sync::atomic::Ordering::Relaxed)
+            || shutdown_cancel.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(Error::NativeFailure);
+        }
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(_) if directory != canonical_root => {
+                traversal_incomplete = true;
+                continue;
+            }
+            Err(_) => return Err(Error::NativeFailure),
+        };
+        for entry in entries {
+            if search_cancel.load(std::sync::atomic::Ordering::Relaxed)
+                || shutdown_cancel.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(Error::NativeFailure);
+            }
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    traversal_incomplete = true;
+                    continue;
+                }
+            };
+            let name = entry.file_name();
+            if !show_hidden && name.as_encoded_bytes().first() == Some(&b'.') {
+                continue;
+            }
+            visited += 1;
+            if visited > max_entries {
+                traversal_incomplete = true;
+                break 'walk;
+            }
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(_) => {
+                    traversal_incomplete = true;
+                    continue;
+                }
+            };
+            if file_type.is_dir() {
+                stack.push(entry.path());
+            } else if file_type.is_file() && name.to_string_lossy().to_lowercase().contains(&needle)
+            {
+                let Ok(relative) = entry
+                    .path()
+                    .strip_prefix(&canonical_root)
+                    .map(Path::to_path_buf)
+                else {
+                    return Err(Error::InvalidSnapshot);
+                };
+                paths.push(root.join(relative));
+                if paths.len() > max_results {
+                    paths.pop();
+                    result_limit_reached = true;
+                    break 'walk;
+                }
+            }
+        }
+    }
+    paths.sort();
+    ui::file_tree::FileTreeSearchSnapshot::try_new(
+        paths,
+        result_limit_reached,
+        traversal_incomplete,
+    )
+}
+
 fn run_app_host_io(
     action: AppHostIoAction,
     cancel: &std::sync::atomic::AtomicBool,
@@ -13668,6 +13774,23 @@ fn run_app_host_io(
                     run_file_tree_listing(root.as_path(), directory.as_path(), max_items, max_bytes)
                         .map(ui::file_tree::FileTreeMaintenanceResult::Listing)
                 }
+                ui::file_tree::FileTreeMaintenanceRequest::SearchFiles {
+                    root,
+                    query,
+                    show_hidden,
+                    max_entries,
+                    max_results,
+                    cancel: search_cancel,
+                } => run_file_tree_search(
+                    root.as_path(),
+                    &query,
+                    show_hidden,
+                    max_entries,
+                    max_results,
+                    &search_cancel,
+                    cancel,
+                )
+                .map(ui::file_tree::FileTreeMaintenanceResult::Search),
                 ui::file_tree::FileTreeMaintenanceRequest::ReplaceWatchSet(_) => {
                     Err(ui::file_tree::FileTreeMaintenanceErrorCode::NativeFailure)
                 }
@@ -39178,6 +39301,87 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn file_tree_search는_접힌_하위폴더_파일을_찾고_숨김을_건너뛴다() {
+        let root = unique_temp_dir("file-tree-search").canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("nested/deeper")).unwrap();
+        std::fs::create_dir_all(root.join(".hidden")).unwrap();
+        std::fs::write(root.join("nested/deeper/Fold-note.md"), b"x").unwrap();
+        std::fs::write(root.join(".hidden/Fold-secret.md"), b"x").unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let visible =
+            run_file_tree_search(&root, "fold", false, 100, 20, &cancel, &cancel).unwrap();
+        assert_eq!(visible.paths(), &[root.join("nested/deeper/Fold-note.md")]);
+        let all = run_file_tree_search(&root, "fold", true, 100, 20, &cancel, &cancel).unwrap();
+        assert_eq!(all.paths().len(), 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_tree_search는_결과_상한을_알린다() {
+        let root = unique_temp_dir("file-tree-search-cap")
+            .canonicalize()
+            .unwrap();
+        std::fs::write(root.join("match-a.txt"), b"a").unwrap();
+        std::fs::write(root.join("match-b.txt"), b"b").unwrap();
+        let snapshot = run_file_tree_search(
+            &root,
+            "match",
+            false,
+            100,
+            1,
+            &std::sync::atomic::AtomicBool::new(false),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(snapshot.paths().len(), 1);
+        assert!(snapshot.result_limit_reached());
+        assert!(!snapshot.traversal_incomplete());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_tree_search는_탐색_상한을_결과_상한과_구분한다() {
+        let root = unique_temp_dir("file-tree-search-scan-cap")
+            .canonicalize()
+            .unwrap();
+        std::fs::write(root.join("first.txt"), b"a").unwrap();
+        std::fs::write(root.join("second.txt"), b"b").unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let snapshot =
+            run_file_tree_search(&root, "absent", false, 1, 20, &cancel, &cancel).unwrap();
+        assert!(snapshot.paths().is_empty());
+        assert!(snapshot.traversal_incomplete());
+        assert!(!snapshot.result_limit_reached());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_tree_search는_루트밖_심볼릭링크를_따라가지_않는다() {
+        let root = unique_temp_dir("file-tree-search-link")
+            .canonicalize()
+            .unwrap();
+        let outside = unique_temp_dir("file-tree-search-outside")
+            .canonicalize()
+            .unwrap();
+        std::fs::write(outside.join("private-match.txt"), b"x").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("linked")).unwrap();
+        let snapshot = run_file_tree_search(
+            &root,
+            "match",
+            true,
+            100,
+            20,
+            &std::sync::atomic::AtomicBool::new(false),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(snapshot.paths().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
     }
 
     // macOS/APFS rejects invalid UTF-8 path components with EILSEQ before `read_dir`; keep the

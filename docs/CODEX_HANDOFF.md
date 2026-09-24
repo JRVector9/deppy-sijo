@@ -42,6 +42,18 @@
 - Remaining work: session 전체 테스트와 format/diff 검사 후 PR1 commit/push; PR2·PR3·PR4 rebase, 최종 검증·빌드·리뷰.
 - Exact next commands: `cd /private/tmp/deppy-ssh-screen-visible-20260924`; `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo test -p session --locked`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`.
 
+## 2026-09-24 파일 검색 PR3 진행
+
+- Current objective: 파일 트리 더보기의 파일 검색을 별도 PR로 구현한다. 접힌 폴더도 프로젝트 루트 전체에서 검색하고 결과를 트리에 표시한다. 앱 재실행 금지.
+- PR3 review follow-up: `codex review --uncommitted`가 superseded scan의 공유 I/O 점유, 검색 모드에서 상위 탐색/생성 버튼 무반응, 새로고침 결과 stale, 탐색 상한을 "Too many matches"로 오표시하는 네 문제를 지적했다. 요청별 `Arc<AtomicBool>` 취소 토큰을 host traversal에 전달해 쿼리 변경·닫기·루트 변경 시 중단하고, 취소된 동일 쿼리 결과도 적용하지 않는다. 검색 모드 상위 탐색/생성/새로고침을 연결했다. 결과 수 상한과 탐색 미완료를 별도 상태/번역으로 표시한다. 수정 후 host 검색 4건, 검색 상태 2건, 결과→트리 egui 1건 passed; 최신 Clippy, format, diff check, i18n-check exit 0.
+- Completed work: PR2 `feat/file-tree-typeahead` 커밋 `9757c7e6`, draft PR #192 생성. 그 위 worktree `/private/tmp/deppy-file-tree-search-20260924`, branch `feat/file-tree-search` 생성. 더보기 메뉴 검색, 별도 검색 UI, 백그라운드 Maintenance SearchFiles, 검색 결과의 `Show in tree` 경로를 구현했다. hidden 설정 적용, 파일 이름 부분 문자열 검색, symlink 미탐색, 50,000 엔트리/100 결과 상한을 둔다.
+- Modified files: `crates/app/src/app.rs`, `crates/app/src/ui/file_tree.rs`, 5개 locale `messages.txt`, `docs/CODEX_HANDOFF.md`.
+- Key design decisions: render leaf는 filesystem을 읽지 않고 기존 App host maintenance worker에 검색 intent를 보낸다. 쿼리가 바뀐 뒤 늦게 온 이전 결과는 적용하지 않는다. 결과 선택 후 트리에서 보기 버튼을 누르면 파일의 부모를 루트로 열고, listing 뒤 해당 파일 행을 선택/스크롤한다.
+- Tests actually run: 새 host 검색 테스트는 함수 부재로 컴파일 RED, 구현 후 하위 폴더·숨김 테스트 1 passed. 상한·루트 밖 symlink 추가 테스트 포함 `cargo test -p deppy-sijo --bin deppy-sijo file_tree_search --locked` 3 passed. 검색 쿼리 세대 테스트 1 passed, 결과→트리 egui kittest 1 passed. `cargo clippy -p deppy-sijo --all-targets --locked -- -D warnings` passed (그 뒤에 소규모 accessor/테스트 변경이 있어 최신 revision 재검사 필요). `cargo run --locked -p xtask -- i18n-check` passed, literal key 1231건/5 locales.
+- Failed approaches: 검색 결과 선택 직후 같은 테스트 프레임에서는 다음 프레임에 표시되는 `Show in tree` 버튼이 아직 없었다. kittest에 한 프레임을 더 진행시켜 실제 UI 상태 전이를 검증했다. 초기 `cargo fmt --all -- --check`는 새 코드 포맷 차이로 실패했고 `cargo fmt --all`을 실행했다. 앱 전체 파일 트리의 기존 4개 실패는 PR2에서 부모 브랜치에서도 재현됨을 기록했다.
+- Remaining work: 검색 PR3 최신 포맷/Clippy/관련 테스트 및 코드 리뷰, 커밋·push·PR 생성. 그 다음 새 파일/폴더 모달 PR4, 최종 빌드·리뷰. 앱 재실행 금지.
+- Exact next commands: `cd /private/tmp/deppy-file-tree-search-20260924`; `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo fmt --all -- --check`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git status --short`.
+
 ## 2026-09-24 파일 트리 폴더 접두어 탐색 PR2 진행
 
 - Current objective: 사용자가 파일 트리에 포커스를 두고 `F`를 누르면 보이는 `Fold` 폴더 행을 선택하고 화면에 스크롤한다. 폴더는 열지 않는다. 파일 검색과 생성 모달은 뒤의 별도 PR이다.

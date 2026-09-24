@@ -2151,12 +2151,9 @@ impl FileTreeUi {
         sidebar: &SidebarSnapshot<'_>,
         catalog: &i18n::Catalog,
     ) -> Option<SidebarAction> {
+        mark_file_tree_search_keyboard_active(ui.ctx(), false);
         let navigation_action = self.navigation_rail_panel(ui, sidebar, catalog);
         let project_action = self.project_file_panel(ui, sessions_by_workspace, sidebar, catalog);
-        mark_file_tree_search_keyboard_active(
-            ui.ctx(),
-            !self.collapsed && self.selected_tool == SidebarTool::Files && self.search.is_some(),
-        );
         let action = project_action.or(navigation_action);
         if action.is_some() {
             // 다른 세션/워크스페이스/도구로 이동한 뒤 숨은 초안을 확정하지 않는다.
@@ -3322,9 +3319,12 @@ impl FileTreeUi {
         }
 
         if self.search.is_some() {
-            self.render_file_search(ui, catalog);
+            self.permanent_delete_confirm(ui, catalog);
+            let search_keyboard_focused = self.render_file_search(ui, catalog);
+            mark_file_tree_search_keyboard_active(ui.ctx(), search_keyboard_focused);
             if let Some(parent) = parent_navigation {
                 self.set_root(Some(parent));
+                mark_file_tree_search_keyboard_active(ui.ctx(), false);
                 ui.ctx().request_repaint();
             }
             return action;
@@ -4601,9 +4601,9 @@ impl FileTreeUi {
         Some(index)
     }
 
-    fn render_file_search(&mut self, ui: &mut egui::Ui, catalog: &i18n::Catalog) {
+    fn render_file_search(&mut self, ui: &mut egui::Ui, catalog: &i18n::Catalog) -> bool {
         let Some(root) = self.root.as_ref() else {
-            return;
+            return false;
         };
         if let Some(error) = self.error.clone() {
             ui.horizontal(|ui| {
@@ -4616,6 +4616,7 @@ impl FileTreeUi {
         let mut changed_query = None;
         let mut close = false;
         let mut reveal = None;
+        let mut keyboard_focused = false;
         if let Some(search) = self.search.as_mut() {
             ui.horizontal(|ui| {
                 let response = ui.add(
@@ -4627,18 +4628,19 @@ impl FileTreeUi {
                     response.request_focus();
                     search.focus = false;
                 }
+                keyboard_focused |= response.has_focus();
                 if response.changed() {
                     while search.query.len() > 256 {
                         search.query.pop();
                     }
                     changed_query = Some(search.query.clone());
                 }
-                close = ui
+                let close_button = ui
                     .small_button("×")
-                    .on_hover_text(catalog.t("search.close", &[]))
-                    .clicked();
+                    .on_hover_text(catalog.t("search.close", &[]));
+                keyboard_focused |= close_button.has_focus();
+                close = close_button.clicked();
             });
-            close |= ui.input(|input| input.key_pressed(egui::Key::Escape));
             if search.busy {
                 ui.horizontal(|ui| {
                     ui.add(egui::Spinner::new().size(12.0));
@@ -4656,12 +4658,12 @@ impl FileTreeUi {
             if search.traversal_incomplete {
                 ui.weak(catalog.t("file_tree.search_incomplete", &[]));
             }
-            if let Some(path) = search.selected.as_ref()
-                && ui
-                    .button(catalog.t("file_tree.show_in_tree", &[]))
-                    .clicked()
-            {
-                reveal = Some(path.clone());
+            if let Some(path) = search.selected.as_ref() {
+                let show_in_tree = ui.button(catalog.t("file_tree.show_in_tree", &[]));
+                keyboard_focused |= show_in_tree.has_focus();
+                if show_in_tree.clicked() {
+                    reveal = Some(path.clone());
+                }
             }
             egui::ScrollArea::vertical()
                 .id_salt("file_tree_search_results")
@@ -4669,22 +4671,23 @@ impl FileTreeUi {
                 .show(ui, |ui| {
                     for path in &search.results {
                         let label = path.strip_prefix(root).unwrap_or(path);
-                        if ui
+                        let result = ui
                             .selectable_label(
                                 search.selected.as_ref() == Some(path),
                                 super::path_display(label),
                             )
-                            .on_hover_text(super::path_display(path))
-                            .clicked()
-                        {
+                            .on_hover_text(super::path_display(path));
+                        keyboard_focused |= result.has_focus();
+                        if result.clicked() {
                             search.selected = Some(path.clone());
                         }
                     }
                 });
         }
+        close |= keyboard_focused && ui.input(|input| input.key_pressed(egui::Key::Escape));
         if close {
             self.close_file_search();
-            return;
+            return false;
         }
         if let Some(query) = changed_query {
             self.request_file_search(query);
@@ -4695,7 +4698,9 @@ impl FileTreeUi {
             self.set_root(Some(parent.to_path_buf()));
             self.reveal_path = Some(path);
             ui.ctx().request_repaint();
+            return false;
         }
+        keyboard_focused
     }
 
     fn request_file_search(&mut self, query: String) {
@@ -13368,6 +13373,49 @@ mod tests {
         std::fs::remove_dir_all(&base).unwrap();
     }
 
+    #[test]
+    fn kittest_검색중_휴지통_실패의_영구삭제_확인을_보인다() {
+        use egui_kittest::kittest::Queryable as _;
+
+        let base = temp_root("search-trash-confirm");
+        std::fs::write(base.join("target.txt"), b"x").unwrap();
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.set_root(Some(base.clone()));
+        drain_listings(&mut tree);
+        let mut harness = delete_confirm_harness(tree, &catalog);
+        let target = DeleteTarget {
+            path: base.join("target.txt"),
+            label: "target.txt".to_owned(),
+            is_dir: false,
+        };
+        harness.state_mut().0.spawn_trash(target.clone());
+        let intent = harness.state_mut().0.take_io_intent().unwrap();
+        harness.state_mut().0.search = Some(FileTreeSearch {
+            query: String::new(),
+            results: Vec::new(),
+            selected: None,
+            busy: false,
+            result_limit_reached: false,
+            traversal_incomplete: false,
+            focus: false,
+        });
+        harness.state_mut().0.complete_io(FileTreeIoCompletion {
+            operation: intent.operation,
+            generation: intent.generation,
+            result: Err(FileTreeIoErrorCode::TrashUnavailable),
+        });
+        harness.step();
+        assert_eq!(harness.state().0.confirm_delete, Some(target));
+        assert!(
+            harness
+                .query_by_label(&catalog.t("file_tree.permanent_delete", &[]))
+                .is_some(),
+            "검색 중에도 삭제 확인 버튼이 보여야 한다"
+        );
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
     /// 회귀: 영구삭제 확인이 트리 갱신으로는 **한 번도** 무효화되지 않던 것(경로 TOCTOU).
     ///
     /// 확인은 사용자가 누를 때까지 남는다. 그 사이 브랜치 전환·빌드·외부 편집이 그
@@ -13734,7 +13782,7 @@ mod tests {
             busy: false,
             result_limit_reached: false,
             traversal_incomplete: false,
-            focus: false,
+            focus: true,
         });
         harness.step();
         // kittest의 step은 프레임을 완료한 뒤 반환하므로, 바로 이전 프레임 번호가
@@ -13744,6 +13792,18 @@ mod tests {
                 .ctx
                 .data(|data| { data.get_temp::<u64>(file_tree_search_keyboard_owner_id()) }),
             Some(harness.ctx.cumulative_frame_nr() - 1)
+        );
+        harness
+            .ctx
+            .memory_mut(|memory| memory.request_focus(egui::Id::new("terminal_focus")));
+        harness.step();
+        assert!(harness.state().0.search.is_some());
+        assert_eq!(
+            harness
+                .ctx
+                .data(|data| data.get_temp::<u64>(file_tree_search_keyboard_owner_id())),
+            None,
+            "검색 창이 열려 있어도 다른 곳에 포커스하면 터미널 입력을 막지 않는다"
         );
         harness.get_by_label("nested/Fold-note.md").click();
         harness.step();

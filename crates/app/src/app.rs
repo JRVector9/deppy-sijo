@@ -13697,6 +13697,22 @@ fn read_file_tree_search_directory(
     })
 }
 
+#[cfg(not(unix))]
+fn run_file_tree_search(
+    _root: &Path,
+    _query: &str,
+    _show_hidden: bool,
+    _max_entries: usize,
+    _max_results: usize,
+    _search_cancel: &std::sync::atomic::AtomicBool,
+    _shutdown_cancel: &std::sync::atomic::AtomicBool,
+) -> Result<ui::file_tree::FileTreeSearchSnapshot, ui::file_tree::FileTreeMaintenanceErrorCode> {
+    // 경로 기반 read_dir는 대기 중인 폴더가 junction/symlink로 교체되면 루트 밖을
+    // 따라간다. handle-relative 순회가 없는 플랫폼에서는 검색을 거절한다.
+    Err(ui::file_tree::FileTreeMaintenanceErrorCode::NativeFailure)
+}
+
+#[cfg(unix)]
 fn run_file_tree_search(
     root: &Path,
     query: &str,
@@ -13727,7 +13743,6 @@ fn run_file_tree_search(
         return Err(Error::InvalidSnapshot);
     }
     let needle = query.to_lowercase();
-    #[cfg(unix)]
     let root_handle = {
         use std::os::unix::fs::OpenOptionsExt;
         let mut options = std::fs::OpenOptions::new();
@@ -13749,7 +13764,6 @@ fn run_file_tree_search(
         {
             return Err(Error::NativeFailure);
         }
-        #[cfg(unix)]
         let directory = match open_file_tree_search_relative(&root_handle, &relative_parent) {
             Ok(directory) => directory,
             Err(_) if !relative_parent.as_os_str().is_empty() => {
@@ -13758,12 +13772,7 @@ fn run_file_tree_search(
             }
             Err(_) => return Err(Error::NativeFailure),
         };
-        #[cfg(not(unix))]
-        let directory = canonical_root.join(&relative_parent);
-        #[cfg(unix)]
         let opened = read_file_tree_search_directory(&directory);
-        #[cfg(not(unix))]
-        let opened = std::fs::read_dir(&directory);
         let entries = match opened {
             Ok(entries) => entries,
             Err(_) if !relative_parent.as_os_str().is_empty() => {
@@ -13785,19 +13794,7 @@ fn run_file_tree_search(
                     continue;
                 }
             };
-            #[cfg(unix)]
             let (name, is_dir, is_file) = (entry.name, entry.is_dir, entry.is_file);
-            #[cfg(not(unix))]
-            let (name, is_dir, is_file) = {
-                let file_type = match entry.file_type() {
-                    Ok(file_type) => file_type,
-                    Err(_) => {
-                        traversal_incomplete = true;
-                        continue;
-                    }
-                };
-                (entry.file_name(), file_type.is_dir(), file_type.is_file())
-            };
             visited += 1;
             if visited > max_entries {
                 traversal_incomplete = true;
@@ -39467,6 +39464,7 @@ mod tests {
         dir
     }
 
+    #[cfg(unix)]
     #[test]
     fn file_tree_search는_접힌_하위폴더_파일을_찾고_숨김을_건너뛴다() {
         let root = unique_temp_dir("file-tree-search").canonicalize().unwrap();
@@ -39483,6 +39481,7 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn file_tree_search는_이름이_일치하는_빈_폴더도_찾는다() {
         let root = unique_temp_dir("file-tree-search-folder")
@@ -39532,6 +39531,7 @@ mod tests {
         std::fs::remove_dir_all(outside).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn file_tree_search는_결과_상한을_알린다() {
         let root = unique_temp_dir("file-tree-search-cap")
@@ -39555,6 +39555,7 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn file_tree_search는_탐색_상한을_결과_상한과_구분한다() {
         let root = unique_temp_dir("file-tree-search-scan-cap")
@@ -39571,6 +39572,7 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn file_tree_search는_숨김_항목도_탐색_상한에_포함한다() {
         let root = unique_temp_dir("file-tree-search-hidden-cap")

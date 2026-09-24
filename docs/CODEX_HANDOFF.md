@@ -31,6 +31,17 @@
 - Remaining work: PR1 commit/push, PR2·PR3·PR4 rebase, 최종 통합 검증·리뷰·release 재빌드.
 - Exact next commands: `cd /private/tmp/deppy-ssh-screen-visible-20260924`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git add crates/session/src/session.rs crates/app/src/ui/workspace.rs docs/CODEX_HANDOFF.md`.
 
+## 2026-09-24 PR3 누적 리뷰 후 검색 입력·삭제 확인·플랫폼 경계
+
+- Current objective: 파일 검색에서 검색 밖 포커스를 터미널에 돌려주고, 검색 중 휴지통 실패 확인을 보이며, 디렉터리 교체로 루트 밖을 순회하지 않게 한다. 앱 재실행 금지.
+- Completed work: 검색 컨트롤(TextEdit/닫기/결과/트리에서 보기)에 실제 포커스가 있을 때만 같은 프레임의 터미널 입력 차단 신호를 세운다. 검색 분기에서 영구삭제 확인을 검색 결과 목록 앞에 표시한다. Unix의 handle-relative 검색은 유지하고, 동등한 안전 순회가 없는 non-Unix에서는 검색을 명시적으로 거절한다.
+- Modified files: `crates/app/src/ui/file_tree.rs`, `crates/app/src/app.rs`, `docs/CODEX_HANDOFF.md`.
+- Key design decisions: 검색 창을 열어둔 상태에서도 다른 영역에 포커스를 옮기면 터미널 입력을 허용한다. Windows junction 교체 경쟁에는 경로 기반 `read_dir`/`canonicalize` 검증이 충분하지 않으므로 Windows 검색은 안전한 handle-relative 구현 전까지 실패로 반환한다. 이 앱의 현 배포 대상은 macOS다.
+- Tests actually run: 검색 밖 포커스 회귀와 검색 중 영구삭제 확인 회귀는 수정 전 RED, 수정 후 각 1 passed. 최종 수정 후 host 검색 7 passed, 기존 검색 결과 kittest 1 passed, 검색 Tab→PTY 차단 1 passed, `cargo clippy -p deppy-sijo --all-targets --locked -- -D warnings`, `cargo fmt --all -- --check`, `git diff --check` exit 0.
+- Failed approaches: 검색 화면이 보인다는 상태만으로 입력 차단을 결정해 검색 밖 포커스도 막았다. non-Unix 경로 기반 탐색은 교체 경쟁을 막을 수 없어 제거했다.
+- Remaining work: PR3 commit/push, PR4 rebase/push, 최종 통합 테스트·코드 리뷰·release 재빌드 및 handoff 갱신.
+- Exact next commands: `cd /private/tmp/deppy-file-tree-search-20260924`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git add crates/app/src/app.rs crates/app/src/ui/file_tree.rs docs/CODEX_HANDOFF.md`.
+
 ## 2026-09-24 PR1 최종 리뷰 후 화면 크기 왕복 복원
 
 - Current objective: 복원한 SSH 셸 화면을 첫 입력 전까지 보여주고, 창 크기를 줄였다 다시 키워도 원본 내용을 복구한다. 사용자 허락 없이 앱 재실행 금지.

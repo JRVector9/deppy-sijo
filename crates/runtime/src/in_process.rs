@@ -4250,6 +4250,35 @@ impl Worker {
     fn trim_live_over_budget(&mut self, visible: &[SessionId]) -> bool {
         let budget = self.cache_budget_bytes;
         let mut trimmed_any = false;
+        // 보존된 이전 화면은 backend scrollback 밖의 셀 버퍼다. 숨긴 화면을
+        // 먼저 회수하고, 보이는 화면은 scrollback 트림으로도 부족할 때만 해제한다.
+        let mut hidden_held: Vec<(SessionId, usize)> = self
+            .sessions
+            .iter()
+            .filter_map(|(id, session)| {
+                let bytes = session.retained_viewport_bytes();
+                (bytes > 0 && !visible.contains(id)).then_some((*id, bytes))
+            })
+            .collect();
+        hidden_held.sort_by_key(|(_, bytes)| std::cmp::Reverse(*bytes));
+        let mut cache_bytes = self.terminal_cache_bytes();
+        for (id, bytes) in hidden_held {
+            if cache_bytes <= budget {
+                break;
+            }
+            if let Some(session) = self.sessions.get_mut(&id)
+                && session.release_held_viewport()
+            {
+                cache_bytes = cache_bytes.saturating_sub(bytes);
+                trimmed_any = true;
+                tracing::warn!(
+                    session = id.0,
+                    retained_bytes = bytes,
+                    visible = false,
+                    "전역 터미널 캐시 예산 초과 — 복원 화면 보관 셀 해제"
+                );
+            }
+        }
         // 트림을 못 하는(불변식이 깨진) 세션은 제외하고 다른 세션 계속 — 한 세션 때문에
         // 전체를 포기하지 않는다(리뷰 A-L1). 실무상 도달 불가하나 방어적.
         let mut cannot_trim: std::collections::HashSet<SessionId> =
@@ -4276,14 +4305,7 @@ impl Worker {
                 .filter(|e| !cannot_trim.contains(&e.id))
                 .collect();
             let Some((id, target)) = select_next_live_trim(&candidates, cache_bytes, budget) else {
-                if cache_bytes > budget {
-                    tracing::warn!(
-                        budget,
-                        actual = cache_bytes,
-                        "모든 세션을 최소 스크롤백까지 줄였으나 전역 예산 초과 지속"
-                    );
-                }
-                return trimmed_any;
+                break;
             };
             let over_bytes = cache_bytes.saturating_sub(budget);
             let was_visible = visible.contains(&id);
@@ -4304,6 +4326,41 @@ impl Worker {
                 "전역 터미널 캐시 예산 초과 — live 세션 스크롤백 트림"
             );
         }
+        let mut visible_held: Vec<(SessionId, usize)> = self
+            .sessions
+            .iter()
+            .filter_map(|(id, session)| {
+                let bytes = session.retained_viewport_bytes();
+                (bytes > 0 && visible.contains(id)).then_some((*id, bytes))
+            })
+            .collect();
+        visible_held.sort_by_key(|(_, bytes)| std::cmp::Reverse(*bytes));
+        let mut cache_bytes = self.terminal_cache_bytes();
+        for (id, bytes) in visible_held {
+            if cache_bytes <= budget {
+                break;
+            }
+            if let Some(session) = self.sessions.get_mut(&id)
+                && session.release_held_viewport()
+            {
+                cache_bytes = cache_bytes.saturating_sub(bytes);
+                trimmed_any = true;
+                tracing::warn!(
+                    session = id.0,
+                    retained_bytes = bytes,
+                    visible = true,
+                    "전역 터미널 캐시 예산 초과 — 복원 화면 보관 셀 해제"
+                );
+            }
+        }
+        if cache_bytes > budget {
+            tracing::warn!(
+                budget,
+                actual = cache_bytes,
+                "복원 화면과 스크롤백 트림 후 전역 예산 초과 지속"
+            );
+        }
+        trimmed_any
     }
 
     /// exited 세션의 scrollback을 zlib 압축 아카이브 항목으로 만든다.
@@ -5455,6 +5512,101 @@ mod tests {
                 "다음세션복원전에예산을맞춰야한다"
             );
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn 복원_화면_보관_셀이_예산을_넘으면_라이브_화면으로_돌아간다() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, _) = admission_worker(resolver, "held-viewport-budget");
+        let id = SessionId(88);
+        let mut session = Session::spawn_with_spec(
+            id,
+            session::SessionKind::Shell,
+            &spec("/bin/cat", &[]),
+            20,
+            6,
+            100,
+        )
+        .unwrap();
+        session
+            .replay_ansi(&mut b"REMOTE-SCREEN".as_slice())
+            .unwrap();
+        session.finish_ansi_replay().unwrap();
+        session
+            .replay_ansi(&mut b"\x1b[2J\x1b[HLIVE-PROMPT".as_slice())
+            .unwrap();
+        let held_bytes = session.retained_viewport_bytes();
+        assert!(held_bytes > 0);
+        worker.cache_budget_bytes = session
+            .cache_footprint()
+            .estimated_bytes
+            .saturating_sub(held_bytes / 2);
+        worker.insert_session(id, session);
+        let retained = worker.sessions.get_mut(&id).unwrap();
+        assert_eq!(retained.retained_viewport_bytes(), 0);
+        assert!(
+            retained
+                .take_snapshot()
+                .unwrap()
+                .visible_cells
+                .iter()
+                .map(|cell| cell.c)
+                .collect::<String>()
+                .contains("LIVE-PROMPT")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn 숨긴_스크롤백으로_예산을_맞출_수_있으면_보이는_복원_화면을_남긴다() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, _) = admission_worker(resolver, "visible-held-priority");
+        let hidden_id = SessionId(89);
+        let visible_id = SessionId(90);
+        let mut hidden = Session::spawn_with_spec(
+            hidden_id,
+            session::SessionKind::Shell,
+            &spec("/bin/cat", &[]),
+            20,
+            6,
+            1000,
+        )
+        .unwrap();
+        let history = (0..500)
+            .map(|line| format!("history-{line}\r\n"))
+            .collect::<String>();
+        hidden.replay_ansi(&mut history.as_bytes()).unwrap();
+        let old_history = hidden.cache_footprint().history_lines;
+        assert!(old_history > LIVE_TRIM_FLOOR_LINES);
+        let mut visible = Session::spawn_with_spec(
+            visible_id,
+            session::SessionKind::Shell,
+            &spec("/bin/cat", &[]),
+            20,
+            6,
+            100,
+        )
+        .unwrap();
+        visible
+            .replay_ansi(&mut b"REMOTE-SCREEN".as_slice())
+            .unwrap();
+        visible.finish_ansi_replay().unwrap();
+        let held_bytes = visible.retained_viewport_bytes();
+        assert!(held_bytes > 0);
+        worker.insert_session(hidden_id, hidden);
+        worker.insert_session(visible_id, visible);
+        worker.cache_budget_bytes = worker.terminal_cache_bytes() - held_bytes / 2;
+        assert!(worker.trim_live_over_budget(&[visible_id]));
+        assert!(worker.sessions[&visible_id].retained_viewport_bytes() > 0);
+        assert!(worker.sessions[&hidden_id].cache_footprint().history_lines < old_history);
+        assert!(worker.terminal_cache_bytes() <= worker.cache_budget_bytes);
     }
 
     #[test]
@@ -11493,11 +11645,20 @@ mod tests {
         let restored_session = probe.wait_for(Duration::from_secs(15), |event| match event {
             RuntimeEvent::Viewport {
                 session, snapshot, ..
-            } if !snapshot.is_alt_screen => Some(*session),
+            } if !snapshot.is_alt_screen
+                && snapshot
+                    .visible_cells
+                    .iter()
+                    .map(|cell| cell.c)
+                    .collect::<String>()
+                    .contains("REMOTE-VIM-BUFFER") =>
+            {
+                Some(*session)
+            }
             _ => None,
         });
 
-        // 1) 화면 보존 — alt-screen 내용이 scrollback에서 찾아져야 한다(위로 스크롤하면 보임).
+        // 1) 화면 보존 — 재접속 없이도 마지막 화면이 보이고 검색도 가능해야 한다.
         client
             .send_command(RuntimeCommand::SearchScrollback {
                 session: restored_session,

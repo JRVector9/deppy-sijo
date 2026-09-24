@@ -1,3 +1,60 @@
+## 2026-09-24 PR1 최종 리뷰 후 보이는 복원 화면 우선 보존
+
+- Current objective: 전역 메모리 예산 초과 시 숨겨진 스크롤백을 먼저 회수해 현재 보이는 SSH 복원 화면을 불필요하게 잃지 않는다. 사용자 허락 없이 앱 재실행 금지.
+- Completed work: 숨긴 세션의 보존 화면을 먼저 해제하고 기존 숨김 우선 scrollback 트림을 실행한다. 그 후에도 예산을 넘을 때만 보이는 복원 화면을 해제한다. 메모리 회수 순서를 확인하는 회귀 테스트를 추가했다.
+- Modified files: `crates/runtime/src/in_process.rs`, `docs/CODEX_HANDOFF.md`.
+- Key design decisions: 화면을 실제로 보고 있는 사용자의 복원 내용은 숨겨진 데이터와 scrollback보다 오래 보존한다. 기존 `select_next_live_trim`의 숨김 우선 정책을 유지한다.
+- Tests actually run: 새 회귀 테스트 수정 전 RED, 수정 후 GREEN. 기존 복원 화면 강제 회수 테스트도 GREEN. `cargo test -p runtime --lib --locked -- --test-threads=1` 309 passed; `cargo clippy -p runtime -p session -p deppy-sijo --all-targets --locked -- -D warnings`, `cargo fmt --all -- --check`, `git diff --check` exit 0.
+- Failed approaches: 보존 화면을 숨김/보임 순서로 모두 해제한 뒤 scrollback을 줄여 작은 초과에도 보이는 화면이 사라졌다.
+- Remaining work: PR1 commit/push, PR2·PR3·PR4 rebase, 최종 스택 검증·코드 리뷰·release 재빌드. 앱 재실행 금지.
+- Exact next commands: `cd /private/tmp/deppy-ssh-screen-visible-20260924`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git add crates/runtime/src/in_process.rs docs/CODEX_HANDOFF.md`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git commit -m 'Preserve visible restored screens during cache trimming'`.
+
+## 2026-09-24 PR1 최종 리뷰 후 셸 종료·한글 셀 경계
+
+- Current objective: 복원된 원격 셸 화면을 유지하되 새 셸이 종료하면 마지막 출력을 보이고, 창 폭 축소가 한글 wide 셀을 잘라도 유효한 화면을 발행한다. 사용자 허락 없이 앱 재실행 금지.
+- Completed work: `pump` 최종 종료 시 보존 화면을 해제해 라이브 backend의 오류/종료 출력을 표시한다. 좁은 화면 복사에서 오른쪽 spacer를 잃는 wide 선행 셀을 배경색을 유지한 공백 셀로 바꾼다. 확대 시 원본 화면은 복원한다.
+- Modified files: `crates/session/src/session.rs`, `docs/CODEX_HANDOFF.md`.
+- Key design decisions: 새 셸 출력 draining과 종료 코드 관찰을 마친 뒤에만 보존 화면을 해제한다. 잘린 글자 한 셀만 공백으로 바꾸어 인접 셀 및 행 배경을 유지한다.
+- Tests actually run: 두 새 회귀 테스트 각각 수정 전 RED, 수정 후 GREEN. `cargo test -p session --locked` 79 passed. `cargo test -p runtime --lib --locked -- --test-threads=1` 308 passed. `cargo clippy -p session -p runtime -p deppy-sijo --all-targets --locked -- -D warnings`, `cargo fmt --all -- --check`, `git diff --check` exit 0.
+- Failed approaches: 기존 구현은 셸 종료 후에도 보존 화면을 붙잡았고, 원본 셀을 단순 slice해 wide 선행 셀만 남겼다.
+- Remaining work: PR1 commit/push, PR2·PR3·PR4 rebase, 최종 스택 재검증·리뷰·release 재빌드. 앱 재실행 금지.
+- Exact next commands: `cd /private/tmp/deppy-ssh-screen-visible-20260924`; `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo fmt --all -- --check`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git add crates/session/src/session.rs docs/CODEX_HANDOFF.md`.
+
+## 2026-09-24 PR1 누적 리뷰 후 빈 화면·검색 이동
+
+- Current objective: 저장된 SSH 셸 화면이 실제로 비어 있으면 새 프롬프트를 보이고, 보존 화면에서 현재 위치의 검색 결과로 이동하면 라이브 화면으로 전환한다. 사용자 허락 없이 앱 재실행 금지.
+- Completed work: `finish_ansi_replay`가 비공백 셀이 있는 셸 화면만 고정한다. 터미널 검색 UI는 목표 스크롤 델타가 0이어도 Scroll 명령을 보내 세션의 보존 화면을 해제한다.
+- Modified files: `crates/session/src/session.rs`, `crates/app/src/ui/workspace.rs`, `docs/CODEX_HANDOFF.md`.
+- Key design decisions: 검색 결과를 탐색하는 사용자 동작은 복원 화면의 첫 입력과 같이 라이브 화면 전환으로 처리한다. 비어 있는 화면 판정은 wide spacer를 제외한 비공백 셀로 한다.
+- Tests actually run: 빈 화면 회귀와 zero-delta 검색 명령 회귀가 수정 전 RED, 수정 후 각각 passed. `cargo test -p session --locked` 76 passed. `cargo clippy -p session -p runtime -p deppy-sijo --all-targets --locked -- -D warnings`와 `cargo fmt --all -- --check` exit 0.
+- Failed approaches: 첫 Clippy 검사에서 `and_then(|_| Some(delta))`가 `bind_instead_of_map`으로 실패해 `map`으로 고쳤다.
+- Remaining work: PR1 commit/push, PR2·PR3·PR4 rebase, 최종 통합 검증·리뷰·release 재빌드.
+- Exact next commands: `cd /private/tmp/deppy-ssh-screen-visible-20260924`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git add crates/session/src/session.rs crates/app/src/ui/workspace.rs docs/CODEX_HANDOFF.md`.
+
+## 2026-09-24 PR1 최종 리뷰 후 화면 크기 왕복 복원
+
+- Current objective: 복원한 SSH 셸 화면을 첫 입력 전까지 보여주고, 창 크기를 줄였다 다시 키워도 원본 내용을 복구한다. 사용자 허락 없이 앱 재실행 금지.
+- Completed work: `HeldViewport`가 원본 snapshot과 표시용 snapshot을 함께 보관한다. 리사이즈마다 원본에서 새 표시 화면을 계산하며 첫 입력/스크롤에서 둘 다 해제한다.
+- Modified files: `crates/session/src/session.rs`, `docs/CODEX_HANDOFF.md`.
+- Key design decisions: 원본 셀은 `Arc` clone으로 공유하므로 셀 배열을 두 번 복사하지 않는다. 축소 시 원본의 하단 행을 선택한다.
+- Tests actually run: 크기 축소→확대 회귀 테스트 수정 전 RED, 수정 후 1 passed. `cargo test -p session --locked` 74 passed, `cargo fmt --all -- --check`와 `git diff --check` exit 0.
+- Failed approaches: 기존 표시 snapshot을 직접 축소해 원본 열/행 정보가 사라졌다.
+- Remaining work: session 전체 테스트와 format/diff 검사 후 PR1 commit/push; PR2·PR3·PR4 rebase, 최종 검증·빌드·리뷰.
+- Exact next commands: `cd /private/tmp/deppy-ssh-screen-visible-20260924`; `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo test -p session --locked`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`.
+
+## 2026-09-24 SSH 화면 복원과 파일 트리 PR 작업 진행
+
+- Final stack re-review follow-up: `codex review --base fix/environment-api-context-integration`가 고정된 화면을 24→10행처럼 줄일 때 상단을 복사해 아래쪽 프롬프트를 잃는 P2를 찾았다. 마지막 N행을 새 viewport에 복사하고 cursor 행을 잘린 상단 수만큼 보정했다. 새 shrink 회귀 테스트는 수정 전 RED, 수정 후 GREEN. `cargo test -p session --locked` 73 passed. 이 수정을 PR1에 추가한 뒤 PR2·PR3·PR4를 순서대로 rebase하고 최종 bundle을 다시 빌드해야 한다. 앱 재실행 금지.
+- Current objective: SSH 원격 셸의 마지막 화면을 앱 복원 후 로컬 셸 전환 중에도 표시하고, 파일 트리 폴더 접두어 탐색·파일 검색·새 파일/폴더 모달을 각각 PR로 구현한 뒤 최종 코드 리뷰한다. 접두어 탐색은 폴더 행을 선택하고 화면에 보이게 할 뿐 폴더에 들어가지 않는다. 앱 재실행은 사용자 명시 요청 전까지 금지한다.
+- PR1 review follow-up: `codex review --uncommitted`가 alt-screen 하단 행 누락, agent respawn 출력 가림, 검색 스크롤 좌표 불일치를 지적했다. 경계 marker 전에 원본 viewport를 캡처하고 Shell에만 고정을 적용했다. 노출 snapshot의 scroll_offset은 live backend에서 읽는다. 각 문제에 회귀 테스트를 추가했다. 최신 revision에서 session 전체 72 passed, runtime 복원 집중 테스트 1 passed, Clippy/format/diff check exit 0.
+- Completed work: v43 HEAD `2a1583d`에서 별도 worktree `/private/tmp/deppy-ssh-screen-visible-20260924`와 branch `fix/ssh-screen-stays-visible`을 만들었다. 세션의 alt/primary 원격 마지막 화면을 첫 입력 전까지 viewport로 유지하고, 리사이즈에서도 셀을 보존한다. 앱 재실행 금지 규칙을 `AGENTS.md`와 `CLAUDE.md`에 반영했다. 후속 PR 경계를 계획 문서에 기록했다.
+- Modified files: `AGENTS.md`, `CLAUDE.md`, `crates/session/src/session.rs`, `crates/runtime/src/in_process.rs`, `docs/superpowers/plans/2026-09-24-file-tree-and-ssh-continuity.md`, `docs/CODEX_HANDOFF.md`.
+- Key design decisions: 기존 터미널 backend를 복제하지 않고 셀 한 화면의 snapshot만 붙잡는다. 라이브 PTY는 계속 실행되며 첫 입력 또는 스크롤 동작에서 라이브 화면으로 전환한다. alt screen은 기존처럼 scrollback에도 직렬화한다. 이 변경은 관리형 SSH 재접속 자체를 구현하지 않는다.
+- Tests actually run: 수정 전 session 회귀 두 건 RED; 최신 수정 후 `cargo test -p session --lib --locked` 72 passed; `cargo test -p runtime --lib 재시작시_alt_screen이었던_셸_pane도_화면이_보존된다 --locked` 1 passed; `cargo clippy -p session -p runtime --all-targets --locked -- -D warnings` passed; `cargo fmt --all -- --check` passed; `git diff --check` passed. macOS linker에는 `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk DEVELOPER_DIR=/Library/Developer/CommandLineTools`를 사용했다.
+- Failed approaches: SDKROOT 없이 session 테스트를 실행하면 Xcode license 때문에 linker exit 69가 났다. 기본 CLT SDK 변수를 설정해 통과했다. alt screen만 복원하면 실제 SSH primary 화면이 남지 않는다는 것을 기존 로그 조사로 확인했다.
+- Remaining work: PR1 포맷 확인·코드 리뷰·커밋·push·PR 생성. 그 다음 폴더 탐색, 파일 검색, 생성 모달 PR을 차례로 구현하고 최종 리뷰/빌드를 한다. 앱을 실행하지 않는다.
+- Exact next commands: `cd /private/tmp/deppy-ssh-screen-visible-20260924`; `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo fmt --all -- --check`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git status --short`.
+
 ## 2026-09-23 최신 v43 재빌드·서명·재실행 완료
 
 - Current objective completed: 사용자의 지시에 따라 로컬 최신 소스를 커밋/원격 동기화
@@ -4471,3 +4528,13 @@
 - 실패 접근: 첫 `cargo fmt --all -- --check`에서 신규 테스트의 긴 `and_then` 한 줄만 포맷 차이로 실패했다. rustfmt 제안 모양으로 고친 뒤 최종 `cargo fmt --all -- --check`와 `git diff --check`가 모두 exit 0이다. 구현 가설 실패나 빌드 정지는 없었다.
 - 남은 작업: 확인된 두 리뷰 결함의 코드 수정과 집중 검증은 완료됐다. 커밋·push·release 빌드·앱 재실행·화면 검증은 이번 요청 범위가 아니며 수행하지 않았다.
 - 다음 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit`; `cargo fmt --all -- --check`; `git diff --check`; `git diff -- crates/app/src/app.rs`; 사용자 요청이 있으면 이후 커밋 또는 재빌드·재실행을 진행한다.
+## 2026-09-24 PR1 누적 리뷰 후 복원 화면 캐시 예산
+
+- Current objective: 저장된 SSH 셸 화면을 유지하면서 보존 셀 메모리를 전역 터미널 캐시 예산에 포함하고, 예산 초과 시 회수한다. 사용자 허락 없이 앱 재실행 금지.
+- Completed work: `Session::cache_footprint`가 `HeldViewport`의 고유 셀 버퍼를 계상한다. runtime은 예산 초과 시 숨겨진 세션의 큰 보존 화면부터 해제하고, 필요하면 보이는 세션을 라이브 화면으로 전환한 뒤 scrollback을 줄인다.
+- Modified files: `crates/session/src/session.rs`, `crates/runtime/src/in_process.rs`, `docs/CODEX_HANDOFF.md`.
+- Key design decisions: 원본과 표시 snapshot이 같은 `Arc` 셀 배열을 공유하면 한 번만 계상한다. 보존 화면 해제는 전체 화면을 dirty로 표시해 다음 viewport를 발행한다.
+- Tests actually run: 새 session·runtime 회귀 테스트 각각 수정 전 RED, 수정 후 GREEN. `cargo test -p session --locked` 77 passed. `cargo test -p runtime --lib --locked` 병렬 실행에서는 큐 압박/자원 감시 관련 3건 실패, `cargo test -p runtime --lib --locked -- --test-threads=1`에서는 308 passed. `cargo clippy -p session -p runtime -p deppy-sijo --all-targets --locked -- -D warnings` passed. `cargo fmt --all` 적용.
+- Failed approaches: 병렬 전체 runtime 실행은 자원 경합으로 3건 실패했다. 단일 스레드 재실행에서 모두 통과했다.
+- Remaining work: PR1 diff/format 확인·commit/push, PR2·PR3·PR4 rebase, 최종 통합 검증·코드 리뷰·release 재빌드. 앱 재실행 금지.
+- Exact next commands: `cd /private/tmp/deppy-ssh-screen-visible-20260924`; `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo fmt --all -- --check`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git diff --check`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools /Library/Developer/CommandLineTools/usr/bin/git add crates/session/src/session.rs crates/runtime/src/in_process.rs docs/CODEX_HANDOFF.md`.

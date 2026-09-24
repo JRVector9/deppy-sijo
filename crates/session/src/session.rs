@@ -8,7 +8,7 @@ use pty::{
 };
 use terminal::{
     CellRange, TerminalBackend, TerminalCacheClass, TerminalCacheEvent, TerminalCacheFootprint,
-    TerminalViewportSnapshot,
+    TerminalCell, TerminalViewportSnapshot,
 };
 
 use crate::lifecycle::SessionLifecycle;
@@ -94,6 +94,14 @@ pub struct Session {
     cache_class: TerminalCacheClass,
     /// OSC 133 프롬프트 마크 (셸 통합 1단계) — pump의 출력 스트림에서 스캔한다.
     prompt_marks: PromptMarks,
+    /// 새 로컬 PTY가 화면을 지워도 첫 입력 전에는 이전 화면을 그대로 보여준다.
+    /// 원본 셀은 첫 입력 전까지 보관해 pane 축소 후 확대에도 다시 보여준다.
+    held_viewport: Option<HeldViewport>,
+}
+
+struct HeldViewport {
+    original: TerminalViewportSnapshot,
+    display: TerminalViewportSnapshot,
 }
 
 impl Session {
@@ -162,6 +170,7 @@ impl Session {
             exit_wait_ticks: 0,
             cache_class: TerminalCacheClass::Visible,
             prompt_marks: PromptMarks::default(),
+            held_viewport: None,
         })
     }
 
@@ -215,6 +224,7 @@ impl Session {
             exit_wait_ticks: 0,
             cache_class: TerminalCacheClass::Exited,
             prompt_marks: PromptMarks::default(),
+            held_viewport: None,
         }
     }
 
@@ -360,6 +370,8 @@ impl Session {
                 self.lifecycle = SessionLifecycle::Exited {
                     exit_code: self.exit_code,
                 };
+                // 더는 입력으로 이전 화면을 해제할 수 없으므로 새 셸의 마지막 출력 표시.
+                self.release_held_viewport();
                 just_exited = true;
             }
         }
@@ -375,7 +387,16 @@ impl Session {
     /// hidden pane에 대해 호출하지 않는 것이 14.4 규칙.
     /// None(외부 surface 백엔드 등)일 때 dirty를 지우면 변경이 영구 미발행된다.
     pub fn take_snapshot(&mut self) -> Option<TerminalViewportSnapshot> {
-        let mut snapshot = self.backend.viewport_snapshot()?;
+        let mut snapshot = self
+            .held_viewport
+            .as_ref()
+            .map(|held| held.display.clone())
+            .or_else(|| self.backend.viewport_snapshot())?;
+        if self.held_viewport.is_some() {
+            // 검색 점프는 이 값을 기준으로 delta를 계산해 live backend에 적용한다.
+            // 새 셸 출력이 scrollback을 밀어도 두 좌표계를 같은 위치로 유지한다.
+            snapshot.scroll_offset = self.backend.viewport_snapshot()?.scroll_offset;
+        }
         snapshot.dirty_ranges = self.take_dirty_ranges(snapshot.cols, snapshot.rows);
         self.dirty = false;
         Some(snapshot)
@@ -435,14 +456,14 @@ impl Session {
     /// 재시작) 그냥 primary로 복귀시키면 그 화면은 통째로 사라진다 — alt-screen에는
     /// scrollback이 없어 나중에 되찾을 방법이 없다. 복귀 직전에 alt 화면을 색 보존
     /// ANSI로 떠서(serialize_scrollback) primary 쪽에 구분선과 함께 다시 흘려보낸다.
-    /// 이러면 위로 스크롤하면 마지막으로 보던 화면이 그대로 보이고, 그 아래에 fresh
-    /// 셸이 새 줄에서 시작한다. 캡처가 이미 redaction을 거친 replay 결과에서만
+    /// 첫 입력 전에는 마지막 화면을 표시하고, 입력하면 fresh 셸로 전환한다.
+    /// 캡처가 이미 redaction을 거친 replay 결과에서만
     /// 나오므로 이 경로로 새로 노출되는 raw secret은 없다. 백엔드가 직렬화를
     /// 지원하지 않으면(None) 기존처럼 그 화면은 버려진다.
     pub fn finish_ansi_replay(&mut self) -> anyhow::Result<()> {
-        let preserved_alt_screen = self
-            .backend
-            .viewport_snapshot()
+        let remote_viewport = self.backend.viewport_snapshot();
+        let preserved_alt_screen = remote_viewport
+            .as_ref()
             .is_some_and(|snapshot| snapshot.is_alt_screen)
             .then(|| self.backend.serialize_scrollback())
             .flatten()
@@ -455,6 +476,26 @@ impl Session {
             self.backend.feed(&dump)?;
             self.backend.feed(b"\r\n\r\n")?;
         }
+        // 에이전트는 재실행 후 새 출력을 즉시 보여야 한다. 셸만 마지막 원격 화면을
+        // 첫 입력 전까지 고정한다. 경계 마커/스페이서를 쓰기 전 원본 화면을 잡아야
+        // alt-screen 하단 행이 밀려 잘리지 않는다.
+        self.held_viewport = (self.kind == SessionKind::Shell)
+            .then_some(remote_viewport)
+            .flatten()
+            .filter(|snapshot| {
+                snapshot
+                    .visible_cells
+                    .iter()
+                    .any(|cell| !cell.wide_spacer && !cell.c.is_whitespace())
+            })
+            .map(|mut snapshot| {
+                snapshot.is_alt_screen = false;
+                snapshot.cursor.visible = false;
+                HeldViewport {
+                    original: snapshot.clone(),
+                    display: snapshot,
+                }
+            });
         self.mark_full_dirty();
         Ok(())
     }
@@ -489,7 +530,14 @@ impl Session {
     pub fn write_input(&mut self, bytes: &[u8]) -> Option<PtyInputEnqueueResult> {
         if let Some(pty) = &mut self.pty {
             match pty.write_input(bytes) {
-                Ok(result) => return Some(result),
+                Ok(result) => {
+                    if matches!(&result, PtyInputEnqueueResult::Accepted)
+                        && self.held_viewport.is_some()
+                    {
+                        self.scroll_to_bottom();
+                    }
+                    return Some(result);
+                }
                 Err(e) => tracing::warn!("PTY 입력 실패: {e:#}"),
             }
         }
@@ -518,6 +566,7 @@ impl Session {
         if actual != (cols, rows) {
             return Err(ResizeError::SizeMismatch);
         }
+        self.resize_held_viewport(cols, rows);
         Ok(ResizeApplied {
             cols: actual.0,
             rows: actual.1,
@@ -537,10 +586,56 @@ impl Session {
             tracing::warn!("PTY resize 실패: {e:#}");
         }
         self.mark_full_dirty();
+        self.resize_held_viewport(cols, rows);
         self.set_cache_class(self.cache_class)
     }
 
+    fn resize_held_viewport(&mut self, cols: u16, rows: u16) {
+        let Some(held) = &mut self.held_viewport else {
+            return;
+        };
+        if held.display.cols == cols && held.display.rows == rows {
+            return;
+        }
+        let source = &held.original;
+        let old_cols = usize::from(source.cols);
+        let new_cols = usize::from(cols);
+        let mut cells = vec![TerminalCell::default(); new_cols * usize::from(rows)];
+        // 줄어든 pane은 마지막 화면의 아래쪽(프롬프트/상태줄)을 남긴다.
+        let first_retained_row = source.rows.saturating_sub(rows);
+        for row in 0..usize::from(source.rows.min(rows)) {
+            let count = old_cols.min(new_cols);
+            let source_row = usize::from(first_retained_row) + row;
+            cells[row * new_cols..row * new_cols + count].copy_from_slice(
+                &source.visible_cells[source_row * old_cols..source_row * old_cols + count],
+            );
+            if count < old_cols && count > 0 {
+                let last = &mut cells[row * new_cols + count - 1];
+                if last.wide {
+                    // 오른쪽 spacer가 잘린 wide 글자는 렌더러에 넘기지 않는다.
+                    let bg = last.bg;
+                    *last = TerminalCell {
+                        bg,
+                        ..TerminalCell::default()
+                    };
+                }
+            }
+        }
+        let mut display = source.clone();
+        display.cols = cols;
+        display.rows = rows;
+        display.visible_cells = cells.into();
+        display.cursor.col = source.cursor.col.min(cols.saturating_sub(1));
+        display.cursor.row = source
+            .cursor
+            .row
+            .saturating_sub(first_retained_row)
+            .min(rows.saturating_sub(1));
+        held.display = display;
+    }
+
     pub fn scroll(&mut self, delta: i32) {
+        self.held_viewport = None;
         self.backend.scroll(delta);
         self.mark_full_dirty();
     }
@@ -548,12 +643,14 @@ impl Session {
     /// 스크롤백에서 맨 아래(라이브 화면)로 복귀 (pane 메뉴/단축키).
     pub fn scroll_to_bottom(&mut self) {
         self.backend.scroll_to_bottom();
+        self.held_viewport = None;
         self.mark_full_dirty();
     }
 
     /// OSC 133 프롬프트 마크로 점프 (−1=이전/과거, +1=다음/최신 — 단축키 ⌘⇧↑/↓).
     /// 델타 수식은 T3 검색의 스크롤 수식과 동치 (prompt_marks.rs 참조).
     pub fn scroll_to_prompt(&mut self, direction: i8) {
+        self.held_viewport = None;
         let footprint = self.backend.cache_footprint();
         // 현재 스크롤 오프셋은 snapshot으로만 읽는다 — 키 입력 빈도라 비용 무시 가능.
         let offset = self
@@ -663,8 +760,38 @@ impl Session {
         self.cache_class
     }
 
+    /// 복원 화면 snapshot이 backend 밖에서 소유한 셀 버퍼만 센다. 원본과 표시용이
+    /// 같은 Arc를 공유하는 동안에는 한 번만 계상한다.
+    pub fn retained_viewport_bytes(&self) -> usize {
+        let Some(held) = self.held_viewport.as_ref() else {
+            return 0;
+        };
+        let cell_size = std::mem::size_of::<TerminalCell>();
+        let original = held.original.visible_cells.len().saturating_mul(cell_size);
+        let display =
+            if std::sync::Arc::ptr_eq(&held.original.visible_cells, &held.display.visible_cells) {
+                0
+            } else {
+                held.display.visible_cells.len().saturating_mul(cell_size)
+            };
+        original.saturating_add(display)
+    }
+
+    /// 전역 캐시 압박 시 보존 화면을 해제하고 라이브 backend를 다시 발행한다.
+    pub fn release_held_viewport(&mut self) -> bool {
+        if self.held_viewport.take().is_none() {
+            return false;
+        }
+        self.mark_full_dirty();
+        true
+    }
+
     pub fn cache_footprint(&self) -> TerminalCacheFootprint {
-        self.backend.cache_footprint()
+        let mut footprint = self.backend.cache_footprint();
+        footprint.estimated_bytes = footprint
+            .estimated_bytes
+            .saturating_add(self.retained_viewport_bytes());
+        footprint
     }
 
     fn mark_dirty_rows(&mut self, rows: &[u16]) {
@@ -1177,20 +1304,389 @@ mod tests {
             .unwrap();
         let snapshot = session.take_snapshot().unwrap();
         assert!(!snapshot.is_alt_screen, "복귀 후엔 alt-screen이면 안 됨");
-        // 6행짜리 좁은 화면이라 marker+dump+spacer가 OLD-HISTORY까지 스크롤백으로
-        // 밀어낸다 — 이는 기대 동작(위로 스크롤하면 보임)이라 screen_text() 대신
-        // scrollback 검색으로 "사라지지 않았음"을 확인한다.
+        // 연결이 종료된 직후에는 마지막 원격 화면을 보는 것이 기본이다. 새 로컬
+        // 프롬프트는 아래에 살아 있지만 사용자가 선택하기 전에는 원격 화면을 가리지 않는다.
         let found = session.search_scrollback("ALT-SCREEN", 10);
         assert!(
             !found.matches.is_empty(),
             "alt-screen 내용이 scrollback에 보존돼야 함"
         );
-        // fresh 셸 출력은 지금 당장 보이는 화면에 있어야 한다(입력 즉시 가능).
-        let text = session.screen_text();
-        assert!(text.contains("FRESH-PROMPT"), "{text:?}");
+        let visible = snapshot
+            .visible_cells
+            .iter()
+            .map(|cell| cell.c)
+            .collect::<String>();
         assert!(
-            !text.contains("ALT-SCREEN"),
-            "이 화면 크기에선 보존 내용이 스크롤백으로 밀려나 있어야 함: {text:?}"
+            visible.contains("ALT-SCREEN"),
+            "재접속 전에도 마지막 원격 화면이 바로 보여야 함: {visible:?}"
+        );
+        assert!(matches!(
+            session.write_input(b"next command\n"),
+            Some(PtyInputEnqueueResult::Accepted)
+        ));
+        let live = session.take_snapshot().unwrap();
+        assert_eq!(live.scroll_offset, 0);
+        assert!(session.screen_text().contains("FRESH-PROMPT"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn 복원된_원격화면은_새_로컬셸이_지워도_첫입력전까지_보인다() {
+        let spec = CommandSpec {
+            program: "/bin/cat".into(),
+            args: Vec::new(),
+            env: Vec::new(),
+            cwd: None,
+        };
+        let mut session =
+            Session::spawn_with_spec(SessionId(22), SessionKind::Shell, &spec, 40, 6, 100).unwrap();
+        session
+            .replay_ansi(&mut std::io::Cursor::new(b"REMOTE-LAST-SCREEN"))
+            .unwrap();
+        session.finish_ansi_replay().unwrap();
+        session
+            .replay_ansi(&mut std::io::Cursor::new(b"\x1b[2J\x1b[HLOCAL-PROMPT"))
+            .unwrap();
+        let old = session.take_snapshot().unwrap();
+        let visible = old
+            .visible_cells
+            .iter()
+            .map(|cell| cell.c)
+            .collect::<String>();
+        assert!(visible.contains("REMOTE-LAST-SCREEN"), "{visible:?}");
+        session.resize_checked(48, 8).unwrap();
+        let resized = session.take_snapshot().unwrap();
+        assert_eq!((resized.cols, resized.rows), (48, 8));
+        assert!(
+            resized
+                .visible_cells
+                .iter()
+                .map(|cell| cell.c)
+                .collect::<String>()
+                .contains("REMOTE-LAST-SCREEN")
+        );
+        assert!(matches!(
+            session.write_input(b"next command\n"),
+            Some(PtyInputEnqueueResult::Accepted)
+        ));
+        let live = session.take_snapshot().unwrap();
+        let visible = live
+            .visible_cells
+            .iter()
+            .map(|cell| cell.c)
+            .collect::<String>();
+        assert!(visible.contains("LOCAL-PROMPT"), "{visible:?}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn 복원된_원격화면에서_검색_스크롤이_0이어도_라이브_화면으로_전환한다() {
+        let spec = CommandSpec {
+            program: "/bin/cat".into(),
+            args: Vec::new(),
+            env: Vec::new(),
+            cwd: None,
+        };
+        let mut session =
+            Session::spawn_with_spec(SessionId(28), SessionKind::Shell, &spec, 40, 6, 100).unwrap();
+        session
+            .replay_ansi(&mut std::io::Cursor::new(b"REMOTE-LAST-SCREEN"))
+            .unwrap();
+        session.finish_ansi_replay().unwrap();
+        session
+            .replay_ansi(&mut std::io::Cursor::new(b"\x1b[2J\x1b[HLOCAL-PROMPT"))
+            .unwrap();
+        assert!(
+            session
+                .take_snapshot()
+                .unwrap()
+                .visible_cells
+                .iter()
+                .map(|cell| cell.c)
+                .collect::<String>()
+                .contains("REMOTE-LAST-SCREEN")
+        );
+        session.scroll(0);
+        assert!(
+            session
+                .take_snapshot()
+                .unwrap()
+                .visible_cells
+                .iter()
+                .map(|cell| cell.c)
+                .collect::<String>()
+                .contains("LOCAL-PROMPT")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn 복원된_원격화면이_비어_있으면_새_셸_프롬프트를_가리지_않는다() {
+        let spec = CommandSpec {
+            program: "/bin/cat".into(),
+            args: Vec::new(),
+            env: Vec::new(),
+            cwd: None,
+        };
+        let mut session =
+            Session::spawn_with_spec(SessionId(29), SessionKind::Shell, &spec, 40, 6, 100).unwrap();
+        session
+            .replay_ansi(&mut std::io::Cursor::new(b"OLD\x1b[2J\x1b[H"))
+            .unwrap();
+        session.finish_ansi_replay().unwrap();
+        session
+            .replay_ansi(&mut std::io::Cursor::new(b"FRESH-PROMPT"))
+            .unwrap();
+        assert!(
+            session
+                .take_snapshot()
+                .unwrap()
+                .visible_cells
+                .iter()
+                .map(|cell| cell.c)
+                .collect::<String>()
+                .contains("FRESH-PROMPT")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn 복원된_원격화면을_줄이면_프롬프트가_있는_아래쪽_행을_남긴다() {
+        let spec = CommandSpec {
+            program: "/bin/cat".into(),
+            args: Vec::new(),
+            env: Vec::new(),
+            cwd: None,
+        };
+        let mut session =
+            Session::spawn_with_spec(SessionId(26), SessionKind::Shell, &spec, 20, 6, 100).unwrap();
+        session
+            .replay_ansi(&mut std::io::Cursor::new(
+                b"ROW0\r\nROW1\r\nROW2\r\nROW3\r\nROW4\r\nPROMPT",
+            ))
+            .unwrap();
+        session.finish_ansi_replay().unwrap();
+        session.resize_checked(20, 3).unwrap();
+        let resized = session.take_snapshot().unwrap();
+        let rows = resized
+            .visible_cells
+            .chunks(20)
+            .map(|row| row.iter().map(|cell| cell.c).collect::<String>())
+            .collect::<Vec<_>>();
+        assert!(rows[0].starts_with("ROW3"), "{rows:?}");
+        assert!(rows[1].starts_with("ROW4"), "{rows:?}");
+        assert!(rows[2].starts_with("PROMPT"), "{rows:?}");
+        assert_eq!(resized.cursor.row, 2);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn 복원된_화면을_좁혀도_잘린_한글_셀을_남기지_않는다() {
+        let spec = CommandSpec {
+            program: "/bin/cat".into(),
+            args: Vec::new(),
+            env: Vec::new(),
+            cwd: None,
+        };
+        let mut session =
+            Session::spawn_with_spec(SessionId(31), SessionKind::Shell, &spec, 8, 6, 100).unwrap();
+        session
+            .replay_ansi(&mut std::io::Cursor::new("AB가".as_bytes()))
+            .unwrap();
+        session.finish_ansi_replay().unwrap();
+        let original = session.take_snapshot().unwrap();
+        assert!(original.visible_cells[2].wide);
+        assert!(original.visible_cells[3].wide_spacer);
+        session.resize_checked(3, 6).unwrap();
+        let narrow = session.take_snapshot().unwrap();
+        assert!(!narrow.visible_cells[2].wide);
+        assert!(!narrow.visible_cells[2].wide_spacer);
+        session.resize_checked(8, 6).unwrap();
+        assert_eq!(
+            session.take_snapshot().unwrap().visible_cells,
+            original.visible_cells
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn 복원_후_새_셸이_바로_종료되면_실패_출력을_보인다() {
+        let spec = CommandSpec {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "printf 'NEW-SHELL-FAILED\\n'; exit 17".into()],
+            env: Vec::new(),
+            cwd: None,
+        };
+        let mut session =
+            Session::spawn_with_spec(SessionId(32), SessionKind::Shell, &spec, 40, 6, 100).unwrap();
+        session
+            .replay_ansi(&mut std::io::Cursor::new(b"OLD-REMOTE-SCREEN"))
+            .unwrap();
+        session.finish_ansi_replay().unwrap();
+        wait(Duration::from_secs(5), || {
+            session.pump(|_| {}).just_exited.then_some(())
+        });
+        assert_eq!(
+            session.lifecycle(),
+            SessionLifecycle::Exited {
+                exit_code: Some(17)
+            }
+        );
+        let visible = session
+            .take_snapshot()
+            .unwrap()
+            .visible_cells
+            .iter()
+            .map(|cell| cell.c)
+            .collect::<String>();
+        assert!(visible.contains("NEW-SHELL-FAILED"), "{visible:?}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn 복원된_원격화면은_크기를_줄였다_늘려도_원본_셀을_복구한다() {
+        let spec = CommandSpec {
+            program: "/bin/cat".into(),
+            args: Vec::new(),
+            env: Vec::new(),
+            cwd: None,
+        };
+        let mut session =
+            Session::spawn_with_spec(SessionId(27), SessionKind::Shell, &spec, 20, 6, 100).unwrap();
+        session
+            .replay_ansi(&mut std::io::Cursor::new(
+                b"ROW0-LONG-TEXT\r\nROW1\r\nROW2\r\nROW3\r\nROW4\r\nPROMPT",
+            ))
+            .unwrap();
+        session.finish_ansi_replay().unwrap();
+        let original = session.take_snapshot().unwrap();
+        session.resize_checked(8, 3).unwrap();
+        session.resize_checked(20, 6).unwrap();
+        let restored = session.take_snapshot().unwrap();
+        assert_eq!(restored.visible_cells, original.visible_cells);
+        assert_eq!(restored.cursor, original.cursor);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn 복원된_화면의_보관_셀은_캐시_예산에_포함된다() {
+        let spec = CommandSpec {
+            program: "/bin/cat".into(),
+            args: Vec::new(),
+            env: Vec::new(),
+            cwd: None,
+        };
+        let mut session =
+            Session::spawn_with_spec(SessionId(30), SessionKind::Shell, &spec, 20, 6, 100).unwrap();
+        session
+            .replay_ansi(&mut std::io::Cursor::new(b"REMOTE-SCREEN"))
+            .unwrap();
+        session.finish_ansi_replay().unwrap();
+        let held_bytes = session
+            .cache_footprint()
+            .estimated_bytes
+            .saturating_sub(session.backend.cache_footprint().estimated_bytes);
+        assert!(held_bytes >= 20 * 6 * std::mem::size_of::<TerminalCell>());
+        session.resize_checked(10, 3).unwrap();
+        let resized_held_bytes = session
+            .cache_footprint()
+            .estimated_bytes
+            .saturating_sub(session.backend.cache_footprint().estimated_bytes);
+        assert!(resized_held_bytes > held_bytes);
+        session.scroll(0);
+        assert_eq!(
+            session.cache_footprint().estimated_bytes,
+            session.backend.cache_footprint().estimated_bytes
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn alt_screen의_마지막_행까지_복원_화면에_보인다() {
+        let spec = CommandSpec {
+            program: "/bin/cat".into(),
+            args: Vec::new(),
+            env: Vec::new(),
+            cwd: None,
+        };
+        let mut session =
+            Session::spawn_with_spec(SessionId(23), SessionKind::Shell, &spec, 20, 6, 100).unwrap();
+        session
+            .replay_ansi(&mut std::io::Cursor::new(
+                b"\x1b[?1049h\x1b[HROW0\r\nROW1\r\nROW2\r\nROW3\r\nROW4\r\nROW5",
+            ))
+            .unwrap();
+        session.finish_ansi_replay().unwrap();
+        let snapshot = session.take_snapshot().unwrap();
+        let rows = snapshot
+            .visible_cells
+            .chunks(20)
+            .map(|row| row.iter().map(|cell| cell.c).collect::<String>())
+            .collect::<Vec<_>>();
+        for (index, row) in rows.iter().enumerate() {
+            assert!(row.starts_with(&format!("ROW{index}")), "{rows:?}");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn 재실행된_에이전트는_새_출력을_바로_보인다() {
+        let spec = CommandSpec {
+            program: "/bin/cat".into(),
+            args: Vec::new(),
+            env: Vec::new(),
+            cwd: None,
+        };
+        let mut session =
+            Session::spawn_with_spec(SessionId(24), SessionKind::Agent, &spec, 40, 6, 100).unwrap();
+        session
+            .replay_ansi(&mut std::io::Cursor::new(b"OLD-AGENT"))
+            .unwrap();
+        session.finish_ansi_replay().unwrap();
+        session
+            .replay_ansi(&mut std::io::Cursor::new(b"\x1b[2J\x1b[HNEW-AGENT"))
+            .unwrap();
+        let visible = session
+            .take_snapshot()
+            .unwrap()
+            .visible_cells
+            .iter()
+            .map(|cell| cell.c)
+            .collect::<String>();
+        assert!(visible.contains("NEW-AGENT"), "{visible:?}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn 고정된_화면의_검색_스크롤좌표는_라이브_백엔드와_일치한다() {
+        let spec = CommandSpec {
+            program: "/bin/cat".into(),
+            args: Vec::new(),
+            env: Vec::new(),
+            cwd: None,
+        };
+        let mut session =
+            Session::spawn_with_spec(SessionId(25), SessionKind::Shell, &spec, 40, 6, 100).unwrap();
+        session
+            .replay_ansi(&mut std::io::Cursor::new(b"REMOTE-LAST-SCREEN"))
+            .unwrap();
+        session.finish_ansi_replay().unwrap();
+        session
+            .replay_ansi(&mut std::io::Cursor::new(
+                b"LOCAL-0\r\nLOCAL-1\r\nLOCAL-2\r\nLOCAL-3\r\nLOCAL-4\r\nLOCAL-5\r\nLOCAL-6",
+            ))
+            .unwrap();
+        session.backend.scroll(2);
+        let held = session.take_snapshot().unwrap();
+        let live_offset = session.backend.viewport_snapshot().unwrap().scroll_offset;
+        assert!(live_offset > 0);
+        assert_eq!(held.scroll_offset, live_offset);
+        assert!(
+            held.visible_cells
+                .iter()
+                .map(|cell| cell.c)
+                .collect::<String>()
+                .contains("REMOTE-LAST-SCREEN")
         );
     }
 

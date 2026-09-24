@@ -1,5 +1,16 @@
 # Deppy Sijo agent instructions
 
+## App restart permission
+
+- Never launch or relaunch Deppy as an automatic part of a code change, build,
+  test, or UI review.
+- Only stop the running app and launch a new one when the user explicitly asks
+  for a restart in the current task. A previous one-time restart request does
+  not authorize later tasks.
+- A request to rebuild or to inspect the UI does not authorize a restart.
+  `scripts/dev-run.sh` launches the app, so do not run it without that explicit
+  request. Build without launching when restart permission is absent.
+
 ## Terminal diagnostic output
 
 When a final agent response contains two or more independently actionable

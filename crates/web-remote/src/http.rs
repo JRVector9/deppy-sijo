@@ -35,6 +35,11 @@ impl RequestHead {
             .map(|(_, v)| v.as_str())
     }
 
+    /// Count duplicate headers for strict authenticated POST endpoints.
+    pub fn header_count(&self, name: &str) -> usize {
+        self.headers.iter().filter(|(n, _)| n == name).count()
+    }
+
     /// Content-Length 헤더를 파싱한다(POST 본문 길이). 없거나 기형이면 None.
     pub fn content_length(&self) -> Option<usize> {
         self.header("content-length")
@@ -152,6 +157,8 @@ impl Response {
 fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        202 => "Accepted",
+        503 => "Service Unavailable",
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",

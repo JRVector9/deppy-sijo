@@ -1,5 +1,7 @@
 //! Local, explicitly shared terminal MCP bridge. All effects stay on the App thread.
 mod history;
+mod oauth;
+pub use oauth::Approval;
 mod server;
 pub use history::{Claim, History, Record};
 use serde_json::{Value, json};
@@ -33,7 +35,7 @@ pub fn tools() -> Value {
     for (name, description, extra, required) in [
         (
             "send_text",
-            "Type into the exact shared session only if input is allowed. submit defaults false; true appends Enter. Control characters/newlines are rejected. queued means runtime admission, not execution/completion. Never automatically retry an unknown outcome.",
+            "Type into the exact shared session only if input is allowed. submit defaults false; true appends Enter. Control characters/newlines are rejected. queued means PTY queue admission, not execution/completion. Never automatically retry an unknown outcome.",
             json!({"text":{"type":"string","description":"Maximum 8192 UTF-8 bytes; no control characters or newlines"},"submit":{"type":"boolean","default":false}}),
             vec!["text"],
         ),

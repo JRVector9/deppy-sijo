@@ -15,3 +15,7 @@ web-remote = { path = "../web-remote" }
 subtle = "2"
 zeroize = "1"
 sha2.workspace = true
+
+base64 = "0.22"
+url = "2"
+secret = { path = "../secret" }

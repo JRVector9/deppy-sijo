@@ -30,7 +30,10 @@ struct Screen {
     text: String,
 }
 pub enum Effect {
-    Input(Vec<u8>),
+    Input {
+        operation_id: String,
+        bytes: Vec<u8>,
+    },
     Watch,
 }
 
@@ -44,6 +47,15 @@ pub enum Action {
     Start,
     Stop,
     Rotate,
+}
+
+struct PendingInput {
+    runtime: u64,
+    session: runtime::SessionId,
+    bytes: usize,
+    submit: bool,
+    deadline: std::time::Instant,
+    reply: Option<std::sync::mpsc::SyncSender<Result<Value, String>>>,
 }
 
 pub struct CloudAgent {
@@ -60,6 +72,8 @@ pub struct CloudAgent {
     screens: HashMap<String, Screen>,
     history: Option<History>,
     records: Vec<Record>,
+    pub answers: std::sync::Arc<[crate::ui::cloud_answer::Answer]>,
+    pending: HashMap<String, PendingInput>,
     redaction: secret::RedactionService,
     token_lease: Option<secret::RedactionLease>,
 }
@@ -90,6 +104,8 @@ impl CloudAgent {
             screens: HashMap::new(),
             history,
             records: vec![],
+            answers: std::sync::Arc::from([]),
+            pending: HashMap::new(),
             redaction,
             token_lease: None,
         }
@@ -104,7 +120,20 @@ impl CloudAgent {
     fn reload_history(&mut self) {
         if let Some(db) = &self.history {
             match db.recent() {
-                Ok(rows) => self.records = rows,
+                Ok(rows) => {
+                    self.answers = rows
+                        .iter()
+                        .filter(|r| r.tool == "notify" && !r.message.is_empty())
+                        .map(|r| crate::ui::cloud_answer::Answer {
+                            id: r.id.clone(),
+                            session: r.session.clone(),
+                            created: r.created,
+                            message: r.message.clone(),
+                        })
+                        .collect::<Vec<_>>()
+                        .into();
+                    self.records = rows;
+                }
                 Err(_) => self.error = Some("history_read_failed".into()),
             }
         }
@@ -200,7 +229,12 @@ impl CloudAgent {
                     return;
                 }
                 let wake = ctx.clone();
-                match Server::start(self.port, &self.hostname, move || wake.request_repaint()) {
+                match Server::start_with_redaction(
+                    self.port,
+                    &self.hostname,
+                    self.redaction.clone(),
+                    move || wake.request_repaint(),
+                ) {
                     Ok(server) => {
                         let token =
                             secret::SecretString::new(server.auth.token_for_user().to_string());
@@ -259,8 +293,67 @@ impl CloudAgent {
         } else {
             self.execute(&req, &mut send, &mut notice)
         };
-        let _ = req.reply.try_send(result);
+        if result.as_ref().is_ok_and(|v| v["status"] == "awaiting_pty") {
+            if let Some(p) = self
+                .pending
+                .get_mut(req.args["operation_id"].as_str().unwrap_or(""))
+            {
+                p.reply = Some(req.reply);
+            }
+        } else {
+            let _ = req.reply.try_send(result);
+        }
         notice
+    }
+    pub fn observe_input(&mut self, runtime: u64, events: &[runtime::RuntimeEvent]) {
+        for event in events {
+            let runtime::RuntimeEvent::InputAdmitted {
+                session,
+                operation_id,
+                result,
+            } = event
+            else {
+                continue;
+            };
+            if !self
+                .pending
+                .get(operation_id)
+                .is_some_and(|p| p.runtime == runtime && p.session == *session)
+            {
+                continue;
+            }
+            let p = self.pending.remove(operation_id).unwrap();
+            let outcome = match result {
+                Ok(()) => {
+                    json!({"status":"queued","admission":"pty_queue","bytes":p.bytes,"submit":p.submit,"retry":false,"completion":"not_confirmed"})
+                }
+                Err(reason) => {
+                    json!({"status":"rejected","error":format!("pty_{reason:?}"),"retry":false})
+                }
+            };
+            let receipt = self
+                .history
+                .as_ref()
+                .ok_or(())
+                .and_then(|db| db.finish(operation_id, &outcome, "").map_err(|_| ()))
+                .map(|()| outcome)
+                .map_err(|()| "outcome_unknown_do_not_retry_input".to_string());
+            if let Some(reply) = p.reply {
+                let _ = reply.try_send(receipt);
+            }
+            self.reload_history();
+        }
+    }
+    pub fn expire_pending(&mut self) {
+        // Allow late results to update receipts for a bounded grace period.
+        // Unknown operations retain their tombstone and are never retyped.
+        self.pending.retain(|_, p| {
+            let expired = std::time::Instant::now() >= p.deadline;
+            if expired && let Some(reply) = p.reply.take() {
+                let _ = reply.try_send(Err("outcome_unknown_do_not_retry_input".into()));
+            }
+            std::time::Instant::now() < p.deadline + std::time::Duration::from_secs(30)
+        });
     }
     fn execute(
         &mut self,
@@ -286,12 +379,15 @@ impl CloudAgent {
             return Err("invalid_arguments".into());
         }
         if req.tool == "list_sessions" {
-            let sessions:Vec<_>=self.targets.iter().filter_map(|t|self.grants.get(&t.id).map(|g| json!({"session_id":t.id,"generation":t.generation,"workspace":t.workspace,"workspace_name":t.workspace_name,"title":t.title,"input_allowed":g.input&&t.live,"live":t.live}))).collect();
+            let sessions:Vec<_>=self.targets.iter().filter_map(|t|self.grants.get(&t.id).map(|g| json!({"session_id":t.id,"generation":t.generation,"workspace":t.workspace,"workspace_name":t.workspace_name,"title":t.title,"input_allowed":g.input&&t.live&&req.input_scope,"live":t.live}))).collect();
             return Ok(json!({"sessions":sessions}));
         }
         let id = field(a, "session_id", 128)?;
         let generation = field(a, "generation", 192)?;
         let is_input = matches!(req.tool.as_str(), "send_text" | "send_ctrl_c");
+        if is_input && !req.input_scope {
+            return Err("oauth_input_scope_required".into());
+        }
         let t = self.authorize(id, generation, is_input)?;
         if req.tool == "read_output" {
             // Existing bounded visibility lease keeps hidden/warm terminal screens fresh.
@@ -340,6 +436,9 @@ impl CloudAgent {
         } else {
             None
         };
+        if bytes.is_some() && self.pending.len() >= 16 {
+            return Err("busy_no_effect".into());
+        }
         let db = self
             .history
             .as_ref()
@@ -357,9 +456,27 @@ impl CloudAgent {
         }
         let outcome = if let Some(bytes) = bytes {
             let size = bytes.len();
-            match send(&t, Effect::Input(bytes)) {
+            match send(
+                &t,
+                Effect::Input {
+                    operation_id: op.to_owned(),
+                    bytes,
+                },
+            ) {
                 Ok(()) => {
-                    json!({"status":"queued","bytes":size,"submit":submit,"retry":false,"completion":"not_confirmed"})
+                    self.pending.insert(
+                        op.to_owned(),
+                        PendingInput {
+                            runtime: t.runtime,
+                            session: t.session,
+                            bytes: size,
+                            submit,
+                            deadline: req.deadline,
+                            reply: None,
+                        },
+                    );
+                    // Claim remains durable unknown until the worker responds.
+                    return Ok(json!({"status":"awaiting_pty"}));
                 }
                 Err(code) => json!({"status":"rejected","error":code,"retry":false}),
             }
@@ -506,6 +623,7 @@ mod integration_tests {
         (
             Request {
                 epoch,
+                input_scope: true,
                 deadline: Instant::now() + Duration::from_secs(3),
                 tool: tool.into(),
                 args,
@@ -544,13 +662,21 @@ mod integration_tests {
             assert_eq!(target.id, t.id);
             assert_eq!(target.workspace, t.workspace);
             assert_eq!(target.runtime, t.runtime);
-            let Effect::Input(bytes) = effect else {
+            let Effect::Input { bytes, .. } = effect else {
                 panic!()
             };
             assert_eq!(bytes, b"pwd\r");
             effects += 1;
             Ok(())
         });
+        b.observe_input(
+            t.runtime,
+            &[runtime::RuntimeEvent::InputAdmitted {
+                session: t.session,
+                operation_id: "input-1".into(),
+                result: Ok(()),
+            }],
+        );
         assert_eq!(rx.recv().unwrap().unwrap()["status"], "queued");
         let (req, rx) = request(&b, "send_text", args);
         b.handle(req, |_, _| {
@@ -572,6 +698,65 @@ mod integration_tests {
         assert_eq!(rx.recv().unwrap().unwrap()["status"], "stored");
         assert_eq!(b.records.iter().filter(|r| r.tool == "notify").count(), 1);
         assert_eq!(b.records[0].message, "그록봇 자체 답변\n분석 완료");
+    }
+    #[test]
+    fn input_waits_for_correlated_pty_result_and_read_only_oauth_cannot_type() {
+        let (mut b, t) = setup();
+        b.allow_input(&t.id, true);
+        let args = json!({"session_id":t.id,"generation":t.generation,"operation_id":"rejected-input","text":"pwd"});
+        let (mut req, rx) = request(&b, "send_text", args.clone());
+        req.input_scope = false;
+        b.handle(req, |_, _| panic!("read-only token typed"));
+        assert!(rx.recv().unwrap().is_err());
+        let (req, rx) = request(&b, "send_text", args.clone());
+        let mut writes = 0;
+        b.handle(req, |_, _| {
+            writes += 1;
+            Ok(())
+        });
+        assert!(rx.try_recv().is_err());
+        let ack = runtime::RuntimeEvent::InputAdmitted {
+            session: t.session,
+            operation_id: "rejected-input".into(),
+            result: Err(runtime::PtyInputRejectReason::QueueFull),
+        };
+        b.observe_input(t.runtime + 1, std::slice::from_ref(&ack));
+        assert!(rx.try_recv().is_err());
+        b.observe_input(t.runtime, &[ack]);
+        assert_eq!(rx.recv().unwrap().unwrap()["status"], "rejected");
+        let (req, rx) = request(&b, "send_text", args);
+        b.handle(req, |_, _| {
+            writes += 1;
+            Ok(())
+        });
+        assert_eq!(rx.recv().unwrap().unwrap()["status"], "rejected");
+        assert_eq!(writes, 1);
+        let (req, rx) = request(
+            &b,
+            "send_text",
+            json!({"session_id":t.id,"generation":t.generation,"operation_id":"unknown-input","text":"pwd"}),
+        );
+        b.handle(req, |_, _| Ok(()));
+        b.pending.get_mut("unknown-input").unwrap().deadline =
+            Instant::now() - Duration::from_secs(1);
+        b.expire_pending();
+        assert!(rx.recv().unwrap().is_err());
+        b.observe_input(
+            t.runtime,
+            &[runtime::RuntimeEvent::InputAdmitted {
+                session: t.session,
+                operation_id: "unknown-input".into(),
+                result: Ok(()),
+            }],
+        );
+        assert!(
+            b.records
+                .iter()
+                .find(|r| r.id == "unknown-input")
+                .unwrap()
+                .outcome
+                .contains("pty_queue")
+        );
     }
     #[test]
     fn revoked_or_expired_requests_cannot_type_or_store_answers() {
@@ -679,6 +864,239 @@ mod http_end_to_end_tests {
         serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap()
     }
     #[test]
+    fn oauth_http_to_real_pty_output_and_own_answer_roundtrip() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        use runtime::{RuntimeCommandSink as _, RuntimeEventStream as _};
+        use sha2::{Digest, Sha256};
+        struct NoSecrets;
+        impl runtime::RuntimeSecretResolver for NoSecrets {
+            fn resolve(&self, _: &str) -> anyhow::Result<runtime::RuntimeSecret> {
+                anyhow::bail!("unused")
+            }
+        }
+        let logs = std::env::temp_dir().join(format!("deppy-cloud-pty-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&logs).unwrap();
+        let factory = runtime::InProcessRuntimeHostFactory::new(
+            std::sync::Arc::new(NoSecrets),
+            secret::RedactionService::new(),
+        );
+        let host = factory
+            .create_client(runtime::RuntimeHostConfig {
+                scrollback_policy: None,
+                output_batch_ms: 5,
+                logs_root: logs.clone(),
+                persist: None,
+                cwd: Some(logs.clone()),
+                extra_env: vec![],
+            })
+            .unwrap();
+        let events = host.subscribe();
+        host.send_command(runtime::RuntimeCommand::SpawnShell {
+            cols: 100,
+            rows: 24,
+            scrollback_lines: 100,
+        })
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let session = loop {
+            if let Some(session) = events.drain().iter().find_map(|e| match e {
+                runtime::RuntimeEvent::ShellSpawned { session } => Some(*session),
+                _ => None,
+            }) {
+                break session;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let mut bridge = CloudAgent::memory();
+        bridge.server = Some(Server::start(0, "", || {}).unwrap());
+        let mut target = Target::fixture("real-session", "real-generation");
+        target.session = session;
+        target.screen = None;
+        bridge.set_targets(vec![target.clone()]);
+        bridge.share(&target, true);
+        bridge.allow_input(&target.id, true);
+        let server = bridge.server.as_ref().unwrap();
+        let addr = server.addr;
+        fn http(
+            addr: std::net::SocketAddr,
+            method: &str,
+            path: &str,
+            kind: &str,
+            body: &str,
+        ) -> String {
+            let mut s = TcpStream::connect(addr).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            write!(s,"{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\n\r\n{body}",body.len()).unwrap();
+            let mut out = String::new();
+            s.read_to_string(&mut out).unwrap();
+            out
+        }
+        let register = http(
+            addr,
+            "POST",
+            "/oauth/register",
+            "application/json",
+            r#"{"client_name":"Fixture Bot","redirect_uris":["http://127.0.0.1:23456/callback"]}"#,
+        );
+        let client: Value =
+            serde_json::from_str(register.split_once("\r\n\r\n").unwrap().1).unwrap();
+        let verifier = "v".repeat(43);
+        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(&verifier));
+        let resource = format!("http://{addr}/mcp");
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs([
+                ("client_id", client["client_id"].as_str().unwrap()),
+                ("redirect_uri", "http://127.0.0.1:23456/callback"),
+                ("resource", &resource),
+                ("response_type", "code"),
+                ("code_challenge_method", "S256"),
+                ("code_challenge", &challenge),
+                ("scope", "deppy.read deppy.input"),
+            ])
+            .finish();
+        assert!(
+            http(addr, "GET", &format!("/oauth/authorize?{query}"), "", "")
+                .starts_with("HTTP/1.1 200")
+        );
+        let approval = server.auth.approvals().pop().unwrap();
+        assert!(server.auth.approve(&approval.id, true));
+        let redirect = http(
+            addr,
+            "GET",
+            &format!("/oauth/authorize?request={}", approval.id),
+            "",
+            "",
+        );
+        let location = redirect
+            .lines()
+            .find_map(|l| l.strip_prefix("Location: "))
+            .unwrap();
+        let code = url::Url::parse(location)
+            .unwrap()
+            .query_pairs()
+            .find(|(k, _)| k == "code")
+            .unwrap()
+            .1
+            .into_owned();
+        let form = url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs([
+                ("grant_type", "authorization_code"),
+                ("client_id", client["client_id"].as_str().unwrap()),
+                ("redirect_uri", "http://127.0.0.1:23456/callback"),
+                ("resource", &resource),
+                ("code", &code),
+                ("code_verifier", &verifier),
+            ])
+            .finish();
+        let token_response = http(
+            addr,
+            "POST",
+            "/oauth/token",
+            "application/x-www-form-urlencoded",
+            &form,
+        );
+        let tokens: Value =
+            serde_json::from_str(token_response.split_once("\r\n\r\n").unwrap().1).unwrap();
+        let token = tokens["access_token"].as_str().unwrap().to_owned();
+        let client = std::thread::spawn(move || {
+            let args = json!({"session_id":"real-session","generation":"real-generation","operation_id":"real-input","text":"printf 'DEPPY_%s\\n' REAL_OUTPUT","submit":true});
+            let response = rpc(addr, &token, 1, "send_text", args.clone());
+            assert_eq!(response["result"]["isError"], false);
+            let result: Value =
+                serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                    .unwrap();
+            assert_eq!(result["admission"], "pty_queue");
+            assert_eq!(
+                rpc(addr, &token, 2, "send_text", args)["result"]["isError"],
+                false
+            );
+            let mut found = false;
+            for n in 0..40 {
+                let r = rpc(
+                    addr,
+                    &token,
+                    10 + n,
+                    "read_output",
+                    json!({"session_id":"real-session","generation":"real-generation"}),
+                );
+                let r: Value =
+                    serde_json::from_str(r["result"]["content"][0]["text"].as_str().unwrap())
+                        .unwrap();
+                if r["screen"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("DEPPY_REAL_OUTPUT"))
+                {
+                    found = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            assert!(found, "executed output must return from the real PTY");
+            assert_eq!(
+                rpc(
+                    addr,
+                    &token,
+                    100,
+                    "notify",
+                    json!({"session_id":"real-session","generation":"real-generation","operation_id":"real-answer","message":"Grok own final answer"})
+                )["result"]["isError"],
+                false
+            );
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let mut writes = 0;
+        let mut notice = false;
+        while !client.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "real roundtrip timed out"
+            );
+            let batch = events.drain();
+            bridge.observe_input(target.runtime, &batch);
+            for e in &batch {
+                if let Some((_, snapshot, _, _)) = e.viewport() {
+                    target.screen = Some(screen_text(snapshot));
+                }
+            }
+            bridge.set_targets(vec![target.clone()]);
+            while let Some(req) = bridge.next_request() {
+                notice |= bridge
+                    .handle(req, |t, e| {
+                        let command = match e {
+                            Effect::Input {
+                                operation_id,
+                                bytes,
+                            } => {
+                                writes += 1;
+                                runtime::RuntimeCommand::WriteInputTracked {
+                                    session: t.session,
+                                    operation_id,
+                                    bytes,
+                                }
+                            }
+                            Effect::Watch => runtime::RuntimeCommand::SetRemoteViewing {
+                                session: t.session,
+                                viewing: true,
+                                ttl_ms: 15000,
+                            },
+                        };
+                        host.send_command(command)
+                            .map_err(|_| "runtime_error".into())
+                    })
+                    .is_some();
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        client.join().unwrap();
+        assert_eq!(writes, 1);
+        assert!(notice);
+        assert_eq!(bridge.answers[0].message, "Grok own final answer");
+        drop(host);
+        drop(bridge);
+        std::fs::remove_dir_all(logs).unwrap();
+    }
+    #[test]
     fn http_client_reads_types_interrupts_and_delivers_its_own_answer_to_original_session() {
         let mut bridge = CloudAgent::memory();
         bridge.server = Some(Server::start(0, "", || {}).unwrap());
@@ -758,7 +1176,7 @@ mod http_end_to_end_tests {
             }
             if let Some(notice) = bridge.handle(req, |t, e| {
                 assert_eq!(t.id, "original-session");
-                if let Effect::Input(bytes) = e {
+                if let Effect::Input { bytes, .. } = e {
                     input_bytes.push(bytes);
                 }
                 Ok(())
@@ -766,6 +1184,16 @@ mod http_end_to_end_tests {
                 assert_eq!(notice.message, "Grok 자체 답변입니다");
                 notices += 1;
             }
+            let acknowledgements: Vec<_> = bridge
+                .pending
+                .iter()
+                .map(|(op, p)| runtime::RuntimeEvent::InputAdmitted {
+                    session: p.session,
+                    operation_id: op.clone(),
+                    result: Ok(()),
+                })
+                .collect();
+            bridge.observe_input(target.runtime, &acknowledgements);
         }
         client.join().unwrap();
         assert_eq!(input_bytes, vec![b"pwd\r".to_vec(), vec![3]]);

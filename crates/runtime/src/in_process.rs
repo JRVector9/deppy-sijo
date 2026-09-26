@@ -1820,6 +1820,35 @@ impl Worker {
         }
     }
 
+    fn admit_input(
+        &mut self,
+        session: SessionId,
+        bytes: &[u8],
+    ) -> Result<(), pty::PtyInputRejectReason> {
+        let Some(active) = self.sessions.get_mut(&session) else {
+            return Err(pty::PtyInputRejectReason::SessionClosed);
+        };
+        match active.write_input(bytes) {
+            Some(pty::PtyInputEnqueueResult::Accepted) => {
+                if let Some(detector) = self.detectors.get_mut(&session) {
+                    detector.on_user_input(bytes);
+                }
+                Ok(())
+            }
+            Some(pty::PtyInputEnqueueResult::Backpressured { pressure }) => {
+                self.pressured_sessions.insert(session);
+                self.emit(RuntimeEvent::PtyInputPressure { session, pressure });
+                Err(pty::PtyInputRejectReason::QueueFull)
+            }
+            Some(pty::PtyInputEnqueueResult::Rejected { pressure }) => {
+                let reason = pressure.reason;
+                self.emit(RuntimeEvent::PtyInputPressure { session, pressure });
+                Err(reason)
+            }
+            None => Err(pty::PtyInputRejectReason::WriterUnavailable),
+        }
+    }
+
     fn handle_command_inner(&mut self, mut command: RuntimeCommand) {
         // All production senders already use this primitive before queue retention. Reapplying it
         // here is an idempotent defense for direct/internal producers and preserves fail-closed
@@ -2111,27 +2140,19 @@ impl Worker {
                 }
             }
             RuntimeCommand::WriteInput { session, bytes } => {
-                if let Some(active) = self.sessions.get_mut(&session) {
-                    match active.write_input(&bytes) {
-                        Some(pty::PtyInputEnqueueResult::Accepted) => {
-                            // 사용자 입력 = 화면 프롬프트에 대한 응답 신호 (status detector)
-                            if let Some(detector) = self.detectors.get_mut(&session) {
-                                detector.on_user_input(&bytes);
-                            }
-                        }
-                        Some(pty::PtyInputEnqueueResult::Backpressured { pressure }) => {
-                            self.pressured_sessions.insert(session);
-                            self.emit(RuntimeEvent::PtyInputPressure { session, pressure });
-                        }
-                        Some(pty::PtyInputEnqueueResult::Rejected { pressure }) => {
-                            // PayloadTooLarge/closed/writer 없음은 큐가 빠지면 회복되는 상태가
-                            // 아니다. resolution poll에 넣으면 즉시 QueueFull(queued=0)이
-                            // 최신값 slot을 덮어 원래 거부 원인을 잃는다.
-                            self.emit(RuntimeEvent::PtyInputPressure { session, pressure });
-                        }
-                        None => {}
-                    }
-                }
+                let _ = self.admit_input(session, &bytes);
+            }
+            RuntimeCommand::WriteInputTracked {
+                session,
+                operation_id,
+                bytes,
+            } => {
+                let result = self.admit_input(session, &bytes);
+                self.emit(RuntimeEvent::InputAdmitted {
+                    session,
+                    operation_id,
+                    result,
+                });
             }
             RuntimeCommand::SetUserStatusOverride { session, override_ } => {
                 if !self.sessions.contains_key(&session) {
@@ -9583,6 +9604,120 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn tracked_input_reports_actual_pty_queue_pressure() {
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("tracked-pressure"),
+            RedactionService::new(),
+            spec("/bin/sh", &["-c", "sleep 30"]),
+            None,
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        let session = probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::ShellSpawned { session } => Some(*session),
+            _ => None,
+        });
+        let mut rejected = false;
+        for n in 0..4 {
+            let id = format!("pressure-{n}");
+            client
+                .send_command(RuntimeCommand::WriteInputTracked {
+                    session,
+                    operation_id: id.clone(),
+                    bytes: vec![b'x'; pty::PtyInputQueuePolicy::default().max_bytes],
+                })
+                .unwrap();
+            let result = probe.wait_for(Duration::from_secs(15), |e| match e {
+                RuntimeEvent::InputAdmitted {
+                    operation_id,
+                    result,
+                    ..
+                } if operation_id == &id => Some(*result),
+                _ => None,
+            });
+            if result == Err(pty::PtyInputRejectReason::QueueFull) {
+                rejected = true;
+                break;
+            }
+            assert_eq!(result, Ok(()));
+        }
+        assert!(rejected, "PTY saturation must yield a correlated rejection");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn tracked_input_reports_real_pty_admission_rejection_and_output() {
+        let mut client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("tracked-admission"),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+            None,
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        let session = probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::ShellSpawned { session } => Some(*session),
+            _ => None,
+        });
+        client
+            .send_command(RuntimeCommand::WriteInputTracked {
+                session,
+                operation_id: "accepted".into(),
+                bytes: b"TRACKED_ROUNDTRIP\r".to_vec(),
+            })
+            .unwrap();
+        let result = probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::InputAdmitted {
+                operation_id,
+                result,
+                ..
+            } if operation_id == "accepted" => Some(*result),
+            _ => None,
+        });
+        assert_eq!(result, Ok(()));
+        probe.wait_for(Duration::from_secs(15), |e| {
+            e.viewport()
+                .and_then(|(_, s, _, _)| snapshot_contains(s, "TRACKED_ROUNDTRIP").then_some(()))
+        });
+        client
+            .send_command(RuntimeCommand::WriteInputTracked {
+                session: SessionId(u64::MAX),
+                operation_id: "missing".into(),
+                bytes: b"ignored".to_vec(),
+            })
+            .unwrap();
+        assert_eq!(
+            probe.wait_for(Duration::from_secs(15), |e| match e {
+                RuntimeEvent::InputAdmitted {
+                    operation_id,
+                    result,
+                    ..
+                } if operation_id == "missing" => Some(*result),
+                _ => None,
+            }),
+            Err(pty::PtyInputRejectReason::SessionClosed)
+        );
+        client.shutdown();
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn input_pressure_events_are_coalesced_per_session() {
         let client = InProcessRuntimeClient::with_shell(
             5,
@@ -9621,14 +9756,29 @@ mod tests {
         // 큐로 옮길 때까지의 유일한 동기화라 느린 공유 CI 러너에서 실패할 수 있어,
         // 첫 압박 이벤트("큐 가득"의 관측 가능한 신호)까지 쓰기를 반복한다 (2026-08-04).
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        // A rejected runtime admission has no PTY effect. Retry only that
+        // explicit outcome; accepted writes are never retried here.
+        let send_saturated = || loop {
+            match client.send_command(RuntimeCommand::WriteInput {
+                session,
+                bytes: saturated.clone(),
+            }) {
+                Ok(()) => break,
+                Err(error)
+                    if matches!(
+                        error.downcast_ref::<RuntimeCommandSendError>(),
+                        Some(RuntimeCommandSendError::Backpressure)
+                    ) =>
+                {
+                    assert!(Instant::now() < deadline, "runtime admission stayed full");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("runtime input admission failed: {error:#}"),
+            }
+        };
         let mut sent = 0usize;
         loop {
-            client
-                .send_command(RuntimeCommand::WriteInput {
-                    session,
-                    bytes: saturated.clone(),
-                })
-                .unwrap();
+            send_saturated();
             sent += 1;
             if probe.rx.drain().iter().any(pressure_for_session) {
                 break;
@@ -9648,12 +9798,7 @@ mod tests {
         // 더 발행되지 않아야 한다. command_budget이 0이면 워커가 명령을 전부 소비한
         // 것이고, 그 시점에 발행될 이벤트는 이미 채널에 있다.
         for _ in 0..8 {
-            client
-                .send_command(RuntimeCommand::WriteInput {
-                    session,
-                    bytes: saturated.clone(),
-                })
-                .unwrap();
+            send_saturated();
             while client.command_budget.retained_bytes() != 0 {
                 assert!(
                     std::time::Instant::now() < deadline,

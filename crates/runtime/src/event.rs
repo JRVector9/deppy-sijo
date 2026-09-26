@@ -241,6 +241,12 @@ pub enum RuntimeEvent {
         session: Option<SessionId>,
         revision: Option<u64>,
     },
+    /// Durable correlated result. No input bytes cross the event boundary.
+    InputAdmitted {
+        session: SessionId,
+        operation_id: String,
+        result: Result<(), pty::PtyInputRejectReason>,
+    },
 }
 
 impl RuntimeEvent {
@@ -507,6 +513,7 @@ mod tests {
                 "ResizeFailed",
                 "ViewportTracked",
                 "EnvironmentApplied",
+                "InputAdmitted",
             ]
         );
     }

@@ -1819,6 +1819,8 @@ impl ProtocolRetryBackoff {
 
 pub struct WorkspaceUi {
     mux: Option<Arc<MuxSnapshot>>,
+    pub cloud_answers: Arc<[crate::ui::cloud_answer::Answer]>,
+    pub selected_cloud_answer: Option<String>,
     sessions: HashMap<SessionId, SessionView>,
     /// Runtime이 per-session shell metadata를 제공하기 전까지 path insert quoting에 쓰는
     /// workspace 기본 shell kind.
@@ -2850,6 +2852,8 @@ impl WorkspaceUi {
     pub fn new() -> Self {
         Self {
             mux: None,
+            cloud_answers: Arc::from([]),
+            selected_cloud_answer: None,
             sessions: HashMap::new(),
             shell_kind: crate::ui::file_tree::default_shell_kind(),
             preedit: String::new(),
@@ -5144,7 +5148,7 @@ impl WorkspaceUi {
                         search.scroll_to_current = !search.matches.is_empty();
                     }
                 }
-                RuntimeEvent::EnvironmentApplied { .. } => {}
+                RuntimeEvent::EnvironmentApplied { .. } | RuntimeEvent::InputAdmitted { .. } => {}
                 RuntimeEvent::LastOutputExtracted {
                     session,
                     text,
@@ -6932,6 +6936,16 @@ impl WorkspaceUi {
             ui.label(catalog.t("workspace.no_session", &[]));
             return render_output;
         };
+
+        if let Some(id) = &pane.persistent_session_id {
+            crate::ui::cloud_answer::contents(
+                ui,
+                &self.cloud_answers,
+                id,
+                &mut self.selected_cloud_answer,
+                catalog,
+            );
+        }
 
         // 터미널 폰트는 UI 배율(zoom_factor)로 같이 커지므로 font_size를 배율로 역보정해
         // 물리 크기를 유지한다(UI만 스케일, 터미널 독립 — 2026-07-13). cell_size·draw가

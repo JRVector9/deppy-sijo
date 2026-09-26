@@ -26,14 +26,19 @@ struct Credential {
     token: Zeroizing<String>,
     epoch: u64,
     expires: u64,
+    oauth: crate::oauth::OAuth,
 }
 pub struct Auth(Mutex<Credential>);
 impl Auth {
     pub fn new_at(time: u64) -> Self {
+        Self::with_redaction(time, secret::RedactionService::new())
+    }
+    fn with_redaction(time: u64, redaction: secret::RedactionService) -> Self {
         Self(Mutex::new(Credential {
             token: make_token(),
             epoch: 1,
             expires: time + TOKEN_TTL,
+            oauth: crate::oauth::OAuth::new(redaction),
         }))
     }
     pub fn token_for_user(&self) -> Zeroizing<String> {
@@ -44,6 +49,7 @@ impl Auth {
     }
     pub fn rotate_at(&self, time: u64) {
         let mut c = self.0.lock().unwrap();
+        c.oauth.clear();
         c.token = make_token();
         c.epoch += 1;
         c.expires = time + TOKEN_TTL;
@@ -52,15 +58,48 @@ impl Auth {
         let mut c = self.0.lock().unwrap();
         c.epoch += 1;
         c.expires = 0;
+        c.oauth.clear();
         c.token = Zeroizing::new(String::new());
     }
     pub fn authenticate(&self, header: &str, time: u64) -> Option<u64> {
+        self.authenticate_scoped(header, time)
+            .map(|(epoch, _)| epoch)
+    }
+    fn authenticate_scoped(&self, header: &str, time: u64) -> Option<(u64, bool)> {
         let supplied = header.strip_prefix("Bearer ")?;
         let c = self.0.lock().ok()?;
-        (time < c.expires
-            && !supplied.is_empty()
-            && bool::from(c.token.as_bytes().ct_eq(supplied.as_bytes())))
-        .then_some(c.epoch)
+        if time >= c.expires || supplied.is_empty() {
+            return None;
+        }
+        if bool::from(c.token.as_bytes().ct_eq(supplied.as_bytes())) {
+            return Some((c.epoch, true));
+        }
+        c.oauth
+            .authenticate(supplied, time)
+            .map(|input| (c.epoch, input))
+    }
+    pub fn approvals(&self) -> Vec<crate::Approval> {
+        let mut c = self.0.lock().unwrap();
+        if now() >= c.expires {
+            return vec![];
+        }
+        c.oauth.approvals(now())
+    }
+    pub fn approve(&self, id: &str, allow: bool) -> bool {
+        let mut c = self.0.lock().unwrap();
+        now() < c.expires && c.oauth.approve(id, allow, now())
+    }
+    fn oauth_route(
+        &self,
+        h: &http::RequestHead,
+        body: &[u8],
+        base: &str,
+        headers: &mut Vec<(String, String)>,
+        wake: &dyn Fn(),
+    ) -> Response {
+        let mut c = self.0.lock().unwrap();
+        let expiry = c.expires;
+        c.oauth.route(h, body, base, now(), expiry, headers, wake)
     }
     pub fn current(&self, epoch: u64, time: u64) -> bool {
         let c = self.0.lock().unwrap();
@@ -78,6 +117,7 @@ fn make_token() -> Zeroizing<String> {
 // No Debug: args may contain secrets and private answers.
 pub struct Request {
     pub epoch: u64,
+    pub input_scope: bool,
     pub deadline: Instant,
     pub tool: String,
     pub args: Value,
@@ -101,11 +141,19 @@ impl Server {
         public_host: &str,
         wake: impl Fn() + Send + Sync + 'static,
     ) -> anyhow::Result<Self> {
+        Self::start_with_redaction(port, public_host, secret::RedactionService::new(), wake)
+    }
+    pub fn start_with_redaction(
+        port: u16,
+        public_host: &str,
+        redaction: secret::RedactionService,
+        wake: impl Fn() + Send + Sync + 'static,
+    ) -> anyhow::Result<Self> {
         anyhow::ensure!(valid_public_host(public_host), "invalid_public_hostname");
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))?;
         listener.set_nonblocking(true)?;
         let addr = listener.local_addr()?;
-        let auth = Arc::new(Auth::new_at(now()));
+        let auth = Arc::new(Auth::with_redaction(now(), redaction));
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, requests) = mpsc::sync_channel(16);
         let (a, s, w) = (auth.clone(), stop.clone(), Arc::new(wake));
@@ -117,6 +165,12 @@ impl Server {
                 while !s.load(Ordering::Acquire) {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
+                            // macOS accepted sockets inherit listener O_NONBLOCK.
+                            // DeadlineReader needs blocking reads with bounded timeouts.
+                            if stream.set_nonblocking(false).is_err() {
+                                continue;
+                            }
+                            let _ = stream.set_write_timeout(Some(REQUEST_TIMEOUT));
                             if active.load(Ordering::Acquire) >= 4 {
                                 let _ = http::write_response(
                                     &mut stream,
@@ -200,8 +254,9 @@ fn handle(
     tx: &SyncSender<Request>,
     wake: &dyn Fn(),
 ) {
-    let response = process(stream, addr, public, auth, tx, wake);
-    let _ = http::write_response(stream, &response);
+    let mut headers = Vec::new();
+    let response = process(stream, addr, public, auth, tx, wake, &mut headers);
+    let _ = http::write_response_with_headers(stream, &response, &headers);
 }
 struct DeadlineReader<'a> {
     stream: &'a mut TcpStream,
@@ -226,6 +281,7 @@ fn process(
     auth: &Auth,
     tx: &SyncSender<Request>,
     wake: &dyn Fn(),
+    headers: &mut Vec<(String, String)>,
 ) -> Response {
     let mut reader = BufReader::new(DeadlineReader {
         stream,
@@ -234,9 +290,6 @@ fn process(
     let Ok(head) = http::read_request_head(&mut reader) else {
         return Response::plain(400, "invalid_request");
     };
-    if head.path != "/mcp" || !head.query.is_empty() {
-        return Response::plain(404, "not_found");
-    }
     let local = addr.to_string();
     let localhost = format!("localhost:{}", addr.port());
     if head.header_count("host") != 1
@@ -255,10 +308,44 @@ fn process(
     {
         return Response::plain(403, "invalid_origin");
     }
+    let base = if public.is_empty() {
+        format!("http://{addr}")
+    } else {
+        format!("https://{public}")
+    };
+    if head.path.starts_with("/.well-known/") || head.path.starts_with("/oauth/") {
+        let body = if head.method == "POST" {
+            if head.header("transfer-encoding").is_some()
+                || head.header_count("content-length") != 1
+                || head.header_count("content-type") != 1
+            {
+                return Response::plain(400, "invalid_request");
+            }
+            let Some(len) = head.content_length().filter(|l| *l <= 8192) else {
+                return Response::plain(413, "body_size");
+            };
+            let Ok(body) = http::read_body(&mut reader, len) else {
+                return Response::plain(400, "truncated_body");
+            };
+            body
+        } else {
+            vec![]
+        };
+        return auth.oauth_route(&head, &body, &base, headers, wake);
+    }
+    if head.path != "/mcp" || !head.query.is_empty() {
+        return Response::plain(404, "not_found");
+    }
+    headers.push((
+        "WWW-Authenticate".into(),
+        format!("Bearer resource_metadata=\"{base}/.well-known/oauth-protected-resource/mcp\""),
+    ));
     if head.header_count("authorization") != 1 {
         return Response::plain(401, "bearer_token_required");
     }
-    let Some(epoch) = auth.authenticate(head.header("authorization").unwrap_or(""), now()) else {
+    let Some((epoch, input_scope)) =
+        auth.authenticate_scoped(head.header("authorization").unwrap_or(""), now())
+    else {
         return Response::plain(401, "invalid_or_expired_token");
     };
     if head.method != "POST" {
@@ -343,6 +430,7 @@ fn process(
             let (reply, rx) = mpsc::sync_channel(1);
             let req = Request {
                 epoch,
+                input_scope,
                 deadline: Instant::now() + Duration::from_secs(3),
                 tool: tool.into(),
                 args,

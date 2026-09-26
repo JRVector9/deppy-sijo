@@ -189,21 +189,6 @@ fn notifications_and_responses_use_202_without_a_body() {
     );
 }
 
-#[cfg(unix)]
-#[test]
-fn history_database_symlinks_are_rejected() {
-    let dir = std::env::temp_dir().join(format!("deppy-mcp-link-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir(&dir).unwrap();
-    let path = dir.join("real.db");
-    drop(History::open(&path).unwrap());
-    let link = dir.join("link.db");
-    std::os::unix::fs::symlink(&path, &link).unwrap();
-    assert!(History::open(&link).is_err());
-    std::fs::remove_file(link).unwrap();
-    std::fs::remove_file(path).unwrap();
-    std::fs::remove_dir(dir).unwrap();
-}
-
 #[test]
 fn notified_answers_survive_input_audit_churn_and_expire_with_newer_answers() {
     let db = History::open_memory().unwrap();
@@ -262,6 +247,19 @@ fn notified_answers_survive_input_audit_churn_and_expire_with_newer_answers() {
 }
 
 #[cfg(unix)]
+#[test]
+fn history_database_symlinks_are_rejected() {
+    let dir = std::env::temp_dir().join(format!("deppy-mcp-link-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("real.db");
+    drop(History::open(&path).unwrap());
+    let link = dir.join("link.db");
+    std::os::unix::fs::symlink(&path, &link).unwrap();
+    assert!(History::open(&link).is_err());
+    std::fs::remove_file(link).unwrap();
+    std::fs::remove_file(path).unwrap();
+    std::fs::remove_dir(dir).unwrap();
+}
 
 #[test]
 fn answer_retention_uses_completion_order() {
@@ -290,6 +288,26 @@ fn answer_retention_uses_completion_order() {
             .message
             .is_empty()
     );
+}
+
+#[test]
+fn oauth_http_discovery_and_challenge_are_available_without_a_token() {
+    use std::io::{Read, Write};
+    let s = Server::start(0, "", || {}).unwrap();
+    let get = |path: &str| {
+        let mut c = std::net::TcpStream::connect(s.addr).unwrap();
+        write!(c, "GET {path} HTTP/1.1\r\nHost: {}\r\n\r\n", s.addr).unwrap();
+        let mut out = String::new();
+        c.read_to_string(&mut out).unwrap();
+        out
+    };
+    let metadata = get("/.well-known/oauth-protected-resource/mcp");
+    assert!(metadata.starts_with("HTTP/1.1 200"), "{metadata}");
+    let challenge = get("/mcp");
+    assert!(challenge.starts_with("HTTP/1.1 401"));
+    assert!(challenge.contains("WWW-Authenticate: Bearer resource_metadata="));
+    let server_metadata = get("/.well-known/oauth-authorization-server");
+    assert!(server_metadata.contains("code_challenge_methods_supported"));
 }
 
 #[test]
@@ -329,4 +347,28 @@ fn legacy_answer_database_migrates_and_prunes_on_open() {
         );
     }
     std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn fragmented_http_request_waits_for_remaining_bytes() {
+    use std::io::{Read, Write};
+    let s = Server::start(0, "", || {}).unwrap();
+    let mut c = std::net::TcpStream::connect(s.addr).unwrap();
+    c.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .unwrap();
+    c.write_all(b"G").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let write = c.write_all(
+        format!(
+            "ET /.well-known/oauth-protected-resource/mcp HTTP/1.1\r\nHost: {}\r\n\r\n",
+            s.addr
+        )
+        .as_bytes(),
+    );
+    let mut out = String::new();
+    let read = c.read_to_string(&mut out);
+    assert!(
+        write.is_ok() && read.is_ok() && out.starts_with("HTTP/1.1 200"),
+        "write={write:?}, read={read:?}, response={out}"
+    );
 }

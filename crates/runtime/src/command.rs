@@ -401,6 +401,14 @@ pub(crate) fn runtime_command_retained_bytes(
             }
         }
         RuntimeCommand::WriteInput { bytes, .. } => retained_add(&mut total, bytes.capacity())?,
+        RuntimeCommand::WriteInputTracked {
+            bytes,
+            operation_id,
+            ..
+        } => {
+            retained_add(&mut total, bytes.capacity())?;
+            retained_string(&mut total, operation_id)?;
+        }
         RuntimeCommand::SeedRedaction { credential_ids } => {
             retained_strings(&mut total, credential_ids)?;
         }
@@ -539,6 +547,14 @@ pub(crate) fn canonicalize_host_command(command: &mut RuntimeCommand) {
             for regex in [waiting_regex, approval_regex, error_regex, done_regex] {
                 canonicalize_optional_string(regex);
             }
+        }
+        RuntimeCommand::WriteInputTracked {
+            operation_id,
+            bytes,
+            ..
+        } => {
+            canonicalize_string(operation_id);
+            *bytes = std::mem::take(bytes).into_boxed_slice().into_vec();
         }
         RuntimeCommand::WriteInput { bytes, .. } => {
             *bytes = std::mem::take(bytes).into_boxed_slice().into_vec();
@@ -699,6 +715,21 @@ pub(crate) fn validate_host_command(command: &RuntimeCommand) -> Result<(), Runt
                 error_regex.as_deref(),
                 done_regex.as_deref(),
             ])?;
+        }
+        RuntimeCommand::WriteInputTracked {
+            operation_id,
+            bytes,
+            ..
+        } => {
+            if operation_id.is_empty()
+                || operation_id.len() > 128
+                || !operation_id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b':'))
+                || bytes.len() > WRITE_INPUT_BYTES_MAX
+            {
+                return Err(admission_error("runtime_command_input_invalid"));
+            }
         }
         RuntimeCommand::WriteInput { bytes, .. } => {
             if bytes.len() > WRITE_INPUT_BYTES_MAX {
@@ -1104,6 +1135,12 @@ pub enum RuntimeCommand {
         cols: u16,
         rows: u16,
     },
+    /// Correlates PTY queue admission; does not confirm shell execution.
+    WriteInputTracked {
+        session: SessionId,
+        operation_id: String,
+        bytes: Vec<u8>,
+    },
 }
 
 impl std::fmt::Debug for RuntimeCommand {
@@ -1179,6 +1216,16 @@ impl std::fmt::Debug for RuntimeCommand {
                 .debug_struct("SetTerminalCachePolicy")
                 .field("max_exited_backends", max_exited_backends)
                 .field("cache_budget_bytes", cache_budget_bytes)
+                .finish(),
+            RuntimeCommand::WriteInputTracked {
+                session,
+                operation_id,
+                bytes,
+            } => f
+                .debug_struct("WriteInputTracked")
+                .field("session", session)
+                .field("operation_id_len", &operation_id.len())
+                .field("bytes_len", &bytes.len())
                 .finish(),
             RuntimeCommand::WriteInput { session, bytes } => f
                 .debug_struct("WriteInput")
@@ -1350,6 +1397,26 @@ impl std::fmt::Debug for RuntimeCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tracked_input_validates_operation_identity_and_preserves_wire_roundtrip() {
+        let make = |id: &str| RuntimeCommand::WriteInputTracked {
+            session: SessionId(7),
+            operation_id: id.into(),
+            bytes: b"pwd\r".to_vec(),
+        };
+        let command = make("input:123");
+        assert!(validate_host_command(&command).is_ok());
+        let wire = postcard::to_allocvec(&command).unwrap();
+        let decoded: RuntimeCommand = postcard::from_bytes(&wire).unwrap();
+        assert!(
+            matches!(decoded, RuntimeCommand::WriteInputTracked { session: SessionId(7), operation_id, bytes } if operation_id == "input:123" && bytes == b"pwd\r")
+        );
+        assert!(!format!("{command:?}").contains("pwd"));
+        for id in ["", "bad\nidentifier", "bad identifier", &"x".repeat(129)] {
+            assert!(validate_host_command(&make(id)).is_err());
+        }
+    }
 
     fn valid_agent_command() -> RuntimeCommand {
         RuntimeCommand::SpawnAgent {
@@ -2116,6 +2183,7 @@ mod tests {
                 "RespawnArchivedAgent",
                 "SetScrollbackLimit",
                 "ResizeTracked",
+                "WriteInputTracked",
             ]
         );
     }

@@ -83,6 +83,32 @@ impl CloudAgent {
                 catalog.t("cloud.error", &[("code", error)]),
             );
         }
+        if let Some(s) = &self.server {
+            for approval in s.auth.approvals() {
+                ui.group(|ui| {
+                    ui.label(
+                        catalog.t("cloud.oauth_request", &[("client", &approval.client_name)]),
+                    );
+                    ui.weak(&approval.redirect_uri);
+                    ui.label(catalog.t(
+                        if approval.input {
+                            "cloud.oauth_input"
+                        } else {
+                            "cloud.oauth_read"
+                        },
+                        &[],
+                    ));
+                    ui.horizontal(|ui| {
+                        if ui.button(catalog.t("cloud.oauth_approve", &[])).clicked() {
+                            s.auth.approve(&approval.id, true);
+                        }
+                        if ui.button(catalog.t("cloud.oauth_deny", &[])).clicked() {
+                            s.auth.approve(&approval.id, false);
+                        }
+                    });
+                });
+            }
+        }
         ui.separator();
         ui.heading(catalog.t("cloud.sessions", &[]));
         ui.label(catalog.t("cloud.permission_hint", &[]));

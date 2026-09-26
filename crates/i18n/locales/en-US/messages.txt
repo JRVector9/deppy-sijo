@@ -1316,7 +1316,13 @@ notification.cloud_answer = Cloud answer: {title}
 cloud.history_answer = Cloud answer
 cloud.history_interrupt = Ctrl+C sent
 cloud.history_input = Terminal input
-cloud.outcome_queued = Queued for runtime input · command completion not confirmed
+cloud.outcome_queued = Accepted by PTY input queue · command completion not confirmed
 cloud.outcome_stored = Answer stored
 cloud.outcome_rejected = Input rejected
 cloud.outcome_unknown = Delivery unknown · no automatic retry
+
+cloud.oauth_request = Connector approval request: {client}
+cloud.oauth_input = Requests read, answers and input scope. Per-session input permission is also required.
+cloud.oauth_read = Requests read and answers scope.
+cloud.oauth_approve = Approve this connector
+cloud.oauth_deny = Deny

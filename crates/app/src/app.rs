@@ -23012,6 +23012,7 @@ impl App {
             // 마지막으로 큐에 남은 이벤트를 처리해 방금 끝난 background 작업의 완료/오류
             // 알림을 놓치지 않는다 (codex 리뷰 — 축출 시 receiver drop으로 유실되던 것).
             let events = rt.events.drain();
+            self.cloud_agent.observe_input(rt.runtime_instance, &events);
             Self::observe_scrollback_policy(&mut rt, &events);
             let approval_events_overflowed = rt.events.take_overflowed();
             if approval_events_overflowed {
@@ -23835,6 +23836,10 @@ impl App {
 
     fn pump_cloud_agent(&mut self, ctx: &egui::Context) {
         self.cloud_agent.apply_action(ctx);
+        // Also project retained answers when the MCP listener is stopped.
+        for rt in std::iter::once(&mut self.active).chain(self.warm.values_mut()) {
+            rt.workspace_ui.cloud_answers = self.cloud_agent.answers.clone();
+        }
         if self.cloud_agent.server.is_none()
             && !(self.settings_open
                 && self.settings_category == ui::settings::Category::CloudAgents)
@@ -23917,19 +23922,21 @@ impl App {
                         &rt.id,
                         mux,
                         rt.live.exited_sessions.contains(&target.session),
-                        matches!(&effect, crate::cloud_agent::Effect::Input(_)),
+                        matches!(&effect, crate::cloud_agent::Effect::Input { .. }),
                     )
                 });
                 if !valid {
                     return Err("session_changed_or_closed_no_effect".into());
                 }
                 let command = match effect {
-                    crate::cloud_agent::Effect::Input(bytes) => {
-                        runtime::RuntimeCommand::WriteInput {
-                            session: target.session,
-                            bytes,
-                        }
-                    }
+                    crate::cloud_agent::Effect::Input {
+                        operation_id,
+                        bytes,
+                    } => runtime::RuntimeCommand::WriteInputTracked {
+                        operation_id,
+                        session: target.session,
+                        bytes,
+                    },
                     crate::cloud_agent::Effect::Watch => {
                         runtime::RuntimeCommand::SetRemoteViewing {
                             session: target.session,
@@ -23943,6 +23950,7 @@ impl App {
                     .map_err(|_| "runtime_queue_rejected_no_effect".to_string())
             });
             if let Some(notice) = notice {
+                ctx.request_repaint();
                 self.notifications_ui.on_cloud_answer(
                     &notice.target.workspace,
                     &notice.target.id,
@@ -23952,6 +23960,9 @@ impl App {
                     &self.i18n,
                 );
             }
+        }
+        for rt in std::iter::once(&mut self.active).chain(self.warm.values_mut()) {
+            rt.workspace_ui.cloud_answers = self.cloud_agent.answers.clone();
         }
     }
 
@@ -29427,6 +29438,7 @@ impl eframe::App for App {
         let mut warm_restore_outcome = None;
         for rt in self.warm.values_mut() {
             let events = rt.events.drain();
+            self.cloud_agent.observe_input(rt.runtime_instance, &events);
             Self::observe_scrollback_policy(rt, &events);
             resource_maintenance_changed |=
                 apply_unattached_events(&mut self.unattached_counts, &rt.id, &events);
@@ -29545,6 +29557,9 @@ impl eframe::App for App {
         // ui()가 스킵돼도 승인/완료/실패 알림은 유지). worker의 wake가 숨겨진 UI를
         // 깨워 이 logic()을 돌린다. 렌더용으로는 pending_events에 쌓아 ui()가 소비한다.
         let new_events = self.active.events.drain();
+        self.cloud_agent
+            .observe_input(self.active.runtime_instance, &new_events);
+        self.cloud_agent.expire_pending();
         Self::observe_scrollback_policy(&mut self.active, &new_events);
         let primary_activation_post_render_tick = primary_activation_needs_post_render_tick(
             self.pending_primary_pane_activation.as_ref(),
@@ -33493,15 +33508,44 @@ impl eframe::App for App {
             let navigation =
                 plan_agent_notification_navigation(&target, &self.active.id, &workspace_ids);
             if let Some(navigation) = navigation {
-                let keep_settings_open = matches!(
+                let mut keep_settings_open = matches!(
                     &navigation,
                     AgentNotificationNavigation::OpenCloudAnswer { .. }
                 );
                 match navigation {
-                    AgentNotificationNavigation::OpenCloudAnswer { operation_id } => {
-                        self.cloud_agent.selected_record = Some(operation_id);
-                        self.set_settings_category(ui::settings::Category::CloudAgents);
-                        self.settings_open = true;
+                    AgentNotificationNavigation::OpenCloudAnswer {
+                        workspace_id,
+                        session_id,
+                        operation_id,
+                    } => {
+                        let original = std::iter::once(&mut self.active)
+                            .chain(self.warm.values_mut())
+                            .find(|rt| rt.id == workspace_id)
+                            .and_then(|rt| {
+                                let session = cloud_agent_mux(rt)?
+                                    .tabs
+                                    .iter()
+                                    .flat_map(|tab| &tab.panes)
+                                    .find(|p| {
+                                        p.persistent_session_id.as_deref() == Some(&session_id)
+                                    })?
+                                    .session_id?;
+                                rt.workspace_ui.selected_cloud_answer = Some(operation_id.clone());
+                                Some((session, rt.runtime_instance))
+                            });
+                        if let Some((session, instance)) = original {
+                            keep_settings_open = false;
+                            self.stage_workspace_controller_action(
+                                WorkspaceControllerAction::FocusPty {
+                                    workspace_id,
+                                    runtime_instance: Some(instance),
+                                    session,
+                                },
+                            );
+                        } else {
+                            self.cloud_agent.selected_record = Some(operation_id);
+                            self.set_settings_category(ui::settings::Category::CloudAgents);
+                        }
                         ui.ctx().request_repaint();
                     }
                     AgentNotificationNavigation::FocusCurrentPty { session } => {
@@ -33936,6 +33980,8 @@ fn tab_of_agent_target(
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AgentNotificationNavigation {
     OpenCloudAnswer {
+        workspace_id: String,
+        session_id: String,
         operation_id: String,
     },
     FocusCurrentPty {
@@ -33960,11 +34006,15 @@ fn plan_agent_notification_navigation(
     known_workspace_ids: &[String],
 ) -> Option<AgentNotificationNavigation> {
     match target {
-        ui::notifications::AgentNotificationTarget::CloudAnswer { operation_id, .. } => {
-            Some(AgentNotificationNavigation::OpenCloudAnswer {
-                operation_id: operation_id.clone(),
-            })
-        }
+        ui::notifications::AgentNotificationTarget::CloudAnswer {
+            workspace_id,
+            session_id,
+            operation_id,
+        } => Some(AgentNotificationNavigation::OpenCloudAnswer {
+            workspace_id: workspace_id.clone(),
+            session_id: session_id.clone(),
+            operation_id: operation_id.clone(),
+        }),
         ui::notifications::AgentNotificationTarget::Pty {
             workspace_id,
             session,
@@ -42912,6 +42962,8 @@ mod tests {
         assert_eq!(
             plan_agent_notification_navigation(&cloud, "other-workspace", &[]),
             Some(AgentNotificationNavigation::OpenCloudAnswer {
+                workspace_id: "original-workspace".into(),
+                session_id: "persistent-session".into(),
                 operation_id: "answer-1".into()
             })
         );

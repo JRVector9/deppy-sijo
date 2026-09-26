@@ -3009,3 +3009,14 @@ physical devices, or 24-hour soak time as explicit blockers, not skipped passes.
 - Failed approaches: 앞 절에 기록한 리뷰 지적 외에 새로운 실패 없음. 전체 리뷰는 세 번 수행했고 각각의 지적을 수용했다.
 - Remaining work: package 완료 확인, `git diff` 최종 확인, 커밋, Obsidian `프로젝트 일지/deppy-sijo/` 기록, 브랜치 push와 PR 게시, 결과 확인.
 - Exact next commands: package session 완료 확인; `git -C /private/tmp/deppy-file-tree-finder-clipboard-20260926 diff --check`; `git -C /private/tmp/deppy-file-tree-finder-clipboard-20260926 status --short`; `git add` 변경 10개 파일; `git commit -m 'feat(file-tree): Finder식 복사·이동 단축키 지원'`; `git push -u origin feat/file-tree-finder-clipboard`; `gh pr create --draft --base feat/fleet-one-list-and-relay-wip --head feat/file-tree-finder-clipboard --body-file <path>`.
+
+### 2026-09-26 Finder 파일 트리 작업 전달 완료
+
+- Current objective: 파일 트리 복사·붙여넣기·이동·삭제 및 Finder식 단축키 작업은 완료했고, 초안 PR #198의 검토를 기다린다. 사용자 지침에 따라 앱은 재실행하지 않는다.
+- Completed work: 소스·번역·인계 변경을 `2591874d`(`feat(file-tree): Finder식 복사·이동 단축키 지원`)로 커밋하고 `feat/file-tree-finder-clipboard`를 push했다. 초안 PR: https://github.com/JRVector9/deppy-sijo/pull/198 (base `feat/fleet-one-list-and-relay-wip`). Obsidian 일지 `프로젝트 일지/deppy-sijo/2026-09-26 파일 트리 Finder 복사 이동.md` 작성. 빌드 산출물 `target/bundle/Deppy Sijo.app` 및 `.zip`.
+- Modified files: `crates/app/src/app.rs`, `crates/app/src/native_key_monitor.rs`, `crates/app/src/ui/file_tree.rs`, `crates/app/src/ui/workspace.rs`, 5개 locale의 `messages.txt`, 이 handoff.
+- Key design decisions: 클립보드 파일 URL은 Finder와 공유하며 명시적인 이동은 ⌥⌘V이다. 파일 조작은 App host의 bounded IO 경로를 사용한다. 파일 트리 포커스가 터미널 raw 입력과 전역 단축키보다 우선하며, 포커스 전환·Busy·후속 key-up은 별도로 다룬다.
+- Test commands and results: 앱 전체 unit suite 2133 passed/14 ignored; i18n 8 passed; strict Clippy, `cargo fmt --all --check`, `git diff --check` passed; `scripts/package-macos.sh`는 명시된 서명 환경에서 번들·ZIP 및 Developer ID 서명 검증 통과. Codex CLI 리뷰 세 차례의 모든 지적을 반영했고 각 수정은 focused 회귀 테스트와 전체 검사로 확인했다. 실제 앱 재실행/UI 검증은 수행하지 않았다.
+- Failed approaches: 이전 절의 성능, 입력 소유권, paste 이벤트와 Busy debounce 지적이 모두 수정되었다. 미수용 코드 리뷰 지적은 없다.
+- Remaining work: PR 검토와 통합. 사용자가 현재 작업에서 명시적으로 허락하기 전에는 앱을 실행·재실행하지 않는다. 실행 UI 수동 확인은 허락 후 별도로 한다.
+- Exact next commands: `gh pr view 198 --json url,state,isDraft,headRefName,baseRefName`; `git -C /private/tmp/deppy-file-tree-finder-clipboard-20260926 status --short --branch`; PR 수정이 필요하면 해당 worktree에서 변경 후 focused test→전체 test→strict Clippy→package 순서로 확인한다. 앱을 자동 실행하는 `scripts/dev-run.sh`는 사용자 재실행 요청 전까지 금지한다.

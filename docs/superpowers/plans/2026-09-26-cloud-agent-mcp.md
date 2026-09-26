@@ -71,9 +71,16 @@ Files: `docs/cloud-agent-mcp.md`, `docs/CODEX_HANDOFF.md`, agent-mcp integration
 
 ## Completion — 2026-09-26
 
-- PR 1: `e872e861`; PR 2: `ab49b177`; PR 3: `ee58a2f2`; PR 4: final review fix/setup-guide commit follows this record. These are implementation units on `feat/cloud-agent-mcp`; GitHub PRs have not been published.
+- PR 1: `e872e861`; PR 2: `ab49b177`; PR 3: `ee58a2f2`; PR 4: `397806c5`. These are implementation units on `feat/cloud-agent-mcp`; GitHub PRs have not been published.
 - 93 focused tests passed: agent-mcp 9, App bridge 7, notifications 25, config 43, i18n 8, notification navigation 1.
 - CLI reviews: 2 P1 and 6 P2 findings fixed. The final targeted navigation review reported no remaining actionable defect.
 - `check-boundary`, `check-deps`, `cargo fmt --all -- --check`, and `git diff --check` passed.
 - Final `cargo build -p deppy-sijo --release` passed. Executable: `target/release/deppy-sijo`. App was not launched/restarted.
 - The actual user's public tunnel/Grok Bot connector has not been configured or verified; local HTTP fixtures do not certify external provider compatibility.
+
+## Follow-up — answer notification visibility
+
+- [x] Reproduce an older answer staying outside the viewport after notification navigation.
+- [x] Scroll to the selected answer once, allowing manual collapse and repeated notification navigation.
+- [x] Verify the focused App bridge suite (8 passed) and release rebuild.
+- [x] Complete source-only CLI review (no actionable defect), commit and journal.

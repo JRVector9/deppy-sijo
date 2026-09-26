@@ -129,7 +129,11 @@ impl CloudAgent {
         if self.records.is_empty() {
             ui.label(catalog.t("cloud.no_history", &[]));
         }
+        // A notification opens and reveals its answer once. Subsequent frames
+        // leave scrolling and collapsing under the user's control.
+        let selected_record = self.selected_record.take();
         for record in &self.records {
+            let selected = selected_record.as_deref() == Some(record.id.as_str());
             let kind = match record.tool.as_str() {
                 "notify" => "cloud.history_answer",
                 "send_ctrl_c" => "cloud.history_interrupt",
@@ -144,15 +148,9 @@ impl CloudAgent {
                 ),
                 record.session.chars().take(8).collect::<String>()
             );
-            egui::CollapsingHeader::new(title)
+            let response = egui::CollapsingHeader::new(title)
                 .id_salt(&record.id)
-                .open(
-                    if self.selected_record.as_deref() == Some(record.id.as_str()) {
-                        Some(true)
-                    } else {
-                        None
-                    },
-                )
+                .open(if selected { Some(true) } else { None })
                 .show(ui, |ui| {
                     ui.weak(format!("{} / {}", record.workspace, record.session));
                     let outcome: serde_json::Value =
@@ -171,6 +169,11 @@ impl CloudAgent {
                         }
                     }
                 });
+            if selected {
+                response
+                    .header_response
+                    .scroll_to_me(Some(egui::Align::TOP));
+            }
         }
     }
 }
@@ -179,6 +182,56 @@ impl CloudAgent {
 mod tests {
     use super::*;
     use egui_kittest::kittest::Queryable as _;
+    #[test]
+    fn answer_navigation_scrolls_once_and_allows_collapsing_and_reopening() {
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        let mut bridge = CloudAgent::memory();
+        bridge.records = (0..40)
+            .map(|index| agent_mcp::Record {
+                id: format!("answer-{index}"),
+                tool: "notify".into(),
+                workspace: "workspace".into(),
+                session: format!("{index:08}"),
+                created: agent_mcp::now() as i64,
+                outcome: r#"{"status":"stored"}"#.into(),
+                message: format!("Cloud answer {index}"),
+            })
+            .collect();
+        let header = format!(
+            "{} · {} · 00000039",
+            catalog.t("cloud.history_answer", &[]),
+            crate::ui::notifications::relative_time_label(&catalog, 0)
+        );
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(900.0, 500.0))
+            .build_ui_state(
+                move |ui, state: &mut (CloudAgent, f32)| {
+                    ui.style_mut().animation_time = 0.0;
+                    let scroll = egui::ScrollArea::vertical().show(ui, |ui| {
+                        state.0.contents(ui, &catalog);
+                    });
+                    state.1 = scroll.state.offset.y;
+                },
+                (bridge, 0.0),
+            );
+        harness.run();
+        assert!(harness.query_by_label("Cloud answer 39").is_none());
+        // This is the same one-shot intent delivered by a cloud-answer notification.
+        harness.state_mut().0.selected_record = Some("answer-39".into());
+        harness.run();
+        assert!(harness.state().1 > 200.0, "navigate to the older answer");
+        let answer = harness.get_by_label("Cloud answer 39").rect();
+        assert!(answer.top() >= 0.0 && answer.bottom() <= 500.0);
+        harness.get_by_label(&header).click();
+        harness.run();
+        assert!(
+            harness.query_by_label("Cloud answer 39").is_none(),
+            "the user can collapse the answer after notification navigation"
+        );
+        harness.state_mut().0.selected_record = Some("answer-39".into());
+        harness.run();
+        harness.get_by_label("Cloud answer 39");
+    }
     #[test]
     fn session_checkboxes_and_take_control_change_real_consent() {
         let catalog = i18n::Catalog::load("ko-KR").unwrap();

@@ -1,5 +1,19 @@
 # Codex handoff
 
+## Cloud answer navigation follow-up — 2026-09-26
+
+- Current objective: Continue the authorized cloud-agent development by completing notification-to-answer visibility for long histories; preserve the no-restart rule.
+- Worktree: `/Users/jr/Desktop/projects/deppy-sijo-cloud-agent-mcp`, `feat/cloud-agent-mcp`, starting HEAD `397806c5`. The original root and unrelated worktrees are preserved.
+- Found: Notification navigation expanded an answer but did not scroll to it; the persistent selected ID also forced it open every frame, preventing manual collapse.
+- Modified: `crates/app/src/cloud_agent/ui.rs`. Consume the notification selection once, open its header, and scroll the existing Settings scroll area to the actual header rectangle.
+- Test executed: `cargo test -p deppy-sijo --bin deppy-sijo answer_navigation_scrolls_once -- --nocapture` failed as expected on the old implementation: `navigate to the older answer`. Log `/tmp/deppy-cloud-answer-scroll-red.log`.
+- Verification executed: focused `cloud_agent` suite passed 8 tests including actual scroll offset, answer visibility, manual collapse, reopening, consent and real HTTP-to-App effects. Log `/tmp/deppy-cloud-answer-scroll-green.log`. Release rebuild passed in 28.23s (`/tmp/deppy-cloud-answer-scroll-release.log`). `cargo fmt --all -- --check` passed after correcting a line wrap; `git diff --check` passed.
+- CLI review completed: `/tmp/deppy-cloud-answer-scroll-review.log` reports no actionable defect in the source diff. It independently reran the focused navigation test successfully. Its initial `--lib` attempt failed because the App is binary-only, then retried without that flag; this was not a product failure.
+- Completed: Follow-up source fix, failure reproduction, focused regressions, source-only review, format/whitespace checks and release rebuild. Commit message: `fix: 그록 답변 알림에서 해당 기록으로 이동한다`; verify its hash with `git log -1 --oneline`. Project journal records this phase.
+- Remaining: Actual public tunnel/Grok account setup is external and remains unconfigured. No further implementation item is pending in the approved plan; no app restart or GitHub publication was performed.
+- Exact next commands: `cd /Users/jr/Desktop/projects/deppy-sijo-cloud-agent-mcp`; `tail -n 60 /tmp/deppy-cloud-answer-scroll-green.log`; `git diff -- crates/app/src/cloud_agent/ui.rs`; `cargo build -p deppy-sijo --release`.
+- Do not launch/restart Deppy.
+
 ## Cloud agent MCP implementation — 2026-09-26
 
 - Objective: Implement reduced MCP + token + per-session sharing/input + answer notifications/history, in four PR units. See `docs/superpowers/plans/2026-09-26-cloud-agent-mcp.md`.

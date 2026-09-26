@@ -1,3 +1,29 @@
+# Codex handoff
+
+## Cloud agent MCP implementation — 2026-09-26
+
+- Objective: Implement reduced MCP + token + per-session sharing/input + answer notifications/history, in four PR units. See `docs/superpowers/plans/2026-09-26-cloud-agent-mcp.md`.
+- Active worktree: `/Users/jr/Desktop/projects/deppy-sijo-cloud-agent-mcp`, branch `feat/cloud-agent-mcp`, base `2a1583d1` (v43). Other worktrees contain unrelated dirty changes and are untouched.
+- Completed: Revised four-PR plan; dedicated MCP crate with token authentication, strict Origin/Host/POST bounds, five tools, local SQLite answer/operation receipts; App active/warm routing and session generation/input checks wired. Settings UI, per-session toggles, take control, persisted coordinates, masked tokens and answer history are implemented. Cloud answer notification opens its stable operation record (not recycled PTY runtime ID).
+- Tests executed: Initial agent-mcp RED failed on missing symbols; GREEN `cargo test -p agent-mcp --lib` passed 5 tests. App permission RED failed missing CloudAgent/Target; GREEN focused permission test passed 1. `cargo check -p deppy-sijo` passed with temporary unused UI warnings.
+- CLI review: gpt-5.6 unavailable with this ChatGPT account; default gpt-6-sol review found total-request parsing deadline (P1), valid notification ACK (P2), schema byte vs character limits (P2). All fixed; targeted regression tests being added.
+- Modified: Cargo manifests/lock, new crates/agent-mcp, app cloud_agent module/composition, workspace snapshot getter, settings category and notifications source.
+- Input acknowledgement: intentionally `queued` at runtime command admission, with `completion:not_confirmed` and retry:false; no claim that the PTY accepted or shell executed it.
+- Failed approaches: unsupported CLI review model; no product launch.
+- Decisions: dedicated loopback port, volatile 24h token, explicitly shared sessions, input default off, stable UUID+runtime generation, bounded mailbox, durable operation claim before dispatch, fifth `notify` tool required for Grok's own answer. No custom relay/webhook/offline queue.
+- Latest tests: agent-mcp 9 passed; App cloud_agent 7 passed (includes real HTTP-to-App fixture, input denial/grant/duplicate/Ctrl+C and own-answer receipt); notifications 25 passed; config 43 passed; i18n 8 passed. No GUI app was launched. Initial release build succeeded in 1m02s; final rebuild also completed after review fixes.
+- Commits: PR 1 `e872e861`; PR 2 `ab49b177`; PR 3 ee58a2f2. Backend and UI are separate commits; no GitHub publication yet.
+- App CLI review found P1 connection action repaint; P2 cached viewport freshness, cloud-vs-PTY notification dedupe, token reveal on close. Fixed with explicit repaint, response refresh_requested/may_be_stale flags, distinct CloudAnswer identity + history navigation, close masking. Regression suite is running.
+- Failed approaches: unsupported review model; routing fixture Leaf→Pane; CloudAnswer exhaustive test match updated; SQLite NOFOLLOW initially rejected macOS /var symlink parent, fixed by canonicalizing the parent while preserving final-component NOFOLLOW. Persistence and symlink tests now pass.
+- Completed final phase: All four planned implementation units are complete. Source review total 2 P1 + 6 P2 findings fixed; final navigation review reports no remaining actionable defect. Final source fix keeps the Cloud Answer Settings destination open rather than applying terminal navigation's close behavior.
+- Final verification executed: agent-mcp 9, App bridge 7, notifications 25, config 43, i18n 8, notification navigation 1 (93 unique focused tests) passed. xtask check-boundary/check-deps, cargo fmt --all -- --check, git diff --check passed. Final release rebuild passed in 17.91s; executable `/Users/jr/Desktop/projects/deppy-sijo-cloud-agent-mcp/target/release/deppy-sijo`.
+- Modified files: New agent-mcp crate and App cloud_agent/UI modules, Cargo files, App composition/config/settings/notifications/workspace getter, five locale catalogs, AGENTS restart rule, revised plan and setup guide.
+- Remaining external validation: public HTTPS tunnel and actual Grok Bot account handshake need user-specific configuration. Bot must call notify for its own answer; this does not intercept plain chat replies. No outstanding implementation step, app restart or public deployment is authorized.
+- Workstep journal: `/Users/jr/Library/CloudStorage/SynologyDrive-sync_data/Obsidian-Vault/프로젝트 일지/deppy-sijo/2026-09-26 클라우드 에이전트 MCP와 그록 답변 수신.md`.
+- Failed approaches include final UI common-close branch overriding answer navigation; fixed and scoped CLI re-review passed. No unresolved review findings.
+- Commands: `cd /Users/jr/Desktop/projects/deppy-sijo-cloud-agent-mcp`; `git status --short`; `cargo test -p agent-mcp`; `cargo build -p deppy-sijo --release`.
+- Never launch/restart Deppy; current user request does not authorize it.
+
 ## 2026-09-23 최신 v43 재빌드·서명·재실행 완료
 
 - Current objective completed: 사용자의 지시에 따라 로컬 최신 소스를 커밋/원격 동기화

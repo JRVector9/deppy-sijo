@@ -33493,6 +33493,10 @@ impl eframe::App for App {
             let navigation =
                 plan_agent_notification_navigation(&target, &self.active.id, &workspace_ids);
             if let Some(navigation) = navigation {
+                let keep_settings_open = matches!(
+                    &navigation,
+                    AgentNotificationNavigation::OpenCloudAnswer { .. }
+                );
                 match navigation {
                     AgentNotificationNavigation::OpenCloudAnswer { operation_id } => {
                         self.cloud_agent.selected_record = Some(operation_id);
@@ -33537,11 +33541,15 @@ impl eframe::App for App {
                         );
                     }
                 }
-                // Settings는 별도 native viewport다. 대상 전환 후 그대로 앞에 남으면
-                // 이동이 실패한 것처럼 보이므로 닫고 root workspace를 key window로 올린다.
-                self.settings_open = false;
+                // Cloud answers live in Settings; terminal/structured session destinations live in root.
+                self.settings_open = keep_settings_open;
+                let destination = if keep_settings_open {
+                    egui::ViewportId::from_hash_of("deppy_settings_window")
+                } else {
+                    egui::ViewportId::ROOT
+                };
                 ui.ctx()
-                    .send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
+                    .send_viewport_cmd_to(destination, egui::ViewportCommand::Focus);
                 ui.ctx().request_repaint();
             }
         }
@@ -42896,6 +42904,17 @@ mod tests {
 
     #[test]
     fn agent_notification_navigation_preserves_transport_workspace_and_session() {
+        let cloud = ui::notifications::AgentNotificationTarget::CloudAnswer {
+            workspace_id: "original-workspace".into(),
+            session_id: "persistent-session".into(),
+            operation_id: "answer-1".into(),
+        };
+        assert_eq!(
+            plan_agent_notification_navigation(&cloud, "other-workspace", &[]),
+            Some(AgentNotificationNavigation::OpenCloudAnswer {
+                operation_id: "answer-1".into()
+            })
+        );
         use ui::notifications::AgentNotificationTarget as Target;
 
         let known = vec!["ws-a".to_owned(), "ws-b".to_owned()];

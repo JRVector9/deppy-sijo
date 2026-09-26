@@ -447,8 +447,8 @@ fn sidebar_tool_action(tool: SidebarTool) -> Option<SidebarAction> {
 
 const FILE_TREE_IO_QUEUE_CAP: usize = 1;
 const FILE_TREE_PATH_MAX_BYTES: usize = 32 * 1024;
-const FILE_TREE_PATH_LIST_MAX_ITEMS: usize = 16;
-const FILE_TREE_PATH_LIST_MAX_BYTES: usize = 256 * 1024;
+const FILE_TREE_PATH_LIST_MAX_ITEMS: usize = 256;
+const FILE_TREE_PATH_LIST_MAX_BYTES: usize = 512 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FileTreeIoOperation(u64);
@@ -564,6 +564,12 @@ pub enum FileTreeIoRequest {
     PasteFromClipboard {
         destination: FileTreePathPayload,
     },
+    MoveFromClipboard {
+        destination: FileTreePathPayload,
+    },
+    Duplicate {
+        sources: FileTreePathListPayload,
+    },
     Trash {
         target: FileTreePathPayload,
     },
@@ -588,6 +594,8 @@ impl std::fmt::Debug for FileTreeIoRequest {
             Self::Move { .. } => "move",
             Self::CopyInto { .. } => "copy_into",
             Self::PasteFromClipboard { .. } => "paste_from_clipboard",
+            Self::MoveFromClipboard { .. } => "move_from_clipboard",
+            Self::Duplicate { .. } => "duplicate",
             Self::Trash { .. } => "trash",
             Self::DeletePermanently { .. } => "delete_permanently",
             Self::CopyFileUrls { .. } => "copy_file_urls",
@@ -1093,6 +1101,9 @@ pub struct FileTreeUi {
     /// (2026-09-04 리뷰 H4). 터미널은 egui TextEdit이 아니라 `text_edit_focused()`
     /// 가드에 걸리지 않는다.
     tree_focused: bool,
+    /// 전역 단축키가 사이드바 render보다 먼저 실행될 때 현재 프레임의 클릭 위치로
+    /// 파일 트리 소유권을 판단할 수 있도록 직전 render의 입력 영역을 보관한다.
+    last_tree_area: Option<egui::Rect>,
     /// 마지막 삭제 제스처 시각 — ⌘C·⌘V와 같은 이유로 키 리피트를 한 제스처로 묶는다.
     last_delete_gesture: Option<std::time::Instant>,
     /// 다중 삭제 대기열. IO 큐가 capacity-1이라 완료될 때마다 하나씩 보낸다.
@@ -1103,6 +1114,9 @@ pub struct FileTreeUi {
     /// 마지막 외부 파일 붙여넣기(⌘V) 처리 시각 — 같은 제스처의 press(native)와
     /// release(egui fallback)가 두 번 복사하는 것을 막는다(터미널 PASTE_GESTURE 관례).
     last_external_paste: Option<std::time::Instant>,
+    /// Busy로 거절된 key-down 뒤 오는 같은 제스처의 key-up만 거른다. 다음 key-down은
+    /// 600ms 안이어도 새 시도이므로 허용한다.
+    last_rejected_paste_press: Option<std::time::Instant>,
     /// 마지막 외부 파일 복사(⌘C) 처리 시각 — native key-down 뒤 늦게 도착한
     /// Event::Copy가 같은 파일 URL 쓰기를 중복하지 않게 한다.
     last_external_copy: Option<std::time::Instant>,
@@ -1181,9 +1195,11 @@ impl FileTreeUi {
             marquee: None,
             trash_queue: Vec::new(),
             tree_focused: false,
+            last_tree_area: None,
             last_delete_gesture: None,
             workspace_drag: None,
             last_external_paste: None,
+            last_rejected_paste_press: None,
             last_external_copy: None,
             consumed_paste_shortcut: false,
             consumed_copy_shortcut: false,
@@ -1741,6 +1757,7 @@ impl FileTreeUi {
         self.selected.clear();
         self.select_anchor = None;
         self.marquee = None;
+        self.tree_focused = false;
         self.env_warning_candidates.clear();
         self.watch_plan_dirty = true;
         if let Some(root) = self.root.clone() {
@@ -2800,6 +2817,7 @@ impl FileTreeUi {
                     None => {
                         self.selected_tool = *tool;
                         if *tool == SidebarTool::Notes {
+                            self.tree_focused = false;
                             self.notes.request_focus();
                         }
                     }
@@ -2900,6 +2918,7 @@ impl FileTreeUi {
             && let Some(parent) = parent_root
         {
             self.set_root(Some(parent));
+            self.tree_focused = true;
             return action;
         }
         if let Some(root) = self.root.clone() {
@@ -3036,6 +3055,20 @@ impl FileTreeUi {
                     .clicked()
                 {
                     menu_action = Some(MenuAction::NewFolder(root.clone()));
+                    ui.close();
+                }
+                if ui.button(catalog.t("file_tree.paste_into", &[])).clicked() {
+                    menu_action = Some(MenuAction::PasteInto(
+                        root.clone(),
+                        ClipboardPasteKind::Copy,
+                    ));
+                    ui.close();
+                }
+                if ui.button(catalog.t("file_tree.move_into", &[])).clicked() {
+                    menu_action = Some(MenuAction::PasteInto(
+                        root.clone(),
+                        ClipboardPasteKind::Move,
+                    ));
                     ui.close();
                 }
             });
@@ -3511,7 +3544,7 @@ impl FileTreeUi {
                             } else {
                                 row.path.parent().map(Path::to_path_buf)
                             };
-                            if let Some(parent) = new_folder_parent {
+                            if let Some(parent) = new_folder_parent.clone() {
                                 let label = if row.is_dir {
                                     catalog.t("file_tree.new_folder_inside", &[])
                                 } else {
@@ -3544,6 +3577,22 @@ impl FileTreeUi {
                             if ui.button(catalog.t("file_tree.copy_file", &[])).clicked() {
                                 menu_action = Some(MenuAction::CopyFile(row.path.clone()));
                                 ui.close();
+                            }
+                            if let Some(destination) = new_folder_parent {
+                                if ui.button(catalog.t("file_tree.paste_into", &[])).clicked() {
+                                    menu_action = Some(MenuAction::PasteInto(
+                                        destination.clone(),
+                                        ClipboardPasteKind::Copy,
+                                    ));
+                                    ui.close();
+                                }
+                                if ui.button(catalog.t("file_tree.move_into", &[])).clicked() {
+                                    menu_action = Some(MenuAction::PasteInto(
+                                        destination,
+                                        ClipboardPasteKind::Move,
+                                    ));
+                                    ui.close();
+                                }
                             }
                             if ui.button(catalog.t("file_tree.copy_path", &[])).clicked() {
                                 menu_action = Some(MenuAction::CopyPath(row.path.clone()));
@@ -3578,6 +3627,7 @@ impl FileTreeUi {
         }
         if let Some(path) = navigate_root {
             self.set_root(Some(path));
+            self.tree_focused = true;
             return action;
         }
         if let Some(path) = toggle {
@@ -3626,6 +3676,7 @@ impl FileTreeUi {
             tree_row_pitch(row_height, ui.spacing()),
         );
         let tree_area = header_rect.union(scroll_output.inner_rect);
+        self.last_tree_area = Some(tree_area);
         if os_drag_active && drag_pos.is_some_and(|pos| tree_area_owns_os_drop(tree_area, pos)) {
             if !drag_row_highlighted {
                 // 행 위가 아니면 루트 반입 — 외곽선 대신 면으로 덮는다(2026-08-10 사용자:
@@ -3648,6 +3699,9 @@ impl FileTreeUi {
             self.start_copy_into(os_dropped, dst_dir);
         }
         self.handle_clipboard_shortcuts(ui, tree_area, hover_target_dir, hover_row_path);
+        if edit.is_none() {
+            edit = self.handle_tree_action_shortcuts(ui);
+        }
 
         // 인라인 편집은 검증 후 native mutation intent만 만든다. 실패 completion이면
         // PendingFileTreeIo가 보관한 편집 snapshot을 복원한다.
@@ -3761,11 +3815,14 @@ impl FileTreeUi {
             }
             Some(MenuAction::CopyFile(path)) => {
                 let paths = if self.selected.contains(&path) {
-                    self.selection_or(None)
+                    self.top_level_selection_or(None)
                 } else {
                     vec![path]
                 };
                 self.copy_files_to_clipboard(&paths);
+            }
+            Some(MenuAction::PasteInto(destination, kind)) => {
+                self.start_clipboard_paste(destination, kind);
             }
             Some(MenuAction::CopyPath(path)) => ui.ctx().copy_text(path.display().to_string()),
             Some(MenuAction::InsertPath(path)) => match FileTreePathPayload::try_new(path) {
@@ -3936,10 +3993,10 @@ impl FileTreeUi {
         // 둬야 루트가 없거나 팝업이 열린 프레임에도 갱신된다.
         if let Some(click) = ui
             .input(|input| {
-                input
-                    .pointer
-                    .any_click()
-                    .then(|| input.pointer.interact_pos())
+                (input.pointer.any_click()
+                    || input.pointer.primary_pressed()
+                    || input.pointer.secondary_pressed())
+                .then(|| input.pointer.interact_pos())
             })
             .flatten()
             && !tree_area.contains(click)
@@ -3955,10 +4012,10 @@ impl FileTreeUi {
         let pointer_over = ui
             .input(|i| i.pointer.latest_pos())
             .is_some_and(|pos| tree_area.contains(pos));
-        if !pointer_over {
+        if !self.tree_focused && !pointer_over {
             return;
         }
-        // ⌘C(③): 포인터 밑 행을 파일 URL로 pasteboard에 — Finder에서 ⌘V 가능.
+        // ⌘C(③): 트리 선택을 파일 URL로 pasteboard에 — Finder에서 ⌘V 가능.
         // AppKit native key-down을 먼저 peek해 비-Latin 배열에서 Event::Copy가 빠져도
         // WorkspaceUi drain 전에 트리가 소유권을 확정한다.
         let egui_copy = ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy)));
@@ -3994,11 +4051,45 @@ impl FileTreeUi {
         // ⌘V(②): 클립보드 파일 목록을 대상 폴더로 복사. macOS는 press가 native
         // key-down(peek)으로, 텍스트 표현이 있으면 Event::Paste로, release가 V key-up
         // fallback으로 온다(터미널 관례) — 어느 쪽이든 한 제스처는 한 번만 처리한다.
-        let paste_signal = ui.input(|i| i.events.iter().any(is_tree_paste_signal))
-            || crate::native_key_monitor::peek_clipboard_paste();
-        if !paste_signal {
+        let native_move = crate::native_key_monitor::peek_clipboard_move();
+        let native_paste = crate::native_key_monitor::peek_clipboard_paste();
+        let (move_event, paste_event, press_signal) = ui.input(|input| {
+            let paste_event = input
+                .events
+                .iter()
+                .any(|event| matches!(event, egui::Event::Paste(_)));
+            let modifier_move_paste = paste_event
+                && input.modifiers.command
+                && input.modifiers.alt
+                && !input.modifiers.ctrl
+                && !input.modifiers.shift;
+            let press = paste_event
+                || input.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        egui::Event::Key {
+                            key: egui::Key::V,
+                            pressed: true,
+                            ..
+                        }
+                    )
+                });
+            (
+                modifier_move_paste || input.events.iter().any(is_tree_move_signal),
+                input.events.iter().any(is_tree_paste_signal),
+                press,
+            )
+        });
+        let press_signal = press_signal || native_move || native_paste;
+        let move_signal = move_event || native_move;
+        let paste_signal = paste_event || native_paste;
+        let kind = if move_signal {
+            ClipboardPasteKind::Move
+        } else if paste_signal {
+            ClipboardPasteKind::Copy
+        } else {
             return;
-        }
+        };
         if self
             .last_external_paste
             .is_some_and(|at| at.elapsed() < EXTERNAL_PASTE_GESTURE_WINDOW)
@@ -4008,16 +4099,47 @@ impl FileTreeUi {
             self.consumed_paste_shortcut = true;
             return;
         }
-        let destination = target_dir.unwrap_or(root);
-        let refresh = vec![destination.clone()];
-        let request = FileTreePathPayload::try_new(destination)
-            .map(|destination| FileTreeIoRequest::PasteFromClipboard { destination });
-        if let Err(code) = request.and_then(|request| self.queue_io(request, refresh, None, None)) {
-            self.reject_io(code);
+        if !press_signal
+            && self
+                .last_rejected_paste_press
+                .is_some_and(|at| at.elapsed() < EXTERNAL_PASTE_GESTURE_WINDOW)
+        {
+            self.consumed_paste_shortcut = true;
             return;
         }
+        let destination = self
+            .focused_paste_destination()
+            .or(target_dir)
+            .unwrap_or(root);
+        // 트리가 제스처를 소유한 뒤 파일 작업이 Busy로 거절되더라도 terminal의
+        // raw key-up 경로로 떨어져 셸에 붙여넣지 않도록 한다.
         self.consumed_paste_shortcut = true;
-        self.last_external_paste = Some(std::time::Instant::now());
+        if self.start_clipboard_paste(destination, kind) {
+            self.last_external_paste = Some(std::time::Instant::now());
+            self.last_rejected_paste_press = None;
+        } else if press_signal {
+            self.last_rejected_paste_press = Some(std::time::Instant::now());
+        }
+    }
+
+    fn start_clipboard_paste(&mut self, destination: PathBuf, kind: ClipboardPasteKind) -> bool {
+        // 클립보드에는 다른 프로세스의 경로도 들어올 수 있어 원본 부모를 leaf가
+        // 알 수 없다. 이동 뒤 루트에서 펼친 폴더를 다시 나열해 원본 행도 갱신한다.
+        let refresh = match kind {
+            ClipboardPasteKind::Copy => vec![destination.clone()],
+            ClipboardPasteKind::Move => self.root.clone().into_iter().collect(),
+        };
+        let request = FileTreePathPayload::try_new(destination).map(|destination| match kind {
+            ClipboardPasteKind::Copy => FileTreeIoRequest::PasteFromClipboard { destination },
+            ClipboardPasteKind::Move => FileTreeIoRequest::MoveFromClipboard { destination },
+        });
+        match request.and_then(|request| self.queue_io(request, refresh, None, None)) {
+            Ok(()) => true,
+            Err(code) => {
+                self.reject_io(code);
+                false
+            }
+        }
     }
 
     fn handle_copy_shortcut_signal(
@@ -4026,15 +4148,18 @@ impl FileTreeUi {
         native_copy: bool,
         egui_copy: bool,
     ) {
-        // 예전처럼 **포인터 밑에 행이 있을 때만** 받는다. 선택이 있다고 행 밖에서도
-        // 받으면, 터미널에서 텍스트를 고른 뒤 마우스가 사이드바에 있는 채 ⌘C를 누를 때
-        // 트리가 그것을 가로채고 소비 표시까지 해 터미널 복사를 막는다(2026-09-04 리뷰 M3).
-        let Some(path) = row_path else {
-            return;
-        };
         if !native_copy && !egui_copy {
             return;
         }
+        // 키보드 포커스를 가진 트리의 선택을 우선한다. 포커스가 없으면 기존처럼
+        // 포인터 밑 행이 있을 때만 소유해 터미널의 ⌘C를 가로채지 않는다.
+        let paths = if self.tree_focused && !self.selected.is_empty() {
+            self.top_level_selection_or(None)
+        } else if let Some(path) = row_path {
+            self.top_level_selection_or(Some(path))
+        } else {
+            return;
+        };
         self.consumed_copy_shortcut = true;
         if self
             .last_external_copy
@@ -4043,8 +4168,6 @@ impl FileTreeUi {
             return;
         }
         self.last_external_copy = Some(std::time::Instant::now());
-        // 선택이 있으면 선택 전체를, 없으면 예전처럼 포인터 밑 행 하나를 복사한다.
-        let paths = self.selection_or(Some(path));
         self.copy_files_to_clipboard(&paths);
     }
 
@@ -4056,6 +4179,108 @@ impl FileTreeUi {
             Ok(()) => {}
             Err(code) => self.reject_io(code),
         }
+    }
+
+    /// 트리에 선택이 있으면 마우스 hover보다 그 위치를 붙여넣기 대상으로 삼는다.
+    /// 한 폴더를 골랐으면 폴더 안, 파일을 골랐으면 같은 폴더다.
+    fn focused_paste_destination(&self) -> Option<PathBuf> {
+        if !self.tree_focused || self.selected.len() != 1 {
+            return None;
+        }
+        let selected = self.selected.iter().next()?;
+        let row = self.flat.iter().find(|row| &row.path == selected)?;
+        Some(row_target_dir(row, self.root.as_deref()))
+    }
+
+    pub(crate) fn keyboard_focused(&self) -> bool {
+        self.tree_focused && self.selected_tool == SidebarTool::Files && !self.collapsed
+    }
+
+    pub(crate) fn release_keyboard_focus(&mut self) {
+        self.tree_focused = false;
+    }
+
+    /// App의 전역 단축키 디스패처가 트리보다 앞서 돈다. 트리 소유 키는 그 경계에서
+    /// 예약해 전역 pane/agent 명령이 먼저 실행되지 않도록 한다.
+    pub(crate) fn reserves_action_shortcut(&self, ctx: &egui::Context) -> bool {
+        let pointer_pos = ctx.input(|input| {
+            input.raw.events.iter().rev().find_map(|event| match event {
+                egui::Event::PointerButton {
+                    pos, pressed: true, ..
+                } => Some(*pos),
+                _ => None,
+            })
+        });
+        let focused = pointer_pos
+            .map(|pos| self.last_tree_area.is_some_and(|area| area.contains(pos)))
+            .unwrap_or_else(|| self.keyboard_focused());
+        self.selected_tool == SidebarTool::Files
+            && !self.collapsed
+            && focused
+            && !ctx.text_edit_focused()
+            && !ctx.any_popup_open()
+            && ctx.input(|input| input.events.iter().any(is_tree_action_shortcut_event))
+    }
+
+    fn handle_tree_action_shortcuts(&mut self, ui: &egui::Ui) -> Option<EditState> {
+        if !self.tree_focused || ui.ctx().text_edit_focused() || ui.ctx().any_popup_open() {
+            return None;
+        }
+        if ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::A)) {
+            self.selected = self.flat.iter().map(|row| row.path.clone()).collect();
+            self.select_anchor = self.flat.last().map(|row| row.path.clone());
+            return None;
+        }
+        if ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::D)) {
+            let sources = self.top_level_selection_or(None);
+            if sources.is_empty() {
+                return None;
+            }
+            let refresh = sources
+                .iter()
+                .filter_map(|path| path.parent().map(Path::to_path_buf))
+                .collect();
+            let request = FileTreePathListPayload::try_new(sources)
+                .map(|sources| FileTreeIoRequest::Duplicate { sources });
+            if let Err(code) =
+                request.and_then(|request| self.queue_io(request, refresh, None, None))
+            {
+                self.reject_io(code);
+            }
+            return None;
+        }
+        if ui.input_mut(|input| {
+            input.consume_key(
+                egui::Modifiers {
+                    command: true,
+                    shift: true,
+                    ..Default::default()
+                },
+                egui::Key::N,
+            )
+        }) {
+            return self
+                .focused_paste_destination()
+                .or_else(|| self.root.clone())
+                .map(|parent| EditState::NewFolder {
+                    parent,
+                    buffer: String::new(),
+                    focus: true,
+                });
+        }
+        if ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+            && self.selected.len() == 1
+        {
+            let path = self.selected.iter().next()?.clone();
+            let name = super::path_file_name_display(&path);
+            return Some(EditState::Rename {
+                path,
+                buffer: name,
+                focus: true,
+                changed: false,
+            });
+        }
+        None
     }
 
     /// 휴지통 이동이 실패한 대상의 영구삭제 확인 (§9-7 — 조용한 영구삭제 금지).
@@ -4213,37 +4438,42 @@ impl FileTreeUi {
             .collect()
     }
 
+    fn top_level_selection_or(&self, fallback: Option<PathBuf>) -> Vec<PathBuf> {
+        let paths = self.selection_or(fallback);
+        let selected: HashSet<&Path> = paths.iter().map(PathBuf::as_path).collect();
+        paths
+            .iter()
+            .filter(|path| {
+                !path
+                    .ancestors()
+                    .skip(1)
+                    .any(|ancestor| selected.contains(ancestor))
+            })
+            .cloned()
+            .collect()
+    }
+
     /// 선택(없으면 `fallback`)을 휴지통으로. IO 큐가 capacity-1이라 첫 대상만 바로
     /// 보내고 나머지는 대기열에 쌓아 완료될 때마다 하나씩 이어 보낸다.
-    /// `hovered`가 선택 **밖**이면 그 행 하나만 지운다 — 우클릭 메뉴와 같은 규칙이다.
-    /// 두 진입점이 다르면, 5개를 골라둔 채 다른 파일 위에서 ⌘⌫를 누른 사용자가
-    /// 그 파일 대신 골라둔 5개를 잃는다(2026-09-04 리뷰 M4).
+    /// 선택이 있으면 마우스 hover보다 선택을 우선한다. 우클릭으로 선택 밖 행을
+    /// 지우는 동작은 이 함수가 아닌 `spawn_trash(target)`을 직접 호출한다.
     fn spawn_trash_selection(&mut self, fallback: Option<PathBuf>) {
         let root = self.root.clone();
-        let is_dir = |path: &Path| {
-            self.flat
-                .iter()
-                .find(|row| row.path == path)
-                .is_some_and(|row| row.is_dir)
-        };
-        let chosen = match &fallback {
-            Some(hovered) if !self.selected.contains(hovered) => vec![hovered.clone()],
-            _ => self.selection_or(fallback.clone()),
-        };
+        let dirs: HashSet<&Path> = self
+            .flat
+            .iter()
+            .filter(|row| row.is_dir)
+            .map(|row| row.path.as_path())
+            .collect();
         // 조상 폴더가 함께 골라졌으면 그 안의 것은 뺀다 — 폴더가 먼저 휴지통으로 가면
         // 뒤따르는 자식 요청은 없는 경로를 지우려다 반드시 실패하고, 그 실패가 배치 전체를
         // 폐기시킨다(2026-09-04 리뷰 M5).
-        let mut targets: Vec<DeleteTarget> = chosen
-            .iter()
-            .filter(|path| {
-                !chosen
-                    .iter()
-                    .any(|other| other != *path && path.starts_with(other))
-            })
-            .cloned()
+        let mut targets: Vec<DeleteTarget> = self
+            .top_level_selection_or(fallback)
+            .into_iter()
             .map(|path| DeleteTarget {
                 label: delete_target_label(root.as_deref(), &path),
-                is_dir: is_dir(&path),
+                is_dir: dirs.contains(path.as_path()),
                 path,
             })
             .collect();
@@ -4564,6 +4794,7 @@ enum MenuAction {
     Delete(DeleteTarget),
     /// 파일/폴더를 pasteboard에 파일 URL로 복사 — Finder ⌘V 대상(§과제③).
     CopyFile(PathBuf),
+    PasteInto(PathBuf, ClipboardPasteKind),
     CopyPath(PathBuf),
     InsertPath(PathBuf),
     CdPath(PathBuf),
@@ -7464,6 +7695,12 @@ fn row_target_dir(row: &FlatRow, root: Option<&Path>) -> PathBuf {
 const EXTERNAL_PASTE_GESTURE_WINDOW: std::time::Duration = std::time::Duration::from_millis(600);
 const EXTERNAL_COPY_GESTURE_WINDOW: std::time::Duration = std::time::Duration::from_millis(600);
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClipboardPasteKind {
+    Copy,
+    Move,
+}
+
 /// 트리 ⌘V 신호(egui 이벤트 기반). macOS는 press가 Event::Paste(클립보드에 텍스트
 /// 표현이 있을 때만)로 오고 파일-only pasteboard면 press 이벤트가 없다 — release
 /// (V key-up)가 fallback이다(터미널 is_clipboard_paste_shortcut 관례). native
@@ -7476,7 +7713,49 @@ fn is_tree_paste_signal(event: &egui::Event) -> bool {
             pressed,
             modifiers,
             ..
-        } => cfg!(target_os = "macos") && !*pressed && modifiers.command && !modifiers.ctrl,
+        } => {
+            cfg!(target_os = "macos")
+                && !*pressed
+                && modifiers.command
+                && !modifiers.ctrl
+                && !modifiers.alt
+        }
+        _ => false,
+    }
+}
+
+fn is_tree_move_signal(event: &egui::Event) -> bool {
+    matches!(
+        event,
+        egui::Event::Key {
+            key: egui::Key::V,
+            pressed,
+            modifiers,
+            ..
+        } if (*pressed || cfg!(target_os = "macos"))
+            && modifiers.command
+            && modifiers.alt
+            && !modifiers.ctrl
+            && !modifiers.shift
+    )
+}
+
+fn is_tree_action_shortcut_event(event: &egui::Event) -> bool {
+    let egui::Event::Key {
+        key,
+        pressed: true,
+        modifiers,
+        ..
+    } = event
+    else {
+        return false;
+    };
+    match key {
+        egui::Key::A | egui::Key::D => modifiers.command && !modifiers.alt && !modifiers.shift,
+        egui::Key::N => modifiers.command && modifiers.shift && !modifiers.alt,
+        egui::Key::Enter => {
+            !modifiers.command && !modifiers.ctrl && !modifiers.alt && !modifiers.shift
+        }
         _ => false,
     }
 }
@@ -7842,6 +8121,100 @@ mod tests {
     }
 
     #[test]
+    fn 키보드로_선택한_파일은_포인터가_행밖에_있어도_복사된다() {
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        let path = PathBuf::from("/tmp/selected-copy.txt");
+        tree.flat.push(FlatRow {
+            path: path.clone(),
+            display_name: "selected-copy.txt".to_owned(),
+            depth: 0,
+            is_dir: false,
+            expanded: false,
+        });
+        tree.selected.insert(path.clone());
+        tree.tree_focused = true;
+
+        tree.handle_copy_shortcut_signal(None, true, false);
+
+        let intent = tree.take_io_intent().expect("selected copy intent");
+        match intent.request {
+            FileTreeIoRequest::CopyFileUrls { paths } => {
+                assert_eq!(paths.into_paths(), vec![path]);
+            }
+            other => panic!("unexpected intent: {other:?}"),
+        }
+        assert_eq!(tree.take_clipboard_shortcut_consumption(), (false, true));
+    }
+
+    #[test]
+    fn 폴더와_자식이_함께_선택되면_폴더만_클립보드에_담는다() {
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        let folder = PathBuf::from("/tmp/selected-folder");
+        let child = folder.join("child.txt");
+        for (path, is_dir) in [(folder.clone(), true), (child.clone(), false)] {
+            tree.flat.push(FlatRow {
+                display_name: path.file_name().unwrap().to_string_lossy().into_owned(),
+                path: path.clone(),
+                depth: usize::from(!is_dir),
+                is_dir,
+                expanded: is_dir,
+            });
+            tree.selected.insert(path);
+        }
+        tree.tree_focused = true;
+
+        tree.handle_copy_shortcut_signal(None, true, false);
+
+        let intent = tree.take_io_intent().expect("copy intent");
+        match intent.request {
+            FileTreeIoRequest::CopyFileUrls { paths } => {
+                assert_eq!(paths.into_paths(), vec![folder]);
+            }
+            other => panic!("unexpected intent: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn 키보드_삭제는_포인터_밑_파일보다_선택한_파일을_우선한다() {
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        let selected = PathBuf::from("/tmp/selected-delete.txt");
+        let hovered = PathBuf::from("/tmp/hovered-delete.txt");
+        for path in [&selected, &hovered] {
+            tree.flat.push(FlatRow {
+                path: path.clone(),
+                display_name: path.file_name().unwrap().to_string_lossy().into_owned(),
+                depth: 0,
+                is_dir: false,
+                expanded: false,
+            });
+        }
+        tree.selected.insert(selected.clone());
+        tree.spawn_trash_selection(Some(hovered));
+
+        let intent = tree.take_io_intent().expect("trash intent");
+        match intent.request {
+            FileTreeIoRequest::Trash { target } => assert_eq!(target.as_path(), selected),
+            other => panic!("unexpected intent: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn 워크스페이스_루트가_바뀌면_파일트리_키보드_포커스를_버린다() {
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.tree_focused = true;
+        tree.set_root(Some(PathBuf::from("/tmp/other-workspace")));
+        assert!(!tree.tree_focused);
+    }
+
+    #[test]
+    fn 터미널이_포커스를_가져가면_파일트리_단축키_소유권을_놓는다() {
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.tree_focused = true;
+        tree.release_keyboard_focus();
+        assert!(!tree.keyboard_focused());
+    }
+
+    #[test]
     fn native_copy뒤_늦은_egui_copy는_소유권만_유지하고_중복하지_않는다() {
         let mut tree = FileTreeUi::new(egui::Context::default());
         let path = PathBuf::from("/tmp/deduplicated-copy.txt");
@@ -7983,6 +8356,10 @@ mod tests {
         let debug = format!("{payload:?}");
         assert!(debug.contains("items: 1"));
         assert!(!debug.contains("/secret/a.txt"));
+        assert!(
+            FileTreePathListPayload::try_new(vec![PathBuf::from("/tmp/item"); 17]).is_ok(),
+            "Finder식 다중선택은 16개를 넘는 파일도 복사할 수 있어야 한다"
+        );
         assert!(matches!(
             FileTreePathListPayload::try_new(vec![
                 PathBuf::from("a");
@@ -8708,6 +9085,66 @@ mod tests {
             });
         }
         panic!("bounded maintenance did not quiesce");
+    }
+
+    #[test]
+    fn 클립보드_이동_완료시_펼친_원본_폴더를_다시_나열한다() {
+        let base = temp_root("clipboard-move-source-refresh");
+        let source_dir = base.join("source");
+        let destination = base.join("destination");
+        std::fs::create_dir(&source_dir).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        let source = source_dir.join("old.txt");
+        std::fs::write(&source, b"old").unwrap();
+
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.set_root(Some(base.clone()));
+        drain_listings(&mut tree);
+        tree.toggle_dir(&source_dir);
+        drain_listings(&mut tree);
+        assert!(tree.flat.iter().any(|row| row.path == source));
+
+        assert!(tree.start_clipboard_paste(destination.clone(), ClipboardPasteKind::Move));
+        let intent = tree.take_io_intent().expect("move intent");
+        std::fs::rename(&source, destination.join("old.txt")).unwrap();
+        tree.complete_io(FileTreeIoCompletion {
+            operation: intent.operation,
+            generation: intent.generation,
+            result: Ok(()),
+        });
+        drain_listings(&mut tree);
+        assert!(!tree.flat.iter().any(|row| row.path == source));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn 대량_형제_선택의_상위경로_정리는_빠르게_끝난다() {
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        for index in 0..8192 {
+            let path = PathBuf::from(format!("/workspace/file-{index:05}.txt"));
+            tree.flat.push(FlatRow {
+                path: path.clone(),
+                display_name: format!("file-{index:05}.txt"),
+                depth: 0,
+                is_dir: false,
+                expanded: false,
+            });
+            tree.selected.insert(path);
+        }
+        let started = std::time::Instant::now();
+        assert_eq!(tree.top_level_selection_or(None).len(), 8192);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "대량 선택의 파일 복사·복제가 눈에 띄게 지연되면 안 된다"
+        );
+
+        let started = std::time::Instant::now();
+        tree.spawn_trash_selection(None);
+        assert_eq!(tree.trash_queue.len(), 8191);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "대량 선택의 삭제 준비가 눈에 띄게 지연되면 안 된다"
+        );
     }
 
     fn pump_listings_for(tree: &mut FileTreeUi, _duration: std::time::Duration) {
@@ -13093,6 +13530,23 @@ mod tests {
         assert!(!is_tree_paste_signal(&egui::Event::Copy));
     }
 
+    #[test]
+    fn option_command_v_keyup도_트리가_소비해_터미널로_새지_않는다() {
+        let event = egui::Event::Key {
+            key: egui::Key::V,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                command: true,
+                alt: true,
+                ..Default::default()
+            },
+        };
+        assert_eq!(is_tree_move_signal(&event), cfg!(target_os = "macos"));
+        assert!(!is_tree_paste_signal(&event));
+    }
+
     fn drop_harness(
         catalog: &i18n::Catalog,
         tree: FileTreeUi,
@@ -13237,6 +13691,487 @@ mod tests {
             harness.state().0.error
         );
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn kittest_선택한_폴더에_포인터_위치와_무관하게_붙여넣는다() {
+        let base = temp_root("paste-selected-folder");
+        let base = base.canonicalize().unwrap();
+        let target = base.join("target");
+        std::fs::create_dir(&target).unwrap();
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.set_root(Some(base.clone()));
+        drain_listings(&mut tree);
+        tree.selected.insert(target.clone());
+        tree.tree_focused = true;
+        let mut harness = drop_harness(&catalog, tree);
+        for _ in 0..20 {
+            harness.step();
+        }
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::PointerMoved(egui::pos2(200.0, 400.0)));
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::Paste(String::new()));
+        harness.step();
+        let intent = harness
+            .state_mut()
+            .0
+            .take_io_intent()
+            .expect("paste intent");
+        match intent.request {
+            FileTreeIoRequest::PasteFromClipboard { destination } => {
+                assert_eq!(destination.as_path(), target);
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn kittest_option_command_v는_선택한_폴더로_이동한다() {
+        let base = temp_root("move-selected-folder");
+        let base = base.canonicalize().unwrap();
+        let target = base.join("target");
+        std::fs::create_dir(&target).unwrap();
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.set_root(Some(base.clone()));
+        drain_listings(&mut tree);
+        tree.selected.insert(target.clone());
+        tree.tree_focused = true;
+        let mut harness = drop_harness(&catalog, tree);
+        for _ in 0..20 {
+            harness.step();
+        }
+        harness.input_mut().events.push(egui::Event::Key {
+            key: egui::Key::V,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                alt: true,
+                command: true,
+                ..Default::default()
+            },
+        });
+        harness.step();
+        let intent = harness.state_mut().0.take_io_intent().expect("move intent");
+        match intent.request {
+            FileTreeIoRequest::MoveFromClipboard { destination } => {
+                assert_eq!(destination.as_path(), target);
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn kittest_option_command_v뒤_늦은_paste이벤트는_복사를_추가하지_않는다() {
+        let base = temp_root("move-dedup");
+        let base = base.canonicalize().unwrap();
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.set_root(Some(base.clone()));
+        drain_listings(&mut tree);
+        tree.tree_focused = true;
+        let mut harness = drop_harness(&catalog, tree);
+        for _ in 0..20 {
+            harness.step();
+        }
+        harness.input_mut().events.push(egui::Event::Key {
+            key: egui::Key::V,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                alt: true,
+                command: true,
+                ..Default::default()
+            },
+        });
+        harness.step();
+        let first = harness.state_mut().0.take_io_intent().expect("move intent");
+        harness.state_mut().0.complete_io(FileTreeIoCompletion {
+            operation: first.operation,
+            generation: first.generation,
+            result: Ok(()),
+        });
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::Paste(String::new()));
+        harness.step();
+        assert!(harness.state_mut().0.take_io_intent().is_none());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn kittest_paste이벤트만_와도_option_command_v는_이동한다() {
+        let base = temp_root("move-paste-event-only");
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.set_root(Some(base.clone()));
+        drain_listings(&mut tree);
+        tree.tree_focused = true;
+        let mut harness = drop_harness(&catalog, tree);
+        for _ in 0..20 {
+            harness.step();
+        }
+        harness.input_mut().modifiers = egui::Modifiers {
+            alt: true,
+            command: true,
+            ..Default::default()
+        };
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::Paste("file url".to_owned()));
+        harness.step();
+        let intent = harness.state_mut().0.take_io_intent().expect("move intent");
+        assert!(matches!(
+            intent.request,
+            FileTreeIoRequest::MoveFromClipboard { .. }
+        ));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn kittest_파일작업중_이동_단축키도_터미널에_넘기지_않는다() {
+        let base = temp_root("move-busy-owned");
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.set_root(Some(base.clone()));
+        drain_listings(&mut tree);
+        tree.tree_focused = true;
+        tree.copy_files_to_clipboard(&[base.join("pending.txt")]);
+        let mut harness = drop_harness(&catalog, tree);
+        for _ in 0..20 {
+            harness.step();
+        }
+        harness.input_mut().events.push(egui::Event::Key {
+            key: egui::Key::V,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                alt: true,
+                command: true,
+                ..Default::default()
+            },
+        });
+        harness.step();
+        assert!(
+            harness
+                .state_mut()
+                .0
+                .take_clipboard_shortcut_consumption()
+                .0
+        );
+        let pending = harness.state_mut().0.take_io_intent().unwrap();
+        harness.state_mut().0.complete_io(FileTreeIoCompletion {
+            operation: pending.operation,
+            generation: pending.generation,
+            result: Ok(()),
+        });
+        harness.input_mut().events.push(egui::Event::Key {
+            key: egui::Key::V,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                alt: true,
+                command: true,
+                ..Default::default()
+            },
+        });
+        harness.step();
+        assert!(harness.state_mut().0.take_io_intent().is_none());
+        harness.input_mut().events.push(egui::Event::Key {
+            key: egui::Key::V,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                alt: true,
+                command: true,
+                ..Default::default()
+            },
+        });
+        harness.step();
+        assert!(matches!(
+            harness.state_mut().0.take_io_intent().unwrap().request,
+            FileTreeIoRequest::MoveFromClipboard { .. }
+        ));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn kittest_폴더_우클릭_붙여넣기는_그_폴더를_대상으로_한다() {
+        let base = temp_root("paste-folder-menu");
+        let base = base.canonicalize().unwrap();
+        let target = base.join("target");
+        std::fs::create_dir(&target).unwrap();
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.set_root(Some(base.clone()));
+        drain_listings(&mut tree);
+        let mut harness = delete_confirm_harness(tree, &catalog);
+        let row = topmost_row_center(&harness, "target", 1);
+
+        let intent =
+            trash_row_via_context_menu(&mut harness, row, &catalog.t("file_tree.paste_into", &[]));
+        match intent.request {
+            FileTreeIoRequest::PasteFromClipboard { destination } => {
+                assert_eq!(destination.as_path(), target);
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn kittest_command_a는_보이는_파일을_모두_선택한다() {
+        let base = temp_root("select-all-shortcut");
+        let base = base.canonicalize().unwrap();
+        std::fs::write(base.join("a.txt"), b"a").unwrap();
+        std::fs::write(base.join("b.txt"), b"b").unwrap();
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.set_root(Some(base.clone()));
+        drain_listings(&mut tree);
+        tree.tree_focused = true;
+        let mut harness = drop_harness(&catalog, tree);
+        for _ in 0..20 {
+            harness.step();
+        }
+        harness.input_mut().events.push(egui::Event::Key {
+            key: egui::Key::A,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        harness.step();
+        assert_eq!(harness.state().0.selected.len(), 2);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn kittest_터미널_드래그_시작은_파일트리_키보드_포커스를_놓는다() {
+        let base = temp_root("tree-blur-terminal-drag");
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.set_root(Some(base.clone()));
+        drain_listings(&mut tree);
+        tree.tree_focused = true;
+        let mut harness = drop_harness(&catalog, tree);
+        for _ in 0..20 {
+            harness.step();
+        }
+        let area = harness.state().0.last_tree_area.unwrap();
+        let pos = egui::pos2((area.right() + 20.0).min(419.0), area.center().y);
+        assert!(!area.contains(pos));
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::PointerMoved(pos));
+        harness.input_mut().events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.step();
+        assert!(!harness.state().0.keyboard_focused());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn kittest_command_d는_선택한_파일의_복제_요청을_낸다() {
+        let base = temp_root("duplicate-shortcut");
+        let base = base.canonicalize().unwrap();
+        let source = base.join("a.txt");
+        std::fs::write(&source, b"a").unwrap();
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.set_root(Some(base.clone()));
+        drain_listings(&mut tree);
+        tree.selected.insert(source.clone());
+        tree.tree_focused = true;
+        let mut harness = drop_harness(&catalog, tree);
+        for _ in 0..20 {
+            harness.step();
+        }
+        harness.input_mut().events.push(egui::Event::Key {
+            key: egui::Key::D,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        harness.step();
+        let intent = harness
+            .state_mut()
+            .0
+            .take_io_intent()
+            .expect("duplicate intent");
+        match intent.request {
+            FileTreeIoRequest::Duplicate { sources } => {
+                assert_eq!(sources.into_paths(), vec![source]);
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn 파일트리_포커스중_복제와_새폴더_단축키를_전역보다_우선한다() {
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.tree_focused = true;
+        let ctx = egui::Context::default();
+        for (key, modifiers) in [
+            (egui::Key::D, egui::Modifiers::COMMAND),
+            (
+                egui::Key::N,
+                egui::Modifiers {
+                    command: true,
+                    shift: true,
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    events: vec![egui::Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                    }],
+                    ..Default::default()
+                },
+                |ui| assert!(tree.reserves_action_shortcut(ui.ctx())),
+            );
+        }
+        tree.tree_focused = false;
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::D,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::COMMAND,
+                }],
+                ..Default::default()
+            },
+            |ui| assert!(!tree.reserves_action_shortcut(ui.ctx())),
+        );
+
+        tree.last_tree_area = Some(egui::Rect::from_min_max(
+            egui::pos2(0.0, 0.0),
+            egui::pos2(200.0, 300.0),
+        ));
+        for (pos, expected) in [
+            (egui::pos2(50.0, 80.0), true),
+            (egui::pos2(450.0, 80.0), false),
+        ] {
+            tree.tree_focused = !expected;
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    events: vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                        egui::Event::Key {
+                            key: egui::Key::D,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: egui::Modifiers::COMMAND,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ui| assert_eq!(tree.reserves_action_shortcut(ui.ctx()), expected),
+            );
+        }
+    }
+
+    #[test]
+    fn kittest_enter는_선택한_파일의_이름변경을_시작한다() {
+        let base = temp_root("rename-shortcut");
+        let base = base.canonicalize().unwrap();
+        let source = base.join("a.txt");
+        std::fs::write(&source, b"a").unwrap();
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.set_root(Some(base.clone()));
+        drain_listings(&mut tree);
+        tree.selected.insert(source.clone());
+        tree.tree_focused = true;
+        let mut harness = drop_harness(&catalog, tree);
+        for _ in 0..20 {
+            harness.step();
+        }
+        harness.input_mut().events.push(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.step();
+        assert!(matches!(
+            harness.state().0.edit.as_ref(),
+            Some(EditState::Rename { path, .. }) if path == &source
+        ));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn kittest_shift_command_n은_선택한_폴더에_새_폴더를_만든다() {
+        let base = temp_root("new-folder-shortcut");
+        let base = base.canonicalize().unwrap();
+        let target = base.join("target");
+        std::fs::create_dir(&target).unwrap();
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.set_root(Some(base.clone()));
+        drain_listings(&mut tree);
+        tree.selected.insert(target.clone());
+        tree.tree_focused = true;
+        let mut harness = drop_harness(&catalog, tree);
+        for _ in 0..20 {
+            harness.step();
+        }
+        harness.input_mut().events.push(egui::Event::Key {
+            key: egui::Key::N,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                command: true,
+                shift: true,
+                ..Default::default()
+            },
+        });
+        harness.step();
+        assert!(matches!(
+            harness.state().0.edit.as_ref(),
+            Some(EditState::NewFolder { parent, .. }) if parent == &target
+        ));
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

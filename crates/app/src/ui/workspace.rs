@@ -1828,9 +1828,11 @@ pub struct WorkspaceUi {
     /// 플래그로 옮긴다. 파일 트리 §과제②③ 충돌 금지).
     suppress_paste_request: bool,
     suppress_copy_request: bool,
+    suppress_tree_keyboard_request: bool,
     /// 위 요청의 이번-프레임 확정값 (prepare_frame이 매 프레임 재계산 — 이월 없음).
     paste_suppressed: bool,
     copy_suppressed: bool,
+    tree_keyboard_suppressed: bool,
     /// 세션 → 셸 pid (App이 ResourceUsage에서 매 프레임 갱신). 터미널 경로 더블클릭의
     /// 상대경로를 그 셸의 실제 cwd로 해석하는 데 쓴다 (2026-07-14).
     session_pids: HashMap<SessionId, u32>,
@@ -2487,6 +2489,8 @@ impl WorkspaceUi {
             suppress_copy_request: false,
             paste_suppressed: false,
             copy_suppressed: false,
+            suppress_tree_keyboard_request: false,
+            tree_keyboard_suppressed: false,
             sent_sizes: HashMap::new(),
             pending_resize_target: HashMap::new(),
             scroll_residual: 0.0,
@@ -4315,6 +4319,11 @@ impl WorkspaceUi {
         self.suppress_copy_request |= copy;
     }
 
+    /// 파일 트리에 키보드 포커스가 있으면 raw/IME/native 입력을 터미널에 넘기지 않는다.
+    pub fn suppress_tree_keyboard_this_frame(&mut self) {
+        self.suppress_tree_keyboard_request = true;
+    }
+
     fn prepare_frame(
         &mut self,
         ctx: &egui::Context,
@@ -4411,6 +4420,7 @@ impl WorkspaceUi {
         // 파일 트리 ⌘V/⌘C 소비 프레임 — 요청을 이번 프레임 확정값으로 옮긴다(이월 없음).
         self.paste_suppressed = std::mem::take(&mut self.suppress_paste_request);
         self.copy_suppressed = std::mem::take(&mut self.suppress_copy_request);
+        self.tree_keyboard_suppressed = std::mem::take(&mut self.suppress_tree_keyboard_request);
         self.handle_events_with_attached_targets(events, catalog, attached_targets);
         // 「마지막 출력 복사」 — handle_events에는 Context가 없어 여기서 수행한다.
         if input_enabled && let Some(text) = self.pending_copy.take() {
@@ -6141,6 +6151,7 @@ impl WorkspaceUi {
                 ui.ctx().any_popup_open(),
                 any_blocking_window_visible,
                 terminal_refocus_pending,
+                self.tree_keyboard_suppressed,
             );
         let preedit =
             (terminal_keyboard_active && !self.preedit.is_empty()).then_some(self.preedit.as_str());
@@ -8224,10 +8235,14 @@ fn terminal_keyboard_input_allowed(
     popup_open: bool,
     top_window_open: bool,
     terminal_refocus_pending: bool,
+    tree_keyboard_focused: bool,
 ) -> bool {
     // TextEditState는 widget이 사라진 뒤 한 프레임 더 memory에 남을 수 있다. terminal
     // refocus가 명시적으로 대기 중이면 그 stale 상태는 무시해야 첫 글자가 빠지지 않는다.
-    !popup_open && !top_window_open && (terminal_refocus_pending || !text_edit_focused)
+    !tree_keyboard_focused
+        && !popup_open
+        && !top_window_open
+        && (terminal_refocus_pending || !text_edit_focused)
 }
 
 fn terminal_accepts_ime_events(
@@ -15827,15 +15842,32 @@ https://example.test/login \
 
     #[test]
     fn terminal_keyboard는_textedit_popup_window가_없을때만_활성이다() {
-        assert!(terminal_keyboard_input_allowed(false, false, false, false));
-        assert!(!terminal_keyboard_input_allowed(true, false, false, false));
-        assert!(!terminal_keyboard_input_allowed(false, true, false, false));
-        assert!(!terminal_keyboard_input_allowed(false, false, true, false));
+        assert!(terminal_keyboard_input_allowed(
+            false, false, false, false, false
+        ));
+        assert!(!terminal_keyboard_input_allowed(
+            true, false, false, false, false
+        ));
+        assert!(!terminal_keyboard_input_allowed(
+            false, true, false, false, false
+        ));
+        assert!(!terminal_keyboard_input_allowed(
+            false, false, true, false, false
+        ));
+        assert!(!terminal_keyboard_input_allowed(
+            false, false, false, false, true
+        ));
         // 검색 닫힘/터미널 클릭 직후에는 사라진 TextEdit의 stale focus보다 terminal refocus가
         // 우선이라 첫 문장부호·한글 조합이 빠지지 않는다.
-        assert!(terminal_keyboard_input_allowed(true, false, false, true));
-        assert!(!terminal_keyboard_input_allowed(true, true, false, true));
-        assert!(!terminal_keyboard_input_allowed(true, false, true, true));
+        assert!(terminal_keyboard_input_allowed(
+            true, false, false, true, false
+        ));
+        assert!(!terminal_keyboard_input_allowed(
+            true, true, false, true, false
+        ));
+        assert!(!terminal_keyboard_input_allowed(
+            true, false, true, true, false
+        ));
     }
 
     #[test]

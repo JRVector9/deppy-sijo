@@ -28,6 +28,7 @@ pub(crate) struct NativeKeyDownBatch {
 enum NativeKeyDown {
     Printable(NativePrintableKeyDown),
     ClipboardPaste { observed_at: Instant },
+    ClipboardMove { observed_at: Instant },
     ClipboardCopy { observed_at: Instant },
 }
 
@@ -35,9 +36,9 @@ impl NativeKeyDown {
     fn fresh(self) -> bool {
         match self {
             Self::Printable(key_down) => key_down.fresh(),
-            Self::ClipboardPaste { observed_at } | Self::ClipboardCopy { observed_at } => {
-                observed_at.elapsed() <= NATIVE_KEY_MAX_AGE
-            }
+            Self::ClipboardPaste { observed_at }
+            | Self::ClipboardMove { observed_at }
+            | Self::ClipboardCopy { observed_at } => observed_at.elapsed() <= NATIVE_KEY_MAX_AGE,
         }
     }
 }
@@ -94,6 +95,12 @@ fn record_clipboard_copy() {
     });
 }
 
+fn record_clipboard_move() {
+    record(NativeKeyDown::ClipboardMove {
+        observed_at: Instant::now(),
+    });
+}
+
 /// 이번 egui 프레임 직전에 AppKit이 본 printable/clipboard key-down을 모두 꺼낸다.
 /// 오래됐거나 터미널 UI가 비활성인 프레임의 레코드는 다음 입력에 섞이지 않도록
 /// 재사용하지 않는다. 같은 프레임의 Command+V key repeat은 paste 1회로 합친다.
@@ -106,6 +113,7 @@ pub(crate) fn drain() -> NativeKeyDownBatch {
         match key_down {
             NativeKeyDown::Printable(key_down) => batch.printable.push(key_down),
             NativeKeyDown::ClipboardPaste { .. } => batch.clipboard_paste = true,
+            NativeKeyDown::ClipboardMove { .. } => {}
             NativeKeyDown::ClipboardCopy { .. } => batch.clipboard_copy = true,
         }
     }
@@ -122,6 +130,15 @@ pub(crate) fn peek_clipboard_paste() -> bool {
     key_downs
         .iter()
         .any(|kd| matches!(kd, NativeKeyDown::ClipboardPaste { .. }) && kd.fresh())
+}
+
+pub(crate) fn peek_clipboard_move() -> bool {
+    let Ok(key_downs) = queue().lock() else {
+        return false;
+    };
+    key_downs
+        .iter()
+        .any(|kd| matches!(kd, NativeKeyDown::ClipboardMove { .. }) && kd.fresh())
 }
 
 /// drain하지 않고 fresh한 Command+C key-down이 있는지만 본다. 파일 트리가 터미널보다
@@ -153,7 +170,9 @@ pub(crate) fn install() {
         // We only inspect it synchronously and return the exact same pointer unchanged.
         let event_ref = unsafe { event.as_ref() };
         let modifiers = event_ref.modifierFlags();
-        if native_clipboard_paste_event(event_ref) {
+        if native_clipboard_move_event(event_ref) {
+            record_clipboard_move();
+        } else if native_clipboard_paste_event(event_ref) {
             record_clipboard_paste();
         } else if native_clipboard_copy_event(event_ref) {
             record_clipboard_copy();
@@ -182,6 +201,27 @@ pub(crate) fn install() {
         INSTALLED.store(false, Ordering::Release);
         tracing::warn!("macOS native key monitor 설치 실패 — IME key-up 복구만 사용");
     }
+}
+
+#[cfg(target_os = "macos")]
+fn native_clipboard_move_event(event: &objc2_app_kit::NSEvent) -> bool {
+    use objc2_app_kit::NSEventModifierFlags;
+
+    let modifiers = event.modifierFlags();
+    let characters = event
+        .charactersIgnoringModifiers()
+        .map(|characters| characters.to_string());
+    is_clipboard_move_key(
+        event.keyCode(),
+        characters.as_deref(),
+        modifiers.contains(NSEventModifierFlags::Command),
+        modifiers.contains(NSEventModifierFlags::Option),
+        modifiers.intersects(
+            NSEventModifierFlags::Control
+                | NSEventModifierFlags::Function
+                | NSEventModifierFlags::Shift,
+        ),
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -240,6 +280,19 @@ fn is_clipboard_paste_key(
     }
     characters_ignoring_modifiers.is_some_and(|characters| characters.eq_ignore_ascii_case("v"))
         || key_code == 0x09
+}
+
+fn is_clipboard_move_key(
+    key_code: u16,
+    characters_ignoring_modifiers: Option<&str>,
+    command: bool,
+    option: bool,
+    conflicting_modifier: bool,
+) -> bool {
+    command
+        && option
+        && !conflicting_modifier
+        && is_clipboard_paste_key(key_code, characters_ignoring_modifiers, true, false)
 }
 
 fn is_clipboard_copy_key(
@@ -352,6 +405,14 @@ mod tests {
         assert!(!is_clipboard_paste_key(0x09, Some("v"), false, false));
         assert!(!is_clipboard_paste_key(0x09, Some("v"), true, true));
         assert!(!is_clipboard_paste_key(0x08, Some("c"), true, false));
+    }
+
+    #[test]
+    fn option_command_v는_일반_붙여넣기와_구분한다() {
+        assert!(is_clipboard_move_key(0x09, Some("v"), true, true, false));
+        assert!(is_clipboard_move_key(0x09, Some("ㅍ"), true, true, false));
+        assert!(!is_clipboard_move_key(0x09, Some("v"), true, false, false));
+        assert!(!is_clipboard_move_key(0x09, Some("v"), true, true, true));
     }
 
     #[test]

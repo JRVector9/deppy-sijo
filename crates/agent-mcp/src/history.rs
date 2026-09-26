@@ -60,6 +60,9 @@ impl History {
     fn init(&self) -> anyhow::Result<()> {
         self.0.busy_timeout(std::time::Duration::from_millis(100))?;
         self.0.execute_batch("PRAGMA journal_mode=DELETE; CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY, fingerprint BLOB NOT NULL, tool TEXT NOT NULL, workspace TEXT NOT NULL, session TEXT NOT NULL, created INTEGER NOT NULL, outcome TEXT NOT NULL, message TEXT NOT NULL DEFAULT '');")?;
+        // A separate completion sequence also migrates existing answers without
+        // changing operation fingerprints or at-most-once tombstones.
+        self.0.execute_batch("CREATE TABLE IF NOT EXISTS answer_completion(sequence INTEGER PRIMARY KEY AUTOINCREMENT, operation_id TEXT NOT NULL UNIQUE); INSERT OR IGNORE INTO answer_completion(operation_id) SELECT id FROM operations WHERE tool='notify' AND message<>'' ORDER BY rowid; UPDATE operations SET message='' WHERE tool='notify' AND message<>'' AND id NOT IN (SELECT operation_id FROM answer_completion ORDER BY sequence DESC LIMIT 100);")?;
         Ok(())
     }
     pub fn claim(
@@ -108,13 +111,18 @@ impl History {
             )? == 1,
             "operation_not_claimed"
         );
-        // Retain the latest 500 full answers; keep all bounded deduplication tombstones.
-        tx.execute("UPDATE operations SET message='' WHERE rowid NOT IN (SELECT rowid FROM operations ORDER BY rowid DESC LIMIT 500)", [])?;
+        if !message.is_empty() {
+            tx.execute("INSERT OR IGNORE INTO answer_completion(operation_id) SELECT id FROM operations WHERE id=?1 AND tool='notify'", [id])?;
+        }
+        // Notifications retain at most 100 items. Input audit churn must never
+        // invalidate a still-visible answer link. Preserve answer bodies on their
+        // own horizon while keeping all bounded idempotency tombstones.
+        tx.execute("UPDATE operations SET message='' WHERE tool='notify' AND message<>'' AND id NOT IN (SELECT operation_id FROM answer_completion ORDER BY sequence DESC LIMIT 100)", [])?;
         tx.commit()?;
         Ok(())
     }
     pub fn recent(&self) -> anyhow::Result<Vec<Record>> {
-        let mut stmt = self.0.prepare("SELECT id,tool,workspace,session,created,outcome,message FROM operations ORDER BY rowid DESC LIMIT 500")?;
+        let mut stmt = self.0.prepare("SELECT id,tool,workspace,session,created,outcome,message FROM operations WHERE rowid IN (SELECT rowid FROM operations ORDER BY rowid DESC LIMIT 500) OR id IN (SELECT operation_id FROM answer_completion ORDER BY sequence DESC LIMIT 100) ORDER BY (SELECT sequence FROM answer_completion WHERE operation_id=operations.id) DESC, rowid DESC")?;
         Ok(stmt
             .query_map([], |r| {
                 Ok(Record {

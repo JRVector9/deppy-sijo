@@ -203,3 +203,130 @@ fn history_database_symlinks_are_rejected() {
     std::fs::remove_file(path).unwrap();
     std::fs::remove_dir(dir).unwrap();
 }
+
+#[test]
+fn notified_answers_survive_input_audit_churn_and_expire_with_newer_answers() {
+    let db = History::open_memory().unwrap();
+    let args = serde_json::json!({});
+    db.claim("answer-old", "notify", &args, "w", "s").unwrap();
+    db.finish(
+        "answer-old",
+        &serde_json::json!({"status":"stored"}),
+        "original answer",
+    )
+    .unwrap();
+    for index in 0..500 {
+        let id = format!("input-{index}");
+        db.claim(&id, "send_text", &args, "w", "s").unwrap();
+        db.finish(&id, &serde_json::json!({"status":"queued"}), "")
+            .unwrap();
+    }
+    assert!(
+        db.recent()
+            .unwrap()
+            .iter()
+            .any(|r| r.id == "answer-old" && r.message == "original answer"),
+        "input audit must not remove a notified answer"
+    );
+    for index in 0..100 {
+        db.claim(&format!("unfinished-{index}"), "notify", &args, "w", "s")
+            .unwrap();
+    }
+    assert!(
+        db.recent()
+            .unwrap()
+            .iter()
+            .any(|r| r.id == "answer-old" && r.message == "original answer"),
+        "unfinished requests must not displace notified answers"
+    );
+    for index in 0..100 {
+        let id = format!("answer-{index}");
+        db.claim(&id, "notify", &args, "w", "s").unwrap();
+        db.finish(&id, &serde_json::json!({"status":"stored"}), "new answer")
+            .unwrap();
+    }
+    let records = db.recent().unwrap();
+    assert!(!records.iter().any(|r| r.id == "answer-old"));
+    assert_eq!(
+        records
+            .iter()
+            .filter(|r| r.tool == "notify" && !r.message.is_empty())
+            .count(),
+        100
+    );
+    assert!(records.len() <= 600);
+    assert!(matches!(
+        db.claim("answer-old", "notify", &args, "w", "s").unwrap(),
+        Claim::Existing(_)
+    ));
+}
+
+#[cfg(unix)]
+
+#[test]
+fn answer_retention_uses_completion_order() {
+    let db = History::open_memory().unwrap();
+    let args = json!({});
+    db.claim("late", "notify", &args, "w", "s").unwrap();
+    for i in 0..100 {
+        let id = format!("early-{i}");
+        db.claim(&id, "notify", &args, "w", "s").unwrap();
+        db.finish(&id, &json!({"status":"stored"}), "earlier")
+            .unwrap();
+    }
+    db.finish("late", &json!({"status":"stored"}), "latest answer")
+        .unwrap();
+    let records = db.recent().unwrap();
+    assert_eq!(records[0].id, "late");
+    assert_eq!(
+        records.iter().find(|r| r.id == "late").unwrap().message,
+        "latest answer"
+    );
+    assert!(
+        records
+            .iter()
+            .find(|r| r.id == "early-0")
+            .unwrap()
+            .message
+            .is_empty()
+    );
+}
+
+#[test]
+fn legacy_answer_database_migrates_and_prunes_on_open() {
+    let path = std::env::temp_dir().join(format!("deppy-legacy-{}.db", uuid::Uuid::new_v4()));
+    {
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE operations(id TEXT PRIMARY KEY, fingerprint BLOB NOT NULL, tool TEXT NOT NULL, workspace TEXT NOT NULL, session TEXT NOT NULL, created INTEGER NOT NULL, outcome TEXT NOT NULL, message TEXT NOT NULL DEFAULT '');").unwrap();
+        for i in 0..150 {
+            db.execute(
+                "INSERT INTO operations VALUES(?1,X'00','notify','w','s',0,'{}','legacy answer')",
+                [format!("old-{i}")],
+            )
+            .unwrap();
+        }
+    }
+    {
+        let db = History::open(&path).unwrap();
+        assert_eq!(
+            db.recent()
+                .unwrap()
+                .iter()
+                .filter(|r| !r.message.is_empty())
+                .count(),
+            100
+        );
+    }
+    {
+        let db = History::open(&path).unwrap();
+        assert_eq!(
+            db.recent()
+                .unwrap()
+                .iter()
+                .filter(|r| !r.message.is_empty())
+                .count(),
+            100
+        );
+    }
+    std::fs::remove_file(path).unwrap();
+}

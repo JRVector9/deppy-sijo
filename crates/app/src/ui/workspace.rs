@@ -8543,6 +8543,14 @@ impl WorkspaceUi {
             .and_then(|p| p.session_id)
     }
 
+    pub fn cloud_agent_screen(&self, session: SessionId) -> Option<String> {
+        self.sessions
+            .get(&session)?
+            .snapshot
+            .as_ref()
+            .map(|s| crate::cloud_agent::screen_text(s))
+    }
+
     pub fn session_bracketed_paste(&self, session: SessionId) -> bool {
         self.sessions
             .get(&session)

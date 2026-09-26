@@ -9283,6 +9283,17 @@ impl web_remote::relay_client::RelayFrameSink for RelayDashboardSink {
     }
 }
 
+fn cloud_agent_mux(rt: &WorkspaceRuntime) -> Option<&runtime::MuxSnapshot> {
+    rt.pending_events
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            runtime::RuntimeEvent::MuxUpdated { snapshot } => Some(snapshot.as_ref()),
+            _ => None,
+        })
+        .or_else(|| rt.workspace_ui.mux().map(Arc::as_ref))
+}
+
 /// Optional web-remote persistence adapter. The concrete SQLite handle is constructed only from
 /// the composition root and shared by dashboard/push through the storage-neutral port. Each
 /// method releases the mutex before the caller performs network I/O.
@@ -9480,6 +9491,7 @@ struct AgentDetectInputSnapshot {
 }
 
 pub struct App {
+    cloud_agent: crate::cloud_agent::CloudAgent,
     config: Config,
     config_path: PathBuf,
     /// 직전 프레임의 실효 테마(다크 여부) — 바뀌면 터미널 렌더 캐시를 비운다.
@@ -14558,6 +14570,15 @@ impl App {
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
             .join("notice_translations.json");
+        let mut cloud_agent = crate::cloud_agent::CloudAgent::new(
+            &db_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("cloud_agent_history.db"),
+            redaction.clone(),
+        );
+        cloud_agent.port = config.cloud_agent.port.max(1024);
+        cloud_agent.hostname = config.cloud_agent.public_host.chars().take(259).collect();
         let composer_history_path = db_path
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
@@ -14819,6 +14840,7 @@ impl App {
             ollama_detect_done: false,
             ollama_detect_rx: None,
             agent_sessions_was_open: false,
+            cloud_agent,
             notifications_ui: ui::notifications::NotificationsUi::new(),
             inbox_waiting_ui: ui::inbox_waiting::InboxWaitingUi::new(),
             // 히스토리 파일은 앱 데이터 디렉터리(= 메타데이터 파일과 같은 폴더) 아래.
@@ -23811,6 +23833,128 @@ impl App {
         }
     }
 
+    fn pump_cloud_agent(&mut self, ctx: &egui::Context) {
+        self.cloud_agent.apply_action(ctx);
+        if self.cloud_agent.server.is_none()
+            && !(self.settings_open
+                && self.settings_category == ui::settings::Category::CloudAgents)
+        {
+            return;
+        }
+        let mut targets = Vec::new();
+        for rt in std::iter::once(&self.active).chain(self.warm.values()) {
+            let Some(mux) = cloud_agent_mux(rt) else {
+                continue;
+            };
+            let name = self
+                .workspaces
+                .iter()
+                .find(|w| w.id == rt.id)
+                .map(Self::workspace_display_name)
+                .unwrap_or_else(|| rt.id.clone());
+            for pane in mux.tabs.iter().flat_map(|tab| &tab.panes) {
+                if targets.len() == 256 {
+                    break;
+                }
+                let (Some(session), Some(id)) =
+                    (pane.session_id, pane.persistent_session_id.as_ref())
+                else {
+                    continue;
+                };
+                if uuid::Uuid::parse_str(id).is_err() {
+                    continue;
+                }
+                let screen = if self.cloud_agent.wants_screen(id) {
+                    rt.pending_events
+                        .iter()
+                        .rev()
+                        .find_map(|e| {
+                            e.viewport()
+                                .filter(|(sid, _, _, _)| *sid == session)
+                                .map(|(_, snap, _, _)| crate::cloud_agent::screen_text(snap))
+                        })
+                        .or_else(|| rt.workspace_ui.cloud_agent_screen(session))
+                } else {
+                    None
+                };
+                targets.push(crate::cloud_agent::Target {
+                    id: id.clone(),
+                    generation: format!(
+                        "{}:{}:{}",
+                        self.cloud_agent.boot, rt.runtime_instance, session.0
+                    ),
+                    workspace: rt.id.clone(),
+                    workspace_name: name.chars().take(256).collect(),
+                    title: ui::workspace::display_pane_title(&pane.title, &self.i18n)
+                        .chars()
+                        .take(256)
+                        .collect(),
+                    runtime: rt.runtime_instance,
+                    session,
+                    pane: pane.id.clone(),
+                    live: !rt.live.exited_sessions.contains(&session),
+                    screen,
+                });
+            }
+        }
+        self.cloud_agent.set_targets(targets);
+        // Bounded frame work; HTTP wakes the App and each request has a deadline.
+        for _ in 0..16 {
+            let Some(req) = self.cloud_agent.next_request() else {
+                break;
+            };
+            let active = &self.active;
+            let warm = &self.warm;
+            let notice = self.cloud_agent.handle(req, |target, effect| {
+                let rt = std::iter::once(active)
+                    .chain(warm.values())
+                    .find(|rt| rt.runtime_instance == target.runtime && rt.id == target.workspace)
+                    .ok_or_else(|| "runtime_changed_no_effect".to_string())?;
+                let valid = cloud_agent_mux(rt).is_some_and(|mux| {
+                    crate::cloud_agent::target_matches(
+                        target,
+                        rt.runtime_instance,
+                        &rt.id,
+                        mux,
+                        rt.live.exited_sessions.contains(&target.session),
+                        matches!(&effect, crate::cloud_agent::Effect::Input(_)),
+                    )
+                });
+                if !valid {
+                    return Err("session_changed_or_closed_no_effect".into());
+                }
+                let command = match effect {
+                    crate::cloud_agent::Effect::Input(bytes) => {
+                        runtime::RuntimeCommand::WriteInput {
+                            session: target.session,
+                            bytes,
+                        }
+                    }
+                    crate::cloud_agent::Effect::Watch => {
+                        runtime::RuntimeCommand::SetRemoteViewing {
+                            session: target.session,
+                            viewing: true,
+                            ttl_ms: 15_000,
+                        }
+                    }
+                };
+                rt.runtime
+                    .send_command(command)
+                    .map_err(|_| "runtime_queue_rejected_no_effect".to_string())
+            });
+            if let Some(notice) = notice {
+                self.notifications_ui.on_cloud_answer(
+                    &notice.target.workspace,
+                    &notice.target.id,
+                    &notice.operation_id,
+                    &notice.target.title,
+                    &notice.message,
+                    &self.i18n,
+                );
+            }
+        }
+    }
+
     fn runtime_by_instance(&self, runtime_instance: u64) -> Option<&WorkspaceRuntime> {
         if self.active.runtime_instance == runtime_instance {
             return Some(&self.active);
@@ -29486,6 +29630,7 @@ impl eframe::App for App {
             // 프레임이 그리는 내용을 위해 프레임을 한 장 더 잡고, egui가 거기에 settle 프레임을
             // 하나 더 붙여 갱신 1회당 3프레임이 된다 (agenttui 실측: 페인트의 70%가 헛 프레임).
         }
+        self.pump_cloud_agent(ctx);
         if primary_activation_post_render_tick {
             // WorkspaceUi consumes MuxUpdated in ui(), after this logic pass. Wake one more tick
             // so the activation state machine observes the materialized exact pane immediately.
@@ -32709,7 +32854,8 @@ impl eframe::App for App {
             devices: &self.relay_devices,
             now: relay_now,
         };
-        let out = ui::settings::show(
+        let cloud_coordinates_before = (self.cloud_agent.port, self.cloud_agent.hostname.clone());
+        let mut out = ui::settings::show(
             ui.ctx(),
             &mut self.settings_open,
             &mut self.settings_category,
@@ -33010,6 +33156,11 @@ impl eframe::App for App {
                 }
             },
         );
+        if cloud_coordinates_before != (self.cloud_agent.port, self.cloud_agent.hostname.clone()) {
+            self.config.cloud_agent.port = self.cloud_agent.port;
+            self.config.cloud_agent.public_host = self.cloud_agent.hostname.clone();
+            out.config_changed = true;
+        }
         if let Some(intent) = connector_intent {
             let subject = if matches!(
                 intent,
@@ -33030,6 +33181,7 @@ impl eframe::App for App {
         }
         // T1: 설정 창이 닫히면 세션 폴더 배너를 버린다 — 다음 우클릭 진입에서 재감지.
         if !self.settings_open {
+            self.cloud_agent.reveal = false;
             self.env_session_banner = None;
             // 닫힌 뒤 프레임이 쉬어도 다음 진입을 새 열기로 인식하고 초안을 즉시 비운다.
             if self.settings_was_open {
@@ -33339,6 +33491,12 @@ impl eframe::App for App {
                 plan_agent_notification_navigation(&target, &self.active.id, &workspace_ids);
             if let Some(navigation) = navigation {
                 match navigation {
+                    AgentNotificationNavigation::OpenCloudAnswer { operation_id } => {
+                        self.cloud_agent.selected_record = Some(operation_id);
+                        self.set_settings_category(ui::settings::Category::CloudAgents);
+                        self.settings_open = true;
+                        ui.ctx().request_repaint();
+                    }
                     AgentNotificationNavigation::FocusCurrentPty { session } => {
                         self.stage_workspace_controller_action(
                             WorkspaceControllerAction::FocusPty {
@@ -33766,6 +33924,9 @@ fn tab_of_agent_target(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AgentNotificationNavigation {
+    OpenCloudAnswer {
+        operation_id: String,
+    },
     FocusCurrentPty {
         session: runtime::SessionId,
     },
@@ -33788,6 +33949,11 @@ fn plan_agent_notification_navigation(
     known_workspace_ids: &[String],
 ) -> Option<AgentNotificationNavigation> {
     match target {
+        ui::notifications::AgentNotificationTarget::CloudAnswer { operation_id, .. } => {
+            Some(AgentNotificationNavigation::OpenCloudAnswer {
+                operation_id: operation_id.clone(),
+            })
+        }
         ui::notifications::AgentNotificationTarget::Pty {
             workspace_id,
             session,

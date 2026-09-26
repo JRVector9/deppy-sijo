@@ -188,3 +188,18 @@ fn notifications_and_responses_use_202_without_a_body() {
         (202, String::new())
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn history_database_symlinks_are_rejected() {
+    let dir = std::env::temp_dir().join(format!("deppy-mcp-link-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("real.db");
+    drop(History::open(&path).unwrap());
+    let link = dir.join("link.db");
+    std::os::unix::fs::symlink(&path, &link).unwrap();
+    assert!(History::open(&link).is_err());
+    std::fs::remove_file(link).unwrap();
+    std::fs::remove_file(path).unwrap();
+    std::fs::remove_dir(dir).unwrap();
+}

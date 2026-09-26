@@ -251,6 +251,7 @@ pub enum Category {
     /// Relay(외부 중계). MobileWeb과 **독립된 평면 섹션**이다 — 「둘 다」는 두 스위치에서
     /// 파생될 뿐, 저장되는 전송 모드는 없다.
     Relay,
+    CloudAgents,
     // ── 관리 (App이 render_management로 렌더) ──
     Credentials,
     Connectors,
@@ -688,6 +689,12 @@ fn nav(
             }
 
             let manage = [
+                (
+                    Category::CloudAgents,
+                    Icon::Link,
+                    catalog.t("cloud.title", &[]),
+                    "cloud agent grok bot mcp remote input 클라우드 그록 입력 답변",
+                ),
                 (
                     Category::Connectors,
                     Icon::Link,

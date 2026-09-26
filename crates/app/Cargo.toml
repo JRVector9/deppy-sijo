@@ -16,6 +16,7 @@ bench-alloc = []
 render-glow = ["eframe/glow"]
 
 [dependencies]
+agent-mcp = { path = "../agent-mcp" }
 eframe = { workspace = true }
 egui = { workspace = true }
 anyhow = { workspace = true }

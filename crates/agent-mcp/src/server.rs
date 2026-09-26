@@ -101,15 +101,7 @@ impl Server {
         public_host: &str,
         wake: impl Fn() + Send + Sync + 'static,
     ) -> anyhow::Result<Self> {
-        anyhow::ensure!(
-            public_host.is_empty()
-                || (public_host.len() <= 253
-                    && public_host.contains('.')
-                    && public_host
-                        .bytes()
-                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-'))),
-            "invalid_public_hostname"
-        );
+        anyhow::ensure!(valid_public_host(public_host), "invalid_public_hostname");
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))?;
         listener.set_nonblocking(true)?;
         let addr = listener.local_addr()?;
@@ -172,6 +164,31 @@ impl Drop for Server {
         }
     }
 }
+fn valid_public_host(host: &str) -> bool {
+    if host.is_empty() {
+        return true;
+    }
+    let domain = if let Some((domain, port)) = host.rsplit_once(':') {
+        if !port.parse::<u16>().is_ok_and(|p| p > 0) {
+            return false;
+        }
+        domain
+    } else {
+        host
+    };
+    domain.len() <= 253
+        && domain.contains('.')
+        && domain.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'-')
+        })
+}
+
 fn supported(version: &str) -> bool {
     matches!(version, "2025-03-26" | "2025-06-18" | "2025-11-25")
 }
@@ -345,7 +362,10 @@ fn process(
     json_response(json!({"jsonrpc":"2.0","id":id,"result":result}))
 }
 fn tool_response(id: Value, result: Result<Value, String>) -> Response {
-    let error = result.is_err();
+    let error = result.is_err()
+        || result
+            .as_ref()
+            .is_ok_and(|v| matches!(v["status"].as_str(), Some("rejected" | "unknown")));
     let payload = result.unwrap_or_else(|e| json!({"error":e}));
     json_response(
         json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":payload.to_string()}],"isError":error}}),
@@ -390,5 +410,24 @@ mod deadline_tests {
         assert!(start.elapsed() < Duration::from_millis(350));
         drop(stream);
         writer.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod hostname_tests {
+    use super::*;
+    #[test]
+    fn dedicated_funnel_port_is_allowed_but_urls_and_bad_domains_are_rejected() {
+        assert!(valid_public_host("mac.example.ts.net:8443"));
+        for host in [
+            "https://mac.example.ts.net",
+            "a.example:0",
+            "a.example:65536",
+            "a..example",
+            "-a.example",
+            "a.example/mcp",
+        ] {
+            assert!(!valid_public_host(host));
+        }
     }
 }

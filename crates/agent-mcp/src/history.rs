@@ -28,11 +28,26 @@ impl History {
                 "history_file_type"
             );
         }
-        let db = Self(Connection::open(path)?);
+        // macOS /var is itself a symlink; resolve the trusted parent, while leaving
+        // the final database component subject to SQLite's NOFOLLOW check.
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("history_filename"))?;
+        let resolved = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .canonicalize()?
+            .join(file_name);
+        let db = Self(Connection::open_with_flags(
+            &resolved,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+                | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+            std::fs::set_permissions(&resolved, std::fs::Permissions::from_mode(0o600))?;
         }
         db.init()?;
         Ok(db)

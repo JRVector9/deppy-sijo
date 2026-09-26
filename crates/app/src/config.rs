@@ -172,6 +172,7 @@ pub struct Config {
     pub performance: PerformanceConfig,
     pub remote: RemoteConfig,
     pub web: WebConfig,
+    pub cloud_agent: CloudAgentConfig,
     /// Relay(외부 중계) 설정. `web`과 **완전히 독립**이다 — 어느 한쪽을 켜거나 끄는 것이
     /// 다른 쪽 상태를 바꾸지 않는다. 「둘 다」는 두 스위치에서 파생되는 표시일 뿐, 저장되는
     /// 전송 모드 열거형 같은 것은 존재하지 않는다.
@@ -181,6 +182,22 @@ pub struct Config {
     /// 알 수 없는 항목은 무시해 이전/이후 버전의 config와 호환한다.
     pub shortcuts: ShortcutsConfig,
     pub agents: AgentsConfig,
+}
+
+/// Non-secret connection coordinates. Server and consent always start disabled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CloudAgentConfig {
+    pub port: u16,
+    pub public_host: String,
+}
+impl Default for CloudAgentConfig {
+    fn default() -> Self {
+        Self {
+            port: 8739,
+            public_host: String::new(),
+        }
+    }
 }
 
 /// Agents 창 (APP) Codex app-server 설정 (PR-L2). 프로바이더는 프로세스 레벨 `-c`

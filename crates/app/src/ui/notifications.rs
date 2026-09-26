@@ -66,6 +66,11 @@ impl fmt::Debug for NativeNotificationIntent {
 pub enum AgentNotificationTarget {
     /// 세션 상태와 무관한 워크스페이스 작업 오류. 목록에 남기되 세션 이동은 하지 않는다.
     Workspace { workspace_id: String },
+    CloudAnswer {
+        workspace_id: String,
+        session_id: String,
+        operation_id: String,
+    },
     Pty {
         workspace_id: String,
         session: SessionId,
@@ -81,7 +86,8 @@ impl AgentNotificationTarget {
         match self {
             Self::Workspace { workspace_id }
             | Self::Pty { workspace_id, .. }
-            | Self::Structured { workspace_id, .. } => workspace_id,
+            | Self::Structured { workspace_id, .. }
+            | Self::CloudAnswer { workspace_id, .. } => workspace_id,
         }
     }
 }
@@ -91,11 +97,13 @@ enum AgentNotificationSource {
     Workspace(WorkspaceErrorKind),
     Pty(Option<AgentProvider>),
     App(AgentProvider),
+    Cloud,
 }
 
 impl AgentNotificationSource {
     fn badge(self) -> &'static str {
         match self {
+            Self::Cloud => "[Cloud]",
             Self::Workspace(_) => "[Deppy Sijo]",
             Self::Pty(Some(AgentProvider::Codex)) => "[Codex PTY]",
             Self::Pty(Some(AgentProvider::Claude)) => "[Claude PTY]",
@@ -133,6 +141,49 @@ struct NotificationItem {
 }
 
 impl NotificationsUi {
+    pub fn on_cloud_answer(
+        &mut self,
+        workspace: &str,
+        session_id: &str,
+        operation_id: &str,
+        title: &str,
+        message: &str,
+        catalog: &i18n::Catalog,
+    ) {
+        let preview: String = message.chars().take(240).collect();
+        let label = format!(
+            "{} — {}",
+            title.chars().take(120).collect::<String>(),
+            preview
+        );
+        let target = AgentNotificationTarget::CloudAnswer {
+            workspace_id: workspace.to_owned(),
+            session_id: session_id.to_owned(),
+            operation_id: operation_id.to_owned(),
+        };
+        self.items.push(NotificationItem {
+            target,
+            source: AgentNotificationSource::Cloud,
+            status: SessionStatus::Done,
+            title: label.clone(),
+            message_id: "notification.cloud_answer",
+            read: false,
+            created_at_secs: deppy_core::time::unix_secs_i64(),
+        });
+        if self.items.len() > MAX_NOTIFICATION_HISTORY {
+            self.items.remove(0);
+        }
+        if let Some(intent) = NativeNotificationIntent::new(
+            catalog.t("notification.cloud_answer", &[("title", &label)]),
+            &preview,
+        ) {
+            if self.native_intents.len() == MAX_NATIVE_INTENTS {
+                self.native_intents.pop_front();
+            }
+            self.native_intents.push_back(intent);
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             items: Vec::new(),
@@ -516,6 +567,7 @@ impl NotificationsUi {
                     // Structured liveness is owned by AgentSessionsUi rather
                     // than the active PTY mux and is pruned separately.
                     AgentNotificationTarget::Structured { .. }
+                    | AgentNotificationTarget::CloudAnswer { .. }
                     | AgentNotificationTarget::Workspace { .. } => true,
                 }
         });
@@ -529,6 +581,7 @@ impl NotificationsUi {
                         alive.contains(session_id)
                     }
                     AgentNotificationTarget::Pty { .. }
+                    | AgentNotificationTarget::CloudAnswer { .. }
                     | AgentNotificationTarget::Workspace { .. } => true,
                 }
         });
@@ -643,6 +696,15 @@ fn bounded_target(target: &AgentNotificationTarget) -> bool {
         | AgentNotificationTarget::Pty { workspace_id, .. } => {
             bounded_text(workspace_id, MAX_WORKSPACE_ID_BYTES)
         }
+        AgentNotificationTarget::CloudAnswer {
+            workspace_id,
+            session_id,
+            operation_id,
+        } => {
+            bounded_text(workspace_id, MAX_WORKSPACE_ID_BYTES)
+                && bounded_text(session_id, 128)
+                && bounded_text(operation_id, 128)
+        }
         AgentNotificationTarget::Structured {
             workspace_id,
             session_id,
@@ -672,8 +734,7 @@ pub fn section_label(ui: &mut egui::Ui, text: &str) {
 /// 경과 초 → 「방금/N분 전/N시간 전/N일 전」 로케일 문구 (작업함 페이지 시간 표시).
 /// diff_panel의 relative_time_label과 같은 구간 규칙이되, 새 사용자 문자열 규칙에 따라
 /// i18n 카탈로그를 쓴다.
-#[allow(dead_code)]
-fn relative_time_label(catalog: &i18n::Catalog, elapsed_secs: i64) -> String {
+pub fn relative_time_label(catalog: &i18n::Catalog, elapsed_secs: i64) -> String {
     let secs = elapsed_secs.max(0);
     if secs < 60 {
         catalog.t("inbox.time.just_now", &[])
@@ -1150,6 +1211,7 @@ mod tests {
             .filter_map(|item| match item.target {
                 AgentNotificationTarget::Pty { session, .. } => Some(session),
                 AgentNotificationTarget::Structured { .. }
+                | AgentNotificationTarget::CloudAnswer { .. }
                 | AgentNotificationTarget::Workspace { .. } => None,
             })
             .collect();
@@ -1298,5 +1360,42 @@ mod tests {
         assert_eq!(relative_time_label(&catalog, 3 * 86_400), "3일 전");
         // 음수(시계 역행)는 방금으로 고정 — 미래 표기를 만들지 않는다.
         assert_eq!(relative_time_label(&catalog, -10), "방금");
+    }
+}
+
+#[cfg(test)]
+mod cloud_answer_tests {
+    use super::*;
+    #[test]
+    fn cloud_answer_keeps_stable_identity_without_suppressing_pty_completion() {
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        let mut n = NotificationsUi::new();
+        n.on_cloud_answer(
+            "workspace",
+            "persistent-uuid",
+            "answer-1",
+            "session",
+            "그록 답변",
+            &catalog,
+        );
+        n.on_pty_exit(
+            "workspace",
+            SessionId(1),
+            Some(0),
+            "session",
+            None,
+            &catalog,
+        );
+        assert_eq!(n.items.len(), 2);
+        assert_eq!(
+            n.items[0].target,
+            AgentNotificationTarget::CloudAnswer {
+                workspace_id: "workspace".into(),
+                session_id: "persistent-uuid".into(),
+                operation_id: "answer-1".into()
+            }
+        );
+        assert_eq!(n.items[1].source, AgentNotificationSource::Pty(None));
+        assert_eq!(n.unread(), 2);
     }
 }

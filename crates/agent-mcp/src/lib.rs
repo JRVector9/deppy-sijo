@@ -28,7 +28,7 @@ pub fn tools() -> Value {
     let identity = json!({"session_id":{"type":"string"},"generation":{"type":"string"},"operation_id":{"type":"string","description":"Unique ID for this action. Reuse only for the exact same action; never retry unknown input with a new ID."}});
     let mut result = vec![
         json!({"name":"list_sessions","description":"List explicitly shared Deppy terminal sessions. Keep the UUID and generation for subsequent calls.","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":true}}),
-        json!({"name":"read_output","description":"Read the latest visible terminal screen when it changes. Not a lossless stdout log. Pass returned cursor; reset=true means resynchronize.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"generation":{"type":"string"},"cursor":{"type":"integer","minimum":0}},"required":["session_id","generation"],"additionalProperties":false},"annotations":{"readOnlyHint":true}}),
+        json!({"name":"read_output","description":"Read the latest observed terminal screen and request a refresh. The cached result may be stale; null means unchanged cache, not proof of no new output. Retry after retry_after_ms for a refreshed screen. Not a lossless stdout log. Pass returned cursor; reset=true means resynchronize.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"generation":{"type":"string"},"cursor":{"type":"integer","minimum":0}},"required":["session_id","generation"],"additionalProperties":false},"annotations":{"readOnlyHint":true}}),
     ];
     for (name, description, extra, required) in [
         (

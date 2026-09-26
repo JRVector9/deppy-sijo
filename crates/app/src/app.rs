@@ -12446,6 +12446,14 @@ fn app_host_copy_into(
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<(), ()> {
     let name = source.file_name().ok_or(())?;
+    if source
+        .parent()
+        .and_then(|parent| std::fs::canonicalize(parent).ok())
+        .as_deref()
+        == Some(destination_dir)
+    {
+        return app_host_duplicate_source(source, budget, cancel).map_err(|_| ());
+    }
     if let Ok(source_real) = std::fs::canonicalize(source)
         && destination_dir.starts_with(source_real)
     {
@@ -12468,14 +12476,85 @@ fn app_host_copy_into(
     Ok(())
 }
 
+fn app_host_duplicate_source(
+    source: &Path,
+    copy_budget: &mut AppHostFileOperationBudget,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<(), ui::file_tree::FileTreeIoErrorCode> {
+    use ui::file_tree::FileTreeIoErrorCode as Error;
+
+    let parent = source.parent().ok_or(Error::InvalidPath)?;
+    let metadata = std::fs::symlink_metadata(source).map_err(|_| Error::InvalidPath)?;
+    let stem = if metadata.file_type().is_dir() {
+        source.file_name()
+    } else {
+        source.file_stem()
+    }
+    .ok_or(Error::InvalidPath)?;
+    let extension = (!metadata.file_type().is_dir())
+        .then(|| source.extension())
+        .flatten();
+    let mut validation = AppHostFileOperationBudget::default();
+    app_host_validate_tree(source, &mut validation, cancel, 0).map_err(|_| Error::NativeFailure)?;
+    let temporary = parent.join(format!(".tmp-{}", uuid::Uuid::new_v4()));
+    if app_host_copy_recursive(source, &temporary, copy_budget, cancel, 0).is_err() {
+        let _ = app_host_remove_all(&temporary);
+        return Err(Error::NativeFailure);
+    }
+    for index in 1..=1_000 {
+        app_host_file_operation_cancelled(cancel).map_err(|_| {
+            let _ = app_host_remove_all(&temporary);
+            Error::NativeFailure
+        })?;
+        let mut name = stem.to_os_string();
+        name.push(" copy");
+        if index > 1 {
+            name.push(format!(" {index}"));
+        }
+        if let Some(extension) = extension {
+            name.push(".");
+            name.push(extension);
+        }
+        match app_host_rename_no_replace(&temporary, &parent.join(name)) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => {
+                let _ = app_host_remove_all(&temporary);
+                return Err(Error::NativeFailure);
+            }
+        }
+    }
+    let _ = app_host_remove_all(&temporary);
+    Err(Error::Conflict)
+}
+
 fn app_host_move(
     root: &Path,
     source: &Path,
     destination_dir: &Path,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<(), ui::file_tree::FileTreeIoErrorCode> {
-    let root =
-        std::fs::canonicalize(root).map_err(|_| ui::file_tree::FileTreeIoErrorCode::OutsideRoot)?;
+    app_host_move_with_root(Some(root), source, destination_dir, cancel)
+}
+
+fn app_host_move_clipboard_source(
+    source: &Path,
+    destination_dir: &Path,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<(), ui::file_tree::FileTreeIoErrorCode> {
+    app_host_move_with_root(None, source, destination_dir, cancel)
+}
+
+fn app_host_move_with_root(
+    root: Option<&Path>,
+    source: &Path,
+    destination_dir: &Path,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<(), ui::file_tree::FileTreeIoErrorCode> {
+    let root = root
+        .map(std::fs::canonicalize)
+        .transpose()
+        .map_err(|_| ui::file_tree::FileTreeIoErrorCode::OutsideRoot)?;
     let destination_dir = std::fs::canonicalize(destination_dir)
         .map_err(|_| ui::file_tree::FileTreeIoErrorCode::OutsideRoot)?;
     let name = source
@@ -12486,8 +12565,9 @@ fn app_host_move(
         .and_then(|parent| std::fs::canonicalize(parent).ok())
         .ok_or(ui::file_tree::FileTreeIoErrorCode::InvalidPath)?;
     let source = source_parent.join(name);
-    if !source.starts_with(&root)
-        || !destination_dir.starts_with(&root)
+    if root
+        .as_ref()
+        .is_some_and(|root| !source.starts_with(root) || !destination_dir.starts_with(root))
         || destination_dir.starts_with(&source)
     {
         return Err(ui::file_tree::FileTreeIoErrorCode::OutsideRoot);
@@ -12637,6 +12717,29 @@ fn run_file_tree_host_io(
             for source in sources {
                 app_host_copy_into(&source, &destination, &mut copy_budget, cancel)
                     .map_err(|_| Error::NativeFailure)?;
+            }
+            Ok(())
+        }
+        Request::MoveFromClipboard { destination } => {
+            let Some(sources) = ui::clipboard_image::read_clipboard_file_list() else {
+                return Ok(());
+            };
+            let destination =
+                std::fs::canonicalize(destination.into_path()).map_err(|_| Error::InvalidPath)?;
+            let mut validation = AppHostFileOperationBudget::default();
+            for source in &sources {
+                app_host_validate_tree(source, &mut validation, cancel, 0)
+                    .map_err(|_| Error::NativeFailure)?;
+            }
+            for source in sources {
+                app_host_move_clipboard_source(&source, &destination, cancel)?;
+            }
+            Ok(())
+        }
+        Request::Duplicate { sources } => {
+            let mut copy_budget = AppHostFileOperationBudget::default();
+            for source in sources.into_paths() {
+                app_host_duplicate_source(&source, &mut copy_budget, cancel)?;
             }
             Ok(())
         }
@@ -21161,6 +21264,13 @@ impl App {
         if self.settings_open || ctx.text_edit_focused() {
             return;
         }
+        if self
+            .file_tree
+            .as_ref()
+            .is_some_and(|tree| tree.reserves_action_shortcut(ctx))
+        {
+            return;
+        }
         let Some(action) = crate::shortcuts::take_triggered_action(ctx, &self.config.shortcuts)
         else {
             return;
@@ -21182,6 +21292,13 @@ impl App {
             multi_pane_pointer_transition,
         ) {
             return;
+        }
+
+        if (shortcut_targets_primary_terminal(action)
+            || action == crate::shortcuts::ShortcutAction::FocusComposer)
+            && let Some(tree) = self.file_tree.as_mut()
+        {
+            tree.release_keyboard_focus();
         }
 
         use crate::shortcuts::ShortcutAction as A;
@@ -28757,11 +28874,12 @@ impl eframe::App for App {
             // 파일 트리가 이번 프레임 ⌘V/⌘C를 소비했으면 같은 제스처가 터미널로도 흘러
             // 이중 처리(경로 삽입 붙여넣기/선택 복사 pasteboard 덮어쓰기)되는 것을
             // 누른다 — 사이드바(좌측 패널)가 workspace show()보다 먼저 도는 순서 전제.
-            if let Some((paste_consumed, copy_consumed)) = self
-                .file_tree
-                .as_mut()
-                .map(|tree| tree.take_clipboard_shortcut_consumption())
-                && (paste_consumed || copy_consumed)
+            if let Some((paste_consumed, copy_consumed, tree_keyboard_focused)) =
+                self.file_tree.as_mut().map(|tree| {
+                    let (paste, copy) = tree.take_clipboard_shortcut_consumption();
+                    (paste, copy, tree.keyboard_focused())
+                })
+                && (paste_consumed || copy_consumed || tree_keyboard_focused)
             {
                 let target = terminal_runtime_identity_for_owner(
                     self.frame_terminal_owner,
@@ -28784,6 +28902,9 @@ impl eframe::App for App {
                     runtime
                         .workspace_ui
                         .suppress_clipboard_shortcuts_this_frame(paste_consumed, copy_consumed);
+                    if tree_keyboard_focused {
+                        runtime.workspace_ui.suppress_tree_keyboard_this_frame();
+                    }
                 }
             }
             match sidebar_action {
@@ -30140,6 +30261,9 @@ impl eframe::App for App {
                 })
                 .unwrap_or(false);
         if primary_terminal_focus_claimed || attached_terminal_focus_claimed {
+            if let Some(tree) = self.file_tree.as_mut() {
+                tree.release_keyboard_focus();
+            }
             self.agent_sessions_ui.surrender_text_focus(ui.ctx());
         }
         // logic에서 workspace/path 변경 때만 검증한 immutable cwd projection을 넘긴다.
@@ -40425,6 +40549,119 @@ mod tests {
         assert!(source.exists());
         assert!(!destination_dir.join("source.bin").exists());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn clipboard_move는_외부_파일을_옮기고_충돌과_자기자손을_거부한다() {
+        let base = std::env::temp_dir().join(format!(
+            "deppy-clipboard-move-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let source_dir = base.join("outside");
+        let destination_dir = base.join("workspace");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::create_dir_all(&destination_dir).unwrap();
+        let source = source_dir.join("note.txt");
+        std::fs::write(&source, b"source").unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+
+        assert_eq!(
+            app_host_move_clipboard_source(&source, &destination_dir, &cancel),
+            Ok(())
+        );
+        assert!(!source.exists());
+        assert_eq!(
+            std::fs::read(destination_dir.join("note.txt")).unwrap(),
+            b"source"
+        );
+
+        std::fs::write(&source, b"new source").unwrap();
+        assert_eq!(
+            app_host_move_clipboard_source(&source, &destination_dir, &cancel),
+            Err(ui::file_tree::FileTreeIoErrorCode::Conflict)
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), b"new source");
+
+        let folder = source_dir.join("folder");
+        let child = folder.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        assert_eq!(
+            app_host_move_clipboard_source(&folder, &child, &cancel),
+            Err(ui::file_tree::FileTreeIoErrorCode::OutsideRoot)
+        );
+        assert!(folder.exists());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn duplicate는_원본을_보존하고_중복_이름을_순서대로_만든다() {
+        let base = std::env::temp_dir().join(format!(
+            "deppy-duplicate-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let source = base.join("note.txt");
+        std::fs::write(&source, b"payload").unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut budget = AppHostFileOperationBudget::default();
+
+        assert_eq!(
+            app_host_duplicate_source(&source, &mut budget, &cancel),
+            Ok(())
+        );
+        assert_eq!(
+            app_host_duplicate_source(&source, &mut budget, &cancel),
+            Ok(())
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), b"payload");
+        assert_eq!(
+            std::fs::read(base.join("note copy.txt")).unwrap(),
+            b"payload"
+        );
+        assert_eq!(
+            std::fs::read(base.join("note copy 2.txt")).unwrap(),
+            b"payload"
+        );
+        let folder = base.join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("child.txt"), b"child").unwrap();
+        assert_eq!(
+            app_host_duplicate_source(&folder, &mut budget, &cancel),
+            Ok(())
+        );
+        assert_eq!(
+            std::fs::read(base.join("folder copy/child.txt")).unwrap(),
+            b"child"
+        );
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn 같은_폴더에_붙여넣으면_원본_옆에_복제본을_만든다() {
+        let base = std::env::temp_dir().join(format!(
+            "deppy-paste-same-folder-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let source = base.join("note.txt");
+        std::fs::write(&source, b"content").unwrap();
+        let destination = base.canonicalize().unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut budget = AppHostFileOperationBudget::default();
+
+        assert_eq!(
+            app_host_copy_into(&source, &destination, &mut budget, &cancel),
+            Ok(())
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), b"content");
+        assert_eq!(
+            std::fs::read(base.join("note copy.txt")).unwrap(),
+            b"content"
+        );
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

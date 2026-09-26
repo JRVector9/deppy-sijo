@@ -2933,3 +2933,79 @@ physical devices, or 24-hour soak time as explicit blockers, not skipped passes.
 - Build result: `DEPPY_SIGN_IDENTITY='Developer ID Application: VectorNine INC (ZDTU5LS35K)' CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 sh scripts/package-macos.sh` completed; independent `codesign --verify --deep --strict --verbose=2` and `unzip -tq` passed. Bundle: `/private/tmp/deppy-sf06-integration/target/bundle/Deppy Sijo.app`; archive: `/private/tmp/deppy-sf06-integration/target/bundle/Deppy Sijo.zip`.
 - Remaining work: visually exercise the resource and port popovers in the signed bundle, then commit/push only when explicitly requested. The current implementation files and handoff remain uncommitted.
 - Exact next commands: `open -n '/private/tmp/deppy-sf06-integration/target/bundle/Deppy Sijo.app'`; `git -C /private/tmp/deppy-sf06-integration status --short --branch`; `git -C /private/tmp/deppy-sf06-integration diff --check`; `git -C /private/tmp/deppy-sf06-integration diff -- crates/app/src/app.rs crates/app/src/ui/activity.rs crates/app/src/ui/agent_terminal.rs crates/app/src/ui/resource_manager.rs docs/CODEX_HANDOFF.md`.
+
+## 2026-09-26 Finder식 파일 트리 조작 (진행 중)
+
+- Current objective: 파일 트리 선택을 복사·붙여넣기·이동·삭제와 연결하고 Finder의 기본 단축키를 지원한다. 사용자 허락 없이 앱을 재실행하지 않는다.
+- Completed work: 별도 worktree `/private/tmp/deppy-file-tree-finder-clipboard-20260926`의 `feat/file-tree-finder-clipboard` 브랜치에서 선택 파일 ⌘C가 포인터 위치와 무관하게 복사되도록 고쳤다. 선택 폴더 ⌘V의 대상은 폴더 자신이며, ⌥⌘V는 별도 native 신호와 host 이동 요청을 사용한다. 우클릭 폴더·루트 메뉴에 붙여넣기/이동을 추가했다. ⌘A 전체 선택과 ⌘D 복제, 외부 경로 이동 시 충돌·자기 자손 가드, 이름 중복 없는 복제본 생성을 구현했다.
+- Modified files: `crates/app/src/ui/file_tree.rs`, `crates/app/src/app.rs`, `crates/app/src/native_key_monitor.rs`, 5개 locale의 `messages.txt`, 이 handoff.
+- Key design decisions: 파일 작업은 기존 capacity-1 `FileTreeIoIntent`와 App host worker에서 실행한다. macOS 파일 URL clipboard를 Finder와 공유한다. 이동은 ⌥⌘V로 명시하고 일반 ⌘V는 원본 보존 복사다. 키보드 포커스가 있는 트리의 선택을 마우스 hover보다 우선한다. 이동은 덮어쓰기와 자기 자손 이동을 거부한다.
+- Test commands and results: 새 RED 테스트에서 선택 복사 intent 부재, 선택 폴더 붙여넣기 대상이 루트로 잘못 잡힘, ⌘A 선택 0건, ⌘D intent 부재, 우클릭 붙여넣기 메뉴 부재를 각각 확인했다. 대응 GREEN 테스트는 모두 통과했다. native ⌥⌘V 분류 테스트와 외부 파일 이동·충돌·자기 자손 거부, 파일/폴더 복제 테스트도 통과했다. 전체 테스트·Clippy·패키지 빌드는 아직 실행하지 않았다.
+- Failed approaches: 새 worktree의 독립 target에서 Cargo가 모든 의존성을 재빌드하기 시작해 중단했고, 이후 기존 프로젝트 target을 `CARGO_TARGET_DIR`로 재사용했다. 이는 테스트 실패가 아니다.
+- Remaining work: 키보드 포커스/선택 경계 사례, 컨텍스트 메뉴 복제 및 Finder 추가 단축키 범위를 마무리하고 전체 회귀·strict Clippy·i18n·release 패키지 빌드, Codex CLI 코드 리뷰, 커밋·푸시·PR을 진행한다. 앱은 재실행하지 않는다.
+- Exact next commands: `git -C /private/tmp/deppy-file-tree-finder-clipboard-20260926 diff --check`; `CARGO_TARGET_DIR=/Users/jr/Desktop/projects/deppy-sijo/target cargo test -p deppy-sijo --bin deppy-sijo file_tree --locked -- --test-threads=1`; `git -C /private/tmp/deppy-file-tree-finder-clipboard-20260926 status --short`.
+
+### 2026-09-26 Finder 작업 코드 리뷰 후속
+
+- Current objective: 파일 트리 선택 기반 복사·붙여넣기·이동·삭제와 Finder 단축키를 완성하고 리뷰·재빌드 후 전달한다. 앱 재실행은 금지한다.
+- Completed work: 전체 앱 테스트 2125개와 i18n 8개, strict Clippy를 통과한 뒤 `codex review --uncommitted`에서 P2 두 건을 발견했다. 클립보드 이동 후 루트부터 펼친 원본 폴더를 다시 나열하도록 수정했고, 상위 선택 정리를 전체 선택의 쌍 비교 대신 경로 조상 hash 조회로 바꿨다. 두 회귀 테스트를 먼저 RED로 확인하고 GREEN으로 바꿨다.
+- Modified files: 앞 절의 9개 파일과 동일하며, `file_tree.rs`에 리뷰 수정 및 회귀 테스트를 추가했다.
+- Key design decisions: 클립보드 원본 경로는 UI에서 읽지 않으므로 이동 성공 시 루트 목록 재나열로 펼친 원본과 대상 폴더를 함께 갱신한다. 선택 정리는 트리 표시 순서를 유지하며 각 경로의 조상만 조회한다.
+- Test commands and results: `cargo test -p deppy-sijo --bin deppy-sijo 클립보드_이동_완료시_펼친_원본_폴더를_다시_나열한다 --locked -- --test-threads=1` RED 뒤 GREEN 1개 통과; 같은 형식의 `대량_형제_선택의_상위경로_정리는_빠르게_끝난다` RED(기존 코드 7.35초) 뒤 GREEN(0.03초). 전체 앱 테스트 2125개/14 ignored, i18n 8개, strict Clippy는 두 수정 이전 결과이므로 재실행이 필요하다.
+- Failed approaches: release 패키지 빌드를 시작했으나 리뷰의 두 P2를 먼저 수정하려고 중단했다. 빌드 성공으로 간주하지 않는다.
+- Remaining work: 포맷·전체 테스트·i18n·strict Clippy·release 패키지 빌드, 리뷰 재실행, 변경 검토, 커밋·푸시·PR. 앱은 재실행하지 않는다.
+- Exact next commands: `cargo fmt --all --check`; `CARGO_TARGET_DIR=/Users/jr/Desktop/projects/deppy-sijo/target cargo test -p deppy-sijo --bin deppy-sijo --locked -- --test-threads=1`; `CARGO_TARGET_DIR=/Users/jr/Desktop/projects/deppy-sijo/target cargo test -p i18n --locked -- --test-threads=1`; `CARGO_TARGET_DIR=/Users/jr/Desktop/projects/deppy-sijo/target cargo clippy -p deppy-sijo --bin deppy-sijo --locked -- -D warnings`; `DEVELOPER_DIR=/Library/Developer/CommandLineTools SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk DEPPY_REQUIRE_TRUSTED_SIGNING=0 DEPPY_ALLOW_UNTRUSTED_SIGNING=1 CARGO_BUILD_JOBS=2 sh scripts/package-macos.sh` in this worktree.
+
+### 2026-09-26 최종 리뷰 진행 상태
+
+- Current objective: 최종 리뷰의 입력 소유권 결함 세 건을 고치고 전체 검증·재빌드를 갱신한다. 앱은 실행하지 않는다.
+- Completed work: 첫 번째 최종 검증에서 앱 테스트 2128개 통과(14 ignored), i18n 8개 통과, 포맷·diff 검사와 strict Clippy 통과, 릴리스 패키지 빌드·Developer ID 서명·패키지 검증 성공. 대량 선택 삭제 준비도 기존 9.11초에서 0.06초로 줄였고 회귀 테스트 RED/GREEN을 확인했다. `codex review --uncommitted`가 추가로 P1 두 건(전역 ⌘D/⇧⌘N 선소비, Enter/Ctrl+D 터미널 입력 누수), P2 한 건(바쁜 이동 제스처가 터미널 붙여넣기로 샘)을 보고했다.
+- Modified files: 앞 절의 파일과 동일하며 `file_tree.rs` 삭제 준비도 공통 상위 선택 정리를 사용한다. 리뷰 입력 소유권 수정을 위해 `app.rs`, `workspace.rs`가 이어서 바뀔 예정이다.
+- Key design decisions: 파일 트리 포커스 중 Finder 동작 키는 전역 shortcut dispatcher 전에 트리가 예약하고, 파일 트리의 키보드 포커스를 터미널 입력 준비에도 전달해 raw events·native key down이 쉘에 함께 가지 않도록 할 예정이다.
+- Test commands and results: 최종 앱 suite `cargo test -p deppy-sijo --bin deppy-sijo --locked -- --test-threads=1` 2128 passed, 14 ignored; i18n 8 passed; `cargo clippy -p deppy-sijo --bin deppy-sijo --locked -- -D warnings` passed; `cargo fmt --all --check`와 `git diff --check` passed; `sh scripts/package-macos.sh`는 동일한 env로 성공하며 서명 검증까지 통과했다. 이 결과는 리뷰 후속 수정 **이전**이며 재검증 필요.
+- Failed approaches: 최종 빌드 직후 삭제의 쌍 비교 성능 문제를 추가 발견해 빌드 결과가 최신 소스의 검증은 아니게 됐다. 리뷰에서 전역 선소비와 raw 터미널 이벤트 복제를 발견해 기존 `consume_key`만으로는 소유권 보호가 안 됨을 확인했다.
+- Remaining work: 리뷰 P1/P2 수정과 회귀 테스트, 전체 검사와 재빌드, 후속 리뷰, 커밋·일지·전달.
+- Exact next commands: `sed -n '21255,21280p;28855,28895p' crates/app/src/app.rs`; `sed -n '6125,6160p;6470,6590p' crates/app/src/ui/workspace.rs`; focused RED/GREEN tests; then repeat full gate and package command above.
+
+### 2026-09-26 입력 소유권 수정 및 재검증
+
+- Current objective: 두 번째 최종 코드 리뷰 결과를 확인하고 변경을 확정·커밋한다. 앱은 재실행하지 않는다.
+- Completed work: P1 전역 단축키 선소비는 `FileTreeUi::reserves_action_shortcut`을 App 디스패처 전에 검사하도록 고쳤다. Enter/Ctrl+D 등의 터미널 입력 누수는 파일 트리 포커스를 `WorkspaceUi`의 프레임 입력 소유권까지 전달하여 막았다. P2 Busy 이동은 제스처를 파일 트리 소유로 먼저 표시해 terminal paste fallback을 막았다. 각 사례의 RED/GREEN 회귀 테스트를 확인했다.
+- Modified files: `crates/app/src/app.rs`, `crates/app/src/native_key_monitor.rs`, `crates/app/src/ui/file_tree.rs`, `crates/app/src/ui/workspace.rs`, 5개 locale `messages.txt`, `docs/CODEX_HANDOFF.md`.
+- Key design decisions: `egui::consume_key`는 처리된 이벤트만 없애므로 terminal이 읽는 `input.raw.events`를 막으려면 터미널 입력 활성 자체를 트리 포커스 프레임에 false로 둔다. 전역 디스패처는 트리에서 처리할 ⌘A/⌘D/⇧⌘N/Enter만 예약하고 나머지 앱 단축키는 유지한다.
+- Test commands and results: 최신 소스 앱 전체 suite `cargo test -p deppy-sijo --bin deppy-sijo --locked -- --test-threads=1`: 2130 passed, 14 ignored. `cargo test -p i18n --locked -- --test-threads=1`: 8 passed. strict Clippy는 작은 needless-return 수정 후 통과. `cargo fmt --all --check`, `git diff --check` 통과. `DEVELOPER_DIR=/Library/Developer/CommandLineTools SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk DEPPY_REQUIRE_TRUSTED_SIGNING=0 DEPPY_ALLOW_UNTRUSTED_SIGNING=1 CARGO_BUILD_JOBS=2 sh scripts/package-macos.sh`: 최신 소스 릴리스 빌드·서명·ZIP 검증 통과 (`target/bundle/Deppy Sijo.app`, `.zip`).
+- Failed approaches: `consume_key`만 쓰면 terminal raw events가 여전히 Enter/Ctrl+D를 받는다는 리뷰 P1을 확인하여 프레임 입력 소유권으로 수정했다. 첫 strict Clippy 시 needless-return 한 건이 실패해 수정 후 재실행했다.
+- Remaining work: 두 번째 `codex review --uncommitted` 결과 반영, 필요 시 회귀 재검증·재빌드, 커밋·Obsidian 일지·전달.
+- Exact next commands: `git -C /private/tmp/deppy-file-tree-finder-clipboard-20260926 diff --check`; `git -C /private/tmp/deppy-file-tree-finder-clipboard-20260926 status --short`; second `codex review --uncommitted` session result 확인; 결과에 따라 focused/full gate 재실행 후 `git add`와 `git commit`.
+
+### 2026-09-26 두 번째 리뷰 후속
+
+- Current objective: 남은 포커스 경계 회귀를 최종 검증하고 커밋·PR로 전달한다. 앱 재실행은 금지한다.
+- Completed work: 두 번째 Codex 리뷰 P1(터미널 포커스 전환 후 트리 포커스 잔존), P2(클릭과 ⌘D/⇧⌘N이 같은 프레임일 때 전역 단축키 선점)를 수용했다. 트리는 영역 밖 pointer press에 즉시 포커스를 놓고, App은 터미널의 명시적 포커스 획득과 pane 관련 전역 단축키 후 트리 포커스를 해제한다. 직전 프레임의 트리 입력 영역을 보관해 같은 프레임 클릭 위치로 단축키 예약을 판단한다.
+- Modified files: `crates/app/src/app.rs`, `crates/app/src/ui/file_tree.rs`에 두 번째 리뷰 후속을 추가했다. 기존 `native_key_monitor.rs`, `workspace.rs`, 5개 locale, handoff 수정도 유지한다.
+- Key design decisions: 논리 포커스의 최종 소유권은 클릭 press, 터미널의 `take_terminal_focus_claimed()`, 명시적인 pane 이동 단축키가 모두 갱신한다. 전역 단축키 단계는 사이드바 render보다 빨라 클릭 위치 판정에 직전 트리 영역이 필요하다.
+- Test commands and results: `파일트리_포커스중_복제와_새폴더_단축키를_전역보다_우선한다` RED(필드·메서드 부재)→GREEN, `터미널이_포커스를_가져가면_파일트리_단축키_소유권을_놓는다` GREEN, `kittest_터미널_드래그_시작은_파일트리_키보드_포커스를_놓는다` GREEN. 이전 전체 앱 2130 passed/14 ignored, i18n 8, strict Clippy, 패키지 빌드는 **이 수정 이전**이므로 재실행해야 한다.
+- Failed approaches: `tree_focused`를 클릭 release에만 의존하면 터미널 drag 시작과 pane-focus shortcut에서 상태가 남는다. 추가 포커스 전이 경로를 명시적으로 연결했다.
+- Remaining work: 포맷·전체 앱/i18n/strict Clippy·패키지 빌드 재검증, 후속 리뷰, 커밋·Obsidian 일지·push/PR.
+- Exact next commands: `cargo fmt --all`; `CARGO_TARGET_DIR=/Users/jr/Desktop/projects/deppy-sijo/target cargo test -p deppy-sijo --bin deppy-sijo --locked -- --test-threads=1`; `CARGO_TARGET_DIR=/Users/jr/Desktop/projects/deppy-sijo/target cargo clippy -p deppy-sijo --bin deppy-sijo --locked -- -D warnings`; 패키지는 이전 절의 `sh scripts/package-macos.sh` 환경 그대로.
+
+### 2026-09-26 세 번째 리뷰 후속
+
+- Current objective: macOS 붙여넣기 두 경계 사례를 고친 최신 소스를 전체 검증·패키징하고 PR로 전달한다. 앱은 재실행하지 않는다.
+- Completed work: 세 번째 Codex 리뷰 P2 두 건을 수용했다. egui-winit이 ⌥⌘V key-down을 `Event::Paste`로 변환해도 현재 수식키로 이동으로 분류한다. Busy 거절 시 성공 제스처 debounce를 기록하지 않고 key-down 뒤의 key-up만 별도로 누르므로 새 key-down 재시도는 허용한다. 두 Kittest를 RED→GREEN으로 확인했다.
+- Modified files: 이전 절의 10개 파일과 동일하며 `file_tree.rs`에 `last_rejected_paste_press` 상태 및 회귀 테스트를 추가했다.
+- Key design decisions: 터미널 fallback 억제와 paste 성공 여부를 별도 상태로 다룬다. 실패한 key-down 뒤 trailing key-up만 600ms 창 안에서 중복으로 보고, 새 press는 재시도한다. `Event::Paste`는 자체에 수식키 정보가 없으므로 같은 프레임의 `input.modifiers`를 함께 본다.
+- Test commands and results: `kittest_paste이벤트만_와도_option_command_v는_이동한다` RED(복사)→GREEN; `kittest_파일작업중_이동_단축키도_터미널에_넘기지_않는다` 확장 RED(재시도 intent 없음)→GREEN. 이전 전체 suite 2132 passed/14 ignored, i18n 8, strict Clippy, package 빌드는 **이 수정 이전**이므로 재검증 필요.
+- Failed approaches: `last_external_paste`에 Busy도 기록하면 동일 제스처 키 해제는 막지만 새로운 빠른 시도까지 잃어버린다. 성공 시각과 거절된 press 시각을 분리했다.
+- Remaining work: 전체 suite·i18n·strict Clippy·포맷·diff·패키지 검증, 최종 변경 검토, 커밋·Obsidian 일지·push/PR. 추가 전체 Codex 리뷰는 이미 세 번 진행되어 최신 두 P2만 focused 재검증으로 확인 중이다.
+- Exact next commands: `cargo fmt --all`; `CARGO_TARGET_DIR=/Users/jr/Desktop/projects/deppy-sijo/target cargo test -p deppy-sijo --bin deppy-sijo --locked -- --test-threads=1`; `CARGO_TARGET_DIR=/Users/jr/Desktop/projects/deppy-sijo/target cargo test -p i18n --locked -- --test-threads=1`; `CARGO_TARGET_DIR=/Users/jr/Desktop/projects/deppy-sijo/target cargo clippy -p deppy-sijo --bin deppy-sijo --locked -- -D warnings`; 기존 package command; then `git status --short`.
+
+### 2026-09-26 최종 전체 검사
+
+- Current objective: 서명된 번들 재검증 후 코드와 인계 문서를 커밋·push하고 PR을 게시한다. 앱은 재실행하지 않는다.
+- Completed work: 세 번째 리뷰의 두 P2를 회귀 테스트 RED/GREEN으로 수정했고, 전체 검증을 다시 끝냈다. 소스 변경은 `app.rs`, `native_key_monitor.rs`, `file_tree.rs`, `workspace.rs`, 5개 locale이다.
+- Key design decisions: 일반 붙여넣기/이동은 macOS clipboard 파일 URL을 공유하지만 파일 작업 자체는 App host의 기존 bounded IO로 수행한다. 파일 트리 키보드 포커스가 terminal raw 입력을 차단하고, 포커스 전환 신호와 현재 pointer press가 소유권을 갱신한다. Busy 거절은 성공 debounce와 구분한다.
+- Test commands and results: 최신 소스 `cargo test -p deppy-sijo --bin deppy-sijo --locked -- --test-threads=1` 2133 passed, 14 ignored; `cargo test -p i18n --locked -- --test-threads=1` 8 passed; `cargo clippy -p deppy-sijo --bin deppy-sijo --locked -- -D warnings` passed; `cargo fmt --all --check`, `git diff --check` passed. 릴리스 package command는 성공했으며 Developer ID 서명, bundle·ZIP 검증을 통과했다. 산출물은 이 worktree의 `target/bundle/Deppy Sijo.app`와 `Deppy Sijo.zip`이다. 앱 재실행은 하지 않았다.
+- Failed approaches: 앞 절에 기록한 리뷰 지적 외에 새로운 실패 없음. 전체 리뷰는 세 번 수행했고 각각의 지적을 수용했다.
+- Remaining work: package 완료 확인, `git diff` 최종 확인, 커밋, Obsidian `프로젝트 일지/deppy-sijo/` 기록, 브랜치 push와 PR 게시, 결과 확인.
+- Exact next commands: package session 완료 확인; `git -C /private/tmp/deppy-file-tree-finder-clipboard-20260926 diff --check`; `git -C /private/tmp/deppy-file-tree-finder-clipboard-20260926 status --short`; `git add` 변경 10개 파일; `git commit -m 'feat(file-tree): Finder식 복사·이동 단축키 지원'`; `git push -u origin feat/file-tree-finder-clipboard`; `gh pr create --draft --base feat/fleet-one-list-and-relay-wip --head feat/file-tree-finder-clipboard --body-file <path>`.

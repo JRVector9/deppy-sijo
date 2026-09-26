@@ -1,4 +1,5 @@
 //! App-owned authorization and effects for the outward MCP bridge.
+mod ui;
 use agent_mcp::{Claim, History, Record, Request, Server, encode_input, now};
 use serde_json::{Value, json};
 use std::{collections::HashMap, path::Path};

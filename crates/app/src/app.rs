@@ -33149,6 +33149,9 @@ impl eframe::App for App {
                     C::Activity => {
                         activity_action = self.activity_ui.contents(ui, &text, &activity_rows);
                     }
+                    C::CloudAgents => {
+                        self.cloud_agent.contents(ui, &text);
+                    }
                     C::Notifications => {
                         notif_click = self.notifications_ui.contents(ui, &text);
                     }

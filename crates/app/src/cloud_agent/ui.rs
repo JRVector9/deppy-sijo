@@ -1,0 +1,211 @@
+//! Settings leaf: captures intents and edits in-memory consent; no network or disk effects.
+use super::{Action, CloudAgent};
+impl CloudAgent {
+    pub fn contents(&mut self, ui: &mut egui::Ui, catalog: &i18n::Catalog) {
+        ui.heading(catalog.t("cloud.title", &[]));
+        ui.label(catalog.t("cloud.intro", &[]));
+        ui.add_space(10.0);
+        let running = self.server.is_some();
+        ui.horizontal(|ui| {
+            ui.label(catalog.t("cloud.port", &[]));
+            ui.add_enabled(
+                !running,
+                egui::DragValue::new(&mut self.port).range(1024..=65535),
+            );
+            ui.label(catalog.t("cloud.hostname", &[]));
+            ui.add_enabled(
+                !running,
+                egui::TextEdit::singleline(&mut self.hostname)
+                    .char_limit(259)
+                    .hint_text("deppy.example.com"),
+            );
+        });
+        ui.label(egui::RichText::new(catalog.t("cloud.tunnel_hint", &[])).weak());
+        ui.horizontal(|ui| {
+            if ui
+                .button(catalog.t(if running { "cloud.stop" } else { "cloud.start" }, &[]))
+                .clicked()
+            {
+                self.action = Some(if running { Action::Stop } else { Action::Start });
+                ui.ctx().request_repaint();
+            }
+            if running && ui.button(catalog.t("cloud.rotate", &[])).clicked() {
+                self.action = Some(Action::Rotate);
+                ui.ctx().request_repaint();
+            }
+            if ui.button(catalog.t("cloud.take_control", &[])).clicked() {
+                // Take control is synchronous consent revocation; no request can be admitted after this click.
+                self.take_control();
+            }
+        });
+        if let Some(s) = &self.server {
+            let local = format!("http://{}/mcp", s.addr);
+            let endpoint = if self.hostname.is_empty() {
+                local.clone()
+            } else {
+                format!("https://{}/mcp", self.hostname)
+            };
+            ui.horizontal(|ui| {
+                ui.monospace(&endpoint);
+                if ui.button(catalog.t("cloud.copy_url", &[])).clicked() {
+                    ui.ctx().copy_text(endpoint);
+                }
+            });
+            ui.label(egui::RichText::new(local).weak());
+            ui.label(
+                catalog.t(
+                    "cloud.expiry",
+                    &[(
+                        "seconds",
+                        &s.auth
+                            .expires()
+                            .saturating_sub(agent_mcp::now())
+                            .to_string(),
+                    )],
+                ),
+            );
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.reveal, catalog.t("cloud.reveal_token", &[]));
+                let token = s.auth.token_for_user();
+                if ui.button(catalog.t("cloud.copy_token", &[])).clicked() {
+                    ui.ctx().copy_text(token.to_string());
+                }
+                ui.monospace(if self.reveal {
+                    token.as_str()
+                } else {
+                    "••••••••••••••••"
+                });
+            });
+        }
+        if let Some(error) = &self.error {
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                catalog.t("cloud.error", &[("code", error)]),
+            );
+        }
+        ui.separator();
+        ui.heading(catalog.t("cloud.sessions", &[]));
+        ui.label(catalog.t("cloud.permission_hint", &[]));
+        if self.targets.is_empty() {
+            ui.label(catalog.t("cloud.no_sessions", &[]));
+        }
+        for t in self.targets.clone() {
+            ui.push_id((&t.id, &t.generation), |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    let mut shared = self.grants.contains_key(&t.id);
+                    if ui
+                        .checkbox(&mut shared, catalog.t("cloud.share", &[]))
+                        .changed()
+                    {
+                        self.share(&t, shared);
+                    }
+                    let mut input = self.grants.get(&t.id).is_some_and(|g| g.input);
+                    if ui
+                        .add_enabled(
+                            shared && t.live,
+                            egui::Checkbox::new(&mut input, catalog.t("cloud.allow_input", &[])),
+                        )
+                        .changed()
+                    {
+                        self.allow_input(&t.id, input);
+                    }
+                    ui.label(format!("{} / {}", t.workspace_name, t.title))
+                        .on_hover_text(&t.id);
+                    if !t.live {
+                        ui.weak(catalog.t("cloud.exited", &[]));
+                    }
+                });
+            });
+        }
+        ui.separator();
+        if ui
+            .button(catalog.t("cloud.copy_instruction", &[]))
+            .clicked()
+        {
+            ui.ctx().copy_text("Use Deppy's MCP connector. First call list_sessions and use the exact session_id and generation. Read the selected session with read_output. Do not type unless input_allowed is true. send_text submit=false only types; submit=true sends Enter. Use one unique operation_id per action and reuse it only for the same action; never retry unknown input with a new ID. After every completed analysis/task, call notify with YOUR OWN complete final answer, including when no terminal command was sent. Keep the original session_id/generation even when Deppy's active tab changes.".into());
+        }
+        ui.label(catalog.t("cloud.answer_hint", &[]));
+        ui.heading(catalog.t("cloud.history", &[]));
+        if self.records.is_empty() {
+            ui.label(catalog.t("cloud.no_history", &[]));
+        }
+        for record in &self.records {
+            let kind = match record.tool.as_str() {
+                "notify" => "cloud.history_answer",
+                "send_ctrl_c" => "cloud.history_interrupt",
+                _ => "cloud.history_input",
+            };
+            let title = format!(
+                "{} · {} · {}",
+                catalog.t(kind, &[]),
+                crate::ui::notifications::relative_time_label(
+                    catalog,
+                    agent_mcp::now() as i64 - record.created
+                ),
+                record.session.chars().take(8).collect::<String>()
+            );
+            egui::CollapsingHeader::new(title)
+                .id_salt(&record.id)
+                .open(
+                    if self.selected_record.as_deref() == Some(record.id.as_str()) {
+                        Some(true)
+                    } else {
+                        None
+                    },
+                )
+                .show(ui, |ui| {
+                    ui.weak(format!("{} / {}", record.workspace, record.session));
+                    let outcome: serde_json::Value =
+                        serde_json::from_str(&record.outcome).unwrap_or_default();
+                    let status = match outcome["status"].as_str() {
+                        Some("queued") => "cloud.outcome_queued",
+                        Some("stored") => "cloud.outcome_stored",
+                        Some("rejected") => "cloud.outcome_rejected",
+                        _ => "cloud.outcome_unknown",
+                    };
+                    ui.label(catalog.t(status, &[]));
+                    if !record.message.is_empty() {
+                        ui.label(&record.message);
+                        if ui.button(catalog.t("cloud.copy_answer", &[])).clicked() {
+                            ui.ctx().copy_text(record.message.clone());
+                        }
+                    }
+                });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui_kittest::kittest::Queryable as _;
+    #[test]
+    fn session_checkboxes_and_take_control_change_real_consent() {
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        let mut bridge = CloudAgent::memory();
+        let target = crate::cloud_agent::Target::fixture("a", "generation-1");
+        bridge.set_targets(vec![target]);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1200.0, 900.0))
+            .build_ui_state(
+                move |ui, state: &mut CloudAgent| state.contents(ui, &catalog),
+                bridge,
+            );
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::CheckBox, "읽기 · 답변 수신")
+            .click();
+        harness.run();
+        assert!(harness.state().grants.contains_key("a"));
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::CheckBox, "입력 허용")
+            .click();
+        harness.run();
+        assert!(harness.state().grants["a"].input);
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, "모든 입력 제어 회수")
+            .click();
+        harness.run();
+        assert!(!harness.state().grants["a"].input);
+        assert!(harness.state().grants.contains_key("a"));
+    }
+}

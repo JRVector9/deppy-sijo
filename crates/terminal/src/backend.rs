@@ -3,6 +3,13 @@ use crate::viewport_snapshot::TerminalViewportSnapshot;
 
 pub const TERMINAL_GLOBAL_CACHE_BUDGET_BYTES: usize = 128 * 1024 * 1024;
 
+/// Navigation/replay state without constructing or consuming a cell snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalViewportMetadata {
+    pub scroll_offset: i32,
+    pub is_alt_screen: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalCacheClass {
     Visible,
@@ -178,6 +185,16 @@ pub trait TerminalBackend {
     fn render_model(&self) -> TerminalRenderModel;
 
     fn viewport_snapshot(&self) -> Option<TerminalViewportSnapshot>;
+
+    /// Backends with a cell model should override this with native metadata reads.
+    /// The fallback preserves the contract of external/test backends.
+    fn viewport_metadata(&self) -> Option<TerminalViewportMetadata> {
+        self.viewport_snapshot()
+            .map(|snapshot| TerminalViewportMetadata {
+                scroll_offset: snapshot.scroll_offset,
+                is_alt_screen: snapshot.is_alt_screen,
+            })
+    }
     fn external_surface(&self) -> Option<TerminalExternalSurfaceHandle>;
 
     fn scroll(&mut self, delta: i32);

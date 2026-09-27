@@ -235,6 +235,20 @@ impl TerminalBackend for GhosttyBackend {
         TerminalRenderModel::CellGrid
     }
 
+    fn viewport_metadata(&self) -> Option<crate::TerminalViewportMetadata> {
+        Some(crate::TerminalViewportMetadata {
+            scroll_offset: self.scroll_offset(),
+            is_alt_screen: self
+                .term
+                .active_screen()
+                .map(|screen| {
+                    screen
+                        != libghostty_vt::ffi::GhosttyTerminalScreen_GHOSTTY_TERMINAL_SCREEN_PRIMARY
+                })
+                .unwrap_or(false),
+        })
+    }
+
     fn viewport_snapshot(&self) -> Option<TerminalViewportSnapshot> {
         let mut render = self.render.borrow_mut();
         let snap = render.update(&self.term).ok()?;

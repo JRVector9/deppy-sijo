@@ -40,7 +40,8 @@ pub use backend::{
     ScrollbackApplyResult, ScrollbackMatch, ScrollbackSearchResult, ScrollbackSerializeError,
     TERMINAL_GLOBAL_CACHE_BUDGET_BYTES, TerminalBackend, TerminalCacheBudget, TerminalCacheClass,
     TerminalCacheEvent, TerminalCacheEventKind, TerminalCacheFootprint,
-    TerminalExternalSurfaceHandle, TerminalRenderModel, fold_char, substring_matches,
+    TerminalExternalSurfaceHandle, TerminalRenderModel, TerminalViewportMetadata, fold_char,
+    substring_matches,
 };
 pub use change_set::TerminalChangeSet;
 pub use renderer_egui::MONO_BOLD_FAMILY;

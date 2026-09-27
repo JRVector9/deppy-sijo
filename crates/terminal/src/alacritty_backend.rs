@@ -378,6 +378,13 @@ impl TerminalBackend for AlacrittyBackend {
         TerminalRenderModel::CellGrid
     }
 
+    fn viewport_metadata(&self) -> Option<crate::TerminalViewportMetadata> {
+        Some(crate::TerminalViewportMetadata {
+            scroll_offset: self.term.grid().display_offset().min(i32::MAX as usize) as i32,
+            is_alt_screen: self.term.mode().contains(TermMode::ALT_SCREEN),
+        })
+    }
+
     fn viewport_snapshot(&self) -> Option<TerminalViewportSnapshot> {
         let cols = self.term.columns();
         let rows = self.term.screen_lines();

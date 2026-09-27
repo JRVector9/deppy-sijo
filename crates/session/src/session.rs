@@ -442,8 +442,8 @@ impl Session {
     pub fn finish_ansi_replay(&mut self) -> anyhow::Result<()> {
         let preserved_alt_screen = self
             .backend
-            .viewport_snapshot()
-            .is_some_and(|snapshot| snapshot.is_alt_screen)
+            .viewport_metadata()
+            .is_some_and(|metadata| metadata.is_alt_screen)
             .then(|| self.backend.serialize_scrollback())
             .flatten()
             .filter(|dump| !dump.is_empty());
@@ -555,11 +555,11 @@ impl Session {
     /// 델타 수식은 T3 검색의 스크롤 수식과 동치 (prompt_marks.rs 참조).
     pub fn scroll_to_prompt(&mut self, direction: i8) {
         let footprint = self.backend.cache_footprint();
-        // 현재 스크롤 오프셋은 snapshot으로만 읽는다 — 키 입력 빈도라 비용 무시 가능.
+        // Navigation does not need a full cell snapshot or consume backend damage.
         let offset = self
             .backend
-            .viewport_snapshot()
-            .map_or(0, |snapshot| snapshot.scroll_offset);
+            .viewport_metadata()
+            .map_or(0, |metadata| metadata.scroll_offset);
         if let Some(delta) = self.prompt_marks.jump_delta(
             direction,
             offset,
@@ -741,6 +741,96 @@ fn dirty_rows_to_ranges(dirty_rows: &mut Vec<u16>, cols: u16, rows: u16) -> Vec<
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    struct SnapshotCountingBackend {
+        inner: terminal::AlacrittyBackend,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl TerminalBackend for SnapshotCountingBackend {
+        fn feed(&mut self, bytes: &[u8]) -> anyhow::Result<terminal::TerminalChangeSet> {
+            self.inner.feed(bytes)
+        }
+        fn resize(&mut self, cols: u16, rows: u16) -> anyhow::Result<()> {
+            self.inner.resize(cols, rows)
+        }
+        fn render_model(&self) -> terminal::TerminalRenderModel {
+            self.inner.render_model()
+        }
+        fn viewport_snapshot(&self) -> Option<TerminalViewportSnapshot> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.viewport_snapshot()
+        }
+        fn viewport_metadata(&self) -> Option<terminal::TerminalViewportMetadata> {
+            self.inner.viewport_metadata()
+        }
+        fn external_surface(&self) -> Option<terminal::TerminalExternalSurfaceHandle> {
+            self.inner.external_surface()
+        }
+        fn scroll(&mut self, delta: i32) {
+            self.inner.scroll(delta);
+        }
+        fn reset(&mut self) {
+            self.inner.reset();
+        }
+        fn set_cache_class(&mut self, class: TerminalCacheClass) -> Option<TerminalCacheEvent> {
+            self.inner.set_cache_class(class)
+        }
+        fn cache_class(&self) -> TerminalCacheClass {
+            self.inner.cache_class()
+        }
+        fn cache_footprint(&self) -> TerminalCacheFootprint {
+            self.inner.cache_footprint()
+        }
+        fn bracketed_paste(&self) -> bool {
+            self.inner.bracketed_paste()
+        }
+        fn screen_text(&self) -> String {
+            self.inner.screen_text()
+        }
+        fn serialize_scrollback(&self) -> Option<Vec<u8>> {
+            self.inner.serialize_scrollback()
+        }
+    }
+
+    fn metadata_fixture(alt: bool) -> (Session, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let mut session = Session::restore_archived(
+            SessionId(701),
+            SessionKind::Shell,
+            80,
+            24,
+            1000,
+            Some(0),
+            &mut &b""[..],
+        );
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut inner = terminal::AlacrittyBackend::new(80, 24, 1000);
+        if alt {
+            inner.feed(b"\x1b[?1049hALT-CONTENT").unwrap();
+        }
+        session.backend = Box::new(SnapshotCountingBackend {
+            inner,
+            calls: calls.clone(),
+        });
+        (session, calls)
+    }
+
+    #[test]
+    fn prompt_jump_metadata_does_not_create_snapshot() {
+        let (mut session, calls) = metadata_fixture(false);
+        session.scroll_to_prompt(-1);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn replay_metadata_does_not_create_snapshot_and_preserves_alt_screen() {
+        let (mut session, calls) = metadata_fixture(true);
+        session.finish_ansi_replay().unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+        let restored = session.backend.serialize_scrollback().unwrap();
+        assert!(String::from_utf8_lossy(&restored).contains("ALT-CONTENT"));
+    }
 
     struct ResizeFailingPty;
     impl PtySession for ResizeFailingPty {

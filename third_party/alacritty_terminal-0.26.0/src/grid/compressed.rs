@@ -144,7 +144,15 @@ impl CompressedRow {
 
     /// 압축 행을 `columns` 폭의 `Row<Cell>`로 복원한다.
     pub(crate) fn decode(&self, columns: usize) -> Row<Cell> {
-        let mut cells: Vec<Cell> = (0..columns).map(|_| Cell::default()).collect();
+        let mut row = Row::from_vec(Vec::new(), 0);
+        self.decode_into(columns, &mut row);
+        row
+    }
+
+    /// Restore into an existing row. Every cell is reset, including sparse extras and attributes.
+    pub(crate) fn decode_into(&self, columns: usize, row: &mut Row<Cell>) {
+        row.reset_default(columns);
+        let cells = &mut row[..Column(columns)];
         // run-length로 열별 속성을 펼치며 문자와 함께 채운다.
         let mut chars = self.text.chars();
         let mut col = 0usize;
@@ -179,7 +187,7 @@ impl CompressedRow {
                 cell.set_hyperlink(data.hyperlink.clone());
             }
         }
-        Row::from_vec(cells, self.occ as usize)
+        row.occ = (self.occ as usize).min(columns);
     }
 }
 

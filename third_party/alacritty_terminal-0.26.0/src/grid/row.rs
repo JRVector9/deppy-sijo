@@ -60,6 +60,13 @@ impl<T: Default> Row<T> {
         self.inner.capacity()
     }
 
+    /// Reset all cells and occupancy while retaining the allocation for repeated decoding.
+    pub(super) fn reset_default(&mut self, columns: usize) {
+        self.inner.clear();
+        self.inner.resize_with(columns, T::default);
+        self.occ = 0;
+    }
+
     /// Increase the number of columns in the row.
     #[inline]
     pub fn grow(&mut self, columns: usize) {
@@ -83,12 +90,19 @@ impl<T: Default> Row<T> {
 
         // Split off cells for a new row.
         let mut new_row = self.inner.split_off(columns);
-        let index = new_row.iter().rposition(|c| !c.is_empty()).map_or(0, |i| i + 1);
+        let index = new_row
+            .iter()
+            .rposition(|c| !c.is_empty())
+            .map_or(0, |i| i + 1);
         new_row.truncate(index);
 
         self.occ = min(self.occ, columns);
 
-        if new_row.is_empty() { None } else { Some(new_row) }
+        if new_row.is_empty() {
+            None
+        } else {
+            Some(new_row)
+        }
     }
 
     /// Reset all cells in the row to the `template` cell.

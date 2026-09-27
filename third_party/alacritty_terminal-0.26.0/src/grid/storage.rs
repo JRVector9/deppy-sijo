@@ -497,7 +497,7 @@ impl Storage<Cell> {
         let idx = self.compute_index(line);
         match self.compressed.get(idx).and_then(Option::as_ref) {
             Some(compressed) => {
-                *scratch = compressed.decode(columns);
+                compressed.decode_into(columns, scratch);
                 scratch
             }
             None => &self.inner[idx],
@@ -681,6 +681,48 @@ mod tests {
         storage.compress_line(Line(-1), 8);
         storage.take_all();
         assert_compressed_totals(&storage);
+    }
+
+    #[test]
+    fn compressed_read_reuses_scratch_cells_and_clears_extras() {
+        use crate::term::cell::{Cell, Hyperlink};
+        use crate::vte::ansi::{Color, NamedColor};
+        let mut storage = Storage::<Cell>::with_capacity(3, 8);
+        storage[Line(0)][Column(0)].c = 'a';
+        storage[Line(0)][Column(0)].push_zerowidth('\u{0301}');
+        storage[Line(0)][Column(0)].set_underline_color(Some(Color::Named(NamedColor::Red)));
+        storage[Line(0)][Column(0)].set_hyperlink(Some(Hyperlink::new(
+            None::<String>,
+            "https://example.com".into(),
+        )));
+        storage[Line(0)][Column(0)].flags = Flags::BOLD | Flags::UNDERLINE;
+        storage[Line(1)][Column(1)].c = 'x';
+        let expected: Vec<_> = (0..3).map(|line| storage[Line(line)].clone()).collect();
+        for line in 0..3 {
+            storage.compress_line(Line(line), 8);
+        }
+        let mut scratch = Row::<Cell>::new(32);
+        let allocation = &scratch[Column(0)] as *const Cell;
+        for line in 0..3 {
+            let decoded = storage.read_line(Line(line), 8, &mut scratch);
+            assert_eq!(
+                &decoded[Column(0)] as *const Cell,
+                allocation,
+                "reuse scratch allocation"
+            );
+            assert_eq!(decoded, &expected[line as usize]);
+            assert_eq!(decoded.occ, expected[line as usize].occ);
+            assert_eq!(decoded.len(), 8);
+        }
+        let short = storage.read_line(Line(0), 1, &mut scratch);
+        assert_eq!(short.occ, 1);
+        assert_eq!(&short[Column(0)] as *const Cell, allocation);
+        let wide = storage.read_line(Line(1), 8, &mut scratch);
+        assert_eq!(&wide[Column(0)] as *const Cell, allocation);
+        assert_eq!(wide, &expected[1]);
+        let empty = storage.read_line(Line(0), 0, &mut scratch);
+        assert_eq!(empty.len(), 0);
+        assert_eq!(empty.occ, 0);
     }
 
     #[test]

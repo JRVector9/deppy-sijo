@@ -21,7 +21,8 @@ use serde::{Deserialize, Serialize};
 /// v3 (2026-07-12): 워크스페이스 상태 와이어 값 `"idle"` → `"suspended"`(I1b-1). 옛 캐시
 /// 클라는 라벨 맵/CSS에 이 값이 없어 영어 "suspended"를 그대로 표시하므로(graceful하나
 /// 미번역), 버전 불일치로 재로드시켜 새 자산을 받게 한다 (리뷰 I1b-1 P3).
-pub const PROTOCOL_VERSION: u32 = 3;
+/// v4: owner-cell grapheme boundaries for canvas text advance.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// 클라이언트 → 서버.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -162,6 +163,9 @@ pub struct CursorView {
 pub struct RunView {
     pub s: u16,
     pub t: String,
+    /// Explicit owner-cell text; present only when scalar iteration would lose boundaries.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub g: Vec<String>,
     pub fg: String,
     pub bg: String,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -256,7 +260,16 @@ fn cursor_view(snapshot: &runtime::TerminalViewportSnapshot) -> CursorView {
 /// 행 하나를 스타일 run들로 인코딩한다 (P5c). wide_spacer 셀은 건너뛰고(자리 채움 —
 /// 렌더 안 함), (fg, bg, wide)가 같은 연속 셀을 하나의 run으로 합친다(사실상 행 RLE).
 /// wide 전환에서도 run을 끊어 클라이언트가 run 단위 고정 폭(1 또는 2셀)으로 전진한다.
+#[cfg(test)]
 fn encode_line(cells: &[runtime::TerminalCell], row: u16) -> LineView {
+    encode_line_with_graphemes(cells, row, &[])
+}
+
+fn encode_line_with_graphemes(
+    cells: &[runtime::TerminalCell],
+    row: u16,
+    graphemes: &[runtime::CellGrapheme],
+) -> LineView {
     let mut runs: Vec<RunView> = Vec::new();
     // 진행 중 run의 (fg, bg, wide, attrs, 다음 예상 열) — 셀마다 hex 문자열을 만들지 않는다.
     // 속성(B-1)이 다르면 run을 끊는다 — 폰도 bold/underline 등을 그린다.
@@ -270,6 +283,21 @@ fn encode_line(cells: &[runtime::TerminalCell], row: u16) -> LineView {
         let col = col as u16;
         let advance = if cell.wide { 2 } else { 1 };
         let attrs = cell.attrs.0;
+        let index = row as usize * cells.len() + col as usize;
+        if let Ok(entry) = graphemes.binary_search_by_key(&index, |entry| entry.index) {
+            let text = &graphemes[entry].text;
+            runs.push(RunView {
+                s: col,
+                t: text.clone(),
+                g: vec![text.clone()],
+                fg: hex_color(cell.fg),
+                bg: hex_color(cell.bg),
+                w: cell.wide,
+                a: attrs,
+            });
+            open = None;
+            continue;
+        }
         match (&mut open, runs.last_mut()) {
             (Some((fg, bg, wide, a, next)), Some(run))
                 if *fg == cell.fg
@@ -285,6 +313,7 @@ fn encode_line(cells: &[runtime::TerminalCell], row: u16) -> LineView {
                 runs.push(RunView {
                     s: col,
                     t: cell.c.to_string(),
+                    g: Vec::new(),
                     fg: hex_color(cell.fg),
                     bg: hex_color(cell.bg),
                     w: cell.wide,
@@ -318,7 +347,9 @@ pub fn encode_viewport(
         let Some(cells) = snapshot.visible_cells.get(range.clone()) else {
             break; // 방어: cells 길이가 cols*rows보다 짧으면 있는 만큼만
         };
-        let changed = if keyframe {
+        let grapheme_changed =
+            baseline.is_none_or(|base| base.row_graphemes(row) != snapshot.row_graphemes(row));
+        let changed = if keyframe || grapheme_changed {
             true
         } else {
             // delta: baseline의 같은 행과 셀 비교 (keyframe이 아니면 기하는 동일)
@@ -327,7 +358,11 @@ pub fn encode_viewport(
                 .is_none_or(|base_cells| base_cells != cells)
         };
         if changed {
-            lines.push(encode_line(cells, row as u16));
+            lines.push(encode_line_with_graphemes(
+                cells,
+                row as u16,
+                snapshot.row_graphemes(row),
+            ));
         }
     }
     ServerMsg::Viewport {
@@ -561,6 +596,27 @@ mod tests {
     const WHITE: [u8; 3] = [255, 255, 255];
     const BLACK: [u8; 3] = [0, 0, 0];
     const RED: [u8; 3] = [255, 0, 0];
+
+    #[test]
+    fn sparse_grapheme_survives_web_keyframe_and_delta() {
+        let base = snapshot(10, 3, vec![cell('a', WHITE, BLACK); 30]);
+        let mut changed = base.clone();
+        changed.graphemes = vec![runtime::CellGrapheme {
+            index: 0,
+            text: "a\u{301}\u{308}".into(),
+        }]
+        .into();
+        for baseline in [None, Some(&base)] {
+            let ServerMsg::Viewport { lines, .. } = encode_viewport("u7", 1, &changed, baseline)
+            else {
+                panic!("viewport")
+            };
+            assert!(!lines.is_empty(), "grapheme-only change must emit the row");
+            assert!(lines[0].runs[0].t.starts_with("a\u{301}\u{308}"));
+            assert_eq!(lines[0].runs[0].g, vec!["a\u{301}\u{308}"]);
+            assert_eq!(lines[0].runs[1].s, 1);
+        }
+    }
 
     #[test]
     fn 행_run은_스타일과_폭_전환에서_끊고_spacer를_건너뛴다() {

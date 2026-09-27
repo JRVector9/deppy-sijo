@@ -491,7 +491,9 @@ export function createViewer(options = {}) {
       const y = row * cellH;
       for (const run of runs) {
         const advance = run.w ? cellW * 2 : cellW;
-        const chars = Array.from(run.t || '');
+        // g preserves one entry per terminal owner cell, including combining scalars.
+        const chars = Array.isArray(run.g) && run.g.every(text => typeof text === 'string' && text.length > 0)
+          ? run.g : Array.from(run.t || '');
         const attrs = run.a || 0;
         ctx.fillStyle = run.bg || '#000000';
         ctx.fillRect(run.s * cellW, y, chars.length * advance, cellH);

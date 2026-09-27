@@ -80,7 +80,7 @@
 
   // 서버와 합의한 WS 프로토콜 버전 — welcome에서 대조한다(불일치 = 셸이 낡음).
   // v3: 워크스페이스 상태 값 "idle"→"suspended"(I1b-1) — 옛 캐시 셸을 재로드시킨다.
-  const PROTOCOL_VERSION = 3;
+  const PROTOCOL_VERSION = 4;
 
   const STATUS_LABEL = {
     running: '실행 중',

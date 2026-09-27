@@ -9,6 +9,7 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU32, Ordering},
+        mpsc::{self, Receiver, SyncSender},
     },
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -28,11 +29,15 @@ type Updates = Arc<Mutex<(u64, Option<Event>)>>;
 
 pub struct Tunnel {
     cancel: Arc<AtomicBool>,
+    signal: SyncSender<()>,
+    address_published: Arc<AtomicBool>,
     updates: Updates,
     observed: u64,
     worker: Option<JoinHandle<()>>,
     #[cfg(test)]
     pid: Arc<AtomicU32>,
+    #[cfg(test)]
+    loop_count: Arc<AtomicU32>,
 }
 
 pub fn companion() -> Option<PathBuf> {
@@ -70,8 +75,16 @@ impl Tunnel {
         probe: impl Fn(&str) -> bool + Send + 'static,
     ) -> std::io::Result<Self> {
         let cancel = Arc::new(AtomicBool::new(false));
+        let (signal, notified) = mpsc::sync_channel(1);
+        let worker_signal = signal.clone();
+        let address_published = Arc::new(AtomicBool::new(false));
+        let published = address_published.clone();
         let updates = Arc::new(Mutex::new((0, None)));
         let pid = Arc::new(AtomicU32::new(0));
+        #[cfg(test)]
+        let loop_count = Arc::new(AtomicU32::new(0));
+        #[cfg(test)]
+        let count = loop_count.clone();
         let (stop, output, child_pid) = (cancel.clone(), updates.clone(), pid.clone());
         let worker = std::thread::Builder::new()
             .name("mcp-tunnel".into())
@@ -83,16 +96,31 @@ impl Tunnel {
                     drop(state);
                     wake();
                 };
-                let event = run(&path, port, timeout, &stop, child_pid, &publish, &probe);
+                let event = run(
+                    &path,
+                    port,
+                    timeout,
+                    &stop,
+                    child_pid,
+                    &publish,
+                    &probe,
+                    (worker_signal, notified, published),
+                    #[cfg(test)]
+                    count,
+                );
                 publish(event);
             })?;
         Ok(Self {
             cancel,
+            signal,
+            address_published,
             updates,
             observed: 0,
             worker: Some(worker),
             #[cfg(test)]
             pid,
+            #[cfg(test)]
+            loop_count,
         })
     }
     pub fn poll(&mut self) -> Option<Event> {
@@ -103,8 +131,18 @@ impl Tunnel {
         self.observed = state.0;
         state.1.clone()
     }
+    /// Call only after the local server accepts this exact public Host/OAuth resource.
+    pub fn acknowledge_address(&self, host: &str) -> bool {
+        let matches = matches!(self.updates.lock().unwrap().1.as_ref(), Some(Event::Address(value)) if value == host);
+        if matches {
+            self.address_published.store(true, Ordering::Release);
+            let _ = self.signal.try_send(());
+        }
+        matches
+    }
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Release);
+        let _ = self.signal.try_send(());
     }
     pub fn finished(&self) -> bool {
         self.worker.as_ref().is_none_or(JoinHandle::is_finished)
@@ -161,6 +199,8 @@ fn run(
     pid: Arc<AtomicU32>,
     publish: &impl Fn(Event),
     probe: &impl Fn(&str) -> bool,
+    signals: (SyncSender<()>, Receiver<()>, Arc<AtomicBool>),
+    #[cfg(test)] loop_count: Arc<AtomicU32>,
 ) -> Event {
     let config = match ConfigFile::create() {
         Ok(config) => config,
@@ -208,14 +248,17 @@ fn run(
     // public endpoint, and continuing health is still determined by HTTPS.
     let registered_once = Arc::new(AtomicBool::new(false));
     let registration = registered_once.clone();
+    let (signal, notified, address_published) = signals;
     #[cfg(test)]
     let child_started = Instant::now();
     let reader = match std::thread::Builder::new()
         .name("mcp-tunnel-log".into())
         .spawn(move || {
-            read_lines(stderr, |line| {
-                if line.contains("Registered tunnel connection") {
-                    registration.store(true, Ordering::Release);
+            let result = read_lines(stderr, |line| {
+                if line.contains("Registered tunnel connection")
+                    && !registration.swap(true, Ordering::AcqRel)
+                {
+                    let _ = signal.try_send(());
                     #[cfg(test)]
                     eprintln!(
                         "first registration at {:.3}s",
@@ -226,9 +269,13 @@ fn run(
                     let mut slot = address.lock().unwrap();
                     if slot.is_none() {
                         *slot = Some(value);
+                        let _ = signal.try_send(());
                     }
                 }
-            })
+            });
+            // EOF/error may precede the child status becoming observable.
+            let _ = signal.try_send(());
+            result
         }) {
         Ok(reader) => reader,
         Err(_) => return Event::Failed("tunnel_reader_failed"),
@@ -237,7 +284,10 @@ fn run(
     let mut ready = false;
     let mut deadline = Instant::now() + timeout;
     let mut next_probe = Instant::now();
+    let mut probed_once = false;
     let outcome = loop {
+        #[cfg(test)]
+        loop_count.fetch_add(1, Ordering::Relaxed);
         if stop.load(Ordering::Acquire) {
             break Event::Stopped;
         }
@@ -255,10 +305,19 @@ fn run(
         if !ready && Instant::now() >= deadline {
             break Event::Failed("tunnel_timeout");
         }
+        if !probed_once
+            && discovered.is_some()
+            && registered_once.load(Ordering::Acquire)
+            && address_published.load(Ordering::Acquire)
+        {
+            next_probe = Instant::now();
+        }
         if Instant::now() >= next_probe {
             if let Some(value) = &discovered
                 && registered_once.load(Ordering::Acquire)
+                && address_published.load(Ordering::Acquire)
             {
+                probed_once = true;
                 let available = probe(value);
                 if stop.load(Ordering::Acquire) {
                     break Event::Stopped;
@@ -274,7 +333,16 @@ fn run(
             }
             next_probe = Instant::now() + Duration::from_secs(if ready { 10 } else { 1 });
         }
-        std::thread::sleep(Duration::from_millis(if ready { 250 } else { 50 }));
+        // Log/cancel notifications wake immediately. The one-second status bound
+        // also handles a child which closes stderr before exiting.
+        let now = Instant::now();
+        let mut wait = next_probe
+            .saturating_duration_since(now)
+            .min(Duration::from_secs(1));
+        if !ready {
+            wait = wait.min(deadline.saturating_duration_since(now));
+        }
+        let _ = notified.recv_timeout(wait);
     };
     drop(child); // Close the pipe by killing/reaping our exact child before joining reader.
     let _ = reader.join();
@@ -400,6 +468,7 @@ mod tests {
                         started.elapsed().as_secs_f64()
                     );
                     server.set_public_host(&host).unwrap();
+                    assert!(tunnel.acknowledge_address(&host));
                 }
                 Some(Event::Ready(_)) => {
                     eprintln!("ready elapsed={:.3}s", started.elapsed().as_secs_f64());
@@ -440,6 +509,98 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn first_probe_waits_for_server_host_publication() {
+        let path = fixture(
+            "printf 'https://fresh.trycloudflare.com\\nRegistered tunnel connection\\n' >&2\nexec /bin/sleep 30",
+        );
+        let probes = Arc::new(AtomicU32::new(0));
+        let observed = probes.clone();
+        let mut tunnel = Tunnel::start_using_probe(
+            path.clone(),
+            8739,
+            Duration::from_secs(3),
+            || {},
+            move |_| {
+                observed.fetch_add(1, Ordering::Relaxed);
+                true
+            },
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while tunnel.updates.lock().unwrap().0 == 0 {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        let before = probes.load(Ordering::Relaxed);
+        assert!(!tunnel.acknowledge_address("wrong.trycloudflare.com"));
+        assert!(tunnel.acknowledge_address("fresh.trycloudflare.com"));
+        let ready_by = Instant::now() + Duration::from_secs(2);
+        while !matches!(tunnel.poll(), Some(Event::Ready(_))) {
+            assert!(Instant::now() < ready_by);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        tunnel.shutdown();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(
+            before, 0,
+            "cannot probe before caller publishes the server host"
+        );
+    }
+
+    #[cfg(unix)]
+    fn poll_published_fixture(tunnel: &mut Tunnel) -> Option<Event> {
+        let event = tunnel.poll();
+        if let Some(Event::Address(host)) = &event {
+            assert!(tunnel.acknowledge_address(host));
+        }
+        event
+    }
+    #[cfg(unix)]
+    fn idle_worker_measurement() -> (u32, Duration) {
+        let path = fixture(
+            "printf 'https://fresh.trycloudflare.com\\nRegistered tunnel connection\\n' >&2\nexec /bin/sleep 30",
+        );
+        let mut tunnel =
+            Tunnel::start_using_probe(path.clone(), 8739, Duration::from_secs(4), || {}, |_| true)
+                .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while !matches!(poll_published_fixture(&mut tunnel), Some(Event::Ready(_))) {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        let before = tunnel.loop_count.load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_secs(2));
+        let loops = tunnel.loop_count.load(Ordering::Relaxed) - before;
+        let cancelled = Instant::now();
+        tunnel.shutdown();
+        let latency = cancelled.elapsed();
+        std::fs::remove_file(path).unwrap();
+        (loops, latency)
+    }
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "measures isolated owned tunnel worker idle wakes and cancellation"]
+    fn measure_registered_worker_idle_wakes_and_cancellation() {
+        let (loops, cancel) = idle_worker_measurement();
+        eprintln!(
+            "idle_worker loops_per_2s={loops} cancellation_ms={:.3}",
+            cancel.as_secs_f64() * 1000.0
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn registered_worker_avoids_quarter_second_polling() {
+        let (loops, _) = idle_worker_measurement();
+        assert!(
+            loops <= 3,
+            "healthy worker woke {loops} times in two seconds"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn first_public_probe_waits_for_initial_tunnel_registration() {
         let marker =
             std::env::temp_dir().join(format!("deppy-first-register-{}", uuid::Uuid::new_v4()));
@@ -464,7 +625,7 @@ mod tests {
         )
         .unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
-        while !matches!(tunnel.poll(), Some(Event::Ready(_))) {
+        while !matches!(poll_published_fixture(&mut tunnel), Some(Event::Ready(_))) {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -555,7 +716,7 @@ mod tests {
                 .unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
-            if matches!(tunnel.poll(), Some(Event::Ready(_))) {
+            if matches!(poll_published_fixture(&mut tunnel), Some(Event::Ready(_))) {
                 break;
             }
             assert!(Instant::now() < deadline);

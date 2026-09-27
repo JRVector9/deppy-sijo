@@ -348,6 +348,9 @@ impl CloudAgent {
                         .as_ref()
                         .is_some_and(|server| server.set_public_host(&host).is_ok())
                     {
+                        if let Some(tunnel) = &self.tunnel {
+                            tunnel.acknowledge_address(&host);
+                        }
                         self.generated_hostname = Some(host);
                         self.connection = Connection::Verifying;
                     } else {

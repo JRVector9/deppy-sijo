@@ -1,0 +1,217 @@
+{
+  "pid": 71086,
+  "wall_s": 30.233425624959636,
+  "cpu_core_pct": 39.59194088187996,
+  "rss_mib_min": 375.0625,
+  "rss_mib_max": 375.796875,
+  "interval_cpu_median": 37.22666618873902,
+  "interval_cpu_max": 72.37382169648788,
+  "samples": [
+    {
+      "elapsed_s": 0.0,
+      "cpu_s": 98492.09,
+      "rss_kib": 384080,
+      "ps_cpu_pct": 55.1
+    },
+    {
+      "elapsed_s": 1.0066352499998175,
+      "cpu_s": 98492.62,
+      "rss_kib": 384080,
+      "ps_cpu_pct": 50.2
+    },
+    {
+      "elapsed_s": 2.015287249989342,
+      "cpu_s": 98493.35,
+      "rss_kib": 384064,
+      "ps_cpu_pct": 69.5
+    },
+    {
+      "elapsed_s": 3.0198849579901434,
+      "cpu_s": 98493.96,
+      "rss_kib": 384080,
+      "ps_cpu_pct": 50.7
+    },
+    {
+      "elapsed_s": 4.028793082979973,
+      "cpu_s": 98494.34,
+      "rss_kib": 384080,
+      "ps_cpu_pct": 29.5
+    },
+    {
+      "elapsed_s": 5.035512665985152,
+      "cpu_s": 98494.74,
+      "rss_kib": 384080,
+      "ps_cpu_pct": 32.9
+    },
+    {
+      "elapsed_s": 6.043717166001443,
+      "cpu_s": 98495.06,
+      "rss_kib": 384080,
+      "ps_cpu_pct": 29.5
+    },
+    {
+      "elapsed_s": 7.0521404999890365,
+      "cpu_s": 98495.47,
+      "rss_kib": 384080,
+      "ps_cpu_pct": 33.7
+    },
+    {
+      "elapsed_s": 8.060595999995712,
+      "cpu_s": 98495.76,
+      "rss_kib": 384080,
+      "ps_cpu_pct": 26.1
+    },
+    {
+      "elapsed_s": 9.068852916010655,
+      "cpu_s": 98496.13,
+      "rss_kib": 384080,
+      "ps_cpu_pct": 32.5
+    },
+    {
+      "elapsed_s": 10.077115583000705,
+      "cpu_s": 98496.48,
+      "rss_kib": 384080,
+      "ps_cpu_pct": 26.9
+    },
+    {
+      "elapsed_s": 11.085148832993582,
+      "cpu_s": 98496.88,
+      "rss_kib": 384080,
+      "ps_cpu_pct": 33.0
+    },
+    {
+      "elapsed_s": 12.09374962496804,
+      "cpu_s": 98497.2,
+      "rss_kib": 384080,
+      "ps_cpu_pct": 31.0
+    },
+    {
+      "elapsed_s": 13.102119290968403,
+      "cpu_s": 98497.58,
+      "rss_kib": 384080,
+      "ps_cpu_pct": 33.0
+    },
+    {
+      "elapsed_s": 14.110604457964655,
+      "cpu_s": 98498.07,
+      "rss_kib": 384800,
+      "ps_cpu_pct": 57.9
+    },
+    {
+      "elapsed_s": 15.118822624965105,
+      "cpu_s": 98498.54,
+      "rss_kib": 384160,
+      "ps_cpu_pct": 35.6
+    },
+    {
+      "elapsed_s": 16.127152499975637,
+      "cpu_s": 98498.92,
+      "rss_kib": 384160,
+      "ps_cpu_pct": 28.0
+    },
+    {
+      "elapsed_s": 17.135271540959366,
+      "cpu_s": 98499.38,
+      "rss_kib": 384544,
+      "ps_cpu_pct": 53.9
+    },
+    {
+      "elapsed_s": 18.142884291009977,
+      "cpu_s": 98499.98,
+      "rss_kib": 384816,
+      "ps_cpu_pct": 55.0
+    },
+    {
+      "elapsed_s": 19.15165012498619,
+      "cpu_s": 98500.34,
+      "rss_kib": 384176,
+      "ps_cpu_pct": 36.7
+    },
+    {
+      "elapsed_s": 20.160367625008803,
+      "cpu_s": 98500.66,
+      "rss_kib": 384176,
+      "ps_cpu_pct": 29.7
+    },
+    {
+      "elapsed_s": 21.164415665960405,
+      "cpu_s": 98501.0,
+      "rss_kib": 384176,
+      "ps_cpu_pct": 33.6
+    },
+    {
+      "elapsed_s": 22.172532583004795,
+      "cpu_s": 98501.31,
+      "rss_kib": 384176,
+      "ps_cpu_pct": 30.8
+    },
+    {
+      "elapsed_s": 23.181022708013188,
+      "cpu_s": 98501.68,
+      "rss_kib": 384096,
+      "ps_cpu_pct": 32.5
+    },
+    {
+      "elapsed_s": 24.18908066599397,
+      "cpu_s": 98502.02,
+      "rss_kib": 384096,
+      "ps_cpu_pct": 33.9
+    },
+    {
+      "elapsed_s": 25.19699570798548,
+      "cpu_s": 98502.4,
+      "rss_kib": 384096,
+      "ps_cpu_pct": 31.3
+    },
+    {
+      "elapsed_s": 26.204846957989503,
+      "cpu_s": 98502.7,
+      "rss_kib": 384096,
+      "ps_cpu_pct": 26.0
+    },
+    {
+      "elapsed_s": 27.214382749982178,
+      "cpu_s": 98503.08,
+      "rss_kib": 384096,
+      "ps_cpu_pct": 31.7
+    },
+    {
+      "elapsed_s": 28.222542500006966,
+      "cpu_s": 98503.38,
+      "rss_kib": 384096,
+      "ps_cpu_pct": 27.0
+    },
+    {
+      "elapsed_s": 29.227642165962607,
+      "cpu_s": 98503.75,
+      "rss_kib": 384096,
+      "ps_cpu_pct": 34.9
+    },
+    {
+      "elapsed_s": 30.233425624959636,
+      "cpu_s": 98504.06,
+      "rss_kib": 384096,
+      "ps_cpu_pct": 27.6
+    }
+  ],
+  "kind": "read-only existing debug app observation; not idle or latest release baseline",
+  "binary": "/Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit/target/debug/deppy-sijo",
+  "launch_time": "2026-09-24 08:31:18 +0900",
+  "os": "macOS27.0 (26A428)",
+  "source_current_head": "2a1583d1 (dirty; does not establish executable source)",
+  "latest_source_head": "78f054b9808851456ef687dbcbc72ba1a6cd823a",
+  "threads_vmmap": 77,
+  "vmmap_physical_footprint_mib": 842.6,
+  "sample_physical_footprint_mib": 853.5,
+  "physical_footprint_peak_mib": 999.7,
+  "graphics_owned_unmapped_resident_mib": 342.3,
+  "ioaccelerator_resident_mib": 202.0,
+  "rss_is_not_physical_footprint": true,
+  "sample_log": "/tmp/deppy-live-sample-20260927.txt",
+  "vmmap_log": "/tmp/deppy-live-vmmap-20260927.txt",
+  "sample_warning": "Inclusive wall-time stack counts include waiting; cannot interpret as function CPU percentage",
+  "latest_release_sha256": "c3a1cf963209e97717745836f7a607672b7f1c787d70039b73dce2fb83d52ab1",
+  "release_build_log": "/tmp/deppy-measure-release-build-20260927.log",
+  "release_build_exit": 0,
+  "isolated_gui_permission": "pending; no bench launched"
+}

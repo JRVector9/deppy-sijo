@@ -1,0 +1,48 @@
+   Compiling terminal v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-render/crates/terminal)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.53s
+     Running unittests src/lib.rs (target/debug/deps/terminal-3b64586eaae4bc18)
+
+running 41 tests
+test renderer_egui::tests::render_tessellation_bench ... ignored, 렌더 테셀레이션 실측 — --ignored --nocapture로만
+test renderer_egui::tests::display_char는_없는_기호만_치환한다 ... ok
+test renderer_egui::tests::fit_width_scale은_가용폭을_맞추고_비정상_입력은_기존_clip을_유지한다 ... ok
+test renderer_egui::tests::row_dirty는_cell_range_intersection을_사용한다 ... ok
+test renderer_egui::tests::terminal_focus_lock_filter는_tui_navigation_keys를_ui_focus에서_잠근다 ... ok
+test renderer_egui::tests::selection_text_행별_trailing_공백_제거와_개행 ... ok
+test renderer_egui::tests::terminal_높이는_완전한_행을_모두_사용한다 ... ok
+test renderer_egui::tests::terminal_행계산은_비정상_높이에서도_최솟값을_지킨다 ... ok
+test renderer_egui::tests::emoji_path_fixture_selection_copy_preserves_rocket ... ok
+test renderer_egui::tests::cjk_wide_spacer_selection_endpoints_include_owner ... ok
+test renderer_egui::tests::wide_글자로_끝나는_선택은_자리_채움까지_칠한다 ... ok
+test renderer_egui::tests::밑줄은_wide_문자의_뒷칸을_중복으로_담지_않는다 ... ok
+test renderer_egui::tests::required_fixture_selection_copy_full_rows ... ok
+test renderer_egui::tests::밑줄은_공백을_건너뛰지_않고_한_런으로_이어진다 ... ok
+test renderer_egui::tests::밑줄은_행끝_필러에_유령선을_긋지_않는다 ... ok
+test renderer_egui::tests::선택_하이라이트는_연속_셀을_run으로_병합한다 ... ok
+test renderer_egui::tests::bold_패밀리가_미등록이면_기본_모노로_내려간다 ... ok
+test renderer_egui::tests::ime_preedit_candidate_fits_when_stale_rows_exceed_pane_height ... ok
+test renderer_egui::tests::ime_none_range_keeps_terminal_candidate_anchor_when_preedit_shifts_left ... ok
+test renderer_egui::tests::ime_preedit_is_laid_out_once_and_fits_at_right_edge ... ok
+test renderer_egui::tests::ime_영역은_비활성_터미널이_출력하지_않는다 ... ok
+test renderer_egui::tests::비활성_터미널은_조합_이벤트가_있어도_ime를_가져가지_않는다 ... ok
+test renderer_egui::tests::terminal_좌우_내부여백은_각각_3픽셀이다 ... ok
+test renderer_egui::tests::ime_영역은_같은_프레임에_공식_소유권을_확보한_뒤_통보된다 ... ok
+test renderer_egui::tests::행_끝_wrap_필러는_end를_넘어_칠하지_않는다 ... ok
+test renderer_egui::tests::취소선은_밑줄과_독립적으로_런을_만든다 ... ok
+test renderer_egui::tests::cjk_runs_batch_owned_spacers_and_preserve_two_cell_advances ... ok
+test renderer_egui::tests::cjk_runs_stop_at_ascii_style_and_unowned_spacer_boundaries ... ok
+test renderer_egui::tests::cjk_runs_keep_emoji_fallback_in_an_independent_run ... ok
+test renderer_egui::tests::같은_배율_재draw는_축소_갤리를_재사용하고_배율이_바뀌면_교체한다 ... ok
+test renderer_egui::tests::행높이_배수는_셀_높이만_키우고_폭은_그대로다 ... ok
+test renderer_egui::tests::같은_스냅샷_재draw는_행을_재구성하지_않는다 ... ok
+test renderer_egui::tests::render_cache는_dirty_row만_재구성한다 ... ok
+test renderer_egui::tests::이번_프레임에_시작된_조합은_포커스_복구가_중단시키지_않는다 ... ok
+test renderer_egui::tests::render_counters는_dirty_painted_shapes를_집계한다 ... ok
+test renderer_egui::tests::sparse_graphemes_survive_paint_and_copy_without_scalar_cell_expansion ... ok
+test renderer_egui::tests::좁은_pane은_그리드만_균일_축소해_마지막_열까지_화면_안에_그린다 ... ok
+test renderer_egui::tests::폭_변화는_행_캐시를_무효화하지_않고_비축소_경로는_기존_metrics를_유지한다 ... ok
+test renderer_egui::tests::조합이_끝난_프레임은_포커스_복구를_막지_않는다 ... ok
+test renderer_egui::tests::조합중_비textedit_포커스전이는_ime를_중단하지_않는다 ... ok
+test renderer_egui::tests::ime_none_range_scrolls_a_long_preedit_to_its_typed_end ... ok
+
+test result: ok. 40 passed; 0 failed; 1 ignored; 0 measured; 72 filtered out; finished in 0.03s

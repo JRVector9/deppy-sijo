@@ -1,0 +1,34 @@
+{
+  "note": "1977 wall-time sample observations per thread; inclusive stacks include waits, values are not CPU share",
+  "threads": {
+    "Thread_8349041   DispatchQueue_1: com.apple.main-thread  (serial)": {
+      "metal_drawable_wait_inclusive": 474,
+      "terminal_draw_inclusive": 47,
+      "egui_tessellate_inclusive": 180
+    },
+    "Thread_8349127: runtime-worker": {
+      "cache_footprint_inclusive": 55
+    },
+    "Thread_8361879: runtime-worker": {
+      "cache_footprint_inclusive": 215
+    },
+    "Thread_8366866: runtime-worker": {
+      "cache_footprint_inclusive": 64
+    },
+    "Thread_8366909: runtime-worker": {
+      "cache_footprint_inclusive": 207
+    },
+    "Thread_9201493: runtime-worker": {
+      "cache_footprint_inclusive": 26
+    },
+    "Thread_17037701: runtime-worker": {
+      "cache_footprint_inclusive": 25
+    },
+    "Thread_26391406: runtime-worker": {
+      "cache_footprint_inclusive": 50
+    },
+    "Thread_65258725: runtime-worker": {
+      "cache_footprint_inclusive": 10
+    }
+  }
+}

@@ -1,0 +1,3 @@
+No actionable findings in commit `5ee9218d`. The zero width suffix rule matches the vendored `Term::input` behavior, and the keyframe and delta fixtures exercise rejection of `ab` in one owner cell.
+
+This was a source only review; I did not run tests or builds.

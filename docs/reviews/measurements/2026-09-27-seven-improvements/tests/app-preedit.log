@@ -1,0 +1,14 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.17s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-631823a1baa9af03)
+
+running 8 tests
+test ui::workspace::tests::조합이_시작되는_프레임은_소유권과_직전_preedit이_없어도_받는다 ... ok
+test ui::workspace::tests::preedit_projection_preserves_char_ranges_and_clears_owner_on_cancel ... ok
+test ui::workspace::tests::빠른_한글_연타로_한_프레임에_섞인_preedit_commit도_음절대로_pty에_들어간다 ... ok
+test ui::workspace::tests::한글_preedit는_도착한_같은_pass에_표시된다 ... ok
+test ui::workspace::tests::preedit_from_a_replaced_pane_session_is_not_painted_or_forwarded ... ok
+test ui::workspace::tests::한글_preedit_후보창은_char_range_내부_커서를_따른다 ... ok
+test ui::workspace::tests::pending_terminal_refocus_cannot_project_a_focused_textedit_preedit ... ok
+test ui::workspace::tests::disabled_terminal_does_not_publish_projected_preedit_or_send_commit ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 2362 filtered out; finished in 0.02s

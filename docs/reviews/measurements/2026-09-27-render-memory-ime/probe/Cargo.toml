@@ -1,0 +1,13 @@
+[package]
+name = "deppy-terminal-research-probe"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+terminal = { path = "/Users/jr/Desktop/projects/deppy-sijo-cloud-agent-mcp/crates/terminal" }
+egui = "=0.36.1"
+
+[patch.crates-io]
+alacritty_terminal = { path = "/Users/jr/Desktop/projects/deppy-sijo-cloud-agent-mcp/third_party/alacritty_terminal-0.26.0" }
+
+[workspace]

@@ -1,0 +1,49 @@
+   Compiling deppy-core v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-model/crates/core)
+   Compiling secret v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-model/crates/secret)
+   Compiling alacritty_terminal v0.26.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-model/third_party/alacritty_terminal-0.26.0)
+   Compiling winit v0.30.13 (/Users/jr/Desktop/projects/deppy-sijo-perf-model/third_party/winit-0.30.13)
+   Compiling pty v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-model/crates/pty)
+   Compiling storage-core v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-model/crates/storage-core)
+   Compiling mcp-store v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-model/crates/mcp-store)
+   Compiling http-client v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-model/crates/http-client)
+   Compiling connector-contract v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-model/crates/connector-contract)
+   Compiling i18n v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-model/crates/i18n)
+   Compiling platform v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-model/crates/platform)
+   Compiling mux v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-model/crates/mux)
+   Compiling audit v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-model/crates/audit)
+   Compiling mcp v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-model/crates/mcp)
+   Compiling auth v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-model/crates/auth)
+   Compiling persist v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-model/crates/persist)
+   Compiling connector-ui v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-model/crates/connector-ui)
+   Compiling storage v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-model/crates/storage)
+   Compiling terminal v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-model/crates/terminal)
+   Compiling accesskit_winit v0.32.2
+   Compiling egui-wgpu v0.36.1
+   Compiling egui-winit v0.36.1
+   Compiling eframe v0.36.1
+   Compiling session v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-model/crates/session)
+   Compiling connector-service v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-model/crates/connector-service)
+   Compiling runtime v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-model/crates/runtime)
+   Compiling web-remote v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-model/crates/web-remote)
+   Compiling agent-mcp v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-model/crates/agent-mcp)
+   Compiling deppy-sijo v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-model/crates/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 26.17s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-dc65cfcaf66bfb31)
+
+running 1 test
+
+thread 'cloud_agent::grapheme_snapshot_tests::cloud_screen_text_preserves_non_composable_graphemes' (83333414) panicked at crates/app/src/cloud_agent.rs:597:13:
+assertion `left == right` failed
+  left: "ᄀ"
+ right: "가ᇹ"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test cloud_agent::grapheme_snapshot_tests::cloud_screen_text_preserves_non_composable_graphemes ... FAILED
+
+failures:
+
+failures:
+    cloud_agent::grapheme_snapshot_tests::cloud_screen_text_preserves_non_composable_graphemes
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2358 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p deppy-sijo --bin deppy-sijo`

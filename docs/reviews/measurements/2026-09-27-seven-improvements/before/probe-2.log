@@ -1,0 +1,16 @@
+TerminalCell size=16B; allocation counts include realloc; bytes are requested allocation traffic, NOT RSS
+normal-aligned one-flags-byte model size=12B
+cluster input="한" first cell='한' (U+D55C) displayed/copy="한"
+cluster input="가ᇹ" first cell='ᄀ' (U+1100) displayed/copy="ᄀ"
+cluster input="a\u{301}\u{308}" first cell='a' (U+0061) displayed/copy="a"
+footprint history=1000 estimate=2463432B: 1.56us/call allocs=0 bytes=0
+snapshot 300x80 history=1000 offset=0: 95.31us/snapshot allocations=3.0 requested_bytes=775217
+snapshot 300x80 history=1000 offset=400: 117.92us/snapshot allocations=83.0 requested_bytes=1351216
+footprint history=5000 estimate=2643432B: 6.79us/call allocs=0 bytes=0
+snapshot 300x80 history=5000 offset=0: 95.25us/snapshot allocations=3.0 requested_bytes=775217
+snapshot 300x80 history=5000 offset=400: 120.27us/snapshot allocations=83.0 requested_bytes=1351216
+footprint history=20000 estimate=3318432B: 30.24us/call allocs=0 bytes=0
+snapshot 300x80 history=20000 offset=0: 86.59us/snapshot allocations=3.0 requested_bytes=775217
+snapshot 300x80 history=20000 offset=400: 114.97us/snapshot allocations=83.0 requested_bytes=1351216
+ASCII 300x80 cached render+tess: 0.19ms shapes=81 rebuilt=0 painted=80 allocations/frame=39 requested_bytes/frame=7971662
+Hangul 300x80 cached render+tess: 0.53ms shapes=11852 rebuilt=0 painted=80 allocations/frame=53 requested_bytes/frame=4365110

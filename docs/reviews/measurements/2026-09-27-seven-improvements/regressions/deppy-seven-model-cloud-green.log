@@ -1,0 +1,11 @@
+   Compiling runtime v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-model/crates/runtime)
+   Compiling web-remote v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-model/crates/web-remote)
+   Compiling agent-mcp v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-model/crates/agent-mcp)
+   Compiling deppy-sijo v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-model/crates/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.66s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-dc65cfcaf66bfb31)
+
+running 1 test
+test cloud_agent::grapheme_snapshot_tests::cloud_screen_text_preserves_non_composable_graphemes ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2358 filtered out; finished in 0.00s

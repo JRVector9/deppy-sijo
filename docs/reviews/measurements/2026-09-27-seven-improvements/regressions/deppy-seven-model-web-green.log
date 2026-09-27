@@ -1,0 +1,50 @@
+   Compiling web-remote v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-model/crates/web-remote)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.95s
+     Running unittests src/lib.rs (target/debug/deps/web_remote-9d705deda5e11b63)
+
+running 1 test
+test protocol::tests::sparse_grapheme_survives_web_keyframe_and_delta ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 318 filtered out; finished in 0.00s
+
+     Running tests/chrome_support_contract.rs (target/debug/deps/chrome_support_contract-97c60b8c7d697ab9)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/relay_shell_chrome.rs (target/debug/deps/relay_shell_chrome-0362e6e93572ed48)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/relay_shell_deploy.rs (target/debug/deps/relay_shell_deploy-6bdbcf7f6cbc5b2e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
+
+     Running tests/relay_webcrypto_vectors.rs (target/debug/deps/relay_webcrypto_vectors-3026eccb6280df16)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/transport_independence.rs (target/debug/deps/transport_independence-20154c58374d7ea4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/viewer_core_chrome.rs (target/debug/deps/viewer_core_chrome-79199bbb0ea687f5)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/viewer_grapheme_chrome.rs (target/debug/deps/viewer_grapheme_chrome-12d3f2af1a2f1736)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s

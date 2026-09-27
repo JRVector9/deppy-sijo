@@ -1,0 +1,24 @@
+   Compiling terminal v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/terminal)
+   Compiling session v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/session)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.99s
+     Running unittests src/lib.rs (target/debug/deps/session-6b5531643ec57c77)
+
+running 2 tests
+test session::tests::prompt_jump_metadata_does_not_create_snapshot ... ok
+test session::tests::replay_metadata_does_not_create_snapshot_and_preserves_alt_screen ... FAILED
+
+failures:
+
+---- session::tests::replay_metadata_does_not_create_snapshot_and_preserves_alt_screen stdout ----
+
+thread 'session::tests::replay_metadata_does_not_create_snapshot_and_preserves_alt_screen' (82897173) panicked at crates/session/src/session.rs:821:9:
+assertion failed: session.screen_text().contains("ALT-CONTENT")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    session::tests::replay_metadata_does_not_create_snapshot_and_preserves_alt_screen
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 68 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p session --lib`

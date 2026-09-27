@@ -1,0 +1,5 @@
+**Low — [ghostty_backend.rs:241](/Users/jr/Desktop/projects/deppy-sijo-performance/crates/terminal/src/ghostty_backend.rs:241):** `active_screen().ok()?` makes the new metadata read return `None` if that query fails. The existing snapshot path treats the same failure as `is_alt_screen = false` and can still return the valid scroll offset. As a result, `scroll_to_prompt()` now substitutes offset `0` and may jump to the wrong mark. Preserve the snapshot path’s fallback for the screen flag.
+
+No other actionable regression was established in the five-file diff. The fallback metadata method retains snapshot behavior for other backends; the native reads do not call snapshot or render update. The new prompt test checks snapshot call count but does not exercise a jump with marks or vi-mode offset parity.
+
+The Ghostty failure fallback is a **new** difference; its existing scrollbar fallback is unchanged. No builds, tests, edits, or app launches were performed.

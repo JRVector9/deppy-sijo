@@ -1,0 +1,20 @@
+
+running 1 test
+test ui::workspace::tests::attached_without_snapshot은_workspace_specific_unavailable을_표시한다 ... FAILED
+
+failures:
+
+failures:
+    ui::workspace::tests::attached_without_snapshot은_workspace_specific_unavailable을_표시한다
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2357 filtered out; finished in 0.06s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.16s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-dc65cfcaf66bfb31)
+
+thread 'ui::workspace::tests::attached_without_snapshot은_workspace_specific_unavailable을_표시한다' (83974227) panicked at crates/app/src/ui/workspace.rs:14983:9:
+assertion `left == right` failed: viewport가 없어도 이미 전송한 폭으로 행 크기 변경을 예약해야 한다
+  left: 116
+ right: 80
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+error: test failed, to rerun pass `-p deppy-sijo --bin deppy-sijo`

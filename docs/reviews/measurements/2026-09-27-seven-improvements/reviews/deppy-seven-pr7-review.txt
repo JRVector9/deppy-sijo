@@ -1,0 +1,3 @@
+No actionable findings in the requested source scope of commit `ebddc67f`. I reviewed the dirty-row union and invalidation paths, sidecar updates, row sharing, Unicode comparison, Arc initialization, serialization, heap accounting, and exclusive dirty cap.
+
+This was a source-only review; I did not run builds, tests, or the app.

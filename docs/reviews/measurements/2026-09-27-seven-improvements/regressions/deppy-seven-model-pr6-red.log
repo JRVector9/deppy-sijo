@@ -1,0 +1,21 @@
+   Compiling terminal v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-model/crates/terminal)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.64s
+     Running unittests src/lib.rs (target/debug/deps/terminal-3b64586eaae4bc18)
+
+running 1 test
+
+thread 'viewport_snapshot::compact_tests::terminal_cell_payload_is_twelve_bytes' (83055030) panicked at crates/terminal/src/viewport_snapshot.rs:191:9:
+assertion `left == right` failed
+  left: 16
+ right: 12
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test viewport_snapshot::compact_tests::terminal_cell_payload_is_twelve_bytes ... FAILED
+
+failures:
+
+failures:
+    viewport_snapshot::compact_tests::terminal_cell_payload_is_twelve_bytes
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 102 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p terminal --lib`

@@ -1,0 +1,6 @@
+PR7 viewport snapshot-only measurement; Cell=12B; requested allocation traffic is NOT RSS
+metadata300x80 calls=3.00 requested_bytes=583216.00 snapshot_us=86.8847
+cursor-only300x80 calls=3.00 requested_bytes=583216.00 snapshot_us=87.3212
+dirty1300x80 calls=3.00 requested_bytes=583216.00 snapshot_us=83.6207
+full300x80 calls=3.00 requested_bytes=583216.00 snapshot_us=86.0283
+cache_footprint allocated_calls=0 requested_bytes=0 query_us=0.0022

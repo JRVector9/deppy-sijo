@@ -1,0 +1,72 @@
+   Compiling libghostty-vt-sys v0.2.1
+error: failed to run custom build command for `libghostty-vt-sys v0.2.1`
+
+Caused by:
+  process didn't exit successfully: `/Users/jr/Desktop/projects/deppy-sijo-perf-model/target/debug/build/libghostty-vt-sys-eacdee65725d7f33/build-script-build` (exit status: 101)
+  --- stdout
+  cargo:rerun-if-env-changed=LIBGHOSTTY_VT_SYS_OPTIMIZE
+  cargo:rerun-if-env-changed=GHOSTTY_SOURCE_DIR
+  cargo:rerun-if-env-changed=GHOSTTY_ZIG_SYSTEM_DIR
+  cargo:rerun-if-env-changed=TARGET
+  cargo:rerun-if-env-changed=HOST
+  cargo:rerun-if-env-changed=DEBUG
+  cargo:rerun-if-env-changed=OPT_LEVEL
+  cargo:rerun-if-changed=crates/libghostty-vt-sys/build.rs
+
+  --- stderr
+  error: undefined symbol: __availability_version_check
+      note: referenced by /Users/jr/.cache/zig/o/4d81ebffef5cd0c7452d87ace1bc3e30/libcompiler_rt.a(libcompiler_rt_zcu.o):___isPlatformVersionAtLeast
+  error: undefined symbol: _abort
+      note: referenced by /Users/jr/Desktop/projects/deppy-sijo-perf-model/target/debug/build/libghostty-vt-sys-fac84c92769c927b/out/zig-cache/o/a03cffebd4c24c54973ea037ee3f72c6/build_zcu.o:_posix.abort
+  error: undefined symbol: _arc4random_buf
+      note: referenced by /Users/jr/Desktop/projects/deppy-sijo-perf-model/target/debug/build/libghostty-vt-sys-fac84c92769c927b/out/zig-cache/o/a03cffebd4c24c54973ea037ee3f72c6/build_zcu.o:_crypto.tlcsprng.tlsCsprngFill
+  error: undefined symbol: _bzero
+      note: referenced by /Users/jr/Desktop/projects/deppy-sijo-perf-model/target/debug/build/libghostty-vt-sys-fac84c92769c927b/out/zig-cache/o/a03cffebd4c24c54973ea037ee3f72c6/build_zcu.o:_hash_map.HashMapUnmanaged(usize,*debug.SelfInfo.Module__struct_3842,hash_map.AutoContext(usize),80).initMetadatas
+      note: referenced by /Users/jr/Desktop/projects/deppy-sijo-perf-model/target/debug/build/libghostty-vt-sys-fac84c92769c927b/out/zig-cache/o/a03cffebd4c24c54973ea037ee3f72c6/build_zcu.o:_hash_map.HashMapUnmanaged([]const u8,u64,hash_map.StringContext,80).initMetadatas
+      note: referenced by /Users/jr/Desktop/projects/deppy-sijo-perf-model/target/debug/build/libghostty-vt-sys-fac84c92769c927b/out/zig-cache/o/a03cffebd4c24c54973ea037ee3f72c6/build_zcu.o:_hash_map.HashMapUnmanaged([]const u8,debug.SelfInfo.Module__struct_3842.OFileInfo,hash_map.StringContext,80).initMetadatas
+      note: referenced by /Users/jr/Desktop/projects/deppy-sijo-perf-model/target/debug/build/libghostty-vt-sys-fac84c92769c927b/out/zig-cache/o/a03cffebd4c24c54973ea037ee3f72c6/build_zcu.o:_Build.Watch.FsEvents.wait
+      note: referenced 14 more times
+  error: undefined symbol: _clock_gettime
+      note: referenced by /Users/jr/Desktop/projects/deppy-sijo-perf-model/target/debug/build/libghostty-vt-sys-fac84c92769c927b/out/zig-cache/o/a03cffebd4c24c54973ea037ee3f72c6/build_zcu.o:_posix.clock_gettime
+  error: undefined symbol: _dispatch_queue_create
+      note: referenced by /Users/jr/Desktop/projects/deppy-sijo-perf-model/target/debug/build/libghostty-vt-sys-fac84c92769c927b/out/zig-cache/o/a03cffebd4c24c54973ea037ee3f72c6/build_zcu.o:_Build.Watch.FsEvents.init
+  error: undefined symbol: _dispatch_semaphore_create
+      note: referenced by /Users/jr/Desktop/projects/deppy-sijo-perf-model/target/debug/build/libghostty-vt-sys-fac84c92769c927b/out/zig-cache/o/a03cffebd4c24c54973ea037ee3f72c6/build_zcu.o:_Build.Watch.FsEvents.init
+  error: undefined symbol: _dispatch_semaphore_signal
+      note: referenced by /Users/jr/Desktop/projects/deppy-sijo-perf-model/target/debug/build/libghostty-vt-sys-fac84c92769c927b/out/zig-cache/o/a03cffebd4c24c54973ea037ee3f72c6/build_zcu.o:_Build.Watch.FsEvents.eventCallback
+  error: undefined symbol: _dispatch_semaphore_wait
+      note: referenced by /Users/jr/Desktop/projects/deppy-sijo-perf-model/target/debug/build/libghostty-vt-sys-fac84c92769c927b/out/zig-cache/o/a03cffebd4c24c54973ea037ee3f72c6/build_zcu.o:_Build.Watch.FsEvents.wait
+  error: undefined symbol: _dispatch_time
+      note: referenced by /Users/jr/Desktop/projects/deppy-sijo-perf-model/target/debug/build/libghostty-vt-sys-fac84c92769c927b/out/zig-cache/o/a03cffebd4c24c54973ea037ee3f72c6/build_zcu.o:_Build.Watch.FsEvents.wait
+  error: undefined symbol: _exit
+      note: referenced by /Users/jr/Desktop/projects/deppy-sijo-perf-model/target/debug/build/libghostty-vt-sys-fac84c92769c927b/out/zig-cache/o/a03cffebd4c24c54973ea037ee3f72c6/build_zcu.o:_posix.exit
+  error: undefined symbol: _fcopyfile
+      note: referenced by /Users/jr/Desktop/projects/deppy-sijo-perf-model/target/debug/build/libghostty-vt-sys-fac84c92769c927b/out/zig-cache/o/a03cffebd4c24c54973ea037ee3f72c6/build_zcu.o:_fs.File.Writer.sendFile
+  error: undefined symbol: _fork
+      note: referenced by /Users/jr/Desktop/projects/deppy-sijo-perf-model/target/debug/build/libghostty-vt-sys-fac84c92769c927b/out/zig-cache/o/a03cffebd4c24c54973ea037ee3f72c6/build_zcu.o:_posix.fork
+  error: undefined symbol: _free
+      note: referenced by /Users/jr/Desktop/projects/deppy-sijo-perf-model/target/debug/build/libghostty-vt-sys-fac84c92769c927b/out/zig-cache/o/a03cffebd4c24c54973ea037ee3f72c6/build_zcu.o:_heap.CAllocator.alignedFree
+  error: undefined symbol: _getcwd
+      note: referenced by /Users/jr/Desktop/projects/deppy-sijo-perf-model/target/debug/build/libghostty-vt-sys-fac84c92769c927b/out/zig-cache/o/a03cffebd4c24c54973ea037ee3f72c6/build_zcu.o:_posix.getcwd
+  error: undefined symbol: _getenv
+      note: referenced by /Users/jr/Desktop/projects/deppy-sijo-perf-model/target/debug/build/libghostty-vt-sys-fac84c92769c927b/out/zig-cache/o/a03cffebd4c24c54973ea037ee3f72c6/build_zcu.o:_posix.getenvZ
+  error: undefined symbol: _isatty
+      note: referenced by /Users/jr/Desktop/projects/deppy-sijo-perf-model/target/debug/build/libghostty-vt-sys-fac84c92769c927b/out/zig-cache/o/a03cffebd4c24c54973ea037ee3f72c6/build_zcu.o:_posix.isatty
+  error: undefined symbol: _malloc_size
+      note: referenced by /Users/jr/Desktop/projects/deppy-sijo-perf-model/target/debug/build/libghostty-vt-sys-fac84c92769c927b/out/zig-cache/o/a03cffebd4c24c54973ea037ee3f72c6/build_zcu.o:_heap.CAllocator.alignedAllocSize
+  error: undefined symbol: _posix_memalign
+      note: referenced by /Users/jr/Desktop/projects/deppy-sijo-perf-model/target/debug/build/libghostty-vt-sys-fac84c92769c927b/out/zig-cache/o/a03cffebd4c24c54973ea037ee3f72c6/build_zcu.o:_heap.CAllocator.alignedAlloc
+  error: undefined symbol: _realpath$DARWIN_EXTSN
+      note: referenced by /Users/jr/Desktop/projects/deppy-sijo-perf-model/target/debug/build/libghostty-vt-sys-fac84c92769c927b/out/zig-cache/o/a03cffebd4c24c54973ea037ee3f72c6/build_zcu.o:_posix.realpathZ
+  error: undefined symbol: _sigaction
+      note: referenced by /Users/jr/Desktop/projects/deppy-sijo-perf-model/target/debug/build/libghostty-vt-sys-fac84c92769c927b/out/zig-cache/o/a03cffebd4c24c54973ea037ee3f72c6/build_zcu.o:_posix.sigaction
+  error: undefined symbol: _sigemptyset
+      note: referenced by /Users/jr/Desktop/projects/deppy-sijo-perf-model/target/debug/build/libghostty-vt-sys-fac84c92769c927b/out/zig-cache/o/a03cffebd4c24c54973ea037ee3f72c6/build_zcu.o:_posix.sigemptyset
+  error: undefined symbol: _sysctlbyname
+      note: referenced by /Users/jr/Desktop/projects/deppy-sijo-perf-model/target/debug/build/libghostty-vt-sys-fac84c92769c927b/out/zig-cache/o/a03cffebd4c24c54973ea037ee3f72c6/build_zcu.o:_posix.sysctlbynameZ
+  error: undefined symbol: _waitpid
+      note: referenced by /Users/jr/Desktop/projects/deppy-sijo-perf-model/target/debug/build/libghostty-vt-sys-fac84c92769c927b/out/zig-cache/o/a03cffebd4c24c54973ea037ee3f72c6/build_zcu.o:_posix.waitpid
+
+  thread 'main' (83845460) panicked at /Users/jr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/libghostty-vt-sys-0.2.1/build.rs:366:5:
+  zig build failed with status exit status: 2
+  note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

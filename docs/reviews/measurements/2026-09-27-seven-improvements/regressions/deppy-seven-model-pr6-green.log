@@ -1,0 +1,9 @@
+   Compiling terminal v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-model/crates/terminal)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.50s
+     Running unittests src/lib.rs (target/debug/deps/terminal-3b64586eaae4bc18)
+
+running 2 tests
+test viewport_snapshot::compact_tests::terminal_cell_payload_is_twelve_bytes ... ok
+test viewport_snapshot::compact_tests::compact_cell_preserves_all_supported_flag_combinations ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 103 filtered out; finished in 0.00s

@@ -1,0 +1,9 @@
+   Compiling terminal v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-model/crates/terminal)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.40s
+     Running unittests src/lib.rs (target/debug/deps/terminal-3b64586eaae4bc18)
+
+running 2 tests
+test alacritty_backend::tests::grapheme_selection_preserves_non_composable_scalars ... ok
+test alacritty_backend::tests::grapheme_snapshot_search_and_screen_text_preserve_clusters ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 0.00s

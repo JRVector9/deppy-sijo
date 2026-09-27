@@ -1,0 +1,13 @@
+[package]
+name = "deppy-terminal-research-probe"
+version = "0.0.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+terminal = { path = "../../../../../crates/terminal" }
+egui = "=0.36.1"
+
+[patch.crates-io]
+alacritty_terminal = { path = "../../../../../third_party/alacritty_terminal-0.26.0" }

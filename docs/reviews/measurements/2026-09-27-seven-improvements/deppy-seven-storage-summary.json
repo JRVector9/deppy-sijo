@@ -1,0 +1,159 @@
+{
+  "baseline": {
+    "footprint-1000": {
+      "median_us": 1.2407,
+      "samples_us": [
+        1.2523,
+        1.2295,
+        1.2407
+      ]
+    },
+    "snapshot-1000-offset-0": {
+      "median_us": 87.37,
+      "samples_us": [
+        91.62,
+        85.53,
+        87.37
+      ]
+    },
+    "snapshot-1000-offset-400": {
+      "median_us": 115.41,
+      "samples_us": [
+        121.1,
+        115.12,
+        115.41
+      ]
+    },
+    "footprint-5000": {
+      "median_us": 6.9098,
+      "samples_us": [
+        7.084,
+        6.8656,
+        6.9098
+      ]
+    },
+    "snapshot-5000-offset-0": {
+      "median_us": 102.04,
+      "samples_us": [
+        85.52,
+        112.41,
+        102.04
+      ]
+    },
+    "snapshot-5000-offset-400": {
+      "median_us": 114.88,
+      "samples_us": [
+        114.88,
+        120.79,
+        113.83
+      ]
+    },
+    "footprint-20000": {
+      "median_us": 29.9154,
+      "samples_us": [
+        29.9154,
+        28.4684,
+        29.9827
+      ]
+    },
+    "snapshot-20000-offset-0": {
+      "median_us": 86.03,
+      "samples_us": [
+        85.25,
+        86.03,
+        130.99
+      ]
+    },
+    "snapshot-20000-offset-400": {
+      "median_us": 114.87,
+      "samples_us": [
+        114.87,
+        114.04,
+        127.66
+      ]
+    }
+  },
+  "after": {
+    "footprint-1000": {
+      "median_us": 0.0023,
+      "samples_us": [
+        0.0021,
+        0.0023,
+        0.0023
+      ]
+    },
+    "snapshot-1000-offset-0": {
+      "median_us": 87.67,
+      "samples_us": [
+        87.67,
+        85.0,
+        93.13
+      ]
+    },
+    "snapshot-1000-offset-400": {
+      "median_us": 116.8,
+      "samples_us": [
+        116.8,
+        113.79,
+        126.59
+      ]
+    },
+    "footprint-5000": {
+      "median_us": 0.0023,
+      "samples_us": [
+        0.0033,
+        0.0021,
+        0.0023
+      ]
+    },
+    "snapshot-5000-offset-0": {
+      "median_us": 90.4,
+      "samples_us": [
+        90.4,
+        86.16,
+        93.79
+      ]
+    },
+    "snapshot-5000-offset-400": {
+      "median_us": 119.18,
+      "samples_us": [
+        119.18,
+        116.88,
+        122.53
+      ]
+    },
+    "footprint-20000": {
+      "median_us": 0.0021,
+      "samples_us": [
+        0.0021,
+        0.0021,
+        0.0023
+      ]
+    },
+    "snapshot-20000-offset-0": {
+      "median_us": 85.98,
+      "samples_us": [
+        85.12,
+        85.98,
+        92.29
+      ]
+    },
+    "snapshot-20000-offset-400": {
+      "median_us": 115.25,
+      "samples_us": [
+        112.36,
+        115.25,
+        123.24
+      ]
+    }
+  },
+  "allocation": {
+    "before_calls": 83,
+    "after_calls": 3,
+    "before_requested_bytes": 1351216,
+    "after_requested_bytes": 775216,
+    "call_reduction_percent": 96.3855421686747,
+    "byte_reduction_percent": 42.62826964748789
+  },
+  "scope": "Release actual backend fixture; requested allocation traffic is not RSS. Input-reference black_box per footprint query; post-query time approaches benchmark floor. No statistically supported whole-snapshot CPU improvement, no live GUI/app claim."
+}

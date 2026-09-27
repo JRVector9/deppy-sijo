@@ -1,0 +1,10 @@
+    Blocking waiting for file lock on package cache
+   Compiling deppy-sijo v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-render/crates/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.90s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-dc65cfcaf66bfb31)
+
+running 2 tests
+test ui::workspace::tests::pending_refocus_is_consumed_after_a_textedit_commit_batch_has_finished ... ok
+test ui::workspace::tests::pending_refocus_keeps_actual_textedit_focus_for_the_complete_ime_batch ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 2367 filtered out; finished in 0.04s

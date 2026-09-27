@@ -1,0 +1,49 @@
+   Compiling deppy-core v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-baseline/crates/core)
+   Compiling secret v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-baseline/crates/secret)
+   Compiling winit v0.30.13 (/Users/jr/Desktop/projects/deppy-sijo-perf-baseline/third_party/winit-0.30.13)
+   Compiling alacritty_terminal v0.26.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-baseline/third_party/alacritty_terminal-0.26.0)
+   Compiling pty v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-baseline/crates/pty)
+   Compiling mcp-store v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-baseline/crates/mcp-store)
+   Compiling storage-core v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-baseline/crates/storage-core)
+   Compiling http-client v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-baseline/crates/http-client)
+   Compiling connector-contract v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-baseline/crates/connector-contract)
+   Compiling relay-protocol v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-baseline/crates/relay-protocol)
+   Compiling i18n v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-baseline/crates/i18n)
+   Compiling platform v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-baseline/crates/platform)
+   Compiling auth v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-baseline/crates/auth)
+   Compiling audit v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-baseline/crates/audit)
+   Compiling mux v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-baseline/crates/mux)
+   Compiling mcp v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-baseline/crates/mcp)
+   Compiling persist v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-baseline/crates/persist)
+   Compiling connector-ui v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-baseline/crates/connector-ui)
+   Compiling storage v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-baseline/crates/storage)
+   Compiling terminal v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-baseline/crates/terminal)
+   Compiling accesskit_winit v0.32.2
+   Compiling egui-wgpu v0.36.1
+   Compiling egui-winit v0.36.1
+   Compiling session v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-baseline/crates/session)
+   Compiling connector-service v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-baseline/crates/connector-service)
+   Compiling runtime v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-baseline/crates/runtime)
+   Compiling eframe v0.36.1
+   Compiling web-remote v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-baseline/crates/web-remote)
+   Compiling agent-mcp v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-baseline/crates/agent-mcp)
+   Compiling deppy-sijo v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-baseline/crates/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 29.36s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-dc65cfcaf66bfb31)
+
+running 13 tests
+test native_key_monitor::tests::command_v는_논리키와_한글배열_물리키_fallback으로_잡는다 ... ok
+test native_key_monitor::tests::command_c는_논리키와_한글배열_물리키_fallback으로_잡는다 ... ok
+test ui::notes::tests::insert_date_line_한글_커서_경계 ... ok
+test shortcuts::tests::한글_입력중에도_단축키는_텍스트가_아니라_키로_잡는다 ... ok
+test ui::aux_search::tests::매칭은_한글_경계를_지킨다 ... ok
+test ui::workspace::tests::한글_파일명은_wide_spacer를_넘어_한_단어로_잡힌다 ... ok
+test ui::workspace::tests::한글_조합직후_정상_text는_특수문자_대체입력을_취소한다 ... ok
+test ui::workspace::tests::한글_조합직후_text없는_문장부호_key는_pty로_보완된다 ... ok
+test ui::workspace::tests::한글_조합직후_같은_특수문자_연타도_text_수만큼만_중복제거한다 ... ok
+test ui::workspace::tests::한글_commit에_포함된_comma는_뒤따른_text와_중복되지_않는다 ... ok
+test ui::workspace::tests::빠른_한글_연타로_한_프레임에_섞인_preedit_commit도_음절대로_pty에_들어간다 ... ok
+test ui::workspace::tests::프레임_경계에서_끊긴_한글_조합도_다음_프레임에서_음절대로_이어붙는다 ... ok
+test fonts::tests::jetbrains_mono의_한글은_정확히_두_셀을_차지한다 ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 2345 filtered out; finished in 0.06s

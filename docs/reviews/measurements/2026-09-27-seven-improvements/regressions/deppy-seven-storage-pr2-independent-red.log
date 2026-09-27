@@ -1,0 +1,20 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
+     Running unittests src/lib.rs (target/debug/deps/alacritty_terminal-709073561dbf464b)
+
+running 1 test
+
+thread 'grid::storage::tests::compressed_read_reuses_scratch_cells_and_clears_extras' (82768278) panicked at src/grid/storage.rs:618:13:
+assertion `left == right` failed: reuse scratch allocation
+  left: 0x104f12ba0
+ right: 0x104f132e0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test grid::storage::tests::compressed_read_reuses_scratch_cells_and_clears_extras ... FAILED
+
+failures:
+
+failures:
+    grid::storage::tests::compressed_read_reuses_scratch_cells_and_clears_extras
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 154 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`

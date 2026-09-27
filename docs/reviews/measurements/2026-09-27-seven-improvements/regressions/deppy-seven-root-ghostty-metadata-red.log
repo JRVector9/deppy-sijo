@@ -1,0 +1,57 @@
+    Checking smallvec v1.15.2
+    Checking once_cell v1.21.4
+   Compiling proc-macro2-diagnostics v0.10.1
+    Checking memchr v2.8.2
+    Checking serde_core v1.0.229
+    Checking libc v0.2.189
+    Checking zerocopy v0.8.52
+   Compiling libghostty-vt-sys v0.2.1
+    Checking emath v0.36.1
+    Checking num-traits v0.2.19
+    Checking hashbrown v0.17.1
+    Checking regex-syntax v0.8.11
+    Checking uuid v1.26.0
+    Checking bytemuck v1.25.0
+    Checking thiserror v2.0.18
+    Checking cursor-icon v1.2.0
+    Checking kurbo v0.13.1
+    Checking accesskit v0.24.1
+    Checking color v0.3.3
+    Checking font-types v0.12.4
+    Checking ecolor v0.36.1
+    Checking aho-corasick v1.1.4
+    Checking errno v0.3.14
+    Checking parking_lot_core v0.9.12
+    Checking euclid v0.22.14
+    Checking read-fonts v0.41.0
+    Checking signal-hook-registry v1.4.8
+    Checking parking_lot v0.12.5
+    Checking signal-hook v0.4.4
+    Checking peniko v0.6.1
+    Checking guillotiere v0.7.0
+   Compiling int-enum v1.2.0
+    Checking vello_common v0.1.0
+    Checking regex-automata v0.4.18
+    Checking bitflags v2.13.0
+    Checking serde v1.0.229
+    Checking rustix v1.1.4
+    Checking libghostty-vt v0.2.1
+    Checking vello_cpu v0.1.0
+    Checking vte v0.15.0
+    Checking ahash v0.8.12
+    Checking rustix-openpty v0.2.0
+    Checking polling v3.11.0
+    Checking alacritty_terminal v0.26.0 (/Users/jr/Desktop/projects/deppy-sijo-performance/third_party/alacritty_terminal-0.26.0)
+    Checking skrifa v0.44.0
+    Checking harfrust v0.12.0
+    Checking epaint v0.36.1
+    Checking egui v0.36.1
+    Checking terminal v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/terminal)
+error[E0425]: cannot find value `GhosttyTerminalScreen_GHOSTTY_TERMINAL_SCREEN_PRIMARY` in crate `libghostty_vt::ffi`
+   --> crates/terminal/src/ghostty_backend.rs:236:48
+    |
+236 |                         != libghostty_vt::ffi::GhosttyTerminalScreen_GHOSTTY_TERMINAL_SCREEN_PRIMARY
+    |                                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not found in `libghostty_vt::ffi`
+
+For more information about this error, try `rustc --explain E0425`.
+error: could not compile `terminal` (lib) due to 1 previous error

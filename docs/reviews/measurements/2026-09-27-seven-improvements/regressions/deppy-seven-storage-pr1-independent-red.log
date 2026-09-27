@@ -1,0 +1,21 @@
+   Compiling alacritty_terminal v0.26.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-storage/third_party/alacritty_terminal-0.26.0)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.98s
+     Running unittests src/lib.rs (target/debug/deps/alacritty_terminal-709073561dbf464b)
+
+running 1 test
+
+thread 'grid::storage::tests::compressed_footprint_query_does_not_visit_rows' (82750165) panicked at src/grid/storage.rs:538:9:
+assertion `left == right` failed: footprint lookup must use per-grid totals without visiting compressed rows
+  left: 5
+ right: 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test grid::storage::tests::compressed_footprint_query_does_not_visit_rows ... FAILED
+
+failures:
+
+failures:
+    grid::storage::tests::compressed_footprint_query_does_not_visit_rows
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 154 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`

@@ -1,0 +1,24 @@
+   Compiling runtime v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-model/crates/runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.72s
+     Running unittests src/lib.rs (target/debug/deps/runtime-5764740797948ab5)
+
+running 2 tests
+
+thread 'remote::tests::multiple_spacing_graphemes_are_rejected_in_keyframe' (83796308) panicked at crates/runtime/src/remote.rs:3874:9:
+one owner cell must not carry two spacing glyphs
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'remote::tests::multiple_spacing_graphemes_are_rejected_in_delta' (83796307) panicked at crates/runtime/src/remote.rs:3884:9:
+delta must reject spacing text inside one owner cell
+test remote::tests::multiple_spacing_graphemes_are_rejected_in_keyframe ... FAILED
+test remote::tests::multiple_spacing_graphemes_are_rejected_in_delta ... FAILED
+
+failures:
+
+failures:
+    remote::tests::multiple_spacing_graphemes_are_rejected_in_delta
+    remote::tests::multiple_spacing_graphemes_are_rejected_in_keyframe
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 314 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p runtime --lib`

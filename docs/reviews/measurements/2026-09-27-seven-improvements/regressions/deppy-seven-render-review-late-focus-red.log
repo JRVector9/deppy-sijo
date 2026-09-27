@@ -1,0 +1,28 @@
+   Compiling deppy-sijo v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-render/crates/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.64s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-dc65cfcaf66bfb31)
+
+running 2 tests
+
+thread 'ui::workspace::tests::pending_refocus_is_consumed_after_a_textedit_commit_batch_has_finished' (84352738) panicked at crates/app/src/ui/workspace.rs:19501:9:
+assertion `left == right` failed
+  left: Some(Id::new(17988307280795870850))
+ right: Some(Id::new("actual-textedit"))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'ui::workspace::tests::pending_refocus_keeps_actual_textedit_focus_for_the_complete_ime_batch' (84352739) panicked at crates/app/src/ui/workspace.rs:19471:13:
+assertion `left == right` failed: a deferred pane refocus must not steal the TextEdit's IME focus
+  left: Some(Id::new(17988307280795870850))
+ right: Some(Id::new("actual-textedit"))
+test ui::workspace::tests::pending_refocus_is_consumed_after_a_textedit_commit_batch_has_finished ... FAILED
+test ui::workspace::tests::pending_refocus_keeps_actual_textedit_focus_for_the_complete_ime_batch ... FAILED
+
+failures:
+
+failures:
+    ui::workspace::tests::pending_refocus_is_consumed_after_a_textedit_commit_batch_has_finished
+    ui::workspace::tests::pending_refocus_keeps_actual_textedit_focus_for_the_complete_ime_batch
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 2366 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `-p deppy-sijo --bin deppy-sijo`

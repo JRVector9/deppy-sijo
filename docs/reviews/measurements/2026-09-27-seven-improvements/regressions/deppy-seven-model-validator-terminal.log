@@ -1,0 +1,10 @@
+   Compiling terminal v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-model/crates/terminal)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.20s
+     Running unittests src/lib.rs (target/debug/deps/terminal-db11bc8baa9dba67)
+
+running 3 tests
+test viewport_snapshot::compact_tests::sparse_text_accepts_single_joined_cluster_only_with_its_owner_width ... ok
+test viewport_snapshot::compact_tests::sparse_text_rejects_two_spacing_clusters ... ok
+test alacritty_backend::tests::native_zero_width_format_extras_remain_valid_sparse_text ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 105 filtered out; finished in 0.00s

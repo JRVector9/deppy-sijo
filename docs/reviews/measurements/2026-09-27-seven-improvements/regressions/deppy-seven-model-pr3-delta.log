@@ -1,0 +1,15 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running unittests src/lib.rs (target/debug/deps/runtime-5764740797948ab5)
+
+running 9 tests
+test remote::tests::tracked_resize_delta의_stamp가_기준선과_다르면_한번만_재동기화한다 ... ok
+test remote::tests::malformed_delta_grapheme_is_rejected_without_mutating_baseline ... ok
+test remote::tests::try_apply_delta_기형은_err ... ok
+test remote::tests::delta_gap_복구 ... ok
+test remote::tests::delta_왕복_등가성 ... ok
+test remote::tests::grapheme_only_delta_roundtrip_and_removal ... ok
+test remote::tests::tracked_resize_plain_delta_왕복은_stamp를_그대로_보존한다 ... ok
+test remote::tests::기형_delta는_패닉없이_keyframe재동기화 ... ok
+test remote::tests::타이핑_delta가_keyframe보다_작다 ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 304 filtered out; finished in 0.00s

@@ -1,0 +1,85 @@
+   Compiling deppy-core v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-baseline/crates/core)
+   Compiling alacritty_terminal v0.26.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-baseline/third_party/alacritty_terminal-0.26.0)
+   Compiling pty v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-baseline/crates/pty)
+   Compiling terminal v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-baseline/crates/terminal)
+   Compiling session v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-baseline/crates/session)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.60s
+     Running unittests src/lib.rs (target/debug/deps/session-6b5531643ec57c77)
+
+running 68 tests
+test prompt_marks::tests::마크_상한을_넘으면_오래된_것부터_버린다 ... ok
+test prompt_marks::tests::출력_마크도_상한을_넘으면_오래된_것부터_버린다 ... ok
+test prompt_marks::tests::마크는_bel과_st_양_종결을_모두_인식한다 ... ok
+test prompt_marks::tests::alt_screen의_lf는_라인을_세지_않는다 ... ok
+test prompt_marks::tests::d가_없으면_현재_라인까지가_출력_범위다 ... ok
+test prompt_marks::tests::chunk_경계에_걸친_마크도_인식한다 ... ok
+test prompt_marks::tests::개행_없는_마지막_출력은_d_라인을_포함하고_char_수로_자른다 ... ok
+test prompt_marks::tests::비_133_osc와_다른_133_동작은_무시한다 ... ok
+test prompt_marks::tests::마지막_출력_범위는_c부터_d_직전_라인까지다 ... ok
+test prompt_marks::tests::마크가_없거나_출력이_없으면_범위도_없다 ... ok
+test prompt_marks::tests::c_d_마크는_출력_경계로_기록되고_점프_마크는_무변경이다 ... ok
+test prompt_marks::tests::트림으로_사라진_마크는_조회_시_제거된다 ... ok
+test prompt_marks::tests::점프_델타는_검색_스크롤_수식과_동치다 ... ok
+test session::tests::dirty_rows를_cell_range로_coalesce한다 ... ok
+test session::tests::archive_limit_화면만_초과하면_화면을_삭제하지_않는다 ... ok
+test session::tests::resize_checked는_유효하지_않은_크기를_적용하지_않는다 ... ok
+test session::tests::live_scrollback_설정은_추가출력없이_full_dirty를_발행한다 ... ok
+test session::tests::아카이브_복원_세션은_스크롤백을_보존한다 ... ok
+test session::tests::live_scrollback_검토_새pty는_이전_압박상한을_이어받지_않는다 ... ok
+test session::tests::resize_checked는_pty_실패를_적용성공으로_반환하지_않는다 ... ok
+test session::tests::archive_limit_이력만_줄이고_최신_화면을_보존한다 ... ok
+test status::tests::exit_sentinel_상태는_idle_휴리스틱에_덮이지_않는다 ... ok
+test status::tests::exit_sentinel_상태도_입력으로_해제된다 ... ok
+test session::tests::resize_checked는_hidden에서_실제_크기를_확인하고_full_dirty를_유지한다 ... ok
+test session::tests::live_scrollback_새pty에_이전_backend를_복사없이_이어준다 ... ok
+test status::tests::idle_heuristic ... ok
+test status::tests::exit_sentinel은_종료코드로_done_error를_latch한다 ... ok
+test status::tests::regex_없는_detector도_builtin_위해_화면을_스캔한다 ... ok
+test status::tests::fix7_여러_줄_붙여넣기는_실제_enter_전까지_제출이_아니다 ... ok
+test status::tests::builtin_패턴이_claude_승인_프롬프트를_감지 ... ok
+test status::tests::builtin_패턴이_codex_승인_푸터를_감지 ... ok
+test status::tests::sentinel_경로는_temp_dir와_pid로_결정된다 ... ok
+test status::tests::review_단순_enter_안내는_응답_후_스크롤백에_남아도_해제한다 ... ok
+test status::tests::latch된_결과_상태는_턴_시작으로도_해제된다 ... ok
+test status::tests::같은_상태의_다른_프롬프트는_소비와_무관하게_재감지 ... ok
+test status::tests::second_review_한_줄_질문은_답변_후_이전_출력에_남아도_해제한다 ... ok
+test status::tests::utf8_문자가_chunk_경계에_걸려도_매칭 ... ok
+test status::tests::같은_프롬프트의_새_복사본은_재감지 ... ok
+test status::tests::나중_stream_매치가_이전_상태를_대체 ... ok
+test status::tests::status_view는_source_confidence_override를_담는다 ... ok
+test status::tests::stream_line_감지와_chunk_경계 ... ok
+test status::tests::응답대기_계획_선택창은_긴_푸터에도_질문으로_감지한다 ... ok
+test status::tests::입력은_미완_라인과_idle_타이머를_리셋 ... ok
+test status::tests::응답대기_방향키와_작성중인_문자는_대기를_소비하지_않는다 ... ok
+test status::tests::입력은_화면_재스캔을_예약 ... ok
+test status::tests::잘못된_regex는_무시 ... ok
+test status::tests::매치는_후속_출력에_유실되지_않고_입력으로_해제 ... ok
+test status::tests::우선순위_error_우선 ... ok
+test status::tests::화면_유래_대기를_같은상태_stream이_latch ... ok
+test status::tests::프롬프트_잔존시_유지_입력으로_소비 ... ok
+test status::tests::개행_없는_스트림에서_line_buf를_재스캔하지_않는다 ... ok
+test status::tests::화면_유래_결과상태는_소멸해도_유지 ... ok
+test status::tests::화면_패턴_앵커는_라인_기준 ... ok
+test status::tests::화면_텍스트_패턴_감지 ... ok
+test status::tests::화면_프롬프트_소멸시_해제 ... ok
+test session::tests::빠른_종료_명령의_출력이_유실되지_않는다 ... ok
+test session::tests::lifecycle_running에서_exited로 ... ok
+test session::tests::ansi_replay는_글자와_truecolor를_복원한다 ... ok
+test session::tests::ansi_replay_경계는_alt_screen을_끝내고_fresh_출력을_새줄에_둔다 ... ok
+test session::tests::scroll은_전체_dirty_range로_무효화한다 ... ok
+test session::tests::마지막_출력을_추출한다 ... ok
+test session::tests::입력_출력_roundtrip과_snapshot_dirty ... ok
+test session::tests::프롬프트_마크로_점프하고_복귀한다 ... ok
+test session::tests::cache_class_숨김_전환은_삭제없이_압축한다 ... ok
+test session::tests::개행_없이_끝난_마지막_출력도_추출된다 ... ok
+test session::tests::snapshot_dirty_ranges는_변경된_행만_전달하고_소거한다 ... ok
+test session::tests::scroll_to_bottom은_라이브_화면으로_복귀한다 ... ok
+test session::tests::마지막_출력_추출은_상한_초과_시_뒤쪽을_남긴다 ... ok
+
+test result: ok. 68 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.66s
+
+   Doc-tests session
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

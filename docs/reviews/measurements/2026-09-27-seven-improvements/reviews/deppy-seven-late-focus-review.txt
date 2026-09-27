@@ -1,0 +1,3 @@
+No actionable findings in the scoped review. The shared IME batch guard covers terminal display, input admission, and late automatic refocus; an explicit pane click still requests focus. The focused TextEdit regressions cover the IME batch, first ASCII key recovery, and pending focus consumption after commit.
+
+Tests were not run, as requested.

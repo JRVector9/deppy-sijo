@@ -1,0 +1,207 @@
+{
+  "source": "5e30a4f1a4472b8f562ce74eb637f2ca3d8db3cc",
+  "results": [
+    {
+      "gate": "vendor",
+      "command": [
+        "cargo",
+        "test",
+        "--manifest-path",
+        "third_party/alacritty_terminal-0.26.0/Cargo.toml",
+        "--lib"
+      ],
+      "exit_code": 0
+    },
+    {
+      "gate": "terminal",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "terminal"
+      ],
+      "exit_code": 0
+    },
+    {
+      "gate": "session",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "session"
+      ],
+      "exit_code": 0
+    },
+    {
+      "gate": "runtime",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "runtime",
+        "--features",
+        "secret/test-keyring-core",
+        "--",
+        "--test-threads=4"
+      ],
+      "exit_code": 0
+    },
+    {
+      "gate": "web",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "web-remote",
+        "--lib"
+      ],
+      "exit_code": 0
+    },
+    {
+      "gate": "web-canvas",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "web-remote",
+        "--test",
+        "viewer_core_chrome",
+        "--test",
+        "viewer_grapheme_chrome",
+        "--",
+        "--ignored"
+      ],
+      "exit_code": 0,
+      "note": "Initial default run ignored both; explicitly executed --ignored afterward; 2 actual passes."
+    },
+    {
+      "gate": "app-workspace",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "deppy-sijo",
+        "--bin",
+        "deppy-sijo",
+        "ui::workspace::tests::",
+        "--",
+        "--test-threads=4"
+      ],
+      "exit_code": 101,
+      "source": "5e30a4f1a4472b8f562ce74eb637f2ca3d8db3cc"
+    },
+    {
+      "gate": "app-hangul",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "deppy-sijo",
+        "--bin",
+        "deppy-sijo",
+        "\ud55c\uae00"
+      ],
+      "exit_code": 0
+    },
+    {
+      "gate": "app-ime",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "deppy-sijo",
+        "--bin",
+        "deppy-sijo",
+        "ime"
+      ],
+      "exit_code": 0,
+      "source": "5e30a4f1a4472b8f562ce74eb637f2ca3d8db3cc"
+    },
+    {
+      "gate": "app-cloud",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "deppy-sijo",
+        "--bin",
+        "deppy-sijo",
+        "cloud_agent"
+      ],
+      "exit_code": 0
+    },
+    {
+      "gate": "boundary",
+      "command": [
+        "cargo",
+        "run",
+        "-p",
+        "xtask",
+        "--",
+        "check-boundary"
+      ],
+      "exit_code": 0
+    },
+    {
+      "gate": "dependencies",
+      "command": [
+        "cargo",
+        "run",
+        "-p",
+        "xtask",
+        "--",
+        "check-deps"
+      ],
+      "exit_code": 0
+    },
+    {
+      "gate": "format",
+      "command": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--",
+        "--check"
+      ],
+      "exit_code": 0,
+      "source": "5e30a4f1a4472b8f562ce74eb637f2ca3d8db3cc"
+    },
+    {
+      "gate": "whitespace",
+      "command": [
+        "git",
+        "diff",
+        "--check"
+      ],
+      "exit_code": 0,
+      "source": "5e30a4f1a4472b8f562ce74eb637f2ca3d8db3cc"
+    },
+    {
+      "gate": "release",
+      "command": [
+        "cargo",
+        "build",
+        "-p",
+        "deppy-sijo",
+        "--release"
+      ],
+      "exit_code": 0,
+      "source": "5e30a4f1a4472b8f562ce74eb637f2ca3d8db3cc"
+    },
+    {
+      "gate": "app-preedit",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "deppy-sijo",
+        "--bin",
+        "deppy-sijo",
+        "preedit"
+      ],
+      "exit_code": 0,
+      "source": "5e30a4f1a4472b8f562ce74eb637f2ca3d8db3cc"
+    }
+  ],
+  "initial_source": "d55ee0aa2e3ad4956b51046c907a1bee76112dfc"
+}

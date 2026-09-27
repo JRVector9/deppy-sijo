@@ -1,0 +1,25 @@
+   Compiling terminal v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-render/crates/terminal)
+   Compiling session v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-render/crates/session)
+   Compiling runtime v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-render/crates/runtime)
+   Compiling web-remote v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-render/crates/web-remote)
+   Compiling agent-mcp v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-render/crates/agent-mcp)
+   Compiling deppy-sijo v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-render/crates/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.76s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-dc65cfcaf66bfb31)
+
+running 2 tests
+test ui::workspace::tests::pending_terminal_refocus_still_recovers_the_first_ascii_key_from_stale_textedit_focus ... ok
+
+thread 'ui::workspace::tests::pending_terminal_refocus_cannot_project_a_focused_textedit_preedit' (83836286) panicked at crates/app/src/ui/workspace.rs:19395:9:
+a TextEdit-owned preedit must not be projected into the terminal
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test ui::workspace::tests::pending_terminal_refocus_cannot_project_a_focused_textedit_preedit ... FAILED
+
+failures:
+
+failures:
+    ui::workspace::tests::pending_terminal_refocus_cannot_project_a_focused_textedit_preedit
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 2364 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `-p deppy-sijo --bin deppy-sijo`

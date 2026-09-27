@@ -1,0 +1,1199 @@
+{
+  "before": {
+    "footprint-1000": {
+      "us": {
+        "samples": [
+          1.233492,
+          1.250142,
+          1.224533
+        ],
+        "median": 1.233492
+      },
+      "calls": {
+        "samples": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "median": 0.0
+      },
+      "bytes": {
+        "samples": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "median": 0.0
+      }
+    },
+    "footprint-5000": {
+      "us": {
+        "samples": [
+          6.832383,
+          6.836658,
+          6.80225
+        ],
+        "median": 6.832383
+      },
+      "calls": {
+        "samples": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "median": 0.0
+      },
+      "bytes": {
+        "samples": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "median": 0.0
+      }
+    },
+    "footprint-20000": {
+      "us": {
+        "samples": [
+          28.343917,
+          28.176275,
+          28.205471
+        ],
+        "median": 28.205471
+      },
+      "calls": {
+        "samples": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "median": 0.0
+      },
+      "bytes": {
+        "samples": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "median": 0.0
+      }
+    },
+    "snapshot-cold": {
+      "us": {
+        "samples": [
+          105.834,
+          91.708,
+          96.833
+        ],
+        "median": 96.833
+      },
+      "calls": {
+        "samples": [
+          4.0,
+          4.0,
+          4.0
+        ],
+        "median": 4.0
+      },
+      "bytes": {
+        "samples": [
+          775280.0,
+          775280.0,
+          775280.0
+        ],
+        "median": 775280.0
+      },
+      "backend_resident_before": {
+        "samples": [
+          2972336.0,
+          2972336.0,
+          2972336.0
+        ],
+        "median": 2972336.0
+      },
+      "backend_resident_after": {
+        "samples": [
+          2972336.0,
+          2972336.0,
+          2972336.0
+        ],
+        "median": 2972336.0
+      }
+    },
+    "snapshot-metadata": {
+      "us": {
+        "samples": [
+          84.0456,
+          85.2162,
+          88.3789
+        ],
+        "median": 85.2162
+      },
+      "calls": {
+        "samples": [
+          3.0,
+          3.0,
+          3.0
+        ],
+        "median": 3.0
+      },
+      "bytes": {
+        "samples": [
+          775216.0,
+          775216.0,
+          775216.0
+        ],
+        "median": 775216.0
+      },
+      "backend_resident_before": {
+        "samples": [
+          2972336.0,
+          2972336.0,
+          2972336.0
+        ],
+        "median": 2972336.0
+      },
+      "backend_resident_after": {
+        "samples": [
+          2972336.0,
+          2972336.0,
+          2972336.0
+        ],
+        "median": 2972336.0
+      }
+    },
+    "snapshot-dirty1": {
+      "us": {
+        "samples": [
+          84.159,
+          85.5883,
+          84.766
+        ],
+        "median": 84.766
+      },
+      "calls": {
+        "samples": [
+          3.0,
+          3.0,
+          3.0
+        ],
+        "median": 3.0
+      },
+      "bytes": {
+        "samples": [
+          775216.0,
+          775216.0,
+          775216.0
+        ],
+        "median": 775216.0
+      },
+      "backend_resident_before": {
+        "samples": [
+          2972336.0,
+          2972336.0,
+          2972336.0
+        ],
+        "median": 2972336.0
+      },
+      "backend_resident_after": {
+        "samples": [
+          2972336.0,
+          2972336.0,
+          2972336.0
+        ],
+        "median": 2972336.0
+      }
+    },
+    "snapshot-dirty80": {
+      "us": {
+        "samples": [
+          84.3775,
+          89.2458,
+          85.0804
+        ],
+        "median": 85.0804
+      },
+      "calls": {
+        "samples": [
+          3.0,
+          3.0,
+          3.0
+        ],
+        "median": 3.0
+      },
+      "bytes": {
+        "samples": [
+          775216.0,
+          775216.0,
+          775216.0
+        ],
+        "median": 775216.0
+      },
+      "backend_resident_before": {
+        "samples": [
+          2972336.0,
+          2972336.0,
+          2972336.0
+        ],
+        "median": 2972336.0
+      },
+      "backend_resident_after": {
+        "samples": [
+          2972336.0,
+          2972336.0,
+          2972336.0
+        ],
+        "median": 2972336.0
+      }
+    },
+    "snapshot-compressed_steady": {
+      "us": {
+        "samples": [
+          128.6442,
+          136.0141,
+          135.9644
+        ],
+        "median": 135.9644
+      },
+      "calls": {
+        "samples": [
+          83.0,
+          83.0,
+          83.0
+        ],
+        "median": 83.0
+      },
+      "bytes": {
+        "samples": [
+          1351216.0,
+          1351216.0,
+          1351216.0
+        ],
+        "median": 1351216.0
+      },
+      "backend_resident_before": {
+        "samples": [
+          2972336.0,
+          2972336.0,
+          2972336.0
+        ],
+        "median": 2972336.0
+      },
+      "backend_resident_after": {
+        "samples": [
+          2972336.0,
+          2972336.0,
+          2972336.0
+        ],
+        "median": 2972336.0
+      }
+    },
+    "snapshot-compressed_scroll": {
+      "us": {
+        "samples": [
+          128.7411,
+          133.5625,
+          130.2387
+        ],
+        "median": 130.2387
+      },
+      "calls": {
+        "samples": [
+          83.0,
+          83.0,
+          83.0
+        ],
+        "median": 83.0
+      },
+      "bytes": {
+        "samples": [
+          1351216.0,
+          1351216.0,
+          1351216.0
+        ],
+        "median": 1351216.0
+      },
+      "backend_resident_before": {
+        "samples": [
+          2972336.0,
+          2972336.0,
+          2972336.0
+        ],
+        "median": 2972336.0
+      },
+      "backend_resident_after": {
+        "samples": [
+          2972336.0,
+          2972336.0,
+          2972336.0
+        ],
+        "median": 2972336.0
+      }
+    },
+    "renderer-ASCII": {
+      "shapes": {
+        "samples": [
+          81.0,
+          81.0,
+          81.0
+        ],
+        "median": 81.0
+      },
+      "rebuilt": {
+        "samples": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "median": 0.0
+      },
+      "painted": {
+        "samples": [
+          80.0,
+          80.0,
+          80.0
+        ],
+        "median": 80.0
+      },
+      "allocations/frame": {
+        "samples": [
+          39.0,
+          39.0,
+          39.0
+        ],
+        "median": 39.0
+      },
+      "requested_bytes/frame": {
+        "samples": [
+          7971662.0,
+          7971662.0,
+          7971662.0
+        ],
+        "median": 7971662.0
+      },
+      "ms": {
+        "samples": [
+          0.16,
+          0.19,
+          0.18
+        ],
+        "median": 0.18
+      }
+    },
+    "renderer-Hangul": {
+      "shapes": {
+        "samples": [
+          11852.0,
+          11852.0,
+          11852.0
+        ],
+        "median": 11852.0
+      },
+      "rebuilt": {
+        "samples": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "median": 0.0
+      },
+      "painted": {
+        "samples": [
+          80.0,
+          80.0,
+          80.0
+        ],
+        "median": 80.0
+      },
+      "allocations/frame": {
+        "samples": [
+          53.0,
+          53.0,
+          53.0
+        ],
+        "median": 53.0
+      },
+      "requested_bytes/frame": {
+        "samples": [
+          4365110.0,
+          4365110.0,
+          4365110.0
+        ],
+        "median": 4365110.0
+      },
+      "ms": {
+        "samples": [
+          0.52,
+          0.53,
+          0.52
+        ],
+        "median": 0.52
+      }
+    }
+  },
+  "stage6": {
+    "footprint-1000": {
+      "us": {
+        "samples": [
+          0.002138,
+          0.002142,
+          0.002129
+        ],
+        "median": 0.002138
+      },
+      "calls": {
+        "samples": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "median": 0.0
+      },
+      "bytes": {
+        "samples": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "median": 0.0
+      }
+    },
+    "footprint-5000": {
+      "us": {
+        "samples": [
+          0.002112,
+          0.002142,
+          0.002129
+        ],
+        "median": 0.002129
+      },
+      "calls": {
+        "samples": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "median": 0.0
+      },
+      "bytes": {
+        "samples": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "median": 0.0
+      }
+    },
+    "footprint-20000": {
+      "us": {
+        "samples": [
+          0.002125,
+          0.002117,
+          0.002158
+        ],
+        "median": 0.002125
+      },
+      "calls": {
+        "samples": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "median": 0.0
+      },
+      "bytes": {
+        "samples": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "median": 0.0
+      }
+    },
+    "snapshot-cold": {
+      "us": {
+        "samples": [
+          96.458,
+          90.75,
+          93.709
+        ],
+        "median": 93.709
+      },
+      "calls": {
+        "samples": [
+          5.0,
+          5.0,
+          5.0
+        ],
+        "median": 5.0
+      },
+      "bytes": {
+        "samples": [
+          583296.0,
+          583296.0,
+          583296.0
+        ],
+        "median": 583296.0
+      },
+      "backend_resident_before": {
+        "samples": [
+          2972336.0,
+          2972336.0,
+          2972336.0
+        ],
+        "median": 2972336.0
+      },
+      "backend_resident_after": {
+        "samples": [
+          2972336.0,
+          2972336.0,
+          2972336.0
+        ],
+        "median": 2972336.0
+      }
+    },
+    "snapshot-metadata": {
+      "us": {
+        "samples": [
+          83.4292,
+          83.6208,
+          84.0835
+        ],
+        "median": 83.6208
+      },
+      "calls": {
+        "samples": [
+          3.0,
+          3.0,
+          3.0
+        ],
+        "median": 3.0
+      },
+      "bytes": {
+        "samples": [
+          583216.0,
+          583216.0,
+          583216.0
+        ],
+        "median": 583216.0
+      },
+      "backend_resident_before": {
+        "samples": [
+          2972336.0,
+          2972336.0,
+          2972336.0
+        ],
+        "median": 2972336.0
+      },
+      "backend_resident_after": {
+        "samples": [
+          2972336.0,
+          2972336.0,
+          2972336.0
+        ],
+        "median": 2972336.0
+      }
+    },
+    "snapshot-dirty1": {
+      "us": {
+        "samples": [
+          83.4369,
+          88.6442,
+          83.1931
+        ],
+        "median": 83.4369
+      },
+      "calls": {
+        "samples": [
+          3.0,
+          3.0,
+          3.0
+        ],
+        "median": 3.0
+      },
+      "bytes": {
+        "samples": [
+          583216.0,
+          583216.0,
+          583216.0
+        ],
+        "median": 583216.0
+      },
+      "backend_resident_before": {
+        "samples": [
+          2972336.0,
+          2972336.0,
+          2972336.0
+        ],
+        "median": 2972336.0
+      },
+      "backend_resident_after": {
+        "samples": [
+          2972336.0,
+          2972336.0,
+          2972336.0
+        ],
+        "median": 2972336.0
+      }
+    },
+    "snapshot-dirty80": {
+      "us": {
+        "samples": [
+          84.1502,
+          89.8085,
+          83.8619
+        ],
+        "median": 84.1502
+      },
+      "calls": {
+        "samples": [
+          3.0,
+          3.0,
+          3.0
+        ],
+        "median": 3.0
+      },
+      "bytes": {
+        "samples": [
+          583216.0,
+          583216.0,
+          583216.0
+        ],
+        "median": 583216.0
+      },
+      "backend_resident_before": {
+        "samples": [
+          2972336.0,
+          2972336.0,
+          2972336.0
+        ],
+        "median": 2972336.0
+      },
+      "backend_resident_after": {
+        "samples": [
+          2972336.0,
+          2972336.0,
+          2972336.0
+        ],
+        "median": 2972336.0
+      }
+    },
+    "snapshot-compressed_steady": {
+      "us": {
+        "samples": [
+          133.5806,
+          132.5621,
+          126.6837
+        ],
+        "median": 132.5621
+      },
+      "calls": {
+        "samples": [
+          3.0,
+          3.0,
+          3.0
+        ],
+        "median": 3.0
+      },
+      "bytes": {
+        "samples": [
+          583216.0,
+          583216.0,
+          583216.0
+        ],
+        "median": 583216.0
+      },
+      "backend_resident_before": {
+        "samples": [
+          2972336.0,
+          2972336.0,
+          2972336.0
+        ],
+        "median": 2972336.0
+      },
+      "backend_resident_after": {
+        "samples": [
+          2972336.0,
+          2972336.0,
+          2972336.0
+        ],
+        "median": 2972336.0
+      }
+    },
+    "snapshot-compressed_scroll": {
+      "us": {
+        "samples": [
+          129.4915,
+          128.075,
+          126.7507
+        ],
+        "median": 128.075
+      },
+      "calls": {
+        "samples": [
+          3.0,
+          3.0,
+          3.0
+        ],
+        "median": 3.0
+      },
+      "bytes": {
+        "samples": [
+          583216.0,
+          583216.0,
+          583216.0
+        ],
+        "median": 583216.0
+      },
+      "backend_resident_before": {
+        "samples": [
+          2972336.0,
+          2972336.0,
+          2972336.0
+        ],
+        "median": 2972336.0
+      },
+      "backend_resident_after": {
+        "samples": [
+          2972336.0,
+          2972336.0,
+          2972336.0
+        ],
+        "median": 2972336.0
+      }
+    }
+  },
+  "after": {
+    "footprint-1000": {
+      "us": {
+        "samples": [
+          0.002596,
+          0.002596,
+          0.002596
+        ],
+        "median": 0.002596
+      },
+      "calls": {
+        "samples": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "median": 0.0
+      },
+      "bytes": {
+        "samples": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "median": 0.0
+      }
+    },
+    "footprint-5000": {
+      "us": {
+        "samples": [
+          0.002817,
+          0.002592,
+          0.002567
+        ],
+        "median": 0.002592
+      },
+      "calls": {
+        "samples": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "median": 0.0
+      },
+      "bytes": {
+        "samples": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "median": 0.0
+      }
+    },
+    "footprint-20000": {
+      "us": {
+        "samples": [
+          0.002575,
+          0.002587,
+          0.002646
+        ],
+        "median": 0.002587
+      },
+      "calls": {
+        "samples": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "median": 0.0
+      },
+      "bytes": {
+        "samples": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "median": 0.0
+      }
+    },
+    "snapshot-cold": {
+      "us": {
+        "samples": [
+          120.833,
+          116.833,
+          110.583
+        ],
+        "median": 116.833
+      },
+      "calls": {
+        "samples": [
+          87.0,
+          87.0,
+          87.0
+        ],
+        "median": 87.0
+      },
+      "bytes": {
+        "samples": [
+          299280.0,
+          299280.0,
+          299280.0
+        ],
+        "median": 299280.0
+      },
+      "backend_resident_before": {
+        "samples": [
+          2972336.0,
+          2972336.0,
+          2972336.0
+        ],
+        "median": 2972336.0
+      },
+      "backend_resident_after": {
+        "samples": [
+          3270256.0,
+          3270256.0,
+          3270256.0
+        ],
+        "median": 3270256.0
+      }
+    },
+    "snapshot-metadata": {
+      "us": {
+        "samples": [
+          2.5154,
+          2.649,
+          2.4375
+        ],
+        "median": 2.5154
+      },
+      "calls": {
+        "samples": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "median": 0.0
+      },
+      "bytes": {
+        "samples": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "median": 0.0
+      },
+      "backend_resident_before": {
+        "samples": [
+          3270256.0,
+          3270256.0,
+          3270256.0
+        ],
+        "median": 3270256.0
+      },
+      "backend_resident_after": {
+        "samples": [
+          3270256.0,
+          3270256.0,
+          3270256.0
+        ],
+        "median": 3270256.0
+      }
+    },
+    "snapshot-dirty1": {
+      "us": {
+        "samples": [
+          2.6548,
+          2.715,
+          2.5283
+        ],
+        "median": 2.6548
+      },
+      "calls": {
+        "samples": [
+          4.0,
+          4.0,
+          4.0
+        ],
+        "median": 4.0
+      },
+      "bytes": {
+        "samples": [
+          6256.0,
+          6256.0,
+          6256.0
+        ],
+        "median": 6256.0
+      },
+      "backend_resident_before": {
+        "samples": [
+          3270256.0,
+          3270256.0,
+          3270256.0
+        ],
+        "median": 3270256.0
+      },
+      "backend_resident_after": {
+        "samples": [
+          3270256.0,
+          3270256.0,
+          3270256.0
+        ],
+        "median": 3270256.0
+      }
+    },
+    "snapshot-dirty80": {
+      "us": {
+        "samples": [
+          92.9823,
+          88.0388,
+          88.2865
+        ],
+        "median": 88.2865
+      },
+      "calls": {
+        "samples": [
+          83.0,
+          83.0,
+          83.0
+        ],
+        "median": 83.0
+      },
+      "bytes": {
+        "samples": [
+          291920.0,
+          291920.0,
+          291920.0
+        ],
+        "median": 291920.0
+      },
+      "backend_resident_before": {
+        "samples": [
+          3270256.0,
+          3270256.0,
+          3270256.0
+        ],
+        "median": 3270256.0
+      },
+      "backend_resident_after": {
+        "samples": [
+          3270256.0,
+          3270256.0,
+          3270256.0
+        ],
+        "median": 3270256.0
+      }
+    },
+    "snapshot-compressed_steady": {
+      "us": {
+        "samples": [
+          0.0515,
+          0.0529,
+          0.0523
+        ],
+        "median": 0.0523
+      },
+      "calls": {
+        "samples": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "median": 0.0
+      },
+      "bytes": {
+        "samples": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "median": 0.0
+      },
+      "backend_resident_before": {
+        "samples": [
+          3270256.0,
+          3270256.0,
+          3270256.0
+        ],
+        "median": 3270256.0
+      },
+      "backend_resident_after": {
+        "samples": [
+          3270256.0,
+          3270256.0,
+          3270256.0
+        ],
+        "median": 3270256.0
+      }
+    },
+    "snapshot-compressed_scroll": {
+      "us": {
+        "samples": [
+          135.0821,
+          131.9302,
+          129.9335
+        ],
+        "median": 131.9302
+      },
+      "calls": {
+        "samples": [
+          85.0,
+          85.0,
+          85.0
+        ],
+        "median": 85.0
+      },
+      "bytes": {
+        "samples": [
+          299200.0,
+          299200.0,
+          299200.0
+        ],
+        "median": 299200.0
+      },
+      "backend_resident_before": {
+        "samples": [
+          3270256.0,
+          3270256.0,
+          3270256.0
+        ],
+        "median": 3270256.0
+      },
+      "backend_resident_after": {
+        "samples": [
+          3270256.0,
+          3270256.0,
+          3270256.0
+        ],
+        "median": 3270256.0
+      }
+    },
+    "renderer-ASCII": {
+      "shapes": {
+        "samples": [
+          81.0,
+          81.0,
+          81.0
+        ],
+        "median": 81.0
+      },
+      "rebuilt": {
+        "samples": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "median": 0.0
+      },
+      "painted": {
+        "samples": [
+          80.0,
+          80.0,
+          80.0
+        ],
+        "median": 80.0
+      },
+      "allocations/frame": {
+        "samples": [
+          39.0,
+          39.0,
+          39.0
+        ],
+        "median": 39.0
+      },
+      "requested_bytes/frame": {
+        "samples": [
+          7971662.0,
+          7971662.0,
+          7971662.0
+        ],
+        "median": 7971662.0
+      },
+      "ms": {
+        "samples": [
+          0.17,
+          0.14,
+          0.15
+        ],
+        "median": 0.15
+      }
+    },
+    "renderer-Hangul": {
+      "shapes": {
+        "samples": [
+          81.0,
+          81.0,
+          81.0
+        ],
+        "median": 81.0
+      },
+      "rebuilt": {
+        "samples": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "median": 0.0
+      },
+      "painted": {
+        "samples": [
+          80.0,
+          80.0,
+          80.0
+        ],
+        "median": 80.0
+      },
+      "allocations/frame": {
+        "samples": [
+          39.0,
+          39.0,
+          39.0
+        ],
+        "median": 39.0
+      },
+      "requested_bytes/frame": {
+        "samples": [
+          3993662.0,
+          3993662.0,
+          3993662.0
+        ],
+        "median": 3993662.0
+      },
+      "ms": {
+        "samples": [
+          0.07,
+          0.07,
+          0.07
+        ],
+        "median": 0.07
+      }
+    }
+  },
+  "scope": "Real release backend/egui APIs, System allocator, three runs. Snapshot feed cost excluded; requested allocation bytes are not RSS. Renderer draw+tessellation CPU is not GPU time; shape count is not draw calls. Footprint O(1) query times approach the benchmark floor. No native macOS IME or isolated Deppy GUI execution was performed."
+}

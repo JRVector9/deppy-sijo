@@ -1,0 +1,7 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.08s
+     Running unittests src/lib.rs (target/debug/deps/terminal-db11bc8baa9dba67)
+
+running 1 test
+test alacritty_backend::tests::native_zero_width_format_extras_remain_valid_sparse_text ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 107 filtered out; finished in 0.00s

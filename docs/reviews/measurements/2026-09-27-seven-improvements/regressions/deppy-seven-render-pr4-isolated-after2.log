@@ -1,0 +1,4 @@
+TerminalCell size=16B; allocation counts include realloc; bytes are requested allocation traffic, NOT RSS
+normal-aligned one-flags-byte model size=12B
+ASCII 300x80 cached render+tess: 0.15ms shapes=81 rebuilt=0 painted=80 allocations/frame=39 requested_bytes/frame=7971662
+Hangul 300x80 cached render+tess: 0.08ms shapes=81 rebuilt=0 painted=80 allocations/frame=39 requested_bytes/frame=3993662

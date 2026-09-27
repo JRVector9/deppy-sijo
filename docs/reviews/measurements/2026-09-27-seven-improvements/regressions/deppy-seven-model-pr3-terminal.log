@@ -1,0 +1,123 @@
+   Compiling terminal v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-model/crates/terminal)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.69s
+     Running unittests src/lib.rs (target/debug/deps/terminal-3b64586eaae4bc18)
+
+running 102 tests
+test alacritty_backend::tests::compression_rss_probe ... ignored
+test alacritty_backend::tests::bracketed_paste_모드 ... ok
+test alacritty_backend::tests::grapheme_selection_preserves_non_composable_scalars ... ok
+test alacritty_backend::tests::grapheme_snapshot_search_and_screen_text_preserve_clusters ... ok
+test alacritty_backend::tests::conceal은_공백_처리 ... ok
+test alacritty_backend::tests::alt_screen_감지 ... ok
+test alacritty_backend::tests::ansi_색상 ... ok
+test alacritty_backend::tests::live_scrollback_사용자_십만줄은_고정_바이트상한으로_줄이지_않는다 ... ok
+test alacritty_backend::tests::live_scrollback_직렬화는_출력상한_직전부터_할당을_제한한다 ... ok
+test alacritty_backend::tests::logical_line_back은_prompt_sp_wrap도_한_라인으로_본다 ... ok
+test alacritty_backend::tests::logical_line_back은_wrap_행을_병합한다 ... ok
+test alacritty_backend::tests::logical_line_back은_커서_기준으로_위_라인을_읽는다 ... ok
+test alacritty_backend::tests::osc_색상과_커서_질의_응답은_요청_순서를_지킨다 ... ok
+test alacritty_backend::tests::osc_색상_질의_응답 ... ok
+test alacritty_backend::tests::reset은_화면을_비운다 ... ok
+test alacritty_backend::tests::rss_probe ... ignored, RSS probe — run manually with --nocapture
+test alacritty_backend::tests::screen_text_경량_조회 ... ok
+test alacritty_backend::tests::nfd_한글_자소분해_입력을_음절로_합성 ... ok
+test alacritty_backend::tests::search_scrollback는_대소문자를_무시한다 ... ok
+test alacritty_backend::tests::sgr_텍스트_속성이_스냅샷_셀에_실린다 ... ok
+test alacritty_backend::tests::size_probe ... ignored, size probe — run manually with --nocapture
+test alacritty_backend::tests::search_scrollback_상한은_최신_매치를_남긴다 ... ok
+test alacritty_backend::tests::deppy_압축영역_스크롤_렌더가_inflate와_동일 ... ok
+test alacritty_backend::tests::agent_redraw_다음입력후_이전출력을_보존한다 ... ok
+test alacritty_backend::tests::search_scrollback는_화면과_history를_모두_찾는다 ... ok
+test alacritty_backend::tests::visible_scrollback은_설계_cap을_넘지_않는다 ... ok
+test alacritty_backend::tests::scrollback_직렬화_왕복 ... ok
+test alacritty_backend::tests::색상_256_기본값 ... ok
+test alacritty_backend::tests::압축_인지_예산은_비압축_추정보다_많은_줄을_담는다 ... ok
+test alacritty_backend::tests::범위_밖_색상_질의는_panic하지_않는다 ... ok
+test alacritty_backend::tests::최악_압축_추정은_예산_이내 ... ok
+test alacritty_backend::tests::일반_텍스트_feed ... ok
+test alacritty_backend::tests::터미널_질의_응답_수집 ... ok
+test alacritty_backend::tests::deppy_활성_hidden_footprint는_hot_raw창을_계상한다 ... ok
+test alacritty_backend::tests::커서_위치 ... ok
+test alacritty_backend::tests::deppy_압축_가득참_재활용_후_최근줄_온전 ... ok
+test backend::search_tests::겹치는_매치는_비겹침으로만_센다 ... ok
+test backend::search_tests::대소문자_무시_부분_문자열_매치 ... ok
+test backend::search_tests::빈_쿼리나_긴_쿼리는_매치_없음 ... ok
+test backend::search_tests::유니코드_대소문자_폴딩 ... ok
+test backend::search_tests::한_라인_다중_매치는_좌에서_우_순서 ... ok
+test input_mapper::tests::bracketed_paste_감싸기 ... ok
+test input_mapper::tests::ctrl_c는_0x03 ... ok
+test input_mapper::tests::function_keys_f1_to_f12_mapping ... ok
+test input_mapper::tests::ime_조합종료_대체키는_단축키를_가로채지_않는다 ... ok
+test input_mapper::tests::ime가_keydown을_삼킨_특수문자는_keyup에서_복구할_수_있다 ... ok
+test input_mapper::tests::ime_조합종료_대체키는_특수문자와_shift_기호를_되살린다 ... ok
+test input_mapper::tests::macos_copy는_무시 ... ok
+test input_mapper::tests::paste_bytes_required_fixtures는_bracketed_상태를_따른다 ... ok
+test input_mapper::tests::tui_navigation_확장키_매핑 ... ok
+test input_mapper::tests::tui_number_selection은_text_event로_전달하고_key_event는_중복하지_않는다 ... ok
+test input_mapper::tests::문장부호와_공백은_key와_text_쌍에서도_한번만_전달된다 ... ok
+test input_mapper::tests::키_뗌은_무시 ... ok
+test input_mapper::tests::텍스트와_ime_commit ... ok
+test input_mapper::tests::특수키_매핑 ... ok
+test policy::tests::자동_예산은_ram비율과_상하한을_지킨다 ... ok
+test renderer_egui::tests::display_char는_없는_기호만_치환한다 ... ok
+test alacritty_backend::tests::한글_wide_char_2셀 ... ok
+test alacritty_backend::tests::deppy_압축_serialize는_inflate와_동일 ... ok
+test renderer_egui::tests::fit_width_scale은_가용폭을_맞추고_비정상_입력은_기존_clip을_유지한다 ... ok
+test renderer_egui::tests::emoji_path_fixture_selection_copy_preserves_rocket ... ok
+test alacritty_backend::tests::스크롤백과_offset ... ok
+test renderer_egui::tests::render_tessellation_bench ... ignored, 렌더 테셀레이션 실측 — --ignored --nocapture로만
+test renderer_egui::tests::cjk_wide_spacer_selection_endpoints_include_owner ... ok
+test renderer_egui::tests::row_dirty는_cell_range_intersection을_사용한다 ... ok
+test renderer_egui::tests::selection_text_행별_trailing_공백_제거와_개행 ... ok
+test renderer_egui::tests::terminal_focus_lock_filter는_tui_navigation_keys를_ui_focus에서_잠근다 ... ok
+test renderer_egui::tests::terminal_높이는_완전한_행을_모두_사용한다 ... ok
+test renderer_egui::tests::required_fixture_selection_copy_full_rows ... ok
+test renderer_egui::tests::terminal_행계산은_비정상_높이에서도_최솟값을_지킨다 ... ok
+test alacritty_backend::tests::deppy_압축_search는_inflate와_동일 ... ok
+test renderer_egui::tests::wide_글자로_끝나는_선택은_자리_채움까지_칠한다 ... ok
+test renderer_egui::tests::밑줄은_wide_문자의_뒷칸을_중복으로_담지_않는다 ... ok
+test renderer_egui::tests::밑줄은_공백을_건너뛰지_않고_한_런으로_이어진다 ... ok
+test renderer_egui::tests::밑줄은_행끝_필러에_유령선을_긋지_않는다 ... ok
+test alacritty_backend::tests::deppy_hidden_전환은_hot_창까지_압축 ... ok
+test alacritty_backend::tests::resize_반영 ... ok
+test renderer_egui::tests::선택_하이라이트는_연속_셀을_run으로_병합한다 ... ok
+test alacritty_backend::tests::live_scrollback_축소후_증가는_삭제한_기록을_복원하지_않는다 ... ok
+test alacritty_backend::tests::streaming_resize_뒤_검색_직렬화_출력이_압축_상태에서_동작한다 ... ok
+test renderer_egui::tests::bold_패밀리가_미등록이면_기본_모노로_내려간다 ... ok
+test renderer_egui::tests::비활성_터미널은_조합_이벤트가_있어도_ime를_가져가지_않는다 ... ok
+test renderer_egui::tests::ime_영역은_비활성_터미널이_출력하지_않는다 ... ok
+test renderer_egui::tests::ime_영역은_같은_프레임에_공식_소유권을_확보한_뒤_통보된다 ... ok
+test renderer_egui::tests::취소선은_밑줄과_독립적으로_런을_만든다 ... ok
+test renderer_egui::tests::같은_배율_재draw는_축소_갤리를_재사용하고_배율이_바뀌면_교체한다 ... ok
+test renderer_egui::tests::행_끝_wrap_필러는_end를_넘어_칠하지_않는다 ... ok
+test renderer_egui::tests::terminal_좌우_내부여백은_각각_3픽셀이다 ... FAILED
+test renderer_egui::tests::행높이_배수는_셀_높이만_키우고_폭은_그대로다 ... ok
+test renderer_egui::tests::render_counters는_dirty_painted_shapes를_집계한다 ... ok
+test renderer_egui::tests::이번_프레임에_시작된_조합은_포커스_복구가_중단시키지_않는다 ... ok
+test renderer_egui::tests::같은_스냅샷_재draw는_행을_재구성하지_않는다 ... ok
+test renderer_egui::tests::render_cache는_dirty_row만_재구성한다 ... ok
+test renderer_egui::tests::조합이_끝난_프레임은_포커스_복구를_막지_않는다 ... ok
+test renderer_egui::tests::조합중_비textedit_포커스전이는_ime를_중단하지_않는다 ... ok
+test renderer_egui::tests::폭_변화는_행_캐시를_무효화하지_않고_비축소_경로는_기존_metrics를_유지한다 ... ok
+test alacritty_backend::tests::hidden_visible_scrollback_cap ... ok
+test renderer_egui::tests::좁은_pane은_그리드만_균일_축소해_마지막_열까지_화면_안에_그린다 ... ok
+test alacritty_backend::tests::deppy_trim_scrollback는_스크롤백을_줄이고_회수한다 ... ok
+test alacritty_backend::tests::hidden_byte_budget은_가시성만으로_이력을_삭제하지_않는다 ... ok
+test alacritty_backend::tests::deppy_트림은_클래스_재적용에_영속하고_clear로_회복된다 ... ok
+test alacritty_backend::tests::cache_footprint는_압축을_반영한다 ... ok
+
+failures:
+
+---- renderer_egui::tests::terminal_좌우_내부여백은_각각_3픽셀이다 stdout ----
+
+thread 'renderer_egui::tests::terminal_좌우_내부여백은_각각_3픽셀이다' (82838399) panicked at crates/terminal/src/renderer_egui.rs:1713:9:
+rect=[[0.0 0.0] - [10000.0 10000.0]], origin=[3.0 0.0], cell=[7.8 15.1], grid_right=34.30664
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    renderer_egui::tests::terminal_좌우_내부여백은_각각_3픽셀이다
+
+test result: FAILED. 97 passed; 1 failed; 4 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+error: test failed, to rerun pass `-p terminal --lib`

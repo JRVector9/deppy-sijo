@@ -1,0 +1,3 @@
+**High — [workspace.rs](/Users/jr/Desktop/projects/deppy-sijo-performance/crates/app/src/ui/workspace.rs:7432):** A pending refocus still calls `request_terminal_focus()` later in the frame when the pane is focused, even if `text_edit_ime_batch` blocked the terminal during rendering. That can take focus from the TextEdit and interrupt its composition. Keep the focus request pending for that IME batch; the new regression checks paint, output, and sent bytes, but does not check focus ownership.
+
+This was a source-only review; I did not run tests, build, or launch the app.

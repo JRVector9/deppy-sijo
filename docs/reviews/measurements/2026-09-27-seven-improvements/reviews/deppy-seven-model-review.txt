@@ -1,0 +1,3 @@
+**Medium — malformed remote grapheme text passes validation.** [viewport_snapshot.rs](/Users/jr/Desktop/projects/deppy-sijo-performance/crates/terminal/src/viewport_snapshot.rs:58) checks that the text starts with the cell’s character and has another scalar, but never checks that the text is one grapheme. A cell containing `a` with sparse text `"ab"` passes validation. The runtime accepts it in a keyframe or row patch, while rendering and text extraction treat both letters as one owner cell, producing text that disagrees with the grid’s cell positions. Validate that each sparse entry contains exactly one grapheme cluster.
+
+Source review only; no tests or builds were run, as requested.

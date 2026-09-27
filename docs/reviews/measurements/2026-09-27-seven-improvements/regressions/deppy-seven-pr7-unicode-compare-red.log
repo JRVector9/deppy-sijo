@@ -1,0 +1,18 @@
+   Compiling deppy-seven-pr7-probe v0.0.0 (/tmp/deppy-seven-pr7-probe)
+    Finished `release` profile [optimized] target(s) in 0.21s
+     Running `target/release/deppy-seven-pr7-probe`
+PR7 viewport snapshot-only measurement; Cell=12B; requested allocation traffic is NOT RSS
+metadata300x80 calls=0.00 requested_bytes=0.00 snapshot_us=0.0670
+cursor-only300x80 calls=0.00 requested_bytes=0.00 snapshot_us=3.6673
+dirty1300x80 calls=5.00 requested_bytes=9856.00 snapshot_us=3.4056
+full300x80 calls=161.00 requested_bytes=572704.00 snapshot_us=131.8641
+unicode_cursor="가ᇹ" calls=1 requested_bytes=12 snapshot_us=2.1250
+unicode_cursor="a\u{301}\u{308}" calls=1 requested_bytes=12 snapshot_us=2.1250
+unicode_cursor="a\u{301}" calls=1 requested_bytes=8 snapshot_us=1.7920
+unicode_cursor="각" calls=1 requested_bytes=12 snapshot_us=1.7910
+
+thread 'main' (84053387) panicked at src/main.rs:70:5:
+assertion `left == right` failed: cursor-only Unicode comparisons must not materialize Strings
+  left: 4
+ right: 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

@@ -1,0 +1,11 @@
+   Compiling terminal v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-model/crates/terminal)
+   Compiling session v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-model/crates/session)
+   Compiling runtime v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-model/crates/runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.12s
+     Running unittests src/lib.rs (target/debug/deps/runtime-2fffe9a82c544efa)
+
+running 2 tests
+test remote::tests::multiple_spacing_graphemes_are_rejected_in_delta ... ok
+test remote::tests::multiple_spacing_graphemes_are_rejected_in_keyframe ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 314 filtered out; finished in 0.00s

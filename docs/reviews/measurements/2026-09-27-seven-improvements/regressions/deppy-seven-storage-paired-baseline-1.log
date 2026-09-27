@@ -1,0 +1,14 @@
+TerminalCell size=16B; allocation counts include realloc; bytes are requested allocation traffic, NOT RSS
+normal-aligned one-flags-byte model size=12B
+cluster input="한" first cell='한' (U+D55C) displayed/copy="한"
+cluster input="가ᇹ" first cell='ᄀ' (U+1100) displayed/copy="ᄀ"
+cluster input="a\u{301}\u{308}" first cell='a' (U+0061) displayed/copy="a"
+footprint history=1000 estimate=2463432B: 1.2523us/call allocs=0 bytes=0
+snapshot 300x80 history=1000 offset=0: 91.62us/snapshot allocations=3.0 requested_bytes=775217
+snapshot 300x80 history=1000 offset=400: 121.10us/snapshot allocations=83.0 requested_bytes=1351216
+footprint history=5000 estimate=2643432B: 7.0840us/call allocs=0 bytes=0
+snapshot 300x80 history=5000 offset=0: 85.52us/snapshot allocations=3.0 requested_bytes=775217
+snapshot 300x80 history=5000 offset=400: 114.88us/snapshot allocations=83.0 requested_bytes=1351216
+footprint history=20000 estimate=3318432B: 29.9154us/call allocs=0 bytes=0
+snapshot 300x80 history=20000 offset=0: 85.25us/snapshot allocations=3.0 requested_bytes=775217
+snapshot 300x80 history=20000 offset=400: 114.87us/snapshot allocations=83.0 requested_bytes=1351216

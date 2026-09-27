@@ -1,0 +1,28 @@
+   Compiling terminal v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-render/crates/terminal)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.57s
+     Running unittests src/lib.rs (target/debug/deps/terminal-3b64586eaae4bc18)
+
+running 2 tests
+
+thread 'renderer_egui::tests::cjk_runs_batch_owned_spacers_and_preserve_two_cell_advances' (82803659) panicked at crates/terminal/src/renderer_egui.rs:1690:9:
+assertion `left == right` failed: same-style CJK should share a galley
+  left: 5
+ right: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'renderer_egui::tests::cjk_runs_stop_at_ascii_style_and_unowned_spacer_boundaries' (82803660) panicked at crates/terminal/src/renderer_egui.rs:1711:9:
+assertion `left == right` failed
+  left: [0, 2, 4, 5, 7, 9, 11]
+ right: [0, 4, 5, 9]
+test renderer_egui::tests::cjk_runs_batch_owned_spacers_and_preserve_two_cell_advances ... FAILED
+test renderer_egui::tests::cjk_runs_stop_at_ascii_style_and_unowned_spacer_boundaries ... FAILED
+
+failures:
+
+failures:
+    renderer_egui::tests::cjk_runs_batch_owned_spacers_and_preserve_two_cell_advances
+    renderer_egui::tests::cjk_runs_stop_at_ascii_style_and_unowned_spacer_boundaries
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 100 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p terminal --lib`

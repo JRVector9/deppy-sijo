@@ -1,0 +1,33 @@
+{
+  "baseline": "78f054b9",
+  "integration": "/Users/jr/Desktop/projects/deppy-sijo-performance",
+  "source": "5e30a4f1",
+  "branch": "feat/measured-seven-improvements",
+  "implemented_prs": 7,
+  "headless_verified_prs": 7,
+  "tasks": {
+    "PR1": "code/headless measurement/test/source review complete",
+    "PR2": "code/headless measurement/test/source review complete",
+    "PR3": "code/headless measurement/test/source review complete",
+    "PR4": "code/headless measurement/test/source review complete",
+    "PR5": "code/headless measurement/test/source review complete",
+    "PR6": "code/headless measurement/test/source review complete",
+    "PR7": "code/headless measurement/test/source review complete"
+  },
+  "source_review_unresolved_findings": 0,
+  "release_build": "passed;24.09s;no launch",
+  "gui_permission": "pending;no Deppy launch",
+  "native_ime": "not executed",
+  "whole_workspace_pass": false,
+  "legacy_workspace_failures": 2,
+  "cold_snapshot_median_us": {
+    "before": 96.833,
+    "after": 116.833
+  },
+  "dirty80_snapshot_median_us": {
+    "before": 85.0804,
+    "after": 88.2865
+  },
+  "new_backend_cache_heap_bytes": 297920,
+  "report": "docs/reviews/2026-09-27-seven-improvements-final.md"
+}

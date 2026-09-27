@@ -1,0 +1,20 @@
+   Compiling runtime v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-model/crates/runtime)
+   Compiling web-remote v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-model/crates/web-remote)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.27s
+     Running unittests src/lib.rs (target/debug/deps/web_remote-9d705deda5e11b63)
+
+running 1 test
+
+thread 'protocol::tests::sparse_grapheme_survives_web_keyframe_and_delta' (82951472) panicked at crates/web-remote/src/protocol.rs:573:13:
+assertion failed: lines[0].runs[0].t.starts_with("a\u{301}\u{308}")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test protocol::tests::sparse_grapheme_survives_web_keyframe_and_delta ... FAILED
+
+failures:
+
+failures:
+    protocol::tests::sparse_grapheme_survives_web_keyframe_and_delta
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 318 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p web-remote --lib`

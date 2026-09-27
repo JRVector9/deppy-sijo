@@ -1,0 +1,9 @@
+   Compiling deppy-sijo v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-render/crates/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.19s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-dc65cfcaf66bfb31)
+
+running 2 tests
+test ui::workspace::tests::pending_terminal_refocus_still_recovers_the_first_ascii_key_from_stale_textedit_focus ... ok
+test ui::workspace::tests::pending_terminal_refocus_cannot_project_a_focused_textedit_preedit ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 2364 filtered out; finished in 0.03s

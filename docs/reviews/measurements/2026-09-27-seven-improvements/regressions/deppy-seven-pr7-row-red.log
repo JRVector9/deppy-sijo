@@ -1,0 +1,19 @@
+   Compiling terminal v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-storage/crates/terminal)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.33s
+     Running unittests src/lib.rs (target/debug/deps/terminal-3b64586eaae4bc18)
+
+running 1 test
+
+thread 'alacritty_backend::tests::snapshot_metadata_and_cursor_only_reuse_all_row_payloads' (83557106) panicked at crates/terminal/src/alacritty_backend.rs:1254:9:
+metadata-only row payload must be shared
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test alacritty_backend::tests::snapshot_metadata_and_cursor_only_reuse_all_row_payloads ... FAILED
+
+failures:
+
+failures:
+    alacritty_backend::tests::snapshot_metadata_and_cursor_only_reuse_all_row_payloads
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 113 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p terminal --lib`

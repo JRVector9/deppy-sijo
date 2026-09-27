@@ -1,0 +1,11 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running unittests src/lib.rs (target/debug/deps/runtime-2fffe9a82c544efa)
+
+running 5 tests
+test remote::tests::malformed_delta_grapheme_is_rejected_without_mutating_baseline ... ok
+test remote::tests::malformed_graphemes_are_rejected_before_event_publish ... ok
+test remote::tests::multiple_spacing_graphemes_are_rejected_in_delta ... ok
+test remote::tests::multiple_spacing_graphemes_are_rejected_in_keyframe ... ok
+test remote::tests::grapheme_only_delta_roundtrip_and_removal ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 311 filtered out; finished in 0.00s

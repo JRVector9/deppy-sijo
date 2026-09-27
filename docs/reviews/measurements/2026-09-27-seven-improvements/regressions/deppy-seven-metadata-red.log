@@ -1,0 +1,34 @@
+    Blocking waiting for file lock on package cache
+   Compiling session v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/session)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.52s
+     Running unittests src/lib.rs (target/debug/deps/session-6b5531643ec57c77)
+
+running 2 tests
+test session::tests::prompt_jump_metadata_does_not_create_snapshot ... FAILED
+test session::tests::replay_metadata_does_not_create_snapshot_and_preserves_alt_screen ... FAILED
+
+failures:
+
+---- session::tests::prompt_jump_metadata_does_not_create_snapshot stdout ----
+
+thread 'session::tests::prompt_jump_metadata_does_not_create_snapshot' (82832587) panicked at crates/session/src/session.rs:810:9:
+assertion `left == right` failed
+  left: 1
+ right: 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- session::tests::replay_metadata_does_not_create_snapshot_and_preserves_alt_screen stdout ----
+
+thread 'session::tests::replay_metadata_does_not_create_snapshot_and_preserves_alt_screen' (82832588) panicked at crates/session/src/session.rs:817:9:
+assertion `left == right` failed
+  left: 1
+ right: 0
+
+
+failures:
+    session::tests::prompt_jump_metadata_does_not_create_snapshot
+    session::tests::replay_metadata_does_not_create_snapshot_and_preserves_alt_screen
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 68 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p session --lib`

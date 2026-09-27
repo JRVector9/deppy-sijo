@@ -1,0 +1,24 @@
+   Compiling terminal v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-render/crates/terminal)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.02s
+     Running unittests src/lib.rs (target/debug/deps/terminal-3b64586eaae4bc18)
+
+running 2 tests
+
+thread 'renderer_egui::tests::ime_none_range_keeps_terminal_candidate_anchor_when_preedit_shifts_left' (83831151) panicked at crates/terminal/src/renderer_egui.rs:1977:9:
+a missing cursor range must not shift the terminal candidate anchor
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test renderer_egui::tests::ime_none_range_keeps_terminal_candidate_anchor_when_preedit_shifts_left ... FAILED
+
+thread 'renderer_egui::tests::ime_none_range_scrolls_a_long_preedit_to_its_typed_end' (83831152) panicked at crates/terminal/src/renderer_egui.rs:2009:9:
+typed end must be visible: end=1251.7866, pane=[[20.0 10.0] - [100.0 210.0]]
+test renderer_egui::tests::ime_none_range_scrolls_a_long_preedit_to_its_typed_end ... FAILED
+
+failures:
+
+failures:
+    renderer_egui::tests::ime_none_range_keeps_terminal_candidate_anchor_when_preedit_shifts_left
+    renderer_egui::tests::ime_none_range_scrolls_a_long_preedit_to_its_typed_end
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 111 filtered out; finished in 0.03s
+
+error: test failed, to rerun pass `-p terminal --lib`

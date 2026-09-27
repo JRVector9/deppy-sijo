@@ -1,0 +1,10 @@
+   Compiling terminal v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-perf-render/crates/terminal)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.57s
+     Running unittests src/lib.rs (target/debug/deps/terminal-3b64586eaae4bc18)
+
+running 3 tests
+test renderer_egui::tests::cjk_runs_keep_emoji_fallback_in_an_independent_run ... ok
+test renderer_egui::tests::cjk_runs_batch_owned_spacers_and_preserve_two_cell_advances ... ok
+test renderer_egui::tests::cjk_runs_stop_at_ascii_style_and_unowned_spacer_boundaries ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 101 filtered out; finished in 0.01s

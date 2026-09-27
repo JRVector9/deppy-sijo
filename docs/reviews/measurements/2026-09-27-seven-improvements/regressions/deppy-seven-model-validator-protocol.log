@@ -1,0 +1,9 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running unittests src/lib.rs (target/debug/deps/runtime-2fffe9a82c544efa)
+
+running 3 tests
+test protocol::tests::tracked_resize_append_preserves_legacy_command_event_and_envelope_bytes ... ok
+test protocol::tests::protocol_version_tracks_live_scrollback_wire_variants ... ok
+test protocol::tests::compact_cell_keeps_six_field_wire_bytes_and_json ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 313 filtered out; finished in 0.00s

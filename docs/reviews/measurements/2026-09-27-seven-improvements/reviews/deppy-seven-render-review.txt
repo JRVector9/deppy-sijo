@@ -1,0 +1,6 @@
+| Priority | Location | Finding | Impact | Next step |
+|---|---|---|---|---|
+| medium | [renderer_egui.rs](/Users/jr/Desktop/projects/deppy-sijo-performance/crates/terminal/src/renderer_egui.rs:754) | A preedit with `active_range_chars: None` uses character 0 as its caret. | At the pane’s right edge, shifting the preedit left also moves the candidate rectangle left of the terminal cursor; a long composition does not scroll to its typed end. | Keep the terminal cursor as the fallback candidate anchor, or use the composition end when scrolling without a supplied range. |
+| medium | [workspace.rs](/Users/jr/Desktop/projects/deppy-sijo-performance/crates/app/src/ui/workspace.rs:7113) | Same-frame preedit is painted before the IME admission check. | While terminal refocus is pending, `terminal_keyboard_active` can be true even with a TextEdit focused; its raw preedit can appear in the terminal although the later check rejects that input. | Gate the display projection against the focused input owner before rendering. |
+
+These are source review findings. I did not run tests, builds, or the app.

@@ -1,0 +1,19 @@
+    Blocking waiting for file lock on build directory
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.60s
+     Running unittests src/lib.rs (target/debug/deps/terminal-3b64586eaae4bc18)
+
+running 1 test
+
+thread 'alacritty_backend::tests::snapshot_resident_cache_is_budgeted_and_hidden_reads_release_it' (83644271) panicked at crates/terminal/src/alacritty_backend.rs:1286:9:
+owned snapshot cache must be in the backend budget
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test alacritty_backend::tests::snapshot_resident_cache_is_budgeted_and_hidden_reads_release_it ... FAILED
+
+failures:
+
+failures:
+    alacritty_backend::tests::snapshot_resident_cache_is_budgeted_and_hidden_reads_release_it
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 113 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p terminal --lib`

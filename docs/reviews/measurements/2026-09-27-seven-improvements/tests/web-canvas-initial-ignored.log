@@ -1,0 +1,15 @@
+   Compiling web-remote v0.1.0 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/web-remote)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.99s
+     Running tests/viewer_core_chrome.rs (target/debug/deps/viewer_core_chrome-826185bfd52c4ef7)
+
+running 1 test
+test the_shared_viewer_core_runs_its_contract_in_a_real_browser ... ignored, requires a locally installed Chromium-family browser
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/viewer_grapheme_chrome.rs (target/debug/deps/viewer_grapheme_chrome-865f6103aef8b168)
+
+running 1 test
+test browser_canvas_preserves_graphemes_and_cell_advances ... ignored, requires a locally installed Chromium-family browser
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s

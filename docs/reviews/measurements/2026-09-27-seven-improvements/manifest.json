@@ -1,0 +1,202 @@
+{
+  "baseline_source": "78f054b9",
+  "stage6_source": "5af4571a",
+  "after_source": "5e30a4f1a4472b8f562ce74eb637f2ca3d8db3cc",
+  "baseline_public_probe_sha256": "5ca36c2d2409909dc6d0ebc664316d2d3683653303662f475c5ce2fc4caab5c2",
+  "baseline_program_sha256": "c3a1cf963209e97717745836f7a607672b7f1c787d70039b73dce2fb83d52ab1",
+  "baseline_source_tree": "/Users/jr/Desktop/projects/deppy-sijo-perf-baseline",
+  "integration_source_tree": "/Users/jr/Desktop/projects/deppy-sijo-performance",
+  "allocator": "System (isolated headless probe)",
+  "egui": "0.36.1",
+  "cols": 300,
+  "rows": 80,
+  "repeats": 3,
+  "gui_launch": "not authorized; not executed",
+  "after_component_source": "ebddc67fbffa9856b28333106bc32a072f264291",
+  "font_sha256": "8b1b23e5de4dff652fb0b938528150d2f531edfda281d3944618b655711aba84",
+  "after_component_builds": [
+    "/tmp/deppy-seven-public-probe-final-build.log",
+    "/tmp/deppy-seven-renderer-probe-final-build.log"
+  ],
+  "comparison_binary_sha256": {
+    "before/deppy-seven-public-probe": "5ca36c2d2409909dc6d0ebc664316d2d3683653303662f475c5ce2fc4caab5c2",
+    "before/deppy-terminal-research-probe": "ca9c05dd749937d2f82ac08b64ab73e65ef2c197763e8ef41e7ef7e3fc33b377",
+    "after/deppy-seven-public-probe": "7204c46fc6149b9d8ce591eecb0cad5ef3b7f642ee248c2a8d6191fd99217b2f",
+    "after/deppy-terminal-research-probe": "1c4dcd00e54f2a54b60ad25d2d5f9fdb63b5fe614276cf49f913131a784a09d4"
+  },
+  "paired_comparison_exit_code": 0,
+  "release_binary_sha256": "9a1639f9fca97d44a24ff18dce6eac35b954f51d41f4a393ed275a99c628efaf",
+  "release_binary": "/Users/jr/Desktop/projects/deppy-sijo-performance/target/release/deppy-sijo",
+  "tests_source": "5e30a4f1a4472b8f562ce74eb637f2ca3d8db3cc",
+  "existing_gui_pid": 71086,
+  "log_tail_normalization": {
+    "rule": "Only redundant terminal newlines at EOF removed for git whitespace check; substantive stdout unchanged. Original files remain in /tmp.",
+    "files": [
+      {
+        "file": "baseline-tests/deppy-seven-exact-before-session.log",
+        "captured_sha256": "204c25acefdc8708a2f325bc180708dcccb489639cc3a6c3cd7a3e86e7eabdd8",
+        "committed_sha256": "f31db74372c79c1a60aa0b697f48c47193111adba499b490dd48520f7a4a344d"
+      },
+      {
+        "file": "baseline-tests/deppy-seven-exact-before-runtime.log",
+        "captured_sha256": "a96ded267279622c2c02b8145310a8849c8501cf60164b87ec7b5b0e73713f2d",
+        "committed_sha256": "7cd77694149e0b3a3a6378344c9c18ead27acb96c03ee683624935b285165868"
+      },
+      {
+        "file": "baseline-tests/deppy-seven-exact-before-app-hangul.log",
+        "captured_sha256": "556b94ef8c71e7f9c9c9b8c41d9be012d087239bb76d5ef40c381d56b87e4d7a",
+        "committed_sha256": "bbf9b05a6312662ef61b114ff28e82554632c485670e819164cc9c501453b7b2"
+      },
+      {
+        "file": "tests/web-canvas.log",
+        "captured_sha256": "4fd64ecbf9d73ce9b35c7fd9ad464cd75eb0bc8846614d42018e40c38367ac12",
+        "committed_sha256": "6560ca8664a463c83df242032d9487217851a4cdc2fd59603cf79d6b54c0f927"
+      },
+      {
+        "file": "tests/app-ime-initial.log",
+        "captured_sha256": "f8e37ebec8c04c4686d15dd98551f6e824ee80979e1733ed30e90808f0112758",
+        "committed_sha256": "5f8db531546bf9d3252e2fce46bfc34581d4d1047168f80f3839a537db1d852b"
+      },
+      {
+        "file": "tests/app-hangul.log",
+        "captured_sha256": "51b4522052f2d7be37b3d4d196b185339639db3cd451e980705997abfc38d959",
+        "committed_sha256": "9d446fd1fdb0974617c37dcdc40da4ab65b90a602880dfdb86228f5d01f1d6b7"
+      },
+      {
+        "file": "tests/web.log",
+        "captured_sha256": "97a4b1d304df2e4352ab4633f87d72ae67110459bc471b9bc4756aded3f0782b",
+        "committed_sha256": "fa135d8c896ca6b0f3adcb04f1e6a13ccd8aa6f6309d8a2e0b951b4e877f56a5"
+      },
+      {
+        "file": "tests/vendor.log",
+        "captured_sha256": "d94b3622b3c2f6b30d681623620062750456cc33b4c164dc0c8b29340380cc68",
+        "committed_sha256": "131e5fb65df011093501d450dd30761fd19e1b6293ccecfe82be29d8403c604b"
+      },
+      {
+        "file": "tests/terminal.log",
+        "captured_sha256": "a08b0e64eca748cffabe37707877e5a0ddd660aff4b8488e89a54be2402ee039",
+        "committed_sha256": "20597e62492319e0d02c26c318c535e4cc0896730e1aee3281efc15a51d4c691"
+      },
+      {
+        "file": "tests/web-canvas-initial-ignored.log",
+        "captured_sha256": "611061aaa270101b5b7ae7f700c211b925b0a30ffae2c84cbca5bbb3730c61e8",
+        "committed_sha256": "ab73858717fc322f38b89b15277446733ab285dcc2b7c95a48e464f72c953b93"
+      },
+      {
+        "file": "tests/session.log",
+        "captured_sha256": "09ab41884f648449cecc5323a38bc0964e0107028c918e948c145196f1605992",
+        "committed_sha256": "ec97f163576eb95ae397ac3294ff2d41f1a5024b56e9b7e33b43c7535d9ec843"
+      },
+      {
+        "file": "tests/app-cloud.log",
+        "captured_sha256": "e074a9cba11f814bd232761d8723f36c683c7ad0f5ea436e029247b7662ed9df",
+        "committed_sha256": "e96b24935b2a9eaa7213976494a6a3803cbe9ba0d8ce9db5eabbe9954539d73e"
+      },
+      {
+        "file": "tests/app-ime.log",
+        "captured_sha256": "b866f5a323ca328a92714cf1b54fe1722ff9f7a5504ed766889246d10a89761b",
+        "committed_sha256": "8ca4e954814151d725907c8c9b9abf51f3c3bdd3d4f892b718ee41489f517783"
+      },
+      {
+        "file": "tests/runtime.log",
+        "captured_sha256": "56cb617cc297f604b8c51aa8e3bb2500d78d1107ab0384837d236c7fdef5728d",
+        "committed_sha256": "c0b006cd83a695f84075ff3dd64bcf04c57ebd9dce788dd6ed74619001e5a85a"
+      },
+      {
+        "file": "tests/app-preedit.log",
+        "captured_sha256": "e4c924c6fa73de23b1079a674da28185e1386130e9b0f076ffb7fbc47bf45960",
+        "committed_sha256": "bc1e6ae530def2579403c14b29d0e42dbcd1719630a09b348e058e337702534b"
+      },
+      {
+        "file": "regressions/deppy-seven-render-review-late-focus-strong-green.log",
+        "captured_sha256": "40d58927fb7c56f1a4985ce91c6cc95e24f7b358937da094dfa80bf927038c03",
+        "committed_sha256": "b4c34d04dbbee3dae5f34a9ad307eb23126dd1f0735d048664662bd792a2711d"
+      },
+      {
+        "file": "regressions/deppy-seven-model-validator-green.log",
+        "captured_sha256": "37bef1fabaac017c5ef4eb97de8e071001da99ca968bc0f7d07706a22e9582aa",
+        "committed_sha256": "2129cfa4660c81e4b2d11eece7f931497d72616ffa18cb344687020fc00bddad"
+      },
+      {
+        "file": "regressions/deppy-seven-model-pr3-green-isolated.log",
+        "captured_sha256": "5acc911a8533f7acf7f031285958eee2a40d02db640c1b988f11ac4a92d58687",
+        "committed_sha256": "50c1a8e095c112887fed4aa1bb3e2e6394fabae0200616e5c6f24f15854fe548"
+      },
+      {
+        "file": "regressions/deppy-seven-model-pr6-green.log",
+        "captured_sha256": "d675f8c0039ffb26da067d70a4983ac3ffdab1422a1da8ff056be3c2e21dcabc",
+        "committed_sha256": "b734da018bd65141443240513b43f228e2ebb54221af52f1494c8397ed1004cc"
+      },
+      {
+        "file": "regressions/deppy-seven-model-pr3-peer.log",
+        "captured_sha256": "8de34b2951901a94e975cbcd2a6fce790c57bc7ad8b6686a297fe98c83fbbdd5",
+        "committed_sha256": "5979ab5caa77c45a3affa540c42ae8aaaa1e7bd9051ed4f6533388776ac9b0ab"
+      },
+      {
+        "file": "regressions/deppy-seven-model-pr3-grapheme.log",
+        "captured_sha256": "4b83b92433f0462d1934eae705e2923869c2d2c519b4d76f158e692d9d52fab2",
+        "committed_sha256": "f39e6df7869ecaf77f1f83c9131e0ac4e245505867026266f4a00c4291b2d9e2"
+      },
+      {
+        "file": "regressions/deppy-seven-render-review-owner-green.log",
+        "captured_sha256": "84f19d052e0902f21337ed543babcaff704dd1128c91742cab955580dcb0d5dd",
+        "committed_sha256": "d23d3d238a39a83d609e5630bf37ad7901b42f7686f14bb7cdb5aeaae9fdefdc"
+      },
+      {
+        "file": "regressions/deppy-seven-model-validator-native.log",
+        "captured_sha256": "de33b9ebb12a908f83922f146eb43117b1551567c7692f4052808636df8f214e",
+        "committed_sha256": "c7dbfcdeab3ddce498a9949fb3007ae7d4a1c9ecfa82b5421819f1cbadf0edf9"
+      },
+      {
+        "file": "regressions/deppy-seven-render-pr4-isolated-green.log",
+        "captured_sha256": "8eb96ac29b6888c2f0ec294d26106616e0614893d354bc3826b8b32d666535a2",
+        "committed_sha256": "ddf86df7ff14ee2d5b171a82c7d0fe0ff8bc02d3ed8eb7d75b56ecb425500cf8"
+      },
+      {
+        "file": "regressions/deppy-seven-model-pr3-protocol.log",
+        "captured_sha256": "6602480858ced3831faf87ceaffc9aed5dc7fba0b06b8142b4afeb49c1670134",
+        "committed_sha256": "3d1dc8ae9e94e462766253a90a64b6877a8ad4b22a28818b235631014e837b5b"
+      },
+      {
+        "file": "regressions/deppy-seven-model-web-green.log",
+        "captured_sha256": "cd905ee6f37339f0c1be7a661355a78e711283e7a13e7ffb95486e8cc264495c",
+        "committed_sha256": "c0466ecbf11e7674f8f7840ddfc5ca839d361c39135daaccd4cdee33f74ae146"
+      },
+      {
+        "file": "regressions/deppy-seven-render-review-none-green.log",
+        "captured_sha256": "fc7a3a85ca9f0d2834610299ab241d58521169b0c0b9c61c994ee3c19fb30b5b",
+        "committed_sha256": "ec50278bd2f8973d33f190c90283ba3450ac8ecea7560c9df566dafd0f4edfae"
+      },
+      {
+        "file": "regressions/deppy-seven-model-validator-terminal.log",
+        "captured_sha256": "f54e13c05946afad5ab6c8358d00f8bd2f414bdf71a6563423b4ccdfbbcfe63b",
+        "committed_sha256": "8b4d28690d5a55f226843e6aa49a1948959feb8b31255aac8698b0ef02d2bd6c"
+      },
+      {
+        "file": "regressions/deppy-seven-model-validator-all-wire.log",
+        "captured_sha256": "65888f98303a9d2c0e1ce90faab46b8b6981183d8024d270f5288b06bfc58ebe",
+        "committed_sha256": "c30c34c876c79be626c1563fb23e1b35def2693fdf3986aa85f79ba16a9a4772"
+      },
+      {
+        "file": "regressions/deppy-seven-model-cloud-green.log",
+        "captured_sha256": "97a5f601271d24d7a489fa1a2f75347782653681be2c4903ea7ea83a4b0eafba",
+        "committed_sha256": "9aa08aa1e34f3a24bbffd2713754825f3e1de3fb089828f10db0c6d9df13c071"
+      },
+      {
+        "file": "regressions/deppy-seven-render-review-late-focus-green.log",
+        "captured_sha256": "cc477582594fd23e319aaea1d07fdbc7a1b39c30a8ad6a99414d94b73df2fd73",
+        "committed_sha256": "8ba00bb94542ada1c7093fde865fd698f79e0fc343076ea3759b5ac9ac660013"
+      },
+      {
+        "file": "regressions/deppy-seven-model-pr3-delta.log",
+        "captured_sha256": "bb154869e512ec829247306d66f3d7f2e7a0d5ab758d3161ec82296cc71e6a4b",
+        "committed_sha256": "7f22c04b066554ebed5b345f98f2e8144e1386a63ed8b0a8e12b1da0d7a5751f"
+      },
+      {
+        "file": "regressions/deppy-seven-model-validator-protocol.log",
+        "captured_sha256": "7bf3b5d44d9f6cb67351127616b3dc3f9b29b1d11cea5cf93764203759267278",
+        "committed_sha256": "4e7161cea14f9c86db775a1841e2071069207351c313f800ff75964860cb2848"
+      }
+    ]
+  }
+}

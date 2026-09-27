@@ -1,0 +1,14 @@
+cell_bytes=12
+allocator=System; requested allocation traffic includes realloc, excludes PTY feed; not RSS/GPU/native IME
+footprint history=1000 us=0.002596 calls=0 bytes=0
+footprint history=5000 us=0.002567 calls=0 bytes=0
+footprint history=20000 us=0.002646 calls=0 bytes=0
+snapshot scenario=cold iterations=1 us=110.5830 calls=87.0000 bytes=299280.0 backend_resident_before=2972336 backend_resident_after=3270256
+snapshot scenario=metadata iterations=200 us=2.4375 calls=0.0000 bytes=0.0 backend_resident_before=3270256 backend_resident_after=3270256
+snapshot scenario=dirty1 iterations=200 us=2.5283 calls=4.0000 bytes=6256.0 backend_resident_before=3270256 backend_resident_after=3270256
+snapshot scenario=dirty80 iterations=200 us=88.2865 calls=83.0000 bytes=291920.0 backend_resident_before=3270256 backend_resident_after=3270256
+snapshot scenario=compressed_steady iterations=200 us=0.0523 calls=0.0000 bytes=0.0 backend_resident_before=3270256 backend_resident_after=3270256
+snapshot scenario=compressed_scroll iterations=200 us=129.9335 calls=85.0000 bytes=299200.0 backend_resident_before=3270256 backend_resident_after=3270256
+cluster input="한" copy="한"
+cluster input="가ᇹ" copy="가ᇹ"
+cluster input="a\u{301}\u{308}" copy="a\u{301}\u{308}"

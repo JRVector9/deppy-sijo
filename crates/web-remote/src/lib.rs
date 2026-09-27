@@ -1126,14 +1126,7 @@ mod tests {
 
         let make_snapshot = |first_char: char| {
             let mut cells = vec![
-                runtime::TerminalCell {
-                    c: ' ',
-                    fg: [255, 255, 255],
-                    bg: [0, 0, 0],
-                    wide: false,
-                    wide_spacer: false,
-                attrs: Default::default(),
-                };
+                runtime::TerminalCell::new(' ', [255, 255, 255], [0, 0, 0], false, false, Default::default());
                 20 // 10×2
             ];
             cells[0].c = first_char;

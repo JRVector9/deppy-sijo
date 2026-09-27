@@ -3426,14 +3426,7 @@ mod tests {
     use terminal::{CellRange, CursorShape, CursorSnapshot, TerminalCell};
 
     fn cell(c: char) -> TerminalCell {
-        TerminalCell {
-            c,
-            fg: [10, 20, 30],
-            bg: [0, 0, 0],
-            wide: false,
-            wide_spacer: false,
-            attrs: Default::default(),
-        }
+        TerminalCell::new(c, [10, 20, 30], [0, 0, 0], false, false, Default::default())
     }
 
     /// cols*rows 그리드 스냅샷을 만든다. `lines[r]`의 각 문자가 셀이 되고 나머지는 공백으로 채운다.
@@ -3963,6 +3956,10 @@ mod tests {
         }]
         .into();
         let composed = Arc::new(composed);
+        let mut keyframe_pipe = DeltaPipe::new();
+        let keyframe_reconstructed = keyframe_pipe.round_trip(s, &composed);
+        assert_eq!(keyframe_reconstructed.graphemes, composed.graphemes);
+        assert_eq!(keyframe_pipe.keyframes, 1);
         let reconstructed = pipe.round_trip(s, &composed);
         assert_eq!(reconstructed.graphemes, composed.graphemes);
         assert_eq!(

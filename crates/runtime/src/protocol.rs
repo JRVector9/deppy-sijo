@@ -437,7 +437,7 @@ pub(crate) fn try_apply_delta(
         visible_cells: cells.into(),
         graphemes: {
             graphemes.sort_unstable_by_key(|entry| entry.index);
-            graphemes.into()
+            terminal::share_cell_graphemes(graphemes)
         },
         dirty_ranges: row_patches_to_dirty_ranges(&delta.changed_rows, cols, rows),
         title: delta.title.clone(),
@@ -509,6 +509,60 @@ mod tests {
         assert_eq!(
             postcard::to_allocvec(&WireMsg::Event(event)).unwrap(),
             [0, 0, 7]
+        );
+    }
+
+    #[test]
+    fn compact_cell_keeps_six_field_wire_bytes_and_json() {
+        #[derive(serde::Serialize)]
+        struct LegacyCell {
+            c: char,
+            fg: [u8; 3],
+            bg: [u8; 3],
+            wide: bool,
+            wide_spacer: bool,
+            attrs: terminal::CellAttrs,
+        }
+        for attrs in 0..32 {
+            for wide in [false, true] {
+                for spacer in [false, true] {
+                    let cell = TerminalCell::new(
+                        '한',
+                        [1, 2, 3],
+                        [4, 5, 6],
+                        wide,
+                        spacer,
+                        terminal::CellAttrs(attrs),
+                    );
+                    let legacy = LegacyCell {
+                        c: cell.c,
+                        fg: cell.fg,
+                        bg: cell.bg,
+                        wide,
+                        wide_spacer: spacer,
+                        attrs: terminal::CellAttrs(attrs),
+                    };
+                    let actual = postcard::to_allocvec(&cell).unwrap();
+                    assert_eq!(actual, postcard::to_allocvec(&legacy).unwrap());
+                    assert_eq!(postcard::from_bytes::<TerminalCell>(&actual).unwrap(), cell);
+                    assert_eq!(
+                        serde_json::to_string(&cell).unwrap(),
+                        serde_json::to_string(&legacy).unwrap()
+                    );
+                }
+            }
+        }
+        let malformed = LegacyCell {
+            c: 'a',
+            fg: [0; 3],
+            bg: [0; 3],
+            wide: false,
+            wide_spacer: false,
+            attrs: terminal::CellAttrs(0x80),
+        };
+        assert!(
+            postcard::from_bytes::<TerminalCell>(&postcard::to_allocvec(&malformed).unwrap())
+                .is_err()
         );
     }
 

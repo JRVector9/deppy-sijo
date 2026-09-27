@@ -26,6 +26,16 @@ pub struct CellGrapheme {
     pub text: String,
 }
 
+/// Avoid a fresh Arc allocation on every ASCII-only snapshot.
+pub fn share_cell_graphemes(entries: Vec<CellGrapheme>) -> Arc<[CellGrapheme]> {
+    if entries.is_empty() {
+        static EMPTY: std::sync::OnceLock<Arc<[CellGrapheme]>> = std::sync::OnceLock::new();
+        Arc::clone(EMPTY.get_or_init(|| Arc::from([])))
+    } else {
+        entries.into()
+    }
+}
+
 /// Peer limits bound sparse text without imposing allocations on ASCII cells.
 pub const MAX_CELL_GRAPHEME_BYTES: usize = 16 * 1024;
 pub const MAX_CELL_GRAPHEME_CHARS: usize = 4096;
@@ -42,7 +52,7 @@ pub fn validate_cell_graphemes(
         if previous.is_some_and(|index| index >= entry.index) {
             return Err("grapheme indices must be unique and sorted");
         }
-        if cell.wide_spacer || entry.text.len() > MAX_CELL_GRAPHEME_BYTES {
+        if cell.wide_spacer() || entry.text.len() > MAX_CELL_GRAPHEME_BYTES {
             return Err("invalid grapheme owner or byte limit");
         }
         let mut chars = entry.text.chars();
@@ -101,7 +111,7 @@ impl TerminalViewportSnapshot {
             || !self
                 .visible_cells
                 .get(index)
-                .is_some_and(|cell| cell.wide_spacer)
+                .is_some_and(|cell| cell.wide_spacer())
         {
             return false;
         }
@@ -111,24 +121,102 @@ impl TerminalViewportSnapshot {
         }
         self.visible_cells
             .get(index - 1)
-            .is_some_and(|owner| owner.wide)
+            .is_some_and(|owner| owner.wide())
     }
 }
 
-/// 색상은 backend에서 RGB로 해석을 끝낸다 — UI는 팔레트를 모른다.
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+/// Fixed snapshot payload: char + RGB + RGB + 7 flag bits, normally aligned to 12 bytes.
+/// Grapheme text stays in the snapshot's sparse side table.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TerminalCell {
     pub c: char,
     pub fg: [u8; 3],
     pub bg: [u8; 3],
-    /// wide char(한글 등)의 첫 셀 — 2셀 폭으로 렌더링
-    pub wide: bool,
-    /// wide char 뒤의 자리 채움 셀 — 렌더링하지 않는다
-    pub wide_spacer: bool,
-    /// SGR 텍스트 속성 (2026-07-14 B-1). backend가 이 flag들을 그냥 버리고 있었다 —
-    /// bold/italic/underline이 화면에 전혀 반영되지 않았다. 비트 하나로 유지해
-    /// 셀 크기 증가를 최소화한다(정렬 포함 기존 12B → 12B, wide/spacer 옆 패딩 활용).
-    pub attrs: CellAttrs,
+    flags: u8,
+}
+
+impl TerminalCell {
+    const ATTR_MASK: u8 = 0x1f;
+    const WIDE: u8 = 1 << 5;
+    const SPACER: u8 = 1 << 6;
+
+    pub const fn new(
+        c: char,
+        fg: [u8; 3],
+        bg: [u8; 3],
+        wide: bool,
+        wide_spacer: bool,
+        attrs: CellAttrs,
+    ) -> Self {
+        assert!(
+            attrs.0 & !Self::ATTR_MASK == 0,
+            "unsupported cell attributes"
+        );
+        Self {
+            c,
+            fg,
+            bg,
+            flags: attrs.0
+                | if wide { Self::WIDE } else { 0 }
+                | if wide_spacer { Self::SPACER } else { 0 },
+        }
+    }
+    pub const fn wide(self) -> bool {
+        self.flags & Self::WIDE != 0
+    }
+    pub const fn wide_spacer(self) -> bool {
+        self.flags & Self::SPACER != 0
+    }
+    pub const fn attrs(self) -> CellAttrs {
+        CellAttrs(self.flags & Self::ATTR_MASK)
+    }
+    pub fn set_wide_spacer(&mut self, value: bool) {
+        if value {
+            self.flags |= Self::SPACER;
+        } else {
+            self.flags &= !Self::SPACER;
+        }
+    }
+}
+
+/// Keep the original six-field postcard/JSON contract independent of memory layout.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TerminalCellWire {
+    c: char,
+    fg: [u8; 3],
+    bg: [u8; 3],
+    wide: bool,
+    wide_spacer: bool,
+    attrs: CellAttrs,
+}
+impl serde::Serialize for TerminalCell {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        TerminalCellWire {
+            c: self.c,
+            fg: self.fg,
+            bg: self.bg,
+            wide: self.wide(),
+            wide_spacer: self.wide_spacer(),
+            attrs: self.attrs(),
+        }
+        .serialize(serializer)
+    }
+}
+impl<'de> serde::Deserialize<'de> for TerminalCell {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = TerminalCellWire::deserialize(deserializer)?;
+        if wire.attrs.0 & !Self::ATTR_MASK != 0 {
+            return Err(serde::de::Error::custom("unsupported cell attributes"));
+        }
+        Ok(Self::new(
+            wire.c,
+            wire.fg,
+            wire.bg,
+            wire.wide,
+            wire.wide_spacer,
+            wire.attrs,
+        ))
+    }
 }
 
 /// 셀의 SGR 텍스트 속성 비트셋 (B-1). INVERSE/HIDDEN은 backend가 이미 fg/bg·문자에
@@ -181,4 +269,39 @@ pub enum CursorShape {
 pub struct CellRange {
     pub start: usize,
     pub end: usize,
+}
+
+#[cfg(test)]
+mod compact_tests {
+    use super::*;
+    #[test]
+    fn compact_cell_preserves_all_supported_flag_combinations() {
+        for attrs in 0..32 {
+            for wide in [false, true] {
+                for spacer in [false, true] {
+                    let mut cell = TerminalCell::new(
+                        '한',
+                        [1, 2, 3],
+                        [4, 5, 6],
+                        wide,
+                        spacer,
+                        CellAttrs(attrs),
+                    );
+                    assert_eq!(cell.wide(), wide);
+                    assert_eq!(cell.wide_spacer(), spacer);
+                    assert_eq!(cell.attrs(), CellAttrs(attrs));
+                    cell.set_wide_spacer(!spacer);
+                    assert_eq!(cell.wide_spacer(), !spacer);
+                    assert_eq!(cell.wide(), wide);
+                    assert_eq!(cell.attrs(), CellAttrs(attrs));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_cell_payload_is_twelve_bytes() {
+        assert_eq!(std::mem::size_of::<TerminalCell>(), 12);
+        assert_eq!(std::mem::align_of::<TerminalCell>(), 4);
+    }
 }

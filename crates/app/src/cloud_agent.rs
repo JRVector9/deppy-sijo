@@ -568,7 +568,7 @@ pub fn screen_text(s: &terminal::TerminalViewportSnapshot) -> String {
     {
         let mut line = String::new();
         for (col, c) in row.iter().enumerate() {
-            if s.is_trailing_wide_spacer(row_index * s.cols as usize + col) || c.wide_spacer {
+            if s.is_trailing_wide_spacer(row_index * s.cols as usize + col) || c.wide_spacer() {
                 continue;
             }
             if !c.c.is_control() {

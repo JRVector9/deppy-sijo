@@ -439,33 +439,29 @@ impl TerminalBackend for AlacrittyBackend {
                 attrs.set(CellAttrs::STRIKEOUT, flags.contains(Flags::STRIKEOUT));
                 attrs.set(CellAttrs::DIM, flags.contains(Flags::DIM));
                 let index = screen_row * cols + col;
-                let (c, text) = if flags.intersects(
-                    Flags::HIDDEN | Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER,
-                ) {
-                    (
-                        if flags.contains(Flags::HIDDEN) {
-                            ' '
-                        } else {
-                            cell.c
-                        },
-                        None,
-                    )
+                let c = if flags.contains(Flags::HIDDEN) {
+                    ' '
+                } else if flags
+                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                {
+                    cell.c
+                } else if let Some(zw) = cell.zerowidth().filter(|zw| !zw.is_empty()) {
+                    let (c, text) = composed_cell(cell.c, Some(zw));
+                    if let Some(text) = text {
+                        graphemes.push(CellGrapheme { index, text });
+                    }
+                    c
                 } else {
-                    composed_cell(cell.c, cell.zerowidth())
+                    cell.c
                 };
-                if let Some(text) = text {
-                    graphemes.push(CellGrapheme { index, text });
-                }
-                cells[index] = TerminalCell {
-                    // SGR conceal(ESC[8m)은 공백으로 — 속성은 유지
+                cells[index] = TerminalCell::new(
                     c,
                     fg,
                     bg,
-                    wide: flags.contains(Flags::WIDE_CHAR),
-                    wide_spacer: flags
-                        .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER),
+                    flags.contains(Flags::WIDE_CHAR),
+                    flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER),
                     attrs,
-                };
+                );
             }
         }
 
@@ -485,7 +481,7 @@ impl TerminalBackend for AlacrittyBackend {
             rows: rows as u16,
             cursor,
             visible_cells: cells.into(),
-            graphemes: graphemes.into(),
+            graphemes: crate::viewport_snapshot::share_cell_graphemes(graphemes),
             // backend 레벨에선 빈 값 — Session::take_snapshot이 누적 dirty rows로
             // 덮어쓰고(session.rs), renderer_egui가 행 캐시 무효화에 소비한다
             // (감사 2026-07-13: "소비자 없음" 서술은 stale이라 교정).
@@ -854,14 +850,14 @@ fn map_cursor_shape(shape: VteCursorShape) -> (CursorShape, bool) {
 
 impl Default for TerminalCell {
     fn default() -> Self {
-        Self {
-            c: ' ',
-            fg: DEFAULT_FG,
-            bg: DEFAULT_BG,
-            wide: false,
-            wide_spacer: false,
-            attrs: CellAttrs::empty(),
-        }
+        Self::new(
+            ' ',
+            DEFAULT_FG,
+            DEFAULT_BG,
+            false,
+            false,
+            CellAttrs::empty(),
+        )
     }
 }
 
@@ -1212,6 +1208,14 @@ mod tests {
     }
 
     #[test]
+    fn ascii_snapshots_share_empty_grapheme_storage() {
+        let backend = AlacrittyBackend::new(20, 3, 10);
+        let first = backend.viewport_snapshot().unwrap();
+        let second = backend.viewport_snapshot().unwrap();
+        assert!(std::sync::Arc::ptr_eq(&first.graphemes, &second.graphemes));
+    }
+
+    #[test]
     fn grapheme_snapshot_search_and_screen_text_preserve_clusters() {
         for text in ["가ᇹ", "a\u{0301}\u{0308}"] {
             let mut backend = AlacrittyBackend::new(20, 3, 10);
@@ -1251,7 +1255,7 @@ mod tests {
         let cols = snap.cols as usize;
         snap.visible_cells[row * cols..(row + 1) * cols]
             .iter()
-            .filter(|c| !c.wide_spacer)
+            .filter(|c| !c.wide_spacer())
             .map(|c| c.c)
             .collect::<String>()
             .trim_end()
@@ -1518,8 +1522,8 @@ mod tests {
         feed(&mut backend, "가나".as_bytes());
         let first = cell_at(&backend, 0, 0);
         assert_eq!(first.c, '가');
-        assert!(first.wide);
-        assert!(cell_at(&backend, 0, 1).wide_spacer);
+        assert!(first.wide());
+        assert!(cell_at(&backend, 0, 1).wide_spacer());
         assert_eq!(cell_at(&backend, 0, 2).c, '나');
         assert_eq!(row_text(&backend, 0), "가나");
     }
@@ -1680,7 +1684,7 @@ mod tests {
         );
         // 마지막 행: 한글 wide + 빨간 SGR 복원
         assert_eq!(cell_at(&b, 4, 0).c, '가');
-        assert!(cell_at(&b, 4, 0).wide);
+        assert!(cell_at(&b, 4, 0).wide());
         assert_eq!(cell_at(&b, 4, 5).fg, ANSI16[1]);
         // 스크롤백 최상단까지 복원
         b.scroll(1000);
@@ -1802,23 +1806,26 @@ mod tests {
         let snap = backend.viewport_snapshot().expect("snapshot");
         let cells = &snap.visible_cells[..5];
         assert_eq!(cells[0].c, 'B');
-        assert!(cells[0].attrs.contains(CellAttrs::BOLD), "bold 미반영");
+        assert!(cells[0].attrs().contains(CellAttrs::BOLD), "bold 미반영");
         assert_eq!(cells[1].c, 'I');
-        assert!(cells[1].attrs.contains(CellAttrs::ITALIC), "italic 미반영");
+        assert!(
+            cells[1].attrs().contains(CellAttrs::ITALIC),
+            "italic 미반영"
+        );
         assert_eq!(cells[2].c, 'U');
         assert!(
-            cells[2].attrs.contains(CellAttrs::UNDERLINE),
+            cells[2].attrs().contains(CellAttrs::UNDERLINE),
             "underline 미반영"
         );
         assert_eq!(cells[3].c, 'S');
         assert!(
-            cells[3].attrs.contains(CellAttrs::STRIKEOUT),
+            cells[3].attrs().contains(CellAttrs::STRIKEOUT),
             "strikeout 미반영"
         );
         assert_eq!(cells[4].c, 'D');
-        assert!(cells[4].attrs.contains(CellAttrs::DIM), "dim 미반영");
+        assert!(cells[4].attrs().contains(CellAttrs::DIM), "dim 미반영");
         // 속성 없는 셀은 비어 있다
-        assert!(snap.visible_cells[10].attrs.is_empty());
+        assert!(snap.visible_cells[10].attrs().is_empty());
     }
 
     // ── deppy-sijo 옵션 D: 스크롤백 라인 압축 통합 ────────────────────────────

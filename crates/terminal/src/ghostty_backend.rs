@@ -268,7 +268,7 @@ impl TerminalBackend for GhosttyBackend {
                 let raw = cell.raw_cell().ok();
                 let wide = raw.and_then(|r| r.wide().ok()).unwrap_or(CellWide::Narrow);
                 if matches!(wide, CellWide::SpacerTail | CellWide::SpacerHead) {
-                    out.wide_spacer = true;
+                    out.set_wide_spacer(true);
                     continue;
                 }
 
@@ -310,14 +310,14 @@ impl TerminalBackend for GhosttyBackend {
                     });
                 }
 
-                *out = TerminalCell {
+                *out = TerminalCell::new(
                     c,
                     fg,
                     bg,
-                    wide: matches!(wide, CellWide::Wide),
-                    wide_spacer: false,
-                    attrs: CellAttrs::empty(),
-                };
+                    matches!(wide, CellWide::Wide),
+                    false,
+                    CellAttrs::empty(),
+                );
             }
             row += 1;
         }
@@ -361,7 +361,7 @@ impl TerminalBackend for GhosttyBackend {
             rows: rows as u16,
             cursor,
             visible_cells: cells.into(),
-            graphemes: graphemes.into(),
+            graphemes: crate::viewport_snapshot::share_cell_graphemes(graphemes),
             // alacritty와 동일 — dirty_ranges는 Session.take_dirty_ranges가 채운다
             dirty_ranges: Vec::new(),
             title,
@@ -491,7 +491,7 @@ mod tests {
         let cols = snap.cols as usize;
         snap.visible_cells[row * cols..(row + 1) * cols]
             .iter()
-            .filter(|c| !c.wide_spacer)
+            .filter(|c| !c.wide_spacer())
             .map(|c| c.c)
             .collect::<String>()
             .trim_end()
@@ -514,8 +514,8 @@ mod tests {
         let snap = b.viewport_snapshot().unwrap();
         let first = snap.visible_cells[0];
         assert_eq!(first.c, '가');
-        assert!(first.wide);
-        assert!(snap.visible_cells[1].wide_spacer);
+        assert!(first.wide());
+        assert!(snap.visible_cells[1].wide_spacer());
         assert_eq!(row_text(&b, 0), "가나");
     }
 

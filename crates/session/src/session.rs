@@ -1073,7 +1073,7 @@ mod tests {
         let cols = top.cols as usize;
         let first_row: String = top.visible_cells[..cols]
             .iter()
-            .filter(|c| !c.wide_spacer)
+            .filter(|c| !c.wide_spacer())
             .map(|c| c.c)
             .collect();
         assert!(first_row.trim_end().starts_with("line0"), "{first_row}");
@@ -1094,7 +1094,7 @@ mod tests {
         let cols = snapshot.cols as usize;
         snapshot.visible_cells[row * cols..(row + 1) * cols]
             .iter()
-            .filter(|c| !c.wide_spacer)
+            .filter(|c| !c.wide_spacer())
             .map(|c| c.c)
             .collect::<String>()
             .trim_end()

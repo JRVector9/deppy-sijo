@@ -277,12 +277,12 @@ fn encode_line_with_graphemes(
     type OpenRun = ([u8; 3], [u8; 3], bool, u8, u16);
     let mut open: Option<OpenRun> = None;
     for (col, cell) in cells.iter().enumerate() {
-        if cell.wide_spacer {
+        if cell.wide_spacer() {
             continue;
         }
         let col = col as u16;
-        let advance = if cell.wide { 2 } else { 1 };
-        let attrs = cell.attrs.0;
+        let advance = if cell.wide() { 2 } else { 1 };
+        let attrs = cell.attrs().0;
         let index = row as usize * cells.len() + col as usize;
         if let Ok(entry) = graphemes.binary_search_by_key(&index, |entry| entry.index) {
             let text = &graphemes[entry].text;
@@ -292,7 +292,7 @@ fn encode_line_with_graphemes(
                 g: vec![text.clone()],
                 fg: hex_color(cell.fg),
                 bg: hex_color(cell.bg),
-                w: cell.wide,
+                w: cell.wide(),
                 a: attrs,
             });
             open = None;
@@ -302,7 +302,7 @@ fn encode_line_with_graphemes(
             (Some((fg, bg, wide, a, next)), Some(run))
                 if *fg == cell.fg
                     && *bg == cell.bg
-                    && *wide == cell.wide
+                    && *wide == cell.wide()
                     && *a == attrs
                     && *next == col =>
             {
@@ -316,10 +316,10 @@ fn encode_line_with_graphemes(
                     g: Vec::new(),
                     fg: hex_color(cell.fg),
                     bg: hex_color(cell.bg),
-                    w: cell.wide,
+                    w: cell.wide(),
                     a: attrs,
                 });
-                open = Some((cell.fg, cell.bg, cell.wide, attrs, col + advance));
+                open = Some((cell.fg, cell.bg, cell.wide(), attrs, col + advance));
             }
         }
     }
@@ -538,34 +538,13 @@ mod tests {
     // ── P5c 인코더 ──
 
     fn cell(c: char, fg: [u8; 3], bg: [u8; 3]) -> runtime::TerminalCell {
-        runtime::TerminalCell {
-            c,
-            fg,
-            bg,
-            wide: false,
-            wide_spacer: false,
-            attrs: Default::default(),
-        }
+        runtime::TerminalCell::new(c, fg, bg, false, false, Default::default())
     }
 
     fn wide_pair(c: char, fg: [u8; 3], bg: [u8; 3]) -> [runtime::TerminalCell; 2] {
         [
-            runtime::TerminalCell {
-                c,
-                fg,
-                bg,
-                wide: true,
-                wide_spacer: false,
-                attrs: Default::default(),
-            },
-            runtime::TerminalCell {
-                c: ' ',
-                fg,
-                bg,
-                wide: false,
-                wide_spacer: true,
-                attrs: Default::default(),
-            },
+            runtime::TerminalCell::new(c, fg, bg, true, false, Default::default()),
+            runtime::TerminalCell::new(' ', fg, bg, false, true, Default::default()),
         ]
     }
 
@@ -698,14 +677,14 @@ mod tests {
     #[test]
     fn 행_첫_셀이_spacer면_건너뛰고_시작_열이_정확하다() {
         // 앞 행 wrap 잔재 등으로 행이 spacer로 시작하는 대칭 케이스 방어 (P5 리뷰 P3).
-        let mut cells = vec![runtime::TerminalCell {
-            c: ' ',
-            fg: WHITE,
-            bg: BLACK,
-            wide: false,
-            wide_spacer: true,
-            attrs: Default::default(),
-        }];
+        let mut cells = vec![runtime::TerminalCell::new(
+            ' ',
+            WHITE,
+            BLACK,
+            false,
+            true,
+            Default::default(),
+        )];
         cells.push(cell('a', WHITE, BLACK));
         cells.push(cell('b', WHITE, BLACK));
         let line = encode_line(&cells, 0);

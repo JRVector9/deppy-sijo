@@ -47,5 +47,6 @@ pub use change_set::TerminalChangeSet;
 pub use renderer_egui::MONO_BOLD_FAMILY;
 pub use viewport_snapshot::{
     CellAttrs, CellGrapheme, CellRange, CursorShape, CursorSnapshot, MAX_CELL_GRAPHEME_BYTES,
-    MAX_CELL_GRAPHEME_CHARS, TerminalCell, TerminalViewportSnapshot, validate_cell_graphemes,
+    MAX_CELL_GRAPHEME_CHARS, TerminalCell, TerminalViewportSnapshot, share_cell_graphemes,
+    validate_cell_graphemes,
 };

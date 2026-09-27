@@ -1591,14 +1591,14 @@ mod tests {
 
     fn viewport_event(session: u64) -> RuntimeEvent {
         let cells = vec![
-            runtime::TerminalCell {
-                c: ' ',
-                fg: [255, 255, 255],
-                bg: [0, 0, 0],
-                wide: false,
-                wide_spacer: false,
-                attrs: Default::default(),
-            };
+            runtime::TerminalCell::new(
+                ' ',
+                [255, 255, 255],
+                [0, 0, 0],
+                false,
+                false,
+                Default::default()
+            );
             4
         ];
         RuntimeEvent::Viewport {

@@ -8041,7 +8041,7 @@ mod tests {
         let cols = snapshot.cols as usize;
         snapshot.visible_cells[row * cols..(row + 1) * cols]
             .iter()
-            .filter(|c| !c.wide_spacer)
+            .filter(|c| !c.wide_spacer())
             .map(|c| c.c)
             .collect::<String>()
             .trim_end()
@@ -10637,7 +10637,7 @@ mod tests {
             snapshot
                 .visible_cells
                 .iter()
-                .filter(|c| !c.wide_spacer)
+                .filter(|c| !c.wide_spacer())
                 .map(|c| c.c)
                 .collect()
         };
@@ -11472,7 +11472,7 @@ mod tests {
                 let text = snapshot
                     .visible_cells
                     .iter()
-                    .filter(|cell| !cell.wide_spacer)
+                    .filter(|cell| !cell.wide_spacer())
                     .map(|cell| cell.c)
                     .collect::<String>();
                 text.contains(&cwd_text).then_some(text)
@@ -11745,7 +11745,7 @@ mod tests {
                 && snapshot
                     .visible_cells
                     .iter()
-                    .any(|cell| cell.c == 'E' && !cell.wide_spacer) =>
+                    .any(|cell| cell.c == 'E' && !cell.wide_spacer()) =>
             {
                 snapshot
                     .visible_cells

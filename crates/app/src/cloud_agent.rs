@@ -19,10 +19,15 @@ pub struct Target {
     pub live: bool,
     pub screen: Option<String>,
 }
-#[derive(Clone)]
 struct Grant {
     generation: String,
     input: bool,
+    permit: runtime::InputPermit,
+}
+impl Drop for Grant {
+    fn drop(&mut self) {
+        self.permit.revoke();
+    }
 }
 struct Screen {
     generation: String,
@@ -33,6 +38,7 @@ pub enum Effect {
     Input {
         operation_id: String,
         bytes: Vec<u8>,
+        admission: runtime::InputAdmission,
     },
     Watch,
 }
@@ -188,6 +194,7 @@ impl CloudAgent {
                 Grant {
                     generation: t.generation.clone(),
                     input: false,
+                    permit: runtime::InputPermit::new(),
                 },
             );
         } else {
@@ -197,11 +204,16 @@ impl CloudAgent {
     }
     pub fn allow_input(&mut self, id: &str, allow: bool) {
         if let Some(g) = self.grants.get_mut(id) {
+            g.permit.revoke();
+            if allow {
+                g.permit = runtime::InputPermit::new();
+            }
             g.input = allow;
         }
     }
     pub fn take_control(&mut self) {
         for g in self.grants.values_mut() {
+            g.permit.revoke();
             g.input = false;
         }
     }
@@ -452,15 +464,28 @@ impl CloudAgent {
         }
         // Recheck token/deadline after SQLite's bounded wait, immediately before effects.
         if !self.server.as_ref().is_some_and(|s| req.live(&s.auth)) {
-            return Err("expired_or_revoked_request_no_effect".into());
+            let outcome = json!({"status":"rejected","error":"expired_or_revoked_request_no_effect","retry":false});
+            db.finish(op, &outcome, "")
+                .map_err(|_| "outcome_unknown_do_not_retry_input")?;
+            self.reload_history();
+            return Ok(outcome);
         }
         let outcome = if let Some(bytes) = bytes {
             let size = bytes.len();
+            let auth = self.server.as_ref().unwrap().auth.clone();
+            let epoch = req.epoch;
+            let access_key = req.access_key.clone();
+            let admission = runtime::InputAdmission::new(
+                self.grants[&t.id].permit.clone(),
+                req.deadline,
+                move |write| auth.admit_current_access(epoch, access_key.as_deref(), write),
+            );
             match send(
                 &t,
                 Effect::Input {
                     operation_id: op.to_owned(),
                     bytes,
+                    admission,
                 },
             ) {
                 Ok(()) => {
@@ -623,6 +648,7 @@ mod integration_tests {
         (
             Request {
                 epoch,
+                access_key: None,
                 input_scope: true,
                 deadline: Instant::now() + Duration::from_secs(3),
                 tool: tool.into(),
@@ -775,6 +801,44 @@ mod integration_tests {
         assert!(b.records.is_empty());
     }
     #[test]
+    fn claim_expiry_records_no_effect_for_exact_retries() {
+        let dir = std::env::temp_dir().join(format!("deppy-claim-expiry-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.db");
+        let mut b = CloudAgent::new(&path, secret::RedactionService::new());
+        b.server = Some(Server::start(0, "", || {}).unwrap());
+        let t = Target::fixture("original-session", "generation-1");
+        b.set_targets(vec![t.clone()]);
+        b.share(&t, true);
+        b.allow_input(&t.id, true);
+        let (ready, ready_rx) = mpsc::sync_channel(1);
+        let lock = std::thread::spawn(move || {
+            let db = rusqlite::Connection::open(path).unwrap();
+            db.execute_batch("BEGIN EXCLUSIVE").unwrap();
+            ready.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(80));
+            db.execute_batch("COMMIT").unwrap();
+        });
+        ready_rx.recv().unwrap();
+        let args = json!({"session_id":t.id,"generation":t.generation,"operation_id":"expired-claim","text":"pwd"});
+        let (mut req, rx) = request(&b, "send_text", args.clone());
+        req.deadline = Instant::now() + Duration::from_millis(25);
+        b.handle(req, |_, _| panic!("expired claim dispatched"));
+        let first = rx.recv().unwrap();
+        lock.join().unwrap();
+        let (req, rx) = request(&b, "send_text", args);
+        b.handle(req, |_, _| panic!("no-effect retry dispatched"));
+        let retry = rx.recv().unwrap().unwrap();
+        assert_eq!(
+            retry["status"], "rejected",
+            "a known no-effect claim must not remain unknown"
+        );
+        assert_eq!(retry["error"], "expired_or_revoked_request_no_effect");
+        assert_eq!(first.unwrap(), retry);
+        assert!(b.records.iter().any(|r| r.id == "expired-claim"
+            && r.outcome.contains("expired_or_revoked_request_no_effect")));
+    }
+    #[test]
     fn list_and_cursor_reads_are_scoped_and_refresh_hidden_screens() {
         let (mut b, t) = setup();
         let other = Target::fixture("not-shared", "generation-2");
@@ -803,6 +867,179 @@ mod integration_tests {
         );
         b.handle(req, |_, _| Ok(()));
         assert!(rx.recv().unwrap().unwrap()["screen"].is_null());
+    }
+}
+
+#[cfg(test)]
+mod guarded_input_tests {
+    use super::*;
+    use runtime::{RuntimeCommandSink as _, RuntimeEventStream as _};
+    use std::{
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        },
+        time::{Duration, Instant},
+    };
+    struct NoSecrets;
+    impl runtime::RuntimeSecretResolver for NoSecrets {
+        fn resolve(&self, _: &str) -> anyhow::Result<runtime::RuntimeSecret> {
+            anyhow::bail!("unused")
+        }
+    }
+    #[test]
+    fn queued_cloud_input_is_cancelled_before_pty_admission() {
+        for action in [
+            "take_control",
+            "unshare",
+            "disable",
+            "rotate",
+            "stop",
+            "generation",
+            "expire",
+            "reenable",
+        ] {
+            let root =
+                std::env::temp_dir().join(format!("deppy-guarded-input-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            let factory = runtime::InProcessRuntimeHostFactory::new(
+                Arc::new(NoSecrets),
+                secret::RedactionService::new(),
+            );
+            let mut host = factory
+                .create_client(runtime::RuntimeHostConfig {
+                    scrollback_policy: None,
+                    output_batch_ms: 5,
+                    logs_root: root.join("logs"),
+                    persist: None,
+                    cwd: Some(root),
+                    extra_env: vec![],
+                })
+                .unwrap();
+            let events = host.subscribe();
+            host.send_command(runtime::RuntimeCommand::SpawnShell {
+                cols: 100,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+            let end = Instant::now() + Duration::from_secs(8);
+            let session = loop {
+                if let Some(session) = events.drain().iter().find_map(|e| match e {
+                    runtime::RuntimeEvent::ShellSpawned { session } => Some(*session),
+                    _ => None,
+                }) {
+                    break session;
+                }
+                assert!(Instant::now() < end, "shell spawn timed out");
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            let armed = Arc::new(AtomicBool::new(false));
+            let a = armed.clone();
+            let (paused, paused_rx) = mpsc::sync_channel(1);
+            let (release, release_rx) = mpsc::sync_channel(1);
+            let release_rx = Mutex::new(release_rx);
+            let gate_events = host.subscribe_with_wake_background(Arc::new(move || {
+                if a.swap(false, Ordering::SeqCst) {
+                    paused.send(()).unwrap();
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap();
+                }
+            }));
+            armed.store(true, Ordering::SeqCst);
+            host.send_command(runtime::RuntimeCommand::SetRemoteViewing {
+                session,
+                viewing: true,
+                ttl_ms: 15000,
+            })
+            .unwrap();
+            paused_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            let mut b = CloudAgent::memory();
+            b.server = Some(Server::start(0, "", || {}).unwrap());
+            let mut t = Target::fixture("guarded-session", "generation-1");
+            t.session = session;
+            b.set_targets(vec![t.clone()]);
+            b.share(&t, true);
+            b.allow_input(&t.id, true);
+            let auth = &b.server.as_ref().unwrap().auth;
+            let epoch = auth
+                .authenticate(&format!("Bearer {}", auth.token_for_user().as_str()), now())
+                .unwrap();
+            let (reply, rx) = mpsc::sync_channel(1);
+            let req = Request {
+                epoch,
+                access_key: None,
+                input_scope: true,
+                deadline: Instant::now()
+                    + if action == "expire" {
+                        Duration::from_millis(25)
+                    } else {
+                        Duration::from_secs(3)
+                    },
+                tool: "send_text".into(),
+                args: json!({"session_id":t.id,"generation":t.generation,"operation_id":"queued-before-revoke","text":"printf 'DEPPY_REVOKED_INPUT\\n'","submit":true}),
+                reply,
+            };
+            b.handle(req, |t, e| match e {
+                Effect::Input {
+                    operation_id,
+                    bytes,
+                    admission,
+                } => host
+                    .send_guarded_input(t.session, operation_id, bytes, admission)
+                    .map_err(|_| "queue rejected".into()),
+                _ => panic!("unexpected watch"),
+            });
+            assert!(rx.try_recv().is_err());
+            match action {
+                "take_control" => b.take_control(),
+                "unshare" => b.share(&t, false),
+                "disable" => b.allow_input(&t.id, false),
+                "rotate" => {
+                    b.action = Some(Action::Rotate);
+                    b.apply_action(&egui::Context::default());
+                }
+                "stop" => {
+                    b.action = Some(Action::Stop);
+                    b.apply_action(&egui::Context::default());
+                }
+                "generation" => {
+                    t.generation = "generation-2".into();
+                    b.set_targets(vec![t.clone()]);
+                }
+                "expire" => std::thread::sleep(Duration::from_millis(40)),
+                "reenable" => {
+                    b.take_control();
+                    b.allow_input(&t.id, true);
+                }
+                _ => unreachable!(),
+            }
+            release.send(()).unwrap();
+            let end = Instant::now() + Duration::from_secs(3);
+            let mut receipt = None;
+            let mut output = false;
+            while Instant::now() < end && receipt.is_none() {
+                let events = gate_events.drain();
+                b.observe_input(t.runtime, &events);
+                output |= events
+                    .iter()
+                    .filter_map(|e| e.viewport())
+                    .any(|(_, snap, _, _)| screen_text(snap).contains("DEPPY_REVOKED_INPUT"));
+                receipt = rx.try_recv().ok();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            host.shutdown();
+            assert_eq!(
+                receipt.unwrap().unwrap()["status"],
+                "rejected",
+                "revocation {action} must cancel the queued input"
+            );
+            assert!(!output, "revocation {action} leaked text to the terminal");
+        }
     }
 }
 
@@ -1067,13 +1304,12 @@ mod http_end_to_end_tests {
                             Effect::Input {
                                 operation_id,
                                 bytes,
+                                admission,
                             } => {
                                 writes += 1;
-                                runtime::RuntimeCommand::WriteInputTracked {
-                                    session: t.session,
-                                    operation_id,
-                                    bytes,
-                                }
+                                return host
+                                    .send_guarded_input(t.session, operation_id, bytes, admission)
+                                    .map_err(|_| "runtime_error".into());
                             }
                             Effect::Watch => runtime::RuntimeCommand::SetRemoteViewing {
                                 session: t.session,

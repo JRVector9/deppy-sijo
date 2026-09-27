@@ -154,6 +154,7 @@ fn pressure_reason(reason: runtime::PtyInputRejectReason) -> &'static str {
         runtime::PtyInputRejectReason::SessionClosed => "closed",
         runtime::PtyInputRejectReason::WriterUnavailable => "unavailable",
         runtime::PtyInputRejectReason::PayloadTooLarge => "too_large",
+        runtime::PtyInputRejectReason::AdmissionDenied => "admission_denied",
     }
 }
 

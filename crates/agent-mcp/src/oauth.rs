@@ -82,9 +82,13 @@ impl OAuth {
         self.access.retain(|_, t| now < t.expires);
         self.refresh.retain(|_, t| now < t.expires);
     }
+    #[cfg(test)]
     pub fn authenticate(&self, token: &str, now: u64) -> Option<bool> {
+        self.authenticate_key(&hash(token), now)
+    }
+    pub fn authenticate_key(&self, key: &str, now: u64) -> Option<bool> {
         self.access
-            .get(&hash(token))
+            .get(key)
             .filter(|a| now < a.expires)
             .map(|a| a.input)
     }
@@ -487,7 +491,7 @@ fn token() -> Zeroizing<String> {
         uuid::Uuid::new_v4().simple()
     ))
 }
-fn hash(s: &str) -> String {
+pub(crate) fn hash(s: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(s.as_bytes()))
 }
 fn valid_redirect(s: &str) -> bool {

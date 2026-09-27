@@ -23932,11 +23932,13 @@ impl App {
                     crate::cloud_agent::Effect::Input {
                         operation_id,
                         bytes,
-                    } => runtime::RuntimeCommand::WriteInputTracked {
-                        operation_id,
-                        session: target.session,
-                        bytes,
-                    },
+                        admission,
+                    } => {
+                        return rt
+                            .runtime
+                            .send_guarded_input(target.session, operation_id, bytes, admission)
+                            .map_err(|_| "runtime_queue_rejected_no_effect".to_string());
+                    }
                     crate::cloud_agent::Effect::Watch => {
                         runtime::RuntimeCommand::SetRemoteViewing {
                             session: target.session,

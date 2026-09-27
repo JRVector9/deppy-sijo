@@ -63,20 +63,21 @@ impl Auth {
     }
     pub fn authenticate(&self, header: &str, time: u64) -> Option<u64> {
         self.authenticate_scoped(header, time)
-            .map(|(epoch, _)| epoch)
+            .map(|(epoch, _, _)| epoch)
     }
-    fn authenticate_scoped(&self, header: &str, time: u64) -> Option<(u64, bool)> {
+    fn authenticate_scoped(&self, header: &str, time: u64) -> Option<(u64, bool, Option<String>)> {
         let supplied = header.strip_prefix("Bearer ")?;
         let c = self.0.lock().ok()?;
         if time >= c.expires || supplied.is_empty() {
             return None;
         }
         if bool::from(c.token.as_bytes().ct_eq(supplied.as_bytes())) {
-            return Some((c.epoch, true));
+            return Some((c.epoch, true, None));
         }
+        let key = crate::oauth::hash(supplied);
         c.oauth
-            .authenticate(supplied, time)
-            .map(|input| (c.epoch, input))
+            .authenticate_key(&key, time)
+            .map(|input| (c.epoch, input, Some(key)))
     }
     pub fn approvals(&self) -> Vec<crate::Approval> {
         let mut c = self.0.lock().unwrap();
@@ -102,9 +103,30 @@ impl Auth {
         c.oauth.route(h, body, base, now(), expiry, headers, wake)
     }
     pub fn current(&self, epoch: u64, time: u64) -> bool {
-        let c = self.0.lock().unwrap();
-        c.epoch == epoch && time < c.expires
+        self.current_access(epoch, None, time)
     }
+    pub fn current_access(&self, epoch: u64, access_key: Option<&str>, time: u64) -> bool {
+        let c = self.0.lock().unwrap();
+        credential_is_current(&c, epoch, access_key, time)
+    }
+    /// Serialize credential replacement/revocation with a short queue admission.
+    /// The callback must not invoke events, user code or authentication again.
+    pub fn admit_current_access(
+        &self,
+        epoch: u64,
+        access_key: Option<&str>,
+        write: &mut dyn FnMut(),
+    ) {
+        let c = self.0.lock().unwrap();
+        if credential_is_current(&c, epoch, access_key, now()) {
+            write();
+        }
+    }
+}
+fn credential_is_current(c: &Credential, epoch: u64, access_key: Option<&str>, time: u64) -> bool {
+    c.epoch == epoch
+        && time < c.expires
+        && access_key.is_none_or(|key| c.oauth.authenticate_key(key, time).is_some())
 }
 fn make_token() -> Zeroizing<String> {
     Zeroizing::new(format!(
@@ -117,6 +139,8 @@ fn make_token() -> Zeroizing<String> {
 // No Debug: args may contain secrets and private answers.
 pub struct Request {
     pub epoch: u64,
+    /// OAuth token fingerprint; manual bearer requests are bound by epoch alone.
+    pub access_key: Option<String>,
     pub input_scope: bool,
     pub deadline: Instant,
     pub tool: String,
@@ -125,7 +149,8 @@ pub struct Request {
 }
 impl Request {
     pub fn live(&self, auth: &Auth) -> bool {
-        Instant::now() < self.deadline && auth.current(self.epoch, now())
+        Instant::now() < self.deadline
+            && auth.current_access(self.epoch, self.access_key.as_deref(), now())
     }
 }
 pub struct Server {
@@ -343,7 +368,7 @@ fn process(
     if head.header_count("authorization") != 1 {
         return Response::plain(401, "bearer_token_required");
     }
-    let Some((epoch, input_scope)) =
+    let Some((epoch, input_scope, access_key)) =
         auth.authenticate_scoped(head.header("authorization").unwrap_or(""), now())
     else {
         return Response::plain(401, "invalid_or_expired_token");
@@ -430,6 +455,7 @@ fn process(
             let (reply, rx) = mpsc::sync_channel(1);
             let req = Request {
                 epoch,
+                access_key,
                 input_scope,
                 deadline: Instant::now() + Duration::from_secs(3),
                 tool: tool.into(),

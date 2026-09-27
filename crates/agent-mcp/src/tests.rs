@@ -28,6 +28,48 @@ fn credentials_expire_and_rotate_without_reusing_authority() {
 }
 
 #[test]
+fn credential_revocation_waits_for_queue_admission_and_blocks_later_writes() {
+    use std::{
+        sync::{Arc, mpsc},
+        time::Duration,
+    };
+    let auth = Arc::new(Auth::new_at(now()));
+    let epoch = auth
+        .authenticate(&format!("Bearer {}", auth.token_for_user().as_str()), now())
+        .unwrap();
+    let (entered, entered_rx) = mpsc::sync_channel(1);
+    let (finish, finish_rx) = mpsc::sync_channel(1);
+    let writer_auth = auth.clone();
+    let writer = std::thread::spawn(move || {
+        writer_auth.admit_current_access(epoch, None, &mut || {
+            entered.send(()).unwrap();
+            finish_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        })
+    });
+    entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let (started, started_rx) = mpsc::sync_channel(1);
+    let (revoked, revoked_rx) = mpsc::sync_channel(1);
+    let revoking_auth = auth.clone();
+    let revoker = std::thread::spawn(move || {
+        started.send(()).unwrap();
+        revoking_auth.revoke();
+        revoked.send(()).unwrap();
+    });
+    started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(
+        revoked_rx.recv_timeout(Duration::from_millis(30)).is_err(),
+        "revoke must not return during an admitted write"
+    );
+    finish.send(()).unwrap();
+    writer.join().unwrap();
+    revoker.join().unwrap();
+    revoked_rx.recv().unwrap();
+    auth.admit_current_access(epoch, None, &mut || {
+        panic!("revoked credential admitted a later write")
+    });
+}
+
+#[test]
 fn claimed_operations_survive_restart_and_cannot_be_reexecuted() {
     let db = History::open_memory().unwrap();
     let args = serde_json::json!({"session_id":"a", "text":"pwd"});
@@ -133,6 +175,161 @@ fn actual_http_auth_origin_initialize_and_answer_tool_discovery() {
         )
         .0,
         401
+    );
+}
+
+#[test]
+fn queued_oauth_request_is_invalid_after_access_refresh() {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Write};
+    fn wire(
+        addr: std::net::SocketAddr,
+        method: &str,
+        path: &str,
+        kind: &str,
+        body: &str,
+        bearer: Option<&str>,
+    ) -> (u16, String) {
+        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let headers=bearer.map(|token|format!("Authorization: Bearer {token}\r\nAccept: application/json, text/event-stream\r\n")).unwrap_or_default();
+        write!(stream,"{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\n{headers}\r\n{body}",body.len()).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        (
+            response.split_whitespace().nth(1).unwrap().parse().unwrap(),
+            response,
+        )
+    }
+    fn body(response: &str) -> Value {
+        serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap()
+    }
+    let server = Server::start(0, "", || {}).unwrap();
+    let addr = server.addr;
+    let (_, r) = wire(
+        addr,
+        "POST",
+        "/oauth/register",
+        "application/json",
+        r#"{"redirect_uris":["https://client.example/callback"]}"#,
+        None,
+    );
+    let client = body(&r)["client_id"].as_str().unwrap().to_owned();
+    let verifier = "v".repeat(43);
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(&verifier));
+    let resource = format!("http://{addr}/mcp");
+    let q = url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs([
+            ("client_id", client.as_str()),
+            ("redirect_uri", "https://client.example/callback"),
+            ("resource", resource.as_str()),
+            ("response_type", "code"),
+            ("code_challenge_method", "S256"),
+            ("code_challenge", challenge.as_str()),
+            ("scope", "deppy.read deppy.input"),
+        ])
+        .finish();
+    assert_eq!(
+        wire(addr, "GET", &format!("/oauth/authorize?{q}"), "", "", None).0,
+        200
+    );
+    let approval = server.auth.approvals().pop().unwrap();
+    assert!(server.auth.approve(&approval.id, true));
+    let (_, r) = wire(
+        addr,
+        "GET",
+        &format!("/oauth/authorize?request={}", approval.id),
+        "",
+        "",
+        None,
+    );
+    let location = r
+        .lines()
+        .find_map(|l| l.strip_prefix("Location: "))
+        .unwrap();
+    let code = url::Url::parse(location)
+        .unwrap()
+        .query_pairs()
+        .find(|(k, _)| k == "code")
+        .unwrap()
+        .1
+        .into_owned();
+    let f = url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs([
+            ("grant_type", "authorization_code"),
+            ("client_id", client.as_str()),
+            ("resource", resource.as_str()),
+            ("redirect_uri", "https://client.example/callback"),
+            ("code", code.as_str()),
+            ("code_verifier", verifier.as_str()),
+        ])
+        .finish();
+    let (_, r) = wire(
+        addr,
+        "POST",
+        "/oauth/token",
+        "application/x-www-form-urlencoded",
+        &f,
+        None,
+    );
+    let tokens = body(&r);
+    let old_access = tokens["access_token"].as_str().unwrap().to_owned();
+    let token_for_request = old_access.clone();
+    let http = std::thread::spawn(move || {
+        wire(addr,"POST","/mcp","application/json",&json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_text","arguments":{}}}).to_string(),Some(&token_for_request))
+    });
+    let pending = server
+        .requests
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    assert!(pending.live(&server.auth));
+    assert!(pending.input_scope);
+    let access_expiry = now() + 3600;
+    assert!(server.auth.current(pending.epoch, access_expiry));
+    assert!(!server.auth.current_access(
+        pending.epoch,
+        pending.access_key.as_deref(),
+        access_expiry
+    ));
+    let f = url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs([
+            ("grant_type", "refresh_token"),
+            ("client_id", client.as_str()),
+            ("resource", resource.as_str()),
+            ("refresh_token", tokens["refresh_token"].as_str().unwrap()),
+            ("scope", "deppy.read"),
+        ])
+        .finish();
+    assert_eq!(
+        wire(
+            addr,
+            "POST",
+            "/oauth/token",
+            "application/x-www-form-urlencoded",
+            &f,
+            None
+        )
+        .0,
+        200
+    );
+    assert!(
+        server
+            .auth
+            .authenticate(&format!("Bearer {old_access}"), now())
+            .is_none()
+    );
+    let live = pending.live(&server.auth);
+    pending
+        .reply
+        .send(Err("expired_or_revoked_request_no_effect".into()))
+        .unwrap();
+    assert_eq!(http.join().unwrap().0, 200);
+    assert!(
+        !live,
+        "a queued request must lose the replaced access token's authority"
     );
 }
 

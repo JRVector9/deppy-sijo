@@ -394,7 +394,35 @@ impl Drop for InProcessRuntimeClient {
 
 impl RuntimeCommandSink for InProcessRuntimeClient {
     fn send_command(&self, command: RuntimeCommand) -> anyhow::Result<()> {
-        let queued = prepare_queued_command(command, &self.command_budget)?;
+        self.enqueue_command(command, None)
+    }
+}
+
+impl InProcessRuntimeClient {
+    pub fn send_guarded_input(
+        &self,
+        session: SessionId,
+        operation_id: String,
+        bytes: Vec<u8>,
+        admission: crate::InputAdmission,
+    ) -> anyhow::Result<()> {
+        self.enqueue_command(
+            RuntimeCommand::WriteInputTracked {
+                session,
+                operation_id,
+                bytes,
+            },
+            Some(admission),
+        )
+    }
+
+    fn enqueue_command(
+        &self,
+        command: RuntimeCommand,
+        admission: Option<crate::InputAdmission>,
+    ) -> anyhow::Result<()> {
+        let mut queued = prepare_queued_command(command, &self.command_budget)?;
+        queued.admission = admission;
         let Some(tx) = self.command_tx.as_ref() else {
             return Err(RuntimeCommandSendError::Disconnected.into());
         };
@@ -643,6 +671,8 @@ impl Drop for RuntimeCommandQueueReservation {
 struct QueuedRuntimeCommand {
     command: RuntimeCommand,
     reservation: RuntimeCommandQueueReservation,
+    // Local-only: never serialize a revocable permission or lose it over a wire.
+    admission: Option<crate::InputAdmission>,
 }
 
 impl QueuedRuntimeCommand {
@@ -650,6 +680,7 @@ impl QueuedRuntimeCommand {
         let Self {
             command,
             reservation,
+            admission: _,
         } = self;
         drop(reservation);
         command
@@ -665,6 +696,7 @@ fn prepare_queued_command(
     Ok(QueuedRuntimeCommand {
         command,
         reservation,
+        admission: None,
     })
 }
 
@@ -1538,7 +1570,7 @@ impl Worker {
             while handled < COMMAND_BURST_CAP {
                 match self.command_rx.try_recv() {
                     Ok(command) => {
-                        self.handle_command(command.into_command());
+                        self.handle_queued_command(command);
                         handled += 1;
                     }
                     Err(TryRecvError::Empty) => break,
@@ -1559,7 +1591,7 @@ impl Worker {
                 // (codex P2). cap은 평시 PTY pump 공정성용이고, 종료 시엔 더 이상
                 // 새 명령이 들어오지 않아 큐가 유한하므로 전량 드레인이 안전하다.
                 while let Ok(command) = self.command_rx.try_recv() {
-                    self.handle_command(command.into_command());
+                    self.handle_queued_command(command);
                 }
                 // 기존 recv_timeout 루프처럼 마지막 command batch 뒤 한 번은 pump해
                 // command 직후 도착한 PTY tail과 status/persistence를 반영하고 종료한다.
@@ -1809,6 +1841,30 @@ impl Worker {
         }
     }
 
+    fn handle_queued_command(&mut self, mut queued: QueuedRuntimeCommand) {
+        let admission = queued.admission.take();
+        let command = queued.into_command();
+        if let Some(admission) = admission {
+            if let RuntimeCommand::WriteInputTracked {
+                session,
+                operation_id,
+                bytes,
+            } = command
+            {
+                let result = self.admit_input_checked(session, &bytes, Some(&admission));
+                self.emit(RuntimeEvent::InputAdmitted {
+                    session,
+                    operation_id,
+                    result,
+                });
+            } else {
+                self.reject_invalid_command(&command);
+            }
+        } else {
+            self.handle_command(command);
+        }
+    }
+
     fn handle_command(&mut self, command: RuntimeCommand) {
         // 하나의 복원 명령이 만든 세션 전체를 집계한 뒤 완료를 알린다.
         self.scrollback_batching = true;
@@ -1825,10 +1881,27 @@ impl Worker {
         session: SessionId,
         bytes: &[u8],
     ) -> Result<(), pty::PtyInputRejectReason> {
+        self.admit_input_checked(session, bytes, None)
+    }
+
+    fn admit_input_checked(
+        &mut self,
+        session: SessionId,
+        bytes: &[u8],
+        admission: Option<&crate::InputAdmission>,
+    ) -> Result<(), pty::PtyInputRejectReason> {
         let Some(active) = self.sessions.get_mut(&session) else {
             return Err(pty::PtyInputRejectReason::SessionClosed);
         };
-        match active.write_input(bytes) {
+        let outcome = if let Some(admission) = admission {
+            admission
+                .admit(|| active.write_input(bytes))
+                .ok_or(pty::PtyInputRejectReason::AdmissionDenied)?
+        } else {
+            active.write_input(bytes)
+        };
+        // The admission lock is gone before detectors/events invoke UI wakes.
+        match outcome {
             Some(pty::PtyInputEnqueueResult::Accepted) => {
                 if let Some(detector) = self.detectors.get_mut(&session) {
                     detector.on_user_input(bytes);
@@ -7877,7 +7950,7 @@ mod tests {
         );
         assert!(!production.contains("try_send(command)"));
         assert!(!production.contains("#[derive(Clone)]\nstruct QueuedRuntimeCommand"));
-        assert!(production.contains("command.into_command()"));
+        assert!(production.contains("queued.into_command()"));
         let queue_preparation = production
             .split("fn prepare_queued_command")
             .nth(1)

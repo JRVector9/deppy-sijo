@@ -54,6 +54,8 @@ pub enum PtyInputRejectReason {
     SessionClosed,
     WriterUnavailable,
     PayloadTooLarge,
+    /// A local admission permit was revoked or expired before the queue write.
+    AdmissionDenied,
 }
 
 #[derive(Clone)]

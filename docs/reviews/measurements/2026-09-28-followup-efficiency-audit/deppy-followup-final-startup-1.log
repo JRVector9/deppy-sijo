@@ -1,0 +1,48 @@
+    Updating crates.io index
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on build directory
+   Compiling deppy-core v0.2.2 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/core)
+   Compiling secret v0.2.2 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/secret)
+   Compiling pty v0.2.2 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/pty)
+   Compiling terminal v0.2.2 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/terminal)
+   Compiling storage-core v0.2.2 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/storage-core)
+   Compiling mcp-store v0.2.2 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/mcp-store)
+   Compiling http-client v0.2.2 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/http-client)
+   Compiling connector-contract v0.2.2 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/connector-contract)
+   Compiling i18n v0.2.2 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/i18n)
+   Compiling platform v0.2.2 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/platform)
+   Compiling mux v0.2.2 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/mux)
+   Compiling persist v0.2.2 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/persist)
+   Compiling audit v0.2.2 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/audit)
+   Compiling auth v0.2.2 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/auth)
+   Compiling mcp v0.2.2 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/mcp)
+   Compiling connector-ui v0.2.2 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/connector-ui)
+   Compiling session v0.2.2 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/session)
+   Compiling storage v0.2.2 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/storage)
+   Compiling connector-service v0.2.2 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/connector-service)
+   Compiling runtime v0.2.2 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/runtime)
+   Compiling web-remote v0.2.2 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/web-remote)
+   Compiling agent-mcp v0.2.2 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/agent-mcp)
+   Compiling deppy-sijo v0.2.2 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 42.92s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-9d6b3d349e936c26)
+
+running 1 test
+address elapsed=3.047s host=pat-tennessee-recently-rebate.trycloudflare.com
+first registration at 3.508s
+probe elapsed=0.067s ready=false
+probe elapsed=0.016s ready=false
+probe elapsed=0.018s ready=false
+probe elapsed=0.018s ready=false
+probe elapsed=0.019s ready=false
+probe elapsed=0.019s ready=false
+probe elapsed=0.022s ready=false
+probe elapsed=0.021s ready=false
+probe elapsed=0.017s ready=false
+probe elapsed=0.900s ready=true
+ready elapsed=13.660s
+test cloud_agent::tunnel::tests::measure_live_automatic_connection_startup ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2393 filtered out; finished in 13.67s

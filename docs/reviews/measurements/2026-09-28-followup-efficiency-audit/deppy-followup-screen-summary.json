@@ -1,0 +1,38 @@
+[
+  {
+    "fixture": "blank",
+    "before_allocations": 565,
+    "after_allocations": 6,
+    "before_requested_bytes": 81528,
+    "after_requested_bytes": 548,
+    "before_median_us": 103.902,
+    "after_median_us": 83.721
+  },
+  {
+    "fixture": "ascii",
+    "before_allocations": 568,
+    "after_allocations": 9,
+    "before_requested_bytes": 157780,
+    "after_requested_bytes": 76800,
+    "before_median_us": 86.015,
+    "after_median_us": 69.368
+  },
+  {
+    "fixture": "cjk",
+    "before_allocations": 568,
+    "after_allocations": 10,
+    "before_requested_bytes": 196030,
+    "after_requested_bytes": 115650,
+    "before_median_us": 80.603,
+    "after_median_us": 59.972
+  },
+  {
+    "fixture": "grapheme",
+    "before_allocations": 402,
+    "after_allocations": 11,
+    "before_requested_bytes": 368324,
+    "after_requested_bytes": 195000,
+    "before_median_us": 214.707,
+    "after_median_us": 179.982
+  }
+]

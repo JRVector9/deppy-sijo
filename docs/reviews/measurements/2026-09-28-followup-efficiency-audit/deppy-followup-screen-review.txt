@@ -1,0 +1,6 @@
+| Priority | Location | Finding | Impact | Next step |
+|---|---|---|---|---|
+| medium | [bench-mcp-screen.py:39](/Users/jr/Desktop/projects/deppy-sijo-performance/scripts/bench-mcp-screen.py:39) | Fixture output is hashed but never checked | Incorrect or empty screen text can pass the allocation assertion | Assert expected output for each fixture |
+| medium | [bench-mcp-screen.py:42](/Users/jr/Desktop/projects/deppy-sijo-performance/scripts/bench-mcp-screen.py:42) | Timed runs still update allocation counters | Counter work skews `mean_us`, especially when comparing allocation changes | Disable counting during timing or label the time as instrumented |
+
+I found no regression in the changed `screen_text` or `grapheme_snapshot_tests` hunks. The row buffer is cleared before reuse; whitespace, control, wide cell, grapheme, empty, and cap behavior remains as before. No tests were run.

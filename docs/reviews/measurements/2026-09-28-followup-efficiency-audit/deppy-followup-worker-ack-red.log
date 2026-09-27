@@ -1,0 +1,25 @@
+   Compiling deppy-sijo v0.2.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.35s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-8da0216105b7ce9c)
+
+running 1 test
+test cloud_agent::tunnel::tests::first_probe_waits_for_server_host_publication ... FAILED
+
+failures:
+
+---- cloud_agent::tunnel::tests::first_probe_waits_for_server_host_publication stdout ----
+first registration at 0.282s
+
+thread 'cloud_agent::tunnel::tests::first_probe_waits_for_server_host_publication' (87022322) panicked at crates/app/src/cloud_agent/tunnel.rs:519:9:
+assertion `left == right` failed: cannot probe before caller publishes the server host
+  left: 1
+ right: 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    cloud_agent::tunnel::tests::first_probe_waits_for_server_host_publication
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2392 filtered out; finished in 0.49s
+
+error: test failed, to rerun pass `-p deppy-sijo --bin deppy-sijo`

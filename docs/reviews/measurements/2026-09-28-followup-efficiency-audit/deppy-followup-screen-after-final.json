@@ -1,0 +1,112 @@
+{
+  "source_commit": "76b326dfbce24de907b83187c9de48ece401df6b",
+  "source_ref": "working-tree",
+  "baseline_ref": "c2be1e79",
+  "function_sha256": "bb873b92406379d36ba96b37d6c31e0deecef695a6f4a9182451b5b84ddee1f6",
+  "terminal_rlib_sha256": "1bfa2bd9c6a74cf13440b532f36e4f779559dbdb6692e8ce1873e1101c94560f",
+  "fixture": "real Alacritty backend 300x80; isolated exact screen_text; System requested allocations; release -O; counters disabled during timing; exact baseline output oracle",
+  "runs": [
+    [
+      {
+        "fixture": "blank",
+        "allocations": 6,
+        "requested_bytes": 548,
+        "output_bytes": 80,
+        "output_hash": "e16b8402dbce37ab",
+        "mean_us": 87.096
+      },
+      {
+        "fixture": "ascii",
+        "allocations": 9,
+        "requested_bytes": 76800,
+        "output_bytes": 23780,
+        "output_hash": "3971939a3cb920da",
+        "mean_us": 66.013
+      },
+      {
+        "fixture": "cjk",
+        "allocations": 10,
+        "requested_bytes": 115650,
+        "output_bytes": 35630,
+        "output_hash": "94918bb9f8171744",
+        "mean_us": 59.672
+      },
+      {
+        "fixture": "grapheme",
+        "allocations": 11,
+        "requested_bytes": 195000,
+        "output_bytes": 64543,
+        "output_hash": "12db5a88b514f065",
+        "mean_us": 174.717
+      }
+    ],
+    [
+      {
+        "fixture": "blank",
+        "allocations": 6,
+        "requested_bytes": 548,
+        "output_bytes": 80,
+        "output_hash": "e16b8402dbce37ab",
+        "mean_us": 83.721
+      },
+      {
+        "fixture": "ascii",
+        "allocations": 9,
+        "requested_bytes": 76800,
+        "output_bytes": 23780,
+        "output_hash": "3971939a3cb920da",
+        "mean_us": 69.368
+      },
+      {
+        "fixture": "cjk",
+        "allocations": 10,
+        "requested_bytes": 115650,
+        "output_bytes": 35630,
+        "output_hash": "94918bb9f8171744",
+        "mean_us": 59.972
+      },
+      {
+        "fixture": "grapheme",
+        "allocations": 11,
+        "requested_bytes": 195000,
+        "output_bytes": 64543,
+        "output_hash": "12db5a88b514f065",
+        "mean_us": 180.24
+      }
+    ],
+    [
+      {
+        "fixture": "blank",
+        "allocations": 6,
+        "requested_bytes": 548,
+        "output_bytes": 80,
+        "output_hash": "e16b8402dbce37ab",
+        "mean_us": 82.698
+      },
+      {
+        "fixture": "ascii",
+        "allocations": 9,
+        "requested_bytes": 76800,
+        "output_bytes": 23780,
+        "output_hash": "3971939a3cb920da",
+        "mean_us": 69.503
+      },
+      {
+        "fixture": "cjk",
+        "allocations": 10,
+        "requested_bytes": 115650,
+        "output_bytes": 35630,
+        "output_hash": "94918bb9f8171744",
+        "mean_us": 65.174
+      },
+      {
+        "fixture": "grapheme",
+        "allocations": 11,
+        "requested_bytes": 195000,
+        "output_bytes": 64543,
+        "output_hash": "12db5a88b514f065",
+        "mean_us": 179.982
+      }
+    ]
+  ]
+}

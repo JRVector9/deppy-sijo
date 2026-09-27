@@ -1,0 +1,3 @@
+No actionable findings in the changed `history.rs` hunks relative to HEAD. The partial index matches the unchanged pruning predicate, and I found no change to tombstone durability or the 100-answer completion order.
+
+This was a source-only review. I did not edit files or run tests, as requested.

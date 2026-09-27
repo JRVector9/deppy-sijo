@@ -1,0 +1,20 @@
+[
+  {
+    "run": 1,
+    "exit_code": 0,
+    "ready_s": 13.66,
+    "log": "/tmp/deppy-followup-final-startup-1.log"
+  },
+  {
+    "run": 2,
+    "exit_code": 0,
+    "ready_s": 21.232,
+    "log": "/tmp/deppy-followup-final-startup-2.log"
+  },
+  {
+    "run": 3,
+    "exit_code": 0,
+    "ready_s": 64.683,
+    "log": "/tmp/deppy-followup-final-startup-3.log"
+  }
+]

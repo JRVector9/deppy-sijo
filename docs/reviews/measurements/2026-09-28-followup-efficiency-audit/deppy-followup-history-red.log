@@ -1,0 +1,142 @@
+    Blocking waiting for file lock on package cache
+    Updating crates.io index
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+   Compiling ring v0.17.14
+   Compiling deppy-core v0.2.2 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/core)
+   Compiling secret v0.2.2 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/secret)
+   Compiling pty v0.2.2 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/pty)
+   Compiling mcp-store v0.2.2 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/mcp-store)
+   Compiling storage-core v0.2.2 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/storage-core)
+   Compiling terminal v0.2.2 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/terminal)
+   Compiling relay-protocol v0.2.2 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/relay-protocol)
+   Compiling mux v0.2.2 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/mux)
+   Compiling audit v0.2.2 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/audit)
+   Compiling persist v0.2.2 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/persist)
+   Compiling rustls-webpki v0.103.13
+   Compiling rcgen v0.14.10
+   Compiling rustls v0.23.43
+   Compiling storage v0.2.2 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/storage)
+   Compiling session v0.2.2 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/session)
+   Compiling tungstenite v0.30.0
+   Compiling ureq v3.4.0
+   Compiling runtime v0.2.2 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/runtime)
+   Compiling web-remote v0.2.2 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/web-remote)
+   Compiling agent-mcp v0.2.2 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/agent-mcp)
+error[E0277]: the trait bound `usize: ToSql` is not satisfied
+   --> crates/agent-mcp/src/history.rs:152:241
+    |
+152 | ....0.execute("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<?1) INSERT INTO operations(id,fingerprint,tool,workspace,session,created,outcome,message) SELECT 'i'||x,X'00','send_text','w','s',0,'{}','' FROM n",[input_count]).u...
+    |       ------- required by a bound introduced by this call                                                                                                                                                                                ^^^^^^^^^^^^^ the trait `ToSql` is not implemented for `usize`
+    |
+    = help: the following other types implement trait `ToSql`:
+              f32
+              f64
+              i16
+              i32
+              i64
+              i8
+              isize
+              u16
+            and 2 others
+    = note: required for `[usize; 1]` to implement `Params`
+note: required by a bound in `Connection::execute`
+   --> /Users/jr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rusqlite-0.40.2/src/lib.rs:620:23
+    |
+620 |     pub fn execute<P: Params>(&self, sql: &str, params: P) -> Result<usize> {
+    |                       ^^^^^^ required by this bound in `Connection::execute`
+
+error[E0277]: the trait bound `usize: FromSql` is not satisfied
+   --> crates/agent-mcp/src/history.rs:187:31
+    |
+187 |                     .get::<_, usize>(0))
+    |                      ---      ^^^^^ the trait `FromSql` is not implemented for `usize`
+    |                      |
+    |                      required by a bound introduced by this call
+    |
+    = help: the following other types implement trait `FromSql`:
+              f32
+              f64
+              i16
+              i32
+              i64
+              i8
+              isize
+              u16
+            and 2 others
+note: required by a bound in `Row::<'_>::get`
+   --> /Users/jr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rusqlite-0.40.2/src/row.rs:285:32
+    |
+285 |     pub fn get<I: RowIndex, T: FromSql>(&self, idx: I) -> Result<T> {
+    |                                ^^^^^^^ required by this bound in `Row::<'_>::get`
+
+error[E0277]: the trait bound `usize: FromSql` is not satisfied
+   --> crates/agent-mcp/src/history.rs:197:36
+    |
+197 |                     |r| r.get::<_, usize>(0)
+    |                           ---      ^^^^^ the trait `FromSql` is not implemented for `usize`
+    |                           |
+    |                           required by a bound introduced by this call
+    |
+    = help: the following other types implement trait `FromSql`:
+              f32
+              f64
+              i16
+              i32
+              i64
+              i8
+              isize
+              u16
+            and 2 others
+note: required by a bound in `Row::<'_>::get`
+   --> /Users/jr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rusqlite-0.40.2/src/row.rs:285:32
+    |
+285 |     pub fn get<I: RowIndex, T: FromSql>(&self, idx: I) -> Result<T> {
+    |                                ^^^^^^^ required by this bound in `Row::<'_>::get`
+
+error[E0277]: the trait bound `usize: FromSql` is not satisfied
+   --> crates/agent-mcp/src/history.rs:209:63
+    |
+209 |                 db.0.query_row("PRAGMA page_count", [], |r| r.get(0))
+    |                                                               ^^^ the trait `FromSql` is not implemented for `usize`
+    |
+    = help: the following other types implement trait `FromSql`:
+              f32
+              f64
+              i16
+              i32
+              i64
+              i8
+              isize
+              u16
+            and 2 others
+note: required by a bound in `Row::<'_>::get`
+   --> /Users/jr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rusqlite-0.40.2/src/row.rs:285:32
+    |
+285 |     pub fn get<I: RowIndex, T: FromSql>(&self, idx: I) -> Result<T> {
+    |                                ^^^^^^^ required by this bound in `Row::<'_>::get`
+
+error[E0277]: the trait bound `usize: FromSql` is not satisfied
+   --> crates/agent-mcp/src/history.rs:212:62
+    |
+212 |                 db.0.query_row("PRAGMA page_size", [], |r| r.get(0))
+    |                                                              ^^^ the trait `FromSql` is not implemented for `usize`
+    |
+    = help: the following other types implement trait `FromSql`:
+              f32
+              f64
+              i16
+              i32
+              i64
+              i8
+              isize
+              u16
+            and 2 others
+note: required by a bound in `Row::<'_>::get`
+   --> /Users/jr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rusqlite-0.40.2/src/row.rs:285:32
+    |
+285 |     pub fn get<I: RowIndex, T: FromSql>(&self, idx: I) -> Result<T> {
+    |                                ^^^^^^^ required by this bound in `Row::<'_>::get`
+
+For more information about this error, try `rustc --explain E0277`.
+error: could not compile `agent-mcp` (lib test) due to 5 previous errors

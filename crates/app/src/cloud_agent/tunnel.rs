@@ -1,5 +1,7 @@
 //! App-owned bundled tunnel companion; no terminal session or AI agent is created.
 
+mod quick_dns;
+
 use std::{
     io::Read,
     path::{Path, PathBuf},
@@ -55,11 +57,7 @@ impl Tunnel {
         timeout: Duration,
         wake: impl Fn() + Send + 'static,
     ) -> std::io::Result<Self> {
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(2)))
-            .max_redirects(0)
-            .build()
-            .into();
+        let agent = metadata_agent();
         Self::start_using_probe(path, port, timeout, wake, move |host| {
             public_metadata_ready(&agent, host)
         })
@@ -206,10 +204,24 @@ fn run(
     };
     let host = Arc::new(Mutex::new(None));
     let address = host.clone();
+    // Only gate the first probe. Later unregister logs cannot undo a healthy
+    // public endpoint, and continuing health is still determined by HTTPS.
+    let registered_once = Arc::new(AtomicBool::new(false));
+    let registration = registered_once.clone();
+    #[cfg(test)]
+    let child_started = Instant::now();
     let reader = match std::thread::Builder::new()
         .name("mcp-tunnel-log".into())
         .spawn(move || {
             read_lines(stderr, |line| {
+                if line.contains("Registered tunnel connection") {
+                    registration.store(true, Ordering::Release);
+                    #[cfg(test)]
+                    eprintln!(
+                        "first registration at {:.3}s",
+                        child_started.elapsed().as_secs_f64()
+                    );
+                }
                 if let Some(value) = generated_host(line) {
                     let mut slot = address.lock().unwrap();
                     if slot.is_none() {
@@ -244,7 +256,9 @@ fn run(
             break Event::Failed("tunnel_timeout");
         }
         if Instant::now() >= next_probe {
-            if let Some(value) = &discovered {
+            if let Some(value) = &discovered
+                && registered_once.load(Ordering::Acquire)
+            {
                 let available = probe(value);
                 if stop.load(Ordering::Acquire) {
                     break Event::Stopped;
@@ -265,6 +279,25 @@ fn run(
     drop(child); // Close the pipe by killing/reaping our exact child before joining reader.
     let _ = reader.join();
     outcome
+}
+
+pub(super) fn metadata_agent() -> ureq::Agent {
+    metadata_agent_with_resolver(quick_dns::QuickResolver::new())
+}
+#[cfg(test)]
+pub(super) fn public_test_agent() -> ureq::Agent {
+    metadata_agent_with_resolver(quick_dns::QuickResolver::with_backup_delay(Duration::ZERO))
+}
+fn metadata_agent_with_resolver(resolver: quick_dns::QuickResolver) -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(2)))
+        .max_redirects(0)
+        .build();
+    ureq::Agent::with_parts(
+        config,
+        ureq::unversioned::transport::DefaultConnector::default(),
+        resolver,
+    )
 }
 
 fn public_metadata_ready(agent: &ureq::Agent, host: &str) -> bool {
@@ -337,6 +370,50 @@ fn read_lines(mut reader: impl Read, mut visit: impl FnMut(&str)) -> std::io::Re
 mod tests {
     use super::*;
     #[test]
+    #[ignore = "opens isolated public tunnel to measure automatic startup"]
+    fn measure_live_automatic_connection_startup() {
+        let server = agent_mcp::Server::start(0, "", || {}).unwrap();
+        let started = Instant::now();
+        let agent = metadata_agent();
+        let mut tunnel = Tunnel::start_using_probe(
+            companion().expect("bundled helper"),
+            server.addr.port(),
+            Duration::from_secs(90),
+            || {},
+            move |host| {
+                let probe_start = Instant::now();
+                let result = public_metadata_ready(&agent, host);
+                eprintln!(
+                    "probe elapsed={:.3}s ready={result}",
+                    probe_start.elapsed().as_secs_f64()
+                );
+                result
+            },
+        )
+        .unwrap();
+        let deadline = started + Duration::from_secs(95);
+        loop {
+            match tunnel.poll() {
+                Some(Event::Address(host)) => {
+                    eprintln!(
+                        "address elapsed={:.3}s host={host}",
+                        started.elapsed().as_secs_f64()
+                    );
+                    server.set_public_host(&host).unwrap();
+                }
+                Some(Event::Ready(_)) => {
+                    eprintln!("ready elapsed={:.3}s", started.elapsed().as_secs_f64());
+                    break;
+                }
+                Some(Event::Failed(code)) => panic!("{code} at {:?}", started.elapsed()),
+                _ => {}
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        tunnel.shutdown();
+    }
+    #[test]
     fn oversized_lines_are_drained_and_next_address_is_observed() {
         let text = format!(
             "{} https://ignored.trycloudflare.com\nhttps://good.trycloudflare.com\n",
@@ -361,6 +438,45 @@ mod tests {
         path
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn first_public_probe_waits_for_initial_tunnel_registration() {
+        let marker =
+            std::env::temp_dir().join(format!("deppy-first-register-{}", uuid::Uuid::new_v4()));
+        let path = fixture(&format!(
+            "printf 'https://fresh.trycloudflare.com\\n' >&2\n/bin/sleep 1.25\n/usr/bin/touch '{}'\nprintf 'Registered tunnel connection\\n' >&2\nexec /bin/sleep 30",
+            marker.display()
+        ));
+        let early = Arc::new(AtomicBool::new(false));
+        let observed = early.clone();
+        let check = marker.clone();
+        let mut tunnel = Tunnel::start_using_probe(
+            path.clone(),
+            8739,
+            Duration::from_secs(3),
+            || {},
+            move |_| {
+                if !check.is_file() {
+                    observed.store(true, Ordering::Release);
+                }
+                true
+            },
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !matches!(tunnel.poll(), Some(Event::Ready(_))) {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        tunnel.shutdown();
+        let was_early = early.load(Ordering::Acquire);
+        std::fs::remove_file(path).unwrap();
+        let _ = std::fs::remove_file(marker);
+        assert!(
+            !was_early,
+            "query before first registration can poison DNS negative cache"
+        );
+    }
     #[cfg(unix)]
     #[test]
     fn cancellation_reaps_only_owned_child_before_startup_finishes() {

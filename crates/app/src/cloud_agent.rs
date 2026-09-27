@@ -1471,16 +1471,18 @@ mod http_end_to_end_tests {
         let client = std::thread::spawn(move || {
             let call = |id, tool, args| {
                 if let Some(url) = &endpoint {
-                    let agent: ureq::Agent = ureq::Agent::config_builder()
-                        .timeout_global(Some(Duration::from_secs(12)))
-                        .build()
-                        .into();
+                    // This client runs on the same Mac whose negative DNS cache
+                    // caused the startup bug; use verified lookup for public tests too.
+                    let agent = super::tunnel::public_test_agent();
                     let request = json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":tool,"arguments":args}}).to_string();
                     let mut response = agent
                         .post(url)
                         .header("Authorization", &format!("Bearer {token}"))
                         .header("Accept", "application/json, text/event-stream")
                         .header("Content-Type", "application/json")
+                        .config()
+                        .timeout_global(Some(Duration::from_secs(12)))
+                        .build()
                         .send(request.as_bytes())
                         .unwrap();
                     serde_json::from_str::<Value>(&response.body_mut().read_to_string().unwrap())

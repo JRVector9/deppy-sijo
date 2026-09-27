@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct NativePrintableKeyDown {
     pub(crate) character: char,
+    /// This physical key was observed after Return in the same drained batch.
+    pub(crate) after_submit: bool,
     observed_at: Instant,
 }
 
@@ -27,6 +29,7 @@ pub(crate) struct NativeKeyDownBatch {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NativeKeyDown {
     Printable(NativePrintableKeyDown),
+    Submit { observed_at: Instant },
     ClipboardPaste { observed_at: Instant },
     ClipboardCopy { observed_at: Instant },
 }
@@ -35,9 +38,9 @@ impl NativeKeyDown {
     fn fresh(self) -> bool {
         match self {
             Self::Printable(key_down) => key_down.fresh(),
-            Self::ClipboardPaste { observed_at } | Self::ClipboardCopy { observed_at } => {
-                observed_at.elapsed() <= NATIVE_KEY_MAX_AGE
-            }
+            Self::Submit { observed_at }
+            | Self::ClipboardPaste { observed_at }
+            | Self::ClipboardCopy { observed_at } => observed_at.elapsed() <= NATIVE_KEY_MAX_AGE,
         }
     }
 }
@@ -47,6 +50,16 @@ impl NativePrintableKeyDown {
     pub(crate) fn for_test(character: char) -> Self {
         Self {
             character,
+            after_submit: false,
+            observed_at: Instant::now(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_after_submit(character: char) -> Self {
+        Self {
+            character,
+            after_submit: true,
             observed_at: Instant::now(),
         }
     }
@@ -78,8 +91,15 @@ fn record(key_down: NativeKeyDown) {
 fn record_printable(character: char) {
     record(NativeKeyDown::Printable(NativePrintableKeyDown {
         character,
+        after_submit: false,
         observed_at: Instant::now(),
     }));
+}
+
+fn record_submit() {
+    record(NativeKeyDown::Submit {
+        observed_at: Instant::now(),
+    });
 }
 
 fn record_clipboard_paste() {
@@ -101,10 +121,19 @@ pub(crate) fn drain() -> NativeKeyDownBatch {
     let Ok(mut key_downs) = queue().lock() else {
         return NativeKeyDownBatch::default();
     };
+    collect_batch(key_downs.drain(..))
+}
+
+fn collect_batch(key_downs: impl IntoIterator<Item = NativeKeyDown>) -> NativeKeyDownBatch {
     let mut batch = NativeKeyDownBatch::default();
-    for key_down in key_downs.drain(..).filter(|key_down| key_down.fresh()) {
+    let mut seen_submit = false;
+    for key_down in key_downs.into_iter().filter(|key_down| key_down.fresh()) {
         match key_down {
-            NativeKeyDown::Printable(key_down) => batch.printable.push(key_down),
+            NativeKeyDown::Printable(mut key_down) => {
+                key_down.after_submit = seen_submit;
+                batch.printable.push(key_down);
+            }
+            NativeKeyDown::Submit { .. } => seen_submit = true,
             NativeKeyDown::ClipboardPaste { .. } => batch.clipboard_paste = true,
             NativeKeyDown::ClipboardCopy { .. } => batch.clipboard_copy = true,
         }
@@ -157,6 +186,15 @@ pub(crate) fn install() {
             record_clipboard_paste();
         } else if native_clipboard_copy_event(event_ref) {
             record_clipboard_copy();
+        } else if matches!(event_ref.keyCode(), 0x24 | 0x4c)
+            && !modifiers.intersects(
+                NSEventModifierFlags::Command
+                    | NSEventModifierFlags::Control
+                    | NSEventModifierFlags::Option
+                    | NSEventModifierFlags::Function,
+            )
+        {
+            record_submit();
         } else if !modifiers.intersects(
             NSEventModifierFlags::Command
                 | NSEventModifierFlags::Control
@@ -363,6 +401,20 @@ mod tests {
         assert!(!is_clipboard_copy_key(0x08, Some("c"), false, false));
         assert!(!is_clipboard_copy_key(0x08, Some("c"), true, true));
         assert!(!is_clipboard_copy_key(0x09, Some("v"), true, false));
+    }
+
+    #[test]
+    fn enter_전후_문장부호의_물리순서를_보존한다() {
+        let batch = collect_batch([
+            NativeKeyDown::Printable(NativePrintableKeyDown::for_test('.')),
+            NativeKeyDown::Submit {
+                observed_at: Instant::now(),
+            },
+            NativeKeyDown::Printable(NativePrintableKeyDown::for_test(',')),
+        ]);
+        assert_eq!(batch.printable.len(), 2);
+        assert!(!batch.printable[0].after_submit);
+        assert!(batch.printable[1].after_submit);
     }
 
     #[cfg(target_os = "macos")]

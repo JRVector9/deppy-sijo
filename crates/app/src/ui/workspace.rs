@@ -19480,16 +19480,60 @@ https://example.test/login \
             assert_eq!(harness.state().0.pending_focus, Some(pane_id("pane")));
             assert!(harness.state().0.preedit.is_empty());
             assert!(written_bytes(drain_protocol(&mut harness.state_mut().0)).is_empty());
-            assert!(
-                harness
-                    .output()
-                    .platform_output
-                    .ime
-                    .as_ref()
-                    .is_none_or(|ime| ime.purpose != egui::IMEPurpose::Terminal
-                        && !ime.should_interrupt_composition)
-            );
+            let ime = harness
+                .output()
+                .platform_output
+                .ime
+                .as_ref()
+                .expect("focused TextEdit candidate output");
+            assert_eq!(ime.purpose, egui::IMEPurpose::Normal);
+            assert!(!ime.should_interrupt_composition);
         }
+    }
+
+    #[test]
+    fn explicit_pane_click_can_claim_focus_during_a_foreign_textedit_ime_batch() {
+        let mut harness = setup_textedit_and_local_pane_harness(SessionId(7));
+        let foreign = egui::Id::new("actual-textedit");
+        harness
+            .ctx
+            .memory_mut(|memory| memory.request_focus(foreign));
+        harness.state_mut().0.pending_focus = Some(pane_id("pane"));
+        let point = harness
+            .output()
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Rect(rect) if rect.fill == renderer_egui::TERMINAL_SURFACE_BG => {
+                    Some(rect.rect.center())
+                }
+                _ => None,
+            })
+            .expect("terminal pane rectangle");
+        harness.input_mut().events.extend([
+            preedit_event("외부조합"),
+            egui::Event::PointerMoved(point),
+            egui::Event::PointerButton {
+                pos: point,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: point,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        harness.run_steps(1);
+        assert_ne!(
+            harness.ctx.memory(|memory| memory.focused()),
+            Some(foreign),
+            "an explicit pane click must still select the terminal"
+        );
+        assert!(harness.state().0.terminal_focus_claimed);
+        assert!(written_bytes(drain_protocol(&mut harness.state_mut().0)).is_empty());
     }
 
     #[test]

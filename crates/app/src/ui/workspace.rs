@@ -7110,7 +7110,21 @@ impl WorkspaceUi {
                 any_blocking_window_visible,
                 terminal_refocus_pending,
             );
-        let preedit_for_frame = terminal_keyboard_active
+        let text_edit_focused_before_draw = ui.ctx().text_edit_focused();
+        // A pending terminal refocus may supersede stale TextEdit focus for
+        // ordinary keys. An IME batch still belongs to that focused TextEdit:
+        // do not paint it, replace its candidate output, or interrupt it while
+        // the later input admission path would reject it.
+        let text_edit_ime_batch = text_edit_focused_before_draw
+            && ui.input(|input| {
+                input
+                    .raw
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, egui::Event::Ime(_)))
+            });
+        let terminal_ime_active = terminal_keyboard_active && !text_edit_ime_batch;
+        let preedit_for_frame = (terminal_ime_active && !text_edit_focused_before_draw)
             .then(|| ui.input(|input| self.preedit.for_frame(session, &input.raw.events)));
         let preedit = preedit_for_frame
             .as_ref()
@@ -7127,7 +7141,7 @@ impl WorkspaceUi {
                 metrics,
                 &mut view.render_cache,
                 preedit,
-                terminal_keyboard_active,
+                terminal_ime_active,
                 selection_range,
                 view.snapshot_gen,
             )
@@ -7520,7 +7534,7 @@ impl WorkspaceUi {
                 .any(is_blocking_terminal_window)
         });
         let terminal_accepts_ime_events = terminal_accepts_ime_events(
-            terminal_keyboard_active,
+            terminal_ime_active,
             terminal_owns_ime_events,
             self.preedit.is_active_for(session),
             renderer_egui::frame_has_active_preedit(ui.ctx()),
@@ -19378,6 +19392,51 @@ https://example.test/login \
             "x".repeat(47),
             "48-char limit must not cut a sparse cluster in the middle"
         );
+    }
+
+    #[test]
+    fn pending_terminal_refocus_cannot_project_a_focused_textedit_preedit() {
+        for event in [preedit_event("외부조합"), commit_event("외부조합")] {
+            let mut harness = setup_focused_local_pane_harness(SessionId(7));
+            let foreign = egui::Id::new("focused-textedit");
+            egui::text_edit::TextEditState::default().store(&harness.ctx, foreign);
+            harness
+                .ctx
+                .memory_mut(|memory| memory.request_focus(foreign));
+            harness.state_mut().pending_focus = Some(pane_id("pane"));
+            assert!(harness.ctx.text_edit_focused());
+            harness.input_mut().events.push(event);
+            harness.run_steps(1);
+            assert!(
+                !harness
+                    .output()
+                    .shapes
+                    .iter()
+                    .any(|shape| matches!(&shape.shape,
+            egui::Shape::Text(text) if text.galley.text() == "외부조합")),
+                "a TextEdit-owned preedit must not be projected into the terminal"
+            );
+            assert!(
+                harness.output().platform_output.ime.is_none(),
+                "the terminal must not replace the focused TextEdit candidate output"
+            );
+            assert!(harness.state().preedit.is_empty());
+            assert!(written_bytes(drain_protocol(harness.state_mut())).is_empty());
+        }
+    }
+    #[test]
+    fn pending_terminal_refocus_still_recovers_the_first_ascii_key_from_stale_textedit_focus() {
+        let mut harness = setup_focused_local_pane_harness(SessionId(7));
+        let stale = egui::Id::new("stale-textedit");
+        egui::text_edit::TextEditState::default().store(&harness.ctx, stale);
+        harness.ctx.memory_mut(|memory| memory.request_focus(stale));
+        harness.state_mut().pending_focus = Some(pane_id("pane"));
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::Text(".".into()));
+        harness.run_steps(1);
+        assert_eq!(written_bytes(drain_protocol(harness.state_mut())), b".");
     }
 
     #[test]

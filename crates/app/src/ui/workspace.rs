@@ -7420,6 +7420,10 @@ impl WorkspaceUi {
         if input_enabled
             && mode.is_local()
             && focused
+            // Share the same ownership gate as preview, candidate output and
+            // input admission. Keep automatic refocus pending for a TextEdit
+            // IME batch; explicit pane clicks below still claim focus directly.
+            && !text_edit_ime_batch
             && self.pending_focus.as_ref() == Some(pane_id)
         {
             let app_armed = self.explicit_pending_focus.as_ref() == Some(pane_id);
@@ -19314,6 +19318,39 @@ https://example.test/login \
         harness
     }
 
+    fn setup_textedit_and_local_pane_harness(
+        session: SessionId,
+    ) -> egui_kittest::Harness<'static, (WorkspaceUi, String)> {
+        let catalog = catalog();
+        let config = TerminalConfig::default();
+        let target = pane_id("pane");
+        let mut workspace = WorkspaceUi::new();
+        workspace.mux = Some(mux(
+            "primary",
+            vec![tab(
+                "primary",
+                vec![pane("pane", session)],
+                LayoutNode::Pane(target.clone()),
+            )],
+            "pane",
+        ));
+        workspace.last_focused_pane = Some(target.clone());
+        workspace.pending_focus = Some(target);
+        workspace.sessions.entry(session).or_default().snapshot = Some(snapshot("ready"));
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, state: &mut (WorkspaceUi, String)| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut state.1).id(egui::Id::new("actual-textedit")),
+                );
+                state.0.show_with_input(ui, &config, &[], &catalog, true);
+            },
+            (workspace, String::new()),
+        );
+        harness.run();
+        drain_protocol(&mut harness.state_mut().0);
+        harness
+    }
+
     fn setup_focused_local_pane_drop_harness(
         session: SessionId,
     ) -> egui_kittest::Harness<'static, (WorkspaceUi, WorkspaceSurfaceOutput)> {
@@ -19424,6 +19461,54 @@ https://example.test/login \
             assert!(written_bytes(drain_protocol(harness.state_mut())).is_empty());
         }
     }
+    #[test]
+    fn pending_refocus_keeps_actual_textedit_focus_for_the_complete_ime_batch() {
+        for event in [preedit_event("외부조합"), commit_event("외부조합")] {
+            let mut harness = setup_textedit_and_local_pane_harness(SessionId(7));
+            let foreign = egui::Id::new("actual-textedit");
+            harness
+                .ctx
+                .memory_mut(|memory| memory.request_focus(foreign));
+            harness.state_mut().0.pending_focus = Some(pane_id("pane"));
+            harness.input_mut().events.push(event);
+            harness.run_steps(1);
+            assert_eq!(
+                harness.ctx.memory(|memory| memory.focused()),
+                Some(foreign),
+                "a deferred pane refocus must not steal the TextEdit's IME focus"
+            );
+            assert_eq!(harness.state().0.pending_focus, Some(pane_id("pane")));
+            assert!(harness.state().0.preedit.is_empty());
+            assert!(written_bytes(drain_protocol(&mut harness.state_mut().0)).is_empty());
+            assert!(
+                harness
+                    .output()
+                    .platform_output
+                    .ime
+                    .as_ref()
+                    .is_none_or(|ime| ime.purpose != egui::IMEPurpose::Terminal
+                        && !ime.should_interrupt_composition)
+            );
+        }
+    }
+
+    #[test]
+    fn pending_refocus_is_consumed_after_a_textedit_commit_batch_has_finished() {
+        let mut harness = setup_textedit_and_local_pane_harness(SessionId(7));
+        let foreign = egui::Id::new("actual-textedit");
+        harness
+            .ctx
+            .memory_mut(|memory| memory.request_focus(foreign));
+        harness.state_mut().0.pending_focus = Some(pane_id("pane"));
+        harness.input_mut().events.push(commit_event("외부조합"));
+        harness.run_steps(1);
+        assert_eq!(harness.ctx.memory(|memory| memory.focused()), Some(foreign));
+        harness.run_steps(1); // Commit is finished; apply the queued pane intent once.
+        assert_ne!(harness.ctx.memory(|memory| memory.focused()), Some(foreign));
+        assert!(harness.state().0.pending_focus.is_none());
+        assert!(written_bytes(drain_protocol(&mut harness.state_mut().0)).is_empty());
+    }
+
     #[test]
     fn pending_terminal_refocus_still_recovers_the_first_ascii_key_from_stale_textedit_focus() {
         let mut harness = setup_focused_local_pane_harness(SessionId(7));

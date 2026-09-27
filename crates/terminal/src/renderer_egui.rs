@@ -847,6 +847,11 @@ fn build_row_cache(
     let mut text_runs = Vec::new();
     let mut pending = PendingTextRun::default();
     for (col, term_cell) in cells.iter().enumerate() {
+        // A trailing spacer belongs to the preceding wide glyph and must not
+        // interrupt its run. A leading wrap filler has no owner on this row.
+        if term_cell.wide_spacer && col > 0 && cells[col - 1].wide {
+            continue;
+        }
         if term_cell.wide_spacer || term_cell.c == ' ' {
             pending.flush(
                 &mut text_runs,
@@ -860,7 +865,11 @@ fn build_row_cache(
 
         let fg = rgb(term_cell.fg);
         let attrs = term_cell.attrs;
-        if term_cell.wide {
+        let width_cols = if term_cell.wide { 2 } else { 1 };
+        // Width-class boundaries keep the fitting contract uniform. epaint
+        // handles fallback fonts inside a galley; each scalar still receives
+        // the terminal's exact one/two-cell advance below.
+        if pending.needs_flush(col, fg, attrs, width_cols) {
             pending.flush(
                 &mut text_runs,
                 painter,
@@ -868,29 +877,10 @@ fn build_row_cache(
                 bold_family_ready,
                 cell_width,
             );
-            let text = display_char(term_cell.c).to_string();
-            text_runs.push(RowTextRun {
-                col,
-                galley: fit_galley_to_cells(
-                    layout_attr_text(painter, text, font_id, fg, attrs, bold_family_ready),
-                    cell_width * 2.0,
-                ),
-                color: fg,
-                scaled: None,
-            });
-        } else {
-            if pending.needs_flush(col, fg, attrs) {
-                pending.flush(
-                    &mut text_runs,
-                    painter,
-                    font_id,
-                    bold_family_ready,
-                    cell_width,
-                );
-            }
-            pending.push(col, display_char(term_cell.c), fg, attrs);
         }
+        pending.push(col, display_char(term_cell.c), fg, attrs, width_cols);
     }
+
     pending.flush(
         &mut text_runs,
         painter,
@@ -915,23 +905,41 @@ struct PendingTextRun {
     /// run은 색뿐 아니라 **속성이 같을 때만** 이어진다 (B-1).
     attrs: CellAttrs,
     text: String,
+    width_cols: usize,
 }
 
 impl PendingTextRun {
-    fn needs_flush(&self, col: usize, color: egui::Color32, attrs: CellAttrs) -> bool {
+    fn needs_flush(
+        &self,
+        col: usize,
+        color: egui::Color32,
+        attrs: CellAttrs,
+        width_cols: usize,
+    ) -> bool {
         self.color.is_some()
-            && (self.color != Some(color) || self.attrs != attrs || self.next_col != col)
+            && (self.color != Some(color)
+                || self.attrs != attrs
+                || self.next_col != col
+                || self.width_cols != width_cols)
     }
 
-    fn push(&mut self, col: usize, ch: char, color: egui::Color32, attrs: CellAttrs) {
+    fn push(
+        &mut self,
+        col: usize,
+        ch: char,
+        color: egui::Color32,
+        attrs: CellAttrs,
+        width_cols: usize,
+    ) {
         if self.color.is_none() {
             self.start_col = col;
             self.next_col = col;
             self.color = Some(color);
             self.attrs = attrs;
+            self.width_cols = width_cols;
         }
         self.text.push(ch);
-        self.next_col = col + 1;
+        self.next_col = col + width_cols;
     }
 
     fn flush(
@@ -954,7 +962,7 @@ impl PendingTextRun {
             col: self.start_col,
             galley: fit_galley_to_cells(
                 layout_attr_text(painter, text, font_id, color, attrs, bold_family_ready),
-                cell_width,
+                cell_width * self.width_cols as f32,
             ),
             color,
             scaled: None,
@@ -1681,6 +1689,47 @@ mod tests {
     }
 
     #[test]
+    fn cjk_runs_batch_owned_spacers_and_preserve_two_cell_advances() {
+        let snapshot = backend_snap("한글가나다");
+        let ctx = egui::Context::default();
+        let mut cache = TerminalRenderCache::default();
+        draw_for_test(&ctx, &mut cache, &snapshot);
+        let row = cache.rows_cache[0].as_ref().unwrap();
+        assert_eq!(
+            row.text_runs.len(),
+            1,
+            "same-style CJK should share a galley"
+        );
+        let galley = &row.text_runs[0].galley;
+        let glyphs = &galley.rows[0].glyphs;
+        let width = glyphs[0].advance_width;
+        for (index, glyph) in glyphs.iter().enumerate() {
+            assert!((glyph.pos.x - index as f32 * width).abs() < 0.01);
+        }
+        assert_eq!(selection_text(&snapshot, 0, 9), "한글가나다");
+    }
+
+    #[test]
+    fn cjk_runs_stop_at_ascii_style_and_unowned_spacer_boundaries() {
+        let snapshot = backend_snap("한글A가나\x1b[31m다라");
+        let ctx = egui::Context::default();
+        let mut cache = TerminalRenderCache::default();
+        draw_for_test(&ctx, &mut cache, &snapshot);
+        let row = cache.rows_cache[0].as_ref().unwrap();
+        assert_eq!(
+            row.text_runs.iter().map(|run| run.col).collect::<Vec<_>>(),
+            vec![0, 4, 5, 9]
+        );
+        assert_eq!(
+            row.text_runs
+                .iter()
+                .map(|run| run.galley.text())
+                .collect::<Vec<_>>(),
+            vec!["한글", "A", "가나", "다라"]
+        );
+    }
+
+    #[test]
     fn terminal_좌우_내부여백은_각각_3픽셀이다() {
         assert_eq!(HORIZONTAL_PADDING, 3.0);
         assert_eq!(grid_width_for_available(100.0), 94.0);
@@ -1706,12 +1755,10 @@ mod tests {
         .drop_without_applying_deltas();
 
         let (rect, origin, cell) = measured.expect("terminal should be rendered");
-        let grid_right = origin.x + cell.x * snapshot.cols as f32;
+        let content = terminal_content_rect(rect);
         assert!((origin.x - rect.left() - 3.0).abs() < f32::EPSILON);
-        assert!(
-            (rect.right() - grid_right - 3.0).abs() < 0.01,
-            "rect={rect:?}, origin={origin:?}, cell={cell:?}, grid_right={grid_right}"
-        );
+        assert!((rect.right() - content.right() - 3.0).abs() < 0.01);
+        assert!(origin.x + cell.x * snapshot.cols as f32 <= content.right());
     }
 
     #[test]

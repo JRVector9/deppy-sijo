@@ -269,18 +269,16 @@ impl OAuth {
                         return error(400, "authorization_expired");
                     };
                     if p.denied || p.approved.is_some() {
-                        let p = self.pending.remove(id).unwrap();
-                        let mut redirect = url::Url::parse(&p.flow.redirect).unwrap();
-                        {
-                            let mut qs = redirect.query_pairs_mut();
-                            if p.denied {
-                                qs.append_pair("error", "access_denied");
-                            } else {
-                                qs.append_pair("code", p.approved.as_ref().unwrap());
-                            }
-                            qs.append_pair("state", &p.flow.state);
+                        let location = redirect_location(
+                            &p.flow.redirect,
+                            &p.flow.state,
+                            p.approved.as_deref().map(String::as_str),
+                        );
+                        if location.len() > web_remote::http::MAX_RESPONSE_HEADER_VALUE_BYTES {
+                            return error(400, "invalid_redirect_size");
                         }
-                        headers.push(("Location".into(), redirect.to_string()));
+                        self.pending.remove(id);
+                        headers.push(("Location".into(), location));
                         return Response::plain(303, "");
                     }
                     return waiting(id);
@@ -310,6 +308,14 @@ impl OAuth {
                 {
                     return error(400, "invalid_scope");
                 }
+                let state = q.get("state").cloned().unwrap_or_default();
+                // Codes are two simple UUIDs (64 ASCII bytes). Validate the final
+                // encoded Location before asking the owner to approve this flow.
+                if redirect_location(&redirect, &state, Some(&"0".repeat(64))).len()
+                    > web_remote::http::MAX_RESPONSE_HEADER_VALUE_BYTES
+                {
+                    return error(400, "invalid_redirect_size");
+                }
                 if self.pending.len() >= 16 {
                     return error(503, "approval_capacity");
                 }
@@ -321,7 +327,7 @@ impl OAuth {
                             client: q["client_id"].clone(),
                             redirect,
                             resource,
-                            state: q.get("state").cloned().unwrap_or_default(),
+                            state,
                             challenge,
                             input: scopes.contains(&"deppy.input"),
                             expires: (now + 300).min(expires),
@@ -346,7 +352,7 @@ impl OAuth {
                 if !self.clients.contains_key(&client) || q.get("resource") != Some(&resource) {
                     return error(400, "invalid_grant");
                 }
-                let (input, expiry, code_key, refresh_key, replaced_access) = match q
+                let (input, refresh_input, expiry, code_key, refresh_key, replaced_access) = match q
                     .get("grant_type")
                     .map(String::as_str)
                 {
@@ -371,7 +377,7 @@ impl OAuth {
                         if self.access.len() >= 32 || self.refresh.len() >= 32 {
                             return error(503, "token_capacity");
                         }
-                        (f.input, expires, Some(key), None, None)
+                        (f.input, f.input, expires, Some(key), None, None)
                     }
                     Some("refresh_token") => {
                         let key = hash(q.get("refresh_token").map(String::as_str).unwrap_or(""));
@@ -381,22 +387,28 @@ impl OAuth {
                         if r.client != client || r.resource != resource {
                             return error(400, "invalid_grant");
                         }
-                        if let Some(scope) = q.get("scope")
-                            && scope
-                                != if r.input {
-                                    "deppy.read deppy.input"
-                                } else {
-                                    "deppy.read"
+                        let input = match q.get("scope") {
+                            None => r.input,
+                            Some(scope) => {
+                                let scopes: Vec<_> = scope.split_whitespace().collect();
+                                if !scopes.contains(&"deppy.read")
+                                    || scopes
+                                        .iter()
+                                        .any(|s| !matches!(*s, "deppy.read" | "deppy.input"))
+                                    || (!r.input && scopes.contains(&"deppy.input"))
+                                {
+                                    return error(400, "invalid_scope");
                                 }
-                        {
-                            return error(400, "invalid_scope");
-                        }
+                                scopes.contains(&"deppy.input")
+                            }
+                        };
                         if self.access.len() - usize::from(self.access.contains_key(&r.access_key))
                             >= 32
                         {
                             return error(503, "token_capacity");
                         }
                         (
+                            input,
                             r.input,
                             r.expires,
                             None,
@@ -442,7 +454,7 @@ impl OAuth {
                     Refresh {
                         client,
                         resource,
-                        input,
+                        input: refresh_input,
                         expires: expiry,
                         access_key: hash(&access),
                         _lease: lease,
@@ -455,6 +467,18 @@ impl OAuth {
             _ => error(404, "not_found"),
         }
     }
+}
+fn redirect_location(redirect: &str, state: &str, code: Option<&str>) -> String {
+    let mut url = url::Url::parse(redirect).expect("registered redirect");
+    {
+        let mut query = url.query_pairs_mut();
+        query.append_pair(
+            if code.is_some() { "code" } else { "error" },
+            code.unwrap_or("access_denied"),
+        );
+        query.append_pair("state", state);
+    }
+    url.into()
 }
 fn token() -> Zeroizing<String> {
     Zeroizing::new(format!(
@@ -557,6 +581,9 @@ mod tests {
         serde_json::from_slice(&r.body).unwrap()
     }
     fn issue(o: &mut OAuth, client: &str, id: &str) -> Value {
+        issue_scoped(o, client, id, false)
+    }
+    fn issue_scoped(o: &mut OAuth, client: &str, id: &str, input: bool) -> Value {
         let verifier = "x".repeat(43);
         o.codes.insert(
             hash(id),
@@ -566,7 +593,7 @@ mod tests {
                 resource: "https://deppy.example/mcp".into(),
                 state: String::new(),
                 challenge: URL_SAFE_NO_PAD.encode(Sha256::digest(&verifier)),
-                input: false,
+                input,
                 expires: 200,
             },
         );
@@ -590,6 +617,153 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned()
+    }
+    #[test]
+    fn redirect_bounds_reject_before_consent_and_allow_encoded_state() {
+        let mut o = OAuth::new(secret::RedactionService::new());
+        let prefix = "https://client.example/";
+        let redirect = format!("{prefix}{}", "x".repeat(2048 - prefix.len()));
+        let registration =
+            json!({"redirect_uris":[redirect,"https://client.example/callback"]}).to_string();
+        let client = json_body(route(&mut o, "POST", "/oauth/register", "", &registration, 100).0)
+            ["client_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest("x".repeat(43)));
+        let state = "~".repeat(2048);
+        let query = |redirect: &str| {
+            format!(
+                "client_id={client}&redirect_uri={redirect}&resource=https://deppy.example/mcp&response_type=code&code_challenge_method=S256&code_challenge={challenge}&state={state}"
+            )
+        };
+        assert_eq!(
+            route(
+                &mut o,
+                "GET",
+                "/oauth/authorize",
+                &query(&redirect),
+                "",
+                101
+            )
+            .0
+            .status,
+            400
+        );
+        assert!(
+            o.approvals(101).is_empty(),
+            "oversized redirects must not solicit consent"
+        );
+        for (allow, time) in [(true, 102), (false, 104)] {
+            assert_eq!(
+                route(
+                    &mut o,
+                    "GET",
+                    "/oauth/authorize",
+                    &query("https://client.example/callback"),
+                    "",
+                    time
+                )
+                .0
+                .status,
+                200
+            );
+            let approval = o.approvals(time).pop().unwrap();
+            assert!(o.approve(&approval.id, allow, time));
+            let (r, h) = route(
+                &mut o,
+                "GET",
+                "/oauth/authorize",
+                &format!("request={}", approval.id),
+                "",
+                time + 1,
+            );
+            assert_eq!(r.status, 303);
+            let location = &h.iter().find(|(k, _)| k == "Location").unwrap().1;
+            let parsed = url::Url::parse(location).unwrap();
+            assert!(
+                parsed
+                    .query_pairs()
+                    .any(|(k, v)| k == "state" && v == state)
+            );
+            assert!(
+                parsed
+                    .query_pairs()
+                    .any(|(k, _)| k == if allow { "code" } else { "error" })
+            );
+            let mut response = Vec::new();
+            web_remote::http::write_response_with_headers(&mut response, &r, &h).unwrap();
+            assert!(response.starts_with(b"HTTP/1.1 303"));
+        }
+    }
+    #[test]
+    fn refresh_scope_order_and_subset_preserve_original_refresh_grant() {
+        let mut o = OAuth::new(secret::RedactionService::new());
+        let client = registered(&mut o);
+        let mut tokens = issue_scoped(&mut o, &client, "input-code", true);
+        for (scope, time, input) in [
+            (Some("deppy.input deppy.read"), 103, true),
+            (Some("deppy.read"), 104, false),
+            (None, 105, true),
+        ] {
+            let mut form = url::form_urlencoded::Serializer::new(String::new());
+            form.extend_pairs([
+                ("grant_type", "refresh_token"),
+                ("client_id", &client),
+                ("resource", "https://deppy.example/mcp"),
+                ("refresh_token", tokens["refresh_token"].as_str().unwrap()),
+            ]);
+            if let Some(scope) = scope {
+                form.append_pair("scope", scope);
+            }
+            let (r, _) = route(&mut o, "POST", "/oauth/token", "", &form.finish(), time);
+            assert_eq!(r.status, 200, "valid refresh scope {scope:?}");
+            tokens = json_body(r);
+            assert_eq!(
+                o.authenticate(tokens["access_token"].as_str().unwrap(), time),
+                Some(input)
+            );
+            assert_eq!(
+                tokens["scope"],
+                if input {
+                    "deppy.read deppy.input"
+                } else {
+                    "deppy.read"
+                }
+            );
+        }
+    }
+    #[test]
+    fn refresh_scope_rejects_expansion_and_unknown_without_consuming_grant() {
+        let mut o = OAuth::new(secret::RedactionService::new());
+        let client = registered(&mut o);
+        let tokens = issue(&mut o, &client, "read-code");
+        for scope in [
+            "deppy.read deppy.input",
+            "deppy.read unknown",
+            "deppy.input",
+            "",
+        ] {
+            let form = url::form_urlencoded::Serializer::new(String::new())
+                .extend_pairs([
+                    ("grant_type", "refresh_token"),
+                    ("client_id", &client),
+                    ("resource", "https://deppy.example/mcp"),
+                    ("refresh_token", tokens["refresh_token"].as_str().unwrap()),
+                    ("scope", scope),
+                ])
+                .finish();
+            assert_eq!(
+                route(&mut o, "POST", "/oauth/token", "", &form, 103)
+                    .0
+                    .status,
+                400
+            );
+            assert!(
+                o.refresh
+                    .contains_key(&hash(tokens["refresh_token"].as_str().unwrap()))
+            );
+        }
     }
     #[test]
     fn refresh_replaces_its_access_slot_at_full_capacity() {

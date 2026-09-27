@@ -9,6 +9,8 @@ use std::io::{BufRead, Write};
 pub const MAX_HEAD_BYTES: usize = 8 * 1024;
 /// 헤더 개수 상한.
 pub const MAX_HEADERS: usize = 64;
+/// Per-value bound shared with callers constructing redirects/challenges.
+pub const MAX_RESPONSE_HEADER_VALUE_BYTES: usize = 8192;
 /// 기본 POST 본문 상한 — 웹푸시 구독 JSON(P4) 등 작은 JSON 본문용. (endpoint URL +
 /// p256dh/auth base64url ≈ 수백 바이트.) 초과는 413. `/upload`(P6d)만 `upload::MAX_UPLOAD_BYTES`로
 /// 별도 상한을 쓴다(lib.rs handle_connection이 경로별로 분기).
@@ -193,7 +195,7 @@ pub fn write_response_with_headers(
         || headers.iter().any(|(k, v)| {
             k.is_empty()
                 || !k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-                || v.len() > 8192
+                || v.len() > MAX_RESPONSE_HEADER_VALUE_BYTES
                 || v.contains(['\r', '\n'])
         })
     {

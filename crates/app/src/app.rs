@@ -43528,6 +43528,7 @@ mod tests {
                     visible: false,
                 },
                 visible_cells: Vec::new().into(),
+                graphemes: Default::default(),
                 dirty_ranges: Vec::new(),
                 title: Some(title.to_owned()),
                 scroll_offset: 0,

@@ -572,7 +572,7 @@ pub fn screen_text(s: &terminal::TerminalViewportSnapshot) -> String {
                 continue;
             }
             if !c.c.is_control() {
-                line.push(c.c);
+                s.push_cell_text(row_index * s.cols as usize + col, &mut line);
             }
             if out.len() + line.len() > MAX_SCREEN {
                 return out;
@@ -586,6 +586,22 @@ pub fn screen_text(s: &terminal::TerminalViewportSnapshot) -> String {
     }
     out
 }
+#[cfg(test)]
+mod grapheme_snapshot_tests {
+    #[test]
+    fn cloud_screen_text_preserves_non_composable_graphemes() {
+        use terminal::TerminalBackend;
+        for text in ["가ᇹ", "a\u{301}\u{308}"] {
+            let mut backend = terminal::AlacrittyBackend::new(20, 3, 10);
+            backend.feed(text.as_bytes()).unwrap();
+            assert_eq!(
+                super::screen_text(&backend.viewport_snapshot().unwrap()).trim_end(),
+                text
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 impl Target {
     fn fixture(id: &str, generation: &str) -> Self {

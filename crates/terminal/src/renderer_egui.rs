@@ -732,7 +732,17 @@ pub fn draw_with_preedit(
     // TUI(claude 등)는 리드로우마다 커서를 숨겼다 켜므로(?25l/?25h) 커서 가시성에
     // 묶으면 조합이 자모 단위로 끊긴다 (2026-07-14 사용자: "ㄹㅗ" 분리).
     if maintains_ime_composition {
-        let mut ime_cursor = egui::Rect::from_min_size(cursor_pos, cell);
+        let clip = painter.clip_rect();
+        let ime_cell = egui::vec2(cell.x.min(clip.width()), cell.y.min(clip.height()));
+        let ime_pos = egui::pos2(
+            cursor_pos
+                .x
+                .clamp(clip.left(), (clip.right() - ime_cell.x).max(clip.left())),
+            cursor_pos
+                .y
+                .clamp(clip.top(), (clip.bottom() - ime_cell.y).max(clip.top())),
+        );
+        let mut ime_cursor = egui::Rect::from_min_size(ime_pos, ime_cell);
         if let Some(preedit) = preedit.filter(|preedit| !preedit.text.is_empty()) {
             let galley =
                 painter.layout_no_wrap(preedit.text.to_owned(), font_id, egui::Color32::BLACK);
@@ -744,8 +754,7 @@ pub fn draw_with_preedit(
             let caret = galley.pos_from_cursor(egui::text::CCursor::new(
                 active.as_ref().map_or(0, |range| range.end),
             ));
-            let clip = painter.clip_rect();
-            let mut text_pos = cursor_pos + egui::vec2(0.0, text_dy);
+            let mut text_pos = ime_pos + egui::vec2(0.0, text_dy);
             // Shift short compositions left at the pane edge. For a longer
             // composition, scroll its visual window so the internal caret fits.
             if galley.rect.width() <= clip.width() {
@@ -783,11 +792,8 @@ pub fn draw_with_preedit(
                 clip.left(),
                 (clip.right() - cell.x.min(clip.width())).max(clip.left()),
             );
-            ime_cursor = egui::Rect::from_min_size(
-                egui::pos2(caret_x, cursor_pos.y),
-                egui::vec2(cell.x.min(clip.width()), cell.y),
-            )
-            .intersect(clip);
+            ime_cursor =
+                egui::Rect::from_min_size(egui::pos2(caret_x, ime_pos.y), ime_cell).intersect(clip);
             painter.galley(text_pos, galley, egui::Color32::BLACK);
             painter.line_segment(
                 [background.left_bottom(), background.right_bottom()],
@@ -1949,6 +1955,23 @@ mod tests {
         assert!((origin.x - rect.left() - 3.0).abs() < f32::EPSILON);
         assert!((rect.right() - content.right() - 3.0).abs() < 0.01);
         assert!(origin.x + cell.x * snapshot.cols as f32 <= content.right());
+    }
+
+    #[test]
+    fn ime_preedit_candidate_fits_when_stale_rows_exceed_pane_height() {
+        let mut snapshot = snap(8, 20, &[]);
+        snapshot.cursor.col = 7;
+        snapshot.cursor.row = 19;
+        let ctx = egui::Context::default();
+        let mut cache = TerminalRenderCache::default();
+        let drawn = draw_in_pane(&ctx, &mut cache, &snapshot, 80.0, next_gen(), None, None);
+        let cursor = drawn.ime_cursor_rect.unwrap();
+        assert!(
+            cursor.width() > 0.0 && cursor.height() > 0.0 && drawn.rect.contains_rect(cursor),
+            "candidate rect must stay valid inside a shorter pane: {cursor:?}, {:?}",
+            drawn.rect
+        );
+        assert!(drawn.rect.contains_rect(preedit_box(&drawn.shapes)));
     }
 
     #[test]

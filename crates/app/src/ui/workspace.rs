@@ -19381,6 +19381,65 @@ https://example.test/login \
     }
 
     #[test]
+    fn preedit_from_a_replaced_pane_session_is_not_painted_or_forwarded() {
+        let mut harness = setup_focused_local_pane_harness(SessionId(7));
+        harness.input_mut().events.push(preedit_event("조합중"));
+        harness.run_steps(1);
+        assert_eq!(harness.state().preedit.owner, Some(SessionId(7)));
+        drain_protocol(harness.state_mut());
+        // Same pane id, different terminal session: the runtime-focus pane id
+        // did not change, so the composition's explicit session owner matters.
+        let workspace = harness.state_mut();
+        workspace.mux = Some(mux(
+            "primary",
+            vec![tab(
+                "primary",
+                vec![pane("pane", SessionId(8))],
+                LayoutNode::Pane(pane_id("pane")),
+            )],
+            "pane",
+        ));
+        workspace.sessions.entry(SessionId(8)).or_default().snapshot = Some(snapshot("ready"));
+        harness.run_steps(1);
+        assert!(
+            !harness
+                .output()
+                .shapes
+                .iter()
+                .any(|shape| matches!(&shape.shape,
+            egui::Shape::Text(text) if text.galley.text() == "조합중"))
+        );
+        assert!(harness.state().preedit.is_empty());
+        assert!(written_bytes(drain_protocol(harness.state_mut())).is_empty());
+    }
+
+    #[test]
+    fn disabled_terminal_does_not_publish_projected_preedit_or_send_commit() {
+        let mut harness = setup_focused_local_pane_harness(SessionId(7));
+        harness.input_mut().events.push(preedit_event("이전조합"));
+        harness.run_steps(1);
+        drain_protocol(harness.state_mut());
+        let ctx = egui::Context::default();
+        let config = TerminalConfig::default();
+        let catalog = catalog();
+        let raw = egui::RawInput {
+            events: vec![preedit_event("다른입력"), commit_event("다른입력")],
+            ..Default::default()
+        };
+        let full = ctx.run_ui(raw, |ui| {
+            harness
+                .state_mut()
+                .show_with_input(ui, &config, &[], &catalog, false);
+        });
+        assert_eq!(harness.state().preedit.text, "이전조합");
+        assert_eq!(harness.state().preedit.owner, Some(SessionId(7)));
+        assert!(!full.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::Shape::Text(text) if text.galley.text() == "다른입력" || text.galley.text() == "이전조합")));
+        assert!(written_bytes(drain_protocol(harness.state_mut())).is_empty());
+        full.drop_without_applying_deltas();
+    }
+
+    #[test]
     fn preedit_projection_preserves_char_ranges_and_clears_owner_on_cancel() {
         let owner = SessionId(7);
         let state = TerminalPreeditState::default().for_frame(

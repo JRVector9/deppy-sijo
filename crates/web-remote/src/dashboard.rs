@@ -1613,6 +1613,7 @@ mod tests {
                     visible: true,
                 },
                 visible_cells: cells.into(),
+                graphemes: Default::default(),
                 dirty_ranges: Vec::new(),
                 title: None,
                 scroll_offset: 0,

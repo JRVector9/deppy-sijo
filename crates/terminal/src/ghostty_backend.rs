@@ -13,6 +13,7 @@
 use std::cell::{Cell as StdCell, RefCell};
 use std::rc::Rc;
 
+use crate::alacritty_backend::composed_cell;
 use libghostty_vt::render::{CellIterator, CursorVisualStyle, RowIterator};
 use libghostty_vt::screen::CellWide;
 use libghostty_vt::terminal::{
@@ -20,7 +21,6 @@ use libghostty_vt::terminal::{
     PrimaryDeviceAttributes, ScrollViewport, SecondaryDeviceAttributes, TertiaryDeviceAttributes,
 };
 use libghostty_vt::{RenderState, Terminal, TerminalOptions};
-use unicode_normalization::UnicodeNormalization;
 
 use crate::backend::{
     TerminalBackend, TerminalCacheBudget, TerminalCacheClass, TerminalCacheEvent,
@@ -28,7 +28,7 @@ use crate::backend::{
 };
 use crate::change_set::TerminalChangeSet;
 use crate::viewport_snapshot::{
-    CursorShape, CursorSnapshot, TerminalCell, TerminalViewportSnapshot,
+    CellAttrs, CellGrapheme, CursorShape, CursorSnapshot, TerminalCell, TerminalViewportSnapshot,
 };
 
 // alacritty_backend와 동일한 기본색 (앱 테마 §theme.rs와 짝)
@@ -148,20 +148,10 @@ impl GhosttyBackend {
     }
 }
 
-/// grapheme cluster를 셀 모델의 단일 char로 합성한다 — alacritty composed_char와
-/// 동일 정책 (NFD 자소 → NFC 음절, 단일 char 합성 실패 시 base로 폴백).
-fn compose_cluster(cluster: &[char]) -> char {
-    match cluster {
-        [] => ' ',
-        [only] => *only,
-        _ => {
-            let s: String = cluster.iter().collect();
-            let mut it = s.nfc();
-            match (it.next(), it.next()) {
-                (Some(c), None) => c,
-                _ => cluster[0],
-            }
-        }
+fn compose_cluster(cluster: &[char]) -> (char, Option<String>) {
+    match cluster.split_first() {
+        Some((&base, rest)) => composed_cell(base, Some(rest)),
+        None => (' ', None),
     }
 }
 
@@ -256,10 +246,11 @@ impl TerminalBackend for GhosttyBackend {
         let rows = snap.rows().ok()?.max(1) as usize;
 
         let mut cells = vec![TerminalCell::default(); cols * rows];
+        let mut graphemes = Vec::new();
         let mut row_iter = self.row_iter.borrow_mut();
         let mut cell_iter = self.cell_iter.borrow_mut();
         let mut rows_iter = row_iter.update(&snap).ok()?;
-        let mut grapheme_buf = ['\0'; 8];
+        let mut grapheme_buf = vec!['\0'; 8];
         let mut row = 0usize;
         while let Some(row_it) = rows_iter.next() {
             if row >= rows {
@@ -299,18 +290,25 @@ impl TerminalBackend for GhosttyBackend {
                 }
 
                 // SGR conceal(invisible)은 공백으로 — alacritty HIDDEN과 동일 정책
-                let c = if style.is_some_and(|s| s.invisible) {
-                    ' '
+                let (c, text) = if style.is_some_and(|s| s.invisible) {
+                    (' ', None)
                 } else {
-                    let len = cell.graphemes_len().unwrap_or(0).min(grapheme_buf.len());
+                    let len = cell.graphemes_len().unwrap_or(0);
+                    grapheme_buf.resize(len, '\0');
                     if len == 0 {
-                        ' '
+                        (' ', None)
                     } else if cell.graphemes_buf(&mut grapheme_buf[..len]).is_ok() {
                         compose_cluster(&grapheme_buf[..len])
                     } else {
-                        ' '
+                        (' ', None)
                     }
                 };
+                if let Some(text) = text {
+                    graphemes.push(CellGrapheme {
+                        index: row * cols + col - 1,
+                        text,
+                    });
+                }
 
                 *out = TerminalCell {
                     c,
@@ -318,6 +316,7 @@ impl TerminalBackend for GhosttyBackend {
                     bg,
                     wide: matches!(wide, CellWide::Wide),
                     wide_spacer: false,
+                    attrs: CellAttrs::empty(),
                 };
             }
             row += 1;
@@ -362,6 +361,7 @@ impl TerminalBackend for GhosttyBackend {
             rows: rows as u16,
             cursor,
             visible_cells: cells.into(),
+            graphemes: graphemes.into(),
             // alacritty와 동일 — dirty_ranges는 Session.take_dirty_ranges가 채운다
             dirty_ranges: Vec::new(),
             title,
@@ -431,7 +431,7 @@ impl TerminalBackend for GhosttyBackend {
         let Ok(mut rows_iter) = row_iter.update(&snap) else {
             return String::new();
         };
-        let mut grapheme_buf = ['\0'; 8];
+        let mut grapheme_buf = vec!['\0'; 8];
         let mut first = true;
         while let Some(row_it) = rows_iter.next() {
             if !first {
@@ -454,11 +454,17 @@ impl TerminalBackend for GhosttyBackend {
                     out.push(' ');
                     continue;
                 }
-                let len = cell.graphemes_len().unwrap_or(0).min(grapheme_buf.len());
+                let len = cell.graphemes_len().unwrap_or(0);
+                grapheme_buf.resize(len, '\0');
                 if len == 0 {
                     out.push(' ');
                 } else if cell.graphemes_buf(&mut grapheme_buf[..len]).is_ok() {
-                    out.push(compose_cluster(&grapheme_buf[..len]));
+                    let (c, text) = compose_cluster(&grapheme_buf[..len]);
+                    if let Some(text) = text {
+                        out.push_str(&text);
+                    } else {
+                        out.push(c);
+                    }
                 } else {
                     out.push(' ');
                 }

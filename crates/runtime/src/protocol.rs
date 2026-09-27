@@ -17,7 +17,10 @@
 use std::sync::Arc;
 
 use deppy_core::SessionId;
-use terminal::{CellRange, CursorSnapshot, TerminalCell, TerminalViewportSnapshot};
+use terminal::{
+    CellGrapheme, CellRange, CursorSnapshot, TerminalCell, TerminalViewportSnapshot,
+    validate_cell_graphemes,
+};
 
 use crate::command::RuntimeCommand;
 use crate::event::RuntimeEvent;
@@ -54,7 +57,8 @@ pub(crate) const PROTO_MAGIC: [u8; 4] = *b"DPRT";
 /// v17: 기본환경 버전과 실제 프로세스 적용 ACK를 전달한다.
 /// v18: operation-correlated PTY input admission; reject older peers before decode.
 /// v19: admission-denied input result; older peers must reject this value before decode.
-pub(crate) const PROTO_VERSION: u16 = 19;
+/// v20: sparse multi-scalar graphemes in viewport and row patches.
+pub(crate) const PROTO_VERSION: u16 = 20;
 
 /// delta viewport 스트리밍 기능 비트 (§3.1).
 pub(crate) const FEAT_DELTA_VIEWPORT: u32 = 1 << 0;
@@ -158,6 +162,8 @@ pub(crate) struct ViewportDelta {
 pub(crate) struct RowPatch {
     pub row: u16,
     pub cells: Vec<TerminalCell>,
+    /// Sparse entries use column indices within this row.
+    pub graphemes: Vec<CellGrapheme>,
 }
 
 /// 서버 수신 명령 프레임 디코드 결과 (§4.4). Delta 접속은 RequestKeyframe 제어를 함께 나른다.
@@ -351,10 +357,20 @@ pub(crate) fn diff_viewport(
     let mut changed_rows = Vec::new();
     for r in 0..cur.rows as usize {
         let rng = r * cols..(r + 1) * cols;
-        if prev.visible_cells[rng.clone()] != cur.visible_cells[rng.clone()] {
+        if prev.visible_cells[rng.clone()] != cur.visible_cells[rng.clone()]
+            || prev.row_graphemes(r) != cur.row_graphemes(r)
+        {
             changed_rows.push(RowPatch {
                 row: r as u16,
                 cells: cur.visible_cells[rng].to_vec(),
+                graphemes: cur
+                    .row_graphemes(r)
+                    .iter()
+                    .map(|entry| CellGrapheme {
+                        index: entry.index - r * cols,
+                        text: entry.text.clone(),
+                    })
+                    .collect(),
             });
         }
     }
@@ -396,21 +412,33 @@ pub(crate) fn try_apply_delta(
         if patch.cells.len() != cols {
             return Err("delta patch cells 수가 cols와 불일치");
         }
+        validate_cell_graphemes(&patch.cells, &patch.graphemes)?;
     }
     // baseline이 온전한지도 확인 — cols*rows 슬라이스 인덱싱이 안전해야 한다.
     if prev.visible_cells.len() != cols * rows {
         return Err("baseline visible_cells 크기가 cols*rows와 불일치");
     }
+    validate_cell_graphemes(&prev.visible_cells, &prev.graphemes)?;
+    let mut graphemes = prev.graphemes.to_vec();
     let mut cells = prev.visible_cells.to_vec(); // COW clone (오늘도 Arc 클론 취급 중)
     for patch in &delta.changed_rows {
         let base = patch.row as usize * cols;
         cells[base..base + cols].copy_from_slice(&patch.cells);
+        graphemes.retain(|entry| entry.index < base || entry.index >= base + cols);
+        graphemes.extend(patch.graphemes.iter().map(|entry| CellGrapheme {
+            index: base + entry.index,
+            text: entry.text.clone(),
+        }));
     }
     Ok(TerminalViewportSnapshot {
         cols: delta.cols,
         rows: delta.rows,
         cursor: delta.cursor,
         visible_cells: cells.into(),
+        graphemes: {
+            graphemes.sort_unstable_by_key(|entry| entry.index);
+            graphemes.into()
+        },
         dirty_ranges: row_patches_to_dirty_ranges(&delta.changed_rows, cols, rows),
         title: delta.title.clone(),
         scroll_offset: delta.scroll_offset,
@@ -497,6 +525,6 @@ mod tests {
         assert!(command_source.contains("SetScrollbackLimit"));
         assert!(event_source.contains("ScrollbackLimitApplied"));
         assert!(protocol_source.contains("**v13**"));
-        assert_eq!(PROTO_VERSION, 19);
+        assert_eq!(PROTO_VERSION, 20);
     }
 }

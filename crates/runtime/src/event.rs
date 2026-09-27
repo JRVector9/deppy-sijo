@@ -353,6 +353,7 @@ mod tests {
                     visible: true,
                 },
                 visible_cells: Vec::new().into(),
+                graphemes: Default::default(),
                 dirty_ranges: dirty,
                 title: None,
                 scroll_offset: 0,

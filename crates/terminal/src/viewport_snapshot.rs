@@ -9,6 +9,8 @@ pub struct TerminalViewportSnapshot {
     pub cursor: CursorSnapshot,
     /// row-major, cols * rows개
     pub visible_cells: Arc<[TerminalCell]>,
+    /// Sorted sparse full text for cells whose NFC contains multiple scalars.
+    pub graphemes: Arc<[CellGrapheme]>,
     /// 직전 take_snapshot 이후 바뀐 셀 범위 — renderer_egui가 행 갤리 캐시 무효화에,
     /// 세션 로직이 dirty 추적에 소비한다 (2026-07-13 감사: "미소비" 주석 stale 교정).
     pub dirty_ranges: Vec<CellRange>,
@@ -17,7 +19,70 @@ pub struct TerminalViewportSnapshot {
     pub is_alt_screen: bool,
 }
 
+/// A cell's full grapheme, stored only when a scalar cannot represent it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CellGrapheme {
+    pub index: usize,
+    pub text: String,
+}
+
+/// Peer limits bound sparse text without imposing allocations on ASCII cells.
+pub const MAX_CELL_GRAPHEME_BYTES: usize = 16 * 1024;
+pub const MAX_CELL_GRAPHEME_CHARS: usize = 4096;
+
+pub fn validate_cell_graphemes(
+    cells: &[TerminalCell],
+    graphemes: &[CellGrapheme],
+) -> Result<(), &'static str> {
+    let mut previous = None;
+    for entry in graphemes {
+        let Some(cell) = cells.get(entry.index) else {
+            return Err("grapheme index out of bounds");
+        };
+        if previous.is_some_and(|index| index >= entry.index) {
+            return Err("grapheme indices must be unique and sorted");
+        }
+        if cell.wide_spacer || entry.text.len() > MAX_CELL_GRAPHEME_BYTES {
+            return Err("invalid grapheme owner or byte limit");
+        }
+        let mut chars = entry.text.chars();
+        if chars.next() != Some(cell.c) || chars.next().is_none() {
+            return Err("grapheme must contain its base and multiple scalars");
+        }
+        if entry.text.chars().count() > MAX_CELL_GRAPHEME_CHARS
+            || entry.text.chars().any(char::is_control)
+        {
+            return Err("invalid grapheme scalar content or count");
+        }
+        previous = Some(entry.index);
+    }
+    Ok(())
+}
+
 impl TerminalViewportSnapshot {
+    pub fn cell_grapheme(&self, index: usize) -> Option<&str> {
+        self.graphemes
+            .binary_search_by_key(&index, |entry| entry.index)
+            .ok()
+            .map(|i| self.graphemes[i].text.as_str())
+    }
+
+    pub fn push_cell_text(&self, index: usize, output: &mut String) {
+        if let Some(text) = self.cell_grapheme(index) {
+            output.push_str(text);
+        } else if let Some(cell) = self.visible_cells.get(index) {
+            output.push(cell.c);
+        }
+    }
+
+    pub fn row_graphemes(&self, row: usize) -> &[CellGrapheme] {
+        let start = row * self.cols as usize;
+        let end = start + self.cols as usize;
+        let first = self.graphemes.partition_point(|entry| entry.index < start);
+        let last = self.graphemes.partition_point(|entry| entry.index < end);
+        &self.graphemes[first..last]
+    }
+
     /// 이 셀이 **진짜 wide 글자의 뒷칸**인가.
     ///
     /// 백엔드는 성질이 다른 둘을 같은 `wide_spacer` 비트로 평탄화한다:

@@ -18,29 +18,25 @@ use crate::backend::{
 };
 use crate::change_set::TerminalChangeSet;
 use crate::viewport_snapshot::{
-    CellAttrs, CursorShape, CursorSnapshot, TerminalCell, TerminalViewportSnapshot,
+    CellAttrs, CellGrapheme, CursorShape, CursorSnapshot, TerminalCell, TerminalViewportSnapshot,
 };
 
-/// 셀의 base char에 alacritty가 붙인 zerowidth(조합) 문자를 NFC로 합성한다.
-/// macOS 등은 파일명을 NFD(자소 분해)로 저장해, 한글은 초성만·악센트 라틴은 base만
-/// 보이던 문제를 해결한다. zerowidth가 없으면(대부분의 셀) base를 그대로 반환해
-/// 단일-char 셀 모델과 오버헤드를 유지한다. 합성이 단일 char로 안 되면(고아 조합/옛한글)
-/// 기존과 동일하게 base만 반환한다.
-fn composed_char(base: char, zerowidth: Option<&[char]>) -> char {
-    match zerowidth {
-        Some(zw) if !zw.is_empty() => {
-            let mut s = String::with_capacity(4);
-            s.push(base);
-            s.extend(zw.iter());
-            // 정확히 단일 char로 합성될 때만 사용한다. 다중 scalar로 남으면(쌓인 결합
-            // 기호 등) 셀은 한 글자만 담으므로 부분 합성 대신 base로 폴백한다.
-            let mut it = s.nfc();
-            match (it.next(), it.next()) {
-                (Some(c), None) => c,
-                _ => base,
-            }
-        }
-        _ => base,
+/// NFC single scalars stay inline; non-composable text preserves all source scalars.
+pub(crate) fn composed_cell(base: char, zerowidth: Option<&[char]>) -> (char, Option<String>) {
+    let Some(zw) = zerowidth.filter(|zw| !zw.is_empty()) else {
+        return (base, None);
+    };
+    let mut text = String::with_capacity(4 + zw.len() * 4);
+    text.push(base);
+    text.extend(zw.iter());
+    let mut nfc = text.nfc();
+    let scalar = match (nfc.next(), nfc.next()) {
+        (Some(c), None) => Some(c),
+        _ => None,
+    };
+    match scalar {
+        Some(c) => (c, None),
+        None => (base, Some(text)),
     }
 }
 
@@ -407,6 +403,7 @@ impl TerminalBackend for AlacrittyBackend {
         let grid = self.term.grid();
         let mut scratch = Row::<AlacrittyCell>::new(cols);
         let mut cells = vec![TerminalCell::default(); cols * rows];
+        let mut graphemes = Vec::new();
         for screen_row in 0..rows {
             let grid_line =
                 alacritty_terminal::index::Line(screen_row as i32 - display_offset as i32);
@@ -441,13 +438,27 @@ impl TerminalBackend for AlacrittyBackend {
                 );
                 attrs.set(CellAttrs::STRIKEOUT, flags.contains(Flags::STRIKEOUT));
                 attrs.set(CellAttrs::DIM, flags.contains(Flags::DIM));
-                cells[screen_row * cols + col] = TerminalCell {
+                let index = screen_row * cols + col;
+                let (c, text) = if flags.intersects(
+                    Flags::HIDDEN | Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER,
+                ) {
+                    (
+                        if flags.contains(Flags::HIDDEN) {
+                            ' '
+                        } else {
+                            cell.c
+                        },
+                        None,
+                    )
+                } else {
+                    composed_cell(cell.c, cell.zerowidth())
+                };
+                if let Some(text) = text {
+                    graphemes.push(CellGrapheme { index, text });
+                }
+                cells[index] = TerminalCell {
                     // SGR conceal(ESC[8m)은 공백으로 — 속성은 유지
-                    c: if flags.contains(Flags::HIDDEN) {
-                        ' '
-                    } else {
-                        composed_char(cell.c, cell.zerowidth())
-                    },
+                    c,
                     fg,
                     bg,
                     wide: flags.contains(Flags::WIDE_CHAR),
@@ -474,6 +485,7 @@ impl TerminalBackend for AlacrittyBackend {
             rows: rows as u16,
             cursor,
             visible_cells: cells.into(),
+            graphemes: graphemes.into(),
             // backend 레벨에선 빈 값 — Session::take_snapshot이 누적 dirty rows로
             // 덮어쓰고(session.rs), renderer_egui가 행 캐시 무효화에 소비한다
             // (감사 2026-07-13: "소비자 없음" 서술은 stale이라 교정).
@@ -688,13 +700,20 @@ impl TerminalBackend for AlacrittyBackend {
                     continue;
                 }
                 // conceal(SGR 8)은 화면과 동일하게 공백 취급 (보이지 않는 텍스트로 매치 금지)
-                let c = if cell.flags.contains(Flags::HIDDEN) {
-                    ' '
+                let (c, text) = if cell.flags.contains(Flags::HIDDEN) {
+                    (' ', None)
                 } else {
-                    composed_char(cell.c, cell.zerowidth())
+                    composed_cell(cell.c, cell.zerowidth())
                 };
-                chars.push(fold_char(c));
-                spans.push((col as u16, col as u16 + 1));
+                if let Some(text) = text {
+                    for scalar in text.chars() {
+                        chars.push(fold_char(scalar));
+                        spans.push((col as u16, col as u16 + 1));
+                    }
+                } else {
+                    chars.push(fold_char(c));
+                    spans.push((col as u16, col as u16 + 1));
+                }
             }
             let line_from_bottom = ((rows as i32 - 1) - line_idx) as u32;
             for (s, e) in substring_matches(&chars, &needle) {
@@ -807,11 +826,16 @@ impl TerminalBackend for AlacrittyBackend {
                 {
                     // conceal(SGR 8)은 snapshot과 동일하게 공백 취급 —
                     // 화면에 보이지 않는 텍스트로 상태를 감지하면 안 된다
-                    out.push(if cell.flags.contains(Flags::HIDDEN) {
-                        ' '
+                    let (c, text) = if cell.flags.contains(Flags::HIDDEN) {
+                        (' ', None)
                     } else {
-                        composed_char(cell.c, cell.zerowidth())
-                    });
+                        composed_cell(cell.c, cell.zerowidth())
+                    };
+                    if let Some(text) = text {
+                        out.push_str(&text);
+                    } else {
+                        out.push(c);
+                    }
                 }
             }
         }
@@ -1185,6 +1209,36 @@ mod tests {
 
     fn feed(backend: &mut AlacrittyBackend, bytes: &[u8]) -> TerminalChangeSet {
         backend.feed(bytes).unwrap()
+    }
+
+    #[test]
+    fn grapheme_snapshot_search_and_screen_text_preserve_clusters() {
+        for text in ["가ᇹ", "a\u{0301}\u{0308}"] {
+            let mut backend = AlacrittyBackend::new(20, 3, 10);
+            feed(&mut backend, text.as_bytes());
+            let snapshot = backend.viewport_snapshot().unwrap();
+            assert_eq!(snapshot.cell_grapheme(0), Some(text));
+            assert!(backend.screen_text().starts_with(text));
+            let found = backend.search_scrollback(text, 10);
+            assert_eq!(found.matches.len(), 1, "{text}");
+            assert_eq!(found.matches[0].col_start, 0);
+        }
+        let mut ascii = AlacrittyBackend::new(20, 3, 10);
+        feed(&mut ascii, b"ASCII");
+        assert!(ascii.viewport_snapshot().unwrap().graphemes.is_empty());
+        let mut hidden = AlacrittyBackend::new(20, 3, 10);
+        feed(&mut hidden, "\x1b[8ma\u{0301}\u{0308}".as_bytes());
+        assert!(hidden.viewport_snapshot().unwrap().graphemes.is_empty());
+    }
+
+    #[test]
+    fn grapheme_selection_preserves_non_composable_scalars() {
+        for text in ["가ᇹ", "a\u{0301}\u{0308}", "한", "ASCII"] {
+            let mut backend = AlacrittyBackend::new(20, 3, 10);
+            feed(&mut backend, text.as_bytes());
+            let snapshot = backend.viewport_snapshot().unwrap();
+            assert_eq!(crate::renderer_egui::selection_text(&snapshot, 0, 19), text);
+        }
     }
 
     fn cell_at(backend: &AlacrittyBackend, row: usize, col: usize) -> TerminalCell {

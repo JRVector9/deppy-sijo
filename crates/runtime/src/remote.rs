@@ -498,6 +498,7 @@ fn validate_event(event: &RuntimeEvent) -> Result<(), &'static str> {
                 return Err("viewport cols/rows가 0");
             }
             let expected = snapshot.cols as usize * snapshot.rows as usize;
+            terminal::validate_cell_graphemes(&snapshot.visible_cells, &snapshot.graphemes)?;
             if snapshot.visible_cells.len() != expected {
                 return Err("visible_cells 크기가 cols*rows와 불일치");
             }
@@ -2890,14 +2891,14 @@ mod tests {
 
     #[test]
     fn v12_v13_peer_is_rejected_at_hello_before_event_decode() {
-        for version in [10, 12, 13, 17, 18] {
+        for version in [10, 12, 13, 17, 18, 19] {
             let old = ClientHello {
                 magic: PROTO_MAGIC,
                 proto_version: version,
                 features: CLIENT_FEATURES,
                 token: b"irrelevant".to_vec(),
             };
-            assert_eq!(PROTO_VERSION, 19);
+            assert_eq!(PROTO_VERSION, 20);
             assert!(!client_hello_matches_protocol(&old));
         }
     }
@@ -3372,6 +3373,7 @@ mod tests {
                     visible: true,
                 },
                 visible_cells: Vec::new().into(),
+                graphemes: Default::default(),
                 dirty_ranges: Vec::new(),
                 title: None,
                 scroll_offset: 0,
@@ -3458,6 +3460,7 @@ mod tests {
                 visible: true,
             },
             visible_cells: cells.into(),
+            graphemes: Default::default(),
             dirty_ranges: Vec::new(),
             title: None,
             scroll_offset: 0,
@@ -3473,6 +3476,7 @@ mod tests {
         assert_eq!(actual.rows, expected.rows);
         assert_eq!(actual.cursor, expected.cursor);
         assert_eq!(actual.visible_cells, expected.visible_cells);
+        assert_eq!(actual.graphemes, expected.graphemes);
         assert_eq!(actual.title, expected.title);
         assert_eq!(actual.scroll_offset, expected.scroll_offset);
         assert_eq!(actual.is_alt_screen, expected.is_alt_screen);
@@ -3868,6 +3872,109 @@ mod tests {
         }
     }
 
+    #[test]
+    fn malformed_graphemes_are_rejected_before_event_publish() {
+        let base = make_snapshot(20, 5, &["a"], false);
+        for entries in [
+            vec![terminal::CellGrapheme {
+                index: 100,
+                text: "a\u{301}".into(),
+            }],
+            vec![terminal::CellGrapheme {
+                index: 0,
+                text: String::new(),
+            }],
+            vec![
+                terminal::CellGrapheme {
+                    index: 1,
+                    text: " \u{301}".into(),
+                },
+                terminal::CellGrapheme {
+                    index: 0,
+                    text: "a\u{301}".into(),
+                },
+            ],
+            vec![terminal::CellGrapheme {
+                index: 0,
+                text: format!("a{}", "x".repeat(terminal::MAX_CELL_GRAPHEME_BYTES)),
+            }],
+            vec![terminal::CellGrapheme {
+                index: 0,
+                text: "a".into(),
+            }],
+            vec![terminal::CellGrapheme {
+                index: 0,
+                text: "b\u{301}".into(),
+            }],
+            vec![terminal::CellGrapheme {
+                index: 0,
+                text: "a\n".into(),
+            }],
+            vec![terminal::CellGrapheme {
+                index: 0,
+                text: format!("a{}", "\u{301}".repeat(terminal::MAX_CELL_GRAPHEME_CHARS)),
+            }],
+            vec![
+                terminal::CellGrapheme {
+                    index: 0,
+                    text: "a\u{301}".into()
+                };
+                2
+            ],
+        ] {
+            let mut snapshot = base.as_ref().clone();
+            snapshot.graphemes = entries.into();
+            assert!(
+                validate_event(&RuntimeEvent::Viewport {
+                    session: SessionId(1),
+                    snapshot: Arc::new(snapshot),
+                    bracketed_paste: false,
+                })
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_delta_grapheme_is_rejected_without_mutating_baseline() {
+        let base = make_snapshot(20, 5, &["a"], false);
+        let mut current = base.as_ref().clone();
+        current.graphemes = vec![terminal::CellGrapheme {
+            index: 0,
+            text: "a\u{301}".into(),
+        }]
+        .into();
+        let mut delta = diff_viewport(&base, &current).unwrap();
+        delta.changed_rows[0].graphemes[0].index = 20;
+        assert!(try_apply_delta(&base, &delta).is_err());
+        assert!(base.graphemes.is_empty());
+    }
+
+    #[test]
+    fn grapheme_only_delta_roundtrip_and_removal() {
+        let s = SessionId(991);
+        let mut pipe = DeltaPipe::new();
+        let base = make_snapshot(20, 5, &["a"], false);
+        pipe.round_trip(s, &base);
+        let mut composed = base.as_ref().clone();
+        composed.graphemes = vec![terminal::CellGrapheme {
+            index: 0,
+            text: "a\u{0301}\u{0308}".into(),
+        }]
+        .into();
+        let composed = Arc::new(composed);
+        let reconstructed = pipe.round_trip(s, &composed);
+        assert_eq!(reconstructed.graphemes, composed.graphemes);
+        assert_eq!(
+            reconstructed.dirty_ranges,
+            vec![CellRange { start: 0, end: 20 }]
+        );
+        let cleared = pipe.round_trip(s, &base);
+        assert!(cleared.graphemes.is_empty());
+        assert_eq!(cleared.dirty_ranges, vec![CellRange { start: 0, end: 20 }]);
+        assert_eq!(pipe.deltas, 2);
+    }
+
     /// §4.8 왕복 등가성: keyframe → 타이핑 delta들 → 재구성이 매 tick source와 셀 단위 동일.
     #[test]
     fn delta_왕복_등가성() {
@@ -4196,6 +4303,7 @@ mod tests {
                     2,
                     vec![RowPatch {
                         row: 9,
+                        graphemes: Vec::new(),
                         cells: vec![cell('z'); 4]
                     }]
                 )
@@ -4211,6 +4319,7 @@ mod tests {
                     2,
                     vec![RowPatch {
                         row: 0,
+                        graphemes: Vec::new(),
                         cells: vec![cell('z'); 2]
                     }]
                 )
@@ -4226,6 +4335,7 @@ mod tests {
                     2,
                     vec![RowPatch {
                         row: 1,
+                        graphemes: Vec::new(),
                         cells: vec![cell('z'); 4]
                     }]
                 )
@@ -4264,6 +4374,7 @@ mod tests {
             title: None,
             changed_rows: vec![RowPatch {
                 row: 99,
+                graphemes: Vec::new(),
                 cells: vec![cell('z')],
             }],
         };

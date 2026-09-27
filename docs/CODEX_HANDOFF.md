@@ -1,3 +1,10 @@
+# User-authorized 0.2.0 restart — 2026-09-28
+
+- User explicitly requested commit and restart. Product already committed bb0441a9 and docs d2288701; clean tree and identical signed app/proxy/helper hashes verified before launch.
+- Gracefully terminated exact old PID67248 and launched signed0.2.0 bundle PID44402. Six-second liveness, executable/cwd and native running-app bundle path/identifier/version verified. Both helpers are adjacent in Contents/MacOS. No user config/data cleanup and no push. No MCP connection was enabled automatically.
+- Running binary: /Users/jr/Desktop/projects/deppy-sijo-performance/target/bundle/Deppy Sijo.app/Contents/MacOS/deppy-sijo. Native app version0.2.0; sourcebb0441a9. Evidence /tmp/deppy-user-restart-20260928-result.json; application log /tmp/deppy-user-restart-20260928-app.log. Restart completed; later restarts still require new explicit authorization.
+- Exact next commands: cat /tmp/deppy-user-restart-20260928-result.json; ps -o pid=,etime=,comm= -p44402; cd /Users/jr/Desktop/projects/deppy-sijo-performance; git status --short; git log -4 --oneline.
+
 # Automatic MCP connection completed — 2026-09-27
 
 ## Current objective and status

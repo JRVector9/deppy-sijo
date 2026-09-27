@@ -752,7 +752,7 @@ pub fn draw_with_preedit(
                 start..range.end.min(chars).max(start)
             });
             let caret = galley.pos_from_cursor(egui::text::CCursor::new(
-                active.as_ref().map_or(0, |range| range.end),
+                active.as_ref().map_or(chars, |range| range.end),
             ));
             let mut text_pos = ime_pos + egui::vec2(0.0, text_dy);
             // Shift short compositions left at the pane edge. For a longer
@@ -792,8 +792,13 @@ pub fn draw_with_preedit(
                 clip.left(),
                 (clip.right() - cell.x.min(clip.width())).max(clip.left()),
             );
-            ime_cursor =
-                egui::Rect::from_min_size(egui::pos2(caret_x, ime_pos.y), ime_cell).intersect(clip);
+            // No supplied range means the IME does not expose its caret.
+            // Scroll the visual composition to the typed end, but retain the
+            // terminal cursor as the candidate anchor instead of guessing one.
+            if active.is_some() {
+                ime_cursor = egui::Rect::from_min_size(egui::pos2(caret_x, ime_pos.y), ime_cell)
+                    .intersect(clip);
+            }
             painter.galley(text_pos, galley, egui::Color32::BLACK);
             painter.line_segment(
                 [background.left_bottom(), background.right_bottom()],
@@ -1958,6 +1963,63 @@ mod tests {
     }
 
     #[test]
+    fn ime_none_range_keeps_terminal_candidate_anchor_when_preedit_shifts_left() {
+        let mut snapshot = snap(8, 1, &[]);
+        snapshot.cursor.col = 7;
+        let ctx = egui::Context::default();
+        let mut cache = TerminalRenderCache::default();
+        let drawn = draw_preedit_in_pane(
+            &ctx,
+            &mut cache,
+            &snapshot,
+            80.0,
+            next_gen(),
+            None,
+            None,
+            "MMMM",
+        );
+        let expected = drawn.origin.x + 7.0 * drawn.cell.x;
+        assert!(
+            (drawn.ime_cursor_rect.unwrap().left() - expected).abs() < 0.01,
+            "a missing cursor range must not shift the terminal candidate anchor"
+        );
+    }
+
+    #[test]
+    fn ime_none_range_scrolls_a_long_preedit_to_its_typed_end() {
+        let mut snapshot = snap(8, 1, &[]);
+        snapshot.cursor.col = 7;
+        let ctx = egui::Context::default();
+        let mut cache = TerminalRenderCache::default();
+        let text = "abcdefghijklmno".repeat(10);
+        let drawn = draw_preedit_in_pane(
+            &ctx,
+            &mut cache,
+            &snapshot,
+            80.0,
+            next_gen(),
+            None,
+            None,
+            &text,
+        );
+        let shape = drawn
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(shape) if shape.galley.text() == text => Some(shape),
+                _ => None,
+            })
+            .unwrap();
+        let end = shape.pos.x + shape.galley.rect.right();
+        assert!(
+            end <= drawn.rect.right() - HORIZONTAL_PADDING + 0.01,
+            "typed end must be visible: end={end}, pane={:?}",
+            drawn.rect
+        );
+        assert!(end >= drawn.origin.x);
+    }
+
+    #[test]
     fn ime_preedit_candidate_fits_when_stale_rows_exceed_pane_height() {
         let mut snapshot = snap(8, 20, &[]);
         snapshot.cursor.col = 7;
@@ -2590,6 +2652,21 @@ mod tests {
         selection: Option<(usize, usize)>,
         marker: Option<(egui::Rect, egui::Color32)>,
     ) -> PaneDraw {
+        draw_preedit_in_pane(
+            ctx, cache, snapshot, pane_width, generation, selection, marker, "한",
+        )
+    }
+
+    fn draw_preedit_in_pane(
+        ctx: &egui::Context,
+        cache: &mut TerminalRenderCache,
+        snapshot: &TerminalViewportSnapshot,
+        pane_width: f32,
+        generation: u64,
+        selection: Option<(usize, usize)>,
+        marker: Option<(egui::Rect, egui::Color32)>,
+        preedit: &str,
+    ) -> PaneDraw {
         let mut measured = None;
         let mut full = ctx.run_ui(egui::RawInput::default(), |ui| {
             ui.set_min_size(egui::vec2(900.0, 400.0));
@@ -2609,7 +2686,7 @@ mod tests {
                 snapshot,
                 m(13.0, 1.0),
                 cache,
-                Some("한"),
+                Some(preedit),
                 true, // 조합 표시와 후보창 좌표까지 같은 프레임에서 확인한다
                 selection,
                 generation,

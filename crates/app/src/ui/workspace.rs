@@ -9600,14 +9600,40 @@ fn last_line_summary(snapshot: &TerminalViewportSnapshot) -> String {
         return String::new();
     }
     for row in (0..snapshot.rows as usize).rev() {
-        let line: String = snapshot.visible_cells[row * cols..(row + 1) * cols]
-            .iter()
-            .filter(|c| !c.wide_spacer)
-            .map(|c| c.c)
-            .collect();
-        let line = line.trim();
+        let mut line = String::new();
+        let mut count = 0;
+        let mut non_whitespace_end = 0;
+        for index in row * cols..(row + 1) * cols {
+            let cell = &snapshot.visible_cells[index];
+            if cell.wide_spacer {
+                continue;
+            }
+            let mut scalar = [0; 4];
+            let text = match snapshot.cell_grapheme(index) {
+                Some(text) => text,
+                None => cell.c.encode_utf8(&mut scalar),
+            };
+            let whitespace = text.chars().all(char::is_whitespace);
+            if line.is_empty() && whitespace {
+                continue;
+            }
+            let chars = text.chars().count();
+            // Keep the prior48-scalar ceiling without splitting a cell's cluster.
+            if count + chars > 48 {
+                if line.is_empty() {
+                    return "…".into();
+                }
+                break;
+            }
+            line.push_str(text);
+            count += chars;
+            if !whitespace {
+                non_whitespace_end = line.len();
+            }
+        }
+        line.truncate(non_whitespace_end);
         if !line.is_empty() {
-            return line.chars().take(48).collect();
+            return line;
         }
     }
     String::new()
@@ -19331,6 +19357,27 @@ https://example.test/login \
             })
             .flatten()
             .collect()
+    }
+
+    #[test]
+    fn sidebar_line_summary_preserves_sparse_graphemes_with_a_bounded_cluster_prefix() {
+        use terminal::TerminalBackend;
+        for text in ["가ᇹ", "a\u{0301}\u{0308}", "a"] {
+            let mut backend = terminal::AlacrittyBackend::new(80, 1, 0);
+            backend.feed(text.as_bytes()).unwrap();
+            assert_eq!(
+                last_line_summary(&backend.viewport_snapshot().unwrap()),
+                text
+            );
+        }
+        let text = "x".repeat(47) + "a\u{0301}\u{0308}";
+        let mut backend = terminal::AlacrittyBackend::new(80, 1, 0);
+        backend.feed(text.as_bytes()).unwrap();
+        assert_eq!(
+            last_line_summary(&backend.viewport_snapshot().unwrap()),
+            "x".repeat(47),
+            "48-char limit must not cut a sparse cluster in the middle"
+        );
     }
 
     #[test]

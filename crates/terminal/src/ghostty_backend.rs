@@ -99,7 +99,7 @@ impl GhosttyBackend {
                 Some(DeviceAttributes {
                     primary: PrimaryDeviceAttributes::new(
                         ConformanceLevel::VT220,
-                        [DeviceAttributeFeature::ANSI_COLOR],
+                        &[DeviceAttributeFeature::ANSI_COLOR],
                     ),
                     secondary: SecondaryDeviceAttributes {
                         device_type: DeviceType::VT220,
@@ -353,7 +353,7 @@ impl TerminalBackend for GhosttyBackend {
         let is_alt_screen = self
             .term
             .active_screen()
-            .map(|s| s != libghostty_vt::ffi::GhosttyTerminalScreen_GHOSTTY_TERMINAL_SCREEN_PRIMARY)
+            .map(|s| s != libghostty_vt::screen::Screen::Primary)
             .unwrap_or(false);
 
         Some(TerminalViewportSnapshot {

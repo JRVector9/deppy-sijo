@@ -1,6 +1,6 @@
 # AI 터미널 입력창의 빠른 한글 입력 및 이전 커밋 리뷰
 
-2026-09-28 · 브랜치 `fix/agent-tui-korean-submit-order` · 버전 0.2.2 → 0.2.3
+2026-09-28 · 브랜치 `fix/agent-tui-korean-submit-order` · 소스 커밋 `2d7b6f84` · 버전 0.2.2 → 0.2.3
 
 ## 조사와 근거
 

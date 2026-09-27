@@ -1,0 +1,23 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.19s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-8da0216105b7ce9c)
+
+running 1 test
+test ui::workspace::tests::agent_info_line은_전송배지_없이_provider와_모델을_보여준다 ... FAILED
+
+failures:
+
+---- ui::workspace::tests::agent_info_line은_전송배지_없이_provider와_모델을_보여준다 stdout ----
+
+thread 'ui::workspace::tests::agent_info_line은_전송배지_없이_provider와_모델을_보여준다' (86577061) panicked at crates/app/src/ui/workspace.rs:15783:9:
+assertion `left == right` failed
+  left: "Awaiting instruction"
+ right: "Idle"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    ui::workspace::tests::agent_info_line은_전송배지_없이_provider와_모델을_보여준다
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2387 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p deppy-sijo --bin deppy-sijo`

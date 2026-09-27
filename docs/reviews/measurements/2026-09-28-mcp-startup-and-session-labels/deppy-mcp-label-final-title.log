@@ -1,0 +1,11 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.17s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-8da0216105b7ce9c)
+
+running 5 tests
+test ui::workspace::tests::workspace_production_title_path에는_project_name_filesystem_probe가_없다 ... ok
+test ui::workspace::tests::project_name_snapshot은_bounded이고_clone과_same_revision_setter는_arc만_공유한다 ... ok
+test ui::workspace::tests::cwd_project_name이_워크스페이스_자체_이름과_다르면_소속을_함께_보여준다 ... ok
+test ui::workspace::tests::cwd_project_name이_워크스페이스_자체_이름과_같으면_그대로_보여준다 ... ok
+test ui::workspace::tests::precomputed_project_name_snapshot은_exact_session_cwd에만_적용된다 ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 2383 filtered out; finished in 0.00s

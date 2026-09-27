@@ -1,0 +1,23 @@
+[
+  {
+    "run": 1,
+    "exit_code": 0,
+    "log": "/tmp/deppy-mcp-latency-clean-after-1.log",
+    "address_s": 3.464,
+    "ready_s": 15.466
+  },
+  {
+    "run": 2,
+    "exit_code": 0,
+    "log": "/tmp/deppy-mcp-latency-clean-after-2.log",
+    "address_s": 3.914,
+    "ready_s": 15.943
+  },
+  {
+    "run": 3,
+    "exit_code": 0,
+    "log": "/tmp/deppy-mcp-latency-clean-after-3.log",
+    "address_s": 3.697,
+    "ready_s": 65.805
+  }
+]

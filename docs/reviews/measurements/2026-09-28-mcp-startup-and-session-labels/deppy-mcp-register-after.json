@@ -1,0 +1,14 @@
+[
+  {
+    "run": 2,
+    "exit_code": 0,
+    "log": "/tmp/deppy-mcp-register-after-2.log",
+    "ready_s": 12.368
+  },
+  {
+    "run": 3,
+    "exit_code": 0,
+    "log": "/tmp/deppy-mcp-register-after-3.log",
+    "ready_s": 67.069
+  }
+]

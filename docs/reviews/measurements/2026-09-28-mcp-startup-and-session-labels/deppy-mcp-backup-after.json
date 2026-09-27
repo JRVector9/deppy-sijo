@@ -1,0 +1,20 @@
+[
+  {
+    "run": 1,
+    "exit_code": 0,
+    "log": "/tmp/deppy-mcp-backup-after-1.log",
+    "ready_s": 15.467
+  },
+  {
+    "run": 2,
+    "exit_code": 0,
+    "log": "/tmp/deppy-mcp-backup-after-2.log",
+    "ready_s": 17.439
+  },
+  {
+    "run": 3,
+    "exit_code": 0,
+    "log": "/tmp/deppy-mcp-backup-after-3.log",
+    "ready_s": 11.241
+  }
+]

@@ -1,0 +1,3 @@
+No actionable findings in the focused review. The DNS fallback shares a one-second budget, caps each provider at 500 ms when backup is active, and leaves the original two-second request deadline in place for HTTPS. The generated-host gate, proxy bypass check, DNS answer validation, and original HTTPS host for certificate/SNI are preserved. `public_test_agent` is behind `#[cfg(test)]`; production uses the 20-second backup delay.
+
+No edits or tests were run.

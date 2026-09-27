@@ -1,0 +1,22 @@
+{
+  "version": "0.2.1",
+  "source_commit": "4ad811affc89c7f5584ddfd087cd33fafa68e801",
+  "bundle": "/Users/jr/Desktop/projects/deppy-sijo-performance/target/bundle-0.2.1/Deppy Sijo.app",
+  "archive": "/Users/jr/Desktop/projects/deppy-sijo-performance/target/bundle-0.2.1/Deppy Sijo.zip",
+  "apple_notarization": false,
+  "native_gui_restarted": false,
+  "files": {
+    "deppy-sijo": {
+      "sha256": "86c6ef9453eac4af81464280df3fe6ec50fa30001c66b8b8a02e2556cc4a1404",
+      "arch": "arm64"
+    },
+    "deppy-mcp-proxy": {
+      "sha256": "b14c7ba0ccea3f1731d7c915c56993ef2714ddfd42d4bbfc937953739c1d7348",
+      "arch": "arm64"
+    },
+    "deppy-cloudflared": {
+      "sha256": "ece387d5190cb843a6d0e449cfcfe8861b0402011ca09d098c0b87e5984d105d",
+      "arch": "arm64"
+    }
+  }
+}

@@ -1,0 +1,90 @@
+[
+  {
+    "gate": "cloud",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "deppy-sijo",
+      "--bin",
+      "deppy-sijo",
+      "cloud_agent"
+    ],
+    "exit_code": 0,
+    "log": "/tmp/deppy-mcp-label-final-cloud.log"
+  },
+  {
+    "gate": "agent-label",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "deppy-sijo",
+      "--bin",
+      "deppy-sijo",
+      "agent_info_line"
+    ],
+    "exit_code": 101,
+    "log": "/tmp/deppy-mcp-label-final-agent-label.log"
+  },
+  {
+    "gate": "title",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "deppy-sijo",
+      "--bin",
+      "deppy-sijo",
+      "project_name"
+    ],
+    "exit_code": 0,
+    "log": "/tmp/deppy-mcp-label-final-title.log"
+  },
+  {
+    "gate": "i18n",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "i18n"
+    ],
+    "exit_code": 0,
+    "log": "/tmp/deppy-mcp-label-final-i18n.log"
+  },
+  {
+    "gate": "boundary",
+    "command": [
+      "cargo",
+      "run",
+      "-p",
+      "xtask",
+      "--",
+      "check-boundary"
+    ],
+    "exit_code": 0,
+    "log": "/tmp/deppy-mcp-label-final-boundary.log"
+  },
+  {
+    "gate": "fmt",
+    "command": [
+      "cargo",
+      "fmt",
+      "--all",
+      "--",
+      "--check"
+    ],
+    "exit_code": 0,
+    "log": "/tmp/deppy-mcp-label-final-fmt.log"
+  },
+  {
+    "gate": "whitespace",
+    "command": [
+      "git",
+      "diff",
+      "--check"
+    ],
+    "exit_code": 0,
+    "log": "/tmp/deppy-mcp-label-final-whitespace.log"
+  }
+]

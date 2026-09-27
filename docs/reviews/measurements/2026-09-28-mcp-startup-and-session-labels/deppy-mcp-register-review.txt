@@ -1,0 +1,3 @@
+No actionable findings in the requested diff. The first probe waits for registration; later unregister logs do not clear the flag, while readiness still requires a successful HTTPS metadata response. The timeout, cancellation, and child-reaping paths remain intact. The public test client uses the verified resolver through the normal network and TLS path. The UI retains the existing session title and uses the bounded `agent_line_for` value.
+
+No edits or tests were performed.

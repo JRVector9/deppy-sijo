@@ -1,0 +1,22 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.16s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-8da0216105b7ce9c)
+
+running 1 test
+address elapsed=3.851s host=returns-describe-boats-von.trycloudflare.com
+first registration at 4.205s
+probe elapsed=0.065s ready=false
+probe elapsed=0.023s ready=false
+probe elapsed=0.020s ready=false
+probe elapsed=0.019s ready=false
+probe elapsed=0.019s ready=false
+probe elapsed=0.023s ready=false
+probe elapsed=0.024s ready=false
+probe elapsed=0.017s ready=false
+probe elapsed=0.020s ready=false
+probe elapsed=0.020s ready=false
+probe elapsed=0.019s ready=false
+probe elapsed=0.957s ready=true
+ready elapsed=17.439s
+test cloud_agent::tunnel::tests::measure_live_automatic_connection_startup ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2389 filtered out; finished in 17.69s

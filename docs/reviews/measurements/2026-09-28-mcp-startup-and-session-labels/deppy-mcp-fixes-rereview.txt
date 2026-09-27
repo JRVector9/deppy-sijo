@@ -1,0 +1,5 @@
+No concrete regressions found in the requested scope.
+
+The Quick DNS fallback stops after a usable answer, limits lookup time to leave room for HTTPS, checks `is_no_proxy(uri)` before a direct fallback, and filters private and reserved IPs. The shared row uses the existing title resolver and `agent_line_for`; the changed hunks leave consent controls and session selection identifiers intact.
+
+No edits or tests were run.

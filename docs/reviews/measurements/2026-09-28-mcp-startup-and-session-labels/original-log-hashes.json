@@ -1,0 +1,68 @@
+{
+  "deppy-mcp-latency-before-1.log": {
+    "original_sha256": "f9c5c0f7691e98912b0eef52a81d6aec4036cd9f27717fd9b624fa90e78216b3"
+  },
+  "deppy-mcp-latency-before-2.log": {
+    "original_sha256": "90a9028093c3c0870a2ce473a6445e5d0e6f38a3114b6baf03cbb41765d533ee"
+  },
+  "deppy-mcp-latency-clean-after.json": {
+    "original_sha256": "31767a74fc13fe905284c7911d19ada12e1a5171cf304fb54bfc43ab40306e72"
+  },
+  "deppy-mcp-register-after.json": {
+    "original_sha256": "76ec388843ebd41188c512bd904305cf7022aa769f6177d6a5b129451eb48002"
+  },
+  "deppy-mcp-backup-after.json": {
+    "original_sha256": "4fdd5cd4ef7be5f19c136be9a777ebc3c4e15a4a6103c8829f8fcb5338f6dd47"
+  },
+  "deppy-mcp-backup-after-1.log": {
+    "original_sha256": "d5e40b0423a31c9df7331687d660a768a6046e100774878c29af23b78476b71c"
+  },
+  "deppy-mcp-backup-after-2.log": {
+    "original_sha256": "c8d098831ca4fade6b15c041576df5472210bab4d5d67922d84b642232d3cad3"
+  },
+  "deppy-mcp-backup-after-3.log": {
+    "original_sha256": "257fdf6ecf147f3d54435726a92951298b1c20c6cf0473aa081637b399e1ef0f"
+  },
+  "deppy-mcp-backup-cloud-green-final.log": {
+    "original_sha256": "7590bc6beca4d23ca6b539f9fa235eb6093e8831d53c3ae648e9363d4c3b67c5"
+  },
+  "deppy-mcp-backup-public.log": {
+    "original_sha256": "0f7438473079e7f5b85905f2800c71b561b6e1f04f453ea3f76f4aa33cb09176"
+  },
+  "deppy-mcp-backup-release.log": {
+    "original_sha256": "0893b5f9e503228e1999a79f5ad460164ec7575237c9f294ac22d9ff2335af8e"
+  },
+  "deppy-mcp-label-final-results.json": {
+    "original_sha256": "9c60778ac4592244ebe567a42bc6a7699bdb1805920bd0ce3660328a3a1fad0d"
+  },
+  "deppy-mcp-label-final-agent-label.log": {
+    "original_sha256": "a355a956757c29ad7fc2a601a119aa7728c4da810e82ecfbe29e2ea6a5fa00de"
+  },
+  "deppy-mcp-label-final-title.log": {
+    "original_sha256": "9fda9071a6d5e11ddac1f1289815b47326ce5784fdf933f4799b556415dbfb16"
+  },
+  "deppy-mcp-label-final-i18n.log": {
+    "original_sha256": "eecfec1f0724070f07e8d518f272ca02097da873bc1436745319606322777a05"
+  },
+  "deppy-mcp-label-final-boundary.log": {
+    "original_sha256": "fdb6984b76b2e837477f22fcc8b21d1875442c5a631de1290a95865cf24a7d95"
+  },
+  "deppy-mcp-dns-review.txt": {
+    "original_sha256": "719897d5cf2c5f38d11965a5d62e37aada14d29eff8e67ec914516ef4f41c32d"
+  },
+  "deppy-mcp-fixes-rereview.txt": {
+    "original_sha256": "7605d7c8077f44740deb3538d04ed36e92ea3874e93db738b436d7bcd234a006"
+  },
+  "deppy-mcp-register-review.txt": {
+    "original_sha256": "605085aa882285b24a72d5e26df919c47cb98cf47068928ad4ed4eef7589d0b8"
+  },
+  "deppy-mcp-backup-review.txt": {
+    "original_sha256": "95049e37545c3265ffba62678bc4060381a1d4425d5105f9e80e18dfc83203fc"
+  },
+  "deppy-mcp-021-artifact-final.json": {
+    "original_sha256": "d007336873a02bd3fddd8517f71fcf6cc396726cb757ddcccee4dc82c8c6a87e"
+  },
+  "deppy-mcp-021-package-verification-final.log": {
+    "original_sha256": "1019f3e1473fef8d528fedb9cb1e3ddc1b891253a7875ed3c2543161e25d20e4"
+  }
+}

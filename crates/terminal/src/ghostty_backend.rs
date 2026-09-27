@@ -231,10 +231,7 @@ impl TerminalBackend for GhosttyBackend {
             is_alt_screen: self
                 .term
                 .active_screen()
-                .map(|screen| {
-                    screen
-                        != libghostty_vt::ffi::GhosttyTerminalScreen_GHOSTTY_TERMINAL_SCREEN_PRIMARY
-                })
+                .map(|screen| screen != libghostty_vt::screen::Screen::Primary)
                 .unwrap_or(false),
         })
     }

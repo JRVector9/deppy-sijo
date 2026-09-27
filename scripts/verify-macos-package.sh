@@ -94,6 +94,8 @@ verify_bundle() {
 
     verify_binary "$candidate/Contents/MacOS/$BIN_NAME"
     verify_binary "$candidate/Contents/MacOS/$PROXY_NAME"
+    verify_binary "$candidate/Contents/MacOS/deppy-cloudflared"
+    [ -s "$candidate/Contents/Resources/cloudflared-LICENSE" ] || fail "missing tunnel companion notice"
     codesign --verify --deep --strict --verbose=2 "$candidate"
 
     if [ "$REQUIRE_TRUSTED" = "1" ]; then
@@ -105,6 +107,7 @@ verify_bundle() {
         verify_trusted_code "$candidate" "$team_id"
         verify_trusted_code "$candidate/Contents/MacOS/$BIN_NAME" "$team_id"
         verify_trusted_code "$candidate/Contents/MacOS/$PROXY_NAME" "$team_id"
+        verify_trusted_code "$candidate/Contents/MacOS/deppy-cloudflared" "$team_id"
         xcrun stapler validate "$candidate"
         verify_gatekeeper "$candidate"
     fi
@@ -119,11 +122,12 @@ if [ -n "$ARCHIVE" ]; then
     ditto -x -k "$ARCHIVE" "$VERIFY_TMP_DIR"
     EXTRACTED_BUNDLE="$VERIFY_TMP_DIR/$APP_NAME.app"
     verify_bundle "$EXTRACTED_BUNDLE"
-    for binary_name in "$BIN_NAME" "$PROXY_NAME"; do
+    for binary_name in "$BIN_NAME" "$PROXY_NAME" deppy-cloudflared; do
         original_hash=$(shasum -a 256 "$BUNDLE/Contents/MacOS/$binary_name" | awk '{print $1}')
         archived_hash=$(shasum -a 256 "$EXTRACTED_BUNDLE/Contents/MacOS/$binary_name" | awk '{print $1}')
         [ "$original_hash" = "$archived_hash" ] || fail "archive changed $binary_name"
     done
+    cmp -s "$BUNDLE/Contents/Resources/cloudflared-LICENSE" "$EXTRACTED_BUNDLE/Contents/Resources/cloudflared-LICENSE" || fail "archive changed tunnel companion notice"
 fi
 
 if [ "$REQUIRE_TRUSTED" = "1" ]; then

@@ -36,6 +36,8 @@ fi
 # claude-usage.json 기록이 며칠째 안 됐다). package-macos.sh와 같은 패턴을 유지한다.
 cargo build -p deppy-sijo -p mcp-proxy $CARGO_ARGS
 BIN="target/$PROFILE_DIR/deppy-sijo"
+TUNNEL_BIN="target/$PROFILE_DIR/deppy-cloudflared"
+python3 scripts/prepare-cloudflared.py --output "$TUNNEL_BIN"
 
 # 서명 우선순위는 package-macos.sh와 동일하게 유지한다 — 배포본과 개발본의
 # designated requirement가 갈리면 권한이 따로 놀아 같은 문제가 재발한다.
@@ -52,6 +54,7 @@ if [ -n "$SIGN_ID" ]; then
     # -i 로 identifier를 고정한다 — ad-hoc의 기본 identifier(deppy_sijo-<해시>)는
     # 그 자체가 빌드마다 달라져 requirement를 흔든다.
     codesign --force --sign "$SIGN_ID" -i "$BUNDLE_ID" "$BIN"
+    codesign --force --sign "$SIGN_ID" -i "$BUNDLE_ID.tunnel" "$TUNNEL_BIN"
     echo "서명: $SIGN_ID (identifier=$BUNDLE_ID — 재빌드해도 권한 유지)"
 else
     echo "경고: 코드서명 인증서가 없어 ad-hoc으로 둡니다 — 재빌드마다 macOS가"

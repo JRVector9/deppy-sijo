@@ -22,3 +22,4 @@ node_modules/
 /.relay-dev.env
 /.relay-dev/
 /scripts/tests/__pycache__/
+/scripts/__pycache__/

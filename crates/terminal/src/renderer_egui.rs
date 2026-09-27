@@ -808,6 +808,13 @@ fn display_char(c: char) -> char {
     }
 }
 
+// Only scripts with terminal two-cell scalar semantics share a wide run.
+// Emoji and symbols may use a different fallback face; keep them independent.
+fn is_cjk_scalar(c: char) -> bool {
+    matches!(c as u32, 0x1100..=0x11ff | 0x2e80..=0xa4cf | 0xac00..=0xd7af
+        | 0xf900..=0xfaff | 0xfe10..=0xfe6f | 0xff00..=0xff60 | 0x20000..=0x323af)
+}
+
 fn build_row_cache(
     painter: &egui::Painter,
     snapshot: &TerminalViewportSnapshot,
@@ -869,7 +876,8 @@ fn build_row_cache(
         // Width-class boundaries keep the fitting contract uniform. epaint
         // handles fallback fonts inside a galley; each scalar still receives
         // the terminal's exact one/two-cell advance below.
-        if pending.needs_flush(col, fg, attrs, width_cols) {
+        let independent = term_cell.wide && !is_cjk_scalar(term_cell.c);
+        if independent || pending.needs_flush(col, fg, attrs, width_cols) {
             pending.flush(
                 &mut text_runs,
                 painter,
@@ -879,6 +887,15 @@ fn build_row_cache(
             );
         }
         pending.push(col, display_char(term_cell.c), fg, attrs, width_cols);
+        if independent {
+            pending.flush(
+                &mut text_runs,
+                painter,
+                font_id,
+                bold_family_ready,
+                cell_width,
+            );
+        }
     }
 
     pending.flush(
@@ -1686,6 +1703,22 @@ mod tests {
                 cache.rebuilt_rows_last_frame(),
             );
         }
+    }
+
+    #[test]
+    fn cjk_runs_keep_emoji_fallback_in_an_independent_run() {
+        let snapshot = backend_snap("한글🚀가나");
+        let ctx = egui::Context::default();
+        let mut cache = TerminalRenderCache::default();
+        draw_for_test(&ctx, &mut cache, &snapshot);
+        let row = cache.rows_cache[0].as_ref().unwrap();
+        assert_eq!(
+            row.text_runs
+                .iter()
+                .map(|run| run.galley.text())
+                .collect::<Vec<_>>(),
+            vec!["한글", "🚀", "가나"]
+        );
     }
 
     #[test]

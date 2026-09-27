@@ -1326,3 +1326,14 @@ cloud.oauth_input = Requests read, answers and input scope. Per-session input pe
 cloud.oauth_read = Requests read and answers scope.
 cloud.oauth_approve = Approve this connector
 cloud.oauth_deny = Deny
+
+# Managed automatic MCP connection
+cloud.mode_auto = 自动生成地址
+cloud.mode_manual = 连接固定地址
+cloud.auto_hint = 无需单独安装或账户。重新连接时地址可能改变。
+cloud.preparing = 正在生成地址…
+cloud.verifying = 正在验证外部连接…
+cloud.ready = MCP 已连接
+cloud.stopping = 正在断开连接…
+cloud.helper_missing = 应用缺少连接助手。请安装最新发行版或连接固定地址。
+cloud.auto_failed = 自动连接失败。请检查网络后重试，或连接固定地址。

@@ -14579,6 +14579,7 @@ impl App {
         );
         cloud_agent.port = config.cloud_agent.port.max(1024);
         cloud_agent.hostname = config.cloud_agent.public_host.chars().take(259).collect();
+        cloud_agent.automatic = config.cloud_agent.automatic;
         let composer_history_path = db_path
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
@@ -28866,6 +28867,7 @@ impl App {
     /// eframe renderer feature와 무관한 공통 종료 경로. `App::on_exit` 시그니처만
     /// `glow` feature에 따라 달라지므로 실제 정리는 여기 한 번만 유지한다.
     fn shutdown_on_exit(&mut self) {
+        self.cloud_agent.shutdown();
         // 디바운스 대기 중이던 메모를 먼저 기록한다 — 종료가 타건보다 빠르면
         // 마지막 문장이 통째로 사라진다.
         self.flush_pending_note();
@@ -32871,7 +32873,11 @@ impl eframe::App for App {
             devices: &self.relay_devices,
             now: relay_now,
         };
-        let cloud_coordinates_before = (self.cloud_agent.port, self.cloud_agent.hostname.clone());
+        let cloud_coordinates_before = (
+            self.cloud_agent.port,
+            self.cloud_agent.hostname.clone(),
+            self.cloud_agent.automatic,
+        );
         let mut out = ui::settings::show(
             ui.ctx(),
             &mut self.settings_open,
@@ -33176,9 +33182,16 @@ impl eframe::App for App {
                 }
             },
         );
-        if cloud_coordinates_before != (self.cloud_agent.port, self.cloud_agent.hostname.clone()) {
+        if cloud_coordinates_before
+            != (
+                self.cloud_agent.port,
+                self.cloud_agent.hostname.clone(),
+                self.cloud_agent.automatic,
+            )
+        {
             self.config.cloud_agent.port = self.cloud_agent.port;
             self.config.cloud_agent.public_host = self.cloud_agent.hostname.clone();
+            self.config.cloud_agent.automatic = self.cloud_agent.automatic;
             out.config_changed = true;
         }
         if let Some(intent) = connector_intent {

@@ -159,6 +159,7 @@ pub struct Server {
     pub requests: Receiver<Request>,
     stop: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
+    public_host: Arc<std::sync::RwLock<String>>,
 }
 impl Server {
     pub fn start(
@@ -182,7 +183,8 @@ impl Server {
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, requests) = mpsc::sync_channel(16);
         let (a, s, w) = (auth.clone(), stop.clone(), Arc::new(wake));
-        let host = public_host.to_owned();
+        let host = Arc::new(std::sync::RwLock::new(public_host.to_owned()));
+        let public_host = host.clone();
         let active = Arc::new(AtomicUsize::new(0));
         let worker = thread::Builder::new()
             .name("agent-mcp".into())
@@ -214,7 +216,8 @@ impl Server {
                             thread::spawn(move || {
                                 let _ = stream.set_read_timeout(Some(REQUEST_TIMEOUT));
                                 let _ = stream.set_write_timeout(Some(REQUEST_TIMEOUT));
-                                handle(&mut stream, addr, &host, &a, &tx, &*w);
+                                let public = host.read().unwrap().clone();
+                                handle(&mut stream, addr, &public, &a, &tx, &*w);
                                 active.fetch_sub(1, Ordering::AcqRel);
                             });
                         }
@@ -231,7 +234,24 @@ impl Server {
             requests,
             stop,
             worker: Some(worker),
+            public_host,
         })
+    }
+
+    /// Publish the generated endpoint once, before exposing URL/token controls.
+    /// Replacing an active OAuth issuer requires stopping and restarting the server.
+    pub fn set_public_host(&self, host: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !host.is_empty() && valid_public_host(host),
+            "invalid_public_hostname"
+        );
+        let mut current = self.public_host.write().unwrap();
+        anyhow::ensure!(
+            current.is_empty() || current.as_str() == host,
+            "public_host_already_set"
+        );
+        *current = host.to_owned();
+        Ok(())
     }
 }
 impl Drop for Server {
@@ -530,6 +550,39 @@ mod deadline_tests {
 #[cfg(test)]
 mod hostname_tests {
     use super::*;
+    #[test]
+    fn generated_hostname_updates_real_host_checks_and_oauth_resource_once() {
+        use std::io::{Read, Write};
+        fn get(server: &Server, host: &str) -> String {
+            let mut stream = TcpStream::connect(server.addr).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            write!(
+                stream,
+                "GET /.well-known/oauth-protected-resource/mcp HTTP/1.1\r\nHost: {host}\r\n\r\n"
+            )
+            .unwrap();
+            let mut output = String::new();
+            stream.read_to_string(&mut output).unwrap();
+            output
+        }
+        let server = Server::start(0, "", || {}).unwrap();
+        let token = server.auth.token_for_user();
+        assert!(get(&server, "abc.trycloudflare.com").starts_with("HTTP/1.1 403"));
+        server.set_public_host("abc.trycloudflare.com").unwrap();
+        let response = get(&server, "abc.trycloudflare.com");
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("https://abc.trycloudflare.com/mcp"));
+        assert_eq!(server.auth.token_for_user().as_str(), token.as_str());
+        assert!(server.set_public_host("https://bad.example").is_err());
+        assert!(
+            server
+                .set_public_host("different.trycloudflare.com")
+                .is_err()
+        );
+        assert!(get(&server, "abc.trycloudflare.com").starts_with("HTTP/1.1 200"));
+    }
     #[test]
     fn dedicated_funnel_port_is_allowed_but_urls_and_bad_domains_are_rejected() {
         assert!(valid_public_host("mac.example.ts.net:8443"));

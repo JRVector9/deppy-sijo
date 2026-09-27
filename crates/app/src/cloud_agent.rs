@@ -1,4 +1,5 @@
 //! App-owned authorization and effects for the outward MCP bridge.
+mod tunnel;
 mod ui;
 use agent_mcp::{Claim, History, Record, Request, Server, encode_input, now};
 use serde_json::{Value, json};
@@ -68,6 +69,10 @@ pub struct CloudAgent {
     pub boot: String,
     pub port: u16,
     pub hostname: String,
+    pub automatic: bool,
+    connection: Connection,
+    generated_hostname: Option<String>,
+    tunnel: Option<tunnel::Tunnel>,
     pub error: Option<String>,
     pub reveal: bool,
     pub selected_record: Option<String>,
@@ -82,6 +87,14 @@ pub struct CloudAgent {
     pending: HashMap<String, PendingInput>,
     redaction: secret::RedactionService,
     token_lease: Option<secret::RedactionLease>,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Connection {
+    Idle,
+    Preparing,
+    Verifying,
+    Ready,
+    Stopping,
 }
 impl CloudAgent {
     pub fn new(path: &Path, redaction: secret::RedactionService) -> Self {
@@ -100,6 +113,10 @@ impl CloudAgent {
             boot: uuid::Uuid::new_v4().to_string(),
             port: 8739,
             hostname: String::new(),
+            automatic: true,
+            connection: Connection::Idle,
+            generated_hostname: None,
+            tunnel: None,
             error: None,
             reveal: false,
             selected_record: None,
@@ -233,42 +250,166 @@ impl CloudAgent {
         }
         Ok(target.clone())
     }
-    pub fn apply_action(&mut self, ctx: &egui::Context) {
-        match self.action.take() {
-            Some(Action::Start) => {
-                if self.history.is_none() {
-                    self.error = Some("history_unavailable".into());
-                    return;
-                }
-                let wake = ctx.clone();
-                match Server::start_with_redaction(
-                    self.port,
-                    &self.hostname,
-                    self.redaction.clone(),
-                    move || wake.request_repaint(),
-                ) {
-                    Ok(server) => {
-                        let token =
-                            secret::SecretString::new(server.auth.token_for_user().to_string());
-                        let Ok(lease) = self.redaction.acquire_rotating(&token) else {
-                            self.error = Some("token_redaction_capacity_no_connection".into());
-                            return;
-                        };
-                        self.token_lease = Some(lease);
-                        ctx.request_repaint_after(std::time::Duration::from_secs(
-                            agent_mcp::TOKEN_TTL,
-                        ));
-                        self.server = Some(server);
-                        self.error = None;
+    fn busy(&self) -> bool {
+        self.server.is_some() || self.tunnel.is_some()
+    }
+    fn ready(&self) -> bool {
+        self.server.is_some() && (self.tunnel.is_none() || self.connection == Connection::Ready)
+    }
+    fn endpoint(&self) -> Option<String> {
+        if !self.ready() {
+            return None;
+        }
+        let server = self.server.as_ref()?;
+        let host = self.generated_hostname.as_deref().unwrap_or(&self.hostname);
+        Some(if host.is_empty() {
+            format!("http://{}/mcp", server.addr)
+        } else {
+            format!("https://{host}/mcp")
+        })
+    }
+    fn start_server(&mut self, ctx: &egui::Context, host: &str) -> bool {
+        if self.history.is_none() {
+            self.error = Some("history_unavailable".into());
+            return false;
+        }
+        let wake = ctx.clone();
+        match Server::start_with_redaction(self.port, host, self.redaction.clone(), move || {
+            wake.request_repaint()
+        }) {
+            Ok(server) => {
+                let token = secret::SecretString::new(server.auth.token_for_user().to_string());
+                let Ok(lease) = self.redaction.acquire_rotating(&token) else {
+                    self.error = Some("token_redaction_capacity_no_connection".into());
+                    return false;
+                };
+                self.token_lease = Some(lease);
+                self.server = Some(server);
+                self.error = None;
+                ctx.request_repaint_after(std::time::Duration::from_secs(agent_mcp::TOKEN_TTL));
+                true
+            }
+            Err(_) => {
+                self.error = Some("server_start_failed_check_port_hostname".into());
+                false
+            }
+        }
+    }
+    fn start_auto(&mut self, ctx: &egui::Context, executable: std::path::PathBuf) {
+        if self.busy() || !self.start_server(ctx, "") {
+            return;
+        }
+        let port = self.server.as_ref().unwrap().addr.port();
+        let wake = ctx.clone();
+        match tunnel::Tunnel::start(
+            executable,
+            port,
+            std::time::Duration::from_secs(90),
+            move || wake.request_repaint(),
+        ) {
+            Ok(worker) => {
+                self.tunnel = Some(worker);
+                self.connection = Connection::Preparing;
+            }
+            Err(_) => {
+                self.stop_connection();
+                self.error = Some("tunnel_worker_failed".into());
+            }
+        }
+    }
+    fn stop_connection(&mut self) {
+        self.take_control();
+        self.server = None;
+        self.token_lease = None;
+        self.generated_hostname = None;
+        self.reveal = false;
+        self.connection = if let Some(worker) = &self.tunnel {
+            worker.cancel();
+            Connection::Stopping
+        } else {
+            Connection::Idle
+        };
+    }
+    pub fn shutdown(&mut self) {
+        self.stop_connection();
+        if let Some(mut worker) = self.tunnel.take() {
+            worker.shutdown();
+        }
+        self.connection = Connection::Idle;
+    }
+    fn poll_connection(&mut self, ctx: &egui::Context) {
+        let event = self.tunnel.as_mut().and_then(tunnel::Tunnel::poll);
+        if self.connection != Connection::Stopping {
+            match event {
+                Some(tunnel::Event::Address(host)) => {
+                    if self
+                        .server
+                        .as_ref()
+                        .is_some_and(|server| server.set_public_host(&host).is_ok())
+                    {
+                        self.generated_hostname = Some(host);
+                        self.connection = Connection::Verifying;
+                    } else {
+                        self.stop_connection();
+                        self.error = Some("tunnel_hostname_failed".into());
                     }
-                    Err(_) => self.error = Some("server_start_failed_check_port_hostname".into()),
+                }
+                Some(tunnel::Event::Ready(host)) => {
+                    // The final state can replace Address between frames; publish before checking it.
+                    if self
+                        .server
+                        .as_ref()
+                        .is_some_and(|server| server.set_public_host(&host).is_ok())
+                    {
+                        self.generated_hostname = Some(host);
+                        self.connection = Connection::Ready;
+                    } else {
+                        self.stop_connection();
+                        self.error = Some("tunnel_hostname_failed".into());
+                    }
+                }
+                Some(tunnel::Event::Failed(code)) => {
+                    self.stop_connection();
+                    self.error = Some(code.into());
+                }
+                Some(tunnel::Event::Stopped) => {
+                    self.stop_connection();
+                }
+                None => {}
+            }
+        }
+        if self.tunnel.as_ref().is_some_and(tunnel::Tunnel::finished) {
+            if self.connection != Connection::Stopping {
+                self.stop_connection();
+                self.error = Some("tunnel_worker_failed".into());
+            }
+            self.tunnel = None;
+            self.connection = Connection::Idle;
+        }
+        if self.tunnel.is_some() && self.connection != Connection::Ready {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+    }
+    pub fn apply_action(&mut self, ctx: &egui::Context) {
+        self.poll_connection(ctx);
+        match self.action.take() {
+            Some(Action::Start) if !self.busy() => {
+                if self.automatic {
+                    if let Some(executable) = tunnel::companion() {
+                        self.start_auto(ctx, executable);
+                    } else {
+                        self.error = Some("tunnel_companion_missing".into());
+                    }
+                } else {
+                    let host = self.hostname.clone();
+                    if self.start_server(ctx, &host) {
+                        self.connection = Connection::Ready;
+                    }
                 }
             }
             Some(Action::Stop) => {
-                self.server = None;
-                self.token_lease = None;
-                self.take_control();
-                self.reveal = false;
+                self.stop_connection();
+                self.error = None;
             }
             Some(Action::Rotate) => {
                 if let Some(s) = &self.server {
@@ -277,8 +418,7 @@ impl CloudAgent {
                     match self.redaction.acquire_rotating(&token) {
                         Ok(lease) => self.token_lease = Some(lease),
                         Err(_) => {
-                            self.server = None;
-                            self.token_lease = None;
+                            self.stop_connection();
                             self.error = Some("token_redaction_capacity_connection_revoked".into());
                         }
                     }
@@ -287,7 +427,7 @@ impl CloudAgent {
                 self.take_control();
                 self.reveal = false;
             }
-            None => {}
+            _ => {}
         }
     }
     pub fn next_request(&self) -> Option<Request> {
@@ -1107,6 +1247,47 @@ mod http_end_to_end_tests {
         net::TcpStream,
         time::Duration,
     };
+    #[cfg(unix)]
+    #[test]
+    fn automatic_start_cancel_keeps_manual_host_and_never_copies_unverified_url() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("deppy-auto-bridge-{}", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &path,
+            "#!/bin/sh\nprintf 'https://fixture.trycloudflare.com\\n' >&2\nexec /bin/sleep 30\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut bridge = CloudAgent::memory();
+        bridge.port = 0;
+        bridge.hostname = "saved.example.com".into();
+        let ctx = egui::Context::default();
+        bridge.start_auto(&ctx, path.clone());
+        let addr = bridge.server.as_ref().unwrap().addr;
+        bridge.start_auto(&ctx, path.clone());
+        assert_eq!(bridge.server.as_ref().unwrap().addr, addr);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while bridge.connection != Connection::Verifying {
+            bridge.apply_action(&ctx);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(bridge.endpoint().is_none());
+        assert_eq!(bridge.hostname, "saved.example.com");
+        let auth = bridge.server.as_ref().unwrap().auth.clone();
+        let token = auth.token_for_user();
+        bridge.action = Some(Action::Stop);
+        bridge.apply_action(&ctx);
+        assert!(bridge.server.is_none());
+        assert!(
+            auth.authenticate(&format!("Bearer {}", token.as_str()), now())
+                .is_none()
+        );
+        bridge.shutdown();
+        assert!(!bridge.busy());
+        assert_eq!(bridge.hostname, "saved.example.com");
+        std::fs::remove_file(path).unwrap();
+    }
     fn rpc(addr: std::net::SocketAddr, token: &str, id: u64, tool: &str, args: Value) -> Value {
         let body=json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":tool,"arguments":args}}).to_string();
         let mut s = TcpStream::connect(addr).unwrap();
@@ -1118,6 +1299,14 @@ mod http_end_to_end_tests {
     }
     #[test]
     fn oauth_http_to_real_pty_output_and_own_answer_roundtrip() {
+        real_roundtrip(false);
+    }
+    #[test]
+    #[ignore = "requires public Cloudflare access and the bundled companion"]
+    fn automatic_public_tunnel_to_real_pty_and_own_answer_roundtrip() {
+        real_roundtrip(true);
+    }
+    fn real_roundtrip(public: bool) {
         use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
         use runtime::{RuntimeCommandSink as _, RuntimeEventStream as _};
         use sha2::{Digest, Sha256};
@@ -1162,7 +1351,32 @@ mod http_end_to_end_tests {
             std::thread::sleep(Duration::from_millis(5));
         };
         let mut bridge = CloudAgent::memory();
-        bridge.server = Some(Server::start(0, "", || {}).unwrap());
+        let ctx = egui::Context::default();
+        let endpoint = if public {
+            bridge.port = 0;
+            bridge.start_auto(
+                &ctx,
+                tunnel::companion().expect("bundled companion required"),
+            );
+            let deadline = std::time::Instant::now() + Duration::from_secs(95);
+            while !bridge.ready() {
+                bridge.apply_action(&ctx);
+                assert!(
+                    bridge.error.is_none(),
+                    "automatic connection failed: {:?}",
+                    bridge.error
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "automatic connection timed out"
+                );
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            bridge.endpoint()
+        } else {
+            bridge.server = Some(Server::start(0, "", || {}).unwrap());
+            None
+        };
         let mut target = Target::fixture("real-session", "real-generation");
         target.session = session;
         target.screen = None;
@@ -1196,7 +1410,9 @@ mod http_end_to_end_tests {
             serde_json::from_str(register.split_once("\r\n\r\n").unwrap().1).unwrap();
         let verifier = "v".repeat(43);
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(&verifier));
-        let resource = format!("http://{addr}/mcp");
+        let resource = endpoint
+            .clone()
+            .unwrap_or_else(|| format!("http://{addr}/mcp"));
         let query = url::form_urlencoded::Serializer::new(String::new())
             .extend_pairs([
                 ("client_id", client["client_id"].as_str().unwrap()),
@@ -1253,22 +1469,37 @@ mod http_end_to_end_tests {
             serde_json::from_str(token_response.split_once("\r\n\r\n").unwrap().1).unwrap();
         let token = tokens["access_token"].as_str().unwrap().to_owned();
         let client = std::thread::spawn(move || {
+            let call = |id, tool, args| {
+                if let Some(url) = &endpoint {
+                    let agent: ureq::Agent = ureq::Agent::config_builder()
+                        .timeout_global(Some(Duration::from_secs(12)))
+                        .build()
+                        .into();
+                    let request = json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":tool,"arguments":args}}).to_string();
+                    let mut response = agent
+                        .post(url)
+                        .header("Authorization", &format!("Bearer {token}"))
+                        .header("Accept", "application/json, text/event-stream")
+                        .header("Content-Type", "application/json")
+                        .send(request.as_bytes())
+                        .unwrap();
+                    serde_json::from_str::<Value>(&response.body_mut().read_to_string().unwrap())
+                        .unwrap()
+                } else {
+                    rpc(addr, &token, id, tool, args)
+                }
+            };
             let args = json!({"session_id":"real-session","generation":"real-generation","operation_id":"real-input","text":"printf 'DEPPY_%s\\n' REAL_OUTPUT","submit":true});
-            let response = rpc(addr, &token, 1, "send_text", args.clone());
+            let response = call(1, "send_text", args.clone());
             assert_eq!(response["result"]["isError"], false);
             let result: Value =
                 serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
                     .unwrap();
             assert_eq!(result["admission"], "pty_queue");
-            assert_eq!(
-                rpc(addr, &token, 2, "send_text", args)["result"]["isError"],
-                false
-            );
+            assert_eq!(call(2, "send_text", args)["result"]["isError"], false);
             let mut found = false;
             for n in 0..40 {
-                let r = rpc(
-                    addr,
-                    &token,
+                let r = call(
                     10 + n,
                     "read_output",
                     json!({"session_id":"real-session","generation":"real-generation"}),
@@ -1287,9 +1518,7 @@ mod http_end_to_end_tests {
             }
             assert!(found, "executed output must return from the real PTY");
             assert_eq!(
-                rpc(
-                    addr,
-                    &token,
+                call(
                     100,
                     "notify",
                     json!({"session_id":"real-session","generation":"real-generation","operation_id":"real-answer","message":"Grok own final answer"})
@@ -1297,10 +1526,12 @@ mod http_end_to_end_tests {
                 false
             );
         });
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let deadline =
+            std::time::Instant::now() + Duration::from_secs(if public { 90 } else { 15 });
         let mut writes = 0;
         let mut notice = false;
         while !client.is_finished() {
+            bridge.apply_action(&ctx);
             assert!(
                 std::time::Instant::now() < deadline,
                 "real roundtrip timed out"
@@ -1345,6 +1576,8 @@ mod http_end_to_end_tests {
         assert!(notice);
         assert_eq!(bridge.answers[0].message, "Grok own final answer");
         drop(host);
+        bridge.shutdown();
+        assert!(!bridge.busy());
         drop(bridge);
         std::fs::remove_dir_all(logs).unwrap();
     }

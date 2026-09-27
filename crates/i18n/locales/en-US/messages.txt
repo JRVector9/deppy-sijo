@@ -1326,3 +1326,14 @@ cloud.oauth_input = Requests read, answers and input scope. Per-session input pe
 cloud.oauth_read = Requests read and answers scope.
 cloud.oauth_approve = Approve this connector
 cloud.oauth_deny = Deny
+
+# Managed automatic MCP connection
+cloud.mode_auto = Generate address automatically
+cloud.mode_manual = Connect a fixed address
+cloud.auto_hint = Create an address without separate installation or an account. Reconnecting may change the address.
+cloud.preparing = Creating address…
+cloud.verifying = Verifying public connection…
+cloud.ready = MCP connected
+cloud.stopping = Disconnecting…
+cloud.helper_missing = The connection helper is missing. Install the latest packaged app or connect a fixed address.
+cloud.auto_failed = Automatic connection failed. Check your network and retry, or connect a fixed address.

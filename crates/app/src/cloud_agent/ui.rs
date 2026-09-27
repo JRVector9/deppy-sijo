@@ -5,31 +5,68 @@ impl CloudAgent {
         ui.heading(catalog.t("cloud.title", &[]));
         ui.label(catalog.t("cloud.intro", &[]));
         ui.add_space(10.0);
-        let running = self.server.is_some();
-        ui.horizontal(|ui| {
-            ui.label(catalog.t("cloud.port", &[]));
-            ui.add_enabled(
-                !running,
-                egui::DragValue::new(&mut self.port).range(1024..=65535),
-            );
-            ui.label(catalog.t("cloud.hostname", &[]));
-            ui.add_enabled(
-                !running,
-                egui::TextEdit::singleline(&mut self.hostname)
-                    .char_limit(259)
-                    .hint_text("deppy.example.com"),
-            );
+        let running = self.busy();
+        ui.add_enabled_ui(!running, |ui| {
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut self.automatic, true, catalog.t("cloud.mode_auto", &[]));
+                ui.radio_value(
+                    &mut self.automatic,
+                    false,
+                    catalog.t("cloud.mode_manual", &[]),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label(catalog.t("cloud.port", &[]));
+                ui.add(egui::DragValue::new(&mut self.port).range(1024..=65535));
+                if !self.automatic {
+                    ui.label(catalog.t("cloud.hostname", &[]));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.hostname)
+                            .char_limit(259)
+                            .hint_text("deppy.example.com"),
+                    );
+                }
+            });
         });
-        ui.label(egui::RichText::new(catalog.t("cloud.tunnel_hint", &[])).weak());
+        ui.label(
+            egui::RichText::new(catalog.t(
+                if self.automatic {
+                    "cloud.auto_hint"
+                } else {
+                    "cloud.tunnel_hint"
+                },
+                &[],
+            ))
+            .weak(),
+        );
+        if running {
+            let key = match self.connection {
+                super::Connection::Preparing => "cloud.preparing",
+                super::Connection::Verifying => "cloud.verifying",
+                super::Connection::Stopping => "cloud.stopping",
+                _ => "cloud.ready",
+            };
+            ui.horizontal(|ui| {
+                if !self.ready() {
+                    ui.spinner();
+                }
+                ui.label(catalog.t(key, &[]));
+            });
+        }
         ui.horizontal(|ui| {
             if ui
-                .button(catalog.t(if running { "cloud.stop" } else { "cloud.start" }, &[]))
+                .add_enabled(
+                    self.connection != super::Connection::Stopping,
+                    egui::Button::new(
+                        catalog.t(if running { "cloud.stop" } else { "cloud.start" }, &[]),
+                    ),
+                )
                 .clicked()
             {
                 self.action = Some(if running { Action::Stop } else { Action::Start });
                 ui.ctx().request_repaint();
             }
-            if running && ui.button(catalog.t("cloud.rotate", &[])).clicked() {
+            if self.ready() && ui.button(catalog.t("cloud.rotate", &[])).clicked() {
                 self.action = Some(Action::Rotate);
                 ui.ctx().request_repaint();
             }
@@ -38,13 +75,8 @@ impl CloudAgent {
                 self.take_control();
             }
         });
-        if let Some(s) = &self.server {
+        if let (Some(s), Some(endpoint)) = (&self.server, self.endpoint()) {
             let local = format!("http://{}/mcp", s.addr);
-            let endpoint = if self.hostname.is_empty() {
-                local.clone()
-            } else {
-                format!("https://{}/mcp", self.hostname)
-            };
             ui.horizontal(|ui| {
                 ui.monospace(&endpoint);
                 if ui.button(catalog.t("cloud.copy_url", &[])).clicked() {
@@ -78,10 +110,14 @@ impl CloudAgent {
             });
         }
         if let Some(error) = &self.error {
-            ui.colored_label(
-                ui.visuals().error_fg_color,
-                catalog.t("cloud.error", &[("code", error)]),
-            );
+            let message = if error == "tunnel_companion_missing" {
+                catalog.t("cloud.helper_missing", &[])
+            } else if error.starts_with("tunnel_") {
+                catalog.t("cloud.auto_failed", &[])
+            } else {
+                catalog.t("cloud.error", &[("code", error)])
+            };
+            ui.colored_label(ui.visuals().error_fg_color, message);
         }
         if let Some(s) = &self.server {
             for approval in s.auth.approvals() {
@@ -208,6 +244,22 @@ impl CloudAgent {
 mod tests {
     use super::*;
     use egui_kittest::kittest::Queryable as _;
+    #[test]
+    fn automatic_connection_is_default_and_manual_host_is_advanced() {
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        let bridge = CloudAgent::memory();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1200.0, 900.0))
+            .build_ui_state(
+                move |ui, state: &mut CloudAgent| state.contents(ui, &catalog),
+                bridge,
+            );
+        assert!(harness.query_by_label("자동 주소 생성").is_some());
+        assert!(harness.query_by_label("공개 HTTPS 호스트").is_none());
+        harness.get_by_label("고정 주소 직접 연결").click();
+        harness.run();
+        assert!(harness.query_by_label("공개 HTTPS 호스트").is_some());
+    }
     #[test]
     fn answer_navigation_scrolls_once_and_allows_collapsing_and_reopening() {
         let catalog = i18n::Catalog::load("ko-KR").unwrap();

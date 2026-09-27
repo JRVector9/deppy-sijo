@@ -1326,3 +1326,14 @@ cloud.oauth_input = Requests read, answers and input scope. Per-session input pe
 cloud.oauth_read = Requests read and answers scope.
 cloud.oauth_approve = Approve this connector
 cloud.oauth_deny = Deny
+
+# Managed automatic MCP connection
+cloud.mode_auto = アドレスを自動生成
+cloud.mode_manual = 固定アドレスに接続
+cloud.auto_hint = 追加のインストールやアカウントは不要です。再接続でアドレスが変わる場合があります。
+cloud.preparing = アドレスを生成中…
+cloud.verifying = 外部接続を確認中…
+cloud.ready = MCP 接続済み
+cloud.stopping = 切断中…
+cloud.helper_missing = 接続ヘルパーがありません。最新の配布アプリをインストールするか、固定アドレスに接続してください。
+cloud.auto_failed = 自動接続に失敗しました。ネットワークを確認して再試行するか、固定アドレスに接続してください。

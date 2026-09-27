@@ -185,18 +185,47 @@ pub struct Config {
 }
 
 /// Non-secret connection coordinates. Server and consent always start disabled.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CloudAgentConfig {
     pub port: u16,
     pub public_host: String,
+    pub automatic: bool,
 }
 impl Default for CloudAgentConfig {
     fn default() -> Self {
         Self {
             port: 8739,
             public_host: String::new(),
+            automatic: true,
         }
+    }
+}
+impl<'de> Deserialize<'de> for CloudAgentConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(default)]
+        struct Stored {
+            port: u16,
+            public_host: String,
+            automatic: Option<bool>,
+        }
+        impl Default for Stored {
+            fn default() -> Self {
+                let config = CloudAgentConfig::default();
+                Self {
+                    port: config.port,
+                    public_host: config.public_host,
+                    automatic: None,
+                }
+            }
+        }
+        let stored = Stored::deserialize(deserializer)?;
+        let automatic = stored.automatic.unwrap_or(stored.public_host.is_empty());
+        Ok(Self {
+            port: stored.port,
+            public_host: stored.public_host,
+            automatic,
+        })
     }
 }
 
@@ -681,6 +710,27 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cloud_automatic_mode_defaults_on_and_manual_choice_roundtrips() {
+        let default = super::CloudAgentConfig::default();
+        let value = serde_json::to_value(&default).unwrap();
+        assert_eq!(value["automatic"], true);
+        let manual: super::CloudAgentConfig = serde_json::from_value(
+            serde_json::json!({"automatic":false,"port":8739,"public_host":"mcp.example.com"}),
+        )
+        .unwrap();
+        assert_eq!(serde_json::to_value(manual).unwrap()["automatic"], false);
+    }
+    #[test]
+    fn older_fixed_host_config_keeps_manual_mode_on_upgrade() {
+        let old: super::CloudAgentConfig = serde_json::from_value(
+            serde_json::json!({"port":8739,"public_host":"existing.example.com"}),
+        )
+        .unwrap();
+        assert_eq!(serde_json::to_value(old).unwrap()["automatic"], false);
+        let empty: super::CloudAgentConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(serde_json::to_value(empty).unwrap()["automatic"], true);
+    }
     /// Relay와 Tailscale(web)은 완전히 독립이다. 「둘 다」는 두 스위치에서 파생될 뿐,
     /// 저장되는 전송 모드 열거형은 존재하지 않는다.
     #[test]

@@ -1,3 +1,4 @@
+use crate::visible_cells::VisibleCells;
 use std::sync::Arc;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -10,7 +11,7 @@ pub struct TerminalViewportSnapshot {
     pub rows: u16,
     pub cursor: CursorSnapshot,
     /// row-major, cols * rows개
-    pub visible_cells: Arc<[TerminalCell]>,
+    pub visible_cells: VisibleCells,
     /// Sorted sparse full text for cells whose NFC contains multiple scalars.
     pub graphemes: Arc<[CellGrapheme]>,
     /// 직전 take_snapshot 이후 바뀐 셀 범위 — renderer_egui가 행 갤리 캐시 무효화에,

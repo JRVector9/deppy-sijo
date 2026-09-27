@@ -1,6 +1,7 @@
 //! AlacrittyBackend (설계문서 4.1/4.3). tty/event_loop는 사용 금지(1.3) —
 //! Term + vte parser + grid만 쓴다. PTY는 pty crate가 소유한다.
 
+use crate::visible_cells::VisibleCells;
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Row, Scroll};
 use alacritty_terminal::term::cell::Cell as AlacrittyCell;
@@ -9,6 +10,8 @@ use alacritty_terminal::term::{Config, Term, TermDamage, TermMode, test::TermSiz
 use alacritty_terminal::vte::ansi::{
     Color, CursorShape as VteCursorShape, NamedColor, Processor, Rgb,
 };
+use std::cell::RefCell;
+use std::sync::Arc;
 use unicode_normalization::UnicodeNormalization;
 
 use crate::backend::{
@@ -26,18 +29,14 @@ pub(crate) fn composed_cell(base: char, zerowidth: Option<&[char]>) -> (char, Op
     let Some(zw) = zerowidth.filter(|zw| !zw.is_empty()) else {
         return (base, None);
     };
+    let mut nfc = std::iter::once(base).chain(zw.iter().copied()).nfc();
+    if let (Some(c), None) = (nfc.next(), nfc.next()) {
+        return (c, None);
+    }
     let mut text = String::with_capacity(4 + zw.len() * 4);
     text.push(base);
     text.extend(zw.iter());
-    let mut nfc = text.nfc();
-    let scalar = match (nfc.next(), nfc.next()) {
-        (Some(c), None) => Some(c),
-        _ => None,
-    };
-    match scalar {
-        Some(c) => (c, None),
-        None => (base, Some(text)),
-    }
+    (base, Some(text))
 }
 
 /// 터미널 질의 응답을 수집한다 (PtyWrite + OSC 색상 질의).
@@ -80,6 +79,138 @@ impl EventListener for CollectingListener {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ViewportKey {
+    cols: usize,
+    rows: usize,
+    display_offset: usize,
+    alt: bool,
+}
+
+#[derive(Default)]
+struct ViewportCache {
+    key: Option<ViewportKey>,
+    cells: Option<VisibleCells>,
+    graphemes: Option<Arc<[CellGrapheme]>>,
+    dirty: Vec<bool>,
+    scratch: Option<Row<AlacrittyCell>>,
+    grapheme_bytes: usize,
+    scratch_bytes: usize,
+}
+impl ViewportCache {
+    fn heap_bytes(&self) -> usize {
+        self.cells.as_ref().map_or(0, VisibleCells::heap_bytes)
+            + self.grapheme_bytes
+            + self.scratch_bytes
+            + self.dirty.capacity() * std::mem::size_of::<bool>()
+    }
+}
+
+#[inline]
+fn snapshot_cell_style(
+    cell: &AlacrittyCell,
+    colors: &alacritty_terminal::term::color::Colors,
+    c: char,
+) -> TerminalCell {
+    let flags = cell.flags;
+    let (mut fg, mut bg) = (
+        resolve_color(cell.fg, colors, DEFAULT_FG),
+        resolve_color(cell.bg, colors, DEFAULT_BG),
+    );
+    if flags.contains(Flags::INVERSE) {
+        std::mem::swap(&mut fg, &mut bg);
+    }
+    let mut attrs = CellAttrs::empty();
+    attrs.set(CellAttrs::BOLD, flags.contains(Flags::BOLD));
+    attrs.set(CellAttrs::ITALIC, flags.contains(Flags::ITALIC));
+    attrs.set(
+        CellAttrs::UNDERLINE,
+        flags.intersects(
+            Flags::UNDERLINE
+                | Flags::DOUBLE_UNDERLINE
+                | Flags::UNDERCURL
+                | Flags::DOTTED_UNDERLINE
+                | Flags::DASHED_UNDERLINE,
+        ),
+    );
+    attrs.set(CellAttrs::STRIKEOUT, flags.contains(Flags::STRIKEOUT));
+    attrs.set(CellAttrs::DIM, flags.contains(Flags::DIM));
+    TerminalCell::new(
+        c,
+        fg,
+        bg,
+        flags.contains(Flags::WIDE_CHAR),
+        flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER),
+        attrs,
+    )
+}
+
+#[inline]
+fn snapshot_cell(
+    cell: &AlacrittyCell,
+    colors: &alacritty_terminal::term::color::Colors,
+) -> (TerminalCell, Option<String>) {
+    let flags = cell.flags;
+    let (c, text) = if flags
+        .intersects(Flags::HIDDEN | Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+    {
+        (
+            if flags.contains(Flags::HIDDEN) {
+                ' '
+            } else {
+                cell.c
+            },
+            None,
+        )
+    } else {
+        composed_cell(cell.c, cell.zerowidth())
+    };
+    (snapshot_cell_style(cell, colors, c), text)
+}
+
+/// Compare the projected row without creating transient grapheme Strings.
+#[inline]
+fn snapshot_cell_matches(
+    cell: &AlacrittyCell,
+    colors: &alacritty_terminal::term::color::Colors,
+    previous: &TerminalCell,
+    previous_text: Option<&str>,
+) -> bool {
+    let flags = cell.flags;
+    let (c, text_matches) = if flags
+        .intersects(Flags::HIDDEN | Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+    {
+        (
+            if flags.contains(Flags::HIDDEN) {
+                ' '
+            } else {
+                cell.c
+            },
+            previous_text.is_none(),
+        )
+    } else if let Some(zw) = cell.zerowidth().filter(|zw| !zw.is_empty()) {
+        if let Some(text) = previous_text {
+            // A stored multi-scalar grapheme preserves source scalars, not normalized text.
+            // Equality with that source also proves the existing composition policy is unchanged.
+            (
+                cell.c,
+                std::iter::once(cell.c)
+                    .chain(zw.iter().copied())
+                    .eq(text.chars()),
+            )
+        } else {
+            let mut nfc = std::iter::once(cell.c).chain(zw.iter().copied()).nfc();
+            match (nfc.next(), nfc.next()) {
+                (Some(c), None) => (c, true),
+                _ => (cell.c, false),
+            }
+        }
+    } else {
+        (cell.c, previous_text.is_none())
+    };
+    text_matches && snapshot_cell_style(cell, colors, c) == *previous
+}
+
 pub struct AlacrittyBackend {
     term: Term<CollectingListener>,
     listener: CollectingListener,
@@ -92,6 +223,7 @@ pub struct AlacrittyBackend {
     /// 되돌리지 못하게 한다(리뷰 A-H1의 flip-flop 방지). 압박 해소 시 runtime이
     /// clear_pressure_trim으로 해제해 스크롤백을 회복한다.
     pressure_trim_floor: Option<usize>,
+    viewport_cache: RefCell<ViewportCache>,
 }
 
 impl AlacrittyBackend {
@@ -108,7 +240,121 @@ impl AlacrittyBackend {
             cache_class,
             active_scrollback_limit,
             pressure_trim_floor: None,
+            viewport_cache: RefCell::new(ViewportCache::default()),
         }
+    }
+
+    #[cfg(test)]
+    fn viewport_snapshot_uncached(&self) -> Option<TerminalViewportSnapshot> {
+        let cols = self.term.columns();
+        let rows = self.term.screen_lines();
+        let colors = self.term.colors();
+
+        // 커서/스크롤 오프셋은 renderable_content 기준(vi 모드 반영)으로 뽑고 borrow를
+        // 즉시 놓는다. 셀은 아래에서 grid.read_line으로 직접 순회한다.
+        let (display_offset, cursor_point, cursor_shape) = {
+            let content = self.term.renderable_content();
+            (
+                content.display_offset,
+                content.cursor.point,
+                content.cursor.shape,
+            )
+        };
+
+        // deppy-sijo(D): display_iter 대신 read_line으로 직접 순회한다 — 스크롤이 압축
+        // 영역까지 가면 read_line이 scratch로 행을 복원해 준다(비압축이면 원시 행 그대로).
+        // display_iter와 동일 매핑: 화면 row r ↔ grid line (r - display_offset).
+        let grid = self.term.grid();
+        let mut scratch = Row::<AlacrittyCell>::new(cols);
+        let mut cells = vec![TerminalCell::default(); cols * rows];
+        let mut graphemes = Vec::new();
+        for screen_row in 0..rows {
+            let grid_line =
+                alacritty_terminal::index::Line(screen_row as i32 - display_offset as i32);
+            let line = grid.read_line(grid_line, &mut scratch);
+            for col in 0..cols {
+                let cell = &line[alacritty_terminal::index::Column(col)];
+                let flags = cell.flags;
+                let (mut fg, mut bg) = (
+                    resolve_color(cell.fg, colors, DEFAULT_FG),
+                    resolve_color(cell.bg, colors, DEFAULT_BG),
+                );
+                if flags.contains(Flags::INVERSE) {
+                    std::mem::swap(&mut fg, &mut bg);
+                }
+                // SGR 텍스트 속성 (B-1, 2026-07-14): 이전엔 이 flag들을 읽지도 않고 버려
+                // bold/italic/underline이 화면에 전혀 반영되지 않았다. INVERSE/HIDDEN은
+                // 위에서 이미 fg/bg·문자에 반영했으므로 attrs에 담지 않는다.
+                let mut attrs = CellAttrs::empty();
+                attrs.set(CellAttrs::BOLD, flags.contains(Flags::BOLD));
+                attrs.set(CellAttrs::ITALIC, flags.contains(Flags::ITALIC));
+                // 밑줄 변형(이중/곡선/점선/파선)은 전부 단일 밑줄로 렌더한다 — egui가
+                // 밑줄 스타일을 구분하지 않는다(구분이 필요해지면 attrs에 비트를 늘린다).
+                attrs.set(
+                    CellAttrs::UNDERLINE,
+                    flags.intersects(
+                        Flags::UNDERLINE
+                            | Flags::DOUBLE_UNDERLINE
+                            | Flags::UNDERCURL
+                            | Flags::DOTTED_UNDERLINE
+                            | Flags::DASHED_UNDERLINE,
+                    ),
+                );
+                attrs.set(CellAttrs::STRIKEOUT, flags.contains(Flags::STRIKEOUT));
+                attrs.set(CellAttrs::DIM, flags.contains(Flags::DIM));
+                let index = screen_row * cols + col;
+                let c = if flags.contains(Flags::HIDDEN) {
+                    ' '
+                } else if flags
+                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                {
+                    cell.c
+                } else if let Some(zw) = cell.zerowidth().filter(|zw| !zw.is_empty()) {
+                    let (c, text) = composed_cell(cell.c, Some(zw));
+                    if let Some(text) = text {
+                        graphemes.push(CellGrapheme { index, text });
+                    }
+                    c
+                } else {
+                    cell.c
+                };
+                cells[index] = TerminalCell::new(
+                    c,
+                    fg,
+                    bg,
+                    flags.contains(Flags::WIDE_CHAR),
+                    flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER),
+                    attrs,
+                );
+            }
+        }
+
+        // cursor.point는 grid 좌표 — 스크롤 중이면 viewport 밖일 수 있다
+        let cursor_row = cursor_point.line.0 + display_offset as i32;
+        let in_view = (0..rows as i32).contains(&cursor_row);
+        let (shape, shape_visible) = map_cursor_shape(cursor_shape);
+        let cursor = CursorSnapshot {
+            col: cursor_point.column.0 as u16,
+            row: cursor_row.max(0) as u16,
+            shape,
+            visible: shape_visible && in_view && self.term.mode().contains(TermMode::SHOW_CURSOR),
+        };
+
+        Some(TerminalViewportSnapshot {
+            cols: cols as u16,
+            rows: rows as u16,
+            cursor,
+            visible_cells: cells.into(),
+            graphemes: crate::viewport_snapshot::share_cell_graphemes(graphemes),
+            // backend 레벨에선 빈 값 — Session::take_snapshot이 누적 dirty rows로
+            // 덮어쓰고(session.rs), renderer_egui가 행 캐시 무효화에 소비한다
+            // (감사 2026-07-13: "소비자 없음" 서술은 stale이라 교정).
+            dirty_ranges: Vec::new(),
+            // OSC 0/2로 프로그램이 설정한 제목 — 세션 이름 동적 표시(없으면 폴더명 fallback).
+            title: self.listener.title.lock().ok().and_then(|t| t.clone()),
+            scroll_offset: display_offset as i32,
+            is_alt_screen: self.term.mode().contains(TermMode::ALT_SCREEN),
+        })
     }
 
     fn apply_cache_class(&mut self, class: TerminalCacheClass) -> Option<TerminalCacheEvent> {
@@ -123,6 +369,9 @@ impl AlacrittyBackend {
         // resize/전이의 클래스 재적용이 트림을 되돌리지 않는다(A-H1 flip-flop 방지).
         let target = budget_target.min(self.pressure_trim_floor.unwrap_or(usize::MAX));
         self.cache_class = class;
+        if class != TerminalCacheClass::Visible {
+            *self.viewport_cache.get_mut() = ViewportCache::default();
+        }
         if target != self.active_scrollback_limit {
             self.term.set_options(Config {
                 scrolling_history: target,
@@ -315,6 +564,12 @@ impl TerminalBackend for AlacrittyBackend {
             dirty_rows = (0..screen_lines as u16).collect();
         }
         self.term.reset_damage();
+        let cache = self.viewport_cache.get_mut();
+        for row in &dirty_rows {
+            if let Some(dirty) = cache.dirty.get_mut(*row as usize) {
+                *dirty = true;
+            }
+        }
 
         let response_events = std::mem::take(
             &mut *self
@@ -360,6 +615,7 @@ impl TerminalBackend for AlacrittyBackend {
     fn resize(&mut self, cols: u16, rows: u16) -> anyhow::Result<()> {
         self.term
             .resize(TermSize::new(cols.max(1) as usize, rows.max(1) as usize));
+        *self.viewport_cache.get_mut() = ViewportCache::default();
         Ok(())
     }
 
@@ -385,9 +641,6 @@ impl TerminalBackend for AlacrittyBackend {
         let cols = self.term.columns();
         let rows = self.term.screen_lines();
         let colors = self.term.colors();
-
-        // 커서/스크롤 오프셋은 renderable_content 기준(vi 모드 반영)으로 뽑고 borrow를
-        // 즉시 놓는다. 셀은 아래에서 grid.read_line으로 직접 순회한다.
         let (display_offset, cursor_point, cursor_shape) = {
             let content = self.term.renderable_content();
             (
@@ -396,101 +649,156 @@ impl TerminalBackend for AlacrittyBackend {
                 content.cursor.shape,
             )
         };
-
-        // deppy-sijo(D): display_iter 대신 read_line으로 직접 순회한다 — 스크롤이 압축
-        // 영역까지 가면 read_line이 scratch로 행을 복원해 준다(비압축이면 원시 행 그대로).
-        // display_iter와 동일 매핑: 화면 row r ↔ grid line (r - display_offset).
+        let key = ViewportKey {
+            cols,
+            rows,
+            display_offset,
+            alt: self.term.mode().contains(TermMode::ALT_SCREEN),
+        };
+        let mut cache = self.viewport_cache.borrow_mut();
+        if cache.key != Some(key) {
+            *cache = ViewportCache::default();
+            cache.key = Some(key);
+            cache.dirty = vec![true; rows];
+            cache.scratch = Some(Row::new(cols));
+        }
+        let previous = cache.cells.clone();
+        let previous_graphemes = cache.graphemes.clone();
+        let old_graphemes = previous_graphemes.as_deref().unwrap_or(&[]);
+        let mut replacement_rows = previous.is_none().then(|| Vec::with_capacity(rows));
+        let mut grapheme_updates: Vec<(usize, Vec<CellGrapheme>)> = Vec::new();
         let grid = self.term.grid();
-        let mut scratch = Row::<AlacrittyCell>::new(cols);
-        let mut cells = vec![TerminalCell::default(); cols * rows];
-        let mut graphemes = Vec::new();
-        for screen_row in 0..rows {
-            let grid_line =
-                alacritty_terminal::index::Line(screen_row as i32 - display_offset as i32);
-            let line = grid.read_line(grid_line, &mut scratch);
-            for col in 0..cols {
-                let cell = &line[alacritty_terminal::index::Column(col)];
-                let flags = cell.flags;
-                let (mut fg, mut bg) = (
-                    resolve_color(cell.fg, colors, DEFAULT_FG),
-                    resolve_color(cell.bg, colors, DEFAULT_BG),
-                );
-                if flags.contains(Flags::INVERSE) {
-                    std::mem::swap(&mut fg, &mut bg);
-                }
-                // SGR 텍스트 속성 (B-1, 2026-07-14): 이전엔 이 flag들을 읽지도 않고 버려
-                // bold/italic/underline이 화면에 전혀 반영되지 않았다. INVERSE/HIDDEN은
-                // 위에서 이미 fg/bg·문자에 반영했으므로 attrs에 담지 않는다.
-                let mut attrs = CellAttrs::empty();
-                attrs.set(CellAttrs::BOLD, flags.contains(Flags::BOLD));
-                attrs.set(CellAttrs::ITALIC, flags.contains(Flags::ITALIC));
-                // 밑줄 변형(이중/곡선/점선/파선)은 전부 단일 밑줄로 렌더한다 — egui가
-                // 밑줄 스타일을 구분하지 않는다(구분이 필요해지면 attrs에 비트를 늘린다).
-                attrs.set(
-                    CellAttrs::UNDERLINE,
-                    flags.intersects(
-                        Flags::UNDERLINE
-                            | Flags::DOUBLE_UNDERLINE
-                            | Flags::UNDERCURL
-                            | Flags::DOTTED_UNDERLINE
-                            | Flags::DASHED_UNDERLINE,
-                    ),
-                );
-                attrs.set(CellAttrs::STRIKEOUT, flags.contains(Flags::STRIKEOUT));
-                attrs.set(CellAttrs::DIM, flags.contains(Flags::DIM));
-                let index = screen_row * cols + col;
-                let c = if flags.contains(Flags::HIDDEN) {
-                    ' '
-                } else if flags
-                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
-                {
-                    cell.c
-                } else if let Some(zw) = cell.zerowidth().filter(|zw| !zw.is_empty()) {
-                    let (c, text) = composed_cell(cell.c, Some(zw));
-                    if let Some(text) = text {
-                        graphemes.push(CellGrapheme { index, text });
+        let mut read_rows = false;
+        for row in 0..rows {
+            if !cache.dirty[row] {
+                continue;
+            }
+            read_rows = true;
+            let grid_line = alacritty_terminal::index::Line(row as i32 - display_offset as i32);
+            let line = grid.read_line(grid_line, cache.scratch.as_mut().unwrap());
+            let start = row * cols;
+            let old_text_start = old_graphemes.partition_point(|entry| entry.index < start);
+            let old_text_end = old_graphemes.partition_point(|entry| entry.index < start + cols);
+            let old_text = &old_graphemes[old_text_start..old_text_end];
+            let unchanged = previous.as_ref().is_some_and(|previous| {
+                (0..cols).all(|col| {
+                    let old_text = old_text
+                        .binary_search_by_key(&(start + col), |entry| entry.index)
+                        .ok()
+                        .map(|index| old_text[index].text.as_str());
+                    snapshot_cell_matches(
+                        &line[alacritty_terminal::index::Column(col)],
+                        colors,
+                        previous.get(start + col).unwrap(),
+                        old_text,
+                    )
+                })
+            });
+            if !unchanged {
+                let mut cells = Arc::<[TerminalCell]>::new_uninit_slice(cols);
+                let slots = Arc::get_mut(&mut cells).unwrap();
+                let mut text = Vec::new();
+                for col in 0..cols {
+                    let (cell, grapheme) =
+                        snapshot_cell(&line[alacritty_terminal::index::Column(col)], colors);
+                    slots[col].write(cell);
+                    if let Some(text_value) = grapheme {
+                        text.push(CellGrapheme {
+                            index: start + col,
+                            text: text_value,
+                        });
                     }
-                    c
+                }
+                // SAFETY: the loop writes exactly once to every slot in 0..cols before
+                // publication. TerminalCell is Copy and owns no resources, so a panic
+                // before this point safely drops only the uninitialized Arc allocation.
+                let cells = unsafe { cells.assume_init() };
+                let replacement = replacement_rows.get_or_insert_with(|| {
+                    previous.as_ref().unwrap().shared_rows().unwrap().to_vec()
+                });
+                if replacement.len() <= row {
+                    replacement.push(cells);
                 } else {
-                    cell.c
-                };
-                cells[index] = TerminalCell::new(
-                    c,
-                    fg,
-                    bg,
-                    flags.contains(Flags::WIDE_CHAR),
-                    flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER),
-                    attrs,
-                );
+                    replacement[row] = cells;
+                }
+                if text != old_text {
+                    grapheme_updates.push((row, text));
+                }
             }
         }
-
-        // cursor.point는 grid 좌표 — 스크롤 중이면 viewport 밖일 수 있다
+        if let Some(replacement) = replacement_rows {
+            cache.cells = Some(VisibleCells::from_rows(cols, replacement));
+        }
+        if !grapheme_updates.is_empty() {
+            let mut entries: Vec<_> = old_graphemes
+                .iter()
+                .filter(|entry| {
+                    !grapheme_updates
+                        .iter()
+                        .any(|(row, _)| entry.index / cols == *row)
+                })
+                .cloned()
+                .collect();
+            for (_, text) in grapheme_updates {
+                entries.extend(text);
+            }
+            entries.sort_unstable_by_key(|entry| entry.index);
+            cache.graphemes = Some(crate::share_cell_graphemes(entries));
+            cache.grapheme_bytes = cache.graphemes.as_ref().map_or(0, |entries| {
+                if entries.is_empty() {
+                    0
+                } else {
+                    2 * std::mem::size_of::<usize>()
+                        + std::mem::size_of_val(&**entries)
+                        + entries
+                            .iter()
+                            .map(|entry| entry.text.capacity())
+                            .sum::<usize>()
+                }
+            });
+        } else if cache.graphemes.is_none() {
+            cache.graphemes = Some(crate::share_cell_graphemes(Vec::new()));
+        }
+        if read_rows {
+            let scratch = cache.scratch.as_ref().unwrap();
+            cache.scratch_bytes = scratch.capacity() * std::mem::size_of::<AlacrittyCell>()
+                + scratch
+                    .into_iter()
+                    .map(AlacrittyCell::extra_heap_bytes)
+                    .sum::<usize>();
+        }
+        cache.dirty.fill(false);
         let cursor_row = cursor_point.line.0 + display_offset as i32;
-        let in_view = (0..rows as i32).contains(&cursor_row);
         let (shape, shape_visible) = map_cursor_shape(cursor_shape);
-        let cursor = CursorSnapshot {
-            col: cursor_point.column.0 as u16,
-            row: cursor_row.max(0) as u16,
-            shape,
-            visible: shape_visible && in_view && self.term.mode().contains(TermMode::SHOW_CURSOR),
-        };
-
-        Some(TerminalViewportSnapshot {
+        let snapshot = TerminalViewportSnapshot {
             cols: cols as u16,
             rows: rows as u16,
-            cursor,
-            visible_cells: cells.into(),
-            graphemes: crate::viewport_snapshot::share_cell_graphemes(graphemes),
-            // backend 레벨에선 빈 값 — Session::take_snapshot이 누적 dirty rows로
-            // 덮어쓰고(session.rs), renderer_egui가 행 캐시 무효화에 소비한다
-            // (감사 2026-07-13: "소비자 없음" 서술은 stale이라 교정).
+            cursor: CursorSnapshot {
+                col: cursor_point.column.0 as u16,
+                row: cursor_row.max(0) as u16,
+                shape,
+                visible: shape_visible
+                    && (0..rows as i32).contains(&cursor_row)
+                    && self.term.mode().contains(TermMode::SHOW_CURSOR),
+            },
+            visible_cells: cache.cells.as_ref().unwrap().clone(),
+            graphemes: cache.graphemes.as_ref().unwrap().clone(),
             dirty_ranges: Vec::new(),
-            // OSC 0/2로 프로그램이 설정한 제목 — 세션 이름 동적 표시(없으면 폴더명 fallback).
-            title: self.listener.title.lock().ok().and_then(|t| t.clone()),
+            title: self
+                .listener
+                .title
+                .lock()
+                .ok()
+                .and_then(|title| title.clone()),
             scroll_offset: display_offset as i32,
-            is_alt_screen: self.term.mode().contains(TermMode::ALT_SCREEN),
-        })
+            is_alt_screen: key.alt,
+        };
+        // Hidden/Exited readers may request snapshots without a later class transition.
+        // The immutable reader result survives, but no render cache stays in the backend.
+        if self.cache_class != TerminalCacheClass::Visible {
+            *cache = ViewportCache::default();
+        }
+        Some(snapshot)
     }
 
     fn external_surface(&self) -> Option<TerminalExternalSurfaceHandle> {
@@ -522,6 +830,7 @@ impl TerminalBackend for AlacrittyBackend {
             self.listener.clone(),
         );
         self.processor = Processor::new();
+        *self.viewport_cache.get_mut() = ViewportCache::default();
     }
 
     fn set_cache_class(&mut self, class: TerminalCacheClass) -> Option<TerminalCacheEvent> {
@@ -622,7 +931,8 @@ impl TerminalBackend for AlacrittyBackend {
                 rows,
                 uncompressed_history,
                 compressed_heap_bytes,
-            ),
+            )
+            .saturating_add(self.viewport_cache.borrow().heap_bytes()),
         }
     }
 
@@ -1266,6 +1576,145 @@ mod tests {
             feed(&mut backend, text.as_bytes());
             let snapshot = backend.viewport_snapshot().unwrap();
             assert_eq!(crate::renderer_egui::selection_text(&snapshot, 0, 19), text);
+        }
+    }
+
+    #[test]
+    fn snapshot_metadata_and_cursor_only_reuse_all_row_payloads() {
+        let mut backend = AlacrittyBackend::new(8, 3, 20);
+        backend.feed("가ᇹ\r\nabc".as_bytes()).unwrap();
+        let first = backend.viewport_snapshot().unwrap();
+        let unchanged = backend.viewport_snapshot().unwrap();
+        assert!(
+            std::ptr::eq(&first.visible_cells[0], &unchanged.visible_cells[0]),
+            "metadata-only row payload must be shared"
+        );
+        assert!(std::sync::Arc::ptr_eq(
+            &first.graphemes,
+            &unchanged.graphemes
+        ));
+        backend.feed(b"\x1b[3;8H").unwrap();
+        let cursor_only = backend.viewport_snapshot().unwrap();
+        for row in 0..3 {
+            assert!(
+                std::ptr::eq(
+                    &first.visible_cells[row * 8],
+                    &cursor_only.visible_cells[row * 8]
+                ),
+                "cursor damage must not replace unchanged row {row}"
+            );
+        }
+        assert_eq!(cursor_only.cursor.row, 2);
+        assert_eq!(cursor_only.cursor.col, 7);
+    }
+
+    #[test]
+    fn snapshot_dirty1_keeps_other_rows_and_sparse_sidecar_shared() {
+        let mut backend = AlacrittyBackend::new(8, 3, 20);
+        backend.feed("가ᇹ\r\nabc".as_bytes()).unwrap();
+        let first = backend.viewport_snapshot().unwrap();
+        backend.feed(b"\x1b[2;1HX").unwrap();
+        let next = backend.viewport_snapshot().unwrap();
+        for row in [0, 2] {
+            assert!(
+                std::ptr::eq(&first.visible_cells[row * 8], &next.visible_cells[row * 8]),
+                "unchanged row {row} must keep its allocation"
+            );
+        }
+        assert!(!std::ptr::eq(
+            &first.visible_cells[8],
+            &next.visible_cells[8]
+        ));
+        assert_eq!(
+            first.visible_cells[8].c, 'a',
+            "old snapshots remain immutable"
+        );
+        assert_eq!(next.visible_cells[8].c, 'X');
+        assert!(
+            std::sync::Arc::ptr_eq(&first.graphemes, &next.graphemes),
+            "ASCII dirtiness must not clone sparse strings"
+        );
+    }
+
+    #[test]
+    fn snapshot_resident_cache_is_budgeted_and_hidden_reads_release_it() {
+        let mut backend = AlacrittyBackend::new(8, 3, 20);
+        let base = backend.cache_footprint().estimated_bytes;
+        let visible = backend.viewport_snapshot().unwrap();
+        assert!(
+            backend.cache_footprint().estimated_bytes
+                >= base + 24 * std::mem::size_of::<TerminalCell>(),
+            "owned snapshot cache must be in the backend budget"
+        );
+        backend.set_cache_class(TerminalCacheClass::Hidden);
+        let hidden_base = backend.cache_footprint().estimated_bytes;
+        assert_eq!(hidden_base, base);
+        let hidden = backend.viewport_snapshot().unwrap();
+        assert_eq!(
+            backend.cache_footprint().estimated_bytes,
+            hidden_base,
+            "explicit hidden reads must not leave a resident cache"
+        );
+        assert_eq!(visible.visible_cells, hidden.visible_cells);
+        backend.set_cache_class(TerminalCacheClass::Visible);
+        let restored = backend.viewport_snapshot().unwrap();
+        assert_eq!(restored.visible_cells, visible.visible_cells);
+        assert!(backend.cache_footprint().estimated_bytes > base);
+        backend.set_cache_class(TerminalCacheClass::Exited);
+        let exited_base = backend.cache_footprint().estimated_bytes;
+        backend.viewport_snapshot().unwrap();
+        assert_eq!(backend.cache_footprint().estimated_bytes, exited_base);
+    }
+
+    #[test]
+    fn snapshot_shared_rows_match_uncached_full_oracle_across_resyncs() {
+        fn check(backend: &AlacrittyBackend) {
+            let actual = backend.viewport_snapshot().unwrap();
+            let full = backend.viewport_snapshot_uncached().unwrap();
+            assert_eq!(actual, full);
+        }
+        let mut backend = AlacrittyBackend::new(10, 4, 30);
+        check(&backend);
+        for output in [
+            "abc한가ᇹa\u{0301}\u{0308}\r\nlast",
+            "\x1b[2;2H\x1b[31;4;3mX\x1b[0m",
+            "\x1b]4;1;#00FF00\x07",
+            "\x1b[?1049hALT\r\n가ᇹ",
+            "\x1b[?1049l",
+            "\x1b[1;1Ha\u{0300}\u{0308}",
+        ] {
+            backend.feed(output.as_bytes()).unwrap();
+            check(&backend);
+        }
+        backend.feed("old line\r\n".repeat(100).as_bytes()).unwrap();
+        check(&backend);
+        backend.scroll(9);
+        check(&backend);
+        backend.scroll(3);
+        check(&backend);
+        backend.scroll_to_bottom();
+        check(&backend);
+        backend.resize(12, 5).unwrap();
+        check(&backend);
+        backend.resize(4, 2).unwrap();
+        check(&backend);
+        backend.reset();
+        check(&backend);
+    }
+
+    #[test]
+    fn snapshot_flat_materialization_is_accounted_without_scanning_rows() {
+        let backend = AlacrittyBackend::new(8, 3, 20);
+        let snapshot = backend.viewport_snapshot().unwrap();
+        let before = backend.cache_footprint().estimated_bytes;
+        assert_eq!(snapshot.visible_cells[..].len(), 24);
+        assert_eq!(
+            backend.cache_footprint().estimated_bytes - before,
+            24 * std::mem::size_of::<TerminalCell>() + 2 * std::mem::size_of::<usize>()
+        );
+        let after = backend.cache_footprint().estimated_bytes;
+        for _ in 0..5 {
+            assert_eq!(backend.cache_footprint().estimated_bytes, after);
         }
     }
 

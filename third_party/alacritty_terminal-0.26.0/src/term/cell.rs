@@ -159,6 +159,16 @@ impl Cell {
         self.extra.as_ref().map(|extra| extra.zerowidth.as_slice())
     }
 
+    /// Resident extra allocation, excluding shared hyperlink backing storage.
+    #[inline]
+    pub fn extra_heap_bytes(&self) -> usize {
+        self.extra.as_ref().map_or(0, |extra| {
+            2 * std::mem::size_of::<usize>()
+                + std::mem::size_of::<CellExtra>()
+                + extra.zerowidth.capacity() * std::mem::size_of::<char>()
+        })
+    }
+
     /// Write a new zerowidth character to this cell.
     #[inline]
     pub fn push_zerowidth(&mut self, character: char) {

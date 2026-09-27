@@ -330,7 +330,7 @@ pub fn merge_unconsumed_viewport_dirty(prev: &RuntimeEvent, next: &mut RuntimeEv
             merged.dirty_ranges.clear();
             merged.dirty_ranges.push(terminal::CellRange {
                 start: 0,
-                end: cells.saturating_sub(1),
+                end: cells,
             });
         }
     }
@@ -361,6 +361,27 @@ mod tests {
             }),
             bracketed_paste: false,
         }
+    }
+
+    #[test]
+    fn viewport_dirty_cap_keeps_the_last_row_for_single_column_grid() {
+        let mut first = viewport_event(vec![terminal::CellRange { start: 0, end: 1 }]);
+        let mut next = viewport_event(vec![
+            terminal::CellRange { start: 1, end: 2 },
+            terminal::CellRange { start: 0, end: 1 },
+        ]);
+        for event in [&mut first, &mut next] {
+            let snapshot = Arc::make_mut(event.viewport_snapshot_mut().unwrap());
+            snapshot.cols = 1;
+        }
+        merge_unconsumed_viewport_dirty(&first, &mut next);
+        assert_eq!(dirty_of(&next).len(), 1);
+        assert_eq!(dirty_of(&next)[0].start, 0);
+        assert_eq!(
+            dirty_of(&next)[0].end,
+            2,
+            "dirty ranges use exclusive ends, including the final row"
+        );
     }
 
     #[test]

@@ -22,4 +22,6 @@ libghostty-vt = { version = "0.2", optional = true }
 ghostty-backend = ["dep:libghostty-vt"]
 
 [dev-dependencies]
+serde_json = { workspace = true }
+postcard = { workspace = true }
 libc = { workspace = true }

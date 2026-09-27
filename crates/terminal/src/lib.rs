@@ -11,6 +11,7 @@ pub mod input_mapper;
 pub mod policy;
 pub mod renderer_egui;
 mod viewport_snapshot;
+mod visible_cells;
 
 pub use alacritty_backend::AlacrittyBackend;
 #[cfg(feature = "ghostty-backend")]
@@ -50,3 +51,5 @@ pub use viewport_snapshot::{
     MAX_CELL_GRAPHEME_CHARS, TerminalCell, TerminalViewportSnapshot, share_cell_graphemes,
     validate_cell_graphemes,
 };
+
+pub use visible_cells::{VisibleCellIndex, VisibleCells};

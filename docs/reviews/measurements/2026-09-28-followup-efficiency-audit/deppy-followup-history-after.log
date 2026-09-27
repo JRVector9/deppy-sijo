@@ -1,0 +1,10 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.13s
+     Running unittests src/lib.rs (target/debug/deps/agent_mcp-3b3dd021f8ec54b2)
+
+running 1 test
+history sqlite=3.53.2 inputs=1000 steps=1620 finish_us=53.765 recent_us=786.206 db_bytes=81920
+history sqlite=3.53.2 inputs=10000 steps=1620 finish_us=54.303 recent_us=784.301 db_bytes=507904
+history sqlite=3.53.2 inputs=99000 steps=1620 finish_us=59.582 recent_us=864.426 db_bytes=5103616
+test history::efficiency_tests::measure_history_completion_and_cleanup_scaling ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 27 filtered out; finished in 0.20s

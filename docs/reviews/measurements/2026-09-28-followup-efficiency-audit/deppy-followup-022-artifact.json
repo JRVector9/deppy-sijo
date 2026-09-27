@@ -1,0 +1,29 @@
+{
+  "version": "0.2.2",
+  "bundle": "/Users/jr/Desktop/projects/deppy-sijo-performance/target/bundle-0.2.2/Deppy Sijo.app",
+  "archive": "/Users/jr/Desktop/projects/deppy-sijo-performance/target/bundle-0.2.2/Deppy Sijo.zip",
+  "apple_notarization": false,
+  "native_gui_restarted": false,
+  "source_tree_hashes": {
+    "Cargo.toml": "f7d39f4c4ea789c8edb76e5be06e2526923db667f37f5e3ec0cd4e9f9efda6dd",
+    "Cargo.lock": "91d0a612752644523dfb8f5dc7aba433853747ff52e9585f7de0274b6fe49780",
+    "crates/app/src/cloud_agent/tunnel.rs": "5aabff60ac3c4eb64e59fa3610f3def30c5e0798d5a3e16b98e4b0d21e13fe66",
+    "crates/app/src/cloud_agent.rs": "1edc79bdf80b442c59ffb91b62a43d3d45fafa1000cb33f33794f357eb782247",
+    "crates/agent-mcp/src/history.rs": "4501390380693673f31c0e534d5ce55ac152c2847d226ab9bcfa209930b7598d"
+  },
+  "files": {
+    "deppy-sijo": {
+      "sha256": "68f09da2f6899c222558469b359ec774fb31cadebcbd3b3ac71da1e487fd6627",
+      "arch": "arm64"
+    },
+    "deppy-mcp-proxy": {
+      "sha256": "166af8f52ec6b12bdec86a9255678bc2af0de36bd244a5eb246e4f8cf7e4e2bb",
+      "arch": "arm64"
+    },
+    "deppy-cloudflared": {
+      "sha256": "83439f8a5871402de6b708b0f0b0aa4322b9f048dd40a084b8507a97a6c094b5",
+      "arch": "arm64"
+    }
+  },
+  "source_commit": "6cabc21bc6b78bb91918f3713eacacc9b65eafc6"
+}

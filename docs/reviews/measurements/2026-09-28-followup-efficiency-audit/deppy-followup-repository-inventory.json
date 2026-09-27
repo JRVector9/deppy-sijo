@@ -1,0 +1,184 @@
+[
+  {
+    "crate": "agent-mcp",
+    "rust_files": 5,
+    "rust_lines": 2465,
+    "files_using_bounds": 5,
+    "files_using_clone": 4
+  },
+  {
+    "crate": "app",
+    "rust_files": 107,
+    "rust_lines": 191367,
+    "files_using_bounds": 79,
+    "files_using_clone": 71
+  },
+  {
+    "crate": "audit",
+    "rust_files": 6,
+    "rust_lines": 4424,
+    "files_using_bounds": 5,
+    "files_using_clone": 4
+  },
+  {
+    "crate": "auth",
+    "rust_files": 13,
+    "rust_lines": 6385,
+    "files_using_bounds": 10,
+    "files_using_clone": 9
+  },
+  {
+    "crate": "connector-contract",
+    "rust_files": 1,
+    "rust_lines": 1200,
+    "files_using_bounds": 1,
+    "files_using_clone": 1
+  },
+  {
+    "crate": "connector-service",
+    "rust_files": 6,
+    "rust_lines": 14227,
+    "files_using_bounds": 4,
+    "files_using_clone": 4
+  },
+  {
+    "crate": "connector-ui",
+    "rust_files": 1,
+    "rust_lines": 2736,
+    "files_using_bounds": 1,
+    "files_using_clone": 1
+  },
+  {
+    "crate": "core",
+    "rust_files": 5,
+    "rust_lines": 271,
+    "files_using_bounds": 0,
+    "files_using_clone": 0
+  },
+  {
+    "crate": "http-client",
+    "rust_files": 1,
+    "rust_lines": 298,
+    "files_using_bounds": 1,
+    "files_using_clone": 0
+  },
+  {
+    "crate": "i18n",
+    "rust_files": 1,
+    "rust_lines": 277,
+    "files_using_bounds": 0,
+    "files_using_clone": 1
+  },
+  {
+    "crate": "mcp",
+    "rust_files": 8,
+    "rust_lines": 6682,
+    "files_using_bounds": 7,
+    "files_using_clone": 4
+  },
+  {
+    "crate": "mcp-proxy",
+    "rust_files": 8,
+    "rust_lines": 6433,
+    "files_using_bounds": 7,
+    "files_using_clone": 5
+  },
+  {
+    "crate": "mcp-store",
+    "rust_files": 1,
+    "rust_lines": 3208,
+    "files_using_bounds": 1,
+    "files_using_clone": 1
+  },
+  {
+    "crate": "mux",
+    "rust_files": 8,
+    "rust_lines": 584,
+    "files_using_bounds": 0,
+    "files_using_clone": 4
+  },
+  {
+    "crate": "persist",
+    "rust_files": 4,
+    "rust_lines": 2314,
+    "files_using_bounds": 3,
+    "files_using_clone": 2
+  },
+  {
+    "crate": "platform",
+    "rust_files": 1,
+    "rust_lines": 142,
+    "files_using_bounds": 1,
+    "files_using_clone": 0
+  },
+  {
+    "crate": "pty",
+    "rust_files": 3,
+    "rust_lines": 3469,
+    "files_using_bounds": 2,
+    "files_using_clone": 1
+  },
+  {
+    "crate": "relay-protocol",
+    "rust_files": 1,
+    "rust_lines": 842,
+    "files_using_bounds": 1,
+    "files_using_clone": 1
+  },
+  {
+    "crate": "relay-server",
+    "rust_files": 3,
+    "rust_lines": 3039,
+    "files_using_bounds": 2,
+    "files_using_clone": 2
+  },
+  {
+    "crate": "runtime",
+    "rust_files": 16,
+    "rust_lines": 27068,
+    "files_using_bounds": 11,
+    "files_using_clone": 9
+  },
+  {
+    "crate": "secret",
+    "rust_files": 7,
+    "rust_lines": 4625,
+    "files_using_bounds": 5,
+    "files_using_clone": 3
+  },
+  {
+    "crate": "session",
+    "rust_files": 7,
+    "rust_lines": 3150,
+    "files_using_bounds": 2,
+    "files_using_clone": 2
+  },
+  {
+    "crate": "storage",
+    "rust_files": 7,
+    "rust_lines": 31195,
+    "files_using_bounds": 7,
+    "files_using_clone": 6
+  },
+  {
+    "crate": "storage-core",
+    "rust_files": 1,
+    "rust_lines": 130,
+    "files_using_bounds": 0,
+    "files_using_clone": 0
+  },
+  {
+    "crate": "terminal",
+    "rust_files": 10,
+    "rust_lines": 7948,
+    "files_using_bounds": 8,
+    "files_using_clone": 4
+  },
+  {
+    "crate": "web-remote",
+    "rust_files": 24,
+    "rust_lines": 20752,
+    "files_using_bounds": 19,
+    "files_using_clone": 11
+  }
+]

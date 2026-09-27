@@ -1,0 +1,9 @@
+   Compiling deppy-sijo v0.2.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.39s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-8da0216105b7ce9c)
+
+running 2 tests
+test cloud_agent::grapheme_snapshot_tests::cloud_screen_text_preserves_non_composable_graphemes ... ok
+test cloud_agent::grapheme_snapshot_tests::cloud_screen_rows_reuse_scratch_without_retaining_prior_text ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 2392 filtered out; finished in 0.00s

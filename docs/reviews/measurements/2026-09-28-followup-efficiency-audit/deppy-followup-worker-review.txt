@@ -1,0 +1,3 @@
+**Medium — [tunnel.rs:295](/Users/jr/Desktop/projects/deppy-sijo-performance/crates/app/src/cloud_agent/tunnel.rs:295): The first probe can race public host registration.** When the address and registration logs arrive together, the worker publishes `Address` and immediately probes. The UI sets the server’s public host only after it consumes that event. If the probe reaches the server first, it receives `403 invalid_host`, then waits one second to retry. Gate the first probe on host publication, or allow the address event to be processed before probing.
+
+No files were edited and no tests were run.

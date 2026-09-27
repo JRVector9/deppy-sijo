@@ -1,0 +1,13 @@
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+   Compiling deppy-sijo v0.2.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 11.04s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-8da0216105b7ce9c)
+
+running 1 test
+first registration at 0.308s
+idle_worker loops_per_2s=8 cancellation_ms=175.424
+test cloud_agent::tunnel::tests::measure_registered_worker_idle_wakes_and_cancellation ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2391 filtered out; finished in 3.31s

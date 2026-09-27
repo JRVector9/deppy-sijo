@@ -1,0 +1,173 @@
+[
+  {
+    "operations": 1100,
+    "before_ms": 0.03841980069410056,
+    "after_ms": 0.019567724666558206,
+    "before_plan": [
+      [
+        4,
+        0,
+        216,
+        "SCAN operations"
+      ],
+      [
+        13,
+        0,
+        0,
+        "LIST SUBQUERY 1"
+      ],
+      [
+        18,
+        13,
+        216,
+        "SCAN answer_completion"
+      ],
+      [
+        24,
+        13,
+        0,
+        "CREATE BLOOM FILTER"
+      ]
+    ],
+    "after_plan": [
+      [
+        5,
+        0,
+        214,
+        "SCAN operations USING INDEX retained_answers"
+      ],
+      [
+        11,
+        0,
+        0,
+        "LIST SUBQUERY 1"
+      ],
+      [
+        16,
+        11,
+        216,
+        "SCAN answer_completion"
+      ],
+      [
+        22,
+        11,
+        0,
+        "CREATE BLOOM FILTER"
+      ]
+    ]
+  },
+  {
+    "operations": 10100,
+    "before_ms": 0.17611874936847016,
+    "after_ms": 0.019261449051555246,
+    "before_plan": [
+      [
+        4,
+        0,
+        216,
+        "SCAN operations"
+      ],
+      [
+        13,
+        0,
+        0,
+        "LIST SUBQUERY 1"
+      ],
+      [
+        18,
+        13,
+        216,
+        "SCAN answer_completion"
+      ],
+      [
+        24,
+        13,
+        0,
+        "CREATE BLOOM FILTER"
+      ]
+    ],
+    "after_plan": [
+      [
+        5,
+        0,
+        214,
+        "SCAN operations USING INDEX retained_answers"
+      ],
+      [
+        11,
+        0,
+        0,
+        "LIST SUBQUERY 1"
+      ],
+      [
+        16,
+        11,
+        216,
+        "SCAN answer_completion"
+      ],
+      [
+        22,
+        11,
+        0,
+        "CREATE BLOOM FILTER"
+      ]
+    ]
+  },
+  {
+    "operations": 99100,
+    "before_ms": 1.5264104004018009,
+    "after_ms": 0.02132500085281208,
+    "before_plan": [
+      [
+        4,
+        0,
+        216,
+        "SCAN operations"
+      ],
+      [
+        13,
+        0,
+        0,
+        "LIST SUBQUERY 1"
+      ],
+      [
+        18,
+        13,
+        216,
+        "SCAN answer_completion"
+      ],
+      [
+        24,
+        13,
+        0,
+        "CREATE BLOOM FILTER"
+      ]
+    ],
+    "after_plan": [
+      [
+        5,
+        0,
+        214,
+        "SCAN operations USING INDEX retained_answers"
+      ],
+      [
+        11,
+        0,
+        0,
+        "LIST SUBQUERY 1"
+      ],
+      [
+        16,
+        11,
+        216,
+        "SCAN answer_completion"
+      ],
+      [
+        22,
+        11,
+        0,
+        "CREATE BLOOM FILTER"
+      ]
+    ]
+  }
+]

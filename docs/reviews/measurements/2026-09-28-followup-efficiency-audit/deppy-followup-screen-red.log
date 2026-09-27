@@ -1,0 +1,45 @@
+   Compiling alacritty_terminal v0.26.0 (/Users/jr/Desktop/projects/deppy-sijo-performance/third_party/alacritty_terminal-0.26.0)
+   Compiling terminal v0.2.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/terminal)
+    Finished `release` profile [optimized] target(s) in 2.81s
+[
+  {
+    "fixture": "blank",
+    "allocations": 565,
+    "requested_bytes": 81528,
+    "output_bytes": 80,
+    "output_hash": "e16b8402dbce37ab",
+    "mean_us": 93.127
+  },
+  {
+    "fixture": "ascii",
+    "allocations": 568,
+    "requested_bytes": 157780,
+    "output_bytes": 23780,
+    "output_hash": "3971939a3cb920da",
+    "mean_us": 84.59
+  },
+  {
+    "fixture": "cjk",
+    "allocations": 568,
+    "requested_bytes": 196030,
+    "output_bytes": 35630,
+    "output_hash": "94918bb9f8171744",
+    "mean_us": 71.942
+  },
+  {
+    "fixture": "grapheme",
+    "allocations": 402,
+    "requested_bytes": 368324,
+    "output_bytes": 64543,
+    "output_hash": "12db5a88b514f065",
+    "mean_us": 187.814
+  }
+]
+Traceback (most recent call last):
+  File "/Users/jr/Desktop/projects/deppy-sijo-performance/scripts/bench-mcp-screen.py", line 81, in <module>
+    main()
+    ~~~~^^
+  File "/Users/jr/Desktop/projects/deppy-sijo-performance/scripts/bench-mcp-screen.py", line 78, in main
+    assert all(row['allocations'] <= 20 for run in runs for row in run), 'screen conversion must not allocate a new buffer for every row'
+           ~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: screen conversion must not allocate a new buffer for every row

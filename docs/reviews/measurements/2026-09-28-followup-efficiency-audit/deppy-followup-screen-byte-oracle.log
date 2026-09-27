@@ -1,0 +1,1 @@
+Exact before/current extracted production functions compared byte-for-byte on real Alacritty 300x80 blank/ASCII/CJK/sparse grapheme+64KiB cutoff fixtures: all passed. Compiled rustc -O, exit0.

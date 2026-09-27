@@ -1,0 +1,28 @@
+    Blocking waiting for file lock on build directory
+   Compiling agent-mcp v0.2.2 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/agent-mcp)
+error[E0277]: the trait bound `usize: FromSql` is not satisfied
+   --> crates/agent-mcp/src/history.rs:187:31
+    |
+187 |                     .get::<_, usize>(0))
+    |                      ---      ^^^^^ the trait `FromSql` is not implemented for `usize`
+    |                      |
+    |                      required by a bound introduced by this call
+    |
+    = help: the following other types implement trait `FromSql`:
+              f32
+              f64
+              i16
+              i32
+              i64
+              i8
+              isize
+              u16
+            and 2 others
+note: required by a bound in `Row::<'_>::get`
+   --> /Users/jr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rusqlite-0.40.2/src/row.rs:285:32
+    |
+285 |     pub fn get<I: RowIndex, T: FromSql>(&self, idx: I) -> Result<T> {
+    |                                ^^^^^^^ required by this bound in `Row::<'_>::get`
+
+For more information about this error, try `rustc --explain E0277`.
+error: could not compile `agent-mcp` (lib test) due to 1 previous error

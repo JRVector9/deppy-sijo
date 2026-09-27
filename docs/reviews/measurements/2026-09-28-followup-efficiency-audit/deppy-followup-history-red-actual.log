@@ -1,0 +1,22 @@
+   Compiling agent-mcp v0.2.2 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/agent-mcp)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.01s
+     Running unittests src/lib.rs (target/debug/deps/agent_mcp-3b3dd021f8ec54b2)
+
+running 1 test
+test history::efficiency_tests::answer_cleanup_work_does_not_scale_with_input_tombstones ... FAILED
+
+failures:
+
+---- history::efficiency_tests::answer_cleanup_work_does_not_scale_with_input_tombstones stdout ----
+
+thread 'history::efficiency_tests::answer_cleanup_work_does_not_scale_with_input_tombstones' (87181457) panicked at crates/agent-mcp/src/history.rs:179:9:
+input tombstones changed cleanup work: 4918 -> 298918 VM steps
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    history::efficiency_tests::answer_cleanup_work_does_not_scale_with_input_tombstones
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 26 filtered out; finished in 0.11s
+
+error: test failed, to rerun pass `-p agent-mcp --lib`

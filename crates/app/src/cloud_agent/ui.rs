@@ -171,8 +171,17 @@ impl CloudAgent {
                     {
                         self.allow_input(&t.id, input);
                     }
-                    ui.label(format!("{} / {}", t.workspace_name, t.title))
-                        .on_hover_text(&t.id);
+                    ui.label(format!(
+                        "{} · {} / {}",
+                        t.workspace_name,
+                        t.title,
+                        t.agent_line
+                            .as_deref()
+                            .filter(|line| !line.trim().is_empty())
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| catalog.t("workspace.spawn.shell", &[]))
+                    ))
+                    .on_hover_text(&t.id);
                     if !t.live {
                         ui.weak(catalog.t("cloud.exited", &[]));
                     }
@@ -244,6 +253,41 @@ impl CloudAgent {
 mod tests {
     use super::*;
     use egui_kittest::kittest::Queryable as _;
+    #[test]
+    fn shared_rows_show_session_agent_model_and_effort_with_shell_fallback() {
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        let mut bridge = CloudAgent::memory();
+        let mut agent = crate::cloud_agent::Target::fixture("agent", "generation-1");
+        agent.title = "리뷰 작업".into();
+        let mut workspace = crate::ui::workspace::WorkspaceUi::new();
+        workspace.set_agent_info(std::collections::HashMap::from([(
+            agent.session,
+            crate::agent_detect::AgentDisplay {
+                kind: crate::agent_detect::AgentKind::Codex,
+                model: Some("gpt-6-astra".into()),
+                effort: Some("xhigh".into()),
+                context_pct: None,
+                last_agent_summary: None,
+                user_instruction: None,
+            },
+        )]));
+        agent.agent_line = workspace.agent_line_for(agent.session);
+        let mut shell = crate::cloud_agent::Target::fixture("shell", "generation-2");
+        shell.title = "배포 셸".into();
+        bridge.set_targets(vec![agent, shell]);
+        let harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1400.0, 900.0))
+            .build_ui_state(
+                move |ui, state: &mut CloudAgent| state.contents(ui, &catalog),
+                bridge,
+            );
+        assert!(
+            harness
+                .query_by_label("workspace · 리뷰 작업 / Codex · gpt-6-astra · xhigh")
+                .is_some()
+        );
+        assert!(harness.query_by_label("workspace · 배포 셸 / 셸").is_some());
+    }
     #[test]
     fn automatic_connection_is_default_and_manual_host_is_advanced() {
         let catalog = i18n::Catalog::load("ko-KR").unwrap();

@@ -23895,6 +23895,10 @@ impl App {
                         .chars()
                         .take(256)
                         .collect(),
+                    agent_line: rt
+                        .workspace_ui
+                        .agent_line_for(session)
+                        .map(|line| line.chars().take(512).collect()),
                     runtime: rt.runtime_instance,
                     session,
                     pane: pane.id.clone(),

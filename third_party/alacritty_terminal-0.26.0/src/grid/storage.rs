@@ -65,6 +65,14 @@ pub struct Storage<T> {
     /// serde에서는 건너뛴다(ref-test JSON 불변 + 역직렬화 시 빈 채로 시작 = 압축 없음).
     #[cfg_attr(feature = "serde", serde(skip))]
     compressed: Vec<Option<CompressedRow>>,
+
+    /// Physical compressed heap includes allocated stale cache slots outside `len`.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    compressed_heap: usize,
+
+    /// Compressed slots in the current logical ring window only.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    compressed_count: usize,
 }
 
 impl<T: PartialEq> PartialEq for Storage<T> {
@@ -88,7 +96,15 @@ impl<T> Storage<T> {
         inner.resize_with(visible_lines, || Row::new(columns));
 
         // compressed는 lazy: 첫 압축 전까지 빈 채로 둔다(오버헤드 0).
-        Storage { inner, zero: 0, visible_lines, len: visible_lines, compressed: Vec::new() }
+        Storage {
+            inner,
+            zero: 0,
+            visible_lines,
+            len: visible_lines,
+            compressed: Vec::new(),
+            compressed_heap: 0,
+            compressed_count: 0,
+        }
     }
 
     /// Increase the number of lines in the buffer.
@@ -121,6 +137,7 @@ impl<T> Storage<T> {
     /// Shrink the number of lines in the buffer.
     #[inline]
     pub fn shrink_lines(&mut self, shrinkage: usize) {
+        self.compressed_count -= self.count_compressed_range(self.len - shrinkage, self.len);
         self.len -= shrinkage;
 
         // Free memory.
@@ -137,6 +154,11 @@ impl<T> Storage<T> {
         self.inner.truncate(self.len);
         // 곁가지도 같은 꼬리 슬롯(가장 오래된 history)을 버린다.
         if !self.compressed.is_empty() {
+            self.compressed_heap -= self.compressed[self.len..]
+                .iter()
+                .flatten()
+                .map(CompressedRow::heap_bytes)
+                .sum::<usize>();
             self.compressed.truncate(self.len);
         }
     }
@@ -158,6 +180,7 @@ impl<T> Storage<T> {
             }
         }
 
+        self.compressed_count += self.count_compressed_range(self.len, self.len + additional_rows);
         self.len += additional_rows;
     }
 
@@ -183,12 +206,8 @@ impl<T> Storage<T> {
         D: PartialEq,
     {
         let idx = self.compute_index(line);
-        if !self.compressed.is_empty() {
-            if let Some(slot) = self.compressed.get_mut(idx) {
-                if slot.take().is_some() {
-                    self.inner[idx] = Row::new(columns);
-                }
-            }
+        if self.take_compressed(idx).is_some() {
+            self.inner[idx] = Row::new(columns);
         }
         self.inner[idx].reset(template);
     }
@@ -227,6 +246,15 @@ impl<T> Storage<T> {
 
         // (inner[i], compressed[i])는 항상 쌍으로 움직인다.
         if !self.compressed.is_empty() {
+            if self.is_logical_slot(a) != self.is_logical_slot(b) {
+                let (active, cached) = if self.is_logical_slot(a) {
+                    (a, b)
+                } else {
+                    (b, a)
+                };
+                self.compressed_count -= usize::from(self.compressed[active].is_some());
+                self.compressed_count += usize::from(self.compressed[cached].is_some());
+            }
             self.compressed.swap(a, b);
         }
     }
@@ -237,7 +265,8 @@ impl<T> Storage<T> {
         debug_assert!(count.unsigned_abs() <= self.inner.len());
 
         let len = self.inner.len();
-        self.zero = (self.zero as isize + count + len as isize) as usize % len;
+        let forward = (count + len as isize) as usize % len;
+        self.shift_zero(forward);
     }
 
     /// Rotate all existing lines down in history.
@@ -247,7 +276,7 @@ impl<T> Storage<T> {
     /// [`rotate_left`]: https://doc.rust-lang.org/std/vec/struct.Vec.html#method.rotate_left
     #[inline]
     pub fn rotate_down(&mut self, count: usize) {
-        self.zero = (self.zero + count) % self.inner.len();
+        self.shift_zero(count % self.inner.len());
     }
 
     /// Update the raw storage buffer.
@@ -258,6 +287,8 @@ impl<T> Storage<T> {
         self.zero = 0;
         // 새 inner는 압축 이력이 없다(resize/reflow는 복원된 행을 넘겨준다).
         self.compressed.clear();
+        self.compressed_heap = 0;
+        self.compressed_count = 0;
     }
 
     /// Remove all rows from storage.
@@ -270,8 +301,65 @@ impl<T> Storage<T> {
         mem::swap(&mut buffer, &mut self.inner);
         self.len = 0;
         self.compressed.clear();
+        self.compressed_heap = 0;
+        self.compressed_count = 0;
 
         buffer
+    }
+
+    /// Count just the logical window boundary that is entering or leaving the ring.
+    fn count_compressed_range(&self, start: usize, end: usize) -> usize {
+        if self.compressed.is_empty() {
+            return 0;
+        }
+        (start..end)
+            .filter(|positive| self.compressed[(self.zero + positive) % self.inner.len()].is_some())
+            .count()
+    }
+
+    fn is_logical_slot(&self, index: usize) -> bool {
+        let positive = if index >= self.zero {
+            index - self.zero
+        } else {
+            self.inner.len() - self.zero + index
+        };
+        positive < self.len
+    }
+
+    /// Remove a physical slot, updating resident heap and logical count separately.
+    fn take_compressed(&mut self, index: usize) -> Option<CompressedRow> {
+        let compressed = self.compressed.get_mut(index)?.take()?;
+        self.compressed_heap -= compressed.heap_bytes();
+        if self.is_logical_slot(index) {
+            self.compressed_count -= 1;
+        }
+        Some(compressed)
+    }
+
+    /// Rotation changes membership only at the ring boundaries, never all history.
+    fn shift_zero(&mut self, forward: usize) {
+        let n = self.inner.len();
+        if self.compressed.is_empty() || self.len == n || self.len == 0 {
+            self.zero = (self.zero + forward) % n;
+            return;
+        }
+        // Follow the shorter direction; each step removes one slot and adds one.
+        if forward <= n / 2 {
+            for _ in 0..forward {
+                self.compressed_count -= usize::from(self.compressed[self.zero].is_some());
+                self.compressed_count +=
+                    usize::from(self.compressed[(self.zero + self.len) % n].is_some());
+                self.zero = (self.zero + 1) % n;
+            }
+        } else {
+            for _ in 0..n - forward {
+                self.compressed_count -=
+                    usize::from(self.compressed[(self.zero + self.len - 1) % n].is_some());
+                self.zero = (self.zero + n - 1) % n;
+                self.compressed_count += usize::from(self.compressed[self.zero].is_some());
+            }
+        }
+        debug_assert!(self.compressed_count <= self.len);
     }
 
     /// Compute actual index in underlying storage given the requested index.
@@ -289,7 +377,11 @@ impl<T> Storage<T> {
         //
         // Requires `zeroed` to be smaller than `self.inner.len() * 2`,
         // but both `self.zero` and `requested` are always smaller than `self.inner.len()`.
-        if zeroed >= self.inner.len() { zeroed - self.inner.len() } else { zeroed }
+        if zeroed >= self.inner.len() {
+            zeroed - self.inner.len()
+        } else {
+            zeroed
+        }
     }
 
     /// Rotate the ringbuffer to reset `self.zero` back to index `0`.
@@ -319,6 +411,8 @@ impl Storage<Cell> {
         let mut compressed = mem::take(&mut self.compressed);
         compressed.resize_with(rows.len(), || None);
         self.len = 0;
+        self.compressed_heap = 0;
+        self.compressed_count = 0;
         rows.into_iter()
             .zip(compressed)
             .map(move |(raw, packed)| packed.map_or(raw, |packed| packed.decode(columns)))
@@ -330,12 +424,16 @@ impl Storage<Cell> {
         self.zero = 0;
         self.inner = Vec::with_capacity(rows.len());
         self.compressed = Vec::with_capacity(rows.len());
+        self.compressed_heap = 0;
+        self.compressed_count = 0;
         for (index, row) in rows.into_iter().enumerate() {
             if index < self.visible_lines {
                 self.inner.push(row.decode(columns));
                 self.compressed.push(None);
             } else {
                 self.inner.push(Row::from_vec(Vec::new(), 0));
+                self.compressed_heap += row.heap_bytes();
+                self.compressed_count += 1;
                 self.compressed.push(Some(row));
             }
         }
@@ -345,9 +443,8 @@ impl Storage<Cell> {
     pub(super) fn inflate_visible(&mut self, columns: usize) {
         for line in 0..self.visible_lines {
             let index = self.compute_index(Line(line as i32));
-            if let Some(Some(row)) = self.compressed.get_mut(index) {
+            if let Some(row) = self.take_compressed(index) {
                 self.inner[index] = row.decode(columns);
-                self.compressed[index] = None;
             }
         }
     }
@@ -374,12 +471,15 @@ impl Storage<Cell> {
             return None;
         }
         let compressed = CompressedRow::encode(&self.inner[idx], columns);
-        let saved = raw_bytes.saturating_sub(compressed.heap_bytes());
+        let heap_bytes = compressed.heap_bytes();
+        let saved = raw_bytes.saturating_sub(heap_bytes);
 
         // 첫 압축에서만 곁가지를 inner와 같은 길이로 실체화(lazy).
         if self.compressed.is_empty() {
             self.compressed.resize_with(self.inner.len(), || None);
         }
+        self.compressed_heap += heap_bytes;
+        self.compressed_count += 1;
         self.compressed[idx] = Some(compressed);
         // 셀 배열의 힙을 즉시 반납(용량까지 드롭).
         self.inner[idx] = Row::from_vec(Vec::new(), 0);
@@ -399,18 +499,14 @@ impl Storage<Cell> {
             Some(compressed) => {
                 *scratch = compressed.decode(columns);
                 scratch
-            },
+            }
             None => &self.inner[idx],
         }
     }
 
     /// 현재 압축 곁가지가 점유하는 힙 바이트 추정 — RSS 예산/실측용.
     pub(crate) fn compressed_heap_bytes(&self) -> usize {
-        self.compressed
-            .iter()
-            .filter_map(Option::as_ref)
-            .map(CompressedRow::heap_bytes)
-            .sum()
+        self.compressed_heap
     }
 
     /// 현재 **논리 버퍼(`len`) 안에서** 압축된 슬롯 수. footprint에서 raw 히스토리 행
@@ -422,20 +518,7 @@ impl Storage<Cell> {
     /// 위험한 방향)한다. 논리 범위로 한정해 그 오차를 없앤다. stale 슬롯의 힙 자체는
     /// [`compressed_heap_bytes`]가 여전히 합산한다(그 메모리는 실제로 상주하므로 맞다).
     pub(crate) fn compressed_row_count(&self) -> usize {
-        if self.compressed.is_empty() {
-            return 0;
-        }
-        let n = self.inner.len();
-        (0..self.len)
-            .filter(|&positive| {
-                let idx = if self.zero + positive >= n {
-                    self.zero + positive - n
-                } else {
-                    self.zero + positive
-                };
-                self.compressed[idx].is_some()
-            })
-            .count()
+        self.compressed_count
     }
 
     /// 모든 압축 슬롯을 복원해 stock 상태로 되돌린다(곁가지 비움). resize/reflow처럼
@@ -445,11 +528,13 @@ impl Storage<Cell> {
             return;
         }
         for idx in 0..self.inner.len() {
-            if let Some(compressed) = self.compressed[idx].take() {
+            if let Some(compressed) = self.take_compressed(idx) {
                 self.inner[idx] = compressed.decode(columns);
             }
         }
         self.compressed.clear();
+        self.compressed_heap = 0;
+        self.compressed_count = 0;
     }
 }
 
@@ -495,6 +580,107 @@ mod tests {
         fn flags_mut(&mut self) -> &mut Flags {
             unimplemented!();
         }
+    }
+
+    fn assert_compressed_totals(storage: &Storage<crate::term::cell::Cell>) {
+        let heap: usize = storage
+            .compressed
+            .iter()
+            .flatten()
+            .map(super::CompressedRow::heap_bytes)
+            .sum();
+        let count = (0..storage.len)
+            .filter(|positive| {
+                let index = (storage.zero + positive) % storage.inner.len();
+                storage.compressed.get(index).is_some_and(Option::is_some)
+            })
+            .count();
+        assert_eq!(
+            storage.compressed_heap_bytes(),
+            heap,
+            "allocated slots include stale cache"
+        );
+        assert_eq!(
+            storage.compressed_row_count(),
+            count,
+            "only active logical slots count"
+        );
+    }
+
+    #[test]
+    fn compressed_footprint_query_does_not_visit_rows() {
+        use super::super::compressed::HEAP_ESTIMATE_VISITS;
+        use crate::term::cell::Cell;
+        let mut storage = Storage::<Cell>::with_capacity(3, 8);
+        storage.initialize(5, 8);
+        for line in -5..0 {
+            storage[Line(line)][Column(0)].c = 'x';
+            storage.compress_line(Line(line), 8);
+        }
+        HEAP_ESTIMATE_VISITS.with(|visits| visits.set(0));
+        assert!(storage.compressed_heap_bytes() > 0);
+        assert_eq!(storage.compressed_row_count(), 5);
+        assert_eq!(
+            HEAP_ESTIMATE_VISITS.with(|visits| visits.get()),
+            0,
+            "footprint lookup must use per-grid totals without visiting compressed rows"
+        );
+    }
+
+    #[test]
+    fn compressed_totals_follow_ring_cache_mutations() {
+        use crate::term::cell::Cell;
+        let mut storage = Storage::<Cell>::with_capacity(3, 8);
+        storage.initialize(9, 8);
+        for line in -9..0 {
+            storage[Line(line)][Column(0)].c = char::from_u32(65 + (-line) as u32).unwrap();
+            storage.compress_line(Line(line), 8);
+        }
+        assert_compressed_totals(&storage);
+        let old_heap = storage.compressed_heap_bytes();
+        storage.shrink_lines(4);
+        assert_eq!(storage.compressed_heap_bytes(), old_heap);
+        assert_eq!(storage.compressed_row_count(), 5);
+        assert_compressed_totals(&storage);
+        storage.initialize(2, 8);
+        assert_compressed_totals(&storage);
+        for shift in [1, -1, 4, -4, 17, -17] {
+            storage.rotate(shift);
+            assert_compressed_totals(&storage);
+        }
+        storage.rotate_down(11);
+        assert_compressed_totals(&storage);
+        storage.swap(Line(0), Line(-4));
+        assert_compressed_totals(&storage);
+        let cloned = storage.clone();
+        assert_compressed_totals(&cloned);
+        storage.reset_row(Line(-1), &Cell::default(), 8);
+        assert_compressed_totals(&storage);
+        storage.inflate_visible(8);
+        assert_compressed_totals(&storage);
+        storage.truncate();
+        assert_compressed_totals(&storage);
+        storage.inflate_all(8);
+        assert_compressed_totals(&storage);
+        storage.compress_line(Line(-2), 8);
+        let rows: Vec<_> = storage.take_rows_streaming(8).collect();
+        assert_compressed_totals(&storage);
+        let packed = rows
+            .iter()
+            .map(|row| super::CompressedRow::encode(row, 8))
+            .collect();
+        storage.replace_compressed(packed, 8);
+        assert_compressed_totals(&storage);
+        storage.grow_visible_lines(5);
+        storage.inflate_visible(8);
+        assert_compressed_totals(&storage);
+        storage.shrink_visible_lines(3);
+        assert_compressed_totals(&storage);
+        storage.replace_inner(vec![Row::new(8); 5]);
+        assert_compressed_totals(&storage);
+        storage.compress_line(Line(-1), 8);
+        storage.take_all();
+        assert_compressed_totals(&storage);
     }
 
     #[test]
@@ -563,6 +749,8 @@ mod tests {
             visible_lines: 3,
             len: 3,
             compressed: Vec::new(),
+            compressed_heap: 0,
+            compressed_count: 0,
         };
 
         // Grow buffer.
@@ -575,8 +763,12 @@ mod tests {
             visible_lines: 4,
             len: 4,
             compressed: Vec::new(),
+            compressed_heap: 0,
+            compressed_count: 0,
         };
-        expected.inner.append(&mut vec![filled_row('\0'); MAX_CACHE_SIZE]);
+        expected
+            .inner
+            .append(&mut vec![filled_row('\0'); MAX_CACHE_SIZE]);
 
         assert_eq!(storage.visible_lines, expected.visible_lines);
         assert_eq!(storage.inner, expected.inner);
@@ -606,6 +798,8 @@ mod tests {
             visible_lines: 3,
             len: 3,
             compressed: Vec::new(),
+            compressed_heap: 0,
+            compressed_count: 0,
         };
 
         // Grow buffer.
@@ -618,8 +812,12 @@ mod tests {
             visible_lines: 4,
             len: 4,
             compressed: Vec::new(),
+            compressed_heap: 0,
+            compressed_count: 0,
         };
-        expected.inner.append(&mut vec![filled_row('\0'); MAX_CACHE_SIZE]);
+        expected
+            .inner
+            .append(&mut vec![filled_row('\0'); MAX_CACHE_SIZE]);
 
         assert_eq!(storage.visible_lines, expected.visible_lines);
         assert_eq!(storage.inner, expected.inner);
@@ -646,6 +844,8 @@ mod tests {
             visible_lines: 3,
             len: 3,
             compressed: Vec::new(),
+            compressed_heap: 0,
+            compressed_count: 0,
         };
 
         // Shrink buffer.
@@ -658,6 +858,8 @@ mod tests {
             visible_lines: 2,
             len: 2,
             compressed: Vec::new(),
+            compressed_heap: 0,
+            compressed_count: 0,
         };
         assert_eq!(storage.visible_lines, expected.visible_lines);
         assert_eq!(storage.inner, expected.inner);
@@ -684,6 +886,8 @@ mod tests {
             visible_lines: 3,
             len: 3,
             compressed: Vec::new(),
+            compressed_heap: 0,
+            compressed_count: 0,
         };
 
         // Shrink buffer.
@@ -696,6 +900,8 @@ mod tests {
             visible_lines: 2,
             len: 2,
             compressed: Vec::new(),
+            compressed_heap: 0,
+            compressed_count: 0,
         };
         assert_eq!(storage.visible_lines, expected.visible_lines);
         assert_eq!(storage.inner, expected.inner);
@@ -735,6 +941,8 @@ mod tests {
             visible_lines: 6,
             len: 6,
             compressed: Vec::new(),
+            compressed_heap: 0,
+            compressed_count: 0,
         };
 
         // Shrink buffer.
@@ -754,6 +962,8 @@ mod tests {
             visible_lines: 2,
             len: 2,
             compressed: Vec::new(),
+            compressed_heap: 0,
+            compressed_count: 0,
         };
         assert_eq!(storage.visible_lines, expected.visible_lines);
         assert_eq!(storage.inner, expected.inner);
@@ -789,6 +999,8 @@ mod tests {
             visible_lines: 1,
             len: 2,
             compressed: Vec::new(),
+            compressed_heap: 0,
+            compressed_count: 0,
         };
 
         // Truncate buffer.
@@ -801,6 +1013,8 @@ mod tests {
             visible_lines: 1,
             len: 2,
             compressed: Vec::new(),
+            compressed_heap: 0,
+            compressed_count: 0,
         };
         assert_eq!(storage.visible_lines, expected.visible_lines);
         assert_eq!(storage.inner, expected.inner);
@@ -826,6 +1040,8 @@ mod tests {
             visible_lines: 1,
             len: 2,
             compressed: Vec::new(),
+            compressed_heap: 0,
+            compressed_count: 0,
         };
 
         // Truncate buffer.
@@ -838,6 +1054,8 @@ mod tests {
             visible_lines: 1,
             len: 2,
             compressed: Vec::new(),
+            compressed_heap: 0,
+            compressed_count: 0,
         };
         assert_eq!(storage.visible_lines, expected.visible_lines);
         assert_eq!(storage.inner, expected.inner);
@@ -885,6 +1103,8 @@ mod tests {
             visible_lines: 0,
             len: 6,
             compressed: Vec::new(),
+            compressed_heap: 0,
+            compressed_count: 0,
         };
 
         // Shrink buffer.
@@ -904,6 +1124,8 @@ mod tests {
             visible_lines: 0,
             len: 3,
             compressed: Vec::new(),
+            compressed_heap: 0,
+            compressed_count: 0,
         };
         assert_eq!(storage.inner, shrinking_expected.inner);
         assert_eq!(storage.zero, shrinking_expected.zero);
@@ -926,6 +1148,8 @@ mod tests {
             visible_lines: 0,
             len: 4,
             compressed: Vec::new(),
+            compressed_heap: 0,
+            compressed_count: 0,
         };
 
         assert_eq!(storage.inner, growing_expected.inner);
@@ -949,6 +1173,8 @@ mod tests {
             visible_lines: 0,
             len: 6,
             compressed: Vec::new(),
+            compressed_heap: 0,
+            compressed_count: 0,
         };
 
         // Initialize additional lines.
@@ -966,8 +1192,15 @@ mod tests {
         ];
         let expected_init_size = std::cmp::max(init_size, MAX_CACHE_SIZE);
         expected_inner.append(&mut vec![filled_row('\0'); expected_init_size]);
-        let expected_storage =
-            Storage { inner: expected_inner, zero: 0, visible_lines: 0, len: 9, compressed: Vec::new() };
+        let expected_storage = Storage {
+            inner: expected_inner,
+            zero: 0,
+            visible_lines: 0,
+            len: 9,
+            compressed: Vec::new(),
+            compressed_heap: 0,
+            compressed_count: 0,
+        };
 
         assert_eq!(storage.len, expected_storage.len);
         assert_eq!(storage.zero, expected_storage.zero);
@@ -982,6 +1215,8 @@ mod tests {
             visible_lines: 0,
             len: 3,
             compressed: Vec::new(),
+            compressed_heap: 0,
+            compressed_count: 0,
         };
 
         storage.rotate(2);

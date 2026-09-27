@@ -58,9 +58,16 @@ pub(crate) struct CompressedRow {
     occ: u16,
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static HEAP_ESTIMATE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl CompressedRow {
     /// 이 압축 행이 실제로 점유하는 힙 바이트 추정 — RSS 예산/실측용.
     pub(crate) fn heap_bytes(&self) -> usize {
+        #[cfg(test)]
+        HEAP_ESTIMATE_VISITS.with(|visits| visits.set(visits.get() + 1));
         let extras_cells: usize = self
             .extras
             .iter()
@@ -323,7 +330,11 @@ mod tests {
         // 그래도 (저장한다면) 왕복은 무손실이어야 한다.
         let restored = compressed.decode(columns());
         for col in 0..columns() {
-            assert_eq!(row[Column(col)], restored[Column(col)], "col {col} 왕복 불일치");
+            assert_eq!(
+                row[Column(col)],
+                restored[Column(col)],
+                "col {col} 왕복 불일치"
+            );
         }
     }
 }

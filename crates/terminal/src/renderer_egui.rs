@@ -915,14 +915,14 @@ fn build_row_cache(
 
     let mut bg_runs = Vec::new();
     for (col, term_cell) in cells.iter().enumerate() {
-        if term_cell.wide_spacer {
+        if term_cell.wide_spacer() {
             continue;
         }
         let bg = rgb(term_cell.bg);
         if bg == default_bg {
             continue;
         }
-        let width_cols = if term_cell.wide { 2 } else { 1 };
+        let width_cols = if term_cell.wide() { 2 } else { 1 };
         push_bg_run(&mut bg_runs, col, (col + width_cols).min(cols), bg);
     }
 
@@ -933,11 +933,11 @@ fn build_row_cache(
     for (col, term_cell) in cells.iter().enumerate() {
         // A trailing spacer belongs to the preceding wide glyph and must not
         // interrupt its run. A leading wrap filler has no owner on this row.
-        if term_cell.wide_spacer && col > 0 && cells[col - 1].wide {
+        if term_cell.wide_spacer() && col > 0 && cells[col - 1].wide() {
             continue;
         }
         let grapheme = snapshot.cell_grapheme(row_start + col);
-        if term_cell.wide_spacer || (term_cell.c == ' ' && grapheme.is_none()) {
+        if term_cell.wide_spacer() || (term_cell.c == ' ' && grapheme.is_none()) {
             pending.flush(
                 &mut text_runs,
                 painter,
@@ -949,8 +949,8 @@ fn build_row_cache(
         }
 
         let fg = rgb(term_cell.fg);
-        let attrs = term_cell.attrs;
-        let width_cols = if term_cell.wide { 2 } else { 1 };
+        let attrs = term_cell.attrs();
+        let width_cols = if term_cell.wide() { 2 } else { 1 };
         if let Some(grapheme) = grapheme {
             pending.flush(
                 &mut text_runs,
@@ -980,7 +980,7 @@ fn build_row_cache(
         // Width-class boundaries keep the fitting contract uniform. epaint
         // handles fallback fonts inside a galley; each scalar still receives
         // the terminal's exact one/two-cell advance below.
-        let independent = term_cell.wide && !is_cjk_scalar(term_cell.c);
+        let independent = term_cell.wide() && !is_cjk_scalar(term_cell.c);
         if independent || pending.needs_flush(col, fg, attrs, width_cols) {
             pending.flush(
                 &mut text_runs,
@@ -1201,10 +1201,10 @@ fn build_line_runs(cells: &[crate::TerminalCell], cols: usize) -> (Vec<RowBgRun>
     let mut underline_runs: Vec<RowBgRun> = Vec::new();
     let mut strikeout_runs: Vec<RowBgRun> = Vec::new();
     for (col, term_cell) in cells.iter().enumerate() {
-        if term_cell.wide_spacer {
+        if term_cell.wide_spacer() {
             continue;
         }
-        let attrs = term_cell.attrs;
+        let attrs = term_cell.attrs();
         if !attrs.contains(CellAttrs::UNDERLINE) && !attrs.contains(CellAttrs::STRIKEOUT) {
             continue;
         }
@@ -1213,7 +1213,7 @@ fn build_line_runs(cells: &[crate::TerminalCell], cols: usize) -> (Vec<RowBgRun>
         } else {
             rgb(term_cell.fg)
         };
-        let width_cols = if term_cell.wide { 2 } else { 1 };
+        let width_cols = if term_cell.wide() { 2 } else { 1 };
         let end_col = (col + width_cols).min(cols);
         if attrs.contains(CellAttrs::UNDERLINE) {
             push_bg_run(&mut underline_runs, col, end_col, color);
@@ -1280,7 +1280,7 @@ fn selection_covers_cell(
         // 행 끝 필러(`LEADING_WIDE_CHAR_SPACER`)는 앞 글자의 뒷칸이 **아니다** — 소유자가
         // 다음 줄에 있으므로 `end` 상한을 그대로 적용한다. 구분하지 않으면 CJK로 wrap되는
         // 행에서 강조가 한 칸 더 칠해진다(2026-08-18 리뷰 실측).
-        Some(cell) if cell.wide_spacer => {
+        Some(cell) if cell.wide_spacer() => {
             if snapshot.is_trailing_wide_spacer(index) {
                 previous_selected
             } else {
@@ -1365,7 +1365,7 @@ pub fn selection_text(snapshot: &TerminalViewportSnapshot, start: usize, end: us
             current_row = row;
         }
         let cell = &snapshot.visible_cells[i];
-        if !cell.wide_spacer {
+        if !cell.wide_spacer() {
             snapshot.push_cell_text(i, &mut line);
         }
     }
@@ -1404,7 +1404,7 @@ fn normalize_selection_endpoint(
     if index >= snapshot.visible_cells.len() {
         return None;
     }
-    if !snapshot.visible_cells[index].wide_spacer {
+    if !snapshot.visible_cells[index].wide_spacer() {
         return Some(index);
     }
     Some(owning_wide_cell(snapshot, index).unwrap_or(index))
@@ -1413,12 +1413,12 @@ fn normalize_selection_endpoint(
 fn owning_wide_cell(snapshot: &TerminalViewportSnapshot, spacer: usize) -> Option<usize> {
     let cols = snapshot.cols as usize;
     let cells = &snapshot.visible_cells;
-    if cols == 0 || spacer >= cells.len() || !cells[spacer].wide_spacer {
+    if cols == 0 || spacer >= cells.len() || !cells[spacer].wide_spacer() {
         return None;
     }
 
     let col = spacer % cols;
-    if col > 0 && cells.get(spacer - 1).is_some_and(|cell| cell.wide) {
+    if col > 0 && cells.get(spacer - 1).is_some_and(|cell| cell.wide()) {
         return Some(spacer - 1);
     }
     None
@@ -1444,14 +1444,14 @@ mod tests {
 
     /// 밑줄 런 테스트용 셀 — 문자/속성/wide 지정.
     fn line_cell(c: char, bits: u8, wide: bool, wide_spacer: bool) -> crate::TerminalCell {
-        crate::TerminalCell {
+        crate::TerminalCell::new(
             c,
-            fg: [0xd8; 3],
-            bg: [0x18, 0x18, 0x1c],
+            [0xd8; 3],
+            [0x18, 0x18, 0x1c],
             wide,
             wide_spacer,
-            attrs: CellAttrs(bits),
-        }
+            CellAttrs(bits),
+        )
     }
 
     #[test]
@@ -1571,14 +1571,14 @@ mod tests {
         for r in 0..rows as usize {
             let line: Vec<char> = text.get(r).unwrap_or(&"").chars().collect();
             for c in 0..cols as usize {
-                cells.push(TerminalCell {
-                    c: *line.get(c).unwrap_or(&' '),
-                    fg: [0xd8; 3],
-                    bg: [0x18, 0x18, 0x1c],
-                    wide: false,
-                    wide_spacer: false,
-                    attrs: Default::default(),
-                });
+                cells.push(TerminalCell::new(
+                    *line.get(c).unwrap_or(&' '),
+                    [0xd8; 3],
+                    [0x18, 0x18, 0x1c],
+                    false,
+                    false,
+                    Default::default(),
+                ));
             }
         }
         TerminalViewportSnapshot {
@@ -1613,7 +1613,7 @@ mod tests {
         snapshot
             .visible_cells
             .iter()
-            .position(|cell| cell.wide_spacer)
+            .position(|cell| cell.wide_spacer())
             .expect("fixture should contain a wide spacer")
     }
 
@@ -1700,14 +1700,14 @@ mod tests {
                 .collect();
             let mut cells = Vec::with_capacity(cols as usize * rows as usize);
             for idx in 0..cols as usize * rows as usize {
-                cells.push(TerminalCell {
-                    c: cb[idx % cb.len()],
-                    fg: palette[(idx / color_period) % palette.len()],
-                    bg: [0x18, 0x18, 0x1c],
-                    wide: false,
-                    wide_spacer: false,
-                    attrs: Default::default(),
-                });
+                cells.push(TerminalCell::new(
+                    cb[idx % cb.len()],
+                    palette[(idx / color_period) % palette.len()],
+                    [0x18, 0x18, 0x1c],
+                    false,
+                    false,
+                    Default::default(),
+                ));
             }
             TerminalViewportSnapshot {
                 cols,
@@ -1859,7 +1859,7 @@ mod tests {
             let run = &row.text_runs[0];
             assert_eq!(run.galley.text(), text);
             let cell = cell_size(&ctx, m(13.0, 1.0));
-            let cols = if snapshot.visible_cells[0].wide {
+            let cols = if snapshot.visible_cells[0].wide() {
                 2.0
             } else {
                 1.0
@@ -2404,7 +2404,7 @@ mod tests {
 
         let filler = 5; // row0의 마지막 칸
         assert!(
-            snapshot.visible_cells[filler].wide_spacer,
+            snapshot.visible_cells[filler].wide_spacer(),
             "백엔드가 필러도 wide_spacer로 평탄화한다(이 테스트의 전제)"
         );
         assert!(
@@ -2418,7 +2418,7 @@ mod tests {
         );
         // "가"의 뒷칸은 여전히 소유자와 함께 칠한다(회귀 방지).
         let owner = snapshot.cols as usize; // row1 0열
-        assert!(snapshot.visible_cells[owner].wide);
+        assert!(snapshot.visible_cells[owner].wide());
         assert!(snapshot.is_trailing_wide_spacer(owner + 1));
         assert!(selection_covers_cell(
             &snapshot,
@@ -2502,7 +2502,7 @@ mod tests {
             .enumerate()
             .find_map(|(index, cell)| {
                 let owner = owning_wide_cell(&snapshot, index)?;
-                (cell.wide_spacer && snapshot.visible_cells[owner].c == '🚀').then_some(index)
+                (cell.wide_spacer() && snapshot.visible_cells[owner].c == '🚀').then_some(index)
             })
             .expect("rocket fixture should contain a wide spacer");
         assert_eq!(selection_text(&snapshot, spacer, spacer), "🚀");

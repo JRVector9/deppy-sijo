@@ -9277,7 +9277,7 @@ fn cell_has_content(snapshot: &terminal::TerminalViewportSnapshot, idx: usize) -
     snapshot
         .visible_cells
         .get(idx)
-        .is_some_and(|cell| !cell.wide_spacer && !cell.c.is_whitespace() && cell.c != '\0')
+        .is_some_and(|cell| !cell.wide_spacer() && !cell.c.is_whitespace() && cell.c != '\0')
 }
 
 fn snapshot_has_visible_text(snapshot: &TerminalViewportSnapshot) -> bool {
@@ -9605,7 +9605,7 @@ fn last_line_summary(snapshot: &TerminalViewportSnapshot) -> String {
         let mut non_whitespace_end = 0;
         for index in row * cols..(row + 1) * cols {
             let cell = &snapshot.visible_cells[index];
-            if cell.wide_spacer {
+            if cell.wide_spacer() {
                 continue;
             }
             let mut scalar = [0; 4];
@@ -15762,14 +15762,14 @@ mod tests {
         // "a nant-성과.pdf b" — 한글은 wide+spacer 2셀. 스페이서를 공백 취급하면
         // 단어가 첫 한글에서 끊긴다 (2026-07-14 "nant-성과분석.pdf 안 열림" 원인).
         fn push(cells: &mut Vec<TerminalCell>, c: char, wide: bool, spacer: bool) {
-            cells.push(TerminalCell {
+            cells.push(TerminalCell::new(
                 c,
-                fg: [255; 3],
-                bg: [0; 3],
+                [255; 3],
+                [0; 3],
                 wide,
-                wide_spacer: spacer,
-                attrs: Default::default(),
-            });
+                spacer,
+                Default::default(),
+            ));
         }
         let cols = 20usize;
         let mut cells = Vec::new();
@@ -15818,36 +15818,36 @@ mod tests {
             for c in line.chars() {
                 // 픽스처에서는 비ASCII를 2칸(wide)으로 본다 — 한글 검증에 충분하다.
                 let wide = !c.is_ascii();
-                cells.push(TerminalCell {
+                cells.push(TerminalCell::new(
                     c,
-                    fg: [255; 3],
-                    bg: [0; 3],
+                    [255; 3],
+                    [0; 3],
                     wide,
-                    wide_spacer: false,
-                    attrs: Default::default(),
-                });
+                    false,
+                    Default::default(),
+                ));
                 width += 1;
                 if wide {
-                    cells.push(TerminalCell {
-                        c: ' ',
-                        fg: [255; 3],
-                        bg: [0; 3],
-                        wide: false,
-                        wide_spacer: true,
-                        attrs: Default::default(),
-                    });
+                    cells.push(TerminalCell::new(
+                        ' ',
+                        [255; 3],
+                        [0; 3],
+                        false,
+                        true,
+                        Default::default(),
+                    ));
                     width += 1;
                 }
             }
             while width < cols {
-                cells.push(TerminalCell {
-                    c: ' ',
-                    fg: [255; 3],
-                    bg: [0; 3],
-                    wide: false,
-                    wide_spacer: false,
-                    attrs: Default::default(),
-                });
+                cells.push(TerminalCell::new(
+                    ' ',
+                    [255; 3],
+                    [0; 3],
+                    false,
+                    false,
+                    Default::default(),
+                ));
                 width += 1;
             }
         }
@@ -15933,7 +15933,7 @@ mod tests {
         let mut snap = line_snap(6, &[""]);
         let cells: &mut Vec<TerminalCell> = &mut snap.visible_cells.to_vec();
         // 마지막 칸만 필러로 만든다 — 앞 칸은 소유자(wide)가 아니라 그냥 공백이다.
-        cells[5].wide_spacer = true;
+        cells[5].set_wide_spacer(true);
         snap.visible_cells = cells.clone().into();
 
         assert!(
@@ -16276,14 +16276,14 @@ mod tests {
         let mut cells = Vec::with_capacity(cols * rows);
         let chars: Vec<char> = text.chars().collect();
         for idx in 0..cols * rows {
-            cells.push(TerminalCell {
-                c: chars.get(idx).copied().unwrap_or(' '),
-                fg: [255, 255, 255],
-                bg: [0, 0, 0],
-                wide: false,
-                wide_spacer: false,
-                attrs: Default::default(),
-            });
+            cells.push(TerminalCell::new(
+                chars.get(idx).copied().unwrap_or(' '),
+                [255, 255, 255],
+                [0, 0, 0],
+                false,
+                false,
+                Default::default(),
+            ));
         }
         Arc::new(TerminalViewportSnapshot {
             cols: cols as u16,

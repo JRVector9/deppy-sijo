@@ -1208,6 +1208,30 @@ mod tests {
     }
 
     #[test]
+    fn native_zero_width_format_extras_remain_valid_sparse_text() {
+        for text in [
+            "a\u{200b}",
+            "a\u{202e}",
+            "a\u{200e}",
+            "a\u{200d}",
+            "a\u{034f}",
+            "가ᇹ",
+            "a\u{301}\u{308}",
+        ] {
+            let mut backend = AlacrittyBackend::new(20, 3, 10);
+            feed(&mut backend, text.as_bytes());
+            let snapshot = backend.viewport_snapshot().unwrap();
+            assert_eq!(snapshot.cell_grapheme(0), Some(text));
+            assert!(
+                crate::validate_cell_graphemes(&snapshot.visible_cells, &snapshot.graphemes)
+                    .is_ok(),
+                "{text:?}"
+            );
+            assert_eq!(crate::renderer_egui::selection_text(&snapshot, 0, 19), text);
+        }
+    }
+
+    #[test]
     fn ascii_snapshots_share_empty_grapheme_storage() {
         let backend = AlacrittyBackend::new(20, 3, 10);
         let first = backend.viewport_snapshot().unwrap();

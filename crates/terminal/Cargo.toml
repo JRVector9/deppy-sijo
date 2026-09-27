@@ -10,6 +10,9 @@ serde = { workspace = true }
 anyhow = { workspace = true }
 alacritty_terminal = { workspace = true }
 unicode-normalization = { workspace = true }
+# Match the vendored engine's width policy and the existing locked segmentation crate.
+unicode-width = "0.2.2"
+unicode-segmentation = "1.13.3"
 egui = { workspace = true }
 # LibGhosttyBackend (v1.x experimental, A/B 실측용) — 빌드에 Zig 툴체인 필요해 opt-in.
 # macOS 26.4 SDK에서는 zig 0.15.2 우회 필요 (scripts/… fake xcrun) — 기본 빌드 무관.

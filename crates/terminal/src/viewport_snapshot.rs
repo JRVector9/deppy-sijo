@@ -1,4 +1,6 @@
 use std::sync::Arc;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// 설계문서 8.1 TerminalViewportSnapshot. UI가 보는 유일한 화면 상태.
 /// serde는 remote transport(PR-19) 직렬화용 — visible_cells의 Arc는 serde rc feature.
@@ -63,6 +65,18 @@ pub fn validate_cell_graphemes(
             || entry.text.chars().any(char::is_control)
         {
             return Err("invalid grapheme scalar content or count");
+        }
+        // Alacritty appends every width-0 scalar to the preceding owner cell. ZWSP,
+        // bidi and other format scalars can form separate UAX29 clusters, so requiring
+        // exactly one cluster would reject valid native snapshots. Preserve that
+        // engine contract. A backend's joined emoji cluster may include spacing
+        // scalars; allow it only as one cluster fitting this owner's 1/2-cell span.
+        let native_zero_width_suffix = entry.text.chars().skip(1).all(|c| c.width() == Some(0));
+        if !native_zero_width_suffix
+            && (entry.text.graphemes(true).take(2).count() != 1
+                || entry.text.width() > if cell.wide() { 2 } else { 1 })
+        {
+            return Err("sparse text contains spacing glyphs outside its owner cell");
         }
         previous = Some(entry.index);
     }
@@ -274,6 +288,36 @@ pub struct CellRange {
 #[cfg(test)]
 mod compact_tests {
     use super::*;
+    #[test]
+    fn sparse_text_accepts_single_joined_cluster_only_with_its_owner_width() {
+        let full = "👩\u{200d}💻";
+        let entry = CellGrapheme {
+            index: 0,
+            text: full.into(),
+        };
+        let wide = TerminalCell::new('👩', [0; 3], [0; 3], true, false, CellAttrs::empty());
+        assert!(validate_cell_graphemes(&[wide], &[entry.clone()]).is_ok());
+        let narrow = TerminalCell::new('👩', [0; 3], [0; 3], false, false, CellAttrs::empty());
+        assert!(validate_cell_graphemes(&[narrow], &[entry]).is_err());
+    }
+
+    #[test]
+    fn sparse_text_rejects_two_spacing_clusters() {
+        for text in ["ab", "a\u{301}b", "a\u{200b}b"] {
+            let cell = TerminalCell::new('a', [0; 3], [0; 3], false, false, CellAttrs::empty());
+            assert!(
+                validate_cell_graphemes(
+                    &[cell],
+                    &[CellGrapheme {
+                        index: 0,
+                        text: text.into()
+                    }]
+                )
+                .is_err()
+            );
+        }
+    }
+
     #[test]
     fn compact_cell_preserves_all_supported_flag_combinations() {
         for attrs in 0..32 {

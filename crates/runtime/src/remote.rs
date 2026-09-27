@@ -3866,6 +3866,45 @@ mod tests {
     }
 
     #[test]
+    fn multiple_spacing_graphemes_are_rejected_in_keyframe() {
+        let mut snapshot = make_snapshot(20, 5, &["a"], false).as_ref().clone();
+        snapshot.graphemes = vec![terminal::CellGrapheme {
+            index: 0,
+            text: "ab".into(),
+        }]
+        .into();
+        let event = RuntimeEvent::Viewport {
+            session: SessionId(1),
+            snapshot: Arc::new(snapshot),
+            bracketed_paste: false,
+        };
+        let decoded: RuntimeEvent =
+            postcard::from_bytes(&postcard::to_allocvec(&event).unwrap()).unwrap();
+        assert!(
+            validate_event(&decoded).is_err(),
+            "one owner cell must not carry two spacing glyphs"
+        );
+    }
+
+    #[test]
+    fn multiple_spacing_graphemes_are_rejected_in_delta() {
+        let baseline = make_snapshot(20, 5, &["a"], false);
+        let mut malicious = baseline.as_ref().clone();
+        malicious.graphemes = vec![terminal::CellGrapheme {
+            index: 0,
+            text: "ab".into(),
+        }]
+        .into();
+        let delta = diff_viewport(&baseline, &malicious).unwrap();
+        let decoded: ViewportDelta =
+            postcard::from_bytes(&postcard::to_allocvec(&delta).unwrap()).unwrap();
+        assert!(
+            try_apply_delta(&baseline, &decoded).is_err(),
+            "delta must reject spacing text inside one owner cell"
+        );
+    }
+
+    #[test]
     fn malformed_graphemes_are_rejected_before_event_publish() {
         let base = make_snapshot(20, 5, &["a"], false);
         for entries in [

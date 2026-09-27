@@ -701,16 +701,17 @@ pub fn target_matches(
 
 pub fn screen_text(s: &terminal::TerminalViewportSnapshot) -> String {
     let mut out = String::new();
-    if s.cols == 0 {
+    if s.cols == 0 || s.rows == 0 || s.visible_cells.is_empty() {
         return out;
     }
+    let mut line = String::with_capacity(usize::from(s.cols).min(MAX_SCREEN));
     for (row_index, row) in s
         .visible_cells
         .chunks(s.cols as usize)
         .take(s.rows as usize)
         .enumerate()
     {
-        let mut line = String::new();
+        line.clear();
         for (col, c) in row.iter().enumerate() {
             if s.is_trailing_wide_spacer(row_index * s.cols as usize + col) || c.wide_spacer() {
                 continue;
@@ -732,6 +733,25 @@ pub fn screen_text(s: &terminal::TerminalViewportSnapshot) -> String {
 }
 #[cfg(test)]
 mod grapheme_snapshot_tests {
+    #[test]
+    fn cloud_screen_rows_reuse_scratch_without_retaining_prior_text() {
+        use terminal::TerminalBackend;
+        for (input, expected) in [
+            ("long-name\r\nx", "long-name\nx\n\n"),
+            ("\x1b[31m한글\x1b[0m  \r\n  x", "한글\n  x\n\n"),
+        ] {
+            let mut backend = terminal::AlacrittyBackend::new(10, 3, 10);
+            backend.feed(input.as_bytes()).unwrap();
+            let snapshot = backend.viewport_snapshot().unwrap();
+            assert_eq!(super::screen_text(&snapshot), expected);
+            let mut empty = snapshot.clone();
+            empty.cols = 0;
+            assert!(super::screen_text(&empty).is_empty());
+            empty.cols = 10;
+            empty.rows = 0;
+            assert!(super::screen_text(&empty).is_empty());
+        }
+    }
     #[test]
     fn cloud_screen_text_preserves_non_composable_graphemes() {
         use terminal::TerminalBackend;

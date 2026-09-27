@@ -930,7 +930,8 @@ fn build_row_cache(
         if term_cell.wide_spacer && col > 0 && cells[col - 1].wide {
             continue;
         }
-        if term_cell.wide_spacer || term_cell.c == ' ' {
+        let grapheme = snapshot.cell_grapheme(row_start + col);
+        if term_cell.wide_spacer || (term_cell.c == ' ' && grapheme.is_none()) {
             pending.flush(
                 &mut text_runs,
                 painter,
@@ -944,6 +945,32 @@ fn build_row_cache(
         let fg = rgb(term_cell.fg);
         let attrs = term_cell.attrs;
         let width_cols = if term_cell.wide { 2 } else { 1 };
+        if let Some(grapheme) = grapheme {
+            pending.flush(
+                &mut text_runs,
+                painter,
+                font_id,
+                bold_family_ready,
+                cell_width,
+            );
+            text_runs.push(RowTextRun {
+                col,
+                galley: fit_grapheme_to_cells(
+                    layout_attr_text(
+                        painter,
+                        grapheme.to_owned(),
+                        font_id,
+                        fg,
+                        attrs,
+                        bold_family_ready,
+                    ),
+                    cell_width * width_cols as f32,
+                ),
+                color: fg,
+                scaled: None,
+            });
+            continue;
+        }
         // Width-class boundaries keep the fitting contract uniform. epaint
         // handles fallback fonts inside a galley; each scalar still receives
         // the terminal's exact one/two-cell advance below.
@@ -1056,6 +1083,39 @@ impl PendingTextRun {
             scaled: None,
         });
     }
+}
+
+// Multi-scalar text occupies its owning terminal cell(s). Scale the complete
+// shaped cluster when needed, retaining the font's mark/ZWJ positions instead
+// of assigning one cell advance to each scalar.
+fn fit_grapheme_to_cells(galley: Arc<egui::Galley>, cell_width: f32) -> Arc<egui::Galley> {
+    let left = galley.mesh_bounds.left().min(0.0);
+    let width = galley.rect.width().max(galley.mesh_bounds.right()) - left;
+    if !width.is_finite() || width <= cell_width + 0.01 || cell_width <= 0.0 {
+        return galley;
+    }
+    let scale = cell_width / width;
+    let center_y = galley.rect.center().y;
+    let mut shape = egui::epaint::TextShape::new(egui::Pos2::ZERO, galley, egui::Color32::WHITE);
+    shape.transform(egui::emath::TSTransform::from_scaling(scale));
+    let offset = egui::vec2(-left * scale, center_y * (1.0 - scale));
+    // TextShape::transform keeps translation in TextShape.pos. This helper
+    // returns only the galley, so apply that offset to its local geometry.
+    let fitted = Arc::make_mut(&mut shape.galley);
+    fitted.rect = fitted.rect.translate(offset);
+    fitted.mesh_bounds = fitted.mesh_bounds.translate(offset);
+    for placed in &mut fitted.rows {
+        let row = Arc::make_mut(&mut placed.row);
+        for glyph in &mut row.glyphs {
+            glyph.pos = glyph.pos * scale + offset;
+            glyph.advance_width *= scale;
+        }
+        row.visuals.mesh_bounds = row.visuals.mesh_bounds.translate(offset);
+        for vertex in &mut row.visuals.mesh.vertices {
+            vertex.pos += offset;
+        }
+    }
+    shape.galley
 }
 
 /// 폰트의 advance 대신 backend가 정한 셀 폭으로 배치한다. D2Coding의 ① 같은
@@ -1300,7 +1360,7 @@ pub fn selection_text(snapshot: &TerminalViewportSnapshot, start: usize, end: us
         }
         let cell = &snapshot.visible_cells[i];
         if !cell.wide_spacer {
-            line.push(cell.c);
+            snapshot.push_cell_text(i, &mut line);
         }
     }
     out.push_str(line.trim_end());
@@ -1525,6 +1585,7 @@ mod tests {
                 visible: false,
             },
             visible_cells: cells.into(),
+            graphemes: Default::default(),
             dirty_ranges: Vec::new(),
             title: None,
             scroll_offset: 0,
@@ -1652,6 +1713,7 @@ mod tests {
                     visible: false,
                 },
                 visible_cells: cells.into(),
+                graphemes: Default::default(),
                 dirty_ranges: Vec::new(),
                 title: None,
                 scroll_offset: 0,
@@ -1773,6 +1835,30 @@ mod tests {
                 (cd_ms + ct_ms) / ITERS as f64,
                 cache.rebuilt_rows_last_frame(),
             );
+        }
+    }
+
+    #[test]
+    fn sparse_graphemes_survive_paint_and_copy_without_scalar_cell_expansion() {
+        for text in ["가ᇹ", "a\u{0301}\u{0308}"] {
+            let snapshot = backend_snap(text);
+            assert_eq!(
+                selection_text(&snapshot, 0, snapshot.cols as usize - 1),
+                text
+            );
+            let ctx = egui::Context::default();
+            let mut cache = TerminalRenderCache::default();
+            draw_for_test(&ctx, &mut cache, &snapshot);
+            let row = cache.rows_cache[0].as_ref().unwrap();
+            let run = &row.text_runs[0];
+            assert_eq!(run.galley.text(), text);
+            let cell = cell_size(&ctx, m(13.0, 1.0));
+            let cols = if snapshot.visible_cells[0].wide {
+                2.0
+            } else {
+                1.0
+            };
+            assert!(run.galley.rect.width() <= cell.x * cols + 0.01);
         }
     }
 

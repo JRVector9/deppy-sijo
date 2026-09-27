@@ -1,0 +1,128 @@
+{
+  "mcp-full.log": {
+    "original": "/tmp/deppy-auto-mcp-full.log",
+    "original_sha256": "f3aa9b9dee2d45b9afe6f3feaf02e323daac3d37b1b03b2af561a45cd07db101",
+    "copied_sha256": "775d87708201e542b2af73928d427986d38c40605ae1da75cfad06495ae42d8a",
+    "eof_normalized": true
+  },
+  "cloud-final.log": {
+    "original": "/tmp/deppy-auto-cloud-final.log",
+    "original_sha256": "88625327bd5786e792cc7041db565dc42760bfc48cbd5fd3d6aac6d439ab5d7f",
+    "copied_sha256": "4de6a7e9220df3e3c9f6d66015016bc34801fd5e7b000b789af9128e9a19a916",
+    "eof_normalized": true
+  },
+  "config-final.log": {
+    "original": "/tmp/deppy-auto-config-fixed.log",
+    "original_sha256": "83c9ec01bd7b1232fba34979de9d56e55c9d46f8ccb2ddc8b070d8b014e92ab6",
+    "copied_sha256": "ed48c492ca1f8ad1a11da31ffd8aa196fd2059e5cb8dc1afc2298e772d934835",
+    "eof_normalized": true
+  },
+  "i18n.log": {
+    "original": "/tmp/deppy-auto-final-i18n.log",
+    "original_sha256": "1227f119d4edc2f22ed41b498a7784db7a7f48342b0b0c8f61e74ffbe4244be1",
+    "copied_sha256": "74e06a6fcb67f78b934acc6b88881ab9809d3141bce3eb509458155a00db5d4c",
+    "eof_normalized": true
+  },
+  "i18n-check.log": {
+    "original": "/tmp/deppy-auto-final-i18n-check.log",
+    "original_sha256": "e8e6924011c1c82eec4ea8f37ef91843830b69d03fc6333b126b70ab4c7c2f0c",
+    "copied_sha256": "e8e6924011c1c82eec4ea8f37ef91843830b69d03fc6333b126b70ab4c7c2f0c",
+    "eof_normalized": false
+  },
+  "boundary.log": {
+    "original": "/tmp/deppy-auto-final-boundary.log",
+    "original_sha256": "ae12ed1bc6e7a4d8646eacd0f737251befb58a0a63a2ed3c7213bdc3bfbdf7d6",
+    "copied_sha256": "ae12ed1bc6e7a4d8646eacd0f737251befb58a0a63a2ed3c7213bdc3bfbdf7d6",
+    "eof_normalized": false
+  },
+  "deps.log": {
+    "original": "/tmp/deppy-auto-final-deps.log",
+    "original_sha256": "451e9e2ccf18c92ed13f76022dbbf7fea5b2617e96d5f7cd5ef86eb5a37798a9",
+    "copied_sha256": "451e9e2ccf18c92ed13f76022dbbf7fea5b2617e96d5f7cd5ef86eb5a37798a9",
+    "eof_normalized": false
+  },
+  "helper-tests.log": {
+    "original": "/tmp/deppy-auto-final-helper.log",
+    "original_sha256": "d094b1bd2c8318c96097f80c50da282add5b2972970a77046de8db6c8935f6ca",
+    "copied_sha256": "d094b1bd2c8318c96097f80c50da282add5b2972970a77046de8db6c8935f6ca",
+    "eof_normalized": false
+  },
+  "shell-syntax.log": {
+    "original": "/tmp/deppy-auto-final-shell.log",
+    "original_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "copied_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "eof_normalized": false
+  },
+  "fmt.log": {
+    "original": "/tmp/deppy-auto-fmt-final.log",
+    "original_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "copied_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "eof_normalized": false
+  },
+  "public-final.log": {
+    "original": "/tmp/deppy-auto-public-final.log",
+    "original_sha256": "bb745b25267469f91902f2345f12f68171408f618442f32478731d8dc3c8644b",
+    "copied_sha256": "fdb3965f6ff28b4214f8e7f9388e7c1d4575194687171dfe3fb231cb0168b5fb",
+    "eof_normalized": true
+  },
+  "release.log": {
+    "original": "/tmp/deppy-auto-release.log",
+    "original_sha256": "5c4e23a9f9ef7afeabde0a0e103112de593d213b9ee0eac53b107cfdff3aa09b",
+    "copied_sha256": "5c4e23a9f9ef7afeabde0a0e103112de593d213b9ee0eac53b107cfdff3aa09b",
+    "eof_normalized": false
+  },
+  "package.log": {
+    "original": "/tmp/deppy-auto-package.log",
+    "original_sha256": "420c56cc2d9a5aeb51b0f8666904a5e393e351554fd0292b4126ba2ed4f733cd",
+    "copied_sha256": "420c56cc2d9a5aeb51b0f8666904a5e393e351554fd0292b4126ba2ed4f733cd",
+    "eof_normalized": false
+  },
+  "helper-review.txt": {
+    "original": "/tmp/deppy-auto-helper-review.txt",
+    "original_sha256": "e5969a801f36beeda809f1c06819357755d96539cb44e73f0230f92e2de947c7",
+    "copied_sha256": "e593160c3ed6d0f5878b7fa1d878d2f5d3e6cf68b1ce32f55400ff1fd2cd8f8a",
+    "eof_normalized": true
+  },
+  "helper-rereview.txt": {
+    "original": "/tmp/deppy-auto-helper-rereview.txt",
+    "original_sha256": "651d8837b7967a91269777f4814e8bad5e695e15653dc334d7252a50e7dbbff9",
+    "copied_sha256": "a0f6a03aa9293b65ed279041779400bd4cc712331bcdee21fecaa31fdd53c909",
+    "eof_normalized": true
+  },
+  "source-review.txt": {
+    "original": "/tmp/deppy-auto-source-review.txt",
+    "original_sha256": "4f603f49fab558af25439dfe59ea5ecb7ef17af816bfe3d7a8e3c1d6771ba46c",
+    "copied_sha256": "3ccdc8a9d9087edcd5eccd49f85ee6f97f22f45ab1496f4cf42b7548d4553795",
+    "eof_normalized": true
+  },
+  "source-rereview.txt": {
+    "original": "/tmp/deppy-auto-source-rereview.txt",
+    "original_sha256": "0927d77815f8641405c77800508e6405ac3dab4dec94cfe74c2a833a90e4feb1",
+    "copied_sha256": "8105368d05902319c98fff30c5e73d2f03ac2560a53768b0223d04c002a76078",
+    "eof_normalized": true
+  },
+  "health-red.log": {
+    "original": "/tmp/deppy-auto-health-red.log",
+    "original_sha256": "edc5d0b32f479303ae7a9e3e6d96ed944635626b9bf6529947199ffb8a93c71b",
+    "copied_sha256": "edc5d0b32f479303ae7a9e3e6d96ed944635626b9bf6529947199ffb8a93c71b",
+    "eof_normalized": false
+  },
+  "migration-red.log": {
+    "original": "/tmp/deppy-auto-migration-red.log",
+    "original_sha256": "2676447e4f2a17ddc6acd61aea18a31bd2835af7a893b4594cc247bd5eaee744",
+    "copied_sha256": "2676447e4f2a17ddc6acd61aea18a31bd2835af7a893b4594cc247bd5eaee744",
+    "eof_normalized": false
+  },
+  "initial-cloud-fixture-failure.log": {
+    "original": "/tmp/deppy-auto-final-cloud.log",
+    "original_sha256": "cc6821de802c35910ce4410a858db04be7bb120d616ccdc6e56c00f32fb9fe2f",
+    "copied_sha256": "cc6821de802c35910ce4410a858db04be7bb120d616ccdc6e56c00f32fb9fe2f",
+    "eof_normalized": false
+  },
+  "artifact-verification.json": {
+    "original": "/tmp/deppy-auto-artifact-verification.json",
+    "original_sha256": "c022d71f75fe36af92d71434d4ef4a108728045171a342d66217ed6c759a5b66",
+    "copied_sha256": "c022d71f75fe36af92d71434d4ef4a108728045171a342d66217ed6c759a5b66",
+    "eof_normalized": false
+  }
+}

@@ -1,3 +1,125 @@
+# Automatic MCP connection completed — 2026-09-27
+
+## Current objective and status
+
+User correction asked to implement the automatic MCP button, rather than leave it as a proposal. Implementation, scoped reviews/fixes, real public end-to-end tests, version increase and local release/package build are complete. No implementation work remains for this unit. No push or GUI restart was authorized in this correction task.
+
+## Completed work and source
+
+- Authoritative tree: /Users/jr/Desktop/projects/deppy-sijo-performance, branch feat/automatic-mcp-connect.
+- Helper commit4c9786a9: pinned SHA256-verified cloudflared2026.9.1, macOS arm64/amd64 preparation, companion packaging/signing/license, archive verification.
+- Product commitbb0441a925d66d8b74602991a92c50018f1242d2: app-owned tunnel lifecycle; verified actual public metadata; real server Host/OAuth hostname publication; default automatic and preserved manual mode/config migration; statuses and URL/token copying; session consent/revoke/input/output/own-answer path preserved; version0.1.0→0.2.0 Cargo/lock.
+- Modified source: Cargo.toml/lock, agent-mcp server, App cloud_agent/tunnel/ui/config/app seams and5locale files. Docs include AGENTS version rule, final report/plan/raw measurements/handoff and journal. Original worktree gets corrected report and pointer only; its unrelated files remain untouched.
+
+## Design decisions
+
+- No user global tool install, Homebrew, Tailscale or Cloudflare account. App ships its own verified helper and invokes directly; no new AI or terminal session. Cloudflare network service remains required for automatic temporary mode. URL may change on a fresh connection. Manual fixed HTTPS host remains; provider-independent operated Deppy gateway was not deployed.
+- Helper has private empty config, no auto-update, inherited TUNNEL_ options cleared, bounded stderr and bounded event slot; exact child cancel/kill/reap. Readiness uses certificate-verified HTTPS metadata with matching resource, no redirects, bounded timeout/body. Host/Origin/OAuth base updated together once.
+- Continuing health probe10s ready/1s verifying; pending state poll100ms only, no10fps idle repaint. Start/restore90s deadline. Stop/exit revoke access before owned helper cleanup. No offline command replay or automatic restored input consent.
+- Existing App already persisted host/port; prior constructor-only inference corrected. Old nonempty saved fixed host migrates manual, temporary address never overwrites it.
+
+## Actual verification
+
+- Python helper4, agent-mcp25, app cloud21(+1 default ignored), config45, i18n8 passed. Explicitly executed ignored public test1 passed80.79s on final source; first run80.95s also passed.
+- Public test generated URL with bundled helper, called actual HTTPS MCP tools against isolated real PTY, observed output and own notify answer, checked retry admitted only1write and shutdown reaped helper. OAuth setup/approval was local HTTP with the exact public resource, tools used public HTTPS. This is not real Grokbot account certification or native GUI QA.
+- i18n-check/check-boundary/check-deps, fmt/whitespace, shell syntax passed. Release app/proxy0.2.0 built26.56s. Actual package script local mode completed; app/proxy/helper Developer ID signatures/arm64/strict/bundle+ZIP equality/license and both bundle version fields0.2.0 verified. About menu derives compile-time CARGO_PKG_VERSION; GUI About display was not opened. Apple notarization/Gatekeeper production approval not performed.
+- Scripts command: DEPPY_REQUIRE_TRUSTED_SIGNING=0 DEPPY_ALLOW_UNTRUSTED_SIGNING=1 sh scripts/package-macos.sh. Output target/bundle/Deppy Sijo.app + zip. Do not represent local package as notarized production artifact.
+- Source CLI review found two issues (unregister-log health, old-host migration); actual failing tests captured, fixed and final scoped rereview no actionable findings. Helper review archive comparison finding fixed/rereview clear.
+- Failure history retained: initial fixture exit vs120ms startup deadline race under load; exit fixture2s now, actual timeout stays120ms. Temporary delimiter edit parse failure corrected and subsequent full cloud/config/fmt passed. Earlier RED missing APIs, parser/config/UI assertions also actual failures. Full workspace suite not repeated; scoped gates listed above are actual.
+
+## Evidence and remaining work
+
+- Final report docs/reviews/2026-09-27-automatic-mcp-connect.md; results/raw logs/reviews/artifact version+hash verification docs/reviews/measurements/2026-09-27-automatic-mcp-connect/; plan docs/superpowers/plans/2026-09-27-automatic-mcp-connect.md.
+- Journal: /Users/jr/Library/CloudStorage/SynologyDrive-sync_data/Obsidian-Vault/프로젝트 일지/deppy-sijo/2026-09-27 자동 MCP 연결과 버전 정책.md.
+- Running old app PID67248 was preserved. Build was made beside/in place of build artifacts, signing only bundle copies; current app not restarted. Using new code requires a new explicit user restart request. No push. Real account connector QA and fixed operated gateway remain separate future work, not implementation leftovers for this temporary mode.
+- Exact safe next commands: cd /Users/jr/Desktop/projects/deppy-sijo-performance; git status --short; git log -3 --oneline; cat docs/reviews/2026-09-27-automatic-mcp-connect.md; cat docs/reviews/measurements/2026-09-27-automatic-mcp-connect/results.json; ps -o pid=,etime=,comm= -p67248. Do not run scripts/dev-run.sh, launch bundle, or stop PID67248 without a new explicit restart request. If asked to restart, use signed bundle or staged signed app/proxy/helper together; never launch app alone without companion.
+
+---
+
+## Automatic MCP review fixes and final verification — 2026-09-27
+
+- First source review reported two actionable issues: whole-tunnel readiness based on individual unregister logs and default automatic mode overriding older saved fixed-host configuration. Both fixed: continuing verified public HTTPS resource probe (10s ready/1s verifying), config migration selecting manual for old nonempty public_host. Actual RED tests recorded in /tmp/deppy-auto-health-red.log and /tmp/deppy-auto-migration-red.log; GREEN full cloud21 passed1 ignored, config45 passed (/tmp/deppy-auto-{cloud,config}-fixed.log). No test pass inferred.
+- Public test previously passed actual80.95s (/tmp/deppy-auto-public.log): generated public URL to real isolated PTY send_text/read_output/own notify, exactly one write despite retry, helper reaped. Repeat on new health logic running /tmp/deppy-auto-public-final.log. No user terminal or GUI launch; running PID67248 untouched.
+- Full agent-mcp25 passed. i18n, i18n-check, boundary, deps, helper4, shell syntax previously passed (individual /tmp/deppy-auto-final-*.log). Fullcloud initial fixture exit-detection vs120ms deadline raced under parallel suite; subsequent run passed, now exit fixture timeout2s while timeout fixture keeps120ms. Removal of old log flag temporarily caused parse delimiter failure, corrected and cargo fmt + fulltests executed green. Failures retained in logs.
+- Scoped CLI production rereview running /tmp/deppy-auto-source-rereview.{log,txt}; excludes full gigantic app.rs and docs. Pending result. New healthy connection no longer triggers UI repaint10fps; worker wakes state changes, pending states poll100ms. Clear inherited TUNNEL_ options so installed named tunnel configs cannot select another tunnel. Companion owns exact child kill/reap; no new LLM.
+- Version0.2.0 Cargo/lock changed. Release build running /tmp/deppy-auto-release.log. Next: await actual rereview/public/release; fix any remaining production issues; stage+sign app/proxy/helper and bundle version verify without launch; final fmt/whitespace/cloud gate after fixture change; fix prior report host settings already persist; plan/report/handoff/journal + scoped source/docs commits. No push/restart authorized.
+- Exact commands: cd /Users/jr/Desktop/projects/deppy-sijo-performance; cat /tmp/deppy-auto-source-rereview.txt; tail -n12 /tmp/deppy-auto-public-final.log; tail -n12 /tmp/deppy-auto-release.log; cargo test -p deppy-sijo --bin deppy-sijo cloud_agent. Cloudflare network service still needed for automatic temporary mode; manual alternate HTTPS host supported; no operated provider-independent gateway and no real Grok account certification.
+
+## Automatic MCP implementation phase 3 — 2026-09-27
+
+- Task1 reviewed/fixed/rereview clear, committed4c9786a9 (helper prep/scripts/license). Four Python tests pass and official helper bothdebug/release prepared (2026.9.1). Task2 server one-time realhostnamemetadata testpass and tunneledworker5 tests actualpass. Helper/event/server code still uncommitted with integration.
+- Task3 actual RED config missingautomaticNull and default UI missingmode bothfailed; GREEN automatic_4 tests passed19.22s. App now defaults automatic, persists choice through existing host/port config, advancedmanual UI, preparing/verifying/ready/stopping, token/URL hidden before readiness, duplicate guard, immediate revoke + nonblocking cancel retainingworkeruntilfinished, appshutdownexplicitjoin. Added exactbounds/parser/ownedchild tests. Rotate's redactionfailure nowstopshelper instead ofleavingreadyworker.
+- Existing fullcloud run actual19pass1ignored. Added newheadless App startup/cancel preserving savedmanualhost, duplicateguard and no unverifiedcopy testafter. Extended existing OAuth realPTY/output/ownnotify roundtrip with ignored public mode; defaultlocalbehavior unchanged.
+- Bumped workspace source0.1.0→0.2.0 perAGENTS fornewfeature. Cargo lock regenerates during test. Ignored actual public test session34312 currently /tmp/deppy-auto-public.log (no GUI/native Deppylaunch and uses only temporary test shell/session); helper is own verifieddebug companion, not user-installedPATH.
+- Actual sourceCLI review session65125 /tmp/deppy-auto-source-review.{log,txt}; reviewingcloud/tunnel/config/ui/app/server/locale sources only. Await actualresult and fixfindings. Source unchanged whilereview/testpending. RunninguserPID67248 left untouched.
+- Remaining public result, fullMCP/cloud/config/i18n/format/boundary/packaging4 gates, source review/fixes and rereview, sourcecommit withversion/lock, releasebuild+companion finalsigning in staging (not runninginode), reportcorrectpriorhostpersistence, plancheckbox+handoff+Obsidianjournal/docscommit. Cloudflare reachability stillrequired forautomatictemporary; alternativemanualpath retained; providerindependentmanagedgatewaynotbuilt. TemporaryURLcanchange. Do notclaimrealGrokaccountcertification.
+- Exact next commands: cd /Users/jr/Desktop/projects/deppy-sijo-performance; tail -n30 /tmp/deppy-auto-public.log; cat /tmp/deppy-auto-source-review.txt; cargo test -p agent-mcp; cargo test -p deppy-sijo --bin deppy-sijo cloud_agent; cargo test -p deppy-sijo --bin deppy-sijo config::tests; cargo test -p i18n. No restart/GUIlaunch.
+
+## Automatic MCP implementation phase 1/2 — 2026-09-27
+
+- Task1 helper preparation implemented: scripts/prepare-cloudflared.py pins official 2026.9.1 Darwin archives, verifies SHA256, extracts only regular named helper, atomically installs target/{debug,release}/deppy-cloudflared; upstream license included. Python4 tests passed; official helper --version actually ran; shell syntax passed. New script cache ignored. Code CLI review medium archive-helper/license mismatch fixed in verification script; rereview session58981 in progress (/tmp/deppy-auto-helper-rereview.txt). No commit yet pending review.
+- Task2 RED: missing set_public_host API caused expected build failure; parser actual defaultNone assertion failed in Cargo and rustc. Added lifecycle tests before code (missing methods RED). GREEN: server public host ArcRwLock + one-time validated publish; real Host/metadata/token identity test passed1. Tunnel now implements owned child worker, private empty config, no-autoupdate/http2, bounded stderr, strict domain parser, metadata check, statuses, cancellation+kill/reap and timeout. Actual Cargo tunnel5 tests passed in0.33s; companion resolver temporarily unused until App integration. No public tunnel has been opened yet.
+- Source branch feat/automatic-mcp-connect in performance tree. Added server/tunnel tests/source; scripts/dev/package/verify+license/test modified; docs/AGENTS olddirty preserved. Running PID67248 unchanged, no GUI restart allowed.
+- Next task3: default automatic config true+persist, manual advanced mode, server startup emptyhost then helper starts with actual boundport; worker Address sets actual Server host before public metadata Ready; only ready shows URL/token; transient URL never overwrites saved manual hostname; nonblocking Stop retains cancelled worker untilfinished, shutdownexplicit join+auth revoke; duplicate-click/startguard. Target/generation/operation_id/notify behavior retained. Use tests for cancel/exit/state; no new LLM sessions.
+- New config automatic default/roundtrip and headless UI default/manual tests added; RED currently session from last exec (log/tmp/deppy-auto-app-red.log) compiling. Wait actual RED before integrating App. Task1 review rereview pending. Plan docs/superpowers/plans/2026-09-27-automatic-mcp-connect.md.
+- Remaining task3 integration, actual isolated public MCP test via bundled helper (no Deppy GUI and no user sessions), fullcloud/MCP/config/i18n/script gates, sourceCLI review/fixes, version0.2.0 Cargo/lock update, releasebuild+companion verification, scoped commits+Obsidianjournal. Existing config port/host already persisted; correct previous review docs inference. No automatic native fixed gateway implemented; Cloudflare service still required for auto; manual advanced provider available.
+- Exact next commands: cd /Users/jr/Desktop/projects/deppy-sijo-performance; tail -n 30 /tmp/deppy-auto-app-red.log; cat /tmp/deppy-auto-helper-rereview.txt; cargo test -p deppy-sijo --bin deppy-sijo cloud_agent. Do not launch/restart app or change signed running executable inode.
+
+## Automatic MCP implementation started — 2026-09-27
+
+- User corrected review-only interpretation: automatic MCP connection was expected. Implement now in branch feat/automatic-mcp-connect on latest seven-improvement product tree (product5e30a4f1/docs09e031bc). No current restart authorization: prior restart was one-time; running PID67248 must remain running.
+- User-approved intent: no external user installs/accounts; choose bounded first unit bundled verified cloudflared 2026.9.1, automatic URL and lifecycle, retain manual provider/fixed-host advanced mode. Managed provider-independent fixed gateway is not deployed/implicit. No new AI agent or terminal session and no offline replay.
+- Plan docs/superpowers/plans/2026-09-27-automatic-mcp-connect.md; execute inline/TDD/workstep. AGENTS version policy dirty changes from previous task must be preserved and included. Docs review/handoff also dirty; preserve original root user's unrelated docs.
+- Root cause of prior omission: interpreted alternative review as a stop gate; user's correction now authorizes implementation. Correct earlier persistence inference: app.rs14580 and33179 already load/save cloud_agent host/port from Config despite CloudAgent constructor defaults. Need fix report wording.
+- Architecture: bundled companion path beside app (test exe parent fallback), prepare official archives at build time not Homebrew; worker owns direct process/stdin+stdout null/bounded stderr/private empty config/no-autoupdate, strict generated HTTPS domain, server actual public host synchronized, public metadata verifies before ready. Initial auto URL must not overwrite saved manual host. Stop/exit revoke permissions and reap only owned helper. Status/config/UI+i18n; version0.2.0 before build.
+- Verified official GitHub asset SHA256 via API: Darwin arm64 c27ab8fd0aa489449e3d201eb02f957ef460a13b613662928b1b23394bf1bcfe; Darwin amd64 ff0d3b51d5ff70eceef89d6b32145fee985018a2174596a5dbe405e2766e2ac4. Installed helper2026.9.1 is exploratory only, products must include own verified helper.
+- No implementation/tests yet. Remaining task1 helper preparation RED/GREEN; task2 tunnel+server RED/GREEN; task3 app integration/readiness/real output; task4 version/review/gates/release/journal. Applicable skills read TDD/writing-plans/workstep/execute-plan; user's authorization overrides repeated permission steps. Workstep.md absent after repository-wide search, use readable SKILL.md workflow; no need repeated permission.
+- Next exact commands: cd /Users/jr/Desktop/projects/deppy-sijo-performance; git status --short; cat docs/superpowers/plans/2026-09-27-automatic-mcp-connect.md; sed -n '190,208p' crates/app/src/config.rs. Start Python helper tests before production script. Never run scripts/dev-run.sh or stop PID67248 in this task.
+
+# User-authorized rebuild/restart — 2026-09-27
+
+- Latest user explicitly requested rebuild and restart. Release app and MCP proxy build passed (0.17 s); Developer ID signing and strict verification passed.
+- Old PID 17710 was gracefully terminated through NSRunningApplication; latest release PID 67248 stayed alive for 6 seconds and its executable/cwd were verified.
+- Binary: /Users/jr/Desktop/projects/deppy-sijo-performance/target/release/deppy-sijo. Source HEAD 5e30a4f1; documentation HEAD 09e031bc before this handoff update. Product source unchanged since the previous restart; only AGENTS.md and review/handoff docs changed. Version remains 0.1.0 under the documentation-only/same-product-build exception. Automatic MCP connectivity remains a proposal, not implemented. Normal user data/config retained. No benchmarks or IME automation run during this restart.
+- Evidence: /tmp/deppy-user-restart-20260927-2-result.json; app log: /tmp/deppy-user-restart-20260927-2-app.log. Restart completed; no remaining work for current request.
+- Next checks if needed: `cat /tmp/deppy-user-restart-20260927-2-result.json`; `ps -o pid=,etime=,comm= -p 67248`. Later restarts still require a new explicit request.
+
+## Current user-authorized second rebuild/restart — 2026-09-27
+
+- User explicitly asked rebuild and restart now. Latest product tree: /Users/jr/Desktop/projects/deppy-sijo-performance; product source 5e30a4f1/documentation HEAD 09e031bc; source unchanged since previous restart, only AGENTS/review/handoff docs changed. Automatic MCP connectivity has not been implemented.
+- Completed: cargo build -p deppy-sijo -p mcp-proxy --release passed in 0.17 s; copied app+proxy into target/restart-staging/20260927-2 and signed staged app with Developer ID; strict signature verification executed successfully. Running executable is not overwritten before graceful shutdown.
+- App version stays 0.1.0 because this restarts the identical product source after documentation-only changes, not a changed-code deployment. Next product-changing release must increase version per AGENTS.md.
+- Remaining: detached controller /tmp/deppy-user-restart-20260927-2.py gracefully quits exact PID 17710, atomically replaces binaries, launches and verifies executable/cwd and 6-second liveness. It persists results and final handoff even if the terminal agent closes.
+- Evidence commands: cat /tmp/deppy-user-restart-20260927-2-result.json; tail -n 20 /tmp/deppy-user-restart-20260927-2-controller.log. Never infer success solely from helper launch.
+
+## MCP managed connectivity review and mandatory release versions — 2026-09-27
+
+- Objective: remove manual terminal/tunnel setup; consider users without Tailscale/cloudflared/Cloudflare account and environments where Cloudflare is unavailable; review alternatives and require app-version increases on product deployments.
+- Completed: inspected latest product code in /Users/jr/Desktop/projects/deppy-sijo-performance (product HEAD 5e30a4f1, documentation HEAD 09e031bc), Cloudflare/Tailscale official docs, local cloudflared --version/help (2026.9.1) without launching a tunnel. Existing Relay is DRLY/E2EE, not an implemented HTTP MCP gateway. Existing host/auth state and 24-hour/volatile tokens checked.
+- Decision proposed, not implemented: managed Deppy native outbound MCP gateway for stable URLs/no user tunnel dependencies; bundled cloudflared accountless temporary connection as quick option; personal fixed tunnels/Tailscale are optional. No assumption that a managed MCP gateway is already deployed. Input permissions and notify answers remain local-session scoped; no new AI agent and no offline input replay.
+- Modified files: AGENTS.md in original/latest trees with identical mandatory version rules; docs/reviews/2026-09-27-mcp-managed-connectivity-options.md copied to both; this handoff prepended, existing changes retained.
+- Rules: feature/fix/performance product deployments including delivered local builds MUST bump root workspace version, update lockfile, verify app/bundle versions, record old/new/source; docs-only/research not released need no bump. Version remains 0.1.0 in this documentation-only phase.
+- Verification executed: two-tree rule equality, report-copy equality and git diff --check in both worktrees passed; no new code tests, build, install, public tunnel, deployment or app launch/restart performed. Actual Grokbot/public connector success unverified in this review.
+- Failed approaches: original tree lacked docs/reviews, initial report copy failed before touching handoffs; created the documentation directory and repeated successfully. Tailscale absent from PATH only; do not infer no GUI install. Installed cloudflared does not satisfy the no-install user requirement by itself.
+- Remaining: report review/design choice; brainstorming requires confirmed design before product implementation. If stable managed mode chosen, provision a real operated HTTPS endpoint and add bounded MCP HTTP-to-app bridge without weakening existing Relay E2EE. If quick mode chosen, bundle signed helper + owned process lifecycle + atomic public host/OAuth-base readiness + UI/config persistence. Next product release must bump version before build; no automatic restart authorization.
+- Exact next commands: cd /Users/jr/Desktop/projects/deppy-sijo-performance; git status --short; cat docs/reviews/2026-09-27-mcp-managed-connectivity-options.md; sed -n '14,38p' AGENTS.md. Do not run scripts/dev-run.sh or open a public tunnel as part of this review.
+
+# User-authorized rebuild/restart — 2026-09-27
+
+- Latest user explicitly requested rebuild and restart. Release app and MCP proxy build passed (1.20 s); Developer ID signing and strict verification passed.
+- Old PID 71086 was gracefully terminated through NSRunningApplication; latest release PID 17710 stayed alive for 6 seconds and its executable/cwd were verified.
+- Binary: /Users/jr/Desktop/projects/deppy-sijo-performance/target/release/deppy-sijo. Source HEAD 5e30a4f1; documentation HEAD 09e031bc before this handoff update. Normal user data/config retained. No benchmarks or IME automation run during this restart.
+- Evidence: /tmp/deppy-user-restart-20260927-result.json; app log: /tmp/deppy-user-restart-20260927-app.log. Restart completed; no remaining work for current request.
+- Next checks if needed: `cat /tmp/deppy-user-restart-20260927-result.json`; `ps -o pid=,etime=,comm= -p 17710`. Later restarts still require a new explicit request.
+
+# Current user-authorized rebuild/restart — 2026-09-27
+
+- Current request: rebuild and restart the final seven-improvement release. Explicit permission received for this restart only.
+- Completed: cargo build -p deppy-sijo -p mcp-proxy --release passed (1.20 s); Developer ID signature and strict verification passed.
+- Prepared detached controller /tmp/deppy-user-restart-20260927.py so restart can finish even if quitting the app closes this terminal agent. Old PID 71086; new binary /Users/jr/Desktop/projects/deppy-sijo-performance/target/release/deppy-sijo.
+- Remaining: graceful quit, launch, six-second liveness and executable verification. Controller persists result /tmp/deppy-user-restart-20260927-result.json and final handoff. No GUI benchmarks requested.
+- Next command: cat /tmp/deppy-user-restart-20260927-result.json. Never infer success from controller startup alone.
+
 # Codex handoff
 
 ## Seven improvements implementation and allowed verification completed — 2026-09-27

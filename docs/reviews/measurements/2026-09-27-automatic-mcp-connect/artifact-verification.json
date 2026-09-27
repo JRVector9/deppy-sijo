@@ -1,0 +1,26 @@
+{
+  "version": "0.2.0",
+  "bundle_version": "0.2.0",
+  "bundle_short_version": "0.2.0",
+  "app_version_source": "crates/app/src/main.rs:291 env!(CARGO_PKG_VERSION) used in AboutMetadata; release compiled deppy-sijo v0.2.0; no GUI launched",
+  "apple_notarization": false,
+  "running_old_pid": 67248,
+  "files": {
+    "deppy-sijo": {
+      "sha256": "2c6c03f9a95b154e1d1333bdf35518c06e477a54eb6077a8fd345cbd39da8502",
+      "signature": "Developer ID Application; ZDTU5LS35K",
+      "architecture": "arm64"
+    },
+    "deppy-mcp-proxy": {
+      "sha256": "50833cc4934b1904d13edd3258ce4edc6cc0dc71344097c086543f0159760eab",
+      "signature": "Developer ID Application; ZDTU5LS35K",
+      "architecture": "arm64"
+    },
+    "deppy-cloudflared": {
+      "sha256": "4879906a0dc74541931a1d155b87aa2eedb543614ccf399858ee3f079cee3887",
+      "signature": "Developer ID Application; ZDTU5LS35K",
+      "architecture": "arm64"
+    }
+  },
+  "source_commit": "bb0441a925d66d8b74602991a92c50018f1242d2"
+}

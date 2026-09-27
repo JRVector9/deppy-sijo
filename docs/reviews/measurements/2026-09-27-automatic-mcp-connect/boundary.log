@@ -1,0 +1,3 @@
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running `target/debug/xtask check-boundary`
+check-boundary OK — UI leaf boundary guard passed; zero allowlist capability

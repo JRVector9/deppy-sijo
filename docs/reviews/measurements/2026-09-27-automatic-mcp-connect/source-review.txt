@@ -1,0 +1,8 @@
+| Priority | Location | Finding | Impact | Next step |
+|---|---|---|---|---|
+| High | [tunnel.rs](/Users/jr/Desktop/projects/deppy-sijo-performance/crates/app/src/cloud_agent/tunnel.rs:200) | Any one “Unregistered tunnel connection” sets the entire tunnel to disconnected. | A healthy tunnel can lose its Ready state and be killed after 90 seconds. | Track connections individually or determine readiness with a continuing public probe. |
+| Medium | [config.rs](/Users/jr/Desktop/projects/deppy-sijo-performance/crates/app/src/config.rs:200) | Existing configs with a saved `public_host` but no `automatic` field load in automatic mode. | An upgrade silently changes a previously configured fixed-host connection to a temporary address. | Migrate older configs with a nonempty `public_host` to manual mode. |
+
+Cloudflare documents that one `cloudflared` tunnel maintains [four connections and remains available when one fails](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/configure-tunnels/tunnel-availability/). Here, clearing the single flag prevents further probes until another registration log appears; the timeout then ends the worker.
+
+No tests were run; this was a read-only review.

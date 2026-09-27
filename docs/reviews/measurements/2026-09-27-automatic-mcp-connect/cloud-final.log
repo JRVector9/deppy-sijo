@@ -1,0 +1,28 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.16s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-82f53068b66d3c97)
+
+running 22 tests
+test cloud_agent::http_end_to_end_tests::automatic_public_tunnel_to_real_pty_and_own_answer_roundtrip ... ignored, requires public Cloudflare access and the bundled companion
+test cloud_agent::tunnel::tests::local_resource_metadata_is_verified_exactly ... ok
+test cloud_agent::routing_tests::reused_worker_session_numbers_do_not_alias_another_workspace_or_incarnation ... ok
+test cloud_agent::tunnel::tests::accepts_only_generated_https_host_without_paths_or_credentials ... ok
+test cloud_agent::tunnel::tests::oversized_lines_are_drained_and_next_address_is_observed ... ok
+test cloud_agent::grapheme_snapshot_tests::cloud_screen_text_preserves_non_composable_graphemes ... ok
+test cloud_agent::tests::input_permission_requires_exact_incarnation_and_live_session ... ok
+test cloud_agent::integration_tests::list_and_cursor_reads_are_scoped_and_refresh_hidden_screens ... ok
+test cloud_agent::integration_tests::input_waits_for_correlated_pty_result_and_read_only_oauth_cannot_type ... ok
+test cloud_agent::integration_tests::input_and_groks_own_answer_are_independent_deduplicated_effects ... ok
+test cloud_agent::integration_tests::revoked_or_expired_requests_cannot_type_or_store_answers ... ok
+test cloud_agent::ui::tests::automatic_connection_is_default_and_manual_host_is_advanced ... ok
+test cloud_agent::ui::tests::session_checkboxes_and_take_control_change_real_consent ... ok
+test cloud_agent::tunnel::tests::cancellation_reaps_only_owned_child_before_startup_finishes ... ok
+test cloud_agent::ui::tests::answer_navigation_scrolls_once_and_allows_collapsing_and_reopening ... ok
+test cloud_agent::integration_tests::claim_expiry_records_no_effect_for_exact_retries ... ok
+test cloud_agent::http_end_to_end_tests::http_client_reads_types_interrupts_and_delivers_its_own_answer_to_original_session ... ok
+test cloud_agent::http_end_to_end_tests::automatic_start_cancel_keeps_manual_host_and_never_copies_unverified_url ... ok
+test cloud_agent::tunnel::tests::unexpected_exit_is_a_failure_and_timeout_reaps_child ... ok
+test cloud_agent::guarded_input_tests::queued_cloud_input_is_cancelled_before_pty_admission ... ok
+test cloud_agent::http_end_to_end_tests::oauth_http_to_real_pty_output_and_own_answer_roundtrip ... ok
+test cloud_agent::tunnel::tests::healthy_public_probe_survives_connection_unregister_logs ... ok
+
+test result: ok. 21 passed; 0 failed; 1 ignored; 0 measured; 2359 filtered out; finished in 1.27s

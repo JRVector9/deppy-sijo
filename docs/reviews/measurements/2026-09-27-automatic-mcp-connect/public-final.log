@@ -1,0 +1,9 @@
+   Compiling deppy-sijo v0.2.0 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.31s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-82f53068b66d3c97)
+
+running 1 test
+test cloud_agent::http_end_to_end_tests::automatic_public_tunnel_to_real_pty_and_own_answer_roundtrip has been running for over 60 seconds
+test cloud_agent::http_end_to_end_tests::automatic_public_tunnel_to_real_pty_and_own_answer_roundtrip ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2380 filtered out; finished in 80.79s

@@ -1,0 +1,51 @@
+   Compiling deppy-core v0.2.0 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/core)
+   Compiling secret v0.2.0 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/secret)
+   Compiling pty v0.2.0 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/pty)
+   Compiling terminal v0.2.0 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/terminal)
+   Compiling mcp-store v0.2.0 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/mcp-store)
+   Compiling storage-core v0.2.0 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/storage-core)
+   Compiling mux v0.2.0 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/mux)
+   Compiling persist v0.2.0 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/persist)
+   Compiling audit v0.2.0 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/audit)
+   Compiling session v0.2.0 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/session)
+   Compiling storage v0.2.0 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/storage)
+   Compiling runtime v0.2.0 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/runtime)
+   Compiling web-remote v0.2.0 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/web-remote)
+   Compiling agent-mcp v0.2.0 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/agent-mcp)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.88s
+     Running unittests src/lib.rs (target/debug/deps/agent_mcp-d35b5a857a2fe41b)
+
+running 25 tests
+test server::hostname_tests::dedicated_funnel_port_is_allowed_but_urls_and_bad_domains_are_rejected ... ok
+test tests::credentials_expire_and_rotate_without_reusing_authority ... ok
+test oauth::tests::late_authorize_preserves_registration_and_denial_redirect_grace ... ok
+test oauth::tests::refresh_scope_rejects_expansion_and_unknown_without_consuming_grant ... ok
+test oauth::tests::failed_secret_registration_preserves_code_refresh_and_existing_access ... ok
+test oauth::tests::refresh_scope_order_and_subset_preserve_original_refresh_grant ... ok
+test oauth::tests::oauth_requires_owner_consent_pkce_binding_single_use_refresh_and_expiry ... ok
+test tests::plain_text_cannot_execute_without_submit ... ok
+test tests::claimed_operations_survive_restart_and_cannot_be_reexecuted ... ok
+test oauth::tests::redirect_bounds_reject_before_consent_and_allow_encoded_state ... ok
+test tests::history_database_symlinks_are_rejected ... ok
+test oauth::tests::refresh_replaces_its_access_slot_at_full_capacity ... ok
+test tests::persisted_answers_are_durable_and_exact_retries_return_receipt ... ok
+test oauth::tests::approval_near_deadline_denial_and_registration_flood_remain_bounded ... ok
+test tests::answer_retention_uses_completion_order ... ok
+test tests::notifications_and_responses_use_202_without_a_body ... ok
+test tests::credential_revocation_waits_for_queue_admission_and_blocks_later_writes ... ok
+test tests::notified_answers_survive_input_audit_churn_and_expire_with_newer_answers ... ok
+test server::hostname_tests::generated_hostname_updates_real_host_checks_and_oauth_resource_once ... ok
+test tests::oauth_http_discovery_and_challenge_are_available_without_a_token ... ok
+test tests::legacy_answer_database_migrates_and_prunes_on_open ... ok
+test tests::fragmented_http_request_waits_for_remaining_bytes ... ok
+test server::deadline_tests::dripping_bytes_do_not_extend_total_read_deadline ... ok
+test tests::queued_oauth_request_is_invalid_after_access_refresh ... ok
+test tests::actual_http_auth_origin_initialize_and_answer_tool_discovery ... ok
+
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+   Doc-tests agent_mcp
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

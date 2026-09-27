@@ -1,0 +1,52 @@
+    Blocking waiting for file lock on build directory
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 13.98s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-82f53068b66d3c97)
+
+running 45 tests
+test config::tests::max_cross_workspace_panes_범위밖_값은_1에서_6으로_정규화된다 ... ok
+test config::tests::max_cross_workspace_panes_신규_기본값은_6이다 ... ok
+test config::tests::fleet_batch_spawn_max_범위밖_값은_정규화에서_1에서_16으로_클램프 ... ok
+test config::tests::agents_미지_프로바이더와_빈_base_url은_정규화된다 ... ok
+test config::tests::output_batch_1ms도_16ms로_정규화 ... ok
+test config::tests::config_reader_rejects_symlink_and_special_file_without_opening_it ... ok
+test config::tests::max_cross_workspace_panes_명시적_2_설정은_유지된다 ... ok
+test config::tests::a_config_without_a_relay_section_loads_with_relay_disabled ... ok
+test config::tests::production_config_load_has_no_unbounded_whole_file_read ... ok
+test config::tests::ram_페이지_조회는_오류와_오버플로를_실패로_보존한다 ... ok
+test config::tests::remote_config_기본값_비활성_포트0 ... ok
+test config::tests::remote_누락시_기본값으로_채운다 ... ok
+test config::tests::prompt_library_enabled_기본_켜짐이고_off는_라운드트립된다 ... ok
+test config::tests::composer_enabled_기본값은_켜짐이고_명시_off는_라운드트립된다 ... ok
+test config::tests::locale_설정은_저장되고_알수없는_locale은_fallback ... ok
+test config::tests::relay_and_web_are_independent_switches_with_no_transport_enum ... ok
+test config::tests::fleet_batch_spawn_max_기본값은_6이고_변경값은_라운드트립된다 ... ok
+test config::tests::environment_view_config_roundtrip ... ok
+test config::tests::web_config_기본값은_off_고정포트 ... ok
+test config::tests::agents_거부_목록은_비어있는_기본값이고_roundtrip된다 ... ok
+test config::tests::agents_섹션_누락시_기본값이고_roundtrip된다 ... ok
+test config::tests::web_누락시_기본값으로_채운다 ... ok
+test config::tests::config_reader_accepts_exact_and_rejects_plus_one_and_invalid_utf8 ... ok
+test config::tests::web_config_roundtrip ... ok
+test config::tests::cloud_automatic_mode_defaults_on_and_manual_choice_roundtrips ... ok
+test config::tests::remote_config_roundtrip ... ok
+test config::tests::누락_필드는_기본값으로_채운다 ... ok
+test config::tests::권장_live_warm은_ram에서_유도되고_3에서_8로_클램프 ... ok
+test config::tests::warm_상한_기본값과_정규화_클램프 ... ok
+test config::tests::기본값_roundtrip ... ok
+test config::tests::max_cross_workspace_panes_유효값은_toml_라운드트립된다 ... ok
+test config::tests::스크롤백_설정은_100과_999를_보존하고_범위밖만_고정한다 ... ok
+test config::tests::워크스페이스_종료확인은_기본_off이고_roundtrip된다 ... ok
+test config::tests::load_or_create_생성_후_재로드_일치 ... ok
+test config::tests::agents_거부_목록의_미지_id와_중복은_로드_정규화에서_버려진다 ... ok
+test config::tests::캐시_예산_신규기본은_auto이고_기존_수동값은_보존한다 ... ok
+test config::tests::older_fixed_host_config_keeps_manual_mode_on_upgrade ... ok
+test config::tests::파일트리_토글_roundtrip ... ok
+test config::tests::워크스페이스_순서는_넣은_그대로_roundtrip된다 ... ok
+test config::tests::캐시_예산_모드_왕복은_수동값과_실제_예산을_구분한다 ... ok
+test config::tests::마지막_workspace_id_roundtrip ... ok
+test config::tests::행높이_배수는_범위밖이면_클램프되고_없으면_1_0이다 ... ok
+test config::tests::sidebar_session_order_워크스페이스별_순서를_저장하고_다시_읽는다 ... ok
+test config::tests::손으로_고친_범위밖_config는_로드시_정규화 ... ok
+test config::tests::비정상적으로_긴_toml_연산자열은_스택오버플로없이_거부한다 ... ok
+
+test result: ok. 45 passed; 0 failed; 0 ignored; 0 measured; 2336 filtered out; finished in 0.02s

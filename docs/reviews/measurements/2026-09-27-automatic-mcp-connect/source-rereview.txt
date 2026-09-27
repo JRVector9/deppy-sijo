@@ -1,0 +1,3 @@
+No actionable findings in the requested scope. The diff preserves existing nonempty fixed-host configurations in manual mode, and automatic readiness depends on a live HTTPS metadata response. The reviewed paths also retain helper cancellation and reaping, clear `TUNNEL_` variables, validate the generated hostname for Host and OAuth handling, and start no background LLM.
+
+No tests were run, as requested.

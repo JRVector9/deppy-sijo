@@ -1,0 +1,24 @@
+   Compiling deppy-sijo v0.2.0 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.12s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-82f53068b66d3c97)
+
+running 1 test
+test config::tests::older_fixed_host_config_keeps_manual_mode_on_upgrade ... FAILED
+
+failures:
+
+---- config::tests::older_fixed_host_config_keeps_manual_mode_on_upgrade stdout ----
+
+thread 'config::tests::older_fixed_host_config_keeps_manual_mode_on_upgrade' (85860268) panicked at crates/app/src/config.rs:700:9:
+assertion `left == right` failed
+  left: Bool(true)
+ right: false
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    config::tests::older_fixed_host_config_keeps_manual_mode_on_upgrade
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2380 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p deppy-sijo --bin deppy-sijo`

@@ -1,0 +1,199 @@
+{
+  "source_commit": "bb0441a925d66d8b74602991a92c50018f1242d2",
+  "version": "0.2.0",
+  "gates": [
+    {
+      "gate": "cloud",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "deppy-sijo",
+        "--bin",
+        "deppy-sijo",
+        "cloud_agent"
+      ],
+      "exit_code": 0,
+      "log": "cloud-final.log",
+      "passed": 21,
+      "ignored": 1
+    },
+    {
+      "gate": "config",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "deppy-sijo",
+        "--bin",
+        "deppy-sijo",
+        "config::tests"
+      ],
+      "exit_code": 0,
+      "log": "config-final.log",
+      "passed": 45
+    },
+    {
+      "gate": "i18n",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "i18n"
+      ],
+      "exit_code": 0,
+      "log": "i18n.log",
+      "passed": 8
+    },
+    {
+      "gate": "i18n-check",
+      "command": [
+        "cargo",
+        "run",
+        "-p",
+        "xtask",
+        "--",
+        "i18n-check"
+      ],
+      "exit_code": 0,
+      "log": "i18n-check.log"
+    },
+    {
+      "gate": "boundary",
+      "command": [
+        "cargo",
+        "run",
+        "-p",
+        "xtask",
+        "--",
+        "check-boundary"
+      ],
+      "exit_code": 0,
+      "log": "boundary.log"
+    },
+    {
+      "gate": "deps",
+      "command": [
+        "cargo",
+        "run",
+        "-p",
+        "xtask",
+        "--",
+        "check-deps"
+      ],
+      "exit_code": 0,
+      "log": "deps.log"
+    },
+    {
+      "gate": "fmt",
+      "command": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--",
+        "--check"
+      ],
+      "exit_code": 0,
+      "log": "fmt.log"
+    },
+    {
+      "gate": "whitespace",
+      "command": [
+        "git",
+        "diff",
+        "--check"
+      ],
+      "exit_code": 0,
+      "log": "executed git diff --check and git diff --cached --check; exit 0, no output"
+    },
+    {
+      "gate": "helper",
+      "command": [
+        "python3",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "scripts/tests",
+        "-p",
+        "test_prepare_cloudflared.py"
+      ],
+      "exit_code": 0,
+      "log": "helper-tests.log",
+      "passed": 4
+    },
+    {
+      "gate": "shell",
+      "command": [
+        "sh",
+        "-n",
+        "scripts/dev-run.sh",
+        "scripts/package-macos.sh",
+        "scripts/verify-macos-package.sh"
+      ],
+      "exit_code": 0,
+      "log": "shell-syntax.log"
+    },
+    {
+      "gate": "mcp",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "agent-mcp"
+      ],
+      "exit_code": 0,
+      "passed": 25,
+      "log": "mcp-full.log"
+    },
+    {
+      "gate": "public",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "deppy-sijo",
+        "--bin",
+        "deppy-sijo",
+        "automatic_public_tunnel_to_real_pty_and_own_answer_roundtrip",
+        "--",
+        "--ignored"
+      ],
+      "exit_code": 0,
+      "passed": 1,
+      "duration_s": 80.79,
+      "log": "public-final.log"
+    },
+    {
+      "gate": "release",
+      "command": [
+        "cargo",
+        "build",
+        "-p",
+        "deppy-sijo",
+        "-p",
+        "mcp-proxy",
+        "--release"
+      ],
+      "exit_code": 0,
+      "duration_s": 26.56,
+      "log": "release.log"
+    },
+    {
+      "gate": "package",
+      "command": [
+        "env",
+        "DEPPY_REQUIRE_TRUSTED_SIGNING=0",
+        "DEPPY_ALLOW_UNTRUSTED_SIGNING=1",
+        "sh",
+        "scripts/package-macos.sh"
+      ],
+      "exit_code": 0,
+      "log": "package.log",
+      "apple_notarization": false
+    }
+  ],
+  "review_remaining_findings": 0,
+  "native_app_restarted": false,
+  "actual_grokbot_account_verified": false
+}

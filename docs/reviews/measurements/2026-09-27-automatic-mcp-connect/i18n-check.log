@@ -1,0 +1,172 @@
+   Compiling xtask v0.2.0 (/Users/jr/Desktop/projects/deppy-sijo-performance/xtask)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.61s
+     Running `target/debug/xtask i18n-check`
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/i18n-ca71e4a4a7e90f6b)
+
+running 8 tests
+test tests::fallback_locale_normalizes_unknown_locale ... ok
+test tests::unsupported_locale_normalizes_to_fallback ... ok
+test tests::catalog_uses_primary_then_fallback_and_args ... ok
+test tests::non_fallback_catalog_loads_current_and_fallback_only ... ok
+test tests::korean_launcher_keeps_provider_reasoning_terms_in_english ... ok
+test tests::required_locales_have_complete_keys ... ok
+test tests::layout_gate_core_ui_labels_fit_generous_budgets ... ok
+test tests::all_bundled_locales_match_fallback_order_and_placeholders ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+   Doc-tests i18n
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Compiling ring v0.17.14
+   Compiling rustls v0.23.43
+   Compiling rustls-webpki v0.103.13
+   Compiling rcgen v0.14.10
+   Compiling ureq v3.4.0
+   Compiling runtime v0.2.0 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/runtime)
+   Compiling tungstenite v0.30.0
+   Compiling http-client v0.2.0 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/http-client)
+   Compiling auth v0.2.0 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/auth)
+   Compiling web-remote v0.2.0 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/web-remote)
+   Compiling mcp v0.2.0 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/mcp)
+   Compiling connector-service v0.2.0 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/connector-service)
+   Compiling agent-mcp v0.2.0 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/agent-mcp)
+   Compiling deppy-sijo v0.2.0 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 18.35s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-82f53068b66d3c97)
+
+running 1 test
+test config::tests::locale_설정은_저장되고_알수없는_locale은_fallback ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2378 filtered out; finished in 0.00s
+
+     Running tests/agent_state_boundary.rs (target/debug/deps/agent_state_boundary-565c3fa6d3fbe5ed)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/alloc_phys_footprint_release.rs (target/debug/deps/alloc_phys_footprint_release-8b0ed6cdbc4c22e1)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/dotenv_launch_boundary.rs (target/debug/deps/dotenv_launch_boundary-6949e57665f4e73d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/lazy_bounded_worker.rs (target/debug/deps/lazy_bounded_worker-c28d0abb21c7d21f)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s
+
+     Running tests/logging_policy.rs (target/debug/deps/logging_policy-7e8ae265a23cf78d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s
+
+     Running tests/scrollback_rss_end_to_end.rs (target/debug/deps/scrollback_rss_end_to_end-e7111643bca59577)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.17s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-82f53068b66d3c97)
+
+running 1 test
+test ui::workspace::tests::path_insert_paste_bytes_required_fixtures는_bracketed와_no_enter를_지킨다 ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2378 filtered out; finished in 0.00s
+
+     Running tests/agent_state_boundary.rs (target/debug/deps/agent_state_boundary-565c3fa6d3fbe5ed)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/alloc_phys_footprint_release.rs (target/debug/deps/alloc_phys_footprint_release-8b0ed6cdbc4c22e1)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/dotenv_launch_boundary.rs (target/debug/deps/dotenv_launch_boundary-6949e57665f4e73d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/lazy_bounded_worker.rs (target/debug/deps/lazy_bounded_worker-c28d0abb21c7d21f)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s
+
+     Running tests/logging_policy.rs (target/debug/deps/logging_policy-7e8ae265a23cf78d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s
+
+     Running tests/scrollback_rss_end_to_end.rs (target/debug/deps/scrollback_rss_end_to_end-e7111643bca59577)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.16s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-82f53068b66d3c97)
+
+running 1 test
+test ui::notifications::tests::status_알림은_message_id를_저장한다 ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2378 filtered out; finished in 0.00s
+
+     Running tests/agent_state_boundary.rs (target/debug/deps/agent_state_boundary-565c3fa6d3fbe5ed)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/alloc_phys_footprint_release.rs (target/debug/deps/alloc_phys_footprint_release-8b0ed6cdbc4c22e1)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/dotenv_launch_boundary.rs (target/debug/deps/dotenv_launch_boundary-6949e57665f4e73d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/lazy_bounded_worker.rs (target/debug/deps/lazy_bounded_worker-c28d0abb21c7d21f)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s
+
+     Running tests/logging_policy.rs (target/debug/deps/logging_policy-7e8ae265a23cf78d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s
+
+     Running tests/scrollback_rss_end_to_end.rs (target/debug/deps/scrollback_rss_end_to_end-e7111643bca59577)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+i18n key coverage OK — 리터럴 키 호출 1257건을 로케일 5개와 대조; 정적으로 못 잡는 동적 키 호출 84건(docs/superpowers/specs/2026-08-19-i18n-key-guard.md 참고)
+i18n-check OK

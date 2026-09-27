@@ -1,0 +1,42 @@
+    Finished `release` profile [optimized] target(s) in 0.16s
+Prepared verified cloudflared 2026.9.1: target/release/deppy-cloudflared
+target/bundle/Deppy Sijo.app/Contents/MacOS/deppy-cloudflared: replacing existing signature
+target/bundle/Deppy Sijo.app/Contents/MacOS/deppy-mcp-proxy: replacing existing signature
+target/bundle/Deppy Sijo.app/Contents/MacOS/deppy-sijo: replacing existing signature
+target/bundle/Deppy Sijo.app: replacing existing signature
+서명: Developer ID Application: VectorNine INC (ZDTU5LS35K) (고정 identity — TCC/키체인 권한 재빌드 후 유지)
+--prepared:/Users/jr/Desktop/projects/deppy-sijo-performance/target/bundle/Deppy Sijo.app/Contents/MacOS/deppy-mcp-proxy
+--validated:/Users/jr/Desktop/projects/deppy-sijo-performance/target/bundle/Deppy Sijo.app/Contents/MacOS/deppy-mcp-proxy
+--prepared:/Users/jr/Desktop/projects/deppy-sijo-performance/target/bundle/Deppy Sijo.app/Contents/MacOS/deppy-cloudflared
+--validated:/Users/jr/Desktop/projects/deppy-sijo-performance/target/bundle/Deppy Sijo.app/Contents/MacOS/deppy-cloudflared
+target/bundle/Deppy Sijo.app/Contents/MacOS/deppy-sijo: valid on disk
+target/bundle/Deppy Sijo.app/Contents/MacOS/deppy-sijo: satisfies its Designated Requirement
+target/bundle/Deppy Sijo.app/Contents/MacOS/deppy-mcp-proxy: valid on disk
+target/bundle/Deppy Sijo.app/Contents/MacOS/deppy-mcp-proxy: satisfies its Designated Requirement
+target/bundle/Deppy Sijo.app/Contents/MacOS/deppy-cloudflared: valid on disk
+target/bundle/Deppy Sijo.app/Contents/MacOS/deppy-cloudflared: satisfies its Designated Requirement
+--prepared:/Users/jr/Desktop/projects/deppy-sijo-performance/target/bundle/Deppy Sijo.app/Contents/MacOS/deppy-mcp-proxy
+--validated:/Users/jr/Desktop/projects/deppy-sijo-performance/target/bundle/Deppy Sijo.app/Contents/MacOS/deppy-mcp-proxy
+--prepared:/Users/jr/Desktop/projects/deppy-sijo-performance/target/bundle/Deppy Sijo.app/Contents/MacOS/deppy-cloudflared
+--validated:/Users/jr/Desktop/projects/deppy-sijo-performance/target/bundle/Deppy Sijo.app/Contents/MacOS/deppy-cloudflared
+target/bundle/Deppy Sijo.app: valid on disk
+target/bundle/Deppy Sijo.app: satisfies its Designated Requirement
+--prepared:/private/tmp/deppy-package-verify.gIEeqr/Deppy Sijo.app/Contents/MacOS/deppy-mcp-proxy
+--validated:/private/tmp/deppy-package-verify.gIEeqr/Deppy Sijo.app/Contents/MacOS/deppy-mcp-proxy
+--prepared:/private/tmp/deppy-package-verify.gIEeqr/Deppy Sijo.app/Contents/MacOS/deppy-cloudflared
+--validated:/private/tmp/deppy-package-verify.gIEeqr/Deppy Sijo.app/Contents/MacOS/deppy-cloudflared
+/tmp/deppy-package-verify.gIEeqr/Deppy Sijo.app/Contents/MacOS/deppy-sijo: valid on disk
+/tmp/deppy-package-verify.gIEeqr/Deppy Sijo.app/Contents/MacOS/deppy-sijo: satisfies its Designated Requirement
+/tmp/deppy-package-verify.gIEeqr/Deppy Sijo.app/Contents/MacOS/deppy-mcp-proxy: valid on disk
+/tmp/deppy-package-verify.gIEeqr/Deppy Sijo.app/Contents/MacOS/deppy-mcp-proxy: satisfies its Designated Requirement
+/tmp/deppy-package-verify.gIEeqr/Deppy Sijo.app/Contents/MacOS/deppy-cloudflared: valid on disk
+/tmp/deppy-package-verify.gIEeqr/Deppy Sijo.app/Contents/MacOS/deppy-cloudflared: satisfies its Designated Requirement
+--prepared:/private/tmp/deppy-package-verify.gIEeqr/Deppy Sijo.app/Contents/MacOS/deppy-mcp-proxy
+--validated:/private/tmp/deppy-package-verify.gIEeqr/Deppy Sijo.app/Contents/MacOS/deppy-mcp-proxy
+--prepared:/private/tmp/deppy-package-verify.gIEeqr/Deppy Sijo.app/Contents/MacOS/deppy-cloudflared
+--validated:/private/tmp/deppy-package-verify.gIEeqr/Deppy Sijo.app/Contents/MacOS/deppy-cloudflared
+/tmp/deppy-package-verify.gIEeqr/Deppy Sijo.app: valid on disk
+/tmp/deppy-package-verify.gIEeqr/Deppy Sijo.app: satisfies its Designated Requirement
+package verification OK: explicitly untrusted development bundle
+bundle: target/bundle/Deppy Sijo.app
+archive: target/bundle/Deppy Sijo.zip

@@ -1,0 +1,7 @@
+| Priority | Location | Finding | Impact | Next step |
+|---|---|---|---|---|
+| medium | [verify-macos-package.sh](/Users/jr/Desktop/projects/deppy-sijo-performance/scripts/verify-macos-package.sh:125) | The ZIP-to-bundle hash comparison omits `deppy-cloudflared` and its license. | Verification can pass when the archive contains different companion contents from the built bundle, provided the archive passes its separate signing checks. | Compare the companion binary and license between the bundle and extracted ZIP. |
+
+The installer’s pinned SHA-256 values match the [GitHub release asset metadata](https://github.com/cloudflare/cloudflared/releases?after=2022.7.25). The cached arm64 archive also matched its pin. Extraction selects a regular `cloudflared` member without extracting other paths, and the output replacement uses a temporary file in the destination directory.
+
+Shell syntax and `git diff --check` passed. The Python suite ran, but three tests could not create temporary directories under this read-only sandbox; their behavior remains unverified here. No files were edited.

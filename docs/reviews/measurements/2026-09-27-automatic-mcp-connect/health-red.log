@@ -1,0 +1,21 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.15s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-82f53068b66d3c97)
+
+running 1 test
+test cloud_agent::tunnel::tests::healthy_public_probe_survives_connection_unregister_logs ... FAILED
+
+failures:
+
+---- cloud_agent::tunnel::tests::healthy_public_probe_survives_connection_unregister_logs stdout ----
+
+thread 'cloud_agent::tunnel::tests::healthy_public_probe_survives_connection_unregister_logs' (85863159) panicked at crates/app/src/cloud_agent/tunnel.rs:434:13:
+assertion failed: Instant::now() < deadline
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    cloud_agent::tunnel::tests::healthy_public_probe_survives_connection_unregister_logs
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2380 filtered out; finished in 3.01s
+
+error: test failed, to rerun pass `-p deppy-sijo --bin deppy-sijo`

@@ -467,6 +467,13 @@ fn paint_cell_lines(
     }
 }
 
+/// Character indices are the egui IME contract, not UTF-8 bytes or UTF-16 units.
+#[derive(Clone, Copy, Debug)]
+pub struct PreeditView<'a> {
+    pub text: &'a str,
+    pub active_range_chars: Option<&'a std::ops::Range<usize>>,
+}
+
 /// snapshot을 그린다. preedit은 IME 조합 중 텍스트 — 커서 위치에 표시한다.
 /// `ime_active`는 호출측이 결정한 논리적 터미널 키보드 소유 상태다. 활성 상태면
 /// 같은 프레임에 egui 포커스를 확보한 뒤 공식 IME 소유권을 확인한다.
@@ -482,6 +489,32 @@ pub fn draw(
     selection: Option<(usize, usize)>,
     // 스냅샷 세대 — 호출측이 새 스냅샷을 받을 때마다 +1. 같은 세대를 다시 그리면
     // dirty_ranges는 이미 소비된 것이라 재-shaping하지 않는다 (2026-07-14 idle 낭비 수정).
+    snapshot_gen: u64,
+) -> RenderOutput {
+    draw_with_preedit(
+        ui,
+        snapshot,
+        metrics,
+        cache,
+        preedit.map(|text| PreeditView {
+            text,
+            active_range_chars: None,
+        }),
+        ime_active,
+        selection,
+        snapshot_gen,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn draw_with_preedit(
+    ui: &mut egui::Ui,
+    snapshot: &TerminalViewportSnapshot,
+    metrics: CellMetrics,
+    cache: &mut TerminalRenderCache,
+    preedit: Option<PreeditView<'_>>,
+    ime_active: bool,
+    selection: Option<(usize, usize)>,
     snapshot_gen: u64,
 ) -> RenderOutput {
     let font_id = egui::FontId::monospace(metrics.font_size);
@@ -526,7 +559,7 @@ pub fn draw(
     // `(true)`는 상태를 되돌리지 않아, 아직 조합을 들고 있는 macOS IM의 다음 커밋이
     // `Ime::Commit` 없이 원시 키로 새어 나간다. 이번 프레임 입력도 함께 본다.
     let continues_preedit = ime_active
-        && (preedit.is_some_and(|preedit| !preedit.is_empty())
+        && (preedit.is_some_and(|preedit| !preedit.text.is_empty())
             || frame_has_active_preedit(ui.ctx()));
     if ime_active && !continues_preedit && !ui.memory(|memory| memory.owns_ime_events(response.id))
     {
@@ -699,30 +732,68 @@ pub fn draw(
     // TUI(claude 등)는 리드로우마다 커서를 숨겼다 켜므로(?25l/?25h) 커서 가시성에
     // 묶으면 조합이 자모 단위로 끊긴다 (2026-07-14 사용자: "ㄹㅗ" 분리).
     if maintains_ime_composition {
-        // 조합 중 텍스트를 커서 위치에 표시
-        if let Some(preedit) = preedit.filter(|p| !p.is_empty()) {
-            // 조합 텍스트도 글자이므로 셀 안 세로 중앙 정렬을 따른다.
-            let text_pos = cursor_pos + egui::vec2(0.0, text_dy);
-            let galley_rect = painter.text(
-                text_pos,
-                egui::Align2::LEFT_TOP,
-                preedit,
-                font_id.clone(),
-                egui::Color32::BLACK,
+        let mut ime_cursor = egui::Rect::from_min_size(cursor_pos, cell);
+        if let Some(preedit) = preedit.filter(|preedit| !preedit.text.is_empty()) {
+            let galley =
+                painter.layout_no_wrap(preedit.text.to_owned(), font_id, egui::Color32::BLACK);
+            let chars = preedit.text.chars().count();
+            let active = preedit.active_range_chars.map(|range| {
+                let start = range.start.min(chars);
+                start..range.end.min(chars).max(start)
+            });
+            let caret = galley.pos_from_cursor(egui::text::CCursor::new(
+                active.as_ref().map_or(0, |range| range.end),
+            ));
+            let clip = painter.clip_rect();
+            let mut text_pos = cursor_pos + egui::vec2(0.0, text_dy);
+            // Shift short compositions left at the pane edge. For a longer
+            // composition, scroll its visual window so the internal caret fits.
+            if galley.rect.width() <= clip.width() {
+                text_pos.x = text_pos
+                    .x
+                    .min(clip.right() - galley.rect.width())
+                    .max(clip.left());
+            } else {
+                text_pos.x = text_pos
+                    .x
+                    .min(clip.right() - caret.left() - cell.x.min(clip.width()));
+            }
+            let background = galley.rect.translate(text_pos.to_vec2()).intersect(clip);
+            painter.rect_filled(background, 0.0, egui::Color32::from_rgb(0xd8, 0xd8, 0xd8));
+            if let Some(range) = &active {
+                if !range.is_empty() {
+                    let start = galley.pos_from_cursor(egui::text::CCursor::new(range.start));
+                    let selected = egui::Rect::from_min_max(
+                        egui::pos2(start.left(), start.top()),
+                        egui::pos2(caret.left(), caret.bottom()),
+                    )
+                    .translate(text_pos.to_vec2())
+                    .intersect(clip);
+                    painter.rect_filled(selected, 0.0, egui::Color32::from_rgb(0x9a, 0xbc, 0xe8));
+                    cache.counters.shapes += 1;
+                }
+                let caret_pos = text_pos + caret.min.to_vec2();
+                painter.line_segment(
+                    [caret_pos, caret_pos + egui::vec2(0.0, caret.height())],
+                    egui::Stroke::new(1.0, egui::Color32::BLACK),
+                );
+                cache.counters.shapes += 1;
+            }
+            let caret_x = (text_pos.x + caret.left()).clamp(
+                clip.left(),
+                (clip.right() - cell.x.min(clip.width())).max(clip.left()),
             );
-            painter.rect_filled(galley_rect, 0.0, egui::Color32::from_rgb(0xd8, 0xd8, 0xd8));
-            painter.text(
-                text_pos,
-                egui::Align2::LEFT_TOP,
-                preedit,
-                font_id,
-                egui::Color32::BLACK,
-            );
+            ime_cursor = egui::Rect::from_min_size(
+                egui::pos2(caret_x, cursor_pos.y),
+                egui::vec2(cell.x.min(clip.width()), cell.y),
+            )
+            .intersect(clip);
+            painter.galley(text_pos, galley, egui::Color32::BLACK);
             painter.line_segment(
-                [galley_rect.left_bottom(), galley_rect.right_bottom()],
+                [background.left_bottom(), background.right_bottom()],
                 egui::Stroke::new(1.5, egui::Color32::BLACK),
             );
-            cache.counters.shapes += 4; // text ×2 + rect_filled + line_segment
+            cache.counters.shapes += 3; // One galley, background, composition underline.
         }
         ui.ctx().output_mut(|o| {
             o.ime = Some(egui::output::IMEOutput {
@@ -732,7 +803,7 @@ pub fn draw(
                 // 커서 rect는 축소 전 좌표로 계산했으므로 후보창이 뜰 화면 좌표로 옮긴다 —
                 // shape가 아니라 output이라 transform_range가 닿지 않는다. scale == 1이면
                 // 항등이라 기존 값과 같다.
-                cursor_rect: transform.mul_rect(egui::Rect::from_min_size(cursor_pos, cell)),
+                cursor_rect: transform.mul_rect(ime_cursor),
                 should_interrupt_composition: false,
             });
         });
@@ -1792,6 +1863,26 @@ mod tests {
         assert!((origin.x - rect.left() - 3.0).abs() < f32::EPSILON);
         assert!((rect.right() - content.right() - 3.0).abs() < 0.01);
         assert!(origin.x + cell.x * snapshot.cols as f32 <= content.right());
+    }
+
+    #[test]
+    fn ime_preedit_is_laid_out_once_and_fits_at_right_edge() {
+        let mut snapshot = snap(8, 1, &[""]);
+        snapshot.cursor.col = 7;
+        let ctx = egui::Context::default();
+        let mut cache = TerminalRenderCache::default();
+        let drawn = draw_in_pane(&ctx, &mut cache, &snapshot, 80.0, next_gen(), None, None);
+        let text_shapes = drawn
+            .shapes
+            .iter()
+            .filter(|shape| {
+                matches!(&shape.shape,
+            egui::Shape::Text(text) if text.galley.text() == "한")
+            })
+            .count();
+        assert_eq!(text_shapes, 1, "preedit must issue one text shape");
+        let background = preedit_box(&drawn.shapes);
+        assert!(background.right() <= drawn.rect.right() - HORIZONTAL_PADDING + 0.01);
     }
 
     #[test]

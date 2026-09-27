@@ -1817,6 +1817,64 @@ impl ProtocolRetryBackoff {
     }
 }
 
+#[derive(Clone, Default, Debug)]
+struct TerminalPreeditState {
+    text: String,
+    active_range_chars: Option<std::ops::Range<usize>>,
+    owner: Option<SessionId>,
+}
+
+impl TerminalPreeditState {
+    fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+    fn is_active_for(&self, owner: SessionId) -> bool {
+        self.owner == Some(owner) && !self.is_empty()
+    }
+
+    // Display projection only: it does not consume raw events or send PTY input.
+    // Publish after the existing IME admission/reconciliation path accepts input.
+    fn for_frame(&self, owner: SessionId, events: &[egui::Event]) -> Self {
+        let mut next = if self.owner == Some(owner) {
+            self.clone()
+        } else {
+            Self::default()
+        };
+        for event in events {
+            match event {
+                egui::Event::Ime(egui::ImeEvent::Preedit {
+                    text,
+                    active_range_chars,
+                }) => {
+                    next.text.clone_from(text);
+                    next.active_range_chars = active_range_chars.as_ref().map(|range| {
+                        let count = text.chars().count();
+                        let start = range.start.min(count);
+                        start..range.end.min(count).max(start)
+                    });
+                    next.owner = (!text.is_empty()).then_some(owner);
+                    if text.is_empty() {
+                        next.clear();
+                    }
+                }
+                egui::Event::Ime(egui::ImeEvent::Commit(_)) => next.clear(),
+                _ => {}
+            }
+        }
+        next
+    }
+
+    fn view(&self) -> Option<renderer_egui::PreeditView<'_>> {
+        (!self.is_empty()).then_some(renderer_egui::PreeditView {
+            text: &self.text,
+            active_range_chars: self.active_range_chars.as_ref(),
+        })
+    }
+}
+
 pub struct WorkspaceUi {
     mux: Option<Arc<MuxSnapshot>>,
     pub cloud_answers: Arc<[crate::ui::cloud_answer::Answer]>,
@@ -1826,7 +1884,7 @@ pub struct WorkspaceUi {
     /// workspace 기본 shell kind.
     shell_kind: crate::ui::file_tree::ShellKind,
     /// IME 조합 중 텍스트 (focused pane 전용)
-    preedit: String,
+    preedit: TerminalPreeditState,
     /// 이번 UI 프레임 직전에 AppKit local monitor가 본 ASCII 문장부호/숫자/공백
     /// key-down. IME Commit/Text와 대조한 뒤 누락된 문자만 복구하고 프레임 끝에 버린다.
     native_printable_key_downs: Vec<crate::native_key_monitor::NativePrintableKeyDown>,
@@ -2856,7 +2914,7 @@ impl WorkspaceUi {
             selected_cloud_answer: None,
             sessions: HashMap::new(),
             shell_kind: crate::ui::file_tree::default_shell_kind(),
-            preedit: String::new(),
+            preedit: TerminalPreeditState::default(),
             native_printable_key_downs: Vec::new(),
             native_clipboard_paste_requested: false,
             native_clipboard_copy_requested: false,
@@ -7052,15 +7110,18 @@ impl WorkspaceUi {
                 any_blocking_window_visible,
                 terminal_refocus_pending,
             );
-        let preedit =
-            (terminal_keyboard_active && !self.preedit.is_empty()).then_some(self.preedit.as_str());
+        let preedit_for_frame = terminal_keyboard_active
+            .then(|| ui.input(|input| self.preedit.for_frame(session, &input.raw.events)));
+        let preedit = preedit_for_frame
+            .as_ref()
+            .and_then(TerminalPreeditState::view);
         // 이 세션의 선택 영역 (정규화)
         let selection_range = self
             .selection
             .and_then(|(s, a, b)| (s == session).then_some((a.min(b), a.max(b))));
         let output = {
             let view = self.sessions.entry(session).or_default();
-            renderer_egui::draw(
+            renderer_egui::draw_with_preedit(
                 ui,
                 &snapshot,
                 metrics,
@@ -7461,7 +7522,7 @@ impl WorkspaceUi {
         let terminal_accepts_ime_events = terminal_accepts_ime_events(
             terminal_keyboard_active,
             terminal_owns_ime_events,
-            !self.preedit.is_empty(),
+            self.preedit.is_active_for(session),
             renderer_egui::frame_has_active_preedit(ui.ctx()),
             ui.ctx().text_edit_focused(),
             ui.ctx().any_popup_open(),
@@ -7497,7 +7558,7 @@ impl WorkspaceUi {
             // 전달하거나, 반대로 `Text`를 생략할 수 있다. AppKit/egui에서 관찰한 실제
             // printable key-down 수를 한도 삼아 두 텍스트 경로와 fallback을 한 번에
             // 조정해야 공백·쉼표의 중복과 첫 문장부호 누락을 동시에 막을 수 있다.
-            let preedit_active_before_input = !self.preedit.is_empty();
+            let preedit_active_before_input = self.preedit.is_active_for(session);
             let native_key_downs = std::mem::take(&mut self.native_printable_key_downs);
             let native_clipboard_paste_requested =
                 std::mem::take(&mut self.native_clipboard_paste_requested);
@@ -7508,6 +7569,9 @@ impl WorkspaceUi {
                     preedit_active_before_input,
                 )
             });
+            if let Some(preedit) = preedit_for_frame {
+                self.preedit = preedit;
+            }
             let mut image_paste_trigger = (native_clipboard_paste_requested
                 && !self.paste_suppressed)
                 .then_some(ClipboardPasteTrigger::NativeKeyDown);
@@ -7515,12 +7579,8 @@ impl WorkspaceUi {
             ui.input(|input| {
                 let modifiers = input.modifiers;
                 for (event_index, event) in input.raw.events.iter().enumerate() {
-                    if let egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }) = event {
-                        self.preedit = text.clone();
+                    if matches!(event, egui::Event::Ime(egui::ImeEvent::Preedit { .. })) {
                         continue;
-                    }
-                    if let egui::Event::Ime(egui::ImeEvent::Commit(_)) = event {
-                        self.preedit.clear();
                     }
                     if let Some(text) = ime_reconciliation.event_text[event_index].as_ref() {
                         pending.extend(text.as_bytes());
@@ -19271,6 +19331,106 @@ https://example.test/login \
     }
 
     #[test]
+    fn preedit_projection_preserves_char_ranges_and_clears_owner_on_cancel() {
+        let owner = SessionId(7);
+        let state = TerminalPreeditState::default().for_frame(
+            owner,
+            &[egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: "가🙂나다".into(),
+                active_range_chars: Some(2..3),
+            })],
+        );
+        assert_eq!(state.active_range_chars, Some(2..3));
+        assert_eq!(state.owner, Some(owner));
+        assert!(state.is_active_for(owner));
+        assert!(!state.is_active_for(SessionId(8)));
+        assert!(state.for_frame(SessionId(8), &[]).is_empty());
+        let clamped = state.for_frame(
+            owner,
+            &[egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: "한글".into(),
+                active_range_chars: Some(8..20),
+            })],
+        );
+        assert_eq!(clamped.active_range_chars, Some(2..2));
+        let reversed = state.for_frame(
+            owner,
+            &[egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: "한글".into(),
+                active_range_chars: Some(2..1),
+            })],
+        );
+        assert_eq!(reversed.active_range_chars, Some(2..2));
+        let none = state.for_frame(owner, &[preedit_event("한글")]);
+        assert_eq!(none.active_range_chars, None);
+        for event in [preedit_event(""), commit_event("한글")] {
+            let cancelled = state.for_frame(owner, &[event]);
+            assert!(cancelled.is_empty());
+            assert_eq!(cancelled.owner, None);
+            assert_eq!(cancelled.active_range_chars, None);
+        }
+        // Projection cannot mutate the prior frame used by physical-key reconciliation.
+        assert_eq!(state.text, "가🙂나다");
+    }
+
+    #[test]
+    fn 한글_preedit_후보창은_char_range_내부_커서를_따른다() {
+        let mut harness = setup_focused_local_pane_harness(SessionId(7));
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: "한글가나".into(),
+                active_range_chars: Some(0..0),
+            }));
+        harness.run_steps(1);
+        let start = harness
+            .output()
+            .platform_output
+            .ime
+            .as_ref()
+            .unwrap()
+            .cursor_rect;
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: "한글가나".into(),
+                active_range_chars: Some(2..3),
+            }));
+        harness.run_steps(1);
+        let internal = harness
+            .output()
+            .platform_output
+            .ime
+            .as_ref()
+            .unwrap()
+            .cursor_rect;
+        assert!(
+            internal.left() > start.left() + 1.0,
+            "selected char range must move candidate anchor"
+        );
+        assert!(written_bytes(drain_protocol(harness.state_mut())).is_empty());
+    }
+
+    #[test]
+    fn 한글_preedit는_도착한_같은_pass에_표시된다() {
+        let mut harness = setup_focused_local_pane_harness(SessionId(7));
+        harness.input_mut().events.push(preedit_event("조합중"));
+        harness.run_steps(1);
+        assert!(
+            harness
+                .output()
+                .shapes
+                .iter()
+                .any(|shape| matches!(&shape.shape,
+            egui::Shape::Text(text) if text.galley.text() == "조합중")),
+            "preedit text must be painted in its arrival pass"
+        );
+        assert!(written_bytes(drain_protocol(harness.state_mut())).is_empty());
+    }
+
+    #[test]
     fn 빠른_한글_연타로_한_프레임에_섞인_preedit_commit도_음절대로_pty에_들어간다() {
         let session = SessionId(7);
         let mut harness = setup_focused_local_pane_harness(session);
@@ -19304,7 +19464,7 @@ https://example.test/login \
         harness.input_mut().events.extend([preedit_event("ㄱ")]);
         harness.run();
         assert!(written_bytes(drain_protocol(harness.state_mut())).is_empty());
-        assert_eq!(harness.state().preedit, "ㄱ");
+        assert_eq!(harness.state().preedit.text, "ㄱ");
 
         // 프레임 2: 나머지 조합과 다음 음절까지 이어서 도착 — self.preedit가
         // 프레임을 넘어 올바르게 이어지는지 확인한다.

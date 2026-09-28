@@ -8601,7 +8601,7 @@ mod tests {
                     crate::ui::agent_visuals::status_color(VisualState::Error),
                 ),
                 (
-                    "1 idle".to_owned(),
+                    "1 awaiting instruction".to_owned(),
                     crate::ui::agent_visuals::status_color(VisualState::Idle),
                 ),
             ]
@@ -8612,7 +8612,7 @@ mod tests {
             .collect::<String>();
         assert_eq!(
             text,
-            "1 running · 2 waiting for input · 1 completed · 1 errors · 1 idle"
+            "1 running · 2 waiting for input · 1 completed · 1 errors · 1 awaiting instruction"
         );
     }
 
@@ -8622,7 +8622,7 @@ mod tests {
         let weak = egui::Color32::GRAY;
         let catalog = catalog();
         let idle = workspace_summary_segments(SidebarSessionSummary::default(), weak, &catalog);
-        assert_eq!(idle[0].0, "Idle");
+        assert_eq!(idle[0].0, "Awaiting instruction");
         assert_eq!(
             idle[0].1,
             crate::ui::agent_visuals::status_color(VisualState::Idle)
@@ -8805,7 +8805,7 @@ mod tests {
             WorkspaceSummaryMode::Compact,
             &catalog(),
         );
-        assert_eq!(compact[0].0, "Idle");
+        assert_eq!(compact[0].0, "Awaiting instruction");
     }
 
     #[test]
@@ -14042,9 +14042,9 @@ mod tests {
         harness.get_by_label("More").click();
         harness.run();
 
-        assert!(harness.query_by_label("New file (root)").is_some());
+        assert!(harness.query_by_label("New file").is_some());
         assert!(harness.query_by_label("Show hidden files").is_some());
-        assert!(harness.query_by_label("New folder (root)").is_some());
+        assert!(harness.query_by_label("New folder").is_some());
     }
 
     #[test]

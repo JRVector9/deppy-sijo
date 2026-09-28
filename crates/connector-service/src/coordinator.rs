@@ -9027,7 +9027,18 @@ mod tests {
                 .coordinator
                 .dispatch(invoke_intent("server-1", "tool-a", input))
                 .unwrap();
-            wait_until(|| fixture.coordinator.current_snapshot().revision.0 > previous);
+            wait_until(|| {
+                let snapshot = fixture.coordinator.current_snapshot();
+                snapshot.revision.0 > previous
+                    && snapshot
+                        .diagnostics
+                        .transitions
+                        .last()
+                        .is_some_and(|transition| {
+                            transition.phase == OperationPhase::Failed
+                                && transition.error_code == Some(ErrorCode::InvalidInput)
+                        })
+            });
             assert_eq!(
                 fixture
                     .coordinator

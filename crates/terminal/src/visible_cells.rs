@@ -267,7 +267,8 @@ mod tests {
         assert_eq!(cells.heap_bytes(), original);
         assert!(cells.get(6).is_none());
         assert!(cells.get(4..7).is_none());
-        assert!(cells.get(4..3).is_none());
+        let reversed_start = cells.len() - 2;
+        assert!(cells.get(reversed_start..reversed_start - 1).is_none());
         assert!(cells.get(6..6).unwrap().is_empty());
         assert!(cells.get(..=usize::MAX).is_none());
         assert_eq!(cells[1..5].len(), 4);

@@ -191,6 +191,10 @@ impl Drop for OwnedChild {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "tunnel worker receives lifecycle and probe callbacks"
+)]
 fn run(
     path: &Path,
     port: u16,

@@ -2657,6 +2657,10 @@ mod tests {
         )
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "test helper keeps render inputs explicit"
+    )]
     fn draw_preedit_in_pane(
         ctx: &egui::Context,
         cache: &mut TerminalRenderCache,

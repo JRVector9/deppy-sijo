@@ -27,8 +27,10 @@ impl Default for InputPermit {
 pub struct InputAdmission {
     permit: InputPermit,
     deadline: Instant,
-    authorize: Box<dyn Fn(&mut dyn FnMut()) + Send + Sync>,
+    authorize: Box<InputAuthorizer>,
 }
+
+type InputAuthorizer = dyn Fn(&mut dyn FnMut()) + Send + Sync;
 
 impl InputAdmission {
     pub fn new(

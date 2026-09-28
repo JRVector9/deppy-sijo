@@ -297,7 +297,7 @@ mod compact_tests {
             text: full.into(),
         };
         let wide = TerminalCell::new('👩', [0; 3], [0; 3], true, false, CellAttrs::empty());
-        assert!(validate_cell_graphemes(&[wide], &[entry.clone()]).is_ok());
+        assert!(validate_cell_graphemes(&[wide], std::slice::from_ref(&entry)).is_ok());
         let narrow = TerminalCell::new('👩', [0; 3], [0; 3], false, false, CellAttrs::empty());
         assert!(validate_cell_graphemes(&[narrow], &[entry]).is_err());
     }

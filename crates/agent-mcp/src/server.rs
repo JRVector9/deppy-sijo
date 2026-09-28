@@ -404,9 +404,9 @@ fn process(
         return Response::plain(400, "unsupported_protocol");
     }
     if head.header_count("content-type") != 1
-        || !head
+        || head
             .header("content-type")
-            .is_some_and(|v| v.split(';').next() == Some("application/json"))
+            .is_none_or(|v| v.split(';').next() != Some("application/json"))
     {
         return Response::plain(415, "application/json_required");
     }

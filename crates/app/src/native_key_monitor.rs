@@ -64,6 +64,19 @@ impl NativePrintableKeyDown {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_test_observed_at(character: char, observed_at: Instant) -> Self {
+        Self {
+            character,
+            after_submit: false,
+            observed_at,
+        }
+    }
+
+    pub(crate) fn observed_before(self, instant: Instant) -> bool {
+        self.observed_at <= instant
+    }
+
     fn fresh(self) -> bool {
         self.observed_at.elapsed() <= NATIVE_KEY_MAX_AGE
     }

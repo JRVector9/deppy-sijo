@@ -110,7 +110,7 @@ fn agent_resume_write_input_process_exception_is_explicitly_tracked() {
         "claude --resume",
         "codex resume",
         "RuntimeCommand::WriteInput",
-        "dotenv_state_for_root",
+        "dotenv_state_for_sources",
         "resume_probe_completion_allowed",
     ] {
         assert!(

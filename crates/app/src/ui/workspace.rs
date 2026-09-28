@@ -1828,8 +1828,12 @@ struct TerminalPreeditState {
 struct PendingImeSubmit {
     owner: SessionId,
     started: std::time::Instant,
+    /// Last visible syllable before AppKit clears preedit ahead of Commit.
+    preedit_at_submit: String,
     /// Native punctuation whose Text event was swallowed while finishing preedit.
     before_submit: Vec<u8>,
+    /// Clipboard bytes requested before Enter; never deduplicate these against Commit.
+    independent_before_submit: Vec<u8>,
     /// Enter itself, followed by keys typed while Commit is still pending.
     after_submit: Vec<u8>,
 }
@@ -1915,9 +1919,15 @@ pub struct WorkspaceUi {
     preedit: TerminalPreeditState,
     /// Enter and later keystrokes waiting for a terminal-owned IME Commit.
     pending_ime_submit: Option<PendingImeSubmit>,
+    /// A focused pane changed before AppKit delivered its pending Commit.
+    detached_ime_submit: Option<PendingImeSubmit>,
+    /// A focus switch may flush the old pane's preedit before AppKit emits Commit.
+    flushed_ime_commit: Option<(String, std::time::Instant)>,
     /// 이번 UI 프레임 직전에 AppKit local monitor가 본 ASCII 문장부호/숫자/공백
     /// key-down. IME Commit/Text와 대조한 뒤 누락된 문자만 복구하고 프레임 끝에 버린다.
     native_printable_key_downs: Vec<crate::native_key_monitor::NativePrintableKeyDown>,
+    #[cfg(test)]
+    test_native_key_downs: Vec<crate::native_key_monitor::NativePrintableKeyDown>,
     /// egui-winit이 이미지-only clipboard에서 Event::Paste 없이 소비하는 macOS Command+V
     /// 원본 key-down. 터미널 입력 소유권을 확인한 pane에서만 1회 소비한다.
     native_clipboard_paste_requested: bool,
@@ -2946,7 +2956,11 @@ impl WorkspaceUi {
             shell_kind: crate::ui::file_tree::default_shell_kind(),
             preedit: TerminalPreeditState::default(),
             pending_ime_submit: None,
+            detached_ime_submit: None,
+            flushed_ime_commit: None,
             native_printable_key_downs: Vec::new(),
+            #[cfg(test)]
+            test_native_key_downs: Vec::new(),
             native_clipboard_paste_requested: false,
             native_clipboard_copy_requested: false,
             prepared_attached_input_owner: None,
@@ -4245,9 +4259,14 @@ impl WorkspaceUi {
                         .pending_ime_submit
                         .as_mut()
                         .filter(|deferred| deferred.owner == pending.session)
+                        .or_else(|| {
+                            self.detached_ime_submit
+                                .as_mut()
+                                .filter(|deferred| deferred.owner == pending.session)
+                        })
                     {
                         if pending.requested_at < deferred.started {
-                            deferred.before_submit.append(&mut bytes);
+                            deferred.independent_before_submit.append(&mut bytes);
                         } else {
                             deferred.after_submit.append(&mut bytes);
                         }
@@ -5369,10 +5388,15 @@ impl WorkspaceUi {
         if input_enabled {
             let native_key_downs = drain_native_input();
             self.native_printable_key_downs = native_key_downs.printable;
+            #[cfg(test)]
+            self.native_printable_key_downs
+                .append(&mut self.test_native_key_downs);
             self.native_clipboard_paste_requested = native_key_downs.clipboard_paste;
             self.native_clipboard_copy_requested = native_key_downs.clipboard_copy;
         } else {
             self.native_printable_key_downs.clear();
+            #[cfg(test)]
+            self.test_native_key_downs.clear();
             self.native_clipboard_paste_requested = false;
             self.native_clipboard_copy_requested = false;
             self.flush_pending_ime_submit();
@@ -5743,7 +5767,9 @@ impl WorkspaceUi {
             self.explicit_pending_focus.as_ref(),
             mux.focused_pane.clone(),
         ) {
-            self.flush_pending_ime_submit();
+            // An ordinary focus acknowledgement must not force the old pane's
+            // detached IME Enter out before its delayed Commit arrives.
+            self.flush_active_ime_submit();
             self.preedit.clear();
             self.scroll_residual = 0.0;
             // 포커스가 옮겨간 pane 세션을 잠깐 강조(pane 전체 2초 플래시).
@@ -7156,10 +7182,84 @@ impl WorkspaceUi {
                 any_blocking_window_visible,
                 terminal_refocus_pending,
             );
+        let text_edit_focused_before_draw = ui.ctx().text_edit_focused();
+        // A pending terminal refocus may supersede stale TextEdit focus for
+        // ordinary keys. IME events in that batch still belong to TextEdit.
+        let text_edit_ime_batch = text_edit_focused_before_draw
+            && ui.input(|input| {
+                input
+                    .raw
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, egui::Event::Ime(_)))
+            });
+        let terminal_ime_active = terminal_keyboard_active && !text_edit_ime_batch;
+        let consumed_detached_commit = if terminal_ime_active && self.detached_ime_submit.is_some()
+        {
+            // Sending the old session's bytes may request a repaint. Release
+            // egui's input read lock before resolving that queued Commit.
+            let events = ui.input(|input| input.raw.events.clone());
+            self.resolve_detached_ime_submit(&events, ui.ctx())
+        } else {
+            // A TextEdit or popup may own the keyboard for longer than the
+            // fallback deadline. It must not strand the old pane's Enter.
+            if !terminal_ime_active && self.detached_ime_submit.is_some() {
+                self.resolve_detached_ime_submit(&[], ui.ctx());
+            }
+            None
+        };
+        // Both a still-queued submit and an already-flushed submit can own a
+        // late AppKit Commit. Decide ownership before text reconciliation so
+        // its paired Key/Text events cannot be attributed to the new pane.
+        let consumed_flushed_commit = if terminal_ime_active && consumed_detached_commit.is_none() {
+            let events = ui.input(|input| input.raw.events.clone());
+            self.consume_flushed_ime_commit(&events)
+        } else {
+            None
+        };
+        let consumed_old_commit = consumed_detached_commit.or(consumed_flushed_commit);
+        let consumed_old_key = consumed_old_commit
+            .as_ref()
+            .and_then(|(index, committed, at)| {
+                let character = committed.chars().last().filter(char::is_ascii)?;
+                if self
+                    .native_printable_key_downs
+                    .iter()
+                    .any(|key| key.character == character && !key.observed_before(*at))
+                {
+                    return None;
+                }
+                ui.input(|input| {
+                    [index.checked_sub(1), index.checked_add(1)]
+                        .into_iter()
+                        .flatten()
+                        .find(|candidate| {
+                            input
+                                .raw
+                                .events
+                                .get(*candidate)
+                                .and_then(input_mapper::ime_terminator_key_char)
+                                == Some(character)
+                        })
+                })
+            });
+        let consumed_old_text_echo =
+            consumed_old_commit
+                .as_ref()
+                .and_then(|(index, committed, _)| {
+                    ui.input(|input| {
+                        paired_old_ime_text_echo_index(
+                            &input.raw.events,
+                            *index,
+                            committed,
+                            cfg!(target_os = "macos"),
+                        )
+                    })
+                });
         // A Commit normally follows Return in the same or next frame. If the
         // platform never delivers it, release queued input instead of losing
         // every subsequent key. A Commit already in this frame still wins.
-        if terminal_keyboard_active
+        if terminal_ime_active
             && self.pending_ime_submit.as_ref().is_some_and(|deferred| {
                 deferred.owner == session
                     && deferred.started.elapsed() >= std::time::Duration::from_secs(2)
@@ -7171,30 +7271,12 @@ impl WorkspaceUi {
                     .iter()
                     .any(|event| matches!(event, egui::Event::Ime(egui::ImeEvent::Commit(_))))
             })
-            && let Some(mut deferred) = self.pending_ime_submit.take()
         {
-            deferred.before_submit.append(&mut deferred.after_submit);
-            if !deferred.before_submit.is_empty() {
-                self.send(RuntimeCommand::WriteInput {
-                    session,
-                    bytes: deferred.before_submit,
-                });
-            }
+            // Commit never arrived. Preserve the last visible syllable as a
+            // focus switch does, then release the queued Enter and later keys.
+            self.flush_pending_ime_submit();
+            self.preedit.clear();
         }
-        let text_edit_focused_before_draw = ui.ctx().text_edit_focused();
-        // A pending terminal refocus may supersede stale TextEdit focus for
-        // ordinary keys. An IME batch still belongs to that focused TextEdit:
-        // do not paint it, replace its candidate output, or interrupt it while
-        // the later input admission path would reject it.
-        let text_edit_ime_batch = text_edit_focused_before_draw
-            && ui.input(|input| {
-                input
-                    .raw
-                    .events
-                    .iter()
-                    .any(|event| matches!(event, egui::Event::Ime(_)))
-            });
-        let terminal_ime_active = terminal_keyboard_active && !text_edit_ime_batch;
         let preedit_for_frame = (terminal_ime_active && !text_edit_focused_before_draw)
             .then(|| ui.input(|input| self.preedit.for_frame(session, &input.raw.events)));
         let preedit = preedit_for_frame
@@ -7652,14 +7734,47 @@ impl WorkspaceUi {
             // printable key-down 수를 한도 삼아 두 텍스트 경로와 fallback을 한 번에
             // 조정해야 공백·쉼표의 중복과 첫 문장부호 누락을 동시에 막을 수 있다.
             let preedit_active_before_input = self.preedit.is_active_for(session);
-            let native_key_downs = std::mem::take(&mut self.native_printable_key_downs);
+            let mut preedit_at_submit = if preedit_active_before_input {
+                self.preedit.text.clone()
+            } else {
+                String::new()
+            };
+            let mut native_key_downs = std::mem::take(&mut self.native_printable_key_downs);
+            if let Some((_, committed, submitted_at)) = &consumed_old_commit {
+                // Those AppKit physical terminators belong to the old Commit,
+                // not to this pane's fallback reconciliation.
+                let mut old_ascii: Vec<char> = committed.chars().filter(char::is_ascii).collect();
+                native_key_downs.retain(|key| {
+                    if key.observed_before(*submitted_at)
+                        && let Some(index) = old_ascii.iter().position(|c| *c == key.character)
+                    {
+                        old_ascii.remove(index);
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
             let native_clipboard_paste_requested =
                 std::mem::take(&mut self.native_clipboard_paste_requested);
             let ime_reconciliation = ui.input(|input| {
+                let mut filtered_events = consumed_old_commit.as_ref().map(|(index, _, _)| {
+                    let mut events = input.raw.events.clone();
+                    events[*index] = egui::Event::Copy;
+                    if let Some(echo) = consumed_old_text_echo {
+                        events[echo] = egui::Event::Copy;
+                    }
+                    if let Some(key) = consumed_old_key {
+                        events[key] = egui::Event::Copy;
+                    }
+                    events
+                });
                 reconcile_ime_text_events(
                     &native_key_downs,
-                    &input.raw.events,
-                    preedit_active_before_input,
+                    filtered_events
+                        .as_mut()
+                        .map_or(input.raw.events.as_slice(), |events| events.as_slice()),
+                    preedit_active_before_input || consumed_old_commit.is_some(),
                     self.pending_ime_submit
                         .as_ref()
                         .is_some_and(|deferred| deferred.for_session(session)),
@@ -7686,10 +7801,22 @@ impl WorkspaceUi {
             ui.input(|input| {
                 let modifiers = input.modifiers;
                 for (event_index, event) in input.raw.events.iter().enumerate() {
+                    if consumed_old_commit
+                        .as_ref()
+                        .is_some_and(|(index, _, _)| *index == event_index)
+                        || consumed_old_text_echo == Some(event_index)
+                        || consumed_old_key == Some(event_index)
+                    {
+                        continue;
+                    }
                     if let egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }) = event {
                         // Empty preedit often precedes Commit; the composition is still
                         // active until that Commit has reached the PTY byte stream.
                         composition_active |= !text.is_empty();
+                        if !text.is_empty() {
+                            preedit_at_submit.clone_from(text);
+                            self.flushed_ime_commit = None;
+                        }
                         continue;
                     }
                     if let Some(text) = ime_reconciliation.event_text[event_index].as_ref() {
@@ -7700,6 +7827,7 @@ impl WorkspaceUi {
                                 following_fallback_insert_at = Some(
                                     pending.len()
                                         + deferred.before_submit.len()
+                                        + deferred.independent_before_submit.len()
                                         + if had_deferred_before_frame {
                                             previous_deferred_bytes
                                         } else {
@@ -7707,6 +7835,7 @@ impl WorkspaceUi {
                                         },
                                 );
                                 pending.append(&mut deferred.before_submit);
+                                pending.append(&mut deferred.independent_before_submit);
                                 pending.append(&mut deferred.after_submit);
                             }
                             composition_active = false;
@@ -7812,7 +7941,9 @@ impl WorkspaceUi {
                                 deferred_submit.get_or_insert_with(|| PendingImeSubmit {
                                     owner: session,
                                     started: std::time::Instant::now(),
+                                    preedit_at_submit: preedit_at_submit.clone(),
                                     before_submit: Vec::new(),
+                                    independent_before_submit: Vec::new(),
                                     after_submit: Vec::new(),
                                 });
                             deferred.after_submit.push(submit);
@@ -7868,11 +7999,15 @@ impl WorkspaceUi {
                 append_ordered_terminal_bytes(&mut pending, &mut deferred_submit, &bytes);
             }
             if deferred_submit.as_ref().is_some_and(|deferred| {
-                deferred.before_submit.len() + deferred.after_submit.len() > 2 * 1024 * 1024
+                deferred.before_submit.len()
+                    + deferred.independent_before_submit.len()
+                    + deferred.after_submit.len()
+                    > 2 * 1024 * 1024
             }) && let Some(mut deferred) = deferred_submit.take()
             {
                 tracing::warn!("IME 제출 대기 입력이 2 MiB를 넘어 PTY에 전달됨");
                 pending.append(&mut deferred.before_submit);
+                pending.append(&mut deferred.independent_before_submit);
                 pending.append(&mut deferred.after_submit);
             }
             self.pending_ime_submit = deferred_submit;
@@ -8891,16 +9026,40 @@ impl WorkspaceUi {
     /// Runtime snapshot을 기다리지 않는 터미널 refocus를 시작한다. egui의 TextEdit state가
     /// 사라지는 데 한 프레임 더 걸려도, 그 사이 첫 printable key를 잃지 않는다.
     fn flush_pending_ime_submit(&mut self) {
-        let Some(mut deferred) = self.pending_ime_submit.take() else {
+        if let Some(detached) = self.detached_ime_submit.take() {
+            self.send_deferred_ime_submit(detached, None);
+        }
+        self.flush_active_ime_submit();
+    }
+
+    fn flush_active_ime_submit(&mut self) {
+        let Some(deferred) = self.pending_ime_submit.take() else {
             return;
         };
-        // A focus switch can prevent the pending AppKit Commit from reaching
-        // this pane. Preserve the visible composed syllable before its Enter.
+        self.send_deferred_ime_submit(deferred, None);
+    }
+
+    fn send_deferred_ime_submit(
+        &mut self,
+        mut deferred: PendingImeSubmit,
+        committed: Option<&str>,
+    ) {
         let mut bytes = Vec::new();
-        if self.preedit.is_active_for(deferred.owner) {
-            bytes.extend_from_slice(self.preedit.text.as_bytes());
+        let composed = committed.unwrap_or(&deferred.preedit_at_submit);
+        if !composed.is_empty() {
+            bytes.extend_from_slice(composed.as_bytes());
+            if committed.is_none() {
+                self.flushed_ime_commit = Some((composed.to_owned(), std::time::Instant::now()));
+            }
         }
-        bytes.append(&mut deferred.before_submit);
+        let overlap = committed.map_or(0, |text| {
+            (1..=text.len().min(deferred.before_submit.len()))
+                .rev()
+                .find(|&length| text.as_bytes().ends_with(&deferred.before_submit[..length]))
+                .unwrap_or(0)
+        });
+        bytes.extend_from_slice(&deferred.before_submit[overlap..]);
+        bytes.append(&mut deferred.independent_before_submit);
         bytes.append(&mut deferred.after_submit);
         if !bytes.is_empty() {
             self.send(RuntimeCommand::WriteInput {
@@ -8910,9 +9069,81 @@ impl WorkspaceUi {
         }
     }
 
+    fn resolve_detached_ime_submit(
+        &mut self,
+        events: &[egui::Event],
+        ctx: &egui::Context,
+    ) -> Option<(usize, String, std::time::Instant)> {
+        let deferred = self.detached_ime_submit.take()?;
+        for (index, event) in events.iter().enumerate() {
+            match event {
+                egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }) if !text.is_empty() => {
+                    self.send_deferred_ime_submit(deferred, None);
+                    return None;
+                }
+                egui::Event::Ime(egui::ImeEvent::Commit(text)) => {
+                    if !deferred.preedit_at_submit.is_empty()
+                        && text.starts_with(&deferred.preedit_at_submit)
+                    {
+                        let submitted_at = deferred.started;
+                        self.send_deferred_ime_submit(deferred, Some(text));
+                        return Some((index, text.clone(), submitted_at));
+                    }
+                    self.send_deferred_ime_submit(deferred, None);
+                    return None;
+                }
+                _ => {}
+            }
+        }
+        if deferred.started.elapsed() >= std::time::Duration::from_secs(2) {
+            self.send_deferred_ime_submit(deferred, None);
+        } else {
+            ctx.request_repaint_after(
+                std::time::Duration::from_secs(2).saturating_sub(deferred.started.elapsed()),
+            );
+            self.detached_ime_submit = Some(deferred);
+        }
+        None
+    }
+
+    fn consume_flushed_ime_commit(
+        &mut self,
+        events: &[egui::Event],
+    ) -> Option<(usize, String, std::time::Instant)> {
+        let (flushed, at) = self.flushed_ime_commit.as_ref()?;
+        if flushed.is_empty() || at.elapsed() >= std::time::Duration::from_secs(2) {
+            self.flushed_ime_commit = None;
+            return None;
+        }
+        for (index, event) in events.iter().enumerate() {
+            match event {
+                egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }) if !text.is_empty() => {
+                    self.flushed_ime_commit = None;
+                    return None;
+                }
+                egui::Event::Ime(egui::ImeEvent::Commit(text)) => {
+                    let (flushed, at) = self.flushed_ime_commit.take()?;
+                    return text
+                        .starts_with(&flushed)
+                        .then(|| (index, text.clone(), at));
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
     fn begin_terminal_refocus(&mut self, pane: runtime::MuxPaneId) {
         self.pending_focus = Some(pane);
-        self.flush_pending_ime_submit();
+        if let Some(deferred) = self.pending_ime_submit.take() {
+            if deferred.preedit_at_submit.is_empty() {
+                self.send_deferred_ime_submit(deferred, None);
+            } else {
+                if let Some(previous) = self.detached_ime_submit.replace(deferred) {
+                    self.send_deferred_ime_submit(previous, None);
+                }
+            }
+        }
         self.preedit.clear();
     }
 
@@ -9679,6 +9910,36 @@ fn consume_ime_terminator_char(candidates: &mut Vec<char>, character: char) -> b
     }
 }
 
+fn paired_old_ime_text_echo_index(
+    events: &[egui::Event],
+    commit_index: usize,
+    committed: &str,
+    native_key_monitor_available: bool,
+) -> Option<usize> {
+    let next = commit_index.checked_add(1)?;
+    let paired_key = committed
+        .chars()
+        .last()
+        .filter(char::is_ascii)
+        .is_some_and(|character| {
+            events
+                .get(next)
+                .and_then(input_mapper::ime_terminator_key_char)
+                == Some(character)
+        });
+    let echo_index = next + usize::from(paired_key);
+    let egui::Event::Text(text) = events.get(echo_index)? else {
+        return None;
+    };
+    if text.is_empty() || !committed.ends_with(text) {
+        return None;
+    }
+    // A full Text copy or a matching Key+Text pair is attributable to the
+    // old Commit on every platform. A bare suffix Text is ambiguous without
+    // AppKit's physical-key observations, so keep it on other platforms.
+    (text == committed || paired_key || native_key_monitor_available).then_some(echo_index)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct ImeTextReconciliation {
     /// raw event와 같은 길이. Text/Commit 위치에는 중복을 제거한 최종 문자열이 있고,
@@ -10030,6 +10291,9 @@ mod tests {
     use super::*;
     use runtime::{MuxPaneId, MuxTabId, PaneSnapshot, TabSnapshot};
     use terminal::{CursorShape, CursorSnapshot, TerminalCell};
+
+    #[path = "ime_input_harness.rs"]
+    mod ime_input_harness;
 
     #[test]
     fn 응답대기_최신_대기는_작업중_기록으로_지우지_않는다() {
@@ -15357,19 +15621,19 @@ mod tests {
             .insert(SessionId(7), (80, 24));
         harness.run();
         let ctx = harness.ctx.clone();
-        let pass = harness
+        let candidate = harness
             .state()
             .staged_terminal_resizes
             .get(&SessionId(7))
-            .expect("attached pane resize candidate")
-            .pass;
+            .copied()
+            .expect("attached pane resize candidate");
         harness
             .state_mut()
-            .flush_render_side_effects_for_pass(&ctx, pass, false);
+            .flush_render_side_effects_for_pass(&ctx, candidate.pass, false);
         assert_eq!(
             harness.state().pending_resize_target[&SessionId(7)].0,
-            80,
-            "viewport가 없어도 이미 전송한 폭으로 행 크기 변경을 예약해야 한다"
+            candidate.cols,
+            "viewport가 없어도 현재 pane 폭으로 행 크기 변경을 예약해야 한다"
         );
         assert!(
             drain_protocol(harness.state_mut()).is_empty(),
@@ -15401,11 +15665,11 @@ mod tests {
                     command,
                     RuntimeCommand::ResizeTracked {
                         session: SessionId(7),
-                        cols: 80,
-                        ..
-                    }
+                    cols,
+                    ..
+                } if *cols == candidate.cols
                 )),
-            "debounce가 끝나면 보존한 폭으로 tracked resize를 보내야 한다"
+            "debounce가 끝나면 현재 pane 폭으로 tracked resize를 보내야 한다"
         );
     }
 
@@ -16053,7 +16317,7 @@ mod tests {
         );
         assert_eq!(
             session_status_label(Some(SessionStatus::Idle), &catalog),
-            "Idle"
+            "Awaiting instruction"
         );
     }
 
@@ -19879,7 +20143,9 @@ https://example.test/login \
         let mut deferred = Some(PendingImeSubmit {
             owner: SessionId(7),
             started: std::time::Instant::now(),
+            preedit_at_submit: String::new(),
             before_submit: Vec::new(),
+            independent_before_submit: Vec::new(),
             after_submit: b"\r\t".to_vec(),
         });
         settle_ime_fallback(
@@ -19900,7 +20166,9 @@ https://example.test/login \
         harness.state_mut().pending_ime_submit = Some(PendingImeSubmit {
             owner: SessionId(7),
             started: std::time::Instant::now() - std::time::Duration::from_secs(3),
+            preedit_at_submit: String::new(),
             before_submit: Vec::new(),
+            independent_before_submit: Vec::new(),
             after_submit: vec![b'\r'],
         });
         harness.input_mut().events.push(commit_event("요"));
@@ -19917,7 +20185,9 @@ https://example.test/login \
         harness.state_mut().pending_ime_submit = Some(PendingImeSubmit {
             owner: SessionId(7),
             started: std::time::Instant::now() - std::time::Duration::from_secs(3),
+            preedit_at_submit: String::new(),
             before_submit: b".".to_vec(),
+            independent_before_submit: Vec::new(),
             after_submit: b"\r\t".to_vec(),
         });
         harness.run_steps(1);
@@ -19995,7 +20265,9 @@ https://example.test/login \
         workspace.pending_ime_submit = Some(PendingImeSubmit {
             owner: SessionId(7),
             started: std::time::Instant::now(),
+            preedit_at_submit: String::new(),
             before_submit: b".".to_vec(),
+            independent_before_submit: Vec::new(),
             after_submit: b"\r\t".to_vec(),
         });
         workspace.begin_terminal_refocus(pane_id("next"));
@@ -20014,10 +20286,19 @@ https://example.test/login \
         workspace.pending_ime_submit = Some(PendingImeSubmit {
             owner: SessionId(7),
             started: std::time::Instant::now(),
+            preedit_at_submit: "요".to_owned(),
             before_submit: Vec::new(),
+            independent_before_submit: Vec::new(),
             after_submit: vec![b'\r'],
         });
         workspace.begin_terminal_refocus(pane_id("next"));
+        assert!(workspace.detached_ime_submit.is_some());
+        assert_eq!(
+            workspace
+                .resolve_detached_ime_submit(&[commit_event("요")], &egui::Context::default())
+                .map(|(index, text, _)| (index, text)),
+            Some((0, "요".to_owned()))
+        );
         assert!(matches!(
             drain_protocol(&mut workspace).as_slice(),
             [RuntimeCommand::WriteInput { session: SessionId(7), bytes }] if bytes == "요\r".as_bytes()
@@ -20243,11 +20524,12 @@ https://example.test/login \
             })],
         );
         assert_eq!(clamped.active_range_chars, Some(2..2));
+        let reversed_start = "한글".chars().count();
         let reversed = state.for_frame(
             owner,
             &[egui::Event::Ime(egui::ImeEvent::Preedit {
                 text: "한글".into(),
-                active_range_chars: Some(2..1),
+                active_range_chars: Some(reversed_start..reversed_start - 1),
             })],
         );
         assert_eq!(reversed.active_range_chars, Some(2..2));

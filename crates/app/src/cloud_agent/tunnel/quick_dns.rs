@@ -239,7 +239,7 @@ mod tests {
                             .set_read_timeout(Some(Duration::from_secs(1)))
                             .unwrap();
                         let mut request = [0; 4096];
-                        stream.read(&mut request).unwrap();
+                        assert!(stream.read(&mut request).unwrap() > 0);
                         let _ = write!(
                             stream,
                             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -349,7 +349,7 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0; 4096];
-            stream.read(&mut request).unwrap();
+            assert!(stream.read(&mut request).unwrap() > 0);
             let body = r#"{"Status":0,"Question":[{"name":"fresh.trycloudflare.com","type":1}],"Answer":[{"name":"fresh.trycloudflare.com","type":1,"data":"104.16.230.132"}]}"#;
             write!(
                 stream,

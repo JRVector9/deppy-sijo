@@ -150,6 +150,10 @@ impl OAuth {
         p.approved = Some(code);
         true
     }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "OAuth route receives request, policy, and response context"
+    )]
     pub fn route(
         &mut self,
         h: &RequestHead,

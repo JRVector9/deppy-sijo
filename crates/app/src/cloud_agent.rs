@@ -3,7 +3,7 @@ mod tunnel;
 mod ui;
 use agent_mcp::{Claim, History, Record, Request, Server, encode_input, now};
 use serde_json::{Value, json};
-use std::{collections::HashMap, path::Path};
+use std::{collections::HashMap, path::Path, sync::mpsc, time::Instant};
 
 const MAX_TARGETS: usize = 256;
 pub const MAX_SCREEN: usize = 64 * 1024;
@@ -80,6 +80,10 @@ pub struct CloudAgent {
     pub action: Option<Action>,
     pub server: Option<Server>,
     targets: Vec<Target>,
+    ended_sessions: Vec<storage::CloudEndedSession>,
+    ended_rx: Option<mpsc::Receiver<Result<Vec<storage::CloudEndedSession>, ()>>>,
+    ended_last_refresh: Option<Instant>,
+    ended_load_failed: bool,
     grants: HashMap<String, Grant>,
     screens: HashMap<String, Screen>,
     history: Option<History>,
@@ -124,6 +128,10 @@ impl CloudAgent {
             action: None,
             server: None,
             targets: vec![],
+            ended_sessions: vec![],
+            ended_rx: None,
+            ended_last_refresh: None,
+            ended_load_failed: false,
             grants: HashMap::new(),
             screens: HashMap::new(),
             history,
@@ -171,7 +179,85 @@ impl CloudAgent {
     pub fn wants_screen(&self, id: &str) -> bool {
         self.server.is_some() && self.grants.contains_key(id)
     }
+    /// Historical rows are display-only; they never enter `targets` or MCP authorization.
+    pub fn refresh_ended_sessions(
+        &mut self,
+        ctx: &egui::Context,
+        db_path: &Path,
+        load: impl FnOnce(&Path) -> Result<Vec<storage::CloudEndedSession>, ()> + Send + 'static,
+    ) {
+        if let Some(rx) = &self.ended_rx {
+            match rx.try_recv() {
+                Ok(Ok(rows)) => {
+                    self.ended_sessions = rows;
+                    self.ended_load_failed = false;
+                    self.ended_rx = None;
+                }
+                Ok(Err(())) | Err(mpsc::TryRecvError::Disconnected) => {
+                    self.ended_load_failed = true;
+                    self.ended_rx = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => return,
+            }
+        }
+        if self.ended_rx.is_some()
+            || self
+                .ended_last_refresh
+                .is_some_and(|at| at.elapsed().as_secs() < 30)
+        {
+            return;
+        }
+        self.ended_last_refresh = Some(Instant::now());
+        let (tx, rx) = mpsc::sync_channel(1);
+        let path = db_path.to_owned();
+        let wake = ctx.clone();
+        match std::thread::Builder::new()
+            .name("cloud-ended-sessions".into())
+            .spawn(move || {
+                let rows = load(&path);
+                let _ = tx.send(rows);
+                wake.request_repaint();
+            }) {
+            Ok(_) => self.ended_rx = Some(rx),
+            Err(_) => self.ended_load_failed = true,
+        }
+    }
+    pub fn release_ended_sessions(&mut self) {
+        self.ended_sessions = Vec::new();
+        self.ended_load_failed = false;
+        if let Some(rx) = &self.ended_rx
+            && matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty))
+        {
+            // Keep the single in-flight reader owned across settings navigation. Dropping
+            // its receiver here would allow quick tab switches to spawn unbounded readers.
+            return;
+        }
+        self.ended_rx = None;
+        self.ended_last_refresh = None;
+    }
+    fn historical_rows(&self) -> Vec<&storage::CloudEndedSession> {
+        let current: std::collections::HashSet<&str> = self
+            .targets
+            .iter()
+            .map(|target| target.id.as_str())
+            .collect();
+        self.ended_sessions
+            .iter()
+            .filter(|row| !current.contains(row.id.as_str()))
+            .collect()
+    }
     pub fn set_targets(&mut self, targets: Vec<Target>) {
+        if self.targets.len() != targets.len()
+            || self
+                .targets
+                .iter()
+                .zip(&targets)
+                .any(|(old, new)| old.id != new.id)
+        {
+            // A just-closed pane falls out of the live projection before the periodic
+            // history poll. Refresh the archived side on the next frame.
+            self.ended_last_refresh = None;
+        }
         self.targets = targets.into_iter().take(MAX_TARGETS).collect();
         self.grants.retain(|id, g| {
             self.targets
@@ -788,6 +874,88 @@ impl Target {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ended_history_shows_closed_sessions_once_without_mcp_authority() {
+        let mut bridge = CloudAgent::memory();
+        let current = Target::fixture("current", "generation");
+        bridge.set_targets(vec![current]);
+        bridge.ended_sessions = ["current", "closed"]
+            .into_iter()
+            .map(|id| storage::CloudEndedSession {
+                id: id.into(),
+                workspace_id: "workspace".into(),
+                workspace_name: "Workspace".into(),
+                title: id.into(),
+            })
+            .collect();
+        assert_eq!(
+            bridge
+                .historical_rows()
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            ["closed"]
+        );
+        assert!(bridge.authorize("closed", "generation", false).is_err());
+    }
+    #[test]
+    fn ended_history_loader_finishes_off_thread_and_releases_its_cache() {
+        let mut bridge = CloudAgent::memory();
+        let ctx = egui::Context::default();
+        let row = storage::CloudEndedSession {
+            id: "old".into(),
+            workspace_id: "workspace".into(),
+            workspace_name: "Workspace".into(),
+            title: "Old task".into(),
+        };
+        bridge.refresh_ended_sessions(&ctx, Path::new("unused"), move |_| Ok(vec![row]));
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        while bridge.ended_rx.is_some() {
+            bridge
+                .refresh_ended_sessions(&ctx, Path::new("unused"), |_| panic!("unexpected reload"));
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(bridge.historical_rows()[0].id, "old");
+        bridge.release_ended_sessions();
+        assert!(bridge.historical_rows().is_empty());
+    }
+    #[test]
+    fn changed_current_targets_schedule_history_refresh() {
+        let mut bridge = CloudAgent::memory();
+        bridge.set_targets(vec![Target::fixture("old", "generation")]);
+        bridge.ended_last_refresh = Some(Instant::now());
+        bridge.set_targets(vec![Target::fixture("old", "generation")]);
+        assert!(bridge.ended_last_refresh.is_some());
+        bridge.set_targets(vec![]);
+        assert!(bridge.ended_last_refresh.is_none());
+    }
+    #[test]
+    fn closing_settings_does_not_spawn_a_second_history_reader() {
+        let mut bridge = CloudAgent::memory();
+        let ctx = egui::Context::default();
+        let (continue_tx, continue_rx) = mpsc::channel();
+        bridge.refresh_ended_sessions(&ctx, Path::new("unused"), move |_| {
+            continue_rx.recv().unwrap();
+            Ok(vec![storage::CloudEndedSession {
+                id: "old".into(),
+                workspace_id: "workspace".into(),
+                workspace_name: "Workspace".into(),
+                title: "Old task".into(),
+            }])
+        });
+        bridge.release_ended_sessions();
+        assert!(bridge.ended_rx.is_some());
+        bridge.refresh_ended_sessions(&ctx, Path::new("unused"), |_| panic!("second reader"));
+        continue_tx.send(()).unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        while bridge.ended_rx.is_some() {
+            bridge.refresh_ended_sessions(&ctx, Path::new("unused"), |_| panic!("second reader"));
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(bridge.historical_rows()[0].id, "old");
+    }
     #[test]
     fn input_permission_requires_exact_incarnation_and_live_session() {
         let mut bridge = CloudAgent::memory();

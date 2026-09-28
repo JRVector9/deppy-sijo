@@ -14,7 +14,7 @@ pub use db::{
     AgentWorkHistoryMutation, AgentWorkHistoryQuery, AgentWorkTurnRow, AgentWorkTurnState,
     AgentWorkTurnUpsert, ApprovalOutcome, ApprovalStatus, ArchivedAgentResumeRow,
     AttentionEventKind, CREDENTIAL_OAUTH_BINDING_BYTES_MAX, CREDENTIAL_SECRET_LOCATION_BYTES_MAX,
-    CREDENTIAL_SECRET_RECORD_BYTES_MAX, ConnectorConfigCas, ConnectorConfigRead,
+    CREDENTIAL_SECRET_RECORD_BYTES_MAX, CloudEndedSession, ConnectorConfigCas, ConnectorConfigRead,
     ConnectorConfigRevision, CredentialEnvBinding, CredentialMeta, CredentialOAuthBindingRecord,
     CredentialSecretLocation, CredentialSecretRecord, Db, EnvApiProjectCount, EnvProfileRow,
     EnvValue, EnvVarRow, HookSessionRow, MCP_REQUEST_TARGET_CREDENTIAL_BYTES_MAX,

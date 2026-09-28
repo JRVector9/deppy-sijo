@@ -1289,6 +1289,14 @@ pub struct PersistedActivityPane {
     pub cwd: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CloudEndedSession {
+    pub id: String,
+    pub workspace_id: String,
+    pub workspace_name: String,
+    pub title: String,
+}
+
 /// Requested complete-or-error bounded projection returned after an [`AgentStateJob`] commits.
 /// Every included row is read from the same transaction snapshot, omitted sections are empty, and
 /// total retained heap bytes are capped globally.
@@ -7092,6 +7100,60 @@ impl Db {
         }
         tx.commit()
             .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+        Ok(result)
+    }
+
+    /// Read-only history for the Cloud Agents settings screen. A closed pane is absent from
+    /// mux_panes, so activity-pane snapshots cannot represent its ended session. This query
+    /// never creates an MCP target or restores a session.
+    pub fn list_cloud_ended_sessions(&self) -> anyhow::Result<Vec<CloudEndedSession>> {
+        Self::read_cloud_ended_sessions(&self.conn)
+    }
+
+    /// The settings query runs off the UI thread with a read-only connection; opening this
+    /// history view must not rerun migrations or contend for a writer lock.
+    pub fn list_cloud_ended_sessions_from_path(
+        path: &Path,
+    ) -> anyhow::Result<Vec<CloudEndedSession>> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(std::time::Duration::from_secs(2))?;
+        Self::read_cloud_ended_sessions(&conn)
+    }
+
+    fn read_cloud_ended_sessions(conn: &Connection) -> anyhow::Result<Vec<CloudEndedSession>> {
+        const MAX_ROWS: usize = 32_768;
+        const MAX_BYTES: usize = 16 * 1024 * 1024;
+        let mut stmt = conn.prepare_cached(
+            "SELECT CASE WHEN length(CAST(sessions.id AS BLOB)) BETWEEN 1 AND 128
+                         THEN sessions.id END,
+                    CASE WHEN length(CAST(sessions.workspace_id AS BLOB)) BETWEEN 1 AND 128
+                         THEN sessions.workspace_id END,
+                    substr(workspaces.name, 1, 256), substr(sessions.title, 1, 256)
+               FROM sessions JOIN workspaces ON workspaces.id = sessions.workspace_id
+              WHERE sessions.status = 'exited'
+              ORDER BY sessions.rowid DESC
+              LIMIT 32769",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut result = Vec::new();
+        let mut retained = 0usize;
+        while let Some(row) = rows.next()? {
+            anyhow::ensure!(result.len() < MAX_ROWS, "cloud_ended_sessions_limit");
+            let id: String = row.get(0)?;
+            let workspace_id: String = row.get(1)?;
+            let workspace_name: String = row.get(2)?;
+            let title: String = row.get(3)?;
+            retained = retained
+                .checked_add(id.len() + workspace_id.len() + workspace_name.len() + title.len())
+                .ok_or_else(|| anyhow::anyhow!("cloud_ended_sessions_limit"))?;
+            anyhow::ensure!(retained <= MAX_BYTES, "cloud_ended_sessions_limit");
+            result.push(CloudEndedSession {
+                id,
+                workspace_id,
+                workspace_name,
+                title,
+            });
+        }
         Ok(result)
     }
 
@@ -13343,6 +13405,56 @@ mod tests {
                 cwd: "/".to_owned(),
             }]
         );
+    }
+
+    #[test]
+    fn cloud_ended_sessions_include_closed_panes_and_exclude_running_sessions() {
+        let db = Db::open_in_memory().unwrap();
+        let ws = db.create_workspace("workspace").unwrap();
+        for (id, status) in [("closed-pane", "exited"), ("live-pane", "running")] {
+            db.conn
+                .execute(
+                    "INSERT INTO sessions
+                       (id, workspace_id, session_kind, agent_id, title, command, args_json,
+                        cwd, status, created_at, updated_at, last_log_offset)
+                     VALUES (?1, ?2, 'shell', NULL, ?1, 'sh', '[]', '/', ?3,
+                        '2026-01-01', '2026-01-01', 0)",
+                    (id, &ws, status),
+                )
+                .unwrap();
+        }
+
+        let rows = db.list_cloud_ended_sessions().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "closed-pane");
+        assert_eq!(rows[0].workspace_id, ws);
+    }
+
+    #[test]
+    fn cloud_ended_sessions_read_only_connection_reads_persisted_history() {
+        let dir =
+            std::env::temp_dir().join(format!("deppy-cloud-history-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.sqlite");
+        {
+            let db = Db::open(&path).unwrap();
+            let ws = db.create_workspace("history").unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO sessions
+                       (id, workspace_id, session_kind, agent_id, title, command, args_json,
+                        cwd, status, created_at, updated_at, last_log_offset)
+                     VALUES ('ended-id', ?1, 'shell', NULL, 'old task', 'sh', '[]', '/', 'exited',
+                        '2026-01-01', '2026-01-01', 0)",
+                    [&ws],
+                )
+                .unwrap();
+        }
+        let rows = Db::list_cloud_ended_sessions_from_path(&path).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].title, "old task");
+        assert_eq!(rows[0].workspace_name, "history");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

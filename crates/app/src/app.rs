@@ -23837,6 +23837,14 @@ impl App {
 
     fn pump_cloud_agent(&mut self, ctx: &egui::Context) {
         self.cloud_agent.apply_action(ctx);
+        if self.settings_open && self.settings_category == ui::settings::Category::CloudAgents {
+            self.cloud_agent
+                .refresh_ended_sessions(ctx, &self.db_path, |path| {
+                    storage::Db::list_cloud_ended_sessions_from_path(path).map_err(|_| ())
+                });
+        } else {
+            self.cloud_agent.release_ended_sessions();
+        }
         // Also project retained answers when the MCP listener is stopped.
         for rt in std::iter::once(&mut self.active).chain(self.warm.values_mut()) {
             rt.workspace_ui.cloud_answers = self.cloud_agent.answers.clone();

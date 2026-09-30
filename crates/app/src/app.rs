@@ -3107,7 +3107,8 @@ struct PendingBatchSpawn {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WorkspaceMutationPurpose {
     SelectInSettings,
-    SwitchRuntime,
+    AddSelectInSettings,
+    AddSwitchRuntime,
 }
 
 enum SettingsJobAction {
@@ -4738,12 +4739,14 @@ fn execute_settings_job_with_repair(
             purpose,
         } => {
             let result = (|| {
-                let path_string = path.to_string_lossy().into_owned();
-                let (dev, ino) = App::folder_anchor(&path_string)
+                let path_string = path
+                    .to_str()
+                    .context("settings_workspace_path_invalid_utf8")?;
+                let (dev, ino) = App::folder_anchor(path_string)
                     .context("settings_workspace_folder_anchor_missing")?;
                 db.find_or_create_workspace_by_exact_path(
                     &name,
-                    &path_string,
+                    path_string,
                     storage::WorkspaceFolderAnchor { dev, ino },
                 )
             })()
@@ -9536,6 +9539,11 @@ pub struct App {
     /// 사이드바 「이름 바꾸기」 모달 — Some((id, 편집 버퍼)). 별칭(name 컬럼)만
     /// 바꾸고 실제 폴더/경로는 불변. 빈 값 확정 = 별칭 해제(폴더명 복귀).
     ws_rename_edit: Option<(String, String)>,
+    workspace_add_ui: Option<crate::workspace_add::WorkspaceAddUi>,
+    workspace_clone_task: Option<crate::workspace_add::CloneTask>,
+    /// Completed clone stays pending for one UI frame so an already visible Cancel can win.
+    pending_workspace_clone_result:
+        Option<Result<crate::workspace_add::CloneOutcome, crate::workspace_add::CloneError>>,
     /// runtime durable 이벤트 큐가 포화돼 느린 구독자가 끊긴 경우 사용자 경고 모달.
     runtime_stream_warning: bool,
     /// live warm hard cap을 넘기는 workspace 전환을 거부했을 때 대상 표시명.
@@ -9826,6 +9834,8 @@ pub struct App {
     /// Render가 반환한 native-host intent. 다음 logic tick에서만 host task로 넘기며
     /// latest-only 한 건만 보존한다.
     pending_app_host_action: Option<AppHostIoAction>,
+    /// Preserve an Add-dialog picker click until the shared host-action slot is free.
+    pending_workspace_add_picker: Option<FolderPickerPurpose>,
     /// 위 슬롯이 차 있어 밀려난 「원문 보기」 요청. 사용자 클릭이라 버리지 않고 다음
     /// 프레임에 태운다. 여기도 latest-only 한 건이다(2026-08-16).
     pending_app_host_retry: Option<AppHostIoAction>,
@@ -9860,6 +9870,8 @@ pub struct App {
     /// 폴더 선택 결과를 settings queue가 빌 때까지 한 건만 보존한다. 선택 결과를 적용하기
     /// 전에는 다음 host action을 시작하지 않아 raw path/backlog가 늘지 않는다.
     pending_folder_picker_completion: Option<(FolderPickerPurpose, PathBuf)>,
+    /// Clone can complete while a native picker owns the one pending folder result.
+    pending_clone_registration: Option<(FolderPickerPurpose, PathBuf)>,
     credentials_ui: ui::credentials::CredentialsUi,
     env_profiles_ui: ui::env_profiles::EnvProfilesUi,
     environment_ui: ui::environment::EnvironmentUi,
@@ -12056,9 +12068,55 @@ enum AppTerminalInputTarget {
 
 #[derive(Clone)]
 enum FolderPickerPurpose {
-    SwitchWorkspace,
     SelectWorkspaceInSettings,
+    AddSwitchWorkspace,
+    AddSelectWorkspaceInSettings,
+    WorkspaceAddDestination,
     SetProjectPath { workspace_id: String },
+}
+
+fn admit_deferred_folder_completion(
+    pending: &mut Option<(FolderPickerPurpose, PathBuf)>,
+    deferred: &mut Option<(FolderPickerPurpose, PathBuf)>,
+    picker_in_flight: bool,
+) {
+    if pending.is_none() && !picker_in_flight {
+        *pending = deferred.take();
+    }
+}
+
+fn admit_workspace_add_picker(
+    host_action: &mut Option<AppHostIoAction>,
+    picker: &mut Option<FolderPickerPurpose>,
+) {
+    if host_action.is_none() {
+        *host_action = picker.take().map(AppHostIoAction::FolderPicker);
+    }
+}
+
+fn workspace_add_registration_purpose(
+    purpose: crate::workspace_add::WorkspaceAddPurpose,
+) -> FolderPickerPurpose {
+    match purpose {
+        crate::workspace_add::WorkspaceAddPurpose::SelectInSettings => {
+            FolderPickerPurpose::AddSelectWorkspaceInSettings
+        }
+        crate::workspace_add::WorkspaceAddPurpose::SwitchRuntime => {
+            FolderPickerPurpose::AddSwitchWorkspace
+        }
+    }
+}
+
+fn cancel_pending_workspace_clone_result(
+    pending: &mut Option<
+        Result<crate::workspace_add::CloneOutcome, crate::workspace_add::CloneError>,
+    >,
+) {
+    if matches!(pending, Some(Ok(_))) {
+        *pending = Some(Err(
+            crate::workspace_add::CloneError::CancelledAfterCompletion,
+        ));
+    }
 }
 
 enum AppHostIoCompletion {
@@ -14012,10 +14070,33 @@ impl App {
                 purpose,
                 selected_path,
             } => {
+                if matches!(
+                    purpose,
+                    FolderPickerPurpose::AddSwitchWorkspace
+                        | FolderPickerPurpose::AddSelectWorkspaceInSettings
+                        | FolderPickerPurpose::WorkspaceAddDestination
+                ) && let Some(dialog) = self.workspace_add_ui.as_mut()
+                {
+                    dialog.finish_picking();
+                }
                 if let Some(path) = selected_path.filter(|path| {
                     path.as_os_str().as_encoded_bytes().len() <= APP_HOST_PATH_MAX_BYTES
                 }) {
-                    self.pending_folder_picker_completion = Some((purpose, path));
+                    if matches!(purpose, FolderPickerPurpose::WorkspaceAddDestination) {
+                        if let Some(dialog) = self.workspace_add_ui.as_mut() {
+                            dialog.set_destination(&path);
+                        }
+                    } else {
+                        if matches!(
+                            purpose,
+                            FolderPickerPurpose::AddSwitchWorkspace
+                                | FolderPickerPurpose::AddSelectWorkspaceInSettings
+                        ) && let Some(dialog) = self.workspace_add_ui.as_mut()
+                        {
+                            dialog.set_registering();
+                        }
+                        self.pending_folder_picker_completion = Some((purpose, path));
+                    }
                 }
             }
             AppHostIoCompletion::Complete => {}
@@ -14259,6 +14340,110 @@ impl App {
         }
     }
 
+    fn open_workspace_add_dialog(&mut self, purpose: crate::workspace_add::WorkspaceAddPurpose) {
+        if self.workspace_add_ui.is_some() {
+            return;
+        }
+        let parent = self
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == self.active.id)
+            .and_then(|workspace| std::path::Path::new(&workspace.path).parent())
+            .filter(|path| path.is_dir())
+            .map(std::path::Path::to_path_buf)
+            .or_else(crate::paths::home_dir)
+            .unwrap_or_else(|| std::path::PathBuf::from("/"));
+        self.workspace_add_ui = Some(crate::workspace_add::WorkspaceAddUi::new(purpose, parent));
+    }
+
+    fn render_workspace_add_dialog(&mut self, ctx: &egui::Context, catalog: &i18n::Catalog) {
+        use crate::workspace_add::{CloneTask, WorkspaceAddIntent};
+        let intent = self
+            .workspace_add_ui
+            .as_mut()
+            .and_then(|dialog| dialog.show(ctx, catalog));
+        match intent {
+            Some(WorkspaceAddIntent::PickLocal) => {
+                let purpose = self
+                    .workspace_add_ui
+                    .as_ref()
+                    .map(|dialog| dialog.purpose())
+                    .map(workspace_add_registration_purpose)
+                    .unwrap_or(FolderPickerPurpose::AddSwitchWorkspace);
+                self.pending_workspace_add_picker = Some(purpose);
+                if let Some(dialog) = self.workspace_add_ui.as_mut() {
+                    dialog.set_picking();
+                }
+            }
+            Some(WorkspaceAddIntent::PickDestination) => {
+                self.pending_workspace_add_picker =
+                    Some(FolderPickerPurpose::WorkspaceAddDestination);
+                if let Some(dialog) = self.workspace_add_ui.as_mut() {
+                    dialog.set_picking();
+                }
+            }
+            Some(WorkspaceAddIntent::Clone(request)) if self.workspace_clone_task.is_none() => {
+                match CloneTask::spawn(request, ctx.clone(), self.data_dir().to_path_buf()) {
+                    Ok(task) => {
+                        self.workspace_clone_task = Some(task);
+                        if let Some(dialog) = self.workspace_add_ui.as_mut() {
+                            dialog.set_cloning();
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(dialog) = self.workspace_add_ui.as_mut() {
+                            dialog.set_error(error);
+                        }
+                    }
+                }
+            }
+            Some(WorkspaceAddIntent::CancelClone) => {
+                if let Some(task) = self.workspace_clone_task.as_ref() {
+                    task.cancel();
+                    cancel_pending_workspace_clone_result(&mut self.pending_workspace_clone_result);
+                    if let Some(dialog) = self.workspace_add_ui.as_mut() {
+                        dialog.set_cancelling();
+                    }
+                }
+            }
+            Some(WorkspaceAddIntent::Close) => self.workspace_add_ui = None,
+            Some(WorkspaceAddIntent::Clone(_)) | None => {}
+        }
+    }
+
+    fn poll_workspace_clone(&mut self, ctx: &egui::Context) {
+        let result = if let Some(result) = self.pending_workspace_clone_result.take() {
+            result
+        } else {
+            let Some(result) = self
+                .workspace_clone_task
+                .as_mut()
+                .and_then(|task| task.poll())
+            else {
+                return;
+            };
+            self.pending_workspace_clone_result = Some(result);
+            ctx.request_repaint();
+            return;
+        };
+        self.workspace_clone_task = None;
+        match result {
+            Ok(outcome) => {
+                if let Some(dialog) = self.workspace_add_ui.as_mut() {
+                    let purpose = workspace_add_registration_purpose(dialog.purpose());
+                    dialog.set_registering();
+                    self.pending_clone_registration = Some((purpose, outcome.path));
+                }
+            }
+            Err(error) => {
+                if let Some(dialog) = self.workspace_add_ui.as_mut() {
+                    dialog.set_error(error);
+                }
+            }
+        }
+        ctx.request_repaint();
+    }
+
     fn try_apply_pending_folder_picker_completion(&mut self) -> bool {
         let Some((purpose, path)) = self.pending_folder_picker_completion.take() else {
             return true;
@@ -14266,18 +14451,15 @@ impl App {
         let retry_purpose = purpose.clone();
         let request_workspace = match &purpose {
             FolderPickerPurpose::SetProjectPath { workspace_id } => workspace_id.clone(),
-            FolderPickerPurpose::SwitchWorkspace
-            | FolderPickerPurpose::SelectWorkspaceInSettings => self.active.id.clone(),
+            FolderPickerPurpose::SelectWorkspaceInSettings
+            | FolderPickerPurpose::AddSwitchWorkspace
+            | FolderPickerPurpose::AddSelectWorkspaceInSettings
+            | FolderPickerPurpose::WorkspaceAddDestination => self.active.id.clone(),
         };
         let action = match purpose {
             FolderPickerPurpose::SetProjectPath { .. } => {
                 SettingsJobAction::SetProjectPath { path: path.clone() }
             }
-            FolderPickerPurpose::SwitchWorkspace => SettingsJobAction::FindOrCreateWorkspace {
-                name: workspace_name_for_path(&path, self.config.ui.session_name_style),
-                path: path.clone(),
-                purpose: WorkspaceMutationPurpose::SwitchRuntime,
-            },
             FolderPickerPurpose::SelectWorkspaceInSettings => {
                 SettingsJobAction::FindOrCreateWorkspace {
                     name: workspace_name_for_path(&path, self.config.ui.session_name_style),
@@ -14285,6 +14467,19 @@ impl App {
                     purpose: WorkspaceMutationPurpose::SelectInSettings,
                 }
             }
+            FolderPickerPurpose::AddSwitchWorkspace => SettingsJobAction::FindOrCreateWorkspace {
+                name: workspace_name_for_path(&path, self.config.ui.session_name_style),
+                path: path.clone(),
+                purpose: WorkspaceMutationPurpose::AddSwitchRuntime,
+            },
+            FolderPickerPurpose::AddSelectWorkspaceInSettings => {
+                SettingsJobAction::FindOrCreateWorkspace {
+                    name: workspace_name_for_path(&path, self.config.ui.session_name_style),
+                    path: path.clone(),
+                    purpose: WorkspaceMutationPurpose::AddSelectInSettings,
+                }
+            }
+            FolderPickerPurpose::WorkspaceAddDestination => return true,
         };
         if self.queue_global_settings_action(&request_workspace, action) {
             true
@@ -14313,6 +14508,16 @@ impl App {
             );
         }
         let db_path = data_dir.join("metadata.sqlite3");
+        let clone_recovery_dir = data_dir.clone();
+        let _ = std::thread::Builder::new()
+            .name("workspace-clone-recovery".to_owned())
+            .spawn(move || {
+                if let Err(error) =
+                    crate::workspace_add::recover_abandoned_clone_staging(&clone_recovery_dir)
+                {
+                    tracing::warn!(error = %error, "clone staging recovery failed");
+                }
+            });
         let db = Db::open(&db_path)?;
         let workspace_id = initial_workspace_id(
             &db,
@@ -14661,6 +14866,9 @@ impl App {
             env_project_close_confirm: None,
             ws_close_confirm: None,
             ws_rename_edit: None,
+            workspace_add_ui: None,
+            workspace_clone_task: None,
+            pending_workspace_clone_result: None,
             runtime_stream_warning: false,
             warm_limit_warning: None,
             cross_workspace_open_warning: None,
@@ -14790,6 +14998,7 @@ impl App {
             pending_connector_dispatch: None,
             app_host_io: None,
             pending_app_host_action: None,
+            pending_workspace_add_picker: None,
             pending_app_host_retry: None,
             pending_file_tree_maintenance: None,
             file_tree_watcher: None,
@@ -14806,6 +15015,7 @@ impl App {
             last_note_edit: std::time::Instant::now(),
             pending_composer_history: None,
             pending_folder_picker_completion: None,
+            pending_clone_registration: None,
             credentials_ui: ui::credentials::CredentialsUi::new(),
             env_profiles_ui: ui::env_profiles::EnvProfilesUi::new(),
             environment_ui: ui::environment::EnvironmentUi::default(),
@@ -23837,6 +24047,14 @@ impl App {
 
     fn pump_cloud_agent(&mut self, ctx: &egui::Context) {
         self.cloud_agent.apply_action(ctx);
+        if self.settings_open && self.settings_category == ui::settings::Category::CloudAgents {
+            self.cloud_agent
+                .refresh_ended_sessions(ctx, &self.db_path, |path| {
+                    storage::Db::list_cloud_ended_sessions_from_path(path).map_err(|_| ())
+                });
+        } else {
+            self.cloud_agent.release_ended_sessions();
+        }
         // Also project retained answers when the MCP listener is stopped.
         for rt in std::iter::once(&mut self.active).chain(self.warm.values_mut()) {
             rt.workspace_ui.cloud_answers = self.cloud_agent.answers.clone();
@@ -26461,13 +26679,22 @@ impl App {
                 SettingsOutcomeKind::WorkspaceFoundOrCreated { purpose, result } => {
                     let Ok(result) = result else {
                         tracing::warn!("workspace find-or-create worker failed");
+                        if matches!(
+                            purpose,
+                            WorkspaceMutationPurpose::AddSelectInSettings
+                                | WorkspaceMutationPurpose::AddSwitchRuntime
+                        ) && let Some(dialog) = self.workspace_add_ui.as_mut()
+                        {
+                            dialog.set_error(crate::workspace_add::CloneError::RegistrationFailed);
+                        }
                         continue;
                     };
                     let workspace_id = result.row.id.clone();
                     let created = result.created;
                     self.upsert_workspace_projection(result.row);
                     match purpose {
-                        WorkspaceMutationPurpose::SelectInSettings => {
+                        WorkspaceMutationPurpose::SelectInSettings
+                        | WorkspaceMutationPurpose::AddSelectInSettings => {
                             self.config.ui.hidden_env_project_ids.remove(&workspace_id);
                             if created {
                                 self.closed_workspaces
@@ -26477,13 +26704,13 @@ impl App {
                                     .closed_workspace_ids
                                     .insert(workspace_id.clone());
                             }
-                            self.settings_workspace_id = Some(workspace_id);
+                            self.settings_workspace_id = Some(workspace_id.clone());
                             if let Err(error) = self.config.save(&self.config_path) {
                                 tracing::warn!("settings workspace state save failed: {error:#}");
                             }
                             self.invalidate_env_profile_ui();
                         }
-                        WorkspaceMutationPurpose::SwitchRuntime => {
+                        WorkspaceMutationPurpose::AddSwitchRuntime => {
                             self.reveal_closed_workspace(&workspace_id);
                             if workspace_id != self.active.id {
                                 self.switch_workspace(&workspace_id);
@@ -26500,6 +26727,28 @@ impl App {
                                     .workspace_ui
                                     .spawn_shell(self.config.terminal.scrollback_lines as usize);
                             }
+                        }
+                    }
+                    if matches!(
+                        purpose,
+                        WorkspaceMutationPurpose::AddSelectInSettings
+                            | WorkspaceMutationPurpose::AddSwitchRuntime
+                    ) {
+                        let switched =
+                            !matches!(purpose, WorkspaceMutationPurpose::AddSwitchRuntime)
+                                || workspace_id == self.active.id;
+                        if switched {
+                            if matches!(purpose, WorkspaceMutationPurpose::AddSwitchRuntime)
+                                && self.workspace_add_ui.as_ref().is_some_and(|dialog| {
+                                    dialog.purpose()
+                                        == crate::workspace_add::WorkspaceAddPurpose::SelectInSettings
+                                })
+                            {
+                                self.settings_workspace_id = Some(workspace_id.clone());
+                            }
+                            self.workspace_add_ui = None;
+                        } else if let Some(dialog) = self.workspace_add_ui.as_mut() {
+                            dialog.set_error(crate::workspace_add::CloneError::SwitchFailed);
                         }
                     }
                 }
@@ -28132,6 +28381,13 @@ impl App {
                             .copied()
                     })
                     .flatten(),
+                    idle_since: (state == AgentVisualState::Idle)
+                        .then(|| {
+                            self.global_turn_done
+                                .get(&(workspace.id.clone(), session))
+                                .copied()
+                        })
+                        .flatten(),
                     workspace_id: workspace.id.clone(),
                     workspace_name: workspace_name.clone(),
                     target: crate::fleet::FleetTarget::Pty {
@@ -28142,6 +28398,7 @@ impl App {
                     title: entry.title,
                     state,
                     agent_line: entry.agent_line,
+                    task_line: runtime.workspace_ui.agent_task_line_for(session, state),
                     waiting_message,
                     active_workspace: active,
                 });
@@ -28187,11 +28444,13 @@ impl App {
                 target: crate::fleet::FleetTarget::Structured {
                     session_id: row.session_id,
                 },
-                title: row.title,
+                title: row.title.clone(),
                 state: row.state,
                 agent_line,
+                task_line: Some(row.title.clone()),
                 waiting_message: None,
                 blocked_since,
+                idle_since: None,
                 // PTY 스냅샷이 없어 출력 시각을 알 수 없다 — 멈춤 표시 대상이 아니다.
                 last_output_at: None,
                 // 예약은 WriteInput 경로라 PTY 전용이다(구조화는 steer).
@@ -29257,9 +29516,23 @@ impl eframe::App for App {
         self.poll_settings_job_admission();
         self.poll_env_api_project_rows();
         self.poll_file_tree_maintenance(ctx);
+        self.poll_workspace_clone(ctx);
+        admit_workspace_add_picker(
+            &mut self.pending_app_host_action,
+            &mut self.pending_workspace_add_picker,
+        );
         // Settings completion을 먼저 drain해야 folder-result backpressure가 같은 wake에서
         // 해제된다. Host task는 그 뒤 한 건만 적용/시작한다.
         self.poll_app_host_io(ctx);
+        let picker_in_flight = self
+            .app_host_io
+            .as_ref()
+            .is_some_and(|task| matches!(task.fallback, AppHostIoFallback::FolderPicker(_)));
+        admit_deferred_folder_completion(
+            &mut self.pending_folder_picker_completion,
+            &mut self.pending_clone_registration,
+            picker_in_flight,
+        );
         self.poll_app_controller(ctx);
         // Drain the notice from the runtime that rendered it before a queued workspace switch can
         // move that runtime into the warm pool.
@@ -29938,11 +30211,10 @@ impl eframe::App for App {
                     if add
                         .on_hover_text(text.t("sidebar.empty.start_workspace", &[]))
                         .clicked()
-                        && self.pending_app_host_action.is_none()
                     {
-                        self.pending_app_host_action = Some(AppHostIoAction::FolderPicker(
-                            FolderPickerPurpose::SwitchWorkspace,
-                        ));
+                        self.open_workspace_add_dialog(
+                            crate::workspace_add::WorkspaceAddPurpose::SwitchRuntime,
+                        );
                         ui.ctx().request_repaint();
                     }
                 }
@@ -30974,15 +31246,12 @@ impl eframe::App for App {
                         .to_owned();
                     self.ws_rename_edit = Some((workspace_id, alias));
                 }
-                Some(ui::file_tree::SidebarAction::CreateWorkspaceFromPicker)
-                    if self.pending_app_host_action.is_none() =>
-                {
-                    self.pending_app_host_action = Some(AppHostIoAction::FolderPicker(
-                        FolderPickerPurpose::SwitchWorkspace,
-                    ));
+                Some(ui::file_tree::SidebarAction::CreateWorkspaceFromPicker) => {
+                    self.open_workspace_add_dialog(
+                        crate::workspace_add::WorkspaceAddPurpose::SwitchRuntime,
+                    );
                     ui.ctx().request_repaint();
                 }
-                Some(ui::file_tree::SidebarAction::CreateWorkspaceFromPicker) => {}
                 None => {}
             }
         }
@@ -32217,6 +32486,8 @@ impl eframe::App for App {
             }
         }
 
+        self.render_workspace_add_dialog(ui.ctx(), &text);
+
         // 「워크스페이스 종료」 확인 모달 — 설정에서 명시적으로 ON한 경우에만 표시한다.
         if let Some((close_id, close_name, total, running)) = self.ws_close_confirm.clone() {
             let mut decision: Option<bool> = None; // Some(true)=모두 종료, Some(false)=취소
@@ -33229,10 +33500,10 @@ impl eframe::App for App {
         } else if is_environment && self.settings_category != ui::settings::Category::Environment {
             self.reset_environment_view_state();
         }
-        if settings_folder_picker_requested && self.pending_app_host_action.is_none() {
-            self.pending_app_host_action = Some(AppHostIoAction::FolderPicker(
-                FolderPickerPurpose::SelectWorkspaceInSettings,
-            ));
+        if settings_folder_picker_requested {
+            self.open_workspace_add_dialog(
+                crate::workspace_add::WorkspaceAddPurpose::SelectInSettings,
+            );
             ui.ctx().request_repaint();
         }
         if let Some(path) = settings_ws_create
@@ -45179,13 +45450,13 @@ mod tests {
                 action: SettingsJobAction::FindOrCreateWorkspace {
                     name: "project".to_owned(),
                     path: workspace_path.clone(),
-                    purpose: WorkspaceMutationPurpose::SwitchRuntime,
+                    purpose: WorkspaceMutationPurpose::AddSwitchRuntime,
                 },
             },
         );
         let first_id = match first.kind {
             SettingsOutcomeKind::WorkspaceFoundOrCreated {
-                purpose: WorkspaceMutationPurpose::SwitchRuntime,
+                purpose: WorkspaceMutationPurpose::AddSwitchRuntime,
                 result: Ok(result),
             } => {
                 assert!(result.created);
@@ -45224,6 +45495,142 @@ mod tests {
         drop(db);
         remove_sqlite_files(&db_path);
         std::fs::remove_dir_all(workspace_path).unwrap();
+    }
+
+    #[test]
+    fn local_git_fixture_clone_registers_real_workspace_with_switch_intent() {
+        let root =
+            std::env::temp_dir().join(format!("deppy-clone-register-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let source = root.join("source.git");
+        crate::git_cli::run_git_bounded(
+            &root,
+            &["init", "--bare", source.to_str().unwrap()],
+            std::time::Duration::from_secs(10),
+            1024,
+        )
+        .unwrap();
+        let parent = root.join("projects");
+        std::fs::create_dir(&parent).unwrap();
+        let request = crate::workspace_add::CloneRequest::prepare(
+            "https://github.com/owner/repo",
+            &parent,
+            "repo",
+        )
+        .unwrap()
+        .with_test_remote(&source);
+        let cloned = crate::workspace_add::clone_or_reuse(
+            &request,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(cloned.path.join(".git").is_dir());
+
+        let db_path = root.join("workspaces.sqlite");
+        let mut db = storage::Db::open(&db_path).unwrap();
+        let request_workspace = db.create_workspace("request").unwrap();
+        let outcome = execute_settings_job(
+            &mut db,
+            &db_path,
+            &secret::RedactionService::new(),
+            SettingsJob {
+                generation: 1,
+                revision: 1,
+                workspace_id: request_workspace,
+                project_root: None,
+                action: SettingsJobAction::FindOrCreateWorkspace {
+                    name: "repo".to_owned(),
+                    path: cloned.path.clone(),
+                    purpose: WorkspaceMutationPurpose::AddSwitchRuntime,
+                },
+            },
+        );
+        match outcome.kind {
+            SettingsOutcomeKind::WorkspaceFoundOrCreated {
+                purpose: WorkspaceMutationPurpose::AddSwitchRuntime,
+                result: Ok(result),
+            } => {
+                assert!(result.created);
+                assert_eq!(result.row.path, cloned.path.to_string_lossy());
+            }
+            _ => panic!("clone was not registered for runtime switch"),
+        }
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn settings_origin_clone_keeps_settings_selection_purpose() {
+        assert!(matches!(
+            workspace_add_registration_purpose(
+                crate::workspace_add::WorkspaceAddPurpose::SelectInSettings
+            ),
+            FolderPickerPurpose::AddSelectWorkspaceInSettings
+        ));
+        assert!(matches!(
+            workspace_add_registration_purpose(
+                crate::workspace_add::WorkspaceAddPurpose::SwitchRuntime
+            ),
+            FolderPickerPurpose::AddSwitchWorkspace
+        ));
+    }
+
+    #[test]
+    fn clone_registration_waits_until_existing_folder_result_is_admitted() {
+        let original = std::path::PathBuf::from("/tmp/original");
+        let cloned = std::path::PathBuf::from("/tmp/cloned");
+        let mut pending = Some((
+            FolderPickerPurpose::SelectWorkspaceInSettings,
+            original.clone(),
+        ));
+        let mut deferred = Some((FolderPickerPurpose::AddSwitchWorkspace, cloned.clone()));
+        admit_deferred_folder_completion(&mut pending, &mut deferred, false);
+        assert_eq!(pending.as_ref().map(|(_, path)| path), Some(&original));
+        assert_eq!(deferred.as_ref().map(|(_, path)| path), Some(&cloned));
+        pending = None;
+        admit_deferred_folder_completion(&mut pending, &mut deferred, true);
+        assert!(pending.is_none());
+        assert_eq!(deferred.as_ref().map(|(_, path)| path), Some(&cloned));
+        admit_deferred_folder_completion(&mut pending, &mut deferred, false);
+        assert_eq!(pending.as_ref().map(|(_, path)| path), Some(&cloned));
+        assert!(deferred.is_none());
+    }
+
+    #[test]
+    fn workspace_add_picker_click_survives_a_busy_host_action_slot() {
+        let mut host_action = Some(AppHostIoAction::OpenPath(PathBuf::from("/tmp/other")));
+        let mut picker = Some(FolderPickerPurpose::AddSwitchWorkspace);
+        admit_workspace_add_picker(&mut host_action, &mut picker);
+        assert!(matches!(host_action, Some(AppHostIoAction::OpenPath(_))));
+        assert!(matches!(
+            picker,
+            Some(FolderPickerPurpose::AddSwitchWorkspace)
+        ));
+
+        host_action = None;
+        admit_workspace_add_picker(&mut host_action, &mut picker);
+        assert!(matches!(
+            host_action,
+            Some(AppHostIoAction::FolderPicker(
+                FolderPickerPurpose::AddSwitchWorkspace
+            ))
+        ));
+        assert!(picker.is_none());
+    }
+
+    #[test]
+    fn cancel_click_in_completion_frame_discards_queued_clone_success() {
+        let mut pending = Some(Ok(crate::workspace_add::CloneOutcome {
+            path: PathBuf::from("/tmp/already-cloned"),
+            reused: false,
+        }));
+        cancel_pending_workspace_clone_result(&mut pending);
+        assert_eq!(
+            pending,
+            Some(Err(
+                crate::workspace_add::CloneError::CancelledAfterCompletion
+            ))
+        );
     }
 
     #[test]

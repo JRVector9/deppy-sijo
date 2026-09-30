@@ -12,7 +12,7 @@
 //!
 //! 상태 색은 앱 공용 팔레트(`agent_visuals::status_color`)를 재사용한다.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::agent_surface::AgentVisualState;
@@ -300,7 +300,10 @@ pub enum BlockedRow {
 /// 맨 앞 큐 항목은 펼치고 그 항목이 가리키는 세션 카드는 뺀다 — 같은 막힘이 두 번
 /// 보이면 화면을 둘로 나누던 때와 다를 게 없다(2026-09-05). 뒤 항목은 세션 카드로
 /// 대신하고, 카드가 없는 결정만 요약 줄로 남긴다. 큐에 없는 막힌 세션은 뒤에 붙는다.
-pub fn blocked_rows(queue: &[BlockedItem], sessions: &[FleetSession]) -> Vec<BlockedRow> {
+pub fn blocked_rows<T: std::borrow::Borrow<FleetSession>>(
+    queue: &[BlockedItem],
+    sessions: &[T],
+) -> Vec<BlockedRow> {
     let mut rows = Vec::with_capacity(queue.len() + sessions.len());
     let mut used = vec![false; sessions.len()];
     for (index, item) in queue.iter().enumerate() {
@@ -310,7 +313,7 @@ pub fn blocked_rows(queue: &[BlockedItem], sessions: &[FleetSession]) -> Vec<Blo
             .and_then(|wanted| {
                 sessions
                     .iter()
-                    .position(|session| session_matches_ref(session, wanted))
+                    .position(|session| session_matches_ref(session.borrow(), wanted))
             })
             .filter(|&slot| !used[slot]);
         if let Some(slot) = matched {
@@ -350,9 +353,57 @@ pub struct FleetUi {
     batch_spawn: Option<BatchSpawnState>,
     /// Some이면 다음 단계 예약 패널이 열려 있다.
     followup: Option<FollowUpState>,
+    /// hook 완료 시각이 없는 세션도 첫 지시 대기 관측부터 시간을 센다.
+    idle_started: HashMap<FleetIdleKey, i64>,
+}
+
+#[derive(Clone, Hash, PartialEq, Eq)]
+enum FleetIdleKey {
+    Pty(String, runtime::SessionId, runtime::MuxPaneId),
+    Structured(String),
+}
+
+impl FleetIdleKey {
+    fn for_session(session: &FleetSession) -> Self {
+        match &session.target {
+            FleetTarget::Pty {
+                session: id, pane, ..
+            } => Self::Pty(session.workspace_id.clone(), *id, pane.clone()),
+            FleetTarget::Structured { session_id } => Self::Structured(session_id.clone()),
+        }
+    }
 }
 
 impl FleetUi {
+    fn idle_since(&self, session: &FleetSession) -> Option<i64> {
+        self.idle_started
+            .get(&FleetIdleKey::for_session(session))
+            .copied()
+    }
+
+    fn update_idle_clocks(&mut self, sessions: &[FleetSession], now: i64) {
+        let idle: HashSet<_> = sessions
+            .iter()
+            .filter(|session| session.state == AgentVisualState::Idle)
+            .map(FleetIdleKey::for_session)
+            .collect();
+        self.idle_started.retain(|key, _| idle.contains(key));
+        for session in sessions {
+            if session.state != AgentVisualState::Idle {
+                continue;
+            }
+            let source = session.idle_since.filter(|at| *at >= 0 && *at <= now);
+            let since = self
+                .idle_started
+                .entry(FleetIdleKey::for_session(session))
+                .or_insert(source.unwrap_or(now));
+            // 새 턴의 완료 hook은 이전 대기 시작 시각보다 최신이다.
+            if let Some(authoritative) = session.idle_since.filter(|at| *at <= now) {
+                *since = (*since).max(authoritative);
+            }
+        }
+    }
+
     /// 「작업」 페이지를 그린다 — 주의 섹션(승인·입력 대기) + 세션 그리드.
     #[allow(clippy::too_many_arguments)]
     pub fn render(
@@ -372,6 +423,13 @@ impl FleetUi {
         let mut out = FleetPageOutput::default();
         let action = &mut out.grid;
         let now = deppy_core::time::unix_secs_i64();
+        self.update_idle_clocks(sessions, now);
+        if sessions.iter().any(|session| {
+            session.state == AgentVisualState::Idle || session.blocked_since.is_some()
+        }) {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_secs(1));
+        }
         egui::Frame::central_panel(ui.style())
             .inner_margin(egui::Margin::symmetric(16, 14))
             .show(ui, |ui| {
@@ -434,7 +492,7 @@ impl FleetUi {
                 }
                 // 묶음별 섹션 — 막힌 것이 맨 위다. 정렬은 순수 함수가 하고 여기서는 그리기만
                 // 한다(순서 계약을 UI 없이 테스트하려고).
-                let mut grouped = crate::fleet::group_sessions(sessions.to_vec());
+                let mut grouped = crate::fleet::group_session_refs(sessions);
                 // 승인과 상태 스냅샷의 도착 순서가 달라도 큐에 연결된 세션은 모두 막힌
                 // 묶음으로 모은다. 그래야 뒤 큐 항목도 Compact 행과 다른 묶음의 카드로
                 // 갈라지지 않고, `blocked_rows`가 큐 순서대로 카드 하나에 대응시킨다.
@@ -460,11 +518,11 @@ impl FleetUi {
                                     match row {
                                         BlockedRow::Expanded(i) => expanded = Some(&queue[i]),
                                         BlockedRow::Compact(i) => compact.push(&queue[i]),
-                                        BlockedRow::Card(slot) => cards.push(&members[slot]),
+                                        BlockedRow::Card(slot) => cards.push(members[slot]),
                                     }
                                 }
                             } else {
-                                cards.extend(members.iter());
+                                cards.extend(members.iter().copied());
                             }
                             let count =
                                 usize::from(expanded.is_some()) + compact.len() + cards.len();
@@ -492,7 +550,8 @@ impl FleetUi {
                             }
                             ui.horizontal_wrapped(|ui| {
                                 for session in cards {
-                                    match card(ui, session, catalog, now) {
+                                    let idle_since = self.idle_since(session);
+                                    match card(ui, session, catalog, now, idle_since) {
                                         Some(CardClick::Open) => {
                                             *action = Some(match &session.target {
                                                 FleetTarget::Pty { tab, pane, .. } => {
@@ -543,7 +602,7 @@ impl FleetUi {
                                     }
                                 }
                             });
-                            ui.add_space(10.0);
+                            ui.add_space(6.0);
                         }
                         // 세션 빈 상태 안내는 목록 **끝**에 — 세션을 전부 닫았는데 승인만 남으면
                         // 막힌 묶음과 안내가 함께 보여야 한다(둘 중 하나만 그리면 안 된다,
@@ -1257,10 +1316,54 @@ fn card(
     session: &FleetSession,
     catalog: &i18n::Catalog,
     now: i64,
+    idle_since: Option<i64>,
 ) -> Option<CardClick> {
-    // 아래쪽 여백이 넓어 카드가 비어 보였다(2026-08-10 사용자 지적). 4행(예약 칩)이
-    // 다 찼을 때가 기준이라 그보다 더 줄이면 칩이 잘린다.
-    let size = egui::vec2(252.0, 84.0);
+    // 실제 행 높이만 예약한다. 작업 설명은 같은 galley를 측정과 그리기에 재사용한다.
+    const CARD_WIDTH: f32 = 252.0;
+    const CONTENT_WIDTH: f32 = CARD_WIDTH - 28.0;
+    let task = session.task_line.as_deref().map_or_else(
+        || catalog.t("fleet.task.unknown", &[]),
+        |line| {
+            catalog.t(
+                if matches!(
+                    session.state,
+                    AgentVisualState::Active
+                        | AgentVisualState::Waiting
+                        | AgentVisualState::NeedsResponse
+                ) {
+                    "fleet.task.current"
+                } else {
+                    "fleet.task.last"
+                },
+                &[("value", line)],
+            )
+        },
+    );
+    let mut task_job = egui::text::LayoutJob::simple(
+        task,
+        egui::FontId::proportional(12.0),
+        ui.visuals().text_color(),
+        CONTENT_WIDTH,
+    );
+    task_job.wrap.max_rows = 2;
+    task_job.wrap.break_anywhere = true;
+    let body_font = egui::TextStyle::Body.resolve(ui.style());
+    let small_font = egui::TextStyle::Small.resolve(ui.style());
+    let (task_galley, body_height, small_height) = ui.fonts_mut(|fonts| {
+        let body_height = fonts.row_height(&body_font);
+        let small_height = fonts.row_height(&small_font);
+        (fonts.layout_job(task_job), body_height, small_height)
+    });
+    let optional_rows = usize::from(session.waiting_message.is_some())
+        + usize::from(session.agent_line.is_some())
+        + usize::from(session.followup.is_some());
+    let rows = 3 + optional_rows;
+    let card_height = 20.0
+        + body_height
+        + small_height * (1 + optional_rows) as f32
+        + task_galley.size().y
+        + (rows - 1) as f32 * 3.0;
+    let size = egui::vec2(CARD_WIDTH, card_height);
     // 자리만 잡는다. **상호작용은 내용을 그린 뒤에** 잡는다 — 여기서 잡으면 나중에
     // 그려진 라벨이 위에 놓여 텍스트 위 클릭을 가로챈다(2026-08-10 실증: 「Kimi」
     // 글자를 눌러도 안 먹혔다).
@@ -1337,6 +1440,18 @@ fn card(
                 .color(state_color),
             );
         }
+        if session.state == AgentVisualState::Idle
+            && let Some(since) = idle_since.or(session.idle_since)
+        {
+            ui.label(
+                egui::RichText::new(catalog.t(
+                    "fleet.idle_for",
+                    &[("value", &crate::fleet::format_blocked_duration(now, since))],
+                ))
+                .small()
+                .color(state_color),
+            );
+        }
         ui.label(egui::RichText::new("·").small().weak());
         ui.add(
             egui::Label::new(egui::RichText::new(&session.workspace_name).small().weak())
@@ -1350,16 +1465,20 @@ fn card(
             );
         }
     });
-    // 3행: 대기 사유 우선, 없으면 에이전트 라인("Codex · gpt-5.5 · xhigh").
+    // 3~4행: 현재/마지막 작업을 최대 두 줄로 보여준다. 근거가 없으면 빈 프로젝트명이나
+    // 임의 터미널 출력으로 작업을 꾸미지 않고 명시적으로 기록 없음이라 한다.
+    content.add(egui::Label::new(task_galley));
+    // 4~5행: 대기 사유와 에이전트 모델. 둘 다 있으면 둘 다 보여준다.
     if let Some(message) = &session.waiting_message {
         content.add(
             egui::Label::new(egui::RichText::new(message).small().color(state_color)).truncate(),
         );
-    } else if let Some(line) = &session.agent_line {
+    }
+    if let Some(line) = &session.agent_line {
         content
             .add(egui::Label::new(egui::RichText::new(line).small().weak().monospace()).truncate());
     }
-    // 4행: 예약 칩. 「예약해뒀다」는 사실이 카드에 없으면 예약해둔 걸 잊는다 — 그러면
+    // 마지막 행: 예약 칩. 「예약해뒀다」는 사실이 카드에 없으면 예약해둔 걸 잊는다 — 그러면
     // 나중에 도착한 프롬프트가 내가 안 시킨 일처럼 보인다.
     if let Some(prompt) = &session.followup {
         content.add(
@@ -1525,12 +1644,144 @@ mod tests {
             title: format!("session-{session}"),
             state,
             agent_line: None,
+            task_line: None,
             waiting_message: None,
             active_workspace: true,
             blocked_since: None,
+            idle_since: None,
             last_output_at: None,
             followup: None,
         }
+    }
+
+    #[test]
+    fn idle_card_shows_how_long_it_has_awaited_an_instruction() {
+        use egui_kittest::kittest::Queryable;
+
+        let mut session = pty_session("ws", 7, AgentVisualState::Idle);
+        session.idle_since = Some(100);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(400.0, 200.0))
+            .build_ui(move |ui| {
+                let _ = card(ui, &session, &catalog(), 220, None);
+            });
+        harness.run();
+        harness.get_by_label("waiting 2:00");
+    }
+
+    #[test]
+    fn idle_card_does_not_treat_last_output_as_completion_time() {
+        use egui_kittest::kittest::Queryable;
+
+        let mut session = pty_session("ws", 7, AgentVisualState::Idle);
+        session.last_output_at = Some(100);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(400.0, 200.0))
+            .build_ui(move |ui| {
+                let _ = card(ui, &session, &catalog(), 220, None);
+            });
+        harness.run();
+        assert!(harness.query_by_label("waiting 2:00").is_none());
+    }
+
+    #[test]
+    fn card_uses_content_height_and_shows_two_task_rows() {
+        use egui_kittest::kittest::Queryable;
+
+        let empty = pty_session("ws", 10, AgentVisualState::Error);
+        let mut compact = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(400.0, 220.0))
+            .build_ui_state(
+                move |ui, measured: &mut f32| {
+                    let top = ui.cursor().top();
+                    let _ = card(ui, &empty, &catalog(), 220, None);
+                    *measured = ui.cursor().top() - top;
+                },
+                0.0,
+            );
+        compact.run();
+        assert!(
+            *compact.state() < 100.0,
+            "a three-row error card should not reserve the old 116px height"
+        );
+
+        let mut active = pty_session("ws", 11, AgentVisualState::Active);
+        active.task_line = Some("예약 트래픽을 불러와 서버 오류 원인을 추적하고 검증 결과를 정리하는 작업을 진행 중입니다".to_owned());
+        active.agent_line = Some("Claude · Opus 5.5 · xhigh".to_owned());
+        let mut expanded = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(400.0, 240.0))
+            .build_ui(move |ui| {
+                let _ = card(ui, &active, &catalog(), 220, None);
+            });
+        expanded.run();
+        let task = expanded.get_by_label_contains("Working on ·");
+        assert!(
+            task.rect().height() > 20.0,
+            "task must occupy two text rows"
+        );
+        assert!(task.rect().height() < 40.0, "task must stop after two rows");
+    }
+
+    #[test]
+    fn idle_clock_survives_repaints_and_resets_after_a_new_turn() {
+        let mut fleet = FleetUi::default();
+        let mut rows = [pty_session("ws", 7, AgentVisualState::Idle)];
+        fleet.update_idle_clocks(&rows, 100);
+        assert_eq!(fleet.idle_since(&rows[0]), Some(100));
+
+        fleet.update_idle_clocks(&rows, 160);
+        assert_eq!(fleet.idle_since(&rows[0]), Some(100));
+
+        rows[0].state = AgentVisualState::Active;
+        fleet.update_idle_clocks(&rows, 170);
+        rows[0].state = AgentVisualState::Idle;
+        fleet.update_idle_clocks(&rows, 200);
+        assert_eq!(fleet.idle_since(&rows[0]), Some(200));
+    }
+
+    #[test]
+    fn idle_without_completion_hook_starts_at_first_idle_observation() {
+        let mut fleet = FleetUi::default();
+        let mut rows = [pty_session("ws", 7, AgentVisualState::Idle)];
+        rows[0].last_output_at = Some(100);
+        fleet.update_idle_clocks(&rows, 1000);
+        assert_eq!(fleet.idle_since(&rows[0]), Some(1000));
+        fleet.update_idle_clocks(&rows, 1060);
+        assert_eq!(fleet.idle_since(&rows[0]), Some(1000));
+    }
+
+    #[test]
+    fn idle_clock_does_not_follow_a_replaced_pty_pane() {
+        let mut fleet = FleetUi::default();
+        let mut rows = [pty_session("ws", 7, AgentVisualState::Idle)];
+        fleet.update_idle_clocks(&rows, 100);
+        assert_eq!(fleet.idle_since(&rows[0]), Some(100));
+
+        rows[0].target = FleetTarget::Pty {
+            session: runtime::SessionId(7),
+            tab: runtime::MuxTabId("t1".into()),
+            pane: runtime::MuxPaneId("p2".into()),
+        };
+        rows[0].idle_since = None;
+        fleet.update_idle_clocks(&rows, 200);
+        assert_eq!(fleet.idle_since(&rows[0]), Some(200));
+    }
+
+    #[test]
+    fn finished_card_keeps_its_last_task_on_a_separate_line() {
+        use egui_kittest::kittest::Queryable;
+
+        let mut session = pty_session("ws", 8, AgentVisualState::Off);
+        session.agent_line = Some("Codex · gpt-6-sol".to_owned());
+        session.task_line = Some("Folder tree fix completed".to_owned());
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(400.0, 200.0))
+            .build_ui(move |ui| {
+                let _ = card(ui, &session, &catalog(), 220, None);
+            });
+        harness.run();
+        harness.get_by_label("Last update · Folder tree fix completed");
+        harness.get_by_label("Codex · gpt-6-sol");
     }
 
     /// 페이지를 한 번 그리고 결과를 돌려주는 최소 하네스. 클릭은 하지 않는다.

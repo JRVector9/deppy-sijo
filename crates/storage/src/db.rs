@@ -1289,6 +1289,14 @@ pub struct PersistedActivityPane {
     pub cwd: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CloudEndedSession {
+    pub id: String,
+    pub workspace_id: String,
+    pub workspace_name: String,
+    pub title: String,
+}
+
 /// Requested complete-or-error bounded projection returned after an [`AgentStateJob`] commits.
 /// Every included row is read from the same transaction snapshot, omitted sections are empty, and
 /// total retained heap bytes are capped globally.
@@ -6874,6 +6882,99 @@ impl Db {
                 },
             )?;
             let row = settings_workspace_projection_from_persisted(persisted)?;
+            anyhow::ensure!(
+                row.folder_anchor
+                    .is_none_or(|stored| stored == folder_anchor),
+                "workspace_path_anchor_conflict"
+            );
+            let anchor_claimed: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM workspaces
+                 WHERE path_dev = ?1 AND path_ino = ?2 AND id != ?3 LIMIT 1)",
+                (&folder_anchor.dev, &folder_anchor.ino, &row.id),
+                |row| row.get(0),
+            )?;
+            anyhow::ensure!(
+                !anchor_claimed,
+                if row.folder_anchor.is_none() {
+                    "workspace_path_anchor_conflict"
+                } else {
+                    "workspace_folder_anchor_duplicate"
+                }
+            );
+            if row.folder_anchor.is_none() {
+                let mut stored = settings_workspace_row_for_update(&tx, &row.id)?
+                    .context("settings_workspace_exact_path_missing")?;
+                stored.path_dev = Some(folder_anchor.dev);
+                stored.path_ino = Some(folder_anchor.ino);
+                settings_workspace_update_admission(&tx, &stored)?;
+                tx.execute(
+                    "UPDATE workspaces SET path_dev = ?2, path_ino = ?3,
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",
+                    (&row.id, folder_anchor.dev, folder_anchor.ino),
+                )?;
+            }
+            tx.commit()?;
+            return Ok(WorkspaceFindOrCreateResult {
+                row: SettingsWorkspaceProjectionRow {
+                    folder_anchor: Some(folder_anchor),
+                    ..row
+                },
+                created: false,
+            });
+        }
+
+        let anchor_probe = settings_read_probe(
+            &tx,
+            "SELECT COUNT(*), COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0)
+             FROM (
+                 SELECT length(CAST(id AS BLOB)) + length(CAST(name AS BLOB)) +
+                        length(CAST(path AS BLOB)) + length(CAST(created_at AS BLOB)) +
+                        length(CAST(COALESCE(path_dev, '') AS BLOB)) +
+                        length(CAST(COALESCE(path_ino, '') AS BLOB)) AS row_bytes
+                 FROM workspaces WHERE path_dev = ?1 AND path_ino = ?2
+                 ORDER BY created_at, id LIMIT 2
+             )",
+            (folder_anchor.dev, folder_anchor.ino),
+            2,
+            SETTINGS_SNAPSHOT_BYTES_MAX,
+            SETTINGS_ROW_BYTES_MAX,
+            "settings_workspace_folder_anchor",
+        )?;
+        anyhow::ensure!(anchor_probe.count < 2, "workspace_folder_anchor_duplicate");
+        if anchor_probe.count == 1 {
+            let existing_id: String = tx.query_row(
+                "SELECT id FROM workspaces WHERE path_dev = ?1 AND path_ino = ?2
+                 ORDER BY created_at, id LIMIT 1",
+                (folder_anchor.dev, folder_anchor.ino),
+                |row| row.get(0),
+            )?;
+            let mut stored = settings_workspace_row_for_update(&tx, &existing_id)?
+                .context("settings_workspace_folder_anchor_missing")?;
+            stored.path = path.to_owned();
+            settings_workspace_update_admission(&tx, &stored)?;
+            let affected = tx.execute(
+                "UPDATE workspaces SET path = ?2,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                 WHERE id = ?1 AND path_dev = ?3 AND path_ino = ?4",
+                (&existing_id, path, folder_anchor.dev, folder_anchor.ino),
+            )?;
+            anyhow::ensure!(affected == 1, "workspace_folder_anchor_rebind_failed");
+            let row = tx.query_row(
+                "SELECT id, name, path, created_at, path_dev, path_ino
+                 FROM workspaces WHERE id = ?1",
+                [&existing_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )?;
+            let row = settings_workspace_projection_from_persisted(row)?;
             tx.commit()?;
             return Ok(WorkspaceFindOrCreateResult {
                 row,
@@ -7092,6 +7193,60 @@ impl Db {
         }
         tx.commit()
             .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+        Ok(result)
+    }
+
+    /// Read-only history for the Cloud Agents settings screen. A closed pane is absent from
+    /// mux_panes, so activity-pane snapshots cannot represent its ended session. This query
+    /// never creates an MCP target or restores a session.
+    pub fn list_cloud_ended_sessions(&self) -> anyhow::Result<Vec<CloudEndedSession>> {
+        Self::read_cloud_ended_sessions(&self.conn)
+    }
+
+    /// The settings query runs off the UI thread with a read-only connection; opening this
+    /// history view must not rerun migrations or contend for a writer lock.
+    pub fn list_cloud_ended_sessions_from_path(
+        path: &Path,
+    ) -> anyhow::Result<Vec<CloudEndedSession>> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(std::time::Duration::from_secs(2))?;
+        Self::read_cloud_ended_sessions(&conn)
+    }
+
+    fn read_cloud_ended_sessions(conn: &Connection) -> anyhow::Result<Vec<CloudEndedSession>> {
+        const MAX_ROWS: usize = 32_768;
+        const MAX_BYTES: usize = 16 * 1024 * 1024;
+        let mut stmt = conn.prepare_cached(
+            "SELECT CASE WHEN length(CAST(sessions.id AS BLOB)) BETWEEN 1 AND 128
+                         THEN sessions.id END,
+                    CASE WHEN length(CAST(sessions.workspace_id AS BLOB)) BETWEEN 1 AND 128
+                         THEN sessions.workspace_id END,
+                    substr(workspaces.name, 1, 256), substr(sessions.title, 1, 256)
+               FROM sessions JOIN workspaces ON workspaces.id = sessions.workspace_id
+              WHERE sessions.status = 'exited'
+              ORDER BY sessions.rowid DESC
+              LIMIT 32769",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut result = Vec::new();
+        let mut retained = 0usize;
+        while let Some(row) = rows.next()? {
+            anyhow::ensure!(result.len() < MAX_ROWS, "cloud_ended_sessions_limit");
+            let id: String = row.get(0)?;
+            let workspace_id: String = row.get(1)?;
+            let workspace_name: String = row.get(2)?;
+            let title: String = row.get(3)?;
+            retained = retained
+                .checked_add(id.len() + workspace_id.len() + workspace_name.len() + title.len())
+                .ok_or_else(|| anyhow::anyhow!("cloud_ended_sessions_limit"))?;
+            anyhow::ensure!(retained <= MAX_BYTES, "cloud_ended_sessions_limit");
+            result.push(CloudEndedSession {
+                id,
+                workspace_id,
+                workspace_name,
+                title,
+            });
+        }
         Ok(result)
     }
 
@@ -13346,6 +13501,56 @@ mod tests {
     }
 
     #[test]
+    fn cloud_ended_sessions_include_closed_panes_and_exclude_running_sessions() {
+        let db = Db::open_in_memory().unwrap();
+        let ws = db.create_workspace("workspace").unwrap();
+        for (id, status) in [("closed-pane", "exited"), ("live-pane", "running")] {
+            db.conn
+                .execute(
+                    "INSERT INTO sessions
+                       (id, workspace_id, session_kind, agent_id, title, command, args_json,
+                        cwd, status, created_at, updated_at, last_log_offset)
+                     VALUES (?1, ?2, 'shell', NULL, ?1, 'sh', '[]', '/', ?3,
+                        '2026-01-01', '2026-01-01', 0)",
+                    (id, &ws, status),
+                )
+                .unwrap();
+        }
+
+        let rows = db.list_cloud_ended_sessions().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "closed-pane");
+        assert_eq!(rows[0].workspace_id, ws);
+    }
+
+    #[test]
+    fn cloud_ended_sessions_read_only_connection_reads_persisted_history() {
+        let dir =
+            std::env::temp_dir().join(format!("deppy-cloud-history-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.sqlite");
+        {
+            let db = Db::open(&path).unwrap();
+            let ws = db.create_workspace("history").unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO sessions
+                       (id, workspace_id, session_kind, agent_id, title, command, args_json,
+                        cwd, status, created_at, updated_at, last_log_offset)
+                     VALUES ('ended-id', ?1, 'shell', NULL, 'old task', 'sh', '[]', '/', 'exited',
+                        '2026-01-01', '2026-01-01', 0)",
+                    [&ws],
+                )
+                .unwrap();
+        }
+        let rows = Db::list_cloud_ended_sessions_from_path(&path).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].title, "old task");
+        assert_eq!(rows[0].workspace_name, "history");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn bounded_activity_panes는_exact_limit과_plus_one을_구분한다() {
         let db = Db::open_in_memory().unwrap();
         let workspace_id = seed_activity_panes(&db, 3, "saved shell");
@@ -17089,17 +17294,95 @@ mod tests {
         assert_eq!(created.row.folder_anchor, Some(anchor));
 
         let reused = db
-            .find_or_create_workspace_by_exact_path(
-                "ignored-new-name",
-                "/project",
-                WorkspaceFolderAnchor { dev: 33, ino: 44 },
-            )
+            .find_or_create_workspace_by_exact_path("ignored-new-name", "/project", anchor)
             .unwrap();
         assert!(!reused.created);
         assert_eq!(reused.row.id, created.row.id);
         assert_eq!(reused.row.name, "project");
         assert_eq!(reused.row.folder_anchor, Some(anchor));
         assert_eq!(db.list_workspaces().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn workspace_find_or_create_rejects_replaced_folder_at_existing_path() {
+        let db = Db::open_in_memory().unwrap();
+        let original = WorkspaceFolderAnchor { dev: 11, ino: 22 };
+        let created = db
+            .find_or_create_workspace_by_exact_path("original", "/project", original)
+            .unwrap();
+        let error = db
+            .find_or_create_workspace_by_exact_path(
+                "replacement",
+                "/project",
+                WorkspaceFolderAnchor { dev: 33, ino: 44 },
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("workspace_path_anchor_conflict"));
+        let stored = db.list_workspaces().unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].id, created.row.id);
+    }
+
+    #[test]
+    fn workspace_find_or_create_rebinds_same_folder_from_alias_path() {
+        let db = Db::open_in_memory().unwrap();
+        let anchor = WorkspaceFolderAnchor { dev: 11, ino: 22 };
+        let created = db
+            .find_or_create_workspace_by_exact_path("project", "/alias/project", anchor)
+            .unwrap();
+        let rebound = db
+            .find_or_create_workspace_by_exact_path("ignored", "/real/project", anchor)
+            .unwrap();
+        assert!(!rebound.created);
+        assert_eq!(rebound.row.id, created.row.id);
+        assert_eq!(rebound.row.path, "/real/project");
+        assert_eq!(db.list_workspaces().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn workspace_find_or_create_does_not_claim_legacy_path_owned_by_another_anchor_row() {
+        let db = Db::open_in_memory().unwrap();
+        let anchor = WorkspaceFolderAnchor { dev: 11, ino: 22 };
+        let known = db
+            .find_or_create_workspace_by_exact_path("known", "/alias/project", anchor)
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO workspaces (id, name, path, created_at, updated_at)
+             VALUES ('legacy', 'legacy', '/real/project', '', '')",
+                [],
+            )
+            .unwrap();
+        let error = db
+            .find_or_create_workspace_by_exact_path("ignored", "/real/project", anchor)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("workspace_path_anchor_conflict"));
+        assert_eq!(
+            db.list_workspaces()
+                .unwrap()
+                .into_iter()
+                .find(|row| row.id == known.row.id)
+                .unwrap()
+                .path,
+            "/alias/project"
+        );
+    }
+
+    #[test]
+    fn workspace_find_or_create_rejects_ambiguous_duplicate_folder_anchor() {
+        let db = Db::open_in_memory().unwrap();
+        let anchor = WorkspaceFolderAnchor { dev: 11, ino: 22 };
+        db.find_or_create_workspace_by_exact_path("project", "/project", anchor)
+            .unwrap();
+        db.conn.execute(
+            "INSERT INTO workspaces (id, name, path, created_at, updated_at, path_dev, path_ino)
+             VALUES ('alias', 'alias', '/alias/project', '', '', 11, 22)",
+            [],
+        ).unwrap();
+        let error = db
+            .find_or_create_workspace_by_exact_path("ignored", "/project", anchor)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("workspace_folder_anchor_duplicate"));
     }
 
     #[test]
@@ -22998,7 +23281,11 @@ mod tests {
         assert!(!existing.created);
         assert_eq!(existing.row.id, "write-workspace-0000");
         let error = db
-            .find_or_create_workspace_by_exact_path("new", "/new", anchor)
+            .find_or_create_workspace_by_exact_path(
+                "new",
+                "/new",
+                WorkspaceFolderAnchor { dev: 7, ino: 10 },
+            )
             .unwrap_err();
 
         assert_static_settings_error(error, "settings_workspace_write_item_limit");

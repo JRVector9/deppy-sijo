@@ -76,14 +76,15 @@ impl CloudAgent {
             }
         });
         if let (Some(s), Some(endpoint)) = (&self.server, self.endpoint()) {
-            let local = format!("http://{}/mcp", s.addr);
             ui.horizontal(|ui| {
                 ui.monospace(&endpoint);
                 if ui.button(catalog.t("cloud.copy_url", &[])).clicked() {
                     ui.ctx().copy_text(endpoint);
                 }
             });
-            ui.label(egui::RichText::new(local).weak());
+            if !self.automatic {
+                ui.label(egui::RichText::new(format!("http://{}/mcp", s.addr)).weak());
+            }
             ui.label(
                 catalog.t(
                     "cloud.expiry",
@@ -188,6 +189,41 @@ impl CloudAgent {
                 });
             });
         }
+        ui.add_space(8.0);
+        ui.heading(catalog.t("cloud.ended_history", &[]));
+        ui.label(catalog.t("cloud.ended_history_hint", &[]));
+        if self.ended_load_failed {
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                catalog.t("cloud.ended_history_error", &[]),
+            );
+        }
+        let historical = self.historical_rows();
+        if historical.is_empty() && self.ended_rx.is_some() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(catalog.t("cloud.ended_history_loading", &[]));
+            });
+        } else if historical.is_empty() && !self.ended_load_failed {
+            ui.weak(catalog.t("cloud.ended_history_empty", &[]));
+        }
+        egui::ScrollArea::vertical()
+            .id_salt("cloud-ended-sessions")
+            .max_height(240.0)
+            .show_rows(ui, 24.0, historical.len(), |ui, range| {
+                for row in &historical[range] {
+                    ui.add(
+                        egui::Label::new(format!(
+                            "{} · {} · {}",
+                            row.workspace_name,
+                            row.title,
+                            catalog.t("cloud.ended_history_status", &[])
+                        ))
+                        .truncate(),
+                    )
+                    .on_hover_text(&row.id);
+                }
+            });
         ui.separator();
         if ui
             .button(catalog.t("cloud.copy_instruction", &[]))
@@ -289,6 +325,29 @@ mod tests {
         assert!(harness.query_by_label("workspace · 배포 셸 / 셸").is_some());
     }
     #[test]
+    fn closed_session_history_is_visible_without_share_controls() {
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        let mut bridge = CloudAgent::memory();
+        bridge.ended_sessions.push(storage::CloudEndedSession {
+            id: "closed-session".into(),
+            workspace_id: "workspace-id".into(),
+            workspace_name: "디자인".into(),
+            title: "이전 작업".into(),
+        });
+        let harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1400.0, 900.0))
+            .build_ui_state(
+                move |ui, state: &mut CloudAgent| state.contents(ui, &catalog),
+                bridge,
+            );
+        assert!(
+            harness
+                .query_by_label("디자인 · 이전 작업 · 종료됨 · 공유 불가")
+                .is_some()
+        );
+        assert!(harness.query_by_label("읽기 · 답변 수신").is_none());
+    }
+    #[test]
     fn automatic_connection_is_default_and_manual_host_is_advanced() {
         let catalog = i18n::Catalog::load("ko-KR").unwrap();
         let bridge = CloudAgent::memory();
@@ -303,6 +362,28 @@ mod tests {
         harness.get_by_label("고정 주소 직접 연결").click();
         harness.run();
         assert!(harness.query_by_label("공개 HTTPS 호스트").is_some());
+    }
+    #[test]
+    fn automatic_connection_shows_public_url_without_local_loopback_url() {
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        let mut bridge = CloudAgent::memory();
+        bridge.server =
+            Some(agent_mcp::Server::start(0, "ready.trycloudflare.com", || {}).unwrap());
+        let local = format!("http://{}/mcp", bridge.server.as_ref().unwrap().addr);
+        bridge.generated_hostname = Some("ready.trycloudflare.com".into());
+        bridge.connection = super::super::Connection::Ready;
+        let harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1400.0, 900.0))
+            .build_ui_state(
+                move |ui, state: &mut CloudAgent| state.contents(ui, &catalog),
+                bridge,
+            );
+        assert!(
+            harness
+                .query_by_label("https://ready.trycloudflare.com/mcp")
+                .is_some()
+        );
+        assert!(harness.query_by_label(&local).is_none());
     }
     #[test]
     fn answer_navigation_scrolls_once_and_allows_collapsing_and_reopening() {

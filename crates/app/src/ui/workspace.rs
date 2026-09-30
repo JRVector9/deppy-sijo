@@ -4853,6 +4853,21 @@ impl WorkspaceUi {
         self.agent_info.get(&session).map(agent_info_line)
     }
 
+    /// Fleet 카드용 한 줄 작업 설명. `agent_info`는 warm 전환 뒤에도 마지막
+    /// transcript 설명을 보존하므로 완료/종료 카드에도 새 파일 I/O 없이 쓸 수 있다.
+    pub fn agent_task_line_for(
+        &self,
+        session: SessionId,
+        state: crate::agent_surface::AgentVisualState,
+    ) -> Option<String> {
+        let display = self.agent_info.get(&session)?;
+        crate::fleet::task_preview(
+            state,
+            display.user_instruction.as_deref(),
+            display.last_agent_summary.as_deref(),
+        )
+    }
+
     /// 비활성(warm) 워크스페이스의 접힌 행 상태 집계용 마지막 감지값.
     /// 활성 워크스페이스는 `session_entries`가 hook/transcript까지 병합한 값을 사용한다.
     pub fn last_session_status(&self, session: SessionId) -> Option<SessionStatus> {

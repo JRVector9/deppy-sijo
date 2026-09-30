@@ -37,6 +37,15 @@
   runtime wire, database schema, or MCP protocol versioning, and do not grant
   permission to launch or restart the app.
 
+## Popup design and reuse
+
+- Before adding or changing a modal, read `docs/design/popup-components.md` and
+  its linked HTML case inventory. Reuse `crates/app/src/ui/popup/` for the shell,
+  fields, notices, and footer; keep dialog state and operations in the caller.
+- Update the design document and the matching numbered HTML case as part of a
+  popup migration. The AI session launcher and native OS windows retain their
+  dedicated UI.
+
 ## Terminal diagnostic output
 
 When a final agent response contains two or more independently actionable

@@ -16,11 +16,9 @@ pub(crate) const fn status_text_color(state: AgentVisualState) -> egui::Color32 
 pub(crate) const fn status_color(state: AgentVisualState) -> egui::Color32 {
     match state {
         AgentVisualState::Off => egui::Color32::from_rgb(0x8b, 0x94, 0x9e),
-        // Idle은 원래 #f2f4f7(L 96%)로 6개 중 **가장 밝았다** — 아무 일도 안 하는 세션의
-        // 레일이 화면에서 가장 강한 신호가 돼, 세션이 많을수록 유휴 레일이 화면을
-        // 지배했다(2026-08-07 사용자). Off(L 58%)보다는 밝아 "살아있음"이 보이되
-        // Active(L 67%) 아래로 내려 신호를 가리지 않게 한다.
-        AgentVisualState::Idle => egui::Color32::from_rgb(0xa1, 0xa8, 0xb0),
+        // 지시 대기는 살아 있는 세션이다. Off와 비슷한 회색이면 끝난 작업으로
+        // 오인되므로, 작업 중 파랑보다 절제된 청록색으로 구분한다.
+        AgentVisualState::Idle => egui::Color32::from_rgb(0x54, 0xb3, 0xa8),
         AgentVisualState::Active => egui::Color32::from_rgb(0x58, 0xa6, 0xff),
         AgentVisualState::Waiting | AgentVisualState::NeedsResponse => {
             egui::Color32::from_rgb(0xff, 0xbf, 0x69)
@@ -35,6 +33,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn awaiting_instruction_uses_a_live_teal_rail_distinct_from_off() {
+        let idle = status_color(AgentVisualState::Idle);
+        let off = status_color(AgentVisualState::Off);
+        assert_ne!(idle, off);
+        assert!(idle.g() > idle.r() && idle.g() > idle.b());
+    }
+
+    #[test]
     fn agent_palette_matches_the_workspace_contract() {
         let cases = [
             (
@@ -43,7 +49,7 @@ mod tests {
             ),
             (
                 AgentVisualState::Idle,
-                egui::Color32::from_rgb(0xa1, 0xa8, 0xb0),
+                egui::Color32::from_rgb(0x54, 0xb3, 0xa8),
             ),
             (
                 AgentVisualState::Active,

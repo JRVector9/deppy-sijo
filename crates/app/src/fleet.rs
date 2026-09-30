@@ -91,6 +91,8 @@ pub struct FleetSession {
     pub state: AgentVisualState,
     /// 에이전트 2행 "Codex · gpt-5.5 · xhigh" 또는 "[APP] Codex · …".
     pub agent_line: Option<String>,
+    /// 현재 작업 또는 끝난 작업의 마지막 응답. 한 줄·160자 이하로 제한한다.
+    pub task_line: Option<String>,
     /// hook이 보고한 대기 사유(needs-input 메시지). Waiting 상태에서만 대개 Some.
     pub waiting_message: Option<String>,
     /// active 워크스페이스의 세션인지(그 외는 warm — 물러났지만 워커는 실행 중).
@@ -98,6 +100,8 @@ pub struct FleetSession {
     /// **나를 막기 시작한 시각**(unix 초). Waiting에서만 Some이고, 이 값이 곧 정렬 키다.
     /// 화면에 그대로 보여줘 "왜 이게 위에 있나"를 설명할 필요가 없게 한다.
     pub blocked_since: Option<i64>,
+    /// 지시 대기가 시작된 시각(unix 초). hook 완료 시각이 있으면 그 값을 쓴다.
+    pub idle_since: Option<i64>,
     /// 마지막으로 새 출력이 온 시각(unix 초). 구조화(App Server) 세션은 PTY 스냅샷이
     /// 없어 항상 None이다 — 그 묶음에는 「출력 없음」을 표시하지 않는다.
     pub last_output_at: Option<i64>,
@@ -235,11 +239,75 @@ pub fn session_group(state: AgentVisualState) -> SessionGroup {
     }
 }
 
+/// 카드의 한 줄 작업 설명. 진행 중에는 최신 사용자 지시를 우선하고, 턴이
+/// 끝난 뒤에는 마지막 에이전트 응답을 우선해 결과가 사라지지 않게 한다.
+pub fn task_preview(
+    state: AgentVisualState,
+    instruction: Option<&str>,
+    agent_summary: Option<&str>,
+) -> Option<String> {
+    let order = if matches!(
+        state,
+        AgentVisualState::Active | AgentVisualState::Waiting | AgentVisualState::NeedsResponse
+    ) {
+        [instruction, agent_summary]
+    } else {
+        [agent_summary, instruction]
+    };
+    let source = order
+        .into_iter()
+        .flatten()
+        .find(|text| text.chars().any(|ch| !ch.is_whitespace()))?;
+    let mut preview = String::with_capacity(164);
+    let mut count = 0;
+    for word in source.split_whitespace() {
+        if count > 0 {
+            if count == 160 {
+                preview.push('…');
+                return Some(preview);
+            }
+            preview.push(' ');
+            count += 1;
+        }
+        for ch in word.chars() {
+            if count == 160 {
+                preview.push('…');
+                return Some(preview);
+            }
+            preview.push(ch);
+            count += 1;
+        }
+    }
+    Some(preview)
+}
+
+/// A borrowed ordering for painting; session titles and task text stay in their source vector.
+pub fn group_session_refs(sessions: &[FleetSession]) -> [Vec<&FleetSession>; 4] {
+    let mut groups: [Vec<&FleetSession>; 4] = Default::default();
+    for session in sessions {
+        let slot = SessionGroup::ORDER
+            .iter()
+            .position(|group| *group == session_group(session.state))
+            .expect("ORDER는 모든 묶음을 담는다");
+        groups[slot].push(session);
+    }
+    for group in &mut groups {
+        group.sort_by(|a, b| {
+            a.workspace_name
+                .cmp(&b.workspace_name)
+                .then_with(|| a.title.cmp(&b.title))
+        });
+    }
+    groups[0].sort_by_key(|s| s.blocked_since.unwrap_or(i64::MAX));
+    groups
+}
+
 /// 묶음별로 나누고 각 묶음 안을 정렬한다.
 ///
 /// 막힌 묶음만 **오래 막힌 순(FIFO)** 이다 — 굶는 항목이 없고, 정렬 키(막힌 시각)가
 /// 화면에 그대로 보여 순서가 자명하다. 나머지는 기존대로 워크스페이스명→제목.
 /// `blocked_since`가 없는 대기 세션(막 감지된 직후)은 맨 뒤로 보낸다.
+#[cfg(test)]
 pub fn group_sessions(sessions: Vec<FleetSession>) -> [Vec<FleetSession>; 4] {
     let mut groups: [Vec<FleetSession>; 4] = Default::default();
     for session in sessions {
@@ -275,6 +343,30 @@ pub fn format_blocked_duration(now: i64, since: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn running_card_names_the_current_user_task() {
+        assert_eq!(
+            task_preview(
+                AgentVisualState::Active,
+                Some("  Fix the folder tree\nthen review  "),
+                Some("Old answer from a previous turn"),
+            ),
+            Some("Fix the folder tree then review".to_owned())
+        );
+    }
+
+    #[test]
+    fn finished_card_retains_the_last_agent_update() {
+        assert_eq!(
+            task_preview(
+                AgentVisualState::Off,
+                Some("Fix the folder tree"),
+                Some("  Folder tree fix completed\nTests passed  "),
+            ),
+            Some("Folder tree fix completed Tests passed".to_owned())
+        );
+    }
 
     #[test]
     fn nav_summary_상태별_집계와_우선순위() {
@@ -358,9 +450,11 @@ mod tests {
             title: title.into(),
             state,
             agent_line: None,
+            task_line: None,
             waiting_message: None,
             active_workspace: true,
             blocked_since: None,
+            idle_since: None,
             last_output_at: None,
             followup: None,
         }

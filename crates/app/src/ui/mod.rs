@@ -28,6 +28,7 @@ pub mod inbox_waiting;
 pub mod markdown_viewer;
 pub mod notes;
 pub mod notifications;
+pub mod popup;
 pub(crate) mod ports;
 pub mod prompt_palette;
 pub(crate) mod resource_manager;

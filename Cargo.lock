@@ -160,7 +160,7 @@ dependencies = [
 
 [[package]]
 name = "agent-mcp"
-version = "0.2.5"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -534,7 +534,7 @@ dependencies = [
 
 [[package]]
 name = "audit"
-version = "0.2.5"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "chacha20poly1305",
@@ -549,7 +549,7 @@ dependencies = [
 
 [[package]]
 name = "auth"
-version = "0.2.5"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "oauth2",
@@ -921,14 +921,14 @@ dependencies = [
 
 [[package]]
 name = "connector-contract"
-version = "0.2.5"
+version = "0.4.4"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "connector-service"
-version = "0.2.5"
+version = "0.4.4"
 dependencies = [
  "audit",
  "auth",
@@ -940,7 +940,7 @@ dependencies = [
 
 [[package]]
 name = "connector-ui"
-version = "0.2.5"
+version = "0.4.4"
 dependencies = [
  "connector-contract",
  "egui",
@@ -1133,7 +1133,7 @@ checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 
 [[package]]
 name = "deppy-core"
-version = "0.2.5"
+version = "0.4.4"
 dependencies = [
  "serde",
  "uuid",
@@ -1141,7 +1141,7 @@ dependencies = [
 
 [[package]]
 name = "deppy-sijo"
-version = "0.2.5"
+version = "0.4.4"
 dependencies = [
  "agent-mcp",
  "anyhow",
@@ -2205,7 +2205,7 @@ dependencies = [
 
 [[package]]
 name = "http-client"
-version = "0.2.5"
+version = "0.4.4"
 dependencies = [
  "ureq",
 ]
@@ -2229,7 +2229,7 @@ dependencies = [
 
 [[package]]
 name = "i18n"
-version = "0.2.5"
+version = "0.4.4"
 dependencies = [
  "anyhow",
 ]
@@ -2747,7 +2747,7 @@ dependencies = [
 
 [[package]]
 name = "mcp"
-version = "0.2.5"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "deppy-core",
@@ -2763,7 +2763,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-proxy"
-version = "0.2.5"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "audit",
@@ -2784,7 +2784,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-store"
-version = "0.2.5"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "deppy-core",
@@ -2903,7 +2903,7 @@ dependencies = [
 
 [[package]]
 name = "mux"
-version = "0.2.5"
+version = "0.4.4"
 dependencies = [
  "deppy-core",
  "serde",
@@ -3575,7 +3575,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "persist"
-version = "0.2.5"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "deppy-core",
@@ -3692,7 +3692,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "platform"
-version = "0.2.5"
+version = "0.4.4"
 dependencies = [
  "notify-rust",
  "tracing",
@@ -3911,7 +3911,7 @@ checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
 
 [[package]]
 name = "pty"
-version = "0.2.5"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "libc",
@@ -4155,11 +4155,11 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "relay-protocol"
-version = "0.2.5"
+version = "0.4.4"
 
 [[package]]
 name = "relay-server"
-version = "0.2.5"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "libc",
@@ -4239,7 +4239,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.2.5"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "deppy-core",
@@ -4425,7 +4425,7 @@ dependencies = [
 
 [[package]]
 name = "secret"
-version = "0.2.5"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",
@@ -4569,7 +4569,7 @@ dependencies = [
 
 [[package]]
 name = "session"
-version = "0.2.5"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "deppy-core",
@@ -4850,7 +4850,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "storage"
-version = "0.2.5"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "audit",
@@ -4872,7 +4872,7 @@ dependencies = [
 
 [[package]]
 name = "storage-core"
-version = "0.2.5"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "rusqlite",
@@ -4958,7 +4958,7 @@ dependencies = [
 
 [[package]]
 name = "terminal"
-version = "0.2.5"
+version = "0.4.4"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -5684,7 +5684,7 @@ dependencies = [
 
 [[package]]
 name = "web-remote"
-version = "0.2.5"
+version = "0.4.4"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -6597,7 +6597,7 @@ checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
 
 [[package]]
 name = "xtask"
-version = "0.2.5"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "quote",

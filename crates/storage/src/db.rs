@@ -6882,6 +6882,99 @@ impl Db {
                 },
             )?;
             let row = settings_workspace_projection_from_persisted(persisted)?;
+            anyhow::ensure!(
+                row.folder_anchor
+                    .is_none_or(|stored| stored == folder_anchor),
+                "workspace_path_anchor_conflict"
+            );
+            let anchor_claimed: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM workspaces
+                 WHERE path_dev = ?1 AND path_ino = ?2 AND id != ?3 LIMIT 1)",
+                (&folder_anchor.dev, &folder_anchor.ino, &row.id),
+                |row| row.get(0),
+            )?;
+            anyhow::ensure!(
+                !anchor_claimed,
+                if row.folder_anchor.is_none() {
+                    "workspace_path_anchor_conflict"
+                } else {
+                    "workspace_folder_anchor_duplicate"
+                }
+            );
+            if row.folder_anchor.is_none() {
+                let mut stored = settings_workspace_row_for_update(&tx, &row.id)?
+                    .context("settings_workspace_exact_path_missing")?;
+                stored.path_dev = Some(folder_anchor.dev);
+                stored.path_ino = Some(folder_anchor.ino);
+                settings_workspace_update_admission(&tx, &stored)?;
+                tx.execute(
+                    "UPDATE workspaces SET path_dev = ?2, path_ino = ?3,
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",
+                    (&row.id, folder_anchor.dev, folder_anchor.ino),
+                )?;
+            }
+            tx.commit()?;
+            return Ok(WorkspaceFindOrCreateResult {
+                row: SettingsWorkspaceProjectionRow {
+                    folder_anchor: Some(folder_anchor),
+                    ..row
+                },
+                created: false,
+            });
+        }
+
+        let anchor_probe = settings_read_probe(
+            &tx,
+            "SELECT COUNT(*), COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0)
+             FROM (
+                 SELECT length(CAST(id AS BLOB)) + length(CAST(name AS BLOB)) +
+                        length(CAST(path AS BLOB)) + length(CAST(created_at AS BLOB)) +
+                        length(CAST(COALESCE(path_dev, '') AS BLOB)) +
+                        length(CAST(COALESCE(path_ino, '') AS BLOB)) AS row_bytes
+                 FROM workspaces WHERE path_dev = ?1 AND path_ino = ?2
+                 ORDER BY created_at, id LIMIT 2
+             )",
+            (folder_anchor.dev, folder_anchor.ino),
+            2,
+            SETTINGS_SNAPSHOT_BYTES_MAX,
+            SETTINGS_ROW_BYTES_MAX,
+            "settings_workspace_folder_anchor",
+        )?;
+        anyhow::ensure!(anchor_probe.count < 2, "workspace_folder_anchor_duplicate");
+        if anchor_probe.count == 1 {
+            let existing_id: String = tx.query_row(
+                "SELECT id FROM workspaces WHERE path_dev = ?1 AND path_ino = ?2
+                 ORDER BY created_at, id LIMIT 1",
+                (folder_anchor.dev, folder_anchor.ino),
+                |row| row.get(0),
+            )?;
+            let mut stored = settings_workspace_row_for_update(&tx, &existing_id)?
+                .context("settings_workspace_folder_anchor_missing")?;
+            stored.path = path.to_owned();
+            settings_workspace_update_admission(&tx, &stored)?;
+            let affected = tx.execute(
+                "UPDATE workspaces SET path = ?2,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                 WHERE id = ?1 AND path_dev = ?3 AND path_ino = ?4",
+                (&existing_id, path, folder_anchor.dev, folder_anchor.ino),
+            )?;
+            anyhow::ensure!(affected == 1, "workspace_folder_anchor_rebind_failed");
+            let row = tx.query_row(
+                "SELECT id, name, path, created_at, path_dev, path_ino
+                 FROM workspaces WHERE id = ?1",
+                [&existing_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )?;
+            let row = settings_workspace_projection_from_persisted(row)?;
             tx.commit()?;
             return Ok(WorkspaceFindOrCreateResult {
                 row,
@@ -17201,17 +17294,95 @@ mod tests {
         assert_eq!(created.row.folder_anchor, Some(anchor));
 
         let reused = db
-            .find_or_create_workspace_by_exact_path(
-                "ignored-new-name",
-                "/project",
-                WorkspaceFolderAnchor { dev: 33, ino: 44 },
-            )
+            .find_or_create_workspace_by_exact_path("ignored-new-name", "/project", anchor)
             .unwrap();
         assert!(!reused.created);
         assert_eq!(reused.row.id, created.row.id);
         assert_eq!(reused.row.name, "project");
         assert_eq!(reused.row.folder_anchor, Some(anchor));
         assert_eq!(db.list_workspaces().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn workspace_find_or_create_rejects_replaced_folder_at_existing_path() {
+        let db = Db::open_in_memory().unwrap();
+        let original = WorkspaceFolderAnchor { dev: 11, ino: 22 };
+        let created = db
+            .find_or_create_workspace_by_exact_path("original", "/project", original)
+            .unwrap();
+        let error = db
+            .find_or_create_workspace_by_exact_path(
+                "replacement",
+                "/project",
+                WorkspaceFolderAnchor { dev: 33, ino: 44 },
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("workspace_path_anchor_conflict"));
+        let stored = db.list_workspaces().unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].id, created.row.id);
+    }
+
+    #[test]
+    fn workspace_find_or_create_rebinds_same_folder_from_alias_path() {
+        let db = Db::open_in_memory().unwrap();
+        let anchor = WorkspaceFolderAnchor { dev: 11, ino: 22 };
+        let created = db
+            .find_or_create_workspace_by_exact_path("project", "/alias/project", anchor)
+            .unwrap();
+        let rebound = db
+            .find_or_create_workspace_by_exact_path("ignored", "/real/project", anchor)
+            .unwrap();
+        assert!(!rebound.created);
+        assert_eq!(rebound.row.id, created.row.id);
+        assert_eq!(rebound.row.path, "/real/project");
+        assert_eq!(db.list_workspaces().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn workspace_find_or_create_does_not_claim_legacy_path_owned_by_another_anchor_row() {
+        let db = Db::open_in_memory().unwrap();
+        let anchor = WorkspaceFolderAnchor { dev: 11, ino: 22 };
+        let known = db
+            .find_or_create_workspace_by_exact_path("known", "/alias/project", anchor)
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO workspaces (id, name, path, created_at, updated_at)
+             VALUES ('legacy', 'legacy', '/real/project', '', '')",
+                [],
+            )
+            .unwrap();
+        let error = db
+            .find_or_create_workspace_by_exact_path("ignored", "/real/project", anchor)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("workspace_path_anchor_conflict"));
+        assert_eq!(
+            db.list_workspaces()
+                .unwrap()
+                .into_iter()
+                .find(|row| row.id == known.row.id)
+                .unwrap()
+                .path,
+            "/alias/project"
+        );
+    }
+
+    #[test]
+    fn workspace_find_or_create_rejects_ambiguous_duplicate_folder_anchor() {
+        let db = Db::open_in_memory().unwrap();
+        let anchor = WorkspaceFolderAnchor { dev: 11, ino: 22 };
+        db.find_or_create_workspace_by_exact_path("project", "/project", anchor)
+            .unwrap();
+        db.conn.execute(
+            "INSERT INTO workspaces (id, name, path, created_at, updated_at, path_dev, path_ino)
+             VALUES ('alias', 'alias', '/alias/project', '', '', 11, 22)",
+            [],
+        ).unwrap();
+        let error = db
+            .find_or_create_workspace_by_exact_path("ignored", "/project", anchor)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("workspace_folder_anchor_duplicate"));
     }
 
     #[test]
@@ -23110,7 +23281,11 @@ mod tests {
         assert!(!existing.created);
         assert_eq!(existing.row.id, "write-workspace-0000");
         let error = db
-            .find_or_create_workspace_by_exact_path("new", "/new", anchor)
+            .find_or_create_workspace_by_exact_path(
+                "new",
+                "/new",
+                WorkspaceFolderAnchor { dev: 7, ino: 10 },
+            )
             .unwrap_err();
 
         assert_static_settings_error(error, "settings_workspace_write_item_limit");

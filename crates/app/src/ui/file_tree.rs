@@ -2834,6 +2834,7 @@ impl FileTreeUi {
 
         let mut create_folder = false;
         let mut create_file = false;
+        let status_busy = self.in_flight > 0;
         let status_listing = matches!(
             self.pending_maintenance,
             Some(PendingFileTreeMaintenance::Listing { .. })
@@ -2908,7 +2909,9 @@ impl FileTreeUi {
                 FileToolbarIcon::Refresh,
                 false,
             )
-            .on_hover_text(if status_listing {
+            .on_hover_text(if status_busy {
+                catalog.t("file_tree.file_operation_running", &[])
+            } else if status_listing {
                 catalog.t("file_tree.listing_folders", &[])
             } else {
                 refresh_label
@@ -2965,6 +2968,22 @@ impl FileTreeUi {
             separator_y,
             crate::ui::designall::separator_stroke(ui.visuals()),
         );
+        if status_busy {
+            // 작업이 시작·종료될 때 목록 위에 행을 끼우면 스크롤 기준과 모든 파일 행이
+            // 한 프레임씩 아래·위로 움직인다. 고정 헤더의 점은 그 높이를 바꾸지 않는다.
+            let center = egui::pos2(header_rect.right() - 7.0, header_rect.top() + 5.0);
+            let badge = ui.interact(
+                egui::Rect::from_center_size(center, egui::vec2(8.0, 8.0)),
+                egui::Id::new("file_tree_busy_indicator"),
+                egui::Sense::hover(),
+            );
+            let running = catalog.t("file_tree.file_operation_running", &[]);
+            badge
+                .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &running));
+            badge.on_hover_text(running);
+            ui.painter()
+                .circle_filled(center, 2.5, ui.visuals().warn_fg_color);
+        }
 
         // 메모 탭은 파일 트리 대신 본문을 통째로 쓴다. 여기서 반환하므로 아래
         // 파일 트리·에러 표시는 그리지 않는다 — 파일 오류는 「파일」 탭으로 돌아오면
@@ -3113,68 +3132,104 @@ impl FileTreeUi {
         let mut edit_done: Option<bool> = None; // Some(true)=커밋, Some(false)=취소
         let mut menu_action: Option<MenuAction> = None;
 
-        // 새 폴더 인라인 편집기 (헤더 아래 고정 행 — 가상화 행높이를 흔들지 않는다)
-        if let Some(EditState::NewFolder {
-            parent,
-            buffer,
-            focus,
-        }) = &mut edit
-        {
-            ui.horizontal(|ui| {
-                ui.label(catalog.t("file_tree.new_folder_label", &[]));
-                let resp = ui.add(
-                    egui::TextEdit::singleline(buffer)
-                        .hint_text(catalog.t("common.name", &[]))
-                        .desired_width(120.0),
-                );
-                if *focus {
-                    resp.request_focus(); // §9-8 — 키가 터미널로 새지 않게 즉시 포커스
-                    *focus = false;
-                }
-                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if ui.small_button(catalog.t("action.new", &[])).clicked() || enter {
-                    edit_done = Some(true);
-                } else if ui.small_button(catalog.t("action.cancel", &[])).clicked()
-                    || ui.input(|i| i.key_pressed(egui::Key::Escape))
-                {
-                    edit_done = Some(false);
-                }
-            });
-            ui.weak(catalog.t(
+        // 생성 폼은 overlay 모달에 그린다. 목록 앞에 행을 끼우면 새 폴더/파일을
+        // 누르는 즉시 모든 파일 행과 스크롤 기준이 40px씩 이동한다.
+        let creation_edit = match &mut edit {
+            Some(EditState::NewFolder {
+                parent,
+                buffer,
+                focus,
+            }) => Some((true, parent, buffer, focus)),
+            Some(EditState::NewFile {
+                parent,
+                buffer,
+                focus,
+            }) => Some((false, parent, buffer, focus)),
+            _ => None,
+        };
+        if let Some((is_folder, parent, buffer, focus)) = creation_edit {
+            let title = catalog.t(
+                if is_folder {
+                    "file_tree.new_folder"
+                } else {
+                    "file_tree.new_file"
+                },
+                &[],
+            );
+            let subtitle = catalog.t(
+                if is_folder {
+                    "file_tree.create_folder_subtitle"
+                } else {
+                    "file_tree.create_file_subtitle"
+                },
+                &[],
+            );
+            let field_label = catalog.t(
+                if is_folder {
+                    "file_tree.folder_name"
+                } else {
+                    "file_tree.file_name"
+                },
+                &[],
+            );
+            let location = catalog.t(
                 "file_tree.location",
                 &[("path", &super::path_display(parent))],
-            ));
-        }
-        if let Some(EditState::NewFile {
-            parent,
-            buffer,
-            focus,
-        }) = &mut edit
-        {
-            ui.horizontal(|ui| {
-                ui.label(catalog.t("file_tree.new_file_label", &[]));
-                let resp = ui.add(
-                    egui::TextEdit::singleline(buffer)
-                        .hint_text(catalog.t("common.name", &[]))
-                        .desired_width(150.0),
-                );
-                if *focus {
-                    resp.request_focus();
-                    *focus = false;
-                }
-                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if ui.small_button(catalog.t("action.new", &[])).clicked() || enter {
-                    edit_done = Some(true);
-                } else if ui.small_button(catalog.t("action.cancel", &[])).clicked()
-                    || ui.input(|i| i.key_pressed(egui::Key::Escape))
-                {
-                    edit_done = Some(false);
-                }
-            });
-            ui.weak(catalog.t(
-                "file_tree.location",
-                &[("path", &super::path_display(parent))],
-            ));
+            );
+            let mut enter = false;
+            let modal = crate::ui::popup::show(
+                ui.ctx(),
+                crate::ui::popup::PopupSpec {
+                    id: egui::Id::new("file_tree_create"),
+                    width: 420.0,
+                    title: &title,
+                    subtitle: &subtitle,
+                    close_label: &catalog.t("action.close", &[]),
+                    close_enabled: true,
+                },
+                |ui| {
+                    crate::ui::popup::body(ui, |ui| {
+                        crate::ui::popup::field(ui, &field_label, Some(&location), |ui| {
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(buffer)
+                                    .desired_width(ui.available_width()),
+                            );
+                            if *focus {
+                                resp.request_focus(); // 키가 터미널로 새지 않게 즉시 포커스
+                                *focus = false;
+                            }
+                            enter = (resp.has_focus() || resp.lost_focus())
+                                && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        });
+                    });
+                    crate::ui::popup::footer(ui, |ui| {
+                        if crate::ui::popup::action_button(
+                            ui,
+                            &catalog.t("action.new", &[]),
+                            crate::ui::popup::ActionTone::Primary,
+                            true,
+                        )
+                        .clicked()
+                            || enter
+                        {
+                            edit_done = Some(true);
+                        }
+                        if crate::ui::popup::action_button(
+                            ui,
+                            &catalog.t("action.cancel", &[]),
+                            crate::ui::popup::ActionTone::Secondary,
+                            true,
+                        )
+                        .clicked()
+                        {
+                            edit_done = Some(false);
+                        }
+                    });
+                },
+            );
+            if modal && edit_done.is_none() {
+                edit_done = Some(false);
+            }
         }
 
         // 헤더 우클릭도 더보기와 같은 생성 위치를 사용한다.
@@ -3191,22 +3246,18 @@ impl FileTreeUi {
 
         // ── 목록 전체를 설명하는 상태 표시 ──
         //
-        // **셋 다 스크롤 영역보다 먼저 그린다.** 아래 `ScrollArea`는
+        // 오류와 영구삭제 확인은 스크롤 영역보다 먼저 그린다. 아래 `ScrollArea`는
         // `auto_shrink([false,false])`라 남은 높이를 전부 가져가므로, 그 뒤에 놓인
         // 위젯은 패널 바닥 밖으로 밀려 잘린다 — 700px 패널에서 실측하면 영구삭제
-        // 확인 문구가 y=695/버튼이 y=728, 오류 라벨이 y=717.5, 진행 문구가 y=696.5로
-        // 모두 화면 밖이었다. 무엇이 실패했는지도, 무엇을 지우는지도, 지금 뭘 하고
-        // 있는지도 보이지 않았다(§조용한 실패 금지).
+        // 확인 문구가 y=695/버튼이 y=728, 오류 라벨이 y=717.5로 화면 밖이었다.
+        // 무엇이 실패했는지, 무엇을 지우는지 보이지 않았다(§조용한 실패 금지).
         //
-        // 쌓는 순서는 오류(왜 멈췄나) → 영구삭제 확인(그래서 뭘 고를까) → 진행
-        // 표시(지금 뭘 하고 있나)다. 셋은 동시에 뜰 수 있고(휴지통 실패 직후 다른
-        // 파일 조작을 걸면 그렇다) 이 순서면 원인 → 선택 → 현재로 읽힌다. 진행
-        // 표시는 자기가 바꾸는 목록 바로 위에 붙는다.
+        // 진행 표시는 높이가 고정된 헤더에 그려 작업 시작·종료 때 파일 행이
+        // 움직이지 않는다. 오류와 영구삭제 확인은 이 아래에 차례로 쌓인다.
         //
         // 그리고 나서 바뀐 상태는 이번 프레임에 실을 수 없으므로 아래에서 한 프레임을
         // 더 요청한다(`status_*` 스냅샷).
         let status_error = self.error.clone();
-        let status_busy = self.in_flight > 0;
         if let Some(err) = status_error.clone() {
             ui.horizontal(|ui| {
                 ui.colored_label(ui.visuals().error_fg_color, err);
@@ -3217,13 +3268,6 @@ impl FileTreeUi {
         }
         // 휴지통 실패 → 영구삭제 확인 (§9-7 — 조용한 영구삭제 금지).
         self.permanent_delete_confirm(ui, catalog);
-        if status_busy {
-            ui.horizontal(|ui| {
-                ui.add(egui::Spinner::new().size(12.0));
-                ui.weak(catalog.t("file_tree.file_operation_running", &[]));
-            });
-        }
-
         // 가상화: 고정 행높이 + path 기반 explicit Id (§9-6).
         // 행높이는 실측 자기보정 — 선언값과 실제가 어긋나면 클릭 대상이 밀린다(필드 주석).
         let row_height = self.measured_row_height.unwrap_or(25.0);
@@ -12815,7 +12859,7 @@ mod tests {
         std::fs::remove_dir_all(&base).unwrap();
     }
 
-    /// 회귀: IO 오류 라벨과 진행 스피너가 패널 밖으로 밀려 보이지 않던 것.
+    /// 회귀: IO 오류 라벨과 진행 표시가 패널 밖으로 밀려 보이지 않던 것.
     ///
     /// 목록 `ScrollArea`는 `auto_shrink([false,false])`라 남은 높이를 전부 가져간다 —
     /// 그 **뒤에** 그린 상태 표시는 패널 바닥 밖으로 나간다. 420×700 패널에서 실측하면
@@ -12823,8 +12867,8 @@ mod tests {
     /// 넘어 잘렸다. 파일 조작이 실패해도 오래 걸려도 화면에는 아무 표시가 없었다
     /// (§조용한 실패 금지).
     ///
-    /// 오류·영구삭제 확인·진행 표시는 동시에 뜰 수 있으므로 셋이 헤더 아래에
-    /// 겹치지 않고 순서대로 쌓이는 것까지 함께 고정한다.
+    /// 오류·영구삭제 확인·진행 표시는 동시에 뜰 수 있다. 진행 점은 높이가
+    /// 고정된 헤더에, 나머지 둘은 목록 위에 그려 겹침과 행 위치 이동을 막는다.
     #[test]
     fn kittest_오류와_진행표시는_패널_안에_쌓인다() {
         use egui_kittest::kittest::Queryable as _;
@@ -12891,7 +12935,7 @@ mod tests {
             .copy_files_to_clipboard(&[base.join("src/mod.rs")]);
         assert!(
             harness.state().0.in_flight > 0,
-            "진행 중 상태를 만들지 못해 스피너 배치를 검증할 수 없다"
+            "진행 중 상태를 만들지 못해 헤더 표시를 검증할 수 없다"
         );
         harness.step();
 
@@ -12922,14 +12966,14 @@ mod tests {
             "진행 표시가 패널(700px) 밖으로 밀렸다: {running_rect:?}"
         );
 
-        // 셋이 겹치지 않고 오류 → 영구삭제 확인 → 진행 표시 순으로 쌓인다.
+        // 고정 헤더의 진행 표시 → 오류 → 영구삭제 확인 순으로 겹치지 않는다.
         assert!(
             error_rect.bottom() <= prompt_rect.top(),
             "오류와 영구삭제 확인이 겹친다: 오류={error_rect:?} 문구={prompt_rect:?}"
         );
         assert!(
-            prompt_rect.bottom() <= running_rect.top(),
-            "영구삭제 확인과 진행 표시가 겹친다: 문구={prompt_rect:?} 진행={running_rect:?}"
+            running_rect.bottom() <= error_rect.top(),
+            "헤더 진행 표시와 오류가 겹친다: 진행={running_rect:?} 오류={error_rect:?}"
         );
 
         std::fs::remove_dir_all(&base).unwrap();
@@ -14261,6 +14305,159 @@ mod tests {
                 },
                 (tree, Vec::new()),
             )
+    }
+
+    #[test]
+    fn kittest_파일작업_진행중에도_트리_행위치는_유지된다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.root = Some(PathBuf::from("/tree-layout"));
+        tree.children = Some(vec![file("anchor.txt")]);
+        tree.rebuild_flat();
+        let mut harness = drop_harness(&catalog, tree);
+        harness.run();
+        harness.run();
+        let before = harness.get_by_label("anchor.txt").rect().top();
+
+        harness.state_mut().0.in_flight = 1;
+        harness.step();
+        let during = harness.get_by_label("anchor.txt").rect().top();
+        assert!(
+            (during - before).abs() < 0.5,
+            "폴더 이동·생성 IO 상태가 목록을 아래로 밀었다: {before} -> {during}"
+        );
+    }
+
+    #[test]
+    fn kittest_새폴더_이름입력중에도_트리_행위치는_유지된다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let root = PathBuf::from("/tree-layout");
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.root = Some(root.clone());
+        tree.children = Some(vec![file("anchor.txt")]);
+        tree.rebuild_flat();
+        let mut harness = drop_harness(&catalog, tree);
+        harness.run();
+        harness.run();
+        let before = harness.get_by_label("anchor.txt").rect().top();
+
+        harness.state_mut().0.edit = Some(EditState::NewFolder {
+            parent: root,
+            buffer: String::new(),
+            focus: false,
+        });
+        harness.run();
+        let during = harness.get_by_label("anchor.txt").rect().top();
+        assert!(
+            (during - before).abs() < 0.5,
+            "새 폴더 입력 폼이 목록을 아래로 밀었다: {before} -> {during}"
+        );
+    }
+
+    #[test]
+    fn kittest_새파일_이름입력중에도_트리_행위치는_유지된다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let root = PathBuf::from("/tree-layout");
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.root = Some(root.clone());
+        tree.children = Some(vec![file("anchor.txt")]);
+        tree.rebuild_flat();
+        let mut harness = drop_harness(&catalog, tree);
+        harness.run();
+        harness.run();
+        let before = harness.get_by_label("anchor.txt").rect().top();
+
+        harness.state_mut().0.edit = Some(EditState::NewFile {
+            parent: root,
+            buffer: String::new(),
+            focus: false,
+        });
+        harness.run();
+        let during = harness.get_by_label("anchor.txt").rect().top();
+        assert!(
+            (during - before).abs() < 0.5,
+            "새 파일 입력 폼이 목록을 아래로 밀었다: {before} -> {during}"
+        );
+    }
+
+    #[test]
+    fn kittest_새폴더와_새파일은_같은_너비의_입력_모달을_사용한다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        let root = PathBuf::from("/tree-layout");
+        for is_folder in [true, false] {
+            let mut tree = FileTreeUi::new(egui::Context::default());
+            tree.root = Some(root.clone());
+            tree.edit = Some(if is_folder {
+                EditState::NewFolder {
+                    parent: root.clone(),
+                    buffer: String::new(),
+                    focus: false,
+                }
+            } else {
+                EditState::NewFile {
+                    parent: root.clone(),
+                    buffer: String::new(),
+                    focus: false,
+                }
+            });
+            let mut harness = drop_harness(&catalog, tree);
+            harness.run();
+            harness.run();
+            let rect = harness
+                .ctx
+                .memory(|memory| memory.area_rect(egui::Id::new("file_tree_create")))
+                .expect("create modal should be visible");
+            assert!(rect.width() >= 375.0, "create dialog too narrow: {rect:?}");
+            harness.get_by_label(if is_folder {
+                "Folder name"
+            } else {
+                "File name"
+            });
+        }
+    }
+
+    #[test]
+    fn kittest_새폴더_모달_enter가_생성요청을_낸다() {
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let root = PathBuf::from("/tree-layout");
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.root = Some(root.clone());
+        tree.children = Some(vec![file("anchor.txt")]);
+        tree.rebuild_flat();
+        tree.edit = Some(EditState::NewFolder {
+            parent: root.clone(),
+            buffer: "draft".to_owned(),
+            focus: true,
+        });
+        let mut harness = drop_harness(&catalog, tree);
+        harness.run();
+        harness.run();
+        harness.event(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        harness.step();
+        let intent = harness
+            .state_mut()
+            .0
+            .take_io_intent()
+            .expect("Enter should submit the create-folder modal");
+        assert!(matches!(
+            intent.request,
+            FileTreeIoRequest::CreateDirectory { parent, name }
+                if parent.as_path() == root && name == "draft"
+        ));
     }
 
     /// Finder → 트리 OS 드롭은 포인터 밑 폴더를 대상으로 bounded host intent를 낸다.

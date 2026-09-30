@@ -1,0 +1,384 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Deppy Sijo · 공용 팝업 컴포넌트 시안</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0f1115;
+      --surface: #181b20;
+      --raised: #21242c;
+      --hover: #292e38;
+      --line: #32363e;
+      --text: #d5d8dd;
+      --muted: #8a8f99;
+      --accent: #39b7d0;
+      --accent-low: #153440;
+      --danger: #ff7373;
+      --danger-low: #3c2529;
+      --success: #51ceb0;
+      --radius: 3px;
+      --font: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Noto Sans KR", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; min-height: 100%; }
+    body { background: var(--bg); color: var(--text); font: 13px/1.45 var(--font); }
+    button, input, textarea, select { font: inherit; }
+    button { cursor: pointer; }
+    button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible {
+      outline: 2px solid var(--accent); outline-offset: 2px;
+    }
+    .app { min-height: 100vh; display: grid; grid-template-columns: 232px minmax(540px, 1fr) 280px; }
+    .rail { position: sticky; top: 0; height: 100vh; min-height: 0; display: flex; flex-direction: column; padding: 22px 15px; background: var(--surface); border-right: 1px solid var(--line); }
+    .brand { display: flex; align-items: center; gap: 10px; padding: 0 10px 23px; font-size: 15px; font-weight: 700; }
+    .brand-mark { width: 20px; height: 20px; display: grid; place-items: center; color: var(--bg); background: var(--accent); border-radius: 3px; font-weight: 900; }
+    .rail-label, .eyebrow { color: var(--muted); font-size: 11px; font-weight: 650; letter-spacing: .07em; text-transform: uppercase; }
+    .rail-label { padding: 0 10px 9px; }
+    .rail-list { min-height: 0; overflow: auto; padding-right: 2px; scrollbar-color: var(--line) transparent; }
+    .group-title { margin: 18px 10px 5px; color: var(--muted); font-size: 10px; font-weight: 700; letter-spacing: .09em; text-transform: uppercase; }
+    .example { display: flex; align-items: center; gap: 9px; width: 100%; min-height: 38px; margin: 3px 0; padding: 8px 10px; border: 1px solid transparent; border-radius: var(--radius); background: transparent; color: var(--muted); text-align: left; }
+    .example:hover { color: var(--text); background: var(--raised); }
+    .example.active { color: var(--text); border-color: #315666; background: var(--accent-low); }
+    .case-number { flex: none; min-width: 23px; color: var(--muted); font: 11px Menlo, Monaco, monospace; }
+    .example.active .case-number { color: var(--accent); }
+    .example svg { width: 16px; height: 16px; flex: none; }
+    .rail-note { margin: 22px 10px 0; padding-top: 15px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; line-height: 1.6; }
+    main { min-width: 0; display: flex; flex-direction: column; }
+    .topbar { height: 60px; padding: 12px 28px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line); background: var(--surface); }
+    .topbar h1 { margin: 1px 0 0; font-size: 16px; font-weight: 650; letter-spacing: -.02em; }
+    .pill { padding: 5px 9px; border: 1px solid var(--line); border-radius: 20px; color: var(--muted); font-size: 11px; }
+    .topbar-actions { display: flex; align-items: center; gap: 9px; }
+    .preview { position: relative; flex: 1; min-height: 630px; overflow: hidden; background: radial-gradient(circle at 50% 30%, #20252e 0, var(--bg) 65%); }
+    .fake-ui { padding: 32px; opacity: .56; }
+    .fake-ui h2 { margin: 0 0 18px; font-size: 18px; font-weight: 550; }
+    .fake-cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 9px; max-width: 1000px; }
+    .fake-card { min-height: 100px; padding: 13px 15px; border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 4px; background: var(--raised); }
+    .fake-card span { display: block; margin-top: 12px; color: var(--muted); font-size: 12px; }
+    .overlay { position: absolute; inset: 0; display: grid; place-items: center; padding: 26px; background: rgba(8, 10, 13, .71); }
+    .overlay.hidden { display: none; }
+    .overlay.popover-mode { place-items: start end; padding: 78px 46px; background: rgba(8, 10, 13, .18); }
+    .overlay.menu-mode .modal-head, .overlay.menu-mode .modal-footer { display: none; }
+    .overlay.menu-mode .modal-body { padding: 6px; }
+    .overlay.menu-mode .menu { width: 100%; padding: 0; border: 0; background: transparent; box-shadow: none; }
+    .modal { width: min(var(--modal-width, 480px), 100%); max-height: min(720px, calc(100vh - 105px)); display: flex; flex-direction: column; border: 1px solid #4a505b; border-radius: var(--radius); background: var(--surface); box-shadow: 0 24px 70px rgba(0,0,0,.52), 0 2px 10px rgba(0,0,0,.35); }
+    .modal-head { position: relative; padding: 19px 22px 16px; border-bottom: 1px solid var(--line); }
+    .modal-head h2 { margin: 0; padding-right: 28px; font-size: 18px; line-height: 1.3; font-weight: 650; letter-spacing: -.025em; }
+    .modal-head p { margin: 7px 22px 0 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
+    .icon-button { position: absolute; top: 15px; right: 16px; width: 30px; height: 30px; display: grid; place-items: center; border: 1px solid transparent; border-radius: var(--radius); background: transparent; color: var(--muted); }
+    .icon-button:hover { border-color: var(--line); background: var(--raised); color: var(--text); }
+    .modal-body { padding: 18px 22px 21px; overflow: auto; }
+    .modal-footer { display: flex; align-items: center; justify-content: flex-end; gap: 8px; padding: 12px 22px; border-top: 1px solid var(--line); background: #1b1e24; }
+    .modal-footer .footnote { margin-right: auto; color: var(--muted); font-size: 11px; }
+    .btn { min-height: 34px; padding: 6px 13px; border: 1px solid var(--line); border-radius: var(--radius); color: var(--text); background: var(--raised); white-space: nowrap; }
+    .btn:hover { background: var(--hover); }
+    .btn.primary { border-color: var(--accent); background: var(--accent); color: #0d1c21; font-weight: 700; }
+    .btn.primary:hover { background: #62c9dd; }
+    .btn.danger { border-color: var(--danger); background: var(--danger); color: #241215; font-weight: 700; }
+    .btn.danger:hover { background: #ff9999; }
+    .btn.ghost { border-color: transparent; background: transparent; color: var(--muted); }
+    .btn.ghost:hover { background: var(--raised); color: var(--text); }
+    .field { margin-bottom: 16px; }
+    .field:last-child { margin-bottom: 0; }
+    .field label, .group-label { display: block; margin-bottom: 7px; color: var(--text); font-size: 12px; font-weight: 600; }
+    .field input, .field textarea, .field select { width: 100%; min-height: 36px; padding: 8px 10px; border: 1px solid #454b55; border-radius: var(--radius); background: var(--bg); color: var(--text); }
+    .field textarea { min-height: 84px; resize: vertical; }
+    .field input::placeholder, .field textarea::placeholder { color: #69717c; }
+    .field-hint { margin-top: 6px; color: var(--muted); font-size: 11px; }
+    .field-row { display: flex; gap: 7px; }
+    .field-row input { flex: 1; min-width: 0; }
+    .field-row .btn { flex: none; }
+    .segmented { display: grid; grid-template-columns: 1fr 1fr; gap: 3px; margin-bottom: 17px; padding: 3px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--bg); }
+    .segmented button { min-height: 31px; border: 1px solid transparent; border-radius: 2px; background: transparent; color: var(--muted); }
+    .segmented button[aria-pressed="true"] { border-color: var(--line); background: var(--raised); color: var(--text); }
+    .notice { display: flex; gap: 9px; align-items: flex-start; margin-top: 16px; padding: 11px 12px; border: 1px solid #315666; border-radius: var(--radius); background: var(--accent-low); color: #bce7ee; font-size: 12px; line-height: 1.5; }
+    .notice.danger-note { border-color: #79464b; background: var(--danger-low); color: #ffc8c8; }
+    .notice .symbol { font-size: 15px; line-height: 1; }
+    .inline-path { padding: 10px 11px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--bg); font: 11px/1.5 Menlo, Monaco, monospace; color: #b7bcc5; word-break: break-all; }
+    .check-row { display: flex; align-items: flex-start; gap: 10px; padding: 12px 0; border-top: 1px solid var(--line); }
+    .check-row input { margin: 3px 0 0; accent-color: var(--accent); }
+    .check-row strong { display: block; font-size: 12px; font-weight: 600; }
+    .check-row span { display: block; color: var(--muted); font-size: 11px; }
+    .menu { width: 252px; padding: 5px; border: 1px solid #4a505b; border-radius: var(--radius); background: var(--surface); box-shadow: 0 16px 44px rgba(0,0,0,.48); }
+    .menu-item { width: 100%; min-height: 34px; display: flex; align-items: center; gap: 10px; padding: 6px 9px; border: 0; border-radius: 2px; color: var(--text); background: transparent; text-align: left; }
+    .menu-item:hover, .menu-item:focus-visible { outline: none; background: var(--hover); }
+    .menu-item .shortcut { margin-left: auto; color: var(--muted); font-size: 11px; }
+    .menu-item.red { color: var(--danger); }
+    .menu-rule { height: 1px; margin: 5px 4px; background: var(--line); }
+    .closed { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); text-align: center; color: var(--muted); }
+    .closed .btn { margin-top: 12px; }
+    .inspector { padding: 22px 20px; border-left: 1px solid var(--line); background: var(--surface); }
+    .inspector h2 { margin: 4px 0 8px; font-size: 16px; }
+    .inspector p { margin: 0 0 18px; color: var(--muted); font-size: 12px; line-height: 1.55; }
+    .spec { display: grid; grid-template-columns: 1fr auto; gap: 8px; padding: 9px 0; border-bottom: 1px solid var(--line); font-size: 12px; }
+    .spec span:first-child { color: var(--muted); }
+    .spec code { color: var(--text); font: 11px Menlo, Monaco, monospace; }
+    .inspector h3 { margin: 24px 0 10px; font-size: 12px; }
+    .current-source { margin-top: 18px; padding: 12px; border: 1px solid var(--line); background: var(--raised); font-size: 12px; }
+    .current-source strong { display: block; margin-bottom: 5px; }
+    .current-source code { display: block; margin-top: 7px; overflow-wrap: anywhere; color: var(--muted); font: 10px/1.5 Menlo, Monaco, monospace; }
+    .part { padding: 8px 0; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 12px; }
+    .part code { display: block; color: var(--text); font: 11px/1.6 Menlo, Monaco, monospace; }
+    .toast { position: absolute; left: 50%; bottom: 24px; transform: translateX(-50%); padding: 9px 14px; border: 1px solid var(--line); background: var(--raised); color: var(--text); box-shadow: 0 6px 20px #0008; opacity: 0; pointer-events: none; transition: opacity .2s; }
+    .toast.visible { opacity: 1; }
+    .inventory { padding: 26px 28px 42px; border-top: 1px solid var(--line); background: var(--bg); }
+    .inventory h2 { margin: 0 0 6px; font-size: 17px; }
+    .inventory > p { max-width: 800px; margin: 0 0 17px; color: var(--muted); font-size: 12px; }
+    .inventory table { width: 100%; border-collapse: collapse; text-align: left; font-size: 12px; }
+    .inventory th, .inventory td { padding: 9px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+    .inventory th { position: sticky; top: 0; color: var(--muted); background: var(--surface); font-size: 11px; }
+    .inventory td code { color: var(--muted); font: 10px/1.5 Menlo, Monaco, monospace; overflow-wrap: anywhere; }
+    .inventory .case-link { padding: 0; border: 0; color: var(--accent); background: transparent; text-align: left; }
+    .inventory .case-link:hover { text-decoration: underline; }
+    .inventory-wrap { max-height: 460px; overflow: auto; border: 1px solid var(--line); }
+    .case-count { margin-left: 8px; color: var(--accent); font-size: 12px; }
+    .case-type { color: var(--muted); white-space: nowrap; }
+    .case-index { color: var(--muted); font: 11px Menlo, Monaco, monospace; }
+    @media (max-width: 1120px) { .app { grid-template-columns: 210px minmax(0,1fr); } .inspector { display: none; } }
+    @media (max-width: 720px) { .app { display: block; } .rail { position: static; height: auto; display: block; padding: 7px; border-right: 0; border-bottom: 1px solid var(--line); } .rail-list { display: flex; gap: 5px; overflow-x: auto; } .group-title, .brand, .rail-label, .rail-note { display: none; } .example { width: auto; flex: none; white-space: nowrap; } .topbar { padding: 12px 16px; } .preview { min-height: calc(100vh - 112px); } .fake-cards { grid-template-columns: 1fr 1fr; } .overlay { padding: 12px; } .modal { width: 100%; max-height: calc(100vh - 145px); } .inventory { padding: 20px 14px; } }
+    @media (prefers-reduced-motion: reduce) { .toast { transition: none; } }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside class="rail" aria-label="팝업 예시 선택">
+      <div class="brand"><span class="brand-mark">D</span>Deppy Sijo</div>
+      <div class="rail-label">실제 코드에서 찾은 화면</div>
+      <div class="rail-list" id="case-nav"></div>
+      <div class="rail-note">왼쪽 사례를 눌러 구조를 비교하세요. 번호는 아래 전체 목록과 같습니다.</div>
+    </aside>
+    <main>
+      <header class="topbar"><div><div class="eyebrow">Shared component proposal</div><h1>팝업 구성 시안</h1></div><div class="topbar-actions"><span class="pill">기존 다크 테마 기준</span><button class="btn" id="show-inventory" type="button">전체 목록 ↓</button></div></header>
+      <section class="preview" aria-label="앱 안에서 보는 팝업 예시">
+        <div class="fake-ui"><h2>작업 <span style="color:var(--muted);font-size:12px">진행 중 2</span></h2><div class="fake-cards"><div class="fake-card">Serenity<span>지시 대기 · Codex</span></div><div class="fake-card">Serenity<span>작업 중 · Claude · Opus 5.5</span></div><div class="fake-card">nomorevibe<span>오류 · 마지막 작업 기록</span></div></div></div>
+        <div class="overlay" id="overlay"><div class="modal" id="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title"><div class="modal-head"><h2 id="modal-title"></h2><p id="modal-subtitle"></p><button class="icon-button" id="close" type="button" aria-label="팝업 닫기">✕</button></div><div class="modal-body" id="modal-body"></div><div class="modal-footer" id="modal-footer"></div></div></div>
+        <div class="closed" id="closed" hidden>팝업을 닫았습니다.<br><button class="btn" id="reopen" type="button">다시 열기</button></div>
+        <div class="toast" id="toast" role="status" aria-live="polite"></div>
+      </section>
+      <section class="inventory" id="inventory"><h2>현재 코드의 팝업·확인·별도 창 목록 <span class="case-count" id="case-count"></span></h2><p>각 행의 ‘현재 방식’은 실제 앱 코드를 기준으로 적었습니다. 보통의 휴지통 이동에는 별도 확인창이 없고, 실패 후 영구 삭제할 때만 패널 안에서 확인합니다.</p><div class="inventory-wrap"><table><thead><tr><th>번호</th><th>영역</th><th>케이스</th><th>현재 방식</th><th>코드 위치</th></tr></thead><tbody id="case-rows"></tbody></table></div></section>
+    </main>
+    <aside class="inspector" aria-label="컴포넌트 규칙"><div class="eyebrow">Component contract</div><h2>하나의 팝업 언어</h2><p>새 기능마다 창의 폭, 글자 크기, 버튼 위치를 새로 정하지 않도록 기본값을 묶습니다.</p>
+      <div class="spec"><span>기본 폭</span><code>480 px</code></div><div class="spec"><span>짧은 확인</span><code>400 px</code></div><div class="spec"><span>긴 양식</span><code>560 px</code></div><div class="spec"><span>제목 / 본문</span><code>18 / 13 px</code></div><div class="spec"><span>레이블 / 안내</span><code>12 / 11 px</code></div><div class="spec"><span>본문 여백</span><code>22 px</code></div><div class="spec"><span>입력 / 버튼 높이</span><code>36 / 34 px</code></div><div class="spec"><span>메뉴 행</span><code>34 px</code></div><div class="spec"><span>키보드</span><code>Tab · Enter · Esc</code></div>
+      <h3>재사용 단위</h3><div class="part"><code>PopupShell + PopupHeader</code>제목, 설명, 닫기, 크기, 배경</div><div class="part"><code>FieldRow + SegmentedChoice</code>레이블, 입력, 오류, 선택</div><div class="part"><code>ActionFooter + InlineNotice</code>취소/확인 위치, 상태 안내</div><div class="part"><code>ContextMenu + Popover</code>메뉴 행, 단축키, 앵커 위치</div><div class="current-source" id="current-source" aria-live="polite"></div>
+    </aside>
+  </div>
+  <script>
+    const views = {
+      workspace: { width: 560, title: '워크스페이스 추가', subtitle: '기존 폴더를 선택하거나 GitHub 저장소를 이 Mac에 복제합니다.', body: `<div class="segmented" aria-label="추가 방식"><button type="button" data-source="local" aria-pressed="false">내 폴더</button><button type="button" data-source="github" aria-pressed="true">GitHub 저장소</button></div><div data-source-fields="local" hidden><div class="field"><label for="local-path">프로젝트 폴더</label><div class="field-row"><input id="local-path" value="/Users/jr/Projects/Serenity" readonly><button class="btn" type="button" data-toast="Finder 폴더 선택기가 열리는 자리입니다.">찾아보기…</button></div><div class="field-hint">선택한 폴더를 그대로 워크스페이스로 엽니다.</div></div></div><div data-source-fields="github"><div class="field"><label for="repo">저장소 URL</label><input id="repo" placeholder="https://github.com/owner/repo" value="https://github.com/example/serenity"><div class="field-hint">지원 형식: GitHub HTTPS 또는 SSH 주소</div></div><div class="field"><label for="destination">저장 위치</label><div class="field-row"><input id="destination" value="/Users/jr/Projects" readonly><button class="btn" type="button" data-toast="폴더 선택기가 열리는 자리입니다.">찾아보기…</button></div></div><div class="field"><label for="folder">폴더 이름</label><input id="folder" value="serenity"></div><div class="notice"><span class="symbol">ⓘ</span><span>저장소를 로컬에 복제한 뒤, 해당 폴더를 워크스페이스로 엽니다.</span></div></div>`, footer: `<span class="footnote">Esc 닫기 · Enter 실행</span><button class="btn ghost" type="button" data-close>취소</button><button class="btn primary" type="button" data-toast="복제 작업이 시작되는 자리입니다.">복제하고 열기</button>` },
+      folder: { width: 420, title: '새 폴더 만들기', subtitle: '현재 폴더 안에 새 폴더를 만듭니다.', body: `<div class="field"><label for="new-folder">폴더 이름</label><input id="new-folder" value="새 폴더" autofocus><div class="field-hint">Serenity / assets</div></div>`, footer: `<span class="footnote">Enter 만들기</span><button class="btn ghost" type="button" data-close>취소</button><button class="btn primary" type="button" data-toast="새 폴더가 만들어지는 자리입니다.">만들기</button>` },
+      followup: { width: 480, title: '다음 단계 예약', subtitle: '이 턴이 끝나면 선택한 에이전트에게 이어서 보냅니다.', body: `<div class="field"><label for="target">대상 세션</label><select id="target"><option>Serenity / Claude · Opus 5.5</option></select></div><div class="field"><label for="prompt">다음에 시킬 일</label><textarea id="prompt" placeholder="예: 서버 오류를 수정한 뒤 관련 테스트를 실행해줘"></textarea><div class="field-hint">에이전트가 질문으로 멈춘 경우에는 보내지 않고 기다립니다.</div></div>`, footer: `<span class="footnote">입력은 이 세션에만 예약됩니다.</span><button class="btn ghost" type="button" data-close>취소</button><button class="btn primary" type="button" data-toast="다음 단계가 예약되는 자리입니다.">예약</button>` },
+      delete: { width: 400, title: '영구 삭제 확인', subtitle: '휴지통으로 이동하지 못한 항목에만 표시됩니다.', body: `<div class="inline-path">Serenity / assets / old-icons</div><div class="notice danger-note"><span class="symbol">!</span><span>이 폴더와 안의 모든 항목을 영구 삭제합니다. 휴지통에서 되돌릴 수 없습니다.</span></div>`, footer: `<button class="btn ghost" type="button" data-close>취소</button><button class="btn danger" type="button" data-toast="영구 삭제 요청을 보내는 자리입니다.">영구 삭제</button>` },
+      menu: { width: 350, title: '파일 트리 상황 메뉴', subtitle: '우클릭과 더보기 버튼이 같은 메뉴 행을 사용합니다.', body: `<div class="group-label">파일 트리</div><div class="menu" role="menu"><button class="menu-item" role="menuitem" type="button" data-toast="복사 명령"><span>복사</span><span class="shortcut">⌘ C</span></button><button class="menu-item" role="menuitem" type="button" data-toast="붙여넣기 명령"><span>붙여넣기</span><span class="shortcut">⌘ V</span></button><button class="menu-item" role="menuitem" type="button" data-toast="Finder에서 보기"><span>Finder에서 보기</span></button><div class="menu-rule"></div><button class="menu-item red" role="menuitem" type="button" data-toast="휴지통 이동 요청을 보내는 자리입니다."><span>휴지통으로 이동</span><span class="shortcut">⌘ ⌫</span></button></div><div class="field-hint" style="margin:10px">휴지통 이동은 바로 요청합니다. 실패 후 영구 삭제만 따로 확인합니다.</div>`, footer: '', presentation: 'menu' }
+    };
+    const buttons = (label, tone = 'primary') => `<button class="btn ghost" type="button" data-close>취소</button><button class="btn ${tone}" type="button" data-toast="${label} 동작을 시연합니다.">${label}</button>`;
+    const confirm = (title, subtitle, detail, accept, tone = 'danger') => ({ width: 400, title, subtitle, body: `<div class="notice ${tone === 'danger' ? 'danger-note' : ''}"><span class="symbol">${tone === 'danger' ? '!' : 'ⓘ'}</span><span>${detail}</span></div>`, footer: buttons(accept, tone) });
+    const info = (title, subtitle, detail) => ({ width: 420, title, subtitle, body: `<div class="notice"><span class="symbol">ⓘ</span><span>${detail}</span></div>`, footer: `<button class="btn primary" type="button" data-close>확인</button>` });
+    Object.assign(views, {
+      file: { width: 420, title: '새 파일 만들기', subtitle: '현재 폴더 안에 새 파일을 만듭니다.', body: `<div class="field"><label for="new-file">파일 이름</label><input id="new-file" value="notes.md"><div class="field-hint">Serenity / docs</div></div>`, footer: buttons('만들기') },
+      session_close: confirm('실행 중인 세션 닫기', 'Serenity / 셀 2 · Claude Code', '이 셀의 실행 중인 세션이 종료됩니다. 계속할까요?', '세션 닫기'),
+      workspace_close: confirm('워크스페이스 종료', 'Serenity · 세션 3개 중 실행 중 2개', '세션 3개를 모두 종료합니다. 워크스페이스 자체는 삭제되지 않습니다. 이 확인은 설정에서 켰을 때 표시됩니다.', '모두 종료'),
+      env_project_close: confirm('환경 및 API 프로젝트 닫기', 'Serenity 프로젝트를 목록에서 닫습니다.', '사이드바 워크스페이스와 실행 중인 세션은 유지됩니다.', '목록에서 닫기', 'primary'),
+      rename_workspace: { width: 420, title: '워크스페이스 이름 바꾸기', subtitle: '표시 이름만 바꿉니다. 실제 폴더 경로는 유지됩니다.', body: `<div class="field"><label for="alias">표시 이름</label><input id="alias" value="Serenity"><div class="field-hint">원래 폴더 이름: serenity</div></div>`, footer: buttons('저장') },
+      credential_edit: { width: 480, title: 'API 키 수정', subtitle: '제공자와 레이블을 바꾸거나 비밀 값을 새로 입력합니다.', body: `<div class="field"><label for="provider">제공자</label><input id="provider" value="Anthropic"></div><div class="field"><label for="key-label">레이블</label><input id="key-label" value="production"></div><div class="field"><label for="secret">비밀 값</label><input id="secret" type="password" placeholder="변경하지 않으려면 비워 두세요"></div>`, footer: buttons('저장') },
+      mcp_server: { width: 560, title: 'MCP 서버 추가·수정', subtitle: '연결 방식에 따라 URL 또는 실행 명령을 입력합니다.', body: `<div class="field"><label for="server-name">서버 이름</label><input id="server-name" value="Local tools"></div><div class="field"><label for="transport">연결 방식</label><select id="transport"><option>HTTP</option><option>stdio</option></select></div><div class="field"><label for="server-url">URL</label><input id="server-url" value="https://tools.example.com/mcp"></div>`, footer: buttons('저장') },
+      broadcast: { width: 560, title: '브로드캐스트', subtitle: '저장된 프롬프트를 여러 PTY 세션에 보냅니다.', body: `<div class="field"><label for="broadcast-prompt">프롬프트</label><select id="broadcast-prompt"><option>테스트 실행 후 결과 요약</option></select></div><label class="check-row"><input type="checkbox" checked><span>Serenity / Claude Code</span></label><label class="check-row"><input type="checkbox" checked><span>Design / Codex</span></label><label class="check-row"><input type="checkbox" checked><span>FieldAI / Claude Code</span></label><div class="notice danger-note"><span class="symbol">!</span><span>3개 이상에 보낼 때만 현재 화면 안에서 2단계 확인이 나옵니다.</span></div>`, footer: buttons('3개 세션에 전송') },
+      batch_spawn: { width: 480, title: '에이전트 일괄 시작', subtitle: '선택한 에이전트의 세션을 여러 개 만듭니다.', body: `<div class="field"><label for="batch-agent">에이전트</label><select id="batch-agent"><option>Codex</option></select></div><div class="field"><label for="batch-count">개수</label><input id="batch-count" type="number" min="1" value="3"></div>`, footer: buttons('시작') },
+      prompt_palette: { width: 560, title: '저장된 프롬프트', subtitle: '검색·삽입·편집을 한 창에서 처리합니다.', body: `<div class="field"><label for="prompt-search">프롬프트 검색</label><input id="prompt-search" placeholder="제목이나 태그 검색"></div><div class="menu"><button class="menu-item" type="button" data-toast="프롬프트 선택"><span>테스트 실행 후 결과 요약</span></button><button class="menu-item" type="button" data-toast="프롬프트 선택"><span>코드 리뷰 요청</span></button></div>`, footer: buttons('새 프롬프트') },
+      prompt_delete: confirm('저장된 프롬프트 삭제', '프롬프트 상세 화면 안에 확인 문구가 나타납니다.', '선택한 프롬프트를 삭제할까요?', '삭제'),
+      document_dirty: { width: 480, title: '저장하지 않은 변경 사항', subtitle: 'notes.md · 닫기 전에 변경 내용을 처리합니다.', body: `<div class="notice danger-note"><span class="symbol">!</span><span>저장하지 않은 내용을 버리면 복구할 수 없습니다. 여러 문서가 대기 중이면 차례로 확인합니다.</span></div>`, footer: `<button class="btn ghost" type="button" data-close>취소</button><button class="btn" type="button" data-toast="저장 후 닫기를 시연합니다.">저장</button><button class="btn danger" type="button" data-toast="변경 내용을 버리고 닫기를 시연합니다.">버리기</button>` },
+      document_conflict: confirm('파일이 외부에서 바뀌었습니다', 'notes.md · 다른 프로그램에서 변경됨', '다시 불러오면 Deppy에서 저장하지 않은 편집 내용이 사라집니다.', '다시 불러오기', 'danger'),
+      document_cap: info('문서 탭 한도', '더 많은 문서 탭을 열 수 없습니다.', '정리할 수 있는 비활성 문서가 없어 새 탭을 열지 못했습니다.'),
+      credential_delete: confirm('API 키 삭제', 'production 키', '키체인에 저장된 비밀 값도 함께 삭제됩니다.', 'API 키 삭제'),
+      env_delete: { width: 440, title: '환경변수 삭제', subtitle: '선택한 변수를 어느 파일에서 제거할지 정합니다.', body: `<div class="field"><label for="env-key">변수</label><input id="env-key" value="API_URL" readonly></div><div class="field"><label for="env-source">삭제할 정의</label><select id="env-source"><option>모든 소스</option><option>.env</option><option>.env.local</option></select></div>`, footer: buttons('삭제', 'danger') },
+      mcp_delete: confirm('MCP 서버 삭제', 'Local tools', '이 서버 연결 설정을 삭제합니다.', '서버 삭제'),
+      production_run: confirm('production 실행 확인', 'Serenity / 배포 에이전트', 'production 프로필로 실행합니다. 비밀 값은 표시하지 않고 실행 시점에만 불러옵니다.', '실행', 'primary'),
+      resource_kill: confirm('리소스 관리자에서 세션 종료', 'Serenity / Claude Code', '선택한 실행 중 세션을 종료할까요? 현재는 리소스 관리자 패널 안에서 확인합니다.', '종료'),
+      resource_unattached: confirm('연결되지 않은 프로세스 종료', 'Serenity · 분리된 프로세스 2개', '현재 워크스페이스에 붙어 있지 않은 프로세스를 종료할까요? 현재는 패널 안에서 확인합니다.', '종료'),
+      port_kill: confirm('포트 점유 프로세스 종료', 'Serenity · localhost:3000', '포트를 점유한 프로세스를 종료할까요? 현재는 포트 패널 안에서 확인합니다.', '프로세스 종료'),
+      mcp_invoke: { width: 560, title: 'MCP 도구 실행', subtitle: '서버 도구에 전달할 JSON 인자를 확인합니다.', body: `<div class="field"><label for="json-args">JSON 인자</label><textarea id="json-args" spellcheck="false">{"path":"/project/README.md"}</textarea></div>`, footer: buttons('도구 실행') },
+      mcp_approval: { width: 560, title: 'MCP 도구 승인', subtitle: '서버·도구·인자 미리보기를 확인하고 범위를 선택합니다.', body: `<div class="inline-path">Local tools / read_file</div><div class="notice"><span class="symbol">ⓘ</span><span>이번 요청에만 적용하거나 이후 요청에도 같은 결정을 적용할 수 있습니다.</span></div>`, footer: `<button class="btn ghost" type="button" data-toast="한 번 거부를 시연합니다.">한 번 거부</button><button class="btn ghost" type="button" data-toast="항상 거부를 시연합니다.">항상 거부</button><button class="btn primary" type="button" data-toast="한 번 허용을 시연합니다.">한 번 허용</button><button class="btn" type="button" data-toast="항상 허용을 시연합니다.">항상 허용</button>` },
+      mcp_trust: confirm('원격 MCP 주소 신뢰', '새 원격 서버 Local tools', '연결할 원격 주소와 목적을 확인한 뒤 계속할지 결정합니다.', '신뢰하고 계속', 'primary'),
+      mcp_oauth: { width: 520, title: 'MCP OAuth 연결', subtitle: '인증 서버·리소스·요청 권한을 확인합니다.', body: `<div class="field"><label>인증 서버</label><div class="inline-path">https://auth.example.com</div></div><div class="field"><label>요청 권한</label><div class="inline-path">tools:read · tools:invoke</div></div><div class="notice"><span class="symbol">ⓘ</span><span>진행·동의·완료/오류 단계가 같은 창에서 전환됩니다.</span></div>`, footer: buttons('계속') },
+      folder_moved: confirm('프로젝트 폴더 이동 감지', '기존 경로와 새 경로를 비교합니다.', '이전 /Projects/Serenity → 현재 /Archive/Serenity. 워크스페이스 경로를 갱신할까요?', '경로 갱신', 'primary'),
+      overflow: info('런타임 이벤트 적체', '구독 연결을 다시 동기화했습니다.', '현재 화면 상태는 다시 맞춰지지만 일부 중간 알림이 누락되었을 수 있습니다.'),
+      warm_limit: info('실행 중 워크스페이스 한도', '새 워크스페이스를 열 수 없습니다.', '백그라운드에서 세션이 실행 중인 워크스페이스가 이미 한도에 도달했습니다.'),
+      cross_pane_failure: info('Pane을 열 수 없음', '다른 워크스페이스에서 셀을 가져오지 못했습니다.', '대상 셀이 변경되었거나 Pane 한도에 도달했을 수 있습니다. 대상 상태를 다시 확인하세요.'),
+      diff: { width: 560, title: '세션 변경사항', subtitle: '현재 세션의 Git diff를 조회하는 별도 창입니다.', body: `<div class="inline-path">Serenity / git diff --stat</div><div class="menu"><div class="menu-item">src/main.rs <span class="shortcut">+18 −4</span></div><div class="menu-item">README.md <span class="shortcut">+6 −1</span></div></div>`, footer: `<button class="btn" type="button" data-close>닫기</button>` },
+      agent_sessions: info('에이전트 세션 관리', '모델·도구·작업을 관리하는 큰 별도 창입니다.', '이 화면은 단순 확인 모달보다 큰 패널형 창으로 유지하는 편이 맞습니다.'),
+      inbox: { width: 480, title: '알림 인박스', subtitle: '벨 아이콘에 붙는 팝오버입니다.', body: `<div class="group-label">대기 중</div><div class="check-row"><span>Claude Code · 도구 승인 요청</span></div><div class="check-row"><span>Codex · 사용자 입력 대기</span></div><div class="group-label">최근 알림</div><div class="check-row"><span>테스트 완료 · Serenity</span></div>`, footer: `<button class="btn" type="button" data-close>전체 기록 보기</button>`, presentation: 'popover' },
+      terminal_status: { width: 400, title: '터미널 상태 팝오버', subtitle: '승인·리소스·포트 표시를 눌렀을 때 펼쳐집니다.', body: `<div class="menu"><div class="menu-item">승인 대기 <span class="shortcut">1건</span></div><div class="menu-item">세션 리소스 <span class="shortcut">CPU 12%</span></div><div class="menu-item">포트 3000 <span class="shortcut">열림</span></div></div>`, footer: '', presentation: 'popover' },
+      composer_picker: { width: 330, title: '입력창 선택 메뉴', subtitle: '모델과 MCP 서버 선택에 쓰이는 앵커 팝업입니다.', body: `<div class="menu"><button class="menu-item" type="button" data-toast="모델 선택"><span>Opus 5.5</span></button><button class="menu-item" type="button" data-toast="모델 선택"><span>gpt-6-sol</span></button><div class="menu-rule"></div><button class="menu-item" type="button" data-toast="MCP 서버 선택"><span>MCP 서버 선택</span></button></div>`, footer: '', presentation: 'menu' },
+      pane_menu: { width: 320, title: '셀·세션 상황 메뉴', subtitle: '셀 우클릭과 세션 카드 메뉴입니다.', body: `<div class="menu"><button class="menu-item" type="button" data-toast="셀 분할"><span>셀 분할</span></button><button class="menu-item" type="button" data-toast="다음 단계 예약"><span>다음 단계 예약</span></button><div class="menu-rule"></div><button class="menu-item red" type="button" data-toast="세션 닫기 요청"><span>세션 닫기</span></button></div>`, footer: '', presentation: 'menu' },
+      settings: info('설정 창', '현재는 별도 macOS 창으로 열립니다.', '이 화면 전체를 작은 공용 팝업으로 바꾸지 않습니다. 내부의 드롭다운과 확인 UI만 공용 규칙을 따를 수 있습니다.'),
+      native_picker: info('macOS 파일·폴더 선택기', '워크스페이스·저장 위치·파일 선택에 사용됩니다.', '운영체제 기본 Finder 선택창은 OS 표준 UI를 유지합니다. 공용 팝업은 이 선택창을 여는 버튼까지만 담당합니다.')
+    });
+    const caseGroups = [
+      ['생성·편집', [
+        ['workspace', '워크스페이스 추가', '공용 Modal 적용', 'crates/app/src/workspace_add.rs:599'],
+        ['folder', '새 폴더 만들기', '공용 Modal 적용', 'crates/app/src/ui/file_tree.rs:3180'],
+        ['file', '새 파일 만들기', '공용 Modal 적용', 'crates/app/src/ui/file_tree.rs:3180'],
+        ['rename_workspace', '워크스페이스 이름 바꾸기', 'Window', 'crates/app/src/app.rs:32653'],
+        ['credential_edit', 'API 키 수정', 'Modal', 'crates/app/src/ui/credentials/edit.rs:87'],
+        ['mcp_server', 'MCP 서버 추가·수정', 'Window', 'crates/connector-ui/src/lib.rs:649']
+      ]],
+      ['세션·종료·삭제', [
+        ['session_close', '실행 중인 셀·세션 닫기', 'Window · 실행 중일 때', 'crates/app/src/ui/workspace.rs:8323'],
+        ['workspace_close', '워크스페이스 세션 모두 종료', 'Window · 설정 ON', 'crates/app/src/app.rs:32485'],
+        ['env_project_close', '환경 및 API 프로젝트 목록 닫기', 'Window · 세션 유지', 'crates/app/src/app.rs:33414'],
+        ['resource_kill', '리소스 관리자 세션 종료', '패널 안 확인', 'crates/app/src/ui/resource_manager.rs:345'],
+        ['resource_unattached', '연결되지 않은 프로세스 종료', '패널 안 확인', 'crates/app/src/ui/resource_manager.rs:345'],
+        ['port_kill', '포트 점유 프로세스 종료', '패널 안 확인', 'crates/app/src/ui/ports.rs:226'],
+        ['delete', '휴지통 실패 후 영구 삭제', '파일 트리 안 확인', 'crates/app/src/ui/file_tree.rs:4229'],
+        ['credential_delete', 'API 키 삭제', 'Window', 'crates/app/src/ui/credentials.rs:763'],
+        ['env_delete', '환경변수 정의 삭제', 'Window', 'crates/app/src/ui/env_profiles.rs:835'],
+        ['mcp_delete', 'MCP 서버 삭제', 'Window', 'crates/connector-ui/src/lib.rs:766'],
+        ['prompt_delete', '저장된 프롬프트 삭제', '팔레트 안 확인', 'crates/app/src/ui/prompt_palette.rs:255']
+      ]],
+      ['AI 작업·외부 도구', [
+        ['followup', '다음 단계 예약', 'Window', 'crates/app/src/ui/fleet.rs:660'],
+        ['broadcast', '여러 세션에 브로드캐스트', 'Window · 3개 이상 인라인 재확인', 'crates/app/src/ui/fleet.rs:752'],
+        ['batch_spawn', '에이전트 일괄 시작', 'Window', 'crates/app/src/ui/fleet.rs:937'],
+        ['production_run', 'production 프로필 실행', 'Window', 'crates/app/src/ui/agents.rs:696'],
+        ['mcp_invoke', 'MCP 도구 직접 실행', 'Window', 'crates/connector-ui/src/lib.rs:720'],
+        ['mcp_approval', 'MCP 도구 실행 승인', 'Window · 커넥터 UI', 'crates/connector-ui/src/lib.rs:791'],
+        ['mcp_trust', '원격 MCP 주소 신뢰', 'Window', 'crates/connector-ui/src/lib.rs:831'],
+        ['mcp_oauth', 'MCP OAuth 진행·동의', 'Window', 'crates/connector-ui/src/lib.rs:866']
+      ]],
+      ['문서·프로젝트 경로', [
+        ['document_dirty', '미저장 문서 닫기', 'Window · 저장/버리기/취소', 'crates/app/src/app.rs:32541'],
+        ['document_conflict', '외부 수정된 문서 다시 불러오기', 'Window', 'crates/app/src/app.rs:32586'],
+        ['document_cap', '문서 탭 한도 안내', 'Window', 'crates/app/src/app.rs:32620'],
+        ['folder_moved', '프로젝트 폴더 이동 감지', 'Window', 'crates/app/src/app.rs:32725']
+      ]],
+      ['조회·상태 안내', [
+        ['prompt_palette', '프롬프트 라이브러리', 'Window', 'crates/app/src/ui/prompt_palette.rs:84'],
+        ['diff', '세션 Git 변경사항', 'Window', 'crates/app/src/ui/diff_panel.rs:882'],
+        ['agent_sessions', '에이전트 세션 관리', '큰 Window', 'crates/app/src/ui/agent_sessions.rs:2197'],
+        ['overflow', '런타임 이벤트 적체', 'Window', 'crates/app/src/app.rs:32422'],
+        ['warm_limit', '실행 중 워크스페이스 한도', 'Window', 'crates/app/src/app.rs:32440'],
+        ['cross_pane_failure', '다른 워크스페이스 셀 열기 실패', 'Window', 'crates/app/src/app.rs:32464']
+      ]],
+      ['팝오버·OS 창', [
+        ['inbox', '알림 벨·승인 인박스', '앵커 Popup', 'crates/app/src/app.rs:28984'],
+        ['terminal_status', '터미널 승인·리소스·포트', '앵커 Popup', 'crates/app/src/ui/agent_terminal.rs:417'],
+        ['composer_picker', '입력창 모델·MCP 선택', '앵커 Popup', 'crates/app/src/ui/composer.rs:1060'],
+        ['menu', '파일 트리 우클릭·더보기', '상황 메뉴 Popup', 'crates/app/src/ui/file_tree.rs:2870'],
+        ['pane_menu', '셀·세션 상황 메뉴', '상황 메뉴 Popup', 'crates/app/src/ui/workspace.rs:8455'],
+        ['settings', '설정', '별도 macOS 창', 'crates/app/src/ui/settings.rs:322'],
+        ['native_picker', '파일·폴더 선택', 'macOS 기본 선택창', 'crates/app/src/app.rs:13793']
+      ]]
+    ];
+    for (const [category, cases] of caseGroups) {
+      for (const [id, label, surface, source] of cases) Object.assign(views[id], { category, label, surface, source });
+    }
+    const nav = document.getElementById('case-nav');
+    const rows = document.getElementById('case-rows');
+    let caseNumber = 0;
+    for (const [category, cases] of caseGroups) {
+      const heading = document.createElement('div');
+      heading.className = 'group-title';
+      heading.textContent = category;
+      nav.append(heading);
+      for (const [id, label, surface, source] of cases) {
+        const number = String(++caseNumber).padStart(2, '0');
+        const button = document.createElement('button');
+        button.className = 'example';
+        button.type = 'button';
+        button.dataset.view = id;
+        const numberBadge = document.createElement('span');
+        numberBadge.className = 'case-number';
+        numberBadge.textContent = number;
+        button.append(numberBadge, document.createTextNode(label));
+        nav.append(button);
+        const tr = document.createElement('tr');
+        const numberCell = document.createElement('td');
+        numberCell.className = 'case-index';
+        numberCell.textContent = number;
+        const groupCell = document.createElement('td');
+        groupCell.textContent = category;
+        const nameCell = document.createElement('td');
+        const link = document.createElement('button');
+        link.className = 'case-link';
+        link.type = 'button';
+        link.dataset.view = id;
+        link.textContent = label;
+        nameCell.append(link);
+        const typeCell = document.createElement('td');
+        typeCell.className = 'case-type';
+        typeCell.textContent = surface;
+        const locationCell = document.createElement('td');
+        const code = document.createElement('code');
+        code.textContent = source;
+        locationCell.append(code);
+        tr.append(numberCell, groupCell, nameCell, typeCell, locationCell);
+        rows.append(tr);
+      }
+    }
+    document.getElementById('case-count').textContent = `${rows.children.length}개`;
+    const overlay = document.getElementById('overlay');
+    const modal = document.getElementById('modal');
+    const toast = document.getElementById('toast');
+    let current = 'workspace';
+    let toastTimer;
+    function render(name) {
+      current = name;
+      const view = views[name];
+      modal.style.setProperty('--modal-width', `${view.width}px`);
+      overlay.classList.toggle('popover-mode', view.presentation === 'popover' || view.presentation === 'menu');
+      overlay.classList.toggle('menu-mode', view.presentation === 'menu');
+      modal.setAttribute('aria-modal', String(view.presentation !== 'popover' && view.presentation !== 'menu'));
+      modal.setAttribute('aria-labelledby', 'modal-title');
+      document.getElementById('modal-title').textContent = view.title;
+      document.getElementById('modal-subtitle').textContent = view.subtitle;
+      document.getElementById('modal-body').innerHTML = view.body;
+      document.getElementById('modal-footer').innerHTML = view.footer;
+      const sourceBox = document.getElementById('current-source');
+      const sourceTitle = document.createElement('strong');
+      sourceTitle.textContent = view.label;
+      const sourceType = document.createElement('span');
+      sourceType.textContent = `현재 방식: ${view.surface}`;
+      const sourceCode = document.createElement('code');
+      sourceCode.textContent = view.source;
+      sourceBox.replaceChildren(sourceTitle, sourceType, sourceCode);
+      document.querySelectorAll('.example').forEach(button => button.classList.toggle('active', button.dataset.view === name));
+      overlay.classList.remove('hidden');
+      document.getElementById('closed').hidden = true;
+      requestAnimationFrame(() => modal.querySelector('input, textarea, select, .menu-item, .btn.primary, .btn.danger')?.focus());
+    }
+    function closeModal() { overlay.classList.add('hidden'); document.getElementById('closed').hidden = false; document.querySelector(`.example[data-view="${current}"]`)?.focus(); }
+    function showToast(message) { toast.textContent = message; toast.classList.add('visible'); clearTimeout(toastTimer); toastTimer = setTimeout(() => toast.classList.remove('visible'), 2500); }
+    document.querySelectorAll('[data-view]').forEach(button => button.addEventListener('click', () => {
+      render(button.dataset.view);
+      if (button.classList.contains('case-link')) document.querySelector('.preview').scrollIntoView({behavior: 'smooth'});
+    }));
+    document.getElementById('show-inventory').addEventListener('click', () => document.getElementById('inventory').scrollIntoView({behavior: 'smooth'}));
+    overlay.addEventListener('click', event => { if (event.target === overlay && overlay.classList.contains('popover-mode')) closeModal(); });
+    document.getElementById('close').addEventListener('click', closeModal);
+    document.getElementById('reopen').addEventListener('click', () => render(current));
+    document.addEventListener('click', event => {
+      if (event.target.closest('[data-close]')) closeModal();
+      const source = event.target.closest('[data-source]');
+      if (source) {
+        modal.querySelectorAll('[data-source]').forEach(button => button.setAttribute('aria-pressed', String(button === source)));
+        modal.querySelectorAll('[data-source-fields]').forEach(fields => { fields.hidden = fields.dataset.sourceFields !== source.dataset.source; });
+        const primary = modal.querySelector('.btn.primary');
+        primary.textContent = source.dataset.source === 'local' ? '폴더 열기' : '복제하고 열기';
+        primary.dataset.toast = source.dataset.source === 'local' ? '선택한 폴더를 여는 자리입니다.' : '복제 작업이 시작되는 자리입니다.';
+      }
+      const action = event.target.closest('[data-toast]');
+      if (action) showToast(action.dataset.toast);
+    });
+    document.addEventListener('keydown', event => {
+      if (event.key === 'Escape' && !overlay.classList.contains('hidden')) { event.preventDefault(); closeModal(); }
+      if (event.key === 'Enter' && !overlay.classList.contains('hidden') && modal.contains(document.activeElement) && ['INPUT', 'SELECT'].includes(document.activeElement.tagName)) { event.preventDefault(); modal.querySelector('.btn.primary')?.click(); }
+      if (event.key === 'Tab' && !overlay.classList.contains('hidden') && !overlay.classList.contains('popover-mode') && modal.contains(document.activeElement)) {
+        const nodes = [...modal.querySelectorAll('button, input, textarea, select')].filter(node => !node.disabled && node.getClientRects().length);
+        if (event.shiftKey && document.activeElement === nodes[0]) { event.preventDefault(); nodes.at(-1).focus(); }
+        else if (!event.shiftKey && document.activeElement === nodes.at(-1)) { event.preventDefault(); nodes[0].focus(); }
+      }
+    });
+    render(current);
+  </script>
+</body>
+</html>

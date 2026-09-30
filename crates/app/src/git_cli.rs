@@ -279,9 +279,27 @@ fn execute_bounded(
     timeout: Duration,
     stdout_max_bytes: usize,
 ) -> anyhow::Result<GitExecution> {
+    execute_bounded_with_cancel(repo, args, timeout, stdout_max_bytes, None)
+}
+
+fn execute_bounded_with_cancel(
+    repo: &Path,
+    args: &[&str],
+    timeout: Duration,
+    stdout_max_bytes: usize,
+    cancelled: Option<&AtomicBool>,
+) -> anyhow::Result<GitExecution> {
+    if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        anyhow::bail!("git_cancelled");
+    }
     let mut running = RunningGit::spawn(repo, args, stdout_max_bytes, STDERR_MAX_BYTES)?;
     let started = Instant::now();
     let (status, killed_for_limit) = loop {
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            let _ = running.kill_and_reap();
+            let _ = running.join_readers();
+            anyhow::bail!("git_cancelled");
+        }
         if running.output_limit_reached() {
             let status = running
                 .kill_and_reap()
@@ -333,6 +351,28 @@ pub fn run_git_bounded(
     max_bytes: usize,
 ) -> anyhow::Result<String> {
     let execution = execute_bounded(repo, args, timeout, max_bytes)?;
+    if execution.stderr.truncated {
+        anyhow::bail!("git_stderr_limit");
+    }
+    if execution.stdout.truncated {
+        anyhow::bail!("git_stdout_limit");
+    }
+    if !execution.status.success() {
+        anyhow::bail!("git_command_failed");
+    }
+    Ok(String::from_utf8_lossy(&execution.stdout.bytes).into_owned())
+}
+
+/// User-started, potentially long-running Git command. The caller owns the cancellation flag;
+/// a cancellation kills and reaps the whole child process group just like a timeout.
+pub fn run_git_bounded_cancellable(
+    repo: &Path,
+    args: &[&str],
+    timeout: Duration,
+    max_bytes: usize,
+    cancelled: &AtomicBool,
+) -> anyhow::Result<String> {
+    let execution = execute_bounded_with_cancel(repo, args, timeout, max_bytes, Some(cancelled))?;
     if execution.stderr.truncated {
         anyhow::bail!("git_stderr_limit");
     }
@@ -447,6 +487,30 @@ mod tests {
         .unwrap();
         assert!(!execution.status.success());
         assert_eq!(execution.active_readers_after_join, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellable_git_reaps_a_running_child_before_timeout() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancelled);
+        let started = Instant::now();
+        let handle = std::thread::spawn(move || {
+            run_git_bounded_cancellable(
+                Path::new("."),
+                &["-c", "alias.slow=!/bin/sleep 30", "slow"],
+                Duration::from_secs(10),
+                1024,
+                &flag,
+            )
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        cancelled.store(true, Ordering::Release);
+        assert_eq!(
+            handle.join().unwrap().unwrap_err().to_string(),
+            "git_cancelled"
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 
     #[test]

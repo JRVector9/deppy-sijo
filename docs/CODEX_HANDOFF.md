@@ -1,3 +1,46 @@
+# Draft stall gates passed / commit and package — 2026-10-05 (KST)
+
+- Objective implementation complete in source: completed checkpoint no longer hidden by later autosave;10s bounded known-unsent wait with retained/retryable draft and no late auto-send; normal saving label removed; errors/retry inside card; known-unsent rejection inline.
+- Final gates executed exit0 /tmp/deppy-draft-stall-final-gates-20261005.log:2792passed/0failed/34ignored (App+integration+i18n), strict affected all-target Clippy-Dwarnings, boundary,27-crate dependency gate, fmt/diff. Final actual input-card error/retry geometry1 and checkpoint3 passed; originalRED3 documented below. Product source self-review complete. No runtime/wire/schema change.
+- Version0.7.2→0.7.3 exactly27 inherited lock entries;2 external dependencies preserved. Modified7files:Cargo.toml/lock,app.rs,composer_draft_worker.rs,ui/composer.rs,reviewreport,thishandoff. No user DB/config/draft/transcript mutation or real agent prompt sent.
+- Next: commit/push source; capture product SHA/sourcecommit; build fresh signed separate0.7.3 artifact and verify versions/signature/source before/after; record sourcecommit in final handoff/report; docs commit/push. Restart explicitly deferred; running0.7.0PID26830 unchanged.
+- Exact commands: git add Cargo.toml Cargo.lock crates/app/src/app.rs crates/app/src/composer_draft_worker.rs crates/app/src/ui/composer.rs docs/reviews/2026-10-05-composer-checkpoint-stall.md docs/CODEX_HANDOFF.md; git commit; git push origin feat/audit-nine-pr-v0.6.0-20261004; python3 /tmp/deppy-rebuild-0.7.3-20261005-proof.py capture; DEPPY_REQUIRE_TRUSTED_SIGNING=0 DEPPY_ALLOW_UNTRUSTED_SIGNING=1 CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 sh /tmp/deppy-rebuild-0.7.3-20261005.sh; python3 /tmp/deppy-rebuild-0.7.3-20261005-proof.py verify.
+
+---
+
+# Draft stall final gates in progress — 2026-10-05 (KST)
+
+- Executed final focused GREEN: input-card error/retry geometry1 and checkpoint3 passed (/tmp/deppy-draft-stall-ui-green-20261005.log). Earlier adjacent pr5_29 passed. Full App/i18n, strict App all-target Clippy-Dwarnings, boundary/deps/fmt currently running gated in /tmp/deppy-draft-stall-final-gates-20261005.log. No Rust/Cargo edits while gate runs.
+- Additional fixture failure: missing crate::config qualification caused compile error; corrected, removed unused NodeT import, successful run supersedes it. No product approach failure.
+- Source self-review: required checkpoint cannot be bypassed; last committed revision only advances after actual save success, pending later revision cannot hide it, newer failure/recovery still reject; deadline releases known-unsent retained input, late save cannot replay. Pure presenter notice hook shares card border; no render filesystem work/new workers. No new independently confirmed issue.
+- Prepared separate0.7.3 package script /tmp/deppy-rebuild-0.7.3-20261005.sh (refuses staged artifact overwrite), and capture/verify proof helper /tmp/deppy-rebuild-0.7.3-20261005-proof.py. Neither build nor restart executed yet. Live0.7.0PID26830 unchanged.
+- Next: inspect final gates; update report/handoff; commit/push product; proof.py capture; DEPPY_REQUIRE_TRUSTED_SIGNING=0 DEPPY_ALLOW_UNTRUSTED_SIGNING=1 CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 sh /tmp/deppy-rebuild-0.7.3-20261005.sh; proof.py verify; docs closeout commit/push. No restart controller.
+
+---
+
+# Draft-saving stall reproduced and fixed / verification — 2026-10-05 (KST)
+
+- RED actually executed: /tmp/deppy-draft-stall-red-20261005.log had2 assertion failures (durable revision1 hidden by Pending2; routine saving label visible). /tmp/deppy-draft-timeout-red-20261005.log had1 assertion failure (expired wait never releases submission).
+- Implemented committed_revision separate from latest UI status, actual App checkpoint_status gate,10s deadline and re-armed repaint; timed-out known-unsent draft is retained/retryable and late save never dispatches it. No unsaved PTY bypass. Normal Pending status hidden; persistence notice/retry rendered inside existing composer frame, known-unsent rejection uses inline state instead of external notification.
+- Initial GREEN executed: composer_checkpoint_3passed; pr5_29passed. Addressed two newly unused methods before strict Clippy; added actual egui shared-border error/retry geometry test, not yet executed. Version0.7.2→0.7.3, exactly27 inherited lock versions, dependencies unchanged.
+- Failed approach: initial version replacement assertion caught29 textual0.7.2 entries including2 external dependencies; script stopped before touching lock. Subsequent locked test refused stale lock. Corrected only27 source-less workspace entries, preserving external dependencies.
+- Modified: app.rs, composer_draft_worker.rs, ui/composer.rs, Cargo.toml/lock, this handoff. Live exact interaction remains unverified; no real user input sent, no native restart. Running0.7.0 PID26830, previous0.7.2 artifact unchanged.
+- Next: focused tests then full affected App/i18n tests, strict Clippy, UI/deps/fmt checks; scoped review, commit/push, unique signed0.7.3 artifact +version/source proof. Restart remains deferred.
+
+---
+
+# Active: draft-saving stall and composer status placement — 2026-10-05 (KST)
+
+- Objective: user confirms Enter does not send while “초안 저장 중…” remains; remove routine saving text and place persistence errors inside the bottom input card. Continue prior authorized commit/push/build scope; restart remains deferred.
+- Baseline: clean HEAD 938c89a0, product 0.7.2 unlaunched; running 0.7.0 PID26830. Authoritative worktree deppy-sijo-performance; preserve older original tree.
+- Investigation: worker publishes only latest-request status. A completed required submission checkpoint can be hidden by a later pending autosave; actual App waits on latest status. Will reproduce this interleaving with controlled worker before fixing. No deadline currently exists for known-unsent checkpoint wait. Routine Pending text is rendered outside composer card by App.
+- Live evidence is limited: a 1-second native sample found composer-draft-save waiting on Condvar, not filesystem I/O; current saved drafts had no uncertain marker. Thus do not claim the live disk was hung or the exact reported interaction reproduced.
+- Modified files: this handoff only so far. Tests: none in this new phase. Failed approaches: ps thread keyword tid unsupported, no mutation.
+- Plan: deterministic RED worker/gate and status tests; track committed checkpoint independently; bound wait without allowing unsaved PTY effects; put error/retry presenter inside card; focused/full affected gates; bump 0.7.2→0.7.3, commit/push, isolated signed build/version verification. No app restart.
+- Next commands: python3 /private/tmp/deppy-audit-nine-pr-20261004/cargo_gate.py test --offline --locked -q -p deppy-sijo composer_checkpoint -- --test-threads=1; git diff --check. Never execute obsolete restart controllers.
+
+---
+
 # Resume/composer source pushed and0.7.2 artifact verified / restart deferred — 2026-10-05(KST)
 
 - Currentobjective: screenshotUIcorrections plus latestresume/composer checks, commit/push/build; user explicitly deferred immediate restart. ExistingUI95807b1/26449130 and additionalproduct2bf3b9762eb8a201f1d2b3156e7cf6df7cbc3465 pushed onfeat/audit-nine-pr-v0.6.0-20261004. This finalrecord is docs-only, sourceartifact remains2bf3b976.

@@ -865,15 +865,27 @@ impl ComposerUi {
         egui::Id::new("composer_text_active")
     }
 
+    #[cfg(test)]
     pub fn render(
         &mut self,
         ui: &mut egui::Ui,
         catalog: &i18n::Catalog,
         ctx: &ComposerContext<'_>,
     ) -> Option<ComposerAction> {
+        self.render_with_notice(ui, catalog, ctx, |_| {})
+    }
+
+    /// Pure presentation hook for host-owned persistence feedback inside the input card.
+    pub(crate) fn render_with_notice(
+        &mut self,
+        ui: &mut egui::Ui,
+        catalog: &i18n::Catalog,
+        ctx: &ComposerContext<'_>,
+        notice: impl FnOnce(&mut egui::Ui),
+    ) -> Option<ComposerAction> {
         self.bind_context(ui.ctx(), ctx);
         let mut buffer = self.buffers.remove(ctx.draft_key).unwrap_or_default();
-        let action = self.render_inner(ui, catalog, ctx, &mut buffer);
+        let action = self.render_inner(ui, catalog, ctx, &mut buffer, notice);
         compact_draft_buffer(&mut buffer);
         if !buffer.is_empty() || self.owners.contains_key(ctx.draft_key) {
             self.buffers.insert(ctx.draft_key.to_owned(), buffer);
@@ -887,6 +899,7 @@ impl ComposerUi {
         catalog: &i18n::Catalog,
         ctx: &ComposerContext<'_>,
         buffer: &mut String,
+        notice: impl FnOnce(&mut egui::Ui),
     ) -> Option<ComposerAction> {
         let egui_ctx = ui.ctx().clone();
         let text_id = Self::text_id(ctx.draft_key);
@@ -1069,6 +1082,7 @@ impl ComposerUi {
                     action = toolbar.action;
                 }
             }
+            notice(ui);
             output
         });
         let mut output = card_response.inner;

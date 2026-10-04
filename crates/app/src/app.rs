@@ -30518,6 +30518,7 @@ impl App {
         let mut retry_prompt_save = false;
         let prompt_library_readonly = prompt_save_status.write_blocking_error().is_some();
         self.prompt_palette.set_read_only(prompt_library_readonly);
+        let mut retry_draft_save = false;
         let composer_action = {
             let dock_frame =
                 ui::designall::structural_frame(ui.visuals()).inner_margin(egui::Margin {
@@ -30566,16 +30567,15 @@ impl App {
                             );
                         });
                     }
-                    if render_composer_draft_save_status(
-                        ui,
-                        text,
-                        draft_save_status,
-                        self.composer_draft_error,
-                        self.composer_draft_save_worker.path(),
-                    ) {
-                        self.composer_checkpoint_at = Some(std::time::Instant::now());
-                    }
-                    composer.render(ui, text, &composer_ctx)
+                    composer.render_with_notice(ui, text, &composer_ctx, |ui| {
+                        retry_draft_save = render_composer_draft_save_status(
+                            ui,
+                            text,
+                            draft_save_status,
+                            self.composer_draft_error,
+                            self.composer_draft_save_worker.path(),
+                        );
+                    })
                 });
             let separator_y = ui::snap_line_to_pixel(
                 dock_response.response.rect.top(),
@@ -30589,6 +30589,9 @@ impl App {
             );
             dock_response.inner
         };
+        if retry_draft_save {
+            self.composer_checkpoint_at = Some(std::time::Instant::now());
+        }
         if retry_prompt_save {
             self.persist_prompt_library();
         }
@@ -30742,6 +30745,7 @@ impl App {
             draft_key,
             submission_id,
             required_save_revision: 0,
+            checkpoint_deadline: std::time::Instant::now() + std::time::Duration::from_secs(10),
         };
         if self.pending_durable_composer_prompt.is_some()
             || self.composer.draft_revision() < required_draft_revision
@@ -30773,14 +30777,7 @@ impl App {
             &pending.prompt,
             pending.generation(),
         );
-        let workspace_id = pending.workspace_id();
-        self.notifications_ui.on_workspace_error(
-            workspace_id,
-            workspace_id,
-            ui::workspace::WorkspaceErrorKind::Other,
-            &self.i18n.t("composer.delivery.rejected", &[]),
-            &self.i18n,
-        );
+        // The retained draft's rejection is shown inside the composer, without a toast.
         self.egui_ctx.request_repaint();
     }
 
@@ -30788,9 +30785,16 @@ impl App {
         let Some((pending, decision)) = take_ready_durable_composer_prompt(
             &mut self.pending_durable_composer_prompt,
             &self.composer,
-            self.composer_draft_save_worker.status(),
+            self.composer_draft_save_worker.checkpoint_status(),
             self.composer_draft_error,
         ) else {
+            if let Some(pending) = &self.pending_durable_composer_prompt {
+                self.egui_ctx.request_repaint_after(
+                    pending
+                        .checkpoint_deadline
+                        .saturating_duration_since(std::time::Instant::now()),
+                );
+            }
             return;
         };
         match decision {
@@ -36450,6 +36454,7 @@ struct PendingDurableComposerPrompt {
     draft_key: String,
     submission_id: u64,
     required_save_revision: u64,
+    checkpoint_deadline: std::time::Instant,
 }
 
 impl PendingDurableComposerPrompt {
@@ -36459,12 +36464,6 @@ impl PendingDurableComposerPrompt {
                 runtime_instance, ..
             } => *runtime_instance,
             AppTerminalInputTarget::Attached(target) => target.runtime_instance,
-        }
-    }
-    fn workspace_id(&self) -> &str {
-        match &self.target {
-            AppTerminalInputTarget::Primary { workspace_id, .. } => workspace_id,
-            AppTerminalInputTarget::Attached(target) => &target.workspace_id,
         }
     }
     fn ready(
@@ -36497,9 +36496,16 @@ fn take_ready_durable_composer_prompt(
     } else {
         pending.ready(composer, status)
     };
+    let decision = if decision == ComposerCheckpointDecision::Wait
+        && std::time::Instant::now() >= pending.checkpoint_deadline
+    {
+        ComposerCheckpointDecision::Reject
+    } else {
+        decision
+    };
     if decision == ComposerCheckpointDecision::Wait {
-        // Worker completion requests the next logic tick. Keep the exact captured target;
-        // unrelated controller/modal work remains independent. No polling timer or I/O.
+        // Keep the exact captured target until completion or the known-unsent deadline.
+        // The host re-arms the deadline repaint; there is no polling loop or render I/O.
         *slot = Some(pending);
         None
     } else {
@@ -36593,8 +36599,7 @@ fn render_composer_draft_save_status(
         Some("composer.draft.failed")
     } else {
         match status {
-            Status::Idle | Status::Saved { .. } => None,
-            Status::Pending { .. } => Some("composer.draft.saving"),
+            Status::Idle | Status::Saved { .. } | Status::Pending { .. } => None,
             Status::Failed { .. } => Some("composer.draft.failed"),
             Status::RecoveryRequired { .. } => Some("composer.draft.recovery"),
         }
@@ -38521,6 +38526,7 @@ mod tests {
             draft_key: "A".into(),
             submission_id,
             required_save_revision: 1,
+            checkpoint_deadline: std::time::Instant::now() + std::time::Duration::from_secs(10),
         });
         // The existing disk file still has false. A queued checkpoint is not a PTY permit.
         assert!(!DraftSnapshot::load_startup(&path).snapshot.drafts[0].delivery_uncertain);
@@ -38602,6 +38608,7 @@ mod tests {
             draft_key: "A".into(),
             submission_id,
             required_save_revision: 1,
+            checkpoint_deadline: std::time::Instant::now() + std::time::Duration::from_secs(10),
         });
         let (pending, decision) = take_ready_durable_composer_prompt(
             &mut slot,
@@ -38718,32 +38725,150 @@ mod tests {
     }
 
     #[test]
-    fn pr5_save_error_is_visible_and_retry_returns_only_an_intent() {
+    fn composer_checkpoint_timeout_keeps_draft_and_late_save_never_sends() {
+        use crate::composer_draft_worker::DraftSaveStatus as Status;
+        let mut composer = ui::composer::ComposerUi::new(
+            std::env::temp_dir().join(format!("deppy-checkpoint-timeout-{}", uuid::Uuid::new_v4())),
+        );
+        composer.insert_text("A", "retained prompt");
+        let ui::composer::ComposerAction::Send(submission) =
+            composer.try_submit("retained prompt", true, "A").unwrap()
+        else {
+            panic!()
+        };
+        let (prompt, _, submission_id) = submission.into_parts();
+        let mut slot = Some(PendingDurableComposerPrompt {
+            target: AppTerminalInputTarget::Primary {
+                workspace_id: "workspace".into(),
+                runtime_instance: 0,
+                session: runtime::SessionId(41),
+            },
+            context: PromptInputContext::ManualShell,
+            prompt,
+            draft_key: "A".into(),
+            submission_id,
+            required_save_revision: 1,
+            checkpoint_deadline: std::time::Instant::now() - std::time::Duration::from_secs(1),
+        });
+        let ready = take_ready_durable_composer_prompt(
+            &mut slot,
+            &composer,
+            Status::Pending { revision: 1 },
+            None,
+        );
+        let (pending, decision) = ready.expect("a stalled save must release the unsent submission");
+        assert_eq!(decision, ComposerCheckpointDecision::Reject);
+        composer.reject_unqueued_submission(
+            &pending.draft_key,
+            pending.submission_id,
+            &pending.prompt,
+            pending.generation(),
+        );
+        assert_eq!(composer.current_text("A"), "retained prompt");
+        assert!(!composer.checkpoint().drafts[0].delivery_uncertain);
+        assert!(
+            take_ready_durable_composer_prompt(
+                &mut slot,
+                &composer,
+                Status::Saved { revision: 1 },
+                None
+            )
+            .is_none()
+        );
+        assert!(
+            composer.try_submit("retained prompt", true, "A").is_some(),
+            "explicit retry must be available"
+        );
+    }
+
+    #[test]
+    fn composer_checkpoint_routine_saving_status_is_silent() {
+        use egui_kittest::kittest::Queryable;
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        let saving = catalog.t("composer.draft.saving", &[]);
+        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
+            assert!(!render_composer_draft_save_status(
+                ui,
+                &catalog,
+                crate::composer_draft_worker::DraftSaveStatus::Pending { revision: 2 },
+                None,
+                Path::new("/temporary-fixture/composer_drafts.json"),
+            ));
+        });
+        harness.run();
+        assert!(harness.query_by_label(&saving).is_none());
+    }
+
+    #[test]
+    fn pr5_save_error_is_inside_input_card_and_retry_returns_only_an_intent() {
         use crate::composer_draft_worker::DraftSaveStatus;
         use egui_kittest::kittest::Queryable;
         let catalog = i18n::Catalog::load("en-US").unwrap();
         let retry = catalog.t("prompt.persistence.retry", &[]);
         let failed = catalog.t("composer.draft.failed", &[]);
         let mut harness = egui_kittest::Harness::new_ui_state(
-            move |ui, state: &mut bool| {
-                *state |= render_composer_draft_save_status(
-                    ui,
-                    &catalog,
-                    DraftSaveStatus::Failed {
-                        revision: 1,
-                        error: crate::composer_drafts::DraftError::WriteFailed,
-                    },
-                    None,
-                    Path::new("/temporary-fixture/composer_drafts.json"),
+            move |ui, state: &mut (ui::composer::ComposerUi, bool)| {
+                let snapshot = connector_contract::ConnectorSnapshot::default();
+                let context = ui::composer::ComposerContext {
+                    workspace_id: "workspace",
+                    draft_key: "A",
+                    runtime_generation: 1,
+                    send_key: crate::config::ComposerSendKey::Enter,
+                    can_send: true,
+                    agent: None,
+                    workspace_root: None,
+                    collapse_shortcut: None,
+                    connector_snapshot: &snapshot,
+                };
+                assert!(
+                    state
+                        .0
+                        .render_with_notice(ui, &catalog, &context, |ui| {
+                            state.1 |= render_composer_draft_save_status(
+                                ui,
+                                &catalog,
+                                DraftSaveStatus::Failed {
+                                    revision: 1,
+                                    error: crate::composer_drafts::DraftError::WriteFailed,
+                                },
+                                None,
+                                Path::new("/temporary-fixture/composer_drafts.json"),
+                            );
+                        })
+                        .is_none()
                 );
             },
-            false,
+            (
+                ui::composer::ComposerUi::new(PathBuf::from("/unused-fixture/history.jsonl")),
+                false,
+            ),
         );
         harness.run();
-        assert!(harness.query_by_label(&failed).is_some());
+        let failed_rect = harness.get_by_label(&failed).rect();
+        let input_rect = harness
+            .get_by_role(egui::accesskit::Role::MultilineTextInput)
+            .rect();
+        let card = harness
+            .output()
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Rect(rect)
+                    if rect.stroke.width > 0.0
+                        && rect.rect.contains_rect(input_rect)
+                        && rect.rect.contains_rect(failed_rect) =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            });
+        assert!(
+            card.is_some(),
+            "editor and persistence feedback must share the bordered input card"
+        );
         harness.get_by_label(&retry).click();
         harness.run();
-        assert!(*harness.state());
+        assert!(harness.state().1);
     }
 
     #[test]

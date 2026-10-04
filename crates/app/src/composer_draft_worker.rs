@@ -39,6 +39,7 @@ struct SaveRequest {
 struct State {
     pending: Option<SaveRequest>,
     latest_revision: u64,
+    committed_revision: u64,
     status: DraftSaveStatus,
     stopping: bool,
 }
@@ -65,6 +66,7 @@ impl DraftSaveWorker {
                 Mutex::new(State {
                     pending: None,
                     latest_revision: 0,
+                    committed_revision: 0,
                     status: recovery_error.map_or(DraftSaveStatus::Idle, |error| {
                         DraftSaveStatus::RecoveryRequired { error }
                     }),
@@ -102,6 +104,23 @@ impl DraftSaveWorker {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .status
+    }
+
+    /// Completion status used by the host's submission checkpoint gate.
+    pub(crate) fn checkpoint_status(&self) -> DraftSaveStatus {
+        let state = self
+            .state
+            .0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        match state.status {
+            DraftSaveStatus::Pending { .. } if state.committed_revision > 0 => {
+                DraftSaveStatus::Saved {
+                    revision: state.committed_revision,
+                }
+            }
+            status => status,
+        }
     }
 
     /// Known-unsent errors are visible to the host. At most two bounded snapshots are retained,
@@ -199,6 +218,9 @@ fn run_with_save(
         }
         {
             let mut guard = state.0.lock().unwrap_or_else(|poison| poison.into_inner());
+            if result.is_ok() {
+                guard.committed_revision = request.revision;
+            }
             if request.revision == guard.latest_revision {
                 guard.status = match result {
                     Ok(_) => DraftSaveStatus::Saved {
@@ -251,6 +273,53 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
+    #[test]
+    fn composer_checkpoint_completion_is_not_hidden_by_a_later_autosave() {
+        let dir = directory();
+        let path = dir.join("drafts.json");
+        let mut worker = DraftSaveWorker::new(path.clone(), None, DraftFileVersion::Missing, || {});
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let state = Arc::clone(&worker.state);
+        let save_path = path.clone();
+        worker.handle = Some(std::thread::spawn(move || {
+            run_with_save(
+                state,
+                DraftFileVersion::Missing,
+                Arc::new(|| {}),
+                move |snapshot, version| {
+                    entered_tx.send(()).unwrap();
+                    release_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                    snapshot.save_checked(&save_path, version)
+                },
+            )
+        }));
+        worker
+            .request(1, snapshot("submission checkpoint"))
+            .unwrap();
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        worker.request(2, snapshot("later editing")).unwrap();
+        release_tx.send(()).unwrap();
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(worker.status(), DraftSaveStatus::Pending { revision: 2 });
+        assert_eq!(
+            DraftSnapshot::load_startup(&path).snapshot,
+            *snapshot("submission checkpoint")
+        );
+        let completed = worker.checkpoint_status();
+        // Release before assertion so a failing test never leaves a blocked worker.
+        release_tx.send(()).unwrap();
+        worker.shutdown();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(completed, DraftSaveStatus::Saved { revision: 1 });
+    }
+
     #[test]
     fn pr5_worker_latest_coalesces_and_drop_drains_original_order() {
         let dir = directory();

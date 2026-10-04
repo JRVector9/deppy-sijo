@@ -1,3 +1,39 @@
+# Active task — note editing and top menu, 2026-10-05(KST)
+
+## Current objective / completed source
+- Notes tab: drag-select then right-click for cut/copy/paste/delete/select-all; preserve only clicked-word selection on double-click and subsequent menu interaction.
+- Overall title/menu bar38→36pt via the shared macOS traffic-light constant. Session pane tab header is unchanged.
+- Worktree `/Users/jr/Desktop/projects/deppy-sijo-performance`, branch `feat/audit-nine-pr-v0.6.0-20261004`, baseline9d6ad930, initially clean. No app launch/stop/restart or new push authorization.
+- Final source implementation, actual tests and independent review completed; fresh final0.6.1 packaging/journal remain.
+
+## Modified files / design
+- `crates/app/src/ui/notes.rs`: workspace-scoped pending TextEdit events; synthetic events removed before returning; pending edit cleared on workspace/external-buffer change. Right-button pointer state is hidden only during TextEdit and restored before rereading its menu response. Normal native word selection and undo/Edited autosave are retained. No separate undo or clipboard engine.
+- While the menu is open or opens via secondary click in this frame, temporarily remove input.events only during TextEdit/date handling, restore before rendering menu. Prevents accidental Enter/Text/Paste/date edits while retaining popup mouse actions/Escape.
+- `crates/app/src/app.rs`: shared overall top height38→36, accompanying comment.
+- Five i18n message files: translated Cut and Select-all labels; reused existing Copy/Delete/Paste keys.
+- `Cargo.toml`, `Cargo.lock`:0.6.0→0.6.1, exactly27 inherited workspace lock entries, no dependency upgrade.
+
+## Actual tests / review
+- Final gate exit0: `/tmp/deppy-notes-final-corrected-gates-20261005.log`. Notes22 + titlebar6 + top-bar2 + i18n8 = **38passed/0failed/0ignored**. Strict App/i18n all-target Clippy (`-D warnings`), UI capability boundary and workspace fmt all passed. `git diff --check` passed. No whole-workspace or native UI test claim.
+- Exact gated batch: `python3 /private/tmp/deppy-audit-nine-pr-20261004/cargo_gate.py --batch '[["test","--offline","--locked","-q","-p","deppy-sijo","ui::notes::tests"],["test","--offline","--locked","-q","-p","deppy-sijo","designall_titlebar"],["test","--offline","--locked","-q","-p","deppy-sijo","designall_top_bar"],["test","--offline","--locked","-q","-p","i18n"],["clippy","--offline","--locked","-p","deppy-sijo","-p","i18n","--all-targets","--","-D","warnings"],["run","--offline","--locked","-q","-p","xtask","--","check-boundary"],["fmt","--all","--","--check"]]'`.
+- Real gesture RED: right-click collapses selection to empty. Ordinary original double-click passes at real1/60s timing; new test confirms clicked word stays selected through right-click, with no old anchor. `/tmp/deppy-notes-red-real-timing-20261005.log`.
+- Actual independent CLI source review6.1-sol/xhigh found one Medium: open menu's Enter edited/autosaved the note. Root RED reproduces `first middle last`→`first \n last`; `/tmp/deppy-notes-review-red-20261005.log`. Also reproduced same-frame right-click+Enter RED in `/tmp/deppy-notes-coalesced-red-20261005.log`; both corrected in final gate.
+- Focused independent follow-up6.1-sol/xhigh exited0, **no confirmed remaining findings**: `/private/tmp/deppy-notes-20261005/followup-result.txt`. Initial source review `/private/tmp/deppy-notes-20261005/review-result.txt`.
+- Actual copy/cut/delete outputs, undo+Edited notifications, select-all/native-paste event, Korean/emoji character offsets, workspace-switch cancellation and menu keyboard guards asserted in offscreen egui. Tests do not read/write actual OS clipboard, user files or user PTYs.
+
+## Failed approaches
+- Default kittest250ms/event cannot produce a double-click; that failure discarded, fixture changed to1/60s.
+- Hiding pointer state also hid initial context-menu response; fixed by restoring pointer then rereading registered response.
+- Unicode fixture changed a same-workspace stored snapshot after initial render; sync correctly ignored stale snapshot. Use explicit external edit API for fixture.
+- `metadata --no-deps` did not update lock; first locked gate refused before tests. Offline full metadata updated only27 inherited workspace versions.
+- First release/package succeeded before review correction, never delivered/executed: preserved `target/review-build-0.6.1-notes-unreleased-20261005/`. Final artifact must be freshly built into `target/bundle-0.6.1/`; no version0.6.1 has yet been shipped.
+
+## Remaining / next exact commands
+- Source commit, then `DEPPY_REQUIRE_TRUSTED_SIGNING=0 DEPPY_ALLOW_UNTRUSTED_SIGNING=1 sh /private/tmp/deppy-notes-20261005/package-0.6.1.sh` (fresh versioned destination, gated offline/locked build, no app launch).
+- Verify metadata/embedded version and both plist fields0.6.1, package signatures/content, unchanged old running executable/ZIP; record source commit and artifact proof, journal, documentation commit. No further optional tests/research or app restart; no push.
+
+---
+
 # CODEX_HANDOFF — task completed, 2026-10-05(KST)
 
 ## Latest task: commit and push — 2026-10-05(KST)

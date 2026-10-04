@@ -21,7 +21,7 @@ use crate::document_io;
 /// 커스텀 상단 타이틀바 높이 — macOS 신호등(닫기/최소화/전체화면) 수직 중앙 정렬에도
 /// 쓰인다(main.rs의 `set_traffic_light_titlebar_height`). 값이 바뀌면 신호등도 다시
 /// 어긋나므로 두 곳이 이 상수 하나만 본다.
-pub(crate) const TOP_BAR_HEIGHT: f32 = 38.0;
+pub(crate) const TOP_BAR_HEIGHT: f32 = 36.0;
 const DESIGNALL_TOP_BAR_SEPARATOR_VISIBLE: bool = false;
 const TOP_BAR_TEXT_BUTTON_HORIZONTAL_PADDING: f32 = 20.0;
 
@@ -32071,7 +32071,7 @@ impl eframe::App for App {
         // 아래에서 함께 처리한다.
         let mut inbox_click = None;
         // 타이틀바 통합 바: 패널 기본 inner_margin(8)을 없애 상단 경계에 붙이고 좌측
-        // 여백을 제거한다(#67 사용자). 항목은 신호등과 38pt 브랜드 바 안에서
+        // 여백을 제거한다(#67 사용자). 항목은 신호등과 36pt 브랜드 바 안에서
         // 맞춰 세로 중앙 정렬.
         let bar_h = TOP_BAR_HEIGHT;
         let top_frame =

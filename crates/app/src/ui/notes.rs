@@ -30,6 +30,8 @@ pub struct NotesUi {
     loaded_workspace: Option<String>,
     /// 다음 렌더에서 텍스트 영역에 커서를 놓는다(탭 진입 시 App/사이드바가 요청).
     focus_pending: bool,
+    /// 메뉴 명령은 다음 렌더의 이 TextEdit 안에서만 처리해 실행 취소/저장을 재사용한다.
+    pending_edit: Option<(egui::Event, egui::text::CCursorRange)>,
 }
 
 impl NotesUi {
@@ -50,6 +52,7 @@ impl NotesUi {
         }
         self.buffer = input.stored.unwrap_or_default().to_owned();
         self.loaded_workspace = Some(input.workspace_id.to_owned());
+        self.pending_edit = None;
     }
 
     pub fn render(
@@ -60,6 +63,22 @@ impl NotesUi {
     ) -> Option<NotesAction> {
         self.sync(&input);
         let edit_id = text_id(input.workspace_id);
+        let previous_response = ui.ctx().read_response(edit_id);
+        let menu_open = previous_response
+            .as_ref()
+            .is_some_and(egui::Response::context_menu_opened);
+        if menu_open || self.pending_edit.is_some() {
+            ui.memory_mut(|memory| memory.request_focus(edit_id));
+        }
+        // 메뉴 중에도 선택 표시는 유지하지만 키 입력은 메뉴가 처리해야 한다.
+        // TextEdit 렌더 동안만 이벤트를 비우고, 메뉴를 그리기 전에 되돌린다.
+        // 빠른 우클릭 + Enter가 같은 프레임에 도착해도 메뉴를 여는 입력을 보호한다.
+        let menu_input = menu_open
+            || previous_response
+                .as_ref()
+                .is_some_and(egui::Response::secondary_clicked);
+        let menu_events =
+            menu_input.then(|| ui.input_mut(|input| std::mem::take(&mut input.events)));
 
         // ⌘⇧D — 커서 위치에 오늘 날짜 줄을 삽입한다. 반드시 메모 TextEdit이
         // 포커스를 쥐고 있을 때만 반응해야 한다(다른 곳에서 눌렀는데 메모가
@@ -70,7 +89,8 @@ impl NotesUi {
         // 버퍼/커서를 바꿔야 같은 프레임에 반영된다(composer.rs의
         // consume-before-draw 관례와 동일).
         let mut date_inserted = false;
-        if ui.ctx().memory(|memory| memory.has_focus(edit_id))
+        if self.pending_edit.is_none()
+            && ui.ctx().memory(|memory| memory.has_focus(edit_id))
             && consume_key_exact(ui.ctx(), NOTE_DATE_MODIFIERS, NOTE_DATE_KEY)
         {
             let char_cursor: usize = egui::text_edit::TextEditState::load(ui.ctx(), edit_id)
@@ -99,6 +119,18 @@ impl NotesUi {
                 date_inserted = true;
             }
         }
+
+        let injected_edit = if let Some((event, selection)) = self.pending_edit.take() {
+            let mut state =
+                egui::text_edit::TextEditState::load(ui.ctx(), edit_id).unwrap_or_default();
+            state.cursor.set_char_range(Some(selection));
+            state.store(ui.ctx(), edit_id);
+            // 먼저 메뉴 명령, 그 다음 실제 키 입력 순서로 처리한다.
+            ui.input_mut(|input| input.events.insert(0, event));
+            true
+        } else {
+            false
+        };
 
         let tokens = designall::tokens(ui.visuals());
 
@@ -130,7 +162,22 @@ impl NotesUi {
         let row_height = ui.text_style_height(&egui::TextStyle::Body);
         let min_rows = ((viewport.height() - 12.0) / row_height).floor().max(3.0) as usize;
 
-        let response = egui::Frame::NONE
+        // egui0.36 TextEdit은 any_pressed()로 선택 시작점을 갱신한다.
+        // 우클릭은 선택을 유지해야 하므로 이 위젯을 그릴 때만 pointer state를
+        // 숨기고 바로 복원한다. 다른 UI의 우클릭 입력은 그대로 전달한다.
+        let secondary_only = ui.input(|input| {
+            !input.pointer.primary_down()
+                && (input.pointer.secondary_down()
+                    || input
+                        .pointer
+                        .button_released(egui::PointerButton::Secondary))
+        });
+        if secondary_only && ui.ctx().is_being_dragged(edit_id) {
+            ui.ctx().stop_dragging();
+        }
+        let saved_pointer =
+            secondary_only.then(|| ui.input_mut(|input| std::mem::take(&mut input.pointer)));
+        let output = egui::Frame::NONE
             .inner_margin(egui::Margin::same(INSET as i8))
             .show(ui, |ui| {
                 // 내용이 칸을 넘으면 **안에서** 스크롤한다. 사이드바 전체가 밀리거나
@@ -138,19 +185,81 @@ impl NotesUi {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.add(
-                            egui::TextEdit::multiline(&mut self.buffer)
-                                .id(edit_id)
-                                .hint_text(catalog.t("notes.placeholder", &[]))
-                                .frame(borderless)
-                                // 내용에 따라 세로로 자란다 — 스크롤은 바깥 ScrollArea가 맡는다.
-                                .desired_rows(min_rows)
-                                .desired_width(f32::INFINITY),
-                        )
+                        egui::TextEdit::multiline(&mut self.buffer)
+                            .id(edit_id)
+                            .hint_text(catalog.t("notes.placeholder", &[]))
+                            .frame(borderless)
+                            // 내용에 따라 세로로 자란다 — 스크롤은 바깥 ScrollArea가 맡는다.
+                            .desired_rows(min_rows)
+                            .desired_width(f32::INFINITY)
+                            .show(ui)
                     })
                     .inner
             })
             .inner;
+        if let Some(pointer) = saved_pointer {
+            ui.input_mut(|input| input.pointer = pointer);
+        }
+        if injected_edit {
+            // 이 leaf가 넣은 이벤트를 다른 편집기/터미널로 누출하지 않는다.
+            ui.input_mut(|input| {
+                input.events.remove(0);
+            });
+        }
+        if let Some(events) = menu_events {
+            ui.input_mut(|input| input.events = events);
+        }
+        let response = &output.response;
+        // 위젯의 텍스트 처리는 pointer를 숨겼지만, 메뉴는 복원된 우클릭 응답을 쓴다.
+        let menu_response = ui.ctx().read_response(edit_id);
+        let selection = output
+            .state
+            .cursor
+            .range(&output.galley)
+            .unwrap_or_default();
+        let has_selection = !selection.is_empty();
+        if let Some(menu_response) = menu_response {
+            menu_response.context_menu(|ui| {
+                let commands = [
+                    ("notes.menu.cut", egui::Event::Cut, has_selection),
+                    ("action.copy", egui::Event::Copy, has_selection),
+                    (
+                        "shortcuts.action.paste",
+                        egui::Event::Paste(String::new()),
+                        true,
+                    ),
+                    (
+                        "action.delete",
+                        note_key_event(egui::Key::Backspace, egui::Modifiers::NONE),
+                        has_selection,
+                    ),
+                    (
+                        "notes.menu.select_all",
+                        note_key_event(egui::Key::A, egui::Modifiers::COMMAND),
+                        !self.buffer.is_empty(),
+                    ),
+                ];
+                for (label, event, enabled) in commands {
+                    if ui
+                        .add_enabled(enabled, egui::Button::new(catalog.t(label, &[])))
+                        .clicked()
+                    {
+                        match event {
+                            egui::Event::Copy => ui
+                                .ctx()
+                                .copy_text(selection.slice_str(&self.buffer).to_owned()),
+                            egui::Event::Paste(_) => ui
+                                .ctx()
+                                .send_viewport_cmd(egui::ViewportCommand::RequestPaste),
+                            event => self.pending_edit = Some((event, selection)),
+                        }
+                        response.request_focus();
+                        ui.close();
+                        ui.ctx().request_repaint();
+                    }
+                }
+            });
+        }
 
         // 하단 한 줄만 둔다 — 포커스 색은 **쓰지 않는다**(2026-08-10 사용자: 정확하게
         // 안 보이게). 탭의 선택 인디케이터가 이미 「메모」에 있어 어디 있는지 알 수 있고,
@@ -179,6 +288,17 @@ impl NotesUi {
     pub fn apply_external_edit(&mut self, workspace_id: &str, body: String) {
         self.buffer = body;
         self.loaded_workspace = Some(workspace_id.to_owned());
+        self.pending_edit = None;
+    }
+}
+
+fn note_key_event(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+    egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers,
     }
 }
 
@@ -300,6 +420,327 @@ fn insert_date_line(buffer: &str, cursor: usize, date: &str) -> (String, usize) 
 
 #[cfg(test)]
 mod tests {
+    struct NoteHarnessState {
+        notes: NotesUi,
+        edited: Option<String>,
+        workspace: &'static str,
+        stored: &'static str,
+        copied: Vec<String>,
+    }
+
+    fn note_harness(catalog: &i18n::Catalog) -> egui_kittest::Harness<'_, NoteHarnessState> {
+        let mut notes = NotesUi::new();
+        notes.request_focus();
+        egui_kittest::Harness::builder()
+            .with_size(egui::vec2(320.0, 300.0))
+            .with_step_dt(1.0 / 60.0)
+            .build_ui_state(
+                move |ui, state: &mut NoteHarnessState| {
+                    if let Some(NotesAction::Edited(body)) = state.notes.render(
+                        ui,
+                        NotesInput {
+                            workspace_id: state.workspace,
+                            stored: Some(state.stored),
+                        },
+                        catalog,
+                    ) {
+                        state.edited = Some(body);
+                    }
+                    ui.output(|output| {
+                        for command in &output.commands {
+                            if let egui::OutputCommand::CopyText(text) = command {
+                                state.copied.push(text.clone());
+                            }
+                        }
+                    });
+                },
+                NoteHarnessState {
+                    notes,
+                    edited: None,
+                    workspace: "ws-a",
+                    stored: "first middle last",
+                    copied: Vec::new(),
+                },
+            )
+    }
+
+    fn note_point(
+        harness: &egui_kittest::Harness<'_, NoteHarnessState>,
+        index: usize,
+    ) -> egui::Pos2 {
+        harness
+            .output()
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == harness.state().notes.buffer => {
+                    let cursor = text.galley.pos_from_cursor(egui::text::CCursor::new(index));
+                    Some(text.pos + cursor.center().to_vec2() + egui::vec2(0.1, 0.0))
+                }
+                _ => None,
+            })
+            .expect("the rendered note text must be present")
+    }
+
+    fn note_click(
+        harness: &mut egui_kittest::Harness<'_, NoteHarnessState>,
+        pos: egui::Pos2,
+        button: egui::PointerButton,
+    ) {
+        harness.event(egui::Event::PointerMoved(pos));
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos,
+                button,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        harness.step();
+    }
+
+    fn selected_note(harness: &egui_kittest::Harness<'_, NoteHarnessState>) -> String {
+        egui::text_edit::TextEditState::load(&harness.ctx, text_id(harness.state().workspace))
+            .unwrap()
+            .cursor
+            .char_range()
+            .unwrap()
+            .slice_str(&harness.state().notes.buffer)
+            .to_owned()
+    }
+
+    fn drag_middle(harness: &mut egui_kittest::Harness<'_, NoteHarnessState>) {
+        harness.run();
+        let start = note_point(harness, 6);
+        let end = note_point(harness, 12);
+        harness.drag_at(start);
+        harness.step();
+        harness.event(egui::Event::PointerMoved(end));
+        harness.step();
+        harness.drop_at(end);
+        harness.step();
+        assert_eq!(selected_note(harness), "middle");
+    }
+
+    #[test]
+    fn kittest_note_right_click_preserves_drag_selection_and_opens_edit_menu() {
+        use egui_kittest::kittest::Queryable as _;
+        let catalog = catalog();
+        let mut harness = note_harness(&catalog);
+        drag_middle(&mut harness);
+        let point = note_point(&harness, 9);
+        note_click(&mut harness, point, egui::PointerButton::Secondary);
+        harness.run();
+        assert_eq!(selected_note(&harness), "middle");
+        harness.get_by_label(&catalog.t("action.copy", &[]));
+        harness.get_by_label(&catalog.t("action.delete", &[]));
+    }
+
+    #[test]
+    fn kittest_note_double_click_replaces_old_anchor_with_clicked_word() {
+        let catalog = catalog();
+        let mut harness = note_harness(&catalog);
+        harness.run();
+        let start = note_point(&harness, 0);
+        note_click(&mut harness, start, egui::PointerButton::Primary);
+        harness.run_steps(30); // Separate the old click from this double-click.
+        let middle = note_point(&harness, 9);
+        note_click(&mut harness, middle, egui::PointerButton::Primary);
+        note_click(&mut harness, middle, egui::PointerButton::Primary);
+        harness.run();
+        assert_eq!(selected_note(&harness), "middle");
+        let point = note_point(&harness, 9);
+        note_click(&mut harness, point, egui::PointerButton::Secondary);
+        harness.run();
+        assert_eq!(selected_note(&harness), "middle");
+    }
+
+    fn open_note_menu(harness: &mut egui_kittest::Harness<'_, NoteHarnessState>) {
+        let point = note_point(harness, 9);
+        note_click(harness, point, egui::PointerButton::Secondary);
+        harness.run();
+    }
+
+    #[test]
+    fn kittest_note_menu_copy_cut_delete_preserve_undo_and_autosave() {
+        use egui_kittest::kittest::Queryable as _;
+        let catalog = catalog();
+        for (label, copies, edits) in [
+            ("action.copy", true, false),
+            ("notes.menu.cut", true, true),
+            ("action.delete", false, true),
+        ] {
+            let mut harness = note_harness(&catalog);
+            drag_middle(&mut harness);
+            open_note_menu(&mut harness);
+            harness.get_by_label(&catalog.t(label, &[])).click();
+            harness.run();
+            assert_eq!(
+                harness.state().copied,
+                if copies { vec!["middle"] } else { vec![] },
+                "{label}"
+            );
+            if edits {
+                assert_eq!(harness.state().notes.buffer, "first  last", "{label}");
+                assert_eq!(
+                    harness.state().edited.as_deref(),
+                    Some("first  last"),
+                    "{label}"
+                );
+                harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+                harness.run();
+                assert_eq!(harness.state().notes.buffer, "first middle last", "{label}");
+                assert_eq!(
+                    harness.state().edited.as_deref(),
+                    Some("first middle last"),
+                    "{label}"
+                );
+            } else {
+                assert_eq!(harness.state().notes.buffer, "first middle last");
+                assert!(harness.state().edited.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn kittest_note_menu_select_all_and_native_paste_replace_only_note_text() {
+        use egui_kittest::kittest::Queryable as _;
+        let catalog = catalog();
+        let mut harness = note_harness(&catalog);
+        drag_middle(&mut harness);
+        open_note_menu(&mut harness);
+        harness
+            .get_by_label(&catalog.t("notes.menu.select_all", &[]))
+            .click();
+        harness.run();
+        assert_eq!(selected_note(&harness), "first middle last");
+        open_note_menu(&mut harness);
+        harness
+            .get_by_label(&catalog.t("shortcuts.action.paste", &[]))
+            .click();
+        harness.step();
+        assert!(
+            harness.output().viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .iter()
+                .any(|command| matches!(command, egui::ViewportCommand::RequestPaste))
+        );
+        // The native backend returns this event. No OS clipboard is read by this test.
+        harness.event(egui::Event::Paste("한글 메모🙂".to_owned()));
+        harness.run();
+        assert_eq!(harness.state().notes.buffer, "한글 메모🙂");
+        assert_eq!(harness.state().edited.as_deref(), Some("한글 메모🙂"));
+    }
+
+    #[test]
+    fn kittest_note_menu_unicode_delete_uses_character_offsets() {
+        use egui_kittest::kittest::Queryable as _;
+        let catalog = catalog();
+        let mut harness = note_harness(&catalog);
+        harness.state_mut().stored = "앞 메모🙂 뒤";
+        harness
+            .state_mut()
+            .notes
+            .apply_external_edit("ws-a", "앞 메모🙂 뒤".to_owned());
+        harness.run();
+        let start = note_point(&harness, 2);
+        let end = note_point(&harness, 5);
+        harness.drag_at(start);
+        harness.step();
+        harness.event(egui::Event::PointerMoved(end));
+        harness.step();
+        harness.drop_at(end);
+        harness.step();
+        assert_eq!(selected_note(&harness), "메모🙂");
+        let point = note_point(&harness, 3);
+        note_click(&mut harness, point, egui::PointerButton::Secondary);
+        harness.run();
+        harness
+            .get_by_label(&catalog.t("action.delete", &[]))
+            .click();
+        harness.run();
+        assert_eq!(harness.state().notes.buffer, "앞  뒤");
+        assert_eq!(harness.state().edited.as_deref(), Some("앞  뒤"));
+    }
+
+    #[test]
+    fn kittest_note_menu_edit_is_not_applied_after_workspace_switch() {
+        use egui_kittest::kittest::Queryable as _;
+        let catalog = catalog();
+        let mut harness = note_harness(&catalog);
+        drag_middle(&mut harness);
+        open_note_menu(&mut harness);
+        harness
+            .get_by_label(&catalog.t("action.delete", &[]))
+            .click();
+        harness.step(); // Menu queues the edit; it has not reached TextEdit yet.
+        assert!(harness.state().notes.pending_edit.is_some());
+        harness.state_mut().workspace = "ws-b";
+        harness.state_mut().stored = "B의 메모";
+        harness.run();
+        assert_eq!(harness.state().notes.buffer, "B의 메모");
+        assert!(harness.state().edited.is_none());
+    }
+
+    #[test]
+    fn kittest_note_open_menu_keyboard_never_edits_or_autosaves_text() {
+        let catalog = catalog();
+        for event in [
+            note_key_event(egui::Key::Enter, egui::Modifiers::NONE),
+            egui::Event::Text("x".to_owned()),
+            egui::Event::Paste("unexpected".to_owned()),
+            note_key_event(NOTE_DATE_KEY, NOTE_DATE_MODIFIERS),
+        ] {
+            let mut harness = note_harness(&catalog);
+            drag_middle(&mut harness);
+            open_note_menu(&mut harness);
+            harness.event(event.clone());
+            harness.run();
+            assert_eq!(
+                harness.state().notes.buffer,
+                "first middle last",
+                "{event:?}"
+            );
+            assert!(harness.state().edited.is_none(), "{event:?}");
+        }
+    }
+
+    #[test]
+    fn kittest_note_right_click_and_enter_in_same_frame_never_edit_text() {
+        use egui_kittest::kittest::Queryable as _;
+        let catalog = catalog();
+        let mut harness = note_harness(&catalog);
+        drag_middle(&mut harness);
+        let pos = note_point(&harness, 9);
+        let mut events = vec![egui::Event::PointerMoved(pos)];
+        for pressed in [true, false] {
+            events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        events.push(note_key_event(egui::Key::Enter, egui::Modifiers::NONE));
+        harness.input_mut().events = events;
+        harness.step();
+        harness.run();
+        assert_eq!(harness.state().notes.buffer, "first middle last");
+        assert!(harness.state().edited.is_none());
+        harness.get_by_label(&catalog.t("action.copy", &[]));
+        assert_eq!(selected_note(&harness), "middle");
+        harness.key_press(egui::Key::Escape);
+        harness.run();
+        assert!(
+            !harness
+                .ctx
+                .read_response(text_id("ws-a"))
+                .unwrap()
+                .context_menu_opened()
+        );
+        assert_eq!(harness.state().notes.buffer, "first middle last");
+    }
+
     use super::*;
 
     fn catalog() -> i18n::Catalog {

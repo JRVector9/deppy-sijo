@@ -92,3 +92,7 @@ xtask는 leaf의 Runtime/OS I/O 금지를 유지하며, dedicated host adapters�
 [cmux PR8848](https://github.com/manaflow-ai/cmux/pull/8848)은 Ghostty IOSurface frame identity 순환 및 이미 소유한 일반 입력의 shortcut 처리 단축을 다룬다. 여기서 확인한 Deppy 원인은 egui protocol admission 순서와 소유권 유실이다. [Warp 공식 known issues](https://docs.warp.dev/support-and-community/troubleshooting-and-support/known-issues/)는 shell integration/locale/EDR 등 별도의 원인을 설명한다. 외부 renderer 수정을 그대로 적용할 근거는 발견하지 않았다.
 
 앱 버전/lock/release/handoff는 root가 소유한다. 이 isolated 조사·test build는0.5.5 기준이며 배포하지 않았다. root의 통합 소스 리뷰·전체 gate·0.6.0 packaging/version 검증이 후속 단계다.
+
+## Root final integration result — 2026-10-05
+
+Finalsource d1818e3355e9604998e6581285bad8e7edd88ffb /productcommit c532ce0ad2c5edcc9e3dcbc779a61b37d5ea53a2. All confirmed follow-up/corrective CLI findings addressed; final tiny review no confirmed findings. Coherent fullsuite4,826passed/0failed/47existingignored, workspace strict/boundary/deps/fmt/diff exit0. Local0.6.0releasebuild/package/version/hash verified; no app stop/launch/restart. See [final results](2026-10-04-final-improvements-report.md) for final source and measurement limits.

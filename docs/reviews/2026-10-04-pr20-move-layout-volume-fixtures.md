@@ -70,4 +70,8 @@ git diff --check
 
 Product/test source was unchanged after the final strict batch; this report records executed results. No native app launch/restart/stop, real user clipboard/Trash/data/PTY, secrets, version/lock change, root documentation, push or delegation. Root's earlier0.6.0 artifact remains unreleased; this child does not claim release completion.
 
-Next root commands in the approved integration worktree: `git show --stat fix/audit-pr20-move-layout-volume-fixtures-20261004`; `git cherry-pick fix/audit-pr20-move-layout-volume-fixtures-20261004`. Root then runs the corrected coherent full gate and the scoped `gpt-6.1-sol`/`xhigh` immutable CLI review before updating its package. Child freezes the scoped Korean commit and waits.
+Next root commands in the approved integration worktree: `git show --stat fix/audit-pr20-move-layout-volume-fixtures-20261004`; `python3 /private/tmp/deppy-audit-nine-pr-20261004/integrate.py 20` (completed while preserving real HEAD/index). Root then runs the corrected coherent full gate and the scoped `gpt-6.1-sol`/`xhigh` immutable CLI review before updating its package. Child freezes the scoped Korean commit and waits.
+
+## Root final integration result — 2026-10-05
+
+Integrated clean6a796b5 into final freeze d1818e3/sourcec532ce0. Tiny immutable CLI confirmed both findings addressed with no confirmed new issue. Coherent full suite4,826passed/0failed/47existingignored; allstrictgates passed. Local0.6.0 build/package/version verification passed, app was not launched or restarted. See consolidated final improvements report.

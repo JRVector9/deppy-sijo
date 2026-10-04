@@ -195,3 +195,7 @@ Final64-name native preflight sample: printable ASCII **0 probes /2,607µs**;64 
 ### Scoped handoff
 
 Changed only `crates/app/src/app.rs`, `crates/app/src/native_key_monitor.rs`, `crates/app/src/ui/file_tree.rs` and this report after9d3. No version/lock, global handoff, native app, user clipboard/Trash/data, PTY, push or agent delegation. No product/test source change after final strict batch; this documentation update records its actual result. Root owns immutable independent review, sequential integration with the PR10 App tail, combined gates and version0.6.0 release/package checks. Required next root commands: `git show --stat <frozen-child-sha>`; `python3 /private/tmp/deppy-audit-nine-pr-20261004/integrate.py 11r` (root preserves its real HEAD/index; the single App-tail overlap was manually merged preserving both tails); run the shared gate's coherent combined suite on the merged source. Root retains the unambiguous frame-tail ordering if PR10 adds a terminal input adapter there.
+
+## Root final integration result — 2026-10-05
+
+Finalsource d1818e3355e9604998e6581285bad8e7edd88ffb /productcommit c532ce0ad2c5edcc9e3dcbc779a61b37d5ea53a2. All confirmed follow-up/corrective CLI findings addressed; final tiny review no confirmed findings. Coherent fullsuite4,826passed/0failed/47existingignored, workspace strict/boundary/deps/fmt/diff exit0. Local0.6.0releasebuild/package/version/hash verified; no app stop/launch/restart. See [final results](2026-10-04-final-improvements-report.md) for final source and measurement limits.

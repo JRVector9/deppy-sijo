@@ -1,6 +1,6 @@
 # 성능·메모리·에이전트 터미널 개선 결과
 
-상태: 통합 검증 진행 중. 배포 완료를 뜻하지 않는다. 현재 실행 중인 앱은 종료하거나 재실행하지 않았다.
+상태: **코드 구현·독립 리뷰·최종 전체 테스트·0.6.0 재빌드 및 패키지 검증 완료.** 완료일은 2026-10-05(KST)이며 문서·로그 경로는 작업 시작일을 유지한다. 현재 실행 중인 앱은 종료하거나 재실행하지 않았다.
 
 ## 작업 범위
 
@@ -46,7 +46,7 @@
 
 추가 3개 수정의 통합 named gate 및 strict workspace Clippy/fmt가 통과했다. 독립 CLI는 PR13의 종료 PTY destructor가 권한 잠금 안에서 실행되는 추가 경로를 확인했다. 이를 즉시 입력 경로에서 분리하고, 실제 자식 프로세스 종료 handshake RED/GREEN과 별도 소스 CLI로 검증했다. 마지막 CLI는 확인된 도입 버그가 없었다. 관련 최종 runtime 336·Session 75·PTY 45 통과 및 strict Clippy/fmt를 확인했다.
 
-기존 private secret-env fixture의 timeout은 baseline에서도 발생했다. 중간 실패 기록을 보존하고 실패 시 자체 테스트 이벤트/행/저장소 상태를 확인하는 진단만 추가했다. 마지막 전체 runtime gate는 336 passed였으며, timeout 원인을 확인했다고 주장하지 않는다. 최종 coherent gate에서 다시 확인한다.
+기존 private secret-env fixture의 timeout은 baseline에서도 발생했다. 중간 실패 기록을 보존하고 실패 시 자체 테스트 이벤트/행/저장소 상태를 확인하는 진단만 추가했다. 해당 단계의 전체 runtime gate는336 passed였으며, 과거 timeout 원인을 모두 확인했다고 주장하지 않는다. 이후 확인한 native 키체인 fixture 문제와 최종 Runtime342 통과 결과는 아래에 구분해 기록한다.
 
 ## 후속 수정 결과
 
@@ -57,27 +57,68 @@
 
 PR10은 빠른 연속 입력을 합칠 때 버퍼 확장256회→9회도 확인했다. 실제16ms 재시도가 egui에서 즉시 repaint가 되는 경우를 재현·수정했다:0µs→15,867µs. 한글 IME Commit+Enter가 같은 pass에서 정확한 한 입력으로 private cat까지 전달됐으며, 단일 fixture host356µs/echo3,223µs다. 실제 실행 중인 Grok/provider 화면을 조작하거나 측정한 값은 아니다. 채널 admission과 이후 PTY acceptance는 구분하며 이미 접수된 입력을 무조건 재전송하지 않는다.
 
-PR11은 공통 상한4,096개/경로합계1MiB/개별32KiB, 조상 중복 제거, 전체 충돌·위험 경로 preflight, 원래 tree root/generation과 연속 삭제 재확인, destructive Cmd+Option+V tree 포커스, typed DND를 적용했다. OS clipboard/Trash는 주입한 private provider로만 검증했다. 알려진 preflight 실패는 첫 효과 전 거절하며, 이후 OS 오류에 대한 여러 파일 rollback을 보장하지 않는다.
+PR11은 공통 상한4,096개/경로합계1MiB/개별32KiB, 조상 중복 제거, 전체 충돌·위험 경로 preflight, 원래 tree root/generation과 연속 삭제 재확인, destructive Cmd+Option+V tree 포커스, typed DND를 적용했다. OS clipboard/Trash는 주입한 private provider로만 검증했다. 알려진 preflight 실패는 첫 원본/내용 전송 전 거절하며, 이후 OS 오류에 대한 여러 파일 rollback을 보장하지 않는다.
 
-세부 명령·실패 기록·측정 범위: [직접 입력 PR10](2026-10-04-pr10-direct-input-latency.md), [다중 선택 PR11](2026-10-04-pr11-tree-multiselect.md). 두 clean commit을 실제 root index 변경 없이 통합했다. 통합 제품 소스 freeze는 `f875919b3d0fe9355f51126bba30b29cf6681eda`다.
+세부 명령·실패 기록·측정 범위: [직접 입력 PR10](2026-10-04-pr10-direct-input-latency.md), [다중 선택 PR11](2026-10-04-pr11-tree-multiselect.md). 두 clean commit을 실제 root index 변경 없이 통합했고 아래 corrective PR도 추가했다. 초기 후속 소스 freeze `f875919b3d0fe9355f51126bba30b29cf6681eda`는 역사적 검증 기준이며 최종 제품 소스는 아래에 기록한다.
 
-## 최종 검증과 후속 작업
+## 마지막 리뷰와 실제 테스트 오류 수정
 
-### 마지막 통합 검증에서 확인한 추가 수정
+후속 PR의 독립 CLI는 실제 backend 이벤트와 디스크 파일명 규칙에서 두 버그를 확인했다. PR11r에서 모두 수정했고, 추가 검토에서 확인한 키보드 배열과 테스트 가정도 PR20에서 수정했다.
 
-고정 소스 `f875919b`의 두 후속 PR 독립 CLI는 PR10 지적 없이, PR11에서 아래 두 실제 경로를 확인했다. 수정과 마지막 재검증은 진행 중이다.
+- macOS `⌘⌥V` press가 egui-winit에서 Paste 또는 무이벤트로 바뀌는 경로를 기존 native monitor의 별도 이동 제스처로 처리한다. 식별 없는 Paste는 이동 시작을 승인하지 않으며 다른 입력 소유자에서 시작한 반복도 나중에 트리로 연결되지 않는다.
+- 목적지 볼륨이 대소문자/유니코드 표기를 같은 이름으로 취급할 때 전체 선택 충돌을 원본/내용 전송 전에 거절한다. 알려진 APFS/HFS ASCII 경로는 임시 probe 0개, 유니코드/알 수 없는 볼륨은 제한된 목적지 probe 후 정리한다. 임시 probe 자체는 metadata 효과다.
+- Dvorak 등의 논리 K가 물리 V 위치에 있을 때 `⌘⌥K`로 이동을 실행하던 경로는 이동 전용 classifier로 거절한다. 기존 일반 붙여넣기·복사는 유지한다.
+- 회귀 테스트는 디스크를 case-insensitive라고 가정하지 않고 실제 create-new 이름 규칙을 관찰한다. 동등한 이름의 전송 전 거절과 서로 다른 ASCII/한글 파일의 전체 복사·이동 성공을 모두 검증했다.
 
-- pinned egui-winit가 Cmd+Option+V press를 Paste 또는 무이벤트로 변환하므로, 주입한 pressed-key fixture와 달리 실제 파일 전용 clipboard move는 시작하지 않는다. 실제 native gesture 계약을 수정한다.
-- 목적지 디스크의 대소문자/정규화 규칙과 raw OsStr planned-name 비교가 달라, `p/a.txt`·`q/A.txt` 그룹에서 알려진 충돌을 첫 효과 전에 놓친다. 실제 destination volume 규칙으로 preflight를 보완한다.
+전체 검증 중 기존 Runtime fixture가 native 키체인 안에서 대기하는 문제도 확인했다. 실제 테스트 프로세스 sample은 `SecretStoreResolver→KeyringSecretStore→SecItemCopyMatching` 경로였다. 기존 전역 mock 등록이 의존 crate의 macOS 구현을 대체하지 못했다. PR18은 테스트 fixture마다 새 메모리 저장소를 명시적으로 주입했다. 제품의 secret resolver·저장소는 변경하지 않았고, 실제 private PTY의 환경 주입·로그 redaction 검증과 timeout도 보존했다.
 
-전체 coherent gate는 Runtime 제외4,475 passed /0 failed /47 existing ignored 후 중단했다. 단독 serial Runtime337은 기존 `로그_secret_scan_평문_없음`에서8분 이상 기다렸다. 테스트 소유 PID76085의 실제 sample은 `SecretStoreResolver→KeyringSecretStore→SecItemCopyMatching` 대기를 확인했다. 기존 keyring mock builder는 의존 crate의 custom macOS 경로를 가로채지 못한다. root는 해당 테스트 프로세스만 종료했고 gate exit101을 보존했다. `cfg(test)` 메모리 저장소를 명시적으로 주입해 이 테스트의 native 키체인 의존을 제거한다. 기존 과거 secret-env timeout의 원인을 모두 증명한 것은 아니다.
+실패 기록은 보존했다. `/tmp/deppy-final-root-workspace-20261004.log`의 Runtime 제외4,475 통과 뒤 Runtime 대기로 종료101인 결과를 전체 통과로 사용하지 않는다. 과거 secret-env timeout의 원인을 모두 같은 문제로 확정한 것도 아니다.
 
-근거: `/tmp/deppy-final-followups-cli-result-20261004.txt`, `/tmp/deppy-final-root-workspace-20261004.log`, `/tmp/deppy-final-runtime-hang-20261004.txt`. 이는 최종 전체 테스트 통과 기록이 아니다.
+마지막 독립 리뷰는 `gpt-6.1-sol` / `xhigh`, 읽기 전용으로 실제 작은 수정분과 호출자를 확인했다. **확인된 도입/미해결 지적 없음**: `/tmp/deppy-pr20-final-cli-result-20261004.txt`. 이전 전체 리뷰·후속 리뷰의 모든 확인된 지적은 각 corrective PR의 실제 RED/GREEN을 거쳐 수정했다. [PR11r 기록](2026-10-04-pr11-tree-multiselect.md), [PR18](2026-10-04-pr18-runtime-secret-test-isolation.md), [PR20](2026-10-04-pr20-move-layout-volume-fixtures.md).
 
+## 최종 통합 검증
 
-- 최초 9개 통합 소스: workspace 4,754 passed / 0 failed / 47 existing ignored, strict workspace all-target Clippy 및 fmt 통과. 이후 리뷰 수정 전의 결과이므로 최종 산출물 검증으로 사용하지 않는다.
-- PR13 최종 격리 소스: runtime 335·session 74·PTY 45 passed, PTY 1 existing ignored; 관련 strict Clippy/fmt 통과.
-- PR14 최종 격리 소스: 실제 private runtime 10개 및 영향 회귀/strict Clippy/fmt 통과.
-- 최종 coherent 소스 전체 테스트, 직접 입력/다중 파일 후속 결과, source commit과 0.6.0 산출물 버전 검증: 진행 중.
+최종 제품 소스 스냅샷: `d1818e3355e9604998e6581285bad8e7edd88ffb`.
+제품 소스 커밋: `c532ce0ad2c5edcc9e3dcbc779a61b37d5ea53a2`.
+두 상태의 `crates/`, `xtask/`, `Cargo.toml`, `Cargo.lock`은 동일하다. 기존 실제 HEAD/index·미커밋 소스는 보존하고 로컬 통합 브랜치 `feat/audit-nine-pr-v0.6.0-20261004`에 커밋했다. 각 PR의 별도 커밋/브랜치도 보존했다. 공개 push는 하지 않았다.
 
-공개 GitHub push나 현재 앱 교체는 이 작업에 포함하지 않았다.
+| 검증 | 최종 실행 결과 |
+|---|---|
+| workspace, Runtime 제외 |4,484 passed /0 failed /47 기존 ignored |
+| Runtime, 직렬 |342 passed /0 failed /0 ignored |
+| 합계(서로 겹치지 않는69그룹) |**4,826 passed /0 failed /47 기존 ignored** |
+| workspace all-target Clippy `-D warnings` |exit0, 새 lint allowance 없음 |
+| fmt / diff check |exit0 |
+| UI boundary |bounded composition-root tail 포함 통과 |
+| 의존성 |27 crates, 금지 edge/순환 없음 |
+
+실행 로그: `/tmp/deppy-final-pr20-root-workspace-20261004.log`. Cargo 공유 target의 잘못된 binary 재사용을 막기 위해 compile부터 테스트 종료까지 자체 gate 잠금을 유지하고 작업트리 전환 때 workspace artifacts를 정리했다. 검증 중 제품 소스를 변경하지 않았다.
+
+정확한 최종 명령은 gate가 다음 Cargo 배열을 순차 실행한다.
+
+```sh
+python3 /private/tmp/deppy-audit-nine-pr-20261004/cargo_gate.py --batch '[
+ ["test","--offline","--locked","-q","--workspace","--exclude","runtime","--","--test-threads=8"],
+ ["test","--offline","--locked","-q","-p","runtime","--","--test-threads=1"],
+ ["clippy","--offline","--locked","--workspace","--all-targets","--","-D","warnings"],
+ ["fmt","--all","--","--check"],
+ ["run","--offline","--locked","-q","-p","xtask","--","check-boundary"],
+ ["run","--offline","--locked","-q","-p","xtask","--","check-deps"]
+]'
+```
+
+## 로컬 재빌드
+
+이전 배포 버전 **0.5.5 → 0.6.0**. gated offline/locked release build와 macOS package verification 모두 exit0. 실제 workspace 멤버27개와 lock entry27개, Cargo 컴파일 메타데이터/바이너리 문자열, 번들의 `CFBundleShortVersionString`·`CFBundleVersion`이0.6.0으로 일치했다. native About은 `CARGO_PKG_VERSION`을 표시하는 소스를 확인했으며 새 앱을 실행해 About UI를 열지는 않았다.
+
+- [최종 앱](../../target/bundle-0.6.0/Deppy%20Sijo.app)
+- [최종 ZIP](../../target/bundle-0.6.0/Deppy%20Sijo.zip)
+- 소스 커밋: `c532ce0ad2c5edcc9e3dcbc779a61b37d5ea53a2`
+- binary SHA256: `2872566b28bf8deb47efca60d8134373a40995dab288e03989d8035e2251ad02`
+- ZIP SHA256: `dc6847b6839682a79373be2b2deb61e16d0dcb4927dfefb2afc61a4fd6c898cb`
+
+앱·두 helper의 서명/architecture/plist/license 및 ZIP 안의 동일 hash를 검증했다. 이는 명시적인 **로컬 개발 산출물** 검증이며 공증된 공개 배포 완료를 뜻하지 않는다. 로그: `/tmp/deppy-release-0.6.0-final-package-20261004.log`; 세부 메타데이터: `/private/tmp/deppy-audit-nine-pr-20261004/release-0.6.0-final-verification.json`.
+
+앞선 검토용0.6.0 번들은 실행·배포하지 않고 `target/review-build-0.6.0-pr11r-unreleased-20261004/`에 따로 보존했다. 실행 중이던 PID21631은 그대로 살아 있고, 기존0.5.3 실행 파일·ZIP의 SHA256과 실제 Git index도 원래와 같음을 읽기 전용으로 확인했다.
+
+실행 중인 앱은 계속 그대로다. 실제 native Grok 화면의 입력 지연, App 전체 RSS/GPU/FPS 또는 Finder 실제 clipboard/Trash를 조작한 검증은 수행하지 않았다. 위 측정은 실제 소스 모듈·private PTY·격리된 파일 작업의 범위다.

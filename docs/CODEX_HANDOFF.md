@@ -1,9 +1,139 @@
-# Active task: nine PR audit fixes and approved follow-ups — 2026-10-04
+# CODEX_HANDOFF — task completed, 2026-10-05(KST)
+
+## Current objective and completed state
+
+The authorized nine audit PRs, direct typing latency **inside the AI terminal**, and Shift+mouse-drag all-selected file copy/move/delete are complete. Root coordinated isolated agents, integrated actual code, fixed every confirmed independent review finding, ran final coherent tests, recorded before/after measurements, and rebuilt/verified a local **0.6.0** artifact. There is no remaining implementation task in this scope.
+
+**Restart remains forbidden.** No native Deppy launch/stop/restart occurred. The original running PID21631 and old0.5.3 executable/ZIP hashes remain unchanged. Do not run `scripts/dev-run.sh`, open the app bundle, or execute the app with `--version` (main has no such CLI flag). A future explicit restart request applies only to that future task.
+
+- Working root: `/Users/jr/Desktop/projects/deppy-sijo-performance`. Original `/Users/jr/Desktop/projects/deppy-sijo` unrelated and untouched.
+- Real root HEAD still `166f8daeb1054cf09a07194fa83bf0a4a19d93ce`, branch `fix/cloud-agent-ended-sessions`; all original dirty/untracked source and real index preserved.
+- Original complete-source baseline: `85631a845d733b340e281df976522be4d4468959`.
+- Final immutable tested/reviewed source: `d1818e3355e9604998e6581285bad8e7edd88ffb`, worktree `/private/tmp/deppy-audit-pr21-20261004`.
+- Final product source commit: **`c532ce0ad2c5edcc9e3dcbc779a61b37d5ea53a2`**, local branch **`feat/audit-nine-pr-v0.6.0-20261004`**. Same product files as final freeze. A following documentation-only commit records completion. No GitHub push/PR publication.
+- Real index SHA256 remains `628583c86018e381fa229c7beaa84547e891bc8e4aeea72eac0bb8db12f7d902`.
+- All direct future CLI/subagent model overrides MUST remain `gpt-6.1-sol` / `xhigh`.
+
+## Completed work / key design decisions
+
+1. Atomic tracked body+CR, exact original session/generation/operation ACK; preserve Rejected/Unknown drafts, no blind resend. Runtime wire21→22.
+2. Live AI process identity plus admission-time foreground/draft/dialog/DEC2004 guards; ordinary fallback/ended shells excluded from automatic input, explicit manual typing retained.
+3. Missing/Loaded/Failed library startup, empty/corrupt originals preserved, bounded serial async checked saves, generated IDs and failed New-save form recovery.
+4. Borrow closed palette drafts, revision/query search cache, virtual rows, bounded editor/undo/template insertion, Fleet reservation/input budgets.
+5. Stable session/workspace draft IDs, bounded live/delivery buffers, serialized durable checkpoint before submit, Pending/Unknown crash warning, workspace hide preserves versus permanent delete clears.
+6. Bounded App-owned image worker, same-handle size/nofollow checks, generation discard and unchanged Arc/texture reuse.
+7. Bounded DB history actor, durable claim before input and finish before reply; original grant/token/target revalidation. Cloud agent's own answer goes to original session output/history, not stdin or hidden background AI.
+8. Busy batch wake/body-clone elimination and same-handle log EOF/batched append; bounded partial-write/external-growth error recovery.
+9. Explicit bounded MCP paste using shared tracked sender; original grant/auth/deadline/identity and actual readiness rechecked; own answers remain original-session history/output.
+10. Direct terminal UI's final non-discarded bounded nonblocking FIFO tail admits max8 commands after widgets. Preserve exact owned known-unsent bytes/target on Busy, bounded actual capacity/coalescing and16ms retry; channel admission is distinct from later PTY acceptance.
+11. Frozen group/root/generation drag payload, common operation-root normalization and4096roots/1MiB aggregate/32KiB path limits. Shared host engine preflights all sources/names/budgets; typed consumers preserve unrelated DND; clipboard origin and internal root authority distinct. Group Trash continuations revalidate original root.
+12. Native nonrepeat MOVE gesture identity and unconditional MOVE-only tail prevent backend Paste suppression/stale focus repeat. MOVE-specific layout predicate rejects other ASCII logical keys on physicalV. Volume-equivalent names refuse before source/content transfer; bounded same-volume Unicode/unknown probes clean first, ordinary APFS/HFS ASCII takes0probes. Later OS errors/races remain nontransactional; no rollback guarantee.
+13. Approval updates queued output before guard; exit clears writable PTY immediately but drops child/joins after authorization locks. Follow-up cancel/replacement revokes its original queued permit. Runtime cfg(test) fixtures inject fresh memory SecretStore; product resolver unchanged.
+
+## Modified files
+
+Exact per-PR source lists live in the coordination manifest and scoped reports. Main modules:
+
+- `crates/app/src/app.rs`, `native_key_monitor.rs`, `agent_detect.rs`, `proc_info.rs`, `prompt_library.rs`, `fleet.rs`, associated workers and `composer_drafts.rs`.
+- `crates/app/src/ui/{workspace,agent_terminal,composer,file_tree,fleet,prompt_palette,markdown_viewer,clipboard_image}.rs`, i18n locales.
+- `crates/runtime/src/{in_process,input_admission,command,event,protocol,remote,lib,test_secret_store}.rs`; PTY input_queue/lib and Session session/status.
+- `crates/agent-mcp/src/{history,lib,server,tests}.rs`; storage logs/db/agent_attention/workspace_identity; `xtask/src/main.rs`.
+- Canonical `Cargo.toml` and27 inherited workspace lock versions0.5.5→0.6.0. No new independent hard-coded app version.
+- Plan, per-PR review reports, final results/checklist and this handoff. Prior popup/document changes were present in baseline and retained.
+
+## Actual final tests and measurements
+
+**Final coherent gate exit0**, `/tmp/deppy-final-pr20-root-workspace-20261004.log`:
+
+| Command / gate | Executed result |
+|---|---|
+|`cargo test --offline --locked -q --workspace --exclude runtime -- --test-threads=8`|4,484passed/0failed/47existingignored,67groups|
+|`cargo test --offline --locked -q -p runtime -- --test-threads=1`|342passed/0failed/0ignored,2groups|
+|Disjoint total|**4,826passed/0failed/47existingignored**|
+|`cargo clippy --offline --locked --workspace --all-targets -- -D warnings`|exit0, no new lint allowances|
+|`cargo fmt --all -- --check` and `git diff --check`|exit0|
+|`cargo run --offline --locked -q -p xtask -- check-boundary`|UI leaves zero capability; bounded composition-root tail passed|
+|`cargo run --offline --locked -q -p xtask -- check-deps`|27crates/no forbidden edge/cycle|
+
+All Cargo above ran through `/private/tmp/deppy-audit-nine-pr-20261004/cargo_gate.py`, holding a global lock through compile AND test execution; on worktree source switch all workspace package artifacts are invalidated, external dependencies retained. No product source mutation during final gate.
+
+Independent final tiny source CLI: `/tmp/deppy-pr20-final-cli-result-20261004.txt`, exit0, **no confirmed findings**, correct6.1-sol/xhigh/read-only. Earlier independent nine/core/follow-up findings all have actual RED/GREEN corrections; last review confirmed both remaining layout/test assumptions addressed. Scoped test groups overlap and must not be summed.
+
+Actual current-source5-median release allocator/module measurement: closed1MiB draft19.701µs/1,048,575B→0B copied;1000checked-save33,620,288→65,917B cumulative allocation,16.193→14.675ms. Cold1000search25.690→26.639ms: **no first-search speedup claim**; unchanged query cache avoids work/allocation. Empty retained draft capacity9,830,400→0B. PR8 real log512chunks512→2writes,3.790→0.616ms; normal2048append metadata2048→0. Direct terminal first-pass0→6B, Busy repaint0→15,867µs, private Korean echo3,223µs single sample. Actual64-file copy/move/delete all member bytes/effects confirmed. See final report for all exact baselines/logs and scopes.
+
+No native Grok UI delay or whole-process RSS/GPU/FPS measurement; no actual user clipboard/OS Trash or user PTY/data/secret access. Private offscreen/backend-shaped egui, test-owned PTYs/files/providers were used.
+
+## Final rebuilt local artifact / version proof
+
+-0.5.5→**0.6.0**, source **c532ce0ad2c5edcc9e3dcbc779a61b37d5ea53a2**.
+-`target/bundle-0.6.0/Deppy Sijo.app`, `target/bundle-0.6.0/Deppy Sijo.zip`.
+- Gated offline/locked release build+macOS package verify exit0: `/tmp/deppy-release-0.6.0-final-package-20261004.log`.
+- Actual workspace_members27/lock27, compile metadata and embedded literal, both plist version fields0.6.0. Native About source uses CARGO_PKG_VERSION; native About UI was not opened.
+- App/helpers signatures/architecture/license, bundle and ZIP content identity verified under explicit local development policy; **not a notarized public release**.
+- Binary SHA256: `2872566b28bf8deb47efca60d8134373a40995dab288e03989d8035e2251ad02`.
+- ZIP SHA256: `dc6847b6839682a79373be2b2deb61e16d0dcb4927dfefb2afc61a4fd6c898cb`.
+- `/private/tmp/deppy-audit-nine-pr-20261004/release-0.6.0-final-verification.json` records all proof and unchanged old PID/hash/index.
+- Superseded **never released/executed** earlier candidate preserved in `target/review-build-0.6.0-pr11r-unreleased-20261004/`.
+
+## Failed approaches / historical evidence
+
+- Initial shared-target compilation-only lock could release before test execution and reuse wrong-worktree binaries. Those counts discarded; final gate uses source invalidation + execution lock.
+- Original synthetic pressedKey did not model pinned egui-winit CmdOptionV suppression; real native+backend-shaped RED exposed it. Popup open_id fixture did not render an actual popup; fixed fixture with Popup.show, guard retained.
+- Raw names missed native case/normalization; initial native tests assumed insensitive volume. Observed create-new fixtures now cover equivalent and distinct ASCII/Korean names. Dvorak physical fallback bug fixed by separate destructive classifier.
+- Final pre-corrective Runtime gate hung in native SecItemCopyMatching because global keyring mock did not replace dependency customMacOS implementation. Only owned testPID76085 was terminated; no Deppy action. Native-free fixture injection keeps existing PTY/secret/redaction assertions. Earlier unrelated timeout causes not all proven identical.
+- Automatic PR11r merge conflicted only at App tail before any write; root preserved both MOVE discard and terminalFIFO tail, both placement guards passed. Other integration failures recorded below were resolved without changing real index/HEAD.
+- Version proof initially counted patched path vendor packages among workspace members; fixed by actual metadata workspace_members27, no product code defect.
+- Strict Boolean lint fixed algebraically, no allow. Earlier failure logs preserved, not cited as passes. Retracted capacity-return suspicion was already correct in immutable PR10; no unnecessary fix/test.
+
+## Remaining work / next agent commands
+
+**None for this implementation/review/rebuild scope.** Do not run optional further tests/research or automatically restart. New user input defines the next task. Read-only inspection commands:
+
+```sh
+git show --stat feat/audit-nine-pr-v0.6.0-20261004
+cat docs/reviews/2026-10-04-final-improvements-report.md
+cat docs/reviews/2026-10-04-nine-pr-implementation-checklist.md
+```
+
+Final report and checklist contain before/after results and completed items. Obsidian journal is in `~/Library/CloudStorage/SynologyDrive-sync_data/Obsidian-Vault/프로젝트 일지/deppy-sijo-performance/`. Original-start-date filenames remain; final completion is Oct5KST.
+
+## Scoped commit ledger
+
+| PR | Clean scoped commit |
+|---|---|
+| 1 | `957ae3b5c56c220f6dee109980c5907bde54d1e8` |
+| 2 | `502bac403a056799e75f00e331d534da7919f4ca` |
+| 3 | `f0b22dd92e361e5053deb03d118905519e7eb083` |
+| 4 | `314ecf376ede58961d910d6e600153261f8b4ffc` |
+| 5 | `78371a7f0b51531160810ae5bc71dc93ee277f81` |
+| 6 | `1234ed9c550adedbcdbc88aa220bc0f96cd9f795` |
+| 7 | `b889969101ebdd637c7c59b06c922ebe837adf81` |
+| 8 | `6aba90515e64a5cbca71d45f96562d0520732fe5` |
+| 9 | `e2cd2c8243372e806a0357f257fb1ddbf83740e4` |
+| 4r | `809bda2f8842e2840f2d4d65f2adc29354801219` |
+| 8r | `3cfe880c88e0a781a3d173458792d9361c518876` |
+| 13 | `5dcc81f69529c49f03fa9d97aa994891f0dd1a5a` |
+| 13r | `87e205811ed41032b943bbbcaf768043f032a3a6` |
+| 14 | `89359378e921a7ffa6a107511f3934823d472ef4` |
+| 15 | `e72f543f7ecd6527359705d8225a2da732ec5872` |
+| 10 | `e428df3ccac7a95bb379ca512b7159d4f3dcebd6` |
+| 11 | `9d3ae0d7232abc02d416f32686b473cf8304e717` |
+| 11r | `350d8d4c5beea108af6fa39396764a246bda9784` |
+| 18 | `0f8c85a934a942156b8b34d0020be1fb24f981b2` |
+| 20 | `6a796b5b30a5ce24458c2faf32d80864921691bb` |
+
+## Previous implementation history (historical, superseded by final state above)
+
+# Historical task: nine PR audit fixes and approved follow-ups — 2026-10-04
 
 ## Latest continuation: independent findings and final integration — 2026-10-04
 
 
 ### Current follow-up and release preparation
+
+- FinalPR20 CLI16077 COMPLETED exit0 no confirmed findings `/tmp/deppy-pr20-final-cli-result-20261004.txt`, bothrequestedfixesacceptedactualcode. Finalcoherentrootgate8808 COMPLETED exit0 `/tmp/deppy-final-pr20-root-workspace-20261004.log`:4,484workspaceexcludingRuntime+342SERIALRuntime=4,826passed/0failed/47existingignored,69groups; strictworkspacealltargetClippy/fmt/boundary/deps/diff0. Actualcountsparsed, no filtered-overlap sum. Productfrozend1818e3/sourcec532ce0. Final no-launchpackage99516 active `/tmp/deppy-release-0.6.0-final-package-20261004.log`. Consolidatedreportupdated reviewedcode/fullresults and supersededfailedlogs; finalartifact/version/checklist/journal/docscommit remain, NOmoreoptionaltests/reviews.
+
+- Final PR20 integrated immutable source d1818e3355e9604998e6581285bad8e7edd88ffb /private/tmp/deppy-audit-pr21-20261004; scoped278-lineactualcodeCLI16077 resumespreviousreviewcontext01a10764, actualheader6.1-sol/xhigh/read-only/cwd21. Root coherentgate8808 running `/tmp/deppy-final-pr20-root-workspace-20261004.log`. Productidenticalcandidate sourcecommit c532ce0ad2c5edcc9e3dcbc779a61b37d5ea53a2 onlocalreleasebranchfeat/audit-nine-pr-v0.6.0-20261004, parentce801819. RootHEAD166/index628preserved. Previous0.6artifactwasneverdelivered; canonical0.6remainsfirstunreleasedminor. Nativeappnotouched; finalfreshpackage/versionverification aftertheseactualresults.
 
 - PR20 frozen6a796b5b30a5ce24458c2faf32d80864921691bb clean4files integratedclean. RootreadexactproductionMOVE-specificclassifier andtestchanges: ASCIIlogicalKphysicalVdenied; logicalVanyphysical/nonLatin/missingphysicalVallowed, repeatsdenied, ordinarycopy/pasteunchanged. App/FileTree productionunchanged, onlytestschange. Native+realoffscreenDvorakbackendRED0/2, fixtureassumptionRED0/1; GREEN2PR20+7PR11r/native9/tree186+2existingignored/strictApp/fmt/diff0. Observed-equivalencecheckskeepzero-source/contenteffects; deterministicdistinctASCII/Koreanpairallmembercopy/movebytesverified. CompletionOct5KST, originalOct4log/taskpathsretained. Root frozen21/tinyCLI+coherentgate next; no new nativeapp actions.
 

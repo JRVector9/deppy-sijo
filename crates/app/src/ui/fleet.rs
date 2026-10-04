@@ -1133,73 +1133,89 @@ impl FleetUi {
     ) -> Option<FleetAction> {
         let state = self.followup.as_mut()?;
         super::popup::window_body(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(catalog.t("fleet.followup.target", &[]))
-                        .small()
-                        .weak(),
+            let target_label = catalog.t("fleet.followup.target", &[]);
+            let target_name = &state.title;
+            let render_target = |ui: &mut egui::Ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.label(egui::RichText::new(&target_label).small().weak());
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(target_name)
+                            .strong()
+                            .color(ui.visuals().hyperlink_color),
+                    )
+                    .truncate(),
                 );
-                ui.add(egui::Label::new(egui::RichText::new(&state.title).strong()).truncate());
-            });
-            if !state.context.model.is_empty() {
-                ui.horizontal(|ui| {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(&state.context.model).size(12.0).weak(),
-                            )
-                            .truncate(),
-                        );
+            };
+            let mut render_effort = |ui: &mut egui::Ui| {
+                let selected = state
+                    .effort
+                    .map(|level| level.value().to_owned())
+                    .unwrap_or_else(|| {
+                        catalog.t(
+                            "fleet.followup.effort_keep",
+                            &[("effort", state.context.current.as_deref().unwrap_or("—"))],
+                        )
                     });
-                });
-            }
-            let selected = state
-                .effort
-                .map(|level| level.value().to_owned())
-                .unwrap_or_else(|| {
-                    let current = state.context.current.as_deref().unwrap_or("—");
-                    catalog.t("fleet.followup.effort_keep", &[("effort", current)])
-                });
-            super::popup::field(
-                ui,
-                &catalog.t("fleet.followup.effort", &[]),
-                Some(&catalog.t("fleet.followup.effort_hint", &[])),
-                |ui| {
-                    ui.add_enabled_ui(
-                        !state.context.levels.is_empty() && !self.followup_pending,
-                        |ui| {
-                            super::popup::choice_input(
-                                ui,
-                                "fleet_followup_effort",
-                                &selected,
-                                |ui| {
-                                    ui.selectable_value(
-                                        &mut state.effort,
-                                        None,
-                                        catalog.t(
-                                            "fleet.followup.effort_keep",
-                                            &[(
-                                                "effort",
-                                                state.context.current.as_deref().unwrap_or("—"),
-                                            )],
-                                        ),
-                                    );
-                                    for &level in &state.context.levels {
-                                        ui.selectable_value(
-                                            &mut state.effort,
-                                            Some(level),
-                                            level.value(),
-                                        );
-                                    }
-                                },
+                let model = if state.context.model.is_empty() {
+                    "—"
+                } else {
+                    &state.context.model
+                };
+                let selected = format!("{model} · {selected}");
+                ui.add_enabled_ui(
+                    !state.context.levels.is_empty() && !self.followup_pending,
+                    |ui| {
+                        super::popup::choice_input(ui, "fleet_followup_effort", &selected, |ui| {
+                            ui.weak(catalog.t("fleet.followup.effort", &[]));
+                            ui.selectable_value(
+                                &mut state.effort,
+                                None,
+                                catalog.t(
+                                    "fleet.followup.effort_keep",
+                                    &[("effort", state.context.current.as_deref().unwrap_or("—"))],
+                                ),
                             );
+                            for &level in &state.context.levels {
+                                ui.selectable_value(&mut state.effort, Some(level), level.value());
+                            }
+                        })
+                        .response
+                        .on_hover_text(format!(
+                            "{}\n{selected}",
+                            catalog.t("fleet.followup.effort", &[])
+                        ));
+                    },
+                );
+            };
+            if ui.available_width() >= 480.0 {
+                let width = ui.available_width();
+                let choice_width = (width * 0.55).clamp(240.0, 340.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(width - choice_width - 8.0, 36.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.set_min_width(width - choice_width - 8.0);
+                            render_target(ui);
                         },
                     );
-                    if state.context.levels.is_empty() {
-                        ui.weak(catalog.t("fleet.followup.effort_unavailable", &[]));
-                    }
-                },
-            );
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(choice_width, 36.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        &mut render_effort,
+                    );
+                });
+            } else {
+                ui.horizontal(render_target);
+                render_effort(ui);
+            }
+            if state.context.levels.is_empty() {
+                ui.weak(catalog.t("fleet.followup.effort_unavailable", &[]));
+            } else {
+                ui.weak(catalog.t("fleet.followup.effort_hint", &[]));
+            }
             ui.add_space(6.0);
             let id = egui::Id::new("fleet_followup_text");
             if self.followup_reset_pending {
@@ -3402,6 +3418,186 @@ mod tests {
         rows[0].idle_since = None;
         fleet.update_idle_clocks(&rows, 200);
         assert_eq!(fleet.idle_since(&rows[0]), Some(200));
+    }
+
+    fn followup_layout_harness(
+        size: egui::Vec2,
+        locale: &'static str,
+    ) -> egui_kittest::Harness<'static, FleetUi> {
+        let mut form = followup_fixture("asdasd".into());
+        form.title = "web (Design)".into();
+        form.context = crate::followup_settings::EffortContext {
+            provider: Some(crate::agent_surface::AgentProvider::Codex),
+            model: "gpt-6.1-sol".into(),
+            current: Some("high".into()),
+            levels: vec![
+                crate::agent_launcher::ReasoningEffort::Low,
+                crate::agent_launcher::ReasoningEffort::High,
+            ],
+        };
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(size)
+            .build_ui_state(
+                move |ui, fleet: &mut FleetUi| {
+                    let library = PromptLibrary {
+                        prompts: vec![crate::prompt_library::Prompt {
+                            id: "layout".into(),
+                            title: "Review".into(),
+                            body: "Review this".into(),
+                            tags: vec![],
+                        }],
+                    };
+                    fleet.followup_window(
+                        ui.ctx(),
+                        &i18n::Catalog::load(locale).unwrap(),
+                        &library,
+                    );
+                },
+                FleetUi {
+                    followup: Some(form),
+                    ..Default::default()
+                },
+            );
+        crate::fonts::install_cjk_fallback(&harness.ctx, None, "JetBrainsMono", "Regular");
+        crate::theme::install_palette(&harness.ctx);
+        harness.run();
+        harness
+    }
+
+    #[test]
+    fn followup_layout_editor_shows_three_rows_before_typing() {
+        use egui_kittest::kittest::Queryable;
+        let harness = followup_layout_harness(egui::vec2(1000.0, 850.0), "ko-KR");
+        let rect = harness
+            .get_by_role(egui::accesskit::Role::MultilineTextInput)
+            .rect();
+        let row = harness
+            .ctx
+            .fonts_mut(|fonts| fonts.row_height(&egui::FontId::proportional(13.0)));
+        assert!(
+            rect.height() >= 3.0 * row + 16.0,
+            "one-row editor: {rect:?}, row={row}"
+        );
+    }
+
+    #[test]
+    fn followup_layout_model_dropdown_is_at_right_of_target() {
+        use egui_kittest::kittest::{NodeT, Queryable};
+        let harness = followup_layout_harness(egui::vec2(1000.0, 850.0), "ko-KR");
+        let chooser = harness
+            .get_all_by_role(egui::accesskit::Role::ComboBox)
+            .into_iter()
+            .find(|node| {
+                node.accesskit_node()
+                    .value()
+                    .is_some_and(|value| value.contains("gpt-6.1-sol"))
+            });
+        assert!(
+            chooser.is_some(),
+            "model must be part of the reasoning chooser"
+        );
+        let rect = chooser.unwrap().rect();
+        let target = harness.get_by_label("web (Design)").rect();
+        let window = harness
+            .ctx
+            .memory(|memory| memory.area_rect(egui::Id::new("fleet_followup")))
+            .unwrap();
+        assert!(
+            (rect.right() - (window.right() - 23.0)).abs() < 2.0,
+            "model chooser must align to body right edge: {rect:?}, window={window:?}"
+        );
+        assert!(
+            rect.left() > target.right() && (rect.center().y - target.center().y).abs() < 2.0,
+            "target={target:?}, model chooser={rect:?}"
+        );
+    }
+
+    #[test]
+    fn followup_layout_target_has_explicit_gap_and_accent_color() {
+        let harness = followup_layout_harness(egui::vec2(1000.0, 850.0), "ko-KR");
+        let label = i18n::Catalog::load("ko-KR")
+            .unwrap()
+            .t("fleet.followup.target", &[]);
+        let painted = |needle: &str| {
+            harness
+                .output()
+                .shapes
+                .iter()
+                .find_map(|shape| {
+                    if let egui::Shape::Text(text) = &shape.shape
+                        && text.galley.text() == needle
+                    {
+                        Some(text)
+                    } else {
+                        None
+                    }
+                })
+                .expect("target text must be rendered")
+        };
+        let prefix = painted(&label);
+        let name = painted("web (Design)");
+        let gap = name.pos.x - (prefix.pos.x + prefix.galley.size().x);
+        assert!(gap >= 7.5, "target label touches name: gap={gap}");
+        assert_ne!(
+            name.galley.job.sections[0].format.color, prefix.galley.job.sections[0].format.color,
+            "target name must be distinguished by color"
+        );
+    }
+
+    #[test]
+    fn followup_layout_narrow_window_keeps_controls_inside_and_original_choice() {
+        use egui_kittest::kittest::{NodeT, Queryable};
+        let mut harness = followup_layout_harness(egui::vec2(400.0, 650.0), "ko-KR");
+        let chooser = harness
+            .get_all_by_role(egui::accesskit::Role::ComboBox)
+            .into_iter()
+            .find(|node| {
+                node.accesskit_node()
+                    .value()
+                    .is_some_and(|value| value.contains("gpt-6.1-sol"))
+            })
+            .unwrap();
+        let rect = chooser.rect();
+        let window = harness
+            .ctx
+            .memory(|memory| memory.area_rect(egui::Id::new("fleet_followup")))
+            .unwrap();
+        assert!(
+            window.contains_rect(rect),
+            "chooser clipped: {rect:?}, window={window:?}"
+        );
+        chooser.click();
+        harness.run();
+        harness.get_by_label("low").click();
+        harness.run();
+        assert_eq!(
+            harness.state().followup.as_ref().unwrap().effort,
+            Some(crate::agent_launcher::ReasoningEffort::Low)
+        );
+        let save = harness
+            .get_by_label(
+                &i18n::Catalog::load("ko-KR")
+                    .unwrap()
+                    .t("fleet.followup.save", &[]),
+            )
+            .rect();
+        assert!(window.contains_rect(save), "footer clipped: {save:?}");
+    }
+
+    #[test]
+    #[ignore = "offscreen Korean screenshots for visual review without launching Deppy"]
+    fn followup_layout_visual_evidence() {
+        for (name, size) in [
+            ("wide", egui::vec2(1000.0, 850.0)),
+            ("narrow", egui::vec2(400.0, 650.0)),
+        ] {
+            let mut harness = followup_layout_harness(size, "ko-KR");
+            harness
+                .render()
+                .unwrap()
+                .save(format!("/tmp/deppy-followup-layout-{name}-20261005.png"))
+                .unwrap();
+        }
     }
 
     #[test]

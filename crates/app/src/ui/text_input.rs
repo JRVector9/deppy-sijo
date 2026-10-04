@@ -163,11 +163,17 @@ pub(crate) fn bounded_edit_with_style(
             .font(egui::FontId::proportional(13.0))
             .margin(egui::Margin::symmetric(10, 8))
             .min_size(egui::vec2(0.0, 36.0)),
-        BoundedEditStyle::WindowEditor { height } => egui::TextEdit::multiline(&mut buffer)
-            .desired_rows(1)
-            .min_size(egui::vec2(0.0, height))
-            .font(egui::FontId::proportional(13.0))
-            .margin(egui::Margin::symmetric(10, 8)),
+        BoundedEditStyle::WindowEditor { height } => {
+            let font = egui::FontId::proportional(13.0);
+            let row_height = ui.fonts_mut(|fonts| fonts.row_height(&font));
+            // egui 0.35 only honors min_size.x in TextEdit's AtomLayout. Size
+            // the actual editor through row count, including the 16pt margins.
+            let rows = ((height - 16.0) / row_height).ceil().max(3.0) as usize;
+            egui::TextEdit::multiline(&mut buffer)
+                .desired_rows(rows)
+                .font(font)
+                .margin(egui::Margin::symmetric(10, 8))
+        }
     };
     let mut response = ui.add(edit.id(id).hint_text(hint).desired_width(f32::INFINITY));
     if rejected {
@@ -186,4 +192,39 @@ pub(crate) fn bounded_edit_with_style(
         ui.ctx().request_repaint();
     }
     (response, rejected)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn followup_layout_window_editor_honors_requested_height_and_minimum_rows() {
+        for height in [0.0, 136.0, 240.0] {
+            let mut actual = 0.0;
+            let mut minimum = 0.0;
+            let mut text = String::new();
+            let ctx = egui::Context::default();
+            ctx.run_ui(egui::RawInput::default(), |ui| {
+                minimum = 3.0
+                    * ui.fonts_mut(|fonts| fonts.row_height(&egui::FontId::proportional(13.0)))
+                    + 16.0;
+                actual = super::bounded_edit_with_style(
+                    ui,
+                    &mut text,
+                    16 * 1024,
+                    egui::Id::new("height-proof"),
+                    "Prompt",
+                    super::BoundedEditStyle::WindowEditor { height },
+                )
+                .0
+                .rect
+                .height();
+            })
+            .drop_without_applying_deltas();
+            assert!(
+                actual >= height.max(minimum),
+                "height={height}, actual={actual}, minimum={minimum}"
+            );
+            assert!(text.is_empty());
+        }
+    }
 }

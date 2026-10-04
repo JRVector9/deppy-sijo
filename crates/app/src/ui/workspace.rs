@@ -462,9 +462,9 @@ fn workspace_protocol_command_is_valid(
 
 // 각 split leaf가 독립 터미널이 되는 패널형 구조. 헤더는 한 줄로 얇게 유지하고
 // PTY는 외곽 카드 여백 없이 패널 면을 채운다.
-/// pane 헤더(세션·문서 탭 줄)의 높이. 32 → 30 → 29로 줄였다(2026-08-22 사용자 요청) —
-/// 탭 줄이 화면에서 차지하는 몫을 줄여 본문에 돌려준다.
-const TERMINAL_PANE_HEADER_HEIGHT: f32 = 29.0;
+/// pane 헤더(세션·문서 탭 줄)의 높이. 29 → 27pt (2026-10-05 사용자 요청).
+/// 전체 앱 제목바와 별도로 탭 줄의 2pt를 본문에 돌려준다.
+const TERMINAL_PANE_HEADER_HEIGHT: f32 = 27.0;
 /// 각 terminal leaf가 분할 축에서 유지하는 최소 logical pixel 크기.
 /// 좌/우 분할에는 너비, 상/하 분할에는 높이로 적용한다.
 const TERMINAL_PANE_MIN_SIZE: f32 = 50.0;
@@ -13197,6 +13197,17 @@ mod tests {
                 .started_at,
             started
         );
+    }
+
+    #[test]
+    fn followup_layout_session_tab_header_is_two_pixels_shorter() {
+        let layout = terminal_pane_layout(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(589.0, 358.0),
+        ));
+        assert_eq!(layout.header.height(), 27.0);
+        assert_eq!(layout.surface.top(), 27.0);
+        assert_eq!(layout.content.top(), 33.0);
     }
 
     #[test]

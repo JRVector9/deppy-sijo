@@ -1,3 +1,46 @@
+# Current screenshot correction / commit / restart — 2026-10-05(KST)
+
+- User explicitly authorized screenshot design corrections, check prior omissions, commit and restart. Worktree /Users/jr/Desktop/projects/deppy-sijo-performance; baselinea00548b9, only prior restart handoff dirty. Running0.7.0 PID26830.
+- Root causes: previous0.6.1 reduced overall TOP_BAR_HEIGHT38→36, not session tab TERMINAL_PANE_HEADER_HEIGHT29. Bounded WindowEditor desired_rows1 uses min_size.y ignored by egui0.35 AtomLayout sizing; screenshot matches actual one-row field. Header target inherits zero horizontal spacing from shared window, model lives in a separate row and standalone full-width effort field.
+- Design: explicit8px target label/name spacing + theme accent name; right model/effort common dropdown with narrow stacked fallback. Editor at least3rows and respects resize height via actual font row calculation; tab header29→27. Existing reservation/runtime guards unchanged. Plan docs/superpowers/plans/2026-10-05-followup-layout-correction.md.
+- Completed: actual RED reproduced all4 screenshot defects (editor32pt, missing model chooser, target gap0, tab29pt); /tmp/deppy-followup-layout-red-20261005.log. First compile lacked NodeT test trait import, fixed before RED. Minimal source correction GREEN4passed/0failed. Extended Korean/narrow/height UI checks and screenshots running. Updated popup contract and matching18 HTML inventory/prototype. No architecture change. Prior actual0.7.0 native restart/version proof confirms current artifact, so not stale-source launch.
+- Additional visual finding: allocated left summary Ui shrank to content and selector did not reach right edge. Tightened actual geometry test reproduced RED (chooser right631.8 vs expected787). Reserve left column min width explicitly. Original4 GREEN passed; extended6 actual UI/height tests and2 Korean snapshots passed before stricter alignment check. Version0.7.0→0.7.1, exactly27 inherited lock entries updated; dependencies unchanged.
+- Final gates executed exit0: geometry6passed + Korean visual1passed; full App/Connector/i18n and App integration2809passed/0failed/34ignored. Strict affected all-target Clippy -D warnings, UI boundary,27-crate dependency gate, fmt and git diff --check passed. Log /tmp/deppy-followup-layout-final-gates-20261005.log. Reviewed corrected wide/narrow actual egui PNGs and final scoped source diff; exact right alignment and narrow chooser/footer interaction verified. Previous notes menu/selection and all migrated centered surfaces exist and relevant full tests passed; no additional confirmed omission in checked scope.
+- Modified files: Cargo.toml/Cargo.lock, ui/fleet.rs, ui/text_input.rs, ui/workspace.rs; popup design +2HTML, correction plan/report and handoff. Existing original-tree dirty AGENTS/docs preserved.
+- Remaining: commit/build/version verification and authorized graceful restart. No subagent requested/started.
+- Failed approach: an unquoted terminal* shell glob matched no files during search; no mutation. Broad read output narrowed afterwards.
+- Exact next command: python3 /private/tmp/deppy-audit-nine-pr-20261004/cargo_gate.py test --offline --locked -q -p deppy-sijo followup_layout -- --test-threads=1.
+
+---
+
+# User-authorized rebuild/restart completed — 2026-10-05(KST)
+
+- Objective completed: user explicitly requested rebuild/restart. Actual latest source462c4af5429056ffd8ce6bd9ab015cc4f60d9cfe, HEADa00548b9 in /Users/jr/Desktop/projects/deppy-sijo-performance. Product source unchanged from reviewed latest commit.
+- Delivered local app0.5.3→0.7.0. Latest0.7.0 was already increased for centered input windows, reasoning choice and intervening fixes and had never been launched/delivered. No additional product/version edits needed.
+- Executed required Cargo-gated offline locked release build and isolated Developer ID-signed local-development package. App/proxy/cloudflared strict signature, architecture, bundle plist, archive/content verification passed. All27 inherited lock versions and embedded/About compiled version binding0.7.0 verified. No new unit tests run for unchanged rebuild; no public notarization claim.
+- Gracefully terminated exact old PID21631 through NSRunningApplication; exit confirmed. Launched new PID26830; native bundle/executable/identifier/both reported versions0.7.0 and6-second sustained liveness verified.
+- Running bundle: /Users/jr/Desktop/projects/deppy-sijo-performance/target/restart-0.7.0-20261005/Deppy Sijo.app. Binary SHA2564ef7f1a5b526e03911b1c6d2d8abf5e27b8ba9bb501502a8501aed1cc8e86c80. Normal user data/config retained. No new AI session, push or unrelated source edit.
+- Modified files: latest and original docs/CODEX_HANDOFF.md only; temporary build/controller/evidence files and target artifact. Prior documentation preserved. No architecture change. Failed approaches: none during rebuild/restart; initial original handoff read oversized and was narrowed.
+- Evidence: /tmp/deppy-rebuild-0.7.0-20261005.log; /tmp/deppy-rebuild-0.7.0-20261005-proof.json; /tmp/deppy-user-restart-0.7.0-20261005-result.json.
+- Remaining work: none for current request. Later restart needs a new explicit request.
+- Exact next read-only commands: cat /tmp/deppy-user-restart-0.7.0-20261005-result.json; ps -o pid=,etime=,comm= -p 26830; git -C /Users/jr/Desktop/projects/deppy-sijo-performance status --short --branch.
+
+---
+
+# User-authorized rebuild/restart in progress — 2026-10-05(KST)
+
+- Objective: user explicitly requested `deppy-sijo 재빌드하고 재실행해`. Rebuild latest product and gracefully restart current app.
+- Authoritative latest worktree: /Users/jr/Desktop/projects/deppy-sijo-performance; HEAD a00548b9, product source 462c4af5429056ffd8ce6bd9ab015cc4f60d9cfe. Clean source verified before this documentation entry. Original tree contains older product and unrelated dirty docs; preserved.
+- Running old version0.5.3 PID21631 from target/bundle-0.5.3. Latest workspace/lock version0.7.0 already increased for centered input windows/reasoning choice plus intervening fixes; latest0.7.0 not previously launched/delivered. Retain0.7.0 for unchanged latest source rebuild.
+- Completed: inspected rules, actual process path, latest handoff/build proof and clean status; git diff --check passed. No new tests yet. No product files modified.
+- Build uses required Cargo gate and a temporary copy of packaging script with isolated output target/restart-0.7.0-20261005; local development signing policy, Developer ID identity. Existing running artifact untouched during build. No public notarization requested.
+- Build/package completed exit0. Actual gated offline locked release build passed; bundle+all3 binaries strict signature, architecture, archive/content verification passed. All27 inherited lock versions, embedded/About compiled version binding and both plist versions0.7.0 verified. Product files match462c4af5. Proof /tmp/deppy-rebuild-0.7.0-20261005-proof.json. No new unit tests run for unchanged source rebuild.
+- Remaining: terminate exact old native process gracefully; launch verified new bundle; check native executable/version and sustained liveness; record final result.
+- Failed approaches: none. Initial original-tree handoff read was oversized; latest bounded handoff establishes authoritative source.
+- Exact next commands: tail -n 25 /tmp/deppy-rebuild-0.7.0-20261005.log; cat /tmp/deppy-user-restart-0.7.0-20261005-result.json (after controller runs); git status --short --branch.
+
+---
+
 # Completed task — centered input windows and next-task effort, 2026-10-05(KST)
 
 ## Objective / completion

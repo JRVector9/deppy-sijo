@@ -56,7 +56,7 @@ pub use host::{
     InProcessRuntimeHostFactory, RuntimeCommandDispatcher, RuntimeHost, RuntimeHostConfig,
     RuntimeHostFactory, RuntimeSecret, RuntimeSecretResolver, RuntimeWake,
 };
-pub use in_process::InProcessRuntimeClient;
+pub use in_process::{InProcessRuntimeClient, InputReplyProbe};
 pub use mux::{LayoutNode, MuxSnapshot, PaneSnapshot, TabSnapshot};
 pub use persistence::PersistConfig;
 pub use pty::{

@@ -2,7 +2,7 @@
 //! 세션 로직(PTY+terminal+lifecycle)은 session crate 소관 (PR-08).
 
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use deppy_core::{MuxPaneId, MuxTabId};
@@ -43,6 +43,58 @@ const DEFAULT_TERMINAL_ROWS: u16 = 24;
 /// 연속 출력 중 viewport snapshot을 만들 수 있는 최소 간격. 8ms는 120Hz 화면을
 /// 따라가면서도 token/chunk마다 전체 grid snapshot을 만드는 폭주를 막는다.
 const ACTIVE_VIEWPORT_FRAME_INTERVAL: Duration = Duration::from_millis(8);
+
+const INPUT_REPLY_MAX_BYTES: usize = 8192;
+
+/// Local-only output produced after one guarded input batch. No wire or disk copy.
+/// The worker holds only a weak reference; the caller closes it on cancellation.
+#[derive(Clone)]
+pub struct InputReplyProbe(Arc<Mutex<InputReplyBuffer>>);
+
+#[derive(Default)]
+struct InputReplyBuffer {
+    closed: bool,
+    bytes: Vec<u8>,
+}
+
+impl InputReplyProbe {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(InputReplyBuffer::default())))
+    }
+
+    pub fn close(&self) {
+        if let Ok(mut buffer) = self.0.lock() {
+            buffer.closed = true;
+            buffer.bytes = Vec::new();
+        }
+    }
+
+    pub fn text(&self) -> String {
+        self.0
+            .lock()
+            .ok()
+            .filter(|buffer| !buffer.closed)
+            .map(|buffer| String::from_utf8_lossy(&buffer.bytes).into_owned())
+            .unwrap_or_default()
+    }
+}
+
+impl InputReplyBuffer {
+    fn append(&mut self, chunk: &[u8]) {
+        if self.closed {
+            return;
+        }
+        if chunk.len() >= INPUT_REPLY_MAX_BYTES {
+            self.bytes.clear();
+            self.bytes
+                .extend_from_slice(&chunk[chunk.len() - INPUT_REPLY_MAX_BYTES..]);
+        } else {
+            let discard = (self.bytes.len() + chunk.len()).saturating_sub(INPUT_REPLY_MAX_BYTES);
+            self.bytes.drain(..discard);
+            self.bytes.extend_from_slice(chunk);
+        }
+    }
+}
 
 /// 구독자 한 명의 송신측. 상태 이벤트(unbounded — 세션 수명당 상수 개수의
 /// 제어 이벤트라 누적 위험 없음)와 세션별 Viewport slot(최신본만 유지 — 14.5의
@@ -276,6 +328,7 @@ impl InProcessRuntimeClient {
                         .unwrap_or_default(),
                     next_id: 1,
                     sessions: std::collections::HashMap::new(),
+                    input_reply_probes: std::collections::HashMap::new(),
                     resize_epoch: 0,
                     resize_records: std::collections::HashMap::new(),
                     session_redaction_leases: std::collections::HashMap::new(),
@@ -399,6 +452,28 @@ impl RuntimeCommandSink for InProcessRuntimeClient {
 }
 
 impl InProcessRuntimeClient {
+    /// Local, correlated, bounded screen read. Does not enable GUI rendering or a remote lease.
+    pub fn inspect_screen(&self, session: SessionId) -> anyhow::Result<Receiver<Option<String>>> {
+        let (reply, receiver) = sync_channel(1);
+        let mut queued = prepare_queued_command(
+            RuntimeCommand::ExtractLastOutput { session },
+            &self.command_budget,
+        )?;
+        queued.screen_reply = Some(reply);
+        self.command_tx
+            .as_ref()
+            .ok_or(RuntimeCommandSendError::Disconnected)?
+            .try_send(queued)
+            .map_err(|error| match error {
+                TrySendError::Full(_) => RuntimeCommandSendError::Backpressure,
+                TrySendError::Disconnected(_) => RuntimeCommandSendError::Disconnected,
+            })?;
+        if let Some(worker) = &self.worker_thread {
+            worker.unpark();
+        }
+        Ok(receiver)
+    }
+
     pub fn send_guarded_input(
         &self,
         session: SessionId,
@@ -432,6 +507,44 @@ impl InProcessRuntimeClient {
             },
             Some(admission),
         )
+    }
+
+    /// Watch only fresh output after actual PTY acceptance. Requires the agent guard's
+    /// bounded drain of preceding output; rejection never activates the probe.
+    pub fn send_guarded_input_batch_with_reply(
+        &self,
+        session: SessionId,
+        operation_id: String,
+        parts: Vec<Vec<u8>>,
+        admission: crate::InputAdmission,
+    ) -> anyhow::Result<InputReplyProbe> {
+        anyhow::ensure!(
+            admission.agent_guard().is_some(),
+            "input_reply_requires_agent_guard"
+        );
+        let probe = InputReplyProbe::new();
+        let mut queued = prepare_queued_command(
+            RuntimeCommand::WriteInputBatchTracked {
+                session,
+                operation_id,
+                parts,
+            },
+            &self.command_budget,
+        )?;
+        queued.admission = Some(admission);
+        queued.input_reply = Some(probe.clone());
+        self.command_tx
+            .as_ref()
+            .ok_or(RuntimeCommandSendError::Disconnected)?
+            .try_send(queued)
+            .map_err(|error| match error {
+                TrySendError::Full(_) => RuntimeCommandSendError::Backpressure,
+                TrySendError::Disconnected(_) => RuntimeCommandSendError::Disconnected,
+            })?;
+        if let Some(worker) = &self.worker_thread {
+            worker.unpark();
+        }
+        Ok(probe)
     }
 
     /// Returns ownership only when the command was never admitted to the worker queue.
@@ -722,6 +835,8 @@ struct QueuedRuntimeCommand {
     reservation: RuntimeCommandQueueReservation,
     // Local-only: never serialize a revocable permission or lose it over a wire.
     admission: Option<crate::InputAdmission>,
+    screen_reply: Option<SyncSender<Option<String>>>,
+    input_reply: Option<InputReplyProbe>,
 }
 
 impl QueuedRuntimeCommand {
@@ -730,6 +845,8 @@ impl QueuedRuntimeCommand {
             command,
             reservation,
             admission: _,
+            screen_reply: _,
+            input_reply: _,
         } = self;
         drop(reservation);
         command
@@ -760,6 +877,8 @@ fn prepare_queued_command_owned(
         command,
         reservation,
         admission: None,
+        screen_reply: None,
+        input_reply: None,
     })
 }
 
@@ -785,6 +904,7 @@ struct Worker {
     next_id: u64,
     /// 다중 세션 (PR-08 Session Runtime). 세션 로직은 session crate 소관.
     sessions: std::collections::HashMap<SessionId, Session>,
+    input_reply_probes: std::collections::HashMap<SessionId, Weak<Mutex<InputReplyBuffer>>>,
     /// Checked redaction leases are retained for exactly as long as their live/readable session.
     /// A session may need more than one lease when restored dotenv values supplement the resolved
     /// default credential set. Removal/archive drops the complete set and starts grace expiry.
@@ -1957,7 +2077,30 @@ impl Worker {
     }
 
     fn handle_queued_command(&mut self, mut queued: QueuedRuntimeCommand) {
+        if let Some(reply) = queued.screen_reply.take() {
+            if let RuntimeCommand::ExtractLastOutput { session } = queued.command {
+                let effects = self.collect_session_pump_effects(&[session], false, true);
+                self.finish_session_pump_effects(effects);
+                let screen = self
+                    .sessions
+                    .get(&session)
+                    .filter(|active| {
+                        active.lifecycle().is_running() && active.pending_output_bytes() == 0
+                    })
+                    .map(|active| {
+                        let text = active.screen_text();
+                        let mut start = text.len().saturating_sub(8192);
+                        while !text.is_char_boundary(start) {
+                            start += 1;
+                        }
+                        text[start..].to_owned()
+                    });
+                let _ = reply.try_send(screen);
+            }
+            return;
+        }
         let admission = queued.admission.take();
+        let input_reply = queued.input_reply.take();
         let command = queued.into_command();
         if let Some(admission) = admission {
             match command {
@@ -1980,6 +2123,22 @@ impl Worker {
                 } => {
                     let slices = parts.iter().map(Vec::as_slice).collect::<Vec<_>>();
                     let result = self.admit_input_batch_checked(session, &slices, Some(&admission));
+                    if result.is_ok()
+                        && let Some(probe) = input_reply
+                    {
+                        self.input_reply_probes.retain(|id, weak| {
+                            self.sessions.contains_key(id) && weak.strong_count() > 0
+                        });
+                        // Session creation already enforces RUNTIME_SESSION_CAP.
+                        debug_assert!(self.input_reply_probes.len() <= RUNTIME_SESSION_CAP);
+                        if let Some(previous) = self
+                            .input_reply_probes
+                            .insert(session, Arc::downgrade(&probe.0))
+                            && let Some(previous) = previous.upgrade()
+                        {
+                            InputReplyProbe(previous).close();
+                        }
+                    }
                     self.emit(RuntimeEvent::InputAdmitted {
                         session,
                         operation_id,
@@ -2096,13 +2255,24 @@ impl Worker {
         // The admission lock is gone before detectors/events invoke UI wakes.
         match outcome {
             Some(pty::PtyInputEnqueueResult::Accepted) => {
-                let submitted = self.detectors.get_mut(&session).is_some_and(|detector| {
-                    let mut submitted = false;
-                    for part in parts {
-                        submitted |= detector.on_user_input(part);
-                    }
-                    submitted
-                });
+                // These two native Codex configuration keys cannot recall or introduce text.
+                // The guard already verified an empty prompt and no existing draft. Keep all
+                // ordinary/history/manual input evidence unchanged; never clear a real draft.
+                let effort_key = matches!(parts, [key] if *key == b"\x1b[1;2A" || *key == b"\x1b[1;2B")
+                    && admission
+                        .and_then(crate::InputAdmission::agent_guard)
+                        .is_some_and(|guard| {
+                            guard.provider == crate::AgentPromptKind::Codex
+                                && guard.intent == crate::AgentInputIntent::AutomaticPrompt
+                        });
+                let submitted = !effort_key
+                    && self.detectors.get_mut(&session).is_some_and(|detector| {
+                        let mut submitted = false;
+                        for part in parts {
+                            submitted |= detector.on_user_input(part);
+                        }
+                        submitted
+                    });
                 if submitted && at_micros > 0 {
                     self.emit(RuntimeEvent::SessionInputSubmitted { session, at_micros });
                 }
@@ -4164,12 +4334,24 @@ impl Worker {
                 continue;
             };
             let active_id = active.id();
+            let reply = self
+                .input_reply_probes
+                .get(&active_id)
+                .and_then(Weak::upgrade);
+            if reply.is_none() {
+                self.input_reply_probes.remove(&active_id);
+            }
             let mut log = self.logs.get_mut(&active_id);
             let mut detector = self.detectors.get_mut(&active_id);
             let mut batch = RedactedLogBatch::default();
             let mut latest_log_offset = None;
             let mut deferred_log = Vec::new();
             let mut on_output = |chunk: &[u8]| {
+                if let Some(reply) = &reply
+                    && let Ok(mut buffer) = reply.lock()
+                {
+                    buffer.append(chunk);
+                }
                 if input_guard && log.is_some() {
                     // Allocate only for actual guarded output with an open log. One flat
                     // buffer charges at most the strict pump cap, independent of chunk count.
@@ -5404,6 +5586,24 @@ fn exited_to_archive_for_budget(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn input_reply_is_bounded_and_close_stops_capture() {
+        let probe = InputReplyProbe::new();
+        probe
+            .0
+            .lock()
+            .unwrap()
+            .append(&vec![b'x'; INPUT_REPLY_MAX_BYTES * 3]);
+        assert_eq!(probe.text().len(), INPUT_REPLY_MAX_BYTES);
+        probe.0.lock().unwrap().append("한글😀".as_bytes());
+        assert!(probe.text().ends_with("한글😀"));
+        assert_eq!(probe.0.lock().unwrap().bytes.len(), INPUT_REPLY_MAX_BYTES);
+        probe.close();
+        probe.0.lock().unwrap().append(b"after cancellation");
+        assert!(probe.text().is_empty());
+        assert_eq!(probe.0.lock().unwrap().bytes.capacity(), 0);
+    }
+
+    #[test]
     fn pr8_pump_log_batch_limits_small_chunk_writes_without_losing_order() {
         let mut batch = RedactedLogBatch::default();
         let mut written = Vec::new();
@@ -6331,6 +6531,7 @@ mod tests {
                 workspace_id: "workspace".to_owned(),
                 next_id: 1,
                 sessions: std::collections::HashMap::new(),
+                input_reply_probes: std::collections::HashMap::new(),
                 resize_epoch: 0,
                 resize_records: std::collections::HashMap::new(),
                 session_redaction_leases: std::collections::HashMap::new(),
@@ -10984,6 +11185,97 @@ mod tests {
             ),
             Err(pty::PtyInputRejectReason::AdmissionDenied),
             "actual mode-off must refuse whole paste and submit"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn followup_codex_effort_keys_do_not_block_next_step_or_prompt() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, _events) = admission_worker(resolver, "followup-codex-effort");
+        let id = SessionId(1);
+        let live = Session::spawn_with_spec(
+            id,
+            session::SessionKind::Shell,
+            &spec(
+                "/bin/sh",
+                &["-c", "stty -echo -icanon; printf READY; exec /bin/cat"],
+            ),
+            80,
+            24,
+            100,
+        )
+        .unwrap();
+        let group = live.process_identity().process_group.unwrap();
+        worker.sessions.insert(id, live);
+        worker.detectors.insert(
+            id,
+            session::StatusDetector::new(session::StatusPatterns::compile(None, None, None, None)),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !worker.sessions[&id].screen_text().contains("READY") {
+            let effects = worker.collect_session_pump_effects(&[id], false, true);
+            worker.finish_session_pump_effects(effects);
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let redraw = |worker: &mut Worker| {
+            worker
+                .sessions
+                .get_mut(&id)
+                .unwrap()
+                .replay_ansi(&mut "\x1b[2J\x1b[H› ".as_bytes())
+                .unwrap();
+        };
+        let admission =
+            crate::InputAdmission::new(crate::InputPermit::new(), deadline, |write| write())
+                .with_agent_guard(crate::AgentInputGuard {
+                    foreground_process_group: group,
+                    provider: crate::AgentPromptKind::Codex,
+                    intent: crate::AgentInputIntent::AutomaticPrompt,
+                });
+        for bytes in [b"\x1b[1;2B".as_slice(), b"\x1b[1;2A".as_slice()] {
+            redraw(&mut worker);
+            assert_eq!(
+                worker.admit_input_batch_checked(id, &[bytes], Some(&admission)),
+                Ok(())
+            );
+            assert!(
+                !worker.detectors[&id].has_input_draft(),
+                "Codex effort key must not create phantom text"
+            );
+        }
+        redraw(&mut worker);
+        assert_eq!(
+            worker.admit_input_batch_checked(id, &[b"next prompt", b"\r"], Some(&admission)),
+            Ok(())
+        );
+        assert!(!worker.detectors[&id].has_input_draft());
+        redraw(&mut worker);
+        assert_eq!(
+            worker.admit_input_batch_checked(id, &[b"\x1b[A"], Some(&admission)),
+            Ok(())
+        );
+        assert!(
+            worker.detectors[&id].has_input_draft(),
+            "ordinary history arrow can recall draft text"
+        );
+        redraw(&mut worker);
+        assert_eq!(
+            worker.admit_input_batch_checked(id, &[b"\x1b[1;2B"], Some(&admission)),
+            Err(pty::PtyInputRejectReason::AdmissionDenied)
+        );
+        worker
+            .detectors
+            .get_mut(&id)
+            .unwrap()
+            .on_user_input(b"\x03genuine draft");
+        assert_eq!(
+            worker.admit_input_batch_checked(id, &[b"\x1b[1;2B"], Some(&admission)),
+            Err(pty::PtyInputRejectReason::AdmissionDenied)
         );
     }
 

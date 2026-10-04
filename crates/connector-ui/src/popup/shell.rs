@@ -16,7 +16,7 @@ struct TargetState {
 }
 
 /// Keep one target and two reusable action scopes per case/viewport.
-pub(crate) fn prepare_target(ctx: &egui::Context, case: egui::Id, target: egui::Id) -> egui::Id {
+pub fn prepare_target(ctx: &egui::Context, case: egui::Id, target: egui::Id) -> egui::Id {
     let key = case.with(("target", ctx.viewport_id()));
     let (changed, slot) = ctx.data_mut(|data| {
         let previous = data.get_temp::<TargetState>(key);
@@ -104,7 +104,7 @@ pub fn popover_frame(ctx: &egui::Context) -> egui::Frame {
         })
 }
 
-fn apply_style(ui: &mut egui::Ui) {
+pub(super) fn apply_style(ui: &mut egui::Ui) {
     ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
     ui.style_mut().override_font_id = None;
     let colors = palette(ui);
@@ -123,7 +123,7 @@ fn apply_style(ui: &mut egui::Ui) {
     visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(3);
 }
 
-fn header(ui: &mut egui::Ui, width: f32, spec: &PopupSpec<'_>) -> bool {
+pub(super) fn header(ui: &mut egui::Ui, width: f32, spec: &PopupSpec<'_>) -> bool {
     let colors = palette(ui);
     let mut close_clicked = false;
     egui::Frame::NONE

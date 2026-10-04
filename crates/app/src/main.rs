@@ -31,6 +31,7 @@ mod env_reload;
 mod environment_application;
 mod fleet;
 mod folder_identity;
+mod followup_settings;
 mod fonts;
 mod git_cli;
 mod grok_usage;

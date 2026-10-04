@@ -18,6 +18,7 @@ use egui::{Button, ComboBox, Label, ScrollArea, TextEdit, Ui};
 use i18n::Catalog;
 
 pub use connector_contract as contract;
+pub mod popup;
 
 const SERVER_ROW_HEIGHT: f32 = 30.0;
 const SERVER_LIST_HEIGHT: f32 = 180.0;
@@ -649,59 +650,88 @@ fn render_add_server_modal(
     };
     let mut close = false;
     let mut save = false;
-    egui::Window::new(&labels.add_server)
-        .id(egui::Id::new("connector_add_server"))
-        .collapsible(false)
-        .resizable(false)
-        .show(ui.ctx(), |ui| {
-            ui.label(&labels.name);
-            ui.add(TextEdit::singleline(&mut current.name).hint_text(&labels.name));
-            ComboBox::from_id_salt("connector_transport")
-                .selected_text(current.transport.label(labels))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut current.transport, FormTransport::Http, &labels.http);
-                    ui.selectable_value(
-                        &mut current.transport,
-                        FormTransport::Stdio,
-                        &labels.stdio,
-                    );
-                });
-            match current.transport {
-                FormTransport::Http => {
-                    ui.label(&labels.url);
-                    ui.add(TextEdit::singleline(&mut current.url).hint_text("https://"));
-                }
-                FormTransport::Stdio => {
-                    if current.id.is_none() {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(&labels.presets);
-                            for preset in STDIO_PRESETS {
-                                if ui
-                                    .small_button(preset.name)
-                                    .on_hover_text(&labels.preset_hint)
-                                    .clicked()
-                                {
-                                    current.apply_preset(preset);
-                                }
-                            }
-                        });
+    let mut open = true;
+    popup::window(
+        ui.ctx(),
+        popup::WindowSpec {
+            id: egui::Id::new("connector_add_server"),
+            title: &labels.add_server,
+            subtitle: "",
+            close_label: &labels.cancel,
+            close_enabled: true,
+            default_size: egui::vec2(560.0, 500.0),
+            min_size: egui::vec2(360.0, 300.0),
+        },
+        &mut open,
+        |ui| {
+            popup::window_body(ui, |ui| {
+                ui.label(&labels.name);
+                popup::text_input(ui, &mut current.name, &labels.name);
+                popup::choice_input(
+                    ui,
+                    "connector_transport",
+                    current.transport.label(labels),
+                    |ui| {
+                        ui.selectable_value(
+                            &mut current.transport,
+                            FormTransport::Http,
+                            &labels.http,
+                        );
+                        ui.selectable_value(
+                            &mut current.transport,
+                            FormTransport::Stdio,
+                            &labels.stdio,
+                        );
+                    },
+                );
+                match current.transport {
+                    FormTransport::Http => {
+                        ui.label(&labels.url);
+                        popup::text_input(ui, &mut current.url, "https://");
                     }
-                    ui.label(&labels.command);
-                    ui.add(TextEdit::singleline(&mut current.command));
-                    ui.label(&labels.arguments);
-                    ui.add(TextEdit::multiline(&mut current.arguments).desired_rows(4));
+                    FormTransport::Stdio => {
+                        if current.id.is_none() {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(&labels.presets);
+                                for preset in STDIO_PRESETS {
+                                    if ui
+                                        .small_button(preset.name)
+                                        .on_hover_text(&labels.preset_hint)
+                                        .clicked()
+                                    {
+                                        current.apply_preset(preset);
+                                    }
+                                }
+                            });
+                        }
+                        ui.label(&labels.command);
+                        popup::text_input(ui, &mut current.command, "");
+                        ui.label(&labels.arguments);
+                        ui.add_sized(
+                            [ui.available_width(), 120.0],
+                            TextEdit::multiline(&mut current.arguments)
+                                .font(egui::FontId::proportional(13.0))
+                                .margin(egui::Margin::symmetric(10, 8)),
+                        );
+                    }
                 }
-            }
-            ui.checkbox(&mut current.enabled, &labels.enabled);
-            ui.horizontal(|ui| {
-                close = ui.button(&labels.cancel).clicked();
-                save = ui
-                    .add_enabled(current.is_valid(), Button::new(&labels.save))
+                ui.checkbox(&mut current.enabled, &labels.enabled);
+            });
+            popup::footer(ui, None, |ui| {
+                save = popup::action_button(
+                    ui,
+                    &labels.save,
+                    popup::ActionTone::Primary,
+                    current.is_valid(),
+                )
+                .clicked();
+                close = popup::action_button(ui, &labels.cancel, popup::ActionTone::Ghost, true)
                     .clicked();
             });
-        });
+        },
+    );
 
-    if close {
+    if close || !open {
         *draft = None;
     } else if save {
         let current = draft.take().expect("draft exists while saving");
@@ -720,27 +750,44 @@ fn render_invoke_modal(
     };
     let mut close = false;
     let mut invoke = false;
-    egui::Window::new(&current.tool_name)
-        .id(egui::Id::new("connector_invoke"))
-        .collapsible(false)
-        .show(ui.ctx(), |ui| {
-            ui.label(&labels.arguments_json);
-            ui.add(
-                TextEdit::multiline(&mut current.arguments_json)
-                    .code_editor()
-                    .char_limit(ResourceLimits::PRODUCTION_CEILING.tool_input_bytes)
-                    .desired_rows(8),
-            );
-            truncate_utf8(
-                &mut current.arguments_json,
-                ResourceLimits::PRODUCTION_CEILING.tool_input_bytes,
-            );
-            ui.horizontal(|ui| {
-                close = ui.button(&labels.cancel).clicked();
-                invoke = ui.button(&labels.invoke).clicked();
+    let mut open = true;
+    popup::window(
+        ui.ctx(),
+        popup::WindowSpec {
+            id: egui::Id::new("connector_invoke"),
+            title: &current.tool_name,
+            subtitle: "",
+            close_label: &labels.cancel,
+            close_enabled: true,
+            default_size: egui::vec2(620.0, 490.0),
+            min_size: egui::vec2(360.0, 300.0),
+        },
+        &mut open,
+        |ui| {
+            popup::window_body(ui, |ui| {
+                ui.label(&labels.arguments_json);
+                ui.add_sized(
+                    [ui.available_width(), ui.available_height().max(136.0)],
+                    TextEdit::multiline(&mut current.arguments_json)
+                        .code_editor()
+                        .char_limit(ResourceLimits::PRODUCTION_CEILING.tool_input_bytes)
+                        .desired_rows(1)
+                        .margin(egui::Margin::symmetric(10, 8)),
+                );
+                truncate_utf8(
+                    &mut current.arguments_json,
+                    ResourceLimits::PRODUCTION_CEILING.tool_input_bytes,
+                );
             });
-        });
-    if close {
+            popup::footer(ui, None, |ui| {
+                invoke = popup::action_button(ui, &labels.invoke, popup::ActionTone::Primary, true)
+                    .clicked();
+                close = popup::action_button(ui, &labels.cancel, popup::ActionTone::Ghost, true)
+                    .clicked();
+            });
+        },
+    );
+    if close || !open {
         *draft = None;
     } else if invoke {
         let mut current = draft.take().expect("draft exists while invoking");

@@ -2194,149 +2194,163 @@ impl AgentSessionsUi {
         let mut window_open = self.open;
         let mut actions = Vec::new();
         let mut secret_intent = None;
-        let window_response = egui::Window::new(catalog.t("agent_sessions.title", &[]))
-            .id(agents_window_id())
-            .open(&mut window_open)
-            .default_width(960.0)
-            .default_height(650.0)
-            .min_width(700.0)
-            .resizable(true)
-            .show(ctx, |ui| {
-                ui.heading(catalog.t("agent_sessions.title", &[]));
-                ui.horizontal(|ui| {
-                    ui.weak(catalog.t("agent_sessions.working_directory", &[]));
-                    ui.monospace(
-                        workspace_cwd
-                            .as_deref()
-                            .filter(|path| !path.is_empty())
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| {
-                                catalog.t("agent_sessions.app_working_directory", &[])
-                            }),
-                    );
-                });
-                if let Some(error) = &self.transport_error {
-                    // #ff7b72는 agent_visuals가 소유한 Error 색을 복사해 둔 것이었다.
-                    // 그 모듈의 존재 이유가 "표면마다 상태색이 갈리지 않게"이므로 우회하지
-                    // 않는다(2026-08-06). 이 파일도 이미 다른 3곳에서 그렇게 쓰고 있다.
-                    ui.colored_label(
-                        crate::ui::agent_visuals::status_color(
-                            crate::agent_surface::AgentVisualState::Error,
-                        ),
-                        error.render(catalog),
-                    );
-                }
-                if let Some(error) = &self.catalog_error {
-                    // 여기만 위와 달리 그대로 둔다. 색(#ffbf69)은 agent_visuals의 Waiting과
-                    // 같지만 의미가 다르다 — 이건 "카탈로그 실패, 폴백 사용"이라는 저하
-                    // 경고이지 대기 상태가 아니다. 색이 같다는 이유로 lifecycle 상태에
-                    // 묶으면 에이전트 UX 때문에 Waiting을 바꿀 때 여기까지 끌려간다.
-                    ui.colored_label(
-                        egui::Color32::from_rgb(0xff, 0xbf, 0x69),
-                        error.render(catalog),
-                    );
-                    ui.weak(catalog.t("agent_sessions.catalog_fallback_hint", &[]));
-                }
-                crate::ui::hairline(ui);
-
-                ui.label(catalog.t("agent_sessions.new_task", &[]));
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(
-                            self.pending_model_catalog.is_none()
-                                && self.pending_skill_catalog.is_none(),
-                            egui::Button::new(catalog.t("agent_sessions.load_catalogs", &[])),
-                        )
-                        .clicked()
-                    {
-                        queue_frame_action(
-                            &mut actions,
-                            PanelAction::RefreshCatalog {
-                                cwd: workspace_cwd.clone(),
-                                force_reload: !self.skill_catalog.is_empty(),
-                            },
-                        );
-                    }
-                    if self.pending_model_catalog.is_some() || self.pending_skill_catalog.is_some()
-                    {
-                        ui.weak(catalog.t("agent_sessions.catalog_waiting", &[]));
-                    }
-                });
-                self.render_agent_controls(
-                    ui,
-                    &mut text_input_ids,
-                    agents_config,
-                    AgentSecretRender {
-                        snapshot: secrets_snapshot,
-                        intent: &mut secret_intent,
-                    },
-                    ollama_models,
-                    catalog,
-                );
-                let prompt_response = ui.add_sized(
-                    [ui.available_width(), 72.0],
-                    egui::TextEdit::multiline(&mut self.new_prompt)
-                        .id_salt("agent-new-prompt")
-                        .hint_text(catalog.t("agent_sessions.prompt_hint", &[]))
-                        .desired_rows(3),
-                );
-                text_input_ids.push(prompt_response.id);
-                truncate_utf8(&mut self.new_prompt, AGENT_SESSION_TEXT_INPUT_MAX_BYTES);
-                if self.focus_new_prompt {
-                    prompt_response.request_focus();
-                    self.focus_new_prompt = false;
-                }
-                ui.horizontal(|ui| {
-                    let can_start = !self.new_prompt.trim().is_empty();
-                    if ui
-                        .add_enabled(
-                            can_start,
-                            egui::Button::new(catalog.t("agent_sessions.run_codex", &[])),
-                        )
-                        .clicked()
-                    {
-                        queue_frame_action(
-                            &mut actions,
-                            PanelAction::Start {
-                                workspace_id: workspace_id.to_owned(),
-                                prompt: std::mem::take(&mut self.new_prompt),
-                                model: self.new_model.clone(),
-                                effort: self.new_effort.clone(),
-                                skills: self.selected_skills(),
-                                cwd: workspace_cwd.clone(),
-                            },
-                        );
-                    }
-                });
-
-                crate::ui::hairline(ui);
-                self.render_surface_tabs(ui, &mut actions, catalog);
-                crate::ui::hairline(ui);
-
-                match self.selected_surface_snapshot() {
-                    Some(surface) if surface.transport == AgentTransport::Pty => {
-                        render_selected_surface_header(ui, &surface, catalog);
-                        self.render_pty_surface(ui, surface, &mut actions, catalog);
-                    }
-                    Some(surface) => {
-                        render_selected_surface_header(ui, &surface, catalog);
-                        if let Some((session_index, session)) = self.take_selected_session() {
-                            self.render_session(
-                                ui,
-                                &session,
-                                workspace_cwd.clone(),
-                                &mut actions,
-                                &mut text_input_ids,
-                                catalog,
+        let window_response = super::popup::window(
+            ctx,
+            super::popup::WindowSpec {
+                id: agents_window_id(),
+                title: &catalog.t("agent_sessions.title", &[]),
+                subtitle: "",
+                close_label: &catalog.t("popup.dismiss", &[]),
+                close_enabled: true,
+                default_size: egui::vec2(960.0, 650.0),
+                min_size: egui::vec2(420.0, 350.0),
+            },
+            &mut window_open,
+            |ui| {
+                egui::Frame::NONE
+                    .inner_margin(egui::Margin::symmetric(22, 18))
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+                        ui.horizontal(|ui| {
+                            ui.weak(catalog.t("agent_sessions.working_directory", &[]));
+                            ui.monospace(
+                                workspace_cwd
+                                    .as_deref()
+                                    .filter(|path| !path.is_empty())
+                                    .map(str::to_owned)
+                                    .unwrap_or_else(|| {
+                                        catalog.t("agent_sessions.app_working_directory", &[])
+                                    }),
                             );
-                            self.restore_session(session_index, session);
+                        });
+                        if let Some(error) = &self.transport_error {
+                            // #ff7b72는 agent_visuals가 소유한 Error 색을 복사해 둔 것이었다.
+                            // 그 모듈의 존재 이유가 "표면마다 상태색이 갈리지 않게"이므로 우회하지
+                            // 않는다(2026-08-06). 이 파일도 이미 다른 3곳에서 그렇게 쓰고 있다.
+                            ui.colored_label(
+                                crate::ui::agent_visuals::status_color(
+                                    crate::agent_surface::AgentVisualState::Error,
+                                ),
+                                error.render(catalog),
+                            );
                         }
-                    }
-                    None => {
-                        ui.weak(catalog.t("agent_sessions.empty_selection", &[]));
-                    }
-                }
-            });
+                        if let Some(error) = &self.catalog_error {
+                            // 여기만 위와 달리 그대로 둔다. 색(#ffbf69)은 agent_visuals의 Waiting과
+                            // 같지만 의미가 다르다 — 이건 "카탈로그 실패, 폴백 사용"이라는 저하
+                            // 경고이지 대기 상태가 아니다. 색이 같다는 이유로 lifecycle 상태에
+                            // 묶으면 에이전트 UX 때문에 Waiting을 바꿀 때 여기까지 끌려간다.
+                            ui.colored_label(
+                                egui::Color32::from_rgb(0xff, 0xbf, 0x69),
+                                error.render(catalog),
+                            );
+                            ui.weak(catalog.t("agent_sessions.catalog_fallback_hint", &[]));
+                        }
+                        crate::ui::hairline(ui);
+
+                        ui.label(catalog.t("agent_sessions.new_task", &[]));
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(
+                                    self.pending_model_catalog.is_none()
+                                        && self.pending_skill_catalog.is_none(),
+                                    egui::Button::new(
+                                        catalog.t("agent_sessions.load_catalogs", &[]),
+                                    ),
+                                )
+                                .clicked()
+                            {
+                                queue_frame_action(
+                                    &mut actions,
+                                    PanelAction::RefreshCatalog {
+                                        cwd: workspace_cwd.clone(),
+                                        force_reload: !self.skill_catalog.is_empty(),
+                                    },
+                                );
+                            }
+                            if self.pending_model_catalog.is_some()
+                                || self.pending_skill_catalog.is_some()
+                            {
+                                ui.weak(catalog.t("agent_sessions.catalog_waiting", &[]));
+                            }
+                        });
+                        self.render_agent_controls(
+                            ui,
+                            &mut text_input_ids,
+                            agents_config,
+                            AgentSecretRender {
+                                snapshot: secrets_snapshot,
+                                intent: &mut secret_intent,
+                            },
+                            ollama_models,
+                            catalog,
+                        );
+                        let prompt_response = ui.add_sized(
+                            [ui.available_width(), 72.0],
+                            egui::TextEdit::multiline(&mut self.new_prompt)
+                                .id_salt("agent-new-prompt")
+                                .hint_text(catalog.t("agent_sessions.prompt_hint", &[]))
+                                .desired_rows(3),
+                        );
+                        text_input_ids.push(prompt_response.id);
+                        truncate_utf8(&mut self.new_prompt, AGENT_SESSION_TEXT_INPUT_MAX_BYTES);
+                        if self.focus_new_prompt {
+                            prompt_response.request_focus();
+                            self.focus_new_prompt = false;
+                        }
+                        ui.horizontal(|ui| {
+                            let can_start = !self.new_prompt.trim().is_empty();
+                            if ui
+                                .add_enabled(
+                                    can_start,
+                                    egui::Button::new(catalog.t("agent_sessions.run_codex", &[])),
+                                )
+                                .clicked()
+                            {
+                                queue_frame_action(
+                                    &mut actions,
+                                    PanelAction::Start {
+                                        workspace_id: workspace_id.to_owned(),
+                                        prompt: std::mem::take(&mut self.new_prompt),
+                                        model: self.new_model.clone(),
+                                        effort: self.new_effort.clone(),
+                                        skills: self.selected_skills(),
+                                        cwd: workspace_cwd.clone(),
+                                    },
+                                );
+                            }
+                        });
+
+                        crate::ui::hairline(ui);
+                        self.render_surface_tabs(ui, &mut actions, catalog);
+                        crate::ui::hairline(ui);
+
+                        match self.selected_surface_snapshot() {
+                            Some(surface) if surface.transport == AgentTransport::Pty => {
+                                render_selected_surface_header(ui, &surface, catalog);
+                                self.render_pty_surface(ui, surface, &mut actions, catalog);
+                            }
+                            Some(surface) => {
+                                render_selected_surface_header(ui, &surface, catalog);
+                                if let Some((session_index, session)) = self.take_selected_session()
+                                {
+                                    self.render_session(
+                                        ui,
+                                        &session,
+                                        workspace_cwd.clone(),
+                                        &mut actions,
+                                        &mut text_input_ids,
+                                        catalog,
+                                    );
+                                    self.restore_session(session_index, session);
+                                }
+                            }
+                            None => {
+                                ui.weak(catalog.t("agent_sessions.empty_selection", &[]));
+                            }
+                        }
+                    });
+            },
+        );
         self.open = window_open;
         let content_visible = window_open
             && window_response

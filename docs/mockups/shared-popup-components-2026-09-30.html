@@ -155,6 +155,7 @@
   </style>
 </head>
 <body>
+<div style="padding:12px 22px;background:#181b20;color:#d5d8dd;border-bottom:1px solid #32363e;font:13px sans-serif">18·19·20 중앙 입력 창 새 제안: <a href="fleet-centered-resizable-popups-2026-10-05.html" style="color:#39b7d0">이동·크기 조절 시안 보기</a> · HTML 검토 단계, 실제 앱 적용 전</div>
   <div class="app">
     <aside class="rail" aria-label="팝업 예시 선택">
       <div class="brand"><span class="brand-mark">D</span>Deppy Sijo</div>
@@ -250,11 +251,11 @@
         ['prompt_delete', '저장된 프롬프트 삭제', '팔레트 안 확인', 'crates/app/src/ui/prompt_palette.rs:255']
       ]],
       ['AI 작업·외부 도구', [
-        ['followup', '다음 단계 예약', 'Window · 4행/16KiB/undo8 · 호스트 거부 시 폼 유지 · 맨 앞 창만 Esc 닫기', 'crates/app/src/ui/fleet.rs'],
-        ['broadcast', '여러 세션에 브로드캐스트', 'Window · 3개 이상 재확인·맨 앞 창만 Esc', 'crates/app/src/ui/fleet.rs'],
-        ['batch_spawn', '에이전트 일괄 시작', 'Window · 확장 결과16KiB 확인 후 시작 · 맨 앞 창만 Esc 닫기', 'crates/app/src/ui/fleet.rs'],
+        ['followup', '다음 단계 예약', '공용 중앙 이동·크기 조절 창 · 추론 강도 선택 ·16KiB/undo8 · 거부 시 폼 유지', 'crates/app/src/ui/fleet.rs'],
+        ['broadcast', '여러 세션에 브로드캐스트', '공용 중앙 이동·크기 조절 창 · 고정 하단 버튼 ·3개 이상 재확인', 'crates/app/src/ui/fleet.rs'],
+        ['batch_spawn', '에이전트 일괄 시작', '공용 중앙 이동·크기 조절 창 · 확장 결과16KiB 확인 후 시작', 'crates/app/src/ui/fleet.rs'],
         ['production_run', 'production 프로필 실행', 'Window', 'crates/app/src/ui/agents.rs:696'],
-        ['mcp_invoke', 'MCP 도구 직접 실행', 'Window · 승인·인증 중 인자 초안 보존', 'crates/connector-ui/src/lib.rs'],
+        ['mcp_invoke', 'MCP 도구 직접 실행', '공용 중앙 이동·크기 조절 창 · 승인·인증 중 인자 초안 보존', 'crates/connector-ui/src/lib.rs'],
         ['mcp_approval', 'MCP 도구 실행 승인', 'Window · 요청별 포커스 초기화', 'crates/connector-ui/src/lib.rs:791'],
         ['mcp_trust', '원격 MCP 주소 신뢰', 'Window', 'crates/connector-ui/src/lib.rs:831'],
         ['mcp_oauth', 'MCP OAuth 진행·동의', 'Window', 'crates/connector-ui/src/lib.rs:866']
@@ -266,9 +267,9 @@
         ['folder_moved', '프로젝트 폴더 이동 감지', '공용 팝업 · 대상 보존·갱신 대기·실패 재시도', 'crates/app/src/ui/document_dialogs.rs']
       ]],
       ['조회·상태 안내', [
-        ['prompt_palette', '프롬프트 라이브러리', 'Window · 맨 앞 창만 Esc 편집 취소·닫기', 'crates/app/src/ui/prompt_palette.rs'],
-        ['diff', '세션 Git 변경사항', 'Window', 'crates/app/src/ui/diff_panel.rs:882'],
-        ['agent_sessions', '에이전트 세션 관리', '큰 Window', 'crates/app/src/ui/agent_sessions.rs:2197'],
+        ['prompt_palette', '프롬프트 라이브러리', '공용 중앙 이동·크기 조절 셸 · 맨 앞 창만 Esc 편집 취소·닫기', 'crates/app/src/ui/prompt_palette.rs'],
+        ['diff', '세션 Git 변경사항', '공용 중앙 이동·크기 조절 셸', 'crates/app/src/ui/diff_panel.rs:882'],
+        ['agent_sessions', '에이전트 세션 관리', '공용 중앙 이동·크기 조절 셸', 'crates/app/src/ui/agent_sessions.rs:2197'],
         ['overflow', '런타임 이벤트 적체', '공용 Info Modal · 순차 안내', 'crates/app/src/app.rs · ui/popup/information.rs'],
         ['warm_limit', '실행 중 워크스페이스 한도', '공용 Info Modal · 순차 안내', 'crates/app/src/app.rs · ui/popup/information.rs'],
         ['cross_pane_failure', '다른 워크스페이스 셀 열기 실패', '공용 Info Modal · 순차 안내', 'crates/app/src/app.rs · ui/popup/information.rs']

@@ -9,3 +9,6 @@ license.workspace = true
 connector-contract = { path = "../connector-contract" }
 egui = { workspace = true }
 i18n = { workspace = true }
+
+[dev-dependencies]
+egui_kittest = { version = "0.36", features = ["wgpu"] }

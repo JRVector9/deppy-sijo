@@ -1,33 +1,9 @@
 //! Input ownership for pending and actually rendered modals. Ordinary
 //! Foreground areas (search, tooltips, closed context menus) are not modals.
 
-#[derive(Clone, Copy)]
-struct ModalFence {
-    pass: u64,
-}
-
-fn fence_id(ctx: &egui::Context) -> egui::Id {
-    egui::Id::new(("popup_input_fence", ctx.viewport_id()))
-}
-
-/// Publish before background keyboard processing. A fence lasts through this
-/// entire pass, including the pass in which a popup closes.
-pub(crate) fn set_pending_modal(ctx: &egui::Context, pending: bool) {
-    if pending {
-        let id = fence_id(ctx);
-        let pass = ctx.cumulative_pass_nr();
-        ctx.data_mut(|data| data.insert_temp(id, ModalFence { pass }));
-    }
-}
-
-pub(crate) fn modal_input_blocked(ctx: &egui::Context) -> bool {
-    let id = fence_id(ctx);
-    let pass = ctx.cumulative_pass_nr();
-    ctx.data(|data| {
-        data.get_temp::<ModalFence>(id)
-            .is_some_and(|fence| fence.pass == pass)
-    }) || ctx.memory(|memory| memory.top_modal_layer().is_some())
-}
+use connector_ui::popup::modal_input_blocked;
+#[cfg(test)]
+use connector_ui::popup::set_pending_modal;
 
 pub(crate) fn background_input_blocked(ctx: &egui::Context) -> bool {
     modal_input_blocked(ctx)

@@ -879,14 +879,20 @@ impl DiffPanelUi {
             return;
         }
         let mut window_open = self.open;
-        egui::Window::new(catalog.t("diff.title", &[]))
-            .id(diff_window_id())
-            .open(&mut window_open)
-            .default_width(760.0)
-            .default_height(520.0)
-            .min_width(420.0)
-            .resizable(true)
-            .show(ctx, |ui| self.render_body(ui, catalog));
+        super::popup::window(
+            ctx,
+            super::popup::WindowSpec {
+                id: diff_window_id(),
+                title: &catalog.t("diff.title", &[]),
+                subtitle: "",
+                close_label: &catalog.t("popup.dismiss", &[]),
+                close_enabled: true,
+                default_size: egui::vec2(760.0, 520.0),
+                min_size: egui::vec2(360.0, 320.0),
+            },
+            &mut window_open,
+            |ui| super::popup::window_body(ui, |ui| self.render_body(ui, catalog)),
+        );
         self.open = window_open;
         if !self.open {
             // 명시적 조회형 — 닫으면 대상/결과를 모두 버린다.

@@ -10310,6 +10310,8 @@ pub struct App {
     /// (`blocked_since`와 같은 관례). 세션당 하나만 들고 있어 예약이 쌓이지 않는다 —
     /// 다시 예약하면 덮어쓴다.
     pty_followup: std::collections::HashMap<(String, runtime::SessionId), QueuedFollowUp>,
+    followup_screen_queries:
+        std::collections::HashMap<(String, runtime::SessionId), FollowUpScreenQuery>,
     pending_prompt_deliveries: std::collections::HashMap<String, PendingPromptDelivery>,
     recent_prompt_receipts: std::collections::VecDeque<PromptReceipt>,
     /// 완료/입력대기 주목(attention) 추적 — 미확인이면 레일 6px, 포커스 확인 시 해제.
@@ -10724,10 +10726,35 @@ struct QueuedFollowUp {
     target: crate::fleet::FleetPromptTarget,
     prompt: Arc<str>,
     queued_turn: Option<i64>,
+    turn_completed: bool,
     delivery_blocked: bool,
     delivery_unknown: bool,
     reservation_id: String,
     input_permit: FollowUpInputPermit,
+    effort: Option<crate::followup_settings::EffortRequest>,
+    effort_stage: FollowUpEffortStage,
+    effort_baseline: Option<EffortBaseline>,
+    effort_read_deadline: Option<std::time::Instant>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+enum FollowUpEffortStage {
+    #[default]
+    Pending,
+    Confirming {
+        deadline: std::time::Instant,
+    },
+    Verified,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct EffortBaseline {
+    current: Option<crate::agent_launcher::ReasoningEffort>,
+}
+struct FollowUpScreenQuery {
+    reservation_id: String,
+    receiver: std::sync::mpsc::Receiver<Option<String>>,
+    deadline: std::time::Instant,
 }
 
 #[derive(Clone)]
@@ -10735,11 +10762,23 @@ struct FollowUpInputPermit(Arc<OwnedFollowUpInputPermit>);
 
 struct OwnedFollowUpInputPermit {
     permit: runtime::InputPermit,
+    reply: std::sync::Mutex<FollowUpReplyState>,
+}
+
+#[derive(Default)]
+struct FollowUpReplyState {
+    revoked: bool,
+    probe: Option<runtime::InputReplyProbe>,
 }
 
 impl Drop for OwnedFollowUpInputPermit {
     fn drop(&mut self) {
         self.permit.revoke();
+        if let Ok(state) = self.reply.get_mut()
+            && let Some(probe) = state.probe.take()
+        {
+            probe.close();
+        }
     }
 }
 
@@ -10747,6 +10786,7 @@ impl Default for FollowUpInputPermit {
     fn default() -> Self {
         Self(Arc::new(OwnedFollowUpInputPermit {
             permit: runtime::InputPermit::new(),
+            reply: std::sync::Mutex::default(),
         }))
     }
 }
@@ -10766,6 +10806,55 @@ impl PartialEq for FollowUpInputPermit {
 impl FollowUpInputPermit {
     fn revoke(&self) {
         self.0.permit.revoke();
+        if let Ok(mut state) = self.0.reply.lock() {
+            state.revoked = true;
+            if let Some(probe) = state.probe.take() {
+                probe.close();
+            }
+        }
+    }
+
+    fn set_reply(&self, probe: runtime::InputReplyProbe) {
+        if let Ok(mut state) = self.0.reply.lock()
+            && !state.revoked
+        {
+            if let Some(previous) = state.probe.replace(probe) {
+                previous.close();
+            }
+        } else {
+            probe.close();
+        }
+    }
+
+    fn reply_text(&self) -> String {
+        self.0
+            .reply
+            .lock()
+            .ok()
+            .and_then(|state| state.probe.as_ref().map(runtime::InputReplyProbe::text))
+            .unwrap_or_default()
+    }
+
+    fn close_reply(&self) {
+        if let Ok(mut state) = self.0.reply.lock()
+            && let Some(probe) = state.probe.take()
+        {
+            probe.close();
+        }
+    }
+}
+
+fn latch_followup_completion(queued: &mut QueuedFollowUp, done: Option<i64>, waiting: bool) {
+    queued.turn_completed |= crate::fleet::followup_ready(queued.queued_turn, done, waiting);
+}
+
+fn followup_effort_expired(queued: &QueuedFollowUp, now: std::time::Instant) -> bool {
+    match queued.effort_stage {
+        FollowUpEffortStage::Pending => queued
+            .effort_read_deadline
+            .is_some_and(|deadline| now >= deadline),
+        FollowUpEffortStage::Confirming { deadline } => now >= deadline,
+        FollowUpEffortStage::Verified => false,
     }
 }
 
@@ -10821,7 +10910,8 @@ fn revoke_followup_authorizations(
     // A canceled/replaced reservation may still have a receipt owner. Revoke that original
     // authorization too, without deleting its Unknown payload or changing other input origins.
     for delivery in pending.values() {
-        if let PromptDeliveryOrigin::FollowUp { queued } = &delivery.origin
+        if let PromptDeliveryOrigin::FollowUp { queued }
+        | PromptDeliveryOrigin::FollowUpSetting { queued, .. } = &delivery.origin
             && target_matches(&queued.target)
         {
             queued.input_permit.revoke();
@@ -10877,6 +10967,10 @@ fn followup_metadata_bytes(key: &(String, runtime::SessionId), queued: &QueuedFo
         + key.0.len()
         + queued.target.workspace_id.len()
         + queued.reservation_id.len()
+        + queued
+            .effort
+            .as_ref()
+            .map_or(0, |effort| effort.model.len())
 }
 
 fn admit_followup_reservation(
@@ -10933,6 +11027,9 @@ enum PromptDeliveryOrigin {
     Broadcast,
     SelectedPaste,
     FollowUp {
+        queued: QueuedFollowUp,
+    },
+    FollowUpSetting {
         queued: QueuedFollowUp,
     },
 }
@@ -11050,6 +11147,22 @@ fn settle_followup_admission(
     } else if let Some(current) = followups.get_mut(key) {
         current.delivery_blocked = true;
         current.delivery_unknown |= outcome == ui::composer::PromptAdmissionOutcome::Unknown;
+    }
+}
+
+fn settle_followup_setting_admission(
+    followups: &mut std::collections::HashMap<(String, runtime::SessionId), QueuedFollowUp>,
+    key: &(String, runtime::SessionId),
+    queued: &QueuedFollowUp,
+    now: std::time::Instant,
+) {
+    if let Some(current) = followups.get_mut(key)
+        && current.reservation_id == queued.reservation_id
+        && !current.delivery_blocked
+    {
+        current.effort_stage = FollowUpEffortStage::Confirming {
+            deadline: now + std::time::Duration::from_secs(20),
+        };
     }
 }
 
@@ -16030,6 +16143,7 @@ impl App {
             global_turn_done: std::collections::HashMap::new(),
             global_idle_since: std::collections::HashMap::new(),
             pty_followup: std::collections::HashMap::new(),
+            followup_screen_queries: std::collections::HashMap::new(),
             pending_prompt_deliveries: std::collections::HashMap::new(),
             recent_prompt_receipts: std::collections::VecDeque::new(),
             session_alerts: std::collections::HashMap::new(),
@@ -17189,6 +17303,330 @@ impl App {
         )
     }
 
+    fn followup_effort_context(
+        &self,
+        target: &crate::fleet::FleetPromptTarget,
+    ) -> crate::followup_settings::EffortContext {
+        let current = self
+            .agent_kinds
+            .get(&(target.runtime_instance, target.session));
+        if current.and_then(|agent| agent.execution) != Some(target.execution) {
+            return crate::followup_settings::EffortContext::default();
+        }
+        self.runtime_by_instance(target.runtime_instance)
+            .filter(|runtime| runtime.id == target.workspace_id)
+            .and_then(|runtime| runtime.workspace_ui.agent_display_for(target.session))
+            .filter(|display| current.is_some_and(|agent| agent.kind == display.kind))
+            .map(|display| {
+                crate::followup_settings::EffortContext::from_display(
+                    display,
+                    self.agent_launcher_snapshot.as_ref(),
+                )
+            })
+            .unwrap_or_default()
+    }
+
+    fn read_followup_screen(
+        &mut self,
+        key: &(String, runtime::SessionId),
+        queued: &QueuedFollowUp,
+    ) -> anyhow::Result<Option<String>> {
+        use std::sync::mpsc::TryRecvError;
+        if let Some(query) = self.followup_screen_queries.get(key) {
+            if query.reservation_id != queued.reservation_id {
+                self.followup_screen_queries.remove(key);
+            } else {
+                match query.receiver.try_recv() {
+                    Ok(screen) => {
+                        self.followup_screen_queries.remove(key);
+                        if screen.is_none() {
+                            self.egui_ctx
+                                .request_repaint_after(std::time::Duration::from_millis(100));
+                        }
+                        return Ok(screen);
+                    }
+                    Err(TryRecvError::Disconnected) => {
+                        self.followup_screen_queries.remove(key);
+                        anyhow::bail!("followup_screen_disconnected");
+                    }
+                    Err(TryRecvError::Empty) if std::time::Instant::now() >= query.deadline => {
+                        self.followup_screen_queries.remove(key);
+                        anyhow::bail!("followup_screen_timeout");
+                    }
+                    Err(TryRecvError::Empty) => {
+                        self.egui_ctx
+                            .request_repaint_after(std::time::Duration::from_millis(100));
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+        if self.followup_screen_queries.len() >= FOLLOWUP_MAX_ITEMS {
+            anyhow::bail!("followup_screen_limit");
+        }
+        let runtime = self
+            .runtime_by_instance(queued.target.runtime_instance)
+            .filter(|runtime| runtime.id == key.0)
+            .ok_or_else(|| anyhow::anyhow!("followup_screen_stale"))?;
+        let receiver = runtime.runtime.inspect_screen(key.1)?;
+        self.followup_screen_queries.insert(
+            key.clone(),
+            FollowUpScreenQuery {
+                reservation_id: queued.reservation_id.clone(),
+                receiver,
+                deadline: std::time::Instant::now() + std::time::Duration::from_secs(2),
+            },
+        );
+        self.egui_ctx
+            .request_repaint_after(std::time::Duration::from_millis(100));
+        Ok(None)
+    }
+
+    fn prepare_followup_effort(
+        &mut self,
+        key: &(String, runtime::SessionId),
+        queued: &QueuedFollowUp,
+    ) -> bool {
+        let Some(request) = &queued.effort else {
+            return true;
+        };
+        let mut context = self.followup_effort_context(&queued.target);
+        let origin = PromptDeliveryOrigin::FollowUp {
+            queued: queued.clone(),
+        };
+        if context.provider != Some(request.provider)
+            || context.model != request.model
+            || context.request(request.level).as_ref() != Some(request)
+        {
+            self.reject_prompt_origin(
+                &key.0,
+                key.1,
+                &queued.prompt,
+                &origin,
+                ui::composer::PromptAdmissionOutcome::Rejected,
+            );
+            return false;
+        }
+        if followup_effort_expired(queued, std::time::Instant::now()) {
+            self.reject_prompt_origin(
+                &key.0,
+                key.1,
+                &queued.prompt,
+                &origin,
+                ui::composer::PromptAdmissionOutcome::Rejected,
+            );
+            return false;
+        }
+        match queued.effort_stage {
+            FollowUpEffortStage::Verified => true,
+            FollowUpEffortStage::Confirming { .. } => {
+                if request.provider == crate::agent_surface::AgentProvider::Claude {
+                    if crate::followup_settings::acknowledged_in_reply(
+                        &queued.input_permit.reply_text(),
+                        request,
+                    ) {
+                        queued.input_permit.close_reply();
+                        if let Some(current) = self.pty_followup.get_mut(key) {
+                            current.effort_stage = FollowUpEffortStage::Verified;
+                        }
+                        return true;
+                    }
+                    self.egui_ctx
+                        .request_repaint_after(std::time::Duration::from_millis(100));
+                    return false;
+                }
+                let screen = match self.read_followup_screen(key, queued) {
+                    Ok(Some(screen)) => screen,
+                    Ok(None) => return false,
+                    Err(_) => {
+                        self.reject_prompt_origin(
+                            &key.0,
+                            key.1,
+                            &queued.prompt,
+                            &origin,
+                            ui::composer::PromptAdmissionOutcome::Rejected,
+                        );
+                        return false;
+                    }
+                };
+                if request.provider == crate::agent_surface::AgentProvider::Codex
+                    && let Some(actual) =
+                        crate::followup_settings::current_codex_effort(&screen, &context)
+                    && actual != request.level
+                    && let Some(previous) =
+                        queued.effort_baseline.and_then(|baseline| baseline.current)
+                {
+                    let index = |level| context.levels.iter().position(|value| *value == level);
+                    if let (Some(actual_index), Some(previous_index), Some(target_index)) =
+                        (index(actual), index(previous), index(request.level))
+                        && actual_index.abs_diff(target_index)
+                            < previous_index.abs_diff(target_index)
+                    {
+                        if let Some(current) = self.pty_followup.get_mut(key) {
+                            current.effort_baseline = Some(EffortBaseline {
+                                current: Some(actual),
+                            });
+                            current.effort_stage = FollowUpEffortStage::Pending;
+                        }
+                        self.egui_ctx.request_repaint();
+                        return false;
+                    }
+                }
+                let confirmed = match request.provider {
+                    crate::agent_surface::AgentProvider::Codex => {
+                        crate::followup_settings::current_codex_effort(&screen, &context)
+                            == Some(request.level)
+                    }
+                    _ => false,
+                };
+                if confirmed {
+                    if let Some(current) = self.pty_followup.get_mut(key) {
+                        current.effort_stage = FollowUpEffortStage::Verified;
+                    }
+                    true
+                } else {
+                    self.egui_ctx
+                        .request_repaint_after(std::time::Duration::from_millis(100));
+                    false
+                }
+            }
+            FollowUpEffortStage::Pending => {
+                if request.provider == crate::agent_surface::AgentProvider::Codex
+                    && queued.effort_baseline.is_none()
+                {
+                    if let Some(current) = self.pty_followup.get_mut(key) {
+                        current.effort_read_deadline.get_or_insert_with(|| {
+                            std::time::Instant::now() + std::time::Duration::from_secs(20)
+                        });
+                    }
+                    let screen = match self.read_followup_screen(key, queued) {
+                        Ok(Some(screen)) => screen,
+                        Ok(None) => return false,
+                        Err(_) => {
+                            self.reject_prompt_origin(
+                                &key.0,
+                                key.1,
+                                &queued.prompt,
+                                &origin,
+                                ui::composer::PromptAdmissionOutcome::Rejected,
+                            );
+                            return false;
+                        }
+                    };
+                    if let Some(current) = self.pty_followup.get_mut(key) {
+                        current.effort_baseline = Some(EffortBaseline {
+                            current: crate::followup_settings::current_codex_effort(
+                                &screen, &context,
+                            ),
+                        });
+                    }
+                    self.egui_ctx.request_repaint();
+                    return false;
+                }
+                if request.provider == crate::agent_surface::AgentProvider::Codex {
+                    let baseline = queued
+                        .effort_baseline
+                        .expect("Codex current effort was read");
+                    context.current = baseline.current.map(|level| level.value().to_owned());
+                    if baseline.current == Some(request.level) {
+                        return true;
+                    }
+                }
+                let origin = PromptDeliveryOrigin::FollowUpSetting {
+                    queued: queued.clone(),
+                };
+                let Some(plan) = context.plan(request) else {
+                    self.reject_prompt_origin(
+                        &key.0,
+                        key.1,
+                        &queued.prompt,
+                        &origin,
+                        ui::composer::PromptAdmissionOutcome::Rejected,
+                    );
+                    return false;
+                };
+                if self.pending_prompt_deliveries.len() >= PROMPT_DELIVERY_MAX_PENDING
+                    || self
+                        .pending_prompt_deliveries
+                        .values()
+                        .map(|pending| pending.prompt.len())
+                        .sum::<usize>()
+                        .saturating_add(request.level.value().len())
+                        > PROMPT_DELIVERY_MAX_BYTES
+                {
+                    self.reject_prompt_origin(
+                        &key.0,
+                        key.1,
+                        &queued.prompt,
+                        &origin,
+                        ui::composer::PromptAdmissionOutcome::Rejected,
+                    );
+                    return false;
+                }
+                let operation_id = format!("followup-effort:{}", uuid::Uuid::new_v4());
+                let deadline = std::time::Instant::now() + PROMPT_ADMISSION_TIMEOUT;
+                let payload: Arc<str> = Arc::from(request.level.value());
+                let result = self
+                    .runtime_by_instance_mut(queued.target.runtime_instance)
+                    .filter(|runtime| runtime.id == key.0)
+                    .ok_or_else(|| anyhow::anyhow!("followup_setting_target_stale"))
+                    .and_then(|runtime| {
+                        let parts = match plan {
+                            crate::pty_effort::EffortPlan::Keys(bytes) => vec![bytes],
+                            crate::pty_effort::EffortPlan::Slash { line, .. } => {
+                                plan_prompt_delivery(&runtime.workspace_ui, key.1, &line, true)
+                                    .ok_or_else(|| anyhow::anyhow!("followup_setting_empty"))?
+                                    .into_parts()
+                            }
+                        };
+                        if request.provider == crate::agent_surface::AgentProvider::Claude {
+                            let probe = runtime.runtime.send_guarded_input_batch_with_reply(
+                                key.1,
+                                operation_id.clone(),
+                                parts,
+                                followup_input_admission(queued, deadline),
+                            )?;
+                            queued.input_permit.set_reply(probe);
+                        } else {
+                            runtime.runtime.send_guarded_input_batch(
+                                key.1,
+                                operation_id.clone(),
+                                parts,
+                                followup_input_admission(queued, deadline),
+                            )?;
+                        }
+                        runtime.workspace_ui.clear_selection(key.1);
+                        Ok(())
+                    });
+                if result.is_err() {
+                    self.reject_prompt_origin(
+                        &key.0,
+                        key.1,
+                        &payload,
+                        &origin,
+                        ui::composer::PromptAdmissionOutcome::Rejected,
+                    );
+                    return false;
+                }
+                self.pending_prompt_deliveries.insert(
+                    operation_id,
+                    PendingPromptDelivery {
+                        workspace_id: key.0.clone(),
+                        runtime_instance: queued.target.runtime_instance,
+                        session: key.1,
+                        prompt: payload,
+                        origin,
+                        deadline,
+                        unknown: false,
+                    },
+                );
+                self.egui_ctx
+                    .request_repaint_after(PROMPT_ADMISSION_TIMEOUT);
+                false
+            }
+        }
+    }
+
     fn flush_queued_followups(&mut self) {
         if self.pty_followup.is_empty() {
             return;
@@ -17214,6 +17652,31 @@ impl App {
             .iter()
             .map(|(workspace_id, session, _)| (workspace_id.clone(), *session))
             .collect();
+        let now = std::time::Instant::now();
+        let mut expired = Vec::new();
+        for (key, queued) in &mut self.pty_followup {
+            latch_followup_completion(
+                queued,
+                self.global_turn_done.get(key).copied(),
+                waiting.contains(key),
+            );
+            if !queued.delivery_blocked && followup_effort_expired(queued, now) {
+                expired.push((key.clone(), queued.clone()));
+            }
+        }
+        // Waiting questions and consumed completion notifications must not suspend deadlines.
+        for (key, queued) in expired {
+            let origin = PromptDeliveryOrigin::FollowUp {
+                queued: queued.clone(),
+            };
+            self.reject_prompt_origin(
+                &key.0,
+                key.1,
+                &queued.prompt,
+                &origin,
+                ui::composer::PromptAdmissionOutcome::Rejected,
+            );
+        }
         let ready: Vec<(String, runtime::SessionId)> = self
             .pty_followup
             .iter()
@@ -17224,11 +17687,8 @@ impl App {
                             && pending.workspace_id == key.0
                             && pending.session == key.1
                     })
-                    && crate::fleet::followup_ready(
-                        queued.queued_turn,
-                        self.global_turn_done.get(*key).copied(),
-                        waiting.contains(*key),
-                    )
+                    && queued.turn_completed
+                    && !waiting.contains(*key)
             })
             .map(|(key, _)| key.clone())
             .collect();
@@ -17238,6 +17698,9 @@ impl App {
                 .get(&key)
                 .expect("ready follow-up")
                 .clone();
+            if !self.prepare_followup_effort(&key, &queued) {
+                continue;
+            }
             let target = queued.target.clone();
             let prompt = Arc::clone(&queued.prompt);
             self.broadcast_prompt_to(&target, &prompt, PromptDeliveryOrigin::FollowUp { queued });
@@ -30614,7 +31077,8 @@ impl App {
                 self.composer
                     .settle_submission(draft_key, *submission_id, prompt, outcome);
             }
-            PromptDeliveryOrigin::FollowUp { queued } => {
+            PromptDeliveryOrigin::FollowUp { queued }
+            | PromptDeliveryOrigin::FollowUpSetting { queued, .. } => {
                 settle_followup_admission(
                     &mut self.pty_followup,
                     &(workspace_id.to_owned(), session),
@@ -30718,6 +31182,16 @@ impl App {
                     ) {
                         self.pending_composer_history = Some(history);
                     }
+                }
+                PromptDeliveryOrigin::FollowUpSetting { queued } => {
+                    settle_followup_setting_admission(
+                        &mut self.pty_followup,
+                        &(pending.workspace_id.clone(), pending.session),
+                        queued,
+                        std::time::Instant::now(),
+                    );
+                    self.egui_ctx
+                        .request_repaint_after(std::time::Duration::from_millis(100));
                 }
                 PromptDeliveryOrigin::FollowUp { queued } => {
                     settle_followup_admission(
@@ -31397,6 +31871,18 @@ impl eframe::App for App {
         }
         // Shortcut handling may persist config, switch runtimes, or start protocol/process work.
         // Consume egui input here so none of those effects are reachable from the render pass.
+        self.followup_screen_queries.retain(|key, query| {
+            self.pty_followup.get(key).is_some_and(|queued| {
+                queued.reservation_id == query.reservation_id && !queued.delivery_blocked
+            })
+        });
+        if self
+            .pty_followup
+            .values()
+            .any(|queued| queued.effort.is_some() && !queued.delivery_blocked)
+        {
+            self.flush_queued_followups();
+        }
         self.flush_queued_pty_adjustments();
         if let Some(intent) = self.pending_agent_launcher_intent.take() {
             self.handle_agent_launcher_intent(intent);
@@ -33598,6 +34084,12 @@ impl eframe::App for App {
                         &text,
                     );
                 } else if fleet_visible {
+                    if let Some(target) = self.fleet_ui.followup_target().cloned() {
+                        let context = self.followup_effort_context(&target);
+                        let reserved = self.pty_followup.get(&(target.workspace_id.clone(), target.session))
+                            .and_then(|queued| queued.effort.as_ref()).map(|effort| effort.level);
+                        self.fleet_ui.set_followup_context(context, reserved);
+                    }
                     self.fleet_ui.set_prompt_revision(self.prompt_library_revision);
                     let blocked_followups = self.pty_followup.iter()
                         .filter(|(_, queued)| queued.delivery_blocked
@@ -34264,6 +34756,7 @@ impl eframe::App for App {
                 workspace_id,
                 session,
                 prompt,
+                effort,
             }) => {
                 let key = (workspace_id, session);
                 if prompt.trim().is_empty() {
@@ -34279,7 +34772,12 @@ impl eframe::App for App {
                             .get(&(expected.runtime_instance, expected.session))
                             .and_then(|agent| agent.execution)
                             == Some(expected.execution);
+                    let settings_valid = effort.as_ref().is_none_or(|effort| {
+                        let context = self.followup_effort_context(&expected);
+                        context.request(effort.level).as_ref() == Some(effort)
+                    });
                     let accepted = valid
+                        && settings_valid
                         && admit_followup_reservation(
                             &mut self.pty_followup,
                             key.clone(),
@@ -34287,10 +34785,15 @@ impl eframe::App for App {
                                 target: expected.clone(),
                                 prompt: Arc::from(prompt),
                                 queued_turn: self.global_turn_done.get(&key).copied(),
+                                turn_completed: false,
                                 delivery_blocked: false,
                                 delivery_unknown: false,
                                 reservation_id: uuid::Uuid::new_v4().to_string(),
                                 input_permit: FollowUpInputPermit::default(),
+                                effort,
+                                effort_stage: FollowUpEffortStage::Pending,
+                                effort_baseline: None,
+                                effort_read_deadline: None,
                             },
                         )
                         .is_ok();
@@ -38397,6 +38900,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     impl FollowUpRuntimeFixture {
         fn new() -> Self {
+            Self::with_old_effort_ack(false)
+        }
+
+        fn with_old_effort_ack(old_ack: bool) -> Self {
             use runtime::{RuntimeCommandSink, RuntimeEventStream};
             struct NoSecrets;
             impl runtime::RuntimeSecretResolver for NoSecrets {
@@ -38426,7 +38933,11 @@ mod tests {
                     command: "/bin/sh".into(),
                     args: vec![
                         "-c".into(),
-                        r#"printf 'OWNER:%s\r\n❯ ' "$$"; exec /bin/cat"#.into(),
+                        if old_ack {
+                            r#"printf 'Set effort level to low\r\nOWNER:%s\r\n❯ ' "$$"; exec /bin/cat"#.into()
+                        } else {
+                            r#"printf 'OWNER:%s\r\n❯ ' "$$"; exec /bin/cat"#.into()
+                        },
                     ],
                     env_plain: vec![],
                     env_secrets: vec![],
@@ -38514,10 +39025,15 @@ mod tests {
                 },
                 prompt: format!("{id} 한글 😀").into(),
                 queued_turn: Some(1),
+                turn_completed: false,
                 delivery_blocked: false,
                 delivery_unknown: false,
                 reservation_id: id.into(),
                 input_permit: FollowUpInputPermit::default(),
+                effort: None,
+                effort_stage: FollowUpEffortStage::Pending,
+                effort_baseline: None,
+                effort_read_deadline: None,
             }
         }
 
@@ -38778,6 +39294,194 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "macos")]
+    fn followup_screen_read_works_when_target_runtime_is_warm() {
+        let fixture = FollowUpRuntimeFixture::new();
+        fixture
+            .client
+            .send_command(runtime::RuntimeCommand::SetWorkspaceState(
+                runtime::WorkspaceRuntimeState::Warm,
+            ))
+            .unwrap();
+        let screen = fixture
+            .client
+            .inspect_screen(fixture.session)
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        assert!(screen.contains("OWNER:"));
+        assert!(screen.len() <= 8192);
+        assert!(
+            fixture
+                .client
+                .inspect_screen(runtime::SessionId(u64::MAX))
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn followup_completion_latch_survives_consumed_marker_and_question() {
+        let fixture = FollowUpRuntimeFixture::new();
+        let mut queued = fixture.reservation("completion-latch");
+        latch_followup_completion(&mut queued, Some(1), false);
+        assert!(
+            !queued.turn_completed,
+            "old completed turn cannot release a reservation"
+        );
+        latch_followup_completion(&mut queued, Some(2), true);
+        assert!(
+            !queued.turn_completed,
+            "a question must not initiate delivery"
+        );
+        latch_followup_completion(&mut queued, Some(2), false);
+        assert!(queued.turn_completed);
+        latch_followup_completion(&mut queued, None, true);
+        assert!(
+            queued.turn_completed,
+            "viewing completion must not stop the setting chain"
+        );
+        let now = std::time::Instant::now();
+        queued.effort_stage = FollowUpEffortStage::Confirming { deadline: now };
+        assert!(
+            followup_effort_expired(&queued, now),
+            "deadline is independent of turn/waiting markers"
+        );
+        queued.effort_stage = FollowUpEffortStage::Pending;
+        queued.effort_read_deadline = Some(now);
+        assert!(followup_effort_expired(&queued, now));
+        queued.effort_stage = FollowUpEffortStage::Verified;
+        assert!(!followup_effort_expired(&queued, now));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn followup_fresh_reply_excludes_old_screen_and_revokes_capture() {
+        use runtime::RuntimeCommandSink;
+        let mut fixture = FollowUpRuntimeFixture::with_old_effort_ack(true);
+        let queued = fixture.reservation("fresh-reply");
+        fixture
+            .client
+            .send_command(runtime::RuntimeCommand::SetWorkspaceState(
+                runtime::WorkspaceRuntimeState::Warm,
+            ))
+            .unwrap();
+        let reply = fixture
+            .client
+            .send_guarded_input_batch_with_reply(
+                fixture.session,
+                "fresh-reply:input".into(),
+                vec![b"Set effort level to low\r".to_vec()],
+                followup_input_admission(
+                    &queued,
+                    std::time::Instant::now() + std::time::Duration::from_secs(5),
+                ),
+            )
+            .unwrap();
+        queued.input_permit.set_reply(reply.clone());
+        assert_eq!(fixture.outcome("fresh-reply:input"), Ok(()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !reply.text().contains("Set effort level to low") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fresh private PTY reply timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(
+            !reply.text().contains("OWNER:"),
+            "old screen output cannot confirm this command"
+        );
+        queued.input_permit.revoke();
+        assert!(reply.text().is_empty());
+        assert!(queued.input_permit.reply_text().is_empty());
+        queued.input_permit.set_reply(reply.clone());
+        assert!(
+            reply.text().is_empty(),
+            "late probe cannot reenable canceled capture"
+        );
+        fixture
+            .client
+            .send_command(runtime::RuntimeCommand::WriteInput {
+                session: fixture.session,
+                bytes: b"after-cancellation\r".to_vec(),
+            })
+            .unwrap();
+        loop {
+            let screen = fixture
+                .client
+                .inspect_screen(fixture.session)
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap()
+                .unwrap_or_default();
+            if screen.contains("after-cancellation") {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(
+            reply.text().is_empty(),
+            "new output cannot reenable canceled capture"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn followup_setting_ack_retains_prompt_and_original_input_permit() {
+        let mut fixture = FollowUpRuntimeFixture::new();
+        let queued = fixture.reservation("setting");
+        let key = (queued.target.workspace_id.clone(), queued.target.session);
+        let mut followups = std::collections::HashMap::from([(key.clone(), queued.clone())]);
+        settle_followup_setting_admission(&mut followups, &key, &queued, std::time::Instant::now());
+        assert_eq!(followups[&key].prompt, queued.prompt);
+        assert!(matches!(
+            followups[&key].effort_stage,
+            FollowUpEffortStage::Confirming { .. }
+        ));
+        fixture
+            .client
+            .send_guarded_input_batch(
+                fixture.session,
+                "followup:after-setting".into(),
+                vec![b"next task".to_vec()],
+                followup_input_admission(
+                    &queued,
+                    std::time::Instant::now() + std::time::Duration::from_secs(5),
+                ),
+            )
+            .unwrap();
+        assert_eq!(fixture.outcome("followup:after-setting"), Ok(()));
+        cancel_followup_reservation(&mut followups, &key);
+        assert!(followups.is_empty());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn followup_late_setting_ack_cannot_release_replacement_or_blocked_task() {
+        let fixture = FollowUpRuntimeFixture::new();
+        let old = fixture.reservation("old-setting");
+        let replacement = fixture.reservation("replacement");
+        let key = (old.target.workspace_id.clone(), old.target.session);
+        let mut followups = std::collections::HashMap::from([(key.clone(), replacement.clone())]);
+        settle_followup_setting_admission(&mut followups, &key, &old, std::time::Instant::now());
+        assert_eq!(followups[&key].effort_stage, FollowUpEffortStage::Pending);
+        followups.get_mut(&key).unwrap().delivery_blocked = true;
+        settle_followup_setting_admission(
+            &mut followups,
+            &key,
+            &replacement,
+            std::time::Instant::now(),
+        );
+        assert_eq!(followups[&key].effort_stage, FollowUpEffortStage::Pending);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
     fn pr14_late_original_ack_does_not_revoke_queued_replacement_authorization() {
         let mut fixture = FollowUpRuntimeFixture::new();
         let old = fixture.reservation("original");
@@ -38847,10 +39551,15 @@ mod tests {
             },
             prompt: "a".repeat(bytes).into(),
             queued_turn: Some(1),
+            turn_completed: false,
             delivery_blocked: false,
             delivery_unknown: false,
             reservation_id: format!("reservation-{id}"),
             input_permit: FollowUpInputPermit::default(),
+            effort: None,
+            effort_stage: FollowUpEffortStage::Pending,
+            effort_baseline: None,
+            effort_read_deadline: None,
         };
         let mut map = std::collections::HashMap::new();
         for id in 0..256 {
@@ -38966,10 +39675,15 @@ mod tests {
             },
             prompt: "small prompt".into(),
             queued_turn: None,
+            turn_completed: false,
             delivery_blocked: false,
             delivery_unknown: false,
             reservation_id: format!("reservation-{id}"),
             input_permit: FollowUpInputPermit::default(),
+            effort: None,
+            effort_stage: FollowUpEffortStage::Pending,
+            effort_baseline: None,
+            effort_read_deadline: None,
         };
         let workspace = "w".repeat(1024);
         let mut map = std::collections::HashMap::new();
@@ -39107,10 +39821,15 @@ mod tests {
             },
             prompt: "original".into(),
             queued_turn: Some(1),
+            turn_completed: false,
             delivery_blocked: false,
             delivery_unknown: false,
             reservation_id: "old".into(),
             input_permit: FollowUpInputPermit::default(),
+            effort: None,
+            effort_stage: FollowUpEffortStage::Pending,
+            effort_baseline: None,
+            effort_read_deadline: None,
         };
         let mut followups = std::collections::HashMap::from([(key.clone(), queued.clone())]);
         settle_followup_admission(

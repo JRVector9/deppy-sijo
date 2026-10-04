@@ -92,7 +92,11 @@ const FORBIDDEN_EDGES: &[(&str, &str)] = &[
 /// 전체를 allow-list로 고정한다. dev/build/target dependency도 같은 규칙을 적용한다.
 const STRICT_CRATE_DEPS: &[(&str, &[&str])] = &[
     ("connector-contract", &["serde"]),
-    ("connector-ui", &["connector-contract", "egui", "i18n"]),
+    // egui_kittest is dev-only; production connector-ui remains capability-free.
+    (
+        "connector-ui",
+        &["connector-contract", "egui", "egui_kittest", "i18n"],
+    ),
     (
         "connector-service",
         &[

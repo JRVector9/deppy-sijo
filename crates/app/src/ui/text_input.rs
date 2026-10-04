@@ -102,6 +102,7 @@ pub(crate) fn bounded_edit(
 pub(crate) enum BoundedEditStyle {
     SingleLine,
     Multiline { rows: usize, code_editor: bool },
+    WindowEditor { height: f32 },
 }
 
 pub(crate) fn bounded_edit_with_style(
@@ -112,7 +113,7 @@ pub(crate) fn bounded_edit_with_style(
     hint: &str,
     style: BoundedEditStyle,
 ) -> (egui::Response, bool) {
-    let multiline = matches!(style, BoundedEditStyle::Multiline { .. });
+    let multiline = !matches!(style, BoundedEditStyle::SingleLine);
     initialize_bounded_undo(ui.ctx(), id);
     let incoming = ui.input(|input| {
         input
@@ -158,7 +159,15 @@ pub(crate) fn bounded_edit_with_style(
                 edit
             }
         }
-        BoundedEditStyle::SingleLine => egui::TextEdit::singleline(&mut buffer),
+        BoundedEditStyle::SingleLine => egui::TextEdit::singleline(&mut buffer)
+            .font(egui::FontId::proportional(13.0))
+            .margin(egui::Margin::symmetric(10, 8))
+            .min_size(egui::vec2(0.0, 36.0)),
+        BoundedEditStyle::WindowEditor { height } => egui::TextEdit::multiline(&mut buffer)
+            .desired_rows(1)
+            .min_size(egui::vec2(0.0, height))
+            .font(egui::FontId::proportional(13.0))
+            .margin(egui::Margin::symmetric(10, 8)),
     };
     let mut response = ui.add(edit.id(id).hint_text(hint).desired_width(f32::INFINITY));
     if rejected {

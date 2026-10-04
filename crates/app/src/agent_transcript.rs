@@ -264,6 +264,13 @@ fn tail_snapshot_from_reader<R: Read + Seek>(
 /// 파일 끝 `max_bytes`만 읽는다. metadata snapshot 이후 append는 다음 poll에서 보고,
 /// 현재 poll에서는 버퍼가 상한을 넘지 않도록 정확한 snapshot 바이트만 읽는다.
 fn tail_snapshot(path: &Path, max_bytes: u64) -> std::io::Result<TailSnapshot> {
+    open_tail_snapshot(path, max_bytes).map(|(_, _, snapshot)| snapshot)
+}
+
+fn open_tail_snapshot(
+    path: &Path,
+    max_bytes: u64,
+) -> std::io::Result<(std::fs::File, u64, TailSnapshot)> {
     let (mut file, snapshot_len) = open_regular_file(path)?;
     let modified_at = file
         .metadata()?
@@ -275,7 +282,44 @@ fn tail_snapshot(path: &Path, max_bytes: u64) -> std::io::Result<TailSnapshot> {
     if file.metadata()?.len() < snapshot_len {
         return Err(invalid_input("transcript_shrank_during_read"));
     }
-    Ok(snapshot)
+    Ok((file, snapshot_len, snapshot))
+}
+
+/// A cold detector can see tool traffic after the user message has left the small
+/// status tail. Recover only the latest real instruction, using the same open
+/// file and EOF snapshot; never derive status/model from older traffic. This runs
+/// only on missing instructions and remains memoized by the detector file stamp.
+fn recover_task_instruction(
+    file: &mut std::fs::File,
+    snapshot_len: u64,
+    snapshot: &TailSnapshot,
+    instruction_event: impl Fn(&Value) -> Option<Option<String>>,
+) -> Option<String> {
+    if snapshot.base_offset == 0 {
+        return None;
+    }
+    let deep = tail_snapshot_from_reader(
+        file,
+        snapshot_len,
+        CONVERSATION_TAIL_BYTES,
+        snapshot.modified_at,
+    )
+    .ok()?;
+    if file.metadata().ok()?.len() < snapshot_len {
+        return None;
+    }
+    validate_tail_text(&deep.text)?;
+    for line in deep.text.lines().rev() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if let Some(instruction) = instruction_event(&value) {
+            // A blank/filtered latest real instruction is a boundary, not license
+            // to borrow another turn's task.
+            return instruction;
+        }
+    }
+    None
 }
 
 fn validate_tail_text(text: &str) -> Option<()> {
@@ -760,7 +804,7 @@ pub fn parse_claude(path: &Path) -> Option<TranscriptState> {
         return None;
     }
     let session_id = raw_session_id.to_owned();
-    let snapshot = tail_snapshot(path, TAIL_BYTES).ok()?;
+    let (mut file, snapshot_len, snapshot) = open_tail_snapshot(path, TAIL_BYTES).ok()?;
     validate_tail_text(&snapshot.text)?;
     let recent_turns = claude_recent_turns(&snapshot);
     let text = &snapshot.text;
@@ -831,6 +875,13 @@ pub fn parse_claude(path: &Path) -> Option<TranscriptState> {
         {
             break;
         }
+    }
+    if user_instruction.is_none() && !user_turn_seen {
+        user_instruction = recover_task_instruction(&mut file, snapshot_len, &snapshot, |value| {
+            (value.get("type").and_then(Value::as_str) == Some("user")
+                && claude_user_starts_new_turn(value))
+            .then(|| claude_user_instruction(value))
+        });
     }
     Some(TranscriptState {
         session_id,
@@ -1898,7 +1949,7 @@ fn codex_recent_turns(snapshot: &TailSnapshot) -> Vec<TranscriptTurn> {
 
 pub fn parse_codex(path: &Path) -> Option<TranscriptState> {
     let session_id = codex_session_id(path.file_name()?.to_str()?)?;
-    let (cwd, snapshot) = codex_snapshot(path).ok()?;
+    let (mut file, snapshot_len, cwd, snapshot) = codex_snapshot(path).ok()?;
     validate_tail_text(&snapshot.text)?;
     let recent_turns = codex_recent_turns(&snapshot);
     let text = &snapshot.text;
@@ -1986,6 +2037,18 @@ pub fn parse_codex(path: &Path) -> Option<TranscriptState> {
             break;
         }
     }
+    if user_instruction.is_none() && !user_turn_seen {
+        user_instruction = recover_task_instruction(&mut file, snapshot_len, &snapshot, |value| {
+            (value.get("type").and_then(Value::as_str) == Some("event_msg")
+                && value.pointer("/payload/type").and_then(Value::as_str) == Some("user_message"))
+            .then(|| {
+                value
+                    .pointer("/payload/message")
+                    .and_then(Value::as_str)
+                    .and_then(clean_agent_summary)
+            })
+        });
+    }
     Some(TranscriptState {
         session_id,
         cwd,
@@ -2039,7 +2102,9 @@ fn codex_cwd_from_head(path: &Path) -> std::io::Result<Option<String>> {
     Ok(cwd)
 }
 
-fn codex_snapshot(path: &Path) -> std::io::Result<(Option<String>, TailSnapshot)> {
+fn codex_snapshot(
+    path: &Path,
+) -> std::io::Result<(std::fs::File, u64, Option<String>, TailSnapshot)> {
     let (mut file, snapshot_len) = open_regular_file(path)?;
     let cwd = codex_cwd_from_head_snapshot(&mut file, snapshot_len)?;
     let modified_at = file
@@ -2052,7 +2117,7 @@ fn codex_snapshot(path: &Path) -> std::io::Result<(Option<String>, TailSnapshot)
     if file.metadata()?.len() < snapshot_len {
         return Err(invalid_input("transcript_shrank_during_read"));
     }
-    Ok((cwd, tail))
+    Ok((file, snapshot_len, cwd, tail))
 }
 
 fn codex_cwd_from_head_snapshot<R: Read + Seek>(
@@ -2818,6 +2883,73 @@ mod tests {
             production.contains("libc::O_NOFOLLOW | libc::O_NONBLOCK"),
             "transcript open must reject symlink/FIFO replacement races"
         );
+    }
+
+    #[test]
+    fn fleet_running_claude_recovers_instruction_after_large_tool_output() {
+        let mut content = String::from(
+            r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"Keep the current task visible"}}"#,
+        );
+        content.push('\n');
+        for _ in 0..6 {
+            content.push_str(&serde_json::json!({"type":"user", "message":{"content":[{"type":"tool_result", "content":"x".repeat(50_000)}]}}).to_string());
+            content.push('\n');
+        }
+        content.push_str(r#"{"type":"assistant","cwd":"/proj","message":{"model":"claude","stop_reason":"tool_use","content":[]}}"#);
+        let path = write_tmp("fleet-running-claude-long.jsonl", &content);
+        let state = parse_claude(&path).unwrap();
+        assert_eq!(state.activity, AgentActivity::Working);
+        assert_eq!(
+            state.user_instruction.as_deref(),
+            Some("Keep the current task visible")
+        );
+        assert_eq!(state.last_agent_summary, None);
+    }
+
+    #[test]
+    fn fleet_recovered_claude_instruction_never_uses_assistant_text() {
+        let mut content = String::from(
+            r#"{"type":"user","message":{"content":"The actual user task"}}
+{"type":"assistant","message":{"content":"An old assistant explanation"}}
+"#,
+        );
+        for _ in 0..6 {
+            content.push_str(&serde_json::json!({"type":"user", "message":{"content":[{"type":"tool_result", "content":"x".repeat(50_000)}]}}).to_string());
+            content.push('\n');
+        }
+        content
+            .push_str(r#"{"type":"assistant","message":{"stop_reason":"tool_use","content":[]}}"#);
+        let state =
+            parse_claude(&write_tmp("fleet-recovery-claude-source.jsonl", &content)).unwrap();
+        assert_eq!(
+            state.user_instruction.as_deref(),
+            Some("The actual user task")
+        );
+    }
+
+    #[test]
+    fn fleet_running_codex_recovers_instruction_after_large_tool_output() {
+        let mut content = String::from(
+            r#"{"type":"session_meta","payload":{"cwd":"/proj"}}
+{"type":"event_msg","payload":{"type":"user_message","message":"Keep the Codex task visible"}}
+"#,
+        );
+        for _ in 0..6 {
+            content.push_str(&serde_json::json!({"type":"response_item", "payload":{"type":"function_call_output", "output":"x".repeat(50_000)}}).to_string());
+            content.push('\n');
+        }
+        content.push_str(r#"{"type":"event_msg","payload":{"type":"task_started"}}"#);
+        let path = write_tmp(
+            "rollout-fleet-long-12345678-1234-1234-1234-123456789abd.jsonl",
+            &content,
+        );
+        let state = parse_codex(&path).unwrap();
+        assert_eq!(state.activity, AgentActivity::Working);
+        assert_eq!(
+            state.user_instruction.as_deref(),
+            Some("Keep the Codex task visible")
+        );
+        assert_eq!(state.last_agent_summary, None);
     }
 
     #[test]

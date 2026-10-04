@@ -83,7 +83,7 @@ fn parse_cursor(text: &str) -> Result<(Vec<ModelChoice>, Option<String>), ()> {
     Ok((models, default))
 }
 
-fn strip_ansi(text: &str) -> String {
+pub(crate) fn strip_ansi(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars();
     while let Some(ch) = chars.next() {

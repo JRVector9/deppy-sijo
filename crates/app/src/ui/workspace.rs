@@ -5044,6 +5044,13 @@ impl WorkspaceUi {
         self.agent_info.get(&session).map(agent_info_line)
     }
 
+    pub(crate) fn agent_display_for(
+        &self,
+        session: SessionId,
+    ) -> Option<&crate::agent_detect::AgentDisplay> {
+        self.agent_info.get(&session)
+    }
+
     /// Fleet 카드용 한 줄 작업 설명. `agent_info`는 warm 전환 뒤에도 마지막
     /// transcript 설명을 보존하므로 완료/종료 카드에도 새 파일 I/O 없이 쓸 수 있다.
     pub fn agent_task_line_for(

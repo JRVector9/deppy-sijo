@@ -10,6 +10,7 @@
 | 02 | 새 폴더 만들기 | 공용 팝업 적용 | `crates/app/src/ui/file_tree.rs` |
 | 03 | 새 파일 만들기 | 공용 팝업 적용 | `crates/app/src/ui/file_tree.rs` |
 | 04 | 워크스페이스 이름 바꾸기 | 워크스페이스 행에서 인라인 편집 | `crates/app/src/ui/file_tree.rs` |
+| 06 | MCP 서버 추가·수정 | 공용 중앙 이동·크기 조절 입력 창 | `crates/connector-ui/src/lib.rs` |
 | 07 | 실행 중인 세션 닫기 | 공용 확인 팝업 · 대상별 입력 보호 | `crates/app/src/ui/session_close_dialogs.rs` · 호출자 `ui/workspace.rs` |
 | 08 | 워크스페이스 세션 모두 종료 | 공용 확인 팝업 · 대상별 입력 보호 | `crates/app/src/ui/session_close_dialogs.rs` · 호출자 `app.rs` |
 | 09 | 환경 및 API 프로젝트 목록 닫기 | 공용 확인 팝업 · 세션 유지·대상별 입력 보호 | `crates/app/src/ui/environment_dialogs.rs` · 호출자 `app.rs` |
@@ -17,10 +18,13 @@
 | 12 | 포트 프로세스 종료 | 공용 확인 팝업 적용 | `crates/app/src/ui/ports.rs` |
 | 13 | 휴지통 실패 후 영구 삭제 | 공용 확인 팝업 적용 | `crates/app/src/ui/file_tree.rs` |
 | 15 | 환경변수 정의 삭제 | 공용 팝업 · 36pt 원본 파일 선택·명시적 삭제 | `crates/app/src/ui/environment_dialogs.rs` · 호출자 `ui/env_profiles.rs` |
+| 18–20 | 다음 단계 예약·브로드캐스트·일괄 시작 | 공용 중앙 이동·크기 조절 창·고정 하단 버튼 | `crates/app/src/ui/fleet.rs` |
+| 22 | MCP 도구 직접 호출 | 공용 중앙 이동·크기 조절 입력 창 | `crates/connector-ui/src/lib.rs` |
 | 26 | 미저장 문서 닫기 | 공용 팝업 · 저장/버리기/취소 | `crates/app/src/ui/document_dialogs.rs` |
 | 27 | 외부 수정 문서 다시 불러오기 | 공용 팝업 · 다시 불러오기/취소 | `crates/app/src/ui/document_dialogs.rs` |
 | 28 | 문서 탭 한도 | 공용 Info 팝업 | `crates/app/src/ui/document_dialogs.rs` |
 | 29 | 프로젝트 폴더 이동 | 공용 팝업 · 이전/현재 경로·접수/실패 상태 | `crates/app/src/ui/document_dialogs.rs` |
+| 30–32 | 프롬프트 라이브러리·변경사항·세션 관리 | 공용 중앙 이동·크기 조절 셸과 본문 여백 | `ui/prompt_palette.rs` · `ui/diff_panel.rs` · `ui/agent_sessions.rs` |
 | 33–35 | 이벤트 적체·워크스페이스 한도·셀 열기 실패 | 공용 Info 팝업 · 순차 안내 | `crates/app/src/ui/popup/information.rs` · 호출자 `app.rs` |
 | 37 포트 | 포트 관리 목록 | 공용 앵커 팝오버 · 목록 행·스크롤·고정 푸터 | `crates/app/src/ui/ports.rs` · 호출자 `ui/agent_terminal.rs` |
 
@@ -28,10 +32,11 @@ AI 세션 시작 런처는 기존 전용 레이아웃을 유지한다. macOS 기
 
 ## 컴포넌트 경계
 
-`crates/app/src/ui/popup/` 아래 코드는 표시만 담당한다. 파일 선택, Git 복제, 파일 생성, 오류 상태, 입력 초안은 각 호출자가 계속 소유한다.
+`crates/connector-ui/src/popup/`가 공용 표시 구현을 소유하고 `crates/app/src/ui/popup/`가 기존 경로에서 이를 재공개한다. App 전용 확인·정보 안내·터미널 입력 차단은 App에 남는다. 두 호출자는 같은 팔레트와 모달 입력 펜스를 사용한다. 파일 선택, Git 복제, 파일 생성, 오류 상태, 입력 초안은 각 호출자가 계속 소유한다.
 
 | 컴포넌트 | 파일 | 책임 |
 | --- | --- | --- |
+| `WindowSpec` / `window` / `window_body` | `connector-ui/src/popup/window.rs` | 중앙에서 열리는 이동·크기 조절 창, 본문 스크롤과 고정 하단 여백 |
 | `PopupSpec` / `show` / `body` | `shell.rs` | 모달 배경, 폭, 제목·설명·닫기, 고정 머리글과 스크롤 본문 |
 | `field` / `text_input` / `path_input` / `segmented_choice` | `fields.rs` | 레이블·힌트, 36pt 입력, 경로와 찾아보기 행, 두 선택지 |
 | `choice_input` | `fields.rs` | 36pt 선택 입력, 공용 테두리·폰트·배경 |
@@ -163,4 +168,14 @@ Deppy를 실행하거나 재실행하는 것은 별도 명시적 요청이 있�
 
 ## Fleet 입력 상한 보정 (2026-10-04)
 
-사례18·19·20의 기존 Window 표시/맨 앞 창 Esc 계약을 유지한다. 다음 단계 예약은 일반 폰트4행 입력이며 UTF-8 본문16KiB, undo8개와 열 때 한 번만 고정 입력 ID를 초기화한다. 입력/템플릿 삽입 상한 거부와 호스트 예약 거부는 공용 Error notice로 안내하며 기존 폼을 보존한다. 호스트가 정확한 원래 대상의 예약을 받아들인 뒤에만 폼을 닫는다. 배치 시작은 확장 결과16KiB를 실제 Start 전에 확인하고, 브로드캐스트의1MiB 결과 상한은 유지한다. 이번 변경은 팝업 셸 이전이 아니다.
+사례18·19·20의 기존 Window 표시/맨 앞 창 Esc 계약을 유지한다. 다음 단계 예약은 일반 폰트4행 입력이며 UTF-8 본문16KiB, undo8개와 열 때 한 번만 고정 입력 ID를 초기화한다. 입력/템플릿 삽입 상한 거부와 호스트 예약 거부는 공용 Error notice로 안내하며 기존 폼을 보존한다. 호스트가 정확한 원래 대상의 예약을 받아들인 뒤에만 폼을 닫는다. 배치 시작은 확장 결과16KiB를 실제 Start 전에 확인하고, 브로드캐스트의1MiB 결과 상한은 유지한다.
+
+## 중앙에서 열리는 이동·크기 조절 창 (2026-10-05)
+
+[승인된 HTML 시안](../mockups/fleet-centered-resizable-popups-2026-10-05.html)을18–20,06·22,30–32에 적용한다. 기본 다음 단계620×560pt, 브로드캐스트680×560pt, 일괄 시작520×440pt. 각 창의 고유 ID와 native Resize 상태로 크기를 유지하며, 열 때 native CENTER_CENTER pivot을 화면 중앙에 둔다. 이동한 위치는 열린 동안 유지하고 재열기 시 중앙으로 돌아온다. 측정 크기를 다시 기본 크기로 넣는 반복 보정이나 영구 repaint 타이머를 만들지 않는다.
+
+공통 창 셸은18pt 제목·13pt 본문·22pt 좌우 여백·36pt 선택 입력·34pt 동작을 사용한다. 입력 창18–20·06·22는 본문만 스크롤하고 하단 버튼을 고정한다. 라이브러리·변경사항·세션 관리의 내부 목록/분할/동작은 각 호출자가 유지한다. 기존 런처·OS 선택창·앵커 메뉴와 관련 없는 승인/확인창은 이번 이동형 창 변경에 포함하지 않는다. 입력 소유권과 Esc는 기존 호출자 정책을 유지한다.
+
+다음 단계 예약은 실제 모델명 옆에 추론 강도를 표시한다. 기본값은 현재 설정 유지이며, 기존 모델 카탈로그와 검증된 CLI 경로가 모두 있는 강도만 선택 가능하다. 선택한 값은 현재 턴이 끝난 후 원래 세션/실행에 적용한다. PTY 입력 접수는 설정 확인이 아니므로, 설정 접수 이후 Codex는 원래 런타임의 일회성 현재 화면에서 선택값을 확인하고, Claude는 해당 입력 접수 이후의 새 출력에서 CLI 확인 메시지를 확인해야 예약 지시를 보낸다. Claude 확인 버퍼는8KiB이며 worker는 약한 참조만 유지한다. 취소·교체·종료 시 버퍼를 비우고 캡처를 중단한다. 새 완료 세대는 예약 자체에 보존해 완료 알림을 읽어도 이어지는 설정 처리가 멈추지 않으며, 확인 기한은 대기/알림 표시 여부와 독립적으로 검사한다.20초 내 확인하지 못하거나 거절/Unknown이면 예약을 남겨 두고 차단하며 알린다. 취소/교체/종료는 원래 입력 permit을 폐기한다.
+
+Codex는 모델별 단축키 한 단계를 보내고 실제 변경을 확인한 다음 이어서 조정한다. Claude는 `/effort`를 사용한다. 변경 확인을 검증하지 못한 Kimi는 읽기 전용으로 표시한다. Codex Ultra는 별도 대화형 선택이 필요해 자동 변경 목록에 넣지 않으며, Grok의 실행 중 변경 경로는 검증되지 않아 비활성화한다. 지원하지 않는 설정을 프롬프트로 보내거나 새 AI 프로세스를 시작하지 않는다. Claude의 CLI는 선택한 추론 강도를 새 세션 기본값으로도 저장할 수 있다.

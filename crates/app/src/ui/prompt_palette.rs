@@ -188,15 +188,24 @@ impl PromptPaletteUi {
         }
         let mut action = None;
         let mut open = true;
-        egui::Window::new(catalog.t("prompt.title", &[]))
-            .id(egui::Id::new("prompt_palette"))
-            .collapsible(false)
-            .resizable(true)
-            .default_width(560.0)
-            .open(&mut open)
-            .show(ctx, |ui| {
-                action = self.body(ui, library, library_revision, composer_draft, catalog);
-            });
+        super::popup::window(
+            ctx,
+            super::popup::WindowSpec {
+                id: egui::Id::new("prompt_palette"),
+                title: &catalog.t("prompt.title", &[]),
+                subtitle: "",
+                close_label: &catalog.t("popup.dismiss", &[]),
+                close_enabled: true,
+                default_size: egui::vec2(560.0, 560.0),
+                min_size: egui::vec2(360.0, 340.0),
+            },
+            &mut open,
+            |ui| {
+                action = super::popup::window_body(ui, |ui| {
+                    self.body(ui, library, library_revision, composer_draft, catalog)
+                });
+            },
+        );
         // Esc: 편집 중이면 폼만 닫고(목록/상세로 복귀), 아니면 팔레트를 닫는다.
         if super::popup::take_window_escape(ctx, egui::Id::new("prompt_palette")) {
             if self.editing.is_some() {

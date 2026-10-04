@@ -47529,6 +47529,8 @@ mod tests {
         for (label, names) in [
             ("case", ["a.txt", "A.txt"]),
             ("normalization", ["é.txt", "e\u{301}.txt"]),
+            ("distinct", ["first.txt", "second.txt"]),
+            ("distinct-unicode", ["파일-1.txt", "파일-2.txt"]),
         ] {
             for move_files in [false, true] {
                 let base = std::env::temp_dir().join(format!(
@@ -47537,11 +47539,24 @@ mod tests {
                 ));
                 let destination = base.join("dest");
                 std::fs::create_dir_all(&destination).unwrap();
-                // Prove the fixture's destination actually treats these names as equivalent.
+                // Observe create-new semantics on this destination, without assuming
+                // case sensitivity or Unicode normalization for the fixture volume.
                 let probe = destination.join(names[0]);
                 std::fs::write(&probe, b"probe").unwrap();
-                assert_eq!(std::fs::read(destination.join(names[1])).unwrap(), b"probe");
+                let equivalent = match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(destination.join(names[1]))
+                {
+                    Ok(_) => {
+                        std::fs::remove_file(destination.join(names[1])).unwrap();
+                        false
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => true,
+                    Err(error) => panic!("observe native destination names: {error}"),
+                };
                 std::fs::remove_file(probe).unwrap();
+                assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 0);
                 let sources: Vec<_> = names
                     .iter()
                     .enumerate()
@@ -47560,15 +47575,34 @@ mod tests {
                     move_files,
                     &std::sync::atomic::AtomicBool::new(false),
                 );
-                assert_eq!(
-                    std::fs::read_dir(&destination).unwrap().count(),
-                    0,
-                    "known volume-equivalent names must refuse before transferring a source/content member"
-                );
-                assert_eq!(result, Err(Error::Conflict));
-                for (i, source) in sources.iter().enumerate() {
-                    assert_eq!(std::fs::read(source).unwrap(), [i as u8]);
+                if equivalent {
+                    assert_eq!(result, Err(Error::Conflict));
+                    assert_eq!(
+                        std::fs::read_dir(&destination).unwrap().count(),
+                        0,
+                        "known volume-equivalent names must refuse before source/content transfer and clean probes"
+                    );
+                    for (i, source) in sources.iter().enumerate() {
+                        assert_eq!(std::fs::read(source).unwrap(), [i as u8]);
+                    }
+                } else {
+                    assert_eq!(result, Ok(()));
+                    assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 2);
+                    for (i, source) in sources.iter().enumerate() {
+                        assert_eq!(
+                            std::fs::read(destination.join(names[i])).unwrap(),
+                            [i as u8]
+                        );
+                        if move_files {
+                            assert!(!source.exists(), "every distinct source must move");
+                        } else {
+                            assert_eq!(std::fs::read(source).unwrap(), [i as u8]);
+                        }
+                    }
                 }
+                println!(
+                    "pr11r observed volume names {label}: equivalent={equivalent} move={move_files}"
+                );
                 std::fs::remove_dir_all(base).unwrap();
             }
         }
@@ -47590,12 +47624,15 @@ mod tests {
         let started = std::time::Instant::now();
         let ascii_probes = app_host_preflight_destination_names(&base, &names, &cancel).unwrap();
         let ascii_us = started.elapsed().as_micros();
+        let volume_case_sensitive = app_host_ascii_destination_case_sensitive(&base);
         assert_eq!(
-            app_host_ascii_destination_case_sensitive(&base),
-            Some(false),
-            "fixture must verify known local insensitive volume metadata"
+            ascii_probes,
+            if volume_case_sensitive.is_some() {
+                0
+            } else {
+                64
+            }
         );
-        assert_eq!(ascii_probes, 0);
         assert_eq!(std::fs::read_dir(&base).unwrap().count(), 0);
         let unicode: Vec<_> = (0..64)
             .map(|i| std::ffi::OsString::from(format!("파일-{i:02}.txt")))
@@ -47607,7 +47644,7 @@ mod tests {
         assert_eq!(unicode_probes, 64);
         assert_eq!(std::fs::read_dir(&base).unwrap().count(), 0);
         println!(
-            "pr11r preflight64 ASCII probes={ascii_probes} elapsed_us={ascii_us}; Unicode probes={unicode_probes} elapsed_us={unicode_us}"
+            "pr11r preflight64 case_sensitive={volume_case_sensitive:?} ASCII probes={ascii_probes} elapsed_us={ascii_us}; Unicode probes={unicode_probes} elapsed_us={unicode_us}"
         );
         let result =
             app_host_preflight_destination_names_with_observer(&base, &names, &cancel, |count| {

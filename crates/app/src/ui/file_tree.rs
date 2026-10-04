@@ -12867,6 +12867,70 @@ mod tests {
     }
 
     #[test]
+    fn pr20_layout_native_move_requires_logical_v_or_non_latin_physical_v() {
+        let root = temp_root("pr20-layout-native").canonicalize().unwrap();
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.root = Some(root.clone());
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, tree: &mut FileTreeUi| {
+                register_tree_keyboard_focus_target(ui);
+                ui.memory_mut(|memory| memory.request_focus(tree_keyboard_focus_id()));
+                tree.handle_clipboard_shortcuts(ui, ui.available_rect_before_wrap(), None, None);
+                let batch = crate::native_key_monitor::drain();
+                assert!(!batch.clipboard_paste);
+                assert!(!batch.clipboard_copy);
+            },
+            tree,
+        );
+        harness.run();
+        harness.hover_at(egui::pos2(50.0, 50.0));
+        let modifiers = egui::Modifiers {
+            command: true,
+            mac_cmd: true,
+            alt: true,
+            ..Default::default()
+        };
+        // Dvorak logical K reaches the pinned backend as Key K, not a Paste.
+        crate::native_key_monitor::tests::record_move_paste_key(0x09, Some("k"), false);
+        harness.event(egui::Event::ModifiersChanged(modifiers));
+        harness.event(egui::Event::Key {
+            key: egui::Key::K,
+            physical_key: Some(egui::Key::V),
+            pressed: true,
+            repeat: false,
+            modifiers,
+        });
+        harness.step();
+        assert!(
+            harness.state_mut().take_io_intent().is_none(),
+            "Cmd+Option+K cannot request a destructive clipboard move"
+        );
+        for (key_code, characters) in [(0x28, Some("v")), (0x09, Some("ㅍ")), (0x09, None)] {
+            crate::native_key_monitor::tests::record_move_paste_key(key_code, characters, false);
+            // File-only clipboard: backend keydown interception emits no Paste/Key.
+            harness.step();
+            let intent = harness.state_mut().take_io_intent().unwrap();
+            assert!(matches!(
+                intent.request,
+                FileTreeIoRequest::PasteFromClipboard {
+                    move_files: true,
+                    ..
+                }
+            ));
+            harness.state_mut().complete_io(FileTreeIoCompletion {
+                operation: intent.operation,
+                generation: intent.generation,
+                result: Ok(()),
+            });
+            crate::native_key_monitor::tests::record_move_paste_key(key_code, characters, true);
+            harness.event(egui::Event::Paste("held clipboard text".to_owned()));
+            harness.step();
+            assert!(harness.state_mut().take_io_intent().is_none());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn pr11r_file_only_backend_move_paste_has_no_pressed_key_event() {
         let root = temp_root("pr11r-file-only-native").canonicalize().unwrap();
         let mut tree = FileTreeUi::new(egui::Context::default());

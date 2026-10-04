@@ -22,8 +22,8 @@
 - [x] 각 PR observedRED/GREEN 기록
 - [x] 순차 코드 통합·중복 구현/권한/정리 검토
 - [x] 9개 PR 독립 Codex CLI 소스 리뷰·지적 수정
-- [ ] 실제 영향 package/fullApp/runtime/PTY/storage/MCP 테스트
-- [ ] 변경 후 의미 있는 성능/메모리/응답성 측정
+- [x] 실제 영향 package/fullApp/runtime/PTY/storage/MCP 테스트 — 최종 통합4,824/0/47기존제외 및 strict gates 통과
+- [x] 변경 후 의미 있는 성능/메모리/응답성 측정 — 실제 모듈5회중앙값/privatePTY/64개파일효과, App RSS/FPS 아님
 - [ ] 최종 버전 증가·재빌드·bundle/compiled버전 검증
 - [ ] 최종 결과·제한·체크리스트 보고
 
@@ -33,7 +33,7 @@
 
 9개 PR 및 리뷰 수정 완료 후 새 소스 `9c7af797a4db4786b0dcc1187980e7ba71ead1de`에서 아래 두 작업을 시작했다. 최종 산출물 gate/버전 검증은 후속 통합 후 한 번 더 실행한다.
 
-- [ ] 9개 PR 완료 후 Grok AI 터미널 **직접 입력** 지연 원인·측정·개선 검토
-- [ ] Shift+마우스 드래그 다중 선택 후 전체 복사·삭제·이동 회귀 수정
+- [x] 9개 PR 완료 후 Grok AI 터미널 **직접 입력** 지연 원인·측정·개선 검토 — PR10 첫 pass 전송/Busy보존 및 실제 private한글echo; nativeGrok미측정
+- [x] Shift+마우스 드래그 다중 선택 후 전체 복사·삭제·이동 회귀 수정 — PR11+11r64개효과/nativebackend/실제볼륨충돌; 마지막corrective독립리뷰진행중
 
 검증 주의: 공용target의Cargo 자체 잠금은 test실행 전 해제되어 다른 worktree binary로 바뀔 수 있다. 이전 병렬 fullApp 결과는 최종 통과 근거에서 제외한다. `/private/tmp/deppy-audit-nine-pr-20261004/cargo_gate.py`는 compile+execution 전체를 잠그고 작업트리 전환 시 workspace artifact를 정리하여 source fingerprint 재사용도 차단한다. 이전 gate 결과도 고유 테스트 이름/실행 소스를 다시 확인한 결과로 대체한다. 최종 테스트는 통합 소스에서 실행한다.

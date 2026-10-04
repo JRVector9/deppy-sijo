@@ -315,9 +315,7 @@ fn record_clipboard_event(
     conflicting_modifier: bool,
     repeat: bool,
 ) -> bool {
-    if option
-        && !conflicting_modifier
-        && is_clipboard_paste_key(key_code, characters, command, false)
+    if option && !conflicting_modifier && is_clipboard_move_paste_key(key_code, characters, command)
     {
         if !repeat {
             record_clipboard_move_paste();
@@ -341,6 +339,24 @@ fn record_clipboard_event(
         true
     } else {
         false
+    }
+}
+
+/// Destructive move follows a supplied ASCII layout key. Only non-Latin or
+/// missing characters may fall back to the ANSI V physical key.
+fn is_clipboard_move_paste_key(
+    key_code: u16,
+    characters_ignoring_modifiers: Option<&str>,
+    command: bool,
+) -> bool {
+    if !command {
+        return false;
+    }
+    match characters_ignoring_modifiers {
+        Some(characters) if characters.eq_ignore_ascii_case("v") => true,
+        Some("") | None => key_code == 0x09,
+        Some(characters) if characters.is_ascii() => false,
+        Some(_) => key_code == 0x09,
     }
 }
 
@@ -443,6 +459,14 @@ pub(crate) fn install() {}
 
 #[cfg(test)]
 pub(crate) mod tests {
+    pub(crate) fn record_move_paste_key(
+        key_code: u16,
+        characters: Option<&str>,
+        repeat: bool,
+    ) -> bool {
+        super::record_clipboard_event(key_code, characters, true, true, false, repeat)
+    }
+
     pub(crate) fn record_move_paste(repeat: bool) {
         super::record_clipboard_event(0x09, Some("√"), true, true, false, repeat);
     }
@@ -493,6 +517,35 @@ pub(crate) mod tests {
             drain().clipboard_paste,
             "ordinary paste flag remains independent"
         );
+    }
+
+    #[test]
+    fn pr20_move_paste_rejects_another_ascii_layout_key() {
+        drain();
+        for characters in ["k", "K", "c", "1", " ", "vk"] {
+            assert!(
+                !record_move_paste_key(0x09, Some(characters), false),
+                "physical V must not override another ASCII layout key: {characters:?}"
+            );
+            assert!(take_clipboard_move_paste().is_none());
+        }
+        for (key_code, characters) in [
+            (0x09, Some("v")),
+            (0x28, Some("V")),
+            (0x09, Some("ㅍ")),
+            (0x09, Some("√")),
+            (0x09, Some("")),
+            (0x09, None),
+        ] {
+            assert!(record_move_paste_key(key_code, characters, false));
+            take_clipboard_move_paste().expect("logical V or non-Latin/missing physical V");
+            assert!(record_move_paste_key(key_code, characters, true));
+            assert!(take_clipboard_move_paste().is_none(), "held repeat");
+        }
+        // Existing ordinary clipboard semantics intentionally keep their fallback.
+        assert!(is_clipboard_paste_key(0x09, Some("k"), true, false));
+        assert!(!is_clipboard_copy_key(0x08, Some("k"), true, false));
+        assert!(!drain().clipboard_paste);
     }
 
     #[test]

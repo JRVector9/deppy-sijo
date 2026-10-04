@@ -102,6 +102,8 @@ pub struct FleetSession {
     pub blocked_since: Option<i64>,
     /// 지시 대기가 시작된 시각(unix 초). hook 완료 시각이 있으면 그 값을 쓴다.
     pub idle_since: Option<i64>,
+    /// Completion identity; never interpreted as a wall-clock timestamp.
+    pub idle_generation: Option<i64>,
     /// 마지막으로 새 출력이 온 시각(unix 초). 구조화(App Server) 세션은 PTY 스냅샷이
     /// 없어 항상 None이다 — 그 묶음에는 「출력 없음」을 표시하지 않는다.
     pub last_output_at: Option<i64>,
@@ -455,6 +457,7 @@ mod tests {
             active_workspace: true,
             blocked_since: None,
             idle_since: None,
+            idle_generation: None,
             last_output_at: None,
             followup: None,
         }

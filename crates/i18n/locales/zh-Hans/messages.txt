@@ -1358,6 +1358,10 @@ workspace.add.github = GitHub 仓库
 workspace.add.local_hint = 将现有文件夹作为工作区打开。
 workspace.add.choose_folder = 选择文件夹…
 workspace.add.url = 仓库 URL
+workspace.add.url_hint = 支持格式：GitHub HTTPS 或 SSH 地址
+popup.shortcut_close = Esc 关闭
+popup.shortcut_create = Enter 创建 · Esc 关闭
+file_tree.create = 创建
 workspace.add.destination = 保存位置
 workspace.add.browse = 浏览…
 workspace.add.folder_name = 文件夹名称
@@ -1381,3 +1385,19 @@ workspace.add.worker_failed = 无法启动克隆任务。
 workspace.add.registration_failed = 无法将文件夹添加为工作区。请重试。
 workspace.add.switch_failed = 工作区已添加，但无法打开。请重试。
 workspace.add.choosing = 正在选择文件夹…
+resource_manager.confirm_session.title = 结束会话
+resource_manager.confirm_unattached.title = 结束未连接的进程
+ports.confirm_title = 结束端口进程
+file_tree.permanent_delete_title = 确认永久删除
+popup.dismiss = 关闭对话框
+
+document.confirm_discard.warning = 放弃未保存的更改后无法恢复。
+workspace.folder_moved.failed = 无法更新文件夹路径，请重试。
+
+workspace.add.folder_identity_conflict = 所选文件夹的卷不同或无法验证原卷。请在工作区设置中重新连接项目路径后再打开。
+
+fleet.idle_observed_for = 观测等待 {value}
+fleet.followup.list = 后续任务 ({count})
+fleet.followup.empty = 没有已安排的任务
+
+env.delete_source = 从哪个文件删除

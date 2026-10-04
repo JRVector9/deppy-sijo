@@ -539,7 +539,8 @@ impl AgentTerminalUi {
                         .open_bool(&mut ports_open)
                         .align(egui::RectAlign::TOP_END)
                         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                        .width(500.0)
+                        .width(560.0_f32.min((ui.ctx().content_rect().width() - 34.0).max(1.0)))
+                        .frame(super::popup::popover_frame(ui.ctx()))
                         .show(|ui| {
                             if let Some(action) =
                                 self.ports
@@ -552,6 +553,14 @@ impl AgentTerminalUi {
                 });
             },
         );
+        // Confirmation modals outlive the source popover and are painted after
+        // its close-state synchronization, so outside clicks cannot lose targets.
+        if let Some(action) = self.resource_manager.confirmation(ui.ctx(), catalog) {
+            intent = Some(StatusBarIntent::Resource(action));
+        }
+        if let Some(action) = self.ports.confirmation(ui.ctx(), catalog) {
+            intent = Some(StatusBarIntent::Ports(action));
+        }
         intent
     }
 

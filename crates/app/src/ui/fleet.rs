@@ -345,6 +345,9 @@ pub struct FleetPageOutput {
     pub structured_decision: Option<(String, bool)>,
 }
 
+/// Actual completion clocks projected by the attention worker, including consumed badges.
+pub type PtyIdleClocks = HashMap<(String, runtime::SessionId), (i64, i64)>;
+
 #[derive(Default)]
 pub struct FleetUi {
     /// Some이면 브로드캐스트 패널이 열려 있다.
@@ -354,7 +357,45 @@ pub struct FleetUi {
     /// Some이면 다음 단계 예약 패널이 열려 있다.
     followup: Option<FollowUpState>,
     /// hook 완료 시각이 없는 세션도 첫 지시 대기 관측부터 시간을 센다.
-    idle_started: HashMap<FleetIdleKey, i64>,
+    idle_started: HashMap<FleetIdleKey, IdleClock>,
+}
+
+#[derive(Clone, Copy)]
+struct IdleTime {
+    since: i64,
+    confirmed: bool,
+}
+
+#[derive(Default)]
+struct IdleClock {
+    since: Option<i64>,
+    confirmed: bool,
+    generation: Option<i64>,
+    last_submission_at_micros: Option<i64>,
+}
+
+/// Both modern and legacy idle generations use microseconds in the snapshot.
+/// An ambiguous same-boundary completion stays observed, not falsely confirmed.
+pub fn completion_follows_submission(generation: Option<i64>, submitted_at: Option<i64>) -> bool {
+    submitted_at.is_none_or(|submitted| generation.is_some_and(|completed| completed > submitted))
+}
+
+impl IdleClock {
+    fn confirm_source(&mut self, since: i64, generation: Option<i64>) {
+        if self.confirmed {
+            if let (Some(current), Some(incoming)) = (self.generation, generation)
+                && incoming < current
+            {
+                return;
+            }
+            if self.since == Some(since) && self.generation == generation {
+                return;
+            }
+        }
+        self.since = Some(since);
+        self.generation = generation;
+        self.confirmed = true;
+    }
 }
 
 #[derive(Clone, Hash, PartialEq, Eq)]
@@ -375,31 +416,151 @@ impl FleetIdleKey {
 }
 
 impl FleetUi {
+    #[cfg(test)]
     fn idle_since(&self, session: &FleetSession) -> Option<i64> {
         self.idle_started
             .get(&FleetIdleKey::for_session(session))
-            .copied()
+            .and_then(|clock| clock.since)
+    }
+
+    fn note_observed_turn_start(&mut self, workspace: &str, session: runtime::SessionId) {
+        for (key, clock) in &mut self.idle_started {
+            if matches!(key, FleetIdleKey::Pty(ws, id, _) if ws == workspace && *id == session)
+                && !clock.confirmed
+            {
+                clock.since = None;
+            }
+        }
+    }
+
+    pub fn observe_attention(
+        &mut self,
+        clocks: &PtyIdleClocks,
+        working: &HashSet<(String, runtime::SessionId)>,
+        blocked: &HashSet<(String, runtime::SessionId)>,
+        now: i64,
+    ) {
+        for (key, clock) in &mut self.idle_started {
+            let FleetIdleKey::Pty(ws, session, _) = key else {
+                continue;
+            };
+            let identity = (ws.clone(), *session);
+            if let Some((since, generation)) =
+                clocks.get(&identity).filter(|(since, generation)| {
+                    *since >= 0
+                        && *since <= now
+                        && *generation > 0
+                        && completion_follows_submission(
+                            Some(*generation),
+                            clock.last_submission_at_micros,
+                        )
+                })
+            {
+                clock.confirm_source(*since, Some(*generation));
+            } else if clock.confirmed || working.contains(&identity) || blocked.contains(&identity)
+            {
+                clock.since = None;
+                clock.generation = None;
+                clock.confirmed = false;
+            }
+        }
+    }
+
+    pub fn observe_structured_status(&mut self, id: &str, state: AgentVisualState, now: i64) {
+        let key = FleetIdleKey::Structured(id.to_owned());
+        if state == AgentVisualState::Off {
+            self.idle_started.remove(&key);
+        } else if let Some(clock) = self.idle_started.get_mut(&key) {
+            if state == AgentVisualState::Idle {
+                clock.since.get_or_insert(now);
+            } else {
+                clock.since = None;
+                clock.confirmed = false;
+                clock.generation = None;
+            }
+        }
+    }
+
+    /// Receives the existing event stream even when Fleet is hidden. No I/O or repaint.
+    pub fn observe_runtime_events(
+        &mut self,
+        workspace: &str,
+        events: &[runtime::RuntimeEvent],
+        _now: i64,
+    ) {
+        for event in events {
+            match event {
+                runtime::RuntimeEvent::SessionStatusChanged {
+                    session,
+                    status:
+                        runtime::SessionStatus::Running
+                        | runtime::SessionStatus::Waiting
+                        | runtime::SessionStatus::NeedsApproval,
+                } => {
+                    self.note_observed_turn_start(workspace, *session);
+                }
+                runtime::RuntimeEvent::SessionInputSubmitted { session, at_micros }
+                    if *at_micros > 0 =>
+                {
+                    for (key, clock) in &mut self.idle_started {
+                        if matches!(key, FleetIdleKey::Pty(ws,id,_) if ws==workspace && id==session)
+                        {
+                            clock.last_submission_at_micros = Some(
+                                clock
+                                    .last_submission_at_micros
+                                    .map_or(*at_micros, |previous| previous.max(*at_micros)),
+                            );
+                            if !completion_follows_submission(
+                                clock.generation,
+                                clock.last_submission_at_micros,
+                            ) {
+                                clock.since = None;
+                                clock.generation = None;
+                                clock.confirmed = false;
+                            }
+                        }
+                    }
+                }
+                runtime::RuntimeEvent::SessionExited { session, .. }
+                | runtime::RuntimeEvent::SessionRestored { session, .. } => {
+                    self.idle_started.retain(|key, _| !matches!(key, FleetIdleKey::Pty(ws, id, _) if ws == workspace && id == session));
+                }
+                _ => {}
+            }
+        }
     }
 
     fn update_idle_clocks(&mut self, sessions: &[FleetSession], now: i64) {
-        let idle: HashSet<_> = sessions
-            .iter()
-            .filter(|session| session.state == AgentVisualState::Idle)
-            .map(FleetIdleKey::for_session)
-            .collect();
-        self.idle_started.retain(|key, _| idle.contains(key));
+        let live: HashSet<_> = sessions.iter().map(FleetIdleKey::for_session).collect();
+        self.idle_started.retain(|key, _| live.contains(key));
         for session in sessions {
-            if session.state != AgentVisualState::Idle {
-                continue;
-            }
-            let source = session.idle_since.filter(|at| *at >= 0 && *at <= now);
-            let since = self
+            let clock = self
                 .idle_started
                 .entry(FleetIdleKey::for_session(session))
-                .or_insert(source.unwrap_or(now));
-            // 새 턴의 완료 hook은 이전 대기 시작 시각보다 최신이다.
-            if let Some(authoritative) = session.idle_since.filter(|at| *at <= now) {
-                *since = (*since).max(authoritative);
+                .or_default();
+            // The persisted reducer is authoritative. A detector event has no episode/time
+            // identity and may be delivered after this completion; it only resets estimates.
+            let source = session.idle_since.filter(|at| {
+                *at >= 0
+                    && *at <= now
+                    && completion_follows_submission(
+                        session.idle_generation,
+                        clock.last_submission_at_micros,
+                    )
+            });
+            if let Some(since) = source {
+                clock.confirm_source(since, session.idle_generation);
+            } else if session.state != AgentVisualState::Idle {
+                clock.since = None;
+                clock.generation = None;
+                clock.confirmed = false;
+            } else {
+                if clock.confirmed {
+                    clock.since = None;
+                    clock.generation = None;
+                    clock.confirmed = false;
+                }
+                clock.since.get_or_insert(now);
             }
         }
     }
@@ -550,8 +711,16 @@ impl FleetUi {
                             }
                             ui.horizontal_wrapped(|ui| {
                                 for session in cards {
-                                    let idle_since = self.idle_since(session);
-                                    match card(ui, session, catalog, now, idle_since) {
+                                    let idle_time = self
+                                        .idle_started
+                                        .get(&FleetIdleKey::for_session(session))
+                                        .and_then(|clock| {
+                                            clock.since.map(|since| IdleTime {
+                                                since,
+                                                confirmed: clock.confirmed,
+                                            })
+                                        });
+                                    match card(ui, session, catalog, now, idle_time) {
                                         Some(CardClick::Open) => {
                                             *action = Some(match &session.target {
                                                 FleetTarget::Pty { tab, pane, .. } => {
@@ -663,7 +832,7 @@ impl FleetUi {
             .show(ctx, |ui| {
                 action = self.followup_body(ui, catalog, library);
             });
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        if super::popup::take_window_escape(ctx, egui::Id::new("fleet_followup")) {
             open = false;
         }
         if !open || action.is_some() {
@@ -755,7 +924,7 @@ impl FleetUi {
             .show(ctx, |ui| {
                 action = self.broadcast_body(ui, sessions, catalog, library);
             });
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        if super::popup::take_window_escape(ctx, egui::Id::new("fleet_broadcast")) {
             open = false;
         }
         // 전송했거나(action Some) 닫으면 패널 상태를 버린다.
@@ -940,7 +1109,7 @@ impl FleetUi {
             .show(ctx, |ui| {
                 action = self.batch_spawn_body(ui, agents, max, catalog, library);
             });
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        if super::popup::take_window_escape(ctx, egui::Id::new("fleet_batch_spawn")) {
             open = false;
         }
         // 시작했거나(action Some) 닫으면 패널 상태를 버린다.
@@ -1316,7 +1485,7 @@ fn card(
     session: &FleetSession,
     catalog: &i18n::Catalog,
     now: i64,
-    idle_since: Option<i64>,
+    idle_time: Option<IdleTime>,
 ) -> Option<CardClick> {
     // 실제 행 높이만 예약한다. 작업 설명은 같은 galley를 측정과 그리기에 재사용한다.
     const CARD_WIDTH: f32 = 252.0;
@@ -1347,22 +1516,87 @@ fn card(
     );
     task_job.wrap.max_rows = 2;
     task_job.wrap.break_anywhere = true;
-    let body_font = egui::TextStyle::Body.resolve(ui.style());
     let small_font = egui::TextStyle::Small.resolve(ui.style());
-    let (task_galley, body_height, small_height) = ui.fonts_mut(|fonts| {
-        let body_height = fonts.row_height(&body_font);
+    let (task_galley, small_height) = ui.fonts_mut(|fonts| {
         let small_height = fonts.row_height(&small_font);
-        (fonts.layout_job(task_job), body_height, small_height)
+        (fonts.layout_job(task_job), small_height)
     });
-    let optional_rows = usize::from(session.waiting_message.is_some())
-        + usize::from(session.agent_line.is_some())
-        + usize::from(session.followup.is_some());
-    let rows = 3 + optional_rows;
-    let card_height = 20.0
-        + body_height
-        + small_height * (1 + optional_rows) as f32
+    // Measure the exact styled text once and reuse it when painting. In particular,
+    // the model's monospace font can be taller than the proportional Small font.
+    let one_line = |text: egui::RichText| {
+        egui::WidgetText::from(text).into_galley(
+            ui,
+            Some(egui::TextWrapMode::Truncate),
+            CONTENT_WIDTH,
+            egui::TextStyle::Body,
+        )
+    };
+    let title_galley = one_line(egui::RichText::new(&session.title).strong());
+    let state_color = status_color(session.state);
+    let waiting_galley = session
+        .waiting_message
+        .as_ref()
+        .map(|message| one_line(egui::RichText::new(message).small().color(state_color)));
+    let agent_galley = session
+        .agent_line
+        .as_ref()
+        .map(|line| one_line(egui::RichText::new(line).small().weak().monospace()));
+    let followup_heading = one_line(
+        egui::RichText::new(catalog.t(
+            "fleet.followup.list",
+            &[("count", if session.followup.is_some() { "1" } else { "0" })],
+        ))
+        .small()
+        .weak(),
+    );
+    let followup_galley = {
+        // Bound layout cost while preserving the full original for editing and hover.
+        let preview = session.followup.as_ref().map_or_else(
+            || catalog.t("fleet.followup.empty", &[]),
+            |prompt| {
+                let mut text: String = prompt.chars().take(512).collect();
+                if prompt.chars().nth(512).is_some() {
+                    text.push('…');
+                }
+                format!("1. {text}")
+            },
+        );
+        let mut job = egui::text::LayoutJob::simple(
+            preview,
+            small_font.clone(),
+            if session.followup.is_some() {
+                status_color(AgentVisualState::Complete)
+            } else {
+                ui.visuals().weak_text_color()
+            },
+            CONTENT_WIDTH,
+        );
+        job.wrap.max_rows = 3;
+        job.wrap.break_anywhere = true;
+        Some(ui.fonts_mut(|fonts| fonts.layout_job(job)))
+    };
+    let optional_galleys = [&waiting_galley, &agent_galley, &followup_galley];
+    let optional_rows = optional_galleys.iter().filter(|row| row.is_some()).count();
+    let optional_height: f32 = optional_galleys
+        .iter()
+        .filter_map(|row| row.as_ref())
+        .map(|galley| galley.size().y)
+        .sum();
+    let rows = 4 + optional_rows;
+    // ui.horizontal reserves at least interact_size.y even for small text labels.
+    let status_height = ui
+        .spacing()
+        .interact_size
+        .y
+        .max(small_height + ui.spacing().extra_text_line_spacing);
+    let card_height = (16.0
+        + title_galley.size().y
+        + status_height
         + task_galley.size().y
-        + (rows - 1) as f32 * 3.0;
+        + optional_height
+        + followup_heading.size().y
+        + (rows - 1) as f32 * 3.0)
+        .ceil();
     let size = egui::vec2(CARD_WIDTH, card_height);
     // 자리만 잡는다. **상호작용은 내용을 그린 뒤에** 잡는다 — 여기서 잡으면 나중에
     // 그려진 라벨이 위에 놓여 텍스트 위 클릭을 가로챈다(2026-08-10 실증: 「Kimi」
@@ -1387,7 +1621,6 @@ fn card(
     } else {
         visuals.widgets.noninteractive.bg_stroke
     };
-    let state_color = status_color(session.state);
     {
         let p = ui.painter();
         p.rect_filled(rect, 6.0, bg);
@@ -1409,7 +1642,7 @@ fn card(
     content.set_clip_rect(inner.intersect(ui.clip_rect()));
     content.spacing_mut().item_spacing.y = 3.0;
     // 1행: 제목.
-    content.add(egui::Label::new(egui::RichText::new(&session.title).strong()).truncate());
+    content.add(egui::Label::new(title_galley));
     // 2행: 상태 라벨(색) + [막힌 시간] + 워크스페이스 + active/warm.
     content.horizontal(|ui| {
         ui.label(
@@ -1441,11 +1674,20 @@ fn card(
             );
         }
         if session.state == AgentVisualState::Idle
-            && let Some(since) = idle_since.or(session.idle_since)
+            && let Some(since) = idle_time
+                .map(|clock| clock.since)
+                .or(session.idle_since.filter(|at| *at >= 0 && *at <= now))
         {
             ui.label(
                 egui::RichText::new(catalog.t(
-                    "fleet.idle_for",
+                    if idle_time.map_or_else(
+                        || session.idle_since == Some(since),
+                        |clock| clock.confirmed,
+                    ) {
+                        "fleet.idle_for"
+                    } else {
+                        "fleet.idle_observed_for"
+                    },
                     &[("value", &crate::fleet::format_blocked_duration(now, since))],
                 ))
                 .small()
@@ -1469,29 +1711,20 @@ fn card(
     // 임의 터미널 출력으로 작업을 꾸미지 않고 명시적으로 기록 없음이라 한다.
     content.add(egui::Label::new(task_galley));
     // 4~5행: 대기 사유와 에이전트 모델. 둘 다 있으면 둘 다 보여준다.
-    if let Some(message) = &session.waiting_message {
-        content.add(
-            egui::Label::new(egui::RichText::new(message).small().color(state_color)).truncate(),
-        );
+    if let Some(galley) = waiting_galley {
+        content.add(egui::Label::new(galley));
     }
-    if let Some(line) = &session.agent_line {
-        content
-            .add(egui::Label::new(egui::RichText::new(line).small().weak().monospace()).truncate());
+    if let Some(galley) = agent_galley {
+        content.add(egui::Label::new(galley));
     }
     // 마지막 행: 예약 칩. 「예약해뒀다」는 사실이 카드에 없으면 예약해둔 걸 잊는다 — 그러면
     // 나중에 도착한 프롬프트가 내가 안 시킨 일처럼 보인다.
-    if let Some(prompt) = &session.followup {
-        content.add(
-            egui::Label::new(
-                egui::RichText::new(format!(
-                    "{} · {prompt}",
-                    catalog.t("fleet.followup.chip", &[])
-                ))
-                .small()
-                .color(status_color(AgentVisualState::Complete)),
-            )
-            .truncate(),
-        );
+    content.add(egui::Label::new(followup_heading));
+    if let Some(galley) = followup_galley {
+        let response = content.add(egui::Label::new(galley));
+        if let Some(prompt) = &session.followup {
+            response.on_hover_text(prompt);
+        }
     }
 
     // 이제 내용 **위에서** 상호작용을 잡는다. 카드 전체가 버튼이므로 커서도 바꾼다.
@@ -1587,6 +1820,98 @@ fn state_label(state: AgentVisualState, catalog: &i18n::Catalog) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn popup_audit_followup_behind_confirmation_keeps_its_draft_on_escape() {
+        let ctx = egui::Context::default();
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        let library = PromptLibrary::default();
+        let mut fleet = FleetUi {
+            followup: Some(FollowUpState {
+                workspace_id: "project".into(),
+                session: runtime::SessionId(7),
+                title: "Agent".into(),
+                text: "Keep this draft".into(),
+            }),
+            ..Default::default()
+        };
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        ctx.run_ui(input, |ui| {
+            crate::ui::popup::show(
+                ui.ctx(),
+                crate::ui::popup::PopupSpec {
+                    id: egui::Id::new("popup_audit_front_modal"),
+                    width: 400.0,
+                    title: "Confirm",
+                    subtitle: "",
+                    close_label: "Close",
+                    close_enabled: true,
+                },
+                |ui| {
+                    ui.label("Front confirmation");
+                },
+            );
+            assert!(
+                fleet
+                    .followup_window(ui.ctx(), &catalog, &library)
+                    .is_none()
+            );
+        })
+        .drop_without_applying_deltas();
+        assert_eq!(
+            fleet.followup.as_ref().map(|draft| draft.text.as_str()),
+            Some("Keep this draft")
+        );
+    }
+
+    #[test]
+    fn popup_audit_escape_closes_only_the_front_fleet_form() {
+        let ctx = egui::Context::default();
+        let catalog = catalog();
+        let library = PromptLibrary::default();
+        let mut fleet = FleetUi {
+            followup: Some(FollowUpState {
+                workspace_id: "project".into(),
+                session: runtime::SessionId(7),
+                title: "Agent".into(),
+                text: "Keep draft".into(),
+            }),
+            broadcast: Some(BroadcastState::default()),
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            ctx.run_ui(egui::RawInput::default(), |ui| {
+                fleet.followup_window(ui.ctx(), &catalog, &library);
+                fleet.broadcast_window(ui.ctx(), &[], &catalog, &library);
+            })
+            .drop_without_applying_deltas();
+        }
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        ctx.run_ui(input, |ui| {
+            fleet.followup_window(ui.ctx(), &catalog, &library);
+            fleet.broadcast_window(ui.ctx(), &[], &catalog, &library);
+        })
+        .drop_without_applying_deltas();
+        assert!(fleet.broadcast.is_none());
+        assert_eq!(
+            fleet.followup.as_ref().map(|draft| draft.text.as_str()),
+            Some("Keep draft")
+        );
+    }
     use crate::ui::approvals::PendingApprovalItem;
     use crate::ui::inbox_waiting::{InboxWaitingUi, WaitingCard};
     use std::collections::HashMap;
@@ -1649,6 +1974,7 @@ mod tests {
             active_workspace: true,
             blocked_since: None,
             idle_since: None,
+            idle_generation: None,
             last_output_at: None,
             followup: None,
         }
@@ -1685,6 +2011,81 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "offscreen PNG for visual review without launching Deppy"]
+    fn fleet_card_render_content_sizing() {
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        let mut idle = pty_session("Serenity", 11, AgentVisualState::Idle);
+        idle.title = "Serenity".into();
+        idle.task_line = Some("커밋 완료했습니다. docs/CODEX_HANDOFF.md에 진행한 작업과 최종 검증 내용을 정리했습니다.".into());
+        idle.agent_line = Some("Codex · gpt-6-sol · xhigh".into());
+        idle.idle_since = Some(100);
+        idle.followup = Some("1, 2번 테스트를 실행하고 실패 원인을 확인한 뒤 코드 리뷰 결과를 정리해줘. 작업별 검증 명령과 결과도 보고해줘.".into());
+        let mut active = pty_session("Serenity", 12, AgentVisualState::Active);
+        active.title = "Serenity".into();
+        active.task_line = Some("1, 2 진행해".into());
+        active.agent_line = Some("Claude · Opus 5.5".into());
+        let mut finished = pty_session("Serenity", 13, AgentVisualState::Off);
+        finished.title = "Serenity".into();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(820.0, 480.0))
+            .build_ui(|ui| {
+                section_header(ui, SessionGroup::Active, 2, &catalog);
+                ui.horizontal_wrapped(|ui| {
+                    let _ = card(ui, &idle, &catalog, 520, None);
+                    let _ = card(ui, &active, &catalog, 520, None);
+                });
+                ui.add_space(6.0);
+                section_header(ui, SessionGroup::Finished, 1, &catalog);
+                let _ = card(ui, &finished, &catalog, 520, None);
+            });
+        crate::fonts::install_cjk_fallback(&harness.ctx, None, "JetBrainsMono", "Regular");
+        crate::theme::install_palette(&harness.ctx);
+        harness.run();
+        let output = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/fleet-waiting-next-tasks-0.5.0.png");
+        harness.render().unwrap().save(output).unwrap();
+    }
+
+    #[test]
+    fn card_keeps_model_and_followup_text_inside_its_clip() {
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        let mut session = pty_session("Serenity", 11, AgentVisualState::Idle);
+        session.task_line = Some("커밋 완료했습니다. docs/CODEX_HANDOFF.md에 진행한 작업과 최종 검증 내용을 정리했습니다.".into());
+        session.agent_line = Some("Codex · gpt-6-sol · xhigh".into());
+        session.idle_since = Some(100);
+        for extra_rows in [false, true] {
+            if extra_rows {
+                session.waiting_message = Some("다음 작업 지시를 기다립니다".into());
+                session.followup = Some("관련 테스트를 실행해줘.\n결과를 확인하고 실패한 원인을 정리한 다음 수정 후 다시 테스트하고 검증 명령과 결과를 보고해줘. ".repeat(100));
+            }
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(400.0, 300.0))
+                .build_ui(|ui| {
+                    let _ = card(ui, &session, &catalog, 220, None);
+                });
+            crate::fonts::install_cjk_fallback(&harness.ctx, None, "JetBrainsMono", "Regular");
+            harness.run();
+            let mut checked = 0;
+            for clipped in &harness.output().shapes {
+                if let egui::Shape::Text(text) = &clipped.shape
+                    && (text.galley.text() == session.agent_line.as_deref().unwrap()
+                        || text.galley.text().starts_with("1. "))
+                {
+                    let painted = text.visual_bounding_rect();
+                    assert!(
+                        clipped.clip_rect.contains_rect(painted),
+                        "text is clipped: {}, painted={painted:?}, clip={:?}",
+                        text.galley.text(),
+                        clipped.clip_rect
+                    );
+                    checked += 1;
+                }
+            }
+            assert_eq!(checked, if extra_rows { 2 } else { 1 });
+        }
+    }
+
+    #[test]
     fn card_uses_content_height_and_shows_two_task_rows() {
         use egui_kittest::kittest::Queryable;
 
@@ -1701,8 +2102,8 @@ mod tests {
             );
         compact.run();
         assert!(
-            *compact.state() < 100.0,
-            "a three-row error card should not reserve the old 116px height"
+            *compact.state() < 125.0,
+            "empty next-task section should reserve only its two compact rows"
         );
 
         let mut active = pty_session("ws", 11, AgentVisualState::Active);
@@ -1720,6 +2121,283 @@ mod tests {
             "task must occupy two text rows"
         );
         assert!(task.rect().height() < 40.0, "task must stop after two rows");
+    }
+
+    #[test]
+    fn fleet_review_fix_submitted_unhooked_turn_does_not_reuse_prior_clock() {
+        let mut fleet = FleetUi::default();
+        let mut rows = [pty_session("ws", 7, AgentVisualState::Idle)];
+        rows[0].idle_since = Some(100);
+        rows[0].idle_generation = Some(100_000_000);
+        fleet.update_idle_clocks(&rows, 105);
+        fleet.observe_runtime_events(
+            "ws",
+            &[
+                runtime::RuntimeEvent::SessionInputSubmitted {
+                    session: runtime::SessionId(7),
+                    at_micros: 200_000_000,
+                },
+                runtime::RuntimeEvent::SessionStatusChanged {
+                    session: runtime::SessionId(7),
+                    status: runtime::SessionStatus::Running,
+                },
+            ],
+            200,
+        );
+        rows[0].state = AgentVisualState::Active;
+        fleet.update_idle_clocks(&rows, 200);
+        rows[0].state = AgentVisualState::Idle;
+        fleet.update_idle_clocks(&rows, 230);
+        let clock = &fleet.idle_started[&FleetIdleKey::for_session(&rows[0])];
+        assert_eq!((clock.since, clock.confirmed), (Some(230), false));
+        fleet.observe_attention(
+            &PtyIdleClocks::from([(("ws".into(), runtime::SessionId(7)), (100, 100_000_000))]),
+            &HashSet::new(),
+            &HashSet::new(),
+            240,
+        );
+        fleet.update_idle_clocks(&rows, 240);
+        assert_eq!(fleet.idle_since(&rows[0]), Some(230));
+    }
+
+    #[test]
+    fn fleet_review_fix_resolved_question_boundary_after_input_remains_confirmed() {
+        let mut fleet = FleetUi::default();
+        let mut rows = [pty_session("ws", 7, AgentVisualState::NeedsResponse)];
+        fleet.update_idle_clocks(&rows, 125);
+        fleet.observe_runtime_events(
+            "ws",
+            &[runtime::RuntimeEvent::SessionInputSubmitted {
+                session: runtime::SessionId(7),
+                at_micros: 130_000_000,
+            }],
+            135,
+        );
+        rows[0].state = AgentVisualState::Idle;
+        rows[0].idle_since = Some(140);
+        rows[0].idle_generation = Some(140_000_001);
+        fleet.observe_attention(
+            &PtyIdleClocks::from([(("ws".into(), runtime::SessionId(7)), (140, 140_000_001))]),
+            &HashSet::new(),
+            &HashSet::new(),
+            145,
+        );
+        fleet.update_idle_clocks(&rows, 160);
+        let clock = &fleet.idle_started[&FleetIdleKey::for_session(&rows[0])];
+        assert_eq!((clock.since, clock.confirmed), (Some(140), true));
+    }
+
+    #[test]
+    fn fleet_review_fix_delayed_submission_keeps_a_newer_completion() {
+        let mut fleet = FleetUi::default();
+        let mut rows = [pty_session("ws", 7, AgentVisualState::Idle)];
+        rows[0].idle_since = Some(300);
+        rows[0].idle_generation = Some(300_000_000);
+        fleet.update_idle_clocks(&rows, 305);
+        fleet.observe_runtime_events(
+            "ws",
+            &[runtime::RuntimeEvent::SessionInputSubmitted {
+                session: runtime::SessionId(7),
+                at_micros: 200_000_000,
+            }],
+            310,
+        );
+        fleet.update_idle_clocks(&rows, 320);
+        let clock = &fleet.idle_started[&FleetIdleKey::for_session(&rows[0])];
+        assert_eq!((clock.since, clock.confirmed), (Some(300), true));
+    }
+
+    #[test]
+    fn fleet_wait_delayed_exact_source_replaces_first_observation() {
+        let mut fleet = FleetUi::default();
+        let mut rows = vec![pty_session("ws", 11, AgentVisualState::Idle)];
+        fleet.update_idle_clocks(&rows, 1000);
+        assert_eq!(fleet.idle_since(&rows[0]), Some(1000));
+        rows[0].idle_since = Some(100);
+        fleet.update_idle_clocks(&rows, 1060);
+        assert_eq!(
+            fleet.idle_since(&rows[0]),
+            Some(100),
+            "completion time must replace an estimate, not max with first paint"
+        );
+    }
+
+    #[test]
+    fn fleet_wait_card_shows_numbered_next_task_and_observed_clock() {
+        use egui_kittest::kittest::Queryable;
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        let mut session = pty_session("ws", 11, AgentVisualState::Idle);
+        session.followup =
+            Some("Run the tests, then review the failed cases and report the results. Fix remaining regressions and summarize all verification commands.".into());
+        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
+            let _ = card(
+                ui,
+                &session,
+                &catalog,
+                120,
+                Some(IdleTime {
+                    since: 60,
+                    confirmed: false,
+                }),
+            );
+        });
+        harness.run();
+        harness.get_by_label("Next tasks (1)");
+        let row = harness.get_by_label_contains("1. Run the tests");
+        assert!(row.rect().height() > 20.0, "long queued task must wrap");
+        harness.get_by_label("observed waiting 1:00");
+    }
+
+    #[test]
+    fn fleet_wait_hidden_runtime_turn_resets_only_its_session_and_prunes_exit() {
+        let mut fleet = FleetUi::default();
+        let mut rows = vec![
+            pty_session("ws", 7, AgentVisualState::Idle),
+            pty_session("other", 7, AgentVisualState::Idle),
+        ];
+        fleet.update_idle_clocks(&rows, 100);
+        fleet.observe_runtime_events(
+            "ws",
+            &[runtime::RuntimeEvent::SessionStatusChanged {
+                session: runtime::SessionId(7),
+                status: runtime::SessionStatus::Running,
+            }],
+            110,
+        );
+        // Fleet is reopened only after the turn finished. An old snapshot cannot revive 90.
+        fleet.update_idle_clocks(&rows, 130);
+        assert_eq!(fleet.idle_since(&rows[0]), Some(130));
+        assert_eq!(fleet.idle_since(&rows[1]), Some(100));
+        assert!(!fleet.idle_started[&FleetIdleKey::for_session(&rows[0])].confirmed);
+        rows[0].idle_since = Some(120);
+        fleet.update_idle_clocks(&rows, 140);
+        assert_eq!(fleet.idle_since(&rows[0]), Some(120));
+        assert!(fleet.idle_started[&FleetIdleKey::for_session(&rows[0])].confirmed);
+        fleet.observe_runtime_events(
+            "ws",
+            &[runtime::RuntimeEvent::SessionExited {
+                session: runtime::SessionId(7),
+                exit_code: Some(0),
+            }],
+            150,
+        );
+        assert_eq!(fleet.idle_since(&rows[0]), None);
+        fleet.update_idle_clocks(&[], 160);
+        assert!(fleet.idle_started.is_empty());
+    }
+
+    #[test]
+    fn fleet_wait_delayed_runtime_drain_accepts_new_completion_before_receipt() {
+        let mut fleet = FleetUi::default();
+        let mut rows = [pty_session("ws", 7, AgentVisualState::Idle)];
+        rows[0].idle_since = Some(90);
+        fleet.update_idle_clocks(&rows, 100);
+        fleet.observe_runtime_events(
+            "ws",
+            &[runtime::RuntimeEvent::SessionStatusChanged {
+                session: runtime::SessionId(7),
+                status: runtime::SessionStatus::Running,
+            }],
+            130,
+        );
+        rows[0].idle_since = Some(120);
+        fleet.update_idle_clocks(&rows, 140);
+        assert_eq!(fleet.idle_since(&rows[0]), Some(120));
+        assert!(fleet.idle_started[&FleetIdleKey::for_session(&rows[0])].confirmed);
+    }
+
+    #[test]
+    fn fleet_wait_same_second_completion_keeps_accumulated_wait() {
+        let mut fleet = FleetUi::default();
+        let mut rows = [pty_session("ws", 7, AgentVisualState::Idle)];
+        rows[0].idle_since = Some(100);
+        fleet.update_idle_clocks(&rows, 100);
+        fleet.observe_attention(
+            &PtyIdleClocks::new(),
+            &HashSet::from([("ws".into(), runtime::SessionId(7))]),
+            &HashSet::new(),
+            100,
+        );
+        rows[0].idle_generation = Some(2);
+        // Another completion within that same second; reopen Fleet much later.
+        fleet.update_idle_clocks(&rows, 3600);
+        assert_eq!(fleet.idle_since(&rows[0]), Some(100));
+        assert_eq!(
+            fleet.idle_started[&FleetIdleKey::for_session(&rows[0])].generation,
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn fleet_wait_completion_projection_before_runtime_drain_is_not_invalidated() {
+        let mut fleet = FleetUi::default();
+        let mut rows = [pty_session("ws", 7, AgentVisualState::Idle)];
+        rows[0].idle_since = Some(90);
+        fleet.update_idle_clocks(&rows, 100);
+        rows[0].idle_since = Some(120);
+        rows[0].idle_generation = Some(2);
+        fleet.observe_attention(
+            &PtyIdleClocks::from([(("ws".into(), runtime::SessionId(7)), (120, 2))]),
+            &HashSet::new(),
+            &HashSet::new(),
+            125,
+        );
+        fleet.observe_runtime_events(
+            "ws",
+            &[runtime::RuntimeEvent::SessionStatusChanged {
+                session: runtime::SessionId(7),
+                status: runtime::SessionStatus::Running,
+            }],
+            130,
+        );
+        fleet.update_idle_clocks(&rows, 140);
+        assert_eq!(fleet.idle_since(&rows[0]), Some(120));
+        assert!(fleet.idle_started[&FleetIdleKey::for_session(&rows[0])].confirmed);
+    }
+
+    #[test]
+    fn fleet_wait_hidden_hook_work_and_missing_source_clear_the_exact_clock() {
+        let mut fleet = FleetUi::default();
+        let mut rows = [pty_session("ws", 7, AgentVisualState::Idle)];
+        rows[0].idle_since = Some(100);
+        rows[0].idle_generation = Some(1);
+        fleet.update_idle_clocks(&rows, 110);
+        fleet.observe_attention(
+            &PtyIdleClocks::new(),
+            &HashSet::from([("ws".into(), runtime::SessionId(7))]),
+            &HashSet::new(),
+            120,
+        );
+        assert_eq!(fleet.idle_since(&rows[0]), None);
+        rows[0].idle_since = None;
+        rows[0].idle_generation = None;
+        fleet.update_idle_clocks(&rows, 150);
+        assert_eq!(fleet.idle_since(&rows[0]), Some(150));
+        assert!(!fleet.idle_started[&FleetIdleKey::for_session(&rows[0])].confirmed);
+        rows[0].idle_since = Some(160);
+        rows[0].idle_generation = Some(2);
+        fleet.update_idle_clocks(&rows, 170);
+        rows[0].idle_since = None;
+        rows[0].idle_generation = None;
+        fleet.update_idle_clocks(&rows, 180);
+        assert_eq!(fleet.idle_since(&rows[0]), Some(180));
+        assert!(!fleet.idle_started[&FleetIdleKey::for_session(&rows[0])].confirmed);
+    }
+
+    #[test]
+    fn fleet_wait_hidden_structured_turn_resets_observed_time() {
+        let mut fleet = FleetUi::default();
+        let mut row = pty_session("ws", 7, AgentVisualState::Idle);
+        row.target = FleetTarget::Structured {
+            session_id: "thread-1".into(),
+        };
+        fleet.update_idle_clocks(&[row.clone()], 100);
+        fleet.observe_structured_status("thread-1", AgentVisualState::Active, 110);
+        fleet.observe_structured_status("thread-1", AgentVisualState::Idle, 130);
+        fleet.update_idle_clocks(&[row.clone()], 140);
+        assert_eq!(fleet.idle_since(&row), Some(130));
+        fleet.observe_structured_status("thread-1", AgentVisualState::Off, 150);
+        assert_eq!(fleet.idle_since(&row), None);
     }
 
     #[test]
@@ -2377,11 +3055,11 @@ mod tests {
     /// 예약해뒀다는 사실이 카드에 안 보이면, 나중에 도착한 프롬프트가 내가 안 시킨
     /// 일처럼 보인다. 칩과 **원문**이 함께 보여야 뭘 예약했는지 기억이 난다.
     #[test]
-    fn 예약된_세션_카드는_칩과_원문을_보여준다() {
+    fn 예약된_세션_카드는_번호_목록과_원문을_보여준다() {
         use egui_kittest::kittest::Queryable;
 
         let outer = catalog();
-        let chip = outer.t("fleet.followup.chip", &[]);
+        let heading = outer.t("fleet.followup.list", &[("count", "1")]);
         let mut session = pty_session("ws-1", 7, AgentVisualState::Active);
         session.followup = Some("테스트 돌리고 실패한 것만 고쳐".to_owned());
         let mut harness = egui_kittest::Harness::builder()
@@ -2415,10 +3093,11 @@ mod tests {
         harness.run();
         assert!(
             harness
-                .query_by_label(&format!("{chip} · 테스트 돌리고 실패한 것만 고쳐"))
+                .query_by_label("1. 테스트 돌리고 실패한 것만 고쳐")
                 .is_some(),
-            "예약 칩과 원문이 카드에 보여야 한다"
+            "번호와 원문이 카드에 보여야 한다"
         );
+        harness.get_by_label(&heading);
     }
 
     /// 예약 버튼은 **대상 세션과 원문을 그대로** 실어 보내야 한다. 대상이 어긋나면

@@ -1358,6 +1358,10 @@ workspace.add.github = GitHub 저장소
 workspace.add.local_hint = 기존 폴더를 워크스페이스로 엽니다.
 workspace.add.choose_folder = 폴더 선택…
 workspace.add.url = 저장소 URL
+workspace.add.url_hint = 지원 형식: GitHub HTTPS 또는 SSH 주소
+popup.shortcut_close = Esc 닫기
+popup.shortcut_create = Enter 만들기 · Esc 닫기
+file_tree.create = 만들기
 workspace.add.destination = 저장 위치
 workspace.add.browse = 찾아보기…
 workspace.add.folder_name = 폴더 이름
@@ -1381,3 +1385,19 @@ workspace.add.worker_failed = 복제 작업을 시작하지 못했습니다.
 workspace.add.registration_failed = 폴더를 워크스페이스에 추가하지 못했습니다. 다시 시도하세요.
 workspace.add.switch_failed = 워크스페이스를 추가했지만 열지 못했습니다. 다시 시도하세요.
 workspace.add.choosing = 폴더 선택 중…
+resource_manager.confirm_session.title = 리소스 관리자 세션 종료
+resource_manager.confirm_unattached.title = 연결되지 않은 프로세스 종료
+ports.confirm_title = 포트 점유 프로세스 종료
+file_tree.permanent_delete_title = 영구 삭제 확인
+popup.dismiss = 팝업 닫기
+
+document.confirm_discard.warning = 저장하지 않은 변경 내용을 버리면 복구할 수 없습니다.
+workspace.folder_moved.failed = 폴더 경로를 갱신하지 못했습니다. 다시 시도하세요.
+
+workspace.add.folder_identity_conflict = 선택한 폴더의 볼륨이 다르거나 기존 볼륨을 확인할 수 없습니다. 워크스페이스 설정에서 프로젝트 경로를 다시 연결한 뒤 열어 주세요.
+
+fleet.idle_observed_for = 관측 기준 {value} 대기
+fleet.followup.list = 다음 작업 ({count})
+fleet.followup.empty = 예약된 작업 없음
+
+env.delete_source = 삭제할 파일

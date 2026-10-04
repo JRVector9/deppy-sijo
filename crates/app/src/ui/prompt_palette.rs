@@ -91,7 +91,7 @@ impl PromptPaletteUi {
                 action = self.body(ui, library, composer_draft, catalog);
             });
         // Esc: 편집 중이면 폼만 닫고(목록/상세로 복귀), 아니면 팔레트를 닫는다.
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        if super::popup::take_window_escape(ctx, egui::Id::new("prompt_palette")) {
             if self.editing.is_some() {
                 self.editing = None;
             } else {
@@ -372,5 +372,86 @@ impl PromptPaletteUi {
             }));
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn popup_audit_palette_draft_survives_escape_owned_by_confirmation() {
+        let ctx = egui::Context::default();
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        let library = PromptLibrary::default();
+        let mut palette = PromptPaletteUi::default();
+        palette.open();
+        palette.editing = Some(PromptDraft {
+            title: "Keep draft".into(),
+            ..Default::default()
+        });
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        ctx.run_ui(input, |ui| {
+            crate::ui::popup::show(
+                ui.ctx(),
+                crate::ui::popup::PopupSpec {
+                    id: egui::Id::new("palette_front_confirm"),
+                    width: 400.0,
+                    title: "Confirm",
+                    subtitle: "",
+                    close_label: "Close",
+                    close_enabled: true,
+                },
+                |ui| {
+                    ui.label("Front confirmation");
+                },
+            );
+            assert!(palette.render(ui.ctx(), &library, "", &catalog).is_none());
+        })
+        .drop_without_applying_deltas();
+        assert!(palette.is_open());
+        assert_eq!(
+            palette.editing.as_ref().map(|draft| draft.title.as_str()),
+            Some("Keep draft")
+        );
+    }
+
+    #[test]
+    fn popup_audit_front_palette_escape_returns_from_edit_then_closes() {
+        let ctx = egui::Context::default();
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        let library = PromptLibrary::default();
+        let mut palette = PromptPaletteUi::default();
+        palette.open();
+        palette.editing = Some(PromptDraft::default());
+        for _ in 0..2 {
+            ctx.run_ui(egui::RawInput::default(), |ui| {
+                palette.render(ui.ctx(), &library, "", &catalog);
+            })
+            .drop_without_applying_deltas();
+        }
+        for editing in [true, false] {
+            let mut input = egui::RawInput::default();
+            input.events.push(egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+            ctx.run_ui(input, |ui| {
+                palette.render(ui.ctx(), &library, "", &catalog);
+            })
+            .drop_without_applying_deltas();
+            assert_eq!(palette.is_open(), editing);
+            assert!(palette.editing.is_none());
+        }
     }
 }

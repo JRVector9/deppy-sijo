@@ -30,6 +30,18 @@ pub struct AgentAttentionEvent {
     pub child_id: Option<String>,
 }
 
+#[derive(Default)]
+struct SavedAttention {
+    json: Option<String>,
+    working: bool,
+    done: bool,
+    updated_at: i64,
+    revision: i64,
+    idle_since: Option<i64>,
+    idle_generation: Option<i64>,
+    waiting: bool,
+}
+
 #[derive(Default, Serialize, Deserialize)]
 struct AttentionState {
     native_session_id: String,
@@ -37,6 +49,12 @@ struct AttentionState {
     last_activity: i64,
     turn_started: i64,
     completed_turn: Option<String>,
+    /// Hook boundaries, not the last quiet-screen observation. Missing old values
+    /// remain unknown rather than inventing an exact idle timestamp.
+    #[serde(default)]
+    completed_at_micros: Option<i64>,
+    #[serde(default)]
+    resolved_at_micros: i64,
     #[serde(default)]
     current_turn: Option<String>,
     #[serde(default)]
@@ -57,6 +75,16 @@ struct AttentionState {
 }
 
 impl AttentionState {
+    fn clear_completion_for_activity(&mut self, at: i64) {
+        self.completed_turn = None;
+        self.completed_at_micros = None;
+        // Child hooks can be saved before an older parent activity hook. Only
+        // a later activity starts a new episode after an already proven result.
+        if self.resolved_at_micros <= at {
+            self.resolved_at_micros = 0;
+        }
+    }
+
     fn prune_anonymous_history(&mut self) {
         // 정리한 경계까지의 양수 잔여만 이월한다. 짝이 없는 과거 결과는 이월하지 않는다.
         while self
@@ -118,6 +146,22 @@ struct AnonymousRequests {
 }
 
 impl AnonymousRequests {
+    fn last_matched_resolution(&self) -> Option<i64> {
+        let mut pending = i16::from(self.baseline.unwrap_or(0));
+        let mut resolved = None;
+        // recount() keeps this bounded history in event-time order. An unmatched
+        // tool result is not evidence that a question was answered.
+        for (at, kind) in &self.seen {
+            if *kind != 0 {
+                pending += 1;
+            } else if pending > 0 {
+                pending -= 1;
+                resolved = Some(*at);
+            }
+        }
+        resolved
+    }
+
     fn baseline(&mut self) -> u8 {
         *self.baseline.get_or_insert_with(|| {
             // 이전 버전의 창 밖 양수 잔여는 보존하고 음수 부채는 버린다.
@@ -264,14 +308,22 @@ impl Db {
         }
         let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         // 길이를 먼저 제한하여 손상된 DB의 큰 JSON을 힙으로 읽지 않는다.
-        let saved: Option<(Option<String>,bool,bool,i64,i64)> = tx.query_row(
+        let saved: Option<SavedAttention> = tx.query_row(
             "SELECT CASE WHEN attention_json IS NULL THEN NULL
                WHEN typeof(attention_json)='text' AND length(CAST(attention_json AS BLOB)) <= ?2
-               THEN attention_json ELSE 'invalid' END, working, turn_done, updated_at, attention_revision
+               THEN attention_json ELSE 'invalid' END, working, turn_done, updated_at, attention_revision, idle_since, waiting, idle_generation
              FROM agent_needs_input WHERE session_key=?1",(key, STATE_BYTES_MAX as i64),
-            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
-        let (json, mut working, mut done, previous_at, revision) =
-            saved.unwrap_or((None, false, false, 0, 0));
+            |r| Ok(SavedAttention { json: r.get(0)?, working: r.get(1)?, done: r.get(2)?, updated_at: r.get(3)?, revision: r.get(4)?, idle_since: r.get(5)?, waiting: r.get(6)?, idle_generation:r.get(7)? })).optional()?;
+        let SavedAttention {
+            json,
+            mut working,
+            mut done,
+            updated_at: previous_at,
+            revision,
+            idle_since: previous_idle,
+            idle_generation: previous_idle_generation,
+            waiting: previous_waiting,
+        } = saved.unwrap_or_default();
         let mut state: AttentionState = match json {
             Some(json) => serde_json::from_str(&json)
                 .map_err(|_| anyhow::anyhow!("agent attention state invalid"))?,
@@ -308,6 +360,18 @@ impl Db {
                 || event.turn_id == state.current_turn);
         let latest = current && event.at_micros >= state.last_activity;
         let mut new_completion = false;
+        let previous_resolution = state.resolved_at_micros;
+        let mut recovered_resolution = None;
+        let pending_before: usize = if event.kind == K::Resolved {
+            state
+                .requests
+                .iter()
+                .filter(|request| request.kind != 0)
+                .map(|request| usize::from(request.pending_count.max(1)))
+                .sum()
+        } else {
+            0
+        };
         if matches!(
             event.kind,
             K::Working | K::ResponseRequired | K::ApprovalRequired | K::Resolved
@@ -359,6 +423,20 @@ impl Db {
                             request.turn.clone_from(&event.turn_id);
                         }
                         request.observe_anonymous(kind, event.at_micros)?;
+                        if kind != 0 && request.turn == event.turn_id {
+                            recovered_resolution = request
+                                .anonymous
+                                .as_ref()
+                                .and_then(AnonymousRequests::last_matched_resolution);
+                        }
+                    } else if kind != 0
+                        && request.kind == 0
+                        && request.at >= event.at_micros
+                        && request.turn == event.turn_id
+                    {
+                        // The result arrived first. This delayed question now
+                        // proves that its tombstone is a real resolution boundary.
+                        recovered_resolution = Some(request.at);
                     } else if event.at_micros >= request.at {
                         request.kind = kind;
                         request.pending_count = u8::from(kind != 0);
@@ -483,7 +561,7 @@ impl Db {
                 }
                 if latest && kind != 0 {
                     done = false;
-                    state.completed_turn = None;
+                    state.clear_completion_for_activity(event.at_micros);
                 }
             }
             K::TurnStart if latest => {
@@ -492,11 +570,11 @@ impl Db {
                 state.turn_started = event.at_micros;
                 state.current_turn.clone_from(&event.turn_id);
                 state.turn_cancelled = false;
-                state.completed_turn = None;
+                state.clear_completion_for_activity(event.at_micros);
             }
             K::Working if latest || owner.is_some() => {
                 if latest {
-                    state.completed_turn = None;
+                    state.clear_completion_for_activity(event.at_micros);
                     working = true;
                     done = false;
                 }
@@ -525,6 +603,7 @@ impl Db {
                     done = true;
                     new_completion = true;
                     state.completed_turn = Some(turn);
+                    state.completed_at_micros = Some(event.at_micros);
                 }
             }
             K::IdleObserved if latest => {
@@ -628,18 +707,80 @@ impl Db {
         let response = state.requests.iter().any(|r| r.kind == 1);
         let approval = state.requests.iter().any(|r| r.kind == 2);
         let waiting = response || approval;
+        let pending_after: usize = if event.kind == K::Resolved {
+            state
+                .requests
+                .iter()
+                .filter(|request| request.kind != 0)
+                .map(|request| usize::from(request.pending_count.max(1)))
+                .sum()
+        } else {
+            0
+        };
+        if event.kind == K::Resolved && pending_after < pending_before {
+            state.resolved_at_micros = state.resolved_at_micros.max(event.at_micros);
+        }
+        if let Some(resolved) = recovered_resolution {
+            state.resolved_at_micros = state.resolved_at_micros.max(resolved);
+        }
+        // Alert acknowledgments consume turn_done, not the actual idle episode.
+        // A quiet-screen observation alone never proves that an agent turn completed.
+        let idle_since = if !waiting
+            && !working
+            && !state.ended
+            && !state.turn_cancelled
+            && state.completed_turn.is_some()
+        {
+            if new_completion {
+                Some(event.at_micros.max(state.resolved_at_micros) / 1_000_000)
+            } else if recovered_resolution.is_some()
+                && state.resolved_at_micros > previous_resolution
+            {
+                state
+                    .completed_at_micros
+                    .map(|completed| completed.max(state.resolved_at_micros) / 1_000_000)
+                    .or(previous_idle)
+            } else {
+                previous_idle.or_else(|| {
+                    (previous_waiting && event.kind == K::Resolved)
+                        .then_some(state.completed_at_micros)
+                        .flatten()
+                        .map(|completed| completed.max(state.resolved_at_micros) / 1_000_000)
+                })
+            }
+        } else {
+            None
+        };
+        let completion_generation = if new_completion {
+            revision.saturating_add(1).max(event.at_micros)
+        } else {
+            revision
+        };
+        let idle_generation = idle_since.and_then(|since| {
+            if new_completion {
+                Some(completion_generation.max(state.resolved_at_micros))
+            } else if previous_idle == Some(since)
+                && state.resolved_at_micros <= previous_resolution
+            {
+                previous_idle_generation
+            } else {
+                state
+                    .completed_at_micros
+                    .map(|completed| completed.max(state.resolved_at_micros))
+            }
+        });
         let json = serde_json::to_string(&state)?;
         anyhow::ensure!(json.len() <= STATE_BYTES_MAX, "agent attention state limit");
         // 보관 시각은 초 단위를 유지하고 완료 소비에는 별도 단조 증가 세대를 쓴다.
         let now = deppy_core::time::unix_secs_i64();
         let updated = now.max(previous_at);
         tx.execute("INSERT INTO agent_needs_input
-            (session_key,waiting,working,turn_done,updated_at,message,response_required,attention_json,attention_revision)
-            VALUES (?1,?2,?3,?4,?5,NULL,?6,?7,?8)
+            (session_key,waiting,working,turn_done,updated_at,message,response_required,attention_json,attention_revision,idle_since,idle_generation)
+            VALUES (?1,?2,?3,?4,?5,NULL,?6,?7,?8,?9,?10)
             ON CONFLICT(session_key) DO UPDATE SET waiting=excluded.waiting,working=excluded.working,
             turn_done=excluded.turn_done,updated_at=excluded.updated_at,message=NULL,
-            response_required=excluded.response_required,attention_json=excluded.attention_json,attention_revision=excluded.attention_revision",
-            rusqlite::params![key,waiting,working,done,updated,response && !approval,json,if new_completion {revision.saturating_add(1).max(event.at_micros)}else{revision}])?;
+            response_required=excluded.response_required,attention_json=excluded.attention_json,attention_revision=excluded.attention_revision,idle_since=excluded.idle_since,idle_generation=excluded.idle_generation",
+            rusqlite::params![key,waiting,working,done,updated,response && !approval,json,completion_generation,idle_since,idle_generation])?;
         evict_hook_state_prefix_overflow(&tx, HookStateTable::NeedsInput, prefix, key)?;
         evict_hook_state_overflow(&tx, HookStateTable::NeedsInput, key)?;
         tx.commit()?;
@@ -746,6 +887,440 @@ impl Db {
 
 #[cfg(test)]
 mod tests {
+    fn waiting_since(db: &Db) -> Option<i64> {
+        db.conn
+            .query_row(
+                "SELECT idle_since FROM agent_needs_input WHERE session_key=?1",
+                [KEY],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn fleet_wait_completion_clock_is_seconds_and_survives_alert_ack() {
+        let db = Db::open_in_memory().unwrap();
+        let mut complete = event(AttentionEventKind::Completed, "", 1);
+        complete.at_micros = 1_700_000_000_987_654;
+        db.record_agent_attention(KEY, &complete).unwrap();
+        let generation = db.list_turn_done_sessions().unwrap()[0].1;
+        assert!(generation > 1_700_000_000);
+        assert_eq!(waiting_since(&db), Some(1_700_000_000));
+        db.clear_agent_turn_done(KEY, generation).unwrap();
+        assert_eq!(waiting_since(&db), Some(1_700_000_000));
+        let mut idle = event(AttentionEventKind::IdleObserved, "", 2);
+        idle.at_micros = complete.at_micros + 5_000_000;
+        db.record_agent_attention(KEY, &idle).unwrap();
+        assert_eq!(waiting_since(&db), Some(1_700_000_000));
+        let mut start = event(AttentionEventKind::TurnStart, "", 3);
+        start.at_micros = complete.at_micros + 10_000_000;
+        db.record_agent_attention(KEY, &start).unwrap();
+        assert_eq!(waiting_since(&db), None);
+        db.record_agent_attention(KEY, &idle).unwrap();
+        assert_eq!(
+            waiting_since(&db),
+            None,
+            "old observations cannot recover previous idle episode"
+        );
+    }
+
+    #[test]
+    fn fleet_wait_same_second_snapshot_retains_distinct_completion_generations() {
+        let db = Db::open_in_memory().unwrap();
+        let ws = db.create_workspace("same-second-clock").unwrap();
+        let key = format!("{ws}:7");
+        let mut e = event(AttentionEventKind::Completed, "", 1);
+        e.at_micros = 1_700_000_000_000_001;
+        e.turn_id = Some("one".into());
+        db.record_agent_attention(&key, &e).unwrap();
+        let job = super::AgentStateJob::projection(&ws);
+        let before = db.apply_agent_state_job(&job).unwrap().idle_sessions[0].clone();
+        db.clear_agent_turn_done(&key, before.2).unwrap();
+        e.kind = AttentionEventKind::TurnStart;
+        e.turn_id = Some("two".into());
+        e.at_micros += 1;
+        db.record_agent_attention(&key, &e).unwrap();
+        assert!(
+            db.apply_agent_state_job(&job)
+                .unwrap()
+                .idle_sessions
+                .is_empty()
+        );
+        e.kind = AttentionEventKind::Completed;
+        e.at_micros += 1;
+        db.record_agent_attention(&key, &e).unwrap();
+        let after = db.apply_agent_state_job(&job).unwrap().idle_sessions[0].clone();
+        assert_eq!(before.1, after.1, "display seconds can be identical");
+        assert!(after.2 > before.2, "episodes must remain distinct");
+        db.clear_agent_turn_done(&key, after.2).unwrap();
+        assert_eq!(
+            db.apply_agent_state_job(&job).unwrap().idle_sessions[0],
+            after
+        );
+    }
+
+    #[test]
+    fn fleet_review_fix_quiet_observation_does_not_shift_delayed_resolution_idle_time() {
+        let db = Db::open_in_memory().unwrap();
+        db.record_agent_attention(
+            KEY,
+            &event(AttentionEventKind::ResponseRequired, "q", 100_000_000),
+        )
+        .unwrap();
+        db.record_agent_attention(KEY, &event(AttentionEventKind::Completed, "", 120_000_000))
+            .unwrap();
+        assert_eq!(waiting_since(&db), None);
+        db.record_agent_attention(
+            KEY,
+            &event(AttentionEventKind::IdleObserved, "", 150_000_000),
+        )
+        .unwrap();
+        db.record_agent_attention(KEY, &event(AttentionEventKind::Resolved, "q", 130_000_000))
+            .unwrap();
+        assert!(db.list_waiting_sessions().unwrap().is_empty());
+        assert_eq!(
+            waiting_since(&db),
+            Some(130),
+            "idle starts at request resolution, not a newer quiet-screen observation"
+        );
+    }
+
+    #[test]
+    fn fleet_review_fix_child_resolution_before_delayed_parent_completion_is_order_independent() {
+        for resolution_first in [false, true] {
+            let db = Db::open_in_memory().unwrap();
+            let ws = db.create_workspace("child-resolution-clock").unwrap();
+            let key = format!("{ws}:7");
+            db.record_agent_attention(&key, &event(AttentionEventKind::TurnStart, "", 90_000_000))
+                .unwrap();
+            db.record_agent_attention(
+                &key,
+                &event(
+                    AttentionEventKind::ResponseRequired,
+                    "child:c:q",
+                    100_000_000,
+                ),
+            )
+            .unwrap();
+            let complete = event(AttentionEventKind::Completed, "", 120_000_000);
+            let resolved = event(AttentionEventKind::Resolved, "child:c:q", 140_000_001);
+            for next in if resolution_first {
+                [&resolved, &complete]
+            } else {
+                [&complete, &resolved]
+            } {
+                db.record_agent_attention(&key, next).unwrap();
+            }
+            let snapshot = db
+                .apply_agent_state_job(&super::AgentStateJob::projection(ws))
+                .unwrap();
+            assert_eq!(snapshot.turn_done_sessions[0].1, 120_000_000);
+            assert_eq!(snapshot.idle_sessions[0].1, 140, "order={resolution_first}");
+            assert_eq!(snapshot.idle_sessions[0].2, 140_000_001);
+        }
+    }
+
+    #[test]
+    fn fleet_review_fix_resolution_boundary_is_distinct_from_notification_generation() {
+        let db = Db::open_in_memory().unwrap();
+        let ws = db.create_workspace("resolved-input-boundary").unwrap();
+        let key = format!("{ws}:7");
+        db.record_agent_attention(
+            &key,
+            &event(AttentionEventKind::ResponseRequired, "q", 100_000_000),
+        )
+        .unwrap();
+        db.record_agent_attention(&key, &event(AttentionEventKind::Completed, "", 120_000_000))
+            .unwrap();
+        db.record_agent_attention(&key, &event(AttentionEventKind::Resolved, "q", 140_000_001))
+            .unwrap();
+        let snapshot = db
+            .apply_agent_state_job(&super::AgentStateJob::projection(ws))
+            .unwrap();
+        assert_eq!(snapshot.turn_done_sessions[0].1, 120_000_000);
+        assert_eq!(snapshot.idle_sessions[0].1, 140);
+        assert_eq!(
+            snapshot.idle_sessions[0].2, 140_000_001,
+            "the idle boundary follows the accepted input at130s even though completion precedes it"
+        );
+    }
+
+    #[test]
+    fn fleet_review_fix_delayed_question_recovers_matching_child_resolution() {
+        for question_before_completion in [false, true] {
+            for request in ["child:c:q", "child:c:elicitation:q"] {
+                let db = Db::open_in_memory().unwrap();
+                let ws = db.create_workspace("delayed-question-clock").unwrap();
+                let key = format!("{ws}:7");
+                let start = event(AttentionEventKind::TurnStart, "", 90_000_000);
+                let resolved = event(AttentionEventKind::Resolved, request, 140_000_001);
+                let question = event(AttentionEventKind::ResponseRequired, request, 100_000_000);
+                let complete = event(AttentionEventKind::Completed, "", 120_000_000);
+                for next in if question_before_completion {
+                    [&start, &resolved, &question, &complete]
+                } else {
+                    [&start, &resolved, &complete, &question]
+                } {
+                    db.record_agent_attention(&key, next).unwrap();
+                }
+                let snapshot = db
+                    .apply_agent_state_job(&super::AgentStateJob::projection(ws))
+                    .unwrap();
+                assert!(snapshot.waiting_sessions.is_empty());
+                assert_eq!(snapshot.turn_done_sessions[0].1, 120_000_000);
+                assert_eq!(
+                    snapshot.idle_sessions[0].1, 140,
+                    "{request}, question_before_completion={question_before_completion}"
+                );
+                assert_eq!(snapshot.idle_sessions[0].2, 140_000_001);
+            }
+        }
+    }
+
+    #[test]
+    fn fleet_review_fix_delayed_parent_work_preserves_newer_child_resolution() {
+        for delayed_kind in [AttentionEventKind::Working, AttentionEventKind::TurnStart] {
+            let db = Db::open_in_memory().unwrap();
+            let ws = db.create_workspace("delayed-parent-clock").unwrap();
+            let key = format!("{ws}:7");
+            for next in [
+                event(AttentionEventKind::TurnStart, "", 90_000_000),
+                event(
+                    AttentionEventKind::ResponseRequired,
+                    "child:c:q",
+                    100_000_000,
+                ),
+                event(AttentionEventKind::Resolved, "child:c:q", 140_000_001),
+                event(delayed_kind, "", 110_000_000),
+                event(AttentionEventKind::Completed, "", 120_000_000),
+            ] {
+                db.record_agent_attention(&key, &next).unwrap();
+            }
+            let snapshot = db
+                .apply_agent_state_job(&super::AgentStateJob::projection(&ws))
+                .unwrap();
+            assert_eq!(snapshot.turn_done_sessions[0].1, 120_000_000);
+            assert_eq!(snapshot.idle_sessions[0].1, 140, "{delayed_kind:?}");
+            assert_eq!(snapshot.idle_sessions[0].2, 140_000_001);
+            // A genuinely later new turn must still discard the old resolution clock.
+            let mut next = event(AttentionEventKind::TurnStart, "", 150_000_000);
+            next.turn_id = Some("turn-2".into());
+            db.record_agent_attention(&key, &next).unwrap();
+            next.kind = AttentionEventKind::Completed;
+            next.at_micros = 160_000_000;
+            db.record_agent_attention(&key, &next).unwrap();
+            assert_eq!(
+                db.apply_agent_state_job(&super::AgentStateJob::projection(&ws))
+                    .unwrap()
+                    .idle_sessions[0]
+                    .1,
+                160
+            );
+        }
+    }
+
+    #[test]
+    fn fleet_review_fix_child_hook_permutations_keep_only_proven_resolution_boundary() {
+        for request in ["child:c:q", "child:c:elicitation:q"] {
+            for first in 0..4 {
+                for second in 0..4 {
+                    for third in 0..4 {
+                        if first == second || first == third || second == third {
+                            continue;
+                        }
+                        let fourth = (0..4)
+                            .find(|index| ![first, second, third].contains(index))
+                            .unwrap();
+                        let order = [first, second, third, fourth];
+                        let db = Db::open_in_memory().unwrap();
+                        let ws = db.create_workspace("child-hook-order").unwrap();
+                        let key = format!("{ws}:7");
+                        db.record_agent_attention(
+                            &key,
+                            &event(AttentionEventKind::TurnStart, "", 90_000_000),
+                        )
+                        .unwrap();
+                        let hooks = [
+                            event(AttentionEventKind::ResponseRequired, request, 100_000_000),
+                            event(AttentionEventKind::Working, "", 110_000_000),
+                            event(AttentionEventKind::Completed, "", 120_000_000),
+                            event(AttentionEventKind::Resolved, request, 140_000_001),
+                        ];
+                        for index in order {
+                            db.record_agent_attention(&key, &hooks[index]).unwrap();
+                        }
+                        db.record_agent_attention(
+                            &key,
+                            &event(
+                                AttentionEventKind::Resolved,
+                                "child:c:unrelated",
+                                150_000_000,
+                            ),
+                        )
+                        .unwrap();
+                        let snapshot = db
+                            .apply_agent_state_job(&super::AgentStateJob::projection(ws))
+                            .unwrap();
+                        assert!(snapshot.waiting_sessions.is_empty());
+                        assert_eq!(snapshot.turn_done_sessions[0].1, 120_000_000);
+                        assert_eq!(snapshot.idle_sessions[0].1, 140, "{request}, {order:?}");
+                        assert_eq!(snapshot.idle_sessions[0].2, 140_000_001);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fleet_review_fix_reverse_question_resolutions_keep_the_last_actual_boundary() {
+        let db = Db::open_in_memory().unwrap();
+        db.record_agent_attention(
+            KEY,
+            &event(AttentionEventKind::ResponseRequired, "first", 100_000_000),
+        )
+        .unwrap();
+        db.record_agent_attention(
+            KEY,
+            &event(AttentionEventKind::ResponseRequired, "second", 110_000_000),
+        )
+        .unwrap();
+        db.record_agent_attention(KEY, &event(AttentionEventKind::Completed, "", 120_000_000))
+            .unwrap();
+        db.record_agent_attention(
+            KEY,
+            &event(AttentionEventKind::Resolved, "second", 140_000_000),
+        )
+        .unwrap();
+        db.record_agent_attention(
+            KEY,
+            &event(AttentionEventKind::IdleObserved, "", 150_000_000),
+        )
+        .unwrap();
+        db.record_agent_attention(
+            KEY,
+            &event(AttentionEventKind::Resolved, "first", 130_000_000),
+        )
+        .unwrap();
+        assert_eq!(waiting_since(&db), Some(140));
+    }
+
+    #[test]
+    fn fleet_review_fix_clock_rollback_does_not_block_other_sessions_attention() {
+        let db = Db::open_in_memory().unwrap();
+        let ws = db.create_workspace("clock-rollback").unwrap();
+        let completed_key = format!("{ws}:7");
+        let waiting_key = format!("{ws}:8");
+        let mut e = event(AttentionEventKind::Completed, "", 1);
+        // A completion stored before a 20-second wall-clock rollback is now in the future.
+        e.at_micros = (deppy_core::time::unix_secs_i64() + 20) * 1_000_000;
+        db.record_agent_attention(&completed_key, &e).unwrap();
+        db.set_agent_needs_input(&waiting_key, true, Some("Please answer"))
+            .unwrap();
+        let job = super::AgentStateJob::projection(&ws);
+        let result = db.apply_agent_state_job(&job);
+        // Control: the same state projects correctly with only idle_since removed.
+        db.conn
+            .execute(
+                "UPDATE agent_needs_input SET idle_since=NULL WHERE session_key=?1",
+                [&completed_key],
+            )
+            .unwrap();
+        let control = db.apply_agent_state_job(&job).unwrap();
+        assert!(
+            control
+                .waiting_sessions
+                .iter()
+                .any(|(key, _)| key == &waiting_key)
+        );
+        let snapshot =
+            result.expect("one future idle clock must not block all other attention state");
+        assert!(
+            snapshot
+                .waiting_sessions
+                .iter()
+                .any(|(key, _)| key == &waiting_key)
+        );
+        assert!(
+            snapshot
+                .idle_sessions
+                .iter()
+                .all(|(key, _, _)| key != &completed_key)
+        );
+    }
+
+    #[test]
+    fn fleet_wait_migrated_unknown_clock_is_not_forged_by_an_idle_observation() {
+        let db = Db::open_in_memory().unwrap();
+        let mut e = event(AttentionEventKind::Completed, "", 1);
+        e.at_micros = 1_700_000_000_000_000;
+        db.record_agent_attention(KEY, &e).unwrap();
+        // Modern pre-migration JSON proves completion but did not store the idle timestamp.
+        db.conn
+            .execute("UPDATE agent_needs_input SET idle_since=NULL", [])
+            .unwrap();
+        e.kind = AttentionEventKind::IdleObserved;
+        e.at_micros += 10_000_000;
+        db.record_agent_attention(KEY, &e).unwrap();
+        assert_eq!(
+            waiting_since(&db),
+            None,
+            "quiet observation must remain estimated"
+        );
+    }
+
+    #[test]
+    fn fleet_wait_acknowledged_completion_survives_db_reopen() {
+        let dir = std::env::temp_dir().join(format!("deppy-idle-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.sqlite");
+        {
+            let db = Db::open(&path).unwrap();
+            let mut e = event(AttentionEventKind::Completed, "", 1);
+            e.at_micros = 1_700_000_000_987_654;
+            db.record_agent_attention(KEY, &e).unwrap();
+            let revision = db.list_turn_done_sessions().unwrap()[0].1;
+            db.clear_agent_turn_done(KEY, revision).unwrap();
+        }
+        {
+            let db = Db::open(&path).unwrap();
+            assert_eq!(waiting_since(&db), Some(1_700_000_000));
+            assert!(db.list_turn_done_sessions().unwrap().is_empty());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn fleet_wait_question_resolution_starts_a_fresh_clock_and_idle_alone_is_unknown() {
+        let db = Db::open_in_memory().unwrap();
+        let mut e = event(AttentionEventKind::IdleObserved, "", 1);
+        e.at_micros = 1_700_000_000_000_000;
+        db.record_agent_attention(KEY, &e).unwrap();
+        assert_eq!(waiting_since(&db), None);
+        e.kind = AttentionEventKind::ResponseRequired;
+        e.request_id = "q".into();
+        e.at_micros += 1_000_000;
+        db.record_agent_attention(KEY, &e).unwrap();
+        e.kind = AttentionEventKind::Completed;
+        e.request_id.clear();
+        e.at_micros += 1_000_000;
+        db.record_agent_attention(KEY, &e).unwrap();
+        assert_eq!(
+            waiting_since(&db),
+            None,
+            "a question blocks instruction-idle time"
+        );
+        e.kind = AttentionEventKind::Resolved;
+        e.request_id = "q".into();
+        e.at_micros += 8_000_000;
+        db.record_agent_attention(KEY, &e).unwrap();
+        assert_eq!(waiting_since(&db), Some(1_700_000_010));
+        e.kind = AttentionEventKind::SessionEnd;
+        e.request_id.clear();
+        e.at_micros += 1_000_000;
+        db.record_agent_attention(KEY, &e).unwrap();
+        assert_eq!(waiting_since(&db), None);
+    }
+
     #[test]
     fn fix5_취소_후_늦은_익명_결과가_다음_질문을_삼키지_않는다() {
         let db = Db::open_in_memory().unwrap();

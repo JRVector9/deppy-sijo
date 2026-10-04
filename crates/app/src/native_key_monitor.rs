@@ -8,6 +8,7 @@
 //! 터미널 키보드 소유권을 아는 `WorkspaceUi`가 결정한다.
 
 use std::collections::VecDeque;
+#[cfg(not(test))]
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -85,20 +86,40 @@ impl NativePrintableKeyDown {
 const NATIVE_KEY_MAX_AGE: Duration = Duration::from_millis(500);
 const NATIVE_KEY_QUEUE_CAPACITY: usize = 64;
 
+#[cfg(not(test))]
 static KEY_DOWNS: OnceLock<Mutex<VecDeque<NativeKeyDown>>> = OnceLock::new();
 
-fn queue() -> &'static Mutex<VecDeque<NativeKeyDown>> {
-    KEY_DOWNS.get_or_init(|| Mutex::new(VecDeque::with_capacity(NATIVE_KEY_QUEUE_CAPACITY)))
+// Each offscreen harness owns its injected native batch. The app retains the
+// process-wide monitor queue; parallel Rust tests must not drain each other's input.
+#[cfg(test)]
+std::thread_local! {
+    static TEST_KEY_DOWNS: std::cell::RefCell<VecDeque<NativeKeyDown>> =
+        std::cell::RefCell::new(VecDeque::with_capacity(NATIVE_KEY_QUEUE_CAPACITY));
+}
+
+fn with_key_downs<R>(run: impl FnOnce(&mut VecDeque<NativeKeyDown>) -> R) -> Option<R> {
+    #[cfg(test)]
+    {
+        Some(TEST_KEY_DOWNS.with(|queue| run(&mut queue.borrow_mut())))
+    }
+    #[cfg(not(test))]
+    {
+        let queue = KEY_DOWNS
+            .get_or_init(|| Mutex::new(VecDeque::with_capacity(NATIVE_KEY_QUEUE_CAPACITY)));
+        let Ok(mut queue) = queue.lock() else {
+            return None;
+        };
+        Some(run(&mut queue))
+    }
 }
 
 fn record(key_down: NativeKeyDown) {
-    let Ok(mut key_downs) = queue().lock() else {
-        return;
-    };
-    if key_downs.len() == NATIVE_KEY_QUEUE_CAPACITY {
-        key_downs.pop_front();
-    }
-    key_downs.push_back(key_down);
+    let _ = with_key_downs(|key_downs| {
+        if key_downs.len() == NATIVE_KEY_QUEUE_CAPACITY {
+            key_downs.pop_front();
+        }
+        key_downs.push_back(key_down);
+    });
 }
 
 fn record_printable(character: char) {
@@ -131,10 +152,7 @@ fn record_clipboard_copy() {
 /// 오래됐거나 터미널 UI가 비활성인 프레임의 레코드는 다음 입력에 섞이지 않도록
 /// 재사용하지 않는다. 같은 프레임의 Command+V key repeat은 paste 1회로 합친다.
 pub(crate) fn drain() -> NativeKeyDownBatch {
-    let Ok(mut key_downs) = queue().lock() else {
-        return NativeKeyDownBatch::default();
-    };
-    collect_batch(key_downs.drain(..))
+    with_key_downs(|key_downs| collect_batch(key_downs.drain(..))).unwrap_or_default()
 }
 
 fn collect_batch(key_downs: impl IntoIterator<Item = NativeKeyDown>) -> NativeKeyDownBatch {
@@ -156,25 +174,25 @@ fn collect_batch(key_downs: impl IntoIterator<Item = NativeKeyDown>) -> NativeKe
 
 /// drain하지 않고 fresh한 Command+V key-down이 있는지만 본다. 파일 트리 ⌘V 게이트가
 /// 터미널의 drain(prepare_frame)보다 **같은 프레임 먼저** 신호를 봐야 붙여넣기 소유권을
-/// 정하고 터미널 이중 처리를 누를 수 있다 — 소비(drain)는 여전히 WorkspaceUi만 한다.
+/// 정하고 터미널 이중 처리를 누를 수 있다 — 실제 키보드 소유자가 batch를 소비한다.
 pub(crate) fn peek_clipboard_paste() -> bool {
-    let Ok(key_downs) = queue().lock() else {
-        return false;
-    };
-    key_downs
-        .iter()
-        .any(|kd| matches!(kd, NativeKeyDown::ClipboardPaste { .. }) && kd.fresh())
+    with_key_downs(|key_downs| {
+        key_downs
+            .iter()
+            .any(|kd| matches!(kd, NativeKeyDown::ClipboardPaste { .. }) && kd.fresh())
+    })
+    .unwrap_or(false)
 }
 
 /// drain하지 않고 fresh한 Command+C key-down이 있는지만 본다. 파일 트리가 터미널보다
 /// 먼저 복사 소유권을 정할 수 있게 하며, 실제 소비는 WorkspaceUi의 drain에 맡긴다.
 pub(crate) fn peek_clipboard_copy() -> bool {
-    let Ok(key_downs) = queue().lock() else {
-        return false;
-    };
-    key_downs
-        .iter()
-        .any(|kd| matches!(kd, NativeKeyDown::ClipboardCopy { .. }) && kd.fresh())
+    with_key_downs(|key_downs| {
+        key_downs
+            .iter()
+            .any(|kd| matches!(kd, NativeKeyDown::ClipboardCopy { .. }) && kd.fresh())
+    })
+    .unwrap_or(false)
 }
 
 #[cfg(target_os = "macos")]
@@ -373,8 +391,22 @@ fn key_code_ascii(key_code: u16, shifted: bool) -> Option<char> {
 pub(crate) fn install() {}
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    pub(crate) fn record_paste() {
+        super::record_clipboard_paste();
+    }
     use super::*;
+
+    #[test]
+    fn test_native_queue_is_local_to_its_owner_thread() {
+        record_paste();
+        let foreign_batch = std::thread::spawn(drain).join().unwrap();
+        assert!(
+            !foreign_batch.clipboard_paste,
+            "another harness drained this test's native paste"
+        );
+        assert!(drain().clipboard_paste);
+    }
 
     #[test]
     fn ascii_문장부호_숫자_공백만_복구후보다() {

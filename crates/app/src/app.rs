@@ -11,6 +11,7 @@ use crate::config::Config;
 use std::sync::Arc;
 
 use crate::ui;
+use crate::ui::document_dialogs::DirtyChoice as DocumentConfirmChoice;
 use secret::KeyringSecretStore;
 use storage::Db;
 
@@ -1644,13 +1645,24 @@ fn session_spawn_skips_dotenv_worker(
         && delivered == Some(current)
 }
 
-/// 전환 성공 후 이 workspace용 런처가 없을 때만 기본 셸을 하나 만든다.
-fn should_bootstrap_created_workspace_shell(
-    created: bool,
-    switched: bool,
-    launcher_open: bool,
+/// Automatic navigation offers once; an explicit folder/session open offers again.
+fn offer_workspace_launcher(
+    launcher: &mut ui::agent_launcher::AgentLauncherUi,
+    seen: &mut std::collections::HashSet<String>,
+    workspace_id: &str,
+    workspace_name: String,
+    launch_pending: bool,
+    explicit: bool,
 ) -> bool {
-    created && switched && !launcher_open
+    if launch_pending {
+        return false;
+    }
+    let first_offer = seen.insert(workspace_id.to_owned());
+    if !explicit && !first_offer {
+        return false;
+    }
+    launcher.open_for(workspace_id.to_owned(), workspace_name);
+    true
 }
 
 fn startup_catalog_blocks_session_creation(
@@ -3189,6 +3201,37 @@ enum SettingsJobAction {
     },
 }
 
+#[derive(Clone, Debug)]
+struct WorkspaceRenamePrompt {
+    workspace_id: String,
+    old_path: String,
+    new_path: String,
+    expected_anchor: storage::WorkspaceFolderAnchor,
+    submission: Option<SettingsOperationKey>,
+    failed: bool,
+}
+
+/// Only the exact submitted operation can settle a folder prompt. A different
+/// workspace's late result still updates its projection, never this newer dialog.
+fn settle_workspace_rename_prompt(
+    prompt: &mut Option<WorkspaceRenamePrompt>,
+    operation: &SettingsOperationKey,
+    result: &Result<storage::WorkspaceMovedPathUpdate, SettingsErrorCode>,
+) {
+    if !prompt
+        .as_ref()
+        .is_some_and(|prompt| prompt.submission.as_ref() == Some(operation))
+    {
+        return;
+    }
+    if result.is_ok() {
+        *prompt = None;
+    } else if let Some(prompt) = prompt {
+        prompt.submission = None;
+        prompt.failed = true;
+    }
+}
+
 struct SettingsOutcome {
     generation: u64,
     revision: u64,
@@ -3294,6 +3337,7 @@ enum SettingsErrorCode {
     DotenvSync,
     ProjectPath,
     WorkspaceMutation,
+    WorkspaceIdentity,
 }
 
 struct SettingsSnapshots {
@@ -4694,15 +4738,16 @@ fn execute_settings_job_with_repair(
         }
         SettingsJobAction::SetProjectPath { path } => {
             let path_string = path.to_string_lossy().into_owned();
-            let anchor = (!path_string.trim().is_empty())
-                .then(|| App::folder_anchor(&path_string))
+            let identity = (!path_string.trim().is_empty())
+                .then(|| crate::folder_identity::probe(&path))
                 .flatten();
             let result = db
-                .set_workspace_path_and_anchor(
+                .set_workspace_path_and_anchor_with_volume(
                     &workspace_id,
                     &path_string,
-                    anchor.map(|value| value.0),
-                    anchor.map(|value| value.1),
+                    identity.map(|value| value.anchor.dev),
+                    identity.map(|value| value.anchor.ino),
+                    identity.and_then(|value| value.volume),
                 )
                 .map_err(|_| SettingsErrorCode::ProjectPath);
             if result.is_ok() && path_string.trim().is_empty() && {
@@ -4742,15 +4787,22 @@ fn execute_settings_job_with_repair(
                 let path_string = path
                     .to_str()
                     .context("settings_workspace_path_invalid_utf8")?;
-                let (dev, ino) = App::folder_anchor(path_string)
+                let identity = crate::folder_identity::probe(&path)
                     .context("settings_workspace_folder_anchor_missing")?;
-                db.find_or_create_workspace_by_exact_path(
+                db.find_or_create_workspace_by_exact_path_with_volume(
                     &name,
                     path_string,
-                    storage::WorkspaceFolderAnchor { dev, ino },
+                    identity.anchor,
+                    identity.volume,
                 )
             })()
-            .map_err(|_| SettingsErrorCode::WorkspaceMutation);
+            .map_err(|error| {
+                if error.to_string().contains("workspace_path_anchor_conflict") {
+                    SettingsErrorCode::WorkspaceIdentity
+                } else {
+                    SettingsErrorCode::WorkspaceMutation
+                }
+            });
             SettingsOutcomeKind::WorkspaceFoundOrCreated { purpose, result }
         }
         SettingsJobAction::AcceptMovedWorkspacePath {
@@ -9530,15 +9582,12 @@ pub struct App {
     /// Includes both worker-admitted and startup-deferred continuations.
     dotenv_pending_bytes: usize,
     /// 프로젝트 폴더 rename 복구 확인 모달 — Some((old, new))이면 표시(2026-07-08).
-    workspace_rename_prompt: Option<(String, String)>,
+    workspace_rename_prompt: Option<WorkspaceRenamePrompt>,
     /// Environment & API 프로젝트 닫기 확인 대기 — sidebar/DB 삭제와 무관하다.
     env_project_close_confirm: Option<(String, String)>,
     /// 사이드바 「워크스페이스 종료」 확인 대기 — Some((id, 표시명, 세션 수, 실행 중 수)).
     /// 확정 시 세션(pane)만 일괄 닫고 워크스페이스(경로·설정·DB 기록)는 보존한다.
     ws_close_confirm: Option<(String, String, usize, usize)>,
-    /// 사이드바 「이름 바꾸기」 모달 — Some((id, 편집 버퍼)). 별칭(name 컬럼)만
-    /// 바꾸고 실제 폴더/경로는 불변. 빈 값 확정 = 별칭 해제(폴더명 복귀).
-    ws_rename_edit: Option<(String, String)>,
     workspace_add_ui: Option<crate::workspace_add::WorkspaceAddUi>,
     workspace_clone_task: Option<crate::workspace_add::CloneTask>,
     /// Completed clone stays pending for one UI frame so an already visible Cancel can win.
@@ -10091,6 +10140,7 @@ pub struct App {
     /// "완료" 표시가 가능해졌다. agent_turn_done(활성 전용)과 달리 워크스페이스별로 갈라
     /// fleet/사이드바 warm 경로에 넘긴다.
     global_turn_done: std::collections::HashMap<(String, runtime::SessionId), i64>,
+    global_idle_since: ui::fleet::PtyIdleClocks,
     /// 「이 턴 끝나면 이거 해」 — 세션별로 예약해둔 다음 프롬프트 한 칸.
     ///
     /// SessionId는 워크스페이스마다 재사용되므로 키는 `(workspace_id, session)` 쌍이다
@@ -11161,14 +11211,6 @@ fn resolve_document_conflict_choice(
     } else {
         None
     }
-}
-
-/// dirty 확인 모달(교체/닫기 공용)에서 사용자가 누른 버튼.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DocumentConfirmChoice {
-    Save,
-    Discard,
-    Cancel,
 }
 
 /// `MarkdownLinkIntent`를 실제로 실행할 행동으로 분류한 결과(설계 §5·§7.3). 실행은
@@ -14865,7 +14907,6 @@ impl App {
             workspace_rename_prompt: None,
             env_project_close_confirm: None,
             ws_close_confirm: None,
-            ws_rename_edit: None,
             workspace_add_ui: None,
             workspace_clone_task: None,
             pending_workspace_clone_result: None,
@@ -15120,6 +15161,7 @@ impl App {
             agent_working: std::collections::HashSet::new(),
             global_working: std::collections::HashSet::new(),
             global_turn_done: std::collections::HashMap::new(),
+            global_idle_since: std::collections::HashMap::new(),
             pty_followup: std::collections::HashMap::new(),
             session_alerts: std::collections::HashMap::new(),
             session_cwds: std::collections::HashMap::new(),
@@ -16429,6 +16471,16 @@ impl App {
                             .then_some(((workspace_id, session), *at))
                     })
                     .collect();
+                self.global_idle_since = snapshot
+                    .idle_sessions
+                    .iter()
+                    .filter_map(|(key, at, generation)| {
+                        let (ws, session) = ui::inbox_waiting::parse_session_key(key)?;
+                        (self.attention_session_alive(&ws, session)
+                            && self.idle_completion_is_current(&ws, session, *generation))
+                        .then_some(((ws, session), (*at, *generation)))
+                    })
+                    .collect();
                 // hook 기반 "작업 중"(v32) — 활성 전용 set + 전 워크스페이스(liveness 필터,
                 // global_waiting과 동일 규칙: 살아있는 세션만).
                 self.agent_working = snapshot
@@ -16447,6 +16499,12 @@ impl App {
                     .collect();
                 let turn_started =
                     turn_start_transitions(&working_now, &self.global_working, &was_blocked);
+                self.fleet_ui.observe_attention(
+                    &self.global_idle_since,
+                    &working_now,
+                    &live_blocked,
+                    deppy_core::time::unix_secs_i64(),
+                );
                 self.global_working = working_now;
                 self.note_turn_starts(&turn_started);
                 self.stage_attention_work_history();
@@ -22407,8 +22465,57 @@ impl App {
         }
     }
 
-    /// 설정에 저장된 전역 단축키 한 건을 실행한다. 설정 창에서는 키 녹화와 검색 입력이
-    /// 우선이고, 일반 TextEdit 포커스 중에도 문자 편집 단축키를 가로채지 않는다.
+    fn pending_attached_close_confirmation(&self) -> Option<&str> {
+        self.cross_workspace_pane
+            .attachments()
+            .iter()
+            .find_map(|pane| {
+                let target = pane.live_target()?;
+                let workspace = self.warm.get(&target.workspace_id)?;
+                (workspace.runtime_instance == target.runtime_instance
+                    && workspace.workspace_ui.has_pending_close_confirmation())
+                .then_some(target.workspace_id.as_str())
+            })
+    }
+
+    fn show_pending_pane_confirmation(&mut self, ctx: &egui::Context, catalog: &i18n::Catalog) {
+        if self.active.workspace_ui.has_pending_close_confirmation() {
+            self.active.workspace_ui.close_confirm_dialog(ctx, catalog);
+        } else if let Some(id) = self
+            .pending_attached_close_confirmation()
+            .map(str::to_owned)
+            && let Some(workspace) = self.warm.get_mut(&id)
+        {
+            workspace.workspace_ui.close_confirm_dialog(ctx, catalog);
+        }
+    }
+
+    fn background_modal_pending(&self) -> bool {
+        self.runtime_stream_warning
+            || self.warm_limit_warning.is_some()
+            || self.cross_workspace_open_warning.is_some()
+            || (self.settings_open
+                && (self.env_project_close_confirm.is_some()
+                    || self.env_profiles_ui.has_pending_confirmation()))
+            || !self.document_pending_confirms.is_empty()
+            || self
+                .file_tree
+                .as_ref()
+                .is_some_and(ui::file_tree::FileTreeUi::has_pending_confirmation)
+            || self.active.workspace_ui.has_pending_close_confirmation()
+            || self.pending_attached_close_confirmation().is_some()
+            || self.document_cap_notice
+            || self.workspace_rename_prompt.is_some()
+            || self.ws_close_confirm.is_some()
+            || self.workspace_add_ui.is_some()
+            || self.agent_launcher_ui.is_open()
+    }
+
+    fn publish_popup_input_fence(&self, ctx: &egui::Context) {
+        ui::popup::set_pending_modal(ctx, self.background_modal_pending());
+    }
+
+    /// Configured keys are processed in logic, after worker results/fences.
     fn handle_configured_shortcut(&mut self, ctx: &egui::Context) {
         if self.settings_open || ctx.text_edit_focused() {
             return;
@@ -23229,6 +23336,11 @@ impl App {
             if approval_events_overflowed {
                 self.runtime_stream_warning = true;
             }
+            self.fleet_ui.observe_runtime_events(
+                &rt.id,
+                &events,
+                deppy_core::time::unix_secs_i64(),
+            );
             Self::record_activity_events(&mut rt, &events);
             self.observe_approval_runtime_events(workspace_id, &events);
             if approval_events_overflowed {
@@ -25145,9 +25257,47 @@ impl App {
         for cwd in self.session_cwds.values() {
             // 후보는 현재 저장 경로와 달라야 한다(같으면 이동 아님).
             if cwd != old_path && Self::folder_anchor(cwd) == Some(anchor) {
-                self.workspace_rename_prompt = Some((old_path.to_owned(), cwd.clone()));
+                self.workspace_rename_prompt = Some(WorkspaceRenamePrompt {
+                    workspace_id: ws.to_owned(),
+                    old_path: old_path.to_owned(),
+                    new_path: cwd.clone(),
+                    expected_anchor: storage::WorkspaceFolderAnchor {
+                        dev: anchor.0,
+                        ino: anchor.1,
+                    },
+                    submission: None,
+                    failed: false,
+                });
                 return;
             }
+        }
+    }
+
+    fn apply_workspace_rename_decision(&mut self, update: bool) {
+        let Some(prompt) = self.workspace_rename_prompt.as_ref() else {
+            return;
+        };
+        if prompt.submission.is_some() {
+            return;
+        }
+        if !update {
+            self.dismissed_renames.insert(prompt.workspace_id.clone());
+            self.workspace_rename_prompt = None;
+            return;
+        }
+        let workspace_id = prompt.workspace_id.clone();
+        let action = SettingsJobAction::AcceptMovedWorkspacePath {
+            expected_old_path: prompt.old_path.clone(),
+            expected_anchor: prompt.expected_anchor,
+            new_path: PathBuf::from(&prompt.new_path),
+        };
+        if self.queue_global_settings_action(&workspace_id, action)
+            && let Some(prompt) = self.workspace_rename_prompt.as_mut()
+        {
+            prompt
+                .submission
+                .clone_from(&self.settings_pending_operation);
+            prompt.failed = false;
         }
     }
 
@@ -25258,14 +25408,17 @@ impl App {
     }
 
     fn open_agent_launcher_for_active(&mut self) {
-        if self.pending_agent_launcher_launch.is_some() {
-            return;
+        let name = self.active_workspace_display_name();
+        if offer_workspace_launcher(
+            &mut self.agent_launcher_ui,
+            &mut self.agent_launcher_seen_workspaces,
+            &self.active.id,
+            name,
+            self.pending_agent_launcher_launch.is_some(),
+            true,
+        ) {
+            self.egui_ctx.request_repaint();
         }
-        self.agent_launcher_seen_workspaces
-            .insert(self.active.id.clone());
-        self.agent_launcher_ui
-            .open_for(self.active.id.clone(), self.active_workspace_display_name());
-        self.egui_ctx.request_repaint();
     }
 
     fn workspace_session_open_step(&self, workspace_id: &str) -> WorkspaceSessionOpenStep {
@@ -25294,15 +25447,15 @@ impl App {
     }
 
     fn offer_agent_launcher_for_active(&mut self) {
-        if self.pending_agent_launcher_launch.is_some() {
-            return;
-        }
-        if self
-            .agent_launcher_seen_workspaces
-            .insert(self.active.id.clone())
-        {
-            self.agent_launcher_ui
-                .open_for(self.active.id.clone(), self.active_workspace_display_name());
+        let name = self.active_workspace_display_name();
+        if offer_workspace_launcher(
+            &mut self.agent_launcher_ui,
+            &mut self.agent_launcher_seen_workspaces,
+            &self.active.id,
+            name,
+            self.pending_agent_launcher_launch.is_some(),
+            false,
+        ) {
             self.egui_ctx.request_repaint();
         }
     }
@@ -25823,6 +25976,15 @@ impl App {
     }
 
     fn invalidate_env_profile_ui(&mut self) {
+        // A queued (not admitted) move can be abandoned by settings navigation.
+        // Unlock that exact prompt; an in-flight move keeps waiting for its outcome.
+        if let Some(job) = self.pending_settings_job.as_ref() {
+            settle_workspace_rename_prompt(
+                &mut self.workspace_rename_prompt,
+                &SettingsOperationKey::for_job(job),
+                &Err(SettingsErrorCode::WorkspaceMutation),
+            );
+        }
         self.pending_settings_job = None;
         self.pending_env_secret_reveal = None;
         self.env_profiles_ui.invalidate_cache();
@@ -26685,7 +26847,13 @@ impl App {
                                 | WorkspaceMutationPurpose::AddSwitchRuntime
                         ) && let Some(dialog) = self.workspace_add_ui.as_mut()
                         {
-                            dialog.set_error(crate::workspace_add::CloneError::RegistrationFailed);
+                            dialog.set_error(
+                                if result == Err(SettingsErrorCode::WorkspaceIdentity) {
+                                    crate::workspace_add::CloneError::FolderIdentityConflict
+                                } else {
+                                    crate::workspace_add::CloneError::RegistrationFailed
+                                },
+                            );
                         }
                         continue;
                     };
@@ -26715,17 +26883,11 @@ impl App {
                             if workspace_id != self.active.id {
                                 self.switch_workspace(&workspace_id);
                             }
-                            // 전환 거부 시 active는 이전 workspace이므로 거기에 셸을 만들지 않는다.
-                            let switched = workspace_id == self.active.id;
-                            let launcher_open = self.agent_launcher_ui.is_open_for(&self.active.id);
-                            if should_bootstrap_created_workspace_shell(
-                                created,
-                                switched,
-                                launcher_open,
-                            ) {
-                                self.active
-                                    .workspace_ui
-                                    .spawn_shell(self.config.terminal.scrollback_lines as usize);
+                            // Explicit selection includes reopening an already active/seen folder.
+                            // A refused switch must never open a launcher for the previous workspace.
+                            if workspace_id == self.active.id {
+                                self.reveal_terminal_session();
+                                self.open_agent_launcher_for_active();
                             }
                         }
                     }
@@ -26753,9 +26915,17 @@ impl App {
                     }
                 }
                 SettingsOutcomeKind::WorkspaceMovedPathAccepted { new_path, result } => {
+                    settle_workspace_rename_prompt(
+                        &mut self.workspace_rename_prompt,
+                        &SettingsOperationKey {
+                            generation: outcome.generation,
+                            revision: outcome.revision,
+                            workspace_id: outcome.workspace_id.clone(),
+                        },
+                        &result,
+                    );
                     if !matches!(result, Ok(storage::WorkspaceMovedPathUpdate::Updated)) {
-                        tracing::info!("workspace moved-path confirmation became stale");
-                        self.workspace_rename_prompt = None;
+                        tracing::info!("workspace moved-path confirmation failed or became stale");
                         continue;
                     }
                     self.update_workspace_projection_path(&outcome.workspace_id, &new_path);
@@ -26769,7 +26939,6 @@ impl App {
                             .send_command(runtime::RuntimeCommand::SetShellCwd(cwd));
                         self.refresh_file_tree_root();
                     }
-                    self.workspace_rename_prompt = None;
                 }
             }
         }
@@ -28261,6 +28430,22 @@ impl App {
     /// build_waiting_cards와 같은 active+warm 유니온 패턴. active 전용 map
     /// (agent_activity/needs_input/turn_done)은 active에만 쓰고, warm은 workspace
     /// namespace가 있는 global_waiting에서 needs_input을 뽑아 넣는다(SessionId 재사용 안전).
+    fn idle_completion_is_current(
+        &self,
+        workspace_id: &str,
+        session: runtime::SessionId,
+        generation: i64,
+    ) -> bool {
+        let workspace = if workspace_id == self.active.id {
+            Some(&self.active)
+        } else {
+            self.warm.get(workspace_id)
+        };
+        let submitted_at =
+            workspace.and_then(|workspace| workspace.workspace_ui.last_input_submission(session));
+        ui::fleet::completion_follows_submission(Some(generation), submitted_at)
+    }
+
     fn build_fleet_sessions(&self, text: &i18n::Catalog) -> Vec<crate::fleet::FleetSession> {
         // 브로드캐스트 직후 낙관적 "작업 중" 윈도우. 감지가 따라잡거나 지나면 실제 상태로.
         const BROADCAST_WORKING_WINDOW: std::time::Duration = std::time::Duration::from_secs(8);
@@ -28381,13 +28566,20 @@ impl App {
                             .copied()
                     })
                     .flatten(),
-                    idle_since: (state == AgentVisualState::Idle)
-                        .then(|| {
-                            self.global_turn_done
-                                .get(&(workspace.id.clone(), session))
-                                .copied()
+                    idle_since: self
+                        .global_idle_since
+                        .get(&(workspace.id.clone(), session))
+                        .filter(|clock| {
+                            self.idle_completion_is_current(&workspace.id, session, clock.1)
                         })
-                        .flatten(),
+                        .map(|clock| clock.0),
+                    idle_generation: self
+                        .global_idle_since
+                        .get(&(workspace.id.clone(), session))
+                        .filter(|clock| {
+                            self.idle_completion_is_current(&workspace.id, session, clock.1)
+                        })
+                        .map(|clock| clock.1),
                     workspace_id: workspace.id.clone(),
                     workspace_name: workspace_name.clone(),
                     target: crate::fleet::FleetTarget::Pty {
@@ -28451,6 +28643,7 @@ impl App {
                 waiting_message: None,
                 blocked_since,
                 idle_since: None,
+                idle_generation: None,
                 // PTY 스냅샷이 없어 출력 시각을 알 수 없다 — 멈춤 표시 대상이 아니다.
                 last_output_at: None,
                 // 예약은 WriteInput 경로라 PTY 전용이다(구조화는 steer).
@@ -29432,7 +29625,6 @@ impl eframe::App for App {
         // Shortcut handling may persist config, switch runtimes, or start protocol/process work.
         // Consume egui input here so none of those effects are reachable from the render pass.
         self.flush_queued_pty_adjustments();
-        self.handle_configured_shortcut(ctx);
         if let Some(intent) = self.pending_agent_launcher_intent.take() {
             self.handle_agent_launcher_intent(intent);
         }
@@ -29495,6 +29687,11 @@ impl eframe::App for App {
         );
         self.stage_structured_agent_state(true);
         for notice in self.agent_sessions_ui.drain_status_notices() {
+            self.fleet_ui.observe_structured_status(
+                &notice.session_id,
+                crate::agent_surface::AgentVisualState::from_structured(notice.status),
+                deppy_core::time::unix_secs_i64(),
+            );
             self.notifications_ui.on_structured_status(
                 &notice.workspace_id,
                 &notice.session_id,
@@ -29587,6 +29784,9 @@ impl eframe::App for App {
         self.poll_pending_resume_agent();
         self.poll_pending_document_open();
         self.poll_document_io();
+        // Receive worker-generated confirmations before global keys can act.
+        self.publish_popup_input_fence(ctx);
+        self.handle_configured_shortcut(ctx);
         self.poll_turn_done_clear();
         self.apply_pending_visual_settings(ctx);
         self.poll_worktree_jobs();
@@ -29748,6 +29948,11 @@ impl eframe::App for App {
             }
             if !events.is_empty() {
                 warm_lifecycle_changed = true;
+                self.fleet_ui.observe_runtime_events(
+                    &rt.id,
+                    &events,
+                    deppy_core::time::unix_secs_i64(),
+                );
                 Self::record_activity_events(rt, &events);
                 approval_runtime_events.extend(
                     events
@@ -29875,6 +30080,11 @@ impl eframe::App for App {
                     .flatten()
             });
         if !new_events.is_empty() {
+            self.fleet_ui.observe_runtime_events(
+                &self.active.id,
+                &new_events,
+                deppy_core::time::unix_secs_i64(),
+            );
             Self::record_activity_events(&mut self.active, &new_events);
             for event in &new_events {
                 if let runtime::RuntimeEvent::AgentSpawnResolved { session, .. } = event {
@@ -30025,6 +30235,7 @@ impl eframe::App for App {
 
     // egui 0.35부터 update(&Context) 대신 ui(&mut Ui) 시그니처를 쓴다.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.publish_popup_input_fence(ui.ctx());
         self.frame_stats.begin();
         if let Some(bench) = self.bench.as_mut() {
             bench.frame_begin(ui.ctx());
@@ -31244,7 +31455,39 @@ impl eframe::App for App {
                         .filter(|name| !name.is_empty() && *name != "default")
                         .unwrap_or_default()
                         .to_owned();
-                    self.ws_rename_edit = Some((workspace_id, alias));
+                    if let Some(tree) = self.file_tree.as_mut() {
+                        tree.begin_workspace_rename(workspace_id, alias);
+                        ui.ctx().request_repaint();
+                    }
+                }
+                Some(ui::file_tree::SidebarAction::CommitWorkspaceName { workspace_id, name }) => {
+                    if let Some(row) = self.workspaces.iter().find(|row| row.id == workspace_id) {
+                        let current = if row.name.trim() == "default" {
+                            ""
+                        } else {
+                            row.name.trim()
+                        };
+                        let next = name.trim();
+                        if next != current
+                            && !self.queue_global_settings_action(
+                                &workspace_id,
+                                SettingsJobAction::RenameWorkspace {
+                                    name: next.to_owned(),
+                                },
+                            )
+                        {
+                            let summary = text.t("workspace.rename_ws.failed", &[]);
+                            if summary.len() <= APP_NOTICE_TEXT_MAX_BYTES && !summary.contains('\0')
+                            {
+                                self.stage_workspace_controller_action(
+                                    WorkspaceControllerAction::Notify {
+                                        summary,
+                                        body: "workspace settings worker unavailable".into(),
+                                    },
+                                );
+                            }
+                        }
+                    }
                 }
                 Some(ui::file_tree::SidebarAction::CreateWorkspaceFromPicker) => {
                     self.open_workspace_add_dialog(
@@ -31363,6 +31606,12 @@ impl eframe::App for App {
             Default::default()
         };
 
+        // Sidebar actions can open a modal after the initial UI fence. Publish
+        // its latest state before search, composer and all terminal surfaces.
+        self.publish_popup_input_fence(ui.ctx());
+        self.show_pending_pane_confirmation(ui.ctx(), &text);
+        let background_modal_pending =
+            self.background_modal_pending() || ui::popup::modal_input_blocked(ui.ctx());
         let terminal_visible = central_view == ui::agent_terminal::AgentTerminalView::Terminal;
         // 첨부 pane을 먼저 그리므로 검색 키는 모든 터미널의 raw 입력 처리보다 앞서 소비한다.
         if terminal_visible
@@ -31406,7 +31655,10 @@ impl eframe::App for App {
         self.active.workspace_ui.set_aux_tabs(aux_tabs);
         // 이력·Git 본문이 떠 있는 동안 입력 소유권은 명시적으로 없다(fail-closed) —
         // 타이핑·IME·붙여넣기가 숨은 PTY로 새지 않게 한다.
-        if terminal_visible && !(history_tab_active || git_tab_active || document_tab_active) {
+        if terminal_visible
+            && !background_modal_pending
+            && !(history_tab_active || git_tab_active || document_tab_active)
+        {
             self.frame_terminal_owner = frame_terminal_owner(
                 &self.cross_workspace_pane,
                 true,
@@ -31638,7 +31890,7 @@ impl eframe::App for App {
                             );
                             current_owner = frame_terminal_owner(
                                 &self.cross_workspace_pane,
-                                true,
+                                !background_modal_pending,
                                 &visible_attachment_ids,
                                 |target| {
                                     self.warm.get(&target.workspace_id).is_some_and(|runtime| {
@@ -31904,14 +32156,14 @@ impl eframe::App for App {
                         );
                     }
                 } else {
-                    current_owner = FrameTerminalOwner::Primary;
+                    current_owner = if background_modal_pending { FrameTerminalOwner::None } else { FrameTerminalOwner::Primary };
                     let primary_rect = ui.available_rect_before_wrap();
                     let primary_output = self.active.workspace_ui.show_with_input(
                         ui,
                         &self.config.terminal,
                         &events,
                         &text,
-                        !(history_tab_active || git_tab_active || document_tab_active),
+                        !(background_modal_pending || history_tab_active || git_tab_active || document_tab_active),
                     );
                     primary_focus_requested = primary_output.focus_requested;
                     primary_local_focus_claim = primary_output.local_focus_claimed;
@@ -31953,7 +32205,11 @@ impl eframe::App for App {
                 .take(ui::cross_workspace::HARD_MAX_CROSS_WORKSPACE_PANES),
         );
         // 이력 본문이 떠 있던 프레임은 어떤 pane도 입력 소유자가 아니다.
-        self.frame_terminal_owner = if history_tab_active || git_tab_active || document_tab_active {
+        self.frame_terminal_owner = if background_modal_pending
+            || history_tab_active
+            || git_tab_active
+            || document_tab_active
+        {
             FrameTerminalOwner::None
         } else {
             current_owner
@@ -32426,105 +32682,74 @@ impl eframe::App for App {
         // 강제 팝업이 필요하다고 판단되면 이 호출 한 줄을 되살리면 된다. 상태(pending
         // 목록)는 인박스 카드의 소스로 계속 쓰이므로 set_pending 폴링은 그대로다.
 
+        // Only one queued status notice is rendered in this pass.
         if self.runtime_stream_warning {
-            let mut close = false;
-            egui::Window::new(text.t("runtime.event_overflow.title", &[]))
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ui.ctx(), |ui| {
-                    ui.label(text.t("runtime.event_overflow.body", &[]));
-                    ui.add_space(8.0);
-                    if ui.button(text.t("action.close", &[])).clicked() {
-                        close = true;
-                    }
-                });
-            if close {
+            if ui::popup::information(
+                ui.ctx(),
+                ui::popup::InformationSpec {
+                    id: egui::Id::new("runtime_event_overflow_notice"),
+                    title: &text.t("runtime.event_overflow.title", &[]),
+                    message: &text.t("runtime.event_overflow.body", &[]),
+                    accept_label: &text.t("action.close", &[]),
+                    close_label: &text.t("popup.dismiss", &[]),
+                },
+            ) {
                 self.runtime_stream_warning = false;
             }
-        }
-
-        if let Some(target) = self.warm_limit_warning.clone() {
-            let mut close = false;
-            egui::Window::new(text.t("workspace.warm_limit.title", &[]))
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ui.ctx(), |ui| {
-                    ui.label(text.t(
+        } else if let Some(target) = self.warm_limit_warning.as_deref() {
+            if ui::popup::information(
+                ui.ctx(),
+                ui::popup::InformationSpec {
+                    id: egui::Id::new("workspace_warm_limit_notice"),
+                    title: &text.t("workspace.warm_limit.title", &[]),
+                    message: &text.t(
                         "workspace.warm_limit.body",
                         &[
-                            ("target", &target),
+                            ("target", target),
                             ("limit", &self.config.performance.max_live_warm.to_string()),
                         ],
-                    ));
-                    ui.add_space(8.0);
-                    if ui.button(text.t("action.close", &[])).clicked() {
-                        close = true;
-                    }
-                });
-            if close {
+                    ),
+                    accept_label: &text.t("action.close", &[]),
+                    close_label: &text.t("popup.dismiss", &[]),
+                },
+            ) {
                 self.warm_limit_warning = None;
             }
-        }
-
-        if let Some(warning) = self.cross_workspace_open_warning {
-            let mut close = false;
-            egui::Window::new(text.t("workspace.cross_pane.open_failed.title", &[]))
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ui.ctx(), |ui| {
-                    ui.label(warning.message(&text));
-                    ui.add_space(8.0);
-                    if ui.button(text.t("action.close", &[])).clicked() {
-                        close = true;
-                    }
-                });
-            if close {
-                self.cross_workspace_open_warning = None;
-            }
+        } else if let Some(warning) = self.cross_workspace_open_warning
+            && ui::popup::information(
+                ui.ctx(),
+                ui::popup::InformationSpec {
+                    id: egui::Id::new("workspace_cross_pane_failure_notice"),
+                    title: &text.t("workspace.cross_pane.open_failed.title", &[]),
+                    message: &warning.message(&text),
+                    accept_label: &text.t("action.close", &[]),
+                    close_label: &text.t("popup.dismiss", &[]),
+                },
+            )
+        {
+            self.cross_workspace_open_warning = None;
         }
 
         self.render_workspace_add_dialog(ui.ctx(), &text);
 
         // 「워크스페이스 종료」 확인 모달 — 설정에서 명시적으로 ON한 경우에만 표시한다.
         if let Some((close_id, close_name, total, running)) = self.ws_close_confirm.clone() {
-            let mut decision: Option<bool> = None; // Some(true)=모두 종료, Some(false)=취소
-            egui::Window::new(text.t("workspace.close_ws_confirm.title", &[]))
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ui.ctx(), |ui| {
-                    ui.label(text.t(
-                        "workspace.close_ws_confirm.body",
-                        &[
-                            ("name", close_name.as_str()),
-                            ("count", &total.to_string()),
-                            ("running", &running.to_string()),
-                        ],
-                    ));
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui
-                            .button(text.t("workspace.close_ws_confirm.confirm", &[]))
-                            .clicked()
-                        {
-                            decision = Some(true);
-                        }
-                        if ui.button(text.t("action.cancel", &[])).clicked() {
-                            decision = Some(false);
-                        }
-                    });
-                });
+            let decision = ui::session_close_dialogs::workspace(
+                ui.ctx(),
+                &close_id,
+                &close_name,
+                total,
+                running,
+                &text,
+            );
             match decision {
-                Some(true) => {
+                Some(ui::popup::ConfirmationChoice::Confirm) => {
                     self.ws_close_confirm = None;
                     self.stage_workspace_controller_action(
                         WorkspaceControllerAction::CloseWorkspace(close_id),
                     );
                 }
-                Some(false) => self.ws_close_confirm = None,
+                Some(ui::popup::ConfirmationChoice::Cancel) => self.ws_close_confirm = None,
                 None => {}
             }
         }
@@ -32536,7 +32761,8 @@ impl eframe::App for App {
         // 이어서 그려진다(2026-08-22 리뷰: 여러 문서의 확인이 겹쳐도 먼저 것이 사라지지
         // 않는다). 문구에 파일명을 넣어 "어느 문서" 확인인지 보이게 한다 — 예전엔
         // 제네릭 문구뿐이라 사용자가 대상을 알 수 없었다.
-        if let Some(pending) = self.document_pending_confirms.front().copied() {
+        let document_confirmation_open = self.document_pending_confirms.front().copied();
+        if let Some(pending) = document_confirmation_open {
             let queued_after = self.document_pending_confirms.len() - 1;
             match pending {
                 DocumentPendingConfirm::CloseWithDirty { id } => {
@@ -32546,74 +32772,32 @@ impl eframe::App for App {
                     let save_too_large = document.is_some_and(|document| {
                         document.is_editable() && !document.source_fits_save_limit()
                     });
-                    let mut choice = None;
-                    egui::Window::new(text.t("document.confirm_discard.title", &[]))
-                        .collapsible(false)
-                        .resizable(false)
-                        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                        .show(ui.ctx(), |ui| {
-                            ui.label(text.t("document.confirm_discard.body", &[("name", &name)]));
-                            if queued_after > 0 {
-                                ui.label(text.t(
-                                    "document.confirm_discard.queued",
-                                    &[("count", &queued_after.to_string())],
-                                ));
-                            }
-                            if save_too_large {
-                                ui.label(text.t("document.limit.save_too_large", &[]));
-                            }
-                            ui.add_space(8.0);
-                            ui.horizontal(|ui| {
-                                let save = ui.add_enabled(
-                                    can_save,
-                                    egui::Button::new(text.t("document.confirm_discard.save", &[])),
-                                );
-                                if save.clicked() {
-                                    choice = Some(DocumentConfirmChoice::Save);
-                                }
-                                if ui
-                                    .button(text.t("document.confirm_discard.discard", &[]))
-                                    .clicked()
-                                {
-                                    choice = Some(DocumentConfirmChoice::Discard);
-                                }
-                                if ui
-                                    .button(text.t("document.confirm_discard.cancel", &[]))
-                                    .clicked()
-                                {
-                                    choice = Some(DocumentConfirmChoice::Cancel);
-                                }
-                            });
-                        });
+                    let choice = ui::document_dialogs::dirty(
+                        ui.ctx(),
+                        ui::document_dialogs::DirtyDialog {
+                            target: egui::Id::new(id),
+                            id: egui::Id::new("document_dirty_confirmation"),
+                            name: &name,
+                            queued_after,
+                            can_save,
+                            save_too_large,
+                        },
+                        &text,
+                    );
                     if let Some(choice) = choice {
                         self.apply_document_confirm_choice(choice);
                     }
                 }
                 DocumentPendingConfirm::SaveConflict { id } => {
                     let name = self.document_file_name(id);
-                    let mut decision: Option<bool> = None; // Some(true)=다시 불러오기, Some(false)=취소
-                    egui::Window::new(text.t("document.conflict.title", &[]))
-                        .collapsible(false)
-                        .resizable(false)
-                        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                        .show(ui.ctx(), |ui| {
-                            ui.label(text.t("document.conflict.body", &[("name", &name)]));
-                            if queued_after > 0 {
-                                ui.label(text.t(
-                                    "document.conflict.queued",
-                                    &[("count", &queued_after.to_string())],
-                                ));
-                            }
-                            ui.add_space(8.0);
-                            ui.horizontal(|ui| {
-                                if ui.button(text.t("document.conflict.reload", &[])).clicked() {
-                                    decision = Some(true);
-                                }
-                                if ui.button(text.t("document.conflict.cancel", &[])).clicked() {
-                                    decision = Some(false);
-                                }
-                            });
-                        });
+                    let decision = ui::document_dialogs::conflict(
+                        ui.ctx(),
+                        egui::Id::new("document_conflict_confirmation"),
+                        egui::Id::new(id),
+                        &name,
+                        queued_after,
+                        &text,
+                    );
                     if let Some(reload) = decision {
                         self.apply_document_conflict_choice(reload);
                     }
@@ -32624,165 +32808,29 @@ impl eframe::App for App {
         // 문서 탭 상한 안내(멀티 문서 탭 설계 §4) — clean 비활성 문서가 하나도 없어
         // 자리를 못 만들었을 때만 선다. 확인만 있는 단순 안내라 확인 모달과 달리
         // 액션 분기가 없다.
-        if self.document_cap_notice {
-            let mut acknowledged = false;
-            egui::Window::new(text.t("document.cap.title", &[]))
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ui.ctx(), |ui| {
-                    ui.label(text.t("document.cap.full", &[]));
-                    if ui.button(text.t("action.close", &[])).clicked() {
-                        acknowledged = true;
-                    }
-                });
-            if acknowledged {
+        if document_confirmation_open.is_none() && self.document_cap_notice {
+            if ui::document_dialogs::cap(ui.ctx(), &text) {
                 self.document_cap_notice = false;
             }
-        }
-
-        // 사이드바 「이름 바꾸기」 모달 — 별칭(name 컬럼)만 편집하고 실제 폴더/경로는
-        // 불변. Enter/저장 = 확정, Esc/취소 = 폐기. 빈 값 확정 = 별칭 해제(폴더명 복귀).
-        if let Some((rename_id, mut buf)) = self.ws_rename_edit.take() {
-            // 대상이 사라졌으면(프레임 사이 삭제) 모달을 접는다 — take()가 이미 닫았다.
-            if let Some(row) = self.workspaces.iter().find(|w| w.id == rename_id) {
-                let folder_hint = {
-                    let path = row.path.trim();
-                    (!path.is_empty())
-                        .then(|| std::path::Path::new(path).file_name())
-                        .flatten()
-                        .map(|base| base.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "~".to_owned())
-                };
-                let current_alias = {
-                    let name = row.name.trim();
-                    if name == "default" { "" } else { name }.to_owned()
-                };
-                let mut decision: Option<bool> = None; // Some(true)=저장, Some(false)=취소
-                egui::Window::new(text.t("workspace.rename_ws.title", &[]))
-                    .collapsible(false)
-                    .resizable(false)
-                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                    .show(ui.ctx(), |ui| {
-                        ui.label(text.t("workspace.rename_ws.body", &[("folder", &folder_hint)]));
-                        ui.add_space(4.0);
-                        let edit = ui.add(
-                            egui::TextEdit::singleline(&mut buf)
-                                .hint_text(folder_hint.as_str())
-                                .desired_width(240.0),
-                        );
-                        // 세션 인라인 편집과 같은 관례 — 키가 터미널로 새지 않게 포커스 고정.
-                        edit.request_focus();
-                        ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            if ui
-                                .button(text.t("workspace.rename_ws.confirm", &[]))
-                                .clicked()
-                            {
-                                decision = Some(true);
-                            }
-                            if ui.button(text.t("action.cancel", &[])).clicked() {
-                                decision = Some(false);
-                            }
-                        });
-                        let (enter, esc) = ui.input(|i| {
-                            (
-                                i.key_pressed(egui::Key::Enter),
-                                i.key_pressed(egui::Key::Escape),
-                            )
-                        });
-                        if enter {
-                            decision = Some(true);
-                        } else if esc {
-                            decision = Some(false);
-                        }
-                    });
-                match decision {
-                    Some(true) => {
-                        let next = buf.trim();
-                        // 별칭이 그대로면 DB 쓰기 생략(churn 방지). 실패는 로그 + OS 알림
-                        // 으로 표면화한다 — 조용한 실패 금지.
-                        if next != current_alias
-                            && !self.queue_global_settings_action(
-                                &rename_id,
-                                SettingsJobAction::RenameWorkspace {
-                                    name: next.to_owned(),
-                                },
-                            )
-                        {
-                            let summary = text.t("workspace.rename_ws.failed", &[]);
-                            let body = "workspace settings worker unavailable".to_owned();
-                            if summary.len() <= APP_NOTICE_TEXT_MAX_BYTES
-                                && body.len() <= APP_NOTICE_TEXT_MAX_BYTES
-                                && !summary.contains('\0')
-                            {
-                                self.stage_workspace_controller_action(
-                                    WorkspaceControllerAction::Notify { summary, body },
-                                );
-                            }
-                        }
-                    }
-                    Some(false) => {}
-                    None => self.ws_rename_edit = Some((rename_id, buf)),
+        } else if document_confirmation_open.is_none() && !self.document_cap_notice {
+            // Capture identity at detection; busy admission preserves the same prompt.
+            if let Some(prompt) = self.workspace_rename_prompt.as_ref() {
+                let decision = ui::document_dialogs::moved(
+                    ui.ctx(),
+                    ui::document_dialogs::MovedDialog {
+                        id: egui::Id::new("workspace_folder_moved"),
+                        old: &prompt.old_path,
+                        new: &prompt.new_path,
+                        can_update: !self.settings_snapshot_pending
+                            && self.pending_settings_job.is_none(),
+                        submitting: prompt.submission.is_some(),
+                        failed: prompt.failed,
+                    },
+                    &text,
+                );
+                if let Some(update) = decision {
+                    self.apply_workspace_rename_decision(update);
                 }
-            }
-        }
-
-        // 프로젝트 폴더 rename/이동 감지 → 복구 확인 모달 (사용자 요청 2026-07-08).
-        if let Some((old, new)) = self.workspace_rename_prompt.clone() {
-            let mut decision: Option<bool> = None; // Some(true)=갱신, Some(false)=무시
-            egui::Window::new(text.t("workspace.folder_moved.title", &[]))
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ui.ctx(), |ui| {
-                    ui.label(text.t("workspace.folder_moved.body", &[]));
-                    ui.add_space(4.0);
-                    ui.label(text.t("workspace.folder_moved.from", &[("path", &old)]));
-                    ui.label(text.t("workspace.folder_moved.to", &[("path", &new)]));
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui
-                            .button(text.t("workspace.folder_moved.update", &[]))
-                            .clicked()
-                        {
-                            decision = Some(true);
-                        }
-                        if ui
-                            .button(text.t("workspace.folder_moved.ignore", &[]))
-                            .clicked()
-                        {
-                            decision = Some(false);
-                        }
-                    });
-                });
-            match decision {
-                Some(true) => {
-                    let workspace_id = self.active.id.clone();
-                    let queued = self
-                        .workspace_anchors
-                        .get(&workspace_id)
-                        .copied()
-                        .is_some_and(|expected_anchor| {
-                            self.queue_global_settings_action(
-                                &workspace_id,
-                                SettingsJobAction::AcceptMovedWorkspacePath {
-                                    expected_old_path: old.clone(),
-                                    expected_anchor,
-                                    new_path: std::path::PathBuf::from(&new),
-                                },
-                            )
-                        });
-                    if !queued {
-                        tracing::info!("폴더 이동 프롬프트 stale 또는 worker unavailable");
-                        self.workspace_rename_prompt = None;
-                    }
-                }
-                Some(false) => {
-                    self.dismissed_renames.insert(self.active.id.clone());
-                    self.workspace_rename_prompt = None;
-                }
-                None => {}
             }
         }
 
@@ -33417,29 +33465,6 @@ impl eframe::App for App {
                                     });
                             });
                         });
-                        // Environment 목록 닫기 확인 모달 — 결정만 캡처하고 설정 전용
-                        // 숨김 상태 반영은 클로저 밖에서 처리한다.
-                        if let Some((_, project_name)) = self.env_project_close_confirm.clone() {
-                            egui::Window::new(text.t("env.project_close_confirm.title", &[]))
-                                .collapsible(false)
-                                .resizable(false)
-                                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                                .show(ui.ctx(), |ui| {
-                                    ui.label(text.t(
-                                        "env.project_close_confirm.body",
-                                        &[("name", &project_name)],
-                                    ));
-                                    ui.add_space(8.0);
-                                    ui.horizontal(|ui| {
-                                        if ui.button(text.t("action.close", &[])).clicked() {
-                                            env_project_close_decision = Some(true);
-                                        }
-                                        if ui.button(text.t("action.cancel", &[])).clicked() {
-                                            env_project_close_decision = Some(false);
-                                        }
-                                    });
-                                });
-                        }
                     }
                     C::Agents => {
                         agents_intent = self.agents_ui.contents(ui, &self.agents_snapshot, &text);
@@ -33454,6 +33479,23 @@ impl eframe::App for App {
                         notif_click = self.notifications_ui.contents(ui, &text);
                     }
                     _ => {}
+                }
+                // Paint settings confirmations outside category contents so they
+                // retain their target even if the displayed category changes.
+                if let Some((project_id, project_name)) = self.env_project_close_confirm.as_ref() {
+                    env_project_close_decision = ui::environment_dialogs::project_close(
+                        ui.ctx(),
+                        project_id,
+                        project_name,
+                        &text,
+                    );
+                } else if cat != C::Environment {
+                    self.env_profiles_ui.render_pending_confirmation(
+                        ui.ctx(),
+                        &self.env_profiles_snapshot,
+                        &text,
+                        &mut env_action,
+                    );
                 }
             },
         );
@@ -35342,6 +35384,74 @@ fn pty_shortcut_missing_feedback(
 
 #[cfg(test)]
 mod tests {
+    fn folder_prompt_fixture() -> WorkspaceRenamePrompt {
+        WorkspaceRenamePrompt {
+            workspace_id: "b".into(),
+            old_path: "/old/b".into(),
+            new_path: "/new/b".into(),
+            expected_anchor: storage::WorkspaceFolderAnchor { dev: 1, ino: 2 },
+            submission: Some(SettingsOperationKey {
+                generation: 3,
+                revision: 4,
+                workspace_id: "b".into(),
+            }),
+            failed: false,
+        }
+    }
+
+    #[test]
+    fn document_popups_old_move_outcome_does_not_clear_new_prompt() {
+        let mut prompt = Some(folder_prompt_fixture());
+        for operation in [
+            SettingsOperationKey {
+                generation: 3,
+                revision: 4,
+                workspace_id: "a".into(),
+            },
+            SettingsOperationKey {
+                generation: 3,
+                revision: 2,
+                workspace_id: "b".into(),
+            },
+            SettingsOperationKey {
+                generation: 2,
+                revision: 4,
+                workspace_id: "b".into(),
+            },
+        ] {
+            settle_workspace_rename_prompt(
+                &mut prompt,
+                &operation,
+                &Ok(storage::WorkspaceMovedPathUpdate::Updated),
+            );
+            assert_eq!(prompt.as_ref().unwrap().old_path, "/old/b");
+            assert!(prompt.as_ref().unwrap().submission.is_some());
+        }
+        let operation = prompt.as_ref().unwrap().submission.clone().unwrap();
+        settle_workspace_rename_prompt(
+            &mut prompt,
+            &operation,
+            &Ok(storage::WorkspaceMovedPathUpdate::Updated),
+        );
+        assert!(prompt.is_none());
+    }
+
+    #[test]
+    fn document_popups_failed_move_preserves_captured_paths_and_allows_retry() {
+        let mut prompt = Some(folder_prompt_fixture());
+        let operation = prompt.as_ref().unwrap().submission.clone().unwrap();
+        settle_workspace_rename_prompt(
+            &mut prompt,
+            &operation,
+            &Err(SettingsErrorCode::WorkspaceMutation),
+        );
+        let prompt = prompt.unwrap();
+        assert_eq!(prompt.workspace_id, "b");
+        assert_eq!(prompt.old_path, "/old/b");
+        assert_eq!(prompt.new_path, "/new/b");
+        assert_eq!(prompt.expected_anchor.ino, 2);
+        assert!(prompt.submission.is_none() && prompt.failed);
+    }
     #[test]
     fn second_review_숨은_터미널의_완료는_읽음_처리하지_않는다() {
         use ui::agent_terminal::AgentTerminalView as V;
@@ -36012,31 +36122,101 @@ mod tests {
     }
 
     #[test]
+    fn popup_audit_folder_reopen_shows_launcher_even_when_previously_seen() {
+        use egui_kittest::kittest::Queryable;
+        let mut launcher = ui::agent_launcher::AgentLauncherUi::new();
+        let mut seen = std::collections::HashSet::from(["project".to_owned()]);
+        assert!(offer_workspace_launcher(
+            &mut launcher,
+            &mut seen,
+            "project",
+            "Selected Project".to_owned(),
+            false,
+            true,
+        ));
+        assert!(launcher.is_open_for("project"));
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui,
+             state: &mut (
+                ui::agent_launcher::AgentLauncherUi,
+                Vec<ui::agent_launcher::AgentLauncherIntent>,
+            )| {
+                if let Some(intent) = state.0.show(ui.ctx(), None, false, &catalog, &[]) {
+                    state.1.push(intent);
+                }
+            },
+            (launcher, Vec::new()),
+        );
+        harness.run();
+        harness
+            .get_by_label(&catalog.t("agent_launcher.blank_terminal", &[]))
+            .click();
+        harness.run();
+        assert!(harness.state().1.iter().any(|intent| matches!(
+            intent, ui::agent_launcher::AgentLauncherIntent::BlankTerminal { workspace_id } if workspace_id == "project"
+        )));
+    }
+
+    #[test]
+    fn popup_audit_automatic_launcher_stays_once_and_pending_launch_is_preserved() {
+        let mut launcher = ui::agent_launcher::AgentLauncherUi::new();
+        let mut seen = std::collections::HashSet::new();
+        assert!(offer_workspace_launcher(
+            &mut launcher,
+            &mut seen,
+            "new",
+            "New".into(),
+            false,
+            false
+        ));
+        launcher.launch_succeeded();
+        assert!(!offer_workspace_launcher(
+            &mut launcher,
+            &mut seen,
+            "new",
+            "New".into(),
+            false,
+            false
+        ));
+        assert!(!launcher.is_open_for("new"));
+        assert!(!offer_workspace_launcher(
+            &mut launcher,
+            &mut seen,
+            "new",
+            "New".into(),
+            true,
+            true
+        ));
+        assert!(!launcher.is_open_for("new"));
+    }
+
+    #[test]
     fn launcher_spawn_created_workspace_waits_for_its_launcher() {
         let mut launcher = ui::agent_launcher::AgentLauncherUi::new();
-        launcher.open_for("new".to_owned(), "Project".to_owned());
-        assert!(!should_bootstrap_created_workspace_shell(
-            true,
-            true,
-            launcher.is_open_for("new")
+        let mut seen = std::collections::HashSet::new();
+        assert!(offer_workspace_launcher(
+            &mut launcher,
+            &mut seen,
+            "new",
+            "Project".into(),
+            false,
+            true
         ));
-        assert!(should_bootstrap_created_workspace_shell(
-            true,
-            true,
-            launcher.is_open_for("other")
-        ));
-        assert!(!should_bootstrap_created_workspace_shell(
-            false, true, false
-        ));
+        assert!(launcher.is_open_for("new"));
+        assert!(!launcher.is_open_for("other"));
     }
 
     #[test]
     fn launcher_spawn_failed_workspace_switch_does_not_create_shell_in_previous_workspace() {
-        assert!(!should_bootstrap_created_workspace_shell(
-            true, false, false
-        ));
-        assert!(!should_bootstrap_created_workspace_shell(true, false, true));
-        assert!(should_bootstrap_created_workspace_shell(true, true, false));
+        assert_eq!(
+            workspace_session_open_step("new", "previous", true, false),
+            WorkspaceSessionOpenStep::Switch
+        );
+        assert_eq!(
+            workspace_session_open_step("new", "previous", true, true),
+            WorkspaceSessionOpenStep::Reject
+        );
     }
 
     #[test]
@@ -39624,7 +39804,7 @@ mod tests {
             .unwrap()
             .0;
         assert!(
-            render.contains("if terminal_visible && !(history_tab_active || git_tab_active || document_tab_active) {"),
+            squeeze_ws(render).contains("if terminal_visible && !background_modal_pending && !(history_tab_active || git_tab_active || document_tab_active) {"),
             "이력·Git 활성 프레임은 터미널 입력 소유자를 잡으면 안 된다"
         );
         assert!(
@@ -41001,7 +41181,7 @@ mod tests {
             .expect("conflict modal 경계가 있어야 한다")
             .0;
         assert!(
-            modal.contains("document.limit.save_too_large"),
+            modal.contains("save_too_large,"),
             "dirty close에도 같은 초과 이유를 보여줘야 한다"
         );
         assert!(
@@ -41013,7 +41193,7 @@ mod tests {
             "일반 can_save는 saving 중 false라 dirty-close modal에 직접 쓰면 안 된다"
         );
         assert!(
-            modal.contains("ui.add_enabled(") && modal.contains("can_save,"),
+            modal.contains("ui::document_dialogs::dirty(") && modal.contains("can_save,"),
             "dirty close Save 버튼은 계산한 modal 자격으로 비활성화해야 한다"
         );
     }
@@ -45431,6 +45611,158 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
+    fn settings_workspace_find_or_create_reopens_folder_after_device_renumbering() {
+        let db_path = temp_db_path("settings-workspace-remount");
+        let workspace_path =
+            temp_db_path("settings-workspace-remount-directory").with_extension("dir");
+        std::fs::create_dir(&workspace_path).unwrap();
+        let path_string = workspace_path.to_str().unwrap();
+        let identity = crate::folder_identity::probe(&workspace_path).unwrap();
+        let (dev, ino) = (identity.anchor.dev, identity.anchor.ino);
+        let volume = identity.volume.expect("macOS test directory volume UUID");
+        let mut db = storage::Db::open(&db_path).unwrap();
+        let existing = db
+            .find_or_create_workspace_by_exact_path_with_volume(
+                "custom name",
+                path_string,
+                storage::WorkspaceFolderAnchor { dev: dev ^ 1, ino },
+                Some(volume),
+            )
+            .unwrap();
+        let outcome = execute_settings_job(
+            &mut db,
+            &db_path,
+            &secret::RedactionService::new(),
+            SettingsJob {
+                generation: 1,
+                revision: 1,
+                workspace_id: existing.row.id.clone(),
+                project_root: None,
+                action: SettingsJobAction::FindOrCreateWorkspace {
+                    name: "ignored".to_owned(),
+                    path: workspace_path.clone(),
+                    purpose: WorkspaceMutationPurpose::AddSwitchRuntime,
+                },
+            },
+        );
+        let stored_anchor = db.workspace_anchor(&existing.row.id).unwrap();
+        let count = db.list_workspaces().unwrap().len();
+        drop(db);
+        remove_sqlite_files(&db_path);
+        std::fs::remove_dir(workspace_path).unwrap();
+        match outcome.kind {
+            SettingsOutcomeKind::WorkspaceFoundOrCreated {
+                purpose: WorkspaceMutationPurpose::AddSwitchRuntime,
+                result: Ok(result),
+            } => {
+                assert!(!result.created);
+                assert_eq!(result.row.id, existing.row.id);
+                assert_eq!(result.row.name, "custom name");
+                assert_eq!(stored_anchor, Some((dev, ino)));
+                assert_eq!(count, 1);
+            }
+            _ => panic!("selected existing folder must reopen after mount device changes"),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn popup_review_settings_worker_rejects_unverified_or_different_volume() {
+        for different_uuid in [false, true] {
+            let db_path = temp_db_path("settings-volume-conflict");
+            let workspace_path = temp_db_path("settings-volume-directory").with_extension("dir");
+            std::fs::create_dir(&workspace_path).unwrap();
+            let identity = crate::folder_identity::probe(&workspace_path).unwrap();
+            let stored = storage::WorkspaceFolderAnchor {
+                dev: identity.anchor.dev ^ 1,
+                ino: identity.anchor.ino,
+            };
+            let mut db = storage::Db::open(&db_path).unwrap();
+            let existing = db
+                .find_or_create_workspace_by_exact_path_with_volume(
+                    "preserved alias",
+                    workspace_path.to_str().unwrap(),
+                    stored,
+                    different_uuid.then(uuid::Uuid::new_v4),
+                )
+                .unwrap();
+            let outcome = execute_settings_job(
+                &mut db,
+                &db_path,
+                &secret::RedactionService::new(),
+                SettingsJob {
+                    generation: 1,
+                    revision: 1,
+                    workspace_id: existing.row.id.clone(),
+                    project_root: None,
+                    action: SettingsJobAction::FindOrCreateWorkspace {
+                        name: "replacement".into(),
+                        path: workspace_path.clone(),
+                        purpose: WorkspaceMutationPurpose::AddSwitchRuntime,
+                    },
+                },
+            );
+            assert!(matches!(
+                outcome.kind,
+                SettingsOutcomeKind::WorkspaceFoundOrCreated {
+                    result: Err(SettingsErrorCode::WorkspaceIdentity),
+                    ..
+                }
+            ));
+            assert_eq!(
+                db.workspace_anchor(&existing.row.id).unwrap(),
+                Some((stored.dev, stored.ino))
+            );
+            let rows = db.list_workspaces().unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].name, "preserved alias");
+            let rebound = execute_settings_job(
+                &mut db,
+                &db_path,
+                &secret::RedactionService::new(),
+                SettingsJob {
+                    generation: 1,
+                    revision: 2,
+                    workspace_id: existing.row.id.clone(),
+                    project_root: None,
+                    action: SettingsJobAction::SetProjectPath {
+                        path: workspace_path.clone(),
+                    },
+                },
+            );
+            assert!(matches!(
+                rebound.kind,
+                SettingsOutcomeKind::ProjectPathSet(Ok(_))
+            ));
+            let reopened = execute_settings_job(
+                &mut db,
+                &db_path,
+                &secret::RedactionService::new(),
+                SettingsJob {
+                    generation: 1,
+                    revision: 3,
+                    workspace_id: existing.row.id.clone(),
+                    project_root: None,
+                    action: SettingsJobAction::FindOrCreateWorkspace {
+                        name: "replacement".into(),
+                        path: workspace_path.clone(),
+                        purpose: WorkspaceMutationPurpose::AddSwitchRuntime,
+                    },
+                },
+            );
+            assert!(
+                matches!(reopened.kind, SettingsOutcomeKind::WorkspaceFoundOrCreated {
+                result: Ok(ref result), ..
+            } if result.row.id == existing.row.id && !result.created)
+            );
+            drop(db);
+            remove_sqlite_files(&db_path);
+            std::fs::remove_dir(workspace_path).unwrap();
+        }
+    }
+
+    #[test]
     fn settings_workspace_find_or_create는_exact_path를_재사용한다() {
         let db_path = temp_db_path("settings-workspace-find-create");
         let workspace_path = temp_db_path("settings-workspace-directory").with_extension("dir");
@@ -49012,5 +49344,127 @@ mod tests {
             body.contains("self.config.ui.workspace_order.len() != order_before"),
             "순서 목록이 줄어든 것만으로는 config를 저장하지 않는다"
         );
+    }
+}
+
+#[cfg(test)]
+mod popup_behavior_connector_probes {
+    use connector_contract::{
+        ApprovalPrompt, ApprovalReason, ConnectorIntent, ConnectorSnapshot, OperationId, ServerId,
+    };
+    use egui_kittest::kittest::Queryable;
+
+    #[test]
+    fn popup_behavior_connector_approval_focus_ids_are_bounded() {
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        let labels = [
+            "connectors.allow_once",
+            "connectors.allow_always",
+            "connectors.deny_once",
+            "connectors.deny_always",
+        ]
+        .map(|key| catalog.t(key, &[]));
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(900.0, 720.0))
+            .build_ui_state(
+                |ui, state: &mut (connector_ui::ConnectorUi, ConnectorSnapshot)| {
+                    let _ = state.0.render(ui, &state.1);
+                },
+                (
+                    connector_ui::ConnectorUi::new(&catalog),
+                    ConnectorSnapshot::default(),
+                ),
+            );
+        let mut button_ids = std::collections::HashSet::new();
+        for request in 0..20 {
+            harness.state_mut().1.approval = Some(ApprovalPrompt {
+                operation_id: OperationId::new(format!("request-{request}")),
+                server_id: ServerId::new("server"),
+                server_name: "Server".into(),
+                tool_name: "Tool".into(),
+                arguments_preview: "{}".into(),
+                reason: ApprovalReason::AskRule,
+            });
+            harness.run();
+            for label in &labels {
+                harness.get_by_label(label).focus();
+                harness.run();
+                button_ids.insert(harness.ctx.memory(|memory| memory.focused()).unwrap());
+            }
+        }
+        assert!(
+            button_ids.len() <= 8,
+            "approval buttons retained {} distinct focus IDs",
+            button_ids.len()
+        );
+    }
+    #[test]
+    fn popup_behavior_probe_next_connector_approval_does_not_inherit_allow_focus() {
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        let allow = catalog.t("connectors.allow_once", &[]);
+        let approval = |name: &str| ApprovalPrompt {
+            operation_id: OperationId::new(name),
+            server_id: ServerId::new("server"),
+            server_name: "Server".into(),
+            tool_name: format!("Tool {name}"),
+            arguments_preview: "{}".into(),
+            reason: ApprovalReason::AskRule,
+        };
+        let snapshot = ConnectorSnapshot {
+            approval: Some(approval("first")),
+            ..Default::default()
+        };
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(900.0, 720.0))
+            .build_ui_state(
+                |ui,
+                 state: &mut (
+                    connector_ui::ConnectorUi,
+                    ConnectorSnapshot,
+                    Option<ConnectorIntent>,
+                )| {
+                    let intent = state.0.render(ui, &state.1);
+                    if intent.is_some() {
+                        state.2 = intent;
+                    }
+                },
+                (connector_ui::ConnectorUi::new(&catalog), snapshot, None),
+            );
+        harness.run();
+        harness.get_by_label(&allow).focus();
+        harness.run();
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+        assert!(
+            matches!(harness.state().2.as_ref(),Some(ConnectorIntent::ResolveApproval{operation_id,..}) if operation_id.as_str()=="first")
+        );
+        harness.state_mut().2 = None;
+        harness.state_mut().1.approval = Some(approval("second"));
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+        if let Some(ConnectorIntent::ResolveApproval {
+            operation_id,
+            decision,
+        }) = harness.state().2.as_ref()
+        {
+            println!(
+                "next approval after bare Enter: operation={} decision={decision:?}",
+                operation_id.as_str()
+            );
+            assert_eq!(operation_id.as_str(), "second");
+        }
+        assert!(
+            harness.state().2.is_none(),
+            "new approval must not inherit previous operation's allow-button focus"
+        );
+        harness.get_by_label(&allow).focus();
+        harness.run();
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+        assert!(matches!(
+            harness.state().2.as_ref(),
+            Some(ConnectorIntent::ResolveApproval { operation_id, decision: connector_contract::ApprovalDecision::AllowOnce })
+                if operation_id.as_str() == "second"
+        ));
     }
 }

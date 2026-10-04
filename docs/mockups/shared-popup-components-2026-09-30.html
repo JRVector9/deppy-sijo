@@ -59,6 +59,14 @@
     .overlay { position: absolute; inset: 0; display: grid; place-items: center; padding: 26px; background: rgba(8, 10, 13, .71); }
     .overlay.hidden { display: none; }
     .overlay.popover-mode { place-items: start end; padding: 78px 46px; background: rgba(8, 10, 13, .18); }
+    .overlay.inline-mode { place-items: start; padding: 75px 32px; background: var(--bg); }
+    .inline-mode .modal { background: transparent; border: 0; box-shadow: none; }
+    .inline-mode .modal-head, .inline-mode .modal-footer { display: none; }
+    .inline-mode .modal-body { padding: 0; }
+    .workspace-row { height: 29px; display: flex; align-items: center; gap: 8px; padding: 0 8px; background: var(--raised); border-radius: 3px; }
+    .workspace-row input { flex: 1; min-width: 0; border: 0; background: transparent; padding: 0; color: var(--text); font-family: inherit; font-size: 14px; outline: none; }
+    .workspace-row span { color: var(--muted); font-size: 12px; }
+    .inline-help { margin-top: 12px; color: var(--muted); font-size: 11px; line-height: 1.6; }
     .overlay.menu-mode .modal-head, .overlay.menu-mode .modal-footer { display: none; }
     .overlay.menu-mode .modal-body { padding: 6px; }
     .overlay.menu-mode .menu { width: 100%; padding: 0; border: 0; background: transparent; box-shadow: none; }
@@ -69,9 +77,9 @@
     .icon-button { position: absolute; top: 15px; right: 16px; width: 30px; height: 30px; display: grid; place-items: center; border: 1px solid transparent; border-radius: var(--radius); background: transparent; color: var(--muted); }
     .icon-button:hover { border-color: var(--line); background: var(--raised); color: var(--text); }
     .modal-body { padding: 18px 22px 21px; overflow: auto; }
-    .modal-footer { display: flex; align-items: center; justify-content: flex-end; gap: 8px; padding: 12px 22px; border-top: 1px solid var(--line); background: #1b1e24; }
+    .modal-footer { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; padding: 12px 22px; border-top: 1px solid var(--line); background: #1b1e24; }
     .modal-footer .footnote { margin-right: auto; color: var(--muted); font-size: 11px; }
-    .btn { min-height: 34px; padding: 6px 13px; border: 1px solid var(--line); border-radius: var(--radius); color: var(--text); background: var(--raised); white-space: nowrap; }
+    .btn { min-height: 34px; padding: 6px 13px; border: 1px solid var(--line); border-radius: var(--radius); color: var(--text); background: var(--raised); max-width: 100%; white-space: normal; overflow-wrap: anywhere; flex: 0 0 auto; }
     .btn:hover { background: var(--hover); }
     .btn.primary { border-color: var(--accent); background: var(--accent); color: #0d1c21; font-weight: 700; }
     .btn.primary:hover { background: #62c9dd; }
@@ -106,6 +114,12 @@
     .menu-item .shortcut { margin-left: auto; color: var(--muted); font-size: 11px; }
     .menu-item.red { color: var(--danger); }
     .menu-rule { height: 1px; margin: 5px 4px; background: var(--line); }
+    .port-row { padding: 11px; margin-top: 7px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--bg); }
+    .port-row strong, .port-row span, .port-row code { display: block; overflow-wrap: anywhere; }
+    .port-row strong { font-size: 13px; }
+    .port-row span { margin-top: 5px; font-size: 12px; color: var(--muted); }
+    .port-row code { margin-top: 5px; font: 11px/1.5 Menlo, Monaco, monospace; color: var(--muted); }
+    .port-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin-top: 8px; }
     .closed { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); text-align: center; color: var(--muted); }
     .closed .btn { margin-top: 12px; }
     .inspector { padding: 22px 20px; border-left: 1px solid var(--line); background: var(--surface); }
@@ -156,7 +170,7 @@
         <div class="closed" id="closed" hidden>팝업을 닫았습니다.<br><button class="btn" id="reopen" type="button">다시 열기</button></div>
         <div class="toast" id="toast" role="status" aria-live="polite"></div>
       </section>
-      <section class="inventory" id="inventory"><h2>현재 코드의 팝업·확인·별도 창 목록 <span class="case-count" id="case-count"></span></h2><p>각 행의 ‘현재 방식’은 실제 앱 코드를 기준으로 적었습니다. 보통의 휴지통 이동에는 별도 확인창이 없고, 실패 후 영구 삭제할 때만 패널 안에서 확인합니다.</p><div class="inventory-wrap"><table><thead><tr><th>번호</th><th>영역</th><th>케이스</th><th>현재 방식</th><th>코드 위치</th></tr></thead><tbody id="case-rows"></tbody></table></div></section>
+<section class="inventory" id="inventory"><h2>현재 코드의 팝업·확인·별도 창 목록 <span class="case-count" id="case-count"></span></h2><p>각 행의 ‘현재 방식’은 실제 앱 코드를 기준으로 적었습니다. 보통의 휴지통 이동에는 별도 확인창이 없고, 실패 후 영구 삭제할 때만 공용 확인 팝업을 표시합니다. 04번 이름 바꾸기는 행 안 편집으로 복원했습니다.</p><div class="inventory-wrap"><table><thead><tr><th>번호</th><th>영역</th><th>케이스</th><th>현재 방식</th><th>코드 위치</th></tr></thead><tbody id="case-rows"></tbody></table></div></section>
     </main>
     <aside class="inspector" aria-label="컴포넌트 규칙"><div class="eyebrow">Component contract</div><h2>하나의 팝업 언어</h2><p>새 기능마다 창의 폭, 글자 크기, 버튼 위치를 새로 정하지 않도록 기본값을 묶습니다.</p>
       <div class="spec"><span>기본 폭</span><code>480 px</code></div><div class="spec"><span>짧은 확인</span><code>400 px</code></div><div class="spec"><span>긴 양식</span><code>560 px</code></div><div class="spec"><span>제목 / 본문</span><code>18 / 13 px</code></div><div class="spec"><span>레이블 / 안내</span><code>12 / 11 px</code></div><div class="spec"><span>본문 여백</span><code>22 px</code></div><div class="spec"><span>입력 / 버튼 높이</span><code>36 / 34 px</code></div><div class="spec"><span>메뉴 행</span><code>34 px</code></div><div class="spec"><span>키보드</span><code>Tab · Enter · Esc</code></div>
@@ -165,8 +179,8 @@
   </div>
   <script>
     const views = {
-      workspace: { width: 560, title: '워크스페이스 추가', subtitle: '기존 폴더를 선택하거나 GitHub 저장소를 이 Mac에 복제합니다.', body: `<div class="segmented" aria-label="추가 방식"><button type="button" data-source="local" aria-pressed="false">내 폴더</button><button type="button" data-source="github" aria-pressed="true">GitHub 저장소</button></div><div data-source-fields="local" hidden><div class="field"><label for="local-path">프로젝트 폴더</label><div class="field-row"><input id="local-path" value="/Users/jr/Projects/Serenity" readonly><button class="btn" type="button" data-toast="Finder 폴더 선택기가 열리는 자리입니다.">찾아보기…</button></div><div class="field-hint">선택한 폴더를 그대로 워크스페이스로 엽니다.</div></div></div><div data-source-fields="github"><div class="field"><label for="repo">저장소 URL</label><input id="repo" placeholder="https://github.com/owner/repo" value="https://github.com/example/serenity"><div class="field-hint">지원 형식: GitHub HTTPS 또는 SSH 주소</div></div><div class="field"><label for="destination">저장 위치</label><div class="field-row"><input id="destination" value="/Users/jr/Projects" readonly><button class="btn" type="button" data-toast="폴더 선택기가 열리는 자리입니다.">찾아보기…</button></div></div><div class="field"><label for="folder">폴더 이름</label><input id="folder" value="serenity"></div><div class="notice"><span class="symbol">ⓘ</span><span>저장소를 로컬에 복제한 뒤, 해당 폴더를 워크스페이스로 엽니다.</span></div></div>`, footer: `<span class="footnote">Esc 닫기 · Enter 실행</span><button class="btn ghost" type="button" data-close>취소</button><button class="btn primary" type="button" data-toast="복제 작업이 시작되는 자리입니다.">복제하고 열기</button>` },
-      folder: { width: 420, title: '새 폴더 만들기', subtitle: '현재 폴더 안에 새 폴더를 만듭니다.', body: `<div class="field"><label for="new-folder">폴더 이름</label><input id="new-folder" value="새 폴더" autofocus><div class="field-hint">Serenity / assets</div></div>`, footer: `<span class="footnote">Enter 만들기</span><button class="btn ghost" type="button" data-close>취소</button><button class="btn primary" type="button" data-toast="새 폴더가 만들어지는 자리입니다.">만들기</button>` },
+      workspace: { width: 560, title: '워크스페이스 추가', subtitle: '기존 폴더를 선택하거나 GitHub 저장소를 이 Mac에 복제합니다.', body: `<div class="segmented" aria-label="추가 방식"><button type="button" data-source="local" aria-pressed="false">내 폴더</button><button type="button" data-source="github" aria-pressed="true">GitHub 저장소</button></div><div data-source-fields="local" hidden><div class="notice" style="margin-top:0"><span class="symbol">ⓘ</span><span>기존 폴더를 워크스페이스로 엽니다. 같은 경로라도 다른 볼륨이면 자동 연결하지 않습니다. 확인할 수 없으면 설정에서 프로젝트 경로를 다시 연결합니다.</span></div></div><div data-source-fields="github"><div class="field"><label for="repo">저장소 URL</label><input id="repo" placeholder="https://github.com/owner/repo" value="https://github.com/example/serenity"><div class="field-hint">지원 형식: GitHub HTTPS 또는 SSH 주소</div></div><div class="field"><label for="destination">저장 위치</label><div class="field-row"><input id="destination" value="/Users/jr/Projects"><button class="btn" type="button" data-toast="폴더 선택기가 열리는 자리입니다.">찾아보기…</button></div></div><div class="field"><label for="folder">폴더 이름</label><input id="folder" value="serenity"></div><div class="notice"><span class="symbol">ⓘ</span><span>저장소를 로컬에 복제한 뒤, 해당 폴더를 워크스페이스로 엽니다.</span></div></div>`, footer: `<span class="footnote">Esc 닫기</span><button class="btn ghost" type="button" data-close>취소</button><button class="btn primary" type="button" data-toast="복제 작업이 시작되는 자리입니다.">복제하고 열기</button>` },
+      folder: { width: 420, title: '새 폴더 만들기', subtitle: '현재 폴더 안에 새 폴더를 만듭니다.', body: `<div class="field"><label for="new-folder">폴더 이름</label><input id="new-folder" value="새 폴더" autofocus><div class="field-hint">Serenity / assets</div></div>`, footer: `<span class="footnote">Enter 만들기 · Esc 닫기</span><button class="btn ghost" type="button" data-close>취소</button><button class="btn primary" type="button" data-toast="새 폴더가 만들어지는 자리입니다.">만들기</button>` },
       followup: { width: 480, title: '다음 단계 예약', subtitle: '이 턴이 끝나면 선택한 에이전트에게 이어서 보냅니다.', body: `<div class="field"><label for="target">대상 세션</label><select id="target"><option>Serenity / Claude · Opus 5.5</option></select></div><div class="field"><label for="prompt">다음에 시킬 일</label><textarea id="prompt" placeholder="예: 서버 오류를 수정한 뒤 관련 테스트를 실행해줘"></textarea><div class="field-hint">에이전트가 질문으로 멈춘 경우에는 보내지 않고 기다립니다.</div></div>`, footer: `<span class="footnote">입력은 이 세션에만 예약됩니다.</span><button class="btn ghost" type="button" data-close>취소</button><button class="btn primary" type="button" data-toast="다음 단계가 예약되는 자리입니다.">예약</button>` },
       delete: { width: 400, title: '영구 삭제 확인', subtitle: '휴지통으로 이동하지 못한 항목에만 표시됩니다.', body: `<div class="inline-path">Serenity / assets / old-icons</div><div class="notice danger-note"><span class="symbol">!</span><span>이 폴더와 안의 모든 항목을 영구 삭제합니다. 휴지통에서 되돌릴 수 없습니다.</span></div>`, footer: `<button class="btn ghost" type="button" data-close>취소</button><button class="btn danger" type="button" data-toast="영구 삭제 요청을 보내는 자리입니다.">영구 삭제</button>` },
       menu: { width: 350, title: '파일 트리 상황 메뉴', subtitle: '우클릭과 더보기 버튼이 같은 메뉴 행을 사용합니다.', body: `<div class="group-label">파일 트리</div><div class="menu" role="menu"><button class="menu-item" role="menuitem" type="button" data-toast="복사 명령"><span>복사</span><span class="shortcut">⌘ C</span></button><button class="menu-item" role="menuitem" type="button" data-toast="붙여넣기 명령"><span>붙여넣기</span><span class="shortcut">⌘ V</span></button><button class="menu-item" role="menuitem" type="button" data-toast="Finder에서 보기"><span>Finder에서 보기</span></button><div class="menu-rule"></div><button class="menu-item red" role="menuitem" type="button" data-toast="휴지통 이동 요청을 보내는 자리입니다."><span>휴지통으로 이동</span><span class="shortcut">⌘ ⌫</span></button></div><div class="field-hint" style="margin:10px">휴지통 이동은 바로 요청합니다. 실패 후 영구 삭제만 따로 확인합니다.</div>`, footer: '', presentation: 'menu' }
@@ -175,39 +189,39 @@
     const confirm = (title, subtitle, detail, accept, tone = 'danger') => ({ width: 400, title, subtitle, body: `<div class="notice ${tone === 'danger' ? 'danger-note' : ''}"><span class="symbol">${tone === 'danger' ? '!' : 'ⓘ'}</span><span>${detail}</span></div>`, footer: buttons(accept, tone) });
     const info = (title, subtitle, detail) => ({ width: 420, title, subtitle, body: `<div class="notice"><span class="symbol">ⓘ</span><span>${detail}</span></div>`, footer: `<button class="btn primary" type="button" data-close>확인</button>` });
     Object.assign(views, {
-      file: { width: 420, title: '새 파일 만들기', subtitle: '현재 폴더 안에 새 파일을 만듭니다.', body: `<div class="field"><label for="new-file">파일 이름</label><input id="new-file" value="notes.md"><div class="field-hint">Serenity / docs</div></div>`, footer: buttons('만들기') },
+      file: { width: 420, title: '새 파일 만들기', subtitle: '현재 폴더 안에 새 파일을 만듭니다.', body: `<div class="field"><label for="new-file">파일 이름</label><input id="new-file" value="notes.md"><div class="field-hint">Serenity / docs</div></div>`, footer: `<span class="footnote">Enter 만들기 · Esc 닫기</span>${buttons('만들기')}` },
       session_close: confirm('실행 중인 세션 닫기', 'Serenity / 셀 2 · Claude Code', '이 셀의 실행 중인 세션이 종료됩니다. 계속할까요?', '세션 닫기'),
       workspace_close: confirm('워크스페이스 종료', 'Serenity · 세션 3개 중 실행 중 2개', '세션 3개를 모두 종료합니다. 워크스페이스 자체는 삭제되지 않습니다. 이 확인은 설정에서 켰을 때 표시됩니다.', '모두 종료'),
-      env_project_close: confirm('환경 및 API 프로젝트 닫기', 'Serenity 프로젝트를 목록에서 닫습니다.', '사이드바 워크스페이스와 실행 중인 세션은 유지됩니다.', '목록에서 닫기', 'primary'),
-      rename_workspace: { width: 420, title: '워크스페이스 이름 바꾸기', subtitle: '표시 이름만 바꿉니다. 실제 폴더 경로는 유지됩니다.', body: `<div class="field"><label for="alias">표시 이름</label><input id="alias" value="Serenity"><div class="field-hint">원래 폴더 이름: serenity</div></div>`, footer: buttons('저장') },
+      env_project_close: confirm('환경 및 API 프로젝트 닫기', 'Serenity', '\'Serenity\' 프로젝트를 환경 및 API 목록에서 닫을까요? 사이드바 워크스페이스와 실행 중인 세션은 유지됩니다.', '닫기', 'primary'),
+      rename_workspace: { width: 280, title: '워크스페이스 이름 바꾸기', subtitle: '워크스페이스 행에서 바로 편집합니다.', body: `<div class="workspace-row"><span aria-hidden="true">▾</span><input id="alias" aria-label="워크스페이스 표시 이름" value="Serenity"></div><div class="inline-help">행에서 커서를 두고 변경합니다.<br>Enter 저장 · Esc 또는 행 밖 클릭 취소<br>실제 폴더 경로는 그대로 유지됩니다.</div>`, footer: '', presentation: 'inline' },
       credential_edit: { width: 480, title: 'API 키 수정', subtitle: '제공자와 레이블을 바꾸거나 비밀 값을 새로 입력합니다.', body: `<div class="field"><label for="provider">제공자</label><input id="provider" value="Anthropic"></div><div class="field"><label for="key-label">레이블</label><input id="key-label" value="production"></div><div class="field"><label for="secret">비밀 값</label><input id="secret" type="password" placeholder="변경하지 않으려면 비워 두세요"></div>`, footer: buttons('저장') },
       mcp_server: { width: 560, title: 'MCP 서버 추가·수정', subtitle: '연결 방식에 따라 URL 또는 실행 명령을 입력합니다.', body: `<div class="field"><label for="server-name">서버 이름</label><input id="server-name" value="Local tools"></div><div class="field"><label for="transport">연결 방식</label><select id="transport"><option>HTTP</option><option>stdio</option></select></div><div class="field"><label for="server-url">URL</label><input id="server-url" value="https://tools.example.com/mcp"></div>`, footer: buttons('저장') },
       broadcast: { width: 560, title: '브로드캐스트', subtitle: '저장된 프롬프트를 여러 PTY 세션에 보냅니다.', body: `<div class="field"><label for="broadcast-prompt">프롬프트</label><select id="broadcast-prompt"><option>테스트 실행 후 결과 요약</option></select></div><label class="check-row"><input type="checkbox" checked><span>Serenity / Claude Code</span></label><label class="check-row"><input type="checkbox" checked><span>Design / Codex</span></label><label class="check-row"><input type="checkbox" checked><span>FieldAI / Claude Code</span></label><div class="notice danger-note"><span class="symbol">!</span><span>3개 이상에 보낼 때만 현재 화면 안에서 2단계 확인이 나옵니다.</span></div>`, footer: buttons('3개 세션에 전송') },
       batch_spawn: { width: 480, title: '에이전트 일괄 시작', subtitle: '선택한 에이전트의 세션을 여러 개 만듭니다.', body: `<div class="field"><label for="batch-agent">에이전트</label><select id="batch-agent"><option>Codex</option></select></div><div class="field"><label for="batch-count">개수</label><input id="batch-count" type="number" min="1" value="3"></div>`, footer: buttons('시작') },
       prompt_palette: { width: 560, title: '저장된 프롬프트', subtitle: '검색·삽입·편집을 한 창에서 처리합니다.', body: `<div class="field"><label for="prompt-search">프롬프트 검색</label><input id="prompt-search" placeholder="제목이나 태그 검색"></div><div class="menu"><button class="menu-item" type="button" data-toast="프롬프트 선택"><span>테스트 실행 후 결과 요약</span></button><button class="menu-item" type="button" data-toast="프롬프트 선택"><span>코드 리뷰 요청</span></button></div>`, footer: buttons('새 프롬프트') },
       prompt_delete: confirm('저장된 프롬프트 삭제', '프롬프트 상세 화면 안에 확인 문구가 나타납니다.', '선택한 프롬프트를 삭제할까요?', '삭제'),
-      document_dirty: { width: 480, title: '저장하지 않은 변경 사항', subtitle: 'notes.md · 닫기 전에 변경 내용을 처리합니다.', body: `<div class="notice danger-note"><span class="symbol">!</span><span>저장하지 않은 내용을 버리면 복구할 수 없습니다. 여러 문서가 대기 중이면 차례로 확인합니다.</span></div>`, footer: `<button class="btn ghost" type="button" data-close>취소</button><button class="btn" type="button" data-toast="저장 후 닫기를 시연합니다.">저장</button><button class="btn danger" type="button" data-toast="변경 내용을 버리고 닫기를 시연합니다.">버리기</button>` },
+      document_dirty: { width: 480, title: '저장하지 않은 변경 사항', subtitle: 'notes.md', body: `<div class="notice danger-note"><span class="symbol">!</span><span>저장하지 않은 내용을 버리면 복구할 수 없습니다. 여러 문서가 대기 중이면 차례로 확인합니다. 다음 문서에서는 이전 버리기 버튼의 키보드 초점을 해제합니다.</span></div>`, footer: `<button class="btn ghost" type="button" data-close>취소</button><button class="btn" type="button" data-toast="저장 후 닫기를 시연합니다.">저장</button><button class="btn danger" type="button" data-toast="변경 내용을 버리고 닫기를 시연합니다.">버리기</button>` },
       document_conflict: confirm('파일이 외부에서 바뀌었습니다', 'notes.md · 다른 프로그램에서 변경됨', '다시 불러오면 Deppy에서 저장하지 않은 편집 내용이 사라집니다.', '다시 불러오기', 'danger'),
-      document_cap: info('문서 탭 한도', '더 많은 문서 탭을 열 수 없습니다.', '정리할 수 있는 비활성 문서가 없어 새 탭을 열지 못했습니다.'),
+      document_cap: { ...info('문서 탭 한도', '', '열린 문서 탭이 모두 저장하지 않은 상태라 자리를 자동으로 만들 수 없습니다. 문서 하나를 저장하거나 닫은 뒤 다시 열어 주세요.'), footer: '<button class="btn primary" type="button" data-close>닫기</button>' },
       credential_delete: confirm('API 키 삭제', 'production 키', '키체인에 저장된 비밀 값도 함께 삭제됩니다.', 'API 키 삭제'),
-      env_delete: { width: 440, title: '환경변수 삭제', subtitle: '선택한 변수를 어느 파일에서 제거할지 정합니다.', body: `<div class="field"><label for="env-key">변수</label><input id="env-key" value="API_URL" readonly></div><div class="field"><label for="env-source">삭제할 정의</label><select id="env-source"><option>모든 소스</option><option>.env</option><option>.env.local</option></select></div>`, footer: buttons('삭제', 'danger') },
+      env_delete: { width: 480, title: '환경변수 삭제', subtitle: 'API_URL', body: `<div class="notice danger-note"><span class="symbol">!</span><span>'API_URL' 변수를 삭제하시겠습니까? 아래에서 선택한 파일의 해당 정의를 제거합니다.</span></div><div class="field" style="margin-top:16px"><label for="env-source">삭제할 파일</label><select id="env-source"><option>모든 파일에서 삭제</option><option>.env</option><option>.env.local</option></select></div>`, footer: buttons('삭제', 'danger') },
       mcp_delete: confirm('MCP 서버 삭제', 'Local tools', '이 서버 연결 설정을 삭제합니다.', '서버 삭제'),
       production_run: confirm('production 실행 확인', 'Serenity / 배포 에이전트', 'production 프로필로 실행합니다. 비밀 값은 표시하지 않고 실행 시점에만 불러옵니다.', '실행', 'primary'),
-      resource_kill: confirm('리소스 관리자에서 세션 종료', 'Serenity / Claude Code', '선택한 실행 중 세션을 종료할까요? 현재는 리소스 관리자 패널 안에서 확인합니다.', '종료'),
-      resource_unattached: confirm('연결되지 않은 프로세스 종료', 'Serenity · 분리된 프로세스 2개', '현재 워크스페이스에 붙어 있지 않은 프로세스를 종료할까요? 현재는 패널 안에서 확인합니다.', '종료'),
-      port_kill: confirm('포트 점유 프로세스 종료', 'Serenity · localhost:3000', '포트를 점유한 프로세스를 종료할까요? 현재는 포트 패널 안에서 확인합니다.', '프로세스 종료'),
+      resource_kill: confirm('리소스 관리자에서 세션 종료', 'Serenity / Claude Code', '선택한 실행 중 세션을 종료할까요?', '종료'),
+      resource_unattached: confirm('연결되지 않은 프로세스 종료', 'Serenity · 분리된 프로세스 2개', '현재 워크스페이스에 붙어 있지 않은 프로세스를 종료할까요?', '종료'),
+      port_kill: confirm('포트 점유 프로세스 종료', 'Serenity · localhost:3000', '포트를 점유한 프로세스를 종료할까요?', '프로세스 종료'),
       mcp_invoke: { width: 560, title: 'MCP 도구 실행', subtitle: '서버 도구에 전달할 JSON 인자를 확인합니다.', body: `<div class="field"><label for="json-args">JSON 인자</label><textarea id="json-args" spellcheck="false">{"path":"/project/README.md"}</textarea></div>`, footer: buttons('도구 실행') },
-      mcp_approval: { width: 560, title: 'MCP 도구 승인', subtitle: '서버·도구·인자 미리보기를 확인하고 범위를 선택합니다.', body: `<div class="inline-path">Local tools / read_file</div><div class="notice"><span class="symbol">ⓘ</span><span>이번 요청에만 적용하거나 이후 요청에도 같은 결정을 적용할 수 있습니다.</span></div>`, footer: `<button class="btn ghost" type="button" data-toast="한 번 거부를 시연합니다.">한 번 거부</button><button class="btn ghost" type="button" data-toast="항상 거부를 시연합니다.">항상 거부</button><button class="btn primary" type="button" data-toast="한 번 허용을 시연합니다.">한 번 허용</button><button class="btn" type="button" data-toast="항상 허용을 시연합니다.">항상 허용</button>` },
+      mcp_approval: { width: 560, title: 'MCP 도구 승인', subtitle: '새 요청에서는 Tab 또는 클릭으로 버튼을 선택한 뒤 Enter로 결정합니다.', body: `<div class="inline-path">Local tools / read_file</div><div class="notice"><span class="symbol">ⓘ</span><span>이번 요청에만 적용하거나 이후 요청에도 같은 결정을 적용할 수 있습니다.</span></div>`, footer: `<button class="btn ghost" type="button" data-toast="한 번 거부를 시연합니다.">한 번 거부</button><button class="btn ghost" type="button" data-toast="항상 거부를 시연합니다.">항상 거부</button><button class="btn primary" type="button" data-toast="한 번 허용을 시연합니다.">한 번 허용</button><button class="btn" type="button" data-toast="항상 허용을 시연합니다.">항상 허용</button>` },
       mcp_trust: confirm('원격 MCP 주소 신뢰', '새 원격 서버 Local tools', '연결할 원격 주소와 목적을 확인한 뒤 계속할지 결정합니다.', '신뢰하고 계속', 'primary'),
       mcp_oauth: { width: 520, title: 'MCP OAuth 연결', subtitle: '인증 서버·리소스·요청 권한을 확인합니다.', body: `<div class="field"><label>인증 서버</label><div class="inline-path">https://auth.example.com</div></div><div class="field"><label>요청 권한</label><div class="inline-path">tools:read · tools:invoke</div></div><div class="notice"><span class="symbol">ⓘ</span><span>진행·동의·완료/오류 단계가 같은 창에서 전환됩니다.</span></div>`, footer: buttons('계속') },
-      folder_moved: confirm('프로젝트 폴더 이동 감지', '기존 경로와 새 경로를 비교합니다.', '이전 /Projects/Serenity → 현재 /Archive/Serenity. 워크스페이스 경로를 갱신할까요?', '경로 갱신', 'primary'),
-      overflow: info('런타임 이벤트 적체', '구독 연결을 다시 동기화했습니다.', '현재 화면 상태는 다시 맞춰지지만 일부 중간 알림이 누락되었을 수 있습니다.'),
-      warm_limit: info('실행 중 워크스페이스 한도', '새 워크스페이스를 열 수 없습니다.', '백그라운드에서 세션이 실행 중인 워크스페이스가 이미 한도에 도달했습니다.'),
-      cross_pane_failure: info('Pane을 열 수 없음', '다른 워크스페이스에서 셀을 가져오지 못했습니다.', '대상 셀이 변경되었거나 Pane 한도에 도달했을 수 있습니다. 대상 상태를 다시 확인하세요.'),
+      folder_moved: { width: 480, title: '프로젝트 폴더 이동 감지', subtitle: '', body: `<div class="notice"><span class="symbol">ⓘ</span><span>프로젝트 폴더가 이동/이름 변경된 것 같습니다. 경로를 갱신할까요?</span></div><div class="field-hint">이전: /Users/jr/Projects/Serenity</div><div class="field-hint">현재: /Users/jr/Archive/Serenity</div><div class="field-hint">다른 설정 작업 중이면 갱신을 잠시 비활성화합니다. 실패한 경로는 유지하고 다시 시도할 수 있습니다.</div>`, footer: `<button class="btn ghost" type="button" data-close>무시</button><button class="btn primary" type="button" data-toast="원래 워크스페이스의 경로 갱신을 요청합니다.">갱신</button>` },
+      overflow: { ...info('런타임 이벤트 적체', '', '이벤트 유계 큐가 가득 차 구독 연결을 자동으로 재설정했습니다. 현재 화면 상태는 다시 동기화되지만 일부 중간 알림은 누락될 수 있습니다.'), footer: '<button class="btn primary" type="button" data-close>닫기</button>' },
+      warm_limit: { ...info('실행 중 workspace 한도 도달', '', 'Design을(를) 열 수 없습니다. 백그라운드에서 세션이 실행 중인 workspace가 이미 4개입니다. 기존 workspace로 전환해 세션을 닫거나 중지한 뒤 다시 시도하세요.'), footer: '<button class="btn primary" type="button" data-close>닫기</button>' },
+      cross_pane_failure: { ...info('Pane을 열 수 없음', '', '세션이 변경되었거나 더 이상 사용할 수 없습니다. 새로고침 후 다시 시도하세요.'), footer: '<button class="btn primary" type="button" data-close>닫기</button>' },
       diff: { width: 560, title: '세션 변경사항', subtitle: '현재 세션의 Git diff를 조회하는 별도 창입니다.', body: `<div class="inline-path">Serenity / git diff --stat</div><div class="menu"><div class="menu-item">src/main.rs <span class="shortcut">+18 −4</span></div><div class="menu-item">README.md <span class="shortcut">+6 −1</span></div></div>`, footer: `<button class="btn" type="button" data-close>닫기</button>` },
       agent_sessions: info('에이전트 세션 관리', '모델·도구·작업을 관리하는 큰 별도 창입니다.', '이 화면은 단순 확인 모달보다 큰 패널형 창으로 유지하는 편이 맞습니다.'),
       inbox: { width: 480, title: '알림 인박스', subtitle: '벨 아이콘에 붙는 팝오버입니다.', body: `<div class="group-label">대기 중</div><div class="check-row"><span>Claude Code · 도구 승인 요청</span></div><div class="check-row"><span>Codex · 사용자 입력 대기</span></div><div class="group-label">최근 알림</div><div class="check-row"><span>테스트 완료 · Serenity</span></div>`, footer: `<button class="btn" type="button" data-close>전체 기록 보기</button>`, presentation: 'popover' },
-      terminal_status: { width: 400, title: '터미널 상태 팝오버', subtitle: '승인·리소스·포트 표시를 눌렀을 때 펼쳐집니다.', body: `<div class="menu"><div class="menu-item">승인 대기 <span class="shortcut">1건</span></div><div class="menu-item">세션 리소스 <span class="shortcut">CPU 12%</span></div><div class="menu-item">포트 3000 <span class="shortcut">열림</span></div></div>`, footer: '', presentation: 'popover' },
+      terminal_status: { width: 560, title: '포트', subtitle: '로컬 수신 포트입니다. 다시 확인된 워크스페이스 프로세스만 종료합니다.', body: `<div class="field-hint">방금</div><div class="group-label" style="margin-top:16px">현재 워크스페이스</div><div class="port-row"><strong>3000 · node</strong><span>Serenity</span><code>127.0.0.1:3000</code><div class="port-actions"><button class="btn ghost" type="button" data-view="port_kill" data-socket="127.0.0.1:3000" data-project="Serenity">종료</button><button class="btn" type="button" data-toast="127.0.0.1:3000 주소를 복사하는 자리입니다.">주소 복사</button></div></div><div class="group-label" style="margin-top:16px">다른 워크스페이스</div><div class="port-row"><strong>4000 · node</strong><span>Design</span><code>[::1]:4000</code><div class="port-actions"><button class="btn ghost" type="button" data-view="port_kill" data-socket="[::1]:4000" data-project="Design">종료</button><button class="btn" type="button" data-toast="[::1]:4000 주소를 복사하는 자리입니다.">주소 복사</button></div></div><div class="group-label" style="margin-top:16px">외부</div><div class="port-row"><strong>5432 · postgres</strong><code>127.0.0.1:5432</code><span>외부 · 읽기 전용</span><div class="port-actions"><button class="btn" type="button" data-toast="127.0.0.1:5432 주소를 복사하는 자리입니다.">주소 복사</button></div></div>`, footer: `<button class="btn ghost" type="button" data-close>닫기</button><button class="btn primary" type="button" data-toast="포트 목록을 다시 조회합니다.">새로고침</button>`, presentation: 'popover' },
       composer_picker: { width: 330, title: '입력창 선택 메뉴', subtitle: '모델과 MCP 서버 선택에 쓰이는 앵커 팝업입니다.', body: `<div class="menu"><button class="menu-item" type="button" data-toast="모델 선택"><span>Opus 5.5</span></button><button class="menu-item" type="button" data-toast="모델 선택"><span>gpt-6-sol</span></button><div class="menu-rule"></div><button class="menu-item" type="button" data-toast="MCP 서버 선택"><span>MCP 서버 선택</span></button></div>`, footer: '', presentation: 'menu' },
       pane_menu: { width: 320, title: '셀·세션 상황 메뉴', subtitle: '셀 우클릭과 세션 카드 메뉴입니다.', body: `<div class="menu"><button class="menu-item" type="button" data-toast="셀 분할"><span>셀 분할</span></button><button class="menu-item" type="button" data-toast="다음 단계 예약"><span>다음 단계 예약</span></button><div class="menu-rule"></div><button class="menu-item red" type="button" data-toast="세션 닫기 요청"><span>세션 닫기</span></button></div>`, footer: '', presentation: 'menu' },
       settings: info('설정 창', '현재는 별도 macOS 창으로 열립니다.', '이 화면 전체를 작은 공용 팝업으로 바꾸지 않습니다. 내부의 드롭다운과 확인 UI만 공용 규칙을 따를 수 있습니다.'),
@@ -215,53 +229,53 @@
     });
     const caseGroups = [
       ['생성·편집', [
-        ['workspace', '워크스페이스 추가', '공용 Modal 적용', 'crates/app/src/workspace_add.rs:599'],
-        ['folder', '새 폴더 만들기', '공용 Modal 적용', 'crates/app/src/ui/file_tree.rs:3180'],
-        ['file', '새 파일 만들기', '공용 Modal 적용', 'crates/app/src/ui/file_tree.rs:3180'],
-        ['rename_workspace', '워크스페이스 이름 바꾸기', 'Window', 'crates/app/src/app.rs:32653'],
+        ['workspace', '워크스페이스 추가', '공용 Modal · 열기 완료 후 전용 런처', 'crates/app/src/workspace_add.rs'],
+        ['folder', '새 폴더 만들기', '공용 Modal · 오류는 폼 안 표시·이름 유지', 'crates/app/src/ui/file_tree.rs'],
+        ['file', '새 파일 만들기', '공용 Modal · 오류는 폼 안 표시·이름 유지', 'crates/app/src/ui/file_tree.rs'],
+        ['rename_workspace', '워크스페이스 이름 바꾸기', '행 안 편집 · 확정 프레임 입력 보호', 'crates/app/src/ui/file_tree.rs'],
         ['credential_edit', 'API 키 수정', 'Modal', 'crates/app/src/ui/credentials/edit.rs:87'],
-        ['mcp_server', 'MCP 서버 추가·수정', 'Window', 'crates/connector-ui/src/lib.rs:649']
+        ['mcp_server', 'MCP 서버 추가·수정', 'Window · 승인·인증 중 초안 보존', 'crates/connector-ui/src/lib.rs']
       ]],
       ['세션·종료·삭제', [
-        ['session_close', '실행 중인 셀·세션 닫기', 'Window · 실행 중일 때', 'crates/app/src/ui/workspace.rs:8323'],
-        ['workspace_close', '워크스페이스 세션 모두 종료', 'Window · 설정 ON', 'crates/app/src/app.rs:32485'],
-        ['env_project_close', '환경 및 API 프로젝트 목록 닫기', 'Window · 세션 유지', 'crates/app/src/app.rs:33414'],
-        ['resource_kill', '리소스 관리자 세션 종료', '패널 안 확인', 'crates/app/src/ui/resource_manager.rs:345'],
-        ['resource_unattached', '연결되지 않은 프로세스 종료', '패널 안 확인', 'crates/app/src/ui/resource_manager.rs:345'],
-        ['port_kill', '포트 점유 프로세스 종료', '패널 안 확인', 'crates/app/src/ui/ports.rs:226'],
-        ['delete', '휴지통 실패 후 영구 삭제', '파일 트리 안 확인', 'crates/app/src/ui/file_tree.rs:4229'],
+        ['session_close', '실행 중인 셀·세션 닫기', '공용 확인 Modal · 대상별 입력 보호 · 실행 중일 때', 'crates/app/src/ui/session_close_dialogs.rs · ui/workspace.rs'],
+        ['workspace_close', '워크스페이스 세션 모두 종료', '공용 확인 Modal · 대상별 입력 보호 · 설정 ON', 'crates/app/src/ui/session_close_dialogs.rs · app.rs'],
+        ['env_project_close', '환경 및 API 프로젝트 목록 닫기', '공용 확인 Modal · 세션 유지', 'crates/app/src/ui/environment_dialogs.rs · app.rs'],
+        ['resource_kill', '리소스 관리자 세션 종료', '공용 확인 Modal 적용', 'crates/app/src/ui/resource_manager.rs'],
+        ['resource_unattached', '연결되지 않은 프로세스 종료', '공용 확인 Modal 적용', 'crates/app/src/ui/resource_manager.rs'],
+        ['port_kill', '포트 점유 프로세스 종료', '공용 확인 Modal 적용', 'crates/app/src/ui/ports.rs'],
+        ['delete', '휴지통 실패 후 영구 삭제', '공용 확인 Modal · 목록 숨김에도 표시·입력 보호', 'crates/app/src/ui/file_tree.rs'],
         ['credential_delete', 'API 키 삭제', 'Window', 'crates/app/src/ui/credentials.rs:763'],
-        ['env_delete', '환경변수 정의 삭제', 'Window', 'crates/app/src/ui/env_profiles.rs:835'],
-        ['mcp_delete', 'MCP 서버 삭제', 'Window', 'crates/connector-ui/src/lib.rs:766'],
+        ['env_delete', '환경변수 정의 삭제', '공용 Modal · 원본 파일 선택·취소', 'crates/app/src/ui/environment_dialogs.rs · env_profiles.rs'],
+        ['mcp_delete', 'MCP 서버 삭제', 'Window · 승인·인증 중 대상 보존', 'crates/connector-ui/src/lib.rs'],
         ['prompt_delete', '저장된 프롬프트 삭제', '팔레트 안 확인', 'crates/app/src/ui/prompt_palette.rs:255']
       ]],
       ['AI 작업·외부 도구', [
-        ['followup', '다음 단계 예약', 'Window', 'crates/app/src/ui/fleet.rs:660'],
-        ['broadcast', '여러 세션에 브로드캐스트', 'Window · 3개 이상 인라인 재확인', 'crates/app/src/ui/fleet.rs:752'],
-        ['batch_spawn', '에이전트 일괄 시작', 'Window', 'crates/app/src/ui/fleet.rs:937'],
+        ['followup', '다음 단계 예약', 'Window · 맨 앞 창만 Esc 닫기', 'crates/app/src/ui/fleet.rs'],
+        ['broadcast', '여러 세션에 브로드캐스트', 'Window · 3개 이상 재확인·맨 앞 창만 Esc', 'crates/app/src/ui/fleet.rs'],
+        ['batch_spawn', '에이전트 일괄 시작', 'Window · 맨 앞 창만 Esc 닫기', 'crates/app/src/ui/fleet.rs'],
         ['production_run', 'production 프로필 실행', 'Window', 'crates/app/src/ui/agents.rs:696'],
-        ['mcp_invoke', 'MCP 도구 직접 실행', 'Window', 'crates/connector-ui/src/lib.rs:720'],
-        ['mcp_approval', 'MCP 도구 실행 승인', 'Window · 커넥터 UI', 'crates/connector-ui/src/lib.rs:791'],
+        ['mcp_invoke', 'MCP 도구 직접 실행', 'Window · 승인·인증 중 인자 초안 보존', 'crates/connector-ui/src/lib.rs'],
+        ['mcp_approval', 'MCP 도구 실행 승인', 'Window · 요청별 포커스 초기화', 'crates/connector-ui/src/lib.rs:791'],
         ['mcp_trust', '원격 MCP 주소 신뢰', 'Window', 'crates/connector-ui/src/lib.rs:831'],
         ['mcp_oauth', 'MCP OAuth 진행·동의', 'Window', 'crates/connector-ui/src/lib.rs:866']
       ]],
       ['문서·프로젝트 경로', [
-        ['document_dirty', '미저장 문서 닫기', 'Window · 저장/버리기/취소', 'crates/app/src/app.rs:32541'],
-        ['document_conflict', '외부 수정된 문서 다시 불러오기', 'Window', 'crates/app/src/app.rs:32586'],
-        ['document_cap', '문서 탭 한도 안내', 'Window', 'crates/app/src/app.rs:32620'],
-        ['folder_moved', '프로젝트 폴더 이동 감지', 'Window', 'crates/app/src/app.rs:32725']
+        ['document_dirty', '미저장 문서 닫기', '공용 팝업 · 대상별 초점·반응형 버튼', 'crates/app/src/ui/document_dialogs.rs'],
+        ['document_conflict', '외부 수정된 문서 다시 불러오기', '공용 팝업 · 첫 프레임 입력 차단·대상별 초점', 'crates/app/src/ui/document_dialogs.rs'],
+        ['document_cap', '문서 탭 한도 안내', '공용 Info 팝업 · 닫기', 'crates/app/src/ui/document_dialogs.rs'],
+        ['folder_moved', '프로젝트 폴더 이동 감지', '공용 팝업 · 대상 보존·갱신 대기·실패 재시도', 'crates/app/src/ui/document_dialogs.rs']
       ]],
       ['조회·상태 안내', [
-        ['prompt_palette', '프롬프트 라이브러리', 'Window', 'crates/app/src/ui/prompt_palette.rs:84'],
+        ['prompt_palette', '프롬프트 라이브러리', 'Window · 맨 앞 창만 Esc 편집 취소·닫기', 'crates/app/src/ui/prompt_palette.rs'],
         ['diff', '세션 Git 변경사항', 'Window', 'crates/app/src/ui/diff_panel.rs:882'],
         ['agent_sessions', '에이전트 세션 관리', '큰 Window', 'crates/app/src/ui/agent_sessions.rs:2197'],
-        ['overflow', '런타임 이벤트 적체', 'Window', 'crates/app/src/app.rs:32422'],
-        ['warm_limit', '실행 중 워크스페이스 한도', 'Window', 'crates/app/src/app.rs:32440'],
-        ['cross_pane_failure', '다른 워크스페이스 셀 열기 실패', 'Window', 'crates/app/src/app.rs:32464']
+        ['overflow', '런타임 이벤트 적체', '공용 Info Modal · 순차 안내', 'crates/app/src/app.rs · ui/popup/information.rs'],
+        ['warm_limit', '실행 중 워크스페이스 한도', '공용 Info Modal · 순차 안내', 'crates/app/src/app.rs · ui/popup/information.rs'],
+        ['cross_pane_failure', '다른 워크스페이스 셀 열기 실패', '공용 Info Modal · 순차 안내', 'crates/app/src/app.rs · ui/popup/information.rs']
       ]],
       ['팝오버·OS 창', [
         ['inbox', '알림 벨·승인 인박스', '앵커 Popup', 'crates/app/src/app.rs:28984'],
-        ['terminal_status', '터미널 승인·리소스·포트', '앵커 Popup', 'crates/app/src/ui/agent_terminal.rs:417'],
+        ['terminal_status', '터미널 상태 · 포트 목록', '포트: 공용 앵커 Popup · 승인·리소스: 기존', 'crates/app/src/ui/ports.rs · ui/agent_terminal.rs'],
         ['composer_picker', '입력창 모델·MCP 선택', '앵커 Popup', 'crates/app/src/ui/composer.rs:1060'],
         ['menu', '파일 트리 우클릭·더보기', '상황 메뉴 Popup', 'crates/app/src/ui/file_tree.rs:2870'],
         ['pane_menu', '셀·세션 상황 메뉴', '상황 메뉴 Popup', 'crates/app/src/ui/workspace.rs:8455'],
@@ -319,15 +333,20 @@
     const overlay = document.getElementById('overlay');
     const modal = document.getElementById('modal');
     const toast = document.getElementById('toast');
-    let current = 'workspace';
+    const requestedCase = decodeURIComponent(location.hash.slice(1));
+    let current = Object.hasOwn(views, requestedCase) ? requestedCase : 'workspace';
     let toastTimer;
+    let returnView;
     function render(name) {
       current = name;
       const view = views[name];
+      history.replaceState(null, '', `#${name}`);
       modal.style.setProperty('--modal-width', `${view.width}px`);
       overlay.classList.toggle('popover-mode', view.presentation === 'popover' || view.presentation === 'menu');
       overlay.classList.toggle('menu-mode', view.presentation === 'menu');
-      modal.setAttribute('aria-modal', String(view.presentation !== 'popover' && view.presentation !== 'menu'));
+      overlay.classList.toggle('inline-mode', view.presentation === 'inline');
+      modal.setAttribute('role', view.presentation === 'inline' ? 'group' : 'dialog');
+      modal.setAttribute('aria-modal', String(!['popover', 'menu', 'inline'].includes(view.presentation)));
       modal.setAttribute('aria-labelledby', 'modal-title');
       document.getElementById('modal-title').textContent = view.title;
       document.getElementById('modal-subtitle').textContent = view.subtitle;
@@ -344,16 +363,31 @@
       document.querySelectorAll('.example').forEach(button => button.classList.toggle('active', button.dataset.view === name));
       overlay.classList.remove('hidden');
       document.getElementById('closed').hidden = true;
-      requestAnimationFrame(() => modal.querySelector('input, textarea, select, .menu-item, .btn.primary, .btn.danger')?.focus());
+      requestAnimationFrame(() => modal.querySelector('input, textarea, select, .menu-item, .btn.primary, .btn.ghost')?.focus());
     }
-    function closeModal() { overlay.classList.add('hidden'); document.getElementById('closed').hidden = false; document.querySelector(`.example[data-view="${current}"]`)?.focus(); }
+    function closeModal() { if (returnView && current === 'port_kill') { const next = returnView; returnView = undefined; render(next); return; } overlay.classList.add('hidden'); document.getElementById('closed').hidden = false; document.querySelector(`.example[data-view="${current}"]`)?.focus(); }
     function showToast(message) { toast.textContent = message; toast.classList.add('visible'); clearTimeout(toastTimer); toastTimer = setTimeout(() => toast.classList.remove('visible'), 2500); }
-    document.querySelectorAll('[data-view]').forEach(button => button.addEventListener('click', () => {
+    document.addEventListener('click', event => {
+      const button = event.target.closest('[data-view]');
+      if (!button) return;
+      if (button.dataset.view === 'port_kill' && button.dataset.socket) {
+        const socket = button.dataset.socket;
+        const project = button.dataset.project;
+        Object.assign(views.port_kill, confirm('포트 점유 프로세스 종료', project, `${project}의 ${socket}에서 node을(를) 종료할까요?`, '종료 확인'));
+        views.port_kill.body = `<div class="inline-path">${socket}</div>` + views.port_kill.body;
+        returnView = 'terminal_status';
+      } else {
+        returnView = undefined;
+      }
       render(button.dataset.view);
       if (button.classList.contains('case-link')) document.querySelector('.preview').scrollIntoView({behavior: 'smooth'});
-    }));
+    });
+    window.addEventListener('hashchange', () => {
+      const name = decodeURIComponent(location.hash.slice(1));
+      if (Object.hasOwn(views, name) && name !== current) render(name);
+    });
     document.getElementById('show-inventory').addEventListener('click', () => document.getElementById('inventory').scrollIntoView({behavior: 'smooth'}));
-    overlay.addEventListener('click', event => { if (event.target === overlay && overlay.classList.contains('popover-mode')) closeModal(); });
+    overlay.addEventListener('click', event => { if (event.target === overlay && (overlay.classList.contains('popover-mode') || overlay.classList.contains('inline-mode'))) closeModal(); });
     document.getElementById('close').addEventListener('click', closeModal);
     document.getElementById('reopen').addEventListener('click', () => render(current));
     document.addEventListener('click', event => {
@@ -371,8 +405,8 @@
     });
     document.addEventListener('keydown', event => {
       if (event.key === 'Escape' && !overlay.classList.contains('hidden')) { event.preventDefault(); closeModal(); }
-      if (event.key === 'Enter' && !overlay.classList.contains('hidden') && modal.contains(document.activeElement) && ['INPUT', 'SELECT'].includes(document.activeElement.tagName)) { event.preventDefault(); modal.querySelector('.btn.primary')?.click(); }
-      if (event.key === 'Tab' && !overlay.classList.contains('hidden') && !overlay.classList.contains('popover-mode') && modal.contains(document.activeElement)) {
+      if (event.key === 'Enter' && !overlay.classList.contains('hidden') && modal.contains(document.activeElement) && ['INPUT', 'SELECT'].includes(document.activeElement.tagName)) { event.preventDefault(); if (overlay.classList.contains('inline-mode')) { showToast('표시 이름을 저장하는 자리입니다.'); closeModal(); } else { modal.querySelector('.btn.primary')?.click(); } }
+      if (event.key === 'Tab' && !overlay.classList.contains('hidden') && !overlay.classList.contains('popover-mode') && !overlay.classList.contains('inline-mode') && modal.contains(document.activeElement)) {
         const nodes = [...modal.querySelectorAll('button, input, textarea, select')].filter(node => !node.disabled && node.getClientRects().length);
         if (event.shiftKey && document.activeElement === nodes[0]) { event.preventDefault(); nodes.at(-1).focus(); }
         else if (!event.shiftKey && document.activeElement === nodes.at(-1)) { event.preventDefault(); nodes[0].focus(); }

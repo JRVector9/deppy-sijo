@@ -247,6 +247,12 @@ pub enum RuntimeEvent {
         operation_id: String,
         result: Result<(), pty::PtyInputRejectReason>,
     },
+    /// Actual accepted Enter/Ctrl-C outside bracketed paste. No input bytes are
+    /// retained. Append-only: preserve existing postcard discriminants.
+    SessionInputSubmitted {
+        session: SessionId,
+        at_micros: i64,
+    },
 }
 
 impl RuntimeEvent {
@@ -536,6 +542,7 @@ mod tests {
                 "ViewportTracked",
                 "EnvironmentApplied",
                 "InputAdmitted",
+                "SessionInputSubmitted",
             ]
         );
     }

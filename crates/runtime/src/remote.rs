@@ -515,6 +515,9 @@ fn validate_event(event: &RuntimeEvent) -> Result<(), &'static str> {
         } if !agent_config_id.is_valid() => {
             return Err("agent_config_id가 비었거나 상한/NUL 규칙 위반");
         }
+        RuntimeEvent::SessionInputSubmitted { at_micros, .. } if *at_micros <= 0 => {
+            return Err("input submission timestamp must be positive");
+        }
         RuntimeEvent::DurableEventBarrierReached { correlation_id: 0 } => {
             return Err("durable event barrier correlation_id는 0일 수 없음");
         }
@@ -2891,14 +2894,14 @@ mod tests {
 
     #[test]
     fn v12_v13_peer_is_rejected_at_hello_before_event_decode() {
-        for version in [10, 12, 13, 17, 18, 19] {
+        for version in [10, 12, 13, 17, 18, 19, 20] {
             let old = ClientHello {
                 magic: PROTO_MAGIC,
                 proto_version: version,
                 features: CLIENT_FEATURES,
                 token: b"irrelevant".to_vec(),
             };
-            assert_eq!(PROTO_VERSION, 20);
+            assert_eq!(PROTO_VERSION, 21);
             assert!(!client_hello_matches_protocol(&old));
         }
     }
@@ -3744,12 +3747,20 @@ mod tests {
             RuntimeEvent::ViewportTracked { .. } => "ViewportTracked",
             RuntimeEvent::EnvironmentApplied { .. } => "EnvironmentApplied",
             RuntimeEvent::InputAdmitted { .. } => "InputAdmitted",
+            RuntimeEvent::SessionInputSubmitted { .. } => "SessionInputSubmitted",
         }
     }
 
     #[test]
     fn unattached_session_event_names_and_remote_codecs_roundtrip() {
         let events = [
+            (
+                RuntimeEvent::SessionInputSubmitted {
+                    session: SessionId(7),
+                    at_micros: 140_000_001,
+                },
+                "SessionInputSubmitted",
+            ),
             (
                 RuntimeEvent::EnvironmentApplied {
                     session: Some(SessionId(4)),

@@ -1893,6 +1893,10 @@ impl Worker {
         let Some(active) = self.sessions.get_mut(&session) else {
             return Err(pty::PtyInputRejectReason::SessionClosed);
         };
+        let at_micros = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_micros().min(i64::MAX as u128) as i64)
+            .unwrap_or(0);
         let outcome = if let Some(admission) = admission {
             admission
                 .admit(|| active.write_input(bytes))
@@ -1903,8 +1907,12 @@ impl Worker {
         // The admission lock is gone before detectors/events invoke UI wakes.
         match outcome {
             Some(pty::PtyInputEnqueueResult::Accepted) => {
-                if let Some(detector) = self.detectors.get_mut(&session) {
-                    detector.on_user_input(bytes);
+                let submitted = self
+                    .detectors
+                    .get_mut(&session)
+                    .is_some_and(|detector| detector.on_user_input(bytes));
+                if submitted && at_micros > 0 {
+                    self.emit(RuntimeEvent::SessionInputSubmitted { session, at_micros });
                 }
                 Ok(())
             }
@@ -9723,6 +9731,100 @@ mod tests {
             assert_eq!(result, Ok(()));
         }
         assert!(rejected, "PTY saturation must yield a correlated rejection");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn fleet_review_fix_submission_event_requires_real_admission_and_no_paste_newline() {
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("fleet-submit"),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+            None,
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        let session = probe.wait_for(Duration::from_secs(5), |event| match event {
+            RuntimeEvent::ShellSpawned { session } => Some(*session),
+            _ => None,
+        });
+        for bytes in [
+            b"typed".as_slice(),
+            b"\x1b[20",
+            b"0~first\nsecond\r",
+            b"\x1b[201~",
+        ] {
+            client
+                .send_command(RuntimeCommand::WriteInput {
+                    session,
+                    bytes: bytes.to_vec(),
+                })
+                .unwrap();
+        }
+        client
+            .send_command(RuntimeCommand::WriteInputTracked {
+                session: SessionId(u64::MAX),
+                operation_id: "rejected-submit".into(),
+                bytes: b"\r".to_vec(),
+            })
+            .unwrap();
+        client
+            .send_command(RuntimeCommand::DurableEventBarrier { correlation_id: 11 })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(5), |event| {
+            matches!(
+                event,
+                RuntimeEvent::DurableEventBarrierReached { correlation_id: 11 }
+            )
+            .then_some(())
+        });
+        assert!(
+            !probe
+                .seen
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::SessionInputSubmitted { .. }))
+        );
+        client
+            .send_command(RuntimeCommand::WriteInput {
+                session,
+                bytes: b"\r".to_vec(),
+            })
+            .unwrap();
+        client
+            .send_command(RuntimeCommand::DurableEventBarrier { correlation_id: 12 })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(5), |event| {
+            matches!(
+                event,
+                RuntimeEvent::DurableEventBarrierReached { correlation_id: 12 }
+            )
+            .then_some(())
+        });
+        let submissions: Vec<_> = probe
+            .seen
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::SessionInputSubmitted { session, at_micros } => {
+                    Some((*session, *at_micros))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            submissions.len(),
+            1,
+            "accepted Enter must emit exactly one timestamp-only boundary"
+        );
+        assert_eq!(submissions[0].0, session);
+        assert!(submissions[0].1 > 0);
     }
 
     #[test]

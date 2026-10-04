@@ -237,6 +237,7 @@ impl AgentLauncherUi {
     }
 
     /// 다른 workspace의 런처를 이 workspace에 예정된 세션으로 세지 않는다.
+    #[cfg(test)]
     pub(crate) fn is_open_for(&self, workspace_id: &str) -> bool {
         self.open && self.workspace_id == workspace_id
     }
@@ -290,6 +291,7 @@ impl AgentLauncherUi {
         // The explicit first-pass width also keeps auto-sized modal content from inheriting the
         // viewport width before its content has been measured.
         let modal_id = egui::Id::new("agent-launcher-modal-v2");
+        super::popup::set_pending_modal(ctx, true);
         let modal_area = egui::Modal::default_area(modal_id).default_width(LAUNCHER_WIDTH);
         let response = egui::Modal::new(modal_id)
             .area(modal_area)

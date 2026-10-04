@@ -414,6 +414,20 @@ pub struct EnvProfilesUi {
 }
 
 impl EnvProfilesUi {
+    pub(crate) fn has_pending_confirmation(&self) -> bool {
+        self.delete_confirm.is_some()
+    }
+
+    pub(crate) fn render_pending_confirmation(
+        &mut self,
+        ctx: &egui::Context,
+        snapshot: &EnvProfilesSnapshot,
+        catalog: &i18n::Catalog,
+        intent: &mut Option<EnvAction>,
+    ) {
+        self.render_delete_confirmation(ctx, snapshot, catalog, intent);
+    }
+
     pub(crate) fn open_prefilled_form(&mut self) {
         self.show_add_form = true;
     }
@@ -831,52 +845,20 @@ impl EnvProfilesUi {
         let Some((_, pending_key)) = self.delete_confirm.as_ref() else {
             return;
         };
-        let mut decision = None;
-        egui::Window::new(catalog.t("env.var_delete_confirm.title", &[]))
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                ui.label(catalog.t(
-                    "env.var_delete_confirm.body_dotenv",
-                    &[("key", pending_key.as_str())],
-                ));
-                egui::ComboBox::from_id_salt("dotenv_delete_source")
-                    .selected_text(
-                        self.delete_source
-                            .as_deref()
-                            .unwrap_or(&catalog.t("env.delete_all_sources", &[])),
-                    )
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.delete_source,
-                            None,
-                            catalog.t("env.delete_all_sources", &[]),
-                        );
-                        if let Some(files) = snapshot
-                            .sources
-                            .as_ref()
-                            .and_then(|sources| sources.keys.get(pending_key))
-                        {
-                            for file in files {
-                                ui.selectable_value(
-                                    &mut self.delete_source,
-                                    Some(file.clone()),
-                                    file,
-                                );
-                            }
-                        }
-                    });
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button(catalog.t("action.delete", &[])).clicked() {
-                        decision = Some(true);
-                    }
-                    if ui.button(catalog.t("action.cancel", &[])).clicked() {
-                        decision = Some(false);
-                    }
-                });
-            });
+        let files = snapshot
+            .sources
+            .as_ref()
+            .and_then(|sources| sources.keys.get(pending_key))
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let decision = super::environment_dialogs::delete_variable(
+            ctx,
+            profile_id,
+            pending_key,
+            &mut self.delete_source,
+            files,
+            catalog,
+        );
         match decision {
             Some(true) if intent.is_none() => {
                 let (_, key) = self.delete_confirm.take().expect("pending checked");
@@ -887,7 +869,10 @@ impl EnvProfilesUi {
                     file: self.delete_source.take(),
                 });
             }
-            Some(false) => self.delete_confirm = None,
+            Some(false) => {
+                self.delete_confirm = None;
+                self.delete_source = None;
+            }
             _ => {}
         }
     }
@@ -1384,6 +1369,116 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+
+    fn delete_popup_harness() -> egui_kittest::Harness<'static, (EnvProfilesUi, Option<EnvAction>)>
+    {
+        let snapshot = FakeAdapter {
+            calls: Cell::new(0),
+        }
+        .snapshot(2)
+        .with_sources(Some(crate::dotenv_sync::DotenvSources {
+            selected_files: vec![".env".into(), ".env.local".into()],
+            read_failed: false,
+            files: vec![".env".into(), ".env.local".into()],
+            keys: std::collections::BTreeMap::from([
+                ("KEY_0".into(), vec![".env".into(), ".env.local".into()]),
+                ("KEY_1".into(), vec![".env.local".into()]),
+            ]),
+        }))
+        .unwrap();
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        let mut view = EnvProfilesUi::new();
+        view.delete_confirm = Some(("dotenv-profile".into(), "KEY_0".into()));
+        view.delete_source = Some(".env.local".into());
+        egui_kittest::Harness::builder()
+            .with_size(egui::vec2(800.0, 650.0))
+            .build_ui_state(
+                move |ui, (view, action)| {
+                    view.render_delete_confirmation(ui.ctx(), &snapshot, &catalog, action);
+                },
+                (view, None),
+            )
+    }
+
+    #[test]
+    fn env_ports_popup_variable_delete_has_standard_controls_and_preserves_source() {
+        use egui_kittest::kittest::Queryable;
+        let mut harness = delete_popup_harness();
+        harness.run();
+        let button = harness.get_by_label("Delete").rect();
+        assert!((button.height() - 34.0).abs() < 0.5, "{button:?}");
+        let source = harness.get_by_role(egui::accesskit::Role::ComboBox).rect();
+        assert!((source.height() - 36.0).abs() < 0.5, "{source:?}");
+        assert!(
+            harness
+                .ctx
+                .memory(|memory| memory.top_modal_layer().is_some())
+        );
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+        assert!(harness.state().1.is_none(), "bare Enter must not delete");
+        harness.get_by_label("Delete").click();
+        harness.run();
+        assert!(matches!(
+            &harness.state().1,
+            Some(EnvAction::DotenvWrite { key, value: None, file: Some(file) })
+                if key == "KEY_0" && file == ".env.local"
+        ));
+    }
+
+    #[test]
+    fn env_ports_popup_variable_delete_escape_cancels_without_writing() {
+        let mut harness = delete_popup_harness();
+        harness.run();
+        harness.key_press(egui::Key::Escape);
+        harness.run();
+        assert!(harness.state().0.delete_confirm.is_none());
+        assert!(harness.state().1.is_none());
+    }
+
+    #[test]
+    fn env_ports_popup_source_menu_owns_first_escape_and_preserves_confirmation() {
+        use egui_kittest::kittest::Queryable;
+        let mut harness = delete_popup_harness();
+        harness.run();
+        harness.get_by_role(egui::accesskit::Role::ComboBox).click();
+        harness.run();
+        assert!(harness.ctx.any_popup_open());
+        harness.key_press(egui::Key::Escape);
+        harness.run();
+        assert!(
+            harness.state().0.delete_confirm.is_some(),
+            "first Escape belongs to the source menu"
+        );
+        assert_eq!(
+            harness.state().0.delete_source.as_deref(),
+            Some(".env.local")
+        );
+        assert!(!harness.ctx.any_popup_open());
+        assert!(harness.state().1.is_none());
+        harness.key_press(egui::Key::Escape);
+        harness.run();
+        assert!(harness.state().0.delete_confirm.is_none());
+        assert!(harness.state().1.is_none());
+    }
+
+    #[test]
+    fn env_ports_popup_variable_target_change_does_not_inherit_delete_focus() {
+        use egui_kittest::kittest::Queryable;
+        let mut harness = delete_popup_harness();
+        harness.run();
+        harness.get_by_label("Delete").focus();
+        harness.run();
+        harness.state_mut().0.delete_confirm = Some(("dotenv-profile".into(), "KEY_1".into()));
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+        assert!(harness.state().1.is_none());
+        harness.get_by_label("Delete").click();
+        harness.run();
+        assert!(
+            matches!(&harness.state().1, Some(EnvAction::DotenvWrite { key, .. }) if key == "KEY_1")
+        );
+    }
 
     #[test]
     fn environment_context_variable_prefill_replaces_entire_draft() {

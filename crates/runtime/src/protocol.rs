@@ -58,7 +58,8 @@ pub(crate) const PROTO_MAGIC: [u8; 4] = *b"DPRT";
 /// v18: operation-correlated PTY input admission; reject older peers before decode.
 /// v19: admission-denied input result; older peers must reject this value before decode.
 /// v20: sparse multi-scalar graphemes in viewport and row patches.
-pub(crate) const PROTO_VERSION: u16 = 20;
+/// v21: accepted input submission timestamps; reject v20 before unknown event decode.
+pub(crate) const PROTO_VERSION: u16 = 21;
 
 /// delta viewport 스트리밍 기능 비트 (§3.1).
 pub(crate) const FEAT_DELTA_VIEWPORT: u32 = 1 << 0;
@@ -579,6 +580,6 @@ mod tests {
         assert!(command_source.contains("SetScrollbackLimit"));
         assert!(event_source.contains("ScrollbackLimitApplied"));
         assert!(protocol_source.contains("**v13**"));
-        assert_eq!(PROTO_VERSION, 20);
+        assert_eq!(PROTO_VERSION, 21);
     }
 }

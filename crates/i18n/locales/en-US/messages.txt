@@ -1358,6 +1358,10 @@ workspace.add.github = GitHub repository
 workspace.add.local_hint = Open an existing folder as a workspace.
 workspace.add.choose_folder = Choose folder…
 workspace.add.url = Repository URL
+workspace.add.url_hint = Supported: GitHub HTTPS or SSH repository URL
+popup.shortcut_close = Esc close
+popup.shortcut_create = Enter create · Esc close
+file_tree.create = Create
 workspace.add.destination = Save in
 workspace.add.browse = Browse…
 workspace.add.folder_name = Folder name
@@ -1381,3 +1385,19 @@ workspace.add.worker_failed = Could not start the clone worker.
 workspace.add.registration_failed = Could not add the folder as a workspace. Try again.
 workspace.add.switch_failed = The workspace was added, but could not be opened. Try again.
 workspace.add.choosing = Choosing folder…
+resource_manager.confirm_session.title = End session
+resource_manager.confirm_unattached.title = End unattached processes
+ports.confirm_title = Terminate port process
+file_tree.permanent_delete_title = Confirm permanent deletion
+popup.dismiss = Close dialog
+
+document.confirm_discard.warning = Discarding loses your unsaved changes. This cannot be undone.
+workspace.folder_moved.failed = Could not update the folder path. Try again.
+
+workspace.add.folder_identity_conflict = The selected folder has a different or unverified volume identity. Reconnect its project path in workspace settings before opening it.
+
+fleet.idle_observed_for = observed waiting {value}
+fleet.followup.list = Next tasks ({count})
+fleet.followup.empty = No scheduled tasks
+
+env.delete_source = File to delete from

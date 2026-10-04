@@ -59,9 +59,6 @@ impl ResourceManagerUi {
 
     pub(crate) fn set_open(&mut self, open: bool) {
         self.open = open;
-        if !open {
-            self.confirm = None;
-        }
     }
 
     pub(crate) fn toggle_open(&mut self) {
@@ -139,7 +136,6 @@ impl ResourceManagerUi {
         {
             intent = Some(ResourceManagerIntent::InspectUnattached);
         }
-        self.render_confirmation(ui, &mut intent, catalog);
         intent
     }
 
@@ -342,16 +338,12 @@ impl ResourceManagerUi {
         );
     }
 
-    fn render_confirmation(
+    pub(crate) fn confirmation(
         &mut self,
-        ui: &mut egui::Ui,
-        intent: &mut Option<ResourceManagerIntent>,
+        ctx: &egui::Context,
         catalog: &i18n::Catalog,
-    ) {
-        let Some(confirm) = self.confirm.clone() else {
-            return;
-        };
-        ui.separator();
+    ) -> Option<ResourceManagerIntent> {
+        let confirm = self.confirm.clone()?;
         let message = match &confirm {
             ResourceConfirm::Unattached {
                 workspace_name,
@@ -369,13 +361,33 @@ impl ResourceManagerUi {
                 &[("session", session_name.as_ref())],
             ),
         };
-        ui.colored_label(ui.visuals().warn_fg_color, message);
-        ui.horizontal(|ui| {
-            if ui
-                .button(catalog.t("resource_manager.confirm_accept", &[]))
-                .clicked()
-            {
-                *intent = Some(match confirm {
+        let (title, subtitle) = match &confirm {
+            ResourceConfirm::Unattached { workspace_name, .. } => (
+                catalog.t("resource_manager.confirm_unattached.title", &[]),
+                workspace_name.as_ref(),
+            ),
+            ResourceConfirm::Session { session_name, .. } => (
+                catalog.t("resource_manager.confirm_session.title", &[]),
+                session_name.as_ref(),
+            ),
+        };
+        let choice = super::popup::confirmation(
+            ctx,
+            super::popup::ConfirmationSpec {
+                id: egui::Id::new("resource_end_confirmation"),
+                title: &title,
+                subtitle,
+                target: None,
+                message: &message,
+                confirm_label: &catalog.t("resource_manager.confirm_accept", &[]),
+                cancel_label: &catalog.t("resource_manager.cancel", &[]),
+                close_label: &catalog.t("popup.dismiss", &[]),
+            },
+        );
+        match choice {
+            Some(super::popup::ConfirmationChoice::Confirm) => {
+                self.confirm = None;
+                Some(match confirm {
                     ResourceConfirm::Unattached {
                         workspace_id,
                         runtime_instance,
@@ -394,16 +406,14 @@ impl ResourceManagerUi {
                         runtime_instance,
                         session,
                     },
-                });
-                self.confirm = None;
+                })
             }
-            if ui
-                .button(catalog.t("resource_manager.cancel", &[]))
-                .clicked()
-            {
+            Some(super::popup::ConfirmationChoice::Cancel) => {
                 self.confirm = None;
+                None
             }
-        });
+            None => None,
+        }
     }
 }
 
@@ -608,6 +618,56 @@ fn pressure_text(pressure: &runtime::PtyInputPressure, catalog: &i18n::Catalog) 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "offscreen popup PNGs for manual visual review"]
+    fn popup_parity_render_resource_confirmations() {
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        for (filename, confirm) in [
+            (
+                "10-resource.png",
+                ResourceConfirm::Session {
+                    workspace_id: "serenity".into(),
+                    runtime_instance: 17,
+                    session: runtime::SessionId(7),
+                    session_name: "Serenity / Claude Code".into(),
+                },
+            ),
+            (
+                "11-unattached.png",
+                ResourceConfirm::Unattached {
+                    workspace_id: "serenity".into(),
+                    runtime_instance: 17,
+                    workspace_name: "Serenity".into(),
+                    count: 2,
+                },
+            ),
+        ] {
+            let manager = ResourceManagerUi {
+                confirm: Some(confirm),
+                ..Default::default()
+            };
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(800.0, 650.0))
+                .build_ui_state(
+                    |ui, manager: &mut ResourceManagerUi| {
+                        assert!(manager.confirmation(ui.ctx(), &catalog).is_none());
+                    },
+                    manager,
+                );
+            crate::fonts::install_cjk_fallback(&harness.ctx, None, "JetBrainsMono", "Regular");
+            harness.ctx.set_visuals(egui::Visuals::dark());
+            harness.run();
+            let output = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/popup-parity");
+            std::fs::create_dir_all(&output).unwrap();
+            harness
+                .render()
+                .unwrap()
+                .save(output.join(filename))
+                .unwrap();
+        }
+    }
+
     use super::*;
     use crate::ui::activity::{ActivitySessionRow, ActivityWorkspaceRow, ActivityWorkspaceState};
     use egui_kittest::kittest::Queryable;
@@ -687,13 +747,16 @@ mod tests {
         let catalog = i18n::Catalog::load("en-US").unwrap();
         egui_kittest::Harness::new_ui_state(
             move |ui, (manager, intents)| {
-                if let Some(intent) = manager.contents(
-                    ui,
-                    &rows,
-                    &HashMap::from([(String::from("workspace-a"), 1)]),
-                    10_000,
-                    &catalog,
-                ) {
+                if let Some(intent) = manager
+                    .contents(
+                        ui,
+                        &rows,
+                        &HashMap::from([(String::from("workspace-a"), 1)]),
+                        10_000,
+                        &catalog,
+                    )
+                    .or_else(|| manager.confirmation(ui.ctx(), &catalog))
+                {
                     intents.push(intent);
                 }
             },
@@ -752,6 +815,13 @@ mod tests {
         harness.run();
         harness.get_by_label("End Local Session").click();
         harness.run();
+        assert!(
+            harness
+                .ctx
+                .memory(|memory| memory.area_rect(egui::Id::new("resource_end_confirmation")))
+                .is_some(),
+            "confirmation must use the shared modal"
+        );
         harness.get_by_label("End Local Session?");
         harness.get_by_label("Cancel").click();
         harness.run();

@@ -130,6 +130,7 @@ pub enum CloneError {
     CancelledAfterCompletion,
     WorkerUnavailable,
     RegistrationFailed,
+    FolderIdentityConflict,
     SwitchFailed,
 }
 
@@ -623,7 +624,8 @@ impl WorkspaceAddUi {
                                 ),
                             ],
                         );
-                        ui.add_space(14.0);
+                        // The body provides 16pt spacing; the segmented control needs 17pt.
+                        ui.add_space(1.0);
                         match self.source {
                             WorkspaceSource::Local => {
                                 crate::ui::popup::notice(
@@ -636,12 +638,12 @@ impl WorkspaceAddUi {
                                 crate::ui::popup::field(
                                     ui,
                                     &catalog.t("workspace.add.url", &[]),
-                                    None,
+                                    Some(&catalog.t("workspace.add.url_hint", &[])),
                                     |ui| {
-                                        let url = ui.add(
-                                            egui::TextEdit::singleline(&mut self.remote_url)
-                                                .hint_text("https://github.com/owner/repo")
-                                                .desired_width(ui.available_width()),
+                                        let url = crate::ui::popup::text_input(
+                                            ui,
+                                            &mut self.remote_url,
+                                            "https://github.com/owner/repo",
                                         );
                                         if url.changed() {
                                             if !self.name_edited {
@@ -658,28 +660,18 @@ impl WorkspaceAddUi {
                                     &catalog.t("workspace.add.destination", &[]),
                                     None,
                                     |ui| {
-                                        ui.horizontal(|ui| {
-                                            let path_width =
-                                                (ui.available_width() - 105.0).max(120.0);
-                                            if ui
-                                                .add(
-                                                    egui::TextEdit::singleline(
-                                                        &mut self.destination_parent,
-                                                    )
-                                                    .desired_width(path_width),
-                                                )
-                                                .changed()
-                                            {
-                                                self.selected_parent = None;
-                                                self.error = None;
-                                            }
-                                            if ui
-                                                .button(catalog.t("workspace.add.browse", &[]))
-                                                .clicked()
-                                            {
-                                                action = Some(WorkspaceAddIntent::PickDestination);
-                                            }
-                                        });
+                                        let row = crate::ui::popup::path_input(
+                                            ui,
+                                            &mut self.destination_parent,
+                                            &catalog.t("workspace.add.browse", &[]),
+                                        );
+                                        if row.input.changed() {
+                                            self.selected_parent = None;
+                                            self.error = None;
+                                        }
+                                        if row.browse.clicked() {
+                                            action = Some(WorkspaceAddIntent::PickDestination);
+                                        }
                                     },
                                 );
                                 crate::ui::popup::field(
@@ -687,9 +679,10 @@ impl WorkspaceAddUi {
                                     &catalog.t("workspace.add.folder_name", &[]),
                                     None,
                                     |ui| {
-                                        let name = ui.add(
-                                            egui::TextEdit::singleline(&mut self.directory_name)
-                                                .desired_width(ui.available_width()),
+                                        let name = crate::ui::popup::text_input(
+                                            ui,
+                                            &mut self.directory_name,
+                                            "",
                                         );
                                         if name.changed() {
                                             self.name_edited = true;
@@ -727,65 +720,71 @@ impl WorkspaceAddUi {
                         );
                     }
                 });
-                crate::ui::popup::footer(ui, |ui| {
-                    use crate::ui::popup::{ActionTone, action_button};
-                    if self.status == WorkspaceAddStatus::Cloning {
-                        if action_button(
-                            ui,
-                            &catalog.t("workspace.add.cancel_clone", &[]),
-                            ActionTone::Secondary,
-                            true,
-                        )
-                        .clicked()
-                        {
-                            action = Some(WorkspaceAddIntent::CancelClone);
-                        }
-                    } else if self.status == WorkspaceAddStatus::Ready {
-                        let primary_key = if self.source == WorkspaceSource::Local {
-                            "workspace.add.choose_folder"
-                        } else {
-                            "workspace.add.clone_open"
-                        };
-                        if action_button(
-                            ui,
-                            &catalog.t(primary_key, &[]),
-                            ActionTone::Primary,
-                            true,
-                        )
-                        .clicked()
-                        {
-                            match self.source {
-                                WorkspaceSource::Local => {
-                                    action = Some(WorkspaceAddIntent::PickLocal);
-                                }
-                                WorkspaceSource::GitHub => {
-                                    match CloneRequest::prepare(
-                                        &self.remote_url,
-                                        self.selected_parent
-                                            .as_deref()
-                                            .unwrap_or_else(|| Path::new(&self.destination_parent)),
-                                        &self.directory_name,
-                                    ) {
-                                        Ok(request) => {
-                                            action = Some(WorkspaceAddIntent::Clone(request));
+                crate::ui::popup::footer(
+                    ui,
+                    (!busy)
+                        .then(|| catalog.t("popup.shortcut_close", &[]))
+                        .as_deref(),
+                    |ui| {
+                        use crate::ui::popup::{ActionTone, action_button};
+                        if self.status == WorkspaceAddStatus::Cloning {
+                            if action_button(
+                                ui,
+                                &catalog.t("workspace.add.cancel_clone", &[]),
+                                ActionTone::Secondary,
+                                true,
+                            )
+                            .clicked()
+                            {
+                                action = Some(WorkspaceAddIntent::CancelClone);
+                            }
+                        } else if self.status == WorkspaceAddStatus::Ready {
+                            let primary_key = if self.source == WorkspaceSource::Local {
+                                "workspace.add.choose_folder"
+                            } else {
+                                "workspace.add.clone_open"
+                            };
+                            if action_button(
+                                ui,
+                                &catalog.t(primary_key, &[]),
+                                ActionTone::Primary,
+                                true,
+                            )
+                            .clicked()
+                            {
+                                match self.source {
+                                    WorkspaceSource::Local => {
+                                        action = Some(WorkspaceAddIntent::PickLocal);
+                                    }
+                                    WorkspaceSource::GitHub => {
+                                        match CloneRequest::prepare(
+                                            &self.remote_url,
+                                            self.selected_parent.as_deref().unwrap_or_else(|| {
+                                                Path::new(&self.destination_parent)
+                                            }),
+                                            &self.directory_name,
+                                        ) {
+                                            Ok(request) => {
+                                                action = Some(WorkspaceAddIntent::Clone(request));
+                                            }
+                                            Err(error) => self.error = Some(error),
                                         }
-                                        Err(error) => self.error = Some(error),
                                     }
                                 }
                             }
+                            if action_button(
+                                ui,
+                                &catalog.t("action.cancel", &[]),
+                                ActionTone::Ghost,
+                                true,
+                            )
+                            .clicked()
+                            {
+                                action = Some(WorkspaceAddIntent::Close);
+                            }
                         }
-                        if action_button(
-                            ui,
-                            &catalog.t("action.cancel", &[]),
-                            ActionTone::Secondary,
-                            true,
-                        )
-                        .clicked()
-                        {
-                            action = Some(WorkspaceAddIntent::Close);
-                        }
-                    }
-                });
+                    },
+                );
             },
         );
         if modal && !busy && action.is_none() {
@@ -810,6 +809,7 @@ impl CloneError {
             Self::CancelledAfterCompletion => "workspace.add.cancelled_after_completion",
             Self::WorkerUnavailable => "workspace.add.worker_failed",
             Self::RegistrationFailed => "workspace.add.registration_failed",
+            Self::FolderIdentityConflict => "workspace.add.folder_identity_conflict",
             Self::SwitchFailed => "workspace.add.switch_failed",
         }
     }
@@ -848,6 +848,10 @@ mod tests {
         harness.get_by_label("Clone and open");
         harness.get_by_label("My folder").click();
         harness.run();
+        assert_eq!(
+            harness.state().0.as_ref().unwrap().source,
+            WorkspaceSource::Local
+        );
         harness.get_by_label("Choose folder…").click();
         harness.run();
         assert!(
@@ -878,6 +882,152 @@ mod tests {
     }
 
     #[test]
+    fn popup_parity_github_inputs_have_the_mockup_height() {
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        let mut dialog =
+            WorkspaceAddUi::new(WorkspaceAddPurpose::SwitchRuntime, std::env::temp_dir());
+        dialog.source = WorkspaceSource::GitHub;
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(800.0, 750.0))
+            .build_ui(move |ui| {
+                dialog.show(ui.ctx(), &catalog);
+            });
+        harness.run();
+        let inputs: Vec<_> = harness
+            .query_all_by_role(egui::accesskit::Role::TextInput)
+            .map(|node| node.rect())
+            .collect();
+        assert_eq!(inputs.len(), 3);
+        for input in inputs {
+            assert!(
+                (input.height() - 36.0).abs() < 0.5,
+                "input height: {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn popup_parity_github_footer_buttons_have_padding_and_gap() {
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        let mut dialog =
+            WorkspaceAddUi::new(WorkspaceAddPurpose::SwitchRuntime, std::env::temp_dir());
+        dialog.source = WorkspaceSource::GitHub;
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(800.0, 750.0))
+            .build_ui(move |ui| {
+                dialog.show(ui.ctx(), &catalog);
+            });
+        harness.run();
+        let cancel = harness.get_by_label("Cancel").rect();
+        let primary = harness.get_by_label("Clone and open").rect();
+        let label_width = harness.ctx.fonts_mut(|fonts| {
+            fonts
+                .layout_no_wrap(
+                    "Cancel".into(),
+                    egui::FontId::proportional(13.0),
+                    egui::Color32::WHITE,
+                )
+                .size()
+                .x
+        });
+        assert!(
+            cancel.width() >= label_width + 25.0,
+            "cancel padding: {cancel:?}, text={label_width}"
+        );
+        assert!(
+            (primary.left() - cancel.right() - 8.0).abs() < 0.5,
+            "footer gap: {cancel:?}, {primary:?}"
+        );
+        assert!((cancel.height() - primary.height()).abs() < 0.5);
+    }
+
+    #[test]
+    fn popup_parity_github_path_row_is_aligned_and_fills_the_form() {
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        let mut dialog =
+            WorkspaceAddUi::new(WorkspaceAddPurpose::SwitchRuntime, std::env::temp_dir());
+        dialog.source = WorkspaceSource::GitHub;
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(800.0, 750.0))
+            .build_ui(move |ui| {
+                dialog.show(ui.ctx(), &catalog);
+            });
+        harness.run();
+        let inputs: Vec<_> = harness
+            .query_all_by_role(egui::accesskit::Role::TextInput)
+            .map(|node| node.rect())
+            .collect();
+        let browse = harness.get_by_label("Browse…").rect();
+        assert!(
+            (browse.right() - inputs[0].right()).abs() < 0.5,
+            "path row leaves a gap: {browse:?}, url={:?}",
+            inputs[0]
+        );
+        assert!((browse.center().y - inputs[1].center().y).abs() < 0.5);
+        assert!((browse.left() - inputs[1].right() - 7.0).abs() < 0.5);
+    }
+
+    #[test]
+    #[ignore = "offscreen popup PNGs for manual visual review"]
+    fn popup_parity_render_workspace_add() {
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        let mut dialog = WorkspaceAddUi::new(
+            WorkspaceAddPurpose::SwitchRuntime,
+            PathBuf::from("/Users/jr/Projects"),
+        );
+        dialog.source = WorkspaceSource::GitHub;
+        dialog.remote_url = "https://github.com/example/serenity".into();
+        dialog.directory_name = "serenity".into();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(800.0, 750.0))
+            .build_ui(move |ui| {
+                dialog.show(ui.ctx(), &catalog);
+            });
+        crate::fonts::install_cjk_fallback(&harness.ctx, None, "JetBrainsMono", "Regular");
+        harness.ctx.set_visuals(egui::Visuals::dark());
+        harness.run();
+        let output = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/popup-parity");
+        std::fs::create_dir_all(&output).unwrap();
+        harness
+            .render()
+            .unwrap()
+            .save(output.join("01-workspace.png"))
+            .unwrap();
+    }
+
+    #[test]
+    fn popup_parity_footer_hint_aligns_with_the_fields() {
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        let mut dialog =
+            WorkspaceAddUi::new(WorkspaceAddPurpose::SwitchRuntime, std::env::temp_dir());
+        dialog.source = WorkspaceSource::GitHub;
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(800.0, 750.0))
+            .build_ui(move |ui| {
+                dialog.show(ui.ctx(), &catalog);
+            });
+        harness.run();
+        let input = harness
+            .query_all_by_role(egui::accesskit::Role::TextInput)
+            .next()
+            .unwrap()
+            .rect();
+        let hint_pos = harness
+            .output()
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == "Esc close" => Some(text.pos),
+                _ => None,
+            })
+            .expect("footer hint should be painted");
+        assert!(
+            (hint_pos.x - input.left()).abs() < 0.5,
+            "hint centered instead of left aligned: {hint_pos:?}, {input:?}"
+        );
+    }
+
+    #[test]
     fn github_add_dialog_stays_inside_a_narrow_window() {
         let catalog = i18n::Catalog::load("en-US").unwrap();
         let mut dialog =
@@ -895,6 +1045,7 @@ mod tests {
             .memory(|memory| memory.area_rect(egui::Id::new("workspace_add_source")))
             .expect("workspace add modal should be visible");
         assert!(rect.left() >= 0.0 && rect.right() <= 280.0, "{rect:?}");
+        assert!(rect.top() >= 0.0 && rect.bottom() <= 360.0, "{rect:?}");
     }
 
     #[test]

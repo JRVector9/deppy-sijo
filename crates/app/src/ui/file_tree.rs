@@ -147,6 +147,18 @@ impl SessionNameEdit {
     }
 }
 
+struct WorkspaceNameEdit {
+    workspace_id: String,
+    text: String,
+    request_focus: bool,
+}
+
+impl WorkspaceNameEdit {
+    fn input_id(&self) -> egui::Id {
+        egui::Id::new(("workspace_name_editor", &self.workspace_id))
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SessionNameEditResult {
     Submit,
@@ -410,10 +422,13 @@ pub enum SidebarAction {
     /// 기록)는 보존한다(설정의 「프로젝트 삭제」와 구분). 확인 다이얼로그 사용 여부는
     /// App의 사용자 설정이 결정한다.
     CloseWorkspace(String),
-    /// 워크스페이스 표시명(별칭) 편집 모달을 연다 — 실제 폴더/경로는 불변.
-    /// 편집 자체는 App 소유 모달이 하고(현재 별칭 원본은 App만 안다), 여기서는
-    /// 대상 id만 올린다.
+    /// 워크스페이스 행에 별칭 편집 커서를 둔다 — 실제 폴더/경로는 불변.
+    /// App이 현재 별칭 원본을 전달하면 트리가 인라인 입력 초안을 관리한다.
     RenameWorkspace(String),
+    CommitWorkspaceName {
+        workspace_id: String,
+        name: String,
+    },
     /// 워크스페이스가 하나도 없을 때의 빈 상태 CTA(큰 + 버튼) — 폴더 선택으로 새
     /// 워크스페이스를 만들어 전환한다. rfd 다이얼로그는 UI leaf가 아니라 App이 연다
     /// (기존 ws_create 관례, 2026-07-18).
@@ -1118,6 +1133,7 @@ pub struct FileTreeUi {
     env_warning_candidates: BTreeSet<PathBuf>,
     /// 우클릭으로 시작한 세션 이름 편집. 전환/숨김/종료 시 취소한다.
     session_name_edit: Option<SessionNameEdit>,
+    workspace_name_edit: Option<WorkspaceNameEdit>,
     /// 워크스페이스별 세션 트리 펼침 상태. 포커스 전환과 독립적이어서 다른 workspace를
     /// 선택해도 기존 트리는 사용자가 직접 접기 전까지 유지된다.
     workspace_sessions_expanded: HashMap<String, bool>,
@@ -1212,6 +1228,7 @@ impl FileTreeUi {
             measured_row_height: None,
             env_warning_candidates: BTreeSet::new(),
             session_name_edit: None,
+            workspace_name_edit: None,
             workspace_sessions_expanded: HashMap::new(),
             last_sidebar_active_workspace: None,
             selected: BTreeSet::new(),
@@ -1242,6 +1259,11 @@ impl FileTreeUi {
 
     pub fn collapse_project_file_panel(&mut self) {
         self.collapsed = true;
+    }
+
+    /// Worker completions can request this dialog before the sidebar renders it.
+    pub fn has_pending_confirmation(&self) -> bool {
+        self.confirm_delete.is_some()
     }
 
     /// 이번 프레임 트리가 소비한 (⌘V, ⌘C). App이 같은 프레임 터미널 이중 처리
@@ -1959,6 +1981,40 @@ impl FileTreeUi {
         self.notes.apply_external_edit(workspace_id, body);
     }
 
+    pub fn begin_workspace_rename(&mut self, workspace_id: String, alias: String) {
+        self.workspace_name_edit = Some(WorkspaceNameEdit {
+            workspace_id,
+            text: alias,
+            request_focus: true,
+        });
+    }
+
+    fn finish_workspace_rename(
+        &mut self,
+        ctx: &egui::Context,
+        result: Option<SessionNameEditResult>,
+        action: &mut Option<SidebarAction>,
+    ) {
+        if let Some(result) = result
+            && let Some(edit) = self.take_workspace_name_edit(ctx)
+            && result == SessionNameEditResult::Submit
+        {
+            *action = Some(SidebarAction::CommitWorkspaceName {
+                workspace_id: edit.workspace_id,
+                name: edit.text.trim().to_owned(),
+            });
+        }
+    }
+
+    fn take_workspace_name_edit(&mut self, ctx: &egui::Context) -> Option<WorkspaceNameEdit> {
+        let edit = self.workspace_name_edit.take()?;
+        let id = edit.input_id();
+        ctx.memory_mut(|memory| memory.surrender_focus(id));
+        ctx.data_mut(|data| data.remove::<egui::text_edit::TextEditState>(id));
+        ctx.request_repaint();
+        Some(edit)
+    }
+
     fn take_session_name_edit(&mut self, ctx: &egui::Context) -> Option<SessionNameEdit> {
         let edit = self.session_name_edit.take()?;
         let id = edit.input_id();
@@ -1975,12 +2031,16 @@ impl FileTreeUi {
         sidebar: &SidebarSnapshot<'_>,
         catalog: &i18n::Catalog,
     ) -> Option<SidebarAction> {
+        // A worker-requested confirmation must stay reachable even with Notes selected,
+        // a collapsed panel, or an unavailable directory listing.
+        self.permanent_delete_confirm(ui, catalog);
         let navigation_action = self.navigation_rail_panel(ui, sidebar, catalog);
         let project_action = self.project_file_panel(ui, sessions_by_workspace, sidebar, catalog);
         let action = project_action.or(navigation_action);
         if action.is_some() {
             // 다른 세션/워크스페이스/도구로 이동한 뒤 숨은 초안을 확정하지 않는다.
             let _ = self.take_session_name_edit(ui.ctx());
+            let _ = self.take_workspace_name_edit(ui.ctx());
         }
         action
     }
@@ -2257,6 +2317,9 @@ impl FileTreeUi {
                     &mut self.last_sidebar_active_workspace,
                     sidebar.active_workspace_id,
                 );
+                if self.workspace_name_edit.as_ref().is_some_and(|edit| !sidebar.workspaces.iter().any(|workspace| workspace.id == edit.workspace_id)) {
+                    let _ = self.take_workspace_name_edit(ui.ctx());
+                }
                 if sidebar.workspaces.is_empty() {
                     ui.add_space(3.0);
                     // 빈 상태 — 워크스페이스가 하나도 없으면(종료 숨김 반영) 헤더/목록 대신
@@ -2328,8 +2391,10 @@ impl FileTreeUi {
                                         color,
                                         false,
                                         Some(expanded),
+                                        self.workspace_name_edit.as_mut().filter(|edit| edit.workspace_id == workspace.id),
                                         catalog,
                                     );
+                                    self.finish_workspace_rename(ui.ctx(), resp.edit_result, &mut action);
                                     let row = &resp.row;
                                     workspace_context_menu(row, workspace, catalog, &mut action);
                                     if track_workspace_drag(
@@ -2387,8 +2452,10 @@ impl FileTreeUi {
                                         active_color,
                                         true,
                                         Some(expanded),
+                                        self.workspace_name_edit.as_mut().filter(|edit| edit.workspace_id == active.id),
                                         catalog,
                                     );
+                                    self.finish_workspace_rename(ui.ctx(), resp.edit_result, &mut action);
                                     let row = &resp.row;
                                     workspace_context_menu(row, active, catalog, &mut action);
                                     if track_workspace_drag(row, &active.id, &mut self.workspace_drag)
@@ -2682,8 +2749,10 @@ impl FileTreeUi {
                                         color,
                                         false,
                                         Some(expanded),
+                                        self.workspace_name_edit.as_mut().filter(|edit| edit.workspace_id == workspace.id),
                                         catalog,
                                     );
+                                    self.finish_workspace_rename(ui.ctx(), resp.edit_result, &mut action);
                                     let row = &resp.row;
                                     workspace_context_menu(row, workspace, catalog, &mut action);
                                     if track_workspace_drag(
@@ -3147,6 +3216,8 @@ impl FileTreeUi {
             }) => Some((false, parent, buffer, focus)),
             _ => None,
         };
+        let creation_open = creation_edit.is_some();
+        let creation_error = self.error.clone();
         if let Some((is_folder, parent, buffer, focus)) = creation_edit {
             let title = catalog.t(
                 if is_folder {
@@ -3190,10 +3261,7 @@ impl FileTreeUi {
                 |ui| {
                     crate::ui::popup::body(ui, |ui| {
                         crate::ui::popup::field(ui, &field_label, Some(&location), |ui| {
-                            let resp = ui.add(
-                                egui::TextEdit::singleline(buffer)
-                                    .desired_width(ui.available_width()),
-                            );
+                            let resp = crate::ui::popup::text_input(ui, buffer, "");
                             if *focus {
                                 resp.request_focus(); // 키가 터미널로 새지 않게 즉시 포커스
                                 *focus = false;
@@ -3201,30 +3269,41 @@ impl FileTreeUi {
                             enter = (resp.has_focus() || resp.lost_focus())
                                 && ui.input(|i| i.key_pressed(egui::Key::Enter));
                         });
-                    });
-                    crate::ui::popup::footer(ui, |ui| {
-                        if crate::ui::popup::action_button(
-                            ui,
-                            &catalog.t("action.new", &[]),
-                            crate::ui::popup::ActionTone::Primary,
-                            true,
-                        )
-                        .clicked()
-                            || enter
-                        {
-                            edit_done = Some(true);
-                        }
-                        if crate::ui::popup::action_button(
-                            ui,
-                            &catalog.t("action.cancel", &[]),
-                            crate::ui::popup::ActionTone::Secondary,
-                            true,
-                        )
-                        .clicked()
-                        {
-                            edit_done = Some(false);
+                        if let Some(error) = &creation_error {
+                            crate::ui::popup::notice(
+                                ui,
+                                error,
+                                crate::ui::popup::NoticeTone::Error,
+                            );
                         }
                     });
+                    crate::ui::popup::footer(
+                        ui,
+                        Some(&catalog.t("popup.shortcut_create", &[])),
+                        |ui| {
+                            if crate::ui::popup::action_button(
+                                ui,
+                                &catalog.t("file_tree.create", &[]),
+                                crate::ui::popup::ActionTone::Primary,
+                                true,
+                            )
+                            .clicked()
+                                || enter
+                            {
+                                edit_done = Some(true);
+                            }
+                            if crate::ui::popup::action_button(
+                                ui,
+                                &catalog.t("action.cancel", &[]),
+                                crate::ui::popup::ActionTone::Ghost,
+                                true,
+                            )
+                            .clicked()
+                            {
+                                edit_done = Some(false);
+                            }
+                        },
+                    );
                 },
             );
             if modal && edit_done.is_none() {
@@ -3258,7 +3337,7 @@ impl FileTreeUi {
         // 그리고 나서 바뀐 상태는 이번 프레임에 실을 수 없으므로 아래에서 한 프레임을
         // 더 요청한다(`status_*` 스냅샷).
         let status_error = self.error.clone();
-        if let Some(err) = status_error.clone() {
+        if !creation_open && let Some(err) = status_error.clone() {
             ui.horizontal(|ui| {
                 ui.colored_label(ui.visuals().error_fg_color, err);
                 if ui.small_button("×").clicked() {
@@ -3266,8 +3345,6 @@ impl FileTreeUi {
                 }
             });
         }
-        // 휴지통 실패 → 영구삭제 확인 (§9-7 — 조용한 영구삭제 금지).
-        self.permanent_delete_confirm(ui, catalog);
         // 가상화: 고정 행높이 + path 기반 explicit Id (§9-6).
         // 행높이는 실측 자기보정 — 선언값과 실제가 어긋나면 클릭 대상이 밀린다(필드 주석).
         let row_height = self.measured_row_height.unwrap_or(25.0);
@@ -4169,7 +4246,10 @@ impl FileTreeUi {
         let Some(root) = self.root.clone() else {
             return;
         };
-        if ui.ctx().text_edit_focused() || ui.ctx().any_popup_open() {
+        if ui.ctx().text_edit_focused()
+            || ui.ctx().any_popup_open()
+            || !ui.memory(|memory| memory.allows_interaction(ui.layer_id()))
+        {
             return;
         }
         let pointer_over = ui
@@ -4279,7 +4359,7 @@ impl FileTreeUi {
         // 디렉터리면 통째로 지운다.
         // 키를 변수로 묶지 않는 이유: xtask i18n-check의 키 커버리지는 **리터럴** 호출만
         // 대조한다. 변수로 넘기면 dynamic으로 세어 넘어가 로케일 누락을 못 잡는다.
-        let prompt = if target.is_dir {
+        let mut prompt = if target.is_dir {
             catalog.t(
                 "file_tree.permanent_delete_folder_prompt",
                 &[("name", &target.label)],
@@ -4290,12 +4370,29 @@ impl FileTreeUi {
                 &[("name", &target.label)],
             )
         };
-        ui.colored_label(ui.visuals().warn_fg_color, prompt);
-        ui.horizontal(|ui| {
-            if ui
-                .button(catalog.t("file_tree.permanent_delete", &[]))
-                .clicked()
-            {
+        if let Some(error) = self.error.as_deref()
+            && error != file_tree_io_error_message(FileTreeIoErrorCode::TrashUnavailable)
+        {
+            // A rejected retry must be visible above the modal backdrop.
+            prompt.push_str("\n\n");
+            prompt.push_str(error);
+        }
+        let path_label = target.path.display().to_string();
+        let choice = super::popup::confirmation(
+            ui.ctx(),
+            super::popup::ConfirmationSpec {
+                id: egui::Id::new("file_permanent_delete_confirmation"),
+                title: &catalog.t("file_tree.permanent_delete_title", &[]),
+                subtitle: "",
+                target: Some(&path_label),
+                message: &prompt,
+                confirm_label: &catalog.t("file_tree.permanent_delete", &[]),
+                cancel_label: &catalog.t("action.cancel", &[]),
+                close_label: &catalog.t("popup.dismiss", &[]),
+            },
+        );
+        match choice {
+            Some(super::popup::ConfirmationChoice::Confirm) => {
                 let path = target.path.clone();
                 let refresh: Vec<PathBuf> =
                     path.parent().map(Path::to_path_buf).into_iter().collect();
@@ -4311,10 +4408,11 @@ impl FileTreeUi {
                     Err(code) => self.reject_io(code),
                 }
             }
-            if ui.button(catalog.t("action.cancel", &[])).clicked() {
+            Some(super::popup::ConfirmationChoice::Cancel) => {
                 self.confirm_delete = None;
             }
-        });
+            None => {}
+        }
     }
 
     /// 휴지통 이동 intent. 실패 completion만 영구삭제 확인으로 승격한다.
@@ -5024,6 +5122,7 @@ struct WorkspaceRowResponse {
     row: egui::Response,
     /// chevron을 눌렀다 — 호출자는 펼침만 토글하고 전환은 방출하지 않는다.
     disclosure_clicked: bool,
+    edit_result: Option<SessionNameEditResult>,
 }
 
 fn workspace_row(
@@ -5032,6 +5131,7 @@ fn workspace_row(
     color: egui::Color32,
     active: bool,
     expanded: Option<bool>,
+    edit: Option<&mut WorkspaceNameEdit>,
     catalog: &i18n::Catalog,
 ) -> WorkspaceRowResponse {
     // 2026-07-26 사용자: 워크스페이스 헤더와 아바타를 다시 10% 축소한다.
@@ -5059,6 +5159,7 @@ fn workspace_row(
         return WorkspaceRowResponse {
             row: response,
             disclosure_clicked: false,
+            edit_result: edit.map(|_| SessionNameEditResult::Cancel),
         };
     }
     // 여기부터는 **그리기 좌표**만 물리 픽셀에 맞춘다 (클릭 판정은 위 response가 원래
@@ -5160,6 +5261,7 @@ fn workspace_row(
                 None,
             )
         });
+    let mut edit_result = None;
     if rect.width() >= 64.0 {
         // 요약 배지 자리를 **실제 폭**만큼만 예약한다 — 고정 198px는 "유휴 5"처럼
         // 짧은 요약에도 이름을 훨씬 일찍 잘라 옆 여백이 남았다(2026-07-18 사용자).
@@ -5171,7 +5273,24 @@ fn workspace_row(
             7.0
         };
         let name_width = (rect.right() - reserved_right - avatar.right() - 7.5).max(0.0);
-        if name_width > 4.0 {
+        if let Some(edit) = edit {
+            let input_rect = egui::Rect::from_min_max(
+                egui::pos2(avatar.right() + 7.5, full_rect.top() + 3.0),
+                egui::pos2(
+                    (rect.right() - reserved_right).max(avatar.right() + 8.5),
+                    full_rect.bottom() - 3.0,
+                ),
+            );
+            edit_result = inline_name_editor(
+                ui,
+                input_rect,
+                edit.input_id(),
+                &mut edit.text,
+                &mut edit.request_focus,
+                crate::fonts::sidebar_font(ui.ctx(), 14.0),
+                &workspace.name,
+            );
+        } else if name_width > 4.0 {
             let name = clipped_line(
                 ui,
                 workspace_label(&workspace.name),
@@ -5189,6 +5308,8 @@ fn workspace_row(
             ui.painter()
                 .galley(name_pos, name, ui.visuals().text_color());
         }
+    } else if edit.is_some() {
+        edit_result = Some(SessionNameEditResult::Cancel);
     }
     if let Some(count) = count_galley {
         let right = if show_disclosure {
@@ -5263,6 +5384,7 @@ fn workspace_row(
     WorkspaceRowResponse {
         row: response,
         disclosure_clicked,
+        edit_result,
     }
 }
 
@@ -6671,18 +6793,31 @@ fn session_name_editor(
     rect: egui::Rect,
     edit: &mut SessionNameEdit,
 ) -> Option<SessionNameEditResult> {
+    inline_name_editor(
+        ui,
+        rect,
+        edit.input_id(),
+        &mut edit.text,
+        &mut edit.request_focus,
+        crate::fonts::sidebar_font(ui.ctx(), SESSION_TITLE_FONT_SIZE),
+        "",
+    )
+}
+
+fn inline_name_editor(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    id: egui::Id,
+    text: &mut String,
+    request_focus: &mut bool,
+    font: egui::FontId,
+    hint: &str,
+) -> Option<SessionNameEditResult> {
     let blocked = !ui.is_enabled()
         || !ui.is_rect_visible(rect)
         || !ui.input(|input| input.focused)
-        || ui.ctx().any_popup_open()
-        || ui.memory(|memory| {
-            !memory.allows_interaction(ui.layer_id())
-                || memory
-                    .areas()
-                    .visible_layer_ids()
-                    .iter()
-                    .any(super::workspace::is_blocking_terminal_window)
-        });
+        || super::popup::background_input_blocked(ui.ctx())
+        || ui.memory(|memory| !memory.allows_interaction(ui.layer_id()));
     let clicked_outside = ui.input(|input| {
         input.pointer.any_pressed()
             && input
@@ -6693,8 +6828,7 @@ fn session_name_editor(
     if blocked || clicked_outside {
         return Some(SessionNameEditResult::Cancel);
     }
-    let id = edit.input_id();
-    if std::mem::take(&mut edit.request_focus) {
+    if std::mem::take(request_focus) {
         // 시작할 때 한 번만 요청한다. 매 프레임 터미널/다른 입력창의 포커스를 빼앗지 않는다.
         ui.memory_mut(|memory| memory.request_focus(id));
     }
@@ -6705,13 +6839,11 @@ fn session_name_editor(
     });
     let response = ui.put(
         rect,
-        egui::TextEdit::singleline(&mut edit.text)
+        egui::TextEdit::singleline(text)
             .id(id)
             .return_key(None)
-            .font(crate::fonts::sidebar_font(
-                ui.ctx(),
-                SESSION_TITLE_FONT_SIZE,
-            ))
+            .font(font)
+            .hint_text(hint)
             .frame(egui::Frame::NONE)
             .margin(egui::Margin::ZERO)
             .vertical_align(egui::Align::Center),
@@ -6739,6 +6871,10 @@ fn session_name_editor(
         });
         if result.is_some() {
             // 확정 후 포커스를 해제해도 같은 프레임에 입력한 문자/Enter가 PTY로 새지 않는다.
+            // egui 이벤트와 따로 보관된 AppKit batch도 이 편집창 소유다. 비활성
+            // terminal은 이를 drain하지 않으므로 여기서 비워 다음 pass 재생도 막는다.
+            let _ = crate::native_key_monitor::drain();
+            super::popup::set_pending_modal(ui.ctx(), true);
             ui.input_mut(|input| {
                 let keep = |event: &egui::Event| {
                     !matches!(
@@ -8539,6 +8675,7 @@ mod tests {
                 &workspace,
                 egui::Color32::LIGHT_BLUE,
                 true,
+                None,
                 None,
                 &catalog,
             );
@@ -12407,7 +12544,7 @@ mod tests {
             generation: intent.generation,
             result: Err(FileTreeIoErrorCode::TrashUnavailable),
         });
-        harness.step();
+        harness.run();
 
         let prompt = catalog.t(
             "file_tree.permanent_delete_prompt",
@@ -12650,7 +12787,7 @@ mod tests {
             generation: file_intent.generation,
             result: Err(FileTreeIoErrorCode::TrashUnavailable),
         });
-        harness.step();
+        harness.run();
 
         assert!(
             harness
@@ -12670,6 +12807,11 @@ mod tests {
             "파일명만 쓴 옛 문구가 돌아왔다 — 루트의 mod.rs와 src/mod.rs를 구분할 수 없다"
         );
 
+        // 확인 모달을 취소해야 다음 행을 조작할 수 있다.
+        harness
+            .get_by_label(&catalog.t("action.cancel", &[]))
+            .click();
+        harness.run();
         // 폴더 행: 종류(is_dir)도 같은 길로 흘러야 "안의 내용까지" 문구가 나온다.
         let folder_row = topmost_row_center(&harness, "inner", 1);
         let folder_intent = trash_row_via_context_menu(
@@ -12742,7 +12884,7 @@ mod tests {
             .state_mut()
             .0
             .copy_files_to_clipboard(&[base.join("src/mod.rs")]);
-        harness.step();
+        harness.run();
 
         harness
             .get_by_label(&catalog.t("file_tree.permanent_delete", &[]))
@@ -12760,6 +12902,23 @@ mod tests {
             harness.state().0.confirm_delete,
             Some(target),
             "큐가 거절해 아무것도 지우지 않았는데 확인이 사라졌다 — 다시 누를 화면이 없다"
+        );
+        let warning = format!(
+            "{}\n\n{}",
+            catalog.t(
+                "file_tree.permanent_delete_prompt",
+                &[("name", "src/mod.rs")]
+            ),
+            file_tree_io_error_message(FileTreeIoErrorCode::Busy)
+        );
+        let warning_rect = harness.get_by_label(&warning).rect();
+        let modal_rect = harness
+            .ctx
+            .memory(|memory| memory.area_rect(egui::Id::new("file_permanent_delete_confirmation")))
+            .unwrap();
+        assert!(
+            modal_rect.contains_rect(warning_rect),
+            "retry failure must be visible inside the modal"
         );
         let queued = harness
             .state_mut()
@@ -13167,6 +13326,99 @@ mod tests {
             ),
             "이름 바꾸기 클릭이 RenameWorkspace 액션을 내지 않음"
         );
+    }
+
+    #[test]
+    fn inline_workspace_rename_keeps_the_cursor_inside_the_row_and_commits_id() {
+        use egui_kittest::kittest::Queryable;
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        let workspaces = vec![SidebarWorkspaceEntry {
+            id: "ws-inline".into(),
+            name: "Serenity".into(),
+            state: SidebarWorkspaceState::Active,
+            summary: Default::default(),
+        }];
+        let mut harness = close_menu_harness(&workspaces, "ws-inline", &catalog);
+        harness
+            .state_mut()
+            .0
+            .begin_workspace_rename("ws-inline".into(), "Serenity".into());
+        harness.run();
+        let row = harness.get_by_label("Serenity").rect();
+        let input = harness.get_by_role(egui::accesskit::Role::TextInput).rect();
+        assert!(
+            row.contains_rect(input),
+            "name editor escaped the row: {row:?}, {input:?}"
+        );
+        assert!(harness.ctx.text_edit_focused());
+        harness
+            .get_by_role(egui::accesskit::Role::TextInput)
+            .type_text(" App");
+        harness.run();
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+        assert!(harness.state().1.iter().any(|action| matches!(action, SidebarAction::CommitWorkspaceName {workspace_id, name} if workspace_id == "ws-inline" && name == "Serenity App")));
+        harness
+            .state_mut()
+            .0
+            .begin_workspace_rename("ws-inline".into(), "Serenity".into());
+        harness.run();
+        harness.key_press(egui::Key::Escape);
+        harness.run();
+        assert!(harness.state().0.workspace_name_edit.is_none());
+        assert_eq!(
+            harness
+                .state()
+                .1
+                .iter()
+                .filter(|action| matches!(action, SidebarAction::CommitWorkspaceName { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn popup_review_closed_context_menu_does_not_cancel_inline_rename() {
+        let ctx = egui::Context::default();
+        let mut open = true;
+        let raw = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        for frame in 0..3 {
+            ctx.run_ui(raw(), |ui| {
+                let anchor = ui.button("Workspace");
+                egui::Popup::menu(&anchor).open_bool(&mut open).show(|ui| {
+                    ui.label("Rename workspace");
+                    if frame == 2 {
+                        ui.close();
+                    }
+                });
+            })
+            .drop_without_applying_deltas();
+        }
+        let mut result = None;
+        ctx.run_ui(raw(), |ui| {
+            assert!(!open && !ctx.any_popup_open());
+            result = inline_name_editor(
+                ui,
+                egui::Rect::from_min_size(egui::pos2(5.0, 5.0), egui::vec2(180.0, 25.0)),
+                egui::Id::new("editor"),
+                &mut "name".into(),
+                &mut true,
+                egui::FontId::proportional(14.0),
+                "",
+            );
+        })
+        .drop_without_applying_deltas();
+        assert!(
+            result.is_none(),
+            "a just-closed menu must allow the new editor to receive focus"
+        );
+        assert!(ctx.text_edit_focused());
     }
 
     /// Idle(비활성) 워크스페이스 메뉴에도 「세션 열기」와 「이름 바꾸기」는 있고 종료
@@ -14425,6 +14677,152 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "offscreen popup PNGs for manual visual review"]
+    fn popup_parity_render_file_tree_confirmation_and_inline() {
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        let output = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/popup-parity");
+        std::fs::create_dir_all(&output).unwrap();
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.root = Some(PathBuf::from("/Users/jr/Projects/Serenity"));
+        tree.confirm_delete = Some(DeleteTarget {
+            path: PathBuf::from("/Users/jr/Projects/Serenity/assets/old-icons"),
+            label: "assets/old-icons".into(),
+            is_dir: true,
+        });
+        let mut harness = delete_confirm_harness(tree, &catalog);
+        harness.set_size(egui::vec2(800.0, 650.0));
+        crate::fonts::install_cjk_fallback(&harness.ctx, None, "JetBrainsMono", "Regular");
+        harness.ctx.set_visuals(egui::Visuals::dark());
+        harness.run();
+        assert!(
+            harness
+                .ctx
+                .memory(
+                    |memory| memory.area_rect(egui::Id::new("file_permanent_delete_confirmation"))
+                )
+                .is_some()
+        );
+        harness
+            .render()
+            .unwrap()
+            .save(output.join("13-delete.png"))
+            .unwrap();
+        let workspaces = vec![SidebarWorkspaceEntry {
+            id: "ws-inline".into(),
+            name: "Serenity".into(),
+            state: SidebarWorkspaceState::Active,
+            summary: Default::default(),
+        }];
+        let mut harness = close_menu_harness(&workspaces, "ws-inline", &catalog);
+        harness
+            .state_mut()
+            .0
+            .begin_workspace_rename("ws-inline".into(), "Serenity".into());
+        harness.ctx.set_visuals(egui::Visuals::dark());
+        harness.run();
+        harness
+            .render()
+            .unwrap()
+            .save(output.join("04-inline-rename.png"))
+            .unwrap();
+    }
+
+    #[test]
+    #[ignore = "offscreen popup PNGs for manual visual review"]
+    fn popup_parity_render_file_tree_create() {
+        use egui_kittest::kittest::Queryable;
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        let root = PathBuf::from("/Users/jr/Projects/Serenity");
+        for is_folder in [true, false] {
+            let mut tree = FileTreeUi::new(egui::Context::default());
+            tree.root = Some(root.clone());
+            tree.edit = Some(if is_folder {
+                EditState::NewFolder {
+                    parent: root.clone(),
+                    buffer: "새 폴더".into(),
+                    focus: false,
+                }
+            } else {
+                EditState::NewFile {
+                    parent: root.clone(),
+                    buffer: "notes.md".into(),
+                    focus: false,
+                }
+            });
+            let mut harness = drop_harness(&catalog, tree);
+            harness.set_size(egui::vec2(800.0, 750.0));
+            crate::fonts::install_cjk_fallback(&harness.ctx, None, "JetBrainsMono", "Regular");
+            harness.ctx.set_visuals(egui::Visuals::dark());
+            harness.run();
+            harness.run();
+            let input = harness.get_by_role(egui::accesskit::Role::TextInput).rect();
+            assert!((input.height() - 36.0).abs() < 0.5, "{input:?}");
+            let output =
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/popup-parity");
+            std::fs::create_dir_all(&output).unwrap();
+            harness
+                .render()
+                .unwrap()
+                .save(output.join(if is_folder {
+                    "02-folder.png"
+                } else {
+                    "03-file.png"
+                }))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn popup_audit_creation_error_is_visible_inside_the_form_and_draft_is_kept() {
+        use egui_kittest::kittest::Queryable;
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        for is_folder in [true, false] {
+            let root = PathBuf::from("/tree-layout");
+            let mut tree = FileTreeUi::new(egui::Context::default());
+            tree.root = Some(root.clone());
+            tree.children = Some(vec![file("anchor.txt")]);
+            tree.rebuild_flat();
+            tree.edit = Some(if is_folder {
+                EditState::NewFolder {
+                    parent: root,
+                    buffer: "invalid/name".into(),
+                    focus: true,
+                }
+            } else {
+                EditState::NewFile {
+                    parent: root,
+                    buffer: "invalid/name".into(),
+                    focus: true,
+                }
+            });
+            let mut harness = drop_harness(&catalog, tree);
+            harness.run();
+            harness.run();
+            harness
+                .get_by_label(&catalog.t("file_tree.create", &[]))
+                .click();
+            harness.run();
+            let error = harness
+                .state()
+                .0
+                .error
+                .clone()
+                .expect("invalid name must report an error");
+            let modal_rect = harness
+                .ctx
+                .memory(|memory| memory.area_rect(egui::Id::new("file_tree_create")))
+                .unwrap();
+            let error_rect = harness.get_by_label(&error).rect();
+            assert!(
+                modal_rect.contains_rect(error_rect),
+                "creation error must be visible above the backdrop: {error_rect:?} vs {modal_rect:?}"
+            );
+            assert!(harness.state().0.edit.is_some());
+            assert!(harness.state_mut().0.take_io_intent().is_none());
+        }
+    }
+
+    #[test]
     fn kittest_새폴더_모달_enter가_생성요청을_낸다() {
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
         let root = PathBuf::from("/tree-layout");
@@ -14955,5 +15353,90 @@ mod tests {
         assert!(marker.right() > marker.left(), "폭이 역전되면 안 된다");
         assert!(marker.width() >= 24.0 - f32::EPSILON);
         assert!(marker.left() >= row.left());
+    }
+    #[test]
+    fn popup_behavior_probe_trash_failure_before_shortcuts() {
+        let ctx = egui::Context::default();
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        let mut tree = FileTreeUi::new(ctx.clone());
+        tree.spawn_trash(DeleteTarget {
+            path: PathBuf::from("/popup-review/a.txt"),
+            label: "a.txt".into(),
+            is_dir: false,
+        });
+        let intent = tree.take_io_intent().unwrap();
+        tree.complete_io(FileTreeIoCompletion {
+            operation: intent.operation,
+            generation: intent.generation,
+            result: Err(FileTreeIoErrorCode::TrashUnavailable),
+        });
+        assert!(tree.confirm_delete.is_some());
+        let config = crate::config::ShortcutsConfig::default();
+        let binding = crate::shortcuts::effective_binding(
+            &config,
+            crate::shortcuts::ShortcutAction::ClosePane,
+        )
+        .unwrap();
+        let mut admitted = None;
+        ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: binding.logical_key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: binding.modifiers,
+                }],
+                ..Default::default()
+            },
+            |ui| {
+                // The App publishes this state before consuming configured shortcuts.
+                crate::ui::popup::set_pending_modal(ui.ctx(), tree.has_pending_confirmation());
+                admitted = crate::shortcuts::take_triggered_action(ui.ctx(), &config);
+                tree.permanent_delete_confirm(ui, &catalog);
+            },
+        )
+        .drop_without_applying_deltas();
+        println!("global shortcut admitted before first trash modal: {admitted:?}");
+        assert!(
+            admitted.is_none(),
+            "pending permanent-delete confirmation must fence global shortcuts before render"
+        );
+    }
+
+    #[test]
+    fn popup_behavior_pending_delete_is_visible_when_file_list_is_hidden() {
+        use egui_kittest::kittest::Queryable;
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        for collapsed in [true, false] {
+            let mut tree = FileTreeUi::new(egui::Context::default());
+            tree.root = Some(PathBuf::from("/popup-review"));
+            tree.collapsed = collapsed;
+            if !collapsed {
+                tree.selected_tool = SidebarTool::Notes;
+            }
+            tree.spawn_trash(DeleteTarget {
+                path: PathBuf::from("/popup-review/a.txt"),
+                label: "a.txt".into(),
+                is_dir: false,
+            });
+            let intent = tree.take_io_intent().unwrap();
+            tree.complete_io(FileTreeIoCompletion {
+                operation: intent.operation,
+                generation: intent.generation,
+                result: Err(FileTreeIoErrorCode::TrashUnavailable),
+            });
+            let mut harness = delete_confirm_harness(tree, &catalog);
+            harness.run();
+            assert!(
+                harness
+                    .query_by_label(&catalog.t("file_tree.permanent_delete", &[]))
+                    .is_some(),
+                "pending confirmation hidden, collapsed={collapsed}"
+            );
+            harness.key_press(egui::Key::Escape);
+            harness.run();
+            assert!(!harness.state().0.has_pending_confirmation());
+        }
     }
 }

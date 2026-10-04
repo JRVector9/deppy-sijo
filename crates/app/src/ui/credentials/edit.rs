@@ -84,6 +84,7 @@ impl CredentialsUi {
         };
         let mut cancel = false;
         let mut save = false;
+        crate::ui::popup::set_pending_modal(ctx, true);
         let response = egui::Modal::new(egui::Id::new("credential_edit_window")).show(ctx, |ui| {
             ui.set_width(320.0);
             ui.heading(catalog.t("credentials.edit.title", &[]));

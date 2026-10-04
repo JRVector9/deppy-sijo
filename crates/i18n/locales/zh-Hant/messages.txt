@@ -1358,6 +1358,10 @@ workspace.add.github = GitHub 儲存庫
 workspace.add.local_hint = 將現有資料夾作為工作區開啟。
 workspace.add.choose_folder = 選擇資料夾…
 workspace.add.url = 儲存庫 URL
+workspace.add.url_hint = 支援格式：GitHub HTTPS 或 SSH 位址
+popup.shortcut_close = Esc 關閉
+popup.shortcut_create = Enter 建立 · Esc 關閉
+file_tree.create = 建立
 workspace.add.destination = 儲存位置
 workspace.add.browse = 瀏覽…
 workspace.add.folder_name = 資料夾名稱
@@ -1381,3 +1385,19 @@ workspace.add.worker_failed = 無法啟動複製工作。
 workspace.add.registration_failed = 無法將資料夾加入工作區。請重試。
 workspace.add.switch_failed = 工作區已加入，但無法開啟。請重試。
 workspace.add.choosing = 正在選擇資料夾…
+resource_manager.confirm_session.title = 結束工作階段
+resource_manager.confirm_unattached.title = 結束未連接的程序
+ports.confirm_title = 結束連接埠程序
+file_tree.permanent_delete_title = 確認永久刪除
+popup.dismiss = 關閉對話框
+
+document.confirm_discard.warning = 捨棄未儲存的變更後無法復原。
+workspace.folder_moved.failed = 無法更新資料夾路徑，請重試。
+
+workspace.add.folder_identity_conflict = 所選資料夾的磁碟區不同或無法驗證原磁碟區。請在工作區設定中重新連接專案路徑後再開啟。
+
+fleet.idle_observed_for = 觀測等待 {value}
+fleet.followup.list = 後續工作 ({count})
+fleet.followup.empty = 沒有已排程的工作
+
+env.delete_source = 要從哪個檔案刪除

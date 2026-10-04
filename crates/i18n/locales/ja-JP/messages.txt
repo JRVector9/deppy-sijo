@@ -1358,6 +1358,10 @@ workspace.add.github = GitHub リポジトリ
 workspace.add.local_hint = 既存のフォルダをワークスペースとして開きます。
 workspace.add.choose_folder = フォルダを選択…
 workspace.add.url = リポジトリ URL
+workspace.add.url_hint = 対応形式: GitHubのHTTPSまたはSSH URL
+popup.shortcut_close = Esc 閉じる
+popup.shortcut_create = Enter 作成 · Esc 閉じる
+file_tree.create = 作成
 workspace.add.destination = 保存先
 workspace.add.browse = 参照…
 workspace.add.folder_name = フォルダ名
@@ -1381,3 +1385,19 @@ workspace.add.worker_failed = クローン処理を開始できませんでし�
 workspace.add.registration_failed = フォルダをワークスペースに追加できませんでした。再試行してください。
 workspace.add.switch_failed = ワークスペースに追加しましたが開けませんでした。再試行してください。
 workspace.add.choosing = フォルダを選択中…
+resource_manager.confirm_session.title = セッションを終了
+resource_manager.confirm_unattached.title = 未接続プロセスを終了
+ports.confirm_title = ポートのプロセスを終了
+file_tree.permanent_delete_title = 完全削除の確認
+popup.dismiss = ダイアログを閉じる
+
+document.confirm_discard.warning = 未保存の変更を破棄すると元に戻せません。
+workspace.folder_moved.failed = フォルダーのパスを更新できませんでした。もう一度お試しください。
+
+workspace.add.folder_identity_conflict = 選択したフォルダーのボリュームが異なるか、以前のボリュームを確認できません。ワークスペース設定でプロジェクトのパスを再接続してから開いてください。
+
+fleet.idle_observed_for = 観測から {value} 待機
+fleet.followup.list = 次の作業 ({count})
+fleet.followup.empty = 予約された作業なし
+
+env.delete_source = 削除元のファイル

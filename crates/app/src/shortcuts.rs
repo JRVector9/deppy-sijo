@@ -450,6 +450,9 @@ pub fn take_triggered_action(
     ctx: &egui::Context,
     config: &ShortcutsConfig,
 ) -> Option<ShortcutAction> {
+    if crate::ui::popup::background_input_blocked(ctx) {
+        return None;
+    }
     let conflicts = conflicts(config);
     let bindings: Vec<_> = ShortcutAction::ALL
         .into_iter()
@@ -593,6 +596,114 @@ fn parse_key(name: &str) -> Option<egui::Key> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn popup_audit_confirmation_blocks_global_close_shortcut_without_consuming_it() {
+        let ctx = egui::Context::default();
+        let config = ShortcutsConfig::default();
+        let binding = effective_binding(&config, ShortcutAction::ClosePane).unwrap();
+        let mut action = None;
+        ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: binding.logical_key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: binding.modifiers,
+                }],
+                ..Default::default()
+            },
+            |ui| {
+                crate::ui::popup::show(
+                    ui.ctx(),
+                    crate::ui::popup::PopupSpec {
+                        id: egui::Id::new("popup_audit_confirm"),
+                        width: 400.0,
+                        title: "Confirm session close",
+                        subtitle: "",
+                        close_label: "Close",
+                        close_enabled: true,
+                    },
+                    |ui| {
+                        ui.label("Confirm session close");
+                    },
+                );
+                action = take_triggered_action(ui.ctx(), &config);
+                assert!(ui.input(|input| {
+                    input
+                        .events
+                        .iter()
+                        .any(|event| matches!(event, egui::Event::Key { pressed: true, .. }))
+                }));
+            },
+        )
+        .drop_without_applying_deltas();
+        assert_eq!(
+            action, None,
+            "confirmation must own keys before a session can close"
+        );
+    }
+
+    #[test]
+    fn popup_audit_floating_form_blocks_global_close_shortcut() {
+        let ctx = egui::Context::default();
+        let config = ShortcutsConfig::default();
+        let binding = effective_binding(&config, ShortcutAction::ClosePane).unwrap();
+        let mut action = None;
+        ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: binding.logical_key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: binding.modifiers,
+                }],
+                ..Default::default()
+            },
+            |ui| {
+                egui::Window::new("Next step")
+                    .id(egui::Id::new("fleet_followup"))
+                    .show(ui.ctx(), |ui| {
+                        ui.label("Draft is still open");
+                    });
+                action = take_triggered_action(ui.ctx(), &config);
+            },
+        )
+        .drop_without_applying_deltas();
+        assert_eq!(action, None);
+    }
+
+    #[test]
+    fn popup_audit_query_window_keeps_global_shortcuts_available() {
+        let ctx = egui::Context::default();
+        let config = ShortcutsConfig::default();
+        let binding = effective_binding(&config, ShortcutAction::ClosePane).unwrap();
+        let mut action = None;
+        ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: binding.logical_key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: binding.modifiers,
+                }],
+                ..Default::default()
+            },
+            |ui| {
+                egui::Window::new("Diff")
+                    .id(crate::ui::diff_panel::diff_window_id())
+                    .show(ui.ctx(), |ui| {
+                        ui.label("Floating query window");
+                    });
+                action = take_triggered_action(ui.ctx(), &config);
+            },
+        )
+        .drop_without_applying_deltas();
+        assert_eq!(action, Some(ShortcutAction::ClosePane));
+    }
 
     #[test]
     fn portable_binding_roundtrip() {

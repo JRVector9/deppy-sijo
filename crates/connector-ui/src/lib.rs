@@ -146,9 +146,12 @@ impl ConnectorUi {
             );
         });
 
-        render_add_server_modal(ui, &self.labels, &mut self.add_server, &mut intent);
-        render_invoke_modal(ui, &self.labels, &mut self.invoke, &mut intent);
-        render_delete_modal(ui, &self.labels, &mut self.delete_server, &mut intent);
+        // Service consent owns interaction until resolved; retain local drafts for retry.
+        if !has_service_modal {
+            render_add_server_modal(ui, &self.labels, &mut self.add_server, &mut intent);
+            render_invoke_modal(ui, &self.labels, &mut self.invoke, &mut intent);
+            render_delete_modal(ui, &self.labels, &mut self.delete_server, &mut intent);
+        }
 
         if let Some(approval) = snapshot.approval.as_ref() {
             render_approval_modal(ui, &self.labels, approval, &mut intent);
@@ -782,14 +785,38 @@ fn render_delete_modal(
     }
 }
 
+#[derive(Clone, Copy)]
+struct ApprovalFocusTarget {
+    target: egui::Id,
+    slot: bool,
+}
+
 fn render_approval_modal(
     ui: &mut Ui,
     labels: &Labels,
     approval: &ApprovalPrompt,
     intent: &mut Option<ConnectorIntent>,
 ) {
+    // Keep one window Area, but require a fresh keyboard choice for each operation.
+    let window_id = egui::Id::new("connector_approval");
+    let target = window_id.with(approval.operation_id.as_str());
+    let target_key = window_id.with(("target", ui.ctx().viewport_id()));
+    let (changed, slot) = ui.ctx().data_mut(|data| {
+        let previous = data.get_temp::<ApprovalFocusTarget>(target_key);
+        let changed = previous.is_none_or(|previous| previous.target != target);
+        let slot = previous.is_some_and(|previous| previous.slot ^ changed);
+        data.insert_temp(target_key, ApprovalFocusTarget { target, slot });
+        (changed, slot)
+    });
+    if changed {
+        ui.memory_mut(|memory| {
+            if let Some(focused) = memory.focused() {
+                memory.surrender_focus(focused);
+            }
+        });
+    }
     egui::Window::new(&labels.approval_needed)
-        .id(egui::Id::new("connector_approval"))
+        .id(window_id)
         .collapsible(false)
         .show(ui.ctx(), |ui| {
             ui.strong(&approval.server_name);
@@ -801,23 +828,27 @@ fn render_approval_modal(
                 .show(ui, |ui| {
                     ui.monospace(&approval.arguments_preview);
                 });
-            ui.horizontal_wrapped(|ui| {
-                for (decision, label) in [
-                    (ApprovalDecision::AllowOnce, labels.allow_once.as_str()),
-                    (ApprovalDecision::AllowAlways, labels.allow_always.as_str()),
-                    (ApprovalDecision::DenyOnce, labels.deny_once.as_str()),
-                    (ApprovalDecision::DenyAlways, labels.deny_always.as_str()),
-                ] {
-                    if ui.button(label).clicked() {
-                        offer_intent(
-                            intent,
-                            ConnectorIntent::ResolveApproval {
-                                operation_id: approval.operation_id.clone(),
-                                decision,
-                            },
-                        );
+            // egui retains focus IDs until directional navigation. Two alternating
+            // scopes isolate consecutive requests without retaining four IDs per request.
+            ui.push_id(window_id.with(("actions", slot)), |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for (decision, label) in [
+                        (ApprovalDecision::AllowOnce, labels.allow_once.as_str()),
+                        (ApprovalDecision::AllowAlways, labels.allow_always.as_str()),
+                        (ApprovalDecision::DenyOnce, labels.deny_once.as_str()),
+                        (ApprovalDecision::DenyAlways, labels.deny_always.as_str()),
+                    ] {
+                        if ui.button(label).clicked() {
+                            offer_intent(
+                                intent,
+                                ConnectorIntent::ResolveApproval {
+                                    operation_id: approval.operation_id.clone(),
+                                    decision,
+                                },
+                            );
+                        }
                     }
-                }
+                })
             });
         });
 }
@@ -1875,6 +1906,48 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn popup_audit_service_prompt_pauses_local_form_and_preserves_draft() {
+        let ctx = egui::Context::default();
+        let catalog = Catalog::load("en-US").unwrap();
+        let mut connector = ConnectorUi::new(&catalog);
+        connector.add_server = Some(ServerFormDraft {
+            name: "Keep my server draft".into(),
+            ..Default::default()
+        });
+        let snapshot = ConnectorSnapshot {
+            oauth: Some(oauth_state(OAuthUiPhase::DiscoveringAuth)),
+            ..Default::default()
+        };
+        ctx.run_ui(raw_input(), |ui| {
+            assert!(connector.render(ui, &snapshot).is_none());
+        })
+        .drop_without_applying_deltas();
+        let local_layer =
+            egui::LayerId::new(egui::Order::Middle, egui::Id::new("connector_add_server"));
+        assert!(
+            !ctx.memory(|memory| memory.areas().is_visible(&local_layer)),
+            "local form must pause while OAuth owns interaction"
+        );
+        assert_eq!(
+            connector.add_server.as_ref().unwrap().name,
+            "Keep my server draft"
+        );
+        ctx.run_ui(raw_input(), |ui| {
+            assert!(
+                connector
+                    .render(ui, &ConnectorSnapshot::default())
+                    .is_none()
+            );
+        })
+        .drop_without_applying_deltas();
+        assert!(ctx.memory(|memory| memory.areas().is_visible(&local_layer)));
+        assert_eq!(
+            connector.add_server.as_ref().unwrap().name,
+            "Keep my server draft"
+        );
+    }
 
     fn raw_input() -> egui::RawInput {
         egui::RawInput {

@@ -3,6 +3,8 @@ mod workspace_env;
 pub use workspace_env::CredentialEnvBinding;
 #[path = "agent_attention.rs"]
 mod agent_attention;
+#[path = "workspace_identity.rs"]
+mod workspace_identity;
 pub use agent_attention::{AgentAttentionEvent, AttentionEventKind};
 
 use std::fs::{self, File, OpenOptions};
@@ -852,6 +854,42 @@ CREATE INDEX idx_relay_devices_recency
     "ALTER TABLE agent_needs_input ADD COLUMN response_required INTEGER NOT NULL DEFAULT 0;
      ALTER TABLE agent_needs_input ADD COLUMN attention_json TEXT;
      ALTER TABLE agent_needs_input ADD COLUMN attention_revision INTEGER NOT NULL DEFAULT 0;",
+    // Volume UUID proofs are optional for legacy/unsupported filesystems, and
+    // cannot survive a path/inode rebind without fresh filesystem verification.
+    "CREATE TABLE workspace_volume_identities (
+       workspace_id TEXT PRIMARY KEY REFERENCES workspaces(id) ON DELETE CASCADE,
+       path TEXT NOT NULL, path_dev INTEGER NOT NULL, path_ino INTEGER NOT NULL,
+       volume_uuid TEXT NOT NULL CHECK(typeof(volume_uuid)='text' AND length(CAST(volume_uuid AS BLOB))=36));
+     CREATE TRIGGER workspace_volume_identity_invalidate AFTER UPDATE OF path,path_dev,path_ino ON workspaces
+     WHEN OLD.path IS NOT NEW.path OR OLD.path_dev IS NOT NEW.path_dev OR OLD.path_ino IS NOT NEW.path_ino
+     BEGIN DELETE FROM workspace_volume_identities WHERE workspace_id=NEW.id; END;",
+    // Actual idle start is Unix seconds, independent of notification CAS generations.
+    "ALTER TABLE agent_needs_input ADD COLUMN idle_since INTEGER;
+     UPDATE agent_needs_input SET idle_since=updated_at
+     WHERE attention_json IS NULL AND turn_done=1 AND working=0 AND waiting=0;
+     UPDATE agent_needs_input SET idle_since=attention_revision/1000000
+     WHERE working=0 AND waiting=0 AND typeof(attention_revision)='integer'
+       AND attention_revision BETWEEN 1000000 AND CAST(strftime('%s','now') AS INTEGER)*1000000+999999
+       AND CASE WHEN typeof(attention_json)='text' AND length(CAST(attention_json AS BLOB))<=32768
+         AND json_valid(attention_json) THEN
+           json_type(attention_json,'$.completed_turn')='text'
+           AND json_type(attention_json,'$.last_activity')='integer'
+           AND json_extract(attention_json,'$.last_activity')=attention_revision
+           AND COALESCE(json_extract(attention_json,'$.turn_cancelled'),0)=0
+           AND COALESCE(json_extract(attention_json,'$.ended'),0)=0
+           AND json_type(attention_json,'$.requests')='array'
+           AND NOT EXISTS(SELECT 1 FROM json_each(attention_json,'$.requests')
+             WHERE CASE WHEN type='object' THEN
+               COALESCE(json_type(value,'$.kind'),'missing')!='integer'
+               OR COALESCE(json_extract(value,'$.kind'),1)!=0 ELSE 1 END)
+         ELSE 0 END;
+     CREATE INDEX idx_agent_idle_clock ON agent_needs_input(updated_at DESC) WHERE idle_since IS NOT NULL;",
+    // Idle episodes may start at a resolved question, after the completion CAS token.
+    "ALTER TABLE agent_needs_input ADD COLUMN idle_generation INTEGER;
+     UPDATE agent_needs_input SET idle_generation=CASE
+       WHEN attention_json IS NOT NULL AND attention_revision/1000000=idle_since
+         THEN attention_revision ELSE idle_since*1000000 END
+     WHERE idle_since IS NOT NULL;",
 ];
 
 /// 옵션2: 저장된 에이전트 세션 한 행 — 재시작 복원 시 native resume에 쓴다.
@@ -1308,6 +1346,8 @@ pub struct AgentStateSnapshot {
     /// 질문 응답이 필요한 전역 세션. 승인만 남은 세션과 구분한다.
     pub response_sessions: Vec<String>,
     pub turn_done_sessions: Vec<(String, i64)>,
+    /// Confirmed idle episodes: key, Unix seconds, and independent microsecond boundary generation.
+    pub idle_sessions: Vec<(String, i64, i64)>,
     /// hook 기반 "작업 중" 세션 키(v32) — clear 이벤트(UserPromptSubmit/PreToolUse)가
     /// 기록. waiting처럼 전역(모든 워크스페이스)이며 2분 stale 창으로 자기치유된다.
     pub working_sessions: Vec<String>,
@@ -1333,6 +1373,7 @@ impl std::fmt::Debug for AgentStateSnapshot {
             .field("waiting_session_count", &self.waiting_sessions.len())
             .field("response_session_count", &self.response_sessions.len())
             .field("turn_done_session_count", &self.turn_done_sessions.len())
+            .field("idle_session_count", &self.idle_sessions.len())
             .field("working_session_count", &self.working_sessions.len())
             .field("agent_session_count", &self.agent_sessions.len())
             .field(
@@ -1904,6 +1945,27 @@ SELECT COUNT(*), COALESCE(SUM(CASE WHEN
 const TURN_DONE_SESSIONS_SELECT: &str = "SELECT session_key, CASE WHEN attention_json IS NULL THEN updated_at ELSE attention_revision END FROM agent_needs_input
     WHERE turn_done = 1 AND (attention_json IS NOT NULL OR updated_at > ?3 - 86400)
     ORDER BY updated_at DESC, substr(CAST(session_key AS BLOB), 1, ?2), rowid LIMIT ?1";
+
+const IDLE_SESSIONS_PREFLIGHT: &str = "WITH selected AS MATERIALIZED (
+    SELECT rowid FROM agent_needs_input WHERE idle_since IS NOT NULL
+    ORDER BY updated_at DESC, substr(CAST(session_key AS BLOB), 1, ?2), rowid LIMIT ?1
+), sized AS MATERIALIZED (
+    SELECT state.session_key,state.idle_since,state.working,state.waiting,
+        state.idle_generation AS idle_generation,
+        length(CAST(state.session_key AS BLOB)) AS row_bytes
+    FROM selected JOIN agent_needs_input state ON state.rowid=selected.rowid
+)
+SELECT COUNT(*), COALESCE(SUM(CASE WHEN
+    typeof(session_key)!='text' OR length(CAST(session_key AS BLOB)) NOT BETWEEN 1 AND ?2
+    OR instr(session_key,char(0))>0 OR typeof(idle_since)!='integer'
+    OR idle_since<0 OR typeof(working)!='integer' OR working!=0
+    OR typeof(waiting)!='integer' OR waiting!=0 OR typeof(idle_generation)!='integer'
+    OR idle_generation<=0 OR row_bytes>?3 THEN 1 ELSE 0 END),0),
+    COALESCE(SUM(row_bytes),0), COALESCE(MAX(row_bytes),0) FROM sized";
+const IDLE_SESSIONS_SELECT: &str =
+    "SELECT session_key,idle_since,idle_generation FROM agent_needs_input
+    WHERE idle_since IS NOT NULL AND idle_since<=?3
+    ORDER BY updated_at DESC, substr(CAST(session_key AS BLOB),1,?2),rowid LIMIT ?1";
 
 // hook 기반 "작업 중"(v32). stale 창은 2분 — Stop이 유실되면(Ctrl-C 등 훅 미발화)
 // hook_working이 PTY IdleHeuristic까지 눌러 고착 표시가 되므로(병렬 리뷰 H1) 창으로
@@ -2833,6 +2895,10 @@ fn agent_state_snapshot_retained_bytes(
     checked_agent_state_vec_allocation(&mut total, &snapshot.turn_done_sessions)?;
     for (session_key, _) in &snapshot.turn_done_sessions {
         checked_agent_state_string_capacity(&mut total, session_key)?;
+    }
+    checked_agent_state_vec_allocation(&mut total, &snapshot.idle_sessions)?;
+    for (key, _, _) in &snapshot.idle_sessions {
+        checked_agent_state_string_capacity(&mut total, key)?;
     }
     checked_agent_state_vec_allocation(&mut total, &snapshot.working_sessions)?;
     for session_key in &snapshot.working_sessions {
@@ -6827,12 +6893,29 @@ impl Db {
     /// Finds one workspace by exact path or atomically creates its name, path, and folder anchor.
     /// The transaction reads no more than two matching rows and fails closed before materializing
     /// either row when duplicate paths already exist.
+    /// Without a stable volume UUID the entire device/inode anchor must match.
     pub fn find_or_create_workspace_by_exact_path(
         &self,
         name: &str,
         path: &str,
         folder_anchor: WorkspaceFolderAnchor,
     ) -> anyhow::Result<WorkspaceFindOrCreateResult> {
+        self.find_or_create_workspace_by_exact_path_with_volume(name, path, folder_anchor, None)
+    }
+
+    /// A previously verified volume UUID plus inode can prove identity after
+    /// device renumbering. Unknown/different volumes must not inherit sessions.
+    pub fn find_or_create_workspace_by_exact_path_with_volume(
+        &self,
+        name: &str,
+        path: &str,
+        folder_anchor: WorkspaceFolderAnchor,
+        volume: Option<uuid::Uuid>,
+    ) -> anyhow::Result<WorkspaceFindOrCreateResult> {
+        anyhow::ensure!(
+            volume.is_none_or(|id| !id.is_nil()),
+            "workspace_volume_identity_invalid"
+        );
         validate_workspace_text_input(name, "name")?;
         validate_workspace_text_input(path, "path")?;
         let input_bytes = name
@@ -6882,11 +6965,14 @@ impl Db {
                 },
             )?;
             let row = settings_workspace_projection_from_persisted(persisted)?;
-            anyhow::ensure!(
-                row.folder_anchor
-                    .is_none_or(|stored| stored == folder_anchor),
-                "workspace_path_anchor_conflict"
-            );
+            workspace_identity::verify(
+                &tx,
+                &row.id,
+                &row.path,
+                row.folder_anchor,
+                folder_anchor,
+                volume,
+            )?;
             let anchor_claimed: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM workspaces
                  WHERE path_dev = ?1 AND path_ino = ?2 AND id != ?3 LIMIT 1)",
@@ -6901,7 +6987,7 @@ impl Db {
                     "workspace_folder_anchor_duplicate"
                 }
             );
-            if row.folder_anchor.is_none() {
+            if row.folder_anchor != Some(folder_anchor) {
                 let mut stored = settings_workspace_row_for_update(&tx, &row.id)?
                     .context("settings_workspace_exact_path_missing")?;
                 stored.path_dev = Some(folder_anchor.dev);
@@ -6913,6 +6999,7 @@ impl Db {
                     (&row.id, folder_anchor.dev, folder_anchor.ino),
                 )?;
             }
+            workspace_identity::record(&tx, &row.id, path, folder_anchor, volume)?;
             tx.commit()?;
             return Ok(WorkspaceFindOrCreateResult {
                 row: SettingsWorkspaceProjectionRow {
@@ -6950,6 +7037,14 @@ impl Db {
             )?;
             let mut stored = settings_workspace_row_for_update(&tx, &existing_id)?
                 .context("settings_workspace_folder_anchor_missing")?;
+            workspace_identity::verify(
+                &tx,
+                &existing_id,
+                &stored.path,
+                Some(folder_anchor),
+                folder_anchor,
+                volume,
+            )?;
             stored.path = path.to_owned();
             settings_workspace_update_admission(&tx, &stored)?;
             let affected = tx.execute(
@@ -6975,6 +7070,7 @@ impl Db {
                 },
             )?;
             let row = settings_workspace_projection_from_persisted(row)?;
+            workspace_identity::record(&tx, &row.id, path, folder_anchor, volume)?;
             tx.commit()?;
             return Ok(WorkspaceFindOrCreateResult {
                 row,
@@ -6999,6 +7095,7 @@ impl Db {
                 strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?4, ?5)",
             (&id, name, path, folder_anchor.dev, folder_anchor.ino),
         )?;
+        workspace_identity::record(&tx, &id, path, folder_anchor, volume)?;
         let inserted_probe = settings_read_probe(
             &tx,
             "SELECT COUNT(*), COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0)
@@ -7404,7 +7501,7 @@ impl Db {
             [],
         )?;
         self.conn.execute(
-            "DELETE FROM agent_needs_input WHERE updated_at < strftime('%s','now') - 604800 AND NOT (attention_json IS NOT NULL AND (waiting=1 OR turn_done=1))",
+            "DELETE FROM agent_needs_input WHERE updated_at < strftime('%s','now') - 604800 AND NOT ((attention_json IS NOT NULL AND (waiting=1 OR turn_done=1)) OR (typeof(idle_since)='integer' AND idle_since>=0 AND working=0 AND waiting=0))",
             [],
         )?;
         self.conn.execute(
@@ -7667,11 +7764,15 @@ impl Db {
         let workspace_prefix = bounded_session_key_prefix(session_key)?;
         let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
             .map_err(|_| anyhow::anyhow!(BOUNDED_WRITE_FAILED))?;
+        let idle_generation = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_micros().min(i64::MAX as u128) as i64)
+            .unwrap_or(0);
         tx.execute(
             "INSERT OR REPLACE INTO agent_needs_input
-                     (session_key, waiting, turn_done, updated_at)
-                 VALUES (?1, 0, 1, CAST(strftime('%s','now') AS INTEGER))",
-            (session_key,),
+                     (session_key, waiting, turn_done, updated_at, idle_since, idle_generation)
+                 VALUES (?1, 0, 1, ?2/1000000, ?2/1000000, ?2)",
+            rusqlite::params![session_key, idle_generation],
         )
         .map_err(|_| anyhow::anyhow!(BOUNDED_WRITE_FAILED))?;
         evict_hook_state_prefix_overflow(
@@ -8327,6 +8428,24 @@ impl Db {
         } else {
             None
         };
+        let idle_probe = if let Some((_, _, _, limit, epoch)) = &attention_probes {
+            Some((
+                bounded_read_preflight(
+                    &tx,
+                    IDLE_SESSIONS_PREFLIGHT,
+                    rusqlite::params![
+                        limit,
+                        BOUNDED_ID_BYTES_MAX as i64,
+                        BOUNDED_ROW_BYTES_MAX as i64
+                    ],
+                    WAITING_SESSION_ROWS_MAX,
+                )?,
+                *limit,
+                *epoch,
+            ))
+        } else {
+            None
+        };
         let agent_probe = if job.include_agent_sessions {
             let sql_limit = bounded_limit_plus_one(AGENT_SESSION_ROWS_MAX, AGENT_SESSION_ROWS_MAX)?;
             Some((
@@ -8453,6 +8572,9 @@ impl Db {
             None
         };
         let logical_retained_bytes = [
+            idle_probe
+                .as_ref()
+                .map_or(0, |(probe, _, _)| probe.retained_bytes),
             hook_status_probes
                 .as_ref()
                 .map_or(0, |(probe, _, _, _)| probe.retained_bytes),
@@ -8630,6 +8752,28 @@ impl Db {
             } else {
                 Vec::new()
             };
+        let idle_sessions = if let Some((probe, limit, epoch)) = &idle_probe {
+            let mut result = Vec::with_capacity(probe.count);
+            let mut stmt = tx
+                .prepare(IDLE_SESSIONS_SELECT)
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+            let mut rows = stmt
+                .query(rusqlite::params![limit, BOUNDED_ID_BYTES_MAX as i64, epoch])
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+            while let Some(row) = rows
+                .next()
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?
+            {
+                result.push((
+                    bounded_required_text(row, 0, BOUNDED_ID_BYTES_MAX, true, true)?.to_owned(),
+                    bounded_integer(row, 1)?,
+                    bounded_integer(row, 2)?,
+                ));
+            }
+            result
+        } else {
+            Vec::new()
+        };
         let working_sessions =
             if let Some((_, _, working_probe, sql_limit, snapshot_epoch)) = &attention_probes {
                 let mut result = Vec::with_capacity(working_probe.count);
@@ -8881,6 +9025,7 @@ impl Db {
             waiting_sessions,
             response_sessions,
             turn_done_sessions,
+            idle_sessions,
             working_sessions,
             agent_sessions,
             global_agent_sessions,
@@ -9201,6 +9346,23 @@ impl Db {
         path_dev: Option<i64>,
         path_ino: Option<i64>,
     ) -> anyhow::Result<SettingsWorkspaceProjectionRow> {
+        self.set_workspace_path_and_anchor_with_volume(workspace_id, path, path_dev, path_ino, None)
+    }
+
+    /// Explicit user rebinding replaces any prior volume proof atomically,
+    /// including when the path and numerical inode anchor happen to be equal.
+    pub fn set_workspace_path_and_anchor_with_volume(
+        &self,
+        workspace_id: &str,
+        path: &str,
+        path_dev: Option<i64>,
+        path_ino: Option<i64>,
+        volume: Option<uuid::Uuid>,
+    ) -> anyhow::Result<SettingsWorkspaceProjectionRow> {
+        anyhow::ensure!(
+            volume.is_none() || (path_dev.is_some() && path_ino.is_some()),
+            "workspace_volume_identity_anchor_missing"
+        );
         validate_workspace_text_input(workspace_id, "id")?;
         validate_workspace_text_input(path, "path")?;
         anyhow::ensure!(
@@ -9270,6 +9432,14 @@ impl Db {
             },
         )?;
         let projection = settings_workspace_projection_from_persisted(persisted)?;
+        if let Some(anchor) = projection.folder_anchor {
+            workspace_identity::record(&tx, workspace_id, path, anchor, volume)?;
+        } else {
+            tx.execute(
+                "DELETE FROM workspace_volume_identities WHERE workspace_id=?1",
+                [workspace_id],
+            )?;
+        }
         tx.commit()?;
         Ok(projection)
     }
@@ -16115,6 +16285,7 @@ mod tests {
             waiting_sessions: vec![(marker.to_owned(), Some(marker.to_owned()))],
             response_sessions: vec![marker.to_owned()],
             turn_done_sessions: vec![(marker.to_owned(), i64::MAX)],
+            idle_sessions: vec![(marker.to_owned(), 0, 1)],
             working_sessions: vec![marker.to_owned()],
             agent_sessions: reconcile.desired_bindings.clone(),
             archived_agent_resume: vec![ArchivedAgentResumeRow {
@@ -16143,6 +16314,112 @@ mod tests {
             format!("{snapshot:?}"),
         ] {
             assert!(!debug.contains(marker), "{debug}");
+        }
+    }
+
+    #[test]
+    fn fleet_wait_migration_restores_only_proven_modern_completions() {
+        let conn = Connection::open_in_memory().unwrap();
+        for sql in &MIGRATIONS[..MIGRATIONS.len() - 2] {
+            conn.execute_batch(sql).unwrap();
+        }
+        let complete =
+            serde_json::json!({"native_session_id":"native", "generation":1_700_000_000_000_000i64,
+            "last_activity":1_700_000_010_000_000i64, "turn_started":1_700_000_000_000_000i64,
+            "completed_turn":"turn", "requests":[]})
+            .to_string();
+        for (key, json, revision) in [
+            ("ws:1", complete.clone(), 1_700_000_010_000_000i64),
+            ("ws:2", complete.clone(), 1_700_000_001_000_000i64),
+            ("ws:3", "invalid".into(), 1_700_000_010_000_000i64),
+            (
+                "ws:4",
+                complete.replace("\"requests\":[]", "\"requests\":[\"bad\"]"),
+                1_700_000_010_000_000i64,
+            ),
+        ] {
+            conn.execute("INSERT INTO agent_needs_input(session_key,waiting,working,turn_done,updated_at,attention_json,attention_revision) VALUES(?1,0,0,0,1,?2,?3)",rusqlite::params![key,json,revision]).unwrap();
+        }
+        for migration in &MIGRATIONS[MIGRATIONS.len() - 2..] {
+            conn.execute_batch(migration).unwrap();
+        }
+        for (key, expected) in [
+            ("ws:1", Some(1_700_000_010i64)),
+            ("ws:2", None),
+            ("ws:3", None),
+            ("ws:4", None),
+        ] {
+            let actual: Option<i64> = conn
+                .query_row(
+                    "SELECT idle_since FROM agent_needs_input WHERE session_key=?1",
+                    [key],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(actual, expected, "{key}");
+        }
+    }
+
+    #[test]
+    fn fleet_wait_startup_prune_retains_acknowledged_idle_under_existing_caps() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_agent_turn_done("ws:1").unwrap();
+        db.conn.execute("UPDATE agent_needs_input SET turn_done=0,attention_json='{}',updated_at=1,idle_since=100",[]).unwrap();
+        db.set_agent_needs_input("ws:2", false, None).unwrap();
+        db.conn
+            .execute(
+                "UPDATE agent_needs_input SET updated_at=1 WHERE session_key='ws:2'",
+                [],
+            )
+            .unwrap();
+        db.prune_agent_hook_state().unwrap();
+        let clocks: Vec<(String, i64)> = db
+            .conn
+            .prepare("SELECT session_key,idle_since FROM agent_needs_input")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(clocks, vec![("ws:1".into(), 100)]);
+    }
+
+    #[test]
+    fn fleet_wait_snapshot_keeps_acknowledged_clock_and_checks_bounds() {
+        let db = Db::open_in_memory().unwrap();
+        let ws = db.create_workspace("fleet-clock").unwrap();
+        let key = format!("{ws}:1");
+        db.set_agent_turn_done(&key).unwrap();
+        let seen = db.list_turn_done_sessions().unwrap()[0].1;
+        db.clear_agent_turn_done(&key, seen).unwrap();
+        let job = AgentStateJob::projection(&ws);
+        let snapshot = db.apply_agent_state_job(&job).unwrap();
+        assert!(snapshot.turn_done_sessions.is_empty());
+        assert_eq!(snapshot.idle_sessions[0].0, key);
+        assert_eq!(snapshot.idle_sessions[0].1, seen);
+        assert_eq!(snapshot.idle_sessions[0].2 / 1_000_000, seen);
+        let mut omitted = job.clone();
+        omitted.include_attention = false;
+        assert_eq!(
+            db.apply_agent_state_job(&omitted)
+                .unwrap()
+                .idle_sessions
+                .capacity(),
+            0
+        );
+        let mut tiny = job.clone();
+        tiny.snapshot_bytes_max = 1;
+        assert!(db.apply_agent_state_job(&tiny).is_err());
+        for value in ["'bad'", "-1", "1.5"] {
+            db.conn
+                .execute(
+                    &format!(
+                        "UPDATE agent_needs_input SET idle_since={value} WHERE session_key=?1"
+                    ),
+                    [&key],
+                )
+                .unwrap();
+            assert!(db.apply_agent_state_job(&job).is_err());
         }
     }
 
@@ -17300,6 +17577,343 @@ mod tests {
         assert_eq!(reused.row.id, created.row.id);
         assert_eq!(reused.row.name, "project");
         assert_eq!(reused.row.folder_anchor, Some(anchor));
+        assert_eq!(db.list_workspaces().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn workspace_find_or_create_refreshes_remounted_device_at_same_path() {
+        let db = Db::open_in_memory().unwrap();
+        let original = WorkspaceFolderAnchor { dev: 11, ino: 22 };
+        let current = WorkspaceFolderAnchor { dev: 33, ino: 22 };
+        let created = db
+            .find_or_create_workspace_by_exact_path_with_volume(
+                "custom name",
+                "/project",
+                original,
+                Some(uuid::Uuid::from_u128(1)),
+            )
+            .unwrap();
+
+        let reopened = db
+            .find_or_create_workspace_by_exact_path_with_volume(
+                "ignored",
+                "/project",
+                current,
+                Some(uuid::Uuid::from_u128(1)),
+            )
+            .unwrap();
+        assert!(!reopened.created);
+        assert_eq!(reopened.row.id, created.row.id);
+        assert_eq!(reopened.row.name, "custom name");
+        assert_eq!(reopened.row.path, "/project");
+        assert_eq!(reopened.row.created_at, created.row.created_at);
+        assert_eq!(reopened.row.folder_anchor, Some(current));
+        assert_eq!(
+            db.workspace_anchor(&created.row.id).unwrap(),
+            Some((33, 22))
+        );
+        assert_eq!(db.list_workspaces().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn popup_review_unknown_volume_device_change_cannot_reuse_workspace() {
+        let db = Db::open_in_memory().unwrap();
+        let original = WorkspaceFolderAnchor { dev: 11, ino: 22 };
+        let created = db
+            .find_or_create_workspace_by_exact_path("original", "/project", original)
+            .unwrap();
+        let result = db.find_or_create_workspace_by_exact_path(
+            "other",
+            "/project",
+            WorkspaceFolderAnchor { dev: 33, ino: 22 },
+        );
+        assert!(
+            result.is_err(),
+            "inode alone must not prove identity on a different device"
+        );
+        assert_eq!(
+            db.workspace_anchor(&created.row.id).unwrap(),
+            Some((11, 22))
+        );
+        assert_eq!(db.list_workspaces().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn popup_review_verified_volume_remount_keeps_workspace_identity() {
+        let db = Db::open_in_memory().unwrap();
+        let volume = uuid::Uuid::from_u128(1);
+        let original = WorkspaceFolderAnchor { dev: 11, ino: 22 };
+        let created = db
+            .find_or_create_workspace_by_exact_path_with_volume(
+                "original",
+                "/project",
+                original,
+                Some(volume),
+            )
+            .unwrap();
+        let current = WorkspaceFolderAnchor { dev: 33, ino: 22 };
+        let reused = db
+            .find_or_create_workspace_by_exact_path_with_volume(
+                "other",
+                "/project",
+                current,
+                Some(volume),
+            )
+            .unwrap();
+        assert!(!reused.created);
+        assert_eq!(reused.row.id, created.row.id);
+        assert_eq!(reused.row.name, "original");
+        assert_eq!(
+            db.workspace_anchor(&created.row.id).unwrap(),
+            Some((33, 22))
+        );
+        assert!(
+            db.find_or_create_workspace_by_exact_path_with_volume(
+                "other",
+                "/project",
+                WorkspaceFolderAnchor { dev: 44, ino: 23 },
+                Some(volume)
+            )
+            .is_err()
+        );
+        assert!(
+            db.find_or_create_workspace_by_exact_path_with_volume(
+                "other",
+                "/project",
+                WorkspaceFolderAnchor { dev: 44, ino: 22 },
+                None
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn popup_review_different_volume_cannot_reuse_even_equal_device_and_inode() {
+        let db = Db::open_in_memory().unwrap();
+        let anchor = WorkspaceFolderAnchor { dev: 11, ino: 22 };
+        let volume = uuid::Uuid::from_u128(1);
+        let created = db
+            .find_or_create_workspace_by_exact_path_with_volume(
+                "original",
+                "/project",
+                anchor,
+                Some(volume),
+            )
+            .unwrap();
+        for dev in [11, 33] {
+            assert!(
+                db.find_or_create_workspace_by_exact_path_with_volume(
+                    "other",
+                    "/project",
+                    WorkspaceFolderAnchor { dev, ino: 22 },
+                    Some(uuid::Uuid::from_u128(2))
+                )
+                .is_err()
+            );
+            assert_eq!(
+                db.workspace_anchor(&created.row.id).unwrap(),
+                Some((11, 22))
+            );
+        }
+        assert!(
+            db.find_or_create_workspace_by_exact_path_with_volume(
+                "other",
+                "/alias",
+                anchor,
+                Some(uuid::Uuid::from_u128(2))
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn popup_review_explicit_same_path_rebind_releases_old_volume_proof() {
+        let db = Db::open_in_memory().unwrap();
+        let anchor = WorkspaceFolderAnchor { dev: 11, ino: 22 };
+        let old_volume = uuid::Uuid::new_v4();
+        let current_volume = uuid::Uuid::new_v4();
+        let created = db
+            .find_or_create_workspace_by_exact_path_with_volume(
+                "custom alias",
+                "/project",
+                anchor,
+                Some(old_volume),
+            )
+            .unwrap();
+        db.set_workspace_path_and_anchor(&created.row.id, "/project", Some(11), Some(22))
+            .unwrap();
+        let reopened = db
+            .find_or_create_workspace_by_exact_path_with_volume(
+                "ignored",
+                "/project",
+                anchor,
+                Some(current_volume),
+            )
+            .expect("explicit reconnect must clear the old proof even at equal path/device/inode");
+        assert_eq!(reopened.row.id, created.row.id);
+        assert_eq!(reopened.row.name, "custom alias");
+        db.set_workspace_path_and_anchor_with_volume(
+            &created.row.id,
+            "/project",
+            Some(11),
+            Some(22),
+            Some(old_volume),
+        )
+        .unwrap();
+        assert!(
+            db.find_or_create_workspace_by_exact_path_with_volume(
+                "ignored",
+                "/project",
+                anchor,
+                Some(current_volume)
+            )
+            .is_err()
+        );
+        let remounted = db
+            .find_or_create_workspace_by_exact_path_with_volume(
+                "ignored",
+                "/project",
+                WorkspaceFolderAnchor { dev: 33, ino: 22 },
+                Some(old_volume),
+            )
+            .unwrap();
+        assert_eq!(remounted.row.id, created.row.id);
+    }
+
+    #[test]
+    fn popup_review_path_rebind_invalidates_old_volume_proof() {
+        let db = Db::open_in_memory().unwrap();
+        let volume = uuid::Uuid::from_u128(1);
+        let anchor = WorkspaceFolderAnchor { dev: 11, ino: 22 };
+        let created = db
+            .find_or_create_workspace_by_exact_path_with_volume(
+                "original",
+                "/project",
+                anchor,
+                Some(volume),
+            )
+            .unwrap();
+        db.set_workspace_path_and_anchor(&created.row.id, "/other", Some(11), Some(23))
+            .unwrap();
+        assert!(
+            db.find_or_create_workspace_by_exact_path_with_volume(
+                "other",
+                "/other",
+                WorkspaceFolderAnchor { dev: 33, ino: 23 },
+                Some(volume)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn popup_review_volume_identity_refresh_rolls_back_with_anchor() {
+        let db = Db::open_in_memory().unwrap();
+        let volume = uuid::Uuid::from_u128(1);
+        let anchor = WorkspaceFolderAnchor { dev: 11, ino: 22 };
+        let created = db
+            .find_or_create_workspace_by_exact_path_with_volume(
+                "original",
+                "/project",
+                anchor,
+                Some(volume),
+            )
+            .unwrap();
+        db.conn.execute_batch("CREATE TEMP TRIGGER fail_volume_cache BEFORE INSERT ON workspace_volume_identities BEGIN SELECT RAISE(ABORT, 'injected volume cache failure'); END;").unwrap();
+        assert!(
+            db.find_or_create_workspace_by_exact_path_with_volume(
+                "other",
+                "/project",
+                WorkspaceFolderAnchor { dev: 33, ino: 22 },
+                Some(volume)
+            )
+            .is_err()
+        );
+        assert_eq!(
+            db.workspace_anchor(&created.row.id).unwrap(),
+            Some((11, 22))
+        );
+        db.conn
+            .execute_batch("DROP TRIGGER fail_volume_cache")
+            .unwrap();
+        assert!(
+            db.find_or_create_workspace_by_exact_path_with_volume(
+                "other",
+                "/project",
+                anchor,
+                Some(uuid::Uuid::from_u128(2))
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn workspace_find_or_create_remount_does_not_claim_another_workspace_anchor() {
+        let db = Db::open_in_memory().unwrap();
+        let original = WorkspaceFolderAnchor { dev: 11, ino: 22 };
+        let current = WorkspaceFolderAnchor { dev: 33, ino: 22 };
+        let created = db
+            .find_or_create_workspace_by_exact_path_with_volume(
+                "project",
+                "/project",
+                original,
+                Some(uuid::Uuid::from_u128(1)),
+            )
+            .unwrap();
+        db.find_or_create_workspace_by_exact_path_with_volume(
+            "other",
+            "/other",
+            current,
+            Some(uuid::Uuid::from_u128(1)),
+        )
+        .unwrap();
+        let error = db
+            .find_or_create_workspace_by_exact_path_with_volume(
+                "ignored",
+                "/project",
+                current,
+                Some(uuid::Uuid::from_u128(1)),
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("workspace_folder_anchor_duplicate"));
+        assert_eq!(
+            db.workspace_anchor(&created.row.id).unwrap(),
+            Some((11, 22))
+        );
+        assert_eq!(db.list_workspaces().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn workspace_find_or_create_remount_refresh_rolls_back_on_write_failure() {
+        let db = Db::open_in_memory().unwrap();
+        let original = WorkspaceFolderAnchor { dev: 11, ino: 22 };
+        let created = db
+            .find_or_create_workspace_by_exact_path_with_volume(
+                "project",
+                "/project",
+                original,
+                Some(uuid::Uuid::from_u128(1)),
+            )
+            .unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_anchor_refresh BEFORE UPDATE OF path_dev ON workspaces
+             BEGIN SELECT RAISE(ABORT, 'injected anchor refresh failure'); END;",
+            )
+            .unwrap();
+        let error = db
+            .find_or_create_workspace_by_exact_path_with_volume(
+                "ignored",
+                "/project",
+                WorkspaceFolderAnchor { dev: 33, ino: 22 },
+                Some(uuid::Uuid::from_u128(1)),
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("injected anchor refresh failure"));
+        assert_eq!(
+            db.workspace_anchor(&created.row.id).unwrap(),
+            Some((11, 22))
+        );
         assert_eq!(db.list_workspaces().unwrap().len(), 1);
     }
 
@@ -23133,10 +23747,14 @@ mod tests {
                 .next()
                 .unwrap()
         };
+        assert!(
+            public_body("set_workspace_path_and_anchor")
+                .contains("self.set_workspace_path_and_anchor_with_volume(")
+        );
         for method in [
             "rename_workspace",
             "set_workspace_path",
-            "set_workspace_path_and_anchor",
+            "set_workspace_path_and_anchor_with_volume",
             "set_workspace_anchor",
             "update_workspace_moved_path_cas",
         ] {

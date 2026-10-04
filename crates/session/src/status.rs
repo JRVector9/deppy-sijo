@@ -347,7 +347,7 @@ impl StatusDetector {
     }
 
     /// 선택 이동과 답변 작성은 제출이 아니다. 화면 프롬프트는 사라짐을 확인해야 해제한다.
-    pub fn on_user_input(&mut self, bytes: &[u8]) {
+    pub fn on_user_input(&mut self, bytes: &[u8]) -> bool {
         self.screen_scan_requested = true;
         self.last_output = Instant::now();
         let mut submitted = false;
@@ -384,11 +384,12 @@ impl StatusDetector {
                 SessionStatus::Waiting | SessionStatus::NeedsApproval
             )
         {
-            return;
+            return submitted;
         }
         if submitted {
             self.on_input();
         }
+        submitted
     }
 
     /// 사용자 입력 수신 — 현재 화면의 매치 프롬프트를 "응답됨"으로 소비한다.
@@ -741,6 +742,36 @@ mod tests {
 
     /// error regex 오탐이 그 pane에 타이핑할 때까지 무기한 남던 문제 — hook이 보고한
     /// 턴 시작도 입력과 동등한 해제 신호다(RuntimeCommand::NoteTurnStart).
+    #[test]
+    fn fleet_review_fix_choice_submit_reports_input_without_consuming_choice_status() {
+        for input in [b"\r".as_slice(), &[3]] {
+            let mut detector = StatusDetector::new(StatusPatterns::compile(None, None, None, None));
+            detector.evaluate(Some("Press enter to confirm"));
+            let status = detector.status();
+            assert!(matches!(
+                status,
+                SessionStatus::Waiting | SessionStatus::NeedsApproval
+            ));
+            assert!(detector.on_user_input(input));
+            assert_eq!(
+                detector.status(),
+                status,
+                "choice remains pending until the screen changes"
+            );
+        }
+    }
+
+    #[test]
+    fn fleet_review_fix_only_real_submit_is_reported_outside_split_bracketed_paste() {
+        let mut detector = StatusDetector::new(patterns());
+        assert!(!detector.on_user_input(b"typing"));
+        assert!(!detector.on_user_input(b"\x1b[20"));
+        assert!(!detector.on_user_input(b"0~first\nsecond\r"));
+        assert!(!detector.on_user_input(b"\x1b[201~"));
+        assert!(detector.on_user_input(b"\r"));
+        assert!(detector.on_user_input(&[3]));
+    }
+
     #[test]
     fn latch된_결과_상태는_턴_시작으로도_해제된다() {
         let mut d = StatusDetector::new(patterns());

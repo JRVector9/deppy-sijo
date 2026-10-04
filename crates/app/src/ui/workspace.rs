@@ -1332,6 +1332,14 @@ fn paint_pane_header_base(
             active_stroke.width,
             ui.ctx().pixels_per_point(),
         );
+        let range = egui::Rangef::new(
+            range.min,
+            crate::ui::snap_line_to_pixel(
+                range.max,
+                active_stroke.width,
+                ui.ctx().pixels_per_point(),
+            ),
+        );
         ui.painter().hline(range, top_y, active_stroke);
     }
     // 헤더와 본문 사이 하단 구분선은 긋지 않는다 — 탭 면과 터미널이 한 덩어리로
@@ -1339,18 +1347,20 @@ fn paint_pane_header_base(
 }
 
 /// 두 탭 사이 세로 헤어라인 — 같은 배경을 쓰는 두 영역의 경계를 읽히게 한다.
-fn paint_tab_divider(ui: &egui::Ui, header: egui::Rect, x: f32) {
+fn paint_tab_divider(ui: &egui::Ui, header: egui::Rect, x: f32, style: PaneHeaderStyle) {
     if x <= header.left() || x >= header.right() {
         return;
     }
+    let stroke = style
+        .active_stroke
+        .unwrap_or_else(|| crate::ui::designall::separator_stroke(ui.visuals()));
     ui.painter().vline(
-        crate::ui::snap_line_to_pixel(
-            x,
-            crate::ui::designall::SEPARATOR_WIDTH,
-            ui.ctx().pixels_per_point(),
+        crate::ui::snap_line_to_pixel(x, stroke.width, ui.ctx().pixels_per_point()),
+        egui::Rangef::new(
+            pane_header_top_line_y(header.top(), stroke.width, ui.ctx().pixels_per_point()),
+            header.bottom(),
         ),
-        egui::Rangef::new(header.top() + 6.0, header.bottom() - 6.0),
-        crate::ui::designall::separator_stroke(ui.visuals()),
+        stroke,
     );
 }
 
@@ -2541,6 +2551,7 @@ struct SessionView {
     /// "작업 중"과 "멈춘 것"은 화면상 둘 다 파란 점인데 실제로는 전혀 다르다. 마지막
     /// 출력 이후 경과로 조용히 죽은 세션을 찾아낸다(2026-08-08).
     last_output_at: Option<i64>,
+    last_submission_at_micros: Option<i64>,
 }
 
 impl SessionView {
@@ -4405,14 +4416,7 @@ impl WorkspaceUi {
         let Some(input_id) = self.search.as_ref().and_then(|search| search.input_id) else {
             return false;
         };
-        if ctx.any_popup_open()
-            || ctx.memory(|memory| {
-                memory
-                    .areas()
-                    .visible_layer_ids()
-                    .iter()
-                    .any(is_blocking_terminal_window)
-            })
+        if super::popup::background_input_blocked(ctx)
             || !ctx.memory(|memory| {
                 memory.has_focus(input_id)
                     || (memory.focused().is_none() && memory.had_focus_last_frame(input_id))
@@ -4868,6 +4872,12 @@ impl WorkspaceUi {
         )
     }
 
+    pub fn last_input_submission(&self, session: SessionId) -> Option<i64> {
+        self.sessions
+            .get(&session)
+            .and_then(|view| view.last_submission_at_micros)
+    }
+
     /// 비활성(warm) 워크스페이스의 접힌 행 상태 집계용 마지막 감지값.
     /// 활성 워크스페이스는 `session_entries`가 hook/transcript까지 병합한 값을 사용한다.
     pub fn last_session_status(&self, session: SessionId) -> Option<SessionStatus> {
@@ -5167,6 +5177,15 @@ impl WorkspaceUi {
                     }
                     self.error_is_pressure = false;
                     self.error = Some(crate::ui::render_message(catalog, message));
+                }
+                RuntimeEvent::SessionInputSubmitted { session, at_micros } => {
+                    if *at_micros > 0 && self.session_alive(*session) {
+                        let view = self.sessions.entry(*session).or_default();
+                        view.last_submission_at_micros = Some(
+                            view.last_submission_at_micros
+                                .map_or(*at_micros, |previous| previous.max(*at_micros)),
+                        );
+                    }
                 }
                 RuntimeEvent::SessionStatusChanged { session, status } => {
                     if self.session_alive(*session) {
@@ -5615,6 +5634,15 @@ impl WorkspaceUi {
                     let alive = mux_sessions(snapshot);
                     self.sessions.retain(|id, _| alive.contains(id));
                     self.mux = Some(Arc::clone(snapshot));
+                }
+                RuntimeEvent::SessionInputSubmitted { session, at_micros } => {
+                    if *at_micros > 0 && self.session_alive(*session) {
+                        let view = self.sessions.entry(*session).or_default();
+                        view.last_submission_at_micros = Some(
+                            view.last_submission_at_micros
+                                .map_or(*at_micros, |previous| previous.max(*at_micros)),
+                        );
+                    }
                 }
                 RuntimeEvent::SessionStatusChanged { session, status } => {
                     if self.session_alive(*session) {
@@ -6196,9 +6224,12 @@ impl WorkspaceUi {
             ),
         });
         paint_pane_header_base(ui, header, style, accent_range);
-        if let Some(first) = placements.first() {
-            paint_tab_divider(ui, header, first.geometry.tab.left());
-        }
+        paint_tab_divider(
+            ui,
+            header,
+            pane_header_active_boundary(header, pseudo_close),
+            style,
+        );
 
         let empty_clip = egui::Rect::from_min_max(
             egui::pos2(label_left, header.top()),
@@ -6210,7 +6241,9 @@ impl WorkspaceUi {
                 egui::pos2(
                     placements
                         .first()
-                        .map_or(header.right(), |p| p.geometry.tab.left()),
+                        .map_or(pane_header_active_boundary(header, pseudo_close), |p| {
+                            p.geometry.tab.left()
+                        }),
                     header.bottom(),
                 ),
             ),
@@ -6252,6 +6285,33 @@ impl WorkspaceUi {
             }
         }
 
+        let blank_left = placements
+            .last()
+            .map_or(pane_header_active_boundary(header, pseudo_close), |p| {
+                p.geometry.tab.right()
+            });
+        if header.right() > blank_left {
+            let blank = ui.interact(
+                egui::Rect::from_min_max(egui::pos2(blank_left, header.top()), header.max),
+                ui.id().with("session_less_new_session_strip"),
+                egui::Sense::click(),
+            );
+            blank.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::Button,
+                    input_enabled,
+                    catalog.t("workspace.new_shell", &[]),
+                )
+            });
+            if blank.clicked() {
+                if input_enabled {
+                    self.new_session_requested = true;
+                } else {
+                    output.focus_requested = true;
+                }
+            }
+        }
+
         if any_active {
             output.aux_body_rect = Some(body);
         } else {
@@ -6264,7 +6324,7 @@ impl WorkspaceUi {
             if input_enabled {
                 self.show_new_session_prompt(&mut child, catalog);
             } else {
-                output.focus_requested =
+                output.focus_requested |=
                     self.show_disabled_empty_surface(&mut child).focus_requested;
             }
         }
@@ -6397,9 +6457,12 @@ impl WorkspaceUi {
             None => egui::Rangef::new(header.left(), pane_header_active_boundary(header, close)),
         });
         paint_pane_header_base(ui, header, style, accent_range);
-        if let Some(first) = placements.first() {
-            paint_tab_divider(ui, header, first.geometry.tab.left());
-        }
+        paint_tab_divider(
+            ui,
+            header,
+            pane_header_active_boundary(header, close),
+            style,
+        );
 
         let header_response = ui.interact(
             header,
@@ -6419,6 +6482,46 @@ impl WorkspaceUi {
         }
         if input_enabled {
             self.pane_context_menu(&header_response, &pane.id, config, catalog);
+        }
+
+        // Blank strip is distinct from the existing tab, X and toolbar targets.
+        let blank_left = placements
+            .last()
+            .map_or(pane_header_active_boundary(header, close), |p| {
+                p.geometry.tab.right()
+            });
+        if buttons.toolbar_left > blank_left {
+            let blank = ui.interact(
+                egui::Rect::from_min_max(
+                    egui::pos2(blank_left, header.top()),
+                    egui::pos2(buttons.toolbar_left, header.bottom()),
+                ),
+                egui::Id::new(("terminal_new_session_strip", &pane.id)),
+                egui::Sense::click(),
+            );
+            blank.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::Button,
+                    input_enabled,
+                    catalog.t("workspace.new_shell", &[]),
+                )
+            });
+            if input_enabled {
+                self.pane_context_menu(&blank, &pane.id, config, catalog);
+            }
+            if blank
+                .on_hover_text(catalog.t("workspace.new_shell", &[]))
+                .clicked()
+            {
+                self.terminal_focus_claimed = true;
+                output.local_focus_claimed = Some(pane.id.clone());
+                self.request_pane_focus(pane.id.clone());
+                if input_enabled {
+                    self.new_session_requested = true;
+                } else {
+                    output.focus_requested = true;
+                }
+            }
         }
 
         // 포커스 점은 없앴다(2026-08-11 사용자: 상태 표시와 색이 달라 헷갈린다).
@@ -6868,6 +6971,9 @@ impl WorkspaceUi {
                 input_enabled,
             );
             render_output.merge(header_output);
+            if self.has_pending_close_confirmation() || self.new_session_requested {
+                super::popup::set_pending_modal(ui.ctx(), true);
+            }
             // 보조 탭이 활성이면 이 pane의 본문은 App이 그린다. 터미널 표면·입력·drop·
             // 컨텍스트 메뉴를 전부 건너뛰어(fail-closed) 숨은 PTY로 입력이 새지 않게 한다.
             if self
@@ -7183,12 +7289,7 @@ impl WorkspaceUi {
             } else {
                 true
             };
-        let any_blocking_window_visible = ui.ctx().memory(|mem| {
-            mem.areas()
-                .visible_layer_ids()
-                .iter()
-                .any(is_blocking_terminal_window)
-        });
+        let any_blocking_window_visible = super::popup::background_input_blocked(ui.ctx());
         let terminal_keyboard_active = terminal_input_owner
             && !search_input_focused
             && terminal_keyboard_input_allowed(
@@ -7699,12 +7800,7 @@ impl WorkspaceUi {
         let terminal_owns_ime_events = ui
             .ctx()
             .memory(|memory| memory.owns_ime_events(output.response.id));
-        let any_blocking_window_visible = ui.ctx().memory(|mem| {
-            mem.areas()
-                .visible_layer_ids()
-                .iter()
-                .any(is_blocking_terminal_window)
-        });
+        let any_blocking_window_visible = super::popup::background_input_blocked(ui.ctx());
         let terminal_accepts_ime_events = terminal_accepts_ime_events(
             terminal_ime_active,
             terminal_owns_ime_events,
@@ -8329,8 +8425,20 @@ impl WorkspaceUi {
         }
     }
 
+    /// Publish pending ownership before App's global shortcuts/render dispatch.
+    pub(crate) fn has_pending_close_confirmation(&self) -> bool {
+        self.confirm_close.as_ref().is_some_and(|pane| {
+            self.mux.as_ref().is_some_and(|mux| {
+                mux.tabs
+                    .iter()
+                    .flat_map(|tab| &tab.panes)
+                    .any(|item| &item.id == pane)
+            })
+        })
+    }
+
     /// 닫기 확인 다이얼로그 (request_close_pane이 세팅) — 실행 중 세션 종료 경고.
-    fn close_confirm_dialog(&mut self, ctx: &egui::Context, catalog: &i18n::Catalog) {
+    pub(crate) fn close_confirm_dialog(&mut self, ctx: &egui::Context, catalog: &i18n::Catalog) {
         let Some(pane) = self.confirm_close.clone() else {
             return;
         };
@@ -8343,26 +8451,22 @@ impl WorkspaceUi {
             self.confirm_close = None;
             return;
         }
-        let mut open = true;
-        egui::Window::new(catalog.t("workspace.close_confirm.title", &[]))
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .open(&mut open)
-            .show(ctx, |ui| {
-                ui.label(catalog.t("workspace.close_confirm.body", &[]));
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if ui.button(catalog.t("action.close", &[])).clicked() {
-                        self.send(RuntimeCommand::ClosePane { pane: pane.clone() });
-                        self.confirm_close = None;
-                    }
-                    if ui.button(catalog.t("action.cancel", &[])).clicked() {
-                        self.confirm_close = None;
-                    }
-                });
-            });
-        if !open {
+        let target = self
+            .mux
+            .as_ref()
+            .and_then(|mux| {
+                mux.tabs
+                    .iter()
+                    .flat_map(|tab| &tab.panes)
+                    .find(|p| p.id == pane)
+            })
+            .map(|p| self.resolve_session_title(&p.title, p.session_id, None, catalog))
+            .unwrap_or_default();
+        let choice = super::session_close_dialogs::session(ctx, &pane.0, &target, catalog);
+        if let Some(choice) = choice {
+            if choice == super::popup::ConfirmationChoice::Confirm {
+                self.send(RuntimeCommand::ClosePane { pane });
+            }
             self.confirm_close = None;
         }
     }
@@ -9873,7 +9977,7 @@ fn terminal_should_copy_selection(
 /// Agents and the diff review panel are floating but non-modal. A terminal
 /// click must be able to reclaim focus while they remain open;
 /// confirmation/error windows continue to block terminal input as before.
-pub(super) fn is_blocking_terminal_window(layer: &egui::LayerId) -> bool {
+pub(crate) fn is_blocking_terminal_window(layer: &egui::LayerId) -> bool {
     layer.order == egui::Order::Middle
         && layer.id != crate::ui::agent_sessions::agents_window_id()
         && layer.id != crate::ui::diff_panel::diff_window_id()
@@ -10417,6 +10521,173 @@ mod tests {
             });
         }
         commands
+    }
+
+    #[test]
+    fn popup_review_pending_session_close_blocks_global_keys_before_modal_render() {
+        let ctx = egui::Context::default();
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        let config = crate::config::ShortcutsConfig::default();
+        let mut workspace = WorkspaceUi::new();
+        workspace.mux = Some(mux(
+            "tab",
+            vec![tab(
+                "tab",
+                vec![pane("p", SessionId(7))],
+                LayoutNode::Pane(pane_id("p")),
+            )],
+            "p",
+        ));
+        workspace.request_close_pane(pane_id("p"));
+        assert!(workspace.has_pending_close_confirmation());
+        let binding = crate::shortcuts::effective_binding(
+            &config,
+            crate::shortcuts::ShortcutAction::ClosePane,
+        )
+        .unwrap();
+        ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: binding.logical_key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: binding.modifiers,
+                }],
+                ..Default::default()
+            },
+            |ui| {
+                super::super::popup::set_pending_modal(
+                    ui.ctx(),
+                    workspace.has_pending_close_confirmation(),
+                );
+                assert!(crate::shortcuts::take_triggered_action(ui.ctx(), &config).is_none());
+                workspace.close_confirm_dialog(ui.ctx(), &catalog);
+                assert!(workspace.has_pending_close_confirmation());
+            },
+        )
+        .drop_without_applying_deltas();
+        workspace.mux = None;
+        assert!(
+            !workspace.has_pending_close_confirmation(),
+            "a disappeared pane must not block all later input"
+        );
+    }
+
+    #[test]
+    fn popup_review_actual_search_area_keeps_enter_shift_enter_and_escape() {
+        let mut workspace = WorkspaceUi::new();
+        workspace.search = Some(TerminalSearch {
+            session: SessionId(7),
+            query: "ready".into(),
+            requested: Some("ready".into()),
+            delivery: None,
+            matches: (0..3)
+                .map(|line_from_bottom| terminal::ScrollbackMatch {
+                    line_from_bottom,
+                    col_start: 0,
+                    col_end: 1,
+                })
+                .collect(),
+            total_lines: 10,
+            capped: false,
+            current: 0,
+            focus_input: true,
+            input_id: None,
+            scroll_to_current: false,
+        });
+        let catalog = catalog();
+        let view = snapshot("ready");
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, ws: &mut WorkspaceUi| {
+                ws.handle_terminal_search_keys(ui.ctx());
+                ws.render_terminal_search(
+                    ui,
+                    SessionId(7),
+                    egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)),
+                    egui::Pos2::ZERO,
+                    egui::vec2(8.0, 16.0),
+                    &view,
+                    &catalog,
+                );
+            },
+            workspace,
+        );
+        harness.run();
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+        assert_eq!(harness.state().search.as_ref().unwrap().current, 1);
+        harness.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::Enter);
+        harness.run();
+        assert_eq!(harness.state().search.as_ref().unwrap().current, 0);
+        harness.key_press(egui::Key::Escape);
+        harness.run();
+        assert!(harness.state().search.is_none());
+    }
+
+    #[test]
+    fn popup_review_pending_conflict_blocks_first_frame_text_and_enter() {
+        let session = SessionId(7);
+        let mut workspace = WorkspaceUi::new();
+        workspace.mux = Some(mux(
+            "primary",
+            vec![tab(
+                "primary",
+                vec![pane("pane", session)],
+                LayoutNode::Pane(pane_id("pane")),
+            )],
+            "pane",
+        ));
+        workspace.last_focused_pane = Some(pane_id("pane"));
+        workspace.pending_focus = Some(pane_id("pane"));
+        workspace.sessions.entry(session).or_default().snapshot = Some(snapshot("ready"));
+        let catalog = catalog();
+        let config = TerminalConfig::default();
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, state: &mut (WorkspaceUi, bool)| {
+                // Mirrors App's terminal-before-document-modal order.
+                super::super::popup::set_pending_modal(ui.ctx(), state.1);
+                state.0.show_with_input(ui, &config, &[], &catalog, true);
+                if state.1 {
+                    let _ = super::super::document_dialogs::conflict(
+                        ui.ctx(),
+                        egui::Id::new("document_conflict_confirmation"),
+                        egui::Id::new("saved"),
+                        "saved.md",
+                        0,
+                        &catalog,
+                    );
+                }
+            },
+            (workspace, false),
+        );
+        harness.run();
+        drain_protocol(&mut harness.state_mut().0);
+        harness.event(egui::Event::Text("baseline".into()));
+        harness.run();
+        assert!(
+            drain_protocol(&mut harness.state_mut().0)
+                .iter()
+                .any(|cmd| matches!(cmd, RuntimeCommand::WriteInput { .. }))
+        );
+        harness.state_mut().1 = true;
+        harness.input_mut().events.extend([
+            egui::Event::Text("race".into()),
+            egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        harness.run();
+        assert!(
+            !drain_protocol(&mut harness.state_mut().0)
+                .iter()
+                .any(|cmd| matches!(cmd, RuntimeCommand::WriteInput { .. })),
+            "pending conflict must fence input before its first rendering"
+        );
     }
 
     #[test]
@@ -14622,6 +14893,13 @@ mod tests {
 
         harness.state_mut().1 = true;
         harness.run();
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+        assert_eq!(
+            harness.state().0.confirm_close,
+            Some(target.clone()),
+            "bare Enter must not close the session"
+        );
         harness.get_by_label(&close_label).click();
         harness.run();
 
@@ -14629,6 +14907,127 @@ mod tests {
         assert!(drain_protocol(&mut harness.state_mut().0).iter().any(
             |command| matches!(command, RuntimeCommand::ClosePane { pane } if pane == &target)
         ));
+    }
+
+    #[test]
+    #[ignore = "offscreen popup PNGs for manual visual review"]
+    fn popup_parity_render_session_close() {
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        let mut workspace = WorkspaceUi::new();
+        let mut session_pane = pane("p", SessionId(7));
+        session_pane.title = "Claude Code".into();
+        workspace.mux = Some(mux(
+            "t",
+            vec![tab("t", vec![session_pane], LayoutNode::Pane(pane_id("p")))],
+            "p",
+        ));
+        workspace.confirm_close = Some(pane_id("p"));
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(800.0, 650.0))
+            .build_ui_state(
+                |ui, workspace: &mut WorkspaceUi| {
+                    workspace.close_confirm_dialog(ui.ctx(), &catalog);
+                },
+                workspace,
+            );
+        crate::fonts::install_cjk_fallback(&harness.ctx, None, "JetBrainsMono", "Regular");
+        harness.ctx.set_visuals(egui::Visuals::dark());
+        harness.run();
+        let output = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/popup-parity");
+        std::fs::create_dir_all(&output).unwrap();
+        harness
+            .render()
+            .unwrap()
+            .save(output.join("07-session.png"))
+            .unwrap();
+    }
+
+    #[test]
+    fn close_popup_new_session_target_does_not_inherit_close_focus() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = catalog();
+        let close_label = catalog.t("action.close", &[]);
+        let mut workspace = WorkspaceUi::new();
+        workspace.mux = Some(mux(
+            "t",
+            vec![tab(
+                "t",
+                vec![pane("first", SessionId(7)), pane("second", SessionId(8))],
+                LayoutNode::Pane(pane_id("first")),
+            )],
+            "first",
+        ));
+        workspace.request_close_pane(pane_id("first"));
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, workspace: &mut WorkspaceUi| {
+                workspace.close_confirm_dialog(ui.ctx(), &catalog);
+            },
+            workspace,
+        );
+        harness.run();
+        harness.get_by_label(&close_label).focus();
+        harness.run();
+        // Both targets have the same display name. Only the pane identity changes.
+        harness.state_mut().request_close_pane(pane_id("second"));
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+        assert_eq!(harness.state().confirm_close, Some(pane_id("second")));
+        assert!(
+            !drain_protocol(harness.state_mut())
+                .iter()
+                .any(|command| matches!(command, RuntimeCommand::ClosePane { .. })),
+            "the previous target's focused button must not close another session"
+        );
+        harness.get_by_label(&close_label).click();
+        harness.run();
+        assert!(drain_protocol(harness.state_mut()).iter().any(
+            |command| matches!(command, RuntimeCommand::ClosePane { pane } if *pane == pane_id("second"))
+        ));
+        assert!(harness.state().confirm_close.is_none());
+    }
+
+    #[test]
+    fn confirmation_modal_blocks_terminal_keys() {
+        let catalog = catalog();
+        let config = TerminalConfig::default();
+        let mut workspace = WorkspaceUi::new();
+        workspace.mux = Some(mux(
+            "t",
+            vec![tab(
+                "t",
+                vec![pane("p", SessionId(7))],
+                LayoutNode::Pane(pane_id("p")),
+            )],
+            "p",
+        ));
+        workspace.sessions.entry(SessionId(7)).or_default().snapshot = Some(snapshot("ready"));
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, workspace: &mut WorkspaceUi| {
+                workspace.show_with_input(ui, &config, &[], &catalog, true);
+            },
+            workspace,
+        );
+        harness.run_steps(5);
+        harness.event(egui::Event::Text("a".into()));
+        harness.run_steps(5);
+        assert!(
+            drain_protocol(harness.state_mut())
+                .iter()
+                .any(|command| matches!(command, RuntimeCommand::WriteInput { .. })),
+            "fixture must accept ordinary input first"
+        );
+        harness.state_mut().confirm_close = Some(pane_id("p"));
+        harness.run_steps(5);
+        harness.event(egui::Event::Text("b".into()));
+        harness.key_press(egui::Key::Enter);
+        harness.run_steps(5);
+        assert!(
+            !drain_protocol(harness.state_mut())
+                .iter()
+                .any(|command| matches!(command, RuntimeCommand::WriteInput { .. })),
+            "confirmation keys leaked to PTY"
+        );
     }
 
     #[test]
@@ -15989,6 +16388,204 @@ mod tests {
     }
 
     #[test]
+    fn tab_strip_blank_click_requests_launcher_without_spawning_shell() {
+        let catalog = catalog();
+        let config = TerminalConfig::default();
+        let mut workspace = WorkspaceUi::new();
+        workspace.mux = Some(mux(
+            "t",
+            vec![tab(
+                "t",
+                vec![pane("p", SessionId(7))],
+                LayoutNode::Pane(pane_id("p")),
+            )],
+            "p",
+        ));
+        let pane = pane("p", SessionId(7));
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(800.0, 400.0))
+            .build_ui_state(
+                move |ui, workspace: &mut WorkspaceUi| {
+                    workspace.render_pane_header(
+                        ui,
+                        egui::Rect::from_min_size(ui.min_rect().min, egui::vec2(760.0, 32.0)),
+                        &pane,
+                        true,
+                        &config,
+                        &catalog,
+                        true,
+                    );
+                },
+                workspace,
+            );
+        harness.run();
+        harness.hover_at(egui::pos2(300.0, 24.0));
+        harness.run();
+        harness.drag_at(egui::pos2(300.0, 24.0));
+        harness.run();
+        harness.drop_at(egui::pos2(300.0, 24.0));
+        harness.run();
+        assert!(
+            harness.state_mut().take_new_session_requested(),
+            "blank strip must open launcher"
+        );
+        assert!(
+            !drain_protocol(harness.state_mut())
+                .iter()
+                .any(|command| matches!(
+                    command,
+                    RuntimeCommand::SpawnShell { .. } | RuntimeCommand::SpawnAgent { .. }
+                ))
+        );
+    }
+
+    #[test]
+    fn tab_strip_inactive_surface_requests_focus_without_launcher() {
+        let catalog = catalog();
+        let config = TerminalConfig::default();
+        let pane = pane("p", SessionId(7));
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, state: &mut (WorkspaceUi, bool)| {
+                let output = state.0.render_pane_header(
+                    ui,
+                    egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(760.0, 32.0)),
+                    &pane,
+                    false,
+                    &config,
+                    &catalog,
+                    false,
+                );
+                state.1 |= output.focus_requested;
+            },
+            (WorkspaceUi::new(), false),
+        );
+        harness.run();
+        let pos = egui::pos2(300.0, 16.0);
+        harness.hover_at(pos);
+        harness.run();
+        harness.drag_at(pos);
+        harness.run();
+        harness.drop_at(pos);
+        harness.run();
+        assert!(harness.state().1);
+        assert!(!harness.state_mut().0.take_new_session_requested());
+        assert!(
+            !drain_protocol(&mut harness.state_mut().0)
+                .iter()
+                .any(|command| matches!(
+                    command,
+                    RuntimeCommand::SpawnShell { .. } | RuntimeCommand::SpawnAgent { .. }
+                ))
+        );
+    }
+
+    #[test]
+    fn tab_strip_divider_is_painted_without_auxiliary_tabs() {
+        for ppp in [1.0, 1.25, 1.5, 2.0, 3.0] {
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(ppp);
+            let catalog = catalog();
+            let config = TerminalConfig::default();
+            let pane = pane("p", SessionId(7));
+            let mut workspace = WorkspaceUi::new();
+            workspace.workspace_accent = egui::Color32::from_rgb(0x9b, 0x77, 0x60);
+            let header = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(760.0, 32.0));
+            let mut expected_x = 0.0;
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800.0, 400.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    let width = ui
+                        .painter()
+                        .layout_no_wrap(
+                            "p".into(),
+                            egui::FontId::proportional(13.0),
+                            egui::Color32::WHITE,
+                        )
+                        .size()
+                        .x;
+                    let close = pane_header_buttons(header, width, 4, 0.0).close;
+                    expected_x = crate::ui::snap_line_to_pixel(
+                        pane_header_active_boundary(header, close),
+                        crate::ui::designall::SEPARATOR_WIDTH,
+                        ui.ctx().pixels_per_point(),
+                    );
+                    workspace.render_pane_header(ui, header, &pane, true, &config, &catalog, true);
+                },
+            );
+            assert!(
+                output.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::Shape::LineSegment { points, .. } if
+                (points[0].x - expected_x).abs() < 0.1 && (points[1].x - expected_x).abs() < 0.1
+                && points[1].y > points[0].y)),
+                "missing vertical divider after X"
+            );
+            let vertical = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::LineSegment { points, stroke }
+                        if (points[0].x - expected_x).abs() < 0.1
+                            && (points[1].x - expected_x).abs() < 0.1
+                            && points[1].y > points[0].y =>
+                    {
+                        Some((*points, *stroke))
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            let top = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::LineSegment { points, stroke }
+                        if points[1].x > points[0].x && (points[1].y - points[0].y).abs() < 0.1 =>
+                    {
+                        Some((*points, *stroke))
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            output.drop_without_applying_deltas();
+            assert_eq!(
+                vertical.1, top.1,
+                "X divider must use the top border stroke"
+            );
+            assert_eq!(
+                vertical.0[0], top.0[1],
+                "top and X divider must share their endpoint"
+            );
+            assert_eq!(vertical.0[1].y, header.bottom());
+        }
+    }
+
+    #[test]
+    fn tab_strip_session_less_blank_click_requests_launcher() {
+        let catalog = catalog();
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, workspace: &mut WorkspaceUi| {
+                workspace.show_session_less_aux_tabs(ui, &catalog, true);
+            },
+            WorkspaceUi::new(),
+        );
+        harness.run();
+        let pos = egui::pos2(300.0, 16.0);
+        harness.hover_at(pos);
+        harness.run();
+        harness.drag_at(pos);
+        harness.run();
+        harness.drop_at(pos);
+        harness.run();
+        assert!(harness.state_mut().take_new_session_requested());
+        assert!(drain_protocol(harness.state_mut()).is_empty());
+    }
+
+    #[test]
     fn 상단_터미널_툴바는_검색_새셸_좌우_상하분할을_정확히_호출한다() {
         let mut ui = WorkspaceUi::new();
         ui.mux = Some(mux(
@@ -16889,6 +17486,55 @@ mod tests {
     /// warm 워크스페이스는 이벤트를 replay용으로만 쌓아 regex status와 mux 구조가
     /// warm 진입 시점에 얼어붙었다 — 표시 상태 3종(mux/status/종료 결과)은 즉시
     /// 반영해야 fleet 카드와 사이드바가 warm을 정확히 보여준다(백로그 4).
+    #[test]
+    fn fleet_review_fix_first_open_and_hidden_submit_state_is_scoped_and_pruned() {
+        for hidden in [false, true] {
+            let mut ui = WorkspaceUi::new();
+            let catalog = catalog();
+            let both = mux(
+                "a",
+                vec![tab(
+                    "a",
+                    vec![pane("pa", SessionId(1)), pane("pb", SessionId(2))],
+                    LayoutNode::Pane(pane_id("pa")),
+                )],
+                "pa",
+            );
+            let events = [
+                RuntimeEvent::MuxUpdated {
+                    snapshot: Arc::clone(&both),
+                },
+                RuntimeEvent::SessionInputSubmitted {
+                    session: SessionId(1),
+                    at_micros: 200_000_000,
+                },
+                RuntimeEvent::SessionInputSubmitted {
+                    session: SessionId(1),
+                    at_micros: 100_000_000,
+                },
+                RuntimeEvent::SessionInputSubmitted {
+                    session: SessionId(9),
+                    at_micros: 300_000_000,
+                },
+            ];
+            if hidden {
+                ui.apply_warm_events(&events, &catalog);
+            } else {
+                ui.handle_events(&events, &catalog);
+            }
+            assert_eq!(ui.last_input_submission(SessionId(1)), Some(200_000_000));
+            assert_eq!(ui.last_input_submission(SessionId(2)), None);
+            assert_eq!(ui.last_input_submission(SessionId(9)), None);
+            let empty = mux("a", Vec::new(), "pa");
+            if hidden {
+                ui.apply_warm_events(&[RuntimeEvent::MuxUpdated { snapshot: empty }], &catalog);
+            } else {
+                ui.handle_events(&[RuntimeEvent::MuxUpdated { snapshot: empty }], &catalog);
+            }
+            assert_eq!(ui.last_input_submission(SessionId(1)), None);
+        }
+    }
+
     #[test]
     fn warm_이벤트는_mux와_status와_종료결과를_즉시_반영한다() {
         let mut ui = WorkspaceUi::new();
@@ -19847,6 +20493,133 @@ https://example.test/login \
     // 메꾼다. 두 테스트 모두 특수문자 없는 순수 한글(가/나)만 써서 문장부호
     // 중복제거 원장(native_key_monitor 기반)이 애초에 관여하지 않는 경로를
     // 검증한다.
+    #[test]
+    fn popup_behavior_probe_workspace_rename_does_not_paste_into_terminal() {
+        use crate::ui::file_tree::{
+            FileTreeUi, SidebarAction, SidebarSnapshot, SidebarWorkspaceEntry,
+            SidebarWorkspaceState,
+        };
+        use egui_kittest::kittest::Queryable;
+        let text = catalog();
+        let config = TerminalConfig::default();
+        let workspaces = vec![SidebarWorkspaceEntry {
+            id: "ws-inline".into(),
+            name: "Serenity".into(),
+            state: SidebarWorkspaceState::Active,
+            summary: Default::default(),
+        }];
+        let mut ws = WorkspaceUi::new();
+        ws.mux = Some(mux(
+            "primary",
+            vec![tab(
+                "primary",
+                vec![pane("pane", SessionId(7))],
+                LayoutNode::Pane(pane_id("pane")),
+            )],
+            "pane",
+        ));
+        ws.last_focused_pane = Some(pane_id("pane"));
+        ws.pending_focus = Some(pane_id("pane"));
+        ws.sessions.entry(SessionId(7)).or_default().snapshot = Some(snapshot("ready"));
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1100.0, 720.0))
+            .build_ui_state(
+                move |ui, state: &mut (FileTreeUi, WorkspaceUi, Vec<SidebarAction>, bool, bool)| {
+                    if !state.3 {
+                        return;
+                    }
+                    if std::mem::take(&mut state.4) {
+                        crate::native_key_monitor::tests::record_paste();
+                    }
+                    let snapshot = SidebarSnapshot {
+                        active_workspace_id: "ws-inline",
+                        workspaces: &workspaces,
+                        view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
+                        home_notice_count: 0,
+                        fleet_summary: Default::default(),
+                        history_tab_active: false,
+                        git_tab_active: false,
+                        agents_open: false,
+                        workspace_note: None,
+                    };
+                    if let Some(action) =
+                        state
+                            .0
+                            .panel(ui, &std::collections::HashMap::new(), &snapshot, &text)
+                    {
+                        state.2.push(action);
+                    }
+                    let (paste, copy) = state.0.take_clipboard_shortcut_consumption();
+                    state.1.suppress_clipboard_shortcuts_this_frame(paste, copy);
+                    state.1.show_with_input(ui, &config, &[], &text, true);
+                },
+                (
+                    FileTreeUi::new(egui::Context::default()),
+                    ws,
+                    Vec::new(),
+                    false,
+                    false,
+                ),
+            );
+        let fonts = crate::config::Config::default();
+        crate::fonts::install_cjk_fallback(
+            &harness.ctx,
+            None,
+            &fonts.terminal.mono_font,
+            &fonts.terminal.mono_weight,
+        );
+        harness.state_mut().3 = true;
+        harness.run();
+        drain_protocol(&mut harness.state_mut().1);
+        while harness.state_mut().1.take_io_intent().is_some() {}
+        harness
+            .state_mut()
+            .0
+            .begin_workspace_rename("ws-inline".into(), "Serenity".into());
+        harness.run();
+        assert!(harness.ctx.text_edit_focused());
+        assert!(
+            harness
+                .query_by_role(egui::accesskit::Role::TextInput)
+                .is_some()
+        );
+        harness.input_mut().events.extend([
+            egui::Event::Paste("-alias".into()),
+            egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        harness.state_mut().4 = true;
+        harness.run_steps(1);
+        assert!(harness.state().2.iter().any(|action| matches!(action, SidebarAction::CommitWorkspaceName { workspace_id, name } if workspace_id == "ws-inline" && name == "Serenity-alias")));
+        let mut clipboard_request = false;
+        while let Some(intent) = harness.state_mut().1.take_io_intent() {
+            eprintln!("after inline rename: {intent:?}");
+            clipboard_request |= matches!(intent, WorkspaceIoIntent::ReadTerminalClipboard { .. });
+        }
+        assert!(
+            !clipboard_request,
+            "inline rename's native paste was sent to the terminal"
+        );
+        // The discarded native batch must not replay after the one-pass fence expires.
+        harness.run_steps(1);
+        assert!(harness.state_mut().1.take_io_intent().is_none());
+        drain_protocol(&mut harness.state_mut().1);
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::Text("x".into()));
+        harness.run_steps(1);
+        assert_eq!(
+            written_bytes(drain_protocol(&mut harness.state_mut().1)),
+            b"x"
+        );
+    }
+
     fn setup_focused_local_pane_harness(
         session: SessionId,
     ) -> egui_kittest::Harness<'static, WorkspaceUi> {

@@ -1656,7 +1656,12 @@ fn collect_jsonl_bounded(
     depth: usize,
     budget: &mut ScanBudget,
 ) -> bool {
-    if depth > MAX_SCAN_DEPTH || out.len() >= MAX_SCAN_FILES || budget.entries >= MAX_SCAN_ENTRIES {
+    // Sorted traversal has already retained the newest prefix. Reaching the file
+    // cap is a successful bounded result, not an I/O failure that clears it all.
+    if out.len() >= MAX_SCAN_FILES {
+        return true;
+    }
+    if depth > MAX_SCAN_DEPTH || budget.entries >= MAX_SCAN_ENTRIES {
         return false;
     }
     let Ok(rd) = std::fs::read_dir(dir) else {
@@ -1680,7 +1685,7 @@ fn collect_jsonl_bounded(
     entries.sort_by_key(|e| std::cmp::Reverse(e.file_name()));
     for e in entries {
         if out.len() >= MAX_SCAN_FILES {
-            return false;
+            return true;
         }
         // file_type()는 심링크를 따라가지 않는다(Path::is_dir과 달리) — 심링크는 스킵.
         let Ok(ft) = e.file_type() else {
@@ -3253,6 +3258,30 @@ mod tests {
             probe.retained_bytes(),
             std::mem::size_of::<ResumeTranscriptProbe>() + "session-id".len()
         );
+    }
+
+    #[test]
+    fn recursive_scan_file_cap_keeps_newest_bounded_prefix() {
+        let root = temp_dir("scan-file-cap");
+        let newest = root.join("2026/10/05");
+        let older = root.join("2026/10/04");
+        std::fs::create_dir_all(&newest).unwrap();
+        std::fs::create_dir_all(&older).unwrap();
+        for index in 0..MAX_SCAN_FILES {
+            let directory = if index < MAX_SCAN_FILES / 2 {
+                &newest
+            } else {
+                &older
+            };
+            std::fs::write(directory.join(format!("rollout-{index:05}.jsonl")), b"{}\n").unwrap();
+        }
+        std::fs::write(older.join("rollout-00000.jsonl"), b"{}\n").unwrap();
+        let mut paths = Vec::new();
+        assert!(collect_jsonl(&root, &mut paths));
+        assert_eq!(paths.len(), MAX_SCAN_FILES);
+        assert_eq!(paths[0], newest.join("rollout-02047.jsonl"));
+        assert!(!paths.contains(&older.join("rollout-00000.jsonl")));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

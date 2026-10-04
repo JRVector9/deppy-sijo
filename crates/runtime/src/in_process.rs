@@ -11281,6 +11281,62 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn composer_codex_placeholder_accepts_multiline_prompt_in_owned_pty() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, _events) = admission_worker(resolver, "composer-codex-placeholder");
+        let id = SessionId(1);
+        let live = Session::spawn_with_spec(
+            id,
+            session::SessionKind::Shell,
+            &spec("/bin/sh", &["-c", r"stty -echo; printf '\033[?2004h› \033[2mAsk Codex to do anything\033[0m\r\033[2C'; exec /bin/cat"]),
+            80, 24, 100,
+        ).unwrap();
+        let group = live.process_identity().process_group.unwrap();
+        worker.sessions.insert(id, live);
+        worker.detectors.insert(
+            id,
+            session::StatusDetector::new(session::StatusPatterns::compile(None, None, None, None)),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !worker.sessions[&id].bracketed_paste() {
+            assert!(Instant::now() < deadline);
+            worker.collect_session_pump_effects(&[id], false, true);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let admission =
+            crate::InputAdmission::new(crate::InputPermit::new(), deadline, |write| write())
+                .with_agent_guard(crate::AgentInputGuard {
+                    foreground_process_group: group,
+                    provider: crate::AgentPromptKind::Codex,
+                    intent: crate::AgentInputIntent::ExplicitPrompt,
+                });
+        assert_eq!(
+            worker.admit_input_batch_checked(
+                id,
+                &[
+                    "\x1b[200~한글 첫 줄\n두 번째 줄\n세 번째 줄\x1b[201~".as_bytes(),
+                    b"\r"
+                ],
+                Some(&admission)
+            ),
+            Ok(())
+        );
+        assert!(!worker.detectors[&id].has_input_draft());
+        while !worker.sessions[&id].screen_text().contains("세 번째 줄") {
+            assert!(
+                Instant::now() < deadline,
+                "accepted bytes must reach the owned PTY reader"
+            );
+            worker.collect_session_pump_effects(&[id], false, true);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn pr2_actual_admission_preserves_existing_tui_draft_and_dialog() {
         let resolver = Arc::new(RecordingResolver {
             calls: Mutex::new(Vec::new()),

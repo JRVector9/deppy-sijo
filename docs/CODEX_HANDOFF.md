@@ -1,3 +1,37 @@
+# Resume/composer gates passed / source commit and package — 2026-10-05(KST)
+
+- Finalgates exit0 /tmp/deppy-resume-composer-final-gates-20261005.log:3156passed/0failed/34ignored (App2742+integration39+Connector22+i18n8+runtime345). Strict App/runtimealltargetClippy-Dwarnings, UIboundary,27crate dependencies, fmt/diff passed. NewcollapsedUI rejectionfeedback assertions also passed. Finalscope selfreview complete; no new issue confirmed.
+- Currentproduct0.7.2, lastshipped0.7.0; confirmedfixes Codexscanboundedprefix and visiblecollapsednonemptydraftsend/feedback. Isolated native-stylePTY delivered Korean3linebody+CR. RealuserCLI rejection notreproduced; no actual promptsent. Keep that limitation in finalreport.
+- Modified8files:Cargo.toml/lock, agent_detect.rs, ui/composer.rs, runtimetest in_process.rs, reviewreport, followupplan, thishandoff. No permanentlocaldiagnosticprobe/DB/configchanges. InitialwrongRustNULfixture corrected andunrelatedstring fullyreverted.
+- Sourcecommit/push and fresh0.7.2package next; prepared /tmp/deppy-rebuild-0.7.2-20261005.sh gatedoffline/locked andisolatedtarget/restart-0.7.2-20261005. No launchcontroller, no restart; running0.7.0PID26830.
+- Exactnext: git add Cargo.toml Cargo.lock crates/app/src/agent_detect.rs crates/app/src/ui/composer.rs crates/runtime/src/in_process.rs docs/reviews/2026-10-05-resume-composer-followup.md docs/superpowers/plans/2026-10-05-resume-composer-followup.md docs/CODEX_HANDOFF.md; git commit; git push origin feat/audit-nine-pr-v0.6.0-20261004; DEPPY_REQUIRE_TRUSTED_SIGNING=0 DEPPY_ALLOW_UNTRUSTED_SIGNING=1 CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 sh /tmp/deppy-rebuild-0.7.2-20261005.sh.
+
+---
+
+# Resume/composer implementation and final gates — 2026-10-05(KST)
+
+- Confirmed scan cap fix remains agent_detect.rs; collapsed nonemptydraft now retains existing toolbar/send/keyhint/admissionfeedback in ui/composer.rs. RED correct fixture missing↑, GREEN initially1UI+1ownedPTY. Additional rejection/collapse assertions are in final gates. Runtime production unchanged; in_process.rs adds realownedPTY integration regression only.
+- Important investigation correction: newer Claude native task belongs to different removedpane, not currentwebpane. Do not migrate that task into older exactpane bycwd or runtimeID. No further exactbinding defect proven beyond Codexscan discardingrecentprefix. User optional clarification has no answer yet.
+- Actual snapshot probe1passed metadataonly: cursor2,28; promptUnknown(dimplacholder), choicefalse, bracketedtrue, detectorRunning/draftfalse. Removedlocalignoredprobe. Production composer delivery failure not reproduced; fixed missing visible send/feedback affordance and tested actual ownedPTY3linebody+CR+echo. Userdraft kept; native inputfocus only, no liveprompt send.
+- Version0.7.1→0.7.2 exactly27inheritedCargo.lock entries, lastshipped0.7.0; no dependencyupdate. Final gated App/runtime/Connector/i18n, strictalltargetClippy, boundary/deps/fmt running /tmp/deppy-resume-composer-final-gates-20261005.log; do not editRust/Cargo until finished.
+- Failed test fixture: Rust\033 becameNUL; corrected rawprintfstring, realPTY GREEN1passed. Broad replacement convertedoneunrelatedteststring; revertedbeforefinalgates. PreviousUIRED usedinsert_text requestingfocus; correctedrestored-bufferfixture thenmissingbuttonRED. Detailedreport docs/reviews/2026-10-05-resume-composer-followup.md.
+- Remaining: inspectfinalgate, commitsource/docs, push, buildfreshsignedlocal0.7.2withuniqueartifactpaths+source/binary/bundleproof; norestart. Current0.7.0PID26830 maintained. Finishreportandhandoff afteractualresults.
+- Exact next commands: tail -n30 /tmp/deppy-resume-composer-final-gates-20261005.log; git diff --check; git diff -- crates/app/src/agent_detect.rs crates/app/src/ui/composer.rs crates/runtime/src/in_process.rs.
+
+---
+
+# Resume/composer follow-up investigation — 2026-10-05(KST)
+
+- Objective: latest native session resume and bottom composer delivery, after UI0.7.1 commit/push. Restart remains deferred by user; current0.7.0 PID26830 unchanged. Branch remote verified26449130; UI build proof remains valid for95807b1 only, not later product edits.
+- Confirmed root cause: Codex has4195JSONL files under74dated directories. collect_jsonl_bounded sorts newest first but filecap4096 returnedfalse, and collect_jsonl cleared every retained path. Synthetic4097file RED reproduced assertion failure (/tmp/deppy-resume-scan-red-20261005.log). Changed filecap to successful boundedprefix; depth/directory-entry/global-operation/error failure still fails closed. recursive_scan GREEN2passed (/tmp/deppy-resume-scan-green-20261005.log). Source change agent_detect.rs only so far, plus temporary diagnostic input_admission.rs ignored probe.
+- Read-only session metadata: Design current Codex CLI runs in previously Grok-labelled persisted terminal, while saved native binding remains old Grok. Current Claude argv resumes old native session; earlier hook keyed runtime5 contains a later Claude native ID, current CLI environment is runtime1. Runtime-local hook keys must not be used to infer persistent targets across a restart. No database/config/transcript edits made.
+- Composer config enables Enter send; current draft persisted normally, delivery_uncertain=false. Native coordinate focus reveals existing @,/model,MCP,send buttons and retains exact draft. AX click did not focus; corrected with coordinate click. Did NOT send real user prompt or alter content. Investigating actual saved redacted terminal snapshot via test-only read-only probe (bounded16MiB, output metadata only), since no reliable live rejection cause yet. Typing intentionally remains draft until explicitsend; do not claim deliverybug fixed without repro.
+- Failed approaches: nonexistent writer.rs/session_log.rs searches corrected to pty/lib.rs and storage/logs.rs; SQLite cols query rejected (schema has no cols). No mutation occurred. Native AX text contained unrelated private notes; do not include them in reports/logs.
+- Remaining: inspect probe; isolate native delivery failure and newest binding refresh; focused/full checks, scoped review, commit/push. Build fresh artifact only after final fixes; no immediate restart. Remove local-only probe before final commit unless replaced with deterministic regression. Cargo mutation only between gated runs.
+- Exact next commands: tail -n40 /tmp/deppy-composer-snapshot-probe-20261005.log; python3 /private/tmp/deppy-audit-nine-pr-20261004/cargo_gate.py test --offline --locked -q -p deppy-sijo recursive_scan -- --test-threads=1; git diff --check.
+
+---
+
 # Current user steering: defer restart; push UI fix; investigate resume/composer — 2026-10-05(KST)
 
 - New user explicitly says do NOT restart immediately; finish existing UI work, commit/push, then investigate2issues: after restart continue/resume shows preceding tasks instead of newest; bottom composer typing does not appear in agent terminal.

@@ -1049,7 +1049,9 @@ impl ComposerUi {
                     .show(ui)
                 })
                 .inner;
-            if self.expanded {
+            // Restored or blurred drafts still need an explicit send control and
+            // its key/admission feedback; collapsing only reduces the editor.
+            if self.expanded || !buffer.trim().is_empty() {
                 ui.add_space(6.0);
                 let toolbar = self.toolbar(
                     ui,
@@ -1769,7 +1771,7 @@ impl ComposerUi {
         self.expanded = true;
     }
 
-    /// 컴포저 하단 툴바(펼침 상태 전용) — 셀렉터 3종 + 전송. 셀렉터는 전부 "검토 가능한
+    /// 컴포저 하단 툴바(펼침 상태 또는 미전송 초안) — 셀렉터 3종 + 전송. 셀렉터는 전부 "검토 가능한
     /// 텍스트 삽입"이다: PTY 에이전트에는 외부 제어 프로토콜이 없어 선택이 상태를 직접
     /// 바꿀 수 없고, 사용자가 삽입된 텍스트를 보고 전송한다. 반환: 전송 버튼 클릭.
     fn toolbar(
@@ -4182,6 +4184,42 @@ mod tests {
             .get_by_role(egui::accesskit::Role::MultilineTextInput)
             .click();
         harness.run();
+    }
+
+    #[test]
+    fn composer_nonempty_collapsed_draft_keeps_explicit_send_control() {
+        use egui_kittest::kittest::Queryable;
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let path = test_history_path("collapsed-send");
+        let mut harness = composer_harness(&catalog, ComposerSendKey::Enter, path.clone());
+        harness.state_mut().0.buffers.insert(
+            TEST_WS.to_owned(),
+            "한글 첫 줄\n두 번째 줄\n세 번째 줄".to_owned(),
+        );
+        harness.run();
+        assert!(!harness.state().0.expanded);
+        harness.get_by_label("↑").click();
+        harness.run();
+        assert_single_send(&harness.state().1, "한글 첫 줄\n두 번째 줄\n세 번째 줄");
+        assert_eq!(buffer_of(&harness), "한글 첫 줄\n두 번째 줄\n세 번째 줄");
+        let ComposerAction::Send(submission) = harness.state_mut().1.pop().unwrap() else {
+            panic!()
+        };
+        let (prompt, _, submission_id) = submission.into_parts();
+        harness.state_mut().0.settle_submission(
+            TEST_WS,
+            submission_id,
+            &prompt,
+            PromptAdmissionOutcome::Rejected,
+        );
+        harness.state_mut().0.expanded = false;
+        harness
+            .ctx
+            .memory_mut(|memory| memory.surrender_focus(ComposerUi::text_id(TEST_WS)));
+        harness.run();
+        harness.get_by_label(&catalog.t("composer.delivery.rejected", &[]));
+        assert_eq!(buffer_of(&harness), "한글 첫 줄\n두 번째 줄\n세 번째 줄");
+        std::fs::remove_file(path).ok();
     }
 
     #[test]

@@ -1,3 +1,14 @@
+# Current user steering: defer restart; push UI fix; investigate resume/composer — 2026-10-05(KST)
+
+- New user explicitly says do NOT restart immediately; finish existing UI work, commit/push, then investigate2issues: after restart continue/resume shows preceding tasks instead of newest; bottom composer typing does not appear in agent terminal.
+- Current UI work completed/committed95807b1aae8d4b4a94f3c97e878bdd20afea6fe8,0.7.1. Full gates2809passed/0failed/34ignored plus geometry6/visual1, clippy/boundaries/fmt/diff. Actual release package exit0 and proof /tmp/deppy-rebuild-0.7.1-20261005-proof.json verifies27versions/plists/embeddedAbout/source digest/DeveloperID signatures/archive. Local artifact target/restart-0.7.1-20261005, NOT launched.
+- Existing app remains0.7.0 PID26830. Prepared /tmp/deppy-user-restart-0.7.1-20261005.py NOT launched; no controller process scheduled. Do not execute it now. Defer any restart until additional issue work is resolved under latest user scope.
+- Remaining: update report/UI completion record without restart; commit docs and push actual current branch feat/audit-nine-pr-v0.6.0-20261004, then root-cause investigate latest native resume/history and composer UI→App→runtime delivery. Preserve user sessions/data; isolate reproductions. Version must advance before any later changed-code delivery. No subagents started/requested.
+- Relevant files discovered: agent_resume.rs, agent_transcript.rs, composer_drafts.rs, composer_draft_worker.rs, ui/composer.rs. Original root unrelated dirty docs/AGENTS retained.
+- Exact next commands: git status --short --branch; git push origin feat/audit-nine-pr-v0.6.0-20261004; rg -n 'resume|continue|latest' crates/app/src/agent_resume.rs; sed -n '1,240p' crates/app/src/ui/composer.rs.
+
+---
+
 # Current screenshot correction / commit / restart — 2026-10-05(KST)
 
 - User explicitly authorized screenshot design corrections, check prior omissions, commit and restart. Worktree /Users/jr/Desktop/projects/deppy-sijo-performance; baselinea00548b9, only prior restart handoff dirty. Running0.7.0 PID26830.
@@ -7,7 +18,8 @@
 - Additional visual finding: allocated left summary Ui shrank to content and selector did not reach right edge. Tightened actual geometry test reproduced RED (chooser right631.8 vs expected787). Reserve left column min width explicitly. Original4 GREEN passed; extended6 actual UI/height tests and2 Korean snapshots passed before stricter alignment check. Version0.7.0→0.7.1, exactly27 inherited lock entries updated; dependencies unchanged.
 - Final gates executed exit0: geometry6passed + Korean visual1passed; full App/Connector/i18n and App integration2809passed/0failed/34ignored. Strict affected all-target Clippy -D warnings, UI boundary,27-crate dependency gate, fmt and git diff --check passed. Log /tmp/deppy-followup-layout-final-gates-20261005.log. Reviewed corrected wide/narrow actual egui PNGs and final scoped source diff; exact right alignment and narrow chooser/footer interaction verified. Previous notes menu/selection and all migrated centered surfaces exist and relevant full tests passed; no additional confirmed omission in checked scope.
 - Modified files: Cargo.toml/Cargo.lock, ui/fleet.rs, ui/text_input.rs, ui/workspace.rs; popup design +2HTML, correction plan/report and handoff. Existing original-tree dirty AGENTS/docs preserved.
-- Remaining: commit/build/version verification and authorized graceful restart. No subagent requested/started.
+- Product committed 95807b1aae8d4b4a94f3c97e878bdd20afea6fe8 (0.7.1); scoped full verification passed before commit. Rebuild/package now in progress into target/restart-0.7.1-20261005, via required Cargo gate. Pre-build product/source digest recorded /tmp/deppy-rebuild-0.7.1-20261005-source.json. Existing0.7.0 app remains running until artifact checks pass.
+- Remaining: build/version/signature verification and authorized graceful restart; then final docs commit. No subagent requested/started.
 - Failed approach: an unquoted terminal* shell glob matched no files during search; no mutation. Broad read output narrowed afterwards.
 - Exact next command: python3 /private/tmp/deppy-audit-nine-pr-20261004/cargo_gate.py test --offline --locked -q -p deppy-sijo followup_layout -- --test-threads=1.
 

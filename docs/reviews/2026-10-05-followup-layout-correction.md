@@ -23,4 +23,4 @@
 
 ## 버전/커밋/실행
 
-0.7.0→0.7.1, canonical workspace와27 inherited lock entries만 변경한다. 최종 커밋/패키지/실행 증거는 완료 후 기록한다. 로컬 개발 Developer ID 서명 정책이며 공증/공개 배포는 요청 범위에 포함되지 않는다.
+0.7.0→0.7.1, canonical workspace와27 inherited lock entries만 변경한다. 제품 커밋95807b1aae8d4b4a94f3c97e878bdd20afea6fe8. 실제 release/package exit0, 소스 digest 불변,27 inherited versions/내장About binding/번들 plist0.7.1 및 서명·archive 검증 완료. 증거 /tmp/deppy-rebuild-0.7.1-20261005-proof.json. 새 사용자 지시에 따라 재실행 보류;0.7.0 PID26830 유지. 로컬 개발 Developer ID 서명 정책이며 공증/공개 배포는 요청 범위에 포함되지 않는다.

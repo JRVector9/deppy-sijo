@@ -1,3 +1,43 @@
+# Completed task — centered input windows and next-task effort, 2026-10-05(KST)
+
+## Objective / completion
+- Applied user-approved visible HTML centered/resizable window design, actual model display + reasoning dropdown for Next Step reservation. Kept real current/recent task on running Fleet cards after large tool output.
+- Worktree /Users/jr/Desktop/projects/deppy-sijo-performance, branch feat/audit-nine-pr-v0.6.0-20261004.
+- Product source commit **462c4af5429056ffd8ce6bd9ab015cc4f60d9cfe**, version **0.6.1→0.7.0**. All implementation/review/test/build/static verification complete. Documentation/journal record this result. No native Deppy launch/stop/restart or push.
+
+## Modified files / key decisions
+- agent_transcript.rs: same-fd/EOF bounded4MiB latest user-instruction recovery after300KiB tool output. Latest tail still owns status/model. Fleet live missing-description fallback says pending description; original per-session carry-forward retained.
+- Common presentation moved once to connector-ui/src/popup; App reexports same APIs/fence. Native centered pivot and native Resize keep movement/size; centers on each open.18pt title/13pt body/36pt input/34pt actions; body scroll/fixed footer.18–20/06/22 common window/body/fields/footer,30–32 shell/padding. App-specific modal/input/operation state remains in caller.
+- followup_settings.rs and ui/fleet.rs: real original model/current effort + typed supported dropdown, keep-current default, invalid selection blocks Save with inline notice.5i18n catalogs. Claude default-persistence hint. Codex/Claude verified live paths; Kimi/Grok read-only; currentUltra preserved in calculation, automatic targetUltra unavailable.
+- app.rs: exact original runtime/session/execution/reservation + revocable permit. Fresh original completion latched in reservation; deadlines evaluated independently of waiting/consumed notification. Correlated setting ACK retains original prompt/permit. Actual selected effort confirms before prompt. Rejected/Unknown/timeout retains/blocks; cancel/replacement/exit revokes.
+- runtime in_process/lib: one-shot local current screen <=8KiB for Codex, reply2s/preparation20s/confirmation20s, same FIFO/worker. Claude operation-owned fresh stdout <=8KiB registered after guarded actual acceptance/drain; worker holds Weak, original permit closes/clears on cancellation/rejection/drop. No wire change/new worker/thread/GUI snapshot/remote lease/hidden agent.
+- Codex only exact single CSI ShiftUp/Down batch with accepted Codex AutomaticPrompt guard avoids phantom draft evidence. All ordinary/manual/history input and real draft protection retained. One setting step after observed native progress; no guessed/blind repeated keys.
+- Canonical Cargo/27 inherited lock versions updated; connector dev-only egui_kittest strict allowlist updated. No new production capability edge.
+- Design doc, numbered HTML inventory, accepted prototype, plan and report updated. Report docs/reviews/2026-10-05-centered-windows-followup-effort.md.
+
+## Actual tests / reviews
+- **Final gate exit0** /tmp/deppy-centered-final-codex-corrected-gates-20261005.log: App2773 +Connector22 +i18n8 +Runtime344 = **3147passed/0failed/33existingignored**. Strict affected all-target Clippy -D warnings, UI capability boundary,27-crate dependency gate, fmt, git diff --check passed.
+- Actual offscreen UI: center/open/title movement/native resize/size retention/reopen/narrow footer; real reasoning choice and original target intent; invalid-model selection Save block. Private Warm target current read/fresh matching ACK capture excludes old screen; cancellation then new output does not recapture. Buffers bounded/free on close. Original permit/late receipts/replacement safety tests pass.
+- Actual runtime Codex regression RED failed phantom draft; GREEN proves two setting keys and following prompt accepted, ordinary history/genuine draft still reject automation. /tmp/deppy-centered-codex-draft-{red,green}-20261005.log.
+- Independent source-only gpt-6.1-sol/xhigh: initial5 (2High+3Medium), focused2 (High consumed completion +Medium ACK count scroll), final1High (phantom draft); all8 corrected. Narrow final corrective review exit0 **no confirmed remaining findings** /private/tmp/deppy-fleet-20261005/codex-draft-final-review-result.txt. Other review files source-review-result.txt/followup-review-result.txt/final-followup-review-result.txt in same tempdir.
+- HTML12browser QA + actual visible native Chrome verified earlier. Preview server44458 remains http://127.0.0.1:57290/fleet-centered-resizable-popups-2026-10-05.html.
+- No native Deppy/actual user AI CLI end-to-end/whole-process RSS/GPU claim. Tests use test-owned PTYs/files/providers; no user sessions/clipboard/files/secrets written.
+
+## Failed approaches
+- Measured-size recentering created perpetual repaint and11px center error; removed fully, native pivot used. Unbounded model label layout placed chooser under footer; bounded horizontal row corrected real hit-test RED.4MiB fallback needed actual user-turn type guard (assistant-type RED). New connector test dependency initially failed strict allowlist; corrected dev-only edge.
+- Historical effort was insufficient; native local current-state read added. Visible Claude ACK counts failed after scroll; replaced with operation-owned fresh output. Consumable completion could stall settings/deadlines; latch and independent expiry used. Codex setting keys created phantom draft; narrow guarded exact-key exception added.
+- Static version helper first searched About config in app.rs; actual bind main.rs:299. Corrected verifier, no app executed. Earlier0.7.0 candidates preserved at target/review-build-0.7.0-before-second-review-20261005 and target/review-build-0.7.0-before-codex-draft-fix-20261005; never delivered/launched.
+
+## Final local artifact / exact next reads
+- **target/bundle-0.7.0/Deppy Sijo.app** and ZIP; final package exit0 /tmp/deppy-centered-package-final-codex-0.7.0-20261005.log. Package signature/content checked under explicit local development policy; no public notarization/deployment claim.
+-27 inherited lock versions/compile metadata/embedded native About version binding and both plist fields0.7.0. Source329-file digest before/after build **334124f95b78695f6cf9be771b75f7429c6ccb8d9ee5bae5588e99d4adc6a5bf** matched. Static proof /private/tmp/deppy-fleet-20261005/release-final-proof.json and verify-final-release.py.
+- Binary SHA256 **9238caf325e0040f19b9253aad4e9ead1714b84f560a02983ade7b446ddaf490**; ZIP **59f63e82e02f23c6c2aaa31e194a1e404afe5ebe3390b0dfc3b276ef9c876a98**.
+- No required work remains. Local source commit and Obsidian project journal completed; final docs commit follows. No push/restart.
+- Next exact read-only commands: git status --short --branch; cat docs/reviews/2026-10-05-centered-windows-followup-effort.md. Future task needs current user scope; native restart remains separately authorized per task. Do not run dev-run.sh, open app bundle, or app --version automatically.
+- Future Cargo only through python3 /private/tmp/deppy-audit-nine-pr-20261004/cargo_gate.py (lock through execution); no Rust edits during Cargo runs.
+
+---
+
 # Completed task — note editing and top menu, 2026-10-05(KST)
 
 ## Current objective / completed source

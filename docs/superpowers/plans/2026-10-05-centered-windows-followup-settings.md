@@ -45,5 +45,5 @@ Files: `crates/app/src/{fleet,followup_settings,app,pty_effort}.rs`, `crates/app
 
 - [x] Freeze source; execute actual independent `codex exec -m gpt-6.1-sol -c model_reasoning_effort=xhigh` source-only review; correct confirmed findings and rerun affected gates.
 - [x] Strict affected all-target Clippy, fmt, UI capability/dependency boundary, relevant suites. No optional whole-workspace rerun unless required by extraction risk.
-- [ ] Version0.6.1→0.7.0 (new feature), inherited workspace lock versions, fresh versioned macOS app+ZIP. Verify compiled version and both bundle version fields; do not execute Deppy.
-- [ ] Local conventional commits, Obsidian project journal and continuous `docs/CODEX_HANDOFF.md`. No push or restart.
+- [x] Version0.6.1→0.7.0 (new feature), inherited workspace lock versions, fresh versioned macOS app+ZIP. Verify compiled version and both bundle version fields; do not execute Deppy.
+- [x] Local conventional commits, Obsidian project journal and continuous `docs/CODEX_HANDOFF.md`. No push or restart.

@@ -1,10 +1,10 @@
-# Active task — note editing and top menu, 2026-10-05(KST)
+# Completed task — note editing and top menu, 2026-10-05(KST)
 
 ## Current objective / completed source
 - Notes tab: drag-select then right-click for cut/copy/paste/delete/select-all; preserve only clicked-word selection on double-click and subsequent menu interaction.
 - Overall title/menu bar38→36pt via the shared macOS traffic-light constant. Session pane tab header is unchanged.
 - Worktree `/Users/jr/Desktop/projects/deppy-sijo-performance`, branch `feat/audit-nine-pr-v0.6.0-20261004`, baseline9d6ad930, initially clean. No app launch/stop/restart or new push authorization.
-- Final source implementation, actual tests and independent review completed; fresh final0.6.1 packaging/journal remain.
+- Implementation,38tests, independent review correction and fresh0.6.1 package verification complete. Source commit `8ebcf3b76c981f4018fe378c29cdc6aa558dfe70`. Native app not restarted; old PID21631/artifact hashes unchanged.
 
 ## Modified files / design
 - `crates/app/src/ui/notes.rs`: workspace-scoped pending TextEdit events; synthetic events removed before returning; pending edit cleared on workspace/external-buffer change. Right-button pointer state is hidden only during TextEdit and restored before rereading its menu response. Normal native word selection and undo/Edited autosave are retained. No separate undo or clipboard engine.
@@ -28,9 +28,12 @@
 - `metadata --no-deps` did not update lock; first locked gate refused before tests. Offline full metadata updated only27 inherited workspace versions.
 - First release/package succeeded before review correction, never delivered/executed: preserved `target/review-build-0.6.1-notes-unreleased-20261005/`. Final artifact must be freshly built into `target/bundle-0.6.1/`; no version0.6.1 has yet been shipped.
 
-## Remaining / next exact commands
-- Source commit, then `DEPPY_REQUIRE_TRUSTED_SIGNING=0 DEPPY_ALLOW_UNTRUSTED_SIGNING=1 sh /private/tmp/deppy-notes-20261005/package-0.6.1.sh` (fresh versioned destination, gated offline/locked build, no app launch).
-- Verify metadata/embedded version and both plist fields0.6.1, package signatures/content, unchanged old running executable/ZIP; record source commit and artifact proof, journal, documentation commit. No further optional tests/research or app restart; no push.
+## Final local release / remaining
+-0.6.0→0.6.1, source `8ebcf3b76c981f4018fe378c29cdc6aa558dfe70`. `target/bundle-0.6.1/Deppy Sijo.app` and matching ZIP, final release/package exit0 `/tmp/deppy-notes-package-final-20261005.log`.
+- Actual27 inherited lock versions, compile/embedded version and native About CARGO_PKG_VERSION configuration, both plist fields0.6.1; native About UI was not opened. Package signing/content verified under local development policy, not public notarized deployment.
+- Binary SHA256 `c475f2221d65a6d3ae3c128c458d642fa238495e30d9acb5bca5c1f18eac5825`; ZIP `0be2a7426ecca662b64f7bf5f4045e0db471bd0782d582fa306bb01cd2aa8d45`. Full proof `/private/tmp/deppy-notes-20261005/release-final-proof.json`.
+- Completed report `docs/reviews/2026-10-05-notes-editing-top-menu.md`. No implementation/test/build/review work remains. Journal and final documentation commit record this result; no push or app restart.
+- Next agent read-only commands: `git status --short --branch`; `cat docs/reviews/2026-10-05-notes-editing-top-menu.md`. Future tasks require current user instructions; do not run `scripts/dev-run.sh`, app bundle, or app --version automatically.
 
 ---
 

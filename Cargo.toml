@@ -86,7 +86,7 @@ libc = "0.2"
 # OAuth PKCE (설계 crate 정책 §oauth2 = "5"). reqwest/tokio 회피 — sync ureq client만
 oauth2 = { version = "5", default-features = false }
 # The shared idle transport uses ureq's unversioned connector API.
-ureq = "=3.4.0"
+ureq = "=3.4.2"
 http-client = { path = "crates/http-client" }
 sha2 = "0.11"
 chacha20poly1305 = "0.11"

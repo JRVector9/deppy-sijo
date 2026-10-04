@@ -8,7 +8,28 @@ use serde_json::{Value, json};
 pub use server::{Auth, Request, Server, TOKEN_TTL, now};
 
 pub const MAX_TEXT: usize = 8 * 1024;
+pub const MAX_PASTE: usize = 32 * 1024;
 pub const MAX_ANSWER: usize = 16 * 1024;
+
+/// Validate before the shared Composer encoder; it must never silently strip unsafe bytes.
+pub fn validate_paste_text(text: &str, submit: bool) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        text.len() <= MAX_PASTE && (submit || !text.is_empty()),
+        "invalid_paste_size"
+    );
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        anyhow::ensure!(
+            !c.is_control()
+                || matches!(c, '\n' | '\t')
+                || (c == '\r' && chars.peek() == Some(&'\n')),
+            "paste_contains_unsafe_control"
+        );
+    }
+    // Empty Enter remains available through legacy send_text, not a paste operation.
+    anyhow::ensure!(!text.is_empty(), "invalid_paste_size");
+    Ok(())
+}
 
 pub fn encode_input(text: &str, submit: bool) -> anyhow::Result<Vec<u8>> {
     anyhow::ensure!(
@@ -37,6 +58,12 @@ pub fn tools() -> Value {
             "send_text",
             "Type into the exact shared session only if input is allowed. submit defaults false; true appends Enter. Control characters/newlines are rejected. queued means PTY queue admission, not execution/completion. Never automatically retry an unknown outcome.",
             json!({"text":{"type":"string","description":"Maximum 8192 UTF-8 bytes; no control characters or newlines"},"submit":{"type":"boolean","default":false}}),
+            vec!["text"],
+        ),
+        (
+            "paste_text",
+            "Explicitly paste into the exact shared session. Maximum 32768 UTF-8 bytes; JSON/envelope bounds may reject earlier. LF/CRLF and tabs require verified bracketed paste, otherwise rejected. submit defaults false; true sends one separate Enter atomically with the body. Known AI execution/draft/dialog changes reject input. queued means admission, not execution/completion. Never automatically retry unknown input.",
+            json!({"text":{"type":"string","description":"Maximum 32768 UTF-8 bytes; LF, CRLF and tab accepted only with verified bracketed paste. Other controls and ESC rejected."},"submit":{"type":"boolean","default":false}}),
             vec!["text"],
         ),
         (

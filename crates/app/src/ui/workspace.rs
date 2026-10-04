@@ -40,6 +40,11 @@ const WORKSPACE_NOTICE_SUMMARY_MAX_BYTES: usize = 4 * 1024;
 const WORKSPACE_NOTICE_BODY_MAX_BYTES: usize = 2 * 1024;
 const WORKSPACE_NOTICE_TOTAL_MAX_BYTES: usize = 5 * 1024;
 const WORKSPACE_PROTOCOL_CAP: usize = 8;
+// Direct terminal gestures may use eight extra ordered slots under host pressure. Payloads in
+// both queued and in-flight slots share the original eight MiB ceiling; no shadow payload exists.
+const TERMINAL_PROTOCOL_PRESSURE_CAP: usize = 2 * WORKSPACE_PROTOCOL_CAP;
+const TERMINAL_PROTOCOL_RETAINED_INPUT_MAX_BYTES: usize =
+    WORKSPACE_PROTOCOL_CAP * WORKSPACE_PROTOCOL_INPUT_MAX_BYTES;
 // Terminal paste accepts files/selections up to the existing 1 MiB clipboard ceiling. This is a
 // local PTY byte stream, not the Connector/MCP tool-argument contract whose independent cap is
 // 32 KiB.
@@ -302,6 +307,7 @@ pub struct WorkspaceProtocolCompletion {
 struct PendingProtocolIntent {
     spawn: bool,
     spawn_cwd: Option<String>,
+    input_bytes: usize,
 }
 
 enum PendingShellSpawn {
@@ -325,6 +331,27 @@ fn workspace_protocol_kind(command: &RuntimeCommand) -> &'static str {
         RuntimeCommand::ExtractLastOutput { .. } => "extract_last_output",
         _ => "invalid",
     }
+}
+
+fn protocol_input_bytes(command: &RuntimeCommand) -> usize {
+    match command {
+        RuntimeCommand::WriteInput { bytes, .. } => bytes.capacity(),
+        _ => 0,
+    }
+}
+
+pub(crate) fn terminal_protocol_command(command: &RuntimeCommand) -> bool {
+    matches!(
+        command,
+        RuntimeCommand::WriteInput { .. }
+            | RuntimeCommand::FocusPane { .. }
+            | RuntimeCommand::Resize { .. }
+            | RuntimeCommand::ResizeTracked { .. }
+            | RuntimeCommand::ResizeSplit { .. }
+            | RuntimeCommand::Scroll { .. }
+            | RuntimeCommand::ScrollToBottom { .. }
+            | RuntimeCommand::ScrollToPrompt { .. }
+    )
 }
 
 fn workspace_protocol_command_is_valid(
@@ -1917,6 +1944,15 @@ impl TerminalPreeditState {
     }
 }
 
+type AgentPasteTarget = (SessionId, crate::agent_detect::AgentExecutionIdentity);
+type AgentSendChoice = (Vec<AgentPasteTarget>, Option<String>);
+
+pub(crate) struct SelectedAgentPrompt {
+    pub session: SessionId,
+    pub execution: crate::agent_detect::AgentExecutionIdentity,
+    pub prompt: std::sync::Arc<str>,
+}
+
 pub struct WorkspaceUi {
     mux: Option<Arc<MuxSnapshot>>,
     pub cloud_answers: Arc<[crate::ui::cloud_answer::Answer]>,
@@ -1970,6 +2006,7 @@ pub struct WorkspaceUi {
     next_protocol_operation: u64,
     protocol_intents: VecDeque<WorkspaceProtocolIntent>,
     protocol_inflight: HashMap<(WorkspaceProtocolOperation, u64), PendingProtocolIntent>,
+    protocol_retry_at: Option<std::time::Instant>,
     pending_path_resolution: Option<PendingPathResolution>,
     /// 직전 폴더 클릭 (경로, 시각) — 더블클릭이 clicked를 두 번 발화시켜 같은 cd가
     /// 연속 주입되는 것을 막는다.
@@ -2091,6 +2128,9 @@ pub struct WorkspaceUi {
     session_project_names: SessionProjectNameSnapshot,
     /// 세션별 에이전트 표시정보(model/effort/context — App이 병합해 set) — 3줄 행 2/3행.
     agent_info: std::collections::HashMap<SessionId, crate::agent_detect::AgentDisplay>,
+    agent_executions:
+        std::collections::HashMap<SessionId, crate::agent_detect::AgentExecutionIdentity>,
+    selected_agent_prompts: VecDeque<SelectedAgentPrompt>,
     /// PR-3: 세션별로 영속된 에이전트 종류("claude"/"codex"/"kimi" — App이 pane_id
     /// 키인 persisted_agents에서 세션 키로 바꿔 매 갱신마다 set). 「다시 실행」 버튼
     /// 문구(이어서/새로) 판정에만 쓴다 — leaf는 agent_resume::resume_args 같은 순수
@@ -3024,6 +3064,7 @@ impl WorkspaceUi {
             next_protocol_operation: 1,
             protocol_intents: VecDeque::with_capacity(WORKSPACE_PROTOCOL_CAP),
             protocol_inflight: HashMap::with_capacity(WORKSPACE_PROTOCOL_CAP),
+            protocol_retry_at: None,
             pending_path_resolution: None,
             last_dir_click: None,
             last_url_click: None,
@@ -3032,6 +3073,8 @@ impl WorkspaceUi {
             session_cwds: std::collections::HashMap::new(),
             session_project_names: SessionProjectNameSnapshot::default(),
             agent_info: std::collections::HashMap::new(),
+            agent_executions: std::collections::HashMap::new(),
+            selected_agent_prompts: VecDeque::new(),
             archived_resume_presentation: std::collections::HashMap::new(),
             pending_pastes: VecDeque::new(),
             native_error: None,
@@ -3898,8 +3941,38 @@ impl WorkspaceUi {
         command: RuntimeCommand,
         spawn_cwd: Option<String>,
     ) -> Result<(WorkspaceProtocolOperation, u64), WorkspaceProtocolErrorCode> {
-        workspace_protocol_command_is_valid(&command)?;
+        self.queue_protocol_intent_owned(command, spawn_cwd)
+            .map_err(|(code, _)| code)
+    }
 
+    fn retained_protocol_input_bytes(&self) -> usize {
+        self.protocol_intents
+            .iter()
+            .map(|intent| protocol_input_bytes(&intent.command))
+            .sum::<usize>()
+            + self
+                .protocol_inflight
+                .values()
+                .map(|pending| pending.input_bytes)
+                .sum::<usize>()
+    }
+
+    fn queue_protocol_intent_owned(
+        &mut self,
+        mut command: RuntimeCommand,
+        spawn_cwd: Option<String>,
+    ) -> Result<(WorkspaceProtocolOperation, u64), (WorkspaceProtocolErrorCode, Box<RuntimeCommand>)>
+    {
+        if let Err(code) = workspace_protocol_command_is_valid(&command) {
+            return Err((code, Box::new(command)));
+        }
+        let retained_input_bytes = self.retained_protocol_input_bytes();
+        if let RuntimeCommand::WriteInput { bytes, .. } = &mut command {
+            // Do this once at ingestion, never on idle frames or host retries.
+            if bytes.capacity() != bytes.len() {
+                *bytes = std::mem::take(bytes).into_boxed_slice().into_vec();
+            }
+        }
         let spawn = matches!(
             &command,
             RuntimeCommand::SpawnShell { .. } | RuntimeCommand::SplitPane { .. }
@@ -3928,7 +4001,7 @@ impl WorkspaceUi {
                 )
                 >= WORKSPACE_PROTOCOL_CAP
         {
-            return Err(WorkspaceProtocolErrorCode::Busy);
+            return Err((WorkspaceProtocolErrorCode::Busy, Box::new(command)));
         }
 
         if let RuntimeCommand::ResizeTracked { session, .. } = &command
@@ -3984,25 +4057,57 @@ impl WorkspaceUi {
             }) = self.protocol_intents.back_mut()
             && queued_session == next_session
         {
-            let combined = queued_bytes
-                .len()
-                .checked_add(next_bytes.len())
-                .ok_or(WorkspaceProtocolErrorCode::PayloadTooLarge)?;
-            if combined > WORKSPACE_PROTOCOL_INPUT_MAX_BYTES {
-                return Err(WorkspaceProtocolErrorCode::PayloadTooLarge);
+            let combined = queued_bytes.len().saturating_add(next_bytes.len());
+            if combined <= WORKSPACE_PROTOCOL_INPUT_MAX_BYTES {
+                let other_bytes = retained_input_bytes - queued_bytes.capacity();
+                let available = TERMINAL_PROTOCOL_RETAINED_INPUT_MAX_BYTES - other_bytes;
+                if combined > available {
+                    return Err((
+                        WorkspaceProtocolErrorCode::PayloadTooLarge,
+                        Box::new(command),
+                    ));
+                }
+                // Geometric growth amortizes new gestures. Charge capacity (not length), and
+                // fall back to exact growth when the aggregate ceiling has less headroom.
+                let target = combined
+                    .next_power_of_two()
+                    .min(WORKSPACE_PROTOCOL_INPUT_MAX_BYTES)
+                    .min(available);
+                if target > queued_bytes.capacity() {
+                    queued_bytes.reserve_exact(target - queued_bytes.len());
+                }
+                if other_bytes + queued_bytes.capacity()
+                    > TERMINAL_PROTOCOL_RETAINED_INPUT_MAX_BYTES
+                {
+                    *queued_bytes = std::mem::take(queued_bytes).into_boxed_slice().into_vec();
+                    return Err((
+                        WorkspaceProtocolErrorCode::PayloadTooLarge,
+                        Box::new(command),
+                    ));
+                }
+                queued_bytes.extend_from_slice(next_bytes);
+                self.command_sent = true;
+                return Ok((*operation, *generation));
             }
-            queued_bytes.extend_from_slice(next_bytes);
-            self.command_sent = true;
-            return Ok((*operation, *generation));
+            // A full command is not a full queue: retain the next whole gesture in its own
+            // ordered entry when the per-command cap prevents adjacent coalescing.
         }
 
+        if retained_input_bytes.saturating_add(protocol_input_bytes(&command))
+            > TERMINAL_PROTOCOL_RETAINED_INPUT_MAX_BYTES
+        {
+            return Err((
+                WorkspaceProtocolErrorCode::PayloadTooLarge,
+                Box::new(command),
+            ));
+        }
         if self
             .protocol_intents
             .len()
             .saturating_add(self.protocol_inflight.len())
             >= WORKSPACE_PROTOCOL_CAP
         {
-            return Err(WorkspaceProtocolErrorCode::Busy);
+            return Err((WorkspaceProtocolErrorCode::Busy, Box::new(command)));
         }
         let (operation, generation) = self.next_protocol_operation();
         self.protocol_intents.push_back(WorkspaceProtocolIntent {
@@ -4016,9 +4121,16 @@ impl WorkspaceUi {
     }
 
     /// Drains one validated protocol request for the composition root. A taken request occupies
-    /// one of the same eight slots until an exact completion is applied, preventing a hidden
-    /// in-flight backlog when a host adapter stalls.
+    /// a bounded slot until an exact completion is applied. The pressure reserve is shared by
+    /// queued and in-flight terminal gestures, preventing a hidden host backlog.
     pub fn take_protocol_intent(&mut self) -> Option<WorkspaceProtocolIntent> {
+        if self
+            .protocol_retry_at
+            .is_some_and(|at| std::time::Instant::now() < at)
+        {
+            return None;
+        }
+        self.protocol_retry_at = None;
         let mut intent = self.protocol_intents.pop_front()?;
         let key = (intent.operation, intent.generation);
         self.protocol_inflight.insert(
@@ -4029,9 +4141,64 @@ impl WorkspaceUi {
                     RuntimeCommand::SpawnShell { .. } | RuntimeCommand::SplitPane { .. }
                 ),
                 spawn_cwd: intent.spawn_cwd.take(),
+                input_bytes: protocol_input_bytes(&intent.command),
             },
         );
         Some(intent)
+    }
+
+    /// The final-pass host only drains this explicit nonblocking terminal prefix. Unsupported
+    /// lifecycle/search/prompt requests remain at the head for the next logic pass.
+    pub(crate) fn take_terminal_protocol_intent(&mut self) -> Option<WorkspaceProtocolIntent> {
+        if !self
+            .protocol_intents
+            .front()
+            .is_some_and(|intent| terminal_protocol_command(&intent.command))
+        {
+            return None;
+        }
+        self.take_protocol_intent()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pr10_stage_input_for_host_test(&mut self, session: SessionId, bytes: Vec<u8>) {
+        self.send(RuntimeCommand::WriteInput { session, bytes });
+    }
+
+    pub(crate) fn has_queued_protocol_intents(&self) -> bool {
+        !self.protocol_intents.is_empty()
+    }
+
+    pub(crate) fn protocol_retry_delay(&self) -> Option<std::time::Duration> {
+        self.protocol_retry_at
+            .map(|at| at.saturating_duration_since(std::time::Instant::now()))
+    }
+
+    /// A failed try_send returns the same owned command, known never to have entered the
+    /// worker. Restore its exact operation/generation at the FIFO head; no payload copy/rebuild.
+    pub(crate) fn return_unsent_terminal_protocol(
+        &mut self,
+        operation: WorkspaceProtocolOperation,
+        generation: u64,
+        command: RuntimeCommand,
+    ) {
+        let key = (operation, generation);
+        if !terminal_protocol_command(&command) || !self.protocol_inflight.contains_key(&key) {
+            return;
+        }
+        let pending = self
+            .protocol_inflight
+            .remove(&key)
+            .expect("exact pending checked");
+        // Runtime canonicalization may compact an amortized-growth buffer on first admission.
+        debug_assert!(protocol_input_bytes(&command) <= pending.input_bytes);
+        self.protocol_intents.push_front(WorkspaceProtocolIntent {
+            operation,
+            generation,
+            command,
+            spawn_cwd: pending.spawn_cwd,
+        });
+        self.protocol_retry_at = Some(std::time::Instant::now() + PROTOCOL_RETRY_BASE);
     }
 
     /// Applies only the exact operation/generation currently in flight. Unknown, duplicate, or
@@ -4041,6 +4208,12 @@ impl WorkspaceUi {
         let Some(pending) = self.protocol_inflight.remove(&key) else {
             return;
         };
+        if pending.input_bytes > 0 && completion.result.is_err() {
+            self.report_protocol_queue_rejection(
+                WorkspaceProtocolErrorCode::DeliveryFailed,
+                "terminal_host_refusal",
+            );
+        }
         if let Some(search) = self.search.as_mut()
             && search.delivery == Some(key)
         {
@@ -4837,6 +5010,20 @@ impl WorkspaceUi {
         info: std::collections::HashMap<SessionId, crate::agent_detect::AgentDisplay>,
     ) {
         self.agent_info = info;
+    }
+
+    pub(crate) fn set_agent_executions(
+        &mut self,
+        executions: std::collections::HashMap<
+            SessionId,
+            crate::agent_detect::AgentExecutionIdentity,
+        >,
+    ) {
+        self.agent_executions = executions;
+    }
+
+    pub(crate) fn take_selected_agent_prompt(&mut self) -> Option<SelectedAgentPrompt> {
+        self.selected_agent_prompts.pop_front()
     }
 
     pub(crate) fn set_archived_resume_presentation(
@@ -6090,11 +6277,11 @@ impl WorkspaceUi {
             if response.drag_started() {
                 response.dnd_set_drag_payload(header_context.attachment_id);
             }
-            response
-                .dnd_release_payload::<crate::ui::cross_workspace::AttachmentId>()
-                .map(|attachment_id| {
+            release_typed_dnd_payload::<crate::ui::cross_workspace::AttachmentId>(&response).map(
+                |attachment_id| {
                     AttachedPaneReorder::new(*attachment_id, header_context.destination_index)
-                })
+                },
+            )
         });
 
         let close_rect = egui::Rect::from_center_size(
@@ -7042,17 +7229,18 @@ impl WorkspaceUi {
             drop_feedback = classify_terminal_drop_feedback(
                 pane_resp
                     .dnd_hover_payload::<std::path::PathBuf>()
-                    .is_some(),
+                    .is_some()
+                    || pane_resp
+                        .dnd_hover_payload::<crate::ui::file_tree::FileTreeDragPayload>()
+                        .is_some(),
                 pane_resp
                     .dnd_hover_payload::<TerminalTextDragPayload>()
                     .is_some(),
                 os_drag_active && os_over_pane,
             );
             if let Some(session) = pane.session_id {
-                if let Some(path) = release_typed_dnd_payload::<std::path::PathBuf>(&pane_resp) {
-                    render_output
-                        .document_drop_paths
-                        .push(path.as_ref().clone());
+                if let Some(paths) = release_file_dnd_paths(&pane_resp) {
+                    render_output.document_drop_paths.extend(paths);
                     render_output.local_focus_claimed = Some(pane_id.clone());
                     if !focused {
                         self.request_pane_focus(pane_id.clone());
@@ -7729,11 +7917,9 @@ impl WorkspaceUi {
         // hover 테두리는 위 pane 배경 경로가 pane_rect에 그린다.
         if mode.is_local()
             && input_enabled
-            && let Some(path) = release_typed_dnd_payload::<std::path::PathBuf>(&output.response)
+            && let Some(paths) = release_file_dnd_paths(&output.response)
         {
-            render_output
-                .document_drop_paths
-                .push(path.as_ref().clone());
+            render_output.document_drop_paths.extend(paths);
             render_output.local_focus_claimed = Some(pane_id.clone());
             if !focused {
                 self.request_pane_focus(pane_id.clone());
@@ -8215,14 +8401,21 @@ impl WorkspaceUi {
 
     /// 실행 중 에이전트 pane 대상 목록 — 감지 워커가 채운 agent_info의 세션들.
     /// 표시 순서를 프레임마다 흔들지 않게 mux pane 순서로 정렬한다.
-    fn agent_send_targets(&self) -> Vec<(SessionId, String)> {
+    fn agent_send_targets(
+        &self,
+    ) -> Vec<(
+        SessionId,
+        crate::agent_detect::AgentExecutionIdentity,
+        String,
+    )> {
         self.mux
             .iter()
             .flat_map(|mux| mux.tabs.iter().flat_map(|tab| &tab.panes))
             .filter_map(|pane| {
                 let session = pane.session_id?;
+                let execution = *self.agent_executions.get(&session)?;
                 let line = self.agent_line_for(session)?;
-                Some((session, line))
+                Some((session, execution, line))
             })
             .collect()
     }
@@ -8234,18 +8427,22 @@ impl WorkspaceUi {
         &self,
         ui: &mut egui::Ui,
         title: String,
-        targets: &[(SessionId, String)],
+        targets: &[(
+            SessionId,
+            crate::agent_detect::AgentExecutionIdentity,
+            String,
+        )],
         catalog: &i18n::Catalog,
-    ) -> Option<(Vec<SessionId>, Option<String>)> {
-        let mut choice: Option<(Vec<SessionId>, Option<String>)> = None;
+    ) -> Option<AgentSendChoice> {
+        let mut choice: Option<AgentSendChoice> = None;
         ui.menu_button(title, |ui| {
-            for (session, agent_line) in targets {
+            for (session, execution, agent_line) in targets {
                 ui.label(egui::RichText::new(agent_line).small().weak());
                 if ui
                     .button(catalog.t("workspace.menu.send_agent.raw", &[]))
                     .clicked()
                 {
-                    choice = Some((vec![*session], None));
+                    choice = Some((vec![(*session, *execution)], None));
                     ui.close();
                 }
                 // 빈 항목은 건너뛴다 — 설정에서 "추가"만 누르고 안 채운 경우 메뉴에
@@ -8256,7 +8453,7 @@ impl WorkspaceUi {
                     .filter(|p| !p.trim().is_empty())
                 {
                     if ui.button(format!("\"{preset}\"")).clicked() {
-                        choice = Some((vec![*session], Some(preset.clone())));
+                        choice = Some((vec![(*session, *execution)], Some(preset.clone())));
                         ui.close();
                     }
                 }
@@ -8271,7 +8468,13 @@ impl WorkspaceUi {
                     ))
                     .clicked()
             {
-                choice = Some((targets.iter().map(|(session, _)| *session).collect(), None));
+                choice = Some((
+                    targets
+                        .iter()
+                        .map(|(session, execution, _)| (*session, *execution))
+                        .collect(),
+                    None,
+                ));
                 ui.close();
             }
         });
@@ -8279,24 +8482,47 @@ impl WorkspaceUi {
     }
 
     /// 선택 본문을 대상 에이전트들에 주입하고 단일 대상이면 pane 포커스까지 옮긴다.
-    fn dispatch_agent_prompt(&mut self, mut send_to: Vec<SessionId>, body: &str) {
-        // 주입 시점에 대상을 재확인한다 — 메뉴가 열린(또는 추출 응답을 기다린) 사이 감지
-        // tick(2.5s)이 에이전트를 제거했을 수 있다(stale 대상 오주입 방지, 2026-07-17
-        // 리뷰 P3).
-        send_to.retain(|session| self.agent_info.contains_key(session));
-        for session in &send_to {
-            self.send_agent_prompt(*session, body);
+    fn dispatch_agent_prompt(&mut self, mut send_to: Vec<AgentPasteTarget>, body: &str) {
+        send_to
+            .retain(|(session, execution)| self.agent_executions.get(session) == Some(execution));
+        if body.trim().is_empty() {
+            return;
         }
-        // 단일 대상이면 그 pane으로 포커스를 옮겨 Enter만 치면 되게 한다. **자동 전송은
-        // 하지 않는다** — 보내기 전에 프롬프트를 다듬을 수 있어야 한다(확정 사항).
-        // 여러 대상(브로드캐스트)은 포커스를 옮기지 않는다 — 어디로 갈지 정할 수 없고,
-        // 사용자가 각 pane에서 직접 출발시키는 것이 비교 실행의 의도다.
-        if let Some(session) = send_to.first().filter(|_| send_to.len() == 1)
+        // At most 32 awaiting host dispatches and 1 MiB total prompt bytes, before retention.
+        let retained = self
+            .selected_agent_prompts
+            .iter()
+            .map(|intent| intent.prompt.len())
+            .sum::<usize>();
+        if self
+            .selected_agent_prompts
+            .len()
+            .saturating_add(send_to.len())
+            > 32
+            || body
+                .len()
+                .checked_mul(send_to.len())
+                .and_then(|bytes| bytes.checked_add(retained))
+                .is_none_or(|bytes| bytes > 1024 * 1024)
+        {
+            self.report_protocol_queue_rejection(
+                WorkspaceProtocolErrorCode::PayloadTooLarge,
+                "selected_agent_prompt",
+            );
+            return;
+        }
+        let prompt: std::sync::Arc<str> = body.into();
+        for &(session, execution) in &send_to {
+            self.selected_agent_prompts.push_back(SelectedAgentPrompt {
+                session,
+                execution,
+                prompt: prompt.clone(),
+            });
+        }
+        // No Enter is generated. Exact host admission owns the shared paste encoder and receipt.
+        if let Some((session, _)) = send_to.first().filter(|_| send_to.len() == 1)
             && let Some(pane) = self.pane_of_session(*session)
         {
-            // request_pane_focus로 pending_focus까지 세팅한다 — FocusPane 직접 전송은
-            // 스냅샷이 돌아올 때까지 terminal_input_owner가 이전 pane을 보므로 첫
-            // 타이핑/Enter가 소스 pane에 들어갈 수 있다(리뷰 P2).
             self.request_pane_focus(pane);
         }
     }
@@ -8351,28 +8577,6 @@ impl WorkspaceUi {
             .iter()
             .flat_map(|tab| &tab.panes)
             .find_map(|pane| (pane.session_id == Some(session)).then(|| pane.id.clone()))
-    }
-
-    /// 에이전트 pane 입력창에 텍스트를 주입한다(전송은 사용자 Enter). 여러 줄이 안전하게
-    /// 한 덩어리로 들어가도록 붙여넣기 경로(bracketed paste)를 그대로 쓴다 — 개행이
-    /// 즉시 전송으로 해석되지 않는다.
-    ///
-    /// bracketed paste가 **꺼진** 세션(감지가 ^Z 중단·백그라운드 에이전트를 아직 대상으로
-    /// 보는 사이 셸 프롬프트로 돌아온 pane, bash 3.2 등)에는 개행을 공백으로 접어 한 줄로
-    /// 보낸다 — raw 개행은 줄마다 즉시 명령으로 실행돼 선택문 안의 문장이 셸 명령이 될 수
-    /// 있다(2026-07-17 리뷰 P1). claude/codex는 실행 중 bracketed paste를 켜므로 정상
-    /// 대상에는 영향이 없다.
-    fn send_agent_prompt(&mut self, session: SessionId, body: &str) {
-        let bracketed = self.session_bracketed_paste(session);
-        let folded;
-        let body = if bracketed {
-            body
-        } else {
-            folded = body.replace(['\r', '\n'], " ");
-            folded.as_str()
-        };
-        let bytes = terminal_text_paste_bytes(body, bracketed);
-        self.send(RuntimeCommand::WriteInput { session, bytes });
     }
 
     /// session이 지금 어느 pane에 붙어 있는지 — 워크트리 삭제 후 같은 cwd를 쓰던
@@ -9276,9 +9480,34 @@ impl WorkspaceUi {
     /// 선택을 해제하지 않는 send — 드래그 오토스크롤 전용(선택을 유지·확장하며
     /// 스크롤해야 한다). 휠/타이핑은 반드시 [`Self::send`]를 쓴다.
     fn send_keep_selection(&mut self, command: RuntimeCommand) -> bool {
-        match self.queue_protocol_intent(command) {
-            Ok(()) => true,
-            Err(code) => {
+        match self.queue_protocol_intent_owned(command, None) {
+            Ok(_) => true,
+            Err((WorkspaceProtocolErrorCode::Busy, command))
+                if terminal_protocol_command(&command) =>
+            {
+                // Reserve entries append to the same deque: Focus/Resize/control boundaries
+                // cannot be bypassed by later input. Existing adjacent input coalescing ran first.
+                if self.protocol_intents.len() + self.protocol_inflight.len()
+                    < TERMINAL_PROTOCOL_PRESSURE_CAP
+                {
+                    let (operation, generation) = self.next_protocol_operation();
+                    self.protocol_intents.push_back(WorkspaceProtocolIntent {
+                        operation,
+                        generation,
+                        command: *command,
+                        spawn_cwd: None,
+                    });
+                    self.command_sent = true;
+                    true
+                } else {
+                    self.report_protocol_queue_rejection(
+                        WorkspaceProtocolErrorCode::DeliveryFailed,
+                        "terminal_pressure_capacity",
+                    );
+                    false
+                }
+            }
+            Err((code, _)) => {
                 self.report_protocol_queue_rejection(code, "protocol_queue");
                 false
             }
@@ -9476,13 +9705,23 @@ fn request_terminal_os_drag_feedback_repaint(
     }
 }
 
-fn release_typed_dnd_payload<Payload>(response: &egui::Response) -> Option<Arc<Payload>>
+pub(crate) fn release_typed_dnd_payload<Payload>(response: &egui::Response) -> Option<Arc<Payload>>
 where
     Payload: std::any::Any + Send + Sync,
 {
     egui::DragAndDrop::has_payload_of_type::<Payload>(&response.ctx)
         .then(|| response.dnd_release_payload::<Payload>())
         .flatten()
+}
+
+fn release_file_dnd_paths(response: &egui::Response) -> Option<Vec<PathBuf>> {
+    if let Some(group) =
+        release_typed_dnd_payload::<crate::ui::file_tree::FileTreeDragPayload>(response)
+    {
+        Some(group.paths().to_vec())
+    } else {
+        release_typed_dnd_payload::<PathBuf>(response).map(|path| vec![path.as_ref().clone()])
+    }
 }
 
 fn selection_range_contains(start: usize, end: usize, idx: usize) -> bool {
@@ -10407,6 +10646,36 @@ fn visible_split_contains_session(snapshot: &MuxSnapshot, session: SessionId) ->
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pr2_selected_text_keeps_captured_owner_and_bounded_no_submit_intent() {
+        let mut ui = super::WorkspaceUi::new();
+        let id = runtime::SessionId(7);
+        let old = crate::agent_detect::AgentExecutionIdentity::fixture(
+            crate::agent_detect::AgentKind::Claude,
+            1,
+        );
+        let new = crate::agent_detect::AgentExecutionIdentity::fixture(
+            crate::agent_detect::AgentKind::Claude,
+            2,
+        );
+        ui.set_agent_executions(std::collections::HashMap::from([(id, old)]));
+        ui.dispatch_agent_prompt(vec![(id, old)], "explain this:\nselected text");
+        let intent = ui.take_selected_agent_prompt().unwrap();
+        assert_eq!(intent.session, id);
+        assert_eq!(intent.execution, old);
+        assert_eq!(intent.prompt.as_ref(), "explain this:\nselected text");
+        assert!(
+            ui.take_protocol_intent().is_none(),
+            "leaf never emits unguarded WriteInput"
+        );
+        ui.set_agent_executions(std::collections::HashMap::from([(id, new)]));
+        ui.dispatch_agent_prompt(vec![(id, old)], "stale");
+        assert!(ui.take_selected_agent_prompt().is_none());
+        ui.dispatch_agent_prompt(vec![(id, new); 33], "bounded");
+        assert!(ui.take_selected_agent_prompt().is_none());
+        assert!(ui.protocol_request_lost);
+    }
+
     use super::*;
     use runtime::{MuxPaneId, MuxTabId, PaneSnapshot, TabSnapshot};
     use terminal::{CursorShape, CursorSnapshot, TerminalCell};
@@ -14584,6 +14853,94 @@ mod tests {
     }
 
     #[test]
+    fn pr11_group_release_survives_legacy_and_attachment_consumers() {
+        let expected = vec![
+            PathBuf::from("/private-pr11/a"),
+            PathBuf::from("/private-pr11/b"),
+        ];
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, paths: &mut Vec<PathBuf>| {
+                let response = ui.allocate_response(ui.available_size(), egui::Sense::hover());
+                assert!(release_typed_dnd_payload::<PathBuf>(&response).is_none());
+                assert!(
+                    release_typed_dnd_payload::<crate::ui::cross_workspace::AttachmentId>(
+                        &response
+                    )
+                    .is_none()
+                );
+                if let Some(group) = release_file_dnd_paths(&response) {
+                    *paths = group;
+                }
+            },
+            Vec::new(),
+        );
+        harness.run();
+        let point = egui::pos2(20.0, 20.0);
+        harness.hover_at(point);
+        harness.drag_at(point);
+        harness.run();
+        egui::DragAndDrop::set_payload(
+            &harness.ctx,
+            crate::ui::file_tree::FileTreeDragPayload::try_new(
+                PathBuf::from("/private-pr11"),
+                8,
+                expected.clone(),
+            )
+            .unwrap(),
+        );
+        harness.event(egui::Event::PointerButton {
+            pos: point,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run();
+        assert_eq!(harness.state(), &expected);
+    }
+
+    #[test]
+    fn pr11_actual_terminal_surface_receives_all_group_and_legacy_paths_without_pty_input() {
+        for group in [true, false] {
+            let mut harness = setup_focused_local_pane_drop_harness(SessionId(7));
+            let paths = vec![
+                PathBuf::from("/private-pr11/a.txt"),
+                PathBuf::from("/private-pr11/b.txt"),
+                PathBuf::from("/private-pr11/c.txt"),
+            ];
+            let point = egui::pos2(80.0, TERMINAL_PANE_HEADER_HEIGHT + 40.0);
+            harness.hover_at(point);
+            harness.drag_at(point);
+            harness.run();
+            if group {
+                egui::DragAndDrop::set_payload(
+                    &harness.ctx,
+                    crate::ui::file_tree::FileTreeDragPayload::try_new(
+                        PathBuf::from("/private-pr11"),
+                        8,
+                        paths.clone(),
+                    )
+                    .unwrap(),
+                );
+            } else {
+                egui::DragAndDrop::set_payload(&harness.ctx, paths[0].clone());
+            }
+            harness.event(egui::Event::PointerButton {
+                pos: point,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+            harness.run();
+            assert_eq!(
+                harness.state().1.document_drop_paths,
+                if group { paths } else { vec![paths[0].clone()] }
+            );
+            assert_eq!(harness.state().1.local_focus_claimed, Some(pane_id("pane")));
+            assert!(written_bytes(drain_protocol(&mut harness.state_mut().0)).is_empty());
+        }
+    }
+
+    #[test]
     fn foreign_identity_color_is_top_line_only() {
         let identity = egui::Color32::LIGHT_BLUE;
         let style = attached_identity_style(identity);
@@ -18368,10 +18725,11 @@ mod tests {
         assert_eq!(
             ui.queue_protocol_intent(RuntimeCommand::WriteInput {
                 session,
-                bytes: vec![b'c'],
+                bytes: vec![b'c']
             }),
-            Err(WorkspaceProtocolErrorCode::PayloadTooLarge)
+            Ok(())
         );
+        assert_eq!(ui.protocol_intents.len(), 2);
         let commands = drain_protocol(&mut ui);
         assert!(matches!(
             &commands[0],
@@ -18379,6 +18737,7 @@ mod tests {
                 if bytes.len() == WORKSPACE_PROTOCOL_INPUT_MAX_BYTES
                     && bytes.last() == Some(&b'b')
         ));
+        assert!(matches!(&commands[1], RuntimeCommand::WriteInput { bytes, .. } if bytes == b"c"));
     }
 
     /// 창 드래그 재현 — 세션의 첫 크기는 지연 없이 즉시 나가지만(세션 생성/split과 동일
@@ -18694,8 +19053,8 @@ mod tests {
         )));
     }
 
-    /// 회귀 — 큐/inflight 8칸이 그냥 꽉 찬 것(Busy)은 자연히 풀리는 내부
-    /// 백프레셔라 배너를 띄우면 안 된다("terminal protocol request rejected" 버그).
+    /// 기본 8칸의 포화는 terminal pressure reserve에 보관한다. 자연히 풀릴
+    /// 백프레셔에는 배너를 띄우지 않고 새 gesture를 원래 FIFO 끝에 유지한다.
     #[test]
     fn send_keep_selection이_큐_포화만으로는_배너를_띄우지_않는다() {
         let mut ui = WorkspaceUi::new();
@@ -18707,14 +19066,23 @@ mod tests {
             .unwrap();
         }
 
-        let delivered = ui.send_keep_selection(RuntimeCommand::Scroll {
+        let paste = "원래 붙여넣기\nexact bytes".as_bytes().to_vec();
+        let delivered = ui.send_keep_selection(RuntimeCommand::WriteInput {
             session: SessionId(99),
-            delta: 1,
+            bytes: paste.clone(),
         });
 
-        assert!(!delivered);
+        assert!(
+            delivered,
+            "bounded pressure reserve must retain the original paste gesture"
+        );
         assert_eq!(ui.error, None, "큐 포화는 배너를 띄우지 않아야 한다");
         assert!(!ui.protocol_request_lost);
+        let commands = drain_protocol(&mut ui);
+        assert_eq!(commands.len(), WORKSPACE_PROTOCOL_CAP + 1);
+        assert!(matches!(commands.last(), Some(RuntimeCommand::WriteInput {
+            session: SessionId(99), bytes,
+        }) if bytes == &paste));
     }
 
     /// spawn_shell_at도 동일 원칙 — spawn 상한 포화는 배너 없이 조용히 거부된다.
@@ -20743,6 +21111,709 @@ https://example.test/login \
             })
             .flatten()
             .collect()
+    }
+
+    #[test]
+    fn pr10_direct_korean_keeps_owned_bytes_when_protocol_queue_is_busy() {
+        let mut harness = setup_focused_local_pane_harness(SessionId(7));
+        for index in 0..WORKSPACE_PROTOCOL_CAP {
+            harness
+                .state_mut()
+                .queue_protocol_intent(RuntimeCommand::Scroll {
+                    session: SessionId(index as u64 + 100),
+                    delta: 1,
+                })
+                .unwrap();
+        }
+        harness.input_mut().events.extend([
+            egui::Event::Text("빠른한글".into()),
+            egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        harness.run_steps(1);
+        let commands = drain_protocol(harness.state_mut());
+        assert_eq!(
+            written_bytes(commands),
+            "빠른한글\r".as_bytes(),
+            "known-unsent direct input must survive protocol slot pressure"
+        );
+    }
+
+    #[test]
+    fn pr10_host_busy_completion_keeps_exact_original_input() {
+        let mut harness = setup_focused_local_pane_harness(SessionId(7));
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::Text("원래세션".into()));
+        harness.run_steps(1);
+        let intent = harness
+            .state_mut()
+            .take_protocol_intent()
+            .expect("direct input");
+        let operation = intent.operation();
+        let generation = intent.generation();
+        assert!(matches!(
+            intent.command,
+            RuntimeCommand::WriteInput {
+                session: SessionId(7),
+                ..
+            }
+        ));
+        harness.state_mut().return_unsent_terminal_protocol(
+            operation,
+            generation,
+            intent.into_command(),
+        );
+        assert!(harness.state_mut().take_protocol_intent().is_none());
+        harness.state_mut().protocol_retry_at = Some(std::time::Instant::now());
+        assert!(
+            matches!(
+                drain_protocol(harness.state_mut()).as_slice(),
+                [RuntimeCommand::WriteInput { session: SessionId(7), bytes }] if bytes == "원래세션".as_bytes()
+            ),
+            "known-unsent host refusal must retain original bytes and target"
+        );
+    }
+
+    #[test]
+    fn pr10_raw_input_pipeline_before_measurement() {
+        let catalog = catalog();
+        let config = TerminalConfig::default();
+        let mut focused = setup_focused_local_pane_harness(SessionId(7));
+        let workspace = std::mem::replace(focused.state_mut(), WorkspaceUi::new());
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, state: &mut (WorkspaceUi, Vec<RuntimeCommand>)| {
+                // Actual eframe order and current App boundary: logic drains before UI.
+                state.1.extend(drain_protocol(&mut state.0));
+                state.0.show_with_input(ui, &config, &[], &catalog, true);
+            },
+            (workspace, Vec::new()),
+        );
+        harness.run();
+        harness.state_mut().1.clear();
+        harness.state_mut().0.pending_focus = Some(pane_id("pane"));
+        harness.run();
+        harness.state_mut().1.clear();
+        let started = std::time::Instant::now();
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::Text("direct".into()));
+        harness.run_steps(1);
+        let first_pass = written_bytes(std::mem::take(&mut harness.state_mut().1));
+        let first_elapsed = started.elapsed();
+        harness.run_steps(1);
+        let second_pass = written_bytes(std::mem::take(&mut harness.state_mut().1));
+        eprintln!(
+            "PR10 before RawInput->host first_logic_input_bytes={} second_logic_input_bytes={} first_pass_us={} second_pass_us={} scope=private-egui-pipeline",
+            first_pass.len(),
+            second_pass.len(),
+            first_elapsed.as_micros(),
+            started.elapsed().as_micros()
+        );
+        assert!(first_pass.is_empty());
+        assert_eq!(second_pass, b"direct");
+    }
+
+    #[test]
+    fn pr10_discarded_pass_does_not_duplicate_terminal_input() {
+        let catalog = catalog();
+        let config = TerminalConfig::default();
+        let mut focused = setup_focused_local_pane_harness(SessionId(7));
+        let workspace = std::mem::replace(focused.state_mut(), WorkspaceUi::new());
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, state: &mut (WorkspaceUi, Vec<RuntimeCommand>, bool)| {
+                // eframe invokes logic before UI on every correction pass. The actual App
+                // full-drain fence must leave this frame's discarded-pass bytes staged.
+                if crate::app::workspace_protocol_logic_pass_ready(ui.ctx()) {
+                    state.1.extend(drain_protocol(&mut state.0));
+                }
+                state.0.show_with_input(ui, &config, &[], &catalog, true);
+                if state.2 && ui.ctx().current_pass_index() == 0 {
+                    ui.ctx().request_discard("PR10 private correction pass");
+                }
+                state.0.flush_render_side_effects(ui.ctx());
+                crate::app::dispatch_terminal_protocol_tail(&mut state.0, ui.ctx(), |command| {
+                    assert!(!ui.ctx().will_discard());
+                    state.1.push(command);
+                    Ok(())
+                });
+            },
+            (workspace, Vec::new(), false),
+        );
+        harness.run();
+        harness.state_mut().0.pending_focus = Some(pane_id("pane"));
+        harness.run();
+        harness.state_mut().1.clear();
+        harness.state_mut().2 = true;
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::Text("한번".into()));
+        harness.run_steps(1);
+        assert_eq!(
+            written_bytes(std::mem::take(&mut harness.state_mut().1)),
+            "한번".as_bytes()
+        );
+    }
+
+    fn pr10_dispatch(workspace: &mut WorkspaceUi, ctx: &egui::Context) -> Vec<RuntimeCommand> {
+        let mut commands = Vec::new();
+        crate::app::dispatch_terminal_protocol_tail(workspace, ctx, |command| {
+            commands.push(command);
+            Ok(())
+        });
+        commands
+    }
+
+    #[test]
+    fn pr10_host_retry_keeps_fifo_generation_and_does_not_copy_on_idle_frames() {
+        let mut workspace = WorkspaceUi::new();
+        let bytes = vec![b'x'; WORKSPACE_PROTOCOL_INPUT_MAX_BYTES];
+        let pointer = bytes.as_ptr();
+        workspace.send(RuntimeCommand::WriteInput {
+            session: SessionId(7),
+            bytes,
+        });
+        let key = (
+            workspace.protocol_intents[0].operation,
+            workspace.protocol_intents[0].generation,
+        );
+        workspace.send(RuntimeCommand::FocusPane {
+            pane: pane_id("next"),
+        });
+        workspace.send(RuntimeCommand::Resize {
+            session: SessionId(8),
+            cols: 80,
+            rows: 24,
+        });
+        workspace.send(RuntimeCommand::WriteInput {
+            session: SessionId(8),
+            bytes: b"next\r".to_vec(),
+        });
+        let ctx = egui::Context::default();
+        let mut attempts = 0;
+        crate::app::dispatch_terminal_protocol_tail(&mut workspace, &ctx, |command| {
+            attempts += 1;
+            Err((
+                runtime::RuntimeCommandSendError::Backpressure.into(),
+                Box::new(command),
+            ))
+        });
+        assert_eq!(attempts, 1);
+        assert!(workspace.protocol_inflight.is_empty());
+        assert_eq!(
+            (
+                workspace.protocol_intents[0].operation,
+                workspace.protocol_intents[0].generation
+            ),
+            key
+        );
+        workspace.protocol_retry_at =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(3600));
+        for _ in 0..120 {
+            crate::app::dispatch_terminal_protocol_tail(&mut workspace, &ctx, |_| {
+                panic!("idle frame rebuilt or retried the retained command")
+            });
+        }
+        assert!(
+            matches!(&workspace.protocol_intents[0].command, RuntimeCommand::WriteInput { session: SessionId(7), bytes }
+            if bytes.as_ptr() == pointer && bytes.capacity() == WORKSPACE_PROTOCOL_INPUT_MAX_BYTES)
+        );
+        workspace.protocol_retry_at = Some(std::time::Instant::now());
+        let commands = pr10_dispatch(&mut workspace, &ctx);
+        assert!(matches!(commands.as_slice(), [
+            RuntimeCommand::WriteInput { session: SessionId(7), bytes },
+            RuntimeCommand::FocusPane { pane },
+            RuntimeCommand::Resize { session: SessionId(8), .. },
+            RuntimeCommand::WriteInput { session: SessionId(8), bytes: next },
+        ] if bytes.as_ptr() == pointer && pane == &pane_id("next") && next == b"next\r"));
+        assert_eq!(workspace.retained_protocol_input_bytes(), 0);
+    }
+
+    #[test]
+    fn pr10_exact_one_mib_input_then_tiny_key_uses_next_fifo_entry() {
+        let mut workspace = WorkspaceUi::new();
+        workspace.send(RuntimeCommand::WriteInput {
+            session: SessionId(7),
+            bytes: vec![b'x'; WORKSPACE_PROTOCOL_INPUT_MAX_BYTES],
+        });
+        workspace.send(RuntimeCommand::WriteInput {
+            session: SessionId(7),
+            bytes: "글".as_bytes().to_vec(),
+        });
+        assert_eq!(workspace.protocol_intents.len(), 2);
+        assert!(!workspace.protocol_request_lost);
+        assert_eq!(
+            written_bytes(drain_protocol(&mut workspace)).len(),
+            WORKSPACE_PROTOCOL_INPUT_MAX_BYTES + "글".len()
+        );
+    }
+
+    #[test]
+    fn pr10_coalesced_blocked_gestures_grow_capacity_geometrically_within_budget() {
+        let mut workspace = WorkspaceUi::new();
+        let mut growths = 0;
+        let mut previous = 0;
+        for _ in 0..256 {
+            workspace.send(RuntimeCommand::WriteInput {
+                session: SessionId(7),
+                bytes: vec![b'x'; 4096],
+            });
+            let retained = workspace.retained_protocol_input_bytes();
+            growths += usize::from(retained != previous);
+            previous = retained;
+            assert!(retained <= WORKSPACE_PROTOCOL_INPUT_MAX_BYTES);
+        }
+        eprintln!(
+            "PR10 blocked adjacent gestures=256 body_bytes={} capacity_growths={growths}",
+            previous
+        );
+        assert!(
+            growths <= 9,
+            "reallocating the growing retained body on every new gesture is quadratic"
+        );
+        assert_eq!(workspace.protocol_intents.len(), 1);
+    }
+
+    #[test]
+    fn pr10_pressure_reserve_and_aggregate_capacity_reject_whole_gesture_visibly() {
+        let mut workspace = WorkspaceUi::new();
+        for index in 0..TERMINAL_PROTOCOL_PRESSURE_CAP {
+            assert!(workspace.send_keep_selection(RuntimeCommand::Scroll {
+                session: SessionId(index as u64),
+                delta: 1
+            }));
+        }
+        assert!(!workspace.send_keep_selection(RuntimeCommand::WriteInput {
+            session: SessionId(77),
+            bytes: b"whole gesture".to_vec()
+        }));
+        assert!(workspace.protocol_request_lost);
+        assert_eq!(
+            workspace.protocol_intents.len(),
+            TERMINAL_PROTOCOL_PRESSURE_CAP
+        );
+        assert!(written_bytes(drain_protocol(&mut workspace)).is_empty());
+        workspace.protocol_request_lost = false;
+        let mut held = Vec::new();
+        for index in 0..WORKSPACE_PROTOCOL_CAP {
+            workspace.send(RuntimeCommand::WriteInput {
+                session: SessionId(index as u64),
+                bytes: vec![0; WORKSPACE_PROTOCOL_INPUT_MAX_BYTES],
+            });
+            held.push(workspace.take_protocol_intent().unwrap());
+        }
+        assert_eq!(
+            workspace.retained_protocol_input_bytes(),
+            TERMINAL_PROTOCOL_RETAINED_INPUT_MAX_BYTES
+        );
+        assert!(!workspace.send_keep_selection(RuntimeCommand::WriteInput {
+            session: SessionId(90),
+            bytes: b"whole".to_vec()
+        }));
+        assert!(workspace.protocol_request_lost);
+        assert!(workspace.protocol_intents.is_empty());
+        for intent in held {
+            workspace.complete_protocol(WorkspaceProtocolCompletion {
+                operation: intent.operation(),
+                generation: intent.generation(),
+                result: Ok(()),
+            });
+        }
+        assert_eq!(workspace.retained_protocol_input_bytes(), 0);
+        let mut oversized = Vec::with_capacity(4 * WORKSPACE_PROTOCOL_INPUT_MAX_BYTES);
+        oversized.extend_from_slice(b"small");
+        workspace.send(RuntimeCommand::WriteInput {
+            session: SessionId(90),
+            bytes: oversized,
+        });
+        assert_eq!(workspace.retained_protocol_input_bytes(), 5);
+    }
+
+    #[test]
+    fn pr10_tail_stops_at_lifecycle_and_disconnect_is_visible_without_retry() {
+        let mut workspace = WorkspaceUi::new();
+        workspace.send(RuntimeCommand::WriteInput {
+            session: SessionId(7),
+            bytes: b"first".to_vec(),
+        });
+        workspace
+            .queue_protocol_intent(RuntimeCommand::ClosePane {
+                pane: pane_id("closing"),
+            })
+            .unwrap();
+        workspace.send(RuntimeCommand::WriteInput {
+            session: SessionId(7),
+            bytes: b"later".to_vec(),
+        });
+        assert_eq!(
+            written_bytes(pr10_dispatch(&mut workspace, &egui::Context::default())),
+            b"first"
+        );
+        assert_eq!(workspace.protocol_intents.len(), 2);
+        drain_protocol(&mut workspace);
+        workspace.send(RuntimeCommand::WriteInput {
+            session: SessionId(7),
+            bytes: b"unsent".to_vec(),
+        });
+        crate::app::dispatch_terminal_protocol_tail(
+            &mut workspace,
+            &egui::Context::default(),
+            |command| {
+                Err((
+                    runtime::RuntimeCommandSendError::Disconnected.into(),
+                    Box::new(command),
+                ))
+            },
+        );
+        assert!(workspace.protocol_intents.is_empty());
+        assert!(workspace.protocol_inflight.is_empty());
+        assert!(workspace.protocol_retry_at.is_none());
+        assert!(workspace.protocol_request_lost);
+    }
+
+    #[test]
+    fn pr10_raw_input_pipeline_after_measurement_and_ime_control_paste() {
+        let catalog = catalog();
+        let config = TerminalConfig::default();
+        let mut focused = setup_focused_local_pane_harness(SessionId(7));
+        let workspace = std::mem::replace(focused.state_mut(), WorkspaceUi::new());
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, state: &mut (WorkspaceUi, Vec<RuntimeCommand>)| {
+                // Real final-pass composition adapter, after the Workspace mapper/resize flush.
+                state.0.show_with_input(ui, &config, &[], &catalog, true);
+                state.0.flush_render_side_effects(ui.ctx());
+                state.1.extend(pr10_dispatch(&mut state.0, ui.ctx()));
+            },
+            (workspace, Vec::new()),
+        );
+        harness.run();
+        harness.state_mut().0.pending_focus = Some(pane_id("pane"));
+        harness.run();
+        harness.state_mut().1.clear();
+        let started = std::time::Instant::now();
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::Text("direct".into()));
+        harness.run_steps(1);
+        let bytes = written_bytes(std::mem::take(&mut harness.state_mut().1));
+        eprintln!(
+            "PR10 after RawInput->host first_pass_input_bytes={} first_pass_us={} scope=private-egui-pipeline",
+            bytes.len(),
+            started.elapsed().as_micros()
+        );
+        assert_eq!(bytes, b"direct");
+        harness.input_mut().events.push(preedit_event("글"));
+        harness.run_steps(1);
+        assert!(written_bytes(std::mem::take(&mut harness.state_mut().1)).is_empty());
+        harness.input_mut().events.extend([
+            egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+            commit_event("글"),
+        ]);
+        harness.run_steps(1);
+        assert_eq!(
+            written_bytes(std::mem::take(&mut harness.state_mut().1)),
+            "글\r".as_bytes()
+        );
+        harness.input_mut().events.extend([
+            egui::Event::Paste("붙여넣기".into()),
+            egui::Event::Key {
+                key: egui::Key::ArrowLeft,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        harness.run_steps(1);
+        let bytes = written_bytes(std::mem::take(&mut harness.state_mut().1));
+        assert!(
+            bytes
+                .windows("붙여넣기".len())
+                .any(|part| part == "붙여넣기".as_bytes())
+        );
+        assert!(bytes.windows(3).any(|part| part == b"\x1b[D"));
+    }
+
+    #[test]
+    fn pr10_raw_input_owner_switch_and_modal_fence_preserve_original_queued_bytes() {
+        let catalog = catalog();
+        let config = TerminalConfig::default();
+        let mut focused = setup_focused_local_pane_harness(SessionId(7));
+        let workspace = std::mem::replace(focused.state_mut(), WorkspaceUi::new());
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, state: &mut (WorkspaceUi, Vec<RuntimeCommand>, bool, bool)| {
+                super::super::popup::set_pending_modal(ui.ctx(), state.3);
+                state.0.show_with_input(ui, &config, &[], &catalog, true);
+                state.0.flush_render_side_effects(ui.ctx());
+                crate::app::dispatch_terminal_protocol_tail(&mut state.0, ui.ctx(), |command| {
+                    if state.2 {
+                        Err((
+                            runtime::RuntimeCommandSendError::Backpressure.into(),
+                            Box::new(command),
+                        ))
+                    } else {
+                        state.1.push(command);
+                        Ok(())
+                    }
+                });
+            },
+            (workspace, Vec::new(), false, false),
+        );
+        harness.run();
+        harness.state_mut().0.pending_focus = Some(pane_id("pane"));
+        harness.run();
+        harness.state_mut().1.clear();
+        harness.state_mut().2 = true;
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::Text("old".into()));
+        harness.run_steps(1);
+        harness.state_mut().0.protocol_retry_at =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(3600));
+        let old_key = (
+            harness.state().0.protocol_intents[0].operation,
+            harness.state().0.protocol_intents[0].generation,
+        );
+        harness.state_mut().0.mux = Some(mux(
+            "primary",
+            vec![tab(
+                "primary",
+                vec![pane("pane", SessionId(8))],
+                LayoutNode::Pane(pane_id("pane")),
+            )],
+            "pane",
+        ));
+        harness
+            .state_mut()
+            .0
+            .sessions
+            .entry(SessionId(8))
+            .or_default()
+            .snapshot = Some(snapshot("new"));
+        harness.state_mut().0.pending_focus = Some(pane_id("pane"));
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::Text("new".into()));
+        harness.run_steps(1);
+        harness.state_mut().3 = true;
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::Text("blocked".into()));
+        harness.run_steps(1);
+        assert_eq!(
+            (
+                harness.state().0.protocol_intents[0].operation,
+                harness.state().0.protocol_intents[0].generation
+            ),
+            old_key
+        );
+        harness.state_mut().0.protocol_retry_at = Some(std::time::Instant::now());
+        harness.state_mut().2 = false;
+        harness.run_steps(1);
+        let inputs: Vec<_> = std::mem::take(&mut harness.state_mut().1)
+            .into_iter()
+            .filter_map(|command| {
+                if let RuntimeCommand::WriteInput { session, bytes } = command {
+                    Some((session, bytes))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            inputs,
+            vec![
+                (SessionId(7), b"old".to_vec()),
+                (SessionId(8), b"new".to_vec())
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pr10_actual_raw_ime_commit_reaches_private_pty_echo_in_same_pass() {
+        use runtime::{RuntimeCommandSink, RuntimeEventStream};
+        struct NoSecrets;
+        impl runtime::RuntimeSecretResolver for NoSecrets {
+            fn resolve(&self, _: &str) -> anyhow::Result<runtime::RuntimeSecret> {
+                anyhow::bail!("private PR10 fixture has no secrets")
+            }
+        }
+        struct PrivateRoot(PathBuf);
+        impl Drop for PrivateRoot {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root =
+            PrivateRoot(std::env::temp_dir().join(format!("deppy-pr10-{}", uuid::Uuid::new_v4())));
+        std::fs::create_dir_all(&root.0).unwrap();
+        let mut client = runtime::InProcessRuntimeClient::try_new_with_resolver(
+            5,
+            Arc::new(NoSecrets),
+            root.0.clone(),
+            secret::RedactionService::new(),
+            None,
+            Some(root.0.clone()),
+            vec![],
+        )
+        .unwrap();
+        let rx = client.subscribe();
+        client
+            .send_command(RuntimeCommand::SpawnAgent {
+                agent_config_id: None,
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+                command: "/bin/sh".into(),
+                args: vec![
+                    "-c".into(),
+                    "stty -echo; printf 'PR10_READY\\r\\n'; exec /bin/cat".into(),
+                ],
+                env_plain: vec![],
+                env_secrets: vec![],
+                waiting_regex: None,
+                approval_regex: None,
+                error_regex: None,
+                done_regex: None,
+            })
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut session = None;
+        let mut ready = false;
+        while session.is_none() || !ready {
+            for event in rx.drain() {
+                if let RuntimeEvent::AgentSpawned { session: spawned } = event {
+                    session = Some(spawned);
+                }
+                if let Some((_, screen, _, _)) = event.viewport() {
+                    ready |= screen
+                        .visible_cells
+                        .iter()
+                        .map(|cell| cell.c)
+                        .collect::<String>()
+                        .contains("PR10_READY");
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "private cat startup timeout"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let session = session.unwrap();
+        let mut focused = setup_focused_local_pane_harness(session);
+        let mut workspace = std::mem::replace(focused.state_mut(), WorkspaceUi::new());
+        let config = TerminalConfig::default();
+        let catalog = catalog();
+        let mut sent = 0;
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui,
+             state: &mut (
+                &mut WorkspaceUi,
+                &runtime::InProcessRuntimeClient,
+                &mut usize,
+            )| {
+                state.0.show_with_input(ui, &config, &[], &catalog, true);
+                state.0.flush_render_side_effects(ui.ctx());
+                crate::app::dispatch_terminal_protocol_tail(state.0, ui.ctx(), |command| {
+                    if let RuntimeCommand::WriteInput {
+                        session: target,
+                        bytes,
+                    } = &command
+                    {
+                        assert_eq!(*target, session);
+                        assert_eq!(bytes, "한글빠른입력\r".as_bytes());
+                        *state.2 += 1;
+                    }
+                    state.1.send_command_owned(command)
+                });
+            },
+            (&mut workspace, &client, &mut sent),
+        );
+        harness.run();
+        harness.state_mut().0.pending_focus = Some(pane_id("pane"));
+        harness.run();
+        harness
+            .input_mut()
+            .events
+            .push(preedit_event("한글빠른입력"));
+        harness.run_steps(1);
+        let started = std::time::Instant::now();
+        harness.input_mut().events.extend([
+            egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+            commit_event("한글빠른입력"),
+        ]);
+        harness.run_steps(1);
+        assert_eq!(
+            *harness.state().2,
+            1,
+            "exactly one input admitted before the next frame"
+        );
+        let host_us = started.elapsed().as_micros();
+        drop(harness);
+        let deadline = started + std::time::Duration::from_secs(5);
+        let mut seen = VecDeque::new();
+        loop {
+            let mut echoed = false;
+            for event in rx.drain() {
+                if let Some((id, screen, _, _)) = event.viewport() {
+                    let text: String = screen
+                        .visible_cells
+                        .iter()
+                        .filter(|cell| !cell.wide_spacer())
+                        .map(|cell| cell.c)
+                        .collect();
+                    echoed |= id == session && text.contains("한글빠른입력");
+                    if seen.len() == 8 {
+                        seen.pop_front();
+                    }
+                    seen.push_back(text);
+                } else if matches!(
+                    &event,
+                    RuntimeEvent::PtyInputPressure { .. } | RuntimeEvent::SessionExited { .. }
+                ) {
+                    panic!("private echo input unexpectedly rejected/exited");
+                }
+            }
+            if echoed {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "private cat echo timeout; private decoded viewport history={seen:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        eprintln!(
+            "PR10 private RawInput IME->channel host_us={host_us} ->cat viewport echo_us={} scope=private-pty-not-native-Grok",
+            started.elapsed().as_micros()
+        );
+        client.shutdown();
     }
 
     #[test]

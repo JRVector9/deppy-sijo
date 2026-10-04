@@ -1,6 +1,103 @@
 use super::*;
 
 #[test]
+fn pr9_explicit_paste_is_discovered_with_no_implicit_submit() {
+    let discovery = tools();
+    let paste = discovery["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "paste_text")
+        .expect("explicit bounded multiline paste must be discoverable");
+    assert_eq!(
+        paste["inputSchema"]["properties"]["submit"]["default"],
+        false
+    );
+    assert_eq!(paste["inputSchema"]["additionalProperties"], false);
+}
+
+#[test]
+fn pr9_paste_utf8_controls_and_legacy_limits_remain_explicit() {
+    assert!(validate_paste_text("한글 😀\r\nnext\tline\nlast", false).is_ok());
+    assert!(validate_paste_text(&"a".repeat(MAX_PASTE), false).is_ok());
+    assert!(validate_paste_text(&"😀".repeat(MAX_PASTE / 4 + 1), false).is_err());
+    for text in [
+        "",
+        "\x1b[201~\rmalicious",
+        "\x00",
+        "\x03",
+        "\x7f",
+        "\u{85}",
+        "one\rtwo",
+    ] {
+        assert!(validate_paste_text(text, false).is_err(), "{text:?}");
+    }
+    assert!(validate_paste_text("", true).is_err());
+    assert!(encode_input(&"a".repeat(MAX_TEXT), false).is_ok());
+    assert!(encode_input(&"a".repeat(MAX_TEXT + 1), false).is_err());
+    for text in ["a\nb", "a\r\nb", "a\tb", "\x1b", "\x03"] {
+        assert!(encode_input(text, false).is_err());
+    }
+    assert_eq!(encode_input("", true).unwrap(), b"\r");
+}
+
+#[test]
+fn pr9_actual_http_dispatch_preserves_paste_args_and_envelope_budget() {
+    let server = Server::start(0, "", || {}).unwrap();
+    let token = server.auth.token_for_user().to_string();
+    let addr = server.addr;
+    let args = json!({"session_id":"original", "generation":"g", "operation_id":"paste-wire", "text":"한글 😀\r\nsecond\tline", "submit":true});
+    let expected = args.clone();
+    let client = std::thread::spawn(move || {
+        let body = json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{"name":"paste_text", "arguments":args}});
+        let (status, response) = http_call_addr(addr, &token, body);
+        (status, response)
+    });
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let req = loop {
+        if let Ok(req) = server.requests.try_recv() {
+            break req;
+        }
+        assert!(
+            std::time::Instant::now() < end,
+            "paste_text was not dispatched by MCP parser"
+        );
+        std::thread::yield_now();
+    };
+    assert_eq!(req.tool, "paste_text");
+    assert_eq!(req.args, expected);
+    req.reply
+        .send(Ok(json!({"status":"queued", "completion":"not_confirmed"})))
+        .unwrap();
+    assert_eq!(client.join().unwrap().0, 200);
+    let large = json!({"jsonrpc":"2.0", "id":2, "method":"tools/call", "params":{"name":"paste_text", "arguments":{"text":"\\".repeat(MAX_PASTE)}}});
+    assert!(large.to_string().len() > 64 * 1024);
+    let (status, _) = http_call_addr(server.addr, &server.auth.token_for_user(), large);
+    assert_eq!(status, 413);
+    assert!(server.requests.try_recv().is_err());
+}
+
+fn http_call_addr(addr: std::net::SocketAddr, token: &str, body: Value) -> (u16, String) {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+    let body = body.to_string();
+    write!(stream, "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n", body.len()).unwrap();
+    // An oversized declared body is refused before body reading; do not create a TCP reset by sending it.
+    if body.len() <= 64 * 1024 {
+        stream.write_all(body.as_bytes()).unwrap();
+    }
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    (
+        response.split_whitespace().nth(1).unwrap().parse().unwrap(),
+        response.split_once("\r\n\r\n").unwrap().1.to_owned(),
+    )
+}
+
+#[test]
 fn plain_text_cannot_execute_without_submit() {
     for text in ["ls\npwd", "ls\rpwd", "\u{1b}[200~evil", "\u{3}", "\u{7}"] {
         assert!(encode_input(text, false).is_err());
@@ -157,7 +254,7 @@ fn actual_http_auth_origin_initialize_and_answer_tool_discovery() {
         serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
     );
     let result: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(result["result"]["tools"].as_array().unwrap().len(), 5);
+    assert_eq!(result["result"]["tools"].as_array().unwrap().len(), 6);
     assert!(
         result["result"]["tools"]
             .as_array()

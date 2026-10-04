@@ -146,6 +146,35 @@ impl PtyOutputReceiver {
         }
     }
 
+    /// Leave an oversized front chunk queued rather than exceed a caller's byte budget.
+    pub fn try_recv_up_to(&self, max_bytes: usize) -> Result<Option<Vec<u8>>, TryRecvError> {
+        let mut state = self.queue.state.lock().expect("PTY output queue mutex");
+        if let Some(chunk) = state.chunks.front() {
+            if chunk.len() > max_bytes {
+                return Ok(None);
+            }
+            let chunk = state.chunks.pop_front().expect("front chunk exists");
+            self.queue.writable.notify_one();
+            return Ok(Some(chunk));
+        }
+        if state.sender_closed || state.cancelled || state.discard {
+            Err(TryRecvError::Disconnected)
+        } else {
+            Err(TryRecvError::Empty)
+        }
+    }
+
+    pub fn pending_output_bytes(&self) -> usize {
+        self.queue
+            .state
+            .lock()
+            .expect("PTY output queue mutex")
+            .chunks
+            .iter()
+            .map(Vec::len)
+            .sum()
+    }
+
     pub fn recv_timeout(&self, timeout: std::time::Duration) -> Result<Vec<u8>, RecvTimeoutError> {
         let deadline = std::time::Instant::now() + timeout;
         let mut state = self.queue.state.lock().expect("PTY output queue mutex");
@@ -260,7 +289,16 @@ pub trait PtySession: Send {
     /// 채널 disconnect는 EOF(프로세스 종료 또는 PTY 닫힘)를 뜻한다.
     fn take_output(&mut self) -> Option<PtyOutputReceiver>;
     fn process_identity(&self) -> ProcessIdentity;
+    /// Current terminal foreground job, queried at admission instead of cached child PID.
+    fn foreground_process_group(&self) -> Option<u32> {
+        None
+    }
     fn write_input(&mut self, bytes: &[u8]) -> anyhow::Result<PtyInputEnqueueResult>;
+    /// One all-or-nothing admission; implementations must not independently enqueue parts.
+    fn write_input_batch(&mut self, parts: &[&[u8]]) -> anyhow::Result<PtyInputEnqueueResult> {
+        let combined: Vec<u8> = parts.iter().flat_map(|part| part.iter().copied()).collect();
+        self.write_input(&combined)
+    }
     /// 입력 큐가 비었는가 — backpressure 해소 이벤트 판정용(2026-07-09).
     fn input_queue_idle(&self) -> bool;
     fn resize(&mut self, cols: u16, rows: u16) -> anyhow::Result<()>;
@@ -1741,6 +1779,21 @@ impl PtySession for PortablePtySession {
         }
     }
 
+    fn foreground_process_group(&self) -> Option<u32> {
+        #[cfg(unix)]
+        {
+            let fd = self.master.as_ref()?.as_raw_fd()?;
+            // SAFETY: fd belongs to the live master, and tcgetpgrp only queries it.
+            u32::try_from(unsafe { libc::tcgetpgrp(fd) })
+                .ok()
+                .filter(|group| *group > 0)
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
     fn input_queue_idle(&self) -> bool {
         self.input_queue.is_idle()
     }
@@ -1763,6 +1816,14 @@ impl PtySession for PortablePtySession {
             });
         };
         input_queue::enqueue_input(tx, &self.input_queue, bytes)
+    }
+
+    fn write_input_batch(&mut self, parts: &[&[u8]]) -> anyhow::Result<PtyInputEnqueueResult> {
+        let Some(tx) = self.input_tx.as_ref() else {
+            // This definitive rejection occurs before any part is attempted.
+            return self.write_input(&[]);
+        };
+        input_queue::enqueue_input_batch(tx, &self.input_queue, parts)
     }
 
     fn resize(&mut self, cols: u16, rows: u16) -> anyhow::Result<()> {
@@ -2116,6 +2177,21 @@ mod tests {
     fn assert_no_workers(liveness: &TestWorkerLiveness) {
         assert_eq!(liveness.readers.load(Ordering::SeqCst), 0);
         assert_eq!(liveness.writers.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn pr13_bounded_receive_leaves_whole_over_budget_chunk_and_reports_backlog() {
+        let (sender, receiver, _control) = pty_output_channel();
+        sender.send(vec![1; 7]).unwrap();
+        sender.send(vec![2; 9]).unwrap();
+        assert_eq!(receiver.pending_output_bytes(), 16);
+        assert_eq!(receiver.try_recv_up_to(6).unwrap(), None);
+        assert_eq!(receiver.pending_output_bytes(), 16);
+        assert_eq!(receiver.try_recv_up_to(8).unwrap(), Some(vec![1; 7]));
+        assert_eq!(receiver.try_recv_up_to(1).unwrap(), None);
+        assert_eq!(receiver.pending_output_bytes(), 9);
+        assert_eq!(receiver.try_recv().unwrap(), vec![2; 9]);
+        assert_eq!(receiver.pending_output_bytes(), 0);
     }
 
     #[test]

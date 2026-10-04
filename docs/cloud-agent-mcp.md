@@ -73,11 +73,13 @@ Deppy의 **그록봇 작업 지시문 복사**를 눌러 봇의 지시문/스킬
 
 1. 봇이 `list_sessions`로 사용자가 공유한 세션을 찾습니다.
 2. `read_output`으로 화면을 읽습니다.
-3. 입력 허용이 켜져 있으면 필요한 명령을 `send_text`로 전달합니다.
+3. 입력 허용이 켜져 있으면 단일 줄 명령을 `send_text`로, 여러 줄 프롬프트는 확인된 bracketed paste 세션에 `paste_text`로 전달합니다.
 4. **봇 자신의 분석 결과를 `notify`로 보냅니다.** 로컬 에이전트의 출력만 읽고 끝내지 않습니다.
 5. Deppy의 기존 알림에 답변 도착이 표시됩니다. 원래 터미널 pane의 접을 수 있는 답변 영역에 표시되며, 알림을 누르면 원래 세션으로 이동해 답변을 펼칩니다. 원래 세션이 닫혔으면 설정의 답변 기록으로 이동합니다. 이후에는 자유롭게 스크롤하거나 답변을 접을 수 있습니다. 설정의 **답변 · 입력 기록**에서 전체 답변을 읽거나 복사할 수 있습니다.
 
 다른 탭에서 작업하더라도 답변은 원래 세션에 연결됩니다. 입력 제어를 회수하거나 연결을 끊어도 이미 받은 답변 기록은 남습니다. 터미널의 TUI 화면이나 stdin에 봇의 설명을 주입하지 않습니다.
+
+Grok bot과 Cloud Agent 모두 같은 흐름을 사용합니다. [명시적 붙여넣기와 원래 세션의 자체 답변 안내](cloud-agent-mcp-guide.md)에 JSON 예, 모드·초안 보호, 크기 제한과 `unknown` 처리 방법이 있습니다.
 
 봇이 대화에서 답변만 하고 `notify`를 호출하지 않으면 Deppy로 전달되지 않습니다. 일반 채팅 답변을 가로채는 기능은 아닙니다. 웹훅으로 봇을 깨우는 기능도 포함하지 않습니다.
 
@@ -88,11 +90,13 @@ Deppy의 **그록봇 작업 지시문 복사**를 눌러 봇의 지시문/스킬
 | `list_sessions` | 공유한 세션 목록 | 없음 |
 | `read_output` | 변경된 터미널 화면 읽기 | `session_id`, `generation`, 선택적 `cursor` |
 | `send_text` | 텍스트 입력·선택적 Enter | 위 식별자, `operation_id`, `text`, `submit` |
+| `paste_text` | 명시적 여러 줄 붙여넣기·선택적 Enter | 위 식별자, `operation_id`, `text`, `submit` |
 | `send_ctrl_c` | Ctrl+C 한 번 보내기 | 위 식별자, `operation_id` |
 | `notify` | 봇 자체 답변 저장·알림 | 위 식별자, `operation_id`, `message` |
 
-- `submit` 기본값은 `false`입니다. CR/LF·ESC·제어문자가 든 텍스트는 거부합니다. Enter는 `submit=true`, Ctrl+C는 별도 도구로만 보냅니다.
-- 입력은 최대 8 KiB, 답변은 최대 16 KiB의 UTF-8 바이트입니다. 등록된 비밀은 화면과 수신 답변에서 가립니다.
+- `submit` 기본값은 `false`입니다. `send_text`는 개행·탭·ESC·제어문자를 거부합니다. `paste_text`는 확인된 DEC 2004 모드에서 LF·CRLF·탭을 허용하며, 단독 CR·ESC·나머지 제어문자는 거부합니다. Enter는 `submit=true`, Ctrl+C는 별도 도구로만 보냅니다.
+- `send_text`는 최대 8 KiB, `paste_text`는 최대 32 KiB, 답변은 최대 16 KiB의 UTF-8 바이트입니다. paste의 직렬화한 arguments와 전체 HTTP 요청은 각각 64 KiB 제한이 있어 JSON 이스케이프나 봉투 때문에 먼저 거부될 수 있습니다. 등록된 비밀은 화면과 수신 답변에서 가립니다.
+- `list_sessions`는 `paste_bracketed`, `paste_text_max_bytes`, `paste_ai_confirmed`도 반환합니다. 실제 붙여넣기에서는 원래 세션·실행·권한·인증·마감 시간을 재검증하고, bracketed paste가 필요한 본문은 실제 런타임 큐 입장 시 모드가 꺼져 있어도 거부합니다. 본문과 선택적 Enter는 하나의 큐 예약입니다. AI에 새 프롬프트를 제출할 때 기존 초안·대화 상자를 보호하며, 의도적인 no-submit append는 기존 초안에 붙일 수 있습니다.
 - `queued`와 `admission:pty_queue`는 해당 PTY 입력 큐가 수락했다는 뜻입니다. 워커가 거부하면 `rejected`를 저장합니다. 셸의 실제 실행·완료는 보증하지 않습니다. 출력으로 작업 결과를 확인하세요.
 - **입력 제어 회수**, 입력 허용 해제, 공유 해제, 연결 종료·토큰 재발급은 아직 PTY에 전달되지 않은 입력도 차단합니다. 다시 입력을 허용해도 이전 큐의 입력이 살아나지 않습니다. 이미 PTY가 수락한 입력은 회수할 수 없습니다.
 - 동일 작업 재요청에는 동일 `operation_id`를 사용하세요. 다른 내용을 같은 ID로 보내면 거부됩니다. 전달 여부가 `unknown`이면 새 ID로 자동 재실행하지 마세요.
@@ -119,4 +123,4 @@ cargo build -p deppy-sijo --release
 
 테스트는 로컬 OAuth/HTTP→App→실제 PTY 입력 수락→실행 출력→봇 자체 답변을 확인하며, 권한/중복 수신/보존/egui 표시를 검사합니다. 실제 Grok Bot 계정 등록·인터넷 터널·봇의 도구 호출 준수 여부는 사용자 환경에서 별도로 연결 확인해야 합니다.
 
-runtime wire 버전은19입니다. 별도 runtime 피어를 사용한다면 같은 버전으로 빌드해야 하며, 이전 버전은 handshake에서 거부됩니다. SSH 터미널 세션은 기존 로컬 runtime의 PTY를 계속 사용합니다.
+runtime wire 버전은22입니다. paste의 모드 입장 조건은 로컬 전용이며 wire 버전을 추가 변경하지 않습니다. 별도 runtime 피어를 사용한다면 같은 버전으로 빌드해야 하며, 이전 버전은 handshake에서 거부됩니다. SSH 터미널 세션은 기존 로컬 runtime의 PTY를 계속 사용합니다.

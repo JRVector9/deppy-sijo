@@ -34,11 +34,54 @@ pub const SESSION_LOG_DISK_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 const SESSION_LOG_SCAN_ENTRY_LIMIT: usize = 4_096;
 const SESSION_LOG_SCAN_LIMIT_ERROR: &str = "session_log_scan_entry_limit";
 
+#[cfg(test)]
+thread_local! { static LOG_IO_COUNTS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0,0)) }; }
+#[cfg(test)]
+thread_local! {
+    static LOG_METADATA_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static LOG_WRITE_FAIL_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static LOG_POSITION_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+fn log_metadata(file: &File) -> std::io::Result<std::fs::Metadata> {
+    #[cfg(test)]
+    LOG_IO_COUNTS.with(|counts| {
+        let (meta, writes) = counts.get();
+        counts.set((meta + 1, writes));
+    });
+    #[cfg(test)]
+    if LOG_METADATA_FAIL.with(std::cell::Cell::get) {
+        return Err(std::io::Error::other("fixture_metadata_failed"));
+    }
+    file.metadata()
+}
+fn log_write_all(file: &mut File, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(test)]
+    LOG_IO_COUNTS.with(|counts| {
+        let (meta, writes) = counts.get();
+        counts.set((meta, writes + 1));
+    });
+    #[cfg(test)]
+    if let Some(limit) = LOG_WRITE_FAIL_AFTER.with(std::cell::Cell::take) {
+        file.write_all(&bytes[..limit.min(bytes.len())])?;
+        return Err(std::io::Error::other("fixture_partial_write"));
+    }
+    file.write_all(bytes)
+}
+fn log_stream_position(file: &mut File) -> std::io::Result<u64> {
+    #[cfg(test)]
+    if LOG_POSITION_FAIL.with(std::cell::Cell::take) {
+        return Err(std::io::Error::other("fixture_position_failed"));
+    }
+    file.stream_position()
+}
+
 struct BoundedLogFile {
     file: File,
     path: PathBuf,
     max_bytes: u64,
     tail_boundary: TailBoundary,
+    /// Confirmed same-handle length. Errors invalidate it; never assume an unknown file is empty.
+    known_len: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -56,11 +99,13 @@ impl BoundedLogFile {
     fn open(path: &Path, max_bytes: u64, tail_boundary: TailBoundary) -> anyhow::Result<Self> {
         let file = open_regular_log_file(path, true)
             .with_context(|| format!("로그 파일 열기 실패: {}", path.display()))?;
+        let known_len = log_metadata(&file)?.len();
         let mut bounded = Self {
             file,
             path: path.to_path_buf(),
             max_bytes,
             tail_boundary,
+            known_len: Some(known_len),
         };
         bounded.compact_if_oversized(max_bytes / 2)?;
         Ok(bounded)
@@ -76,54 +121,105 @@ impl BoundedLogFile {
         let path = directory.path.join(name);
         let file = open_regular_log_at(directory, std::ffi::OsStr::new(name), true)
             .with_context(|| format!("로그 파일 열기 실패: {}", path.display()))?;
+        let known_len = log_metadata(&file)?.len();
         let mut bounded = Self {
             file,
             path,
             max_bytes,
             tail_boundary,
+            known_len: Some(known_len),
         };
         bounded.compact_if_oversized(max_bytes / 2)?;
         Ok(bounded)
     }
 
     fn len(&self) -> std::io::Result<u64> {
-        self.file.metadata().map(|metadata| metadata.len())
+        self.known_len
+            .ok_or_else(|| std::io::Error::other("log_length_unknown"))
     }
-
+    fn recover_len(&mut self) -> std::io::Result<u64> {
+        if let Some(len) = self.known_len {
+            return Ok(len);
+        }
+        let len = log_metadata(&self.file)?.len();
+        self.known_len = Some(len);
+        Ok(len)
+    }
+    fn compact(&mut self, retain: u64) -> std::io::Result<()> {
+        self.known_len = None;
+        self.known_len = Some(compact_open_file_to_tail(
+            &mut self.file,
+            retain,
+            self.tail_boundary,
+        )?);
+        Ok(())
+    }
     fn append(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        if let Err(error) = self.append_inner(bytes) {
+            // External writes can make the cached length stale, and a failed write or position
+            // query can leave new bytes behind. Reconcile the pinned inode even on failure;
+            // never replay the original slice or report a repaired write as successful.
+            self.known_len = None;
+            if let Err(repair_error) = self.repair_cap_after_error() {
+                return Err(error.context(format!(
+                    "로그 오류 후 상한 복구 실패: {}: {repair_error}",
+                    self.path.display()
+                )));
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+    fn repair_cap_after_error(&mut self) -> std::io::Result<()> {
+        if log_metadata(&self.file)?.len() > self.max_bytes {
+            compact_open_file_to_tail(&mut self.file, self.max_bytes / 2, self.tail_boundary)?;
+        }
+        Ok(())
+    }
+    fn append_inner(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
         if bytes.is_empty() {
             return Ok(());
         }
         let incoming = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         if incoming >= self.max_bytes {
-            // giant chunk 자체가 이전 chunk의 UTF-8/ANSI sequence를 이어갈 수 있으므로
-            // 임의 slice를 먼저 만들지 않는다. 전체 stream을 append한 다음 시작부터
-            // parser state를 계산해 안전한 최근 tail로 줄인다.
-            self.file
-                .write_all(bytes)
-                .with_context(|| format!("로그 기록 실패: {}", self.path.display()))?;
-            compact_open_file_to_tail(&mut self.file, self.max_bytes, self.tail_boundary)
-                .with_context(|| format!("로그 tail 압축 실패: {}", self.path.display()))?;
+            self.known_len = None;
+            let len = replace_open_file_with_appended_tail(
+                &mut self.file,
+                bytes,
+                self.max_bytes,
+                self.tail_boundary,
+            )
+            .with_context(|| format!("로그 tail 기록 실패: {}", self.path.display()))?;
+            self.known_len = Some(len);
             return Ok(());
         }
-        let current = self.len().unwrap_or(0);
+        let current = self
+            .recover_len()
+            .with_context(|| format!("로그 길이 조회 실패: {}", self.path.display()))?;
         if current.saturating_add(incoming) > self.max_bytes {
             let retain = self
                 .max_bytes
                 .saturating_sub(incoming)
                 .min(self.max_bytes / 2);
-            compact_open_file_to_tail(&mut self.file, retain, self.tail_boundary)
+            self.compact(retain)
                 .with_context(|| format!("로그 tail 압축 실패: {}", self.path.display()))?;
         }
-        self.file
-            .write_all(bytes)
+        // Reserve capacity from the cached length; failures also reconcile external changes.
+        self.known_len = None;
+        log_write_all(&mut self.file, bytes)
             .with_context(|| format!("로그 기록 실패: {}", self.path.display()))?;
+        // O_APPEND leaves this handle at its actual new EOF, including an external truncate or
+        // append. A cheap position query reconciles successful writes without per-chunk fstat.
+        let len = log_stream_position(&mut self.file)?;
+        self.known_len = Some(len);
+        if len > self.max_bytes {
+            self.compact(self.max_bytes / 2)?;
+        }
         Ok(())
     }
-
     fn compact_if_oversized(&mut self, retain_bytes: u64) -> anyhow::Result<()> {
-        if self.len().unwrap_or(0) > self.max_bytes {
-            compact_open_file_to_tail(&mut self.file, retain_bytes, self.tail_boundary)
+        if self.recover_len()? > self.max_bytes {
+            self.compact(retain_bytes)
                 .with_context(|| format!("기존 로그 tail 압축 실패: {}", self.path.display()))?;
         }
         Ok(())
@@ -841,6 +937,64 @@ fn read_terminal_size_bounded_with_hook(
 /// 열린 파일의 끝 `retain_bytes`만 같은 inode에 다시 쓴다. writer handle을 교체/rename하지
 /// 않으므로 런타임이 계속 가진 append handle에도 즉시 적용된다. text/JSONL은 LF가 있으면
 /// 첫 완전한 줄로 정렬하고, line-oriented가 아닌 ANSI는 UTF-8/escape 경계에 맞춘다.
+/// For a chunk at least as large as the cap, the final retained tail lies wholly within
+/// the incoming slice. Scan the previous pinned stream only for ANSI boundary state, then
+/// replace it with that bounded slice. Never append a giant chunk and hope later truncation works.
+fn replace_open_file_with_appended_tail(
+    file: &mut File,
+    incoming: &[u8],
+    max_bytes: u64,
+    boundary: TailBoundary,
+) -> std::io::Result<u64> {
+    let previous_len = log_metadata(file)?.len();
+    let max =
+        usize::try_from(max_bytes).map_err(|_| std::io::Error::other("log_tail_size_invalid"))?;
+    let mut start = incoming.len().saturating_sub(max);
+    match boundary {
+        TailBoundary::Ansi => {
+            let mut scanner = AnsiBoundaryScanner::default();
+            file.seek(std::io::SeekFrom::Start(0))?;
+            let mut position = 0u64;
+            let mut buffer = [0u8; 8192];
+            while position < previous_len {
+                let take = (previous_len - position).min(buffer.len() as u64) as usize;
+                file.read_exact(&mut buffer[..take])?;
+                for byte in &buffer[..take] {
+                    scanner.advance(*byte);
+                }
+                position += take as u64;
+            }
+            let mut safe = None;
+            for (index, byte) in incoming.iter().enumerate() {
+                if index >= start && safe.is_none() && scanner.at_boundary() {
+                    safe = Some(index);
+                }
+                scanner.advance(*byte);
+            }
+            start = safe.unwrap_or(incoming.len());
+        }
+        TailBoundary::NextNewlineIfPresent => {
+            if previous_len.saturating_add(start as u64) > 0 {
+                if let Some(newline) = incoming[start..].iter().position(|byte| *byte == b'\n') {
+                    start += newline + 1;
+                } else {
+                    start += incoming[start..]
+                        .iter()
+                        .take_while(|byte| **byte & 0xc0 == 0x80)
+                        .count();
+                }
+            }
+        }
+    }
+    if log_metadata(file)?.len() != previous_len {
+        return Err(std::io::Error::other("log_changed_during_compaction"));
+    }
+    file.set_len(0)?;
+    log_write_all(file, &incoming[start..])?;
+    file.flush()?;
+    Ok((incoming.len() - start) as u64)
+}
+
 fn compact_open_file_to_tail(
     file: &mut File,
     retain_bytes: u64,
@@ -856,7 +1010,7 @@ fn compact_open_file_to_tail_with_hook(
     after_snapshot: impl FnOnce(),
 ) -> std::io::Result<u64> {
     file.flush()?;
-    let len = file.metadata()?.len();
+    let len = log_metadata(file)?.len();
     if len <= retain_bytes {
         return Ok(len);
     }
@@ -883,11 +1037,11 @@ fn compact_open_file_to_tail_with_hook(
         let continuation_bytes = tail.iter().take_while(|byte| **byte & 0xc0 == 0x80).count();
         tail.drain(..continuation_bytes);
     }
-    if file.metadata()?.len() != len {
+    if log_metadata(file)?.len() != len {
         return Err(std::io::Error::other("log_changed_during_compaction"));
     }
     file.set_len(0)?;
-    file.write_all(&tail)?;
+    log_write_all(file, &tail)?;
     file.flush()?;
     Ok(tail.len() as u64)
 }
@@ -1944,6 +2098,275 @@ fn json_escape(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pr8_repeated_log_append_reuses_writer_length_and_measures_io() {
+        let root = temp_root("pr8-counted-append");
+        let path = root.join("bounded.log");
+        let mut log = BoundedLogFile::open(&path, 1024 * 1024, TailBoundary::Ansi).unwrap();
+        LOG_IO_COUNTS.with(|counts| counts.set((0, 0)));
+        let started = std::time::Instant::now();
+        for _ in 0..2048 {
+            log.append(&[b'x'; 128]).unwrap();
+        }
+        log.flush();
+        let elapsed = started.elapsed();
+        let (metadata, writes) = LOG_IO_COUNTS.with(std::cell::Cell::get);
+        eprintln!("PR8 file2048x128B metadata={metadata} write_all={writes} elapsed={elapsed:?}");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 2048 * 128);
+        drop(log);
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(
+            metadata <= 2,
+            "metadata was re-read {metadata} times on append"
+        );
+    }
+
+    #[test]
+    fn pr8_failed_giant_append_never_exceeds_file_cap() {
+        let root = temp_root("pr8-failed-giant");
+        let path = root.join("bounded.log");
+        let mut log = BoundedLogFile::open(&path, 64, TailBoundary::Ansi).unwrap();
+        LOG_WRITE_FAIL_AFTER.with(|failure| failure.set(Some(75)));
+        assert!(log.append(&[b'x'; 128]).is_err());
+        let len = std::fs::metadata(&path).unwrap().len();
+        drop(log);
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(len <= 64, "failed giant append left {len} bytes beyond cap");
+    }
+    #[test]
+    fn pr8_metadata_error_must_not_assume_empty_length_or_bypass_cap() {
+        let root = temp_root("pr8-metadata-failure");
+        let path = root.join("bounded.log");
+        let mut log = BoundedLogFile::open(&path, 64, TailBoundary::Ansi).unwrap();
+        log.append(&[b'a'; 48]).unwrap();
+        LOG_METADATA_FAIL.with(|failure| failure.set(true));
+        let result = log.append(&[b'b'; 32]);
+        LOG_METADATA_FAIL.with(|failure| failure.set(false));
+        let len = std::fs::metadata(&path).unwrap().len();
+        drop(log);
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(
+            result.is_err(),
+            "metadata failure incorrectly reported append success"
+        );
+        assert!(len <= 64, "metadata failure left {len} bytes beyond cap");
+    }
+
+    #[test]
+    fn pr8_external_append_and_truncate_reconcile_same_handle() {
+        let root = temp_root("pr8-external-changes");
+        let path = root.join("bounded.log");
+        let mut log = BoundedLogFile::open(&path, 64, TailBoundary::Ansi).unwrap();
+        log.append(&[b'a'; 32]).unwrap();
+        let mut external = OpenOptions::new().append(true).open(&path).unwrap();
+        external.write_all(&[b'b'; 32]).unwrap();
+        log.append(b"c").unwrap();
+        assert!(log.len().unwrap() <= 64);
+        assert!(std::fs::read(&path).unwrap().ends_with(b"c"));
+        external.set_len(0).unwrap();
+        log.append(b"new").unwrap();
+        assert_eq!(log.len().unwrap(), 3);
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        drop(external);
+        drop(log);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pr8_external_append_then_partial_write_error_repairs_file_cap() {
+        let root = temp_root("pr8-external-partial-cap");
+        let path = root.join("bounded.log");
+        let mut log = BoundedLogFile::open(&path, 64, TailBoundary::Ansi).unwrap();
+        log.append(&[b'a'; 32]).unwrap();
+        let mut external = OpenOptions::new().append(true).open(&path).unwrap();
+        external.write_all(&[b'b'; 32]).unwrap();
+        LOG_WRITE_FAIL_AFTER.with(|failure| failure.set(Some(5)));
+        let result = log.append(&[b'c'; 20]);
+        let bytes = std::fs::read(&path).unwrap();
+        let length_unknown = log.len().is_err();
+        drop(external);
+        drop(log);
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(
+            result.is_err(),
+            "partial write incorrectly reported success"
+        );
+        assert!(length_unknown, "partial write retained a confirmed length");
+        assert!(
+            bytes.len() <= 64,
+            "failed partial append left {} bytes beyond cap",
+            bytes.len()
+        );
+        assert!(bytes.ends_with(&[b'c'; 5]));
+        assert!(!bytes.ends_with(&[b'c'; 6]), "failed bytes were replayed");
+    }
+
+    #[test]
+    fn pr8_position_error_repairs_actual_eof_and_keeps_original_error() {
+        let root = temp_root("pr8-position-error-cap");
+        let path = root.join("bounded.log");
+        let mut log = BoundedLogFile::open(&path, 64, TailBoundary::Ansi).unwrap();
+        log.append(&[b'a'; 32]).unwrap();
+        let mut external = OpenOptions::new().append(true).open(&path).unwrap();
+        external.write_all(&[b'b'; 32]).unwrap();
+        LOG_POSITION_FAIL.with(|failure| failure.set(true));
+        let error = log.append(&[b'c'; 20]).unwrap_err();
+        assert!(format!("{error:#}").contains("fixture_position_failed"));
+        assert!(log.len().is_err());
+        let mut expected = vec![b'b'; 12];
+        expected.extend_from_slice(&[b'c'; 20]);
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
+        drop(external);
+        drop(log);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pr8_error_cap_repair_failure_preserves_both_errors_and_unknown_length() {
+        let root = temp_root("pr8-error-repair-failure");
+        let path = root.join("bounded.log");
+        let mut log = BoundedLogFile::open(&path, 64, TailBoundary::Ansi).unwrap();
+        log.append(&[b'a'; 32]).unwrap();
+        let mut external = OpenOptions::new().append(true).open(&path).unwrap();
+        external.write_all(&[b'b'; 32]).unwrap();
+        LOG_WRITE_FAIL_AFTER.with(|failure| failure.set(Some(5)));
+        LOG_METADATA_FAIL.with(|failure| failure.set(true));
+        let result = log.append(&[b'c'; 20]);
+        LOG_METADATA_FAIL.with(|failure| failure.set(false));
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(error.contains("fixture_partial_write"));
+        assert!(error.contains("fixture_metadata_failed"));
+        assert!(log.len().is_err());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 69);
+        log.append(b"d").unwrap();
+        assert!(log.len().unwrap() <= 64);
+        assert!(std::fs::read(&path).unwrap().ends_with(b"cccccd"));
+        drop(external);
+        drop(log);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pr8_error_cap_repair_preserves_pinned_inode_and_tail_boundary() {
+        for (index, external_bytes, expected_tail) in [
+            ("bbbb\x1b]title-\x07😀한글-endTAIL!", "😀한글-endTAIL!"),
+            ("bbbb😀한글abcdefghijklmnopqr", "한글abcdefghijklmnopqr"),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, (external, tail))| (i, external, tail))
+        {
+            assert_eq!(external_bytes.len(), 32);
+            let root = temp_root(&format!("pr8-error-pinned-boundary-{index}"));
+            let path = root.join("bounded.log");
+            let mut log = BoundedLogFile::open(&path, 64, TailBoundary::Ansi).unwrap();
+            log.append(&[b'a'; 32]).unwrap();
+            let mut external = OpenOptions::new().append(true).open(&path).unwrap();
+            external.write_all(external_bytes.as_bytes()).unwrap();
+            let pinned = root.join("pinned.log");
+            let unrelated = root.join("unrelated.log");
+            std::fs::rename(&path, &pinned).unwrap();
+            std::fs::write(&unrelated, b"unrelated").unwrap();
+            std::os::unix::fs::symlink(&unrelated, &path).unwrap();
+            LOG_WRITE_FAIL_AFTER.with(|failure| failure.set(Some(5)));
+            assert!(log.append(&[b'c'; 20]).is_err());
+            assert!(log.len().is_err());
+            let mut expected = expected_tail.as_bytes().to_vec();
+            expected.extend_from_slice(&[b'c'; 5]);
+            assert_eq!(std::fs::read(&pinned).unwrap(), expected);
+            assert_eq!(std::fs::read(&unrelated).unwrap(), b"unrelated");
+            drop(external);
+            drop(log);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn pr8_partial_write_recovery_uses_actual_length_and_preserves_cap() {
+        let root = temp_root("pr8-partial-recovery");
+        let path = root.join("bounded.log");
+        let mut log = BoundedLogFile::open(&path, 64, TailBoundary::Ansi).unwrap();
+        log.append(&[b'a'; 40]).unwrap();
+        LOG_WRITE_FAIL_AFTER.with(|failure| failure.set(Some(5)));
+        assert!(log.append(&[b'b'; 20]).is_err());
+        assert!(log.len().is_err());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 45);
+        log.append(&[b'c'; 20]).unwrap();
+        assert!(log.len().unwrap() <= 64);
+        assert!(std::fs::read(&path).unwrap().ends_with(&[b'c'; 20]));
+        drop(log);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pr8_giant_tail_preserves_split_escape_utf8_and_pinned_inode() {
+        for (index, prefix, incoming) in [
+            (
+                &b"old\x1b]title"[..],
+                "😀한글\x07abcdef😀한글\x1b[31mred\x1b[0m-end".as_bytes(),
+            ),
+            (&b"\x1b["[..], &b"31mABCDEFGHIJKLMNO\x1b[0mTAIL-END"[..]),
+            (
+                &b"old"[..],
+                "가나다라마바사아자차카타파하😀😀end".as_bytes(),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, (p, b))| (i, p, b))
+        {
+            let root = temp_root(&format!("pr8-giant-boundary-{index}"));
+            let path = root.join("bounded.log");
+            let expected_path = root.join("expected.log");
+            let mut combined = prefix.to_vec();
+            combined.extend_from_slice(incoming);
+            std::fs::write(&expected_path, combined).unwrap();
+            let mut expected = open_regular_log_file(&expected_path, false).unwrap();
+            compact_open_file_to_tail(&mut expected, 24, TailBoundary::Ansi).unwrap();
+            let expected_bytes = std::fs::read(&expected_path).unwrap();
+            let mut log = BoundedLogFile::open(&path, 24, TailBoundary::Ansi).unwrap();
+            log.append(prefix).unwrap();
+            let pinned = root.join("pinned.log");
+            std::fs::rename(&path, &pinned).unwrap();
+            std::fs::write(&path, b"replacement").unwrap();
+            log.append(incoming).unwrap();
+            assert_eq!(std::fs::read(&pinned).unwrap(), expected_bytes);
+            assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+            drop(log);
+            drop(expected);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn pr8_measure_append_fixture_five_samples() {
+        let mut samples = Vec::new();
+        for n in 0..5 {
+            let root = temp_root(&format!("pr8-median-{n}"));
+            let path = root.join("bounded.log");
+            let mut log = BoundedLogFile::open(&path, 1024 * 1024, TailBoundary::Ansi).unwrap();
+            LOG_IO_COUNTS.with(|count| count.set((0, 0)));
+            let started = std::time::Instant::now();
+            for _ in 0..2048 {
+                log.append(&[b'x'; 128]).unwrap();
+            }
+            log.flush();
+            let us = started.elapsed().as_secs_f64() * 1e6;
+            let counts = LOG_IO_COUNTS.with(std::cell::Cell::get);
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), 2048 * 128);
+            eprintln!(
+                "PR8 sample{n} file2048x128B metadata={} write_all={} us={us:.3}",
+                counts.0, counts.1
+            );
+            samples.push(us);
+            drop(log);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+        samples.sort_by(f64::total_cmp);
+        eprintln!("PR8 median5 file2048x128B us={:.3}", samples[2]);
+    }
+
     use super::*;
 
     fn temp_root(name: &str) -> PathBuf {

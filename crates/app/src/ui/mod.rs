@@ -36,6 +36,7 @@ pub mod prompt_palette;
 pub(crate) mod resource_manager;
 pub(crate) mod session_close_dialogs;
 pub mod settings;
+pub(crate) mod text_input;
 pub mod transcript_viewer;
 pub mod work_history;
 pub mod workspace;

@@ -56,6 +56,8 @@ pub enum PtyInputRejectReason {
     PayloadTooLarge,
     /// A local admission permit was revoked or expired before the queue write.
     AdmissionDenied,
+    /// A writer disappeared after a prefix may have been queued. Never retry automatically.
+    AdmissionUnknown,
 }
 
 #[derive(Clone)]
@@ -139,7 +141,20 @@ pub(crate) fn enqueue_input(
     queue: &PtyInputQueueState,
     bytes: &[u8],
 ) -> anyhow::Result<PtyInputEnqueueResult> {
-    let attempted_bytes = bytes.len();
+    enqueue_input_batch(tx, queue, &[bytes])
+}
+
+/// Reserve the complete paste + submit before enqueueing either part. Each part retains
+/// its writer-message boundary; producers cannot interleave input between parts.
+pub(crate) fn enqueue_input_batch(
+    tx: &SyncSender<Vec<u8>>,
+    queue: &PtyInputQueueState,
+    parts: &[&[u8]],
+) -> anyhow::Result<PtyInputEnqueueResult> {
+    let attempted_bytes = parts
+        .iter()
+        .try_fold(0usize, |sum, part| sum.checked_add(part.len()))
+        .unwrap_or(usize::MAX);
     let (chunk_size, chunk_count) = {
         let mut inner = queue.inner.lock().expect("PTY input queue mutex");
         if inner.closed {
@@ -152,7 +167,12 @@ pub(crate) fn enqueue_input(
             });
         }
         let chunk_size = inner.policy.large_paste_threshold.max(1);
-        let chunk_count = attempted_bytes.div_ceil(chunk_size);
+        let chunk_count = parts
+            .iter()
+            .try_fold(0usize, |sum, part| {
+                sum.checked_add(part.len().div_ceil(chunk_size))
+            })
+            .unwrap_or(usize::MAX);
         // 정책상 영원히 수용 불가능한 payload — 큐가 비어도 못 들어간다
         if attempted_bytes > inner.policy.max_bytes || chunk_count > inner.policy.max_messages {
             return Ok(PtyInputEnqueueResult::Rejected {
@@ -189,7 +209,7 @@ pub(crate) fn enqueue_input(
 
     let mut sent_bytes = 0usize;
     let mut sent_chunks = 0usize;
-    for chunk in bytes.chunks(chunk_size) {
+    for chunk in parts.iter().flat_map(|part| part.chunks(chunk_size)) {
         match tx.try_send(chunk.to_vec()) {
             Ok(()) => {
                 sent_bytes += chunk.len();
@@ -201,12 +221,19 @@ pub(crate) fn enqueue_input(
             Err(TrySendError::Full(_)) => {
                 queue.release(attempted_bytes - sent_bytes, chunk_count - sent_chunks);
                 let inner = queue.inner.lock().expect("PTY input queue mutex");
-                return Ok(PtyInputEnqueueResult::Backpressured {
-                    pressure: PtyInputQueueState::pressure(
-                        &inner,
-                        attempted_bytes,
-                        PtyInputRejectReason::QueueFull,
-                    ),
+                let pressure = PtyInputQueueState::pressure(
+                    &inner,
+                    attempted_bytes,
+                    if sent_chunks == 0 {
+                        PtyInputRejectReason::QueueFull
+                    } else {
+                        PtyInputRejectReason::AdmissionUnknown
+                    },
+                );
+                return Ok(if sent_chunks == 0 {
+                    PtyInputEnqueueResult::Backpressured { pressure }
+                } else {
+                    PtyInputEnqueueResult::Rejected { pressure }
                 });
             }
             Err(TrySendError::Disconnected(_)) => {
@@ -222,7 +249,11 @@ pub(crate) fn enqueue_input(
                     pressure: PtyInputQueueState::pressure(
                         &inner,
                         attempted_bytes,
-                        PtyInputRejectReason::WriterUnavailable,
+                        if sent_chunks == 0 {
+                            PtyInputRejectReason::WriterUnavailable
+                        } else {
+                            PtyInputRejectReason::AdmissionUnknown
+                        },
                     ),
                 });
             }
@@ -235,6 +266,79 @@ pub(crate) fn enqueue_input(
 mod tests {
     use super::*;
     use std::sync::mpsc::sync_channel;
+
+    #[test]
+    fn pr1_default_queue_reserves_paste_body_and_submit_together() {
+        let policy = PtyInputQueuePolicy::default();
+        let (tx, rx) = sync_channel(policy.max_messages);
+        let queue = PtyInputQueueState::new(policy);
+        let body = vec![b'x'; policy.max_bytes];
+        let result = enqueue_input_batch(&tx, &queue, &[&body, b"\r"]).unwrap();
+        assert!(
+            !result.is_accepted(),
+            "over-budget whole submission must refuse both parts"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a refused submission leaves no pasted prefix"
+        );
+    }
+
+    #[test]
+    fn pr1_partial_writer_failure_is_unknown_never_a_retryable_queue_refusal() {
+        let (tx, rx) = sync_channel(1);
+        let queue = PtyInputQueueState::new(PtyInputQueuePolicy {
+            max_bytes: 10,
+            max_messages: 2,
+            large_paste_threshold: 10,
+        });
+        let result = enqueue_input_batch(&tx, &queue, &[b"body", b"\r"]).unwrap();
+        assert!(matches!(
+            result,
+            PtyInputEnqueueResult::Rejected {
+                pressure: PtyInputPressure {
+                    reason: PtyInputRejectReason::AdmissionUnknown,
+                    ..
+                }
+            }
+        ));
+        assert_eq!(rx.try_recv().unwrap(), b"body");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn pr1_batch_keeps_body_submit_boundaries_and_order() {
+        let policy = PtyInputQueuePolicy::default();
+        let (tx, rx) = sync_channel(policy.max_messages);
+        let queue = PtyInputQueueState::new(policy);
+        assert!(
+            enqueue_input_batch(&tx, &queue, &["\x1b[200~한글\x1b[201~".as_bytes(), b"\r"])
+                .unwrap()
+                .is_accepted()
+        );
+        assert_eq!(rx.try_recv().unwrap(), "\x1b[200~한글\x1b[201~".as_bytes());
+        assert_eq!(rx.try_recv().unwrap(), b"\r");
+    }
+
+    #[test]
+    fn pr1_default_queue_no_cr_after_body_refusal() {
+        let policy = PtyInputQueuePolicy::default();
+        let (tx, rx) = sync_channel(policy.max_messages);
+        let queue = PtyInputQueueState::new(policy);
+        enqueue_input(&tx, &queue, &vec![b'q'; policy.max_bytes - 1]).unwrap();
+        let queued_before = queue.inner.lock().unwrap().queued_bytes;
+        let result = enqueue_input_batch(&tx, &queue, &[b"long-body", b"\r"]).unwrap();
+        assert!(matches!(
+            result,
+            PtyInputEnqueueResult::Backpressured { .. }
+        ));
+        assert_eq!(queue.inner.lock().unwrap().queued_bytes, queued_before);
+        let mut bytes = Vec::new();
+        while let Ok(part) = rx.try_recv() {
+            bytes.extend(part);
+        }
+        assert!(bytes.iter().all(|byte| *byte == b'q'));
+    }
 
     #[test]
     fn queue_accepts_within_budget() {

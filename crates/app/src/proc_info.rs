@@ -15,11 +15,11 @@
 //! 검증해 이 경우를 잡고 있었으므로, 그 정밀도를 공유 헬퍼의 기본값으로 승격했다.
 //! `bench.rs`의 `own_task_info`도 같은 `proc_pidinfo` 계열 FFI를 쓰고 있어 그 스타일을 따른다.
 
-/// 프로세스 시작 시각(초+마이크로초, `proc_bsdinfo.pbi_start_tvsec`/`pbi_start_tvusec` 그대로).
+/// Kernel process birth identity: macOS seconds/microseconds; Linux boot-relative start ticks in seconds.
 /// 초 단위 비트 시프트로 하나의 `u64`에 합성하지 않고 필드 두 개짜리 struct로 둔 이유:
 /// 합성하면 오버플로/마스킹을 직접 검증해야 하는데, 초 값은 이미 `u64`라 시프트할 여유
 /// 비트가 없다. 필드별 비교가 그대로 정확하고 더 읽기 쉽다.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ProcessBirth {
     pub(crate) seconds: u64,
     pub(crate) microseconds: u64,
@@ -33,10 +33,61 @@ pub(crate) fn pid_start_time(pid: u32) -> Option<ProcessBirth> {
     {
         pid_start_time_macos(pid)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        pid_start_time_linux(pid)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         None
     }
+}
+
+#[cfg(target_os = "linux")]
+fn pid_start_time_linux(pid: u32) -> Option<ProcessBirth> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    if pid == 0 || pid > i32::MAX as u32 {
+        return None;
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(format!("/proc/{pid}/stat"))
+        .ok()?;
+    read_linux_process_birth(pid, file)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn read_linux_process_birth(pid: u32, reader: impl std::io::Read) -> Option<ProcessBirth> {
+    use std::io::Read as _;
+    const MAX_STAT_BYTES: usize = 4096;
+    if pid == 0 || pid > i32::MAX as u32 {
+        return None;
+    }
+    let mut stat = String::new();
+    reader
+        .take((MAX_STAT_BYTES + 1) as u64)
+        .read_to_string(&mut stat)
+        .ok()?;
+    if stat.len() > MAX_STAT_BYTES {
+        return None;
+    }
+    // comm may contain spaces and ')'. The last ') ' is the actual field boundary.
+    let (head, fields) = stat.rsplit_once(") ")?;
+    let recorded_pid = head.split_once(" (")?.0.parse::<u32>().ok()?;
+    if recorded_pid != pid {
+        return None;
+    }
+    // fields begins at state (field 3); starttime is field 22, hence index 19.
+    let ticks = fields
+        .split_ascii_whitespace()
+        .nth(19)?
+        .parse::<u64>()
+        .ok()?;
+    Some(ProcessBirth {
+        seconds: ticks,
+        microseconds: 0,
+    })
 }
 
 /// 프로세스의 현재 작업 디렉터리. 없거나 조회 실패면 None.
@@ -132,8 +183,43 @@ fn pid_cwd_macos(pid: u32) -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(os_str))
 }
 
+/// Kernel process group; missing information is never an AI input authorization.
+pub(crate) fn pid_process_group(pid: u32) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        let pid = i32::try_from(pid).ok().filter(|pid| *pid > 0)?;
+        // SAFETY: getpgid only queries the supplied positive process ID.
+        u32::try_from(unsafe { libc::getpgid(pid) })
+            .ok()
+            .filter(|group| *group > 0)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pr2_linux_birth_fixture_handles_comm_spaces_parentheses_and_fixed_read_bound() {
+        let stat = format!(
+            "42 (worker name) tricky) R {} 987654 0",
+            ["0"; 18].join(" ")
+        );
+        let birth = super::read_linux_process_birth(42, stat.as_bytes()).unwrap();
+        assert_eq!(birth.seconds, 987654);
+        assert_eq!(birth.microseconds, 0);
+        assert!(super::read_linux_process_birth(43, stat.as_bytes()).is_none());
+        assert!(super::read_linux_process_birth(0, stat.as_bytes()).is_none());
+        assert!(super::read_linux_process_birth(42, b"42 malformed".as_slice()).is_none());
+        let overflow = stat.replace("987654", "18446744073709551616");
+        assert!(super::read_linux_process_birth(42, overflow.as_bytes()).is_none());
+        let oversized = format!("{stat}{}", " ".repeat(4096));
+        assert!(super::read_linux_process_birth(42, oversized.as_bytes()).is_none());
+    }
+
     use super::*;
 
     #[test]

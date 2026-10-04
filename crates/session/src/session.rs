@@ -97,6 +97,8 @@ pub struct Session {
 }
 
 impl Session {
+    pub const INPUT_GUARD_OUTPUT_MAX_BYTES: usize = FEED_PER_PUMP_CAP;
+
     /// resolve가 끝난 CommandSpec으로 spawn한다 (secret 참조 없음 — lib.rs 참조).
     pub fn spawn_with_spec(
         id: SessionId,
@@ -277,6 +279,29 @@ impl Session {
     /// `on_output`은 raw chunk마다 불린다 — 로그/status detector는
     /// backend 내부가 아니라 이 output stream 기반이다 (설계문서 4.1).
     pub fn pump(&mut self, mut on_output: impl FnMut(&[u8])) -> PumpResult {
+        self.pump_inner(&mut on_output, false).0
+    }
+
+    /// One strict byte-bounded pass immediately before guarded input. The regular pump
+    /// retains its existing chunk policy; guard admission must reject a remaining backlog.
+    /// An exited PTY is detached immediately, closing every input path, but its destructor
+    /// must run only after the caller releases input authorization locks.
+    pub fn pump_for_input_guard(
+        &mut self,
+        mut on_output: impl FnMut(&[u8]),
+    ) -> (PumpResult, Option<Box<dyn PtySession>>) {
+        self.pump_inner(&mut on_output, true)
+    }
+
+    pub fn pending_output_bytes(&self) -> usize {
+        self.output.pending_output_bytes()
+    }
+
+    fn pump_inner(
+        &mut self,
+        on_output: &mut impl FnMut(&[u8]),
+        input_guard: bool,
+    ) -> (PumpResult, Option<Box<dyn PtySession>>) {
         let mut fed = 0usize;
         let mut eof = false;
         // 터미널 질의 응답의 tick당 상한 — 악성 출력이 DA/OSC 질의를 폭주시켜도
@@ -288,8 +313,14 @@ impl Session {
             if fed >= FEED_PER_PUMP_CAP {
                 break; // 나머지는 다음 tick에서
             }
-            match self.output.try_recv() {
-                Ok(chunk) => {
+            let next = if input_guard {
+                self.output.try_recv_up_to(FEED_PER_PUMP_CAP - fed)
+            } else {
+                self.output.try_recv().map(Some)
+            };
+            match next {
+                Ok(None) => break,
+                Ok(Some(chunk)) => {
                     fed += chunk.len();
                     on_output(&chunk);
                     // OSC 133 프롬프트 마크 스캔 (셸 통합 1단계) — 로그/감지와 같은
@@ -352,23 +383,32 @@ impl Session {
         //    (descendant가 slave 보유) 경우엔 grace tick 안에서 매 tick 계속 draining
         //    하다가 상한 초과 시 마감한다. pty는 마감 순간까지 유지해 draining을 막지 않는다.
         let mut just_exited = false;
+        let mut deferred_pty = None;
         if eof || self.child_dead {
             self.exit_wait_ticks += 1;
             let ready = eof && self.child_dead;
             if self.pty.is_some() && (ready || self.exit_wait_ticks >= EXIT_WAIT_TICK_CAP) {
-                self.pty = None; // 프로세스만 정리, backend(scrollback)는 유지
+                let retired = self.pty.take(); // 입력 경로를 즉시 닫고 backend는 유지
+                if input_guard {
+                    deferred_pty = retired;
+                } else {
+                    drop(retired);
+                }
                 self.lifecycle = SessionLifecycle::Exited {
                     exit_code: self.exit_code,
                 };
                 just_exited = true;
             }
         }
-        PumpResult {
-            dirty: self.dirty,
-            produced_output: fed > 0,
-            output_bytes: fed,
-            just_exited,
-        }
+        (
+            PumpResult {
+                dirty: self.dirty,
+                produced_output: fed > 0,
+                output_bytes: fed,
+                just_exited,
+            },
+            deferred_pty,
+        )
     }
 
     /// snapshot을 만들고 (성공 시에만) dirty를 지운다. 호출 시점은 호출측이 결정 —
@@ -379,6 +419,15 @@ impl Session {
         snapshot.dirty_ranges = self.take_dirty_ranges(snapshot.cols, snapshot.rows);
         self.dirty = false;
         Some(snapshot)
+    }
+
+    /// One admission-time viewport read; does not consume dirty ranges or publish hidden panes.
+    pub fn input_guard_snapshot(&self) -> Option<TerminalViewportSnapshot> {
+        self.backend.viewport_snapshot()
+    }
+
+    pub fn foreground_process_group(&self) -> Option<u32> {
+        self.pty.as_ref()?.foreground_process_group()
     }
 
     pub fn bracketed_paste(&self) -> bool {
@@ -494,6 +543,17 @@ impl Session {
             }
         }
         None
+    }
+
+    pub fn write_input_batch(&mut self, parts: &[&[u8]]) -> Option<PtyInputEnqueueResult> {
+        let pty = self.pty.as_mut()?;
+        match pty.write_input_batch(parts) {
+            Ok(result) => Some(result),
+            Err(error) => {
+                tracing::warn!(%error, "PTY input batch failed");
+                None
+            }
+        }
     }
 
     pub fn resize_checked(&mut self, cols: u16, rows: u16) -> Result<ResizeApplied, ResizeError> {
@@ -1177,6 +1237,54 @@ mod tests {
             session.lifecycle(),
             SessionLifecycle::Exited { exit_code: Some(0) }
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pr13_guard_detaches_exited_writer_before_deferred_drop() {
+        let spec = CommandSpec {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), r"printf '\033[?2004hfinal'".into()],
+            env: Vec::new(),
+            cwd: None,
+        };
+        let mut session =
+            Session::spawn_with_spec(SessionId(34), SessionKind::Shell, &spec, 80, 24, 100)
+                .unwrap();
+        let mut retired = None;
+        let mut output_bytes = 0;
+        wait(Duration::from_secs(5), || {
+            let (result, teardown) =
+                session.pump_for_input_guard(|chunk| output_bytes += chunk.len());
+            if result.just_exited {
+                retired = teardown;
+                Some(())
+            } else {
+                assert!(teardown.is_none());
+                None
+            }
+        });
+        assert!(
+            retired.is_some(),
+            "real exited PTY remains owned until finish"
+        );
+        assert_eq!(
+            session.lifecycle(),
+            SessionLifecycle::Exited { exit_code: Some(0) }
+        );
+        assert!(
+            session.bracketed_paste(),
+            "DEC-only admission can still see mode on"
+        );
+        assert!(output_bytes > 0);
+        assert_eq!(session.foreground_process_group(), None);
+        assert_eq!(session.write_input(b"must-not-send"), None);
+        assert_eq!(session.write_input_batch(&[b"body", b"\r"]), None);
+        let (next, teardown) =
+            session.pump_for_input_guard(|_| panic!("exited session fed output"));
+        assert_eq!(next.output_bytes, 0);
+        assert!(!next.just_exited && teardown.is_none());
+        drop(retired);
     }
 
     #[test]

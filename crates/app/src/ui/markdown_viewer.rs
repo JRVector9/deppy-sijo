@@ -10,14 +10,18 @@
 //! - `egui_commonmark::CommonMarkViewer`/`CommonMarkCache`는 이 파일 밖으로 나가지
 //!   않는다. 공개 타입은 [`MarkdownViewer`], [`MarkdownViewerContext`],
 //!   [`MarkdownLinkIntent`], [`MarkdownDocumentSlot`], [`MarkdownSourceRevision`]뿐이다.
-//! - 로컬 이미지는 [`show`](MarkdownViewer::show) 안에서 워크스페이스 루트 밖 탈출을
-//!   막고 나서 직접 읽는다(§7.2) — 이건 App host의 intent 왕복 없이 leaf가 소유하는
-//!   "렌더에 필요한 바이트 읽기"이지, "다른 문서를 연다"류의 탐색 액션이 아니다.
+//! - 로컬 PNG는 App 소유 bounded worker가 검증·읽기·디코드한다. show는 요청과
+//!   완료된 Arc 이미지로만 렌더하며 파일 I/O를 수행하지 않는다.
 //! - 링크 클릭·상대 `.md` 문서 열기처럼 **탐색을 일으키는 동작**은 절대 여기서
 //!   처리하지 않는다. `show`는 클릭된 링크의 [`MarkdownLinkIntent`]만 돌려주고,
 //!   실제로 브라우저를 열거나 다른 문서를 로드하는 일은 호출부(App host) 몫이다.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use crate::markdown_image_io::{self, ImageOutcome, ImageRequest, ImageWorker, LoadedImage};
+#[cfg(test)]
+use crate::markdown_image_io::{ImageRejection, MAX_IMAGE_DIMENSION_PX, MAX_IMAGE_ENCODED_BYTES};
 
 use egui_commonmark::{Alert, AlertBundle, CommonMarkCache, CommonMarkViewer};
 
@@ -64,15 +68,6 @@ const PAGE_ITEM_SPACING_Y: f32 = 14.0;
 /// 재캐시를 트리거하지 않는다(§6.4 WidthBucket).
 const CONTENT_WIDTH_BUCKET_PX: f32 = 40.0;
 
-// ── 로컬 이미지 broker 상한 (§7.2) ──────────────────────────────────────────
-/// 인코딩된 PNG 바이트 상한 — 문서 탭 설계 §6의 8 MiB Refuse 티어와 같은 기준을
-/// 재사용한다(별도 숫자를 새로 정의하지 않는다).
-const MAX_IMAGE_ENCODED_BYTES: u64 = 8 * 1024 * 1024;
-/// 디코드된 한 변 상한(px) — 가늘고 긴 픽셀폭탄 PNG(예: 1×500000)을 차단한다.
-const MAX_IMAGE_DIMENSION_PX: u32 = 6000;
-/// 디코드된 총 픽셀 수 상한 — RGBA 기준 대략 64MB 텍스처로 수렴한다.
-const MAX_IMAGE_PIXELS: u64 = 16_000_000;
-
 /// 문서 탭 하나를 식별하는 opaque 슬롯. 실제 `DocumentId`(문서 I/O 쪽 소유)와의
 /// 결합은 tab 배선 몫이라 여기서는 호출부가 안정적으로 배정하는 `u64`로만 다룬다 —
 /// 이 leaf는 다른 진행 중인 작업(`document_io.rs`)의 타입에 의존하지 않는다.
@@ -87,7 +82,7 @@ pub struct MarkdownSourceRevision(pub u64);
 pub struct MarkdownViewerContext<'a> {
     /// 문서 탭 식별자 — 캐시 키와 이미지 broker 세대 계산에 쓴다.
     pub slot: MarkdownDocumentSlot,
-    /// source 리비전 — 바뀌면 scrollable 캐시와 이미지 등록을 다시 만든다.
+    /// source 리비전 — 스크롤/참조 캐시를 갱신하되 변경 없는 이미지는 재사용한다.
     pub revision: MarkdownSourceRevision,
     /// 워크스페이스 루트(canonical 여부는 broker가 스스로 보장한다) — 로컬 이미지가
     /// 이 밖으로 나가지 못하게 막는 경계.
@@ -128,75 +123,19 @@ fn scroll_source_id(slot: MarkdownDocumentSlot) -> egui::Id {
     egui::Id::new(("markdown_viewer_vertical", slot.0))
 }
 
-/// 로컬 PNG 이미지 검증 실패 사유. 등록을 생략하는 이유일 뿐 — 실패해도 렌더는
-/// 멈추지 않는다(§7.2: "decode 실패는 page 안 placeholder로 표시하고 render를
-/// 중단하지 않는다"). egui가 loader 없음으로 처리해 알아서 실패 placeholder를 그린다.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ImageRejection {
-    AbsolutePath,
-    WrongExtension,
-    OutsideWorkspace,
-    NotARegularFile,
-    TooLarge,
-    ReadFailed,
-    DecodeRejected,
+#[cfg(test)]
+fn validate_and_read(root: &Path, base: &Path, relative: &str) -> Result<Vec<u8>, ImageRejection> {
+    markdown_image_io::validate_and_read_with_hook(root, base, relative, || {})
 }
 
-/// 워크스페이스 루트 밖 파일을 로컬 이미지로 읽지 않는다(§7.2, 이 PR의 최우선 테스트
-/// 대상). 허용 조건: 스킴 없는 상대경로 + `.png` 확장자 + canonicalize 후 워크스페이스
-/// 루트 안 + 일반 파일 + 인코딩 바이트 상한 + 디코드 치수/픽셀수 상한.
-///
-/// `canonicalize`는 symlink 체인을 전부 실제 경로로 풀어주므로 `../..` 탈출과
-/// symlink 탈출을 같은 검사(`starts_with`)로 동시에 막는다 — app.rs의
-/// `run_file_tree_listing`이 파일 트리 사이드바에 쓰는 것과 같은 패턴이다.
-fn validate_and_read(
-    workspace_root: &Path,
-    base_directory: &Path,
+#[cfg(test)]
+fn validate_and_read_with_hook(
+    root: &Path,
+    base: &Path,
     relative: &str,
+    hook: impl FnOnce(),
 ) -> Result<Vec<u8>, ImageRejection> {
-    let candidate = Path::new(relative);
-    if candidate.is_absolute() {
-        return Err(ImageRejection::AbsolutePath);
-    }
-    let has_png_extension = candidate
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("png"));
-    if !has_png_extension {
-        return Err(ImageRejection::WrongExtension);
-    }
-    let canonical_root =
-        std::fs::canonicalize(workspace_root).map_err(|_| ImageRejection::OutsideWorkspace)?;
-    let joined = base_directory.join(candidate);
-    let canonical_target =
-        std::fs::canonicalize(&joined).map_err(|_| ImageRejection::OutsideWorkspace)?;
-    if !canonical_target.starts_with(&canonical_root) {
-        return Err(ImageRejection::OutsideWorkspace);
-    }
-    let metadata = std::fs::metadata(&canonical_target).map_err(|_| ImageRejection::ReadFailed)?;
-    if !metadata.is_file() {
-        // 심볼릭 링크 자체는 canonicalize가 이미 실제 파일로 풀었으므로 여기 남는
-        // is_file() == false는 디렉터리·소켓·FIFO 같은 special file이다.
-        return Err(ImageRejection::NotARegularFile);
-    }
-    if metadata.len() > MAX_IMAGE_ENCODED_BYTES {
-        return Err(ImageRejection::TooLarge);
-    }
-    let bytes = std::fs::read(&canonical_target).map_err(|_| ImageRejection::ReadFailed)?;
-    let (width, height) = image::ImageReader::new(std::io::Cursor::new(bytes.as_slice()))
-        .with_guessed_format()
-        .map_err(|_| ImageRejection::DecodeRejected)?
-        .into_dimensions()
-        .map_err(|_| ImageRejection::DecodeRejected)?;
-    if width == 0
-        || height == 0
-        || width > MAX_IMAGE_DIMENSION_PX
-        || height > MAX_IMAGE_DIMENSION_PX
-        || u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS
-    {
-        return Err(ImageRejection::DecodeRejected);
-    }
-    Ok(bytes)
+    markdown_image_io::validate_and_read_with_hook(root, base, relative, hook)
 }
 
 /// egui_commonmark가 `enable_scroll_to_heading(true)`일 때 켜는 것과 같은
@@ -234,7 +173,13 @@ fn extract_destinations(source: &str) -> (Vec<String>, Vec<String>) {
                 // 범위에서 로드하지 않는다(§7.2). default_implicit_uri_scheme
                 // 접두사도 스킴이 있는 dest에는 붙지 않으므로 등록해 봐야 URI가
                 // 어긋나 의미가 없다.
-                if !dest.contains("://") && !dest.starts_with("data:") {
+                if !dest.contains("://")
+                    && !dest.starts_with("data:")
+                    && image_refs.len() < markdown_image_io::MAX_DOCUMENT_IMAGES
+                    && image_refs.iter().map(String::len).sum::<usize>() + dest.len()
+                        <= markdown_image_io::MAX_REQUEST_PATH_BYTES
+                    && !image_refs.contains(&dest)
+                {
                     image_refs.push(dest);
                 }
             }
@@ -386,15 +331,72 @@ fn apply_page_style(ui: &mut egui::Ui) {
     style.visuals.extreme_bg_color = code_surface;
 }
 
-/// 워크스페이스 루트 밖 파일을 읽지 않는 로컬 PNG broker(§7.2). `MarkdownViewer`가
-/// 소유하며 밖으로 나가지 않는다.
-///
-/// 세대(`slot`+`revision`) 단위로 한 번만 스캔한다 — 같은 세대에서 다시 `sync`를
-/// 호출해도(매 프레임 호출된다) 파일을 다시 읽거나 재검증하지 않는다. 세대가
-/// 바뀌면 이전에 등록한 이미지를 `forget_image`로 지우고 다시 스캔한다.
+/// Predecoded images: rendering only clones an Arc, never reads/decodes files.
+#[derive(Default)]
+struct MarkdownDecodedLoader {
+    images: Mutex<std::collections::HashMap<String, Arc<egui::ColorImage>>>,
+}
+
+impl egui::load::ImageLoader for MarkdownDecodedLoader {
+    fn id(&self) -> &str {
+        "deppy-markdown-decoded"
+    }
+    fn load(
+        &self,
+        _: &egui::Context,
+        uri: &str,
+        _: egui::load::SizeHint,
+    ) -> egui::load::ImageLoadResult {
+        if !uri.starts_with("deppy-image://") {
+            return Err(egui::load::LoadError::NotSupported);
+        }
+        self.images
+            .lock()
+            .unwrap()
+            .get(uri)
+            .cloned()
+            .map(|image| egui::load::ImagePoll::Ready { image })
+            .ok_or_else(|| egui::load::LoadError::Loading("Local image unavailable".into()))
+    }
+    fn forget(&self, uri: &str) {
+        self.images.lock().unwrap().remove(uri);
+    }
+    fn forget_all(&self) {
+        self.images.lock().unwrap().clear();
+    }
+    fn byte_size(&self) -> usize {
+        self.images
+            .lock()
+            .unwrap()
+            .values()
+            .map(|image| image.pixels.len() * 4)
+            .sum()
+    }
+}
+
+fn decoded_loader(ctx: &egui::Context) -> Arc<MarkdownDecodedLoader> {
+    let key = egui::Id::new("deppy-markdown-decoded-loader");
+    if let Some(loader) = ctx.data(|data| data.get_temp::<Arc<MarkdownDecodedLoader>>(key)) {
+        return loader;
+    }
+    let loader = Arc::new(MarkdownDecodedLoader::default());
+    ctx.add_image_loader(loader.clone());
+    ctx.data_mut(|data| data.insert_temp(key, loader.clone()));
+    loader
+}
+
+/// One active document working set; one coalesced request plus at most one
+/// outstanding worker request/result. Pending jobs borrow the bounded Arc set.
 struct WorkspaceImageBroker {
     registered_uris: Vec<String>,
     last_generation: Option<(u64, u64)>,
+    roots: Option<(PathBuf, PathBuf)>,
+    images: Vec<(String, Arc<LoadedImage>)>,
+    expected: Option<(u64, u64, u64)>,
+    pending: Option<ImageRequest>,
+    inflight: Option<(u64, u64, u64)>,
+    token: u64,
+    refresh_at: std::time::Instant,
 }
 
 impl WorkspaceImageBroker {
@@ -402,13 +404,23 @@ impl WorkspaceImageBroker {
         Self {
             registered_uris: Vec::new(),
             last_generation: None,
+            roots: None,
+            images: Vec::new(),
+            expected: None,
+            pending: None,
+            inflight: None,
+            token: 0,
+            refresh_at: std::time::Instant::now(),
         }
     }
 
-    /// `default_implicit_uri_scheme`에 넘길 접두사를 돌려준다. 이 접두사가 있어야
-    /// CommonMarkViewer가 스킴 없는 상대경로에 `deppy-image://<세대>/`를 붙여
-    /// broker가 등록한 것과 같은 URI를 만든다. Viewer에는 canonical 절대경로가 아니라
-    /// 이 세대-스코프 URI만 전달된다(§7.2).
+    fn clear_images(&mut self, ctx: &egui::Context) {
+        for uri in self.registered_uris.drain(..) {
+            ctx.forget_image(&uri);
+        }
+        self.images.clear();
+    }
+
     fn sync(
         &mut self,
         ctx: &egui::Context,
@@ -416,28 +428,168 @@ impl WorkspaceImageBroker {
         view: &MarkdownViewerContext<'_>,
     ) -> String {
         let generation = (view.slot.0, view.revision.0);
-        let prefix = format!("deppy-image://{}-{}/", view.slot.0, view.revision.0);
-        if self.last_generation == Some(generation) {
+        let prefix = format!("deppy-image://{}/", view.slot.0);
+        let roots_changed = self
+            .roots
+            .as_ref()
+            .is_none_or(|(root, base)| root != view.workspace_root || base != view.base_directory);
+        let changed = self.last_generation != Some(generation) || roots_changed;
+        let now = std::time::Instant::now();
+        if !changed && (self.inflight.is_some() || self.pending.is_some()) {
+            // The worker wakes on completion. An expired refresh deadline must
+            // not become an immediate repaint loop while I/O is still running.
             return prefix;
         }
-        for uri in self.registered_uris.drain(..) {
-            ctx.forget_image(&uri);
+        if !changed && now < self.refresh_at {
+            if !image_refs.is_empty() {
+                ctx.request_repaint_after(self.refresh_at.saturating_duration_since(now));
+            }
+            return prefix;
+        }
+        if roots_changed || self.last_generation.is_some_and(|old| old.0 != view.slot.0) {
+            self.clear_images(ctx);
         }
         self.last_generation = Some(generation);
-        for relative in image_refs {
-            let uri = format!("{prefix}{relative}");
-            if self.registered_uris.contains(&uri) {
-                continue; // 같은 세대에서 같은 이미지가 여러 번 참조돼도 한 번만 읽는다.
+        self.roots = Some((
+            view.workspace_root.to_owned(),
+            view.base_directory.to_owned(),
+        ));
+        let mut refs = Vec::new();
+        let mut total = 0;
+        for name in image_refs {
+            if refs.contains(name) {
+                continue;
             }
-            if let Ok(bytes) = validate_and_read(view.workspace_root, view.base_directory, relative)
+            if refs.len() >= markdown_image_io::MAX_DOCUMENT_IMAGES
+                || total + name.len() > markdown_image_io::MAX_REQUEST_PATH_BYTES
             {
-                ctx.include_bytes(uri.clone(), bytes);
-                self.registered_uris.push(uri);
+                break;
             }
-            // 실패 시 아무것도 등록하지 않는다 — egui가 loader 없음으로 처리해 알아서
-            // 실패 placeholder를 그린다(§7.2, render를 중단하지 않는다).
+            total += name.len();
+            refs.push(name.clone());
+        }
+        self.images.retain(|(name, _)| {
+            if refs.contains(name) {
+                true
+            } else {
+                ctx.forget_image(&format!("{prefix}{name}"));
+                false
+            }
+        });
+        self.registered_uris = self
+            .images
+            .iter()
+            .map(|(name, _)| format!("{prefix}{name}"))
+            .collect();
+        self.token = self.token.wrapping_add(1);
+        self.expected = Some((generation.0, generation.1, self.token));
+        self.pending = if refs.is_empty() {
+            None
+        } else {
+            Some(ImageRequest {
+                token: self.token,
+                slot: generation.0,
+                revision: generation.1,
+                root: view.workspace_root.to_owned(),
+                base: view.base_directory.to_owned(),
+                refs,
+                previous: self.images.clone(),
+            })
+        };
+        self.refresh_at = now + std::time::Duration::from_secs(2);
+        if self.pending.is_some() {
+            // One wake to admit the coalesced request on the next logic tick.
+            ctx.request_repaint();
+            ctx.request_repaint_after(std::time::Duration::from_secs(2));
         }
         prefix
+    }
+
+    fn apply(
+        &mut self,
+        ctx: &egui::Context,
+        outcome: ImageOutcome,
+        current: Option<(u64, u64)>,
+    ) -> bool {
+        if self.expected != Some((outcome.slot, outcome.revision, outcome.token))
+            || current != Some((outcome.slot, outcome.revision))
+        {
+            return false;
+        }
+        let prefix = format!("deppy-image://{}/", outcome.slot);
+        let loader = decoded_loader(ctx);
+        let mut changed = false;
+        for (name, old) in &self.images {
+            if !outcome
+                .images
+                .iter()
+                .any(|(next, image)| next == name && Arc::ptr_eq(old, image))
+            {
+                ctx.forget_image(&format!("{prefix}{name}"));
+                changed = true;
+            }
+        }
+        for (name, image) in &outcome.images {
+            let uri = format!("{prefix}{name}");
+            let retained = loader.images.lock().unwrap().contains_key(&uri);
+            if !retained
+                || !self
+                    .images
+                    .iter()
+                    .any(|(old, previous)| old == name && Arc::ptr_eq(previous, image))
+            {
+                // A rejected placeholder may have been cached before completion.
+                ctx.forget_image(&uri);
+                ctx.include_bytes(uri.clone(), image.encoded.clone());
+                loader
+                    .images
+                    .lock()
+                    .unwrap()
+                    .insert(uri, image.decoded.clone());
+                changed = true;
+            }
+        }
+        self.registered_uris = outcome
+            .images
+            .iter()
+            .map(|(name, _)| format!("{prefix}{name}"))
+            .collect();
+        self.images = outcome.images;
+        self.refresh_at = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        changed
+    }
+
+    fn poll(
+        &mut self,
+        ctx: &egui::Context,
+        worker: &mut ImageWorker,
+        current: Option<(u64, u64)>,
+    ) -> bool {
+        let mut changed = false;
+        if let Some(outcome) = worker.try_recv() {
+            self.inflight = None;
+            if let Ok(outcome) = outcome.into_result() {
+                changed = self.apply(ctx, outcome, current);
+            }
+        }
+        if self.inflight.is_none()
+            && let Some(job) = self.pending.take()
+        {
+            let key = (job.slot, job.revision, job.token);
+            if current == Some((job.slot, job.revision)) && self.expected == Some(key) {
+                match worker.try_request(job) {
+                    Ok(()) => self.inflight = Some(key),
+                    Err(crate::lazy_worker::LazyWorkerSubmitError::Full(job)) => {
+                        self.pending = Some(job)
+                    }
+                    Err(crate::lazy_worker::LazyWorkerSubmitError::Unavailable { .. }) => {
+                        self.refresh_at =
+                            std::time::Instant::now() + std::time::Duration::from_secs(2);
+                    }
+                }
+            }
+        }
+        changed
     }
 
     fn forget_document(&mut self, ctx: &egui::Context, slot: MarkdownDocumentSlot) {
@@ -447,10 +599,12 @@ impl WorkspaceImageBroker {
         {
             return;
         }
-        for uri in self.registered_uris.drain(..) {
-            ctx.forget_image(&uri);
-        }
+        self.clear_images(ctx);
         self.last_generation = None;
+        self.roots = None;
+        self.expected = None;
+        self.pending = None;
+        // The outstanding worker may finish; poll drops its invalidated result.
     }
 }
 
@@ -519,6 +673,27 @@ impl MarkdownViewer {
         }
     }
 
+    /// App logic drains image work, checking the original slot/revision against
+    /// current document state before including any bytes/texture resources.
+    pub(crate) fn poll_images(
+        &mut self,
+        ctx: &egui::Context,
+        worker: &mut ImageWorker,
+        current: Option<(MarkdownDocumentSlot, MarkdownSourceRevision)>,
+    ) {
+        if self.image_broker.poll(
+            ctx,
+            worker,
+            current.map(|(slot, revision)| (slot.0, revision.0)),
+        ) {
+            if let Some(key) = self.scroll_key.take() {
+                self.cache
+                    .clear_scrollable_with_id(scroll_source_id(MarkdownDocumentSlot(key.slot)));
+            }
+            ctx.request_repaint();
+        }
+    }
+
     /// `source`를 읽기 좋은 문서 페이지로 그린다. 클릭된 링크가 있으면 intent를
     /// 돌려준다 — 파일을 열거나 URL을 여는 건 호출부 몫이다.
     pub fn show(
@@ -530,6 +705,7 @@ impl MarkdownViewer {
         // "file"/"http" feature를 켜지 않았으므로 이 호출은 PNG 디코드 loader만
         // 설치한다(§7.1) — 켤 때마다 새로 설치하지 않고 이미 있으면 건너뛴다.
         egui_extras::install_image_loaders(ui.ctx());
+        decoded_loader(ui.ctx());
 
         // 소스가 그대로면 다시 파싱하지 않는다(위 `destinations_key` 참고).
         let destinations_key = (view.slot.0, view.revision.0);
@@ -645,6 +821,31 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    fn sync_images(
+        broker: &mut WorkspaceImageBroker,
+        ctx: &egui::Context,
+        refs: &[String],
+        view: &MarkdownViewerContext<'_>,
+    ) {
+        broker.sync(ctx, refs, view);
+        if let Some(job) = broker.pending.take() {
+            broker.apply(
+                ctx,
+                markdown_image_io::load_images(job),
+                Some((view.slot.0, view.revision.0)),
+            );
+        }
+    }
+
+    fn settle_viewer(viewer: &mut MarkdownViewer, ctx: &egui::Context) {
+        if let Some(job) = viewer.image_broker.pending.take() {
+            let current = Some((job.slot, job.revision));
+            viewer
+                .image_broker
+                .apply(ctx, markdown_image_io::load_images(job), current);
+        }
+    }
+
     fn write_png(path: &Path, width: u32, height: u32) {
         let image = image::RgbaImage::from_pixel(width, height, image::Rgba([10, 20, 30, 255]));
         image.save(path).expect("테스트 PNG 저장 실패");
@@ -663,6 +864,432 @@ mod tests {
         // macOS의 /tmp는 /private/tmp 심볼릭 링크라 canonicalize로 대칭을 맞춘다
         // (file_tree.rs 테스트와 같은 관례).
         base.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn pr6_file_growth_after_stat_cannot_bypass_encoded_limit() {
+        let workspace = temp_dir("growth-race");
+        let path = workspace.join("a.png");
+        write_png(&path, 4, 4);
+        let result = validate_and_read_with_hook(&workspace, &workspace, "a.png", || {
+            let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.set_len(MAX_IMAGE_ENCODED_BYTES + 1).unwrap();
+        });
+        assert!(
+            matches!(result, Err(ImageRejection::TooLarge)),
+            "growth must be refused"
+        );
+    }
+
+    #[test]
+    fn pr6_text_revision_reuses_unchanged_image_uri() {
+        let workspace = temp_dir("text-revision-reuse");
+        write_png(&workspace.join("a.png"), 4, 4);
+        let ctx = egui::Context::default();
+        let mut broker = WorkspaceImageBroker::new();
+        let refs = vec!["a.png".to_owned()];
+        sync_images(
+            &mut broker,
+            &ctx,
+            &refs,
+            &MarkdownViewerContext {
+                slot: MarkdownDocumentSlot(1),
+                revision: MarkdownSourceRevision(1),
+                workspace_root: &workspace,
+                base_directory: &workspace,
+            },
+        );
+        let first = broker.images[0].1.clone();
+        let uri = broker.registered_uris[0].clone();
+        let texture = ctx
+            .try_load_texture(
+                &uri,
+                egui::TextureOptions::default(),
+                egui::load::SizeHint::default(),
+            )
+            .unwrap();
+        sync_images(
+            &mut broker,
+            &ctx,
+            &refs,
+            &MarkdownViewerContext {
+                slot: MarkdownDocumentSlot(1),
+                revision: MarkdownSourceRevision(2),
+                workspace_root: &workspace,
+                base_directory: &workspace,
+            },
+        );
+        assert_eq!(broker.registered_uris, vec![uri.clone()]);
+        assert!(
+            Arc::ptr_eq(&first, &broker.images[0].1),
+            "text-only edit must not read/decode unchanged file bytes again"
+        );
+        let next = ctx
+            .try_load_texture(
+                &uri,
+                egui::TextureOptions::default(),
+                egui::load::SizeHint::default(),
+            )
+            .unwrap();
+        let (
+            egui::load::TexturePoll::Ready { texture: first },
+            egui::load::TexturePoll::Ready { texture: second },
+        ) = (texture, next)
+        else {
+            panic!("texture must be ready")
+        };
+        assert_eq!(
+            first.id, second.id,
+            "unchanged image texture must never be forgotten/recreated"
+        );
+    }
+
+    #[test]
+    fn pr6_fifty_images_cannot_exceed_document_pixel_budget() {
+        let workspace = temp_dir("fifty-images");
+        let mut refs = Vec::new();
+        for index in 0..50 {
+            let name = format!("image-{index}.png");
+            write_png(&workspace.join(&name), 1000, 1000);
+            refs.push(name);
+        }
+        let ctx = egui::Context::default();
+        let mut broker = WorkspaceImageBroker::new();
+        sync_images(
+            &mut broker,
+            &ctx,
+            &refs,
+            &MarkdownViewerContext {
+                slot: MarkdownDocumentSlot(1),
+                revision: MarkdownSourceRevision(1),
+                workspace_root: &workspace,
+                base_directory: &workspace,
+            },
+        );
+        assert_eq!(
+            broker.registered_uris.len(),
+            8,
+            "50 valid images must load8 within the budget, not silently reject all"
+        );
+        assert_eq!(
+            broker
+                .images
+                .iter()
+                .map(|(_, image)| image.pixels)
+                .sum::<u64>(),
+            8_000_000
+        );
+        assert!(
+            broker
+                .images
+                .iter()
+                .map(|(_, image)| image.encoded.len())
+                .sum::<usize>()
+                <= markdown_image_io::MAX_DOCUMENT_ENCODED_BYTES as usize
+        );
+    }
+
+    #[test]
+    fn pr6_encoded_budget_includes_reused_images() {
+        let workspace = temp_dir("encoded-budget");
+        let refs: Vec<_> = (0..4).map(|index| format!("a{index}.png")).collect();
+        for name in &refs {
+            let path = workspace.join(name);
+            write_png(&path, 4, 4);
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_len(5 * 1024 * 1024)
+                .unwrap();
+        }
+        let ctx = egui::Context::default();
+        let mut broker = WorkspaceImageBroker::new();
+        for revision in [1, 2] {
+            sync_images(
+                &mut broker,
+                &ctx,
+                &refs,
+                &MarkdownViewerContext {
+                    slot: MarkdownDocumentSlot(1),
+                    revision: MarkdownSourceRevision(revision),
+                    workspace_root: &workspace,
+                    base_directory: &workspace,
+                },
+            );
+            assert_eq!(broker.images.len(), 3);
+            assert_eq!(
+                broker
+                    .images
+                    .iter()
+                    .map(|(_, image)| image.encoded.len())
+                    .sum::<usize>(),
+                15 * 1024 * 1024
+            );
+        }
+    }
+
+    #[test]
+    fn pr6_asset_change_same_document_revision_replaces_decoded_and_texture() {
+        let workspace = temp_dir("asset-change");
+        let path = workspace.join("a.png");
+        write_png(&path, 4, 4);
+        let ctx = egui::Context::default();
+        let refs = vec!["a.png".to_owned()];
+        let view = MarkdownViewerContext {
+            slot: MarkdownDocumentSlot(1),
+            revision: MarkdownSourceRevision(1),
+            workspace_root: &workspace,
+            base_directory: &workspace,
+        };
+        let mut broker = WorkspaceImageBroker::new();
+        sync_images(&mut broker, &ctx, &refs, &view);
+        let previous = broker.images[0].1.clone();
+        let uri = broker.registered_uris[0].clone();
+        let texture = ctx
+            .try_load_texture(
+                &uri,
+                egui::TextureOptions::default(),
+                egui::load::SizeHint::default(),
+            )
+            .unwrap();
+        write_png(&workspace.join("replacement.png"), 8, 8);
+        std::fs::rename(workspace.join("replacement.png"), path).unwrap();
+        broker.refresh_at = std::time::Instant::now();
+        sync_images(&mut broker, &ctx, &refs, &view);
+        assert!(!Arc::ptr_eq(&previous, &broker.images[0].1));
+        assert_eq!(broker.images[0].1.decoded.size, [8, 8]);
+        assert_eq!(broker.registered_uris, vec![uri.clone()]);
+        let next = ctx
+            .try_load_texture(
+                &uri,
+                egui::TextureOptions::default(),
+                egui::load::SizeHint::default(),
+            )
+            .unwrap();
+        let (
+            egui::load::TexturePoll::Ready { texture: first },
+            egui::load::TexturePoll::Ready { texture: second },
+        ) = (texture, next)
+        else {
+            panic!("texture must be ready")
+        };
+        assert_ne!(first.id, second.id);
+    }
+
+    #[test]
+    fn pr6_loader_eviction_reinstates_unchanged_arcs_without_redecode() {
+        let workspace = temp_dir("loader-eviction");
+        write_png(&workspace.join("a.png"), 4, 4);
+        let ctx = egui::Context::default();
+        let refs = vec!["a.png".to_owned()];
+        let view = MarkdownViewerContext {
+            slot: MarkdownDocumentSlot(1),
+            revision: MarkdownSourceRevision(1),
+            workspace_root: &workspace,
+            base_directory: &workspace,
+        };
+        let mut broker = WorkspaceImageBroker::new();
+        sync_images(&mut broker, &ctx, &refs, &view);
+        let old = broker.images[0].1.clone();
+        let uri = broker.registered_uris[0].clone();
+        ctx.forget_all_images();
+        assert!(
+            ctx.try_load_image(&uri, egui::load::SizeHint::default())
+                .is_err()
+        );
+        broker.refresh_at = std::time::Instant::now();
+        sync_images(&mut broker, &ctx, &refs, &view);
+        assert!(Arc::ptr_eq(&old, &broker.images[0].1));
+        assert!(ctx.try_load_bytes(&uri).is_ok());
+        assert!(
+            ctx.try_load_image(&uri, egui::load::SizeHint::default())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn pr6_newer_revision_rejects_old_completion_and_coalesces_pending() {
+        let workspace = temp_dir("stale-revision");
+        write_png(&workspace.join("a.png"), 4, 4);
+        write_png(&workspace.join("b.png"), 8, 8);
+        let ctx = egui::Context::default();
+        let mut broker = WorkspaceImageBroker::new();
+        broker.sync(
+            &ctx,
+            &["a.png".to_owned()],
+            &MarkdownViewerContext {
+                slot: MarkdownDocumentSlot(1),
+                revision: MarkdownSourceRevision(1),
+                workspace_root: &workspace,
+                base_directory: &workspace,
+            },
+        );
+        let first = broker.pending.take().unwrap();
+        for revision in 2..=100 {
+            broker.sync(
+                &ctx,
+                &["b.png".to_owned()],
+                &MarkdownViewerContext {
+                    slot: MarkdownDocumentSlot(1),
+                    revision: MarkdownSourceRevision(revision),
+                    workspace_root: &workspace,
+                    base_directory: &workspace,
+                },
+            );
+        }
+        let latest = broker.pending.take().unwrap();
+        assert_eq!(latest.revision, 100);
+        assert_eq!(latest.refs, vec!["b.png"]);
+        assert!(!broker.apply(&ctx, markdown_image_io::load_images(first), Some((1, 100))));
+        assert!(broker.registered_uris.is_empty());
+        assert!(broker.apply(&ctx, markdown_image_io::load_images(latest), Some((1, 100))));
+        assert_eq!(broker.images[0].0, "b.png");
+        assert_eq!(broker.images[0].1.decoded.size, [8, 8]);
+    }
+
+    #[test]
+    fn pr6_render_is_nonblocking_and_closed_document_drops_real_late_worker_result() {
+        let workspace = temp_dir("closed-late-worker");
+        write_png(&workspace.join("a.png"), 4, 4);
+        let ctx = egui::Context::default();
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let mut worker = ImageWorker::new(
+            "test-markdown-gated",
+            std::time::Duration::from_secs(1),
+            move || {
+                let release = release_rx.clone();
+                let started = started_tx.clone();
+                move |request| {
+                    started.send(()).unwrap();
+                    release.lock().unwrap().recv().unwrap();
+                    markdown_image_io::load_images(request)
+                }
+            },
+            || {},
+        );
+        struct Release(std::sync::mpsc::SyncSender<()>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                let _ = self.0.try_send(());
+            }
+        }
+        let release = Release(release_tx);
+        let mut viewer = MarkdownViewer::new();
+        let render = |viewer: &mut MarkdownViewer| {
+            ctx.run_ui(Default::default(), |ui| {
+                viewer.show(
+                    ui,
+                    "![a](a.png)",
+                    MarkdownViewerContext {
+                        slot: MarkdownDocumentSlot(1),
+                        revision: MarkdownSourceRevision(1),
+                        workspace_root: &workspace,
+                        base_directory: &workspace,
+                    },
+                );
+            })
+            .drop_without_applying_deltas();
+        };
+        render(&mut viewer);
+        assert!(
+            viewer.image_broker.images.is_empty(),
+            "render must not synchronously read/register/decode images"
+        );
+        let current = Some((MarkdownDocumentSlot(1), MarkdownSourceRevision(1)));
+        viewer.poll_images(&ctx, &mut worker, current);
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        // Render real UI repeatedly while the actual worker is held at a gate.
+        for _ in 0..10 {
+            render(&mut viewer);
+        }
+        assert!(viewer.image_broker.images.is_empty());
+        viewer.forget_document(&ctx, MarkdownDocumentSlot(1));
+        release.0.send(()).unwrap();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while viewer.image_broker.inflight.is_some() && std::time::Instant::now() < until {
+            viewer.poll_images(&ctx, &mut worker, None);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(viewer.image_broker.inflight.is_none());
+        assert!(
+            viewer.image_broker.images.is_empty() && viewer.image_broker.registered_uris.is_empty()
+        );
+        assert!(ctx.try_load_bytes("deppy-image://1/a.png").is_err());
+        assert!(
+            ctx.try_load_image("deppy-image://1/a.png", egui::load::SizeHint::default())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn pr6_completion_cannot_register_into_another_active_document() {
+        let workspace = temp_dir("wrong-slot");
+        write_png(&workspace.join("a.png"), 4, 4);
+        let ctx = egui::Context::default();
+        let mut broker = WorkspaceImageBroker::new();
+        broker.sync(
+            &ctx,
+            &["a.png".to_owned()],
+            &MarkdownViewerContext {
+                slot: MarkdownDocumentSlot(1),
+                revision: MarkdownSourceRevision(1),
+                workspace_root: &workspace,
+                base_directory: &workspace,
+            },
+        );
+        let outcome = markdown_image_io::load_images(broker.pending.take().unwrap());
+        assert!(!broker.apply(&ctx, outcome, Some((2, 1))));
+        assert!(broker.registered_uris.is_empty());
+        assert!(ctx.try_load_bytes("deppy-image://1/a.png").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pr6_path_replacement_after_validation_reads_only_the_validated_handle() {
+        let workspace = temp_dir("pinned-handle");
+        let outside = temp_dir("pinned-outside");
+        write_png(&workspace.join("a.png"), 4, 4);
+        write_png(&outside.join("secret.png"), 8, 8);
+        let expected = std::fs::read(workspace.join("a.png")).unwrap();
+        let result = validate_and_read_with_hook(&workspace, &workspace, "a.png", || {
+            std::fs::rename(workspace.join("a.png"), workspace.join("old.png")).unwrap();
+            std::os::unix::fs::symlink(outside.join("secret.png"), workspace.join("a.png"))
+                .unwrap();
+        });
+        match result {
+            Ok(bytes) => assert_eq!(bytes, expected, "only the pinned file may supply bytes"),
+            Err(ImageRejection::Changed) => {} // rename may update the pinned inode's ctime.
+            Err(other) => panic!("unexpected rejection: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pr6_closed_document_resources_release_decoded_and_encoded_arcs() {
+        let workspace = temp_dir("arc-release");
+        write_png(&workspace.join("a.png"), 4, 4);
+        let ctx = egui::Context::default();
+        let mut broker = WorkspaceImageBroker::new();
+        sync_images(
+            &mut broker,
+            &ctx,
+            &["a.png".to_owned()],
+            &MarkdownViewerContext {
+                slot: MarkdownDocumentSlot(1),
+                revision: MarkdownSourceRevision(1),
+                workspace_root: &workspace,
+                base_directory: &workspace,
+            },
+        );
+        let encoded = Arc::downgrade(&broker.images[0].1.encoded);
+        let decoded = Arc::downgrade(&broker.images[0].1.decoded);
+        broker.forget_document(&ctx, MarkdownDocumentSlot(1));
+        assert!(encoded.upgrade().is_none());
+        assert!(decoded.upgrade().is_none());
     }
 
     // ── ① 이미지 broker: 워크스페이스 밖 경로 거부 (가장 중요한 테스트) ──────────
@@ -762,10 +1389,10 @@ mod tests {
         assert_eq!(result, Err(ImageRejection::DecodeRejected));
     }
 
-    // ── ② broker 캐시: 세대가 같으면 다시 읽지 않는다 (되돌리면 실패) ───────────
+    // ── ② broker 캐시: refresh 간격 안에서는 다시 읽지 않는다 ───────────
 
     #[test]
-    fn broker는_같은_세대에서_다시_읽지_않는다() {
+    fn broker는_refresh_간격_안에서_파일을_다시_읽지_않는다() {
         let workspace = temp_dir("cache-generation");
         let doc_dir = workspace.join("docs");
         std::fs::create_dir_all(&doc_dir).unwrap();
@@ -780,18 +1407,18 @@ mod tests {
 
         let ctx = egui::Context::default();
         let mut broker = WorkspaceImageBroker::new();
-        broker.sync(&ctx, &image_refs, &view);
+        sync_images(&mut broker, &ctx, &image_refs, &view);
         assert_eq!(broker.registered_uris.len(), 1);
 
-        // 파일을 지운다 — 만약 두 번째 `sync`가 다시 검증/등록을 시도한다면 이제는
-        // 실패해서 등록 목록에서 빠질 것이다. 같은 세대에서는 재검증하지 않아야
-        // 등록이 그대로 남는다.
+        // refresh deadline 전에는 렌더를 반복해도 검증/읽기를 예약하지 않는다.
+        // deadline 뒤에는 같은 source revision이어도 삭제/교체를 확인한다.
+        broker.refresh_at = std::time::Instant::now() + std::time::Duration::from_secs(60);
         std::fs::remove_file(doc_dir.join("a.png")).unwrap();
-        broker.sync(&ctx, &image_refs, &view);
+        sync_images(&mut broker, &ctx, &image_refs, &view);
         assert_eq!(
             broker.registered_uris.len(),
             1,
-            "같은 (slot, revision)이면 파일이 사라져도 재검증하지 않아야 한다"
+            "refresh 간격 안에서는 파일이 사라져도 I/O를 다시 예약하지 않아야 한다"
         );
     }
 
@@ -806,7 +1433,8 @@ mod tests {
 
         let ctx = egui::Context::default();
         let mut broker = WorkspaceImageBroker::new();
-        broker.sync(
+        sync_images(
+            &mut broker,
             &ctx,
             &image_refs,
             &MarkdownViewerContext {
@@ -819,7 +1447,8 @@ mod tests {
         assert_eq!(broker.registered_uris.len(), 1);
 
         std::fs::remove_file(doc_dir.join("a.png")).unwrap();
-        broker.sync(
+        sync_images(
+            &mut broker,
             &ctx,
             &image_refs,
             &MarkdownViewerContext {
@@ -957,6 +1586,7 @@ mod tests {
             );
         })
         .drop_without_applying_deltas();
+        settle_viewer(&mut viewer, &ctx);
         let uri = viewer.image_broker.registered_uris[0].clone();
         let size_hint = egui::load::SizeHint::default();
         assert!(ctx.try_load_bytes(&uri).is_ok());
@@ -1000,6 +1630,7 @@ mod tests {
             );
         })
         .drop_without_applying_deltas();
+        settle_viewer(&mut viewer, &ctx);
         let uri = viewer.image_broker.registered_uris[0].clone();
         let scroll_key = viewer.scroll_key;
 

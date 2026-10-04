@@ -1401,3 +1401,31 @@ fleet.followup.list = 后续任务 ({count})
 fleet.followup.empty = 没有已安排的任务
 
 env.delete_source = 从哪个文件删除
+
+composer.delivery.persisting = 正在输入前保存…
+composer.delivery.pending = 正在确认输入接收…
+composer.delivery.rejected = 未发送；草稿已保留
+composer.delivery.unknown = 接收状态未知；重新发送前请检查原终端
+composer.delivery.allow_resend = 已检查；允许重发
+composer.delivery.accepted = 输入已接收；执行尚未确认
+
+prompt.persistence.saving = 正在保存…
+prompt.persistence.failed = 保存失败 · 更改仍保留在内存中
+prompt.persistence.recovery = 原文件已保留 · 自动保存已停用。修复文件后请重新打开应用
+prompt.persistence.limit_or_error = 超出限制或保存错误 · 更改未保存
+prompt.persistence.retry = 重试保存
+prompt.persistence.conflict = 文件已在外部更改 · 未保存的更改仍保留在内存中
+prompt.persistence.recovery_hint = 请备份当前更改并修复原文件，然后重新打开应用
+
+prompt.input_limit = 已达到输入限制。原文已保留，请缩短输入或模板参数。
+prompt.preview_truncated = 仅显示前16 KiB。插入时使用完整预览内容。
+fleet.followup.retained = 保留的预约任务：{count} 个
+fleet.followup.blocked = 取消会移除预约，并可阻止尚未被PTY接收的输入。已接收的输入无法撤回，结果未知的状态也无法由取消确认；不会自动重试。
+fleet.followup.admission_rejected = 无法预约任务。已保留填写的表单。请检查目标和限制，或取消受阻预约。
+
+composer.draft.limit = 草稿输入已达上限（每项1MiB、总计32MiB / 256项）。原文已保留。
+composer.draft.saving = 正在保存草稿…
+composer.draft.failed = 草稿未保存 · 文字保留在内存中
+composer.draft.recovery = 草稿需要恢复 · 输入框为只读
+composer.draft.recovery_hint = 请备份composer_drafts.json，恢复有效文件后重新打开应用。未保存文字保留在此窗口中。
+composer.draft.delivery_limit = 待确认发送已达上限（8MiB / 256项）。请在原会话中确认或删除；不会自动重发。

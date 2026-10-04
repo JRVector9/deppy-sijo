@@ -160,3 +160,7 @@ Deppy를 실행하거나 재실행하는 것은 별도 명시적 요청이 있�
 26–29 검증: `cargo test --offline --locked -q -p deppy-sijo --bin deppy-sijo document_popups -- --test-threads=1`. `popup_parity_render_document_popups -- --ignored --test-threads=1`은 실제 표시 함수의 PNG26–29를 생성한다. App 전체를 클릭하거나 실제 파일을 버리는 테스트는 아니다. `tab_strip`은 빈 클릭/비활성 초점/세션 없는 헤더/실제 세로선 paint를 검증한다.
 
 5건 회귀 수정 검증: `popup_review`는 연속 문서 focus, 첫 프레임 PTY/전역 키, 실제 검색·인라인 편집,5개 언어의280×360pt footer와 native UUID/worker 경로를 확인한다. Storage의 같은 필터는 미확인·다른 볼륨, 재마운트, 명시적 재연결, 무효화와 rollback을 검사한다. 전체 실행 결과는 최신 handoff/리뷰 보고서를 따른다.
+
+## Fleet 입력 상한 보정 (2026-10-04)
+
+사례18·19·20의 기존 Window 표시/맨 앞 창 Esc 계약을 유지한다. 다음 단계 예약은 일반 폰트4행 입력이며 UTF-8 본문16KiB, undo8개와 열 때 한 번만 고정 입력 ID를 초기화한다. 입력/템플릿 삽입 상한 거부와 호스트 예약 거부는 공용 Error notice로 안내하며 기존 폼을 보존한다. 호스트가 정확한 원래 대상의 예약을 받아들인 뒤에만 폼을 닫는다. 배치 시작은 확장 결과16KiB를 실제 Start 전에 확인하고, 브로드캐스트의1MiB 결과 상한은 유지한다. 이번 변경은 팝업 셸 이전이 아니다.

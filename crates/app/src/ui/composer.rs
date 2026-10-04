@@ -9,9 +9,15 @@
 //! 세션이며 실제 주입(WriteInput)은 app.rs가 한다 — 이 모듈은 leaf UI 경계를 지켜
 //! 런타임/저장소 구체 타입을 직접 만지지 않는다.
 
-use std::collections::HashMap;
+use super::text_input::{BoundedTextBuffer, forget_bounded_text_state, initialize_bounded_undo};
+use crate::composer_drafts::{
+    DRAFT_KEY_MAX_BYTES, DRAFT_MAX_ITEMS, DRAFT_METADATA_MAX_BYTES, DRAFT_TOTAL_MAX_BYTES,
+    DRAFT_WORKSPACE_MAX_BYTES, DraftRecord, DraftSnapshot,
+};
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use unicode_normalization::UnicodeNormalization;
 
@@ -24,6 +30,8 @@ use connector_contract::{ConnectorSnapshot, ServerId, ServerSummary, ToolPage};
 pub const COMPOSER_HISTORY_MAX_ITEMS: usize = 100;
 pub const COMPOSER_HISTORY_MAX_BYTES: usize = 1024 * 1024;
 pub const COMPOSER_PROMPT_MAX_BYTES: usize = 1024 * 1024;
+const COMPOSER_DELIVERY_MAX_ITEMS: usize = 256;
+const COMPOSER_DELIVERY_MAX_BYTES: usize = 8 * 1024 * 1024;
 /// JSON string escaping은 한 input byte를 최악 6 bytes(`\u00XX`)로 확장한다.
 pub const COMPOSER_HISTORY_FILE_MAX_BYTES: usize = COMPOSER_HISTORY_MAX_BYTES * 6 + 1024;
 /// 펼침 상태 텍스트 영역 상한(줄) — 넘으면 내부 스크롤.
@@ -56,7 +64,6 @@ const MCP_SERVER_LIST_HEIGHT: f32 = MCP_SERVER_ROW_HEIGHT * 4.0;
 const MCP_TOOL_ROW_HEIGHT: f32 = 28.0;
 const MCP_TOOL_LIST_HEIGHT: f32 = MCP_TOOL_ROW_HEIGHT * 6.0;
 const CONTEXT_FILE_PATH_MAX_BYTES: usize = 32 * 1024;
-const CONTEXT_FILE_WORKSPACE_MAX_BYTES: usize = 4 * 1024;
 pub const COMPOSER_ATTACHMENT_MAX_ITEMS: usize = 16;
 pub const COMPOSER_ATTACHMENT_MAX_BYTES: usize = 256 * 1024;
 
@@ -84,6 +91,8 @@ pub enum ComposerAction {
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct ComposerSubmission {
+    submission_id: u64,
+    required_draft_revision: u64,
     prompt: std::sync::Arc<str>,
     history: std::sync::Arc<[std::sync::Arc<str>]>,
 }
@@ -100,6 +109,9 @@ impl std::fmt::Debug for ComposerSubmission {
 }
 
 impl ComposerSubmission {
+    pub(crate) fn required_draft_revision(&self) -> u64 {
+        self.required_draft_revision
+    }
     #[cfg(test)]
     pub fn prompt(&self) -> &str {
         &self.prompt
@@ -110,8 +122,14 @@ impl ComposerSubmission {
         &self.history
     }
 
-    pub fn into_parts(self) -> (std::sync::Arc<str>, std::sync::Arc<[std::sync::Arc<str>]>) {
-        (self.prompt, self.history)
+    pub fn into_parts(
+        self,
+    ) -> (
+        std::sync::Arc<str>,
+        std::sync::Arc<[std::sync::Arc<str>]>,
+        u64,
+    ) {
+        (self.prompt, self.history, self.submission_id)
     }
 }
 
@@ -201,6 +219,9 @@ impl ContextFileRequest {
 /// 렌더에 필요한 프레임 데이터 (App이 채워 넘긴다 — 경계상 평면 값만).
 pub struct ComposerContext<'a> {
     pub workspace_id: &'a str,
+    /// Stable persisted terminal draft identity; host workspace/root remain separate.
+    pub draft_key: &'a str,
+    pub runtime_generation: u64,
     pub send_key: ComposerSendKey,
     /// 포커스된 터미널 세션이 있는가 — 없으면 전송을 막고 자리표시로 안내한다.
     pub can_send: bool,
@@ -234,6 +255,8 @@ struct ToolbarInput<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AttachTarget {
     workspace_id: String,
+    draft_key: String,
+    runtime_generation: u64,
     workspace_root: Option<PathBuf>,
     /// 시작 시점 커서에 **동기로 삽입해 둔** 플레이스홀더 토큰. 완료 시 문자열 치환으로
     /// 결과가 들어가므로, 변환 중 사용자가 타이핑/이동/전환해도 토큰이 텍스트와 함께
@@ -246,9 +269,40 @@ struct AttachTarget {
 }
 
 /// 하단 도크 컴포저 상태. App이 소유하고 매 프레임 `render`를 호출한다.
+/// PTY queue admission only; it never represents AI execution or completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptAdmissionOutcome {
+    Accepted,
+    Rejected,
+    Unknown,
+}
+
+#[derive(Clone)]
+struct ComposerDelivery {
+    submission_id: u64,
+    generation: u64,
+    workspace_id: String,
+    prompt: std::sync::Arc<str>,
+    outcome: Option<PromptAdmissionOutcome>,
+    awaiting_checkpoint: bool,
+}
+
 pub struct ComposerUi {
     /// 워크스페이스별 드래프트 — 전환해도 초안이 유지된다.
     buffers: HashMap<String, String>,
+    owners: HashMap<String, String>,
+    uncertain_drafts: HashSet<String>,
+    generations: HashMap<String, u64>,
+    cached_drafts: HashMap<String, DraftRecord>,
+    dirty_keys: HashSet<String>,
+    draft_revision: u64,
+    read_only: bool,
+    input_limited: bool,
+    delivery_limited: bool,
+    active_workspace_id: String,
+    active_generation: u64,
+    deliveries: HashMap<String, ComposerDelivery>,
+    submission_sequence: u64,
     /// 펼침 상태 — 포커스/⌘J로 열리고, ⌘J/바깥 클릭으로 접힌다.
     expanded: bool,
     /// ⌘J(전역 단축키) → 다음 렌더에서 펼침 + 포커스 요청.
@@ -302,6 +356,19 @@ impl ComposerUi {
     pub fn new(history_path: PathBuf) -> Self {
         Self {
             buffers: HashMap::new(),
+            owners: HashMap::new(),
+            uncertain_drafts: HashSet::new(),
+            generations: HashMap::new(),
+            cached_drafts: HashMap::new(),
+            dirty_keys: HashSet::new(),
+            draft_revision: 0,
+            read_only: false,
+            input_limited: false,
+            delivery_limited: false,
+            active_workspace_id: String::new(),
+            active_generation: 0,
+            deliveries: HashMap::new(),
+            submission_sequence: 0,
             expanded: false,
             focus_requested: false,
             history: load_history(&history_path).into(),
@@ -315,6 +382,340 @@ impl ComposerUi {
             mcp_selected_server: None,
             pending_context_file: None,
             context_file_seq: 0,
+        }
+    }
+
+    pub(crate) fn restore_drafts(&mut self, snapshot: DraftSnapshot) {
+        if !self.buffers.is_empty()
+            || !self.cached_drafts.is_empty()
+            || snapshot.validate().is_err()
+        {
+            self.input_limited = true;
+            return;
+        }
+        for draft in snapshot.drafts {
+            if draft.delivery_uncertain {
+                self.uncertain_drafts.insert(draft.key.clone());
+            }
+            self.buffers
+                .insert(draft.key.clone(), draft.text.to_string());
+            self.owners
+                .insert(draft.key.clone(), draft.workspace_id.clone());
+            self.cached_drafts.insert(draft.key.clone(), draft);
+        }
+    }
+    pub(crate) fn draft_revision(&self) -> u64 {
+        self.draft_revision
+    }
+    pub(crate) fn active_draft_key(&self) -> &str {
+        self.last_workspace.as_deref().unwrap_or("")
+    }
+    pub(crate) fn set_read_only(&mut self, read_only: bool) {
+        self.read_only = read_only;
+        if read_only {
+            self.focus_requested = false;
+            self.pending_surrender = None;
+        }
+    }
+    fn mark_dirty(&mut self, key: &str) {
+        if self.buffers.get(key).is_none_or(|text| text.is_empty())
+            && !self.uncertain_drafts.contains(key)
+            && self.last_workspace.as_deref() != Some(key)
+        {
+            self.owners.remove(key);
+        } else if !self.owners.contains_key(key) {
+            let owner = if let Some(delivery) = self.deliveries.get(key) {
+                delivery.workspace_id.clone()
+            } else if self.last_workspace.as_deref() == Some(key)
+                && !self.active_workspace_id.is_empty()
+            {
+                self.active_workspace_id.clone()
+            } else {
+                key.to_owned()
+            };
+            self.owners.insert(key.to_owned(), owner);
+        }
+        self.dirty_keys.insert(key.to_owned());
+        self.draft_revision = self
+            .draft_revision
+            .checked_add(1)
+            .expect("draft revision exhausted");
+    }
+    pub(crate) fn checkpoint(&mut self) -> Arc<DraftSnapshot> {
+        for key in self.dirty_keys.drain() {
+            if let Some(buffer) = self.buffers.get_mut(&key) {
+                compact_draft_buffer(buffer);
+            }
+            let uncertain = self.uncertain_drafts.contains(&key);
+            let text = self.buffers.get(&key).map(String::as_str).unwrap_or("");
+            if text.is_empty() && !uncertain {
+                self.buffers.remove(&key);
+                self.cached_drafts.remove(&key);
+                self.owners.remove(&key);
+                if !self.deliveries.contains_key(&key) {
+                    self.generations.remove(&key);
+                }
+                self.pending_caret.remove(&key);
+                continue;
+            }
+            // Only owned asynchronous placeholders are omitted: they cannot finish after restart.
+            let targets = [
+                self.pending_attachment.as_ref().map(|r| &r.target),
+                self.pending_context_file.as_ref().map(|r| &r.target),
+            ];
+            let mut body = None;
+            for target in targets
+                .into_iter()
+                .flatten()
+                .filter(|target| target.draft_key == key)
+            {
+                let current = body.as_deref().unwrap_or(text);
+                if let Some((pattern, start)) =
+                    find_token_pattern(current, &target.token, "", target.padding)
+                {
+                    let mut stripped = current.to_owned();
+                    stripped.replace_range(start..start + pattern.len(), "");
+                    body = Some(stripped);
+                }
+            }
+            let text: Arc<str> = body.map_or_else(|| Arc::from(text), Arc::from);
+            self.cached_drafts.insert(
+                key.clone(),
+                DraftRecord {
+                    key: key.clone(),
+                    workspace_id: self
+                        .owners
+                        .get(&key)
+                        .cloned()
+                        .unwrap_or_else(|| key.clone()),
+                    delivery_uncertain: uncertain,
+                    text,
+                },
+            );
+        }
+        Arc::new(DraftSnapshot {
+            drafts: self.cached_drafts.values().cloned().collect(),
+        })
+    }
+    fn max_bytes_for(&self, key: &str) -> usize {
+        if self.read_only || key.is_empty() || key.len() > DRAFT_KEY_MAX_BYTES {
+            return self.buffers.get(key).map_or(0, String::len);
+        }
+        let owner = self.owners.get(key).map(String::as_str).unwrap_or_else(|| {
+            if self.active_workspace_id.is_empty() {
+                key
+            } else {
+                &self.active_workspace_id
+            }
+        });
+        let metadata = self
+            .owners
+            .iter()
+            .filter(|(stored, _)| stored.as_str() != key)
+            .map(|(stored, owner)| stored.len() + owner.len())
+            .sum::<usize>();
+        if owner.is_empty()
+            || owner.len() > DRAFT_WORKSPACE_MAX_BYTES
+            || metadata + key.len() + owner.len() > DRAFT_METADATA_MAX_BYTES
+            || (!self.owners.contains_key(key) && self.owners.len() >= DRAFT_MAX_ITEMS)
+        {
+            return 0;
+        }
+        let others = self
+            .buffers
+            .iter()
+            .filter(|(stored, _)| stored.as_str() != key)
+            .map(|(_, text)| text.len())
+            .sum::<usize>();
+        COMPOSER_PROMPT_MAX_BYTES.min(DRAFT_TOTAL_MAX_BYTES.saturating_sub(others))
+    }
+    fn insert_bounded(
+        &mut self,
+        buffer: &mut String,
+        cursor: Option<usize>,
+        text: &str,
+    ) -> Option<InsertedSnippet> {
+        let key = self.last_workspace.clone().unwrap_or_default();
+        let max = if key.is_empty() {
+            COMPOSER_PROMPT_MAX_BYTES
+        } else {
+            self.max_bytes_for(&key)
+        };
+        // Compute exact boundary padding before constructing a piece.
+        let byte = cursor
+            .and_then(|position| buffer.char_indices().nth(position).map(|(i, _)| i))
+            .unwrap_or(buffer.len());
+        let leading = buffer[..byte]
+            .chars()
+            .next_back()
+            .is_some_and(|c| !c.is_whitespace());
+        let trailing = buffer[byte..]
+            .chars()
+            .next()
+            .is_some_and(|c| !c.is_whitespace());
+        if self.read_only
+            || buffer
+                .len()
+                .saturating_add(text.len())
+                .saturating_add(usize::from(leading) + usize::from(trailing))
+                > max
+        {
+            self.input_limited = true;
+            return None;
+        }
+        let inserted = insert_snippet(buffer, cursor, text);
+        if !key.is_empty() {
+            self.mark_dirty(&key)
+        }
+        Some(inserted)
+    }
+    fn prepend_bounded_model(&mut self, buffer: &mut String, model: &str) -> bool {
+        let key = self.last_workspace.clone().unwrap_or_default();
+        let max = if key.is_empty() {
+            COMPOSER_PROMPT_MAX_BYTES
+        } else {
+            self.max_bytes_for(&key)
+        };
+        if self.read_only || buffer.len().saturating_add(8).saturating_add(model.len()) > max {
+            self.input_limited = true;
+            return false;
+        }
+        prepend_model_command(buffer, model);
+        if !key.is_empty() {
+            self.mark_dirty(&key)
+        }
+        true
+    }
+    fn replace_bounded(&mut self, buffer: &mut String, text: &str) -> bool {
+        let key = self.last_workspace.clone().unwrap_or_default();
+        let max = if key.is_empty() {
+            COMPOSER_PROMPT_MAX_BYTES
+        } else {
+            self.max_bytes_for(&key)
+        };
+        if self.read_only || text.len() > max {
+            self.input_limited = true;
+            return false;
+        }
+        if buffer != text {
+            *buffer = text.to_owned();
+            if !key.is_empty() {
+                self.mark_dirty(&key)
+            }
+        }
+        true
+    }
+    fn target_current(&self, target: &AttachTarget) -> bool {
+        self.generations
+            .get(&target.draft_key)
+            .copied()
+            .unwrap_or(0)
+            == target.runtime_generation
+    }
+    fn bind_context(&mut self, egui_ctx: &egui::Context, ctx: &ComposerContext<'_>) {
+        if self
+            .generations
+            .get(ctx.draft_key)
+            .is_some_and(|generation| *generation != ctx.runtime_generation)
+        {
+            self.cancel_requests_for(egui_ctx, ctx.draft_key);
+            if let Some(delivery) = self.deliveries.get_mut(ctx.draft_key)
+                && delivery.outcome.is_none()
+            {
+                delivery.outcome = Some(PromptAdmissionOutcome::Unknown);
+            }
+        }
+        self.active_workspace_id = ctx.workspace_id.to_owned();
+        self.active_generation = ctx.runtime_generation;
+        self.sync_workspace(egui_ctx, ctx.draft_key);
+        if self
+            .buffers
+            .get(ctx.draft_key)
+            .is_some_and(|text| !text.is_empty())
+            || self.deliveries.contains_key(ctx.draft_key)
+        {
+            self.generations
+                .insert(ctx.draft_key.to_owned(), ctx.runtime_generation);
+            if !self.owners.contains_key(ctx.draft_key) && self.max_bytes_for(ctx.draft_key) > 0 {
+                self.owners
+                    .insert(ctx.draft_key.to_owned(), ctx.workspace_id.to_owned());
+            }
+        }
+    }
+    fn cancel_requests_for(&mut self, egui_ctx: &egui::Context, key: &str) {
+        let mut targets = Vec::with_capacity(2);
+        if self
+            .pending_attachment
+            .as_ref()
+            .is_some_and(|r| r.target.draft_key == key)
+        {
+            targets.push(self.pending_attachment.take().unwrap().target)
+        }
+        if self
+            .pending_context_file
+            .as_ref()
+            .is_some_and(|r| r.target.draft_key == key)
+        {
+            targets.push(self.pending_context_file.take().unwrap().target)
+        }
+        let active = self.last_workspace.clone().unwrap_or_default();
+        for target in targets {
+            let mut buffer = self.buffers.remove(&active).unwrap_or_default();
+            self.resolve_attach(egui_ctx, &target, "", &active, &mut buffer);
+            if !buffer.is_empty() || self.owners.contains_key(&active) {
+                self.buffers.insert(active.clone(), buffer);
+            }
+        }
+    }
+    /// Runtime retirement cancels continuations but retains restorable text.
+    pub(crate) fn retire_generation(&mut self, egui_ctx: &egui::Context, generation: u64) {
+        let keys = self
+            .generations
+            .iter()
+            .filter(|(_, value)| **value == generation)
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in keys {
+            self.cancel_requests_for(egui_ctx, &key);
+            if let Some(delivery) = self.deliveries.get_mut(&key)
+                && delivery.outcome.is_none()
+            {
+                delivery.outcome = Some(PromptAdmissionOutcome::Unknown);
+            }
+            self.generations.remove(&key);
+        }
+    }
+    /// Called only after an admitted explicit permanent close is absent from authoritative mux.
+    pub(crate) fn delete_draft(&mut self, egui_ctx: &egui::Context, key: &str) {
+        self.cancel_requests_for(egui_ctx, key);
+        let existed = self.buffers.remove(key).is_some()
+            || self.cached_drafts.contains_key(key)
+            || self.uncertain_drafts.contains(key);
+        self.uncertain_drafts.remove(key);
+        self.deliveries.remove(key);
+        self.owners.remove(key);
+        self.generations.remove(key);
+        self.pending_caret.remove(key);
+        if existed {
+            self.mark_dirty(key);
+            self.owners.remove(key);
+        }
+    }
+    pub(crate) fn delete_workspace_drafts(&mut self, egui_ctx: &egui::Context, workspace_id: &str) {
+        let keys = self
+            .owners
+            .iter()
+            .filter(|(_, owner)| owner.as_str() == workspace_id)
+            .map(|(key, _)| key.clone())
+            .chain(
+                self.deliveries
+                    .iter()
+                    .filter(|(_, delivery)| delivery.workspace_id == workspace_id)
+                    .map(|(key, _)| key.clone()),
+            )
+            .collect::<HashSet<_>>();
+        for key in keys {
+            self.delete_draft(egui_ctx, &key)
         }
     }
 
@@ -335,7 +736,9 @@ impl ComposerUi {
         selected_path: Option<PathBuf>,
         active_workspace: &str,
     ) -> bool {
-        if self.pending_context_file.as_ref() != Some(&request) {
+        if self.pending_context_file.as_ref() != Some(&request)
+            || !self.target_current(&request.target)
+        {
             return false;
         }
         self.pending_context_file = None;
@@ -345,7 +748,7 @@ impl ComposerUi {
             .map_or_else(String::new, |path| {
                 mention_path(request.target.workspace_root.as_deref(), &path)
             });
-        if request.target.workspace_id == active_workspace {
+        if request.target.draft_key == active_workspace {
             let Some(mut active_buffer) = self.buffers.remove(active_workspace) else {
                 return false;
             };
@@ -383,11 +786,30 @@ impl ComposerUi {
     /// 프롬프트 라이브러리 팔레트가 고른 텍스트를 활성 워크스페이스의 컴포저 버퍼에
     /// 삽입한다(끝에 경계 공백 보정). 실제 전송은 기존 Send 경로(사용자 검토 후)가 한다.
     pub fn insert_text(&mut self, active_workspace: &str, text: &str) {
-        let buffer = self.buffers.entry(active_workspace.to_owned()).or_default();
-        let inserted = insert_snippet(buffer, None, text);
-        // 삽입 조각 끝으로 캐럿을 예약한다(post-show 경로 — 툴바 삽입과 동일 규칙).
-        // 안 하면 egui TextEditState 캐럿이 이전 위치에 남아, 이어 입력이 엉뚱한 곳에
-        // 들어간다(PR-2 리뷰 High).
+        if text.is_empty() {
+            return;
+        }
+        let mut buffer = self.buffers.remove(active_workspace).unwrap_or_default();
+        let max = self.max_bytes_for(active_workspace);
+        if self.read_only
+            || buffer
+                .len()
+                .saturating_add(text.len())
+                .saturating_add(usize::from(
+                    !buffer.is_empty() && !buffer.ends_with(char::is_whitespace),
+                ))
+                > max
+        {
+            self.input_limited = true;
+            if !buffer.is_empty() {
+                self.buffers.insert(active_workspace.to_owned(), buffer);
+            }
+            return;
+        }
+        let inserted = insert_snippet(&mut buffer, None, text);
+        compact_draft_buffer(&mut buffer);
+        self.buffers.insert(active_workspace.to_owned(), buffer);
+        self.mark_dirty(active_workspace);
         self.pending_cursor = Some(inserted.cursor);
         self.request_focus();
     }
@@ -402,14 +824,16 @@ impl ComposerUi {
         payload: Option<ClipboardAttachmentPayload>,
         active_workspace: &str,
     ) -> bool {
-        if self.pending_attachment.as_ref() != Some(&request) {
+        if self.pending_attachment.as_ref() != Some(&request)
+            || !self.target_current(&request.target)
+        {
             return false;
         }
         self.pending_attachment = None;
         let replacement = payload.map_or_else(String::new, |payload| {
             joined_mentions(request.target.workspace_root.as_deref(), &payload.paths)
         });
-        if request.target.workspace_id == active_workspace {
+        if request.target.draft_key == active_workspace {
             let Some(mut active_buffer) = self.buffers.remove(active_workspace) else {
                 return false;
             };
@@ -437,7 +861,8 @@ impl ComposerUi {
 
     /// 컴포저 TextEdit의 egui Id — 워크스페이스별 상태(커서 등) 분리.
     fn text_id(workspace_id: &str) -> egui::Id {
-        egui::Id::new(("composer_text", workspace_id))
+        let _ = workspace_id;
+        egui::Id::new("composer_text_active")
     }
 
     pub fn render(
@@ -446,10 +871,13 @@ impl ComposerUi {
         catalog: &i18n::Catalog,
         ctx: &ComposerContext<'_>,
     ) -> Option<ComposerAction> {
-        // 버퍼를 잠시 꺼내 self 차용 충돌 없이 다룬다 — 렌더 끝에 반드시 되돌린다.
-        let mut buffer = self.buffers.remove(ctx.workspace_id).unwrap_or_default();
+        self.bind_context(ui.ctx(), ctx);
+        let mut buffer = self.buffers.remove(ctx.draft_key).unwrap_or_default();
         let action = self.render_inner(ui, catalog, ctx, &mut buffer);
-        self.buffers.insert(ctx.workspace_id.to_owned(), buffer);
+        compact_draft_buffer(&mut buffer);
+        if !buffer.is_empty() || self.owners.contains_key(ctx.draft_key) {
+            self.buffers.insert(ctx.draft_key.to_owned(), buffer);
+        }
         action
     }
 
@@ -461,10 +889,10 @@ impl ComposerUi {
         buffer: &mut String,
     ) -> Option<ComposerAction> {
         let egui_ctx = ui.ctx().clone();
-        let text_id = Self::text_id(ctx.workspace_id);
+        let text_id = Self::text_id(ctx.draft_key);
         // 워크스페이스 전환 감지 — 히스토리 탐색 위치/커서 예약은 이전 워크스페이스
         // 문맥이므로 리셋한다(드래프트는 워크스페이스별 맵이 이미 분리 — codex P3).
-        self.sync_workspace(&egui_ctx, ctx.workspace_id);
+        self.sync_workspace(&egui_ctx, ctx.draft_key);
         // 지연된 포커스 반납(접힘 단축키 — pending_surrender 필드 주석 참조). 새 입력
         // 프레임(time 증가) **이면서 접힘 키가 릴리스된 뒤**에만 반납한다 — 그때의
         // raw 이벤트에는 접힘 키(초타·repeat 모두)가 이미 없으므로 터미널로 새지 않는다.
@@ -473,6 +901,9 @@ impl ComposerUi {
         {
             self.pending_surrender = None;
             egui_ctx.memory_mut(|memory| memory.surrender_focus(id));
+        }
+        if self.read_only {
+            egui_ctx.memory_mut(|memory| memory.surrender_focus(text_id));
         }
         // 직전 프레임의 포커스 — 이번 프레임 TextEdit이 그려지기 전이라 memory가 그 값이다.
         let had_focus = egui_ctx.memory(|memory| memory.has_focus(text_id));
@@ -530,7 +961,7 @@ impl ComposerUi {
         // ── 전송 판정 (빈 내용/세션 없음이면 무시 — Enter는 이미 소비돼 개행도 안 된다) ──
         // 키 경유 전송은 TextEdit을 그리기 전에 처리해 비워진 버퍼가 이번 프레임에 보인다.
         if send_requested && action.is_none() {
-            action = self.try_submit(buffer, ctx.can_send, ctx.workspace_id);
+            action = self.try_submit(buffer, ctx.can_send, ctx.draft_key);
             send_requested = false;
         }
 
@@ -563,22 +994,59 @@ impl ComposerUi {
             }
         };
 
+        initialize_bounded_undo(&egui_ctx, text_id);
+        let max_bytes = self.max_bytes_for(ctx.draft_key);
+        let incoming = egui_ctx.input(|input| {
+            input
+                .events
+                .iter()
+                .map(|event| match event {
+                    egui::Event::Text(text)
+                    | egui::Event::Paste(text)
+                    | egui::Event::Ime(egui::ImeEvent::Commit(text)) => text.len(),
+                    egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }) => text.len(),
+                    egui::Event::Key {
+                        key: egui::Key::Enter | egui::Key::Tab,
+                        pressed: true,
+                        ..
+                    } => 1,
+                    _ => 0,
+                })
+                .fold(0usize, usize::saturating_add)
+        });
+        let undo=egui_ctx.input(|input|input.events.iter().any(|event|matches!(event,egui::Event::Key{key:egui::Key::Z|egui::Key::Y,pressed:true,modifiers,..} if modifiers.command)));
+        let may_receive = had_focus || egui_ctx.input(|input| input.pointer.any_pressed());
+        let backup = (may_receive && (incoming > max_bytes.saturating_sub(buffer.len()) || undo))
+            .then(|| buffer.clone());
+        let backup_state = backup
+            .as_ref()
+            .and_then(|_| egui::TextEdit::load_state(&egui_ctx, text_id));
+        let backup_undo = backup_state.as_ref().map(|state| state.undoer());
+        let mut rejected = false;
         let card = composer_frame(ui.visuals());
         let card_response = card.show(ui, |ui| {
+            if self.read_only {
+                ui.disable();
+            }
             let output = egui::ScrollArea::vertical()
                 .id_salt(text_id.with("scroll"))
                 .max_height(text_h)
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
-                    egui::TextEdit::multiline(buffer)
-                        .id(text_id)
-                        // 카드가 이미 배경/테두리를 그린다 — TextEdit 자체 프레임은 투명.
-                        .frame(egui::Frame::NONE)
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(target_rows)
-                        .hint_text(hint)
-                        .return_key(Some(return_key))
-                        .show(ui)
+                    egui::TextEdit::multiline(&mut BoundedTextBuffer {
+                        text: buffer,
+                        max_bytes,
+                        rejected: &mut rejected,
+                    })
+                    .interactive(!self.read_only)
+                    .id(text_id)
+                    // 카드가 이미 배경/테두리를 그린다 — TextEdit 자체 프레임은 투명.
+                    .frame(egui::Frame::NONE)
+                    .desired_width(f32::INFINITY)
+                    .desired_rows(target_rows)
+                    .hint_text(hint)
+                    .return_key(Some(return_key))
+                    .show(ui)
                 })
                 .inner;
             if self.expanded {
@@ -601,7 +1069,37 @@ impl ComposerUi {
             }
             output
         });
-        let output = card_response.inner;
+        let mut output = card_response.inner;
+        if rejected {
+            if let Some(backup) = backup {
+                *buffer = backup;
+            }
+            if let Some(mut state) = backup_state {
+                if let Some(undo) = backup_undo {
+                    state.set_undoer(undo);
+                }
+                state.clone().store(&egui_ctx, text_id);
+                output.state = state;
+            }
+            self.input_limited = true;
+        } else if output.response.changed() {
+            self.input_limited = false;
+            self.mark_dirty(ctx.draft_key);
+        }
+        if self.delivery_limited {
+            ui.label(
+                egui::RichText::new(catalog.t("composer.draft.delivery_limit", &[]))
+                    .color(ui.visuals().warn_fg_color)
+                    .size(11.0),
+            );
+        }
+        if self.input_limited {
+            ui.label(
+                egui::RichText::new(catalog.t("composer.draft.limit", &[]))
+                    .color(ui.visuals().warn_fg_color)
+                    .size(11.0),
+            );
+        }
 
         // recall/삽입 직후 커서를 예약된 위치로 — TextEdit이 상태를 저장한 **뒤에**
         // 버퍼를 바꾸는 경로(히스토리 recall·툴바/첨부 삽입)는 커서가 옛 위치(삽입
@@ -630,7 +1128,7 @@ impl ComposerUi {
 
         // 전송 버튼 경유 요청 — 키 경유와 같은 규칙(빈 내용/세션 없음 무시).
         if send_requested && action.is_none() {
-            action = self.try_submit(buffer, ctx.can_send, ctx.workspace_id);
+            action = self.try_submit(buffer, ctx.can_send, ctx.draft_key);
         }
         if action.is_some() {
             // 전송 후에도 포커스 유지 — 연속 프롬프트 작성(ChatGPT 관례).
@@ -666,30 +1164,220 @@ impl ComposerUi {
         action
     }
 
-    /// 전송 시도 — 빈 내용/세션 없음/limit 초과는 무시한다. 성공 시 bounded history
-    /// snapshot을 갱신하고 App-owned 전송+영속화 intent 하나로 반환한다.
-    fn try_submit(
+    /// Stage an immutable submission while retaining the original draft. History and
+    /// draft clearing settle only from the exact operation's actual PTY admission.
+    pub(crate) fn try_submit(
         &mut self,
-        buffer: &mut String,
+        buffer: &str,
         can_send: bool,
         workspace_id: &str,
     ) -> Option<ComposerAction> {
-        if !can_send
+        if self.read_only
+            || !can_send
+            || self.submission_blocked(workspace_id)
             || buffer.trim().is_empty()
             || buffer.len() > COMPOSER_PROMPT_MAX_BYTES
+            || buffer.len() > self.max_bytes_for(workspace_id)
             || self.attach_pending_in(workspace_id, buffer)
         {
             return None;
         }
-        let prompt: std::sync::Arc<str> = std::mem::take(buffer).into();
+        let owner = self
+            .owners
+            .get(workspace_id)
+            .map(String::as_str)
+            .unwrap_or_else(|| {
+                if self.active_workspace_id.is_empty() {
+                    workspace_id
+                } else {
+                    &self.active_workspace_id
+                }
+            });
+        if workspace_id.is_empty()
+            || workspace_id.len() > DRAFT_KEY_MAX_BYTES
+            || owner.len() > DRAFT_WORKSPACE_MAX_BYTES
+            || self
+                .deliveries
+                .iter()
+                .filter(|(key, _)| key.as_str() != workspace_id)
+                .map(|(key, delivery)| key.len() + delivery.workspace_id.len())
+                .sum::<usize>()
+                .saturating_add(workspace_id.len() + owner.len())
+                > DRAFT_METADATA_MAX_BYTES
+        {
+            self.delivery_limited = true;
+            return None;
+        }
+        let delivery_bytes = self
+            .deliveries
+            .iter()
+            .filter(|(key, _)| key.as_str() != workspace_id)
+            .map(|(_, delivery)| delivery.prompt.len())
+            .sum::<usize>();
+        if delivery_bytes.saturating_add(buffer.len()) > COMPOSER_DELIVERY_MAX_BYTES
+            || (!self.deliveries.contains_key(workspace_id)
+                && self.deliveries.len() >= COMPOSER_DELIVERY_MAX_ITEMS)
+        {
+            self.delivery_limited = true;
+            return None;
+        }
+        self.delivery_limited = false;
+        self.generations
+            .insert(workspace_id.to_owned(), self.active_generation);
+        self.submission_sequence = self.submission_sequence.checked_add(1)?;
+        let submission_id = self.submission_sequence;
+        // Retain the exact original until the runtime acknowledges its PTY reservation.
+        let prompt: std::sync::Arc<str> = buffer.into();
         let mut history = self.history.iter().cloned().collect::<Vec<_>>();
         push_history(&mut history, std::sync::Arc::clone(&prompt));
+        self.deliveries.insert(
+            workspace_id.to_owned(),
+            ComposerDelivery {
+                submission_id,
+                generation: self.active_generation,
+                workspace_id: owner.to_owned(),
+                prompt: std::sync::Arc::clone(&prompt),
+                outcome: None,
+                awaiting_checkpoint: true,
+            },
+        );
+        self.uncertain_drafts.insert(workspace_id.to_owned());
+        self.mark_dirty(workspace_id);
+        Some(ComposerAction::Send(ComposerSubmission {
+            submission_id,
+            required_draft_revision: self.draft_revision,
+            prompt,
+            history: history.into(),
+        }))
+    }
+
+    fn submission_blocked(&self, workspace_id: &str) -> bool {
+        self.uncertain_drafts.contains(workspace_id)
+            || self.deliveries.get(workspace_id).is_some_and(|delivery| {
+                delivery.outcome.is_none()
+                    || delivery.outcome == Some(PromptAdmissionOutcome::Unknown)
+            })
+    }
+
+    /// A queued host checkpoint is valid only for this still-pending original generation.
+    pub(crate) fn pending_submission_matches(
+        &self,
+        key: &str,
+        submission_id: u64,
+        prompt: &str,
+        generation: u64,
+    ) -> bool {
+        self.uncertain_drafts.contains(key)
+            && self.generations.get(key) == Some(&generation)
+            && self.deliveries.get(key).is_some_and(|delivery| {
+                delivery.submission_id == submission_id
+                    && delivery.generation == generation
+                    && delivery.prompt.as_ref() == prompt
+                    && delivery.outcome.is_none()
+            })
+    }
+
+    /// The host has not crossed the PTY queue boundary. An exact original-generation
+    /// rejection may therefore clear uncertainty even after that runtime retired; it
+    /// cannot settle a revived/replaced submission or erase the user's retained text.
+    pub(crate) fn reject_unqueued_submission(
+        &mut self,
+        key: &str,
+        submission_id: u64,
+        prompt: &str,
+        generation: u64,
+    ) {
+        if let Some(delivery) = self.deliveries.get_mut(key)
+            && delivery.submission_id == submission_id
+            && delivery.generation == generation
+            && delivery.prompt.as_ref() == prompt
+            && matches!(
+                delivery.outcome,
+                None | Some(PromptAdmissionOutcome::Unknown)
+            )
+        {
+            delivery.outcome = Some(PromptAdmissionOutcome::Rejected);
+            delivery.awaiting_checkpoint = false;
+            self.uncertain_drafts.remove(key);
+            self.mark_dirty(key);
+        }
+    }
+
+    pub(crate) fn mark_submission_dispatched(
+        &mut self,
+        key: &str,
+        submission_id: u64,
+        prompt: &str,
+        generation: u64,
+    ) {
+        if self.pending_submission_matches(key, submission_id, prompt, generation)
+            && let Some(delivery) = self.deliveries.get_mut(key)
+        {
+            delivery.awaiting_checkpoint = false;
+        }
+    }
+
+    /// Host rejection and runtime results settle only their original submitted snapshot.
+    /// Edits made while awaiting the acknowledgement remain untouched.
+    pub fn settle_submission(
+        &mut self,
+        workspace_id: &str,
+        submission_id: u64,
+        prompt: &str,
+        outcome: PromptAdmissionOutcome,
+    ) -> Option<std::sync::Arc<[std::sync::Arc<str>]>> {
+        let delivery = self.deliveries.get_mut(workspace_id)?;
+        if self.generations.get(workspace_id).copied().unwrap_or(0) != delivery.generation {
+            return None;
+        }
+        if delivery.submission_id != submission_id || delivery.prompt.as_ref() != prompt {
+            return None;
+        }
+        if outcome != PromptAdmissionOutcome::Accepted {
+            delivery.outcome = Some(outcome);
+            delivery.awaiting_checkpoint = false;
+            if outcome == PromptAdmissionOutcome::Unknown {
+                self.uncertain_drafts.insert(workspace_id.to_owned());
+            } else {
+                self.uncertain_drafts.remove(workspace_id);
+            }
+            self.mark_dirty(workspace_id);
+            return None;
+        }
+        delivery.outcome = Some(PromptAdmissionOutcome::Accepted);
+        delivery.awaiting_checkpoint = false;
+        delivery.prompt = std::sync::Arc::from("");
+        self.uncertain_drafts.remove(workspace_id);
+        self.mark_dirty(workspace_id);
+        if let Some(buffer) = self.buffers.get_mut(workspace_id)
+            && buffer == prompt
+        {
+            buffer.clear();
+            compact_draft_buffer(buffer);
+        }
+        let mut history = self.history.iter().cloned().collect::<Vec<_>>();
+        push_history(&mut history, std::sync::Arc::from(prompt));
         self.history = history.into();
         self.history_pos = None;
-        Some(ComposerAction::Send(ComposerSubmission {
-            prompt,
-            history: std::sync::Arc::clone(&self.history),
-        }))
+        Some(std::sync::Arc::clone(&self.history))
+    }
+
+    fn acknowledge_uncertain_delivery(&mut self, key: &str) {
+        if self
+            .deliveries
+            .get(key)
+            .is_some_and(|delivery| delivery.outcome.is_none())
+        {
+            return;
+        }
+        if self.uncertain_drafts.remove(key) {
+            if let Some(delivery) = self.deliveries.get_mut(key)
+                && delivery.outcome == Some(PromptAdmissionOutcome::Unknown)
+            {
+                delivery.outcome = Some(PromptAdmissionOutcome::Rejected);
+            }
+            self.mark_dirty(key);
+        }
     }
 
     /// 이 버퍼에 **진행 중 작업의 토큰**이 남아 있는가 — 이 상태로 전송하면 리터럴
@@ -698,9 +1386,9 @@ impl ComposerUi {
     /// 히스토리 recall로 토큰 없는 버퍼가 되면 전송이 자연 허용된다.
     fn attach_pending_in(&self, workspace_id: &str, buffer: &str) -> bool {
         self.pending_attachment.as_ref().is_some_and(|request| {
-            request.target.workspace_id == workspace_id && buffer.contains(&request.target.token)
+            request.target.draft_key == workspace_id && buffer.contains(&request.target.token)
         }) || self.pending_context_file.as_ref().is_some_and(|request| {
-            request.target.workspace_id == workspace_id && buffer.contains(&request.target.token)
+            request.target.draft_key == workspace_id && buffer.contains(&request.target.token)
         })
     }
 
@@ -730,7 +1418,10 @@ impl ComposerUi {
                 Some(pos) => pos - 1,
             };
             self.history_pos = Some(next);
-            *buffer = self.history[next].to_string();
+            let recalled = Arc::clone(&self.history[next]);
+            if !self.replace_bounded(buffer, &recalled) {
+                return;
+            }
             self.pending_cursor = Some(buffer.chars().count());
         }
         if browsing
@@ -740,13 +1431,20 @@ impl ComposerUi {
             match self.history_pos {
                 Some(pos) if pos + 1 < self.history.len() => {
                     self.history_pos = Some(pos + 1);
-                    *buffer = self.history[pos + 1].to_string();
+                    let recalled = Arc::clone(&self.history[pos + 1]);
+                    if !self.replace_bounded(buffer, &recalled) {
+                        return;
+                    }
                     self.pending_cursor = Some(buffer.chars().count());
                 }
                 _ => {
                     // 최신을 지나면 빈 드래프트로 복귀 — 탐색 종료.
                     self.history_pos = None;
-                    buffer.clear();
+                    if !buffer.is_empty() {
+                        buffer.clear();
+                        let key = self.last_workspace.clone().unwrap_or_default();
+                        self.mark_dirty(&key);
+                    }
                 }
             }
         }
@@ -759,6 +1457,15 @@ impl ComposerUi {
         if self.last_workspace.as_deref() == Some(workspace_id) {
             return;
         }
+        if let Some(old) = self.last_workspace.as_ref()
+            && (self.owners.contains_key(old)
+                || self.buffers.get(old).is_some_and(|text| !text.is_empty()))
+            && let Some(caret) = stored_char_range(egui_ctx, Self::text_id(old))
+        {
+            self.pending_caret.insert(old.clone(), caret);
+        }
+        forget_bounded_text_state(egui_ctx, Self::text_id(workspace_id));
+        initialize_bounded_undo(egui_ctx, Self::text_id(workspace_id));
         self.last_workspace = Some(workspace_id.to_owned());
         self.history_pos = None;
         self.pending_cursor = None;
@@ -796,7 +1503,7 @@ impl ComposerUi {
         if has_text_paste {
             return None;
         }
-        self.begin_attachment_request(egui_ctx, ctx.workspace_id, ctx.workspace_root, buffer)
+        self.begin_attachment_request(egui_ctx, ctx.draft_key, ctx.workspace_root, buffer)
             .map(ComposerAction::RequestClipboardAttachment)
     }
 
@@ -814,8 +1521,9 @@ impl ComposerUi {
         workspace_root: Option<&Path>,
         buffer: &mut String,
     ) -> Option<ClipboardAttachmentRequest> {
-        if workspace_id.is_empty()
-            || workspace_id.len() > CONTEXT_FILE_WORKSPACE_MAX_BYTES
+        if self.read_only
+            || workspace_id.is_empty()
+            || workspace_id.len() > DRAFT_KEY_MAX_BYTES
             || workspace_root.is_some_and(|root| {
                 root.as_os_str().as_encoded_bytes().len() > CONTEXT_FILE_PATH_MAX_BYTES
             })
@@ -833,7 +1541,7 @@ impl ComposerUi {
             .pending_cursor
             .take()
             .or_else(|| cursor_char_index(egui_ctx, Self::text_id(workspace_id)));
-        let inserted = insert_snippet(buffer, cursor, &token);
+        let inserted = self.insert_bounded(buffer, cursor, &token)?;
         // 토큰 삽입 캐럿도 show **전에** 즉시 저장한다(resolve_attach와 동일 원칙 —
         // codex P2 7차, 마지막 남은 post-show 예약 자리였다). 붙여넣기 제스처와 Text
         // 이벤트가 한 입력 프레임에 배치되면 예약으로는 그 프레임의 텍스트가 옛 캐럿
@@ -842,12 +1550,24 @@ impl ComposerUi {
         let request = ClipboardAttachmentRequest {
             request_id: self.attach_seq,
             target: AttachTarget {
-                workspace_id: workspace_id.to_owned(),
+                workspace_id: if self.active_workspace_id.is_empty() {
+                    workspace_id.to_owned()
+                } else {
+                    self.active_workspace_id.clone()
+                },
+                draft_key: workspace_id.to_owned(),
+                runtime_generation: self
+                    .generations
+                    .get(workspace_id)
+                    .copied()
+                    .unwrap_or(self.active_generation),
                 workspace_root: workspace_root.map(Path::to_path_buf),
                 token,
                 padding: (inserted.leading_space, inserted.trailing_space),
             },
         };
+        self.generations
+            .insert(workspace_id.to_owned(), request.target.runtime_generation);
         self.pending_attachment = Some(request.clone());
         Some(request)
     }
@@ -862,8 +1582,9 @@ impl ComposerUi {
         workspace_root: Option<&Path>,
         buffer: &mut String,
     ) -> Option<(ContextFileRequest, usize)> {
-        if workspace_id.is_empty()
-            || workspace_id.len() > CONTEXT_FILE_WORKSPACE_MAX_BYTES
+        if self.read_only
+            || workspace_id.is_empty()
+            || workspace_id.len() > DRAFT_KEY_MAX_BYTES
             || workspace_root.is_some_and(|root| {
                 root.as_os_str().as_encoded_bytes().len() > CONTEXT_FILE_PATH_MAX_BYTES
             })
@@ -880,16 +1601,28 @@ impl ComposerUi {
             .pending_cursor
             .take()
             .or_else(|| cursor_char_index(egui_ctx, Self::text_id(workspace_id)));
-        let inserted = insert_snippet(buffer, cursor, &token);
+        let inserted = self.insert_bounded(buffer, cursor, &token)?;
         let request = ContextFileRequest {
             request_id: self.context_file_seq,
             target: AttachTarget {
-                workspace_id: workspace_id.to_owned(),
+                workspace_id: if self.active_workspace_id.is_empty() {
+                    workspace_id.to_owned()
+                } else {
+                    self.active_workspace_id.clone()
+                },
+                draft_key: workspace_id.to_owned(),
+                runtime_generation: self
+                    .generations
+                    .get(workspace_id)
+                    .copied()
+                    .unwrap_or(self.active_generation),
                 workspace_root: workspace_root.map(Path::to_path_buf),
                 token,
                 padding: (inserted.leading_space, inserted.trailing_space),
             },
         };
+        self.generations
+            .insert(workspace_id.to_owned(), request.target.runtime_generation);
         self.pending_context_file = Some(request.clone());
         Some((request, inserted.cursor))
     }
@@ -911,11 +1644,36 @@ impl ComposerUi {
         active_workspace: &str,
         active_buffer: &mut String,
     ) -> bool {
-        let is_active = target.workspace_id == active_workspace;
+        let is_active = target.draft_key == active_workspace;
+        let max = self
+            .max_bytes_for(&target.draft_key)
+            .saturating_sub(if !is_active { active_buffer.len() } else { 0 });
+        let current = if is_active {
+            active_buffer.as_str()
+        } else {
+            self.buffers
+                .get(&target.draft_key)
+                .map(String::as_str)
+                .unwrap_or("")
+        };
+        let overflow = find_token_pattern(current, &target.token, replacement, target.padding)
+            .is_some_and(|(pattern, _)| {
+                current
+                    .len()
+                    .saturating_sub(pattern.len())
+                    .saturating_add(replacement.len())
+                    > max
+            });
+        let replacement = if overflow {
+            self.input_limited = true;
+            ""
+        } else {
+            replacement
+        };
         let replaced = {
             let draft = if is_active {
                 &mut *active_buffer
-            } else if let Some(draft) = self.buffers.get_mut(&target.workspace_id) {
+            } else if let Some(draft) = self.buffers.get_mut(&target.draft_key) {
                 draft
             } else {
                 return false; // 드래프트 자체가 사라짐(워크스페이스 소멸 등) — 폐기
@@ -927,16 +1685,18 @@ impl ComposerUi {
             };
             let replace_start = draft[..byte_start].chars().count();
             let pattern_chars = pattern.chars().count();
-            *draft = draft.replacen(&pattern, replacement, 1);
+            draft.replace_range(byte_start..byte_start + pattern.len(), replacement);
+            compact_draft_buffer(draft);
             (replace_start, pattern_chars)
         };
+        self.mark_dirty(&target.draft_key);
         let (replace_start, pattern_chars) = replaced;
         let replacement_chars = replacement.chars().count();
         let rebase = |endpoint: usize| {
             rebase_caret(endpoint, replace_start, pattern_chars, replacement_chars)
         };
         // 캐럿/선택 리베이스 — 대상 워크스페이스의 현재 상태를 읽어 델타 적용.
-        let ws_text_id = Self::text_id(&target.workspace_id);
+        let ws_text_id = Self::text_id(&target.draft_key);
         if is_active {
             // show **전에** TextEditState에 즉시 반영한다(codex P1) — 치환은 show 전에
             // 일어나므로 post-show 예약(pending_cursor)으로는 같은 프레임의 타이핑이
@@ -951,13 +1711,13 @@ impl ComposerUi {
                 // 남기면 토큰이 딴 곳이어도 사용자 선택이 풀린다(codex P2).
                 store_caret_range_now(egui_ctx, ws_text_id, rebase(primary), rebase(secondary));
             }
-        } else if let Some((primary, secondary)) = stored_char_range(egui_ctx, ws_text_id) {
+        } else if let Some(&(primary, secondary)) = self.pending_caret.get(&target.draft_key) {
             self.pending_caret.insert(
-                target.workspace_id.clone(),
+                target.draft_key.clone(),
                 (rebase(primary), rebase(secondary)),
             );
         }
-        true
+        !overflow
     }
 
     /// OS 파일 드롭 — 포인터가 도크 위에 있을 때만 받아 @멘션으로 삽입한다.
@@ -997,7 +1757,11 @@ impl ComposerUi {
             return;
         }
         // 여러 파일은 합쳐 1회 삽입(순서 보존 — 첨부 완료 치환과 동일 규칙).
-        let inserted = insert_snippet(buffer, None, &joined_mentions(workspace_root, &dropped));
+        let Some(inserted) =
+            self.insert_bounded(buffer, None, &joined_mentions(workspace_root, &dropped))
+        else {
+            return;
+        };
         // 드롭 처리는 post-show 캐럿 반영 **이후**에 돈다 — pending_cursor 예약은 다음
         // 프레임에나 적용돼 그 사이 타이핑이 낡은 캐럿을 쓰고 전환 시 유실된다(codex P2).
         // 첨부 완료(resolve_attach)와 같은 원칙으로 즉시 저장한다.
@@ -1036,7 +1800,7 @@ impl ComposerUi {
                 && may_emit_action
                 && let Some((request, cursor)) = self.begin_context_file_request(
                     egui_ctx,
-                    ctx.workspace_id,
+                    ctx.draft_key,
                     ctx.workspace_root,
                     buffer,
                 )
@@ -1059,8 +1823,9 @@ impl ComposerUi {
                     .on_hover_text(catalog.t("composer.model_hint", &[]));
                 egui::Popup::menu(&resp).show(|ui| {
                     for model in models {
-                        if ui.button(*model).clicked() {
-                            inserted_cursor = Some(prepend_model_command(buffer, model));
+                        if ui.button(*model).clicked() && self.prepend_bounded_model(buffer, model)
+                        {
+                            inserted_cursor = Some(format!("/model {model}\n").chars().count());
                         }
                     }
                 });
@@ -1075,15 +1840,51 @@ impl ComposerUi {
             }
             // 우측: 전송 버튼 + 전송 키 힌트. 첨부 변환 중(토큰 pending)엔 전송을 막고
             // 사유를 힌트로 보인다 — try_submit과 같은 조건(codex P1).
-            let attach_pending = self.attach_pending_in(ctx.workspace_id, buffer);
+            let attach_pending = self.attach_pending_in(ctx.draft_key, buffer);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let enabled = ctx.can_send && !buffer.trim().is_empty() && !attach_pending;
+                let enabled = ctx.can_send
+                    && !buffer.trim().is_empty()
+                    && !attach_pending
+                    && !self.submission_blocked(ctx.draft_key);
                 if ui
                     .add_enabled(enabled, egui::Button::new("↑").corner_radius(1))
                     .on_hover_text(catalog.t("composer.send", &[]))
                     .clicked()
                 {
                     send_clicked = true;
+                }
+                if let Some(delivery) = self.deliveries.get_mut(ctx.draft_key) {
+                    let key = match delivery.outcome {
+                        None if delivery.awaiting_checkpoint => "composer.delivery.persisting",
+                        None => "composer.delivery.pending",
+                        Some(PromptAdmissionOutcome::Rejected) => "composer.delivery.rejected",
+                        Some(PromptAdmissionOutcome::Unknown) => "composer.delivery.unknown",
+                        Some(PromptAdmissionOutcome::Accepted) => "composer.delivery.accepted",
+                    };
+                    ui.label(egui::RichText::new(catalog.t(key, &[])).size(11.0).weak());
+                    if delivery.outcome == Some(PromptAdmissionOutcome::Unknown)
+                        && ui
+                            .small_button(catalog.t("composer.delivery.allow_resend", &[]))
+                            .clicked()
+                    {
+                        // Explicit acknowledgement only. Never resend automatically.
+                        self.acknowledge_uncertain_delivery(ctx.draft_key);
+                    }
+                }
+                if !self.deliveries.contains_key(ctx.draft_key)
+                    && self.uncertain_drafts.contains(ctx.draft_key)
+                {
+                    ui.label(
+                        egui::RichText::new(catalog.t("composer.delivery.unknown", &[]))
+                            .size(11.0)
+                            .weak(),
+                    );
+                    if ui
+                        .small_button(catalog.t("composer.delivery.allow_resend", &[]))
+                        .clicked()
+                    {
+                        self.acknowledge_uncertain_delivery(ctx.draft_key);
+                    }
                 }
                 let hint_key = if attach_pending {
                     "composer.attach_pending"
@@ -1155,7 +1956,7 @@ impl ComposerUi {
             }
 
             egui::ScrollArea::vertical()
-                .id_salt(("composer_mcp_servers", ctx.workspace_id))
+                .id_salt(("composer_mcp_servers", ctx.draft_key))
                 .max_height(MCP_SERVER_LIST_HEIGHT)
                 .show_rows(ui, MCP_SERVER_ROW_HEIGHT, enabled_count, |ui, rows| {
                     for index in rows {
@@ -1204,7 +2005,7 @@ impl ComposerUi {
             egui::ScrollArea::vertical()
                 .id_salt((
                     "composer_mcp_tools",
-                    ctx.workspace_id,
+                    ctx.draft_key,
                     server.id.as_str(),
                     page.offset,
                 ))
@@ -1230,7 +2031,9 @@ impl ComposerUi {
                                     &[("tool", tool.name.as_str())],
                                 )
                             );
-                            *inserted_cursor = Some(insert_snippet(buffer, cursor, &phrase).cursor);
+                            if let Some(inserted) = self.insert_bounded(buffer, cursor, &phrase) {
+                                *inserted_cursor = Some(inserted.cursor);
+                            }
                         }
                     }
                 });
@@ -1258,6 +2061,16 @@ impl ComposerUi {
 
         self.mcp_selected_server = selected;
         request
+    }
+}
+
+/// Release erased text capacity and compact only substantially shrunken edits. Stable
+/// frames do not copy bodies; post-mutation capacity stays below max(2*len,64KiB).
+fn compact_draft_buffer(text: &mut String) {
+    if text.is_empty() {
+        *text = String::new();
+    } else if text.capacity() > text.len().saturating_mul(2).max(64 * 1024) {
+        *text = text.as_str().to_owned();
     }
 }
 
@@ -1727,6 +2540,15 @@ pub enum ComposerInputPlan {
     BracketedPaste { body: Vec<u8>, submit: Vec<u8> },
 }
 
+impl ComposerInputPlan {
+    pub fn into_parts(self) -> Vec<Vec<u8>> {
+        match self {
+            Self::Single(bytes) => vec![bytes],
+            Self::BracketedPaste { body, submit } => vec![body, submit],
+        }
+    }
+}
+
 /// 프로바이더/터미널 상태에 맞는 입력 계획을 만든다.
 ///
 /// - Codex로 감지됐거나 터미널이 DEC 2004를 켠 세션은 명시적 bracketed paste + 별도
@@ -1757,6 +2579,783 @@ pub fn plan_composer_input(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pr5_real_same_workspace_persisted_sessions_keep_independent_drafts() {
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, state: &mut (ComposerUi, String, ConnectorSnapshot)| {
+                state.0.render(
+                    ui,
+                    &catalog,
+                    &ComposerContext {
+                        workspace_id: TEST_WS,
+                        draft_key: &state.1,
+                        runtime_generation: 1,
+                        send_key: ComposerSendKey::CmdEnter,
+                        can_send: true,
+                        agent: None,
+                        workspace_root: None,
+                        collapse_shortcut: None,
+                        connector_snapshot: &state.2,
+                    },
+                );
+            },
+            (
+                ComposerUi::new(test_history_path("pr5-sessions")),
+                "persisted-session-A".to_owned(),
+                ConnectorSnapshot::default(),
+            ),
+        );
+        use egui_kittest::kittest::Queryable;
+        harness.run();
+        harness
+            .get_by_role(egui::accesskit::Role::MultilineTextInput)
+            .click();
+        harness.run();
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::Text("first".into()));
+        harness.run();
+        harness.state_mut().1 = "persisted-session-B".into();
+        harness.run();
+        harness
+            .get_by_role(egui::accesskit::Role::MultilineTextInput)
+            .click();
+        harness.run();
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::Text("second".into()));
+        harness.run();
+        assert_eq!(
+            harness.state().0.current_text("persisted-session-A"),
+            "first"
+        );
+        assert_eq!(
+            harness.state().0.current_text("persisted-session-B"),
+            "second"
+        );
+    }
+
+    #[test]
+    fn pr5_real_ime_cannot_grow_draft_past_one_mib() {
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        let mut harness = composer_harness(
+            &catalog,
+            ComposerSendKey::CmdEnter,
+            test_history_path("pr5-ime"),
+        );
+        let original = "가".repeat(COMPOSER_PROMPT_MAX_BYTES / 3);
+        harness
+            .state_mut()
+            .0
+            .buffers
+            .insert(TEST_WS.into(), original.clone());
+        harness.run();
+        focus_composer(&mut harness);
+        store_caret_now(
+            &harness.ctx,
+            ComposerUi::text_id(TEST_WS),
+            original.chars().count(),
+        );
+        harness
+            .ctx
+            .memory_mut(|memory| memory.request_focus(ComposerUi::text_id(TEST_WS)));
+        assert!(
+            harness
+                .ctx
+                .memory(|memory| memory.has_focus(ComposerUi::text_id(TEST_WS)))
+        );
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: "나".into(),
+                active_range_chars: None,
+            }));
+        harness.run();
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::Ime(egui::ImeEvent::Commit("나".into())));
+        harness.run();
+        assert_eq!(
+            buffer_of(&harness).len(),
+            original.len(),
+            "live IME bypasses the send-only cap"
+        );
+    }
+
+    #[test]
+    fn pr5_real_typing_and_paste_refuse_overflow_without_losing_selection() {
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        let mut harness = composer_harness(
+            &catalog,
+            ComposerSendKey::CmdEnter,
+            test_history_path("pr5-overflow"),
+        );
+        let original = "가".repeat(COMPOSER_PROMPT_MAX_BYTES / 3);
+        harness
+            .state_mut()
+            .0
+            .buffers
+            .insert(TEST_WS.into(), original.clone());
+        harness.run();
+        let id = ComposerUi::text_id(TEST_WS);
+        harness.ctx.memory_mut(|memory| memory.request_focus(id));
+        store_caret_now(&harness.ctx, id, original.chars().count());
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::Text("나".into()));
+        harness.run();
+        assert_eq!(
+            buffer_of(&harness).len(),
+            original.len(),
+            "typing must not bypass byte budget"
+        );
+        harness.ctx.memory_mut(|memory| memory.request_focus(id));
+        store_caret_range_now(&harness.ctx, id, 1, 0);
+        harness.input_mut().events.push(egui::Event::Paste(
+            "x".repeat(COMPOSER_PROMPT_MAX_BYTES + 1),
+        ));
+        harness.run();
+        assert_eq!(
+            buffer_of(&harness),
+            original,
+            "over-limit paste keeps original selection body"
+        );
+        assert_eq!(stored_char_range(&harness.ctx, id), Some((1, 0)));
+    }
+
+    #[test]
+    fn pr5_restart_existing_draft_fixture_is_restored() {
+        let dir = std::env::temp_dir().join(format!("deppy-pr5-startup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("composer_drafts.json");
+        std::fs::write(&path, r#"{"drafts":[{"key":"persisted-session-A","workspace_id":"ws-test","text":"한글 recovered"}]}"#).unwrap();
+        let startup = DraftSnapshot::load_startup(&path);
+        assert!(startup.error.is_none());
+        let mut composer = ComposerUi::new(dir.join("composer_history.jsonl"));
+        composer.restore_drafts(startup.snapshot);
+        assert_eq!(
+            composer.current_text("persisted-session-A"),
+            "한글 recovered"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pr5_aggregate_item_metadata_and_programmatic_ingestion_preserve_existing_drafts() {
+        let mut composer = ComposerUi::new(test_history_path("pr5-budget"));
+        let full: Arc<str> = Arc::from("x".repeat(COMPOSER_PROMPT_MAX_BYTES));
+        composer.restore_drafts(DraftSnapshot {
+            drafts: (0..32)
+                .map(|i| DraftRecord {
+                    key: format!("session-{i}"),
+                    workspace_id: "ws".into(),
+                    delivery_uncertain: false,
+                    text: Arc::clone(&full),
+                })
+                .collect(),
+        });
+        composer.insert_text("session-new", "Korean 한글");
+        assert!(composer.current_text("session-new").is_empty());
+        assert_eq!(
+            composer.buffers.values().map(String::len).sum::<usize>(),
+            DRAFT_TOTAL_MAX_BYTES
+        );
+        assert!(composer.input_limited);
+        composer.insert_text("session-0", "overflow");
+        assert_eq!(
+            composer.current_text("session-0").len(),
+            COMPOSER_PROMPT_MAX_BYTES
+        );
+        composer.delete_draft(&egui::Context::default(), "session-0");
+        composer.checkpoint();
+        composer.insert_text("session-new", "한글");
+        assert_eq!(composer.current_text("session-new"), "한글");
+        let mut composer = ComposerUi::new(test_history_path("pr5-items"));
+        composer.restore_drafts(DraftSnapshot {
+            drafts: (0..DRAFT_MAX_ITEMS)
+                .map(|i| DraftRecord {
+                    key: format!("session-{i}"),
+                    workspace_id: "ws".into(),
+                    delivery_uncertain: false,
+                    text: Arc::from("dirty"),
+                })
+                .collect(),
+        });
+        composer.insert_text("session-over-item", "new");
+        assert!(composer.current_text("session-over-item").is_empty());
+        assert_eq!(composer.buffers.len(), DRAFT_MAX_ITEMS);
+        let mut composer = ComposerUi::new(test_history_path("pr5-metadata"));
+        composer.restore_drafts(DraftSnapshot {
+            drafts: (0..64)
+                .map(|i| DraftRecord {
+                    key: format!("{i:03}{}", "k".repeat(4085)),
+                    workspace_id: "owner-id".into(),
+                    delivery_uncertain: false,
+                    text: Arc::from("dirty"),
+                })
+                .collect(),
+        });
+        assert_eq!(composer.buffers.len(), 64);
+        composer.insert_text(&"z".repeat(1000), "new");
+        assert_eq!(
+            composer.buffers.len(),
+            64,
+            "metadata cap must refuse rather than evict"
+        );
+    }
+    #[test]
+    fn pr5_checkpoint_shares_unchanged_body_and_strips_only_owned_pending_tokens() {
+        let egui_ctx = egui::Context::default();
+        let mut composer = ComposerUi::new(test_history_path("pr5-checkpoint"));
+        composer.insert_text("A", "user ⟦attach-999⟧");
+        composer.insert_text("B", "unchanged");
+        let first = composer.checkpoint();
+        let previous = Arc::clone(
+            &first
+                .drafts
+                .iter()
+                .find(|draft| draft.key == "B")
+                .unwrap()
+                .text,
+        );
+        composer.last_workspace = Some("A".into());
+        composer.active_workspace_id = "actual-workspace".into();
+        composer.active_generation = 4;
+        let mut buffer = composer.buffers.remove("A").unwrap();
+        let request = composer
+            .begin_attachment_request(&egui_ctx, "A", None, &mut buffer)
+            .unwrap();
+        composer.buffers.insert("A".into(), buffer);
+        let second = composer.checkpoint();
+        let body = &second
+            .drafts
+            .iter()
+            .find(|draft| draft.key == "A")
+            .unwrap()
+            .text;
+        assert_eq!(body.as_ref(), "user ⟦attach-999⟧");
+        assert!(composer.current_text("A").contains(request.token()));
+        assert!(Arc::ptr_eq(
+            &previous,
+            &second
+                .drafts
+                .iter()
+                .find(|draft| draft.key == "B")
+                .unwrap()
+                .text
+        ));
+        let mut restored = ComposerUi::new(test_history_path("pr5-restored"));
+        restored.restore_drafts((*second).clone());
+        assert_eq!(restored.current_text("A"), "user ⟦attach-999⟧");
+    }
+    #[test]
+    fn pr5_late_context_file_routes_original_session_root_and_cannot_resurrect_deleted_draft() {
+        let egui_ctx = egui::Context::default();
+        let mut composer = ComposerUi::new(test_history_path("pr5-late"));
+        let connectors = ConnectorSnapshot::default();
+        let context = |key| ComposerContext {
+            workspace_id: "workspace",
+            draft_key: key,
+            runtime_generation: 7,
+            send_key: ComposerSendKey::CmdEnter,
+            can_send: true,
+            agent: None,
+            workspace_root: None,
+            collapse_shortcut: None,
+            connector_snapshot: &connectors,
+        };
+        composer.bind_context(&egui_ctx, &context("A"));
+        let mut buffer = "first".to_owned();
+        let (request, _) = composer
+            .begin_context_file_request(&egui_ctx, "A", Some(Path::new("/original")), &mut buffer)
+            .unwrap();
+        assert_eq!(request.target.workspace_id, "workspace");
+        assert_eq!(request.target.draft_key, "A");
+        composer.buffers.insert("A".into(), buffer);
+        composer.mark_dirty("A");
+        composer.bind_context(&egui_ctx, &context("B"));
+        composer.insert_text("B", "second");
+        assert!(composer.complete_context_file(
+            &egui_ctx,
+            request,
+            Some(PathBuf::from("/original/file.txt")),
+            "B"
+        ));
+        assert_eq!(composer.current_text("A"), "first @file.txt");
+        assert_eq!(composer.current_text("B"), "second");
+        composer.bind_context(&egui_ctx, &context("A"));
+        let mut buffer = composer.buffers.remove("A").unwrap();
+        let (request, _) = composer
+            .begin_context_file_request(&egui_ctx, "A", None, &mut buffer)
+            .unwrap();
+        composer.buffers.insert("A".into(), buffer);
+        composer.delete_draft(&egui_ctx, "A");
+        assert!(!composer.complete_context_file(
+            &egui_ctx,
+            request,
+            Some(PathBuf::from("/late")),
+            "B"
+        ));
+        assert!(composer.current_text("A").is_empty());
+        assert!(
+            !composer
+                .checkpoint()
+                .drafts
+                .iter()
+                .any(|draft| draft.key == "A")
+        );
+        assert_eq!(composer.current_text("B"), "second");
+    }
+    #[test]
+    fn pr5_retired_runtime_preserves_draft_but_discards_attachments_and_old_ack() {
+        let egui_ctx = egui::Context::default();
+        let mut composer = ComposerUi::new(test_history_path("pr5-generation"));
+        let connectors = ConnectorSnapshot::default();
+        let context = |generation| ComposerContext {
+            workspace_id: "workspace",
+            draft_key: "A",
+            runtime_generation: generation,
+            send_key: ComposerSendKey::CmdEnter,
+            can_send: true,
+            agent: None,
+            workspace_root: None,
+            collapse_shortcut: None,
+            connector_snapshot: &connectors,
+        };
+        composer.bind_context(&egui_ctx, &context(7));
+        composer.insert_text("A", "exact prompt");
+        let prompt = composer.current_text("A").to_owned();
+        let Some(ComposerAction::Send(submission)) = composer.try_submit(&prompt, true, "A") else {
+            panic!("submission")
+        };
+        let (_, _, id) = submission.into_parts();
+        let mut buffer = composer.buffers.remove("A").unwrap();
+        let request = composer
+            .begin_attachment_request(&egui_ctx, "A", None, &mut buffer)
+            .unwrap();
+        composer.buffers.insert("A".into(), buffer);
+        composer.retire_generation(&egui_ctx, 7);
+        assert_eq!(composer.current_text("A"), "exact prompt");
+        assert!(!composer.complete_clipboard_attachment(&egui_ctx, request, None, "A"));
+        composer.bind_context(&egui_ctx, &context(8));
+        assert!(
+            composer.submission_blocked("A"),
+            "unknown prior delivery needs explicit resend acknowledgment"
+        );
+        assert!(
+            composer
+                .settle_submission("A", id, &prompt, PromptAdmissionOutcome::Accepted)
+                .is_none()
+        );
+        assert_eq!(composer.current_text("A"), "exact prompt");
+        composer.acknowledge_uncertain_delivery("A");
+        assert!(composer.try_submit(&prompt, true, "A").is_some());
+    }
+    #[test]
+    fn pr5_unknown_delivery_payload_budget_and_permanent_delete_release_retention() {
+        let mut composer = ComposerUi::new(test_history_path("pr5-delivery-budget"));
+        let body = "x".repeat(COMPOSER_PROMPT_MAX_BYTES);
+        for i in 0..8 {
+            let key = format!("session-{i}");
+            let Some(ComposerAction::Send(submission)) = composer.try_submit(&body, true, &key)
+            else {
+                panic!("bounded admission")
+            };
+            let (_, _, id) = submission.into_parts();
+            composer.settle_submission(&key, id, &body, PromptAdmissionOutcome::Unknown);
+        }
+        assert_eq!(
+            composer
+                .deliveries
+                .values()
+                .map(|delivery| delivery.prompt.len())
+                .sum::<usize>(),
+            COMPOSER_DELIVERY_MAX_BYTES
+        );
+        assert!(composer.try_submit("next", true, "session-new").is_none());
+        assert!(composer.submission_blocked("session-0"));
+        composer.delete_draft(&egui::Context::default(), "session-0");
+        assert!(composer.try_submit("next", true, "session-new").is_some());
+        assert!(!composer.deliveries.contains_key("session-0"));
+    }
+    #[test]
+    fn pr5_real_composer_undo_is_bounded_and_never_crosses_session_drafts() {
+        let ctx = egui::Context::default();
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        let connectors = ConnectorSnapshot::default();
+        let mut composer = ComposerUi::new(test_history_path("pr5-undo"));
+        composer.insert_text("A", "base");
+        let mut time = 0.0;
+        let frame = |composer: &mut ComposerUi, key: &str, time: f64, events: Vec<egui::Event>| {
+            ctx.run_ui(
+                egui::RawInput {
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    composer.render(
+                        ui,
+                        &catalog,
+                        &ComposerContext {
+                            workspace_id: "workspace",
+                            draft_key: key,
+                            runtime_generation: 1,
+                            send_key: ComposerSendKey::CmdEnter,
+                            can_send: true,
+                            agent: None,
+                            workspace_root: None,
+                            collapse_shortcut: None,
+                            connector_snapshot: &connectors,
+                        },
+                    );
+                },
+            )
+            .drop_without_applying_deltas();
+        };
+        frame(&mut composer, "A", time, Vec::new());
+        let id = ComposerUi::text_id("A");
+        ctx.memory_mut(|memory| memory.request_focus(id));
+        store_caret_now(&ctx, id, 4);
+        for _ in 0..20 {
+            time += 2.0;
+            frame(
+                &mut composer,
+                "A",
+                time,
+                vec![egui::Event::Text("a".into())],
+            );
+            time += 2.0;
+            frame(&mut composer, "A", time, Vec::new());
+        }
+        let undo = || egui::Event::Key {
+            key: egui::Key::Z,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        };
+        let mut undos = 0;
+        for _ in 0..25 {
+            let previous = composer.current_text("A").to_owned();
+            time += 2.0;
+            frame(&mut composer, "A", time, vec![undo()]);
+            if composer.current_text("A") != previous {
+                undos += 1
+            }
+        }
+        assert!(
+            undos > 0 && undos <= super::super::text_input::TEXT_EDIT_MAX_UNDOS,
+            "actual undo count={undos}"
+        );
+        let retained_a = composer.current_text("A").to_owned();
+        composer.insert_text("B", "B-only");
+        time += 2.0;
+        frame(&mut composer, "B", time, Vec::new());
+        assert_eq!(id, ComposerUi::text_id("B"));
+        ctx.memory_mut(|memory| memory.request_focus(id));
+        time += 2.0;
+        frame(&mut composer, "B", time, vec![undo()]);
+        assert_eq!(composer.current_text("B"), "B-only");
+        assert_eq!(composer.current_text("A"), retained_a);
+        composer.set_read_only(true);
+        ctx.memory_mut(|memory| memory.request_focus(id));
+        time += 2.0;
+        frame(&mut composer, "B", time, Vec::new());
+        assert!(
+            !ctx.memory(|memory| memory.has_focus(id)),
+            "read-only recovery must release focus for terminal typing"
+        );
+    }
+    #[test]
+    fn pr5_workspace_delete_retires_unknown_delivery_even_after_its_draft_was_cleared() {
+        let ctx = egui::Context::default();
+        let mut composer = ComposerUi::new(test_history_path("pr5-cleared-delivery"));
+        let connectors = ConnectorSnapshot::default();
+        composer.bind_context(
+            &ctx,
+            &ComposerContext {
+                workspace_id: "actual-workspace",
+                draft_key: "session-A",
+                runtime_generation: 1,
+                send_key: ComposerSendKey::CmdEnter,
+                can_send: true,
+                agent: None,
+                workspace_root: None,
+                collapse_shortcut: None,
+                connector_snapshot: &connectors,
+            },
+        );
+        composer.insert_text("session-A", "original");
+        let Some(ComposerAction::Send(submission)) =
+            composer.try_submit("original", true, "session-A")
+        else {
+            panic!("submission")
+        };
+        let (_, _, id) = submission.into_parts();
+        composer.settle_submission("session-A", id, "original", PromptAdmissionOutcome::Unknown);
+        composer.buffers.get_mut("session-A").unwrap().clear();
+        composer.mark_dirty("session-A");
+        composer.checkpoint();
+        assert!(
+            composer.owners.contains_key("session-A"),
+            "empty uncertainty marker keeps its original workspace owner"
+        );
+        assert!(composer.deliveries.contains_key("session-A"));
+        composer.delete_workspace_drafts(&ctx, "other-workspace");
+        assert!(composer.submission_blocked("session-A"));
+        composer.delete_workspace_drafts(&ctx, "actual-workspace");
+        assert!(!composer.deliveries.contains_key("session-A"));
+        assert!(!composer.generations.contains_key("session-A"));
+    }
+
+    #[test]
+    fn pr5_durable_pending_and_empty_unknown_restore_blocked_without_fabricated_receipts() {
+        use crate::composer_drafts::DraftFileVersion;
+        let dir =
+            std::env::temp_dir().join(format!("deppy-pr5-uncertain-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("drafts.json");
+        let mut composer = ComposerUi::new(dir.join("history.jsonl"));
+        composer.insert_text("A", "exact prompt");
+        let Some(ComposerAction::Send(submission)) = composer.try_submit("exact prompt", true, "A")
+        else {
+            panic!("submission")
+        };
+        let (_, _, id) = submission.into_parts();
+        let snapshot = composer.checkpoint();
+        assert!(snapshot.drafts[0].delivery_uncertain);
+        let version = snapshot
+            .save_checked(&path, DraftFileVersion::Missing)
+            .unwrap();
+        let startup = DraftSnapshot::load_startup(&path);
+        assert!(startup.error.is_none());
+        let mut restored = ComposerUi::new(dir.join("unused-history.jsonl"));
+        restored.restore_drafts(startup.snapshot);
+        assert!(restored.deliveries.is_empty());
+        assert_eq!(restored.submission_sequence, 0);
+        assert!(restored.submission_blocked("A"));
+        assert!(restored.try_submit("exact prompt", true, "A").is_none());
+        restored.acknowledge_uncertain_delivery("A");
+        assert!(!restored.submission_blocked("A"));
+        assert!(!restored.checkpoint().drafts[0].delivery_uncertain);
+        assert!(restored.try_submit("reviewed prompt", true, "A").is_some());
+        composer.settle_submission("A", id, "exact prompt", PromptAdmissionOutcome::Unknown);
+        composer.buffers.get_mut("A").unwrap().clear();
+        composer.mark_dirty("A");
+        let empty = composer.checkpoint();
+        assert_eq!(empty.drafts.len(), 1);
+        assert!(empty.drafts[0].text.is_empty());
+        assert!(empty.drafts[0].delivery_uncertain);
+        empty.save_checked(&path, version).unwrap();
+        let mut restored = ComposerUi::new(dir.join("unused-history.jsonl"));
+        restored.restore_drafts(DraftSnapshot::load_startup(&path).snapshot);
+        assert!(restored.current_text("A").is_empty());
+        assert!(restored.submission_blocked("A"));
+        assert_eq!(restored.owners.get("A").map(String::as_str), Some("A"));
+        restored.acknowledge_uncertain_delivery("A");
+        assert!(restored.checkpoint().drafts.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn pr5_uncertainty_checkpoint_invalidates_on_exact_ack_and_old_format_defaults_safe() {
+        let dir =
+            std::env::temp_dir().join(format!("deppy-pr5-old-format-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("drafts.json");
+        std::fs::write(
+            &path,
+            br#"{"drafts":[{"key":"A","workspace_id":"workspace","text":"legacy"}]}"#,
+        )
+        .unwrap();
+        let loaded = DraftSnapshot::load_startup(&path);
+        assert!(loaded.error.is_none());
+        assert!(!loaded.snapshot.drafts[0].delivery_uncertain);
+        let mut composer = ComposerUi::new(dir.join("history.jsonl"));
+        composer.restore_drafts(loaded.snapshot);
+        let Some(ComposerAction::Send(submission)) = composer.try_submit("legacy", true, "A")
+        else {
+            panic!("submission")
+        };
+        let (_, _, id) = submission.into_parts();
+        assert!(composer.checkpoint().drafts[0].delivery_uncertain);
+        let revision = composer.draft_revision();
+        composer.settle_submission("A", id, "legacy", PromptAdmissionOutcome::Rejected);
+        assert!(composer.draft_revision() > revision);
+        assert!(!composer.checkpoint().drafts[0].delivery_uncertain);
+        assert!(!composer.submission_blocked("A"));
+        let Some(ComposerAction::Send(submission)) = composer.try_submit("legacy", true, "A")
+        else {
+            panic!("submission")
+        };
+        let (_, _, id) = submission.into_parts();
+        assert!(composer.checkpoint().drafts[0].delivery_uncertain);
+        composer.insert_text("A", "follow-up");
+        let retained = composer.current_text("A").to_owned();
+        composer.settle_submission("A", id, "legacy", PromptAdmissionOutcome::Accepted);
+        let saved = composer.checkpoint();
+        assert_eq!(saved.drafts[0].text.as_ref(), retained);
+        assert!(!saved.drafts[0].delivery_uncertain);
+        assert!(!composer.submission_blocked("A"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pr5_checkpoint_releases_cleared_capacity_and_compacts_shrunk_dirty_drafts() {
+        let mut composer = ComposerUi::new(test_history_path("pr5-capacity"));
+        let body = "x".repeat(32 * 1024);
+        for i in 0..300 {
+            let key = format!("cleared-{i}");
+            composer.insert_text(&key, &body);
+            composer.buffers.get_mut(&key).unwrap().clear();
+            composer.mark_dirty(&key);
+            composer.checkpoint();
+        }
+        let retained: usize = composer.buffers.values().map(String::capacity).sum();
+        assert!(
+            composer.buffers.is_empty(),
+            "cleared entries retained={} bytes in {} buffers",
+            retained,
+            composer.buffers.len()
+        );
+        composer.insert_text("uncertain", &body);
+        let Some(ComposerAction::Send(submission)) = composer.try_submit(&body, true, "uncertain")
+        else {
+            panic!("submission")
+        };
+        let (_, _, id) = submission.into_parts();
+        composer.settle_submission("uncertain", id, &body, PromptAdmissionOutcome::Unknown);
+        composer.buffers.get_mut("uncertain").unwrap().clear();
+        composer.mark_dirty("uncertain");
+        let saved = composer.checkpoint();
+        assert!(saved.drafts[0].delivery_uncertain);
+        assert_eq!(
+            composer.buffers["uncertain"].capacity(),
+            0,
+            "empty marker must not retain old1MiB capacity"
+        );
+        composer.insert_text("small", &"x".repeat(COMPOSER_PROMPT_MAX_BYTES));
+        composer.buffers.get_mut("small").unwrap().truncate(1);
+        composer.mark_dirty("small");
+        composer.checkpoint();
+        assert_eq!(composer.current_text("small"), "x");
+        assert!(
+            composer.buffers["small"].capacity() <= 64 * 1024,
+            "large-shrunk dirty body retained excess capacity"
+        );
+    }
+
+    #[test]
+    fn pr5_readonly_recovery_refuses_programmatic_mutation_and_retains_exact_draft() {
+        let mut composer = ComposerUi::new(test_history_path("pr5-readonly"));
+        composer.insert_text("A", "original");
+        let revision = composer.draft_revision();
+        composer.set_read_only(true);
+        composer.insert_text("A", "overwrite");
+        assert_eq!(composer.current_text("A"), "original");
+        assert_eq!(composer.draft_revision(), revision);
+        assert!(composer.try_submit("original", true, "A").is_none());
+    }
+
+    #[test]
+    fn pr1_submission_retains_original_draft_until_pty_acceptance() {
+        let mut ui = ComposerUi::new(test_history_path("pr1-retention"));
+        let draft = "한글 prompt\n두번째 줄".to_owned();
+        let original = draft.clone();
+        assert!(ui.try_submit(&draft, true, TEST_WS).is_some());
+        assert_eq!(
+            draft, original,
+            "staging or stale target rejection must not consume the draft"
+        );
+        assert!(
+            ui.history.is_empty(),
+            "history records actual admission, not a Send click"
+        );
+    }
+
+    #[test]
+    fn pr1_host_or_stale_target_rejection_keeps_exact_original_and_allows_manual_retry() {
+        let mut ui = ComposerUi::new(test_history_path("pr1-rejection"));
+        let original = "한글 😀\nline two".to_owned();
+        let draft = original.clone();
+        let ComposerAction::Send(submission) = ui.try_submit(&draft, true, TEST_WS).unwrap() else {
+            panic!()
+        };
+        ui.buffers.insert(TEST_WS.to_owned(), draft);
+        ui.settle_submission(
+            TEST_WS,
+            submission.submission_id,
+            submission.prompt(),
+            PromptAdmissionOutcome::Rejected,
+        );
+        assert_eq!(ui.current_text(TEST_WS), original);
+        assert!(ui.history.is_empty());
+        let draft = ui.buffers.remove(TEST_WS).unwrap();
+        assert!(ui.try_submit(&draft, true, TEST_WS).is_some());
+    }
+
+    #[test]
+    fn pr1_acceptance_clears_only_the_original_snapshot_and_records_history_once() {
+        let mut ui = ComposerUi::new(test_history_path("pr1-accepted"));
+        let draft = "original".to_owned();
+        ui.try_submit(&draft, true, TEST_WS).unwrap();
+        ui.buffers
+            .insert(TEST_WS.to_owned(), "new edit while waiting".to_owned());
+        assert!(
+            ui.settle_submission(TEST_WS, 1, "original", PromptAdmissionOutcome::Accepted)
+                .is_some()
+        );
+        assert_eq!(ui.current_text(TEST_WS), "new edit while waiting");
+        assert_eq!(
+            ui.history.iter().map(AsRef::as_ref).collect::<Vec<_>>(),
+            vec!["original"]
+        );
+        assert!(
+            ui.settle_submission(TEST_WS, 1, "original", PromptAdmissionOutcome::Accepted)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn pr1_unknown_or_pending_submission_never_automatically_retries() {
+        let mut ui = ComposerUi::new(test_history_path("pr1-unknown"));
+        let draft = "keep me".to_owned();
+        ui.try_submit(&draft, true, TEST_WS).unwrap();
+        assert!(ui.try_submit(&draft, true, TEST_WS).is_none());
+        ui.settle_submission(TEST_WS, 1, "keep me", PromptAdmissionOutcome::Unknown);
+        assert!(ui.try_submit(&draft, true, TEST_WS).is_none());
+        assert_eq!(draft, "keep me");
+        assert!(ui.history.is_empty());
+    }
+
+    #[test]
+    fn pr1_late_old_ack_cannot_consume_a_same_text_explicit_retry() {
+        let mut ui = ComposerUi::new(test_history_path("pr1-late-ack"));
+        let draft = "same text".to_owned();
+        ui.try_submit(&draft, true, TEST_WS).unwrap();
+        ui.settle_submission(TEST_WS, 1, "same text", PromptAdmissionOutcome::Unknown);
+        ui.acknowledge_uncertain_delivery(TEST_WS);
+        ui.try_submit(&draft, true, TEST_WS).unwrap();
+        ui.buffers.insert(TEST_WS.to_owned(), draft);
+        assert!(
+            ui.settle_submission(TEST_WS, 1, "same text", PromptAdmissionOutcome::Accepted)
+                .is_none()
+        );
+        assert_eq!(ui.current_text(TEST_WS), "same text");
+        assert!(ui.history.is_empty());
+        assert!(
+            ui.settle_submission(TEST_WS, 2, "same text", PromptAdmissionOutcome::Accepted)
+                .is_some()
+        );
+        assert!(ui.current_text(TEST_WS).is_empty());
+    }
 
     #[test]
     fn designall_composer는_그림자없는_입력표면이다() {
@@ -1886,17 +3485,24 @@ mod tests {
         let path = test_history_path("send-history-intent");
         std::fs::remove_file(&path).ok();
         let mut ui = ComposerUi::new(path.clone());
-        let mut buffer = "hello".to_owned();
-        let action = ui.try_submit(&mut buffer, true, TEST_WS).unwrap();
+        let buffer = "hello".to_owned();
+        let action = ui.try_submit(&buffer, true, TEST_WS).unwrap();
         let ComposerAction::Send(submission) = action else {
             panic!("expected Send");
         };
         assert_eq!(submission.prompt(), "hello");
-        assert!(std::sync::Arc::ptr_eq(&submission.history, &ui.history));
+        assert!(
+            ui.history.is_empty(),
+            "history waits for actual PTY admission"
+        );
+        assert_eq!(
+            submission.history().last().map(AsRef::as_ref),
+            Some("hello")
+        );
         assert!(!path.exists(), "leaf Send는 history file을 쓰지 않는다");
 
-        let mut oversized = "x".repeat(COMPOSER_PROMPT_MAX_BYTES + 1);
-        assert!(ui.try_submit(&mut oversized, true, TEST_WS).is_none());
+        let oversized = "x".repeat(COMPOSER_PROMPT_MAX_BYTES + 1);
+        assert!(ui.try_submit(&oversized, true, TEST_WS).is_none());
         assert_eq!(oversized.len(), COMPOSER_PROMPT_MAX_BYTES + 1);
     }
 
@@ -2215,6 +3821,7 @@ mod tests {
         let path = test_history_path("attach-token-switch");
         let mut ui = ComposerUi::new(path.clone());
         // ws-a가 활성일 때 첨부 시작 (드래프트에 이미 내용).
+        ui.sync_workspace(&egui_ctx, "ws-a");
         let mut draft_a = "a-draft".to_owned();
         let request = ui
             .begin_attachment_request(&egui_ctx, "ws-a", None, &mut draft_a)
@@ -2537,6 +4144,8 @@ mod tests {
             move |ui, (widget, captured, connector_snapshot, workspace_root): &mut ComposerHarnessState| {
                 let ctx = ComposerContext {
                     workspace_id: TEST_WS,
+                    draft_key: TEST_WS,
+                    runtime_generation: 1,
                     send_key,
                     can_send: true,
                     agent: None,
@@ -2576,7 +4185,7 @@ mod tests {
     }
 
     #[test]
-    fn kittest_enter_전송_시_send와_버퍼_클리어() {
+    fn kittest_enter_전송_시_send와_수용전_버퍼_보존() {
         use egui_kittest::kittest::Queryable;
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
         let path = test_history_path("enter-send");
@@ -2589,10 +4198,12 @@ mod tests {
         harness.key_press(egui::Key::Enter);
         harness.run();
         assert_single_send(&harness.state().1, "hello agent");
-        assert!(
-            buffer_of(&harness).is_empty(),
-            "전송 후 버퍼가 비워져야 한다"
+        assert_eq!(
+            buffer_of(&harness),
+            "hello agent",
+            "PTY 수용 전에는 초안을 보존한다"
         );
+        assert!(harness.state().0.history.is_empty());
         assert!(
             !path.exists(),
             "Send render 경로는 history 파일을 생성/기록하면 안 된다"

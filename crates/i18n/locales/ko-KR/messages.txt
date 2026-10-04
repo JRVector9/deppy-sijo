@@ -1401,3 +1401,31 @@ fleet.followup.list = 다음 작업 ({count})
 fleet.followup.empty = 예약된 작업 없음
 
 env.delete_source = 삭제할 파일
+
+composer.delivery.persisting = 입력 전에 저장 중…
+composer.delivery.pending = 입력 수용 확인 중…
+composer.delivery.rejected = 전송 거절됨 · 초안 보존
+composer.delivery.unknown = 수용 여부 불명 · 원래 터미널을 확인 후 재전송하세요
+composer.delivery.allow_resend = 확인했음 · 재전송 허용
+composer.delivery.accepted = 입력 수용됨 · 실행 여부 미확인
+
+prompt.persistence.saving = 저장 중…
+prompt.persistence.failed = 저장 실패 · 변경 내용은 메모리에 남아 있습니다
+prompt.persistence.recovery = 원본 파일 보존 · 자동 저장 중지. 파일을 복구한 뒤 앱을 다시 열어주세요
+prompt.persistence.limit_or_error = 한도 초과 또는 저장 오류 · 변경을 저장하지 못했습니다
+prompt.persistence.retry = 저장 재시도
+prompt.persistence.conflict = 파일이 외부에서 변경됨 · 현재 변경은 저장되지 않고 메모리에 남아 있습니다
+prompt.persistence.recovery_hint = 현재 변경을 백업하고 원본 파일을 복구한 뒤 앱을 다시 열어주세요
+
+prompt.input_limit = 입력 한도를 넘었습니다. 원문은 유지됩니다. 입력 또는 템플릿 파라미터를 줄여 주세요.
+prompt.preview_truncated = 처음 16 KiB만 표시합니다. 삽입에는 전체 미리보기 내용이 사용됩니다.
+fleet.followup.retained = 보관 중인 예약 작업: {count}개
+fleet.followup.blocked = 취소하면 예약을 제거하고 PTY에 접수되기 전 입력을 막을 수 있습니다. 이미 접수된 입력을 되돌리거나 결과 불명 상태를 해소할 수는 없으며, 자동으로 다시 보내지 않습니다.
+fleet.followup.admission_rejected = 작업을 예약하지 못했습니다. 작성 중인 폼은 유지됩니다. 대상과 한도를 확인하거나 막힌 예약을 취소하세요.
+
+composer.draft.limit = 초안 입력 한도에 도달했습니다(개별 1MiB, 전체 32MiB / 256개). 기존 글은 유지됩니다.
+composer.draft.saving = 초안 저장 중…
+composer.draft.failed = 초안 저장 실패 · 글은 메모리에 유지됩니다
+composer.draft.recovery = 초안 복구 필요 · 입력창은 읽기 전용입니다
+composer.draft.recovery_hint = composer_drafts.json을 백업하고 정상 파일로 복구한 뒤 앱을 다시 열어주세요. 저장되지 않은 글은 이 창에 남습니다.
+composer.draft.delivery_limit = 전송 결과 보류 한도에 도달했습니다(8MiB / 256건). 원래 세션에서 확인하거나 삭제해 주세요. 자동 재전송하지 않습니다.

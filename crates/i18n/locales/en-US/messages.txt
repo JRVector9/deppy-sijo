@@ -1401,3 +1401,31 @@ fleet.followup.list = Next tasks ({count})
 fleet.followup.empty = No scheduled tasks
 
 env.delete_source = File to delete from
+
+composer.delivery.persisting = Saving before input…
+composer.delivery.pending = Waiting for input acceptance…
+composer.delivery.rejected = Not sent; draft retained
+composer.delivery.unknown = Acceptance unknown; check the original terminal before resending
+composer.delivery.allow_resend = I checked; allow resend
+composer.delivery.accepted = Input accepted; execution not confirmed
+
+prompt.persistence.saving = Saving…
+prompt.persistence.failed = Save failed · Changes remain in memory
+prompt.persistence.recovery = Original preserved · Saving disabled. Recover the file, then reopen the app
+prompt.persistence.limit_or_error = Limit exceeded or save error · Changes were not saved
+prompt.persistence.retry = Retry save
+prompt.persistence.conflict = File changed externally · Unsaved changes remain in memory
+prompt.persistence.recovery_hint = Back up current changes, recover the original file, then reopen the app
+
+prompt.input_limit = Input limit reached. The original text is kept; shorten the field or template parameters.
+prompt.preview_truncated = Showing the first 16 KiB. Insert uses the complete preview text.
+fleet.followup.retained = Retained scheduled tasks: {count}
+fleet.followup.blocked = Cancel removes the reservation and can stop input before PTY admission. It cannot undo admitted input or resolve an unknown outcome; there is no automatic retry.
+fleet.followup.admission_rejected = The task could not be reserved. Your form is kept. Check the target and limits, or cancel a blocked reservation.
+
+composer.draft.limit = Draft input limit reached (1 MiB each, 32 MiB / 256 drafts total). Original text is kept.
+composer.draft.saving = Saving drafts…
+composer.draft.failed = Drafts not saved · Text remains in memory
+composer.draft.recovery = Draft recovery required · Composer is read only
+composer.draft.recovery_hint = Back up composer_drafts.json, restore a valid file, then reopen the app. Unsaved text stays in this window.
+composer.draft.delivery_limit = Unsettled delivery limit reached (8 MiB / 256 entries). Resolve or delete the original session; no automatic resend.

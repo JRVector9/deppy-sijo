@@ -2561,6 +2561,7 @@ impl Drop for RemoteRuntimeClient {
 mod tests {
     use super::*;
     use crate::protocol::FEAT_DELTA_VIEWPORT;
+    use crate::test_secret_store::test_store;
     use std::time::{Duration, Instant};
 
     /// v2 핸드셰이크를 수동으로 수행한다 (raw 소켓 테스트용):
@@ -2579,20 +2580,12 @@ mod tests {
         postcard::from_bytes::<ServerHello>(&frame).ok()
     }
 
-    fn init_mock_store() {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| {
-            keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
-        });
-    }
-
     fn test_backend(name: &str) -> InProcessRuntimeClient {
-        init_mock_store();
         let logs = std::env::temp_dir().join(format!("deppy-remote-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&logs).unwrap();
         InProcessRuntimeClient::with_shell(
             5,
-            Arc::new(secret::KeyringSecretStore),
+            test_store(),
             logs,
             secret::RedactionService::new(),
             pty::CommandSpec {
@@ -2894,14 +2887,14 @@ mod tests {
 
     #[test]
     fn v12_v13_peer_is_rejected_at_hello_before_event_decode() {
-        for version in [10, 12, 13, 17, 18, 19, 20] {
+        for version in [10, 12, 13, 17, 18, 19, 20, 21] {
             let old = ClientHello {
                 magic: PROTO_MAGIC,
                 proto_version: version,
                 features: CLIENT_FEATURES,
                 token: b"irrelevant".to_vec(),
             };
-            assert_eq!(PROTO_VERSION, 21);
+            assert_eq!(PROTO_VERSION, 22);
             assert!(!client_hello_matches_protocol(&old));
         }
     }
@@ -4731,12 +4724,11 @@ mod tests {
 
     /// 커스텀 셸 커맨드로 백엔드를 만든다 (slow-consumer 테스트의 대량 출력용).
     fn test_backend_cmd(name: &str, args: Vec<String>) -> InProcessRuntimeClient {
-        init_mock_store();
         let logs = std::env::temp_dir().join(format!("deppy-remote-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&logs).unwrap();
         InProcessRuntimeClient::with_shell(
             5,
-            Arc::new(secret::KeyringSecretStore),
+            test_store(),
             logs,
             secret::RedactionService::new(),
             pty::CommandSpec {

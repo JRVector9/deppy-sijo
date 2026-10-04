@@ -28,17 +28,27 @@ pub(crate) struct NativeKeyDownBatch {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NativeMovePasteGesture {
+    pub(crate) sequence: u64,
+    observed_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NativeKeyDown {
     Printable(NativePrintableKeyDown),
     Submit { observed_at: Instant },
     ClipboardPaste { observed_at: Instant },
     ClipboardCopy { observed_at: Instant },
+    ClipboardMovePaste(NativeMovePasteGesture),
 }
 
 impl NativeKeyDown {
     fn fresh(self) -> bool {
         match self {
             Self::Printable(key_down) => key_down.fresh(),
+            Self::ClipboardMovePaste(gesture) => {
+                gesture.observed_at.elapsed() <= NATIVE_KEY_MAX_AGE
+            }
             Self::Submit { observed_at }
             | Self::ClipboardPaste { observed_at }
             | Self::ClipboardCopy { observed_at } => observed_at.elapsed() <= NATIVE_KEY_MAX_AGE,
@@ -148,6 +158,40 @@ fn record_clipboard_copy() {
     });
 }
 
+fn record_clipboard_move_paste() {
+    static NEXT_GESTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    record(NativeKeyDown::ClipboardMovePaste(NativeMovePasteGesture {
+        sequence: NEXT_GESTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        observed_at: Instant::now(),
+    }));
+}
+
+/// Destructive move gestures are taken before tree ownership guards, never left
+/// pending for a later focus change. Ordinary terminal clipboard flags stay separate.
+pub(crate) fn take_clipboard_move_paste() -> Option<NativeMovePasteGesture> {
+    with_key_downs(|key_downs| {
+        let mut newest = None;
+        key_downs.retain(|key_down| {
+            if let NativeKeyDown::ClipboardMovePaste(gesture) = key_down {
+                if key_down.fresh() {
+                    newest = Some(*gesture);
+                }
+                false
+            } else {
+                true
+            }
+        });
+        newest
+    })
+    .flatten()
+}
+
+/// Composition-root frame tail, including Home/Fleet/hidden-sidebar frames.
+/// Discard only unclaimed destructive metadata; ordinary input retains its owner.
+pub(crate) fn discard_unclaimed_move_paste() {
+    let _ = take_clipboard_move_paste();
+}
+
 /// 이번 egui 프레임 직전에 AppKit이 본 printable/clipboard key-down을 모두 꺼낸다.
 /// 오래됐거나 터미널 UI가 비활성인 프레임의 레코드는 다음 입력에 섞이지 않도록
 /// 재사용하지 않는다. 같은 프레임의 Command+V key repeat은 paste 1회로 합친다.
@@ -167,6 +211,8 @@ fn collect_batch(key_downs: impl IntoIterator<Item = NativeKeyDown>) -> NativeKe
             NativeKeyDown::Submit { .. } => seen_submit = true,
             NativeKeyDown::ClipboardPaste { .. } => batch.clipboard_paste = true,
             NativeKeyDown::ClipboardCopy { .. } => batch.clipboard_copy = true,
+            // File-tree-only authority: never turn an unclaimed move into terminal paste.
+            NativeKeyDown::ClipboardMovePaste(_) => {}
         }
     }
     batch
@@ -213,10 +259,18 @@ pub(crate) fn install() {
         // We only inspect it synchronously and return the exact same pointer unchanged.
         let event_ref = unsafe { event.as_ref() };
         let modifiers = event_ref.modifierFlags();
-        if native_clipboard_paste_event(event_ref) {
-            record_clipboard_paste();
-        } else if native_clipboard_copy_event(event_ref) {
-            record_clipboard_copy();
+        let clipboard_characters = event_ref
+            .charactersIgnoringModifiers()
+            .map(|text| text.to_string());
+        if record_clipboard_event(
+            event_ref.keyCode(),
+            clipboard_characters.as_deref(),
+            modifiers.contains(NSEventModifierFlags::Command),
+            modifiers.contains(NSEventModifierFlags::Option),
+            modifiers.intersects(NSEventModifierFlags::Control | NSEventModifierFlags::Function),
+            event_ref.isARepeat(),
+        ) {
+            // The event itself is still returned unchanged to winit.
         } else if matches!(event_ref.keyCode(), 0x24 | 0x4c)
             && !modifiers.intersects(
                 NSEventModifierFlags::Command
@@ -253,44 +307,41 @@ pub(crate) fn install() {
     }
 }
 
-#[cfg(target_os = "macos")]
-fn native_clipboard_copy_event(event: &objc2_app_kit::NSEvent) -> bool {
-    use objc2_app_kit::NSEventModifierFlags;
-
-    let modifiers = event.modifierFlags();
-    let characters = event
-        .charactersIgnoringModifiers()
-        .map(|characters| characters.to_string());
-    is_clipboard_copy_key(
-        event.keyCode(),
-        characters.as_deref(),
-        modifiers.contains(NSEventModifierFlags::Command),
-        modifiers.intersects(
-            NSEventModifierFlags::Control
-                | NSEventModifierFlags::Option
-                | NSEventModifierFlags::Function,
-        ),
-    )
-}
-
-#[cfg(target_os = "macos")]
-fn native_clipboard_paste_event(event: &objc2_app_kit::NSEvent) -> bool {
-    use objc2_app_kit::NSEventModifierFlags;
-
-    let modifiers = event.modifierFlags();
-    let characters = event
-        .charactersIgnoringModifiers()
-        .map(|characters| characters.to_string());
-    is_clipboard_paste_key(
-        event.keyCode(),
-        characters.as_deref(),
-        modifiers.contains(NSEventModifierFlags::Command),
-        modifiers.intersects(
-            NSEventModifierFlags::Control
-                | NSEventModifierFlags::Option
-                | NSEventModifierFlags::Function,
-        ),
-    )
+fn record_clipboard_event(
+    key_code: u16,
+    characters: Option<&str>,
+    command: bool,
+    option: bool,
+    conflicting_modifier: bool,
+    repeat: bool,
+) -> bool {
+    if option
+        && !conflicting_modifier
+        && is_clipboard_paste_key(key_code, characters, command, false)
+    {
+        if !repeat {
+            record_clipboard_move_paste();
+        }
+        true
+    } else if is_clipboard_paste_key(
+        key_code,
+        characters,
+        command,
+        option || conflicting_modifier,
+    ) {
+        record_clipboard_paste();
+        true
+    } else if is_clipboard_copy_key(
+        key_code,
+        characters,
+        command,
+        option || conflicting_modifier,
+    ) {
+        record_clipboard_copy();
+        true
+    } else {
+        false
+    }
 }
 
 /// `charactersIgnoringModifiers`가 Latin `v`를 주는 배열은 논리 키를 따르고, 한글처럼
@@ -392,6 +443,9 @@ pub(crate) fn install() {}
 
 #[cfg(test)]
 pub(crate) mod tests {
+    pub(crate) fn record_move_paste(repeat: bool) {
+        super::record_clipboard_event(0x09, Some("√"), true, true, false, repeat);
+    }
     pub(crate) fn record_paste() {
         super::record_clipboard_paste();
     }
@@ -406,6 +460,39 @@ pub(crate) mod tests {
             "another harness drained this test's native paste"
         );
         assert!(drain().clipboard_paste);
+    }
+
+    #[test]
+    fn pr11r_move_gestures_have_identity_expire_and_never_promote_to_terminal_paste() {
+        drain();
+        record_move_paste(false);
+        let first = take_clipboard_move_paste().unwrap();
+        assert!(take_clipboard_move_paste().is_none());
+        record_move_paste(true);
+        assert!(
+            take_clipboard_move_paste().is_none(),
+            "native isARepeat cannot create another gesture"
+        );
+        record_move_paste(false);
+        let next = take_clipboard_move_paste().unwrap();
+        assert_ne!(first.sequence, next.sequence);
+        record(NativeKeyDown::ClipboardMovePaste(NativeMovePasteGesture {
+            sequence: next.sequence + 1,
+            observed_at: Instant::now() - Duration::from_secs(2),
+        }));
+        assert!(take_clipboard_move_paste().is_none());
+        record_move_paste(false);
+        let unclaimed = drain();
+        assert!(!unclaimed.clipboard_paste);
+        assert!(!unclaimed.clipboard_copy);
+        assert!(unclaimed.printable.is_empty());
+        record_paste();
+        record_move_paste(false);
+        take_clipboard_move_paste().unwrap();
+        assert!(
+            drain().clipboard_paste,
+            "ordinary paste flag remains independent"
+        );
     }
 
     #[test]

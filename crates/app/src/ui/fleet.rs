@@ -37,7 +37,7 @@ pub enum FleetAction {
     /// 대상·프롬프트를 사용자가 명시적으로 고른 뒤에만 발행된다).
     Broadcast {
         prompt: String,
-        targets: Vec<(String, runtime::SessionId)>,
+        targets: Vec<crate::fleet::FleetPromptTarget>,
     },
     /// 등록된 에이전트 설정으로 N개 세션을 한 번에 시작. `prompt`가 Some이면 렌더된
     /// 프롬프트 텍스트를 각 에이전트의 초기 argv(위치 인자)로 전달해 즉시 작업을
@@ -53,6 +53,7 @@ pub enum FleetAction {
     /// 달리 **지금 보내지 않는다**: App이 hook의 turn_done을 보고 턴이 끝난 뒤 보낸다.
     /// `prompt`가 비면 예약 해제다.
     ScheduleFollowUp {
+        target: Option<crate::fleet::FleetPromptTarget>,
         workspace_id: String,
         session: runtime::SessionId,
         prompt: String,
@@ -64,8 +65,9 @@ pub enum FleetAction {
 struct BroadcastState {
     prompt_id: Option<String>,
     params: BTreeMap<String, String>,
+    preview: FleetPromptPreview,
     /// 체크된 대상 (workspace_id, session).
-    targets: HashSet<(String, runtime::SessionId)>,
+    targets: HashSet<crate::fleet::FleetPromptTarget>,
     /// 대상 3개 이상 전송의 2단계 확인 단계(리뷰 Low). 프롬프트·대상이 바뀌면 초기화한다.
     confirm_send: bool,
 }
@@ -73,6 +75,7 @@ struct BroadcastState {
 /// 다음 단계 예약 패널 상태. 대상 세션은 패널을 여는 순간 고정된다 — 브로드캐스트와
 /// 달리 대상이 하나라 고르는 단계가 없다.
 struct FollowUpState {
+    target: Option<crate::fleet::FleetPromptTarget>,
     workspace_id: String,
     session: runtime::SessionId,
     /// 카드 제목 — 어느 세션에 예약하는지 패널에서 다시 보여준다.
@@ -81,13 +84,160 @@ struct FollowUpState {
     text: String,
 }
 
+fn append_followup_template(text: &mut String, body: &str) -> bool {
+    let separator = usize::from(!text.is_empty() && !text.ends_with('\n'));
+    if separator.saturating_add(body.len())
+        > crate::fleet::FLEET_PROMPT_MAX_BYTES.saturating_sub(text.len())
+    {
+        return false;
+    }
+    if separator == 1 {
+        text.push('\n');
+    }
+    text.push_str(body);
+    true
+}
+
 /// 배치 스폰 패널 상태 — 에이전트 선택 + 개수 + (선택) 프롬프트. 패널을 열 때마다
 /// 초기화한다. `prompt_id`가 None이면 빈 세션(PR-S1과 동일 — "없음" 선택).
+#[derive(Default)]
 struct BatchSpawnState {
     agent_id: Option<String>,
     count: u32,
     prompt_id: Option<String>,
     params: BTreeMap<String, String>,
+    preview: FleetPromptPreview,
+}
+
+/// One bounded expansion per open form, invalidated by content revision or accepted edits.
+#[derive(Default)]
+struct FleetPromptPreview {
+    key: Option<(u64, String)>,
+    names: Vec<String>,
+    rendered: Option<String>,
+    parse_error: bool,
+    input_error: bool,
+    dirty: bool,
+}
+
+fn fleet_prompt_input<'a>(
+    ui: &mut egui::Ui,
+    prompt: &crate::prompt_library::Prompt,
+    params: &mut BTreeMap<String, String>,
+    preview: &'a mut FleetPromptPreview,
+    revision: u64,
+    limits: (&str, usize),
+    catalog: &i18n::Catalog,
+) -> (Option<&'a str>, bool) {
+    use crate::prompt_library::{
+        PROMPT_PARAM_MAX_NAMES, PROMPT_PARAM_VALUE_MAX_BYTES, PROMPT_PARAM_VALUES_MAX_BYTES,
+        param_names_bounded, render_bounded,
+    };
+    let (salt, max_output_bytes) = limits;
+    let new_content = !preview
+        .key
+        .as_ref()
+        .is_some_and(|(rev, id)| *rev == revision && id == &prompt.id);
+    if new_content {
+        preview.key = Some((revision, prompt.id.clone()));
+        preview.rendered = None;
+        preview.input_error = false;
+        preview.dirty = true;
+        match param_names_bounded(&prompt.body) {
+            Ok(names) => {
+                params.retain(|name, _| names.contains(name));
+                preview.names = names;
+                preview.parse_error = false;
+            }
+            Err(_) => {
+                preview.names.clear();
+                params.clear();
+                preview.parse_error = true;
+            }
+        }
+        for index in 0..PROMPT_PARAM_MAX_NAMES {
+            let id = egui::Id::new((salt, index));
+            super::text_input::forget_bounded_text_state(ui.ctx(), id);
+            ui.memory_mut(|memory| memory.surrender_focus(id));
+        }
+    }
+    let mut changed = new_content;
+    if !preview.parse_error {
+        let mut total: usize = params.values().map(String::len).sum();
+        egui::ScrollArea::vertical()
+            .id_salt((salt, "fields"))
+            .max_height(180.0)
+            .show(ui, |ui| {
+                egui::Grid::new((salt, "grid"))
+                    .num_columns(2)
+                    .show(ui, |ui| {
+                        for (index, name) in preview.names.iter().enumerate() {
+                            ui.monospace(format!("{{{{{name}}}}}"));
+                            let value = params.entry(name.clone()).or_default();
+                            let previous = value.len();
+                            let budget = PROMPT_PARAM_VALUE_MAX_BYTES.min(
+                                PROMPT_PARAM_VALUES_MAX_BYTES
+                                    .saturating_sub(total.saturating_sub(previous)),
+                            );
+                            let (response, rejected) = super::text_input::bounded_edit(
+                                ui,
+                                value,
+                                budget,
+                                egui::Id::new((salt, index)),
+                                "",
+                                false,
+                            );
+                            total = total.saturating_sub(previous).saturating_add(value.len());
+                            if response.changed() {
+                                preview.dirty = true;
+                                preview.input_error = rejected;
+                                changed = true;
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
+        if preview.dirty {
+            preview.dirty = false;
+            preview.rendered = render_bounded(&prompt.body, params).ok();
+        }
+    }
+    let output_error = preview
+        .rendered
+        .as_ref()
+        .is_some_and(|text| text.len() > max_output_bytes);
+    if preview.parse_error || preview.input_error || preview.rendered.is_none() || output_error {
+        ui.colored_label(
+            ui.visuals().warn_fg_color,
+            catalog.t("prompt.input_limit", &[]),
+        );
+    }
+    if let Some(rendered) = &preview.rendered {
+        const MAX_PREVIEW: usize = 16 * 1024;
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(
+                        &rendered[..rendered.floor_char_boundary(MAX_PREVIEW.min(rendered.len()))],
+                    )
+                    .monospace(),
+                )
+                .wrap(),
+            );
+            if rendered.len() > MAX_PREVIEW {
+                ui.weak(catalog.t("prompt.preview_truncated", &[]));
+            }
+        });
+    }
+    let filled = preview.names.iter().all(|name| {
+        params
+            .get(name)
+            .is_some_and(|value| !value.trim().is_empty())
+    });
+    let ready = (!preview.parse_error && !preview.input_error && !output_error && filled)
+        .then_some(preview.rendered.as_deref())
+        .flatten();
+    (ready, changed)
 }
 
 /// 배치 스폰 패널에 필요한 App 투영 — 슬림 (id, name) 목록 + 설정 상한. `render`의
@@ -350,12 +500,20 @@ pub type PtyIdleClocks = HashMap<(String, runtime::SessionId), (i64, i64)>;
 
 #[derive(Default)]
 pub struct FleetUi {
+    /// App supplies the actual accepted library content revision before rendering Fleet.
+    prompt_revision: u64,
     /// Some이면 브로드캐스트 패널이 열려 있다.
     broadcast: Option<BroadcastState>,
     /// Some이면 배치 스폰 패널이 열려 있다.
     batch_spawn: Option<BatchSpawnState>,
     /// Some이면 다음 단계 예약 패널이 열려 있다.
     followup: Option<FollowUpState>,
+    followup_reset_pending: bool,
+    followup_input_error: bool,
+    followup_admission_error: bool,
+    followup_pending: bool,
+    retained_followups: usize,
+    blocked_followups: Vec<(String, runtime::SessionId)>,
     /// hook 완료 시각이 없는 세션도 첫 지시 대기 관측부터 시간을 센다.
     idle_started: HashMap<FleetIdleKey, IdleClock>,
 }
@@ -416,6 +574,86 @@ impl FleetIdleKey {
 }
 
 impl FleetUi {
+    pub fn set_followup_summary(
+        &mut self,
+        total: usize,
+        mut blocked: Vec<(String, runtime::SessionId)>,
+    ) {
+        blocked.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.0.cmp(&right.1.0)));
+        self.retained_followups = total;
+        self.blocked_followups = blocked;
+    }
+
+    /// A host refusal keeps the exact original form and draft available to correct or cancel.
+    pub fn settle_followup(&mut self, target: &crate::fleet::FleetPromptTarget, accepted: bool) {
+        if !self.followup.as_ref().is_some_and(|state| {
+            state.target.as_ref() == Some(target)
+                && state.workspace_id == target.workspace_id
+                && state.session == target.session
+        }) {
+            return;
+        }
+        self.followup_pending = false;
+        if accepted {
+            self.followup = None;
+        } else {
+            self.followup_admission_error = true;
+        }
+    }
+
+    fn blocked_followup_controls(
+        &self,
+        ui: &mut egui::Ui,
+        catalog: &i18n::Catalog,
+    ) -> Option<FleetAction> {
+        if self.retained_followups == 0 {
+            return None;
+        }
+        ui.weak(catalog.t(
+            "fleet.followup.retained",
+            &[("count", &self.retained_followups.to_string())],
+        ));
+        if self.blocked_followups.is_empty() {
+            return None;
+        }
+        ui.colored_label(
+            ui.visuals().warn_fg_color,
+            catalog.t("fleet.followup.blocked", &[]),
+        );
+        let mut action = None;
+        egui::ScrollArea::vertical()
+            .id_salt("fleet_blocked_followups")
+            .max_height(120.0)
+            .show_rows(
+                ui,
+                ui.text_style_height(&egui::TextStyle::Body) + 8.0,
+                self.blocked_followups.len(),
+                |ui, range| {
+                    for index in range {
+                        let (workspace, session) = &self.blocked_followups[index];
+                        ui.push_id(("blocked_followup", workspace, session.0), |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(format!("{} / {}", workspace, session.0));
+                                if ui.button(catalog.t("fleet.followup.cancel", &[])).clicked() {
+                                    action = Some(FleetAction::ScheduleFollowUp {
+                                        target: None,
+                                        workspace_id: workspace.clone(),
+                                        session: *session,
+                                        prompt: String::new(),
+                                    });
+                                }
+                            })
+                        });
+                    }
+                },
+            );
+        action
+    }
+
+    pub fn set_prompt_revision(&mut self, revision: u64) {
+        self.prompt_revision = revision;
+    }
+
     #[cfg(test)]
     fn idle_since(&self, session: &FleetSession) -> Option<i64> {
         self.idle_started
@@ -604,6 +842,7 @@ impl FleetUi {
                         self.broadcast = Some(BroadcastState {
                             prompt_id: library.prompts.first().map(|p| p.id.clone()),
                             params: BTreeMap::new(),
+                            preview: FleetPromptPreview::default(),
                             targets: sessions
                                 .iter()
                                 .filter(|s| s.state != AgentVisualState::Active)
@@ -620,11 +859,15 @@ impl FleetUi {
                             count: 1,
                             prompt_id: None,
                             params: BTreeMap::new(),
+                            preview: FleetPromptPreview::default(),
                         });
                     }
                     None => {}
                 }
                 ui.add_space(12.0);
+                if let Some(cancel) = self.blocked_followup_controls(ui, catalog) {
+                    *action = Some(cancel);
+                }
                 let AttentionInput {
                     pending,
                     workspace_names,
@@ -744,14 +987,20 @@ impl FleetUi {
                                                 // 이미 예약된 세션이면 그 원문으로
                                                 // 열어 고쳐 쓰게 한다.
                                                 self.followup = Some(FollowUpState {
+                                                    target: session.broadcast_key(),
                                                     workspace_id: session.workspace_id.clone(),
                                                     session: *id,
                                                     title: session.title.clone(),
                                                     text: session
                                                         .followup
-                                                        .clone()
-                                                        .unwrap_or_default(),
+                                                        .as_deref()
+                                                        .unwrap_or_default()
+                                                        .to_owned(),
                                                 });
+                                                self.followup_reset_pending = true;
+                                                self.followup_input_error = false;
+                                                self.followup_admission_error = false;
+                                                self.followup_pending = false;
                                             }
                                         }
                                         Some(CardClick::CancelFollowUp) => {
@@ -761,6 +1010,7 @@ impl FleetUi {
                                                 // 빈 프롬프트 = 해제(App이 같은 경로로
                                                 // 지운다 — 액션을 하나 더 만들지 않는다).
                                                 *action = Some(FleetAction::ScheduleFollowUp {
+                                                    target: None,
                                                     workspace_id: session.workspace_id.clone(),
                                                     session: *id,
                                                     prompt: String::new(),
@@ -835,8 +1085,9 @@ impl FleetUi {
         if super::popup::take_window_escape(ctx, egui::Id::new("fleet_followup")) {
             open = false;
         }
-        if !open || action.is_some() {
+        if !open {
             self.followup = None;
+            self.followup_pending = false;
         }
         action
     }
@@ -858,12 +1109,27 @@ impl FleetUi {
         });
         ui.weak(catalog.t("fleet.followup.hint", &[]));
         ui.add_space(6.0);
-        ui.add(
-            egui::TextEdit::multiline(&mut state.text)
-                .desired_rows(4)
-                .desired_width(f32::INFINITY)
-                .hint_text(catalog.t("fleet.followup.placeholder", &[])),
+        let id = egui::Id::new("fleet_followup_text");
+        if self.followup_reset_pending {
+            super::text_input::forget_bounded_text_state(ui.ctx(), id);
+            ui.memory_mut(|memory| memory.surrender_focus(id));
+            self.followup_reset_pending = false;
+        }
+        let (response, rejected) = super::text_input::bounded_edit_with_style(
+            ui,
+            &mut state.text,
+            crate::fleet::FLEET_PROMPT_MAX_BYTES,
+            id,
+            &catalog.t("fleet.followup.placeholder", &[]),
+            super::text_input::BoundedEditStyle::Multiline {
+                rows: 4,
+                code_editor: false,
+            },
         );
+        if response.changed() {
+            self.followup_input_error = rejected;
+            self.followup_admission_error = false;
+        }
         // 저장된 프롬프트는 **본문에 끼워 넣기만** 한다 — 브로드캐스트처럼 선택 하나로
         // 전송되는 게 아니라 사용자가 이어서 고쳐 쓰는 자리이기 때문이다.
         if !library.prompts.is_empty() {
@@ -873,28 +1139,49 @@ impl FleetUi {
                 .show_ui(ui, |ui| {
                     for prompt in &library.prompts {
                         if ui.selectable_label(false, &prompt.title).clicked() {
-                            if !state.text.is_empty() && !state.text.ends_with('\n') {
-                                state.text.push('\n');
+                            self.followup_input_error =
+                                !append_followup_template(&mut state.text, &prompt.body);
+                            if !self.followup_input_error {
+                                self.followup_admission_error = false;
                             }
-                            state.text.push_str(&prompt.body);
                         }
                     }
                 });
         }
         ui.add_space(8.0);
-        let prompt = state.text.trim().to_owned();
+        if self.followup_input_error || state.text.len() > crate::fleet::FLEET_PROMPT_MAX_BYTES {
+            super::popup::notice(
+                ui,
+                &catalog.t("prompt.input_limit", &[]),
+                super::popup::NoticeTone::Error,
+            );
+        }
+        if self.followup_admission_error {
+            super::popup::notice(
+                ui,
+                &catalog.t("fleet.followup.admission_rejected", &[]),
+                super::popup::NoticeTone::Error,
+            );
+        }
+        let prompt = state.text.trim();
+        let within_limit = state.text.len() <= crate::fleet::FLEET_PROMPT_MAX_BYTES;
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(
-                    !prompt.is_empty(),
+                    !prompt.is_empty()
+                        && within_limit
+                        && state.target.is_some()
+                        && !self.followup_pending,
                     egui::Button::new(catalog.t("fleet.followup.save", &[])),
                 )
                 .clicked()
             {
+                self.followup_pending = true;
                 return Some(FleetAction::ScheduleFollowUp {
+                    target: state.target.clone(),
                     workspace_id: state.workspace_id.clone(),
                     session: state.session,
-                    prompt,
+                    prompt: prompt.to_owned(),
                 });
             }
             None
@@ -962,6 +1249,7 @@ impl FleetUi {
                     if ui.selectable_label(picked, &prompt.title).clicked() {
                         state.prompt_id = Some(prompt.id.clone());
                         state.params.clear();
+                        state.preview = FleetPromptPreview::default();
                         state.confirm_send = false;
                     }
                 }
@@ -969,26 +1257,22 @@ impl FleetUi {
         // ② 파라미터 + 미리보기.
         let prompt = state.prompt_id.as_ref().and_then(|id| library.get(id));
         let ready_prompt = if let Some(prompt) = prompt {
-            let names = prompt.params();
-            if !names.is_empty() {
-                egui::Grid::new("fleet_bc_params")
-                    .num_columns(2)
-                    .show(ui, |ui| {
-                        for name in &names {
-                            ui.monospace(format!("{{{{{name}}}}}"));
-                            ui.text_edit_singleline(state.params.entry(name.clone()).or_default());
-                            ui.end_row();
-                        }
-                    });
+            let (ready, changed) = fleet_prompt_input(
+                ui,
+                prompt,
+                &mut state.params,
+                &mut state.preview,
+                self.prompt_revision,
+                (
+                    "fleet_bc_param",
+                    crate::prompt_library::PROMPT_BODY_MAX_BYTES,
+                ),
+                catalog,
+            );
+            if changed {
+                state.confirm_send = false;
             }
-            let rendered = crate::prompt_library::render(&prompt.body, &state.params);
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.add(egui::Label::new(egui::RichText::new(&rendered).monospace()).wrap());
-            });
-            let filled = names
-                .iter()
-                .all(|n| state.params.get(n).is_some_and(|v| !v.trim().is_empty()));
-            filled.then_some(rendered)
+            ready
         } else {
             None
         };
@@ -1023,7 +1307,7 @@ impl FleetUi {
         // ④ 전송 — 현재 PTY 세션과 교집합만 보낸다. 패널 연 뒤 종료된 stale 대상을 제외해
         // 카운트가 실제 전송 수와 일치하게 한다(세션 순회 순서라 결정적).
         ui.add_space(6.0);
-        let effective_targets: Vec<(String, runtime::SessionId)> = sessions
+        let effective_targets: Vec<crate::fleet::FleetPromptTarget> = sessions
             .iter()
             .filter_map(|s| s.broadcast_key())
             .filter(|key| state.targets.contains(key))
@@ -1046,9 +1330,9 @@ impl FleetUi {
             {
                 if count >= CONFIRM_THRESHOLD {
                     state.confirm_send = true;
-                } else if let Some(prompt_text) = ready_prompt.clone() {
+                } else if let Some(prompt_text) = ready_prompt {
                     out = Some(FleetAction::Broadcast {
-                        prompt: prompt_text,
+                        prompt: prompt_text.to_owned(),
                         targets: effective_targets.clone(),
                     });
                 }
@@ -1070,7 +1354,7 @@ impl FleetUi {
                     && let Some(prompt_text) = ready_prompt
                 {
                     out = Some(FleetAction::Broadcast {
-                        prompt: prompt_text,
+                        prompt: prompt_text.to_owned(),
                         targets: effective_targets,
                     });
                     state.confirm_send = false;
@@ -1191,35 +1475,29 @@ impl FleetUi {
                     if ui.selectable_label(picked, &prompt.title).clicked() {
                         state.prompt_id = Some(prompt.id.clone());
                         state.params.clear();
+                        state.preview = FleetPromptPreview::default();
                     }
                 }
             });
         let selected_prompt = state.prompt_id.as_ref().and_then(|id| library.get(id));
         // ready: 바깥 None이면 시작 불가(파라미터 미입력), Some(None)이면 빈 세션,
         // Some(Some(text))면 렌더된 프롬프트로 시작.
-        let ready: Option<Option<String>> = if let Some(prompt) = selected_prompt {
-            let names = prompt.params();
-            if !names.is_empty() {
-                egui::Grid::new("fleet_batch_params")
-                    .num_columns(2)
-                    .show(ui, |ui| {
-                        for name in &names {
-                            ui.monospace(format!("{{{{{name}}}}}"));
-                            ui.text_edit_singleline(state.params.entry(name.clone()).or_default());
-                            ui.end_row();
-                        }
-                    });
-            }
-            let rendered = crate::prompt_library::render(&prompt.body, &state.params);
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.add(egui::Label::new(egui::RichText::new(&rendered).monospace()).wrap());
-            });
-            let filled = names
-                .iter()
-                .all(|n| state.params.get(n).is_some_and(|v| !v.trim().is_empty()));
-            if filled { Some(Some(rendered)) } else { None }
-        } else {
+        let ready: Option<Option<&str>> = if let Some(prompt) = selected_prompt {
+            fleet_prompt_input(
+                ui,
+                prompt,
+                &mut state.params,
+                &mut state.preview,
+                self.prompt_revision,
+                ("fleet_batch_param", crate::fleet::FLEET_PROMPT_MAX_BYTES),
+                catalog,
+            )
+            .0
+            .map(Some)
+        } else if state.prompt_id.is_none() {
             Some(None)
+        } else {
+            None
         };
         ui.add_space(10.0);
         // ④ 시작.
@@ -1235,12 +1513,12 @@ impl FleetUi {
                 )
                 .clicked()
                 && let Some(agent_id) = state.agent_id.clone()
-                && let Some(prompt) = ready.clone()
+                && let Some(prompt) = ready
             {
                 out = Some(FleetAction::BatchSpawn {
                     agent_id,
                     count: state.count,
-                    prompt,
+                    prompt: prompt.map(str::to_owned),
                 });
             }
             // 프롬프트를 골랐지만 파라미터가 안 채워졌을 때만 힌트(broadcast의 fill과
@@ -1723,7 +2001,7 @@ fn card(
     if let Some(galley) = followup_galley {
         let response = content.add(egui::Label::new(galley));
         if let Some(prompt) = &session.followup {
-            response.on_hover_text(prompt);
+            response.on_hover_text(prompt.as_ref());
         }
     }
 
@@ -1735,7 +2013,13 @@ fn card(
     // 예약은 PTY 전용이다 — 구조화 세션은 steer 경로라 WriteInput 대상이 아니다.
     if matches!(session.target, FleetTarget::Pty { .. }) {
         response.context_menu(|ui| {
-            if ui.button(catalog.t("fleet.followup.menu", &[])).clicked() {
+            if ui
+                .add_enabled(
+                    session.broadcast_key().is_some(),
+                    egui::Button::new(catalog.t("fleet.followup.menu", &[])),
+                )
+                .clicked()
+            {
                 click = Some(CardClick::ScheduleFollowUp);
                 ui.close();
             }
@@ -1819,7 +2103,483 @@ fn state_label(state: AgentVisualState, catalog: &i18n::Catalog) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pr4_fleet_live_forms_reject_parameter_count_and_expansion_overflow() {
+        use egui_kittest::kittest::Queryable;
+        for batch in [false, true] {
+            for scenario in [0, 1, 2] {
+                if scenario == 2 && !batch {
+                    continue;
+                }
+                let expansion = scenario == 1;
+                let body = if expansion {
+                    "{{x}}".repeat(129)
+                } else if scenario == 2 {
+                    "x".repeat(16 * 1024 + 1)
+                } else {
+                    (0..129).map(|i| format!("{{{{p{i}}}}}")).collect()
+                };
+                let library = PromptLibrary {
+                    prompts: vec![crate::prompt_library::Prompt {
+                        id: "bounded-fixture".into(),
+                        title: "Fixture".into(),
+                        body,
+                        tags: vec![],
+                    }],
+                };
+                let params = if expansion {
+                    BTreeMap::from([("x".into(), "a".repeat(8192))])
+                } else {
+                    BTreeMap::new()
+                };
+                let mut fleet = FleetUi {
+                    broadcast: Some(BroadcastState {
+                        prompt_id: Some("bounded-fixture".into()),
+                        params: params.clone(),
+                        ..Default::default()
+                    }),
+                    batch_spawn: Some(BatchSpawnState {
+                        agent_id: Some("fixture".into()),
+                        count: 1,
+                        prompt_id: Some("bounded-fixture".into()),
+                        params,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                let mut harness = egui_kittest::Harness::builder()
+                    .with_size(egui::vec2(700.0, 500.0))
+                    .build_ui(|ui| {
+                        if batch {
+                            let agents = [(Arc::from("fixture"), Arc::from("Fixture"))];
+                            let _ = fleet.batch_spawn_body(ui, &agents, 4, &catalog(), &library);
+                        } else {
+                            let _ = fleet.broadcast_body(ui, &[], &catalog(), &library);
+                        }
+                    });
+                harness.run();
+                assert!(
+                    harness
+                        .query_by_label(&catalog().t("prompt.input_limit", &[]))
+                        .is_some(),
+                    "actual Fleet form must show limit before enabling action: batch={batch}, expansion={expansion}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pr4_fleet_followup_actual_paste_overflow_preserves_original() {
+        use egui_kittest::kittest::Queryable;
+        let fleet = FleetUi {
+            followup: Some(FollowUpState {
+                target: None,
+                workspace_id: "fixture".into(),
+                session: runtime::SessionId(1),
+                title: "Fixture".into(),
+                text: "KEEP".into(),
+            }),
+            ..Default::default()
+        };
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(700.0, 500.0))
+            .build_ui_state(
+                |ui, fleet: &mut FleetUi| {
+                    let _ = fleet.followup_body(ui, &catalog(), &PromptLibrary::default());
+                },
+                fleet,
+            );
+        harness.run();
+        harness
+            .get_by_role(egui::accesskit::Role::MultilineTextInput)
+            .click();
+        harness.run();
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::Paste("가".repeat(6000)));
+        harness.run();
+        let draft = &harness.state().followup.as_ref().unwrap().text;
+        assert!(
+            draft == "KEEP",
+            "rejected paste changed original: {} bytes",
+            draft.len()
+        );
+        assert!(
+            harness
+                .query_by_label(&catalog().t("prompt.input_limit", &[]))
+                .is_some()
+        );
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::Ime(egui::ImeEvent::Commit("😀".repeat(5000))));
+        harness.run();
+        assert_eq!(harness.state().followup.as_ref().unwrap().text, "KEEP");
+    }
+
+    #[test]
+    fn pr4_fleet_batch_host_limit_keeps_actual_form_open_without_action() {
+        use egui_kittest::kittest::Queryable;
+        struct State {
+            fleet: FleetUi,
+            acted: bool,
+        }
+        let state = State {
+            fleet: FleetUi {
+                batch_spawn: Some(BatchSpawnState {
+                    agent_id: Some("fixture".into()),
+                    count: 1,
+                    prompt_id: Some("large".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            acted: false,
+        };
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(800.0, 900.0))
+            .build_ui_state(
+                |ui, state: &mut State| {
+                    let library = PromptLibrary {
+                        prompts: vec![crate::prompt_library::Prompt {
+                            id: "large".into(),
+                            title: "Large".into(),
+                            body: "x".repeat(16 * 1024 + 1),
+                            tags: vec![],
+                        }],
+                    };
+                    let agents = [(Arc::from("fixture"), Arc::from("Fixture"))];
+                    state.acted |= state
+                        .fleet
+                        .batch_spawn_window(ui.ctx(), &agents, 4, &catalog(), &library)
+                        .is_some();
+                },
+                state,
+            );
+        harness.run();
+        use egui_kittest::kittest::NodeT;
+        assert!(
+            harness
+                .get_by_label(&catalog().t("fleet.batch.start", &[("count", "1")]))
+                .accesskit_node()
+                .is_disabled(),
+            "batch Start must be disabled at the actual host byte limit"
+        );
+        harness
+            .get_by_label(&catalog().t("fleet.batch.start", &[("count", "1")]))
+            .click();
+        harness.run();
+        assert!(
+            !harness.state().acted,
+            "oversized prompt must not leave the UI as a launch intent"
+        );
+        assert!(harness.state().fleet.batch_spawn.is_some());
+    }
+
     use super::*;
+
+    #[test]
+    fn pr4_fleet_broadcast_keeps_one_mib_while_batch_uses_host_limit() {
+        let ctx = egui::Context::default();
+        for size in [
+            crate::fleet::FLEET_PROMPT_MAX_BYTES + 1,
+            crate::prompt_library::PROMPT_BODY_MAX_BYTES,
+            crate::prompt_library::PROMPT_BODY_MAX_BYTES + 1,
+        ] {
+            let prompt = crate::prompt_library::Prompt {
+                id: "limit".into(),
+                title: "Limit".into(),
+                body: "a".repeat(size),
+                tags: vec![],
+            };
+            for max in [
+                crate::fleet::FLEET_PROMPT_MAX_BYTES,
+                crate::prompt_library::PROMPT_BODY_MAX_BYTES,
+            ] {
+                let mut preview = FleetPromptPreview::default();
+                let mut params = BTreeMap::new();
+                let mut ready = None;
+                ctx.run_ui(egui::RawInput::default(), |ui| {
+                    ready = fleet_prompt_input(
+                        ui,
+                        &prompt,
+                        &mut params,
+                        &mut preview,
+                        1,
+                        ("limit", max),
+                        &catalog(),
+                    )
+                    .0
+                    .map(str::len);
+                })
+                .drop_without_applying_deltas();
+                assert_eq!(
+                    ready,
+                    (size <= max).then_some(size),
+                    "size={size}, form limit={max}"
+                );
+            }
+        }
+    }
+
+    fn followup_fixture(text: String) -> FollowUpState {
+        FollowUpState {
+            target: Some(crate::fleet::FleetPromptTarget {
+                workspace_id: "fixture".into(),
+                runtime_instance: 41,
+                session: runtime::SessionId(7),
+                execution: crate::agent_detect::AgentExecutionIdentity::fixture(
+                    crate::agent_detect::AgentKind::Claude,
+                    1,
+                ),
+            }),
+            workspace_id: "fixture".into(),
+            session: runtime::SessionId(7),
+            title: "Fixture".into(),
+            text,
+        }
+    }
+
+    #[test]
+    fn pr4_fleet_followup_host_rejection_retains_exact_form_until_accepted() {
+        use egui_kittest::kittest::Queryable;
+        struct State {
+            fleet: FleetUi,
+            action: Option<FleetAction>,
+        }
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(800.0, 650.0))
+            .build_ui_state(
+                |ui, state: &mut State| {
+                    if let Some(action) =
+                        state
+                            .fleet
+                            .followup_window(ui.ctx(), &catalog(), &PromptLibrary::default())
+                    {
+                        state.action = Some(action);
+                    }
+                },
+                State {
+                    fleet: FleetUi {
+                        followup: Some(followup_fixture("  한글 😀\n다음 작업\t  ".into())),
+                        followup_reset_pending: true,
+                        ..Default::default()
+                    },
+                    action: None,
+                },
+            );
+        harness.run();
+        harness
+            .get_by_label(&catalog().t("fleet.followup.save", &[]))
+            .click();
+        harness.run();
+        let Some(FleetAction::ScheduleFollowUp {
+            target: Some(target),
+            prompt,
+            ..
+        }) = harness.state().action.as_ref()
+        else {
+            panic!("no exact reservation action")
+        };
+        assert_eq!(prompt, "한글 😀\n다음 작업");
+        let target = target.clone();
+        assert!(
+            harness.state().fleet.followup.is_some(),
+            "host has not accepted yet"
+        );
+        assert!(harness.state().fleet.followup_pending);
+        let mut stale = target.clone();
+        stale.runtime_instance += 1;
+        harness.state_mut().fleet.settle_followup(&stale, true);
+        assert!(harness.state().fleet.followup.is_some());
+        harness.state_mut().fleet.settle_followup(&target, false);
+        harness.run();
+        assert_eq!(
+            harness.state().fleet.followup.as_ref().unwrap().text,
+            "  한글 😀\n다음 작업\t  "
+        );
+        assert!(
+            harness
+                .query_by_label(&catalog().t("fleet.followup.admission_rejected", &[]))
+                .is_some()
+        );
+        assert!(!harness.state().fleet.followup_pending);
+        harness.state_mut().fleet.settle_followup(&target, true);
+        assert!(harness.state().fleet.followup.is_none());
+    }
+
+    #[test]
+    fn pr4_fleet_followup_template_separator_is_atomic_at_limit() {
+        let limit = crate::fleet::FLEET_PROMPT_MAX_BYTES;
+        let mut original = "a".repeat(limit - 3);
+        let before = original.clone();
+        assert!(!append_followup_template(&mut original, "한"));
+        assert_eq!(original, before, "separator must count before any mutation");
+        original.pop();
+        assert!(append_followup_template(&mut original, "한"));
+        assert_eq!(original.len(), limit);
+        assert!(original.ends_with("\n한"));
+        let before = original.clone();
+        assert!(!append_followup_template(&mut original, "😀"));
+        assert_eq!(original, before);
+    }
+
+    #[test]
+    fn pr4_fleet_blocked_reservation_cancel_is_visible_without_session_cards() {
+        use egui_kittest::kittest::Queryable;
+        struct State {
+            fleet: FleetUi,
+            action: Option<FleetAction>,
+        }
+        let mut fleet = FleetUi::default();
+        fleet.set_followup_summary(1, vec![("closed-workspace".into(), runtime::SessionId(99))]);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(900.0, 600.0))
+            .build_ui_state(
+                |ui, state: &mut State| {
+                    let mut waiting = InboxWaitingUi::new();
+                    let page = state.fleet.render(
+                        ui,
+                        &[],
+                        FleetSummary::default(),
+                        &catalog(),
+                        &PromptLibrary::default(),
+                        BatchSpawnInput {
+                            agents: &[],
+                            max: 4,
+                        },
+                        AttentionInput {
+                            pending: &[],
+                            workspace_names: &HashMap::new(),
+                            session_titles: &HashMap::new(),
+                            waiting_cards: &[],
+                            waiting_ui: &mut waiting,
+                            structured: &[],
+                        },
+                    );
+                    if let Some(action) = page.grid {
+                        state.action = Some(action);
+                    }
+                },
+                State {
+                    fleet,
+                    action: None,
+                },
+            );
+        harness.run();
+        assert!(
+            harness
+                .query_by_label(&catalog().t("fleet.followup.blocked", &[]))
+                .is_some()
+        );
+        harness
+            .get_by_label(&catalog().t("fleet.followup.cancel", &[]))
+            .click();
+        harness.run();
+        assert!(
+            matches!(harness.state().action.as_ref(), Some(FleetAction::ScheduleFollowUp {
+            target: None, workspace_id, session: runtime::SessionId(99), prompt,
+        }) if workspace_id == "closed-workspace" && prompt.is_empty())
+        );
+    }
+
+    #[test]
+    fn pr4_fleet_followup_reopen_resets_fixed_id_undo_but_stable_form_can_undo() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("fleet_followup_text");
+        let mut fleet = FleetUi {
+            followup: Some(followup_fixture("BASE".into())),
+            followup_reset_pending: true,
+            ..Default::default()
+        };
+        let mut time = 0.0;
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            fleet.followup_body(ui, &catalog(), &PromptLibrary::default());
+        })
+        .drop_without_applying_deltas();
+        ctx.memory_mut(|memory| memory.request_focus(id));
+        let mut state = egui::TextEdit::load_state(&ctx, id).unwrap();
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::one(
+                egui::text::CCursor::new(4),
+            )));
+        state.store(&ctx, id);
+        for _ in 0..20 {
+            time += 2.0;
+            let mut input = egui::RawInput {
+                time: Some(time),
+                ..Default::default()
+            };
+            input.events.push(egui::Event::Text("a".into()));
+            ctx.run_ui(input, |ui| {
+                fleet.followup_body(ui, &catalog(), &PromptLibrary::default());
+            })
+            .drop_without_applying_deltas();
+            time += 2.0;
+            ctx.run_ui(
+                egui::RawInput {
+                    time: Some(time),
+                    ..Default::default()
+                },
+                |ui| {
+                    fleet.followup_body(ui, &catalog(), &PromptLibrary::default());
+                },
+            )
+            .drop_without_applying_deltas();
+        }
+        fleet.followup_admission_error = true;
+        let mut undos = 0;
+        for _ in 0..25 {
+            let previous = fleet.followup.as_ref().unwrap().text.clone();
+            time += 2.0;
+            let mut input = egui::RawInput {
+                time: Some(time),
+                ..Default::default()
+            };
+            input.events.push(egui::Event::Key {
+                key: egui::Key::Z,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::COMMAND,
+            });
+            ctx.run_ui(input, |ui| {
+                fleet.followup_body(ui, &catalog(), &PromptLibrary::default());
+            })
+            .drop_without_applying_deltas();
+            if fleet.followup.as_ref().unwrap().text == previous {
+                break;
+            }
+            undos += 1;
+            assert!(fleet.followup.as_ref().unwrap().text.starts_with("BASE"));
+        }
+        assert!(
+            undos > 0 && undos <= 8,
+            "stable form retains bounded useful undo: {undos}"
+        );
+        fleet.followup = Some(followup_fixture("OTHER_SESSION".into()));
+        fleet.followup_reset_pending = true;
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            fleet.followup_body(ui, &catalog(), &PromptLibrary::default());
+        })
+        .drop_without_applying_deltas();
+        ctx.memory_mut(|memory| memory.request_focus(id));
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::Key {
+            key: egui::Key::Z,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        ctx.run_ui(input, |ui| {
+            fleet.followup_body(ui, &catalog(), &PromptLibrary::default());
+        })
+        .drop_without_applying_deltas();
+        assert_eq!(fleet.followup.as_ref().unwrap().text, "OTHER_SESSION");
+    }
 
     #[test]
     fn popup_audit_followup_behind_confirmation_keeps_its_draft_on_escape() {
@@ -1828,6 +2588,15 @@ mod tests {
         let library = PromptLibrary::default();
         let mut fleet = FleetUi {
             followup: Some(FollowUpState {
+                target: Some(crate::fleet::FleetPromptTarget {
+                    workspace_id: "ws-1".into(),
+                    runtime_instance: 1,
+                    session: runtime::SessionId(7),
+                    execution: crate::agent_detect::AgentExecutionIdentity::fixture(
+                        crate::agent_detect::AgentKind::Claude,
+                        1,
+                    ),
+                }),
                 workspace_id: "project".into(),
                 session: runtime::SessionId(7),
                 title: "Agent".into(),
@@ -1878,6 +2647,15 @@ mod tests {
         let library = PromptLibrary::default();
         let mut fleet = FleetUi {
             followup: Some(FollowUpState {
+                target: Some(crate::fleet::FleetPromptTarget {
+                    workspace_id: "ws-1".into(),
+                    runtime_instance: 1,
+                    session: runtime::SessionId(7),
+                    execution: crate::agent_detect::AgentExecutionIdentity::fixture(
+                        crate::agent_detect::AgentKind::Claude,
+                        1,
+                    ),
+                }),
                 workspace_id: "project".into(),
                 session: runtime::SessionId(7),
                 title: "Agent".into(),
@@ -1966,6 +2744,15 @@ mod tests {
                 tab: runtime::MuxTabId("t1".into()),
                 pane: runtime::MuxPaneId("p1".into()),
             },
+            prompt_target: Some(crate::fleet::FleetPromptTarget {
+                workspace_id: workspace_id.into(),
+                runtime_instance: 1,
+                session: runtime::SessionId(session),
+                execution: crate::agent_detect::AgentExecutionIdentity::fixture(
+                    crate::agent_detect::AgentKind::Claude,
+                    1,
+                ),
+            }),
             title: format!("session-{session}"),
             state,
             agent_line: None,
@@ -2056,7 +2843,7 @@ mod tests {
         for extra_rows in [false, true] {
             if extra_rows {
                 session.waiting_message = Some("다음 작업 지시를 기다립니다".into());
-                session.followup = Some("관련 테스트를 실행해줘.\n결과를 확인하고 실패한 원인을 정리한 다음 수정 후 다시 테스트하고 검증 명령과 결과를 보고해줘. ".repeat(100));
+                session.followup = Some("관련 테스트를 실행해줘.\n결과를 확인하고 실패한 원인을 정리한 다음 수정 후 다시 테스트하고 검증 명령과 결과를 보고해줘. ".repeat(100).into());
             }
             let mut harness = egui_kittest::Harness::builder()
                 .with_size(egui::vec2(400.0, 300.0))
@@ -3061,7 +3848,7 @@ mod tests {
         let outer = catalog();
         let heading = outer.t("fleet.followup.list", &[("count", "1")]);
         let mut session = pty_session("ws-1", 7, AgentVisualState::Active);
-        session.followup = Some("테스트 돌리고 실패한 것만 고쳐".to_owned());
+        session.followup = Some("테스트 돌리고 실패한 것만 고쳐".into());
         let mut harness = egui_kittest::Harness::builder()
             .with_size(egui::vec2(1100.0, 600.0))
             .build_ui(|ui| {
@@ -3117,6 +3904,15 @@ mod tests {
         // 테스트라 열린 상태에서 시작한다.
         let fleet = FleetUi {
             followup: Some(FollowUpState {
+                target: Some(crate::fleet::FleetPromptTarget {
+                    workspace_id: "ws-1".into(),
+                    runtime_instance: 1,
+                    session: runtime::SessionId(7),
+                    execution: crate::agent_detect::AgentExecutionIdentity::fixture(
+                        crate::agent_detect::AgentKind::Claude,
+                        1,
+                    ),
+                }),
                 workspace_id: "ws-1".to_owned(),
                 session: runtime::SessionId(7),
                 title: "session-7".to_owned(),
@@ -3150,6 +3946,7 @@ mod tests {
                         },
                     );
                     if let Some(FleetAction::ScheduleFollowUp {
+                        target: _,
                         workspace_id,
                         session,
                         prompt,

@@ -463,7 +463,12 @@ fn process(
             let Some(tool) = v["params"]["name"].as_str().filter(|s| {
                 matches!(
                     *s,
-                    "list_sessions" | "read_output" | "send_text" | "send_ctrl_c" | "notify"
+                    "list_sessions"
+                        | "read_output"
+                        | "send_text"
+                        | "paste_text"
+                        | "send_ctrl_c"
+                        | "notify"
                 )
             }) else {
                 return rpc_error(id, -32602, "unknown_tool");

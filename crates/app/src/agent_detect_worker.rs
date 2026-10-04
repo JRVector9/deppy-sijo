@@ -1116,6 +1116,7 @@ mod tests {
             agent_kinds: Some(HashMap::from([(
                 session,
                 RunningAgent {
+                    execution: None,
                     kind: AgentKind::Claude,
                     model: None,
                     effort: None,
@@ -1181,6 +1182,7 @@ mod tests {
                         (
                             *session,
                             RunningAgent {
+                                execution: None,
                                 kind: AgentKind::Claude,
                                 model: None,
                                 effort: None,
@@ -1251,6 +1253,7 @@ mod tests {
         let kimi = HashMap::from([(
             SessionId(9),
             RunningAgent {
+                execution: None,
                 kind: AgentKind::Kimi,
                 model: Some("kimi-code/k3".to_owned()),
                 effort: None,
@@ -1569,6 +1572,7 @@ mod tests {
                         (
                             *session,
                             RunningAgent {
+                                execution: None,
                                 kind: AgentKind::Claude,
                                 model: None,
                                 effort: None,

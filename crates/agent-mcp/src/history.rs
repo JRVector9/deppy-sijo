@@ -86,17 +86,24 @@ impl History {
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':')),
             "invalid_operation_id"
         );
-        let hash = Sha256::digest(serde_json::to_vec(&(tool, args))?).to_vec();
+        anyhow::ensure!(
+            tool.len() <= 64 && workspace.len() <= 128 && session.len() <= 128,
+            "history_identity_too_large"
+        );
+        let encoded = serde_json::to_vec(&(tool, args))?;
+        anyhow::ensure!(encoded.len() <= 65_600, "history_arguments_too_large");
+        let hash = Sha256::digest(encoded).to_vec();
         let tx = self.0.unchecked_transaction()?;
         let row: Option<(Vec<u8>, String)> = tx
             .query_row(
-                "SELECT fingerprint,outcome FROM operations WHERE id=?1",
+                "SELECT CASE WHEN length(fingerprint)<=32 THEN fingerprint END, CASE WHEN length(CAST(outcome AS BLOB))<=2048 THEN outcome END FROM operations WHERE id=?1",
                 [id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
         if let Some((previous, outcome)) = row {
             anyhow::ensure!(previous == hash, "operation_id_conflict");
+            anyhow::ensure!(outcome.len() <= 2048, "history_outcome_too_large");
             return Ok(Claim::Existing(serde_json::from_str(&outcome)?));
         }
         let count: i64 = tx.query_row("SELECT count(*) FROM operations", [], |r| r.get(0))?;
@@ -108,6 +115,10 @@ impl History {
     }
     pub fn finish(&self, id: &str, outcome: &Value, message: &str) -> anyhow::Result<()> {
         anyhow::ensure!(message.len() <= crate::MAX_ANSWER, "answer_too_large");
+        anyhow::ensure!(
+            outcome.to_string().len() <= 2048,
+            "history_outcome_too_large"
+        );
         let tx = self.0.unchecked_transaction()?;
         anyhow::ensure!(
             tx.execute(
@@ -127,10 +138,16 @@ impl History {
         Ok(())
     }
     pub fn recent(&self) -> anyhow::Result<Vec<Record>> {
-        let mut stmt = self.0.prepare("SELECT id,tool,workspace,session,created,outcome,message FROM operations WHERE rowid IN (SELECT rowid FROM operations ORDER BY rowid DESC LIMIT 500) OR id IN (SELECT operation_id FROM answer_completion ORDER BY sequence DESC LIMIT 100) ORDER BY (SELECT sequence FROM answer_completion WHERE operation_id=operations.id) DESC, rowid DESC")?;
+        self.recent_bounded(3 * 1024 * 1024)
+    }
+    /// Retained audit/answer rows are bounded before SQLite materializes their TEXT bodies.
+    /// Oversized externally modified rows fail closed rather than allocating their contents.
+    pub fn recent_bounded(&self, max_bytes: usize) -> anyhow::Result<Vec<Record>> {
+        let mut stmt = self.0.prepare("SELECT CASE WHEN length(CAST(id AS BLOB))<=128 THEN id END, CASE WHEN length(CAST(tool AS BLOB))<=64 THEN tool END, CASE WHEN length(CAST(workspace AS BLOB))<=128 THEN workspace END, CASE WHEN length(CAST(session AS BLOB))<=128 THEN session END, created, CASE WHEN length(CAST(outcome AS BLOB))<=2048 THEN outcome END, CASE WHEN length(CAST(message AS BLOB))<=16384 THEN message END FROM operations WHERE rowid IN (SELECT rowid FROM operations ORDER BY rowid DESC LIMIT 500) OR id IN (SELECT operation_id FROM answer_completion ORDER BY sequence DESC LIMIT 100) ORDER BY (SELECT sequence FROM answer_completion WHERE operation_id=operations.id) DESC, rowid DESC")?;
+        let mut bytes = 0usize;
         Ok(stmt
             .query_map([], |r| {
-                Ok(Record {
+                let row = Record {
                     id: r.get(0)?,
                     tool: r.get(1)?,
                     workspace: r.get(2)?,
@@ -138,7 +155,19 @@ impl History {
                     created: r.get(4)?,
                     outcome: r.get(5)?,
                     message: r.get(6)?,
-                })
+                };
+                bytes = bytes.saturating_add(
+                    row.id.len()
+                        + row.tool.len()
+                        + row.workspace.len()
+                        + row.session.len()
+                        + row.outcome.len()
+                        + row.message.len(),
+                );
+                if bytes > max_bytes {
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
+                Ok(row)
             })?
             .collect::<Result<Vec<_>, _>>()?)
     }

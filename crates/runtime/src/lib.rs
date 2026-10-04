@@ -9,12 +9,16 @@ mod event;
 mod host;
 mod in_process;
 mod input_admission;
-pub use input_admission::{InputAdmission, InputPermit};
+pub use input_admission::{
+    AgentInputGuard, AgentInputIntent, AgentPromptKind, InputAdmission, InputPermit,
+};
 pub mod known_hosts;
 mod persistence;
 mod protocol;
 mod remote;
 mod resource_monitor;
+#[cfg(test)]
+mod test_secret_store;
 pub mod tls_identity;
 
 // deppy-sijo: 메모리 해제 훅 — hidden/exited 전환이 스크롤백을 압축·트림해 셀 배열을

@@ -400,6 +400,22 @@ pub(crate) fn runtime_command_retained_bytes(
                 retained_optional_string(&mut total, regex)?;
             }
         }
+        RuntimeCommand::WriteInputBatchTracked {
+            operation_id,
+            parts,
+            ..
+        } => {
+            retained_string(&mut total, operation_id)?;
+            retained_add(
+                &mut total,
+                parts
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Vec<u8>>()),
+            )?;
+            for part in parts {
+                retained_add(&mut total, part.capacity())?;
+            }
+        }
         RuntimeCommand::WriteInput { bytes, .. } => retained_add(&mut total, bytes.capacity())?,
         RuntimeCommand::WriteInputTracked {
             bytes,
@@ -555,6 +571,17 @@ pub(crate) fn canonicalize_host_command(command: &mut RuntimeCommand) {
         } => {
             canonicalize_string(operation_id);
             *bytes = std::mem::take(bytes).into_boxed_slice().into_vec();
+        }
+        RuntimeCommand::WriteInputBatchTracked {
+            operation_id,
+            parts,
+            ..
+        } => {
+            canonicalize_string(operation_id);
+            for part in parts.iter_mut() {
+                *part = std::mem::take(part).into_boxed_slice().into_vec();
+            }
+            *parts = std::mem::take(parts).into_boxed_slice().into_vec();
         }
         RuntimeCommand::WriteInput { bytes, .. } => {
             *bytes = std::mem::take(bytes).into_boxed_slice().into_vec();
@@ -727,6 +754,26 @@ pub(crate) fn validate_host_command(command: &RuntimeCommand) -> Result<(), Runt
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b':'))
                 || bytes.len() > WRITE_INPUT_BYTES_MAX
+            {
+                return Err(admission_error("runtime_command_input_invalid"));
+            }
+        }
+        RuntimeCommand::WriteInputBatchTracked {
+            operation_id,
+            parts,
+            ..
+        } => {
+            if operation_id.is_empty()
+                || operation_id.len() > 128
+                || !operation_id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b':'))
+                || parts.is_empty()
+                || parts.len() > 32
+                || parts
+                    .iter()
+                    .try_fold(0usize, |sum, part| sum.checked_add(part.len()))
+                    .is_none_or(|bytes| bytes > WRITE_INPUT_BYTES_MAX)
             {
                 return Err(admission_error("runtime_command_input_invalid"));
             }
@@ -1141,6 +1188,13 @@ pub enum RuntimeCommand {
         operation_id: String,
         bytes: Vec<u8>,
     },
+    /// Atomic queue admission preserving each paste/submit writer-message boundary.
+    /// Appended to preserve existing postcard discriminants.
+    WriteInputBatchTracked {
+        session: SessionId,
+        operation_id: String,
+        parts: Vec<Vec<u8>>,
+    },
 }
 
 impl std::fmt::Debug for RuntimeCommand {
@@ -1226,6 +1280,17 @@ impl std::fmt::Debug for RuntimeCommand {
                 .field("session", session)
                 .field("operation_id_len", &operation_id.len())
                 .field("bytes_len", &bytes.len())
+                .finish(),
+            RuntimeCommand::WriteInputBatchTracked {
+                session,
+                operation_id,
+                parts,
+            } => f
+                .debug_struct("WriteInputBatchTracked")
+                .field("session", session)
+                .field("operation_id_len", &operation_id.len())
+                .field("part_count", &parts.len())
+                .field("byte_count", &parts.iter().map(Vec::len).sum::<usize>())
                 .finish(),
             RuntimeCommand::WriteInput { session, bytes } => f
                 .debug_struct("WriteInput")
@@ -1397,6 +1462,40 @@ impl std::fmt::Debug for RuntimeCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pr1_batch_input_validates_total_budget_identity_and_redacts_debug() {
+        let make = |parts| RuntimeCommand::WriteInputBatchTracked {
+            session: SessionId(7),
+            operation_id: "prompt:one".to_owned(),
+            parts,
+        };
+        let mut command = make(vec!["한글\n😀".as_bytes().to_vec(), b"\r".to_vec()]);
+        assert!(prepare_runtime_command_for_retention_internal(&mut command).is_ok());
+        let encoded = postcard::to_allocvec(&command).unwrap();
+        let decoded: RuntimeCommand = postcard::from_bytes(&encoded).unwrap();
+        assert!(
+            matches!(decoded, RuntimeCommand::WriteInputBatchTracked { session: SessionId(7), operation_id, parts }
+            if operation_id == "prompt:one" && parts == vec!["한글\n😀".as_bytes().to_vec(), b"\r".to_vec()])
+        );
+        assert!(!format!("{command:?}").contains("한글"));
+        assert!(
+            prepare_runtime_command_for_retention_internal(&mut make(vec![
+                vec![0; WRITE_INPUT_BYTES_MAX],
+                vec![0]
+            ]))
+            .is_err()
+        );
+        assert!(
+            prepare_runtime_command_for_retention_internal(&mut make(vec![vec![]; 33])).is_err()
+        );
+        assert!(prepare_runtime_command_for_retention_internal(&mut make(vec![])).is_err());
+        let mut bad_identity = make(vec![vec![1]]);
+        if let RuntimeCommand::WriteInputBatchTracked { operation_id, .. } = &mut bad_identity {
+            *operation_id = "unsafe id".into();
+        }
+        assert!(prepare_runtime_command_for_retention_internal(&mut bad_identity).is_err());
+    }
 
     #[test]
     fn tracked_input_validates_operation_identity_and_preserves_wire_roundtrip() {
@@ -2184,6 +2283,7 @@ mod tests {
                 "SetScrollbackLimit",
                 "ResizeTracked",
                 "WriteInputTracked",
+                "WriteInputBatchTracked",
             ]
         );
     }

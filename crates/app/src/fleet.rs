@@ -11,6 +11,9 @@
 
 use crate::agent_surface::AgentVisualState;
 
+/// Shared host/form UTF-8 byte bound for batch argv prompts and scheduled follow-ups.
+pub const FLEET_PROMPT_MAX_BYTES: usize = 16 * 1024;
+
 /// 작업 메뉴의 상태별 건수. 상태 없는 셸·비활성 저장 행은 알림에서 제외한다.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FleetNavSummary {
@@ -86,6 +89,7 @@ pub struct FleetSession {
     pub workspace_name: String,
     /// 포커스 라우팅 + 종류(PTY vs 구조화). 브로드캐스트는 PTY만 대상이다.
     pub target: FleetTarget,
+    pub prompt_target: Option<FleetPromptTarget>,
     pub title: String,
     /// 정규화된 시각 상태(agent_surface). needs-input/승인/오류/완료/작업중/유휴/off.
     pub state: AgentVisualState,
@@ -110,7 +114,7 @@ pub struct FleetSession {
     /// 이 턴이 끝나면 이어서 보낼 예약 프롬프트. 카드 칩과 예약 패널의 초기값을 함께
     /// 담당한다 — 원문이 있어야 다시 열었을 때 고쳐 쓸 수 있다. PTY 전용이라 구조화
     /// 세션은 항상 None이다(steer 경로).
-    pub followup: Option<String>,
+    pub followup: Option<std::sync::Arc<str>>,
 }
 
 /// 「작업 중」인데 이만큼 출력이 없으면 멈춘 것으로 본다.
@@ -167,13 +171,27 @@ pub enum FleetTarget {
     Structured { session_id: String },
 }
 
+/// Captured at selection, never rebound to a replacement AI in the same terminal.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FleetPromptTarget {
+    pub workspace_id: String,
+    pub runtime_instance: u64,
+    pub session: runtime::SessionId,
+    pub execution: crate::agent_detect::AgentExecutionIdentity,
+}
+
 impl FleetSession {
-    /// 브로드캐스트 대상 키 — PTY만 Some(구조화는 steer라 제외).
-    pub fn broadcast_key(&self) -> Option<(String, runtime::SessionId)> {
-        match &self.target {
-            FleetTarget::Pty { session, .. } => Some((self.workspace_id.clone(), *session)),
-            FleetTarget::Structured { .. } => None,
+    pub fn broadcast_key(&self) -> Option<FleetPromptTarget> {
+        let FleetTarget::Pty { session, .. } = self.target else {
+            return None;
+        };
+        if matches!(self.state, AgentVisualState::Off | AgentVisualState::Error) {
+            return None;
         }
+        self.prompt_target
+            .as_ref()
+            .filter(|target| target.workspace_id == self.workspace_id && target.session == session)
+            .cloned()
     }
 }
 
@@ -449,6 +467,7 @@ mod tests {
             target: FleetTarget::Structured {
                 session_id: format!("{workspace}-{title}"),
             },
+            prompt_target: None,
             title: title.into(),
             state,
             agent_line: None,
@@ -461,6 +480,70 @@ mod tests {
             last_output_at: None,
             followup: None,
         }
+    }
+
+    #[test]
+    fn pr2_ordinary_and_exited_shells_are_not_ai_broadcast_targets() {
+        let mut row = session("local", "shell", AgentVisualState::Idle);
+        row.target = FleetTarget::Pty {
+            session: runtime::SessionId(7),
+            tab: runtime::MuxTabId("tab".into()),
+            pane: runtime::MuxPaneId("pane".into()),
+        };
+        assert_eq!(
+            row.broadcast_key(),
+            None,
+            "ordinary shell must not receive AI prompts"
+        );
+        row.agent_line = Some("Claude".into());
+        row.state = AgentVisualState::Off;
+        assert_eq!(
+            row.broadcast_key(),
+            None,
+            "stale AI label does not make fallback shell eligible"
+        );
+    }
+
+    #[test]
+    fn pr2_selected_target_does_not_follow_replacement_ai_or_runtime() {
+        let mut row = session("local", "Claude", AgentVisualState::Active);
+        row.target = FleetTarget::Pty {
+            session: runtime::SessionId(7),
+            tab: runtime::MuxTabId("tab".into()),
+            pane: runtime::MuxPaneId("pane".into()),
+        };
+        let old = FleetPromptTarget {
+            workspace_id: "local".into(),
+            runtime_instance: 10,
+            session: runtime::SessionId(7),
+            execution: crate::agent_detect::AgentExecutionIdentity::fixture(
+                crate::agent_detect::AgentKind::Claude,
+                1,
+            ),
+        };
+        row.prompt_target = Some(old.clone());
+        let selected = std::collections::HashSet::from([row.broadcast_key().unwrap()]);
+        row.prompt_target.as_mut().unwrap().execution =
+            crate::agent_detect::AgentExecutionIdentity::fixture(
+                crate::agent_detect::AgentKind::Claude,
+                2,
+            );
+        assert!(
+            !selected.contains(&row.broadcast_key().unwrap()),
+            "replacement AI not silently selected"
+        );
+        row.prompt_target = Some(FleetPromptTarget {
+            runtime_instance: 11,
+            ..old
+        });
+        assert!(
+            !selected.contains(&row.broadcast_key().unwrap()),
+            "replacement runtime not silently selected"
+        );
+        row.target = FleetTarget::Structured {
+            session_id: "thread".into(),
+        };
+        assert!(row.broadcast_key().is_none());
     }
 
     fn blocked(workspace: &str, title: &str, since: i64) -> FleetSession {

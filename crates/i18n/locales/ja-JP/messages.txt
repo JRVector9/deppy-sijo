@@ -1401,3 +1401,31 @@ fleet.followup.list = 次の作業 ({count})
 fleet.followup.empty = 予約された作業なし
 
 env.delete_source = 削除元のファイル
+
+composer.delivery.persisting = 入力前に保存中…
+composer.delivery.pending = 入力の受け付けを確認中…
+composer.delivery.rejected = 未送信・下書きを保持
+composer.delivery.unknown = 受け付け不明・元の端末を確認してから再送してください
+composer.delivery.allow_resend = 確認済み・再送を許可
+composer.delivery.accepted = 入力受け付け済み・実行は未確認
+
+prompt.persistence.saving = 保存中…
+prompt.persistence.failed = 保存失敗 · 変更はメモリに残っています
+prompt.persistence.recovery = 原本を保護 · 自動保存を停止。ファイルを復旧してからアプリを開き直してください
+prompt.persistence.limit_or_error = 上限超過または保存エラー · 変更は保存されていません
+prompt.persistence.retry = 保存を再試行
+prompt.persistence.conflict = ファイルが外部で変更 · 未保存の変更はメモリに残っています
+prompt.persistence.recovery_hint = 現在の変更をバックアップし、原本を復旧してからアプリを開き直してください
+
+prompt.input_limit = 入力上限に達しました。元の内容は保持されます。入力やテンプレート変数を短くしてください。
+prompt.preview_truncated = 最初の16 KiBを表示しています。挿入には全文を使用します。
+fleet.followup.retained = 保持中の予約タスク: {count}件
+fleet.followup.blocked = 取り消すと予約を削除し、PTY受付前の入力を止められます。受付済みの入力を戻したり、結果不明の状態を解消したりすることはできません。自動再送は行いません。
+fleet.followup.admission_rejected = タスクを予約できませんでした。入力フォームは保持されます。対象と上限を確認するか、ブロックされた予約を取り消してください。
+
+composer.draft.limit = 下書きの入力上限です（各1MiB、合計32MiB / 256件）。元の文字は保持されます。
+composer.draft.saving = 下書きを保存中…
+composer.draft.failed = 下書き未保存 · 文字はメモリに保持されます
+composer.draft.recovery = 下書きの復旧が必要 · 入力欄は読み取り専用です
+composer.draft.recovery_hint = composer_drafts.jsonをバックアップして正常なファイルを復元し、アプリを開き直してください。未保存の文字はこの画面に残ります。
+composer.draft.delivery_limit = 送信結果の保留上限です（8MiB / 256件）。元のセッションで確認または削除してください。自動再送は行いません。

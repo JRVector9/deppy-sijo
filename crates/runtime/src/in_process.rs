@@ -416,6 +416,55 @@ impl InProcessRuntimeClient {
         )
     }
 
+    /// Guard remains held through one reservation of all paste/submit parts.
+    pub fn send_guarded_input_batch(
+        &self,
+        session: SessionId,
+        operation_id: String,
+        parts: Vec<Vec<u8>>,
+        admission: crate::InputAdmission,
+    ) -> anyhow::Result<()> {
+        self.enqueue_command(
+            RuntimeCommand::WriteInputBatchTracked {
+                session,
+                operation_id,
+                parts,
+            },
+            Some(admission),
+        )
+    }
+
+    /// Returns ownership only when the command was never admitted to the worker queue.
+    /// Success means channel admission, not PTY acceptance. No automatic retry occurs here.
+    pub fn send_command_owned(
+        &self,
+        command: RuntimeCommand,
+    ) -> Result<(), (anyhow::Error, Box<RuntimeCommand>)> {
+        let queued = prepare_queued_command_owned(command, &self.command_budget)?;
+        let Some(tx) = self.command_tx.as_ref() else {
+            return Err((
+                RuntimeCommandSendError::Disconnected.into(),
+                Box::new(queued.into_command()),
+            ));
+        };
+        match tx.try_send(queued) {
+            Ok(()) => {
+                if let Some(worker_thread) = &self.worker_thread {
+                    worker_thread.unpark();
+                }
+                Ok(())
+            }
+            Err(TrySendError::Full(queued)) => Err((
+                RuntimeCommandSendError::Backpressure.into(),
+                Box::new(queued.into_command()),
+            )),
+            Err(TrySendError::Disconnected(queued)) => Err((
+                RuntimeCommandSendError::Disconnected.into(),
+                Box::new(queued.into_command()),
+            )),
+        }
+    }
+
     fn enqueue_command(
         &self,
         command: RuntimeCommand,
@@ -688,11 +737,25 @@ impl QueuedRuntimeCommand {
 }
 
 fn prepare_queued_command(
-    mut command: RuntimeCommand,
+    command: RuntimeCommand,
     budget: &Arc<RuntimeCommandQueueBudget>,
 ) -> anyhow::Result<QueuedRuntimeCommand> {
-    let retention = crate::command::prepare_runtime_command_for_retention_internal(&mut command)?;
-    let reservation = budget.reserve(retention.retained_bytes())?;
+    prepare_queued_command_owned(command, budget).map_err(|(error, _)| error)
+}
+
+fn prepare_queued_command_owned(
+    mut command: RuntimeCommand,
+    budget: &Arc<RuntimeCommandQueueBudget>,
+) -> Result<QueuedRuntimeCommand, (anyhow::Error, Box<RuntimeCommand>)> {
+    let retention =
+        match crate::command::prepare_runtime_command_for_retention_internal(&mut command) {
+            Ok(retention) => retention,
+            Err(error) => return Err((error.into(), Box::new(command))),
+        };
+    let reservation = match budget.reserve(retention.retained_bytes()) {
+        Ok(reservation) => reservation,
+        Err(error) => return Err((error, Box::new(command))),
+    };
     Ok(QueuedRuntimeCommand {
         command,
         reservation,
@@ -951,6 +1014,17 @@ struct PumpActivity {
     viewport_emitted: bool,
 }
 
+struct SessionPumpEffects {
+    events: Vec<(RuntimeEvent, bool)>,
+    log_offsets: Vec<(SessionId, u64)>,
+    status_updates: Vec<(SessionId, session::SessionStatus)>,
+    exited_classes: Vec<(SessionId, TerminalCacheClass)>,
+    deferred_logs: Vec<(SessionId, Vec<u8>)>,
+    final_viewports: Vec<(SessionId, bool)>,
+    deferred_ptys: Vec<Box<dyn pty::PtySession>>,
+    activity: PumpActivity,
+}
+
 /// 세션 하나의 redaction 상태 + 로그 파일 (설계문서 7장).
 struct SessionLog {
     redactor: StreamRedactor,
@@ -965,6 +1039,47 @@ impl SessionLog {
             .last_log_offset
             .saturating_add(u64::try_from(redacted.len()).unwrap_or(u64::MAX));
         Ok(self.last_log_offset)
+    }
+}
+
+/// Redacted bytes are batched only inside one bounded PTY pump, never across ticks or sessions.
+/// The last partial batch is flushed before lifecycle/output decisions and persisted offsets.
+const REDACTED_LOG_BATCH_BYTES: usize = 32 * 1024;
+#[derive(Default)]
+struct RedactedLogBatch {
+    bytes: Vec<u8>,
+}
+impl RedactedLogBatch {
+    fn push(
+        &mut self,
+        mut bytes: &[u8],
+        mut append: impl FnMut(&[u8]) -> anyhow::Result<u64>,
+    ) -> anyhow::Result<Option<u64>> {
+        let mut last = None;
+        while !bytes.is_empty() {
+            if self.bytes.capacity() == 0 {
+                self.bytes.reserve_exact(REDACTED_LOG_BATCH_BYTES);
+            }
+            let take = (REDACTED_LOG_BATCH_BYTES - self.bytes.len()).min(bytes.len());
+            self.bytes.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+            if self.bytes.len() == REDACTED_LOG_BATCH_BYTES {
+                last = self.finish(&mut append)?;
+            }
+        }
+        Ok(last)
+    }
+    fn finish(
+        &mut self,
+        mut append: impl FnMut(&[u8]) -> anyhow::Result<u64>,
+    ) -> anyhow::Result<Option<u64>> {
+        if self.bytes.is_empty() {
+            return Ok(None);
+        }
+        let result = append(&self.bytes).map(Some);
+        // A failed batch is not replayed: write_all may have partially written its prefix.
+        self.bytes.clear();
+        result
     }
 }
 
@@ -1845,20 +1960,33 @@ impl Worker {
         let admission = queued.admission.take();
         let command = queued.into_command();
         if let Some(admission) = admission {
-            if let RuntimeCommand::WriteInputTracked {
-                session,
-                operation_id,
-                bytes,
-            } = command
-            {
-                let result = self.admit_input_checked(session, &bytes, Some(&admission));
-                self.emit(RuntimeEvent::InputAdmitted {
+            match command {
+                RuntimeCommand::WriteInputTracked {
                     session,
                     operation_id,
-                    result,
-                });
-            } else {
-                self.reject_invalid_command(&command);
+                    bytes,
+                } => {
+                    let result = self.admit_input_checked(session, &bytes, Some(&admission));
+                    self.emit(RuntimeEvent::InputAdmitted {
+                        session,
+                        operation_id,
+                        result,
+                    });
+                }
+                RuntimeCommand::WriteInputBatchTracked {
+                    session,
+                    operation_id,
+                    parts,
+                } => {
+                    let slices = parts.iter().map(Vec::as_slice).collect::<Vec<_>>();
+                    let result = self.admit_input_batch_checked(session, &slices, Some(&admission));
+                    self.emit(RuntimeEvent::InputAdmitted {
+                        session,
+                        operation_id,
+                        result,
+                    });
+                }
+                _ => self.reject_invalid_command(&command),
             }
         } else {
             self.handle_command(command);
@@ -1890,27 +2018,91 @@ impl Worker {
         bytes: &[u8],
         admission: Option<&crate::InputAdmission>,
     ) -> Result<(), pty::PtyInputRejectReason> {
-        let Some(active) = self.sessions.get_mut(&session) else {
+        self.admit_input_batch_checked(session, &[bytes], admission)
+    }
+
+    fn admit_input_batch_checked(
+        &mut self,
+        session: SessionId,
+        parts: &[&[u8]],
+        admission: Option<&crate::InputAdmission>,
+    ) -> Result<(), pty::PtyInputRejectReason> {
+        self.admit_input_batch_checked_with_log_sink(
+            session,
+            parts,
+            admission,
+            SessionLog::append_redacted_output,
+        )
+    }
+
+    fn admit_input_batch_checked_with_log_sink(
+        &mut self,
+        session: SessionId,
+        parts: &[&[u8]],
+        admission: Option<&crate::InputAdmission>,
+        append: impl FnMut(&mut SessionLog, &[u8]) -> anyhow::Result<u64>,
+    ) -> Result<(), pty::PtyInputRejectReason> {
+        if !self.sessions.contains_key(&session) {
             return Err(pty::PtyInputRejectReason::SessionClosed);
-        };
+        }
         let at_micros = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_micros().min(i64::MAX as u128) as i64)
             .unwrap_or(0);
         let outcome = if let Some(admission) = admission {
-            admission
-                .admit(|| active.write_input(bytes))
-                .ok_or(pty::PtyInputRejectReason::AdmissionDenied)?
+            let mut refreshed = None;
+            let admitted = admission.admit(|| {
+                let refresh_output =
+                    admission.requires_bracketed_paste() || admission.agent_guard().is_some();
+                if refresh_output {
+                    refreshed = Some(self.collect_session_pump_effects(&[session], false, true));
+                }
+                let active = self
+                    .sessions
+                    .get_mut(&session)
+                    .ok_or(pty::PtyInputRejectReason::SessionClosed)?;
+                if refresh_output && active.pending_output_bytes() > 0 {
+                    return Err(pty::PtyInputRejectReason::AdmissionDenied);
+                }
+                // The authorization callback can wait for its own lock. Query live foreground,
+                // draft and dialog state inside its accepted callback, immediately before retention.
+                if admission.requires_bracketed_paste() && !active.bracketed_paste() {
+                    return Err(pty::PtyInputRejectReason::AdmissionDenied);
+                }
+                if let Some(guard) = admission.agent_guard()
+                    && !guard.allows(active, self.detectors.get(&session))
+                {
+                    return Err(pty::PtyInputRejectReason::AdmissionDenied);
+                }
+                // A bounded refresh/guard can take time, and more output can arrive while
+                // it runs. Refuse known-unsent rather than spin or use that stale screen.
+                if admission.deadline_elapsed()
+                    || (refresh_output && active.pending_output_bytes() > 0)
+                {
+                    return Err(pty::PtyInputRejectReason::AdmissionDenied);
+                }
+                Ok(active.write_input_batch(parts))
+            });
+            if let Some(effects) = refreshed {
+                self.finish_session_pump_effects_with_log_sink(effects, append);
+            }
+            admitted.ok_or(pty::PtyInputRejectReason::AdmissionDenied)??
         } else {
-            active.write_input(bytes)
+            self.sessions
+                .get_mut(&session)
+                .expect("session exists")
+                .write_input_batch(parts)
         };
         // The admission lock is gone before detectors/events invoke UI wakes.
         match outcome {
             Some(pty::PtyInputEnqueueResult::Accepted) => {
-                let submitted = self
-                    .detectors
-                    .get_mut(&session)
-                    .is_some_and(|detector| detector.on_user_input(bytes));
+                let submitted = self.detectors.get_mut(&session).is_some_and(|detector| {
+                    let mut submitted = false;
+                    for part in parts {
+                        submitted |= detector.on_user_input(part);
+                    }
+                    submitted
+                });
                 if submitted && at_micros > 0 {
                     self.emit(RuntimeEvent::SessionInputSubmitted { session, at_micros });
                 }
@@ -2229,6 +2421,19 @@ impl Worker {
                 bytes,
             } => {
                 let result = self.admit_input(session, &bytes);
+                self.emit(RuntimeEvent::InputAdmitted {
+                    session,
+                    operation_id,
+                    result,
+                });
+            }
+            RuntimeCommand::WriteInputBatchTracked {
+                session,
+                operation_id,
+                parts,
+            } => {
+                let slices = parts.iter().map(Vec::as_slice).collect::<Vec<_>>();
+                let result = self.admit_input_batch_checked(session, &slices, None);
                 self.emit(RuntimeEvent::InputAdmitted {
                     session,
                     operation_id,
@@ -3638,13 +3843,15 @@ impl Worker {
         };
         let mut log = self.logs.get_mut(&session);
         let mut latest_offset = None;
+        let mut batch = RedactedLogBatch::default();
         let mut drained = 0usize;
         for _ in 0..FINAL_DRAIN_MAX_PUMPS {
             let result = active.pump(|chunk| {
                 if let Some(log) = log.as_mut() {
                     let redacted = log.redactor.redact_chunk(chunk);
-                    match log.append_redacted_output(&redacted) {
-                        Ok(offset) => latest_offset = Some(offset),
+                    match batch.push(&redacted, |bytes| log.append_redacted_output(bytes)) {
+                        Ok(Some(offset)) => latest_offset = Some(offset),
+                        Ok(None) => {}
                         Err(error) => trace_runtime_failure(
                             "session_log_final_append",
                             "session_log_append_failed",
@@ -3656,6 +3863,17 @@ impl Worker {
             drained = drained.saturating_add(result.output_bytes);
             if !result.produced_output || drained >= FINAL_DRAIN_MAX_BYTES {
                 break;
+            }
+        }
+        if let Some(log) = log.as_mut() {
+            match batch.finish(|bytes| log.append_redacted_output(bytes)) {
+                Ok(Some(offset)) => latest_offset = Some(offset),
+                Ok(None) => {}
+                Err(error) => trace_runtime_failure(
+                    "session_log_final_append",
+                    "session_log_append_failed",
+                    error,
+                ),
             }
         }
         if let Some(offset) = latest_offset
@@ -3903,24 +4121,68 @@ impl Worker {
         // 폴백 셸이 이어받기 전에(=SessionExited보다 훨씬 먼저) 에이전트 자신의 진짜
         // 종료 코드를 반영한다 — 아래 evaluate()가 이번 tick에 바로 새 상태를 emit한다.
         self.poll_agent_exit_sentinels();
+        let sessions = self.sessions.keys().copied().collect::<Vec<_>>();
+        let effects = self.collect_session_pump_effects(&sessions, allow_viewport, false);
+        self.finish_session_pump_effects(effects)
+    }
+
+    /// The same stream/parser/detector/log lifecycle serves normal ticks and the guarded
+    /// target-only refresh. Effects are emitted only after the input authorization lock exits.
+    fn collect_session_pump_effects(
+        &mut self,
+        sessions: &[SessionId],
+        allow_viewport: bool,
+        input_guard: bool,
+    ) -> SessionPumpEffects {
         let watched = self.mux.watched_sessions();
         // 원격 시청 lease 세션 — GUI 가시성과 무관하게 Viewport 대상 (P5a).
-        let remote_viewed = self.remote_viewed_sessions();
+        let remote_viewed = if input_guard {
+            let now = Instant::now();
+            sessions
+                .iter()
+                .copied()
+                .filter(|id| {
+                    self.remote_viewing
+                        .get(id)
+                        .is_some_and(|expiry| *expiry > now)
+                })
+                .collect()
+        } else {
+            self.remote_viewed_sessions()
+        };
         // (이벤트, gui_viewport) — Viewport만 원격 전용 여부를 구분한다 (P5 리뷰 P1).
         let mut events: Vec<(RuntimeEvent, bool)> = Vec::new();
         let mut log_offsets = Vec::new();
         let mut status_updates = Vec::new();
+        let mut exited_classes = Vec::new();
+        let mut deferred_logs = Vec::new();
+        let mut final_viewports = Vec::new();
+        let mut deferred_ptys = Vec::new();
         let mut activity = PumpActivity::default();
-        for active in self.sessions.values_mut() {
+        for session in sessions {
+            let Some(active) = self.sessions.get_mut(session) else {
+                continue;
+            };
             let active_id = active.id();
             let mut log = self.logs.get_mut(&active_id);
             let mut detector = self.detectors.get_mut(&active_id);
-            let result = active.pump(|chunk| {
-                if let Some(log) = log.as_mut() {
+            let mut batch = RedactedLogBatch::default();
+            let mut latest_log_offset = None;
+            let mut deferred_log = Vec::new();
+            let mut on_output = |chunk: &[u8]| {
+                if input_guard && log.is_some() {
+                    // Allocate only for actual guarded output with an open log. One flat
+                    // buffer charges at most the strict pump cap, independent of chunk count.
+                    if deferred_log.capacity() == 0 {
+                        deferred_log.reserve_exact(Session::INPUT_GUARD_OUTPUT_MAX_BYTES);
+                    }
+                    deferred_log.extend_from_slice(chunk);
+                } else if let Some(log) = log.as_mut() {
                     // redaction 후에만 디스크에 닿는다 (7장 — raw 평문 저장 금지)
                     let redacted = log.redactor.redact_chunk(chunk);
-                    match log.append_redacted_output(&redacted) {
-                        Ok(offset) => log_offsets.push((active_id, offset)),
+                    match batch.push(&redacted, |bytes| log.append_redacted_output(bytes)) {
+                        Ok(Some(offset)) => latest_log_offset = Some(offset),
+                        Ok(None) => {}
                         Err(error) => trace_runtime_failure(
                             "session_log_append",
                             "session_log_append_failed",
@@ -3931,7 +4193,32 @@ impl Worker {
                 if let Some(detector) = detector.as_mut() {
                     detector.on_output(chunk); // 1단: stream line regex
                 }
-            });
+            };
+            let (result, deferred_pty) = if input_guard {
+                active.pump_for_input_guard(&mut on_output)
+            } else {
+                (active.pump(&mut on_output), None)
+            };
+            if let Some(pty) = deferred_pty {
+                deferred_ptys.push(pty);
+            }
+            if !input_guard && let Some(log) = log.as_mut() {
+                match batch.finish(|bytes| log.append_redacted_output(bytes)) {
+                    Ok(Some(offset)) => latest_log_offset = Some(offset),
+                    Ok(None) => {}
+                    Err(error) => trace_runtime_failure(
+                        "session_log_append",
+                        "session_log_append_failed",
+                        error,
+                    ),
+                }
+            }
+            if let Some(offset) = latest_log_offset {
+                log_offsets.push((active_id, offset));
+            }
+            if !deferred_log.is_empty() {
+                deferred_logs.push((active_id, deferred_log));
+            }
             // 2·3단: 화면 텍스트 패턴 + idle — batch 주기, 경량 grid 조회
             // (snapshot 미생성 — hidden 세션 규칙, PR-12).
             // 종료된 세션은 감지 중단 — 단, 종료 tick에서는 마지막 출력의
@@ -3986,6 +4273,11 @@ impl Worker {
                         // 다음 paced tick에서 재시도한다.
                         activity.pending_viewport = true;
                     }
+                } else if result.just_exited {
+                    // There is no later paced tick after pane cleanup. Publish the final
+                    // watched frame in finish, outside any input authorization lock.
+                    let gui_viewport = self.render_active && watched.contains(&active.id());
+                    final_viewports.push((active.id(), gui_viewport));
                 } else {
                     // PTY/parser/log는 즉시 처리하되 snapshot만 다음 display cadence로 합친다.
                     activity.pending_viewport = true;
@@ -3999,19 +4291,7 @@ impl Worker {
                     } else {
                         TerminalCacheClass::Exited
                     };
-                if active.cache_class() != class {
-                    if let Some(event) = active.set_cache_class(class) {
-                        trace_terminal_cache_event(active.id(), event);
-                    }
-                    // Exited 전환은 스크롤백을 전체 압축·트림해 셀 배열을 해제한다 —
-                    // 트림 이벤트 유무와 무관하게 해제 페이지를 OS로 돌려주도록 신호한다.
-                    if class == TerminalCacheClass::Exited {
-                        crate::signal_memory_released();
-                    }
-                }
-                if class != TerminalCacheClass::Hidden {
-                    self.hidden_scrollback.remove(&active.id());
-                }
+                exited_classes.push((active.id(), class));
             }
             if result.just_exited
                 && let session::SessionLifecycle::Exited { exit_code } = active.lifecycle()
@@ -4021,7 +4301,6 @@ impl Worker {
                 } else {
                     session::SessionStatus::Error
                 };
-                self.status_overrides.remove(&active.id());
                 events.push((
                     RuntimeEvent::SessionStatusViewChanged {
                         session: active.id(),
@@ -4036,6 +4315,95 @@ impl Worker {
                     },
                     true,
                 ));
+            }
+        }
+        SessionPumpEffects {
+            events,
+            log_offsets,
+            status_updates,
+            exited_classes,
+            deferred_logs,
+            final_viewports,
+            deferred_ptys,
+            activity,
+        }
+    }
+
+    fn finish_session_pump_effects(&mut self, effects: SessionPumpEffects) -> PumpActivity {
+        self.finish_session_pump_effects_with_log_sink(effects, SessionLog::append_redacted_output)
+    }
+
+    fn finish_session_pump_effects_with_log_sink(
+        &mut self,
+        effects: SessionPumpEffects,
+        mut append: impl FnMut(&mut SessionLog, &[u8]) -> anyhow::Result<u64>,
+    ) -> PumpActivity {
+        let SessionPumpEffects {
+            mut events,
+            mut log_offsets,
+            status_updates,
+            exited_classes,
+            deferred_logs,
+            final_viewports,
+            deferred_ptys,
+            mut activity,
+        } = effects;
+        // Sessions already detached these exited writers. Escalation and worker joins
+        // happen only here, after InputAdmission released permit/credential locks.
+        drop(deferred_ptys);
+        for (session, gui_viewport) in final_viewports {
+            if let Some(active) = self.sessions.get_mut(&session)
+                && let Some(snapshot) = active.take_snapshot()
+            {
+                events.push((
+                    RuntimeEvent::Viewport {
+                        session,
+                        snapshot: Arc::new(snapshot),
+                        bracketed_paste: active.bracketed_paste(),
+                    },
+                    gui_viewport,
+                ));
+                activity.viewport_emitted = true;
+            }
+        }
+        for (session, raw) in deferred_logs {
+            let Some(log) = self.logs.get_mut(&session) else {
+                continue;
+            };
+            let redacted = log.redactor.redact_chunk(&raw);
+            let mut batch = RedactedLogBatch::default();
+            let mut latest_log_offset = None;
+            match batch.push(&redacted, |bytes| append(log, bytes)) {
+                Ok(Some(offset)) => latest_log_offset = Some(offset),
+                Ok(None) => {}
+                Err(error) => {
+                    trace_runtime_failure("session_log_append", "session_log_append_failed", error)
+                }
+            }
+            match batch.finish(|bytes| append(log, bytes)) {
+                Ok(Some(offset)) => latest_log_offset = Some(offset),
+                Ok(None) => {}
+                Err(error) => {
+                    trace_runtime_failure("session_log_append", "session_log_append_failed", error)
+                }
+            }
+            if let Some(offset) = latest_log_offset {
+                log_offsets.push((session, offset));
+            }
+        }
+        for (session, class) in exited_classes {
+            if let Some(active) = self.sessions.get_mut(&session)
+                && active.cache_class() != class
+            {
+                if let Some(event) = active.set_cache_class(class) {
+                    trace_terminal_cache_event(session, event);
+                }
+                if class == TerminalCacheClass::Exited {
+                    crate::signal_memory_released();
+                }
+            }
+            if class != TerminalCacheClass::Hidden {
+                self.hidden_scrollback.remove(&session);
             }
         }
         if let Some(pipe) = &mut self.persist {
@@ -5035,8 +5403,137 @@ fn exited_to_archive_for_budget(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pr8_pump_log_batch_limits_small_chunk_writes_without_losing_order() {
+        let mut batch = RedactedLogBatch::default();
+        let mut written = Vec::new();
+        let mut calls = 0usize;
+        let chunks: Vec<Vec<u8>> = (0..512)
+            .map(|n| format!("{n:04}:{}\n", "x".repeat(122)).into_bytes())
+            .collect();
+        let expected: Vec<u8> = chunks.iter().flatten().copied().collect();
+        for chunk in &chunks {
+            batch
+                .push(chunk, |bytes| {
+                    calls += 1;
+                    written.extend_from_slice(bytes);
+                    Ok(written.len() as u64)
+                })
+                .unwrap();
+        }
+        batch
+            .finish(|bytes| {
+                calls += 1;
+                written.extend_from_slice(bytes);
+                Ok(written.len() as u64)
+            })
+            .unwrap();
+        eprintln!("PR8 runtime512x128B append calls={calls}");
+        assert_eq!(written, expected);
+        assert!(
+            calls <= 2,
+            "pump issued {calls} small writes instead of bounded batches"
+        );
+    }
+
+    #[test]
+    fn pr8_measure_real_log_writer_batch_five_samples() {
+        let chunks: Vec<Vec<u8>> = (0..512)
+            .map(|n| format!("{n:04}:{}\n", "x".repeat(122)).into_bytes())
+            .collect();
+        let expected: Vec<u8> = chunks.iter().flatten().copied().collect();
+        let mut samples: [Vec<f64>; 2] = [Vec::new(), Vec::new()];
+        for sample in 0..5 {
+            for (mode, timings) in samples.iter_mut().enumerate() {
+                let root = std::env::temp_dir().join(format!(
+                    "deppy-pr8-batch-{}-{sample}-{mode}",
+                    uuid::Uuid::new_v4()
+                ));
+                let mut writer = SessionLogWriter::open(&root, SessionId(1)).unwrap();
+                let mut calls = 0;
+                let started = Instant::now();
+                if mode == 0 {
+                    // Actual pre-PR8 call pattern, current storage: isolate only batching's effect.
+                    for chunk in &chunks {
+                        calls += 1;
+                        writer.append_output(chunk).unwrap();
+                    }
+                } else {
+                    let mut batch = RedactedLogBatch::default();
+                    let mut append = |bytes: &[u8]| -> anyhow::Result<u64> {
+                        calls += 1;
+                        writer.append_output(bytes)?;
+                        Ok(0)
+                    };
+                    for chunk in &chunks {
+                        batch.push(chunk, &mut append).unwrap();
+                    }
+                    batch.finish(&mut append).unwrap();
+                }
+                writer.flush();
+                let us = started.elapsed().as_secs_f64() * 1e6;
+                assert_eq!(
+                    std::fs::read(root.join("1/redacted.ansi.log")).unwrap(),
+                    expected
+                );
+                assert_eq!(
+                    std::fs::read(root.join("1/redacted.plain.txt")).unwrap(),
+                    expected
+                );
+                assert_eq!(calls, if mode == 0 { 512 } else { 2 });
+                eprintln!(
+                    "PR8 realWriter sample{sample} mode{mode} append_output={calls} us={us:.3}"
+                );
+                timings.push(us);
+                drop(writer);
+                std::fs::remove_dir_all(root).unwrap();
+            }
+        }
+        for (mode, timings) in samples.iter_mut().enumerate() {
+            timings.sort_by(f64::total_cmp);
+            eprintln!("PR8 realWriter median5 mode{mode} us={:.3}", timings[2]);
+        }
+    }
+
+    #[test]
+    fn pr8_partial_log_batch_failure_is_not_replayed() {
+        let mut batch = RedactedLogBatch::default();
+        batch
+            .push(b"old", |_| panic!("must remain buffered"))
+            .unwrap();
+        let mut written = Vec::new();
+        assert!(
+            batch
+                .finish(|bytes| {
+                    written.extend_from_slice(&bytes[..1]);
+                    anyhow::bail!("partial write")
+                })
+                .is_err()
+        );
+        assert!(
+            batch
+                .finish(|_| panic!("must not replay failed bytes"))
+                .unwrap()
+                .is_none()
+        );
+        batch
+            .push("한글😀\x1b[31mnew".as_bytes(), |_| {
+                panic!("must remain buffered")
+            })
+            .unwrap();
+        batch
+            .finish(|bytes| {
+                written.extend_from_slice(bytes);
+                Ok(written.len() as u64)
+            })
+            .unwrap();
+        assert_eq!(written, "o한글😀\x1b[31mnew".as_bytes());
+        assert!(batch.bytes.capacity() <= REDACTED_LOG_BATCH_BYTES);
+    }
+
     use super::*;
     use crate::command::{SplitDirection, WorkspaceRuntimeState};
+    use crate::test_secret_store::test_store;
     use std::time::Instant;
     use tracing::field::{Field, Visit};
     use tracing::span::{Attributes, Id, Record};
@@ -5891,7 +6388,6 @@ mod tests {
 
     impl UnattachedHarness {
         fn new(name: &str) -> Self {
-            init_mock_store();
             let resolver = Arc::new(RecordingResolver {
                 calls: Mutex::new(Vec::new()),
                 value: Some("runtime-secret-value".to_owned()),
@@ -6596,8 +7092,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    fn test_store() -> Arc<dyn SecretStore> {
-        Arc::new(secret::KeyringSecretStore)
+    #[test]
+    fn pr18_secret_store_resolver_uses_only_its_injected_fixture() {
+        let store = test_store();
+        let empty_store = test_store();
+        store
+            .set_secret(
+                "resolver-fixture",
+                &secret::SecretString::new("private-value".into()),
+            )
+            .unwrap();
+        let resolver = SecretStoreResolver(Arc::clone(&store));
+        let value = resolver.resolve("resolver-fixture").unwrap();
+        assert_eq!(value.as_secret_string().expose(), "private-value");
+        assert_eq!(format!("{value:?}"), "RuntimeSecret(REDACTED)");
+        assert!(
+            SecretStoreResolver(empty_store)
+                .resolve("resolver-fixture")
+                .is_err()
+        );
+        store.delete_secret("resolver-fixture").unwrap();
+        assert!(resolver.resolve("resolver-fixture").is_err());
     }
 
     fn test_logs_root(name: &str) -> PathBuf {
@@ -6808,7 +7323,6 @@ mod tests {
     fn lazy_restore_durable_event_barrier_fixture(
         name: &str,
     ) -> (InProcessRuntimeClient, Probe, MuxPaneId, MuxPaneId, PathBuf) {
-        init_mock_store();
         let dir = unique_test_dir(name);
         let db_path = dir.join("metadata.sqlite3");
         let workspace_id = format!("ws-{name}");
@@ -7014,7 +7528,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn restore_workspace_pane_materializes_only_requested_panes_and_reuses_catalog() {
-        init_mock_store();
         let dir = unique_test_dir("lazy-restore-two-pane");
         let db_path = dir.join("metadata.sqlite3");
         let workspace_id = "ws-lazy-restore";
@@ -7103,7 +7616,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn restore_workspace_pane_unknown_target_creates_no_partial_session() {
-        init_mock_store();
         let dir = unique_test_dir("lazy-restore-unknown");
         let db_path = dir.join("metadata.sqlite3");
         let workspace_id = "ws-lazy-restore-unknown";
@@ -7148,7 +7660,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn restore_workspace_pane_spawn_failure_preserves_persisted_association() {
-        init_mock_store();
         let dir = unique_test_dir("lazy-restore-spawn-failure");
         let db_path = dir.join("metadata.sqlite3");
         let workspace_id = "ws-lazy-restore-spawn-failure";
@@ -7199,7 +7710,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn restore_workspace_pane_closed_skeleton_is_not_materialized_by_full_restore() {
-        init_mock_store();
         let dir = unique_test_dir("lazy-restore-close-skeleton");
         let db_path = dir.join("metadata.sqlite3");
         let workspace_id = "ws-lazy-restore-close-skeleton";
@@ -7240,7 +7750,6 @@ mod tests {
 
     #[cfg(unix)]
     fn assert_lazy_restore_close_survives_restart(close_tab: bool) {
-        init_mock_store();
         let dir = unique_test_dir(if close_tab {
             "lazy-restore-close-tab-restart"
         } else {
@@ -7357,7 +7866,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn restore_workspace_pane_full_failure_preserves_remaining_association_for_restart() {
-        init_mock_store();
         let dir = unique_test_dir("lazy-restore-full-failure-restart");
         let db_path = dir.join("metadata.sqlite3");
         let workspace_id = "ws-lazy-full-failure-restart";
@@ -7443,7 +7951,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn restore_workspace_pane_then_full_restore_materializes_remaining_once() {
-        init_mock_store();
         let dir = unique_test_dir("lazy-restore-full");
         let db_path = dir.join("metadata.sqlite3");
         let workspace_id = "ws-lazy-restore-full";
@@ -7512,7 +8019,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn restore_workspace_pane_agent_is_archived_without_agent_start_event() {
-        init_mock_store();
         let dir = unique_test_dir("lazy-restore-agent");
         let db_path = dir.join("metadata.sqlite3");
         let workspace_id = "ws-lazy-restore-agent";
@@ -7578,7 +8084,6 @@ mod tests {
         // 처음부터 None이라 Session::pump의 just_exited가 구조적으로 다시 true가 될 수
         // 없다(pty.is_some() 전제) — 이 테스트는 그 불변식을 실제 여러 pump tick에
         // 걸쳐 관찰로도 고정한다.
-        init_mock_store();
         let dir = unique_test_dir("lazy-restore-agent-survives-ticks");
         let db_path = dir.join("metadata.sqlite3");
         let workspace_id = "ws-lazy-restore-agent-survives-ticks";
@@ -7678,15 +8183,6 @@ mod tests {
         mux
     }
 
-    /// mock keyring store는 test only (설계문서 1.4). 프로세스 전역 1회만 등록 —
-    /// 테스트별 재등록은 병렬 실행에서 이전 등록분의 secret을 날린다.
-    fn init_mock_store() {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| {
-            keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
-        });
-    }
-
     fn spec(program: &str, args: &[&str]) -> CommandSpec {
         CommandSpec {
             program: program.into(),
@@ -7779,7 +8275,6 @@ mod tests {
     /// 누적되지 않고 latest-value slot 하나로 코얼레싱된다.
     #[test]
     fn resource_usage는_드레인_없이도_slot_하나로_코얼레싱된다() {
-        init_mock_store();
         let client = InProcessRuntimeClient::with_shell(
             5,
             test_store(),
@@ -7880,6 +8375,78 @@ mod tests {
     }
 
     #[test]
+    fn pr10_owned_sender_returns_original_body_on_channel_and_byte_pressure() {
+        let (tx, rx) = sync_channel(1);
+        let budget = Arc::new(RuntimeCommandQueueBudget::default());
+        let mut client = InProcessRuntimeClient {
+            command_tx: Some(tx),
+            command_budget: Arc::clone(&budget),
+            subscribers: Arc::default(),
+            worker: None,
+            worker_thread: None,
+            shutdown_flag: Arc::default(),
+        };
+        client
+            .send_command(RuntimeCommand::SetWorkspaceState(
+                WorkspaceRuntimeState::Active,
+            ))
+            .unwrap();
+        let baseline_bytes = budget.retained_bytes();
+        let bytes = vec![b'x'; 1024 * 1024];
+        let pointer = bytes.as_ptr();
+        let mut command = RuntimeCommand::WriteInput {
+            session: SessionId(73),
+            bytes,
+        };
+        for _ in 0..4 {
+            let (error, returned) = client.send_command_owned(command).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<RuntimeCommandSendError>(),
+                Some(&RuntimeCommandSendError::Backpressure)
+            );
+            command = *returned;
+            assert!(
+                matches!(&command, RuntimeCommand::WriteInput { session: SessionId(73), bytes }
+                if bytes.as_ptr() == pointer && bytes.len() == 1024 * 1024)
+            );
+            assert_eq!(budget.retained_bytes(), baseline_bytes);
+        }
+        drop(rx.recv().unwrap());
+        let held = budget.reserve(RUNTIME_COMMAND_QUEUE_BYTES_MAX).unwrap();
+        let (error, returned) = client.send_command_owned(command).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<RuntimeCommandSendError>(),
+            Some(&RuntimeCommandSendError::Backpressure)
+        );
+        assert!(
+            matches!(&*returned, RuntimeCommand::WriteInput { bytes, .. } if bytes.as_ptr() == pointer)
+        );
+        drop(held);
+        client.send_command_owned(*returned).unwrap();
+        assert!(budget.retained_bytes() >= 1024 * 1024);
+        let admitted = rx.recv().unwrap().into_command();
+        assert!(
+            matches!(&admitted, RuntimeCommand::WriteInput { bytes, .. } if bytes.as_ptr() == pointer)
+        );
+        assert_eq!(budget.retained_bytes(), 0);
+        drop(rx);
+        let (error, returned) = client.send_command_owned(admitted).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<RuntimeCommandSendError>(),
+            Some(&RuntimeCommandSendError::Disconnected)
+        );
+        assert!(
+            matches!(&*returned, RuntimeCommand::WriteInput { bytes, .. } if bytes.as_ptr() == pointer)
+        );
+        client.command_tx = None;
+        let (error, _) = client.send_command_owned(*returned).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<RuntimeCommandSendError>(),
+            Some(&RuntimeCommandSendError::Disconnected)
+        );
+    }
+
+    #[test]
     fn command_queue_byte_budget_accepts_exact_rejects_repeated_plus_one_and_recovers() {
         let budget = Arc::new(RuntimeCommandQueueBudget::default());
         let exact = budget.reserve(RUNTIME_COMMAND_QUEUE_BYTES_MAX).unwrap();
@@ -7956,16 +8523,32 @@ mod tests {
             production.matches("prepare_queued_command(command").count(),
             3
         );
+        assert_eq!(
+            production
+                .matches("prepare_queued_command_owned(command")
+                .count(),
+            2,
+            "owned sender and shared wrapper must use the same canonicalization/reservation"
+        );
         assert!(!production.contains("try_send(command)"));
         assert!(!production.contains("#[derive(Clone)]\nstruct QueuedRuntimeCommand"));
         assert!(production.contains("queued.into_command()"));
-        let queue_preparation = production
-            .split("fn prepare_queued_command")
-            .nth(1)
+        let wrapper = production
+            .split_once("fn prepare_queued_command(")
             .unwrap()
-            .split("struct Worker")
+            .1
+            .split_once("fn prepare_queued_command_owned(")
+            .unwrap()
+            .0;
+        assert!(wrapper.contains("prepare_queued_command_owned(command, budget)"));
+        let queue_preparation = production
+            .split_once("fn prepare_queued_command_owned(")
+            .unwrap()
+            .1
+            .split("struct LazyWorkspaceRestore")
             .next()
             .unwrap();
+        assert!(queue_preparation.contains("budget.reserve(retention.retained_bytes())"));
         assert!(
             queue_preparation
                 .contains("prepare_runtime_command_for_retention_internal(&mut command)")
@@ -8259,7 +8842,6 @@ mod tests {
         // pty가 처음부터 None이라 pane 자동 닫힘 대상이 되지 않고(§셸_exit... 테스트의
         // 코드 주석 참고) 무기한 유지된다. 이 테스트는 그 자리에서 Scroll이 여전히
         // Viewport로 응답하는지 고정한다(예전 이름: 종료_후에도_scrollback_열람_가능).
-        init_mock_store();
         let dir = unique_test_dir("archived-pane-scroll");
         let db_path = dir.join("metadata.sqlite3");
         let workspace_id = "ws-archived-pane-scroll";
@@ -8854,7 +9436,6 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn spawn_agent_secret_env_주입() {
-        init_mock_store();
         let store = test_store();
         store
             .set_secret(
@@ -8865,7 +9446,7 @@ mod tests {
 
         let client = InProcessRuntimeClient::with_shell(
             5,
-            store,
+            Arc::clone(&store),
             test_logs_root("agent"),
             RedactionService::new(),
             pty::default_shell(),
@@ -8889,14 +9470,65 @@ mod tests {
                 done_regex: None,
             })
             .unwrap();
-        probe.wait_for(Duration::from_secs(15), |e| match e {
-            RuntimeEvent::Viewport { snapshot, .. }
-                if snapshot_text(snapshot, 0).contains("P=plain-v S=s3cret-value") =>
-            {
-                Some(())
+        let waited = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            probe.wait_for(Duration::from_secs(15), |e| match e {
+                RuntimeEvent::Viewport { snapshot, .. }
+                    if snapshot_text(snapshot, 0).contains("P=plain-v S=s3cret-value") =>
+                {
+                    Some(())
+                }
+                _ => None,
+            });
+        }));
+        if let Err(panic) = waited {
+            // Failure-only diagnostics for this synthetic private fixture. Never dump
+            // arbitrary event payloads or actual keyring error strings.
+            let resolved = store
+                .get_secret("cred-agent-test")
+                .map(|value| value.expose() == "s3cret-value");
+            eprintln!(
+                "owned secret fixture resolve_matches={:?}",
+                resolved.map_err(|_| "resolve_error")
+            );
+            for event in &probe.seen {
+                match event {
+                    RuntimeEvent::Viewport {
+                        session, snapshot, ..
+                    } => {
+                        let row = snapshot_text(snapshot, 0);
+                        let expected_any_row = (0..snapshot.rows as usize).any(|row| {
+                            snapshot_text(snapshot, row).contains("P=plain-v S=s3cret-value")
+                        });
+                        eprintln!(
+                            "owned fixture Viewport session={} row0={row:?} expected_any_row={expected_any_row}",
+                            session.0
+                        );
+                    }
+                    RuntimeEvent::SpawnFailed { kind, message } => {
+                        eprintln!(
+                            "owned fixture SpawnFailed kind={kind:?} id={} code={:?}",
+                            message.message_id,
+                            message.arg_value("error_code")
+                        );
+                    }
+                    RuntimeEvent::AgentSpawned { session } => {
+                        eprintln!("owned fixture AgentSpawned session={}", session.0);
+                    }
+                    RuntimeEvent::SessionExited { session, exit_code } => {
+                        eprintln!(
+                            "owned fixture SessionExited session={} code={exit_code:?}",
+                            session.0
+                        );
+                    }
+                    RuntimeEvent::MuxUpdated { .. } => eprintln!("owned fixture MuxUpdated"),
+                    _ => eprintln!(
+                        "owned fixture other_variant={:?}",
+                        std::mem::discriminant(event)
+                    ),
+                }
             }
-            _ => None,
-        });
+            std::panic::resume_unwind(panic);
+        }
     }
 
     #[test]
@@ -9078,7 +9710,6 @@ mod tests {
 
     #[test]
     fn spawn_agent_resolve_실패시_spawn_안함() {
-        init_mock_store();
         let client = InProcessRuntimeClient::with_shell(
             5,
             test_store(),
@@ -9310,7 +9941,6 @@ mod tests {
     #[cfg(unix)]
     fn 로그_secret_scan_평문_없음() {
         // 완료 기준 (PR-11): 세션 로그 어디에도 secret 평문이 없어야 한다
-        init_mock_store();
         let store = test_store();
         store
             .set_secret(
@@ -9735,6 +10365,959 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn pr13_exit_teardown_releases_authorization_before_revocation_handshake() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, events) = admission_worker(resolver, "pr13-exit-teardown");
+        let id = SessionId(1);
+        let ready = worker.logs_root.join("descendant-ready");
+        let started = worker.logs_root.join("teardown-started");
+        let released = worker.logs_root.join("permit-revoked");
+        let acknowledged = worker.logs_root.join("descendant-acknowledged");
+        let (output_tx, output_rx) = std::sync::mpsc::channel();
+        let live = Session::spawn_with_spec_and_output_wake(
+            id,
+            session::SessionKind::Shell,
+            &spec(
+                "/bin/sh",
+                &[
+                    "-c",
+                    r#"(trap '' HUP; trap 'printf teardown > "$2"; while [ ! -f "$3" ]; do /bin/sleep 0.005; done; printf acknowledged > "$4"; exit 0' TERM; printf ready > "$1"; while :; do /bin/sleep 0.01; done) & while [ ! -f "$1" ]; do /bin/sleep 0.005; done; printf '\033[?2004lpr13-exit-final'; exit 0"#,
+                    "pr13",
+                    ready.to_str().unwrap(),
+                    started.to_str().unwrap(),
+                    released.to_str().unwrap(),
+                    acknowledged.to_str().unwrap(),
+                ],
+            ),
+            80,
+            24,
+            100,
+            Arc::new(move || {
+                let _ = output_tx.send(());
+            }),
+        )
+        .unwrap();
+        worker.sessions.insert(id, live);
+        worker.attach_in_new_tab(id, "owned-exit-teardown");
+        let viewports = Arc::clone(&worker.subscribers.lock().unwrap()[0].viewports);
+        output_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let permit = crate::InputPermit::new();
+        let authorizing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let inside_authorizer = Arc::clone(&authorizing);
+        let admission = crate::InputAdmission::new(
+            permit.clone(),
+            Instant::now() + Duration::from_secs(5),
+            move |write| {
+                inside_authorizer.store(true, std::sync::atomic::Ordering::SeqCst);
+                write();
+                inside_authorizer.store(false, std::sync::atomic::Ordering::SeqCst);
+            },
+        )
+        .with_bracketed_paste_required();
+        let controller_started = started.clone();
+        let controller_released = released.clone();
+        let controller = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !controller_started.exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            if !controller_started.exists() {
+                return None;
+            }
+            let teardown_inside_authorization =
+                authorizing.load(std::sync::atomic::Ordering::SeqCst);
+            permit.revoke();
+            std::fs::write(controller_released, b"revoked").unwrap();
+            Some(teardown_inside_authorization)
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut exited = false;
+        while !exited && Instant::now() < deadline {
+            assert_eq!(
+                worker.admit_input_batch_checked(id, &[b"must-not-send", b"\r"], Some(&admission)),
+                Err(pty::PtyInputRejectReason::AdmissionDenied)
+            );
+            exited = events.try_iter().any(|event| matches!(event, RuntimeEvent::SessionExited { session, .. } if session == id));
+            if !exited {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        let teardown_inside_authorization = controller.join().unwrap();
+        assert!(exited, "owned shell must exit through guarded admission");
+        assert_eq!(
+            teardown_inside_authorization,
+            Some(false),
+            "actual descendant teardown ran while authorization was held"
+        );
+        assert!(
+            acknowledged.exists(),
+            "permit revocation must release the real descendant before teardown completes"
+        );
+        let slots = viewports.lock().unwrap();
+        let Some(RuntimeEvent::Viewport { snapshot, .. }) = slots.get(&id) else {
+            panic!("guarded exit must preserve its final watched viewport");
+        };
+        assert!(snapshot_text(snapshot, 0).contains("pr13-exit-final"));
+        for path in [ready, started, released, acknowledged] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pr13_final_watched_output_survives_paced_fast_exit() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, events) = admission_worker(resolver, "pr13-final-viewport");
+        let id = SessionId(1);
+        let (output_tx, output_rx) = std::sync::mpsc::channel();
+        let mut live = Session::spawn_with_spec_and_output_wake(
+            id,
+            session::SessionKind::Shell,
+            &spec("/bin/sh", &["-c", "printf 'pr13-final-output'"]),
+            80,
+            24,
+            100,
+            Arc::new(move || {
+                let _ = output_tx.send(());
+            }),
+        )
+        .unwrap();
+        live.take_snapshot().unwrap();
+        worker.sessions.insert(id, live);
+        worker.attach_in_new_tab(id, "owned-final");
+        assert!(worker.mux.watched_sessions().contains(&id));
+        let viewports = Arc::clone(&worker.subscribers.lock().unwrap()[0].viewports);
+        output_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut exited = false;
+        while !exited && Instant::now() < deadline {
+            worker.pump_sessions(false);
+            exited = events.try_iter().any(|event| matches!(event, RuntimeEvent::SessionExited { session, .. } if session == id));
+            if !exited {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        assert!(exited, "owned child must exit through the real shared pump");
+        let slots = viewports.lock().unwrap();
+        let Some(RuntimeEvent::Viewport { snapshot, .. }) = slots.get(&id) else {
+            panic!("paced exit removed the watched session without its final viewport");
+        };
+        assert!(snapshot_text(snapshot, 0).contains("pr13-final-output"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pr13_guard_refreshes_queued_dec2004_off_before_admission() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, _events) = admission_worker(resolver, "pr13-queued-dec2004");
+        let id = SessionId(1);
+        let (output_tx, output_rx) = std::sync::mpsc::channel();
+        let mut live = Session::spawn_with_spec_and_output_wake(
+            id,
+            session::SessionKind::Shell,
+            &spec(
+                "/bin/sh",
+                &["-c", r"stty -echo; printf '\033[?2004l'; exec /bin/cat"],
+            ),
+            80,
+            24,
+            100,
+            Arc::new(move || {
+                let _ = output_tx.send(());
+            }),
+        )
+        .unwrap();
+        live.replay_ansi(&mut "\x1b[?2004h".as_bytes()).unwrap();
+        worker.sessions.insert(id, live);
+        output_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            worker.sessions[&id].bracketed_paste(),
+            "cached mode is still enabled before admission"
+        );
+        let admission = crate::InputAdmission::new(
+            crate::InputPermit::new(),
+            Instant::now() + Duration::from_secs(5),
+            |write| write(),
+        )
+        .with_bracketed_paste_required();
+        assert_eq!(
+            worker.admit_input_batch_checked(
+                id,
+                &[b"\x1b[200~line1\nline2\x1b[201~", b"\r"],
+                Some(&admission)
+            ),
+            Err(pty::PtyInputRejectReason::AdmissionDenied),
+            "queued mode-off must be applied before retaining any body or submit"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pr13_guard_refreshes_queued_choice_prompt_before_admission() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, events) = admission_worker(resolver, "pr13-queued-choice");
+        let id = SessionId(1);
+        let (output_tx, output_rx) = std::sync::mpsc::channel();
+        let mut live = Session::spawn_with_spec_and_output_wake(
+            id,
+            session::SessionKind::Agent,
+            &spec(
+                "/bin/sh",
+                &[
+                    "-c",
+                    r"stty -echo; printf '\r\nEnter to select\r\n❯ '; exec /bin/cat",
+                ],
+            ),
+            80,
+            24,
+            100,
+            Arc::new(move || {
+                let _ = output_tx.send(());
+            }),
+        )
+        .unwrap();
+        let group = live.process_identity().process_group.unwrap();
+        live.replay_ansi(&mut "❯ ".as_bytes()).unwrap();
+        worker.sessions.insert(id, live);
+        worker.detectors.insert(
+            id,
+            session::StatusDetector::new(session::StatusPatterns::compile(
+                Some("Enter to select"),
+                None,
+                None,
+                None,
+            )),
+        );
+        output_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            !worker.sessions[&id]
+                .screen_text()
+                .contains("Enter to select"),
+            "dialog is queued, not yet parsed"
+        );
+        let authorizing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let inside_authorizer = Arc::clone(&authorizing);
+        let during_wake = Arc::clone(&authorizing);
+        worker.subscribers.lock().unwrap()[0].wake = Some(Arc::new(move || {
+            assert!(
+                !during_wake.load(std::sync::atomic::Ordering::SeqCst),
+                "output events must wait until authorization released"
+            );
+        }));
+        let admission = crate::InputAdmission::new(
+            crate::InputPermit::new(),
+            Instant::now() + Duration::from_secs(5),
+            move |write| {
+                inside_authorizer.store(true, std::sync::atomic::Ordering::SeqCst);
+                write();
+                inside_authorizer.store(false, std::sync::atomic::Ordering::SeqCst);
+            },
+        )
+        .with_agent_guard(crate::AgentInputGuard {
+            foreground_process_group: group,
+            provider: crate::AgentPromptKind::Claude,
+            intent: crate::AgentInputIntent::ExplicitPrompt,
+        });
+        assert_eq!(
+            worker.admit_input_batch_checked(id, &[b"AUTOMATIC", b"\r"], Some(&admission)),
+            Err(pty::PtyInputRejectReason::AdmissionDenied),
+            "queued dialog must protect the otherwise empty prompt"
+        );
+        assert_eq!(
+            events
+                .try_iter()
+                .filter(|event| matches!(event, RuntimeEvent::SessionStatusChanged { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            worker.sessions[&id]
+                .screen_text()
+                .contains("Enter to select")
+        );
+        let output_bytes = worker.detectors[&id].stats().stream_bytes;
+        assert!(output_bytes > 0);
+        worker.pump_sessions(false);
+        assert_eq!(
+            worker.detectors[&id].stats().stream_bytes,
+            output_bytes,
+            "normal pump must not replay raw output"
+        );
+        assert!(
+            !events.try_iter().any(|event| matches!(
+                event,
+                RuntimeEvent::SessionStatusChanged { .. }
+                    | RuntimeEvent::SessionInputSubmitted { .. }
+            )),
+            "next normal pump must not replay status or submit rejected input"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pr13_guard_refreshes_output_arriving_during_authorization_wait() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, _events) = admission_worker(resolver, "pr13-auth-output");
+        let release = worker.logs_root.join("release-test-output");
+        let id = SessionId(1);
+        let (output_tx, output_rx) = std::sync::mpsc::channel();
+        let mut live = Session::spawn_with_spec_and_output_wake(
+            id, session::SessionKind::Shell,
+            &spec("/bin/sh", &["-c", r#"stty -echo; while [ ! -f "$1" ]; do sleep 0.01; done; printf '\033[?2004l'; exec /bin/cat"#, "pr13", release.to_str().unwrap()]),
+            80, 24, 100,
+            Arc::new(move || { let _ = output_tx.send(()); }),
+        ).unwrap();
+        live.replay_ansi(&mut "\x1b[?2004h".as_bytes()).unwrap();
+        worker.sessions.insert(id, live);
+        assert_eq!(worker.sessions[&id].pending_output_bytes(), 0);
+        let output_rx = Mutex::new(output_rx);
+        let release_in_authorizer = release.clone();
+        let admission = crate::InputAdmission::new(
+            crate::InputPermit::new(),
+            Instant::now() + Duration::from_secs(5),
+            move |write| {
+                std::fs::write(&release_in_authorizer, b"release").unwrap();
+                output_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(3))
+                    .unwrap();
+                write();
+            },
+        )
+        .with_bracketed_paste_required();
+        assert_eq!(
+            worker.admit_input_batch_checked(id, &[b"body", b"\r"], Some(&admission)),
+            Err(pty::PtyInputRejectReason::AdmissionDenied)
+        );
+        assert!(
+            !worker.sessions[&id].bracketed_paste(),
+            "refresh must run after authorization waited"
+        );
+        std::fs::remove_file(release).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pr13_flood_stops_at_strict_budget_without_replaying_output_or_input() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, events) = admission_worker(resolver, "pr13-output-flood");
+        let id = SessionId(1);
+        let (output_tx, output_rx) = std::sync::mpsc::channel();
+        let mut live = Session::spawn_with_spec_and_output_wake(
+            id,
+            session::SessionKind::Shell,
+            &spec(
+                "/bin/sh",
+                &[
+                    "-c",
+                    "stty -echo; dd if=/dev/zero bs=1024 count=384 2>/dev/null; exec /bin/cat",
+                ],
+            ),
+            80,
+            24,
+            100,
+            Arc::new(move || {
+                let _ = output_tx.send(());
+            }),
+        )
+        .unwrap();
+        live.replay_ansi(&mut "\x1b[?2004h".as_bytes()).unwrap();
+        let total = 384 * 1024;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while live.pending_output_bytes() < total {
+            output_rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap();
+        }
+        worker.sessions.insert(id, live);
+        worker.detectors.insert(
+            id,
+            session::StatusDetector::new(session::StatusPatterns::compile(None, None, None, None)),
+        );
+        worker.open_session_log(id);
+        let admission = crate::InputAdmission::new(
+            crate::InputPermit::new(),
+            Instant::now() + Duration::from_secs(5),
+            |write| write(),
+        )
+        .with_bracketed_paste_required();
+        assert_eq!(
+            worker.admit_input_batch_checked(id, &[b"body", b"\r"], Some(&admission)),
+            Err(pty::PtyInputRejectReason::AdmissionDenied)
+        );
+        let fed = worker.detectors[&id].stats().stream_bytes as usize;
+        assert!(
+            fed > 0 && fed <= 256 * 1024,
+            "guard consumed {fed} bytes past its fixed budget"
+        );
+        assert_eq!(worker.sessions[&id].pending_output_bytes(), total - fed);
+        assert!(worker.sessions[&id].pending_output_bytes() > 0);
+        worker.pump_sessions(false);
+        assert_eq!(worker.sessions[&id].pending_output_bytes(), 0);
+        assert_eq!(worker.detectors[&id].stats().stream_bytes, total as u64);
+        assert_eq!(worker.logs[&id].last_log_offset, total as u64);
+        worker.pump_sessions(false);
+        assert_eq!(worker.detectors[&id].stats().stream_bytes, total as u64);
+        assert_eq!(worker.logs[&id].last_log_offset, total as u64);
+        assert!(
+            !events
+                .try_iter()
+                .any(|event| matches!(event, RuntimeEvent::SessionInputSubmitted { .. }))
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pr13_deferred_log_sink_allows_revocation_while_disk_work_is_delayed() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, _events) = admission_worker(resolver, "pr13-deferred-log");
+        let id = SessionId(1);
+        let (output_tx, output_rx) = std::sync::mpsc::channel();
+        let mut live = Session::spawn_with_spec_and_output_wake(
+            id,
+            session::SessionKind::Shell,
+            &spec(
+                "/bin/sh",
+                &["-c", "stty -echo; printf 'owned-log-output'; exec /bin/cat"],
+            ),
+            80,
+            24,
+            100,
+            Arc::new(move || {
+                let _ = output_tx.send(());
+            }),
+        )
+        .unwrap();
+        live.replay_ansi(&mut "\x1b[?2004h".as_bytes()).unwrap();
+        worker.sessions.insert(id, live);
+        worker.open_session_log(id);
+        output_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let permit = crate::InputPermit::new();
+        let admission = crate::InputAdmission::new(
+            permit.clone(),
+            Instant::now() + Duration::from_secs(5),
+            |write| write(),
+        )
+        .with_bracketed_paste_required();
+        let (sink_started_tx, sink_started_rx) = std::sync::mpsc::channel();
+        let (revoked_tx, revoked_rx) = std::sync::mpsc::channel();
+        let controller = std::thread::spawn(move || {
+            if sink_started_rx.recv_timeout(Duration::from_secs(5)).is_ok() {
+                permit.revoke();
+                let _ = revoked_tx.send(());
+            }
+        });
+        let mut revoke_completed_in_sink = false;
+        let mut writes = 0;
+        let result = worker.admit_input_batch_checked_with_log_sink(
+            id,
+            &[b""],
+            Some(&admission),
+            |log, bytes| {
+                writes += 1;
+                sink_started_tx.send(()).unwrap();
+                // Bounded delayed-sink handshake: a regression never waits indefinitely.
+                revoke_completed_in_sink =
+                    revoked_rx.recv_timeout(Duration::from_millis(500)).is_ok();
+                log.append_redacted_output(bytes)
+            },
+        );
+        controller.join().unwrap();
+        assert_eq!(result, Ok(()));
+        assert!(
+            revoke_completed_in_sink,
+            "disk phase held the permit and blocked cancellation"
+        );
+        assert_eq!(writes, 1);
+        assert_eq!(
+            worker.logs[&id].last_log_offset,
+            b"owned-log-output".len() as u64
+        );
+        worker
+            .sessions
+            .get_mut(&id)
+            .unwrap()
+            .write_input(b"next-owned-output\n")
+            .unwrap();
+        output_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let before_log = worker.logs[&id].last_log_offset;
+        let mut charged_effects = None;
+        let phase_admission = crate::InputAdmission::new(
+            crate::InputPermit::new(),
+            Instant::now() + Duration::from_secs(5),
+            |write| write(),
+        );
+        phase_admission.admit(|| {
+            charged_effects = Some(worker.collect_session_pump_effects(&[id], false, true));
+            assert_eq!(
+                worker.logs[&id].last_log_offset, before_log,
+                "collector wrote to disk while admission was held"
+            );
+        });
+        let charged_effects = charged_effects.unwrap();
+        assert_eq!(charged_effects.deferred_logs.len(), 1);
+        let raw = &charged_effects.deferred_logs[0].1;
+        assert!(!raw.is_empty() && raw.len() <= Session::INPUT_GUARD_OUTPUT_MAX_BYTES);
+        assert_eq!(
+            raw.capacity(),
+            Session::INPUT_GUARD_OUTPUT_MAX_BYTES,
+            "actual deferred raw-body charge must be bounded"
+        );
+        worker.finish_session_pump_effects(charged_effects);
+        assert!(worker.logs[&id].last_log_offset > before_log);
+        let mut effects = None;
+        let admission = crate::InputAdmission::new(
+            crate::InputPermit::new(),
+            Instant::now() + Duration::from_secs(5),
+            |write| write(),
+        );
+        admission.admit(|| {
+            effects = Some(worker.collect_session_pump_effects(&[id], false, true));
+        });
+        assert!(
+            effects.unwrap().deferred_logs.is_empty(),
+            "no output allocates no deferred body"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pr13_ordinary_keyboard_does_not_drain_or_wait_for_output() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, _events) = admission_worker(resolver, "pr13-keyboard-output");
+        let id = SessionId(1);
+        let (output_tx, output_rx) = std::sync::mpsc::channel();
+        let mut live = Session::spawn_with_spec_and_output_wake(
+            id,
+            session::SessionKind::Shell,
+            &spec(
+                "/bin/sh",
+                &["-c", r"stty -echo; printf '\033[?2004l'; exec /bin/cat"],
+            ),
+            80,
+            24,
+            100,
+            Arc::new(move || {
+                let _ = output_tx.send(());
+            }),
+        )
+        .unwrap();
+        live.replay_ansi(&mut "\x1b[?2004h".as_bytes()).unwrap();
+        worker.sessions.insert(id, live);
+        output_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let pending = worker.sessions[&id].pending_output_bytes();
+        assert!(pending > 0);
+        assert_eq!(
+            worker.admit_input_batch_checked(id, &[b"manual"], None),
+            Ok(())
+        );
+        assert!(worker.sessions[&id].bracketed_paste());
+        assert_eq!(worker.sessions[&id].pending_output_bytes(), pending);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pr9_actual_paste_admission_rechecks_dec2004_at_queue_boundary() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, _events) = admission_worker(resolver, "pr9-dec2004");
+        let id = SessionId(1);
+        let mut live = Session::spawn_with_spec(
+            id,
+            session::SessionKind::Shell,
+            &spec("/bin/cat", &[]),
+            80,
+            24,
+            100,
+        )
+        .unwrap();
+        live.replay_ansi(&mut "\x1b[?2004h".as_bytes()).unwrap();
+        worker.sessions.insert(id, live);
+        let admission = crate::InputAdmission::new(
+            crate::InputPermit::new(),
+            Instant::now() + Duration::from_secs(5),
+            |write| write(),
+        )
+        .with_bracketed_paste_required();
+        assert_eq!(
+            worker.admit_input_batch_checked(id, &[b""], Some(&admission)),
+            Ok(())
+        );
+        worker
+            .sessions
+            .get_mut(&id)
+            .unwrap()
+            .replay_ansi(&mut "\x1b[?2004l".as_bytes())
+            .unwrap();
+        assert_eq!(
+            worker.admit_input_batch_checked(
+                id,
+                &[b"\x1b[200~line1\nline2\x1b[201~", b"\r"],
+                Some(&admission)
+            ),
+            Err(pty::PtyInputRejectReason::AdmissionDenied),
+            "actual mode-off must refuse whole paste and submit"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pr2_actual_admission_preserves_existing_tui_draft_and_dialog() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, _events) = admission_worker(resolver, "pr2-input-draft");
+        let id = SessionId(1);
+        let mut live = Session::spawn_with_spec(
+            id,
+            session::SessionKind::Shell,
+            &spec("/bin/cat", &[]),
+            80,
+            24,
+            100,
+        )
+        .unwrap();
+        let group = live.process_identity().process_group.unwrap();
+        live.replay_ansi(&mut "❯ ".as_bytes()).unwrap();
+        worker.sessions.insert(id, live);
+        worker.detectors.insert(
+            id,
+            session::StatusDetector::new(session::StatusPatterns::compile(None, None, None, None)),
+        );
+        let admission = crate::InputAdmission::new(
+            crate::InputPermit::new(),
+            Instant::now() + Duration::from_secs(5),
+            |write| write(),
+        )
+        .with_agent_guard(crate::AgentInputGuard {
+            foreground_process_group: group,
+            provider: crate::AgentPromptKind::Claude,
+            intent: crate::AgentInputIntent::ExplicitPrompt,
+        });
+        assert_eq!(
+            worker.admit_input_batch_checked(id, &[b""], Some(&admission)),
+            Ok(()),
+            "positive empty cursor-row and foreground control"
+        );
+        for input in [b"\x1b[".as_slice(), b"D\x1b[I\x7f", b"\x1b[200~\x1b[201~"] {
+            worker.detectors.get_mut(&id).unwrap().on_user_input(input);
+        }
+        assert_eq!(
+            worker.admit_input_batch_checked(id, &[b""], Some(&admission)),
+            Ok(()),
+            "empty prompt remains usable after split navigation and empty bracketed paste"
+        );
+        worker
+            .detectors
+            .get_mut(&id)
+            .unwrap()
+            .on_user_input(b"\x1b[A");
+        assert_eq!(
+            worker.admit_input_batch_checked(id, &[b""], Some(&admission)),
+            Err(pty::PtyInputRejectReason::AdmissionDenied),
+            "history recall protects input before screen echo"
+        );
+        worker
+            .detectors
+            .get_mut(&id)
+            .unwrap()
+            .on_user_input(b"\x03");
+        assert_eq!(
+            worker.admit_input_batch_checked(id, &[b"draft"], None),
+            Ok(())
+        );
+        assert_eq!(
+            worker.admit_input_batch_checked(id, &[b"AUTOMATIC", b"\r"], Some(&admission)),
+            Err(pty::PtyInputRejectReason::AdmissionDenied),
+            "must not append to unsubmitted local draft"
+        );
+        let append = crate::InputAdmission::new(
+            crate::InputPermit::new(),
+            Instant::now() + Duration::from_secs(5),
+            |write| write(),
+        )
+        .with_agent_guard(crate::AgentInputGuard {
+            foreground_process_group: group,
+            provider: crate::AgentPromptKind::Claude,
+            intent: crate::AgentInputIntent::ExplicitAppend,
+        });
+        assert_eq!(
+            worker.admit_input_batch_checked(id, &[b" SELECTED"], Some(&append)),
+            Ok(()),
+            "deliberate no-submit append preserves existing manual draft"
+        );
+        assert!(worker.detectors[&id].has_input_draft());
+        worker
+            .detectors
+            .get_mut(&id)
+            .unwrap()
+            .on_user_input(b"\x03");
+        worker
+            .sessions
+            .get_mut(&id)
+            .unwrap()
+            .replay_ansi(&mut "\r\n❯ Yes, allow\r\nEnter to select".as_bytes())
+            .unwrap();
+        worker
+            .detectors
+            .get_mut(&id)
+            .unwrap()
+            .evaluate(Some("❯ Yes, allow\nEnter to select"));
+        assert_eq!(
+            worker.admit_input_batch_checked(id, &[b"AUTOMATIC", b"\r"], Some(&admission)),
+            Err(pty::PtyInputRejectReason::AdmissionDenied),
+            "dialog cannot receive natural prompt"
+        );
+        assert_eq!(
+            worker.admit_input_batch_checked(id, &[b" SELECTED"], Some(&append)),
+            Err(pty::PtyInputRejectReason::AdmissionDenied),
+            "explicit append still respects dialog safety"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pr2_automatic_unknown_and_wrong_foreground_fail_closed_but_explicit_other_is_useful() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, _events) = admission_worker(resolver, "pr2-unknown");
+        let id = SessionId(1);
+        let mut live = Session::spawn_with_spec(
+            id,
+            session::SessionKind::Shell,
+            &spec("/bin/cat", &[]),
+            80,
+            24,
+            100,
+        )
+        .unwrap();
+        let group = live.process_identity().process_group.unwrap();
+        live.replay_ansi(&mut "unknown provider input".as_bytes())
+            .unwrap();
+        worker.sessions.insert(id, live);
+        worker.detectors.insert(
+            id,
+            session::StatusDetector::new(session::StatusPatterns::compile(None, None, None, None)),
+        );
+        let guard = |intent, foreground| {
+            crate::InputAdmission::new(
+                crate::InputPermit::new(),
+                Instant::now() + Duration::from_secs(5),
+                |write| write(),
+            )
+            .with_agent_guard(crate::AgentInputGuard {
+                foreground_process_group: foreground,
+                provider: crate::AgentPromptKind::Other,
+                intent,
+            })
+        };
+        assert_eq!(
+            worker.admit_input_batch_checked(
+                id,
+                &[b""],
+                Some(&guard(crate::AgentInputIntent::AutomaticPrompt, group))
+            ),
+            Err(pty::PtyInputRejectReason::AdmissionDenied)
+        );
+        assert_eq!(
+            worker.admit_input_batch_checked(
+                id,
+                &[b""],
+                Some(&guard(crate::AgentInputIntent::ExplicitPrompt, group))
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            worker.admit_input_batch_checked(
+                id,
+                &[b""],
+                Some(&guard(
+                    crate::AgentInputIntent::ExplicitAppend,
+                    group.saturating_add(1)
+                ))
+            ),
+            Err(pty::PtyInputRejectReason::AdmissionDenied)
+        );
+        assert_eq!(
+            worker.admit_input_batch_checked(
+                id,
+                &[b"explicit prompt", b"\r"],
+                Some(&guard(crate::AgentInputIntent::ExplicitPrompt, group))
+            ),
+            Ok(())
+        );
+        assert!(!worker.detectors[&id].has_input_draft());
+        // Manual normal-shell input is unaffected by automatic provider readiness.
+        assert_eq!(
+            worker.admit_input_batch_checked(id, &[b"manual"], None),
+            Ok(())
+        );
+        assert!(worker.detectors[&id].has_input_draft());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pr1_guarded_batch_has_one_permission_check_and_correlated_acceptance() {
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("pr1-batch"),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+            None,
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        let session = probe.wait_for(Duration::from_secs(5), |event| match event {
+            RuntimeEvent::ShellSpawned { session } => Some(*session),
+            _ => None,
+        });
+        let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&checks);
+        let permit = crate::InputPermit::new();
+        let admission = crate::InputAdmission::new(
+            permit.clone(),
+            Instant::now() + Duration::from_secs(5),
+            move |write| {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                write();
+            },
+        );
+        client
+            .send_guarded_input_batch(
+                session,
+                "pr1:accepted".into(),
+                vec![
+                    "\x1b[200~한글\n😀\x1b[201~".as_bytes().to_vec(),
+                    b"\r".to_vec(),
+                ],
+                admission,
+            )
+            .unwrap();
+        let result = probe.wait_for(Duration::from_secs(5), |event| match event {
+            RuntimeEvent::InputAdmitted {
+                operation_id,
+                result,
+                ..
+            } if operation_id == "pr1:accepted" => Some(*result),
+            _ => None,
+        });
+        assert_eq!(result, Ok(()));
+        assert_eq!(checks.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let submitted = probe
+            .seen
+            .iter()
+            .filter(|event| matches!(event, RuntimeEvent::SessionInputSubmitted { .. }))
+            .count();
+        assert_eq!(
+            submitted, 1,
+            "only the submit CR outside bracketed paste marks submission"
+        );
+        permit.revoke();
+        let admission =
+            crate::InputAdmission::new(permit, Instant::now() + Duration::from_secs(5), |write| {
+                write()
+            });
+        client
+            .send_guarded_input_batch(
+                session,
+                "pr1:denied".into(),
+                vec![b"body".to_vec(), b"\r".to_vec()],
+                admission,
+            )
+            .unwrap();
+        let result = probe.wait_for(Duration::from_secs(5), |event| match event {
+            RuntimeEvent::InputAdmitted {
+                operation_id,
+                result,
+                ..
+            } if operation_id == "pr1:denied" => Some(*result),
+            _ => None,
+        });
+        assert_eq!(result, Err(pty::PtyInputRejectReason::AdmissionDenied));
+        assert_eq!(
+            probe
+                .seen
+                .iter()
+                .filter(|event| matches!(event, RuntimeEvent::SessionInputSubmitted { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn pr1_stale_session_batch_is_correlated_rejection_without_submission() {
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("pr1-stale"),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+            None,
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::WriteInputBatchTracked {
+                session: SessionId(u64::MAX),
+                operation_id: "pr1:stale".into(),
+                parts: vec![b"body".to_vec(), b"\r".to_vec()],
+            })
+            .unwrap();
+        let result = probe.wait_for(Duration::from_secs(5), |event| match event {
+            RuntimeEvent::InputAdmitted {
+                operation_id,
+                result,
+                ..
+            } if operation_id == "pr1:stale" => Some(*result),
+            _ => None,
+        });
+        assert_eq!(result, Err(pty::PtyInputRejectReason::SessionClosed));
+        assert!(
+            !probe
+                .seen
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::SessionInputSubmitted { .. }))
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn fleet_review_fix_submission_event_requires_real_admission_and_no_paste_newline() {
         let client = InProcessRuntimeClient::with_shell(
             5,
@@ -10151,7 +11734,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn emergency_persist_flush는_워커를_막지_않는다() {
-        init_mock_store();
         let dir = std::env::temp_dir().join(format!("deppy-rtemflush-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let db_path = dir.join("metadata.sqlite3");
@@ -10201,7 +11783,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn 세션과_layout이_영속된다() {
-        init_mock_store();
         let dir = std::env::temp_dir().join(format!("deppy-rtpersist-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let db_path = dir.join("metadata.sqlite3");
@@ -10479,7 +12060,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn exit시_scrollback_아카이브가_디스크에_기록된다() {
-        init_mock_store();
         let dir = std::env::temp_dir().join(format!("deppy-rtarchive-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let db_path = dir.join("metadata.sqlite3");
@@ -10547,7 +12127,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unknown_archive_usage_blocks_new_writes_and_makes_gc_progress() {
-        init_mock_store();
         let dir = unique_test_dir("archive-scan-over-limit");
         let db_path = dir.join("metadata.sqlite3");
         {
@@ -10624,7 +12203,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn newly_over_limit_archive_scan_rolls_back_the_triggering_write() {
-        init_mock_store();
         let dir = unique_test_dir("archive-scan-growth-over-limit");
         let db_path = dir.join("metadata.sqlite3");
         {
@@ -10702,7 +12280,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn 재시작시_agent_pane은_열람전용으로_복원된다() {
-        init_mock_store();
         let dir = std::env::temp_dir().join(format!("deppy-rta2-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let db_path = dir.join("metadata.sqlite3");
@@ -10852,7 +12429,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn archived_restore_invalid_metadata_preserves_persistent_row_for_fallback() {
-        init_mock_store();
         let dir = unique_test_dir("sf03-invalid-archive");
         let db_path = dir.join("metadata.sqlite3");
         let logs_root = dir.join("logs");
@@ -10899,7 +12475,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn archived_restore_truncated_stream_preserves_persistent_row_for_fallback() {
-        init_mock_store();
         let dir = unique_test_dir("sf03-truncated-archive");
         let db_path = dir.join("metadata.sqlite3");
         let logs_root = dir.join("logs");
@@ -11048,7 +12623,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn respawn_archived_agent_reuses_pane_persistent_id_and_appends_extra_args() {
-        init_mock_store();
         let dir = unique_test_dir("respawn-success");
         let db_path = dir.join("metadata.sqlite3");
         let logs_root = dir.join("logs");
@@ -11191,7 +12765,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn respawn_archived_agent_failure_preserves_previous_archived_state() {
-        init_mock_store();
         let dir = unique_test_dir("respawn-failure");
         let db_path = dir.join("metadata.sqlite3");
         let logs_root = dir.join("logs");
@@ -11308,7 +12881,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn respawn_archived_agent_ignores_non_archived_targets() {
-        init_mock_store();
         let client = InProcessRuntimeClient::with_shell(
             5,
             test_store(),
@@ -11396,7 +12968,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn 재시작시_저장된_layout이_복원된다() {
-        init_mock_store();
         let dir = std::env::temp_dir().join(format!("deppy-rtrestore-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let db_path = dir.join("metadata.sqlite3");
@@ -11534,7 +13105,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn restore_cwd_uses_persisted_session_cwd_for_shell_spawn() {
-        init_mock_store();
         let dir = unique_test_dir("sf03-restore-cwd");
         let cwd = dir.join("cwd-target");
         std::fs::create_dir_all(&cwd).unwrap();
@@ -11591,7 +13161,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn 재시작시_ansi_scrollback과_color가_복원된다() {
-        init_mock_store();
         let dir = std::env::temp_dir().join(format!(
             "deppy-rt-ansi-restore-{}-{}",
             std::process::id(),
@@ -11732,7 +13301,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn 재시작시_alt_screen이었던_셸_pane도_화면이_보존된다() {
-        init_mock_store();
         let dir = std::env::temp_dir().join(format!(
             "deppy-rt-altscreen-restore-{}-{}",
             std::process::id(),
@@ -11872,7 +13440,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn tracked_resize_worker는_실제크기_ack과_멱등_stamp를_반환한다() {
-        init_mock_store();
         let client = InProcessRuntimeClient::with_shell(
             5,
             test_store(),
@@ -11963,7 +13530,6 @@ mod tests {
     #[test]
     fn subscribe_with_wake는_상태이벤트에_깨운다() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        init_mock_store();
         let client = InProcessRuntimeClient::with_shell(
             5,
             test_store(),
@@ -11999,7 +13565,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn warm에서_viewport_중단_active복귀시_재개() {
-        init_mock_store();
         let client = InProcessRuntimeClient::with_shell(
             5,
             test_store(),
@@ -12060,7 +13625,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn 가시성_전이_후_세션_렌더_유지() {
-        init_mock_store();
         let client = InProcessRuntimeClient::with_shell(
             5,
             test_store(),
@@ -12129,7 +13693,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn 원격_시청_lease는_hidden_세션_viewport를_흐르게_하고_해제시_멈춘다() {
-        init_mock_store();
         let client = InProcessRuntimeClient::with_shell(
             5,
             test_store(),
@@ -12239,7 +13802,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn 원격_시청은_warm에서도_생성되고_ttl_만료로_중단된다() {
-        init_mock_store();
         let client = InProcessRuntimeClient::with_shell(
             5,
             test_store(),
@@ -12307,7 +13869,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn kill된_세션의_lease는_정리되고_stale_커맨드는_무시된다() {
-        init_mock_store();
         let client = InProcessRuntimeClient::with_shell(
             5,
             test_store(),
@@ -12390,7 +13951,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn command_sink이_살아있어도_shutdown이_완료된다() {
-        init_mock_store();
         let mut client = InProcessRuntimeClient::with_shell(
             5,
             test_store(),
@@ -12419,7 +13979,6 @@ mod tests {
     #[test]
     fn 원격_전용_viewport는_render_bound_구독자를_깨우지_않는다() {
         use std::sync::atomic::{AtomicU64, Ordering};
-        init_mock_store();
         // 연속 출력 세션 — Warm + lease면 모든 Viewport가 원격 전용이다.
         let client = InProcessRuntimeClient::with_shell(
             5,
@@ -12498,7 +14057,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn scroll은_lease_세션의_viewport를_흐르게_한다() {
-        init_mock_store();
         let client = InProcessRuntimeClient::with_shell(
             5,
             test_store(),
@@ -12551,7 +14109,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn lease_갱신은_스냅샷을_재push하지_않는다() {
-        init_mock_store();
         let client = InProcessRuntimeClient::with_shell(
             5,
             test_store(),
@@ -12860,7 +14417,6 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn restore는_세션이_있으면_skip한다() {
-        init_mock_store();
         let dir = std::env::temp_dir().join(format!("deppy-rtskip-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let db_path = dir.join("metadata.sqlite3");
@@ -12961,7 +14517,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn respawn_archived_agent는_저장된_error_regex로_상태를_감지한다() {
-        init_mock_store();
         let dir = unique_test_dir("respawn-regex");
         let db_path = dir.join("metadata.sqlite3");
         let logs_root = dir.join("logs");

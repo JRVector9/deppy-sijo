@@ -495,9 +495,9 @@ fn sidebar_tool_action(tool: SidebarTool) -> Option<SidebarAction> {
 }
 
 const FILE_TREE_IO_QUEUE_CAP: usize = 1;
-const FILE_TREE_PATH_MAX_BYTES: usize = 32 * 1024;
-const FILE_TREE_PATH_LIST_MAX_ITEMS: usize = 16;
-const FILE_TREE_PATH_LIST_MAX_BYTES: usize = 256 * 1024;
+pub(crate) const FILE_TREE_PATH_MAX_BYTES: usize = 32 * 1024;
+pub(crate) const FILE_TREE_PATH_LIST_MAX_ITEMS: usize = 4096;
+pub(crate) const FILE_TREE_PATH_LIST_MAX_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FileTreeIoOperation(u64);
@@ -555,13 +555,17 @@ pub struct FileTreePathListPayload {
 
 impl FileTreePathListPayload {
     pub fn try_new(paths: Vec<PathBuf>) -> Result<Self, FileTreeIoErrorCode> {
+        let paths = operation_roots(&paths);
         if paths.is_empty() || paths.len() > FILE_TREE_PATH_LIST_MAX_ITEMS {
             return Err(FileTreeIoErrorCode::PathListTooLarge);
         }
         let mut bytes = 0usize;
         for path in &paths {
             let encoded = path.as_os_str().as_encoded_bytes();
-            if encoded.contains(&0) || encoded.len() > FILE_TREE_PATH_MAX_BYTES {
+            if encoded.is_empty()
+                || encoded.contains(&0)
+                || encoded.len() > FILE_TREE_PATH_MAX_BYTES
+            {
                 return Err(FileTreeIoErrorCode::InvalidPath);
             }
             bytes = bytes
@@ -576,6 +580,69 @@ impl FileTreePathListPayload {
 
     pub fn into_paths(self) -> Vec<PathBuf> {
         self.paths
+    }
+}
+
+/// Preserve selection order, but operate on a selected ancestor only once.
+pub(crate) fn operation_roots(paths: &[PathBuf]) -> Vec<PathBuf> {
+    // A lexical ancestor through `..` may be a real sibling (or resolve through
+    // a symlink). Retain it until host canonicalization can prove ancestry.
+    let has_parent_component = |path: &Path| {
+        path.components()
+            .any(|component| component == std::path::Component::ParentDir)
+    };
+    let all: BTreeSet<&Path> = paths
+        .iter()
+        .map(PathBuf::as_path)
+        .filter(|path| !has_parent_component(path))
+        .collect();
+    let mut seen = HashSet::new();
+    paths
+        .iter()
+        .filter(|path| {
+            seen.insert(path.as_path())
+                && (has_parent_component(path)
+                    || !path.ancestors().skip(1).any(|parent| all.contains(&parent)))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Local, bounded, frozen file drag. Never substitute the current selection at release.
+#[derive(Clone)]
+pub(crate) struct FileTreeDragPayload {
+    root: PathBuf,
+    generation: u64,
+    paths: std::sync::Arc<[PathBuf]>,
+}
+
+impl FileTreeDragPayload {
+    pub(crate) fn try_new(
+        root: PathBuf,
+        generation: u64,
+        paths: Vec<PathBuf>,
+    ) -> Result<Self, FileTreeIoErrorCode> {
+        let root = FileTreePathPayload::try_new(root)?.into_path();
+        let paths = FileTreePathListPayload::try_new(paths)?.into_paths().into();
+        Ok(Self {
+            root,
+            generation,
+            paths,
+        })
+    }
+
+    pub(crate) fn paths(&self) -> &[PathBuf] {
+        &self.paths
+    }
+}
+
+impl std::fmt::Debug for FileTreeDragPayload {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FileTreeDragPayload")
+            .field("items", &self.paths.len())
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
     }
 }
 
@@ -603,18 +670,21 @@ pub enum FileTreeIoRequest {
     },
     Move {
         root: FileTreePathPayload,
-        source: FileTreePathPayload,
+        sources: FileTreePathListPayload,
         destination: FileTreePathPayload,
     },
     CopyInto {
+        root: Option<FileTreePathPayload>,
         sources: FileTreePathListPayload,
         destination: FileTreePathPayload,
     },
     PasteFromClipboard {
         destination: FileTreePathPayload,
+        move_files: bool,
     },
     Trash {
         target: FileTreePathPayload,
+        preflight: Option<(FileTreePathPayload, FileTreePathListPayload)>,
     },
     DeletePermanently {
         target: FileTreePathPayload,
@@ -1155,6 +1225,9 @@ pub struct FileTreeUi {
     /// 마지막 외부 파일 붙여넣기(⌘V) 처리 시각 — 같은 제스처의 press(native)와
     /// release(egui fallback)가 두 번 복사하는 것을 막는다(터미널 PASTE_GESTURE 관례).
     last_external_paste: Option<std::time::Instant>,
+    /// Held move gesture: backend Paste repeats have no KeyDown/repeat identity.
+    move_paste_active: bool,
+    last_move_paste_gesture: Option<u64>,
     /// 마지막 외부 파일 복사(⌘C) 처리 시각 — native key-down 뒤 늦게 도착한
     /// Event::Copy가 같은 파일 URL 쓰기를 중복하지 않게 한다.
     last_external_copy: Option<std::time::Instant>,
@@ -1237,6 +1310,8 @@ impl FileTreeUi {
             trash_queue: Vec::new(),
             workspace_drag: None,
             last_external_paste: None,
+            move_paste_active: false,
+            last_move_paste_gesture: None,
             last_external_copy: None,
             consumed_paste_shortcut: false,
             consumed_copy_shortcut: false,
@@ -3079,17 +3154,26 @@ impl FileTreeUi {
         );
         // 헤더(루트) 드롭도 외곽선을 쓰지 않는다 — 폴더 행과 같은 면 강조로 통일한다
         // (2026-08-10 사용자: 외곽 테두리 제거).
-        if header_drop.dnd_hover_payload::<PathBuf>().is_some() {
+        if header_drop
+            .dnd_hover_payload::<FileTreeDragPayload>()
+            .is_some()
+            || header_drop.dnd_hover_payload::<PathBuf>().is_some()
+        {
             ui.painter().rect_filled(
                 header_rect,
                 0.0,
                 ui.visuals().selection.bg_fill.gamma_multiply(0.22),
             );
         }
-        if let (Some(payload), Some(root)) = (
-            header_drop.dnd_release_payload::<PathBuf>(),
-            self.root.clone(),
-        ) {
+        if let Some(payload) =
+            super::workspace::release_typed_dnd_payload::<FileTreeDragPayload>(&header_drop)
+            && let Some(root) = self.root.clone()
+        {
+            self.start_drag_transfer(&payload, root, ui.input(|input| input.modifiers.alt));
+        } else if let Some(payload) =
+            super::workspace::release_typed_dnd_payload::<PathBuf>(&header_drop)
+            && let Some(root) = self.root.clone()
+        {
             self.start_move((*payload).clone(), root);
         }
 
@@ -3358,7 +3442,9 @@ impl FileTreeUi {
         let mut open_file: Option<PathBuf> = None; // 파일 더블클릭 → 연결 프로그램 열기
         // 문서 대상(md·txt 등) 더블클릭 → 문서 탭. open_file과 같은 이유로 루프 밖에서 처리.
         let mut open_document: Option<(PathBuf, DocumentTargetKind)> = None;
-        let mut drop_action: Option<(PathBuf, PathBuf)> = None; // (src, dst_dir)
+        let mut drop_action: Option<(std::sync::Arc<FileTreeDragPayload>, PathBuf, bool)> = None;
+        let mut legacy_drop_action: Option<(PathBuf, PathBuf)> = None;
+        let mut drag_error = None;
         let mut observed_row_height: Option<f32> = None;
         // ── OS 파일 반입 상태 (Finder → 트리, §드롭·⌘V) ──
         // winit 0.30은 macOS draggingUpdated:를 구현하지 않아 드래그 중 포인터 이벤트가
@@ -3557,12 +3643,13 @@ impl FileTreeUi {
                         }
                     }
 
-                    // 행 전체 = 드래그 소스 (payload = 절대 경로, §4). Id는 path 기반(§9-6).
+                    // The full row owns drag start. A plain scope avoids the built-in source
+                    // replacing the frozen group payload with a fresh path on every drag frame.
                     let drag_id = egui::Id::new(("file_tree_row", &row.path));
                     let egui::InnerResponse {
                         inner: label_resp,
                         response,
-                    } = ui.dnd_drag_source(drag_id, row.path.clone(), |ui| {
+                    } = ui.scope(|ui| {
                         ui.allocate_ui_with_layout(
                             egui::vec2(ui.available_width(), row_height),
                             egui::Layout::left_to_right(egui::Align::Center),
@@ -3667,7 +3754,10 @@ impl FileTreeUi {
                         let press = ui.input(|input| input.pointer.press_origin());
                         match press.filter(|pos| pos.x > response.rect.right() + MARQUEE_NAME_GAP) {
                             Some(pos) => marquee_start = Some(pos),
-                            None => row_resp.dnd_set_drag_payload(row.path.clone()),
+                            None => match self.drag_payload_for(&row.path) {
+                                Ok(payload) => row_resp.dnd_set_drag_payload(payload),
+                                Err(code) => drag_error = Some(code),
+                            },
                         }
                     }
                     // 행높이 실측 (드래그 중엔 행이 tooltip 레이어로 빠져 rect가 다름 — 제외)
@@ -3680,6 +3770,38 @@ impl FileTreeUi {
                     // 폴더로, 가장자리와 파일 행은 **그 행의 부모 폴더**로 간다
                     // (판정 규칙과 근거는 `super::file_drop`). 파일 행이 대상이 아니던
                     // 시절엔 파일 사이에 놓으면 아무 일도 안 일어났다(2026-08-10 사용자).
+                    if !inaccessible
+                        && let Some(hover) = row_resp.dnd_hover_payload::<FileTreeDragPayload>()
+                        && let Some(pointer) = ui.ctx().pointer_interact_pos()
+                        && let Some((decision, _)) = group_row_drop_target(
+                            row,
+                            row_rect,
+                            pointer.y,
+                            hover.paths(),
+                            ui.input(|input| input.modifiers.alt),
+                        )
+                    {
+                        paint_row_drop_target(ui, ppp, row_rect, row.depth, decision);
+                    }
+                    if !inaccessible
+                        && let Some(payload) = super::workspace::release_typed_dnd_payload::<
+                            FileTreeDragPayload,
+                        >(&row_resp)
+                        && let Some(pointer) = ui.ctx().pointer_interact_pos()
+                    {
+                        let copy = ui.input(|input| input.modifiers.alt);
+                        match group_row_drop_target(row, row_rect, pointer.y, payload.paths(), copy)
+                        {
+                            Some((decision, destination))
+                                if decision.eligibility
+                                    == super::file_drop::DropEligibility::Allowed =>
+                            {
+                                drop_action = Some((payload, destination, copy));
+                            }
+                            Some(_) => {}
+                            None => drag_error = Some(FileTreeIoErrorCode::OutsideRoot),
+                        }
+                    }
                     if !inaccessible
                         && let Some(hover) = row_resp.dnd_hover_payload::<PathBuf>()
                         && let Some(pointer) = ui.ctx().pointer_interact_pos()
@@ -3697,7 +3819,8 @@ impl FileTreeUi {
                         paint_row_drop_target(ui, ppp, row_rect, row.depth, target);
                     }
                     if !inaccessible
-                        && let Some(payload) = row_resp.dnd_release_payload::<PathBuf>()
+                        && let Some(payload) =
+                            super::workspace::release_typed_dnd_payload::<PathBuf>(&row_resp)
                         && let Some(pointer) = ui.ctx().pointer_interact_pos()
                         && let Some(target) = super::file_drop::row_drop_target(
                             super::file_drop::RowInfo {
@@ -3723,7 +3846,7 @@ impl FileTreeUi {
                             })
                             .flatten();
                         if let Some(destination) = destination {
-                            drop_action = Some(((*payload).clone(), destination));
+                            legacy_drop_action = Some(((*payload).clone(), destination));
                         }
                     }
                     let single_clicked =
@@ -3864,7 +3987,13 @@ impl FileTreeUi {
                 Err(code) => self.reject_io(code),
             }
         }
-        if let Some((src, dst_dir)) = drop_action {
+        if let Some(code) = drag_error {
+            self.reject_io(code);
+        }
+        if let Some((payload, destination, copy)) = drop_action {
+            self.start_drag_transfer(&payload, destination, copy);
+        }
+        if let Some((src, dst_dir)) = legacy_drop_action {
             self.start_move(src, dst_dir);
         }
 
@@ -4201,13 +4330,62 @@ impl FileTreeUi {
         let request = (|| {
             Ok(FileTreeIoRequest::Move {
                 root: FileTreePathPayload::try_new(root)?,
-                source: FileTreePathPayload::try_new(src)?,
+                sources: FileTreePathListPayload::try_new(vec![src])?,
                 destination: FileTreePathPayload::try_new(dst_dir)?,
             })
         })();
         match request.and_then(|request| self.queue_io(request, refresh, None, None)) {
             Ok(()) => {}
             Err(code) => self.reject_io(code),
+        }
+    }
+
+    fn drag_payload_for(&self, path: &Path) -> Result<FileTreeDragPayload, FileTreeIoErrorCode> {
+        let root = self.root.clone().ok_or(FileTreeIoErrorCode::InvalidPath)?;
+        let paths = if self.selected.contains(path) {
+            self.selection_or(None)
+        } else {
+            vec![path.to_path_buf()]
+        };
+        FileTreeDragPayload::try_new(root, self.io_generation, paths)
+    }
+
+    fn start_drag_transfer(
+        &mut self,
+        payload: &FileTreeDragPayload,
+        destination: PathBuf,
+        copy: bool,
+    ) {
+        if self.root.as_ref() != Some(&payload.root) || self.io_generation != payload.generation {
+            self.reject_io(FileTreeIoErrorCode::OutsideRoot);
+            return;
+        }
+        let refresh = payload
+            .paths()
+            .iter()
+            .flat_map(|path| parent_dirs(path, &destination))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let request = (|| {
+            let sources = FileTreePathListPayload::try_new(payload.paths().to_vec())?;
+            let destination = FileTreePathPayload::try_new(destination)?;
+            Ok(if copy {
+                FileTreeIoRequest::CopyInto {
+                    root: Some(FileTreePathPayload::try_new(payload.root.clone())?),
+                    sources,
+                    destination,
+                }
+            } else {
+                FileTreeIoRequest::Move {
+                    root: FileTreePathPayload::try_new(payload.root.clone())?,
+                    sources,
+                    destination,
+                }
+            })
+        })();
+        if let Err(code) = request.and_then(|request| self.queue_io(request, refresh, None, None)) {
+            self.reject_io(code);
         }
     }
 
@@ -4221,6 +4399,7 @@ impl FileTreeUi {
         let refresh = vec![dst_dir.clone()];
         let request = (|| {
             Ok(FileTreeIoRequest::CopyInto {
+                root: None,
                 sources: FileTreePathListPayload::try_new(sources)?,
                 destination: FileTreePathPayload::try_new(dst_dir)?,
             })
@@ -4243,6 +4422,29 @@ impl FileTreeUi {
         target_dir: Option<PathBuf>,
         row_path: Option<PathBuf>,
     ) {
+        // Take before ownership guards. An unclaimed native move cannot be replayed
+        // when the pointer/focus/root changes in a later frame.
+        let native_move = crate::native_key_monitor::take_clipboard_move_paste()
+            .filter(|gesture| self.last_move_paste_gesture != Some(gesture.sequence));
+        if let Some(gesture) = native_move {
+            self.last_move_paste_gesture = Some(gesture.sequence);
+        }
+        let active_move_release = self.move_paste_active
+            && ui.input(|input| {
+                input.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        egui::Event::Key {
+                            key: egui::Key::V,
+                            pressed: false,
+                            ..
+                        }
+                    )
+                })
+            });
+        if active_move_release {
+            self.move_paste_active = false;
+        }
         let Some(root) = self.root.clone() else {
             return;
         };
@@ -4283,24 +4485,86 @@ impl FileTreeUi {
         // ⌘V(②): 클립보드 파일 목록을 대상 폴더로 복사. macOS는 press가 native
         // key-down(peek)으로, 텍스트 표현이 있으면 Event::Paste로, release가 V key-up
         // fallback으로 온다(터미널 관례) — 어느 쪽이든 한 제스처는 한 번만 처리한다.
-        let paste_signal = ui.input(|i| i.events.iter().any(is_tree_paste_signal))
-            || crate::native_key_monitor::peek_clipboard_paste();
-        if !paste_signal {
+        let (move_key, move_start, move_release, move_paste_event) = ui.input(|input| {
+            (
+                input.events.iter().any(is_tree_move_paste_key),
+                input.events.iter().any(|event| {
+                    is_tree_move_paste_key(event)
+                        && matches!(
+                            event,
+                            egui::Event::Key {
+                                pressed: true,
+                                repeat: false,
+                                ..
+                            }
+                        )
+                }),
+                input.events.iter().any(|event| {
+                    is_tree_move_paste_key(event)
+                        && matches!(event, egui::Event::Key { pressed: false, .. })
+                }),
+                cfg!(target_os = "macos")
+                    && input
+                        .events
+                        .iter()
+                        .any(|event| matches!(event, egui::Event::Paste(_)))
+                    && input.modifiers.command
+                    && input.modifiers.alt
+                    && !input.modifiers.ctrl,
+            )
+        });
+        let move_files =
+            native_move.is_some() || move_key || move_paste_event || active_move_release;
+        // Backend Paste carries neither native gesture identity nor repeat state.
+        // It may accompany a held gesture that began under another focus owner.
+        let start_move = native_move.is_some() || move_start;
+        // Moving clipboard files is destructive: the tree must own keyboard focus,
+        // just as for Cmd+Delete. Pointer hover alone retains the terminal's input.
+        if move_files && !ui.memory(|memory| memory.has_focus(tree_keyboard_focus_id())) {
             return;
         }
-        if self
-            .last_external_paste
-            .is_some_and(|at| at.elapsed() < EXTERNAL_PASTE_GESTURE_WINDOW)
-        {
-            // 같은 ⌘V 제스처의 후속 신호(press→release) — 재복사 없이 터미널 이중
-            // 처리만 계속 누른다.
+        if move_files {
             self.consumed_paste_shortcut = true;
-            return;
+            ui.input_mut(|input| {
+                input.events.retain(|event| {
+                    !(is_tree_move_paste_key(event)
+                        || (active_move_release
+                            && matches!(
+                                event,
+                                egui::Event::Key {
+                                    key: egui::Key::V,
+                                    pressed: false,
+                                    ..
+                                }
+                            )))
+                })
+            });
+            if !start_move {
+                return;
+            }
+            self.move_paste_active = !(move_release || active_move_release);
+        } else {
+            let paste_signal = ui.input(|i| i.events.iter().any(is_tree_paste_signal))
+                || crate::native_key_monitor::peek_clipboard_paste();
+            if !paste_signal {
+                return;
+            }
+            if self
+                .last_external_paste
+                .is_some_and(|at| at.elapsed() < EXTERNAL_PASTE_GESTURE_WINDOW)
+            {
+                self.consumed_paste_shortcut = true;
+                return;
+            }
         }
         let destination = target_dir.unwrap_or(root);
         let refresh = vec![destination.clone()];
-        let request = FileTreePathPayload::try_new(destination)
-            .map(|destination| FileTreeIoRequest::PasteFromClipboard { destination });
+        let request = FileTreePathPayload::try_new(destination).map(|destination| {
+            FileTreeIoRequest::PasteFromClipboard {
+                destination,
+                move_files,
+            }
+        });
         if let Err(code) = request.and_then(|request| self.queue_io(request, refresh, None, None)) {
             self.reject_io(code);
             return;
@@ -4573,11 +4837,13 @@ impl FileTreeUi {
         if self.selected.is_empty() {
             return fallback.into_iter().collect();
         }
-        self.flat
+        let paths = self
+            .flat
             .iter()
             .filter(|row| self.selected.contains(&row.path))
             .map(|row| row.path.clone())
-            .collect()
+            .collect::<Vec<_>>();
+        operation_roots(&paths)
     }
 
     /// 선택(없으면 `fallback`)을 휴지통으로. IO 큐가 capacity-1이라 첫 대상만 바로
@@ -4597,19 +4863,34 @@ impl FileTreeUi {
             Some(hovered) if !self.selected.contains(hovered) => vec![hovered.clone()],
             _ => self.selection_or(fallback.clone()),
         };
-        // 조상 폴더가 함께 골라졌으면 그 안의 것은 뺀다 — 폴더가 먼저 휴지통으로 가면
-        // 뒤따르는 자식 요청은 없는 경로를 지우려다 반드시 실패하고, 그 실패가 배치 전체를
-        // 폐기시킨다(2026-09-04 리뷰 M5).
+        if chosen.is_empty() {
+            return;
+        }
+        let preflight = match FileTreePathListPayload::try_new(chosen) {
+            Ok(paths) => paths,
+            Err(code) => {
+                self.confirm_delete = None;
+                self.reject_io(code);
+                return;
+            }
+        };
+        let chosen = preflight.paths.clone();
+        let root = match root
+            .ok_or(FileTreeIoErrorCode::OutsideRoot)
+            .and_then(FileTreePathPayload::try_new)
+        {
+            Ok(root) => root,
+            Err(code) => {
+                self.confirm_delete = None;
+                self.reject_io(code);
+                return;
+            }
+        };
         let mut targets: Vec<DeleteTarget> = chosen
             .iter()
-            .filter(|path| {
-                !chosen
-                    .iter()
-                    .any(|other| other != *path && path.starts_with(other))
-            })
             .cloned()
             .map(|path| DeleteTarget {
-                label: delete_target_label(root.as_deref(), &path),
+                label: delete_target_label(Some(root.as_path()), &path),
                 is_dir: is_dir(&path),
                 path,
             })
@@ -4619,7 +4900,7 @@ impl FileTreeUi {
         }
         let first = targets.remove(0);
         self.trash_queue = targets;
-        if self.spawn_trash(first) {
+        if self.spawn_trash_preflight(first, Some((root, preflight))) {
             self.selected.clear();
             self.select_anchor = None;
         } else {
@@ -4633,6 +4914,33 @@ impl FileTreeUi {
     /// 무장한 채 두면 **무관한 IO가 성공하는 순간** 뒤 대상들이 조용히 지워진다
     /// (2026-09-04 리뷰 H1).
     fn spawn_trash(&mut self, target: DeleteTarget) -> bool {
+        // Continuations revalidate the original root at their own host boundary.
+        // A parent symlink may have changed since the group's first preflight.
+        let preflight = self
+            .root
+            .clone()
+            .map(|root| {
+                Ok((
+                    FileTreePathPayload::try_new(root)?,
+                    FileTreePathListPayload::try_new(vec![target.path.clone()])?,
+                ))
+            })
+            .transpose();
+        match preflight {
+            Ok(preflight) => self.spawn_trash_preflight(target, preflight),
+            Err(code) => {
+                self.confirm_delete = None;
+                self.reject_io(code);
+                false
+            }
+        }
+    }
+
+    fn spawn_trash_preflight(
+        &mut self,
+        target: DeleteTarget,
+        preflight: Option<(FileTreePathPayload, FileTreePathListPayload)>,
+    ) -> bool {
         // 새 삭제 제스처를 접수했으면 직전 실패가 남긴 영구삭제 확인은 닫는다.
         // 남겨두면 방금 고른 파일이 아니라 **예전 대상** 이름이 패널 아래에 그대로
         // 떠 있고, 그 확인을 누르는 순간 엉뚱한 파일이 영구 삭제된다.
@@ -4649,8 +4957,12 @@ impl FileTreeUi {
             .map(Path::to_path_buf)
             .into_iter()
             .collect();
-        let request = FileTreePathPayload::try_new(target.path.clone())
-            .map(|payload| FileTreeIoRequest::Trash { target: payload });
+        let request = FileTreePathPayload::try_new(target.path.clone()).map(|payload| {
+            FileTreeIoRequest::Trash {
+                target: payload,
+                preflight,
+            }
+        });
         match request.and_then(|request| self.queue_io(request, refresh, Some(target), None)) {
             Ok(()) => true,
             Err(code) => {
@@ -8022,6 +8334,42 @@ fn row_target_dir(row: &FlatRow, root: Option<&Path>) -> PathBuf {
     }
 }
 
+fn group_row_drop_target(
+    row: &FlatRow,
+    rect: egui::Rect,
+    pointer_y: f32,
+    paths: &[PathBuf],
+    copy: bool,
+) -> Option<(super::file_drop::DropDecision, PathBuf)> {
+    use super::file_drop::{DropDecision, DropEligibility, RowDropTarget};
+    if !(rect.top()..rect.bottom()).contains(&pointer_y) {
+        return None;
+    }
+    let target = super::file_drop::band_target(row.is_dir, rect.top(), rect.bottom(), pointer_y);
+    let destination = match target {
+        RowDropTarget::IntoFolder => row.path.clone(),
+        _ => row.path.parent()?.to_path_buf(),
+    };
+    let mut eligibility = DropEligibility::NoOp;
+    for path in paths {
+        match super::file_drop::drop_eligibility(path, &destination) {
+            DropEligibility::Forbidden => return None,
+            DropEligibility::Allowed => eligibility = DropEligibility::Allowed,
+            DropEligibility::NoOp => {}
+        }
+    }
+    if copy {
+        eligibility = DropEligibility::Allowed;
+    }
+    Some((
+        DropDecision {
+            target,
+            eligibility,
+        },
+        destination,
+    ))
+}
+
 /// 같은 ⌘V 제스처(press+release) 이중 처리 방지 창 — 터미널 PASTE_GESTURE_WINDOW 관례.
 const EXTERNAL_PASTE_GESTURE_WINDOW: std::time::Duration = std::time::Duration::from_millis(600);
 const EXTERNAL_COPY_GESTURE_WINDOW: std::time::Duration = std::time::Duration::from_millis(600);
@@ -8031,6 +8379,16 @@ const EXTERNAL_COPY_GESTURE_WINDOW: std::time::Duration = std::time::Duration::f
 /// (V key-up)가 fallback이다(터미널 is_clipboard_paste_shortcut 관례). native
 /// key-down은 peek_clipboard_paste로 별도 감지한다.
 fn is_tree_paste_signal(event: &egui::Event) -> bool {
+    if is_tree_move_paste_key(event) {
+        return matches!(
+            event,
+            egui::Event::Key {
+                pressed: true,
+                repeat: false,
+                ..
+            }
+        );
+    }
     match event {
         egui::Event::Paste(_) => true,
         egui::Event::Key {
@@ -8041,6 +8399,11 @@ fn is_tree_paste_signal(event: &egui::Event) -> bool {
         } => cfg!(target_os = "macos") && !*pressed && modifiers.command && !modifiers.ctrl,
         _ => false,
     }
+}
+
+fn is_tree_move_paste_key(event: &egui::Event) -> bool {
+    matches!(event, egui::Event::Key { key: egui::Key::V, modifiers, .. }
+        if cfg!(target_os = "macos") && modifiers.command && modifiers.alt && !modifiers.ctrl)
 }
 
 fn tree_area_owns_os_drop(tree_area: egui::Rect, pos: egui::Pos2) -> bool {
@@ -8536,10 +8899,11 @@ mod tests {
         assert!(debug.contains("items: 1"));
         assert!(!debug.contains("/secret/a.txt"));
         assert!(matches!(
-            FileTreePathListPayload::try_new(vec![
-                PathBuf::from("a");
-                FILE_TREE_PATH_LIST_MAX_ITEMS + 1
-            ]),
+            FileTreePathListPayload::try_new(
+                (0..=FILE_TREE_PATH_LIST_MAX_ITEMS)
+                    .map(|i| PathBuf::from(format!("/secret/{i}")))
+                    .collect()
+            ),
             Err(FileTreeIoErrorCode::PathListTooLarge)
         ));
     }
@@ -12015,7 +12379,7 @@ mod tests {
                 .take_io_intent()
                 .unwrap_or_else(|| panic!("{step}번째 삭제 intent가 없다"));
             match &intent.request {
-                FileTreeIoRequest::Trash { target } => {
+                FileTreeIoRequest::Trash { target, .. } => {
                     assert_eq!(target.as_path(), want.as_path(), "{step}번째 대상")
                 }
                 other => panic!("unexpected request: {other:?}"),
@@ -12076,6 +12440,7 @@ mod tests {
     #[test]
     fn 다중_삭제의_첫_요청이_busy면_새_대기열을_버린다() {
         let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.root = Some(PathBuf::from("/root"));
         tree.flat = ["old.txt", "new-a.txt", "new-b.txt"]
             .into_iter()
             .map(|name| FlatRow {
@@ -12156,6 +12521,893 @@ mod tests {
             !egui::DragAndDrop::has_any_payload(&harness.ctx),
             "선택 사각형이 파일 이동 payload로 바뀌었다"
         );
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn pr11_shift_marquee_then_selected_row_drag_freezes_all_three_sources() {
+        pr11_marquee_drag_and_host_effect(false);
+    }
+
+    #[test]
+    fn pr11_option_shift_marquee_drag_copies_all_three_frozen_sources() {
+        pr11_marquee_drag_and_host_effect(true);
+    }
+
+    fn pr11_marquee_drag_and_host_effect(copy: bool) {
+        use egui_kittest::kittest::Queryable as _;
+        let base = temp_root(if copy {
+            "pr11-marquee-copy"
+        } else {
+            "pr11-marquee-move"
+        });
+        std::fs::create_dir(base.join("dest")).unwrap();
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(base.join(name), name).unwrap();
+        }
+        let base = base.canonicalize().unwrap();
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.set_root(Some(base.clone()));
+        drain_listings(&mut tree);
+        let mut harness = drop_harness(&catalog, tree);
+        for _ in 0..10 {
+            harness.step();
+        }
+        let a = harness.get_by_label("a.txt").rect().center();
+        let c = harness.get_by_label("c.txt").rect().center();
+        let destination = harness.get_by_label("dest").rect().center();
+        let start = egui::pos2(220.0, a.y);
+        let end = egui::pos2(220.0, c.y);
+        harness.event(egui::Event::ModifiersChanged(egui::Modifiers::SHIFT));
+        harness.event(egui::Event::PointerMoved(start));
+        harness.event(egui::Event::PointerButton {
+            pos: start,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::SHIFT,
+        });
+        harness.step();
+        harness.event(egui::Event::ModifiersChanged(egui::Modifiers::SHIFT));
+        harness.hover_at(end);
+        harness.step();
+        assert_eq!(harness.state().0.selected.len(), 3, "actual Shift marquee");
+        harness.event(egui::Event::PointerButton {
+            pos: end,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::SHIFT,
+        });
+        harness.step();
+        harness.event(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+        harness.hover_at(a);
+        harness.drag_at(a);
+        harness.step();
+        harness.hover_at(a + egui::vec2(20.0, 0.0));
+        harness.step();
+        assert!(egui::DragAndDrop::has_any_payload(&harness.ctx));
+        // Changing selection after drag start must not change the frozen operation group.
+        harness.state_mut().0.selected = BTreeSet::from([base.join("c.txt")]);
+        let modifiers = if copy {
+            egui::Modifiers::ALT
+        } else {
+            egui::Modifiers::NONE
+        };
+        harness.event(egui::Event::ModifiersChanged(modifiers));
+        harness.hover_at(destination);
+        harness.step();
+        harness.event(egui::Event::PointerButton {
+            pos: destination,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers,
+        });
+        harness.step();
+        let intent = harness.state_mut().0.take_io_intent().expect("move intent");
+        let sources = match &intent.request {
+            FileTreeIoRequest::Move { sources, .. } if !copy => &sources.paths,
+            FileTreeIoRequest::CopyInto {
+                sources,
+                root: Some(_),
+                ..
+            } if copy => &sources.paths,
+            other => panic!("unexpected transfer: {other:?}"),
+        };
+        assert_eq!(
+            sources.as_slice(),
+            &["a.txt", "b.txt", "c.txt"].map(|name| base.join(name)),
+            "all frozen selected members must reach host IO"
+        );
+        let result = crate::app::pr11_private_file_fixture_io(intent.request, &base);
+        assert_eq!(result, Ok(()));
+        assert_eq!(std::fs::read_dir(base.join("dest")).unwrap().count(), 3);
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            assert_eq!(base.join(name).exists(), copy);
+            assert_eq!(
+                std::fs::read(base.join("dest").join(name)).unwrap(),
+                name.as_bytes()
+            );
+        }
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn pr11_tree_header_does_not_steal_session_payload_before_matching_consumer() {
+        use egui_kittest::kittest::Queryable as _;
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.root = Some(PathBuf::from("/pr11-private-header"));
+        tree.children = Some(vec![file("a.txt")]);
+        tree.rebuild_flat();
+        let mut fonts_ready = false;
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(420.0, 700.0))
+            .build_ui_state(
+                |ui, state: &mut (FileTreeUi, bool)| {
+                    if !fonts_ready {
+                        install_sidebar_test_fonts(ui.ctx());
+                        fonts_ready = true;
+                        return;
+                    }
+                    let sidebar = SidebarSnapshot {
+                        active_workspace_id: "ws-test",
+                        workspaces: &[],
+                        view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
+                        home_notice_count: 0,
+                        fleet_summary: Default::default(),
+                        history_tab_active: false,
+                        git_tab_active: false,
+                        agents_open: false,
+                        workspace_note: None,
+                    };
+                    state.0.panel(ui, &HashMap::new(), &sidebar, &catalog);
+                    if ui.input(|input| input.pointer.any_released()) {
+                        // Observe in this pass, before egui's end-pass payload cleanup.
+                        state.1 =
+                            egui::DragAndDrop::payload::<SessionRowDragPayload>(ui.ctx()).is_some();
+                    }
+                },
+                (tree, false),
+            );
+        for _ in 0..10 {
+            harness.step();
+        }
+        let destination = harness.get_by_label("Files").rect().center();
+        egui::DragAndDrop::set_payload(
+            &harness.ctx,
+            SessionRowDragPayload::new(SessionRowTarget::persisted(
+                "other-workspace",
+                runtime::MuxPaneId::new(),
+            )),
+        );
+        harness.hover_at(destination);
+        harness.event(egui::Event::PointerButton {
+            pos: destination,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.step();
+        assert!(
+            harness.state().1,
+            "PathBuf-only tree header stole unrelated session payload"
+        );
+        assert!(harness.state_mut().0.take_io_intent().is_none());
+    }
+
+    #[test]
+    fn pr11_option_move_paste_repeat_is_consumed_without_new_file_operation() {
+        let root = temp_root("pr11-paste-repeat").canonicalize().unwrap();
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.root = Some(root.clone());
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, tree: &mut FileTreeUi| {
+                let area = ui.available_rect_before_wrap();
+                register_tree_keyboard_focus_target(ui);
+                ui.memory_mut(|memory| memory.request_focus(tree_keyboard_focus_id()));
+                tree.handle_clipboard_shortcuts(ui, area, None, None);
+                assert!(!ui.input(|input| input.events.iter().any(is_tree_move_paste_key)));
+            },
+            tree,
+        );
+        harness.run();
+        harness.hover_at(egui::pos2(50.0, 50.0));
+        let modifiers = egui::Modifiers {
+            command: true,
+            mac_cmd: true,
+            alt: true,
+            ..Default::default()
+        };
+        harness.event(egui::Event::Key {
+            key: egui::Key::V,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        });
+        harness.run();
+        let first = harness
+            .state_mut()
+            .take_io_intent()
+            .expect("initial explicit move");
+        harness.state_mut().complete_io(FileTreeIoCompletion {
+            operation: first.operation,
+            generation: first.generation,
+            result: Ok(()),
+        });
+        harness.state_mut().last_external_paste =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+        // egui computes repeat from the prior physical key state.
+        harness.event(egui::Event::Key {
+            key: egui::Key::V,
+            physical_key: None,
+            pressed: true,
+            repeat: true,
+            modifiers,
+        });
+        harness.run();
+        assert!(
+            harness.state_mut().take_io_intent().is_none(),
+            "held Option+Cmd+V must not start another file operation"
+        );
+        harness.event(egui::Event::Key {
+            key: egui::Key::V,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers,
+        });
+        harness.run();
+        assert!(
+            harness.state_mut().take_io_intent().is_none(),
+            "release after the gesture window must not move twice"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pr11_option_move_paste_requires_tree_keyboard_focus() {
+        let root = temp_root("pr11-paste-focus").canonicalize().unwrap();
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.root = Some(root.clone());
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, state: &mut (FileTreeUi, bool, bool)| {
+                let area = ui.available_rect_before_wrap();
+                register_tree_keyboard_focus_target(ui);
+                ui.interact(
+                    egui::Rect::from_min_size(ui.cursor().min, egui::Vec2::ZERO),
+                    egui::Id::new("pr11-terminal-focus"),
+                    egui::Sense::focusable_noninteractive(),
+                )
+                .widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::Label,
+                        true,
+                        "Private terminal focus",
+                    )
+                });
+                let focus = if state.1 {
+                    tree_keyboard_focus_id()
+                } else {
+                    egui::Id::new("pr11-terminal-focus")
+                };
+                ui.memory_mut(|memory| memory.request_focus(focus));
+                let had_move_key =
+                    ui.input(|input| input.events.iter().any(is_tree_move_paste_key));
+                state.0.handle_clipboard_shortcuts(ui, area, None, None);
+                if had_move_key {
+                    state.2 = ui.input(|input| input.events.iter().any(is_tree_move_paste_key));
+                }
+            },
+            (tree, false, false),
+        );
+        harness.run();
+        harness.hover_at(egui::pos2(50.0, 50.0));
+        let event = egui::Event::Key {
+            key: egui::Key::V,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                command: true,
+                mac_cmd: true,
+                alt: true,
+                ..Default::default()
+            },
+        };
+        harness.event(event.clone());
+        harness.run();
+        assert!(
+            harness.state_mut().0.take_io_intent().is_none(),
+            "pointer over tree with terminal focus must not move clipboard files"
+        );
+        assert!(
+            harness.state().2,
+            "tree cannot consume the terminal's Option+Cmd+V"
+        );
+        assert_eq!(
+            harness.state_mut().0.take_clipboard_shortcut_consumption(),
+            (false, false)
+        );
+        // A fresh tree-owned press follows the terminal-owned release.
+        harness.event(egui::Event::Key {
+            key: egui::Key::V,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                command: true,
+                mac_cmd: true,
+                alt: true,
+                ..Default::default()
+            },
+        });
+        harness.run();
+        harness.state_mut().1 = true;
+        harness.event(event);
+        harness.run();
+        assert!(!harness.state().2);
+        let intent = harness
+            .state_mut()
+            .0
+            .take_io_intent()
+            .expect("tree-focused explicit move intent");
+        assert!(matches!(
+            intent.request,
+            FileTreeIoRequest::PasteFromClipboard {
+                move_files: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            harness.state_mut().0.take_clipboard_shortcut_consumption(),
+            (true, false)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pr11r_file_only_backend_move_paste_has_no_pressed_key_event() {
+        let root = temp_root("pr11r-file-only-native").canonicalize().unwrap();
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.root = Some(root.clone());
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, tree: &mut FileTreeUi| {
+                register_tree_keyboard_focus_target(ui);
+                ui.memory_mut(|memory| memory.request_focus(tree_keyboard_focus_id()));
+                tree.handle_clipboard_shortcuts(ui, ui.available_rect_before_wrap(), None, None);
+                let batch = crate::native_key_monitor::drain();
+                assert!(
+                    !batch.clipboard_paste,
+                    "Option move cannot be promoted to terminal paste"
+                );
+            },
+            tree,
+        );
+        harness.run();
+        harness.hover_at(egui::pos2(50.0, 50.0));
+        // Pinned egui-winit returns without Key/Paste for a file-only clipboard.
+        crate::native_key_monitor::tests::record_move_paste(false);
+        harness.event(egui::Event::ModifiersChanged(egui::Modifiers {
+            command: true,
+            mac_cmd: true,
+            alt: true,
+            ..Default::default()
+        }));
+        harness.step();
+        let intent = harness
+            .state_mut()
+            .take_io_intent()
+            .expect("actual native file-only move gesture");
+        assert!(matches!(
+            intent.request,
+            FileTreeIoRequest::PasteFromClipboard {
+                move_files: true,
+                ..
+            }
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pr11r_text_backend_paste_repeats_and_release_do_not_repeat_move() {
+        let root = temp_root("pr11r-native-text-repeat")
+            .canonicalize()
+            .unwrap();
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.root = Some(root.clone());
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, tree: &mut FileTreeUi| {
+                register_tree_keyboard_focus_target(ui);
+                ui.memory_mut(|memory| memory.request_focus(tree_keyboard_focus_id()));
+                tree.handle_clipboard_shortcuts(ui, ui.available_rect_before_wrap(), None, None);
+                assert!(!crate::native_key_monitor::drain().clipboard_paste);
+            },
+            tree,
+        );
+        harness.run();
+        harness.hover_at(egui::pos2(50.0, 50.0));
+        let modifiers = egui::Modifiers {
+            command: true,
+            mac_cmd: true,
+            alt: true,
+            ..Default::default()
+        };
+        crate::native_key_monitor::tests::record_move_paste(false);
+        harness.event(egui::Event::ModifiersChanged(modifiers));
+        harness.event(egui::Event::Paste(
+            "clipboard text accompanying file URLs".to_owned(),
+        ));
+        harness.step();
+        let first = harness.state_mut().take_io_intent().unwrap();
+        assert!(matches!(
+            first.request,
+            FileTreeIoRequest::PasteFromClipboard {
+                move_files: true,
+                ..
+            }
+        ));
+        harness.state_mut().complete_io(FileTreeIoCompletion {
+            operation: first.operation,
+            generation: first.generation,
+            result: Ok(()),
+        });
+        harness.state_mut().last_external_paste =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+        crate::native_key_monitor::tests::record_move_paste(true);
+        harness.event(egui::Event::Paste(
+            "clipboard text accompanying file URLs".to_owned(),
+        ));
+        harness.step();
+        assert!(harness.state_mut().take_io_intent().is_none());
+        assert!(harness.state_mut().take_clipboard_shortcut_consumption().0);
+        harness.event(egui::Event::Key {
+            key: egui::Key::V,
+            physical_key: Some(egui::Key::V),
+            pressed: false,
+            repeat: false,
+            modifiers,
+        });
+        harness.step();
+        assert!(harness.state_mut().take_io_intent().is_none());
+        // A distinct physical gesture works immediately, without the ordinary paste debounce.
+        crate::native_key_monitor::tests::record_move_paste(false);
+        harness.event(egui::Event::Paste(
+            "clipboard text accompanying file URLs".to_owned(),
+        ));
+        harness.step();
+        assert!(harness.state_mut().take_io_intent().is_some());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pr11r_unclaimed_native_move_cannot_rebind_after_terminal_text_or_popup_focus() {
+        for owner in 1..=3 {
+            let root = temp_root(&format!("pr11r-native-owner-{owner}"))
+                .canonicalize()
+                .unwrap();
+            let mut tree = FileTreeUi::new(egui::Context::default());
+            tree.root = Some(root.clone());
+            let mut harness = egui_kittest::Harness::new_ui_state(
+                |ui, state: &mut (FileTreeUi, u8, String)| {
+                    register_tree_keyboard_focus_target(ui);
+                    let terminal = egui::Id::new("pr11r-terminal-owner");
+                    ui.interact(
+                        egui::Rect::from_min_size(ui.cursor().min, egui::Vec2::ZERO),
+                        terminal,
+                        egui::Sense::focusable_noninteractive(),
+                    )
+                    .widget_info(|| {
+                        egui::WidgetInfo::labeled(
+                            egui::WidgetType::Label,
+                            true,
+                            "Private terminal owner",
+                        )
+                    });
+                    if state.1 == 2 {
+                        ui.add(egui::TextEdit::singleline(&mut state.2))
+                            .request_focus();
+                    } else {
+                        ui.memory_mut(|memory| {
+                            memory.request_focus(if state.1 == 1 {
+                                terminal
+                            } else {
+                                tree_keyboard_focus_id()
+                            })
+                        });
+                    }
+                    if state.1 == 3 {
+                        let anchor = ui.button("Private existing popup owner");
+                        egui::Popup::from_response(&anchor).open(true).show(|ui| {
+                            ui.label("Popup owns input");
+                        });
+                    } else {
+                        egui::Popup::close_all(ui.ctx());
+                    }
+                    state.0.handle_clipboard_shortcuts(
+                        ui,
+                        ui.available_rect_before_wrap(),
+                        None,
+                        None,
+                    );
+                    assert!(!crate::native_key_monitor::drain().clipboard_paste);
+                },
+                (tree, owner, String::new()),
+            );
+            harness.run();
+            harness.hover_at(egui::pos2(50.0, 50.0));
+            crate::native_key_monitor::tests::record_move_paste(false);
+            harness.step();
+            assert!(
+                harness.state_mut().0.take_io_intent().is_none(),
+                "owner{owner} must deny move"
+            );
+            assert_eq!(
+                harness.state_mut().0.take_clipboard_shortcut_consumption(),
+                (false, false)
+            );
+            harness.state_mut().1 = 0;
+            // Pinned backend repeats Paste without KeyDown/repeat identity.
+            // The held gesture began under another owner, so it cannot rebind.
+            crate::native_key_monitor::tests::record_move_paste(true);
+            harness.event(egui::Event::ModifiersChanged(egui::Modifiers {
+                command: true,
+                mac_cmd: true,
+                alt: true,
+                ..Default::default()
+            }));
+            harness.event(egui::Event::Paste("held clipboard text".to_owned()));
+            harness.step();
+            assert!(
+                harness.state_mut().0.take_io_intent().is_none(),
+                "unclaimed native gesture rebound after owner{owner} changed"
+            );
+            crate::native_key_monitor::tests::record_move_paste(false);
+            harness.step();
+            assert!(
+                harness.state_mut().0.take_io_intent().is_some(),
+                "fresh tree-owned gesture must still work"
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn pr11r_hidden_frame_discards_move_only_before_later_tree_focus() {
+        for hidden_mode in ["Home", "Fleet", "Collapsed sidebar"] {
+            let root = temp_root(&format!("pr11r-hidden-{hidden_mode}"))
+                .canonicalize()
+                .unwrap();
+            let mut tree = FileTreeUi::new(egui::Context::default());
+            tree.root = Some(root.clone());
+            let mut harness = egui_kittest::Harness::new_ui_state(
+                |ui, state: &mut (FileTreeUi, bool)| {
+                    if state.1 {
+                        register_tree_keyboard_focus_target(ui);
+                        ui.memory_mut(|memory| memory.request_focus(tree_keyboard_focus_id()));
+                        state.0.handle_clipboard_shortcuts(
+                            ui,
+                            ui.available_rect_before_wrap(),
+                            None,
+                            None,
+                        );
+                    } else {
+                        // Actual egui frame with no tree or Workspace input consumer.
+                        ui.label(hidden_mode);
+                    }
+                    // Same unconditional composition-root tail as App::ui.
+                    crate::native_key_monitor::discard_unclaimed_move_paste();
+                },
+                (tree, false),
+            );
+            harness.run();
+            harness.hover_at(egui::pos2(50.0, 50.0));
+            crate::native_key_monitor::tests::record_paste();
+            crate::native_key_monitor::tests::record_move_paste(false);
+            harness.step();
+            assert!(crate::native_key_monitor::take_clipboard_move_paste().is_none());
+            assert!(
+                crate::native_key_monitor::peek_clipboard_paste(),
+                "tail must preserve ordinary metadata"
+            );
+            assert!(crate::native_key_monitor::drain().clipboard_paste);
+            harness.state_mut().1 = true;
+            crate::native_key_monitor::tests::record_move_paste(true);
+            harness.event(egui::Event::ModifiersChanged(egui::Modifiers {
+                command: true,
+                mac_cmd: true,
+                alt: true,
+                ..Default::default()
+            }));
+            harness.event(egui::Event::Paste("held clipboard text".to_owned()));
+            harness.step();
+            assert!(
+                harness.state_mut().0.take_io_intent().is_none(),
+                "hidden {hidden_mode} gesture cannot bind to later tree frame"
+            );
+            crate::native_key_monitor::tests::record_move_paste(false);
+            harness.step();
+            assert!(harness.state_mut().0.take_io_intent().is_some());
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pr11_group_trash_continuation_rechecks_original_root_after_parent_change() {
+        let base = temp_root("pr11-trash-root-change").canonicalize().unwrap();
+        let root = base.join("tree");
+        let inside = root.join("inside");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(root.join("a.txt"), b"first").unwrap();
+        std::fs::write(inside.join("b.txt"), b"inside").unwrap();
+        std::fs::write(outside.join("b.txt"), b"outside").unwrap();
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(&inside, &alias).unwrap();
+        let paths = [root.join("a.txt"), alias.join("b.txt")];
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.root = Some(root.clone());
+        tree.flat = paths
+            .iter()
+            .map(|path| FlatRow {
+                path: path.clone(),
+                display_name: path.file_name().unwrap().to_string_lossy().into_owned(),
+                depth: 0,
+                is_dir: false,
+                expanded: false,
+            })
+            .collect();
+        tree.selected = paths.iter().cloned().collect();
+        tree.spawn_trash_selection(None);
+        let first = tree.take_io_intent().unwrap();
+        let result = crate::app::pr11_private_file_fixture_io(first.request, &base);
+        assert_eq!(result, Ok(()));
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&outside, &alias).unwrap();
+        tree.complete_io(FileTreeIoCompletion {
+            operation: first.operation,
+            generation: first.generation,
+            result,
+        });
+        let next = tree.take_io_intent().unwrap();
+        let result = crate::app::pr11_private_file_fixture_io(next.request, &base);
+        assert_eq!(
+            result,
+            Err(FileTreeIoErrorCode::OutsideRoot),
+            "queued continuation must not escape frozen tree root"
+        );
+        assert_eq!(std::fs::read(outside.join("b.txt")).unwrap(), b"outside");
+        assert_eq!(std::fs::read(inside.join("b.txt")).unwrap(), b"inside");
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn pr11_sixty_four_selected_files_are_all_copied_moved_and_deleted_by_host() {
+        let base = temp_root("pr11-sixty-four").canonicalize().unwrap();
+        let copied = base.join("copied");
+        let moved = base.join("moved");
+        std::fs::create_dir(&copied).unwrap();
+        std::fs::create_dir(&moved).unwrap();
+        let sources: Vec<_> = (0..64)
+            .map(|i| base.join(format!("file-{i:02}.txt")))
+            .collect();
+        for (i, source) in sources.iter().enumerate() {
+            std::fs::write(source, [i as u8]).unwrap();
+        }
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.set_root(Some(base.clone()));
+        drain_listings(&mut tree);
+        tree.selected = sources.iter().cloned().collect();
+        let payload = tree
+            .drag_payload_for(&sources[0])
+            .expect("all 64 selected files need one bounded group");
+        assert_eq!(payload.paths().len(), 64);
+        for (destination, copy) in [(&copied, true), (&moved, false)] {
+            tree.start_drag_transfer(&payload, destination.clone(), copy);
+            let intent = tree.take_io_intent().expect("whole-group host intent");
+            let result = crate::app::pr11_private_file_fixture_io(intent.request, &base);
+            assert_eq!(result, Ok(()));
+            tree.complete_io(FileTreeIoCompletion {
+                operation: intent.operation,
+                generation: intent.generation,
+                result,
+            });
+            assert_eq!(std::fs::read_dir(destination).unwrap().count(), 64);
+            for (i, source) in sources.iter().enumerate() {
+                assert_eq!(
+                    std::fs::read(destination.join(source.file_name().unwrap())).unwrap(),
+                    [i as u8]
+                );
+                assert_eq!(source.exists(), copy);
+            }
+        }
+        drain_listings(&mut tree);
+        tree.toggle_dir(&moved);
+        drain_listings(&mut tree);
+        tree.selected = sources
+            .iter()
+            .map(|source| moved.join(source.file_name().unwrap()))
+            .collect();
+        tree.spawn_trash_selection(None);
+        let mut deleted = 0;
+        while let Some(intent) = tree.take_io_intent() {
+            assert!(matches!(intent.request, FileTreeIoRequest::Trash { .. }));
+            let result = crate::app::pr11_private_file_fixture_io(intent.request, &base);
+            assert_eq!(result, Ok(()));
+            deleted += 1;
+            tree.complete_io(FileTreeIoCompletion {
+                operation: intent.operation,
+                generation: intent.generation,
+                result,
+            });
+            assert!(deleted <= 64);
+        }
+        assert_eq!(
+            deleted, 64,
+            "test-owned Trash backend must receive every selected member"
+        );
+        assert_eq!(std::fs::read_dir(&moved).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(&copied).unwrap().count(), 64);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn pr11_group_limits_accept_exact_bounds_and_reject_whole_overflow() {
+        let paths: Vec<_> = (0..FILE_TREE_PATH_LIST_MAX_ITEMS)
+            .map(|i| PathBuf::from(format!("/private-pr11/{i}")))
+            .collect();
+        assert_eq!(
+            FileTreePathListPayload::try_new(paths.clone())
+                .unwrap()
+                .paths
+                .len(),
+            4096
+        );
+        let mut overflow = paths;
+        overflow.push(PathBuf::from("/private-pr11/overflow"));
+        assert!(matches!(
+            FileTreePathListPayload::try_new(overflow.clone()),
+            Err(FileTreeIoErrorCode::PathListTooLarge)
+        ));
+        let exact_bytes: Vec<_> = (0..32)
+            .map(|i| {
+                let prefix = format!("/{i:02}/");
+                PathBuf::from(prefix.clone() + &"x".repeat(FILE_TREE_PATH_MAX_BYTES - prefix.len()))
+            })
+            .collect();
+        assert_eq!(
+            FileTreePathListPayload::try_new(exact_bytes.clone())
+                .unwrap()
+                .bytes,
+            FILE_TREE_PATH_LIST_MAX_BYTES
+        );
+        let mut too_many_bytes = exact_bytes;
+        too_many_bytes.push(PathBuf::from("z"));
+        assert!(matches!(
+            FileTreePathListPayload::try_new(too_many_bytes),
+            Err(FileTreeIoErrorCode::PathListTooLarge)
+        ));
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.root = Some(PathBuf::from("/private-pr11"));
+        tree.flat = overflow
+            .iter()
+            .map(|path| FlatRow {
+                path: path.clone(),
+                display_name: "fixture".to_owned(),
+                depth: 0,
+                is_dir: false,
+                expanded: false,
+            })
+            .collect();
+        tree.selected = overflow.iter().cloned().collect();
+        assert!(matches!(
+            tree.drag_payload_for(&overflow[0]),
+            Err(FileTreeIoErrorCode::PathListTooLarge)
+        ));
+        tree.copy_files_to_clipboard(&tree.selection_or(None));
+        assert!(tree.take_io_intent().is_none());
+        tree.start_copy_into(overflow.clone(), PathBuf::from("/private-pr11/dest"));
+        assert!(tree.take_io_intent().is_none());
+        tree.spawn_trash_selection(None);
+        assert!(tree.take_io_intent().is_none());
+        assert!(tree.trash_queue.is_empty());
+        assert_eq!(tree.selected.len(), 4097);
+        assert_eq!(
+            tree.error.as_deref(),
+            Some(file_tree_io_error_message(
+                FileTreeIoErrorCode::PathListTooLarge
+            ))
+        );
+    }
+
+    #[test]
+    fn pr11_frozen_drag_rejects_root_generation_change_and_old_completion() {
+        let base = temp_root("pr11-generation").canonicalize().unwrap();
+        let next = base.join("next");
+        std::fs::create_dir(&next).unwrap();
+        std::fs::write(base.join("a.txt"), b"a").unwrap();
+        std::fs::write(next.join("b.txt"), b"b").unwrap();
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.set_root(Some(base.clone()));
+        drain_listings(&mut tree);
+        let payload = tree.drag_payload_for(&base.join("a.txt")).unwrap();
+        tree.start_drag_transfer(&payload, next.clone(), false);
+        let old = tree.take_io_intent().unwrap();
+        tree.set_root(Some(next.clone()));
+        tree.start_drag_transfer(&payload, next.clone(), true);
+        assert!(tree.take_io_intent().is_none());
+        assert_eq!(
+            tree.error.as_deref(),
+            Some(file_tree_io_error_message(FileTreeIoErrorCode::OutsideRoot))
+        );
+        tree.copy_files_to_clipboard(&[next.join("b.txt")]);
+        let current = tree.take_io_intent().unwrap();
+        tree.complete_io(FileTreeIoCompletion {
+            operation: old.operation,
+            generation: old.generation,
+            result: Ok(()),
+        });
+        assert_eq!(
+            tree.pending_io.as_ref().unwrap().operation,
+            current.operation
+        );
+        assert_eq!(
+            tree.pending_io.as_ref().unwrap().generation,
+            current.generation
+        );
+        assert!(base.join("a.txt").exists());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn pr11_keyboard_and_menu_copy_share_all_selected_operation_roots() {
+        use egui_kittest::kittest::Queryable as _;
+        let base = temp_root("pr11-copy-roots").canonicalize().unwrap();
+        std::fs::create_dir(base.join("folder")).unwrap();
+        std::fs::write(base.join("folder/child.txt"), b"child").unwrap();
+        std::fs::write(base.join("a.txt"), b"a").unwrap();
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.set_root(Some(base.clone()));
+        drain_listings(&mut tree);
+        tree.toggle_dir(&base.join("folder"));
+        drain_listings(&mut tree);
+        tree.selected = [
+            base.join("folder"),
+            base.join("folder/child.txt"),
+            base.join("a.txt"),
+        ]
+        .into_iter()
+        .collect();
+        let mut harness = delete_confirm_harness(tree, &catalog);
+        let point = harness.get_by_label("a.txt").rect().center();
+        harness.hover_at(point);
+        harness.event(egui::Event::Copy);
+        harness.step();
+        let keyboard = harness
+            .state_mut()
+            .0
+            .take_io_intent()
+            .expect("Cmd+C files intent");
+        let expected = vec![base.join("folder"), base.join("a.txt")];
+        match keyboard.request {
+            FileTreeIoRequest::CopyFileUrls { paths } => assert_eq!(paths.into_paths(), expected),
+            other => panic!("unexpected copy: {other:?}"),
+        }
+        harness.state_mut().0.complete_io(FileTreeIoCompletion {
+            operation: keyboard.operation,
+            generation: keyboard.generation,
+            result: Ok(()),
+        });
+        let menu =
+            trash_row_via_context_menu(&mut harness, point, &catalog.t("file_tree.copy_file", &[]));
+        match menu.request {
+            FileTreeIoRequest::CopyFileUrls { paths } => assert_eq!(paths.into_paths(), expected),
+            other => panic!("unexpected menu copy: {other:?}"),
+        }
+        // Only inspect the clipboard intent; never invoke the real OS clipboard.
         std::fs::remove_dir_all(base).unwrap();
     }
 
@@ -12534,7 +13786,7 @@ mod tests {
             .take_io_intent()
             .expect("trash intent");
         match &intent.request {
-            FileTreeIoRequest::Trash { target } => {
+            FileTreeIoRequest::Trash { target, .. } => {
                 assert_eq!(target.as_path(), base.join("src/mod.rs"));
             }
             other => panic!("unexpected request: {other:?}"),
@@ -12773,7 +14025,7 @@ mod tests {
             &catalog.t("file_tree.move_to_trash", &[]),
         );
         match &file_intent.request {
-            FileTreeIoRequest::Trash { target } => {
+            FileTreeIoRequest::Trash { target, .. } => {
                 assert_eq!(
                     target.as_path(),
                     base.join("src/mod.rs"),
@@ -12820,7 +14072,7 @@ mod tests {
             &catalog.t("file_tree.move_to_trash", &[]),
         );
         match &folder_intent.request {
-            FileTreeIoRequest::Trash { target } => {
+            FileTreeIoRequest::Trash { target, .. } => {
                 assert_eq!(target.as_path(), base.join("src/inner"));
             }
             other => panic!("unexpected request: {other:?}"),
@@ -14898,6 +16150,7 @@ mod tests {
             FileTreeIoRequest::CopyInto {
                 sources,
                 destination,
+                ..
             } => {
                 assert_eq!(sources.into_paths(), vec![src.clone()]);
                 assert_eq!(destination.as_path(), base.join("dropdir"));
@@ -14950,8 +16203,12 @@ mod tests {
             .take_io_intent()
             .expect("paste intent");
         match intent.request {
-            FileTreeIoRequest::PasteFromClipboard { destination } => {
+            FileTreeIoRequest::PasteFromClipboard {
+                destination,
+                move_files,
+            } => {
                 assert_eq!(destination.as_path(), base.as_path());
+                assert!(!move_files, "ordinary paste must still copy");
             }
             other => panic!("unexpected request: {other:?}"),
         }

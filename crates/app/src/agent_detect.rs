@@ -47,7 +47,7 @@ const PROCESS_TIMEOUT: Duration = Duration::from_secs(3);
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const PIPE_READER_STACK_BYTES: usize = 128 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AgentKind {
     Claude,
     Codex,
@@ -101,9 +101,96 @@ pub struct DetectedAgents {
 /// `effort=None`이 되자 강도 단축키가 조용히 아무것도 하지 않았다.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunningAgent {
+    pub(crate) execution: Option<AgentExecutionIdentity>,
     pub kind: AgentKind,
     pub model: Option<String>,
     pub effort: Option<String>,
+}
+
+/// One detected CLI execution, independent of its persistent terminal/session label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AgentExecutionIdentity {
+    kind: AgentKind,
+    pid: u32,
+    birth: crate::proc_info::ProcessBirth,
+    process_group: u32,
+}
+
+impl AgentExecutionIdentity {
+    fn capture(kind: AgentKind, pid: u32) -> Option<Self> {
+        Some(Self {
+            kind,
+            pid,
+            birth: crate::proc_info::pid_start_time(pid)?,
+            process_group: crate::proc_info::pid_process_group(pid)?,
+        })
+    }
+
+    pub(crate) fn is_current(self) -> bool {
+        crate::proc_info::pid_start_time(self.pid) == Some(self.birth)
+            && crate::proc_info::pid_process_group(self.pid) == Some(self.process_group)
+    }
+
+    /// Reuse with the caller's existing permission/auth deadline; do not replace that permit.
+    pub(crate) fn input_guard_for(
+        self,
+        intent: runtime::AgentInputIntent,
+    ) -> runtime::AgentInputGuard {
+        let provider = match self.kind {
+            AgentKind::Claude => runtime::AgentPromptKind::Claude,
+            AgentKind::Codex => runtime::AgentPromptKind::Codex,
+            AgentKind::Grok | AgentKind::Kimi => runtime::AgentPromptKind::Other,
+        };
+        runtime::AgentInputGuard {
+            foreground_process_group: self.process_group,
+            provider,
+            intent,
+        }
+    }
+
+    pub(crate) fn input_admission(
+        self,
+        automatic: bool,
+        deadline: Instant,
+    ) -> runtime::InputAdmission {
+        let intent = if automatic {
+            runtime::AgentInputIntent::AutomaticPrompt
+        } else {
+            runtime::AgentInputIntent::ExplicitPrompt
+        };
+        self.input_admission_for(intent, deadline)
+    }
+
+    pub(crate) fn input_admission_for(
+        self,
+        intent: runtime::AgentInputIntent,
+        deadline: Instant,
+    ) -> runtime::InputAdmission {
+        runtime::InputAdmission::new(runtime::InputPermit::new(), deadline, move |admit| {
+            if self.is_current() {
+                admit();
+            }
+        })
+        .with_agent_guard(self.input_guard_for(intent))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture_current(kind: AgentKind, pid: u32) -> Option<Self> {
+        Self::capture(kind, pid)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture(kind: AgentKind, generation: u64) -> Self {
+        Self {
+            kind,
+            pid: 1,
+            birth: crate::proc_info::ProcessBirth {
+                seconds: generation,
+                microseconds: 0,
+            },
+            process_group: 1,
+        }
+    }
 }
 
 /// 최후의 그물(완료/실패 알림 겹 ④) — ps 스캔이 "에이전트 있음"에서 "없음"으로 본
@@ -137,6 +224,7 @@ mod agent_vanished_tests {
 
     fn running() -> RunningAgent {
         RunningAgent {
+            execution: None,
             kind: AgentKind::Claude,
             model: None,
             effort: None,
@@ -278,6 +366,11 @@ fn kinds_from_cache(
                 (
                     *sid,
                     RunningAgent {
+                        execution: AgentExecutionIdentity::capture(
+                            entry.binding.kind,
+                            entry.owner_pid,
+                        )
+                        .filter(|execution| Some(execution.birth) == entry.owner_start_time),
                         kind: entry.binding.kind,
                         model: entry.model.clone(),
                         effort: entry.effort.clone(),
@@ -365,6 +458,7 @@ fn agent_kinds_from_rows(
                 .filter(|row| descendants.contains(&row.pid))
                 .find_map(|row| {
                     classify(&row.command).map(|(kind, _)| RunningAgent {
+                        execution: AgentExecutionIdentity::capture(kind, row.pid),
                         kind,
                         model: argv_flag_value(&row.command, "--model"),
                         effort: effort_flag(kind)
@@ -2157,6 +2251,189 @@ mod tests {
         ));
         std::fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn pr2_kernel_identity_rejects_pid_generation_and_group_changes() {
+        let current =
+            AgentExecutionIdentity::capture(AgentKind::Claude, std::process::id()).unwrap();
+        assert!(current.is_current());
+        assert!(
+            !AgentExecutionIdentity {
+                birth: crate::proc_info::ProcessBirth {
+                    seconds: current.birth.seconds.saturating_add(1),
+                    ..current.birth
+                },
+                ..current
+            }
+            .is_current()
+        );
+        assert!(
+            !AgentExecutionIdentity {
+                process_group: current.process_group.saturating_add(1),
+                ..current
+            }
+            .is_current()
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn pr2_frozen_ai_owner_exit_cannot_write_to_fixture_fallback_shell() {
+        use runtime::{RuntimeCommand, RuntimeCommandSink, RuntimeEvent, RuntimeEventStream};
+        struct NoSecrets;
+        impl runtime::RuntimeSecretResolver for NoSecrets {
+            fn resolve(&self, _: &str) -> anyhow::Result<runtime::RuntimeSecret> {
+                anyhow::bail!("fixture has no secrets")
+            }
+        }
+        fn wait<T>(
+            rx: &runtime::RuntimeEventReceiver,
+            seen: &mut VecDeque<RuntimeEvent>,
+            mut matches: impl FnMut(&RuntimeEvent) -> Option<T>,
+        ) -> T {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                seen.extend(rx.drain());
+                while let Some(event) = seen.pop_front() {
+                    if let Some(value) = matches(&event) {
+                        return value;
+                    }
+                }
+                assert!(Instant::now() < deadline, "fixture runtime event timed out");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        fn viewport_text(event: &RuntimeEvent) -> Option<String> {
+            let (_, snapshot, _, _) = event.viewport()?;
+            Some(snapshot.visible_cells.iter().map(|cell| cell.c).collect())
+        }
+        let root = temp_dir("pr2-fallback");
+        let mut client = runtime::InProcessRuntimeClient::try_new_with_resolver(
+            5,
+            Arc::new(NoSecrets),
+            root.clone(),
+            secret::RedactionService::new(),
+            None,
+            None,
+            vec![],
+        )
+        .unwrap();
+        let rx = client.subscribe();
+        let mut seen = VecDeque::new();
+        client.send_command(RuntimeCommand::SpawnAgent {
+            agent_config_id: None, cols: 80, rows: 24, scrollback_lines: 100,
+            command: "/bin/sh".into(), args: vec!["-c".into(),
+                r#"sleep 30 & owner=$!; printf 'OWNER:%s\r\n❯ ' "$owner"; wait "$owner"; printf '\r\nFALLBACK\r\n❯ '; exec /bin/cat"#.into()],
+            env_plain: vec![], env_secrets: vec![], waiting_regex: None, approval_regex: None,
+            error_regex: None, done_regex: None,
+        }).unwrap();
+        let session = wait(&rx, &mut seen, |event| match event {
+            RuntimeEvent::AgentSpawned { session } => Some(*session),
+            _ => None,
+        });
+        let owner = wait(&rx, &mut seen, |event| {
+            let text = viewport_text(event)?;
+            if !text.contains('❯') {
+                return None;
+            }
+            text.split_once("OWNER:")?
+                .1
+                .trim_start()
+                .split(|c: char| !c.is_ascii_digit())
+                .next()?
+                .parse::<u32>()
+                .ok()
+        });
+        let execution = AgentExecutionIdentity::capture(AgentKind::Claude, owner).unwrap();
+        assert!(execution.is_current());
+        client
+            .send_guarded_input_batch(
+                session,
+                "pr2:positive".into(),
+                vec![Vec::new()],
+                execution.input_admission(false, Instant::now() + Duration::from_secs(5)),
+            )
+            .unwrap();
+        assert_eq!(
+            wait(&rx, &mut seen, |event| match event {
+                RuntimeEvent::InputAdmitted {
+                    operation_id,
+                    result,
+                    ..
+                } if operation_id == "pr2:positive" => Some(*result),
+                _ => None,
+            }),
+            Ok(()),
+            "live owner and real foreground guard must admit the positive control"
+        );
+        // Only this fixture's recorded child is signalled; the wrapper reaps it and execs cat.
+        assert!(execution.is_current());
+        // SAFETY: owner is a positive PID freshly returned by the private fixture, checked above.
+        assert_eq!(
+            unsafe { libc::kill(i32::try_from(owner).unwrap(), libc::SIGTERM) },
+            0
+        );
+        wait(&rx, &mut seen, |event| {
+            viewport_text(event).filter(|text| text.contains("FALLBACK"))
+        });
+        assert!(
+            !execution.is_current(),
+            "AI owner exited although the PTY remains alive"
+        );
+        let mut composer = crate::ui::composer::ComposerUi::new(root.join("history.jsonl"));
+        composer.insert_text("fixture", "FORBIDDEN natural prompt");
+        let draft = composer.current_text("fixture").to_owned();
+        let crate::ui::composer::ComposerAction::Send(submission) =
+            composer.try_submit(&draft, true, "fixture").unwrap()
+        else {
+            panic!()
+        };
+        let (prompt, _, submission_id) = submission.into_parts();
+        client
+            .send_guarded_input_batch(
+                session,
+                "pr2:fallback".into(),
+                vec![prompt.as_bytes().to_vec(), b"\r".to_vec()],
+                execution.input_admission(false, Instant::now() + Duration::from_secs(5)),
+            )
+            .unwrap();
+        let result = wait(&rx, &mut seen, |event| match event {
+            RuntimeEvent::InputAdmitted {
+                operation_id,
+                result,
+                ..
+            } if operation_id == "pr2:fallback" => Some(*result),
+            _ => None,
+        });
+        assert_eq!(result, Err(pty::PtyInputRejectReason::AdmissionDenied));
+        composer.settle_submission(
+            "fixture",
+            submission_id,
+            &prompt,
+            crate::ui::composer::PromptAdmissionOutcome::Rejected,
+        );
+        assert_eq!(
+            composer.current_text("fixture"),
+            draft,
+            "actual host rejection retains original Composer draft"
+        );
+        client
+            .send_command(RuntimeCommand::WriteInput {
+                session,
+                bytes: b"MANUAL_SHELL_CONTROL\r".to_vec(),
+            })
+            .unwrap();
+        let screen = wait(&rx, &mut seen, |event| {
+            viewport_text(event).filter(|text| text.contains("MANUAL_SHELL_CONTROL"))
+        });
+        assert!(
+            !screen.contains("FORBIDDEN"),
+            "neither body nor Enter entered fallback"
+        );
+        client.shutdown();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// 자기 자신의 pid가 결과에 들어오고 `std::env::current_dir()`와 일치하는지 확인한다

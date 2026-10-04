@@ -260,6 +260,19 @@ pub struct StatusDetectorStats {
     pub idle_evaluations: u64,
 }
 
+#[derive(Clone, Copy, Default)]
+enum InputSequence {
+    #[default]
+    Ground,
+    Escape,
+    Ss3,
+    Csi {
+        code: u16,
+        digits_only: bool,
+        len: u8,
+    },
+}
+
 pub struct StatusDetector {
     patterns: StatusPatterns,
     /// 완성되지 않은 마지막 라인 (chunk 경계 대응).
@@ -289,6 +302,8 @@ pub struct StatusDetector {
     /// bracketed paste의 개행을 제출로 오인하지 않는다. 분할된 시작/끝 표식도 이어 읽는다.
     bracketed_paste: bool,
     paste_marker_matched: usize,
+    input_draft_dirty: bool,
+    input_sequence: InputSequence,
     source: StatusSource,
     stats: StatusDetectorStats,
 }
@@ -309,6 +324,8 @@ impl StatusDetector {
             screen_scan_requested: false,
             bracketed_paste: false,
             paste_marker_matched: 0,
+            input_draft_dirty: false,
+            input_sequence: InputSequence::Ground,
             source: StatusSource::IdleHeuristic,
             stats: StatusDetectorStats::default(),
         }
@@ -328,6 +345,11 @@ impl StatusDetector {
 
     pub fn status(&self) -> SessionStatus {
         self.status
+    }
+
+    /// Accepted, unsubmitted bytes. Output redraws and hook status cannot erase this evidence.
+    pub fn has_input_draft(&self) -> bool {
+        self.input_draft_dirty
     }
 
     pub fn stats(&self) -> StatusDetectorStats {
@@ -352,21 +374,7 @@ impl StatusDetector {
         self.last_output = Instant::now();
         let mut submitted = false;
         for &byte in bytes {
-            let marker = if self.bracketed_paste {
-                b"\x1b[201~"
-            } else {
-                b"\x1b[200~"
-            };
-            if byte == marker[self.paste_marker_matched] {
-                self.paste_marker_matched += 1;
-                if self.paste_marker_matched == marker.len() {
-                    self.bracketed_paste = !self.bracketed_paste;
-                    self.paste_marker_matched = 0;
-                }
-            } else {
-                self.paste_marker_matched = usize::from(byte == 0x1b);
-                submitted |= !self.bracketed_paste && matches!(byte, b'\r' | b'\n' | 3);
-            }
+            submitted |= self.note_input_byte(byte);
         }
         // 선택창은 화면 변경으로 완료를 확인하고, 한 줄 질문은 Enter 제출을 소비한다.
         let choice_screen = self.last_screen_matches.iter().any(|(_, line)| {
@@ -390,6 +398,98 @@ impl StatusDetector {
             self.on_input();
         }
         submitted
+    }
+
+    /// Constant-space accepted-input evidence. Navigation/focus and empty paste markers are not
+    /// draft text; edits never clear a genuine draft without an actual submit/cancel boundary.
+    fn note_input_byte(&mut self, byte: u8) -> bool {
+        if self.bracketed_paste {
+            let marker = b"\x1b[201~";
+            if byte == marker[self.paste_marker_matched] {
+                self.paste_marker_matched += 1;
+                if self.paste_marker_matched == marker.len() {
+                    self.bracketed_paste = false;
+                    self.paste_marker_matched = 0;
+                }
+            } else {
+                self.input_draft_dirty = true; // Includes literal pasted CR/LF and failed markers.
+                self.paste_marker_matched = usize::from(byte == 0x1b);
+            }
+            return false;
+        }
+        if matches!(byte, b'\r' | b'\n' | 3) {
+            self.input_draft_dirty = false;
+            self.input_sequence = InputSequence::Ground;
+            return true;
+        }
+        match self.input_sequence {
+            InputSequence::Ground => match byte {
+                0x1b => self.input_sequence = InputSequence::Escape,
+                // Cursor movement, deletion, redraw and erase cannot introduce new text.
+                0 | 1 | 2 | 4 | 5 | 6 | 8 | 11 | 12 | 21 | 23 | 127 => {}
+                _ => self.input_draft_dirty = true,
+            },
+            InputSequence::Escape => {
+                self.input_sequence = match byte {
+                    b'[' => InputSequence::Csi {
+                        code: 0,
+                        digits_only: true,
+                        len: 0,
+                    },
+                    b'O' => InputSequence::Ss3,
+                    0x1b => InputSequence::Escape,
+                    _ => {
+                        self.input_draft_dirty = true;
+                        InputSequence::Ground
+                    }
+                };
+            }
+            InputSequence::Ss3 => {
+                if !matches!(byte, b'C' | b'D' | b'H' | b'F' | b'P'..=b'S') {
+                    self.input_draft_dirty = true;
+                }
+                self.input_sequence = InputSequence::Ground;
+            }
+            InputSequence::Csi {
+                mut code,
+                mut digits_only,
+                len,
+            } => {
+                if (0x40..=0x7e).contains(&byte) {
+                    if byte == b'~' && digits_only && code == 200 {
+                        self.bracketed_paste = true;
+                        self.paste_marker_matched = 0;
+                    } else if !(matches!(byte, b'C' | b'D' | b'H' | b'F' | b'I' | b'O' | b'Z')
+                        || byte == b'~' && digits_only && matches!(code, 1..=8 | 201))
+                    {
+                        self.input_draft_dirty = true;
+                    }
+                    self.input_sequence = InputSequence::Ground;
+                } else if len >= 32 || !(0x20..=0x3f).contains(&byte) {
+                    self.input_draft_dirty = true;
+                    self.input_sequence = InputSequence::Ground;
+                } else {
+                    if byte.is_ascii_digit() && digits_only {
+                        if let Some(next) = code
+                            .checked_mul(10)
+                            .and_then(|value| value.checked_add(u16::from(byte - b'0')))
+                        {
+                            code = next;
+                        } else {
+                            digits_only = false;
+                        }
+                    } else {
+                        digits_only = false;
+                    }
+                    self.input_sequence = InputSequence::Csi {
+                        code,
+                        digits_only,
+                        len: len + 1,
+                    };
+                }
+            }
+        }
+        false
     }
 
     /// 사용자 입력 수신 — 현재 화면의 매치 프롬프트를 "응답됨"으로 소비한다.
@@ -599,6 +699,71 @@ fn status_source_reason(source: StatusSource) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pr2_navigation_and_empty_split_paste_do_not_create_a_phantom_draft() {
+        let mut d =
+            super::StatusDetector::new(super::StatusPatterns::compile(None, None, None, None));
+        for bytes in [
+            b"\x1b[".as_slice(),
+            b"D\x1b[1;5C",
+            b"\x1b[I\x1b[O",
+            b"\x7f\x08",
+        ] {
+            assert!(!d.on_user_input(bytes));
+            assert!(
+                !d.has_input_draft(),
+                "navigation/focus/delete on an empty input is not text"
+            );
+        }
+        for bytes in [b"\x1b[20".as_slice(), b"0~\x1b[2", b"01~"] {
+            assert!(!d.on_user_input(bytes));
+            assert!(
+                !d.has_input_draft(),
+                "empty bracketed paste markers carry no draft"
+            );
+        }
+        d.on_user_input(b"\x1b[A");
+        assert!(
+            d.has_input_draft(),
+            "Up may recall history before any new output arrives"
+        );
+        d.on_user_input(b"\x03");
+        d.on_user_input(b"\x1bOB");
+        assert!(d.has_input_draft(), "SS3 Down can also recall history");
+        d.on_user_input(b"\x03");
+        d.on_user_input(b"genuine draft");
+        d.on_user_input(b"\x1b[D\x7f\x15");
+        assert!(
+            d.has_input_draft(),
+            "navigation/deletion cannot prove genuine draft erased"
+        );
+    }
+
+    #[test]
+    fn pr2_draft_evidence_survives_redraw_turn_hook_and_bracketed_newlines() {
+        let mut d =
+            super::StatusDetector::new(super::StatusPatterns::compile(None, None, None, None));
+        assert!(!d.has_input_draft());
+        d.on_user_input(b"draft");
+        assert!(d.has_input_draft());
+        d.on_turn_start();
+        d.evaluate(Some("new output"));
+        assert!(
+            d.has_input_draft(),
+            "output/hooks cannot prove draft consumed"
+        );
+        d.on_user_input(b"\x03");
+        assert!(!d.has_input_draft());
+        for bytes in [b"\x1b[20".as_slice(), b"0~body\r\nmore\x1b[201~"] {
+            assert!(!d.on_user_input(bytes));
+        }
+        assert!(d.has_input_draft(), "paste newline isn't submit");
+        assert!(d.on_user_input(b"\rtrailing draft"));
+        assert!(d.has_input_draft(), "bytes after submit start a new draft");
+        assert!(d.on_user_input(b"\r"));
+        assert!(!d.has_input_draft());
+    }
+
     use super::*;
 
     #[test]

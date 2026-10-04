@@ -872,7 +872,9 @@ fn check_boundary() -> anyhow::Result<()> {
     check_app_composition_root_boundary(&root, &mut violations)?;
 
     if violations.is_empty() {
-        println!("check-boundary OK — UI leaf boundary guard passed; zero allowlist capability");
+        println!(
+            "check-boundary OK — UI leaves have zero native/runtime capability; bounded composition-root terminal tail passed"
+        );
         Ok(())
     } else {
         violations.sort();
@@ -1120,6 +1122,180 @@ fn check_app_render_source_boundary(
             violations.push(format!(
                 "{rel}: App::ui direct source violation: '{pattern}' ({reason})"
             ));
+        }
+    }
+    check_terminal_tail_host_source(&source, violations)?;
+    let call = "self.flush_workspace_terminal_protocol_tail(ui.ctx());";
+    if ui_body.matches(call).count() != 1
+        || ui_body
+            .find(call)
+            .zip(ui_body.rfind("flush_render_side_effects(ui.ctx());"))
+            .is_none_or(|(tail, flush)| tail <= flush)
+        || ui_body
+            .find(call)
+            .zip(ui_body.find("self.frame_stats.end();"))
+            .is_none_or(|(tail, end)| tail >= end)
+    {
+        violations.push(format!(
+            "{rel}: terminal host tail must run once after final render flush"
+        ));
+    }
+    Ok(())
+}
+
+// App's sole render-time runtime capability is a bounded, nonblocking terminal FIFO prefix.
+// Inspect the actual production adapter bodies, including their calls, so an extra broad helper
+// cannot hide storage/lifecycle/guarded delivery behind the permitted App::ui call.
+fn check_terminal_tail_host_source(
+    source: &str,
+    violations: &mut Vec<String>,
+) -> anyhow::Result<()> {
+    const ADAPTERS: &[(&str, &[&str])] = &[
+        (
+            "dispatch_terminal_protocol_tail",
+            &[
+                "will_discard",
+                "take_terminal_protocol_intent",
+                "operation",
+                "generation",
+                "focus_pane",
+                "cloned",
+                "send",
+                "into_command",
+                "finish_owned_workspace_protocol_delivery",
+                "is_some",
+                "cancel_terminal_focus",
+                "protocol_retry_delay",
+                "has_queued_protocol_intents",
+                "request_repaint",
+                "request_workspace_protocol_retry",
+                "Some",
+            ],
+        ),
+        (
+            "flush_workspace_terminal_protocol_tail",
+            &[
+                "dispatch_terminal_protocol_tail",
+                "send_command_owned",
+                "cancel_terminal_focus_intents",
+                "arm_terminal_focus",
+                "values_mut",
+                "Some",
+            ],
+        ),
+        (
+            "finish_owned_workspace_protocol_delivery",
+            &[
+                "Ok",
+                "Err",
+                "Some",
+                "downcast_ref",
+                "terminal_protocol_command",
+                "return_unsent_terminal_protocol",
+                "classify_workspace_protocol_delivery",
+                "is_ok",
+                "complete_protocol",
+            ],
+        ),
+        (
+            "request_workspace_protocol_retry",
+            &[
+                "input",
+                "try_from_secs_f32",
+                "unwrap_or_default",
+                "request_repaint_after",
+                "saturating_add",
+            ],
+        ),
+    ];
+    let syntax = syn::parse_file(source).context("terminal host source parsing failed")?;
+    let mut bodies = std::collections::HashMap::new();
+    for item in syntax.items {
+        match item {
+            syn::Item::Fn(function) => {
+                bodies.insert(
+                    function.sig.ident.to_string(),
+                    function.block.to_token_stream().to_string(),
+                );
+            }
+            syn::Item::Impl(implementation) => {
+                for item in implementation.items {
+                    if let syn::ImplItem::Fn(function) = item {
+                        bodies.insert(
+                            function.sig.ident.to_string(),
+                            function.block.to_token_stream().to_string(),
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for (name, allowed) in ADAPTERS {
+        let Some(body) = bodies.get(*name) else {
+            violations.push(format!(
+                "app.rs: missing bounded terminal host adapter {name}"
+            ));
+            continue;
+        };
+        let tokens: Vec<_> = body.split_whitespace().collect();
+        for (index, token) in tokens.iter().enumerate().skip(1) {
+            if !token.starts_with('(') {
+                continue;
+            }
+            let mut callee = index - 1;
+            // Include macro and generic calls, rather than allowing a broad helper to evade
+            // the effect allowlist simply by changing invocation syntax.
+            if tokens[callee] == "!" && callee > 0 {
+                callee -= 1;
+            }
+            if tokens[callee] == ">" {
+                let mut depth = 1;
+                while callee > 0 && depth > 0 {
+                    callee -= 1;
+                    match tokens[callee] {
+                        ">" => depth += 1,
+                        "<" => depth -= 1,
+                        _ => {}
+                    }
+                }
+                if depth == 0 && callee >= 2 && tokens[callee - 1] == "::" {
+                    callee -= 2;
+                }
+            }
+            let method = tokens[callee];
+            if method
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+                && !allowed.contains(&method)
+            {
+                violations.push(format!(
+                    "app.rs: terminal adapter {name} calls unapproved effect {method}"
+                ));
+            }
+        }
+        for pattern in [
+            "std :: fs",
+            "std :: process",
+            "send_guarded",
+            "shutdown",
+            "join",
+            "sleep",
+            "recv",
+            "dotenv",
+            "self . db",
+        ] {
+            if body.contains(pattern) {
+                violations.push(format!(
+                    "app.rs: terminal adapter {name} contains blocking or broad effect {pattern}"
+                ));
+            }
+        }
+        if *name == "dispatch_terminal_protocol_tail"
+            && (!body.contains("for _ in 0 .. 8 {") || !body.contains("ctx . will_discard ()"))
+        {
+            violations
+                .push("app.rs: terminal host adapter lost final-pass/eight-command bound".into());
         }
     }
     Ok(())
@@ -1570,6 +1746,38 @@ mod tests {
             !violations[0].contains("test.only.fake.key"),
             "test 모듈의 가짜 키는 애초에 추출되지 않아야 한다"
         );
+    }
+
+    #[test]
+    fn pr10_terminal_host_exception_rejects_broad_hidden_calls() {
+        let source = include_str!("../../crates/app/src/app.rs");
+        let mut violations = Vec::new();
+        check_terminal_tail_host_source(source, &mut violations).unwrap();
+        assert!(violations.is_empty(), "{violations:?}");
+        for (old, new) in [
+            (
+                "self.active.runtime.send_command_owned(command)",
+                "self.active.runtime.send_guarded_input(command)",
+            ),
+            (
+                "self.cancel_terminal_focus_intents();\n            self.active.workspace_ui.arm_terminal_focus(pane);",
+                "self.refresh_workspaces();\n            self.active.workspace_ui.arm_terminal_focus(pane);",
+            ),
+            ("for _ in 0..8 {", "for _ in 0..8000 {"),
+            (
+                "self.active.runtime.send_command_owned(command)",
+                "self.active.runtime.broad_helper::<()>(command)",
+            ),
+        ] {
+            assert!(source.contains(old));
+            let changed = source.replace(old, new);
+            let mut violations = Vec::new();
+            check_terminal_tail_host_source(&changed, &mut violations).unwrap();
+            assert!(
+                !violations.is_empty(),
+                "hidden broad adapter call/bound escaped: {new}"
+            );
+        }
     }
 
     #[test]

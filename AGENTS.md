@@ -1,5 +1,11 @@
 # Deppy Sijo agent instructions
 
+## 모델 규칙 (JR 지정, 2026-10-04)
+
+- 서브에이전트를 띄우거나 `codex exec` / `codex review`를 직접 호출할 때 모델은 항상 `gpt-6.1-sol`, reasoning effort는 `xhigh`로 한다.
+- 다른 모델이나 `high` 이하 effort를 지정하지 않는다. 스킬의 기본 모델 지정보다 이 규칙을 우선한다.
+- 예: `codex exec -m gpt-6.1-sol -c model_reasoning_effort=xhigh ...`
+
 ## App restart permission
 
 - Never launch or relaunch Deppy as an automatic part of a code change, build,

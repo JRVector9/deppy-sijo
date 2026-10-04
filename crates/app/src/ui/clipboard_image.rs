@@ -4,9 +4,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 const MAX_CLIPBOARD_TEXT_BYTES: usize = 1024 * 1024;
-const MAX_CLIPBOARD_FILE_ITEMS: usize = 256;
-const MAX_CLIPBOARD_PATH_BYTES: usize = 4 * 1024;
-const MAX_CLIPBOARD_FILE_LIST_BYTES: usize = 512 * 1024;
+use super::file_tree::{
+    FILE_TREE_PATH_LIST_MAX_BYTES as MAX_CLIPBOARD_FILE_LIST_BYTES,
+    FILE_TREE_PATH_LIST_MAX_ITEMS as MAX_CLIPBOARD_FILE_ITEMS,
+    FILE_TREE_PATH_MAX_BYTES as MAX_CLIPBOARD_PATH_BYTES,
+};
 const MAX_PNG_BYTES: usize = 32 * 1024 * 1024;
 const MAX_RGBA_PIXELS: usize = 40_000_000;
 
@@ -49,7 +51,10 @@ fn validate_clipboard_paths(paths: &[PathBuf]) -> anyhow::Result<()> {
     let mut retained_bytes = 0usize;
     for path in paths {
         let path_bytes = path.as_os_str().as_encoded_bytes().len();
-        if path_bytes == 0 || path_bytes > MAX_CLIPBOARD_PATH_BYTES {
+        if path_bytes == 0
+            || path_bytes > MAX_CLIPBOARD_PATH_BYTES
+            || path.as_os_str().as_encoded_bytes().contains(&0)
+        {
             return Err(clipboard_error("clipboard.file_list.path_limit"));
         }
         retained_bytes = retained_bytes
@@ -672,7 +677,10 @@ mod tests {
             "clipboard.file_list.path_limit"
         );
 
-        let exact_bytes = vec![PathBuf::from("x".repeat(MAX_CLIPBOARD_PATH_BYTES)); 128];
+        let exact_bytes = vec![
+            PathBuf::from("x".repeat(MAX_CLIPBOARD_PATH_BYTES));
+            MAX_CLIPBOARD_FILE_LIST_BYTES / MAX_CLIPBOARD_PATH_BYTES
+        ];
         assert_eq!(
             exact_bytes
                 .iter()

@@ -1595,6 +1595,104 @@ fn classify_workspace_protocol_delivery(
     })
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum TerminalProtocolDelivery {
+    Accepted,
+    Failed,
+    Retry,
+}
+
+fn finish_owned_workspace_protocol_delivery(
+    workspace: &mut ui::workspace::WorkspaceUi,
+    operation: ui::workspace::WorkspaceProtocolOperation,
+    generation: u64,
+    result: Result<(), (anyhow::Error, Box<runtime::RuntimeCommand>)>,
+) -> TerminalProtocolDelivery {
+    let completion = match result {
+        Ok(()) => Ok(()),
+        Err((error, command)) => {
+            if error.downcast_ref::<runtime::RuntimeCommandSendError>()
+                == Some(&runtime::RuntimeCommandSendError::Backpressure)
+                && ui::workspace::terminal_protocol_command(&command)
+            {
+                workspace.return_unsent_terminal_protocol(operation, generation, *command);
+                return TerminalProtocolDelivery::Retry;
+            }
+            classify_workspace_protocol_delivery(Err(error))
+        }
+    };
+    let delivered = completion.is_ok();
+    workspace.complete_protocol(ui::workspace::WorkspaceProtocolCompletion {
+        operation,
+        generation,
+        result: completion,
+    });
+    if delivered {
+        TerminalProtocolDelivery::Accepted
+    } else {
+        TerminalProtocolDelivery::Failed
+    }
+}
+
+fn request_workspace_protocol_retry(ctx: &egui::Context, delay: std::time::Duration) {
+    // egui subtracts predicted_dt from delayed repaints. Preserve the actual 16ms admission
+    // deadline instead of turning each busy-only frame into an immediate repaint poll.
+    let prediction = ctx.input(|input| {
+        std::time::Duration::try_from_secs_f32(input.predicted_dt).unwrap_or_default()
+    });
+    ctx.request_repaint_after(delay.saturating_add(prediction));
+}
+
+pub(crate) fn workspace_protocol_logic_pass_ready(ctx: &egui::Context) -> bool {
+    ctx.current_pass_index() == 0
+}
+
+/// Composition-root exception: final, non-discarded UI pass may admit at most eight already
+/// validated terminal commands through nonblocking try_send. This drains only the FIFO prefix;
+/// lifecycle, storage, dotenv, dialogs and guarded prompt delivery remain in logic. Returns only
+/// the last accepted focus target, never re-resolves an input session from current focus.
+pub(crate) fn dispatch_terminal_protocol_tail(
+    workspace: &mut ui::workspace::WorkspaceUi,
+    ctx: &egui::Context,
+    mut send: impl FnMut(
+        runtime::RuntimeCommand,
+    ) -> Result<(), (anyhow::Error, Box<runtime::RuntimeCommand>)>,
+) -> Option<runtime::MuxPaneId> {
+    if ctx.will_discard() {
+        return None;
+    }
+    let mut focused = None;
+    for _ in 0..8 {
+        let Some(intent) = workspace.take_terminal_protocol_intent() else {
+            break;
+        };
+        let operation = intent.operation();
+        let generation = intent.generation();
+        let focus = intent.focus_pane().cloned();
+        let result = send(intent.into_command());
+        match finish_owned_workspace_protocol_delivery(workspace, operation, generation, result) {
+            TerminalProtocolDelivery::Accepted => {
+                if focus.is_some() {
+                    focused = focus;
+                }
+            }
+            TerminalProtocolDelivery::Retry => break,
+            TerminalProtocolDelivery::Failed => {
+                if focus.is_some() {
+                    workspace.cancel_terminal_focus();
+                }
+            }
+        }
+    }
+    if let Some(delay) = workspace.protocol_retry_delay() {
+        request_workspace_protocol_retry(ctx, delay);
+    } else if workspace.has_queued_protocol_intents() {
+        // A capped prefix or unsupported lifecycle head must reach the next logic pass.
+        ctx.request_repaint();
+    }
+    focused
+}
+
 /// dotenv 동기화가 실패했을 때도 통과시킬 continuation인가(2026-08-21).
 ///
 /// **세션을 여는 일은 `.env`와 독립이어야 한다.** `.env` 한 줄이 문제라고 그
@@ -3100,20 +3198,76 @@ struct SettingsJob {
 /// 재검증한다. prepare_agent_launch의 args-byte 상한(64KiB, 설정 args 포함)과는 별개로,
 /// 패널이 비정상적으로 큰 값을 보내는 경우를 조기에 거부해 settings 잡 큐까지 가지
 /// 않게 한다.
-const FLEET_BATCH_SPAWN_PROMPT_MAX_BYTES: usize = 16 * 1024;
+const FLEET_BATCH_SPAWN_PROMPT_MAX_BYTES: usize = crate::fleet::FLEET_PROMPT_MAX_BYTES;
 
 /// fleet 배치 스폰(PR-S1) 대기 상태 — settings 잡 큐가 단일 슬롯이라 프레임에 걸쳐
 /// PrepareAgentLaunch를 하나씩 큐잉한다(`pump_batch_spawn`).
 struct PendingBatchSpawn {
     agent_id: String,
-    /// 남은 스폰 횟수 — 큐잉 성공마다 감소, 0이면 pending 상태를 지운다.
     remaining: u32,
-    /// staging(버튼 클릭) 시점의 활성 workspace. 펌프 도중 활성 workspace가 바뀌면
-    /// 엉뚱한 workspace로 이어 스폰되는 걸 막기 위해 남은 스폰을 전부 취소한다.
     staged_workspace_id: String,
-    /// 선택된 저장 프롬프트의 렌더 결과(PR-S2) — Some이면 각 스폰마다 초기 argv
-    /// 프롬프트로 전달된다. None이면 빈 세션(PR-S1과 동일).
-    prompt: Option<String>,
+    /// Shared across accepted settings jobs; argv materialization is worker-owned.
+    prompt: Option<Arc<str>>,
+    retry_at: Option<std::time::Instant>,
+    waiting_for_worker: bool,
+}
+const BATCH_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+#[derive(Clone, Copy)]
+enum BatchAdmission {
+    Queued,
+    WaitingForWorker,
+    KnownUnsent,
+}
+
+/// App and headless tests use the same bounded scheduling step. The settings completion wake
+/// resumes ordered work; a delayed fallback keeps known-unsent jobs from becoming stuck.
+fn pump_batch_spawn_step(
+    pending: &mut Option<PendingBatchSpawn>,
+    ctx: &egui::Context,
+    active_workspace: &str,
+    busy: bool,
+    now: std::time::Instant,
+    mut queue: impl FnMut(String, Option<Arc<str>>) -> BatchAdmission,
+) {
+    let Some(batch) = pending.as_mut() else {
+        return;
+    };
+    if batch.staged_workspace_id != active_workspace {
+        *pending = None;
+        return;
+    }
+    if busy {
+        batch.waiting_for_worker = true;
+        if batch.retry_at.is_none_or(|at| now >= at) {
+            batch.retry_at = Some(now + BATCH_RETRY_DELAY);
+        }
+        // egui resets a pass's deadline after an earlier input frame: rearm the remaining delay.
+        ctx.request_repaint_after(batch.retry_at.unwrap().saturating_duration_since(now));
+        return;
+    }
+    if !batch.waiting_for_worker
+        && let Some(at) = batch.retry_at
+        && now < at
+    {
+        ctx.request_repaint_after(at.saturating_duration_since(now));
+        return;
+    }
+    batch.waiting_for_worker = false;
+    let admission = queue(batch.agent_id.clone(), batch.prompt.clone());
+    match admission {
+        BatchAdmission::Queued => {
+            batch.remaining -= 1;
+            batch.retry_at = None;
+            if batch.remaining == 0 {
+                *pending = None;
+            }
+        }
+        BatchAdmission::WaitingForWorker | BatchAdmission::KnownUnsent => {
+            batch.waiting_for_worker = matches!(admission, BatchAdmission::WaitingForWorker);
+            batch.retry_at = Some(now + BATCH_RETRY_DELAY);
+            ctx.request_repaint_after(BATCH_RETRY_DELAY);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3162,7 +3316,7 @@ enum SettingsJobAction {
         runtime_workspace_id: String,
         /// fleet 배치 스폰(PR-S2)의 렌더된 프롬프트 — 설정 args 뒤에 위치 인자로
         /// 덧붙는다. 일반 AgentsIntent::Run 경로는 항상 None.
-        extra_arg: Option<String>,
+        extra_arg: Option<Arc<str>>,
     },
     PrepareQuickAgentLaunch {
         request_id: u64,
@@ -3910,7 +4064,7 @@ fn prepare_agent_launch(
     agent_id: &str,
     profile_id: Option<&str>,
     runtime_workspace_id: String,
-    extra_arg: Option<String>,
+    extra_arg: Option<Arc<str>>,
 ) -> anyhow::Result<PreparedAgentLaunch> {
     let rows = db.settings_agent_launch_rows(workspace_id, agent_id, profile_id)?;
     let agent = rows.agent.context("settings_agent_missing")?;
@@ -3970,7 +4124,7 @@ fn prepare_agent_launch(
     // `codex "<prompt>"`와 동일한 형태로 각 CLI가 초기 프롬프트로 즉시 받는다(PR-S2).
     let mut args = agent.args;
     if let Some(extra) = extra_arg {
-        args.push(extra);
+        args.push(extra.to_string());
     }
 
     Ok(PreparedAgentLaunch {
@@ -9809,6 +9963,7 @@ pub struct App {
     /// 갈리는 건 `MarkdownDocumentSlot`을 문서 id로 만들기 때문이다(단일 인스턴스를
     /// 여러 문서가 슬롯으로 나눠 쓴다).
     document_markdown_viewer: ui::markdown_viewer::MarkdownViewer,
+    document_image_worker: crate::markdown_image_io::ImageWorker,
     /// pane이 하나도 없는 워크스페이스에서 문서를 열었을 때 — 셸 pane을 먼저 스폰하고
     /// (`SpawnShellAt`), 그 pane이 나타나면 `poll_pending_document_open`이 이어받아 연다.
     pending_document_open: Option<PathBuf>,
@@ -9932,11 +10087,6 @@ pub struct App {
     /// fleet 배치 스폰(PR-S1) 대기 — Some이면 매 logic tick `pump_batch_spawn`이 settings
     /// 잡 큐 1슬롯이 빌 때마다 하나씩 launch를 큐잉한다.
     pending_batch_spawn: Option<PendingBatchSpawn>,
-    /// 브로드캐스트 직후 대상 세션을 잠깐 "작업 중"으로 낙관적 표시하기 위한 타임스탬프
-    /// ((workspace_id, session) → 전송 시각). 전송했으니 지금 작업을 시작했다는 걸 아는데
-    /// transcript 감지에는 지연이 있어(warm은 아예 활동 추적 안 됨) 그 공백을 메운다.
-    /// BROADCAST_WORKING_WINDOW 안에서 감지 상태가 Idle/Off일 때만 Active로 덮는다.
-    broadcast_working: std::collections::HashMap<(String, runtime::SessionId), std::time::Instant>,
     /// 상태바·홈이 쓰는 activity_rows 500ms 캐시 — 매 프레임(타이핑 중 60~120fps)
     /// 전 워크스페이스 × 세션의 String/Vec 재조립을 피한다. 리소스 샘플 주기(2s)보다
     /// 짧아 표시 신선도는 유지된다.
@@ -10011,12 +10161,25 @@ pub struct App {
     /// 하단 도크 프롬프트 컴포저 (2026-07-17) — 워크스페이스별 드래프트 + 영속 히스토리.
     composer: ui::composer::ComposerUi,
     composer_history_path: PathBuf,
+    composer_draft_save_worker: crate::composer_draft_worker::DraftSaveWorker,
+    composer_checkpoint_revision: u64,
+    composer_save_revision: u64,
+    composer_checkpoint_at: Option<std::time::Instant>,
+    composer_draft_error: Option<crate::composer_drafts::DraftError>,
+    composer_pending_deletions: Vec<ComposerPendingDeletion>,
+    /// One immutable Composer submission awaiting its write-ahead uncertainty marker.
+    /// Separate from workspace/modal actions so fsync cannot hold the controller slot.
+    pending_durable_composer_prompt: Option<PendingDurableComposerPrompt>,
     /// 프롬프트 라이브러리 (기능2) — 저장된 에이전트 프롬프트 팔레트. 파레트에서 고른
     /// 프롬프트는 파라미터를 채워 활성 세션의 컴포저 버퍼에 삽입된다.
     prompt_palette: ui::prompt_palette::PromptPaletteUi,
     prompt_library: crate::prompt_library::PromptLibrary,
-    /// 저장/삭제 영속화 경로 (persist_prompt_library).
-    prompt_library_path: PathBuf,
+    /// Monotonic in-memory revision used by persistence and palette caches.
+    prompt_library_revision: u64,
+    prompt_library_save_revision: u64,
+    prompt_library_save_worker: crate::prompt_library_worker::PromptLibrarySaveWorker,
+    pending_prompt_library_save: bool,
+    prompt_library_edit_error: Option<crate::prompt_library::PromptLibraryError>,
     /// agent-proxy 승인 팝업 (option 1.5). proxy가 DB에 쓴 pending 행을 폴링해 표시한다.
     approvals_ui: ui::approvals::ApprovalsUi,
     /// 이미 알림을 발화한 pending 승인 id — 폴링마다 재발화하지 않기 위한 기억.
@@ -10147,6 +10310,8 @@ pub struct App {
     /// (`blocked_since`와 같은 관례). 세션당 하나만 들고 있어 예약이 쌓이지 않는다 —
     /// 다시 예약하면 덮어쓴다.
     pty_followup: std::collections::HashMap<(String, runtime::SessionId), QueuedFollowUp>,
+    pending_prompt_deliveries: std::collections::HashMap<String, PendingPromptDelivery>,
+    recent_prompt_receipts: std::collections::VecDeque<PromptReceipt>,
     /// 완료/입력대기 주목(attention) 추적 — 미확인이면 레일 6px, 포커스 확인 시 해제.
     session_alerts: std::collections::HashMap<runtime::SessionId, SessionAlert>,
     /// 세션별 현재 작업 폴더(감지 워커 lsof) — 행 1행 폴더명 + 워크스페이스명.
@@ -10556,8 +10721,336 @@ fn pending_verdict(caught_up: bool, queued: bool, waited: std::time::Duration) -
 /// 이미 끝나 있던 턴으로 즉시 발사되지 않는다(`crate::fleet::followup_ready`).
 #[derive(Debug, Clone, PartialEq)]
 struct QueuedFollowUp {
-    prompt: String,
+    target: crate::fleet::FleetPromptTarget,
+    prompt: Arc<str>,
     queued_turn: Option<i64>,
+    delivery_blocked: bool,
+    delivery_unknown: bool,
+    reservation_id: String,
+    input_permit: FollowUpInputPermit,
+}
+
+#[derive(Clone)]
+struct FollowUpInputPermit(Arc<OwnedFollowUpInputPermit>);
+
+struct OwnedFollowUpInputPermit {
+    permit: runtime::InputPermit,
+}
+
+impl Drop for OwnedFollowUpInputPermit {
+    fn drop(&mut self) {
+        self.permit.revoke();
+    }
+}
+
+impl Default for FollowUpInputPermit {
+    fn default() -> Self {
+        Self(Arc::new(OwnedFollowUpInputPermit {
+            permit: runtime::InputPermit::new(),
+        }))
+    }
+}
+
+impl std::fmt::Debug for FollowUpInputPermit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("FollowUpInputPermit")
+    }
+}
+
+impl PartialEq for FollowUpInputPermit {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl FollowUpInputPermit {
+    fn revoke(&self) {
+        self.0.permit.revoke();
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum FollowUpAdmissionError {
+    LimitExceeded,
+    Unknown,
+}
+
+const FOLLOWUP_MAX_ITEMS: usize = 256;
+const FOLLOWUP_MAX_PROMPT_BYTES: usize = 4 * 1024 * 1024;
+const FOLLOWUP_MAX_METADATA_BYTES: usize = 256 * 1024;
+
+fn cancel_followup_reservation(
+    followups: &mut std::collections::HashMap<(String, runtime::SessionId), QueuedFollowUp>,
+    key: &(String, runtime::SessionId),
+) -> Option<QueuedFollowUp> {
+    if let Some(queued) = followups.get(key) {
+        queued.input_permit.revoke();
+    }
+    followups.remove(key)
+}
+
+fn followup_input_admission(
+    queued: &QueuedFollowUp,
+    deadline: std::time::Instant,
+) -> runtime::InputAdmission {
+    let execution = queued.target.execution;
+    runtime::InputAdmission::new(
+        queued.input_permit.0.permit.clone(),
+        deadline,
+        move |admit| {
+            if execution.is_current() {
+                admit();
+            }
+        },
+    )
+    .with_agent_guard(execution.input_guard_for(runtime::AgentInputIntent::AutomaticPrompt))
+}
+
+fn revoke_followup_authorizations(
+    followups: &mut std::collections::HashMap<(String, runtime::SessionId), QueuedFollowUp>,
+    pending: &std::collections::HashMap<String, PendingPromptDelivery>,
+    target_matches: impl Fn(&crate::fleet::FleetPromptTarget) -> bool,
+) {
+    for queued in followups
+        .values_mut()
+        .filter(|queued| target_matches(&queued.target))
+    {
+        queued.input_permit.revoke();
+        queued.delivery_blocked = true;
+    }
+    // A canceled/replaced reservation may still have a receipt owner. Revoke that original
+    // authorization too, without deleting its Unknown payload or changing other input origins.
+    for delivery in pending.values() {
+        if let PromptDeliveryOrigin::FollowUp { queued } = &delivery.origin
+            && target_matches(&queued.target)
+        {
+            queued.input_permit.revoke();
+        }
+    }
+}
+
+fn followup_closed_by_command(
+    target: &crate::fleet::FleetPromptTarget,
+    runtime_instance: u64,
+    command: &runtime::RuntimeCommand,
+    mux: Option<&runtime::MuxSnapshot>,
+) -> bool {
+    if target.runtime_instance != runtime_instance {
+        return false;
+    }
+    match command {
+        runtime::RuntimeCommand::KillSession { session } => target.session == *session,
+        runtime::RuntimeCommand::ClosePane { pane } => mux.is_some_and(|mux| {
+            mux.tabs.iter().flat_map(|tab| &tab.panes).any(|candidate| {
+                candidate.id == *pane && candidate.session_id == Some(target.session)
+            })
+        }),
+        runtime::RuntimeCommand::CloseTab { tab } => mux.is_some_and(|mux| {
+            mux.tabs
+                .iter()
+                .filter(|candidate| candidate.id == *tab)
+                .flat_map(|tab| &tab.panes)
+                .any(|pane| pane.session_id == Some(target.session))
+        }),
+        _ => false,
+    }
+}
+
+fn followup_session_unavailable(live: &LiveSessionTracker, session: runtime::SessionId) -> bool {
+    live.exited_sessions.contains(&session)
+        || (live.seen_mux && !live.mux_sessions.contains(&session))
+}
+
+fn followup_unavailable_from_projection(
+    target: &crate::fleet::FleetPromptTarget,
+    runtime: Option<(&str, bool)>,
+    execution: Option<crate::agent_detect::AgentExecutionIdentity>,
+) -> bool {
+    runtime.is_none_or(|(workspace, unavailable)| workspace != target.workspace_id || unavailable)
+        || execution.is_some_and(|current| current != target.execution)
+}
+
+fn followup_metadata_bytes(key: &(String, runtime::SessionId), queued: &QueuedFollowUp) -> usize {
+    std::mem::size_of::<QueuedFollowUp>()
+        + std::mem::size_of::<OwnedFollowUpInputPermit>()
+        + std::mem::size_of::<(String, runtime::SessionId)>()
+        + key.0.len()
+        + queued.target.workspace_id.len()
+        + queued.reservation_id.len()
+}
+
+fn admit_followup_reservation(
+    followups: &mut std::collections::HashMap<(String, runtime::SessionId), QueuedFollowUp>,
+    key: (String, runtime::SessionId),
+    queued: QueuedFollowUp,
+) -> Result<(), FollowUpAdmissionError> {
+    let replaced = followups.get(&key);
+    if replaced.is_some_and(|current| current.delivery_unknown) {
+        return Err(FollowUpAdmissionError::Unknown);
+    }
+    let count = followups.len() + usize::from(replaced.is_none());
+    let prompt_bytes = followups
+        .values()
+        .map(|queued| queued.prompt.len())
+        .sum::<usize>()
+        - replaced.map_or(0, |queued| queued.prompt.len())
+        + queued.prompt.len();
+    let metadata = followups
+        .iter()
+        .map(|(key, queued)| followup_metadata_bytes(key, queued))
+        .sum::<usize>()
+        - replaced.map_or(0, |current| followup_metadata_bytes(&key, current))
+        + followup_metadata_bytes(&key, &queued);
+    if key.0 != queued.target.workspace_id
+        || key.1 != queued.target.session
+        || queued.prompt.trim().is_empty()
+        || queued.prompt.len() > crate::fleet::FLEET_PROMPT_MAX_BYTES
+        || count > FOLLOWUP_MAX_ITEMS
+        || prompt_bytes > FOLLOWUP_MAX_PROMPT_BYTES
+        || metadata > FOLLOWUP_MAX_METADATA_BYTES
+    {
+        return Err(FollowUpAdmissionError::LimitExceeded);
+    }
+    // Replacement is transactional: every validation above must succeed before old input
+    // authorization is revoked. The runtime holds this same permit through actual retention.
+    if let Some(previous) = replaced {
+        previous.input_permit.revoke();
+    }
+    followups.insert(key, queued);
+    Ok(())
+}
+
+const PROMPT_ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const PROMPT_DELIVERY_MAX_PENDING: usize = 256;
+const PROMPT_DELIVERY_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Clone)]
+enum PromptDeliveryOrigin {
+    Composer {
+        draft_key: String,
+        submission_id: u64,
+    },
+    Broadcast,
+    SelectedPaste,
+    FollowUp {
+        queued: QueuedFollowUp,
+    },
+}
+
+struct PendingPromptDelivery {
+    workspace_id: String,
+    runtime_instance: u64,
+    session: runtime::SessionId,
+    prompt: Arc<str>,
+    origin: PromptDeliveryOrigin,
+    deadline: std::time::Instant,
+    unknown: bool,
+}
+
+/// Bounded, non-sensitive evidence survives target retirement without holding live
+/// admission capacity or a second copy of the user's draft. Unknown is never a retry signal.
+struct PromptReceipt {
+    operation_id: String,
+    workspace_id: String,
+    runtime_instance: u64,
+    session: runtime::SessionId,
+    prompt_bytes: usize,
+    unknown_payload: Option<Arc<str>>,
+    outcome: ui::composer::PromptAdmissionOutcome,
+}
+
+fn record_prompt_receipt(
+    receipts: &mut std::collections::VecDeque<PromptReceipt>,
+    operation_id: String,
+    pending: &PendingPromptDelivery,
+    outcome: ui::composer::PromptAdmissionOutcome,
+) {
+    receipts.push_back(PromptReceipt {
+        operation_id,
+        workspace_id: pending.workspace_id.clone(),
+        runtime_instance: pending.runtime_instance,
+        session: pending.session,
+        prompt_bytes: pending.prompt.len(),
+        unknown_payload: (outcome == ui::composer::PromptAdmissionOutcome::Unknown)
+            .then(|| Arc::clone(&pending.prompt)),
+        outcome,
+    });
+    let receipt = receipts.back().expect("just recorded");
+    tracing::debug!(operation_id = %receipt.operation_id, workspace_id = %receipt.workspace_id,
+        runtime_instance = receipt.runtime_instance, session = receipt.session.0,
+        prompt_bytes = receipt.prompt_bytes, admission = ?receipt.outcome,
+        "PTY input receipt; execution is not confirmed");
+    while receipts.len() > PROMPT_DELIVERY_MAX_PENDING
+        || receipts
+            .iter()
+            .filter_map(|receipt| receipt.unknown_payload.as_ref())
+            .map(|payload| payload.len())
+            .sum::<usize>()
+            > PROMPT_DELIVERY_MAX_BYTES
+    {
+        receipts.pop_front();
+    }
+}
+
+fn take_retired_prompt_deliveries(
+    pending: &mut std::collections::HashMap<String, PendingPromptDelivery>,
+    target_live: impl Fn(&PendingPromptDelivery) -> bool,
+) -> Vec<(String, PendingPromptDelivery)> {
+    let retired = pending
+        .iter()
+        .filter(|(_, delivery)| !target_live(delivery))
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    retired
+        .into_iter()
+        .filter_map(|id| pending.remove(&id).map(|delivery| (id, delivery)))
+        .collect()
+}
+
+fn next_prompt_admission_wake(
+    pending: &std::collections::HashMap<String, PendingPromptDelivery>,
+    now: std::time::Instant,
+) -> Option<std::time::Duration> {
+    pending
+        .values()
+        .filter(|pending| !pending.unknown)
+        .map(|pending| pending.deadline.saturating_duration_since(now))
+        .min()
+}
+
+impl PendingPromptDelivery {
+    fn acknowledges(&self, runtime_instance: u64, session: runtime::SessionId) -> bool {
+        self.runtime_instance == runtime_instance && self.session == session
+    }
+
+    fn mark_unknown_if_expired(&mut self, now: std::time::Instant) -> bool {
+        if self.unknown || now < self.deadline {
+            return false;
+        }
+        self.unknown = true;
+        true
+    }
+}
+
+fn settle_followup_admission(
+    followups: &mut std::collections::HashMap<(String, runtime::SessionId), QueuedFollowUp>,
+    key: &(String, runtime::SessionId),
+    queued: &QueuedFollowUp,
+    outcome: ui::composer::PromptAdmissionOutcome,
+) {
+    queued.input_permit.revoke();
+    if followups
+        .get(key)
+        .is_none_or(|current| current.reservation_id != queued.reservation_id)
+    {
+        return;
+    }
+    if outcome == ui::composer::PromptAdmissionOutcome::Accepted {
+        followups.remove(key);
+    } else if let Some(current) = followups.get_mut(key) {
+        current.delivery_blocked = true;
+        current.delivery_unknown |= outcome == ui::composer::PromptAdmissionOutcome::Unknown;
+    }
 }
 
 /// hook 상태에서 "새 턴 시작"으로 볼 전이만 고른다 — 직전에 막혀 있던(대기 또는 완료)
@@ -11780,9 +12273,72 @@ enum WorkspaceControllerAction {
     },
     ComposerPrompt {
         target: AppTerminalInputTarget,
+        context: PromptInputContext,
         prompt: Arc<str>,
+        draft_key: String,
+        submission_id: u64,
+        required_draft_revision: u64,
     },
     SyncDotenv,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PromptInputContext {
+    ManualShell,
+    Ai(crate::agent_detect::AgentExecutionIdentity),
+    UnconfirmedAi,
+}
+
+/// One encoder for Composer/Fleet/full prompts and explicit no-submit selected text.
+fn plan_prompt_delivery(
+    workspace_ui: &ui::workspace::WorkspaceUi,
+    session: runtime::SessionId,
+    prompt: &str,
+    submit: bool,
+) -> Option<ui::composer::ComposerInputPlan> {
+    let bracketed = workspace_ui.session_bracketed_paste(session);
+    let provider = workspace_ui.agent_provider_for(session);
+    let folded;
+    let prompt =
+        if !submit && !bracketed && provider != Some(crate::agent_surface::AgentProvider::Codex) {
+            folded = prompt.replace(['\r', '\n'], " ");
+            folded.as_str()
+        } else {
+            prompt
+        };
+    ui::composer::plan_composer_input(prompt, submit, bracketed, provider)
+}
+
+/// Shares the actual host single-slot admission boundary with the regression tests.
+fn stage_composer_prompt_action(
+    slot: &mut Option<WorkspaceControllerAction>,
+    composer: &mut ui::composer::ComposerUi,
+    target: Option<(AppTerminalInputTarget, PromptInputContext)>,
+    draft_key: String,
+    prompt: Arc<str>,
+    submission_id: u64,
+    required_draft_revision: u64,
+) -> bool {
+    if slot.is_none()
+        && let Some((target, context)) = target
+    {
+        *slot = Some(WorkspaceControllerAction::ComposerPrompt {
+            target,
+            context,
+            prompt,
+            draft_key,
+            submission_id,
+            required_draft_revision,
+        });
+        return true;
+    }
+    composer.settle_submission(
+        &draft_key,
+        submission_id,
+        &prompt,
+        ui::composer::PromptAdmissionOutcome::Rejected,
+    );
+    false
 }
 
 // 기존 controller 요청(특히 현재 workspace의 dotenv 동기화)을 덮어쓰거나 앞지르지 않는다.
@@ -13377,13 +13933,16 @@ fn app_host_copy_into(
 }
 
 fn app_host_move(
-    root: &Path,
+    root: Option<&Path>,
     source: &Path,
     destination_dir: &Path,
+    copy_budget: &mut AppHostFileOperationBudget,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<(), ui::file_tree::FileTreeIoErrorCode> {
-    let root =
-        std::fs::canonicalize(root).map_err(|_| ui::file_tree::FileTreeIoErrorCode::OutsideRoot)?;
+    let root = root
+        .map(std::fs::canonicalize)
+        .transpose()
+        .map_err(|_| ui::file_tree::FileTreeIoErrorCode::OutsideRoot)?;
     let destination_dir = std::fs::canonicalize(destination_dir)
         .map_err(|_| ui::file_tree::FileTreeIoErrorCode::OutsideRoot)?;
     let name = source
@@ -13394,8 +13953,9 @@ fn app_host_move(
         .and_then(|parent| std::fs::canonicalize(parent).ok())
         .ok_or(ui::file_tree::FileTreeIoErrorCode::InvalidPath)?;
     let source = source_parent.join(name);
-    if !source.starts_with(&root)
-        || !destination_dir.starts_with(&root)
+    if root
+        .as_ref()
+        .is_some_and(|root| !source.starts_with(root) || !destination_dir.starts_with(root))
         || destination_dir.starts_with(&source)
     {
         return Err(ui::file_tree::FileTreeIoErrorCode::OutsideRoot);
@@ -13413,8 +13973,7 @@ fn app_host_move(
             app_host_validate_tree(&source, &mut validation, cancel, 0)
                 .map_err(|_| ui::file_tree::FileTreeIoErrorCode::NativeFailure)?;
             let temporary = destination_dir.join(format!(".tmp-{}", uuid::Uuid::new_v4()));
-            let mut copy_budget = AppHostFileOperationBudget::default();
-            if app_host_copy_recursive(&source, &temporary, &mut copy_budget, cancel, 0).is_err() {
+            if app_host_copy_recursive(&source, &temporary, copy_budget, cancel, 0).is_err() {
                 let _ = app_host_remove_all(&temporary);
                 return Err(ui::file_tree::FileTreeIoErrorCode::NativeFailure);
             }
@@ -13440,6 +13999,251 @@ fn app_host_move(
     }
 }
 
+fn app_host_prepare_file_sources(
+    root: Option<&Path>,
+    sources: Vec<PathBuf>,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<PathBuf>, ui::file_tree::FileTreeIoErrorCode> {
+    use ui::file_tree::{FileTreeIoErrorCode as Error, FileTreePathListPayload};
+    let root = root
+        .map(std::fs::canonicalize)
+        .transpose()
+        .map_err(|_| Error::OutsideRoot)?;
+    let sources = FileTreePathListPayload::try_new(sources)?.into_paths();
+    let mut normalized = Vec::with_capacity(sources.len());
+    for source in sources {
+        app_host_file_operation_cancelled(cancel).map_err(|_| Error::NativeFailure)?;
+        let name = source.file_name().ok_or(Error::InvalidPath)?;
+        let parent = source
+            .parent()
+            .and_then(|parent| std::fs::canonicalize(parent).ok())
+            .ok_or(Error::InvalidPath)?;
+        let source = parent.join(name);
+        if root
+            .as_ref()
+            .is_some_and(|root| source == *root || !source.starts_with(root))
+        {
+            return Err(Error::OutsideRoot);
+        }
+        std::fs::symlink_metadata(&source).map_err(|_| Error::InvalidPath)?;
+        normalized.push(source);
+    }
+    FileTreePathListPayload::try_new(normalized).map(FileTreePathListPayload::into_paths)
+}
+
+#[cfg(target_os = "macos")]
+fn app_host_ascii_destination_case_sensitive(destination: &Path) -> Option<bool> {
+    use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt as _};
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NONBLOCK)
+        .open(destination)
+        .ok()?;
+    // SAFETY: statfs is an all-integer/array C struct; the owned directory fd and
+    // writable initialized buffer remain alive for both native metadata calls.
+    let mut volume: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatfs(directory.as_raw_fd(), &mut volume) } != 0 {
+        return None;
+    }
+    let filesystem = volume.f_fstypename.map(|byte| byte as u8);
+    // Other filesystems may also normalize ASCII (e.g. trailing dots): do not
+    // infer their complete name rules from case sensitivity alone.
+    if !filesystem.starts_with(b"apfs\0") && !filesystem.starts_with(b"hfs\0") {
+        return None;
+    }
+    match unsafe { libc::fpathconf(directory.as_raw_fd(), libc::_PC_CASE_SENSITIVE) } {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn app_host_ascii_destination_case_sensitive(_destination: &Path) -> Option<bool> {
+    None
+}
+
+struct AppHostNameProbeDirectory(Option<PathBuf>);
+
+impl AppHostNameProbeDirectory {
+    fn finish(
+        mut self,
+        result: Result<usize, ui::file_tree::FileTreeIoErrorCode>,
+    ) -> Result<usize, ui::file_tree::FileTreeIoErrorCode> {
+        let directory = self.0.as_ref().expect("owned probe directory");
+        app_host_remove_all(directory)
+            .map_err(|_| ui::file_tree::FileTreeIoErrorCode::NativeFailure)?;
+        self.0 = None;
+        result
+    }
+}
+
+impl Drop for AppHostNameProbeDirectory {
+    fn drop(&mut self) {
+        if let Some(directory) = self.0.take() {
+            let _ = app_host_remove_all(&directory);
+        }
+    }
+}
+
+/// Return the number of native empty-file probes. Known APFS/HFS printable-ASCII
+/// names need only volume metadata; Unicode/unknown volumes use their exact VFS rules.
+fn app_host_preflight_destination_names(
+    destination: &Path,
+    names: &[&std::ffi::OsStr],
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<usize, ui::file_tree::FileTreeIoErrorCode> {
+    app_host_preflight_destination_names_with_observer(destination, names, cancel, |_| {})
+}
+
+fn app_host_preflight_destination_names_with_observer(
+    destination: &Path,
+    names: &[&std::ffi::OsStr],
+    cancel: &std::sync::atomic::AtomicBool,
+    mut observed_probe: impl FnMut(usize),
+) -> Result<usize, ui::file_tree::FileTreeIoErrorCode> {
+    use ui::file_tree::{
+        FILE_TREE_PATH_LIST_MAX_BYTES, FILE_TREE_PATH_LIST_MAX_ITEMS, FILE_TREE_PATH_MAX_BYTES,
+        FileTreeIoErrorCode as Error,
+    };
+    app_host_file_operation_cancelled(cancel).map_err(|_| Error::NativeFailure)?;
+    if names.len() > FILE_TREE_PATH_LIST_MAX_ITEMS {
+        return Err(Error::PathListTooLarge);
+    }
+    let mut bytes = 0usize;
+    for name in names {
+        let encoded = name.as_encoded_bytes();
+        if encoded.is_empty()
+            || encoded.contains(&0)
+            || encoded.len() > FILE_TREE_PATH_MAX_BYTES
+            || Path::new(name).file_name() != Some(*name)
+        {
+            return Err(Error::InvalidPath);
+        }
+        bytes = bytes
+            .checked_add(encoded.len())
+            .filter(|bytes| *bytes <= FILE_TREE_PATH_LIST_MAX_BYTES)
+            .ok_or(Error::PathListTooLarge)?;
+    }
+    if names.len() < 2 {
+        return Ok(0);
+    }
+    if names.iter().all(|name| {
+        name.as_encoded_bytes()
+            .iter()
+            .all(|byte| (0x20..0x7f).contains(byte))
+    }) && let Some(case_sensitive) = app_host_ascii_destination_case_sensitive(destination)
+    {
+        let mut planned = std::collections::HashSet::new();
+        for name in names {
+            app_host_file_operation_cancelled(cancel).map_err(|_| Error::NativeFailure)?;
+            let key = if case_sensitive {
+                name.as_encoded_bytes().to_vec()
+            } else {
+                name.as_encoded_bytes().to_ascii_lowercase()
+            };
+            if !planned.insert(key) {
+                return Err(Error::Conflict);
+            }
+        }
+        return Ok(0);
+    }
+    let directory = destination.join(format!(".tmp-name-plan-{}", uuid::Uuid::new_v4()));
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder
+        .create(&directory)
+        .map_err(|_| Error::NativeFailure)?;
+    let cleanup = AppHostNameProbeDirectory(Some(directory.clone()));
+    let result = (|| {
+        let mut probes = 0;
+        for name in names {
+            app_host_file_operation_cancelled(cancel).map_err(|_| Error::NativeFailure)?;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(directory.join(name))
+                .map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::AlreadyExists {
+                        Error::Conflict
+                    } else {
+                        Error::NativeFailure
+                    }
+                })?;
+            probes += 1;
+            observed_probe(probes);
+        }
+        Ok(probes)
+    })();
+    // Cleanup succeeds before any source/content transfer begins. Drop retries on
+    // native cleanup failure or unwind; that failure refuses the actual operation.
+    cleanup.finish(result)
+}
+
+fn app_host_transfer_files(
+    root: Option<&Path>,
+    sources: Vec<PathBuf>,
+    destination: &Path,
+    move_files: bool,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<(), ui::file_tree::FileTreeIoErrorCode> {
+    use ui::file_tree::{FileTreeIoErrorCode as Error, FileTreePathPayload};
+    let sources = app_host_prepare_file_sources(root, sources, cancel)?;
+    let destination = std::fs::canonicalize(destination).map_err(|_| Error::InvalidPath)?;
+    if !destination.is_dir() {
+        return Err(Error::InvalidPath);
+    }
+    if let Some(root) = root {
+        let root = std::fs::canonicalize(root).map_err(|_| Error::OutsideRoot)?;
+        if !destination.starts_with(root) {
+            return Err(Error::OutsideRoot);
+        }
+    }
+    let mut validation = AppHostFileOperationBudget::default();
+    let mut names = std::collections::HashSet::new();
+    for source in &sources {
+        if destination.starts_with(source)
+            || (!move_files
+                && std::fs::canonicalize(source)
+                    .is_ok_and(|source_real| destination.starts_with(source_real)))
+        {
+            return Err(Error::OutsideRoot);
+        }
+        if move_files && source.parent() == Some(destination.as_path()) {
+            continue;
+        }
+        let name = source.file_name().ok_or(Error::InvalidPath)?;
+        if !names.insert(name) {
+            return Err(Error::Conflict);
+        }
+        let target = FileTreePathPayload::try_new(destination.join(name))?;
+        match std::fs::symlink_metadata(target.as_path()) {
+            Ok(_) => return Err(Error::Conflict),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(Error::NativeFailure),
+        }
+        app_host_validate_tree(source, &mut validation, cancel, 0)
+            .map_err(|_| Error::NativeFailure)?;
+    }
+    let planned_names: Vec<_> = names.into_iter().collect();
+    app_host_preflight_destination_names(&destination, &planned_names, cancel)?;
+    app_host_file_operation_cancelled(cancel).map_err(|_| Error::NativeFailure)?;
+    let mut copy_budget = AppHostFileOperationBudget::default();
+    for source in sources {
+        if move_files {
+            app_host_move(root, &source, &destination, &mut copy_budget, cancel)?;
+        } else {
+            app_host_copy_into(&source, &destination, &mut copy_budget, cancel)
+                .map_err(|_| Error::NativeFailure)?;
+        }
+    }
+    Ok(())
+}
+
 fn app_host_rename_is_noop(source: &Path, requested_name: &str) -> bool {
     source
         .parent()
@@ -13452,6 +14256,20 @@ fn app_host_rename_is_noop(source: &Path, requested_name: &str) -> bool {
 fn run_file_tree_host_io(
     request: ui::file_tree::FileTreeIoRequest,
     cancel: &std::sync::atomic::AtomicBool,
+) -> Result<(), ui::file_tree::FileTreeIoErrorCode> {
+    run_file_tree_host_io_with_native(
+        request,
+        cancel,
+        ui::clipboard_image::read_clipboard_file_list,
+        |path| trash::delete(path).map_err(|_| ()),
+    )
+}
+
+fn run_file_tree_host_io_with_native(
+    request: ui::file_tree::FileTreeIoRequest,
+    cancel: &std::sync::atomic::AtomicBool,
+    mut clipboard_paths: impl FnMut() -> Option<Vec<PathBuf>>,
+    mut trash_path: impl FnMut(&Path) -> Result<(), ()>,
 ) -> Result<(), ui::file_tree::FileTreeIoErrorCode> {
     use ui::file_tree::{FileTreeIoErrorCode as Error, FileTreeIoRequest as Request};
     match request {
@@ -13503,57 +14321,63 @@ fn run_file_tree_host_io(
         }
         Request::Move {
             root,
-            source,
+            sources,
             destination,
-        } => app_host_move(
-            root.as_path(),
-            source.as_path(),
+        } => app_host_transfer_files(
+            Some(root.as_path()),
+            sources.into_paths(),
             destination.as_path(),
+            true,
             cancel,
         ),
         Request::CopyInto {
+            root,
             sources,
             destination,
+        } => app_host_transfer_files(
+            root.as_ref().map(|root| root.as_path()),
+            sources.into_paths(),
+            destination.as_path(),
+            false,
+            cancel,
+        ),
+        Request::PasteFromClipboard {
+            destination,
+            move_files,
         } => {
-            let destination =
-                std::fs::canonicalize(destination.into_path()).map_err(|_| Error::InvalidPath)?;
-            let sources = sources.into_paths();
-            let mut validation = AppHostFileOperationBudget::default();
-            for source in &sources {
-                app_host_validate_tree(source, &mut validation, cancel, 0)
-                    .map_err(|_| Error::NativeFailure)?;
-            }
-            let mut copy_budget = AppHostFileOperationBudget::default();
-            for source in sources {
-                app_host_copy_into(&source, &destination, &mut copy_budget, cancel)
-                    .map_err(|_| Error::NativeFailure)?;
-            }
-            Ok(())
-        }
-        Request::PasteFromClipboard { destination } => {
-            let Some(sources) = ui::clipboard_image::read_clipboard_file_list() else {
+            let Some(sources) = clipboard_paths() else {
                 return Ok(());
             };
-            let destination =
-                std::fs::canonicalize(destination.into_path()).map_err(|_| Error::InvalidPath)?;
-            let mut validation = AppHostFileOperationBudget::default();
-            for source in &sources {
-                app_host_validate_tree(source, &mut validation, cancel, 0)
-                    .map_err(|_| Error::NativeFailure)?;
-            }
-            let mut copy_budget = AppHostFileOperationBudget::default();
-            for source in sources {
-                app_host_copy_into(&source, &destination, &mut copy_budget, cancel)
-                    .map_err(|_| Error::NativeFailure)?;
-            }
-            Ok(())
+            app_host_transfer_files(None, sources, destination.as_path(), move_files, cancel)
         }
-        Request::Trash { target } => {
+        Request::Trash { target, preflight } => {
             let mut validation = AppHostFileOperationBudget::default();
-            app_host_validate_tree(target.as_path(), &mut validation, cancel, 0)
-                .map_err(|_| Error::TrashUnavailable)?;
+            let target = if let Some((root, paths)) = preflight {
+                let sources = app_host_prepare_file_sources(
+                    Some(root.as_path()),
+                    paths.into_paths(),
+                    cancel,
+                )?;
+                let target_parent = target
+                    .parent()
+                    .and_then(|parent| std::fs::canonicalize(parent).ok())
+                    .ok_or(Error::InvalidPath)?;
+                let target = target_parent.join(target.file_name().ok_or(Error::InvalidPath)?);
+                if !sources.contains(&target) {
+                    return Err(Error::InvalidPath);
+                }
+                for source in sources {
+                    app_host_validate_tree(&source, &mut validation, cancel, 0)
+                        .map_err(|_| Error::NativeFailure)?;
+                }
+                target
+            } else {
+                app_host_validate_tree(target.as_path(), &mut validation, cancel, 0)
+                    .map_err(|_| Error::TrashUnavailable)?;
+                target.into_path()
+            };
             app_host_file_operation_cancelled(cancel).map_err(|_| Error::TrashUnavailable)?;
-            trash::delete(target.as_path()).map_err(|_| Error::TrashUnavailable)
+            trash_path(&target).map_err(|_| Error::TrashUnavailable)
         }
         Request::DeletePermanently { target } => {
             let mut validation = AppHostFileOperationBudget::default();
@@ -13578,6 +14402,25 @@ fn run_file_tree_host_io(
                 .ok_or(Error::NativeFailure)
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn pr11_private_file_fixture_io(
+    request: ui::file_tree::FileTreeIoRequest,
+    root: &Path,
+) -> Result<(), ui::file_tree::FileTreeIoErrorCode> {
+    run_file_tree_host_io_with_native(
+        request,
+        &std::sync::atomic::AtomicBool::new(false),
+        || None,
+        |path| {
+            if path.starts_with(root) {
+                app_host_remove_all(path).map_err(|_| ())
+            } else {
+                Err(())
+            }
+        },
+    )
 }
 
 fn read_inbox_log_preview(
@@ -14083,7 +14926,7 @@ impl App {
                 request,
                 selected_path,
             } => {
-                let active_workspace = self.active.id.clone();
+                let active_workspace = self.composer.active_draft_key().to_owned();
                 let _ = self.composer.complete_context_file(
                     &self.egui_ctx,
                     request,
@@ -14092,7 +14935,7 @@ impl App {
                 );
             }
             AppHostIoCompletion::ComposerClipboard { request, payload } => {
-                let active_workspace = self.active.id.clone();
+                let active_workspace = self.composer.active_draft_key().to_owned();
                 let _ = self.composer.complete_clipboard_attachment(
                     &self.egui_ctx,
                     request,
@@ -14823,6 +15666,7 @@ impl App {
                 .unwrap_or_else(|| Path::new("."))
                 .join("cloud_agent_history.db"),
             redaction.clone(),
+            egui_ctx.clone(),
         );
         cloud_agent.port = config.cloud_agent.port.max(1024);
         cloud_agent.hostname = config.cloud_agent.public_host.chars().take(259).collect();
@@ -14831,21 +15675,33 @@ impl App {
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
             .join("composer_history.jsonl");
+        let draft_path = composer_history_path.with_file_name("composer_drafts.json");
+        let draft_startup = crate::composer_drafts::DraftSnapshot::load_startup(&draft_path);
+        let mut composer = ui::composer::ComposerUi::new(composer_history_path.clone());
+        composer.restore_drafts(draft_startup.snapshot);
+        composer.set_read_only(draft_startup.error.is_some());
+        let draft_wake = egui_ctx.clone();
+        let composer_draft_save_worker = crate::composer_draft_worker::DraftSaveWorker::new(
+            draft_path,
+            draft_startup.error,
+            draft_startup.file_version,
+            move || draft_wake.request_repaint(),
+        );
         // 프롬프트 라이브러리 (기능2) — 없으면 예시 프롬프트로 씨드해 팔레트가 비지 않게 한다.
         let prompt_library_path = db_path
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
             .join("prompt_library.json");
-        let mut prompt_library = crate::prompt_library::PromptLibrary::load(&prompt_library_path);
-        if prompt_library.prompts.is_empty() {
-            prompt_library = crate::prompt_library::PromptLibrary::default_seed();
-            if let Err(error) = prompt_library.save(&prompt_library_path) {
-                tracing::warn!(
-                    path = %prompt_library_path.display(),
-                    "프롬프트 라이브러리 씨드 저장 실패: {error:#}"
-                );
-            }
-        }
+        let prompt_startup =
+            crate::prompt_library::PromptLibrary::load_startup(&prompt_library_path);
+        let prompt_library = prompt_startup.library;
+        let prompt_wake = egui_ctx.clone();
+        let prompt_library_save_worker = crate::prompt_library_worker::PromptLibrarySaveWorker::new(
+            prompt_library_path,
+            prompt_startup.error,
+            prompt_startup.file_version,
+            move || prompt_wake.request_repaint(),
+        );
         let notice_translation_cache =
             match crate::notice_translate::TranslationCache::load(&notice_translation_cache_path) {
                 Ok(cache) => cache,
@@ -15002,6 +15858,7 @@ impl App {
             document_close_after_save: std::collections::HashSet::new(),
             document_cap_notice: false,
             document_markdown_viewer: ui::markdown_viewer::MarkdownViewer::new(),
+            document_image_worker: crate::markdown_image_io::new_worker(egui_ctx.clone()),
             pending_document_open: None,
             work_history_rows: Vec::new(),
             work_history_rows_revision: 0,
@@ -15064,7 +15921,6 @@ impl App {
             agent_terminal_ui: ui::agent_terminal::AgentTerminalUi::new(),
             fleet_ui: ui::fleet::FleetUi::default(),
             pending_batch_spawn: None,
-            broadcast_working: std::collections::HashMap::new(),
             activity_rows_cache: None,
             port_worker,
             port_snapshot: None,
@@ -15096,11 +15952,22 @@ impl App {
             notifications_ui: ui::notifications::NotificationsUi::new(),
             inbox_waiting_ui: ui::inbox_waiting::InboxWaitingUi::new(),
             // 히스토리 파일은 앱 데이터 디렉터리(= 메타데이터 파일과 같은 폴더) 아래.
-            composer: ui::composer::ComposerUi::new(composer_history_path.clone()),
+            composer,
             composer_history_path,
+            composer_draft_save_worker,
+            composer_checkpoint_revision: 0,
+            composer_save_revision: 0,
+            composer_checkpoint_at: None,
+            composer_draft_error: None,
+            composer_pending_deletions: Vec::new(),
+            pending_durable_composer_prompt: None,
             prompt_palette: ui::prompt_palette::PromptPaletteUi::default(),
             prompt_library,
-            prompt_library_path,
+            prompt_library_revision: 1,
+            prompt_library_save_revision: 0,
+            prompt_library_save_worker,
+            pending_prompt_library_save: prompt_startup.seed_missing,
+            prompt_library_edit_error: None,
             approvals_ui: ui::approvals::ApprovalsUi::new(),
             approval_notified: std::collections::HashSet::new(),
             _pending_approval_owner: pending_approval_owner,
@@ -15163,6 +16030,8 @@ impl App {
             global_turn_done: std::collections::HashMap::new(),
             global_idle_since: std::collections::HashMap::new(),
             pty_followup: std::collections::HashMap::new(),
+            pending_prompt_deliveries: std::collections::HashMap::new(),
+            recent_prompt_receipts: std::collections::VecDeque::new(),
             session_alerts: std::collections::HashMap::new(),
             session_cwds: std::collections::HashMap::new(),
             agent_info: std::collections::HashMap::new(),
@@ -15452,45 +16321,40 @@ impl App {
     /// logic tick 빈 슬롯이면 PrepareAgentLaunch를 하나씩 큐잉한다. AgentsIntent::Run
     /// 핸들러와 같은 launch 파이프라인을 재사용하되 N개를 여러 프레임에 걸쳐 순차 발사한다.
     fn pump_batch_spawn(&mut self, ctx: &egui::Context) {
-        let Some(pending) = &self.pending_batch_spawn else {
-            return;
-        };
-        // staging(버튼 클릭) 이후 활성 workspace가 바뀌면 남은 스폰을 전부 취소한다 —
-        // 그러지 않으면 사용자가 다른 workspace로 전환한 사이에도 스폰이 이어져 엉뚱한
-        // workspace에 세션이 쌓인다(배치 스폰은 클릭 시점의 workspace에만 적용).
-        if pending.staged_workspace_id != self.active.id {
-            self.pending_batch_spawn = None;
+        if self.pending_batch_spawn.is_none() {
             return;
         }
-        // 아래 request_settings_snapshot_if_needed/queue_settings_action이 &mut self를
-        // 요구하므로 pending의 값은 먼저 복제해 빌림을 끝낸다.
-        let agent_id = pending.agent_id.clone();
-        let prompt = pending.prompt.clone();
+        let mut pending = self.pending_batch_spawn.take();
         let workspace_id = self.active.id.clone();
-        // 설정/에이전트 창을 한 번도 안 열었으면 agents_snapshot이 비어 있을 수 있다 —
-        // Run 핸들러와 동일하게 project_root는 workspace_tree_root에서 유도한다.
-        let project_root = self.workspace_tree_root(&workspace_id);
-        self.request_settings_snapshot_if_needed(&workspace_id, project_root);
-        let queued = self.queue_settings_action(
+        let busy = self.settings_snapshot_pending || self.pending_settings_job.is_some();
+        pump_batch_spawn_step(
+            &mut pending,
+            ctx,
             &workspace_id,
-            None,
-            SettingsJobAction::PrepareAgentLaunch {
-                agent_id,
-                profile_id: None,
-                runtime_workspace_id: workspace_id.clone(),
-                extra_arg: prompt,
+            busy,
+            std::time::Instant::now(),
+            |agent_id, prompt| {
+                let project_root = self.workspace_tree_root(&workspace_id);
+                self.request_settings_snapshot_if_needed(&workspace_id, project_root);
+                if self.queue_settings_action(
+                    &workspace_id,
+                    None,
+                    SettingsJobAction::PrepareAgentLaunch {
+                        agent_id,
+                        profile_id: None,
+                        runtime_workspace_id: workspace_id.clone(),
+                        extra_arg: prompt,
+                    },
+                ) {
+                    BatchAdmission::Queued
+                } else if self.settings_snapshot_pending || self.pending_settings_job.is_some() {
+                    BatchAdmission::WaitingForWorker
+                } else {
+                    BatchAdmission::KnownUnsent
+                }
             },
         );
-        if queued && let Some(pending) = &mut self.pending_batch_spawn {
-            pending.remaining -= 1;
-            if pending.remaining == 0 {
-                self.pending_batch_spawn = None;
-            }
-        }
-        // 남은 스폰이 있으면 다음 프레임에 즉시 재시도 — 사용자 입력 없이도 큐가 드레인된다.
-        if self.pending_batch_spawn.is_some() {
-            ctx.request_repaint();
-        }
+        self.pending_batch_spawn = pending;
     }
 
     fn bench_setup(&mut self, bench: &mut crate::bench::Bench) {
@@ -15614,6 +16478,9 @@ impl App {
         self.notifications_ui.prune_workspace(delete_id);
         if let Err(e) = self.db.delete_workspace(delete_id) {
             tracing::warn!("벤치 워크스페이스 삭제 실패: {e:#}");
+        } else {
+            self.composer
+                .delete_workspace_drafts(&self.egui_ctx, delete_id);
         }
         self.refresh_workspaces();
         bench.emit_ws_step("delete", elapsed_ms(started));
@@ -16303,44 +17170,77 @@ impl App {
 
     /// 턴이 끝난 세션의 예약된 다음 단계를 보낸다.
     ///
-    /// 판정은 `crate::fleet::followup_ready`가 전부 한다(순수 함수). 여기서는 죽은
-    /// 세션의 예약을 먼저 버리고 — 워크스페이스가 닫혔거나 pane이 사라졌다 — 살아남은
-    /// 것만 발사한다. 보낸 예약은 즉시 지운다: 한 칸이라 반복 발사가 되면 안 된다.
+    /// Readiness comes from the observed turn boundary. Closed/stale targets keep their
+    /// reservation blocked for explicit user action. A ready reservation is removed only
+    /// after its matching runtime confirms actual PTY admission; pending/unknown never retries.
+    fn followup_target_unavailable(&self, target: &crate::fleet::FleetPromptTarget) -> bool {
+        followup_unavailable_from_projection(
+            target,
+            self.runtime_by_instance(target.runtime_instance)
+                .map(|runtime| {
+                    (
+                        runtime.id.as_str(),
+                        followup_session_unavailable(&runtime.live, target.session),
+                    )
+                }),
+            self.agent_kinds
+                .get(&(target.runtime_instance, target.session))
+                .and_then(|agent| agent.execution),
+        )
+    }
+
     fn flush_queued_followups(&mut self) {
         if self.pty_followup.is_empty() {
             return;
         }
-        let dead: Vec<(String, runtime::SessionId)> = self
+        // Missing UI/agent projections are not proof of deletion. Keep every reservation,
+        // and block only when the original runtime/execution/session is demonstrably unavailable.
+        let unavailable = self
             .pty_followup
-            .keys()
-            .filter(|(workspace_id, session)| !self.attention_session_alive(workspace_id, *session))
-            .cloned()
-            .collect();
-        for key in dead {
-            self.pty_followup.remove(&key);
+            .iter()
+            .filter(|(_, queued)| {
+                !queued.delivery_blocked && self.followup_target_unavailable(&queued.target)
+            })
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in unavailable {
+            if let Some(queued) = self.pty_followup.get_mut(&key) {
+                queued.input_permit.revoke();
+                queued.delivery_blocked = true;
+            }
         }
         let waiting: std::collections::HashSet<(String, runtime::SessionId)> = self
             .global_waiting
             .iter()
             .map(|(workspace_id, session, _)| (workspace_id.clone(), *session))
             .collect();
-        let ready: Vec<((String, runtime::SessionId), String)> = self
+        let ready: Vec<(String, runtime::SessionId)> = self
             .pty_followup
             .iter()
             .filter(|(key, queued)| {
-                crate::fleet::followup_ready(
-                    queued.queued_turn,
-                    self.global_turn_done.get(*key).copied(),
-                    waiting.contains(*key),
-                )
+                !queued.delivery_blocked
+                    && !self.pending_prompt_deliveries.values().any(|pending| {
+                        !pending.unknown
+                            && pending.workspace_id == key.0
+                            && pending.session == key.1
+                    })
+                    && crate::fleet::followup_ready(
+                        queued.queued_turn,
+                        self.global_turn_done.get(*key).copied(),
+                        waiting.contains(*key),
+                    )
             })
-            .map(|(key, queued)| (key.clone(), queued.prompt.clone()))
+            .map(|(key, _)| key.clone())
             .collect();
-        for (key, prompt) in ready {
-            self.pty_followup.remove(&key);
-            let (workspace_id, session) = key;
-            tracing::info!("다음 단계 예약: 턴이 끝나 지금 보낸다");
-            self.broadcast_prompt_to(&workspace_id, session, &prompt);
+        for key in ready {
+            let queued = self
+                .pty_followup
+                .get(&key)
+                .expect("ready follow-up")
+                .clone();
+            let target = queued.target.clone();
+            let prompt = Arc::clone(&queued.prompt);
+            self.broadcast_prompt_to(&target, &prompt, PromptDeliveryOrigin::FollowUp { queued });
         }
     }
 
@@ -17219,6 +18119,14 @@ impl App {
             apply_claude_statusline(display, self.statuslines.get(&(instance, *session)));
         }
         self.active.workspace_ui.set_agent_info(merged);
+        self.active.workspace_ui.set_agent_executions(
+            kinds_for_active
+                .into_iter()
+                .filter_map(|(session, running)| {
+                    running.execution.map(|execution| (session, execution))
+                })
+                .collect(),
+        );
     }
 
     /// `runtime_instance`가 은퇴할 때(그 워커가 실제로 shutdown되고 다시 warm으로 되돌아가지
@@ -17227,6 +18135,15 @@ impl App {
     /// 종료 분기, `bench_delete_workspace` (아래 와이어링 테스트가 이 셋을 고정한다). App
     /// 전체 종료(`on_exit`)는 App 자신이 곧 드롭되므로 제외 — 정리해도 남길 자리가 없다.
     fn prune_agent_display_for_retired_instance(&mut self, runtime_instance: u64) {
+        revoke_followup_authorizations(
+            &mut self.pty_followup,
+            &self.pending_prompt_deliveries,
+            |target| target.runtime_instance == runtime_instance,
+        );
+        self.composer
+            .retire_generation(&self.egui_ctx, runtime_instance);
+        self.composer_pending_deletions
+            .retain(|pending| pending.runtime_instance != runtime_instance);
         retain_other_runtime_instance(&mut self.agent_info, runtime_instance);
         retain_other_runtime_instance(&mut self.agent_kinds, runtime_instance);
         retain_other_runtime_instance(&mut self.statuslines, runtime_instance);
@@ -20652,8 +21569,22 @@ impl App {
             WorkspaceControllerAction::Notify { summary, body } => {
                 platform::notify(&summary, &body);
             }
-            WorkspaceControllerAction::ComposerPrompt { target, prompt } => {
-                self.send_composer_prompt(&target, &prompt);
+            WorkspaceControllerAction::ComposerPrompt {
+                target,
+                context,
+                prompt,
+                draft_key,
+                submission_id,
+                required_draft_revision,
+            } => {
+                self.defer_composer_prompt(
+                    target,
+                    context,
+                    prompt,
+                    draft_key,
+                    submission_id,
+                    required_draft_revision,
+                );
             }
             WorkspaceControllerAction::SyncDotenv => self.sync_dotenv_env(),
         }
@@ -20687,6 +21618,27 @@ impl App {
     }
 
     fn drain_workspace_protocol_intents(&mut self, runtime_instance: u64) {
+        if !workspace_protocol_logic_pass_ready(&self.egui_ctx) {
+            return;
+        }
+        while let Some((workspace_id, intent)) = self
+            .runtime_by_instance_mut(runtime_instance)
+            .and_then(|runtime| {
+                runtime
+                    .workspace_ui
+                    .take_selected_agent_prompt()
+                    .map(|intent| (runtime.id.clone(), intent))
+            })
+        {
+            self.queue_prompt_delivery(
+                workspace_id,
+                runtime_instance,
+                intent.session,
+                intent.prompt,
+                PromptDeliveryOrigin::SelectedPaste,
+                PromptInputContext::Ai(intent.execution),
+            );
+        }
         while let Some(intent) = self
             .runtime_by_instance_mut(runtime_instance)
             .and_then(|runtime| runtime.workspace_ui.take_protocol_intent())
@@ -20697,6 +21649,45 @@ impl App {
                 .then(|| intent.focus_pane().cloned())
                 .flatten();
             let command = intent.into_command();
+            if matches!(
+                command,
+                runtime::RuntimeCommand::ClosePane { .. }
+                    | runtime::RuntimeCommand::CloseTab { .. }
+                    | runtime::RuntimeCommand::KillSession { .. }
+            ) {
+                let mux = self
+                    .runtime_by_instance(runtime_instance)
+                    .and_then(|runtime| runtime.workspace_ui.mux().cloned());
+                revoke_followup_authorizations(
+                    &mut self.pty_followup,
+                    &self.pending_prompt_deliveries,
+                    |target| {
+                        followup_closed_by_command(
+                            target,
+                            runtime_instance,
+                            &command,
+                            mux.as_deref(),
+                        )
+                    },
+                );
+            }
+            let draft_deletion = self
+                .runtime_by_instance(runtime_instance)
+                .and_then(|runtime| {
+                    composer_permanent_close_marker(
+                        &command,
+                        runtime_instance,
+                        &runtime.id,
+                        cloud_agent_mux(runtime),
+                        &self.closed_workspaces,
+                    )
+                });
+            let draft_barrier = draft_deletion
+                .as_ref()
+                .filter(|_| {
+                    self.composer_pending_deletions.len() < crate::composer_drafts::DRAFT_MAX_ITEMS
+                })
+                .and_then(|_| self.next_restore_barrier.allocate());
             if let Some(pane) = newer_local_focus.as_ref() {
                 self.cancel_terminal_focus_intents();
                 self.active.workspace_ui.arm_terminal_focus(pane.clone());
@@ -20731,28 +21722,68 @@ impl App {
             let Some(runtime) = self.runtime_by_instance_mut(runtime_instance) else {
                 continue;
             };
-            let result =
-                classify_workspace_protocol_delivery(runtime.runtime.send_command(command));
-            let delivered = result.is_ok();
-            runtime
-                .workspace_ui
-                .complete_protocol(ui::workspace::WorkspaceProtocolCompletion {
-                    operation,
-                    generation,
-                    result,
-                });
+            let result = runtime.runtime.send_command_owned(command);
+            let delivery = finish_owned_workspace_protocol_delivery(
+                &mut runtime.workspace_ui,
+                operation,
+                generation,
+                result,
+            );
+            if delivery == TerminalProtocolDelivery::Retry {
+                break;
+            }
+            let delivered = delivery == TerminalProtocolDelivery::Accepted;
             if newer_local_focus.is_some() && !delivered {
                 runtime.workspace_ui.cancel_terminal_focus();
+            }
+            if delivered
+                && let (Some(mut deletion), Some(correlation_id)) = (draft_deletion, draft_barrier)
+                && runtime
+                    .runtime
+                    .send_command(runtime::RuntimeCommand::DurableEventBarrier { correlation_id })
+                    .is_ok()
+            {
+                deletion.correlation_id = correlation_id;
+                self.composer_pending_deletions.push(deletion);
             }
         }
     }
 
-    fn poll_workspace_protocol_intents(&mut self) {
+    fn poll_workspace_protocol_intents(&mut self, ctx: &egui::Context) {
+        // A discarded pass can have staged new terminal input. Leave it queued until final
+        // pass admission; retain FIFO order, including any resize staged after that input.
+        if !workspace_protocol_logic_pass_ready(ctx) {
+            return;
+        }
         let mut runtime_instances = Vec::with_capacity(1 + self.warm.len());
         runtime_instances.push(self.active.runtime_instance);
         runtime_instances.extend(self.warm.values().map(|runtime| runtime.runtime_instance));
         for runtime_instance in runtime_instances {
             self.drain_workspace_protocol_intents(runtime_instance);
+            if let Some(delay) = self
+                .runtime_by_instance(runtime_instance)
+                .and_then(|runtime| runtime.workspace_ui.protocol_retry_delay())
+            {
+                request_workspace_protocol_retry(ctx, delay);
+            }
+        }
+    }
+
+    /// This host adapter is deliberately narrower than drain_workspace_protocol_intents.
+    /// Its only runtime effect is nonblocking owned channel admission; no worker/PTY wait.
+    fn flush_workspace_terminal_protocol_tail(&mut self, ctx: &egui::Context) {
+        let focused =
+            dispatch_terminal_protocol_tail(&mut self.active.workspace_ui, ctx, |command| {
+                self.active.runtime.send_command_owned(command)
+            });
+        if let Some(pane) = focused {
+            self.cancel_terminal_focus_intents();
+            self.active.workspace_ui.arm_terminal_focus(pane);
+        }
+        for runtime in self.warm.values_mut() {
+            dispatch_terminal_protocol_tail(&mut runtime.workspace_ui, ctx, |command| {
+                runtime.runtime.send_command_owned(command)
+            });
         }
     }
 
@@ -23331,6 +24362,7 @@ impl App {
             // 알림을 놓치지 않는다 (codex 리뷰 — 축출 시 receiver drop으로 유실되던 것).
             let events = rt.events.drain();
             self.cloud_agent.observe_input(rt.runtime_instance, &events);
+            self.observe_prompt_admissions(rt.runtime_instance, &events);
             Self::observe_scrollback_policy(&mut rt, &events);
             let approval_events_overflowed = rt.events.take_overflowed();
             if approval_events_overflowed {
@@ -23340,6 +24372,14 @@ impl App {
                 &rt.id,
                 &events,
                 deppy_core::time::unix_secs_i64(),
+            );
+            confirm_composer_draft_deletions(
+                &mut self.composer,
+                &mut self.composer_pending_deletions,
+                &self.egui_ctx,
+                rt.runtime_instance,
+                rt.workspace_ui.mux(),
+                &events,
             );
             Self::record_activity_events(&mut rt, &events);
             self.observe_approval_runtime_events(workspace_id, &events);
@@ -23430,6 +24470,11 @@ impl App {
     /// 워크스페이스의 세션(pane)을 전부 닫는다 — 사이드바 「워크스페이스 종료」 확정 경로.
     /// 워크스페이스 자체(경로·설정·DB 기록)는 보존한다(설정의 「프로젝트 삭제」와 구분).
     fn close_workspace_sessions(&mut self, workspace_id: &str) {
+        revoke_followup_authorizations(
+            &mut self.pty_followup,
+            &self.pending_prompt_deliveries,
+            |target| target.workspace_id == workspace_id,
+        );
         // A Catalog/explicit restore can still be waiting behind dotenv or bounded command
         // delivery while the mux is empty. Drop every local restore owner before deriving the
         // panes to close, otherwise its late completion can recreate a just-closed workspace.
@@ -24167,14 +25212,16 @@ impl App {
         } else {
             self.cloud_agent.release_ended_sessions();
         }
-        // Also project retained answers when the MCP listener is stopped.
-        for rt in std::iter::once(&mut self.active).chain(self.warm.values_mut()) {
-            rt.workspace_ui.cloud_answers = self.cloud_agent.answers.clone();
-        }
-        if self.cloud_agent.server.is_none()
-            && !(self.settings_open
-                && self.settings_category == ui::settings::Category::CloudAgents)
+        if !(self.cloud_agent.needs_target_projection()
+            || self.settings_open && self.settings_category == ui::settings::Category::CloudAgents)
         {
+            let notices = self
+                .cloud_agent
+                .poll_history(|_, _| Err("connection_stopped_no_effect".into()));
+            self.apply_cloud_answer_notices(ctx, notices);
+            for rt in std::iter::once(&mut self.active).chain(self.warm.values_mut()) {
+                rt.workspace_ui.cloud_answers = self.cloud_agent.answers.clone();
+            }
             return;
         }
         let mut targets = Vec::new();
@@ -24233,73 +25280,107 @@ impl App {
                     session,
                     pane: pane.id.clone(),
                     live: !rt.live.exited_sessions.contains(&session),
+                    provider: rt.workspace_ui.agent_provider_for(session),
+                    execution: self
+                        .agent_kinds
+                        .get(&(rt.runtime_instance, session))
+                        .and_then(|agent| agent.execution),
+                    known_ai: rt.workspace_ui.agent_provider_for(session).is_some()
+                        || self
+                            .agent_kinds
+                            .contains_key(&(rt.runtime_instance, session))
+                        || rt.live.session_kinds.get(&session) == Some(&runtime::SpawnKind::Agent),
+                    bracketed_paste: rt.workspace_ui.session_bracketed_paste(session),
                     screen,
                 });
             }
         }
         self.cloud_agent.set_targets(targets);
+        // Completion is polled after exact runtime/pane projection, even after connection stop.
+        let active = &self.active;
+        let warm = &self.warm;
+        let mut send = |target: &crate::cloud_agent::Target, effect: crate::cloud_agent::Effect| {
+            let rt = std::iter::once(active)
+                .chain(warm.values())
+                .find(|rt| rt.runtime_instance == target.runtime && rt.id == target.workspace)
+                .ok_or_else(|| "runtime_changed_no_effect".to_string())?;
+            let valid = cloud_agent_mux(rt).is_some_and(|mux| {
+                crate::cloud_agent::target_matches(
+                    target,
+                    rt.runtime_instance,
+                    &rt.id,
+                    mux,
+                    rt.live.exited_sessions.contains(&target.session),
+                    matches!(
+                        &effect,
+                        crate::cloud_agent::Effect::Input { .. }
+                            | crate::cloud_agent::Effect::PasteInput { .. }
+                    ),
+                )
+            });
+            if !valid {
+                return Err("session_changed_or_closed_no_effect".into());
+            }
+            let command = match effect {
+                crate::cloud_agent::Effect::Input {
+                    operation_id,
+                    bytes,
+                    admission,
+                } => {
+                    return rt
+                        .runtime
+                        .send_guarded_input(target.session, operation_id, bytes, admission)
+                        .map_err(|_| "runtime_queue_rejected_no_effect".to_string());
+                }
+                crate::cloud_agent::Effect::PasteInput {
+                    operation_id,
+                    parts,
+                    admission,
+                } => {
+                    return rt
+                        .runtime
+                        .send_guarded_input_batch(target.session, operation_id, parts, admission)
+                        .map_err(|_| "runtime_queue_rejected_no_effect".to_string());
+                }
+                crate::cloud_agent::Effect::Watch => runtime::RuntimeCommand::SetRemoteViewing {
+                    session: target.session,
+                    viewing: true,
+                    ttl_ms: 15_000,
+                },
+            };
+            rt.runtime
+                .send_command(command)
+                .map_err(|_| "runtime_queue_rejected_no_effect".to_string())
+        };
+        let notices = self.cloud_agent.poll_history(&mut send);
         // Bounded frame work; HTTP wakes the App and each request has a deadline.
         for _ in 0..16 {
             let Some(req) = self.cloud_agent.next_request() else {
                 break;
             };
-            let active = &self.active;
-            let warm = &self.warm;
-            let notice = self.cloud_agent.handle(req, |target, effect| {
-                let rt = std::iter::once(active)
-                    .chain(warm.values())
-                    .find(|rt| rt.runtime_instance == target.runtime && rt.id == target.workspace)
-                    .ok_or_else(|| "runtime_changed_no_effect".to_string())?;
-                let valid = cloud_agent_mux(rt).is_some_and(|mux| {
-                    crate::cloud_agent::target_matches(
-                        target,
-                        rt.runtime_instance,
-                        &rt.id,
-                        mux,
-                        rt.live.exited_sessions.contains(&target.session),
-                        matches!(&effect, crate::cloud_agent::Effect::Input { .. }),
-                    )
-                });
-                if !valid {
-                    return Err("session_changed_or_closed_no_effect".into());
-                }
-                let command = match effect {
-                    crate::cloud_agent::Effect::Input {
-                        operation_id,
-                        bytes,
-                        admission,
-                    } => {
-                        return rt
-                            .runtime
-                            .send_guarded_input(target.session, operation_id, bytes, admission)
-                            .map_err(|_| "runtime_queue_rejected_no_effect".to_string());
-                    }
-                    crate::cloud_agent::Effect::Watch => {
-                        runtime::RuntimeCommand::SetRemoteViewing {
-                            session: target.session,
-                            viewing: true,
-                            ttl_ms: 15_000,
-                        }
-                    }
-                };
-                rt.runtime
-                    .send_command(command)
-                    .map_err(|_| "runtime_queue_rejected_no_effect".to_string())
-            });
-            if let Some(notice) = notice {
-                ctx.request_repaint();
-                self.notifications_ui.on_cloud_answer(
-                    &notice.target.workspace,
-                    &notice.target.id,
-                    &notice.operation_id,
-                    &notice.target.title,
-                    &notice.message,
-                    &self.i18n,
-                );
-            }
+            self.cloud_agent.handle(req, &mut send);
         }
+        self.apply_cloud_answer_notices(ctx, notices);
         for rt in std::iter::once(&mut self.active).chain(self.warm.values_mut()) {
             rt.workspace_ui.cloud_answers = self.cloud_agent.answers.clone();
+        }
+    }
+
+    fn apply_cloud_answer_notices(
+        &mut self,
+        ctx: &egui::Context,
+        notices: Vec<crate::cloud_agent::AnswerNotice>,
+    ) {
+        for notice in notices {
+            ctx.request_repaint();
+            self.notifications_ui.on_cloud_answer(
+                &notice.target.workspace,
+                &notice.target.id,
+                &notice.operation_id,
+                &notice.target.title,
+                &notice.message,
+                &self.i18n,
+            );
         }
     }
 
@@ -27424,6 +28505,17 @@ impl App {
                     StormAction::Resume => runtime::RuntimeCommand::ResumeSession { session },
                     StormAction::Kill => runtime::RuntimeCommand::KillSession { session },
                 };
+                if matches!(action, StormAction::Kill) {
+                    revoke_followup_authorizations(
+                        &mut self.pty_followup,
+                        &self.pending_prompt_deliveries,
+                        |target| {
+                            target.runtime_instance == workspace.runtime_instance
+                                && target.workspace_id == workspace.id
+                                && target.session == session
+                        },
+                    );
+                }
                 if let Err(error) = workspace.runtime.send_command(command) {
                     tracing::warn!(
                         kind = "resource",
@@ -27830,6 +28922,17 @@ impl App {
                 runtime::RuntimeCommand::KillSession { session }
             }
         };
+        if let runtime::RuntimeCommand::KillSession { session } = &command {
+            revoke_followup_authorizations(
+                &mut self.pty_followup,
+                &self.pending_prompt_deliveries,
+                |queued| {
+                    queued.runtime_instance == target.runtime_instance
+                        && queued.workspace_id == target.workspace_id
+                        && queued.session == *session
+                },
+            );
+        }
         let result = if resource_target_matches_runtime(
             &target,
             &self.active.id,
@@ -28447,9 +29550,7 @@ impl App {
     }
 
     fn build_fleet_sessions(&self, text: &i18n::Catalog) -> Vec<crate::fleet::FleetSession> {
-        // 브로드캐스트 직후 낙관적 "작업 중" 윈도우. 감지가 따라잡거나 지나면 실제 상태로.
-        const BROADCAST_WORKING_WINDOW: std::time::Duration = std::time::Duration::from_secs(8);
-        let now = std::time::Instant::now();
+        // Execution status remains detector/hook-owned; PTY admission is only an input receipt.
         let empty_activity: std::collections::HashMap<
             runtime::SessionId,
             crate::agent_transcript::AgentActivity,
@@ -28535,22 +29636,21 @@ impl App {
                     .iter()
                     .find(|(ws, s, _)| ws == &workspace.id && *s == session)
                     .and_then(|(_, _, message)| message.clone());
-                // 감지 상태. 브로드캐스트 직후 아직 Idle/Off로 보이면(감지 지연/​warm 미추적)
-                // 윈도우 안에서 Active로 덮는다 — Waiting/Done/Error 등 확정 상태는 그대로 둔다.
                 use crate::agent_surface::AgentVisualState;
-                let detected =
+                let state =
                     AgentVisualState::from_pty_with_agent(entry.status, entry.agent_line.is_some());
-                let optimistic = matches!(detected, AgentVisualState::Idle | AgentVisualState::Off)
-                    && self
-                        .broadcast_working
-                        .get(&(workspace.id.clone(), session))
-                        .is_some_and(|sent| now.duration_since(*sent) < BROADCAST_WORKING_WINDOW);
-                let state = if optimistic {
-                    AgentVisualState::Active
-                } else {
-                    detected
-                };
                 out.push(crate::fleet::FleetSession {
+                    prompt_target: self
+                        .agent_kinds
+                        .get(&(runtime.runtime_instance, session))
+                        .and_then(|agent| agent.execution)
+                        .filter(|execution| execution.is_current())
+                        .map(|execution| crate::fleet::FleetPromptTarget {
+                            workspace_id: workspace.id.clone(),
+                            runtime_instance: runtime.runtime_instance,
+                            session,
+                            execution,
+                        }),
                     last_output_at: entry.last_output_at,
                     followup: self
                         .pty_followup
@@ -28630,6 +29730,7 @@ impl App {
             .then(|| self.structured_blocked_since.get(&row.session_id).copied())
             .flatten();
             out.push(crate::fleet::FleetSession {
+                prompt_target: None,
                 active_workspace: row.workspace_id.as_deref() == Some(self.active.id.as_str()),
                 workspace_id,
                 workspace_name,
@@ -28762,14 +29863,97 @@ impl App {
     /// 영역이 자동으로 줄어든다(통합 도크 — 팝업/오버레이 금지 사양). 설정 OFF면
     /// 호출측이 아예 부르지 않는다(Panel 미생성 — 리소스 0).
     /// MCP 목록은 Connector의 bounded immutable overview/단일 tool page만 읽는다.
-    /// 프롬프트 라이브러리를 파일에 저장한다(저장/편집/삭제 후). 실패는 경고만 남기고
-    /// 앱을 막지 않는다 — 사용자 데이터라 다음 저장에서 복구된다.
-    fn persist_prompt_library(&self) {
-        if let Err(error) = self.prompt_library.save(&self.prompt_library_path) {
-            tracing::warn!(
-                path = %self.prompt_library_path.display(),
-                "프롬프트 라이브러리 저장 실패: {error:#}"
-            );
+    /// Accepted data changes invalidate palette caches; save retries have a separate revision.
+    fn mark_prompt_library_changed(&mut self) {
+        if let Some(revision) = self.prompt_library_revision.checked_add(1) {
+            self.prompt_library_revision = revision;
+            self.persist_prompt_library();
+        } else {
+            self.prompt_library_edit_error =
+                Some(crate::prompt_library::PromptLibraryError::StaleRevision);
+        }
+    }
+
+    /// Render records a dirty intent; logic owns worker admission and snapshot allocation.
+    fn persist_prompt_library(&mut self) {
+        self.pending_prompt_library_save = true;
+        self.prompt_library_edit_error = None;
+        self.egui_ctx.request_repaint();
+    }
+
+    fn pump_composer_checkpoint(&mut self, force: bool) {
+        let revision = self.composer.draft_revision();
+        if !force
+            && revision == self.composer_checkpoint_revision
+            && self.composer_checkpoint_at.is_none()
+        {
+            return;
+        }
+        if self
+            .composer_draft_save_worker
+            .status()
+            .write_blocking_error()
+            .is_some()
+        {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let deadline = *self
+            .composer_checkpoint_at
+            .get_or_insert_with(|| now + std::time::Duration::from_millis(500));
+        if !force && now < deadline {
+            self.egui_ctx.request_repaint_after(deadline - now);
+            return;
+        }
+        self.composer_checkpoint_at = None;
+        // Force at shutdown only if there is an actual uncheckpointed edit.
+        if force && revision == self.composer_checkpoint_revision {
+            return;
+        }
+        let Some(save_revision) = self.composer_save_revision.checked_add(1) else {
+            self.composer_draft_error = Some(crate::composer_drafts::DraftError::StaleRevision);
+            return;
+        };
+        self.composer_save_revision = save_revision;
+        let snapshot = self.composer.checkpoint();
+        match self
+            .composer_draft_save_worker
+            .request(save_revision, snapshot)
+        {
+            Ok(()) => {
+                self.composer_checkpoint_revision = revision;
+                self.composer_draft_error = None
+            }
+            Err(error) => {
+                self.composer_draft_error = Some(error);
+                self.composer_checkpoint_revision = revision
+            }
+        }
+    }
+
+    fn pump_prompt_library_save(&mut self) {
+        if !std::mem::take(&mut self.pending_prompt_library_save) {
+            return;
+        }
+        if let Some(error) = self
+            .prompt_library_save_worker
+            .status()
+            .write_blocking_error()
+        {
+            self.prompt_library_edit_error = Some(error);
+            return;
+        }
+        let Some(revision) = self.prompt_library_save_revision.checked_add(1) else {
+            self.prompt_library_edit_error =
+                Some(crate::prompt_library::PromptLibraryError::StaleRevision);
+            return;
+        };
+        self.prompt_library_save_revision = revision;
+        if let Err(error) = self
+            .prompt_library_save_worker
+            .request(revision, Arc::new(self.prompt_library.clone()))
+        {
+            self.prompt_library_edit_error = Some(error);
         }
     }
 
@@ -28788,6 +29972,29 @@ impl App {
             || self.active.id.clone(),
             |target| target.workspace_id.clone(),
         );
+        let composer_runtime = match composer_target.as_ref() {
+            Some(AppTerminalInputTarget::Attached(target)) => self
+                .warm
+                .get(&target.workspace_id)
+                .filter(|runtime| runtime.runtime_instance == target.runtime_instance),
+            _ => Some(&self.active),
+        };
+        let composer_generation = composer_runtime.map_or(0, |runtime| runtime.runtime_instance);
+        let composer_session = match composer_target.as_ref() {
+            Some(AppTerminalInputTarget::Primary { session, .. }) => Some(*session),
+            Some(AppTerminalInputTarget::Attached(target)) => Some(target.session),
+            None => None,
+        };
+        let composer_pane = composer_runtime.and_then(cloud_agent_mux).and_then(|mux| {
+            mux.tabs.iter().flat_map(|tab| &tab.panes).find(|pane| {
+                composer_session.is_some_and(|session| pane.session_id == Some(session))
+                    || (composer_session.is_none() && mux.focused_pane.as_ref() == Some(&pane.id))
+            })
+        });
+        let composer_draft_key = composer_session_draft_key(&composer_workspace_id, composer_pane);
+        let draft_save_status = self.composer_draft_save_worker.status();
+        self.composer
+            .set_read_only(draft_save_status.write_blocking_error().is_some());
         let composer_agent = match composer_target.as_ref() {
             Some(AppTerminalInputTarget::Primary { session, .. }) => {
                 self.active.workspace_ui.agent_provider_for(*session)
@@ -28799,6 +30006,39 @@ impl App {
                 .and_then(|runtime| runtime.workspace_ui.agent_provider_for(target.session)),
             None => None,
         };
+        let composer_context =
+            composer_target
+                .as_ref()
+                .map_or(PromptInputContext::ManualShell, |target| {
+                    let (runtime_instance, session) = match target {
+                        AppTerminalInputTarget::Primary {
+                            runtime_instance,
+                            session,
+                            ..
+                        } => (*runtime_instance, *session),
+                        AppTerminalInputTarget::Attached(target) => {
+                            (target.runtime_instance, target.session)
+                        }
+                    };
+                    self.agent_kinds
+                        .get(&(runtime_instance, session))
+                        .and_then(|agent| agent.execution)
+                        .map(PromptInputContext::Ai)
+                        .unwrap_or(
+                            if composer_agent.is_some()
+                                || self.runtime_by_instance(runtime_instance).is_some_and(
+                                    |runtime| {
+                                        runtime.live.session_kinds.get(&session)
+                                            == Some(&runtime::SpawnKind::Agent)
+                                    },
+                                )
+                            {
+                                PromptInputContext::UnconfirmedAi
+                            } else {
+                                PromptInputContext::ManualShell
+                            },
+                        )
+                });
         let composer_root = if attached_focus_target.is_some() {
             self.workspace_tree_root(&composer_workspace_id)
         } else {
@@ -28809,6 +30049,12 @@ impl App {
         // enabled 여부도 미리 복사한다(클로저 안에서 self.config를 못 읽음).
         let mut open_palette = false;
         let prompt_library_enabled = self.config.ui.prompt_library_enabled;
+        let prompt_save_status = self.prompt_library_save_worker.status();
+        let prompt_edit_error = self.prompt_library_edit_error;
+        let prompt_save_path = self.prompt_library_save_worker.path();
+        let mut retry_prompt_save = false;
+        let prompt_library_readonly = prompt_save_status.write_blocking_error().is_some();
+        self.prompt_palette.set_read_only(prompt_library_readonly);
         let composer_action = {
             let dock_frame =
                 ui::designall::structural_frame(ui.visuals()).inner_margin(egui::Margin {
@@ -28820,6 +30066,8 @@ impl App {
             let composer = &mut self.composer;
             let composer_ctx = ui::composer::ComposerContext {
                 workspace_id: &composer_workspace_id,
+                draft_key: &composer_draft_key,
+                runtime_generation: composer_generation,
                 send_key: self.config.ui.composer_send_key,
                 can_send: composer_target.is_some(),
                 agent: composer_agent,
@@ -28846,7 +30094,23 @@ impl App {
                             {
                                 open_palette = true;
                             }
+                            retry_prompt_save = render_prompt_library_save_status(
+                                ui,
+                                text,
+                                prompt_save_status,
+                                prompt_edit_error,
+                                prompt_save_path,
+                            );
                         });
+                    }
+                    if render_composer_draft_save_status(
+                        ui,
+                        text,
+                        draft_save_status,
+                        self.composer_draft_error,
+                        self.composer_draft_save_worker.path(),
+                    ) {
+                        self.composer_checkpoint_at = Some(std::time::Instant::now());
                     }
                     composer.render(ui, text, &composer_ctx)
                 });
@@ -28862,6 +30126,9 @@ impl App {
             );
             dock_response.inner
         };
+        if retry_prompt_save {
+            self.persist_prompt_library();
+        }
         // 설정에서 꺼져 있으면(PR-7) 팔레트를 그리지 않는다. 켜져 있던 중 끄면 닫는다.
         if prompt_library_enabled {
             // 이미 열려 있으면 재초기화하지 않는다 — 파라미터 입력 중 재클릭으로 작업이
@@ -28872,25 +30139,56 @@ impl App {
             // 팔레트는 떠 있는 Window라 도크와 독립적으로 그린다. intent를 받으면 App이
             // 실제 부수효과를 수행한다(leaf+intent+host I/O 경계): 삽입=컴포저 버퍼 쓰기,
             // 저장/삭제=라이브러리 변경 + 파일 영속화. composer_draft는 "현재 내용 저장" 프리필용.
-            let composer_draft = self
-                .composer
-                .current_text(&composer_workspace_id)
-                .to_owned();
-            match self
-                .prompt_palette
-                .render(ui.ctx(), &self.prompt_library, &composer_draft, text)
-            {
+            let palette_action = if self.prompt_palette.is_open() {
+                self.prompt_palette.render(
+                    ui.ctx(),
+                    &self.prompt_library,
+                    self.prompt_library_revision,
+                    self.composer.current_text(&composer_draft_key),
+                    text,
+                )
+            } else {
+                None
+            };
+            match palette_action {
                 Some(ui::prompt_palette::PromptPaletteAction::Insert(prompt_text)) => {
-                    self.composer
-                        .insert_text(&composer_workspace_id, &prompt_text);
+                    self.composer.insert_text(&composer_draft_key, &prompt_text);
                 }
-                Some(ui::prompt_palette::PromptPaletteAction::Upsert(prompt)) => {
-                    self.prompt_library.upsert(prompt);
-                    self.persist_prompt_library();
+                Some(ui::prompt_palette::PromptPaletteAction::Upsert { prompt, creating }) => {
+                    let valid = if let Some(error) = self
+                        .prompt_library_save_worker
+                        .status()
+                        .write_blocking_error()
+                    {
+                        Err(error)
+                    } else {
+                        self.prompt_library.validate_upsert(&prompt)
+                    };
+                    match valid {
+                        Ok(()) => {
+                            if self.prompt_library.get(&prompt.id) != Some(&prompt) {
+                                self.prompt_library.upsert(prompt);
+                                self.mark_prompt_library_changed();
+                            }
+                        }
+                        Err(error) => {
+                            self.prompt_palette
+                                .restore_rejected_prompt(prompt, creating);
+                            self.prompt_library_edit_error = Some(error);
+                        }
+                    }
                 }
                 Some(ui::prompt_palette::PromptPaletteAction::Delete(id)) => {
-                    self.prompt_library.delete(&id);
-                    self.persist_prompt_library();
+                    if let Some(error) = self
+                        .prompt_library_save_worker
+                        .status()
+                        .write_blocking_error()
+                    {
+                        self.prompt_library_edit_error = Some(error);
+                    } else if self.prompt_library.get(&id).is_some() {
+                        self.prompt_library.delete(&id);
+                        self.mark_prompt_library_changed();
+                    }
                 }
                 None => {}
             }
@@ -28899,13 +30197,18 @@ impl App {
         }
         match composer_action {
             Some(ui::composer::ComposerAction::Send(submission)) => {
-                let (prompt, history) = submission.into_parts();
-                if let Some(target) = composer_target
-                    && self.stage_workspace_controller_action(
-                        WorkspaceControllerAction::ComposerPrompt { target, prompt },
-                    )
-                {
-                    self.pending_composer_history = Some(history);
+                let required_draft_revision = submission.required_draft_revision();
+                let (prompt, _, submission_id) = submission.into_parts();
+                if stage_composer_prompt_action(
+                    &mut self.pending_workspace_controller_action,
+                    &mut self.composer,
+                    composer_target.map(|target| (target, composer_context)),
+                    composer_draft_key.clone(),
+                    prompt,
+                    submission_id,
+                    required_draft_revision,
+                ) {
+                    self.egui_ctx.request_repaint();
                 }
             }
             Some(ui::composer::ComposerAction::RequestMcpToolPage { server_id, offset }) => {
@@ -28930,7 +30233,7 @@ impl App {
                         Some(AppHostIoAction::ComposerContextFile(request));
                     ui.ctx().request_repaint();
                 } else {
-                    let active_workspace = self.active.id.clone();
+                    let active_workspace = self.composer.active_draft_key().to_owned();
                     let _ = self.composer.complete_context_file(
                         &self.egui_ctx,
                         request,
@@ -28945,7 +30248,7 @@ impl App {
                         Some(AppHostIoAction::ComposerClipboard(request));
                     ui.ctx().request_repaint();
                 } else {
-                    let active_workspace = self.active.id.clone();
+                    let active_workspace = self.composer.active_draft_key().to_owned();
                     let _ = self.composer.complete_clipboard_attachment(
                         &self.egui_ctx,
                         request,
@@ -28958,107 +30261,553 @@ impl App {
         }
     }
 
-    /// 컴포저 프롬프트를 렌더 시점에 캡처한 exact runtime/session에 주입한다.
-    /// bracketed-paste TUI에는 짧은 한 줄도 명시적 paste 본문과 별도 submit CR로
-    /// 보낸다. Codex 감지 워커가 아직 결과를 내기 전에는 일반 키 입력 경로를 타던
-    /// 타이밍 의존을 없애고, PTY writer의 FIFO 순서로 두 입력을 전달한다.
-    /// 주입 전 clear_selection은 WriteInput 직접 전송 관례(inject_waiting_answer와 동일).
-    fn send_composer_prompt(&mut self, target: &AppTerminalInputTarget, prompt: &str) {
-        match target {
+    /// Checkpoint the Pending marker before any PTY effect. The single deferred slot
+    /// shares the retained receipt Arc and never holds workspace/modal controls hostage.
+    fn defer_composer_prompt(
+        &mut self,
+        target: AppTerminalInputTarget,
+        context: PromptInputContext,
+        prompt: Arc<str>,
+        draft_key: String,
+        submission_id: u64,
+        required_draft_revision: u64,
+    ) {
+        let mut pending = PendingDurableComposerPrompt {
+            target,
+            context,
+            prompt,
+            draft_key,
+            submission_id,
+            required_save_revision: 0,
+        };
+        if self.pending_durable_composer_prompt.is_some()
+            || self.composer.draft_revision() < required_draft_revision
+            || !self.composer.pending_submission_matches(
+                &pending.draft_key,
+                pending.submission_id,
+                &pending.prompt,
+                pending.generation(),
+            )
+        {
+            self.reject_unqueued_composer_prompt(pending);
+            return;
+        }
+        self.pump_composer_checkpoint(true);
+        if self.composer_checkpoint_revision < required_draft_revision
+            || self.composer_draft_error.is_some()
+        {
+            self.reject_unqueued_composer_prompt(pending);
+            return;
+        }
+        pending.required_save_revision = self.composer_save_revision;
+        self.pending_durable_composer_prompt = Some(pending);
+    }
+
+    fn reject_unqueued_composer_prompt(&mut self, pending: PendingDurableComposerPrompt) {
+        self.composer.reject_unqueued_submission(
+            &pending.draft_key,
+            pending.submission_id,
+            &pending.prompt,
+            pending.generation(),
+        );
+        let workspace_id = pending.workspace_id();
+        self.notifications_ui.on_workspace_error(
+            workspace_id,
+            workspace_id,
+            ui::workspace::WorkspaceErrorKind::Other,
+            &self.i18n.t("composer.delivery.rejected", &[]),
+            &self.i18n,
+        );
+        self.egui_ctx.request_repaint();
+    }
+
+    fn poll_durable_composer_prompt(&mut self) {
+        let Some((pending, decision)) = take_ready_durable_composer_prompt(
+            &mut self.pending_durable_composer_prompt,
+            &self.composer,
+            self.composer_draft_save_worker.status(),
+            self.composer_draft_error,
+        ) else {
+            return;
+        };
+        match decision {
+            ComposerCheckpointDecision::Wait => {
+                unreachable!("waiting action stays in the bounded slot")
+            }
+            ComposerCheckpointDecision::Reject => self.reject_unqueued_composer_prompt(pending),
+            ComposerCheckpointDecision::Dispatch => {
+                // Take-before-dispatch: a delayed repaint/ACK cannot repeat this action.
+                self.composer.mark_submission_dispatched(
+                    &pending.draft_key,
+                    pending.submission_id,
+                    &pending.prompt,
+                    pending.generation(),
+                );
+                self.send_composer_prompt(
+                    &pending.target,
+                    pending.context,
+                    pending.prompt,
+                    pending.draft_key,
+                    pending.submission_id,
+                );
+            }
+        }
+    }
+
+    /// Exact identity validation precedes one tracked, atomic paste/submit reservation.
+    fn send_composer_prompt(
+        &mut self,
+        target: &AppTerminalInputTarget,
+        context: PromptInputContext,
+        prompt: Arc<str>,
+        draft_key: String,
+        submission_id: u64,
+    ) {
+        let origin = PromptDeliveryOrigin::Composer {
+            draft_key,
+            submission_id,
+        };
+        let identity = match target {
             AppTerminalInputTarget::Primary {
                 workspace_id,
                 runtime_instance,
                 session,
             } => {
-                let Some(runtime) = self.runtime_by_instance_mut(*runtime_instance) else {
-                    return;
-                };
-                if runtime.id != *workspace_id
-                    || !runtime.workspace_ui.mux().is_some_and(|mux| {
-                        mux.tabs
-                            .iter()
-                            .flat_map(|tab| &tab.panes)
-                            .any(|pane| pane.session_id == Some(*session))
-                    })
-                {
-                    return;
-                }
-                Self::write_prompt_to_session(
-                    &mut runtime.workspace_ui,
-                    &runtime.runtime,
-                    *session,
-                    prompt,
-                );
+                let valid =
+                    self.runtime_by_instance_mut(*runtime_instance)
+                        .is_some_and(|runtime| {
+                            runtime.id == *workspace_id
+                                && runtime.workspace_ui.mux().is_some_and(|mux| {
+                                    mux.tabs
+                                        .iter()
+                                        .flat_map(|tab| &tab.panes)
+                                        .any(|pane| pane.session_id == Some(*session))
+                                })
+                        });
+                valid.then_some((workspace_id.clone(), *runtime_instance, *session))
             }
-            AppTerminalInputTarget::Attached(target) => {
-                let Some(runtime) = self.warm.get_mut(&target.workspace_id) else {
-                    return;
-                };
-                if runtime.runtime_instance != target.runtime_instance
-                    || runtime.workspace_ui.mux().is_none_or(|mux| {
-                        attached_target_relation(mux, target)
-                            != ui::cross_workspace::LiveTargetRelation::Exact
-                    })
-                {
-                    return;
-                }
-                Self::write_prompt_to_session(
-                    &mut runtime.workspace_ui,
-                    &runtime.runtime,
-                    target.session,
-                    prompt,
-                );
-            }
-        }
-    }
-
-    /// 브로드캐스트(기능2×1): 특정 (workspace, session)에 프롬프트를 컴포저 Send와 동일한
-    /// 경로로 주입한다. active/warm 런타임을 라우팅하고, suspended/사라진 워크스페이스는
-    /// runtime이 없어 자연히 no-op(inject_waiting_answer와 같은 관례).
-    fn broadcast_prompt_to(
-        &mut self,
-        workspace_id: &str,
-        session: runtime::SessionId,
-        prompt: &str,
-    ) {
-        if workspace_id == self.active.id {
-            Self::write_prompt_to_session(
-                &mut self.active.workspace_ui,
-                &self.active.runtime,
+            AppTerminalInputTarget::Attached(target) => self
+                .warm
+                .get(&target.workspace_id)
+                .filter(|runtime| {
+                    runtime.runtime_instance == target.runtime_instance
+                        && runtime.workspace_ui.mux().is_some_and(|mux| {
+                            attached_target_relation(mux, target)
+                                == ui::cross_workspace::LiveTargetRelation::Exact
+                        })
+                })
+                .map(|_| {
+                    (
+                        target.workspace_id.clone(),
+                        target.runtime_instance,
+                        target.session,
+                    )
+                }),
+        };
+        if let Some((workspace_id, runtime_instance, session)) = identity {
+            self.queue_prompt_delivery(
+                workspace_id,
+                runtime_instance,
                 session,
                 prompt,
+                origin,
+                context,
             );
-        } else if let Some(rt) = self.warm.get_mut(workspace_id) {
-            Self::write_prompt_to_session(&mut rt.workspace_ui, &rt.runtime, session, prompt);
+        } else if let PromptDeliveryOrigin::Composer {
+            draft_key,
+            submission_id,
+        } = origin
+        {
+            self.composer.settle_submission(
+                &draft_key,
+                submission_id,
+                &prompt,
+                ui::composer::PromptAdmissionOutcome::Rejected,
+            );
         }
     }
 
-    /// 한 세션에 프롬프트를 주입한다 — send_composer_prompt와 동일한 bracketed-paste + CR
-    /// 계획을 쓰되 대상 세션을 인자로 받아 active/warm 어디든 보낸다.
+    fn broadcast_prompt_to(
+        &mut self,
+        target: &crate::fleet::FleetPromptTarget,
+        prompt: &str,
+        origin: PromptDeliveryOrigin,
+    ) {
+        self.queue_prompt_delivery(
+            target.workspace_id.clone(),
+            target.runtime_instance,
+            target.session,
+            Arc::from(prompt),
+            origin,
+            PromptInputContext::Ai(target.execution),
+        );
+    }
+
+    fn queue_prompt_delivery(
+        &mut self,
+        workspace_id: String,
+        runtime_instance: u64,
+        session: runtime::SessionId,
+        prompt: Arc<str>,
+        origin: PromptDeliveryOrigin,
+        context: PromptInputContext,
+    ) {
+        // Unknown operations keep their exact target and payload until a correlated late ACK
+        // or an explicit new action for that same source. No automatic retry gets a new ID.
+        self.pending_prompt_deliveries.retain(|_, pending| {
+            !(pending.unknown
+                && pending.workspace_id == workspace_id
+                && pending.session == session
+                && match (&pending.origin, &origin) {
+                    (
+                        PromptDeliveryOrigin::Composer { draft_key: old, .. },
+                        PromptDeliveryOrigin::Composer { draft_key: new, .. },
+                    ) => old == new,
+                    (
+                        PromptDeliveryOrigin::FollowUp { .. },
+                        PromptDeliveryOrigin::FollowUp { .. },
+                    )
+                    | (PromptDeliveryOrigin::Broadcast, PromptDeliveryOrigin::Broadcast)
+                    | (PromptDeliveryOrigin::SelectedPaste, PromptDeliveryOrigin::SelectedPaste) => true,
+                    _ => false,
+                })
+        });
+        if self.pending_prompt_deliveries.len() >= PROMPT_DELIVERY_MAX_PENDING
+            || self
+                .pending_prompt_deliveries
+                .values()
+                .map(|pending| pending.prompt.len())
+                .sum::<usize>()
+                .saturating_add(prompt.len())
+                > PROMPT_DELIVERY_MAX_BYTES
+        {
+            self.reject_prompt_origin(
+                &workspace_id,
+                session,
+                &prompt,
+                &origin,
+                ui::composer::PromptAdmissionOutcome::Rejected,
+            );
+            return;
+        }
+        let execution = match context {
+            PromptInputContext::ManualShell => None,
+            PromptInputContext::Ai(execution)
+                if execution.is_current()
+                    && self
+                        .agent_kinds
+                        .get(&(runtime_instance, session))
+                        .and_then(|agent| agent.execution)
+                        == Some(execution) =>
+            {
+                Some(execution)
+            }
+            PromptInputContext::Ai(_) | PromptInputContext::UnconfirmedAi => {
+                self.reject_prompt_origin(
+                    &workspace_id,
+                    session,
+                    &prompt,
+                    &origin,
+                    ui::composer::PromptAdmissionOutcome::Rejected,
+                );
+                return;
+            }
+        };
+        let automatic = matches!(
+            origin,
+            PromptDeliveryOrigin::Broadcast | PromptDeliveryOrigin::FollowUp { .. }
+        );
+        let submit = !matches!(origin, PromptDeliveryOrigin::SelectedPaste);
+        let admission = execution.map(|execution| {
+            let deadline = std::time::Instant::now() + PROMPT_ADMISSION_TIMEOUT;
+            if let PromptDeliveryOrigin::FollowUp { queued } = &origin {
+                followup_input_admission(queued, deadline)
+            } else if submit {
+                execution.input_admission(automatic, deadline)
+            } else {
+                execution.input_admission_for(runtime::AgentInputIntent::ExplicitAppend, deadline)
+            }
+        });
+        let operation_id = format!("prompt:{}", uuid::Uuid::new_v4());
+        let queued = self
+            .runtime_by_instance_mut(runtime_instance)
+            .filter(|runtime| runtime.id == workspace_id)
+            .ok_or_else(|| anyhow::anyhow!("prompt_target_stale"))
+            .and_then(|runtime| {
+                Self::write_prompt_to_session(
+                    &mut runtime.workspace_ui,
+                    &runtime.runtime,
+                    session,
+                    &prompt,
+                    operation_id.clone(),
+                    admission,
+                    submit,
+                )
+            });
+        if queued.is_err() {
+            self.reject_prompt_origin(
+                &workspace_id,
+                session,
+                &prompt,
+                &origin,
+                ui::composer::PromptAdmissionOutcome::Rejected,
+            );
+            return;
+        }
+        let deadline = std::time::Instant::now() + PROMPT_ADMISSION_TIMEOUT;
+        self.pending_prompt_deliveries.insert(
+            operation_id,
+            PendingPromptDelivery {
+                workspace_id,
+                runtime_instance,
+                session,
+                prompt,
+                origin,
+                deadline,
+                unknown: false,
+            },
+        );
+        self.egui_ctx
+            .request_repaint_after(PROMPT_ADMISSION_TIMEOUT);
+    }
+
+    /// Public encoding plan is shared with the explicit remote paste path. The command
+    /// keeps separate body/CR writer boundaries but reserves both parts before either.
     fn write_prompt_to_session(
         workspace_ui: &mut ui::workspace::WorkspaceUi,
         runtime: &InProcessRuntimeClient,
         session: runtime::SessionId,
         prompt: &str,
-    ) {
-        let bracketed = workspace_ui.session_bracketed_paste(session);
-        let provider = workspace_ui.agent_provider_for(session);
+        operation_id: String,
+        admission: Option<runtime::InputAdmission>,
+        submit: bool,
+    ) -> anyhow::Result<()> {
+        let parts = plan_prompt_delivery(workspace_ui, session, prompt, submit)
+            .ok_or_else(|| anyhow::anyhow!("prompt_empty"))?
+            .into_parts();
+        if let Some(admission) = admission {
+            runtime.send_guarded_input_batch(session, operation_id, parts, admission)?;
+        } else {
+            runtime.send_command(runtime::RuntimeCommand::WriteInputBatchTracked {
+                session,
+                operation_id,
+                parts,
+            })?;
+        }
         workspace_ui.clear_selection(session);
-        let Some(plan) = ui::composer::plan_composer_input(prompt, true, bracketed, provider)
-        else {
-            return;
-        };
-        let writes = match plan {
-            ui::composer::ComposerInputPlan::Single(bytes) => vec![bytes],
-            ui::composer::ComposerInputPlan::BracketedPaste { body, submit } => vec![body, submit],
-        };
-        for bytes in writes {
-            if let Err(e) =
-                runtime.send_command(runtime::RuntimeCommand::WriteInput { session, bytes })
-            {
-                tracing::warn!("브로드캐스트 전송 실패: {e:#}");
-                return;
+        Ok(())
+    }
+
+    fn reject_prompt_origin(
+        &mut self,
+        workspace_id: &str,
+        session: runtime::SessionId,
+        prompt: &str,
+        origin: &PromptDeliveryOrigin,
+        outcome: ui::composer::PromptAdmissionOutcome,
+    ) {
+        match origin {
+            PromptDeliveryOrigin::Composer {
+                draft_key,
+                submission_id,
+            } => {
+                self.composer
+                    .settle_submission(draft_key, *submission_id, prompt, outcome);
             }
+            PromptDeliveryOrigin::FollowUp { queued } => {
+                settle_followup_admission(
+                    &mut self.pty_followup,
+                    &(workspace_id.to_owned(), session),
+                    queued,
+                    outcome,
+                );
+            }
+            PromptDeliveryOrigin::Broadcast | PromptDeliveryOrigin::SelectedPaste => {}
+        }
+        let key = if outcome == ui::composer::PromptAdmissionOutcome::Unknown {
+            "composer.delivery.unknown"
+        } else {
+            "composer.delivery.rejected"
+        };
+        self.notifications_ui.on_workspace_error(
+            workspace_id,
+            workspace_id,
+            ui::workspace::WorkspaceErrorKind::Other,
+            &self.i18n.t(key, &[]),
+            &self.i18n,
+        );
+    }
+
+    fn observe_prompt_admissions(
+        &mut self,
+        runtime_instance: u64,
+        events: &[runtime::RuntimeEvent],
+    ) {
+        for event in events {
+            let runtime::RuntimeEvent::InputAdmitted {
+                session,
+                operation_id,
+                result,
+            } = event
+            else {
+                continue;
+            };
+            if self
+                .pending_prompt_deliveries
+                .get(operation_id)
+                .is_none_or(|pending| !pending.acknowledges(runtime_instance, *session))
+            {
+                continue;
+            }
+            if matches!(result, Err(pty::PtyInputRejectReason::AdmissionUnknown)) {
+                let pending = self
+                    .pending_prompt_deliveries
+                    .get_mut(operation_id)
+                    .expect("matched operation");
+                pending.unknown = true;
+                let (workspace_id, session, prompt, origin) = (
+                    pending.workspace_id.clone(),
+                    pending.session,
+                    Arc::clone(&pending.prompt),
+                    pending.origin.clone(),
+                );
+                self.reject_prompt_origin(
+                    &workspace_id,
+                    session,
+                    &prompt,
+                    &origin,
+                    ui::composer::PromptAdmissionOutcome::Unknown,
+                );
+                continue;
+            }
+            let pending = self
+                .pending_prompt_deliveries
+                .remove(operation_id)
+                .expect("matched operation");
+            if let Err(reason) = result {
+                let outcome = if *reason == pty::PtyInputRejectReason::AdmissionUnknown {
+                    ui::composer::PromptAdmissionOutcome::Unknown
+                } else {
+                    ui::composer::PromptAdmissionOutcome::Rejected
+                };
+                record_prompt_receipt(
+                    &mut self.recent_prompt_receipts,
+                    operation_id.clone(),
+                    &pending,
+                    outcome,
+                );
+                self.reject_prompt_origin(
+                    &pending.workspace_id,
+                    pending.session,
+                    &pending.prompt,
+                    &pending.origin,
+                    outcome,
+                );
+                continue;
+            }
+            match &pending.origin {
+                PromptDeliveryOrigin::Composer {
+                    draft_key,
+                    submission_id,
+                } => {
+                    if let Some(history) = self.composer.settle_submission(
+                        draft_key,
+                        *submission_id,
+                        &pending.prompt,
+                        ui::composer::PromptAdmissionOutcome::Accepted,
+                    ) {
+                        self.pending_composer_history = Some(history);
+                    }
+                }
+                PromptDeliveryOrigin::FollowUp { queued } => {
+                    settle_followup_admission(
+                        &mut self.pty_followup,
+                        &(pending.workspace_id.clone(), pending.session),
+                        queued,
+                        ui::composer::PromptAdmissionOutcome::Accepted,
+                    );
+                }
+                PromptDeliveryOrigin::Broadcast | PromptDeliveryOrigin::SelectedPaste => {}
+            }
+            record_prompt_receipt(
+                &mut self.recent_prompt_receipts,
+                operation_id.clone(),
+                &pending,
+                ui::composer::PromptAdmissionOutcome::Accepted,
+            );
+        }
+    }
+
+    fn retire_prompt_delivery_targets(&mut self) {
+        let active = &self.active;
+        let warm = &self.warm;
+        let retired =
+            take_retired_prompt_deliveries(&mut self.pending_prompt_deliveries, |pending| {
+                let runtime = std::iter::once(active)
+                    .chain(warm.values())
+                    .find(|runtime| {
+                        runtime.runtime_instance == pending.runtime_instance
+                            && runtime.id == pending.workspace_id
+                    });
+                runtime.is_some_and(|runtime| {
+                    !runtime.live.exited_sessions.contains(&pending.session)
+                        && runtime.workspace_ui.mux().is_none_or(|mux| {
+                            mux.tabs
+                                .iter()
+                                .flat_map(|tab| &tab.panes)
+                                .any(|pane| pane.session_id == Some(pending.session))
+                        })
+                })
+            });
+        for (id, pending) in retired {
+            record_prompt_receipt(
+                &mut self.recent_prompt_receipts,
+                id,
+                &pending,
+                ui::composer::PromptAdmissionOutcome::Unknown,
+            );
+            self.reject_prompt_origin(
+                &pending.workspace_id,
+                pending.session,
+                &pending.prompt,
+                &pending.origin,
+                ui::composer::PromptAdmissionOutcome::Unknown,
+            );
+        }
+    }
+
+    fn expire_prompt_deliveries(&mut self) {
+        let now = std::time::Instant::now();
+        let expired = self
+            .pending_prompt_deliveries
+            .iter()
+            .filter(|(_, pending)| !pending.unknown && now >= pending.deadline)
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for id in expired {
+            let pending = self
+                .pending_prompt_deliveries
+                .get_mut(&id)
+                .expect("expired operation");
+            if !pending.mark_unknown_if_expired(now) {
+                continue;
+            }
+            let (workspace_id, session, prompt, origin) = (
+                pending.workspace_id.clone(),
+                pending.session,
+                Arc::clone(&pending.prompt),
+                pending.origin.clone(),
+            );
+            self.reject_prompt_origin(
+                &workspace_id,
+                session,
+                &prompt,
+                &origin,
+                ui::composer::PromptAdmissionOutcome::Unknown,
+            );
+        }
+        if let Some(delay) = next_prompt_admission_wake(&self.pending_prompt_deliveries, now) {
+            self.egui_ctx.request_repaint_after(delay);
         }
     }
 
@@ -29323,6 +31072,16 @@ impl App {
     /// eframe renderer feature와 무관한 공통 종료 경로. `App::on_exit` 시그니처만
     /// `glow` feature에 따라 달라지므로 실제 정리는 여기 한 번만 유지한다.
     fn shutdown_on_exit(&mut self) {
+        revoke_followup_authorizations(
+            &mut self.pty_followup,
+            &self.pending_prompt_deliveries,
+            |_| true,
+        );
+        // A last render edit may not have reached logic yet. Admit and drain it before exit.
+        self.pump_prompt_library_save();
+        self.prompt_library_save_worker.shutdown();
+        self.pump_composer_checkpoint(true);
+        self.composer_draft_save_worker.shutdown();
         self.cloud_agent.shutdown();
         // 디바운스 대기 중이던 메모를 먼저 기록한다 — 종료가 타건보다 빠르면
         // 마지막 문장이 통째로 사라진다.
@@ -29556,6 +31315,18 @@ impl App {
     }
 }
 
+impl Drop for App {
+    fn drop(&mut self) {
+        revoke_followup_authorizations(
+            &mut self.pty_followup,
+            &self.pending_prompt_deliveries,
+            |_| true,
+        );
+        self.pump_composer_checkpoint(true);
+        self.composer_draft_save_worker.shutdown();
+    }
+}
+
 impl eframe::App for App {
     #[cfg(feature = "render-glow")]
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -29574,6 +31345,8 @@ impl eframe::App for App {
     // minimized 미갱신 문제를 피한다). None(미보고)이면 안전하게 Active 유지.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.pump_scrollback_policy(ctx);
+        self.pump_prompt_library_save();
+        self.pump_composer_checkpoint(false);
         // 메모 자동 저장 디바운스. 타건이 멎으면 입력 이벤트도 멎으므로 만료 시점을
         // **한 번** 예약해 깨운다 — 폴링이 아니라 밀린 편집이 있을 때만 거는 one-shot이라
         // 유휴 프레임을 만들지 않는다. render 경로가 아닌 여기 두는 이유는
@@ -29642,7 +31415,6 @@ impl eframe::App for App {
         self.poll_port_inventory(ctx);
         self.pump_resource_maintenance();
         self.pump_perf_harness();
-        self.pump_batch_spawn(ctx);
         if let Some((intent, subject)) = self.pending_connector_dispatch.take() {
             let result = match subject {
                 Some(subject) => self
@@ -29710,6 +31482,7 @@ impl eframe::App for App {
         // Settings mutation completion can invalidate the Environment projection. Drain it before
         // project admission so the same event-driven logic pass submits the newest generation.
         self.poll_settings_outcomes();
+        self.pump_batch_spawn(ctx);
         self.poll_settings_job_admission();
         self.poll_env_api_project_rows();
         self.poll_file_tree_maintenance(ctx);
@@ -29779,11 +31552,28 @@ impl eframe::App for App {
             self.handle_work_history_action(ctx, action);
         }
         self.poll_workspace_controller();
+        self.poll_durable_composer_prompt();
         self.poll_pending_workspace_session_open();
         self.poll_pending_workspace_focus();
         self.poll_pending_resume_agent();
         self.poll_pending_document_open();
         self.poll_document_io();
+        let current_image_document = self.active_document.and_then(|id| {
+            self.documents
+                .iter()
+                .find(|document| document.id == id)
+                .map(|document| {
+                    (
+                        ui::markdown_viewer::MarkdownDocumentSlot(u64::from(id.0)),
+                        ui::markdown_viewer::MarkdownSourceRevision(document.source_revision),
+                    )
+                })
+        });
+        self.document_markdown_viewer.poll_images(
+            ctx,
+            &mut self.document_image_worker,
+            current_image_document,
+        );
         // Receive worker-generated confirmations before global keys can act.
         self.publish_popup_input_fence(ctx);
         self.handle_configured_shortcut(ctx);
@@ -29909,6 +31699,7 @@ impl eframe::App for App {
         let mut runtime_stream_overflowed = false;
         let mut approval_events_overflowed = false;
         let mut approval_runtime_events = Vec::new();
+        let mut prompt_admission_events = Vec::new();
         let mut warm_lifecycle_changed = false;
         let mut resource_maintenance_changed = false;
         let expected_restore_barrier = self.cross_workspace_restore.armed_barrier().map(
@@ -29920,6 +31711,14 @@ impl eframe::App for App {
         for rt in self.warm.values_mut() {
             let events = rt.events.drain();
             self.cloud_agent.observe_input(rt.runtime_instance, &events);
+            prompt_admission_events.extend(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, runtime::RuntimeEvent::InputAdmitted { .. }))
+                    .cloned()
+                    .map(|event| (rt.runtime_instance, event)),
+            );
+
             Self::observe_scrollback_policy(rt, &events);
             resource_maintenance_changed |=
                 apply_unattached_events(&mut self.unattached_counts, &rt.id, &events);
@@ -29952,6 +31751,14 @@ impl eframe::App for App {
                     &rt.id,
                     &events,
                     deppy_core::time::unix_secs_i64(),
+                );
+                confirm_composer_draft_deletions(
+                    &mut self.composer,
+                    &mut self.composer_pending_deletions,
+                    ctx,
+                    rt.runtime_instance,
+                    rt.workspace_ui.mux(),
+                    &events,
                 );
                 Self::record_activity_events(rt, &events);
                 approval_runtime_events.extend(
@@ -30022,6 +31829,9 @@ impl eframe::App for App {
                 ctx.request_repaint();
             }
         }
+        for (runtime_instance, event) in prompt_admission_events {
+            self.observe_prompt_admissions(runtime_instance, std::slice::from_ref(&event));
+        }
         for (workspace_id, event) in approval_runtime_events {
             self.observe_agent_launcher_runtime_events(&workspace_id, std::slice::from_ref(&event));
             self.observe_approval_runtime_events(&workspace_id, std::slice::from_ref(&event));
@@ -30046,6 +31856,9 @@ impl eframe::App for App {
         self.cloud_agent
             .observe_input(self.active.runtime_instance, &new_events);
         self.cloud_agent.expire_pending();
+        self.observe_prompt_admissions(self.active.runtime_instance, &new_events);
+        self.retire_prompt_delivery_targets();
+        self.expire_prompt_deliveries();
         Self::observe_scrollback_policy(&mut self.active, &new_events);
         let primary_activation_post_render_tick = primary_activation_needs_post_render_tick(
             self.pending_primary_pane_activation.as_ref(),
@@ -30084,6 +31897,14 @@ impl eframe::App for App {
                 &self.active.id,
                 &new_events,
                 deppy_core::time::unix_secs_i64(),
+            );
+            confirm_composer_draft_deletions(
+                &mut self.composer,
+                &mut self.composer_pending_deletions,
+                ctx,
+                self.active.runtime_instance,
+                self.active.workspace_ui.mux(),
+                &new_events,
             );
             Self::record_activity_events(&mut self.active, &new_events);
             for event in &new_events {
@@ -30206,10 +32027,9 @@ impl eframe::App for App {
         }
 
         self.refresh_activity_snapshot_if_needed();
-        // Render and non-render WorkspaceUi producers share one capacity-eight protocol contract.
-        // Drain each resident runtime only in logic, returning exact operation/generation
-        // completions so queue and in-flight slots cannot accumulate across frames.
-        self.poll_workspace_protocol_intents();
+        // Logic handles the full bounded Workspace protocol. The final UI tail can also admit
+        // only its nonblocking terminal prefix without a next-frame typing delay.
+        self.poll_workspace_protocol_intents(ctx);
         while let Some(intent) = self.notifications_ui.pop_native_intent() {
             platform::notify(intent.summary(), intent.body());
         }
@@ -31778,6 +33598,12 @@ impl eframe::App for App {
                         &text,
                     );
                 } else if fleet_visible {
+                    self.fleet_ui.set_prompt_revision(self.prompt_library_revision);
+                    let blocked_followups = self.pty_followup.iter()
+                        .filter(|(_, queued)| queued.delivery_blocked
+                            || self.followup_target_unavailable(&queued.target))
+                        .map(|(key, _)| key.clone()).collect();
+                    self.fleet_ui.set_followup_summary(self.pty_followup.len(), blocked_followups);
                     let page = self.fleet_ui.render(
                         ui,
                         &fleet_sessions,
@@ -32401,15 +34227,8 @@ impl eframe::App for App {
             Some(ui::fleet::FleetAction::Broadcast { prompt, targets }) => {
                 // 저장된 프롬프트를 선택된 각 실행 중 에이전트에 컴포저 Send와 동일 경로로
                 // 주입한다(사용자가 대상·프롬프트를 명시적으로 고른 뒤에만 발행됨).
-                let now = std::time::Instant::now();
-                // 만료된 낙관적 마커 정리(윈도우보다 넉넉히 — 맵을 작게 유지).
-                self.broadcast_working.retain(|_, sent| {
-                    now.duration_since(*sent) < std::time::Duration::from_secs(30)
-                });
-                for (workspace_id, session) in targets {
-                    self.broadcast_prompt_to(&workspace_id, session, &prompt);
-                    // 방금 프롬프트를 보냈으니 잠깐 "작업 중"으로 낙관적 표시(감지 지연 메움).
-                    self.broadcast_working.insert((workspace_id, session), now);
+                for target in targets {
+                    self.broadcast_prompt_to(&target, &prompt, PromptDeliveryOrigin::Broadcast);
                 }
             }
             Some(ui::fleet::FleetAction::BatchSpawn {
@@ -32433,12 +34252,15 @@ impl eframe::App for App {
                         agent_id,
                         remaining: count.clamp(1, cap),
                         staged_workspace_id: self.active.id.clone(),
-                        prompt,
+                        prompt: prompt.map(Arc::from),
+                        retry_at: None,
+                        waiting_for_worker: false,
                     });
                     ui.ctx().request_repaint();
                 }
             }
             Some(ui::fleet::FleetAction::ScheduleFollowUp {
+                target,
                 workspace_id,
                 session,
                 prompt,
@@ -32446,23 +34268,37 @@ impl eframe::App for App {
                 let key = (workspace_id, session);
                 if prompt.trim().is_empty() {
                     // 빈 프롬프트 = 해제. 카드의 「예약 취소」가 이 경로로 온다.
-                    self.pty_followup.remove(&key);
-                } else if prompt.len() > FLEET_BATCH_SPAWN_PROMPT_MAX_BYTES {
-                    // 배치 스폰과 같은 상한. PTY에 통째로 붙여넣는 경로라 비정상적으로 큰
-                    // 입력은 예약 자체를 하지 않는다.
-                    self.agents_ui
-                        .report_error(ui::agents::AgentsUiErrorCode::TooManyArguments);
-                } else {
-                    // 예약 시점의 turn_done 세대를 함께 기록한다 — 이미 끝나 있던 턴으로
-                    // 즉시 발사되면 "이 턴 끝나면"이 아니게 된다.
-                    let queued_turn = self.global_turn_done.get(&key).copied();
-                    self.pty_followup.insert(
-                        key,
-                        QueuedFollowUp {
-                            prompt,
-                            queued_turn,
-                        },
-                    );
+                    cancel_followup_reservation(&mut self.pty_followup, &key);
+                } else if let Some(expected) = target {
+                    let valid = expected.workspace_id == key.0
+                        && expected.session == key.1
+                        && expected.execution.is_current()
+                        && !self.followup_target_unavailable(&expected)
+                        && self
+                            .agent_kinds
+                            .get(&(expected.runtime_instance, expected.session))
+                            .and_then(|agent| agent.execution)
+                            == Some(expected.execution);
+                    let accepted = valid
+                        && admit_followup_reservation(
+                            &mut self.pty_followup,
+                            key.clone(),
+                            QueuedFollowUp {
+                                target: expected.clone(),
+                                prompt: Arc::from(prompt),
+                                queued_turn: self.global_turn_done.get(&key).copied(),
+                                delivery_blocked: false,
+                                delivery_unknown: false,
+                                reservation_id: uuid::Uuid::new_v4().to_string(),
+                                input_permit: FollowUpInputPermit::default(),
+                            },
+                        )
+                        .is_ok();
+                    self.fleet_ui.settle_followup(&expected, accepted);
+                    if !accepted {
+                        self.agents_ui
+                            .report_error(ui::agents::AgentsUiErrorCode::TooManyArguments);
+                    }
                 }
             }
             None => {}
@@ -34029,6 +35865,10 @@ impl eframe::App for App {
         for runtime in self.warm.values_mut() {
             runtime.workspace_ui.flush_render_side_effects(ui.ctx());
         }
+        // Home/Fleet/hidden-sidebar frames may render no native input consumer.
+        // An unclaimed destructive move gesture must not bind to a later frame.
+        crate::native_key_monitor::discard_unclaimed_move_paste();
+        self.flush_workspace_terminal_protocol_tail(ui.ctx());
         self.frame_stats.end();
         // B1: 이번 프레임에 그린 터미널 렌더 카운터를 프레임 이벤트에 실어 보낸다.
         // frame_stats.end() 뒤라 JSONL 기록 비용은 ui_ms에 섞이지 않는다.
@@ -34060,6 +35900,273 @@ fn elapsed_ms(started: std::time::Instant) -> f64 {
 /// 명령이 쌓이기만 한다 — 2026-07-17 사용자가 실제로 겪은 증상.
 fn waiting_answer_bytes(reply: &str) -> Vec<u8> {
     format!("{reply}\r").into_bytes()
+}
+
+/// Persistence feedback is paint-only; retry returns an intent for the App logic pump.
+#[derive(Clone, Debug)]
+struct ComposerPendingDeletion {
+    runtime_instance: u64,
+    correlation_id: u64,
+    pane: runtime::MuxPaneId,
+    draft_key: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposerCheckpointDecision {
+    Wait,
+    Dispatch,
+    Reject,
+}
+
+fn composer_checkpoint_decision(
+    status: crate::composer_draft_worker::DraftSaveStatus,
+    required_save_revision: u64,
+    pending_marker: bool,
+) -> ComposerCheckpointDecision {
+    use crate::composer_draft_worker::DraftSaveStatus as Status;
+    if !pending_marker || required_save_revision == 0 {
+        return ComposerCheckpointDecision::Reject;
+    }
+    match status {
+        Status::Saved { revision } if revision >= required_save_revision => {
+            ComposerCheckpointDecision::Dispatch
+        }
+        Status::Failed { .. } | Status::RecoveryRequired { .. } => {
+            ComposerCheckpointDecision::Reject
+        }
+        Status::Idle | Status::Pending { .. } | Status::Saved { .. } => {
+            ComposerCheckpointDecision::Wait
+        }
+    }
+}
+
+struct PendingDurableComposerPrompt {
+    target: AppTerminalInputTarget,
+    context: PromptInputContext,
+    prompt: Arc<str>,
+    draft_key: String,
+    submission_id: u64,
+    required_save_revision: u64,
+}
+
+impl PendingDurableComposerPrompt {
+    fn generation(&self) -> u64 {
+        match &self.target {
+            AppTerminalInputTarget::Primary {
+                runtime_instance, ..
+            } => *runtime_instance,
+            AppTerminalInputTarget::Attached(target) => target.runtime_instance,
+        }
+    }
+    fn workspace_id(&self) -> &str {
+        match &self.target {
+            AppTerminalInputTarget::Primary { workspace_id, .. } => workspace_id,
+            AppTerminalInputTarget::Attached(target) => &target.workspace_id,
+        }
+    }
+    fn ready(
+        &self,
+        composer: &ui::composer::ComposerUi,
+        status: crate::composer_draft_worker::DraftSaveStatus,
+    ) -> ComposerCheckpointDecision {
+        composer_checkpoint_decision(
+            status,
+            self.required_save_revision,
+            composer.pending_submission_matches(
+                &self.draft_key,
+                self.submission_id,
+                &self.prompt,
+                self.generation(),
+            ),
+        )
+    }
+}
+
+fn take_ready_durable_composer_prompt(
+    slot: &mut Option<PendingDurableComposerPrompt>,
+    composer: &ui::composer::ComposerUi,
+    status: crate::composer_draft_worker::DraftSaveStatus,
+    error: Option<crate::composer_drafts::DraftError>,
+) -> Option<(PendingDurableComposerPrompt, ComposerCheckpointDecision)> {
+    let pending = slot.take()?;
+    let decision = if error.is_some() {
+        ComposerCheckpointDecision::Reject
+    } else {
+        pending.ready(composer, status)
+    };
+    if decision == ComposerCheckpointDecision::Wait {
+        // Worker completion requests the next logic tick. Keep the exact captured target;
+        // unrelated controller/modal work remains independent. No polling timer or I/O.
+        *slot = Some(pending);
+        None
+    } else {
+        Some((pending, decision))
+    }
+}
+fn composer_permanent_close_marker(
+    command: &runtime::RuntimeCommand,
+    runtime_instance: u64,
+    workspace_id: &str,
+    mux: Option<&runtime::MuxSnapshot>,
+    closed: &std::collections::HashMap<String, ClosedWorkspaceState>,
+) -> Option<ComposerPendingDeletion> {
+    let runtime::RuntimeCommand::ClosePane { pane } = command else {
+        return None;
+    };
+    // Only panes captured by active workspace cleanup are restorable closures. A fresh
+    // pane can be opened/explicitly closed while old ClosePane acknowledgements are pending.
+    if matches!(closed.get(workspace_id), Some(ClosedWorkspaceState::ClosingPanes(panes)) if panes.contains(&pane.0))
+    {
+        return None;
+    }
+    let snapshot = mux?
+        .tabs
+        .iter()
+        .flat_map(|tab| &tab.panes)
+        .find(|candidate| candidate.id == *pane)?;
+    let draft_key = composer_session_draft_key(workspace_id, Some(snapshot));
+    (!draft_key.is_empty()).then(|| ComposerPendingDeletion {
+        runtime_instance,
+        correlation_id: 0,
+        pane: pane.clone(),
+        draft_key,
+    })
+}
+fn composer_session_draft_key(workspace_id: &str, pane: Option<&runtime::PaneSnapshot>) -> String {
+    let (kind, identity) = pane.map_or(("scratch", ""), |pane| {
+        pane.persistent_session_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .map_or(("pane", pane.id.0.as_str()), |id| ("session", id))
+    });
+    if workspace_id.is_empty()
+        || workspace_id.len() > crate::composer_drafts::DRAFT_WORKSPACE_MAX_BYTES
+        || workspace_id.len() + identity.len() + 32 > crate::composer_drafts::DRAFT_KEY_MAX_BYTES
+    {
+        return String::new();
+    }
+    format!("{}:{workspace_id}:{kind}:{identity}", workspace_id.len())
+}
+fn confirm_composer_draft_deletions(
+    composer: &mut ui::composer::ComposerUi,
+    pending: &mut Vec<ComposerPendingDeletion>,
+    ctx: &egui::Context,
+    runtime_instance: u64,
+    previous_mux: Option<&Arc<runtime::MuxSnapshot>>,
+    events: &[runtime::RuntimeEvent],
+) {
+    pending.retain(|deletion| {
+        if deletion.runtime_instance != runtime_instance {
+            return true;
+        }
+        let Some(mux) =
+            runtime_mux_at_durable_barrier(previous_mux, events, deletion.correlation_id)
+        else {
+            return true;
+        };
+        if let Some(mux) = mux
+            && !mux
+                .tabs
+                .iter()
+                .flat_map(|tab| &tab.panes)
+                .any(|pane| pane.id == deletion.pane)
+        {
+            composer.delete_draft(ctx, &deletion.draft_key);
+        }
+        // The correlated close completed. A refused/unknown removal retains its draft,
+        // and the bounded marker is released rather than waiting for a second identical ACK.
+        false
+    });
+}
+fn render_composer_draft_save_status(
+    ui: &mut egui::Ui,
+    text: &i18n::Catalog,
+    status: crate::composer_draft_worker::DraftSaveStatus,
+    error: Option<crate::composer_drafts::DraftError>,
+    path: &Path,
+) -> bool {
+    use crate::composer_draft_worker::DraftSaveStatus as Status;
+    let key = if error.is_some() {
+        Some("composer.draft.failed")
+    } else {
+        match status {
+            Status::Idle | Status::Saved { .. } => None,
+            Status::Pending { .. } => Some("composer.draft.saving"),
+            Status::Failed { .. } => Some("composer.draft.failed"),
+            Status::RecoveryRequired { .. } => Some("composer.draft.recovery"),
+        }
+    };
+    let Some(key) = key else { return false };
+    let mut retry = false;
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new(text.t(key, &[]))
+                .size(11.0)
+                .color(ui.visuals().warn_fg_color),
+        )
+        .on_hover_text(format!(
+            "{}\n{}",
+            text.t("composer.draft.recovery_hint", &[]),
+            path.display()
+        ));
+        if matches!(status, Status::Failed { .. }) && status.write_blocking_error().is_none() {
+            retry = ui
+                .small_button(text.t("prompt.persistence.retry", &[]))
+                .clicked();
+        }
+    });
+    retry
+}
+
+fn render_prompt_library_save_status(
+    ui: &mut egui::Ui,
+    text: &i18n::Catalog,
+    status: crate::prompt_library_worker::PromptLibrarySaveStatus,
+    edit_error: Option<crate::prompt_library::PromptLibraryError>,
+    path: &std::path::Path,
+) -> bool {
+    use crate::prompt_library::PromptLibraryError as Error;
+    use crate::prompt_library_worker::PromptLibrarySaveStatus as Status;
+    let key = match status {
+        Status::RecoveryRequired { .. } => Some("prompt.persistence.recovery"),
+        Status::Failed {
+            error: Error::Conflict,
+            ..
+        } => Some("prompt.persistence.conflict"),
+        _ if edit_error.is_some() => Some("prompt.persistence.limit_or_error"),
+        Status::Pending { .. } => Some("prompt.persistence.saving"),
+        Status::Failed { .. } => Some("prompt.persistence.failed"),
+        Status::Idle | Status::Saved { .. } => None,
+    };
+    if let Some(key) = key {
+        let color = if matches!(status, Status::Pending { .. }) && edit_error.is_none() {
+            ui.visuals().weak_text_color()
+        } else {
+            ui.visuals().error_fg_color
+        };
+        let hint = if matches!(
+            status,
+            Status::RecoveryRequired { .. }
+                | Status::Failed {
+                    error: Error::Conflict,
+                    ..
+                }
+        ) {
+            format!(
+                "{}\n{}",
+                text.t("prompt.persistence.recovery_hint", &[]),
+                path.display()
+            )
+        } else {
+            path.display().to_string()
+        };
+        ui.label(egui::RichText::new(text.t(key, &[])).small().color(color))
+            .on_hover_text(hint);
+    }
+    matches!(status, Status::Failed { error, .. } if error != Error::Conflict)
+        && ui
+            .small_button(text.t("prompt.persistence.retry", &[]))
+            .clicked()
 }
 
 /// 컴포저 접힘 단축키 — FocusComposer의 유효 바인딩에 **dispatcher와 같은 충돌 억제**를
@@ -35384,6 +37491,1689 @@ fn pty_shortcut_missing_feedback(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pr10_busy_deadline_does_not_request_immediate_idle_repaint() {
+        let ctx = egui::Context::default();
+        for _ in 0..3 {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |_| {});
+            output.textures_delta.clear();
+        }
+        let mut workspace = ui::workspace::WorkspaceUi::new();
+        // Public keyboard-producer behavior is tested in Workspace; this fixture stages a
+        // validated command through its public close-free test adapter below.
+        workspace.pr10_stage_input_for_host_test(runtime::SessionId(7), b"busy".to_vec());
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            dispatch_terminal_protocol_tail(&mut workspace, ui.ctx(), |command| {
+                Err((
+                    runtime::RuntimeCommandSendError::Backpressure.into(),
+                    Box::new(command),
+                ))
+            });
+        });
+        let delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+        output.textures_delta.clear();
+        eprintln!("PR10 busy-only repaint delay_us={}", delay.as_micros());
+        assert!(
+            delay >= std::time::Duration::from_millis(1),
+            "16ms retry deadline became immediate UI polling"
+        );
+    }
+
+    #[test]
+    fn pr10_actual_app_logic_and_final_tail_keep_correction_pass_fence() {
+        let production = include_str!("app.rs")
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap();
+        let drain = production
+            .split("fn drain_workspace_protocol_intents(")
+            .nth(1)
+            .unwrap()
+            .split("fn poll_workspace_protocol_intents(")
+            .next()
+            .unwrap();
+        assert!(
+            drain
+                .find("workspace_protocol_logic_pass_ready(&self.egui_ctx)")
+                .unwrap()
+                < drain.find("take_protocol_intent()").unwrap()
+        );
+        let tail = production
+            .split("fn flush_workspace_terminal_protocol_tail(")
+            .nth(1)
+            .unwrap()
+            .split("fn drain_closing_workspace_protocol_intents(")
+            .next()
+            .unwrap();
+        assert!(tail.contains("send_command_owned(command)"));
+        assert!(!tail.contains("drain_workspace_protocol_intents("));
+        let ui = production
+            .split("fn ui(&mut self, ui: &mut egui::Ui")
+            .nth(1)
+            .unwrap();
+        assert!(
+            ui.rfind("flush_render_side_effects(ui.ctx());").unwrap()
+                < ui.find("self.flush_workspace_terminal_protocol_tail(ui.ctx());")
+                    .unwrap()
+        );
+    }
+
+    #[test]
+    fn pr8_busy_batch_does_not_materialize_prompt_or_request_every_frame() {
+        let ctx = egui::Context::default();
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = wakes.clone();
+        ctx.set_request_repaint_callback(move |info| {
+            if info.delay.is_zero() {
+                count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        let mut pending = Some(PendingBatchSpawn {
+            agent_id: "agent".into(),
+            remaining: 3,
+            staged_workspace_id: "workspace".into(),
+            prompt: Some(Arc::from("x".repeat(FLEET_BATCH_SPAWN_PROMPT_MAX_BYTES))),
+            retry_at: None,
+            waiting_for_worker: false,
+        });
+        let mut copies = 0usize;
+        let mut immediate = 0usize;
+        let started = std::time::Instant::now();
+        for index in 0..120 {
+            ctx.begin_pass(egui::RawInput::default());
+            // Count only this production step: egui itself requests two initial setup frames.
+            let before = wakes.load(std::sync::atomic::Ordering::Relaxed);
+            pump_batch_spawn_step(
+                &mut pending,
+                &ctx,
+                "workspace",
+                true,
+                started + std::time::Duration::from_secs_f64(index as f64 / 60.0),
+                |_, prompt| {
+                    copies += prompt.unwrap().len();
+                    BatchAdmission::KnownUnsent
+                },
+            );
+            immediate += wakes.load(std::sync::atomic::Ordering::Relaxed) - before;
+            let mut output = ctx.end_pass();
+            output.textures_delta.clear();
+        }
+        eprintln!(
+            "PR8 busy120ticks/2s prompt bytes materialized={copies}, immediate wakes={immediate}"
+        );
+        assert_eq!(
+            copies, 0,
+            "busy batch cloned/materialized payload every frame"
+        );
+        assert!(
+            immediate <= 8,
+            "busy worker requested immediate repaint per frame" // egui subtracts predicted_dt: the eight 250ms fallback deadlines can be immediate.
+        );
+        assert_eq!(pending.unwrap().remaining, 3);
+    }
+
+    #[test]
+    fn pr8_batch_rearms_fallback_after_intervening_frames() {
+        let ctx = egui::Context::default();
+        for _ in 0..3 {
+            ctx.begin_pass(egui::RawInput::default());
+            ctx.end_pass().textures_delta.clear();
+        }
+        let now = std::time::Instant::now();
+        let mut pending = Some(PendingBatchSpawn {
+            agent_id: "agent".into(),
+            remaining: 2,
+            staged_workspace_id: "workspace".into(),
+            prompt: None,
+            retry_at: None,
+            waiting_for_worker: false,
+        });
+        for (millis, busy) in [(0, true), (100, true), (250, false), (300, false)] {
+            ctx.begin_pass(egui::RawInput::default());
+            pump_batch_spawn_step(
+                &mut pending,
+                &ctx,
+                "workspace",
+                busy,
+                now + std::time::Duration::from_millis(millis),
+                |_, _| BatchAdmission::KnownUnsent,
+            );
+            let mut output = ctx.end_pass();
+            let delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+            output.textures_delta.clear();
+            assert!(
+                delay <= BATCH_RETRY_DELAY,
+                "lost fallback at {millis}ms: {delay:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pr8_batch_retry_is_delayed_and_workspace_switch_cancels() {
+        let ctx = egui::Context::default();
+        let now = std::time::Instant::now();
+        let mut pending = Some(PendingBatchSpawn {
+            agent_id: "agent".into(),
+            remaining: 3,
+            staged_workspace_id: "workspace".into(),
+            prompt: Some(Arc::from("shared")),
+            retry_at: None,
+            waiting_for_worker: false,
+        });
+        let mut attempts = 0;
+        for millis in [0, 10, 249, 250] {
+            pump_batch_spawn_step(
+                &mut pending,
+                &ctx,
+                "workspace",
+                false,
+                now + std::time::Duration::from_millis(millis),
+                |_, _| {
+                    attempts += 1;
+                    BatchAdmission::KnownUnsent
+                },
+            );
+        }
+        assert_eq!(attempts, 2);
+        assert_eq!(pending.as_ref().unwrap().remaining, 3);
+        pump_batch_spawn_step(&mut pending, &ctx, "other", true, now, |_, _| {
+            panic!("cancelled")
+        });
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn pr8_settings_completion_wake_resumes_ordered_shared_prompt() {
+        let path = temp_db_path("pr8-completion-wake");
+        let db = Db::open(&path).unwrap();
+        let workspace_id = db.create_workspace("pr8").unwrap();
+        drop(db);
+        let ctx = egui::Context::default();
+        let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+        ctx.set_request_repaint_callback(move |info| {
+            if info.delay.is_zero() {
+                let _ = wake_tx.send(());
+            }
+        });
+        let worker = SettingsSnapshotWorker::new(
+            path,
+            secret::RedactionService::new(),
+            ctx.clone(),
+            Arc::new(DeferredSecretRepair::empty()),
+        );
+        let slot = worker.spawn_slot_with_idle_ttl(std::time::Duration::from_secs(30));
+        let prompt: Arc<str> = Arc::from("original shared prompt");
+        let mut pending = Some(PendingBatchSpawn {
+            agent_id: "agent".into(),
+            remaining: 3,
+            staged_workspace_id: workspace_id.clone(),
+            prompt: Some(prompt.clone()),
+            retry_at: None,
+            waiting_for_worker: false,
+        });
+        let now = std::time::Instant::now();
+        let mut revisions = Vec::new();
+        for revision in 1..=3 {
+            for _ in 0..3 {
+                ctx.begin_pass(egui::RawInput::default());
+                ctx.end_pass().textures_delta.clear();
+            }
+            for _ in wake_rx.try_iter() {}
+            // A busy step must leave the current job untouched, even before retry_at.
+            pump_batch_spawn_step(&mut pending, &ctx, &workspace_id, true, now, |_, _| {
+                panic!("busy")
+            });
+            pump_batch_spawn_step(
+                &mut pending,
+                &ctx,
+                &workspace_id,
+                false,
+                now,
+                |id, shared| {
+                    assert_eq!(id, "agent");
+                    assert!(Arc::ptr_eq(shared.as_ref().unwrap(), &prompt));
+                    assert!(
+                        SettingsSnapshotWorker::try_send_to_slot(
+                            &slot,
+                            SettingsJob {
+                                generation: 1,
+                                revision,
+                                workspace_id: workspace_id.clone(),
+                                project_root: None,
+                                action: SettingsJobAction::Load,
+                            }
+                        )
+                        .is_ok()
+                    );
+                    BatchAdmission::Queued
+                },
+            );
+            wake_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("real worker completion wake");
+            let result = slot
+                .rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            revisions.push(result.revision);
+        }
+        assert_eq!(revisions, [1, 2, 3]);
+        assert!(pending.is_none());
+        let SettingsWorkerSlot { tx, rx, handle, .. } = slot;
+        drop(tx);
+        drop(rx);
+        handle.join().unwrap();
+    }
+
+    fn pr1_test_delivery(
+        now: std::time::Instant,
+        session: u64,
+        unknown: bool,
+    ) -> PendingPromptDelivery {
+        PendingPromptDelivery {
+            workspace_id: "workspace".into(),
+            runtime_instance: 41,
+            session: runtime::SessionId(session),
+            prompt: Arc::from("original"),
+            origin: PromptDeliveryOrigin::Broadcast,
+            deadline: now + PROMPT_ADMISSION_TIMEOUT,
+            unknown,
+        }
+    }
+
+    #[test]
+    fn pr5_stable_session_key_ignores_runtime_local_counter_and_keeps_workspace_boundary() {
+        let mut mux = archived_resume_test_mux("durable-A");
+        let pane = &mut mux.tabs[0].panes[0];
+        let original = composer_session_draft_key("workspace", Some(pane));
+        pane.session_id = Some(runtime::SessionId(999));
+        pane.id = runtime::MuxPaneId("restored-pane".into());
+        assert_eq!(
+            composer_session_draft_key("workspace", Some(pane)),
+            original
+        );
+        pane.persistent_session_id = Some("durable-B".into());
+        assert_ne!(
+            composer_session_draft_key("workspace", Some(pane)),
+            original
+        );
+        assert_ne!(
+            composer_session_draft_key("another-workspace", Some(pane)),
+            composer_session_draft_key("workspace", Some(pane))
+        );
+        pane.persistent_session_id = None;
+        let fallback = composer_session_draft_key("workspace", Some(pane));
+        pane.session_id = Some(runtime::SessionId(4));
+        assert_eq!(
+            composer_session_draft_key("workspace", Some(pane)),
+            fallback
+        );
+        assert_ne!(fallback, composer_session_draft_key("workspace", None));
+    }
+    #[test]
+    fn pr5_confirmed_permanent_delete_requires_exact_runtime_barrier_and_absent_pane() {
+        let ctx = egui::Context::default();
+        let present = Arc::new(archived_resume_test_mux("durable-A"));
+        let key = composer_session_draft_key("workspace", Some(&present.tabs[0].panes[0]));
+        let mut composer = ui::composer::ComposerUi::new(
+            std::env::temp_dir().join(format!("deppy-pr5-unused-{}.jsonl", uuid::Uuid::new_v4())),
+        );
+        composer.insert_text(&key, "dirty prompt");
+        let mut pending = vec![ComposerPendingDeletion {
+            runtime_instance: 7,
+            correlation_id: 41,
+            pane: present.tabs[0].panes[0].id.clone(),
+            draft_key: key.clone(),
+        }];
+        let absent = Arc::new(runtime::MuxSnapshot {
+            tabs: Vec::new(),
+            active_tab: None,
+            focused_pane: None,
+        });
+        let missing = runtime::RuntimeEvent::MuxUpdated {
+            snapshot: Arc::clone(&absent),
+        };
+        confirm_composer_draft_deletions(
+            &mut composer,
+            &mut pending,
+            &ctx,
+            7,
+            Some(&present),
+            std::slice::from_ref(&missing),
+        );
+        assert_eq!(
+            composer.current_text(&key),
+            "dirty prompt",
+            "an incomplete projection alone never purges"
+        );
+        let wrong = runtime::RuntimeEvent::DurableEventBarrierReached { correlation_id: 40 };
+        confirm_composer_draft_deletions(
+            &mut composer,
+            &mut pending,
+            &ctx,
+            7,
+            Some(&absent),
+            &[wrong],
+        );
+        assert_eq!(pending.len(), 1);
+        let exact = runtime::RuntimeEvent::DurableEventBarrierReached { correlation_id: 41 };
+        confirm_composer_draft_deletions(
+            &mut composer,
+            &mut pending,
+            &ctx,
+            8,
+            Some(&absent),
+            std::slice::from_ref(&exact),
+        );
+        assert_eq!(composer.current_text(&key), "dirty prompt");
+        confirm_composer_draft_deletions(
+            &mut composer,
+            &mut pending,
+            &ctx,
+            7,
+            Some(&present),
+            &[missing, exact],
+        );
+        assert!(pending.is_empty());
+        assert!(composer.current_text(&key).is_empty());
+        assert!(composer.checkpoint().drafts.is_empty());
+        // Archive/exit/close-workspace supplies no permanent marker, so even a valid barrier
+        // and empty authoritative mux keep a restorable hidden draft.
+        composer.insert_text(&key, "restorable");
+        confirm_composer_draft_deletions(
+            &mut composer,
+            &mut pending,
+            &ctx,
+            7,
+            Some(&absent),
+            &[runtime::RuntimeEvent::DurableEventBarrierReached { correlation_id: 42 }],
+        );
+        assert_eq!(composer.current_text(&key), "restorable");
+    }
+    #[test]
+    fn pr5_actual_active_workspace_close_intents_preserve_drafts_but_explicit_pane_close_deletes() {
+        let ctx = egui::Context::default();
+        let mux = Arc::new(archived_resume_test_mux("durable-A"));
+        let pane = mux.tabs[0].panes[0].id.clone();
+        let key = composer_session_draft_key("workspace", Some(&mux.tabs[0].panes[0]));
+        let mut workspace_ui = ui::workspace::WorkspaceUi::new();
+        workspace_ui.close_pane_now(pane.clone());
+        let cleanup_command = workspace_ui.take_protocol_intent().unwrap().into_command();
+        let closed = std::collections::HashMap::from([(
+            "workspace".to_owned(),
+            ClosedWorkspaceState::ClosingPanes(std::collections::HashSet::from([pane.0.clone()])),
+        )]);
+        assert!(
+            composer_permanent_close_marker(&cleanup_command, 7, "workspace", Some(&mux), &closed)
+                .is_none(),
+            "actual ClosePane producer during active workspace cleanup must not create a permanent marker"
+        );
+        let mut with_fresh_pane = (*mux).clone();
+        let mut fresh = with_fresh_pane.tabs[0].panes[0].clone();
+        fresh.id = runtime::MuxPaneId("fresh-pane".into());
+        fresh.persistent_session_id = Some("durable-fresh".into());
+        with_fresh_pane.tabs[0].panes.push(fresh.clone());
+        assert!(
+            composer_permanent_close_marker(
+                &runtime::RuntimeCommand::ClosePane {
+                    pane: fresh.id.clone()
+                },
+                7,
+                "workspace",
+                Some(&with_fresh_pane),
+                &closed,
+            )
+            .is_some(),
+            "explicit fresh pane closure stays permanent while old cleanup ACKs remain pending"
+        );
+        let mut composer = ui::composer::ComposerUi::new(std::env::temp_dir().join(format!(
+            "deppy-pr5-close-unused-{}.jsonl",
+            uuid::Uuid::new_v4()
+        )));
+        composer.insert_text(&key, "restorable dirty prompt");
+        let empty = Arc::new(runtime::MuxSnapshot {
+            tabs: Vec::new(),
+            active_tab: None,
+            focused_pane: None,
+        });
+        let events = vec![
+            runtime::RuntimeEvent::MuxUpdated { snapshot: empty },
+            runtime::RuntimeEvent::DurableEventBarrierReached { correlation_id: 41 },
+        ];
+        let mut pending = Vec::new();
+        confirm_composer_draft_deletions(&mut composer, &mut pending, &ctx, 7, Some(&mux), &events);
+        assert_eq!(composer.current_text(&key), "restorable dirty prompt");
+        let mut permanent = composer_permanent_close_marker(
+            &cleanup_command,
+            7,
+            "workspace",
+            Some(&mux),
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
+        permanent.correlation_id = 41;
+        pending.push(permanent);
+        confirm_composer_draft_deletions(&mut composer, &mut pending, &ctx, 7, Some(&mux), &events);
+        assert!(composer.current_text(&key).is_empty());
+        // Bind the real App active-close producer to the origin state exercised above.
+        let source = include_str!("app.rs");
+        let close = source
+            .split_once("fn close_workspace_sessions(")
+            .unwrap()
+            .1
+            .split_once("fn ")
+            .unwrap()
+            .0;
+        let active = close
+            .split_once("if workspace_id == self.active.id")
+            .unwrap()
+            .1
+            .split_once("else if self.warm.contains_key")
+            .unwrap()
+            .0;
+        assert!(
+            active.find("ClosedWorkspaceState::ClosingPanes(").unwrap()
+                < active
+                    .find("self.drain_workspace_protocol_intents(")
+                    .unwrap()
+        );
+    }
+
+    #[test]
+    fn pr5_actual_checkpoint_worker_gates_one_original_target_before_any_input_dispatch() {
+        use crate::composer_draft_worker::{DraftSaveStatus, DraftSaveWorker};
+        use crate::composer_drafts::{DraftFileVersion, DraftRecord, DraftSnapshot};
+        let dir = std::env::temp_dir().join(format!("deppy-pr5-dispatch-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("drafts.json");
+        let initial = DraftSnapshot {
+            drafts: vec![DraftRecord {
+                key: "A".into(),
+                workspace_id: "workspace".into(),
+                delivery_uncertain: false,
+                text: Arc::from("original 한글"),
+            }],
+        };
+        initial
+            .save_checked(&path, DraftFileVersion::Missing)
+            .unwrap();
+        let startup = DraftSnapshot::load_startup(&path);
+        let mut composer = ui::composer::ComposerUi::new(dir.join("unused_history.jsonl"));
+        composer.restore_drafts(startup.snapshot);
+        let ui::composer::ComposerAction::Send(submission) =
+            composer.try_submit("original 한글", true, "A").unwrap()
+        else {
+            panic!()
+        };
+        let required_draft_revision = submission.required_draft_revision();
+        let (prompt, _, submission_id) = submission.into_parts();
+        let mut slot = Some(PendingDurableComposerPrompt {
+            context: PromptInputContext::ManualShell,
+            target: AppTerminalInputTarget::Primary {
+                workspace_id: "workspace".into(),
+                runtime_instance: 0,
+                session: runtime::SessionId(41),
+            },
+            prompt,
+            draft_key: "A".into(),
+            submission_id,
+            required_save_revision: 1,
+        });
+        // The existing disk file still has false. A queued checkpoint is not a PTY permit.
+        assert!(!DraftSnapshot::load_startup(&path).snapshot.drafts[0].delivery_uncertain);
+        assert!(
+            take_ready_durable_composer_prompt(
+                &mut slot,
+                &composer,
+                DraftSaveStatus::Pending { revision: 1 },
+                None
+            )
+            .is_none()
+        );
+        let mut worker = DraftSaveWorker::new(path.clone(), None, startup.file_version, || {});
+        worker.request(1, composer.checkpoint()).unwrap();
+        composer.insert_text("A", " changed while saving");
+        composer.insert_text("B", "other session");
+        assert!(composer.draft_revision() > required_draft_revision);
+        worker.request(2, composer.checkpoint()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while matches!(worker.status(), DraftSaveStatus::Pending { .. }) {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(worker.status(), DraftSaveStatus::Saved { revision: 2 });
+        let restored = DraftSnapshot::load_startup(&path);
+        assert!(
+            restored
+                .snapshot
+                .drafts
+                .iter()
+                .find(|draft| draft.key == "A")
+                .unwrap()
+                .delivery_uncertain
+        );
+        let mut after_crash =
+            ui::composer::ComposerUi::new(dir.join("unused_restored_history.jsonl"));
+        after_crash.restore_drafts(restored.snapshot);
+        assert!(after_crash.try_submit("original 한글", true, "A").is_none());
+        let (pending, decision) =
+            take_ready_durable_composer_prompt(&mut slot, &composer, worker.status(), None)
+                .unwrap();
+        assert_eq!(decision, ComposerCheckpointDecision::Dispatch);
+        assert!(
+            matches!(&pending.target, AppTerminalInputTarget::Primary { workspace_id, runtime_instance: 0, session: runtime::SessionId(41) } if workspace_id == "workspace")
+        );
+        assert_eq!(pending.prompt.as_ref(), "original 한글");
+        assert!(
+            take_ready_durable_composer_prompt(&mut slot, &composer, worker.status(), None)
+                .is_none(),
+            "saved/late repaint cannot dispatch twice"
+        );
+        worker.shutdown();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn pr5_checkpoint_failure_and_retirement_reject_known_unqueued_without_retry_or_draft_loss() {
+        use crate::composer_draft_worker::DraftSaveStatus as Status;
+        use crate::composer_drafts::DraftError;
+        let ctx = egui::Context::default();
+        let mut composer = ui::composer::ComposerUi::new(
+            std::env::temp_dir().join(format!("deppy-pr5-reject-{}", uuid::Uuid::new_v4())),
+        );
+        composer.insert_text("A", "retained prompt");
+        let ui::composer::ComposerAction::Send(submission) =
+            composer.try_submit("retained prompt", true, "A").unwrap()
+        else {
+            panic!()
+        };
+        let (prompt, _, submission_id) = submission.into_parts();
+        let mut slot = Some(PendingDurableComposerPrompt {
+            context: PromptInputContext::ManualShell,
+            target: AppTerminalInputTarget::Primary {
+                workspace_id: "workspace".into(),
+                runtime_instance: 0,
+                session: runtime::SessionId(41),
+            },
+            prompt,
+            draft_key: "A".into(),
+            submission_id,
+            required_save_revision: 1,
+        });
+        let (pending, decision) = take_ready_durable_composer_prompt(
+            &mut slot,
+            &composer,
+            Status::Failed {
+                revision: 1,
+                error: DraftError::Conflict,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(decision, ComposerCheckpointDecision::Reject);
+        composer.retire_generation(&ctx, 0);
+        composer.reject_unqueued_submission(
+            &pending.draft_key,
+            pending.submission_id,
+            &pending.prompt,
+            pending.generation(),
+        );
+        assert_eq!(composer.current_text("A"), "retained prompt");
+        assert!(
+            !composer.checkpoint().drafts[0].delivery_uncertain,
+            "known no-PTY effect is not restored as an unknown delivery"
+        );
+        assert!(slot.is_none());
+        assert!(
+            take_ready_durable_composer_prompt(
+                &mut slot,
+                &composer,
+                Status::Saved { revision: 2 },
+                None
+            )
+            .is_none(),
+            "save retry alone never transmits rejected input"
+        );
+        let source = include_str!("app.rs");
+        let dispatch = source
+            .split_once("fn poll_durable_composer_prompt(")
+            .unwrap()
+            .1
+            .split_once("fn send_composer_prompt(")
+            .unwrap()
+            .0;
+        assert!(dispatch.contains("take_ready_durable_composer_prompt("));
+        assert!(dispatch.contains("ComposerCheckpointDecision::Dispatch =>"));
+        assert!(dispatch.contains("self.send_composer_prompt("));
+        let defer = source
+            .split_once("fn defer_composer_prompt(")
+            .unwrap()
+            .1
+            .split_once("fn reject_unqueued_composer_prompt(")
+            .unwrap()
+            .0;
+        assert!(defer.contains("self.pump_composer_checkpoint(true);"));
+        assert!(!defer.contains("self.send_composer_prompt("));
+    }
+
+    #[test]
+    fn pr5_input_dispatch_waits_for_the_exact_or_newer_durable_marker_and_fails_closed() {
+        use crate::composer_draft_worker::DraftSaveStatus as Status;
+        use crate::composer_drafts::DraftError;
+        assert_eq!(
+            composer_checkpoint_decision(Status::Idle, 8, true),
+            ComposerCheckpointDecision::Wait
+        );
+        assert_eq!(
+            composer_checkpoint_decision(Status::Saved { revision: 7 }, 8, true),
+            ComposerCheckpointDecision::Wait
+        );
+        assert_eq!(
+            composer_checkpoint_decision(Status::Pending { revision: 8 }, 8, true),
+            ComposerCheckpointDecision::Wait
+        );
+        assert_eq!(
+            composer_checkpoint_decision(Status::Pending { revision: 9 }, 8, true),
+            ComposerCheckpointDecision::Wait
+        );
+        assert_eq!(
+            composer_checkpoint_decision(Status::Saved { revision: 8 }, 8, true),
+            ComposerCheckpointDecision::Dispatch
+        );
+        assert_eq!(
+            composer_checkpoint_decision(Status::Saved { revision: 9 }, 8, true),
+            ComposerCheckpointDecision::Dispatch
+        );
+        for error in [
+            DraftError::WriteFailed,
+            DraftError::Conflict,
+            DraftError::ReadFailed,
+        ] {
+            assert_eq!(
+                composer_checkpoint_decision(Status::Failed { revision: 8, error }, 8, true),
+                ComposerCheckpointDecision::Reject
+            );
+        }
+        assert_eq!(
+            composer_checkpoint_decision(
+                Status::RecoveryRequired {
+                    error: DraftError::Corrupt
+                },
+                8,
+                true
+            ),
+            ComposerCheckpointDecision::Reject
+        );
+        assert_eq!(
+            composer_checkpoint_decision(Status::Saved { revision: 9 }, 8, false),
+            ComposerCheckpointDecision::Reject
+        );
+        assert_eq!(
+            composer_checkpoint_decision(Status::Saved { revision: 9 }, 0, true),
+            ComposerCheckpointDecision::Reject
+        );
+    }
+
+    #[test]
+    fn pr5_save_error_is_visible_and_retry_returns_only_an_intent() {
+        use crate::composer_draft_worker::DraftSaveStatus;
+        use egui_kittest::kittest::Queryable;
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        let retry = catalog.t("prompt.persistence.retry", &[]);
+        let failed = catalog.t("composer.draft.failed", &[]);
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, state: &mut bool| {
+                *state |= render_composer_draft_save_status(
+                    ui,
+                    &catalog,
+                    DraftSaveStatus::Failed {
+                        revision: 1,
+                        error: crate::composer_drafts::DraftError::WriteFailed,
+                    },
+                    None,
+                    Path::new("/temporary-fixture/composer_drafts.json"),
+                );
+            },
+            false,
+        );
+        harness.run();
+        assert!(harness.query_by_label(&failed).is_some());
+        harness.get_by_label(&retry).click();
+        harness.run();
+        assert!(*harness.state());
+    }
+
+    #[test]
+    fn pr1_deadline_is_rearmed_after_intervening_frames_until_unknown() {
+        let now = std::time::Instant::now();
+        let mut pending =
+            std::collections::HashMap::from([("op".into(), pr1_test_delivery(now, 7, false))]);
+        assert_eq!(
+            next_prompt_admission_wake(&pending, now),
+            Some(PROMPT_ADMISSION_TIMEOUT)
+        );
+        assert_eq!(
+            next_prompt_admission_wake(&pending, now + std::time::Duration::from_secs(2)),
+            Some(std::time::Duration::from_secs(8))
+        );
+        assert_eq!(
+            next_prompt_admission_wake(&pending, now + PROMPT_ADMISSION_TIMEOUT),
+            Some(std::time::Duration::ZERO)
+        );
+        pending
+            .get_mut("op")
+            .unwrap()
+            .mark_unknown_if_expired(now + PROMPT_ADMISSION_TIMEOUT);
+        assert_eq!(
+            next_prompt_admission_wake(&pending, now + PROMPT_ADMISSION_TIMEOUT),
+            None
+        );
+    }
+
+    #[test]
+    fn pr1_retired_unknown_releases_capacity_and_preserves_bounded_target_receipt() {
+        let now = std::time::Instant::now();
+        let mut pending = std::collections::HashMap::from([
+            ("old".into(), pr1_test_delivery(now, 7, true)),
+            ("live".into(), pr1_test_delivery(now, 8, false)),
+        ]);
+        let mut receipts = std::collections::VecDeque::new();
+        for (id, delivery) in take_retired_prompt_deliveries(&mut pending, |delivery| {
+            delivery.session == runtime::SessionId(8)
+        }) {
+            record_prompt_receipt(
+                &mut receipts,
+                id,
+                &delivery,
+                ui::composer::PromptAdmissionOutcome::Unknown,
+            );
+        }
+        assert_eq!(pending.len(), 1);
+        assert!(pending.contains_key("live"));
+        assert_eq!(receipts[0].operation_id, "old");
+        assert_eq!(receipts[0].runtime_instance, 41);
+        assert_eq!(receipts[0].session, runtime::SessionId(7));
+        assert_eq!(receipts[0].prompt_bytes, 8);
+        assert_eq!(receipts[0].unknown_payload.as_deref(), Some("original"));
+        assert_eq!(
+            receipts[0].outcome,
+            ui::composer::PromptAdmissionOutcome::Unknown
+        );
+        for index in 0..=PROMPT_DELIVERY_MAX_PENDING {
+            record_prompt_receipt(
+                &mut receipts,
+                format!("op:{index}"),
+                &pr1_test_delivery(now, 7, true),
+                ui::composer::PromptAdmissionOutcome::Unknown,
+            );
+        }
+        assert_eq!(receipts.len(), PROMPT_DELIVERY_MAX_PENDING);
+        let mut large = pr1_test_delivery(now, 7, true);
+        large.prompt = Arc::from("x".repeat(1024 * 1024));
+        for index in 0..10 {
+            record_prompt_receipt(
+                &mut receipts,
+                format!("large:{index}"),
+                &large,
+                ui::composer::PromptAdmissionOutcome::Unknown,
+            );
+        }
+        assert!(
+            receipts
+                .iter()
+                .filter_map(|receipt| receipt.unknown_payload.as_ref())
+                .map(|payload| payload.len())
+                .sum::<usize>()
+                <= PROMPT_DELIVERY_MAX_BYTES
+        );
+    }
+
+    #[test]
+    fn pr2_selected_text_uses_shared_encoder_without_enter_when_paste_mode_is_off() {
+        let workspace = ui::workspace::WorkspaceUi::new();
+        let plan = plan_prompt_delivery(
+            &workspace,
+            runtime::SessionId(7),
+            "one\r\ntwo\nthree",
+            false,
+        )
+        .unwrap();
+        let bytes: Vec<u8> = plan.into_parts().into_iter().flatten().collect();
+        assert_eq!(bytes, b"one  two three");
+        assert!(!bytes.contains(&b'\r') && !bytes.contains(&b'\n'));
+        let submit =
+            plan_prompt_delivery(&workspace, runtime::SessionId(7), "manual shell", true).unwrap();
+        assert_eq!(submit.into_parts(), vec![b"manual shell\r".to_vec()]);
+    }
+
+    #[test]
+    fn pr1_busy_host_slot_does_not_erase_draft_or_history() {
+        let mut composer = ui::composer::ComposerUi::new(
+            std::env::temp_dir().join(format!("deppy-pr1-staging-{}", std::process::id())),
+        );
+        composer.insert_text("workspace", "한글 😀 prompt");
+        let draft = composer.current_text("workspace").to_owned();
+        let ui::composer::ComposerAction::Send(submission) =
+            composer.try_submit(&draft, true, "workspace").unwrap()
+        else {
+            panic!()
+        };
+        let (prompt, _, submission_id) = submission.into_parts();
+        let required_draft_revision = composer.draft_revision();
+        let mut slot = Some(WorkspaceControllerAction::SyncDotenv);
+        let target = AppTerminalInputTarget::Primary {
+            workspace_id: "workspace".into(),
+            runtime_instance: 41,
+            session: runtime::SessionId(7),
+        };
+        assert!(!stage_composer_prompt_action(
+            &mut slot,
+            &mut composer,
+            Some((target, PromptInputContext::ManualShell)),
+            "workspace".into(),
+            prompt,
+            submission_id,
+            required_draft_revision,
+        ));
+        assert!(matches!(slot, Some(WorkspaceControllerAction::SyncDotenv)));
+        assert_eq!(composer.current_text("workspace"), "한글 😀 prompt");
+        let draft = composer.current_text("workspace").to_owned();
+        assert!(
+            composer.try_submit(&draft, true, "workspace").is_some(),
+            "host rejection re-enables manual sending"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    struct FollowUpRuntimeFixture {
+        client: runtime::InProcessRuntimeClient,
+        rx: runtime::RuntimeEventReceiver,
+        events: Vec<runtime::RuntimeEvent>,
+        root: PathBuf,
+        session: runtime::SessionId,
+        execution: crate::agent_detect::AgentExecutionIdentity,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl FollowUpRuntimeFixture {
+        fn new() -> Self {
+            use runtime::{RuntimeCommandSink, RuntimeEventStream};
+            struct NoSecrets;
+            impl runtime::RuntimeSecretResolver for NoSecrets {
+                fn resolve(&self, _: &str) -> anyhow::Result<runtime::RuntimeSecret> {
+                    anyhow::bail!("private fixture has no secrets")
+                }
+            }
+            let root = std::env::temp_dir().join(format!("deppy-pr14-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            let client = runtime::InProcessRuntimeClient::try_new_with_resolver(
+                5,
+                Arc::new(NoSecrets),
+                root.clone(),
+                secret::RedactionService::new(),
+                None,
+                Some(root.clone()),
+                vec![],
+            )
+            .unwrap();
+            let rx = client.subscribe();
+            client
+                .send_command(runtime::RuntimeCommand::SpawnAgent {
+                    agent_config_id: None,
+                    cols: 80,
+                    rows: 24,
+                    scrollback_lines: 100,
+                    command: "/bin/sh".into(),
+                    args: vec![
+                        "-c".into(),
+                        r#"printf 'OWNER:%s\r\n❯ ' "$$"; exec /bin/cat"#.into(),
+                    ],
+                    env_plain: vec![],
+                    env_secrets: vec![],
+                    waiting_regex: None,
+                    approval_regex: None,
+                    error_regex: None,
+                    done_regex: None,
+                })
+                .unwrap();
+            let mut events = Vec::new();
+            let session = Self::wait(&rx, &mut events, |event| match event {
+                runtime::RuntimeEvent::AgentSpawned { session } => Some(*session),
+                _ => None,
+            });
+            let owner = Self::wait(&rx, &mut events, |event| {
+                let (_, screen, _, _) = event.viewport()?;
+                let text: String = screen.visible_cells.iter().map(|cell| cell.c).collect();
+                if !text.contains('❯') {
+                    return None;
+                }
+                text.split_once("OWNER:")?
+                    .1
+                    .trim_start()
+                    .split(|c: char| !c.is_ascii_digit())
+                    .next()?
+                    .parse::<u32>()
+                    .ok()
+            });
+            let execution = crate::agent_detect::AgentExecutionIdentity::fixture_current(
+                crate::agent_detect::AgentKind::Claude,
+                owner,
+            )
+            .expect("private foreground owner must be current");
+            Self {
+                client,
+                rx,
+                events,
+                root,
+                session,
+                execution,
+            }
+        }
+
+        fn wait<T>(
+            rx: &runtime::RuntimeEventReceiver,
+            events: &mut Vec<runtime::RuntimeEvent>,
+            mut matches: impl FnMut(&runtime::RuntimeEvent) -> Option<T>,
+        ) -> T {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                events.extend(rx.drain());
+                assert!(
+                    events.len() <= 1024,
+                    "private fixture event budget exceeded"
+                );
+                if let Some(value) = events.iter().find_map(&mut matches) {
+                    return value;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "private fixture timed out"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+
+        fn outcome(&mut self, id: &str) -> Result<(), pty::PtyInputRejectReason> {
+            Self::wait(&self.rx, &mut self.events, |event| match event {
+                runtime::RuntimeEvent::InputAdmitted {
+                    operation_id,
+                    result,
+                    ..
+                } if operation_id == id => Some(*result),
+                _ => None,
+            })
+        }
+
+        fn reservation(&self, id: &str) -> QueuedFollowUp {
+            QueuedFollowUp {
+                target: crate::fleet::FleetPromptTarget {
+                    workspace_id: "private-pr14".into(),
+                    runtime_instance: 41,
+                    session: self.session,
+                    execution: self.execution,
+                },
+                prompt: format!("{id} 한글 😀").into(),
+                queued_turn: Some(1),
+                delivery_blocked: false,
+                delivery_unknown: false,
+                reservation_id: id.into(),
+                input_permit: FollowUpInputPermit::default(),
+            }
+        }
+
+        fn block_worker(&self) -> std::sync::mpsc::SyncSender<()> {
+            let (entered, ready) = std::sync::mpsc::sync_channel(1);
+            let (release, wait) = std::sync::mpsc::sync_channel(1);
+            let wait = std::sync::Mutex::new(wait);
+            self.client
+                .send_guarded_input_batch(
+                    self.session,
+                    "pr14:barrier".into(),
+                    vec![Vec::new()],
+                    runtime::InputAdmission::new(
+                        runtime::InputPermit::new(),
+                        std::time::Instant::now() + std::time::Duration::from_secs(5),
+                        move |admit| {
+                            let _ = entered.send(());
+                            if wait
+                                .lock()
+                                .unwrap()
+                                .recv_timeout(std::time::Duration::from_secs(5))
+                                .is_ok()
+                            {
+                                admit();
+                            }
+                        },
+                    ),
+                )
+                .unwrap();
+            ready
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            release
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for FollowUpRuntimeFixture {
+        fn drop(&mut self) {
+            self.client.shutdown();
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn pr14_queued_followup_race(action: u8) {
+        let mut fixture = FollowUpRuntimeFixture::new();
+        let old = fixture.reservation("original");
+        let key = (old.target.workspace_id.clone(), old.target.session);
+        let mut map = std::collections::HashMap::new();
+        admit_followup_reservation(&mut map, key.clone(), old.clone()).unwrap();
+        fixture
+            .client
+            .send_guarded_input_batch(
+                fixture.session,
+                "pr14:positive".into(),
+                vec![Vec::new()],
+                followup_input_admission(
+                    &old,
+                    std::time::Instant::now() + std::time::Duration::from_secs(5),
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            fixture.outcome("pr14:positive"),
+            Ok(()),
+            "positive control proves actual original execution/foreground authorization before cancel"
+        );
+        let release = fixture.block_worker();
+        fixture
+            .client
+            .send_guarded_input_batch(
+                fixture.session,
+                "pr14:original".into(),
+                vec![old.prompt.as_bytes().to_vec(), b"\r".to_vec()],
+                followup_input_admission(
+                    &old,
+                    std::time::Instant::now() + std::time::Duration::from_secs(5),
+                ),
+            )
+            .unwrap();
+        match action {
+            0 => {
+                assert!(cancel_followup_reservation(&mut map, &key).is_some());
+                assert!(map.is_empty());
+            }
+            1 => {
+                admit_followup_reservation(
+                    &mut map,
+                    key.clone(),
+                    fixture.reservation("replacement"),
+                )
+                .unwrap();
+                assert_eq!(map[&key].reservation_id, "replacement");
+            }
+            2 => {
+                settle_followup_admission(
+                    &mut map,
+                    &key,
+                    &old,
+                    ui::composer::PromptAdmissionOutcome::Accepted,
+                );
+                assert!(map.is_empty());
+            }
+            3 => {
+                settle_followup_admission(
+                    &mut map,
+                    &key,
+                    &old,
+                    ui::composer::PromptAdmissionOutcome::Unknown,
+                );
+                assert!(map[&key].delivery_unknown && map[&key].delivery_blocked);
+            }
+            4 => {
+                revoke_followup_authorizations(
+                    &mut map,
+                    &std::collections::HashMap::new(),
+                    |target| target.runtime_instance == old.target.runtime_instance,
+                );
+                assert!(map.contains_key(&key));
+            }
+            5 => {
+                drop(map);
+            }
+            6 => {
+                let mut rejected = fixture.reservation("rejected");
+                rejected.prompt = "x".repeat(crate::fleet::FLEET_PROMPT_MAX_BYTES + 1).into();
+                assert_eq!(
+                    admit_followup_reservation(&mut map, key.clone(), rejected),
+                    Err(FollowUpAdmissionError::LimitExceeded)
+                );
+                assert_eq!(map[&key], old);
+            }
+            7 => {
+                let pending = std::collections::HashMap::from([(
+                    "pr14:original".to_owned(),
+                    PendingPromptDelivery {
+                        workspace_id: old.target.workspace_id.clone(),
+                        runtime_instance: old.target.runtime_instance,
+                        session: old.target.session,
+                        prompt: Arc::clone(&old.prompt),
+                        origin: PromptDeliveryOrigin::FollowUp {
+                            queued: old.clone(),
+                        },
+                        deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+                        unknown: true,
+                    },
+                )]);
+                map.clear();
+                revoke_followup_authorizations(&mut map, &pending, |target| {
+                    target.runtime_instance == old.target.runtime_instance
+                });
+                assert!(pending["pr14:original"].unknown);
+                assert_eq!(pending["pr14:original"].prompt, old.prompt);
+            }
+            8 => {
+                revoke_followup_authorizations(
+                    &mut map,
+                    &std::collections::HashMap::new(),
+                    |target| target.runtime_instance == old.target.runtime_instance + 1,
+                );
+                assert_eq!(map[&key], old);
+            }
+            _ => panic!("unsupported private fixture action"),
+        }
+        drop(old);
+        release.send(()).unwrap();
+        let preserved = matches!(action, 6 | 8);
+        let expected = if preserved {
+            Ok(())
+        } else {
+            Err(pty::PtyInputRejectReason::AdmissionDenied)
+        };
+        assert_eq!(
+            fixture.outcome("pr14:original"),
+            expected,
+            "only revoked original reservations must be denied at actual PTY admission"
+        );
+        assert_eq!(
+            fixture
+                .events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    runtime::RuntimeEvent::SessionInputSubmitted { .. }
+                ))
+                .count(),
+            usize::from(preserved),
+            "original body+Enter is admitted once only when its reservation authorization is preserved"
+        );
+        if preserved {
+            FollowUpRuntimeFixture::wait(&fixture.rx, &mut fixture.events, |event| {
+                let (_, screen, _, _) = event.viewport()?;
+                screen
+                    .visible_cells
+                    .iter()
+                    .map(|cell| cell.c)
+                    .collect::<String>()
+                    .contains("original")
+                    .then_some(())
+            });
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn pr14_explicit_cancel_revokes_already_queued_private_runtime_followup() {
+        pr14_queued_followup_race(0);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn pr14_successful_replacement_revokes_already_queued_private_runtime_followup() {
+        pr14_queued_followup_race(1);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn pr14_accepted_settlement_revokes_original_private_runtime_authorization() {
+        pr14_queued_followup_race(2);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn pr14_unknown_settlement_blocks_and_revokes_original_private_runtime_authorization() {
+        pr14_queued_followup_race(3);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn pr14_retirement_revokes_queued_private_runtime_authorization_without_purging_prompt() {
+        pr14_queued_followup_race(4);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn pr14_final_reservation_owner_drop_revokes_queued_private_runtime_authorization() {
+        pr14_queued_followup_race(5);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn pr14_rejected_replacement_keeps_original_private_runtime_input_authorized() {
+        pr14_queued_followup_race(6);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn pr14_retirement_revokes_pending_origin_without_map_entry_and_retains_unknown() {
+        pr14_queued_followup_race(7);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn pr14_unrelated_runtime_retirement_keeps_original_private_runtime_input_authorized() {
+        pr14_queued_followup_race(8);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn pr14_late_original_ack_does_not_revoke_queued_replacement_authorization() {
+        let mut fixture = FollowUpRuntimeFixture::new();
+        let old = fixture.reservation("original");
+        let replacement = fixture.reservation("replacement");
+        let key = (old.target.workspace_id.clone(), old.target.session);
+        let mut map = std::collections::HashMap::new();
+        admit_followup_reservation(&mut map, key.clone(), old.clone()).unwrap();
+        admit_followup_reservation(&mut map, key.clone(), replacement.clone()).unwrap();
+        let release = fixture.block_worker();
+        fixture
+            .client
+            .send_guarded_input_batch(
+                fixture.session,
+                "pr14:replacement".into(),
+                vec![replacement.prompt.as_bytes().to_vec(), b"\r".to_vec()],
+                followup_input_admission(
+                    &replacement,
+                    std::time::Instant::now() + std::time::Duration::from_secs(5),
+                ),
+            )
+            .unwrap();
+        settle_followup_admission(
+            &mut map,
+            &key,
+            &old,
+            ui::composer::PromptAdmissionOutcome::Accepted,
+        );
+        assert_eq!(map[&key], replacement);
+        drop(old);
+        drop(replacement);
+        release.send(()).unwrap();
+        assert_eq!(fixture.outcome("pr14:replacement"), Ok(()));
+        assert_eq!(
+            fixture
+                .events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    runtime::RuntimeEvent::SessionInputSubmitted { .. }
+                ))
+                .count(),
+            1
+        );
+        FollowUpRuntimeFixture::wait(&fixture.rx, &mut fixture.events, |event| {
+            let (_, screen, _, _) = event.viewport()?;
+            screen
+                .visible_cells
+                .iter()
+                .map(|cell| cell.c)
+                .collect::<String>()
+                .contains("replacement")
+                .then_some(())
+        });
+    }
+
+    #[test]
+    fn pr4_followup_actual_map_admission_bounds_replacement_and_unknown() {
+        let queued = |id: u64, bytes: usize| QueuedFollowUp {
+            target: crate::fleet::FleetPromptTarget {
+                workspace_id: "w".into(),
+                runtime_instance: 41,
+                session: runtime::SessionId(id),
+                execution: crate::agent_detect::AgentExecutionIdentity::fixture(
+                    crate::agent_detect::AgentKind::Claude,
+                    1,
+                ),
+            },
+            prompt: "a".repeat(bytes).into(),
+            queued_turn: Some(1),
+            delivery_blocked: false,
+            delivery_unknown: false,
+            reservation_id: format!("reservation-{id}"),
+            input_permit: FollowUpInputPermit::default(),
+        };
+        let mut map = std::collections::HashMap::new();
+        for id in 0..256 {
+            assert_eq!(
+                admit_followup_reservation(
+                    &mut map,
+                    ("w".into(), runtime::SessionId(id)),
+                    queued(id, 16 * 1024)
+                ),
+                Ok(())
+            );
+        }
+        let original = map.clone();
+        assert_eq!(
+            admit_followup_reservation(
+                &mut map,
+                ("w".into(), runtime::SessionId(256)),
+                queued(256, 1)
+            ),
+            Err(FollowUpAdmissionError::LimitExceeded),
+            "capacity admission must reject before replacing or retaining payload"
+        );
+        assert_eq!(map, original);
+        let key = ("w".into(), runtime::SessionId(1));
+        assert_eq!(
+            admit_followup_reservation(&mut map, key.clone(), queued(1, 16 * 1024)),
+            Ok(()),
+            "same-size replacement uses delta, not extra slot/body capacity"
+        );
+        assert_eq!(
+            admit_followup_reservation(&mut map, key.clone(), queued(1, 1)),
+            Ok(())
+        );
+        let current = map[&key].clone();
+        settle_followup_admission(
+            &mut map,
+            &key,
+            &current,
+            ui::composer::PromptAdmissionOutcome::Unknown,
+        );
+        let unknown = map[&key].clone();
+        assert_eq!(
+            admit_followup_reservation(&mut map, key.clone(), queued(1, 2)),
+            Err(FollowUpAdmissionError::Unknown),
+            "unknown is never evicted/retried by another reservation"
+        );
+        assert_eq!(map[&key], unknown);
+        settle_followup_admission(
+            &mut map,
+            &key,
+            &unknown,
+            ui::composer::PromptAdmissionOutcome::Rejected,
+        );
+        assert!(
+            map[&key].delivery_unknown,
+            "a later rejection cannot erase unknown delivery"
+        );
+        let removed = map.remove(&key).unwrap();
+        assert!(
+            removed.delivery_unknown,
+            "explicit cancel removes only the retained reservation"
+        );
+        assert_eq!(
+            admit_followup_reservation(&mut map, key.clone(), queued(1, 16 * 1024)),
+            Ok(())
+        );
+        let before = map.clone();
+        assert_eq!(
+            admit_followup_reservation(&mut map, key.clone(), queued(1, 16 * 1024 + 1)),
+            Err(FollowUpAdmissionError::LimitExceeded)
+        );
+        assert_eq!(map, before);
+        assert!(
+            Arc::ptr_eq(&map[&key].prompt, &map[&key].clone().prompt),
+            "view/origin clones share immutable body storage"
+        );
+        let mut tiny = std::collections::HashMap::new();
+        for id in 0..256 {
+            assert_eq!(
+                admit_followup_reservation(
+                    &mut tiny,
+                    ("w".into(), runtime::SessionId(id)),
+                    queued(id, 1)
+                ),
+                Ok(())
+            );
+        }
+        let before = tiny.clone();
+        assert_eq!(
+            admit_followup_reservation(
+                &mut tiny,
+                ("w".into(), runtime::SessionId(256)),
+                queued(256, 1)
+            ),
+            Err(FollowUpAdmissionError::LimitExceeded),
+            "count cap is independent of prompt byte capacity"
+        );
+        assert_eq!(tiny, before);
+    }
+
+    #[test]
+    fn pr4_followup_metadata_admission_is_atomic_and_replacement_uses_delta() {
+        let execution = crate::agent_detect::AgentExecutionIdentity::fixture(
+            crate::agent_detect::AgentKind::Claude,
+            1,
+        );
+        let make = |workspace: &str, id: u64| QueuedFollowUp {
+            target: crate::fleet::FleetPromptTarget {
+                workspace_id: workspace.into(),
+                runtime_instance: 1,
+                session: runtime::SessionId(id),
+                execution,
+            },
+            prompt: "small prompt".into(),
+            queued_turn: None,
+            delivery_blocked: false,
+            delivery_unknown: false,
+            reservation_id: format!("reservation-{id}"),
+            input_permit: FollowUpInputPermit::default(),
+        };
+        let workspace = "w".repeat(1024);
+        let mut map = std::collections::HashMap::new();
+        let mut rejected = None;
+        for id in 0..256 {
+            let key = (workspace.clone(), runtime::SessionId(id));
+            let previous = map.clone();
+            if admit_followup_reservation(&mut map, key, make(&workspace, id)).is_err() {
+                assert_eq!(map, previous);
+                rejected = Some(id);
+                break;
+            }
+        }
+        assert!(
+            rejected.is_some_and(|id| id > 0 && id < 256),
+            "metadata cap independently bounds retained identifiers"
+        );
+        let key = (workspace.clone(), runtime::SessionId(0));
+        assert_eq!(
+            admit_followup_reservation(&mut map, key.clone(), make(&workspace, 0)),
+            Ok(())
+        );
+        let previous = map.clone();
+        let mut replacement = make(&workspace, 0);
+        replacement.reservation_id = "r".repeat(FOLLOWUP_MAX_METADATA_BYTES);
+        assert_eq!(
+            admit_followup_reservation(&mut map, key, replacement),
+            Err(FollowUpAdmissionError::LimitExceeded)
+        );
+        assert_eq!(map, previous);
+    }
+
+    #[test]
+    fn pr4_followup_unavailable_requires_original_runtime_or_confirmed_projection_evidence() {
+        let execution = crate::agent_detect::AgentExecutionIdentity::fixture(
+            crate::agent_detect::AgentKind::Claude,
+            1,
+        );
+        let target = crate::fleet::FleetPromptTarget {
+            workspace_id: "original".into(),
+            runtime_instance: 41,
+            session: runtime::SessionId(7),
+            execution,
+        };
+        assert!(
+            !followup_unavailable_from_projection(&target, Some(("original", false)), None),
+            "missing agent/UI projection is unproven, keep reservation"
+        );
+        assert!(!followup_unavailable_from_projection(
+            &target,
+            Some(("original", false)),
+            Some(execution)
+        ));
+        assert!(followup_unavailable_from_projection(&target, None, None));
+        assert!(followup_unavailable_from_projection(
+            &target,
+            Some(("replacement", false)),
+            Some(execution)
+        ));
+        assert!(followup_unavailable_from_projection(
+            &target,
+            Some(("original", true)),
+            Some(execution)
+        ));
+        let replacement = crate::agent_detect::AgentExecutionIdentity::fixture(
+            crate::agent_detect::AgentKind::Claude,
+            2,
+        );
+        assert!(followup_unavailable_from_projection(
+            &target,
+            Some(("original", false)),
+            Some(replacement)
+        ));
+    }
+
+    #[test]
+    fn pr4_followup_removed_session_stays_cancelable_after_exit_marker_cleanup() {
+        let session = runtime::SessionId(7);
+        let mut live = LiveSessionTracker::default();
+        assert!(
+            !followup_session_unavailable(&live, session),
+            "no runtime snapshot is unproven"
+        );
+        let mux = |include: bool| runtime::RuntimeEvent::MuxUpdated {
+            snapshot: Arc::new(runtime::MuxSnapshot {
+                tabs: vec![runtime::TabSnapshot {
+                    id: runtime::MuxTabId::new(),
+                    title: "fixture".into(),
+                    layout: runtime::LayoutNode::Pane(runtime::MuxPaneId::new()),
+                    panes: if include {
+                        vec![runtime::PaneSnapshot {
+                            id: runtime::MuxPaneId::new(),
+                            session_id: Some(session),
+                            title: "fixture".into(),
+                            persistent_session_id: None,
+                        }]
+                    } else {
+                        vec![]
+                    },
+                }],
+                active_tab: None,
+                focused_pane: None,
+            }),
+        };
+        live.observe(&mux(true));
+        assert!(!followup_session_unavailable(&live, session));
+        live.observe(&runtime::RuntimeEvent::SessionExited {
+            session,
+            exit_code: Some(0),
+        });
+        assert!(followup_session_unavailable(&live, session));
+        live.observe(&mux(false));
+        assert!(
+            live.exited_sessions.is_empty(),
+            "actual tracker compacts old exit markers"
+        );
+        assert!(
+            followup_session_unavailable(&live, session),
+            "complete original runtime snapshot proves session removal, so retain it blocked for Cancel"
+        );
+    }
+
+    #[test]
+    fn pr1_followup_rejected_unknown_and_replaced_reservations_are_not_lost() {
+        let key = ("workspace".to_owned(), runtime::SessionId(7));
+        let queued = QueuedFollowUp {
+            target: crate::fleet::FleetPromptTarget {
+                workspace_id: "workspace".into(),
+                runtime_instance: 41,
+                session: runtime::SessionId(7),
+                execution: crate::agent_detect::AgentExecutionIdentity::fixture(
+                    crate::agent_detect::AgentKind::Claude,
+                    1,
+                ),
+            },
+            prompt: "original".into(),
+            queued_turn: Some(1),
+            delivery_blocked: false,
+            delivery_unknown: false,
+            reservation_id: "old".into(),
+            input_permit: FollowUpInputPermit::default(),
+        };
+        let mut followups = std::collections::HashMap::from([(key.clone(), queued.clone())]);
+        settle_followup_admission(
+            &mut followups,
+            &key,
+            &queued,
+            ui::composer::PromptAdmissionOutcome::Rejected,
+        );
+        assert_eq!(followups[&key].prompt.as_ref(), "original");
+        assert!(followups[&key].delivery_blocked);
+        settle_followup_admission(
+            &mut followups,
+            &key,
+            &queued,
+            ui::composer::PromptAdmissionOutcome::Unknown,
+        );
+        assert!(followups.contains_key(&key));
+        let mut replacement = queued.clone();
+        replacement.reservation_id = "replacement".into();
+        replacement.input_permit = FollowUpInputPermit::default();
+        followups.insert(key.clone(), replacement.clone());
+        settle_followup_admission(
+            &mut followups,
+            &key,
+            &queued,
+            ui::composer::PromptAdmissionOutcome::Accepted,
+        );
+        assert_eq!(followups[&key], replacement);
+        settle_followup_admission(
+            &mut followups,
+            &key,
+            &replacement,
+            ui::composer::PromptAdmissionOutcome::Accepted,
+        );
+        assert!(followups.is_empty());
+    }
+
+    #[test]
+    fn pr1_delivery_ack_requires_exact_runtime_session_and_unknown_retains_original() {
+        let now = std::time::Instant::now();
+        let mut delivery = PendingPromptDelivery {
+            workspace_id: "workspace".into(),
+            runtime_instance: 41,
+            session: runtime::SessionId(7),
+            prompt: Arc::from("exact original"),
+            origin: PromptDeliveryOrigin::Broadcast,
+            deadline: now + PROMPT_ADMISSION_TIMEOUT,
+            unknown: false,
+        };
+        assert!(delivery.acknowledges(41, runtime::SessionId(7)));
+        assert!(!delivery.acknowledges(42, runtime::SessionId(7)));
+        assert!(!delivery.acknowledges(41, runtime::SessionId(8)));
+        assert!(!delivery.mark_unknown_if_expired(now));
+        assert!(delivery.mark_unknown_if_expired(now + PROMPT_ADMISSION_TIMEOUT));
+        assert!(!delivery.mark_unknown_if_expired(now + PROMPT_ADMISSION_TIMEOUT * 2));
+        assert_eq!(delivery.prompt.as_ref(), "exact original");
+        assert_eq!(delivery.runtime_instance, 41);
+        assert!(
+            delivery.acknowledges(41, runtime::SessionId(7)),
+            "late correlated ACK can settle the original"
+        );
+    }
+
     fn folder_prompt_fixture() -> WorkspaceRenamePrompt {
         WorkspaceRenamePrompt {
             workspace_id: "b".into(),
@@ -35861,6 +39651,54 @@ mod tests {
         );
     }
     use super::*;
+
+    #[test]
+    fn pr3_prompt_library_save_status_errors_are_visible_and_retry_is_explicit() {
+        use crate::prompt_library::PromptLibraryError as Error;
+        use crate::prompt_library_worker::PromptLibrarySaveStatus as Status;
+        use egui_kittest::kittest::Queryable;
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, state: &mut (Status, bool)| {
+                state.1 |= render_prompt_library_save_status(
+                    ui,
+                    &catalog,
+                    state.0,
+                    None,
+                    std::path::Path::new("/fixture/prompt_library.json"),
+                );
+            },
+            (
+                Status::RecoveryRequired {
+                    error: Error::Corrupt,
+                },
+                false,
+            ),
+        );
+        harness.run();
+        harness.get_by_label(
+            "Original preserved · Saving disabled. Recover the file, then reopen the app",
+        );
+        assert!(harness.query_by_label("Retry save").is_none());
+        harness.state_mut().0 = Status::Failed {
+            revision: 1,
+            error: Error::Conflict,
+        };
+        harness.run();
+        harness.get_by_label("File changed externally · Unsaved changes remain in memory");
+        assert!(harness.query_by_label("Retry save").is_none());
+        harness.state_mut().0 = Status::Failed {
+            revision: 2,
+            error: Error::WriteFailed,
+        };
+        harness.run();
+        harness.get_by_label("Save failed · Changes remain in memory");
+        assert!(!harness.state().1);
+        harness.get_by_label("Retry save").click();
+        harness.run();
+        assert!(harness.state().1);
+    }
+
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
@@ -36380,11 +40218,15 @@ mod tests {
         let stats_end = ui_body
             .rfind("self.frame_stats.end();")
             .expect("frame stats end");
+        let move_metadata_tail = ui_body
+            .rfind("crate::native_key_monitor::discard_unclaimed_move_paste();")
+            .expect("unconditional native move metadata frame tail");
 
         assert!(last_widget < active_flush);
         assert!(last_widget < warm_flush);
         assert!(active_flush < stats_end);
         assert!(warm_flush < stats_end);
+        assert!(warm_flush < move_metadata_tail && move_metadata_tail < stats_end);
     }
 
     #[test]
@@ -37321,6 +41163,7 @@ mod tests {
             (
                 rich,
                 RunningAgent {
+                    execution: None,
                     kind: AgentKind::Claude,
                     model: Some("argv-값".to_owned()),
                     effort: None,
@@ -37329,6 +41172,7 @@ mod tests {
             (
                 detected_only,
                 RunningAgent {
+                    execution: None,
                     kind: AgentKind::Kimi,
                     model: Some("kimi-code/k3".to_owned()),
                     effort: Some("high".to_owned()),
@@ -37696,6 +41540,7 @@ mod tests {
         let kinds = HashMap::from([(
             session,
             RunningAgent {
+                execution: None,
                 kind: AgentKind::Grok,
                 model: Some("grok-4.6".to_owned()),
                 effort: Some("xhigh".to_owned()),
@@ -37732,6 +41577,7 @@ mod tests {
         let kinds = HashMap::from([(
             session,
             RunningAgent {
+                execution: None,
                 kind: AgentKind::Codex,
                 model: Some("중단된 예전 모델".to_owned()),
                 effort: Some("low".to_owned()),
@@ -37768,6 +41614,7 @@ mod tests {
             user_instruction: Some("이전 Grok 요청".to_owned()),
         };
         let direct_claude = RunningAgent {
+            execution: None,
             kind: AgentKind::Claude,
             model: None,
             effort: None,
@@ -37789,6 +41636,7 @@ mod tests {
             user_instruction: Some("계속".to_owned()),
         };
         let running_grok = RunningAgent {
+            execution: None,
             kind: AgentKind::Grok,
             model: Some("grok-4.6".to_owned()),
             effort: Some("xhigh".to_owned()),
@@ -37823,6 +41671,7 @@ mod tests {
     #[test]
     fn 새_직접실행_claude만_기본값_worker를_새로_요청한다() {
         let direct_claude = crate::agent_detect::RunningAgent {
+            execution: None,
             kind: crate::agent_detect::AgentKind::Claude,
             model: None,
             effort: None,
@@ -37835,6 +41684,7 @@ mod tests {
         let explicit_claude = HashMap::from([(
             runtime::SessionId(2),
             crate::agent_detect::RunningAgent {
+                execution: None,
                 kind: crate::agent_detect::AgentKind::Claude,
                 model: Some("sonnet".to_owned()),
                 effort: Some("high".to_owned()),
@@ -37848,6 +41698,7 @@ mod tests {
         let direct_codex = HashMap::from([(
             runtime::SessionId(3),
             crate::agent_detect::RunningAgent {
+                execution: None,
                 kind: crate::agent_detect::AgentKind::Codex,
                 model: None,
                 effort: None,
@@ -43331,12 +47182,448 @@ mod tests {
         let cancel = std::sync::atomic::AtomicBool::new(true);
 
         assert_eq!(
-            app_host_move(&root, &source, &destination_dir, &cancel),
+            app_host_move(
+                Some(&root),
+                &source,
+                &destination_dir,
+                &mut AppHostFileOperationBudget::default(),
+                &cancel
+            ),
             Err(ui::file_tree::FileTreeIoErrorCode::NativeFailure)
         );
         assert!(source.exists());
         assert!(!destination_dir.join("source.bin").exists());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pr11_copy_group_conflict_in_last_member_refuses_all_before_effects() {
+        let root = std::env::temp_dir().join(format!("deppy-pr11-copy-{}", uuid::Uuid::new_v4()));
+        let destination = root.join("dest");
+        std::fs::create_dir_all(&destination).unwrap();
+        let sources = ["a.txt", "b.txt", "c.txt"].map(|name| root.join(name));
+        for (index, source) in sources.iter().enumerate() {
+            std::fs::write(source, [index as u8]).unwrap();
+        }
+        std::fs::write(destination.join("c.txt"), b"existing").unwrap();
+        let request = ui::file_tree::FileTreeIoRequest::CopyInto {
+            root: None,
+            sources: ui::file_tree::FileTreePathListPayload::try_new(sources.to_vec()).unwrap(),
+            destination: ui::file_tree::FileTreePathPayload::try_new(destination.clone()).unwrap(),
+        };
+        assert!(
+            run_file_tree_host_io(request, &std::sync::atomic::AtomicBool::new(false)).is_err()
+        );
+        assert!(
+            !destination.join("a.txt").exists(),
+            "first member changed before full preflight"
+        );
+        assert!(
+            !destination.join("b.txt").exists(),
+            "second member changed before full preflight"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("c.txt")).unwrap(),
+            b"existing"
+        );
+        assert!(sources.iter().all(|source| source.exists()));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pr11_copy_selected_folder_and_child_operates_only_on_root_once() {
+        let root = std::env::temp_dir().join(format!("deppy-pr11-roots-{}", uuid::Uuid::new_v4()));
+        let folder = root.join("folder");
+        let child = folder.join("child.txt");
+        let destination = root.join("dest");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::write(&child, b"child").unwrap();
+        let request = ui::file_tree::FileTreeIoRequest::CopyInto {
+            root: None,
+            sources: ui::file_tree::FileTreePathListPayload::try_new(vec![folder, child]).unwrap(),
+            destination: ui::file_tree::FileTreePathPayload::try_new(destination.clone()).unwrap(),
+        };
+        run_file_tree_host_io(request, &std::sync::atomic::AtomicBool::new(false)).unwrap();
+        assert_eq!(
+            std::fs::read(destination.join("folder/child.txt")).unwrap(),
+            b"child"
+        );
+        assert!(
+            !destination.join("child.txt").exists(),
+            "selected child must not be copied twice"
+        );
+        assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pr11_explicit_fake_clipboard_copies_then_moves_all_outside_tree_sources() {
+        use ui::file_tree::{
+            FileTreeIoErrorCode as Error, FileTreeIoRequest as Request,
+            FileTreePathListPayload as Paths, FileTreePathPayload as PathPayload,
+        };
+        let base =
+            std::env::temp_dir().join(format!("deppy-pr11-clipboard-{}", uuid::Uuid::new_v4()));
+        let tree_root = base.join("tree");
+        let foreign = base.join("foreign");
+        let copied = tree_root.join("copied");
+        let moved = tree_root.join("moved");
+        for dir in [&copied, &moved, &foreign] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let sources = ["a.txt", "b.txt", "c.txt"].map(|name| foreign.join(name));
+        for (i, source) in sources.iter().enumerate() {
+            std::fs::write(source, [i as u8]).unwrap();
+        }
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let forbidden = Request::Move {
+            root: PathPayload::try_new(tree_root.clone()).unwrap(),
+            sources: Paths::try_new(sources.to_vec()).unwrap(),
+            destination: PathPayload::try_new(moved.clone()).unwrap(),
+        };
+        assert_eq!(
+            run_file_tree_host_io(forbidden, &cancel),
+            Err(Error::OutsideRoot)
+        );
+        assert!(sources.iter().all(|source| source.exists()));
+        for (destination, move_files) in [(&copied, false), (&moved, true)] {
+            let mut clipboard_reads = 0;
+            let request = Request::PasteFromClipboard {
+                destination: PathPayload::try_new(destination.clone()).unwrap(),
+                move_files,
+            };
+            let result = run_file_tree_host_io_with_native(
+                request,
+                &cancel,
+                || {
+                    clipboard_reads += 1;
+                    Some(sources.to_vec())
+                },
+                |_| panic!("clipboard transfer must never call Trash"),
+            );
+            assert_eq!(result, Ok(()));
+            assert_eq!(clipboard_reads, 1);
+            assert_eq!(std::fs::read_dir(destination).unwrap().count(), 3);
+            for (i, source) in sources.iter().enumerate() {
+                assert_eq!(source.exists(), !move_files);
+                assert_eq!(
+                    std::fs::read(destination.join(source.file_name().unwrap())).unwrap(),
+                    [i as u8]
+                );
+            }
+        }
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pr11_group_trash_uses_preflight_canonical_parent_for_native_effect() {
+        use ui::file_tree::{
+            FileTreeIoRequest as Request, FileTreePathListPayload as Paths,
+            FileTreePathPayload as PathPayload,
+        };
+        let base =
+            std::env::temp_dir().join(format!("deppy-pr11-trash-parent-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(base.join("real")).unwrap();
+        let base = base.canonicalize().unwrap();
+        let target = base.join("real/a.txt");
+        std::fs::write(&target, b"owned").unwrap();
+        std::os::unix::fs::symlink(base.join("real"), base.join("alias")).unwrap();
+        let alias_target = base.join("alias/a.txt");
+        let request = Request::Trash {
+            target: PathPayload::try_new(alias_target.clone()).unwrap(),
+            preflight: Some((
+                PathPayload::try_new(base.clone()).unwrap(),
+                Paths::try_new(vec![alias_target]).unwrap(),
+            )),
+        };
+        let result = run_file_tree_host_io_with_native(
+            request,
+            &std::sync::atomic::AtomicBool::new(false),
+            || None,
+            |actual| {
+                assert_eq!(
+                    actual, target,
+                    "native effect must use the same canonical parent validated for the group"
+                );
+                Ok(())
+            },
+        );
+        assert_eq!(result, Ok(()));
+        assert!(target.exists());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pr11_copy_last_symlink_cycle_refuses_all_before_effects() {
+        let root =
+            std::env::temp_dir().join(format!("deppy-pr11-copy-symlink-{}", uuid::Uuid::new_v4()));
+        let destination = root.join("dest");
+        std::fs::create_dir_all(&destination).unwrap();
+        let source = root.join("a.txt");
+        let link = root.join("z-link");
+        std::fs::write(&source, b"owned").unwrap();
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+        let request = ui::file_tree::FileTreeIoRequest::CopyInto {
+            root: None,
+            sources: ui::file_tree::FileTreePathListPayload::try_new(vec![source.clone(), link])
+                .unwrap(),
+            destination: ui::file_tree::FileTreePathPayload::try_new(destination.clone()).unwrap(),
+        };
+        assert!(
+            run_file_tree_host_io(request, &std::sync::atomic::AtomicBool::new(false)).is_err()
+        );
+        assert_eq!(
+            std::fs::read_dir(&destination).unwrap().count(),
+            0,
+            "last canonical source cycle must be caught before copying first member"
+        );
+        assert_eq!(std::fs::read(source).unwrap(), b"owned");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pr11_group_transfer_unsafe_member_refuses_all_and_same_folder_semantics_hold() {
+        use ui::file_tree::FileTreeIoErrorCode as Error;
+        let base = std::env::temp_dir().join(format!(
+            "deppy-pr11-transfer-safety-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let folder = base.join("folder");
+        let destination = folder.join("dest");
+        std::fs::create_dir_all(&destination).unwrap();
+        let a = base.join("a.txt");
+        std::fs::write(&a, b"a").unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        for move_files in [false, true] {
+            assert_eq!(
+                app_host_transfer_files(
+                    Some(&base),
+                    vec![a.clone(), folder.clone()],
+                    &destination,
+                    move_files,
+                    &cancel
+                ),
+                Err(Error::OutsideRoot)
+            );
+            assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 0);
+            assert!(a.exists());
+        }
+        assert_eq!(
+            app_host_transfer_files(Some(&base), vec![a.clone()], &base, true, &cancel),
+            Ok(())
+        );
+        assert_eq!(std::fs::read(&a).unwrap(), b"a");
+        assert_eq!(
+            app_host_transfer_files(Some(&base), vec![a.clone()], &base, false, &cancel),
+            Err(Error::Conflict)
+        );
+        let already_there = destination.join("b.txt");
+        std::fs::write(&already_there, b"b").unwrap();
+        assert_eq!(
+            app_host_transfer_files(
+                Some(&base),
+                vec![already_there.clone(), a.clone()],
+                &destination,
+                true,
+                &cancel
+            ),
+            Ok(())
+        );
+        assert!(!a.exists());
+        assert_eq!(std::fs::read(destination.join("a.txt")).unwrap(), b"a");
+        assert_eq!(std::fs::read(already_there).unwrap(), b"b");
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn pr11_group_trash_missing_last_member_calls_no_native_backend() {
+        use ui::file_tree::{
+            FileTreeIoRequest as Request, FileTreePathListPayload as Paths,
+            FileTreePathPayload as PathPayload,
+        };
+        let base = std::env::temp_dir().join(format!(
+            "deppy-pr11-trash-preflight-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&base).unwrap();
+        let first = base.join("a.txt");
+        std::fs::write(&first, b"first").unwrap();
+        let request = Request::Trash {
+            target: PathPayload::try_new(first.clone()).unwrap(),
+            preflight: Some((
+                PathPayload::try_new(base.clone()).unwrap(),
+                Paths::try_new(vec![first.clone(), base.join("missing.txt")]).unwrap(),
+            )),
+        };
+        let mut calls = 0;
+        let result = run_file_tree_host_io_with_native(
+            request,
+            &std::sync::atomic::AtomicBool::new(false),
+            || None,
+            |_| {
+                calls += 1;
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(calls, 0);
+        assert_eq!(std::fs::read(first).unwrap(), b"first");
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn pr11_fake_clipboard_parent_component_does_not_omit_real_sibling() {
+        use ui::file_tree::{FileTreeIoRequest as Request, FileTreePathPayload as PathPayload};
+        let base = std::env::temp_dir().join(format!(
+            "deppy-pr11-parent-component-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let foreign = base.join("foreign");
+        let folder = foreign.join("folder");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("child.txt"), b"child").unwrap();
+        std::fs::write(foreign.join("a.txt"), b"sibling").unwrap();
+        let sources = vec![folder.clone(), folder.join("../a.txt")];
+        for (name, move_files) in [("copied", false), ("moved", true)] {
+            let destination = base.join(name);
+            std::fs::create_dir(&destination).unwrap();
+            let request = Request::PasteFromClipboard {
+                destination: PathPayload::try_new(destination.clone()).unwrap(),
+                move_files,
+            };
+            assert_eq!(
+                run_file_tree_host_io_with_native(
+                    request,
+                    &std::sync::atomic::AtomicBool::new(false),
+                    || Some(sources.clone()),
+                    |_| panic!("no native Trash")
+                ),
+                Ok(())
+            );
+            assert_eq!(
+                std::fs::read_dir(&destination).unwrap().count(),
+                2,
+                "lexical .. path is a sibling, not a selected descendant"
+            );
+            assert_eq!(
+                std::fs::read(destination.join("a.txt")).unwrap(),
+                b"sibling"
+            );
+            assert_eq!(
+                std::fs::read(destination.join("folder/child.txt")).unwrap(),
+                b"child"
+            );
+            assert_eq!(folder.exists(), !move_files);
+            assert_eq!(foreign.join("a.txt").exists(), !move_files);
+        }
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn pr11r_native_volume_case_and_normalization_conflicts_precede_all_transfers() {
+        use ui::file_tree::FileTreeIoErrorCode as Error;
+        for (label, names) in [
+            ("case", ["a.txt", "A.txt"]),
+            ("normalization", ["é.txt", "e\u{301}.txt"]),
+        ] {
+            for move_files in [false, true] {
+                let base = std::env::temp_dir().join(format!(
+                    "deppy-pr11r-volume-{label}-{}",
+                    uuid::Uuid::new_v4()
+                ));
+                let destination = base.join("dest");
+                std::fs::create_dir_all(&destination).unwrap();
+                // Prove the fixture's destination actually treats these names as equivalent.
+                let probe = destination.join(names[0]);
+                std::fs::write(&probe, b"probe").unwrap();
+                assert_eq!(std::fs::read(destination.join(names[1])).unwrap(), b"probe");
+                std::fs::remove_file(probe).unwrap();
+                let sources: Vec<_> = names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| {
+                        let parent = base.join(format!("source-{i}"));
+                        std::fs::create_dir(&parent).unwrap();
+                        let path = parent.join(name);
+                        std::fs::write(&path, [i as u8]).unwrap();
+                        path
+                    })
+                    .collect();
+                let result = app_host_transfer_files(
+                    Some(&base),
+                    sources.clone(),
+                    &destination,
+                    move_files,
+                    &std::sync::atomic::AtomicBool::new(false),
+                );
+                assert_eq!(
+                    std::fs::read_dir(&destination).unwrap().count(),
+                    0,
+                    "known volume-equivalent names must refuse before transferring a source/content member"
+                );
+                assert_eq!(result, Err(Error::Conflict));
+                for (i, source) in sources.iter().enumerate() {
+                    assert_eq!(std::fs::read(source).unwrap(), [i as u8]);
+                }
+                std::fs::remove_dir_all(base).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn pr11r_64_name_volume_preflight_measures_shortcut_and_cleans_native_probes() {
+        let base = std::env::temp_dir().join(format!(
+            "deppy-pr11r-name-preflight-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&base).unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let ascii: Vec<_> = (0..64)
+            .map(|i| std::ffi::OsString::from(format!("file-{i:02}.txt")))
+            .collect();
+        let names: Vec<_> = ascii.iter().map(std::ffi::OsString::as_os_str).collect();
+        let started = std::time::Instant::now();
+        let ascii_probes = app_host_preflight_destination_names(&base, &names, &cancel).unwrap();
+        let ascii_us = started.elapsed().as_micros();
+        assert_eq!(
+            app_host_ascii_destination_case_sensitive(&base),
+            Some(false),
+            "fixture must verify known local insensitive volume metadata"
+        );
+        assert_eq!(ascii_probes, 0);
+        assert_eq!(std::fs::read_dir(&base).unwrap().count(), 0);
+        let unicode: Vec<_> = (0..64)
+            .map(|i| std::ffi::OsString::from(format!("파일-{i:02}.txt")))
+            .collect();
+        let names: Vec<_> = unicode.iter().map(std::ffi::OsString::as_os_str).collect();
+        let started = std::time::Instant::now();
+        let unicode_probes = app_host_preflight_destination_names(&base, &names, &cancel).unwrap();
+        let unicode_us = started.elapsed().as_micros();
+        assert_eq!(unicode_probes, 64);
+        assert_eq!(std::fs::read_dir(&base).unwrap().count(), 0);
+        println!(
+            "pr11r preflight64 ASCII probes={ascii_probes} elapsed_us={ascii_us}; Unicode probes={unicode_probes} elapsed_us={unicode_us}"
+        );
+        let result =
+            app_host_preflight_destination_names_with_observer(&base, &names, &cancel, |count| {
+                assert_eq!(count, 1);
+                cancel.store(true, std::sync::atomic::Ordering::Release);
+            });
+        assert_eq!(
+            result,
+            Err(ui::file_tree::FileTreeIoErrorCode::NativeFailure)
+        );
+        assert_eq!(
+            std::fs::read_dir(&base).unwrap().count(),
+            0,
+            "cancellation after first actual native probe must clean the owned directory"
+        );
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
@@ -48166,7 +52453,11 @@ mod tests {
                     runtime_instance: 3,
                     session: runtime::SessionId(7),
                 },
+                context: PromptInputContext::ManualShell,
                 prompt: Arc::from("보존할 입력"),
+                draft_key: "workspace-a".to_owned(),
+                submission_id: 1,
+                required_draft_revision: 1,
             },
         ];
         for original in original {
@@ -48185,7 +52476,7 @@ mod tests {
                     assert_eq!(session, runtime::SessionId(7));
                     assert_eq!(bytes, b"echo keep\n");
                 }
-                WorkspaceControllerAction::ComposerPrompt { target, prompt } => {
+                WorkspaceControllerAction::ComposerPrompt { target, prompt, .. } => {
                     assert!(
                         matches!(target, AppTerminalInputTarget::Primary { workspace_id, runtime_instance: 3, session: runtime::SessionId(7) } if workspace_id == "workspace-a")
                     );
@@ -48273,7 +52564,7 @@ mod tests {
             .expect("정확한 대상에서 세션 시작 창을 열어야 한다");
         assert!(validate < switch && switch < revalidate && revalidate < open);
         assert!(source.contains(
-            "self.poll_workspace_controller();\n        self.poll_pending_workspace_session_open();"
+            "self.poll_workspace_controller();\n        self.poll_durable_composer_prompt();\n        self.poll_pending_workspace_session_open();"
         ));
     }
 

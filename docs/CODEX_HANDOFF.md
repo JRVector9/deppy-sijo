@@ -1,3 +1,15 @@
+# Active: user-authorized 0.7.4 rebuild and restart — 2026-10-05
+
+- Current request explicitly authorizes rebuilding and restarting once. Authoritative worktree /Users/jr/Desktop/projects/deppy-sijo-performance, branch feat/audit-nine-pr-v0.6.0-20261004; source fixes bcfe111df53b177c1fd1f665b9d1427c7a78634f, previous clean HEAD931f37b2. No Deppy process at preflight; no shared Codex daemon stop/restart intended.
+- Last shipped version0.7.3 is greatest in inspected worktrees/bundle artifacts. New local release0.7.4: root workspace version and exactly27 inherited workspace lock entries updated; external dependencies preserved. Source includes popup Context nested-lock fix, explicit composer stale-stream admission correction with current-screen controls, OAuth wake after credential unlock, checkpoint deadline-first dispatch, inline composer rejection feedback.
+- Prior actual source validation remains3264pass/35ignored, strict5affectedcrate Clippy/boundary/27dependencies/fmt/diff PASS; prior parallel Runtime3fail and serial347PASS preserved in review report. Version-only release preparation has not rerun those suites. No live user prompt sent or long-input verification claimed.
+- Modified files in this phase: Cargo.toml, Cargo.lock, this handoff. Temporary outside-repository0.7.4 package/proof scripts adapted from prior0.7.3 helpers, preserve old artifacts and refuse staged overwrite. Planned new bundle target/restart-0.7.4-20261005/Deppy Sijo.app; local Developer ID signing, no new notarization/public deployment.
+- Executed gated offline/locked metadata exit0:27 workspace packages report0.7.4; git diff --check PASS. External package equality verified before write. No failed approach this release phase.
+- Next: version/source commit+push; capture source commit/digest, gated release package, verify unchanged source/native version bindings/plist both fields/signature/archive. Only after verification perform the newly authorized launch and check executable path/PID/responsiveness. Do not mutate Rust/Cargo or commit HEAD while capture-to-verify build is active.
+- Exact next commands: python3 /private/tmp/deppy-audit-nine-pr-20261004/cargo_gate.py metadata --offline --locked --no-deps --format-version 1; git diff --check; git add Cargo.toml Cargo.lock docs/CODEX_HANDOFF.md; git commit; git push origin feat/audit-nine-pr-v0.6.0-20261004; python3 /tmp/deppy-rebuild-0.7.4-20261005-proof.py capture; DEPPY_REQUIRE_TRUSTED_SIGNING=0 DEPPY_ALLOW_UNTRUSTED_SIGNING=1 CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 sh /tmp/deppy-rebuild-0.7.4-20261005.sh; python3 /tmp/deppy-rebuild-0.7.4-20261005-proof.py verify. Build/launch results pending; do not infer success.
+
+---
+
 # Composer correction and two deadlock fixes committed and pushed — 2026-10-05
 
 - Product source commit `bcfe111df53b177c1fd1f665b9d1427c7a78634f` pushed to origin/feat/audit-nine-pr-v0.6.0-20261004. Worktree was clean afterpush; this closeout is documentation-only, no new tests/product changes/release/launch.

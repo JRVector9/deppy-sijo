@@ -1,3 +1,28 @@
+# Composer draft-saving fix pushed and 0.7.3 artifact verified — 2026-10-05 (KST)
+
+- Current objective: user confirmed persistent “초안 저장 중…” and Enter not sending; eliminate routine status and keep persistence feedback inside the bottom input card. Existing screenshot, latest-resume and composer follow-ups are included in the latest artifact. User's immediate restart deferral remains in force.
+- Completed: reproduced completed revision1 hidden by Pending2; track committed revision separately and use it in the actual App checkpoint gate. Added a10s known-unsent deadline with re-armed repaint, preserved/retryable draft, no late automatic send or checkpoint bypass. Routine saving text removed; error/retry presenter shares input-card border; known-unsent rejection inline. Runtime/wire/schema unchanged.
+- Source commit `22a344dacd3964cdee0cd65baa82358e9b7b49a2` pushed on `feat/audit-nine-pr-v0.6.0-20261004`. This closeout is documentation-only. Product files: Cargo.toml/lock, app.rs, composer_draft_worker.rs, ui/composer.rs. Report: docs/reviews/2026-10-05-composer-checkpoint-stall.md.
+- Tests actually executed: initial RED2 + timeout RED1; focused GREEN checkpoint3, adjacent pr5_29, actual egui error/retry shared-card geometry1. Final gates `/tmp/deppy-draft-stall-final-gates-20261005.log` exit0:2792passed/0failed/34ignored across App/integration/i18n; strict affected all-target Clippy-Dwarnings, UI boundary,27-crate dependency gate, fmt/diff pass. Manual source review; no independent CLI review or subagents.
+- Release old0.7.2 unlaunched→new0.7.3; last launched0.7.0 PID26830 unchanged.27 inherited lock entries match, external dependencies untouched. Fresh gated offline/locked signed local-development package script exit0, strict signatures/architecture/archive verification and both plist fields0.7.3 verified. Compiled native/About version binding uses CARGO_PKG_VERSION; binary contains0.7.3. No new notarization/public deployment.
+- Artifact `target/restart-0.7.3-20261005/Deppy Sijo.app` and ZIP; source commit22a344da. Proof `/tmp/deppy-rebuild-0.7.3-20261005-proof.json`, build log `/tmp/deppy-rebuild-0.7.3-20261005.log`.805 product files unchanged between source capture and post-build; source SHA2565c617f39025cfbb87522efcc2e0e4679415b90e76893496b769599601ba47a12; binary SHA25634dfcbe3702ad9be117619a66922573ff41bd74bb4b3e13f4a29b26ec9acfd2c.
+- Failed approaches: version count assertion safely caught2 external0.7.2 dependencies, stale lock then refused locked test; corrected only27 workspace entries. UI test missed crate::config qualification then corrected before GREEN. Proof helper initially included source-less vendors then selected version.workspace=true manifests; corrected capture passed early in compilation, before packaging. No incorrect product lock changes or hidden test failures.
+- Limitation/remaining: actual user's Enter interaction against their agent is not reproduced/verified after this fix. Read-only native sample found writer waiting on Condvar, not disk I/O; don't claim live filesystem hang. No real user prompt sent or DB/config/draft/transcript modified. Package NOT launched and no restart controller scheduled. Keep running0.7.0 until restart explicitly authorized under continued user scope.
+- Exact next commands: `cd /Users/jr/Desktop/projects/deppy-sijo-performance`; `git status --short --branch`; `git ls-remote origin refs/heads/feat/audit-nine-pr-v0.6.0-20261004`; `cat /tmp/deppy-rebuild-0.7.3-20261005-proof.json`; `ps -o pid=,etime=,comm= -p26830`. Never run obsolete0.7.1 restart controller or automatic dev-run. Product/build work complete; restart/live Enter verification remains deferred.
+
+---
+
+# Composer fix source pushed /0.7.3 build in progress — 2026-10-05 (KST)
+
+- Product commit22a344dacd3964cdee0cd65baa82358e9b7b49a2 pushed onfeat/audit-nine-pr-v0.6.0-20261004. Final gates2792passed/0failed/34ignored and strict Clippy/boundary/deps/fmt/diff all passed before commit. Only documentation may change during release build.
+- Gated offline/locked release build and separate signing/archive verification running /tmp/deppy-rebuild-0.7.3-20261005.log. Planned artifact target/restart-0.7.3-20261005/Deppy Sijo.app, script refuses to overwrite staging. No launch/controller scheduled; live0.7.0PID26830 unchanged.
+- Source capture /tmp/deppy-rebuild-0.7.3-20261005-source.json:805tracked product files, SHA2565c617f39025cfbb87522efcc2e0e4679415b90e76893496b769599601ba47a12, commit22a344da, version0.7.3. Captured early during release compilation after proof helper validation correction, before artifact packaging. Product source unchanged.
+- Proof helper first counted source-less vendored packages as workspace packages and asserted; corrected selection to canonical version.workspace=true manifests27. No product/build failure, no wrong lock edits. Source capture passed after correction.
+- Remaining: wait build exit; proof.py verify exact source/version/signature; record package evidence and commit/push docs. Never claim bundle success or native Enter PASS before actual results. Restart remains deferred.
+- Exact next: tail -n25 /tmp/deppy-rebuild-0.7.3-20261005.log; python3 /tmp/deppy-rebuild-0.7.3-20261005-proof.py verify; git diff --check; ps -o pid=,etime=,comm= -p26830.
+
+---
+
 # Draft stall gates passed / commit and package — 2026-10-05 (KST)
 
 - Objective implementation complete in source: completed checkpoint no longer hidden by later autosave;10s bounded known-unsent wait with retained/retryable draft and no late auto-send; normal saving label removed; errors/retry inside card; known-unsent rejection inline.

@@ -20,7 +20,7 @@ Final gates actually executed exit0:2792passed/0failed/34ignored across App+inte
 ## Release record
 
 - Product commit `22a344dacd3964cdee0cd65baa82358e9b7b49a2` pushed on `feat/audit-nine-pr-v0.6.0-20261004`.
-- Gated offline/locked release build and package script exited0. Separately staged `target/restart-0.7.3-20261005/Deppy Sijo.app` and ZIP. Developer ID identity Vector Nine INC (ZDTU5LS35K); binary/bundle strict signature, architecture and archive verification passed under the explicit local development policy. No new notarization or public deployment.
+- Gated offline/locked release build and package script exited0. Separately staged `target/restart-0.7.3-20261005/Deppy Sijo.app` and ZIP. Developer ID identity VectorNine INC (ZDTU5LS35K); binary/bundle strict signature, architecture and archive verification passed under the explicit local development policy. No new notarization or public deployment.
 - Both `CFBundleShortVersionString` and `CFBundleVersion` are0.7.3;27 inherited workspace lock versions match. Compiled native/About uses `CARGO_PKG_VERSION`, and the compiled binary contains0.7.3. The new native UI has not been launched or inspected.
 - Proof `/tmp/deppy-rebuild-0.7.3-20261005-proof.json` verifies805 tracked product files unchanged between capture and post-build; source SHA256 `5c617f39025cfbb87522efcc2e0e4679415b90e76893496b769599601ba47a12`, binary SHA256 `34dfcbe3702ad9be117619a66922573ff41bd74bb4b3e13f4a29b26ec9acfd2c`. Build log `/tmp/deppy-rebuild-0.7.3-20261005.log`.
 - Running0.7.0 PID26830 remains unchanged. No restart controller scheduled. Actual user-agent Enter interaction still needs verification after an authorized restart; the deterministic worker/gate and actual egui geometry regressions passed.

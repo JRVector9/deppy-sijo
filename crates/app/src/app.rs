@@ -11034,6 +11034,31 @@ enum PromptDeliveryOrigin {
     },
 }
 
+fn notify_prompt_rejection(
+    notifications: &mut ui::notifications::NotificationsUi,
+    text: &i18n::Catalog,
+    workspace_id: &str,
+    origin: &PromptDeliveryOrigin,
+    outcome: ui::composer::PromptAdmissionOutcome,
+) {
+    // Composer already retains the exact outcome in its input card.
+    if matches!(origin, PromptDeliveryOrigin::Composer { .. }) {
+        return;
+    }
+    let key = if outcome == ui::composer::PromptAdmissionOutcome::Unknown {
+        "composer.delivery.unknown"
+    } else {
+        "composer.delivery.rejected"
+    };
+    notifications.on_workspace_error(
+        workspace_id,
+        workspace_id,
+        ui::workspace::WorkspaceErrorKind::Other,
+        &text.t(key, &[]),
+        text,
+    );
+}
+
 struct PendingPromptDelivery {
     workspace_id: String,
     runtime_instance: u64,
@@ -31092,17 +31117,12 @@ impl App {
             }
             PromptDeliveryOrigin::Broadcast | PromptDeliveryOrigin::SelectedPaste => {}
         }
-        let key = if outcome == ui::composer::PromptAdmissionOutcome::Unknown {
-            "composer.delivery.unknown"
-        } else {
-            "composer.delivery.rejected"
-        };
-        self.notifications_ui.on_workspace_error(
-            workspace_id,
-            workspace_id,
-            ui::workspace::WorkspaceErrorKind::Other,
-            &self.i18n.t(key, &[]),
+        notify_prompt_rejection(
+            &mut self.notifications_ui,
             &self.i18n,
+            workspace_id,
+            origin,
+            outcome,
         );
     }
 
@@ -36491,17 +36511,11 @@ fn take_ready_durable_composer_prompt(
     error: Option<crate::composer_drafts::DraftError>,
 ) -> Option<(PendingDurableComposerPrompt, ComposerCheckpointDecision)> {
     let pending = slot.take()?;
-    let decision = if error.is_some() {
+    // Expiry wins even when a late save completed before this logic tick.
+    let decision = if error.is_some() || std::time::Instant::now() >= pending.checkpoint_deadline {
         ComposerCheckpointDecision::Reject
     } else {
         pending.ready(composer, status)
-    };
-    let decision = if decision == ComposerCheckpointDecision::Wait
-        && std::time::Instant::now() >= pending.checkpoint_deadline
-    {
-        ComposerCheckpointDecision::Reject
-    } else {
-        decision
     };
     if decision == ComposerCheckpointDecision::Wait {
         // Keep the exact captured target until completion or the known-unsent deadline.
@@ -38725,6 +38739,63 @@ mod tests {
     }
 
     #[test]
+    fn composer_checkpoint_expired_saved_marker_keeps_draft_without_dispatch() {
+        use crate::composer_draft_worker::DraftSaveStatus as Status;
+        let mut composer = ui::composer::ComposerUi::new(
+            std::env::temp_dir().join(format!("deppy-checkpoint-timeout-{}", uuid::Uuid::new_v4())),
+        );
+        composer.insert_text("A", "retained prompt");
+        let ui::composer::ComposerAction::Send(submission) =
+            composer.try_submit("retained prompt", true, "A").unwrap()
+        else {
+            panic!()
+        };
+        let (prompt, _, submission_id) = submission.into_parts();
+        let mut slot = Some(PendingDurableComposerPrompt {
+            target: AppTerminalInputTarget::Primary {
+                workspace_id: "workspace".into(),
+                runtime_instance: 0,
+                session: runtime::SessionId(41),
+            },
+            context: PromptInputContext::ManualShell,
+            prompt,
+            draft_key: "A".into(),
+            submission_id,
+            required_save_revision: 1,
+            checkpoint_deadline: std::time::Instant::now() - std::time::Duration::from_secs(1),
+        });
+        let ready = take_ready_durable_composer_prompt(
+            &mut slot,
+            &composer,
+            Status::Saved { revision: 1 },
+            None,
+        );
+        let (pending, decision) = ready.expect("a stalled save must release the unsent submission");
+        assert_eq!(decision, ComposerCheckpointDecision::Reject);
+        composer.reject_unqueued_submission(
+            &pending.draft_key,
+            pending.submission_id,
+            &pending.prompt,
+            pending.generation(),
+        );
+        assert_eq!(composer.current_text("A"), "retained prompt");
+        assert!(!composer.checkpoint().drafts[0].delivery_uncertain);
+        assert!(
+            take_ready_durable_composer_prompt(
+                &mut slot,
+                &composer,
+                Status::Saved { revision: 1 },
+                None
+            )
+            .is_none()
+        );
+        assert!(
+            composer.try_submit("retained prompt", true, "A").is_some(),
+            "explicit retry must be available"
+        );
+    }
+
+    #[test]
     fn composer_checkpoint_timeout_keeps_draft_and_late_save_never_sends() {
         use crate::composer_draft_worker::DraftSaveStatus as Status;
         let mut composer = ui::composer::ComposerUi::new(
@@ -38779,6 +38850,55 @@ mod tests {
             composer.try_submit("retained prompt", true, "A").is_some(),
             "explicit retry must be available"
         );
+    }
+
+    #[test]
+    fn composer_rejection_feedback_stays_inline_without_native_intents() {
+        let text = i18n::Catalog::load("ko-KR").unwrap();
+        let origin = PromptDeliveryOrigin::Composer {
+            draft_key: "A".into(),
+            submission_id: 1,
+        };
+        for outcome in [
+            ui::composer::PromptAdmissionOutcome::Rejected,
+            ui::composer::PromptAdmissionOutcome::Unknown,
+        ] {
+            let mut notices = ui::notifications::NotificationsUi::new();
+            notify_prompt_rejection(&mut notices, &text, "workspace", &origin, outcome);
+            assert!(
+                notices.pop_native_intent().is_none(),
+                "composer feedback must not leave the input card"
+            );
+            assert_eq!(notices.unread(), 0);
+        }
+    }
+
+    #[test]
+    fn composer_rejection_routing_keeps_other_origin_notifications() {
+        let text = i18n::Catalog::load("ko-KR").unwrap();
+        for origin in [
+            PromptDeliveryOrigin::Broadcast,
+            PromptDeliveryOrigin::SelectedPaste,
+        ] {
+            for outcome in [
+                ui::composer::PromptAdmissionOutcome::Rejected,
+                ui::composer::PromptAdmissionOutcome::Unknown,
+            ] {
+                let mut notices = ui::notifications::NotificationsUi::new();
+                notify_prompt_rejection(&mut notices, &text, "workspace", &origin, outcome);
+                let native = notices
+                    .pop_native_intent()
+                    .expect("other delivery origins still notify");
+                let key = if outcome == ui::composer::PromptAdmissionOutcome::Unknown {
+                    "composer.delivery.unknown"
+                } else {
+                    "composer.delivery.rejected"
+                };
+                assert!(native.body().contains(&text.t(key, &[])));
+                assert_eq!(notices.unread(), 1);
+                assert!(notices.pop_native_intent().is_none());
+            }
+        }
     }
 
     #[test]

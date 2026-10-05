@@ -11282,28 +11282,202 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn composer_codex_placeholder_accepts_multiline_prompt_in_owned_pty() {
+        for prompt in [
+            "한글 첫 줄\n두 번째 줄\n세 번째 줄".to_owned(),
+            "가".repeat(170),
+            "가".repeat(171),
+            "가".repeat(2_000),
+            format!("{}\n끝", "가".repeat(30_000)),
+        ] {
+            let prompt = format!("{prompt}COMPOSER-FIXTURE-END");
+            let resolver = Arc::new(RecordingResolver {
+                calls: Mutex::new(Vec::new()),
+                value: None,
+            });
+            let (mut worker, _events) = admission_worker(resolver, "composer-codex-placeholder");
+            let id = SessionId(1);
+            let live = Session::spawn_with_spec(
+            id,
+            session::SessionKind::Shell,
+            &spec("/bin/sh", &["-c", r"stty raw -echo; printf '\033[?2004h› \033[2mAsk Codex to do anything\033[0m\r\033[2C'; exec /bin/cat"]),
+            80, 24, 100,
+        ).unwrap();
+            let group = live.process_identity().process_group.unwrap();
+            worker.sessions.insert(id, live);
+            worker.detectors.insert(
+                id,
+                session::StatusDetector::new(session::StatusPatterns::compile(
+                    None, None, None, None,
+                )),
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !worker.sessions[&id].bracketed_paste() {
+                assert!(Instant::now() < deadline);
+                worker.collect_session_pump_effects(&[id], false, true);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let admission =
+                crate::InputAdmission::new(crate::InputPermit::new(), deadline, |write| write())
+                    .with_agent_guard(crate::AgentInputGuard {
+                        foreground_process_group: group,
+                        provider: crate::AgentPromptKind::Codex,
+                        intent: crate::AgentInputIntent::ExplicitPrompt,
+                    });
+            let body = format!("\x1b[200~{prompt}\x1b[201~");
+            assert_eq!(
+                worker.admit_input_batch_checked(id, &[body.as_bytes(), b"\r"], Some(&admission)),
+                Ok(())
+            );
+            assert!(!worker.detectors[&id].has_input_draft());
+            while !worker.sessions[&id]
+                .screen_text()
+                .contains("COMPOSER-FIXTURE-END")
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "accepted bytes must reach the owned PTY reader"
+                );
+                worker.collect_session_pump_effects(&[id], false, true);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+    #[test]
+    #[cfg(unix)]
+    fn composer_ready_prompt_is_not_vetoed_by_previous_stream_status() {
+        for (tag, status) in [
+            ("WAIT-FIXTURE", session::SessionStatus::Waiting),
+            ("APPROVAL-FIXTURE", session::SessionStatus::NeedsApproval),
+        ] {
+            for (provider, ready) in [
+                (crate::AgentPromptKind::Claude, "❯ "),
+                (
+                    crate::AgentPromptKind::Codex,
+                    "› \x1b[2mAsk Codex to do anything\x1b[0m\r\x1b[2C",
+                ),
+            ] {
+                let resolver = Arc::new(RecordingResolver {
+                    calls: Mutex::new(Vec::new()),
+                    value: None,
+                });
+                let (mut worker, _events) = admission_worker(resolver, "composer-stale-stream");
+                let id = SessionId(1);
+                // The former question/approval is gone; a real CLI has redrawn its native
+                // input. Its stream status stays latched until accepted user input.
+                let script = format!(
+                    "stty raw -echo; printf '{tag}\\n\\033[2J\\033[H\\033[?2004h{ready}'; exec /bin/cat"
+                );
+                let live = Session::spawn_with_spec(
+                    id,
+                    session::SessionKind::Agent,
+                    &spec("/bin/sh", &["-c", &script]),
+                    80,
+                    24,
+                    100,
+                )
+                .unwrap();
+                let group = live.process_identity().process_group.unwrap();
+                worker.sessions.insert(id, live);
+                worker.detectors.insert(
+                    id,
+                    session::StatusDetector::new(session::StatusPatterns::compile(
+                        Some("WAIT-FIXTURE"),
+                        Some("APPROVAL-FIXTURE"),
+                        None,
+                        None,
+                    )),
+                );
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !worker.sessions[&id].bracketed_paste() {
+                    assert!(Instant::now() < deadline);
+                    let effects = worker.collect_session_pump_effects(&[id], false, true);
+                    worker.finish_session_pump_effects(effects);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                assert_eq!(worker.detectors[&id].status(), status);
+                assert!(!worker.detectors[&id].has_input_draft());
+                let guard = |intent| {
+                    crate::InputAdmission::new(crate::InputPermit::new(), deadline, |write| write())
+                        .with_agent_guard(crate::AgentInputGuard {
+                            foreground_process_group: group,
+                            provider,
+                            intent,
+                        })
+                };
+                assert_eq!(
+                    worker.admit_input_batch_checked(
+                        id,
+                        &[b""],
+                        Some(&guard(crate::AgentInputIntent::AutomaticPrompt))
+                    ),
+                    Err(pty::PtyInputRejectReason::AdmissionDenied),
+                    "automatic sends remain conservative"
+                );
+                let prompt = format!("{}\nCOMPOSER-READY-END", "긴 문장 ".repeat(2_000));
+                let body = format!("\x1b[200~{prompt}\x1b[201~");
+                assert_eq!(
+                    worker.admit_input_batch_checked(
+                        id,
+                        &[body.as_bytes(), b"\r"],
+                        Some(&guard(crate::AgentInputIntent::ExplicitPrompt))
+                    ),
+                    Ok(()),
+                    "current native input must accept explicit user submit despite previous stream status"
+                );
+                assert!(!worker.detectors[&id].has_input_draft());
+                while !worker.sessions[&id]
+                    .screen_text()
+                    .contains("COMPOSER-READY-END")
+                {
+                    assert!(
+                        Instant::now() < deadline,
+                        "accepted long prompt must reach owned PTY"
+                    );
+                    let effects = worker.collect_session_pump_effects(&[id], false, true);
+                    worker.finish_session_pump_effects(effects);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn composer_ready_hint_still_protects_current_question_and_accepted_draft() {
         let resolver = Arc::new(RecordingResolver {
             calls: Mutex::new(Vec::new()),
             value: None,
         });
-        let (mut worker, _events) = admission_worker(resolver, "composer-codex-placeholder");
+        let (mut worker, _events) = admission_worker(resolver, "composer-current-screen");
         let id = SessionId(1);
         let live = Session::spawn_with_spec(
             id,
-            session::SessionKind::Shell,
-            &spec("/bin/sh", &["-c", r"stty -echo; printf '\033[?2004h› \033[2mAsk Codex to do anything\033[0m\r\033[2C'; exec /bin/cat"]),
-            80, 24, 100,
-        ).unwrap();
+            session::SessionKind::Agent,
+            &spec(
+                "/bin/sh",
+                &["-c", "stty raw -echo; printf READY; exec /bin/cat"],
+            ),
+            80,
+            24,
+            100,
+        )
+        .unwrap();
         let group = live.process_identity().process_group.unwrap();
         worker.sessions.insert(id, live);
         worker.detectors.insert(
             id,
-            session::StatusDetector::new(session::StatusPatterns::compile(None, None, None, None)),
+            session::StatusDetector::new(session::StatusPatterns::compile(
+                Some("STREAM-WAIT"),
+                None,
+                None,
+                None,
+            )),
         );
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !worker.sessions[&id].bracketed_paste() {
+        while !worker.sessions[&id].screen_text().contains("READY") {
             assert!(Instant::now() < deadline);
-            worker.collect_session_pump_effects(&[id], false, true);
+            let effects = worker.collect_session_pump_effects(&[id], false, true);
+            worker.finish_session_pump_effects(effects);
             std::thread::sleep(Duration::from_millis(1));
         }
         let admission =
@@ -11313,26 +11487,67 @@ mod tests {
                     provider: crate::AgentPromptKind::Codex,
                     intent: crate::AgentInputIntent::ExplicitPrompt,
                 });
+        let hint = "› \x1b[2mAsk Codex to do anything\x1b[0m\r\x1b[2C";
+        // A current real question is not just a former stream state. Even a native
+        // hint must not override that screen-derived approval observation.
+        let current = format!("\x1b[2J\x1b[HWould you like to run fixture? [y/n]\r\n{hint}");
+        worker
+            .sessions
+            .get_mut(&id)
+            .unwrap()
+            .replay_ansi(&mut current.as_bytes())
+            .unwrap();
+        let text = worker.sessions[&id].screen_text();
+        worker.detectors.get_mut(&id).unwrap().evaluate(Some(&text));
         assert_eq!(
-            worker.admit_input_batch_checked(
-                id,
-                &[
-                    "\x1b[200~한글 첫 줄\n두 번째 줄\n세 번째 줄\x1b[201~".as_bytes(),
-                    b"\r"
-                ],
-                Some(&admission)
-            ),
-            Ok(())
+            worker.detectors[&id].status(),
+            session::SessionStatus::NeedsApproval
         );
-        assert!(!worker.detectors[&id].has_input_draft());
-        while !worker.sessions[&id].screen_text().contains("세 번째 줄") {
-            assert!(
-                Instant::now() < deadline,
-                "accepted bytes must reach the owned PTY reader"
-            );
-            worker.collect_session_pump_effects(&[id], false, true);
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        assert_eq!(
+            worker.detectors[&id].status_view(None).source,
+            session::StatusSource::ScreenText
+        );
+        assert_eq!(
+            worker.admit_input_batch_checked(id, &[b"must-not-send", b"\r"], Some(&admission)),
+            Err(pty::PtyInputRejectReason::AdmissionDenied)
+        );
+        // An old approval can retain StreamRegex precedence even when the current
+        // screen also contains an approval. The source label alone is insufficient.
+        let detector = worker.detectors.get_mut(&id).unwrap();
+        *detector = session::StatusDetector::new(session::StatusPatterns::compile(
+            Some("STREAM-WAIT"),
+            Some("STREAM-APPROVAL"),
+            None,
+            None,
+        ));
+        detector.on_output(b"STREAM-APPROVAL\n");
+        detector.evaluate(Some(&text));
+        assert_eq!(
+            detector.status_view(None).source,
+            session::StatusSource::StreamRegex
+        );
+        assert_eq!(
+            worker.admit_input_batch_checked(id, &[b"must-not-send", b"\r"], Some(&admission)),
+            Err(pty::PtyInputRejectReason::AdmissionDenied),
+            "current approval must win even over an equally ranked stream latch"
+        );
+        // Input recalled before the next screen echo is still authoritative draft
+        // evidence. A native placeholder and old stream state cannot erase it.
+        worker
+            .sessions
+            .get_mut(&id)
+            .unwrap()
+            .replay_ansi(&mut format!("\x1b[2J\x1b[H{hint}").as_bytes())
+            .unwrap();
+        let detector = worker.detectors.get_mut(&id).unwrap();
+        detector.on_input();
+        detector.on_output(b"STREAM-WAIT\n");
+        detector.on_user_input(b"\x1b[A");
+        assert!(detector.has_input_draft());
+        assert_eq!(
+            worker.admit_input_batch_checked(id, &[b"must-not-send", b"\r"], Some(&admission)),
+            Err(pty::PtyInputRejectReason::AdmissionDenied)
+        );
     }
 
     #[test]

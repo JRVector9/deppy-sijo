@@ -347,6 +347,18 @@ impl StatusDetector {
         self.status
     }
 
+    /// A current screen request remains evidence even if a same-priority stream
+    /// latch retained the status source. Do not use that source label as proof
+    /// that an approval/question has disappeared. The match set is bounded.
+    pub fn has_screen_input_request(&self) -> bool {
+        self.last_screen_matches.iter().any(|(status, _)| {
+            matches!(
+                status,
+                SessionStatus::Waiting | SessionStatus::NeedsApproval
+            )
+        })
+    }
+
     /// Accepted, unsubmitted bytes. Output redraws and hook status cannot erase this evidence.
     pub fn has_input_draft(&self) -> bool {
         self.input_draft_dirty

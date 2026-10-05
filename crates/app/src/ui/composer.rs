@@ -4240,29 +4240,35 @@ mod tests {
     fn kittest_enter_전송_시_send와_수용전_버퍼_보존() {
         use egui_kittest::kittest::Queryable;
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
-        let path = test_history_path("enter-send");
-        let mut harness = composer_harness(&catalog, ComposerSendKey::Enter, path.clone());
-        focus_composer(&mut harness);
-        harness
-            .get_by_role(egui::accesskit::Role::MultilineTextInput)
-            .type_text("hello agent");
-        harness.run();
-        harness.key_press(egui::Key::Enter);
-        harness.run();
-        assert_single_send(&harness.state().1, "hello agent");
-        assert_eq!(
-            buffer_of(&harness),
-            "hello agent",
-            "PTY 수용 전에는 초안을 보존한다"
-        );
-        assert!(harness.state().0.history.is_empty());
-        assert!(
-            !path.exists(),
-            "Send render 경로는 history 파일을 생성/기록하면 안 된다"
-        );
-        std::fs::remove_file(&path).ok();
+        for prompt in [
+            "hello agent".to_owned(),
+            "긴 문장을 보내도 전체 내용이 전달되어야 합니다. ".repeat(50),
+            "첫 번째 줄의 작업을 점검합니다.\n두 번째 줄도 확인합니다.\n마지막 줄까지 전송합니다."
+                .repeat(10),
+        ] {
+            let path = test_history_path("enter-send");
+            let mut harness = composer_harness(&catalog, ComposerSendKey::Enter, path.clone());
+            focus_composer(&mut harness);
+            harness
+                .get_by_role(egui::accesskit::Role::MultilineTextInput)
+                .type_text(&prompt);
+            harness.run();
+            harness.key_press(egui::Key::Enter);
+            harness.run();
+            assert_single_send(&harness.state().1, &prompt);
+            assert_eq!(
+                buffer_of(&harness),
+                prompt,
+                "PTY 수용 전에는 초안을 보존한다"
+            );
+            assert!(harness.state().0.history.is_empty());
+            assert!(
+                !path.exists(),
+                "Send render 경로는 history 파일을 생성/기록하면 안 된다"
+            );
+            std::fs::remove_file(&path).ok();
+        }
     }
-
     #[test]
     fn kittest_shift_enter_는_개행만_한다() {
         use egui_kittest::kittest::Queryable;

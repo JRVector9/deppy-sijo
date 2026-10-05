@@ -119,6 +119,8 @@ impl InputAdmission {
 enum PromptRow {
     Empty,
     Draft,
+    /// Native input hint; unlike an arbitrary unknown row, no user text is present.
+    Placeholder,
     Unknown,
 }
 
@@ -152,6 +154,7 @@ fn prompt_row(
         return PromptRow::Empty;
     }
     // A dim suggestion before the cursor has entered it is not a verified empty prompt.
+    // Keep that positive native-input evidence separate from an arbitrary unknown row.
     // Explicit visible-session sends can proceed; automation must still fail closed.
     let first = index
         + 1
@@ -165,7 +168,7 @@ fn prompt_row(
             .filter(|cell| !cell.c.is_whitespace())
             .all(|cell| cell.attrs().contains(terminal::CellAttrs::DIM))
     {
-        return PromptRow::Unknown;
+        return PromptRow::Placeholder;
     }
     PromptRow::Draft
 }
@@ -188,36 +191,63 @@ fn choice_dialog(snapshot: &terminal::TerminalViewportSnapshot) -> bool {
 }
 
 impl AgentInputGuard {
+    fn deny(self, reason: &'static str) -> bool {
+        // Diagnostic tags only: never log a prompt, terminal cells or user content.
+        tracing::info!(component = "agent_input", reason, intent = ?self.intent,
+            provider = ?self.provider, "input admission declined");
+        false
+    }
+
     pub(crate) fn allows(
         self,
         active: &session::Session,
         detector: Option<&session::StatusDetector>,
     ) -> bool {
         if active.foreground_process_group() != Some(self.foreground_process_group) {
-            return false;
+            return self.deny("foreground_changed");
         }
         let Some(detector) = detector else {
-            return false;
+            return self.deny("detector_unavailable");
         };
-        if (self.intent != AgentInputIntent::ExplicitAppend && detector.has_input_draft())
-            || matches!(
-                detector.status(),
-                session::SessionStatus::Waiting | session::SessionStatus::NeedsApproval
-            )
-        {
-            return false;
+        if self.intent != AgentInputIntent::ExplicitAppend && detector.has_input_draft() {
+            return self.deny("accepted_input_draft");
         }
         let snapshot = active.input_guard_snapshot();
         if snapshot.as_ref().is_some_and(choice_dialog) {
-            return false;
+            return self.deny("current_choice_dialog");
         }
         let row = snapshot.as_ref().map_or(PromptRow::Unknown, |snapshot| {
             prompt_row(snapshot, self.provider)
         });
+        // Stream status is latched until input. It cannot veto that very input after
+        // the CLI has visibly returned to its native editor. This exception is only
+        // for deliberate submit with positive ready-row evidence; current screen
+        // approval state, dialogs, accepted drafts and automatic sends still veto.
+        if self.intent == AgentInputIntent::ExplicitPrompt
+            && matches!(row, PromptRow::Empty | PromptRow::Placeholder)
+            && detector.status_view(None).source == session::StatusSource::StreamRegex
+            && !detector.has_screen_input_request()
+        {
+            return true;
+        }
+        if matches!(
+            detector.status(),
+            session::SessionStatus::Waiting | session::SessionStatus::NeedsApproval
+        ) {
+            return self.deny("current_input_request");
+        }
         match row {
             PromptRow::Empty => true,
-            PromptRow::Draft => self.intent == AgentInputIntent::ExplicitAppend,
-            PromptRow::Unknown => self.intent != AgentInputIntent::AutomaticPrompt,
+            PromptRow::Draft if self.intent == AgentInputIntent::ExplicitAppend => true,
+            PromptRow::Draft => self.deny("visible_input_draft"),
+            PromptRow::Placeholder | PromptRow::Unknown
+                if self.intent != AgentInputIntent::AutomaticPrompt =>
+            {
+                true
+            }
+            PromptRow::Placeholder | PromptRow::Unknown => {
+                self.deny("automatic_prompt_not_verified_empty")
+            }
         }
     }
 }

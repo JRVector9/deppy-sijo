@@ -1,0 +1,23 @@
+# Live UI freeze: popup Context lock recursion
+
+## Confirmed cause
+
+App PID40395, native0.7.3, was reported frozen again. The live16:36:19KST3-second sample `/tmp/deppy-live-freeze-40395-20261005.sample` holds all2091main-thread samples at `connector_ui::popup::modal_input_blocked → Context::cumulative_pass_nr → parking_lot::RawRwLock::lock_shared_slow → pthread_cond_wait`. Runtime repaint readers and agent-state repaint writer are also blocked; CPU0%. This is actual frozen-process evidence, distinct from the earlier healthy baseline and09:23SQLite disk-write resource report.
+
+`crates/connector-ui/src/popup/mod.rs` called `fence_id(ctx)`/`ctx.viewport_id()` and `ctx.cumulative_pass_nr()` while `ctx.data` retained a read guard on the same Context RwLock. When a background repaint queues an exclusive writer, the nested read waits behind that writer; the writer waits for the still-held outer read. UI cannot return, and downstream worker repaint calls stall. The erroneous lines were introduced by0.7.0commit462c4af54 on2026-10-05. The same defect exists in0.7.3. System sleep is unnecessary to reproduce it. The earlier force-quit0.7.0process stack was lost, so a shared cause for that earlier incident is an inference, not a captured fact.
+
+## Correction and actual checks
+
+Copy viewport-specific fence ID and current pass before entering `ctx.data`; callback now accesses only its supplied data. Preserve current-pass modal blocking, next-pass expiry, viewport identity and actual top modal behavior. No timer/worker/wire/schema change. Related shared-popup accessors reviewed for the same recursion; no additional confirmed instance found in the popup modules inspected.
+
+Actual real-Context regression runs concurrent pending-modal polling with2background repaint writers in an owned subprocess. RED:1pass(pass expiry),1fail(child stuck, killed/reaped after5s), `/tmp/deppy-popup-deadlock-red-20261005.log`. GREEN:24Connector tests+56App popup tests=80pass,0fail,10App popup tests ignored; strictConnector all-targetClippy passed, `/tmp/deppy-popup-deadlock-green-20261005.log`. Boundary and fmt passed, `/tmp/deppy-popup-deadlock-boundary-20261005.log`. `git diff --check` passed. No release build, no new compiled app delivered, no relaunch/force-quit of user process, no tests claimed for live recovery.
+
+Current canonical0.7.3 remains valid for investigation/test-only edits. A later delivered changed app must increase above0.7.3 and verify fresh artifact versions/signature/source. The sampled running0.7.3 contained none of these uncommitted source changes; source correction cannot unwind already-held locks. At the final read-only check, ps for PID40395 and pgrep -x deppy-sijo both returned no process (exit1). The process has since exited; its exit cause is not established. The agent did not terminate or relaunch it.
+
+## Remaining independent work
+
+- Repeated composer rejection persists0.7.3 according to user; short strings may work, long strings/session-specific behavior fails. Do not equate this with the confirmed freeze or claim it solved. Real owned PTY length cases up to30kKorean, actual egui Enter long/multiline, and privateCodex0.160.0TUI→localHTTPfixture1/1000/10000characters passed. Generic guard failure reason is still opaque; explicit vs automatic input admission must be isolated and genuine terminal draft/approval behavior preserved.
+- QuotedCodex Server is draining -32600: installedCLI uses shared background daemon unless --no-daemon. Doctor/current daemon health good; owned no-daemon fixture succeeds. No shared daemon stopped/restarted; current production daemon drain not independently reproduced.
+- Warp comparison requested. Immutable source treeb865631c9a0e46b548c7ec7dc32e228a148171d1 cached read-only in `/tmp/deppy-warp-reference-20261005`. Warp keeps `InputBufferModel` as editor-subscribed content/cursor state; CLI rich composer retains per-terminal drafts and emits open/close events; AI input mode is separate policy state. UI foreground executor is !Send/!Sync, background task handles are separate. These observations support explicit editor ownership and event-based routing, not a claim of immunity to hangs. No Warp code copied into Deppy; no Warp build executed.
+
+Source references: [Warp buffer model](https://github.com/warpdotdev/warp/blob/b865631c9a0e46b548c7ec7dc32e228a148171d1/app/src/terminal/input/buffer_model.rs), [CLI rich input state](https://github.com/warpdotdev/warp/blob/b865631c9a0e46b548c7ec7dc32e228a148171d1/app/src/terminal/cli_agent_sessions/mod.rs), [foreground/background executor](https://github.com/warpdotdev/warp/blob/b865631c9a0e46b548c7ec7dc32e228a148171d1/crates/warpui_core/src/async/native/executor.rs).

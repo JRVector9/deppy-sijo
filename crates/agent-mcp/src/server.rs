@@ -98,9 +98,20 @@ impl Auth {
         headers: &mut Vec<(String, String)>,
         wake: &dyn Fn(),
     ) -> Response {
-        let mut c = self.0.lock().unwrap();
-        let expiry = c.expires;
-        c.oauth.route(h, body, base, now(), expiry, headers, wake)
+        // Route mutation and approval publication are serialized by the credential
+        // mutex. Notify only after releasing it: the supplied callback may read Auth.
+        let notification_requested = std::cell::Cell::new(false);
+        let response = {
+            let mut c = self.0.lock().unwrap();
+            let expiry = c.expires;
+            c.oauth.route(h, body, base, now(), expiry, headers, &|| {
+                notification_requested.set(true);
+            })
+        };
+        if notification_requested.get() {
+            wake();
+        }
+        response
     }
     pub fn current(&self, epoch: u64, time: u64) -> bool {
         self.current_access(epoch, None, time)
@@ -600,6 +611,98 @@ mod hostname_tests {
             "a.example/mcp",
         ] {
             assert!(!valid_public_host(host));
+        }
+    }
+}
+
+#[cfg(test)]
+mod oauth_lock_tests {
+    use super::*;
+
+    #[test]
+    fn oauth_wake_can_read_auth_without_deadlock() {
+        const CHILD_ENV: &str = "DEPPY_OAUTH_WAKE_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let auth = Auth::new_at(now());
+            let head = |method: &str, target: &str, content_type: &str| {
+                let wire = format!(
+                    "{method} {target} HTTP/1.1\r\nHost: localhost\r\nContent-Type: {content_type}\r\n\r\n"
+                );
+                http::read_request_head(&mut BufReader::new(wire.as_bytes())).unwrap()
+            };
+            let base = "http://localhost:4321";
+            let mut headers = Vec::new();
+            let response = auth.oauth_route(
+                &head("POST", "/oauth/register", "application/json"),
+                br#"{"redirect_uris":["https://client.example/callback"]}"#,
+                base,
+                &mut headers,
+                &|| panic!("registration must not request an approval wake"),
+            );
+            assert_eq!(response.status, 201);
+            let registration: Value = serde_json::from_slice(&response.body).unwrap();
+            let resource = format!("{base}/mcp");
+            let challenge = "A".repeat(43);
+            let query = url::form_urlencoded::Serializer::new(String::new())
+                .extend_pairs([
+                    ("client_id", registration["client_id"].as_str().unwrap()),
+                    ("redirect_uri", "https://client.example/callback"),
+                    ("resource", resource.as_str()),
+                    ("response_type", "code"),
+                    ("code_challenge_method", "S256"),
+                    ("code_challenge", challenge.as_str()),
+                ])
+                .finish();
+            let wakes = std::cell::Cell::new(0);
+            let response = auth.oauth_route(
+                &head("GET", &format!("/oauth/authorize?{query}"), ""),
+                &[],
+                base,
+                &mut headers,
+                &|| {
+                    // Real Auth reads take its credential mutex again. The notification
+                    // must run after publication and after that mutex is released.
+                    assert_eq!(auth.approvals().len(), 1);
+                    assert!(auth.expires() > now());
+                    wakes.set(wakes.get() + 1);
+                },
+            );
+            assert_eq!(response.status, 200);
+            assert_eq!(wakes.get(), 1);
+            let response = auth.oauth_route(
+                &head("GET", "/oauth/authorize?invalid=1", ""),
+                &[],
+                base,
+                &mut headers,
+                &|| panic!("failed authorization must not notify"),
+            );
+            assert_eq!(response.status, 400);
+            return;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "server::oauth_lock_tests::oauth_wake_can_read_auth_without_deadlock",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(
+                    status.success(),
+                    "OAuth wake regression child failed: {status}"
+                );
+                break;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("OAuth approval wake deadlocked while reading Auth");
+            }
+            thread::sleep(Duration::from_millis(5));
         }
     }
 }

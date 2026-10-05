@@ -32,9 +32,13 @@ pub fn set_pending_modal(ctx: &egui::Context, pending: bool) {
 }
 #[doc(hidden)]
 pub fn modal_input_blocked(ctx: &egui::Context) -> bool {
+    // Context accessors share one RwLock. Never reacquire it inside data():
+    // a queued background repaint writer would strand this outer read guard.
+    let id = fence_id(ctx);
+    let pass = ctx.cumulative_pass_nr();
     ctx.data(|data| {
-        data.get_temp::<ModalFence>(fence_id(ctx))
-            .is_some_and(|f| f.pass == ctx.cumulative_pass_nr())
+        data.get_temp::<ModalFence>(id)
+            .is_some_and(|f| f.pass == pass)
     }) || ctx.memory(|m| m.top_modal_layer().is_some())
 }
 #[derive(Clone, Copy)]
@@ -134,5 +138,85 @@ fn palette_for(dark_mode: bool) -> Palette {
             danger_hover: egui::Color32::from_rgb(0xcd, 0x46, 0x53),
             danger_text: egui::Color32::WHITE,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn popup_fence_polling_does_not_deadlock_background_repaint() {
+        const CHILD_ENV: &str = "DEPPY_POPUP_REPAINT_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            use std::sync::{Arc, Barrier};
+            let ctx = egui::Context::default();
+            ctx.begin_pass(egui::RawInput::default());
+            set_pending_modal(&ctx, true);
+            let barrier = Arc::new(Barrier::new(3));
+            let writers = (0..2)
+                .map(|_| {
+                    let ctx = ctx.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        for _ in 0..30_000 {
+                            ctx.request_repaint();
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            barrier.wait();
+            for _ in 0..30_000 {
+                assert!(modal_input_blocked(&ctx));
+            }
+            for writer in writers {
+                writer.join().unwrap();
+            }
+            ctx.end_pass().drop_without_applying_deltas();
+            return;
+        }
+        // Bound a real lock regression in an owned subprocess; a broken Context must not
+        // strand the test runner or leave blocked background threads alive after failure.
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "popup::tests::popup_fence_polling_does_not_deadlock_background_repaint",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(
+                    status.success(),
+                    "popup/repaint concurrency child failed: {status}"
+                );
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("popup fence reader and background repaint stalled on the Context lock");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn popup_pending_fence_expires_after_its_pass() {
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput::default());
+        assert!(!modal_input_blocked(&ctx));
+        set_pending_modal(&ctx, true);
+        assert!(modal_input_blocked(&ctx));
+        set_pending_modal(&ctx, false);
+        assert!(modal_input_blocked(&ctx));
+        ctx.end_pass().drop_without_applying_deltas();
+        ctx.begin_pass(egui::RawInput::default());
+        assert!(!modal_input_blocked(&ctx));
+        ctx.end_pass().drop_without_applying_deltas();
     }
 }

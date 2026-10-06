@@ -9849,8 +9849,9 @@ pub struct App {
     /// 재조회 중에도 마지막 목록과 상세 화면을 유지한다.
     env_api_projects_dirty: bool,
     /// T1: pane 우클릭 → 환경설정 진입 시 감지한 focused 세션 폴더 배너.
-    /// 우클릭 진입 시점에만 계산하고, 버튼 클릭 또는 설정 창 닫힘에 버린다.
+    /// 우클릭 진입 시점에만 계산하고, 등록 성공·다른 동작 또는 설정 창 닫힘에 버린다.
     env_session_banner: Option<EnvSessionCwdBanner>,
+    pending_env_session_cwd_registration: Option<PathBuf>,
     /// 폭주 경고 배너를 닫음 (로드맵 B2). 현재 폭주가 모두 해소되면 리셋돼 다음
     /// 폭주에 다시 뜬다 — 에피소드별 상태를 안 들고도 유계.
     storm_banner_dismissed: bool,
@@ -15580,6 +15581,12 @@ impl App {
             FolderPickerPurpose::WorkspaceAddDestination => return true,
         };
         if self.queue_global_settings_action(&request_workspace, action) {
+            if matches!(
+                retry_purpose,
+                FolderPickerPurpose::SelectWorkspaceInSettings
+            ) {
+                self.pending_env_session_cwd_registration = Some(path);
+            }
             true
         } else {
             self.pending_folder_picker_completion = Some((retry_purpose, path));
@@ -15996,6 +16003,7 @@ impl App {
             env_api_projects_cache: None,
             env_api_projects_dirty: true,
             env_session_banner: None,
+            pending_env_session_cwd_registration: None,
             storm_banner_dismissed: false,
             pending_storm_action: None,
             env_project_rows_worker,
@@ -26993,6 +27001,15 @@ impl App {
         );
         match choice {
             Some(ui::popup::ConfirmationChoice::Cancel) => {
+                if prompt.purpose == WorkspaceMutationPurpose::SelectInSettings
+                    && let Some(banner) = self.env_session_banner.as_mut()
+                    && banner.cwd == prompt.path
+                {
+                    banner.registration_pending = false;
+                }
+                if prompt.purpose == WorkspaceMutationPurpose::SelectInSettings {
+                    self.pending_env_session_cwd_registration = None;
+                }
                 self.pending_legacy_workspace_rebind = None;
                 self.workspace_add_ui = None;
             }
@@ -27047,6 +27064,8 @@ impl App {
         Some(EnvSessionCwdBanner {
             registered: cwd_belongs_to_any(&cwd_canon, &roots),
             cwd,
+            registration_pending: false,
+            registration_error: None,
         })
     }
 
@@ -28625,6 +28644,17 @@ impl App {
                     self.pending_legacy_workspace_rebind = Some(prompt);
                 }
                 SettingsOutcomeKind::WorkspaceFoundOrCreated { purpose, result } => {
+                    let banner_path = (purpose == WorkspaceMutationPurpose::SelectInSettings)
+                        .then(|| self.pending_env_session_cwd_registration.take())
+                        .flatten();
+                    settle_env_session_cwd_registration(
+                        &mut self.env_session_banner,
+                        banner_path.as_deref(),
+                        result
+                            .as_ref()
+                            .map(|found| Path::new(&found.row.path))
+                            .map_err(|error| *error),
+                    );
                     let Ok(result) = result else {
                         tracing::warn!("workspace find-or-create worker failed");
                         if matches!(
@@ -35852,6 +35882,7 @@ impl eframe::App for App {
                         // 속하지 않으면 새 프로젝트 등록, 활성 워크스페이스가 경로 미설정이면
                         // 이 폴더 지정 CTA. 클릭 시 기존 ws_create/SetProjectPath 흐름 재사용.
                         let mut banner_used = false;
+                        let mut banner_register_requested = false;
                         if settings_env_wsid.as_deref() == Some(wsid.as_str())
                             && let Some(banner) = &self.env_session_banner
                         {
@@ -35872,16 +35903,32 @@ impl eframe::App for App {
                                             ));
                                             if show_register
                                                 && ui
-                                                    .button(text.t("env.session_cwd.register", &[]))
+                                                    .add_enabled(
+                                                        !banner.registration_pending,
+                                                        egui::Button::new(text.t(
+                                                            if banner.registration_pending {
+                                                                "workspace.add.opening"
+                                                            } else {
+                                                                "env.session_cwd.register"
+                                                            },
+                                                            &[],
+                                                        )),
+                                                    )
                                                     .clicked()
                                             {
                                                 settings_ws_create = Some(banner.cwd.clone());
-                                                banner_used = true;
+                                                banner_register_requested = true;
                                             }
                                             if show_set_path
                                                 && ui
-                                                    .button(
-                                                        text.t("env.session_cwd.set_project", &[]),
+                                                    .add_enabled(
+                                                        !banner.registration_pending,
+                                                        egui::Button::new(
+                                                            text.t(
+                                                                "env.session_cwd.set_project",
+                                                                &[],
+                                                            ),
+                                                        ),
                                                     )
                                                     .clicked()
                                             {
@@ -35893,12 +35940,31 @@ impl eframe::App for App {
                                                 banner_used = true;
                                             }
                                         });
+                                        if let Some(error) = banner.registration_error {
+                                            ui.colored_label(
+                                                ui.visuals().error_fg_color,
+                                                text.t(
+                                                    if error == SettingsErrorCode::WorkspaceIdentity
+                                                    {
+                                                        "workspace.add.folder_identity_conflict"
+                                                    } else {
+                                                        "workspace.add.registration_failed"
+                                                    },
+                                                    &[],
+                                                ),
+                                            );
+                                        }
                                     });
                                 ui.separator();
                             }
                         }
                         if banner_used {
                             self.env_session_banner = None;
+                        } else if banner_register_requested
+                            && let Some(banner) = self.env_session_banner.as_mut()
+                        {
+                            banner.registration_pending = true;
+                            banner.registration_error = None;
                         }
                         // 전체 가용 높이를 **먼저** 캡처해 좌측 리스트/우측 스크롤에 강제한다
                         // — horizontal 안에서 available_height가 줄어 리스트가 수십 px로
@@ -36143,12 +36209,17 @@ impl eframe::App for App {
             );
             ui.ctx().request_repaint();
         }
-        if let Some(path) = settings_ws_create
+        if let Some(path) = settings_ws_create.as_ref()
             && path.as_os_str().as_encoded_bytes().len() <= APP_HOST_PATH_MAX_BYTES
         {
             self.pending_folder_picker_completion =
-                Some((FolderPickerPurpose::SelectWorkspaceInSettings, path));
+                Some((FolderPickerPurpose::SelectWorkspaceInSettings, path.clone()));
             ui.ctx().request_repaint();
+        } else if settings_ws_create.is_some()
+            && let Some(banner) = self.env_session_banner.as_mut()
+        {
+            banner.registration_pending = false;
+            banner.registration_error = Some(SettingsErrorCode::WorkspaceMutation);
         }
         if let Some(workspace_id) = settings_workspace_select
             && let Some(selected) = resolve_settings_workspace_id(
@@ -38157,6 +38228,32 @@ struct EnvSessionCwdBanner {
     cwd: std::path::PathBuf,
     /// cwd가 기존 워크스페이스 path와 일치하거나 그 하위 폴더인가.
     registered: bool,
+    registration_pending: bool,
+    registration_error: Option<SettingsErrorCode>,
+}
+
+fn settle_env_session_cwd_registration(
+    banner: &mut Option<EnvSessionCwdBanner>,
+    requested_path: Option<&Path>,
+    result: Result<&Path, SettingsErrorCode>,
+) {
+    let Some(current) = banner.as_mut() else {
+        return;
+    };
+    if !current.registration_pending || requested_path != Some(current.cwd.as_path()) {
+        return;
+    }
+    match result {
+        Ok(path) if path == current.cwd => *banner = None,
+        Ok(_) => {
+            current.registration_pending = false;
+            current.registration_error = Some(SettingsErrorCode::WorkspaceMutation);
+        }
+        Err(error) => {
+            current.registration_pending = false;
+            current.registration_error = Some(error);
+        }
+    }
 }
 
 /// 폭주 배너 버튼이 요청하는 대응 (로드맵 B3) — 확정된 폭주 세션 전체에 적용된다.
@@ -51370,6 +51467,42 @@ mod tests {
         drop(db);
         remove_sqlite_files(&db_path);
         std::fs::remove_dir(folder).unwrap();
+    }
+
+    #[test]
+    fn 세션_경로_등록_실패는_배너와_재시도를_보존하고_다른_요청은_무시한다() {
+        let path = PathBuf::from("/tmp/deppy-session-cwd-registration");
+        let mut banner = Some(EnvSessionCwdBanner {
+            cwd: path.clone(),
+            registered: false,
+            registration_pending: true,
+            registration_error: None,
+        });
+        settle_env_session_cwd_registration(
+            &mut banner,
+            Some(Path::new("/tmp/another-workspace")),
+            Err(SettingsErrorCode::WorkspaceIdentity),
+        );
+        assert!(banner.as_ref().unwrap().registration_pending);
+        assert_eq!(banner.as_ref().unwrap().registration_error, None);
+
+        settle_env_session_cwd_registration(
+            &mut banner,
+            Some(&path),
+            Err(SettingsErrorCode::WorkspaceIdentity),
+        );
+        let retry = banner.as_ref().unwrap();
+        assert!(!retry.registration_pending);
+        assert_eq!(
+            retry.registration_error,
+            Some(SettingsErrorCode::WorkspaceIdentity)
+        );
+
+        let retry = banner.as_mut().unwrap();
+        retry.registration_pending = true;
+        retry.registration_error = None;
+        settle_env_session_cwd_registration(&mut banner, Some(&path), Ok(&path));
+        assert!(banner.is_none());
     }
 
     #[test]

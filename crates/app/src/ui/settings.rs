@@ -363,6 +363,13 @@ pub fn show(
                             nav(ui, *category, notif_unread, search_query, catalog)
                         })
                         .inner;
+                    let rendered_category = *category;
+                    ui.ctx().data_mut(|data| {
+                        data.insert_temp(
+                            egui::Id::new("settings_rendered_category"),
+                            rendered_category,
+                        )
+                    });
                     let inline_detail = is_inline_settings_category(*category);
                     let detail_frame = egui::Frame::default()
                         .fill(if inline_detail {
@@ -447,9 +454,19 @@ pub fn show(
                                     });
                             }
                         });
+                    ui.ctx().data_mut(|data| {
+                        let id = egui::Id::new("settings_search_row_reveal");
+                        if data
+                            .get_temp::<(Category, String)>(id)
+                            .is_some_and(|(target, _)| target == rendered_category)
+                        {
+                            data.remove::<(Category, String)>(id);
+                        }
+                    });
                     if let Some(requested) = requested_category {
                         // 현재 상세 화면이 포커스 이탈을 처리한 뒤 다음 프레임부터 전환한다.
                         *category = requested;
+                        ui.ctx().request_repaint();
                     }
                 });
             if close_requested {
@@ -683,7 +700,7 @@ fn nav(
                 .into_iter()
                 .filter(|(cat, _, label, aliases)| {
                     nav_matches(query, label, aliases)
-                        || content_hits.iter().any(|(hit, _)| hit == cat)
+                        || content_hits.iter().any(|hit| hit.category == *cat)
                 })
                 .collect();
             if !visible_settings.is_empty() {
@@ -696,10 +713,20 @@ fn nav(
                         }
                         requested_category = Some(cat);
                     }
-                    for (_, hit) in content_hits.iter().filter(|(hit_cat, _)| *hit_cat == cat) {
-                        if nav_search_hit(ui, hit) {
+                    for hit in content_hits.iter().filter(|hit| hit.category == cat) {
+                        if nav_search_hit(ui, &hit.title) {
                             if cat == Category::Shortcuts {
-                                reveal_shortcut_search_hit(ui.ctx(), Some(hit), catalog);
+                                reveal_shortcut_search_hit(ui.ctx(), Some(&hit.title), catalog);
+                            } else if is_inline_settings_category(cat) {
+                                ui.ctx().data_mut(|data| {
+                                    data.insert_temp(
+                                        egui::Id::new("settings_search_row_reveal"),
+                                        (
+                                            cat,
+                                            catalog.t(inline_search_row_key(&hit.key), &[]),
+                                        ),
+                                    )
+                                });
                             }
                             requested_category = Some(cat);
                         }
@@ -737,7 +764,7 @@ fn nav(
                 .into_iter()
                 .filter(|(cat, _, label, aliases)| {
                     nav_matches(query, label, aliases)
-                        || content_hits.iter().any(|(hit, _)| hit == cat)
+                        || content_hits.iter().any(|hit| hit.category == *cat)
                 })
                 .collect();
             if !visible_manage.is_empty() {
@@ -748,8 +775,8 @@ fn nav(
                     if nav_item(ui, category, cat, icon, &label, None) {
                         requested_category = Some(cat);
                     }
-                    for (_, hit) in content_hits.iter().filter(|(hit_cat, _)| *hit_cat == cat) {
-                        if nav_search_hit(ui, hit) {
+                    for hit in content_hits.iter().filter(|hit| hit.category == cat) {
+                        if nav_search_hit(ui, &hit.title) {
                             requested_category = Some(cat);
                         }
                     }
@@ -775,7 +802,7 @@ fn nav(
                 .into_iter()
                 .filter(|(cat, _, label, aliases)| {
                     nav_matches(query, label, aliases)
-                        || content_hits.iter().any(|(hit, _)| hit == cat)
+                        || content_hits.iter().any(|hit| hit.category == *cat)
                 })
                 .collect();
             if !visible_monitor.is_empty() {
@@ -789,8 +816,8 @@ fn nav(
                     if nav_item(ui, category, cat, icon, &label, item_badge) {
                         requested_category = Some(cat);
                     }
-                    for (_, hit) in content_hits.iter().filter(|(hit_cat, _)| *hit_cat == cat) {
-                        if nav_search_hit(ui, hit) {
+                    for hit in content_hits.iter().filter(|hit| hit.category == cat) {
+                        if nav_search_hit(ui, &hit.title) {
                             requested_category = Some(cat);
                         }
                     }
@@ -994,12 +1021,15 @@ const INLINE_SEARCH_KEYS: &[(Category, &str)] = &[
 ];
 
 fn management_search_category(key: &str) -> Option<Category> {
+    if key.contains("_confirm") || key.contains(".delete_confirm.") {
+        return None;
+    }
     if key.starts_with("cloud.") {
         Some(Category::CloudAgents)
     } else if key.starts_with("connector.") || key.starts_with("connectors.") {
         Some(Category::Connectors)
     } else if key.starts_with("env.")
-        || key.starts_with("credentials.")
+        || searchable_credential_key(key)
         || key == "workspace.manager.new_hint"
     {
         Some(Category::Environment)
@@ -1012,6 +1042,49 @@ fn management_search_category(key: &str) -> Option<Category> {
     } else {
         None
     }
+}
+
+fn searchable_credential_key(key: &str) -> bool {
+    matches!(
+        key,
+        "credentials.api_keys"
+            | "credentials.empty"
+            | "credentials.provider"
+            | "credentials.label"
+            | "credentials.kind"
+            | "credentials.secret"
+            | "credentials.env_bindings"
+            | "credentials.env_name"
+            | "credentials.purge_orphans"
+    )
+}
+
+fn inline_search_row_key(key: &str) -> &str {
+    for parent in [
+        "settings.session_name_style",
+        "settings.theme",
+        "settings.ui_font",
+        "settings.cache_budget",
+    ] {
+        if key.starts_with(parent) && key.as_bytes().get(parent.len()) == Some(&b'.') {
+            return parent;
+        }
+    }
+    match key {
+        "settings.agent_presets.add" | "settings.agent_presets.remove" => "settings.agent_presets",
+        "settings.cache_budget.help" => "settings.cache_budget",
+        "settings.file_tree.hint" => "settings.file_tree_sidebar",
+        "settings.output_batch.hint" => "settings.output_batch_ms",
+        "settings.scrollback.hint" => "settings.scrollback_lines",
+        _ => key.strip_suffix(".hint").unwrap_or(key),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SettingsSearchHit {
+    category: Category,
+    key: String,
+    title: String,
 }
 
 fn inline_search_category_for_option(key: &str) -> Option<Category> {
@@ -1035,7 +1108,7 @@ fn inline_search_category_for_option(key: &str) -> Option<Category> {
 }
 
 fn push_settings_search_hit(
-    hits: &mut Vec<(Category, String)>,
+    hits: &mut Vec<SettingsSearchHit>,
     category: Category,
     key: &str,
     value: &str,
@@ -1052,13 +1125,17 @@ fn push_settings_search_hit(
     let title = catalog.t(title_key, &[]);
     if !hits
         .iter()
-        .any(|(cat, label)| *cat == category && label == &title)
+        .any(|hit| hit.category == category && hit.title == title)
     {
-        hits.push((category, title));
+        hits.push(SettingsSearchHit {
+            category,
+            key: key.to_owned(),
+            title,
+        });
     }
 }
 
-fn settings_content_hits(query: &str, catalog: &i18n::Catalog) -> Vec<(Category, String)> {
+fn settings_content_hits(query: &str, catalog: &i18n::Catalog) -> Vec<SettingsSearchHit> {
     let query = query.to_lowercase();
     let mut hits = Vec::new();
     for (category, keys) in INLINE_SEARCH_KEYS {
@@ -1209,6 +1286,7 @@ fn settings_hairline(ui: &mut egui::Ui) {
 fn page_title(ui: &mut egui::Ui, title: &str) {
     let (rect, _) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 18.0), egui::Sense::hover());
+    reveal_settings_search_anchor(ui, title, rect);
     ui.painter().text(
         rect.left_center(),
         egui::Align2::LEFT_CENTER,
@@ -1223,11 +1301,12 @@ fn page_title(ui: &mut egui::Ui, title: &str) {
 /// 섹션 제목 — 카드 없이 title + 1px divider만 사용한다.
 fn section(ui: &mut egui::Ui, title: &str) {
     ui.add_space(14.0);
-    ui.label(
+    let response = ui.label(
         egui::RichText::new(title)
             .size(SETTINGS_TYPE.section_title)
             .strong(),
     );
+    reveal_settings_search_anchor(ui, title, response.rect);
     ui.add_space(4.0);
     settings_hairline(ui);
 }
@@ -1243,6 +1322,7 @@ fn row(
         egui::vec2(ui.available_width(), SETTINGS_DETAIL.row_height),
         egui::Sense::hover(),
     );
+    reveal_settings_search_anchor(ui, label, rect);
     let control_width = SETTINGS_DETAIL
         .control_column
         .min((rect.width() - SETTINGS_DETAIL.column_gap).max(0.0));
@@ -1297,6 +1377,29 @@ fn row(
         y,
         egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
     );
+}
+
+fn reveal_settings_search_anchor(ui: &egui::Ui, label: &str, rect: egui::Rect) {
+    let reveal = ui.ctx().data_mut(|data| {
+        let id = egui::Id::new("settings_search_row_reveal");
+        let category = data.get_temp::<Category>(egui::Id::new("settings_rendered_category"));
+        if data
+            .get_temp::<(Category, String)>(id)
+            .is_some_and(|(target, row)| Some(target) == category && row == label)
+        {
+            data.remove::<(Category, String)>(id);
+            true
+        } else {
+            false
+        }
+    });
+    if reveal {
+        ui.scroll_to_rect_animation(
+            rect,
+            Some(egui::Align::Center),
+            egui::style::ScrollAnimation::none(),
+        );
+    }
 }
 
 fn detail_text(ui: &mut egui::Ui, text: impl Into<String>, selectable: bool) {
@@ -2283,11 +2386,9 @@ fn agent_send_presets_section(
     catalog: &i18n::Catalog,
 ) {
     ui.add_space(8.0);
-    ui.label(
-        egui::RichText::new(catalog.t("settings.agent_presets", &[]))
-            .strong()
-            .size(13.0),
-    );
+    let title = catalog.t("settings.agent_presets", &[]);
+    let response = ui.label(egui::RichText::new(&title).strong().size(13.0));
+    reveal_settings_search_anchor(ui, &title, response.rect);
     ui.label(
         egui::RichText::new(catalog.t("settings.agent_presets.hint", &[]))
             .size(11.0)
@@ -4732,7 +4833,8 @@ mod tests {
             let hits = settings_content_hits(query, &catalog);
             let expected = catalog.t(title_key, &[]);
             assert!(
-                hits.contains(&(category, expected)),
+                hits.iter()
+                    .any(|hit| hit.category == category && hit.title == expected),
                 "{query}: matching setting was omitted from search"
             );
         }
@@ -4743,13 +4845,101 @@ mod tests {
         let catalog = i18n::Catalog::load("ko-KR").unwrap();
         let serve = catalog.t("settings.mobile_web.serve_setup", &[]);
         assert!(
-            settings_content_hits(&serve, &catalog).contains(&(super::Category::MobileWeb, serve))
+            settings_content_hits(&serve, &catalog)
+                .iter()
+                .any(|hit| hit.category == super::Category::MobileWeb && hit.title == serve)
         );
         for key in ["shortcuts.action.copy", "shortcuts.action.paste"] {
             let title = catalog.t(key, &[]);
             assert!(
                 settings_content_hits(&title, &catalog)
-                    .contains(&(super::Category::Shortcuts, title))
+                    .iter()
+                    .any(|hit| hit.category == super::Category::Shortcuts && hit.title == title)
+            );
+        }
+    }
+
+    #[test]
+    fn 설정_검색_선택지는_소속_설정_행으로_이동하도록_요청한다() {
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        let option = catalog.t("settings.session_name_style.folder", &[]);
+        let row = catalog.t("settings.session_name_style", &[]);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(240.0, 600.0))
+            .build_ui_state(
+                |ui, state: &mut (String, Option<super::Category>)| {
+                    if let Some(category) =
+                        nav(ui, super::Category::Terminal, 0, &mut state.0, &catalog)
+                    {
+                        state.1 = Some(category);
+                    }
+                },
+                (option.clone(), None),
+            );
+        harness.run();
+        harness.get_by_label(&option).click();
+        harness.run();
+        assert_eq!(harness.state().1, Some(super::Category::General));
+        assert_eq!(
+            harness.ctx.data_mut(
+                |data| data.get_temp::<(super::Category, String)>(egui::Id::new(
+                    "settings_search_row_reveal"
+                ))
+            ),
+            Some((super::Category::General, row))
+        );
+    }
+
+    #[test]
+    fn 설정_검색_대상_행은_긴_페이지에서_스크롤되어_보인다() {
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(520.0, 240.0))
+            .build_ui_state(
+                |ui, offset: &mut f32| {
+                    ui.ctx().data_mut(|data| {
+                        data.insert_temp(
+                            egui::Id::new("settings_rendered_category"),
+                            super::Category::General,
+                        )
+                    });
+                    let output = egui::ScrollArea::vertical()
+                        .id_salt("settings_search_scroll_test")
+                        .show(ui, |ui| {
+                            for index in 0..12 {
+                                super::row(ui, &format!("행 {index}"), None, |_| {});
+                            }
+                            super::row(ui, "대상 행", None, |_| {});
+                        });
+                    *offset = output.state.offset.y;
+                },
+                0.0,
+            );
+        harness.run();
+        assert_eq!(*harness.state(), 0.0);
+        harness.ctx.data_mut(|data| {
+            data.insert_temp(
+                egui::Id::new("settings_search_row_reveal"),
+                (super::Category::General, "대상 행".to_owned()),
+            )
+        });
+        harness.run();
+        assert!(*harness.state() > 0.0);
+    }
+
+    #[test]
+    fn 설정_검색은_열려있지_않은_확인창_문구를_결과로_내지_않는다() {
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        for key in [
+            "credentials.delete_confirm.title",
+            "env.project_close_confirm.title",
+            "agents.production_confirm_title",
+        ] {
+            let title = catalog.t(key, &[]);
+            assert!(
+                !settings_content_hits(&title, &catalog)
+                    .iter()
+                    .any(|hit| hit.key == key),
+                "{key} was indexed although its dialog is closed"
             );
         }
     }

@@ -23,12 +23,34 @@ pub fn window<R>(
     open: &mut bool,
     contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> Option<egui::InnerResponse<Option<R>>> {
+    window_impl(ctx, spec, open, false, contents)
+}
+
+/// A centered, movable window whose viewport-clamped size cannot grow with content.
+/// Long forms should use `window_body` so the header and footer remain visible.
+pub fn fixed_window<R>(
+    ctx: &egui::Context,
+    spec: WindowSpec<'_>,
+    open: &mut bool,
+    contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> Option<egui::InnerResponse<Option<R>>> {
+    window_impl(ctx, spec, open, true, contents)
+}
+
+fn window_impl<R>(
+    ctx: &egui::Context,
+    spec: WindowSpec<'_>,
+    open: &mut bool,
+    fixed_size: bool,
+    contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> Option<egui::InnerResponse<Option<R>>> {
     if !*open {
         return None;
     }
     let viewport = ctx.content_rect().shrink(16.0);
     let max_size = viewport.size().max(egui::vec2(1.0, 1.0));
     let min_size = spec.min_size.min(max_size);
+    let default_size = spec.default_size.clamp(min_size, max_size);
     let key = spec.id.with(("window_geometry", ctx.viewport_id()));
     let frame = ctx.cumulative_frame_nr();
     let previous = ctx.data(|data| data.get_temp::<WindowGeometry>(key));
@@ -38,18 +60,24 @@ pub fn window<R>(
         .title_bar(false)
         .collapsible(false)
         .resizable(true)
-        .default_size(spec.default_size.clamp(min_size, max_size))
+        .default_size(default_size)
         .pivot(egui::Align2::CENTER_CENTER)
         .default_pos(viewport.center())
         .min_size(min_size)
         .max_size(max_size)
         .constrain_to(viewport)
         .frame(super::popover_frame(ctx));
+    if fixed_size {
+        native = native.fixed_size(default_size);
+    }
     if opening {
         native = native.current_pos(viewport.center());
     }
     let mut close = false;
     let result = native.show(ctx, |ui| {
+        if fixed_size {
+            ui.set_min_size(ui.available_size());
+        }
         shell::apply_style(ui);
         let width = ui.available_width();
         close = shell::header(

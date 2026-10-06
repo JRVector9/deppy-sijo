@@ -1311,6 +1311,9 @@ impl Worker {
         match command {
             RuntimeCommand::SpawnAgent {
                 agent_config_id, ..
+            }
+            | RuntimeCommand::SpawnAgentBeside {
+                agent_config_id, ..
             } => {
                 let correlation_id = agent_config_id
                     .as_ref()
@@ -2300,7 +2303,11 @@ impl Worker {
             self.reject_invalid_command(&command);
             return;
         }
+        let (command, agent_split_target) = command.into_agent_spawn_target();
         match command {
+            RuntimeCommand::SpawnAgentBeside { .. } => {
+                unreachable!("split launch normalized above")
+            }
             RuntimeCommand::SpawnShell {
                 cols,
                 rows,
@@ -2403,6 +2410,17 @@ impl Worker {
                 let correlation_id = agent_config_id
                     .as_ref()
                     .map(|id| AgentConfigCorrelationId::from_validated(id.clone()));
+                if agent_split_target
+                    .as_ref()
+                    .is_some_and(|pane| self.mux.tab_of_pane(pane).is_none())
+                {
+                    self.emit(RuntimeEvent::SpawnFailed {
+                        kind: SpawnKind::Agent,
+                        message: MessagePayload::new("runtime.split.target_missing"),
+                    });
+                    self.emit_agent_spawn_resolved(correlation_id, None);
+                    return;
+                }
                 if self.suspended {
                     self.emit(RuntimeEvent::SpawnFailed {
                         kind: SpawnKind::Agent,
@@ -2462,7 +2480,21 @@ impl Worker {
                         // regex가 없어도 idle heuristic(3단)은 동작해야 한다 — 상시 설치
                         self.detectors.insert(id, StatusDetector::new(patterns));
                         self.register_agent_exit_watch(id);
-                        self.attach_in_new_tab(id, AGENT_TITLE_ID);
+                        if let Some(target) = agent_split_target {
+                            if !self.attach_agent_beside(id, AGENT_TITLE_ID, &target) {
+                                self.remove_session(id);
+                                self.detectors.remove(&id);
+                                self.agent_exit_watch.remove(&id);
+                                self.emit(RuntimeEvent::SpawnFailed {
+                                    kind: SpawnKind::Agent,
+                                    message: MessagePayload::new("runtime.split.target_lost"),
+                                });
+                                self.emit_agent_spawn_resolved(correlation_id, None);
+                                return;
+                            }
+                        } else {
+                            self.attach_in_new_tab(id, AGENT_TITLE_ID);
+                        }
                         if let Some(pipe) = &mut self.persist {
                             // 스키마 CHECK: agent kind는 agent_id 필수 — config id가
                             // 없는 spawn(perf 하네스 등)은 shell kind로 기록한다
@@ -3134,6 +3166,33 @@ impl Worker {
         self.mux.window.add_tab(tab.id.clone());
         self.mux.tabs.insert(tab.id.clone(), tab);
         self.mux.focus.focus(pane_id);
+    }
+
+    fn attach_agent_beside(
+        &mut self,
+        session: SessionId,
+        title_prefix: &str,
+        target: &MuxPaneId,
+    ) -> bool {
+        let Some(tab_id) = self.mux.tab_of_pane(target) else {
+            return false;
+        };
+        let pane_id = MuxPaneId::new();
+        if !self.mux.tabs.get_mut(&tab_id).is_some_and(|tab| {
+            tab.split_pane(target, mux::SplitDirection::Horizontal, pane_id.clone())
+        }) {
+            return false;
+        }
+        self.tab_counter += 1;
+        let mut pane = MuxPane::new(
+            pane_id.clone(),
+            format!("{title_prefix} {}", self.tab_counter),
+        );
+        pane.session_id = Some(session);
+        self.mux.panes.insert(pane_id.clone(), pane);
+        self.mux.window.active_tab = Some(tab_id);
+        self.mux.focus.focus(pane_id);
+        true
     }
 
     /// 복원(PR-14)이 spawn하는 fresh 셸의 scrollback 기본값 — 실제 config 값은
@@ -3861,6 +3920,8 @@ impl Worker {
                     });
                     return;
                 }
+                // A queued split retains its exact target even if another tab became active.
+                self.mux.window.active_tab = Some(tab_id);
                 self.mux.focus.focus(pane_id);
                 self.emit_mux_snapshot();
                 self.emit(RuntimeEvent::ShellSpawned { session: id });
@@ -6782,6 +6843,179 @@ mod tests {
             error_regex: None,
             done_regex: None,
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn agent_right_split_preserves_anchor_tab_even_when_another_tab_is_active() {
+        let mut harness = UnattachedHarness::new("agent-right-split");
+        let (worker, events) = (&mut harness.worker, &harness.events);
+        worker.shell = spec("/bin/cat", &[]);
+        worker.handle_command(RuntimeCommand::SpawnShell {
+            cols: 80,
+            rows: 24,
+            scrollback_lines: 100,
+        });
+        let original = worker.mux.snapshot(|_| None);
+        let original_tab = original.active_tab.clone().unwrap();
+        let original_pane = original.focused_pane.clone().unwrap();
+        let original_session = original.tabs[0].panes[0].session_id;
+        events.try_iter().for_each(drop);
+        worker.handle_command(RuntimeCommand::SpawnShell {
+            cols: 80,
+            rows: 24,
+            scrollback_lines: 100,
+        });
+        assert_ne!(worker.mux.window.active_tab, Some(original_tab.clone()));
+        events.try_iter().for_each(drop);
+
+        let mut launch = correlated_agent_command();
+        if let RuntimeCommand::SpawnAgent { command, .. } = &mut launch {
+            *command = "/bin/cat".to_owned();
+        }
+        worker.handle_command(launch.with_right_split(original_pane.clone()).unwrap());
+
+        let resolved = events.try_iter().collect::<Vec<_>>();
+        let failure = resolved.iter().find_map(|event| match event {
+            RuntimeEvent::SpawnFailed { message, .. } => Some(message.message_id.as_str()),
+            _ => None,
+        });
+        assert!(
+            resolved.iter().any(|event| matches!(
+                event,
+                RuntimeEvent::AgentSpawnResolved {
+                    session: Some(_),
+                    ..
+                }
+            )),
+            "agent must resolve successfully; failure={failure:?}"
+        );
+        let snapshot = worker.mux.snapshot(|_| None);
+        assert_eq!(snapshot.tabs.len(), 2, "launch must not create a third tab");
+        assert_eq!(snapshot.active_tab, Some(original_tab.clone()));
+        let tab = snapshot
+            .tabs
+            .iter()
+            .find(|tab| tab.id == original_tab)
+            .unwrap();
+        assert_eq!(tab.panes.len(), 2);
+        assert_eq!(tab.panes[0].id, original_pane);
+        assert_eq!(tab.panes[0].session_id, original_session);
+        let right = tab.panes[1].id.clone();
+        assert_eq!(snapshot.focused_pane, Some(right.clone()));
+        assert!(
+            matches!(&tab.layout, mux::LayoutNode::Split { direction: mux::SplitDirection::Horizontal, first, second, .. }
+            if **first == mux::LayoutNode::Pane(original_pane) && **second == mux::LayoutNode::Pane(right))
+        );
+        assert_eq!(worker.sessions.len(), 3);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn shell_right_split_reveals_anchor_tab_when_another_tab_became_active() {
+        let mut harness = UnattachedHarness::new("shell-right-split-tab-focus");
+        let (worker, events) = (&mut harness.worker, &harness.events);
+        worker.shell = spec("/bin/cat", &[]);
+        worker.handle_command(RuntimeCommand::SpawnShell {
+            cols: 80,
+            rows: 24,
+            scrollback_lines: 100,
+        });
+        let before = worker.mux.snapshot(|_| None);
+        let target_tab = before.active_tab.clone().unwrap();
+        let target_pane = before.focused_pane.clone().unwrap();
+        let target_session = before.tabs[0].panes[0].session_id;
+        events.try_iter().for_each(drop);
+        worker.handle_command(RuntimeCommand::SpawnShell {
+            cols: 80,
+            rows: 24,
+            scrollback_lines: 100,
+        });
+        assert_ne!(worker.mux.window.active_tab, Some(target_tab.clone()));
+        events.try_iter().for_each(drop);
+
+        worker.handle_command(RuntimeCommand::SplitPane {
+            pane: target_pane.clone(),
+            direction: mux::SplitDirection::Horizontal,
+            scrollback_lines: 100,
+        });
+        assert!(
+            events
+                .try_iter()
+                .any(|event| matches!(event, RuntimeEvent::ShellSpawned { .. })),
+            "owned shell must spawn successfully"
+        );
+        let after = worker.mux.snapshot(|_| None);
+        assert_eq!(
+            after.tabs.len(),
+            2,
+            "right split must not create another tab"
+        );
+        assert_eq!(
+            after.active_tab,
+            Some(target_tab.clone()),
+            "new right pane must be visible even after active tab changed"
+        );
+        let target = after.tabs.iter().find(|tab| tab.id == target_tab).unwrap();
+        assert_eq!(target.panes.len(), 2);
+        assert_eq!(target.panes[0].id, target_pane);
+        assert_eq!(target.panes[0].session_id, target_session);
+        assert_eq!(after.focused_pane, Some(target.panes[1].id.clone()));
+        assert!(matches!(&target.layout,
+            mux::LayoutNode::Split { direction: mux::SplitDirection::Horizontal, first, second, .. }
+            if **first == mux::LayoutNode::Pane(target.panes[0].id.clone())
+                && **second == mux::LayoutNode::Pane(target.panes[1].id.clone())));
+        assert_eq!(worker.sessions.len(), 3);
+    }
+
+    #[test]
+    fn agent_right_split_stale_target_rejects_before_secret_or_process_creation() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: Some("runtime-secret-value".to_owned()),
+        });
+        let (mut worker, events) = admission_worker(resolver.clone(), "agent-right-split-stale");
+        let initial_id = worker.next_id;
+        worker.handle_command(
+            correlated_agent_command()
+                .with_right_split(MuxPaneId("closed-pane".to_owned()))
+                .unwrap(),
+        );
+        assert!(resolver.calls.lock().unwrap().is_empty());
+        assert_eq!(worker.next_id, initial_id);
+        assert!(worker.sessions.is_empty());
+        assert!(worker.mux.tabs.is_empty());
+        assert!(events.try_iter().any(|event| matches!(
+            event,
+            RuntimeEvent::AgentSpawnResolved { session: None, .. }
+        )));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn agent_right_split_spawn_failure_keeps_original_layout_and_session() {
+        let mut harness = UnattachedHarness::new("agent-right-split-failure");
+        let (worker, events) = (&mut harness.worker, &harness.events);
+        worker.shell = spec("/bin/cat", &[]);
+        worker.handle_command(RuntimeCommand::SpawnShell {
+            cols: 80,
+            rows: 24,
+            scrollback_lines: 100,
+        });
+        events.try_iter().for_each(drop);
+        let before = worker.mux.snapshot(|_| None);
+        let target = before.focused_pane.clone().unwrap();
+        let mut command = correlated_agent_command();
+        if let RuntimeCommand::SpawnAgent { command, .. } = &mut command {
+            *command = "/definitely-missing-deppy-test-agent".to_owned();
+        }
+        worker.handle_command(command.with_right_split(target).unwrap());
+        assert_eq!(worker.mux.snapshot(|_| None), before);
+        assert_eq!(worker.sessions.len(), 1);
+        assert!(events.try_iter().any(|event| matches!(
+            event,
+            RuntimeEvent::AgentSpawnResolved { session: None, .. }
+        )));
     }
 
     #[test]

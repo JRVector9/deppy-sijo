@@ -13,7 +13,7 @@ pub use notice::{NoticeTone, notice};
 pub use shell::{
     PopupSpec, body, body_with_max_height, popover, popover_frame, prepare_target, show,
 };
-pub use window::{WindowSpec, window, window_body};
+pub use window::{WindowSpec, fixed_window, window, window_body};
 
 #[derive(Clone, Copy)]
 struct ModalFence {

@@ -6912,6 +6912,42 @@ impl Db {
         folder_anchor: WorkspaceFolderAnchor,
         volume: Option<uuid::Uuid>,
     ) -> anyhow::Result<WorkspaceFindOrCreateResult> {
+        self.find_or_create_workspace_by_exact_path_with_volume_policy(
+            name,
+            path,
+            folder_anchor,
+            volume,
+            false,
+        )
+    }
+
+    /// A folder explicitly chosen by the user may reconnect a legacy exact-path row after
+    /// device renumbering when its inode still matches and macOS supplies a current volume UUID.
+    /// An existing UUID mismatch and alias-path reuse remain rejected.
+    pub fn find_or_create_selected_workspace_by_exact_path_with_volume(
+        &self,
+        name: &str,
+        path: &str,
+        folder_anchor: WorkspaceFolderAnchor,
+        volume: Option<uuid::Uuid>,
+    ) -> anyhow::Result<WorkspaceFindOrCreateResult> {
+        self.find_or_create_workspace_by_exact_path_with_volume_policy(
+            name,
+            path,
+            folder_anchor,
+            volume,
+            true,
+        )
+    }
+
+    fn find_or_create_workspace_by_exact_path_with_volume_policy(
+        &self,
+        name: &str,
+        path: &str,
+        folder_anchor: WorkspaceFolderAnchor,
+        volume: Option<uuid::Uuid>,
+        allow_selected_legacy_rebind: bool,
+    ) -> anyhow::Result<WorkspaceFindOrCreateResult> {
         anyhow::ensure!(
             volume.is_none_or(|id| !id.is_nil()),
             "workspace_volume_identity_invalid"
@@ -6972,6 +7008,7 @@ impl Db {
                 row.folder_anchor,
                 folder_anchor,
                 volume,
+                allow_selected_legacy_rebind,
             )?;
             let anchor_claimed: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM workspaces
@@ -7044,6 +7081,7 @@ impl Db {
                 Some(folder_anchor),
                 folder_anchor,
                 volume,
+                false,
             )?;
             stored.path = path.to_owned();
             settings_workspace_update_admission(&tx, &stored)?;
@@ -17613,6 +17651,95 @@ mod tests {
             Some((33, 22))
         );
         assert_eq!(db.list_workspaces().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn user_selected_legacy_exact_path_rebinds_once_with_a_recorded_volume() {
+        let db = Db::open_in_memory().unwrap();
+        let old = WorkspaceFolderAnchor { dev: 11, ino: 22 };
+        let current = WorkspaceFolderAnchor { dev: 33, ino: 22 };
+        let volume = uuid::Uuid::from_u128(1);
+        let created = db
+            .find_or_create_workspace_by_exact_path_with_volume("original", "/project", old, None)
+            .unwrap();
+
+        assert!(
+            db.find_or_create_workspace_by_exact_path_with_volume(
+                "ignored",
+                "/project",
+                current,
+                Some(volume)
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("workspace_legacy_rebind_requires_confirmation")
+        );
+        let selected = db
+            .find_or_create_selected_workspace_by_exact_path_with_volume(
+                "ignored",
+                "/project",
+                current,
+                Some(volume),
+            )
+            .unwrap();
+        assert!(!selected.created);
+        assert_eq!(selected.row.id, created.row.id);
+        assert_eq!(selected.row.name, "original");
+        assert_eq!(
+            db.workspace_anchor(&created.row.id).unwrap(),
+            Some((33, 22))
+        );
+        assert!(
+            db.find_or_create_selected_workspace_by_exact_path_with_volume(
+                "ignored",
+                "/project",
+                current,
+                Some(uuid::Uuid::from_u128(2))
+            )
+            .is_err()
+        );
+        assert_eq!(db.list_workspaces().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn user_selection_cannot_override_known_volume_or_changed_inode() {
+        for (stored_volume, current, selected_volume) in [
+            (None, WorkspaceFolderAnchor { dev: 33, ino: 22 }, None),
+            (
+                Some(uuid::Uuid::from_u128(1)),
+                WorkspaceFolderAnchor { dev: 33, ino: 22 },
+                Some(uuid::Uuid::from_u128(2)),
+            ),
+            (
+                None,
+                WorkspaceFolderAnchor { dev: 33, ino: 23 },
+                Some(uuid::Uuid::from_u128(1)),
+            ),
+        ] {
+            let db = Db::open_in_memory().unwrap();
+            let old = WorkspaceFolderAnchor { dev: 11, ino: 22 };
+            let created = db
+                .find_or_create_workspace_by_exact_path_with_volume(
+                    "original",
+                    "/project",
+                    old,
+                    stored_volume,
+                )
+                .unwrap();
+            assert!(
+                db.find_or_create_selected_workspace_by_exact_path_with_volume(
+                    "ignored",
+                    "/project",
+                    current,
+                    selected_volume
+                )
+                .is_err()
+            );
+            assert_eq!(
+                db.workspace_anchor(&created.row.id).unwrap(),
+                Some((11, 22))
+            );
+        }
     }
 
     #[test]

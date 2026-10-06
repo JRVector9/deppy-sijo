@@ -1351,7 +1351,7 @@ impl FleetUi {
         self.broadcast.as_ref()?;
         let mut action = None;
         let mut open = true;
-        super::popup::window(
+        super::popup::fixed_window(
             ctx,
             super::popup::WindowSpec {
                 id: egui::Id::new("fleet_broadcast"),
@@ -1462,7 +1462,6 @@ impl FleetUi {
         });
         // ④ 전송 — 현재 PTY 세션과 교집합만 보낸다. 패널 연 뒤 종료된 stale 대상을 제외해
         // 카운트가 실제 전송 수와 일치하게 한다(세션 순회 순서라 결정적).
-        ui.add_space(6.0);
         let effective_targets: Vec<crate::fleet::FleetPromptTarget> = sessions
             .iter()
             .filter_map(|s| s.broadcast_key())
@@ -3418,6 +3417,151 @@ mod tests {
         rows[0].idle_since = None;
         fleet.update_idle_clocks(&rows, 200);
         assert_eq!(fleet.idle_since(&rows[0]), Some(200));
+    }
+
+    fn broadcast_layout_harness(
+        size: egui::Vec2,
+        long_prompt: bool,
+    ) -> egui_kittest::Harness<'static, FleetUi> {
+        let sessions: Vec<_> = (1..=40)
+            .map(|id| pty_session("ws", id, AgentVisualState::Active))
+            .collect();
+        let targets = sessions[..3]
+            .iter()
+            .filter_map(FleetSession::broadcast_key)
+            .collect();
+        let library = PromptLibrary {
+            prompts: vec![crate::prompt_library::Prompt {
+                id: "layout".into(),
+                title: "Broadcast prompt".into(),
+                body: if long_prompt {
+                    "A long broadcast preview line.\n".repeat(100)
+                } else {
+                    "Review the current changes".into()
+                },
+                tags: vec![],
+            }],
+        };
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(size)
+            .build_ui_state(
+                move |ui, fleet: &mut FleetUi| {
+                    fleet.broadcast_window(ui.ctx(), &sessions, &catalog(), &library);
+                },
+                FleetUi {
+                    broadcast: Some(BroadcastState {
+                        prompt_id: Some("layout".into()),
+                        targets,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            );
+        crate::theme::install_palette(&harness.ctx);
+        for _ in 0..16 {
+            harness.step();
+        }
+        harness
+    }
+
+    #[test]
+    fn broadcast_layout_does_not_grow_with_long_preview_or_repaints() {
+        use egui_kittest::kittest::Queryable;
+        for long_prompt in [false, true] {
+            let mut harness = broadcast_layout_harness(egui::vec2(1000.0, 850.0), long_prompt);
+            let rect = harness
+                .ctx
+                .memory(|memory| memory.area_rect(egui::Id::new("fleet_broadcast")))
+                .unwrap();
+            assert!(rect.height() <= 564.0, "broadcast grew: {rect:?}");
+            let send = harness
+                .get_by_label(&catalog().t("fleet.broadcast.send", &[("count", "3")]))
+                .rect();
+            assert!(rect.contains_rect(send), "send footer escaped: {send:?}");
+            for _ in 0..16 {
+                harness.step();
+            }
+            let after = harness
+                .ctx
+                .memory(|memory| memory.area_rect(egui::Id::new("fleet_broadcast")))
+                .unwrap();
+            assert!(
+                (after.size() - rect.size()).length() < 1.0,
+                "repaint resized broadcast: {rect:?} -> {after:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn broadcast_layout_scroll_reaches_targets_and_keeps_confirmation_visible() {
+        use egui_kittest::kittest::Queryable;
+        let mut harness = broadcast_layout_harness(egui::vec2(1000.0, 850.0), true);
+        let last = format!(
+            "session-40 · ws  ({})",
+            state_label(AgentVisualState::Active, &catalog())
+        );
+        let wheel = |harness: &mut egui_kittest::Harness<'_, FleetUi>, pos| {
+            harness
+                .input_mut()
+                .events
+                .push(egui::Event::PointerMoved(pos));
+            harness.input_mut().events.push(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -4000.0),
+                phase: egui::TouchPhase::Move,
+                modifiers: egui::Modifiers::NONE,
+            });
+            for _ in 0..30 {
+                harness.step();
+            }
+        };
+        let center = harness
+            .ctx
+            .memory(|memory| memory.area_rect(egui::Id::new("fleet_broadcast")))
+            .unwrap()
+            .center();
+        wheel(&mut harness, center);
+        let first = format!(
+            "session-1 · ws  ({})",
+            state_label(AgentVisualState::Active, &catalog())
+        );
+        let center = harness.get_by_label(&first).rect().center();
+        wheel(&mut harness, center);
+        let rect = harness
+            .ctx
+            .memory(|memory| memory.area_rect(egui::Id::new("fleet_broadcast")))
+            .unwrap();
+        let target = harness.get_by_label(&last).rect();
+        assert!(
+            rect.contains_rect(target),
+            "last target inaccessible: {target:?}, window={rect:?}"
+        );
+        harness
+            .get_by_label(&catalog().t("fleet.broadcast.send", &[("count", "3")]))
+            .click();
+        harness.run();
+        let confirm = harness
+            .get_by_label(&catalog().t("fleet.broadcast.confirm_yes", &[]))
+            .rect();
+        assert!(
+            rect.contains_rect(confirm),
+            "confirmation footer clipped: {confirm:?}"
+        );
+        assert!(harness.state().broadcast.as_ref().unwrap().confirm_send);
+    }
+
+    #[test]
+    fn broadcast_layout_small_viewport_keeps_send_visible() {
+        use egui_kittest::kittest::Queryable;
+        let harness = broadcast_layout_harness(egui::vec2(400.0, 360.0), true);
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 360.0));
+        let send = harness
+            .get_by_label(&catalog().t("fleet.broadcast.send", &[("count", "3")]))
+            .rect();
+        assert!(
+            viewport.contains_rect(send),
+            "send outside small viewport: {send:?}"
+        );
     }
 
     fn followup_layout_harness(

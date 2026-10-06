@@ -505,6 +505,13 @@ struct PaneHeaderStyle {
     active_stroke: Option<egui::Stroke>,
 }
 
+impl PaneHeaderStyle {
+    fn line_stroke(self, visuals: &egui::Visuals) -> egui::Stroke {
+        self.active_stroke
+            .unwrap_or_else(|| crate::ui::designall::separator_stroke(visuals))
+    }
+}
+
 /// 채도를 `factor`배로 낮춘다 (0.0이면 무채색, 1.0이면 원본). luma 쪽으로 섞으므로
 /// **밝기는 유지되고 채도만 빠진다** — 알파를 낮추는 것과 다르다. 알파를 낮추면 선이
 /// 그냥 어두워져 신호가 약해지는데, "쨍하다"는 건 채도 문제이지 밝기 문제가 아니다
@@ -1378,9 +1385,7 @@ fn paint_tab_divider(ui: &egui::Ui, header: egui::Rect, x: f32, style: PaneHeade
     if x <= header.left() || x >= header.right() {
         return;
     }
-    let stroke = style
-        .active_stroke
-        .unwrap_or_else(|| crate::ui::designall::separator_stroke(ui.visuals()));
+    let stroke = style.line_stroke(ui.visuals());
     ui.painter().vline(
         crate::ui::snap_line_to_pixel(x, stroke.width, ui.ctx().pixels_per_point()),
         egui::Rangef::new(
@@ -1389,6 +1394,12 @@ fn paint_tab_divider(ui: &egui::Ui, header: egui::Rect, x: f32, style: PaneHeade
         ),
         stroke,
     );
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NewSessionRequest {
+    NewTab,
+    SplitRight(runtime::MuxPaneId),
 }
 
 /// pane 헤더 버튼 기하 — 닫기(×)는 마지막까지 남는 버튼이다.
@@ -2086,7 +2097,7 @@ pub struct WorkspaceUi {
     /// pane 우클릭 → "환경변수·API 설정" 요청 (E4 ⑥). App이 프레임에서 take해
     /// 설정 창을 Environment 카테고리로 연다.
     open_environment_requested: Option<super::environment::EnvironmentOpenRequest>,
-    new_session_requested: bool,
+    new_session_requested: Option<NewSessionRequest>,
     /// pane 우클릭 → 세션 폴더 요청(파일 트리 이동/Finder 열기, 2026-07-18). cwd
     /// 해석(lsof 폴백 포함)과 트리·Finder 라우팅은 App 몫이라 요청만 쌓는다 — E4 ⑥
     /// take_open_environment와 같은 프레임 소비 패턴.
@@ -3045,7 +3056,7 @@ impl WorkspaceUi {
             confirm_close: None,
             agent_send_presets: Vec::new(),
             open_environment_requested: None,
-            new_session_requested: false,
+            new_session_requested: None,
             session_folder_request: None,
             note_append_request: None,
             respawn_archived_request: None,
@@ -6306,11 +6317,18 @@ impl WorkspaceUi {
             egui::pos2(header.left() + 8.0, header.top()),
             egui::pos2(close_rect.left() - 4.0, header.bottom()),
         );
+        let title_color = if identity_style.top_line.color != egui::Color32::TRANSPARENT
+            && ui.rect_contains_pointer(header)
+        {
+            identity_style.top_line.color
+        } else {
+            tokens.muted_text
+        };
         let mut title_job = egui::text::LayoutJob::single_section(
             attached_display_title.to_owned(),
             egui::TextFormat {
                 font_id: egui::FontId::proportional(12.0),
-                color: tokens.muted_text,
+                color: title_color,
                 ..Default::default()
             },
         );
@@ -6327,7 +6345,7 @@ impl WorkspaceUi {
                 text_rect.center().y - title_galley.size().y / 2.0,
             ),
             title_galley,
-            tokens.muted_text,
+            title_color,
         );
         (detach, reorder_requested)
     }
@@ -6353,7 +6371,7 @@ impl WorkspaceUi {
                 .on_hover_text(catalog.t("workspace.start_shell_prompt", &[]))
                 .clicked()
             {
-                self.new_session_requested = true;
+                self.new_session_requested = Some(NewSessionRequest::NewTab);
             }
         });
     }
@@ -6449,7 +6467,9 @@ impl WorkspaceUi {
             empty_clip,
             header.center().y,
             font.clone(),
-            if any_active {
+            if ui.rect_contains_pointer(empty_response.rect) {
+                style.line_stroke(ui.visuals()).color
+            } else if any_active {
                 tokens.muted_text
             } else {
                 tokens.text
@@ -6474,6 +6494,7 @@ impl WorkspaceUi {
                 catalog,
                 &font,
                 placement.kind,
+                style.line_stroke(ui.visuals()).color,
             ) {
                 output.aux_tab_intent = Some((placement.kind, intent));
             }
@@ -6499,7 +6520,7 @@ impl WorkspaceUi {
             });
             if blank.clicked() {
                 if input_enabled {
-                    self.new_session_requested = true;
+                    self.new_session_requested = Some(NewSessionRequest::NewTab);
                 } else {
                     output.focus_requested = true;
                 }
@@ -6659,7 +6680,10 @@ impl WorkspaceUi {
         );
 
         let header_response = ui.interact(
-            header,
+            egui::Rect::from_min_max(
+                header.min,
+                egui::pos2(pane_header_active_boundary(header, close), header.bottom()),
+            ),
             egui::Id::new(("terminal_pane_header", &pane.id)),
             egui::Sense::click(),
         );
@@ -6678,25 +6702,26 @@ impl WorkspaceUi {
             self.pane_context_menu(&header_response, &pane.id, config, catalog);
         }
 
-        // Blank strip is distinct from the existing tab, X and toolbar targets.
+        // Cover the vacant strip through the right edge, including empty toolbar margins.
+        // Actual toolbar buttons register later and retain priority over this background.
         let blank_left = placements
             .last()
             .map_or(pane_header_active_boundary(header, close), |p| {
                 p.geometry.tab.right()
             });
-        if buttons.toolbar_left > blank_left {
+        if header.right() > blank_left {
+            // Auxiliary bodies fence terminal input, while the selector remains a header action.
+            let launcher_enabled =
+                (input_enabled || aux_active) && !super::popup::modal_input_blocked(ui.ctx());
             let blank = ui.interact(
-                egui::Rect::from_min_max(
-                    egui::pos2(blank_left, header.top()),
-                    egui::pos2(buttons.toolbar_left, header.bottom()),
-                ),
+                egui::Rect::from_min_max(egui::pos2(blank_left, header.top()), header.max),
                 egui::Id::new(("terminal_new_session_strip", &pane.id)),
                 egui::Sense::click(),
             );
             blank.widget_info(|| {
                 egui::WidgetInfo::labeled(
                     egui::WidgetType::Button,
-                    input_enabled,
+                    launcher_enabled,
                     catalog.t("workspace.new_shell", &[]),
                 )
             });
@@ -6710,8 +6735,9 @@ impl WorkspaceUi {
                 self.terminal_focus_claimed = true;
                 output.local_focus_claimed = Some(pane.id.clone());
                 self.request_pane_focus(pane.id.clone());
-                if input_enabled {
-                    self.new_session_requested = true;
+                if launcher_enabled {
+                    self.new_session_requested =
+                        Some(NewSessionRequest::SplitRight(pane.id.clone()));
                 } else {
                     output.focus_requested = true;
                 }
@@ -6731,7 +6757,9 @@ impl WorkspaceUi {
             egui::pos2(title_right, header.bottom()),
         );
         // 보조 탭이 활성이면 세션 탭은 포커스된 pane이라도 선택 해제 상태로 읽혀야 한다.
-        let title_color = if focused && !aux_active {
+        let title_color = if ui.rect_contains_pointer(header_response.rect) {
+            style.line_stroke(ui.visuals()).color
+        } else if focused && !aux_active {
             tokens.text
         } else {
             tokens.muted_text
@@ -6830,6 +6858,7 @@ impl WorkspaceUi {
                 catalog,
                 &font,
                 placement.kind,
+                style.line_stroke(ui.visuals()).color,
             ) {
                 output.aux_tab_intent = Some((placement.kind, intent));
             }
@@ -6852,11 +6881,14 @@ impl WorkspaceUi {
         catalog: &i18n::Catalog,
         font: &egui::FontId,
         kind: PaneAuxTabKind,
+        hover_color: egui::Color32,
     ) -> Option<PaneAuxTabIntent> {
         let tokens = crate::ui::designall::tokens(ui.visuals());
         let mut intent = None;
         let tab_response = ui.interact(geometry.tab, id.with("tab"), egui::Sense::click());
-        let label_color = if active {
+        let label_color = if ui.rect_contains_pointer(tab_response.rect) {
+            hover_color
+        } else if active {
             tokens.text
         } else {
             tokens.muted_text
@@ -6924,7 +6956,9 @@ impl WorkspaceUi {
                     self.open_search_for_session(session);
                 }
             }
-            TerminalToolbarIcon::NewTerminal => self.new_session_requested = true,
+            TerminalToolbarIcon::NewTerminal => {
+                self.new_session_requested = Some(NewSessionRequest::NewTab)
+            }
             TerminalToolbarIcon::SplitColumns => self.send(RuntimeCommand::SplitPane {
                 pane: pane.clone(),
                 direction: SplitDirection::Horizontal,
@@ -7165,7 +7199,7 @@ impl WorkspaceUi {
                 input_enabled,
             );
             render_output.merge(header_output);
-            if self.has_pending_close_confirmation() || self.new_session_requested {
+            if self.has_pending_close_confirmation() || self.new_session_requested.is_some() {
                 super::popup::set_pending_modal(ui.ctx(), true);
             }
             // 보조 탭이 활성이면 이 pane의 본문은 App이 그린다. 터미널 표면·입력·drop·
@@ -8933,8 +8967,8 @@ impl WorkspaceUi {
         self.open_environment_requested.take()
     }
 
-    pub fn take_new_session_requested(&mut self) -> bool {
-        std::mem::take(&mut self.new_session_requested)
+    pub fn take_new_session_requested(&mut self) -> Option<NewSessionRequest> {
+        self.new_session_requested.take()
     }
 
     /// pane 우클릭의 세션 폴더 요청(트리 이동/Finder)을 소비한다 — App이 프레임마다
@@ -9202,6 +9236,19 @@ impl WorkspaceUi {
         if let Some(session) = session {
             self.send(RuntimeCommand::ScrollToPrompt { session, direction });
         }
+    }
+
+    pub fn split_pane(
+        &mut self,
+        pane: runtime::MuxPaneId,
+        direction: SplitDirection,
+        scrollback_lines: usize,
+    ) {
+        self.send(RuntimeCommand::SplitPane {
+            pane,
+            direction,
+            scrollback_lines,
+        });
     }
 
     /// 단축키용 현재 pane 분할. UI 버튼과 같은 runtime 명령을 사용한다.
@@ -15431,7 +15478,7 @@ mod tests {
         harness.run();
 
         assert!(harness.state().1.focus_requested);
-        assert!(!harness.state_mut().0.take_new_session_requested());
+        assert!(harness.state_mut().0.take_new_session_requested().is_none());
         assert!(drain_protocol(&mut harness.state_mut().0).is_empty());
     }
 
@@ -15471,7 +15518,7 @@ mod tests {
         harness.run();
 
         assert!(harness.state().1.focus_requested);
-        assert!(!harness.state_mut().0.take_new_session_requested());
+        assert!(harness.state_mut().0.take_new_session_requested().is_none());
         assert!(drain_protocol(&mut harness.state_mut().0).is_empty());
     }
 
@@ -16758,8 +16805,229 @@ mod tests {
         harness.get_by_label(&button_label).click();
         harness.run();
 
-        assert!(harness.state_mut().take_new_session_requested());
+        assert!(harness.state_mut().take_new_session_requested().is_some());
         assert!(drain_protocol(harness.state_mut()).is_empty());
+    }
+
+    fn painted_tab_text(output: &egui::FullOutput, label: &str) -> (egui::Color32, egui::Rect) {
+        output
+            .shapes
+            .iter()
+            .find_map(|shape| {
+                if let egui::Shape::Text(text) = &shape.shape
+                    && text.galley.text() == label
+                {
+                    Some((
+                        text.galley.job.sections[0].format.color,
+                        egui::Rect::from_min_size(text.pos, text.galley.size()),
+                    ))
+                } else {
+                    None
+                }
+            })
+            .expect("tab title must be painted")
+    }
+
+    #[test]
+    fn tab_title_hover_matches_line_without_affecting_other_tabs_or_input() {
+        for focused in [false, true] {
+            for aux_active in [false, true] {
+                let catalog = catalog();
+                let config = TerminalConfig::default();
+                let snapshot = pane("p", SessionId(7));
+                let mut workspace = WorkspaceUi::new();
+                workspace.workspace_accent = egui::Color32::from_rgb(0xb9, 0x8a, 0x53);
+                workspace.set_aux_tabs(vec![PaneAuxTab {
+                    kind: PaneAuxTabKind::History,
+                    label: "History".to_owned(),
+                    active: aux_active,
+                }]);
+                workspace.aux_tab_pane = Some(pane_id("p"));
+                let mut harness = egui_kittest::Harness::builder()
+                    .with_size(egui::vec2(800.0, 400.0))
+                    .build_ui_state(
+                        move |ui, workspace: &mut WorkspaceUi| {
+                            workspace.render_pane_header(
+                                ui,
+                                egui::Rect::from_min_size(
+                                    egui::pos2(8.0, 8.0),
+                                    egui::vec2(760.0, TERMINAL_PANE_HEADER_HEIGHT),
+                                ),
+                                &snapshot,
+                                focused,
+                                &config,
+                                &catalog,
+                                true,
+                            );
+                        },
+                        workspace,
+                    );
+                harness.run();
+                let (normal_session, session_rect) = painted_tab_text(harness.output(), "p");
+                let (normal_aux, aux_rect) = painted_tab_text(harness.output(), "History");
+                let line_color = harness
+                    .output()
+                    .shapes
+                    .iter()
+                    .find_map(|shape| {
+                        if let egui::Shape::LineSegment { points, stroke } = &shape.shape
+                            && points[0].x == points[1].x
+                            && points[0].y < points[1].y
+                        {
+                            Some(stroke.color)
+                        } else {
+                            None
+                        }
+                    })
+                    .expect("session tab divider must be painted");
+                assert_ne!(normal_session, line_color);
+                assert_ne!(normal_aux, line_color);
+
+                // Hover either label or its nested close button; only this tab changes.
+                for point in [
+                    session_rect.center(),
+                    egui::pos2(session_rect.right() + 14.0, 20.0),
+                ] {
+                    harness.hover_at(point);
+                    harness.run();
+                    assert_eq!(
+                        painted_tab_text(harness.output(), "p").0,
+                        line_color,
+                        "session hover must match its line; focused={focused}, aux_active={aux_active}"
+                    );
+                    assert_eq!(painted_tab_text(harness.output(), "History").0, normal_aux);
+                }
+                for point in [
+                    aux_rect.center(),
+                    egui::pos2(aux_rect.right() + PANE_AUX_TAB_CLOSE_GAP, 20.0),
+                ] {
+                    harness.hover_at(point);
+                    harness.run();
+                    assert_eq!(painted_tab_text(harness.output(), "History").0, line_color);
+                    assert_eq!(painted_tab_text(harness.output(), "p").0, normal_session);
+                }
+                harness.hover_at(egui::pos2(400.0, 80.0));
+                harness.run();
+                assert_eq!(painted_tab_text(harness.output(), "p").0, normal_session);
+                assert_eq!(painted_tab_text(harness.output(), "History").0, normal_aux);
+                assert!(harness.state_mut().take_new_session_requested().is_none());
+                assert!(
+                    drain_protocol(harness.state_mut()).is_empty(),
+                    "hover must not send runtime input"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tab_title_hover_session_less_strip_matches_its_line_and_restores_color() {
+        let catalog = catalog();
+        let empty = catalog.t("workspace.tab.no_session", &[]);
+        let mut workspace = WorkspaceUi::new();
+        workspace.workspace_accent = egui::Color32::from_rgb(0xb9, 0x8a, 0x53);
+        workspace.set_aux_tabs(vec![PaneAuxTab {
+            kind: PaneAuxTabKind::History,
+            label: "History".to_owned(),
+            active: true,
+        }]);
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, workspace: &mut WorkspaceUi| {
+                workspace.show_session_less_aux_tabs(ui, &catalog, true);
+            },
+            workspace,
+        );
+        harness.run();
+        let line_color = harness
+            .output()
+            .shapes
+            .iter()
+            .find_map(|shape| {
+                if let egui::Shape::LineSegment { points, stroke } = &shape.shape
+                    && points[1].x > points[0].x
+                    && points[0].y == points[1].y
+                {
+                    Some(stroke.color)
+                } else {
+                    None
+                }
+            })
+            .expect("selected auxiliary tab line must be painted");
+        for label in [&empty, "History"] {
+            let (normal, rect) = painted_tab_text(harness.output(), label);
+            harness.hover_at(rect.center());
+            harness.run();
+            assert_eq!(painted_tab_text(harness.output(), label).0, line_color);
+            harness.hover_at(egui::pos2(400.0, 80.0));
+            harness.run();
+            assert_eq!(painted_tab_text(harness.output(), label).0, normal);
+        }
+        assert!(harness.state_mut().take_new_session_requested().is_none());
+        assert!(drain_protocol(harness.state_mut()).is_empty());
+    }
+
+    #[test]
+    fn tab_title_hover_attached_header_matches_source_line_without_detaching() {
+        let catalog = catalog();
+        let target = AttachedPaneTarget {
+            workspace_id: "other".to_owned(),
+            tab: tab_id("t"),
+            pane: pane_id("p"),
+            session: SessionId(7),
+        };
+        let mut attachments = crate::ui::cross_workspace::CrossWorkspacePaneState::default();
+        let id = attachments
+            .attach_right(
+                "primary",
+                crate::ui::cross_workspace::WorkspacePaneTarget::new(
+                    "other",
+                    1,
+                    tab_id("t"),
+                    pane_id("p"),
+                    SessionId(7),
+                ),
+                420.0,
+                1,
+            )
+            .appended_id()
+            .unwrap();
+        let line_color = egui::Color32::from_rgb(0xa9, 0x82, 0x54);
+        let header_context = AttachedPaneHeaderContext::new(id, 0).with_identity_color(line_color);
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, state: &mut (WorkspaceUi, bool)| {
+                let (detach, reorder) = state.0.render_attached_pane_header(
+                    ui,
+                    egui::Rect::from_min_size(
+                        egui::pos2(8.0, 8.0),
+                        egui::vec2(360.0, TERMINAL_PANE_HEADER_HEIGHT),
+                    ),
+                    &target,
+                    "Other",
+                    "Project (Other)",
+                    &catalog,
+                    Some(header_context),
+                );
+                state.1 |= detach || reorder.is_some();
+            },
+            (WorkspaceUi::new(), false),
+        );
+        harness.run();
+        let (normal, rect) = painted_tab_text(harness.output(), "Project (Other)");
+        for point in [rect.center(), egui::pos2(353.0, 20.0)] {
+            harness.hover_at(point);
+            harness.run();
+            assert_eq!(
+                painted_tab_text(harness.output(), "Project (Other)").0,
+                line_color
+            );
+        }
+        harness.hover_at(egui::pos2(400.0, 80.0));
+        harness.run();
+        assert_eq!(
+            painted_tab_text(harness.output(), "Project (Other)").0,
+            normal
+        );
+        assert!(!harness.state().1, "hover must not detach or reorder");
+        assert!(drain_protocol(&mut harness.state_mut().0).is_empty());
     }
 
     #[test]
@@ -16801,8 +17069,9 @@ mod tests {
         harness.drop_at(egui::pos2(300.0, 24.0));
         harness.run();
         assert!(
-            harness.state_mut().take_new_session_requested(),
-            "blank strip must open launcher"
+            harness.state_mut().take_new_session_requested()
+                == Some(NewSessionRequest::SplitRight(pane_id("p"))),
+            "blank strip must open launcher for the clicked pane"
         );
         assert!(
             !drain_protocol(harness.state_mut())
@@ -16812,6 +17081,125 @@ mod tests {
                     RuntimeCommand::SpawnShell { .. } | RuntimeCommand::SpawnAgent { .. }
                 ))
         );
+    }
+
+    #[test]
+    fn tab_strip_visible_blank_is_clickable_across_its_full_height_and_width() {
+        let catalog = catalog();
+        let config = TerminalConfig::default();
+        let snapshot = pane("p", SessionId(7));
+        let header = egui::Rect::from_min_size(
+            egui::pos2(8.0, 8.0),
+            egui::vec2(760.0, TERMINAL_PANE_HEADER_HEIGHT),
+        );
+        let mut workspace = WorkspaceUi::new();
+        workspace.mux = Some(mux(
+            "t",
+            vec![tab(
+                "t",
+                vec![pane("p", SessionId(7))],
+                LayoutNode::Pane(pane_id("p")),
+            )],
+            "p",
+        ));
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(800.0, 400.0))
+            .build_ui_state(
+                move |ui, workspace: &mut WorkspaceUi| {
+                    workspace
+                        .render_pane_header(ui, header, &snapshot, true, &config, &catalog, true);
+                },
+                workspace,
+            );
+        harness.run();
+        // Includes the top/bottom of the blank strip and the empty right margin
+        // beyond the toolbar. Actual title/X/tool icons remain separate targets.
+        for x in [100.0, 300.0, 670.0, header.right() - 1.0] {
+            for y in [header.top() + 1.0, header.center().y, header.bottom() - 1.0] {
+                let point = egui::pos2(x, y);
+                harness.hover_at(point);
+                harness.run();
+                harness.drag_at(point);
+                harness.run();
+                harness.drop_at(point);
+                harness.run();
+                assert!(
+                    harness.state_mut().take_new_session_requested()
+                        == Some(NewSessionRequest::SplitRight(pane_id("p"))),
+                    "blank click missed at {point:?}"
+                );
+                assert!(
+                    drain_protocol(harness.state_mut())
+                        .iter()
+                        .all(|command| matches!(command, RuntimeCommand::FocusPane { .. })),
+                    "blank must not close, split or spawn before launcher selection"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tab_strip_aux_body_blank_opens_launcher_with_terminal_input_disabled() {
+        for blocked_by_modal in [false, true] {
+            let catalog = catalog();
+            let config = TerminalConfig::default();
+            let snapshot = pane("p", SessionId(7));
+            let mut workspace = WorkspaceUi::new();
+            workspace.mux = Some(mux(
+                "t",
+                vec![tab(
+                    "t",
+                    vec![pane("p", SessionId(7))],
+                    LayoutNode::Pane(pane_id("p")),
+                )],
+                "p",
+            ));
+            workspace.set_aux_tabs(vec![PaneAuxTab {
+                kind: PaneAuxTabKind::History,
+                label: "History".to_owned(),
+                active: true,
+            }]);
+            workspace.aux_tab_pane = Some(pane_id("p"));
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(800.0, 400.0))
+                .build_ui_state(
+                    move |ui, workspace: &mut WorkspaceUi| {
+                        super::super::popup::set_pending_modal(ui.ctx(), blocked_by_modal);
+                        workspace.render_pane_header(
+                            ui,
+                            egui::Rect::from_min_size(
+                                egui::pos2(8.0, 8.0),
+                                egui::vec2(760.0, TERMINAL_PANE_HEADER_HEIGHT),
+                            ),
+                            &snapshot,
+                            true,
+                            &config,
+                            &catalog,
+                            false,
+                        );
+                    },
+                    workspace,
+                );
+            harness.run();
+            let point = egui::pos2(300.0, 20.0);
+            harness.hover_at(point);
+            harness.run();
+            harness.drag_at(point);
+            harness.run();
+            harness.drop_at(point);
+            harness.run();
+            assert_eq!(
+                harness.state_mut().take_new_session_requested(),
+                (!blocked_by_modal).then(|| NewSessionRequest::SplitRight(pane_id("p"))),
+                "auxiliary body blocks PTY input, but the launcher must remain available unless a modal blocks it"
+            );
+            assert!(
+                drain_protocol(harness.state_mut())
+                    .iter()
+                    .all(|command| matches!(command, RuntimeCommand::FocusPane { .. })),
+                "opening the selector must not spawn or send PTY input"
+            );
+        }
     }
 
     #[test]
@@ -16843,7 +17231,7 @@ mod tests {
         harness.drop_at(pos);
         harness.run();
         assert!(harness.state().1);
-        assert!(!harness.state_mut().0.take_new_session_requested());
+        assert!(harness.state_mut().0.take_new_session_requested().is_none());
         assert!(
             !drain_protocol(&mut harness.state_mut().0)
                 .iter()
@@ -16956,7 +17344,7 @@ mod tests {
         harness.run();
         harness.drop_at(pos);
         harness.run();
-        assert!(harness.state_mut().take_new_session_requested());
+        assert!(harness.state_mut().take_new_session_requested().is_some());
         assert!(drain_protocol(harness.state_mut()).is_empty());
     }
 
@@ -16981,7 +17369,10 @@ mod tests {
             Some(SessionId(7))
         );
         ui.activate_terminal_toolbar(TerminalToolbarIcon::NewTerminal, &target, &config);
-        assert!(ui.take_new_session_requested());
+        assert_eq!(
+            ui.take_new_session_requested(),
+            Some(NewSessionRequest::NewTab)
+        );
         ui.activate_terminal_toolbar(TerminalToolbarIcon::SplitColumns, &target, &config);
         ui.activate_terminal_toolbar(TerminalToolbarIcon::SplitRows, &target, &config);
 

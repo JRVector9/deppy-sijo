@@ -1,7 +1,7 @@
 //! Filesystem identity probing for the settings worker; never called by rendering.
 use std::path::Path;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FolderIdentity {
     pub anchor: storage::WorkspaceFolderAnchor,
     pub volume: Option<uuid::Uuid>,

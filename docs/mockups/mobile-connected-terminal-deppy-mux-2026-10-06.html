@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Deppy Sijo · 모바일 연결 터미널 시안</title>
+  <style>
+    :root { color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --back:#101114; --phone:#050607; --surface:#111315; --surface2:#191b1e; --border:#292c30;
+      --text:#f4f5f6; --muted:#969ba2; --dim:#697078; --green:#5acf90; --amber:#e4b45b;
+      --red:#ed7776; --cyan:#7ecbd1; --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--back); color:var(--text); }
+    button,textarea { font:inherit; }
+    button { cursor:pointer; -webkit-tap-highlight-color:transparent; }
+    button:focus-visible,textarea:focus-visible { outline:2px solid var(--cyan); outline-offset:2px; }
+    .layout { max-width:1260px; margin:auto; padding:28px 26px 54px; }
+    .intro { max-width:960px; margin-bottom:24px; }
+    .eyebrow { margin:0 0 9px; color:var(--cyan); font:700 11px/1.3 var(--mono); letter-spacing:.11em; }
+    h1 { margin:0; font-size:clamp(25px,3vw,39px); letter-spacing:-.035em; }
+    .intro p:last-child { color:var(--muted); line-height:1.55; margin:10px 0 0; font-size:14px; }
+    .scenario-nav { display:flex; gap:7px; overflow:auto; margin-bottom:22px; padding-bottom:4px; }
+    .scenario-nav button { flex:none; border:1px solid var(--border); background:#17191b; color:#aeb2b8;
+      border-radius:11px; padding:11px 13px; min-height:43px; font-size:12px; font-weight:650; }
+    .scenario-nav button.active { background:#e7eaed; color:#101114; border-color:#e7eaed; }
+    .board { display:grid; grid-template-columns:minmax(300px,390px) minmax(290px,1fr); gap:clamp(22px,5vw,72px); align-items:start; }
+    .phone { width:390px; max-width:100%; height: min(844px,calc(100svh - 38px)); min-height:660px;
+      margin:auto; border:8px solid #292c2f; border-radius:43px; background:var(--phone);
+      box-shadow:0 30px 80px #0009; overflow:hidden; position:relative; display:flex; flex-direction:column; }
+    .statusbar { height:44px; flex:none; display:flex; align-items:center; justify-content:space-between; padding:8px 21px 0;
+      font-size:12px; font-weight:700; letter-spacing:-.02em; background:var(--phone); }
+    .island { width:102px; height:26px; border-radius:18px; background:#000; margin-top:-4px; }
+    .screen { display:none; min-height:0; flex:1; flex-direction:column; }
+    .screen.active { display:flex; }
+    .home-head { display:flex; align-items:center; justify-content:space-between; padding:18px 17px 15px; }
+    .home-head h2 { font-size:22px; letter-spacing:-.035em; margin:0 0 4px; }
+    .home-head p { font-size:12px; color:var(--muted); margin:0; }
+    .mac-label { font:600 11px var(--mono); color:var(--muted); padding:13px 18px 8px; }
+    .conn-pill { display:inline-flex; align-items:center; gap:6px; border:1px solid #285941; border-radius:30px;
+      padding:6px 9px; color:var(--green); background:#102219; font-size:11px; font-weight:700; white-space:nowrap; }
+    .conn-pill.offline { border-color:#654232; background:#281c16; color:var(--amber); }
+    .dot { width:6px; height:6px; border-radius:50%; background:currentColor; box-shadow:0 0 9px currentColor; }
+    .workspace-card { margin:6px 12px 0; padding:14px; border:1px solid #34373a; border-radius:15px; background:#141619; }
+    .workspace-card h3 { font-size:16px; margin:0 0 3px; }
+    .workspace-card p { margin:0; font:11px/1.5 var(--mono); color:var(--muted); }
+    .session-card { display:flex; align-items:center; gap:10px; width:100%; background:var(--surface);
+      color:var(--text); border:1px solid var(--border); border-radius:11px; margin-top:9px; padding:12px 10px; text-align:left; min-height:60px; }
+    .session-card:hover { background:#1d2023; }
+    .session-card .glyph { width:31px; height:31px; display:grid; place-items:center; border-radius:8px;
+      background:#25282b; color:#d9e0e4; font:17px var(--mono); flex:none; }
+    .session-card .copy { min-width:0; flex:1; }
+    .session-card strong { display:block; font-size:13px; font-weight:650; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .session-card small { display:block; color:var(--muted); font-size:11px; margin-top:4px; }
+    .session-card .arrow { color:var(--muted); font-size:21px; }
+    .home-foot { margin-top:auto; padding:16px; font-size:11px; color:var(--dim); text-align:center; }
+    .nav { flex:none; height:53px; display:flex; align-items:center; gap:7px; padding:0 10px 4px; position:relative; }
+    .nav .back,.nav .menu { height:39px; width:39px; flex:none; background:none; color:var(--text); border:0; border-radius:10px; font-size:23px; }
+    .nav .back:hover,.nav .menu:hover { background:var(--surface2); }
+    .nav .menu { font-size:20px; }
+    .title-pill { display:flex; flex-direction:column; align-items:center; justify-content:center; min-width:0; flex:1;
+      height:39px; border:1px solid #35383c; border-radius:20px; background:#202226d9; color:var(--text); padding:3px 12px; }
+    .title-pill strong { display:block; max-width:100%; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; font-size:12px; }
+    .title-pill small { color:var(--muted); font-size:10px; margin-top:1px; }
+    .connection-line { flex:none; height:27px; padding:0 14px; display:flex; align-items:center; gap:6px;
+      color:var(--green); font:11px/1 var(--mono); }
+    .connection-line.offline { color:var(--amber); }
+    .connection-line span:last-child { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .terminal-stage { position:relative; flex:1; min-height:0; overflow:hidden; background:#050607; }
+    .terminal-output { height:100%; overflow:auto; overscroll-behavior:contain; padding:10px 13px 14px; color:#e9edf0;
+      font:12px/1.56 var(--mono); overflow-wrap:anywhere; scrollbar-width:thin; }
+    .line { display:block; min-height:18px; white-space:pre-wrap; }
+    .transcript[hidden],.history-lines[hidden] { display:none; }
+    .line.dim { color:#7a8289; }
+    .line.green { color:#75d99b; }
+    .line.amber { color:#eac177; }
+    .line.cyan { color:#88cad1; }
+    .line .prompt { color:#a4e0bd; }
+    .cursor { display:inline-block; width:7px; height:13px; margin-left:3px; vertical-align:-2px; background:#e6e8e9; }
+    .scroll-note { position:absolute; bottom:9px; left:50%; transform:translateX(-50%); display:none;
+      gap:8px; align-items:center; width:max-content; max-width:95%; padding:6px 8px; border-radius:18px;
+      border:1px solid #40454a; background:#202326f0; font-size:10px; color:#d5d8dc; }
+    .scroll-note.visible { display:flex; }
+    .scroll-note button { border:0; background:#e5e8ea; color:#151719; padding:5px 8px; border-radius:11px; font-size:10px; font-weight:700; }
+    .dock { flex:none; position:relative; border-top:1px solid #222529; background:#0b0d0e; padding:7px 9px 5px; }
+    .attachment-chip { display:none; align-items:center; gap:7px; width:max-content; max-width:100%; margin:0 0 6px 45px;
+      padding:5px 8px; border:1px solid #42474b; border-radius:9px; background:#202326; font-size:11px; }
+    .attachment-chip.visible { display:flex; }
+    .attachment-chip button { border:0; color:var(--muted); background:transparent; font-size:14px; }
+    .composer { display:flex; align-items:flex-end; gap:7px; }
+    .attach { width:39px; height:39px; border:0; color:#d1d5d7; background:#202326; border-radius:50%; flex:none; font-size:19px; }
+    .composer-field { display:flex; align-items:flex-end; gap:6px; min-width:0; flex:1; border:1px solid #404448; border-radius:19px;
+      padding:4px 4px 4px 12px; background:#1c1f21; min-height:42px; }
+    textarea { display:block; min-height:32px; max-height:133px; min-width:0; flex:1; padding:6px 0 4px; resize:none;
+      overflow-y:auto; border:0; outline:0; background:transparent; color:var(--text); font-size:14px; line-height:20px; }
+    textarea::placeholder { color:#899096; }
+    .send { width:32px; height:32px; border:0; border-radius:50%; background:#e6e9eb; color:#151719;
+      display:grid; place-items:center; font-size:20px; font-weight:800; flex:none; }
+    .send:disabled { background:#34383b; color:#8e9599; cursor:default; }
+    .accessory { display:flex; gap:6px; overflow:auto; scrollbar-width:none; padding:8px 0 3px; }
+    .accessory::-webkit-scrollbar { display:none; }
+    .accessory button { min-width:43px; height:32px; flex:none; padding:0 9px; border-radius:9px; border:1px solid #363a3d;
+      color:#cbd0d2; background:#191b1d; font:11px var(--mono); }
+    .accessory button:active { background:#34383b; }
+    .inline-state { min-height:16px; color:var(--muted); font-size:10px; padding:2px 3px 0; }
+    .keyboard { display:none; flex:none; height:205px; padding:8px 4px 10px; border-top:1px solid #33373b;
+      background:#222528; }
+    .keyboard.visible { display:flex; flex-direction:column; gap:7px; }
+    .keyrow { display:flex; justify-content:center; gap:4px; flex:1; }
+    .key { flex:1; max-width:41px; display:grid; place-items:center; background:#4d5257; border-radius:5px;
+      box-shadow:0 1px 0 #17191a; color:#fff; font-size:13px; }
+    .key.wide { max-width:none; flex:2; color:#e9ebed; background:#363a3f; }
+    .home-indicator { height:17px; flex:none; display:grid; place-items:start center; background:#0b0d0e; padding-top:7px; }
+    .home-indicator::after { content:""; width:110px; height:4px; border-radius:5px; background:#f1f3f5; }
+    .picker { display:none; position:absolute; z-index:5; top:91px; left:25px; right:25px; padding:10px; border:1px solid #484c50;
+      border-radius:15px; background:#202326f5; box-shadow:0 16px 45px #000b; }
+    .picker.visible { display:block; }
+    .picker p { color:var(--muted); font:10px var(--mono); margin:3px 8px 8px; }
+    .picker button { display:block; width:100%; min-height:41px; border:0; border-radius:8px; background:transparent; color:var(--text); text-align:left; padding:7px; }
+    .picker button:hover { background:#383c40; }
+    .connection-overlay { display:none; position:absolute; inset:0; z-index:4; background:#050607eb;
+      flex-direction:column; align-items:center; justify-content:center; text-align:center; padding:25px; }
+    .connection-overlay.visible { display:flex; }
+    .connection-overlay .icon { font-size:37px; margin-bottom:12px; color:var(--amber); }
+    .connection-overlay h3 { font-size:17px; margin:0 0 8px; }
+    .connection-overlay p { margin:0 0 17px; color:#bdc1c5; font-size:12px; line-height:1.55; }
+    .connection-overlay button { min-height:42px; border:0; border-radius:11px; padding:0 18px; color:#141719; background:#e7ebed; font-weight:750; }
+    .description { border-top:1px solid var(--border); padding:20px 0; }
+    .description .number { color:var(--cyan); font:700 12px var(--mono); }
+    .description h2 { margin:7px 0 8px; font-size:26px; letter-spacing:-.035em; }
+    .description p { max-width:620px; color:#b9bec2; line-height:1.62; font-size:14px; }
+    .description ol { padding-left:21px; color:#d8dcdf; line-height:1.8; font-size:13px; }
+    .contract { margin-top:24px; border:1px solid #30363a; border-radius:12px; padding:16px 18px; background:#171a1c; }
+    .contract h3 { margin:0 0 8px; font-size:14px; }
+    .contract p { margin:0 0 8px; font-size:12px; color:#adb3b7; line-height:1.55; }
+    .contract p:last-child { margin:0; }
+    .contract code { font:11px var(--mono); color:#a2d7dc; }
+    .demo-warning { color:#bbc0c3; font-size:12px; margin:18px 0 0; line-height:1.5; }
+    @media(max-width:730px) { .layout { padding:18px 12px 35px; } .board { grid-template-columns:1fr; gap:18px; }
+      .description { max-width:390px; margin:auto; } .phone { height:min(790px,calc(100svh - 30px)); } }
+    @media(max-width:430px) { .phone { max-width:390px; min-height:600px; } .layout { padding:12px 4px 24px; }
+      .intro,.scenario-nav { margin-left:8px; margin-right:8px; } }
+  </style>
+</head>
+<body>
+  <main class="layout">
+    <div class="intro">
+      <p class="eyebrow">DEPPY SIJO / MOBILE TERMINAL / DESIGN PROPOSAL</p>
+      <h1>연결된 모바일 터미널</h1>
+      <p>deppy-mux iOS의 큰 터미널 화면, 하단 입력창·특수키 바, 명시적인 재연결 화면을 Deppy Sijo의 기존 모바일 뷰어에 맞춘 시안입니다.</p>
+    </div>
+    <nav class="scenario-nav" aria-label="시나리오 선택">
+      <button type="button" data-scenario="list" class="active">01 · 세션 선택</button>
+      <button type="button" data-scenario="live">02 · 터미널 보기</button>
+      <button type="button" data-scenario="compose">03 · 긴 메시지 입력</button>
+      <button type="button" data-scenario="controls">04 · 특수키·스크롤</button>
+      <button type="button" data-scenario="offline">05 · 연결 복구</button>
+    </nav>
+    <div class="board">
+      <section class="phone" aria-label="모바일 화면 시안">
+        <div class="statusbar"><span>9:41</span><div class="island" aria-hidden="true"></div><span>●●● ▰</span></div>
+        <div class="screen active" id="listScreen">
+          <div class="home-head"><div><h2>시조새</h2><p>JR-MacBook Pro · 연결된 작업</p></div><span class="conn-pill"><span class="dot"></span>연결됨</span></div>
+          <div class="mac-label">WORKSPACE · 2 SESSIONS</div>
+          <div class="workspace-card"><h3>Design</h3><p>~/Desktop/projects/colon35/Design</p>
+            <button class="session-card" type="button" data-open-session="codex"><span class="glyph">›_</span><span class="copy"><strong>web (Design)</strong><small>Codex · 작업 중</small></span><span class="arrow">›</span></button>
+            <button class="session-card" type="button" data-open-session="claude"><span class="glyph">›_</span><span class="copy"><strong>API 검토</strong><small>Claude Code · 입력 대기</small></span><span class="arrow">›</span></button>
+          </div>
+          <p class="home-foot">세션을 선택하면 해당 터미널로 이동합니다.</p>
+        </div>
+        <div class="screen" id="terminalScreen">
+          <div class="nav"><button class="back" id="back" type="button" aria-label="세션 목록">‹</button>
+            <button class="title-pill" id="pickerButton" type="button" aria-label="세션 선택"><strong id="workspaceName">Design</strong><small id="sessionName">web (Design) ▾</small></button>
+            <button class="menu" id="menuButton" type="button" aria-label="세션 메뉴">⋯</button></div>
+          <div class="connection-line" id="connectionLine"><span class="dot"></span><span id="connectionText">JR-MacBook Pro · 연결됨</span></div>
+          <div class="terminal-stage"><div class="terminal-output" id="terminalOutput" aria-label="터미널 출력"><div class="history-lines" id="historyLines" hidden></div><div class="transcript" id="transcriptCodex">
+            <span class="line dim">$ cd ~/Desktop/projects/colon35/Design</span>
+            <span class="line dim">$ codex</span><span class="line green">✓  workspace loaded</span>
+            <span class="line"> </span><span class="line">현재 작업의 테스트 결과를 확인하고 있습니다.</span>
+            <span class="line cyan">  app tests: 2758 passed</span><span class="line cyan">  runtime tests: 353 passed</span>
+            <span class="line"> </span><span class="line amber">› 다음 변경을 기다리는 중</span>
+            <span class="line"><span class="prompt">›</span> <span class="cursor"></span></span></div>
+            <div class="transcript" id="transcriptClaude" hidden><span class="line dim">$ claude</span>
+              <span class="line green">✓  API 검토 세션 준비됨</span><span class="line"> </span>
+              <span class="line">API 응답 타입을 확인했습니다.</span><span class="line amber">› 다음 지시를 기다리는 중</span>
+              <span class="line"><span class="prompt">›</span> <span class="cursor"></span></span></div>
+          </div><div class="scroll-note" id="scrollNote">이전 출력 보는 중 <button type="button" id="bottomButton">맨 아래로</button></div>
+            <div class="connection-overlay" id="connectionOverlay"><span class="icon">⌁</span><h3 id="offlineTitle">Mac 연결이 끊어졌습니다</h3>
+              <p>터미널 화면을 다시 받을 수 없습니다.<br>입력 내용은 이 기기에 남아 있습니다.</p>
+              <button id="retryButton" type="button">다시 연결</button></div>
+          </div>
+          <div class="dock"><div class="attachment-chip" id="attachmentChip">▧ screenshot.png <button id="removeAttachment" type="button" aria-label="첨부 제거">×</button></div>
+            <div class="composer"><button class="attach" id="attachButton" type="button" aria-label="첨부파일">＋</button>
+              <div class="composer-field"><textarea id="composerText" rows="1" placeholder="메시지 입력…" aria-label="터미널에 보낼 메시지"></textarea>
+                <button class="send" id="sendButton" type="button" aria-label="메시지 전송" disabled>↑</button></div></div>
+            <div class="accessory" aria-label="터미널 특수키"><button type="button" data-key="Esc">Esc</button><button type="button" data-key="Tab">Tab</button>
+              <button type="button" data-key="Ctrl-C">Ctrl C</button><button type="button" data-key="↑">↑</button><button type="button" data-key="↓">↓</button>
+              <button type="button" data-key="←">←</button><button type="button" data-key="→">→</button><button type="button" data-key="Enter">Enter</button></div>
+            <div class="inline-state" id="inlineState" role="status" aria-live="polite"></div></div>
+          <div class="keyboard" id="keyboard" aria-label="키보드 높이 시뮬레이션"><div class="keyrow"><span class="key">Q</span><span class="key">W</span><span class="key">E</span><span class="key">R</span><span class="key">T</span><span class="key">Y</span><span class="key">U</span><span class="key">I</span><span class="key">O</span><span class="key">P</span></div>
+            <div class="keyrow"><span class="key">A</span><span class="key">S</span><span class="key">D</span><span class="key">F</span><span class="key">G</span><span class="key">H</span><span class="key">J</span><span class="key">K</span><span class="key">L</span></div>
+            <div class="keyrow"><span class="key wide">⇧</span><span class="key">Z</span><span class="key">X</span><span class="key">C</span><span class="key">V</span><span class="key">B</span><span class="key">N</span><span class="key">M</span><span class="key wide">⌫</span></div>
+            <div class="keyrow"><span class="key wide">123</span><span class="key wide">한/영</span><span class="key wide">space</span><span class="key wide">↵</span></div></div>
+          <div class="home-indicator" aria-hidden="true"></div>
+          <div class="picker" id="picker" aria-label="세션 전환"><p>DESIGN · 세션</p>
+            <button type="button" data-select-session="codex">✓ &nbsp;web (Design) · Codex</button>
+            <button type="button" data-select-session="claude">&nbsp;&nbsp;&nbsp;API 검토 · Claude Code</button></div>
+        </div>
+      </section>
+      <aside class="description" aria-live="polite"><span class="number" id="stepNumber">01 / CONNECTED</span>
+        <h2 id="stepTitle">연결된 세션 선택</h2><p id="stepCopy">Mac 연결 상태와 워크스페이스를 확인하고, 작업 중인 세션을 선택합니다. 기존 Deppy 모바일 목록의 세션 진입 흐름을 유지합니다.</p>
+        <ol id="stepList"><li>연결된 Mac 이름과 상태를 먼저 확인합니다.</li><li>세션 행을 누르면 해당 터미널로 들어갑니다.</li><li>터미널 상단 제목에서 다른 세션으로 이동합니다.</li></ol>
+        <div class="contract"><h3>시안에서 확인할 결정</h3><p><code>deppy-mux</code>의 하단 도크 구성과 연결 복구 표현을 참고했습니다. Deppy의 현재 원격 터미널 캔버스와 전송 경로를 전제로 한 화면 제안입니다.</p>
+          <p>입력창 초안은 세션별로 유지하고, 전송 중·거절·연결 끊김 상태는 하단 입력 영역 안에 표시합니다. 이 HTML은 실제 Mac이나 터미널에 연결하지 않습니다.</p></div>
+        <p class="demo-warning">화면의 전송·연결 버튼은 시나리오 확인용 시뮬레이션입니다.</p></aside>
+    </div>
+  </main>
+  <script>
+    const scenarios = {
+      list: {number:'01 / CONNECTED', title:'연결된 세션 선택', copy:'Mac 연결 상태와 워크스페이스를 확인하고, 작업 중인 세션을 선택합니다. 기존 Deppy 모바일 목록의 세션 진입 흐름을 유지합니다.', steps:['연결된 Mac 이름과 상태를 먼저 확인합니다.','세션 행을 누르면 해당 터미널로 들어갑니다.','터미널 상단 제목에서 다른 세션으로 이동합니다.']},
+      live: {number:'02 / LIVE TERMINAL', title:'터미널 보기', copy:'출력 영역이 화면 대부분을 차지합니다. 상단 제목은 현재 워크스페이스와 세션을 구분해 표시하고, 아래에는 입력창과 특수키 바가 계속 붙어 있습니다.', steps:['상단에서 돌아가기·세션 전환·연결 상태를 확인합니다.','출력을 스크롤해도 입력창의 위치는 고정됩니다.','세션 전환은 다른 세션의 초안을 덮어쓰지 않습니다.']},
+      compose: {number:'03 / COMPOSE', title:'긴 메시지 입력', copy:'입력창이 여러 줄로 위쪽으로 자라고, 터미널 영역만 그만큼 줄어듭니다. 키보드를 열어도 특수키 바가 입력창 아래에 보입니다.', steps:['문장을 길게 입력해도 아직 터미널로 보내지 않습니다.','전송을 누르면 한 번의 메시지로 보낸다는 흐름을 표시합니다.','연결이 끊기면 초안을 보존하고 전송을 잠급니다.']},
+      controls: {number:'04 / TERMINAL KEYS', title:'특수키와 스크롤', copy:'Esc·Tab·Ctrl C·화살표 같은 터미널 키를 가로로 넘길 수 있습니다. 이전 출력을 볼 때는 현재 위치를 알리고 한 번에 맨 아래로 돌아갑니다.', steps:['특수키는 현재 선택한 세션으로만 보낸다는 전제입니다.','스크롤백을 보는 동안 새 출력이 와도 위치를 뺏지 않습니다.','맨 아래로 버튼으로 최신 출력으로 돌아갑니다.']},
+      offline: {number:'05 / RECOVERY', title:'연결 복구', copy:'연결이 끊기면 검은 빈 화면 대신 이유와 재시도 동작을 명확히 보여줍니다. 입력 초안은 남기고 전송만 잠급니다.', steps:['연결 상태를 터미널 위에 분명하게 표시합니다.','재시도 중 상태를 별도로 표시합니다.','재연결 뒤 같은 세션으로 돌아가고 초안이 유지됩니다.']}
+    };
+    const $ = (id) => document.getElementById(id);
+    let scenario = 'list'; let session = 'codex'; let connected = true;
+    const drafts = {codex:'',claude:''};
+    const pending = new Set(); const attachments = {codex:false,claude:false};
+    for(let i=1;i<=24;i++){const line=document.createElement('span');line.className='line dim';line.textContent='$ 이전 명령 '+String(i).padStart(2,'0')+' · 출력 확인';$('historyLines').append(line);}
+    function sizeComposer() { const field=$('composerText'); field.style.height='32px'; field.style.height=Math.min(field.scrollHeight,133)+'px'; }
+    function setScenario(name) {
+      scenario=name; connected=name!=='offline';
+      $('listScreen').classList.toggle('active',name==='list'); $('terminalScreen').classList.toggle('active',name!=='list');
+      document.querySelectorAll('[data-scenario]').forEach(b=>b.classList.toggle('active',b.dataset.scenario===name));
+      $('keyboard').classList.toggle('visible',name==='compose'); $('scrollNote').classList.toggle('visible',name==='controls');
+      $('historyLines').hidden=name!=='controls';
+      $('connectionOverlay').classList.toggle('visible',name==='offline'); $('connectionLine').classList.toggle('offline',!connected);
+      $('connectionText').textContent=connected?'JR-MacBook Pro · 연결됨':'JR-MacBook Pro · 연결 끊김';
+      $('composerText').readOnly=!connected; $('inlineState').textContent=name==='offline'?'연결을 복구하면 초안을 전송할 수 있습니다.':'';
+      if(name==='compose' && !drafts[session]) drafts[session]='지금 수정한 모바일 터미널 화면을 검토해 주세요.\n긴 문장을 여러 줄로 작성해도 입력은 이 창에 남아 있고, 전송을 누를 때에만 한 번에 보내고 싶습니다.';
+      $('composerText').value=drafts[session]; sizeComposer(); updateAttachment(); updateSend();
+      const info=scenarios[name]; $('stepNumber').textContent=info.number; $('stepTitle').textContent=info.title; $('stepCopy').textContent=info.copy;
+      $('stepList').replaceChildren(...info.steps.map(text=>{const li=document.createElement('li');li.textContent=text;return li;}));
+      if(name==='controls'){ const output=$('terminalOutput'); output.scrollTop=0; } else $('terminalOutput').scrollTop=$('terminalOutput').scrollHeight;
+      $('picker').classList.remove('visible');
+    }
+    function updateSend(){ $('sendButton').disabled=!connected||pending.has(session)||(!$('composerText').value.trim()&&!attachments[session]); }
+    function updateAttachment(){ $('attachmentChip').classList.toggle('visible',attachments[session]); }
+    function selectSession(id){ drafts[session]=$('composerText').value; session=id; $('sessionName').textContent=(id==='codex'?'web (Design)':'API 검토')+' ▾';
+      $('transcriptCodex').hidden=id!=='codex'; $('transcriptClaude').hidden=id!=='claude';
+      $('composerText').value=drafts[id]; sizeComposer(); updateAttachment(); updateSend(); $('picker').classList.remove('visible'); $('inlineState').textContent='선택한 세션의 초안을 표시합니다.'; }
+    document.querySelectorAll('[data-scenario]').forEach(b=>b.addEventListener('click',()=>setScenario(b.dataset.scenario)));
+    document.querySelectorAll('[data-open-session]').forEach(b=>b.addEventListener('click',()=>{selectSession(b.dataset.openSession);setScenario('live');}));
+    document.querySelectorAll('[data-select-session]').forEach(b=>b.addEventListener('click',()=>selectSession(b.dataset.selectSession)));
+    $('back').addEventListener('click',()=>setScenario('list'));
+    $('pickerButton').addEventListener('click',()=>$('picker').classList.toggle('visible'));
+    $('menuButton').addEventListener('click',()=>$('inlineState').textContent='세션 선택은 가운데 제목을 눌러 확인할 수 있습니다.');
+    $('composerText').addEventListener('input',()=>{drafts[session]=$('composerText').value;sizeComposer();updateSend();});
+    $('composerText').addEventListener('keydown',event=>{if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();$('sendButton').click();}});
+    $('sendButton').addEventListener('click',()=>{if($('sendButton').disabled)return; const target=session; pending.add(target);updateSend();$('inlineState').textContent='전송 중…';
+      const text=$('composerText').value; const hadAttachment=attachments[target]; setTimeout(()=>{pending.delete(target);if(!connected){updateSend();$('inlineState').textContent='연결이 끊겨 초안을 보존했습니다.';return;}
+        const line=document.createElement('span');line.className='line cyan';line.textContent='› '+(text||'[screenshot.png]'); $(target==='codex'?'transcriptCodex':'transcriptClaude').append(line);
+        if(drafts[target]===text)drafts[target]=''; attachments[target]=false;
+        if(session===target){$('composerText').value=drafts[target];sizeComposer();updateAttachment();$('inlineState').textContent='이 시안에서만 전송을 표시했습니다.';
+          $('terminalOutput').scrollTop=$('terminalOutput').scrollHeight;}
+        updateSend();
+      },650);
+    });
+    $('retryButton').addEventListener('click',()=>{ $('offlineTitle').textContent='다시 연결하는 중…'; $('retryButton').disabled=true;
+      setTimeout(()=>{ $('retryButton').disabled=false; $('offlineTitle').textContent='Mac 연결이 끊어졌습니다';setScenario('live'); $('inlineState').textContent='연결되었습니다. 초안이 보존되었습니다.'; },850); });
+    $('bottomButton').addEventListener('click',()=>{ $('terminalOutput').scrollTop=$('terminalOutput').scrollHeight;$('scrollNote').classList.remove('visible'); });
+    $('terminalOutput').addEventListener('scroll',()=>{if(scenario==='controls'){$('scrollNote').classList.toggle('visible',$('terminalOutput').scrollTop<$('terminalOutput').scrollHeight-$('terminalOutput').clientHeight-8);}});
+    document.querySelectorAll('[data-key]').forEach(b=>b.addEventListener('click',()=>{if(!connected)return;$('inlineState').textContent=b.dataset.key+' · 선택한 세션의 터미널 키 시뮬레이션';}));
+    $('attachButton').addEventListener('click',()=>{attachments[session]=true;updateAttachment();updateSend();$('inlineState').textContent='이 시안에서 screenshot.png를 첨부했습니다.';});
+    $('removeAttachment').addEventListener('click',()=>{attachments[session]=false;updateAttachment();updateSend();});
+    setScenario('list');
+  </script>
+</body>
+</html>

@@ -618,6 +618,11 @@ fn nav(
     ui.add_space(8.0);
 
     let query = search_query.trim().to_owned();
+    let content_hits = if query.is_empty() {
+        Vec::new()
+    } else {
+        settings_content_hits(&query, catalog)
+    };
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -676,14 +681,28 @@ fn nav(
             ];
             let visible_settings: Vec<_> = settings
                 .into_iter()
-                .filter(|(_, _, label, aliases)| nav_matches(query, label, aliases))
+                .filter(|(cat, _, label, aliases)| {
+                    nav_matches(query, label, aliases)
+                        || content_hits.iter().any(|(hit, _)| hit == cat)
+                })
                 .collect();
             if !visible_settings.is_empty() {
                 nav_group_label(ui, &catalog.t("settings.group.settings", &[]));
                 for (cat, icon, label, _) in visible_settings {
                     rendered += 1;
                     if nav_item(ui, category, cat, icon, &label, None) {
+                        if cat == Category::Shortcuts && !query.is_empty() {
+                            reveal_shortcut_search_hit(ui.ctx(), None, catalog);
+                        }
                         requested_category = Some(cat);
+                    }
+                    for (_, hit) in content_hits.iter().filter(|(hit_cat, _)| *hit_cat == cat) {
+                        if nav_search_hit(ui, hit) {
+                            if cat == Category::Shortcuts {
+                                reveal_shortcut_search_hit(ui.ctx(), Some(hit), catalog);
+                            }
+                            requested_category = Some(cat);
+                        }
                     }
                 }
             }
@@ -716,7 +735,10 @@ fn nav(
             ];
             let visible_manage: Vec<_> = manage
                 .into_iter()
-                .filter(|(_, _, label, aliases)| nav_matches(query, label, aliases))
+                .filter(|(cat, _, label, aliases)| {
+                    nav_matches(query, label, aliases)
+                        || content_hits.iter().any(|(hit, _)| hit == cat)
+                })
                 .collect();
             if !visible_manage.is_empty() {
                 ui.add_space(6.0);
@@ -725,6 +747,11 @@ fn nav(
                     rendered += 1;
                     if nav_item(ui, category, cat, icon, &label, None) {
                         requested_category = Some(cat);
+                    }
+                    for (_, hit) in content_hits.iter().filter(|(hit_cat, _)| *hit_cat == cat) {
+                        if nav_search_hit(ui, hit) {
+                            requested_category = Some(cat);
+                        }
                     }
                 }
             }
@@ -746,7 +773,10 @@ fn nav(
             ];
             let visible_monitor: Vec<_> = monitor
                 .into_iter()
-                .filter(|(_, _, label, aliases)| nav_matches(query, label, aliases))
+                .filter(|(cat, _, label, aliases)| {
+                    nav_matches(query, label, aliases)
+                        || content_hits.iter().any(|(hit, _)| hit == cat)
+                })
                 .collect();
             if !visible_monitor.is_empty() {
                 ui.add_space(6.0);
@@ -758,6 +788,11 @@ fn nav(
                         .flatten();
                     if nav_item(ui, category, cat, icon, &label, item_badge) {
                         requested_category = Some(cat);
+                    }
+                    for (_, hit) in content_hits.iter().filter(|(hit_cat, _)| *hit_cat == cat) {
+                        if nav_search_hit(ui, hit) {
+                            requested_category = Some(cat);
+                        }
                     }
                 }
             }
@@ -857,6 +892,256 @@ fn nav_matches(query: &str, label: &str, aliases: &str) -> bool {
     }
     let query = query.to_lowercase();
     label.to_lowercase().contains(&query) || aliases.to_lowercase().contains(&query)
+}
+
+/// Searchable translated content rendered by each inline settings page.
+/// Keep this index in sync with the page labels, descriptions, and controls.
+const INLINE_SEARCH_KEYS: &[(Category, &str)] = &[
+    (
+        Category::General,
+        concat!(
+            "settings.agent_presets settings.agent_presets.add settings.agent_presets.hint ",
+            "settings.agent_presets.remove settings.appearance settings.auto_resume ",
+            "settings.auto_resume.hint settings.composer_enabled settings.composer_enabled.hint ",
+            "settings.composer_send_key settings.composer_send_key.hint settings.confirm_workspace_close ",
+            "settings.confirm_workspace_close.hint settings.file_tree.hint settings.file_tree_sidebar ",
+            "settings.fleet_batch_spawn_max settings.fleet_batch_spawn_max.hint settings.prompt_library ",
+            "settings.prompt_library.hint settings.session_name_style settings.session_name_style.hint ",
+            "settings.status_hooks settings.status_hooks.hint settings.theme ",
+            "settings.theme.dark settings.theme.hint settings.theme.light ",
+            "settings.theme.system settings.ui_font settings.ui_font.auto ",
+            "settings.ui_font.hint settings.ui_scale settings.ui_scale.hint ",
+        ),
+    ),
+    (
+        Category::Language,
+        "settings.language settings.locale settings.locale.hint ",
+    ),
+    (
+        Category::Terminal,
+        concat!(
+            "settings.cache_budget settings.cache_budget.auto settings.cache_budget.help ",
+            "settings.cache_budget.hint settings.cache_budget.manual settings.cache_budget.mode ",
+            "settings.exited_cap settings.exited_cap.hint settings.font_size ",
+            "settings.line_height settings.line_height.hint settings.mono_font ",
+            "settings.mono_font.hint settings.mono_weight settings.mono_weight.hint ",
+            "settings.scrollback.hint settings.scrollback_lines settings.terminal ",
+        ),
+    ),
+    (
+        Category::Shortcuts,
+        concat!(
+            "settings.shortcuts shortcuts.clear ",
+            "shortcuts.clear.hint shortcuts.conflict shortcuts.desc.terminal ",
+            "shortcuts.filter.all shortcuts.help shortcuts.modifier_required ",
+            "shortcuts.record.hint shortcuts.recording shortcuts.reset ",
+            "shortcuts.reset.hint shortcuts.reset_all shortcuts.reset_all.hint ",
+            "shortcuts.search shortcuts.unassigned ",
+        ),
+    ),
+    (
+        Category::Performance,
+        concat!(
+            "settings.max_cross_workspace_panes settings.max_cross_workspace_panes.hint settings.max_live_warm ",
+            "settings.max_warm settings.max_warm.hint settings.output_batch.hint ",
+            "settings.output_batch_ms settings.performance ",
+        ),
+    ),
+    (
+        Category::RemoteTls,
+        concat!(
+            "settings.address settings.client_fingerprint_hint settings.fingerprint ",
+            "settings.forget settings.known_hosts settings.no_trust_records ",
+            "settings.port settings.remote_tls settings.remote_tls_enabled ",
+            "settings.show settings.start_failed settings.toggle_restart_required ",
+            "settings.token settings.token_hidden_hint settings.token_sensitive_warning ",
+        ),
+    ),
+    (
+        Category::MobileWeb,
+        concat!(
+            "action.copy settings.address settings.mobile_web ",
+            "settings.mobile_web.cert_note settings.mobile_web.detect settings.mobile_web.detect_no_cli ",
+            "settings.mobile_web.detect_no_hostname settings.mobile_web.detected settings.mobile_web.detecting ",
+            "settings.mobile_web.hostname settings.mobile_web.hostname.hint settings.mobile_web.qr_hint ",
+            "settings.mobile_web.qr_needs_hostname settings.mobile_web.rotate settings.mobile_web.rotate.hint ",
+            "settings.mobile_web.serve_approve settings.mobile_web.serve_checking ",
+            "settings.mobile_web.serve_guide settings.mobile_web.serve_missing settings.mobile_web.serve_not_enabled ",
+            "settings.mobile_web.serve_ready settings.mobile_web.serve_recheck settings.mobile_web.serve_setup ",
+            "settings.mobile_web.url settings.mobile_web.url_warning settings.mobile_web_enabled ",
+            "settings.mobile_web_enabled.hint settings.port settings.show ",
+            "settings.start_failed settings.toggle_restart_required settings.token ",
+        ),
+    ),
+    (
+        Category::Relay,
+        concat!(
+            "action.copy ",
+            "settings.relay settings.relay.devices settings.relay.devices.empty ",
+            "settings.relay.devices.expires settings.relay.devices.last_seen settings.relay.devices.never ",
+            "settings.relay.devices.revoke settings.relay.devices.revoke.hint settings.relay.devices.revoked ",
+            "settings.relay.devices.view_only settings.relay.pairing settings.relay.pairing.approve ",
+            "settings.relay.pairing.begin settings.relay.pairing.cancel settings.relay.pairing.code ",
+            "settings.relay.pairing.code.hint settings.relay.pairing.hint settings.relay.pairing.link ",
+            "settings.relay.pairing.link.blocked settings.relay.pairing.link.hint settings.relay.pairing.not_ready ",
+            "settings.relay.pairing.reject settings.relay.pairing.waiting settings.relay.status ",
+            "settings.relay.status.blocked settings.relay.status.connected settings.relay.status.connecting ",
+            "settings.relay.status.disabled settings.relay.status.halted_auth settings.relay.status.halted_revoked ",
+            "settings.relay.time.expired settings.relay.time.just_now settings.relay_enabled ",
+            "settings.relay_enabled.hint settings.start_failed ",
+        ),
+    ),
+];
+
+fn management_search_category(key: &str) -> Option<Category> {
+    if key.starts_with("cloud.") {
+        Some(Category::CloudAgents)
+    } else if key.starts_with("connector.") || key.starts_with("connectors.") {
+        Some(Category::Connectors)
+    } else if key.starts_with("env.")
+        || key.starts_with("credentials.")
+        || key == "workspace.manager.new_hint"
+    {
+        Some(Category::Environment)
+    } else if key.starts_with("agents.") {
+        Some(Category::Agents)
+    } else if key.starts_with("activity.") {
+        Some(Category::Activity)
+    } else if key.starts_with("notification.") || key.starts_with("inbox.") {
+        Some(Category::Notifications)
+    } else {
+        None
+    }
+}
+
+fn inline_search_category_for_option(key: &str) -> Option<Category> {
+    if !key.starts_with("settings.") {
+        return None;
+    }
+    if key.starts_with("settings.scrollback.") {
+        return Some(Category::Terminal);
+    }
+    let mut parent = key;
+    while let Some((prefix, _)) = parent.rsplit_once('.') {
+        parent = prefix;
+        if let Some((category, _)) = INLINE_SEARCH_KEYS.iter().find(|(_, keys)| {
+            keys.split_ascii_whitespace()
+                .any(|candidate| candidate == parent)
+        }) {
+            return Some(*category);
+        }
+    }
+    None
+}
+
+fn push_settings_search_hit(
+    hits: &mut Vec<(Category, String)>,
+    category: Category,
+    key: &str,
+    value: &str,
+    query: &str,
+    catalog: &i18n::Catalog,
+) {
+    if !key.to_lowercase().contains(query) && !value.to_lowercase().contains(query) {
+        return;
+    }
+    let title_key = key
+        .strip_suffix(".hint")
+        .filter(|parent| catalog.t(parent, &[]) != *parent)
+        .unwrap_or(key);
+    let title = catalog.t(title_key, &[]);
+    if !hits
+        .iter()
+        .any(|(cat, label)| *cat == category && label == &title)
+    {
+        hits.push((category, title));
+    }
+}
+
+fn settings_content_hits(query: &str, catalog: &i18n::Catalog) -> Vec<(Category, String)> {
+    let query = query.to_lowercase();
+    let mut hits = Vec::new();
+    for (category, keys) in INLINE_SEARCH_KEYS {
+        for key in keys.split_ascii_whitespace() {
+            let value = catalog.t(key, &[]);
+            push_settings_search_hit(&mut hits, *category, key, &value, &query, catalog);
+        }
+    }
+    for action in ShortcutAction::ALL {
+        let title = catalog.t(action.title_key(), &[]);
+        let description = catalog.t(action.description_key(), &[]);
+        push_settings_search_hit(
+            &mut hits,
+            Category::Shortcuts,
+            action.title_key(),
+            &format!("{title} {description}"),
+            &query,
+            catalog,
+        );
+    }
+    for (title_key, key_label) in FIXED_TERMINAL_SHORTCUTS {
+        let title = catalog.t(title_key, &[]);
+        push_settings_search_hit(
+            &mut hits,
+            Category::Shortcuts,
+            title_key,
+            &format!("{title} {key_label}"),
+            &query,
+            catalog,
+        );
+    }
+    for (key, value) in catalog.entries() {
+        let indexed_inline = INLINE_SEARCH_KEYS.iter().any(|(_, keys)| {
+            keys.split_ascii_whitespace()
+                .any(|candidate| candidate == key)
+        });
+        let category = management_search_category(key).or_else(|| {
+            (!indexed_inline)
+                .then(|| inline_search_category_for_option(key))
+                .flatten()
+        });
+        if let Some(category) = category {
+            push_settings_search_hit(&mut hits, category, key, value, &query, catalog);
+        }
+    }
+    hits
+}
+
+fn nav_search_hit(ui: &mut egui::Ui, label: &str) -> bool {
+    ui.horizontal(|ui| {
+        ui.add_space(24.0);
+        ui.add_sized(
+            [ui.available_width(), 28.0],
+            egui::Button::new(egui::RichText::new(label).size(12.0))
+                .frame(false)
+                .truncate(),
+        )
+        .on_hover_text(label)
+        .clicked()
+    })
+    .inner
+}
+
+fn reveal_shortcut_search_hit(ctx: &egui::Context, hit: Option<&str>, catalog: &i18n::Catalog) {
+    let action_title = hit.filter(|label| {
+        ShortcutAction::ALL
+            .into_iter()
+            .any(|action| catalog.t(action.title_key(), &[]) == *label)
+            || FIXED_TERMINAL_SHORTCUTS
+                .iter()
+                .any(|(key, _)| catalog.t(key, &[]) == *label)
+    });
+    let state_id = egui::Id::new("settings_shortcuts_page_state");
+    ctx.data_mut(|data| {
+        let mut state = data
+            .get_temp::<ShortcutPageState>(state_id)
+            .unwrap_or_default();
+        state.query = action_title.unwrap_or_default().to_owned();
+        state.filter = ShortcutPageFilter::All;
+        state.recording = None;
+        state.capture_error = false;
+        data.insert_temp(state_id, state);
+    });
 }
 
 // ── 폼 헬퍼 ──
@@ -3463,8 +3748,9 @@ mod tests {
     }
 
     use super::{
-        SETTINGS_DETAIL, SETTINGS_TYPE, masked_url, nav_matches, parse_stepper_f32,
-        parse_stepper_i64, qr_color_image, stepper, stepper_f32, truncate_fingerprint,
+        SETTINGS_DETAIL, SETTINGS_TYPE, masked_url, nav, nav_matches, parse_stepper_f32,
+        parse_stepper_i64, qr_color_image, settings_content_hits, stepper, stepper_f32,
+        truncate_fingerprint,
     };
     // kittest 조회(get_by_label 등)는 트레이트 메서드다.
     use egui_kittest::kittest::Queryable as _;
@@ -4386,6 +4672,127 @@ mod tests {
             "터미널",
             "terminal paste clipboard"
         ));
+    }
+
+    #[test]
+    fn 설정_검색은_카테고리_밖의_행_제목과_설명도_찾는다() {
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(240.0, 600.0))
+            .build_ui_state(
+                |ui, state: &mut (String, Option<super::Category>)| {
+                    if let Some(category) =
+                        nav(ui, super::Category::Terminal, 0, &mut state.0, &catalog)
+                    {
+                        state.1 = Some(category);
+                    }
+                },
+                ("워크스페이스".to_owned(), None),
+            );
+        harness.run();
+        let general_hit = catalog.t("settings.confirm_workspace_close", &[]);
+        let performance_hit = catalog.t("settings.max_cross_workspace_panes", &[]);
+        assert!(harness.query_by_label(&general_hit).is_some());
+        assert!(harness.query_by_label(&performance_hit).is_some());
+        assert!(
+            harness
+                .query_by_label(&catalog.t("settings.search.no_results", &[]))
+                .is_none()
+        );
+        harness.get_by_label(&general_hit).click();
+        harness.run();
+        assert_eq!(harness.state().1, Some(super::Category::General));
+    }
+
+    #[test]
+    fn 설정_검색은_설명_선택지_단축키와_관리_화면까지_찾는다() {
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        for (query, category, title_key) in [
+            (
+                "최대 개수입니다",
+                super::Category::Performance,
+                "settings.max_cross_workspace_panes",
+            ),
+            (
+                "현재 폴더명",
+                super::Category::General,
+                "settings.session_name_style.folder",
+            ),
+            (
+                "화면을 열거나",
+                super::Category::Shortcuts,
+                "shortcuts.action.toggle_sidebar",
+            ),
+            (
+                "라이브 반영",
+                super::Category::Environment,
+                "env.live_reload",
+            ),
+        ] {
+            let hits = settings_content_hits(query, &catalog);
+            let expected = catalog.t(title_key, &[]);
+            assert!(
+                hits.contains(&(category, expected)),
+                "{query}: matching setting was omitted from search"
+            );
+        }
+    }
+
+    #[test]
+    fn 설정_검색은_실제_서브_페이지와_고정_단축키를_가리킨다() {
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        let serve = catalog.t("settings.mobile_web.serve_setup", &[]);
+        assert!(
+            settings_content_hits(&serve, &catalog).contains(&(super::Category::MobileWeb, serve))
+        );
+        for key in ["shortcuts.action.copy", "shortcuts.action.paste"] {
+            let title = catalog.t(key, &[]);
+            assert!(
+                settings_content_hits(&title, &catalog)
+                    .contains(&(super::Category::Shortcuts, title))
+            );
+        }
+    }
+
+    #[test]
+    fn 전역_검색_단축키_결과는_페이지의_이전_필터를_해제한다() {
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        let copy = catalog.t("shortcuts.action.copy", &[]);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(240.0, 600.0))
+            .build_ui_state(
+                |ui, state: &mut (String, Option<super::Category>)| {
+                    if let Some(category) =
+                        nav(ui, super::Category::General, 0, &mut state.0, &catalog)
+                    {
+                        state.1 = Some(category);
+                    }
+                },
+                (copy.clone(), None),
+            );
+        let shortcut_state = egui::Id::new("settings_shortcuts_page_state");
+        harness.ctx.data_mut(|data| {
+            data.insert_temp(
+                shortcut_state,
+                super::ShortcutPageState {
+                    query: "unrelated".to_owned(),
+                    filter: super::ShortcutPageFilter::Group(
+                        crate::shortcuts::ShortcutGroup::Navigation,
+                    ),
+                    ..Default::default()
+                },
+            );
+        });
+        harness.run();
+        harness.get_all_by_label(&copy).next().unwrap().click();
+        harness.run();
+        assert_eq!(harness.state().1, Some(super::Category::Shortcuts));
+        let local = harness
+            .ctx
+            .data_mut(|data| data.get_temp::<super::ShortcutPageState>(shortcut_state))
+            .unwrap();
+        assert_eq!(local.filter, super::ShortcutPageFilter::All);
+        assert_eq!(local.query, copy);
     }
 
     /// 「관리」 그룹은 연결·환경 및 API·에이전트 셋만 갖는다. 워크스페이스 항목은

@@ -1576,6 +1576,7 @@ fn runtime_command_requires_dotenv(command: &runtime::RuntimeCommand) -> bool {
         command,
         runtime::RuntimeCommand::SpawnShell { .. }
             | runtime::RuntimeCommand::SpawnAgent { .. }
+            | runtime::RuntimeCommand::SpawnAgentBeside { .. }
             | runtime::RuntimeCommand::SplitPane { .. }
             | runtime::RuntimeCommand::RestoreWorkspace
     ) || runtime_command_is_targeted_workspace_restore(command)
@@ -1715,6 +1716,7 @@ fn dotenv_failure_allows_session(continuation: &PendingDotenvContinuation) -> bo
         runtime::RuntimeCommand::SpawnShell { .. }
             | runtime::RuntimeCommand::SplitPane { .. }
             | runtime::RuntimeCommand::SpawnAgent { .. }
+            | runtime::RuntimeCommand::SpawnAgentBeside { .. }
     )
 }
 
@@ -1723,6 +1725,7 @@ fn runtime_command_creates_session(command: &runtime::RuntimeCommand) -> bool {
         command,
         runtime::RuntimeCommand::SpawnShell { .. }
             | runtime::RuntimeCommand::SpawnAgent { .. }
+            | runtime::RuntimeCommand::SpawnAgentBeside { .. }
             | runtime::RuntimeCommand::SplitPane { .. }
     )
 }
@@ -3347,6 +3350,7 @@ enum SettingsJobAction {
         name: String,
         path: PathBuf,
         purpose: WorkspaceMutationPurpose,
+        confirmed_legacy_identity: Option<crate::folder_identity::FolderIdentity>,
     },
     AcceptMovedWorkspacePath {
         expected_old_path: String,
@@ -3363,6 +3367,16 @@ struct WorkspaceRenamePrompt {
     expected_anchor: storage::WorkspaceFolderAnchor,
     submission: Option<SettingsOperationKey>,
     failed: bool,
+}
+
+#[derive(Debug, Clone)]
+struct LegacyWorkspaceRebindPrompt {
+    request_workspace_id: String,
+    request_revision: u64,
+    name: String,
+    path: PathBuf,
+    purpose: WorkspaceMutationPurpose,
+    identity: crate::folder_identity::FolderIdentity,
 }
 
 /// Only the exact submitted operation can settle a folder prompt. A different
@@ -3465,6 +3479,7 @@ enum SettingsOutcomeKind {
         purpose: WorkspaceMutationPurpose,
         result: Result<storage::WorkspaceFindOrCreateResult, SettingsErrorCode>,
     },
+    LegacyWorkspaceRebindRequired(LegacyWorkspaceRebindPrompt),
     WorkspaceMovedPathAccepted {
         new_path: PathBuf,
         result: Result<storage::WorkspaceMovedPathUpdate, SettingsErrorCode>,
@@ -3516,7 +3531,32 @@ struct PreparedAgentLaunch {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct AgentLauncherSplitTarget {
+    workspace_id: String,
+    runtime_instance: u64,
+    pane: runtime::MuxPaneId,
+}
+
+impl AgentLauncherSplitTarget {
+    fn is_current(
+        &self,
+        workspace_id: &str,
+        runtime_instance: u64,
+        mux: Option<&runtime::MuxSnapshot>,
+    ) -> bool {
+        self.workspace_id == workspace_id
+            && self.runtime_instance == runtime_instance
+            && mux.is_some_and(|mux| {
+                mux.tabs
+                    .iter()
+                    .any(|tab| tab.panes.iter().any(|pane| pane.id == self.pane))
+            })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct PendingAgentLauncherLaunch {
+    split_target: Option<AgentLauncherSplitTarget>,
     request_id: u64,
     workspace_id: String,
     agent_config_id: String,
@@ -4936,28 +4976,57 @@ fn execute_settings_job_with_repair(
             name,
             path,
             purpose,
+            confirmed_legacy_identity,
         } => {
+            let identity = crate::folder_identity::probe(&path);
             let result = (|| {
                 let path_string = path
                     .to_str()
                     .context("settings_workspace_path_invalid_utf8")?;
-                let identity = crate::folder_identity::probe(&path)
-                    .context("settings_workspace_folder_anchor_missing")?;
-                db.find_or_create_workspace_by_exact_path_with_volume(
-                    &name,
-                    path_string,
-                    identity.anchor,
-                    identity.volume,
-                )
-            })()
-            .map_err(|error| {
-                if error.to_string().contains("workspace_path_anchor_conflict") {
-                    SettingsErrorCode::WorkspaceIdentity
+                let identity = identity.context("settings_workspace_folder_anchor_missing")?;
+                if let Some(expected) = confirmed_legacy_identity {
+                    anyhow::ensure!(identity == expected, "workspace_path_anchor_conflict");
+                    db.find_or_create_selected_workspace_by_exact_path_with_volume(
+                        &name,
+                        path_string,
+                        identity.anchor,
+                        identity.volume,
+                    )
                 } else {
-                    SettingsErrorCode::WorkspaceMutation
+                    db.find_or_create_workspace_by_exact_path_with_volume(
+                        &name,
+                        path_string,
+                        identity.anchor,
+                        identity.volume,
+                    )
                 }
-            });
-            SettingsOutcomeKind::WorkspaceFoundOrCreated { purpose, result }
+            })();
+            if confirmed_legacy_identity.is_none()
+                && result.as_ref().err().is_some_and(|error| {
+                    error
+                        .to_string()
+                        .contains("workspace_legacy_rebind_requires_confirmation")
+                })
+                && let Some(identity) = identity
+            {
+                SettingsOutcomeKind::LegacyWorkspaceRebindRequired(LegacyWorkspaceRebindPrompt {
+                    request_workspace_id: workspace_id.clone(),
+                    request_revision: revision,
+                    name,
+                    path,
+                    purpose,
+                    identity,
+                })
+            } else {
+                let result = result.map_err(|error| {
+                    if error.to_string().contains("workspace_path_anchor_conflict") {
+                        SettingsErrorCode::WorkspaceIdentity
+                    } else {
+                        SettingsErrorCode::WorkspaceMutation
+                    }
+                });
+                SettingsOutcomeKind::WorkspaceFoundOrCreated { purpose, result }
+            }
         }
         SettingsJobAction::AcceptMovedWorkspacePath {
             expected_old_path,
@@ -9743,6 +9812,7 @@ pub struct App {
     /// 확정 시 세션(pane)만 일괄 닫고 워크스페이스(경로·설정·DB 기록)는 보존한다.
     ws_close_confirm: Option<(String, String, usize, usize)>,
     workspace_add_ui: Option<crate::workspace_add::WorkspaceAddUi>,
+    pending_legacy_workspace_rebind: Option<LegacyWorkspaceRebindPrompt>,
     workspace_clone_task: Option<crate::workspace_add::CloneTask>,
     /// Completed clone stays pending for one UI frame so an already visible Cancel can win.
     pending_workspace_clone_result:
@@ -9819,6 +9889,7 @@ pub struct App {
     secret_store: KeyringSecretStore,
     agents_ui: ui::agents::AgentsUi,
     agent_launcher_ui: ui::agent_launcher::AgentLauncherUi,
+    agent_launcher_split_target: Option<AgentLauncherSplitTarget>,
     agent_launcher_worker:
         crate::lazy_worker::LazyBoundedWorker<u64, (u64, crate::agent_launcher::DetectionSnapshot)>,
     agent_launcher_snapshot: Option<crate::agent_launcher::DetectionSnapshot>,
@@ -12366,6 +12437,7 @@ enum AppControllerAction {
 /// when `logic` drains this slot on the next tick.
 enum WorkspaceControllerAction {
     OpenAgentLauncher,
+    OpenAgentLauncherBeside(AgentLauncherSplitTarget),
     OpenAgentLauncherForWorkspace(String),
     SwitchWorkspace(String),
     ActivatePersistedSession {
@@ -15488,18 +15560,21 @@ impl App {
                     name: workspace_name_for_path(&path, self.config.ui.session_name_style),
                     path: path.clone(),
                     purpose: WorkspaceMutationPurpose::SelectInSettings,
+                    confirmed_legacy_identity: None,
                 }
             }
             FolderPickerPurpose::AddSwitchWorkspace => SettingsJobAction::FindOrCreateWorkspace {
                 name: workspace_name_for_path(&path, self.config.ui.session_name_style),
                 path: path.clone(),
                 purpose: WorkspaceMutationPurpose::AddSwitchRuntime,
+                confirmed_legacy_identity: None,
             },
             FolderPickerPurpose::AddSelectWorkspaceInSettings => {
                 SettingsJobAction::FindOrCreateWorkspace {
                     name: workspace_name_for_path(&path, self.config.ui.session_name_style),
                     path: path.clone(),
                     purpose: WorkspaceMutationPurpose::AddSelectInSettings,
+                    confirmed_legacy_identity: None,
                 }
             }
             FolderPickerPurpose::WorkspaceAddDestination => return true,
@@ -15902,6 +15977,7 @@ impl App {
             env_project_close_confirm: None,
             ws_close_confirm: None,
             workspace_add_ui: None,
+            pending_legacy_workspace_rebind: None,
             workspace_clone_task: None,
             pending_workspace_clone_result: None,
             runtime_stream_warning: false,
@@ -15950,6 +16026,7 @@ impl App {
             secret_store: KeyringSecretStore,
             agents_ui: ui::agents::AgentsUi::new(),
             agent_launcher_ui: ui::agent_launcher::AgentLauncherUi::new(),
+            agent_launcher_split_target: None,
             agent_launcher_worker,
             agent_launcher_snapshot: None,
             agent_launcher_pending_snapshot: None,
@@ -20806,6 +20883,7 @@ impl App {
                             )
                         });
                         if opened {
+                            self.agent_launcher_split_target = None;
                             self.agent_launcher_seen_workspaces
                                 .insert(self.active.id.clone());
                             self.egui_ctx.request_repaint();
@@ -21866,6 +21944,21 @@ impl App {
         match action {
             WorkspaceControllerAction::OpenAgentLauncher => {
                 self.open_agent_launcher_for_active();
+            }
+            WorkspaceControllerAction::OpenAgentLauncherBeside(target) => {
+                if self.pending_agent_launcher_launch.is_none()
+                    && target.is_current(
+                        &self.active.id,
+                        self.active.runtime_instance,
+                        self.active.workspace_ui.mux().map(|mux| mux.as_ref()),
+                    )
+                {
+                    self.cancel_terminal_focus_intents();
+                    self.cross_workspace_pane.focus_primary();
+                    self.reveal_terminal_session();
+                    self.open_agent_launcher_for_active();
+                    self.agent_launcher_split_target = Some(target);
+                }
             }
             WorkspaceControllerAction::OpenAgentLauncherForWorkspace(workspace_id) => {
                 self.open_agent_launcher_for_workspace(&workspace_id);
@@ -24027,6 +24120,7 @@ impl App {
             || self.workspace_rename_prompt.is_some()
             || self.ws_close_confirm.is_some()
             || self.workspace_add_ui.is_some()
+            || self.pending_legacy_workspace_rebind.is_some()
             || self.agent_launcher_ui.is_open()
     }
 
@@ -26870,6 +26964,54 @@ impl App {
         }
     }
 
+    fn show_legacy_workspace_rebind_confirmation(
+        &mut self,
+        ctx: &egui::Context,
+        catalog: &i18n::Catalog,
+    ) {
+        let Some(prompt) = self.pending_legacy_workspace_rebind.as_ref() else {
+            return;
+        };
+        let target = prompt.path.to_string_lossy();
+        let choice = ui::popup::confirmation_for_target(
+            ctx,
+            egui::Id::new((
+                "legacy_workspace_rebind",
+                &prompt.path,
+                prompt.request_revision,
+            )),
+            ui::popup::ConfirmationSpec {
+                id: egui::Id::new("legacy_workspace_rebind"),
+                title: &catalog.t("workspace.rebind.title", &[]),
+                subtitle: &catalog.t("workspace.rebind.subtitle", &[]),
+                target: Some(&target),
+                message: &catalog.t("workspace.rebind.warning", &[]),
+                confirm_label: &catalog.t("workspace.rebind.confirm", &[]),
+                cancel_label: &catalog.t("action.cancel", &[]),
+                close_label: &catalog.t("popup.dismiss", &[]),
+            },
+        );
+        match choice {
+            Some(ui::popup::ConfirmationChoice::Cancel) => {
+                self.pending_legacy_workspace_rebind = None;
+                self.workspace_add_ui = None;
+            }
+            Some(ui::popup::ConfirmationChoice::Confirm) => {
+                let prompt = prompt.clone();
+                let action = SettingsJobAction::FindOrCreateWorkspace {
+                    name: prompt.name,
+                    path: prompt.path,
+                    purpose: prompt.purpose,
+                    confirmed_legacy_identity: Some(prompt.identity),
+                };
+                if self.queue_global_settings_action(&prompt.request_workspace_id, action) {
+                    self.pending_legacy_workspace_rebind = None;
+                }
+            }
+            None => {}
+        }
+    }
+
     /// 지정 workspace의 프로젝트 루트. App이 이미 소유한 immutable workspace projection을
     /// 사용해 render/action 경로에서 SQLite를 다시 조회하지 않는다.
     fn workspace_tree_root(&self, workspace_id: &str) -> Option<PathBuf> {
@@ -26986,6 +27128,7 @@ impl App {
             self.pending_agent_launcher_launch.is_some(),
             true,
         ) {
+            self.agent_launcher_split_target = None;
             self.egui_ctx.request_repaint();
         }
     }
@@ -27025,6 +27168,7 @@ impl App {
             self.pending_agent_launcher_launch.is_some(),
             false,
         ) {
+            self.agent_launcher_split_target = None;
             self.egui_ctx.request_repaint();
         }
     }
@@ -27172,8 +27316,38 @@ impl App {
                 self.request_agent_launcher_refresh();
             }
             ui::agent_launcher::AgentLauncherIntent::BlankTerminal { workspace_id } => {
-                if workspace_id == self.active.id {
-                    self.reveal_active_workspace_for_new_session();
+                if workspace_id != self.active.id {
+                    return;
+                }
+                if self
+                    .agent_launcher_split_target
+                    .as_ref()
+                    .is_some_and(|target| {
+                        !target.is_current(
+                            &self.active.id,
+                            self.active.runtime_instance,
+                            self.active.workspace_ui.mux().map(|mux| mux.as_ref()),
+                        )
+                    })
+                {
+                    // The blank-terminal button closes the launcher before emitting its intent.
+                    // Reopen with the same failed target so rejection remains visible and cannot
+                    // silently fall back to launching in a different pane.
+                    let target = self.agent_launcher_split_target.clone();
+                    self.open_agent_launcher_for_active();
+                    self.agent_launcher_split_target = target;
+                    self.agent_launcher_ui
+                        .report_error(ui::agent_launcher::LauncherErrorCode::AgentUnavailable);
+                    return;
+                }
+                self.reveal_active_workspace_for_new_session();
+                if let Some(target) = self.agent_launcher_split_target.as_ref() {
+                    self.active.workspace_ui.split_pane(
+                        target.pane.clone(),
+                        runtime::SplitDirection::Horizontal,
+                        self.config.terminal.scrollback_lines as usize,
+                    );
+                } else {
                     self.active
                         .workspace_ui
                         .spawn_shell(self.config.terminal.scrollback_lines as usize);
@@ -27190,6 +27364,21 @@ impl App {
                     return;
                 }
                 if workspace_id != self.active.id {
+                    self.agent_launcher_ui
+                        .report_error(ui::agent_launcher::LauncherErrorCode::AgentUnavailable);
+                    return;
+                }
+                if self
+                    .agent_launcher_split_target
+                    .as_ref()
+                    .is_some_and(|target| {
+                        !target.is_current(
+                            &self.active.id,
+                            self.active.runtime_instance,
+                            self.active.workspace_ui.mux().map(|mux| mux.as_ref()),
+                        )
+                    })
+                {
                     self.agent_launcher_ui
                         .report_error(ui::agent_launcher::LauncherErrorCode::AgentUnavailable);
                     return;
@@ -27225,6 +27414,7 @@ impl App {
                 );
                 if queued {
                     self.pending_agent_launcher_launch = Some(PendingAgentLauncherLaunch {
+                        split_target: self.agent_launcher_split_target.clone(),
                         request_id,
                         workspace_id,
                         agent_config_id: kind.stable_config_id().to_owned(),
@@ -27816,6 +28006,24 @@ impl App {
             }
             return false;
         }
+        let split_target = launcher_request_id
+            .and(self.pending_agent_launcher_launch.as_ref())
+            .and_then(|pending| pending.split_target.clone());
+        if split_target.as_ref().is_some_and(|target| {
+            !target.is_current(
+                &self.active.id,
+                self.active.runtime_instance,
+                self.active.workspace_ui.mux().map(|mux| mux.as_ref()),
+            )
+        }) {
+            if let Some(ticket_id) = ticket_id {
+                self.approval_launch_tracker.cancel(ticket_id);
+            }
+            if let Some(request_id) = launcher_request_id {
+                self.fail_agent_launcher_request(request_id);
+            }
+            return false;
+        }
         let command = runtime::RuntimeCommand::SpawnAgent {
             agent_config_id: Some(prepared.agent_config_id),
             cols: 80,
@@ -27829,6 +28037,12 @@ impl App {
             approval_regex: prepared.approval_regex,
             error_regex: prepared.error_regex,
             done_regex: prepared.done_regex,
+        };
+        let command = match split_target {
+            Some(target) => command
+                .with_right_split(target.pane)
+                .expect("prepared agent command"),
+            None => command,
         };
         let runtime_instance = self.active.runtime_instance;
         if self
@@ -28406,6 +28620,9 @@ impl App {
                             "workspace rename worker failed"
                         );
                     }
+                }
+                SettingsOutcomeKind::LegacyWorkspaceRebindRequired(prompt) => {
+                    self.pending_legacy_workspace_rebind = Some(prompt);
                 }
                 SettingsOutcomeKind::WorkspaceFoundOrCreated { purpose, result } => {
                     let Ok(result) = result else {
@@ -34630,8 +34847,20 @@ impl eframe::App for App {
                 attachment_id,
             ));
         }
-        if self.active.workspace_ui.take_new_session_requested() {
-            self.stage_workspace_controller_action(WorkspaceControllerAction::OpenAgentLauncher);
+        if let Some(request) = self.active.workspace_ui.take_new_session_requested() {
+            let action = match request {
+                ui::workspace::NewSessionRequest::NewTab => {
+                    WorkspaceControllerAction::OpenAgentLauncher
+                }
+                ui::workspace::NewSessionRequest::SplitRight(pane) => {
+                    WorkspaceControllerAction::OpenAgentLauncherBeside(AgentLauncherSplitTarget {
+                        workspace_id: self.active.id.clone(),
+                        runtime_instance: self.active.runtime_instance,
+                        pane,
+                    })
+                }
+            };
+            self.stage_workspace_controller_action(action);
         }
         if let Some(action) = work_history_action
             && self.pending_work_history_action.is_none()
@@ -35093,7 +35322,10 @@ impl eframe::App for App {
             self.cross_workspace_open_warning = None;
         }
 
-        self.render_workspace_add_dialog(ui.ctx(), &text);
+        if self.pending_legacy_workspace_rebind.is_none() {
+            self.render_workspace_add_dialog(ui.ctx(), &text);
+        }
+        self.show_legacy_workspace_rebind_confirmation(ui.ctx(), &text);
 
         // 「워크스페이스 종료」 확인 모달 — 설정에서 명시적으로 ON한 경우에만 표시한다.
         if let Some((close_id, close_name, total, running)) = self.ws_close_confirm.clone() {
@@ -41817,7 +42049,9 @@ mod tests {
             .split_once("let mut primary_focus_requested")
             .unwrap()
             .1
-            .split_once("if self.active.workspace_ui.take_new_session_requested()")
+            .split_once(
+                "if let Some(request) = self.active.workspace_ui.take_new_session_requested()",
+            )
             .unwrap()
             .0;
         let claim = render.find("primary_local_focus_claim").unwrap();
@@ -44615,7 +44849,9 @@ mod tests {
             .split_once("let terminal_visible =")
             .unwrap()
             .1
-            .split_once("if self.active.workspace_ui.take_new_session_requested()")
+            .split_once(
+                "if let Some(request) = self.active.workspace_ui.take_new_session_requested()",
+            )
             .unwrap()
             .0;
         assert!(
@@ -46773,7 +47009,9 @@ mod tests {
             .split_once("let terminal_visible =")
             .unwrap()
             .1
-            .split_once("if self.active.workspace_ui.take_new_session_requested()")
+            .split_once(
+                "if let Some(request) = self.active.workspace_ui.take_new_session_requested()",
+            )
             .unwrap()
             .0;
 
@@ -46794,7 +47032,9 @@ mod tests {
             .split_once("let terminal_visible =")
             .unwrap()
             .1
-            .split_once("if self.active.workspace_ui.take_new_session_requested()")
+            .split_once(
+                "if let Some(request) = self.active.workspace_ui.take_new_session_requested()",
+            )
             .unwrap()
             .0;
 
@@ -50537,8 +50777,70 @@ mod tests {
     }
 
     #[test]
+    fn launcher_split_target_is_bound_to_workspace_runtime_and_clicked_pane() {
+        let mut mux = cross_workspace_test_mux("tab", "anchor", runtime::SessionId(42));
+        let target = AgentLauncherSplitTarget {
+            workspace_id: "workspace".to_owned(),
+            runtime_instance: 11,
+            pane: runtime::MuxPaneId("anchor".to_owned()),
+        };
+        assert!(target.is_current("workspace", 11, Some(&mux)));
+        mux.focused_pane = Some(runtime::MuxPaneId("different-focus".to_owned()));
+        assert!(
+            target.is_current("workspace", 11, Some(&mux)),
+            "focus changes must not retarget a pending launch"
+        );
+        assert!(!target.is_current("other-workspace", 11, Some(&mux)));
+        assert!(!target.is_current("workspace", 12, Some(&mux)));
+        assert!(!target.is_current("workspace", 11, None));
+        mux.tabs[0].panes.clear();
+        assert!(
+            !target.is_current("workspace", 11, Some(&mux)),
+            "closed anchor must fail closed"
+        );
+    }
+
+    #[test]
+    fn launcher_split_agent_retains_dotenv_and_close_cancellation_gates() {
+        let command = runtime::RuntimeCommand::SpawnAgent {
+            cols: 80,
+            rows: 24,
+            scrollback_lines: 100,
+            agent_config_id: Some("agent".to_owned()),
+            command: "/bin/cat".to_owned(),
+            args: vec![],
+            env_plain: vec![],
+            env_secrets: vec![],
+            waiting_regex: None,
+            approval_regex: None,
+            error_regex: None,
+            done_regex: None,
+        }
+        .with_right_split(runtime::MuxPaneId("anchor".to_owned()))
+        .unwrap();
+        assert!(runtime_command_requires_dotenv(&command));
+        assert!(runtime_command_creates_session(&command));
+        assert!(!session_spawn_skips_dotenv_worker(
+            &command,
+            Some((false, None)),
+            (false, None),
+            false
+        ));
+        let continuation = PendingDotenvContinuation::AgentLaunch {
+            command,
+            approval_ticket: None,
+            launcher_request_id: Some(1),
+        };
+        assert!(dotenv_failure_allows_session(&continuation));
+        assert!(dotenv_continuation_must_cancel_on_workspace_close(
+            &continuation
+        ));
+    }
+
+    #[test]
     fn launcher_spawn_correlation은_workspace와_config가_모두_맞을때만_소비한다() {
         let mut pending = Some(PendingAgentLauncherLaunch {
+            split_target: None,
             request_id: 7,
             workspace_id: "workspace-a".to_owned(),
             agent_config_id: "deppy-builtin-codex".to_owned(),
@@ -50931,6 +51233,7 @@ mod tests {
                     name: "ignored".to_owned(),
                     path: workspace_path.clone(),
                     purpose: WorkspaceMutationPurpose::AddSwitchRuntime,
+                    confirmed_legacy_identity: None,
                 },
             },
         );
@@ -50955,8 +51258,123 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
+    fn selected_legacy_workspace_folder_reconnects_after_device_renumbering() {
+        let db_path = temp_db_path("settings-legacy-workspace-reselect");
+        let folder = temp_db_path("settings-legacy-workspace-folder").with_extension("dir");
+        std::fs::create_dir(&folder).unwrap();
+        let identity = crate::folder_identity::probe(&folder).unwrap();
+        assert!(identity.volume.is_some());
+        let old_anchor = storage::WorkspaceFolderAnchor {
+            dev: identity.anchor.dev ^ 1,
+            ino: identity.anchor.ino,
+        };
+        let mut db = storage::Db::open(&db_path).unwrap();
+        let existing = db
+            .find_or_create_workspace_by_exact_path_with_volume(
+                "existing name",
+                folder.to_str().unwrap(),
+                old_anchor,
+                None,
+            )
+            .unwrap();
+
+        let outcome = execute_settings_job(
+            &mut db,
+            &db_path,
+            &secret::RedactionService::new(),
+            SettingsJob {
+                generation: 1,
+                revision: 1,
+                workspace_id: existing.row.id.clone(),
+                project_root: None,
+                action: SettingsJobAction::FindOrCreateWorkspace {
+                    name: "ignored".to_owned(),
+                    path: folder.clone(),
+                    purpose: WorkspaceMutationPurpose::AddSwitchRuntime,
+                    confirmed_legacy_identity: None,
+                },
+            },
+        );
+        let prompt = match outcome.kind {
+            SettingsOutcomeKind::LegacyWorkspaceRebindRequired(prompt) => prompt,
+            _ => panic!("device renumbering must require explicit confirmation"),
+        };
+        assert_eq!(prompt.path, folder);
+        assert_eq!(prompt.identity, identity);
+        assert_eq!(
+            db.workspace_anchor(&existing.row.id).unwrap(),
+            Some((old_anchor.dev, old_anchor.ino))
+        );
+        let stale_confirmation = execute_settings_job(
+            &mut db,
+            &db_path,
+            &secret::RedactionService::new(),
+            SettingsJob {
+                generation: 1,
+                revision: 2,
+                workspace_id: existing.row.id.clone(),
+                project_root: None,
+                action: SettingsJobAction::FindOrCreateWorkspace {
+                    name: prompt.name.clone(),
+                    path: prompt.path.clone(),
+                    purpose: prompt.purpose,
+                    confirmed_legacy_identity: Some(crate::folder_identity::FolderIdentity {
+                        volume: Some(uuid::Uuid::new_v4()),
+                        ..prompt.identity
+                    }),
+                },
+            },
+        );
+        assert!(matches!(
+            stale_confirmation.kind,
+            SettingsOutcomeKind::WorkspaceFoundOrCreated {
+                result: Err(SettingsErrorCode::WorkspaceIdentity),
+                ..
+            }
+        ));
+        assert_eq!(
+            db.workspace_anchor(&existing.row.id).unwrap(),
+            Some((old_anchor.dev, old_anchor.ino))
+        );
+        let confirmed = execute_settings_job(
+            &mut db,
+            &db_path,
+            &secret::RedactionService::new(),
+            SettingsJob {
+                generation: 1,
+                revision: 3,
+                workspace_id: prompt.request_workspace_id,
+                project_root: None,
+                action: SettingsJobAction::FindOrCreateWorkspace {
+                    name: prompt.name,
+                    path: prompt.path,
+                    purpose: prompt.purpose,
+                    confirmed_legacy_identity: Some(prompt.identity),
+                },
+            },
+        );
+        assert!(matches!(
+            confirmed.kind,
+            SettingsOutcomeKind::WorkspaceFoundOrCreated {
+                result: Ok(ref result),
+                ..
+            } if !result.created && result.row.id == existing.row.id
+                && result.row.name == "existing name"
+        ));
+        assert_eq!(
+            db.workspace_anchor(&existing.row.id).unwrap(),
+            Some((identity.anchor.dev, identity.anchor.ino))
+        );
+        assert_eq!(db.list_workspaces().unwrap().len(), 1);
+        drop(db);
+        remove_sqlite_files(&db_path);
+        std::fs::remove_dir(folder).unwrap();
+    }
+
+    #[test]
     #[cfg(unix)]
-    fn popup_review_settings_worker_rejects_unverified_or_different_volume() {
+    fn popup_review_settings_worker_requires_legacy_confirmation_and_rejects_volume_conflict() {
         for different_uuid in [false, true] {
             let db_path = temp_db_path("settings-volume-conflict");
             let workspace_path = temp_db_path("settings-volume-directory").with_extension("dir");
@@ -50967,12 +51385,19 @@ mod tests {
                 ino: identity.anchor.ino,
             };
             let mut db = storage::Db::open(&db_path).unwrap();
+            let stored_volume = different_uuid.then(|| {
+                let mut other = uuid::Uuid::new_v4();
+                while Some(other) == identity.volume {
+                    other = uuid::Uuid::new_v4();
+                }
+                other
+            });
             let existing = db
                 .find_or_create_workspace_by_exact_path_with_volume(
                     "preserved alias",
                     workspace_path.to_str().unwrap(),
                     stored,
-                    different_uuid.then(uuid::Uuid::new_v4),
+                    stored_volume,
                 )
                 .unwrap();
             let outcome = execute_settings_job(
@@ -50988,16 +51413,25 @@ mod tests {
                         name: "replacement".into(),
                         path: workspace_path.clone(),
                         purpose: WorkspaceMutationPurpose::AddSwitchRuntime,
+                        confirmed_legacy_identity: None,
                     },
                 },
             );
-            assert!(matches!(
-                outcome.kind,
-                SettingsOutcomeKind::WorkspaceFoundOrCreated {
-                    result: Err(SettingsErrorCode::WorkspaceIdentity),
-                    ..
-                }
-            ));
+            if different_uuid || identity.volume.is_none() {
+                assert!(matches!(
+                    outcome.kind,
+                    SettingsOutcomeKind::WorkspaceFoundOrCreated {
+                        result: Err(SettingsErrorCode::WorkspaceIdentity),
+                        ..
+                    }
+                ));
+            } else {
+                assert!(matches!(
+                    outcome.kind,
+                    SettingsOutcomeKind::LegacyWorkspaceRebindRequired(ref prompt)
+                        if prompt.path == workspace_path && prompt.identity == identity
+                ));
+            }
             assert_eq!(
                 db.workspace_anchor(&existing.row.id).unwrap(),
                 Some((stored.dev, stored.ino))
@@ -51036,6 +51470,7 @@ mod tests {
                         name: "replacement".into(),
                         path: workspace_path.clone(),
                         purpose: WorkspaceMutationPurpose::AddSwitchRuntime,
+                        confirmed_legacy_identity: None,
                     },
                 },
             );
@@ -51071,6 +51506,7 @@ mod tests {
                     name: "project".to_owned(),
                     path: workspace_path.clone(),
                     purpose: WorkspaceMutationPurpose::AddSwitchRuntime,
+                    confirmed_legacy_identity: None,
                 },
             },
         );
@@ -51098,6 +51534,7 @@ mod tests {
                     name: "ignored".to_owned(),
                     path: workspace_path.clone(),
                     purpose: WorkspaceMutationPurpose::SelectInSettings,
+                    confirmed_legacy_identity: None,
                 },
             },
         );
@@ -51162,6 +51599,7 @@ mod tests {
                     name: "repo".to_owned(),
                     path: cloned.path.clone(),
                     purpose: WorkspaceMutationPurpose::AddSwitchRuntime,
+                    confirmed_legacy_identity: None,
                 },
             },
         );

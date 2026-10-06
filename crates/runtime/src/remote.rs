@@ -413,6 +413,10 @@ fn validate_command(command: &RuntimeCommand) -> Result<(), &'static str> {
     if let RuntimeCommand::SpawnAgent {
         agent_config_id: Some(id),
         ..
+    }
+    | RuntimeCommand::SpawnAgentBeside {
+        agent_config_id: Some(id),
+        ..
     } = command
         && !crate::command::agent_config_id_is_valid(id)
     {
@@ -425,6 +429,12 @@ fn validate_command(command: &RuntimeCommand) -> Result<(), &'static str> {
             scrollback_lines,
         }
         | RuntimeCommand::SpawnAgent {
+            cols,
+            rows,
+            scrollback_lines,
+            ..
+        }
+        | RuntimeCommand::SpawnAgentBeside {
             cols,
             rows,
             scrollback_lines,
@@ -2894,7 +2904,7 @@ mod tests {
                 features: CLIENT_FEATURES,
                 token: b"irrelevant".to_vec(),
             };
-            assert_eq!(PROTO_VERSION, 22);
+            assert_eq!(PROTO_VERSION, 23);
             assert!(!client_hello_matches_protocol(&old));
         }
     }

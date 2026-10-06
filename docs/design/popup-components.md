@@ -1,6 +1,6 @@
 # 공용 팝업 디자인과 구현 규칙
 
-기준 시안: [42개 팝업 사례](../mockups/shared-popup-components-2026-09-30.html). 이 문서는 새 팝업을 만들거나 기존 팝업을 옮길 때 사용하는 구현 계약이다. 사례 번호는 시안의 왼쪽 목록과 전체 표에서 같다.
+기준 시안: [43개 팝업 사례](../mockups/shared-popup-components-2026-09-30.html). 이 문서는 새 팝업을 만들거나 기존 팝업을 옮길 때 사용하는 구현 계약이다. 사례 번호는 시안의 왼쪽 목록과 전체 표에서 같다.
 
 ## 적용 범위
 
@@ -24,6 +24,7 @@
 | 27 | 외부 수정 문서 다시 불러오기 | 공용 팝업 · 다시 불러오기/취소 | `crates/app/src/ui/document_dialogs.rs` |
 | 28 | 문서 탭 한도 | 공용 Info 팝업 | `crates/app/src/ui/document_dialogs.rs` |
 | 29 | 프로젝트 폴더 이동 | 공용 팝업 · 이전/현재 경로·접수/실패 상태 | `crates/app/src/ui/document_dialogs.rs` |
+| 43 | 기존 워크스페이스 재연결 | 공용 확인 팝업 · 선택 폴더 표시·명시적 승인 | `crates/app/src/app.rs` · `ui/popup/confirmation.rs` |
 | 30–32 | 프롬프트 라이브러리·변경사항·세션 관리 | 공용 중앙 이동·크기 조절 셸과 본문 여백 | `ui/prompt_palette.rs` · `ui/diff_panel.rs` · `ui/agent_sessions.rs` |
 | 33–35 | 이벤트 적체·워크스페이스 한도·셀 열기 실패 | 공용 Info 팝업 · 순차 안내 | `crates/app/src/ui/popup/information.rs` · 호출자 `app.rs` |
 | 37 포트 | 포트 관리 목록 | 공용 앵커 팝오버 · 목록 행·스크롤·고정 푸터 | `crates/app/src/ui/ports.rs` · 호출자 `ui/agent_terminal.rs` |
@@ -36,7 +37,7 @@ AI 세션 시작 런처는 기존 전용 레이아웃을 유지한다. macOS 기
 
 | 컴포넌트 | 파일 | 책임 |
 | --- | --- | --- |
-| `WindowSpec` / `window` / `window_body` | `connector-ui/src/popup/window.rs` | 중앙에서 열리는 이동·크기 조절 창, 본문 스크롤과 고정 하단 여백 |
+| `WindowSpec` / `window` / `fixed_window` / `window_body` | `connector-ui/src/popup/window.rs` | 중앙에서 열리는 이동·크기 조절 창, 본문 스크롤과 고정 하단 여백 |
 | `PopupSpec` / `show` / `body` | `shell.rs` | 모달 배경, 폭, 제목·설명·닫기, 고정 머리글과 스크롤 본문 |
 | `field` / `text_input` / `path_input` / `segmented_choice` | `fields.rs` | 레이블·힌트, 36pt 입력, 경로와 찾아보기 행, 두 선택지 |
 | `choice_input` | `fields.rs` | 36pt 선택 입력, 공용 테두리·폰트·배경 |
@@ -97,7 +98,7 @@ let close_requested = popup::show(ctx, popup::PopupSpec {
 
 - 새 폴더·새 파일은 이름 입력에 바로 초점을 주고, Enter는 만들기, Esc·취소·닫기는 입력을 버린다. 파일 트리 행을 밀지 않도록 모달은 트리 레이아웃 밖에 둔다.
 - 워크스페이스 추가는 `내 폴더`/`GitHub 저장소` 선택, URL·저장 위치·폴더 이름의 초안, 복제 상태와 오류를 기존 `WorkspaceAddUi`가 관리한다. 하단의 주 동작은 선택 방식에 맞춰 바뀐다. 복제 중에는 닫기를 막고 복제 취소만 허용한다.
-- 로컬 폴더 등록은 열린 디렉터리 descriptor에서 dev/inode와 macOS 볼륨 UUID를 같은 객체 기준으로 읽어 settings worker에서 저장한다. 기존 UUID와 inode가 일치할 때만 재마운트의 장치 번호 변경을 허용한다. 다른 볼륨·식별 정보가 없는 장치 변경은 기존 workspace를 자동 재사용하지 않고 오류 안내를 표시한다. 설정의 명시적 프로젝트 경로 재연결은 같은 경로/dev/inode여도 이전 증명을 트랜잭션 안에서 교체한다.
+- 로컬 폴더 등록은 열린 디렉터리 descriptor에서 dev/inode와 macOS 볼륨 UUID를 같은 객체 기준으로 읽어 settings worker에서 저장한다. 기존 UUID와 inode가 일치하면 장치 번호 변경을 허용한다. 과거 UUID 증명이 없는 기존 경로는 inode가 같고 현재 UUID를 읽을 수 있어도 자동 연결하지 않는다. 선택한 폴더를 사례43 공용 확인창에 표시하고, 사용자가 다시 연결을 누른 경우에만 원래 probe의 dev/inode/UUID를 worker에서 재검사한 뒤 기존 workspace에 연결한다. 다른 UUID·inode 또는 UUID 조회 불가 시 계속 거부한다. 설정의 명시적 프로젝트 경로 재연결은 같은 경로/dev/inode여도 이전 증명을 트랜잭션 안에서 교체한다.
 - 시안의 01번은 GitHub 입력 상태를 보여주는 예시다. 실제 첫 선택은 기존과 같이 `내 폴더`이며, 사용자가 GitHub를 누르면 저장소 입력으로 전환한다.
 - URL 아래에는 지원 형식 안내를 표시한다. 하단 단축키는 생성 창에서 `Enter 만들기 · Esc 닫기`, 워크스페이스 추가에서 `Esc 닫기`다. 워크스페이스 복제는 버튼으로 시작하므로 Enter 실행이라고 표기하지 않는다.
 - 모달 UI 안에서 디스크·네트워크 작업을 시작하거나 동기 대기하지 않는다. 호출자가 의도를 받아 기존 작업 경로로 보낸다.
@@ -140,7 +141,7 @@ let close_requested = popup::show(ctx, popup::PopupSpec {
 
 37의 포트 부분은 상태바 앵커 팝오버다. 배경 모달을 만들지 않고 공용 머리글·표면·닫기·본문·고정 푸터를 재사용한다. 폭은560pt 이하로 제한한다. 본문은 viewport와560pt 상한을 함께 적용한 한 개 ScrollArea이고 현재/다른/외부 섹션과 `list_row`를 그린다. 행 동작은 `list_actions`가 실제34pt 높이로 배치하며, 스크롤 영역의 남은 높이를 버튼 행 높이로 사용하지 않는다. 새로고침은 푸터에서 기존 의도만 보내며 새 폴링을 추가하지 않는다. 주소 복사는 IPv4/IPv6/와일드카드 소켓 문자열을 그대로 유지한다. 외부·보호·소유권 불명 프로세스는 읽기 전용이다. 행의 종료는 기존12번 확인창을 열 뿐이고 확인창은 원래 팝오버 외부에서 원래 소유권/프로세스 시작 식별자를 유지한다. 승인·리소스 팝오버의 기존 표시 구조는 이번 변경에 포함하지 않는다.
 
-HTML의37번은 상세 포트 목록을 보여준다. 번호는 기존42개를 유지하며 `#terminal_status`, `#env_project_close`, `#env_delete`, `#overflow`, `#warm_limit`, `#cross_pane_failure`로 해당 화면을 직접 열 수 있다. 시안의 포트 종료를 누르면 선택한 소켓/워크스페이스로12번을 보여주고 취소 시 목록으로 돌아간다.
+HTML의37번은 상세 포트 목록을 보여준다. 기존42개 번호를 유지하고43번 재연결 확인을 추가했으며 `#terminal_status`, `#env_project_close`, `#env_delete`, `#overflow`, `#warm_limit`, `#cross_pane_failure`, `#workspace_rebind`로 해당 화면을 직접 열 수 있다. 시안의 포트 종료를 누르면 선택한 소켓/워크스페이스로12번을 보여주고 취소 시 목록으로 돌아간다.
 
 ## 다음 팝업을 적용할 때
 
@@ -191,3 +192,9 @@ Codex는 모델별 단축키 한 단계를 보내고 실제 변경을 확인한 
 ## Context 잠금 규칙 (2026-10-05 정지 수정)
 
 `Context::data/input/memory` 콜백 안에서는 같은 Context의 다른 접근자를 호출하지 않는다. viewport ID와 pass 번호는 콜백 전에 복사하고, 콜백 안에서는 전달받은 데이터만 조회한다. 팝업 입력 펜스와 백그라운드 repaint가 동시에 실행될 때 중첩 읽기 잠금이 대기 중인 쓰기 잠금을 가로막아 UI 전체가 멈출 수 있다. 같은 pass의 모달 차단과 다음 pass 만료 동작은 유지한다. 표시·HTML 사례 변경은 없다.
+
+## 브로드캐스트 고정 크기·내부 스크롤 (2026-10-05)
+
+사례19는 공용 `fixed_window`를 사용해680×560pt로 연다. 화면이 작을 때만 화면 가장자리 여백을 제외한 크기로 줄인다. 제목을 끌어 이동할 수 있지만 내용이나 대상 수, 반복 repaint로 창 크기가 늘어나지 않으며 수동 크기 조절도 제공하지 않는다. 긴 미리보기는 본문 스크롤, 파라미터와 대상 목록은 기존180pt 내부 스크롤을 사용한다. 머리글과 전송·3개 이상 재확인 버튼은 본문 밖에 유지한다. 빈 라이브러리 안내도 같은 고정 창 안에 표시한다.
+
+`window_body`는 본문 여백과 하단 높이를 이미 예약하므로 본문 뒤에 추가 여백을 넣지 않는다. 추가 여백을 예약 없이 붙이면 native Resize의 실제 콘텐츠 높이에 포함되어 매 프레임 창이 커질 수 있다. 다른 사례의 `window` 이동·크기 조절은 그대로 사용한다.

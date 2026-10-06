@@ -2781,6 +2781,7 @@ impl FileTreeUi {
                                                                 && session_row_should_activate(
                                                                     &entry.target,
                                                                     entry.focused,
+                                                                    resp.double_clicked(),
                                                                 )
                                                             {
                                                                 action = Some(session_row_activation(
@@ -6451,8 +6452,12 @@ fn session_row_activation(target: &SessionRowTarget) -> SidebarAction {
     }
 }
 
-fn session_row_should_activate(target: &SessionRowTarget, focused: bool) -> bool {
-    !focused || target.session().is_none()
+fn session_row_should_activate(
+    target: &SessionRowTarget,
+    focused: bool,
+    double_clicked: bool,
+) -> bool {
+    !focused || target.session().is_none() || double_clicked
 }
 
 fn can_open_session_beside(active_workspace_id: &str, target: &SessionRowTarget) -> bool {
@@ -14932,6 +14937,113 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn kittest_홈_작업_이력_git에서_선택된_세션을_더블클릭하면_정확한_pane으로_돌아간다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let workspaces = vec![SidebarWorkspaceEntry {
+            id: "workspace-a".to_owned(),
+            name: "Workspace A".to_owned(),
+            state: SidebarWorkspaceState::Active,
+            summary: SidebarSessionSummary::default(),
+        }];
+        let sessions = std::collections::HashMap::from([(
+            "workspace-a".to_owned(),
+            vec![SidebarSessionRow::from_live(
+                "workspace-a",
+                7,
+                SessionEntry {
+                    tab: runtime::MuxTabId("tab-a".to_owned()),
+                    pane: runtime::MuxPaneId("pane-a".to_owned()),
+                    session: Some(runtime::SessionId(42)),
+                    title: "Session A".to_owned(),
+                    title_is_custom: true,
+                    agent_model: None,
+                    status: None,
+                    summary: String::new(),
+                    focused: true,
+                    attention: false,
+                    pulse: None,
+                    agent_line: None,
+                    status_label: None,
+                    resumable: false,
+                    has_cwd: false,
+                    in_worktree: false,
+                    status_line: None,
+                    last_output_at: None,
+                },
+            )],
+        )]);
+
+        for (view, history_tab_active, git_tab_active) in [
+            (
+                crate::ui::agent_terminal::AgentTerminalView::Home,
+                false,
+                false,
+            ),
+            (
+                crate::ui::agent_terminal::AgentTerminalView::Fleet,
+                false,
+                false,
+            ),
+            (
+                crate::ui::agent_terminal::AgentTerminalView::Terminal,
+                true,
+                false,
+            ),
+            (
+                crate::ui::agent_terminal::AgentTerminalView::Terminal,
+                false,
+                true,
+            ),
+        ] {
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(420.0, 700.0))
+                .with_step_dt(1.0 / 60.0)
+                .build_ui_state(
+                    |ui, state: &mut (FileTreeUi, Vec<SidebarAction>, bool)| {
+                        if !state.2 {
+                            return;
+                        }
+                        let snapshot = SidebarSnapshot {
+                            active_workspace_id: "workspace-a",
+                            workspaces: &workspaces,
+                            view,
+                            home_notice_count: 0,
+                            fleet_summary: Default::default(),
+                            history_tab_active,
+                            git_tab_active,
+                            agents_open: false,
+                            workspace_note: None,
+                        };
+                        if let Some(action) = state.0.panel(ui, &sessions, &snapshot, &catalog) {
+                            state.1.push(action);
+                        }
+                    },
+                    (FileTreeUi::new(egui::Context::default()), Vec::new(), false),
+                );
+            install_sidebar_test_fonts(&harness.ctx);
+            harness.state_mut().2 = true;
+            harness.run();
+
+            harness.get_by_label("Session A").click();
+            harness.run();
+            assert!(harness.state().1.is_empty(), "{view:?}: single click");
+
+            harness.get_by_label("Session A").click();
+            harness.run();
+            assert!(
+                matches!(
+                    harness.state().1.as_slice(),
+                    [SidebarAction::FocusSession { workspace_id, tab, pane }]
+                        if workspace_id == "workspace-a" && tab.0 == "tab-a" && pane.0 == "pane-a"
+                ),
+                "{view:?}: double click must focus the exact session pane"
+            );
+        }
+    }
+
     /// 회귀 고정(2026-08-15): 세션 행 컨텍스트 메뉴의 「변경 보기」는 **그 세션**의
     /// ShowDiff{session}을 낸다 — 포커스 세션이 아니라 클릭한 행 기준이어야 한다.
     /// 한때 payload 없는 유닛 variant로 단순화됐다가(포커스 세션 기준으로 App이
@@ -16342,9 +16454,10 @@ mod tests {
             runtime::SessionId(42),
         );
 
-        assert!(session_row_should_activate(&persisted, true));
-        assert!(!session_row_should_activate(&live, true));
-        assert!(session_row_should_activate(&live, false));
+        assert!(session_row_should_activate(&persisted, true, false));
+        assert!(!session_row_should_activate(&live, true, false));
+        assert!(session_row_should_activate(&live, false, false));
+        assert!(session_row_should_activate(&live, true, true));
     }
 
     #[test]

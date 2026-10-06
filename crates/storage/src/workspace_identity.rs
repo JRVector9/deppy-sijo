@@ -11,6 +11,7 @@ pub(super) fn verify(
     stored: Option<WorkspaceFolderAnchor>,
     current: WorkspaceFolderAnchor,
     volume: Option<uuid::Uuid>,
+    allow_selected_legacy_rebind: bool,
 ) -> anyhow::Result<()> {
     let Some(stored) = stored else {
         return Ok(());
@@ -32,8 +33,14 @@ pub(super) fn verify(
     anyhow::ensure!(stored.ino == current.ino, "workspace_path_anchor_conflict");
     if let Some(cached) = cached {
         anyhow::ensure!(volume == Some(cached), "workspace_path_anchor_conflict");
-    } else {
-        anyhow::ensure!(stored.dev == current.dev, "workspace_path_anchor_conflict");
+    } else if stored.dev != current.dev {
+        let Some(_) = volume.filter(|_| allow_selected_legacy_rebind) else {
+            anyhow::bail!(if volume.is_some() {
+                "workspace_legacy_rebind_requires_confirmation"
+            } else {
+                "workspace_path_anchor_conflict"
+            });
+        };
     }
     Ok(())
 }

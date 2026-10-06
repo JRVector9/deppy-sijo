@@ -378,8 +378,23 @@ pub(crate) fn runtime_command_retained_bytes(
     command: &RuntimeCommand,
 ) -> Result<usize, RuntimeAdmissionError> {
     let mut total = std::mem::size_of::<RuntimeCommand>();
+    if let RuntimeCommand::SpawnAgentBeside { pane, .. } = command {
+        retained_string(&mut total, &pane.0)?;
+    }
     match command {
         RuntimeCommand::SpawnAgent {
+            agent_config_id,
+            command,
+            args,
+            env_plain,
+            env_secrets,
+            waiting_regex,
+            approval_regex,
+            error_regex,
+            done_regex,
+            ..
+        }
+        | RuntimeCommand::SpawnAgentBeside {
             agent_config_id,
             command,
             args,
@@ -542,8 +557,23 @@ fn canonicalize_mux_tab_id(id: &mut MuxTabId) {
 /// events are rebuilt with length-bound backing allocations. Validation must run first; this is
 /// capacity canonicalization only and does not alter command semantics or wire representation.
 pub(crate) fn canonicalize_host_command(command: &mut RuntimeCommand) {
+    if let RuntimeCommand::SpawnAgentBeside { pane, .. } = command {
+        canonicalize_mux_pane_id(pane);
+    }
     match command {
         RuntimeCommand::SpawnAgent {
+            agent_config_id,
+            command,
+            args,
+            env_plain,
+            env_secrets,
+            waiting_regex,
+            approval_regex,
+            error_regex,
+            done_regex,
+            ..
+        }
+        | RuntimeCommand::SpawnAgentBeside {
             agent_config_id,
             command,
             args,
@@ -701,6 +731,13 @@ fn mux_tab_id_is_valid(id: &MuxTabId) -> bool {
 }
 
 pub(crate) fn validate_host_command(command: &RuntimeCommand) -> Result<(), RuntimeAdmissionError> {
+    if let RuntimeCommand::SpawnAgentBeside { pane, .. } = command
+        && !mux_pane_id_is_valid(pane)
+    {
+        return Err(admission_error(
+            "runtime_command_spawn_agent_target_invalid",
+        ));
+    }
     match command {
         RuntimeCommand::SpawnShell {
             cols,
@@ -724,6 +761,21 @@ pub(crate) fn validate_host_command(command: &RuntimeCommand) -> Result<(), Runt
             approval_regex,
             error_regex,
             done_regex,
+        }
+        | RuntimeCommand::SpawnAgentBeside {
+            cols,
+            rows,
+            scrollback_lines,
+            agent_config_id,
+            command,
+            args,
+            env_plain,
+            env_secrets,
+            waiting_regex,
+            approval_regex,
+            error_regex,
+            done_regex,
+            ..
         } => {
             if !dimensions_are_valid(*cols, *rows)
                 || *scrollback_lines > SCROLLBACK_LINES_MAX
@@ -1195,6 +1247,23 @@ pub enum RuntimeCommand {
         operation_id: String,
         parts: Vec<Vec<u8>>,
     },
+    /// Atomically launches the selected agent in the right half of the exact target pane.
+    /// Append-only: all legacy command discriminants and payloads remain unchanged.
+    SpawnAgentBeside {
+        pane: MuxPaneId,
+        cols: u16,
+        rows: u16,
+        scrollback_lines: usize,
+        agent_config_id: Option<String>,
+        command: String,
+        args: Vec<String>,
+        env_plain: Vec<(String, String)>,
+        env_secrets: Vec<(String, String)>,
+        waiting_regex: Option<String>,
+        approval_regex: Option<String>,
+        error_regex: Option<String>,
+        done_regex: Option<String>,
+    },
 }
 
 impl std::fmt::Debug for RuntimeCommand {
@@ -1223,6 +1292,21 @@ impl std::fmt::Debug for RuntimeCommand {
                 approval_regex,
                 error_regex,
                 done_regex,
+            }
+            | RuntimeCommand::SpawnAgentBeside {
+                cols,
+                rows,
+                scrollback_lines,
+                agent_config_id,
+                command,
+                args,
+                env_plain,
+                env_secrets,
+                waiting_regex,
+                approval_regex,
+                error_regex,
+                done_regex,
+                ..
             } => f
                 .debug_struct("SpawnAgent")
                 .field("cols", cols)
@@ -1459,6 +1543,83 @@ impl std::fmt::Debug for RuntimeCommand {
     }
 }
 
+impl RuntimeCommand {
+    /// Converts only an agent launch; all launch fields are moved without cloning secrets.
+    pub fn with_right_split(
+        self,
+        pane: MuxPaneId,
+    ) -> Result<Self, RuntimeCommandPreparationErrorCode> {
+        match self {
+            Self::SpawnAgent {
+                cols,
+                rows,
+                scrollback_lines,
+                agent_config_id,
+                command,
+                args,
+                env_plain,
+                env_secrets,
+                waiting_regex,
+                approval_regex,
+                error_regex,
+                done_regex,
+            } => Ok(Self::SpawnAgentBeside {
+                pane,
+                cols,
+                rows,
+                scrollback_lines,
+                agent_config_id,
+                command,
+                args,
+                env_plain,
+                env_secrets,
+                waiting_regex,
+                approval_regex,
+                error_regex,
+                done_regex,
+            }),
+            _ => Err(RuntimeCommandPreparationErrorCode::InvalidCommand),
+        }
+    }
+
+    pub(crate) fn into_agent_spawn_target(self) -> (Self, Option<MuxPaneId>) {
+        match self {
+            Self::SpawnAgentBeside {
+                pane,
+                cols,
+                rows,
+                scrollback_lines,
+                agent_config_id,
+                command,
+                args,
+                env_plain,
+                env_secrets,
+                waiting_regex,
+                approval_regex,
+                error_regex,
+                done_regex,
+            } => (
+                Self::SpawnAgent {
+                    cols,
+                    rows,
+                    scrollback_lines,
+                    agent_config_id,
+                    command,
+                    args,
+                    env_plain,
+                    env_secrets,
+                    waiting_regex,
+                    approval_regex,
+                    error_regex,
+                    done_regex,
+                },
+                Some(pane),
+            ),
+            other => (other, None),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1532,6 +1693,61 @@ mod tests {
             error_regex: None,
             done_regex: None,
         }
+    }
+
+    #[test]
+    fn agent_right_split_preserves_launch_fields_and_wire_round_trips() {
+        let original = valid_agent_command();
+        assert_eq!(
+            postcard::to_allocvec(&original).unwrap()[0],
+            1,
+            "legacy SpawnAgent discriminant"
+        );
+        let target = MuxPaneId("anchor".to_owned());
+        let beside = original.clone().with_right_split(target.clone()).unwrap();
+        assert!(validate_host_command(&beside).is_ok());
+        let bytes = postcard::to_allocvec(&beside).unwrap();
+        assert_eq!(
+            bytes[0], 39,
+            "new variant must append after all 39 legacy commands"
+        );
+        let decoded: RuntimeCommand = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, beside);
+        let (launch, pane) = decoded.into_agent_spawn_target();
+        assert_eq!(pane, Some(target));
+        assert_eq!(launch, original);
+    }
+
+    #[test]
+    fn agent_right_split_validates_and_accounts_for_exact_target() {
+        for id in ["", "bad\nidentifier", &"x".repeat(MUX_ID_BYTES_MAX + 1)] {
+            let mut command = valid_agent_command()
+                .with_right_split(MuxPaneId(id.to_owned()))
+                .unwrap();
+            assert!(prepare_runtime_command_for_retention(&mut command).is_err());
+        }
+        let mut oversized_capacity = String::with_capacity(100_000);
+        oversized_capacity.push_str("anchor");
+        let mut command = valid_agent_command()
+            .with_right_split(MuxPaneId(oversized_capacity))
+            .unwrap();
+        assert!(runtime_command_retained_bytes(&command).unwrap() > 100_000);
+        let retained = prepare_runtime_command_for_retention(&mut command).unwrap();
+        assert!(retained.retained_bytes() < 1_000);
+        let RuntimeCommand::SpawnAgentBeside {
+            pane,
+            command: program,
+            ..
+        } = &mut command
+        else {
+            unreachable!()
+        };
+        assert_eq!(pane.0.capacity(), "anchor".len());
+        *program = "x".repeat(COMMAND_BYTES_MAX + 1);
+        assert!(
+            prepare_runtime_command_for_retention(&mut command).is_err(),
+            "split must preserve full launch validation"
+        );
     }
 
     #[test]
@@ -2284,6 +2500,7 @@ mod tests {
                 "ResizeTracked",
                 "WriteInputTracked",
                 "WriteInputBatchTracked",
+                "SpawnAgentBeside",
             ]
         );
     }

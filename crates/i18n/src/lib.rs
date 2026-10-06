@@ -41,6 +41,17 @@ impl Catalog {
         interpolate(template, args)
     }
 
+    /// Localized templates for indexing visible settings text. The fallback catalog owns the
+    /// complete key set; an optional locale contributes values where present.
+    pub fn entries(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.fallback.iter().map(|(key, fallback)| {
+            (
+                key.as_str(),
+                self.primary.get(key).unwrap_or(fallback).as_str(),
+            )
+        })
+    }
+
     pub fn loaded_locale_count(&self) -> usize {
         if self.locale == FALLBACK_LOCALE { 1 } else { 2 }
     }

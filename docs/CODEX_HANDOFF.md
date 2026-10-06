@@ -6367,3 +6367,18 @@ User correction asked to implement the automatic MCP button, rather than leave i
 - Failed approaches: none in this research phase. Official vendor documents were checked via web search; no hosted Grokbot account or alternate tunnel was connected, so their end-to-end latency/compatibility is unmeasured.
 - Remaining work: report researched options and recommend a direction. Do not implement a managed gateway or restart the user app without a new task. PR #204 remains open and stacked on #203.
 - Exact next commands: `cd /Users/jr/Desktop/projects/deppy-sijo-performance`; `git status --short`; `git log -3 --oneline`; `rg -n 'PRODUCTION_RELAY_ENDPOINT' crates/web-remote/src/relay_client/lifecycle.rs`; inspect PR #204 checks if further source changes are requested. Preserve running 0.2.4 PID14179; 0.2.5 is built separately.
+# 2026-10-06 설정 검색·세션 경로 등록 리뷰 수정 진행
+
+- 현재 목표: 직전 코드 리뷰의 세 건(검색 결과가 설정 행을 드러내지 않음, 닫힌 대화상자 문구 색인, 세션 cwd 배너 등록 실패 무표시)을 수정한다. 작업 위치는 `/Users/jr/Desktop/projects/deppy-sijo-performance`, HEAD `b8c370af`, 브랜치 `feat/audit-nine-pr-v0.6.0-20261004`다. 앱 재실행은 이번 요청에 없으므로 금지한다.
+- 검색 RCA: 결과가 `(Category, title)`만 보존했고 클릭 시 카테고리만 바꿨다. 결과 키를 보존하고 인라인 설정의 부모 행을 찾아 `scroll_to_rect_animation`으로 표시하도록 변경했다. 페이지/섹션/행 앵커를 연결했다. 자격증명은 보이는 기본 설정 키만 색인하고 `*_confirm` 대화상자 문구를 제외했다.
+- 배너 RCA: `등록` 클릭 순간 배너를 지웠으며 `SelectInSettings` 오류는 로그만 남겼다. 배너를 실제 결과까지 유지하고 요청 경로를 별도로 추적한다. 실패 시 기존 현지화 오류와 재시도 버튼을 같은 배너에 표시하고, 성공 시 해당 경로 배너만 닫는다. 재연결 확인 취소 시 대기 상태를 해제한다.
+- 수정 파일: `crates/app/src/ui/settings.rs`, `crates/app/src/app.rs`, 이 handoff. 설계/모달 표시는 변경하지 않았고 `docs/design/popup-components.md` 및 HTML 사례43의 취소 계약을 확인했다.
+- 테스트 실제 결과: 신규 검색 결과 대상 테스트 RED 0PASS/1FAIL(대상 상태 None), 닫힌 확인창 색인 테스트 RED 0PASS/1FAIL(검색 결과 존재), 추가 `env.project_close_confirm` 확장 RED 0PASS/1FAIL. 수정 후 `설정_검색` 7PASS/0FAIL(실제 긴 페이지 스크롤 테스트 포함), `세션_경로_등록_실패` 1PASS/0FAIL. 중간 컴파일 한 번 실패(E0308, 카테고리 참조 역참조 누락)했고 수정 후 통과했다. 전체 회귀/Clippy/fmt는 아직 실행하지 않았다.
+- 남음: 현재 diff 정밀 검토와 오류 경계 점검, 집중 테스트 재확인, 완전 App 테스트 및 strict Clippy/boundary/fmt, 이후 handoff 완료 기록. 릴리스 번들/버전 변경/앱 재실행은 이번 요청 범위에 없다.
+- 다음 정확한 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-performance`; `git diff --check`; `python3 /private/tmp/deppy-audit-nine-pr-20261004/cargo_gate.py test --offline --locked -p deppy-sijo --bin deppy-sijo 세션_경로_등록_실패 -- --test-threads=1`; `python3 /private/tmp/deppy-audit-nine-pr-20261004/cargo_gate.py test --offline --locked -p deppy-sijo --bin deppy-sijo -- --test-threads=1`. Cargo는 계속 같은 gate를 사용하고 실행 중 Rust 파일을 수정하지 않는다.
+
+## 완료 확인
+
+- 최종 소스 검증: App 전체 `2768 passed; 0 failed; 31 ignored` (67.10초). 같은 batch의 strict App all-target Clippy `-D warnings`, `xtask check-boundary`, `cargo fmt --all -- --check` 모두 exit0. 이후 등록 대기 중 다른 배너 동작만 비활성화하고 `cargo fmt --all` 후 검색 집중7PASS, 배너 결과1PASS, strict Clippy, fmtcheck를 재실행해 모두 exit0. `git diff --check` exit0. 전체 앱은 이 마지막 버튼 비활성화 한 줄 뒤 다시 실행하지 않았다.
+- 최종 결정: 검색 결과 키를 보존하고 인라인 설정의 부모 행·섹션으로 즉시 스크롤한다. 닫힌 확인창 문구는 결과에서 제외한다. 관리/모니터 카테고리는 기존 카테고리 탐색 계약을 유지하며, 동적 데이터/편집창의 모든 필드까지 자동 확장하는 기능은 추가하지 않았다. 세션 cwd 등록 배너는 요청 경로가 일치하는 결과만 받아 실패 문구와 재시도를 유지한다.
+- 남은 요청 작업: 없음. 제품 코드 커밋 `0b191c03`(`fix(settings): 검색 위치와 세션 경로 등록 오류 보완`)에 `crates/app/src/app.rs`, `crates/app/src/ui/settings.rs`를 포함했다. 이 인계는 별도 문서 커밋에 포함한다. 제품 번들·버전 bump·앱 launch/restart는 수행하지 않았다. 다음 에이전트의 정확한 읽기 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-performance`; `git status --short --branch`; `git log -3 --oneline`; `git show --stat 0b191c03`. 앱 재실행은 새 명시 요청이 있어야 한다.

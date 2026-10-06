@@ -10339,6 +10339,7 @@ pub struct App {
     last_hook_query: std::time::Instant,
     hook_overrides:
         std::collections::HashMap<runtime::SessionId, crate::agent_detect::AgentBinding>,
+    hook_task_prompts: std::collections::HashMap<runtime::SessionId, (String, String)>,
     /// 마지막으로 DB에 저장한 pane_id → row — 차등 upsert/delete 및 churn 방지용.
     persisted_agents: std::collections::HashMap<String, storage::AgentSessionRow>,
     /// Durable sessions.id → archived agent identity/native resume token. Runtime-local SessionId
@@ -10742,6 +10743,19 @@ fn shared_agent_transcript_sessions(
         }
     }
     shared
+}
+
+fn trusted_pane_task_prompt<'a>(
+    session: runtime::SessionId,
+    bindings: &std::collections::HashMap<runtime::SessionId, crate::agent_detect::AgentBinding>,
+    prompts: &'a std::collections::HashMap<runtime::SessionId, (String, String)>,
+) -> Option<&'a str> {
+    let binding = bindings.get(&session)?;
+    let (native_id, prompt) = prompts.get(&session)?;
+    (binding.kind == crate::agent_detect::AgentKind::Claude
+        && binding.session_id == *native_id
+        && !prompt.is_empty())
+    .then_some(prompt.as_str())
 }
 
 /// 저장된 동일 Claude 대화를 둘 이상의 pane이 복원하면 첫 pane만 원본 ID를
@@ -16274,6 +16288,7 @@ impl App {
             }),
             last_hook_query: std::time::Instant::now(),
             hook_overrides: std::collections::HashMap::new(),
+            hook_task_prompts: std::collections::HashMap::new(),
             persisted_agents: std::collections::HashMap::new(),
             archived_agent_resume: std::collections::HashMap::new(),
             agent_needs_input: std::collections::HashSet::new(),
@@ -17911,6 +17926,16 @@ impl App {
                         ))
                     })
                     .collect();
+                self.hook_task_prompts = snapshot
+                    .hook_sessions
+                    .iter()
+                    .filter_map(|row| {
+                        Some((
+                            session_id(&row.session_key)?,
+                            (row.agent_session_id.clone(), row.task_prompt.clone()?),
+                        ))
+                    })
+                    .collect();
                 // statuslines는 (runtime_instance, SessionId)로 네임스페이스돼 있어(위
                 // agent_info 필드 주석) 전체 교체가 아니라 현재 active instance 몫만
                 // 갈아끼운다 — 통째로 교체하면 warm으로 물러난 다른 workspace의 보존값이
@@ -18493,6 +18518,7 @@ impl App {
             agent_hook_query_due(sessions.len(), self.last_hook_query.elapsed());
         if sessions.is_empty() {
             self.hook_overrides.clear();
+            self.hook_task_prompts.clear();
             // 활성 instance 몫만 지운다 — 통째 clear는 warm 워크스페이스의 보존값을 지운다.
             let instance = self.active.runtime_instance;
             self.statuslines.retain(|(rt, _), _| *rt != instance);
@@ -18753,6 +18779,11 @@ impl App {
             if let Some(display) = merged.get_mut(&session) {
                 display.last_agent_summary = None;
                 display.user_instruction = None;
+                if let Some(prompt) =
+                    trusted_pane_task_prompt(session, &self.agent_bindings, &self.hook_task_prompts)
+                {
+                    display.user_instruction = Some(prompt.to_owned());
+                }
             }
         }
         self.active.workspace_ui.set_agent_info(merged);
@@ -23898,6 +23929,7 @@ impl App {
 
         // 현재 활성을 Warm으로 내리고 warm 풀에 보관 (워커·세션 계속 실행).
         let mut old = std::mem::replace(&mut self.active, new_active);
+        self.hook_task_prompts.clear();
         switch_cross_workspace_pane_layout(
             &old.id,
             &self.active.id,
@@ -33196,10 +33228,15 @@ impl eframe::App for App {
         let shared_transcripts = shared_agent_transcript_sessions(&self.agent_bindings);
         let mut shared_ordinal = 0usize;
         for entry in &mut terminal_sessions {
-            if entry
-                .session
-                .is_some_and(|session| shared_transcripts.contains(&session))
-                && !entry.title_is_custom
+            if entry.session.is_some_and(|session| {
+                shared_transcripts.contains(&session)
+                    && trusted_pane_task_prompt(
+                        session,
+                        &self.agent_bindings,
+                        &self.hook_task_prompts,
+                    )
+                    .is_none()
+            }) && !entry.title_is_custom
             {
                 shared_ordinal += 1;
                 entry.status_line = Some(format!("{} · {}", entry.title, shared_ordinal));
@@ -42962,6 +42999,32 @@ mod tests {
         assert_eq!(
             shared_agent_transcript_sessions(&bindings),
             std::collections::HashSet::from([runtime::SessionId(1), runtime::SessionId(2)])
+        );
+        let prompts = HashMap::from([
+            (
+                runtime::SessionId(1),
+                ("same".to_owned(), "첫 pane 작업".to_owned()),
+            ),
+            (
+                runtime::SessionId(2),
+                ("same".to_owned(), "둘째 pane 작업".to_owned()),
+            ),
+            (
+                runtime::SessionId(3),
+                ("old".to_owned(), "이전 작업".to_owned()),
+            ),
+        ]);
+        assert_eq!(
+            trusted_pane_task_prompt(runtime::SessionId(1), &bindings, &prompts),
+            Some("첫 pane 작업")
+        );
+        assert_eq!(
+            trusted_pane_task_prompt(runtime::SessionId(2), &bindings, &prompts),
+            Some("둘째 pane 작업")
+        );
+        assert_eq!(
+            trusted_pane_task_prompt(runtime::SessionId(3), &bindings, &prompts),
+            None
         );
     }
 

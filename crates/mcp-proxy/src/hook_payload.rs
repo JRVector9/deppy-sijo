@@ -15,6 +15,7 @@ enum Shape {
     Message,
     Item,
     List,
+    Preview,
 }
 
 impl<'de> DeserializeSeed<'de> for Shape {
@@ -37,6 +38,23 @@ impl<'de> Visitor<'de> for Shape {
     }
 
     fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Value, E> {
+        if matches!(self, Self::Preview) {
+            let mut preview = String::new();
+            for c in value.chars() {
+                let c = if c.is_whitespace() || c.is_control() {
+                    ' '
+                } else {
+                    c
+                };
+                if preview.len() + c.len_utf8() > 256 {
+                    break;
+                }
+                if c != ' ' || (!preview.is_empty() && !preview.ends_with(' ')) {
+                    preview.push(c);
+                }
+            }
+            return Ok(Value::String(preview.trim().to_owned()));
+        }
         // 알림 문구와 식별자는 별도 상한을 둔다. 너무 큰 값은 상태에 넣지 않는다.
         Ok(if value.len() <= 4096 {
             Value::String(value.into())
@@ -63,6 +81,7 @@ impl<'de> Visitor<'de> for Shape {
                 continue;
             }
             let child = match (self, key.as_str()) {
+                (Self::Hook, "prompt") => Some(Self::Preview),
                 (Self::Hook, "tool_calls") | (Self::Message, "content") => Some(Self::List),
                 (Self::Transcript, "message") => Some(Self::Message),
                 (
@@ -287,5 +306,20 @@ mod tests {
         let raw = json!({"tool_response":"x".repeat(INPUT_BYTES_MAX as usize),"session_id":"s"})
             .to_string();
         assert!(read(raw.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn 사용자_입력_hook은_긴_본문에서_짧은_작업_미리보기만_남긴다() {
+        let raw = json!({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "shared-native",
+            "prompt": format!("  서로 다른 작업\n{}", "가".repeat(5000)),
+        })
+        .to_string();
+        let parsed = read(raw.as_bytes()).unwrap();
+        let preview = parsed["prompt"].as_str().unwrap();
+        assert!(preview.starts_with("서로 다른 작업 "));
+        assert!(preview.len() <= 256);
+        assert!(!preview.contains('\n'));
     }
 }

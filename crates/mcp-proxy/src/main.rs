@@ -374,6 +374,12 @@ fn run_hooks(args: &[String]) -> anyhow::Result<()> {
                 };
                 let _ = db.upsert_hook_session(&session_key, kind, sid, path);
             }
+            if event == "observe"
+                && v.get("hook_event_name").and_then(|x| x.as_str()) == Some("UserPromptSubmit")
+                && let (Some(sid), Some(prompt)) = (sid, v.get("prompt").and_then(|x| x.as_str()))
+            {
+                let _ = db.record_hook_task_prompt(&session_key, sid, prompt);
+            }
         }
     }
     Ok(())

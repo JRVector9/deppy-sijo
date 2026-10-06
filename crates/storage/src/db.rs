@@ -890,6 +890,11 @@ CREATE INDEX idx_relay_devices_recency
        WHEN attention_json IS NOT NULL AND attention_revision/1000000=idle_since
          THEN attention_revision ELSE idle_since*1000000 END
      WHERE idle_since IS NOT NULL;",
+    // A Claude hook runs inside one pane even when two processes resume the same native ID.
+    // Keep only a bounded task prompt per pane; transcript summaries cannot distinguish them.
+    "ALTER TABLE agent_hook_sessions ADD COLUMN task_prompt TEXT
+       CHECK(task_prompt IS NULL OR (typeof(task_prompt)='text'
+         AND length(CAST(task_prompt AS BLOB)) <= 256));",
 ];
 
 /// 옵션2: 저장된 에이전트 세션 한 행 — 재시작 복원 시 native resume에 쓴다.
@@ -1831,7 +1836,8 @@ const HOOK_SESSIONS_PREFIX_PREFLIGHT: &str = "WITH selected AS MATERIALIZED (
 ), sized AS MATERIALIZED (
     SELECT hook.*, length(CAST(hook.session_key AS BLOB)) + length(CAST(hook.kind AS BLOB))
          + length(CAST(hook.agent_session_id AS BLOB))
-         + length(CAST(hook.transcript_path AS BLOB)) AS row_bytes
+         + length(CAST(hook.transcript_path AS BLOB))
+         + COALESCE(length(CAST(hook.task_prompt AS BLOB)), 0) AS row_bytes
       FROM selected JOIN agent_hook_sessions hook ON hook.rowid = selected.rowid
 )
 SELECT COUNT(*), COALESCE(SUM(CASE WHEN
@@ -1840,10 +1846,12 @@ SELECT COUNT(*), COALESCE(SUM(CASE WHEN
     OR typeof(agent_session_id) != 'text'
        OR length(CAST(agent_session_id AS BLOB)) NOT BETWEEN 1 AND ?3
     OR typeof(transcript_path) != 'text' OR length(CAST(transcript_path AS BLOB)) > ?4
+    OR (task_prompt IS NOT NULL AND (typeof(task_prompt) != 'text'
+       OR length(CAST(task_prompt AS BLOB)) > 256))
     OR typeof(updated_at) != 'integer' OR row_bytes > ?5 THEN 1 ELSE 0 END), 0),
     COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0) FROM sized";
 const HOOK_SESSIONS_PREFIX_SELECT: &str =
-    "SELECT session_key, kind, agent_session_id, transcript_path
+    "SELECT session_key, kind, agent_session_id, transcript_path, task_prompt
     FROM agent_hook_sessions
     WHERE updated_at > ?4 - 86400
       AND substr(CAST(session_key AS BLOB), 1, length(CAST(?1 AS BLOB))) = CAST(?1 AS BLOB)
@@ -3295,6 +3303,7 @@ pub struct HookSessionRow {
     pub kind: String,
     pub agent_session_id: String,
     pub transcript_path: String,
+    pub task_prompt: Option<String>,
 }
 
 /// claude statusLine 표시 정보 한 행 (v17).
@@ -7569,9 +7578,18 @@ impl Db {
         let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
             .map_err(|_| anyhow::anyhow!(BOUNDED_WRITE_FAILED))?;
         tx.execute(
-            "INSERT OR REPLACE INTO agent_hook_sessions
+            "INSERT INTO agent_hook_sessions
                  (session_key, kind, agent_session_id, transcript_path, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, CAST(strftime('%s','now') AS INTEGER))",
+                 VALUES (?1, ?2, ?3, ?4, CAST(strftime('%s','now') AS INTEGER))
+                 ON CONFLICT(session_key) DO UPDATE SET
+                   task_prompt = CASE
+                     WHEN agent_hook_sessions.kind = excluded.kind
+                      AND agent_hook_sessions.agent_session_id = excluded.agent_session_id
+                     THEN agent_hook_sessions.task_prompt ELSE NULL END,
+                   kind = excluded.kind,
+                   agent_session_id = excluded.agent_session_id,
+                   transcript_path = excluded.transcript_path,
+                   updated_at = excluded.updated_at",
             rusqlite::params![session_key, kind, agent_session_id, transcript_path],
         )
         .map_err(|_| anyhow::anyhow!(BOUNDED_WRITE_FAILED))?;
@@ -7587,10 +7605,32 @@ impl Db {
         Ok(())
     }
 
+    /// Store only the prompt observed by this pane's Claude hook, never by shared transcript ID.
+    pub fn record_hook_task_prompt(
+        &self,
+        session_key: &str,
+        agent_session_id: &str,
+        prompt: &str,
+    ) -> anyhow::Result<()> {
+        bounded_session_key_prefix(session_key)?;
+        anyhow::ensure!(
+            bounded_id_is_valid(agent_session_id)
+                && !prompt.is_empty()
+                && bounded_text_is_valid(prompt, 256),
+            BOUNDED_WRITE_INPUT_INVALID
+        );
+        self.conn.execute(
+            "UPDATE agent_hook_sessions SET task_prompt = ?3
+             WHERE session_key = ?1 AND kind = 'claude' AND agent_session_id = ?2",
+            rusqlite::params![session_key, agent_session_id, prompt],
+        )?;
+        Ok(())
+    }
+
     /// hook이 보고한 바인딩 목록 (최근 24h — 죽은 세션 행이 영원히 남지 않게).
     pub fn list_hook_sessions(&self) -> anyhow::Result<Vec<HookSessionRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT session_key, kind, agent_session_id, transcript_path FROM agent_hook_sessions
+            "SELECT session_key, kind, agent_session_id, transcript_path, task_prompt FROM agent_hook_sessions
              WHERE updated_at > strftime('%s','now') - 86400",
         )?;
         let rows = stmt
@@ -7600,6 +7640,7 @@ impl Db {
                     kind: r.get(1)?,
                     agent_session_id: r.get(2)?,
                     transcript_path: r.get(3)?,
+                    task_prompt: r.get(4)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -7669,6 +7710,7 @@ impl Db {
                         false,
                     )?
                     .to_owned(),
+                    task_prompt: bounded_optional_text(row, 4, 256)?.map(str::to_owned),
                 });
             }
         }
@@ -8692,6 +8734,7 @@ impl Db {
                         false,
                     )?
                     .to_owned(),
+                    task_prompt: bounded_optional_text(row, 4, 256)?.map(str::to_owned),
                 });
             }
             result
@@ -15083,6 +15126,47 @@ mod tests {
     }
 
     #[test]
+    fn 같은_native_id를_공유해도_hook_작업_입력은_pane별로_분리된다() {
+        let db = Db::open_in_memory().unwrap();
+        let workspace = db.create_workspace("hook-prompts").unwrap();
+        let first = format!("{workspace}:1");
+        let second = format!("{workspace}:2");
+        for key in [&first, &second] {
+            db.upsert_hook_session(key, "claude", "shared", "/tmp/shared.jsonl")
+                .unwrap();
+        }
+        db.record_hook_task_prompt(&first, "shared", "첫 작업")
+            .unwrap();
+        db.record_hook_task_prompt(&second, "shared", "둘째 작업")
+            .unwrap();
+        // 일반 hook 갱신은 현재 pane의 미리보기를 지우지 않는다.
+        db.upsert_hook_session(&first, "claude", "shared", "/tmp/shared.jsonl")
+            .unwrap();
+        let rows = db
+            .list_hook_sessions_for_prefix_bounded(&format!("{workspace}:"), 2)
+            .unwrap();
+        let by_key: std::collections::HashMap<_, _> = rows
+            .iter()
+            .map(|row| (row.session_key.as_str(), row.task_prompt.as_deref()))
+            .collect();
+        assert_eq!(by_key[first.as_str()], Some("첫 작업"));
+        assert_eq!(by_key[second.as_str()], Some("둘째 작업"));
+        // 과거 ID가 보낸 지연 hook은 새 바인딩의 작업 제목을 다시 덮을 수 없다.
+        db.upsert_hook_session(&first, "claude", "forked", "/tmp/forked.jsonl")
+            .unwrap();
+        db.record_hook_task_prompt(&first, "shared", "오래된 작업")
+            .unwrap();
+        let first_row = db
+            .list_hook_sessions()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.session_key == first)
+            .unwrap();
+        assert_eq!(first_row.agent_session_id, "forked");
+        assert_eq!(first_row.task_prompt, None);
+    }
+
+    #[test]
     fn agent_state_projection_legacy_default는_기존section을모두요청한다() {
         let job = AgentStateJob::projection("legacy-workspace");
         assert!(job.include_hook_status);
@@ -16313,6 +16397,7 @@ mod tests {
                 kind: marker.to_owned(),
                 agent_session_id: marker.to_owned(),
                 transcript_path: marker.to_owned(),
+                task_prompt: Some(marker.to_owned()),
             }],
             statuslines: vec![StatuslineRow {
                 session_key: marker.to_owned(),
@@ -16358,7 +16443,11 @@ mod tests {
     #[test]
     fn fleet_wait_migration_restores_only_proven_modern_completions() {
         let conn = Connection::open_in_memory().unwrap();
-        for sql in &MIGRATIONS[..MIGRATIONS.len() - 2] {
+        let idle_migration = MIGRATIONS
+            .iter()
+            .position(|sql| sql.contains("ADD COLUMN idle_since"))
+            .unwrap();
+        for sql in &MIGRATIONS[..idle_migration] {
             conn.execute_batch(sql).unwrap();
         }
         let complete =
@@ -16378,7 +16467,7 @@ mod tests {
         ] {
             conn.execute("INSERT INTO agent_needs_input(session_key,waiting,working,turn_done,updated_at,attention_json,attention_revision) VALUES(?1,0,0,0,1,?2,?3)",rusqlite::params![key,json,revision]).unwrap();
         }
-        for migration in &MIGRATIONS[MIGRATIONS.len() - 2..] {
+        for migration in &MIGRATIONS[idle_migration..] {
             conn.execute_batch(migration).unwrap();
         }
         for (key, expected) in [

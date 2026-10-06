@@ -81,9 +81,19 @@ fn dotenv_gate_classifies_every_process_capable_runtime_variant() {
     let body = function_body(production_source(), "runtime_command_requires_dotenv");
     for variant in ["SpawnShell", "SpawnAgent", "SplitPane", "RestoreWorkspace"] {
         let pattern = format!("RuntimeCommand::{variant}");
+        // `SpawnAgent`는 `SpawnAgentBeside`의 접두사다. 식별자 끝까지 대조해야
+        // 정상 분기를 중복으로 세는 거짓 실패를 피할 수 있다.
+        let count = body
+            .match_indices(&pattern)
+            .filter(|(offset, _)| {
+                body[offset + pattern.len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(|next| !next.is_ascii_alphanumeric() && next != '_')
+            })
+            .count();
         assert_eq!(
-            body.matches(&pattern).count(),
-            1,
+            count, 1,
             "dotenv launch classifier must contain {pattern} exactly once"
         );
     }

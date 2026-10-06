@@ -1,8 +1,8 @@
 //! 세션(셸)의 프로세스 트리에서 실행 중인 claude/codex/grok을 감지하고 transcript로 바인딩한다
 //! (옵션2 Phase 2). 셸 pid → 자손 프로세스 → 에이전트 식별:
 //!
-//! - **claude**: 프로세스 argv에 `--session-id <uuid>`가 있어 **결정적**으로 세션ID를 얻는다.
-//!   → `~/.claude/projects/*/<session-id>.jsonl` transcript로 직결(같은 cwd 다중 실행도 안 겹침).
+//! - **claude**: argv의 `--session-id`/`--resume` 또는 pane별 hook에서 세션ID를 얻는다.
+//!   cwd의 최신 파일은 같은 폴더의 다른 대화일 수 있으므로 바인딩 근거로 쓰지 않는다.
 //! - **codex**: argv에 세션ID가 없어 프로세스 cwd(lsof)로 rollout(session_meta.cwd)을 매칭한다.
 //! - **grok**: `active_sessions.json`의 pid를 우선하고, 없으면 cwd의 최신 세션으로 제한해 매칭한다.
 //!
@@ -312,8 +312,8 @@ struct CacheEntry {
 const FASTPATH_FULL_SCAN_INTERVAL: Duration = Duration::from_secs(30);
 
 /// 휴리스틱(비결정적) 바인딩이 배치에 하나라도 섞이면 안전망 대신 이 주기를 쓴다.
-/// 결정적 승격(`codex_open_rollout`)과 Claude 휴리스틱의 자기교정(다음 전체 탐색에서 더
-/// 정확한 transcript로 재바인딩)이 수 초 안에 여전히 일어나야 하기 때문이다 — 30초까지
+/// 결정적 승격(`codex_open_rollout`)과 cwd 휴리스틱의 재검증이 수 초 안에
+/// 여전히 일어나야 하기 때문이다 — 30초까지
 /// 굶기면 반응성 계약이 깨진다. owner pid 생존 확인 자체는 결정성과 무관하게 유효하므로
 /// (같은 pane에서 에이전트가 교체되면 owner 프로세스가 죽는 사건이라 즉시 잡힌다) 휴리스틱
 /// 항목을 fast path에서 통째로 뺄 필요는 없고, "승격/자기교정 시도" 빈도만 이 주기로
@@ -593,6 +593,10 @@ pub fn detect_cached(
         if let Some(b) = overrides.get(sid)
             && valid_binding(b)
             && let Some(owner) = find_agent_pid(*shell_pid, rows, b.kind)
+            && rows
+                .iter()
+                .find(|row| row.pid == owner)
+                .is_some_and(|row| hook_binding_matches_command(b, &row.command))
         {
             let running = kinds.get(sid).filter(|r| r.kind == b.kind);
             cache.entries.insert(
@@ -854,21 +858,51 @@ fn classify(command: &str) -> Option<(AgentKind, Option<String>)> {
     None
 }
 
-/// claude argv의 `--session-id <uuid>` 추출.
+/// Claude argv의 정확한 대화 ID. `--fork-session`은 resume 대상에서 새 ID를 만들므로
+/// 원본 ID로 바인딩하지 않는다. 새 ID는 pane별 hook이 보고한 뒤 확정한다.
 fn claude_session_id(command: &str) -> Option<String> {
+    if command
+        .split_whitespace()
+        .any(|token| token == "--fork-session")
+    {
+        return None;
+    }
+    claude_command_session_id(command)
+}
+
+fn claude_command_session_id(command: &str) -> Option<String> {
     let mut it = command.split_whitespace();
     while let Some(tok) = it.next() {
-        if tok == "--session-id" {
+        if matches!(tok, "--session-id" | "--resume" | "-r") {
             return it
                 .next()
                 .filter(|value| valid_session_id(value))
                 .map(str::to_owned);
         }
-        if let Some(v) = tok.strip_prefix("--session-id=") {
+        if let Some(v) = tok
+            .strip_prefix("--session-id=")
+            .or_else(|| tok.strip_prefix("--resume="))
+        {
             return valid_session_id(v).then(|| v.to_owned());
         }
     }
     None
+}
+
+/// hook 레코드는 pane에 남아 있어도 그 pane의 Claude 프로세스는 새 대화로 바뀔 수 있다.
+/// 명시적 resume ID와 다르거나 fork의 원본 ID인 오래된 hook은 새 프로세스에 적용하지 않는다.
+fn hook_binding_matches_command(binding: &AgentBinding, command: &str) -> bool {
+    if binding.kind != AgentKind::Claude {
+        return true;
+    }
+    let declared = claude_command_session_id(command);
+    if command
+        .split_whitespace()
+        .any(|token| token == "--fork-session")
+    {
+        return declared.as_deref() != Some(binding.session_id.as_str());
+    }
+    declared.is_none_or(|id| id == binding.session_id)
 }
 
 fn valid_session_id(value: &str) -> bool {
@@ -927,7 +961,7 @@ fn valid_binding(binding: &AgentBinding) -> bool {
 }
 
 /// 감지된 에이전트를 실제 transcript 파일로 확정한다. 두 번째 반환값 = 결정적 여부:
-/// argv 세션ID(claude)·lsof 열린 파일(codex)은 결정적, cwd 매칭은 휴리스틱(오바인딩 가능 —
+/// argv 세션ID(Claude)·lsof 열린 파일(Codex)은 결정적, 일부 provider의 cwd 매칭은 휴리스틱(오바인딩 가능 —
 /// 2026-07-07 실증: 프로세스 cwd(/Users)와 rollout 기록 cwd(arteawiki)가 다르거나, 같은
 /// cwd 다중 세션이 최신 쪽으로 모임). find_agent가 결정적 후보를 우선한다.
 fn bind_transcript(
@@ -969,7 +1003,9 @@ fn bind_transcript(
             ))
         }
         AgentKind::Claude => {
-            // 1순위: argv --session-id (결정적 — cmux/자동화 실행 케이스).
+            // argv의 명시적 ID만 사용한다. 같은 cwd의 최신 mtime transcript는
+            // 다른 pane의 대화일 수 있어 요약과 다음 실행의 --resume까지 오염시킨다.
+            // 인자 없는 직접 실행은 pane별 hook이 ID를 보고할 때까지 종류만 표시한다.
             if let Some(sid) = sid_hint {
                 let transcript = find_claude_transcript(&sid)?;
                 return Some((
@@ -981,20 +1017,7 @@ fn bind_transcript(
                     true,
                 ));
             }
-            // fallback: 손타이핑 `claude`(argv에 세션ID 없음 — 2026-07-07 실증)는 cwd의
-            // 프로젝트 디렉터리(~/.claude/projects/<escaped-cwd>/)에서 최신 mtime transcript.
-            // 이게 없으면 상태가 느린 화면 regex로만 잡혀 딜레이가 났다. 같은 cwd에 claude
-            // 2개면 최신 대화 쪽으로 모일 수 있는 한계는 codex cwd fallback과 동일.
-            let cwd = process_cwd(pid, budget)?;
-            let (session_id, transcript) = find_claude_transcript_by_cwd(&cwd)?;
-            Some((
-                AgentBinding {
-                    kind,
-                    session_id,
-                    transcript,
-                },
-                false,
-            ))
+            None
         }
         AgentKind::Codex => {
             // 1순위: 프로세스가 append 중인 rollout을 lsof로 직접 획득 — 결정적(스캔·상한·
@@ -1326,50 +1349,6 @@ pub fn kind_from_str(s: &str) -> Option<AgentKind> {
         "grok" => Some(AgentKind::Grok),
         _ => None,
     }
-}
-
-/// claude 프로젝트 디렉터리 이름 — cwd의 비영숫자를 전부 '-'로 치환한다
-/// (실증: `/Users/jr/Desktop/Projects/deppy/.claude/...` → `-Users-jr-Desktop-Projects-deppy--claude-...`).
-fn claude_project_dir_escape(cwd: &str) -> String {
-    cwd.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect()
-}
-
-/// cwd 기준으로 claude transcript를 찾는다 — 그 cwd의 프로젝트 디렉터리에서 최신 mtime
-/// jsonl(활성 대화가 append 중인 것). 파일명(stem) = 세션ID.
-fn find_claude_transcript_by_cwd(cwd: &str) -> Option<(String, PathBuf)> {
-    if !valid_absolute_path(cwd) {
-        return None;
-    }
-    let dir = crate::paths::home_dir()?
-        .join(".claude/projects")
-        .join(claude_project_dir_escape(cwd));
-    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
-    let mut entries = std::fs::read_dir(dir).ok()?;
-    for _ in 0..MAX_DIRECTORY_ENTRIES {
-        let Some(e) = entries.next() else { break };
-        let Ok(e) = e else { return None };
-        let p = e.path();
-        if e.file_type().ok().is_some_and(|kind| kind.is_file())
-            && p.extension().is_some_and(|x| x == "jsonl")
-            && let Ok(meta) = e.metadata()
-            && let Ok(mtime) = meta.modified()
-            && best.as_ref().is_none_or(|(bm, _)| mtime > *bm)
-        {
-            best = Some((mtime, p));
-        }
-    }
-    if entries.next().is_some() {
-        return None;
-    }
-    let (_, p) = best?;
-    let sid = p.file_stem()?.to_str()?;
-    if !valid_session_id(sid) {
-        return None;
-    }
-    let sid = sid.to_owned();
-    Some((sid, p))
 }
 
 /// 세션ID로 claude transcript를 찾는다 (`~/.claude/projects/*/<sid>.jsonl`).
@@ -3495,6 +3474,53 @@ mod tests {
     }
 
     #[test]
+    fn claude_resume_id_is_exact_but_forked_resume_is_not() {
+        assert_eq!(
+            claude_session_id(
+                "/Users/jr/.local/bin/claude --resume 113b810f-3b5b-4327-a139-064534e73547"
+            ),
+            Some("113b810f-3b5b-4327-a139-064534e73547".to_owned())
+        );
+        assert_eq!(
+            claude_session_id(
+                "/Users/jr/.local/bin/claude --fork-session --resume 113b810f-3b5b-4327-a139-064534e73547"
+            ),
+            None
+        );
+        assert!(
+            bind_transcript(
+                AgentKind::Claude,
+                None,
+                std::process::id(),
+                &mut DetectionBudget::default()
+            )
+            .is_none(),
+            "ID가 없는 Claude를 cwd의 마지막 대화에 연결하면 같은 폴더의 다른 pane을 오인한다"
+        );
+    }
+
+    #[test]
+    fn 오래된_claude_hook은_다른_resume이나_fork에_적용하지_않는다() {
+        let binding = AgentBinding {
+            kind: AgentKind::Claude,
+            session_id: "old-session".to_owned(),
+            transcript: PathBuf::from("/tmp/old-session.jsonl"),
+        };
+        assert!(!hook_binding_matches_command(
+            &binding,
+            "claude --resume other-session"
+        ));
+        assert!(!hook_binding_matches_command(
+            &binding,
+            "claude --fork-session --resume old-session"
+        ));
+        assert!(hook_binding_matches_command(
+            &binding,
+            "claude --resume old-session"
+        ));
+    }
+
+    #[test]
     fn classify_codex_node_wrapper() {
         let (kind, sid) = classify("node /opt/homebrew/bin/codex --enable hooks").unwrap();
         assert_eq!(kind, AgentKind::Codex);
@@ -3922,16 +3948,6 @@ mod tests {
         assert!(agent_pid_matches_kind(200, AgentKind::Claude, &rows));
         assert!(!agent_pid_matches_kind(200, AgentKind::Codex, &rows));
         assert!(!agent_pid_matches_kind(999, AgentKind::Claude, &rows));
-    }
-
-    #[test]
-    fn claude_project_dir_escape_비영숫자를_하이픈으로() {
-        assert_eq!(
-            claude_project_dir_escape("/Users/jr/Desktop/Projects/deppy-sijo"),
-            "-Users-jr-Desktop-Projects-deppy-sijo"
-        );
-        // dot도 '-' (실증: deppy/.claude → deppy--claude)
-        assert_eq!(claude_project_dir_escape("/a/b.c/d_e"), "-a-b-c-d-e");
     }
 
     /// 실제 머신의 claude/codex 프로세스를 감지해 transcript 바인딩까지 되는지 smoke-test.

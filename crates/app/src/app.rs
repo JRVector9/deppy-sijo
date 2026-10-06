@@ -10649,7 +10649,7 @@ type PtyAdjustWrites = Vec<Vec<u8>>;
 /// 종류만 먼저 뜬다(빈 줄보다 낫다).
 ///
 /// 이미 있는 항목은 덮지 않는다. transcript에서 온 model/effort/context가 더 풍부하다.
-/// 새 감지값에 **작업 설명이 비어 있으면 직전 값을 그대로 이어받는다**.
+/// 같은 native 대화의 새 감지값에 **작업 설명이 비어 있으면 직전 값을 그대로 이어받는다**.
 ///
 /// transcript 스캔은 최근 구간만 본다 — 에이전트가 말을 멈추고 대기 상태로 오래 있으면
 /// 그 구간에서 요약/지시가 사라져 `None`이 되고, 사이드바 활동 줄이 프로젝트 폴더명으로
@@ -10662,12 +10662,13 @@ type PtyAdjustWrites = Vec<Vec<u8>>;
 fn carry_forward_agent_activity(
     next: &mut crate::agent_detect::AgentDisplay,
     previous: &crate::agent_detect::AgentDisplay,
+    same_binding: bool,
 ) {
-    // **에이전트가 바뀌었으면 이어받지 않는다.** 에이전트가 끝나면 shim이 같은 pane에
+    // **대화 바인딩이나 에이전트가 바뀌었으면 이어받지 않는다.** 에이전트가 끝나면 shim이 같은 pane에
     // 폴백 셸을 얹으므로(wrap_agent_then_shell) SessionId가 그대로다 — 사용자가 그
     // 셸에서 다른 에이전트를 직접 띄우면 같은 키에 새 종류가 들어온다. 그때 이어받으면
     // **옛 에이전트가 한 말이 새 대화의 것처럼** 보인다(2026-08-19 코드 리뷰).
-    if next.kind != previous.kind {
+    if !same_binding || next.kind != previous.kind {
         return;
     }
     fn is_blank(value: &Option<String>) -> bool {
@@ -10724,6 +10725,40 @@ fn merge_detected_kinds(
         let display = display_for(kind, info.get(session), running);
         info.insert(*session, display);
     }
+}
+
+/// 하나의 native 대화를 여러 pane이 공유하면 transcript의 마지막 문장은 어느 pane의
+/// 작업인지 판별할 수 없다. 해당 pane들의 작업 설명을 공유 transcript에서 가져오지 않는다.
+fn shared_agent_transcript_sessions(
+    bindings: &std::collections::HashMap<runtime::SessionId, crate::agent_detect::AgentBinding>,
+) -> std::collections::HashSet<runtime::SessionId> {
+    let mut seen = std::collections::HashMap::new();
+    let mut shared = std::collections::HashSet::new();
+    for (session, binding) in bindings {
+        let key = (binding.kind, binding.session_id.as_str());
+        if let Some(previous) = seen.insert(key, *session) {
+            shared.insert(previous);
+            shared.insert(*session);
+        }
+    }
+    shared
+}
+
+/// 저장된 동일 Claude 대화를 둘 이상의 pane이 복원하면 첫 pane만 원본 ID를
+/// 유지하고 나머지는 `--fork-session`으로 독립시킨다. 이미 다른 pane에서 실행
+/// 중이면 pane 정렬 순서와 관계없이 새 복원 쪽을 fork한다.
+fn fork_shared_claude_resume(
+    target: &storage::AgentSessionIdentity,
+    saved: &std::collections::HashMap<String, storage::AgentSessionRow>,
+    other_running: bool,
+) -> bool {
+    target.kind == "claude"
+        && (other_running
+            || saved.values().any(|row| {
+                row.kind == target.kind
+                    && row.session_id == target.session_id
+                    && row.pane_id < target.pane_id
+            }))
 }
 
 /// agent_info/agent_kinds/statuslines(위 필드 주석)처럼 `(runtime_instance, K)`로
@@ -17014,8 +17049,13 @@ impl App {
         };
         let now = deppy_core::time::unix_secs_i64();
         let instance = self.active.runtime_instance;
+        let shared_transcripts = shared_agent_transcript_sessions(&self.agent_bindings);
         let mut rows = Vec::new();
         for (session, recent) in turns {
+            if shared_transcripts.contains(session) {
+                // 같은 native 파일의 턴은 어느 pane에서 시작했는지 알 수 없다.
+                continue;
+            }
             let Some(binding) = self.agent_bindings.get(session) else {
                 continue;
             };
@@ -17152,8 +17192,12 @@ impl App {
 
     fn stage_attention_work_history(&mut self) {
         let now = deppy_core::time::unix_secs_i64();
+        let shared_transcripts = shared_agent_transcript_sessions(&self.agent_bindings);
         let mut rows = Vec::new();
         for (session, binding) in &self.agent_bindings {
+            if shared_transcripts.contains(session) {
+                continue;
+            }
             let state = if self.agent_needs_input.contains(session) {
                 Some(storage::AgentWorkTurnState::Waiting)
             } else if self.agent_turn_done.contains_key(session) {
@@ -18190,7 +18234,18 @@ impl App {
                 .as_deref()
                 .map(|cwd| format!("cd {} && ", crate::agent_hooks::sh_quote(cwd)))
                 .unwrap_or_default();
+            let other_running = self.agent_bindings.iter().any(|(session, binding)| {
+                *session != result.session
+                    && binding.kind == crate::agent_detect::AgentKind::Claude
+                    && binding.session_id == result.identity.session_id
+            });
+            let fork_claude =
+                fork_shared_claude_resume(&result.identity, &self.restore_agents, other_running);
             let command = match result.identity.kind.as_str() {
+                "claude" if fork_claude => format!(
+                    "{cd_prefix}claude --fork-session --resume {}\n",
+                    result.identity.session_id
+                ),
                 "claude" => format!(
                     "{cd_prefix}claude --resume {}\n",
                     result.identity.session_id
@@ -18519,7 +18574,10 @@ impl App {
             });
             for (session, mut display) in info {
                 if let Some(previous) = self.agent_info.get(&(instance, session)) {
-                    carry_forward_agent_activity(&mut display, previous);
+                    let same_binding = latest_bindings.as_ref().is_none_or(|bindings| {
+                        bindings.get(&session) == self.agent_bindings.get(&session)
+                    });
+                    carry_forward_agent_activity(&mut display, previous, same_binding);
                 }
                 self.agent_info.insert((instance, session), display);
             }
@@ -18690,6 +18748,12 @@ impl App {
         merge_detected_kinds(&mut merged, &kinds_for_active, &self.agent_bindings);
         for (session, display) in merged.iter_mut() {
             apply_claude_statusline(display, self.statuslines.get(&(instance, *session)));
+        }
+        for session in shared_agent_transcript_sessions(&self.agent_bindings) {
+            if let Some(display) = merged.get_mut(&session) {
+                display.last_agent_summary = None;
+                display.user_instruction = None;
+            }
         }
         self.active.workspace_ui.set_agent_info(merged);
         self.active.workspace_ui.set_agent_executions(
@@ -33126,6 +33190,21 @@ impl eframe::App for App {
             &self.agent_turn_done,
             &self.agent_working,
         );
+        // 동일 native transcript를 공유하는 pane은 원문 마지막 응답을 어느 쪽의
+        // 작업인지 판별할 수 없다. 각 행에는 중복된 작업 문구 대신 고유한 pane 번호를
+        // 표시한다. 사용자 지정 제목은 session_headline이 그대로 우선한다.
+        let shared_transcripts = shared_agent_transcript_sessions(&self.agent_bindings);
+        let mut shared_ordinal = 0usize;
+        for entry in &mut terminal_sessions {
+            if entry
+                .session
+                .is_some_and(|session| shared_transcripts.contains(&session))
+                && !entry.title_is_custom
+            {
+                shared_ordinal += 1;
+                entry.status_line = Some(format!("{} · {}", entry.title, shared_ordinal));
+            }
+        }
         // 저장된 에이전트가 있고 지금 실행 중이 아닌 pane — 컨텍스트 메뉴 '이어가기' 노출.
         for entry in &mut terminal_sessions {
             entry.resumable = entry.agent_line.is_none()
@@ -41063,7 +41142,7 @@ mod tests {
         let previous = display_with(Some("PR #124 코드 리뷰 완료"), Some("PR #124를 검토해"));
         let mut next = display_with(None, None);
 
-        carry_forward_agent_activity(&mut next, &previous);
+        carry_forward_agent_activity(&mut next, &previous, true);
 
         assert_eq!(
             next.last_agent_summary.as_deref(),
@@ -41072,13 +41151,24 @@ mod tests {
         assert_eq!(next.user_instruction.as_deref(), Some("PR #124를 검토해"));
     }
 
+    #[test]
+    fn 같은_종류여도_대화_바인딩이_바뀌면_이전_작업설명을_이어받지_않는다() {
+        let previous = display_with(Some("이전 대화 응답"), Some("이전 대화 지시"));
+        let mut next = display_with(None, None);
+
+        carry_forward_agent_activity(&mut next, &previous, false);
+
+        assert!(next.last_agent_summary.is_none());
+        assert!(next.user_instruction.is_none());
+    }
+
     /// 공백만 있는 값도 "비었다"로 본다 — 그러지 않으면 빈 줄이 옛 문구를 덮는다.
     #[test]
     fn 공백뿐인_감지값도_직전_값을_이어받는다() {
         let previous = display_with(Some("이전 작업"), None);
         let mut next = display_with(Some("   "), None);
 
-        carry_forward_agent_activity(&mut next, &previous);
+        carry_forward_agent_activity(&mut next, &previous, true);
 
         assert_eq!(next.last_agent_summary.as_deref(), Some("이전 작업"));
     }
@@ -41089,7 +41179,7 @@ mod tests {
         let previous = display_with(Some("옛 작업"), Some("옛 지시"));
         let mut next = display_with(Some("새 작업"), Some("새 지시"));
 
-        carry_forward_agent_activity(&mut next, &previous);
+        carry_forward_agent_activity(&mut next, &previous, true);
 
         assert_eq!(next.last_agent_summary.as_deref(), Some("새 작업"));
         assert_eq!(next.user_instruction.as_deref(), Some("새 지시"));
@@ -41105,7 +41195,7 @@ mod tests {
             ..display_with(None, None)
         };
 
-        carry_forward_agent_activity(&mut next, &previous);
+        carry_forward_agent_activity(&mut next, &previous, true);
 
         assert!(
             next.last_agent_summary.is_none(),
@@ -41126,7 +41216,7 @@ mod tests {
             ..display_with(None, None)
         };
 
-        carry_forward_agent_activity(&mut next, &previous);
+        carry_forward_agent_activity(&mut next, &previous, true);
 
         assert!(next.model.is_none(), "모델은 이어받지 않는다");
         assert!(next.effort.is_none(), "추론 강도는 이어받지 않는다");
@@ -42851,6 +42941,59 @@ mod tests {
         assert_eq!(shown.context_pct, None);
         assert_eq!(shown.last_agent_summary, None);
         assert_eq!(shown.user_instruction, None);
+    }
+
+    #[test]
+    fn 같은_native_대화를_공유하는_pane만_요약을_억제한다() {
+        use crate::agent_detect::{AgentBinding, AgentKind};
+
+        let binding = |kind, id: &str| AgentBinding {
+            kind,
+            session_id: id.to_owned(),
+            transcript: PathBuf::from(format!("/tmp/{id}.jsonl")),
+        };
+        let bindings = HashMap::from([
+            (runtime::SessionId(1), binding(AgentKind::Claude, "same")),
+            (runtime::SessionId(2), binding(AgentKind::Claude, "same")),
+            (runtime::SessionId(3), binding(AgentKind::Claude, "other")),
+            (runtime::SessionId(4), binding(AgentKind::Codex, "same")),
+        ]);
+
+        assert_eq!(
+            shared_agent_transcript_sessions(&bindings),
+            std::collections::HashSet::from([runtime::SessionId(1), runtime::SessionId(2)])
+        );
+    }
+
+    #[test]
+    fn 같은_claude_대화_복원은_두번째_pane부터_fork한다() {
+        let saved = HashMap::from([
+            (
+                "pane-a".to_owned(),
+                storage::AgentSessionRow {
+                    pane_id: "pane-a".to_owned(),
+                    kind: "claude".to_owned(),
+                    session_id: "shared".to_owned(),
+                },
+            ),
+            (
+                "pane-b".to_owned(),
+                storage::AgentSessionRow {
+                    pane_id: "pane-b".to_owned(),
+                    kind: "claude".to_owned(),
+                    session_id: "shared".to_owned(),
+                },
+            ),
+        ]);
+        let target = |pane_id: &str| storage::AgentSessionIdentity {
+            pane_id: pane_id.to_owned(),
+            kind: "claude".to_owned(),
+            session_id: "shared".to_owned(),
+        };
+
+        assert!(!fork_shared_claude_resume(&target("pane-a"), &saved, false));
+        assert!(fork_shared_claude_resume(&target("pane-b"), &saved, false));
+        assert!(fork_shared_claude_resume(&target("pane-a"), &saved, true));
     }
 
     #[test]

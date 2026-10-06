@@ -565,6 +565,30 @@ impl Db {
                 }
             }
             K::TurnStart if latest => {
+                // 새 사용자 입력은 이전 부모 턴의 미해결 승인보다 강한 진행 증거다.
+                // PostToolUse가 빠졌어도 과거 승인이 새 턴까지 붙어 있지 않게 한다.
+                // 병렬 자식의 질문/승인은 부모 입력으로 해제됐다고 단정할 수 없다.
+                if event.at_micros > state.turn_started
+                    && event
+                        .turn_id
+                        .as_ref()
+                        .is_some_and(|turn| state.current_turn.as_ref() != Some(turn))
+                {
+                    for request in &mut state.requests {
+                        if request_owner(&request.id).is_none() && request.at <= event.at_micros {
+                            request.kind = 0;
+                            request.pending_count = 0;
+                            request.at = event.at_micros;
+                            request.anonymous = None;
+                        }
+                    }
+                    state
+                        .active_tools
+                        .retain(|(id, _)| request_owner(id).is_some());
+                    state
+                        .tool_groups
+                        .retain(|(id, _, _)| request_owner(id).is_some());
+                }
                 working = true;
                 done = false;
                 state.turn_started = event.at_micros;
@@ -1657,6 +1681,47 @@ mod tests {
             tool_input_hash: None,
             child_id: None,
         }
+    }
+
+    #[test]
+    fn 새_사용자_턴은_이전_부모_승인을_닫고_자식_요청은_보존한다() {
+        let db = Db::open_in_memory().unwrap();
+        db.record_agent_attention(KEY, &event(AttentionEventKind::TurnStart, "", 1))
+            .unwrap();
+        db.record_agent_attention(KEY, &event(AttentionEventKind::ApprovalRequired, "old", 2))
+            .unwrap();
+        db.record_agent_attention(
+            KEY,
+            &event(AttentionEventKind::ResponseRequired, "child:c:q", 3),
+        )
+        .unwrap();
+        let mut next = event(AttentionEventKind::TurnStart, "", 4);
+        next.turn_id = Some("turn-2".into());
+        db.record_agent_attention(KEY, &next).unwrap();
+        assert_eq!(
+            db.pending_agent_request_ids(KEY, "native-1").unwrap(),
+            vec!["child:c:q"]
+        );
+        assert_eq!(db.list_response_sessions().unwrap(), vec![KEY]);
+        db.record_agent_attention(KEY, &event(AttentionEventKind::Resolved, "child:c:q", 5))
+            .unwrap();
+        assert!(db.list_waiting_sessions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn 턴_id가_없는_중복_시작은_현재_승인을_임의로_해제하지_않는다() {
+        let db = Db::open_in_memory().unwrap();
+        db.record_agent_attention(KEY, &event(AttentionEventKind::TurnStart, "", 1))
+            .unwrap();
+        db.record_agent_attention(KEY, &event(AttentionEventKind::ApprovalRequired, "q", 2))
+            .unwrap();
+        let mut unproven = event(AttentionEventKind::TurnStart, "", 3);
+        unproven.turn_id = None;
+        db.record_agent_attention(KEY, &unproven).unwrap();
+        assert_eq!(
+            db.pending_agent_request_ids(KEY, "native-1").unwrap(),
+            vec!["q"]
+        );
     }
 
     #[test]

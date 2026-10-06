@@ -212,11 +212,20 @@ pub fn remove() -> anyhow::Result<()> {
             std::fs::remove_file(file)?;
         }
     }
-    if let Some(root) = root()
-        && root.exists()
-    {
-        std::fs::remove_dir_all(root)?;
+    if let Some(root) = root() {
+        remove_launch_shims(&root)?;
     }
+    Ok(())
+}
+
+fn remove_launch_shims(root: &std::path::Path) -> anyhow::Result<()> {
+    let shims = root.join("shims");
+    if shims.exists() {
+        std::fs::remove_dir_all(shims)?;
+    }
+    // 실행 중인 Claude/Codex는 시작할 때 받은 hook 경로를 계속 호출한다.
+    // 설정을 끈 뒤에도 그 프로세스의 요청 해제 이벤트는 받아야 하므로 hooks와
+    // Claude 설정 파일은 보존한다. statusline/zdot도 별도 기능의 소유물이다.
     Ok(())
 }
 
@@ -337,6 +346,34 @@ fn kimi_hook_entries(hooks_dir: &std::path::Path) -> Vec<(String, String)> {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn 설정을_꺼도_실행중인_세션의_hook과_다른_앱_파일은_보존한다() {
+        let root = std::env::temp_dir().join(format!("deppy-shim-remove-{}", uuid::Uuid::new_v4()));
+        for dir in ["shims", "hooks", "statusline", "zdot"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        for path in [
+            "shims/claude",
+            "hooks/deppy-hook-observe.sh",
+            "claude-hook-settings.json",
+            "statusline/pane.sig",
+            "zdot/.zshrc",
+        ] {
+            std::fs::write(root.join(path), "test").unwrap();
+        }
+        remove_launch_shims(&root).unwrap();
+        assert!(!root.join("shims").exists());
+        for path in [
+            "hooks/deppy-hook-observe.sh",
+            "claude-hook-settings.json",
+            "statusline/pane.sig",
+            "zdot/.zshrc",
+        ] {
+            assert!(root.join(path).exists(), "{path}");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[cfg(unix)]
     #[test]

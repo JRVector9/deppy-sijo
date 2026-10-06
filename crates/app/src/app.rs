@@ -10340,6 +10340,8 @@ pub struct App {
     hook_overrides:
         std::collections::HashMap<runtime::SessionId, crate::agent_detect::AgentBinding>,
     hook_task_prompts: std::collections::HashMap<runtime::SessionId, (String, String)>,
+    /// Transcript turns cannot be attributed until this workspace's hook history is loaded.
+    hook_projection_ready: bool,
     /// 마지막으로 DB에 저장한 pane_id → row — 차등 upsert/delete 및 churn 방지용.
     persisted_agents: std::collections::HashMap<String, storage::AgentSessionRow>,
     /// Durable sessions.id → archived agent identity/native resume token. Runtime-local SessionId
@@ -10728,20 +10730,26 @@ fn merge_detected_kinds(
     }
 }
 
-/// 하나의 native 대화를 여러 pane이 공유하면 transcript의 마지막 문장은 어느 pane의
-/// 작업인지 판별할 수 없다. 해당 pane들의 작업 설명을 공유 transcript에서 가져오지 않는다.
+/// 하나의 native 대화를 여러 pane이 공유했으면 한 pane이 닫힌 뒤에도 transcript의
+/// 마지막 문장을 남은 pane에 귀속할 수 없다. 최근 hook 바인딩도 함께 확인한다.
 fn shared_agent_transcript_sessions(
     bindings: &std::collections::HashMap<runtime::SessionId, crate::agent_detect::AgentBinding>,
+    hook_history: &std::collections::HashMap<runtime::SessionId, crate::agent_detect::AgentBinding>,
 ) -> std::collections::HashSet<runtime::SessionId> {
     let mut seen = std::collections::HashMap::new();
     let mut shared = std::collections::HashSet::new();
-    for (session, binding) in bindings {
+    for (session, binding) in hook_history
+        .iter()
+        .filter(|(session, _)| !bindings.contains_key(session))
+        .chain(bindings.iter())
+    {
         let key = (binding.kind, binding.session_id.as_str());
         if let Some(previous) = seen.insert(key, *session) {
             shared.insert(previous);
             shared.insert(*session);
         }
     }
+    shared.retain(|session| bindings.contains_key(session));
     shared
 }
 
@@ -10756,6 +10764,37 @@ fn trusted_pane_task_prompt<'a>(
         && binding.session_id == *native_id
         && !prompt.is_empty())
     .then_some(prompt.as_str())
+}
+
+fn apply_pane_task_prompts(
+    displays: &mut std::collections::HashMap<runtime::SessionId, crate::agent_detect::AgentDisplay>,
+    bindings: &std::collections::HashMap<runtime::SessionId, crate::agent_detect::AgentBinding>,
+    hook_history: &std::collections::HashMap<runtime::SessionId, crate::agent_detect::AgentBinding>,
+    prompts: &std::collections::HashMap<runtime::SessionId, (String, String)>,
+    hook_projection_ready: bool,
+) {
+    if !hook_projection_ready {
+        for (session, display) in displays {
+            if bindings
+                .get(session)
+                .is_some_and(|binding| binding.kind == crate::agent_detect::AgentKind::Claude)
+            {
+                display.last_agent_summary = None;
+                display.user_instruction = None;
+            }
+        }
+        return;
+    }
+    let shared = shared_agent_transcript_sessions(bindings, hook_history);
+    for (session, display) in displays {
+        let prompt = trusted_pane_task_prompt(*session, bindings, prompts);
+        if shared.contains(session) {
+            // Once a transcript has been shared, its latest assistant text can belong to
+            // another pane even after that pane closes. Prefer the pane's own hook input.
+            display.last_agent_summary = None;
+            display.user_instruction = prompt.map(str::to_owned);
+        }
+    }
 }
 
 /// 저장된 동일 Claude 대화를 둘 이상의 pane이 복원하면 첫 pane만 원본 ID를
@@ -15746,7 +15785,8 @@ impl App {
         let initial_approval_snapshot =
             load_approval_snapshot(&db).expect("initial approval snapshot load failed");
         // shim을 make_runtime 전에 설치한다 — 첫 셸부터 PATH에 shim이 얹히도록.
-        if config.ui.agent_status_hooks
+        if !cfg!(test)
+            && config.ui.agent_status_hooks
             && let Ok(bin) = mcp_proxy_bin()
             && let Err(e) = crate::agent_shim::install(&db_path, &bin)
         {
@@ -16289,6 +16329,7 @@ impl App {
             last_hook_query: std::time::Instant::now(),
             hook_overrides: std::collections::HashMap::new(),
             hook_task_prompts: std::collections::HashMap::new(),
+            hook_projection_ready: false,
             persisted_agents: std::collections::HashMap::new(),
             archived_agent_resume: std::collections::HashMap::new(),
             agent_needs_input: std::collections::HashSet::new(),
@@ -17059,12 +17100,18 @@ impl App {
             Vec<crate::agent_transcript::TranscriptTurn>,
         >,
     ) {
+        // The detector can finish before the first Hooks projection. Until historical pane
+        // bindings arrive, a now-single pane may still point at a mixed Claude transcript.
+        if !self.hook_projection_ready {
+            return;
+        }
         let Some(mux) = self.active.workspace_ui.mux().cloned() else {
             return;
         };
         let now = deppy_core::time::unix_secs_i64();
         let instance = self.active.runtime_instance;
-        let shared_transcripts = shared_agent_transcript_sessions(&self.agent_bindings);
+        let shared_transcripts =
+            shared_agent_transcript_sessions(&self.agent_bindings, &self.hook_overrides);
         let mut rows = Vec::new();
         for (session, recent) in turns {
             if shared_transcripts.contains(session) {
@@ -17206,8 +17253,12 @@ impl App {
     }
 
     fn stage_attention_work_history(&mut self) {
+        if !self.hook_projection_ready {
+            return;
+        }
         let now = deppy_core::time::unix_secs_i64();
-        let shared_transcripts = shared_agent_transcript_sessions(&self.agent_bindings);
+        let shared_transcripts =
+            shared_agent_transcript_sessions(&self.agent_bindings, &self.hook_overrides);
         let mut rows = Vec::new();
         for (session, binding) in &self.agent_bindings {
             if shared_transcripts.contains(session) {
@@ -17936,6 +17987,7 @@ impl App {
                         ))
                     })
                     .collect();
+                self.hook_projection_ready = true;
                 // statuslines는 (runtime_instance, SessionId)로 네임스페이스돼 있어(위
                 // agent_info 필드 주석) 전체 교체가 아니라 현재 active instance 몫만
                 // 갈아끼운다 — 통째로 교체하면 warm으로 물러난 다른 workspace의 보존값이
@@ -18519,6 +18571,7 @@ impl App {
         if sessions.is_empty() {
             self.hook_overrides.clear();
             self.hook_task_prompts.clear();
+            self.hook_projection_ready = false;
             // 활성 instance 몫만 지운다 — 통째 clear는 warm 워크스페이스의 보존값을 지운다.
             let instance = self.active.runtime_instance;
             self.statuslines.retain(|(rt, _), _| *rt != instance);
@@ -18775,17 +18828,13 @@ impl App {
         for (session, display) in merged.iter_mut() {
             apply_claude_statusline(display, self.statuslines.get(&(instance, *session)));
         }
-        for session in shared_agent_transcript_sessions(&self.agent_bindings) {
-            if let Some(display) = merged.get_mut(&session) {
-                display.last_agent_summary = None;
-                display.user_instruction = None;
-                if let Some(prompt) =
-                    trusted_pane_task_prompt(session, &self.agent_bindings, &self.hook_task_prompts)
-                {
-                    display.user_instruction = Some(prompt.to_owned());
-                }
-            }
-        }
+        apply_pane_task_prompts(
+            &mut merged,
+            &self.agent_bindings,
+            &self.hook_overrides,
+            &self.hook_task_prompts,
+            self.hook_projection_ready,
+        );
         self.active.workspace_ui.set_agent_info(merged);
         self.active.workspace_ui.set_agent_executions(
             kinds_for_active
@@ -21021,6 +21070,12 @@ impl App {
     /// 에이전트 상태 hook을 설정 토글에 맞춰 전역 설치/해제한다(옵션2 needsInput).
     /// best-effort — 실패해도 앱은 정상 동작(regex fallback). claude + codex.
     fn sync_agent_hooks(&self) {
+        // App::new를 쓰는 단위 테스트가 실제 HOME의 hook/shim을 지우면 실행 중인
+        // Deppy 세션의 상태 추적이 끊긴다. 설치/제거 동작은 agent_shim의 격리된
+        // 임시 디렉터리 테스트에서 검증하고, App 테스트에서는 전역 부작용을 막는다.
+        if cfg!(test) {
+            return;
+        }
         let result = (|| -> anyhow::Result<()> {
             // 전역 config 방식(구)은 항상 정리한다 — shim 방식으로 전환(cmux식, 2026-07-07).
             crate::agent_hooks::uninstall_claude()?;
@@ -23929,7 +23984,9 @@ impl App {
 
         // 현재 활성을 Warm으로 내리고 warm 풀에 보관 (워커·세션 계속 실행).
         let mut old = std::mem::replace(&mut self.active, new_active);
+        self.hook_overrides.clear();
         self.hook_task_prompts.clear();
+        self.hook_projection_ready = false;
         switch_cross_workspace_pane_layout(
             &old.id,
             &self.active.id,
@@ -33225,7 +33282,8 @@ impl eframe::App for App {
         // 동일 native transcript를 공유하는 pane은 원문 마지막 응답을 어느 쪽의
         // 작업인지 판별할 수 없다. 각 행에는 중복된 작업 문구 대신 고유한 pane 번호를
         // 표시한다. 사용자 지정 제목은 session_headline이 그대로 우선한다.
-        let shared_transcripts = shared_agent_transcript_sessions(&self.agent_bindings);
+        let shared_transcripts =
+            shared_agent_transcript_sessions(&self.agent_bindings, &self.hook_overrides);
         let mut shared_ordinal = 0usize;
         for entry in &mut terminal_sessions {
             if entry.session.is_some_and(|session| {
@@ -42997,7 +43055,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            shared_agent_transcript_sessions(&bindings),
+            shared_agent_transcript_sessions(&bindings, &HashMap::new()),
             std::collections::HashSet::from([runtime::SessionId(1), runtime::SessionId(2)])
         );
         let prompts = HashMap::from([
@@ -43026,6 +43084,71 @@ mod tests {
             trusted_pane_task_prompt(runtime::SessionId(3), &bindings, &prompts),
             None
         );
+    }
+
+    #[test]
+    fn 공유_pane_하나가_닫혀도_남은_pane의_hook_작업을_표시한다() {
+        use crate::agent_detect::{AgentBinding, AgentDisplay, AgentKind};
+
+        let first = runtime::SessionId(1);
+        let second = runtime::SessionId(2);
+        let binding = AgentBinding {
+            kind: AgentKind::Claude,
+            session_id: "same".to_owned(),
+            transcript: PathBuf::from("/tmp/same.jsonl"),
+        };
+        let mut bindings = HashMap::from([(first, binding.clone()), (second, binding)]);
+        let hook_history = bindings.clone();
+        let prompts = HashMap::from([
+            (first, ("same".to_owned(), "첫 작업".to_owned())),
+            (second, ("same".to_owned(), "둘째 작업".to_owned())),
+        ]);
+        let display = || AgentDisplay {
+            kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+            context_pct: None,
+            last_agent_summary: Some("둘째 pane의 마지막 응답".to_owned()),
+            user_instruction: None,
+        };
+        let mut merged = HashMap::from([(first, display()), (second, display())]);
+        apply_pane_task_prompts(&mut merged, &bindings, &hook_history, &prompts, true);
+        assert_eq!(merged[&first].last_agent_summary, None);
+        assert_eq!(merged[&first].user_instruction.as_deref(), Some("첫 작업"));
+        assert_eq!(
+            merged[&second].user_instruction.as_deref(),
+            Some("둘째 작업")
+        );
+
+        bindings.remove(&second);
+        let mut merged = HashMap::from([(first, display())]);
+        assert_eq!(
+            shared_agent_transcript_sessions(&bindings, &hook_history),
+            std::collections::HashSet::from([first])
+        );
+        apply_pane_task_prompts(&mut merged, &bindings, &hook_history, &prompts, true);
+        assert_eq!(merged[&first].last_agent_summary, None);
+        assert_eq!(merged[&first].user_instruction.as_deref(), Some("첫 작업"));
+
+        let unique = runtime::SessionId(3);
+        bindings.insert(
+            unique,
+            AgentBinding {
+                kind: AgentKind::Claude,
+                session_id: "unique".to_owned(),
+                transcript: PathBuf::from("/tmp/unique.jsonl"),
+            },
+        );
+        let mut merged = HashMap::from([(unique, display())]);
+        apply_pane_task_prompts(&mut merged, &bindings, &hook_history, &prompts, true);
+        assert_eq!(
+            merged[&unique].last_agent_summary.as_deref(),
+            Some("둘째 pane의 마지막 응답")
+        );
+
+        let mut merged = HashMap::from([(unique, display())]);
+        apply_pane_task_prompts(&mut merged, &bindings, &HashMap::new(), &prompts, false);
+        assert_eq!(merged[&unique].last_agent_summary, None);
     }
 
     #[test]

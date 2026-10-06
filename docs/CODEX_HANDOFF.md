@@ -1,3 +1,15 @@
+# 0.8.1 컴포저 수정 번들 준비(미실행) — 2026-10-07
+
+- Current objective: 앞서 확인한 Composer 거짓 거절 수정 `85dcf87f`을 사용자가 검토·적용할 수 있는 버전된 로컬 번들로 준비한다. 새 버전 재실행은 이번 버그 요청에 명시되지 않았으므로 실행하지 않는다.
+- Completed: canonical workspace 버전 0.8.0→0.8.1 patch, `cargo update --workspace --offline`으로 inherited lock 27개만 증가. 버전 커밋 `65d68809` (`chore: prepare 0.8.1 composer fix bundle`), 제품 수정 소스 커밋 `85dcf87f`. 변경 파일 `Cargo.toml`, `Cargo.lock`; 기존 Composer 수정 소스는 그대로다.
+- Artifact and version proof: `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 DEPPY_REQUIRE_TRUSTED_SIGNING=0 DEPPY_ALLOW_UNTRUSTED_SIGNING=1 sh scripts/package-macos.sh` exit 0 (`/tmp/deppy-0.8.1-local-package-20261007.log`). `target/restart-0.8.1-20261007/Deppy Sijo.app` 및 ZIP을 별도 경로에 보존하고 `scripts/verify-macos-package.sh` 재검증 exit 0 (`/tmp/deppy-0.8.1-staged-verify-20261007.log`). Developer ID Application: VectorNine INC 서명의 로컬 개발 패키지이며 새 공증/외부 배포는 없다. 앱 실행 파일 SHA-256 `f02fc46944c4863a975d2d67142bbcff97149e7d005e661c44d944168057d66e`; proxy `d9cc5e3c49341c3a3e10413d014eb0d227288f740001f700e1a6966c660fa34e`. Bundle의 `CFBundleShortVersionString`/`CFBundleVersion` 모두 0.8.1, locked Cargo metadata의 app/proxy 0.8.1, 컴파일된 앱 실행 파일의 `deppy-sijo/0.8.1` 확인. 실제 native About UI는 이 번들을 실행하지 않았으므로 아직 확인하지 않았다.
+- Actual validation: 앞선 같은 제품 소스에서 Session 75, Runtime 354, App unit 2774/31 ignored 및 integration 4+5+15+15 pass; strict Session+Runtime+App Clippy/fmt PASS. 이번 버전만 변경한 후 locked Cargo metadata, release build, staged bundle/ZIP 서명·아키텍처·plist 검사, `git diff --check` PASS. 버전 변경 후 전체 테스트를 다시 실행했다고 주장하지 않는다.
+- Failed approaches: 없음. 0.8.0 현재 PID 56575는 계속 실행 중이며 이 번들로 교체하지 않았다.
+- Remaining: 이 handoff를 커밋/푸시하고 브랜치 정리를 확인한다. 실행 중 앱에 0.8.1 수정 적용은 사용자가 **새 현재 작업에서** 재실행을 명시 요청한 후에만 한다. 그때 기존 PID/경로를 재확인하고 정상 종료→검증된 0.8.1 번들 실행→실제 About UI 0.8.1 및 생존 확인이 필요하다. 실제 사용자 문장 전송 시험은 수행하지 않았다.
+- Exact next commands: `cd /Users/jr/Desktop/projects/deppy-sijo-performance`; `git diff --check`; `git add docs/CODEX_HANDOFF.md`; `git commit -m 'docs: record prepared 0.8.1 composer bundle'`; `git push origin feat/audit-nine-pr-v0.6.0-20261004`; `git status --short --branch`; `ps -o pid=,etime=,state=,command= -p 56575`. 새 재실행 요청 없이는 `open`, `scripts/dev-run.sh`, 종료 명령을 실행하지 않는다.
+
+---
+
 # 하단 컴포저의 빈 터미널 입력줄 전송 거절 — 2026-10-07
 
 - Current objective: 사용자가 하단 프롬프트 입력창(Composer)에서 입력 후 전송이 간헐적으로 거절된다고 보고. 방금 재실행한 0.8.0 앱에서 원인을 조사하고 소스 수정. 이 새 요청에는 추가 앱 재실행 권한이 없다.

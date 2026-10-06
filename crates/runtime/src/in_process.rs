@@ -11786,6 +11786,98 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn composer_explicit_prompt_accepts_redrawn_empty_editor_after_cleared_native_draft() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, _events) = admission_worker(resolver, "composer-cleared-native-draft");
+        let id = SessionId(1);
+        let mut live = Session::spawn_with_spec(
+            id,
+            session::SessionKind::Shell,
+            &spec("/bin/cat", &[]),
+            80,
+            24,
+            100,
+        )
+        .unwrap();
+        let group = live.process_identity().process_group.unwrap();
+        live.replay_ansi(&mut "❯ ".as_bytes()).unwrap();
+        worker.sessions.insert(id, live);
+        worker.detectors.insert(
+            id,
+            session::StatusDetector::new(session::StatusPatterns::compile(None, None, None, None)),
+        );
+        let admission = crate::InputAdmission::new(
+            crate::InputPermit::new(),
+            Instant::now() + Duration::from_secs(5),
+            |write| write(),
+        )
+        .with_agent_guard(crate::AgentInputGuard {
+            foreground_process_group: group,
+            provider: crate::AgentPromptKind::Claude,
+            intent: crate::AgentInputIntent::ExplicitPrompt,
+        });
+
+        // The native editor may erase text without a submit byte (e.g. backspace/Ctrl+U).
+        let detector = worker.detectors.get_mut(&id).unwrap();
+        detector.on_user_input(b"old native draft\x15");
+        assert!(detector.has_input_draft());
+        assert_eq!(
+            worker.admit_input_batch_checked(id, &[b"new prompt", b"\r"], Some(&admission)),
+            Err(pty::PtyInputRejectReason::AdmissionDenied),
+            "without a fresh native redraw, accepted-input evidence still protects the draft"
+        );
+        let draft_redraw = b"\x1b[2J\x1b[H\xe2\x9d\xaf still here";
+        worker
+            .sessions
+            .get_mut(&id)
+            .unwrap()
+            .replay_ansi(&mut draft_redraw.as_slice())
+            .unwrap();
+        worker
+            .detectors
+            .get_mut(&id)
+            .unwrap()
+            .on_output(draft_redraw);
+        assert_eq!(
+            worker.admit_input_batch_checked(id, &[b"new prompt", b"\r"], Some(&admission)),
+            Err(pty::PtyInputRejectReason::AdmissionDenied),
+            "a visible native draft must never be overwritten"
+        );
+        let redraw = b"\x1b[2J\x1b[H\xe2\x9d\xaf ";
+        worker
+            .sessions
+            .get_mut(&id)
+            .unwrap()
+            .replay_ansi(&mut redraw.as_slice())
+            .unwrap();
+        worker.detectors.get_mut(&id).unwrap().on_output(redraw);
+        let automatic = crate::InputAdmission::new(
+            crate::InputPermit::new(),
+            Instant::now() + Duration::from_secs(5),
+            |write| write(),
+        )
+        .with_agent_guard(crate::AgentInputGuard {
+            foreground_process_group: group,
+            provider: crate::AgentPromptKind::Claude,
+            intent: crate::AgentInputIntent::AutomaticPrompt,
+        });
+        assert_eq!(
+            worker.admit_input_batch_checked(id, &[b"auto", b"\r"], Some(&automatic)),
+            Err(pty::PtyInputRejectReason::AdmissionDenied),
+            "automation must still refuse accepted-draft evidence"
+        );
+        assert_eq!(
+            worker.admit_input_batch_checked(id, &[b"new prompt", b"\r"], Some(&admission)),
+            Ok(()),
+            "a fresh, positively empty native editor must admit the deliberate composer send"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn pr2_actual_admission_preserves_existing_tui_draft_and_dialog() {
         let resolver = Arc::new(RecordingResolver {
             calls: Mutex::new(Vec::new()),

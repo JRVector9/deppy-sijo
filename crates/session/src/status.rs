@@ -303,6 +303,10 @@ pub struct StatusDetector {
     bracketed_paste: bool,
     paste_marker_matched: usize,
     input_draft_dirty: bool,
+    /// A native erase key was accepted while a draft existed, followed by fresh PTY output.
+    /// Only an explicit send may combine this with a verified empty native editor row.
+    input_draft_erase_requested: bool,
+    input_draft_erase_redrawn: bool,
     input_sequence: InputSequence,
     source: StatusSource,
     stats: StatusDetectorStats,
@@ -325,6 +329,8 @@ impl StatusDetector {
             bracketed_paste: false,
             paste_marker_matched: 0,
             input_draft_dirty: false,
+            input_draft_erase_requested: false,
+            input_draft_erase_redrawn: false,
             input_sequence: InputSequence::Ground,
             source: StatusSource::IdleHeuristic,
             stats: StatusDetectorStats::default(),
@@ -362,6 +368,10 @@ impl StatusDetector {
     /// Accepted, unsubmitted bytes. Output redraws and hook status cannot erase this evidence.
     pub fn has_input_draft(&self) -> bool {
         self.input_draft_dirty
+    }
+
+    pub fn has_redrawn_erase_attempt(&self) -> bool {
+        self.input_draft_dirty && self.input_draft_erase_requested && self.input_draft_erase_redrawn
     }
 
     pub fn stats(&self) -> StatusDetectorStats {
@@ -415,6 +425,18 @@ impl StatusDetector {
     /// Constant-space accepted-input evidence. Navigation/focus and empty paste markers are not
     /// draft text; edits never clear a genuine draft without an actual submit/cancel boundary.
     fn note_input_byte(&mut self, byte: u8) -> bool {
+        let erase = self.input_draft_dirty
+            && !self.bracketed_paste
+            && matches!(self.input_sequence, InputSequence::Ground)
+            && matches!(byte, 8 | 21 | 23 | 127);
+        if erase {
+            self.input_draft_erase_requested = true;
+            self.input_draft_erase_redrawn = false;
+        } else if byte != 0 {
+            // A later key can add/recall text; only the last accepted edit may prove empty.
+            self.input_draft_erase_requested = false;
+            self.input_draft_erase_redrawn = false;
+        }
         if self.bracketed_paste {
             let marker = b"\x1b[201~";
             if byte == marker[self.paste_marker_matched] {
@@ -431,6 +453,8 @@ impl StatusDetector {
         }
         if matches!(byte, b'\r' | b'\n' | 3) {
             self.input_draft_dirty = false;
+            self.input_draft_erase_requested = false;
+            self.input_draft_erase_redrawn = false;
             self.input_sequence = InputSequence::Ground;
             return true;
         }
@@ -569,6 +593,9 @@ impl StatusDetector {
         self.stats.stream_chunks += 1;
         self.stats.stream_bytes += chunk.len() as u64;
         self.last_output = Instant::now();
+        if !chunk.is_empty() && self.input_draft_erase_requested {
+            self.input_draft_erase_redrawn = true;
+        }
         if self.idle_waiting {
             self.status = SessionStatus::Running;
             self.idle_waiting = false;

@@ -209,9 +209,6 @@ impl AgentInputGuard {
         let Some(detector) = detector else {
             return self.deny("detector_unavailable");
         };
-        if self.intent != AgentInputIntent::ExplicitAppend && detector.has_input_draft() {
-            return self.deny("accepted_input_draft");
-        }
         let snapshot = active.input_guard_snapshot();
         if snapshot.as_ref().is_some_and(choice_dialog) {
             return self.deny("current_choice_dialog");
@@ -219,6 +216,15 @@ impl AgentInputGuard {
         let row = snapshot.as_ref().map_or(PromptRow::Unknown, |snapshot| {
             prompt_row(snapshot, self.provider)
         });
+        if self.intent != AgentInputIntent::ExplicitAppend
+            && detector.has_input_draft()
+            && !(self.intent == AgentInputIntent::ExplicitPrompt
+                && row == PromptRow::Empty
+                && detector.has_redrawn_erase_attempt()
+                && !detector.has_screen_input_request())
+        {
+            return self.deny("accepted_input_draft");
+        }
         // Stream status is latched until input. It cannot veto that very input after
         // the CLI has visibly returned to its native editor. This exception is only
         // for deliberate submit with positive ready-row evidence; current screen

@@ -288,7 +288,7 @@ mod tests {
             "viewer는 inert dashboard 뒤의 형제여야 함"
         );
         for marker in [
-            r#"<main id="dashboard-shell" class="app">"#,
+            r#"<main id="dashboard-shell" class="app m-screen">"#,
             r#"class="viewer-shell""#,
             r#"role="dialog""#,
             r#"aria-modal="true""#,

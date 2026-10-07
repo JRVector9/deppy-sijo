@@ -19,12 +19,23 @@
   <link rel="stylesheet" href="/app.__SHELL_VERSION__.css">
 </head>
 <body data-view="shell">
-  <main id="dashboard-shell" class="app">
-    <header class="brand">
-      <img src="/icon-192.png" alt="" width="36" height="36">
-      <h1>시조새</h1>
-      <p class="status"><span id="dot" class="dot"></span> <span id="status-text">연결 중…</span></p>
+  <main id="dashboard-shell" class="app m-screen">
+    <header class="brand m-topbar">
+      <div class="m-brand">
+        <h1 class="m-brand-title">시조새</h1>
+        <p id="status-text" class="m-brand-subtitle">연결 중…</p>
+      </div>
+      <div class="m-topbar-actions">
+        <span class="status m-pill"><span id="dot" class="dot"></span><span id="workspace-count">0 워크스페이스</span></span>
+        <button id="dashboard-menu-button" class="m-icon-button small" type="button"
+                aria-label="메뉴" aria-expanded="false" aria-controls="dashboard-menu">⋯</button>
+      </div>
     </header>
+    <div id="dashboard-menu" class="m-menu" hidden>
+      <div class="m-menu-section"><span class="label">연결 상태</span><span id="dashboard-menu-status" class="value">연결 중…</span></div>
+      <button id="dashboard-approvals-button" class="m-menu-button" type="button" disabled>승인 대기 0</button>
+      <p id="resource" class="m-menu-version"></p>
+    </div>
 
     <!-- 미러 진입 안내(I1b-2): 워크스페이스 전환 상한 초과 등. 서버 notice를 몇 초 표시 후
          자동으로 숨긴다. 내용은 textContent로만 삽입한다(innerHTML 금지). -->
@@ -44,17 +55,17 @@
     <button id="notify-enable" class="notify-enable" type="button" hidden>알림 켜기 — 승인 뱃지·푸시</button>
 
     <!-- 킬러 기능: 승인 대시보드. 카드의 미리보기/서버/도구는 모두 textContent로만 삽입한다. -->
-    <section class="panel" aria-labelledby="approvals-title">
-      <h2 id="approvals-title">승인 대기 <span id="approvals-count" class="count">0</span></h2>
+    <button id="approval-toggle" class="approval-toggle" type="button" hidden>승인 대기 <span id="approvals-count" class="count">0</span></button>
+    <section id="approval-panel" class="panel" aria-labelledby="approvals-title" hidden>
+      <h2 id="approvals-title">승인 대기</h2>
       <div id="approvals" class="cards"></div>
       <p id="approvals-empty" class="empty">대기 중인 승인이 없습니다.</p>
     </section>
 
-    <section class="panel" aria-labelledby="sessions-title">
-      <h2 id="sessions-title" tabindex="-1">세션</h2>
+    <section class="panel workspace-panel" aria-labelledby="sessions-title">
+      <h2 id="sessions-title" class="sr-only" tabindex="-1">워크스페이스</h2>
       <ul id="sessions" class="sessions"></ul>
-      <p id="sessions-empty" class="empty">활성 세션이 없습니다.</p>
-      <p id="resource" class="resource"></p>
+      <p id="sessions-empty" class="m-panel-note">연결할 워크스페이스가 없습니다.</p>
     </section>
   </main>
   <section id="viewer" class="viewer-shell" role="dialog" aria-modal="true"
@@ -63,15 +74,24 @@
       <button id="viewer-back" class="viewer-back" type="button"
               aria-label="세션 목록으로 돌아가기">‹</button>
       <div class="viewer-heading">
-        <h2 id="viewer-title">터미널</h2>
-        <p id="viewer-session" class="viewer-session">세션</p>
+        <h2 id="viewer-title">워크스페이스</h2>
+        <p id="viewer-session" class="viewer-session sr-only">세션</p>
+        <p id="viewer-connection" class="viewer-connection" role="status" aria-live="polite" aria-atomic="true">
+          <span id="viewer-connection-label">연결 중</span>
+          <span id="viewer-connection-detail" class="sr-only">터미널 화면을 준비하고 있습니다.</span>
+        </p>
       </div>
-      <p id="viewer-connection" class="viewer-connection" role="status"
-         aria-live="polite" aria-atomic="true">
-        <span id="viewer-connection-label">연결 중</span>
-        <span id="viewer-connection-detail" class="sr-only">터미널 화면을 준비하고 있습니다.</span>
-      </p>
+      <div class="viewer-actions">
+        <button id="viewer-session-chip" class="m-term-chip" type="button" aria-label="다음 세션으로 전환">세션</button>
+        <button id="viewer-menu-button" class="m-icon-button small" type="button"
+                aria-label="터미널 메뉴" aria-expanded="false" aria-controls="viewer-menu">⋯</button>
+      </div>
     </header>
+    <div id="viewer-menu" class="m-menu viewer-menu" hidden>
+      <div class="m-menu-section"><span class="label">연결 상태</span><span id="viewer-menu-status" class="value">연결 중</span></div>
+      <button id="viewer-menu-keys" class="m-menu-button" type="button">터미널 특수키</button>
+      <button id="viewer-menu-approvals" class="m-menu-button" type="button" disabled>승인 대기</button>
+    </div>
     <div id="viewer-stage" class="viewer-stage">
       <div class="viewer-wrap"><canvas id="viewer-canvas" aria-label="원격 터미널 화면"></canvas></div>
       <div id="viewer-scroll-note" class="viewer-scroll-note" hidden>
@@ -86,7 +106,8 @@
            aria-hidden="true" hidden><span>화면이 보호되었습니다</span></div>
     </div>
     <footer class="viewer-controls">
-      <div class="viewer-keys" role="group" aria-label="터미널 특수키">
+      <p id="composer-note" class="composer-note" hidden></p>
+      <div id="viewer-quick-actions" class="viewer-keys" role="group" aria-label="터미널 특수키" hidden>
         <button type="button" data-key="esc">Esc</button>
         <button type="button" data-key="tab">Tab</button>
         <button type="button" data-key="up">↑</button>
@@ -97,16 +118,16 @@
         <button type="button" data-key="ctrl_d">Ctrl‑D</button>
         <button type="button" data-key="enter">Enter</button>
       </div>
-      <div class="composer">
+      <div class="composer m-composer">
         <input id="composer-file" type="file" hidden
                accept="image/png,image/jpeg,image/gif,image/webp,image/heic,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,.md">
-        <button id="composer-attach" type="button" class="composer-attach" aria-label="파일 첨부">📎</button>
+        <button id="composer-attach" type="button" class="composer-attach" aria-label="파일 첨부">+</button>
+        <button id="viewer-quick-button" type="button" class="composer-quick" aria-label="터미널 특수키">/</button>
         <textarea id="composer-text" rows="1" placeholder="메시지 입력…"
                   aria-label="터미널에 보낼 메시지"
                   autocapitalize="off" autocorrect="off" spellcheck="false"></textarea>
-        <button id="composer-send" type="button">전송</button>
+        <button id="composer-send" type="button" aria-label="전송">↵</button>
       </div>
-      <p id="composer-note" class="composer-note" hidden></p>
     </footer>
   </section>
   <script type="module" src="/app.__SHELL_VERSION__.js"></script>

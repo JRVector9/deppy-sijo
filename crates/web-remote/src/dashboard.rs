@@ -213,6 +213,7 @@ impl WorkspaceState {
 pub struct WorkspaceSeed {
     pub id: String,
     pub name: String,
+    pub current_directory: Option<String>,
     pub state: WorkspaceState,
     pub sessions: Vec<SessionSeed>,
 }
@@ -352,6 +353,7 @@ fn workspace_views(
         return vec![WorkspaceView {
             id: String::new(),
             name: String::new(),
+            current_directory: None,
             state: WorkspaceState::Active.as_str(),
             sessions: live
                 .iter()
@@ -409,6 +411,7 @@ fn workspace_views(
             WorkspaceView {
                 id: ws.id.clone(),
                 name: ws.name.clone(),
+                current_directory: ws.current_directory.clone(),
                 state: ws.state.as_str(),
                 sessions,
             }
@@ -1324,6 +1327,7 @@ mod tests {
             WorkspaceSeed {
                 id: "ws-1".into(),
                 name: "deppy-sijo".into(),
+                current_directory: Some("/Users/jr/deppy-sijo".into()),
                 state: WorkspaceState::Active,
                 sessions: vec![SessionSeed {
                     id: Some(10),
@@ -1336,6 +1340,7 @@ mod tests {
             WorkspaceSeed {
                 id: "ws-2".into(),
                 name: "source".into(),
+                current_directory: None,
                 state: WorkspaceState::Warm,
                 sessions: vec![SessionSeed {
                     id: Some(10), // 앱이 실수로 id를 넣어도 브리지가 표시 전용으로 만든다
@@ -1358,6 +1363,10 @@ mod tests {
         );
         assert_eq!(views[0].sessions[0].title, "deppy-sijo");
         assert_eq!(views[0].sessions[0].status, Some("needs_approval"));
+        assert_eq!(
+            views[0].current_directory.as_deref(),
+            Some("/Users/jr/deppy-sijo")
+        );
         // 돌고 있는 에이전트 요약이 실린다(폰에서 "무슨 에이전트가 도는지" 확인)
         assert_eq!(
             views[0].sessions[0].agent.as_deref(),
@@ -1898,6 +1907,7 @@ mod tests {
         let active = |status: Option<SessionStatus>| WorkspaceSeed {
             id: "ws-1".into(),
             name: "p".into(),
+            current_directory: None,
             state: WorkspaceState::Active,
             sessions: vec![SessionSeed {
                 id: Some(7),

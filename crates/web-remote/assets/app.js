@@ -69,6 +69,57 @@
   const sessionsEmpty = document.getElementById('sessions-empty');
   const resourceEl = document.getElementById('resource');
   const noticeBanner = document.getElementById('notice-banner');
+  const workspaceCount = document.getElementById('workspace-count');
+  const dashboardMenuStatus = document.getElementById('dashboard-menu-status');
+  const approvalToggle = document.getElementById('approval-toggle');
+  const approvalPanel = document.getElementById('approval-panel');
+  const dashboardApprovalsButton = document.getElementById('dashboard-approvals-button');
+  const viewerApprovalsButton = document.getElementById('viewer-menu-approvals');
+  const viewerTitle = document.getElementById('viewer-title');
+  const viewerSessionChip = document.getElementById('viewer-session-chip');
+  const viewerQuickActions = document.getElementById('viewer-quick-actions');
+  const viewerMenuStatus = document.getElementById('viewer-menu-status');
+
+  function attachMenu(buttonId, panelId) {
+    const button = document.getElementById(buttonId);
+    const panel = document.getElementById(panelId);
+    button.addEventListener('click', () => {
+      panel.hidden = !panel.hidden;
+      button.setAttribute('aria-expanded', String(!panel.hidden));
+    });
+    document.addEventListener('click', (event) => {
+      if (panel.hidden || panel.contains(event.target) || button.contains(event.target)) return;
+      panel.hidden = true;
+      button.setAttribute('aria-expanded', 'false');
+    });
+    return () => {
+      panel.hidden = true;
+      button.setAttribute('aria-expanded', 'false');
+    };
+  }
+
+  const closeDashboardMenu = attachMenu('dashboard-menu-button', 'dashboard-menu');
+  const closeViewerMenu = attachMenu('viewer-menu-button', 'viewer-menu');
+  function showApprovals() {
+    approvalPanel.hidden = !approvalPanel.hidden;
+    closeDashboardMenu();
+    if (!viewer.el.hidden) requestCloseViewer();
+  }
+  approvalToggle.addEventListener('click', showApprovals);
+  dashboardApprovalsButton.addEventListener('click', showApprovals);
+  viewerApprovalsButton.addEventListener('click', () => {
+    closeViewerMenu();
+    approvalPanel.hidden = false;
+    requestCloseViewer();
+  });
+  function toggleQuickActions() {
+    const previousWrapHeight = viewer.wrap.clientHeight;
+    viewerQuickActions.hidden = !viewerQuickActions.hidden;
+    closeViewerMenu();
+    scheduleViewerRenderForLayoutChange(previousWrapHeight);
+  }
+  document.getElementById('viewer-quick-button').addEventListener('click', toggleQuickActions);
+  document.getElementById('viewer-menu-keys').addEventListener('click', toggleQuickActions);
 
   const token = localStorage.getItem(TOKEN_KEY);
 
@@ -104,6 +155,7 @@
   function setStatus(cls, text) {
     dot.className = 'dot ' + cls;
     statusText.textContent = text;
+    dashboardMenuStatus.textContent = text;
   }
 
   function wsUrl() {
@@ -281,6 +333,7 @@
         updateComposerEnabled();
       },
       connectionChanged: (state, connected) => {
+        viewerMenuStatus.textContent = connected ? '연결됨' : (state === 'reconnecting' ? '재연결 중' : '연결 중');
         if (!connected) {
           stopAllKeyRepeats();
           cancelActiveUpload();
@@ -336,6 +389,8 @@
         cancelPendingUploadSelection();
       },
       beforeHide: () => {
+        closeViewerMenu();
+        viewerQuickActions.hidden = true;
         composerRecoveryWarningSession = null;
         composerSession = null;
         composerText.value = '';
@@ -358,7 +413,7 @@
   // 특수키 행은 쓰기 경로라 코어가 아니라 이 셸이 소유한다.
   viewer.keys = Array.from(document.querySelectorAll('.viewer-keys button'));
   const {
-    openViewer,
+    openViewer: openCoreViewer,
     requestCloseViewer,
     setViewerConnection,
     setPrivacyCurtain,
@@ -368,6 +423,32 @@
     scheduleViewerRender,
     scheduleViewerRenderForLayoutChange,
   } = viewer;
+
+  function updateViewerHeading(sessionId) {
+    const workspace = lastWorkspaces.find((item) =>
+      (item.sessions || []).some((session) => session.id === sessionId));
+    const session = workspace && workspace.sessions.find((item) => item.id === sessionId);
+    viewerTitle.textContent = workspace?.name || '워크스페이스';
+    viewerSessionChip.textContent = session?.title || '세션';
+    const available = (workspace?.sessions || []).filter((item) => item.id && !item.exited);
+    viewerSessionChip.disabled = available.length < 2;
+  }
+
+  function openViewer(sessionId, title) {
+    const opened = openCoreViewer(sessionId, title);
+    if (opened) updateViewerHeading(sessionId);
+    return opened;
+  }
+
+  viewerSessionChip.addEventListener('click', () => {
+    const workspace = lastWorkspaces.find((item) =>
+      (item.sessions || []).some((session) => session.id === viewer.watching));
+    const available = (workspace?.sessions || []).filter((item) => item.id && !item.exited);
+    if (available.length < 2) return;
+    const current = available.findIndex((session) => session.id === viewer.watching);
+    const next = available[(current + 1) % available.length];
+    openViewer(next.id, next.title || '세션');
+  });
 
   // ── 스크롤백 열람 — 코어가 해석한 팬 제스처를 줄 단위 delta로 바꿔 보낸다 (양수 = 과거로).
   // 스크롤 상태는 세션당 하나(데스크톱과 공유 — tmux 관례). 60ms 코얼레싱으로
@@ -925,6 +1006,11 @@
 
   function renderApprovals(pending) {
     approvalsCount.textContent = String(pending.length);
+    approvalToggle.hidden = pending.length === 0;
+    dashboardApprovalsButton.textContent = '승인 대기 ' + pending.length;
+    dashboardApprovalsButton.disabled = pending.length === 0;
+    viewerApprovalsButton.disabled = pending.length === 0;
+    if (pending.length === 0) approvalPanel.hidden = true;
     approvalsEmpty.hidden = pending.length > 0;
     approvalsEl.textContent = '';
     for (const item of pending) {
@@ -1103,6 +1189,8 @@
   // 프로젝트명 규칙으로 서버가 해석해 보낸다.
   function renderWorkspaces(workspaces, resource) {
     lastWorkspaces = workspaces;
+    workspaceCount.textContent = workspaces.length + ' 워크스페이스';
+    if (viewer.watching) updateViewerHeading(viewer.watching);
     if (resource) lastResource = resource;
     lastSessions = workspaces.flatMap((ws) => ws.sessions || []).filter((s) => s.id);
     for (const session of lastSessions) {
@@ -1128,14 +1216,33 @@
 
     for (const ws of workspaces) {
       const group = document.createElement('li');
-      group.className = 'ws-group';
+      group.className = 'ws-group m-card';
 
       const head = document.createElement('div');
-      head.className = 'ws-head';
+      head.className = 'ws-head m-card-body';
+      const open = document.createElement('button');
+      open.type = 'button';
+      open.className = 'ws-open';
       const name = document.createElement('span');
-      name.className = 'ws-name';
+      name.className = 'ws-name m-card-name';
       name.textContent = ws.name || ws.id;
-      head.appendChild(name);
+      open.appendChild(name);
+      const firstSession = (ws.sessions || []).find((session) => session.id && !session.exited);
+      open.disabled = ws.state === 'active' && !firstSession;
+      open.addEventListener('click', () => {
+        if (ws.state === 'active' && firstSession) openViewer(firstSession.id, firstSession.title || '세션');
+        else if (ws.state !== 'active') send({ type: 'switch', workspace: ws.id });
+      });
+      group.addEventListener('click', (event) => {
+        if (!event.target.closest('button, .ws-sessions')) open.click();
+      });
+      head.appendChild(open);
+      if (ws.current_directory) {
+        const path = document.createElement('span');
+        path.className = 'ws-path m-card-path';
+        path.textContent = ws.current_directory;
+        head.appendChild(path);
+      }
       const state = document.createElement('span');
       state.className = 'ws-state ' + (ws.state || 'suspended');
       state.textContent = WORKSPACE_STATE_LABEL[ws.state] || ws.state || '';
@@ -1154,10 +1261,14 @@
         });
         head.appendChild(enter);
       }
+      const count = document.createElement('span');
+      count.className = 'm-badge-count';
+      count.textContent = String((ws.sessions || []).length);
       group.appendChild(head);
+      group.appendChild(count);
 
       const list = document.createElement('ul');
-      list.className = 'ws-sessions';
+      list.className = 'ws-sessions m-chip-row';
       for (const s of ws.sessions || []) {
         list.appendChild(sessionRow(s, ws));
       }
@@ -1183,7 +1294,7 @@
 
   function sessionRow(s, ws) {
     const li = document.createElement('li');
-    li.className = 'session';
+    li.className = 'session m-chip';
 
     // 이름 + (있으면) 돌고 있는 에이전트 요약 — 2줄. 둘 다 textContent로만 삽입한다.
     const nameBox = document.createElement('span');
@@ -1214,13 +1325,16 @@
       viewBtn.type = 'button';
       viewBtn.className = 'view-btn';
       viewBtn.dataset.sessionId = s.id;
-      viewBtn.textContent = s.id === viewer.watching ? '보는 중' : '보기';
+      viewBtn.textContent = s.id === viewer.watching ? '보는 중' : '열기';
       viewBtn.disabled = s.id === viewer.watching;
       viewBtn.addEventListener('click', () => {
         openViewer(s.id, s.title || '세션');
         renderWorkspaces(lastWorkspaces, lastResource); // "보는 중" 배지 갱신
       });
       li.appendChild(viewBtn);
+      li.addEventListener('click', (event) => {
+        if (!event.target.closest('button')) viewBtn.click();
+      });
     } else if (!s.id) {
       // 표시 전용 — 이 워크스페이스로 전환해야 볼 수 있다.
       const note = document.createElement('span');

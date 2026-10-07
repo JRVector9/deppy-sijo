@@ -21997,6 +21997,7 @@ impl App {
                     return WorkspaceSeed {
                         id: ws.id.clone(),
                         name: Self::workspace_display_name(ws),
+                        current_directory: Some(ws.path.clone()),
                         state: WorkspaceState::Active,
                         sessions,
                     };
@@ -22044,6 +22045,7 @@ impl App {
                 WorkspaceSeed {
                     id: ws.id.clone(),
                     name: Self::workspace_display_name(ws),
+                    current_directory: Some(ws.path.clone()),
                     state,
                     sessions,
                 }

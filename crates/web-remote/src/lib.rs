@@ -1675,6 +1675,7 @@ mod tests {
         vec![dashboard::WorkspaceSeed {
             id: "ws-1".to_owned(),
             name: "프로젝트".to_owned(),
+            current_directory: None,
             state: dashboard::WorkspaceState::Active,
             sessions,
         }]
@@ -1758,6 +1759,7 @@ mod tests {
                 dashboard::WorkspaceSeed {
                     id: "ws-1".to_owned(),
                     name: "deppy-sijo".to_owned(),
+                    current_directory: None,
                     state: dashboard::WorkspaceState::Active,
                     sessions: vec![dashboard::SessionSeed {
                         id: Some(7),
@@ -1770,6 +1772,7 @@ mod tests {
                 dashboard::WorkspaceSeed {
                     id: "ws-2".to_owned(),
                     name: "source".to_owned(),
+                    current_directory: None,
                     state: dashboard::WorkspaceState::Warm,
                     sessions: vec![dashboard::SessionSeed {
                         id: None,

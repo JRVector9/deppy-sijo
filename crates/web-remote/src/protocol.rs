@@ -109,6 +109,9 @@ pub struct SessionView {
 pub struct WorkspaceView {
     pub id: String,
     pub name: String,
+    /// 연결 화면의 작업 경로. 셸은 textContent로만 렌더한다.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_directory: Option<String>,
     /// "active" | "warm" | "suspended"
     pub state: &'static str,
     pub sessions: Vec<SessionView>,
@@ -773,6 +776,7 @@ mod tests {
                 WorkspaceView {
                     id: "ws-1".into(),
                     name: "deppy-sijo".into(),
+                    current_directory: Some("/Users/jr/deppy-sijo".into()),
                     state: "active",
                     sessions: vec![SessionView {
                         id: Some("u7".into()),
@@ -785,6 +789,7 @@ mod tests {
                 WorkspaceView {
                     id: "ws-2".into(),
                     name: "source".into(),
+                    current_directory: None,
                     state: "warm",
                     // 표시 전용 — id/status 없음(직렬화에서 생략된다)
                     sessions: vec![SessionView {
@@ -807,6 +812,10 @@ mod tests {
         assert!(dash.contains(r#""status":"needs_approval""#), "{dash}");
         assert!(dash.contains(r#""rss_mb":340"#), "{dash}");
         assert!(dash.contains(r#""state":"warm""#), "{dash}");
+        assert!(
+            dash.contains(r#""current_directory":"/Users/jr/deppy-sijo""#),
+            "{dash}"
+        );
         // notice None이면 프레임에 실리지 않는다(skip_serializing_if).
         assert!(!dash.contains(r#""notice""#), "{dash}");
         assert!(

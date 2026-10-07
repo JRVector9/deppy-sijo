@@ -1,3 +1,15 @@
+# 0.8.3 재실행과 nomorevibe 제목 복원 한계 — 2026-10-07
+
+- Current objective: 사용자의 새 명시적 재실행 요청에 따라 검증된 0.8.3 앱으로 교체하고 실제 nomorevibe 세션 제목을 확인한다.
+- Completed work: 실행 중 0.8.0 PID 56575를 AppleScript quit으로 정상 종료하고 PID 소멸을 확인했다. `open -n 'target/staged-0.8.3-20261007/Deppy Sijo.app'`로 0.8.3을 실행해 새 PID 43295와 정확한 앱 경로를 `pgrep -fl`로 확인했다. CUA 실제 화면에서 세션 18개와 nomorevibe pane/터미널 복원을 확인했다. 내부 `<task-notification>` 원문은 더 이상 제목에 보이지 않지만, 제목이 현재 작업 문장 대신 `nomorevibe · 1`로 폴백했다.
+- Modified files: 이 handoff만. Key design decision: 실행 중인 사용자 Claude 세션에 테스트 입력을 보내거나 라이브 DB를 직접 고치지 않는다. 공유 native transcript의 최신 문장을 현재 pane 소유로 추측해 표시하면 과거의 세션 간 제목 혼선이 재발하므로 자동 복원 근거로 쓰지 않는다.
+- Test commands/results: `PlistBuddy` staged bundle short version 0.8.3; AppleScript quit exit0, 기존 PID ps 조회 exit1(종료), `open -n` exit0, `pgrep -fl`에서 새 PID 43295/정확한 0.8.3 bundle 경로 1건. CUA 화면에서 UI 열림/nomorevibe terminal 복원/태그 제거/폴백 제목 확인. 앞선 0.8.3 소스 전체 suite와 package 검증은 바로 아래 section에 기록돼 있으며 이번 재실행에서 반복하지 않았다.
+- Failed approaches/limits: 라이브 DB를 읽기 전용으로 확인하니 nomorevibe 옛 runtime key `:4`의 `task_prompt`는 내부 알림(255자)이었고 새 runtime key `:2`는 빈 값이다. 기존 0.8.0이 마지막 유효 prompt를 알림으로 덮어쓴 뒤 종료됐으므로 0.8.3 필터로 원래 pane별 문장을 역복원할 수 없다. 새 유효한 UserPromptSubmit 입력이 들어오면 0.8.3 저장 필터가 이후 내부 알림 덮어쓰기를 방지하지만, 아직 그 경로를 live UI에서 시험하지 않았다.
+- Remaining work: 재시작 후에도 pane별 작업 미리보기를 안정적으로 복원하려면 runtime SessionId가 아닌 durable pane ID로 마지막 유효 prompt를 영속화하는 별도 구현이 필요하다. 이전에 지워진 특정 문장은 안전한 pane attribution 근거 없이 shared transcript에서 추측하면 안 된다. 다음 변경은 RED 회귀 → 구현 → 관련 전체 테스트 → 0.8.4 이상 버전된 새 bundle 검증 순으로 한다. 이 handoff 문서만 커밋/푸시하고 현재 0.8.3 앱은 유지한다.
+- Exact next commands: `cd /Users/jr/Desktop/projects/deppy-sijo-performance`; `git diff --check`; `git add docs/CODEX_HANDOFF.md`; `git commit -m 'docs: 0.8.3 재실행과 작업 제목 복원 한계 기록'`; `git push origin feat/audit-nine-pr-v0.6.0-20261004`; `git status --short --branch`; `ps -o pid=,etime=,state=,command= -p 43295`. 제품 수정에 착수할 때는 `sed -n '10735,10800p;17955,17995p;19185,19235p' crates/app/src/app.rs`와 `sed -n '354,370p;7500,7545p;7605,7645p' crates/storage/src/db.rs`부터 읽는다.
+
+---
+
 # nomorevibe 세션 제목의 내부 알림 노출 수정 — 2026-10-07
 
 - Current objective: nomorevibe 세션 사이드바 제목에 `<task-notification>` 원문이 노출되는 문제를 고치고 현재 pane의 실제 작업 제목을 유지한다. 이번 요청은 앱 재실행 권한이 없어 실행 중 앱은 유지한다.

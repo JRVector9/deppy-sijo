@@ -4,8 +4,9 @@
 //! ChatGPT Desktop 컴포저처럼 창 하단에 **레이아웃의 일부로 상주**한다 — 팝업/오버레이/
 //! 플로팅 금지(사용자 명시). 워크스페이스당 드래프트 1개, 항상 표시.
 //!
-//! 두 상태: 비활성이면 한 줄 컴팩트 입력, 포커스(클릭) 또는 ⌘J면 여러 줄로 부드럽게
-//! 확장(`animate_value_with_time` 높이 트윈). 전송 대상은 활성 워크스페이스의 포커스된
+//! 입력 영역은 항상 3줄 높이이며 긴 내용은 내부 스크롤로 표시한다. 입력·포커스 변화가
+//! 도크 높이와 PTY 행 수를 바꾸면 TUI 커서 아래의 출력이 소실될 수 있다. 전송 대상은
+//! 활성 워크스페이스의 포커스된
 //! 세션이며 실제 주입(WriteInput)은 app.rs가 한다 — 이 모듈은 leaf UI 경계를 지켜
 //! 런타임/저장소 구체 타입을 직접 만지지 않는다.
 
@@ -34,12 +35,8 @@ const COMPOSER_DELIVERY_MAX_ITEMS: usize = 256;
 const COMPOSER_DELIVERY_MAX_BYTES: usize = 8 * 1024 * 1024;
 /// JSON string escaping은 한 input byte를 최악 6 bytes(`\u00XX`)로 확장한다.
 pub const COMPOSER_HISTORY_FILE_MAX_BYTES: usize = COMPOSER_HISTORY_MAX_BYTES * 6 + 1024;
-/// 펼침 상태 텍스트 영역 상한(줄) — 넘으면 내부 스크롤.
-const MAX_TEXT_ROWS: usize = 8;
-/// 펼침 상태 최소 줄 수 — 빈 버퍼여도 여러 줄 컴포저로 보이게.
-const EXPANDED_MIN_ROWS: usize = 3;
-/// 접힘↔펼침 높이 트윈 시간(초).
-const ANIM_SECONDS: f32 = 0.16;
+/// 포커스·내용과 무관한 입력 높이. 초과 내용은 도크 안에서 스크롤한다.
+const TEXT_ROWS: usize = 3;
 
 fn composer_frame(visuals: &egui::Visuals) -> egui::Frame {
     let tokens = crate::ui::designall::tokens(visuals);
@@ -303,7 +300,8 @@ pub struct ComposerUi {
     active_generation: u64,
     deliveries: HashMap<String, ComposerDelivery>,
     submission_sequence: u64,
-    /// 펼침 상태 — 포커스/⌘J로 열리고, ⌘J/바깥 클릭으로 접힌다.
+    /// 입력 활성 상태 — 포커스/⌘J로 켜지고, ⌘J/바깥 클릭으로 해제한다.
+    /// 키 소유권만 바꾸며 도크 높이는 바꾸지 않는다.
     expanded: bool,
     /// ⌘J(전역 단축키) → 다음 렌더에서 펼침 + 포커스 요청.
     focus_requested: bool,
@@ -979,17 +977,7 @@ impl ComposerUi {
         }
 
         let row_h = ui.text_style_height(&egui::TextStyle::Body);
-        let line_count = buffer.split('\n').count().max(1);
-        let target_rows = if self.expanded {
-            line_count.clamp(EXPANDED_MIN_ROWS, MAX_TEXT_ROWS)
-        } else {
-            1
-        };
-        let text_h = egui_ctx.animate_value_with_time(
-            text_id.with("height"),
-            row_h * target_rows as f32,
-            ANIM_SECONDS,
-        );
+        let text_h = row_h * TEXT_ROWS as f32;
 
         let hint = if !ctx.can_send {
             catalog.t("composer.no_session", &[])
@@ -1044,7 +1032,7 @@ impl ComposerUi {
             let output = egui::ScrollArea::vertical()
                 .id_salt(text_id.with("scroll"))
                 .max_height(text_h)
-                .auto_shrink([false, true])
+                .auto_shrink([false, false])
                 .show(ui, |ui| {
                     egui::TextEdit::multiline(&mut BoundedTextBuffer {
                         text: buffer,
@@ -1057,31 +1045,29 @@ impl ComposerUi {
                     // 카드가 이미 배경/테두리를 그린다 — TextEdit 자체 프레임은 투명.
                     .frame(egui::Frame::NONE)
                     .desired_width(f32::INFINITY)
-                    .desired_rows(target_rows)
+                    .desired_rows(TEXT_ROWS)
                     .hint_text(hint)
                     .return_key(Some(return_key))
                     .show(ui)
                 })
                 .inner;
-            // Restored or blurred drafts still need an explicit send control and
-            // its key/admission feedback; collapsing only reduces the editor.
-            if self.expanded || !buffer.trim().is_empty() {
-                ui.add_space(6.0);
-                let toolbar = self.toolbar(
-                    ui,
-                    catalog,
-                    ctx,
-                    ToolbarInput {
-                        egui_ctx: &egui_ctx,
-                        text_id,
-                        buffer,
-                        may_emit_action: action.is_none(),
-                    },
-                );
-                send_requested |= toolbar.send_clicked;
-                if action.is_none() {
-                    action = toolbar.action;
-                }
+            // Keep the toolbar's space even for empty or blurred drafts. Adding
+            // it on the first character would still shrink the terminal grid.
+            ui.add_space(6.0);
+            let toolbar = self.toolbar(
+                ui,
+                catalog,
+                ctx,
+                ToolbarInput {
+                    egui_ctx: &egui_ctx,
+                    text_id,
+                    buffer,
+                    may_emit_action: action.is_none(),
+                },
+            );
+            send_requested |= toolbar.send_clicked;
+            if action.is_none() {
+                action = toolbar.action;
             }
             notice(ui);
             output
@@ -1173,10 +1159,6 @@ impl ComposerUi {
             if output.response.has_focus() {
                 egui_ctx.memory_mut(|memory| memory.surrender_focus(text_id));
             }
-        }
-        // 애니메이션 중에는 매 프레임 다시 그린다.
-        if (text_h - row_h * target_rows as f32).abs() > 0.5 {
-            egui_ctx.request_repaint();
         }
         action
     }
@@ -1786,7 +1768,7 @@ impl ComposerUi {
         self.expanded = true;
     }
 
-    /// 컴포저 하단 툴바(펼침 상태 또는 미전송 초안) — 셀렉터 3종 + 전송. 셀렉터는 전부 "검토 가능한
+    /// 높이가 일정한 컴포저 하단 툴바 — 셀렉터 3종 + 전송. 셀렉터는 전부 "검토 가능한
     /// 텍스트 삽입"이다: PTY 에이전트에는 외부 제어 프로토콜이 없어 선택이 상태를 직접
     /// 바꿀 수 없고, 사용자가 삽입된 텍스트를 보고 전송한다. 반환: 전송 버튼 클릭.
     fn toolbar(
@@ -4218,6 +4200,92 @@ mod tests {
             .get_by_role(egui::accesskit::Role::MultilineTextInput)
             .click();
         harness.run();
+    }
+
+    #[test]
+    fn composer_focus_and_multiline_draft_preserve_terminal_grid_and_output() {
+        use terminal::TerminalBackend;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let path = test_history_path("stable-terminal-grid");
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui,
+             (composer, backend, sizes): &mut (
+                ComposerUi,
+                terminal::AlacrittyBackend,
+                Vec<u16>,
+            )| {
+                let snapshot = connector_contract::ConnectorSnapshot::default();
+                let context = ComposerContext {
+                    workspace_id: TEST_WS,
+                    draft_key: TEST_WS,
+                    runtime_generation: 1,
+                    send_key: ComposerSendKey::Enter,
+                    can_send: true,
+                    agent: None,
+                    workspace_root: None,
+                    collapse_shortcut: cmd_j(),
+                    connector_snapshot: &snapshot,
+                };
+                egui::Panel::bottom("composer_dock")
+                    .resizable(false)
+                    .show(ui, |ui| {
+                        composer.render(ui, &catalog, &context);
+                    });
+                let rows =
+                    terminal::renderer_egui::grid_rows_for_available(ui.available_height(), 20.0);
+                if backend.grid_dimensions().unwrap().1 != rows {
+                    backend.resize(80, rows).unwrap();
+                }
+                sizes.push(rows);
+            },
+            (
+                ComposerUi::new(path.clone()),
+                terminal::AlacrittyBackend::new(80, 24, 1000),
+                Vec::new(),
+            ),
+        );
+        harness.run_steps(20);
+        let initial_rows = harness.state().1.grid_dimensions().unwrap().1;
+        // A TUI can leave its cursor above displayed output. Shrinking this grid
+        // removes the rows below that cursor, even if the dock later collapses.
+        for row in 1..=initial_rows {
+            harness
+                .state_mut()
+                .1
+                .feed(format!("\x1b[{row};1Hterminal-row-{row:02}").as_bytes())
+                .unwrap();
+        }
+        harness.state_mut().1.feed(b"\x1b[H").unwrap();
+        let initial_output = harness.state().1.screen_text();
+        harness.state_mut().2.clear();
+
+        harness.state_mut().0.request_focus();
+        harness.run_steps(20);
+        harness.state_mut().0.insert_text(
+            TEST_WS,
+            &"한글 경로와 긴 작업 내용을 입력합니다.\n".repeat(40),
+        );
+        harness.run_steps(20);
+        harness.state_mut().0.expanded = false;
+        harness.ctx.memory_mut(|memory| {
+            memory.surrender_focus(ComposerUi::text_id(TEST_WS));
+        });
+        harness.run_steps(20);
+        harness.state_mut().0.buffers.remove(TEST_WS);
+        harness.run_steps(20);
+
+        assert_eq!(
+            harness.state().1.screen_text(),
+            initial_output,
+            "composer editing must not erase terminal rows"
+        );
+        assert!(
+            harness.state().2.iter().all(|rows| *rows == initial_rows),
+            "focus, multiline input and blur must not resize the PTY: {:?}",
+            harness.state().2
+        );
+        std::fs::remove_file(path).ok();
     }
 
     #[test]

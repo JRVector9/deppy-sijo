@@ -1,3 +1,16 @@
+# nomorevibe 세션 제목의 내부 알림 노출 수정 — 2026-10-07
+
+- Current objective: nomorevibe 세션 사이드바 제목에 `<task-notification>` 원문이 노출되는 문제를 고치고 현재 pane의 실제 작업 제목을 유지한다. 이번 요청은 앱 재실행 권한이 없어 실행 중 앱은 유지한다.
+- Completed work: 실행 중 Deppy 0.8.0 화면에서 태그 노출을 확인했다. 읽기 전용 live SQLite에서 nomorevibe workspace의 Claude hook `task_prompt`에 내부 알림이 저장된 행을 확인했다(조회 중 다음 유효한 prompt로 갱신됨). transcript parser는 이미 해당 알림을 거르지만, `UserPromptSubmit` hook 저장과 shared-pane 제목 선택은 별도 필터가 없었다. `storage::task_prompt_is_displayable`을 추가해 내부 알림이 기존 pane 작업 지시를 덮지 않게 하고, App이 기존 오염된 DB 행을 표시하지 않도록 했다. 이후 구버전 라이브 UI에서 제목이 실제 작업 문장인 “문장단위의 검색이 가능한지?”로 회복된 것도 관찰했다. 이는 유효한 새 hook 입력 덕분이며 수정된 0.8.3 UI 동작 검증은 아니다.
+- Modified files/source commit: `crates/storage/src/db.rs`, `crates/storage/src/lib.rs`, `crates/app/src/app.rs`, `Cargo.toml`, `Cargo.lock`은 `1a61c503` (`fix: 세션 작업 제목의 내부 알림 필터 (v0.8.3)`)로 커밋했다. 이 handoff는 후속 문서 변경이다. Key design decision: 실제 사용자 prompt는 pane별 hook 값으로 유지한다. 공유 native transcript는 어느 pane의 최신 응답인지 판별할 수 없어 기존 정책대로 요약을 억제한다. 이미 덮인 prompt는 추측해 복구하지 않고 새 유효 입력을 기다린다.
+- Test commands/results: `storage`와 App 각각 새 회귀 테스트를 구현 전에 RED로 확인했다(둘 다 1FAIL, 기대값과 정확히 불일치). 구현 뒤 둘 다 각각 1PASS. 전체 Storage414PASS, App2775PASS/31ignored, MCP proxy81PASS/1ignored. `cargo fmt --all -- --check` exit0, `RUSTFLAGS='-D warnings' cargo clippy --offline --locked -p storage -p deppy-sijo -p mcp-proxy --all-targets` exit0, `git diff --check`와 staged diff check exit0. 첫 `--exact` 테스트 호출 두 건은 모듈 경로를 빼서 0 tests로 끝났으므로 통과 근거로 쓰지 않는다.
+- Artifact and version proof: root workspace 0.8.2→0.8.3 patch, inherited lock 27개만 offline update. `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 DEPPY_REQUIRE_TRUSTED_SIGNING=0 DEPPY_ALLOW_UNTRUSTED_SIGNING=1 sh scripts/package-macos.sh` exit0. `target/staged-0.8.3-20261007/`에 앱/ZIP을 보존하고 동일 정책으로 `scripts/verify-macos-package.sh` 재검증 exit0. 앱 Info.plist의 `CFBundleShortVersionString`/`CFBundleVersion` 모두 0.8.3; 실행하지 않고 `strings`로 앱 binary `deppy-sijo/0.8.3` 확인. 앱 SHA-256 `8d12b513ea976bcf33b59425ef897bfd7d3d5825461735bba0102bc333396674`, proxy SHA-256 `b88b1d2dbf7dcb449a6fa93409193beca6866dccf267dafb749f3d7d0c553436`. 신규 공증/외부 배포는 하지 않았다.
+- Failed approaches: `cargo test ... -- --exact`는 이름에 `db::tests::`/`app::tests::` 경로를 넣지 않아 0건 선택됐다. 필터 문자열만 주고 재실행해 RED를 검증했다. 실시간 DB row는 조회 중 새 유효 prompt로 바뀌므로 원문 데이터 수정을 하지 않았다.
+- Remaining work: 이 handoff를 커밋/푸시하고 브랜치 clean/upstream 확인. 실행 중 0.8.0 PID 56575는 유지했다. 0.8.3 새 앱의 실제 UI 동작은 재실행 권한이 없어 미검증이다.
+- Exact next commands: `cd /Users/jr/Desktop/projects/deppy-sijo-performance`; `git diff --check`; `git add docs/CODEX_HANDOFF.md`; `git commit -m 'docs: 세션 제목 알림 RCA와 0.8.3 검증 기록'`; `git push origin feat/audit-nine-pr-v0.6.0-20261004`; `git status --short --branch`; `ps -o pid=,etime=,state=,command= -p 56575`. 앱 `open`/종료 명령은 새 재실행 요청이 없으면 실행하지 않는다.
+
+---
+
 # 실제 Claude 다중 행 초안 보호 수정 및 0.8.2 준비 — 2026-10-07
 
 - Current objective: 실제 Deppy 0.8.0 화면에서 재현한 `❯` 첫 행만 빈 Claude 초안이 0.8.1 admission 우회 조건에서 잘못 허용될 수 있는 문제를 수정하고, 새 버전의 로컬 번들을 검증한다. 이번 요청에는 앱 재실행 권한이 없다.

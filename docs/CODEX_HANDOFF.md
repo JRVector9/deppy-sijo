@@ -1,13 +1,15 @@
 # 0.8.7 재빌드·재실행 — 2026-10-08
 
-- Current objective: 사용자 최신 요청 `재빌드하고 재실행해`에 따라 최신 소스를 0.8.7로 패키징·검증하고 실행 중 0.8.3 앱을 교체한다. 이번 작업의 재시작은 명시적으로 허가됨.
+- Current objective: 사용자 최신 요청 `재빌드하고 재실행해`에 따른 0.8.7 패키징·검증·앱 교체 완료. 이번 명시적 재시작 권한은 이 교체에 사용했으며 후속 작업의 자동 재시작을 허용하지 않는다.
 - Completed work: 제품 수정 `3cf8f5b7`, 문서 `bdc20cac`는 원격과 동기화됐고 시작 시 worktree clean 확인. 마지막 제공 번들 0.8.6보다 높은 patch 0.8.7로 canonical workspace Cargo.toml 및 Cargo.lock inherited 27개 패키지를 갱신했다. 의존성 버전은 변경하지 않는다.
 - Modified files: `Cargo.toml`, `Cargo.lock`, 이 handoff. 기존 검증 완료 Composer 3줄 고정/내부 스크롤 수정과 0.8.4~0.8.6 제목·한글 붙여넣기·PWA 변경이 이번 빌드에 포함된다.
 - Key design decisions: 공식 package/verify 스크립트의 기존 로컬 Developer ID 개발 서명 정책을 사용한다. 검증된 새 app을 `target/restart-0.8.7-20261008/`에 보존하고 이전 앱은 새 빌드가 준비된 뒤 정상 종료한다. 새 공증/외부 배포는 요청 범위에 없음. PWA 감사에서 발견한 미구현 5개 항목은 새 수정 없이 그대로 남는다.
-- Test commands/results: `cargo update --offline --workspace` exit0, inherited workspace 27개만 0.8.6→0.8.7. 제품 소스는 마지막 전체 App 2782 PASS/31 ignored, integration 4+5+15+15 PASS, strict Clippy/fmt PASS 이후 변경 없음. 이번 릴리스 빌드/버전·서명·실행 검증 진행 중.
-- Failed approaches: 없음. 직전 GitHub 일반 push 500 이력 및 공식 Git API 같은 SHA 반영 대안은 아래 항목에 기록돼 있다.
-- Remaining work: 버전 변경 커밋, release bundle 생성/검증, exact bundle/binary 0.8.7 확인, 이전 PID43295 정상 종료, 새 앱 실행 및 UI/프로세스 검증, 결과 handoff 기록.
-- Exact next commands: `cd /Users/jr/Desktop/projects/deppy-sijo-performance`; `git diff --check`; `git add Cargo.toml Cargo.lock docs/CODEX_HANDOFF.md`; `git commit -m 'chore: bump local app release to 0.8.7'`; `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 DEPPY_REQUIRE_TRUSTED_SIGNING=0 DEPPY_ALLOW_UNTRUSTED_SIGNING=1 sh scripts/package-macos.sh`. 완료된 앱을 검증한 뒤에만 정상 종료/새 bundle 실행.
+- Test commands/results: `cargo update --offline --workspace` exit0, inherited workspace 27개만 0.8.6→0.8.7. 제품 소스는 마지막 전체 App 2782 PASS/31 ignored, integration 4+5+15+15 PASS, strict Clippy/fmt PASS 이후 변경 없음. `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 DEPPY_REQUIRE_TRUSTED_SIGNING=0 DEPPY_ALLOW_UNTRUSTED_SIGNING=1 sh scripts/package-macos.sh` exit0(릴리스 compile 1m18s). 새 앱 및 ZIP을 `target/restart-0.8.7-20261008/`에 보존하고 같은 정책 verify 스크립트 재실행 exit0. 앱/동반 바이너리 서명·아키텍처·bundle/ZIP 일치 검사 PASS. 로그 `/private/tmp/deppy-0.8.7-{package,verify}-20261008.log`. 번들 두 version key와 binary token 모두 0.8.7 확인. 버전/source commit `b56b5cf5`는 일반 git push로 원격 반영 완료. 버전만 변경한 뒤 전체 unit tests를 다시 실행한 것은 아님.
+- Restart/UI verification: CUA로 이전 앱에 ⌘Q 정상 종료, PID43295 및 모든 deppy-sijo 프로세스가 사라짐 확인 후 정확한 새 번들 경로로 실행. 새 PID71458, 실행 파일 `target/restart-0.8.7-20261008/Deppy Sijo.app/Contents/MacOS/deppy-sijo`, 단일 인스턴스 및 1m54s 생존 확인. 실제 native About에서 `Deppy Sijo Version 0.8.7 (0.8.7)` 확인 후 정보 창을 닫았다. 메인 터미널과 고정 높이 Composer/항상 표시 툴바가 실제 화면에 보임. 사용자 세션에 시험 프롬프트를 전송하지 않았다.
+- Release/version/source proof: 마지막 제공 빌드 0.8.6→0.8.7 patch(이전 실행 앱은 0.8.3), 제품 수정 `3cf8f5b7`, 버전/source `b56b5cf5`. App SHA-256 `d329d1330a58c40039cf7f26c31a55d34532005eeea12ebc4f82adf1fcb9466e`, proxy `9f0e67e1f9bca8efe34ab5db8377cdcdbf8c26ef52d3a3ecb10311a4bc16ef80`, ZIP `e354b5392ce1401edc540b8566e8fb4327ff4f2f23e2c56b83b7a604dd389406`. Bundle identifier `app.vector9.deppy-sijo`, signing TeamIdentifier `ZDTU5LS35K`. 기존 로컬 개발 서명 정책으로 검증했고 새 공증은 하지 않았다.
+- Failed approaches/limits: CUA 첫 종료 요청들은 사용자 화면 변경 freshness guard로 실행이 지연됐으며 최신 AX 재조회와 같은 호출에서 종료를 요청해 성공했다. 종료 후 AX 조회의 procNotFound는 정상 종료 결과이고 새 인스턴스 실행 전에 ps로 확인했다. 직전 GitHub 일반 push 500은 이번 버전 커밋 push에서 재발하지 않았다.
+- Remaining work: 이 완료 기록 커밋/푸시 및 clean 확인. PWA 미구현 5개 사항은 QA 보고서의 별도 후속 기능 작업이고 이번 재빌드에서 고쳤다고 주장하지 않는다. 후속 앱 재시작은 새 사용자 지시 필요.
+- Exact next commands: `cd /Users/jr/Desktop/projects/deppy-sijo-performance`; `git diff --check`; `git add docs/CODEX_HANDOFF.md`; `git commit -m 'docs: record verified 0.8.7 rebuild and restart'`; `git push origin feat/audit-nine-pr-v0.6.0-20261004`; `git status --short --branch`; `ps -o pid=,etime=,state=,command= -p 71458`.
 
 ---
 

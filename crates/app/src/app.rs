@@ -30975,7 +30975,7 @@ impl App {
         }
     }
 
-    fn render_composer_dock(&mut self, ui: &mut egui::Ui, text: &i18n::Catalog) {
+    fn render_composer_dock(&mut self, ui: &mut egui::Ui, text: &i18n::Catalog) -> f32 {
         let primary_session = self.active.workspace_ui.focused_session();
         let composer_target = focused_composer_target_for_owner(
             self.frame_terminal_owner,
@@ -31074,7 +31074,9 @@ impl App {
         let prompt_library_readonly = prompt_save_status.write_blocking_error().is_some();
         self.prompt_palette.set_read_only(prompt_library_readonly);
         let mut retry_draft_save = false;
-        let composer_action = {
+        let (composer_action, height_expansion) = {
+            let available_before = ui.available_height();
+            let mut prompt_row_height = 0.0;
             let dock_frame =
                 ui::designall::structural_frame(ui.visuals()).inner_margin(egui::Margin {
                     left: 10,
@@ -31082,6 +31084,7 @@ impl App {
                     top: 8,
                     bottom: 10,
                 });
+            let dock_margin = dock_frame.total_margin().sum().y;
             let composer = &mut self.composer;
             let composer_ctx = ui::composer::ComposerContext {
                 workspace_id: &composer_workspace_id,
@@ -31105,7 +31108,7 @@ impl App {
                     // 단축키 대신 버튼으로 연다. 툴바 스타일(small_button "/model")과 맞춘다.
                     // 설정에서 끄면(PR-7) 버튼을 숨긴다.
                     if prompt_library_enabled {
-                        ui.horizontal(|ui| {
+                        let response = ui.horizontal(|ui| {
                             if ui
                                 .small_button("/prompt")
                                 .on_hover_text(text.t("composer.prompt_hint", &[]))
@@ -31121,6 +31124,8 @@ impl App {
                                 prompt_save_path,
                             );
                         });
+                        prompt_row_height =
+                            response.response.rect.height() + ui.spacing().item_spacing.y;
                     }
                     composer.render_with_notice(ui, text, &composer_ctx, |ui| {
                         retry_draft_save = render_composer_draft_save_status(
@@ -31142,7 +31147,14 @@ impl App {
                 separator_y,
                 ui::designall::separator_stroke(ui.visuals()),
             );
-            dock_response.inner
+            (
+                dock_response.inner,
+                available_before
+                    - ui.available_height()
+                    - dock_margin
+                    - prompt_row_height
+                    - composer.compact_height(),
+            )
         };
         if retry_draft_save {
             self.composer_checkpoint_at = Some(std::time::Instant::now());
@@ -31280,6 +31292,7 @@ impl App {
             }
             None => {}
         }
+        height_expansion
     }
 
     /// Checkpoint the Pending marker before any PTY effect. The single deferred slot
@@ -34585,11 +34598,21 @@ impl eframe::App for App {
         }
         // 컴포저는 터미널 표면에만 붙는다. 홈/작업함/fleet은 전체 폭 페이지가 중앙을 쓴다.
         // 이력·Git 탭이 활성이면 보낼 터미널이 없으므로 함께 감춘다.
-        if terminal_visible
+        let composer_visible = terminal_visible
             && !(history_tab_active || git_tab_active || document_tab_active)
-            && self.config.ui.composer_enabled
-        {
-            self.render_composer_dock(ui, &text);
+            && self.config.ui.composer_enabled;
+        let composer_height_expansion = if composer_visible {
+            self.render_composer_dock(ui, &text)
+        } else {
+            0.0
+        };
+        self.active
+            .workspace_ui
+            .set_composer_height_expansion(composer_height_expansion);
+        for runtime in self.warm.values_mut() {
+            runtime
+                .workspace_ui
+                .set_composer_height_expansion(composer_height_expansion);
         }
 
         // 작업창은 여백 없이 경계까지 채운다 — CentralPanel 기본 inner_margin(8) 탓에

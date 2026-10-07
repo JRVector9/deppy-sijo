@@ -4,8 +4,8 @@
 //! ChatGPT Desktop 컴포저처럼 창 하단에 **레이아웃의 일부로 상주**한다 — 팝업/오버레이/
 //! 플로팅 금지(사용자 명시). 워크스페이스당 드래프트 1개, 항상 표시.
 //!
-//! 입력 영역은 항상 3줄 높이이며 긴 내용은 내부 스크롤로 표시한다. 입력·포커스 변화가
-//! 도크 높이와 PTY 행 수를 바꾸면 TUI 커서 아래의 출력이 소실될 수 있다. 전송 대상은
+//! 입력 영역은 비활성 1줄, 포커스 시 3–8줄이며 긴 내용은 내부 스크롤로 표시한다.
+//! 호스트는 접힌 높이를 기준으로 PTY 행 수를 유지해 확장 중 출력이 소실되지 않게 한다. 전송 대상은
 //! 활성 워크스페이스의 포커스된
 //! 세션이며 실제 주입(WriteInput)은 app.rs가 한다 — 이 모듈은 leaf UI 경계를 지켜
 //! 런타임/저장소 구체 타입을 직접 만지지 않는다.
@@ -35,8 +35,8 @@ const COMPOSER_DELIVERY_MAX_ITEMS: usize = 256;
 const COMPOSER_DELIVERY_MAX_BYTES: usize = 8 * 1024 * 1024;
 /// JSON string escaping은 한 input byte를 최악 6 bytes(`\u00XX`)로 확장한다.
 pub const COMPOSER_HISTORY_FILE_MAX_BYTES: usize = COMPOSER_HISTORY_MAX_BYTES * 6 + 1024;
-/// 포커스·내용과 무관한 입력 높이. 초과 내용은 도크 안에서 스크롤한다.
-const TEXT_ROWS: usize = 3;
+const EXPANDED_MIN_ROWS: usize = 3;
+const EXPANDED_MAX_ROWS: usize = 8;
 
 fn composer_frame(visuals: &egui::Visuals) -> egui::Frame {
     let tokens = crate::ui::designall::tokens(visuals);
@@ -301,8 +301,9 @@ pub struct ComposerUi {
     deliveries: HashMap<String, ComposerDelivery>,
     submission_sequence: u64,
     /// 입력 활성 상태 — 포커스/⌘J로 켜지고, ⌘J/바깥 클릭으로 해제한다.
-    /// 키 소유권만 바꾸며 도크 높이는 바꾸지 않는다.
     expanded: bool,
+    /// One-row card height used by the host to retain terminal sizing during growth.
+    compact_height: f32,
     /// ⌘J(전역 단축키) → 다음 렌더에서 펼침 + 포커스 요청.
     focus_requested: bool,
     /// 보낸 프롬프트(오래된 것 → 최신). 시작 시 파일에서 1회 로드하고, 전송 시에는
@@ -368,6 +369,7 @@ impl ComposerUi {
             deliveries: HashMap::new(),
             submission_sequence: 0,
             expanded: false,
+            compact_height: 0.0,
             focus_requested: false,
             history: load_history(&history_path).into(),
             history_pos: None,
@@ -863,6 +865,10 @@ impl ComposerUi {
         egui::Id::new("composer_text_active")
     }
 
+    pub(crate) fn compact_height(&self) -> f32 {
+        self.compact_height
+    }
+
     #[cfg(test)]
     pub fn render(
         &mut self,
@@ -977,7 +983,15 @@ impl ComposerUi {
         }
 
         let row_h = ui.text_style_height(&egui::TextStyle::Body);
-        let text_h = row_h * TEXT_ROWS as f32;
+        let text_rows = if self.expanded {
+            buffer
+                .lines()
+                .count()
+                .clamp(EXPANDED_MIN_ROWS, EXPANDED_MAX_ROWS)
+        } else {
+            1
+        };
+        let text_h = row_h * text_rows as f32;
 
         let hint = if !ctx.can_send {
             catalog.t("composer.no_session", &[])
@@ -1025,6 +1039,7 @@ impl ComposerUi {
         let backup_undo = backup_state.as_ref().map(|state| state.undoer());
         let mut rejected = false;
         let card = composer_frame(ui.visuals());
+        self.compact_height = row_h + card.total_margin().sum().y;
         let card_response = card.show(ui, |ui| {
             if self.read_only {
                 ui.disable();
@@ -1032,6 +1047,7 @@ impl ComposerUi {
             let output = egui::ScrollArea::vertical()
                 .id_salt(text_id.with("scroll"))
                 .max_height(text_h)
+                .min_scrolled_height(0.0)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     egui::TextEdit::multiline(&mut BoundedTextBuffer {
@@ -1045,29 +1061,29 @@ impl ComposerUi {
                     // 카드가 이미 배경/테두리를 그린다 — TextEdit 자체 프레임은 투명.
                     .frame(egui::Frame::NONE)
                     .desired_width(f32::INFINITY)
-                    .desired_rows(TEXT_ROWS)
+                    .desired_rows(text_rows)
                     .hint_text(hint)
                     .return_key(Some(return_key))
                     .show(ui)
                 })
                 .inner;
-            // Keep the toolbar's space even for empty or blurred drafts. Adding
-            // it on the first character would still shrink the terminal grid.
-            ui.add_space(6.0);
-            let toolbar = self.toolbar(
-                ui,
-                catalog,
-                ctx,
-                ToolbarInput {
-                    egui_ctx: &egui_ctx,
-                    text_id,
-                    buffer,
-                    may_emit_action: action.is_none(),
-                },
-            );
-            send_requested |= toolbar.send_clicked;
-            if action.is_none() {
-                action = toolbar.action;
+            if self.expanded || !buffer.is_empty() {
+                ui.add_space(6.0);
+                let toolbar = self.toolbar(
+                    ui,
+                    catalog,
+                    ctx,
+                    ToolbarInput {
+                        egui_ctx: &egui_ctx,
+                        text_id,
+                        buffer,
+                        may_emit_action: action.is_none(),
+                    },
+                );
+                send_requested |= toolbar.send_clicked;
+                if action.is_none() {
+                    action = toolbar.action;
+                }
             }
             notice(ui);
             output
@@ -4203,6 +4219,43 @@ mod tests {
     }
 
     #[test]
+    fn composer_focus_expands_and_blur_returns_to_compact_height() {
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let path = test_history_path("focus-height");
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, (composer, height): &mut (ComposerUi, f32)| {
+                let snapshot = ConnectorSnapshot::default();
+                let context = ComposerContext {
+                    workspace_id: TEST_WS,
+                    draft_key: TEST_WS,
+                    runtime_generation: 1,
+                    send_key: ComposerSendKey::Enter,
+                    can_send: true,
+                    agent: None,
+                    workspace_root: None,
+                    collapse_shortcut: cmd_j(),
+                    connector_snapshot: &snapshot,
+                };
+                composer.render(ui, &catalog, &context);
+                *height = ui.min_rect().height();
+            },
+            (ComposerUi::new(path.clone()), 0.0),
+        );
+        harness.run_steps(20);
+        let compact = harness.state().1;
+        harness.state_mut().0.request_focus();
+        harness.run_steps(20);
+        assert!(harness.state().1 > compact + 20.0);
+        harness.state_mut().0.expanded = false;
+        harness.ctx.memory_mut(|memory| {
+            memory.surrender_focus(ComposerUi::text_id(TEST_WS));
+        });
+        harness.run_steps(20);
+        assert!((harness.state().1 - compact).abs() < 1.0);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
     fn composer_focus_and_multiline_draft_preserve_terminal_grid_and_output() {
         use terminal::TerminalBackend;
 
@@ -4227,13 +4280,18 @@ mod tests {
                     collapse_shortcut: cmd_j(),
                     connector_snapshot: &snapshot,
                 };
+                let before = ui.available_height();
                 egui::Panel::bottom("composer_dock")
+                    .frame(egui::Frame::NONE)
                     .resizable(false)
                     .show(ui, |ui| {
                         composer.render(ui, &catalog, &context);
                     });
-                let rows =
-                    terminal::renderer_egui::grid_rows_for_available(ui.available_height(), 20.0);
+                let rows = terminal::renderer_egui::grid_rows_for_available(
+                    ui.available_height()
+                        + (before - ui.available_height() - composer.compact_height()),
+                    20.0,
+                );
                 if backend.grid_dimensions().unwrap().1 != rows {
                     backend.resize(80, rows).unwrap();
                 }

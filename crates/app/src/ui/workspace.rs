@@ -1966,6 +1966,8 @@ pub(crate) struct SelectedAgentPrompt {
 
 pub struct WorkspaceUi {
     mux: Option<Arc<MuxSnapshot>>,
+    /// Composer growth crops the viewport; only permanent layout changes resize PTYs.
+    composer_height_expansion: f32,
     pub cloud_answers: Arc<[crate::ui::cloud_answer::Answer]>,
     pub selected_cloud_answer: Option<String>,
     sessions: HashMap<SessionId, SessionView>,
@@ -3003,6 +3005,10 @@ impl SessionView {
 }
 
 impl WorkspaceUi {
+    pub(crate) fn set_composer_height_expansion(&mut self, height: f32) {
+        self.composer_height_expansion = if height.is_finite() { height } else { 0.0 };
+    }
+
     pub fn with_resize_owner(owner: [u8; 16]) -> Self {
         let mut view = Self::new();
         view.resize_owner = owner;
@@ -3012,6 +3018,7 @@ impl WorkspaceUi {
     pub fn new() -> Self {
         Self {
             mux: None,
+            composer_height_expansion: 0.0,
             cloud_answers: Arc::from([]),
             selected_cloud_answer: None,
             sessions: HashMap::new(),
@@ -6091,6 +6098,10 @@ impl WorkspaceUi {
         let pane_output = self.render_node(
             ui,
             rect,
+            egui::Rect::from_min_max(
+                rect.min,
+                rect.max + egui::vec2(0.0, self.composer_height_expansion),
+            ),
             layout,
             &layout_metrics,
             0,
@@ -6221,6 +6232,7 @@ impl WorkspaceUi {
             surface.focus_requested = self
                 .render_pane(
                     &mut child,
+                    self.composer_height_expansion,
                     &target.pane,
                     mux,
                     config,
@@ -6978,6 +6990,7 @@ impl WorkspaceUi {
         &mut self,
         ui: &mut egui::Ui,
         rect: egui::Rect,
+        sizing_rect: egui::Rect,
         node: &LayoutNode,
         layout_metrics: &[TerminalLayoutMetric],
         metric_index: usize,
@@ -6997,6 +7010,7 @@ impl WorkspaceUi {
                 child.set_clip_rect(rect.intersect(ui.clip_rect()));
                 self.render_pane(
                     &mut child,
+                    sizing_rect.height() - rect.height(),
                     pane_id,
                     mux,
                     config,
@@ -7054,10 +7068,20 @@ impl WorkspaceUi {
                     terminal_split_ratio(rect, *direction, requested_ratio, first_min, second_min);
                 let (first_rect, second_rect, gap_rect) =
                     terminal_split_rects(rect, *direction, ratio);
+                let sizing_ratio = terminal_split_ratio(
+                    sizing_rect,
+                    *direction,
+                    requested_ratio,
+                    first_min,
+                    second_min,
+                );
+                let (first_sizing_rect, second_sizing_rect, _) =
+                    terminal_split_rects(sizing_rect, *direction, sizing_ratio);
                 path.push(0);
                 let mut output = self.render_node(
                     ui,
                     first_rect,
+                    first_sizing_rect,
                     first,
                     layout_metrics,
                     first_metric_index,
@@ -7074,6 +7098,7 @@ impl WorkspaceUi {
                 output.merge(self.render_node(
                     ui,
                     second_rect,
+                    second_sizing_rect,
                     second,
                     layout_metrics,
                     second_metric_index,
@@ -7145,6 +7170,7 @@ impl WorkspaceUi {
     fn render_pane(
         &mut self,
         ui: &mut egui::Ui,
+        extra_height: f32,
         pane_id: &runtime::MuxPaneId,
         mux: &MuxSnapshot,
         config: &TerminalConfig,
@@ -7184,6 +7210,15 @@ impl WorkspaceUi {
             .is_some_and(|view| view.restored_readonly && view.exit_code.is_some());
         let pane_layout =
             terminal_pane_layout_for_state(ui.max_rect(), embedded_header, show_archived_notice);
+        let sizing_layout = terminal_pane_layout_for_state(
+            egui::Rect::from_min_max(
+                ui.max_rect().min,
+                ui.max_rect().max + egui::vec2(0.0, extra_height),
+            ),
+            embedded_header,
+            show_archived_notice,
+        );
+        let extra_height = sizing_layout.content.height() - pane_layout.content.height();
         let pane_rect = pane_layout.surface;
         let tokens = crate::ui::designall::tokens(ui.visuals());
         ui.painter()
@@ -7445,7 +7480,7 @@ impl WorkspaceUi {
                 .is_some_and(|view| view.snapshot.is_some());
         if layout_ready {
             let cols = renderer_egui::grid_cols_for_available(avail.x, cell.x);
-            let rows = renderer_egui::grid_rows_for_available(avail.y, cell.y);
+            let rows = renderer_egui::grid_rows_for_available(avail.y + extra_height, cell.y);
             let rows =
                 u32::from(rows).min(runtime::TERMINAL_CELL_COUNT_MAX / u32::from(cols)) as u16;
             // 기존 디바운스와 실제 적용 세대 확인을 거쳐 최종 크기만 표시한다.
@@ -7633,7 +7668,7 @@ impl WorkspaceUi {
             .and_then(|(s, a, b)| (s == session).then_some((a.min(b), a.max(b))));
         let output = {
             let view = self.sessions.entry(session).or_default();
-            renderer_egui::draw_with_preedit(
+            renderer_egui::draw_with_preedit_in_viewport(
                 ui,
                 &snapshot,
                 metrics,
@@ -7642,6 +7677,7 @@ impl WorkspaceUi {
                 terminal_ime_active,
                 selection_range,
                 view.snapshot_gen,
+                extra_height > 0.0,
             )
         };
         // B1 실측: 이 프레임에 그린 pane들의 렌더 비용을 합산한다 (visible pane 전부).
@@ -18030,6 +18066,131 @@ mod tests {
             active_tab: Some(tab_id(active)),
             focused_pane: Some(pane_id(focused)),
         })
+    }
+
+    #[test]
+    fn composer_growth_keeps_nested_pane_sizes_and_window_resize_still_changes_them() {
+        let config = TerminalConfig::default();
+        let catalog = catalog();
+        let mut workspace = WorkspaceUi::new();
+        let sessions = [SessionId(71), SessionId(72), SessionId(73)];
+        let panes = ["upper", "lower-left", "lower-right"];
+        workspace.mux = Some(mux(
+            "primary",
+            vec![tab(
+                "primary",
+                panes
+                    .iter()
+                    .zip(sessions)
+                    .map(|(name, session)| pane(name, session))
+                    .collect(),
+                LayoutNode::Split {
+                    direction: SplitDirection::Vertical,
+                    ratio: 0.4,
+                    first: Box::new(LayoutNode::Pane(pane_id(panes[0]))),
+                    second: Box::new(LayoutNode::Split {
+                        direction: SplitDirection::Horizontal,
+                        ratio: 0.5,
+                        first: Box::new(LayoutNode::Pane(pane_id(panes[1]))),
+                        second: Box::new(LayoutNode::Pane(pane_id(panes[2]))),
+                    }),
+                },
+            )],
+            panes[0],
+        ));
+        for session in sessions {
+            workspace.sessions.entry(session).or_default().snapshot = Some(snapshot("ready"));
+        }
+        let history = std::env::temp_dir().join(format!(
+            "deppy-composer-layout-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui,
+                  (workspace, composer, sizes): &mut (
+                WorkspaceUi,
+                super::super::composer::ComposerUi,
+                HashMap<SessionId, (u16, u16)>,
+            )| {
+                let connectors = connector_contract::ConnectorSnapshot::default();
+                let context = super::super::composer::ComposerContext {
+                    workspace_id: "composer-ws",
+                    draft_key: "composer-ws",
+                    runtime_generation: 1,
+                    send_key: crate::config::ComposerSendKey::Enter,
+                    can_send: true,
+                    agent: None,
+                    workspace_root: None,
+                    collapse_shortcut: None,
+                    connector_snapshot: &connectors,
+                };
+                let frame = egui::Frame::NONE.inner_margin(egui::Margin::symmetric(10, 9));
+                let before = ui.available_height();
+                egui::Panel::bottom("composer-test")
+                    .frame(frame)
+                    .resizable(false)
+                    .show(ui, |ui| {
+                        composer.render(ui, &catalog, &context);
+                    });
+                workspace.set_composer_height_expansion(
+                    before
+                        - ui.available_height()
+                        - frame.total_margin().sum().y
+                        - composer.compact_height(),
+                );
+                workspace.show_with_input(ui, &config, &[], &catalog, false);
+                if !ui.is_sizing_pass() {
+                    *sizes = workspace
+                        .staged_terminal_resizes
+                        .iter()
+                        .map(|(session, resize)| (*session, (resize.cols, resize.rows)))
+                        .collect();
+                }
+            },
+            (
+                workspace,
+                super::super::composer::ComposerUi::new(history),
+                HashMap::new(),
+            ),
+        );
+        harness.run_steps(20);
+        let compact = harness.state().2.clone();
+        assert_eq!(compact.len(), 3);
+        harness.state_mut().1.request_focus();
+        harness.run_steps(20);
+        assert_eq!(harness.state().2, compact);
+        harness
+            .state_mut()
+            .1
+            .insert_text("composer-ws", &"긴 한글 입력\n".repeat(40));
+        harness.run_steps(20);
+        assert_eq!(harness.state().2, compact);
+        harness.event(egui::Event::PointerMoved(egui::pos2(20.0, 20.0)));
+        harness.event(egui::Event::PointerButton {
+            pos: egui::pos2(20.0, 20.0),
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.event(egui::Event::PointerButton {
+            pos: egui::pos2(20.0, 20.0),
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run_steps(20);
+        assert_eq!(harness.state().2, compact);
+        harness.set_size(egui::vec2(600.0, 420.0));
+        harness.run_steps(20);
+        assert_ne!(
+            harness.state().2,
+            compact,
+            "actual window resizing must still resize PTYs"
+        );
     }
 
     #[test]

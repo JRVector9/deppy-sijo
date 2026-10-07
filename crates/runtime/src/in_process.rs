@@ -11936,7 +11936,12 @@ mod tests {
             Ok(()),
             "positive empty cursor-row and foreground control"
         );
-        for input in [b"\x1b[".as_slice(), b"D\x1b[I\x7f", b"\x1b[200~\x1b[201~"] {
+        for input in [
+            b"\x1b[".as_slice(),
+            b"D\x1b[I\x7f",
+            b"\x1b[200~\x1b[201~",
+            b"\x14",
+        ] {
             worker.detectors.get_mut(&id).unwrap().on_user_input(input);
         }
         assert_eq!(

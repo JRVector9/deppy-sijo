@@ -432,7 +432,7 @@ impl StatusDetector {
         if erase {
             self.input_draft_erase_requested = true;
             self.input_draft_erase_redrawn = false;
-        } else if byte != 0 {
+        } else if byte != 0 && byte != 20 {
             // A later key can add/recall text; only the last accepted edit may prove empty.
             self.input_draft_erase_requested = false;
             self.input_draft_erase_redrawn = false;
@@ -462,7 +462,9 @@ impl StatusDetector {
             InputSequence::Ground => match byte {
                 0x1b => self.input_sequence = InputSequence::Escape,
                 // Cursor movement, deletion, redraw and erase cannot introduce new text.
-                0 | 1 | 2 | 4 | 5 | 6 | 8 | 11 | 12 | 21 | 23 | 127 => {}
+                // Ctrl+T transposes existing readline text or toggles Claude's
+                // task display. It cannot introduce text into an empty editor.
+                0 | 1 | 2 | 4 | 5 | 6 | 8 | 11 | 12 | 20 | 21 | 23 | 127 => {}
                 _ => self.input_draft_dirty = true,
             },
             InputSequence::Escape => {
@@ -775,6 +777,35 @@ mod tests {
         assert!(
             d.has_input_draft(),
             "navigation/deletion cannot prove genuine draft erased"
+        );
+    }
+
+    #[test]
+    fn ctrl_t_does_not_create_a_phantom_draft_or_clear_real_text() {
+        let mut detector = StatusDetector::new(StatusPatterns::compile(None, None, None, None));
+        assert!(!detector.on_user_input(b"\x14"));
+        assert!(
+            !detector.has_input_draft(),
+            "Claude's display control is not text"
+        );
+        detector.on_user_input(b"real native draft\x14");
+        assert!(
+            detector.has_input_draft(),
+            "a control key cannot erase existing draft evidence"
+        );
+        detector.on_user_input(b"\r");
+        assert!(!detector.has_input_draft());
+        detector.on_user_input(b"native text\x15");
+        detector.on_output(b"redraw");
+        detector.on_user_input(b"\x14");
+        assert!(
+            detector.has_redrawn_erase_attempt(),
+            "display controls preserve verified erase evidence"
+        );
+        detector.on_user_input(b"\r\x1b[200~\x14\x1b[201~");
+        assert!(
+            detector.has_input_draft(),
+            "paste payloads remain protected"
         );
     }
 

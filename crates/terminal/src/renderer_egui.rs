@@ -517,6 +517,32 @@ pub fn draw_with_preedit(
     selection: Option<(usize, usize)>,
     snapshot_gen: u64,
 ) -> RenderOutput {
+    draw_with_preedit_in_viewport(
+        ui,
+        snapshot,
+        metrics,
+        cache,
+        preedit,
+        ime_active,
+        selection,
+        snapshot_gen,
+        false,
+    )
+}
+
+/// Crop a retained grid during transient Composer growth without resizing the PTY.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_with_preedit_in_viewport(
+    ui: &mut egui::Ui,
+    snapshot: &TerminalViewportSnapshot,
+    metrics: CellMetrics,
+    cache: &mut TerminalRenderCache,
+    preedit: Option<PreeditView<'_>>,
+    ime_active: bool,
+    selection: Option<(usize, usize)>,
+    snapshot_gen: u64,
+    crop_retained_grid: bool,
+) -> RenderOutput {
     let font_id = egui::FontId::monospace(metrics.font_size);
     let cell = cell_size(ui.ctx(), metrics);
     let bold_family_ready = mono_bold_family_ready(ui.ctx());
@@ -579,7 +605,16 @@ pub fn draw_with_preedit(
     // painter: 아래에서 논리(역변환) clip으로 바뀐다 — 나머지 그리드가 쓴다.
     let screen_painter = background_painter.with_clip_rect(content_rect);
     let mut painter = screen_painter.clone();
-    let origin = content_rect.min;
+    let mut origin = content_rect.min;
+    if crop_retained_grid && snapshot.scroll_offset == 0 {
+        let overflow = (f32::from(snapshot.rows) * cell.y * scale - content_rect.height()).max(0.0);
+        let pan = if snapshot.cursor.visible {
+            overflow.min(f32::from(snapshot.cursor.row) * cell.y * scale)
+        } else {
+            overflow
+        };
+        origin.y -= pan;
+    }
     // 그리드는 **축소 전 좌표**(원래 cell·origin)로 그린 뒤 이 변환으로 한 번에 줄인다.
     // scale == 1이면 항등이라 아래 경로가 전부 기존 동작 그대로다.
     let transform = grid_fit_transform(origin, scale);
@@ -1928,6 +1963,67 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["한글", "A", "가나", "다라"]
         );
+    }
+
+    #[test]
+    fn retained_viewport_keeps_cursor_and_hit_coordinates_inside_the_clip() {
+        for width_scale in [1.0, 0.55] {
+            let mut snapshot = snap(20, 20, &["first row"]);
+            snapshot.cursor.row = 19;
+            snapshot.cursor.col = 2;
+            snapshot.cursor.visible = true;
+            let ctx = egui::Context::default();
+            let mut cache = TerminalRenderCache::default();
+            let mut measured = None;
+            ctx.run_ui(egui::RawInput::default(), |ui| {
+                let metrics = m(13.0, 1.0);
+                let cell = cell_size(ui.ctx(), metrics);
+                let rect = egui::Rect::from_min_size(
+                    egui::pos2(20.0, 20.0),
+                    egui::vec2(
+                        cell.x * 20.0 * width_scale + 2.0 * HORIZONTAL_PADDING,
+                        cell.y * 4.0,
+                    ),
+                );
+                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+                child.set_clip_rect(rect);
+                let output = draw_with_preedit_in_viewport(
+                    &mut child,
+                    &snapshot,
+                    metrics,
+                    &mut cache,
+                    None,
+                    false,
+                    None,
+                    next_gen(),
+                    true,
+                );
+                measured = Some((output.origin, output.cell_size, output.response.rect));
+            })
+            .drop_without_applying_deltas();
+            let (origin, cell, rect) = measured.unwrap();
+            let cursor_center = origin + egui::vec2(cell.x * 2.5, cell.y * 19.5);
+            assert!(origin.y < rect.top());
+            assert!(rect.contains(cursor_center));
+            assert_eq!(((cursor_center.y - origin.y) / cell.y).floor() as u16, 19);
+            assert_eq!(((cursor_center.x - origin.x) / cell.x).floor() as u16, 2);
+            snapshot.cursor.row = 0;
+            ctx.run_ui(egui::RawInput::default(), |ui| {
+                let output = draw_with_preedit_in_viewport(
+                    ui,
+                    &snapshot,
+                    m(13.0, 1.0),
+                    &mut cache,
+                    None,
+                    false,
+                    None,
+                    next_gen(),
+                    true,
+                );
+                assert!((output.origin.y - output.response.rect.top()).abs() < 0.01);
+            })
+            .drop_without_applying_deltas();
+        }
     }
 
     #[test]

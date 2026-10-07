@@ -1,3 +1,16 @@
+# 0.8.7 재빌드·재실행 — 2026-10-08
+
+- Current objective: 사용자 최신 요청 `재빌드하고 재실행해`에 따라 최신 소스를 0.8.7로 패키징·검증하고 실행 중 0.8.3 앱을 교체한다. 이번 작업의 재시작은 명시적으로 허가됨.
+- Completed work: 제품 수정 `3cf8f5b7`, 문서 `bdc20cac`는 원격과 동기화됐고 시작 시 worktree clean 확인. 마지막 제공 번들 0.8.6보다 높은 patch 0.8.7로 canonical workspace Cargo.toml 및 Cargo.lock inherited 27개 패키지를 갱신했다. 의존성 버전은 변경하지 않는다.
+- Modified files: `Cargo.toml`, `Cargo.lock`, 이 handoff. 기존 검증 완료 Composer 3줄 고정/내부 스크롤 수정과 0.8.4~0.8.6 제목·한글 붙여넣기·PWA 변경이 이번 빌드에 포함된다.
+- Key design decisions: 공식 package/verify 스크립트의 기존 로컬 Developer ID 개발 서명 정책을 사용한다. 검증된 새 app을 `target/restart-0.8.7-20261008/`에 보존하고 이전 앱은 새 빌드가 준비된 뒤 정상 종료한다. 새 공증/외부 배포는 요청 범위에 없음. PWA 감사에서 발견한 미구현 5개 항목은 새 수정 없이 그대로 남는다.
+- Test commands/results: `cargo update --offline --workspace` exit0, inherited workspace 27개만 0.8.6→0.8.7. 제품 소스는 마지막 전체 App 2782 PASS/31 ignored, integration 4+5+15+15 PASS, strict Clippy/fmt PASS 이후 변경 없음. 이번 릴리스 빌드/버전·서명·실행 검증 진행 중.
+- Failed approaches: 없음. 직전 GitHub 일반 push 500 이력 및 공식 Git API 같은 SHA 반영 대안은 아래 항목에 기록돼 있다.
+- Remaining work: 버전 변경 커밋, release bundle 생성/검증, exact bundle/binary 0.8.7 확인, 이전 PID43295 정상 종료, 새 앱 실행 및 UI/프로세스 검증, 결과 handoff 기록.
+- Exact next commands: `cd /Users/jr/Desktop/projects/deppy-sijo-performance`; `git diff --check`; `git add Cargo.toml Cargo.lock docs/CODEX_HANDOFF.md`; `git commit -m 'chore: bump local app release to 0.8.7'`; `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 DEPPY_REQUIRE_TRUSTED_SIGNING=0 DEPPY_ALLOW_UNTRUSTED_SIGNING=1 sh scripts/package-macos.sh`. 완료된 앱을 검증한 뒤에만 정상 종료/새 bundle 실행.
+
+---
+
 # 모바일 PWA 감사 완료·Composer 높이 변경 손실 수정 — 2026-10-08
 
 - Current objective: 검증 완료한 Mac Composer 수정 및 PWA 감사 기록을 현재 브랜치에 커밋하고 원격에 반영 완료. 이 완료 기록도 후속 문서 커밋으로 동기화한다. 현재 요청에 앱 재시작 권한 없음.

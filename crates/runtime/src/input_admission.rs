@@ -124,6 +124,25 @@ enum PromptRow {
     Unknown,
 }
 
+fn is_native_editor_border(cells: &[terminal::TerminalCell], prompt_fg: [u8; 3]) -> bool {
+    let mut strokes = 0;
+    let mut border_fg = None;
+    for cell in cells {
+        if cell.c.is_whitespace() {
+            continue;
+        }
+        if !matches!(cell.c, '─' | '━' | '═') || cell.fg == prompt_fg {
+            return false;
+        }
+        if border_fg.is_some_and(|fg| fg != cell.fg) {
+            return false;
+        }
+        border_fg = Some(cell.fg);
+        strokes += 1;
+    }
+    strokes >= cells.len().saturating_mul(3) / 4
+}
+
 fn prompt_row(
     snapshot: &terminal::TerminalViewportSnapshot,
     provider: AgentPromptKind,
@@ -151,6 +170,26 @@ fn prompt_row(
     }
     let tail = &cells[index + 1..];
     if tail.iter().all(|cell| cell.c.is_whitespace()) {
+        // Claude's multiline editor keeps its ❯ marker on the first row even
+        // when Ctrl+U clears that row and later draft lines remain. The bottom
+        // rule separates those lines from status/footer content.
+        if provider == AgentPromptKind::Claude {
+            for row in usize::from(snapshot.cursor.row) + 1..usize::from(snapshot.rows) {
+                let start = row * usize::from(snapshot.cols);
+                let Some(next) = snapshot
+                    .visible_cells
+                    .get(start..start + usize::from(snapshot.cols))
+                else {
+                    return PromptRow::Unknown;
+                };
+                if is_native_editor_border(next, cells[index].fg) {
+                    break;
+                }
+                if next.iter().any(|cell| !cell.c.is_whitespace()) {
+                    return PromptRow::Draft;
+                }
+            }
+        }
         return PromptRow::Empty;
     }
     // A dim suggestion before the cursor has entered it is not a verified empty prompt.
@@ -309,5 +348,41 @@ mod tests {
         assert!(choice_dialog(&snapshot(
             "Press enter to confirm or esc to cancel"
         )));
+    }
+
+    #[test]
+    fn claude_empty_cursor_row_does_not_hide_multiline_draft() {
+        assert_eq!(
+            prompt_row(
+                &snapshot("❯ \r\n  remaining native draft\r\n────────────────────\x1b[1;3H"),
+                AgentPromptKind::Claude,
+            ),
+            PromptRow::Draft,
+        );
+        assert_eq!(
+            prompt_row(
+                &snapshot("❯ \r\n\r\n  remaining native draft\r\n────────────────────\x1b[1;3H"),
+                AgentPromptKind::Claude,
+            ),
+            PromptRow::Draft,
+        );
+        assert_eq!(
+            prompt_row(
+                &snapshot(&format!(
+                    "❯ \r\n\x1b[38;2;136;136;136m{}\x1b[39m\r\n~/project\x1b[1;3H",
+                    "─".repeat(80)
+                )),
+                AgentPromptKind::Claude,
+            ),
+            PromptRow::Empty,
+        );
+        assert_eq!(
+            prompt_row(
+                &snapshot(&format!("❯ \r\n{}\x1b[1;3H", "─".repeat(80))),
+                AgentPromptKind::Claude,
+            ),
+            PromptRow::Draft,
+            "a full-width line typed by the user is not an editor border",
+        );
     }
 }

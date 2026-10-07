@@ -11846,6 +11846,26 @@ mod tests {
             Err(pty::PtyInputRejectReason::AdmissionDenied),
             "a visible native draft must never be overwritten"
         );
+        // Claude can leave a continuation line after Ctrl+U erases the first
+        // line. The cursor row then looks empty while the editor is not.
+        let multiline_redraw =
+            "\x1b[2J\x1b[H❯ \r\n  remaining native draft\r\n────────────────────\x1b[1;3H";
+        worker
+            .sessions
+            .get_mut(&id)
+            .unwrap()
+            .replay_ansi(&mut multiline_redraw.as_bytes())
+            .unwrap();
+        worker
+            .detectors
+            .get_mut(&id)
+            .unwrap()
+            .on_output(multiline_redraw.as_bytes());
+        assert_eq!(
+            worker.admit_input_batch_checked(id, &[b"new prompt", b"\r"], Some(&admission)),
+            Err(pty::PtyInputRejectReason::AdmissionDenied),
+            "a draft on another native editor row must still block composer submit"
+        );
         let redraw = b"\x1b[2J\x1b[H\xe2\x9d\xaf ";
         worker
             .sessions

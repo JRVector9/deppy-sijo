@@ -69,6 +69,25 @@ pub struct Db {
     authorization_db_identity: String,
 }
 
+/// Whether a Claude hook preview describes user work rather than an internal event.
+/// Also used when reading older rows that already contain an internal notification.
+pub fn task_prompt_is_displayable(prompt: &str) -> bool {
+    let prompt = prompt.trim_start();
+    !prompt.is_empty()
+        && ![
+            "<task-notification",
+            "<system-reminder",
+            "<local-command",
+            "<command-name",
+            "<environment_context",
+            "<permissions",
+            "<INSTRUCTIONS",
+            "<heartbeat",
+        ]
+        .iter()
+        .any(|prefix| prompt.starts_with(prefix))
+}
+
 /// Durable, process-independent Connector configuration identity. SQLite stores revisions as a
 /// positive signed INTEGER; the public type prevents accidental arithmetic outside storage.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -7619,6 +7638,11 @@ impl Db {
                 && bounded_text_is_valid(prompt, 256),
             BOUNDED_WRITE_INPUT_INVALID
         );
+        // Claude can emit an internal UserPromptSubmit (for example task-notification).
+        // It must not replace the pane's last actual user task.
+        if !task_prompt_is_displayable(prompt) {
+            return Ok(());
+        }
         self.conn.execute(
             "UPDATE agent_hook_sessions SET task_prompt = ?3
              WHERE session_key = ?1 AND kind = 'claude' AND agent_session_id = ?2",
@@ -15164,6 +15188,32 @@ mod tests {
             .unwrap();
         assert_eq!(first_row.agent_session_id, "forked");
         assert_eq!(first_row.task_prompt, None);
+    }
+
+    #[test]
+    fn 내부_알림은_현재_pane의_작업_제목을_덮지_않는다() {
+        let db = Db::open_in_memory().unwrap();
+        let workspace = db.create_workspace("hook-internal-prompt").unwrap();
+        let key = format!("{workspace}:4");
+        db.upsert_hook_session(&key, "claude", "native", "/tmp/native.jsonl")
+            .unwrap();
+        db.record_hook_task_prompt(&key, "native", "실제 진행 중인 작업")
+            .unwrap();
+
+        db.record_hook_task_prompt(
+            &key,
+            "native",
+            "<task-notification> <task-id>internal</task-id>",
+        )
+        .unwrap();
+
+        let row = db
+            .list_hook_sessions()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.session_key == key)
+            .unwrap();
+        assert_eq!(row.task_prompt.as_deref(), Some("실제 진행 중인 작업"));
     }
 
     #[test]

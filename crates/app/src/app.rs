@@ -10762,7 +10762,7 @@ fn trusted_pane_task_prompt<'a>(
     let (native_id, prompt) = prompts.get(&session)?;
     (binding.kind == crate::agent_detect::AgentKind::Claude
         && binding.session_id == *native_id
-        && !prompt.is_empty())
+        && storage::task_prompt_is_displayable(prompt))
     .then_some(prompt.as_str())
 }
 
@@ -43084,6 +43084,30 @@ mod tests {
             trusted_pane_task_prompt(runtime::SessionId(3), &bindings, &prompts),
             None
         );
+    }
+
+    #[test]
+    fn 저장된_내부_알림은_pane_작업_제목으로_사용하지_않는다() {
+        use crate::agent_detect::{AgentBinding, AgentKind};
+
+        let session = runtime::SessionId(4);
+        let bindings = HashMap::from([(
+            session,
+            AgentBinding {
+                kind: AgentKind::Claude,
+                session_id: "native".to_owned(),
+                transcript: PathBuf::from("/tmp/native.jsonl"),
+            },
+        )]);
+        let prompts = HashMap::from([(
+            session,
+            (
+                "native".to_owned(),
+                "<task-notification> <task-id>internal</task-id>".to_owned(),
+            ),
+        )]);
+
+        assert_eq!(trusted_pane_task_prompt(session, &bindings, &prompts), None);
     }
 
     #[test]

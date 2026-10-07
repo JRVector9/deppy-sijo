@@ -28,7 +28,7 @@ pub use db::{
     SettingsWorkspaceProjectionRow, StatuslineRow, StructuredThreadMutation, StructuredThreadRow,
     WORKSPACE_NOTE_MAX_BYTES, WebPushSubscriptionRow, WorkspaceFindOrCreateResult,
     WorkspaceFolderAnchor, WorkspaceMovedPathUpdate, WorkspaceRow,
-    prepare_agent_state_job_for_retention,
+    prepare_agent_state_job_for_retention, task_prompt_is_displayable,
 };
 pub use mcp_store::{
     MCP_PERMISSION_POINT_BYTES_MAX, MCP_SERVER_INVENTORY_BYTES_MAX, MCP_SERVER_INVENTORY_LIMIT_MAX,

@@ -1,3 +1,41 @@
+# 실제 Claude 다중 행 초안 보호 수정 및 0.8.2 준비 — 2026-10-07
+
+- Current objective: 실제 Deppy 0.8.0 화면에서 재현한 `❯` 첫 행만 빈 Claude 초안이 0.8.1 admission 우회 조건에서 잘못 허용될 수 있는 문제를 수정하고, 새 버전의 로컬 번들을 검증한다. 이번 요청에는 앱 재실행 권한이 없다.
+- Completed source work: `input_admission::prompt_row`가 Claude의 빈 커서 행 아래를 native editor 하단 구분선까지 검사한다. 후속 행에 문자가 남아 있으면 `Draft`로 분류해 Composer 제출을 거절한다. 구분선은 실제 Claude ANSI 로그에서 확인한 대로 긴 선 문자와 별도 전경색을 함께 요구하므로, 사용자가 선 문자를 한 줄 가득 입력해도 초안으로 취급한다. 기존 단일 행 빈 editor 허용은 유지된다. `in_process` Worker/PTY 테스트에 실제 Ctrl+U 후의 두 줄 형상 보호를 추가했다. `Cargo.toml` workspace 버전을 0.8.1→0.8.2 patch로 높이고 `Cargo.lock` inherited workspace 27개만 offline update했다.
+- Modified files/source commit: `crates/runtime/src/input_admission.rs`, `crates/runtime/src/in_process.rs`, `Cargo.toml`, `Cargo.lock`은 `ba5c55be` (`fix: Claude 다중 줄 초안 전송 보호 (v0.8.2)`)로 커밋했다. 이 handoff는 후속 문서 변경이다. Key design decision: native 초안이 있다는 detector 증거를 무조건 지우지 않고, 실제 다중 행 editor 내용을 검사한 경우에만 stale-draft 우회를 허용한다. 경계가 모호하면 거절한다.
+- Actual tests: unit 다중 행 test 첫 RED exit101 (`/tmp/deppy-composer-multiline-red-20261007.log`, expected Draft/actual Empty), 수정 후 GREEN1PASS. 선 문자만으로 경계를 판단한 첫 구현도 RED exit101 (`/tmp/deppy-composer-border-red-20261007.log`, typed full-width rule을 Empty로 오인), 색 구분 추가 후 GREEN1PASS (`/tmp/deppy-composer-border-green-20261007.log`). Worker focused1PASS. 변경 소스의 Runtime 전체355PASS (`/tmp/deppy-composer-multiline-runtime-full-20261007.log`), App 전체 unit2774PASS/31ignored 및 integration4+5+15+15PASS (`/tmp/deppy-composer-multiline-app-full-20261007.log`), strict Session+Runtime+App all-target Clippy-Dwarnings exit0 (`/tmp/deppy-composer-multiline-clippy-20261007.log`), fmt check exit0, `git diff --check` exit0. 이 테스트는 0.8.1 소스에서 수행했고 그 뒤에는 버전만 0.8.2로 변경했다.
+- Artifact and version proof: `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 DEPPY_REQUIRE_TRUSTED_SIGNING=0 DEPPY_ALLOW_UNTRUSTED_SIGNING=1 sh scripts/package-macos.sh` exit0 (`/tmp/deppy-0.8.2-local-package-20261007.log`); signed app/ZIP을 `target/staged-0.8.2-20261007/`에 별도 보존하고 `scripts/verify-macos-package.sh` 재검증 exit0 (`/tmp/deppy-0.8.2-staged-verify-20261007.log`). 명시적 untrusted local-development 정책으로 서명/아키텍처/ZIP 추출 검증을 통과했으며 새 공증/외부 배포는 없다. staged bundle의 `CFBundleShortVersionString`/`CFBundleVersion` 모두 0.8.2, locked Cargo metadata의 app/proxy 모두 0.8.2, 실행하지 않고 `strings`로 확인한 앱 바이너리의 `deppy-sijo/0.8.2` 일치. 앱 바이너리 SHA-256 `860a57cdc7d013d5c24487eba4f81117e94ffa03d0315cd138f1c4119a0eb319`, proxy `57b7a5faf7140e6dcbe9818eee3b42de98680b366e31ea534417d98643f01278`.
+- Failed approaches/limits: 선 모양만으로 구분선을 식별하면 사용자가 입력한 긴 선도 빈 editor로 오인하므로 실제 Claude의 별도 색 증거를 함께 요구한다. `cargo test -p app`은 존재하지 않는 package ID로 즉시 실패했고 올바른 `-p deppy-sijo`로 전체 App suite를 통과했다. 수정된 0.8.2 앱의 실제 UI 전송은 실행 권한이 없어 아직 시험하지 않았다.
+- Remaining work: 이 handoff를 커밋/푸시하고 브랜치 clean/upstream 상태를 확인한다. 실행 중 0.8.0 PID 56575는 유지한다. 이후 새 명시적 재실행 요청이 있을 때만 0.8.2로 교체하고 실제 화면에서 전송 경로를 다시 확인한다. 이번 0.8.2 번들의 native About UI와 실제 전송은 미실행 상태라 검증하지 않았다.
+- Exact next commands: `cd /Users/jr/Desktop/projects/deppy-sijo-performance`; `git diff --check`; `git add docs/CODEX_HANDOFF.md`; `git commit -m 'docs: 실제 Composer 검증과 0.8.2 번들 기록'`; `git push origin feat/audit-nine-pr-v0.6.0-20261004`; `git status --short --branch`; `ps -o pid=,etime=,state=,command= -p 56575`. 앱 `open`/종료 명령은 새 재실행 요청이 없으면 실행하지 않는다.
+
+---
+
+# 실제 Claude 화면에서 Composer 거절 검증 — 2026-10-07
+
+- Current objective: 사용자의 "실제 화면에서 테스트" 및 "이어서 해" 요청에 따라, 실행 중인 Deppy 0.8.0의 실제 Claude Code 편집기와 하단 Composer에서 다중 행 초안 조건을 재현한다. 새 앱 재실행 요청은 없으므로 미실행 0.8.1 번들은 실행하지 않는다.
+- Completed work: UI에서 `nomorevibe` 워크스페이스에 임시 Claude 세션 1개를 열고, 실제 native 편집기에 두 줄의 무해한 임시 초안을 paste했다. 커서를 첫 줄로 옮겨 Ctrl+U를 누르자 첫 줄은 빈 `❯`/커서로 바뀌고 **둘째 줄의 초안은 그대로 남는 화면**을 확인했다. 하단 Composer에 무해한 확인 문장을 넣고 Enter를 누르자 `전송 거절됨 · 초안 보존`이 표시되고 터미널 초안도 전송되지 않았다. `app.log.2026-10-07`은 `2026-10-07T00:10:32.238427Z`에 `reason="accepted_input_draft" intent=ExplicitPrompt provider=Claude`를 기록했다. Composer 문장과 native 초안을 각각 지운 뒤 검증용 세션을 닫았고 UI 세션 수는 18→17로 원복됐다. 기존 사용자 세션에는 입력을 보내지 않았다.
+- Modified files: 검토 기록인 `docs/CODEX_HANDOFF.md`만 변경; 제품 소스·실행 파일은 변경하지 않았다. Key design decision: 실제 Claude editor가 첫 `❯` 행은 비고 아래 행에 초안이 남는 상태를 만들 수 있음을 확인했으므로, 커서의 한 행만 보고 `Empty`를 반환하는 0.8.1 source path를 안전하다고 간주하지 않는다. 다만 0.8.1 자체는 UI에서 실행하지 않았으므로 실제 0.8.1 전송 허용 여부는 아직 미검증이다.
+- Test commands/results: 실제 UI 순서 `paste(두 줄)` → `Up` → `Ctrl+U` → Composer paste → `Return` = 거절/초안 보존(화면 확인). 대응 runtime 로그 위 1건 확인. `git diff --check` exit 0. 앞선 합성 snapshot probe는 0 pass/1 fail이었고 제거했다. 이번 실제 UI 테스트는 실행 중인 0.8.0에 한정된다.
+- Failed approaches/limits: 0.8.1을 새로 실행해 비교하지 않았다. 기존 단일 행 회귀 테스트만으로는 실제 다중 행 편집기 상태를 덮지 못했다. 하단 Composer의 `setValue`는 egui 텍스트를 채우지 않아 `paste`로 입력했다.
+- Remaining work: 0.8.1의 한 행 `prompt_row`/모든 출력 redraw 조건을 수정하고, 실제 두 줄 형상의 RED/GREEN 회귀와 관련 전체 테스트를 실행한다. 제품 소스를 추가 수정해 로컬 릴리스하면 0.8.1보다 높은 patch 버전과 번들 버전 검증이 필요하다. 새 현재 작업의 명시적 재실행 요청 없이 Deppy를 종료·실행하지 않는다.
+- Exact next commands: `cd /Users/jr/Desktop/projects/deppy-sijo-performance`; `git status --short --branch`; `sed -n '127,255p' crates/runtime/src/input_admission.rs`; `sed -n '427,460p;590,600p' crates/session/src/status.rs`; `rg 'input admission declined' '/Users/jr/Library/Application Support/app.vector9.deppy-sijo/logs/app.log.2026-10-07' | tail -n 5`; `git diff --check`. 수정 시 다중 행 native draft 회귀를 먼저 추가하고, 0.8.1 번들을 실행하지 않는다.
+
+---
+
+# 0.8.1 Composer 수정 재검토 — 2026-10-07
+
+- Current objective: 사용자의 재검토 요청에 따라 `85dcf87f`의 하단 Composer 전송 거절 수정이 실제 문제를 개선하고 안전한지 검토한다. 이번 요청은 앱 재실행을 허가하지 않는다.
+- Completed work: 기존 라이브 0.8.0 로그와 0.8.1 소스의 admission 조건을 대조했다. 0.8.1은 기존 native 초안을 지운 키(Backspace/Ctrl+U/Ctrl+W)가 수락되고, 그 뒤 PTY 출력이 있으며, 현재 `❯` 커서 행이 비었을 때에만 `accepted_input_draft` 거절을 해제한다. 따라서 단일 행에서 이 조건을 만족한 거짓 거절은 개선한다. 실제 로그에는 삭제 키 기록이 없어서 사용자의 원래 실패가 해당 조건에 걸리는지는 증명하지 못한다. `visible_input_draft` 거절은 그대로 유지된다.
+- Review finding: `crates/runtime/src/input_admission.rs::prompt_row`는 커서가 있는 한 행만 보고 `Empty`를 반환한다. 임시 검토 테스트에서 `❯ ` 행 뒤의 다른 행에 남은 native 초안을 둔 snapshot을 만들었을 때 예상 `Draft` 대신 실제 `Empty`가 반환되어 실패했다(0 pass/1 fail, `/tmp/deppy-composer-review-multiline-probe-20261007.log`). `crates/session/src/status.rs::on_output`은 삭제 후의 **어떤** 비어 있지 않은 PTY 출력도 redraw 증거로 간주한다. 이 두 조건이 함께면 기존 초안이 남은 다중 행 editor를 비었다고 오인하여 명시적 전송을 허용할 가능성이 있다. 합성 snapshot이므로 실제 Claude UI에서 같은 화면이 나오는지는 추가 확인 필요하다.
+- Modified files: 검토용 테스트는 실패 확인 후 제거해 제품 소스는 원상 복구했다. 이 handoff만 변경했다. Architecture/design decision: 현재 근거로 0.8.1의 실사용 해결을 확정하지 않으며, 미실행 번들을 사용자 앱으로 교체하지 않는다.
+- Test commands/results: `python3 /private/tmp/deppy-audit-nine-pr-20261004/cargo_gate.py test --offline --locked -p runtime review_probe_multiline_native_draft_is_not_empty -- --test-threads=1` exit 101, 예상 `Draft`/실제 `Empty`; 이후 임시 테스트 제거. 이전 전체 suite 성공은 위 0.8.1 준비 기록 참조하며, 이번 검토 후 전체 suite를 다시 실행했다고 주장하지 않는다.
+- Failed approaches: 한 행의 빈 `❯`만으로 native editor 전체가 비었다고 판단할 수 없음이 드러났다. 실제 사용자 문장이나 native 초안을 읽거나 전송하지 않았다.
+- Remaining work: 실제 실패 시점의 native 편집기 화면과 키/출력 순서를 개인정보 없이 재현하거나, 다중 행 안전성을 보수적으로 보장하는 admission 조건을 설계해 RED/GREEN 회귀 및 전체 관련 테스트를 실행한다. 제품 소스가 다시 바뀌면 0.8.1보다 높은 버전의 번들을 만들고 버전 검증해야 한다. 실행 중 PID 56575는 계속 0.8.0이며, 앱 재실행은 새 현재 작업에서 사용자가 명시 요청할 때만 한다.
+- Exact next commands: `cd /Users/jr/Desktop/projects/deppy-sijo-performance`; `git status --short --branch`; `git diff --check`; `sed -n '127,255p' crates/runtime/src/input_admission.rs`; `sed -n '427,460p;590,600p' crates/session/src/status.rs`; `tail -n 25 /tmp/deppy-composer-review-multiline-probe-20261007.log`; `ps -o pid=,etime=,state=,command= -p 56575`. 소스 수정은 테스트를 먼저 재현한 뒤 진행하며, 새 재실행 요청 없이 `open`/`scripts/dev-run.sh`/앱 종료 명령을 실행하지 않는다.
+
+---
+
 # 0.8.1 컴포저 수정 번들 준비(미실행) — 2026-10-07
 
 - Current objective: 앞서 확인한 Composer 거짓 거절 수정 `85dcf87f`을 사용자가 검토·적용할 수 있는 버전된 로컬 번들로 준비한다. 새 버전 재실행은 이번 버그 요청에 명시되지 않았으므로 실행하지 않는다.

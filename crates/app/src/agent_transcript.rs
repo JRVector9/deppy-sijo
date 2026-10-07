@@ -696,10 +696,22 @@ fn claude_user_instruction(value: &Value) -> Option<String> {
 }
 
 fn claude_internal_user_event(value: &Value) -> bool {
-    value
-        .pointer("/message/content")
-        .and_then(Value::as_str)
-        .is_some_and(|_| claude_user_instruction(value).is_none())
+    let Some(content) = value.pointer("/message/content") else {
+        return false;
+    };
+    if content.is_string() {
+        return claude_user_instruction(value).is_none();
+    }
+    content.as_array().is_some_and(|items| {
+        !items.is_empty()
+            && items.iter().all(|item| {
+                item.get("type").and_then(Value::as_str) == Some("text")
+                    && item
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| clean_agent_summary(text).is_none())
+            })
+    })
 }
 
 fn claude_user_starts_new_turn(value: &Value) -> bool {
@@ -3122,6 +3134,22 @@ mod tests {
             clean_agent_summary("<div> 태그 렌더링을 고쳐"),
             Some("<div> 태그 렌더링을 고쳐".to_owned())
         );
+    }
+
+    #[test]
+    fn 배열로_기록된_내부_전달문은_끝난_턴을_다시_작업중으로_바꾸지_않는다() {
+        let path = write_tmp(
+            "sess-agent-message-array.jsonl",
+            r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"실제 작업"}}
+{"type":"assistant","cwd":"/proj","message":{"role":"assistant","model":"claude-opus-4-8","stop_reason":"end_turn","content":[{"type":"text","text":"작업 완료"}]}}
+{"type":"user","cwd":"/proj","message":{"role":"user","content":[{"type":"text","text":"<agent-message from=\"subagent\"> [Subagent hand-back] internal"}]}}
+"#,
+        );
+        let state = parse_claude(&path).unwrap();
+        assert_eq!(state.activity, AgentActivity::Idle);
+        assert_eq!(state.user_instruction.as_deref(), Some("실제 작업"));
+        assert_eq!(state.last_agent_summary.as_deref(), Some("작업 완료"));
+        assert_eq!(state.recent_turns.len(), 1);
     }
 
     #[test]

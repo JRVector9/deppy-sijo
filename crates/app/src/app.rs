@@ -10834,6 +10834,9 @@ fn apply_pane_task_prompts(
             // Once a transcript has been shared, its latest assistant text can belong to
             // another pane even after that pane closes. Prefer the pane's own hook input.
             display.last_agent_summary = None;
+            if prompt.is_none() {
+                display.user_instruction = None;
+            }
         }
     }
 }
@@ -43442,6 +43445,48 @@ mod tests {
         let mut merged = HashMap::from([(unique, display())]);
         apply_pane_task_prompts(&mut merged, &bindings, &HashMap::new(), &prompts, false);
         assert_eq!(merged[&unique].last_agent_summary, None);
+    }
+
+    #[test]
+    fn 공유_대화에서_해당_pane_작업이_없으면_다른_pane의_지시를_숨긴다() {
+        use crate::agent_detect::{AgentBinding, AgentDisplay, AgentKind};
+
+        let first = runtime::SessionId(1);
+        let second = runtime::SessionId(2);
+        let binding = AgentBinding {
+            kind: AgentKind::Claude,
+            session_id: "shared".to_owned(),
+            transcript: PathBuf::from("/tmp/shared.jsonl"),
+        };
+        let bindings = HashMap::from([(first, binding.clone()), (second, binding)]);
+        let prompts = HashMap::from([
+            (first, ("shared".to_owned(), "첫 pane 작업".to_owned())),
+            (
+                second,
+                (
+                    "shared".to_owned(),
+                    "<agent-message from=\"subagent\"> internal".to_owned(),
+                ),
+            ),
+        ]);
+        let display = || AgentDisplay {
+            kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+            context_pct: None,
+            last_agent_summary: Some("공유 transcript의 응답".to_owned()),
+            user_instruction: Some("둘째 pane의 작업".to_owned()),
+        };
+        let mut displays = HashMap::from([(first, display()), (second, display())]);
+
+        apply_pane_task_prompts(&mut displays, &bindings, &HashMap::new(), &prompts, true);
+
+        assert_eq!(
+            displays[&first].user_instruction.as_deref(),
+            Some("첫 pane 작업")
+        );
+        assert_eq!(displays[&second].user_instruction, None);
+        assert_eq!(displays[&second].last_agent_summary, None);
     }
 
     #[test]

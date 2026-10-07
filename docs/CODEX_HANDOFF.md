@@ -1,3 +1,16 @@
+# 0.8.5 리뷰 후속 수정과 모바일 PWA 비교 착수 — 2026-10-07
+
+- Current objective: 최근 `<agent-message>` 제목 필터 구현을 재검토하고 발견된 버그를 수정한 뒤, `/Users/jr/Desktop/projects/deppy-mux`의 모바일 PWA 연결 화면을 Deppy Sijo에 동일하게 구현한다. 현재 요청에는 앱 재실행 지시가 없다.
+- Completed work: `84dc30db` 후속 리뷰에서 Claude 내부 user 이벤트가 text 배열이면 완료 상태를 Working으로 오판하는 경로와, 공유 transcript의 pane별 유효 prompt가 없을 때 Fleet 카드에 다른 pane의 `user_instruction`이 남는 경로를 발견했다. 각각 실제 파서와 `apply_pane_task_prompts` 회귀 테스트를 수정 전 RED로 확인하고, 내부 text 배열 판정과 공유 pane의 출처 불명 지시 제거를 구현했다. deppy-mux의 모바일 웹 경로 `/[locale]/w/[slug]`와 Deppy의 `crates/web-remote/assets` 경로를 찾았으며 자세한 UI 비교는 다음 단계다.
+- Modified files: `crates/app/src/agent_transcript.rs`, `crates/app/src/app.rs`, 이 handoff. 제품 버전은 아직 0.8.5이며 이 수정이 들어간 앱 번들을 배포하지 않았다.
+- Key design decisions: Claude 배열 user 이벤트 중 비어 있지 않은 `text` 항목만 있고 모든 텍스트가 내부 메시지인 경우에만 합성 이벤트로 취급한다. 도구 결과 배열은 기존대로 작업 상태를 갱신한다. 공유 native transcript는 pane별 유효 prompt가 없으면 `last_agent_summary`와 `user_instruction` 모두 표시하지 않는다.
+- Test commands/results: `python3 /private/tmp/deppy-audit-nine-pr-20261004/cargo_gate.py test --offline --locked -q -p deppy-sijo <focused name>`로 두 테스트가 수정 전 각각 Working≠Idle, 타 pane 지시 Some≠None으로 실패했다. 수정 후 같은 두 집중 테스트 PASS. 전체 `python3 /private/tmp/deppy-audit-nine-pr-20261004/cargo_gate.py --batch '[["test","--offline","--locked","-q","-p","deppy-sijo"],["clippy","--offline","--locked","-q","-p","deppy-sijo","--all-targets","--","-D","warnings"],["fmt","--all","--","--check"]]'` exit0: unit 2781 PASS/31 ignored, integration 4+5+15+15 PASS, strict Clippy PASS, fmt PASS. `git diff --check` exit0.
+- Failed approaches/limits: 리뷰 스킬의 필수 `.agents/skills/gstack/review/checklist.md`가 설치되지 않아 해당 자동 체크리스트는 실행할 수 없었다. 실제 소스·저장값·표시 경로를 직접 추적해 리뷰했다. 이미 저장된 원본 작업 제목은 pane별 신뢰할 출처가 없으면 복원할 수 없다. 새 코드의 실제 GUI 동작은 앱 재실행 권한이 없어 미검증이다.
+- Remaining work: 이 리뷰 수정과 handoff를 커밋/푸시하고, deppy-mux의 연결된 모바일 PWA 화면과 현재 Deppy 로컬/Relay 셸을 비교한다. 동일 화면 구현과 해당 경로 테스트가 끝난 뒤 출시할 경우 마지막 출시 0.8.5보다 높은 버전으로 올려 패키징/버전 검증한다. 앱 재실행은 현재 요청에서 금지된다.
+- Exact next commands: `cd /Users/jr/Desktop/projects/deppy-sijo-performance`; `git diff --check`; `git add crates/app/src/agent_transcript.rs crates/app/src/app.rs docs/CODEX_HANDOFF.md`; `git commit -m 'fix: keep internal Claude events and shared transcript text out of pane status'`; `git push origin feat/audit-nine-pr-v0.6.0-20261004`; `sed -n '1,240p' /Users/jr/Desktop/projects/deppy-mux/web/app/'[locale]'/w/'[slug]'/web-access-session-client.tsx`; `sed -n '1,240p' crates/web-remote/assets/index.html`. 앱 종료/`open`/`scripts/dev-run.sh`는 실행하지 않는다.
+
+---
+
 # 0.8.5 Design 세션 내부 agent-message 제목 필터 — 2026-10-07
 
 - Current objective: Design 워크스페이스 세션 제목에 `<agent-message from="…"> [Subagent hand-back]` 태그 및 Claude 세션 간 전달 안내가 실제 진행 작업처럼 노출되는 문제를 고친다. 이번 요청에는 앱 재실행 지시가 없다.

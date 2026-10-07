@@ -782,6 +782,7 @@ mod tests {
             text: &mut original,
             max_bytes: 7,
             rejected: &mut rejected,
+            normalize_nfc: false,
         };
         assert_eq!(buffer.insert_text("가나", egui::text::CharIndex(4)), 0);
         assert_eq!(original, "KEEP");
@@ -797,6 +798,7 @@ mod tests {
             text: &mut text,
             max_bytes: 5,
             rejected: &mut rejected,
+            normalize_nfc: false,
         };
         assert_eq!(buffer.insert_text("가", egui::text::CharIndex(1)), 1);
         assert_eq!(buffer.as_str(), "a가b");
@@ -812,6 +814,7 @@ mod tests {
             text: &mut existing,
             max_bytes: 5,
             rejected: &mut refused,
+            normalize_nfc: false,
         };
         assert_eq!(buffer.insert_text("x", egui::text::CharIndex(0)), 0);
         assert_eq!(buffer.as_str(), original);

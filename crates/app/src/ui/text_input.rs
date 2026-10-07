@@ -36,6 +36,7 @@ pub(crate) struct BoundedTextBuffer<'a> {
     pub(crate) text: &'a mut String,
     pub(crate) max_bytes: usize,
     pub(crate) rejected: &'a mut bool,
+    pub(crate) normalize_nfc: bool,
 }
 impl egui::TextBuffer for BoundedTextBuffer<'_> {
     fn type_id(&self) -> std::any::TypeId {
@@ -48,6 +49,10 @@ impl egui::TextBuffer for BoundedTextBuffer<'_> {
         self.text
     }
     fn insert_text(&mut self, text: &str, index: egui::text::CharIndex) -> usize {
+        use unicode_normalization::UnicodeNormalization;
+        let normalized =
+            (self.normalize_nfc && !text.is_ascii()).then(|| text.nfc().collect::<String>());
+        let text = normalized.as_deref().unwrap_or(text);
         if text.len() > self.max_bytes.saturating_sub(self.text.len()) {
             *self.rejected = true;
             return 0;
@@ -58,6 +63,10 @@ impl egui::TextBuffer for BoundedTextBuffer<'_> {
         self.text.delete_char_range(range);
     }
     fn replace_with(&mut self, text: &str) {
+        use unicode_normalization::UnicodeNormalization;
+        let normalized =
+            (self.normalize_nfc && !text.is_ascii()).then(|| text.nfc().collect::<String>());
+        let text = normalized.as_deref().unwrap_or(text);
         if text.len() > self.max_bytes {
             *self.rejected = true;
         } else {
@@ -149,6 +158,7 @@ pub(crate) fn bounded_edit_with_style(
         text,
         max_bytes,
         rejected: &mut rejected,
+        normalize_nfc: false,
     };
     let edit = match style {
         BoundedEditStyle::Multiline { rows, code_editor } => {

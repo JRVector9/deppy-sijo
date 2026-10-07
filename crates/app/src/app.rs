@@ -10340,6 +10340,7 @@ pub struct App {
     hook_overrides:
         std::collections::HashMap<runtime::SessionId, crate::agent_detect::AgentBinding>,
     hook_task_prompts: std::collections::HashMap<runtime::SessionId, (String, String)>,
+    fresh_hook_task_prompts: std::collections::HashMap<runtime::SessionId, (String, String)>,
     /// Transcript turns cannot be attributed until this workspace's hook history is loaded.
     hook_projection_ready: bool,
     /// 마지막으로 DB에 저장한 pane_id → row — 차등 upsert/delete 및 churn 방지용.
@@ -10452,6 +10453,8 @@ pub struct App {
     /// 이미 에이전트/ssh 등 다른 작업이 있어 건너뛴 경우도 포함한다. 그래야 사용자가
     /// 작업을 종료한 뒤 뒤늦게 resume 명령이 주입되지 않는다.
     resumed_panes: std::collections::HashSet<String>,
+    /// Original native ID for an app-initiated Claude resume fork, until the new binding saves.
+    forked_resume_origins: std::collections::HashMap<String, String>,
     resume_probe_pending_panes: std::collections::HashSet<String>,
     /// 알림 클릭으로 다른 workspace 전환 후, mux 재구성되면 이동할 (workspace, session).
     pending_focus: Option<(String, u64, runtime::SessionId)>,
@@ -10766,6 +10769,41 @@ fn trusted_pane_task_prompt<'a>(
     .then_some(prompt.as_str())
 }
 
+/// Ignore hook rows inherited from a previous process: runtime SessionId can be reused.
+fn refresh_fresh_hook_prompts(
+    observed: &mut std::collections::HashMap<runtime::SessionId, (String, String)>,
+    fresh: &mut std::collections::HashMap<runtime::SessionId, (String, String)>,
+    next: std::collections::HashMap<runtime::SessionId, (String, String)>,
+    had_projection: bool,
+) {
+    if had_projection {
+        fresh.retain(|session, value| next.get(session) == Some(value));
+        for (session, value) in &next {
+            if observed.get(session) != Some(value) {
+                fresh.insert(*session, value.clone());
+            }
+        }
+    } else {
+        fresh.clear();
+    }
+    *observed = next;
+}
+
+fn persisted_pane_task_prompt<'a>(
+    pane_id: &str,
+    binding: &crate::agent_detect::AgentBinding,
+    saved: &'a std::collections::HashMap<String, storage::AgentSessionRow>,
+    forked_from: Option<&str>,
+) -> Option<&'a str> {
+    let row = saved.get(pane_id)?;
+    (binding.kind == crate::agent_detect::AgentKind::Claude
+        && row.kind == "claude"
+        && (row.session_id == binding.session_id || forked_from == Some(row.session_id.as_str())))
+    .then_some(row.task_prompt.as_deref())
+    .flatten()
+    .filter(|prompt| storage::task_prompt_is_displayable(prompt))
+}
+
 fn apply_pane_task_prompts(
     displays: &mut std::collections::HashMap<runtime::SessionId, crate::agent_detect::AgentDisplay>,
     bindings: &std::collections::HashMap<runtime::SessionId, crate::agent_detect::AgentBinding>,
@@ -10780,7 +10818,8 @@ fn apply_pane_task_prompts(
                 .is_some_and(|binding| binding.kind == crate::agent_detect::AgentKind::Claude)
             {
                 display.last_agent_summary = None;
-                display.user_instruction = None;
+                display.user_instruction =
+                    trusted_pane_task_prompt(*session, bindings, prompts).map(str::to_owned);
             }
         }
         return;
@@ -10788,11 +10827,13 @@ fn apply_pane_task_prompts(
     let shared = shared_agent_transcript_sessions(bindings, hook_history);
     for (session, display) in displays {
         let prompt = trusted_pane_task_prompt(*session, bindings, prompts);
+        if let Some(prompt) = prompt {
+            display.user_instruction = Some(prompt.to_owned());
+        }
         if shared.contains(session) {
             // Once a transcript has been shared, its latest assistant text can belong to
             // another pane even after that pane closes. Prefer the pane's own hook input.
             display.last_agent_summary = None;
-            display.user_instruction = prompt.map(str::to_owned);
         }
     }
 }
@@ -16329,6 +16370,7 @@ impl App {
             last_hook_query: std::time::Instant::now(),
             hook_overrides: std::collections::HashMap::new(),
             hook_task_prompts: std::collections::HashMap::new(),
+            fresh_hook_task_prompts: std::collections::HashMap::new(),
             hook_projection_ready: false,
             persisted_agents: std::collections::HashMap::new(),
             archived_agent_resume: std::collections::HashMap::new(),
@@ -16360,6 +16402,7 @@ impl App {
             restore_loaded_for: None,
             global_resumable_panes: std::collections::HashSet::new(),
             resumed_panes: std::collections::HashSet::new(),
+            forked_resume_origins: std::collections::HashMap::new(),
             resume_probe_pending_panes: std::collections::HashSet::new(),
             pending_focus: None,
             pending_resume_agent: None,
@@ -17977,7 +18020,7 @@ impl App {
                         ))
                     })
                     .collect();
-                self.hook_task_prompts = snapshot
+                let new_prompts: std::collections::HashMap<_, _> = snapshot
                     .hook_sessions
                     .iter()
                     .filter_map(|row| {
@@ -17987,7 +18030,36 @@ impl App {
                         ))
                     })
                     .collect();
+                refresh_fresh_hook_prompts(
+                    &mut self.hook_task_prompts,
+                    &mut self.fresh_hook_task_prompts,
+                    new_prompts,
+                    self.hook_projection_ready,
+                );
                 self.hook_projection_ready = true;
+                let prompt_sync_needed = self.active.workspace_ui.mux().is_some_and(|mux| {
+                    self.agent_bindings.iter().any(|(session, binding)| {
+                        let Some(prompt) = trusted_pane_task_prompt(
+                            *session,
+                            &self.agent_bindings,
+                            &self.fresh_hook_task_prompts,
+                        ) else {
+                            return false;
+                        };
+                        pane_of_session(mux, *session).is_some_and(|pane| {
+                            persisted_pane_task_prompt(
+                                &pane.0,
+                                binding,
+                                &self.persisted_agents,
+                                self.forked_resume_origins.get(&pane.0).map(String::as_str),
+                            ) != Some(prompt)
+                        })
+                    })
+                });
+                if prompt_sync_needed {
+                    let bindings = self.agent_bindings.clone();
+                    self.stage_pane_binding_sync(&bindings);
+                }
                 // statuslines는 (runtime_instance, SessionId)로 네임스페이스돼 있어(위
                 // agent_info 필드 주석) 전체 교체가 아니라 현재 active instance 몫만
                 // 갈아끼운다 — 통째로 교체하면 warm으로 물러난 다른 workspace의 보존값이
@@ -18134,7 +18206,9 @@ impl App {
                 }
                 self.restore_loaded_for = Some(self.active.id.clone());
                 self.resumed_panes.clear();
+                self.forked_resume_origins.clear();
                 self.push_archived_resume_presentation();
+                self.push_agent_display();
             }
             crate::agent_state_worker::AgentStateSection::BindingSync => {
                 let rows = snapshot
@@ -18145,6 +18219,12 @@ impl App {
                     .collect::<std::collections::HashMap<_, _>>();
                 self.persisted_agents = rows.clone();
                 self.restore_agents = rows;
+                self.forked_resume_origins.retain(|pane, original| {
+                    self.persisted_agents
+                        .get(pane)
+                        .is_some_and(|row| row.session_id == *original)
+                });
+                self.push_agent_display();
                 self.archived_agent_resume = snapshot
                     .archived_agent_resume
                     .iter()
@@ -18342,6 +18422,10 @@ impl App {
                 .is_ok()
             {
                 self.resumed_panes.insert(result.pane_id.clone());
+                if fork_claude {
+                    self.forked_resume_origins
+                        .insert(result.pane_id.clone(), result.identity.session_id.clone());
+                }
             }
         }
     }
@@ -18571,6 +18655,7 @@ impl App {
         if sessions.is_empty() {
             self.hook_overrides.clear();
             self.hook_task_prompts.clear();
+            self.fresh_hook_task_prompts.clear();
             self.hook_projection_ready = false;
             // 활성 instance 몫만 지운다 — 통째 clear는 warm 워크스페이스의 보존값을 지운다.
             let instance = self.active.runtime_instance;
@@ -18828,11 +18913,30 @@ impl App {
         for (session, display) in merged.iter_mut() {
             apply_claude_statusline(display, self.statuslines.get(&(instance, *session)));
         }
+        let mut prompts = self.fresh_hook_task_prompts.clone();
+        if let Some(mux) = self.active.workspace_ui.mux() {
+            for (session, binding) in &self.agent_bindings {
+                if trusted_pane_task_prompt(*session, &self.agent_bindings, &prompts).is_some() {
+                    continue;
+                }
+                let Some(pane) = pane_of_session(mux, *session) else {
+                    continue;
+                };
+                if let Some(prompt) = persisted_pane_task_prompt(
+                    &pane.0,
+                    binding,
+                    &self.persisted_agents,
+                    self.forked_resume_origins.get(&pane.0).map(String::as_str),
+                ) {
+                    prompts.insert(*session, (binding.session_id.clone(), prompt.to_owned()));
+                }
+            }
+        }
         apply_pane_task_prompts(
             &mut merged,
             &self.agent_bindings,
             &self.hook_overrides,
-            &self.hook_task_prompts,
+            &prompts,
             self.hook_projection_ready,
         );
         self.active.workspace_ui.set_agent_info(merged);
@@ -19190,44 +19294,7 @@ impl App {
         bindings: &std::collections::HashMap<runtime::SessionId, crate::agent_detect::AgentBinding>,
     ) {
         let mux = self.active.workspace_ui.mux().cloned();
-        let current: std::collections::HashMap<String, storage::AgentSessionRow> = bindings
-            .iter()
-            .filter_map(|(sid, b)| {
-                let pane = mux.as_ref().and_then(|m| pane_of_session(m, *sid))?;
-                let kind = match b.kind {
-                    crate::agent_detect::AgentKind::Claude => "claude",
-                    crate::agent_detect::AgentKind::Codex => "codex",
-                    crate::agent_detect::AgentKind::Kimi => "kimi",
-                    crate::agent_detect::AgentKind::Grok => "grok",
-                };
-                Some((
-                    pane.0.clone(),
-                    storage::AgentSessionRow {
-                        pane_id: pane.0,
-                        kind: kind.to_owned(),
-                        session_id: b.session_id.clone(),
-                    },
-                ))
-            })
-            .collect();
-        if let Some(mux) = &mux {
-            let live_pane_ids = mux
-                .tabs
-                .iter()
-                .flat_map(|tab| tab.panes.iter().map(|pane| pane.id.0.clone()))
-                .collect::<Vec<_>>();
-            if !live_pane_ids.is_empty() {
-                self.stage_agent_state_projection(
-                    crate::agent_state_worker::AgentStateSection::BindingSync,
-                    AppAgentStateProjectionKind::BindingSync(
-                        storage::AgentSessionBindingReconcile {
-                            live_pane_ids,
-                            desired_bindings: current.values().cloned().collect(),
-                        },
-                    ),
-                );
-            }
-        }
+        self.stage_pane_binding_sync(bindings);
         if self.restore_loaded_for.as_deref() != Some(self.active.id.as_str()) {
             self.stage_agent_state_projection(
                 crate::agent_state_worker::AgentStateSection::Restore,
@@ -19323,6 +19390,63 @@ impl App {
                 ) {
                     self.resume_probe_pending_panes.extend(pending_panes);
                 }
+            }
+        }
+    }
+
+    fn stage_pane_binding_sync(
+        &mut self,
+        bindings: &std::collections::HashMap<runtime::SessionId, crate::agent_detect::AgentBinding>,
+    ) {
+        let mux = self.active.workspace_ui.mux().cloned();
+        let current: std::collections::HashMap<String, storage::AgentSessionRow> = bindings
+            .iter()
+            .filter_map(|(sid, b)| {
+                let pane = mux.as_ref().and_then(|m| pane_of_session(m, *sid))?;
+                let task_prompt =
+                    trusted_pane_task_prompt(*sid, bindings, &self.fresh_hook_task_prompts)
+                        .or_else(|| {
+                            persisted_pane_task_prompt(
+                                &pane.0,
+                                b,
+                                &self.persisted_agents,
+                                self.forked_resume_origins.get(&pane.0).map(String::as_str),
+                            )
+                        })
+                        .map(str::to_owned);
+                let kind = match b.kind {
+                    crate::agent_detect::AgentKind::Claude => "claude",
+                    crate::agent_detect::AgentKind::Codex => "codex",
+                    crate::agent_detect::AgentKind::Kimi => "kimi",
+                    crate::agent_detect::AgentKind::Grok => "grok",
+                };
+                Some((
+                    pane.0.clone(),
+                    storage::AgentSessionRow {
+                        pane_id: pane.0,
+                        kind: kind.to_owned(),
+                        session_id: b.session_id.clone(),
+                        task_prompt,
+                    },
+                ))
+            })
+            .collect();
+        if let Some(mux) = &mux {
+            let live_pane_ids = mux
+                .tabs
+                .iter()
+                .flat_map(|tab| tab.panes.iter().map(|pane| pane.id.0.clone()))
+                .collect::<Vec<_>>();
+            if !live_pane_ids.is_empty() {
+                self.stage_agent_state_projection(
+                    crate::agent_state_worker::AgentStateSection::BindingSync,
+                    AppAgentStateProjectionKind::BindingSync(
+                        storage::AgentSessionBindingReconcile {
+                            live_pane_ids,
+                            desired_bindings: current.values().cloned().collect(),
+                        },
+                    ),
+                );
             }
         }
     }
@@ -23986,6 +24110,7 @@ impl App {
         let mut old = std::mem::replace(&mut self.active, new_active);
         self.hook_overrides.clear();
         self.hook_task_prompts.clear();
+        self.fresh_hook_task_prompts.clear();
         self.hook_projection_ready = false;
         switch_cross_workspace_pane_layout(
             &old.id,
@@ -32100,6 +32225,9 @@ impl App {
         });
         let final_items = live_items.max(desired_items);
         let bindings = &self.agent_bindings;
+        let hook_task_prompts = &self.fresh_hook_task_prompts;
+        let persisted_agents = &self.persisted_agents;
+        let forked_resume_origins = &self.forked_resume_origins;
         let pending_turn_done_clear = &mut self.pending_turn_done_clear;
         let report = self
             .agent_state_worker
@@ -32116,6 +32244,17 @@ impl App {
                     .iter()
                     .filter_map(|(session, binding)| {
                         let pane = mux.and_then(|mux| pane_of_session(mux, *session))?;
+                        let task_prompt =
+                            trusted_pane_task_prompt(*session, bindings, hook_task_prompts)
+                                .or_else(|| {
+                                    persisted_pane_task_prompt(
+                                        &pane.0,
+                                        binding,
+                                        persisted_agents,
+                                        forked_resume_origins.get(&pane.0).map(String::as_str),
+                                    )
+                                })
+                                .map(str::to_owned);
                         Some(storage::AgentSessionRow {
                             pane_id: pane.0,
                             kind: match binding.kind {
@@ -32125,6 +32264,7 @@ impl App {
                                 crate::agent_detect::AgentKind::Grok => "grok".to_owned(),
                             },
                             session_id: binding.session_id.clone(),
+                            task_prompt,
                         })
                     })
                     .collect();
@@ -33291,9 +33431,20 @@ impl eframe::App for App {
                     && trusted_pane_task_prompt(
                         session,
                         &self.agent_bindings,
-                        &self.hook_task_prompts,
+                        &self.fresh_hook_task_prompts,
                     )
                     .is_none()
+                    && self.agent_bindings.get(&session).is_none_or(|binding| {
+                        persisted_pane_task_prompt(
+                            &entry.pane.0,
+                            binding,
+                            &self.persisted_agents,
+                            self.forked_resume_origins
+                                .get(&entry.pane.0)
+                                .map(String::as_str),
+                        )
+                        .is_none()
+                    })
             }) && !entry.title_is_custom
             {
                 shared_ordinal += 1;
@@ -43111,6 +43262,125 @@ mod tests {
     }
 
     #[test]
+    fn 재시작_후_새_runtime_id에서도_서로_다른_pane_작업_제목을_복원한다() {
+        use crate::agent_detect::{AgentBinding, AgentDisplay, AgentKind};
+        let binding = AgentBinding {
+            kind: AgentKind::Claude,
+            session_id: "shared-native".into(),
+            transcript: PathBuf::from("/tmp/shared.jsonl"),
+        };
+        let saved = HashMap::from([
+            (
+                "pane-a".into(),
+                storage::AgentSessionRow {
+                    pane_id: "pane-a".into(),
+                    kind: "claude".into(),
+                    session_id: "shared-native".into(),
+                    task_prompt: Some("첫 작업".into()),
+                },
+            ),
+            (
+                "pane-b".into(),
+                storage::AgentSessionRow {
+                    pane_id: "pane-b".into(),
+                    kind: "claude".into(),
+                    session_id: "shared-native".into(),
+                    task_prompt: Some("둘째 작업".into()),
+                },
+            ),
+        ]);
+        let first = runtime::SessionId(101);
+        let second = runtime::SessionId(102);
+        let bindings = HashMap::from([(first, binding.clone()), (second, binding.clone())]);
+        let prompts = HashMap::from([
+            (
+                first,
+                (
+                    binding.session_id.clone(),
+                    persisted_pane_task_prompt("pane-a", &binding, &saved, None)
+                        .unwrap()
+                        .to_owned(),
+                ),
+            ),
+            (
+                second,
+                (
+                    binding.session_id.clone(),
+                    persisted_pane_task_prompt("pane-b", &binding, &saved, None)
+                        .unwrap()
+                        .to_owned(),
+                ),
+            ),
+        ]);
+        let display = || AgentDisplay {
+            kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+            context_pct: None,
+            last_agent_summary: Some("공유 transcript 응답".into()),
+            user_instruction: None,
+        };
+        let mut displays = HashMap::from([(first, display()), (second, display())]);
+        apply_pane_task_prompts(&mut displays, &bindings, &HashMap::new(), &prompts, false);
+        assert_eq!(
+            displays[&first].user_instruction.as_deref(),
+            Some("첫 작업")
+        );
+        assert_eq!(
+            displays[&second].user_instruction.as_deref(),
+            Some("둘째 작업")
+        );
+        assert_eq!(displays[&first].last_agent_summary, None);
+        assert_eq!(
+            persisted_pane_task_prompt(
+                "pane-a",
+                &AgentBinding {
+                    session_id: "another-native".into(),
+                    ..binding.clone()
+                },
+                &saved,
+                None,
+            ),
+            None
+        );
+        assert_eq!(
+            persisted_pane_task_prompt(
+                "pane-a",
+                &AgentBinding {
+                    session_id: "forked-native".into(),
+                    ..binding
+                },
+                &saved,
+                Some("shared-native"),
+            ),
+            Some("첫 작업")
+        );
+    }
+
+    #[test]
+    fn 재시작_전_hook_기록은_새_runtime_id의_작업_제목을_덮지_않는다() {
+        let session = runtime::SessionId(2);
+        let mut observed = HashMap::new();
+        let mut fresh = HashMap::new();
+        refresh_fresh_hook_prompts(
+            &mut observed,
+            &mut fresh,
+            HashMap::from([(session, ("shared".into(), "옛 pane 작업".into()))]),
+            false,
+        );
+        assert!(fresh.is_empty());
+        refresh_fresh_hook_prompts(
+            &mut observed,
+            &mut fresh,
+            HashMap::from([(session, ("shared".into(), "현재 pane 작업".into()))]),
+            true,
+        );
+        assert_eq!(fresh[&session].1, "현재 pane 작업");
+        refresh_fresh_hook_prompts(&mut observed, &mut fresh, HashMap::new(), true);
+        assert!(fresh.is_empty());
+    }
+
+    #[test]
     fn 공유_pane_하나가_닫혀도_남은_pane의_hook_작업을_표시한다() {
         use crate::agent_detect::{AgentBinding, AgentDisplay, AgentKind};
 
@@ -43184,6 +43454,7 @@ mod tests {
                     pane_id: "pane-a".to_owned(),
                     kind: "claude".to_owned(),
                     session_id: "shared".to_owned(),
+                    task_prompt: None,
                 },
             ),
             (
@@ -43192,6 +43463,7 @@ mod tests {
                     pane_id: "pane-b".to_owned(),
                     kind: "claude".to_owned(),
                     session_id: "shared".to_owned(),
+                    task_prompt: None,
                 },
             ),
         ]);

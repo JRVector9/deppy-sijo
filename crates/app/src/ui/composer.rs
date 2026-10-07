@@ -1050,6 +1050,7 @@ impl ComposerUi {
                         text: buffer,
                         max_bytes,
                         rejected: &mut rejected,
+                        normalize_nfc: true,
                     })
                     .interactive(!self.read_only)
                     .id(text_id)
@@ -2744,6 +2745,25 @@ mod tests {
             "over-limit paste keeps original selection body"
         );
         assert_eq!(stored_char_range(&harness.ctx, id), Some((1, 0)));
+    }
+
+    #[test]
+    fn pasted_decomposed_hangul_path_is_composed_in_the_composer() {
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        let mut harness = composer_harness(
+            &catalog,
+            ComposerSendKey::CmdEnter,
+            test_history_path("hangul-path-paste"),
+        );
+        harness.run();
+        let id = ComposerUi::text_id(TEST_WS);
+        harness.ctx.memory_mut(|memory| memory.request_focus(id));
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::Paste("/Users/jr/한글/문서.txt".into()));
+        harness.run();
+        assert_eq!(buffer_of(&harness), "/Users/jr/한글/문서.txt");
     }
 
     #[test]

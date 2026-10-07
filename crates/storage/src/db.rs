@@ -914,6 +914,10 @@ CREATE INDEX idx_relay_devices_recency
     "ALTER TABLE agent_hook_sessions ADD COLUMN task_prompt TEXT
        CHECK(task_prompt IS NULL OR (typeof(task_prompt)='text'
          AND length(CAST(task_prompt AS BLOB)) <= 256));",
+    // A pane ID survives app restart; runtime SessionId and hook session_key do not.
+    "ALTER TABLE agent_sessions ADD COLUMN task_prompt TEXT
+       CHECK(task_prompt IS NULL OR (typeof(task_prompt)='text'
+         AND length(CAST(task_prompt AS BLOB)) <= 256));",
 ];
 
 /// 옵션2: 저장된 에이전트 세션 한 행 — 재시작 복원 시 native resume에 쓴다.
@@ -924,6 +928,8 @@ pub struct AgentSessionRow {
     pub kind: String,
     /// 에이전트 자신의 세션 ID (`claude --resume <id>` / `codex resume <id>`).
     pub session_id: String,
+    /// Pane-scoped last real Claude user task; never inferred from a shared transcript.
+    pub task_prompt: Option<String>,
 }
 
 /// Restored read-only agent pane metadata joined by the durable `sessions.id` carried in mux
@@ -2023,6 +2029,7 @@ const AGENT_SESSIONS_BOUNDED_PREFLIGHT: &str = "WITH selected AS MATERIALIZED (
 ), sized AS MATERIALIZED (
     SELECT session.*, length(CAST(session.pane_id AS BLOB))
          + length(CAST(session.kind AS BLOB)) + length(CAST(session.session_id AS BLOB))
+         + COALESCE(length(CAST(session.task_prompt AS BLOB)), 0)
          AS row_bytes
       FROM selected JOIN agent_sessions session ON session.rowid = selected.rowid
 )
@@ -2030,9 +2037,11 @@ SELECT COUNT(*), COALESCE(SUM(CASE WHEN
        typeof(pane_id) != 'text' OR length(CAST(pane_id AS BLOB)) NOT BETWEEN 1 AND ?3
     OR typeof(kind) != 'text' OR length(CAST(kind AS BLOB)) > ?4
     OR typeof(session_id) != 'text' OR length(CAST(session_id AS BLOB)) NOT BETWEEN 1 AND ?3
+    OR typeof(task_prompt) NOT IN ('null', 'text')
+    OR length(CAST(task_prompt AS BLOB)) > 256
     OR typeof(updated_at) != 'integer' OR row_bytes > ?5 THEN 1 ELSE 0 END), 0),
     COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0) FROM sized";
-const AGENT_SESSIONS_BOUNDED_SELECT: &str = "SELECT pane_id, kind, session_id
+const AGENT_SESSIONS_BOUNDED_SELECT: &str = "SELECT pane_id, kind, session_id, task_prompt
     FROM agent_sessions WHERE workspace_id = ?1
     ORDER BY updated_at DESC, substr(CAST(pane_id AS BLOB), 1, ?3), rowid LIMIT ?2";
 
@@ -2658,7 +2667,15 @@ fn agent_session_identity_input_bytes(
 }
 
 fn agent_session_row_input_bytes(row: &AgentSessionRow) -> anyhow::Result<usize> {
-    agent_session_identity_input_bytes(&row.pane_id, &row.kind, &row.session_id)
+    let base = agent_session_identity_input_bytes(&row.pane_id, &row.kind, &row.session_id)?;
+    let prompt = row.task_prompt.as_deref().unwrap_or_default();
+    anyhow::ensure!(
+        prompt.is_empty() || (prompt.len() <= 256 && task_prompt_is_displayable(prompt)),
+        AGENT_STATE_INPUT_INVALID
+    );
+    base.checked_add(prompt.len())
+        .filter(|bytes| *bytes <= BOUNDED_ROW_BYTES_MAX)
+        .ok_or_else(|| anyhow::anyhow!(AGENT_STATE_INPUT_INVALID))
 }
 
 fn canonicalize_agent_state_string(value: &mut String) {
@@ -2679,6 +2696,7 @@ fn canonicalize_agent_session_row(row: &mut AgentSessionRow) {
     canonicalize_agent_state_string(&mut row.pane_id);
     canonicalize_agent_state_string(&mut row.kind);
     canonicalize_agent_state_string(&mut row.session_id);
+    canonicalize_agent_state_optional_string(&mut row.task_prompt);
 }
 
 fn canonicalize_structured_thread_row(row: &mut StructuredThreadRow) {
@@ -2836,6 +2854,7 @@ fn agent_state_job_retained_bytes(
             checked_agent_state_string_capacity(&mut total, &row.pane_id)?;
             checked_agent_state_string_capacity(&mut total, &row.kind)?;
             checked_agent_state_string_capacity(&mut total, &row.session_id)?;
+            checked_agent_state_optional_string_capacity(&mut total, &row.task_prompt)?;
         }
     }
     checked_agent_state_vec_allocation(&mut total, &job.stale_binding_deletes)?;
@@ -2936,6 +2955,7 @@ fn agent_state_snapshot_retained_bytes(
         checked_agent_state_string_capacity(&mut total, &row.pane_id)?;
         checked_agent_state_string_capacity(&mut total, &row.kind)?;
         checked_agent_state_string_capacity(&mut total, &row.session_id)?;
+        checked_agent_state_optional_string_capacity(&mut total, &row.task_prompt)?;
     }
     checked_agent_state_vec_allocation(&mut total, &snapshot.global_agent_sessions)?;
     for (workspace_id, pane_id) in &snapshot.global_agent_sessions {
@@ -7537,9 +7557,15 @@ impl Db {
             AGENT_SESSION_CAPACITY_EXCEEDED
         );
         tx.execute(
-            "INSERT OR REPLACE INTO agent_sessions
+            "INSERT INTO agent_sessions
                    (workspace_id, pane_id, kind, session_id, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, CAST(strftime('%s','now') AS INTEGER))",
+                 VALUES (?1, ?2, ?3, ?4, CAST(strftime('%s','now') AS INTEGER))
+                 ON CONFLICT(workspace_id, pane_id) DO UPDATE SET
+                   task_prompt = CASE WHEN agent_sessions.kind = excluded.kind
+                     AND agent_sessions.session_id = excluded.session_id
+                     THEN agent_sessions.task_prompt ELSE NULL END,
+                   kind = excluded.kind, session_id = excluded.session_id,
+                   updated_at = excluded.updated_at",
             (workspace_id, pane_id, kind, session_id),
         )
         .map_err(|_| anyhow::anyhow!(BOUNDED_WRITE_FAILED))?;
@@ -8102,13 +8128,14 @@ impl Db {
     /// 워크스페이스의 저장된 에이전트 세션 (복원 시 resume 대상).
     pub fn list_agent_sessions(&self, workspace_id: &str) -> anyhow::Result<Vec<AgentSessionRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT pane_id, kind, session_id FROM agent_sessions WHERE workspace_id = ?1",
+            "SELECT pane_id, kind, session_id, task_prompt FROM agent_sessions WHERE workspace_id = ?1",
         )?;
         let rows = stmt.query_map([workspace_id], |row| {
             Ok(AgentSessionRow {
                 pane_id: row.get(0)?,
                 kind: row.get(1)?,
                 session_id: row.get(2)?,
+                task_prompt: row.get(3)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -8163,6 +8190,7 @@ impl Db {
                         .to_owned(),
                     session_id: bounded_required_text(row, 2, BOUNDED_ID_BYTES_MAX, true, true)?
                         .to_owned(),
+                    task_prompt: bounded_optional_text(row, 3, 256)?.map(str::to_owned),
                 });
             }
         }
@@ -8413,6 +8441,7 @@ impl Db {
                             true,
                         )?
                         .to_owned(),
+                        task_prompt: bounded_optional_text(row, 3, 256)?.map(str::to_owned),
                     });
                 }
             }
@@ -8430,15 +8459,27 @@ impl Db {
             for row in &reconcile.desired_bindings {
                 tx.execute(
                     "INSERT INTO agent_sessions
-                           (workspace_id, pane_id, kind, session_id, updated_at)
-                         VALUES (?1, ?2, ?3, ?4, CAST(strftime('%s','now') AS INTEGER))
+                           (workspace_id, pane_id, kind, session_id, task_prompt, updated_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, CAST(strftime('%s','now') AS INTEGER))
                          ON CONFLICT(workspace_id, pane_id) DO UPDATE SET
+                           task_prompt = CASE WHEN agent_sessions.kind = excluded.kind
+                             AND agent_sessions.session_id = excluded.session_id
+                             THEN COALESCE(excluded.task_prompt, agent_sessions.task_prompt)
+                             ELSE excluded.task_prompt END,
                            kind = excluded.kind,
                            session_id = excluded.session_id,
                            updated_at = excluded.updated_at
                          WHERE agent_sessions.kind != excluded.kind
-                            OR agent_sessions.session_id != excluded.session_id",
-                    rusqlite::params![job.workspace_id, row.pane_id, row.kind, row.session_id],
+                            OR agent_sessions.session_id != excluded.session_id
+                            OR (excluded.task_prompt IS NOT NULL
+                                AND agent_sessions.task_prompt IS NOT excluded.task_prompt)",
+                    rusqlite::params![
+                        job.workspace_id,
+                        row.pane_id,
+                        row.kind,
+                        row.session_id,
+                        row.task_prompt
+                    ],
                 )
                 .map_err(|_| anyhow::anyhow!(AGENT_STATE_PERSIST_FAILED))?;
             }
@@ -8927,6 +8968,7 @@ impl Db {
                         .to_owned(),
                     session_id: bounded_required_text(row, 2, BOUNDED_ID_BYTES_MAX, true, true)?
                         .to_owned(),
+                    task_prompt: bounded_optional_text(row, 3, 256)?.map(str::to_owned),
                 });
             }
             result
@@ -13942,6 +13984,66 @@ mod tests {
     }
 
     #[test]
+    fn pane_task_prompt_survives_reconcile_and_clears_on_new_native_session() {
+        let db = Db::open_in_memory().unwrap();
+        let ws = db.create_workspace("titles").unwrap();
+        let reconcile = |native: &str, prompt: Option<&str>| {
+            let mut job = AgentStateJob::projection(ws.clone());
+            job.binding_reconcile = Some(AgentSessionBindingReconcile {
+                live_pane_ids: vec!["pane-a".into()],
+                desired_bindings: vec![AgentSessionRow {
+                    pane_id: "pane-a".into(),
+                    kind: "claude".into(),
+                    session_id: native.into(),
+                    task_prompt: prompt.map(str::to_owned),
+                }],
+            });
+            db.apply_agent_state_job(&job).unwrap();
+        };
+        reconcile("native-1", Some("한글 경로 수정"));
+        reconcile("native-1", None);
+        assert_eq!(
+            db.list_agent_sessions(&ws).unwrap()[0]
+                .task_prompt
+                .as_deref(),
+            Some("한글 경로 수정")
+        );
+        reconcile("native-2", None);
+        assert_eq!(db.list_agent_sessions(&ws).unwrap()[0].task_prompt, None);
+    }
+
+    #[test]
+    fn shared_native_panes_restore_distinct_task_prompts_after_db_reopen() {
+        let (dir, path, db) = file_db("pane-task-restore");
+        let ws = db.create_workspace("shared-native").unwrap();
+        let mut job = AgentStateJob::projection(ws.clone());
+        job.binding_reconcile = Some(AgentSessionBindingReconcile {
+            live_pane_ids: vec!["pane-a".into(), "pane-b".into()],
+            desired_bindings: [("pane-a", "첫 작업"), ("pane-b", "둘째 작업")]
+                .into_iter()
+                .map(|(pane, prompt)| AgentSessionRow {
+                    pane_id: pane.into(),
+                    kind: "claude".into(),
+                    session_id: "shared-native".into(),
+                    task_prompt: Some(prompt.into()),
+                })
+                .collect(),
+        });
+        db.apply_agent_state_job(&job).unwrap();
+        drop(db);
+        let reopened = Db::open(&path).unwrap();
+        let rows = reopened.list_agent_sessions_bounded(&ws, 2).unwrap();
+        let titles = rows
+            .into_iter()
+            .map(|row| (row.pane_id, row.task_prompt))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(titles["pane-a"].as_deref(), Some("첫 작업"));
+        assert_eq!(titles["pane-b"].as_deref(), Some("둘째 작업"));
+        drop(reopened);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn structured_threads_crud와_archive_filter_roundtrip() {
         let db = Db::open_in_memory().unwrap();
         let ws = db.create_workspace("structured").unwrap();
@@ -15109,6 +15211,7 @@ mod tests {
                 pane_id: "pane-desired".to_owned(),
                 kind: "codex".to_owned(),
                 session_id: "desired".to_owned(),
+                task_prompt: None,
             }],
         });
         job.turn_done_clears.push(AgentTurnDoneClear {
@@ -15558,6 +15661,7 @@ mod tests {
                 pane_id: "new-pane".to_owned(),
                 kind: "codex".to_owned(),
                 session_id: "new-session".to_owned(),
+                task_prompt: None,
             }],
         });
         job.turn_done_clears.push(AgentTurnDoneClear {
@@ -15581,6 +15685,7 @@ mod tests {
                 pane_id: "new-pane".to_owned(),
                 kind: "codex".to_owned(),
                 session_id: "new-session".to_owned(),
+                task_prompt: None,
             }]
         );
         assert!(db.list_structured_threads(&ws, true).unwrap()[0].archived);
@@ -16351,6 +16456,7 @@ mod tests {
                 pane_id: pane_id.clone(),
                 kind: "codex".to_owned(),
                 session_id: format!("session-{index}"),
+                task_prompt: None,
             })
             .collect::<Vec<_>>();
         let mut exact = AgentStateJob::projection(&ws);
@@ -16415,6 +16521,7 @@ mod tests {
                 pane_id: marker.to_owned(),
                 kind: marker.to_owned(),
                 session_id: marker.to_owned(),
+                task_prompt: None,
             }],
         };
         let clear = AgentTurnDoneClear {
@@ -16761,6 +16868,7 @@ mod tests {
                 pane_id: "binding-explode".to_owned(),
                 kind: "codex".to_owned(),
                 session_id: "session".to_owned(),
+                task_prompt: None,
             }],
         });
         assert_eq!(

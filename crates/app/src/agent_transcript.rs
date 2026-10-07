@@ -559,19 +559,10 @@ fn bounded_path_owned(value: &str) -> Option<String> {
         .then(|| value.to_owned())
 }
 
-/// 노이즈로 보고 거부할 접두 목록 — 요약(`clean_agent_summary`)과 원문 읽기
-/// (`read_conversation`)가 이 판정을 공유한다(2026-08-15 리팩터). 목록 자체는 상한이
-/// 바뀌어도 그대로 둔다 — 정확도를 올리는 규칙이라 상한과 무관하다.
+/// Hook 저장과 transcript 읽기는 동일한 내부 메시지 판정을 써야 한다. 어느 한쪽만
+/// 통과하면 이미 저장된 오염된 제목 또는 대화의 합성 user turn이 다시 노출된다.
 fn is_noise_prefix(text: &str) -> bool {
-    text.is_empty()
-        || text.starts_with("<system-reminder")
-        || text.starts_with("<local-command")
-        || text.starts_with("<command-name")
-        || text.starts_with("<environment_context")
-        || text.starts_with("<permissions")
-        || text.starts_with("<INSTRUCTIONS")
-        || text.starts_with("<task-notification")
-        || text.starts_with("<heartbeat")
+    !storage::task_prompt_is_displayable(text)
 }
 
 fn clean_agent_summary(text: &str) -> Option<String> {
@@ -3112,6 +3103,25 @@ mod tests {
         assert_eq!(clean_agent_summary("<task-notification> internal"), None);
         assert_eq!(clean_agent_summary("<heartbeat> internal"), None);
         assert_eq!(clean_agent_summary("   \n\t"), None);
+    }
+
+    #[test]
+    fn 하위_에이전트_반환은_사용자_작업이나_세션_제목이_아니다() {
+        for internal in [
+            "<agent-message from=\"subagent\"> [Subagent hand-back] internal",
+            "Another Claude session sent a message: <agent-message from=\"subagent\"> internal",
+        ] {
+            assert_eq!(clean_agent_summary(internal), None);
+            let event = serde_json::json!({
+                "type": "user", "message": {"role": "user", "content": internal}
+            });
+            assert_eq!(claude_user_instruction(&event), None);
+            assert!(!claude_user_starts_new_turn(&event));
+        }
+        assert_eq!(
+            clean_agent_summary("<div> 태그 렌더링을 고쳐"),
+            Some("<div> 태그 렌더링을 고쳐".to_owned())
+        );
     }
 
     #[test]

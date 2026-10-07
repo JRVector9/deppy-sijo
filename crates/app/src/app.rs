@@ -43250,15 +43250,14 @@ mod tests {
                 transcript: PathBuf::from("/tmp/native.jsonl"),
             },
         )]);
-        let prompts = HashMap::from([(
-            session,
-            (
-                "native".to_owned(),
-                "<task-notification> <task-id>internal</task-id>".to_owned(),
-            ),
-        )]);
-
-        assert_eq!(trusted_pane_task_prompt(session, &bindings, &prompts), None);
+        for internal in [
+            "<task-notification> <task-id>internal</task-id>",
+            "<agent-message from=\"subagent\"> [Subagent hand-back] internal",
+            "Another Claude session sent a message: <agent-message from=\"subagent\"> internal",
+        ] {
+            let prompts = HashMap::from([(session, ("native".to_owned(), internal.to_owned()))]);
+            assert_eq!(trusted_pane_task_prompt(session, &bindings, &prompts), None);
+        }
     }
 
     #[test]

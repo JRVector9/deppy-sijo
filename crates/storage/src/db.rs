@@ -69,11 +69,24 @@ pub struct Db {
     authorization_db_identity: String,
 }
 
-/// Whether a Claude hook preview describes user work rather than an internal event.
-/// Also used when reading older rows that already contain an internal notification.
+/// Whether a Claude message describes user work rather than an internal event.
+/// Shared with transcript parsing and used when reading already-polluted hook rows.
 pub fn task_prompt_is_displayable(prompt: &str) -> bool {
     let prompt = prompt.trim_start();
+    let agent_envelope = |text: &str| {
+        text.strip_prefix("<agent-message").is_some_and(|rest| {
+            rest.chars()
+                .next()
+                .is_some_and(|ch| ch == '>' || ch.is_ascii_whitespace())
+        })
+    };
+    let relayed_agent_envelope = prompt
+        .strip_prefix("Another Claude session sent a message:")
+        .is_some_and(|rest| agent_envelope(rest.trim_start()));
     !prompt.is_empty()
+        && !agent_envelope(prompt)
+        && !relayed_agent_envelope
+        && !prompt.starts_with("[Subagent hand-back]")
         && ![
             "<task-notification",
             "<system-reminder",
@@ -15303,12 +15316,19 @@ mod tests {
         db.record_hook_task_prompt(&key, "native", "실제 진행 중인 작업")
             .unwrap();
 
-        db.record_hook_task_prompt(
-            &key,
-            "native",
+        for internal in [
             "<task-notification> <task-id>internal</task-id>",
-        )
-        .unwrap();
+            "<agent-message from=\"subagent\"> [Subagent hand-back] internal",
+            "Another Claude session sent a message: <agent-message from=\"subagent\"> internal",
+        ] {
+            db.record_hook_task_prompt(&key, "native", internal)
+                .unwrap();
+            assert!(!task_prompt_is_displayable(internal));
+        }
+        assert!(task_prompt_is_displayable(
+            "<agent-message-example> UI 문구를 바꿔"
+        ));
+        assert!(task_prompt_is_displayable("<div> 태그 렌더링을 고쳐"));
 
         let row = db
             .list_hook_sessions()

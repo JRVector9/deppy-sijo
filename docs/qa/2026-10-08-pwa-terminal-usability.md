@@ -76,8 +76,8 @@ Blink의 공식 사용 안내는 글자 크기 핀치, 선택 복사, Ctrl/Alt �
 | --- | --- | --- | --- | --- |
 | 1 | 고정15px/12–24px 설정, 로컬 grid 이동, 명시적 전체 맞춤, 키보드 메뉴 위치 | renderer + input_ui | 원격180열/좁은 화면에서 글자 크기와 Unicode 좌표, viewport 메뉴 검증 | 커밋27186086 |
 | 2 | 직접 입력/IME/붙여넣기/제어 키 | input_ui + backend | 정확한 세션과 실시간 터미널 모드, 중복/재연결 입력 방지 | 커밋fcfbbfd1 |
-| 3 | 단일 resize 제어권과 실제 PTY 행·열 동기화 | backend + input_ui | 경쟁 소켓/네이티브 resize 복원/회전·키보드·연결 정리 검증 | 구현·검증 완료, 커밋 직전 |
-| 4 | 선택·복사·검색/별도 읽기 모드, 연결별 이력 위치 | renderer + backend + input_ui | 네이티브 스크롤 불변, 새 출력 시 읽기 위치 유지 | renderer 읽기 위치 확장 격리 개발, 통합은 PR3 이후 |
+| 3 | 단일 resize 제어권과 실제 PTY 행·열 동기화 | backend + input_ui | 경쟁 소켓/네이티브 resize 복원/회전·키보드·연결 정리 검증 | 커밋00cb838a |
+| 4 | 선택·복사·검색/별도 읽기 모드, 연결별 이력 위치 | renderer + backend + input_ui | 네이티브 스크롤 불변, 새 출력 시 읽기 위치 유지 | 구현·리뷰·최종 검증 완료; PR4 커밋은 아래 조회 명령 참조 |
 
 각 담당자는 독점 파일만 수정하며 root가 실제 코드 리뷰·검증 후 PR 단위로 커밋한다. 현재 요청에는 앱 재실행과 배포가 포함되지 않는다. 실기기 iPhone/Android 검증은 자동 Chromium 검증과 구분해 기록한다.
 
@@ -101,3 +101,16 @@ Blink의 공식 사용 안내는 글자 크기 핀치, 선택 복사, Ctrl/Alt �
 - runtime/native 리뷰의 만료 재확인·복원 실패 시 희망 크기 보존·tracked 재시도·조용한 복원 화면·아직 생성되지 않은 세션 뷰 문제를 모두 수정했다. 서버의 같은 UUID 인스턴스 교체와 취소/해제 완료 응답, UI 읽기 중단·축소 해제 재평가도 RED/GREEN 후 집중 재리뷰OK다.
 - 실제 인증 WebSocket/임시 PTY에서80×24→40×6→80×24 keyframe과 경쟁 연결 거절을 확인했다. 실제 두 워커의 전송 유실 재시도·연결0 정리·이전 워커 sink 정리도 통과했다. 전체 검증은 Web336(1ignored)+기존 통합20, runtime371, terminal121(4ignored), session76, native3/기존 trackedUI18, 앱 테스트 대상 컴파일, 모바일 UI226/기존 흐름 Chrome wrapper 각각1PASS다. 최종 strict runtime/web/App all-targets Clippy·fmt·boundary도 통과했다.
 - 전체 검증에서 이전 코드 문자열을 확인하던 중복 검사1줄을 제거했다. 기존 입력 fixture의 cat 출력/가상 프롬프트 경쟁은6바이트 제어문자·만료되지 않은 deadline으로 재현했고, fixture 출력만 차단하여 원래 입력 가드·assertion·deadline을 보존했다. 수정 후 집중10회 및 전체 runtime371이 통과했다.
+
+### PR4 완료와 검증 — 2026-10-09
+
+- 독립 DOM 선택 계층, 명시적 읽기 줄바꿈, 불러온 화면 범위의 검색과 선택 복사를 통합했다. 새 출력은 전송 기준 화면만 갱신하며 읽던 화면은 유지한다. 일치하는 이력 응답이나 명시적 현재 화면 복귀만 읽기 화면을 바꾼다. 최종 실제 Chromium reading180/history89/readability113 assertions와 러너 실패 회귀2개가 통과했다.
+- 모바일 UI 최종281 assertions(설정 재로딩 포함), 기존 흐름 parity 및 요청 번호 한도 회귀216 assertions가 통과했다. 요청 중 누적 이동은 같은 표시 행 기준을 사용하고, 취소·연결 변경·기한 초과 후 늦은 응답은 화면을 덮지 않는다. 검색·복사와 입력 확정·화면 크기 제어의 전체 리뷰는 CONCLUSION: OK다. 실제 stage0→6px인데 내부 스크롤 영역이0px인 경우의 크기 복구 누락을 재현해 실제 영역 변경 감지를 추가했고, 해당 작은 수정도 집중 재리뷰OK다.
+- 터미널의 순수 이력 조회는 행 식별자·저장 한도·중복 내용·줄바꿈·보조 화면·resize·trim·행 삽입을 다룬다. 리뷰에서 native snapshot을 호출하는 미지원 fallback과 넓은 문자의 커서 차이를 실제 RED로 확인해 수정했다. 최종 집중9개 및 전체 terminal130개가 통과했고4개는 기존 ignored다.
+- 실제 임시 PTY에서 native scroll/damage를 보존하는 런타임 조회, 유계 응답 저장, 출력 폭주 중 응답 전송, 오래된 응답 병합과 wire metadata 회귀6개가 통과했다. 전체 runtime377/session76 및 런타임·터미널 집중 재리뷰가 통과했다. runtime wire25→26, JSON5를 유지하며 이력 metadata·읽기 요청·오류 응답을 추가했다. `first_line`은 decimal 문자열과 BigInt로 처리해 u64 정밀도를 보존한다.
+- 실제 인증 WebSocket 두 연결과 임시 PTY로 Mac이 과거3행을 보던 상태에서도 각각 현재 화면0행을 받으며, 모바일3행/1행 열람·새 출력·독립 복귀가 Mac 스크롤을 바꾸지 않는 것을 검증했다. Web 이력 회귀12개와 실제 워커 통합1개가 통과했다. 새 Dashboard에 늦은 이전 응답이 들어오는 작업 번호 충돌을 RED로 재현해 임의 시작값·단조 증가·소진 시 거절로 수정했고 집중 재리뷰OK다.
+- 실제 Chromium CDP 마우스 드래그로 첫/아래 행의 grid/읽기 선택과 Unicode 복사·메뉴 포커스·입력 비전송을 검증했다(클립보드 쓰기는 stub). 안내 오버레이의 첫 행 선택 간섭은 두 모드에서 RED로 재현해 고정된 별도 영역으로 옮겼고 실제 드래그29/29/16 assertions가 통과했다. 긴 안내문에 의한 폭 확장도 반복된 실제 만료 문구로320→507.9px RED를 확인해 최소 폭 제약을 수정했다. 작은 수정의 집중 재리뷰OK다. 이 결과는 iOS longpress 실기기 검증을 뜻하지 않는다.
+- 최종 전체 Rust 검증: Web349 unit(1 ignored)+기본 통합20, App2809(38 ignored), runtime377, terminal130(4 ignored), session76, vendored terminal202(1 ignored). 기존 core/grapheme/readability와 신규 reading/history/mobile-usability/shell-parity Chrome wrapper7개를 명시적으로 실행해 각각1PASS를 확인했다. strict5개 패키지 all-target Clippy·fmt·boundary·diff check 모두 통과했다.
+- 중간 gate의 vendor 패키지 선택 오류, 앱의 새 이력 응답 분기 누락, Clippy3개 문법/fixture 지적은 실패 결과를 handoff에 기록하고 수정한 뒤 필요한 후속 검증만 실행했다. 이전 코드 문자열을 비교하던 Web 테스트는 실제 읽기 계약에 맞게 watch/범위/no-native-scroll 검증으로 수정했다. 기능 리뷰 지적은 모두 수정·재리뷰OK이며 마지막에는 제품 동작을 바꾸지 않는 문법 정리만 적용했다.
+- 실제 iPhone/Safari·Android/Chrome 설치 PWA의 가상 키보드·longpress·시스템 클립보드는 미검증이다. 선택 복사의 자동 검증은 clipboard stub을 사용했다. 선택적 Ghostty feature 빌드는 Zig 부재로 실행하지 않았으며, 미지원 이력 조회는 native snapshot 호출 없이 unavailable을 반환하는 회귀를 검증했다.
+- PR4 커밋 제목은 `feat(pwa): PR4 독립 이력과 모바일 읽기 도구`다. 정확한 SHA는 `git log -1 --format='%H %s' --grep='PR4 독립 이력과 모바일 읽기 도구'`로 조회한다. 앱 배포·재실행·push는 수행하지 않았고 소스 버전은0.8.7이다. 제품 빌드를 전달할 다음 작업에서는 출시 버전 증가와 바이너리·macOS bundle 버전 검증이 필요하다.

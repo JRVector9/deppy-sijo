@@ -46,10 +46,18 @@
 // updateScrollNote, clearViewerCanvas, clearStaleViewerHistory, activateViewerShell,
 // scheduleViewerRender, scheduleViewportSettle, cancelScheduledViewerRender,
 // scheduleViewerRenderForLayoutChange.
-// settings() → { fontSize, overview }, setFontSize(px) (12–24px), setOverview(bool)
+// settings() → { fontSize, overview, readableWrap }, setFontSize(px) (12–24px), setOverview(bool)
 // getCellMetrics() → { cellWidth, cellHeight, fontSize } (개요에서는 실제 축소 크기).
 // layoutChanged에는 stageWidth, stageHeight, configuredFontSize도 포함한다.
 // resumeFollow() → 현재 커서/최신 출력 따라가기. 수동 이동 후에는 명시적으로 재개한다.
+// setReadableWrap(bool) → 좌표 커서를 숨기는 읽기 줄바꿈(기기 저장).
+// getSelectedText() → 터미널에 속한 선택 문자열. findText(query, direction = 1),
+// clearSearch() → 현재 불러온 화면만 검색. { query, total, index, scope: 'loaded viewport' }.
+// hooks.searchChanged(result) → 프레임 갱신으로 검색 결과가 바뀔 때.
+// expectHistoryWindow(request) → 호스트가 보낸 nonzero-u32 기록 요청 응답만 설치한다.
+// cancelHistoryWindow(request) → 현재 요청만 취소하고 불러온 창을 유지한다.
+// getHistoryState(), hooks.readingChanged(state) → 불러온 창 보존/만료/요청 상태.
+// hooks.resumeHistory() → 기록 열람에서 현재 화면 복귀를 호스트에 위임한다.
 
 /// 호스트 문서에 뷰어 마크업이 없을 때(시청 전용 셸) 코어가 직접 만든다. 루프백 셸의
 /// `index.html`에 있는 것과 같은 구조에서 쓰기 컨트롤(특수키·작성기)만 뺀 것이다 — 같은
@@ -148,15 +156,47 @@ export function createViewer(options = {}) {
     followingLive: true,
   };
 
+  if (viewer.scrollNote) {
+    viewer.el.insertBefore(viewer.scrollNote, viewer.wrap.parentElement);
+    viewer.el.classList.add('viewer-has-scroll-note');
+  }
+
   const FONT_FAMILY = 'ui-monospace, Menlo, monospace';
   const PREFS_KEY = 'deppy-viewer:prefs';
-  const prefs = { fontSize: 15, overview: false };
+  const prefs = { fontSize: 15, overview: false, readableWrap: false };
   try {
     const saved = JSON.parse(localStorage.getItem(PREFS_KEY));
     if (saved && Number.isFinite(saved.fontSize)) prefs.fontSize = Math.max(12, Math.min(24, saved.fontSize));
     if (saved && typeof saved.overview === 'boolean') prefs.overview = saved.overview;
+    if (saved && typeof saved.readableWrap === 'boolean') prefs.readableWrap = saved.readableWrap;
   } catch (_) { /* Private browsing or unavailable storage keeps readable defaults. */ }
+  if (prefs.readableWrap) prefs.overview = false;
   viewer.wrap.classList.toggle('overview', prefs.overview);
+  viewer.wrap.classList.toggle('readable', prefs.readableWrap);
+  const textLayer = document.createElement('div');
+  textLayer.className = 'viewer-text-layer';
+  textLayer.setAttribute('role', 'document');
+  textLayer.setAttribute('aria-label', '터미널 출력 — 현재 불러온 화면');
+  const searchMarks = document.createElement('div');
+  searchMarks.className = 'viewer-search-marks';
+  searchMarks.setAttribute('aria-hidden', 'true');
+  textLayer.append(searchMarks);
+  viewer.wrap.append(textLayer);
+  viewer.textLayer = textLayer;
+  viewer.canvas.setAttribute('aria-hidden', 'true');
+  const textRows = [];
+  const textRowKeys = [];
+  let searchQuery = '';
+  let searchMatches = [];
+  let searchIndex = -1;
+  let wireScreen = null;
+  let keyframeRequested = false;
+  let retainedDisplay = false;
+  let expiredHistory = false;
+  let pendingHistoryRequest = null;
+  let waitingForResume = false;
+  let registeringResume = false;
+  let lastReadingStateKey = '';
   const localPositions = new Map();
   let restoreLocalPosition = false;
   let automaticPosition = null;
@@ -165,6 +205,94 @@ export function createViewer(options = {}) {
   let cellMetrics = null;
   let lastLayoutKey = '';
   const measuringContext = document.createElement('canvas').getContext('2d');
+  const positionKey = session => session + (prefs.readableWrap ? ':reading' : ':grid');
+
+  function getHistoryState() {
+    const metadata = viewer.screen && viewer.screen.history;
+    return {
+      retained: retainedDisplay,
+      expired: expiredHistory,
+      pendingRequest: pendingHistoryRequest,
+      offset: viewer.screen ? viewer.screen.offset : 0,
+      latestOffset: wireScreen ? wireScreen.offset : 0,
+      totalLines: metadata ? metadata.total_lines : null,
+      generation: metadata ? metadata.generation : null,
+      firstLine: metadata ? metadata.first_line : null,
+    };
+  }
+
+  function notifyReadingChanged() {
+    const state = getHistoryState();
+    const key = JSON.stringify(state);
+    if (key === lastReadingStateKey) return;
+    lastReadingStateKey = key;
+    if (hooks.readingChanged) hooks.readingChanged(state);
+  }
+
+  function resetHistoryState() {
+    wireScreen = null;
+    keyframeRequested = false;
+    retainedDisplay = false;
+    expiredHistory = false;
+    pendingHistoryRequest = null;
+    waitingForResume = false;
+    lastReadingStateKey = '';
+  }
+
+  function expectHistoryWindow(request) {
+    if (!viewer.watching || !Number.isInteger(request) || request <= 0 || request > 0xffffffff) return false;
+    pendingHistoryRequest = request;
+    if (!registeringResume) {
+      waitingForResume = false;
+      viewer.followingLive = false;
+    }
+    retainedDisplay = true;
+    rememberLocalPosition();
+    updateScrollNote();
+    notifyReadingChanged();
+    return true;
+  }
+
+  function cancelHistoryWindow(request) {
+    if (pendingHistoryRequest === null || request !== pendingHistoryRequest) return false;
+    pendingHistoryRequest = null;
+    waitingForResume = false;
+    retainedDisplay = true;
+    viewer.followingLive = false;
+    rememberLocalPosition();
+    updateScrollNote();
+    notifyReadingChanged();
+    return true;
+  }
+
+  function inferHistoryExpiration() {
+    const loaded = viewer.screen && viewer.screen.history;
+    const latest = wireScreen && wireScreen.history;
+    if (!retainedDisplay || !loaded || !latest) return;
+    if (loaded.generation !== latest.generation) { expiredHistory = true; return; }
+    if (typeof loaded.first_line !== 'string' || typeof latest.first_line !== 'string'
+        || !/^\d+$/.test(loaded.first_line) || !/^\d+$/.test(latest.first_line)
+        || !Number.isSafeInteger(latest.total_lines)) return;
+    const floor = BigInt(latest.first_line) + BigInt(wireScreen.offset)
+      + BigInt(wireScreen.rows) - BigInt(latest.total_lines);
+    if (BigInt(loaded.first_line) < floor) expiredHistory = true;
+  }
+
+  function publishScreen(screen, manual = false) {
+    const previous = viewer.screen;
+    const differentWindow = previous && (previous.history && screen.history
+      ? previous.history.generation !== screen.history.generation || previous.history.first_line !== screen.history.first_line
+      : previous.offset !== screen.offset || previous.cols !== screen.cols || previous.rows !== screen.rows);
+    if (manual && differentWindow) {
+      if (selectionTouchesText()) window.getSelection().removeAllRanges();
+      clearSearch();
+    }
+    viewer.screen = screen;
+    expiredHistory = false;
+    viewerScreenRevision += 1;
+    updateScrollNote();
+    scheduleViewerRender();
+  }
 
   function measureCells() {
     if (measuredFontSize !== prefs.fontSize) {
@@ -199,23 +327,48 @@ export function createViewer(options = {}) {
 
   function rememberLocalPosition() {
     if (viewer.watching && !prefs.overview && !restoreLocalPosition) {
-      localPositions.set(viewer.watching, {
+      localPositions.set(positionKey(viewer.watching), {
         left: viewer.wrap.scrollLeft, top: viewer.wrap.scrollTop, follow: viewer.followingLive,
       });
     }
   }
 
   function stopFollowing() {
-    if (!viewer.watching || prefs.overview) return;
+    if (!viewer.watching) return;
+    if (waitingForResume && pendingHistoryRequest !== null) cancelHistoryWindow(pendingHistoryRequest);
     viewer.followingLive = false;
+    retainedDisplay = true;
     rememberLocalPosition();
     updateScrollNote();
+    notifyReadingChanged();
   }
 
   function resumeFollow() {
+    if (waitingForResume && pendingHistoryRequest !== null) return;
+    const selection = window.getSelection();
+    if (selectionTouchesText()) selection.removeAllRanges();
+    clearSearch();
     viewer.followingLive = true;
+    const needsReset = (wireScreen && wireScreen.offset > 0) || pendingHistoryRequest !== null
+      || (retainedDisplay && hooks.resumeHistory);
+    if (needsReset) {
+      retainedDisplay = true;
+      waitingForResume = true;
+      pendingHistoryRequest = null;
+      if (hooks.resumeHistory) {
+        registeringResume = true;
+        try { hooks.resumeHistory(); } finally { registeringResume = false; }
+      }
+      if (pendingHistoryRequest === null) { waitingForResume = false; viewer.followingLive = false; }
+    } else {
+      retainedDisplay = false;
+      waitingForResume = false;
+      expiredHistory = false;
+      if (wireScreen) publishScreen(wireScreen);
+    }
     rememberLocalPosition();
     updateScrollNote();
+    notifyReadingChanged();
     scheduleViewerRender();
   }
   if (viewer.resumeFollowButton) viewer.resumeFollowButton.addEventListener('click', resumeFollow);
@@ -239,12 +392,63 @@ export function createViewer(options = {}) {
     overview = !!overview;
     if (overview === prefs.overview) return;
     rememberLocalPosition();
+    if (overview && prefs.readableWrap) {
+      prefs.readableWrap = false;
+      viewer.wrap.classList.remove('readable');
+      restoreLocalPosition = true;
+    }
     prefs.overview = overview;
     viewer.wrap.classList.toggle('overview', overview);
     if (!overview) restoreLocalPosition = true;
     resetPan();
     savePreferences();
   }
+
+  function setReadableWrap(readable) {
+    readable = !!readable;
+    if (readable === prefs.readableWrap) return;
+    rememberLocalPosition();
+    if (viewer.watching) stopFollowing();
+    viewer.followingLive = false;
+    prefs.readableWrap = readable;
+    if (readable) prefs.overview = false;
+    viewer.wrap.classList.toggle('readable', readable);
+    viewer.wrap.classList.toggle('overview', prefs.overview);
+    restoreLocalPosition = true;
+    lastViewerRenderKey = '';
+    resetPan();
+    updateScrollNote();
+    savePreferences();
+  }
+
+  function getSelectedText() {
+    if (!viewer.privacy.hidden) return '';
+    const selection = window.getSelection();
+    return selection && selection.rangeCount && textLayer.contains(selection.anchorNode)
+      && textLayer.contains(selection.focusNode) ? selection.toString() : '';
+  }
+
+  function selectionTouchesText() {
+    const selection = window.getSelection();
+    return !!(selection && selection.rangeCount && !selection.isCollapsed
+      && selection.getRangeAt(0).intersectsNode(textLayer));
+  }
+
+  document.addEventListener('selectionchange', () => {
+    if (viewer.privacy.hidden && selectionTouchesText()) stopFollowing();
+  });
+  document.addEventListener('copy', event => {
+    if (!viewer.privacy.hidden && selectionTouchesText()) {
+      if (event.clipboardData) event.clipboardData.setData('text/plain', '');
+      event.preventDefault();
+      return;
+    }
+    const text = getSelectedText();
+    if (text && event.clipboardData) {
+      event.clipboardData.setData('text/plain', text);
+      event.preventDefault();
+    }
+  });
 
   function getCellMetrics() {
     return { ...(cellMetrics || measureCells()) };
@@ -293,9 +497,15 @@ export function createViewer(options = {}) {
     viewer.connectionStatus.className = 'viewer-connection ' + state;
     viewer.overlay.hidden = connected;
     if (!connected) {
+      wireScreen = null;
+      keyframeRequested = false;
+      pendingHistoryRequest = null;
+      if (waitingForResume) viewer.followingLive = false;
+      waitingForResume = false;
       viewer.overlayTitle.textContent = copy[0];
       viewer.overlayDetail.textContent = copy[1];
       resetPan();
+      notifyReadingChanged();
     }
     if (hooks.connectionChanged) hooks.connectionChanged(state, connected);
   }
@@ -303,9 +513,18 @@ export function createViewer(options = {}) {
   // 프라이버시 커튼 — 백그라운드로 나갈 때만 덮는다(시청 중일 때). 돌아오면 항상 걷는다.
   function setPrivacyCurtain(covered) {
     if (covered) {
-      if (viewer.watching) viewer.privacy.hidden = false;
+      if (viewer.watching) {
+        if (pendingHistoryRequest !== null) cancelHistoryWindow(pendingHistoryRequest);
+        if (selectionTouchesText()) window.getSelection().removeAllRanges();
+        viewer.privacy.hidden = false;
+        textLayer.inert = true;
+        textLayer.setAttribute('aria-hidden', 'true');
+        clearSearch();
+      }
     } else {
       viewer.privacy.hidden = true;
+      textLayer.inert = false;
+      textLayer.removeAttribute('aria-hidden');
     }
   }
 
@@ -344,6 +563,8 @@ export function createViewer(options = {}) {
     viewer.watching = null;
     viewer.returnSession = null;
     viewer.screen = null;
+    resetHistoryState();
+    resetTextLayer();
     viewer.pendingClose = null;
     if (hooks.beforeHide) hooks.beforeHide(options, returnSession);
     resetPan();
@@ -357,6 +578,7 @@ export function createViewer(options = {}) {
     if (hooks.afterHide) hooks.afterHide(options, returnSession);
     setViewerClosing(false);
     if (hooks.afterClose) hooks.afterClose(options, returnSession);
+    notifyReadingChanged();
   }
 
   function mergeViewerCloseOptions(current = {}, incoming = {}) {
@@ -394,11 +616,14 @@ export function createViewer(options = {}) {
     viewer.watching = sessionId;
     viewer.returnSession = sessionId;
     viewer.screen = null;
+    resetHistoryState();
     clearViewerCanvas();
+    resetTextLayer();
     viewer.canvas.style.width = '0px';
     viewer.canvas.style.height = '0px';
     restoreLocalPosition = true;
-    viewer.followingLive = (localPositions.get(sessionId) || { follow: true }).follow;
+    viewer.followingLive = (localPositions.get(positionKey(sessionId)) || { follow: !prefs.readableWrap }).follow;
+    retainedDisplay = !viewer.followingLive;
     cellMetrics = null;
     lastLayoutKey = '';
     resetPan();
@@ -415,6 +640,7 @@ export function createViewer(options = {}) {
     if (viewer.connection === 'connected') {
       send({ type: 'watch', session: sessionId });
     }
+    notifyReadingChanged();
     return true;
   }
 
@@ -422,7 +648,12 @@ export function createViewer(options = {}) {
   // 식별자가 영속 UUID라 재시작 뒤에도 같은 세션이 잡힌다 (I1).
   function rewatch() {
     if (!viewer.watching) return;
-    viewer.screen = null;
+    wireScreen = null;
+    keyframeRequested = false;
+    pendingHistoryRequest = null;
+    if (waitingForResume) viewer.followingLive = false;
+    waitingForResume = false;
+    notifyReadingChanged();
     send({ type: 'watch', session: viewer.watching });
   }
 
@@ -437,35 +668,72 @@ export function createViewer(options = {}) {
 
   function handleViewport(msg) {
     if (msg.session !== viewer.watching) return; // 전환 직후 이전 세션의 잔여 프레임
-    if (!msg.keyframe && !viewer.screen) {
-      // delta인데 기준 화면이 없다 — 재동기화 요청 (P5c RequestKeyframe)
-      send({ type: 'request_keyframe' });
+    const request = msg.history && msg.history.request;
+    const explicit = Number.isInteger(request) && request > 0 && request <= 0xffffffff;
+    const matching = explicit && request === pendingHistoryRequest;
+    if (explicit && !matching) {
+      wireScreen = null;
+      requestKeyframe();
+      notifyReadingChanged();
       return;
     }
-    if (msg.keyframe || viewer.screen.cols !== msg.cols || viewer.screen.rows !== msg.rows) {
-      viewer.screen = { cols: msg.cols, rows: msg.rows, lines: new Array(msg.rows).fill(null) };
+    if (!msg.keyframe && !wireScreen) {
+      // delta인데 기준 화면이 없다 — 재동기화 요청 (P5c RequestKeyframe)
+      requestKeyframe();
+      return;
     }
+    if (msg.keyframe) keyframeRequested = false;
+    const next = msg.keyframe || wireScreen.cols !== msg.cols || wireScreen.rows !== msg.rows
+      ? { cols: msg.cols, rows: msg.rows, lines: new Array(msg.rows).fill(null) }
+      : { ...wireScreen, lines: wireScreen.lines.slice() };
     for (const line of msg.lines || []) {
-      if (line.row < viewer.screen.rows) viewer.screen.lines[line.row] = line.runs || [];
+      if (line.row < next.rows) next.lines[line.row] = line.runs || [];
     }
-    viewer.screen.cursor = msg.cursor || null;
-    viewer.screen.alt = !!msg.alt;
-    viewer.screen.offset = msg.offset | 0;
+    next.cursor = msg.cursor || null;
+    next.alt = !!msg.alt;
+    next.offset = msg.offset | 0;
+    next.history = msg.history ? { ...msg.history } : null;
+    wireScreen = next;
+    if ((!explicit || matching) && next.history && next.history.expired) {
+      if (matching) {
+        pendingHistoryRequest = null;
+        waitingForResume = false;
+      }
+      retainedDisplay = true;
+      expiredHistory = true;
+      viewer.followingLive = false;
+      rememberLocalPosition();
+      updateScrollNote();
+    } else if (matching) {
+      pendingHistoryRequest = null;
+      viewer.followingLive = waitingForResume && next.offset === 0;
+      retainedDisplay = !viewer.followingLive;
+      waitingForResume = false;
+      publishScreen(next, true);
+    } else if (!explicit) {
+      if (!viewer.screen || (!retainedDisplay && pendingHistoryRequest === null && !waitingForResume)) publishScreen(next);
+      else inferHistoryExpiration();
+    }
     updateScrollNote();
-    viewerScreenRevision += 1;
-    scheduleViewerRender();
+    notifyReadingChanged();
+  }
+
+  function requestKeyframe() {
+    if (keyframeRequested) return;
+    keyframeRequested = true;
+    send({ type: 'request_keyframe' });
   }
 
   // ── 세로 팬 제스처 — 터치/휠을 줄 단위 delta로 바꿔 호스트에 넘긴다(양수 = 과거로).
   // 실제 스크롤백 명령은 쓰기 권한이 있는 셸만 보낸다 — 코어는 제스처만 해석한다.
-  let lastTouchY = null;
+  let touchGesture = null;
 
   function pan(lines) {
     if (hooks.pan) hooks.pan(lines);
   }
 
   function resetPan() {
-    lastTouchY = null;
+    touchGesture = null;
     if (hooks.resetPan) hooks.resetPan();
   }
 
@@ -474,36 +742,60 @@ export function createViewer(options = {}) {
     const text = viewer.offsetText;
     if (!note) return;
     const offset = (viewer.screen && viewer.screen.offset) || 0;
-    note.hidden = offset <= 0 && viewer.followingLive;
-    if (offset > 0) text.textContent = '↑ ' + offset + '줄 위 (과거 열람 중)';
+    note.hidden = offset <= 0 && viewer.followingLive && !retainedDisplay && pendingHistoryRequest === null && !expiredHistory;
+    if (pendingHistoryRequest !== null) text.textContent = waitingForResume ? '현재 화면 요청 중…' : '기록 화면 요청 중…';
+    else if (expiredHistory) text.textContent = '불러온 기록이 만료되었습니다 (로컬 화면 보존)';
+    else if (offset > 0) text.textContent = '↑ ' + offset + '줄 위 (과거 열람 중)';
     else if (!viewer.followingLive) text.textContent = '화면 따라가기 일시정지';
-    if (viewer.resumeFollowButton) viewer.resumeFollowButton.hidden = offset > 0;
+    if (viewer.resumeFollowButton) {
+      viewer.resumeFollowButton.hidden = offset > 0 && !hooks.resumeHistory;
+      viewer.resumeFollowButton.disabled = waitingForResume && pendingHistoryRequest !== null;
+    }
   }
 
-  viewer.canvas.addEventListener('touchstart', (e) => {
-    if (prefs.overview && e.touches.length === 1) lastTouchY = e.touches[0].clientY;
+  const atHistoryEdge = delta => delta > 0 ? viewer.wrap.scrollTop <= 1
+    : viewer.wrap.scrollTop + viewer.wrap.clientHeight >= viewer.wrap.scrollHeight - 1;
+  viewer.wrap.addEventListener('touchstart', (e) => {
+    touchGesture = e.touches.length === 1 ? {
+      x: e.touches[0].clientX, y: e.touches[0].clientY,
+      lastY: e.touches[0].clientY, axis: null,
+    } : null;
   }, { passive: true });
-  viewer.canvas.addEventListener('touchmove', (e) => {
-    if (!prefs.overview) return; // native local grid scrolling
+  viewer.wrap.addEventListener('touchmove', (e) => {
     if (window.visualViewport && window.visualViewport.scale > 1.01) {
-      lastTouchY = null;
+      touchGesture = null;
       return; // native pan while zoomed
     }
-    if (lastTouchY == null || e.touches.length !== 1) return;
-    e.preventDefault(); // 페이지 스크롤 대신 터미널 스크롤백
+    if (e.touches.length !== 1) { touchGesture = null; return; }
+    if (!touchGesture) return;
     const y = e.touches[0].clientY;
-    const dy = y - lastTouchY;
-    lastTouchY = y;
+    const dx = e.touches[0].clientX - touchGesture.x;
+    const totalY = y - touchGesture.y;
+    let dy = y - touchGesture.lastY;
+    touchGesture.lastY = y;
+    if (!touchGesture.axis) {
+      if (Math.max(Math.abs(dx), Math.abs(totalY)) < 8) return;
+      touchGesture.axis = Math.abs(totalY) > Math.abs(dx) * 1.25 ? 'vertical' : 'horizontal';
+      dy = totalY; // retain distance accumulated before the direction/threshold settled
+    }
+    if (touchGesture.axis !== 'vertical') return;
+    if (!dy || getSelectedText() || (!prefs.overview && !atHistoryEdge(dy)) || !hooks.pan) return;
+    e.preventDefault(); // viewport edge → connection-local history supplied by host
     // 손가락을 아래로 끌면(dy>0) 과거로 — 콘텐츠가 손가락을 따라온다.
     pan(dy / (viewer.cellH || 16));
   }, { passive: false });
-  viewer.canvas.addEventListener('touchend', () => { lastTouchY = null; }, { passive: true });
-  viewer.canvas.addEventListener('wheel', (e) => {
-    if (!prefs.overview) return;
+  viewer.wrap.addEventListener('touchend', () => { touchGesture = null; }, { passive: true });
+  viewer.wrap.addEventListener('touchcancel', () => { touchGesture = null; }, { passive: true });
+  viewer.wrap.addEventListener('wheel', (e) => {
     if (e.ctrlKey) return; // preserve browser pinch zoom
+    if (window.visualViewport && window.visualViewport.scale > 1.01) return;
+    if (!e.deltaY || Math.abs(e.deltaX) > Math.abs(e.deltaY) || getSelectedText() || !hooks.pan) return;
+    const pixels = e.deltaY * (e.deltaMode === 1 ? (viewer.cellH || 16)
+      : e.deltaMode === 2 ? viewer.wrap.clientHeight : 1);
+    if (!prefs.overview && !atHistoryEdge(-pixels)) return;
     e.preventDefault();
     // 휠 위(deltaY<0) = 과거로(양수 delta).
-    pan(-e.deltaY / (viewer.cellH || 16));
+    pan(-pixels / (viewer.cellH || 16));
   }, { passive: false });
 
   const MAX_CANVAS_PIXELS = 8 * 1024 * 1024;
@@ -605,15 +897,18 @@ export function createViewer(options = {}) {
     ].join(':');
     canvas.style.width = cssWidth + 'px';
     canvas.style.height = cssHeight + 'px';
+    renderTextLayer(screen, cssWidth, cssHeight, cellW, cellH, fontSize);
     if (restoreLocalPosition && !prefs.overview) {
       // New dimensions must be installed before the browser can restore an overflow position.
-      const position = localPositions.get(viewer.watching) || { left: 0, top: 0 };
+      const position = localPositions.get(positionKey(viewer.watching)) || { left: 0, top: 0 };
       setLocalPosition(position.left, position.top);
       restoreLocalPosition = false;
     }
     followLiveOutput(screen, cellW, cellH);
+    paintSearchMarks();
     if (renderKey === lastViewerRenderKey) return;
     lastViewerRenderKey = renderKey;
+    if (prefs.readableWrap) return;
     const pixelWidth = Math.max(1, Math.round(cssWidth * dpr));
     const pixelHeight = Math.max(1, Math.round(cssHeight * dpr));
     if (canvas.width !== pixelWidth) canvas.width = pixelWidth;
@@ -632,13 +927,6 @@ export function createViewer(options = {}) {
       const style = attrs & A_ITALIC ? 'italic ' : '';
       const weight = attrs & A_BOLD ? '700 ' : '';
       return style + weight + fontPx + 'px ' + FONT_FAMILY;
-    };
-    const dimmed = (hex) => {
-      const match = /^#?([0-9a-f]{6})$/i.exec(hex || '');
-      if (!match) return hex;
-      const value = parseInt(match[1], 16);
-      const fade = (channel) => Math.round(channel * 0.6);
-      return `rgb(${fade((value >> 16) & 255)},${fade((value >> 8) & 255)},${fade(value & 255)})`;
     };
     ctx.font = fontFor(0);
     ctx.textBaseline = 'middle';
@@ -687,6 +975,14 @@ export function createViewer(options = {}) {
     }
   }
 
+  function dimmed(hex) {
+    const match = /^#?([0-9a-f]{6})$/i.exec(hex || '');
+    if (!match) return hex;
+    const value = parseInt(match[1], 16);
+    const fade = channel => Math.round(channel * 0.6);
+    return `rgb(${fade((value >> 16) & 255)},${fade((value >> 8) & 255)},${fade(value & 255)})`;
+  }
+
   function cursorCells(screen, cursor) {
     for (const run of screen.lines[cursor.row] || []) {
       if (!run.w) continue;
@@ -699,8 +995,222 @@ export function createViewer(options = {}) {
     return { col: cursor.col, span: 1 };
   }
 
+  function resetTextLayer() {
+    if (selectionTouchesText()) window.getSelection().removeAllRanges();
+    textLayer.replaceChildren(searchMarks);
+    textRows.length = 0;
+    textRowKeys.length = 0;
+    clearSearch();
+  }
+
+  function selectionPoint(node, offset, end) {
+    if (node === textLayer) {
+      const row = textRows[Math.min(textRows.length - 1, end ? Math.max(0, offset - 1) : offset)];
+      return row ? ownerPoint(row, end ? row.textContent.length : 0, end) : null;
+    }
+    const row = (node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement).closest('.viewer-text-row');
+    if (!row || !textLayer.contains(row)) return null;
+    const range = document.createRange();
+    range.setStart(row, 0); range.setEnd(node, offset);
+    return ownerPoint(row, range.toString().length, end);
+  }
+
+  function ownerPoint(row, offset, end) {
+    if (offset === row.textContent.length) return { row: Number(row.dataset.row), boundary: 'end' };
+    for (const cell of row.children) {
+      const length = cell.textContent.length;
+      if (offset < length || (end && offset <= length)) {
+        const spaces = /^ +$/.test(cell.textContent) && length === Number(cell.dataset.span);
+        return { row: Number(row.dataset.row), col: Number(cell.dataset.col) + (spaces ? offset : 0),
+          inner: spaces ? 0 : offset };
+      }
+      offset -= length;
+    }
+    return null;
+  }
+
+  function textPoint(point) {
+    const row = textRows[point.row];
+    if (row && point.boundary === 'end') return [row, row.childNodes.length];
+    if (row && point.col !== undefined) {
+      for (const cell of row.children) {
+        const col = Number(cell.dataset.col), span = Number(cell.dataset.span);
+        if (point.col < col || point.col > col + span
+            || (point.col === col + span && cell !== row.lastElementChild)) continue;
+        const spaces = /^ +$/.test(cell.textContent) && cell.textContent.length === span;
+        const offset = spaces ? point.col - col + point.inner : point.inner;
+        return offset <= cell.textContent.length ? [cell.firstChild, offset] : null;
+      }
+      return null;
+    }
+    if (!row || point.offset > row.textContent.length) return null;
+    const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT);
+    let remaining = point.offset;
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      if (remaining <= node.length) return [node, remaining];
+      remaining -= node.length;
+    }
+    return [row, 0];
+  }
+
+  function textRange(start, end) {
+    const first = textPoint(start), last = textPoint(end);
+    if (!first || !last) return null;
+    const range = document.createRange();
+    range.setStart(...first); range.setEnd(...last);
+    return range;
+  }
+
+  function renderTextLayer(screen, width, height, cellW, cellH, fontSize) {
+    const selection = window.getSelection();
+    const copied = getSelectedText();
+    const selectedRange = copied && selection.getRangeAt(0);
+    const start = selectedRange && selectionPoint(selectedRange.startContainer, selectedRange.startOffset, false);
+    const end = selectedRange && selectionPoint(selectedRange.endContainer, selectedRange.endOffset, true);
+    let changedSelection = false;
+    textLayer.style.setProperty('--viewer-cell-width', cellW + 'px');
+    textLayer.style.setProperty('--viewer-cell-height', cellH + 'px');
+    textLayer.style.font = fontSize + 'px ' + FONT_FAMILY;
+    textLayer.style.width = prefs.readableWrap ? '100%' : width + 'px';
+    textLayer.style.height = prefs.readableWrap ? 'auto' : height + 'px';
+    for (let index = 0; index < screen.rows; index++) {
+      const runs = screen.lines[index] || [];
+      const key = JSON.stringify([screen.cols, runs]);
+      if (key === textRowKeys[index]) continue;
+      if (start && end && index >= start.row && index <= end.row) changedSelection = true;
+      let row = textRows[index];
+      if (!row) {
+        row = document.createElement('div'); row.className = 'viewer-text-row'; row.dataset.row = index;
+        textRows[index] = row; textLayer.insertBefore(row, searchMarks);
+      }
+      const cells = [];
+      const cell = (text, span, attrs = 0, fg = '#d4d4d4', bg = '#000000', padding = false) => {
+        const node = document.createElement('span');
+        node.className = 'viewer-text-cell' + (padding ? ' viewer-text-padding' : '');
+        node.textContent = text;
+        node.dataset.col = next;
+        node.dataset.span = span;
+        node.style.width = `calc(var(--viewer-cell-width) * ${span})`;
+        node.style.color = attrs & 16 ? dimmed(fg) : fg;
+        node.style.backgroundColor = bg;
+        if (attrs & 1) node.style.fontWeight = '700';
+        if (attrs & 2) node.style.fontStyle = 'italic';
+        node.style.textDecoration = [attrs & 4 ? 'underline' : '', attrs & 8 ? 'line-through' : ''].filter(Boolean).join(' ');
+        cells.push(node);
+      };
+      let next = 0;
+      for (const run of runs) {
+        const owners = Array.isArray(run.g) && run.g.every(text => typeof text === 'string' && text.length > 0)
+          ? run.g : Array.from(run.t || '');
+        const span = run.w ? 2 : 1;
+        if (run.s > next) {
+          const gap = Math.min(screen.cols, run.s) - next;
+          if (gap > 0) cell(' '.repeat(gap), gap);
+          next += gap;
+        }
+        for (let owner = 0; owner < owners.length; owner++) {
+          const col = run.s + owner * span;
+          if (col < next || col >= screen.cols) continue;
+          cell(owners[owner], Math.min(span, screen.cols - col), run.a || 0, run.fg, run.bg);
+          next = col + span;
+        }
+      }
+      if (next < screen.cols) cell(' '.repeat(screen.cols - next), screen.cols - next, 0, undefined, undefined, true);
+      row.replaceChildren(...cells);
+      textRowKeys[index] = key;
+    }
+    while (textRows.length > screen.rows) textRows.pop().remove();
+    textRowKeys.length = screen.rows;
+    if (copied && start && end && (changedSelection || end.row >= screen.rows)) {
+      const range = textRange(start, end);
+      selection.removeAllRanges();
+      // Never silently turn copied text into different output when a selected row changes.
+      if (range) selection.addRange(range);
+      if (getSelectedText() !== copied) selection.removeAllRanges();
+    }
+    refreshSearch();
+  }
+
+  function searchResult() {
+    return { query: searchQuery, total: searchMatches.length, index: searchIndex + 1, scope: 'loaded viewport' };
+  }
+
+  function refreshSearch() {
+    if (!searchQuery) return;
+    const current = searchMatches[searchIndex];
+    const pattern = new RegExp(searchQuery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'giu');
+    searchMatches = [];
+    for (let row = 0; row < textRows.length; row++) {
+      for (const match of textRows[row].textContent.matchAll(pattern)) {
+        searchMatches.push({ row, offset: match.index, end: match.index + match[0].length });
+      }
+    }
+    const retained = current && searchMatches.findIndex(match => match.row === current.row
+      && match.offset === current.offset && match.end === current.end);
+    searchIndex = retained >= 0 ? retained : Math.min(Math.max(0, searchIndex), searchMatches.length - 1);
+    if (hooks.searchChanged) hooks.searchChanged(searchResult());
+  }
+
+  function currentSearchRange() {
+    const match = searchMatches[searchIndex];
+    return match ? textRange({ row: match.row, offset: match.offset }, { row: match.row, offset: match.end }) : null;
+  }
+
+  function paintSearchMarks() {
+    const range = currentSearchRange();
+    const bounds = textLayer.getBoundingClientRect();
+    const marks = [];
+    if (range) for (const rect of range.getClientRects()) {
+      if (!rect.width || !rect.height) continue;
+      const mark = document.createElement('span'); mark.className = 'viewer-search-mark';
+      mark.style.left = rect.left - bounds.left + 'px'; mark.style.top = rect.top - bounds.top + 'px';
+      mark.style.width = rect.width + 'px'; mark.style.height = rect.height + 'px'; marks.push(mark);
+    }
+    searchMarks.replaceChildren(...marks);
+  }
+
+  function findText(query, direction = 1) {
+    if (!viewer.privacy.hidden) { clearSearch(); return searchResult(); }
+    query = String(query || '');
+    const same = query === searchQuery;
+    searchQuery = query;
+    if (!query) { clearSearch(); return searchResult(); }
+    stopFollowing();
+    if (!same) { searchMatches = []; searchIndex = -1; }
+    refreshSearch();
+    if (searchMatches.length) {
+      searchIndex = same ? (searchIndex + (direction < 0 ? -1 : 1) + searchMatches.length) % searchMatches.length
+        : direction < 0 ? searchMatches.length - 1 : 0;
+      const range = currentSearchRange();
+      const rect = range.getClientRects()[0];
+      if (rect) {
+        const wrap = viewer.wrap.getBoundingClientRect();
+        const left = viewer.wrap.scrollLeft + rect.left - wrap.left;
+        const top = viewer.wrap.scrollTop + rect.top - wrap.top;
+        setLocalPosition(prefs.readableWrap ? 0 : Math.max(0, left), Math.max(0, top));
+        rememberLocalPosition();
+      }
+    }
+    paintSearchMarks();
+    const result = searchResult();
+    if (hooks.searchChanged) hooks.searchChanged(result);
+    return result;
+  }
+
+  function clearSearch() {
+    searchQuery = ''; searchMatches = []; searchIndex = -1;
+    searchMarks.replaceChildren();
+    if (hooks.searchChanged) hooks.searchChanged(searchResult());
+  }
+
   function followLiveOutput(screen, cellW, cellH) {
-    if (!viewer.followingLive || prefs.overview || screen.offset > 0) return;
+    if (!viewer.followingLive || retainedDisplay || prefs.overview || screen.offset > 0 || getSelectedText()) return;
+    if (prefs.readableWrap) {
+      const last = textRows.findLast(row => row.textContent.trim());
+      if (last) setLocalPosition(0, Math.max(0, last.offsetTop + last.offsetHeight - viewer.wrap.clientHeight));
+      rememberLocalPosition();
+      return;
+    }
     const cursor = screen.cursor;
     let row = cursor && cursor.visible ? cursor.row : -1;
     if (row < 0) {
@@ -761,7 +1271,14 @@ export function createViewer(options = {}) {
     settings,
     setFontSize,
     setOverview,
+    setReadableWrap,
     getCellMetrics,
+    getSelectedText,
+    getHistoryState,
+    expectHistoryWindow,
+    cancelHistoryWindow,
+    findText,
+    clearSearch,
     resumeFollow,
     openViewer,
     requestCloseViewer,

@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 
 pub mod dashboard;
+mod history;
 pub mod http;
 pub mod pairing;
 pub mod protocol;
@@ -1153,6 +1154,7 @@ mod tests {
                     title: None,
                     scroll_offset: 0,
                     is_alt_screen: false,
+                    history: None,
                 }),
                 bracketed_paste: false,
             }
@@ -1197,6 +1199,240 @@ mod tests {
 
         drop(ws);
         server.shutdown();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ws_history_real_worker_two_connections_preserve_native_offset_and_loaded_anchor() {
+        use runtime::{RuntimeCommandSink as _, RuntimeEventStream as _};
+        struct NoSecrets;
+        impl runtime::RuntimeSecretResolver for NoSecrets {
+            fn resolve(&self, _: &str) -> anyhow::Result<runtime::RuntimeSecret> {
+                anyhow::bail!("no test credentials")
+            }
+        }
+        let directory =
+            std::env::temp_dir().join(format!("deppy-pwa-ws-history-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let db_path = directory.join("metadata.sqlite3");
+        let db = storage::Db::open(&db_path).unwrap();
+        let workspace_id = db
+            .create_workspace("PWA immutable history fixture")
+            .unwrap();
+        drop(db);
+        let mut worker = runtime::InProcessRuntimeClient::try_new_with_resolver(
+            5,
+            Arc::new(NoSecrets),
+            directory.join("logs"),
+            secret::RedactionService::new(),
+            Some(runtime::PersistConfig {
+                db_path,
+                workspace_id,
+            }),
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+        let events = worker.subscribe();
+        worker.send_command(runtime::RuntimeCommand::SpawnAgent {
+            cols: 32, rows: 3, scrollback_lines: 100, agent_config_id: None,
+            command: "/bin/sh".into(), args: vec!["-c".into(), r"stty -echo; printf '00\r\n01\r\n02\r\n03\r\n04\r\n05\r\n06\r\n07\r\n08\r\n09\r\n'; while IFS= read -r line; do printf 'same\r\n'; done".into()],
+            env_plain: Vec::new(), env_secrets: Vec::new(), waiting_regex: None, approval_regex: None, error_regex: None, done_regex: None,
+        }).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut identity = None;
+        let mut live_first = None;
+        while identity.is_none() || live_first.is_none() {
+            for event in events.drain() {
+                if let runtime::RuntimeEvent::MuxUpdated { snapshot } = &event {
+                    identity = snapshot
+                        .tabs
+                        .iter()
+                        .flat_map(|tab| &tab.panes)
+                        .find_map(|pane| {
+                            Some((pane.session_id?, pane.persistent_session_id.clone()?))
+                        });
+                }
+                if let Some((_, snapshot, _, _)) = event.viewport()
+                    && let Some(history) = snapshot.history
+                    && history.first_line >= 8
+                {
+                    live_first = Some(history.first_line);
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "actual history PTY output/membership timed out"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let (id, uuid) = identity.unwrap();
+        let live_first = live_first.unwrap();
+        let wait_native = |offset: i32| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if events.drain().iter().any(|event| {
+                    event.viewport().is_some_and(|(session, snapshot, _, _)| {
+                        session == id && snapshot.scroll_offset == offset
+                    })
+                }) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "native offset {offset} not observed"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        worker
+            .send_command(runtime::RuntimeCommand::Scroll {
+                session: id,
+                delta: 3,
+            })
+            .unwrap();
+        wait_native(3); // Native history exists BEFORE the first Web watch.
+        let server = start(None);
+        let dashboard = server.core.dashboard();
+        let captured: Arc<Mutex<Vec<runtime::RuntimeCommand>>> = Arc::default();
+        let recorded = Arc::clone(&captured);
+        let sink = worker.command_sink().unwrap();
+        dashboard.set_runtime_binding(
+            worker.subscribe_with_wake_background(dashboard.wake_fn()),
+            Some(Arc::new(move |command| {
+                recorded.lock().unwrap().push(command.clone());
+                sink(command);
+            })),
+        );
+        let mut first = ws_client_authed(server.local_addr());
+        let mut second = ws_client_authed(server.local_addr());
+        for ws in [&mut first, &mut second] {
+            send_text(
+                ws,
+                &serde_json::json!({"type":"watch","session":uuid}).to_string(),
+            );
+        }
+        let read_window = |ws: &mut WebSocket<TcpStream>,
+                           request: Option<u32>,
+                           after_seq: u64,
+                           minimum_first: u64| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let text = read_frame_of_type(
+                    ws,
+                    "viewport",
+                    deadline.saturating_duration_since(Instant::now()),
+                )
+                .expect("immutable socket window timed out");
+                let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+                let first_line = frame["history"]["first_line"]
+                    .as_str()
+                    .and_then(|line| line.parse::<u64>().ok());
+                if frame["history"]["request"].as_u64() == request.map(u64::from)
+                    && frame["seq"].as_u64().is_some_and(|seq| seq > after_seq)
+                    && first_line.is_some_and(|first| first >= minimum_first)
+                {
+                    break frame;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "unexpected history frame: {text}"
+                );
+            }
+        };
+        let first_live = read_window(&mut first, None, 0, live_first);
+        let second_live = read_window(&mut second, None, 0, live_first);
+        assert_eq!(first_live["offset"], 0);
+        assert_eq!(second_live["offset"], 0);
+        assert_eq!(
+            first_live["history"]["generation"],
+            second_live["history"]["generation"]
+        );
+        let anchor = |frame: &serde_json::Value| serde_json::json!({"generation":frame["history"]["generation"],"first_line":frame["history"]["first_line"]});
+        send_text(&mut first, &serde_json::json!({"type":"scroll","session":uuid,"request":1,"delta":3,"anchor":anchor(&first_live)}).to_string());
+        let first_history = read_window(&mut first, Some(1), 0, 0);
+        assert_eq!(first_history["offset"], 3);
+        assert_eq!(first_history["keyframe"], true);
+        send_text(&mut second, &serde_json::json!({"type":"scroll","session":uuid,"request":1,"delta":1,"anchor":anchor(&second_live)}).to_string());
+        let second_history = read_window(&mut second, Some(1), 0, 0);
+        assert_eq!(second_history["offset"], 1);
+        send_text(&mut first, &serde_json::json!({"type":"scroll","session":uuid,"request":2,"delta":i32::MIN,"reset":true,"anchor":{"generation":"invalid","first_line":"invalid"}}).to_string());
+        let reset = read_window(&mut first, Some(2), 0, live_first);
+        assert_eq!(reset["offset"], 0);
+        // Native scroll while both sockets are watched still produces mobile live0.
+        worker
+            .send_command(runtime::RuntimeCommand::Scroll {
+                session: id,
+                delta: 2,
+            })
+            .unwrap();
+        wait_native(5);
+        let after_native_first =
+            read_window(&mut first, None, reset["seq"].as_u64().unwrap(), live_first);
+        let after_native_second = read_window(
+            &mut second,
+            None,
+            second_history["seq"].as_u64().unwrap(),
+            live_first,
+        );
+        assert_eq!(after_native_first["offset"], 0);
+        assert_eq!(after_native_second["offset"], 0);
+        worker
+            .send_command(runtime::RuntimeCommand::WriteInput {
+                session: id,
+                bytes: b"x\rx\rx\rx\r".to_vec(),
+            })
+            .unwrap();
+        wait_native(9);
+        let live_now = read_window(
+            &mut first,
+            None,
+            after_native_first["seq"].as_u64().unwrap(),
+            live_first + 4,
+        );
+        let second_now = read_window(
+            &mut second,
+            None,
+            after_native_second["seq"].as_u64().unwrap(),
+            live_first + 4,
+        );
+        assert_eq!(live_now["offset"], 0);
+        assert_eq!(second_now["offset"], 0);
+        // Relative reads anchor the DISPLAYED window, even after a server-side reset.
+        send_text(&mut first, &serde_json::json!({"type":"scroll","session":uuid,"request":3,"delta":1,"anchor":anchor(&first_history)}).to_string());
+        let next_first = read_window(&mut first, Some(3), 0, 0);
+        assert_eq!(
+            next_first["history"]["first_line"],
+            (live_first - 4).to_string()
+        );
+        assert_eq!(next_first["offset"], 8);
+        send_text(&mut second, &serde_json::json!({"type":"scroll","session":uuid,"request":2,"delta":2,"anchor":anchor(&second_history)}).to_string());
+        let next_second = read_window(&mut second, Some(2), 0, 0);
+        assert_eq!(
+            next_second["history"]["first_line"],
+            (live_first - 3).to_string()
+        );
+        assert_eq!(next_second["offset"], 7);
+        worker
+            .send_command(runtime::RuntimeCommand::Scroll {
+                session: id,
+                delta: 0,
+            })
+            .unwrap();
+        wait_native(9);
+        assert!(
+            !captured
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|command| matches!(command, runtime::RuntimeCommand::Scroll { .. })),
+            "Web reads must never dispatch native Scroll"
+        );
+        drop(first);
+        drop(second);
+        server.shutdown();
+        worker.shutdown();
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -1577,8 +1813,8 @@ mod tests {
         server.shutdown();
     }
 
-    /// 스크롤백 열람: scroll은 시청 중 세션에만 Scroll 커맨드로 전달되고,
-    /// 비정상 delta는 캡된다.
+    /// Legacy request-less scroll reads use immutable queries for the watched
+    /// session only, retaining the delta cap without changing native history.
     #[test]
     fn ws_scroll은_시청_중_세션에만_전달되고_캡된다() {
         let server = start(None);
@@ -1611,7 +1847,10 @@ mod tests {
                 .unwrap()
                 .iter()
                 .filter_map(|command| match command {
-                    runtime::RuntimeCommand::Scroll { session, delta } => Some((session.0, *delta)),
+                    runtime::RuntimeCommand::QueryTerminalHistory { session, query, .. } => {
+                        assert!(!query.reset);
+                        Some((session.0, query.delta))
+                    }
                     _ => None,
                 })
                 .collect();
@@ -1623,9 +1862,20 @@ mod tests {
                 );
                 break;
             }
-            assert!(Instant::now() < deadline, "Scroll 커맨드가 도착하지 않음");
+            assert!(
+                Instant::now() < deadline,
+                "immutable history query not received"
+            );
             std::thread::sleep(Duration::from_millis(20));
         }
+        assert!(
+            !captured
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|command| { matches!(command, runtime::RuntimeCommand::Scroll { .. }) }),
+            "legacy socket scroll must never move native display_offset"
+        );
         drop(ws);
         server.shutdown();
     }

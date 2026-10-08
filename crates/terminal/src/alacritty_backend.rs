@@ -244,6 +244,16 @@ impl AlacrittyBackend {
         }
     }
 
+    fn history_metadata_at(&self, offset: usize) -> crate::TerminalHistoryMetadata {
+        let grid = self.term.grid();
+        let (generation, tail) = grid.history_identity();
+        crate::TerminalHistoryMetadata {
+            generation,
+            first_line: tail - offset.min(grid.history_size()) as u64,
+            total_lines: (grid.history_size() + grid.screen_lines()).min(u32::MAX as usize) as u32,
+        }
+    }
+
     #[cfg(test)]
     fn viewport_snapshot_uncached(&self) -> Option<TerminalViewportSnapshot> {
         let cols = self.term.columns();
@@ -354,6 +364,7 @@ impl AlacrittyBackend {
             title: self.listener.title.lock().ok().and_then(|t| t.clone()),
             scroll_offset: display_offset as i32,
             is_alt_screen: self.term.mode().contains(TermMode::ALT_SCREEN),
+            history: Some(self.history_metadata_at(display_offset)),
         })
     }
 
@@ -630,6 +641,84 @@ impl TerminalBackend for AlacrittyBackend {
         TerminalRenderModel::CellGrid
     }
 
+    fn history_snapshot(
+        &self,
+        query: crate::TerminalHistoryQuery,
+    ) -> Option<crate::TerminalHistorySnapshot> {
+        let grid = self.term.grid();
+        let cols = grid.columns();
+        let rows = grid.screen_lines();
+        let count = cols.checked_mul(rows).filter(|count| *count <= 65_536)?;
+        let alt = self.term.mode().contains(TermMode::ALT_SCREEN);
+        let (generation, tail) = grid.history_identity();
+        let floor = tail - grid.history_size() as u64;
+        let expired = !query.reset
+            && query.anchor.is_some_and(|anchor| {
+                alt || anchor.generation != generation
+                    || !(floor..=tail).contains(&anchor.first_line)
+            });
+        let offset = if query.reset || expired || alt {
+            0
+        } else {
+            let base = query.anchor.map_or(tail, |anchor| anchor.first_line);
+            // i128 permits ordinary overscroll below zero without unsigned underflow.
+            let desired =
+                (base as i128 - query.delta as i128).clamp(floor as i128, tail as i128) as u64;
+            (tail - desired) as usize
+        };
+        let mut scratch = Row::<AlacrittyCell>::new(cols);
+        let colors = self.term.colors();
+        let mut cells = Vec::with_capacity(count);
+        let mut graphemes = Vec::new();
+        for row in 0..rows {
+            let line = grid.read_line(
+                alacritty_terminal::index::Line(row as i32 - offset as i32),
+                &mut scratch,
+            );
+            for col in 0..cols {
+                let (cell, text) =
+                    snapshot_cell(&line[alacritty_terminal::index::Column(col)], colors);
+                if let Some(text) = text {
+                    graphemes.push(CellGrapheme {
+                        index: row * cols + col,
+                        text,
+                    });
+                }
+                cells.push(cell);
+            }
+        }
+        let cursor = self.term.renderable_content().cursor;
+        let cursor_row = cursor.point.line.0 + offset as i32;
+        let (shape, shape_visible) = map_cursor_shape(cursor.shape);
+        Some(crate::TerminalHistorySnapshot {
+            snapshot: TerminalViewportSnapshot {
+                cols: cols as u16,
+                rows: rows as u16,
+                cursor: CursorSnapshot {
+                    col: cursor.point.column.0 as u16,
+                    row: cursor_row.max(0) as u16,
+                    shape,
+                    visible: shape_visible
+                        && (0..rows as i32).contains(&cursor_row)
+                        && self.term.mode().contains(TermMode::SHOW_CURSOR),
+                },
+                visible_cells: cells.into(),
+                graphemes: crate::share_cell_graphemes(graphemes),
+                dirty_ranges: Vec::new(),
+                title: self
+                    .listener
+                    .title
+                    .lock()
+                    .ok()
+                    .and_then(|title| title.clone()),
+                scroll_offset: offset as i32,
+                is_alt_screen: alt,
+                history: Some(self.history_metadata_at(offset)),
+            },
+            expired,
+        })
+    }
+
     fn viewport_metadata(&self) -> Option<crate::TerminalViewportMetadata> {
         Some(crate::TerminalViewportMetadata {
             scroll_offset: self.term.grid().display_offset().min(i32::MAX as usize) as i32,
@@ -792,6 +881,7 @@ impl TerminalBackend for AlacrittyBackend {
                 .and_then(|title| title.clone()),
             scroll_offset: display_offset as i32,
             is_alt_screen: key.alt,
+            history: Some(self.history_metadata_at(display_offset)),
         };
         // Hidden/Exited readers may request snapshots without a later class transition.
         // The immutable reader result survives, but no render cache stays in the backend.
@@ -1519,6 +1609,269 @@ mod tests {
 
     fn feed(backend: &mut AlacrittyBackend, bytes: &[u8]) -> TerminalChangeSet {
         backend.feed(bytes).unwrap()
+    }
+
+    #[test]
+    fn history_cursor_matches_native_owner_projection_for_wide_spacers_at_each_offset() {
+        let mut backend = AlacrittyBackend::new(4, 3, 20);
+        feed(&mut backend, "ab한".as_bytes());
+        let native = backend.viewport_snapshot().unwrap();
+        let live = history_query(&backend, None, 0, true).snapshot;
+        assert_eq!(
+            live.cursor, native.cursor,
+            "live cursor must point at wide owner column2"
+        );
+        feed(&mut backend, b"\r\n0\r\n1\r\n2\r\n3\r\n\x1b[1;1H");
+        feed(&mut backend, "ab한".as_bytes());
+        let shifted = history_query(&backend, None, 1, false).snapshot;
+        backend.scroll(1);
+        let native = backend.viewport_snapshot().unwrap();
+        assert_eq!(
+            shifted.cursor, native.cursor,
+            "query offset projects owner cursor exactly once"
+        );
+    }
+
+    #[test]
+    fn history_identity_counts_appended_rows_after_ring_cap_without_content_guessing() {
+        let mut backend = AlacrittyBackend::new(8, 3, 4);
+        feed(
+            &mut backend,
+            b"same\r\nsame\r\nsame\r\nsame\r\nsame\r\nsame\r\nsame\r\nsame\r\n",
+        );
+        let before = serde_json::to_value(backend.viewport_snapshot().unwrap()).unwrap();
+        assert!(
+            before["history"].is_object(),
+            "live snapshots need stable history identities even at offset zero"
+        );
+        let before_first = before["history"]["first_line"].as_u64().unwrap();
+        assert_eq!(before["history"]["total_lines"], 7);
+        feed(&mut backend, b"same\r\nsame\r\nsame\r\nsame\r\n");
+        let after = serde_json::to_value(backend.viewport_snapshot().unwrap()).unwrap();
+        assert_eq!(
+            after["history"]["total_lines"], 7,
+            "retained count saturates"
+        );
+        assert_eq!(
+            after["history"]["first_line"].as_u64().unwrap(),
+            before_first + 4,
+            "duplicate content at full cap still advances semantic row identity"
+        );
+        assert_eq!(
+            after["history"]["generation"],
+            before["history"]["generation"]
+        );
+    }
+
+    fn history_anchor(snapshot: &TerminalViewportSnapshot) -> crate::TerminalHistoryAnchor {
+        let metadata = snapshot.history.unwrap();
+        crate::TerminalHistoryAnchor {
+            generation: metadata.generation,
+            first_line: metadata.first_line,
+        }
+    }
+
+    fn history_query(
+        backend: &AlacrittyBackend,
+        anchor: Option<crate::TerminalHistoryAnchor>,
+        delta: i32,
+        reset: bool,
+    ) -> crate::TerminalHistorySnapshot {
+        backend
+            .history_snapshot(crate::TerminalHistoryQuery {
+                anchor,
+                delta,
+                reset,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn history_query_keeps_native_offset_damage_cache_and_pinned_source_immutable() {
+        let mut backend = AlacrittyBackend::new(8, 3, 20);
+        for row in 0..12 {
+            feed(&mut backend, format!("{row:02}\r\n").as_bytes());
+        }
+        backend.scroll(3);
+        let native = backend.viewport_snapshot().unwrap();
+        let anchor = history_anchor(&native);
+        let key = backend.viewport_cache.borrow().key;
+        let dirty = backend.viewport_cache.borrow().dirty.clone();
+        backend
+            .term
+            .scroll_display(alacritty_terminal::grid::Scroll::Delta(1));
+        backend
+            .term
+            .scroll_display(alacritty_terminal::grid::Scroll::Delta(-1));
+        let queried = history_query(&backend, Some(anchor), 2, false);
+        assert!(!queried.expired);
+        assert_eq!(queried.snapshot.scroll_offset, 5);
+        assert_eq!(backend.term.grid().display_offset(), 3);
+        assert!(matches!(backend.term.damage(), TermDamage::Full));
+        assert_eq!(backend.viewport_cache.borrow().key, key);
+        assert_eq!(backend.viewport_cache.borrow().dirty, dirty);
+        let source = queried.snapshot.clone();
+        let source_anchor = history_anchor(&source);
+        feed(&mut backend, b"new\r\nnew\r\n");
+        let pinned = history_query(&backend, Some(source_anchor), 0, false);
+        assert!(!pinned.expired);
+        assert_eq!(pinned.snapshot.visible_cells, source.visible_cells);
+        assert_eq!(
+            pinned.snapshot.history.unwrap().first_line,
+            source_anchor.first_line
+        );
+        assert_eq!(pinned.snapshot.scroll_offset, source.scroll_offset + 2);
+        assert_eq!(
+            history_query(&backend, None, 0, true)
+                .snapshot
+                .scroll_offset,
+            0
+        );
+        assert_eq!(
+            backend.term.grid().display_offset(),
+            5,
+            "query never resets native scroll"
+        );
+    }
+
+    #[test]
+    fn history_query_valid_base_clamps_overscroll_but_evicted_base_expires_after_trim() {
+        let mut backend = AlacrittyBackend::new(8, 3, 8);
+        for row in 0..12 {
+            feed(&mut backend, format!("{row:02}\r\n").as_bytes());
+        }
+        let loaded = history_query(&backend, None, 3, false).snapshot;
+        let anchor = history_anchor(&loaded);
+        let oldest = history_query(&backend, Some(anchor), 100_000, false);
+        assert!(
+            !oldest.expired,
+            "valid base overscroll is ordinary oldest boundary"
+        );
+        assert_eq!(oldest.snapshot.scroll_offset, 8);
+        let bottom = history_query(&backend, Some(anchor), -100_000, false);
+        assert!(!bottom.expired);
+        assert_eq!(bottom.snapshot.scroll_offset, 0);
+        backend.trim_scrollback(1);
+        let expired = history_query(&backend, Some(anchor), 0, false);
+        assert!(
+            expired.expired,
+            "trim advances floor without guessing identical line content"
+        );
+        assert_eq!(expired.snapshot.scroll_offset, 0);
+        assert_eq!(
+            expired.snapshot.history.unwrap().generation,
+            anchor.generation
+        );
+        let reset = history_query(&backend, Some(anchor), 100_000, true);
+        assert!(
+            !reset.expired,
+            "absolute reset ignores evicted anchor and relative delta"
+        );
+        assert_eq!(reset.snapshot.scroll_offset, 0);
+    }
+
+    #[test]
+    fn history_identity_expires_on_real_resize_reset_clear_and_alt_round_trip() {
+        let mut backend = AlacrittyBackend::new(8, 3, 20);
+        feed(&mut backend, b"one\r\ntwo\r\nthree\r\nfour\r\n");
+        let original = history_anchor(&history_query(&backend, None, 1, false).snapshot);
+        backend.resize(8, 3).unwrap();
+        assert!(!history_query(&backend, Some(original), 0, false).expired);
+        backend.resize(9, 4).unwrap();
+        assert!(history_query(&backend, Some(original), 0, false).expired);
+        let resized = history_anchor(&history_query(&backend, None, 0, true).snapshot);
+        feed(&mut backend, b"\x1b[?1049h");
+        assert!(history_query(&backend, Some(resized), 0, false).expired);
+        assert_eq!(
+            history_query(&backend, None, 100, false)
+                .snapshot
+                .scroll_offset,
+            0
+        );
+        feed(&mut backend, b"\x1b[?1049l");
+        assert!(history_query(&backend, Some(resized), 0, false).expired);
+        let primary = history_anchor(&history_query(&backend, None, 0, true).snapshot);
+        feed(&mut backend, b"\x1b[?1049h\x1b[?1049l");
+        assert!(
+            history_query(&backend, Some(primary), 0, false).expired,
+            "same-feed buffer roundtrip still invalidates loaded identity"
+        );
+        let primary = history_anchor(&history_query(&backend, None, 0, true).snapshot);
+        feed(&mut backend, b"\x1b[3J");
+        assert!(
+            !history_query(&backend, Some(primary), 0, false).expired,
+            "the app intentionally preserves scrollback on CSI 3 J"
+        );
+        backend.term.grid_mut().clear_history();
+        assert!(history_query(&backend, Some(primary), 0, false).expired);
+        let cleared = history_anchor(&history_query(&backend, None, 0, true).snapshot);
+        backend.reset();
+        assert!(history_query(&backend, Some(cleared), 0, false).expired);
+    }
+
+    #[test]
+    fn history_identity_counts_soft_wrap_but_not_partial_region_rotation() {
+        let mut backend = AlacrittyBackend::new(8, 3, 20);
+        feed(&mut backend, &[b'x'; 64]);
+        let wrapped = history_query(&backend, None, 0, true)
+            .snapshot
+            .history
+            .unwrap();
+        assert_eq!(
+            wrapped.first_line, 5,
+            "soft-wrap creates semantic history without any LF bytes"
+        );
+        feed(&mut backend, b"\x1b[2;3r\x1b[3;1H\n\n\n\n");
+        let partial = history_query(&backend, None, 0, true)
+            .snapshot
+            .history
+            .unwrap();
+        assert_eq!(
+            partial.first_line, wrapped.first_line,
+            "non-top region never appends history"
+        );
+        assert_eq!(partial.generation, wrapped.generation);
+    }
+
+    #[test]
+    fn history_identity_expires_for_reverse_index_and_insert_at_top() {
+        for shift in [b"\x1b[1;1H\x1bM".as_slice(), b"\x1b[1;1H\x1b[L".as_slice()] {
+            let mut backend = AlacrittyBackend::new(8, 3, 20);
+            feed(&mut backend, b"one\r\ntwo\r\nthree");
+            let anchor = history_anchor(&history_query(&backend, None, 0, true).snapshot);
+            feed(&mut backend, shift);
+            assert!(
+                history_query(&backend, Some(anchor), 0, false).expired,
+                "structural shift at primary top must expire loaded top identity: {shift:?}"
+            );
+        }
+        let mut backend = AlacrittyBackend::new(8, 3, 20);
+        let anchor = history_anchor(&history_query(&backend, None, 0, true).snapshot);
+        feed(&mut backend, b"\x1b[2;3r\x1b[2;1H\x1bM");
+        assert!(
+            !history_query(&backend, Some(anchor), 0, false).expired,
+            "partial region leaves primary top in place"
+        );
+    }
+
+    #[test]
+    fn history_identity_loaded_grid_trim_keeps_absolute_tail() {
+        let mut backend = AlacrittyBackend::new(8, 3, 8);
+        feed(
+            &mut backend,
+            b"same\r\nsame\r\nsame\r\nsame\r\nsame\r\nsame\r\n",
+        );
+        let mut restored: alacritty_terminal::grid::Grid<AlacrittyCell> =
+            serde_json::from_value(serde_json::to_value(backend.term.grid()).unwrap()).unwrap();
+        let before = restored.history_identity();
+        assert!(before.1 > 2);
+        restored.update_history(2);
+        assert_eq!(
+            restored.history_identity(),
+            before,
+            "materialize serde-loaded tail before shrinking retained rows"
+        );
+        assert_eq!(restored.history_size(), 2);
     }
 
     #[test]

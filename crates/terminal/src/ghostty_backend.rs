@@ -364,6 +364,7 @@ impl TerminalBackend for GhosttyBackend {
             title,
             scroll_offset: self.scroll_offset(),
             is_alt_screen,
+            history: None,
         })
     }
 

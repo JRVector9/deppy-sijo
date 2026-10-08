@@ -226,6 +226,7 @@ fn stream_loop(
     // 시청 화면 상태 (P5c) — 접속별 baseline. 없으면 다음 프레임은 keyframe.
     // watch 전환·RequestKeyframe에서 리셋한다 (remote.rs §4.4-5 관례).
     let mut viewport_seq = 0u64;
+    let mut wire_seq = 0u64;
     let mut baseline: Option<std::sync::Arc<runtime::TerminalViewportSnapshot>> = None;
     // 입력 큐 압박 버전 (P6a) — watch 전환 시 리셋.
     let mut pressure_ver = 0u64;
@@ -263,18 +264,74 @@ fn stream_loop(
             }
         }
 
+        if let Some(reply) = dashboard.history_reply(watch.connection) {
+            match reply.result {
+                Ok((snapshot, expired))
+                    if watch.watched.as_deref() == Some(reply.uuid.as_str())
+                        && watch.is_current(&reply.uuid) =>
+                {
+                    let Some(seq) = wire_seq.checked_add(1) else {
+                        return;
+                    };
+                    let frame = crate::protocol::encode_viewport_for_source(
+                        &reply.uuid,
+                        seq,
+                        &snapshot,
+                        None,
+                        &reply.namespace,
+                        reply.request,
+                        expired,
+                    );
+                    if ws.send(Message::Text(frame.encode().into())).is_err() {
+                        return;
+                    }
+                    wire_seq = seq;
+                    baseline = Some(snapshot);
+                }
+                Err(reason) => {
+                    let frame = if let Some(request) = reply.request {
+                        ServerMsg::HistoryError {
+                            session: reply.uuid,
+                            request,
+                            reason,
+                        }
+                    } else {
+                        ServerMsg::Error {
+                            message: reason.into(),
+                        }
+                    };
+                    if ws.send(Message::Text(frame.encode().into())).is_err() {
+                        return;
+                    }
+                }
+                _ => {}
+            }
+        }
+
         // 시청 화면 push (P5c) — 슬롯이 내 seq보다 새로우면 baseline과 diff해 전송.
         // baseline 없음(첫 프레임/전환/재동기화)이면 keyframe이 나간다.
         if let Some(session) = watch.watched.clone()
             && watch.is_current(&session)
-            && let Some((seq, snapshot)) = dashboard.viewport_if_newer(&session, viewport_seq)
+            && let Some((version, snapshot, namespace)) =
+                dashboard.viewport_for_connection(&session, watch.generation, viewport_seq)
         {
-            let frame =
-                crate::protocol::encode_viewport(&session, seq, &snapshot, baseline.as_deref());
+            let Some(seq) = wire_seq.checked_add(1) else {
+                return;
+            };
+            let frame = crate::protocol::encode_viewport_for_source(
+                &session,
+                seq,
+                &snapshot,
+                baseline.as_deref(),
+                &namespace,
+                None,
+                false,
+            );
             if ws.send(Message::Text(frame.encode().into())).is_err() {
                 return;
             }
-            viewport_seq = seq;
+            wire_seq = seq;
+            viewport_seq = version;
             baseline = Some(snapshot);
         }
         // 입력 큐 압박 push (P6a) — composer 전송 버튼 게이트 신호.
@@ -340,14 +397,31 @@ fn stream_loop(
                             }
                         }
                         // 스크롤백 이동 — 역시 시청 중 세션에만 (스크롤백 열람).
-                        Some(ClientMsg::Scroll { session, delta }) => {
-                            if watch.is_current(&session) {
-                                dashboard.send_scroll_for_connection(
-                                    &session,
-                                    watch.generation,
+                        Some(ClientMsg::Scroll {
+                            session,
+                            delta,
+                            request,
+                            reset,
+                            anchor,
+                        }) => {
+                            // The dashboard returns a correlated stale failure as well as
+                            // checking the exact current watch before any worker query.
+                            let generation = if watch.watched.as_deref() == Some(session.as_str()) {
+                                watch.generation
+                            } else {
+                                0
+                            };
+                            dashboard.request_history(
+                                watch.connection,
+                                &session,
+                                generation,
+                                crate::history::HistoryRead {
                                     delta,
-                                );
-                            }
+                                    request: request.map(std::num::NonZeroU32::get),
+                                    reset,
+                                    anchor,
+                                },
+                            );
                         }
                         // 자유 텍스트 입력 (P6a) — 시청 중 세션에만. 정규화/제어문자
                         // strip/bracketed wrap은 브리지가 한다. 상한 초과는 버리고 로그만

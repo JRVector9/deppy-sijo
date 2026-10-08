@@ -7,6 +7,7 @@ mod backend;
 mod change_set;
 #[cfg(feature = "ghostty-backend")]
 mod ghostty_backend;
+mod history;
 pub mod input_mapper;
 pub mod policy;
 pub mod renderer_egui;
@@ -53,3 +54,7 @@ pub use viewport_snapshot::{
 };
 
 pub use visible_cells::{VisibleCellIndex, VisibleCells};
+
+pub use history::{
+    TerminalHistoryAnchor, TerminalHistoryMetadata, TerminalHistoryQuery, TerminalHistorySnapshot,
+};

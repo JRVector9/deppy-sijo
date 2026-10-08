@@ -24,6 +24,8 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
             "resize on a compressed grid — inflate_all() 먼저 호출해야 함"
         );
 
+        let changed = self.lines != lines || self.columns != columns;
+
         // Use empty template cell for resetting cells due to resize.
         let template = mem::take(&mut self.cursor.template);
 
@@ -41,6 +43,9 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
 
         // Restore template cell.
         self.cursor.template = template;
+        if changed {
+            self.invalidate_history_identity();
+        }
     }
 
     /// Add lines to the visible area.

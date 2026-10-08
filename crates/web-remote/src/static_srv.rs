@@ -577,7 +577,6 @@ mod tests {
             "viewer.el.style.setProperty('--viewer-width'",
             "viewer.el.style.setProperty('--viewer-controls-max-height'",
             "viewer.el.style.setProperty('--viewer-composer-max-height'",
-            "const prefs = { fontSize: 15, overview: false }",
             "measuringContext.measureText('M'.repeat(32)).width / 32",
             "const scale = prefs.overview ? Math.min(1,",
             "availableHeight / (screen.rows * measured.cellHeight)",

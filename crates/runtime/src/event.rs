@@ -271,6 +271,13 @@ pub enum RuntimeEvent {
         cols: u16,
         rows: u16,
     },
+    /// Transient correlated query answer; unavailable sessions return no snapshot.
+    TerminalHistoryResult {
+        session: SessionId,
+        operation_id: u64,
+        snapshot: Option<Arc<TerminalViewportSnapshot>>,
+        expired: bool,
+    },
 }
 
 impl RuntimeEvent {
@@ -382,6 +389,7 @@ mod tests {
                 title: None,
                 scroll_offset: 0,
                 is_alt_screen: false,
+                history: None,
             }),
             bracketed_paste: false,
         }
@@ -564,6 +572,7 @@ mod tests {
                 "TerminalControlChanged",
                 "TerminalControlResult",
                 "ResizeDeferred",
+                "TerminalHistoryResult",
             ]
         );
     }

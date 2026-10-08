@@ -63,7 +63,8 @@ pub(crate) const PROTO_MAGIC: [u8; 4] = *b"DPRT";
 /// v23: atomic agent launch beside an exact pane; reject older peers before decode.
 /// v24: direct terminal input mapped against live terminal modes on the worker.
 /// v25: worker-authoritative expiring terminal resize ownership and native deferral.
-pub(crate) const PROTO_VERSION: u16 = 25;
+/// v26: immutable history identities and correlated viewport queries.
+pub(crate) const PROTO_VERSION: u16 = 26;
 
 /// delta viewport 스트리밍 기능 비트 (§3.1).
 pub(crate) const FEAT_DELTA_VIEWPORT: u32 = 1 << 0;
@@ -157,6 +158,7 @@ pub(crate) struct ViewportDelta {
     pub cursor: CursorSnapshot,
     pub scroll_offset: i32,
     pub is_alt_screen: bool,
+    pub history: Option<terminal::TerminalHistoryMetadata>,
     pub title: Option<String>,
     /// 바뀐 row들 (각 row는 정확히 cols개 셀).
     pub changed_rows: Vec<RowPatch>,
@@ -389,6 +391,7 @@ pub(crate) fn diff_viewport(
         cursor: cur.cursor,
         scroll_offset: cur.scroll_offset,
         is_alt_screen: cur.is_alt_screen,
+        history: cur.history,
         title: cur.title.clone(),
         changed_rows,
     })
@@ -448,6 +451,7 @@ pub(crate) fn try_apply_delta(
         title: delta.title.clone(),
         scroll_offset: delta.scroll_offset,
         is_alt_screen: delta.is_alt_screen,
+        history: delta.history,
     })
 }
 
@@ -584,6 +588,6 @@ mod tests {
         assert!(command_source.contains("SetScrollbackLimit"));
         assert!(event_source.contains("ScrollbackLimitApplied"));
         assert!(protocol_source.contains("**v13**"));
-        assert_eq!(PROTO_VERSION, 25);
+        assert_eq!(PROTO_VERSION, 26);
     }
 }

@@ -146,7 +146,7 @@ impl RelayMessageAdapter {
             return false;
         }
         match message {
-            ServerMsg::TerminalControl { .. } => false,
+            ServerMsg::TerminalControl { .. } | ServerMsg::HistoryError { .. } => false,
             ServerMsg::Approvals { .. } => self.permissions.allows(RelayAction::Approval),
             ServerMsg::Welcome { .. }
             | ServerMsg::Dashboard { .. }
@@ -189,6 +189,9 @@ mod tests {
             ClientMsg::Scroll {
                 session: "1".to_owned(),
                 delta: 5,
+                request: None,
+                reset: false,
+                anchor: None,
             },
             ClientMsg::Switch {
                 workspace: "other".to_owned(),
@@ -256,6 +259,7 @@ mod tests {
             },
             alt: false,
             offset: 0,
+            history: None,
             lines: Vec::new(),
         }
     }

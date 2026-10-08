@@ -484,6 +484,9 @@ fn validate_event(event: &RuntimeEvent) -> Result<(), &'static str> {
                 .is_none_or(|token| token.is_valid() && token.owner_epoch == stamp.owner_epoch)
     };
     match event {
+        RuntimeEvent::TerminalHistoryResult {
+            operation_id: 0, ..
+        } => return Err("history operation id 無効"),
         RuntimeEvent::ResizeApplied { stamp, .. }
             if !valid_stamp(stamp) || stamp.token.is_none() =>
         {
@@ -503,9 +506,31 @@ fn validate_event(event: &RuntimeEvent) -> Result<(), &'static str> {
     }
     match event {
         RuntimeEvent::Viewport { snapshot, .. }
-        | RuntimeEvent::ViewportTracked { snapshot, .. } => {
+        | RuntimeEvent::ViewportTracked { snapshot, .. }
+        | RuntimeEvent::TerminalHistoryResult {
+            snapshot: Some(snapshot),
+            ..
+        } => {
             if snapshot.cols == 0 || snapshot.rows == 0 {
                 return Err("viewport cols/rows가 0");
+            }
+            if let Some(history) = snapshot.history
+                && (history.generation == 0
+                    || snapshot.scroll_offset < 0
+                    || history.total_lines < snapshot.rows as u32
+                    || snapshot.scroll_offset as u32 > history.total_lines - snapshot.rows as u32
+                    || history
+                        .first_line
+                        .checked_add(snapshot.scroll_offset as u64)
+                        .is_none())
+            {
+                return Err("viewport history identity invalid");
+            }
+            if matches!(event, RuntimeEvent::TerminalHistoryResult { .. })
+                && snapshot.cols as usize * snapshot.rows as usize
+                    > crate::TERMINAL_CELL_COUNT_MAX as usize
+            {
+                return Err("history snapshot cell cap exceeded");
             }
             let expected = snapshot.cols as usize * snapshot.rows as usize;
             terminal::validate_cell_graphemes(&snapshot.visible_cells, &snapshot.graphemes)?;
@@ -555,6 +580,8 @@ enum OutboundOverflow {
 struct OutboundEventQueue {
     durable: VecDeque<RuntimeEvent>,
     viewports: HashMap<SessionId, RuntimeEvent>,
+    history_results: VecDeque<RuntimeEvent>,
+    history_turn: bool,
     viewport_order: VecDeque<SessionId>,
     durable_cap: usize,
     viewport_cap: usize,
@@ -569,6 +596,8 @@ impl OutboundEventQueue {
         Self {
             durable: VecDeque::new(),
             viewports: HashMap::new(),
+            history_results: VecDeque::new(),
+            history_turn: false,
             viewport_order: VecDeque::new(),
             durable_cap,
             viewport_cap,
@@ -603,6 +632,9 @@ impl OutboundEventQueue {
             self.viewport_order.push_back(session);
             self.viewports.insert(session, event);
             Ok(())
+        } else if matches!(&event, RuntimeEvent::TerminalHistoryResult { .. }) {
+            crate::client::push_history_result(&mut self.history_results, event);
+            Ok(())
         } else {
             if self.durable.len() >= self.durable_cap {
                 return Err(OutboundOverflow::DurableFull);
@@ -616,16 +648,24 @@ impl OutboundEventQueue {
         if let Some(event) = self.durable.pop_front() {
             return Some(event);
         }
+        // Preserve durable FIFO first, then alternate transient output/replies so
+        // neither continuous PTY output nor a query flood can starve the other.
+        if self.history_turn && !self.history_results.is_empty() {
+            self.history_turn = false;
+            return self.history_results.pop_front();
+        }
         while let Some(session) = self.viewport_order.pop_front() {
             if let Some(event) = self.viewports.remove(&session) {
+                self.history_turn = true;
                 return Some(event);
             }
         }
-        None
+        self.history_turn = false;
+        self.history_results.pop_front()
     }
 
     fn is_empty(&self) -> bool {
-        self.durable.is_empty() && self.viewports.is_empty()
+        self.durable.is_empty() && self.viewports.is_empty() && self.history_results.is_empty()
     }
 
     #[cfg(test)]
@@ -682,6 +722,12 @@ fn drain_receiver_into_outbound(
         .drain()
         .map(|(_, event)| event)
         .collect();
+    let history_results: Vec<_> = receiver
+        .history_results
+        .lock()
+        .expect("remote receiver history result lock")
+        .drain(..)
+        .collect();
     // Local-only PTY input pressure is coalesced in a receiver slot. Drain it so
     // the remote bridge cannot accumulate telemetry, but keep it off the v2 wire
     // until protocol negotiation has a feature bit for additive telemetry.
@@ -713,6 +759,9 @@ fn drain_receiver_into_outbound(
         }
     }
     for event in viewports {
+        outbound.enqueue(event)?;
+    }
+    for event in history_results {
         outbound.enqueue(event)?;
     }
     Ok(source)
@@ -1647,6 +1696,7 @@ struct RemoteSubscriber {
     events: SyncSender<RuntimeEvent>,
     overflowed: Arc<AtomicBool>,
     viewports: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>>,
+    history_results: Arc<Mutex<std::collections::VecDeque<RuntimeEvent>>>,
     input_pressures: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>>,
 }
 
@@ -2452,6 +2502,18 @@ fn dispatch(subscribers: &Arc<Mutex<Vec<RemoteSubscriber>>>, event: RuntimeEvent
                     }
                 }
                 true
+            } else if matches!(&event, RuntimeEvent::TerminalHistoryResult { .. }) {
+                if Arc::strong_count(&subscriber.history_results) <= 1 {
+                    return false;
+                }
+                crate::client::push_history_result(
+                    &mut subscriber
+                        .history_results
+                        .lock()
+                        .expect("remote history result lock"),
+                    event.clone(),
+                );
+                true
             } else if let RuntimeEvent::PtyInputPressure { session, .. } = &event {
                 if Arc::strong_count(&subscriber.input_pressures) <= 1 {
                     return false;
@@ -2519,6 +2581,7 @@ impl RuntimeEventStream for RemoteRuntimeClient {
         let (tx, rx) = sync_channel(LOCAL_EVENT_QUEUE_CAP);
         let viewports: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>> =
             Arc::default();
+        let history_results = Arc::new(Mutex::new(std::collections::VecDeque::new()));
         let input_pressures: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>> =
             Arc::default();
         let overflowed = Arc::new(AtomicBool::new(false));
@@ -2528,6 +2591,7 @@ impl RuntimeEventStream for RemoteRuntimeClient {
                 events: tx,
                 overflowed: Arc::clone(&overflowed),
                 viewports: Arc::clone(&viewports),
+                history_results: Arc::clone(&history_results),
                 input_pressures: Arc::clone(&input_pressures),
             });
         }
@@ -2537,6 +2601,7 @@ impl RuntimeEventStream for RemoteRuntimeClient {
             pending_durable: Mutex::new(None),
             overflowed,
             viewports,
+            history_results,
             input_pressures,
             // remote는 wire 단계에서 outbound 큐가 이미 유계/코얼레싱이라(감사 통과)
             // ResourceUsage도 채널 경로 그대로 — 빈 slot만 채운다.
@@ -2636,6 +2701,83 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         panic!("remote event receiver did not observe disconnect");
+    }
+
+    #[test]
+    fn history_runtime_query_metadata_survives_equal_cell_delta_and_reply_wire() {
+        let base = make_snapshot(32, 3, &["same"], false);
+        let mut next = (*base).clone();
+        next.history = Some(terminal::TerminalHistoryMetadata {
+            generation: 7,
+            first_line: u64::MAX - 10,
+            total_lines: 10,
+        });
+        let delta = crate::protocol::diff_viewport(&base, &next).unwrap();
+        assert!(delta.changed_rows.is_empty());
+        let applied = crate::protocol::try_apply_delta(&base, &delta).unwrap();
+        assert_eq!(applied.history, next.history);
+        let event = RuntimeEvent::TerminalHistoryResult {
+            session: SessionId(7),
+            operation_id: 9,
+            snapshot: Some(Arc::new(next)),
+            expired: true,
+        };
+        let bytes = postcard::to_allocvec(&event).unwrap();
+        let decoded: RuntimeEvent = postcard::from_bytes(&bytes).unwrap();
+        assert!(
+            matches!(decoded, RuntimeEvent::TerminalHistoryResult { operation_id: 9, snapshot: Some(snapshot), expired: true, .. } if snapshot.history == applied.history)
+        );
+        validate_event(&event).unwrap();
+    }
+
+    #[test]
+    fn history_runtime_query_forwarder_is_bounded_and_fair_under_viewport_flood() {
+        let mut queue = OutboundEventQueue::with_caps(1, 1);
+        for operation_id in 1..=40 {
+            queue
+                .enqueue(RuntimeEvent::TerminalHistoryResult {
+                    session: SessionId(1),
+                    operation_id,
+                    snapshot: None,
+                    expired: false,
+                })
+                .unwrap();
+        }
+        assert_eq!(queue.durable_len(), 0);
+        assert_eq!(
+            queue.history_results.len(),
+            crate::client::HISTORY_RESULT_SLOT_CAP
+        );
+        queue
+            .enqueue(RuntimeEvent::ShellSpawned {
+                session: SessionId(1),
+            })
+            .unwrap();
+        assert!(matches!(
+            queue.pop_front(),
+            Some(RuntimeEvent::ShellSpawned { .. })
+        ));
+        for expected in 9..=40 {
+            let mut delivered = false;
+            for _ in 0..2 {
+                queue
+                    .enqueue(RuntimeEvent::Viewport {
+                        session: SessionId(1),
+                        snapshot: make_snapshot(32, 3, &["live"], false),
+                        bracketed_paste: false,
+                    })
+                    .unwrap();
+                if matches!(queue.pop_front(), Some(RuntimeEvent::TerminalHistoryResult { operation_id, .. }) if operation_id == expected)
+                {
+                    delivered = true;
+                    break;
+                }
+            }
+            assert!(
+                delivered,
+                "each query reply needs a delivery turn despite continuous viewport feed"
+            );
+        }
     }
 
     #[test]
@@ -2897,14 +3039,14 @@ mod tests {
 
     #[test]
     fn v12_v13_peer_is_rejected_at_hello_before_event_decode() {
-        for version in [10, 12, 13, 17, 18, 19, 20, 21, 23, 24] {
+        for version in [10, 12, 13, 17, 18, 19, 20, 21, 23, 24, 25] {
             let old = ClientHello {
                 magic: PROTO_MAGIC,
                 proto_version: version,
                 features: CLIENT_FEATURES,
                 token: b"irrelevant".to_vec(),
             };
-            assert_eq!(PROTO_VERSION, 25);
+            assert_eq!(PROTO_VERSION, 26);
             assert!(!client_hello_matches_protocol(&old));
         }
     }
@@ -3384,6 +3526,7 @@ mod tests {
                 title: None,
                 scroll_offset: 0,
                 is_alt_screen: false,
+                history: None,
             }),
             bracketed_paste: false,
         };
@@ -3464,6 +3607,7 @@ mod tests {
             title: None,
             scroll_offset: 0,
             is_alt_screen: alt,
+            history: None,
         })
     }
 
@@ -3647,12 +3791,14 @@ mod tests {
     fn receiver_drain은_durable_cap에서_멈춘다() {
         let (tx, rx) = std::sync::mpsc::channel();
         let viewports: Arc<Mutex<HashMap<SessionId, RuntimeEvent>>> = Arc::default();
+        let history_results = Arc::default();
         let input_pressures: Arc<Mutex<HashMap<SessionId, RuntimeEvent>>> = Arc::default();
         let receiver = RuntimeEventReceiver {
             events: rx,
             pending_durable: Mutex::new(None),
             overflowed: Arc::default(),
             viewports,
+            history_results,
             input_pressures,
             resource_usage: Arc::default(),
         };
@@ -3674,12 +3820,14 @@ mod tests {
     fn receiver_drain은_additive_local_events를_wire에서_필터링한다() {
         let (tx, rx) = std::sync::mpsc::channel();
         let viewports: Arc<Mutex<HashMap<SessionId, RuntimeEvent>>> = Arc::default();
+        let history_results = Arc::default();
         let input_pressures: Arc<Mutex<HashMap<SessionId, RuntimeEvent>>> = Arc::default();
         let receiver = RuntimeEventReceiver {
             events: rx,
             pending_durable: Mutex::new(None),
             overflowed: Arc::default(),
             viewports,
+            history_results,
             input_pressures: Arc::clone(&input_pressures),
             resource_usage: Arc::default(),
         };
@@ -3753,6 +3901,7 @@ mod tests {
             RuntimeEvent::TerminalControlChanged { .. } => "TerminalControlChanged",
             RuntimeEvent::TerminalControlResult { .. } => "TerminalControlResult",
             RuntimeEvent::ResizeDeferred { .. } => "ResizeDeferred",
+            RuntimeEvent::TerminalHistoryResult { .. } => "TerminalHistoryResult",
             RuntimeEvent::SessionInputSubmitted { .. } => "SessionInputSubmitted",
         }
     }
@@ -4340,6 +4489,7 @@ mod tests {
             rows,
             cursor: ok_cursor,
             scroll_offset: 0,
+            history: None,
             is_alt_screen: false,
             title: None,
             changed_rows: rows_patch,
@@ -4423,6 +4573,7 @@ mod tests {
                 visible: true,
             },
             scroll_offset: 0,
+            history: None,
             is_alt_screen: false,
             title: None,
             changed_rows: vec![RowPatch {
@@ -4657,6 +4808,7 @@ mod tests {
                 events: tx,
                 overflowed: Arc::default(),
                 viewports: Arc::clone(&slot),
+                history_results: Arc::default(),
                 input_pressures: Arc::default(),
             }]));
         let mut recon: HashMap<SessionId, ViewportBaseline> = HashMap::new();

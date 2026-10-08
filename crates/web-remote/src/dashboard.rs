@@ -31,6 +31,7 @@ use runtime::{
     SessionStatus,
 };
 
+use crate::history::{HistoryQueries, HistoryRead, HistoryReply, HistoryTarget};
 use crate::protocol::{ApprovalView, ResourceView, ServerMsg, SessionView, WorkspaceView};
 use crate::repository::{PENDING_APPROVAL_LIMIT, PendingApprovalRecord, WebRemoteRepository};
 use crate::resize_control::{ControlAction, ControlTarget, ResizeControls};
@@ -467,6 +468,7 @@ struct Inner {
     /// 워커가 모르는 UUID는 변환되지 않아 명령 자체가 만들어지지 않는다(앨리어싱 차단).
     ids: IdMap,
     resize_controls: ResizeControls,
+    history_queries: HistoryQueries,
 }
 
 /// 접속 스레드가 소켓으로 밀어낼 발행 스냅샷. 버전이 오르면 push 대상.
@@ -485,6 +487,7 @@ struct Published {
 }
 
 struct Shared {
+    history_nonce: String,
     inner: Mutex<Inner>,
     published: Mutex<Published>,
     /// 승인 대시보드용 app-owned 저장소 포트(없으면 승인 목록은 빈 채로 상태만 흐른다).
@@ -524,10 +527,14 @@ impl ConnectionGuard {
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
-        self.shared.connections.fetch_sub(1, Ordering::SeqCst);
+        let last = self.shared.connections.fetch_sub(1, Ordering::SeqCst) == 1;
         {
             let mut inner = self.shared.inner.lock().expect("dashboard inner lock");
             inner.resize_controls.disconnect(self.id, Instant::now());
+            inner.history_queries.disconnect(self.id);
+            if last {
+                inner.history_queries.cancel_all_passive();
+            }
             inner.dirty = true;
         }
         // 0으로 떨어졌으면 브리지가 타이머를 접고 park하도록 깨운다.
@@ -540,6 +547,7 @@ impl DashboardHandle {
     /// JoinHandle은 서버가 소유해 shutdown 시 join한다.
     pub fn spawn(repository: Option<Arc<dyn WebRemoteRepository>>) -> (Self, JoinHandle<()>) {
         let shared = Arc::new(Shared {
+            history_nonce: uuid::Uuid::new_v4().simple().to_string(),
             inner: Mutex::new(Inner {
                 dirty: false,
                 dashboard_dirty: false,
@@ -561,6 +569,7 @@ impl DashboardHandle {
                 bracketed: BTreeMap::new(),
                 ids: IdMap::default(),
                 resize_controls: ResizeControls::default(),
+                history_queries: HistoryQueries::default(),
             }),
             published: Mutex::new(Published::default()),
             repository,
@@ -646,6 +655,7 @@ impl DashboardHandle {
     /// 호출. 같은 inner 임계구역에서 published를 중첩 취득해 원자화한다.
     fn clear_watch_state(inner: &mut Inner, shared: &Shared) {
         inner.resize_controls.invalidate_binding(Instant::now());
+        inner.history_queries.clear_binding();
         inner.watch_generation = inner
             .watch_generation
             .checked_add(1)
@@ -792,6 +802,7 @@ impl DashboardHandle {
             if entry.count == 0 {
                 inner.watchers.remove(old);
                 inner.bracketed.remove(old);
+                inner.history_queries.cancel_passive(old);
                 if let Some(session) = inner.ids.session(old) {
                     commands.push(lease_command(session, false));
                 }
@@ -919,21 +930,89 @@ impl DashboardHandle {
         self.send_scroll_for_connection(uuid, generation, delta);
     }
 
-    pub fn send_scroll_for_connection(&self, uuid: &str, generation: u64, delta: i32) {
-        const SCROLL_DELTA_CAP: i32 = 100_000;
+    /// Legacy callers without socket identity cannot hold an isolated cursor.
+    /// This entry point is unsupported; WS reads use request_history below.
+    pub fn send_scroll_for_connection(&self, uuid: &str, generation: u64, _delta: i32) {
         let inner = self.shared.inner.lock().expect("dashboard inner lock");
-        let Some(session) = Self::resolve_watched(&inner, uuid, generation) else {
-            return;
-        };
-        let delta = delta.clamp(-SCROLL_DELTA_CAP, SCROLL_DELTA_CAP);
-        if delta != 0
-            && let Some(sink) = &inner.command_sink
-        {
-            sink(RuntimeCommand::Scroll {
+        let _ = Self::resolve_watched(&inner, uuid, generation);
+    }
+
+    pub(crate) fn request_history(
+        &self,
+        connection: u64,
+        uuid: &str,
+        watch: u64,
+        read: HistoryRead,
+    ) {
+        let HistoryRead {
+            delta,
+            request,
+            reset,
+            anchor,
+        } = read;
+        let mut inner = self.shared.inner.lock().expect("dashboard inner lock");
+        let target = Self::resolve_watched(&inner, uuid, watch).and_then(|session| {
+            inner.command_sink.clone().map(|sink| HistoryTarget {
+                uuid: uuid.into(),
+                binding: inner.watch_generation,
+                watch,
                 session: SessionId(session),
-                delta,
-            });
-        }
+                namespace: format!("{}:{}", self.shared.history_nonce, inner.watch_generation),
+                sink,
+            })
+        });
+        let query = if reset {
+            Ok(runtime::TerminalHistoryQuery::live())
+        } else {
+            parse_history_anchor(
+                anchor.as_ref(),
+                target.as_ref().map(|target| target.namespace.as_str()),
+            )
+            .map(|anchor| runtime::TerminalHistoryQuery {
+                anchor,
+                delta: delta.clamp(-100_000, 100_000),
+                reset: false,
+            })
+        };
+        inner
+            .history_queries
+            .request(connection, uuid, request, target, query, Instant::now());
+        inner.dirty = true;
+        self.shared.cvar.notify_all();
+    }
+
+    pub(crate) fn history_reply(&self, connection: u64) -> Option<HistoryReply> {
+        let mut inner = self.shared.inner.lock().expect("dashboard inner lock");
+        let Inner {
+            history_queries,
+            ids,
+            watchers,
+            watch_generation,
+            ..
+        } = &mut *inner;
+        history_queries.take_reply(connection, |target| {
+            history_target_current(target, *watch_generation, ids, watchers)
+        })
+    }
+
+    pub fn viewport_for_connection(
+        &self,
+        uuid: &str,
+        watch: u64,
+        last: u64,
+    ) -> Option<(u64, Arc<runtime::TerminalViewportSnapshot>, String)> {
+        let inner = self.shared.inner.lock().expect("dashboard inner lock");
+        Self::resolve_watched(&inner, uuid, watch)?;
+        let published = self.shared.published.lock().expect("published lock");
+        let (version, snapshot) = published
+            .viewports
+            .get(uuid)
+            .filter(|(version, _)| *version > last)?;
+        Some((
+            *version,
+            Arc::clone(snapshot),
+            format!("{}:{}", self.shared.history_nonce, inner.watch_generation),
+        ))
     }
 
     /// 시청 세션에 제어 키를 보낸다 (P5d + P6a 확장 — 화살표/Esc/Tab 등).
@@ -1037,6 +1116,7 @@ impl DashboardHandle {
         let id = {
             let mut inner = self.shared.inner.lock().expect("dashboard inner lock");
             let id = inner.resize_controls.register();
+            inner.history_queries.register(id);
             inner.force_poll = true;
             inner.dirty = true;
             Self::request_initial_mux(&mut inner);
@@ -1110,6 +1190,7 @@ impl DashboardHandle {
     pub fn release_resize_control_for_connection(&self, connection: u64) {
         let mut inner = self.shared.inner.lock().expect("dashboard inner lock");
         inner.resize_controls.unwatch(connection, Instant::now());
+        inner.history_queries.unwatch(connection);
         inner.dirty = true;
         self.shared.cvar.notify_all();
     }
@@ -1220,6 +1301,7 @@ impl DashboardHandle {
                 bracketed,
                 ids,
                 resize_controls,
+                history_queries,
                 watch_generation,
                 command_sink,
                 ..
@@ -1239,35 +1321,122 @@ impl DashboardHandle {
             resize_controls.event(*watch_generation, &event, Instant::now());
             // 실경로(run)와 동일하게 inner 임계구역 안에서 published를 중첩 취득해
             // 슬롯을 반영한다 (P5 리뷰 ②-P1 — 락 순서 inner→published). 키는 UUID (I1).
-            if let RuntimeEvent::Viewport {
-                session,
-                snapshot,
-                bracketed_paste,
-            }
-            | RuntimeEvent::ViewportTracked {
-                session,
-                snapshot,
-                bracketed_paste,
-                ..
-            } = &event
+            if let Some((session, _, paste, _)) = event.viewport()
                 && let Some(uuid) = ids.uuid(session.0)
                 && watchers.contains_key(uuid)
             {
-                let uuid = uuid.to_owned();
-                bracketed.insert(uuid.clone(), *bracketed_paste);
+                bracketed.insert(uuid.into(), paste);
+            }
+            if let Some((uuid, snapshot)) = history_viewport_event(
+                history_queries,
+                ids,
+                watchers,
+                *watch_generation,
+                command_sink,
+                &self.shared,
+                &event,
+            ) {
                 let mut published = self.shared.published.lock().expect("published lock");
                 let entry = published
                     .viewports
                     .entry(uuid)
-                    .or_insert((0, Arc::clone(snapshot)));
+                    .or_insert((0, Arc::clone(&snapshot)));
                 entry.0 += 1;
-                entry.1 = Arc::clone(snapshot);
+                entry.1 = snapshot;
             }
             inner.dirty = true;
             // 실경로(run)와 동일 게이트 — 대시보드 관련 이벤트만 재구축을 켠다 (PR-F1).
             inner.dashboard_dirty |= relevant;
         }
         self.shared.cvar.notify_all();
+    }
+}
+
+fn parse_history_anchor(
+    anchor: Option<&crate::protocol::HistoryAnchorView>,
+    namespace: Option<&str>,
+) -> Result<Option<runtime::TerminalHistoryAnchor>, &'static str> {
+    let Some(anchor) = anchor else {
+        return Ok(None);
+    };
+    let namespace = namespace.ok_or("stale")?;
+    let generation = anchor
+        .generation
+        .strip_prefix(namespace)
+        .and_then(|suffix| suffix.strip_prefix(':'))
+        .ok_or("invalid_anchor")?;
+    let parse = |value: &str| {
+        if value.is_empty() || value.len() > 20 || !value.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return None;
+        }
+        value.parse::<u64>().ok()
+    };
+    if anchor.generation.len() > 96 {
+        return Err("invalid_anchor");
+    }
+    let generation = parse(generation)
+        .filter(|generation| *generation != 0)
+        .ok_or("invalid_anchor")?;
+    let first_line = parse(&anchor.first_line).ok_or("invalid_anchor")?;
+    Ok(Some(runtime::TerminalHistoryAnchor {
+        generation,
+        first_line,
+    }))
+}
+
+fn history_target_current(
+    target: &HistoryTarget,
+    binding: u64,
+    ids: &IdMap,
+    watchers: &BTreeMap<String, WatcherEntry>,
+) -> bool {
+    target.binding == binding
+        && ids.session(&target.uuid) == Some(target.session.0)
+        && watchers.get(&target.uuid).is_some_and(|watch| {
+            watch.generation == target.watch && watch.session == Some(target.session.0)
+        })
+}
+
+fn history_viewport_event(
+    queries: &mut HistoryQueries,
+    ids: &IdMap,
+    watchers: &BTreeMap<String, WatcherEntry>,
+    binding: u64,
+    sink: &Option<CommandSink>,
+    shared: &Shared,
+    event: &RuntimeEvent,
+) -> Option<(String, Arc<runtime::TerminalViewportSnapshot>)> {
+    queries.invalidate(|target| history_target_current(target, binding, ids, watchers));
+    if let Some((session, snapshot, _, _)) = event.viewport() {
+        let uuid = ids.uuid(session.0)?;
+        let watch = watchers.get(uuid)?;
+        if watch.session != Some(session.0) {
+            return None;
+        }
+        if snapshot.scroll_offset == 0 {
+            queries.cancel_passive(uuid);
+            return Some((uuid.into(), Arc::clone(snapshot)));
+        }
+        if shared.connections.load(Ordering::SeqCst) > 0
+            && let Some(sink) = sink
+        {
+            queries.passive(
+                HistoryTarget {
+                    uuid: uuid.into(),
+                    binding,
+                    watch: watch.generation,
+                    session,
+                    namespace: format!("{}:{binding}", shared.history_nonce),
+                    sink: Arc::clone(sink),
+                },
+                snapshot.history.map(|history| history.generation),
+                Instant::now(),
+            );
+        }
+        None
+    } else {
+        queries.event(event, Instant::now())
     }
 }
 
@@ -1316,10 +1485,23 @@ fn run(shared: &Arc<Shared>) {
             let conns = shared.connections.load(Ordering::SeqCst);
             let poll_due =
                 conns > 0 && (inner.force_poll || inner.last_poll.elapsed() >= POLL_INTERVAL);
-            if inner.dirty || poll_due || inner.resize_controls.tick_due(Instant::now()) {
+            if inner.dirty
+                || poll_due
+                || inner.resize_controls.tick_due(Instant::now())
+                || inner
+                    .history_queries
+                    .timer_wait(Instant::now())
+                    .is_some_and(|wait| wait.is_zero())
+            {
                 break;
             }
-            let control_wait = inner.resize_controls.timer_wait(Instant::now());
+            let control_wait = match (
+                inner.resize_controls.timer_wait(Instant::now()),
+                inner.history_queries.timer_wait(Instant::now()),
+            ) {
+                (Some(control), Some(history)) => Some(control.min(history)),
+                (control, history) => control.or(history),
+            };
             let wait = if conns > 0 {
                 Some(control_wait.map_or_else(
                     || POLL_INTERVAL.saturating_sub(inner.last_poll.elapsed()),
@@ -1371,6 +1553,7 @@ fn run(shared: &Arc<Shared>) {
                 bracketed,
                 ids,
                 resize_controls,
+                history_queries,
                 watch_generation,
                 command_sink,
                 ..
@@ -1391,6 +1574,18 @@ fn run(shared: &Arc<Shared>) {
                     staged_pressure.retain(|uuid, _| watchers.contains_key(uuid));
                 }
                 resize_controls.event(*watch_generation, event, Instant::now());
+                if let Some((uuid, snapshot)) = history_viewport_event(
+                    history_queries,
+                    ids,
+                    watchers,
+                    *watch_generation,
+                    command_sink,
+                    shared,
+                    event,
+                ) {
+                    staged_viewports.insert(uuid, snapshot);
+                }
+
                 // 세션 상태 전이(입력대기/완료)를 웹푸시로 넘긴다 — 앱이 닫혀 있어도 알린다(P4).
                 // notify_session이 Done/Waiting 외 상태는 무시하므로 여기서는 걸러내지 않는다.
                 if let Some(push) = push_sink.as_ref() {
@@ -1401,12 +1596,12 @@ fn run(shared: &Arc<Shared>) {
                 match event {
                     RuntimeEvent::Viewport {
                         session,
-                        snapshot,
+                        snapshot: _,
                         bracketed_paste,
                     }
                     | RuntimeEvent::ViewportTracked {
                         session,
-                        snapshot,
+                        snapshot: _,
                         bracketed_paste,
                         ..
                     } => {
@@ -1414,7 +1609,6 @@ fn run(shared: &Arc<Shared>) {
                             && watchers.contains_key(uuid)
                         {
                             let uuid = uuid.to_owned();
-                            staged_viewports.insert(uuid.clone(), Arc::clone(snapshot));
                             bracketed.insert(uuid, *bracketed_paste);
                         }
                     }
@@ -1464,6 +1658,7 @@ fn run(shared: &Arc<Shared>) {
         {
             let Inner {
                 resize_controls,
+                history_queries,
                 ids,
                 watchers,
                 watch_generation,
@@ -1478,6 +1673,10 @@ fn run(shared: &Arc<Shared>) {
                 Instant::now(),
             );
             resize_controls.tick(Instant::now());
+            history_queries.invalidate(|target| {
+                history_target_current(target, *watch_generation, ids, watchers)
+            });
+            history_queries.tick(Instant::now());
         }
         // 시청 화면/입력압박 슬롯 반영 — watcher 판정과 **같은 inner 임계구역에서**
         // published를 중첩 취득해 삽입한다 (P5 리뷰 ②-P1: inner 해제 후 삽입하면 그 사이
@@ -1623,6 +1822,100 @@ mod tests {
                 focused_pane: Some(runtime::MuxPaneId("p-1".into())),
             }),
         }
+    }
+
+    #[test]
+    fn history_web_anchor_namespaces_reject_same_numeric_engine_after_binding_or_dashboard_restart()
+    {
+        let anchor = crate::protocol::HistoryAnchorView {
+            generation: "oldnonce:1:7".into(),
+            first_line: "9007199254740993".into(),
+        };
+        assert_eq!(
+            parse_history_anchor(Some(&anchor), Some("oldnonce:1"))
+                .unwrap()
+                .unwrap()
+                .first_line,
+            9_007_199_254_740_993
+        );
+        for namespace in ["oldnonce:2", "newnonce:1"] {
+            assert_eq!(
+                parse_history_anchor(Some(&anchor), Some(namespace)),
+                Err("invalid_anchor")
+            );
+        }
+        for value in ["18446744073709551616", "-1", "1e3", "0x1", ""] {
+            let invalid = crate::protocol::HistoryAnchorView {
+                generation: "oldnonce:1:7".into(),
+                first_line: value.into(),
+            };
+            assert_eq!(
+                parse_history_anchor(Some(&invalid), Some("oldnonce:1")),
+                Err("invalid_anchor")
+            );
+        }
+        let (first, first_thread) = DashboardHandle::spawn(None);
+        let (second, second_thread) = DashboardHandle::spawn(None);
+        assert_ne!(first.shared.history_nonce, second.shared.history_nonce);
+        first.stop();
+        second.stop();
+        first_thread.join().unwrap();
+        second_thread.join().unwrap();
+    }
+
+    #[test]
+    fn history_web_legacy_scroll_never_moves_native_terminal_display() {
+        let (handle, thread) = DashboardHandle::spawn(None);
+        let (sink, captured) = capture_sink();
+        handle.set_command_sink(sink);
+        seed_ids(&handle, &[7]);
+        handle.rebind_watch(None, Some(&test_uuid(7)));
+        captured.lock().unwrap().clear();
+        handle.send_scroll(&test_uuid(7), 5);
+        assert!(
+            !captured
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|command| matches!(command, RuntimeCommand::Scroll { .. })),
+            "legacy Web read cannot mutate native display_offset"
+        );
+        handle.stop();
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn history_web_native_positive_offset_requests_live_window_instead_of_publishing_mac_history() {
+        let (handle, thread) = DashboardHandle::spawn(None);
+        let connection = handle.register_connection();
+        let (sink, captured) = capture_sink();
+        handle.set_command_sink(sink);
+        seed_ids(&handle, &[7]);
+        handle.rebind_watch(None, Some(&test_uuid(7)));
+        let RuntimeEvent::Viewport {
+            session,
+            snapshot,
+            bracketed_paste,
+        } = viewport_event(7)
+        else {
+            unreachable!()
+        };
+        let mut native = (*snapshot).clone();
+        native.scroll_offset = 5;
+        captured.lock().unwrap().clear();
+        handle.inject_event(RuntimeEvent::Viewport {
+            session,
+            snapshot: Arc::new(native),
+            bracketed_paste,
+        });
+        assert!(
+            handle.viewport_if_newer(&test_uuid(7), 0).is_none(),
+            "Mac history must never become a shared mobile live frame"
+        );
+        assert!(captured.lock().unwrap().iter().any(|command| matches!(command, RuntimeCommand::QueryTerminalHistory { query, .. } if query.reset)), "native positive offset requires event-driven pure live0 query");
+        drop(connection);
+        handle.stop();
+        thread.join().unwrap();
     }
 
     #[test]
@@ -2666,6 +2959,7 @@ mod tests {
                 title: None,
                 scroll_offset: 0,
                 is_alt_screen: false,
+                history: None,
             }),
             bracketed_paste: false,
         }

@@ -103,6 +103,7 @@ struct Subscriber {
     events: SyncSender<RuntimeEvent>,
     overflowed: Arc<std::sync::atomic::AtomicBool>,
     viewports: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>>,
+    history_results: Arc<Mutex<std::collections::VecDeque<RuntimeEvent>>>,
     input_pressures: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>>,
     /// ResourceUsage 최신본 slot — 주기 샘플이 느린 소비자 채널에 무한 누적되지
     /// 않게 latest-value 덮어쓰기(안정성 감사 High #1).
@@ -607,6 +608,7 @@ impl RuntimeEventStream for InProcessRuntimeClient {
         let (tx, rx) = sync_channel(LOCAL_EVENT_QUEUE_CAP);
         let viewports: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>> =
             Arc::default();
+        let history_results = Arc::new(Mutex::new(std::collections::VecDeque::new()));
         let input_pressures: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>> =
             Arc::default();
         let resource_usage: Arc<Mutex<Option<RuntimeEvent>>> = Arc::default();
@@ -618,6 +620,7 @@ impl RuntimeEventStream for InProcessRuntimeClient {
                 events: tx,
                 overflowed: Arc::clone(&overflowed),
                 viewports: Arc::clone(&viewports),
+                history_results: Arc::clone(&history_results),
                 input_pressures: Arc::clone(&input_pressures),
                 resource_usage: Arc::clone(&resource_usage),
                 wake: None,
@@ -628,6 +631,7 @@ impl RuntimeEventStream for InProcessRuntimeClient {
             pending_durable: Mutex::new(None),
             overflowed,
             viewports,
+            history_results,
             input_pressures,
             resource_usage,
         }
@@ -659,6 +663,7 @@ impl InProcessRuntimeClient {
         let (tx, rx) = sync_channel(LOCAL_EVENT_QUEUE_CAP);
         let viewports: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>> =
             Arc::default();
+        let history_results = Arc::new(Mutex::new(std::collections::VecDeque::new()));
         let input_pressures: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>> =
             Arc::default();
         let resource_usage: Arc<Mutex<Option<RuntimeEvent>>> = Arc::default();
@@ -670,6 +675,7 @@ impl InProcessRuntimeClient {
                 events: tx,
                 overflowed: Arc::clone(&overflowed),
                 viewports: Arc::clone(&viewports),
+                history_results: Arc::clone(&history_results),
                 input_pressures: Arc::clone(&input_pressures),
                 resource_usage: Arc::clone(&resource_usage),
                 wake: Some(wake),
@@ -680,6 +686,7 @@ impl InProcessRuntimeClient {
             pending_durable: Mutex::new(None),
             overflowed,
             viewports,
+            history_results,
             input_pressures,
             resource_usage,
         }
@@ -2409,6 +2416,23 @@ impl Worker {
                         wakes.push(Arc::clone(wake));
                     }
                     true
+                } else if matches!(&event, RuntimeEvent::TerminalHistoryResult { .. }) {
+                    if Arc::strong_count(&subscriber.history_results) <= 1 {
+                        return false;
+                    }
+                    if !subscriber.render_bound {
+                        crate::client::push_history_result(
+                            &mut subscriber
+                                .history_results
+                                .lock()
+                                .expect("history result slot lock"),
+                            event.clone(),
+                        );
+                        if let Some(wake) = &subscriber.wake {
+                            wakes.push(Arc::clone(wake));
+                        }
+                    }
+                    true
                 } else if let RuntimeEvent::PtyInputPressure { session, .. } = &event {
                     if Arc::strong_count(&subscriber.input_pressures) <= 1 {
                         return false;
@@ -3047,6 +3071,27 @@ impl Worker {
             }
             RuntimeCommand::WriteInput { session, bytes } => {
                 let _ = self.admit_input(session, &bytes);
+            }
+            RuntimeCommand::QueryTerminalHistory {
+                session,
+                operation_id,
+                query,
+            } => {
+                let result = self
+                    .sessions
+                    .get(&session)
+                    .and_then(|active| active.history_snapshot(query));
+                let expired = result.as_ref().is_some_and(|result| result.expired);
+                let snapshot = result.map(|result| Arc::new(result.snapshot));
+                self.emit_gated(
+                    RuntimeEvent::TerminalHistoryResult {
+                        session,
+                        operation_id,
+                        snapshot,
+                        expired,
+                    },
+                    false,
+                );
             }
             RuntimeCommand::RequestMuxSnapshot => self.emit_current_mux_snapshot(),
             RuntimeCommand::TerminalControl {
@@ -7071,6 +7116,7 @@ mod tests {
             events: event_tx,
             overflowed: Arc::default(),
             viewports: Arc::default(),
+            history_results: Arc::default(),
             input_pressures: Arc::default(),
             resource_usage: Arc::default(),
             wake: None,
@@ -9214,6 +9260,7 @@ mod tests {
             events: tx,
             overflowed: Arc::clone(&overflowed),
             viewports: Arc::default(),
+            history_results: Arc::default(),
             input_pressures: Arc::default(),
             resource_usage: Arc::default(),
             wake: None,
@@ -10936,6 +10983,158 @@ mod tests {
             harness.worker.resize_epoch, epoch,
             "duplicate release cannot restore twice"
         );
+    }
+
+    #[test]
+    fn history_runtime_query_replies_are_bounded_without_durable_or_native_wakes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, events) = admission_worker(resolver, "history-mailbox");
+        let answers = Arc::clone(&worker.subscribers.lock().unwrap()[0].history_results);
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let callback_wakes = Arc::clone(&wakes);
+        worker.subscribers.lock().unwrap()[0].wake = Some(Arc::new(move || {
+            callback_wakes.fetch_add(1, Ordering::Relaxed);
+        }));
+        for operation_id in 1..=40 {
+            worker.handle_command(RuntimeCommand::QueryTerminalHistory {
+                session: SessionId(99),
+                operation_id,
+                query: terminal::TerminalHistoryQuery::live(),
+            });
+        }
+        assert_eq!(
+            answers.lock().unwrap().len(),
+            crate::client::HISTORY_RESULT_SLOT_CAP
+        );
+        assert!(
+            events.try_iter().next().is_none(),
+            "large answers never enter lifecycle FIFO"
+        );
+        assert_eq!(wakes.load(Ordering::Relaxed), 40);
+        assert!(matches!(
+            answers.lock().unwrap().front(),
+            Some(RuntimeEvent::TerminalHistoryResult {
+                operation_id: 9,
+                snapshot: None,
+                ..
+            })
+        ));
+        worker.subscribers.lock().unwrap()[0].render_bound = true;
+        let before = wakes.load(Ordering::Relaxed);
+        worker.handle_command(RuntimeCommand::QueryTerminalHistory {
+            session: SessionId(99),
+            operation_id: 41,
+            query: terminal::TerminalHistoryQuery::live(),
+        });
+        assert_eq!(
+            wakes.load(Ordering::Relaxed),
+            before,
+            "phone queries cannot request native repaint"
+        );
+        assert_eq!(answers.lock().unwrap().len(), 32);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn history_runtime_query_is_correlated_pure_and_independent_of_native_scroll() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, _events) = admission_worker(resolver, "history-query");
+        let answers = Arc::clone(&worker.subscribers.lock().unwrap()[0].history_results);
+        let id = SessionId(1);
+        let (output_tx, output_rx) = std::sync::mpsc::channel();
+        let live = Session::spawn_with_spec_and_output_wake(
+            id, session::SessionKind::Shell,
+            &spec("/bin/sh", &["-c", r"printf '00\r\n01\r\n02\r\n03\r\n04\r\n05\r\n06\r\n07\r\n08\r\n09\r\n'; exec /bin/cat >/dev/null"]),
+            32, 3, 20, Arc::new(move || { let _ = output_tx.send(()); }),
+        ).unwrap();
+        worker.sessions.insert(id, live);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let effects = worker.collect_session_pump_effects(&[id], false, true);
+            worker.finish_session_pump_effects(effects);
+            if worker.sessions[&id]
+                .history_snapshot(terminal::TerminalHistoryQuery::live())
+                .unwrap()
+                .snapshot
+                .history
+                .unwrap()
+                .first_line
+                >= 8
+            {
+                break;
+            }
+            output_rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap();
+        }
+        worker.sessions.get_mut(&id).unwrap().scroll(3);
+        let native = worker.sessions[&id].input_guard_snapshot().unwrap();
+        let metadata = native.history.unwrap();
+        let anchor = terminal::TerminalHistoryAnchor {
+            generation: metadata.generation,
+            first_line: metadata.first_line,
+        };
+        for (operation_id, query, expected_offset) in [
+            (11, terminal::TerminalHistoryQuery::live(), 0),
+            (
+                12,
+                terminal::TerminalHistoryQuery {
+                    anchor: Some(anchor),
+                    delta: 2,
+                    reset: false,
+                },
+                5,
+            ),
+        ] {
+            worker.handle_command(RuntimeCommand::QueryTerminalHistory {
+                session: id,
+                operation_id,
+                query,
+            });
+            let answer = answers
+                .lock()
+                .unwrap()
+                .drain(..)
+                .find_map(|event| match event {
+                    RuntimeEvent::TerminalHistoryResult {
+                        operation_id: actual,
+                        snapshot,
+                        expired,
+                        ..
+                    } if actual == operation_id => {
+                        assert!(!expired);
+                        snapshot
+                    }
+                    _ => None,
+                })
+                .expect("each immutable query must return its exact bounded window");
+            assert_eq!(answer.scroll_offset, expected_offset);
+            assert_eq!(
+                worker.sessions[&id]
+                    .input_guard_snapshot()
+                    .unwrap()
+                    .scroll_offset,
+                3
+            );
+        }
+        let still_dirty = worker
+            .sessions
+            .get_mut(&id)
+            .unwrap()
+            .take_snapshot()
+            .unwrap();
+        assert!(
+            !still_dirty.dirty_ranges.is_empty(),
+            "query must not consume native dirty ranges"
+        );
+        assert_eq!(still_dirty.scroll_offset, 3);
     }
 
     #[test]

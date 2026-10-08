@@ -89,6 +89,12 @@
   const viewerOverviewState = document.getElementById('viewer-overview-state');
   const viewerResizeControl = document.getElementById('viewer-resize-control');
   const viewerResizeStatus = document.getElementById('viewer-resize-status');
+  const viewerReadableWrap = document.getElementById('viewer-readable-wrap');
+  const viewerReadableState = document.getElementById('viewer-readable-state');
+  const viewerSearchText = document.getElementById('viewer-search-text');
+  const viewerSearchCount = document.getElementById('viewer-search-count');
+  const viewerCopyStatus = document.getElementById('viewer-copy-status');
+  const viewerReadingStatus = document.getElementById('viewer-reading-status');
 
   function attachMenu(buttonId, panelId) {
     const button = document.getElementById(buttonId);
@@ -235,6 +241,7 @@
 
   function disconnect() {
     retireResizeControl();
+    retireHistory();
     manualClose = true;
     if (reconnectTimer) {
       clearTimeout(reconnectTimer);
@@ -274,8 +281,15 @@
         renderApprovals(msg.pending || []);
         break;
       case 'viewport':
+        historyCompleting = historyPending && historyTargetCurrent(historyPending)
+          && msg.session === historyPending.session && msg.history?.request === historyPending.request
+          ? { context: historyPending, success: !msg.history.expired } : null;
         handleViewport(msg);
+        historyCompleting = null;
         reevaluateResizeReading();
+        break;
+      case 'history_error':
+        handleHistoryError(msg);
         break;
       case 'terminal_control':
         handleTerminalControl(msg);
@@ -307,8 +321,7 @@
 
   function sendSerialized(serialized) {
     if (!ws || ws.readyState !== WebSocket.OPEN) return false;
-    ws.send(serialized);
-    return true;
+    try { ws.send(serialized); return true; } catch (_) { return false; }
   }
 
   function send(msg) {
@@ -344,6 +357,7 @@
       closingChanged: (closing) => {
         if (closing) {
           retireResizeControl();
+          retireHistory();
           stopAllKeyRepeats();
           resetDirectInput();
         }
@@ -355,6 +369,7 @@
         viewerMenuStatus.textContent = connected ? '연결됨' : (state === 'reconnecting' ? '재연결 중' : '연결 중');
         if (!connected) {
           retireResizeControl();
+          retireHistory();
           stopAllKeyRepeats();
           resetDirectInput();
           cancelActiveUpload();
@@ -393,8 +408,12 @@
       },
       pan: queueScroll,
       resetPan: resetScroll,
+      searchChanged: syncViewerSearch,
+      readingChanged: handleReadingChanged,
+      resumeHistory: () => sendHistoryRequest('reset', 0),
       beforeOpen: () => {
         retireResizeControl();
+        retireHistory();
         resizeLayout = null;
         stopAllKeyRepeats();
         resetDirectInput();
@@ -410,12 +429,14 @@
       afterOpen: () => updateComposerEnabled(),
       beforeRequestClose: () => {
         retireResizeControl();
+        retireHistory();
         resetDirectInput();
         cancelActiveUpload();
         cancelPendingUploadSelection();
       },
       beforeClose: ({ discardDraft = false } = {}, returnSession) => {
         retireResizeControl();
+        retireHistory();
         stopAllKeyRepeats();
         if (discardDraft) discardSessionDraft(returnSession);
         else saveComposerDraft();
@@ -424,6 +445,7 @@
       },
       beforeHide: () => {
         retireResizeControl();
+        retireHistory();
         resizeLayout = null;
         closeViewerMenu();
         viewerQuickActions.hidden = true;
@@ -497,8 +519,9 @@
 
   function mobileResizeSuspended() {
     const settings = viewer.settings();
+    const history = viewer.getHistoryState();
     return settings.overview || settings.readableWrap || !viewer.followingLive
-      || !!(viewer.screen && viewer.screen.offset > 0);
+      || !!(viewer.screen && viewer.screen.offset > 0) || history.retained || history.pendingRequest !== null;
   }
 
   function refreshMobileResizeLayout(metrics = viewer.getCellMetrics()) {
@@ -506,6 +529,14 @@
     // mobile-size echo removing scrollbars cannot produce another resize.
     resizeLayout = { ...metrics, stageWidth: viewerStage.clientWidth, stageHeight: viewerStage.clientHeight };
     scheduleMobileResize();
+  }
+
+  if ('ResizeObserver' in window) {
+    new ResizeObserver(() => {
+      // A scrollbar can leave the inner wrap at zero while the physical stage recovers.
+      if (!resizeLayout || viewerStage.clientWidth !== resizeLayout.stageWidth
+          || viewerStage.clientHeight !== resizeLayout.stageHeight) refreshMobileResizeLayout();
+    }).observe(viewerStage);
   }
 
   function reevaluateResizeReading() {
@@ -638,12 +669,14 @@
   }
 
   function syncViewerReadabilityControls() {
-    const { fontSize, overview } = viewer.settings();
+    const { fontSize, overview, readableWrap } = viewer.settings();
     viewerFontSize.textContent = fontSize + 'px';
     viewerFontSmaller.disabled = fontSize <= 12;
     viewerFontLarger.disabled = fontSize >= 24;
     viewerOverview.setAttribute('aria-pressed', String(overview));
     viewerOverviewState.textContent = overview ? '켜짐' : '꺼짐';
+    viewerReadableWrap.setAttribute('aria-pressed', String(readableWrap));
+    viewerReadableState.textContent = readableWrap ? '켜짐' : '꺼짐';
   }
 
   viewerFontSmaller.addEventListener('click', () => {
@@ -660,6 +693,55 @@
     refreshMobileResizeLayout();
   });
   syncViewerReadabilityControls();
+
+  viewerReadableWrap.addEventListener('click', () => {
+    viewer.setReadableWrap(!viewer.settings().readableWrap);
+    syncViewerReadabilityControls();
+    refreshMobileResizeLayout();
+  });
+  function syncViewerSearch(result) {
+    viewerSearchText.value = result.query;
+    viewerSearchCount.textContent = result.query ? (result.total ? `${result.index} / ${result.total}` : '일치하는 텍스트가 없습니다.') : '';
+  }
+  const findLoadedText = (direction = 1) => syncViewerSearch(viewer.findText(viewerSearchText.value, direction));
+  viewerSearchText.addEventListener('input', () => findLoadedText());
+  viewerSearchText.addEventListener('keydown', (event) => {
+    if (event.isComposing || event.keyCode === 229) return;
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      findLoadedText(event.shiftKey ? -1 : 1);
+    } else if (event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
+      viewer.clearSearch();
+    }
+  });
+  document.getElementById('viewer-search-prev').addEventListener('click', () => findLoadedText(-1));
+  document.getElementById('viewer-search-next').addEventListener('click', () => findLoadedText(1));
+  document.getElementById('viewer-search-clear').addEventListener('click', () => viewer.clearSearch());
+  const copySelection = document.getElementById('viewer-copy-selection');
+  let copyRequest = 0;
+  copySelection.addEventListener('pointerdown', (event) => event.preventDefault());
+  copySelection.addEventListener('click', async () => {
+    const request = ++copyRequest;
+    const text = viewer.getSelectedText();
+    if (!text) {
+      viewerCopyStatus.textContent = '터미널에서 복사할 텍스트를 선택하세요.';
+      return;
+    }
+    const socket = ws;
+    const session = viewer.watching;
+    const epoch = historyEpoch;
+    viewerCopyStatus.textContent = '복사 중…';
+    const current = () => request === copyRequest && socket === ws && session === viewer.watching && epoch === historyEpoch
+      && !viewer.el.hidden && viewer.privacy.hidden;
+    try {
+      await navigator.clipboard.writeText(text);
+      if (current()) viewerCopyStatus.textContent = '선택한 텍스트를 복사했습니다.';
+    } catch (_) {
+      if (current()) viewerCopyStatus.textContent = '복사 권한을 확인하거나 Ctrl/Cmd+C로 복사하세요.';
+    }
+  });
 
   function updateViewerHeading(sessionId) {
     const workspace = lastWorkspaces.find((item) =>
@@ -688,42 +770,160 @@
   });
 
   // ── 스크롤백 열람 — 코어가 해석한 팬 제스처를 줄 단위 delta로 바꿔 보낸다 (양수 = 과거로).
-  // 스크롤 상태는 세션당 하나(데스크톱과 공유 — tmux 관례). 60ms 코얼레싱으로
-  // 빠른 스와이프가 메시지 폭주를 만들지 않게 한다.
+  // 60ms마다 표시 중인 기록 위치에서 이동한다. 소켓별 요청과 표시 anchor는
+  // 데스크톱/다른 시청자의 커서와 독립적이며 passive 출력으로 바꾸지 않는다.
   let scrollAcc = 0;
   let scrollTimer = null;
+  let scrollTarget = null;
+  let historyEpoch = 0;
+  let historyPending = null;
+  let historyCompleting = null;
+  let historyNotice = '';
+  const historyRequests = new WeakMap();
+  const HISTORY_REQUEST_MAX = 0xffffffff;
+  const HISTORY_TIMEOUT_MS = 5000;
+  const HISTORY_DELTA_CAP = 100000;
+
+  function historyTargetCurrent(target) {
+    return !!target && target.socket === ws && target.session === viewer.watching
+      && target.epoch === historyEpoch;
+  }
+
+  function historyReady() {
+    return mobileResizeReady() && viewer.privacy.hidden;
+  }
+
+  function syncHistoryUi(state = viewer.getHistoryState()) {
+    const pending = historyPending && historyTargetCurrent(historyPending)
+      && state.pendingRequest === historyPending.request ? historyPending : null;
+    const bottom = document.getElementById('viewer-bottom');
+    bottom.disabled = !!(pending && pending.kind === 'reset');
+    bottom.textContent = bottom.disabled ? '현재 화면 확인 중…' : '현재 화면으로';
+    viewerReadingStatus.textContent = historyNotice || (pending
+      ? (pending.kind === 'reset' ? '현재 화면을 확인 중입니다…' : '기록을 불러오는 중입니다…')
+      : state.expired ? '불러온 기록이 만료되었습니다. 현재 화면으로 돌아갈 수 있습니다.'
+      : state.retained ? '불러온 화면을 유지합니다. 현재 화면으로 돌아갈 수 있습니다.' : '');
+  }
+
+  function clearHistoryPending(clearPan = true) {
+    const previous = historyPending;
+    historyPending = null;
+    if (previous) clearTimeout(previous.timer);
+    if (clearPan) resetScroll();
+    return previous;
+  }
+
+  function cancelHistoryRequest(note = '') {
+    const previous = clearHistoryPending();
+    historyNotice = note;
+    if (previous && historyTargetCurrent(previous) && viewer.getHistoryState().pendingRequest === previous.request) {
+      viewer.cancelHistoryWindow(previous.request);
+    }
+    syncHistoryUi();
+  }
+
+  function retireHistory() {
+    cancelHistoryRequest();
+    historyEpoch++;
+    viewerCopyStatus.textContent = '';
+  }
+
+  function handleReadingChanged(state) {
+    if (historyPending && state.pendingRequest !== historyPending.request) {
+      const matchedSuccess = historyCompleting && historyCompleting.context === historyPending && historyCompleting.success;
+      clearHistoryPending(!matchedSuccess); // Keep an unsent gesture increment after its earlier ACK.
+    }
+    syncHistoryUi(state);
+    reevaluateResizeReading();
+  }
+
+  function handleHistoryError(msg) {
+    const pending = historyPending;
+    if (!pending || !historyTargetCurrent(pending) || msg.session !== pending.session || msg.request !== pending.request) return;
+    const notes = {
+      timeout: '기록 요청을 확인하지 못했습니다. 현재 화면으로 다시 요청하세요.',
+      unavailable: '기록을 사용할 수 없습니다. 현재 화면으로 다시 요청할 수 있습니다.',
+      stale: '기록 요청이 바뀌었습니다. 현재 화면으로 다시 요청하세요.',
+      invalid_anchor: '기록 위치를 확인할 수 없습니다. 현재 화면으로 다시 요청하세요.',
+      capacity: '기록 요청이 많습니다. 잠시 후 다시 요청하세요.',
+    };
+    cancelHistoryRequest(notes[msg.reason] || '기록 요청을 완료하지 못했습니다. 다시 요청하세요.');
+  }
+
+  function sendHistoryRequest(kind, increment) {
+    if (!historyReady()) return false;
+    const socket = ws;
+    const previous = historyPending;
+    const wave = kind === 'manual' && previous?.kind === 'manual' && historyTargetCurrent(previous) ? previous : null;
+    const state = viewer.getHistoryState();
+    const anchor = wave ? wave.anchor : typeof state.generation === 'string' && typeof state.firstLine === 'string'
+      ? { generation: state.generation, first_line: state.firstLine } : null;
+    const delta = kind === 'reset' ? 0 : Math.max(-HISTORY_DELTA_CAP, Math.min(HISTORY_DELTA_CAP, (wave?.delta || 0) + increment));
+    const sequence = historyRequests.get(socket) || 0;
+    if (sequence >= HISTORY_REQUEST_MAX) {
+      disconnect(); setViewerConnection('connecting'); connect();
+      historyNotice = '연결을 새로 열었습니다. 현재 화면으로 다시 요청하세요.';
+      syncHistoryUi();
+      return false;
+    }
+    const request = sequence + 1;
+    historyRequests.set(socket, request);
+    const context = { socket, session: viewer.watching, epoch: historyEpoch, request, kind, anchor, delta,
+      deadline: wave ? wave.deadline : Date.now() + HISTORY_TIMEOUT_MS, timer: null };
+    if (previous) clearTimeout(previous.timer);
+    historyPending = context;
+    historyNotice = '';
+    const message = { type: 'scroll', session: context.session, delta, request, reset: kind === 'reset' };
+    if (kind === 'manual' && anchor) message.anchor = anchor;
+    try { socket.send(JSON.stringify(message)); } catch (_) {
+      historyPending = previous;
+      cancelHistoryRequest('연결이 바뀌어 기록을 요청하지 못했습니다. 다시 요청하세요.');
+      return false;
+    }
+    if (!viewer.expectHistoryWindow(request)) {
+      cancelHistoryRequest('기록 요청을 확인하지 못했습니다. 다시 요청하세요.');
+      return false;
+    }
+    context.timer = setTimeout(() => {
+      if (historyPending !== context || !historyTargetCurrent(context)) return;
+      cancelHistoryRequest('기록 요청을 확인하지 못했습니다. 현재 화면으로 다시 요청하세요.');
+    }, Math.max(0, context.deadline - Date.now()));
+    syncHistoryUi();
+    return true;
+  }
 
   function queueScroll(lines) {
-    if (!remoteInputReady()) return;
-    scrollAcc += lines;
+    if (!historyReady() || !Number.isFinite(lines)) return;
+    scrollAcc = Math.max(-HISTORY_DELTA_CAP, Math.min(HISTORY_DELTA_CAP, scrollAcc + lines));
     if (scrollTimer) return;
+    scrollTarget = { socket: ws, session: viewer.watching, epoch: historyEpoch };
     scrollTimer = setTimeout(() => {
       scrollTimer = null;
+      if (!historyTargetCurrent(scrollTarget) || !historyReady()) { resetScroll(); return; }
       const whole = Math.trunc(scrollAcc);
       scrollAcc -= whole;
-      if (whole !== 0 && remoteInputReady()) {
-        send({ type: 'scroll', session: viewer.watching, delta: whole });
-      }
+      if (whole !== 0) sendHistoryRequest('manual', whole);
     }, 60);
   }
 
   function resetScroll() {
     scrollAcc = 0;
+    scrollTarget = null;
     if (scrollTimer) {
       clearTimeout(scrollTimer);
       scrollTimer = null;
     }
   }
 
-  document.getElementById('viewer-bottom').addEventListener('click', () => {
-    const offset = (viewer.screen && viewer.screen.offset) || 0;
+  function resumeCurrent() {
+    if (historyPending?.kind === 'reset' && historyTargetCurrent(historyPending)) return;
+    cancelHistoryRequest();
     viewer.resumeFollow();
     resetPan();
     refreshMobileResizeLayout();
-    if (offset > 0 && remoteInputReady()) {
-      send({ type: 'scroll', session: viewer.watching, delta: -offset });
-    }
-  });
+  }
+  document.getElementById('viewer-bottom').addEventListener('click', resumeCurrent);
+  window.addEventListener('pagehide', retireHistory);
 
   function sendKey(key, target = directTarget()) {
     if (!remoteInputReady()) return;
@@ -732,7 +932,7 @@
       sendDirectKey(ctrl ? key.slice(-1) : key, { ctrl }, target);
       return;
     }
-    send({ type: 'key', session: viewer.watching, key });
+    if (send({ type: 'key', session: viewer.watching, key })) resumeCurrent();
   }
 
   // ── composer (P6b) — 자유 입력. 행동 계약:
@@ -990,6 +1190,7 @@
       setComposerNote('연결이 끊겼습니다 — 재연결 후 다시 전송하세요');
       return;
     }
+    resumeCurrent();
     rememberRecentSent(target, text);
     composerRecoveryWarningSession = null;
     setComposerNote('');
@@ -1272,7 +1473,10 @@
       return false;
     }
     if (paste) resetDirectModifiers();
-    return sendSerialized(serialized);
+    const sent = sendSerialized(serialized);
+    if (sent) resumeCurrent();
+    else setComposerNote('직접 입력을 보내지 못했습니다. 연결을 확인하고 다시 입력하세요.');
+    return sent;
   }
 
   function flushDirectComposition(end = directText.value.length, preserveText = false) {
@@ -1314,7 +1518,9 @@
       return false;
     }
     resetDirectModifiers();
-    return send({ type: 'direct_key', session: target.session, key, ctrl, alt, shift, meta: false });
+    const sent = send({ type: 'direct_key', session: target.session, key, ctrl, alt, shift, meta: false });
+    if (sent) resumeCurrent();
+    return sent;
   }
 
   function applyInputMode() {

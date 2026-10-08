@@ -1636,6 +1636,7 @@ mod tests {
             title: None,
             scroll_offset: 0,
             is_alt_screen: false,
+            history: None,
         }
     }
 
@@ -1764,6 +1765,7 @@ mod tests {
                 title: None,
                 scroll_offset: 0,
                 is_alt_screen: false,
+                history: None,
             }
         }
 

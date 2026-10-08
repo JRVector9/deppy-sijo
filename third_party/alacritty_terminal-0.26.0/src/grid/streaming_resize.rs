@@ -115,6 +115,7 @@ impl Grid<Cell> {
         columns: usize,
     ) -> ReflowMetrics {
         self.preflight_resize(lines, columns);
+        let changed = self.lines != lines || self.columns != columns;
 
         let mut metrics = ReflowMetrics::default();
         let template = mem::take(&mut self.cursor.template);
@@ -131,6 +132,9 @@ impl Grid<Cell> {
         }
         self.cursor.template = template;
         self.compress_history(0);
+        if changed {
+            self.invalidate_history_identity();
+        }
         metrics
     }
 

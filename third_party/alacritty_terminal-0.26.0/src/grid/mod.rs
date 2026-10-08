@@ -82,6 +82,13 @@ pub enum Scroll {
     Bottom,
 }
 
+fn new_history_generation() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_add(1))
+        .expect("history generation exhausted")
+}
+
 /// Grid based terminal content storage.
 ///
 /// ```notrust
@@ -139,6 +146,12 @@ pub struct Grid<T> {
 
     /// Maximum number of lines in history.
     max_scroll_limit: usize,
+
+    // Source identities survive reuse of physical rows at the history cap.
+    #[cfg_attr(feature = "serde", serde(skip, default = "new_history_generation"))]
+    history_generation: u64,
+    #[cfg_attr(feature = "serde", serde(skip))]
+    history_tail: u64,
 }
 
 impl<T: GridCell + Default + PartialEq> Grid<T> {
@@ -147,6 +160,8 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
             raw: Storage::with_capacity(lines, columns),
             max_scroll_limit,
             display_offset: 0,
+            history_generation: new_history_generation(),
+            history_tail: 0,
             saved_cursor: Cursor::default(),
             cursor: Cursor::default(),
             lines,
@@ -157,6 +172,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
     /// Update the size of the scrollback history.
     pub fn update_history(&mut self, history_size: usize) {
         let current_history_size = self.history_size();
+        self.history_tail = self.history_tail.max(current_history_size as u64);
         if current_history_size > history_size {
             self.raw.shrink_lines(current_history_size - history_size);
         }
@@ -197,6 +213,9 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         T: ResetDiscriminant<D>,
         D: PartialEq,
     {
+        if positions != 0 && region.start == Line(0) {
+            self.invalidate_history_identity();
+        }
         // When rotating the entire region, just reset everything.
         if region.end - region.start <= positions {
             for i in (region.start.0..region.end.0).map(Line::from) {
@@ -274,6 +293,12 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
 
         // Only rotate the entire history if the active region starts at the top.
         if region.start == 0 {
+            let tail = self.history_tail.max(self.history_size() as u64);
+            if let Some(next) = tail.checked_add(positions as u64) {
+                self.history_tail = next;
+            } else {
+                self.invalidate_history_identity();
+            }
             // Create scrollback for the new lines.
             self.increase_scroll_limit(positions);
 
@@ -361,6 +386,17 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
 }
 
 impl<T> Grid<T> {
+    /// Generation and absolute source line at the live screen's top.
+    pub fn history_identity(&self) -> (u64, u64) {
+        (self.history_generation, self.history_tail.max(self.history_size() as u64))
+    }
+
+    /// Expire cursors when rows can no longer be mapped to their old identities.
+    pub fn invalidate_history_identity(&mut self) {
+        self.history_generation = new_history_generation();
+        self.history_tail = self.history_size() as u64;
+    }
+
     /// Reset a visible region within the grid.
     pub fn reset_region<D, R: RangeBounds<Line>>(&mut self, bounds: R)
     where
@@ -391,6 +427,7 @@ impl<T> Grid<T> {
     pub fn clear_history(&mut self) {
         // Explicitly purge all lines from history.
         self.raw.shrink_lines(self.history_size());
+        self.invalidate_history_identity();
 
         // Reset display offset.
         self.display_offset = 0;

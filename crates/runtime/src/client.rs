@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -34,6 +34,31 @@ pub(crate) const LOCAL_EVENT_QUEUE_CAP: usize = 1024;
 /// UI 한 프레임에서 durable 이벤트를 처리할 최대 수. backlog가 남으면 최신값 slot은
 /// 다음 프레임으로 미뤄 Spawn/Mux보다 Viewport가 먼저 보이는 순서 역전을 막는다.
 const DURABLE_DRAIN_BUDGET: usize = 256;
+/// Query windows are transient: bounded eviction leaves callers to retry or time out.
+pub(crate) const HISTORY_RESULT_SLOT_CAP: usize = 32;
+
+pub(crate) fn push_history_result(queue: &mut VecDeque<RuntimeEvent>, event: RuntimeEvent) {
+    let RuntimeEvent::TerminalHistoryResult { operation_id, .. } = &event else {
+        return;
+    };
+    queue.retain(|previous| !matches!(previous, RuntimeEvent::TerminalHistoryResult { operation_id: previous, .. } if previous == operation_id));
+    while queue.len() >= HISTORY_RESULT_SLOT_CAP {
+        queue.pop_front();
+    }
+    queue.push_back(event);
+}
+
+fn restore_history_results(queue: &mut VecDeque<RuntimeEvent>, old: Vec<RuntimeEvent>) {
+    let mut restored: VecDeque<_> = old.into_iter().filter(|event| {
+        let RuntimeEvent::TerminalHistoryResult { operation_id, .. } = event else { return false; };
+        !queue.iter().any(|newer| matches!(newer, RuntimeEvent::TerminalHistoryResult { operation_id: newer, .. } if newer == operation_id))
+    }).collect();
+    restored.append(queue);
+    while restored.len() > HISTORY_RESULT_SLOT_CAP {
+        restored.pop_front();
+    }
+    *queue = restored;
+}
 
 /// 이벤트 수신측. 상태 이벤트(저빈도 제어)와 Viewport(고빈도 출력)를 분리한다 (설계문서 8.2):
 /// Viewport는 세션별 최신본 하나만 유지하는 slot이라 소비가 늦어도 누적되지 않는다 (14.5).
@@ -44,6 +69,7 @@ pub struct RuntimeEventReceiver {
     /// 송신 큐 포화로 이 구독자가 disconnect됐는지 소비자에게 한 번 surface한다.
     pub(crate) overflowed: Arc<AtomicBool>,
     pub(crate) viewports: Arc<Mutex<HashMap<SessionId, RuntimeEvent>>>,
+    pub(crate) history_results: Arc<Mutex<VecDeque<RuntimeEvent>>>,
     pub(crate) input_pressures: Arc<Mutex<HashMap<SessionId, RuntimeEvent>>>,
     /// ResourceUsage 최신본 slot — 주기 샘플(유일한 무한 반복 이벤트 소스)이라 느린
     /// 소비자에게도 채널에 누적되지 않게 latest-value로 덮어쓴다(안정성 감사 High #1).
@@ -137,6 +163,12 @@ impl RuntimeEventReceiver {
             .expect("viewport slot lock")
             .drain()
             .collect();
+        let history_results: Vec<RuntimeEvent> = self
+            .history_results
+            .lock()
+            .expect("history result slot lock")
+            .drain(..)
+            .collect();
         let input_pressures: Vec<(SessionId, RuntimeEvent)> = self
             .input_pressures
             .lock()
@@ -182,6 +214,12 @@ impl RuntimeEventReceiver {
                         }
                     }
                     drop(current_viewports);
+                    let mut current_history = self
+                        .history_results
+                        .lock()
+                        .expect("history result slot lock");
+                    restore_history_results(&mut current_history, history_results);
+                    drop(current_history);
                     let mut current_pressures = self
                         .input_pressures
                         .lock()
@@ -209,6 +247,7 @@ impl RuntimeEventReceiver {
         out.extend(resource);
         out.extend(input_pressures.into_iter().map(|(_, event)| event));
         out.extend(viewports.into_iter().map(|(_, event)| event));
+        out.extend(history_results);
         out
     }
 }
@@ -229,6 +268,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn history_runtime_query_backlog_restore_keeps_newest_per_operation_and_order() {
+        let answer = |operation_id, expired| RuntimeEvent::TerminalHistoryResult {
+            session: SessionId(1),
+            operation_id,
+            snapshot: None,
+            expired,
+        };
+        let mut queue = VecDeque::from([answer(2, false), answer(3, false)]);
+        restore_history_results(&mut queue, vec![answer(1, true), answer(2, true)]);
+        let actual: Vec<_> = queue
+            .iter()
+            .map(|event| match event {
+                RuntimeEvent::TerminalHistoryResult {
+                    operation_id,
+                    expired,
+                    ..
+                } => (*operation_id, *expired),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(
+            actual,
+            vec![(1, true), (2, false), (3, false)],
+            "old backlog cannot replace/duplicate a fresher correlated answer"
+        );
+    }
+
+    #[test]
     fn durable_drain은_프레임_budget에서_멈추고_나머지를_보존한다() {
         let (tx, rx) = std::sync::mpsc::channel();
         for id in 0..(DURABLE_DRAIN_BUDGET + 17) {
@@ -242,6 +309,7 @@ mod tests {
             pending_durable: Mutex::new(None),
             overflowed: Arc::default(),
             viewports: Arc::default(),
+            history_results: Arc::default(),
             input_pressures: Arc::default(),
             resource_usage: Arc::new(Mutex::new(Some(RuntimeEvent::ResourceUsage {
                 snapshot: crate::resource_monitor::ProcessResourceSnapshot {

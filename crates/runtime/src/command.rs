@@ -505,6 +505,7 @@ pub(crate) fn runtime_command_retained_bytes(
         | RuntimeCommand::KillSession { .. }
         | RuntimeCommand::RestoreWorkspace
         | RuntimeCommand::RequestMuxSnapshot
+        | RuntimeCommand::QueryTerminalHistory { .. }
         | RuntimeCommand::TerminalControl { .. }
         | RuntimeCommand::SetWorkspaceState(_)
         | RuntimeCommand::SetUserStatusOverride { .. }
@@ -683,6 +684,7 @@ pub(crate) fn canonicalize_host_command(command: &mut RuntimeCommand) {
         | RuntimeCommand::KillSession { .. }
         | RuntimeCommand::RestoreWorkspace
         | RuntimeCommand::RequestMuxSnapshot
+        | RuntimeCommand::QueryTerminalHistory { .. }
         | RuntimeCommand::TerminalControl { .. }
         | RuntimeCommand::SetWorkspaceState(_)
         | RuntimeCommand::SetUserStatusOverride { .. }
@@ -955,6 +957,18 @@ pub(crate) fn validate_host_command(command: &RuntimeCommand) -> Result<(), Runt
                     .contains(requested)
             {
                 return Err(admission_error("runtime_scrollback_policy_invalid"));
+            }
+        }
+        RuntimeCommand::QueryTerminalHistory {
+            operation_id,
+            query,
+            ..
+        } => {
+            if *operation_id == 0
+                || query.delta.unsigned_abs() > 100_000
+                || query.anchor.is_some_and(|anchor| anchor.generation == 0)
+            {
+                return Err(admission_error("runtime_terminal_history_invalid"));
             }
         }
         RuntimeCommand::TerminalControl {
@@ -1301,11 +1315,27 @@ pub enum RuntimeCommand {
         operation_id: u64,
         request: crate::TerminalControlRequest,
     },
+    /// Pure, bounded source-window read. Never changes the native display offset.
+    QueryTerminalHistory {
+        session: SessionId,
+        operation_id: u64,
+        query: terminal::TerminalHistoryQuery,
+    },
 }
 
 impl std::fmt::Debug for RuntimeCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            RuntimeCommand::QueryTerminalHistory {
+                session,
+                operation_id,
+                query,
+            } => f
+                .debug_struct("QueryTerminalHistory")
+                .field("session", session)
+                .field("operation_id", operation_id)
+                .field("query", query)
+                .finish(),
             RuntimeCommand::TerminalControl {
                 session,
                 operation_id,
@@ -1676,6 +1706,48 @@ impl RuntimeCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_runtime_query_validation_bounds_and_wire_roundtrip() {
+        let command = RuntimeCommand::QueryTerminalHistory {
+            session: SessionId(7),
+            operation_id: 9,
+            query: terminal::TerminalHistoryQuery {
+                anchor: Some(terminal::TerminalHistoryAnchor {
+                    generation: u64::MAX,
+                    first_line: u64::MAX,
+                }),
+                delta: 100_000,
+                reset: false,
+            },
+        };
+        validate_host_command(&command).unwrap();
+        let bytes = postcard::to_allocvec(&command).unwrap();
+        assert!(matches!(
+            postcard::from_bytes::<RuntimeCommand>(&bytes).unwrap(),
+            RuntimeCommand::QueryTerminalHistory {
+                operation_id: 9,
+                ..
+            }
+        ));
+        for (operation_id, delta, generation) in
+            [(0, 0, 1), (1, 100_001, 1), (1, i32::MIN, 1), (1, 0, 0)]
+        {
+            let invalid = RuntimeCommand::QueryTerminalHistory {
+                session: SessionId(7),
+                operation_id,
+                query: terminal::TerminalHistoryQuery {
+                    anchor: Some(terminal::TerminalHistoryAnchor {
+                        generation,
+                        first_line: 0,
+                    }),
+                    delta,
+                    reset: false,
+                },
+            };
+            assert!(validate_host_command(&invalid).is_err());
+        }
+    }
 
     #[test]
     fn direct_terminal_input_is_bounded_retained_and_redacted_on_wire() {
@@ -2595,6 +2667,7 @@ mod tests {
                 "WriteTerminalInput",
                 "RequestMuxSnapshot",
                 "TerminalControl",
+                "QueryTerminalHistory",
             ]
         );
     }

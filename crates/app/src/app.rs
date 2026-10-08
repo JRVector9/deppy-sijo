@@ -50673,6 +50673,7 @@ mod tests {
                 title: Some(title.to_owned()),
                 scroll_offset: 0,
                 is_alt_screen: false,
+                history: None,
             }),
             bracketed_paste: false,
         }

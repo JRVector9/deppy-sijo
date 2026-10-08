@@ -2,6 +2,8 @@
   localStorage.setItem('deppy.webToken', 'usability-test-token');
   globalThis.mobileUsabilitySent = [];
   globalThis.mobileUsabilityErrors = [];
+  globalThis.mobileHistoryAutoReply = true;
+  globalThis.mobileInputSendFailure = false;
   window.addEventListener('error', (event) => mobileUsabilityErrors.push(event.message));
   class TestViewport extends EventTarget {
     constructor() {
@@ -21,6 +23,7 @@
     constructor() {
       this.readyState = 0;
       this.listeners = new Map();
+      this.liveFrames = new Map();
       globalThis.mobileUsabilitySocket = this;
       setTimeout(() => {
         this.readyState = 1;
@@ -33,9 +36,15 @@
     emit(type, event = {}) {
       for (const handler of this.listeners.get(type) || []) handler(event);
     }
-    message(frame) { this.emit('message', { data: JSON.stringify(frame) }); }
+    message(frame) {
+      if (frame.type === 'viewport' && !frame.history?.request && frame.offset === 0) {
+        this.liveFrames.set(frame.session, { ...this.liveFrames.get(frame.session), ...frame });
+      }
+      this.emit('message', { data: JSON.stringify(frame) });
+    }
     send(raw) {
       const frame = JSON.parse(raw);
+      if (mobileInputSendFailure && ['input', 'direct_input', 'direct_key'].includes(frame.type)) throw new Error('send failed');
       mobileUsabilitySent.push(frame);
       if (frame.type === 'auth') {
         setTimeout(() => {
@@ -55,6 +64,17 @@
             { s: 0, t: `${row} 한글 /path/to/project ┌────┐ readable terminal`, fg: '#d4d4d4' },
           ] })),
           cursor: { visible: true, row: 2, col: 6 }, offset: 0,
+          history: { generation: '1', first_line: '10000', total_lines: 5000, expired: false },
+        }), 10);
+      }
+      if (frame.type === 'scroll' && mobileHistoryAutoReply) {
+        const live = this.liveFrames.get(frame.session);
+        if (!live) return;
+        const base = BigInt(frame.anchor?.first_line || '10000');
+        const desired = frame.reset ? 10000n : base - BigInt(frame.delta);
+        const first = desired < 5040n ? 5040n : desired > 10000n ? 10000n : desired;
+        setTimeout(() => this.message({ ...live, keyframe: true, offset: Number(10000n - first),
+          history: { generation: '1', first_line: String(first), total_lines: 5000, request: frame.request, expired: false },
         }), 10);
       }
     }
@@ -84,6 +104,181 @@ const usabilitySettle = () => new Promise((resolve) =>
   requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(resolve, 90))));
 const usabilityById = (id) => document.getElementById(id);
 const usabilityFont = () => Number(usabilityById('viewer-canvas').getContext('2d').font.match(/([\d.]+)px/)[1]);
+
+async function runMobileReadingChecks() {
+  const wrapToggle = usabilityById('viewer-readable-wrap');
+  const search = usabilityById('viewer-search-text');
+  const count = usabilityById('viewer-search-count');
+  const copy = usabilityById('viewer-copy-selection');
+  const note = usabilityById('viewer-reading-status');
+  const wrap = document.querySelector('.viewer-wrap');
+  const layer = document.querySelector('.viewer-text-layer');
+  const sleep = (ms = 100) => new Promise((resolve) => setTimeout(resolve, ms));
+  const scrolls = () => mobileUsabilitySent.filter((frame) => frame.type === 'scroll');
+  let checkpoint = scrolls().length;
+  const take = () => { const result = scrolls().slice(checkpoint); checkpoint = scrolls().length; return result; };
+  const frame = (request, first = '10000', text = '한글🙂 <b>Alpha</b> alpha', expired = false) => {
+    mobileUsabilitySocket.message({ type: 'viewport', session: 's-1', keyframe: true, cols: 180, rows: 40,
+      lines: [{ row: 0, runs: [{ s: 0, t: text, fg: '#d4d4d4' }] }, { row: 1, runs: [{ s: 0, t: 'Beta Alpha', a: 1 }] }],
+      cursor: { visible: true, row: 1, col: 1 }, offset: Number(10000n - BigInt(first)),
+      history: { generation: '1', first_line: first, total_lines: 5000, ...(request ? { request } : {}), expired },
+    });
+  };
+  const select = () => {
+    const cells = layer.querySelector('[data-row="0"]').querySelectorAll('.viewer-text-cell');
+    const range = document.createRange(); range.setStart(cells[0].firstChild, 0); range.setEnd(cells[2].firstChild, cells[2].firstChild.length);
+    const selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(range);
+    document.dispatchEvent(new Event('selectionchange'));
+    return selection.toString();
+  };
+  const find = (value) => { search.value = value; search.dispatchEvent(new Event('input', { bubbles: true })); };
+  const pan = (rows) => {
+    wrap.scrollTop = rows > 0 ? 0 : wrap.scrollHeight;
+    wrap.dispatchEvent(new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaY: -rows, deltaMode: 1 }));
+  };
+  frame(); await usabilitySettle();
+  let copied = [];
+  let clipboardOutcome = 'ok';
+  let finishClipboard;
+  Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText(text) {
+    copied.push(text);
+    if (clipboardOutcome === 'fail') return Promise.reject(new Error('permission'));
+    if (clipboardOutcome === 'pending') return new Promise((resolve) => { finishClipboard = resolve; });
+    return Promise.resolve();
+  } } });
+  const selected = select(); copy.click(); await sleep(20);
+  usabilityCheck(selected === '한글🙂' && copied[0] === selected && usabilityById('viewer-copy-status').textContent.includes('복사했습니다'),
+    'explicit copy uses exactly the selected Unicode terminal text');
+  find('alpha'); usabilityCheck(count.textContent === '1 / 3', 'literal case-insensitive search counts loaded rows');
+  usabilityById('viewer-search-next').click(); usabilityCheck(count.textContent === '2 / 3', 'search next advances one loaded match');
+  usabilityById('viewer-search-prev').click(); usabilityCheck(count.textContent === '1 / 3', 'search previous returns to loaded match');
+  usabilityCheck(window.getSelection().toString() === selected && usabilityById('viewer-search-scope').textContent.includes('불러온 범위'),
+    'search preserves copy selection and visibly limits its scope');
+  find('<b>'); usabilityCheck(count.textContent === '1 / 1' && !layer.querySelector('b'), 'HTML-like search remains literal text');
+  find('not present'); usabilityCheck(count.textContent.includes('없습니다'), 'no-match search is honest');
+  search.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, cancelable: true, key: 'Escape', isComposing: true, keyCode: 229 }));
+  usabilityCheck(search.value === 'not present', 'search IME Escape does not discard the composing query');
+  usabilityById('viewer-search-clear').click(); usabilityCheck(search.value === '' && count.textContent === '', 'clear resets query and count');
+  clipboardOutcome = 'fail'; copy.click(); await sleep(20);
+  usabilityCheck(usabilityById('viewer-copy-status').textContent.includes('권한'), 'clipboard rejection offers native-copy recovery');
+  window.getSelection().removeAllRanges(); copy.click(); await sleep(20);
+  usabilityCheck(copied.length === 2, 'empty selection never writes to clipboard');
+  select(); usabilityById('viewer-privacy-curtain').hidden = false; copy.click(); find('alpha');
+  usabilityCheck(copied.length === 2 && count.textContent === '', 'privacy protects explicit copy and search');
+  usabilityById('viewer-privacy-curtain').hidden = true;
+  wrapToggle.click(); await usabilitySettle();
+  usabilityCheck(wrapToggle.getAttribute('aria-pressed') === 'true' && getComputedStyle(usabilityById('viewer-canvas')).display === 'none', 'readable wrap is explicit');
+  usabilityById('viewer-overview').click(); await usabilitySettle();
+  usabilityCheck(wrapToggle.getAttribute('aria-pressed') === 'false' && usabilityById('viewer-overview').getAttribute('aria-pressed') === 'true', 'overview and readable wrap are exclusive');
+  usabilityById('viewer-overview').click();
+  mobileHistoryAutoReply = false;
+  usabilityById('viewer-bottom').click();
+  let sent = take();
+  usabilityCheck(sent.length === 1 && sent[0].reset === true && sent[0].delta === 0 && sent[0].request > 0,
+    'retained offset-zero current action sends an absolute correlated reset');
+  const reset = sent[0];
+  usabilityById('viewer-bottom').click(); usabilityById('viewer-bottom').click();
+  usabilityCheck(take().length === 0, 'repeated current action deduplicates its pending reset');
+  frame(reset.request); await usabilitySettle();
+  usabilityCheck(!usabilityById('viewer-bottom').disabled, 'matching current reply completes reset and clears pending UI');
+  pan(5); await sleep(); sent = take();
+  usabilityCheck(sent.length === 1 && sent[0].delta === 5 && sent[0].anchor?.first_line === '10000' && sent[0].anchor.generation === '1', 'relative history captures displayed anchor');
+  const firstPan = sent[0]; pan(3); await sleep(); sent = take();
+  usabilityCheck(sent.length === 1 && sent[0].delta === 8 && sent[0].request > firstPan.request && sent[0].anchor.first_line === '10000', 'in-flight history wave accumulates movement from one displayed base');
+  const lastPan = sent[0]; frame(firstPan.request, '9995', 'OLD'); frame(undefined, '10000', 'PASSIVE'); await usabilitySettle();
+  usabilityCheck(layer.textContent.includes('한글🙂') && !layer.textContent.includes('OLD'), 'stale reply and passive live source cannot rebase the reader');
+  frame(lastPan.request, '9992', 'MATCHED'); await usabilitySettle();
+  usabilityCheck(layer.textContent.includes('MATCHED'), 'latest matching reply publishes the requested source');
+  pan(2); await sleep(); const queuedFirst = take()[0]; pan(3);
+  frame(queuedFirst.request, '9990', 'ACK BEFORE FLUSH'); await sleep(); sent = take();
+  usabilityCheck(sent.length === 1 && sent[0].delta === 3 && sent[0].anchor.first_line === '9990', 'matching ACK before coalesced flush preserves unsent increment from newly displayed base');
+  frame(sent[0].request, '9987', 'CONTINUED'); await usabilitySettle();
+  usabilityById('viewer-bottom').click(); const canceledReset = take()[0];
+  find('CONTINUED');
+  usabilityCheck(!usabilityById('viewer-bottom').disabled, 'new search cancels pending reset and restores current action');
+  pan(4); await sleep(); sent = take();
+  usabilityCheck(sent.length === 1 && sent[0].anchor.first_line === '9987' && sent[0].delta === 4, 'relative pan after canceled server reset starts from retained displayed source');
+  frame(canceledReset.request); frame(sent[0].request, '9983', 'AFTER CANCEL'); await usabilitySettle();
+  usabilityCheck(layer.textContent.includes('AFTER CANCEL') && search.value === '', 'matching source replacement clears old search without canceled reset jump');
+  usabilityById('viewer-bottom').click(); const failed = take()[0];
+  mobileUsabilitySocket.message({ type: 'history_error', session: 's-1', request: failed.request - 1, reason: 'unavailable' });
+  usabilityCheck(usabilityById('viewer-bottom').disabled, 'unrelated query error cannot cancel current reset');
+  mobileUsabilitySocket.message({ type: 'history_error', session: 's-1', request: failed.request, reason: 'unavailable' });
+  usabilityCheck(!usabilityById('viewer-bottom').disabled && note.textContent.includes('사용할 수'), 'matching query failure retains display and exposes recovery');
+  frame(failed.request); await usabilitySettle(); usabilityCheck(layer.textContent.includes('AFTER CANCEL'), 'failed query late answer cannot install');
+  usabilityById('viewer-bottom').click(); const timeout = take()[0]; await sleep(4900);
+  usabilityCheck(usabilityById('viewer-bottom').disabled, 'an older canceled deadline cannot cancel the newer reset');
+  await sleep(250);
+  usabilityCheck(!usabilityById('viewer-bottom').disabled && note.textContent.includes('확인하지'), 'connected-socket query has bounded timeout and reachable retry');
+  frame(timeout.request); await usabilitySettle(); usabilityCheck(layer.textContent.includes('AFTER CANCEL'), 'timed-out late answer stays retained');
+  mobileUsabilitySocket.message({ type: 'input_pressure', session: 's-1', reason: 'queue_full', queued: 1 });
+  pan(2); await sleep(); sent = take();
+  usabilityCheck(sent.length === 1 && sent[0].anchor.first_line === '9983', 'input queue pressure never blocks independent reading navigation');
+  frame(sent[0].request, '9983', 'EXPIRED FALLBACK', true); await usabilitySettle();
+  usabilityCheck(note.textContent.includes('만료'), 'matching expiry is honestly reported');
+  usabilityCheck(layer.textContent.includes('AFTER CANCEL') && !layer.textContent.includes('EXPIRED FALLBACK'), 'expired response preserves loaded text');
+  mobileUsabilitySocket.message({ type: 'input_pressure', session: 's-1', reason: 'queue_full', queued: 0 });
+  usabilityById('viewer-bottom').click(); let inputReset = take()[0]; frame(inputReset.request); await usabilitySettle();
+  const direct = () => usabilityById('direct-text');
+  const directEdit = (text, composing = false) => {
+    direct().value = '\u200b' + text;
+    direct().dispatchEvent(new InputEvent('input', { bubbles: true, inputType: composing ? 'insertCompositionText' : 'insertText', data: text, isComposing: composing }));
+  };
+  select(); find('alpha'); usabilityById('direct-ctrl').click(); usabilityById('direct-ctrl').click();
+  direct().dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true })); directEdit('ㅎ', true); await sleep(20);
+  usabilityCheck(take().length === 0 && search.value === 'alpha', 'modifier arming and unconfirmed IME preserve reading without reset');
+  directEdit('한', true); direct().dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: '한' })); await sleep(20);
+  direct().dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, cancelable: true, key: 'Enter' }));
+  sent = take(); inputReset = sent[0];
+  usabilityCheck(sent.length === 1 && inputReset.reset && search.value === '', 'confirmed IME plus semantic Enter resumes current exactly once');
+  frame(undefined, '10000', 'PASSIVE EXPIRED', true); directEdit('x');
+  usabilityCheck(take().length === 0 && usabilityById('viewer-bottom').disabled, 'successful typing and passive expiry preserve one pending reset');
+  frame(inputReset.request); await usabilitySettle();
+  select(); find('alpha'); const loadedBeforeFailure = layer.textContent; mobileInputSendFailure = true; directEdit('실패');
+  usabilityCheck(take().length === 0 && search.value === 'alpha' && layer.textContent === loadedBeforeFailure
+    && note.textContent.includes('유지'), 'failed direct transport keeps loaded reading source/query');
+  usabilityById('viewer-mode-composer').click(); const composer = usabilityById('composer-text');
+  composer.value = '초안'; composer.dispatchEvent(new Event('input', { bubbles: true }));
+  usabilityCheck(take().length === 0 && search.value === 'alpha', 'composer draft edit remains in reading');
+  usabilityById('composer-send').click();
+  usabilityCheck(composer.value === '초안' && take().length === 0 && search.value === 'alpha', 'failed composer transport preserves draft and reading');
+  mobileInputSendFailure = false;
+  const originalFetch = window.fetch;
+  try {
+    window.fetch = async () => ({ ok: true, json: async () => ({ path: '/tmp/mobile-attachment.txt' }) });
+    usabilityById('composer-attach').click();
+    const files = new DataTransfer(); files.items.add(new File(['attachment'], 'attachment.txt', { type: 'text/plain' }));
+    usabilityById('composer-file').files = files.files;
+    usabilityById('composer-file').dispatchEvent(new Event('change', { bubbles: true })); await sleep(20);
+  } finally { window.fetch = originalFetch; }
+  usabilityCheck(composer.value.includes('/tmp/mobile-attachment.txt') && search.value === 'alpha' && take().length === 0,
+    'upload path insertion edits the independent draft without resuming reading');
+  usabilityById('composer-send').click(); sent = take();
+  usabilityCheck(sent.length === 1 && sent[0].reset && search.value === '', 'successful committed composer resumes current once');
+  frame(sent[0].request); await usabilitySettle(); usabilityById('viewer-mode-direct').click();
+  wrapToggle.click(); await usabilitySettle(); wrapToggle.click();
+  usabilityCheck(note.textContent.includes('유지') && !usabilityById('viewer-bottom').disabled, 'leaving readable mode stays pinned until explicit current recovery');
+  mobileHistoryAutoReply = true;
+  usabilityById('viewer-bottom').click(); await usabilitySettle(); take();
+  clipboardOutcome = 'pending'; select(); copy.click(); const obsoleteCopy = finishClipboard;
+  window.getSelection().removeAllRanges(); copy.click(); obsoleteCopy(); await sleep(20);
+  usabilityCheck(usabilityById('viewer-copy-status').textContent.includes('선택하세요'), 'new copy intent invalidates an older clipboard completion');
+  clipboardOutcome = 'pending'; frame(); await usabilitySettle(); select(); copy.click();
+  usabilityById('viewer-session-chip').click(); usabilityById('viewer-session-chip').click(); await usabilitySettle(); finishClipboard(); await sleep(20);
+  usabilityCheck(!usabilityById('viewer-copy-status').textContent.includes('복사했습니다'), 'old clipboard promise cannot label a new watch as copied');
+  clipboardOutcome = 'ok';
+  usabilityById('viewer-bottom').click(); await usabilitySettle(); take();
+  mobileHistoryAutoReply = false;
+  pan(1000000); await sleep(); const capped = take()[0];
+  usabilityCheck(capped.delta === 100000 && capped.anchor.first_line === '10000', 'relative cumulative delta uses the safe agreed cap');
+  const beforeQueuedSwitch = mobileUsabilitySent.length;
+  pan(3); usabilityById('viewer-session-chip').click(); usabilityById('viewer-session-chip').click(); await sleep();
+  usabilityCheck(!mobileUsabilitySent.slice(beforeQueuedSwitch).some((value) => value.type === 'scroll'), 'watch transition clears queued history gestures');
+  frame(capped.request, '9990', 'OLD WATCH REPLY'); await usabilitySettle();
+  usabilityCheck(!layer.textContent.includes('OLD WATCH REPLY'), 'same-UUID old-watch history reply cannot install');
+  mobileHistoryAutoReply = true;
+  usabilityById('viewer-bottom').click(); await usabilitySettle(); take();
+}
 
 async function runMobileResizeChecks() {
   const button = usabilityById('viewer-resize-control');
@@ -220,6 +415,12 @@ async function runMobileResizeChecks() {
   }
   await sleep(100);
   expectResize(acquire, 'passive frames do not restart the geometry settle timer');
+  usabilityById('viewer-readable-wrap').click(); viewport(855, 510); usabilityById('viewer-font-larger').click(); await sleep();
+  usabilityCheck(take().length === 0 && status.textContent.includes('일시정지') && !button.disabled,
+    'owned lease remains releasable while readable mode suspends geometry');
+  usabilityById('viewer-readable-wrap').click(); await sleep();
+  usabilityCheck(take().length === 0, 'leaving readable wrap does not implicitly leave retained reading');
+  usabilityById('viewer-bottom').click(); await sleep(); expectResize(acquire, 'explicit matching current reply resumes resize after reading');
 
   viewport(390, 600); await sleep(70); viewport(390, 470); await sleep(70); viewport(390, 360); await sleep(100);
   usabilityCheck(take().length === 0, 'keyboard animation waits for 200ms settled geometry');
@@ -236,8 +437,14 @@ async function runMobileResizeChecks() {
   const bounded = expectResize(acquire, 'huge viewport');
   usabilityCheck(bounded.cols === 400 && bounded.rows === 163 && bounded.cols * bounded.rows <= 65536, 'mobile geometry honors dimensions and cell budget');
   viewport(320, 140); await sleep();
-  const tiny = expectResize(acquire, 'tiny keyboard viewport');
-  usabilityCheck(tiny.cols >= 32 && tiny.rows >= 2, 'tiny stage still uses the protocol minimum geometry');
+  usabilityCheck(usabilityById('viewer-stage').clientHeight === 0 && take().length === 0
+    && button.getAttribute('aria-pressed') === 'true' && !button.disabled,
+    'zero physical stage suspends resize while ownership and release remain available');
+  viewport(320, 180); await sleep();
+  usabilityCheck(usabilityById('viewer-stage').clientHeight > 0 && document.querySelector('.viewer-wrap').clientHeight === 0,
+    'keyboard recovery changes physical geometry while scrollbar-constrained inner geometry stays zero');
+  const tiny = expectResize(acquire, 'tiny keyboard viewport recovery');
+  usabilityCheck(tiny.cols === 32 && tiny.rows === 2, 'positive tiny stage uses the protocol minimum geometry');
 
   mobileUsabilitySocket.message({ type: 'input_pressure', session: 's-1', reason: 'queue_full', queued: 1 });
   viewport(430, 844);
@@ -620,6 +827,8 @@ async function runMobileUsability() {
   const fontLabel = usabilityById('viewer-font-size');
   const overview = usabilityById('viewer-overview');
   usabilityCheck(smaller && larger && fontLabel && overview, 'readability controls must exist');
+  usabilityCheck(usabilityById('viewer-readable-wrap') && usabilityById('viewer-search-text')
+    && usabilityById('viewer-copy-selection'), 'reading, loaded-window search and explicit selected-copy controls must exist');
   const restored = sessionStorage.getItem('mobile-usability-restore') === 'yes';
   usabilityCheck(fontLabel.textContent === (restored ? '17px' : '15px'), 'configured font default/restoration');
   usabilityCheck(overview.getAttribute('aria-pressed') === String(restored), 'explicit overview default/restoration');
@@ -699,6 +908,7 @@ async function runMobileUsability() {
   await usabilitySettle();
   usabilityCheck(wrap.scrollLeft < pausedPosition.left && wrap.scrollTop < pausedPosition.top,
     'later live frames continue following after return-to-current');
+  await runMobileReadingChecks();
   await runMobileResizeChecks();
   await runDirectInputChecks();
   const composer = usabilityById('composer-text');

@@ -32,6 +32,23 @@ pub enum ResizeControlAction {
     Release,
 }
 
+/// Opaque source generation and exact decimal row identity from the loaded window.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct HistoryAnchorView {
+    pub generation: String,
+    pub first_line: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HistoryView {
+    pub generation: String,
+    pub first_line: String,
+    pub total_lines: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request: Option<u32>,
+    pub expired: bool,
+}
+
 /// 클라이언트 → 서버.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -60,10 +77,17 @@ pub enum ClientMsg {
     /// 시청 중 세션에 최소 제어 키 (P5d). 화이트리스트("ctrl_c"/"enter")만 서버가
     /// 바이트로 매핑한다 — 자유 타이핑·IME는 비범위(필요 시 별도 PR).
     Key { session: String, key: String },
-    /// 시청 중 세션의 스크롤백 이동 (스크롤백 열람 — P5 후속). delta 양수 = 과거로.
-    /// 스크롤 상태는 세션당 하나(데스크톱과 공유 — tmux 관례, RuntimeCommand::Scroll
-    /// 재사용). 서버가 delta를 방어적으로 캡한다.
-    Scroll { session: String, delta: i32 },
+    /// Connection-local immutable history read. Positive delta moves toward history.
+    Scroll {
+        session: String,
+        delta: i32,
+        #[serde(default)]
+        request: Option<std::num::NonZeroU32>,
+        #[serde(default)]
+        reset: bool,
+        #[serde(default)]
+        anchor: Option<HistoryAnchorView>,
+    },
     /// 시청 중 세션에 자유 텍스트 입력 (P6a — composer). 서버가 C0 제어문자를 걷어내고
     /// (\t 제외 — 제어 시퀀스는 named key로만), \n을 \r로 정규화하며, 여러 줄/대형
     /// 텍스트는 세션의 bracketed paste 모드가 켜져 있으면 wrap한다. submit=true면
@@ -257,10 +281,12 @@ pub enum ServerMsg {
         rows: u16,
         cursor: CursorView,
         alt: bool,
-        /// 스크롤백 오프셋(줄) — 0 = 맨 아래(라이브). 클라가 "과거 열람 중" 표시와
-        /// 맨 아래 복귀(delta = -offset)에 쓴다.
+        /// Display offset in rows; zero is live. Absolute return uses Scroll reset:true
+        /// so output arriving while a window is pinned cannot change its target.
         offset: i32,
         lines: Vec<LineView>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        history: Option<HistoryView>,
     },
     /// 시청 세션의 PTY 입력 큐 압박 (P6a) — composer 전송 버튼 게이트.
     /// queued=0이면 해소(재활성). reason: "queue_full"/"closed"/"too_large"/"unavailable".
@@ -275,6 +301,11 @@ pub enum ServerMsg {
         session: String,
         request: u32,
         owned: bool,
+        reason: &'static str,
+    },
+    HistoryError {
+        session: String,
+        request: u32,
         reason: &'static str,
     },
 }
@@ -423,12 +454,123 @@ pub fn encode_viewport(
         alt: snapshot.is_alt_screen,
         offset: snapshot.scroll_offset,
         lines,
+        history: None,
     }
+}
+
+/// Source-scoped frames keep exact identities. Only an explicit query carries a
+/// request, and every such response is a full window even when cells are equal.
+pub fn encode_viewport_for_source(
+    session: &str,
+    seq: u64,
+    snapshot: &runtime::TerminalViewportSnapshot,
+    baseline: Option<&runtime::TerminalViewportSnapshot>,
+    namespace: &str,
+    request: Option<u32>,
+    expired: bool,
+) -> ServerMsg {
+    let mut frame = encode_viewport(
+        session,
+        seq,
+        snapshot,
+        if request.is_some() { None } else { baseline },
+    );
+    if let ServerMsg::Viewport { history, .. } = &mut frame {
+        *history = snapshot.history.map(|source| HistoryView {
+            generation: format!("{namespace}:{}", source.generation),
+            first_line: source.first_line.to_string(),
+            total_lines: source.total_lines,
+            request,
+            expired,
+        });
+    }
+    frame
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_web_wire_accepts_optional_anchor_absolute_reset_and_transient_full_reply() {
+        let parsed = ClientMsg::parse(r#"{"type":"scroll","session":"uuid","delta":3,"request":7,"reset":false,"anchor":{"generation":"nonce:1:7","first_line":"9007199254740993"}}"#).unwrap();
+        assert!(
+            matches!(parsed, ClientMsg::Scroll { request: Some(request), anchor: Some(anchor), reset: false, .. } if request.get() == 7 && anchor.generation == "nonce:1:7")
+        );
+        assert!(
+            ClientMsg::parse(r#"{"type":"scroll","session":"uuid","delta":0,"request":0}"#)
+                .is_none()
+        );
+        let mut source = snapshot(10, 2, vec![cell('x', WHITE, BLACK); 20]);
+        source.history = Some(runtime::TerminalHistoryMetadata {
+            generation: 7,
+            first_line: 100,
+            total_lines: 10,
+        });
+        let explicit = serde_json::to_value(encode_viewport_for_source(
+            "uuid",
+            1,
+            &source,
+            Some(&source),
+            "nonce:1",
+            Some(7),
+            false,
+        ))
+        .unwrap();
+        assert_eq!(explicit["keyframe"], true);
+        assert_eq!(explicit["lines"].as_array().unwrap().len(), 2);
+        assert_eq!(explicit["history"]["request"], 7);
+        assert_eq!(explicit["history"]["generation"], "nonce:1:7");
+        let passive = serde_json::to_value(encode_viewport_for_source(
+            "uuid",
+            2,
+            &source,
+            Some(&source),
+            "nonce:1",
+            None,
+            false,
+        ))
+        .unwrap();
+        assert!(passive["history"].get("request").is_none());
+        assert_eq!(passive["keyframe"], false);
+        let failure = serde_json::to_value(ServerMsg::HistoryError {
+            session: "uuid".into(),
+            request: 7,
+            reason: "timeout",
+        })
+        .unwrap();
+        assert_eq!(failure["type"], "history_error");
+        assert_eq!(failure["request"], 7);
+    }
+
+    #[test]
+    fn history_web_viewport_exposes_exact_source_identity_even_with_equal_cells() {
+        let mut source = snapshot(10, 2, vec![cell('x', WHITE, BLACK); 20]);
+        source.history = Some(runtime::TerminalHistoryMetadata {
+            generation: 7,
+            first_line: 9_007_199_254_740_993,
+            total_lines: 10,
+        });
+        let value = serde_json::to_value(encode_viewport_for_source(
+            "u7",
+            1,
+            &source,
+            Some(&source),
+            "test:1",
+            None,
+            false,
+        ))
+        .unwrap();
+        assert_eq!(
+            value["history"]["first_line"], "9007199254740993",
+            "source identities must not lose JS integer precision"
+        );
+        assert_eq!(value["history"]["total_lines"], 10);
+        assert!(
+            value["history"].get("request").is_none(),
+            "passive frames never leak manual request metadata"
+        );
+    }
 
     #[test]
     fn resize_control_wire_requires_nonzero_request_and_explicit_action() {
@@ -574,7 +716,10 @@ mod tests {
             msg,
             ClientMsg::Scroll {
                 session: "u7".into(),
-                delta: -12
+                delta: -12,
+                request: None,
+                reset: false,
+                anchor: None,
             }
         );
         // Input — submit 생략 시 false (삽입만)
@@ -653,6 +798,7 @@ mod tests {
             title: None,
             scroll_offset: 0,
             is_alt_screen: false,
+            history: None,
         }
     }
 

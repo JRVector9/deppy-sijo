@@ -426,6 +426,14 @@ impl Session {
         self.backend.viewport_snapshot()
     }
 
+    /// Reads a source window without consuming native dirty ranges or moving its viewport.
+    pub fn history_snapshot(
+        &self,
+        query: terminal::TerminalHistoryQuery,
+    ) -> Option<terminal::TerminalHistorySnapshot> {
+        self.backend.history_snapshot(query)
+    }
+
     pub fn foreground_process_group(&self) -> Option<u32> {
         self.pty.as_ref()?.foreground_process_group()
     }

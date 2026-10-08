@@ -5687,7 +5687,9 @@ impl WorkspaceUi {
                         search.scroll_to_current = !search.matches.is_empty();
                     }
                 }
-                RuntimeEvent::EnvironmentApplied { .. } | RuntimeEvent::InputAdmitted { .. } => {}
+                RuntimeEvent::EnvironmentApplied { .. }
+                | RuntimeEvent::InputAdmitted { .. }
+                | RuntimeEvent::TerminalHistoryResult { .. } => {}
                 RuntimeEvent::LastOutputExtracted {
                     session,
                     text,
@@ -18310,6 +18312,7 @@ mod tests {
             title: None,
             scroll_offset: 0,
             is_alt_screen: false,
+            history: None,
         };
         // '성'(idx 7) 위 hover — 파일명 전체가 한 단어여야 한다(폴더 cd·URL 열기 판정용).
         // 더블클릭은 2026-08-17부터 `line_range_at`(행 전체)을 쓴다.
@@ -18375,6 +18378,7 @@ mod tests {
             title: None,
             scroll_offset: 0,
             is_alt_screen: false,
+            history: None,
         }
     }
 
@@ -18934,6 +18938,7 @@ mod tests {
             title: None,
             scroll_offset: 0,
             is_alt_screen: false,
+            history: None,
         })
     }
 

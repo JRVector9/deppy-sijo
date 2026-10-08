@@ -186,6 +186,14 @@ pub trait TerminalBackend {
 
     fn viewport_snapshot(&self) -> Option<TerminalViewportSnapshot>;
 
+    /// Unsupported engines return no window without reading native render state.
+    fn history_snapshot(
+        &self,
+        _query: crate::TerminalHistoryQuery,
+    ) -> Option<crate::TerminalHistorySnapshot> {
+        None
+    }
+
     /// Backends with a cell model should override this with native metadata reads.
     /// The fallback preserves the contract of external/test backends.
     fn viewport_metadata(&self) -> Option<TerminalViewportMetadata> {
@@ -340,5 +348,64 @@ mod search_tests {
         let hay = fold("Grüße HÄLLO");
         assert_eq!(substring_matches(&hay, &fold("grüße")), vec![(0, 5)]);
         assert_eq!(substring_matches(&hay, &fold("hällo")), vec![(6, 11)]);
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+    struct Unsupported(std::cell::Cell<usize>);
+    impl TerminalBackend for Unsupported {
+        fn feed(&mut self, _: &[u8]) -> anyhow::Result<TerminalChangeSet> {
+            unreachable!()
+        }
+        fn resize(&mut self, _: u16, _: u16) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        fn render_model(&self) -> TerminalRenderModel {
+            TerminalRenderModel::CellGrid
+        }
+        fn viewport_snapshot(&self) -> Option<TerminalViewportSnapshot> {
+            self.0.set(self.0.get() + 1);
+            None
+        }
+        fn external_surface(&self) -> Option<TerminalExternalSurfaceHandle> {
+            None
+        }
+        fn scroll(&mut self, _: i32) {
+            unreachable!()
+        }
+        fn reset(&mut self) {
+            unreachable!()
+        }
+        fn set_cache_class(&mut self, _: TerminalCacheClass) -> Option<TerminalCacheEvent> {
+            unreachable!()
+        }
+        fn cache_class(&self) -> TerminalCacheClass {
+            unreachable!()
+        }
+        fn cache_footprint(&self) -> TerminalCacheFootprint {
+            unreachable!()
+        }
+        fn bracketed_paste(&self) -> bool {
+            false
+        }
+        fn screen_text(&self) -> String {
+            unreachable!()
+        }
+    }
+    #[test]
+    fn history_unsupported_query_does_not_call_mutating_native_snapshot() {
+        let backend = Unsupported(std::cell::Cell::new(0));
+        assert!(
+            backend
+                .history_snapshot(crate::TerminalHistoryQuery::live())
+                .is_none()
+        );
+        assert_eq!(
+            backend.0.get(),
+            0,
+            "unsupported query cannot consume native render cache/damage"
+        );
     }
 }

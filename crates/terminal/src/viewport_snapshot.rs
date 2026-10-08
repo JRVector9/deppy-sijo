@@ -20,6 +20,7 @@ pub struct TerminalViewportSnapshot {
     pub title: Option<String>,
     pub scroll_offset: i32,
     pub is_alt_screen: bool,
+    pub history: Option<crate::TerminalHistoryMetadata>,
 }
 
 /// A cell's full grapheme, stored only when a scalar cannot represent it.

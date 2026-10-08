@@ -12,7 +12,9 @@ const chrome = [process.env.CHROME_PATH, process.env.CHROME_BIN,
   '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', '/usr/bin/google-chrome',
   '/usr/bin/chromium', '/usr/bin/chromium-browser'].find(file => file && fs.existsSync(file));
 if (!chrome) throw Error('Set CHROME_PATH/CHROME_BIN or install Chromium');
-const script = read('web/shared/viewer-core.js') + '\n' + read('crates/web-remote/tests/fixtures/viewer-readability-contract.js');
+const fixture = process.argv.includes('--history') ? 'viewer-history-contract.js'
+  : process.argv.includes('--reading') ? 'viewer-reading-contract.js' : 'viewer-readability-contract.js';
+const script = read('web/shared/viewer-core.js') + '\n' + read('crates/web-remote/tests/fixtures/' + fixture);
 const html = `<!doctype html><meta charset="utf-8"><style>${read('web/shared/viewer-core.css')}</style><body data-status="running"><script type="module">${script.replaceAll('</script', '<\\/script')}</script><script>
 new MutationObserver(() => { if (['ok','error'].includes(document.body.dataset.status))
   fetch('/report', {method:'POST',body:document.body.dataset.status+'\\n'+document.body.textContent});

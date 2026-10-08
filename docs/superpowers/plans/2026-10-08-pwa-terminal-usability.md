@@ -17,7 +17,7 @@
 | pwa_backend | necessary Rust in crates/web-remote, runtime, terminal, app, excluding browser wrappers | PR2 direct contract, PR3 resize lease, PR4 local history |
 | root | this plan, audit progress, handoff, review outputs, staging and commits | review/test each unit before next dependent phase |
 
-PR1 committed27186086. Phase4 renderer develops ahead in isolated checkout /Users/jr/Desktop/projects/deppy-sijo-pwa-reading-20261008 atPR1; root imports its exclusively owned files only afterPR3. It must not run Cargo or use the main target. Integration/commit order remains PR1→PR2→PR3→PR4.
+PR1 committed27186086, PR2 fcfbbfd1, PR3 00cb838a. PR4 implementation, reviews and final gates completed on 2026-10-09; its source unit is committed as `feat(pwa): PR4 독립 이력과 모바일 읽기 도구`. Resolve its exact SHA with `git log -1 --format='%H %s' --grep='PR4 독립 이력과 모바일 읽기 도구'`. Phase4 renderer developed ahead in isolated checkout /Users/jr/Desktop/projects/deppy-sijo-pwa-reading-20261008 atPR1; root imported its seven exclusively owned files afterPR3. Those files now belong to renderer in the main tasktree; the isolated source stays frozen and must not run Cargo or use the main target. Integration/commit order remains PR1→PR2→PR3→PR4.
 
 All agents use gpt-6.1-sol with xhigh effort. Agents do not commit, restart Deppy, invoke review CLIs, or modify other owners' files. Root directly reviews code via Codex CLI, assigns corrections back to the owner, and commits reviewed units. Rust source is quiescent during each serialized Cargo run. UI JavaScript edits pause for web/App Cargo gates because assets are embedded via include_str; isolated renderer work can continue. No release artifact is delivered, so source version stays 0.8.7; any future delivery requires a version bump and artifact verification.
 
@@ -76,24 +76,29 @@ send({type: 'resize_control', session, action: 'release', request: 2});
 
 **Files:** core renderer/CSS; shell controls; web-remote viewport/history path and runtime/terminal read-only offset snapshot API.
 
-- [ ] Execute RED tests for copy/select/search, readable wrap without misleading TUI cursor, retained reading position under new output, independent offsets on two sockets and unchanged native scroll offset.
-- [ ] Add a DOM text/selection layer preserving owner-cell geometry in grid mode; readable wrap is opt-in. Keep history reads immutable and per connection. Scroll continues to use the existing session-targeted frame shape with local offset semantics.
+- [x] Execute RED tests for copy/select/search, readable wrap without misleading TUI cursor, retained reading position under new output, independent offsets on two sockets and unchanged native scroll offset.
+- [x] Add a DOM text/selection layer preserving owner-cell geometry in grid mode; readable wrap is opt-in. Keep history reads immutable and per connection. Scroll continues to use the existing session-targeted frame shape with local offset semantics.
 
 ```js
-send({type: 'scroll', session, delta: 20}); // updates only this connection's history offset
-send({type: 'scroll', session, delta: -20});
+send({type: 'scroll', session, request: 1, delta: 20,
+  anchor: {generation: displayedGeneration, first_line: displayedFirstLine}});
+// While in flight, retain this displayed anchor and accumulate delta for newer requests.
+send({type: 'scroll', session, request: 2, delta: 0, reset: true});
+// Absolute live reset ignores any anchor. Only the matching reply changes the read window.
 viewer.setReadableWrap(true); // reading mode; grid remains default
 ```
 
-- [ ] Run focused and full affected crate gates plus isolated browser viewport/input/history scenarios GREEN; review correction loop and PR4 commit.
+- [x] Run focused and full affected crate gates plus isolated browser viewport/input/history scenarios GREEN; review correction loop and PR4 commit.
 
 ## Final validation and delivery boundaries
 
-- [ ] Run fmt, strict affected all-target Clippy, runtime/terminal/web-remote/App tests as warranted and boundary checks via the serialized gate:
+- [x] Run fmt, strict affected all-target Clippy, runtime/terminal/web-remote/App tests as warranted and boundary checks via the serialized gate:
 
 ```sh
 RUST_TEST_THREADS=1 python3 /private/tmp/deppy-audit-nine-pr-20261004/cargo_gate.py --batch '[["test","--offline","--locked","-q","-p","web-remote"],["fmt","--all","--","--check"]]'
 ```
 
-- [ ] Confirm git diff --check, PR-unit commit SHAs, audit acceptance progress and handoff exact next commands.
-- [ ] Report actual executed tests and remaining real iPhone/Android validation explicitly. No Deppy launch/restart, no release packaging or push in this task.
+- [x] Confirm git diff --check, PR-unit commit SHAs, audit acceptance progress and handoff exact next commands.
+- [x] Record actual executed tests and remaining real iPhone/Android validation explicitly. No Deppy launch/restart, no release packaging or push in this task.
+
+Final evidence: terminal130 (4 ignored), session76, runtime377, Web349 unit (1 ignored) plus20 default integration, App2809 (38 ignored), vendored terminal202 (1 ignored), and all7 explicitly executed Chrome wrappers passed. Browser assertions: reading180/history89/readability113/UI281 and sequence-limit216; runner failure regressions2 passed. Real authenticated two-WebSocket/temporary-PTY independent-history regression passed. Strict all-target Clippy for all5 affected packages, workspace fmt and boundary check passed in the final serialized gate. Native iPhone/Android installed-PWA testing remains unexecuted; optional Ghostty feature build remains unexecuted because Zig is unavailable. Full commands/results and intermediate failed gates are recorded in the handoff and audit.

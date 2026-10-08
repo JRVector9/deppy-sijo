@@ -58,18 +58,19 @@ send({type: 'direct_key', session, key: 'up', ctrl: false, alt: false, shift: fa
 
 **Files:** web-remote protocol/dashboard/ws_api, runtime resize handling and snapshots as needed; shell ownership UI and settled geometry.
 
-- [ ] Execute RED tests for one owner per session, competing sockets, native desired size restoration, disconnect/unwatch/workspace invalidation, rotation/keyboard changes, and no repeated identical resizes.
-- [ ] Implement an explicit lease with bounds and status; exact response fields are coordinated before UI integration.
+- [x] Execute RED tests for one owner per session, competing sockets, native desired size restoration, disconnect/unwatch/workspace invalidation, rotation/keyboard changes, and no repeated identical resizes.
+- [x] Implement an explicit lease with bounds and status; exact response fields are coordinated before UI integration.
 
 ```js
-send({type: 'resize_control', session, action: 'acquire'});
-send({type: 'resize', session, cols: 40, rows: 24});
-send({type: 'resize_control', session, action: 'release'});
+send({type: 'resize_control', session, action: 'acquire', request: 1});
+send({type: 'resize', session, request: 1, cols: 40, rows: 24});
+send({type: 'resize_control', session, action: 'release', request: 2});
+// terminal_control echoes request, owned and reason; resize waits for owned=true.
 // cols/rows derive from measured cells and available stage; debounce before send.
 ```
 
-- [ ] Native layout records desired dimensions while remote owns geometry; release restores native desire. Socket/session cleanup must release safely; request a keyframe after geometry changes. No ownership means display-only preserved host grid.
-- [ ] Run focused ownership/runtime/browser tests GREEN; root review, corrections, handoff and PR3 commit.
+- [x] Native layout records desired dimensions while remote owns geometry; release restores native desire. Socket/session cleanup must release safely; request a keyframe after geometry changes. No ownership means display-only preserved host grid.
+- [x] Run focused ownership/runtime/browser tests GREEN; root review, corrections, handoff and PR3 commit.
 
 ## PR4: Selection, reading mode, search and independent history
 

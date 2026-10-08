@@ -38687,6 +38687,9 @@ fn event_session(event: &runtime::RuntimeEvent) -> Option<runtime::SessionId> {
         | runtime::RuntimeEvent::ViewportTracked { session, .. }
         | runtime::RuntimeEvent::ResizeApplied { session, .. }
         | runtime::RuntimeEvent::ResizeFailed { session, .. }
+        | runtime::RuntimeEvent::ResizeDeferred { session, .. }
+        | runtime::RuntimeEvent::TerminalControlChanged { session, .. }
+        | runtime::RuntimeEvent::TerminalControlResult { session, .. }
         | runtime::RuntimeEvent::SessionExited { session, .. }
         | runtime::RuntimeEvent::SessionStatusChanged { session, .. }
         | runtime::RuntimeEvent::PtyInputPressure { session, .. }

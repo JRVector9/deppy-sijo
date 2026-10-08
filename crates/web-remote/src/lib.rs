@@ -35,6 +35,7 @@ pub mod push;
 pub mod relay;
 pub mod relay_client;
 pub mod repository;
+mod resize_control;
 pub mod session_core;
 pub mod static_srv;
 pub mod upload;
@@ -1196,6 +1197,214 @@ mod tests {
 
         drop(ws);
         server.shutdown();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ws_resize_control_real_worker_correlates_owner_and_actual_keyframes() {
+        use runtime::{RuntimeCommandSink as _, RuntimeEventStream as _};
+        struct NoSecrets;
+        impl runtime::RuntimeSecretResolver for NoSecrets {
+            fn resolve(&self, _: &str) -> anyhow::Result<runtime::RuntimeSecret> {
+                anyhow::bail!("no test credentials")
+            }
+        }
+        let directory =
+            std::env::temp_dir().join(format!("deppy-pwa-ws-control-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let db_path = directory.join("metadata.sqlite3");
+        let db = storage::Db::open(&db_path).unwrap();
+        let workspace_id = db
+            .create_workspace("PWA websocket control fixture")
+            .unwrap();
+        drop(db);
+        let mut worker = runtime::InProcessRuntimeClient::try_new_with_resolver(
+            5,
+            Arc::new(NoSecrets),
+            directory.join("logs"),
+            secret::RedactionService::new(),
+            Some(runtime::PersistConfig {
+                db_path,
+                workspace_id,
+            }),
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+        let events = worker.subscribe();
+        worker
+            .send_command(runtime::RuntimeCommand::SpawnAgent {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+                agent_config_id: None,
+                command: "/bin/cat".into(),
+                args: Vec::new(),
+                env_plain: Vec::new(),
+                env_secrets: Vec::new(),
+                waiting_regex: None,
+                approval_regex: None,
+                error_regex: None,
+                done_regex: None,
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let uuid = loop {
+            if let Some(uuid) = events.drain().iter().find_map(|event| match event {
+                runtime::RuntimeEvent::MuxUpdated { snapshot } => snapshot
+                    .tabs
+                    .iter()
+                    .flat_map(|tab| &tab.panes)
+                    .find_map(|pane| pane.persistent_session_id.clone()),
+                _ => None,
+            }) {
+                break uuid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "real websocket PTY spawn timed out"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let server = start(None);
+        let captured: Arc<Mutex<Vec<runtime::RuntimeCommand>>> = Arc::default();
+        let counted = Arc::clone(&captured);
+        let sink = worker.command_sink().unwrap();
+        let dashboard = server.core.dashboard();
+        dashboard.set_runtime_binding(
+            worker.subscribe_with_wake_background(dashboard.wake_fn()),
+            Some(Arc::new(move |command| {
+                counted.lock().unwrap().push(command.clone());
+                sink(command);
+            })),
+        );
+        let read_control = |ws: &mut WebSocket<TcpStream>, request: u32, reason: &str| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let text = read_frame_of_type(ws, "terminal_control", remaining)
+                    .expect("correlated terminal control reply timed out");
+                let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if frame["request"] == request && frame["reason"] == reason {
+                    break frame;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "unexpected control reply: {text}"
+                );
+            }
+        };
+        let read_geometry = |ws: &mut WebSocket<TcpStream>, cols: u16, rows: u16| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let text = read_frame_of_type(ws, "viewport", remaining)
+                    .expect("actual resized keyframe timed out");
+                let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if frame["cols"] == cols && frame["rows"] == rows {
+                    assert_eq!(
+                        frame["keyframe"], true,
+                        "first actual geometry frame must be full: {text}"
+                    );
+                    break;
+                }
+                assert!(Instant::now() < deadline, "unexpected geometry: {text}");
+            }
+        };
+        let mut ws = ws_client_authed(server.local_addr());
+        send_text(
+            &mut ws,
+            &format!(r#"{{"type":"watch","session":"{uuid}"}}"#),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !captured.lock().unwrap().iter().any(|command| {
+            matches!(
+                command,
+                runtime::RuntimeCommand::SetRemoteViewing { viewing: true, .. }
+            )
+        }) {
+            assert!(
+                Instant::now() < deadline,
+                "fresh membership/watch did not establish lease"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        read_geometry(&mut ws, 80, 24);
+        send_text(
+            &mut ws,
+            &format!(
+                r#"{{"type":"resize_control","session":"{uuid}","action":"acquire","request":1}}"#
+            ),
+        );
+        assert_eq!(read_control(&mut ws, 1, "owned")["owned"], true);
+        let mut observer = ws_client_authed(server.local_addr());
+        send_text(
+            &mut observer,
+            &format!(r#"{{"type":"watch","session":"{uuid}"}}"#),
+        );
+        send_text(
+            &mut observer,
+            &format!(
+                r#"{{"type":"resize_control","session":"{uuid}","action":"acquire","request":1}}"#
+            ),
+        );
+        assert_eq!(read_control(&mut observer, 1, "in_use")["owned"], false);
+        send_text(
+            &mut ws,
+            &format!(r#"{{"type":"resize","session":"{uuid}","request":1,"cols":40,"rows":6}}"#),
+        );
+        assert_eq!(read_control(&mut ws, 1, "owned")["owned"], true);
+        // Reading the control ACK first makes reversed viewport/ACK ordering fail.
+        read_geometry(&mut ws, 40, 6);
+        send_text(
+            &mut ws,
+            &format!(
+                r#"{{"type":"resize_control","session":"{uuid}","action":"release","request":2}}"#
+            ),
+        );
+        assert_eq!(read_control(&mut ws, 2, "released")["owned"], false);
+        read_geometry(&mut ws, 80, 24);
+        let resized = captured
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|command| {
+                matches!(
+                    command,
+                    runtime::RuntimeCommand::TerminalControl {
+                        request: runtime::TerminalControlRequest::Resize { .. },
+                        ..
+                    }
+                )
+            })
+            .count();
+        send_text(
+            &mut ws,
+            &format!(r#"{{"type":"resize","session":"{uuid}","request":1,"cols":50,"rows":8}}"#),
+        );
+        send_text(&mut ws, r#"{"type":"request_keyframe"}"#);
+        read_geometry(&mut ws, 80, 24);
+        assert_eq!(
+            captured
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|command| matches!(
+                    command,
+                    runtime::RuntimeCommand::TerminalControl {
+                        request: runtime::TerminalControlRequest::Resize { .. },
+                        ..
+                    }
+                ))
+                .count(),
+            resized,
+            "old acquire geometry escaped release guard"
+        );
+        drop(observer);
+        drop(ws);
+        server.shutdown();
+        worker.shutdown();
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     /// P5d: 제어 키는 시청 중 세션에만 WriteInput으로 전달되고, 비시청 세션·

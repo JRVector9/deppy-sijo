@@ -409,7 +409,6 @@ mod tests {
             "if (viewer.watching !== endedSession) return;",
             "queueMicrotask(() => {",
             "let pointerActive = false;",
-            "repeated = repeated || pointerActive;",
             "if (s.id && !s.exited)",
             "else if (!s.id) {",
             "if (known && !known.exited) {",

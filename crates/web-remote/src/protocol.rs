@@ -25,6 +25,13 @@ use serde::{Deserialize, Serialize};
 /// v5: explicit direct text and named keys; resize ownership and local history contracts.
 pub const PROTOCOL_VERSION: u32 = 5;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResizeControlAction {
+    Acquire,
+    Release,
+}
+
 /// 클라이언트 → 서버.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -94,6 +101,17 @@ pub enum ClientMsg {
     /// 초과는 앱이 거부하며 notice로 알린다. `workspace`는 프레임이 이미 폰에 준 워크스페이스
     /// id(안정 문자열 — 세션 u64와 달리 매핑 불필요)다.
     Switch { workspace: String },
+    ResizeControl {
+        session: String,
+        action: ResizeControlAction,
+        request: std::num::NonZeroU32,
+    },
+    Resize {
+        session: String,
+        request: std::num::NonZeroU32,
+        cols: u16,
+        rows: u16,
+    },
 }
 
 impl ClientMsg {
@@ -253,6 +271,12 @@ pub enum ServerMsg {
     },
     /// 인증 실패 등 — 직후 close.
     Error { message: String },
+    TerminalControl {
+        session: String,
+        request: u32,
+        owned: bool,
+        reason: &'static str,
+    },
 }
 
 impl ServerMsg {
@@ -405,6 +429,28 @@ pub fn encode_viewport(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resize_control_wire_requires_nonzero_request_and_explicit_action() {
+        for text in [
+            r#"{"type":"resize_control","session":"uuid","action":"acquire","request":1}"#,
+            r#"{"type":"resize_control","session":"uuid","action":"release","request":4294967295}"#,
+            r#"{"type":"resize","session":"uuid","request":1,"cols":40,"rows":6}"#,
+        ] {
+            assert!(
+                ClientMsg::parse(text).is_some(),
+                "explicit correlated control wire: {text}"
+            );
+        }
+        for text in [
+            r#"{"type":"resize_control","session":"uuid","action":"acquire"}"#,
+            r#"{"type":"resize_control","session":"uuid","action":"acquire","request":0}"#,
+            r#"{"type":"resize_control","session":"uuid","action":"renew","request":1}"#,
+            r#"{"type":"resize","session":"uuid","request":0,"cols":40,"rows":6}"#,
+        ] {
+            assert!(ClientMsg::parse(text).is_none());
+        }
+    }
 
     #[test]
     fn direct_terminal_input_wire_accepts_explicit_text_and_keys() {

@@ -46,6 +46,7 @@ impl ResizeFailure {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ResizeDecision {
     Apply,
+    Deferred,
     Replay(Result<ResizeStamp, ResizeFailure>),
 }
 
@@ -53,7 +54,7 @@ pub(crate) enum ResizeDecision {
 pub(crate) struct ResizeRecord {
     pub token: ResizeToken,
     pub target: (u16, u16),
-    pub result: Result<ResizeStamp, ResizeFailure>,
+    pub result: Option<Result<ResizeStamp, ResizeFailure>>,
     pub stamp: Option<ResizeStamp>,
 }
 
@@ -67,7 +68,7 @@ impl ResizeRecord {
         Self {
             token,
             target,
-            result,
+            result: Some(result),
             stamp,
         }
     }
@@ -81,7 +82,9 @@ impl ResizeRecord {
                 Ok(())
             }
             ResizeDecision::Replay(Err(reason)) => Err(reason),
-            ResizeDecision::Replay(Ok(_)) => Err(ResizeFailure::Conflict),
+            ResizeDecision::Replay(Ok(_)) | ResizeDecision::Deferred => {
+                Err(ResizeFailure::Conflict)
+            }
         }
     }
 
@@ -106,10 +109,13 @@ impl ResizeRecord {
             if target != self.target {
                 return ResizeDecision::Replay(Err(ResizeFailure::Conflict));
             }
-            if self.result.is_err_and(ResizeFailure::retryable) {
+            let Some(result) = self.result else {
+                return ResizeDecision::Deferred;
+            };
+            if result.is_err_and(ResizeFailure::retryable) {
                 return ResizeDecision::Apply;
             }
-            return ResizeDecision::Replay(self.result);
+            return ResizeDecision::Replay(result);
         }
         ResizeDecision::Apply
     }
@@ -138,9 +144,9 @@ mod tests {
         let record = record();
         assert_eq!(
             record.classify(record.token, record.target),
-            ResizeDecision::Replay(record.result)
+            ResizeDecision::Replay(record.result.unwrap())
         );
-        assert_eq!(record.stamp, record.result.ok());
+        assert_eq!(record.stamp, record.result.unwrap().ok());
     }
     #[test]
     fn tracked_resize는_이전세대와_같은세대_다른크기를_거부한다() {
@@ -184,15 +190,15 @@ mod tests {
     #[test]
     fn tracked_resize의_부분실패는_같은_token으로_재적용할_수_있다() {
         let mut record = record();
-        record.result = Err(ResizeFailure::Pty);
+        record.result = Some(Err(ResizeFailure::Pty));
         assert_eq!(
             record.classify(record.token, record.target),
             ResizeDecision::Apply
         );
-        record.result = Err(ResizeFailure::CounterExhausted);
+        record.result = Some(Err(ResizeFailure::CounterExhausted));
         assert_eq!(
             record.classify(record.token, record.target),
-            ResizeDecision::Replay(record.result)
+            ResizeDecision::Replay(record.result.unwrap())
         );
     }
 

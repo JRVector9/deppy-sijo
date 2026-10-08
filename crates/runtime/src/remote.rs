@@ -2897,14 +2897,14 @@ mod tests {
 
     #[test]
     fn v12_v13_peer_is_rejected_at_hello_before_event_decode() {
-        for version in [10, 12, 13, 17, 18, 19, 20, 21, 23] {
+        for version in [10, 12, 13, 17, 18, 19, 20, 21, 23, 24] {
             let old = ClientHello {
                 magic: PROTO_MAGIC,
                 proto_version: version,
                 features: CLIENT_FEATURES,
                 token: b"irrelevant".to_vec(),
             };
-            assert_eq!(PROTO_VERSION, 24);
+            assert_eq!(PROTO_VERSION, 25);
             assert!(!client_hello_matches_protocol(&old));
         }
     }
@@ -3750,6 +3750,9 @@ mod tests {
             RuntimeEvent::ViewportTracked { .. } => "ViewportTracked",
             RuntimeEvent::EnvironmentApplied { .. } => "EnvironmentApplied",
             RuntimeEvent::InputAdmitted { .. } => "InputAdmitted",
+            RuntimeEvent::TerminalControlChanged { .. } => "TerminalControlChanged",
+            RuntimeEvent::TerminalControlResult { .. } => "TerminalControlResult",
+            RuntimeEvent::ResizeDeferred { .. } => "ResizeDeferred",
             RuntimeEvent::SessionInputSubmitted { .. } => "SessionInputSubmitted",
         }
     }

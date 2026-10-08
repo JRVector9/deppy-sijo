@@ -318,6 +318,9 @@ body[data-view="shell"] .brand .status { min-height: 28px; }
 .viewer-font-controls .m-menu-steps button { min-height: 44px; }
 .viewer-font-controls button:disabled { opacity: 0.45; cursor: default; }
 .viewer-menu .m-menu-toggle { min-height: 44px; }
+.viewer-resize-status { margin: 0 6px 8px; color: var(--m-muted); font-size: 11px; line-height: 1.5; }
+#viewer-resize-control[aria-pressed="true"] { color: var(--m-text); background: var(--m-panel-2); }
+#viewer-resize-control:disabled { opacity: 0.45; cursor: default; }
 .viewer-controls {
   padding: 6px max(8px, env(safe-area-inset-right))
     max(6px, env(safe-area-inset-bottom)) max(8px, env(safe-area-inset-left));

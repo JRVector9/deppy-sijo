@@ -96,7 +96,9 @@ impl RelayMessageAdapter {
         match message {
             // protocol-v3 페어링 토큰은 loopback 전송의 것이다. Relay 채널에서 이 메시지를
             // 받아 주면 두 인증 체계가 서로를 대체할 수 있게 된다.
-            ClientMsg::Auth { .. } => None,
+            ClientMsg::Auth { .. } | ClientMsg::ResizeControl { .. } | ClientMsg::Resize { .. } => {
+                None
+            }
             ClientMsg::Watch { .. } | ClientMsg::Unwatch | ClientMsg::RequestKeyframe => {
                 Some(RelayAction::View)
             }
@@ -144,6 +146,7 @@ impl RelayMessageAdapter {
             return false;
         }
         match message {
+            ServerMsg::TerminalControl { .. } => false,
             ServerMsg::Approvals { .. } => self.permissions.allows(RelayAction::Approval),
             ServerMsg::Welcome { .. }
             | ServerMsg::Dashboard { .. }

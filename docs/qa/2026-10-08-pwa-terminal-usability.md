@@ -75,9 +75,9 @@ Blink의 공식 사용 안내는 글자 크기 핀치, 선택 복사, Ctrl/Alt �
 | PR 단위 | 우선 개선 | 병렬 담당 | 완료 조건 | 현재 상태 |
 | --- | --- | --- | --- | --- |
 | 1 | 고정15px/12–24px 설정, 로컬 grid 이동, 명시적 전체 맞춤, 키보드 메뉴 위치 | renderer + input_ui | 원격180열/좁은 화면에서 글자 크기와 Unicode 좌표, viewport 메뉴 검증 | 커밋27186086 |
-| 2 | 직접 입력/IME/붙여넣기/제어 키 | input_ui + backend | 정확한 세션과 실시간 터미널 모드, 중복/재연결 입력 방지 | 검증·최종 재리뷰 완료 |
-| 3 | 단일 resize 제어권과 실제 PTY 행·열 동기화 | backend + input_ui | 경쟁 소켓/네이티브 resize 복원/회전·키보드·연결 정리 검증 | PR2 이후 |
-| 4 | 선택·복사·검색/별도 읽기 모드, 연결별 이력 위치 | renderer + backend + input_ui | 네이티브 스크롤 불변, 새 출력 시 읽기 위치 유지 | renderer 격리 개발·리뷰 중, 통합은 PR3 이후 |
+| 2 | 직접 입력/IME/붙여넣기/제어 키 | input_ui + backend | 정확한 세션과 실시간 터미널 모드, 중복/재연결 입력 방지 | 커밋fcfbbfd1 |
+| 3 | 단일 resize 제어권과 실제 PTY 행·열 동기화 | backend + input_ui | 경쟁 소켓/네이티브 resize 복원/회전·키보드·연결 정리 검증 | 구현·검증 완료, 커밋 직전 |
+| 4 | 선택·복사·검색/별도 읽기 모드, 연결별 이력 위치 | renderer + backend + input_ui | 네이티브 스크롤 불변, 새 출력 시 읽기 위치 유지 | renderer 읽기 위치 확장 격리 개발, 통합은 PR3 이후 |
 
 각 담당자는 독점 파일만 수정하며 root가 실제 코드 리뷰·검증 후 PR 단위로 커밋한다. 현재 요청에는 앱 재실행과 배포가 포함되지 않는다. 실기기 iPhone/Android 검증은 자동 Chromium 검증과 구분해 기록한다.
 
@@ -93,3 +93,11 @@ Blink의 공식 사용 안내는 글자 크기 핀치, 선택 복사, Ctrl/Alt �
 - 브라우저152 assertions와 기존 모바일 흐름, 마지막 두 Chrome Rust wrapper가 통과했다. 실제 임시 PTY의 cursor/paste mode와 출력 폭주 회귀를 검증했다. 최종 Rust gate에서 runtime362/web323(1ignored), 앱 테스트 대상 컴파일·strict Clippy·fmt·boundary가 통과했다. 앞선 terminal121(4ignored)/session76 전체 검증 후 해당 코드는 바뀌지 않았다.
 - 리뷰 지적은 원자적 runtime source/sink 교체, 세대별 Relay·기존 입력 전송/정리, 입력 직전 bounded mode refresh, 조회의 저장 상태 변경 방지, IME 인터럽트·포커스 이탈·pointer 이벤트 순서다. 각 회귀 RED를 재현하고 수정했다. 서버 조회·UI pointer의 마지막 집중 재리뷰 모두 CONCLUSION: OK다.
 - JSON 프로토콜5, runtime wire24로 갱신했다. 재연결 직접 입력 재전송은 없으며, 조회는 mux 이벤트만 보내 저장된 시작 배치를 변경하지 않는다.
+
+### PR3 구현과 검증
+
+- 세션별 실제 PTY 크기는 한 연결만 제어한다. 명시적 획득·해제와 전체 WebSocket 수명 동안 증가하는 요청 번호를 사용하며, 워커의 owner/epoch 확인 응답 전에는 크기를 보내지 않는다. lease15초·갱신5초, 읽기·축소·과거 열람 중에는 자동 크기 변경을 멈춘다.
+- 고정 셀 크기와 실제 stage 영역으로 행·열을 계산하고200ms 안정화 뒤 중복 크기를 제거한다. 모바일 제어 중 Mac의 최신 희망 크기를 기록하고 해제·만료 시 복원하며 모바일 크기로 Mac 설정을 덮지 않는다. runtime wire24→25, JSON5에 명시적 resize 계약을 추가했다.
+- runtime/native 리뷰의 만료 재확인·복원 실패 시 희망 크기 보존·tracked 재시도·조용한 복원 화면·아직 생성되지 않은 세션 뷰 문제를 모두 수정했다. 서버의 같은 UUID 인스턴스 교체와 취소/해제 완료 응답, UI 읽기 중단·축소 해제 재평가도 RED/GREEN 후 집중 재리뷰OK다.
+- 실제 인증 WebSocket/임시 PTY에서80×24→40×6→80×24 keyframe과 경쟁 연결 거절을 확인했다. 실제 두 워커의 전송 유실 재시도·연결0 정리·이전 워커 sink 정리도 통과했다. 전체 검증은 Web336(1ignored)+기존 통합20, runtime371, terminal121(4ignored), session76, native3/기존 trackedUI18, 앱 테스트 대상 컴파일, 모바일 UI226/기존 흐름 Chrome wrapper 각각1PASS다. 최종 strict runtime/web/App all-targets Clippy·fmt·boundary도 통과했다.
+- 전체 검증에서 이전 코드 문자열을 확인하던 중복 검사1줄을 제거했다. 기존 입력 fixture의 cat 출력/가상 프롬프트 경쟁은6바이트 제어문자·만료되지 않은 deadline으로 재현했고, fixture 출력만 차단하여 원래 입력 가드·assertion·deadline을 보존했다. 수정 후 집중10회 및 전체 runtime371이 통과했다.

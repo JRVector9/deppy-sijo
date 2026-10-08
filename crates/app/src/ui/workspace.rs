@@ -2550,6 +2550,7 @@ struct TrackedResize {
     token: runtime::ResizeToken,
     target: (u16, u16),
     admitted: bool,
+    deferred: bool,
     applied: Option<runtime::ResizeStamp>,
     retry_at: Option<std::time::Instant>,
     retries: u8,
@@ -2579,6 +2580,8 @@ struct SessionView {
     /// stable 화면을 유지하는 유계 fence. target shape 후보만 latest-wins로 받는다.
     resize_presentation: Option<ResizePresentationFence>,
     resize_request: Option<TrackedResize>,
+    remote_resize_controlled: bool,
+    remote_resize_epoch: u64,
     resize_desired: Option<(u16, u16)>,
     resize_watermark: Option<runtime::ResizeStamp>,
     resize_generation: u64,
@@ -2624,7 +2627,11 @@ impl SessionView {
     ) -> Option<runtime::ResizeToken> {
         self.set_resize_desired(target);
         if let Some(request) = &self.resize_request {
-            if request.admitted && request.applied.is_none() {
+            if request.admitted
+                && !request.deferred
+                && !self.remote_resize_controlled
+                && request.applied.is_none()
+            {
                 return None;
             }
             if request.target == target && !request.admitted {
@@ -2657,13 +2664,16 @@ impl SessionView {
             token,
             target,
             admitted: false,
+            deferred: false,
             applied: None,
             retry_at: None,
             retries: 0,
             retry_pending: None,
             retry_delivery: ProtocolRetryBackoff::default(),
         });
-        self.arm_or_retarget_resize_presentation(target.0, target.1, std::time::Instant::now());
+        if !self.remote_resize_controlled {
+            self.arm_or_retarget_resize_presentation(target.0, target.1, std::time::Instant::now());
+        }
         Some(token)
     }
 
@@ -2673,10 +2683,60 @@ impl SessionView {
         {
             self.resize_tracking_started = true;
             request.admitted = true;
-            if request.applied.is_none() {
+            if request.applied.is_none() && !request.deferred && !self.remote_resize_controlled {
                 request.retry_at = Some(now + std::time::Duration::from_secs(2));
             }
         }
+    }
+
+    fn remote_control_changed(&mut self, state: runtime::TerminalControlState) {
+        if state.epoch < self.remote_resize_epoch {
+            return;
+        }
+        self.remote_resize_epoch = state.epoch;
+        self.remote_resize_controlled = state.owner.is_some();
+        self.resize_recovery = None;
+        self.resize_owner_retries = 0;
+        if self.remote_resize_controlled {
+            if self
+                .resize_request
+                .as_ref()
+                .is_some_and(|request| request.applied.is_some())
+            {
+                self.resize_request = None;
+            }
+            self.resize_presentation = None;
+            self.pending_snapshot = None;
+            if let Some(request) = self.resize_request.as_mut() {
+                request.retry_at = None;
+            }
+        } else if let Some(request) = self.resize_request.as_mut()
+            && request.deferred
+            && request.applied.is_none()
+        {
+            request.retry_at = Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
+        }
+    }
+
+    fn resize_deferred(&mut self, token: runtime::ResizeToken, target: (u16, u16)) -> bool {
+        if !self.remote_resize_controlled {
+            return false;
+        }
+        let Some(request) = self.resize_request.as_mut().filter(|request| {
+            request.token == token && request.target == target && request.applied.is_none()
+        }) else {
+            return false;
+        };
+        request.admitted = true;
+        request.deferred = true;
+        request.retry_at = None;
+        request.retry_pending = None;
+        request.retry_delivery = ProtocolRetryBackoff::default();
+        self.resize_tracking_started = true;
+        self.resize_recovery = None;
+        self.resize_presentation = None;
+        self.pending_snapshot = None;
+        true
     }
 
     fn observe_resize_applied(
@@ -2708,6 +2768,7 @@ impl SessionView {
         }
         let first = request.applied.is_none();
         request.applied = Some(stamp);
+        request.deferred = false;
         request.retry_at = None;
         if first && let Some(fence) = self.resize_presentation.as_mut() {
             fence.started_at = now;
@@ -2724,6 +2785,9 @@ impl SessionView {
         now: std::time::Instant,
     ) -> bool {
         let Some(stamp) = stamp else {
+            if self.remote_resize_controlled {
+                return true;
+            }
             return !self.resize_tracking_started && self.resize_request.is_none();
         };
         if shape != (stamp.cols, stamp.rows) {
@@ -2734,6 +2798,11 @@ impl SessionView {
             .is_some_and(|old| stamp.epoch < old.epoch || stamp.owner_epoch < old.owner_epoch)
         {
             return false;
+        }
+        if self.remote_resize_controlled {
+            self.resize_tracking_started = true;
+            self.resize_watermark = Some(stamp);
+            return true;
         }
         if self.resize_request.is_some() {
             return self.observe_resize_applied(stamp, now);
@@ -2768,6 +2837,9 @@ impl SessionView {
     }
 
     fn take_resize_owner_retry(&mut self, stamp: runtime::ResizeStamp) -> bool {
+        if self.remote_resize_controlled {
+            return false;
+        }
         let Some(rejected) = self.resize_recovery else {
             return false;
         };
@@ -2783,6 +2855,9 @@ impl SessionView {
         &mut self,
         now: std::time::Instant,
     ) -> Option<(runtime::ResizeToken, (u16, u16))> {
+        if self.remote_resize_controlled {
+            return None;
+        }
         let request = self.resize_request.as_mut()?;
         if request.retry_pending.is_some() || request.retry_at.is_none_or(|due| now < due) {
             return None;
@@ -3461,12 +3536,40 @@ impl WorkspaceUi {
         true
     }
 
+    fn finish_resize_deferred(
+        &mut self,
+        session: SessionId,
+        token: runtime::ResizeToken,
+        cols: u16,
+        rows: u16,
+    ) {
+        if !self
+            .sessions
+            .get_mut(&session)
+            .is_some_and(|view| view.resize_deferred(token, (cols, rows)))
+        {
+            return;
+        }
+        let keys = self
+            .resize_delivery_rollbacks
+            .iter()
+            .filter(|(_, rollback)| rollback.session == session && rollback.token == token)
+            .map(|(key, _)| *key)
+            .collect::<Vec<_>>();
+        for key in keys {
+            self.resize_delivery_rollbacks.remove(&key);
+            self.split_final_resize_pending.remove(&key);
+        }
+        self.split_final_resize_sessions.remove(&session);
+        self.pending_resize_target.remove(&session);
+    }
+
     fn finish_resize_viewport(&mut self, session: SessionId, stamp: runtime::ResizeStamp) {
         // 다른 창/legacy resize가 실제 격자를 바꾸면 이전 queue 크기로 중복 제거하지 않는다.
         if self
             .sessions
             .get(&session)
-            .is_some_and(|view| view.resize_request.is_none())
+            .is_some_and(|view| !view.remote_resize_controlled && view.resize_request.is_none())
             && self
                 .sent_sizes
                 .get(&session)
@@ -5514,6 +5617,23 @@ impl WorkspaceUi {
                 RuntimeEvent::AgentSpawned { .. } | RuntimeEvent::AgentSpawnResolved { .. } => {}
                 RuntimeEvent::ResourceUsage { .. }
                 | RuntimeEvent::ScrollbackLimitApplied { .. } => {}
+                RuntimeEvent::TerminalControlChanged { session, state, .. } => {
+                    if self.session_alive(*session) || self.sessions.contains_key(session) {
+                        self.sessions
+                            .entry(*session)
+                            .or_default()
+                            .remote_control_changed(*state);
+                    }
+                }
+                RuntimeEvent::ResizeDeferred {
+                    session,
+                    token,
+                    cols,
+                    rows,
+                } => {
+                    self.finish_resize_deferred(*session, *token, *cols, *rows);
+                }
+                RuntimeEvent::TerminalControlResult { .. } => {}
                 RuntimeEvent::ResizeApplied { session, stamp } => {
                     if let Some(view) = self.sessions.get_mut(session) {
                         view.observe_resize_applied(*stamp, std::time::Instant::now());
@@ -5864,6 +5984,23 @@ impl WorkspaceUi {
     pub fn apply_warm_events(&mut self, events: &[RuntimeEvent], catalog: &i18n::Catalog) {
         for event in events {
             match event {
+                RuntimeEvent::TerminalControlChanged { session, state, .. } => {
+                    if self.session_alive(*session) || self.sessions.contains_key(session) {
+                        self.sessions
+                            .entry(*session)
+                            .or_default()
+                            .remote_control_changed(*state);
+                    }
+                }
+                RuntimeEvent::ResizeDeferred {
+                    session,
+                    token,
+                    cols,
+                    rows,
+                } => {
+                    self.finish_resize_deferred(*session, *token, *cols, *rows);
+                }
+                RuntimeEvent::TerminalControlResult { .. } => {}
                 RuntimeEvent::ResizeApplied { session, stamp } => {
                     if let Some(view) = self.sessions.get_mut(session) {
                         view.observe_resize_applied(*stamp, std::time::Instant::now());
@@ -12601,6 +12738,236 @@ mod tests {
         view.resize_owner_retries = 2;
         ui.queue_terminal_resize_debounced(&egui::Context::default(), session, 110, 40);
         assert_eq!(ui.sessions[&session].resize_owner_retries, 0);
+    }
+
+    #[test]
+    fn native_remote_resize_review_acquire_retires_completed_request_for_quiet_tokenless_restore() {
+        let mut ui = WorkspaceUi::new();
+        let session = SessionId(66);
+        let now = std::time::Instant::now();
+        ui.queue_terminal_resize(session, 100, 30);
+        drain_protocol(&mut ui);
+        let view = ui.sessions.get_mut(&session).unwrap();
+        let token = view.resize_request.as_ref().unwrap().token;
+        view.observe_resize_applied(
+            runtime::ResizeStamp {
+                epoch: 1,
+                owner_epoch: 1,
+                token: Some(token),
+                cols: 100,
+                rows: 30,
+            },
+            now,
+        );
+        assert!(view.resize_request.as_ref().unwrap().applied.is_some());
+        view.remote_control_changed(runtime::TerminalControlState {
+            epoch: 1,
+            owner: Some([7; 16]),
+            lease_ms: 15_000,
+        });
+        assert!(view.accepts_resize_viewport(
+            Some(runtime::ResizeStamp {
+                epoch: 2,
+                owner_epoch: 1,
+                token: None,
+                cols: 40,
+                rows: 6
+            }),
+            (40, 6),
+            now
+        ));
+        view.remote_control_changed(runtime::TerminalControlState {
+            epoch: 2,
+            owner: None,
+            lease_ms: 0,
+        });
+        let restored = runtime::ResizeStamp {
+            epoch: 3,
+            owner_epoch: 1,
+            token: None,
+            cols: 100,
+            rows: 30,
+        };
+        assert!(
+            view.accepts_resize_viewport(Some(restored), (100, 30), now),
+            "single quiet restored frame must be presentable after fence was retired"
+        );
+        ui.finish_resize_viewport(session, restored);
+        assert_eq!(ui.sent_sizes.get(&session), Some(&(100, 30)));
+    }
+
+    #[test]
+    fn native_remote_resize_review_records_control_before_first_view_for_active_and_warm_sessions()
+    {
+        for warm in [false, true] {
+            let mut ui = WorkspaceUi::new();
+            let session = SessionId(41);
+            ui.mux = Some(split_mux_snapshot(0.5));
+            let event = RuntimeEvent::TerminalControlChanged {
+                session,
+                state: runtime::TerminalControlState {
+                    epoch: 1,
+                    owner: Some([7; 16]),
+                    lease_ms: 15_000,
+                },
+                status: runtime::TerminalControlStatus::Owned,
+            };
+            if warm {
+                ui.apply_warm_events(&[event], &catalog());
+            } else {
+                ui.handle_events(&[event], &catalog());
+            }
+            assert!(
+                ui.sessions
+                    .get(&session)
+                    .is_some_and(|view| view.remote_resize_controlled),
+                "live mux membership must retain early ownership"
+            );
+            let unknown = RuntimeEvent::TerminalControlChanged {
+                session: SessionId(999),
+                state: runtime::TerminalControlState {
+                    epoch: 1,
+                    owner: Some([7; 16]),
+                    lease_ms: 15_000,
+                },
+                status: runtime::TerminalControlStatus::Owned,
+            };
+            if warm {
+                ui.apply_warm_events(&[unknown], &catalog());
+            } else {
+                ui.handle_events(&[unknown], &catalog());
+            }
+            assert!(
+                !ui.sessions.contains_key(&SessionId(999)),
+                "unknown ids cannot grow view state"
+            );
+        }
+    }
+
+    #[test]
+    fn native_remote_resize_control_suppresses_geometry_retry_and_keeps_changed_desire() {
+        for warm in [false, true] {
+            let mut ui = WorkspaceUi::new();
+            let session = SessionId(66);
+            ui.sessions.entry(session).or_default();
+            let now = std::time::Instant::now();
+            ui.queue_terminal_resize(session, 100, 30);
+            drain_protocol(&mut ui);
+            let token = ui.sessions[&session].resize_request.as_ref().unwrap().token;
+            ui.sessions
+                .get_mut(&session)
+                .unwrap()
+                .resize_admitted(token, now);
+            let events = [
+                RuntimeEvent::TerminalControlChanged {
+                    session,
+                    state: runtime::TerminalControlState {
+                        epoch: 1,
+                        owner: Some([7; 16]),
+                        lease_ms: 15_000,
+                    },
+                    status: runtime::TerminalControlStatus::Owned,
+                },
+                RuntimeEvent::ResizeDeferred {
+                    session,
+                    token,
+                    cols: 100,
+                    rows: 30,
+                },
+            ];
+            if warm {
+                ui.apply_warm_events(&events, &catalog());
+            } else {
+                ui.handle_events(&events, &catalog());
+            }
+            let remote = runtime::ResizeStamp {
+                epoch: 2,
+                owner_epoch: 1,
+                token: None,
+                cols: 40,
+                rows: 6,
+            };
+            assert!(
+                ui.sessions
+                    .get_mut(&session)
+                    .unwrap()
+                    .accepts_resize_viewport(Some(remote), (40, 6), now),
+                "mobile actual geometry must remain presentable while desktop target is deferred"
+            );
+            ui.finish_resize_viewport(session, remote);
+            assert_eq!(
+                ui.sent_sizes.get(&session),
+                Some(&(100, 30)),
+                "remote actual geometry must not retrigger the desktop resize loop"
+            );
+            assert!(
+                ui.sessions
+                    .get_mut(&session)
+                    .unwrap()
+                    .resize_retry_due(now + std::time::Duration::from_secs(10))
+                    .is_none()
+            );
+            assert!(!ui.queue_terminal_resize(session, 100, 30));
+            assert!(ui.queue_terminal_resize(session, 120, 35));
+            let intent = ui.take_protocol_intent().unwrap();
+            let RuntimeCommand::ResizeTracked {
+                token: changed,
+                cols: 120,
+                rows: 35,
+                ..
+            } = intent.command
+            else {
+                panic!("one changed native want");
+            };
+            assert!(changed.generation > token.generation);
+            let events = [RuntimeEvent::ResizeDeferred {
+                session,
+                token: changed,
+                cols: 120,
+                rows: 35,
+            }];
+            if warm {
+                ui.apply_warm_events(&events, &catalog());
+            } else {
+                ui.handle_events(&events, &catalog());
+            }
+            assert!(ui.resize_delivery_rollbacks.is_empty());
+            assert!(ui.split_final_resize_pending.is_empty());
+            assert!(ui.sessions[&session].resize_presentation.is_none());
+            let events = [RuntimeEvent::TerminalControlChanged {
+                session,
+                state: runtime::TerminalControlState {
+                    epoch: 2,
+                    owner: None,
+                    lease_ms: 0,
+                },
+                status: runtime::TerminalControlStatus::Released,
+            }];
+            if warm {
+                ui.apply_warm_events(&events, &catalog());
+            } else {
+                ui.handle_events(&events, &catalog());
+            }
+            let restored = runtime::ResizeStamp {
+                epoch: 3,
+                owner_epoch: 1,
+                token: Some(changed),
+                cols: 120,
+                rows: 35,
+            };
+            assert!(
+                ui.sessions
+                    .get_mut(&session)
+                    .unwrap()
+                    .accepts_resize_viewport(Some(restored), (120, 35), now)
+            );
+            ui.finish_resize_viewport(session, restored);
+            assert!(!ui.queue_terminal_resize(session, 120, 35));
+            assert!(
+                ui.queue_terminal_resize(session, 125, 36),
+                "normal native resizing resumes after release"
+            );
+        }
     }
 
     #[test]

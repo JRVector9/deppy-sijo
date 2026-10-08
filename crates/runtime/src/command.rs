@@ -505,6 +505,7 @@ pub(crate) fn runtime_command_retained_bytes(
         | RuntimeCommand::KillSession { .. }
         | RuntimeCommand::RestoreWorkspace
         | RuntimeCommand::RequestMuxSnapshot
+        | RuntimeCommand::TerminalControl { .. }
         | RuntimeCommand::SetWorkspaceState(_)
         | RuntimeCommand::SetUserStatusOverride { .. }
         | RuntimeCommand::SetTerminalCachePolicy { .. }
@@ -682,6 +683,7 @@ pub(crate) fn canonicalize_host_command(command: &mut RuntimeCommand) {
         | RuntimeCommand::KillSession { .. }
         | RuntimeCommand::RestoreWorkspace
         | RuntimeCommand::RequestMuxSnapshot
+        | RuntimeCommand::TerminalControl { .. }
         | RuntimeCommand::SetWorkspaceState(_)
         | RuntimeCommand::SetUserStatusOverride { .. }
         | RuntimeCommand::SetTerminalCachePolicy { .. }
@@ -953,6 +955,15 @@ pub(crate) fn validate_host_command(command: &RuntimeCommand) -> Result<(), Runt
                     .contains(requested)
             {
                 return Err(admission_error("runtime_scrollback_policy_invalid"));
+            }
+        }
+        RuntimeCommand::TerminalControl {
+            operation_id,
+            request,
+            ..
+        } => {
+            if *operation_id == 0 || !request.is_valid() {
+                return Err(admission_error("runtime_terminal_control_invalid"));
             }
         }
         RuntimeCommand::DurableEventBarrier { correlation_id } => {
@@ -1285,11 +1296,26 @@ pub enum RuntimeCommand {
     },
     /// Refresh authoritative UUID/session membership after a new subscription.
     RequestMuxSnapshot,
+    TerminalControl {
+        session: SessionId,
+        operation_id: u64,
+        request: crate::TerminalControlRequest,
+    },
 }
 
 impl std::fmt::Debug for RuntimeCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            RuntimeCommand::TerminalControl {
+                session,
+                operation_id,
+                request,
+            } => f
+                .debug_struct("TerminalControl")
+                .field("session", session)
+                .field("operation_id", operation_id)
+                .field("request", request)
+                .finish(),
             RuntimeCommand::RequestMuxSnapshot => f.write_str("RequestMuxSnapshot"),
             RuntimeCommand::WriteTerminalInput { session, input } => f
                 .debug_struct("WriteTerminalInput")
@@ -2568,6 +2594,7 @@ mod tests {
                 "SpawnAgentBeside",
                 "WriteTerminalInput",
                 "RequestMuxSnapshot",
+                "TerminalControl",
             ]
         );
     }

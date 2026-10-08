@@ -85,6 +85,231 @@ const usabilitySettle = () => new Promise((resolve) =>
 const usabilityById = (id) => document.getElementById(id);
 const usabilityFont = () => Number(usabilityById('viewer-canvas').getContext('2d').font.match(/([\d.]+)px/)[1]);
 
+async function runMobileResizeChecks() {
+  const button = usabilityById('viewer-resize-control');
+  const status = usabilityById('viewer-resize-status');
+  usabilityCheck(button && status, 'explicit mobile terminal size control and status must exist');
+  const all = () => mobileUsabilitySent.filter((frame) => frame.type === 'resize_control' || frame.type === 'resize');
+  let checkpoint = all().length;
+  const take = () => { const result = all().slice(checkpoint); checkpoint = all().length; return result; };
+  const sleep = (ms = 320) => new Promise((resolve) => setTimeout(resolve, ms));
+  const viewport = (width, height) => {
+    Object.assign(mobileUsabilityViewport, { width, height, offsetTop: 0, offsetLeft: 0 });
+    mobileUsabilityViewport.dispatchEvent(new Event('resize'));
+  };
+  const response = (request, owned, reason = owned ? 'owned' : 'released', session = 's-1', socket = mobileUsabilitySocket) =>
+    socket.message({ type: 'terminal_control', session, request, owned, reason });
+  const action = (name, session = 's-1') => {
+    button.click();
+    const sent = take();
+    usabilityCheck(sent.length === 1 && sent[0].type === 'resize_control' && sent[0].session === session
+      && sent[0].action === name && Number.isInteger(sent[0].request) && sent[0].request > 0,
+      `explicit ${name} sends one correlated control for ${session}`);
+    return sent[0].request;
+  };
+  const expectedGrid = () => {
+    const stage = usabilityById('viewer-stage');
+    const font = Number(usabilityById('viewer-font-size').textContent.replace('px', ''));
+    const canvas = usabilityById('viewer-canvas');
+    const measure = document.createElement('canvas').getContext('2d');
+    measure.font = canvas.getContext('2d').font;
+    const width = measure.measureText('M'.repeat(32)).width / 32;
+    const cols = Math.max(32, Math.min(400, Math.floor(stage.clientWidth / width)));
+    return { cols, rows: Math.max(2, Math.min(200, Math.floor(65536 / cols), Math.floor(stage.clientHeight / Math.ceil(font * 1.4)))) };
+  };
+  const expectResize = (request, message, session = 's-1') => {
+    const sent = take();
+    const size = expectedGrid();
+    usabilityCheck(sent.length === 1 && sent[0].type === 'resize' && sent[0].session === session
+      && sent[0].request === request && sent[0].cols === size.cols && sent[0].rows === size.rows,
+      `${message}: one configured-font stage resize`);
+    return sent[0];
+  };
+
+  const scrollbars = document.createElement('style');
+  scrollbars.textContent = '#viewer .viewer-wrap::-webkit-scrollbar { width:24px; height:24px; }';
+  document.head.append(scrollbars);
+  mobileUsabilityViewport.dispatchEvent(new Event('resize'));
+  await usabilitySettle();
+  usabilityCheck(document.querySelector('.viewer-wrap').offsetWidth > document.querySelector('.viewer-wrap').clientWidth,
+    'geometry echo regression exercises real layout scrollbars');
+  usabilityCheck(all().length === 0 && button.getAttribute('aria-pressed') === 'false', 'watch never auto-acquires terminal size');
+  if (globalThis.mobileResizeSequenceLimit) {
+    const firstRequest = action('acquire'); response(firstRequest, true); await sleep(); expectResize(firstRequest, 'bounded sequence first lease');
+    const releaseRequest = action('release'); response(releaseRequest, false);
+    const lastRequest = action('acquire'); response(lastRequest, true); await sleep(); expectResize(lastRequest, 'bounded sequence final lease');
+    usabilityCheck(lastRequest === mobileResizeSequenceLimit, 'bounded sequence reaches the maximum without wrap');
+    const exhaustedSocket = mobileUsabilitySocket;
+    button.click();
+    await usabilityWait(() => mobileUsabilitySocket !== exhaustedSocket && usabilityById('viewer-connection-label').textContent === '연결됨');
+    await sleep();
+    usabilityCheck(exhaustedSocket.readyState === 3 && take().length === 0,
+      'sequence exhaustion closes the owned socket without zero request or automatic reacquisition');
+    const freshRequest = action('acquire');
+    usabilityCheck(freshRequest === 1, 'only a fresh explicit action on a new socket starts a new sequence');
+    response(freshRequest, true); await sleep(); expectResize(freshRequest, 'fresh socket after sequence exhaustion');
+    const finalRelease = action('release'); response(finalRelease, false);
+    scrollbars.remove();
+    return;
+  }
+  let acquire = action('acquire');
+  usabilityCheck(button.getAttribute('aria-pressed') === 'false' && status.textContent.includes('요청'), 'pending request never claims ownership');
+  viewport(430, 932); await sleep();
+  usabilityCheck(take().length === 0, 'layout cannot resize before an authoritative grant');
+  response(acquire, true, 'owned', 's-2'); response(acquire + 1, true); await sleep();
+  usabilityCheck(take().length === 0 && button.getAttribute('aria-pressed') === 'false', 'wrong UUID and request cannot grant local resize permission');
+  response(acquire, false, 'in_use');
+  usabilityCheck(status.textContent.includes('다른') && button.getAttribute('aria-pressed') === 'false', 'denial is honestly view-only and explicitly retryable');
+  const denied = acquire;
+  acquire = action('acquire');
+  usabilityCheck(acquire > denied, 'request sequence increases after an explicit retry');
+  response(denied, true); await sleep();
+  usabilityCheck(take().length === 0, 'late rejected acquire grant cannot satisfy a newer request');
+  response(acquire, true); await sleep();
+  const first = expectResize(acquire, 'authoritative grant');
+  usabilityCheck(button.getAttribute('aria-pressed') === 'true', 'only a matching grant displays owned state');
+  for (const reason of ['owned', 'owned', 'invalid_size', 'resize_failed', 'owned']) response(acquire, true, reason);
+  mobileUsabilitySocket.message({ type: 'viewport', session: 's-1', keyframe: true,
+    cols: first.cols, rows: first.rows, lines: [], cursor: null, offset: 0 });
+  await sleep();
+  usabilityCheck(take().length === 0, 'renewal/error ACKs and actual geometry echoes cannot create resize feedback');
+
+  mobileUsabilitySocket.message({ type: 'viewport', session: 's-1', keyframe: true,
+    cols: 180, rows: 40, lines: [], cursor: { visible: true, row: 2, col: 6 }, offset: 0 });
+  await usabilitySettle();
+  const readingWrap = document.querySelector('.viewer-wrap');
+  readingWrap.scrollLeft = 120; readingWrap.scrollTop = 80;
+  readingWrap.dispatchEvent(new Event('scroll'));
+  viewport(844, 390); usabilityById('viewer-font-larger').click(); await sleep();
+  usabilityCheck(take().length === 0 && status.textContent.includes('일시정지') && !button.disabled,
+    'local reading suspends rotation/font resize and retains explicit release');
+  usabilityById('viewer-bottom').click(); await sleep(); expectResize(acquire, 'returning from local reading');
+  mobileUsabilitySocket.message({ type: 'viewport', session: 's-1', keyframe: false,
+    cols: 180, rows: 40, lines: [], cursor: null, offset: 20 });
+  viewport(430, 600); await sleep();
+  usabilityCheck(take().length === 0 && status.textContent.includes('일시정지'), 'historical viewport remains stable during layout changes');
+  usabilityById('viewer-bottom').click(); await sleep(80);
+  usabilityCheck(take().length === 0, 'return-to-current cannot resize until its historical viewport reaches offset zero');
+  mobileUsabilitySocket.message({ type: 'viewport', session: 's-1', keyframe: false,
+    cols: 180, rows: 40, lines: [], cursor: { visible: true, row: 2, col: 6 }, offset: 0 });
+  await sleep(); expectResize(acquire, 'current viewport resumes resize after historical reading');
+  viewport(500, 650); await sleep(70);
+  readingWrap.scrollLeft = 200; readingWrap.dispatchEvent(new Event('scroll')); await sleep();
+  usabilityCheck(take().length === 0, 'starting local reading cancels an already pending resize');
+  usabilityById('viewer-bottom').click(); await sleep(); expectResize(acquire, 'local reading transition explicitly resumes pending geometry');
+
+  const beforeOverviewRelease = action('release'); response(beforeOverviewRelease, false);
+  mobileUsabilitySocket.message({ type: 'viewport', session: 's-1', keyframe: true,
+    cols: 32, rows: 2, lines: [], cursor: null, offset: 0 });
+  await usabilitySettle();
+  const fittingFont = usabilityFont();
+  usabilityById('viewer-overview').click(); await usabilitySettle();
+  usabilityCheck(Math.abs(usabilityFont() - fittingFont) < 0.01, 'overview regression has scale one and unchanged stage metrics');
+  acquire = action('acquire'); response(acquire, true); await sleep();
+  usabilityCheck(take().length === 0, 'grant during fitting overview still suspends resize');
+  usabilityById('viewer-overview').click(); await sleep();
+  expectResize(acquire, 'leaving fitting overview explicitly schedules the first granted size');
+  viewport(550, 700); await sleep(70); usabilityById('viewer-overview').click(); await sleep();
+  usabilityCheck(take().length === 0, 'entering fitting overview cancels prior pending geometry');
+  usabilityById('viewer-overview').click(); await sleep(); expectResize(acquire, 'leaving fitting overview reevaluates pending geometry');
+  viewport(650, 720);
+  for (let index = 0; index < 3; index++) {
+    await sleep(80);
+    mobileUsabilitySocket.message({ type: 'viewport', session: 's-1', keyframe: false,
+      cols: 32, rows: 2, lines: [], cursor: null, offset: 0 });
+  }
+  await sleep(100);
+  expectResize(acquire, 'passive frames do not restart the geometry settle timer');
+
+  viewport(390, 600); await sleep(70); viewport(390, 470); await sleep(70); viewport(390, 360); await sleep(100);
+  usabilityCheck(take().length === 0, 'keyboard animation waits for 200ms settled geometry');
+  await sleep(170); expectResize(acquire, 'settled keyboard geometry');
+  viewport(844, 390); await sleep(70); viewport(932, 430); await sleep(); expectResize(acquire, 'settled rotation');
+  usabilityById('viewer-font-larger').click(); await sleep(); expectResize(acquire, 'font size change');
+  usabilityById('viewer-overview').click(); viewport(390, 600); await sleep();
+  usabilityCheck(take().length === 0 && status.textContent.includes('일시정지') && !button.disabled,
+    'overview suspends auto-resize without losing the release control');
+  usabilityById('viewer-font-larger').click(); await sleep();
+  usabilityCheck(take().length === 0, 'shrunk overview font metrics never resize the PTY');
+  usabilityById('viewer-overview').click(); await sleep(); expectResize(acquire, 'leaving overview uses configured font');
+  viewport(10000, 10000); await sleep();
+  const bounded = expectResize(acquire, 'huge viewport');
+  usabilityCheck(bounded.cols === 400 && bounded.rows === 163 && bounded.cols * bounded.rows <= 65536, 'mobile geometry honors dimensions and cell budget');
+  viewport(320, 140); await sleep();
+  const tiny = expectResize(acquire, 'tiny keyboard viewport');
+  usabilityCheck(tiny.cols >= 32 && tiny.rows >= 2, 'tiny stage still uses the protocol minimum geometry');
+
+  mobileUsabilitySocket.message({ type: 'input_pressure', session: 's-1', reason: 'queue_full', queued: 1 });
+  viewport(430, 844);
+  const release = action('release');
+  usabilityCheck(release > acquire && button.getAttribute('aria-pressed') === 'false', 'release stops local ownership immediately during queue pressure');
+  response(acquire, true); await sleep();
+  usabilityCheck(take().length === 0, 'release clears a pending resize timer and ignores late grant');
+  response(release, false, 'restore_failed');
+  usabilityCheck(status.textContent.includes('복원') && button.getAttribute('aria-pressed') === 'false', 'restore failure does not claim retained ownership');
+  mobileUsabilitySocket.message({ type: 'input_pressure', session: 's-1', reason: 'queue_full', queued: 0 });
+  const canceledAcquire = action('acquire');
+  const cancel = action('release');
+  response(canceledAcquire, true); response(cancel, false); await sleep();
+  usabilityCheck(take().length === 0 && cancel > canceledAcquire, 'pending acquire can be canceled without a late resize');
+  const timedOut = action('acquire'); response(timedOut, false, 'timeout'); response(timedOut, true); await sleep();
+  usabilityCheck(take().length === 0 && status.textContent.includes('확인하지'), 'final timeout cannot be revived by a late grant with the same request');
+  const expiring = action('acquire'); response(expiring, true); await sleep(); expectResize(expiring, 'lease before expiry');
+  viewport(844, 390); response(expiring, false, 'expired'); response(expiring, true); await sleep();
+  usabilityCheck(take().length === 0 && status.textContent.includes('끝났') && button.getAttribute('aria-pressed') === 'false',
+    'lease expiry clears pending geometry and cannot be revived by a same-request grant');
+
+  acquire = action('acquire'); response(acquire, true); await sleep(); expectResize(acquire, 'fresh lease');
+  viewport(390, 500);
+  const sentBeforeSwitch = mobileUsabilitySent.length;
+  usabilityById('viewer-session-chip').click();
+  const transition = mobileUsabilitySent.slice(sentBeforeSwitch);
+  const oldRelease = take();
+  usabilityCheck(oldRelease.length === 1 && oldRelease[0].session === 's-1' && oldRelease[0].action === 'release'
+    && oldRelease[0].request > acquire && transition.findIndex((f) => f.type === 'resize_control') < transition.findIndex((f) => f.type === 'watch'),
+    'session switch releases the captured old UUID before watching a new one');
+  response(acquire, true); await sleep(); usabilityCheck(take().length === 0, 'old session grant and timer cannot affect the new session');
+  usabilityById('viewer-session-chip').click(); await sleep();
+  usabilityCheck(take().length === 0, 'switching back never auto-acquires');
+  const afterWatch = action('acquire');
+  usabilityCheck(afterWatch > oldRelease[0].request, 'request sequence survives A to B to A on one socket');
+  response(acquire, true); await sleep(); usabilityCheck(take().length === 0, 'same UUID stale grant cannot satisfy a later watch');
+  response(afterWatch, true); await sleep(); expectResize(afterWatch, 'new watch matching grant');
+  window.dispatchEvent(new Event('pagehide'));
+  const pageRelease = take();
+  usabilityCheck(pageRelease.length === 1 && pageRelease[0].action === 'release' && pageRelease[0].session === 's-1', 'pagehide releases captured ownership');
+  response(afterWatch, true); await sleep(); usabilityCheck(take().length === 0, 'pagehide retirement blocks late grant');
+
+  acquire = action('acquire');
+  const oldSocket = mobileUsabilitySocket;
+  oldSocket.close();
+  await usabilityWait(() => mobileUsabilitySocket !== oldSocket && usabilityById('viewer-connection-label').textContent === '연결됨');
+  await sleep();
+  usabilityCheck(take().length === 0 && button.getAttribute('aria-pressed') === 'false', 'reconnect re-watches but never acquires automatically');
+  response(acquire, true, 'owned', 's-1', oldSocket); await sleep();
+  usabilityCheck(take().length === 0, 'stale socket cannot grant control after reconnect');
+  acquire = action('acquire'); response(acquire, true); await sleep(); expectResize(acquire, 'fresh socket explicit grant');
+  let hidden = true;
+  Object.defineProperty(document, 'hidden', { configurable: true, get: () => hidden });
+  const backgroundSocket = mobileUsabilitySocket;
+  document.dispatchEvent(new Event('visibilitychange'));
+  const backgroundRelease = take();
+  usabilityCheck(backgroundRelease.length === 1 && backgroundRelease[0].action === 'release'
+    && backgroundSocket.readyState === 3, 'background releases while captured socket is still open');
+  hidden = false; document.dispatchEvent(new Event('visibilitychange'));
+  await usabilityWait(() => mobileUsabilitySocket !== backgroundSocket && usabilityById('viewer-connection-label').textContent === '연결됨');
+  delete document.hidden;
+  await sleep(); usabilityCheck(take().length === 0, 'foreground return never reacquires');
+  acquire = action('acquire'); response(acquire, true); await sleep(); expectResize(acquire, 'lease before explicit close');
+  usabilityById('viewer-back').click();
+  await usabilityWait(() => usabilityById('viewer').hidden);
+  const closeRelease = take();
+  usabilityCheck(closeRelease.length === 1 && closeRelease[0].action === 'release' && closeRelease[0].session === 's-1', 'Back releases before viewer closes');
+  document.querySelector('.ws-open').click(); await sleep();
+  usabilityCheck(take().length === 0, 'reopening is view-only');
+  scrollbars.remove();
+}
+
 async function runDirectInputChecks() {
   const direct = () => usabilityById('direct-text');
   const directMode = usabilityById('viewer-mode-direct');
@@ -474,6 +699,7 @@ async function runMobileUsability() {
   await usabilitySettle();
   usabilityCheck(wrap.scrollLeft < pausedPosition.left && wrap.scrollTop < pausedPosition.top,
     'later live frames continue following after return-to-current');
+  await runMobileResizeChecks();
   await runDirectInputChecks();
   const composer = usabilityById('composer-text');
   composer.value = '세션 A 긴 지시 초안';

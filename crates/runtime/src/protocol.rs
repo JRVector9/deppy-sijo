@@ -62,7 +62,8 @@ pub(crate) const PROTO_MAGIC: [u8; 4] = *b"DPRT";
 /// v22: atomic tracked input batches and possibly-partial admission results.
 /// v23: atomic agent launch beside an exact pane; reject older peers before decode.
 /// v24: direct terminal input mapped against live terminal modes on the worker.
-pub(crate) const PROTO_VERSION: u16 = 24;
+/// v25: worker-authoritative expiring terminal resize ownership and native deferral.
+pub(crate) const PROTO_VERSION: u16 = 25;
 
 /// delta viewport 스트리밍 기능 비트 (§3.1).
 pub(crate) const FEAT_DELTA_VIEWPORT: u32 = 1 << 0;
@@ -583,6 +584,6 @@ mod tests {
         assert!(command_source.contains("SetScrollbackLimit"));
         assert!(event_source.contains("ScrollbackLimitApplied"));
         assert!(protocol_source.contains("**v13**"));
-        assert_eq!(PROTO_VERSION, 24);
+        assert_eq!(PROTO_VERSION, 25);
     }
 }

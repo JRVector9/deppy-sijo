@@ -81,11 +81,14 @@
   const viewerMenuStatus = document.getElementById('viewer-menu-status');
   const viewerMenu = document.getElementById('viewer-menu');
   const viewerHeader = document.querySelector('.viewer-header');
+  const viewerStage = document.getElementById('viewer-stage');
   const viewerFontSmaller = document.getElementById('viewer-font-smaller');
   const viewerFontLarger = document.getElementById('viewer-font-larger');
   const viewerFontSize = document.getElementById('viewer-font-size');
   const viewerOverview = document.getElementById('viewer-overview');
   const viewerOverviewState = document.getElementById('viewer-overview-state');
+  const viewerResizeControl = document.getElementById('viewer-resize-control');
+  const viewerResizeStatus = document.getElementById('viewer-resize-status');
 
   function attachMenu(buttonId, panelId) {
     const button = document.getElementById(buttonId);
@@ -231,6 +234,7 @@
   }
 
   function disconnect() {
+    retireResizeControl();
     manualClose = true;
     if (reconnectTimer) {
       clearTimeout(reconnectTimer);
@@ -271,6 +275,10 @@
         break;
       case 'viewport':
         handleViewport(msg);
+        reevaluateResizeReading();
+        break;
+      case 'terminal_control':
+        handleTerminalControl(msg);
         break;
       case 'input_pressure':
         // PTY 입력 큐 압박/거부 — 사유별로 다르게 다룬다 (리뷰 P2-2, P3-1).
@@ -335,6 +343,7 @@
     hooks: {
       closingChanged: (closing) => {
         if (closing) {
+          retireResizeControl();
           stopAllKeyRepeats();
           resetDirectInput();
         }
@@ -345,6 +354,7 @@
       connectionChanged: (state, connected) => {
         viewerMenuStatus.textContent = connected ? '연결됨' : (state === 'reconnecting' ? '재연결 중' : '연결 중');
         if (!connected) {
+          retireResizeControl();
           stopAllKeyRepeats();
           resetDirectInput();
           cancelActiveUpload();
@@ -359,6 +369,7 @@
           inputBlocked = false; // reset per connection generation
         }
         updateComposerEnabled();
+        syncResizeControl();
         if (connected) consumePendingUploadSelection();
       },
       // 컨트롤/작성기 높이 상한은 이 셸만의 것이다(시청 전용 셸에는 컨트롤이 없다).
@@ -375,13 +386,16 @@
         }
         positionViewerMenu(height);
       },
-      layoutChanged: () => {
+      layoutChanged: (metrics) => {
         syncViewerReadabilityControls();
         positionViewerMenu();
+        refreshMobileResizeLayout(metrics);
       },
       pan: queueScroll,
       resetPan: resetScroll,
       beforeOpen: () => {
+        retireResizeControl();
+        resizeLayout = null;
         stopAllKeyRepeats();
         resetDirectInput();
         preserveComposerDraftForTransition();
@@ -395,11 +409,13 @@
       },
       afterOpen: () => updateComposerEnabled(),
       beforeRequestClose: () => {
+        retireResizeControl();
         resetDirectInput();
         cancelActiveUpload();
         cancelPendingUploadSelection();
       },
       beforeClose: ({ discardDraft = false } = {}, returnSession) => {
+        retireResizeControl();
         stopAllKeyRepeats();
         if (discardDraft) discardSessionDraft(returnSession);
         else saveComposerDraft();
@@ -407,6 +423,8 @@
         cancelPendingUploadSelection();
       },
       beforeHide: () => {
+        retireResizeControl();
+        resizeLayout = null;
         closeViewerMenu();
         viewerQuickActions.hidden = true;
         composerRecoveryWarningSession = null;
@@ -442,6 +460,177 @@
     scheduleViewerRenderForLayoutChange,
   } = viewer;
 
+  // A lease is granted by the runtime, scoped to this socket and watched UUID.
+  // Client numbers correlate replies only; they never imply authority.
+  const resizeRequests = new WeakMap();
+  const RESIZE_REQUEST_MAX = 0xffffffff;
+  let resizeControl = null;
+  let resizeLayout = null;
+  let resizeTimer = null;
+  let resizeReadingSuspended = null;
+
+  function clearResizeTimer() {
+    clearTimeout(resizeTimer);
+    resizeTimer = null;
+  }
+
+  function nextResizeRequest(socket) {
+    const previous = resizeRequests.get(socket) || 0;
+    if (previous >= RESIZE_REQUEST_MAX) return null;
+    const request = previous + 1;
+    resizeRequests.set(socket, request);
+    return request;
+  }
+
+  function resizeSocketReady(socket) {
+    return !!socket && socket === ws && isCurrentSocket(socket) && socket.readyState === WebSocket.OPEN;
+  }
+
+  function resizeContextCurrent(context) {
+    return context === resizeControl && context.session === viewer.watching && resizeSocketReady(context.socket);
+  }
+
+  function mobileResizeReady() {
+    return resizeSocketReady(ws) && !!viewer.watching && !viewer.el.hidden
+      && !viewer.closing && !document.hidden && viewer.connection === 'connected';
+  }
+
+  function mobileResizeSuspended() {
+    const settings = viewer.settings();
+    return settings.overview || settings.readableWrap || !viewer.followingLive
+      || !!(viewer.screen && viewer.screen.offset > 0);
+  }
+
+  function refreshMobileResizeLayout(metrics = viewer.getCellMetrics()) {
+    // Scrollbars depend on the received grid. Use the physical stage so a
+    // mobile-size echo removing scrollbars cannot produce another resize.
+    resizeLayout = { ...metrics, stageWidth: viewerStage.clientWidth, stageHeight: viewerStage.clientHeight };
+    scheduleMobileResize();
+  }
+
+  function reevaluateResizeReading() {
+    if (mobileResizeSuspended() !== resizeReadingSuspended) refreshMobileResizeLayout();
+  }
+
+  function syncResizeControl() {
+    const context = resizeControl;
+    const active = context && resizeContextCurrent(context);
+    const owned = !!(active && context.owned);
+    const pending = active && context.reason === 'pending';
+    viewerResizeControl.setAttribute('aria-pressed', String(owned));
+    viewerResizeControl.textContent = owned ? '크기 제어 해제'
+      : pending ? (context.action === 'acquire' ? '크기 요청 취소' : '해제 확인 중…') : '휴대폰 크기로 맞춤';
+    // PTY input pressure does not prevent release or affect lease ownership.
+    viewerResizeControl.disabled = !mobileResizeReady() || (pending && context.action === 'release')
+      || (!owned && !pending && (terminalInputLockOverflow || terminalInputBlockedSessions.has(viewer.watching)));
+    const reasons = {
+      in_use: '다른 화면에서 터미널 크기를 제어 중입니다.',
+      released: '크기 제어를 해제했습니다. 원격 크기를 그대로 표시합니다.',
+      expired: '크기 제어 시간이 끝났습니다. 다시 요청할 수 있습니다.',
+      unavailable: '이 터미널에서 크기 제어를 사용할 수 없습니다.',
+      stale: '크기 제어가 바뀌었습니다. 다시 요청할 수 있습니다.',
+      capacity: '크기 제어 요청이 많습니다. 잠시 후 다시 요청하세요.',
+      timeout: '크기 제어를 확인하지 못했습니다. 다시 요청할 수 있습니다.',
+      restore_failed: '크기 제어는 해제했지만 원격 화면 크기 복원에 실패했습니다.',
+      invalid_size: '요청한 크기를 적용할 수 없습니다. 크기 제어는 유지됩니다.',
+      resize_failed: '터미널 크기 변경에 실패했습니다. 크기 제어는 유지됩니다.',
+    };
+    viewerResizeStatus.textContent = owned && mobileResizeSuspended()
+      ? '화면을 읽거나 전체 화면을 맞추는 동안 자동 크기 변경이 일시정지됩니다. 제어를 해제할 수 있습니다.'
+      : pending ? (context.action === 'acquire' ? '터미널 크기 제어권을 요청 중입니다…' : '크기 제어 해제를 확인 중입니다…')
+      : active && reasons[context.reason] ? reasons[context.reason]
+      : owned ? '휴대폰에서 터미널 크기를 제어합니다.' : '원격 터미널 크기를 그대로 표시합니다.';
+  }
+
+  function retireResizeControl() {
+    const previous = resizeControl;
+    resizeControl = null;
+    clearResizeTimer();
+    if (previous && previous.action === 'acquire' && previous.acceptGrant
+        && previous.socket.readyState === WebSocket.OPEN) {
+      const request = nextResizeRequest(previous.socket);
+      if (request !== null) {
+        previous.socket.send(JSON.stringify({ type: 'resize_control', session: previous.session, action: 'release', request }));
+      } else if (previous.socket === ws) disconnect(); // Exhaustion closes the lease; never wrap to zero.
+    }
+    syncResizeControl();
+  }
+
+  function requestResizeControl(action) {
+    if (!mobileResizeReady()) return;
+    if (action === 'acquire' && (terminalInputLockOverflow || terminalInputBlockedSessions.has(viewer.watching))) return;
+    const socket = ws;
+    const session = viewer.watching;
+    clearResizeTimer();
+    resizeControl = null; // Revoke permission before a new action or any synchronous reply.
+    const request = nextResizeRequest(socket);
+    if (request === null) {
+      disconnect();
+      setViewerConnection('connecting');
+      connect();
+      return; // A fresh socket still requires a fresh explicit click.
+    }
+    resizeControl = { socket, session, request, action, owned: false, reason: 'pending',
+      acceptGrant: action === 'acquire', lastGeometry: null };
+    syncResizeControl();
+    socket.send(JSON.stringify({ type: 'resize_control', session, action, request }));
+  }
+
+  function handleTerminalControl(msg) {
+    const context = resizeControl;
+    if (!context || !resizeContextCurrent(context) || msg.session !== context.session
+        || msg.request !== context.request || typeof msg.owned !== 'boolean') return;
+    if (msg.owned && (!context.acceptGrant || context.action !== 'acquire')) return;
+    if (msg.owned && !['owned', 'invalid_size', 'resize_failed'].includes(msg.reason)) return;
+    if (msg.reason === 'pending' && context.owned) return;
+    const granted = msg.owned && !context.owned;
+    context.owned = msg.owned;
+    context.reason = typeof msg.reason === 'string' ? msg.reason : 'unavailable';
+    if (!msg.owned) {
+      clearResizeTimer();
+      if (context.reason !== 'pending') context.acceptGrant = false;
+    }
+    syncResizeControl();
+    if (granted) scheduleMobileResize(); // Renew/error ACKs preserve geometry deduplication.
+  }
+
+  function scheduleMobileResize() {
+    const context = resizeControl;
+    resizeReadingSuspended = mobileResizeSuspended();
+    if (!context || !resizeContextCurrent(context) || !context.owned || !mobileResizeReady()
+        || resizeReadingSuspended) {
+      clearResizeTimer();
+      syncResizeControl();
+      return;
+    }
+    const metrics = resizeLayout;
+    const configuredFont = viewer.settings().fontSize;
+    clearResizeTimer();
+    if (!metrics || metrics.stageWidth <= 0 || metrics.stageHeight <= 0
+        || metrics.cellWidth <= 0 || metrics.cellHeight <= 0
+        || Math.abs(metrics.fontSize - configuredFont) > 0.01) return;
+    const cols = Math.max(32, Math.min(400, Math.floor(metrics.stageWidth / metrics.cellWidth)));
+    const rows = Math.max(2, Math.min(200, Math.floor(65536 / cols), Math.floor(metrics.stageHeight / metrics.cellHeight)));
+    const geometry = cols + 'x' + rows;
+    if (geometry === context.lastGeometry) return;
+    resizeTimer = setTimeout(() => {
+      resizeTimer = null;
+      if (!resizeContextCurrent(context) || !context.owned || !mobileResizeReady() || mobileResizeSuspended()) return;
+      context.lastGeometry = geometry;
+      context.socket.send(JSON.stringify({ type: 'resize', session: context.session, request: context.request, cols, rows }));
+    }, 200);
+    syncResizeControl();
+  }
+
+  viewerResizeControl.addEventListener('click', () => {
+    const context = resizeControl;
+    requestResizeControl(context && (context.owned || (context.action === 'acquire' && context.reason === 'pending')) ? 'release' : 'acquire');
+  });
+  window.addEventListener('pagehide', retireResizeControl);
+  // Core updates follow state before this listener; a local pan can pause
+  // reading without changing its metrics or receiving a server frame.
+  viewer.wrap.addEventListener('scroll', reevaluateResizeReading);
+
   function positionViewerMenu(height = viewer.el.clientHeight) {
     const top = viewerHeader.offsetHeight + 4;
     viewerMenu.style.setProperty('--viewer-menu-top', top + 'px');
@@ -468,6 +657,7 @@
   viewerOverview.addEventListener('click', () => {
     viewer.setOverview(!viewer.settings().overview);
     syncViewerReadabilityControls();
+    refreshMobileResizeLayout();
   });
   syncViewerReadabilityControls();
 
@@ -529,6 +719,7 @@
     const offset = (viewer.screen && viewer.screen.offset) || 0;
     viewer.resumeFollow();
     resetPan();
+    refreshMobileResizeLayout();
     if (offset > 0 && remoteInputReady()) {
       send({ type: 'scroll', session: viewer.watching, delta: -offset });
     }
@@ -774,6 +965,7 @@
     directText.disabled = !ready || inputMode !== 'direct';
     for (const button of directButtons) button.disabled = !ready || inputMode !== 'direct';
     for (const button of viewer.keys) button.disabled = !ready;
+    syncResizeControl();
   }
 
   function sendComposer() {

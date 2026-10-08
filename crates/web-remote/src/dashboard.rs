@@ -33,6 +33,7 @@ use runtime::{
 
 use crate::protocol::{ApprovalView, ResourceView, ServerMsg, SessionView, WorkspaceView};
 use crate::repository::{PENDING_APPROVAL_LIMIT, PendingApprovalRecord, WebRemoteRepository};
+use crate::resize_control::{ControlAction, ControlTarget, ResizeControls};
 
 /// 승인 DB 폴링 주기 — 접속이 있을 때만 적용된다(계획 완료기준: 상태/승인 반영 ≤1s).
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -80,6 +81,8 @@ impl IdMap {
 
 /// 세션 하나의 시청 집계 (P5b) — 접속 수 + 마지막 lease 갱신 시각.
 struct WatcherEntry {
+    generation: u64,
+    session: Option<u64>,
     count: usize,
     last_renewal: Instant,
 }
@@ -455,6 +458,7 @@ struct Inner {
     watchers: BTreeMap<String, WatcherEntry>,
     /// Invalidates each socket binding when the runtime source changes.
     watch_generation: u64,
+    next_watch_incarnation: u64,
     /// 시청 세션별 최신 bracketed paste 모드 (P6a — Viewport 이벤트에서 캐시).
     /// send_input의 wrap 판정에 쓴다. 시청 종료 시 함께 정리된다.
     bracketed: BTreeMap<String, bool>,
@@ -462,6 +466,7 @@ struct Inner {
     /// 폰에는 UUID만 노출하고(u64는 아예 안 보낸다), 명령을 만들 때 여기서 변환한다 —
     /// 워커가 모르는 UUID는 변환되지 않아 명령 자체가 만들어지지 않는다(앨리어싱 차단).
     ids: IdMap,
+    resize_controls: ResizeControls,
 }
 
 /// 접속 스레드가 소켓으로 밀어낼 발행 스냅샷. 버전이 오르면 push 대상.
@@ -508,11 +513,23 @@ pub struct DashboardHandle {
 /// 접속 1건의 수명 동안 연결 수를 +1로 유지하는 RAII 가드(Drop 시 -1 + 재평가 notify).
 pub struct ConnectionGuard {
     shared: Arc<Shared>,
+    id: u64,
+}
+
+impl ConnectionGuard {
+    pub fn id(&self) -> u64 {
+        self.id
+    }
 }
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         self.shared.connections.fetch_sub(1, Ordering::SeqCst);
+        {
+            let mut inner = self.shared.inner.lock().expect("dashboard inner lock");
+            inner.resize_controls.disconnect(self.id, Instant::now());
+            inner.dirty = true;
+        }
         // 0으로 떨어졌으면 브리지가 타이머를 접고 park하도록 깨운다.
         self.shared.cvar.notify_all();
     }
@@ -540,8 +557,10 @@ impl DashboardHandle {
                 notice: None,
                 watchers: BTreeMap::new(),
                 watch_generation: 1,
+                next_watch_incarnation: 1,
                 bracketed: BTreeMap::new(),
                 ids: IdMap::default(),
+                resize_controls: ResizeControls::default(),
             }),
             published: Mutex::new(Published::default()),
             repository,
@@ -626,6 +645,7 @@ impl DashboardHandle {
     /// 시청 상태(watcher refcount + 화면 슬롯)를 전부 비운다 — 새 worker 구독 시
     /// 호출. 같은 inner 임계구역에서 published를 중첩 취득해 원자화한다.
     fn clear_watch_state(inner: &mut Inner, shared: &Shared) {
+        inner.resize_controls.invalidate_binding(Instant::now());
         inner.watch_generation = inner
             .watch_generation
             .checked_add(1)
@@ -635,6 +655,45 @@ impl DashboardHandle {
         let mut published = shared.published.lock().expect("published lock");
         published.viewports.clear();
         published.input_pressure.clear();
+    }
+
+    fn reconcile_watches(
+        watchers: &mut BTreeMap<String, WatcherEntry>,
+        ids: &IdMap,
+        bracketed: &mut BTreeMap<String, bool>,
+        resize_controls: &mut ResizeControls,
+        generation: u64,
+        sink: &Option<CommandSink>,
+        shared: &Shared,
+    ) {
+        let mut replaced = Vec::new();
+        for (uuid, entry) in watchers.iter_mut() {
+            let current = ids.session(uuid);
+            if entry.session.is_none() {
+                // A startup Watch may precede the first membership query.
+                entry.session = current;
+            } else if entry.session != current {
+                replaced.push(uuid.clone());
+            }
+        }
+        for uuid in replaced {
+            let entry = watchers.remove(&uuid).unwrap();
+            if let (Some(session), Some(sink)) = (entry.session, sink) {
+                sink(lease_command(session, false));
+            }
+            bracketed.remove(&uuid);
+            let mut published = shared.published.lock().expect("published lock");
+            published.viewports.remove(&uuid);
+            published.input_pressure.remove(&uuid);
+        }
+        resize_controls.invalidate_targets(
+            generation,
+            |target| {
+                watchers.contains_key(&target.uuid)
+                    && ids.session(&target.uuid) == Some(target.session.0)
+            },
+            Instant::now(),
+        );
     }
 
     /// web → runtime 명령 싱크를 붙인다 (P5b — receiver와 같은 시점에 교체된다).
@@ -698,7 +757,9 @@ impl DashboardHandle {
             .inner
             .lock()
             .expect("dashboard inner lock")
-            .watch_generation;
+            .watchers
+            .get(from.or(to).unwrap_or(""))
+            .map_or(0, |entry| entry.generation);
         self.rebind_watch_for_connection(from, to, generation);
     }
 
@@ -712,10 +773,17 @@ impl DashboardHandle {
         let mut inner = self.shared.inner.lock().expect("dashboard inner lock");
         // An old socket cannot remove the watch registered by a new socket after
         // invalidation. An explicit watch from the old socket registers afresh.
-        let from = from.filter(|_| generation == inner.watch_generation);
+        let from = from.filter(|uuid| {
+            inner
+                .watchers
+                .get(*uuid)
+                .is_some_and(|entry| entry.generation == generation)
+        });
         Self::request_initial_mux(&mut inner);
         if from == to {
-            return inner.watch_generation;
+            return to
+                .and_then(|uuid| inner.watchers.get(uuid))
+                .map_or(inner.watch_generation, |entry| entry.generation);
         }
         if let Some(old) = from
             && let Some(entry) = inner.watchers.get_mut(old)
@@ -735,17 +803,24 @@ impl DashboardHandle {
             }
         }
         if let Some(new) = to {
-            let entry = inner
-                .watchers
-                .entry(new.to_owned())
-                .or_insert(WatcherEntry {
+            if !inner.watchers.contains_key(new) {
+                inner.next_watch_incarnation = inner
+                    .next_watch_incarnation
+                    .checked_add(1)
+                    .expect("watch incarnation");
+                let entry = WatcherEntry {
+                    generation: inner.next_watch_incarnation,
+                    session: inner.ids.session(new),
                     count: 0,
                     last_renewal: Instant::now(),
-                });
+                };
+                inner.watchers.insert(new.to_owned(), entry);
+            }
+            let entry = inner.watchers.get_mut(new).unwrap();
             entry.count += 1;
             if entry.count == 1 {
                 entry.last_renewal = Instant::now();
-                if let Some(session) = inner.ids.session(new) {
+                if let Some(session) = entry.session {
                     commands.push(lease_command(session, true));
                 }
             }
@@ -755,14 +830,13 @@ impl DashboardHandle {
                 sink(command);
             }
         }
-        inner.watch_generation
+        to.and_then(|uuid| inner.watchers.get(uuid))
+            .map_or(inner.watch_generation, |entry| entry.generation)
     }
 
     pub fn watch_binding_is_current(&self, uuid: &str, generation: u64) -> bool {
         let inner = self.shared.inner.lock().expect("dashboard inner lock");
-        generation == inner.watch_generation
-            && inner.watchers.contains_key(uuid)
-            && inner.ids.session(uuid).is_some()
+        Self::resolve_watched(&inner, uuid, generation).is_some()
     }
 
     /// 시청 세션에 composer 텍스트를 입력한다 (P6a). `uuid`는 **영속 세션 UUID**다 —
@@ -774,7 +848,9 @@ impl DashboardHandle {
             .inner
             .lock()
             .expect("dashboard inner lock")
-            .watch_generation;
+            .watchers
+            .get(uuid)
+            .map_or(0, |entry| entry.generation);
         self.send_input_for_connection(uuid, generation, text, submit);
     }
 
@@ -799,10 +875,7 @@ impl DashboardHandle {
     /// switch cannot pair an old session id with a new worker's command sink.
     pub fn send_terminal_input(&self, uuid: &str, generation: u64, input: runtime::TerminalInput) {
         let inner = self.shared.inner.lock().expect("dashboard inner lock");
-        if generation != inner.watch_generation || !inner.watchers.contains_key(uuid) {
-            return;
-        }
-        if let Some(session) = inner.ids.session(uuid)
+        if let Some(session) = Self::resolve_watched(&inner, uuid, generation)
             && let Some(sink) = &inner.command_sink
         {
             sink(RuntimeCommand::WriteTerminalInput {
@@ -826,10 +899,10 @@ impl DashboardHandle {
     /// 워크스페이스 전환 후 남은 접속 바인딩(리뷰 P2-1)과 worker-로컬 id 앨리어싱(I1)을
     /// 한 지점에서 막는다.
     fn resolve_watched(inner: &Inner, uuid: &str, generation: u64) -> Option<u64> {
-        if generation != inner.watch_generation || !inner.watchers.contains_key(uuid) {
-            return None;
-        }
-        inner.ids.session(uuid)
+        let entry = inner.watchers.get(uuid)?;
+        let session = entry.session?;
+        (entry.generation == generation && inner.ids.session(uuid) == Some(session))
+            .then_some(session)
     }
 
     /// 시청 세션의 스크롤백을 이동한다. delta 양수 = 과거로.
@@ -840,7 +913,9 @@ impl DashboardHandle {
             .inner
             .lock()
             .expect("dashboard inner lock")
-            .watch_generation;
+            .watchers
+            .get(uuid)
+            .map_or(0, |entry| entry.generation);
         self.send_scroll_for_connection(uuid, generation, delta);
     }
 
@@ -870,7 +945,9 @@ impl DashboardHandle {
             .inner
             .lock()
             .expect("dashboard inner lock")
-            .watch_generation;
+            .watchers
+            .get(uuid)
+            .map_or(0, |entry| entry.generation);
         self.send_key_for_connection(uuid, generation, key);
     }
 
@@ -957,19 +1034,108 @@ impl DashboardHandle {
     /// 인증 완료 접속을 등록한다 — 연결 수 +1, 즉시 폴링 강제. Drop 시 자동 -1.
     pub fn register_connection(&self) -> ConnectionGuard {
         self.shared.connections.fetch_add(1, Ordering::SeqCst);
-        {
+        let id = {
             let mut inner = self.shared.inner.lock().expect("dashboard inner lock");
+            let id = inner.resize_controls.register();
             inner.force_poll = true;
             inner.dirty = true;
             Self::request_initial_mux(&mut inner);
             // 첫 접속(접속 0 구간)에는 발행을 건너뛰므로, 등록 시점에 최신 Dashboard를
             // 반드시 한 번 만들어 Welcome 직후 첫 프레임이 나가게 한다 (PR-F1).
             inner.dashboard_dirty = true;
-        }
+            id
+        };
         self.shared.cvar.notify_all();
         ConnectionGuard {
             shared: Arc::clone(&self.shared),
+            id,
         }
+    }
+
+    pub fn resize_control_for_connection(
+        &self,
+        connection: u64,
+        uuid: &str,
+        generation: u64,
+        action: crate::protocol::ResizeControlAction,
+        request: u32,
+    ) {
+        let mut inner = self.shared.inner.lock().expect("dashboard inner lock");
+        let action = match action {
+            crate::protocol::ResizeControlAction::Acquire => ControlAction::Acquire,
+            crate::protocol::ResizeControlAction::Release => ControlAction::Release,
+        };
+        let target = Self::resolve_watched(&inner, uuid, generation).and_then(|session| {
+            inner.command_sink.clone().map(|sink| ControlTarget {
+                uuid: uuid.into(),
+                generation: inner.watch_generation,
+                session: SessionId(session),
+                sink,
+            })
+        });
+        if let Some(target) = target {
+            inner
+                .resize_controls
+                .request(connection, target, action, request, Instant::now());
+        } else {
+            inner
+                .resize_controls
+                .reject(connection, uuid, action, request);
+        }
+        inner.dirty = true;
+        self.shared.cvar.notify_all();
+    }
+
+    pub fn resize_for_connection(
+        &self,
+        connection: u64,
+        uuid: &str,
+        generation: u64,
+        request: u32,
+        cols: u16,
+        rows: u16,
+    ) {
+        let mut inner = self.shared.inner.lock().expect("dashboard inner lock");
+        if Self::resolve_watched(&inner, uuid, generation).is_none() {
+            return;
+        }
+        let source_generation = inner.watch_generation;
+        inner
+            .resize_controls
+            .resize(connection, uuid, source_generation, request, cols, rows);
+        inner.dirty = true;
+        self.shared.cvar.notify_all();
+    }
+
+    pub fn release_resize_control_for_connection(&self, connection: u64) {
+        let mut inner = self.shared.inner.lock().expect("dashboard inner lock");
+        inner.resize_controls.unwatch(connection, Instant::now());
+        inner.dirty = true;
+        self.shared.cvar.notify_all();
+    }
+
+    pub fn terminal_control_if_newer(
+        &self,
+        connection: u64,
+        last: u64,
+    ) -> Option<(u64, String, bool)> {
+        let inner = self.shared.inner.lock().expect("dashboard inner lock");
+        inner
+            .resize_controls
+            .reply_after(connection, last)
+            .map(|(version, reply)| {
+                (
+                    version,
+                    ServerMsg::TerminalControl {
+                        session: reply.uuid,
+                        request: reply.request,
+                        owned: reply.owned,
+                        reason: reply.reason,
+                    }
+                    .encode(),
+                    reply.keyframe,
+                )
+            })
     }
 
     /// 승인 결정을 DB에 되쓴다(first-writer-wins — 이미 해소된 id는 조용한 no-op). 이후
@@ -1053,9 +1219,24 @@ impl DashboardHandle {
                 watchers,
                 bracketed,
                 ids,
+                resize_controls,
+                watch_generation,
+                command_sink,
                 ..
             } = &mut *inner;
             let relevant = apply_event(sessions, resource, ids, &event);
+            if matches!(event, RuntimeEvent::MuxUpdated { .. }) {
+                Self::reconcile_watches(
+                    watchers,
+                    ids,
+                    bracketed,
+                    resize_controls,
+                    *watch_generation,
+                    command_sink,
+                    &self.shared,
+                );
+            }
+            resize_controls.event(*watch_generation, &event, Instant::now());
             // 실경로(run)와 동일하게 inner 임계구역 안에서 published를 중첩 취득해
             // 슬롯을 반영한다 (P5 리뷰 ②-P1 — 락 순서 inner→published). 키는 UUID (I1).
             if let RuntimeEvent::Viewport {
@@ -1135,19 +1316,25 @@ fn run(shared: &Arc<Shared>) {
             let conns = shared.connections.load(Ordering::SeqCst);
             let poll_due =
                 conns > 0 && (inner.force_poll || inner.last_poll.elapsed() >= POLL_INTERVAL);
-            if inner.dirty || poll_due {
+            if inner.dirty || poll_due || inner.resize_controls.tick_due(Instant::now()) {
                 break;
             }
-            if conns > 0 {
-                // 다음 폴링 만기까지만 잔다(승인 ≤1s 반영).
-                let wait = POLL_INTERVAL.saturating_sub(inner.last_poll.elapsed());
+            let control_wait = inner.resize_controls.timer_wait(Instant::now());
+            let wait = if conns > 0 {
+                Some(control_wait.map_or_else(
+                    || POLL_INTERVAL.saturating_sub(inner.last_poll.elapsed()),
+                    |control| control.min(POLL_INTERVAL.saturating_sub(inner.last_poll.elapsed())),
+                ))
+            } else {
+                control_wait
+            };
+            if let Some(wait) = wait {
                 let (guard, _) = shared
                     .cvar
                     .wait_timeout(inner, wait)
                     .expect("dashboard cvar wait");
                 inner = guard;
             } else {
-                // 접속 0 — 런타임 wake/등록/stop이 깨울 때까지 무기한 park(타이머 없음 → CPU 0).
                 inner = shared.cvar.wait(inner).expect("dashboard cvar wait");
             }
         }
@@ -1183,10 +1370,27 @@ fn run(shared: &Arc<Shared>) {
                 watchers,
                 bracketed,
                 ids,
+                resize_controls,
+                watch_generation,
+                command_sink,
                 ..
             } = &mut *inner;
             for event in &events {
                 rebuild_dashboard |= apply_event(sessions, resource, ids, event);
+                if matches!(event, RuntimeEvent::MuxUpdated { .. }) {
+                    DashboardHandle::reconcile_watches(
+                        watchers,
+                        ids,
+                        bracketed,
+                        resize_controls,
+                        *watch_generation,
+                        command_sink,
+                        shared,
+                    );
+                    staged_viewports.retain(|uuid, _| watchers.contains_key(uuid));
+                    staged_pressure.retain(|uuid, _| watchers.contains_key(uuid));
+                }
+                resize_controls.event(*watch_generation, event, Instant::now());
                 // 세션 상태 전이(입력대기/완료)를 웹푸시로 넘긴다 — 앱이 닫혀 있어도 알린다(P4).
                 // notify_session이 Done/Waiting 외 상태는 무시하므로 여기서는 걸러내지 않는다.
                 if let Some(push) = push_sink.as_ref() {
@@ -1256,6 +1460,24 @@ fn run(shared: &Arc<Shared>) {
                     }
                 }
             }
+        }
+        {
+            let Inner {
+                resize_controls,
+                ids,
+                watchers,
+                watch_generation,
+                ..
+            } = &mut *inner;
+            resize_controls.invalidate_targets(
+                *watch_generation,
+                |target| {
+                    watchers.contains_key(&target.uuid)
+                        && ids.session(&target.uuid) == Some(target.session.0)
+                },
+                Instant::now(),
+            );
+            resize_controls.tick(Instant::now());
         }
         // 시청 화면/입력압박 슬롯 반영 — watcher 판정과 **같은 inner 임계구역에서**
         // published를 중첩 취득해 삽입한다 (P5 리뷰 ②-P1: inner 해제 후 삽입하면 그 사이
@@ -1675,6 +1897,127 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn resize_control_review_same_uuid_replacement_requires_fresh_watch_incarnation() {
+        use crate::protocol::ResizeControlAction as Action;
+        let (handle, thread) = DashboardHandle::spawn(None);
+        let (sink, captured) = capture_sink();
+        handle.set_command_sink(sink);
+        handle.inject_event(mux_event(&[(7, "old"), (9, "other")]));
+        let uuid = test_uuid(7);
+        let old = handle.rebind_watch_for_connection(None, Some(&uuid), 0);
+        let other = handle.rebind_watch_for_connection(None, Some("uuid-9"), 0);
+        let connection = handle.register_connection();
+        handle.resize_control_for_connection(connection.id(), &uuid, old, Action::Acquire, 1);
+        let mut replaced = mux_event(&[(8, "replacement"), (9, "other")]);
+        if let RuntimeEvent::MuxUpdated { snapshot } = &mut replaced {
+            Arc::make_mut(snapshot).tabs[0].panes[0].persistent_session_id = Some(uuid.clone());
+        }
+        handle.inject_event(replaced);
+        captured.lock().unwrap().clear();
+        handle.resize_control_for_connection(connection.id(), &uuid, old, Action::Acquire, 2);
+        handle.resize_for_connection(connection.id(), &uuid, old, 1, 40, 6);
+        handle.send_terminal_input(
+            &uuid,
+            old,
+            runtime::TerminalInput::Text {
+                text: "old".into(),
+                paste: false,
+            },
+        );
+        handle.send_input_for_connection(&uuid, old, "old", true);
+        handle.send_key_for_connection(&uuid, old, "ctrl_c");
+        handle.send_scroll_for_connection(&uuid, old, 1);
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "old watch dispatched into replacement"
+        );
+        assert!(!handle.watch_binding_is_current(&uuid, old));
+        assert!(
+            handle.watch_binding_is_current("uuid-9", other),
+            "unrelated live watch must survive"
+        );
+        let fresh = handle.rebind_watch_for_connection(Some(&uuid), Some(&uuid), old);
+        assert_ne!(fresh, old);
+        assert!(handle.watch_binding_is_current(&uuid, fresh));
+        handle.rebind_watch_for_connection(Some(&uuid), None, old);
+        assert!(
+            handle.watch_binding_is_current(&uuid, fresh),
+            "old teardown removed fresh watch"
+        );
+        captured.lock().unwrap().clear();
+        handle.resize_control_for_connection(connection.id(), &uuid, fresh, Action::Acquire, 1);
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "fresh watch reset whole socket request counter"
+        );
+        handle.resize_control_for_connection(connection.id(), &uuid, fresh, Action::Acquire, 3);
+        assert!(matches!(
+            captured.lock().unwrap().as_slice(),
+            [RuntimeCommand::TerminalControl {
+                session: SessionId(8),
+                request: runtime::TerminalControlRequest::Query,
+                ..
+            }]
+        ));
+        let query = captured
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|command| match command {
+                RuntimeCommand::TerminalControl {
+                    operation_id,
+                    request: runtime::TerminalControlRequest::Query,
+                    ..
+                } => Some(*operation_id),
+                _ => None,
+            })
+            .unwrap();
+        captured.lock().unwrap().clear();
+        handle.inject_event(RuntimeEvent::TerminalControlResult {
+            session: SessionId(8),
+            operation_id: query,
+            state: runtime::TerminalControlState {
+                epoch: 0,
+                owner: None,
+                lease_ms: 0,
+            },
+            status: runtime::TerminalControlStatus::Released,
+            stamp: None,
+        });
+        let (operation, owner) = captured
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|command| match command {
+                RuntimeCommand::TerminalControl {
+                    session: SessionId(8),
+                    operation_id,
+                    request: runtime::TerminalControlRequest::Acquire { owner, .. },
+                } => Some((*operation_id, *owner)),
+                _ => None,
+            })
+            .expect(
+                "fresh incarnation query ACK must dispatch acquire on the current worker binding",
+            );
+        handle.inject_event(RuntimeEvent::TerminalControlResult {
+            session: SessionId(8),
+            operation_id: operation,
+            state: runtime::TerminalControlState {
+                epoch: 1,
+                owner: Some(owner),
+                lease_ms: 15000,
+            },
+            status: runtime::TerminalControlStatus::Owned,
+            stamp: None,
+        });
+        let grant = wait_resize_reply(&handle, connection.id(), 3, "owned");
+        assert_eq!(grant["owned"], true);
+        drop(connection);
+        handle.stop();
+        thread.join().unwrap();
+    }
+
     fn direct_test_runtime() -> (runtime::InProcessRuntimeClient, std::path::PathBuf) {
         struct NoSecrets;
         impl runtime::RuntimeSecretResolver for NoSecrets {
@@ -1715,6 +2058,270 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[cfg(unix)]
+    fn resize_test_session(
+        client: &runtime::InProcessRuntimeClient,
+    ) -> (SessionId, String, RuntimeEventReceiver) {
+        use runtime::{RuntimeCommandSink as _, RuntimeEventStream as _};
+        let events = client.subscribe();
+        client
+            .send_command(RuntimeCommand::SpawnAgent {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+                agent_config_id: None,
+                command: "/bin/cat".into(),
+                args: Vec::new(),
+                env_plain: Vec::new(),
+                env_secrets: Vec::new(),
+                waiting_regex: None,
+                approval_regex: None,
+                error_regex: None,
+                done_regex: None,
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            for event in events.drain() {
+                if let RuntimeEvent::MuxUpdated { snapshot } = event
+                    && let Some(pair) = snapshot
+                        .tabs
+                        .iter()
+                        .flat_map(|tab| &tab.panes)
+                        .find_map(|pane| pane.session_id.zip(pane.persistent_session_id.clone()))
+                {
+                    return (pair.0, pair.1, events);
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "real control PTY spawn timed out"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn wait_resize_reply(
+        handle: &DashboardHandle,
+        connection: u64,
+        request: u32,
+        reason: &str,
+    ) -> serde_json::Value {
+        let deadline = Instant::now() + Duration::from_secs(6);
+        loop {
+            if let Some((_, json, _)) = handle.terminal_control_if_newer(connection, 0) {
+                let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+                if value["request"] == request && value["reason"] == reason {
+                    return value;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "control {request}/{reason} acknowledgement timed out"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resize_control_real_worker_retries_dropped_enqueues_and_releases_at_zero_connections() {
+        use crate::protocol::ResizeControlAction as Action;
+        use runtime::{TerminalControlRequest as Control, TerminalControlStatus as Status};
+        let (mut worker, directory) = direct_test_runtime();
+        let (id, uuid, native_events) = resize_test_session(&worker);
+        let (handle, thread) = DashboardHandle::spawn(None);
+        let sink = worker.command_sink().unwrap();
+        let attempts: StdArc<Mutex<BTreeMap<&'static str, usize>>> = StdArc::default();
+        let counted = StdArc::clone(&attempts);
+        handle.set_runtime_binding(
+            worker.subscribe_with_wake_background(handle.wake_fn()),
+            Some(StdArc::new(move |command| {
+                let kind = match &command {
+                    RuntimeCommand::TerminalControl {
+                        request: Control::Query,
+                        ..
+                    } => Some("query"),
+                    RuntimeCommand::TerminalControl {
+                        request: Control::Acquire { .. },
+                        ..
+                    } => Some("acquire"),
+                    RuntimeCommand::TerminalControl {
+                        request: Control::Resize { .. },
+                        ..
+                    } => Some("resize"),
+                    RuntimeCommand::TerminalControl {
+                        request: Control::Release { .. },
+                        ..
+                    } => Some("release"),
+                    _ => None,
+                };
+                if let Some(kind) = kind {
+                    let mut count = counted.lock().unwrap();
+                    let value = count.entry(kind).or_default();
+                    *value += 1;
+                    if *value == 1 {
+                        return;
+                    }
+                }
+                sink(command);
+            })),
+        );
+        let connection = handle.register_connection();
+        let generation = handle.rebind_watch_for_connection(None, Some(&uuid), 0);
+        wait_for_direct_binding(&handle, &uuid, generation);
+        handle.resize_control_for_connection(
+            connection.id(),
+            &uuid,
+            generation,
+            Action::Acquire,
+            1,
+        );
+        let first = wait_resize_reply(&handle, connection.id(), 1, "pending");
+        assert_eq!(first["owned"], false);
+        assert_eq!(
+            wait_resize_reply(&handle, connection.id(), 1, "owned")["owned"],
+            true
+        );
+        handle.resize_for_connection(connection.id(), &uuid, generation, 1, 40, 6);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if handle
+                .viewport_if_newer(&uuid, 0)
+                .is_some_and(|(_, frame)| (frame.cols, frame.rows) == (40, 6))
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "mobile actual keyframe timed out"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        handle.release_resize_control_for_connection(connection.id());
+        handle.rebind_watch_for_connection(Some(&uuid), None, generation);
+        drop(connection);
+        assert_eq!(handle.shared.connections.load(Ordering::SeqCst), 0);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if native_events.drain().iter().any(|event| matches!(event, RuntimeEvent::TerminalControlResult { session, status: Status::Released, state, stamp: Some(stamp), .. } if *session == id && state.owner.is_none() && (stamp.cols, stamp.rows) == (80, 24))) { break; }
+            assert!(
+                Instant::now() < deadline,
+                "zero-connection dropped release did not restore native PTY"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        for kind in ["query", "acquire", "resize", "release"] {
+            assert!(
+                attempts.lock().unwrap()[kind] >= 2,
+                "first enqueue was dropped: {kind}"
+            );
+        }
+        let acquire_attempts = attempts.lock().unwrap()["acquire"];
+        let reconnect = handle.register_connection();
+        handle.rebind_watch_for_connection(None, Some(&uuid), generation);
+        assert!(
+            handle
+                .terminal_control_if_newer(reconnect.id(), 0)
+                .is_none(),
+            "reconnect/watch does not reacquire"
+        );
+        assert_eq!(attempts.lock().unwrap()["acquire"], acquire_attempts);
+        drop(reconnect);
+        handle.stop();
+        thread.join().unwrap();
+        worker.shutdown();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resize_control_real_worker_binding_cleanup_never_releases_same_numeric_id_on_new_worker() {
+        use crate::protocol::ResizeControlAction as Action;
+        use runtime::{TerminalControlRequest as Control, TerminalControlStatus as Status};
+        let (mut old_worker, old_directory) = direct_test_runtime();
+        let (old_id, old_uuid, old_events) = resize_test_session(&old_worker);
+        let (mut new_worker, new_directory) = direct_test_runtime();
+        let (new_id, new_uuid, _new_events) = resize_test_session(&new_worker);
+        assert_eq!(old_id, new_id);
+        let (handle, thread) = DashboardHandle::spawn(None);
+        let connection = handle.register_connection();
+        handle.set_runtime_binding(
+            old_worker.subscribe_with_wake_background(handle.wake_fn()),
+            old_worker.command_sink(),
+        );
+        let old_generation = handle.rebind_watch_for_connection(None, Some(&old_uuid), 0);
+        wait_for_direct_binding(&handle, &old_uuid, old_generation);
+        handle.resize_control_for_connection(
+            connection.id(),
+            &old_uuid,
+            old_generation,
+            Action::Acquire,
+            1,
+        );
+        wait_resize_reply(&handle, connection.id(), 1, "owned");
+        handle.resize_for_connection(connection.id(), &old_uuid, old_generation, 1, 40, 6);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while handle
+            .viewport_if_newer(&old_uuid, 0)
+            .is_none_or(|(_, frame)| (frame.cols, frame.rows) != (40, 6))
+        {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let new_releases = StdArc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = StdArc::clone(&new_releases);
+        let new_sink = new_worker.command_sink().unwrap();
+        handle.set_runtime_binding(
+            new_worker.subscribe_with_wake_background(handle.wake_fn()),
+            Some(StdArc::new(move |command| {
+                if matches!(
+                    command,
+                    RuntimeCommand::TerminalControl {
+                        request: Control::Release { .. },
+                        ..
+                    }
+                ) {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                }
+                new_sink(command);
+            })),
+        );
+        handle.resize_control_for_connection(
+            connection.id(),
+            &old_uuid,
+            old_generation,
+            Action::Release,
+            2,
+        );
+        handle.resize_for_connection(connection.id(), &old_uuid, old_generation, 1, 50, 8);
+        let fresh = handle.rebind_watch_for_connection(None, Some(&new_uuid), old_generation);
+        wait_for_direct_binding(&handle, &new_uuid, fresh);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if old_events.drain().iter().any(|event| matches!(event, RuntimeEvent::TerminalControlResult { status: Status::Released, stamp: Some(stamp), .. } if (stamp.cols, stamp.rows) == (80, 24))) { break; }
+            assert!(
+                Instant::now() < deadline,
+                "old worker captured cleanup did not restore"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(new_releases.load(Ordering::SeqCst), 0);
+        handle.resize_control_for_connection(connection.id(), &new_uuid, fresh, Action::Acquire, 3);
+        assert_eq!(
+            wait_resize_reply(&handle, connection.id(), 3, "owned")["owned"],
+            true
+        );
+        assert_eq!(new_releases.load(Ordering::SeqCst), 0);
+        drop(connection);
+        handle.stop();
+        thread.join().unwrap();
+        old_worker.shutdown();
+        new_worker.shutdown();
+        std::fs::remove_dir_all(old_directory).unwrap();
+        std::fs::remove_dir_all(new_directory).unwrap();
     }
 
     #[test]
@@ -2378,6 +2985,8 @@ mod tests {
         watchers.insert(
             test_uuid(1),
             WatcherEntry {
+                generation: 1,
+                session: None,
                 count: 1,
                 last_renewal: now - Duration::from_secs(20),
             },
@@ -2385,6 +2994,8 @@ mod tests {
         watchers.insert(
             test_uuid(2),
             WatcherEntry {
+                generation: 1,
+                session: None,
                 count: 1,
                 last_renewal: now,
             },

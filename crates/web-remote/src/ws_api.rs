@@ -108,7 +108,7 @@ pub fn serve(
     }
 
     // 2) 등록(연결 수 +1, 즉시 폴링) — Drop 시 자동 해제. 이후 스냅샷 스트림.
-    let _guard = dashboard.register_connection();
+    let guard = dashboard.register_connection();
     if ws
         .send(Message::Text(
             ServerMsg::Welcome {
@@ -128,6 +128,7 @@ pub fn serve(
         dashboard,
         watched: None,
         generation: 0,
+        connection: guard.id(),
     };
     stream_loop(&mut ws, dashboard, stop, &mut watch);
     drop(watch);
@@ -141,11 +142,14 @@ struct WatchBinding<'a> {
     /// 시청 중인 **영속 세션 UUID** (I1 — u64는 이 계층에 없다).
     watched: Option<String>,
     generation: u64,
+    connection: u64,
 }
 
 impl WatchBinding<'_> {
     /// 시청 대상을 전환한다 (None = 해제). 같은 대상 재지정은 브리지가 no-op 처리한다.
     fn set(&mut self, to: Option<String>) {
+        self.dashboard
+            .release_resize_control_for_connection(self.connection);
         let from = std::mem::replace(&mut self.watched, to);
         self.generation = self.dashboard.rebind_watch_for_connection(
             from.as_deref(),
@@ -164,6 +168,8 @@ impl WatchBinding<'_> {
 
 impl Drop for WatchBinding<'_> {
     fn drop(&mut self) {
+        self.dashboard
+            .release_resize_control_for_connection(self.connection);
         if let Some(uuid) = self.watched.take() {
             self.dashboard
                 .rebind_watch_for_connection(Some(&uuid), None, self.generation);
@@ -223,6 +229,7 @@ fn stream_loop(
     let mut baseline: Option<std::sync::Arc<runtime::TerminalViewportSnapshot>> = None;
     // 입력 큐 압박 버전 (P6a) — watch 전환 시 리셋.
     let mut pressure_ver = 0u64;
+    let mut control_ver = 0u64;
 
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -241,6 +248,19 @@ fn stream_loop(
                 return;
             }
             last_appr = version;
+        }
+
+        if let Some((version, json, keyframe)) =
+            dashboard.terminal_control_if_newer(watch.connection, control_ver)
+        {
+            if ws.send(Message::Text(json.into())).is_err() {
+                return;
+            }
+            control_ver = version;
+            if keyframe {
+                viewport_seq = 0;
+                baseline = None;
+            }
         }
 
         // 시청 화면 push (P5c) — 슬롯이 내 seq보다 새로우면 baseline과 diff해 전송.
@@ -387,6 +407,38 @@ fn stream_loop(
                                         shift,
                                         meta,
                                     },
+                                );
+                            }
+                        }
+                        Some(ClientMsg::ResizeControl {
+                            session,
+                            action,
+                            request,
+                        }) => {
+                            if watch.is_current(&session) {
+                                dashboard.resize_control_for_connection(
+                                    watch.connection,
+                                    &session,
+                                    watch.generation,
+                                    action,
+                                    request.get(),
+                                );
+                            }
+                        }
+                        Some(ClientMsg::Resize {
+                            session,
+                            request,
+                            cols,
+                            rows,
+                        }) => {
+                            if watch.is_current(&session) {
+                                dashboard.resize_for_connection(
+                                    watch.connection,
+                                    &session,
+                                    watch.generation,
+                                    request.get(),
+                                    cols,
+                                    rows,
                                 );
                             }
                         }

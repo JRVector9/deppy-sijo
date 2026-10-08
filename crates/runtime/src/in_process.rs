@@ -331,6 +331,7 @@ impl InProcessRuntimeClient {
                     input_reply_probes: std::collections::HashMap::new(),
                     resize_epoch: 0,
                     resize_records: std::collections::HashMap::new(),
+                    terminal_controls: std::collections::HashMap::new(),
                     session_redaction_leases: std::collections::HashMap::new(),
                     seed_redaction_lease: None,
                     logs: std::collections::HashMap::new(),
@@ -910,6 +911,7 @@ struct Worker {
     /// default credential set. Removal/archive drops the complete set and starts grace expiry.
     resize_epoch: u64,
     resize_records: std::collections::HashMap<SessionId, crate::resize::ResizeRecord>,
+    terminal_controls: std::collections::HashMap<SessionId, crate::terminal_control::ControlRecord>,
     session_redaction_leases: std::collections::HashMap<SessionId, Vec<RedactionLease>>,
     /// Wire compatibility for `SeedRedaction`: one latest-only checked lease replaces the legacy
     /// permanent corpus registration. Production composition no longer sends this command.
@@ -1490,7 +1492,7 @@ impl Worker {
         let Some(record) = self.resize_records.get_mut(&session) else {
             return;
         };
-        record.result = Err(crate::ResizeFailure::Superseded);
+        record.result = Some(Err(crate::ResizeFailure::Superseded));
         let Some(epoch) = self.resize_epoch.checked_add(1) else {
             record.stamp = None;
             return;
@@ -1518,6 +1520,7 @@ impl Worker {
     ) {
         use crate::resize::{ResizeDecision, ResizeRecord};
         use crate::{ResizeFailure, ResizeStamp};
+        self.expire_terminal_control(session, Instant::now());
         if !self.sessions.contains_key(&session) {
             self.emit_resize_result(session, token, Err(ResizeFailure::MissingSession));
             return;
@@ -1526,21 +1529,57 @@ impl Worker {
             self.emit_resize_result(session, token, Err(ResizeFailure::Superseded));
             return;
         }
-        if let Some(record) = self.resize_records.get(&session)
-            && let ResizeDecision::Replay(result) = record.classify(token, (cols, rows))
-        {
-            self.emit_resize_result(session, token, result);
-            if result.is_ok()
-                || matches!(
-                    result,
-                    Err(ResizeFailure::Conflict | ResizeFailure::Superseded)
-                )
-            {
-                if let Some(active) = self.sessions.get_mut(&session) {
-                    active.mark_full_dirty();
+        if let Some(record) = self.resize_records.get(&session) {
+            match record.classify(token, (cols, rows)) {
+                ResizeDecision::Replay(result) => {
+                    self.emit_resize_result(session, token, result);
+                    if result.is_ok()
+                        || matches!(
+                            result,
+                            Err(ResizeFailure::Conflict | ResizeFailure::Superseded)
+                        )
+                    {
+                        if let Some(active) = self.sessions.get_mut(&session) {
+                            active.mark_full_dirty();
+                        }
+                        self.push_watched_viewports();
+                    }
+                    return;
                 }
-                self.push_watched_viewports();
+                ResizeDecision::Deferred | ResizeDecision::Apply => {}
             }
+        }
+        if self
+            .terminal_controls
+            .get(&session)
+            .is_some_and(|control| control.lease.is_some())
+        {
+            let mut record = self
+                .resize_records
+                .get(&session)
+                .copied()
+                .unwrap_or_else(|| {
+                    ResizeRecord::new(token, (cols, rows), Err(ResizeFailure::Superseded), None)
+                });
+            if let Err(reason) = record.change_owner(token) {
+                self.emit_resize_result(session, token, Err(reason));
+                return;
+            }
+            record.target = (cols, rows);
+            record.result = None;
+            self.resize_records.insert(session, record);
+            self.terminal_controls.get_mut(&session).unwrap().wanted =
+                Some(crate::terminal_control::NativeGeometry {
+                    cols,
+                    rows,
+                    token: Some(token),
+                });
+            self.emit(RuntimeEvent::ResizeDeferred {
+                session,
+                token,
+                cols,
+                rows,
+            });
             return;
         }
         let Some(epoch) = self.resize_epoch.checked_add(1) else {
@@ -1592,9 +1631,20 @@ impl Worker {
             return;
         }
         record.target = (cols, rows);
-        record.result = result;
+        record.result = Some(result);
         record.stamp = stamp;
         self.resize_records.insert(session, record);
+        if let Some(control) = self.terminal_controls.get_mut(&session) {
+            control.wanted = if result.is_ok() {
+                None
+            } else {
+                Some(crate::terminal_control::NativeGeometry {
+                    cols,
+                    rows,
+                    token: Some(token),
+                })
+            };
+        }
         if result.is_ok() {
             self.save_terminal_size(session, cols, rows);
         }
@@ -1603,7 +1653,380 @@ impl Worker {
         self.push_watched_viewports();
     }
 
+    fn terminal_control_state(&self, session: SessionId) -> crate::TerminalControlState {
+        self.terminal_controls
+            .get(&session)
+            .copied()
+            .unwrap_or_default()
+            .state(Instant::now())
+    }
+
+    fn emit_terminal_control_result(
+        &self,
+        session: SessionId,
+        operation_id: u64,
+        status: crate::TerminalControlStatus,
+        stamp: Option<crate::ResizeStamp>,
+    ) {
+        self.emit(RuntimeEvent::TerminalControlResult {
+            session,
+            operation_id,
+            state: self.terminal_control_state(session),
+            status,
+            stamp,
+        });
+    }
+
+    fn forget_terminal_control(&mut self, session: SessionId) {
+        if let Some(mut control) = self.terminal_controls.remove(&session)
+            && control.lease.take().is_some()
+        {
+            control.epoch = control.epoch.saturating_add(1);
+            self.emit(RuntimeEvent::TerminalControlChanged {
+                session,
+                state: control.state(Instant::now()),
+                status: crate::TerminalControlStatus::Unavailable,
+            });
+        }
+    }
+
+    fn resize_controlled_terminal(
+        &mut self,
+        session: SessionId,
+        cols: u16,
+        rows: u16,
+    ) -> (crate::TerminalControlStatus, Option<crate::ResizeStamp>) {
+        use crate::TerminalControlStatus as Status;
+        let Some(epoch) = self.resize_epoch.checked_add(1) else {
+            return (Status::ResizeFailed, None);
+        };
+        self.resize_epoch = epoch;
+        let owner_epoch = self
+            .resize_records
+            .get(&session)
+            .map_or(0, |record| record.token.owner_epoch);
+        let Some(active) = self.sessions.get_mut(&session) else {
+            return (Status::Unavailable, None);
+        };
+        let result = active.resize_checked(cols, rows);
+        if let Ok(applied) = &result
+            && let Some(event) = applied.cache_event
+        {
+            trace_terminal_cache_event(session, event);
+        }
+        let stamp = active
+            .grid_dimensions()
+            .map(|(cols, rows)| crate::ResizeStamp {
+                epoch,
+                owner_epoch,
+                token: None,
+                cols,
+                rows,
+            });
+        let wanted = self
+            .terminal_controls
+            .get(&session)
+            .and_then(|control| control.wanted);
+        if let Some(record) = self.resize_records.get_mut(&session) {
+            record.stamp = stamp;
+            if let Some(result) = record.result {
+                let retry_desktop = result.is_err_and(crate::ResizeFailure::retryable)
+                    && wanted.is_some_and(|wanted| {
+                        wanted.token == Some(record.token)
+                            && (wanted.cols, wanted.rows) == record.target
+                    });
+                record.result = if retry_desktop {
+                    None
+                } else {
+                    Some(Err(crate::ResizeFailure::Superseded))
+                };
+            }
+        }
+        active.mark_full_dirty();
+        crate::signal_memory_released();
+        (
+            if result.is_ok() {
+                Status::Owned
+            } else {
+                Status::ResizeFailed
+            },
+            stamp,
+        )
+    }
+
+    fn end_terminal_control(
+        &mut self,
+        session: SessionId,
+        reason: crate::TerminalControlStatus,
+    ) -> (crate::TerminalControlStatus, Option<crate::ResizeStamp>) {
+        use crate::TerminalControlStatus as Status;
+        let Some(control) = self.terminal_controls.get_mut(&session) else {
+            return (Status::Stale, None);
+        };
+        let Some(lease) = control.lease.take() else {
+            return (Status::Stale, None);
+        };
+        control.epoch = control.epoch.saturating_add(1);
+        let wanted = control.wanted;
+        self.emit(RuntimeEvent::TerminalControlChanged {
+            session,
+            state: self.terminal_control_state(session),
+            status: reason,
+        });
+        let mut status = reason;
+        let mut stamp = None;
+        if let Some(wanted) = wanted {
+            if let Some(token) = wanted.token {
+                self.apply_tracked_resize(session, token, wanted.cols, wanted.rows);
+                let result = self
+                    .resize_records
+                    .get(&session)
+                    .and_then(|record| record.result);
+                match result {
+                    Some(Ok(actual)) => stamp = Some(actual),
+                    _ => status = Status::RestoreFailed,
+                }
+            } else {
+                let (result, actual) =
+                    self.resize_controlled_terminal(session, wanted.cols, wanted.rows);
+                stamp = actual;
+                if result == Status::Owned {
+                    if let Some(control) = self.terminal_controls.get_mut(&session) {
+                        control.wanted = None;
+                    }
+                    self.save_terminal_size(session, wanted.cols, wanted.rows);
+                } else {
+                    status = Status::RestoreFailed;
+                }
+                self.push_watched_viewports();
+            }
+        }
+        if let Some(control) = self.terminal_controls.get_mut(&session) {
+            control.released = Some((lease.owner, lease.epoch, status, stamp));
+        }
+        if status == Status::RestoreFailed {
+            self.emit(RuntimeEvent::TerminalControlChanged {
+                session,
+                state: self.terminal_control_state(session),
+                status,
+            });
+        }
+        (status, stamp)
+    }
+
+    fn expire_terminal_control(&mut self, session: SessionId, now: Instant) {
+        if self
+            .terminal_controls
+            .get(&session)
+            .and_then(|control| control.lease)
+            .is_some_and(|lease| lease.expires_at <= now)
+        {
+            self.end_terminal_control(session, crate::TerminalControlStatus::Expired);
+        }
+    }
+
+    fn expire_terminal_controls(&mut self, now: Instant) {
+        let due = self
+            .terminal_controls
+            .iter()
+            .filter_map(|(&session, control)| {
+                control
+                    .lease
+                    .filter(|lease| lease.expires_at <= now)
+                    .map(|_| session)
+            })
+            .collect::<Vec<_>>();
+        for session in due {
+            self.end_terminal_control(session, crate::TerminalControlStatus::Expired);
+        }
+    }
+
+    fn handle_terminal_control(
+        &mut self,
+        session: SessionId,
+        operation_id: u64,
+        request: crate::TerminalControlRequest,
+    ) {
+        use crate::TerminalControlRequest as Request;
+        use crate::TerminalControlStatus as Status;
+        use crate::terminal_control::{ControlLease, NativeGeometry, ResizeReplay};
+        // Restoring another session can cross this target's deadline after the
+        // outer expiry sweep captured its timestamp. Recheck before authority.
+        self.expire_terminal_control(session, Instant::now());
+        if !self
+            .sessions
+            .get(&session)
+            .is_some_and(|active| active.lifecycle() == session::SessionLifecycle::Running)
+        {
+            self.forget_terminal_control(session);
+            self.emit_terminal_control_result(session, operation_id, Status::Unavailable, None);
+            return;
+        }
+        let now = Instant::now();
+        let record = *self.terminal_controls.entry(session).or_default();
+        match request {
+            Request::Query => self.emit_terminal_control_result(
+                session,
+                operation_id,
+                if record.lease.is_some() {
+                    Status::Owned
+                } else {
+                    Status::Released
+                },
+                None,
+            ),
+            Request::Acquire {
+                owner,
+                expected_epoch,
+                ttl_ms,
+            } => {
+                if let Some(lease) = record.lease {
+                    let status = if lease.owner == owner
+                        && expected_epoch.checked_add(1) == Some(lease.epoch)
+                    {
+                        Status::Owned
+                    } else {
+                        Status::InUse
+                    };
+                    self.emit_terminal_control_result(session, operation_id, status, None);
+                    return;
+                }
+                let Some(epoch) = record
+                    .epoch
+                    .checked_add(1)
+                    .filter(|_| expected_epoch == record.epoch)
+                else {
+                    self.emit_terminal_control_result(session, operation_id, Status::Stale, None);
+                    return;
+                };
+                let Some((cols, rows)) = self.sessions[&session].grid_dimensions() else {
+                    self.emit_terminal_control_result(
+                        session,
+                        operation_id,
+                        Status::Unavailable,
+                        None,
+                    );
+                    return;
+                };
+                let control = self.terminal_controls.get_mut(&session).unwrap();
+                control.epoch = epoch;
+                control.lease = Some(ControlLease {
+                    owner,
+                    epoch,
+                    expires_at: now + Duration::from_millis(u64::from(ttl_ms)),
+                    resize: None,
+                });
+                control.wanted = control.wanted.or(Some(NativeGeometry {
+                    cols,
+                    rows,
+                    token: None,
+                }));
+                control.released = None;
+                self.emit(RuntimeEvent::TerminalControlChanged {
+                    session,
+                    state: self.terminal_control_state(session),
+                    status: Status::Owned,
+                });
+                self.emit_terminal_control_result(session, operation_id, Status::Owned, None);
+            }
+            Request::Renew {
+                owner,
+                lease_epoch,
+                ttl_ms,
+            } => {
+                if let Some(lease) = self
+                    .terminal_controls
+                    .get_mut(&session)
+                    .and_then(|control| control.lease.as_mut())
+                    && lease.owner == owner
+                    && lease.epoch == lease_epoch
+                {
+                    lease.expires_at = now + Duration::from_millis(u64::from(ttl_ms));
+                    self.emit_terminal_control_result(session, operation_id, Status::Owned, None);
+                } else {
+                    self.emit_terminal_control_result(session, operation_id, Status::Stale, None);
+                }
+            }
+            Request::Release { owner, lease_epoch } => {
+                if record
+                    .lease
+                    .is_some_and(|lease| lease.owner == owner && lease.epoch == lease_epoch)
+                {
+                    let (status, stamp) = self.end_terminal_control(session, Status::Released);
+                    self.emit_terminal_control_result(session, operation_id, status, stamp);
+                } else if let Some((last_owner, last_epoch, status, stamp)) = record.released
+                    && last_owner == owner
+                    && last_epoch == lease_epoch
+                {
+                    self.emit_terminal_control_result(session, operation_id, status, stamp);
+                } else {
+                    self.emit_terminal_control_result(session, operation_id, Status::Stale, None);
+                }
+            }
+            Request::Resize {
+                owner,
+                lease_epoch,
+                revision,
+                cols,
+                rows,
+            } => {
+                let Some(lease) = record
+                    .lease
+                    .filter(|lease| lease.owner == owner && lease.epoch == lease_epoch)
+                else {
+                    self.emit_terminal_control_result(session, operation_id, Status::Stale, None);
+                    return;
+                };
+                if let Some(replay) = lease.resize
+                    && revision <= replay.revision
+                {
+                    if revision == replay.revision && replay.target == (cols, rows) {
+                        self.emit_terminal_control_result(
+                            session,
+                            operation_id,
+                            replay.status,
+                            replay.stamp,
+                        );
+                    } else {
+                        self.emit_terminal_control_result(
+                            session,
+                            operation_id,
+                            Status::Stale,
+                            None,
+                        );
+                    }
+                    return;
+                }
+                let (status, stamp) = if !(32..=400).contains(&cols)
+                    || !(2..=200).contains(&rows)
+                    || u32::from(cols) * u32::from(rows) > crate::command::TERMINAL_CELL_COUNT_MAX
+                {
+                    (Status::InvalidSize, None)
+                } else {
+                    self.resize_controlled_terminal(session, cols, rows)
+                };
+                self.terminal_controls
+                    .get_mut(&session)
+                    .unwrap()
+                    .lease
+                    .as_mut()
+                    .unwrap()
+                    .resize = Some(ResizeReplay {
+                    revision,
+                    target: (cols, rows),
+                    status,
+                    stamp,
+                });
+                self.emit_terminal_control_result(session, operation_id, status, stamp);
+                if stamp.is_some() {
+                    self.push_watched_viewports();
+                }
+            }
+        }
+    }
+
     fn remove_session(&mut self, session: SessionId) -> Option<Session> {
+        self.forget_terminal_control(session);
         self.invalidate_resize(session);
         self.scrollback_results.remove(&session);
         self.archive_failed.remove(&session);
@@ -1798,7 +2221,14 @@ impl Worker {
             } else {
                 self.batch
             };
+            let wait = self
+                .terminal_controls
+                .values()
+                .filter_map(|control| control.lease)
+                .map(|lease| lease.expires_at.saturating_duration_since(now))
+                .fold(wait, Duration::min);
             std::thread::park_timeout(wait);
+            self.expire_terminal_controls(Instant::now());
 
             // 몰려온 명령은 한 번에 소화하되 상한을 둔다 — 명령 폭주
             // (paste/resize 연타)가 PTY pump·로그·상태 감지를 굶기지 않게 한다.
@@ -2156,6 +2586,7 @@ impl Worker {
     }
 
     fn handle_command(&mut self, command: RuntimeCommand) {
+        self.expire_terminal_controls(Instant::now());
         // 하나의 복원 명령이 만든 세션 전체를 집계한 뒤 완료를 알린다.
         self.scrollback_batching = true;
         self.handle_command_inner(command);
@@ -2618,6 +3049,11 @@ impl Worker {
                 let _ = self.admit_input(session, &bytes);
             }
             RuntimeCommand::RequestMuxSnapshot => self.emit_current_mux_snapshot(),
+            RuntimeCommand::TerminalControl {
+                session,
+                operation_id,
+                request,
+            } => self.handle_terminal_control(session, operation_id, request),
             RuntimeCommand::WriteTerminalInput { session, input } => {
                 if input.requires_current_modes() {
                     // Commands run before the normal output pump. Parse the target's queued
@@ -2708,6 +3144,18 @@ impl Worker {
                 cols,
                 rows,
             } => {
+                self.expire_terminal_control(session, Instant::now());
+                if let Some(control) = self.terminal_controls.get_mut(&session)
+                    && control.lease.is_some()
+                {
+                    control.wanted = Some(crate::terminal_control::NativeGeometry {
+                        cols,
+                        rows,
+                        token: None,
+                    });
+                    self.invalidate_resize(session);
+                    return;
+                }
                 if let Some(active) = self.sessions.get_mut(&session) {
                     if let Some(event) = active.resize(cols, rows) {
                         trace_terminal_cache_event(session, event);
@@ -2718,6 +3166,18 @@ impl Worker {
                         active.cache_class(),
                         TerminalCacheClass::Hidden | TerminalCacheClass::Exited
                     );
+                    let applied_target = active.grid_dimensions() == Some((cols, rows));
+                    if let Some(control) = self.terminal_controls.get_mut(&session) {
+                        control.wanted = if applied_target {
+                            None
+                        } else {
+                            Some(crate::terminal_control::NativeGeometry {
+                                cols,
+                                rows,
+                                token: None,
+                            })
+                        };
+                    }
                     self.save_terminal_size(session, cols, rows);
                     self.invalidate_resize(session);
                     if freed_scrollback {
@@ -4711,6 +5171,7 @@ impl Worker {
         // 증가 = spawn 순서)로 정렬해 결정적 LRU를 만든다 (오래된 것이 앞. codex 리뷰)
         exited.sort_by_key(|(s, _)| s.0);
         for (session, exit_code) in exited {
+            self.forget_terminal_control(session);
             let detail = exit_code.map(|c| format!("exit code {c}"));
             self.close_session_log(session, "exited", detail.as_deref());
             self.detectors.remove(&session);
@@ -6637,6 +7098,7 @@ mod tests {
                 input_reply_probes: std::collections::HashMap::new(),
                 resize_epoch: 0,
                 resize_records: std::collections::HashMap::new(),
+                terminal_controls: std::collections::HashMap::new(),
                 session_redaction_leases: std::collections::HashMap::new(),
                 seed_redaction_lease: None,
                 secret_resolver: resolver,
@@ -9458,6 +9920,1026 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn terminal_control_review_rechecks_target_expiry_after_other_restore_before_renew_or_resize() {
+        use crate::{TerminalControlRequest as Control, TerminalControlStatus as Status};
+        for resize in [false, true] {
+            let mut harness = UnattachedHarness::new("control-review-fresh-expiry");
+            let first = harness.spawn_attached();
+            let target = harness.spawn_attached();
+            for (id, owner) in [(first, [7; 16]), (target, [8; 16])] {
+                control_operation(
+                    &mut harness,
+                    id,
+                    1,
+                    Control::Acquire {
+                        owner,
+                        expected_epoch: 0,
+                        ttl_ms: 15_000,
+                    },
+                );
+                control_operation(
+                    &mut harness,
+                    id,
+                    2,
+                    Control::Resize {
+                        owner,
+                        lease_epoch: 1,
+                        revision: 1,
+                        cols: 40,
+                        rows: 6,
+                    },
+                );
+            }
+            let captured = Instant::now();
+            harness
+                .worker
+                .terminal_controls
+                .get_mut(&first)
+                .unwrap()
+                .lease
+                .as_mut()
+                .unwrap()
+                .expires_at = captured;
+            harness
+                .worker
+                .terminal_controls
+                .get_mut(&target)
+                .unwrap()
+                .lease
+                .as_mut()
+                .unwrap()
+                .expires_at = captured + Duration::from_secs(1);
+            harness.worker.expire_terminal_controls(captured);
+            harness.events.try_iter().for_each(drop);
+            // The target crosses its deadline during another session's restoration.
+            // Enter the same target handler after the outer expiry pass has finished.
+            harness
+                .worker
+                .terminal_controls
+                .get_mut(&target)
+                .unwrap()
+                .lease
+                .as_mut()
+                .unwrap()
+                .expires_at = Instant::now();
+            harness.worker.handle_terminal_control(
+                target,
+                3,
+                if resize {
+                    Control::Resize {
+                        owner: [8; 16],
+                        lease_epoch: 1,
+                        revision: 2,
+                        cols: 50,
+                        rows: 8,
+                    }
+                } else {
+                    Control::Renew {
+                        owner: [8; 16],
+                        lease_epoch: 1,
+                        ttl_ms: 15_000,
+                    }
+                },
+            );
+            let events = harness.events.try_iter().collect::<Vec<_>>();
+            assert_eq!(
+                control_status(&events, 3),
+                Status::Stale,
+                "target must not revive after its deadline"
+            );
+            assert_eq!(
+                harness.worker.sessions[&target].grid_dimensions(),
+                Some((80, 24))
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn terminal_control_review_failed_restore_retains_desktop_want_across_reacquire() {
+        use crate::{TerminalControlRequest as Control, TerminalControlStatus as Status};
+        let mut harness = UnattachedHarness::new("control-review-failed-restore");
+        let id = harness.spawn_attached();
+        control_operation(
+            &mut harness,
+            id,
+            1,
+            Control::Acquire {
+                owner: [7; 16],
+                expected_epoch: 0,
+                ttl_ms: 15_000,
+            },
+        );
+        control_operation(
+            &mut harness,
+            id,
+            2,
+            Control::Resize {
+                owner: [7; 16],
+                lease_epoch: 1,
+                revision: 1,
+                cols: 40,
+                rows: 6,
+            },
+        );
+        // Exercise the real application failure path before any backend mutation.
+        let epoch = harness.worker.resize_epoch;
+        harness.worker.resize_epoch = u64::MAX;
+        assert_eq!(
+            control_status(
+                &control_operation(
+                    &mut harness,
+                    id,
+                    3,
+                    Control::Release {
+                        owner: [7; 16],
+                        lease_epoch: 1
+                    }
+                ),
+                3
+            ),
+            Status::RestoreFailed
+        );
+        assert_eq!(
+            harness.worker.sessions[&id].grid_dimensions(),
+            Some((40, 6))
+        );
+        let wanted = harness.worker.terminal_controls[&id]
+            .wanted
+            .expect("failed application must retain desktop target");
+        assert_eq!((wanted.cols, wanted.rows), (80, 24));
+        harness.worker.resize_epoch = epoch;
+        control_operation(
+            &mut harness,
+            id,
+            4,
+            Control::Acquire {
+                owner: [8; 16],
+                expected_epoch: 2,
+                ttl_ms: 15_000,
+            },
+        );
+        control_operation(
+            &mut harness,
+            id,
+            5,
+            Control::Release {
+                owner: [8; 16],
+                lease_epoch: 3,
+            },
+        );
+        assert_eq!(
+            harness.worker.sessions[&id].grid_dimensions(),
+            Some((80, 24)),
+            "later acquire cannot adopt mobile geometry as desktop desire"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn terminal_control_review_retryable_tracked_restore_reacquire_resize_release_keeps_latest_token()
+     {
+        use crate::{
+            ResizeToken, TerminalControlRequest as Control, TerminalControlStatus as Status,
+        };
+        let mut harness = UnattachedHarness::new("control-review-tracked-restore");
+        let id = harness.spawn_attached();
+        control_operation(
+            &mut harness,
+            id,
+            1,
+            Control::Acquire {
+                owner: [7; 16],
+                expected_epoch: 0,
+                ttl_ms: 15_000,
+            },
+        );
+        control_operation(
+            &mut harness,
+            id,
+            2,
+            Control::Resize {
+                owner: [7; 16],
+                lease_epoch: 1,
+                revision: 1,
+                cols: 40,
+                rows: 6,
+            },
+        );
+        let latest = ResizeToken {
+            owner: [1; 16],
+            generation: 1,
+            owner_epoch: 1,
+        };
+        harness
+            .worker
+            .handle_command(RuntimeCommand::ResizeTracked {
+                session: id,
+                token: latest,
+                cols: 120,
+                rows: 34,
+            });
+        harness.events.try_iter().for_each(drop);
+        let epoch = harness.worker.resize_epoch;
+        harness.worker.resize_epoch = u64::MAX;
+        assert_eq!(
+            control_status(
+                &control_operation(
+                    &mut harness,
+                    id,
+                    3,
+                    Control::Release {
+                        owner: [7; 16],
+                        lease_epoch: 1
+                    }
+                ),
+                3
+            ),
+            Status::RestoreFailed
+        );
+        harness.worker.resize_epoch = epoch;
+        // Inject the cached result of a transient PTY failure. The actual real
+        // terminal is still mobile-sized after the preceding failed restore.
+        harness.worker.resize_records.get_mut(&id).unwrap().result =
+            Some(Err(crate::ResizeFailure::Pty));
+        assert_eq!(
+            harness.worker.terminal_controls[&id].wanted.unwrap().token,
+            Some(latest)
+        );
+        control_operation(
+            &mut harness,
+            id,
+            4,
+            Control::Acquire {
+                owner: [8; 16],
+                expected_epoch: 2,
+                ttl_ms: 15_000,
+            },
+        );
+        control_operation(
+            &mut harness,
+            id,
+            5,
+            Control::Resize {
+                owner: [8; 16],
+                lease_epoch: 3,
+                revision: 1,
+                cols: 50,
+                rows: 8,
+            },
+        );
+        let events = control_operation(
+            &mut harness,
+            id,
+            6,
+            Control::Release {
+                owner: [8; 16],
+                lease_epoch: 3,
+            },
+        );
+        assert_eq!(
+            control_status(&events, 6),
+            Status::Released,
+            "retained latest tracked desire remains eligible after another mobile resize"
+        );
+        assert_eq!(
+            harness.worker.sessions[&id].grid_dimensions(),
+            Some((120, 34))
+        );
+        assert!(events.iter().any(|event| matches!(event, RuntimeEvent::ResizeApplied { stamp, .. } if stamp.token == Some(latest) && (stamp.cols, stamp.rows) == (120, 34))));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn terminal_control_expiry_has_its_own_wakeup_with_maximum_fallback_batch() {
+        use crate::{TerminalControlRequest as Control, TerminalControlStatus as Status};
+        let client = InProcessRuntimeClient::with_shell(
+            1_000,
+            test_store(),
+            test_logs_root("control-long-batch"),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+            None,
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        let session = probe.wait_for(Duration::from_secs(5), |event| match event {
+            RuntimeEvent::ShellSpawned { session } => Some(*session),
+            _ => None,
+        });
+        client
+            .send_command(RuntimeCommand::TerminalControl {
+                session,
+                operation_id: 1,
+                request: Control::Acquire {
+                    owner: [7; 16],
+                    expected_epoch: 0,
+                    ttl_ms: 200,
+                },
+            })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(5), |event| match event {
+            RuntimeEvent::TerminalControlResult {
+                operation_id: 1,
+                status: Status::Owned,
+                ..
+            } => Some(()),
+            _ => None,
+        });
+        let started = Instant::now();
+        probe.wait_for(Duration::from_millis(750), |event| match event {
+            RuntimeEvent::TerminalControlChanged {
+                status: Status::Expired,
+                state,
+                ..
+            } if state.owner.is_none() => Some(()),
+            _ => None,
+        });
+        assert!(
+            started.elapsed() < Duration::from_millis(750),
+            "lease must expire without output or another command"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn terminal_control_mobile_geometry_never_overwrites_persisted_desktop_preference() {
+        use crate::{
+            ResizeToken, TerminalControlRequest as Control, TerminalControlStatus as Status,
+        };
+        let dir = std::env::temp_dir().join(format!("deppy-control-size-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("metadata.sqlite3");
+        create_persist_db(&db_path, "control-size");
+        let logs = dir.join("logs");
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            logs.clone(),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+            Some(crate::persistence::PersistConfig {
+                db_path,
+                workspace_id: "control-size".into(),
+            }),
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        let (session, persistent) = probe.wait_for(Duration::from_secs(5), |event| match event {
+            RuntimeEvent::MuxUpdated { snapshot } => snapshot
+                .tabs
+                .iter()
+                .flat_map(|tab| &tab.panes)
+                .find_map(|pane| pane.session_id.zip(pane.persistent_session_id.clone())),
+            _ => None,
+        });
+        let first = ResizeToken {
+            owner: [1; 16],
+            owner_epoch: 1,
+            generation: 1,
+        };
+        client
+            .send_command(RuntimeCommand::ResizeTracked {
+                session,
+                token: first,
+                cols: 100,
+                rows: 30,
+            })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(5), |event| match event {
+            RuntimeEvent::ResizeApplied { stamp, .. } if stamp.token == Some(first) => Some(()),
+            _ => None,
+        });
+        assert_eq!(
+            SessionLogWriter::load_terminal_size(&logs, &persistent).unwrap(),
+            Some((100, 30))
+        );
+        client
+            .send_command(RuntimeCommand::TerminalControl {
+                session,
+                operation_id: 1,
+                request: Control::Acquire {
+                    owner: [7; 16],
+                    expected_epoch: 0,
+                    ttl_ms: 15_000,
+                },
+            })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(5), |event| match event {
+            RuntimeEvent::TerminalControlResult {
+                operation_id: 1,
+                status: Status::Owned,
+                ..
+            } => Some(()),
+            _ => None,
+        });
+        client
+            .send_command(RuntimeCommand::TerminalControl {
+                session,
+                operation_id: 2,
+                request: Control::Resize {
+                    owner: [7; 16],
+                    lease_epoch: 1,
+                    revision: 1,
+                    cols: 40,
+                    rows: 6,
+                },
+            })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(5), |event| match event {
+            RuntimeEvent::TerminalControlResult {
+                operation_id: 2,
+                status: Status::Owned,
+                ..
+            } => Some(()),
+            _ => None,
+        });
+        assert_eq!(
+            SessionLogWriter::load_terminal_size(&logs, &persistent).unwrap(),
+            Some((100, 30))
+        );
+        let latest = ResizeToken {
+            generation: 2,
+            ..first
+        };
+        client
+            .send_command(RuntimeCommand::ResizeTracked {
+                session,
+                token: latest,
+                cols: 120,
+                rows: 34,
+            })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(5), |event| match event {
+            RuntimeEvent::ResizeDeferred { token, .. } if *token == latest => Some(()),
+            _ => None,
+        });
+        assert_eq!(
+            SessionLogWriter::load_terminal_size(&logs, &persistent).unwrap(),
+            Some((100, 30))
+        );
+        client
+            .send_command(RuntimeCommand::TerminalControl {
+                session,
+                operation_id: 3,
+                request: Control::Release {
+                    owner: [7; 16],
+                    lease_epoch: 1,
+                },
+            })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(5), |event| match event {
+            RuntimeEvent::TerminalControlResult {
+                operation_id: 3,
+                status: Status::Released,
+                ..
+            } => Some(()),
+            _ => None,
+        });
+        assert_eq!(
+            SessionLogWriter::load_terminal_size(&logs, &persistent).unwrap(),
+            Some((120, 34))
+        );
+        drop(probe);
+        drop(client);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn control_operation(
+        harness: &mut UnattachedHarness,
+        id: SessionId,
+        operation_id: u64,
+        request: crate::TerminalControlRequest,
+    ) -> Vec<RuntimeEvent> {
+        harness
+            .worker
+            .handle_command(RuntimeCommand::TerminalControl {
+                session: id,
+                operation_id,
+                request,
+            });
+        harness.events.try_iter().collect()
+    }
+
+    fn control_status(events: &[RuntimeEvent], operation_id: u64) -> crate::TerminalControlStatus {
+        events
+            .iter()
+            .find_map(|event| match event {
+                RuntimeEvent::TerminalControlResult {
+                    operation_id: actual,
+                    status,
+                    ..
+                } if *actual == operation_id => Some(*status),
+                _ => None,
+            })
+            .expect("authoritative control result")
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn terminal_control_single_owner_revisions_geometry_bounds_and_stale_release() {
+        use crate::{TerminalControlRequest as Control, TerminalControlStatus as Status};
+        let mut harness = UnattachedHarness::new("control-owner-revisions");
+        let id = harness.spawn_attached();
+        let a = [7; 16];
+        let b = [8; 16];
+        let acquire = control_operation(
+            &mut harness,
+            id,
+            1,
+            Control::Acquire {
+                owner: a,
+                expected_epoch: 0,
+                ttl_ms: 15_000,
+            },
+        );
+        assert_eq!(control_status(&acquire, 1), Status::Owned);
+        assert_eq!(
+            control_status(
+                &control_operation(
+                    &mut harness,
+                    id,
+                    2,
+                    Control::Acquire {
+                        owner: b,
+                        expected_epoch: 0,
+                        ttl_ms: 15_000
+                    }
+                ),
+                2
+            ),
+            Status::InUse
+        );
+        assert_eq!(
+            control_status(
+                &control_operation(
+                    &mut harness,
+                    id,
+                    3,
+                    Control::Resize {
+                        owner: b,
+                        lease_epoch: 1,
+                        revision: 1,
+                        cols: 40,
+                        rows: 6
+                    }
+                ),
+                3
+            ),
+            Status::Stale
+        );
+        for (revision, cols, rows) in [
+            (1, 31, 2),
+            (2, 401, 2),
+            (3, 32, 1),
+            (4, 32, 201),
+            (5, 400, 200),
+        ] {
+            let op = revision + 3;
+            assert_eq!(
+                control_status(
+                    &control_operation(
+                        &mut harness,
+                        id,
+                        op,
+                        Control::Resize {
+                            owner: a,
+                            lease_epoch: 1,
+                            revision,
+                            cols,
+                            rows
+                        }
+                    ),
+                    op
+                ),
+                Status::InvalidSize
+            );
+            assert_eq!(
+                harness.worker.sessions[&id].grid_dimensions(),
+                Some((80, 24))
+            );
+        }
+        assert_eq!(
+            control_status(
+                &control_operation(
+                    &mut harness,
+                    id,
+                    10,
+                    Control::Resize {
+                        owner: a,
+                        lease_epoch: 1,
+                        revision: 6,
+                        cols: 32,
+                        rows: 2
+                    }
+                ),
+                10
+            ),
+            Status::Owned
+        );
+        let stamp_epoch = harness.worker.resize_epoch;
+        assert_eq!(
+            control_status(
+                &control_operation(
+                    &mut harness,
+                    id,
+                    11,
+                    Control::Resize {
+                        owner: a,
+                        lease_epoch: 1,
+                        revision: 6,
+                        cols: 32,
+                        rows: 2
+                    }
+                ),
+                11
+            ),
+            Status::Owned
+        );
+        assert_eq!(harness.worker.resize_epoch, stamp_epoch);
+        assert_eq!(
+            control_status(
+                &control_operation(
+                    &mut harness,
+                    id,
+                    12,
+                    Control::Resize {
+                        owner: a,
+                        lease_epoch: 1,
+                        revision: 6,
+                        cols: 33,
+                        rows: 2
+                    }
+                ),
+                12
+            ),
+            Status::Stale
+        );
+        assert_eq!(
+            control_status(
+                &control_operation(
+                    &mut harness,
+                    id,
+                    13,
+                    Control::Release {
+                        owner: b,
+                        lease_epoch: 1
+                    }
+                ),
+                13
+            ),
+            Status::Stale
+        );
+        assert_eq!(
+            harness.worker.sessions[&id].grid_dimensions(),
+            Some((32, 2))
+        );
+        assert_eq!(
+            control_status(
+                &control_operation(
+                    &mut harness,
+                    id,
+                    14,
+                    Control::Release {
+                        owner: a,
+                        lease_epoch: 1
+                    }
+                ),
+                14
+            ),
+            Status::Released
+        );
+        assert_eq!(
+            control_status(
+                &control_operation(
+                    &mut harness,
+                    id,
+                    15,
+                    Control::Acquire {
+                        owner: b,
+                        expected_epoch: 2,
+                        ttl_ms: 15_000
+                    }
+                ),
+                15
+            ),
+            Status::Owned
+        );
+        control_operation(
+            &mut harness,
+            id,
+            16,
+            Control::Release {
+                owner: a,
+                lease_epoch: 1,
+            },
+        );
+        assert_eq!(harness.worker.terminal_control_state(id).owner, Some(b));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn terminal_control_expiry_restores_legacy_native_want_and_late_renew_cannot_reacquire() {
+        use crate::{TerminalControlRequest as Control, TerminalControlStatus as Status};
+        let mut harness = UnattachedHarness::new("control-expiry-native");
+        let id = harness.spawn_attached();
+        let owner = [7; 16];
+        control_operation(
+            &mut harness,
+            id,
+            1,
+            Control::Acquire {
+                owner,
+                expected_epoch: 0,
+                ttl_ms: 15_000,
+            },
+        );
+        control_operation(
+            &mut harness,
+            id,
+            2,
+            Control::Resize {
+                owner,
+                lease_epoch: 1,
+                revision: 1,
+                cols: 40,
+                rows: 6,
+            },
+        );
+        harness.worker.handle_command(RuntimeCommand::Resize {
+            session: id,
+            cols: 130,
+            rows: 35,
+        });
+        assert_eq!(
+            harness.worker.sessions[&id].grid_dimensions(),
+            Some((40, 6))
+        );
+        harness
+            .worker
+            .terminal_controls
+            .get_mut(&id)
+            .unwrap()
+            .lease
+            .as_mut()
+            .unwrap()
+            .expires_at = Instant::now();
+        let events = control_operation(
+            &mut harness,
+            id,
+            3,
+            Control::Renew {
+                owner,
+                lease_epoch: 1,
+                ttl_ms: 15_000,
+            },
+        );
+        assert_eq!(control_status(&events, 3), Status::Stale);
+        assert!(events.iter().any(|event| matches!(event, RuntimeEvent::TerminalControlChanged { status: Status::Expired, state, .. } if state.owner.is_none())));
+        assert_eq!(
+            harness.worker.sessions[&id].grid_dimensions(),
+            Some((130, 35))
+        );
+        assert_eq!(harness.worker.terminal_control_state(id).owner, None);
+        assert_eq!(
+            control_status(
+                &control_operation(
+                    &mut harness,
+                    id,
+                    4,
+                    Control::Acquire {
+                        owner,
+                        expected_epoch: 0,
+                        ttl_ms: 15_000
+                    }
+                ),
+                4
+            ),
+            Status::Stale
+        );
+        let epoch = harness.worker.resize_epoch;
+        control_operation(
+            &mut harness,
+            id,
+            5,
+            Control::Release {
+                owner,
+                lease_epoch: 1,
+            },
+        );
+        assert_eq!(harness.worker.resize_epoch, epoch);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn terminal_control_real_pty_reports_mobile_and_restored_native_geometry() {
+        use crate::TerminalControlRequest as Control;
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, events) = admission_worker(resolver, "control-real-pty-stty");
+        let id = SessionId(1);
+        let (output_tx, output_rx) = std::sync::mpsc::channel();
+        let live = Session::spawn_with_spec_and_output_wake(
+            id,
+            session::SessionKind::Shell,
+            &spec(
+                "/bin/sh",
+                &[
+                    "-c",
+                    r"stty raw -echo; printf 'READY\r\n'; while IFS= read -r line; do stty size; done",
+                ],
+            ),
+            80,
+            24,
+            100,
+            Arc::new(move || {
+                let _ = output_tx.send(());
+            }),
+        )
+        .unwrap();
+        worker.sessions.insert(id, live);
+        let wait_text = |worker: &mut Worker, wanted: &str| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let effects = worker.collect_session_pump_effects(&[id], false, true);
+                worker.finish_session_pump_effects(effects);
+                events.try_iter().for_each(drop);
+                if worker.sessions[&id].screen_text().contains(wanted) {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "PTY did not report {wanted:?}");
+                let _ = output_rx.recv_timeout(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(100)),
+                );
+            }
+        };
+        wait_text(&mut worker, "READY");
+        worker.handle_command(RuntimeCommand::TerminalControl {
+            session: id,
+            operation_id: 1,
+            request: Control::Acquire {
+                owner: [7; 16],
+                expected_epoch: 0,
+                ttl_ms: 15_000,
+            },
+        });
+        worker.handle_command(RuntimeCommand::TerminalControl {
+            session: id,
+            operation_id: 2,
+            request: Control::Resize {
+                owner: [7; 16],
+                lease_epoch: 1,
+                revision: 1,
+                cols: 40,
+                rows: 6,
+            },
+        });
+        worker.handle_command(RuntimeCommand::WriteInput {
+            session: id,
+            bytes: vec![b'\n'],
+        });
+        wait_text(&mut worker, "6 40");
+        worker.handle_command(RuntimeCommand::Resize {
+            session: id,
+            cols: 120,
+            rows: 34,
+        });
+        worker.handle_command(RuntimeCommand::TerminalControl {
+            session: id,
+            operation_id: 3,
+            request: Control::Release {
+                owner: [7; 16],
+                lease_epoch: 1,
+            },
+        });
+        worker.handle_command(RuntimeCommand::WriteInput {
+            session: id,
+            bytes: vec![b'\n'],
+        });
+        wait_text(&mut worker, "34 120");
+        assert_eq!(worker.sessions[&id].grid_dimensions(), Some((120, 34)));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn terminal_control_defers_native_geometry_and_restores_latest_real_pty_target_once() {
+        use crate::{ResizeToken, TerminalControlRequest as Control};
+        let mut harness = UnattachedHarness::new("control-native-geometry");
+        let id = harness.spawn_attached();
+        let owner = [7; 16];
+        harness
+            .worker
+            .handle_command(RuntimeCommand::TerminalControl {
+                session: id,
+                operation_id: 1,
+                request: Control::Acquire {
+                    owner,
+                    expected_epoch: 0,
+                    ttl_ms: 15_000,
+                },
+            });
+        harness.events.try_iter().for_each(drop);
+        harness
+            .worker
+            .handle_command(RuntimeCommand::TerminalControl {
+                session: id,
+                operation_id: 2,
+                request: Control::Resize {
+                    owner,
+                    lease_epoch: 1,
+                    revision: 1,
+                    cols: 40,
+                    rows: 6,
+                },
+            });
+        harness.events.try_iter().for_each(drop);
+        let first = ResizeToken {
+            owner: [1; 16],
+            generation: 1,
+            owner_epoch: 1,
+        };
+        let latest = ResizeToken {
+            generation: 2,
+            ..first
+        };
+        for (token, cols, rows) in [
+            (first, 110, 33),
+            (latest, 120, 34),
+            (latest, 120, 34),
+            (first, 110, 33),
+        ] {
+            harness
+                .worker
+                .handle_command(RuntimeCommand::ResizeTracked {
+                    session: id,
+                    token,
+                    cols,
+                    rows,
+                });
+            let events = harness.events.try_iter().collect::<Vec<_>>();
+            if token == first && harness.worker.resize_records[&id].token == latest {
+                assert!(events.iter().any(|event| matches!(event, RuntimeEvent::ResizeFailed { token, reason: crate::ResizeFailure::Stale, .. } if *token == first)));
+            } else {
+                assert!(events.iter().any(|event| matches!(event, RuntimeEvent::ResizeDeferred { token: actual, cols: actual_cols, rows: actual_rows, .. } if *actual == token && (*actual_cols, *actual_rows) == (cols, rows))));
+            }
+        }
+        assert_eq!(
+            harness.worker.sessions[&id].grid_dimensions(),
+            Some((40, 6)),
+            "native tracked resizes must remain deferred while the real PTY is remotely controlled"
+        );
+        harness
+            .worker
+            .handle_command(RuntimeCommand::TerminalControl {
+                session: id,
+                operation_id: 3,
+                request: Control::Release {
+                    owner,
+                    lease_epoch: 1,
+                },
+            });
+        let release = harness.events.try_iter().collect::<Vec<_>>();
+        assert_eq!(
+            harness.worker.sessions[&id].grid_dimensions(),
+            Some((120, 34))
+        );
+        assert!(release.iter().any(|event| matches!(event,
+            RuntimeEvent::ResizeApplied { session, stamp } if *session == id && stamp.token == Some(latest) && (stamp.cols, stamp.rows) == (120, 34))));
+        let epoch = harness.worker.resize_epoch;
+        harness
+            .worker
+            .handle_command(RuntimeCommand::TerminalControl {
+                session: id,
+                operation_id: 4,
+                request: Control::Release {
+                    owner,
+                    lease_epoch: 1,
+                },
+            });
+        assert_eq!(
+            harness.worker.resize_epoch, epoch,
+            "duplicate release cannot restore twice"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn direct_input_refreshes_queued_mode_changes_without_viewport_wait() {
         let resolver = Arc::new(RecordingResolver {
             calls: Mutex::new(Vec::new()),
@@ -11798,7 +13280,12 @@ mod tests {
             session::SessionKind::Shell,
             &spec(
                 "/bin/sh",
-                &["-c", "stty -echo -icanon; printf READY; exec /bin/cat"],
+                // Prompt rows are drawn by this fixture; cat must consume input
+                // without asynchronously replaying CSI keys over those rows.
+                &[
+                    "-c",
+                    "stty -echo -icanon; printf READY; exec /bin/cat >/dev/null",
+                ],
             ),
             80,
             24,

@@ -253,6 +253,24 @@ pub enum RuntimeEvent {
         session: SessionId,
         at_micros: i64,
     },
+    TerminalControlChanged {
+        session: SessionId,
+        state: crate::TerminalControlState,
+        status: crate::TerminalControlStatus,
+    },
+    TerminalControlResult {
+        session: SessionId,
+        operation_id: u64,
+        state: crate::TerminalControlState,
+        status: crate::TerminalControlStatus,
+        stamp: Option<crate::ResizeStamp>,
+    },
+    ResizeDeferred {
+        session: SessionId,
+        token: crate::ResizeToken,
+        cols: u16,
+        rows: u16,
+    },
 }
 
 impl RuntimeEvent {
@@ -543,6 +561,9 @@ mod tests {
                 "EnvironmentApplied",
                 "InputAdmitted",
                 "SessionInputSubmitted",
+                "TerminalControlChanged",
+                "TerminalControlResult",
+                "ResizeDeferred",
             ]
         );
     }

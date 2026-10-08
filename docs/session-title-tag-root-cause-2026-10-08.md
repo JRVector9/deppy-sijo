@@ -29,3 +29,5 @@ Claude native JSONL의 `type: user`는 실제 사용자 지시뿐 아니라 내�
 세 종류의 재발 사례와 포장된 내부 메시지를 native string/array 입력, 완료 상태 보존, fresh/restored pane hydration, hook 예산 및 기존 작업 보존에서 검증했다. `/private/tmp/deppy-paste-three-incidents2-20261008.log` exit0: storage 4 PASS, App 4 PASS/1 ignored, 명시적으로 실행한 실제 native 파일 검사 1 PASS. 실제 파일 검사도 수정된 제품 파서로 문제의 pasted 이벤트와 현재/최근 제목을 확인했으며 비공개 프롬프트는 출력하지 않았다.
 
 최종 전체 게이트 `/private/tmp/deppy-paste-final-20261008.log` exit0: Storage 420 PASS, App 2806 PASS/38 ignored, integration 4+5+15+15 PASS(플랫폼/리소스 검사 3 ignored), Proxy 81 PASS/1 ignored, i18n 8 PASS. App/Storage/Proxy/i18n all-target strict Clippy, fmt, xtask boundary 모두 PASS. 이후 Rust 소스를 변경하지 않았다. 앱 재실행·제품 배포·버전 변경은 이번 요청에서 실행하지 않는다. 실행 중 0.8.7에는 이 소스 변경이 아직 반영되지 않았다.
+
+제품 소스 및 검증 자료는 `7de5b2d4fa3b64596ac3c7f9e69085c16c4882b3`로 커밋되어 `origin/feat/audit-nine-pr-v0.6.0-20261004`에 푸시됐다. 앱 재빌드/배포/재실행은 포함하지 않는다.

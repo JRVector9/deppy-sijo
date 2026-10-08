@@ -1,8 +1,8 @@
-# Commit/push follow-up authorized — 2026-10-08
+# Completed source commit/push — 2026-10-08
 
 - User now explicitly requests committing and pushing all completed current changes. Scope: compact/common context menus and unified session labels, pane-scoped Git/history/document views, approved history browser, shared task-title transport projection, plans/audits and native renderer evidence. Preserve nominal deppy-sijo worktree. No build delivery/restart requested; source version0.8.7 unchanged.
 - Validation already complete: final full source gate storage420/App2806/proxy81/i18n8 plus integrations and strict Clippy/fmt/boundary PASS; read-only actual reported native title1PASS; history native3screens and menu17screens verified in preceding phase. Re-ran git diff--check before staging, PASS; no Rust changes since final gate.
-- Next actions: commit scoped changed files, record resulting source commit here, push current `feat/audit-nine-pr-v0.6.0-20261004` branch to origin, verify local/remote HEAD equality and clean task worktree. Do not restart/package or alter nominal worktree.
+- Completed: source/UI/test/evidence changes committed as `7de5b2d4fa3b64596ac3c7f9e69085c16c4882b3` (`feat: refine history and menus with isolated session views`),70files. `git push origin HEAD:refs/heads/feat/audit-nine-pr-v0.6.0-20261004` exit0, remote advanced556963eb→7de5b2d4, including previously unpushed5d68285e. This documentation completion records that source commit; push it on the same branch and verify local/remote HEAD equality and a clean task worktree. App0.8.7 unchanged; no product delivery or restart. Nominal worktree untouched.
 
 ---
 

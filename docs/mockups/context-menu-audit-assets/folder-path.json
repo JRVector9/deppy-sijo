@@ -1,0 +1,50 @@
+{
+  "font": "Apple SD Gothic Neo (app default)",
+  "font_points": 13.0,
+  "id": "folder-path",
+  "image": "context-menu-audit-assets/folder-path.png",
+  "image_pixels": [
+    420,
+    700
+  ],
+  "pixels_per_point": 1.0,
+  "rect": [
+    160.0,
+    310.0,
+    202.0,
+    70.0
+  ],
+  "row_gap_points": 3.0,
+  "rows": [
+    {
+      "disabled": false,
+      "label": "경로 복사",
+      "rect": [
+        165.0,
+        315.0,
+        192.0,
+        18.0
+      ]
+    },
+    {
+      "disabled": false,
+      "label": "터미널에 경로 삽입",
+      "rect": [
+        165.0,
+        336.0,
+        192.0,
+        18.0
+      ]
+    },
+    {
+      "disabled": false,
+      "label": "해당 경로로 이동",
+      "rect": [
+        165.0,
+        357.0,
+        192.0,
+        18.0
+      ]
+    }
+  ]
+}

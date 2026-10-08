@@ -1,0 +1,1095 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Deppy Sijo · 시안과 실제 메뉴 비교</title>
+<style>
+:root{color-scheme:dark;--bg:#0f1115;--surface:#181b20;--raised:#21242c;--line:#32363e;--text:#dcdee2;--muted:#9299a5;--accent:#39b8e8;--green:#6bcca4;--orange:#e4b96b;--red:#ef6671;--font:-apple-system,BlinkMacSystemFont,"Apple SD Gothic Neo",sans-serif}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:13px/1.55 var(--font)}button,select{font:inherit;color:inherit}button{cursor:pointer}a{color:var(--accent);text-underline-offset:3px}button:focus-visible,select:focus-visible,a:focus-visible{outline:2px solid var(--accent);outline-offset:3px}code{font:11px ui-monospace,SFMono-Regular,monospace;overflow-wrap:anywhere}svg{fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}.symbol-defs{position:absolute;width:0;height:0;overflow:hidden}
+header{padding:17px 28px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;gap:16px;background:var(--surface)}.brand{display:flex;align-items:center;gap:11px}.mark{display:grid;place-items:center;width:25px;height:25px;border-radius:3px;background:var(--accent);color:var(--bg);font-weight:700}.brand strong{font-size:14px}.brand span{color:var(--muted);font-size:12px}.status{font-size:11px;color:var(--orange);border:1px solid #5b4930;border-radius:3px;padding:4px 8px}.shell{max-width:1580px;margin:auto;display:grid;grid-template-columns:185px minmax(0,1fr);min-height:calc(100vh - 60px)}nav{border-right:1px solid var(--line);padding:25px 12px}.nav-title{margin:0 10px 12px;font-size:11px;color:var(--muted)}.nav-button{display:flex;align-items:center;gap:8px;width:100%;background:transparent;border:1px solid transparent;border-radius:3px;padding:10px 11px;text-align:left;font-size:12px;margin-bottom:3px}.nav-button:hover{background:var(--raised)}.nav-button[aria-current=true]{background:#162b36;color:var(--accent);border-color:#2a4859}.nav-button small{margin-left:auto;color:var(--muted);font-size:10px}.nav-note{border-top:1px solid var(--line);padding-top:17px;margin:25px 10px;color:var(--muted);font-size:11px}.nav-note a{display:block;margin-top:10px}main{min-width:0;padding:25px 28px 40px}.intro{display:flex;justify-content:space-between;gap:18px;align-items:flex-start}.eyebrow{color:var(--accent);font-size:10px;letter-spacing:.08em}h1{font-size:25px;line-height:1.3;font-weight:650;letter-spacing:-.03em;margin:4px 0 9px}.intro p{color:var(--muted);font-size:12px;margin:0;max-width:720px}.control{display:flex;flex-direction:column;gap:5px;font-size:11px;color:var(--muted);min-width:185px}.control select{background:var(--surface);border:1px solid var(--line);border-radius:3px;padding:7px 9px;font-size:12px}.summary{display:grid;grid-template-columns:repeat(4,1fr);border:1px solid var(--line);border-radius:4px;margin:21px 0 20px;background:var(--surface)}.summary div{padding:13px 17px;border-right:1px solid var(--line)}.summary div:last-child{border:0}.summary strong{display:block;font-size:18px;font-weight:600;line-height:1.3}.summary span{font-size:11px;color:var(--muted)}.good{color:var(--green)}.warn{color:var(--orange)}.bad{color:var(--red)}.comparison{display:grid;grid-template-columns:1fr 1fr;gap:16px}.panel{border:1px solid var(--line);border-radius:4px;overflow:hidden;min-width:0;background:var(--surface)}.panel-head{display:flex;justify-content:space-between;gap:12px;padding:13px 17px;border-bottom:1px solid var(--line);font-size:12px}.panel-head span{color:var(--muted);font-size:11px}.panel-head strong{font-weight:550}.stage{height:425px;padding:28px;overflow:auto;background:#0b0d11;position:relative}.stage-hint{font-size:10px;color:#89919f;margin:0 0 14px}.scale-line{display:flex;justify-content:space-between;align-items:center;position:relative;height:24px;margin:0 0 12px;font:11px ui-monospace,SFMono-Regular,monospace;color:var(--muted)}.scale-line:before{content:"";position:absolute;bottom:0;left:0;right:0;border-bottom:1px solid #586170}.scale-line:after{content:"";position:absolute;bottom:-3px;left:0;right:0;height:7px;border-left:1px solid #586170;border-right:1px solid #586170}.native-crop{position:relative;overflow:hidden;flex-shrink:0}.native-crop img{max-width:none;position:absolute;display:block}.panel-foot{padding:12px 17px;border-top:1px solid var(--line);color:var(--muted);font-size:11px;min-height:64px}.panel-foot p{margin:0}.panel-foot p+p{margin-top:5px}.failure{padding:15px;border:1px solid var(--red);color:var(--red)}
+.reference-menu{width:256px;padding:4px;background:#21252d;border:1px solid #414956;border-radius:5px;box-shadow:0 12px 36px #0008;color:#dcdee2}.reference-menu.original{width:284px;padding:5px}.reference-title{color:#828893;font-size:12px;border-bottom:1px solid #39414c;padding:10px 10px 12px;margin-bottom:5px}.reference-item{display:flex;align-items:center;gap:9px;width:100%;min-height:28px;text-align:left;border:0;border-radius:3px;background:none;padding:5px 8px;line-height:1.3;font-size:12px;white-space:nowrap}.original .reference-item{min-height:32px;padding:7px 10px}.reference-item svg{width:15px;height:15px;opacity:.75;flex-shrink:0}.reference-item .arrow{margin-left:auto;color:#828893;font-size:15px;line-height:1}.reference-item:hover{background:#344352;color:#e4f4fc}.reference-item.danger{color:var(--red)}.reference-item.danger:hover{background:#462f38;color:#ff9aa5}.reference-separator{height:1px;background:#39414c;margin:5px 6px}
+.measurements{margin-top:19px;border:1px solid var(--line);border-radius:4px;overflow:auto}table{border-collapse:collapse;width:100%;text-align:left;font-size:12px}th{font-size:11px;font-weight:500;color:var(--muted);background:var(--surface)}th,td{border-bottom:1px solid var(--line);padding:9px 13px;white-space:nowrap}tr:last-child td{border-bottom:0}td small{display:block;font-size:10px;color:var(--muted)}.notes{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:20px}.note{border:1px solid var(--line);border-radius:4px;padding:16px 18px;background:var(--surface)}h2{font-size:14px;font-weight:550;margin:0 0 10px}.note p{margin:0 0 9px;font-size:12px;color:var(--muted)}.note p:last-child{margin:0}.note .label{color:var(--text)}.inventory{margin-top:27px}.inventory-head{display:flex;justify-content:space-between;gap:15px;align-items:center;margin-bottom:11px}.inventory-head h2{margin:0}.inventory-head span{color:var(--muted);font-size:11px}.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:4px}.table-button{border:0;background:none;padding:0;text-align:left;font:inherit;color:var(--accent);cursor:pointer}.evidence{margin-top:21px;border-top:1px solid var(--line);padding-top:15px;font-size:12px;color:var(--muted)}summary{cursor:pointer}.evidence-grid{display:grid;grid-template-columns:1fr 1fr;gap:15px;margin-top:13px}.evidence pre{font:11px/1.7 ui-monospace,SFMono-Regular,monospace;white-space:pre-wrap;overflow-wrap:anywhere;background:var(--surface);border:1px solid var(--line);border-radius:3px;padding:12px;color:#abb2bd;margin:7px 0}.row-checks{margin-top:14px}.row-checks td{font-size:11px}.unit-note{font-size:11px;color:var(--muted);margin:13px 0 0}
+@media(max-width:1050px){.shell{grid-template-columns:155px minmax(0,1fr)}main{padding:23px 18px}.comparison{gap:12px}.stage{padding:20px}.intro{display:block}.control{margin-top:14px;width:max-content}.summary div{padding:12px}.summary strong{font-size:16px}.notes{grid-template-columns:1fr}.stage{height:420px}}
+@media(max-width:800px){header{padding:13px 16px}.brand span{display:none}.shell{display:block}nav{display:flex;overflow:auto;padding:9px;border-right:0;border-bottom:1px solid var(--line)}#navigation{display:flex;gap:4px}.nav-title,.nav-note{display:none}.nav-button{white-space:nowrap;padding:7px 10px;margin:0;width:auto}.nav-button small{display:none}.comparison{grid-template-columns:1fr}.stage{height:425px;padding:25px}.summary{grid-template-columns:1fr 1fr}.summary div:nth-child(2){border-right:0}.summary div:nth-child(-n+2){border-bottom:1px solid var(--line)}h1{font-size:22px}.evidence-grid{grid-template-columns:1fr}.status{font-size:10px}}
+</style>
+</head>
+<body>
+<!-- The icon definitions come from the approved HTML, not the native screenshot. -->
+<svg class="symbol-defs" aria-hidden="true"><defs>
+<symbol id="i-terminal" viewBox="0 0 20 20"><rect x="2" y="3" width="16" height="14" rx="2"/><path d="m5 7 3 3-3 3m5 0h4"/></symbol>
+<symbol id="i-copy" viewBox="0 0 20 20"><rect x="7" y="7" width="10" height="10" rx="1"/><path d="M13 7V3H3v10h4"/></symbol>
+<symbol id="i-paste" viewBox="0 0 20 20"><path d="M6 4H3v14h14V4h-3"/><rect x="6" y="2" width="8" height="4" rx="1"/><path d="M6 10h8m-8 4h6"/></symbol>
+<symbol id="i-folder" viewBox="0 0 20 20"><path d="M2 6V4h6l2 2h8v11H2Zm0 3h16"/></symbol>
+<symbol id="i-session" viewBox="0 0 20 20"><rect x="2" y="2" width="12" height="12" rx="2"/><path d="M6 18h12V6M5 6h6M5 10h4"/></symbol>
+<symbol id="i-split" viewBox="0 0 20 20"><rect x="2" y="3" width="16" height="14" rx="1"/><path d="M10 3v14"/></symbol>
+<symbol id="i-file" viewBox="0 0 20 20"><path d="M4 2h8l4 4v12H4Zm8 0v4h4M7 10h6m-6 4h4"/></symbol>
+<symbol id="i-settings" viewBox="0 0 20 20"><path d="M3 5h14M3 10h14M3 15h14"/><circle cx="7" cy="5" r="2" fill="#21252d"/><circle cx="13" cy="10" r="2" fill="#21252d"/><circle cx="8" cy="15" r="2" fill="#21252d"/></symbol>
+<symbol id="i-arrow" viewBox="0 0 20 20"><path d="M10 3v13m-5-5 5 5 5-5M4 18h12"/></symbol>
+<symbol id="i-plus" viewBox="0 0 20 20"><path d="M10 3v14M3 10h14"/></symbol>
+<symbol id="i-close" viewBox="0 0 20 20"><path d="m5 5 10 10M15 5 5 15"/></symbol>
+<symbol id="i-edit" viewBox="0 0 20 20"><path d="m4 12 9-9 4 4-9 9-5 1Zm7-7 4 4"/></symbol>
+<symbol id="i-trash" viewBox="0 0 20 20"><path d="M3 5h14M7 5V2h6v3M5 5l1 13h8l1-13M8 8v7m4-7v7"/></symbol>
+<symbol id="i-clock" viewBox="0 0 20 20"><circle cx="10" cy="10" r="8"/><path d="M10 5v5l4 2"/></symbol>
+</defs></svg>
+<header><div class="brand"><div class="mark">D</div><strong>Deppy Sijo</strong><span>우클릭 메뉴 · 시안과 구현 비교</span></div><span class="status">현재 소스 기준 · 앱 재시작 전</span></header>
+<div class="shell"><nav aria-label="비교할 메뉴 위치"><p class="nav-title">9개 우클릭 위치</p><div id="navigation"></div><div class="nav-note">오른쪽은 앱의 메뉴 함수로 생성한 실제 렌더링입니다.<br><br>양쪽 모두 논리 1배 크기로 표시합니다.<a href="context-menus-2026-10-08.html" target="_blank" rel="noopener">지난 수정 시안 열기 ↗</a></div></nav>
+<main>
+<div class="intro"><div><span class="eyebrow">DESIGN / IMPLEMENTATION</span><h1 id="title">터미널 · 탭바</h1><p id="fixture"></p></div><label class="control">비교할 화면<select id="variant" aria-label="비교할 화면"></select></label></div>
+<div class="summary"><div><strong class="good" id="overall">측정값 확인 중</strong><span>항목·순서·구분선 대조</span></div><div><strong id="range">—</strong><span>실제 메뉴 가로 크기</span></div><div><strong>18pt</strong><span>실제 한 행 높이</span></div><div><strong class="good">제목 없음</strong><span>9개 최상위 메뉴 확인</span></div></div>
+<div class="comparison">
+<section class="panel" aria-label="기존 시안 미리보기"><div class="panel-head"><strong>기존 시안</strong><select id="baseline" aria-label="기존 시안 버전"><option value="original">최초 시안 · 284px</option><option value="compact">지난 수정 시안 · 256px</option></select></div><div class="stage"><p class="stage-hint" id="referenceHint"></p><div class="scale-line" id="referenceRuler"><span>가로</span><span id="referenceWidth"></span></div><div id="reference"></div></div><div class="panel-foot"><p id="referenceCaption"></p><p>하위 메뉴가 있는 행을 누르면 해당 화면을 비교합니다.</p></div></section>
+<section class="panel" aria-label="실제 코드 렌더링 미리보기"><div class="panel-head"><strong>구현 · 실제 egui 렌더링</strong><span id="nativeDimensions"></span></div><div class="stage"><p class="stage-hint">이미지 재현 · 기본 글꼴 13pt · 논리 1배</p><div class="scale-line" id="nativeRuler"><span>가로</span><span id="nativeWidth"></span></div><div class="native-crop" id="nativeCrop"><img id="nativeImage" alt="실제 메뉴 렌더링"></div><p id="imageError" class="failure" hidden>렌더링 이미지가 로드되지 않았습니다.</p></div><div class="panel-foot"><p id="nativeCaption"></p><p><a id="pngLink" target="_blank" rel="noopener">원본 렌더링 PNG ↗</a> · <a id="jsonLink" target="_blank" rel="noopener">측정 JSON ↗</a></p></div></section>
+</div>
+<p class="unit-note">CSS px와 egui pt를 논리 1배에서 비교했습니다. Retina 캡처는 pixels_per_point로 나누어 표시합니다. 브라우저 확대율은 양쪽에 동일하게 적용됩니다.</p>
+<div class="measurements"><table aria-label="선택한 메뉴 규격 비교"><thead><tr><th>비교 항목</th><th id="baselineHeading">최초 시안</th><th>실제 구현</th><th>판정</th></tr></thead><tbody id="measurements"></tbody></table></div>
+<div class="notes">
+<section class="note"><h2>요청한 변경 확인</h2><p><span class="label">상단 제목 제거:</span> 실제 메뉴에 ‘정리안’ 등의 제목을 넣지 않습니다. 가로는 대부분 202pt, 가장 긴 환경·API 메뉴는 220.3pt로 두 시안보다 작습니다.</p><p><span class="label">세로 간격:</span> 바깥 여백 4pt, 행 사이 <span id="rowGapValue"></span>pt입니다. 한 행은 18pt이며 메뉴 안에서 줄바꿈하지 않습니다. 긴 글자는 필요한 만큼 너비를 늘립니다.</p><p><span class="label">추가 수정:</span> 파일 목록 헤더의 우클릭이 열리지 않는 결함을 발견해 수정했습니다. 실제 우클릭 후 ‘새 폴더’ 표시와 ‘메모’ 탭의 왼쪽 클릭을 회귀 테스트로 확인했습니다.</p></section>
+<section class="note"><h2>시안과 남아 있는 외형 차이</h2><p><span class="label">배경·테두리:</span> HTML은 #21252d / #414956, 앱은 기존 공통 테마의 #181b20 / #32363e를 사용합니다.</p><p><span class="label">모서리·글자:</span> HTML은 모서리 5px / 글자 12px, 앱은 1pt / 13pt입니다. 아이콘도 HTML 15px, 앱 14pt의 벡터 그림으로 약간 다릅니다.</p><p>메뉴 구성과 축소는 적용됐지만 외형이 픽셀 단위로 같지는 않습니다. 오른쪽 이미지에서 차이를 그대로 확인할 수 있습니다.</p></section>
+</div>
+<section class="inventory"><div class="inventory-head"><h2>최상위 9개 메뉴 실측</h2><span>기본 한국어 · 행 높이 모두 18pt</span></div><div class="table-wrap"><table aria-label="전체 메뉴 측정값"><thead><tr><th>위치</th><th>구현 가로 × 세로</th><th>최초 284px 대비</th><th>수정 256px 대비</th><th>항목·순서</th></tr></thead><tbody id="inventory"></tbody></table></div></section>
+<details class="evidence"><summary>측정 방법·소스·검증 범위 보기</summary><div class="evidence-grid"><div><p>실제 production 메뉴 함수를 egui_kittest에서 우클릭/hover로 열었습니다. Popup Area의 경계와 접근성 버튼 경계를 측정하고, 같은 화면을 PNG로 렌더링했습니다.</p><p>최초 시안 원본은 이전 수정 때 덮어써져 기록된 284px / 32px / 여백 5px로 복원했습니다. 제목의 정확한 원래 높이는 남아 있지 않아 최초 시안의 총 높이 감소율은 주장하지 않습니다. 지난 수정 시안은 기존 HTML의 256px / 28px / 여백 4px CSS를 사용합니다.</p><p>한국어 기본 글꼴·다크 테마의 대표 상태를 검증했습니다. 임의 글꼴/배율, 모든 조건별 분기, 실행 중 앱의 픽셀 일치까지 검증한 것은 아닙니다. 실제 세션 입력·파일 삭제는 실행하지 않았습니다.</p><p id="testResult">검증 결과 기록 준비 중</p><p id="sourceStamp"></p></div><div><span>선택 화면의 측정 원본</span><pre id="evidenceJSON"></pre><span>구현 소스</span><pre id="sourcePaths"></pre></div></div><div class="row-checks table-wrap"><table aria-label="시안과 실제 항목 대조"><thead><tr><th>행</th><th>시안의 항목</th><th>구현의 항목</th><th>결과</th></tr></thead><tbody id="rowChecks"></tbody></table></div></details>
+</main></div>
+<script id="evidence-data" type="application/json">{
+  "menus": {
+    "environment": {
+      "font": "Apple SD Gothic Neo (app default)",
+      "font_points": 13.0,
+      "id": "environment",
+      "image": "context-menu-audit-assets/environment.png",
+      "image_pixels": [
+        1400,
+        1000
+      ],
+      "pixels_per_point": 2.0,
+      "rect": [
+        220.0,
+        57.0,
+        220.28125,
+        79.0
+      ],
+      "row_gap_points": 3.0,
+      "rows": [
+        {
+          "disabled": false,
+          "label": "폴더 선택",
+          "rect": [
+            225.0,
+            62.0,
+            210.28125,
+            18.0
+          ]
+        },
+        {
+          "disabled": false,
+          "label": "프로젝트 env 다시 탐색(.env 재스캔)",
+          "rect": [
+            225.0,
+            83.0,
+            210.28125,
+            18.0
+          ]
+        },
+        {
+          "disabled": false,
+          "label": "해제",
+          "rect": [
+            225.0,
+            113.0,
+            210.28125,
+            18.0
+          ]
+        }
+      ]
+    },
+    "file-path": {
+      "font": "Apple SD Gothic Neo (app default)",
+      "font_points": 13.0,
+      "id": "file-path",
+      "image": "context-menu-audit-assets/file-path.png",
+      "image_pixels": [
+        420,
+        700
+      ],
+      "pixels_per_point": 1.0,
+      "rect": [
+        171.0,
+        331.0,
+        202.0,
+        49.0
+      ],
+      "row_gap_points": 3.0,
+      "rows": [
+        {
+          "disabled": false,
+          "label": "경로 복사",
+          "rect": [
+            176.0,
+            336.0,
+            192.0,
+            18.0
+          ]
+        },
+        {
+          "disabled": false,
+          "label": "터미널에 경로 삽입",
+          "rect": [
+            176.0,
+            357.0,
+            192.0,
+            18.0
+          ]
+        }
+      ]
+    },
+    "file": {
+      "font": "Apple SD Gothic Neo (app default)",
+      "font_points": 13.0,
+      "id": "file",
+      "image": "context-menu-audit-assets/file.png",
+      "image_pixels": [
+        420,
+        700
+      ],
+      "pixels_per_point": 1.0,
+      "rect": [
+        166.0,
+        203.0,
+        202.0,
+        151.0
+      ],
+      "row_gap_points": 3.0,
+      "rows": [
+        {
+          "disabled": false,
+          "label": "OS 기본 앱으로 열기",
+          "rect": [
+            171.0,
+            208.0,
+            192.0,
+            18.0
+          ]
+        },
+        {
+          "disabled": false,
+          "label": "복사",
+          "rect": [
+            171.0,
+            229.0,
+            192.0,
+            18.0
+          ]
+        },
+        {
+          "disabled": false,
+          "label": "이름 변경",
+          "rect": [
+            171.0,
+            250.0,
+            192.0,
+            18.0
+          ]
+        },
+        {
+          "disabled": false,
+          "label": "새 폴더 (같은 위치)",
+          "rect": [
+            171.0,
+            280.0,
+            192.0,
+            18.0
+          ]
+        },
+        {
+          "disabled": false,
+          "label": "경로 ⏵",
+          "rect": [
+            171.0,
+            301.0,
+            192.0,
+            18.0
+          ]
+        },
+        {
+          "disabled": false,
+          "label": "휴지통으로 이동",
+          "rect": [
+            171.0,
+            331.0,
+            192.0,
+            18.0
+          ]
+        }
+      ]
+    },
+    "fleet": {
+      "font": "Apple SD Gothic Neo (app default)",
+      "font_points": 13.0,
+      "id": "fleet",
+      "image": "context-menu-audit-assets/fleet.png",
+      "image_pixels": [
+        1400,
+        1000
+      ],
+      "pixels_per_point": 2.0,
+      "rect": [
+        47.5,
+        24.0,
+        202.0,
+        58.0
+      ],
+      "row_gap_points": 3.0,
+      "rows": [
+        {
+          "disabled": false,
+          "label": "다음 단계 예약…",
+          "rect": [
+            52.5,
+            29.0,
+            192.0,
+            18.0
+          ]
+        },
+        {
+          "disabled": false,
+          "label": "예약 취소",
+          "rect": [
+            52.5,
+            59.0,
+            192.0,
+            18.0
+          ]
+        }
+      ]
+    },
+    "folder-path": {
+      "font": "Apple SD Gothic Neo (app default)",
+      "font_points": 13.0,
+      "id": "folder-path",
+      "image": "context-menu-audit-assets/folder-path.png",
+      "image_pixels": [
+        420,
+        700
+      ],
+      "pixels_per_point": 1.0,
+      "rect": [
+        160.0,
+        310.0,
+        202.0,
+        70.0
+      ],
+      "row_gap_points": 3.0,
+      "rows": [
+        {
+          "disabled": false,
+          "label": "경로 복사",
+          "rect": [
+            165.0,
+            315.0,
+            192.0,
+            18.0
+          ]
+        },
+        {
+          "disabled": false,
+          "label": "터미널에 경로 삽입",
+          "rect": [
+            165.0,
+            336.0,
+            192.0,
+            18.0
+          ]
+        },
+        {
+          "disabled": false,
+          "label": "해당 경로로 이동",
+          "rect": [
+            165.0,
+            357.0,
+            192.0,
+            18.0
+          ]
+        }
+      ]
+    },
+    "folder": {
+      "font": "Apple SD Gothic Neo (app default)",
+      "font_points": 13.0,
+      "id": "folder",
+      "image": "context-menu-audit-assets/folder.png",
+      "image_pixels": [
+        420,
+        700
+      ],
+      "pixels_per_point": 1.0,
+      "rect": [
+        155.0,
+        203.0,
+        202.0,
+        130.0
+      ],
+      "row_gap_points": 3.0,
+      "rows": [
+        {
+          "disabled": false,
+          "label": "복사",
+          "rect": [
+            160.0,
+            208.0,
+            192.0,
+            18.0
+          ]
+        },
+        {
+          "disabled": false,
+          "label": "이름 변경",
+          "rect": [
+            160.0,
+            229.0,
+            192.0,
+            18.0
+          ]
+        },
+        {
+          "disabled": false,
+          "label": "새 폴더 (이 안에)",
+          "rect": [
+            160.0,
+            259.0,
+            192.0,
+            18.0
+          ]
+        },
+        {
+          "disabled": false,
+          "label": "경로 ⏵",
+          "rect": [
+            160.0,
+            280.0,
+            192.0,
+            18.0
+          ]
+        },
+        {
+          "disabled": false,
+          "label": "휴지통으로 이동",
+          "rect": [
+            160.0,
+            310.0,
+            192.0,
+            18.0
+          ]
+        }
+      ]
+    },
+    "notes": {
+      "font": "Apple SD Gothic Neo (app default)",
+      "font_points": 13.0,
+      "id": "notes",
+      "image": "context-menu-audit-assets/notes.png",
+      "image_pixels": [
+        320,
+        300
+      ],
+      "pixels_per_point": 1.0,
+      "rect": [
+        62.0,
+        23.0,
+        202.0,
+        121.0
+      ],
+      "row_gap_points": 3.0,
+      "rows": [
+        {
+          "disabled": false,
+          "label": "잘라내기",
+          "rect": [
+            67.0,
+            28.0,
+            192.0,
+            18.0
+          ]
+        },
+        {
+          "disabled": false,
+          "label": "복사",
+          "rect": [
+            67.0,
+            49.0,
+            192.0,
+            18.0
+          ]
+        },
+        {
+          "disabled": false,
+          "label": "붙여넣기",
+          "rect": [
+            67.0,
+            70.0,
+            192.0,
+            18.0
+          ]
+        },
+        {
+          "disabled": false,
+          "label": "삭제",
+          "rect": [
+            67.0,
+            91.0,
+            192.0,
+            18.0
+          ]
+        },
+        {
+          "disabled": false,
+          "label": "전체 선택",
+          "rect": [
+            67.0,
+            121.0,
+            192.0,
+            18.0
+          ]
+        }
+      ]
+    },
+    "session-folder": {
+      "font": "Apple SD Gothic Neo (app default)",
+      "font_points": 13.0,
+      "id": "session-folder",
+      "image": "context-menu-audit-assets/session-folder.png",
+      "image_pixels": [
+        1400,
+        1000
+      ],
+      "pixels_per_point": 2.0,
+      "rect": [
+        249.0,
+        89.0,
+        202.0,
+        49.0
+      ],
+      "row_gap_points": 3.0,
+      "rows": [
+        {
+          "disabled": false,
+          "label": "Finder에서 폴더 열기",
+          "rect": [
+            254.0,
+            94.0,
+            192.0,
+            18.0
+          ]
+        },
+        {
+          "disabled": false,
+          "label": "폴더 경로 복사",
+          "rect": [
+            254.0,
+            115.0,
+            192.0,
+            18.0
+          ]
+        }
+      ]
+    },
+    "session-inactive": {
+      "font": "Apple SD Gothic Neo (app default)",
+      "font_points": 13.0,
+      "id": "session-inactive",
+      "image": "context-menu-audit-assets/session-inactive.png",
+      "image_pixels": [
+        1400,
+        1000
+      ],
+      "pixels_per_point": 2.0,
+      "rect": [
+        45.0,
+        17.0,
+        202.0,
+        28.0
+      ],
+      "row_gap_points": 3.0,
+      "rows": [
+        {
+          "disabled": false,
+          "label": "옆에 열기",
+          "rect": [
+            50.0,
+            22.0,
+            192.0,
+            18.0
+          ]
+        }
+      ]
+    },
+    "session-new": {
+      "font": "Apple SD Gothic Neo (app default)",
+      "font_points": 13.0,
+      "id": "session-new",
+      "image": "context-menu-audit-assets/session-new.png",
+      "image_pixels": [
+        1400,
+        1000
+      ],
+      "pixels_per_point": 2.0,
+      "rect": [
+        249.0,
+        68.0,
+        202.0,
+        49.0
+      ],
+      "row_gap_points": 3.0,
+      "rows": [
+        {
+          "disabled": false,
+          "label": "세션 추가",
+          "rect": [
+            254.0,
+            73.0,
+            192.0,
+            18.0
+          ]
+        },
+        {
+          "disabled": false,
+          "label": "새 워크트리에서 새 세션",
+          "rect": [
+            254.0,
+            94.0,
+            192.0,
+            18.0
+          ]
+        }
+      ]
+    },
+    "session": {
+      "font": "Apple SD Gothic Neo (app default)",
+      "font_points": 13.0,
+      "id": "session",
+      "image": "context-menu-audit-assets/session.png",
+      "image_pixels": [
+        1400,
+        1000
+      ],
+      "pixels_per_point": 2.0,
+      "rect": [
+        45.0,
+        17.0,
+        202.0,
+        130.0
+      ],
+      "row_gap_points": 3.0,
+      "rows": [
+        {
+          "disabled": false,
+          "label": "이름 변경",
+          "rect": [
+            50.0,
+            22.0,
+            192.0,
+            18.0
+          ]
+        },
+        {
+          "disabled": false,
+          "label": "변경 보기",
+          "rect": [
+            50.0,
+            43.0,
+            192.0,
+            18.0
+          ]
+        },
+        {
+          "disabled": false,
+          "label": "세션 추가 ⏵",
+          "rect": [
+            50.0,
+            73.0,
+            192.0,
+            18.0
+          ]
+        },
+        {
+          "disabled": false,
+          "label": "세션 폴더 ⏵",
+          "rect": [
+            50.0,
+            94.0,
+            192.0,
+            18.0
+          ]
+        },
+        {
+          "disabled": false,
+          "label": "세션 닫기",
+          "rect": [
+            50.0,
+            124.0,
+            192.0,
+            18.0
+          ]
+        }
+      ]
+    },
+    "terminal-folder": {
+      "font": "Apple SD Gothic Neo (app default)",
+      "font_points": 13.0,
+      "id": "terminal-folder",
+      "image": "context-menu-audit-assets/terminal-folder.png",
+      "image_pixels": [
+        1400,
+        1000
+      ],
+      "pixels_per_point": 2.0,
+      "rect": [
+        249.0,
+        152.0,
+        202.0,
+        49.0
+      ],
+      "row_gap_points": 3.0,
+      "rows": [
+        {
+          "disabled": false,
+          "label": "파일 트리를 이 폴더로 이동",
+          "rect": [
+            254.0,
+            157.0,
+            192.0,
+            18.0
+          ]
+        },
+        {
+          "disabled": false,
+          "label": "Finder에서 폴더 열기",
+          "rect": [
+            254.0,
+            178.0,
+            192.0,
+            18.0
+          ]
+        }
+      ]
+    },
+    "terminal-selection": {
+      "font": "Apple SD Gothic Neo (app default)",
+      "font_points": 13.0,
+      "id": "terminal-selection",
+      "image": "context-menu-audit-assets/terminal-selection.png",
+      "image_pixels": [
+        1400,
+        1000
+      ],
+      "pixels_per_point": 2.0,
+      "rect": [
+        249.0,
+        59.0,
+        202.0,
+        70.0
+      ],
+      "row_gap_points": 3.0,
+      "rows": [
+        {
+          "disabled": false,
+          "label": "공백 정리 후 복사하기",
+          "rect": [
+            254.0,
+            64.0,
+            192.0,
+            18.0
+          ]
+        },
+        {
+          "disabled": false,
+          "label": "메모에 추가",
+          "rect": [
+            254.0,
+            85.0,
+            192.0,
+            18.0
+          ]
+        },
+        {
+          "disabled": false,
+          "label": "환경·API에 넣기 ⏵",
+          "rect": [
+            254.0,
+            106.0,
+            192.0,
+            18.0
+          ]
+        }
+      ]
+    },
+    "terminal-split": {
+      "font": "Apple SD Gothic Neo (app default)",
+      "font_points": 13.0,
+      "id": "terminal-split",
+      "image": "context-menu-audit-assets/terminal-split.png",
+      "image_pixels": [
+        1400,
+        1000
+      ],
+      "pixels_per_point": 2.0,
+      "rect": [
+        249.0,
+        110.0,
+        202.0,
+        49.0
+      ],
+      "row_gap_points": 3.0,
+      "rows": [
+        {
+          "disabled": false,
+          "label": "좌우로 분할",
+          "rect": [
+            254.0,
+            115.0,
+            192.0,
+            18.0
+          ]
+        },
+        {
+          "disabled": false,
+          "label": "상하로 분할",
+          "rect": [
+            254.0,
+            136.0,
+            192.0,
+            18.0
+          ]
+        }
+      ]
+    },
+    "terminal": {
+      "font": "Apple SD Gothic Neo (app default)",
+      "font_points": 13.0,
+      "id": "terminal",
+      "image": "context-menu-audit-assets/terminal.png",
+      "image_pixels": [
+        1400,
+        1000
+      ],
+      "pixels_per_point": 2.0,
+      "rect": [
+        45.0,
+        17.0,
+        202.0,
+        214.0
+      ],
+      "row_gap_points": 3.0,
+      "rows": [
+        {
+          "disabled": false,
+          "label": "복사",
+          "rect": [
+            50.0,
+            22.0,
+            192.0,
+            18.0
+          ]
+        },
+        {
+          "disabled": false,
+          "label": "붙여넣기",
+          "rect": [
+            50.0,
+            43.0,
+            192.0,
+            18.0
+          ]
+        },
+        {
+          "disabled": false,
+          "label": "선택 내용 ⏵",
+          "rect": [
+            50.0,
+            64.0,
+            192.0,
+            18.0
+          ]
+        },
+        {
+          "disabled": false,
+          "label": "마지막 출력 복사",
+          "rect": [
+            50.0,
+            85.0,
+            192.0,
+            18.0
+          ]
+        },
+        {
+          "disabled": false,
+          "label": "화면 분할 ⏵",
+          "rect": [
+            50.0,
+            115.0,
+            192.0,
+            18.0
+          ]
+        },
+        {
+          "disabled": false,
+          "label": "맨 아래로 스크롤",
+          "rect": [
+            50.0,
+            136.0,
+            192.0,
+            18.0
+          ]
+        },
+        {
+          "disabled": false,
+          "label": "세션 폴더 ⏵",
+          "rect": [
+            50.0,
+            157.0,
+            192.0,
+            18.0
+          ]
+        },
+        {
+          "disabled": false,
+          "label": "환경변수·API 설정…",
+          "rect": [
+            50.0,
+            178.0,
+            192.0,
+            18.0
+          ]
+        },
+        {
+          "disabled": false,
+          "label": "세션 닫기",
+          "rect": [
+            50.0,
+            208.0,
+            192.0,
+            18.0
+          ]
+        }
+      ]
+    },
+    "tree-header": {
+      "font": "Apple SD Gothic Neo (app default)",
+      "font_points": 13.0,
+      "id": "tree-header",
+      "image": "context-menu-audit-assets/tree-header.png",
+      "image_pixels": [
+        420,
+        700
+      ],
+      "pixels_per_point": 1.0,
+      "rect": [
+        177.0,
+        140.0,
+        202.0,
+        28.0
+      ],
+      "row_gap_points": 3.0,
+      "rows": [
+        {
+          "disabled": false,
+          "label": "새 폴더",
+          "rect": [
+            182.0,
+            145.0,
+            192.0,
+            18.0
+          ]
+        }
+      ]
+    },
+    "workspace": {
+      "font": "Apple SD Gothic Neo (app default)",
+      "font_points": 13.0,
+      "id": "workspace",
+      "image": "context-menu-audit-assets/workspace.png",
+      "image_pixels": [
+        420,
+        700
+      ],
+      "pixels_per_point": 1.0,
+      "rect": [
+        100.0,
+        24.0,
+        202.0,
+        79.0
+      ],
+      "row_gap_points": 3.0,
+      "rows": [
+        {
+          "disabled": false,
+          "label": "세션 추가",
+          "rect": [
+            105.0,
+            29.0,
+            192.0,
+            18.0
+          ]
+        },
+        {
+          "disabled": false,
+          "label": "이름 변경",
+          "rect": [
+            105.0,
+            50.0,
+            192.0,
+            18.0
+          ]
+        },
+        {
+          "disabled": false,
+          "label": "워크스페이스 세션 모두 종료…",
+          "rect": [
+            105.0,
+            80.0,
+            192.0,
+            18.0
+          ]
+        }
+      ]
+    }
+  },
+  "tests": "Final source gate: Storage 420 PASS; App 2806 PASS / 38 ignored; integrations 4+5+15+15 PASS; Proxy 81 PASS / 1 ignored; i18n 8 PASS; strict Clippy/fmt/boundary PASS. Title matrix Storage 4/App 4 PASS, explicit read-only native title 1 PASS. History native capture 1 PASS (3 images) and menu capture 5 PASS (17 images) from preceding history phase; subsequent source change confined to title projection.",
+  "source": "2026-10-08 소스 대조 · HEAD 5d68285e + 미커밋 변경 · 실행 중 앱 캡처 아님",
+  "source_files_sha256": {
+    "crates/app/src/app.rs": "a11f12f305a9957f6bf7a97a8ee70c24f914f694b5f1136a58173ec4f365a66a",
+    "crates/app/src/theme.rs": "f86faec7b4f618b170ded111a41caf466f12a31e7f71083c11089dfc98e09728",
+    "crates/app/src/fonts.rs": "6028be52b19fa6948db868243ce8958a597ca3ed950d0e4ecaad8612e1a53265",
+    "crates/app/src/ui/context_menu.rs": "dacaf93bea3f06e8c397c2172895c37a31c98afc31fc59a56f8a55895473f12a",
+    "crates/app/src/ui/context_menu_audit.rs": "8c58fae3b6b35cac23757e1d4f9ae8e82f04b2c72e4d55094b45017b024ed22c",
+    "crates/app/src/ui/workspace.rs": "28f02424b5eeee500352b54bac0bbcd484e93f6dad73c5c05abff73934b6b894",
+    "crates/app/src/ui/file_tree.rs": "a327178af8bdc24310bc743d11476550656022b8e4821339643b9abde4e7cbd2",
+    "crates/app/src/ui/fleet.rs": "b6a1e982e3393eb1d76033c0f41c7b9540d0d6e3a4cae6a599aada0aa705de7d",
+    "crates/app/src/ui/notes.rs": "5411a7ef604ec7bd26fd3750026526272f184aa8766544bdcc4d795103fb90e7",
+    "crates/i18n/locales/ko-KR/messages.txt": "dd75111949720828361964b39559d827e1fecdefcdf213e24f5bee1a3fc1c064"
+  },
+  "embedded_at": "2026-10-08T02:13:36.539717+00:00"
+}</script>
+<script>
+'use strict';
+const $=id=>document.getElementById(id);
+// Expected labels/grouping are copied from the approved proposal independently
+// of the rendered accessibility JSON; mismatches remain visible in this page.
+const item=(label,icon,child=null)=>({label,icon,child});
+const specs={
+ 'terminal':{name:'최상위 메뉴',rows:[item('복사','copy'),item('붙여넣기','paste'),item('선택 내용','file','terminal-selection'),item('마지막 출력 복사','copy'),item('화면 분할','split','terminal-split'),item('맨 아래로 스크롤','arrow'),item('세션 폴더','folder','terminal-folder'),item('환경변수·API 설정…','settings'),item('세션 닫기','close')],separators:[4,8],danger:[8]},
+ 'terminal-selection':{name:'선택 내용',rows:[item('공백 정리 후 복사하기','copy'),item('메모에 추가','file'),item('환경·API에 넣기','settings')],separators:[],arrows:[2]},
+ 'terminal-split':{name:'화면 분할',rows:[item('좌우로 분할','split'),item('상하로 분할','split')],separators:[]},
+ 'terminal-folder':{name:'세션 폴더',rows:[item('파일 트리를 이 폴더로 이동','folder'),item('Finder에서 폴더 열기','folder')],separators:[]},
+ 'session':{name:'활성 세션',rows:[item('이름 변경','edit'),item('변경 보기','file'),item('세션 추가','plus','session-new'),item('세션 폴더','folder','session-folder'),item('세션 닫기','close')],separators:[2,4],danger:[4]},
+ 'session-new':{name:'세션 추가',rows:[item('세션 추가','plus'),item('새 워크트리에서 새 세션','plus')],separators:[]},
+ 'session-folder':{name:'세션 폴더',rows:[item('Finder에서 폴더 열기','folder'),item('폴더 경로 복사','copy')],separators:[]},
+ 'session-inactive':{name:'다른 워크스페이스 세션',rows:[item('옆에 열기','session')],separators:[]},
+ 'workspace':{name:'최상위 메뉴',rows:[item('세션 추가','plus'),item('이름 변경','edit'),item('워크스페이스 세션 모두 종료…','close')],separators:[2],danger:[2]},
+ 'file':{name:'문서 파일',rows:[item('OS 기본 앱으로 열기','file'),item('복사','copy'),item('이름 변경','edit'),item('새 폴더 (같은 위치)','plus'),item('경로','folder','file-path'),item('휴지통으로 이동','trash')],separators:[3,5],danger:[5]},
+ 'file-path':{name:'경로',rows:[item('경로 복사','copy'),item('터미널에 경로 삽입','terminal')],separators:[]},
+ 'folder':{name:'폴더',rows:[item('복사','copy'),item('이름 변경','edit'),item('새 폴더 (이 안에)','plus'),item('경로','folder','folder-path'),item('휴지통으로 이동','trash')],separators:[2,4],danger:[4]},
+ 'folder-path':{name:'경로',rows:[item('경로 복사','copy'),item('터미널에 경로 삽입','terminal'),item('해당 경로로 이동','folder')],separators:[]},
+ 'fleet':{name:'예약된 작업 있음',rows:[item('다음 단계 예약…','clock'),item('예약 취소','close')],separators:[1],danger:[1]},
+ 'notes':{name:'텍스트 선택 있음',rows:[item('잘라내기','edit'),item('복사','copy'),item('붙여넣기','paste'),item('삭제','trash'),item('전체 선택','file')],separators:[4]},
+ 'environment':{name:'프로젝트 폴더 지정됨',rows:[item('폴더 선택','folder'),item('프로젝트 env 다시 탐색(.env 재스캔)','settings'),item('해제','close')],separators:[2],danger:[2]},
+ 'tree-header':{name:'파일 트리 루트 있음',rows:[item('새 폴더','plus')],separators:[]}
+};
+const groups=[
+ {id:'terminal',name:'터미널 · 탭바',variants:['terminal','terminal-selection','terminal-split','terminal-folder'],source:'crates/app/src/ui/workspace.rs · pane_context_menu / selected_text_menu_items',fixture:'로컬 pane pa · 세션 7 · 텍스트 선택 있음 · 실행 중 에이전트 없음. 에이전트 보내기 항목은 이 상태에서 표시되지 않습니다.'},
+ {id:'session',name:'세션 목록',variants:['session','session-new','session-folder','session-inactive'],source:'crates/app/src/ui/file_tree.rs · active_session_context_menu_actions / draw_active_session_context_menu',fixture:'활성 세션 · 현재 폴더 있음 · 이어가기 대상 없음 · 워크트리 아님. 다른 워크스페이스 상태도 별도로 비교합니다.'},
+ {id:'workspace',name:'워크스페이스',variants:['workspace'],source:'crates/app/src/ui/file_tree.rs · workspace row context menu',fixture:'세션이 있는 활성 워크스페이스의 메뉴입니다.'},
+ {id:'file',name:'파일',variants:['file','file-path'],source:'crates/app/src/ui/file_tree.rs · file/folder context menu',fixture:'문서로 인식되는 audit.md 파일입니다. 경로 하위 메뉴도 실제로 열어 측정했습니다.'},
+ {id:'folder',name:'폴더',variants:['folder','folder-path'],source:'crates/app/src/ui/file_tree.rs · file/folder context menu',fixture:'접근 가능한 docs 폴더입니다. 경로 하위 메뉴에는 해당 경로로 이동이 추가됩니다.'},
+ {id:'fleet',name:'작업 카드',variants:['fleet'],source:'crates/app/src/ui/fleet.rs · scheduled follow-up card context menu',fixture:'유효한 PTY 대상 키가 있고 다음 단계가 예약된 상태입니다.'},
+ {id:'notes',name:'메모',variants:['notes'],source:'crates/app/src/ui/notes.rs · TextEdit context menu',fixture:'메모 내용과 텍스트 선택이 있어 편집 항목이 활성화된 상태입니다.'},
+ {id:'environment',name:'환경·API 폴더',variants:['environment'],source:'crates/app/src/app.rs · render_env_api_project_header',fixture:'프로젝트 폴더가 지정되어 재탐색과 해제가 표시되는 상태입니다.'},
+ {id:'tree-header',name:'파일 목록 헤더',variants:['tree-header'],source:'crates/app/src/ui/file_tree.rs · actual header DnD response context menu',fixture:'파일 트리 루트가 연결된 상태입니다. 실제 헤더 빈 영역의 우클릭으로 새 폴더 메뉴를 열었습니다.'}
+];
+const payload=JSON.parse($('evidence-data').textContent), evidence=payload.menus||{};
+const state={group:'terminal',variant:'terminal',baseline:'original'};
+const fmt=n=>Number.isInteger(n)?String(n):n.toFixed(1);
+const same=(a,b)=>JSON.stringify(a)===JSON.stringify(b);
+const normalize=s=>s.replace(/\s*⏵$/u,'');
+function check(id){
+ const actual=evidence[id],expected=specs[id];
+ if(!actual)return{labels:false,separators:false,arrows:false,ok:false};
+ const gaps=actual.rows.slice(1).map((r,i)=>r.rect[1]-(actual.rows[i].rect[1]+actual.rows[i].rect[3]));
+ const separators=gaps.flatMap((gap,i)=>gap>(actual.row_gap_points??1)+0.1?[i+1]:[]);
+ const expectedArrows=expected.rows.flatMap((r,i)=>r.child||(expected.arrows||[]).includes(i)?[i]:[]);
+ const actualArrows=actual.rows.flatMap((r,i)=>r.label.endsWith('⏵')?[i]:[]);
+ const labels=same(expected.rows.map(r=>r.label),actual.rows.map(r=>normalize(r.label)));
+ const separatorMatch=same(expected.separators,separators),arrows=same(expectedArrows,actualArrows);
+ return{labels,separators:separatorMatch,arrows,ok:labels&&separatorMatch&&arrows};
+}
+function cell(text,className=''){const td=document.createElement('td');td.textContent=text;td.className=className;return td;}
+function tableRow(values){const tr=document.createElement('tr');values.forEach(v=>tr.append(cell(typeof v==='string'?v:v.text,typeof v==='string'?'':v.className)));return tr;}
+function selectVariant(id){state.variant=id;render();}
+function renderReference(spec){
+ const menu=document.createElement('div');menu.className='reference-menu'+(state.baseline==='original'?' original':'');
+ const group=groups.find(g=>g.id===state.group);
+ if(state.baseline==='original'&&state.variant===group.id){const title=document.createElement('div');title.className='reference-title';title.textContent=group.name+' · 정리안';menu.append(title);}
+ spec.rows.forEach((entry,i)=>{
+  if(spec.separators.includes(i)){const sep=document.createElement('div');sep.className='reference-separator';menu.append(sep);}
+  const row=document.createElement('button');row.type='button';row.className='reference-item'+((spec.danger||[]).includes(i)?' danger':'');
+  row.innerHTML=`<svg aria-hidden="true"><use href="#i-${entry.icon}"></use></svg>`;
+  const label=document.createElement('span');label.textContent=entry.label;row.append(label);
+  if(entry.child||(spec.arrows||[]).includes(i)){const arrow=document.createElement('span');arrow.className='arrow';arrow.textContent='›';row.append(arrow);}
+  if(entry.child){row.setAttribute('aria-label',entry.label+' 비교');row.onclick=()=>selectVariant(entry.child);}else{row.title='비교 미리보기입니다. 실제 동작을 실행하지 않습니다.';}
+  menu.append(row);
+ });
+ $('reference').replaceChildren(menu);
+}
+function render(){
+ const group=groups.find(g=>g.id===state.group),spec=specs[state.variant],actual=evidence[state.variant],original=state.baseline==='original';
+ $('title').textContent=group.name;$('fixture').textContent=state.variant==='session-inactive'?'다른 워크스페이스에 속한 세션입니다. 옆에 열기만 표시됩니다.':group.fixture;
+ $('navigation').replaceChildren(...groups.map(g=>{const b=document.createElement('button');b.className='nav-button';b.type='button';b.textContent=g.name;b.setAttribute('aria-current',String(g.id===state.group));const small=document.createElement('small');small.textContent=g.variants.length+'개';b.append(small);b.onclick=()=>{state.group=g.id;state.variant=g.id;render();};return b;}));
+ $('variant').replaceChildren(...group.variants.map(id=>{const option=document.createElement('option');option.value=id;option.textContent=specs[id].name;return option;}));$('variant').value=state.variant;
+ $('baseline').value=state.baseline;
+ const width=original?284:256,rowHeight=original?32:28,margin=original?5:4;
+ const referenceName=original?'최초 시안 · 규격 복원':'지난 수정 시안';
+ $('baselineHeading').textContent=referenceName;$('referenceWidth').textContent=width+'px';$('referenceRuler').style.width=width+'px';
+ $('referenceHint').textContent=original?'기록된 크기로 복원 · 원본 캡처 아님':'기존 수정 HTML의 메뉴 CSS';
+ $('referenceCaption').textContent=original?'284px / 행 32px / 여백 5px. 제목 높이는 복원 프리뷰 값입니다.':'256px / 행 28px / 여백 4px. 상단 제목은 제거된 상태입니다.';
+ renderReference(spec);
+ if(!actual){$('nativeCrop').hidden=true;$('imageError').hidden=false;$('imageError').textContent='이 화면의 측정 데이터가 없습니다.';return;}
+ const [x,y,w,h]=actual.rect,ppp=actual.pixels_per_point;
+ $('rowGapValue').textContent=fmt(actual.row_gap_points??1);
+ $('nativeDimensions').textContent=fmt(w)+' × '+fmt(h)+'pt';$('nativeWidth').textContent=fmt(w)+'pt';$('nativeRuler').style.width=w+'px';
+ $('nativeCrop').hidden=false;$('nativeCrop').style.width=w+'px';$('nativeCrop').style.height=h+'px';
+ const img=$('nativeImage');img.style.width=actual.image_pixels[0]/ppp+'px';img.style.height=actual.image_pixels[1]/ppp+'px';img.style.left=-x+'px';img.style.top=-y+'px';img.alt=group.name+' · '+spec.name+' · 실제 코드 렌더링';$('imageError').hidden=true;img.src=actual.image;
+ $('pngLink').href=actual.image;$('jsonLink').href='context-menu-audit-assets/'+state.variant+'.json';
+ const result=check(state.variant),reduce=(1-w/width)*100;
+ $('nativeCaption').textContent=spec.name+' · '+actual.rows.length+'개 항목 · '+actual.font_points+'pt · '+(result.ok?'항목·순서·구분선 일치':'대조 불일치 확인 필요');
+ const rows=[
+  ['가로 크기',width+'px',fmt(w)+'pt',{text:reduce.toFixed(1)+'% 작음',className:'good'}],
+  ['한 행 높이',rowHeight+'px',fmt(actual.rows[0].rect[3])+'pt',{text:((1-actual.rows[0].rect[3]/rowHeight)*100).toFixed(1)+'% 작음',className:'good'}],
+  ['바깥 여백',margin+'px','4pt',{text:original?'1pt 축소':'동일',className:'good'}],
+  ['행 사이 간격','별도 간격 없음',fmt(actual.row_gap_points??1)+'pt','공통 ROW_GAP 적용'],
+  ['상단 제목',original&&state.variant===group.id?'있음 (복원)':'없음','없음',{text:'제거 확인',className:'good'}],
+  ['항목·순서·구분선',spec.rows.length+'개',actual.rows.length+'개',{text:result.ok?'일치':'불일치',className:result.ok?'good':'bad'}],
+  ['글자 크기 / 모서리','12px / 5px',actual.font_points+'pt / 1pt',{text:'시안과 차이',className:'warn'}]
+ ];
+ $('measurements').replaceChildren(...rows.map(tableRow));
+ $('evidenceJSON').textContent=JSON.stringify(actual,null,2);
+ $('sourcePaths').textContent=group.source+'\ncrates/app/src/ui/context_menu.rs · 공통 스타일 / 아이콘\ncrates/app/src/ui/context_menu_audit.rs · 측정 / 캡처\ncrates/app/src/theme.rs · 앱 팔레트';
+ const max=Math.max(spec.rows.length,actual.rows.length);
+ $('rowChecks').replaceChildren(...Array.from({length:max},(_,i)=>{const expected=spec.rows[i]?.label||'—',native=actual.rows[i]?normalize(actual.rows[i].label):'—';return tableRow([String(i+1),expected,native,{text:expected===native?'일치':'불일치',className:expected===native?'good':'bad'}]);}));
+ // Keep both canvases aligned and show the entire reference, including its
+ // final danger row. Canvas height does not alter either menu's logical scale.
+ const canvasHeight=Math.max(300,$('reference').firstElementChild.getBoundingClientRect().height+130,h+130);
+ document.querySelectorAll('.stage').forEach(stage=>{stage.style.height=canvasHeight+'px';});
+}
+function renderSummary(){
+ const ids=Object.keys(specs),matched=ids.filter(id=>check(id).ok).length;
+ $('overall').textContent=matched+'/'+ids.length+' 일치';$('overall').className=matched===ids.length?'good':'bad';
+ const widths=ids.filter(id=>evidence[id]).map(id=>evidence[id].rect[2]);$('range').textContent=widths.length?fmt(Math.min(...widths))+'–'+fmt(Math.max(...widths))+'pt':'측정 없음';
+ $('inventory').replaceChildren(...groups.map(g=>{const actual=evidence[g.id],c=check(g.id),w=actual?.rect[2],h=actual?.rect[3];const tr=document.createElement('tr'),td=document.createElement('td'),b=document.createElement('button');b.className='table-button';b.textContent=g.name;b.onclick=()=>{state.group=g.id;state.variant=g.id;render();document.querySelector('.intro').scrollIntoView({behavior:'smooth',block:'start'});};td.append(b);tr.append(td);tr.append(cell(actual?fmt(w)+' × '+fmt(h)+'pt':'측정 없음'),cell(actual?((1-w/284)*100).toFixed(1)+'% 축소':'—','good'),cell(actual?((1-w/256)*100).toFixed(1)+'% 축소':'—','good'),cell(c.ok?'일치':'불일치',c.ok?'good':'bad'));return tr;}));
+ $('testResult').textContent=payload.tests||'검증 결과 기록 없음';
+ $('sourceStamp').textContent=payload.source||'소스 기록 없음';
+}
+const initial=new URLSearchParams(location.search);if(specs[initial.get('menu')]){state.variant=initial.get('menu');state.group=groups.find(g=>g.variants.includes(state.variant)).id;}if(initial.get('baseline')==='compact')state.baseline='compact';
+$('baseline').onchange=e=>{state.baseline=e.target.value;render();};$('variant').onchange=e=>selectVariant(e.target.value);$('nativeImage').onerror=()=>{$('imageError').hidden=false;};
+renderSummary();render();
+</script>
+</body>
+</html>

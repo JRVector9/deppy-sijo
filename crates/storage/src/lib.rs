@@ -2,6 +2,7 @@
 //! SQLite metadata·rotation·encrypted raw log(기본 비활성 — 7장)는 후속 PR.
 
 mod db;
+mod task_prompt;
 pub use db::{
     AGENT_STATE_BINDING_ROWS_MAX, AGENT_STATE_EXACT_MUTATIONS_MAX, AGENT_STATE_JOB_BYTES_MAX,
     AGENT_STATE_SNAPSHOT_BYTES_MAX, AGENT_STATE_STRUCTURED_MUTATION_BYTES_MAX,
@@ -28,7 +29,7 @@ pub use db::{
     SettingsWorkspaceProjectionRow, StatuslineRow, StructuredThreadMutation, StructuredThreadRow,
     WORKSPACE_NOTE_MAX_BYTES, WebPushSubscriptionRow, WorkspaceFindOrCreateResult,
     WorkspaceFolderAnchor, WorkspaceMovedPathUpdate, WorkspaceRow,
-    prepare_agent_state_job_for_retention, task_prompt_is_displayable,
+    prepare_agent_state_job_for_retention, task_prompt_is_displayable, task_prompt_text,
 };
 pub use mcp_store::{
     MCP_PERMISSION_POINT_BYTES_MAX, MCP_SERVER_INVENTORY_BYTES_MAX, MCP_SERVER_INVENTORY_LIMIT_MAX,

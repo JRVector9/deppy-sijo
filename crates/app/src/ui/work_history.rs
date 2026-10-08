@@ -3,6 +3,8 @@
 //! 저장소 조회, Git 수집, 세션 이동 같은 권한은 갖지 않는다. App이 넘긴 bounded
 //! immutable snapshot을 그리며, 밖으로는 durable identity 기반 의도만 내보낸다.
 
+mod browser;
+
 /// 카드가 실제로 구분·정렬·검색·렌더에 쓰는 상태만 남긴 leaf 전용 상태값.
 /// 저장소 쪽 durable 상태값과 값 집합은 같지만, leaf가 그 크레이트를 직접
 /// 참조하지 않도록 App이 변환한다(`crates/app/src/app.rs`).
@@ -17,12 +19,16 @@ pub enum WorkHistoryState {
 /// 탭이 활성인 동안 매 프레임 렌더되므로, `String`을 복제하지 않고 App이 들고
 /// 있는 durable work-turn 행의 필드를 참조로만 넘긴다.
 ///
-/// durable 행이 갖는 `pane_id`·`cwd`·`occurred_at`은 이 파일 어디에서도 읽지
-/// 않아 뺐다 — pane 매칭·git 조회·활성화 판단은 모두 App
-/// 쪽(`resolve_work_history_activation` 등)의 책임이라 leaf 뷰에 들어올 이유가
-/// 없다.
+/// Pane/path/start data support browser filtering and detail display. Activation and
+/// current-state ownership checks remain in App; this view carries no capabilities.
 #[derive(Clone, Copy, Debug)]
 pub struct WorkHistoryRow<'a> {
+    pub pane_id: &'a str,
+    pub pane_title: Option<&'a str>,
+    pub cwd: Option<&'a str>,
+    pub occurred_at: Option<i64>,
+    /// None means a saved active status has no exact live proof.
+    pub current_state: Option<WorkHistoryState>,
     pub workspace_id: &'a str,
     pub kind: &'a str,
     pub agent_session_id: &'a str,
@@ -40,6 +46,8 @@ pub struct WorkHistoryRow<'a> {
 }
 
 pub struct WorkHistorySnapshot<'a> {
+    pub current_pane: Option<&'a str>,
+    pub collection_blocked: usize,
     pub workspace_name: &'a str,
     pub current_branch: Option<&'a str>,
     pub rows: &'a [WorkHistoryRow<'a>],
@@ -179,12 +187,11 @@ impl WorkHistoryProvider {
     }
 }
 
-/// 카드 정렬 기준. 기본값 `StateFirst`는 기존 동작(state_rank → updated_at desc →
-/// source_offset desc)을 그대로 유지한다.
+/// Work start newest-first is the default. StateFirst remains an explicit option.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum WorkHistorySortMode {
-    #[default]
     StateFirst,
+    #[default]
     RecentFirst,
 }
 
@@ -261,14 +268,20 @@ fn compare_rows(
     match sort_mode {
         WorkHistorySortMode::StateFirst => state_rank(left.state)
             .cmp(&state_rank(right.state))
-            .then_with(|| right.updated_at.cmp(&left.updated_at))
+            .then_with(|| {
+                right
+                    .occurred_at
+                    .unwrap_or(right.updated_at)
+                    .cmp(&left.occurred_at.unwrap_or(left.updated_at))
+            })
             .then_with(|| right.source_offset.cmp(&left.source_offset))
             .then_with(|| left.kind.cmp(right.kind))
             .then_with(|| left.agent_session_id.cmp(right.agent_session_id))
             .then_with(|| left.turn_key.cmp(right.turn_key)),
         WorkHistorySortMode::RecentFirst => right
-            .updated_at
-            .cmp(&left.updated_at)
+            .occurred_at
+            .unwrap_or(right.updated_at)
+            .cmp(&left.occurred_at.unwrap_or(left.updated_at))
             .then_with(|| right.source_offset.cmp(&left.source_offset))
             .then_with(|| left.kind.cmp(right.kind))
             .then_with(|| left.agent_session_id.cmp(right.agent_session_id))
@@ -509,6 +522,8 @@ fn group_accessible_label(kind: &str, agent_session_id: &str) -> String {
 }
 
 pub struct WorkHistoryUi {
+    browser: browser::BrowserState,
+    browser_embedded: bool,
     query: String,
     filter: WorkHistoryFilter,
     providers: Vec<WorkHistoryProvider>,
@@ -544,10 +559,12 @@ pub struct WorkHistoryUi {
 impl WorkHistoryUi {
     pub fn new() -> Self {
         Self {
+            browser: browser::BrowserState::default(),
+            browser_embedded: false,
             query: String::new(),
             filter: WorkHistoryFilter::All,
             providers: Vec::new(),
-            sort_mode: WorkHistorySortMode::StateFirst,
+            sort_mode: WorkHistorySortMode::RecentFirst,
             selected: None,
             collapsed_groups: std::collections::HashSet::new(),
             collapsed_generation: 0,
@@ -614,12 +631,14 @@ impl WorkHistoryUi {
         content.show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.set_min_height((available_height - f32::from(BODY_MARGIN_Y) * 2.0).max(0.0));
-            if self.render_context_row(ui, &snapshot, shown, catalog) {
-                action = Some(WorkHistoryAction::Refresh);
+            if !self.browser_embedded {
+                if self.render_context_row(ui, &snapshot, shown, catalog) {
+                    action = Some(WorkHistoryAction::Refresh);
+                }
+                ui.add_space(8.0);
+                self.render_controls(ui, catalog);
+                ui.add_space(8.0);
             }
-            ui.add_space(8.0);
-            self.render_controls(ui, catalog);
-            ui.add_space(8.0);
 
             if let Some(error) = snapshot.error {
                 render_error(ui, error, catalog);
@@ -959,7 +978,11 @@ impl WorkHistoryUi {
 
     fn toggle_selected(&mut self, identity: WorkTurnIdentity) {
         if self.selected.as_ref() == Some(&identity) {
-            self.selected = None;
+            // The browser detail always needs a selected identity; only standalone cards
+            // use a second click to collapse/deselect their inline body.
+            if !self.browser_embedded {
+                self.selected = None;
+            }
         } else {
             self.selected = Some(identity);
         }
@@ -1026,6 +1049,9 @@ fn row_matches_query(row: &WorkHistoryRow<'_>, query: &str) -> bool {
         Some(row.instruction),
         row.agent_summary,
         Some(row.kind),
+        Some(row.pane_id),
+        row.pane_title,
+        Some(row.agent_session_id),
         row.model,
         row.effort,
         row.branch,
@@ -1273,7 +1299,12 @@ fn render_card(
                             ui.set_width(ui.available_width());
                             let summary = match row.agent_summary {
                                 Some(text) => collapsed_summary_block(text),
-                                None => catalog.t(catalog_key_for_summary_fallback(row.state), &[]),
+                                None => catalog.t(
+                                    row.current_state
+                                        .map(catalog_key_for_summary_fallback)
+                                        .unwrap_or("history.state.unknown"),
+                                    &[],
+                                ),
                             };
                             ui.add(egui::Label::new(egui::RichText::new(summary).weak()).wrap());
                         });
@@ -1658,7 +1689,7 @@ fn metadata_parts<'a>(row: &WorkHistoryRow<'a>) -> MetadataParts<'a> {
 fn render_metadata(ui: &mut egui::Ui, row: &WorkHistoryRow<'_>, catalog: &i18n::Catalog) {
     let metadata = metadata_parts(row);
     // 그릴 것이 하나도 없으면 여백만 남은 빈 줄이 생긴다 — 아예 그리지 않는다.
-    let show_state = row.state != WorkHistoryState::Completed;
+    let show_state = row.current_state != Some(WorkHistoryState::Completed);
     if metadata.branch.is_none() && metadata.git_change_count.is_none() && !show_state {
         return;
     }
@@ -1682,11 +1713,13 @@ fn render_metadata(ui: &mut egui::Ui, row: &WorkHistoryRow<'_>, catalog: &i18n::
                 // 「완료」는 대부분의 행이 가진 값이라 다 적으면 목록이 그 단어로 덮인다.
                 // 실행 중·확인 필요만 점과 함께 보여 눈에 걸리게 한다.
                 if show_state {
-                    status_dot(ui, row.state);
+                    if let Some(state) = row.current_state {
+                        status_dot(ui, state);
+                    }
                     ui.label(
-                        egui::RichText::new(state_label(row.state, catalog))
+                        egui::RichText::new(browser::display_state(row, catalog))
                             .small()
-                            .color(state_color(row.state, ui.visuals())),
+                            .color(browser::display_color(row, ui.visuals())),
                     );
                 }
             });
@@ -1837,6 +1870,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn approved_history_defaults_to_work_start_order() {
+        let mut old = row("old", storage::AgentWorkTurnState::Working, 900);
+        old.occurred_at = Some(100);
+        let mut recent = row("recent", storage::AgentWorkTurnState::Completed, 200);
+        recent.occurred_at = Some(200);
+        let data = [old, recent];
+        let views = views(&data);
+        let browser = WorkHistoryUi::new();
+        assert_eq!(
+            browser.visible_rows(&views)[0].turn_key,
+            "recent",
+            "updating an old active turn must not move it above newer work"
+        );
+    }
+
     /// production 함수는 leaf 뷰(`WorkHistoryRow`)만 받으므로, 이 파일의 테스트가
     /// 계속 `storage::AgentWorkTurnRow` 픽스처로 쓰기 위한 변환 헬퍼.
     /// `WorkHistoryRow::from`은 App(`crates/app/src/app.rs`)이 정의한다 — 같은
@@ -1935,7 +1984,7 @@ mod tests {
         let mut harness = card_harness(&catalog, &candidate, &presentation);
 
         harness
-            .get_by_role_and_label(egui::accesskit::Role::Button, "View Git changes")
+            .get_by_role_and_label(egui::accesskit::Role::Button, "View current Git")
             .click();
         harness.run();
 
@@ -2002,7 +2051,7 @@ mod tests {
         let card_toggle =
             harness.get_by_role_and_label(egui::accesskit::Role::Button, &candidate.instruction);
 
-        for label in ["New run", "View Git changes"] {
+        for label in ["New run", "View current Git"] {
             assert!(
                 card_toggle
                     .query_by_role_and_label(egui::accesskit::Role::Button, label)
@@ -2242,7 +2291,8 @@ mod tests {
             row("working-new", storage::AgentWorkTurnState::Working, 20),
             same_second_newer,
         ];
-        let ui = WorkHistoryUi::new();
+        let mut ui = WorkHistoryUi::new();
+        ui.sort_mode = WorkHistorySortMode::StateFirst;
         let views = views(&rows);
 
         let keys: Vec<&str> = ui
@@ -2681,7 +2731,8 @@ mod tests {
         let mut c_completed = row("c-completed", storage::AgentWorkTurnState::Completed, 50);
         c_completed.agent_session_id = "session-c".to_owned();
         let rows = vec![a_working, a_completed, b_waiting, c_completed];
-        let ui = WorkHistoryUi::new();
+        let mut ui = WorkHistoryUi::new();
+        ui.sort_mode = WorkHistorySortMode::StateFirst;
         let views = views(&rows);
 
         let groups = ui.grouped_rows(&views);
@@ -2849,6 +2900,8 @@ mod tests {
                     state.show(
                         ui,
                         WorkHistorySnapshot {
+                            current_pane: None,
+                            collection_blocked: 0,
                             workspace_name: "workspace",
                             current_branch: None,
                             rows,
@@ -2998,6 +3051,8 @@ mod tests {
                     state.show(
                         ui,
                         WorkHistorySnapshot {
+                            current_pane: None,
+                            collection_blocked: 0,
                             workspace_name: "workspace",
                             current_branch: None,
                             rows: &views,
@@ -3263,6 +3318,8 @@ mod tests {
                     state.show(
                         ui,
                         WorkHistorySnapshot {
+                            current_pane: None,
+                            collection_blocked: 0,
                             workspace_name: "workspace",
                             current_branch: None,
                             rows: &views,
@@ -3328,6 +3385,8 @@ mod tests {
                     state.show(
                         ui,
                         WorkHistorySnapshot {
+                            current_pane: None,
+                            collection_blocked: 0,
                             workspace_name: "workspace",
                             current_branch: None,
                             rows: &views,

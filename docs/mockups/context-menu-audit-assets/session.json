@@ -1,0 +1,70 @@
+{
+  "font": "Apple SD Gothic Neo (app default)",
+  "font_points": 13.0,
+  "id": "session",
+  "image": "context-menu-audit-assets/session.png",
+  "image_pixels": [
+    1400,
+    1000
+  ],
+  "pixels_per_point": 2.0,
+  "rect": [
+    45.0,
+    17.0,
+    202.0,
+    130.0
+  ],
+  "row_gap_points": 3.0,
+  "rows": [
+    {
+      "disabled": false,
+      "label": "이름 변경",
+      "rect": [
+        50.0,
+        22.0,
+        192.0,
+        18.0
+      ]
+    },
+    {
+      "disabled": false,
+      "label": "변경 보기",
+      "rect": [
+        50.0,
+        43.0,
+        192.0,
+        18.0
+      ]
+    },
+    {
+      "disabled": false,
+      "label": "세션 추가 ⏵",
+      "rect": [
+        50.0,
+        73.0,
+        192.0,
+        18.0
+      ]
+    },
+    {
+      "disabled": false,
+      "label": "세션 폴더 ⏵",
+      "rect": [
+        50.0,
+        94.0,
+        192.0,
+        18.0
+      ]
+    },
+    {
+      "disabled": false,
+      "label": "세션 닫기",
+      "rect": [
+        50.0,
+        124.0,
+        192.0,
+        18.0
+      ]
+    }
+  ]
+}

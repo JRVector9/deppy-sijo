@@ -2191,22 +2191,30 @@ fn card(
     let mut click = response.clicked().then_some(CardClick::Open);
     // 예약은 PTY 전용이다 — 구조화 세션은 steer 경로라 WriteInput 대상이 아니다.
     if matches!(session.target, FleetTarget::Pty { .. }) {
-        response.context_menu(|ui| {
-            if ui
-                .add_enabled(
-                    session.broadcast_key().is_some(),
-                    egui::Button::new(catalog.t("fleet.followup.menu", &[])),
-                )
-                .clicked()
+        super::context_menu::show(&response, |ui| {
+            if super::context_menu::enabled_button(
+                ui,
+                session.broadcast_key().is_some(),
+                catalog.t("fleet.followup.menu", &[]),
+                super::context_menu::Icon::Clock,
+            )
+            .clicked()
             {
                 click = Some(CardClick::ScheduleFollowUp);
                 ui.close();
             }
-            if session.followup.is_some()
-                && ui.button(catalog.t("fleet.followup.cancel", &[])).clicked()
-            {
-                click = Some(CardClick::CancelFollowUp);
-                ui.close();
+            if session.followup.is_some() {
+                ui.separator();
+                if super::context_menu::danger_button(
+                    ui,
+                    catalog.t("fleet.followup.cancel", &[]),
+                    super::context_menu::Icon::Close,
+                )
+                .clicked()
+                {
+                    click = Some(CardClick::CancelFollowUp);
+                    ui.close();
+                }
             }
         });
     }
@@ -2920,6 +2928,36 @@ mod tests {
             headline: Some("계속할까요?".to_owned()),
             preview_source: None,
         }
+    }
+
+    #[test]
+    #[ignore = "offscreen menu audit PNGs and measured geometry"]
+    fn context_menu_audit_fleet() {
+        use egui_kittest::kittest::Queryable;
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        let mut session = pty_session("audit", 7, AgentVisualState::Active);
+        session.followup = Some("예약된 지시".into());
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(700.0, 500.0))
+            .with_pixels_per_point(2.0)
+            .build_ui(|ui| {
+                super::super::designall::apply_workspace_visuals(ui);
+                let _ = card(ui, &session, &catalog, 0, None);
+            });
+        super::super::context_menu_audit::prepare(&harness.ctx);
+        harness.run();
+        let target = harness.get_by_label(&session.title).rect().center();
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos: target,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+            harness.step();
+        }
+        harness.run();
+        super::super::context_menu_audit::save(&mut harness, "fleet");
     }
 
     fn pty_session(workspace_id: &str, session: u64, state: AgentVisualState) -> FleetSession {

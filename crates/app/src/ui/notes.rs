@@ -219,29 +219,40 @@ impl NotesUi {
             .unwrap_or_default();
         let has_selection = !selection.is_empty();
         if let Some(menu_response) = menu_response {
-            menu_response.context_menu(|ui| {
+            super::context_menu::show(&menu_response, |ui| {
+                use super::context_menu::Icon;
                 let commands = [
-                    ("notes.menu.cut", egui::Event::Cut, has_selection),
-                    ("action.copy", egui::Event::Copy, has_selection),
+                    (
+                        "notes.menu.cut",
+                        egui::Event::Cut,
+                        has_selection,
+                        Icon::Edit,
+                    ),
+                    ("action.copy", egui::Event::Copy, has_selection, Icon::Copy),
                     (
                         "shortcuts.action.paste",
                         egui::Event::Paste(String::new()),
                         true,
+                        Icon::Paste,
                     ),
                     (
                         "action.delete",
                         note_key_event(egui::Key::Backspace, egui::Modifiers::NONE),
                         has_selection,
+                        Icon::Trash,
                     ),
                     (
                         "notes.menu.select_all",
                         note_key_event(egui::Key::A, egui::Modifiers::COMMAND),
                         !self.buffer.is_empty(),
+                        Icon::File,
                     ),
                 ];
-                for (label, event, enabled) in commands {
-                    if ui
-                        .add_enabled(enabled, egui::Button::new(catalog.t(label, &[])))
+                for (index, (label, event, enabled, icon)) in commands.into_iter().enumerate() {
+                    if index == 4 {
+                        ui.separator();
+                    }
+                    if super::context_menu::enabled_button(ui, enabled, catalog.t(label, &[]), icon)
                         .clicked()
                     {
                         match event {
@@ -553,6 +564,17 @@ mod tests {
         note_click(&mut harness, point, egui::PointerButton::Secondary);
         harness.run();
         assert_eq!(selected_note(&harness), "middle");
+    }
+
+    #[test]
+    #[ignore = "offscreen menu audit PNGs and measured geometry"]
+    fn context_menu_audit_notes() {
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        let mut harness = note_harness(&catalog);
+        super::super::context_menu_audit::prepare(&harness.ctx);
+        drag_middle(&mut harness);
+        open_note_menu(&mut harness);
+        super::super::context_menu_audit::save(&mut harness, "notes");
     }
 
     fn open_note_menu(harness: &mut egui_kittest::Harness<'_, NoteHarnessState>) {

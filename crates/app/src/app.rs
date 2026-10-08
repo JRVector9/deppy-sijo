@@ -517,6 +517,12 @@ impl From<storage::AgentWorkTurnState> for ui::work_history::WorkHistoryState {
 impl<'a> From<&'a storage::AgentWorkTurnRow> for ui::work_history::WorkHistoryRow<'a> {
     fn from(row: &'a storage::AgentWorkTurnRow) -> Self {
         Self {
+            pane_id: &row.pane_id,
+            pane_title: None,
+            cwd: row.cwd.as_deref(),
+            occurred_at: row.occurred_at,
+            current_state: (row.state == storage::AgentWorkTurnState::Completed)
+                .then_some(ui::work_history::WorkHistoryState::Completed),
             workspace_id: &row.workspace_id,
             kind: &row.kind,
             agent_session_id: &row.agent_session_id,
@@ -532,6 +538,23 @@ impl<'a> From<&'a storage::AgentWorkTurnRow> for ui::work_history::WorkHistoryRo
             state: row.state.into(),
             updated_at: row.updated_at,
         }
+    }
+}
+
+/// Recorded terminal results remain valid. Active states require exact live ownership
+/// and a freshly observed matching turn; age alone never proves completion.
+fn verified_work_history_state(
+    recorded: storage::AgentWorkTurnState,
+    exact_live_binding: bool,
+    newest_observed_turn: bool,
+    live: Option<storage::AgentWorkTurnState>,
+) -> Option<ui::work_history::WorkHistoryState> {
+    if exact_live_binding && newest_observed_turn && live.is_some() {
+        live.map(Into::into)
+    } else if recorded == storage::AgentWorkTurnState::Completed {
+        Some(ui::work_history::WorkHistoryState::Completed)
+    } else {
+        None
     }
 }
 
@@ -6342,27 +6365,41 @@ fn render_env_api_project_header(
         if response.clicked() && !project_id.is_empty() {
             *env_action = Some(ui::env_profiles::EnvAction::ChooseProjectFolder);
         }
-        response.context_menu(|ui| {
-            if ui
-                .button(catalog.t("env.project_folder.choose", &[]))
-                .clicked()
+        ui::context_menu::show(&response, |ui| {
+            if ui::context_menu::button(
+                ui,
+                catalog.t("env.project_folder.choose", &[]),
+                ui::context_menu::Icon::Folder,
+            )
+            .clicked()
             {
                 *env_action = Some(ui::env_profiles::EnvAction::ChooseProjectFolder);
                 ui.close();
             }
-            if !path.is_empty()
-                && ui
-                    .button(catalog.t("env.project_folder.clear", &[]))
-                    .clicked()
-            {
-                *env_action = Some(ui::env_profiles::EnvAction::SetProjectPath(
-                    std::path::PathBuf::new(),
-                ));
-                ui.close();
-            }
-            if !path.is_empty() && ui.button(catalog.t("env.resync_hint", &[])).clicked() {
-                *env_action = Some(ui::env_profiles::EnvAction::Resync);
-                ui.close();
+            if !path.is_empty() {
+                if ui::context_menu::button(
+                    ui,
+                    catalog.t("env.resync_hint", &[]),
+                    ui::context_menu::Icon::Settings,
+                )
+                .clicked()
+                {
+                    *env_action = Some(ui::env_profiles::EnvAction::Resync);
+                    ui.close();
+                }
+                ui.separator();
+                if ui::context_menu::danger_button(
+                    ui,
+                    catalog.t("env.project_folder.clear", &[]),
+                    ui::context_menu::Icon::Close,
+                )
+                .clicked()
+                {
+                    *env_action = Some(ui::env_profiles::EnvAction::SetProjectPath(
+                        std::path::PathBuf::new(),
+                    ));
+                    ui.close();
+                }
             }
         });
     }
@@ -9919,61 +9956,15 @@ pub struct App {
     /// Render가 반환한 controller action 한 건. 다음 logic tick에서만 실행해 process와
     /// protocol I/O가 render call graph에 들어오지 않게 한다.
     pending_agent_sessions_action: Option<ui::agent_sessions::AgentSessionsDeferredAction>,
-    /// 세션 cwd 레포의 git 변경분 리뷰 패널 (사이드바 「변경 보기」). 진입점은
-    /// 2026-08-15부터 사이드바 Git 탭 + `diff_viewer_ui`로 옮겨갔다 — 이 필드는
-    /// work history의 「변경 보기」(`open_for_path`)가 계속 쓴다(Task 11에서 은퇴 검토).
+    /// Session-owned auxiliary tabs, filters, selection and cached results.
+    session_aux: crate::session_aux::SessionAuxViews,
+    /// Work history's legacy change preview; independent from the session Git view.
     diff_panel_ui: ui::diff_panel::DiffPanelUi,
-    /// Git 보조 본문 우측(마스터-디테일) 실용형 diff 뷰어 — git 패널 행 클릭이 연다
-    /// (2026-08-15 2차, 스펙 §8-3). 전면 뷰가 아니라 `render_git_tab_body`가 그린다.
-    diff_viewer_ui: ui::diff_viewer::DiffViewerUi,
-    /// git 패널 IO 완료의 stale 폐기용 세대. 요청마다 증가하며, 완료 시점에 이 값과
-    /// 다르면 조용히 버린다(기존 Diff IO의 generation 관례, 2026-08-15).
+    /// Globally unique async request id. Each session retains its last issued id.
     git_panel_generation: u64,
-    /// Git 패널 렌더 상태 — 2026-08-15 2차부터 file_tree(사이드바)가 아니라 App이 직접
-    /// 소유한다. Git이 사이드바 인라인 탭에서 pane 보조 탭으로 옮겨가면서, 사이드바
-    /// leaf가 더는 git IO 결과를 들고 있을 이유가 없어졌다(§8-1).
-    git_panel_ui: ui::git_panel::GitPanelUi,
-    /// 지금 Git 패널이 보여주는(요청 중인) repo cwd — `request_git_panel_io_at`이 요청마다
-    /// 갱신한다. ⟳ 새로고침·파일 diff는 포커스 세션을 다시 묻지 않고 이 값을 그대로
-    /// 써서, 패널이 열려 있는 동안 포커스가 다른 세션으로 옮겨가도 다른 repo로 갈아타지
-    /// 않는다(2026-08-16, 「변경 보기」로 세션에 고정한 뒤 ⟳를 누르면 포커스 세션으로
-    /// 조용히 바뀌던 결함 수정).
-    git_panel_cwd: Option<PathBuf>,
-    /// 이력과 같은 보조 UI 탭 상태 기계 — runtime의 mux 탭/pane과 무관하다.
-    git_tab: ui::workspace::PaneAuxTabState,
-    /// Git 본문 좌(목록)/우(diff) 분할 폭 — 사용자가 구분선을 한 번도 안 끌었으면
-    /// `None`(자동 계산), 끌고 나면 `Some(px)`로 그 값을 기억한다. 이력과는 따로 기억한다
-    /// (2026-08-16 사용자: 가로 폭을 조절할 수 없다). 재시작 시 유지하지 않는다(사이드바
-    /// 폭도 그렇다).
-    git_tab_split_width: Option<f32>,
-    work_history_ui: ui::work_history::WorkHistoryUi,
-    /// 이력은 전역 중앙 페이지가 아니라 현재 세션 pane 헤더 옆의 **보조 UI 탭**이다.
-    /// 이 상태는 runtime의 mux 탭/pane과 무관하다 — 열고 닫아도 PTY·세션은 그대로다
-    /// (2026-08-14 사용자: 터미널 전체가 다른 페이지로 바뀌는 방식은 원하지 않는다).
-    work_history_tab: ui::workspace::PaneAuxTabState,
-    /// 이력 본문 좌(카드)/우(원문) 분할 폭 — `git_tab_split_width`와 같은 규칙, Git과는
-    /// 따로 기억한다.
-    work_history_tab_split_width: Option<f32>,
-    /// 이력·Git과 같은 보조 UI 탭 상태 기계 — 문서 **그룹** 전체(멀티 문서 탭 설계
-    /// §2)의 활성 여부다. 문서가 하나도 없으면 `Closed`, 하나 이상 있으면
-    /// `OpenActive`/`OpenInactive` — 이력·Git·문서 그룹 중 어느 것이 보조 본문을
-    /// 차지하는지는 여전히 이 셋의 상호배타(`resolve_aux_tab_exclusivity`)로 정해지고,
-    /// 문서 그룹 **안에서** 어느 문서가 보이는지는 `active_document`가 따로 정한다.
-    document_tab: ui::workspace::PaneAuxTabState,
-    /// 지금 열려 있는 문서들 — App 소유(멀티 문서 탭 설계 §2). 탭이 닫히면
-    /// 그 자리만 빠지고 나머지는 그대로다. `DOCUMENT_TABS_MAX`·
-    /// `DOCUMENT_TOTAL_RETAINED_BYTES_MAX` 둘 다로 유계다(§4).
+    /// Global bounded buffers, owned by document ids in session_aux views.
     documents: Vec<OpenDocument>,
-    /// 문서 그룹 안에서 지금 보이는 문서 — `documents`가 비어 있으면 `None`이다.
-    active_document: Option<ui::workspace::DocumentTabId>,
-    /// 다음에 배정할 `DocumentTabId` — 절대 감소하지 않고, 닫힌 문서의 id를
-    /// 재사용하지 않는다(멀티 문서 탭 설계 §1 — 재사용하면 그 문서의 늦게 도착한
-    /// IO 결과가 새 문서에 잘못 적용될 수 있다).
     next_document_tab_id: u32,
-    /// 문서 본문 좌(source)/우(preview) Split 분할 폭 — `git_tab_split_width`와 같은
-    /// 규칙, Git·이력과는 따로 기억한다. 문서마다 따로 기억하지 않는다(설계 §4 지시
-    /// — 분할 폭은 공유해도 된다).
-    document_tab_split_width: Option<f32>,
     /// 아직 워커에 admit되지 못한 로드 요청들 — 문서를 연달아 열면 쌓일 수 있다
     /// (워커는 한 번에 하나만 처리한다, `document_load_inflight` 참고). FIFO로
     /// 순서대로 admit한다.
@@ -10026,19 +10017,12 @@ pub struct App {
     /// 탭 설계) App 전역 슬롯 하나가 아니라 집합이다 — 서로 다른 문서 둘을 동시에
     /// "저장 후 닫기"해도 서로의 continuation을 덮어쓰지 않는다.
     document_close_after_save: std::collections::HashSet<ui::workspace::DocumentTabId>,
-    /// 상한(`DOCUMENT_TABS_MAX`·`DOCUMENT_TOTAL_RETAINED_BYTES_MAX`)에 걸렸는데 닫을 clean
-    /// 문서가 하나도 없어 새 문서를 열지 못했다는 안내(설계 §4). `true`면 모달을
-    /// 그린다.
-    document_cap_notice: bool,
-    /// Markdown Preview/Split 렌더 캐시 — leaf 소유 상태를 App이 세션처럼 들고
-    /// 있는다(`transcript_viewer_ui`·`diff_viewer_ui`와 같은 관례). 문서마다 캐시가
-    /// 갈리는 건 `MarkdownDocumentSlot`을 문서 id로 만들기 때문이다(단일 인스턴스를
-    /// 여러 문서가 슬롯으로 나눠 쓴다).
+    /// Markdown caches are keyed by unique DocumentTabId.
     document_markdown_viewer: ui::markdown_viewer::MarkdownViewer,
     document_image_worker: crate::markdown_image_io::ImageWorker,
     /// pane이 하나도 없는 워크스페이스에서 문서를 열었을 때 — 셸 pane을 먼저 스폰하고
     /// (`SpawnShellAt`), 그 pane이 나타나면 `poll_pending_document_open`이 이어받아 연다.
-    pending_document_open: Option<PathBuf>,
+    pending_document_open: Option<(String, u64, PathBuf)>,
     work_history_rows: Vec<storage::AgentWorkTurnRow>,
     /// `work_history_rows`를 실제로 수정할 때마다(교체·in-place 갱신·비움) 올린다.
     /// leaf(`ui::work_history::WorkHistorySnapshot::rows_revision`)가 이 값으로
@@ -10066,16 +10050,8 @@ pub struct App {
     work_history_git_manual_refresh: bool,
     work_history_git_manual_generation: Option<u64>,
     pending_work_history_action: Option<ui::work_history::WorkHistoryAction>,
-    /// 이력 보조 본문 우측(마스터-디테일) 원문 뷰어 — 카드 「원문 보기」가 연다
-    /// (2026-08-15 Task 10, 스펙 §2). 아무것도 저장하지 않는다.
-    transcript_viewer_ui: ui::transcript_viewer::TranscriptViewerUi,
-    /// 원문 IO 완료의 stale 폐기용 세대 — `git_panel_generation`과 같은 관례.
+    /// Globally unique transcript request id; completions route to their issuing view.
     transcript_generation: u64,
-    /// 보조 본문(이력·Git) 검색 상태 — App이 소유하고 leaf는 읽기만 한다(2026-08-18
-    /// 스펙 `docs/superpowers/specs/2026-08-18-aux-search-design.md`).
-    /// 활성 보조 탭이 바뀌거나(`apply_work_history_tab_intent`/`apply_git_tab_intent`)
-    /// 워크스페이스가 바뀌면(`reset_git_surfaces` 옆) `reset()`한다.
-    aux_search: ui::aux_search::AuxSearchState,
     /// Lazy aggregate boundary for hook/attention/restore/binding/resume/catalog/project-name
     /// persistence and filesystem projections. Construction opens no DB and starts no thread.
     agent_state_worker: crate::agent_state_worker::AgentStateWorker<AppAgentStateBackend>,
@@ -10114,7 +10090,7 @@ pub struct App {
     pending_workspace_add_picker: Option<FolderPickerPurpose>,
     /// 위 슬롯이 차 있어 밀려난 「원문 보기」 요청. 사용자 클릭이라 버리지 않고 다음
     /// 프레임에 태운다. 여기도 latest-only 한 건이다(2026-08-16).
-    pending_app_host_retry: Option<AppHostIoAction>,
+    pending_app_host_retry: std::collections::VecDeque<AppHostIoAction>,
     pending_file_tree_maintenance: Option<ui::file_tree::FileTreeMaintenanceIntent>,
     file_tree_watcher: Option<AppFileTreeWatcher>,
     /// Settings가 반환한 lifecycle action 한 건. 다음 logic tick에서만 실행한다.
@@ -10756,17 +10732,39 @@ fn shared_agent_transcript_sessions(
     shared
 }
 
+/// A shared file is attributable only by an exact, unique pane prompt. Prefixes,
+/// repeated instructions and another pane's same prompt remain ambiguous.
+fn attributable_shared_history_turn(
+    prompt: Option<&str>,
+    recent: &[crate::agent_transcript::TranscriptTurn],
+    peer_prompts: &[&str],
+) -> Option<usize> {
+    let prompt = storage::task_prompt_text(prompt?)?;
+    if peer_prompts
+        .iter()
+        .any(|peer| storage::task_prompt_text(peer).as_deref() == Some(prompt.as_ref()))
+    {
+        return None;
+    }
+    let mut matching = recent
+        .iter()
+        .take(24)
+        .enumerate()
+        .filter(|(_, turn)| turn.instruction.trim() == prompt.as_ref());
+    let (index, _) = matching.next()?;
+    matching.next().is_none().then_some(index)
+}
+
 fn trusted_pane_task_prompt<'a>(
     session: runtime::SessionId,
     bindings: &std::collections::HashMap<runtime::SessionId, crate::agent_detect::AgentBinding>,
     prompts: &'a std::collections::HashMap<runtime::SessionId, (String, String)>,
-) -> Option<&'a str> {
+) -> Option<std::borrow::Cow<'a, str>> {
     let binding = bindings.get(&session)?;
     let (native_id, prompt) = prompts.get(&session)?;
-    (binding.kind == crate::agent_detect::AgentKind::Claude
-        && binding.session_id == *native_id
-        && storage::task_prompt_is_displayable(prompt))
-    .then_some(prompt.as_str())
+    (binding.kind == crate::agent_detect::AgentKind::Claude && binding.session_id == *native_id)
+        .then(|| storage::task_prompt_text(prompt))
+        .flatten()
 }
 
 /// Ignore hook rows inherited from a previous process: runtime SessionId can be reused.
@@ -10794,14 +10792,14 @@ fn persisted_pane_task_prompt<'a>(
     binding: &crate::agent_detect::AgentBinding,
     saved: &'a std::collections::HashMap<String, storage::AgentSessionRow>,
     forked_from: Option<&str>,
-) -> Option<&'a str> {
+) -> Option<std::borrow::Cow<'a, str>> {
     let row = saved.get(pane_id)?;
     (binding.kind == crate::agent_detect::AgentKind::Claude
         && row.kind == "claude"
         && (row.session_id == binding.session_id || forked_from == Some(row.session_id.as_str())))
     .then_some(row.task_prompt.as_deref())
     .flatten()
-    .filter(|prompt| storage::task_prompt_is_displayable(prompt))
+    .and_then(storage::task_prompt_text)
 }
 
 fn apply_pane_task_prompts(
@@ -10818,8 +10816,8 @@ fn apply_pane_task_prompts(
                 .is_some_and(|binding| binding.kind == crate::agent_detect::AgentKind::Claude)
             {
                 display.last_agent_summary = None;
-                display.user_instruction =
-                    trusted_pane_task_prompt(*session, bindings, prompts).map(str::to_owned);
+                display.user_instruction = trusted_pane_task_prompt(*session, bindings, prompts)
+                    .map(std::borrow::Cow::into_owned);
             }
         }
         return;
@@ -10827,8 +10825,8 @@ fn apply_pane_task_prompts(
     let shared = shared_agent_transcript_sessions(bindings, hook_history);
     for (session, display) in displays {
         let prompt = trusted_pane_task_prompt(*session, bindings, prompts);
-        if let Some(prompt) = prompt {
-            display.user_instruction = Some(prompt.to_owned());
+        if let Some(prompt) = prompt.as_ref() {
+            display.user_instruction = Some(prompt.to_string());
         }
         if shared.contains(session) {
             // Once a transcript has been shared, its latest assistant text can belong to
@@ -12097,8 +12095,8 @@ fn document_close_disposition(document: Option<&OpenDocument>) -> DocumentCloseD
 /// 만드는 값이 곧 그 위젯의 id다 — 예전처럼 위젯 계층을 역산할 필요가 없다
 /// (2026-08-23). 컨테이너가 달라도 같은 값이라 Source·Split 두 모드가 커서와 undo
 /// 기록을 공유한다.
-fn document_source_editor_id(path: &Path) -> egui::Id {
-    egui::Id::new(("document_tab_source_editor", path))
+fn document_source_editor_id(id: ui::workspace::DocumentTabId, path: &Path) -> egui::Id {
+    egui::Id::new(("document_tab_source_editor", id, path))
 }
 
 /// 문서를 닫을 때 egui가 들고 있던 source 편집기 `TextEditState`를 지운다 — 안 지우면
@@ -12108,7 +12106,7 @@ fn document_source_editor_id(path: &Path) -> egui::Id {
 /// Source·Split 두 모드가 **같은 절대 id**를 쓰므로 한 번만 지우면 된다(2026-08-23).
 /// 그 모드로 열린 적이 없으면 애초에 저장된 적이 없어 `remove`가 조용히 no-op이다.
 fn clear_document_editor_state(ctx: &egui::Context, document: &OpenDocument) {
-    let editor_id = document_source_editor_id(&document.path);
+    let editor_id = document_source_editor_id(document.id, &document.path);
     ctx.data_mut(|d| d.remove::<egui::text_edit::TextEditState>(editor_id));
 }
 
@@ -12145,12 +12143,12 @@ fn dispatch_document_drop_paths(
 /// 같은 경로가 이미 열려 있으면 그 id를 돌려준다(멀티 문서 탭 설계 ③) —
 /// `begin_document_open`이 이 값이 있으면 새로 열지 않고 그 탭만 활성화한다.
 /// 순수 함수라 App 없이 테스트한다.
-fn find_open_document_by_path(
-    documents: &[OpenDocument],
+fn find_open_document_by_path<'a>(
+    documents: impl IntoIterator<Item = &'a OpenDocument>,
     path: &Path,
 ) -> Option<ui::workspace::DocumentTabId> {
     documents
-        .iter()
+        .into_iter()
         .find(|document| document.path == path)
         .map(|document| document.id)
 }
@@ -12293,6 +12291,7 @@ fn plan_document_eviction(
 /// 문서 하나를 닫은 뒤(`documents`에서 이미 그 문서가 제거된 상태) 다음에 활성화할
 /// 문서를 고른다(순수 함수, 멀티 문서 탭 설계 ⑥) — 이웃(오른쪽 우선, 없으면 왼쪽).
 /// `closed_index`는 방금 제거된 문서가 있던 자리(`Vec::remove`에 준 인덱스)다.
+#[cfg(test)]
 fn next_active_document_after_close(
     documents: &[OpenDocument],
     closed_index: usize,
@@ -12358,7 +12357,7 @@ fn reveal_session_aux_tabs(
 /// (2026-08-17 리뷰).
 const GIT_TAB_LIST_MIN_WIDTH: f32 = 180.0;
 /// 이력 보조 본문 좌측 목록의 최소 폭 — 카드가 git 파일 행보다 정보가 많아 더 크다.
-const HISTORY_TAB_LIST_MIN_WIDTH: f32 = 220.0;
+pub(crate) const HISTORY_TAB_LIST_MIN_WIDTH: f32 = 220.0;
 
 fn git_tab_list_width(body_width: f32) -> f32 {
     const FIXED: f32 = 300.0;
@@ -12367,7 +12366,7 @@ fn git_tab_list_width(body_width: f32) -> f32 {
 
 /// 이력 보조 본문 좌측 카드 목록 폭 — `git_tab_list_width`와 같은 규칙(스펙 §2-1)이지만
 /// 카드가 git 파일 행보다 정보가 많아 하한을 조금 크게 잡는다(220 vs 180).
-fn history_tab_list_width(body_width: f32) -> f32 {
+pub(crate) fn history_tab_list_width(body_width: f32) -> f32 {
     const FIXED: f32 = 360.0;
     (body_width * 0.4).clamp(HISTORY_TAB_LIST_MIN_WIDTH, FIXED)
 }
@@ -12405,7 +12404,12 @@ const DOCUMENT_TOTAL_RETAINED_BYTES_MAX: u64 = 24 * 1024 * 1024;
 /// 끌고 나면(`Some(px)`) 그 값을 쓴다. 매 프레임 좌측 최소(`min_list`)·우측 최소
 /// (`AUX_DETAIL_MIN_WIDTH`)로 다시 clamp해, 저장된 폭이 이전 프레임 창 크기 기준이어도
 /// 창을 줄였다 늘렸을 때 항상 유효한 값이 나온다.
-fn aux_split_width(stored: Option<f32>, auto: f32, body_width: f32, min_list: f32) -> f32 {
+pub(crate) fn aux_split_width(
+    stored: Option<f32>,
+    auto: f32,
+    body_width: f32,
+    min_list: f32,
+) -> f32 {
     let requested = stored.unwrap_or(auto);
     let upper = (body_width - AUX_DETAIL_MIN_WIDTH).max(0.0);
     let lower = min_list.min(upper);
@@ -12495,6 +12499,7 @@ enum AppHostIoAction {
 /// 새 워크스페이스 기준으로 다시 채운다. `diff_viewer_ui`도 함께 비워 선택돼 있던 파일
 /// diff가 이전 워크스페이스 것으로 남지 않게 하고, `git_panel_generation`을 올려 이미
 /// in-flight이던 이전 워크스페이스 IO의 완료가 새 화면에 반영되지 않게 막는다.
+#[cfg(test)]
 fn reset_git_surfaces(
     git_panel_ui: &mut ui::git_panel::GitPanelUi,
     diff_viewer_ui: &mut ui::diff_viewer::DiffViewerUi,
@@ -12513,6 +12518,7 @@ fn reset_git_surfaces(
 /// 버려지게 한다. 슬롯이 차 있어 대기 중이던 `pending_app_host_retry`는 아직 어떤
 /// IO도 시작하지 않았으므로 세대 검사로 걸러지지 않는다 — 여기서 직접 비워, 슬롯이
 /// 빌 때 이전 워크스페이스 요청이 다시 실행되지 않게 한다.
+#[cfg(test)]
 fn invalidate_transcript_requests(
     transcript_generation: &mut u64,
     pending_app_host_retry: &mut Option<AppHostIoAction>,
@@ -15238,14 +15244,14 @@ impl App {
             }
             AppHostIoCompletion::GitPanel(completion) => {
                 // stale(세대 불일치)은 조용히 버린다 — 최신 요청의 완료만 반영한다.
-                if completion.generation == self.git_panel_generation {
+                if let Some(view) = self.session_aux.git_result_owner(completion.generation) {
                     match completion.result {
                         ui::git_panel::GitPanelIoResult::Snapshot(result) => {
-                            self.git_panel_ui.set_snapshot(result);
+                            view.git_panel_ui.set_snapshot(result);
                         }
                         ui::git_panel::GitPanelIoResult::FileDiff(result) => match result {
-                            Ok(view) => self.diff_viewer_ui.set_view(view),
-                            Err(_) => self
+                            Ok(diff) => view.diff_viewer_ui.set_view(diff),
+                            Err(_) => view
                                 .diff_viewer_ui
                                 .set_view(ui::diff_viewer::FileDiffView::default()),
                         },
@@ -15259,8 +15265,8 @@ impl App {
                 result,
             } => {
                 // stale(세대 불일치)은 조용히 버린다 — git 패널 IO와 같은 규칙.
-                if generation == self.transcript_generation {
-                    self.transcript_viewer_ui
+                if let Some(view) = self.session_aux.transcript_result_owner(generation) {
+                    view.transcript_viewer_ui
                         .set_conversation(result, Some(focus_offset));
                     self.egui_ctx.request_repaint();
                 }
@@ -15483,7 +15489,7 @@ impl App {
         // 슬롯이 차 있어 밀려났던 원문 보기 요청을 먼저 태운다 — 사용자 클릭이라
         // 버리지 않는다(WorkHistoryAction::ShowTranscript 참조).
         if self.pending_app_host_action.is_none()
-            && let Some(request) = self.pending_app_host_retry.take()
+            && let Some(request) = self.pending_app_host_retry.pop_front()
         {
             self.pending_app_host_action = Some(request);
         }
@@ -16189,21 +16195,11 @@ impl App {
                     secret_store: KeyringSecretStore,
                 })),
             pending_agent_sessions_action: None,
+            session_aux: crate::session_aux::SessionAuxViews::default(),
             diff_panel_ui: ui::diff_panel::DiffPanelUi::new(),
-            diff_viewer_ui: ui::diff_viewer::DiffViewerUi::default(),
             git_panel_generation: 0,
-            git_panel_ui: ui::git_panel::GitPanelUi::default(),
-            git_panel_cwd: None,
-            git_tab: ui::workspace::PaneAuxTabState::default(),
-            git_tab_split_width: None,
-            work_history_ui: ui::work_history::WorkHistoryUi::new(),
-            work_history_tab: ui::workspace::PaneAuxTabState::default(),
-            work_history_tab_split_width: None,
-            document_tab: ui::workspace::PaneAuxTabState::default(),
             documents: Vec::new(),
-            active_document: None,
             next_document_tab_id: 0,
-            document_tab_split_width: None,
             document_pending_loads: std::collections::VecDeque::new(),
             document_load_inflight: None,
             document_load_worker,
@@ -16212,7 +16208,6 @@ impl App {
             document_save_worker,
             document_pending_confirms: std::collections::VecDeque::new(),
             document_close_after_save: std::collections::HashSet::new(),
-            document_cap_notice: false,
             document_markdown_viewer: ui::markdown_viewer::MarkdownViewer::new(),
             document_image_worker: crate::markdown_image_io::new_worker(egui_ctx.clone()),
             pending_document_open: None,
@@ -16232,9 +16227,7 @@ impl App {
             work_history_git_manual_refresh: false,
             work_history_git_manual_generation: None,
             pending_work_history_action: None,
-            transcript_viewer_ui: ui::transcript_viewer::TranscriptViewerUi::default(),
             transcript_generation: 0,
-            aux_search: ui::aux_search::AuxSearchState::default(),
             agent_state_worker,
             agent_state_scope: initial_agent_state_scope,
             pending_agent_state_scope: None,
@@ -16253,7 +16246,7 @@ impl App {
             app_host_io: None,
             pending_app_host_action: None,
             pending_workspace_add_picker: None,
-            pending_app_host_retry: None,
+            pending_app_host_retry: std::collections::VecDeque::new(),
             pending_file_tree_maintenance: None,
             file_tree_watcher: None,
             pending_app_controller_action: None,
@@ -17160,15 +17153,48 @@ impl App {
             shared_agent_transcript_sessions(&self.agent_bindings, &self.hook_overrides);
         let mut rows = Vec::new();
         for (session, recent) in turns {
-            if shared_transcripts.contains(session) {
-                // 같은 native 파일의 턴은 어느 pane에서 시작했는지 알 수 없다.
-                continue;
-            }
             let Some(binding) = self.agent_bindings.get(session) else {
                 continue;
             };
             let Some(pane) = pane_of_session(&mux, *session) else {
                 continue;
+            };
+            let is_shared = shared_transcripts.contains(session);
+            let attributed = if is_shared {
+                let prompt = trusted_pane_task_prompt(
+                    *session,
+                    &self.agent_bindings,
+                    &self.fresh_hook_task_prompts,
+                )
+                .or_else(|| {
+                    persisted_pane_task_prompt(&pane.0, binding, &self.persisted_agents, None)
+                });
+                let peer_prompts: Vec<_> = self
+                    .persisted_agents
+                    .values()
+                    .filter(|saved| {
+                        saved.pane_id != pane.0
+                            && saved.kind == agent_kind_id(binding.kind)
+                            && saved.session_id == binding.session_id
+                    })
+                    .filter_map(|saved| saved.task_prompt.as_deref())
+                    .chain(
+                        self.hook_task_prompts
+                            .iter()
+                            .filter(|(sid, (native, _))| {
+                                **sid != *session && *native == binding.session_id
+                            })
+                            .map(|(_, (_, prompt))| prompt.as_str()),
+                    )
+                    .collect();
+                let Some(index) =
+                    attributable_shared_history_turn(prompt.as_deref(), recent, &peer_prompts)
+                else {
+                    continue;
+                };
+                Some(index)
+            } else {
+                None
             };
             let kind = agent_kind_id(binding.kind).to_owned();
             self.work_history_projection_cache.retain(|_, saved| {
@@ -17211,10 +17237,38 @@ impl App {
                 if rows.len() == crate::agent_state_worker::AGENT_STATE_WORK_HISTORY_BATCH_MAX {
                     break;
                 }
+                if is_shared && attributed != Some(index) {
+                    continue;
+                }
+                // Never reassign a previously owned turn to another pane, even if historical
+                // hook evidence has already aged out of the bounded projection.
+                let foreign_owner =
+                    self.work_history_rows.iter().any(|saved| {
+                        saved.kind == kind
+                            && saved.agent_session_id == binding.session_id
+                            && saved.turn_key == turn.turn_key
+                            && saved.pane_id != pane.0
+                    }) || self.work_history_projection_cache.values().any(|saved| {
+                        saved.kind == kind
+                            && saved.agent_session_id == binding.session_id
+                            && saved.turn_key == turn.turn_key
+                            && saved.pane_id != pane.0
+                    });
+                if foreign_owner {
+                    continue;
+                }
                 if turn.source_offset > i64::MAX as u64 || turn.instruction.is_empty() {
                     continue;
                 }
-                let state = if index > 0 {
+                let state = if is_shared {
+                    // Another pane can produce the newest transcript event. Only this turn's
+                    // own terminal result is safe; do not project shared live attention here.
+                    if turn.activity == crate::agent_transcript::AgentActivity::Idle {
+                        storage::AgentWorkTurnState::Completed
+                    } else {
+                        storage::AgentWorkTurnState::Working
+                    }
+                } else if index > 0 {
                     storage::AgentWorkTurnState::Completed
                 } else if self.agent_needs_input.contains(session) {
                     storage::AgentWorkTurnState::Waiting
@@ -18055,7 +18109,9 @@ impl App {
                                 binding,
                                 &self.persisted_agents,
                                 self.forked_resume_origins.get(&pane.0).map(String::as_str),
-                            ) != Some(prompt)
+                            )
+                            .as_deref()
+                                != Some(prompt.as_ref())
                         })
                     })
                 });
@@ -18486,7 +18542,7 @@ impl App {
                         &continuation.payload().kind,
                         AppAgentStateExactKind::WorkHistoryBatch(_)
                     ) && exact_scope_current
-                        && self.work_history_tab.is_active()
+                        && self.session_aux.current.work_history_tab.is_active()
                     {
                         let _ = self.request_work_history_projection(false);
                     }
@@ -18612,7 +18668,7 @@ impl App {
                 ) {
                     self.handle_catalog_startup_failure();
                 }
-                if self.work_history_tab.is_active() {
+                if self.session_aux.current.work_history_tab.is_active() {
                     let _ = self.request_work_history_projection(false);
                 }
             }
@@ -18931,7 +18987,7 @@ impl App {
                     &self.persisted_agents,
                     self.forked_resume_origins.get(&pane.0).map(String::as_str),
                 ) {
-                    prompts.insert(*session, (binding.session_id.clone(), prompt.to_owned()));
+                    prompts.insert(*session, (binding.session_id.clone(), prompt.into_owned()));
                 }
             }
         }
@@ -19219,9 +19275,9 @@ impl App {
             self.agent_terminal_ui.view(),
             app_focused,
             self.settings_open
-                || self.work_history_tab.is_active()
-                || self.git_tab.is_active()
-                || self.document_tab.is_active(),
+                || self.session_aux.current.work_history_tab.is_active()
+                || self.session_aux.current.git_tab.is_active()
+                || self.session_aux.current.document_tab.is_active(),
             self.frame_terminal_owner,
         );
         let active_tab = self
@@ -19416,7 +19472,7 @@ impl App {
                                 self.forked_resume_origins.get(&pane.0).map(String::as_str),
                             )
                         })
-                        .map(str::to_owned);
+                        .map(std::borrow::Cow::into_owned);
                 let kind = match b.kind {
                     crate::agent_detect::AgentKind::Claude => "claude",
                     crate::agent_detect::AgentKind::Codex => "codex",
@@ -19525,15 +19581,96 @@ impl App {
         self.session_cwds.get(&session).cloned()
     }
 
-    /// Git 보조 탭을 **새로** 여는 경로(레일 「Git」·pane 헤더 탭 클릭)가 쓰는 cwd —
-    /// 포커스된 세션 기준(2026-08-15, Task 10 Step 6). `ShowDiff{session}`(세션 메뉴
-    /// 「변경 보기」)은 더 이상 이 값으로 수렴하지 않는다 — 포커스가 다른 세션에 있으면
-    /// 엉뚱한 repo가 뜨는 회귀가 있어 그 세션 고유 cwd로 고정하게 바뀌었다(2026-08-15
-    /// 회귀 수정). ⟳ 새로고침·파일 diff처럼 **이미 열린** 패널을 다루는 경로는 이 값을
-    /// 다시 묻지 않고 `git_panel_cwd`(패널이 지금 보여주는 repo)를 쓴다(2026-08-16,
-    /// 항목 3 — 안 그러면 ⟳가 포커스 세션 쪽으로 조용히 갈아탄다).
+    /// Resolve ownership before actions and chrome projection, including pending mux/focus.
+    fn sync_session_aux_scope(&mut self) {
+        let latest = self
+            .active
+            .pending_events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                runtime::RuntimeEvent::MuxUpdated { snapshot } => Some(snapshot.as_ref()),
+                _ => None,
+            })
+            .or_else(|| self.active.workspace_ui.mux().map(|mux| mux.as_ref()));
+        let (pane, session) = self.active.workspace_ui.aux_target(latest);
+        self.session_aux
+            .switch(crate::session_aux::SessionAuxScope {
+                workspace_id: self.active.id.clone(),
+                runtime_instance: self.active.runtime_instance,
+                pane,
+                session,
+            });
+    }
+
+    fn prune_session_aux_views(&mut self) {
+        self.session_aux.retain_live(|scope| {
+            std::iter::once(&self.active)
+                .chain(self.warm.values())
+                .any(|runtime| {
+                    runtime.id == scope.workspace_id
+                        && runtime.runtime_instance == scope.runtime_instance
+                        && scope.pane.as_ref().is_none_or(|id| {
+                            runtime.workspace_ui.mux().is_some_and(|mux| {
+                                mux.tabs
+                                    .iter()
+                                    .flat_map(|t| &t.panes)
+                                    .any(|p| &p.id == id && p.session_id == scope.session)
+                            })
+                        })
+                })
+        });
+    }
+
+    fn enqueue_aux_host_retry(&mut self, action: AppHostIoAction) {
+        // Latest per owner/surface, FIFO across sessions: a click in B must not erase A's load.
+        self.pending_app_host_retry.retain(|request| match request {
+            AppHostIoAction::GitPanel(intent) => self
+                .session_aux
+                .git_result_owner(intent.generation)
+                .is_some(),
+            AppHostIoAction::Transcript { generation, .. } => self
+                .session_aux
+                .transcript_result_owner(*generation)
+                .is_some(),
+            _ => false,
+        });
+        if self.pending_app_host_retry.len() >= 64
+            && let Some(dropped) = self.pending_app_host_retry.pop_front()
+        {
+            match dropped {
+                AppHostIoAction::GitPanel(intent) => {
+                    if let Some(view) = self.session_aux.git_result_owner(intent.generation) {
+                        match intent.request {
+                            ui::git_panel::GitPanelIoRequest::Snapshot => {
+                                view.git_panel_ui.set_snapshot(Err(
+                                    ui::git_panel::GitPanelErrorCode::CollectionFailed,
+                                ))
+                            }
+                            ui::git_panel::GitPanelIoRequest::FileDiff { .. } => view
+                                .diff_viewer_ui
+                                .set_view(ui::diff_viewer::FileDiffView::default()),
+                        }
+                    }
+                }
+                AppHostIoAction::Transcript { generation, .. } => {
+                    if let Some(view) = self.session_aux.transcript_result_owner(generation) {
+                        view.transcript_viewer_ui.set_conversation(
+                            Err(crate::agent_transcript::TranscriptViewError::ReadFailed),
+                            None,
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.pending_app_host_retry.push_back(action);
+    }
+
+    /// Uses the selected session, including pending focus. Refresh uses git_panel_cwd
+    /// pinned in that session view; ShowDiff uses its explicitly selected session cwd.
     fn focused_session_repo_cwd(&self) -> Option<PathBuf> {
-        let session = self.active.workspace_ui.focused_session()?;
+        let session = self.session_aux.owner.as_ref()?.session?;
         self.cached_session_cwd(session).map(PathBuf::from)
     }
 
@@ -19560,12 +19697,22 @@ impl App {
     ) {
         let Some(cwd) = cwd else {
             // repo를 못 찾았다 — 고정도 함께 푼다(옛 repo에 붙잡히지 않게).
-            self.git_panel_cwd = None;
-            self.git_panel_ui
+            self.session_aux.current.git_generation = None;
+            self.session_aux.current.git_diff_generation = None;
+            self.session_aux.current.git_panel_cwd = None;
+            self.session_aux
+                .current
+                .git_panel_ui
                 .set_snapshot(Err(ui::git_panel::GitPanelErrorCode::NoRepo));
             return;
         };
         self.git_panel_generation = self.git_panel_generation.wrapping_add(1).max(1);
+        let snapshot = matches!(request, ui::git_panel::GitPanelIoRequest::Snapshot);
+        if snapshot {
+            self.session_aux.current.git_generation = Some(self.git_panel_generation);
+        } else {
+            self.session_aux.current.git_diff_generation = Some(self.git_panel_generation);
+        }
         let action = AppHostIoAction::GitPanel(ui::git_panel::GitPanelIoIntent {
             generation: self.git_panel_generation,
             cwd: cwd.clone(),
@@ -19578,21 +19725,23 @@ impl App {
         if self.pending_app_host_action.is_none() {
             self.pending_app_host_action = Some(action);
         } else {
-            self.pending_app_host_retry = Some(action);
+            self.enqueue_aux_host_retry(action);
         }
         // 패널이 지금 보여주는(요청 중인) repo cwd — ⟳·파일 diff 재요청이 포커스 세션을
         // 다시 묻지 않고 이 값을 쓴다(`resolve_git_refresh_cwd`). **요청이 실제로 큐나
         // 대기 슬롯에 올라간 뒤에만** 갱신한다.
-        self.git_panel_cwd = Some(cwd);
+        self.session_aux.current.git_panel_cwd = Some(cwd);
         ctx.request_repaint();
-        self.git_panel_ui.set_loading();
+        if snapshot {
+            self.session_aux.current.git_panel_ui.set_loading();
+        }
     }
 
     /// ↗ 클릭 — upstream이 GitHub remote면 브랜치 페이지를 연다. remote 조회는 이미
     /// 스냅샷 수집 시점에 끝나 있어(`GitPanelSnapshot::remote_https_base`) 여기서는
     /// IO 없이 즉시 URL을 구성한다(스펙 §4, Task 10 Step 7).
     fn open_git_panel_remote(&mut self, ctx: &egui::Context) {
-        let Some((base, branch)) = self.git_panel_ui.remote_target() else {
+        let Some((base, branch)) = self.session_aux.current.git_panel_ui.remote_target() else {
             tracing::info!(kind = "git_panel", "non-github remote — open skipped");
             return;
         };
@@ -19731,8 +19880,12 @@ impl App {
         // `search_summary()`에서 가져온다 — 그 값은 **직전 프레임** 캐시라(질의가 막
         // 바뀐 프레임만 1프레임 지연) 반드시 검색 바를 먼저 그린 뒤에 그 결과로
         // `render`를 불러야 한다(transcript_viewer.rs `search_summary` 문서의 계약).
-        let (search_total, search_truncated) = self.transcript_viewer_ui.search_summary();
-        let body = if self.aux_search.open {
+        let (search_total, search_truncated) = self
+            .session_aux
+            .current
+            .transcript_viewer_ui
+            .search_summary();
+        let body = if self.session_aux.current.aux_search.open {
             let mut bar = ui.new_child(
                 egui::UiBuilder::new()
                     .max_rect(body)
@@ -19741,12 +19894,16 @@ impl App {
             bar.set_clip_rect(body.intersect(ui.clip_rect()));
             if let Some(action) = ui::aux_search::search_bar(
                 &mut bar,
-                &self.aux_search,
+                &self.session_aux.current.aux_search,
                 search_total,
                 search_truncated,
                 text,
             ) {
-                apply_aux_search_action(&mut self.aux_search, action, search_total);
+                apply_aux_search_action(
+                    &mut self.session_aux.current.aux_search,
+                    action,
+                    search_total,
+                );
             }
             // `bar`는 body 안에 고정된 max_rect의 child라 검색 바가 소비한 세로
             // 공간만큼 커서가 내려가 있다 — 남은 영역이 곧 마스터-디테일에 넘길 rect다.
@@ -19754,44 +19911,35 @@ impl App {
         } else {
             body
         };
-        let filter = if self.aux_search.is_active() {
-            self.aux_search.query.as_str()
+        let filter = if self.session_aux.current.aux_search.is_active() {
+            self.session_aux.current.aux_search.query.as_str()
         } else {
             ""
         };
 
-        let auto_list_width = history_tab_list_width(body.width());
-        let list_width = aux_split_width(
-            self.work_history_tab_split_width,
-            auto_list_width,
-            body.width(),
-            HISTORY_TAB_LIST_MIN_WIDTH,
-        );
-        let (list_rect, transcript_rect) = body.split_left_right_at_x(body.left() + list_width);
-
-        let mut child = ui.new_child(
-            egui::UiBuilder::new()
-                .max_rect(list_rect)
-                .id_salt("work_history_pane_tab"),
-        );
-        child.set_clip_rect(list_rect.intersect(ui.clip_rect()));
-        // leaf는 storage 크레이트를 모른다 — 렌더 직전에 빌린 뷰만 만들어 넘긴다.
-        // `self.work_history_rows`(공유 대여)와 `self.work_history_ui`(가변 대여)는
-        // 서로 다른 필드라 아래처럼 직접 필드로 접근하는 한 동시에 빌릴 수 있다.
-        //
-        // `rows`와 `presentations`를 **한 번의 순회에서 같이** 만든다 — 예전에는
-        // `work_history_presentations()`가 별도로 전체 행을 순회하며 매 행마다
-        // `WorkTurnIdentity::from(row)`(String 4개)를 할당해 프레임당 1,024개
-        // (256행 × 4)를 만들었다(2026-08-19 계측). presentation은 카드가 펼쳐졌을
-        // 때만 읽히고(`render_card`의 `if expanded` 블록), 눌렸을 때 필요한 identity는
-        // 그 자리에서 들고 있는 row로 즉석에서 만들면 되므로 여기선 identity를 아예
-        // 담지 않는다(`WorkHistoryActionPresentation` 문서 참고). 대신 `rows[i]`와
-        // `presentations[i]`가 항상 같은 턴을 가리키도록 **같은 순회에서 함께**
-        // 만들어 인덱스 정합을 자명하게 보장한다 — leaf는 이 인덱스로 O(1) 조회한다
-        // (문자열 4개를 비교하는 선형 탐색이 없다, 스펙 이슈 #2).
-        let mut presentations: Vec<ui::work_history::WorkHistoryActionPresentation> =
-            Vec::with_capacity(self.work_history_rows.len());
-        let rows: Vec<ui::work_history::WorkHistoryRow<'_>> = self
+        let shared = shared_agent_transcript_sessions(&self.agent_bindings, &self.hook_overrides);
+        let mux = self.active.workspace_ui.mux();
+        let panes: std::collections::HashMap<_, _> = mux
+            .into_iter()
+            .flat_map(|mux| &mux.tabs)
+            .flat_map(|tab| &tab.panes)
+            .map(|pane| (pane.id.0.as_str(), pane))
+            .collect();
+        let mut newest_by_owner: std::collections::HashMap<_, &storage::AgentWorkTurnUpsert> =
+            std::collections::HashMap::new();
+        for saved in self.work_history_projection_cache.values() {
+            let key = (
+                saved.pane_id.as_str(),
+                saved.kind.as_str(),
+                saved.agent_session_id.as_str(),
+            );
+            let newest = newest_by_owner.entry(key).or_insert(saved);
+            if saved.source_offset > newest.source_offset {
+                *newest = saved;
+            }
+        }
+        let mut presentations = Vec::with_capacity(self.work_history_rows.len());
+        let rows: Vec<_> = self
             .work_history_rows
             .iter()
             .map(|row| {
@@ -19803,86 +19951,84 @@ impl App {
                             && !cwd.as_bytes().contains(&0)
                     }),
                 });
-                ui::work_history::WorkHistoryRow::from(row)
+                let pane = panes.get(row.pane_id.as_str());
+                let session = pane.and_then(|pane| pane.session_id);
+                let binding_matches = session
+                    .and_then(|sid| self.agent_bindings.get(&sid))
+                    .is_some_and(|binding| {
+                        agent_kind_id(binding.kind) == row.kind
+                            && binding.session_id == row.agent_session_id
+                    });
+                let newest = newest_by_owner.get(&(
+                    row.pane_id.as_str(),
+                    row.kind.as_str(),
+                    row.agent_session_id.as_str(),
+                ));
+                let live = session.and_then(|sid| {
+                    if self.agent_needs_input.contains(&sid) {
+                        Some(storage::AgentWorkTurnState::Waiting)
+                    } else if self.agent_turn_done.contains_key(&sid) {
+                        Some(storage::AgentWorkTurnState::Completed)
+                    } else if self.agent_working.contains(&sid) {
+                        Some(storage::AgentWorkTurnState::Working)
+                    } else {
+                        None
+                    }
+                });
+                let mut view = ui::work_history::WorkHistoryRow::from(row);
+                view.pane_title = pane.map(|pane| pane.title.as_str());
+                view.current_state = verified_work_history_state(
+                    row.state,
+                    self.hook_projection_ready
+                        && binding_matches
+                        && session.is_some_and(|sid| !shared.contains(&sid)),
+                    newest.is_some_and(|saved| {
+                        saved.turn_key == row.turn_key && saved.source_offset == row.source_offset
+                    }),
+                    live,
+                );
+                view
             })
             .collect();
-        let action = self.work_history_ui.show(
+        let snapshot = ui::work_history::WorkHistorySnapshot {
+            workspace_name,
+            current_branch,
+            rows: &rows,
+            rows_revision: self.work_history_rows_revision,
+            loading: self.work_history_loading,
+            error: self.work_history_error,
+            current_pane: self
+                .session_aux
+                .owner
+                .as_ref()
+                .and_then(|scope| scope.pane.as_ref())
+                .map(|pane| pane.0.as_str()),
+            collection_blocked: shared.len(),
+        };
+        let search = self.session_aux.current.aux_search.is_active().then_some((
+            self.session_aux.current.aux_search.query.as_str(),
+            self.session_aux.current.aux_search.active,
+        ));
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(body)
+                .id_salt("work_history_browser"),
+        );
+        child.set_clip_rect(body.intersect(ui.clip_rect()));
+        self.session_aux.current.work_history_ui.show_browser(
             &mut child,
-            ui::work_history::WorkHistorySnapshot {
-                workspace_name,
-                current_branch,
-                rows: &rows,
-                rows_revision: self.work_history_rows_revision,
-                loading: self.work_history_loading,
-                error: self.work_history_error,
-            },
+            snapshot,
             &presentations,
             text,
             filter,
-        );
-
-        // 목록/원문 경계 세로 구분선 — 드래그로 폭 조절(2026-08-16 사용자: 가로 폭을
-        // 조절할 수 없다). 드래그 누적은 cross-workspace 분할선과 같은 패턴이다 —
-        // `drag_started()`에서 시작 폭을 `ctx.data_mut`에 저장하고 `total_drag_delta()`로
-        // 시작 폭 기준 절대 계산한다(`primary_divider_requested_width` 참고: 매 프레임
-        // `pointer.delta()`를 누적하면 드리프트가 생긴다).
-        let divider_hit_rect = egui::Rect::from_min_max(
-            egui::pos2(list_rect.right() - 3.0, body.top()),
-            egui::pos2(list_rect.right() + 3.0, body.bottom()),
-        );
-        let resize_id = ui.id().with("work_history_tab_split_resize");
-        let resize_response = ui
-            .interact(divider_hit_rect, resize_id, egui::Sense::drag())
-            .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
-        let resize_start_id = resize_id.with("drag_start_width");
-        if resize_response.drag_started() {
-            ui.ctx()
-                .data_mut(|data| data.insert_temp(resize_start_id, list_width));
-        }
-        if let Some(total_drag_delta) = resize_response.total_drag_delta() {
-            let start_width = ui
-                .ctx()
-                .data(|data| data.get_temp::<f32>(resize_start_id))
-                .unwrap_or(list_width);
-            self.work_history_tab_split_width =
-                aux_divider_requested_width(start_width, total_drag_delta.x);
-            ui.ctx().request_repaint();
-        }
-        if resize_response.drag_stopped() {
-            ui.ctx()
-                .data_mut(|data| data.remove::<f32>(resize_start_id));
-        }
-        // 구분선 색 — 기본은 designall::separator_stroke, hover/drag는 사이드바 리사이즈와
-        // 같은 규칙(file_tree.rs의 file_tree_sidebar_resize 참고).
-        let separator = if resize_response.dragged() {
-            ui.visuals().widgets.active.bg_stroke
-        } else if resize_response.hovered() {
-            ui.visuals().widgets.hovered.bg_stroke
-        } else {
-            ui::designall::separator_stroke(ui.visuals())
-        };
-        let ppp = ui.ctx().pixels_per_point();
-        let sep_x = ui::snap_line_to_pixel(
-            ui::designall::panel_edge_separator_x(list_rect.right(), ppp),
-            separator.width,
-            ppp,
-        );
-        ui.painter().vline(sep_x, body.y_range(), separator);
-
-        let mut transcript = ui.new_child(
-            egui::UiBuilder::new()
-                .max_rect(transcript_rect.shrink2(egui::vec2(6.0, 0.0)))
-                .id_salt("work_history_transcript_pane_tab"),
-        );
-        transcript.set_clip_rect(transcript_rect.intersect(ui.clip_rect()));
-        let search = self
-            .aux_search
-            .is_active()
-            .then_some((self.aux_search.query.as_str(), self.aux_search.active));
-        self.transcript_viewer_ui
-            .render(&mut transcript, text, search);
-
-        action
+            &mut self.session_aux.current.work_history_tab_split_width,
+            |transcript| {
+                self.session_aux
+                    .current
+                    .transcript_viewer_ui
+                    .render(transcript, text, search)
+            },
+        )
     }
 
     /// Git 보조 탭 본문 — 좌 목록 / 우 diff 마스터-디테일(스펙 §8-3). 이력 본문
@@ -19895,8 +20041,9 @@ impl App {
     ) -> Option<ui::git_panel::GitPanelAction> {
         // 보조 검색 바 — render_work_history_tab_body와 같은 규칙. total/truncated는
         // 우측 diff 뷰어의 `search_summary()`(직전 프레임 캐시)에서 가져온다.
-        let (search_total, search_truncated) = self.diff_viewer_ui.search_summary();
-        let body = if self.aux_search.open {
+        let (search_total, search_truncated) =
+            self.session_aux.current.diff_viewer_ui.search_summary();
+        let body = if self.session_aux.current.aux_search.open {
             let mut bar = ui.new_child(
                 egui::UiBuilder::new()
                     .max_rect(body)
@@ -19905,19 +20052,23 @@ impl App {
             bar.set_clip_rect(body.intersect(ui.clip_rect()));
             if let Some(action) = ui::aux_search::search_bar(
                 &mut bar,
-                &self.aux_search,
+                &self.session_aux.current.aux_search,
                 search_total,
                 search_truncated,
                 text,
             ) {
-                apply_aux_search_action(&mut self.aux_search, action, search_total);
+                apply_aux_search_action(
+                    &mut self.session_aux.current.aux_search,
+                    action,
+                    search_total,
+                );
             }
             bar.available_rect_before_wrap()
         } else {
             body
         };
-        let filter = if self.aux_search.is_active() {
-            self.aux_search.query.as_str()
+        let filter = if self.session_aux.current.aux_search.is_active() {
+            self.session_aux.current.aux_search.query.as_str()
         } else {
             ""
         };
@@ -19925,7 +20076,7 @@ impl App {
         let auto_list_width = git_tab_list_width(body.width());
         // 180.0 = git_tab_list_width의 MIN과 같은 값(파일 목록 좌측 최소 폭).
         let list_width = aux_split_width(
-            self.git_tab_split_width,
+            self.session_aux.current.git_tab_split_width,
             auto_list_width,
             body.width(),
             GIT_TAB_LIST_MIN_WIDTH,
@@ -19938,7 +20089,11 @@ impl App {
                 .id_salt("git_panel_pane_tab"),
         );
         list.set_clip_rect(list_rect.intersect(ui.clip_rect()));
-        let action = self.git_panel_ui.render(&mut list, text, filter);
+        let action = self
+            .session_aux
+            .current
+            .git_panel_ui
+            .render(&mut list, text, filter);
 
         // 목록/diff 경계 세로 구분선 — 드래그로 폭 조절(2026-08-16 사용자: 가로 폭을
         // 조절할 수 없다). 드래그 누적은 cross-workspace 분할선과 같은 패턴이다 —
@@ -19963,7 +20118,8 @@ impl App {
                 .ctx()
                 .data(|data| data.get_temp::<f32>(resize_start_id))
                 .unwrap_or(list_width);
-            self.git_tab_split_width = aux_divider_requested_width(start_width, total_drag_delta.x);
+            self.session_aux.current.git_tab_split_width =
+                aux_divider_requested_width(start_width, total_drag_delta.x);
             ui.ctx().request_repaint();
         }
         if resize_response.drag_stopped() {
@@ -19993,11 +20149,14 @@ impl App {
                 .id_salt("git_diff_pane_tab"),
         );
         detail.set_clip_rect(diff_rect.intersect(ui.clip_rect()));
-        let search = self
-            .aux_search
-            .is_active()
-            .then_some((self.aux_search.query.as_str(), self.aux_search.active));
-        self.diff_viewer_ui.render(&mut detail, text, search);
+        let search = self.session_aux.current.aux_search.is_active().then_some((
+            self.session_aux.current.aux_search.query.as_str(),
+            self.session_aux.current.aux_search.active,
+        ));
+        self.session_aux
+            .current
+            .diff_viewer_ui
+            .render(&mut detail, text, search);
         action
     }
 
@@ -20017,7 +20176,7 @@ impl App {
         body: egui::Rect,
         text: &i18n::Catalog,
     ) {
-        let Some(id) = self.active_document else {
+        let Some(id) = self.session_aux.current.active_document else {
             return;
         };
         let Some(document) = self.documents.iter().find(|document| document.id == id) else {
@@ -20130,7 +20289,7 @@ impl App {
                     let editable = document.is_editable();
                     match mode {
                         ui::document::DocumentViewMode::Source => {
-                            let editor_id = document_source_editor_id(&document.path);
+                            let editor_id = document_source_editor_id(document.id, &document.path);
                             editor_changed = ui::document::source_editor(
                                 ui,
                                 editor_id,
@@ -20154,7 +20313,7 @@ impl App {
                             let content_rect = ui.available_rect_before_wrap();
                             let auto_source_width = content_rect.width() * 0.5;
                             let source_width = aux_split_width(
-                                self.document_tab_split_width,
+                                self.session_aux.current.document_tab_split_width,
                                 auto_source_width,
                                 content_rect.width(),
                                 DOCUMENT_TAB_SOURCE_MIN_WIDTH,
@@ -20173,7 +20332,7 @@ impl App {
                                 .iter_mut()
                                 .find(|document| document.id == id)
                                 .expect("checked above");
-                            let editor_id = document_source_editor_id(&document.path);
+                            let editor_id = document_source_editor_id(document.id, &document.path);
                             editor_changed = ui::document::source_editor(
                                 &mut source_ui,
                                 editor_id,
@@ -20285,7 +20444,7 @@ impl App {
             self.on_document_source_edited(id);
         }
         if let Some(width) = split_width {
-            self.document_tab_split_width = Some(width);
+            self.session_aux.current.document_tab_split_width = Some(width);
         }
         if open_with_os_clicked {
             self.open_document_path_with_os(ui.ctx(), id);
@@ -20301,7 +20460,7 @@ impl App {
         body: egui::Rect,
         text: &i18n::Catalog,
     ) {
-        let Some(id) = self.active_document else {
+        let Some(id) = self.session_aux.current.active_document else {
             return;
         };
         match guard_document_render(
@@ -20527,37 +20686,44 @@ impl App {
     fn reveal_terminal_session(&mut self) {
         self.agent_terminal_ui
             .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
-        let (history, git, document, reset_search) =
-            reveal_session_aux_tabs(self.work_history_tab, self.git_tab, self.document_tab);
-        self.work_history_tab = history;
-        self.git_tab = git;
-        self.document_tab = document;
+        let (history, git, document, reset_search) = reveal_session_aux_tabs(
+            self.session_aux.current.work_history_tab,
+            self.session_aux.current.git_tab,
+            self.session_aux.current.document_tab,
+        );
+        self.session_aux.current.work_history_tab = history;
+        self.session_aux.current.git_tab = git;
+        self.session_aux.current.document_tab = document;
         if reset_search {
-            self.aux_search.reset();
+            self.session_aux.current.aux_search.reset();
         }
     }
 
     /// pane 헤더 보조 탭이 올린 의도. 어떤 경로도 `RuntimeCommand`를 만들지 않는다 —
     /// 이력 X는 UI 탭만 닫고 세션·PTY·mux 탭은 건드리지 않는다.
     fn apply_work_history_tab_intent(&mut self, intent: ui::workspace::PaneAuxTabIntent) {
-        let previous = self.work_history_tab;
-        self.work_history_tab = match intent {
+        let previous = self.session_aux.current.work_history_tab;
+        self.session_aux.current.work_history_tab = match intent {
             ui::workspace::PaneAuxTabIntent::Activate => previous.on_tab_click(),
             ui::workspace::PaneAuxTabIntent::ShowSession => previous.on_session_tab_click(),
             ui::workspace::PaneAuxTabIntent::Close => previous.on_close(),
         };
-        if self.work_history_tab.is_active() != previous.is_active() {
+        if self.session_aux.current.work_history_tab.is_active() != previous.is_active() {
             // 활성 보조 탭이 바뀌었다(켜졌거나 꺼졌거나) — 이력에서 찾던 문구가 남아
             // 있으면 다음에 뭘 보든 "왜 안 보이지"가 된다(스펙).
-            self.aux_search.reset();
+            self.session_aux.current.aux_search.reset();
         }
-        if self.work_history_tab.is_active() && !previous.is_active() {
+        if self.session_aux.current.work_history_tab.is_active() && !previous.is_active() {
             // 헤더에서 이력 탭을 직접 눌러 활성화하는 경로 — Git이 활성이었다면 물러난다
             // (보조 본문은 하나뿐이다, 스펙 §8-2).
-            (self.work_history_tab, self.git_tab, self.document_tab) = resolve_aux_tab_exclusivity(
-                self.work_history_tab,
-                self.git_tab,
-                self.document_tab,
+            (
+                self.session_aux.current.work_history_tab,
+                self.session_aux.current.git_tab,
+                self.session_aux.current.document_tab,
+            ) = resolve_aux_tab_exclusivity(
+                self.session_aux.current.work_history_tab,
+                self.session_aux.current.git_tab,
+                self.session_aux.current.document_tab,
                 AuxTabWinner::History,
             );
             self.enter_work_history_tab();
@@ -20571,21 +20737,25 @@ impl App {
         ctx: &egui::Context,
         intent: ui::workspace::PaneAuxTabIntent,
     ) {
-        let previous = self.git_tab;
-        self.git_tab = match intent {
+        let previous = self.session_aux.current.git_tab;
+        self.session_aux.current.git_tab = match intent {
             ui::workspace::PaneAuxTabIntent::Activate => previous.on_tab_click(),
             ui::workspace::PaneAuxTabIntent::ShowSession => previous.on_session_tab_click(),
             ui::workspace::PaneAuxTabIntent::Close => previous.on_close(),
         };
-        if self.git_tab.is_active() != previous.is_active() {
+        if self.session_aux.current.git_tab.is_active() != previous.is_active() {
             // apply_work_history_tab_intent와 같은 이유로 비운다.
-            self.aux_search.reset();
+            self.session_aux.current.aux_search.reset();
         }
-        if self.git_tab.is_active() && !previous.is_active() {
-            (self.work_history_tab, self.git_tab, self.document_tab) = resolve_aux_tab_exclusivity(
-                self.work_history_tab,
-                self.git_tab,
-                self.document_tab,
+        if self.session_aux.current.git_tab.is_active() && !previous.is_active() {
+            (
+                self.session_aux.current.work_history_tab,
+                self.session_aux.current.git_tab,
+                self.session_aux.current.document_tab,
+            ) = resolve_aux_tab_exclusivity(
+                self.session_aux.current.work_history_tab,
+                self.session_aux.current.git_tab,
+                self.session_aux.current.document_tab,
                 AuxTabWinner::Git,
             );
             self.request_git_panel_io(ctx, ui::git_panel::GitPanelIoRequest::Snapshot);
@@ -20619,10 +20789,11 @@ impl App {
             }
             ui::workspace::PaneAuxTabIntent::Activate => self.activate_document_tab(id),
             ui::workspace::PaneAuxTabIntent::ShowSession => {
-                let previous_group_active = self.document_tab.is_active();
-                self.document_tab = self.document_tab.on_session_tab_click();
-                if self.document_tab.is_active() != previous_group_active {
-                    self.aux_search.reset();
+                let previous_group_active = self.session_aux.current.document_tab.is_active();
+                self.session_aux.current.document_tab =
+                    self.session_aux.current.document_tab.on_session_tab_click();
+                if self.session_aux.current.document_tab.is_active() != previous_group_active {
+                    self.session_aux.current.aux_search.reset();
                 }
             }
         }
@@ -20635,22 +20806,27 @@ impl App {
     /// `Closed`일 수 없어 `on_tab_click`으로 충분하다 — 닫혀 있던 그룹을 처음 여는
     /// 것은 `begin_document_open`의 새 문서 경로가 따로 한다.
     fn activate_document_tab(&mut self, id: ui::workspace::DocumentTabId) {
-        let previous_group_active = self.document_tab.is_active();
-        let previous_active_document = self.active_document;
-        self.active_document = Some(id);
-        self.document_tab = self.document_tab.on_tab_click();
-        if self.document_tab.is_active() != previous_group_active
-            || self.active_document != previous_active_document
+        let previous_group_active = self.session_aux.current.document_tab.is_active();
+        let previous_active_document = self.session_aux.current.active_document;
+        self.session_aux.current.active_document = Some(id);
+        self.session_aux.current.document_tab =
+            self.session_aux.current.document_tab.on_tab_click();
+        if self.session_aux.current.document_tab.is_active() != previous_group_active
+            || self.session_aux.current.active_document != previous_active_document
         {
             // 활성 보조 탭이 바뀌었거나(그룹이 켜지거나 꺼졌다) 보이는 문서 자체가
             // 바뀌었다 — 어느 쪽이든 이전 문서에서 찾던 문구가 남아 있으면 안 된다.
-            self.aux_search.reset();
+            self.session_aux.current.aux_search.reset();
         }
-        if self.document_tab.is_active() && !previous_group_active {
-            (self.work_history_tab, self.git_tab, self.document_tab) = resolve_aux_tab_exclusivity(
-                self.work_history_tab,
-                self.git_tab,
-                self.document_tab,
+        if self.session_aux.current.document_tab.is_active() && !previous_group_active {
+            (
+                self.session_aux.current.work_history_tab,
+                self.session_aux.current.git_tab,
+                self.session_aux.current.document_tab,
+            ) = resolve_aux_tab_exclusivity(
+                self.session_aux.current.work_history_tab,
+                self.session_aux.current.git_tab,
+                self.session_aux.current.document_tab,
                 AuxTabWinner::Document,
             );
         }
@@ -20677,13 +20853,7 @@ impl App {
         self.document_close_after_save.remove(&id);
         self.document_pending_confirms
             .retain(|confirm| confirm.document_id() != id);
-        if self.active_document == Some(id) {
-            self.active_document = next_active_document_after_close(&self.documents, index);
-            self.aux_search.reset();
-        }
-        if self.documents.is_empty() {
-            self.document_tab = self.document_tab.on_close();
-        }
+        self.session_aux.close_document(id);
     }
 
     /// dirty 확인을 통과한 뒤(또는 확인이 필요 없을 때) 문서 탭을 포커스된 pane 위에
@@ -20695,20 +20865,29 @@ impl App {
     /// `plan_document_eviction`(둘 다 순수 함수)이 판정하고, 여기서는 그 결정을
     /// 실행만 한다.
     fn begin_document_open(&mut self, path: PathBuf) {
-        if let Some(id) = find_open_document_by_path(&self.documents, &path) {
+        self.sync_session_aux_scope();
+        if let Some(id) = find_open_document_by_path(
+            self.documents
+                .iter()
+                .filter(|d| self.session_aux.current.document_ids.contains(&d.id)),
+            &path,
+        ) {
             self.activate_document_tab(id);
-            self.document_cap_notice = false;
+            self.session_aux.current.document_cap_notice = false;
             self.reveal_terminal_view_for_aux_tab();
             return;
         }
-        let Some(evict) = plan_document_eviction(&self.documents, self.active_document) else {
-            self.document_cap_notice = true;
+        let Some(evict) =
+            plan_document_eviction(&self.documents, self.session_aux.current.active_document)
+        else {
+            self.session_aux.current.document_cap_notice = true;
             return;
         };
         for victim in evict {
             self.close_document_entry(victim);
         }
         let id = ui::workspace::DocumentTabId(self.next_document_tab_id);
+        self.session_aux.current.document_ids.push(id);
         self.next_document_tab_id = self.next_document_tab_id.wrapping_add(1);
         self.documents.push(OpenDocument {
             id,
@@ -20727,16 +20906,20 @@ impl App {
             render_failed: false,
         });
         self.document_pending_loads.push_back((id, path));
-        self.active_document = Some(id);
-        self.document_tab = ui::workspace::PaneAuxTabState::OpenActive;
-        (self.work_history_tab, self.git_tab, self.document_tab) = resolve_aux_tab_exclusivity(
-            self.work_history_tab,
-            self.git_tab,
-            self.document_tab,
+        self.session_aux.current.active_document = Some(id);
+        self.session_aux.current.document_tab = ui::workspace::PaneAuxTabState::OpenActive;
+        (
+            self.session_aux.current.work_history_tab,
+            self.session_aux.current.git_tab,
+            self.session_aux.current.document_tab,
+        ) = resolve_aux_tab_exclusivity(
+            self.session_aux.current.work_history_tab,
+            self.session_aux.current.git_tab,
+            self.session_aux.current.document_tab,
             AuxTabWinner::Document,
         );
-        self.document_cap_notice = false;
-        self.aux_search.reset();
+        self.session_aux.current.document_cap_notice = false;
+        self.session_aux.current.aux_search.reset();
         self.reveal_terminal_view_for_aux_tab();
     }
 
@@ -20754,7 +20937,8 @@ impl App {
         if has_focused_pane {
             self.begin_document_open(path);
         } else {
-            self.pending_document_open = Some(path);
+            self.pending_document_open =
+                Some((self.active.id.clone(), self.active.runtime_instance, path));
             self.stage_workspace_controller_action(WorkspaceControllerAction::SpawnShellAt {
                 cwd: None,
             });
@@ -20764,9 +20948,12 @@ impl App {
     /// `open_document`가 pane이 없어 미룬 문서 열기 — 스폰된 pane이 포커스를 받으면
     /// 이어받는다. `poll_pending_resume_agent`와 같은 틱에서 돈다.
     fn poll_pending_document_open(&mut self) {
-        let Some(path) = self.pending_document_open.clone() else {
+        let Some((workspace, runtime, path)) = self.pending_document_open.clone() else {
             return;
         };
+        if workspace != self.active.id || runtime != self.active.runtime_instance {
+            return;
+        }
         let ready = self
             .active
             .workspace_ui
@@ -20934,13 +21121,13 @@ impl App {
                 &self.documents,
                 id,
                 incoming_source_bytes,
-                self.active_document,
+                self.session_aux.current.active_document,
             );
             let execution = execute_document_load_admission(admission, id, |victim| {
                 self.close_document_entry(victim);
             });
             if execution.show_cap_notice {
-                self.document_cap_notice = true;
+                self.session_aux.current.document_cap_notice = true;
             }
             if !execution.apply_outcome {
                 return;
@@ -21057,10 +21244,13 @@ impl App {
                 };
                 let Some(kind) = crate::agent_detect::kind_from_str(&row.kind) else {
                     // 원문 자체를 못 찾은 경로라 초점도 의미가 없다 — None.
-                    self.transcript_viewer_ui.set_conversation(
-                        Err(crate::agent_transcript::TranscriptViewError::NotFound),
-                        None,
-                    );
+                    self.session_aux
+                        .current
+                        .transcript_viewer_ui
+                        .set_conversation(
+                            Err(crate::agent_transcript::TranscriptViewError::NotFound),
+                            None,
+                        );
                     return;
                 };
                 let Some(path) = crate::agent_detect::transcript_path_for(
@@ -21069,13 +21259,17 @@ impl App {
                     row.cwd.as_deref(),
                 ) else {
                     // 원문 자체를 못 찾은 경로라 초점도 의미가 없다 — None.
-                    self.transcript_viewer_ui.set_conversation(
-                        Err(crate::agent_transcript::TranscriptViewError::NotFound),
-                        None,
-                    );
+                    self.session_aux
+                        .current
+                        .transcript_viewer_ui
+                        .set_conversation(
+                            Err(crate::agent_transcript::TranscriptViewError::NotFound),
+                            None,
+                        );
                     return;
                 };
                 self.transcript_generation = self.transcript_generation.wrapping_add(1).max(1);
+                self.session_aux.current.transcript_generation = Some(self.transcript_generation);
                 let request = AppHostIoAction::Transcript {
                     generation: self.transcript_generation,
                     path,
@@ -21090,10 +21284,10 @@ impl App {
                 if self.pending_app_host_action.is_none() {
                     self.pending_app_host_action = Some(request);
                 } else {
-                    self.pending_app_host_retry = Some(request);
+                    self.enqueue_aux_host_retry(request);
                 }
                 ctx.request_repaint();
-                self.transcript_viewer_ui.set_loading();
+                self.session_aux.current.transcript_viewer_ui.set_loading();
             }
             WorkHistoryAction::Activate(identity) => {
                 let row = self
@@ -24112,7 +24306,9 @@ impl App {
         }
 
         // 현재 활성을 Warm으로 내리고 warm 풀에 보관 (워커·세션 계속 실행).
+        self.sync_session_aux_scope();
         let mut old = std::mem::replace(&mut self.active, new_active);
+        self.sync_session_aux_scope();
         self.hook_overrides.clear();
         self.hook_task_prompts.clear();
         self.fresh_hook_task_prompts.clear();
@@ -24138,32 +24334,9 @@ impl App {
         self.work_history_error = None;
         self.work_history_git_cwds.clear();
         self.work_history_git_generation = self.work_history_git_generation.wrapping_add(1).max(1);
-        if !self.transcript_viewer_ui.is_empty() {
-            // 열려 있던 원문은 이전 워크스페이스 턴의 것이라 더 이상 유효하지 않다 —
-            // 닫힌 상태로 되돌린다(2026-08-15 Task 10).
-            self.transcript_viewer_ui = ui::transcript_viewer::TranscriptViewerUi::default();
-        }
-        // 원문 IO 세대도 올린다 — 뷰어를 방금 비웠어도 in-flight이거나 큐 대기 중이던
-        // 이전 워크스페이스의 원문 읽기가 완료되면 세대 검사 없이는 방금 비운 뷰어를
-        // 되살릴 수 있었다(2026-08-16, 코드 리뷰 항목 2).
-        invalidate_transcript_requests(
-            &mut self.transcript_generation,
-            &mut self.pending_app_host_retry,
-        );
-        // Git 보조 본문도 이력과 같은 자리에서 무효화한다 — `git_tab`은 열린 채 유지하되
-        // 스냅샷·diff·cwd·세대는 새 워크스페이스 기준으로 다시 채워야 한다(항목 1).
-        reset_git_surfaces(
-            &mut self.git_panel_ui,
-            &mut self.diff_viewer_ui,
-            &mut self.git_panel_generation,
-            &mut self.git_panel_cwd,
-        );
-        // 보조 검색도 같은 자리에서 비운다 — 이전 워크스페이스에서 찾던 문구가 새
-        // 워크스페이스의 이력/Git 목록을 걸러 놓으면 "왜 안 보이지"가 된다(스펙).
-        self.aux_search.reset();
-        // 이력 탭은 워크스페이스를 바꿔도 유지한다 — 열려 활성인 상태였다면 새
-        // 워크스페이스 projection을 기다리는 loading으로 이어 붙인다.
-        self.work_history_loading = self.work_history_tab.is_active();
+        // Per-session auxiliary views are parked/restored by scope. Workspace history
+        // rows remain a workspace projection and are reloaded independently.
+        self.work_history_loading = self.session_aux.current.work_history_tab.is_active();
         // 웹 대시보드가 켜져 있으면 새 활성 worker로 재구독한다(전환 후 상태 스트림 유지).
         self.rebind_web_dashboard();
         // agent 감지 워커: 전환 시 epoch을 올려 이전 워크스페이스의 잔여 결과를 폐기하고,
@@ -24407,7 +24580,7 @@ impl App {
                 .is_some_and(ui::file_tree::FileTreeUi::has_pending_confirmation)
             || self.active.workspace_ui.has_pending_close_confirmation()
             || self.pending_attached_close_confirmation().is_some()
-            || self.document_cap_notice
+            || self.session_aux.current.document_cap_notice
             || self.workspace_rename_prompt.is_some()
             || self.ws_close_confirm.is_some()
             || self.workspace_add_ui.is_some()
@@ -24514,8 +24687,10 @@ impl App {
             // 검색을 토글한다 — 세션 헤더 검색 버튼(workspace.rs
             // `search_click_targets_aux_search`)과 같은 규칙(스펙 "진입").
             A::TerminalSearch => {
-                if self.work_history_tab.is_active() || self.git_tab.is_active() {
-                    self.aux_search.toggle();
+                if self.session_aux.current.work_history_tab.is_active()
+                    || self.session_aux.current.git_tab.is_active()
+                {
+                    self.session_aux.current.aux_search.toggle();
                 } else {
                     self.active.workspace_ui.open_search();
                 }
@@ -32272,7 +32447,7 @@ impl App {
                                         forked_resume_origins.get(&pane.0).map(String::as_str),
                                     )
                                 })
-                                .map(str::to_owned);
+                                .map(std::borrow::Cow::into_owned);
                         Some(storage::AgentSessionRow {
                             pane_id: pane.0,
                             kind: match binding.kind {
@@ -32400,6 +32575,7 @@ impl eframe::App for App {
     // 스킵 판단에 쓰는 바로 그 신호(minimized OR occluded — macOS는 occluded로 갱신되어
     // minimized 미갱신 문제를 피한다). None(미보고)이면 안전하게 Active 유지.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.prune_session_aux_views();
         self.pump_scrollback_policy(ctx);
         self.pump_prompt_library_save();
         self.pump_composer_checkpoint(false);
@@ -32626,7 +32802,7 @@ impl eframe::App for App {
         self.poll_pending_resume_agent();
         self.poll_pending_document_open();
         self.poll_document_io();
-        let current_image_document = self.active_document.and_then(|id| {
+        let current_image_document = self.session_aux.current.active_document.and_then(|id| {
             self.documents
                 .iter()
                 .find(|document| document.id == id)
@@ -33123,6 +33299,7 @@ impl eframe::App for App {
 
     // egui 0.35부터 update(&Context) 대신 ui(&mut Ui) 시그니처를 쓴다.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.sync_session_aux_scope();
         self.publish_popup_input_fence(ui.ctx());
         self.frame_stats.begin();
         if let Some(bench) = self.bench.as_mut() {
@@ -33747,8 +33924,8 @@ impl eframe::App for App {
             view: self.agent_terminal_ui.view(),
             home_notice_count: self.home_notice_unread,
             fleet_summary,
-            history_tab_active: self.work_history_tab.is_active(),
-            git_tab_active: self.git_tab.is_active(),
+            history_tab_active: self.session_aux.current.work_history_tab.is_active(),
+            git_tab_active: self.session_aux.current.git_tab.is_active(),
             agents_open: self.agent_sessions_ui.is_open(),
             workspace_note: self.workspace_note.as_deref(),
         };
@@ -34052,22 +34229,29 @@ impl eframe::App for App {
                     // 레일은 이제 전역 페이지가 아니라 **현재 워크스페이스의 이력 보조
                     // 탭**을 연다/활성화한다. 재클릭은 탭을 지우지 않고 세션 탭으로만
                     // 돌아간다(탭 제거는 이력 X 전용).
-                    let previous_history_active = self.work_history_tab.is_active();
-                    self.work_history_tab = self.work_history_tab.on_rail_click();
-                    if self.work_history_tab.is_active() != previous_history_active {
+                    let previous_history_active =
+                        self.session_aux.current.work_history_tab.is_active();
+                    self.session_aux.current.work_history_tab =
+                        self.session_aux.current.work_history_tab.on_rail_click();
+                    if self.session_aux.current.work_history_tab.is_active()
+                        != previous_history_active
+                    {
                         // 헤더 탭 클릭(apply_work_history_tab_intent)과 같은 이유로
                         // 비운다 — 레일도 활성 보조 탭을 바꾸는 또 다른 진입점이다.
-                        self.aux_search.reset();
+                        self.session_aux.current.aux_search.reset();
                     }
-                    if self.work_history_tab.is_active() {
+                    if self.session_aux.current.work_history_tab.is_active() {
                         // Git이 활성이었다면 물러난다 — 보조 본문은 하나뿐이다(스펙 §8-2).
-                        (self.work_history_tab, self.git_tab, self.document_tab) =
-                            resolve_aux_tab_exclusivity(
-                                self.work_history_tab,
-                                self.git_tab,
-                                self.document_tab,
-                                AuxTabWinner::History,
-                            );
+                        (
+                            self.session_aux.current.work_history_tab,
+                            self.session_aux.current.git_tab,
+                            self.session_aux.current.document_tab,
+                        ) = resolve_aux_tab_exclusivity(
+                            self.session_aux.current.work_history_tab,
+                            self.session_aux.current.git_tab,
+                            self.session_aux.current.document_tab,
+                            AuxTabWinner::History,
+                        );
                         // 홈/작업 페이지 위에서 눌렀다면 탭이 있는 작업면으로 먼저 돌아간다.
                         self.reveal_terminal_view_for_aux_tab();
                         self.enter_work_history_tab();
@@ -34076,22 +34260,25 @@ impl eframe::App for App {
                 Some(ui::file_tree::SidebarAction::ShowGit) => {
                     // 레일 「Git」 — 이력과 같은 재클릭 규칙(활성 재클릭 시 세션으로 복귀,
                     // 탭 자체는 남는다).
-                    let previous = self.git_tab;
-                    self.git_tab = previous.on_rail_click();
-                    if self.git_tab.is_active() != previous.is_active() {
+                    let previous = self.session_aux.current.git_tab;
+                    self.session_aux.current.git_tab = previous.on_rail_click();
+                    if self.session_aux.current.git_tab.is_active() != previous.is_active() {
                         // 레일도 활성 보조 탭을 바꾸는 진입점이다(apply_git_tab_intent와
                         // 같은 이유).
-                        self.aux_search.reset();
+                        self.session_aux.current.aux_search.reset();
                     }
-                    if self.git_tab.is_active() {
+                    if self.session_aux.current.git_tab.is_active() {
                         // 이력과 같은 진입 — 활성이 될 때만 스냅샷을 새로 받는다(폴링 없음).
-                        (self.work_history_tab, self.git_tab, self.document_tab) =
-                            resolve_aux_tab_exclusivity(
-                                self.work_history_tab,
-                                self.git_tab,
-                                self.document_tab,
-                                AuxTabWinner::Git,
-                            );
+                        (
+                            self.session_aux.current.work_history_tab,
+                            self.session_aux.current.git_tab,
+                            self.session_aux.current.document_tab,
+                        ) = resolve_aux_tab_exclusivity(
+                            self.session_aux.current.work_history_tab,
+                            self.session_aux.current.git_tab,
+                            self.session_aux.current.document_tab,
+                            AuxTabWinner::Git,
+                        );
                         self.reveal_terminal_view_for_aux_tab();
                         self.request_git_panel_io(
                             ui.ctx(),
@@ -34240,14 +34427,36 @@ impl eframe::App for App {
                 // 떴다. Git 탭 진입은 유지하되 cwd는 이 세션 기준으로 고정한다
                 // (2026-08-15 회귀 수정 유지, 2차에서 사이드바 탭 → 보조 탭으로 갱신).
                 Some(ui::file_tree::SidebarAction::ShowDiff { session }) => {
-                    self.git_tab = ui::workspace::PaneAuxTabState::OpenActive;
-                    (self.work_history_tab, self.git_tab, self.document_tab) =
-                        resolve_aux_tab_exclusivity(
-                            self.work_history_tab,
-                            self.git_tab,
-                            self.document_tab,
-                            AuxTabWinner::Git,
+                    let target = self.active.workspace_ui.mux().and_then(|mux| {
+                        mux.tabs.iter().find_map(|tab| {
+                            tab.panes
+                                .iter()
+                                .find(|pane| pane.session_id == Some(session))
+                                .map(|pane| (tab.id.clone(), pane.id.clone()))
+                        })
+                    });
+                    if let Some((tab, pane)) = target {
+                        self.active.workspace_ui.arm_terminal_focus(pane.clone());
+                        self.stage_workspace_controller_action(
+                            WorkspaceControllerAction::FocusSession {
+                                workspace_id: self.active.id.clone(),
+                                tab,
+                                pane,
+                            },
                         );
+                        self.sync_session_aux_scope();
+                    }
+                    self.session_aux.current.git_tab = ui::workspace::PaneAuxTabState::OpenActive;
+                    (
+                        self.session_aux.current.work_history_tab,
+                        self.session_aux.current.git_tab,
+                        self.session_aux.current.document_tab,
+                    ) = resolve_aux_tab_exclusivity(
+                        self.session_aux.current.work_history_tab,
+                        self.session_aux.current.git_tab,
+                        self.session_aux.current.document_tab,
+                        AuxTabWinner::Git,
+                    );
                     self.reveal_terminal_view_for_aux_tab();
                     let cwd = self.cached_session_cwd(session).map(PathBuf::from);
                     self.request_git_panel_io_at(
@@ -34431,17 +34640,18 @@ impl eframe::App for App {
         {
             self.push_archived_resume_presentation();
         }
+        self.sync_session_aux_scope();
         let events = std::mem::take(&mut self.active.pending_events);
         let central_view = self.agent_terminal_ui.view();
         let home_visible = central_view == ui::agent_terminal::AgentTerminalView::Home;
         let fleet_visible = central_view == ui::agent_terminal::AgentTerminalView::Fleet;
         let information_visible = home_visible || fleet_visible;
         // 이력은 전역 페이지가 아니라 포커스된 세션 pane 헤더 옆의 보조 탭이다.
-        let history_tab_active = self.work_history_tab.is_active();
+        let history_tab_active = self.session_aux.current.work_history_tab.is_active();
         // Git도 이력과 같은 보조 탭이다 — 동시 활성은 없다(스펙 §8-2).
-        let git_tab_active = self.git_tab.is_active();
+        let git_tab_active = self.session_aux.current.git_tab.is_active();
         // 문서도 같은 보조 탭이다(D0) — 셋 다 동시 활성은 없다.
-        let document_tab_active = self.document_tab.is_active();
+        let document_tab_active = self.session_aux.current.document_tab.is_active();
         // 홈/작업함/fleet이 중앙을 차지해도 활성 워크스페이스 이벤트는 계속 소화한다.
         if information_visible {
             self.active
@@ -34546,14 +34756,14 @@ impl eframe::App for App {
         // 닫힘 상태와 홈/작업 페이지에서는 세션 헤더가 예전 그대로다 — X가 실제로
         // 탭을 없앤다.
         let mut aux_tabs = Vec::new();
-        if terminal_visible && self.work_history_tab.is_open() {
+        if terminal_visible && self.session_aux.current.work_history_tab.is_open() {
             aux_tabs.push(ui::workspace::PaneAuxTab {
                 kind: ui::workspace::PaneAuxTabKind::History,
                 label: text.t("workspace.tab.history", &[]),
                 active: history_tab_active,
             });
         }
-        if terminal_visible && self.git_tab.is_open() {
+        if terminal_visible && self.session_aux.current.git_tab.is_open() {
             aux_tabs.push(ui::workspace::PaneAuxTab {
                 kind: ui::workspace::PaneAuxTabKind::Git,
                 label: text.t("workspace.tab.git", &[]),
@@ -34563,16 +34773,31 @@ impl eframe::App for App {
         // 문서 탭 라벨은 파일명이다(설계 §2 — 문서가 먼저 축약되는 이유이기도 하다).
         // 열려 있는 문서마다 하나씩(멀티 문서 탭 설계 §2) — `active`는 그중 지금
         // 보이는 문서 하나에만 선다.
-        if terminal_visible && self.document_tab.is_open() {
-            for document in &self.documents {
+        if terminal_visible && self.session_aux.current.document_tab.is_open() {
+            for document in self
+                .documents
+                .iter()
+                .filter(|d| self.session_aux.current.document_ids.contains(&d.id))
+            {
                 aux_tabs.push(ui::workspace::PaneAuxTab {
                     kind: ui::workspace::PaneAuxTabKind::Document(document.id),
                     label: ui::path_file_name_display(&document.path),
-                    active: document_tab_active && self.active_document == Some(document.id),
+                    active: document_tab_active
+                        && self.session_aux.current.active_document == Some(document.id),
                 });
             }
         }
-        self.active.workspace_ui.set_aux_tabs(aux_tabs);
+        self.active.workspace_ui.set_owned_aux_tabs(
+            self.session_aux
+                .owner
+                .as_ref()
+                .and_then(|owner| owner.pane.clone()),
+            self.session_aux
+                .owner
+                .as_ref()
+                .and_then(|owner| owner.session),
+            aux_tabs,
+        );
         // 이력·Git 본문이 떠 있는 동안 입력 소유권은 명시적으로 없다(fail-closed) —
         // 타이핑·IME·붙여넣기가 숨은 PTY로 새지 않게 한다.
         if terminal_visible
@@ -35068,7 +35293,7 @@ impl eframe::App for App {
                     aux_tab_intent = primary_output.aux_tab_intent;
                     dropped_document_paths.extend(primary_output.document_drop_paths);
                     if primary_output.aux_search_toggle_requested {
-                        self.aux_search.toggle();
+                        self.session_aux.current.aux_search.toggle();
                     }
                     if let Some(body) = primary_output.aux_body_rect {
                         if git_tab_active {
@@ -35112,7 +35337,7 @@ impl eframe::App for App {
                     aux_tab_intent = primary_output.aux_tab_intent;
                     dropped_document_paths.extend(primary_output.document_drop_paths);
                     if primary_output.aux_search_toggle_requested {
-                        self.aux_search.toggle();
+                        self.session_aux.current.aux_search.toggle();
                     }
                     if let Some(body) = primary_output.aux_body_rect {
                         if git_tab_active {
@@ -35260,7 +35485,7 @@ impl eframe::App for App {
                 // 직후 `reset_git_surfaces`가 비운 자리를 렌더가 자동으로 다시 채우는
                 // 경우) 포커스 세션 기준으로 새로 고른다(항목 3).
                 let cwd = resolve_git_refresh_cwd(GitRefreshCwd {
-                    pinned: self.git_panel_cwd.clone(),
+                    pinned: self.session_aux.current.git_panel_cwd.clone(),
                     focused: self.focused_session_repo_cwd(),
                 });
                 self.request_git_panel_io_at(
@@ -35273,12 +35498,15 @@ impl eframe::App for App {
                 self.open_git_panel_remote(ui.ctx());
             }
             Some(ui::git_panel::GitPanelAction::ShowFileDiff { rel_path, mode }) => {
-                self.diff_viewer_ui.open(rel_path.clone(), mode);
+                self.session_aux
+                    .current
+                    .diff_viewer_ui
+                    .open(rel_path.clone(), mode);
                 // 지금 패널이 보여주는 repo(`git_panel_cwd`)의 파일이다 — 포커스 세션을
                 // 다시 묻지 않는다(항목 3, Refresh와 같은 규칙).
                 self.request_git_panel_io_at(
                     ui.ctx(),
-                    self.git_panel_cwd.clone(),
+                    self.session_aux.current.git_panel_cwd.clone(),
                     ui::git_panel::GitPanelIoRequest::FileDiff { rel_path, mode },
                 );
             }
@@ -35291,7 +35519,8 @@ impl eframe::App for App {
                 // 않는다). 이미 있는 `SpawnShellAt` 액션으로 올려 다음 logic tick이
                 // 처리하게 한다 — 그 핸들러가 reveal + spawn_shell_at을 함께 한다.
                 // 셸이 뜨는 곳을 봐야 하므로 Git 탭은 세션 탭으로 물러난다(탭은 남는다).
-                self.git_tab = self.git_tab.on_session_tab_click();
+                self.session_aux.current.git_tab =
+                    self.session_aux.current.git_tab.on_session_tab_click();
                 self.stage_workspace_controller_action(WorkspaceControllerAction::SpawnShellAt {
                     cwd: Some(path),
                 });
@@ -35786,11 +36015,13 @@ impl eframe::App for App {
         // 문서 탭 상한 안내(멀티 문서 탭 설계 §4) — clean 비활성 문서가 하나도 없어
         // 자리를 못 만들었을 때만 선다. 확인만 있는 단순 안내라 확인 모달과 달리
         // 액션 분기가 없다.
-        if document_confirmation_open.is_none() && self.document_cap_notice {
+        if document_confirmation_open.is_none() && self.session_aux.current.document_cap_notice {
             if ui::document_dialogs::cap(ui.ctx(), &text) {
-                self.document_cap_notice = false;
+                self.session_aux.current.document_cap_notice = false;
             }
-        } else if document_confirmation_open.is_none() && !self.document_cap_notice {
+        } else if document_confirmation_open.is_none()
+            && !self.session_aux.current.document_cap_notice
+        {
             // Capture identity at detection; busy admission preserves the same prompt.
             if let Some(prompt) = self.workspace_rename_prompt.as_ref() {
                 let decision = ui::document_dialogs::moved(
@@ -38001,7 +38232,10 @@ fn fluid_cross_workspace_layout(
 /// (2026-08-17 리뷰).
 ///
 /// NaN/무한대는 `None` — 그 값을 폭에 넣으면 이후 clamp가 전부 오염된다.
-fn aux_divider_requested_width(start_width: f32, total_drag_delta_x: f32) -> Option<f32> {
+pub(crate) fn aux_divider_requested_width(
+    start_width: f32,
+    total_drag_delta_x: f32,
+) -> Option<f32> {
     if !start_width.is_finite() || !total_drag_delta_x.is_finite() {
         return None;
     }
@@ -42745,7 +42979,8 @@ mod tests {
 
         let logic = source
             .split_once(
-                "    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {",
+                "    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.prune_session_aux_views();",
             )
             .and_then(|(_, tail)| tail.split_once("mem_pressure_monitor"))
             .map(|(body, _)| body)
@@ -43252,15 +43487,105 @@ mod tests {
             ),
         ]);
         assert_eq!(
-            trusted_pane_task_prompt(runtime::SessionId(1), &bindings, &prompts),
+            trusted_pane_task_prompt(runtime::SessionId(1), &bindings, &prompts).as_deref(),
             Some("첫 pane 작업")
         );
         assert_eq!(
-            trusted_pane_task_prompt(runtime::SessionId(2), &bindings, &prompts),
+            trusted_pane_task_prompt(runtime::SessionId(2), &bindings, &prompts).as_deref(),
             Some("둘째 pane 작업")
         );
         assert_eq!(
             trusted_pane_task_prompt(runtime::SessionId(3), &bindings, &prompts),
+            None
+        );
+    }
+
+    #[test]
+    fn pasted_transport_titles_are_clean_for_fresh_and_restored_pane_prompts() {
+        use crate::agent_detect::{AgentBinding, AgentKind};
+        let session = runtime::SessionId(8);
+        let binding = AgentBinding {
+            kind: AgentKind::Claude,
+            session_id: "native".into(),
+            transcript: PathBuf::from("/tmp/native.jsonl"),
+        };
+        let bindings = HashMap::from([(session, binding.clone())]);
+        for (raw, expected) in [
+            (
+                "<pasted_content id=\"e89a\">1. 실제 작업을 수정해",
+                Some("1. 실제 작업을 수정해"),
+            ),
+            (
+                "<pasted_content id='x'>첫 지시</pasted_content>\n추가 지시",
+                Some("첫 지시\n추가 지시"),
+            ),
+            ("<task-notification>internal", None),
+            ("<agent-message from='subagent'>internal", None),
+            ("<pasted_content id='x'><task-notification>internal", None),
+            (
+                "<pasted_content id='x'><agent-message from='subagent'>internal",
+                None,
+            ),
+        ] {
+            let prompts = HashMap::from([(session, ("native".into(), raw.into()))]);
+            assert_eq!(
+                trusted_pane_task_prompt(session, &bindings, &prompts).as_deref(),
+                expected
+            );
+            let saved = HashMap::from([(
+                "pane-a".into(),
+                storage::AgentSessionRow {
+                    pane_id: "pane-a".into(),
+                    kind: "claude".into(),
+                    session_id: "native".into(),
+                    task_prompt: Some(raw.into()),
+                },
+            )]);
+            let restored = persisted_pane_task_prompt("pane-a", &binding, &saved, None);
+            assert_eq!(restored.as_deref(), expected);
+            let restored_prompts = restored
+                .map(|prompt| HashMap::from([(session, ("native".into(), prompt.into_owned()))]))
+                .unwrap_or_default();
+            let mut display = display_with(Some("old summary"), Some("old instruction"));
+            display.kind = AgentKind::Claude;
+            let mut displays = HashMap::from([(session, display)]);
+            apply_pane_task_prompts(
+                &mut displays,
+                &bindings,
+                &HashMap::new(),
+                &restored_prompts,
+                false,
+            );
+            assert_eq!(displays[&session].user_instruction.as_deref(), expected);
+            assert_eq!(displays[&session].last_agent_summary, None);
+        }
+    }
+
+    #[test]
+    fn pasted_transport_shared_history_compares_normalized_peer_prompts() {
+        let recent = [crate::agent_transcript::TranscriptTurn {
+            turn_key: "mine".into(),
+            source_offset: 10,
+            instruction: "실제 작업".into(),
+            agent_summary: None,
+            occurred_at: Some(100),
+            activity: crate::agent_transcript::AgentActivity::Working,
+            messages: vec![],
+        }];
+        assert_eq!(
+            attributable_shared_history_turn(
+                Some("<pasted_content id='a'>실제 작업"),
+                &recent,
+                &[]
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            attributable_shared_history_turn(
+                Some("<pasted_content id='a'>실제 작업"),
+                &recent,
+                &["<pasted_content id='b'>실제 작업"]
+            ),
             None
         );
     }
@@ -43284,7 +43609,10 @@ mod tests {
             "Another Claude session sent a message: <agent-message from=\"subagent\"> internal",
         ] {
             let prompts = HashMap::from([(session, ("native".to_owned(), internal.to_owned()))]);
-            assert_eq!(trusted_pane_task_prompt(session, &bindings, &prompts), None);
+            assert_eq!(
+                trusted_pane_task_prompt(session, &bindings, &prompts).as_deref(),
+                None
+            );
         }
     }
 
@@ -43326,7 +43654,7 @@ mod tests {
                     binding.session_id.clone(),
                     persisted_pane_task_prompt("pane-a", &binding, &saved, None)
                         .unwrap()
-                        .to_owned(),
+                        .into_owned(),
                 ),
             ),
             (
@@ -43335,7 +43663,7 @@ mod tests {
                     binding.session_id.clone(),
                     persisted_pane_task_prompt("pane-b", &binding, &saved, None)
                         .unwrap()
-                        .to_owned(),
+                        .into_owned(),
                 ),
             ),
         ]);
@@ -43379,7 +43707,8 @@ mod tests {
                 },
                 &saved,
                 Some("shared-native"),
-            ),
+            )
+            .as_deref(),
             Some("첫 작업")
         );
     }
@@ -45288,16 +45617,13 @@ mod tests {
     /// 참고.
     #[test]
     fn history_tab_divider는_total_drag_delta_기반으로_폭을_누적한다() {
-        let source = include_str!("app.rs");
+        let source = include_str!("ui/work_history/browser.rs");
         let divider = source
             .split_once("let resize_id = ui.id().with(\"work_history_tab_split_resize\")")
             .unwrap()
-            .1
-            .split_once("let mut transcript = ui.new_child(")
-            .unwrap()
-            .0;
-        assert!(divider.contains("resize_response.total_drag_delta()"));
-        assert!(!divider.contains("resize_response.drag_delta().x"));
+            .1;
+        assert!(divider.contains("response.total_drag_delta()"));
+        assert!(!divider.contains("response.drag_delta().x"));
     }
 
     /// 워크스페이스 전환은 Git 보조 본문을 무효화해야 한다(2026-08-16 코드 리뷰 항목 1) —
@@ -45376,34 +45702,23 @@ mod tests {
     /// `reset_git_surfaces`를 부르는지 — 순수 함수 자체는 위 두 테스트로 동작을
     /// 검증했으니, 여기서는 배선(호출) 여부만 소스로 확인한다(보조 용도).
     #[test]
-    fn 워크스페이스_전환은_reset_git_surfaces를_부른다() {
+    fn 워크스페이스_전환은_세션별_보조_상태를_보존한다() {
         let source = include_str!("app.rs");
         let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
         let body = production
             .split_once("fn switch_workspace_with_preferred_pane(")
-            .expect("전환 함수가 있어야 한다")
+            .unwrap()
             .1
             .split_once("fn cycle_workspace(")
-            .expect("다음 함수 경계가 있어야 한다")
+            .unwrap()
             .0;
-        assert!(
-            body.contains("reset_git_surfaces("),
-            "전환 시 Git 보조 본문을 무효화해야 한다"
+        assert_eq!(
+            body.matches("self.sync_session_aux_scope()").count(),
+            2,
+            "park the old view before replacing the runtime, then restore the new view"
         );
-        assert!(
-            body.contains("invalidate_transcript_requests("),
-            "전환 시 원문 IO 세대도 무효화해야 한다(항목 2)"
-        );
-        assert!(
-            !body.contains("self.git_tab = "),
-            "git_tab 자체는 건드리지 않는다 — 이력 탭과 같은 규칙으로 열린 채 유지한다"
-        );
-        assert!(
-            body.contains("self.aux_search.reset()"),
-            "워크스페이스 전환 시 보조 검색도 비워야 한다 — \
-             안 그러면 이전 워크스페이스에서 찾던 문구가 새 워크스페이스의 이력/Git \
-             목록을 걸러 놓는다"
-        );
+        assert!(!body.contains("reset_git_surfaces("));
+        assert!(!body.contains("invalidate_transcript_requests("));
     }
 
     /// 원문 IO 세대 무효화(항목 2) — in-flight이거나 슬롯 대기 중이던 이전 워크스페이스의
@@ -45501,7 +45816,7 @@ mod tests {
             .expect("다음 액션 경계가 있어야 한다")
             .0;
         assert!(
-            show_file_diff.contains("self.git_panel_cwd.clone()"),
+            show_file_diff.contains("self.session_aux.current.git_panel_cwd.clone()"),
             "파일 diff 재요청도 포커스 세션이 아니라 지금 보여주는 repo cwd를 써야 한다"
         );
         assert!(
@@ -45553,7 +45868,7 @@ mod tests {
             .unwrap_or(0);
         let handler = &handler[..cut];
         assert!(
-            handler.contains("pending_app_host_retry = Some(request)"),
+            handler.contains("enqueue_aux_host_retry(request)"),
             "슬롯이 차 있으면 대기 슬롯에 얹어야 한다"
         );
         assert!(
@@ -45561,7 +45876,7 @@ mod tests {
             "어느 경로로 가든 로딩 표시는 세운다 — 클릭이 먹혔다는 신호다"
         );
         assert!(
-            production.contains("self.pending_app_host_retry.take()"),
+            production.contains("self.pending_app_host_retry.pop_front()"),
             "대기 슬롯을 다음 프레임에 태우는 배수 지점이 있어야 한다"
         );
     }
@@ -45650,7 +45965,9 @@ mod tests {
             "이력·Git 활성 프레임은 터미널 입력 소유자를 잡으면 안 된다"
         );
         assert!(
-            render.contains("if terminal_visible && self.work_history_tab.is_open() {"),
+            render.contains(
+                "if terminal_visible && self.session_aux.current.work_history_tab.is_open() {"
+            ),
             "이력 탭 chrome은 탭이 열려 있을 때만 붙어야 한다(이력 X가 실제로 없앤다)"
         );
         assert!(
@@ -45696,8 +46013,10 @@ mod tests {
             );
         }
         assert_eq!(
-            intent.matches("self.aux_search.reset()").count(),
-            6,
+            intent
+                .matches("self.session_aux.current.aux_search.reset()")
+                .count(),
+            5,
             "apply_work_history_tab_intent·apply_git_tab_intent·\
              apply_document_tab_intent(ShowSession 분기)·activate_document_tab·\
              close_document_entry·begin_document_open 여섯 다 활성 보조 탭이 바뀌면\
@@ -46200,7 +46519,7 @@ mod tests {
             .expect("admission 뒤 outcome 적용");
         assert!(plan < execute && execute < clone);
         assert!(body.contains("self.close_document_entry(victim);"));
-        assert!(body.contains("self.document_cap_notice = true;"));
+        assert!(body.contains("self.session_aux.current.document_cap_notice = true;"));
         assert!(body.contains("if !execution.apply_outcome {"));
     }
 
@@ -46306,9 +46625,32 @@ mod tests {
     /// 달라도 같은 값이어야 한다 — Source 모드와 Split 모드(컨테이너 한 겹 더)를 같은
     /// 하네스에서 확인해 그 불변식을 고정한다(2026-08-23).
     #[test]
+    fn session_aux_same_path_documents_have_independent_buffers_and_editor_ids() {
+        let a = stub_open_document_id(1, "/tmp/shared.md", "A draft", "base", true);
+        let b = stub_open_document_id(2, "/tmp/shared.md", "B draft", "base", true);
+        let documents = [a, b];
+        let path = Path::new("/tmp/shared.md");
+        for id in [
+            ui::workspace::DocumentTabId(1),
+            ui::workspace::DocumentTabId(2),
+        ] {
+            assert_eq!(
+                find_open_document_by_path(documents.iter().filter(|d| d.id == id), path),
+                Some(id)
+            );
+        }
+        assert_ne!(
+            document_source_editor_id(documents[0].id, path),
+            document_source_editor_id(documents[1].id, path)
+        );
+        assert_eq!(documents[0].source, "A draft");
+        assert_eq!(documents[1].source, "B draft");
+    }
+
+    #[test]
     fn 문서_편집기_id는_컨테이너와_무관하게_같고_실제_저장_위치와_일치한다() {
         let path = PathBuf::from("/tmp/explore.md");
-        let editor_id = document_source_editor_id(&path);
+        let editor_id = document_source_editor_id(ui::workspace::DocumentTabId(0), &path);
         let mut source = "hello".to_owned();
 
         // Source 모드 — body ui에 그대로 그린다.
@@ -46346,7 +46688,7 @@ mod tests {
     #[test]
     fn clear_document_editor_state는_저장된_텍스트편집기_상태를_지운다() {
         let path = PathBuf::from("/tmp/explore.md");
-        let editor_id = document_source_editor_id(&path);
+        let editor_id = document_source_editor_id(ui::workspace::DocumentTabId(0), &path);
         let mut source = "hello".to_owned();
         let mut harness = egui_kittest::Harness::new_ui(|ui| {
             ui::document::source_editor(ui, editor_id, &mut source, true);
@@ -46586,27 +46928,17 @@ mod tests {
     }
 
     #[test]
-    fn close_document_entry는_활성_문서를_닫으면_이웃을_고르고_마지막이면_그룹을_닫는다() {
+    fn close_document_entry는_활성_문서를_닫으면_소유_세션의_이웃을_고른다() {
         let source = include_str!("app.rs");
-        let function_body = source
+        let body = source
             .split_once("fn close_document_entry(&mut self")
-            .expect("close_document_entry 정의를 찾아야 한다")
+            .unwrap()
             .1
             .split_once("\n    fn ")
-            .expect("다음 함수 경계를 찾아야 한다")
+            .unwrap()
             .0;
-        assert!(
-            function_body.contains(
-                "self.active_document = next_active_document_after_close(&self.documents, index);"
-            ),
-            "활성 문서를 닫으면 next_active_document_after_close로 이웃을 골라야 한다: \
-             {function_body}"
-        );
-        assert!(
-            function_body.contains("if self.documents.is_empty() {")
-                && function_body.contains("self.document_tab = self.document_tab.on_close();"),
-            "마지막 문서를 닫으면 문서 그룹 자체가 닫혀야 한다: {function_body}"
-        );
+        assert!(body.contains("self.session_aux.close_document(id)"));
+        assert!(!body.contains("next_active_document_after_close(&self.documents"));
     }
 
     #[test]
@@ -46629,14 +46961,14 @@ mod tests {
             "새 문서를 열 때 기존 목록을 지우거나 통째로 바꾸면 안 된다: {function_body}"
         );
         let refuse_branch = function_body
-            .split_once("plan_document_eviction(&self.documents, self.active_document) else {")
+            .split_once("plan_document_eviction(")
             .expect("상한 판정 호출이 있어야 한다")
             .1
             .split_once("};")
             .expect("else 블록이 끝나야 한다")
             .0;
         assert!(
-            refuse_branch.contains("self.document_cap_notice = true;"),
+            refuse_branch.contains("self.session_aux.current.document_cap_notice = true;"),
             "자리를 못 만들면 상한 안내를 세워야 한다: {refuse_branch}"
         );
         assert!(
@@ -47644,11 +47976,11 @@ mod tests {
             .expect("다음 분기 경계가 있어야 한다")
             .0;
         assert!(
-            arm.contains("self.work_history_tab.is_active() || self.git_tab.is_active()"),
+            squeeze_ws(arm).contains("self.session_aux.current.work_history_tab.is_active() || self.session_aux.current.git_tab.is_active()"),
             "보조 본문 활성 여부로 갈라야 한다"
         );
         assert!(
-            arm.contains("self.aux_search.toggle()"),
+            arm.contains("self.session_aux.current.aux_search.toggle()"),
             "활성이면 보조 검색을 토글해야 한다"
         );
         assert!(
@@ -47672,7 +48004,9 @@ mod tests {
             .split_once("Some(ui::file_tree::SidebarAction::ShowGit) => {")
             .expect("다음 분기 경계가 있어야 한다");
         assert!(
-            history.0.contains("self.aux_search.reset()"),
+            history
+                .0
+                .contains("self.session_aux.current.aux_search.reset()"),
             "레일 이력 클릭도 활성 탭이 바뀌면 보조 검색을 비워야 한다"
         );
         let git = history
@@ -47681,7 +48015,7 @@ mod tests {
             .expect("다음 분기 경계가 있어야 한다")
             .0;
         assert!(
-            git.contains("self.aux_search.reset()"),
+            git.contains("self.session_aux.current.aux_search.reset()"),
             "레일 Git 클릭도 활성 탭이 바뀌면 보조 검색을 비워야 한다"
         );
     }
@@ -47701,7 +48035,7 @@ mod tests {
             .expect("다음 함수 경계가 있어야 한다")
             .0;
         assert!(
-            history_body.contains("self.work_history_ui.show("),
+            history_body.contains("self.session_aux.current.work_history_ui.show_browser("),
             "이력 카드 목록 렌더 호출이 있어야 한다"
         );
         assert!(
@@ -47712,11 +48046,14 @@ mod tests {
         // 접을 때 사이에 공백이 끼어 접힘 여부에 따라 매치가 갈린다. 나누면 접히든
         // 펴지든 둘 다 통과하면서 "그 뷰어가 그 인자로 불린다"는 계약은 그대로 지킨다.
         assert!(
-            squeeze_ws(history_body).contains("self.transcript_viewer_ui"),
+            history_body
+                .split_whitespace()
+                .collect::<String>()
+                .contains("self.session_aux.current.transcript_viewer_ui"),
             "원문 뷰어를 그리는 주체가 transcript_viewer_ui여야 한다"
         );
         assert!(
-            squeeze_ws(history_body).contains(".render(&mut transcript, text, search);"),
+            squeeze_ws(history_body).contains(".render(transcript, text, search)"),
             "원문 뷰어는 aux_search에서 뽑은 search를 써야 한다"
         );
         let git_body = production
@@ -47727,11 +48064,16 @@ mod tests {
             .expect("다음 함수 경계가 있어야 한다")
             .0;
         assert!(
-            git_body.contains("self.git_panel_ui.render(&mut list, text, filter);"),
+            git_body
+                .split_whitespace()
+                .collect::<String>()
+                .contains("self.session_aux.current.git_panel_ui.render(&mutlist,text,filter);"),
             "Git 파일 목록 필터는 aux_search에서 뽑은 filter를 써야 한다"
         );
         assert!(
-            git_body.contains("self.diff_viewer_ui.render(&mut detail, text, search);"),
+            git_body.split_whitespace().collect::<String>().contains(
+                "self.session_aux.current.diff_viewer_ui.render(&mutdetail,text,search);"
+            ),
             "diff 뷰어는 aux_search에서 뽑은 search를 써야 한다"
         );
     }
@@ -47783,7 +48125,8 @@ mod tests {
             "세션 이동은 이력·Git·문서 탭을 공통 전이로 비활성화해야 한다"
         );
         assert!(
-            helper.contains("if reset_search") && helper.contains("self.aux_search.reset();"),
+            helper.contains("if reset_search")
+                && helper.contains("self.session_aux.current.aux_search.reset();"),
             "활성 보조 본문에서 세션으로 이동하면 공유 검색을 초기화해야 한다"
         );
         assert!(
@@ -53677,6 +54020,52 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "offscreen menu audit PNGs and measured geometry"]
+    fn context_menu_audit_environment() {
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        let project = ui::env_project_list::EnvProjectRow {
+            id: "audit".into(),
+            name: "Audit".into(),
+            alias: String::new(),
+            path: "/Users/jr/Projects/audit".into(),
+            path_missing: false,
+            env_count: 0,
+            key_count: 0,
+        };
+        let mut action = None;
+        let mut rename = None;
+        let mut edit = EnvApiProjectEditState::default();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(700.0, 500.0))
+            .with_pixels_per_point(2.0)
+            .build_ui(|ui| {
+                ui::designall::apply_workspace_visuals(ui);
+                render_env_api_project_header(
+                    ui,
+                    Some(&project),
+                    &mut action,
+                    &mut rename,
+                    &mut edit,
+                    &catalog,
+                );
+            });
+        ui::context_menu_audit::prepare(&harness.ctx);
+        harness.run();
+        let target = egui::pos2(220.0, 57.0);
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos: target,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+            harness.step();
+        }
+        harness.run();
+        ui::context_menu_audit::save(&mut harness, "environment");
+    }
+
+    #[test]
     fn 환경_프로젝트_닫기는_설정목록만_숨기고_sidebar와_active를_유지한다() {
         let project = |id: &str| ui::env_project_list::EnvProjectRow {
             id: id.to_owned(),
@@ -55287,6 +55676,69 @@ mod tests {
         assert_eq!(
             attached_app_server_conflict(None, |_| Some("x".to_owned())),
             None
+        );
+    }
+
+    #[test]
+    fn approved_history_shared_turn_requires_unique_exact_pane_proof() {
+        use crate::agent_transcript::{AgentActivity, TranscriptTurn};
+        let turn = |key: &str, instruction: &str| TranscriptTurn {
+            turn_key: key.into(),
+            source_offset: 10,
+            instruction: instruction.into(),
+            agent_summary: None,
+            occurred_at: Some(100),
+            activity: AgentActivity::Working,
+            messages: vec![],
+        };
+        let recent = [turn("other", "다른 작업"), turn("mine", "내 작업")];
+        assert_eq!(
+            attributable_shared_history_turn(Some("내 작업"), &recent, &["다른 작업"]),
+            Some(1)
+        );
+        assert_eq!(
+            attributable_shared_history_turn(Some("내 작업"), &recent, &["내 작업"]),
+            None
+        );
+        assert_eq!(
+            attributable_shared_history_turn(Some("내"), &recent, &[]),
+            None,
+            "prefix similarity is not ownership proof"
+        );
+        assert_eq!(attributable_shared_history_turn(None, &recent, &[]), None);
+        assert_eq!(
+            attributable_shared_history_turn(
+                Some("내 작업"),
+                &[turn("a", "내 작업"), turn("b", "내 작업")],
+                &[]
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn approved_history_live_status_requires_exact_newest_owned_turn() {
+        use storage::AgentWorkTurnState as S;
+        use ui::work_history::WorkHistoryState as V;
+        assert_eq!(
+            verified_work_history_state(S::Working, false, true, Some(S::Working)),
+            None
+        );
+        assert_eq!(
+            verified_work_history_state(S::Waiting, true, false, Some(S::Working)),
+            None
+        );
+        assert_eq!(
+            verified_work_history_state(S::Working, true, true, None),
+            None
+        );
+        assert_eq!(
+            verified_work_history_state(S::Working, true, true, Some(S::Waiting)),
+            Some(V::Waiting)
+        );
+        assert_eq!(
+            verified_work_history_state(S::Completed, false, false, None),
+            Some(V::Completed)
         );
     }
 

@@ -2613,151 +2613,18 @@ impl FileTreeUi {
                                                             // 빠르게 두 번 누르면 편집기가 열려 오조작이 됐다.
                                                             // (수동 상태 지정 U17b는 hook 감지 정착으로 제거 — 2026-07-17 사용자.)
                                                             if let Some(session) = entry.target.session() {
-                                                                resp.context_menu(|ui| {
+                                                                super::context_menu::show(&resp, |ui| {
                                                                     live_session_context_menu_items(ui, |ui| {
-                                                                    if ui
-                                                                        .button(catalog.t(
-                                                                            "workspace.rename_menu",
-                                                                            &[],
-                                                                        ))
-                                                                        .clicked()
-                                                                    {
-                                                                        let _ = self.take_session_name_edit(ui.ctx());
-                                                                        self.session_name_edit = Some(SessionNameEdit {
-                                                                            target: entry.target.clone(),
-                                                                            text: if entry.title_is_custom { entry.title.clone() } else { String::new() },
-                                                                            request_focus: true,
-                                                                        });
-                                                                        ui.close();
-                                                                    }
-                                                                    ui.separator();
-                                                                    if ui
-                                                                .button(catalog.t(
-                                                                    "sidebar.menu.open_folder",
-                                                                    &[],
-                                                                ))
-                                                                .clicked()
-                                                            {
-                                                                action = Some(
-                                                                SidebarAction::OpenSessionFolder {
-                                                                    session,
-                                                                },
-                                                            );
-                                                                ui.close();
-                                                            }
-                                                                    if ui
-                                                                .button(catalog.t(
-                                                                    "sidebar.menu.copy_path",
-                                                                    &[],
-                                                                ))
-                                                                .clicked()
-                                                            {
-                                                                action = Some(
-                                                                SidebarAction::CopySessionPath {
-                                                                    session,
-                                                                },
-                                                            );
-                                                                ui.close();
-                                                            }
-                                                                    if ui
-                                                                .button(catalog.t(
-                                                                    "sidebar.menu.new_shell_here",
-                                                                    &[],
-                                                                ))
-                                                                .clicked()
-                                                            {
-                                                                action = Some(
-                                                                SidebarAction::NewShellSameFolder {
-                                                                    session,
-                                                                },
-                                                            );
-                                                                ui.close();
-                                                            }
-                                                                    // 변경 보기 — 이 세션 cwd 레포의 diff를 사이드바 Git
-                                                                    // 탭에 연다(PR-D). session payload를 실어 보낸다 — App이
-                                                                    // 포커스 세션이 아니라 **이** 세션의 cwd로 수집해야 한다
-                                                                    // (2026-08-15 회귀 수정, Task 10 Step 9 되돌림).
-                                                                    if ui
-                                                                .button(catalog.t(
-                                                                    "sidebar.menu.show_diff",
-                                                                    &[],
-                                                                ))
-                                                                .clicked()
-                                                            {
-                                                                action = Some(SidebarAction::ShowDiff {
-                                                                    session,
-                                                                });
-                                                                ui.close();
-                                                            }
-                                                                    // 새 워크트리에서 셸 — cwd를 아는 세션만 (레포 판정은
-                                                                    // dispatch의 백그라운드 repo_root가 한다, PR-W).
-                                                                    if entry.has_cwd
-                                                        && ui
-                                                            .button(catalog.t(
-                                                                "sidebar.menu.new_worktree_cell",
-                                                                &[],
-                                                            ))
-                                                            .clicked()
-                                                    {
-                                                        action =
-                                                            Some(SidebarAction::NewWorktreeCell {
-                                                                session,
-                                                            });
-                                                        ui.close();
-                                                    }
-                                                                    // 워크트리 삭제 — 이 세션 cwd가 `.deppy/worktrees/`
-                                                                    // 하위일 때만 노출(2026-07-18 사용자 제안).
-                                                                    if entry.in_worktree
-                                                            && ui
-                                                                .button(catalog.t(
-                                                                    "sidebar.menu.remove_worktree",
-                                                                    &[],
-                                                                ))
-                                                                .clicked()
-                                                        {
-                                                            action = Some(
-                                                                SidebarAction::RemoveWorktree {
-                                                                    session,
-                                                                },
-                                                            );
-                                                            ui.close();
-                                                        }
-                                                                    if entry.resumable
-                                                                && ui
-                                                                    .button(catalog.t(
-                                                                        "sidebar.menu.resume_agent",
-                                                                        &[],
-                                                                    ))
-                                                                    .clicked()
-                                                            {
-                                                                action = Some(
-                                                                    SidebarAction::ResumeAgent {
-                                                                        workspace_id: entry
-                                                                            .target
-                                                                            .workspace_id()
-                                                                            .to_owned(),
-                                                                        pane: entry.target.pane().clone(),
-                                                                        session,
-                                                                        title: entry.title.clone(),
-                                                                    },
-                                                                );
-                                                                ui.close();
-                                                            }
-                                                                    ui.separator();
-                                                                    if ui
-                                                                .button(catalog.t(
-                                                                    "sidebar.menu.close_pane",
-                                                                    &[],
-                                                                ))
-                                                                .clicked()
-                                                            {
-                                                                action = Some(
-                                                                    SidebarAction::ClosePane {
-                                                                        pane: entry.target.pane().clone(),
-                                                                    },
-                                                                );
-                                                                ui.close();
-                                                            }
+                                                                        if super::context_menu::button(ui, catalog.t("workspace.rename_menu", &[]), super::context_menu::Icon::Edit).clicked() {
+                                                                            let _ = self.take_session_name_edit(ui.ctx());
+                                                                            self.session_name_edit = Some(SessionNameEdit {
+                                                                                target: entry.target.clone(),
+                                                                                text: if entry.title_is_custom { entry.title.clone() } else { String::new() },
+                                                                                request_focus: true,
+                                                                            });
+                                                                            ui.close();
+                                                                        }
+                                                                        active_session_context_menu_actions(ui, entry, session, catalog, &mut action);
                                                                     });
                                                                 });
                                                             }
@@ -3398,8 +3265,13 @@ impl FileTreeUi {
 
         // 헤더 우클릭도 더보기와 같은 생성 위치를 사용한다.
         if self.root.is_some() {
-            header_drop.context_menu(|ui| {
-                if ui.button(catalog.t("file_tree.new_folder", &[])).clicked()
+            super::context_menu::show(&header_drop, |ui| {
+                if super::context_menu::button(
+                    ui,
+                    catalog.t("file_tree.new_folder", &[]),
+                    super::context_menu::Icon::Plus,
+                )
+                .clicked()
                     && let Some(parent) = self.creation_parent()
                 {
                     menu_action = Some(MenuAction::NewFolder(parent));
@@ -3879,74 +3751,101 @@ impl FileTreeUi {
                     }
                     // 우클릭 컨텍스트 메뉴 (FT-3) — 행 전체에서 열리게 row_resp에 단다
                     if !inaccessible {
-                        row_resp.context_menu(|ui| {
-                            // 문서 대상은 더블클릭이 문서 탭으로 가로채므로, OS 기본 앱으로
-                            // 여는 예전 길을 메뉴에 남긴다(설계 §3.1, 기존 동작을 빼앗지
-                            // 않는다).
+                        super::context_menu::show(&row_resp, |ui| {
+                            use super::context_menu::{self as menu, Icon};
                             if !row.is_dir
                                 && classify_document_target(&row.path).is_some()
-                                && ui
-                                    .button(catalog.t("file_tree.open_with_os", &[]))
-                                    .clicked()
+                                && menu::button(
+                                    ui,
+                                    catalog.t("file_tree.open_with_os", &[]),
+                                    Icon::File,
+                                )
+                                .clicked()
                             {
                                 menu_action = Some(MenuAction::OpenWithOs(row.path.clone()));
                                 ui.close();
                             }
+                            if menu::button(ui, catalog.t("file_tree.copy_file", &[]), Icon::Copy)
+                                .clicked()
+                            {
+                                menu_action = Some(MenuAction::CopyFile(row.path.clone()));
+                                ui.close();
+                            }
+                            if menu::button(ui, catalog.t("file_tree.rename", &[]), Icon::Edit)
+                                .clicked()
+                            {
+                                menu_action = Some(MenuAction::Rename(row.path.clone()));
+                                ui.close();
+                            }
+                            ui.separator();
                             let new_folder_parent = if row.is_dir {
                                 Some(row.path.clone())
                             } else {
                                 row.path.parent().map(Path::to_path_buf)
                             };
                             if let Some(parent) = new_folder_parent {
-                                let label = if row.is_dir {
-                                    catalog.t("file_tree.new_folder_inside", &[])
+                                let key = if row.is_dir {
+                                    "file_tree.new_folder_inside"
                                 } else {
-                                    catalog.t("file_tree.new_folder_alongside", &[])
+                                    "file_tree.new_folder_alongside"
                                 };
-                                if ui.button(label).clicked() {
+                                if menu::button(ui, catalog.t(key, &[]), Icon::Plus).clicked() {
                                     menu_action = Some(MenuAction::NewFolder(parent));
                                     ui.close();
                                 }
                             }
-                            if ui.button(catalog.t("file_tree.rename", &[])).clicked() {
-                                menu_action = Some(MenuAction::Rename(row.path.clone()));
-                                ui.close();
-                            }
-                            if ui
-                                .button(catalog.t("file_tree.move_to_trash", &[]))
-                                .clicked()
+                            menu::submenu(
+                                ui,
+                                catalog.t("file_tree.menu.path", &[]),
+                                Icon::Folder,
+                                |ui| {
+                                    if menu::button(
+                                        ui,
+                                        catalog.t("file_tree.copy_path", &[]),
+                                        Icon::Copy,
+                                    )
+                                    .clicked()
+                                    {
+                                        menu_action = Some(MenuAction::CopyPath(row.path.clone()));
+                                        ui.close();
+                                    }
+                                    if menu::button(
+                                        ui,
+                                        catalog.t("file_tree.insert_path_terminal", &[]),
+                                        Icon::Terminal,
+                                    )
+                                    .clicked()
+                                    {
+                                        menu_action =
+                                            Some(MenuAction::InsertPath(row.path.clone()));
+                                        ui.close();
+                                    }
+                                    if row.is_dir
+                                        && menu::button(
+                                            ui,
+                                            catalog.t("file_tree.cd_here", &[]),
+                                            Icon::Folder,
+                                        )
+                                        .clicked()
+                                    {
+                                        menu_action = Some(MenuAction::CdPath(row.path.clone()));
+                                        ui.close();
+                                    }
+                                },
+                            );
+                            ui.separator();
+                            if menu::danger_button(
+                                ui,
+                                catalog.t("file_tree.move_to_trash", &[]),
+                                Icon::Trash,
+                            )
+                            .clicked()
                             {
-                                // 삭제 대상은 **이 행**에서 확정한다 — 나중에 경로만
-                                // 보고 이름/종류를 다시 유추하지 않는다(DeleteTarget 주석).
                                 menu_action = Some(MenuAction::Delete(DeleteTarget {
                                     path: row.path.clone(),
                                     label: delete_target_label(self.root.as_deref(), &row.path),
                                     is_dir: row.is_dir,
                                 }));
-                                ui.close();
-                            }
-                            ui.separator();
-                            // 파일 복사(③) — pasteboard 파일 URL로 써서 Finder ⌘V 대상.
-                            if ui.button(catalog.t("file_tree.copy_file", &[])).clicked() {
-                                menu_action = Some(MenuAction::CopyFile(row.path.clone()));
-                                ui.close();
-                            }
-                            if ui.button(catalog.t("file_tree.copy_path", &[])).clicked() {
-                                menu_action = Some(MenuAction::CopyPath(row.path.clone()));
-                                ui.close();
-                            }
-                            if ui
-                                .button(catalog.t("file_tree.insert_path_terminal", &[]))
-                                .clicked()
-                            {
-                                menu_action = Some(MenuAction::InsertPath(row.path.clone()));
-                                ui.close();
-                            }
-                            // 디렉터리만 — 포커스된 터미널에서 이 폴더로 cd (2026-07-08).
-                            if row.is_dir
-                                && ui.button(catalog.t("file_tree.cd_here", &[])).clicked()
-                            {
-                                menu_action = Some(MenuAction::CdPath(row.path.clone()));
                                 ui.close();
                             }
                         });
@@ -5775,7 +5674,7 @@ fn disclosure_chevron_points(center: egui::Pos2, expanded: bool) -> [egui::Pos2;
     }
 }
 
-/// 워크스페이스 행 우클릭 메뉴 — 「세션 열기」와 「이름 바꾸기」(별칭 편집)는 세션이
+/// 워크스페이스 행 우클릭 메뉴 — 「세션 추가」와 「이름 바꾸기」(별칭 편집)는 세션이
 /// 없어도 항상, 「워크스페이스 종료」(세션 일괄 닫기, 선택적 확인은 App)는 닫을
 /// 세션이 있는 비 Idle만.
 fn workspace_context_menu(
@@ -5784,7 +5683,9 @@ fn workspace_context_menu(
     catalog: &i18n::Catalog,
     action: &mut Option<SidebarAction>,
 ) {
-    resp.context_menu(|ui| workspace_context_menu_items(ui, workspace, catalog, action));
+    super::context_menu::show(resp, |ui| {
+        workspace_context_menu_items(ui, workspace, catalog, action)
+    });
 }
 
 /// 메뉴 본문 — 팝업 없이 렌더할 수 있게 분리해 kittest 대상으로 삼는다
@@ -5817,18 +5718,25 @@ fn workspace_context_menu_items(
             .x
     })
     .fold(0.0_f32, f32::max);
-    ui.set_min_width(widest + ui.spacing().button_padding.x * 2.0 + 2.0);
-    if ui.button(open_session_label).clicked() {
+    ui.set_min_width(widest + ui.spacing().button_padding.x * 2.0 + 22.0);
+    if super::context_menu::button(ui, open_session_label, super::context_menu::Icon::Plus)
+        .clicked()
+    {
         *action = Some(SidebarAction::OpenWorkspaceSession(workspace.id.clone()));
         ui.close();
     }
-    if ui.button(rename_label).clicked() {
+    if super::context_menu::button(ui, rename_label, super::context_menu::Icon::Edit).clicked() {
         *action = Some(SidebarAction::RenameWorkspace(workspace.id.clone()));
         ui.close();
     }
-    if workspace.state != SidebarWorkspaceState::Idle && ui.button(close_label).clicked() {
-        *action = Some(SidebarAction::CloseWorkspace(workspace.id.clone()));
-        ui.close();
+    if workspace.state != SidebarWorkspaceState::Idle {
+        ui.separator();
+        if super::context_menu::danger_button(ui, close_label, super::context_menu::Icon::Close)
+            .clicked()
+        {
+            *action = Some(SidebarAction::CloseWorkspace(workspace.id.clone()));
+            ui.close();
+        }
     }
 }
 
@@ -6354,7 +6262,7 @@ fn inactive_workspace_sessions(
                             action = Some(open_beside_action(entry.target.clone()));
                         }
                     }
-                    response.context_menu(|ui| {
+                    super::context_menu::show(&response, |ui| {
                         inactive_session_context_menu_items(
                             ui,
                             workspace,
@@ -6387,19 +6295,19 @@ fn inactive_session_context_menu_items(
     if !can_open_session_beside(active_workspace_id, &entry.target) {
         return;
     }
-    let menu_style = inactive_session_menu_style();
-    ui.set_min_width(menu_style.min_width);
-    let previous_wrap_mode = ui.style().wrap_mode;
-    ui.style_mut().wrap_mode = Some(menu_style.wrap_mode);
-    if ui
-        .button(catalog.t("workspace.menu.open_beside", &[]))
+    super::context_menu::scope(ui, |ui| {
+        if super::context_menu::button(
+            ui,
+            catalog.t("workspace.menu.open_beside", &[]),
+            super::context_menu::Icon::Terminal,
+        )
         .clicked()
-    {
-        debug_assert_eq!(workspace.id, entry.target.workspace_id());
-        *action = Some(open_beside_action(entry.target.clone()));
-        ui.close();
-    }
-    ui.style_mut().wrap_mode = previous_wrap_mode;
+        {
+            debug_assert_eq!(workspace.id, entry.target.workspace_id());
+            *action = Some(open_beside_action(entry.target.clone()));
+            ui.close();
+        }
+    });
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -6410,7 +6318,7 @@ struct InactiveSessionMenuStyle {
 
 fn inactive_session_menu_style() -> InactiveSessionMenuStyle {
     InactiveSessionMenuStyle {
-        min_width: 220.0,
+        min_width: super::context_menu::MIN_WIDTH,
         wrap_mode: egui::TextWrapMode::Extend,
     }
 }
@@ -6420,11 +6328,104 @@ fn live_session_context_menu_items<R>(
     add_items: impl FnOnce(&mut egui::Ui) -> R,
 ) -> egui::InnerResponse<R> {
     let menu_style = inactive_session_menu_style();
-    ui.scope(|ui| {
+    super::context_menu::scope(ui, |ui| {
         ui.set_min_width(menu_style.min_width);
         ui.style_mut().wrap_mode = Some(menu_style.wrap_mode);
         add_items(ui)
     })
+}
+
+fn active_session_context_menu_actions(
+    ui: &mut egui::Ui,
+    entry: &SidebarSessionRow,
+    session: runtime::SessionId,
+    catalog: &i18n::Catalog,
+    action: &mut Option<SidebarAction>,
+) {
+    use super::context_menu::{self as menu, Icon};
+    if menu::button(ui, catalog.t("sidebar.menu.show_diff", &[]), Icon::File).clicked() {
+        *action = Some(SidebarAction::ShowDiff { session });
+        ui.close();
+    }
+    if entry.resumable
+        && menu::button(
+            ui,
+            catalog.t("sidebar.menu.resume_agent", &[]),
+            Icon::Terminal,
+        )
+        .clicked()
+    {
+        *action = Some(SidebarAction::ResumeAgent {
+            workspace_id: entry.target.workspace_id().to_owned(),
+            pane: entry.target.pane().clone(),
+            session,
+            title: entry.title.clone(),
+        });
+        ui.close();
+    }
+    ui.separator();
+    menu::submenu(
+        ui,
+        catalog.t("sidebar.menu.new_session", &[]),
+        Icon::Plus,
+        |ui| {
+            if menu::button(
+                ui,
+                catalog.t("sidebar.menu.new_shell_here", &[]),
+                Icon::Plus,
+            )
+            .clicked()
+            {
+                *action = Some(SidebarAction::NewShellSameFolder { session });
+                ui.close();
+            }
+            if entry.has_cwd
+                && menu::button(
+                    ui,
+                    catalog.t("sidebar.menu.new_worktree_cell", &[]),
+                    Icon::Plus,
+                )
+                .clicked()
+            {
+                *action = Some(SidebarAction::NewWorktreeCell { session });
+                ui.close();
+            }
+        },
+    );
+    menu::submenu(
+        ui,
+        catalog.t("workspace.menu.session_folder", &[]),
+        Icon::Folder,
+        |ui| {
+            if menu::button(ui, catalog.t("sidebar.menu.open_folder", &[]), Icon::Folder).clicked()
+            {
+                *action = Some(SidebarAction::OpenSessionFolder { session });
+                ui.close();
+            }
+            if menu::button(ui, catalog.t("sidebar.menu.copy_path", &[]), Icon::Copy).clicked() {
+                *action = Some(SidebarAction::CopySessionPath { session });
+                ui.close();
+            }
+        },
+    );
+    ui.separator();
+    if entry.in_worktree
+        && menu::danger_button(
+            ui,
+            catalog.t("sidebar.menu.remove_worktree", &[]),
+            Icon::Trash,
+        )
+        .clicked()
+    {
+        *action = Some(SidebarAction::RemoveWorktree { session });
+        ui.close();
+    }
+    if menu::danger_button(ui, catalog.t("sidebar.menu.close_pane", &[]), Icon::Close).clicked() {
+        *action = Some(SidebarAction::ClosePane {
+            pane: entry.target.pane().clone(),
+        });
+        ui.close();
+    }
 }
 
 fn open_beside_action(target: SessionRowTarget) -> SidebarAction {
@@ -14607,7 +14608,7 @@ mod tests {
         );
 
         harness.run();
-        harness.get_by_label("Open session").click();
+        harness.get_by_label("Add session").click();
         harness.run();
 
         assert!(
@@ -14615,7 +14616,7 @@ mod tests {
                 harness.state(),
                 Some(SidebarAction::OpenWorkspaceSession(id)) if id == "ws-session"
             ),
-            "세션 열기 클릭이 대상 워크스페이스 id를 보존하지 않음"
+            "세션 추가 클릭이 대상 워크스페이스 id를 보존하지 않음"
         );
     }
 
@@ -14742,7 +14743,7 @@ mod tests {
         assert!(ctx.text_edit_focused());
     }
 
-    /// Idle(비활성) 워크스페이스 메뉴에도 「세션 열기」와 「이름 바꾸기」는 있고 종료
+    /// Idle(비활성) 워크스페이스 메뉴에도 「세션 추가」와 「이름 바꾸기」는 있고 종료
     /// 항목만 없다 — 닫을 세션이 없다.
     #[test]
     fn kittest_비활성_워크스페이스에는_종료메뉴가_없다() {
@@ -15359,7 +15360,7 @@ mod tests {
         );
 
         harness.run();
-        assert!(harness.state().0 >= 220.0);
+        assert!(harness.state().0 >= super::super::context_menu::MIN_WIDTH);
         assert!(harness.state().1, "menu scope did not use Extend wrapping");
         assert!(
             harness.state().2,
@@ -15399,7 +15400,7 @@ mod tests {
 
         // 그 하나가 컨텍스트 메뉴 안이어야 한다.
         let menu = production
-            .split("resp.context_menu(|ui| {")
+            .split("super::context_menu::show(&resp, |ui| {")
             .nth(1)
             .and_then(|tail| tail.split("} else if resp.clicked()").next())
             .expect("live session context menu");
@@ -15417,7 +15418,7 @@ mod tests {
             .next()
             .expect("production source");
         let context_menu = production
-            .split("resp.context_menu(|ui| {")
+            .split("super::context_menu::show(&resp, |ui| {")
             .nth(1)
             // 경계: 메뉴 블록 다음에 오는 클릭 처리. 예전엔 `if resp.double_clicked()`가
             // 그 자리였는데 더블클릭 이름 변경을 제거하며 사라졌다(2026-08-11).
@@ -15511,7 +15512,7 @@ mod tests {
             None,
         );
         harness.run();
-        let open = harness.get_by_label("Open session").rect();
+        let open = harness.get_by_label("Add session").rect();
         let close = harness.get_by_label("Close workspace sessions").rect();
         let rename = harness.get_by_label("Rename workspace").rect();
         assert!(
@@ -16595,8 +16596,208 @@ mod tests {
     fn inactive_session_menu_keeps_korean_labels_on_one_line() {
         let style = inactive_session_menu_style();
 
-        assert!(style.min_width >= 220.0);
+        assert!((180.0..=205.0).contains(&style.min_width));
         assert_eq!(style.wrap_mode, egui::TextWrapMode::Extend);
+    }
+
+    #[test]
+    fn context_menu_header_right_click_keeps_primary_tabs() {
+        use egui_kittest::kittest::Queryable;
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.root = Some(PathBuf::from("/tree-layout"));
+        tree.children = Some(vec![]);
+        let mut harness = delete_confirm_harness(tree, &catalog);
+        super::super::context_menu_audit::prepare(&harness.ctx);
+        harness.run();
+        let target = harness.get_by_label("파일").rect().center() + egui::vec2(60.0, 0.0);
+        harness.event(egui::Event::PointerMoved(target));
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos: target,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+            harness.step();
+        }
+        harness.run();
+        harness.get_by_label("새 폴더");
+        harness.key_press(egui::Key::Escape);
+        harness.run();
+        harness.get_by_label("메모").click();
+        harness.run();
+        assert_eq!(harness.state().0.selected_tool, SidebarTool::Notes);
+    }
+
+    #[test]
+    #[ignore = "offscreen menu audit PNGs and measured geometry"]
+    fn context_menu_audit_file_tree() {
+        use egui_kittest::kittest::Queryable;
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        let workspaces = vec![SidebarWorkspaceEntry {
+            id: "ws-audit".into(),
+            name: "Audit workspace".into(),
+            state: SidebarWorkspaceState::Active,
+            summary: Default::default(),
+        }];
+        let mut harness = close_menu_harness(&workspaces, "ws-audit", &catalog);
+        super::super::context_menu_audit::prepare(&harness.ctx);
+        assert!(right_click_scan(
+            &mut harness,
+            &catalog.t("sidebar.menu.rename_workspace", &[])
+        ));
+        super::super::context_menu_audit::save(&mut harness, "workspace");
+        drop(harness);
+        let entry = SidebarSessionRow {
+            target: SessionRowTarget::live(
+                "ws-audit",
+                1,
+                runtime::MuxTabId("t1".into()),
+                runtime::MuxPaneId("p1".into()),
+                runtime::SessionId(7),
+            ),
+            title: "Audit session".into(),
+            title_is_custom: false,
+            agent_model: None,
+            status: None,
+            summary: String::new(),
+            focused: true,
+            attention: false,
+            pulse: None,
+            agent_line: None,
+            status_label: None,
+            resumable: false,
+            has_cwd: true,
+            in_worktree: false,
+            status_line: None,
+        };
+        for inactive in [false, true] {
+            let mut action = None;
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(700.0, 500.0))
+                .with_pixels_per_point(2.0)
+                .build_ui(|ui| {
+                    crate::fonts::apply_sidebar_text_styles(ui);
+                    super::super::designall::apply_workspace_visuals(ui);
+                    let response = ui.button("Audit target");
+                    super::super::context_menu::show(&response, |ui| {
+                        if inactive {
+                            inactive_session_context_menu_items(
+                                ui,
+                                &workspaces[0],
+                                "other",
+                                &entry,
+                                &catalog,
+                                &mut action,
+                            );
+                        } else {
+                            live_session_context_menu_items(ui, |ui| {
+                                let _ = super::super::context_menu::button(
+                                    ui,
+                                    catalog.t("workspace.rename_menu", &[]),
+                                    super::super::context_menu::Icon::Edit,
+                                );
+                                active_session_context_menu_actions(
+                                    ui,
+                                    &entry,
+                                    runtime::SessionId(7),
+                                    &catalog,
+                                    &mut action,
+                                );
+                            });
+                        }
+                    });
+                });
+            super::super::context_menu_audit::prepare(&harness.ctx);
+            harness.run();
+            harness.get_by_label("Audit target").click_secondary();
+            harness.run();
+            super::super::context_menu_audit::save(
+                &mut harness,
+                if inactive {
+                    "session-inactive"
+                } else {
+                    "session"
+                },
+            );
+            if !inactive {
+                harness.get_by_label_contains("세션 추가").hover();
+                harness.run();
+                super::super::context_menu_audit::save(&mut harness, "session-new");
+                harness.get_by_label_contains("세션 폴더").hover();
+                harness.run();
+                super::super::context_menu_audit::save(&mut harness, "session-folder");
+            }
+        }
+        for is_dir in [false, true] {
+            let root = PathBuf::from("/tree-layout");
+            let mut node = file(if is_dir { "docs" } else { "audit.md" });
+            node.is_dir = is_dir;
+            let mut tree = FileTreeUi::new(egui::Context::default());
+            tree.root = Some(root);
+            tree.children = Some(vec![node]);
+            tree.rebuild_flat();
+            let mut harness = delete_confirm_harness(tree, &catalog);
+            super::super::context_menu_audit::prepare(&harness.ctx);
+            harness.run();
+            harness
+                .get_by_label(if is_dir { "docs" } else { "audit.md" })
+                .click_secondary();
+            harness.run();
+            super::super::context_menu_audit::save(
+                &mut harness,
+                if is_dir { "folder" } else { "file" },
+            );
+            harness.get_by_label_contains("경로").hover();
+            harness.run();
+            super::super::context_menu_audit::save(
+                &mut harness,
+                if is_dir { "folder-path" } else { "file-path" },
+            );
+            harness.key_press(egui::Key::Escape);
+            harness.run();
+            let target = harness.get_by_label("파일").rect().center() + egui::vec2(60.0, 0.0);
+            harness.event(egui::Event::PointerMoved(target));
+            for pressed in [true, false] {
+                harness.event(egui::Event::PointerButton {
+                    pos: target,
+                    button: egui::PointerButton::Secondary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                });
+                harness.step();
+            }
+            harness.run();
+            if !is_dir {
+                super::super::context_menu_audit::save(&mut harness, "tree-header");
+            }
+        }
+    }
+
+    #[test]
+    fn compact_context_menu_short_session_row_is_narrow_and_scoped() {
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, state: &mut (f32, bool)| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                let menu = live_session_context_menu_items(ui, |ui| {
+                    let _ = ui.button("Close session");
+                });
+                state.0 = menu.response.rect.width();
+                state.1 = ui.wrap_mode() == egui::TextWrapMode::Wrap;
+            },
+            (0.0, false),
+        );
+        harness.run();
+        assert!(
+            harness.state().0 <= 205.0,
+            "short menu is too wide: {}",
+            harness.state().0
+        );
+        assert!(
+            harness.state().1,
+            "menu style leaked into the surrounding UI"
+        );
     }
 
     #[test]

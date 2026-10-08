@@ -2133,6 +2133,7 @@ pub struct WorkspaceUi {
     /// 아무 pane도 포커스하지 않은 프레임에서는 layout의 첫 pane으로 떨어진다 —
     /// 그러지 않으면 탭도 본문도 사라져 레일만 켜진 채 화면이 반응하지 않는다.
     aux_tab_pane: Option<runtime::MuxPaneId>,
+    aux_tab_owner: Option<(runtime::MuxPaneId, Option<SessionId>)>,
     /// 세션별 현재 작업 폴더(App이 매 프레임 set) — 1행 제목 폴더명/프로젝트명 원천.
     session_cwds: std::collections::HashMap<SessionId, String>,
     /// App host가 filesystem 밖에서 미리 계산한 세션별 프로젝트 표시명. cwd를 함께
@@ -3073,6 +3074,7 @@ impl WorkspaceUi {
             workspace_accent: egui::Color32::TRANSPARENT,
             aux_tabs: Vec::new(),
             aux_tab_pane: None,
+            aux_tab_owner: None,
             session_pids: HashMap::new(),
             path_click_cache: None,
             io_generation: 1,
@@ -4907,8 +4909,58 @@ impl WorkspaceUi {
     /// 포커스된 로컬 pane 헤더 옆에 붙일 보조 탭 목록. 비어 있으면 헤더는 예전 그대로다.
     /// 개수 상한은 여기서 자르지 않는다 — App이 문서 탭 개수를 이미 유계로 관리하고,
     /// 좁은 헤더에서의 축약은 `layout_aux_tabs`가 활성 탭을 보존하며 처리한다.
+    #[cfg(test)]
     pub fn set_aux_tabs(&mut self, tabs: Vec<PaneAuxTab>) {
+        let (pane, session) = self.aux_target(self.mux.as_deref());
+        self.set_owned_aux_tabs(pane, session, tabs);
+    }
+
+    pub fn set_owned_aux_tabs(
+        &mut self,
+        pane: Option<runtime::MuxPaneId>,
+        session: Option<SessionId>,
+        tabs: Vec<PaneAuxTab>,
+    ) {
+        self.aux_tab_owner = pane.map(|pane| (pane, session));
         self.aux_tabs = tabs;
+    }
+
+    pub fn aux_target(
+        &self,
+        mux: Option<&MuxSnapshot>,
+    ) -> (Option<runtime::MuxPaneId>, Option<SessionId>) {
+        let Some(mux) = mux else {
+            return (None, None);
+        };
+        if let Some(pending) = self
+            .explicit_pending_focus
+            .as_ref()
+            .or(self.pending_focus.as_ref())
+            && let Some(pane) = mux
+                .tabs
+                .iter()
+                .flat_map(|tab| &tab.panes)
+                .find(|pane| &pane.id == pending)
+        {
+            return (Some(pane.id.clone()), pane.session_id);
+        }
+        let Some(tab) = mux
+            .active_tab
+            .as_ref()
+            .and_then(|id| mux.tabs.iter().find(|tab| &tab.id == id))
+        else {
+            return (None, None);
+        };
+        let pane = aux_tab_owner_pane(
+            &tab.layout,
+            self.pending_focus.as_ref(),
+            mux.focused_pane.as_ref(),
+        );
+        let session = pane
+            .as_ref()
+            .and_then(|id| tab.panes.iter().find(|p| &p.id == id))
+            .and_then(|p| p.session_id);
+        (pane, session)
     }
 
     pub fn set_ui_scale(&mut self, scale: f32) {
@@ -6004,7 +6056,7 @@ impl WorkspaceUi {
             self.reconcile_active_split_drag(ui.ctx(), input_enabled, None);
             // 세션이 없어도 이력 보조 탭은 유효하다 — 탭이 열려 있으면 예전처럼
             // 「새 셸」 프롬프트만 남기고 끝내지 않고 탭 스트립과 본문 rect를 만든다.
-            let output = if !self.aux_tabs.is_empty() {
+            let output = if !self.aux_tabs.is_empty() && self.aux_tab_owner.is_none() {
                 self.show_session_less_aux_tabs(ui, catalog, input_enabled)
             } else if input_enabled {
                 self.show_new_session_prompt(ui, catalog);
@@ -6056,7 +6108,7 @@ impl WorkspaceUi {
             self.reconcile_active_split_drag(ui.ctx(), input_enabled, None);
             // 세션이 없어도 이력 보조 탭은 유효하다 — 탭이 열려 있으면 예전처럼
             // 「새 셸」 프롬프트만 남기고 끝내지 않고 탭 스트립과 본문 rect를 만든다.
-            let output = if !self.aux_tabs.is_empty() {
+            let output = if !self.aux_tabs.is_empty() && self.aux_tab_owner.is_none() {
                 self.show_session_less_aux_tabs(ui, catalog, input_enabled)
             } else if input_enabled {
                 self.show_new_session_prompt(ui, catalog);
@@ -6083,15 +6135,22 @@ impl WorkspaceUi {
         let rect = ui.available_rect_before_wrap();
         let layout = &active_tab.layout;
         let layout_metrics = terminal_layout_metrics(layout);
-        self.aux_tab_pane = (!self.aux_tabs.is_empty())
-            .then(|| {
-                aux_tab_owner_pane(
-                    layout,
-                    self.pending_focus.as_ref(),
-                    mux.focused_pane.as_ref(),
-                )
+        self.aux_tab_pane = self
+            .aux_tab_owner
+            .as_ref()
+            .filter(|(id, session)| {
+                !self.aux_tabs.is_empty()
+                    && active_tab
+                        .panes
+                        .iter()
+                        .any(|p| &p.id == id && &p.session_id == session)
+                    && {
+                        let mut ids = Vec::new();
+                        layout_panes(layout, &mut ids);
+                        ids.contains(&id)
+                    }
             })
-            .flatten();
+            .map(|(id, _)| id.clone());
         let embedded_headers = keeps_embedded_pane_header(layout);
         let tab_id = active_tab.id.clone();
         let mut split_path = Vec::new();
@@ -8018,16 +8077,19 @@ impl WorkspaceUi {
         if mode.is_local() {
             self.pane_context_menu(&output.response, pane_id, config, catalog);
         } else {
-            output.response.context_menu(|ui| {
+            super::context_menu::show(&output.response, |ui| {
                 if let Some((selected, a, b)) = self.selection
                     && selected == session
                 {
                     let text = renderer_egui::selection_text(&snapshot, a.min(b), a.max(b));
                     self.environment_selection_menu(ui, session, &text, catalog);
                 }
-                if ui
-                    .button(catalog.t("workspace.open_environment", &[]))
-                    .clicked()
+                if super::context_menu::button(
+                    ui,
+                    catalog.t("workspace.open_environment", &[]),
+                    super::context_menu::Icon::Settings,
+                )
+                .clicked()
                 {
                     self.open_environment_requested =
                         Some(self.environment_open_request(Some(session), None));
@@ -8512,12 +8574,15 @@ impl WorkspaceUi {
         catalog: &i18n::Catalog,
     ) -> Option<AgentSendChoice> {
         let mut choice: Option<AgentSendChoice> = None;
-        ui.menu_button(title, |ui| {
+        super::context_menu::submenu(ui, title, super::context_menu::Icon::Send, |ui| {
             for (session, execution, agent_line) in targets {
                 ui.label(egui::RichText::new(agent_line).small().weak());
-                if ui
-                    .button(catalog.t("workspace.menu.send_agent.raw", &[]))
-                    .clicked()
+                if super::context_menu::button(
+                    ui,
+                    catalog.t("workspace.menu.send_agent.raw", &[]),
+                    super::context_menu::Icon::Send,
+                )
+                .clicked()
                 {
                     choice = Some((vec![(*session, *execution)], None));
                     ui.close();
@@ -8529,7 +8594,13 @@ impl WorkspaceUi {
                     .iter()
                     .filter(|p| !p.trim().is_empty())
                 {
-                    if ui.button(format!("\"{preset}\"")).clicked() {
+                    if super::context_menu::button(
+                        ui,
+                        format!("\"{preset}\""),
+                        super::context_menu::Icon::Send,
+                    )
+                    .clicked()
+                    {
                         choice = Some((vec![(*session, *execution)], Some(preset.clone())));
                         ui.close();
                     }
@@ -8538,12 +8609,15 @@ impl WorkspaceUi {
             }
             // 대상이 둘 이상일 때만 — 하나뿐이면 개별 전송과 같아 의미가 없다.
             if targets.len() > 1
-                && ui
-                    .button(catalog.t(
+                && super::context_menu::button(
+                    ui,
+                    catalog.t(
                         "workspace.menu.send_agent.all",
                         &[("count", &targets.len().to_string())],
-                    ))
-                    .clicked()
+                    ),
+                    super::context_menu::Icon::Send,
+                )
+                .clicked()
             {
                 choice = Some((
                     targets
@@ -8636,9 +8710,12 @@ impl WorkspaceUi {
         session: SessionId,
         catalog: &i18n::Catalog,
     ) {
-        if ui
-            .button(catalog.t("workspace.menu.copy_last_output", &[]))
-            .clicked()
+        if super::context_menu::button(
+            ui,
+            catalog.t("workspace.menu.copy_last_output", &[]),
+            super::context_menu::Icon::Copy,
+        )
+        .clicked()
         {
             self.last_output_copy_pending.insert(session);
             self.send(RuntimeCommand::ExtractLastOutput { session });
@@ -8809,25 +8886,34 @@ impl WorkspaceUi {
         catalog: &i18n::Catalog,
     ) {
         use super::environment::{EnvironmentPrefill, EnvironmentSelectionKind as K};
-        ui.menu_button(catalog.t("workspace.menu.add_to_environment", &[]), |ui| {
-            for (kind, key) in [
-                (K::ApiName, "workspace.menu.use_as_api_name"),
-                (K::ApiValue, "workspace.menu.use_as_api_value"),
-                (K::VariableName, "workspace.menu.use_as_env_name"),
-                (K::VariableValue, "workspace.menu.use_as_env_value"),
-            ] {
-                if ui
-                    .add_enabled(kind.accepts(text), egui::Button::new(catalog.t(key, &[])))
+        super::context_menu::submenu(
+            ui,
+            catalog.t("workspace.menu.add_to_environment", &[]),
+            super::context_menu::Icon::Settings,
+            |ui| {
+                for (kind, key) in [
+                    (K::ApiName, "workspace.menu.use_as_api_name"),
+                    (K::ApiValue, "workspace.menu.use_as_api_value"),
+                    (K::VariableName, "workspace.menu.use_as_env_name"),
+                    (K::VariableValue, "workspace.menu.use_as_env_value"),
+                ] {
+                    if super::context_menu::enabled_button(
+                        ui,
+                        kind.accepts(text),
+                        catalog.t(key, &[]),
+                        super::context_menu::Icon::Settings,
+                    )
                     .clicked()
-                {
-                    self.open_environment_requested = Some(self.environment_open_request(
-                        Some(session),
-                        EnvironmentPrefill::from_selection(kind, text),
-                    ));
-                    ui.close();
+                    {
+                        self.open_environment_requested = Some(self.environment_open_request(
+                            Some(session),
+                            EnvironmentPrefill::from_selection(kind, text),
+                        ));
+                        ui.close();
+                    }
                 }
-            }
-        });
+            },
+        );
     }
 
     fn pane_context_menu(
@@ -8837,7 +8923,8 @@ impl WorkspaceUi {
         config: &TerminalConfig,
         catalog: &i18n::Catalog,
     ) {
-        resp.context_menu(|ui| {
+        use super::context_menu::{self as menu, Icon};
+        menu::show(resp, |ui| {
             let session = self.mux.as_ref().and_then(|mux| {
                 mux.tabs
                     .iter()
@@ -8845,154 +8932,144 @@ impl WorkspaceUi {
                     .find(|pane| &pane.id == pane_id)
                     .and_then(|pane| pane.session_id)
             });
-            // 선택 텍스트(파일명 드래그)가 열 수 있는 파일이면 "열기" 항목을 맨 위에
-            // (2026-07-14 사용자: 더블클릭 열기는 복사와 겹쳐 우클릭 메뉴로). 메뉴가
-            // 열려 있는 동안만 평가되고, 해석은 resolve_path_cached의 TTL 캐시를 탄다.
-            if let Some(sel_session) = session
-                && let Some((s, a, b)) = self.selection
-                && s == sel_session
-            {
-                let text = self
-                    .sessions
-                    .get(&sel_session)
-                    .and_then(|view| view.snapshot.as_ref())
-                    .map(|snap| renderer_egui::selection_text(snap, a.min(b), a.max(b)));
-                if let Some(text) = text
-                    && !text.trim().is_empty()
-                    && !text.contains('\n')
-                    && let Some(PathClick::OpenFile(path)) =
-                        self.resolve_path_cached(sel_session, text.trim())
-                {
-                    let name = super::path_file_name_display(&path);
-                    if ui
-                        .button(catalog.t("workspace.open_file", &[("name", name.as_str())]))
-                        .clicked()
-                    {
-                        self.request_open_path(path);
-                        ui.close();
-                    }
-                    ui.separator();
+            let selected = session.and_then(|session| {
+                let (selected_session, a, b) = self.selection?;
+                if selected_session != session {
+                    return None;
                 }
-            }
-            // 복사 + 에이전트로 보내기: 선택 텍스트가 있으면 표시
-            // ("열기" 항목의 selection 판별 코드를 재사용).
-            if let Some(sel_session) = session
-                && let Some((s, a, b)) = self.selection
-                && s == sel_session
+                let snapshot = self.sessions.get(&session)?.snapshot.as_ref()?;
+                let text = renderer_egui::selection_text(snapshot, a.min(b), a.max(b));
+                (!text.trim().is_empty()).then_some((session, text))
+            });
+            if let Some((session, text)) = selected.as_ref()
+                && !text.contains('\n')
+                && let Some(PathClick::OpenFile(path)) =
+                    self.resolve_path_cached(*session, text.trim())
             {
-                let text = self
-                    .sessions
-                    .get(&sel_session)
-                    .and_then(|view| view.snapshot.as_ref())
-                    .map(|snap| renderer_egui::selection_text(snap, a.min(b), a.max(b)));
-                if let Some(text) = text
-                    && !text.trim().is_empty()
+                let name = super::path_file_name_display(&path);
+                if menu::button(
+                    ui,
+                    catalog.t("workspace.open_file", &[("name", name.as_str())]),
+                    Icon::File,
+                )
+                .clicked()
                 {
-                    if ui.button(catalog.t("workspace.menu.copy", &[])).clicked() {
-                        ui.ctx().copy_text(text.clone());
-                        ui.close();
-                    }
-                    // 터미널 화면에서 여러 행을 드래그하면 selection_text가 화면 행마다
-                    // 개행을 넣는다. 문서형 명령의 들여쓰기/빈 행/줄 연속 `\`까지 그대로
-                    // 복사하면 다시 붙였을 때 명령이 여러 조각으로 깨지므로, 선택 원문을
-                    // 한 줄 명령으로 정리해 클립보드에 넣는 명시적 복사 동작을 제공한다.
-                    if ui
-                        .button(catalog.t("workspace.menu.copy_trimmed", &[]))
-                        .clicked()
-                    {
-                        ui.ctx().copy_text(clean_terminal_selection_for_copy(&text));
-                        ui.close();
-                    }
-                    // 선택 → 메모에 추가 (PR-4): 선택 원문을 그대로 워크스페이스 메모
-                    // 끝에 붙인다. "복사"와 같은 selection 판별을 재사용하고, 개행
-                    // 처리·상한 판정은 요청만 올려보내 App이 한다(leaf는 storage
-                    // 상수를 못 본다).
-                    if ui
-                        .button(catalog.t("workspace.menu.add_to_note", &[]))
-                        .clicked()
-                    {
-                        self.note_append_request = Some(text.clone());
-                        ui.close();
-                    }
-                    // 선택 → 에이전트로 보내기 (2026-07-17 시나리오 ①): 에러 출력을
-                    // 복사→pane 전환→붙여넣기→타이핑하던 흐름을 우클릭 두 번으로 줄인다.
-                    // 대상은 **실행 중으로 감지된 에이전트 pane**(등록 목록이 아니라
-                    // agent_info) — 없으면 이 메뉴 자체가 안 보인다.
-                    self.send_to_agent_menu(ui, &text, catalog);
-                    self.environment_selection_menu(ui, sel_session, &text, catalog);
+                    self.request_open_path(path);
+                    ui.close();
                 }
+                ui.separator();
             }
-            // 마지막 명령 출력 복사/전송 (셸 통합 2단계) — 드래그 선택 없이도 세션이
-            // 있으면 표시. OSC 133 C~D 마크 범위를 워커에서 추출해 되받는다.
-            if let Some(out_session) = session {
-                self.last_output_menu_items(ui, out_session, catalog);
+            if let Some((_, text)) = selected.as_ref()
+                && menu::button(ui, catalog.t("workspace.menu.copy", &[]), Icon::Copy).clicked()
+            {
+                ui.ctx().copy_text(text.clone());
+                ui.close();
             }
-            // 붙여넣기: 세션이 있으면 항상 표시. 드래그앤드롭 텍스트 붙여넣기(위 dnd_release_payload
-            // 처리)와 동일한 경로(terminal_text_paste_bytes + session_bracketed_paste)로 주입한다.
-            // send()가 WriteInput 공통 지점에서 선택 해제를 처리하므로 별도 clear_selection 불필요.
-            if let Some(paste_session) = session
-                && ui.button(catalog.t("workspace.menu.paste", &[])).clicked()
+            if let Some(session) = session
+                && menu::button(ui, catalog.t("workspace.menu.paste", &[]), Icon::Paste).clicked()
             {
                 self.request_terminal_clipboard(
-                    paste_session,
-                    self.session_bracketed_paste(paste_session),
-                    self.session_shell_kind(paste_session),
+                    session,
+                    self.session_bracketed_paste(session),
+                    self.session_shell_kind(session),
                     None,
                 );
                 ui.close();
             }
-            if ui
-                .button(catalog.t("workspace.split_horizontal", &[]))
-                .clicked()
-            {
-                self.send(RuntimeCommand::SplitPane {
-                    pane: pane_id.clone(),
-                    direction: SplitDirection::Horizontal,
-                    scrollback_lines: config.scrollback_lines as usize,
-                });
-                ui.close();
+            if let Some((session, text)) = selected.as_ref() {
+                menu::submenu(
+                    ui,
+                    catalog.t("workspace.menu.selection", &[]),
+                    Icon::File,
+                    |ui| {
+                        if menu::button(
+                            ui,
+                            catalog.t("workspace.menu.copy_trimmed", &[]),
+                            Icon::Copy,
+                        )
+                        .clicked()
+                        {
+                            ui.ctx().copy_text(clean_terminal_selection_for_copy(text));
+                            ui.close();
+                        }
+                        if menu::button(
+                            ui,
+                            catalog.t("workspace.menu.add_to_note", &[]),
+                            Icon::Edit,
+                        )
+                        .clicked()
+                        {
+                            self.note_append_request = Some(text.clone());
+                            ui.close();
+                        }
+                        self.send_to_agent_menu(ui, text, catalog);
+                        self.environment_selection_menu(ui, *session, text, catalog);
+                    },
+                );
             }
-            if ui
-                .button(catalog.t("workspace.split_vertical", &[]))
-                .clicked()
-            {
-                self.send(RuntimeCommand::SplitPane {
-                    pane: pane_id.clone(),
-                    direction: SplitDirection::Vertical,
-                    scrollback_lines: config.scrollback_lines as usize,
-                });
-                ui.close();
-            }
-            ui.separator();
-            // 스크롤백에서 맨 아래(라이브 화면)로 복귀 — 세션이 있는 pane에서만 노출.
-            if let Some(session) = session
-                && ui
-                    .button(catalog.t("workspace.menu.scroll_bottom", &[]))
-                    .clicked()
-            {
-                self.scroll_session_to_bottom(session);
-                ui.close();
-            }
-            // 세션 폴더 진입 동선 (2026-07-18 사용자): 파일 트리를 이 세션의 현재
-            // 폴더로 이동 / Finder로 열기. cwd 해석·라우팅은 App이 take해 수행한다.
             if let Some(session) = session {
-                self.session_folder_menu_items(ui, session, catalog);
+                self.last_output_menu_items(ui, session, catalog);
+                ui.separator();
             }
-            // (수동 상태 지정 U17b 서브메뉴는 사이드바와 함께 제거 — hook 감지 정착,
-            // 2026-07-17 사용자. wire 명령 SetUserStatusOverride는 계약상 유지.)
-            if ui.button(catalog.t("workspace.close_pane", &[])).clicked() {
-                self.request_close_pane(pane_id.clone());
-                ui.close();
-            }
-            ui.separator();
-            // E4 ⑥: 프로젝트 화면에서 바로 환경변수·API 설정 진입 (에이전트에게 줄
-            // 환경변수를 작업 중 즉시 등록하는 동선 — 사용자 시나리오).
-            if ui
-                .button(catalog.t("workspace.open_environment", &[]))
+            menu::submenu(
+                ui,
+                catalog.t("workspace.menu.split", &[]),
+                Icon::Split,
+                |ui| {
+                    for (key, direction) in [
+                        (
+                            "workspace.menu.split_horizontal",
+                            SplitDirection::Horizontal,
+                        ),
+                        ("workspace.menu.split_vertical", SplitDirection::Vertical),
+                    ] {
+                        if menu::button(ui, catalog.t(key, &[]), Icon::Split).clicked() {
+                            self.send(RuntimeCommand::SplitPane {
+                                pane: pane_id.clone(),
+                                direction,
+                                scrollback_lines: config.scrollback_lines as usize,
+                            });
+                            ui.close();
+                        }
+                    }
+                },
+            );
+            if let Some(session) = session {
+                if menu::button(
+                    ui,
+                    catalog.t("workspace.menu.scroll_bottom", &[]),
+                    Icon::Bottom,
+                )
                 .clicked()
+                {
+                    self.scroll_session_to_bottom(session);
+                    ui.close();
+                }
+                menu::submenu(
+                    ui,
+                    catalog.t("workspace.menu.session_folder", &[]),
+                    Icon::Folder,
+                    |ui| {
+                        self.session_folder_menu_items(ui, session, catalog);
+                    },
+                );
+            }
+            if menu::button(
+                ui,
+                catalog.t("workspace.open_environment", &[]),
+                Icon::Settings,
+            )
+            .clicked()
             {
                 self.open_environment_requested =
                     Some(self.environment_open_request(session, None));
+                ui.close();
+            }
+            ui.separator();
+            if menu::danger_button(ui, catalog.t("workspace.close_pane", &[]), Icon::Close)
+                .clicked()
+            {
+                self.request_close_pane(pane_id.clone());
                 ui.close();
             }
         });
@@ -9042,16 +9119,22 @@ impl WorkspaceUi {
         session: SessionId,
         catalog: &i18n::Catalog,
     ) {
-        if ui
-            .button(catalog.t("workspace.menu.reveal_in_tree", &[]))
-            .clicked()
+        if super::context_menu::button(
+            ui,
+            catalog.t("workspace.menu.reveal_in_tree", &[]),
+            super::context_menu::Icon::Folder,
+        )
+        .clicked()
         {
             self.session_folder_request = Some(SessionFolderRequest::RevealInTree(session));
             ui.close();
         }
-        if ui
-            .button(catalog.t("sidebar.menu.open_folder", &[]))
-            .clicked()
+        if super::context_menu::button(
+            ui,
+            catalog.t("sidebar.menu.open_folder", &[]),
+            super::context_menu::Icon::Folder,
+        )
+        .clicked()
         {
             self.session_folder_request = Some(SessionFolderRequest::OpenInFinder(session));
             ui.close();
@@ -13861,6 +13944,87 @@ mod tests {
         assert!(
             body.top() >= TERMINAL_PANE_HEADER_HEIGHT.min(body.bottom()),
             "본문은 탭 스트립 아래에서 시작해야 한다"
+        );
+    }
+
+    #[test]
+    fn session_aux_tabs_do_not_follow_a_new_session() {
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut ws = WorkspaceUi::new();
+        ws.mux = Some(mux(
+            "a",
+            vec![tab(
+                "a",
+                vec![pane("pa", SessionId(7))],
+                LayoutNode::Pane(pane_id("pa")),
+            )],
+            "pa",
+        ));
+        ws.set_aux_tabs(vec![
+            PaneAuxTab {
+                kind: PaneAuxTabKind::Git,
+                label: "Git".to_owned(),
+                active: false,
+            },
+            PaneAuxTab {
+                kind: PaneAuxTabKind::Document(DocumentTabId(1)),
+                label: "session-a.md".to_owned(),
+                active: true,
+            },
+        ]);
+        let fresh = mux(
+            "b",
+            vec![
+                tab(
+                    "a",
+                    vec![pane("pa", SessionId(7))],
+                    LayoutNode::Pane(pane_id("pa")),
+                ),
+                tab(
+                    "b",
+                    vec![pane("pb", SessionId(9))],
+                    LayoutNode::Pane(pane_id("pb")),
+                ),
+            ],
+            "pb",
+        );
+        let context = egui::Context::default();
+        let mut render = || {
+            let mut output = None;
+            context
+                .run_ui(egui::RawInput::default(), |ui| {
+                    output = Some(ws.show_with_input(
+                        ui,
+                        &TerminalConfig::default(),
+                        &[],
+                        &catalog,
+                        true,
+                    ));
+                })
+                .drop_without_applying_deltas();
+            output.unwrap()
+        };
+        assert!(
+            render().aux_body_rect.is_some(),
+            "A must initially show its document body"
+        );
+
+        ws.mux = Some(fresh);
+        let mut output = None;
+        context
+            .run_ui(egui::RawInput::default(), |ui| {
+                output =
+                    Some(ws.show_with_input(ui, &TerminalConfig::default(), &[], &catalog, true));
+            })
+            .drop_without_applying_deltas();
+        assert!(
+            output.unwrap().aux_body_rect.is_none(),
+            "a new session must not display another session's document body"
+        );
+        assert_ne!(
+            ws.aux_tab_pane.as_ref(),
+            Some(&pane_id("pb")),
+            "Git and document headers must remain owned by A"
         );
     }
 
@@ -20012,6 +20176,147 @@ mod tests {
                 RuntimeCommand::ExtractLastOutput { session } if *session == SessionId(7)
             )
         }));
+    }
+
+    #[test]
+    #[ignore = "offscreen menu audit PNGs and measured geometry"]
+    fn context_menu_audit_workspace() {
+        use egui_kittest::kittest::Queryable;
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        let mut ws = WorkspaceUi::new();
+        ws.mux = Some(mux(
+            "a",
+            vec![tab(
+                "a",
+                vec![pane("pa", SessionId(7))],
+                LayoutNode::Pane(pane_id("pa")),
+            )],
+            "pa",
+        ));
+        ws.sessions.entry(SessionId(7)).or_default().snapshot =
+            Some(shaped_snapshot(48, 1, "선택한 터미널 내용"));
+        ws.selection = Some((SessionId(7), 0, 9));
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(700.0, 500.0))
+            .with_pixels_per_point(2.0)
+            .build_ui_state(
+                |ui, ws: &mut WorkspaceUi| {
+                    super::super::designall::apply_workspace_visuals(ui);
+                    let response = ui.button("Audit target");
+                    ws.pane_context_menu(
+                        &response,
+                        &pane_id("pa"),
+                        &TerminalConfig::default(),
+                        &catalog,
+                    );
+                },
+                ws,
+            );
+        super::super::context_menu_audit::prepare(&harness.ctx);
+        harness.run();
+        harness.get_by_label("Audit target").click_secondary();
+        harness.run();
+        super::super::context_menu_audit::save(&mut harness, "terminal");
+        harness.get_by_label_contains("선택 내용").hover();
+        harness.run();
+        super::super::context_menu_audit::save(&mut harness, "terminal-selection");
+        harness.get_by_label_contains("화면 분할").hover();
+        harness.run();
+        super::super::context_menu_audit::save(&mut harness, "terminal-split");
+        harness.get_by_label_contains("세션 폴더").hover();
+        harness.run();
+        super::super::context_menu_audit::save(&mut harness, "terminal-folder");
+    }
+
+    #[test]
+    fn compact_context_menu_groups_splits_and_keeps_the_clicked_pane() {
+        use egui_kittest::kittest::Queryable;
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut ws = WorkspaceUi::new();
+        ws.mux = Some(mux(
+            "a",
+            vec![tab(
+                "a",
+                vec![pane("pa", SessionId(7)), pane("pb", SessionId(9))],
+                LayoutNode::Split {
+                    direction: SplitDirection::Horizontal,
+                    ratio: 0.5,
+                    first: Box::new(LayoutNode::Pane(pane_id("pa"))),
+                    second: Box::new(LayoutNode::Pane(pane_id("pb"))),
+                },
+            )],
+            "pb",
+        ));
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, ws: &mut WorkspaceUi| {
+                let response = ui.button("Terminal target");
+                ws.pane_context_menu(
+                    &response,
+                    &pane_id("pa"),
+                    &TerminalConfig::default(),
+                    &catalog,
+                );
+            },
+            ws,
+        );
+        harness.run();
+        harness.get_by_label("Terminal target").click_secondary();
+        harness.run();
+        assert!(harness.query_by_label("Split side by side").is_none());
+        harness.get_by_label_contains("Split view").hover();
+        harness.run();
+        harness.get_by_label("Split side by side").click();
+        harness.run();
+        assert!(drain_protocol(harness.state_mut()).iter().any(|command| matches!(
+            command, RuntimeCommand::SplitPane { pane, direction: SplitDirection::Horizontal, .. }
+                if pane == &pane_id("pa")
+        )));
+    }
+
+    #[test]
+    fn compact_context_menu_folder_submenu_retains_session_identity() {
+        use egui_kittest::kittest::Queryable;
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut ws = WorkspaceUi::new();
+        ws.mux = Some(mux(
+            "a",
+            vec![tab(
+                "a",
+                vec![pane("pa", SessionId(7)), pane("pb", SessionId(9))],
+                LayoutNode::Split {
+                    direction: SplitDirection::Horizontal,
+                    ratio: 0.5,
+                    first: Box::new(LayoutNode::Pane(pane_id("pa"))),
+                    second: Box::new(LayoutNode::Pane(pane_id("pb"))),
+                },
+            )],
+            "pb",
+        ));
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, ws: &mut WorkspaceUi| {
+                let response = ui.button("Terminal target");
+                ws.pane_context_menu(
+                    &response,
+                    &pane_id("pa"),
+                    &TerminalConfig::default(),
+                    &catalog,
+                );
+            },
+            ws,
+        );
+        harness.run();
+        harness.get_by_label("Terminal target").click_secondary();
+        harness.run();
+        let folder_label = catalog.t("sidebar.menu.open_folder", &[]);
+        assert!(harness.query_by_label(&folder_label).is_none());
+        harness.get_by_label_contains("Session folder").hover();
+        harness.run();
+        harness.get_by_label(&folder_label).click();
+        harness.run();
+        assert!(matches!(
+            harness.state_mut().take_session_folder_request(),
+            Some(SessionFolderRequest::OpenInFinder(SessionId(7)))
+        ));
     }
 
     #[test]

@@ -1,0 +1,40 @@
+{
+  "font": "Apple SD Gothic Neo (app default)",
+  "font_points": 13.0,
+  "id": "session-new",
+  "image": "context-menu-audit-assets/session-new.png",
+  "image_pixels": [
+    1400,
+    1000
+  ],
+  "pixels_per_point": 2.0,
+  "rect": [
+    249.0,
+    68.0,
+    202.0,
+    49.0
+  ],
+  "row_gap_points": 3.0,
+  "rows": [
+    {
+      "disabled": false,
+      "label": "세션 추가",
+      "rect": [
+        254.0,
+        73.0,
+        192.0,
+        18.0
+      ]
+    },
+    {
+      "disabled": false,
+      "label": "새 워크트리에서 새 세션",
+      "rect": [
+        254.0,
+        94.0,
+        192.0,
+        18.0
+      ]
+    }
+  ]
+}

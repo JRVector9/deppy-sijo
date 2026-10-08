@@ -117,6 +117,7 @@ impl TranscriptViewerUi {
     /// 아직 아무것도 열지 않은 초기 상태인가. App이 이걸로 좌측 목록에서 아무
     /// 카드도 고르지 않은 상태인지 물을 수 있다. 대화가 0건이어도 한 번
     /// 열렸으면(로딩 포함) false다 — "열림"과 "내용 있음"은 별개다.
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         !self.loading && self.conversation.is_none()
     }

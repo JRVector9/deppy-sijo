@@ -566,14 +566,7 @@ fn is_noise_prefix(text: &str) -> bool {
 }
 
 fn clean_agent_summary(text: &str) -> Option<String> {
-    let mut visible = text.trim_start();
-    // 렌더링용 이미지 첨부 표식이 앞에 붙은 메시지는 경로 표식만 걷어낸다.
-    while visible.starts_with("<image ") {
-        visible = visible.split_once('>')?.1.trim_start();
-    }
-    if is_noise_prefix(visible) {
-        return None;
-    }
+    let visible = storage::task_prompt_text(text)?;
 
     let mut summary = String::with_capacity(text.len().min(AGENT_SUMMARY_BYTES));
     let mut summary_chars = 0_usize;
@@ -2529,6 +2522,112 @@ mod tests {
             content.push('\n');
         }
         write_tmp(&format!("read-conversation-{id}.jsonl"), &content)
+    }
+
+    #[test]
+    fn pasted_transport_title_is_unwrapped_before_summary_budget() {
+        let text = "\n\n<pasted_content id=\"e89a\">\n1. 마지막 스타 확인 기간을 관리자에서 설정해. 디폴트는 7일.\n2. 삭제된 레포 후보도 확인해.";
+        let line = serde_json::json!({"type":"user","uuid":"paste-turn","timestamp":"2026-10-08T00:54:10Z","message":{"content":[{"type":"text","text":text}]}}).to_string();
+        let path = write_tmp("paste-transport-title", &line);
+        let state = parse_claude(&path).unwrap();
+        assert!(
+            state
+                .user_instruction
+                .as_deref()
+                .unwrap()
+                .starts_with("1. 마지막 스타")
+        );
+        assert!(!state.recent_turns[0].instruction.contains("pasted_content"));
+        assert_eq!(
+            clean_agent_summary("<pasted_content id='x'>작업 완료</pasted_content>"),
+            Some("작업 완료".into())
+        );
+    }
+
+    #[test]
+    fn pasted_transport_internal_events_do_not_replace_completed_turn() {
+        for internal in [
+            "<task-notification>internal",
+            "<agent-message from='subagent'>internal",
+            "<pasted_content id='x'><task-notification>internal</pasted_content>",
+            "<pasted_content id='x'><agent-message from='subagent'>internal</pasted_content>",
+        ] {
+            for content in [
+                serde_json::json!(internal),
+                serde_json::json!([{"type":"text","text":internal}]),
+            ] {
+                let user = serde_json::json!({"type":"user","uuid":"real-turn","message":{"content":"<pasted_content id='x'>첫 지시</pasted_content>\n추가 지시"}});
+                let assistant = serde_json::json!({"type":"assistant","message":{"stop_reason":"end_turn","content":[{"type":"text","text":"실제 작업 완료"}]}});
+                let synthetic = serde_json::json!({"type":"user","message":{"content":content}});
+                let file = write_tmp(
+                    "paste-transport-internal",
+                    &format!("{user}\n{assistant}\n{synthetic}\n"),
+                );
+                let state = parse_claude(&file).unwrap();
+                assert_eq!(
+                    state.user_instruction.as_deref(),
+                    Some("첫 지시\n추가 지시")
+                );
+                assert_eq!(state.last_agent_summary.as_deref(), Some("실제 작업 완료"));
+                assert_eq!(state.activity, AgentActivity::Idle);
+                assert_eq!(state.recent_turns.len(), 1);
+            }
+        }
+    }
+
+    /// Read-only opt-in check of the exact reported native transcript, without prompt output.
+    #[test]
+    #[ignore = "requires DEPPY_TITLE_TRANSCRIPT pointing to a local Claude JSONL"]
+    fn pasted_transport_real_native_title_projection() {
+        let path = std::path::PathBuf::from(std::env::var("DEPPY_TITLE_TRANSCRIPT").unwrap());
+        let snapshot = tail_snapshot(&path, MAX_TAIL_SNAPSHOT_BYTES).unwrap();
+        let mut pasted_events = 0;
+        for (_, line) in snapshot_lines(&snapshot) {
+            let Ok(value) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            if value.get("type").and_then(Value::as_str) != Some("user") {
+                continue;
+            }
+            let Some(content) = value.pointer("/message/content") else {
+                continue;
+            };
+            let raw = content.as_str().or_else(|| {
+                content
+                    .as_array()?
+                    .iter()
+                    .find_map(|item| item.get("text")?.as_str())
+            });
+            let Some(raw) = raw.filter(|text| text.trim_start().starts_with("<pasted_content"))
+            else {
+                continue;
+            };
+            let expected = clean_agent_summary(raw);
+            assert_eq!(claude_user_instruction(&value), expected);
+            if let Some(title) = expected {
+                assert!(!title.contains("pasted_content"));
+                pasted_events += 1;
+            }
+        }
+        assert!(
+            pasted_events > 0,
+            "reported paste event must be in the bounded snapshot"
+        );
+        let state = parse_claude(&path).unwrap();
+        for title in state
+            .user_instruction
+            .iter()
+            .chain(state.last_agent_summary.iter())
+            .chain(state.recent_turns.iter().map(|turn| &turn.instruction))
+        {
+            assert_eq!(
+                storage::task_prompt_text(title).as_deref(),
+                Some(title.as_str())
+            );
+        }
+        println!(
+            "native title projection: {pasted_events} pasted user events verified; no prompt text emitted"
+        );
     }
 
     #[test]

@@ -1,0 +1,30 @@
+{
+  "font": "Apple SD Gothic Neo (app default)",
+  "font_points": 13.0,
+  "id": "session-inactive",
+  "image": "context-menu-audit-assets/session-inactive.png",
+  "image_pixels": [
+    1400,
+    1000
+  ],
+  "pixels_per_point": 2.0,
+  "rect": [
+    45.0,
+    17.0,
+    202.0,
+    28.0
+  ],
+  "row_gap_points": 3.0,
+  "rows": [
+    {
+      "disabled": false,
+      "label": "옆에 열기",
+      "rect": [
+        50.0,
+        22.0,
+        192.0,
+        18.0
+      ]
+    }
+  ]
+}

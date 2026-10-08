@@ -1,0 +1,30 @@
+{
+  "font": "Apple SD Gothic Neo (app default)",
+  "font_points": 13.0,
+  "id": "tree-header",
+  "image": "context-menu-audit-assets/tree-header.png",
+  "image_pixels": [
+    420,
+    700
+  ],
+  "pixels_per_point": 1.0,
+  "rect": [
+    177.0,
+    140.0,
+    202.0,
+    28.0
+  ],
+  "row_gap_points": 3.0,
+  "rows": [
+    {
+      "disabled": false,
+      "label": "새 폴더",
+      "rect": [
+        182.0,
+        145.0,
+        192.0,
+        18.0
+      ]
+    }
+  ]
+}

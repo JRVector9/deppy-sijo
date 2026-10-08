@@ -1,0 +1,8 @@
+<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>이력 시안 적용 결과</title>
+<style>:root{color-scheme:dark;font:14px/1.6 -apple-system,BlinkMacSystemFont,sans-serif;background:#111418;color:#dce0e6}body{margin:24px auto;max-width:1180px;padding:0 20px}h1{font-size:24px}h2{font-size:17px;margin-top:28px}p{color:#a5afbc}a{color:#7ed4e3}img{max-width:100%;height:auto;border:1px solid #303640}.narrow{display:flex;gap:24px;flex-wrap:wrap}.narrow figure{margin:0;max-width:390px}figcaption{padding:8px 0;color:#a5afbc}code{color:#afdfbe}</style>
+<h1>이력 시안 적용 결과</h1><p><a href="work-history-proposal-2026-10-08.html">승인한 HTML 시안</a>을 실제 egui 이력 탭에 적용했습니다. 아래는 제품 렌더러를 격리 테스트에서 실행한 화면입니다. 예시 데이터이며 실행 중 앱이나 PWA 실기기 캡처는 아닙니다.</p>
+<p>날짜별 68pt 목록 · 시작 시각 최신순 · 선택한 지시/결과와 원문 상세 · 세션/기간/상태/에이전트 검색 · 내부 스크롤 · 좁은 화면의 목록↔상세 전환. 스타일은 앱의 공통 테마와 기본 글꼴을 따릅니다.</p>
+<h2>데스크톱 · 1100 × 720pt</h2><img src="work-history-applied-assets/desktop.png" alt="날짜별 목록과 우측 상세, 공통 필터와 마지막 저장 상태">
+<h2>좁은 화면 · 390 × 720pt</h2><div class="narrow"><figure><img src="work-history-applied-assets/narrow-list.png" alt="여러 줄 필터가 모두 보이는 좁은 이력 목록"><figcaption>목록 · 필터를 행으로 나눠 잘림 방지</figcaption></figure><figure><img src="work-history-applied-assets/narrow-detail.png" alt="뒤로 버튼과 지시, 결과가 보이는 좁은 상세"><figcaption>선택한 상세 · 목록으로 돌아가기</figcaption></figure></div>
+<p>공유 대화는 고유한 pane 지시와 정확히 일치하는 턴만 수집합니다. 출처를 증명할 수 없는 턴은 계속 차단하며, 오래된 실행/대기 상태는 현재 상태를 확인한 것으로 표시하지 않습니다. Git은 작업 시점 변경량과 구분해 ‘현재 Git 보기’로 연결합니다.</p>
+<p>검증 명령: <code>cargo test -p deppy-sijo approved_history</code> 및 opt-in <code>approved_history_render_evidence -- --ignored</code>. 이번 작업은 소스 적용과 테스트 단계입니다.</p></html>

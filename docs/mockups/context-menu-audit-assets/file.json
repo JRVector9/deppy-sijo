@@ -1,0 +1,80 @@
+{
+  "font": "Apple SD Gothic Neo (app default)",
+  "font_points": 13.0,
+  "id": "file",
+  "image": "context-menu-audit-assets/file.png",
+  "image_pixels": [
+    420,
+    700
+  ],
+  "pixels_per_point": 1.0,
+  "rect": [
+    166.0,
+    203.0,
+    202.0,
+    151.0
+  ],
+  "row_gap_points": 3.0,
+  "rows": [
+    {
+      "disabled": false,
+      "label": "OS 기본 앱으로 열기",
+      "rect": [
+        171.0,
+        208.0,
+        192.0,
+        18.0
+      ]
+    },
+    {
+      "disabled": false,
+      "label": "복사",
+      "rect": [
+        171.0,
+        229.0,
+        192.0,
+        18.0
+      ]
+    },
+    {
+      "disabled": false,
+      "label": "이름 변경",
+      "rect": [
+        171.0,
+        250.0,
+        192.0,
+        18.0
+      ]
+    },
+    {
+      "disabled": false,
+      "label": "새 폴더 (같은 위치)",
+      "rect": [
+        171.0,
+        280.0,
+        192.0,
+        18.0
+      ]
+    },
+    {
+      "disabled": false,
+      "label": "경로 ⏵",
+      "rect": [
+        171.0,
+        301.0,
+        192.0,
+        18.0
+      ]
+    },
+    {
+      "disabled": false,
+      "label": "휴지통으로 이동",
+      "rect": [
+        171.0,
+        331.0,
+        192.0,
+        18.0
+      ]
+    }
+  ]
+}

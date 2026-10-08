@@ -1,0 +1,40 @@
+{
+  "font": "Apple SD Gothic Neo (app default)",
+  "font_points": 13.0,
+  "id": "terminal-folder",
+  "image": "context-menu-audit-assets/terminal-folder.png",
+  "image_pixels": [
+    1400,
+    1000
+  ],
+  "pixels_per_point": 2.0,
+  "rect": [
+    249.0,
+    152.0,
+    202.0,
+    49.0
+  ],
+  "row_gap_points": 3.0,
+  "rows": [
+    {
+      "disabled": false,
+      "label": "파일 트리를 이 폴더로 이동",
+      "rect": [
+        254.0,
+        157.0,
+        192.0,
+        18.0
+      ]
+    },
+    {
+      "disabled": false,
+      "label": "Finder에서 폴더 열기",
+      "rect": [
+        254.0,
+        178.0,
+        192.0,
+        18.0
+      ]
+    }
+  ]
+}

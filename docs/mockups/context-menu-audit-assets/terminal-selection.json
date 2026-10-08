@@ -1,0 +1,50 @@
+{
+  "font": "Apple SD Gothic Neo (app default)",
+  "font_points": 13.0,
+  "id": "terminal-selection",
+  "image": "context-menu-audit-assets/terminal-selection.png",
+  "image_pixels": [
+    1400,
+    1000
+  ],
+  "pixels_per_point": 2.0,
+  "rect": [
+    249.0,
+    59.0,
+    202.0,
+    70.0
+  ],
+  "row_gap_points": 3.0,
+  "rows": [
+    {
+      "disabled": false,
+      "label": "공백 정리 후 복사하기",
+      "rect": [
+        254.0,
+        64.0,
+        192.0,
+        18.0
+      ]
+    },
+    {
+      "disabled": false,
+      "label": "메모에 추가",
+      "rect": [
+        254.0,
+        85.0,
+        192.0,
+        18.0
+      ]
+    },
+    {
+      "disabled": false,
+      "label": "환경·API에 넣기 ⏵",
+      "rect": [
+        254.0,
+        106.0,
+        192.0,
+        18.0
+      ]
+    }
+  ]
+}

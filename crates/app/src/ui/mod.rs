@@ -9,6 +9,9 @@ pub mod aux_search;
 pub mod clipboard_image;
 pub(crate) mod cloud_answer;
 pub mod composer;
+pub(crate) mod context_menu;
+#[cfg(test)]
+pub(crate) mod context_menu_audit;
 pub mod credentials;
 pub(crate) mod cross_workspace;
 pub mod designall;

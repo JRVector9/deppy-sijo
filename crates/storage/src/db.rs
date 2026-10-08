@@ -69,37 +69,7 @@ pub struct Db {
     authorization_db_identity: String,
 }
 
-/// Whether a Claude message describes user work rather than an internal event.
-/// Shared with transcript parsing and used when reading already-polluted hook rows.
-pub fn task_prompt_is_displayable(prompt: &str) -> bool {
-    let prompt = prompt.trim_start();
-    let agent_envelope = |text: &str| {
-        text.strip_prefix("<agent-message").is_some_and(|rest| {
-            rest.chars()
-                .next()
-                .is_some_and(|ch| ch == '>' || ch.is_ascii_whitespace())
-        })
-    };
-    let relayed_agent_envelope = prompt
-        .strip_prefix("Another Claude session sent a message:")
-        .is_some_and(|rest| agent_envelope(rest.trim_start()));
-    !prompt.is_empty()
-        && !agent_envelope(prompt)
-        && !relayed_agent_envelope
-        && !prompt.starts_with("[Subagent hand-back]")
-        && ![
-            "<task-notification",
-            "<system-reminder",
-            "<local-command",
-            "<command-name",
-            "<environment_context",
-            "<permissions",
-            "<INSTRUCTIONS",
-            "<heartbeat",
-        ]
-        .iter()
-        .any(|prefix| prompt.starts_with(prefix))
-}
+pub use crate::task_prompt::{task_prompt_is_displayable, task_prompt_text};
 
 /// Durable, process-independent Connector configuration identity. SQLite stores revisions as a
 /// positive signed INTEGER; the public type prevents accidental arithmetic outside storage.
@@ -7672,20 +7642,22 @@ impl Db {
     ) -> anyhow::Result<()> {
         bounded_session_key_prefix(session_key)?;
         anyhow::ensure!(
-            bounded_id_is_valid(agent_session_id)
-                && !prompt.is_empty()
-                && bounded_text_is_valid(prompt, 256),
+            bounded_id_is_valid(agent_session_id) && !prompt.is_empty(),
             BOUNDED_WRITE_INPUT_INVALID
         );
-        // Claude can emit an internal UserPromptSubmit (for example task-notification).
-        // It must not replace the pane's last actual user task.
-        if !task_prompt_is_displayable(prompt) {
+        // Normalize transport metadata before applying the existing 256-byte title budget.
+        // Wrapped internal events must leave the previous pane task intact.
+        let Some(prompt) = task_prompt_text(prompt) else {
             return Ok(());
-        }
+        };
+        anyhow::ensure!(
+            bounded_text_is_valid(prompt.as_ref(), 256),
+            BOUNDED_WRITE_INPUT_INVALID
+        );
         self.conn.execute(
             "UPDATE agent_hook_sessions SET task_prompt = ?3
              WHERE session_key = ?1 AND kind = 'claude' AND agent_session_id = ?2",
-            rusqlite::params![session_key, agent_session_id, prompt],
+            rusqlite::params![session_key, agent_session_id, prompt.as_ref()],
         )?;
         Ok(())
     }
@@ -15304,6 +15276,54 @@ mod tests {
             .unwrap();
         assert_eq!(first_row.agent_session_id, "forked");
         assert_eq!(first_row.task_prompt, None);
+    }
+
+    #[test]
+    fn pasted_transport_hook_stores_human_task_and_rejects_wrapped_internal_events() {
+        let db = Db::open_in_memory().unwrap();
+        let workspace = db.create_workspace("paste-hook").unwrap();
+        let key = format!("{workspace}:1");
+        db.upsert_hook_session(&key, "claude", "native", "/tmp/native.jsonl")
+            .unwrap();
+        db.record_hook_task_prompt(
+            &key,
+            "native",
+            "<pasted_content id=\"e89a\">실제 작업을 고쳐",
+        )
+        .unwrap();
+        assert_eq!(
+            db.list_hook_sessions().unwrap()[0].task_prompt.as_deref(),
+            Some("실제 작업을 고쳐")
+        );
+        db.record_hook_task_prompt(
+            &key,
+            "native",
+            "<pasted_content id='x'>첫 지시</pasted_content>\n추가 지시",
+        )
+        .unwrap();
+        assert_eq!(
+            db.list_hook_sessions().unwrap()[0].task_prompt.as_deref(),
+            Some("첫 지시\n추가 지시")
+        );
+        // Transport bytes must not consume the human title budget.
+        let wrapped = format!("<pasted_content id='{}'>실제 작업을 고쳐", "x".repeat(240));
+        assert!(wrapped.len() > 256);
+        db.record_hook_task_prompt(&key, "native", &wrapped)
+            .unwrap();
+        for internal in [
+            "<task-notification>internal",
+            "<agent-message from='subagent'>internal",
+            "<pasted_content id='x'><agent-message from='subagent'>internal</agent-message></pasted_content>",
+            "<pasted_content id='x'><task-notification>internal</task-notification></pasted_content>",
+        ] {
+            assert!(!task_prompt_is_displayable(internal));
+            db.record_hook_task_prompt(&key, "native", internal)
+                .unwrap();
+            assert_eq!(
+                db.list_hook_sessions().unwrap()[0].task_prompt.as_deref(),
+                Some("실제 작업을 고쳐")
+            );
+        }
     }
 
     #[test]

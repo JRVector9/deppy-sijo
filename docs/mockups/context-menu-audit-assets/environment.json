@@ -1,0 +1,50 @@
+{
+  "font": "Apple SD Gothic Neo (app default)",
+  "font_points": 13.0,
+  "id": "environment",
+  "image": "context-menu-audit-assets/environment.png",
+  "image_pixels": [
+    1400,
+    1000
+  ],
+  "pixels_per_point": 2.0,
+  "rect": [
+    220.0,
+    57.0,
+    220.28125,
+    79.0
+  ],
+  "row_gap_points": 3.0,
+  "rows": [
+    {
+      "disabled": false,
+      "label": "폴더 선택",
+      "rect": [
+        225.0,
+        62.0,
+        210.28125,
+        18.0
+      ]
+    },
+    {
+      "disabled": false,
+      "label": "프로젝트 env 다시 탐색(.env 재스캔)",
+      "rect": [
+        225.0,
+        83.0,
+        210.28125,
+        18.0
+      ]
+    },
+    {
+      "disabled": false,
+      "label": "해제",
+      "rect": [
+        225.0,
+        113.0,
+        210.28125,
+        18.0
+      ]
+    }
+  ]
+}

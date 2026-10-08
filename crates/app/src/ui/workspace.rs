@@ -465,6 +465,8 @@ fn workspace_protocol_command_is_valid(
 /// pane 헤더(세션·문서 탭 줄)의 높이. 29 → 27pt (2026-10-05 사용자 요청).
 /// 전체 앱 제목바와 별도로 탭 줄의 2pt를 본문에 돌려준다.
 const TERMINAL_PANE_HEADER_HEIGHT: f32 = 27.0;
+const PANE_HEADER_TAB_INACTIVE_ALPHA: f32 = 0.24;
+const PANE_HEADER_TAB_HOVER_ALPHA: f32 = 0.36;
 /// 각 terminal leaf가 분할 축에서 유지하는 최소 logical pixel 크기.
 /// 좌/우 분할에는 너비, 상/하 분할에는 높이로 적용한다.
 const TERMINAL_PANE_MIN_SIZE: f32 = 50.0;
@@ -1340,60 +1342,51 @@ fn paint_tab_label(
     );
 }
 
-/// 헤더 바탕 — 배경, 선택 탭 위의 accent 상단선, 하단 separator.
-///
-/// `accent_range`가 없으면 상단선을 그리지 않는다(비포커스 pane).
-fn paint_pane_header_base(
-    ui: &egui::Ui,
-    header: egui::Rect,
-    style: PaneHeaderStyle,
-    accent_range: Option<egui::Rangef>,
-) {
+/// 헤더 바탕. 선은 각 탭이 자기 상단·우측에만 그린다.
+fn paint_pane_header_base(ui: &egui::Ui, header: egui::Rect, style: PaneHeaderStyle) {
     ui.painter().rect_filled(header, 0.0, style.background);
     if let Some(selection_fill) = style.selection_fill {
         ui.painter().rect_filled(header, 0.0, selection_fill);
-    }
-    if let (Some(active_stroke), Some(range)) = (style.active_stroke, accent_range) {
-        // round_to_pixel_center는 문서가 밝히듯 **홀수 물리픽셀 폭**용이다. 이 선은
-        // 1.0 **포인트**라 Retina에서 2 물리픽셀(짝수)이므로, 픽셀 중심에 맞추면
-        // 양끝이 반 픽셀씩 걸쳐 뭉개지고 header.top()이 소수일 땐 헤더 첫 행이 아예
-        // 비어 1px 여백으로 보인다(2026-08-07 사용자).
-        //
-        // 짝수 폭은 **경계**에 맞춰야 한다 — 헤더 상단을 픽셀 격자에 스냅한 뒤
-        // half-width를 더하면 선이 첫 행부터 정확히 덮는다.
-        let top_y = pane_header_top_line_y(
-            header.top(),
-            active_stroke.width,
-            ui.ctx().pixels_per_point(),
-        );
-        let range = egui::Rangef::new(
-            range.min,
-            crate::ui::snap_line_to_pixel(
-                range.max,
-                active_stroke.width,
-                ui.ctx().pixels_per_point(),
-            ),
-        );
-        ui.painter().hline(range, top_y, active_stroke);
     }
     // 헤더와 본문 사이 하단 구분선은 긋지 않는다 — 탭 면과 터미널이 한 덩어리로
     // 이어져 보여야 한다(2026-08-22 사용자 요청).
 }
 
-/// 두 탭 사이 세로 헤어라인 — 같은 배경을 쓰는 두 영역의 경계를 읽히게 한다.
-fn paint_tab_divider(ui: &egui::Ui, header: egui::Rect, x: f32, style: PaneHeaderStyle) {
-    if x <= header.left() || x >= header.right() {
+/// 탭마다 상단·우측 두 선만 소유한다. 인접 탭은 좌측선을 겹쳐 그리지 않는다.
+fn paint_tab_lines(
+    ui: &egui::Ui,
+    header: egui::Rect,
+    tab: egui::Rect,
+    mut stroke: egui::Stroke,
+    selected: bool,
+) {
+    let tab = tab.intersect(header);
+    if tab.width() <= 0.0 || tab.height() <= 0.0 {
         return;
     }
-    let stroke = style.line_stroke(ui.visuals());
-    ui.painter().vline(
-        crate::ui::snap_line_to_pixel(x, stroke.width, ui.ctx().pixels_per_point()),
-        egui::Rangef::new(
-            pane_header_top_line_y(header.top(), stroke.width, ui.ctx().pixels_per_point()),
-            header.bottom(),
-        ),
-        stroke,
+    let alpha = if selected {
+        1.0
+    } else if ui.rect_contains_pointer(tab) {
+        PANE_HEADER_TAB_HOVER_ALPHA
+    } else {
+        PANE_HEADER_TAB_INACTIVE_ALPHA
+    };
+    stroke.color = stroke.color.gamma_multiply(alpha);
+    let ppp = ui.ctx().pixels_per_point();
+    let top = pane_header_top_line_y(tab.top(), stroke.width, ppp);
+    let right = crate::ui::snap_line_to_pixel(
+        tab.right().min(header.right() - stroke.width * 0.5),
+        stroke.width,
+        ppp,
     );
+    if right <= tab.left() {
+        return;
+    }
+    let painter = ui
+        .painter()
+        .with_clip_rect(header.intersect(ui.clip_rect()));
+    painter.hline(egui::Rangef::new(tab.left(), right), top, stroke);
+    painter.vline(right, egui::Rangef::new(top, tab.bottom()), stroke);
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -6485,15 +6478,7 @@ impl WorkspaceUi {
             .rect_filled(header, 0.0, identity_style.header_fill);
         // 하단 구분선 없음 — 일반 pane 헤더와 같은 규칙(2026-08-22).
         if identity_style.top_line.color != egui::Color32::TRANSPARENT {
-            ui.painter().hline(
-                header.x_range(),
-                pane_header_top_line_y(
-                    header.top(),
-                    identity_style.top_line.width,
-                    ui.ctx().pixels_per_point(),
-                ),
-                identity_style.top_line,
-            );
+            paint_tab_lines(ui, header, header, identity_style.top_line, true);
         }
 
         let reorder_requested = header_context.and_then(|header_context| {
@@ -6635,22 +6620,19 @@ impl WorkspaceUi {
         let any_active = active_kind.is_some();
 
         let style = pane_header_style(self.workspace_accent, true);
-        let accent_range = Some(match placements.iter().find(|p| p.active) {
-            Some(placement) => egui::Rangef::new(
-                placement.geometry.tab.left(),
-                placement.geometry.tab.right().min(header.right()),
-            ),
-            None => egui::Rangef::new(
-                header.left(),
-                pane_header_active_boundary(header, pseudo_close),
-            ),
-        });
-        paint_pane_header_base(ui, header, style, accent_range);
-        paint_tab_divider(
+        paint_pane_header_base(ui, header, style);
+        paint_tab_lines(
             ui,
             header,
-            pane_header_active_boundary(header, pseudo_close),
-            style,
+            egui::Rect::from_min_max(
+                header.min,
+                egui::pos2(
+                    pane_header_active_boundary(header, pseudo_close),
+                    header.bottom(),
+                ),
+            ),
+            style.line_stroke(ui.visuals()),
+            !any_aux_tab_active(&self.aux_tabs),
         );
 
         let empty_clip = egui::Rect::from_min_max(
@@ -6704,7 +6686,7 @@ impl WorkspaceUi {
                 catalog,
                 &font,
                 placement.kind,
-                style.line_stroke(ui.visuals()).color,
+                style,
             ) {
                 output.aux_tab_intent = Some((placement.kind, intent));
             }
@@ -6872,21 +6854,16 @@ impl WorkspaceUi {
         let aux_active = any_aux_tab_active(&aux_tabs);
         let tokens = crate::ui::designall::tokens(ui.visuals());
         let style = pane_header_style(self.workspace_accent, focused);
-        // 상단 accent는 **선택된 탭**만 덮는다. 보조 탭이 붙으면 이 선의 범위가 곧
-        // 탭 선택 표시라, 별도 선택 위젯을 새로 만들지 않고 같은 chrome을 나눠 쓴다.
-        let accent_range = Some(match placements.iter().find(|p| p.active) {
-            Some(placement) => egui::Rangef::new(
-                placement.geometry.tab.left(),
-                placement.geometry.tab.right().min(header.right()),
-            ),
-            None => egui::Rangef::new(header.left(), pane_header_active_boundary(header, close)),
-        });
-        paint_pane_header_base(ui, header, style, accent_range);
-        paint_tab_divider(
+        paint_pane_header_base(ui, header, style);
+        paint_tab_lines(
             ui,
             header,
-            pane_header_active_boundary(header, close),
-            style,
+            egui::Rect::from_min_max(
+                header.min,
+                egui::pos2(pane_header_active_boundary(header, close), header.bottom()),
+            ),
+            style.line_stroke(ui.visuals()),
+            !aux_active,
         );
 
         let header_response = ui.interact(
@@ -7068,7 +7045,7 @@ impl WorkspaceUi {
                 catalog,
                 &font,
                 placement.kind,
-                style.line_stroke(ui.visuals()).color,
+                style,
             ) {
                 output.aux_tab_intent = Some((placement.kind, intent));
             }
@@ -7091,13 +7068,20 @@ impl WorkspaceUi {
         catalog: &i18n::Catalog,
         font: &egui::FontId,
         kind: PaneAuxTabKind,
-        hover_color: egui::Color32,
+        style: PaneHeaderStyle,
     ) -> Option<PaneAuxTabIntent> {
         let tokens = crate::ui::designall::tokens(ui.visuals());
         let mut intent = None;
         let tab_response = ui.interact(geometry.tab, id.with("tab"), egui::Sense::click());
+        paint_tab_lines(
+            ui,
+            header,
+            geometry.tab,
+            style.line_stroke(ui.visuals()),
+            active,
+        );
         let label_color = if ui.rect_contains_pointer(tab_response.rect) {
-            hover_color
+            style.line_stroke(ui.visuals()).color
         } else if active {
             tokens.text
         } else {
@@ -17434,21 +17418,23 @@ mod tests {
                 harness.run();
                 let (normal_session, session_rect) = painted_tab_text(harness.output(), "p");
                 let (normal_aux, aux_rect) = painted_tab_text(harness.output(), "History");
+                let selected_rect = if aux_active { aux_rect } else { session_rect };
                 let line_color = harness
                     .output()
                     .shapes
                     .iter()
                     .find_map(|shape| {
                         if let egui::Shape::LineSegment { points, stroke } = &shape.shape
-                            && points[0].x == points[1].x
-                            && points[0].y < points[1].y
+                            && points[0].y == points[1].y
+                            && points[0].x <= selected_rect.center().x
+                            && points[1].x >= selected_rect.center().x
                         {
                             Some(stroke.color)
                         } else {
                             None
                         }
                     })
-                    .expect("session tab divider must be painted");
+                    .expect("selected tab top line must be painted");
                 assert_ne!(normal_session, line_color);
                 assert_ne!(normal_aux, line_color);
 
@@ -17506,6 +17492,7 @@ mod tests {
             workspace,
         );
         harness.run();
+        let selected_rect = painted_tab_text(harness.output(), "History").1;
         let line_color = harness
             .output()
             .shapes
@@ -17514,6 +17501,8 @@ mod tests {
                 if let egui::Shape::LineSegment { points, stroke } = &shape.shape
                     && points[1].x > points[0].x
                     && points[0].y == points[1].y
+                    && points[0].x <= selected_rect.center().x
+                    && points[1].x >= selected_rect.center().x
                 {
                     Some(stroke.color)
                 } else {

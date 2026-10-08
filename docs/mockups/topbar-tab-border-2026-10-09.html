@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Deppy · 탭바 라인 규칙 시안</title>
+<style>
+:root {
+  color-scheme: dark;
+  --page: #171b21;
+  --surface: #0b0e12;
+  --text: #d8dce3;
+  --muted: #89919e;
+  --accent: #b8798c;
+  --tab-height: 27px;
+  --tab-font-size: 13px;
+  --tab-line-width: 1px;
+  --tab-line-active-alpha: 1;
+  --tab-line-inactive-alpha: .24;
+  --tab-line-hover-alpha: .36;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--page); color: var(--text); font: 14px/1.65 -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Noto Sans KR", sans-serif; }
+button, select { font: inherit; }
+button { cursor: pointer; }
+main { max-width: 1180px; margin: 0 auto; padding: 40px 30px 64px; }
+.eyebrow { margin: 0 0 7px; color: var(--accent); font-size: 12px; letter-spacing: .08em; }
+h1 { margin: 0; font-size: 26px; font-weight: 600; letter-spacing: -.6px; }
+.intro { margin: 10px 0 28px; color: var(--muted); }
+.section-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin: 26px 0 10px; }
+h2 { margin: 0; font-size: 15px; font-weight: 600; }
+.subtle { color: var(--muted); font-size: 12px; }
+.toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.toolbar button, .toolbar select { color: #b7bfcc; background: #222730; border: 1px solid #373e49; border-radius: 4px; padding: 4px 9px; font-size: 12px; }
+.toolbar button[aria-pressed="true"] { color: var(--text); border-color: var(--accent); }
+.toolbar button:focus-visible, .toolbar select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.preview { background: var(--surface); border: 1px solid #303640; overflow: hidden; }
+.zoom-space { --zoom: 2; height: calc(var(--tab-height) * var(--zoom)); overflow-x: auto; overflow-y: hidden; scrollbar-width: none; }
+.zoom-space::-webkit-scrollbar { display: none; }
+.scaled-strip { transform: scale(var(--zoom)); transform-origin: top left; width: calc(100% / var(--zoom)); min-width: 560px; }
+.tab-strip { display: flex; height: var(--tab-height); align-items: stretch; background: var(--surface); }
+.tab {
+  --line-alpha: var(--tab-line-inactive-alpha);
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 9px;
+  flex: 0 0 auto;
+  min-width: 0;
+  height: var(--tab-height);
+  background: var(--surface);
+  color: var(--muted);
+  font-size: var(--tab-font-size);
+  line-height: 1;
+  white-space: nowrap;
+  user-select: none;
+  cursor: pointer;
+}
+/* Every tab owns exactly two lines. Adjacent tabs never draw a left edge. */
+.tab::before, .tab::after { content: ""; position: absolute; pointer-events: none; background: var(--accent); opacity: var(--line-alpha); }
+.tab::before { left: 0; right: 0; top: 0; height: var(--tab-line-width); }
+.tab::after { top: 0; bottom: 0; right: 0; width: var(--tab-line-width); }
+.tab[data-kind="session"] { width: 240px; }
+.tab[data-kind="history"] { width: 74px; }
+.tab[data-kind="git"] { width: 68px; }
+.tab[data-kind="document"] { width: 128px; }
+.tab[data-selected="true"] { --line-alpha: var(--tab-line-active-alpha); color: var(--text); }
+.tab:hover { --line-alpha: var(--tab-line-hover-alpha); }
+.tab[data-selected="true"]:hover { --line-alpha: var(--tab-line-active-alpha); }
+.tab:hover .tab-label { color: var(--accent); }
+.tab-label { overflow: hidden; text-overflow: ellipsis; min-width: 0; flex: 1; }
+.tab-icon { font-size: 12px; color: inherit; flex: 0 0 auto; }
+.tab-close { position: relative; flex: 0 0 16px; width: 16px; height: 22px; padding: 0; border: 0; background: transparent; color: var(--muted); }
+.tab-close::before, .tab-close::after { content: ""; position: absolute; top: 10.5px; left: 3.5px; width: 9px; height: 1.5px; border-radius: .5px; background: currentColor; transform: rotate(45deg); }
+.tab-close::after { transform: rotate(-45deg); }
+.tab-close:hover { color: var(--text); }
+.tab[data-kind="session"] .tab-close:hover { color: #e28d8d; }
+.tab:focus-visible, .tab-close:focus-visible { outline: 1px dashed var(--accent); outline-offset: -4px; }
+.tab-blank { flex: 1; min-width: 20px; }
+.preview-body { min-height: 132px; padding: 24px; border: 0; }
+.body-label { font-size: 11px; color: #666f7c; margin: 0 0 6px; }
+.body-title { margin: 0; color: #c9cfd8; font-size: 15px; }
+.body-desc { margin: 9px 0 0; color: #707b8a; font: 12px/1.8 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.body-desc span { color: #94a8a0; }
+.preview-caption { margin: 8px 0 0; color: var(--muted); font-size: 12px; }
+.cases { display: grid; gap: 13px; }
+.case-label { font-size: 12px; color: var(--muted); margin: 0 0 5px; }
+.case .preview { overflow-x: auto; }
+.case .tab-strip { min-width: 540px; }
+.case .tab { cursor: default; }
+.case .tab:hover { --line-alpha: var(--tab-line-inactive-alpha); }
+.case .tab[data-selected="true"]:hover { --line-alpha: var(--tab-line-active-alpha); }
+.case .tab:hover .tab-label { color: inherit; }
+.case .tab-close { pointer-events: none; }
+.case-body { height: 24px; background: var(--surface); }
+.rules { width: 100%; margin-top: 11px; border-collapse: collapse; font-size: 13px; }
+.rules th { text-align: left; font-size: 11px; color: var(--muted); font-weight: 500; }
+.rules th, .rules td { border-bottom: 1px solid #303640; padding: 9px 12px 9px 0; vertical-align: top; }
+.rules td:nth-child(2) { color: #abb3c0; }
+.rules td:last-child { color: var(--muted); }
+.note { margin: 13px 0 0; color: var(--muted); font-size: 12px; }
+details { margin-top: 30px; border-top: 1px solid #303640; padding-top: 14px; }
+summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+.before { display: block; width: min(100%, 953px); height: auto; margin: 14px 0; border: 1px solid #303640; }
+.prototype-note { margin-top: 28px; color: #717b89; font-size: 12px; }
+@media (max-width: 650px) { main { padding: 24px 16px 40px; } h1 { font-size: 22px; } .section-head { align-items: flex-start; flex-direction: column; gap: 8px; } .rules { font-size: 12px; } .preview-body { padding: 18px; } }
+</style>
+</head>
+<body>
+<main>
+  <p class="eyebrow">DEPPY SIJO · HTML 시안</p>
+  <h1>탭바의 선택 상태와 구분선</h1>
+  <p class="intro">선택 탭은 상단·우측 라인으로 강조합니다. 다른 탭도 같은 위치에 연한 라인을 두고, 탭 종류와 관계없이 하나의 규칙을 사용합니다.</p>
+  <div class="section-head">
+    <h2>클릭해서 선택 상태 비교</h2>
+    <div class="toolbar" aria-label="시안 보기 설정">
+      <button id="zoom-1" type="button" aria-pressed="false">실제 크기</button>
+      <button id="zoom-2" type="button" aria-pressed="true">2배 확대</button>
+      <label class="subtle" for="accent">워크스페이스 색</label>
+      <select id="accent"><option value="#b8798c">현재 계열</option><option value="#71a8b7">청록</option><option value="#bb9867">앰버</option></select>
+      <button id="reset" type="button">초기화</button>
+    </div>
+  </div>
+  <div class="preview" id="interactive-preview">
+    <div class="zoom-space" id="zoom-space"><div class="scaled-strip"><div class="tab-strip" id="interactive-strip" role="tablist" aria-label="세션과 보조 화면"></div></div></div>
+    <div class="preview-body" role="tabpanel" id="preview-panel" aria-labelledby="tab-git" tabindex="0">
+      <p class="body-label">선택된 화면</p>
+      <p class="body-title" id="selected-title">Git</p>
+      <p class="body-desc" id="selected-desc"><span>Design</span> / 세션에 속한 Git 작업 화면</p>
+    </div>
+  </div>
+  <p class="preview-caption" id="preview-caption">높이 27px · 라인 1px · 현재 2배 확대. 탭 선택·hover·닫기를 확인할 수 있습니다. 좁은 화면에서는 탭 줄을 가로로 이동하세요.</p>
+
+  <div class="section-head"><h2>선택 위치별 실제 크기</h2><span class="subtle">모두 동일한 높이와 선 규칙</span></div>
+  <div class="cases" id="cases"></div>
+
+  <div class="section-head"><h2>공통 규칙</h2></div>
+  <table class="rules">
+    <thead><tr><th>상태</th><th>상단·우측 라인</th><th>타이틀</th></tr></thead>
+    <tbody>
+      <tr><td>선택</td><td>워크스페이스 색 · 100%</td><td>밝은 기본 텍스트</td></tr>
+      <tr><td>비선택</td><td>같은 색 · 24%</td><td>연한 텍스트</td></tr>
+      <tr><td>비선택 hover</td><td>같은 색 · 36%</td><td>선택 라인과 같은 색</td></tr>
+      <tr><td>선택 hover</td><td>선택 상태 유지 · 100%</td><td>선택 라인과 같은 색</td></tr>
+    </tbody>
+  </table>
+  <p class="note">좌측선·하단선은 그리지 않습니다. 각 탭이 자신의 우측 경계를 한 번만 그려 중복 강조를 없앱니다. 빈 영역에는 탭 라인을 연장하지 않습니다. 닫기 버튼에 마우스를 올려도 선택 라인은 바뀌지 않습니다.</p>
+  <p class="note">높이 27px·선 두께 1px·상태별 농도는 공통 변수로 관리합니다. 긴 제목은 한 줄 말줄임 처리하며, 선택 여부나 hover로 탭 크기를 바꾸지 않습니다.</p>
+  <details><summary>제공한 현재 화면 보기</summary><img class="before" src="topbar-tab-border-2026-10-09-assets/before.png" alt="현재 화면: Git 상단선이 강조되어 있고 앞쪽 세션의 우측선도 강조되어 있는 탭바"><p class="note">현재 화면에서는 선택 상단선과 세션 경계선의 강조 기준이 달라 보입니다. 시안은 탭별 상태 하나로 두 선을 함께 결정합니다.</p></details>
+  <p class="prototype-note">디자인 검토용 HTML입니다. 본문은 예시이며 실제 앱·세션과 연결하지 않습니다.</p>
+</main>
+<script>
+const defaults = [
+  {kind: 'session', label: '인텔리전스 메뉴 작가 인증 관리 UI', icon: '◐', title: '인텔리전스 메뉴 작가 인증 관리 UI', desc: 'Design / 진행 중인 세션의 터미널 화면'},
+  {kind: 'history', label: '이력', title: '이력', desc: 'Design / 현재 세션의 작업 이력'},
+  {kind: 'git', label: 'Git', title: 'Git', desc: 'Design / 세션에 속한 Git 작업 화면'},
+  {kind: 'document', label: 'PR_PLAN.md', title: 'PR_PLAN.md', desc: 'Design / 현재 세션에서 연 문서'}
+];
+let tabs = defaults.slice();
+let active = 'git';
+const strip = document.getElementById('interactive-strip');
+const panel = document.getElementById('preview-panel');
+function makeTab(item, selected, interactive) {
+  const tab = document.createElement('div');
+  tab.className = 'tab'; tab.dataset.kind = item.kind; tab.dataset.selected = String(selected); tab.title = item.label;
+  if (interactive) { tab.id = 'tab-' + item.kind; tab.setAttribute('role', 'tab'); tab.setAttribute('aria-selected', String(selected)); tab.setAttribute('aria-controls', 'preview-panel'); tab.tabIndex = selected ? 0 : -1; }
+  if (item.icon) { const icon = document.createElement('span'); icon.className = 'tab-icon'; icon.textContent = item.icon; icon.setAttribute('aria-hidden', 'true'); tab.append(icon); }
+  const label = document.createElement('span'); label.className = 'tab-label'; label.textContent = item.label; tab.append(label);
+  const close = document.createElement(interactive ? 'button' : 'span'); close.className = 'tab-close'; close.setAttribute('aria-label', item.label + ' 탭 닫기');
+  if (interactive) {
+    close.type = 'button'; close.tabIndex = -1;
+    close.addEventListener('click', event => { event.stopPropagation(); const index = tabs.findIndex(t => t.kind === item.kind); tabs = tabs.filter(t => t.kind !== item.kind); if (active === item.kind) active = tabs[Math.min(index, tabs.length - 1)]?.kind ?? null; render(); strip.querySelector('[aria-selected="true"]')?.focus({preventScroll: true}); });
+    tab.addEventListener('click', () => { active = item.kind; render(); strip.querySelector('[aria-selected="true"]')?.focus({preventScroll: true}); });
+    tab.addEventListener('keydown', event => {
+      if (event.target !== tab) return;
+      const index = tabs.findIndex(t => t.kind === item.kind);
+      if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) { event.preventDefault(); const target = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : (index + (event.key === 'ArrowLeft' ? -1 : 1) + tabs.length) % tabs.length; active = tabs[target].kind; render(); strip.querySelector('[aria-selected="true"]')?.focus({preventScroll: true}); }
+      if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); active = item.kind; render(); strip.querySelector('[aria-selected="true"]')?.focus({preventScroll: true}); }
+      if (event.key === 'Delete') { event.preventDefault(); close.click(); }
+    });
+  } else { close.setAttribute('aria-hidden', 'true'); }
+  tab.append(close); return tab;
+}
+function render() {
+  strip.replaceChildren(...tabs.map(item => makeTab(item, active === item.kind, true)));
+  const blank = document.createElement('div'); blank.className = 'tab-blank'; strip.append(blank);
+  const selected = tabs.find(t => t.kind === active);
+  document.getElementById('selected-title').textContent = selected?.title ?? '열린 탭이 없습니다';
+  document.getElementById('selected-desc').textContent = selected?.desc ?? '초기화로 시안의 탭을 다시 열 수 있습니다.';
+  if (selected) panel.setAttribute('aria-labelledby', 'tab-' + selected.kind); else panel.removeAttribute('aria-labelledby');
+}
+for (const selected of defaults) {
+  const section = document.createElement('div'); section.className = 'case';
+  const caption = document.createElement('p'); caption.className = 'case-label'; caption.textContent = selected.label + ' 선택'; section.append(caption);
+  const preview = document.createElement('div'); preview.className = 'preview';
+  const row = document.createElement('div'); row.className = 'tab-strip'; row.append(...defaults.map(item => makeTab(item, item.kind === selected.kind, false)));
+  const blank = document.createElement('div'); blank.className = 'tab-blank'; row.append(blank);
+  const body = document.createElement('div'); body.className = 'case-body'; preview.append(row, body); section.append(preview); document.getElementById('cases').append(section);
+}
+function zoom(value) {
+  document.getElementById('zoom-space').style.setProperty('--zoom', value);
+  for (const n of [1, 2]) document.getElementById('zoom-' + n).setAttribute('aria-pressed', String(value === n));
+  document.getElementById('preview-caption').textContent = '높이 27px · 라인 1px · 현재 ' + (value === 1 ? '실제 크기' : '2배 확대') + '. 탭 선택·hover·닫기를 확인할 수 있습니다. 좁은 화면에서는 탭 줄을 가로로 이동하세요.';
+}
+document.getElementById('zoom-1').addEventListener('click', () => zoom(1));
+document.getElementById('zoom-2').addEventListener('click', () => zoom(2));
+document.getElementById('accent').addEventListener('change', event => document.documentElement.style.setProperty('--accent', event.target.value));
+document.getElementById('reset').addEventListener('click', () => { tabs = defaults.slice(); active = 'git'; render(); });
+render();
+</script>
+</body>
+</html>

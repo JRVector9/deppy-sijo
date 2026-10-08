@@ -1,0 +1,157 @@
+{
+  "revision": "651ac9ff",
+  "portrait": {
+    "viewer": {
+      "x": 0,
+      "y": 0,
+      "width": 390,
+      "height": 844,
+      "bottom": 844
+    },
+    "canvas": {
+      "x": 0,
+      "y": 334.828125,
+      "width": 390,
+      "height": 173.328125,
+      "bottom": 508.15625
+    },
+    "composer": {
+      "x": 78,
+      "y": 808,
+      "width": 265,
+      "height": 30,
+      "bottom": 838
+    },
+    "font": "3.55px ui-monospace, Menlo, monospace",
+    "stage": {
+      "x": 0,
+      "y": 42,
+      "width": 390,
+      "height": 759,
+      "bottom": 801
+    }
+  },
+  "landscape": {
+    "viewer": {
+      "x": 0,
+      "y": 0,
+      "width": 844,
+      "height": 390,
+      "bottom": 390
+    },
+    "canvas": {
+      "x": 78.875,
+      "y": 42,
+      "width": 686.25,
+      "height": 305,
+      "bottom": 347
+    },
+    "composer": {
+      "x": 78,
+      "y": 354,
+      "width": 719,
+      "height": 30,
+      "bottom": 384
+    },
+    "font": "6.25px ui-monospace, Menlo, monospace",
+    "stage": {
+      "x": 0,
+      "y": 42,
+      "width": 844,
+      "height": 305,
+      "bottom": 347
+    }
+  },
+  "small": {
+    "viewer": {
+      "x": 0,
+      "y": 0,
+      "width": 320,
+      "height": 568,
+      "bottom": 568
+    },
+    "canvas": {
+      "x": 0,
+      "y": 212.390625,
+      "width": 320,
+      "height": 142.21875,
+      "bottom": 354.609375
+    },
+    "composer": {
+      "x": 78,
+      "y": 532,
+      "width": 195,
+      "height": 30,
+      "bottom": 562
+    },
+    "font": "2.92px ui-monospace, Menlo, monospace",
+    "stage": {
+      "x": 0,
+      "y": 42,
+      "width": 320,
+      "height": 483,
+      "bottom": 525
+    }
+  },
+  "keyboard": {
+    "viewer": {
+      "x": 0,
+      "y": 160,
+      "width": 390,
+      "height": 360,
+      "bottom": 520
+    },
+    "canvas": {
+      "x": 0,
+      "y": 252.828125,
+      "width": 390,
+      "height": 173.328125,
+      "bottom": 426.15625
+    },
+    "composer": {
+      "x": 78,
+      "y": 484,
+      "width": 265,
+      "height": 30,
+      "bottom": 514
+    },
+    "font": "3.55px ui-monospace, Menlo, monospace",
+    "stage": {
+      "x": 0,
+      "y": 202,
+      "width": 390,
+      "height": 275,
+      "bottom": 477
+    }
+  },
+  "keyboardMenu": {
+    "top": 46,
+    "bottom": 160,
+    "visualTop": 160,
+    "visualBottom": 520
+  },
+  "settingsControls": {
+    "font": 0,
+    "fit": false,
+    "wrap": false
+  },
+  "exceptions": [],
+  "columnFontProbe": [
+    {
+      "cols": 80,
+      "font": "7.99px ui-monospace, Menlo, monospace",
+      "canvas_height": 390
+    },
+    {
+      "cols": 120,
+      "font": "5.33px ui-monospace, Menlo, monospace",
+      "canvas_height": 260
+    },
+    {
+      "cols": 180,
+      "font": "3.55px ui-monospace, Menlo, monospace",
+      "canvas_height": 173.328125
+    }
+  ],
+  "scope": "Current production assets, isolated Chromium, synthetic viewport frames; not a live phone or user terminal capture."
+}

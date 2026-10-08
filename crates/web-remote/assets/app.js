@@ -79,6 +79,13 @@
   const viewerSessionChip = document.getElementById('viewer-session-chip');
   const viewerQuickActions = document.getElementById('viewer-quick-actions');
   const viewerMenuStatus = document.getElementById('viewer-menu-status');
+  const viewerMenu = document.getElementById('viewer-menu');
+  const viewerHeader = document.querySelector('.viewer-header');
+  const viewerFontSmaller = document.getElementById('viewer-font-smaller');
+  const viewerFontLarger = document.getElementById('viewer-font-larger');
+  const viewerFontSize = document.getElementById('viewer-font-size');
+  const viewerOverview = document.getElementById('viewer-overview');
+  const viewerOverviewState = document.getElementById('viewer-overview-state');
 
   function attachMenu(buttonId, panelId) {
     const button = document.getElementById(buttonId);
@@ -362,6 +369,11 @@
             !== composerMaxHeightPx) {
           viewer.el.style.setProperty('--viewer-composer-max-height', composerMaxHeightPx);
         }
+        positionViewerMenu(height);
+      },
+      layoutChanged: () => {
+        syncViewerReadabilityControls();
+        positionViewerMenu();
       },
       pan: queueScroll,
       resetPan: resetScroll,
@@ -424,6 +436,35 @@
     scheduleViewerRenderForLayoutChange,
   } = viewer;
 
+  function positionViewerMenu(height = viewer.el.clientHeight) {
+    const top = viewerHeader.offsetHeight + 4;
+    viewerMenu.style.setProperty('--viewer-menu-top', top + 'px');
+    viewerMenu.style.setProperty('--viewer-menu-max-height', Math.max(1, height - top - 8) + 'px');
+  }
+
+  function syncViewerReadabilityControls() {
+    const { fontSize, overview } = viewer.settings();
+    viewerFontSize.textContent = fontSize + 'px';
+    viewerFontSmaller.disabled = fontSize <= 12;
+    viewerFontLarger.disabled = fontSize >= 24;
+    viewerOverview.setAttribute('aria-pressed', String(overview));
+    viewerOverviewState.textContent = overview ? '켜짐' : '꺼짐';
+  }
+
+  viewerFontSmaller.addEventListener('click', () => {
+    viewer.setFontSize(viewer.settings().fontSize - 1);
+    syncViewerReadabilityControls();
+  });
+  viewerFontLarger.addEventListener('click', () => {
+    viewer.setFontSize(viewer.settings().fontSize + 1);
+    syncViewerReadabilityControls();
+  });
+  viewerOverview.addEventListener('click', () => {
+    viewer.setOverview(!viewer.settings().overview);
+    syncViewerReadabilityControls();
+  });
+  syncViewerReadabilityControls();
+
   function updateViewerHeading(sessionId) {
     const workspace = lastWorkspaces.find((item) =>
       (item.sessions || []).some((session) => session.id === sessionId));
@@ -480,6 +521,7 @@
 
   document.getElementById('viewer-bottom').addEventListener('click', () => {
     const offset = (viewer.screen && viewer.screen.offset) || 0;
+    viewer.resumeFollow();
     resetPan();
     if (offset > 0 && remoteInputReady()) {
       send({ type: 'scroll', session: viewer.watching, delta: -offset });

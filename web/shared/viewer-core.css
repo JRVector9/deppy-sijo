@@ -49,10 +49,13 @@ body.viewer-open { overflow: hidden; overscroll-behavior: none; }
 .viewer-connection.reconnecting, .viewer-connection.paused { color: var(--m-amber, #f0b84b); }
 .viewer-stage { position: relative; min-width: 0; min-height: 0; overflow: hidden; background: var(--m-terminal, #030303); }
 .viewer-wrap {
-  width: 100%; height: 100%; display: flex; align-items: center;
-  justify-content: center; overflow: hidden; background: var(--m-terminal, #030303);
+  width: 100%; height: 100%; overflow: auto; overscroll-behavior: contain;
+  background: var(--m-terminal, #030303);
 }
 .viewer-wrap canvas { display: block; flex: none; touch-action: pan-x pan-y pinch-zoom; }
+.viewer-wrap.overview {
+  display: flex; align-items: center; justify-content: center; overflow: hidden;
+}
 .viewer-overlay, .viewer-privacy-curtain {
   position: absolute; inset: 0; z-index: 3; display: flex;
   flex-direction: column; align-items: center; justify-content: center;
@@ -68,3 +71,7 @@ body.viewer-open { overflow: hidden; overscroll-behavior: none; }
   border: 1px solid var(--m-line, #2a2a2a); border-radius: 12px; color: var(--m-muted, #a8a8a8); font-size: 12px;
 }
 .viewer-scroll-note[hidden] { display: none; }
+.viewer-scroll-note button {
+  padding: 6px 10px; border: 1px solid var(--m-line, #2a2a2a); border-radius: 8px;
+  background: #0b0b0b; color: var(--m-text, #f2f2f2); cursor: pointer;
+}

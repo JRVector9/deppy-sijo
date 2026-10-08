@@ -89,6 +89,16 @@
     </header>
     <div id="viewer-menu" class="m-menu viewer-menu" hidden>
       <div class="m-menu-section"><span class="label">연결 상태</span><span id="viewer-menu-status" class="value">연결 중</span></div>
+      <div class="viewer-font-controls">
+        <div class="m-menu-row"><span>글자 크기</span><output id="viewer-font-size" class="mono">15px</output></div>
+        <div class="m-menu-steps">
+          <button id="viewer-font-smaller" type="button" aria-label="글자 작게">A−</button>
+          <button id="viewer-font-larger" type="button" aria-label="글자 크게">A+</button>
+        </div>
+      </div>
+      <button id="viewer-overview" class="m-menu-toggle" type="button" aria-pressed="false">
+        <span>전체 화면 맞춤 (축소)</span><span id="viewer-overview-state" class="state">꺼짐</span>
+      </button>
       <button id="viewer-menu-keys" class="m-menu-button" type="button">터미널 특수키</button>
       <button id="viewer-menu-approvals" class="m-menu-button" type="button" disabled>승인 대기</button>
     </div>
@@ -96,7 +106,7 @@
       <div class="viewer-wrap"><canvas id="viewer-canvas" aria-label="원격 터미널 화면"></canvas></div>
       <div id="viewer-scroll-note" class="viewer-scroll-note" hidden>
         <span id="viewer-offset-text"></span>
-        <button id="viewer-bottom" type="button">맨 아래로</button>
+        <button id="viewer-bottom" type="button">현재 화면으로</button>
       </div>
       <div id="viewer-connection-overlay" class="viewer-overlay" aria-hidden="true" hidden>
         <strong id="viewer-overlay-title">연결 중</strong>

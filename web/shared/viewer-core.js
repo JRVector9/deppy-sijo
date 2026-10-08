@@ -25,6 +25,7 @@
 //     closingChanged(closing)             닫힘 잠금이 켜지고 꺼질 때
 //     connectionChanged(state, connected) 연결 상태가 바뀐 뒤
 //     viewportSynced(width, height)       visual viewport 크기를 반영한 뒤
+//     layoutChanged(metrics)             셀·stage 크기를 반영한 뒤(첫 프레임 전에도 호출)
 //     pan(lines)                          세로 팬 제스처(줄 단위, 양수 = 과거로)
 //     resetPan()                          팬 누적 상태를 버려야 할 때
 //     beforeOpen(sessionId)               열기 직전
@@ -45,6 +46,10 @@
 // updateScrollNote, clearViewerCanvas, clearStaleViewerHistory, activateViewerShell,
 // scheduleViewerRender, scheduleViewportSettle, cancelScheduledViewerRender,
 // scheduleViewerRenderForLayoutChange.
+// settings() → { fontSize, overview }, setFontSize(px) (12–24px), setOverview(bool)
+// getCellMetrics() → { cellWidth, cellHeight, fontSize } (개요에서는 실제 축소 크기).
+// layoutChanged에는 stageWidth, stageHeight, configuredFontSize도 포함한다.
+// resumeFollow() → 현재 커서/최신 출력 따라가기. 수동 이동 후에는 명시적으로 재개한다.
 
 /// 호스트 문서에 뷰어 마크업이 없을 때(시청 전용 셸) 코어가 직접 만든다. 루프백 셸의
 /// `index.html`에 있는 것과 같은 구조에서 쓰기 컨트롤(특수키·작성기)만 뺀 것이다 — 같은
@@ -90,7 +95,8 @@ function buildViewerDom(mount) {
       el('div', { class: 'viewer-wrap' },
         el('canvas', { id: 'viewer-canvas', 'aria-label': '원격 터미널 화면' })),
       el('div', { id: 'viewer-scroll-note', class: 'viewer-scroll-note', hidden: true },
-        el('span', { id: 'viewer-offset-text' })),
+        el('span', { id: 'viewer-offset-text' }),
+        el('button', { id: 'viewer-resume-follow', type: 'button', text: '현재 화면으로' })),
       el(
         'div',
         { id: 'viewer-connection-overlay', class: 'viewer-overlay', 'aria-hidden': 'true',
@@ -131,6 +137,7 @@ export function createViewer(options = {}) {
     privacy: document.getElementById('viewer-privacy-curtain'),
     scrollNote: document.getElementById('viewer-scroll-note'),
     offsetText: document.getElementById('viewer-offset-text'),
+    resumeFollowButton: document.getElementById('viewer-resume-follow'),
     ...(options.elements || {}),
     watching: null,
     returnSession: null,
@@ -138,7 +145,132 @@ export function createViewer(options = {}) {
     closing: false,
     pendingClose: null,
     connection: 'connecting',
+    followingLive: true,
   };
+
+  const FONT_FAMILY = 'ui-monospace, Menlo, monospace';
+  const PREFS_KEY = 'deppy-viewer:prefs';
+  const prefs = { fontSize: 15, overview: false };
+  try {
+    const saved = JSON.parse(localStorage.getItem(PREFS_KEY));
+    if (saved && Number.isFinite(saved.fontSize)) prefs.fontSize = Math.max(12, Math.min(24, saved.fontSize));
+    if (saved && typeof saved.overview === 'boolean') prefs.overview = saved.overview;
+  } catch (_) { /* Private browsing or unavailable storage keeps readable defaults. */ }
+  viewer.wrap.classList.toggle('overview', prefs.overview);
+  const localPositions = new Map();
+  let restoreLocalPosition = false;
+  let automaticPosition = null;
+  let measuredFontSize = 0;
+  let baseMetrics = null;
+  let cellMetrics = null;
+  let lastLayoutKey = '';
+  const measuringContext = document.createElement('canvas').getContext('2d');
+
+  function measureCells() {
+    if (measuredFontSize !== prefs.fontSize) {
+      measuringContext.font = prefs.fontSize + 'px ' + FONT_FAMILY;
+      baseMetrics = {
+        cellWidth: measuringContext.measureText('M'.repeat(32)).width / 32,
+        cellHeight: Math.ceil(prefs.fontSize * 1.4),
+        fontSize: prefs.fontSize,
+      };
+      measuredFontSize = prefs.fontSize;
+    }
+    return baseMetrics;
+  }
+
+  function settings() {
+    return { ...prefs };
+  }
+
+  function savePreferences() {
+    try { localStorage.setItem(PREFS_KEY, JSON.stringify(prefs)); } catch (_) { /* Display settings still work. */ }
+    cellMetrics = null;
+    scheduleViewerRender();
+  }
+
+  function setFontSize(px) {
+    if (!Number.isFinite(px)) return;
+    const size = Math.max(12, Math.min(24, px));
+    if (size === prefs.fontSize) return;
+    prefs.fontSize = size;
+    savePreferences();
+  }
+
+  function rememberLocalPosition() {
+    if (viewer.watching && !prefs.overview && !restoreLocalPosition) {
+      localPositions.set(viewer.watching, {
+        left: viewer.wrap.scrollLeft, top: viewer.wrap.scrollTop, follow: viewer.followingLive,
+      });
+    }
+  }
+
+  function stopFollowing() {
+    if (!viewer.watching || prefs.overview) return;
+    viewer.followingLive = false;
+    rememberLocalPosition();
+    updateScrollNote();
+  }
+
+  function resumeFollow() {
+    viewer.followingLive = true;
+    rememberLocalPosition();
+    updateScrollNote();
+    scheduleViewerRender();
+  }
+  if (viewer.resumeFollowButton) viewer.resumeFollowButton.addEventListener('click', resumeFollow);
+
+  function setLocalPosition(left, top) {
+    viewer.wrap.scrollLeft = left;
+    viewer.wrap.scrollTop = top;
+    automaticPosition = scrollGeometry();
+  }
+
+  function scrollGeometry() {
+    return {
+      left: viewer.wrap.scrollLeft, top: viewer.wrap.scrollTop,
+      width: viewer.wrap.clientWidth, height: viewer.wrap.clientHeight,
+      maxLeft: Math.max(0, viewer.wrap.scrollWidth - viewer.wrap.clientWidth),
+      maxTop: Math.max(0, viewer.wrap.scrollHeight - viewer.wrap.clientHeight),
+    };
+  }
+
+  function setOverview(overview) {
+    overview = !!overview;
+    if (overview === prefs.overview) return;
+    rememberLocalPosition();
+    prefs.overview = overview;
+    viewer.wrap.classList.toggle('overview', overview);
+    if (!overview) restoreLocalPosition = true;
+    resetPan();
+    savePreferences();
+  }
+
+  function getCellMetrics() {
+    return { ...(cellMetrics || measureCells()) };
+  }
+
+  viewer.wrap.addEventListener('scroll', () => {
+    if (restoreLocalPosition || prefs.overview) return;
+    const position = scrollGeometry();
+    const samePosition = automaticPosition && position.left === automaticPosition.left
+      && position.top === automaticPosition.top;
+    const changedGeometry = automaticPosition && ['width', 'height', 'maxLeft', 'maxTop']
+      .some(key => position[key] !== automaticPosition[key]);
+    const layoutClamp = changedGeometry
+      && position.left === Math.min(automaticPosition.left, position.maxLeft)
+      && position.top === Math.min(automaticPosition.top, position.maxTop);
+    if (!samePosition && !layoutClamp) stopFollowing();
+    else automaticPosition = position;
+    if (layoutClamp) scheduleViewerRender();
+    rememberLocalPosition();
+  }, { passive: true });
+  viewer.wrap.addEventListener('wheel', (event) => {
+    if (!event.ctrlKey && (event.deltaX || event.deltaY)) stopFollowing();
+  }, { passive: true });
+  viewer.wrap.addEventListener('touchmove', (event) => {
+    if (event.touches.length === 1 && !(window.visualViewport && window.visualViewport.scale > 1.01)) stopFollowing();
+  }, { passive: true });
 
   const VIEWER_CONNECTION_COPY = {
     connecting: ['연결 중', '터미널 화면을 준비하고 있습니다.'],
@@ -207,6 +339,7 @@ export function createViewer(options = {}) {
     const returnSession = viewer.returnSession;
     if (hooks.beforeClose) hooks.beforeClose(options, returnSession);
     cancelScheduledViewerRender(); // central viewer close
+    rememberLocalPosition();
     send({ type: 'unwatch' });
     viewer.watching = null;
     viewer.returnSession = null;
@@ -256,11 +389,18 @@ export function createViewer(options = {}) {
   function openViewer(sessionId, title) {
     if (!sessionId || viewer.closing || viewer.watching === sessionId) return false;
     if (hooks.beforeOpen) hooks.beforeOpen(sessionId);
+    rememberLocalPosition();
     setViewerClosing(false);
     viewer.watching = sessionId;
     viewer.returnSession = sessionId;
     viewer.screen = null;
     clearViewerCanvas();
+    viewer.canvas.style.width = '0px';
+    viewer.canvas.style.height = '0px';
+    restoreLocalPosition = true;
+    viewer.followingLive = (localPositions.get(sessionId) || { follow: true }).follow;
+    cellMetrics = null;
+    lastLayoutKey = '';
     resetPan();
     updateScrollNote();
     if (hooks.sessionChanged) hooks.sessionChanged(sessionId);
@@ -334,14 +474,17 @@ export function createViewer(options = {}) {
     const text = viewer.offsetText;
     if (!note) return;
     const offset = (viewer.screen && viewer.screen.offset) || 0;
-    note.hidden = offset <= 0;
+    note.hidden = offset <= 0 && viewer.followingLive;
     if (offset > 0) text.textContent = '↑ ' + offset + '줄 위 (과거 열람 중)';
+    else if (!viewer.followingLive) text.textContent = '화면 따라가기 일시정지';
+    if (viewer.resumeFollowButton) viewer.resumeFollowButton.hidden = offset > 0;
   }
 
   viewer.canvas.addEventListener('touchstart', (e) => {
-    if (e.touches.length === 1) lastTouchY = e.touches[0].clientY;
+    if (prefs.overview && e.touches.length === 1) lastTouchY = e.touches[0].clientY;
   }, { passive: true });
   viewer.canvas.addEventListener('touchmove', (e) => {
+    if (!prefs.overview) return; // native local grid scrolling
     if (window.visualViewport && window.visualViewport.scale > 1.01) {
       lastTouchY = null;
       return; // native pan while zoomed
@@ -356,13 +499,13 @@ export function createViewer(options = {}) {
   }, { passive: false });
   viewer.canvas.addEventListener('touchend', () => { lastTouchY = null; }, { passive: true });
   viewer.canvas.addEventListener('wheel', (e) => {
+    if (!prefs.overview) return;
     if (e.ctrlKey) return; // preserve browser pinch zoom
     e.preventDefault();
     // 휠 위(deltaY<0) = 과거로(양수 delta).
     pan(-e.deltaY / (viewer.cellH || 16));
   }, { passive: false });
 
-  const CELL_ASPECT_RATIO = 2;
   const MAX_CANVAS_PIXELS = 8 * 1024 * 1024;
   let viewerRenderFrame = 0;
   let viewerViewportSettleTimer = 0;
@@ -408,6 +551,7 @@ export function createViewer(options = {}) {
       viewerRenderFrame = 0;
       syncViewerViewport();
       drawScreenNow();
+      notifyLayoutChanged();
     });
   }
 
@@ -435,11 +579,15 @@ export function createViewer(options = {}) {
     const availableWidth = viewer.wrap.clientWidth;
     const availableHeight = viewer.wrap.clientHeight;
     if (availableWidth <= 0 || availableHeight <= 0 || screen.cols <= 0 || screen.rows <= 0) return;
-    const cellW = Math.min(
-      availableWidth / screen.cols,
-      availableHeight / (screen.rows * CELL_ASPECT_RATIO),
-    );
-    const cellH = cellW * CELL_ASPECT_RATIO;
+    const measured = measureCells();
+    const scale = prefs.overview ? Math.min(1,
+      availableWidth / (screen.cols * measured.cellWidth),
+      availableHeight / (screen.rows * measured.cellHeight),
+    ) : 1;
+    const cellW = measured.cellWidth * scale;
+    const cellH = measured.cellHeight * scale;
+    const fontSize = prefs.fontSize * scale;
+    cellMetrics = { cellWidth: cellW, cellHeight: cellH, fontSize };
     viewer.cellH = cellH;
     const cssWidth = cellW * screen.cols;
     const cssHeight = cellH * screen.rows;
@@ -452,15 +600,24 @@ export function createViewer(options = {}) {
       availableWidth.toFixed(2),
       availableHeight.toFixed(2),
       dpr.toFixed(3),
+      cellW.toFixed(4),
+      cellH.toFixed(4),
     ].join(':');
+    canvas.style.width = cssWidth + 'px';
+    canvas.style.height = cssHeight + 'px';
+    if (restoreLocalPosition && !prefs.overview) {
+      // New dimensions must be installed before the browser can restore an overflow position.
+      const position = localPositions.get(viewer.watching) || { left: 0, top: 0 };
+      setLocalPosition(position.left, position.top);
+      restoreLocalPosition = false;
+    }
+    followLiveOutput(screen, cellW, cellH);
     if (renderKey === lastViewerRenderKey) return;
     lastViewerRenderKey = renderKey;
     const pixelWidth = Math.max(1, Math.round(cssWidth * dpr));
     const pixelHeight = Math.max(1, Math.round(cssHeight * dpr));
     if (canvas.width !== pixelWidth) canvas.width = pixelWidth;
     if (canvas.height !== pixelHeight) canvas.height = pixelHeight;
-    canvas.style.width = cssWidth + 'px';
-    canvas.style.height = cssHeight + 'px';
     const ctx = canvas.getContext('2d');
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.fillStyle = '#000000';
@@ -470,11 +627,11 @@ export function createViewer(options = {}) {
     const A_UNDERLINE = 4;
     const A_STRIKE = 8;
     const A_DIM = 16;
-    const fontPx = (cellH * 0.82).toFixed(2);
+    const fontPx = fontSize.toFixed(2);
     const fontFor = (attrs) => {
       const style = attrs & A_ITALIC ? 'italic ' : '';
       const weight = attrs & A_BOLD ? '700 ' : '';
-      return style + weight + fontPx + 'px ui-monospace, Menlo, monospace';
+      return style + weight + fontPx + 'px ' + FONT_FAMILY;
     };
     const dimmed = (hex) => {
       const match = /^#?([0-9a-f]{6})$/i.exec(hex || '');
@@ -517,10 +674,68 @@ export function createViewer(options = {}) {
     }
     ctx.font = fontFor(0);
     const cursor = screen.cursor;
-    if (cursor && cursor.visible) {
+    if (cursor && cursor.visible && cursor.col >= 0 && cursor.col < screen.cols
+        && cursor.row >= 0 && cursor.row < screen.rows) {
+      const { col, span } = cursorCells(screen, cursor);
+      const thickness = Math.max(1, Math.min(2, fontSize / 10));
+      const x = col * cellW;
+      const y = cursor.row * cellH;
       ctx.fillStyle = 'rgba(212, 212, 212, 0.45)';
-      ctx.fillRect(cursor.col * cellW, cursor.row * cellH, cellW, cellH);
+      if (cursor.shape === 'beam') ctx.fillRect(x, y, Math.min(thickness, cellW), cellH);
+      else if (cursor.shape === 'underline') ctx.fillRect(x, y + cellH - Math.min(thickness, cellH), span * cellW, Math.min(thickness, cellH));
+      else ctx.fillRect(x, y, span * cellW, cellH);
     }
+  }
+
+  function cursorCells(screen, cursor) {
+    for (const run of screen.lines[cursor.row] || []) {
+      if (!run.w) continue;
+      const owners = Array.isArray(run.g) && run.g.every(text => typeof text === 'string' && text.length > 0)
+        ? run.g : Array.from(run.t || '');
+      if (cursor.col >= run.s && cursor.col < run.s + owners.length * 2) {
+        return { col: run.s + Math.floor((cursor.col - run.s) / 2) * 2, span: 2 };
+      }
+    }
+    return { col: cursor.col, span: 1 };
+  }
+
+  function followLiveOutput(screen, cellW, cellH) {
+    if (!viewer.followingLive || prefs.overview || screen.offset > 0) return;
+    const cursor = screen.cursor;
+    let row = cursor && cursor.visible ? cursor.row : -1;
+    if (row < 0) {
+      for (let index = screen.rows - 1; index >= 0; index--) {
+        if ((screen.lines[index] || []).some(run => (run.t || (run.g || []).join('')).trim())) {
+          row = index;
+          break;
+        }
+      }
+    }
+    if (row < 0 || row >= screen.rows) return;
+    const reveal = (start, end, position, size) => start < position ? start
+      : end > position + size ? Math.max(0, end - size) : position;
+    const top = reveal(row * cellH, (row + 1) * cellH, viewer.wrap.scrollTop, viewer.wrap.clientHeight);
+    const { col, span } = cursor && cursor.visible ? cursorCells(screen, cursor) : { col: -1, span: 1 };
+    const left = col >= 0 && col < screen.cols
+      ? reveal(col * cellW, (col + span) * cellW, viewer.wrap.scrollLeft, viewer.wrap.clientWidth)
+      : viewer.wrap.scrollLeft;
+    // A font or stage change can clamp native scroll even when the cursor is already visible.
+    setLocalPosition(left, top);
+    rememberLocalPosition();
+  }
+
+  function notifyLayoutChanged() {
+    if (!viewer.watching || viewer.el.hidden) return;
+    const metrics = {
+      ...getCellMetrics(),
+      stageWidth: viewer.wrap.clientWidth,
+      stageHeight: viewer.wrap.clientHeight,
+      configuredFontSize: prefs.fontSize,
+    };
+    const key = JSON.stringify(metrics);
+    if (key === lastLayoutKey) return;
+    lastLayoutKey = key;
+    if (hooks.layoutChanged) hooks.layoutChanged(metrics);
   }
 
   window.addEventListener('resize', scheduleViewerRender);
@@ -532,6 +747,9 @@ export function createViewer(options = {}) {
   if (hasViewerResizeObserver) {
     new ResizeObserver(scheduleViewerRender).observe(viewer.wrap);
   }
+  if (document.fonts) {
+    document.fonts.ready.then(() => { measuredFontSize = 0; scheduleViewerRender(); });
+  }
 
   function scheduleViewerRenderForLayoutChange(previousWrapHeight) {
     if (viewer.wrap.clientHeight !== previousWrapHeight) scheduleViewerRender();
@@ -540,6 +758,11 @@ export function createViewer(options = {}) {
   clearStaleViewerHistory();
 
   return Object.assign(viewer, {
+    settings,
+    setFontSize,
+    setOverview,
+    getCellMetrics,
+    resumeFollow,
     openViewer,
     requestCloseViewer,
     finishCloseViewer,

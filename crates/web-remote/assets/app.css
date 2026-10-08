@@ -306,7 +306,18 @@ body[data-view="shell"] .brand .status { min-height: 28px; }
 }
 .viewer-heading .viewer-connection { margin-top: 2px; font-size: 11px; line-height: 1; }
 .viewer-actions { display: flex; align-items: center; gap: 4px; min-width: 0; }
-.viewer-menu { position: fixed; top: calc(max(8px, env(safe-area-inset-top)) + 38px); }
+.viewer-menu {
+  position: absolute;
+  top: var(--viewer-menu-top, 46px);
+  width: min(15.5rem, calc(100% - 16px));
+  max-height: var(--viewer-menu-max-height, calc(100% - 54px));
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.viewer-font-controls { padding: 6px 4px 10px; }
+.viewer-font-controls .m-menu-steps button { min-height: 44px; }
+.viewer-font-controls button:disabled { opacity: 0.45; cursor: default; }
+.viewer-menu .m-menu-toggle { min-height: 44px; }
 .viewer-controls {
   padding: 6px max(8px, env(safe-area-inset-right))
     max(6px, env(safe-area-inset-bottom)) max(8px, env(safe-area-inset-left));

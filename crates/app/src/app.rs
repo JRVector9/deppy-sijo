@@ -9085,6 +9085,7 @@ struct RelayDashboardSink {
     permissions: web_remote::relay_client::RelayMessageAdapter,
     /// 기기가 시청 중인 세션과 baseline — web 전송의 접속 스레드가 드는 것과 같은 상태다.
     watched: Option<String>,
+    watch_generation: u64,
     viewport_seq: u64,
     baseline: Option<Arc<runtime::TerminalViewportSnapshot>>,
     last_dash: u64,
@@ -9122,6 +9123,7 @@ impl RelayDashboardSink {
                 web_remote::relay::contract::RelayPermissions::default(),
             ),
             watched: None,
+            watch_generation: 0,
             viewport_seq: 0,
             baseline: None,
             last_dash: 0,
@@ -9357,18 +9359,22 @@ impl RelayDashboardSink {
                     // 옛 세션의 lease가 반납된다. None을 넘기면 시청이 바뀔 때마다 lease가
                     // 하나씩 영구히 쌓이고, watchers 표도 상한 없이 자란다.
                     web_remote::protocol::ClientMsg::Watch { session } => {
-                        self.core
-                            .dashboard()
-                            .rebind_watch(self.watched.as_deref(), Some(&session));
+                        self.watch_generation = self.core.dashboard().rebind_watch_for_connection(
+                            self.watched.as_deref(),
+                            Some(&session),
+                            self.watch_generation,
+                        );
                         self.watched = Some(session);
                         self.viewport_seq = 0;
                         self.baseline = None;
                     }
                     web_remote::protocol::ClientMsg::Unwatch => {
                         let previous = self.watched.take();
-                        self.core
-                            .dashboard()
-                            .rebind_watch(previous.as_deref(), None);
+                        self.watch_generation = self.core.dashboard().rebind_watch_for_connection(
+                            previous.as_deref(),
+                            None,
+                            self.watch_generation,
+                        );
                         self.viewport_seq = 0;
                         self.baseline = None;
                     }
@@ -9413,6 +9419,10 @@ impl RelayDashboardSink {
             self.last_dash = version;
         }
         if let Some(session) = self.watched.clone()
+            && self
+                .core
+                .dashboard()
+                .watch_binding_is_current(&session, self.watch_generation)
             && let Some((seq, snapshot)) = self
                 .core
                 .dashboard()
@@ -9517,6 +9527,7 @@ impl web_remote::relay_client::RelayFrameSink for RelayDashboardSink {
             web_remote::relay::contract::RelayPermissions::default(),
         );
         self.watched = None;
+        self.watch_generation = 0;
         self.viewport_seq = 0;
         self.baseline = None;
         self.last_dash = 0;
@@ -9533,7 +9544,11 @@ impl web_remote::relay_client::RelayFrameSink for RelayDashboardSink {
         self.registration_ready = false;
         self.active_connection = None;
         if let Some(session) = self.watched.take() {
-            self.core.dashboard().rebind_watch(Some(&session), None);
+            self.core.dashboard().rebind_watch_for_connection(
+                Some(&session),
+                None,
+                self.watch_generation,
+            );
         }
     }
 
@@ -21578,12 +21593,8 @@ impl App {
             // background 구독 — 웹 브리지는 렌더와 무관하므로 원격 전용 Viewport에도
             // 깨어나되(시청 프레임 라우팅), GUI repaint는 유발하지 않는다 (P5 리뷰 P1).
             .subscribe_with_wake_background(server.dashboard_wake());
-        // 터미널 뷰어(P5)의 시청 lease를 runtime으로 보낼 명령 싱크 — receiver보다 먼저
-        // (set_runtime_source의 lease 재선언이 이 싱크로 나간다, rebind와 동일 순서).
-        if let Some(sink) = self.active.runtime.command_sink() {
-            server.set_runtime_command_sink(sink);
-        }
-        server.set_runtime_source(receiver);
+        // UUID 맵·시청 상태·구독·명령 싱크를 하나의 worker binding으로 교체한다.
+        server.set_runtime_binding(receiver, self.active.runtime.command_sink());
         // 구독 등록 직후 전체 워크스페이스 스냅샷을 시드한다 — 이벤트 스트림은 edge-trigger라,
         // 재구독한 대시보드는 과거 이력을 모른다. 시드가 없으면 이미 needs_approval로 정착한
         // 세션이 다음 상태 변화까지 "실행 중"으로 오표시된다(계획 P2 리뷰: 킬러 기능 훼손).
@@ -22111,12 +22122,8 @@ impl App {
                 .active
                 .runtime
                 .subscribe_with_wake_background(web.server.dashboard_wake());
-            // 명령 싱크를 receiver보다 먼저 교체한다 — set_runtime_source의 lease 재선언이
-            // 새 worker의 싱크로 나가게 (P5b, 워크스페이스 전환 시 시청 연속성).
-            if let Some(sink) = self.active.runtime.command_sink() {
-                web.server.set_runtime_command_sink(sink);
-            }
-            web.server.set_runtime_source(receiver);
+            web.server
+                .set_runtime_binding(receiver, self.active.runtime.command_sink());
             // 재구독 직후 새 워크스페이스 스냅샷을 시드한다(start_web과 동일 이유 + 세션 맵
             // 통째 교체로 옛 워크스페이스 세션 정체/전환 레이스까지 해소 — P2 리뷰).
             let seeds = self.web_workspace_seed();

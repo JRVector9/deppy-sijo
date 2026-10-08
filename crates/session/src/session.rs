@@ -434,6 +434,10 @@ impl Session {
         self.backend.bracketed_paste()
     }
 
+    pub fn application_cursor(&self) -> bool {
+        self.backend.application_cursor()
+    }
+
     /// status detector용 경량 화면 텍스트 (snapshot 미생성 — PR-12 hidden 규칙).
     pub fn screen_text(&self) -> String {
         self.backend.screen_text()

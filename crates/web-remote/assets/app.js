@@ -138,7 +138,7 @@
 
   // 서버와 합의한 WS 프로토콜 버전 — welcome에서 대조한다(불일치 = 셸이 낡음).
   // v3: 워크스페이스 상태 값 "idle"→"suspended"(I1b-1) — 옛 캐시 셸을 재로드시킨다.
-  const PROTOCOL_VERSION = 4;
+  const PROTOCOL_VERSION = 5;
 
   const STATUS_LABEL = {
     running: '실행 중',
@@ -334,7 +334,10 @@
     backdrop: dashboardShell,
     hooks: {
       closingChanged: (closing) => {
-        if (closing) stopAllKeyRepeats();
+        if (closing) {
+          stopAllKeyRepeats();
+          resetDirectInput();
+        }
         inputBlocked = closing;
         for (const button of viewer.keys) button.disabled = closing;
         updateComposerEnabled();
@@ -343,6 +346,7 @@
         viewerMenuStatus.textContent = connected ? '연결됨' : (state === 'reconnecting' ? '재연결 중' : '연결 중');
         if (!connected) {
           stopAllKeyRepeats();
+          resetDirectInput();
           cancelActiveUpload();
           for (const sessionId of Array.from(recentSentBySession.keys())) {
             restoreDraft(
@@ -379,6 +383,7 @@
       resetPan: resetScroll,
       beforeOpen: () => {
         stopAllKeyRepeats();
+        resetDirectInput();
         preserveComposerDraftForTransition();
         cancelActiveUpload();
         cancelPendingUploadSelection();
@@ -390,6 +395,7 @@
       },
       afterOpen: () => updateComposerEnabled(),
       beforeRequestClose: () => {
+        resetDirectInput();
         cancelActiveUpload();
         cancelPendingUploadSelection();
       },
@@ -528,8 +534,13 @@
     }
   });
 
-  function sendKey(key) {
+  function sendKey(key, target = directTarget()) {
     if (!remoteInputReady()) return;
+    if (inputMode === 'direct') {
+      const ctrl = key === 'ctrl_c' || key === 'ctrl_d';
+      sendDirectKey(ctrl ? key.slice(-1) : key, { ctrl }, target);
+      return;
+    }
     send({ type: 'key', session: viewer.watching, key });
   }
 
@@ -543,6 +554,26 @@
   const composerNote = document.getElementById('composer-note');
   const composerAttach = document.getElementById('composer-attach');
   const composerFile = document.getElementById('composer-file');
+  const composer = document.querySelector('.composer');
+  let directText = document.getElementById('direct-text');
+  const directControls = document.getElementById('direct-controls');
+  const directButtons = Array.from(directControls.querySelectorAll('button'));
+  const directCtrl = document.getElementById('direct-ctrl');
+  const directAlt = document.getElementById('direct-alt');
+  const modeDirect = document.getElementById('viewer-mode-direct');
+  const modeComposer = document.getElementById('viewer-mode-composer');
+  const INPUT_MODE_KEY = 'deppy.inputMode';
+  let inputMode = 'direct';
+  try { if (localStorage.getItem(INPUT_MODE_KEY) === 'composer') inputMode = 'composer'; } catch (_) {}
+  const DIRECT_CONTEXT = '\u200b';
+  let directGeneration = 0;
+  let directComposition = null;
+  let pendingDirectComposition = null;
+  let directCompositionTimer = null;
+  let directEditGuard = null;
+  let directEditGuardTimer = null;
+  let directCtrlArmed = false;
+  let directAltArmed = false;
   let inputBlocked = false;
   const MAX_TERMINAL_INPUT_LOCKS = 256;
   const TERMINAL_INPUT_LOCK_OVERFLOW_NOTICE =
@@ -734,16 +765,21 @@
 
   function updateComposerEnabled() {
     const ready = remoteInputReady();
-    composerSend.disabled = !ready;
-    composerText.disabled = !ready;
-    composerAttach.disabled = !ready || uploadBusy;
+    if (!ready && (directComposition || pendingDirectComposition || directCtrlArmed || directAltArmed)) {
+      resetDirectInput();
+    }
+    composerSend.disabled = !ready || inputMode !== 'composer';
+    composerText.disabled = !ready || inputMode !== 'composer';
+    composerAttach.disabled = !ready || inputMode !== 'composer' || uploadBusy;
+    directText.disabled = !ready || inputMode !== 'direct';
+    for (const button of directButtons) button.disabled = !ready || inputMode !== 'direct';
     for (const button of viewer.keys) button.disabled = !ready;
   }
 
   function sendComposer() {
     // (2) 전송 시점 target 캡처 — 이후 전환돼도 이 세션으로만 간다.
     const target = viewer.watching;
-    if (!target || !remoteInputReady()) return;
+    if (!target || !remoteInputReady() || inputMode !== 'composer') return;
     const text = composerText.value;
     if (!text) return;
     const inputMessage = { type: 'input', session: target, text, submit: true };
@@ -836,6 +872,11 @@
         if (!restoreDraft('입력이 너무 커서 전달되지 않았습니다', msg.session)) {
           setComposerNote('입력이 너무 커서 전달되지 않았습니다');
         }
+        break;
+      case 'admission_denied':
+        // Mode refresh can transiently deny an operation without entering the PTY queue.
+        // Preserve a separate queue_full lock, and keep interrupts available otherwise.
+        setComposerNote('터미널 상태를 갱신 중이라 입력이 전달되지 않았습니다 — 다시 입력하세요');
         break;
       default:
         inputBlocked = queued > 0;
@@ -974,6 +1015,284 @@
     beginSelectedUpload(uploadSession, file);
   });
 
+  function resetDirectText() {
+    // Soft keyboards need an editable character to produce Backspace on an idle field.
+    directText.value = DIRECT_CONTEXT;
+    directText.setSelectionRange(1, 1);
+  }
+
+  function clearDirectEditGuard() {
+    clearTimeout(directEditGuardTimer);
+    directEditGuardTimer = null;
+    directEditGuard = null;
+  }
+
+  function guardDirectEdit(kind, text = '') {
+    clearDirectEditGuard();
+    directEditGuard = { kind, text };
+    directEditGuardTimer = setTimeout(clearDirectEditGuard, 0);
+  }
+
+  function resetDirectModifiers() {
+    directCtrlArmed = false;
+    directAltArmed = false;
+    directCtrl.setAttribute('aria-pressed', 'false');
+    directAlt.setAttribute('aria-pressed', 'false');
+  }
+
+  function resetDirectInput() {
+    directGeneration++;
+    clearTimeout(directCompositionTimer);
+    directCompositionTimer = null;
+    directComposition = null;
+    pendingDirectComposition = null;
+    clearDirectEditGuard();
+    resetDirectModifiers();
+    // Retire the native IME target as well as timers. Late browser input from its old
+    // composition must never become a new session/mode/connection's terminal input.
+    const freshInput = directText.cloneNode(false);
+    directText.replaceWith(freshInput);
+    directText = freshInput;
+    resetDirectText();
+  }
+
+  function directTarget() {
+    return { session: viewer.watching, socket: ws, element: directText, generation: directGeneration,
+      ctrl: directCtrlArmed, alt: directAltArmed };
+  }
+
+  function directTargetReady(target) {
+    return inputMode === 'direct' && target.session === viewer.watching
+      && target.socket === ws && target.generation === directGeneration
+      && target.element === directText
+      && !!ws && ws.readyState === WebSocket.OPEN && remoteInputReady();
+  }
+
+  function sendDirectText(text, paste = false, target = directTarget()) {
+    if (!text || !directTargetReady(target)) return false;
+    if (!paste && (target.ctrl || target.alt)) {
+      return sendDirectKey(text, { ctrl: target.ctrl, alt: target.alt }, target);
+    }
+    const serialized = JSON.stringify({ type: 'direct_input', session: target.session, text, paste });
+    if (utf8Encoder.encode(text).byteLength > MAX_INPUT_BYTES
+        || utf8Encoder.encode(serialized).byteLength > MAX_INPUT_FRAME_BYTES) {
+      setComposerNote('입력이 너무 큽니다 (256KB 초과)');
+      return false;
+    }
+    if (paste) resetDirectModifiers();
+    return sendSerialized(serialized);
+  }
+
+  function flushDirectComposition(end = directText.value.length, preserveText = false) {
+    const pending = pendingDirectComposition;
+    if (!pending) return;
+    clearTimeout(directCompositionTimer);
+    directCompositionTimer = null;
+    pendingDirectComposition = null;
+    const value = directText.value;
+    const suffix = pending.suffix && value.endsWith(pending.suffix) ? pending.suffix.length : 0;
+    const text = value.slice(pending.start, Math.max(pending.start, Math.min(end, value.length - suffix)));
+    if (text) sendDirectText(text, false, pending.target);
+    if (!preserveText && !directComposition) {
+      resetDirectText();
+      guardDirectEdit('composition', text);
+    }
+  }
+
+  function sendDirectKey(key, modifiers = {}, target = directTarget()) {
+    if (!directTargetReady(target)) return false;
+    const ctrl = !!(modifiers.ctrl || target.ctrl);
+    const alt = !!(modifiers.alt || target.alt);
+    const shift = !!modifiers.shift;
+    const interrupt = (key === 'esc' && !ctrl) || (ctrl && /^[cCdD]$/.test(key));
+    if (interrupt && (directComposition || pendingDirectComposition)) {
+      resetDirectInput();
+      target = directTarget();
+      directText.focus({ preventScroll: true });
+    } else flushDirectComposition();
+    if (directComposition || !directTargetReady(target)) return false;
+    const ascii = key.length === 1 && /^[\x20-\x7e]$/.test(key);
+    const named = ['enter', 'backspace', 'tab', 'esc', 'up', 'down', 'left', 'right',
+      'home', 'end', 'delete', 'insert', 'page_up', 'page_down'].includes(key);
+    const validCtrlAscii = /^[a-zA-Z @2\[3\\4\]5^6_7?8]$/.test(key);
+    if ((!named && !(ascii && (ctrl || alt))) || (ascii && ctrl && !validCtrlAscii)
+        || (ctrl && ['enter', 'tab', 'esc'].includes(key))) {
+      resetDirectModifiers();
+      setComposerNote('지원하지 않는 Ctrl/Alt 키 조합입니다');
+      return false;
+    }
+    resetDirectModifiers();
+    return send({ type: 'direct_key', session: target.session, key, ctrl, alt, shift, meta: false });
+  }
+
+  function applyInputMode() {
+    const previousWrapHeight = viewer.wrap.clientHeight;
+    const direct = inputMode === 'direct';
+    directControls.hidden = !direct;
+    composer.hidden = direct;
+    modeDirect.setAttribute('aria-pressed', String(direct));
+    modeComposer.setAttribute('aria-pressed', String(!direct));
+    updateComposerEnabled();
+    if (!direct) autoGrow();
+    scheduleViewerRenderForLayoutChange(previousWrapHeight);
+  }
+
+  function setInputMode(mode) {
+    if (inputMode !== mode) {
+      saveComposerDraft();
+      resetDirectInput();
+      stopAllKeyRepeats();
+      inputMode = mode;
+      try { localStorage.setItem(INPUT_MODE_KEY, mode); } catch (_) {}
+      applyInputMode();
+    }
+    if (remoteInputReady()) (mode === 'direct' ? directText : composerText).focus({ preventScroll: true });
+  }
+
+  modeDirect.addEventListener('click', () => setInputMode('direct'));
+  modeComposer.addEventListener('click', () => setInputMode('composer'));
+  for (const [button, modifier] of [[directCtrl, 'ctrl'], [directAlt, 'alt']]) {
+    button.addEventListener('click', () => {
+      if (!directTargetReady(directTarget())) return;
+      if (modifier === 'ctrl') directCtrlArmed = !directCtrlArmed;
+      else directAltArmed = !directAltArmed;
+      button.setAttribute('aria-pressed', String(modifier === 'ctrl' ? directCtrlArmed : directAltArmed));
+      directText.focus({ preventScroll: true });
+    });
+  }
+  for (const button of directButtons) button.addEventListener('pointerdown', (event) => event.preventDefault());
+
+  const DIRECT_KEY_NAMES = { Enter: 'enter', Backspace: 'backspace', Tab: 'tab', Escape: 'esc',
+    ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right', Home: 'home', End: 'end',
+    Delete: 'delete', Insert: 'insert', PageUp: 'page_up', PageDown: 'page_down' };
+  const DIRECT_EDIT_KEYS = { deleteContentBackward: 'backspace', deleteContentForward: 'delete',
+    insertLineBreak: 'enter', insertParagraph: 'enter' };
+  function matchingDirectEdit(event) {
+    const guard = directEditGuard;
+    return guard && (guard.kind === DIRECT_EDIT_KEYS[event.inputType]
+      || (guard.kind === 'paste' && event.inputType === 'insertFromPaste')
+      || (guard.kind === 'text' && event.inputType === 'insertText' && event.data === guard.text)
+      || (guard.kind === 'composition' && event.inputType === 'insertCompositionText' && event.data === guard.text));
+  }
+
+  function onDirectInput(type, handler) {
+    directControls.addEventListener(type, (event) => {
+      if (event.target === directText) handler(event);
+    }, true);
+  }
+
+  onDirectInput('keydown', (event) => {
+    if (event.ctrlKey && event.shiftKey && !event.altKey && !event.metaKey
+        && (event.key.toLowerCase() === 'm' || event.code === 'KeyM')) {
+      event.preventDefault();
+      stopAllKeyRepeats();
+      resetDirectInput();
+      document.getElementById('viewer-menu-button').focus({ preventScroll: true });
+      return;
+    }
+    clearDirectEditGuard();
+    if (event.isComposing || event.keyCode === 229 || directComposition) return;
+    if (event.metaKey || event.getModifierState('AltGraph')
+        || (event.ctrlKey && event.key.toLowerCase() === 'v')) return;
+    const key = DIRECT_KEY_NAMES[event.key];
+    if (key || ((event.ctrlKey || event.altKey) && event.key.length === 1)) {
+      event.preventDefault();
+      sendDirectKey(key || event.key, { ctrl: event.ctrlKey, alt: event.altKey, shift: event.shiftKey });
+      if (['enter', 'backspace', 'delete'].includes(key)) guardDirectEdit(key);
+      else if (!key) guardDirectEdit('text', event.key);
+    } else flushDirectComposition();
+  });
+  onDirectInput('compositionstart', () => {
+    if (!directTargetReady(directTarget())) return;
+    const start = directText.selectionStart;
+    flushDirectComposition(start, true);
+    clearDirectEditGuard();
+    directComposition = { target: directTarget(), start,
+      suffix: directText.value.slice(directText.selectionEnd), implicit: false };
+  });
+  onDirectInput('compositionend', () => {
+    if (!directComposition) return;
+    pendingDirectComposition = directComposition;
+    directComposition = null;
+    // Read the settled DOM range: Korean consonants can move into the next syllable.
+    directCompositionTimer = setTimeout(() => flushDirectComposition(), 0);
+  });
+  onDirectInput('beforeinput', (event) => {
+    if (!directTargetReady(directTarget())) {
+      event.preventDefault();
+      return;
+    }
+    if (directComposition || event.isComposing) return;
+    if (matchingDirectEdit(event)) {
+      event.preventDefault();
+      return;
+    }
+    clearDirectEditGuard();
+    const key = DIRECT_EDIT_KEYS[event.inputType];
+    if (key && event.cancelable) {
+      event.preventDefault();
+      sendDirectKey(key);
+      guardDirectEdit(key);
+    } else if (event.inputType === 'insertFromPaste' && event.data !== null && event.cancelable) {
+      event.preventDefault();
+      flushDirectComposition();
+      sendDirectText(event.data, true);
+      resetDirectText();
+      guardDirectEdit('paste');
+    }
+  });
+  onDirectInput('input', (event) => {
+    if (!directTargetReady(directTarget())) {
+      resetDirectText();
+      return;
+    }
+    if (event.isComposing) {
+      if (!directComposition) directComposition = { target: directTarget(),
+        start: directText.value.startsWith(DIRECT_CONTEXT) ? 1 : 0, suffix: '', implicit: true };
+      return;
+    }
+    if (directComposition) {
+      if (directComposition.implicit) {
+        pendingDirectComposition = directComposition;
+        directComposition = null;
+        flushDirectComposition();
+      }
+      return;
+    }
+    if (pendingDirectComposition) return;
+    if (matchingDirectEdit(event)) {
+      resetDirectText();
+      return;
+    }
+    const key = DIRECT_EDIT_KEYS[event.inputType];
+    if (key) sendDirectKey(key);
+    else {
+      const value = directText.value;
+      sendDirectText(value.startsWith(DIRECT_CONTEXT) ? value.slice(1) : value, event.inputType === 'insertFromPaste');
+    }
+    resetDirectText();
+  });
+  onDirectInput('paste', (event) => {
+    if (!event.clipboardData) return; // beforeinput/input provide the browser paste fallback.
+    event.preventDefault();
+    if (!directTargetReady(directTarget())) return;
+    flushDirectComposition();
+    const text = event.clipboardData.getData('text/plain');
+    if (directComposition) resetDirectInput();
+    sendDirectText(text, true);
+    resetDirectText();
+    guardDirectEdit('paste');
+  });
+  onDirectInput('focus', () => {
+    if (!directComposition) directText.setSelectionRange(directText.value.length, directText.value.length);
+  });
+  onDirectInput('click', () => {
+    if (!directComposition) directText.setSelectionRange(directText.value.length, directText.value.length);
+  });
+  window.addEventListener('pagehide', resetDirectInput);
+  resetDirectInput();
+  applyInputMode();
+
   composerText.addEventListener('input', () => {
     if (composerRecoveryWarningSession) {
       composerRecoveryWarningSession = null;
@@ -993,8 +1312,13 @@
   composerSend.addEventListener('click', sendComposer);
 
   // 특수키 행 — 누르는 즉시 전송(composer 미경유). 화살표는 길게 눌러 반복.
-  for (const btn of document.querySelectorAll('.viewer-keys button')) {
-    const key = btn.dataset.key;
+  for (const btn of document.querySelectorAll('.viewer-keys button, .direct-accessories button[data-direct-key]')) {
+    const key = btn.dataset.key || btn.dataset.directKey;
+    let repeatTarget = null;
+    const sendButtonKey = () => {
+      if (btn.dataset.directKey) sendDirectKey(key, {}, repeatTarget || directTarget());
+      else sendKey(key, repeatTarget || directTarget());
+    };
     let repeatTimer = null;
     let repeatInterval = null;
     let repeated = false;
@@ -1006,8 +1330,9 @@
       repeatInterval = null;
     };
     keyRepeatCancels.push(() => {
-      repeated = repeated || pointerActive;
+      repeated = repeated || pointerActive || !!repeatTarget;
       pointerActive = false;
+      repeatTarget = null;
       stopRepeat();
     });
     // 반복이 발화했으면 뒤따르는 click을 무시한다 — 아니면 목표에서 한 칸 오버슛한다
@@ -1015,19 +1340,44 @@
     btn.addEventListener('click', () => {
       if (repeated) {
         repeated = false;
+        repeatTarget = null;
         return;
       }
-      sendKey(key);
+      sendButtonKey();
+      repeatTarget = null;
     });
+    if (key === 'esc' || key === 'ctrl_c' || key === 'ctrl_d') {
+      btn.addEventListener('pointerdown', (event) => {
+        if (inputMode !== 'direct') return;
+        // Interrupt intent starts at press-down: blur or an already pending IME
+        // timer must not commit a candidate while the user holds this button.
+        event.preventDefault();
+        if (!directTargetReady(directTarget())) return;
+        if (directComposition || pendingDirectComposition) {
+          resetDirectInput();
+          directText.focus({ preventScroll: true });
+        }
+        repeatTarget = directTarget();
+        pointerActive = true;
+        repeated = false;
+      });
+      btn.addEventListener('pointerup', () => { pointerActive = false; });
+      btn.addEventListener('pointercancel', () => {
+        repeated = repeated || pointerActive || !!repeatTarget;
+        pointerActive = false;
+        repeatTarget = null;
+      });
+    }
     if (key === 'up' || key === 'down' || key === 'left' || key === 'right') {
       const startRepeat = () => {
+        repeatTarget = directTarget();
         pointerActive = true;
         stopRepeat();
         repeated = false;
         repeatTimer = setTimeout(() => {
           repeatInterval = setInterval(() => {
             repeated = true;
-            sendKey(key);
+            sendButtonKey();
           }, 120);
         }, 400);
       };

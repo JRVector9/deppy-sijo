@@ -74,10 +74,10 @@ Blink의 공식 사용 안내는 글자 크기 핀치, 선택 복사, Ctrl/Alt �
 
 | PR 단위 | 우선 개선 | 병렬 담당 | 완료 조건 | 현재 상태 |
 | --- | --- | --- | --- | --- |
-| 1 | 고정15px/12–24px 설정, 로컬 grid 이동, 명시적 전체 맞춤, 키보드 메뉴 위치 | renderer + input_ui | 원격180열/좁은 화면에서 글자 크기와 Unicode 좌표, viewport 메뉴 검증 | 검증·리뷰 완료 |
-| 2 | 직접 입력/IME/붙여넣기/제어 키 | input_ui + backend | 정확한 세션과 실시간 터미널 모드, 중복/재연결 입력 방지 | backend RED 확인, 순서 대기 |
+| 1 | 고정15px/12–24px 설정, 로컬 grid 이동, 명시적 전체 맞춤, 키보드 메뉴 위치 | renderer + input_ui | 원격180열/좁은 화면에서 글자 크기와 Unicode 좌표, viewport 메뉴 검증 | 커밋27186086 |
+| 2 | 직접 입력/IME/붙여넣기/제어 키 | input_ui + backend | 정확한 세션과 실시간 터미널 모드, 중복/재연결 입력 방지 | 검증·최종 재리뷰 완료 |
 | 3 | 단일 resize 제어권과 실제 PTY 행·열 동기화 | backend + input_ui | 경쟁 소켓/네이티브 resize 복원/회전·키보드·연결 정리 검증 | PR2 이후 |
-| 4 | 선택·복사·검색/별도 읽기 모드, 연결별 이력 위치 | renderer + backend + input_ui | 네이티브 스크롤 불변, 새 출력 시 읽기 위치 유지 | PR3 이후 |
+| 4 | 선택·복사·검색/별도 읽기 모드, 연결별 이력 위치 | renderer + backend + input_ui | 네이티브 스크롤 불변, 새 출력 시 읽기 위치 유지 | renderer 격리 개발·리뷰 중, 통합은 PR3 이후 |
 
 각 담당자는 독점 파일만 수정하며 root가 실제 코드 리뷰·검증 후 PR 단위로 커밋한다. 현재 요청에는 앱 재실행과 배포가 포함되지 않는다. 실기기 iPhone/Android 검증은 자동 Chromium 검증과 구분해 기록한다.
 
@@ -86,3 +86,10 @@ Blink의 공식 사용 안내는 글자 크기 핀치, 선택 복사, Ctrl/Alt �
 - 실제 격리 Chromium: renderer113 assertions, UI34 assertions, 기존 core/grapheme 및 신규 renderer/UI Rust browser wrapper 각각1PASS. 브라우저 러너 조기 종료·실행 실패 회귀2PASS. 실기기 결과는 아니다.
 - 직접 CLI 리뷰 gpt-6.1-sol/xhigh에서3MEDIUM(폰트 축소 clamp 시 따라가기 해제, wide cursor 일부 잘림, 러너 종료 대기)이 발견됐다. 모두 RED/GREEN으로 수정했고 집중 재리뷰 `CONCLUSION: OK`를 확인했다.
 - 15px 고정 grid/12–24px 설정, 명시적 축소 개요, 세션별 로컬 이동·따라가기, Unicode owner-cell/커서 모양, 키보드 viewport 메뉴와 현재 화면 복귀를 적용했다. PR2 서버 변경은 PR1에 포함하지 않는다.
+
+### PR2 검증과 리뷰
+
+- 직접 입력(확정된 한글 조합·문자·붙여넣기)과 명시적 Enter/Backspace/Tab/Esc/방향키/Ctrl/Alt를 추가했다. 긴 지시 작성기와 세션별 초안은 별도 모드로 유지한다. 조합 중 인터럽트는 누름 시작에서 후보를 폐기하며, Ctrl+Shift+M으로 메뉴에 포커스를 옮길 수 있다.
+- 브라우저152 assertions와 기존 모바일 흐름, 마지막 두 Chrome Rust wrapper가 통과했다. 실제 임시 PTY의 cursor/paste mode와 출력 폭주 회귀를 검증했다. 최종 Rust gate에서 runtime362/web323(1ignored), 앱 테스트 대상 컴파일·strict Clippy·fmt·boundary가 통과했다. 앞선 terminal121(4ignored)/session76 전체 검증 후 해당 코드는 바뀌지 않았다.
+- 리뷰 지적은 원자적 runtime source/sink 교체, 세대별 Relay·기존 입력 전송/정리, 입력 직전 bounded mode refresh, 조회의 저장 상태 변경 방지, IME 인터럽트·포커스 이탈·pointer 이벤트 순서다. 각 회귀 RED를 재현하고 수정했다. 서버 조회·UI pointer의 마지막 집중 재리뷰 모두 CONCLUSION: OK다.
+- JSON 프로토콜5, runtime wire24로 갱신했다. 재연결 직접 입력 재전송은 없으며, 조회는 mux 이벤트만 보내 저장된 시작 배치를 변경하지 않는다.

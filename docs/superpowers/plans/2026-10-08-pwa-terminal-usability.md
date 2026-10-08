@@ -17,7 +17,9 @@
 | pwa_backend | necessary Rust in crates/web-remote, runtime, terminal, app, excluding browser wrappers | PR2 direct contract, PR3 resize lease, PR4 local history |
 | root | this plan, audit progress, handoff, review outputs, staging and commits | review/test each unit before next dependent phase |
 
-All agents use gpt-6.1-sol with xhigh effort. Agents do not commit, restart Deppy, invoke review CLIs, or modify other owners' files. Root directly reviews code via Codex CLI, assigns corrections back to the owner, and commits reviewed units. Rust source is quiescent during each serialized Cargo run. JS may develop concurrently with Rust. No release artifact is delivered, so source version stays 0.8.7; any future delivery requires a version bump and artifact verification.
+PR1 committed27186086. Phase4 renderer develops ahead in isolated checkout /Users/jr/Desktop/projects/deppy-sijo-pwa-reading-20261008 atPR1; root imports its exclusively owned files only afterPR3. It must not run Cargo or use the main target. Integration/commit order remains PR1→PR2→PR3→PR4.
+
+All agents use gpt-6.1-sol with xhigh effort. Agents do not commit, restart Deppy, invoke review CLIs, or modify other owners' files. Root directly reviews code via Codex CLI, assigns corrections back to the owner, and commits reviewed units. Rust source is quiescent during each serialized Cargo run. UI JavaScript edits pause for web/App Cargo gates because assets are embedded via include_str; isolated renderer work can continue. No release artifact is delivered, so source version stays 0.8.7; any future delivery requires a version bump and artifact verification.
 
 ## PR1: Fixed font, local grid movement, settings and keyboard-safe menu
 
@@ -41,16 +43,16 @@ viewer.getCellMetrics(); // {cellWidth, cellHeight, fontSize, stageWidth, stageH
 
 **Files:** assets/app.js, app.css, index.html; web-remote/src/protocol.rs, dashboard.rs, ws_api.rs and focused backend tests; mobile-usability fixture.
 
-- [ ] Execute RED tests for confirmed Korean composition exactly once, paste once, Enter/Backspace/Tab/Esc/arrows/modifiers, correct watched UUID, disconnected rejection, and application cursor/bracketed paste behavior.
-- [ ] Implement a clear direct-input mode retaining the long-instruction composer and independent draft. Confirm exact wire fields with backend before using the following proposed contract.
+- [x] Execute RED tests for confirmed Korean composition exactly once, paste once, Enter/Backspace/Tab/Esc/arrows/modifiers, correct watched UUID, disconnected rejection, and application cursor/bracketed paste behavior.
+- [x] Implement a clear direct-input mode retaining the long-instruction composer and independent draft. Confirm exact wire fields with backend before using the following proposed contract.
 
 ```js
 send({type: 'direct_input', session, text: '한글', paste: false});
-send({type: 'direct_key', session, key: 'ArrowUp', ctrl: false, alt: false, shift: false, meta: false});
+send({type: 'direct_key', session, key: 'up', ctrl: false, alt: false, shift: false, meta: false});
 ```
 
-- [ ] Server authenticates/watch-gates target, bounds input, sanitizes free text controls, maps allowed keys to current terminal modes, and does not replay direct input after reconnect.
-- [ ] Run focused Rust and browser tests GREEN; root code review, corrections, handoff and PR2 commit.
+- [x] Server authenticates/watch-gates target, bounds input, sanitizes free text controls, maps allowed keys to current terminal modes, and does not replay direct input after reconnect.
+- [x] Run focused Rust and browser tests GREEN; root code review, corrections, handoff and PR2 commit.
 
 ## PR3: Single-owner actual PTY resize
 

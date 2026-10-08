@@ -100,8 +100,8 @@ impl RelayMessageAdapter {
             ClientMsg::Watch { .. } | ClientMsg::Unwatch | ClientMsg::RequestKeyframe => {
                 Some(RelayAction::View)
             }
-            ClientMsg::Input { .. } => Some(RelayAction::Input),
-            ClientMsg::Key { .. } => Some(RelayAction::Key),
+            ClientMsg::Input { .. } | ClientMsg::DirectInput { .. } => Some(RelayAction::Input),
+            ClientMsg::Key { .. } | ClientMsg::DirectKey { .. } => Some(RelayAction::Key),
             ClientMsg::Scroll { .. } => Some(RelayAction::Scroll),
             ClientMsg::Switch { .. } => Some(RelayAction::Switch),
             ClientMsg::Resolve { .. } => Some(RelayAction::Approval),
@@ -196,6 +196,32 @@ mod tests {
                 remember: true,
             },
         ]
+    }
+
+    #[test]
+    fn direct_terminal_messages_require_the_existing_input_grant() {
+        for message in [
+            ClientMsg::DirectInput {
+                session: "u7".into(),
+                text: "한글".into(),
+                paste: false,
+            },
+            ClientMsg::DirectKey {
+                session: "u7".into(),
+                key: "c".into(),
+                ctrl: true,
+                alt: false,
+                shift: false,
+                meta: false,
+            },
+        ] {
+            assert!(matches!(
+                view_only().admit(message.clone()),
+                RelayAdmission::Denied(DenialReason::PermissionDenied(_))
+            ));
+            let mut granted = RelayMessageAdapter::new(RelayPermissions::new(true, true, false));
+            assert!(matches!(granted.admit(message), RelayAdmission::Allow(_)));
+        }
     }
 
     fn dashboard() -> ServerMsg {

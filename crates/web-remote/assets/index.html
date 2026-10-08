@@ -84,7 +84,8 @@
       <div class="viewer-actions">
         <button id="viewer-session-chip" class="m-term-chip" type="button" aria-label="다음 세션으로 전환">세션</button>
         <button id="viewer-menu-button" class="m-icon-button small" type="button"
-                aria-label="터미널 메뉴" aria-expanded="false" aria-controls="viewer-menu">⋯</button>
+                aria-label="터미널 메뉴" aria-expanded="false" aria-controls="viewer-menu"
+                aria-keyshortcuts="Control+Shift+M">⋯</button>
       </div>
     </header>
     <div id="viewer-menu" class="m-menu viewer-menu" hidden>
@@ -117,6 +118,29 @@
     </div>
     <footer class="viewer-controls">
       <p id="composer-note" class="composer-note" hidden></p>
+      <div class="viewer-input-modes" role="group" aria-label="입력 방식">
+        <button id="viewer-mode-direct" type="button" aria-pressed="true">터미널</button>
+        <button id="viewer-mode-composer" type="button" aria-pressed="false">작성</button>
+      </div>
+      <div id="direct-controls" class="direct-controls">
+        <div class="direct-accessories" role="group" aria-label="터미널 보조 키">
+          <button id="direct-ctrl" type="button" aria-pressed="false">Ctrl</button>
+          <button id="direct-alt" type="button" aria-pressed="false">Alt</button>
+          <button type="button" data-direct-key="esc">Esc</button>
+          <button type="button" data-direct-key="tab">Tab</button>
+          <button type="button" data-direct-key="left">←</button>
+          <button type="button" data-direct-key="up">↑</button>
+          <button type="button" data-direct-key="down">↓</button>
+          <button type="button" data-direct-key="right">→</button>
+          <button type="button" data-direct-key="backspace">⌫</button>
+          <button type="button" data-direct-key="enter">Enter</button>
+        </div>
+        <textarea id="direct-text" rows="1" aria-label="터미널에 직접 입력"
+                  aria-describedby="direct-focus-help"
+                  autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false"
+                  enterkeyhint="enter"></textarea>
+        <p id="direct-focus-help" class="direct-focus-help">Ctrl+Shift+M: 입력에서 나와 메뉴로 이동</p>
+      </div>
       <div id="viewer-quick-actions" class="viewer-keys" role="group" aria-label="터미널 특수키" hidden>
         <button type="button" data-key="esc">Esc</button>
         <button type="button" data-key="tab">Tab</button>
@@ -128,7 +152,7 @@
         <button type="button" data-key="ctrl_d">Ctrl‑D</button>
         <button type="button" data-key="enter">Enter</button>
       </div>
-      <div class="composer m-composer">
+      <div class="composer m-composer" hidden>
         <input id="composer-file" type="file" hidden
                accept="image/png,image/jpeg,image/gif,image/webp,image/heic,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,.md">
         <button id="composer-attach" type="button" class="composer-attach" aria-label="파일 첨부">+</button>

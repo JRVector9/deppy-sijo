@@ -432,6 +432,9 @@ pub(crate) fn runtime_command_retained_bytes(
             }
         }
         RuntimeCommand::WriteInput { bytes, .. } => retained_add(&mut total, bytes.capacity())?,
+        RuntimeCommand::WriteTerminalInput { input, .. } => {
+            retained_string(&mut total, input.payload())?;
+        }
         RuntimeCommand::WriteInputTracked {
             bytes,
             operation_id,
@@ -501,6 +504,7 @@ pub(crate) fn runtime_command_retained_bytes(
         | RuntimeCommand::Scroll { .. }
         | RuntimeCommand::KillSession { .. }
         | RuntimeCommand::RestoreWorkspace
+        | RuntimeCommand::RequestMuxSnapshot
         | RuntimeCommand::SetWorkspaceState(_)
         | RuntimeCommand::SetUserStatusOverride { .. }
         | RuntimeCommand::SetTerminalCachePolicy { .. }
@@ -616,6 +620,9 @@ pub(crate) fn canonicalize_host_command(command: &mut RuntimeCommand) {
         RuntimeCommand::WriteInput { bytes, .. } => {
             *bytes = std::mem::take(bytes).into_boxed_slice().into_vec();
         }
+        RuntimeCommand::WriteTerminalInput { input, .. } => {
+            canonicalize_string(input.payload_mut());
+        }
         RuntimeCommand::SeedRedaction { credential_ids } => {
             canonicalize_strings(credential_ids);
         }
@@ -674,6 +681,7 @@ pub(crate) fn canonicalize_host_command(command: &mut RuntimeCommand) {
         | RuntimeCommand::Scroll { .. }
         | RuntimeCommand::KillSession { .. }
         | RuntimeCommand::RestoreWorkspace
+        | RuntimeCommand::RequestMuxSnapshot
         | RuntimeCommand::SetWorkspaceState(_)
         | RuntimeCommand::SetUserStatusOverride { .. }
         | RuntimeCommand::SetTerminalCachePolicy { .. }
@@ -835,6 +843,11 @@ pub(crate) fn validate_host_command(command: &RuntimeCommand) -> Result<(), Runt
                 return Err(admission_error("runtime_command_input_invalid"));
             }
         }
+        RuntimeCommand::WriteTerminalInput { input, .. } => {
+            if !input.is_valid() {
+                return Err(admission_error("runtime_command_input_invalid"));
+            }
+        }
         RuntimeCommand::ResizeTracked {
             token, cols, rows, ..
         } => {
@@ -962,6 +975,7 @@ pub(crate) fn validate_host_command(command: &RuntimeCommand) -> Result<(), Runt
         RuntimeCommand::Scroll { .. }
         | RuntimeCommand::KillSession { .. }
         | RuntimeCommand::RestoreWorkspace
+        | RuntimeCommand::RequestMuxSnapshot
         | RuntimeCommand::SetWorkspaceState(_)
         | RuntimeCommand::SetUserStatusOverride { .. }
         | RuntimeCommand::SetShellCwd(None)
@@ -1264,11 +1278,24 @@ pub enum RuntimeCommand {
         error_regex: Option<String>,
         done_regex: Option<String>,
     },
+    /// Maps direct text/keys against live backend modes. Append-only wire contract.
+    WriteTerminalInput {
+        session: SessionId,
+        input: crate::TerminalInput,
+    },
+    /// Refresh authoritative UUID/session membership after a new subscription.
+    RequestMuxSnapshot,
 }
 
 impl std::fmt::Debug for RuntimeCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            RuntimeCommand::RequestMuxSnapshot => f.write_str("RequestMuxSnapshot"),
+            RuntimeCommand::WriteTerminalInput { session, input } => f
+                .debug_struct("WriteTerminalInput")
+                .field("session", session)
+                .field("payload_len", &input.payload().len())
+                .finish(),
             RuntimeCommand::SpawnShell {
                 cols,
                 rows,
@@ -1623,6 +1650,44 @@ impl RuntimeCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_terminal_input_is_bounded_retained_and_redacted_on_wire() {
+        let make = |input| RuntimeCommand::WriteTerminalInput {
+            session: SessionId(7),
+            input,
+        };
+        let mut command = make(crate::TerminalInput::Text {
+            text: " 한글🙂 ".into(),
+            paste: true,
+        });
+        assert!(prepare_runtime_command_for_retention_internal(&mut command).is_ok());
+        let encoded = postcard::to_allocvec(&command).unwrap();
+        let decoded: RuntimeCommand = postcard::from_bytes(&encoded).unwrap();
+        assert!(
+            matches!(decoded, RuntimeCommand::WriteTerminalInput { session: SessionId(7), input: crate::TerminalInput::Text { text, paste: true } } if text == " 한글🙂 ")
+        );
+        assert!(!format!("{command:?}").contains("한글"));
+        assert!(
+            validate_host_command(&make(crate::TerminalInput::Text {
+                text: "x".repeat(crate::DIRECT_INPUT_TEXT_BYTES_MAX + 1),
+                paste: true
+            }))
+            .is_err()
+        );
+        for (key, meta) in [("not_a_key", false), ("\x1b[A", false), ("c", true)] {
+            assert!(
+                validate_host_command(&make(crate::TerminalInput::Key {
+                    key: key.into(),
+                    ctrl: true,
+                    alt: false,
+                    shift: false,
+                    meta
+                }))
+                .is_err()
+            );
+        }
+    }
 
     #[test]
     fn pr1_batch_input_validates_total_budget_identity_and_redacts_debug() {
@@ -2501,6 +2566,8 @@ mod tests {
                 "WriteInputTracked",
                 "WriteInputBatchTracked",
                 "SpawnAgentBeside",
+                "WriteTerminalInput",
+                "RequestMuxSnapshot",
             ]
         );
     }

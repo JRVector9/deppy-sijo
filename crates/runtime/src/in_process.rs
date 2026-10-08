@@ -2617,6 +2617,42 @@ impl Worker {
             RuntimeCommand::WriteInput { session, bytes } => {
                 let _ = self.admit_input(session, &bytes);
             }
+            RuntimeCommand::RequestMuxSnapshot => self.emit_current_mux_snapshot(),
+            RuntimeCommand::WriteTerminalInput { session, input } => {
+                if input.requires_current_modes() {
+                    // Commands run before the normal output pump. Parse the target's queued
+                    // modes with the existing strict budget; never spin behind an output flood.
+                    let effects = self.collect_session_pump_effects(&[session], false, true);
+                    self.finish_session_pump_effects(effects);
+                    if self
+                        .sessions
+                        .get(&session)
+                        .is_some_and(|active| active.pending_output_bytes() > 0)
+                    {
+                        let policy = pty::PtyInputQueuePolicy::default();
+                        self.emit(RuntimeEvent::PtyInputPressure {
+                            session,
+                            pressure: pty::PtyInputPressure {
+                                attempted_bytes: input.payload().len(),
+                                queued_bytes: 0,
+                                queued_messages: 0,
+                                max_bytes: policy.max_bytes,
+                                max_messages: policy.max_messages,
+                                reason: pty::PtyInputRejectReason::AdmissionDenied,
+                            },
+                        });
+                        return;
+                    }
+                }
+                let Some(active) = self.sessions.get(&session) else {
+                    return;
+                };
+                if let Some(bytes) =
+                    input.encode(active.bracketed_paste(), active.application_cursor())
+                {
+                    let _ = self.admit_input(session, &bytes);
+                }
+            }
             RuntimeCommand::WriteInputTracked {
                 session,
                 operation_id,
@@ -4218,6 +4254,12 @@ impl Worker {
         } else if let Some(pipe) = &mut self.persist {
             pipe.save_layout(&self.mux.window, &self.mux.tabs, &self.mux.panes);
         }
+        self.emit_current_mux_snapshot();
+    }
+
+    // Queries only publish current live membership. A cold worker may still have
+    // saved panes awaiting deferred restoration; querying must never save its empty mux.
+    fn emit_current_mux_snapshot(&self) {
         self.emit(RuntimeEvent::MuxUpdated {
             snapshot: Arc::new(self.mux.snapshot(|session| {
                 // 영속 UUID(sessions.id) — 경계를 넘는 식별자. persist가 없으면 None이고,
@@ -7781,6 +7823,81 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn direct_mux_query_before_cold_restore_preserves_persisted_panes() {
+        let name = "direct-mux-query-before-restore";
+        let (client, mut probe, first_pane, second_pane, dir) =
+            lazy_restore_durable_event_barrier_fixture(name);
+        let conn = rusqlite::Connection::open(dir.join("metadata.sqlite3")).unwrap();
+        let workspace_id = format!("ws-{name}");
+        let saved = persist::load_workspace_restore_bounded(&conn, &workspace_id)
+            .unwrap()
+            .window
+            .expect("seeded saved window");
+        assert_eq!(saved.tabs.len(), 2);
+        client
+            .send_command(RuntimeCommand::RequestMuxSnapshot)
+            .unwrap();
+        client
+            .send_command(RuntimeCommand::DurableEventBarrier {
+                correlation_id: 401,
+            })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(5), |event| {
+            matches!(
+                event,
+                RuntimeEvent::DurableEventBarrierReached {
+                    correlation_id: 401
+                }
+            )
+            .then_some(())
+        });
+        assert!(
+            probe.seen.iter().any(|event| matches!(event,
+                RuntimeEvent::MuxUpdated { snapshot } if snapshot.tabs.is_empty()
+            )),
+            "the query must publish the empty live mux without materializing saved panes"
+        );
+        let after_query = persist::load_workspace_restore_bounded(&conn, &workspace_id)
+            .unwrap()
+            .window
+            .expect("snapshot query erased the saved window");
+        assert_eq!(
+            after_query, saved,
+            "read-only query erased persisted tabs/panes before Catalog could observe them"
+        );
+
+        // The catalog still observes saved panes and can request deferred restoration.
+        client
+            .send_command(RuntimeCommand::RestoreWorkspacePane {
+                pane: first_pane.clone(),
+            })
+            .unwrap();
+        let restored = probe.wait_for(Duration::from_secs(5), |event| match event {
+            RuntimeEvent::MuxUpdated { snapshot }
+                if snapshot
+                    .tabs
+                    .iter()
+                    .flat_map(|tab| &tab.panes)
+                    .any(|pane| pane.id == first_pane && pane.session_id.is_some()) =>
+            {
+                Some(snapshot.clone())
+            }
+            _ => None,
+        });
+        assert!(
+            restored
+                .tabs
+                .iter()
+                .flat_map(|tab| &tab.panes)
+                .any(|pane| pane.id == second_pane && pane.session_id.is_none())
+        );
+        drop(conn);
+        drop(client);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn restore_workspace_pane_durable_event_barrier_follows_requested_mux_result() {
         let (client, mut probe, first_pane, _second_pane, dir) =
             lazy_restore_durable_event_barrier_fixture("restore-durable-barrier-order");
@@ -9264,6 +9381,251 @@ mod tests {
             _ => None,
         });
         assert_ne!(new_session, session);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn direct_terminal_input_reads_live_modes_before_pty_write() {
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("direct-input"),
+            RedactionService::new(),
+            spec(
+                "/bin/sh",
+                &[
+                    "-c",
+                    r"stty raw -echo; printf '\033[?1h\033[?2004hREADY\r\n'; dd bs=1 count=16 2>/dev/null | od -An -tx1; sleep 30",
+                ],
+            ),
+            None,
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        let session = probe.wait_for(Duration::from_secs(5), |event| match event {
+            RuntimeEvent::ShellSpawned { session } => Some(*session),
+            _ => None,
+        });
+        probe.wait_for(Duration::from_secs(5), |event| match event {
+            RuntimeEvent::Viewport { snapshot, .. }
+                if snapshot_text(snapshot, 0).contains("READY") =>
+            {
+                Some(())
+            }
+            _ => None,
+        });
+        for input in [
+            crate::TerminalInput::Key {
+                key: "up".into(),
+                ctrl: false,
+                alt: false,
+                shift: false,
+                meta: false,
+            },
+            crate::TerminalInput::Text {
+                text: "x".into(),
+                paste: true,
+            },
+        ] {
+            client
+                .send_command(RuntimeCommand::WriteTerminalInput { session, input })
+                .unwrap();
+        }
+        probe.wait_for(Duration::from_secs(5), |event| match event {
+            RuntimeEvent::Viewport { snapshot, .. }
+                if snapshot_text(snapshot, 1)
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    == [
+                        "1b", "4f", "41", "1b", "5b", "32", "30", "30", "7e", "78", "1b", "5b",
+                        "32", "30", "31", "7e",
+                    ] =>
+            {
+                Some(())
+            }
+            _ => None,
+        });
+        client
+            .send_command(RuntimeCommand::KillSession { session })
+            .unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn direct_input_refreshes_queued_mode_changes_without_viewport_wait() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, _events) = admission_worker(resolver, "direct-queued-modes");
+        let id = SessionId(1);
+        let (output_tx, output_rx) = std::sync::mpsc::channel();
+        let live = Session::spawn_with_spec_and_output_wake(
+            id, session::SessionKind::Shell,
+            &spec("/bin/sh", &["-c", r"stty raw -echo; printf '\033[?1h\033[?2004hREADY\r\n'; dd bs=1 count=16 2>/dev/null | od -An -tx1; sleep 30"]),
+            80, 24, 100, Arc::new(move || { let _ = output_tx.send(()); }),
+        ).unwrap();
+        worker.sessions.insert(id, live);
+        output_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(worker.sessions[&id].pending_output_bytes() > 0);
+        assert!(!worker.sessions[&id].application_cursor());
+        assert!(!worker.sessions[&id].bracketed_paste());
+        for input in [
+            crate::TerminalInput::Key {
+                key: "up".into(),
+                ctrl: false,
+                alt: false,
+                shift: false,
+                meta: false,
+            },
+            crate::TerminalInput::Text {
+                text: "x".into(),
+                paste: true,
+            },
+        ] {
+            worker.handle_command(RuntimeCommand::WriteTerminalInput { session: id, input });
+        }
+        assert!(
+            worker.sessions[&id].application_cursor(),
+            "direct command must parse queued DECCKM before encoding"
+        );
+        assert!(
+            worker.sessions[&id].bracketed_paste(),
+            "direct command must parse queued DEC2004 before encoding"
+        );
+        let expected = [
+            "1b", "4f", "41", "1b", "5b", "32", "30", "30", "7e", "78", "1b", "5b", "32", "30",
+            "31", "7e",
+        ];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let effects = worker.collect_session_pump_effects(&[id], false, true);
+            worker.finish_session_pump_effects(effects);
+            if worker.sessions[&id]
+                .screen_text()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .windows(expected.len())
+                .any(|bytes| bytes == expected)
+            {
+                break;
+            }
+            output_rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn direct_input_mode_refresh_is_bounded_and_flood_keeps_interrupt_keys_available() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, _events) = admission_worker(resolver, "direct-mode-flood");
+        let pressures = Arc::clone(&worker.subscribers.lock().unwrap()[0].input_pressures);
+        let id = SessionId(1);
+        let (output_tx, output_rx) = std::sync::mpsc::channel();
+        let live = Session::spawn_with_spec_and_output_wake(
+            id,
+            session::SessionKind::Shell,
+            &spec("/bin/sh", &["-c", "stty raw -echo; dd if=/dev/zero bs=1024 count=768 2>/dev/null; dd bs=1 count=4 2>/dev/null | od -An -tx1; sleep 30"]),
+            80, 24, 100,
+            Arc::new(move || { let _ = output_tx.send(()); }),
+        ).unwrap();
+        let total = 768 * 1024;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while live.pending_output_bytes() < total {
+            output_rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap();
+        }
+        worker.sessions.insert(id, live);
+        worker.handle_command(RuntimeCommand::WriteTerminalInput {
+            session: id,
+            input: crate::TerminalInput::Text {
+                text: "wrong-paste".into(),
+                paste: true,
+            },
+        });
+        assert_eq!(
+            worker.sessions[&id].pending_output_bytes(),
+            total - Session::INPUT_GUARD_OUTPUT_MAX_BYTES
+        );
+        assert!(pressures.lock().unwrap().values().any(|event| matches!(event, RuntimeEvent::PtyInputPressure {
+            session,
+            pressure: pty::PtyInputPressure { reason: pty::PtyInputRejectReason::AdmissionDenied, queued_bytes: 0, queued_messages: 0, .. },
+        } if *session == id)), "bounded mode refresh must report a transient denial");
+        for input in [
+            crate::TerminalInput::Key {
+                key: "c".into(),
+                ctrl: true,
+                alt: false,
+                shift: false,
+                meta: false,
+            },
+            crate::TerminalInput::Key {
+                key: "d".into(),
+                ctrl: true,
+                alt: false,
+                shift: false,
+                meta: false,
+            },
+            crate::TerminalInput::Key {
+                key: "esc".into(),
+                ctrl: false,
+                alt: false,
+                shift: false,
+                meta: false,
+            },
+            crate::TerminalInput::Text {
+                text: "x".into(),
+                paste: false,
+            },
+        ] {
+            worker.handle_command(RuntimeCommand::WriteTerminalInput { session: id, input });
+        }
+        assert!(
+            worker.sessions[&id].pending_output_bytes()
+                >= total - Session::INPUT_GUARD_OUTPUT_MAX_BYTES,
+            "mode-independent input must not drain or wait for the output flood"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let effects = worker.collect_session_pump_effects(&[id], false, true);
+            worker.finish_session_pump_effects(effects);
+            if worker.sessions[&id]
+                .screen_text()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .windows(4)
+                .any(|bytes| bytes == ["03", "04", "1b", "78"])
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "PTY capture timed out: {:?}",
+                worker.sessions[&id].screen_text()
+            );
+            if worker.sessions[&id].pending_output_bytes() == 0 {
+                output_rx
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "PTY capture {error:?}: {:?}",
+                            worker.sessions[&id].screen_text()
+                        )
+                    });
+            }
+        }
     }
 
     #[test]

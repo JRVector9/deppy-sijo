@@ -217,13 +217,18 @@ impl WebRemoteServer {
         self.core.dashboard().wake_fn()
     }
 
-    /// 활성 workspace worker 이벤트 구독을 대시보드에 붙인다(시작 + 워크스페이스 전환마다).
-    pub fn set_runtime_source(&self, receiver: runtime::RuntimeEventReceiver) {
-        self.core.dashboard().set_runtime_source(receiver);
+    /// 이벤트 구독과 명령 싱크를 같은 worker binding으로 원자적으로 교체한다.
+    pub fn set_runtime_binding(
+        &self,
+        receiver: runtime::RuntimeEventReceiver,
+        sink: Option<dashboard::CommandSink>,
+    ) {
+        self.core.dashboard().set_runtime_binding(receiver, sink);
     }
 
     /// web → runtime 명령 싱크를 붙인다 (P5b — 시청 lease 전송용, receiver와 같은 시점에
     /// 교체). 미설정이면 터미널 뷰어만 비활성 — 대시보드/승인은 그대로 동작한다.
+    #[cfg(test)]
     pub fn set_runtime_command_sink(&self, sink: dashboard::CommandSink) {
         self.core.dashboard().set_command_sink(sink);
     }

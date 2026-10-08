@@ -127,6 +127,7 @@ pub fn serve(
     let mut watch = WatchBinding {
         dashboard,
         watched: None,
+        generation: 0,
     };
     stream_loop(&mut ws, dashboard, stop, &mut watch);
     drop(watch);
@@ -139,21 +140,33 @@ struct WatchBinding<'a> {
     dashboard: &'a DashboardHandle,
     /// 시청 중인 **영속 세션 UUID** (I1 — u64는 이 계층에 없다).
     watched: Option<String>,
+    generation: u64,
 }
 
 impl WatchBinding<'_> {
     /// 시청 대상을 전환한다 (None = 해제). 같은 대상 재지정은 브리지가 no-op 처리한다.
     fn set(&mut self, to: Option<String>) {
         let from = std::mem::replace(&mut self.watched, to);
-        self.dashboard
-            .rebind_watch(from.as_deref(), self.watched.as_deref());
+        self.generation = self.dashboard.rebind_watch_for_connection(
+            from.as_deref(),
+            self.watched.as_deref(),
+            self.generation,
+        );
+    }
+
+    fn is_current(&self, uuid: &str) -> bool {
+        self.watched.as_deref() == Some(uuid)
+            && self
+                .dashboard
+                .watch_binding_is_current(uuid, self.generation)
     }
 }
 
 impl Drop for WatchBinding<'_> {
     fn drop(&mut self) {
         if let Some(uuid) = self.watched.take() {
-            self.dashboard.rebind_watch(Some(&uuid), None);
+            self.dashboard
+                .rebind_watch_for_connection(Some(&uuid), None, self.generation);
         }
     }
 }
@@ -233,6 +246,7 @@ fn stream_loop(
         // 시청 화면 push (P5c) — 슬롯이 내 seq보다 새로우면 baseline과 diff해 전송.
         // baseline 없음(첫 프레임/전환/재동기화)이면 keyframe이 나간다.
         if let Some(session) = watch.watched.clone()
+            && watch.is_current(&session)
             && let Some((seq, snapshot)) = dashboard.viewport_if_newer(&session, viewport_seq)
         {
             let frame =
@@ -245,6 +259,7 @@ fn stream_loop(
         }
         // 입력 큐 압박 push (P6a) — composer 전송 버튼 게이트 신호.
         if let Some(session) = watch.watched.clone()
+            && watch.is_current(&session)
             && let Some((version, json)) = dashboard.input_pressure_if_newer(&session, pressure_ver)
         {
             if ws.send(Message::Text(json.into())).is_err() {
@@ -300,14 +315,18 @@ fn stream_loop(
                         }
                         // 최소 제어 (P5d) — 이 접속이 시청 중인 세션에만 허용한다.
                         Some(ClientMsg::Key { session, key }) => {
-                            if watch.watched.as_deref() == Some(session.as_str()) {
-                                dashboard.send_key(&session, &key);
+                            if watch.is_current(&session) {
+                                dashboard.send_key_for_connection(&session, watch.generation, &key);
                             }
                         }
                         // 스크롤백 이동 — 역시 시청 중 세션에만 (스크롤백 열람).
                         Some(ClientMsg::Scroll { session, delta }) => {
-                            if watch.watched.as_deref() == Some(session.as_str()) {
-                                dashboard.send_scroll(&session, delta);
+                            if watch.is_current(&session) {
+                                dashboard.send_scroll_for_connection(
+                                    &session,
+                                    watch.generation,
+                                    delta,
+                                );
                             }
                         }
                         // 자유 텍스트 입력 (P6a) — 시청 중 세션에만. 정규화/제어문자
@@ -318,15 +337,57 @@ fn stream_loop(
                             text,
                             submit,
                         }) => {
-                            if watch.watched.as_deref() == Some(session.as_str()) {
+                            if watch.is_current(&session) {
                                 if text.len() <= MAX_INPUT_TEXT_BYTES {
-                                    dashboard.send_input(&session, &text, submit);
+                                    dashboard.send_input_for_connection(
+                                        &session,
+                                        watch.generation,
+                                        &text,
+                                        submit,
+                                    );
                                 } else {
                                     tracing::warn!(
                                         len = text.len(),
                                         "web-remote: Input 텍스트 상한 초과 — 무시"
                                     );
                                 }
+                            }
+                        }
+                        Some(ClientMsg::DirectInput {
+                            session,
+                            text,
+                            paste,
+                        }) => {
+                            if watch.is_current(&session)
+                                && text.len() <= runtime::DIRECT_INPUT_TEXT_BYTES_MAX
+                            {
+                                dashboard.send_terminal_input(
+                                    &session,
+                                    watch.generation,
+                                    runtime::TerminalInput::Text { text, paste },
+                                );
+                            }
+                        }
+                        Some(ClientMsg::DirectKey {
+                            session,
+                            key,
+                            ctrl,
+                            alt,
+                            shift,
+                            meta,
+                        }) => {
+                            if watch.is_current(&session) && key.len() <= 32 {
+                                dashboard.send_terminal_input(
+                                    &session,
+                                    watch.generation,
+                                    runtime::TerminalInput::Key {
+                                        key,
+                                        ctrl,
+                                        alt,
+                                        shift,
+                                        meta,
+                                    },
+                                );
                             }
                         }
                         // 워크스페이스 전환 요청 (미러 진입 — I1b-2). watch 게이트 없음:

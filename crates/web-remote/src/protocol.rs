@@ -22,7 +22,8 @@ use serde::{Deserialize, Serialize};
 /// 클라는 라벨 맵/CSS에 이 값이 없어 영어 "suspended"를 그대로 표시하므로(graceful하나
 /// 미번역), 버전 불일치로 재로드시켜 새 자산을 받게 한다 (리뷰 I1b-1 P3).
 /// v4: owner-cell grapheme boundaries for canvas text advance.
-pub const PROTOCOL_VERSION: u32 = 4;
+/// v5: explicit direct text and named keys; resize ownership and local history contracts.
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// 클라이언트 → 서버.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -65,6 +66,26 @@ pub enum ClientMsg {
         text: String,
         #[serde(default)]
         submit: bool,
+    },
+    /// Committed typing/IME text or explicit paste. Control bytes use DirectKey.
+    DirectInput {
+        session: String,
+        text: String,
+        #[serde(default)]
+        paste: bool,
+    },
+    /// Named lowercase terminal key or one printable ASCII Ctrl/Alt key.
+    DirectKey {
+        session: String,
+        key: String,
+        #[serde(default)]
+        ctrl: bool,
+        #[serde(default)]
+        alt: bool,
+        #[serde(default)]
+        shift: bool,
+        #[serde(default)]
+        meta: bool,
     },
     /// 워크스페이스 전환 요청 (미러 진입 — I1b-2). 폰이 비활성 워크스페이스로 들어가
     /// 이어서 작업할 때 보낸다. 데스크탑 active를 그 워크스페이스로 전환시킨다(하드 미러 —
@@ -384,6 +405,20 @@ pub fn encode_viewport(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_terminal_input_wire_accepts_explicit_text_and_keys() {
+        assert!(
+            ClientMsg::parse(
+                r#"{"type":"direct_input","session":"u7","text":"한글 ","paste":false}"#,
+            )
+            .is_some()
+        );
+        assert!(ClientMsg::parse(
+            r#"{"type":"direct_key","session":"u7","key":"left","ctrl":true,"alt":false,"shift":false,"meta":false}"#,
+        )
+        .is_some());
+    }
 
     #[test]
     fn auth_프레임을_파싱한다() {

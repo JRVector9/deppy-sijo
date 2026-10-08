@@ -940,6 +940,10 @@ impl TerminalBackend for AlacrittyBackend {
         self.term.mode().contains(TermMode::BRACKETED_PASTE)
     }
 
+    fn application_cursor(&self) -> bool {
+        self.term.mode().contains(TermMode::APP_CURSOR)
+    }
+
     /// grid 전체(history+화면)를 truecolor SGR ANSI로 덤프한다. 새 백엔드에
     /// 그대로 feed하면 스크롤백·색·wide char가 복원된다 (압축 아카이브 왕복용).
     /// wrapped 행은 개행 없이 이어붙여 복원 시 reflow가 자연스럽다.
@@ -2116,6 +2120,16 @@ mod tests {
         assert!(backend.bracketed_paste());
         feed(&mut backend, b"\x1b[?2004l");
         assert!(!backend.bracketed_paste());
+    }
+
+    #[test]
+    fn application_cursor_mode_is_read_from_live_backend() {
+        let mut backend = AlacrittyBackend::new(80, 24, 100);
+        assert!(!backend.application_cursor());
+        feed(&mut backend, b"\x1b[?1h");
+        assert!(backend.application_cursor());
+        feed(&mut backend, b"\x1b[?1l");
+        assert!(!backend.application_cursor());
     }
 
     #[test]

@@ -9,7 +9,7 @@
       setTimeout(() => {
         this.readyState = FakeSocket.OPEN;
         this.dispatch('open');
-        this.dispatch('message', { data: JSON.stringify({ type: 'welcome', v: 4 }) });
+        this.dispatch('message', { data: JSON.stringify({ type: 'welcome', v: this.version }) });
         this.dispatch('message', { data: JSON.stringify({
           type: 'dashboard',
           workspaces: [{ id: 'ws-1', name: 'Design', current_directory: '/Users/jr/Design', state: 'active', sessions: [
@@ -31,7 +31,11 @@
     dispatch(type, event = {}) {
       for (const listener of this.listeners.get(type) || []) listener(event);
     }
-    send(value) { mobileSent.push(JSON.parse(value)); }
+    send(value) {
+      const frame = JSON.parse(value);
+      mobileSent.push(frame);
+      if (frame.type === 'auth') this.version = frame.v;
+    }
     close() { this.readyState = 3; }
   }
   globalThis.WebSocket = FakeSocket;
@@ -69,6 +73,7 @@ async function run() {
   check(!document.getElementById('viewer').hidden, 'terminal opens from workspace card');
   check(document.getElementById('viewer-title').textContent === 'Design', 'terminal workspace title');
   check(document.getElementById('viewer-session-chip').textContent === 'Claude', 'terminal title chip');
+  document.getElementById('viewer-mode-composer').click();
   check(getComputedStyle(document.querySelector('.composer')).display === 'grid', 'compact four-column composer');
   const composer = document.getElementById('composer-text');
   composer.value = '모바일 입력';

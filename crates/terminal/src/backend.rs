@@ -247,6 +247,11 @@ pub trait TerminalBackend {
 
     fn bracketed_paste(&self) -> bool;
 
+    /// DEC cursor-key mode (DECCKM), queried at direct key dispatch time.
+    fn application_cursor(&self) -> bool {
+        false
+    }
+
     /// 현재 화면(스크롤 무시, 실제 grid)의 텍스트 — status detector용 경량 조회.
     /// TerminalViewportSnapshot을 만들지 않는다 (설계문서 PR-12: hidden session 규칙).
     fn screen_text(&self) -> String;

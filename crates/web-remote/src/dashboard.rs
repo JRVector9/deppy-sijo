@@ -430,8 +430,10 @@ struct Inner {
     dashboard_dirty: bool,
     /// 접속 등록/resolve 직후 즉시 1회 폴링을 강제한다(주기와 무관).
     force_poll: bool,
-    /// 활성 workspace worker 구독. 전환 시 [`DashboardHandle::set_runtime_source`]가 교체한다.
+    /// 활성 workspace worker 구독. 전환 시 [`DashboardHandle::set_runtime_binding`]가 교체한다.
     receiver: Option<RuntimeEventReceiver>,
+    needs_initial_mux: bool,
+    last_mux_request: Option<Instant>,
     /// 활성 워크스페이스 세션의 **라이브 상태**(런타임 이벤트 유래 — egui 프레임과 무관).
     sessions: BTreeMap<u64, SessionEntry>,
     /// 앱이 push한 워크스페이스 구성(활성+warm+유휴)과 세션 표시명. 상태가 바뀔 때만
@@ -451,6 +453,8 @@ struct Inner {
     notice: Option<String>,
     /// 세션별 시청 접속 집계 (P5b). 0→1에서 lease on, 1→0에서 lease off를 보낸다.
     watchers: BTreeMap<String, WatcherEntry>,
+    /// Invalidates each socket binding when the runtime source changes.
+    watch_generation: u64,
     /// 시청 세션별 최신 bracketed paste 모드 (P6a — Viewport 이벤트에서 캐시).
     /// send_input의 wrap 판정에 쓴다. 시청 종료 시 함께 정리된다.
     bracketed: BTreeMap<String, bool>,
@@ -524,6 +528,8 @@ impl DashboardHandle {
                 dashboard_dirty: false,
                 force_poll: false,
                 receiver: None,
+                needs_initial_mux: false,
+                last_mux_request: None,
                 sessions: BTreeMap::new(),
                 workspaces: Vec::new(),
                 resource: None,
@@ -533,6 +539,7 @@ impl DashboardHandle {
                 switch_sink: None,
                 notice: None,
                 watchers: BTreeMap::new(),
+                watch_generation: 1,
                 bracketed: BTreeMap::new(),
                 ids: IdMap::default(),
             }),
@@ -584,20 +591,45 @@ impl DashboardHandle {
     /// 세션**이 승격되고 Ctrl-C까지 그 세션으로 들어간다. 옛 worker의 lease는 명시
     /// 해제를 보내지 않아도 TTL(≤45s)로 원복된다(Warm 전환 직후라 유계 허용).
     /// 폰 시청자는 프레임이 멎으므로 새 세션 목록에서 다시 선택한다.
-    pub fn set_runtime_source(&self, receiver: RuntimeEventReceiver) {
+    pub fn set_runtime_binding(&self, receiver: RuntimeEventReceiver, sink: Option<CommandSink>) {
         {
             let mut inner = self.shared.inner.lock().expect("dashboard inner lock");
+            Self::clear_watch_state(&mut inner, &self.shared);
+            inner.ids.clear();
+            inner.sessions.clear();
             inner.receiver = Some(receiver);
+            inner.command_sink = sink;
+            inner.needs_initial_mux = true;
+            inner.last_mux_request = None;
+            Self::request_initial_mux(&mut inner);
             inner.dirty = true;
             inner.dashboard_dirty = true;
-            Self::clear_watch_state(&mut inner, &self.shared);
         }
         self.shared.cvar.notify_all();
+    }
+
+    // A queue drop is indistinguishable from a pending response. Keep one query
+    // pending until a current-source MuxUpdated arrives, retrying at most once/sec.
+    fn request_initial_mux(inner: &mut Inner) {
+        if inner.needs_initial_mux
+            && inner.receiver.is_some()
+            && inner
+                .last_mux_request
+                .is_none_or(|last| last.elapsed() >= POLL_INTERVAL)
+            && let Some(sink) = &inner.command_sink
+        {
+            inner.last_mux_request = Some(Instant::now());
+            sink(RuntimeCommand::RequestMuxSnapshot);
+        }
     }
 
     /// 시청 상태(watcher refcount + 화면 슬롯)를 전부 비운다 — 새 worker 구독 시
     /// 호출. 같은 inner 임계구역에서 published를 중첩 취득해 원자화한다.
     fn clear_watch_state(inner: &mut Inner, shared: &Shared) {
+        inner.watch_generation = inner
+            .watch_generation
+            .checked_add(1)
+            .expect("watch generation");
         inner.watchers.clear();
         inner.bracketed.clear();
         let mut published = shared.published.lock().expect("published lock");
@@ -606,6 +638,7 @@ impl DashboardHandle {
     }
 
     /// web → runtime 명령 싱크를 붙인다 (P5b — receiver와 같은 시점에 교체된다).
+    #[cfg(test)]
     pub fn set_command_sink(&self, sink: CommandSink) {
         let mut inner = self.shared.inner.lock().expect("dashboard inner lock");
         inner.command_sink = Some(sink);
@@ -658,12 +691,32 @@ impl DashboardHandle {
     ///
     /// `from`과 `to`는 **영속 세션 UUID**다 (I1). lease 명령은 현재 워커의 u64로 변환해서만
     /// 나간다 — 워커가 모르는 UUID(전환된 워크스페이스 등)면 명령 자체를 만들지 않는다.
+    #[cfg(test)]
     pub fn rebind_watch(&self, from: Option<&str>, to: Option<&str>) {
-        if from == to {
-            return;
-        }
+        let generation = self
+            .shared
+            .inner
+            .lock()
+            .expect("dashboard inner lock")
+            .watch_generation;
+        self.rebind_watch_for_connection(from, to, generation);
+    }
+
+    pub fn rebind_watch_for_connection(
+        &self,
+        from: Option<&str>,
+        to: Option<&str>,
+        generation: u64,
+    ) -> u64 {
         let mut commands: Vec<RuntimeCommand> = Vec::new();
         let mut inner = self.shared.inner.lock().expect("dashboard inner lock");
+        // An old socket cannot remove the watch registered by a new socket after
+        // invalidation. An explicit watch from the old socket registers afresh.
+        let from = from.filter(|_| generation == inner.watch_generation);
+        Self::request_initial_mux(&mut inner);
+        if from == to {
+            return inner.watch_generation;
+        }
         if let Some(old) = from
             && let Some(entry) = inner.watchers.get_mut(old)
         {
@@ -702,30 +755,59 @@ impl DashboardHandle {
                 sink(command);
             }
         }
+        inner.watch_generation
+    }
+
+    pub fn watch_binding_is_current(&self, uuid: &str, generation: u64) -> bool {
+        let inner = self.shared.inner.lock().expect("dashboard inner lock");
+        generation == inner.watch_generation
+            && inner.watchers.contains_key(uuid)
+            && inner.ids.session(uuid).is_some()
     }
 
     /// 시청 세션에 composer 텍스트를 입력한다 (P6a). `uuid`는 **영속 세션 UUID**다 —
     /// 현재 워커의 u64로 변환되지 않으면(다른 워크스페이스/죽은 세션) 아무것도 하지 않는다.
+    #[cfg(test)]
     pub fn send_input(&self, uuid: &str, text: &str, submit: bool) {
-        let (sink, session, bracketed) = {
-            let inner = self.shared.inner.lock().expect("dashboard inner lock");
-            if !inner.watchers.contains_key(uuid) {
-                return; // 시청 중이 아니다(전환으로 정리됐을 수 있다 — 리뷰 P2-1)
-            }
-            let Some(session) = inner.ids.session(uuid) else {
-                return; // 이 워커가 모르는 세션 — 명령 자체를 만들지 않는다 (I1)
-            };
-            (
-                inner.command_sink.clone(),
-                session,
-                inner.bracketed.get(uuid).copied().unwrap_or(false),
-            )
+        let generation = self
+            .shared
+            .inner
+            .lock()
+            .expect("dashboard inner lock")
+            .watch_generation;
+        self.send_input_for_connection(uuid, generation, text, submit);
+    }
+
+    pub fn send_input_for_connection(&self, uuid: &str, generation: u64, text: &str, submit: bool) {
+        let inner = self.shared.inner.lock().expect("dashboard inner lock");
+        let Some(session) = Self::resolve_watched(&inner, uuid, generation) else {
+            return;
         };
-        let Some(sink) = sink else { return };
+        let Some(sink) = &inner.command_sink else {
+            return;
+        };
+        let bracketed = inner.bracketed.get(uuid).copied().unwrap_or(false);
         if let Some(bytes) = encode_input(text, submit, bracketed) {
             sink(RuntimeCommand::WriteInput {
                 session: SessionId(session),
                 bytes,
+            });
+        }
+    }
+
+    /// Resolve and dispatch while holding the worker binding lock: a workspace
+    /// switch cannot pair an old session id with a new worker's command sink.
+    pub fn send_terminal_input(&self, uuid: &str, generation: u64, input: runtime::TerminalInput) {
+        let inner = self.shared.inner.lock().expect("dashboard inner lock");
+        if generation != inner.watch_generation || !inner.watchers.contains_key(uuid) {
+            return;
+        }
+        if let Some(session) = inner.ids.session(uuid)
+            && let Some(sink) = &inner.command_sink
+        {
+            sink(RuntimeCommand::WriteTerminalInput {
+                session: SessionId(session),
+                input,
             });
         }
     }
@@ -743,32 +825,35 @@ impl DashboardHandle {
     /// 시청 중이고 **현재 워커가 아는** 세션이면 u64를 돌려준다 — 명령 게이트.
     /// 워크스페이스 전환 후 남은 접속 바인딩(리뷰 P2-1)과 worker-로컬 id 앨리어싱(I1)을
     /// 한 지점에서 막는다.
-    fn resolve_watched(&self, uuid: &str) -> Option<u64> {
-        let inner = self.shared.inner.lock().expect("dashboard inner lock");
-        if !inner.watchers.contains_key(uuid) {
+    fn resolve_watched(inner: &Inner, uuid: &str, generation: u64) -> Option<u64> {
+        if generation != inner.watch_generation || !inner.watchers.contains_key(uuid) {
             return None;
         }
         inner.ids.session(uuid)
     }
 
     /// 시청 세션의 스크롤백을 이동한다. delta 양수 = 과거로.
+    #[cfg(test)]
     pub fn send_scroll(&self, uuid: &str, delta: i32) {
-        const SCROLL_DELTA_CAP: i32 = 100_000;
-        let Some(session) = self.resolve_watched(uuid) else {
-            return;
-        };
-        let delta = delta.clamp(-SCROLL_DELTA_CAP, SCROLL_DELTA_CAP);
-        if delta == 0 {
-            return;
-        }
-        let sink = self
+        let generation = self
             .shared
             .inner
             .lock()
             .expect("dashboard inner lock")
-            .command_sink
-            .clone();
-        if let Some(sink) = sink {
+            .watch_generation;
+        self.send_scroll_for_connection(uuid, generation, delta);
+    }
+
+    pub fn send_scroll_for_connection(&self, uuid: &str, generation: u64, delta: i32) {
+        const SCROLL_DELTA_CAP: i32 = 100_000;
+        let inner = self.shared.inner.lock().expect("dashboard inner lock");
+        let Some(session) = Self::resolve_watched(&inner, uuid, generation) else {
+            return;
+        };
+        let delta = delta.clamp(-SCROLL_DELTA_CAP, SCROLL_DELTA_CAP);
+        if delta != 0
+            && let Some(sink) = &inner.command_sink
+        {
             sink(RuntimeCommand::Scroll {
                 session: SessionId(session),
                 delta,
@@ -778,7 +863,18 @@ impl DashboardHandle {
 
     /// 시청 세션에 제어 키를 보낸다 (P5d + P6a 확장 — 화살표/Esc/Tab 등).
     /// 제어 시퀀스는 이 화이트리스트로만 생성된다(자유 텍스트의 제어문자는 strip).
+    #[cfg(test)]
     pub fn send_key(&self, uuid: &str, key: &str) {
+        let generation = self
+            .shared
+            .inner
+            .lock()
+            .expect("dashboard inner lock")
+            .watch_generation;
+        self.send_key_for_connection(uuid, generation, key);
+    }
+
+    pub fn send_key_for_connection(&self, uuid: &str, generation: u64, key: &str) {
         let bytes: &[u8] = match key {
             "ctrl_c" => b"\x03",
             "ctrl_d" => b"\x04",
@@ -792,17 +888,11 @@ impl DashboardHandle {
             "left" => b"\x1b[D",
             _ => return,
         };
-        let Some(session) = self.resolve_watched(uuid) else {
+        let inner = self.shared.inner.lock().expect("dashboard inner lock");
+        let Some(session) = Self::resolve_watched(&inner, uuid, generation) else {
             return;
         };
-        let sink = self
-            .shared
-            .inner
-            .lock()
-            .expect("dashboard inner lock")
-            .command_sink
-            .clone();
-        if let Some(sink) = sink {
+        if let Some(sink) = &inner.command_sink {
             sink(RuntimeCommand::WriteInput {
                 session: SessionId(session),
                 bytes: bytes.to_vec(),
@@ -871,6 +961,7 @@ impl DashboardHandle {
             let mut inner = self.shared.inner.lock().expect("dashboard inner lock");
             inner.force_poll = true;
             inner.dirty = true;
+            Self::request_initial_mux(&mut inner);
             // 첫 접속(접속 0 구간)에는 발행을 건너뛰므로, 등록 시점에 최신 Dashboard를
             // 반드시 한 번 만들어 Welcome 직후 첫 프레임이 나가게 한다 (PR-F1).
             inner.dashboard_dirty = true;
@@ -1071,8 +1162,15 @@ fn run(shared: &Arc<Shared>) {
         let mut staged_viewports: BTreeMap<String, Arc<runtime::TerminalViewportSnapshot>> =
             BTreeMap::new();
         let mut staged_pressure: BTreeMap<String, String> = BTreeMap::new();
+        let mut initial_mux_received = false;
+        let mut source_disconnected = false;
         if let Some(receiver) = inner.receiver.as_ref() {
             let events = receiver.drain();
+            source_disconnected = receiver.is_disconnected();
+            initial_mux_received = inner.needs_initial_mux
+                && events
+                    .iter()
+                    .any(|event| matches!(event, RuntimeEvent::MuxUpdated { .. }));
             if receiver.take_overflowed() {
                 tracing::warn!(
                     "web-remote 대시보드 이벤트 큐 overflow — 상태가 잠시 뒤처질 수 있음"
@@ -1135,6 +1233,30 @@ fn run(shared: &Arc<Shared>) {
                 }
             }
         }
+        if source_disconnected {
+            DashboardHandle::clear_watch_state(&mut inner, shared);
+            inner.ids.clear();
+            inner.sessions.clear();
+            inner.receiver = None;
+            inner.command_sink = None;
+            inner.needs_initial_mux = false;
+            inner.last_mux_request = None;
+            staged_viewports.clear();
+            staged_pressure.clear();
+            rebuild_dashboard = true;
+        } else if initial_mux_received {
+            inner.needs_initial_mux = false;
+            inner.last_mux_request = None;
+            // An explicit Watch may precede the first response. Its UUID only
+            // gains a viewing lease once the new worker confirms membership.
+            if let Some(sink) = &inner.command_sink {
+                for uuid in inner.watchers.keys() {
+                    if let Some(session) = inner.ids.session(uuid) {
+                        sink(lease_command(session, true));
+                    }
+                }
+            }
+        }
         // 시청 화면/입력압박 슬롯 반영 — watcher 판정과 **같은 inner 임계구역에서**
         // published를 중첩 취득해 삽입한다 (P5 리뷰 ②-P1: inner 해제 후 삽입하면 그 사이
         // 완주한 rebind_watch(마지막 이탈)의 슬롯 제거를 덮어 시청 0 슬롯이 부활·잔존한다).
@@ -1160,6 +1282,9 @@ fn run(shared: &Arc<Shared>) {
 
         // 2) 승인 폴링 — 접속 ≥1 + (강제 or 주기 만기)에서만. 접속 0이면 완전 정지.
         let conns = shared.connections.load(Ordering::SeqCst);
+        if conns > 0 {
+            DashboardHandle::request_initial_mux(&mut inner);
+        }
         let should_poll =
             conns > 0 && (inner.force_poll || inner.last_poll.elapsed() >= POLL_INTERVAL);
         inner.force_poll = false;
@@ -1502,6 +1627,312 @@ mod tests {
     }
 
     #[test]
+    fn direct_input_requires_current_connection_generation_and_exact_uuid() {
+        let (handle, thread) = DashboardHandle::spawn(None);
+        let (sink, captured) = capture_sink();
+        handle.set_command_sink(sink);
+        seed_ids(&handle, &[7]);
+        let uuid = test_uuid(7);
+        let old = handle.rebind_watch_for_connection(None, Some(&uuid), 0);
+        let text = || runtime::TerminalInput::Text {
+            text: "한글 ".into(),
+            paste: false,
+        };
+        captured.lock().unwrap().clear();
+        handle.send_terminal_input(&uuid, old, text());
+        assert!(matches!(
+            captured.lock().unwrap().last(),
+            Some(RuntimeCommand::WriteTerminalInput {
+                session: SessionId(7),
+                ..
+            })
+        ));
+        {
+            let mut inner = handle.shared.inner.lock().unwrap();
+            DashboardHandle::clear_watch_state(&mut inner, &handle.shared);
+        }
+        let fresh = handle.rebind_watch_for_connection(None, Some(&uuid), 0);
+        assert_ne!(old, fresh);
+        captured.lock().unwrap().clear();
+        handle.send_terminal_input(&uuid, old, text());
+        handle.send_input_for_connection(&uuid, old, "stale composer", true);
+        handle.send_key_for_connection(&uuid, old, "ctrl_c");
+        handle.send_scroll_for_connection(&uuid, old, 5);
+        handle.send_terminal_input("another-session", fresh, text());
+        assert!(captured.lock().unwrap().is_empty());
+        handle.rebind_watch_for_connection(Some(&uuid), None, old);
+        assert!(
+            handle.watch_binding_is_current(&uuid, fresh),
+            "stale socket drop removed fresh watch"
+        );
+        handle.send_terminal_input(&uuid, fresh, text());
+        assert!(matches!(
+            captured.lock().unwrap().last(),
+            Some(RuntimeCommand::WriteTerminalInput { .. })
+        ));
+        handle.stop();
+        thread.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    fn direct_test_runtime() -> (runtime::InProcessRuntimeClient, std::path::PathBuf) {
+        struct NoSecrets;
+        impl runtime::RuntimeSecretResolver for NoSecrets {
+            fn resolve(&self, _: &str) -> anyhow::Result<runtime::RuntimeSecret> {
+                anyhow::bail!("no test credentials")
+            }
+        }
+        let directory =
+            std::env::temp_dir().join(format!("deppy-pwa-binding-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let db_path = directory.join("metadata.sqlite3");
+        let db = storage::Db::open(&db_path).unwrap();
+        let workspace_id = db.create_workspace("PWA binding fixture").unwrap();
+        drop(db);
+        let client = runtime::InProcessRuntimeClient::try_new_with_resolver(
+            5,
+            StdArc::new(NoSecrets),
+            directory.join("logs"),
+            secret::RedactionService::new(),
+            Some(runtime::PersistConfig {
+                db_path,
+                workspace_id,
+            }),
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+        (client, directory)
+    }
+
+    #[cfg(unix)]
+    fn wait_for_direct_binding(handle: &DashboardHandle, uuid: &str, generation: u64) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !handle.watch_binding_is_current(uuid, generation) {
+            assert!(
+                Instant::now() < deadline,
+                "fresh worker membership query timed out"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn direct_binding_retries_dropped_initial_query_and_accepts_empty_mux_ack() {
+        let (mut worker, directory) = direct_test_runtime();
+        let (handle, thread) = DashboardHandle::spawn(None);
+        let attempts = StdArc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = StdArc::clone(&attempts);
+        let sink = worker.command_sink().unwrap();
+        handle.set_runtime_binding(
+            worker.subscribe_with_wake_background(handle.wake_fn()),
+            Some(StdArc::new(move |command| {
+                if matches!(command, RuntimeCommand::RequestMuxSnapshot)
+                    && counted.fetch_add(1, Ordering::SeqCst) == 0
+                {
+                    return; // simulate a full command queue on the first request
+                }
+                sink(command);
+            })),
+        );
+        std::thread::sleep(POLL_INTERVAL + Duration::from_millis(100));
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "no query retry timer at zero connections"
+        );
+        assert!(handle.shared.inner.lock().unwrap().needs_initial_mux);
+        let _conn = handle.register_connection();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while handle.shared.inner.lock().unwrap().needs_initial_mux {
+            assert!(
+                Instant::now() < deadline,
+                "dropped initial query was not retried/acknowledged"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(
+            handle
+                .shared
+                .inner
+                .lock()
+                .unwrap()
+                .ids
+                .to_session
+                .is_empty()
+        );
+        std::thread::sleep(POLL_INTERVAL + Duration::from_millis(100));
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "an empty authoritative mux is still an acknowledgement"
+        );
+        handle.stop();
+        thread.join().unwrap();
+        worker.shutdown();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn direct_binding_switch_does_not_alias_ids_between_two_real_workers() {
+        use runtime::{RuntimeCommandSink as _, RuntimeEventStream as _};
+        let make_worker = || {
+            let (client, directory) = direct_test_runtime();
+            let events = client.subscribe();
+            client
+                .send_command(RuntimeCommand::SpawnAgent {
+                    cols: 80,
+                    rows: 24,
+                    scrollback_lines: 100,
+                    agent_config_id: None,
+                    command: "/bin/cat".into(),
+                    args: Vec::new(),
+                    env_plain: Vec::new(),
+                    env_secrets: Vec::new(),
+                    waiting_regex: None,
+                    approval_regex: None,
+                    error_regex: None,
+                    done_regex: None,
+                })
+                .unwrap();
+            client
+                .send_command(RuntimeCommand::DurableEventBarrier { correlation_id: 1 })
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut session = None;
+            let mut uuid = None;
+            loop {
+                let mut complete = false;
+                for event in events.drain() {
+                    match event {
+                        RuntimeEvent::MuxUpdated { snapshot } => {
+                            uuid = snapshot
+                                .tabs
+                                .iter()
+                                .flat_map(|tab| &tab.panes)
+                                .find_map(|pane| pane.persistent_session_id.clone());
+                        }
+                        RuntimeEvent::AgentSpawned { session: id } => session = Some(id),
+                        RuntimeEvent::DurableEventBarrierReached { correlation_id: 1 } => {
+                            complete = true
+                        }
+                        _ => {}
+                    }
+                }
+                if complete {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "runtime fixture spawn barrier timed out"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            (
+                client,
+                session.expect("real agent PTY spawned"),
+                uuid.expect("persistent session UUID"),
+                directory,
+            )
+        };
+        let (mut old_worker, old_id, old_uuid, old_directory) = make_worker();
+        let (mut new_worker, new_id, new_uuid, new_directory) = make_worker();
+        assert_eq!(
+            old_id, new_id,
+            "worker-local ids must alias for this regression"
+        );
+        let (handle, thread) = DashboardHandle::spawn(None);
+        let _conn = handle.register_connection();
+        handle.set_runtime_binding(
+            old_worker.subscribe_with_wake_background(handle.wake_fn()),
+            old_worker.command_sink(),
+        );
+        let old_generation = handle.rebind_watch_for_connection(None, Some(&old_uuid), 0);
+        wait_for_direct_binding(&handle, &old_uuid, old_generation);
+        let written = StdArc::new(std::sync::atomic::AtomicUsize::new(0));
+        let record = StdArc::clone(&written);
+        let new_sink = new_worker.command_sink().unwrap();
+        let start = StdArc::new(std::sync::Barrier::new(2));
+        let sending = StdArc::clone(&start);
+        let sender = handle.clone();
+        let sending_uuid = old_uuid.clone();
+        let commands = std::thread::spawn(move || {
+            sending.wait();
+            for _ in 0..100 {
+                sender.send_input_for_connection(&sending_uuid, old_generation, "old", false);
+                sender.send_key_for_connection(&sending_uuid, old_generation, "esc");
+                sender.send_scroll_for_connection(&sending_uuid, old_generation, 1);
+            }
+        });
+        start.wait();
+        handle.set_runtime_binding(
+            new_worker.subscribe_with_wake_background(handle.wake_fn()),
+            Some(StdArc::new(move |command| {
+                if matches!(
+                    command,
+                    RuntimeCommand::WriteTerminalInput { .. }
+                        | RuntimeCommand::WriteInput { .. }
+                        | RuntimeCommand::Scroll { .. }
+                ) {
+                    record.fetch_add(1, Ordering::SeqCst);
+                }
+                new_sink(command);
+            })),
+        );
+        commands.join().unwrap();
+        let fresh_generation = handle.rebind_watch_for_connection(None, Some(&old_uuid), 0);
+        for generation in [old_generation, fresh_generation] {
+            handle.send_terminal_input(
+                &old_uuid,
+                generation,
+                runtime::TerminalInput::Text {
+                    text: "wrong-worker".into(),
+                    paste: false,
+                },
+            );
+        }
+        assert_eq!(
+            written.load(Ordering::SeqCst),
+            0,
+            "stale UUID mapping dispatched to new worker's aliased numeric id"
+        );
+        let generation =
+            handle.rebind_watch_for_connection(Some(&old_uuid), Some(&new_uuid), fresh_generation);
+        wait_for_direct_binding(&handle, &new_uuid, generation);
+        handle.send_terminal_input(
+            &new_uuid,
+            generation,
+            runtime::TerminalInput::Text {
+                text: "right-worker".into(),
+                paste: false,
+            },
+        );
+        assert_eq!(written.load(Ordering::SeqCst), 1);
+        // A stale Relay disconnect from A must not remove a fresh WS watch after A→B→A.
+        handle.set_runtime_binding(
+            old_worker.subscribe_with_wake_background(handle.wake_fn()),
+            old_worker.command_sink(),
+        );
+        let returned = handle.rebind_watch_for_connection(None, Some(&old_uuid), 0);
+        wait_for_direct_binding(&handle, &old_uuid, returned);
+        handle.rebind_watch_for_connection(Some(&old_uuid), None, old_generation);
+        assert!(handle.watch_binding_is_current(&old_uuid, returned));
+        assert_eq!(
+            handle.shared.inner.lock().unwrap().watchers[&old_uuid].count,
+            1
+        );
+        handle.stop();
+        thread.join().unwrap();
+        old_worker.shutdown();
+        new_worker.shutdown();
+        std::fs::remove_dir_all(old_directory).unwrap();
+        std::fs::remove_dir_all(new_directory).unwrap();
+    }
+
+    #[test]
     fn rebind_watch는_refcount_전이에서만_lease를_보낸다() {
         let (handle, thread) = DashboardHandle::spawn(None);
         let (sink, captured) = capture_sink();
@@ -1572,7 +2003,7 @@ mod tests {
         handle.inject_event(viewport_event(3));
         assert!(handle.viewport_if_newer(&test_uuid(3), 0).is_some());
         captured.lock().unwrap().clear();
-        // 새 worker 구독 시점의 정리 경로 (set_runtime_source가 호출)
+        // 새 worker 구독 시점의 정리 경로 (set_runtime_binding가 호출)
         {
             let mut inner = handle.shared.inner.lock().unwrap();
             DashboardHandle::clear_watch_state(&mut inner, &handle.shared);

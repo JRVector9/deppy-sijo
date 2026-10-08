@@ -412,6 +412,10 @@ impl TerminalBackend for GhosttyBackend {
         self.term.mode(Mode::BRACKETED_PASTE).unwrap_or(false)
     }
 
+    fn application_cursor(&self) -> bool {
+        self.term.mode(Mode::DECCKM).unwrap_or(false)
+    }
+
     fn screen_text(&self) -> String {
         // RenderState는 viewport 기준 — 사용자가 스크롤백을 보는 중이면 활성 화면과
         // 어긋난다. 상태감지는 스크롤 여부와 무관해야 하므로 bottom이 아니면

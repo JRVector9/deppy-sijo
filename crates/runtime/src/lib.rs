@@ -9,9 +9,11 @@ mod event;
 mod host;
 mod in_process;
 mod input_admission;
+mod terminal_input;
 pub use input_admission::{
     AgentInputGuard, AgentInputIntent, AgentPromptKind, InputAdmission, InputPermit,
 };
+pub use terminal_input::{DIRECT_INPUT_TEXT_BYTES_MAX, TerminalInput};
 pub mod known_hosts;
 mod persistence;
 mod protocol;

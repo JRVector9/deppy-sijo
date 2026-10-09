@@ -58,6 +58,10 @@
 // cancelHistoryWindow(request) → 현재 요청만 취소하고 불러온 창을 유지한다.
 // getHistoryState(), hooks.readingChanged(state) → 불러온 창 보존/만료/요청 상태.
 // hooks.resumeHistory() → 기록 열람에서 현재 화면 복귀를 호스트에 위임한다.
+// hooks.historyRowsChanged(rows, metrics) → 가용 높이에 맞춘 유계 표시 행 수.
+// hooks.historyNavigate({ delta, rows, reason }) → 겹침 구간을 미리 불러온다.
+// expectHistoryWindow(request, { preservePosition, follow, reason }) → 연속 이력 앵커 유지.
+// getDesiredHistoryRows() → 최대256행/65536셀 안에서 표시 높이와 앞뒤 여유를 계산한다.
 
 /// 호스트 문서에 뷰어 마크업이 없을 때(시청 전용 셸) 코어가 직접 만든다. 루프백 셸의
 /// `index.html`에 있는 것과 같은 구조에서 쓰기 컨트롤(특수키·작성기)만 뺀 것이다 — 같은
@@ -103,8 +107,8 @@ function buildViewerDom(mount) {
       el('div', { class: 'viewer-wrap' },
         el('canvas', { id: 'viewer-canvas', 'aria-label': '원격 터미널 화면' })),
       el('div', { id: 'viewer-scroll-note', class: 'viewer-scroll-note', hidden: true },
-        el('span', { id: 'viewer-offset-text' }),
-        el('button', { id: 'viewer-resume-follow', type: 'button', text: '현재 화면으로' })),
+        el('span', { id: 'viewer-offset-text', class: 'sr-only' }),
+        el('button', { id: 'viewer-resume-follow', type: 'button', text: '↓ 맨 아래로' })),
       el(
         'div',
         { id: 'viewer-connection-overlay', class: 'viewer-overlay', 'aria-hidden': 'true',
@@ -157,8 +161,10 @@ export function createViewer(options = {}) {
   };
 
   if (viewer.scrollNote) {
-    viewer.el.insertBefore(viewer.scrollNote, viewer.wrap.parentElement);
-    viewer.el.classList.add('viewer-has-scroll-note');
+    viewer.wrap.parentElement.append(viewer.scrollNote);
+    viewer.el.classList.remove('viewer-has-scroll-note');
+    if (viewer.offsetText) viewer.offsetText.classList.add('sr-only');
+    if (viewer.resumeFollowButton) viewer.resumeFollowButton.textContent = '↓ 맨 아래로';
   }
 
   const FONT_FAMILY = 'ui-monospace, Menlo, monospace';
@@ -192,18 +198,27 @@ export function createViewer(options = {}) {
   let wireScreen = null;
   let keyframeRequested = false;
   let retainedDisplay = false;
+  let retainedSourceChanged = false;
   let expiredHistory = false;
   let pendingHistoryRequest = null;
+  let pendingHistoryOptions = null;
   let waitingForResume = false;
   let registeringResume = false;
   let lastReadingStateKey = '';
   const localPositions = new Map();
+  const sessionDisplays = new Map();
   let restoreLocalPosition = false;
   let automaticPosition = null;
   let measuredFontSize = 0;
   let baseMetrics = null;
   let cellMetrics = null;
   let lastLayoutKey = '';
+  let desiredHistoryRows = 1;
+  let lastDesiredHistoryRows = 0;
+  let pendingPositionAnchor = null;
+  let lastNavigationKey = '';
+  const MAX_HISTORY_ROWS = 512;
+  const MAX_HISTORY_CELLS = 65536;
   const measuringContext = document.createElement('canvas').getContext('2d');
   const positionKey = session => session + (prefs.readableWrap ? ':reading' : ':grid');
 
@@ -218,6 +233,13 @@ export function createViewer(options = {}) {
       totalLines: metadata ? metadata.total_lines : null,
       generation: metadata ? metadata.generation : null,
       firstLine: metadata ? metadata.first_line : null,
+      followingLive: viewer.followingLive,
+      offLatest: isOffLatest(),
+      desiredRows: getDesiredHistoryRows(),
+      cachedRows: viewer.screen ? viewer.screen.rows : 0,
+      nativeRows: metadata ? metadata.native_rows ?? viewer.screen.rows : null,
+      liveFirstLine: metadata ? metadata.live_first_line ?? null : null,
+      historyMessage: historyMessage(),
     };
   }
 
@@ -233,20 +255,27 @@ export function createViewer(options = {}) {
     wireScreen = null;
     keyframeRequested = false;
     retainedDisplay = false;
+    retainedSourceChanged = false;
     expiredHistory = false;
     pendingHistoryRequest = null;
+    pendingHistoryOptions = null;
     waitingForResume = false;
     lastReadingStateKey = '';
+    pendingPositionAnchor = null;
+    lastNavigationKey = '';
+    lastDesiredHistoryRows = 0;
   }
 
-  function expectHistoryWindow(request) {
+  function expectHistoryWindow(request, options = {}) {
     if (!viewer.watching || !Number.isInteger(request) || request <= 0 || request > 0xffffffff) return false;
     pendingHistoryRequest = request;
+    pendingHistoryOptions = { ...options };
     if (!registeringResume) {
       waitingForResume = false;
-      viewer.followingLive = false;
+      if (typeof options.follow === 'boolean') viewer.followingLive = options.follow;
+      else viewer.followingLive = false;
     }
-    retainedDisplay = true;
+    retainedDisplay = !viewer.followingLive || registeringResume;
     rememberLocalPosition();
     updateScrollNote();
     notifyReadingChanged();
@@ -256,6 +285,8 @@ export function createViewer(options = {}) {
   function cancelHistoryWindow(request) {
     if (pendingHistoryRequest === null || request !== pendingHistoryRequest) return false;
     pendingHistoryRequest = null;
+    pendingHistoryOptions = null;
+    lastNavigationKey = '';
     waitingForResume = false;
     retainedDisplay = true;
     viewer.followingLive = false;
@@ -265,10 +296,153 @@ export function createViewer(options = {}) {
     return true;
   }
 
+  function sourceFirst(screen) {
+    const first = screen && screen.history && screen.history.first_line;
+    return typeof first === 'string' && /^\d+$/.test(first) ? BigInt(first) : null;
+  }
+
+  function expandedHistory(screen) {
+    return !!(screen && !screen.alt && sourceFirst(screen) !== null
+      && Number.isInteger(screen.history.native_rows) && screen.history.native_rows > 0);
+  }
+
+  function liveEnd(screen) {
+    const first = sourceFirst(screen);
+    return first === null ? null : first + BigInt(screen.rows) + BigInt(screen.offset);
+  }
+
+  function historyFloor(screen) {
+    const end = liveEnd(screen);
+    return end === null || !Number.isSafeInteger(screen.history.total_lines) ? null
+      : end - BigInt(screen.history.total_lines);
+  }
+
+  function getDesiredHistoryRows() {
+    const cells = measureCells();
+    const visible = Math.max(1, Math.ceil(viewer.wrap.clientHeight / cells.cellHeight));
+    const cols = viewer.screen ? viewer.screen.cols : wireScreen ? wireScreen.cols : 1;
+    const limit = Math.max(1, Math.min(256, Math.floor(MAX_HISTORY_CELLS / Math.max(1, cols))));
+    desiredHistoryRows = Math.min(limit, visible + Math.max(4, Math.ceil(visible / 2)));
+    return desiredHistoryRows;
+  }
+
+  function historyMessage() {
+    if (pendingHistoryRequest !== null) return waitingForResume ? '현재 화면 요청 중…' : '기록 화면 요청 중…';
+    if (expiredHistory) return '불러온 기록이 만료되었습니다 (로컬 화면 보존)';
+    if (viewer.screen && viewer.screen.offset > 0) return '↑ ' + viewer.screen.offset + '줄 위 (과거 열람 중)';
+    return viewer.followingLive ? '' : '화면 따라가기 일시정지';
+  }
+
+  function isOffLatest() {
+    if (!viewer.screen) return false;
+    if (viewer.followingLive && !retainedDisplay && viewer.screen.offset === 0) return false;
+    if (viewer.screen.offset > 0 || waitingForResume || expiredHistory || retainedSourceChanged) return true;
+    if (!expandedHistory(viewer.screen)) return !viewer.followingLive || retainedDisplay;
+    const latestEnd = liveEnd(wireScreen), displayedEnd = sourceFirst(viewer.screen) + BigInt(viewer.screen.rows);
+    return (latestEnd !== null && latestEnd > displayedEnd)
+      || viewer.wrap.scrollTop < Math.max(0, viewer.wrap.scrollHeight - viewer.wrap.clientHeight) - 2;
+  }
+
+  function capturePositionAnchor() {
+    const screen = viewer.screen;
+    if (!expandedHistory(screen) || prefs.overview || !textRows.length) return null;
+    const top = viewer.wrap.scrollTop;
+    const row = textRows.find(node => node.offsetTop + node.offsetHeight > top) || textRows.at(-1);
+    return row ? { generation: screen.history.generation, identity: row.dataset.identity,
+      fraction: (top - row.offsetTop) / Math.max(1, row.offsetHeight), left: viewer.wrap.scrollLeft } : null;
+  }
+
+  function restorePositionAnchor(anchor) {
+    if (!anchor || !viewer.screen || viewer.screen.history?.generation !== anchor.generation) return false;
+    const row = textRows.find(node => node.dataset.identity === anchor.identity);
+    if (!row) return false;
+    setLocalPosition(prefs.readableWrap ? 0 : anchor.left,
+      Math.max(0, row.offsetTop + anchor.fraction * Math.max(1, row.offsetHeight)));
+    return true;
+  }
+
+  // Only widened, identity-bearing windows are joined. The wire baseline stays an exact
+  // source window; this bounded display cache is never a delta decoder baseline.
+  function canJoinHistoryWindow(next, previous = viewer.screen) {
+    if (!expandedHistory(next) || !expandedHistory(previous)
+        || previous.history.generation !== next.history.generation || previous.cols !== next.cols) return false;
+    const before = sourceFirst(previous), after = sourceFirst(next);
+    return after <= before + BigInt(previous.rows) && before <= after + BigInt(next.rows);
+  }
+
+  function joinHistoryWindow(next, preserve = false) {
+    const previous = viewer.screen;
+    if (!canJoinHistoryWindow(next, previous)) return next;
+    const before = sourceFirst(previous), after = sourceFirst(next);
+    const beforeEnd = before + BigInt(previous.rows), afterEnd = after + BigInt(next.rows);
+    let first = before < after ? before : after;
+    const floor = historyFloor(next);
+    if (!preserve && viewer.followingLive && floor !== null && first < floor) first = floor;
+    const end = beforeEnd > afterEnd ? beforeEnd : afterEnd;
+    const count = Number(end - first);
+    const limit = Math.max(1, Math.min(MAX_HISTORY_ROWS, Math.floor(MAX_HISTORY_CELLS / next.cols)));
+    const anchor = capturePositionAnchor();
+    const protectedRow = anchor && /^\d+$/.test(anchor.identity) ? Number(BigInt(anchor.identity) - first)
+      : viewer.followingLive ? count - 1 : Number(before - first);
+    let start = 0;
+    if (count > limit) {
+      start = viewer.followingLive ? count - limit
+        : Math.max(0, Math.min(count - limit, protectedRow - Math.floor(limit / 4)));
+      const selection = window.getSelection();
+      if (selectionTouchesText()) {
+        const range = selection.getRangeAt(0);
+        const selected = selectionPoint(range.startContainer, range.startOffset, false);
+        if (selected && selected.identity) start = Math.max(0,
+          Math.min(count - limit, Number(BigInt(selected.identity) - first)));
+      }
+    }
+    const keptFirst = first + BigInt(start), rows = Math.min(count, limit), lines = new Array(rows).fill(null);
+    const copy = screen => {
+      const index = Number(sourceFirst(screen) - keptFirst);
+      for (let row = 0; row < screen.rows; row++) {
+        const target = index + row;
+        if (target >= 0 && target < rows) lines[target] = screen.lines[row];
+      }
+    };
+    copy(preserve ? next : previous); copy(preserve ? previous : next);
+    const endIdentity = keptFirst + BigInt(rows), newestEnd = liveEnd(next);
+    const offset = Number(newestEnd > endIdentity ? newestEnd - endIdentity : 0n);
+    const cursor = next.cursor ? { ...next.cursor, row: next.cursor.row + Number(after - keptFirst) } : null;
+    if (cursor && (cursor.row < 0 || cursor.row >= rows)) cursor.visible = false;
+    return { ...next, rows, lines, cursor, offset,
+      history: { ...next.history, first_line: keptFirst.toString(), request: undefined } };
+  }
+
+  function requestHistoryNavigation(direction, reason = 'scroll') {
+    if (!hooks.historyNavigate || !expandedHistory(viewer.screen) || prefs.overview
+        || pendingHistoryRequest !== null || waitingForResume || expiredHistory || getSelectedText()
+        || viewer.connection !== 'connected') return false;
+    const rows = getDesiredHistoryRows(), screen = viewer.screen;
+    const floor = historyFloor(wireScreen || screen), first = sourceFirst(screen);
+    if (direction > 0 && floor !== null && first <= floor) return false;
+    if (direction < 0 && screen.offset <= 0 && !isOffLatest()) return false;
+    const step = Math.max(1, Math.floor(rows / 2));
+    const delta = direction > 0 ? step : -Math.max(step, screen.rows - rows + step);
+    const key = [screen.history.generation, screen.history.first_line, screen.rows, screen.offset, direction, rows].join(':');
+    if (key === lastNavigationKey) return false;
+    lastNavigationKey = key;
+    hooks.historyNavigate({ delta, rows, reason });
+    return true;
+  }
+
+  function preloadHistoryAtPosition() {
+    if (!viewer.screen || viewer.followingLive || prefs.overview) return;
+    const threshold = Math.max(getCellMetrics().cellHeight * 3, viewer.wrap.clientHeight / 2);
+    if (viewer.wrap.scrollTop <= threshold) requestHistoryNavigation(1);
+    else if (viewer.wrap.scrollTop + viewer.wrap.clientHeight >= viewer.wrap.scrollHeight - threshold
+        && viewer.screen.offset > 0) requestHistoryNavigation(-1);
+  }
+
   function inferHistoryExpiration() {
     const loaded = viewer.screen && viewer.screen.history;
     const latest = wireScreen && wireScreen.history;
     if (!retainedDisplay || !loaded || !latest) return;
+    if (viewer.screen.alt !== wireScreen.alt) { expiredHistory = true; return; }
     if (loaded.generation !== latest.generation) { expiredHistory = true; return; }
     if (typeof loaded.first_line !== 'string' || typeof latest.first_line !== 'string'
         || !/^\d+$/.test(loaded.first_line) || !/^\d+$/.test(latest.first_line)
@@ -283,15 +457,34 @@ export function createViewer(options = {}) {
     const differentWindow = previous && (previous.history && screen.history
       ? previous.history.generation !== screen.history.generation || previous.history.first_line !== screen.history.first_line
       : previous.offset !== screen.offset || previous.cols !== screen.cols || previous.rows !== screen.rows);
-    if (manual && differentWindow) {
+    if (manual && differentWindow && !expandedHistory(screen)) {
       if (selectionTouchesText()) window.getSelection().removeAllRanges();
       clearSearch();
     }
     viewer.screen = screen;
+    if (viewer.followingLive || !previous || previous.history?.generation !== screen.history?.generation
+        || previous.cols !== screen.cols || previous.alt !== screen.alt) retainedSourceChanged = false;
+    pruneSessionDisplays(screen);
     expiredHistory = false;
     viewerScreenRevision += 1;
     updateScrollNote();
     scheduleViewerRender();
+  }
+
+  function pruneSessionDisplays(active = null) {
+    let rows = active ? active.rows : 0, cells = active ? active.rows * active.cols : 0;
+    for (const screen of sessionDisplays.values()) { rows += screen.rows; cells += screen.rows * screen.cols; }
+    while ((rows > MAX_HISTORY_ROWS || cells > MAX_HISTORY_CELLS) && sessionDisplays.size) {
+      const key = sessionDisplays.keys().next().value, screen = sessionDisplays.get(key);
+      sessionDisplays.delete(key); rows -= screen.rows; cells -= screen.rows * screen.cols;
+    }
+  }
+
+  function rememberHistoryWindow() {
+    if (!viewer.watching || !expandedHistory(viewer.screen)) return;
+    sessionDisplays.delete(viewer.watching);
+    sessionDisplays.set(viewer.watching, viewer.screen);
+    pruneSessionDisplays();
   }
 
   function measureCells() {
@@ -321,6 +514,7 @@ export function createViewer(options = {}) {
     if (!Number.isFinite(px)) return;
     const size = Math.max(12, Math.min(24, px));
     if (size === prefs.fontSize) return;
+    if (!viewer.followingLive) pendingPositionAnchor = capturePositionAnchor();
     prefs.fontSize = size;
     savePreferences();
   }
@@ -329,6 +523,7 @@ export function createViewer(options = {}) {
     if (viewer.watching && !prefs.overview && !restoreLocalPosition) {
       localPositions.set(positionKey(viewer.watching), {
         left: viewer.wrap.scrollLeft, top: viewer.wrap.scrollTop, follow: viewer.followingLive,
+        anchor: capturePositionAnchor(),
       });
     }
   }
@@ -336,6 +531,9 @@ export function createViewer(options = {}) {
   function stopFollowing() {
     if (!viewer.watching) return;
     if (waitingForResume && pendingHistoryRequest !== null) cancelHistoryWindow(pendingHistoryRequest);
+    // A layout request may remain useful after a gesture, but its earlier live intent
+    // must not override the user's newer reading position when the response arrives.
+    if (pendingHistoryRequest !== null && pendingHistoryOptions) pendingHistoryOptions.follow = false;
     viewer.followingLive = false;
     retainedDisplay = true;
     rememberLocalPosition();
@@ -355,6 +553,7 @@ export function createViewer(options = {}) {
       retainedDisplay = true;
       waitingForResume = true;
       pendingHistoryRequest = null;
+      pendingHistoryOptions = null;
       if (hooks.resumeHistory) {
         registeringResume = true;
         try { hooks.resumeHistory(); } finally { registeringResume = false; }
@@ -364,7 +563,7 @@ export function createViewer(options = {}) {
       retainedDisplay = false;
       waitingForResume = false;
       expiredHistory = false;
-      if (wireScreen) publishScreen(wireScreen);
+      if (wireScreen) publishScreen(joinHistoryWindow(wireScreen));
     }
     rememberLocalPosition();
     updateScrollNote();
@@ -408,6 +607,7 @@ export function createViewer(options = {}) {
     readable = !!readable;
     if (readable === prefs.readableWrap) return;
     rememberLocalPosition();
+    const anchor = capturePositionAnchor();
     if (viewer.watching) stopFollowing();
     viewer.followingLive = false;
     prefs.readableWrap = readable;
@@ -415,6 +615,8 @@ export function createViewer(options = {}) {
     viewer.wrap.classList.toggle('readable', readable);
     viewer.wrap.classList.toggle('overview', prefs.overview);
     restoreLocalPosition = true;
+    // A first visit to the other presentation mode follows the same source row.
+    if (!localPositions.has(positionKey(viewer.watching))) pendingPositionAnchor = anchor;
     lastViewerRenderKey = '';
     resetPan();
     updateScrollNote();
@@ -466,8 +668,13 @@ export function createViewer(options = {}) {
       && position.top === Math.min(automaticPosition.top, position.maxTop);
     if (!samePosition && !layoutClamp) stopFollowing();
     else automaticPosition = position;
-    if (layoutClamp) scheduleViewerRender();
-    rememberLocalPosition();
+    if (layoutClamp) {
+      pendingPositionAnchor = localPositions.get(positionKey(viewer.watching))?.anchor || pendingPositionAnchor;
+      scheduleViewerRender();
+    } else rememberLocalPosition();
+    updateScrollNote();
+    notifyReadingChanged();
+    preloadHistoryAtPosition();
   }, { passive: true });
   viewer.wrap.addEventListener('wheel', (event) => {
     if (!event.ctrlKey && (event.deltaX || event.deltaY)) stopFollowing();
@@ -500,6 +707,7 @@ export function createViewer(options = {}) {
       wireScreen = null;
       keyframeRequested = false;
       pendingHistoryRequest = null;
+      pendingHistoryOptions = null;
       if (waitingForResume) viewer.followingLive = false;
       waitingForResume = false;
       viewer.overlayTitle.textContent = copy[0];
@@ -559,6 +767,7 @@ export function createViewer(options = {}) {
     if (hooks.beforeClose) hooks.beforeClose(options, returnSession);
     cancelScheduledViewerRender(); // central viewer close
     rememberLocalPosition();
+    rememberHistoryWindow();
     send({ type: 'unwatch' });
     viewer.watching = null;
     viewer.returnSession = null;
@@ -612,6 +821,7 @@ export function createViewer(options = {}) {
     if (!sessionId || viewer.closing || viewer.watching === sessionId) return false;
     if (hooks.beforeOpen) hooks.beforeOpen(sessionId);
     rememberLocalPosition();
+    rememberHistoryWindow();
     setViewerClosing(false);
     viewer.watching = sessionId;
     viewer.returnSession = sessionId;
@@ -619,6 +829,12 @@ export function createViewer(options = {}) {
     resetHistoryState();
     clearViewerCanvas();
     resetTextLayer();
+    const savedScreen = sessionDisplays.get(sessionId);
+    if (savedScreen) {
+      sessionDisplays.delete(sessionId);
+      viewer.screen = savedScreen;
+      viewerScreenRevision += 1;
+    }
     viewer.canvas.style.width = '0px';
     viewer.canvas.style.height = '0px';
     restoreLocalPosition = true;
@@ -651,10 +867,14 @@ export function createViewer(options = {}) {
     wireScreen = null;
     keyframeRequested = false;
     pendingHistoryRequest = null;
+    pendingHistoryOptions = null;
     if (waitingForResume) viewer.followingLive = false;
     waitingForResume = false;
+    lastDesiredHistoryRows = 0;
+    lastNavigationKey = '';
     notifyReadingChanged();
     send({ type: 'watch', session: viewer.watching });
+    scheduleViewerRender();
   }
 
   viewer.back.addEventListener('click', () => requestCloseViewer());
@@ -677,8 +897,15 @@ export function createViewer(options = {}) {
       notifyReadingChanged();
       return;
     }
-    if (!msg.keyframe && !wireScreen) {
-      // delta인데 기준 화면이 없다 — 재동기화 요청 (P5c RequestKeyframe)
+    if (!Number.isInteger(msg.cols) || !Number.isInteger(msg.rows) || msg.cols <= 0 || msg.rows <= 0
+        || msg.cols * msg.rows > MAX_HISTORY_CELLS) { requestKeyframe(); return; }
+    const sameWindow = wireScreen && wireScreen.cols === msg.cols && wireScreen.rows === msg.rows
+      && wireScreen.alt === !!msg.alt && wireScreen.offset === Math.max(0, Number(msg.offset) || 0)
+      && (wireScreen.history?.generation ?? null) === (msg.history?.generation ?? null)
+      && (wireScreen.history?.first_line ?? null) === (msg.history?.first_line ?? null);
+    if (!msg.keyframe && !sameWindow) {
+      // A native delta cannot be decoded against a widened/history/source-shifted window.
+      wireScreen = null;
       requestKeyframe();
       return;
     }
@@ -687,16 +914,25 @@ export function createViewer(options = {}) {
       ? { cols: msg.cols, rows: msg.rows, lines: new Array(msg.rows).fill(null) }
       : { ...wireScreen, lines: wireScreen.lines.slice() };
     for (const line of msg.lines || []) {
-      if (line.row < next.rows) next.lines[line.row] = line.runs || [];
+      if (Number.isInteger(line.row) && line.row >= 0 && line.row < next.rows) next.lines[line.row] = line.runs || [];
     }
     next.cursor = msg.cursor || null;
     next.alt = !!msg.alt;
-    next.offset = msg.offset | 0;
+    next.offset = Math.max(0, Number(msg.offset) || 0);
     next.history = msg.history ? { ...msg.history } : null;
     wireScreen = next;
+    if (retainedDisplay && expandedHistory(next) && expandedHistory(viewer.screen)
+        && next.history.generation === viewer.screen.history.generation && next.cols === viewer.screen.cols) {
+      const index = Number(sourceFirst(next) - sourceFirst(viewer.screen));
+      if (next.lines.some((runs, row) => index + row >= 0 && index + row < viewer.screen.rows
+          && JSON.stringify(runs || []) !== JSON.stringify(viewer.screen.lines[index + row] || []))) {
+        retainedSourceChanged = true;
+      }
+    }
     if ((!explicit || matching) && next.history && next.history.expired) {
       if (matching) {
         pendingHistoryRequest = null;
+        pendingHistoryOptions = null;
         waitingForResume = false;
       }
       retainedDisplay = true;
@@ -705,14 +941,37 @@ export function createViewer(options = {}) {
       rememberLocalPosition();
       updateScrollNote();
     } else if (matching) {
+      const options = pendingHistoryOptions || {};
+      const anchor = options.preservePosition || expandedHistory(next) ? capturePositionAnchor() : null;
       pendingHistoryRequest = null;
-      viewer.followingLive = waitingForResume && next.offset === 0;
+      pendingHistoryOptions = null;
+      viewer.followingLive = (waitingForResume || options.follow === true) && next.offset === 0;
       retainedDisplay = !viewer.followingLive;
       waitingForResume = false;
-      publishScreen(next, true);
+      pendingPositionAnchor = viewer.followingLive ? null : anchor;
+      if (options.reason === 'layout' && !viewer.followingLive && viewer.screen && !canJoinHistoryWindow(next)) {
+        // A user may pause after a latest-layout request. Its now-distant result can
+        // refresh the wire baseline, but cannot replace the newer reading intent.
+        inferHistoryExpiration();
+        scheduleViewerRender();
+      } else publishScreen(joinHistoryWindow(next, !viewer.followingLive && options.reason === 'layout'), true);
+      lastNavigationKey = '';
     } else if (!explicit) {
-      if (!viewer.screen || (!retainedDisplay && pendingHistoryRequest === null && !waitingForResume)) publishScreen(next);
-      else inferHistoryExpiration();
+      if (!viewer.screen || (!retainedDisplay && pendingHistoryRequest === null && !waitingForResume)) {
+        publishScreen(joinHistoryWindow(next));
+      } else {
+        inferHistoryExpiration();
+        if (!expiredHistory && canJoinHistoryWindow(next)
+            && pendingHistoryRequest === null && !waitingForResume) {
+          const joined = joinHistoryWindow(next, true);
+          // Retained identities remain immutable; new adjacent rows can extend their scroll range.
+          if (joined.history?.generation === viewer.screen.history?.generation
+              && (joined.rows !== viewer.screen.rows || joined.history.first_line !== viewer.screen.history.first_line)) {
+            pendingPositionAnchor = capturePositionAnchor();
+            publishScreen(joined);
+          }
+        }
+      }
     }
     updateScrollNote();
     notifyReadingChanged();
@@ -729,7 +988,8 @@ export function createViewer(options = {}) {
   let touchGesture = null;
 
   function pan(lines) {
-    if (hooks.pan) hooks.pan(lines);
+    if (expandedHistory(viewer.screen) && hooks.historyNavigate) requestHistoryNavigation(lines > 0 ? 1 : -1, 'edge');
+    else if (hooks.pan) hooks.pan(lines);
   }
 
   function resetPan() {
@@ -742,11 +1002,8 @@ export function createViewer(options = {}) {
     const text = viewer.offsetText;
     if (!note) return;
     const offset = (viewer.screen && viewer.screen.offset) || 0;
-    note.hidden = offset <= 0 && viewer.followingLive && !retainedDisplay && pendingHistoryRequest === null && !expiredHistory;
-    if (pendingHistoryRequest !== null) text.textContent = waitingForResume ? '현재 화면 요청 중…' : '기록 화면 요청 중…';
-    else if (expiredHistory) text.textContent = '불러온 기록이 만료되었습니다 (로컬 화면 보존)';
-    else if (offset > 0) text.textContent = '↑ ' + offset + '줄 위 (과거 열람 중)';
-    else if (!viewer.followingLive) text.textContent = '화면 따라가기 일시정지';
+    note.hidden = !isOffLatest();
+    if (text) text.textContent = historyMessage();
     if (viewer.resumeFollowButton) {
       viewer.resumeFollowButton.hidden = offset > 0 && !hooks.resumeHistory;
       viewer.resumeFollowButton.disabled = waitingForResume && pendingHistoryRequest !== null;
@@ -871,6 +1128,9 @@ export function createViewer(options = {}) {
     const availableWidth = viewer.wrap.clientWidth;
     const availableHeight = viewer.wrap.clientHeight;
     if (availableWidth <= 0 || availableHeight <= 0 || screen.cols <= 0 || screen.rows <= 0) return;
+    if (!viewer.followingLive && !pendingPositionAnchor && expandedHistory(screen)) {
+      pendingPositionAnchor = localPositions.get(positionKey(viewer.watching))?.anchor || capturePositionAnchor();
+    }
     const measured = measureCells();
     const scale = prefs.overview ? Math.min(1,
       availableWidth / (screen.cols * measured.cellWidth),
@@ -901,16 +1161,23 @@ export function createViewer(options = {}) {
     if (restoreLocalPosition && !prefs.overview) {
       // New dimensions must be installed before the browser can restore an overflow position.
       const position = localPositions.get(positionKey(viewer.watching)) || { left: 0, top: 0 };
-      setLocalPosition(position.left, position.top);
+      if (!restorePositionAnchor(position.anchor)) setLocalPosition(position.left, position.top);
       restoreLocalPosition = false;
     }
+    if (pendingPositionAnchor && !prefs.overview) {
+      restorePositionAnchor(pendingPositionAnchor);
+      pendingPositionAnchor = null;
+      rememberLocalPosition();
+    }
     followLiveOutput(screen, cellW, cellH);
+    updateScrollNote();
+    preloadHistoryAtPosition();
     paintSearchMarks();
     if (renderKey === lastViewerRenderKey) return;
     lastViewerRenderKey = renderKey;
     if (prefs.readableWrap) return;
-    const pixelWidth = Math.max(1, Math.round(cssWidth * dpr));
-    const pixelHeight = Math.max(1, Math.round(cssHeight * dpr));
+    const pixelWidth = Math.max(1, Math.floor(cssWidth * dpr));
+    const pixelHeight = Math.max(1, Math.min(Math.floor(cssHeight * dpr), Math.floor(MAX_CANVAS_PIXELS / pixelWidth)));
     if (canvas.width !== pixelWidth) canvas.width = pixelWidth;
     if (canvas.height !== pixelHeight) canvas.height = pixelHeight;
     const ctx = canvas.getContext('2d');
@@ -1016,12 +1283,13 @@ export function createViewer(options = {}) {
   }
 
   function ownerPoint(row, offset, end) {
-    if (offset === row.textContent.length) return { row: Number(row.dataset.row), boundary: 'end' };
+    const identity = { row: Number(row.dataset.row), identity: row.dataset.identity, generation: row.dataset.generation };
+    if (offset === row.textContent.length) return { ...identity, boundary: 'end' };
     for (const cell of row.children) {
       const length = cell.textContent.length;
       if (offset < length || (end && offset <= length)) {
         const spaces = /^ +$/.test(cell.textContent) && length === Number(cell.dataset.span);
-        return { row: Number(row.dataset.row), col: Number(cell.dataset.col) + (spaces ? offset : 0),
+        return { ...identity, col: Number(cell.dataset.col) + (spaces ? offset : 0),
           inner: spaces ? 0 : offset };
       }
       offset -= length;
@@ -1030,7 +1298,8 @@ export function createViewer(options = {}) {
   }
 
   function textPoint(point) {
-    const row = textRows[point.row];
+    const row = point.identity === undefined ? textRows[point.row]
+      : textRows.find(node => node.dataset.identity === point.identity && node.dataset.generation === point.generation);
     if (row && point.boundary === 'end') return [row, row.childNodes.length];
     if (row && point.col !== undefined) {
       for (const cell of row.children) {
@@ -1068,6 +1337,30 @@ export function createViewer(options = {}) {
     const start = selectedRange && selectionPoint(selectedRange.startContainer, selectedRange.startOffset, false);
     const end = selectedRange && selectionPoint(selectedRange.endContainer, selectedRange.endOffset, true);
     let changedSelection = false;
+    const identified = expandedHistory(screen), first = sourceFirst(screen);
+    const existing = new Map(textRows.filter(row => row.dataset.identity !== undefined)
+      .map(row => [row.dataset.generation + ':' + row.dataset.identity, row]));
+    const ordered = Array.from({ length: screen.rows }, (_, index) => {
+      const identity = identified ? (first + BigInt(index)).toString() : undefined;
+      const row = identified ? existing.get(screen.history.generation + ':' + identity)
+        : textRows[index]?.dataset.identity === undefined ? textRows[index] : null;
+      const node = row || document.createElement('div');
+      node.className = 'viewer-text-row'; node.dataset.row = index;
+      if (identified) {
+        node.dataset.identity = identity; node.dataset.generation = screen.history.generation;
+      } else { delete node.dataset.identity; delete node.dataset.generation; }
+      return node;
+    });
+    const kept = new Set(ordered);
+    for (const row of textRows) if (!kept.has(row)) { row.remove(); changedSelection = true; }
+    textRows.splice(0, textRows.length, ...ordered);
+    for (let index = 0; index < textRows.length; index++) {
+      const reference = textLayer.children[index];
+      if (reference !== textRows[index]) {
+        textLayer.insertBefore(textRows[index], reference || searchMarks);
+        changedSelection = true;
+      }
+    }
     textLayer.style.setProperty('--viewer-cell-width', cellW + 'px');
     textLayer.style.setProperty('--viewer-cell-height', cellH + 'px');
     textLayer.style.font = fontSize + 'px ' + FONT_FAMILY;
@@ -1076,13 +1369,9 @@ export function createViewer(options = {}) {
     for (let index = 0; index < screen.rows; index++) {
       const runs = screen.lines[index] || [];
       const key = JSON.stringify([screen.cols, runs]);
-      if (key === textRowKeys[index]) continue;
+      if (key === textRows[index]._viewerKey) continue;
       if (start && end && index >= start.row && index <= end.row) changedSelection = true;
       let row = textRows[index];
-      if (!row) {
-        row = document.createElement('div'); row.className = 'viewer-text-row'; row.dataset.row = index;
-        textRows[index] = row; textLayer.insertBefore(row, searchMarks);
-      }
       const cells = [];
       const cell = (text, span, attrs = 0, fg = '#d4d4d4', bg = '#000000', padding = false) => {
         const node = document.createElement('span');
@@ -1117,6 +1406,7 @@ export function createViewer(options = {}) {
       }
       if (next < screen.cols) cell(' '.repeat(screen.cols - next), screen.cols - next, 0, undefined, undefined, true);
       row.replaceChildren(...cells);
+      row._viewerKey = key;
       textRowKeys[index] = key;
     }
     while (textRows.length > screen.rows) textRows.pop().remove();
@@ -1142,10 +1432,12 @@ export function createViewer(options = {}) {
     searchMatches = [];
     for (let row = 0; row < textRows.length; row++) {
       for (const match of textRows[row].textContent.matchAll(pattern)) {
-        searchMatches.push({ row, offset: match.index, end: match.index + match[0].length });
+        searchMatches.push({ row, identity: textRows[row].dataset.identity, generation: textRows[row].dataset.generation,
+          offset: match.index, end: match.index + match[0].length });
       }
     }
-    const retained = current && searchMatches.findIndex(match => match.row === current.row
+    const retained = current && searchMatches.findIndex(match => (current.identity === undefined ? match.row === current.row
+      : match.identity === current.identity && match.generation === current.generation)
       && match.offset === current.offset && match.end === current.end);
     searchIndex = retained >= 0 ? retained : Math.min(Math.max(0, searchIndex), searchMatches.length - 1);
     if (hooks.searchChanged) hooks.searchChanged(searchResult());
@@ -1153,7 +1445,7 @@ export function createViewer(options = {}) {
 
   function currentSearchRange() {
     const match = searchMatches[searchIndex];
-    return match ? textRange({ row: match.row, offset: match.offset }, { row: match.row, offset: match.end }) : null;
+    return match ? textRange({ ...match, offset: match.offset }, { ...match, offset: match.end }) : null;
   }
 
   function paintSearchMarks() {
@@ -1241,11 +1533,19 @@ export function createViewer(options = {}) {
       stageWidth: viewer.wrap.clientWidth,
       stageHeight: viewer.wrap.clientHeight,
       configuredFontSize: prefs.fontSize,
+      nativeRows: viewer.screen?.history?.native_rows ?? viewer.screen?.rows ?? null,
     };
     const key = JSON.stringify(metrics);
-    if (key === lastLayoutKey) return;
-    lastLayoutKey = key;
-    if (hooks.layoutChanged) hooks.layoutChanged(metrics);
+    if (key !== lastLayoutKey) {
+      lastLayoutKey = key;
+      if (hooks.layoutChanged) hooks.layoutChanged(metrics);
+    }
+    const rows = getDesiredHistoryRows();
+    if (rows !== lastDesiredHistoryRows) {
+      lastDesiredHistoryRows = rows;
+      if (hooks.historyRowsChanged) hooks.historyRowsChanged(rows, metrics);
+      notifyReadingChanged();
+    }
   }
 
   window.addEventListener('resize', scheduleViewerRender);
@@ -1275,6 +1575,7 @@ export function createViewer(options = {}) {
     getCellMetrics,
     getSelectedText,
     getHistoryState,
+    getDesiredHistoryRows,
     expectHistoryWindow,
     cancelHistoryWindow,
     findText,

@@ -89,6 +89,7 @@ fn observer_settings(command: &str, grok: bool) -> serde_json::Value {
             "ElicitationResult",
             "Stop",
             "StopFailure",
+            "SubagentStart",
             "SubagentStop",
             "SessionEnd",
         ]

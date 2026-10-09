@@ -59,6 +59,17 @@ struct AttentionState {
     current_turn: Option<String>,
     #[serde(default)]
     turn_cancelled: bool,
+    /// The working column describes the entire session, including background children.
+    #[serde(default)]
+    parent_working: Option<bool>,
+    #[serde(default)]
+    completion_deferred: bool,
+    #[serde(default)]
+    children_working: bool,
+    /// Actual child work/requests fence older exits; reconciled results use parent time
+    /// and do not prove that the child started or resumed at that timestamp.
+    #[serde(default)]
+    child_activity: Vec<(String, i64)>,
     requests: Vec<RequestState>,
     #[serde(default)]
     active_tools: Vec<(String, Option<String>)>,
@@ -75,9 +86,17 @@ struct AttentionState {
 }
 
 impl AttentionState {
+    fn active_tool_count(&self, lifecycle: bool) -> usize {
+        self.active_tools
+            .iter()
+            .filter(|(id, _)| child_lifecycle(id) == lifecycle)
+            .count()
+    }
+
     fn clear_completion_for_activity(&mut self, at: i64) {
         self.completed_turn = None;
         self.completed_at_micros = None;
+        self.completion_deferred = false;
         // Child hooks can be saved before an older parent activity hook. Only
         // a later activity starts a new episode after an already proven result.
         if self.resolved_at_micros <= at {
@@ -129,6 +148,10 @@ struct TurnTermination {
 fn request_owner(id: &str) -> Option<&str> {
     let (owner, _) = id.strip_prefix("child:")?.split_once(':')?;
     Some(&id[..6 + owner.len()])
+}
+
+fn child_lifecycle(id: &str) -> bool {
+    request_owner(id).is_some() && id.ends_with(":lifecycle")
 }
 
 fn anonymous_request(id: &str) -> bool {
@@ -329,6 +352,7 @@ impl Db {
                 .map_err(|_| anyhow::anyhow!("agent attention state invalid"))?,
             None => AttentionState::default(),
         };
+        working = state.parent_working.unwrap_or(working);
         if state.ended && event.kind != K::SessionStart {
             return Ok(());
         }
@@ -385,6 +409,24 @@ impl Db {
             }))
         {
             return Ok(());
+        }
+        // Old persisted tools and legacy question hooks prove a child exists even
+        // when no SubagentStart/Working hook has supplied its lifetime yet.
+        // Do not fabricate an activity clock from this parent/result event.
+        let child_lifecycles: Vec<_> = state
+            .active_tools
+            .iter()
+            .filter_map(|(id, _)| request_owner(id))
+            .map(|owner| format!("{owner}:lifecycle"))
+            .collect();
+        for lifecycle in child_lifecycles {
+            if !state.active_tools.iter().any(|(id, _)| id == &lifecycle) {
+                anyhow::ensure!(
+                    state.active_tool_count(true) < REQUESTS_MAX,
+                    "agent attention child lifecycle limit"
+                );
+                state.active_tools.push((lifecycle, None));
+            }
         }
         match event.kind {
             K::ResponseRequired | K::ApprovalRequired | K::Resolved => {
@@ -543,10 +585,9 @@ impl Db {
                     // 알림만 있던 경로는 기존처럼 해당 소유자의 모든 실행 결과를 기다린다.
                     if finished
                         && (finished_approval
-                            || !state
-                                .active_tools
-                                .iter()
-                                .any(|(id, _)| request_owner(id) == owner))
+                            || !state.active_tools.iter().any(|(id, _)| {
+                                request_owner(id) == owner && !id.ends_with(":lifecycle")
+                            }))
                         && !state.requests.iter().any(|r| {
                             r.kind == 2 && r.id != notification && request_owner(&r.id) == owner
                         })
@@ -602,6 +643,18 @@ impl Db {
                     working = true;
                     done = false;
                 }
+                // A tool result finishes that call, not the child. Keep its lifecycle
+                // until SubagentStop, including older sessions without SubagentStart.
+                if let Some(owner) = owner {
+                    let lifecycle = format!("{owner}:lifecycle");
+                    if !state.active_tools.iter().any(|(id, _)| id == &lifecycle) {
+                        anyhow::ensure!(
+                            state.active_tool_count(true) < REQUESTS_MAX,
+                            "agent attention child lifecycle limit"
+                        );
+                        state.active_tools.push((lifecycle, None));
+                    }
+                }
             }
             K::Completed if latest && !state.turn_cancelled => {
                 working = false;
@@ -634,13 +687,29 @@ impl Db {
                 working = false;
             }
             K::Cancelled | K::SessionEnd => {
+                // A child lifecycle spans parent turns. Its exit ends all of that
+                // child's calls, including calls started before the parent resumed.
+                let child_exit = owner.is_some() && event.request_id.ends_with(":lifecycle");
+                if child_exit
+                    && state
+                        .child_activity
+                        .iter()
+                        .any(|(child, at)| Some(child.as_str()) == owner && *at > event.at_micros)
+                {
+                    return Ok(());
+                }
+                let terminated_turn = if child_exit {
+                    None
+                } else {
+                    event.turn_id.clone()
+                };
                 if event.kind == K::SessionEnd {
                     state.ended = true;
                 }
                 if let Some(end) = state
                     .terminated_turns
                     .iter_mut()
-                    .find(|end| end.owner.as_deref() == owner && end.turn == event.turn_id)
+                    .find(|end| end.owner.as_deref() == owner && end.turn == terminated_turn)
                 {
                     end.at = end.at.max(event.at_micros);
                 } else {
@@ -658,20 +727,22 @@ impl Db {
                     }
                     state.terminated_turns.push(TurnTermination {
                         owner: owner.map(str::to_owned),
-                        turn: event.turn_id.clone(),
+                        turn: terminated_turn,
                         at: event.at_micros,
                     });
                 }
                 state.active_tools.retain(|(id, turn)| {
                     event.kind != K::SessionEnd
                         && (request_owner(id) != owner
-                            || (event.turn_id.is_some() && turn != &event.turn_id))
+                            || (!child_exit && event.turn_id.is_some() && turn != &event.turn_id))
                 });
                 for r in &mut state.requests {
                     if r.at <= event.at_micros
                         && (event.kind == K::SessionEnd
                             || (request_owner(&r.id) == owner
-                                && (event.turn_id.is_none() || r.turn == event.turn_id)))
+                                && (child_exit
+                                    || event.turn_id.is_none()
+                                    || r.turn == event.turn_id)))
                     {
                         r.kind = 0;
                         r.at = event.at_micros;
@@ -683,6 +754,7 @@ impl Db {
                     working = false;
                     done = false;
                     state.turn_cancelled = true;
+                    state.completion_deferred = false;
                 }
             }
             _ => {}
@@ -695,13 +767,25 @@ impl Db {
                 .iter()
                 .any(|r| r.id == event.request_id && r.kind == 0 && r.at >= event.at_micros)
         {
+            if let Some(owner) = owner {
+                let lifecycle = format!("{owner}:lifecycle");
+                if !state.active_tools.iter().any(|(id, _)| id == &lifecycle) {
+                    // Reserve the child's lifetime in the same transaction as
+                    // its first question, so capacity rejection cannot poison cleanup.
+                    anyhow::ensure!(
+                        state.active_tool_count(true) < REQUESTS_MAX,
+                        "agent attention child lifecycle limit"
+                    );
+                    state.active_tools.push((lifecycle, None));
+                }
+            }
             if !state
                 .active_tools
                 .iter()
                 .any(|(id, _)| id == &event.request_id)
             {
                 anyhow::ensure!(
-                    state.active_tools.len() < REQUESTS_MAX,
+                    state.active_tool_count(child_lifecycle(&event.request_id)) < REQUESTS_MAX,
                     "agent attention active tool limit"
                 );
                 state
@@ -724,8 +808,67 @@ impl Db {
         state
             .tool_groups
             .retain(|(id, _, _)| state.active_tools.iter().any(|(active, _)| active == id));
+        state.child_activity.retain(|(child, _)| {
+            state
+                .active_tools
+                .iter()
+                .any(|(id, _)| id == &format!("{child}:lifecycle"))
+        });
+        if let Some(owner) = owner
+            && matches!(
+                event.kind,
+                K::Working | K::ResponseRequired | K::ApprovalRequired
+            )
+            && state
+                .active_tools
+                .iter()
+                .any(|(id, _)| id == &format!("{owner}:lifecycle"))
+        {
+            if let Some((_, at)) = state
+                .child_activity
+                .iter_mut()
+                .find(|(child, _)| child == owner)
+            {
+                *at = (*at).max(event.at_micros);
+            } else {
+                anyhow::ensure!(
+                    state.child_activity.len() < REQUESTS_MAX,
+                    "agent attention child activity limit"
+                );
+                state
+                    .child_activity
+                    .push((owner.to_owned(), event.at_micros));
+            }
+        }
         if current {
             state.last_activity = state.last_activity.max(event.at_micros);
+        }
+        state.parent_working = Some(working);
+        state.children_working = state
+            .active_tools
+            .iter()
+            .any(|(id, _)| request_owner(id).is_some());
+        working |= state.children_working;
+        // Parent Stop is only a partial completion while a background child is alive.
+        // Preserve its boundary and publish once when the last child actually exits.
+        if state.children_working
+            && state.completed_turn.is_some()
+            && !state.turn_cancelled
+            && !state.ended
+        {
+            state.completion_deferred = true;
+            done = false;
+            new_completion = false;
+        } else if !working && state.completion_deferred && !state.turn_cancelled && !state.ended {
+            state.completion_deferred = false;
+            done = true;
+            new_completion = true;
+            state.completed_at_micros = Some(
+                state
+                    .completed_at_micros
+                    .unwrap_or(event.at_micros)
+                    .max(event.at_micros),
+            );
         }
         state.prune_anonymous_history();
         let response = state.requests.iter().any(|r| r.kind == 1);
@@ -749,6 +892,7 @@ impl Db {
         }
         // Alert acknowledgments consume turn_done, not the actual idle episode.
         // A quiet-screen observation alone never proves that an agent turn completed.
+        let completion_boundary = state.completed_at_micros.unwrap_or(event.at_micros);
         let idle_since = if !waiting
             && !working
             && !state.ended
@@ -756,7 +900,7 @@ impl Db {
             && state.completed_turn.is_some()
         {
             if new_completion {
-                Some(event.at_micros.max(state.resolved_at_micros) / 1_000_000)
+                Some(completion_boundary.max(state.resolved_at_micros) / 1_000_000)
             } else if recovered_resolution.is_some()
                 && state.resolved_at_micros > previous_resolution
             {
@@ -776,7 +920,7 @@ impl Db {
             None
         };
         let completion_generation = if new_completion {
-            revision.saturating_add(1).max(event.at_micros)
+            revision.saturating_add(1).max(completion_boundary)
         } else {
             revision
         };
@@ -873,7 +1017,9 @@ impl Db {
         let state: AttentionState = serde_json::from_str(&json)
             .map_err(|_| anyhow::anyhow!("agent attention state invalid"))?;
         anyhow::ensure!(
-            state.requests.len() <= REQUESTS_MAX && state.active_tools.len() <= REQUESTS_MAX,
+            state.requests.len() <= REQUESTS_MAX
+                && state.active_tool_count(false) <= REQUESTS_MAX
+                && state.active_tool_count(true) <= REQUESTS_MAX,
             "agent attention request limit"
         );
         if state.native_session_id != native {
@@ -1394,7 +1540,7 @@ mod tests {
     }
 
     #[test]
-    fn fix7_자식의_도구와_승인_알림은_부모_상태를_바꾸지_않고_해제한다() {
+    fn fix7_자식의_도구와_승인_알림을_해제하고_자식_종료_후_완료한다() {
         let db = Db::open_in_memory().unwrap();
         for (kind, id, at) in [
             (AttentionEventKind::Completed, "", 1),
@@ -1417,8 +1563,213 @@ mod tests {
         db.record_agent_attention(KEY, &event(AttentionEventKind::Resolved, "child:a:q", 6))
             .unwrap();
         assert!(db.list_waiting_sessions().unwrap().is_empty());
+        assert!(db.list_turn_done_sessions().unwrap().is_empty());
+        assert_eq!(db.list_working_sessions().unwrap(), vec![KEY]);
+        db.record_agent_attention(
+            KEY,
+            &event(AttentionEventKind::Cancelled, "child:a:lifecycle", 7),
+        )
+        .unwrap();
         assert_eq!(db.list_turn_done_sessions().unwrap().len(), 1);
         assert!(db.list_working_sessions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn background_child_question_resumption_ignores_an_old_exit() {
+        let db = Db::open_in_memory().unwrap();
+        for (kind, id, at) in [
+            (AttentionEventKind::TurnStart, "", 1),
+            (AttentionEventKind::Working, "child:a:lifecycle", 2),
+            (AttentionEventKind::Completed, "", 3),
+            (AttentionEventKind::Cancelled, "child:a:lifecycle", 4),
+        ] {
+            db.record_agent_attention(KEY, &event(kind, id, at))
+                .unwrap();
+        }
+        let mut question = event(AttentionEventKind::ResponseRequired, "child:a:q", 6);
+        question.tool_group = Some("child:a:question".into());
+        db.record_agent_attention(KEY, &question).unwrap();
+        db.record_agent_attention(
+            KEY,
+            &event(AttentionEventKind::Cancelled, "child:a:lifecycle", 4),
+        )
+        .unwrap();
+        assert_eq!(db.list_working_sessions().unwrap(), vec![KEY]);
+        db.record_agent_attention(KEY, &event(AttentionEventKind::Resolved, "child:a:q", 7))
+            .unwrap();
+        assert!(db.list_waiting_sessions().unwrap().is_empty());
+        assert_eq!(db.list_working_sessions().unwrap(), vec![KEY]);
+        assert!(db.list_turn_done_sessions().unwrap().is_empty());
+        db.record_agent_attention(
+            KEY,
+            &event(AttentionEventKind::Cancelled, "child:a:lifecycle", 8),
+        )
+        .unwrap();
+        assert!(db.list_working_sessions().unwrap().is_empty());
+        assert_eq!(db.list_turn_done_sessions().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn background_child_question_capacity_rejects_an_extra_owner_without_poisoning_cleanup() {
+        let db = Db::open_in_memory().unwrap();
+        db.record_agent_attention(KEY, &event(AttentionEventKind::TurnStart, "", 1))
+            .unwrap();
+        for i in 0..REQUESTS_MAX {
+            db.record_agent_attention(
+                KEY,
+                &event(
+                    AttentionEventKind::Working,
+                    &format!("child:{i}:lifecycle"),
+                    i as i64 + 2,
+                ),
+            )
+            .unwrap();
+        }
+        let mut own = event(AttentionEventKind::ResponseRequired, "child:0:q", 66);
+        own.tool_group = Some("child:0:question".into());
+        db.record_agent_attention(KEY, &own).unwrap();
+        let mut extra = event(AttentionEventKind::ResponseRequired, "child:extra:q", 67);
+        extra.tool_group = Some("child:extra:question".into());
+        assert!(db.record_agent_attention(KEY, &extra).is_err());
+        assert_eq!(
+            db.pending_agent_request_ids(KEY, "native-1").unwrap(),
+            vec!["child:0:q"]
+        );
+        db.record_agent_attention(KEY, &event(AttentionEventKind::Resolved, "child:0:q", 68))
+            .unwrap();
+        assert!(db.list_waiting_sessions().unwrap().is_empty());
+        db.record_agent_attention(KEY, &event(AttentionEventKind::Completed, "", 69))
+            .unwrap();
+        db.record_agent_attention(
+            KEY,
+            &event(AttentionEventKind::Cancelled, "child:0:lifecycle", 70),
+        )
+        .unwrap();
+        assert_eq!(db.list_working_sessions().unwrap(), vec![KEY]);
+        db.record_agent_attention(KEY, &event(AttentionEventKind::SessionEnd, "", 71))
+            .unwrap();
+        assert!(db.list_working_sessions().unwrap().is_empty());
+        assert!(db.list_turn_done_sessions().unwrap().is_empty());
+        assert!(
+            db.pending_agent_request_ids(KEY, "native-1")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn background_legacy_child_tools_keep_lifetime_after_a_result() {
+        for tool_count in [REQUESTS_MAX, 1] {
+            let db = Db::open_in_memory().unwrap();
+            // Persisted pre-fix JSON has child tools but none of the new aggregate fields.
+            let legacy = r#"{"native_session_id":"native-1","generation":0,"last_activity":1000000,"turn_started":1000000,"completed_turn":null,"requests":[],"active_tools":[["child:a:tool","turn-1"]]}"#;
+            let mut legacy: serde_json::Value = serde_json::from_str(legacy).unwrap();
+            legacy["active_tools"] = serde_json::json!(
+                (0..tool_count)
+                    .map(|i| (format!("child:a:tool-{i}"), "turn-1"))
+                    .collect::<Vec<_>>()
+            );
+            db.conn.execute(
+            "INSERT INTO agent_needs_input(session_key,waiting,working,turn_done,updated_at,attention_json) VALUES (?1,0,1,0,strftime('%s','now'),?2)",
+            (KEY, legacy.to_string()),
+        ).unwrap();
+            db.record_agent_attention(KEY, &event(AttentionEventKind::Completed, "", 3_000_000))
+                .unwrap();
+            assert!(
+                db.pending_agent_request_ids(KEY, "native-1")
+                    .unwrap()
+                    .is_empty()
+            );
+            for i in 0..tool_count {
+                db.record_agent_attention(
+                    KEY,
+                    &event(
+                        AttentionEventKind::Resolved,
+                        &format!("child:a:tool-{i}"),
+                        4_000_000 + i as i64,
+                    ),
+                )
+                .unwrap();
+            }
+            assert_eq!(db.list_working_sessions().unwrap(), vec![KEY]);
+            assert!(db.list_turn_done_sessions().unwrap().is_empty());
+            // Bootstrap must not invent a child start time from the newer parent's hook.
+            db.record_agent_attention(
+                KEY,
+                &event(
+                    AttentionEventKind::Cancelled,
+                    "child:a:lifecycle",
+                    2_500_000,
+                ),
+            )
+            .unwrap();
+            assert!(db.list_working_sessions().unwrap().is_empty());
+            assert_eq!(waiting_since(&db), Some(3));
+            assert_eq!(db.list_turn_done_sessions().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn background_child_delayed_exit_keeps_the_later_parent_completion_clock() {
+        let db = Db::open_in_memory().unwrap();
+        for (kind, id, at) in [
+            (AttentionEventKind::TurnStart, "", 1_000_000),
+            (AttentionEventKind::Working, "child:a:lifecycle", 2_000_000),
+            (AttentionEventKind::Completed, "", 10_000_000),
+            (
+                AttentionEventKind::Cancelled,
+                "child:a:lifecycle",
+                9_000_000,
+            ),
+        ] {
+            db.record_agent_attention(KEY, &event(kind, id, at))
+                .unwrap();
+        }
+        assert_eq!(waiting_since(&db), Some(10));
+        let completed = db.list_turn_done_sessions().unwrap();
+        assert_eq!(completed.len(), 1);
+        assert!(completed[0].1 >= 10_000_000);
+        db.clear_agent_turn_done(KEY, completed[0].1).unwrap();
+        let snapshot = db
+            .apply_agent_state_job(&AgentStateJob::projection("other"))
+            .unwrap();
+        assert_eq!(
+            snapshot.idle_sessions,
+            vec![(KEY.to_owned(), 10, completed[0].1)]
+        );
+        assert!(snapshot.turn_done_sessions.is_empty());
+    }
+
+    #[test]
+    fn background_child_lifecycle_survives_long_tools_in_global_projection() {
+        let db = Db::open_in_memory().unwrap();
+        for (kind, id, at) in [
+            (AttentionEventKind::TurnStart, "", 1),
+            (AttentionEventKind::Working, "child:a:lifecycle", 2),
+            (AttentionEventKind::Completed, "", 3),
+        ] {
+            db.record_agent_attention(KEY, &event(kind, id, at))
+                .unwrap();
+        }
+        db.conn.execute("UPDATE agent_needs_input SET updated_at=strftime('%s','now')-600 WHERE session_key=?1", [KEY]).unwrap();
+        assert_eq!(db.list_working_sessions().unwrap(), vec![KEY]);
+        let snapshot = db
+            .apply_agent_state_job(&AgentStateJob::projection("other"))
+            .unwrap();
+        assert_eq!(snapshot.working_sessions, vec![KEY]);
+        assert!(snapshot.turn_done_sessions.is_empty());
+        assert!(snapshot.idle_sessions.is_empty());
+        db.record_agent_attention(
+            KEY,
+            &event(AttentionEventKind::Cancelled, "child:a:lifecycle", 4),
+        )
+        .unwrap();
+        let snapshot = db
+            .apply_agent_state_job(&AgentStateJob::projection("other"))
+            .unwrap();
+        assert!(snapshot.working_sessions.is_empty());
+        assert_eq!(snapshot.turn_done_sessions.len(), 1);
+        assert_eq!(snapshot.idle_sessions.len(), 1);
     }
 
     #[test]

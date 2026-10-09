@@ -1362,7 +1362,7 @@ pub struct AgentStateSnapshot {
     /// Confirmed idle episodes: key, Unix seconds, and independent microsecond boundary generation.
     pub idle_sessions: Vec<(String, i64, i64)>,
     /// hook 기반 "작업 중" 세션 키(v32) — clear 이벤트(UserPromptSubmit/PreToolUse)가
-    /// 기록. waiting처럼 전역(모든 워크스페이스)이며 2분 stale 창으로 자기치유된다.
+    /// 기록. 전역이며 부모 단독 신호는2분 후 만료한다. 자식 lifecycle은 종료까지 유지한다.
     pub working_sessions: Vec<String>,
     pub agent_sessions: Vec<AgentSessionRow>,
     /// 전 워크스페이스 스코프에서 실제 resume 명령이 있는 provider의
@@ -1989,9 +1989,14 @@ const IDLE_SESSIONS_SELECT: &str =
 // (하트비트) 창이 계속 연장되고, 활성 워크스페이스는 만료 후에도 transcript activity가
 // 폴백이라 유실 영향이 없다. waiting과 달리 전역(prefix 없음) — warm 워크스페이스
 // 세션도 fleet에서 작업 중을 보여야 한다.
+// 명시적인 child lifecycle은 장시간 도구/추론 중에도 종료 훅까지 유지한다.
+// JSON 근거는32KiB 이하의 유효한 값에만 적용하며 구버전/단독 부모 신호의2분 창은 유지한다.
 const WORKING_SESSIONS_PREFLIGHT: &str = "WITH selected AS MATERIALIZED (
     SELECT rowid FROM agent_needs_input
-     WHERE working = 1 AND updated_at > ?4 - 120
+     WHERE working = 1 AND (updated_at > ?4 - 120 OR
+       CASE WHEN typeof(attention_json)='text' AND length(CAST(attention_json AS BLOB))<=32768
+         THEN CASE WHEN json_valid(attention_json) THEN json_extract(attention_json,'$.children_working') END
+       END = 1)
      ORDER BY updated_at DESC, substr(CAST(session_key AS BLOB), 1, ?2), rowid LIMIT ?1
 ), sized AS MATERIALIZED (
     SELECT state.*, length(CAST(state.session_key AS BLOB)) AS row_bytes
@@ -2003,7 +2008,10 @@ SELECT COUNT(*), COALESCE(SUM(CASE WHEN
     OR row_bytes > ?3 THEN 1 ELSE 0 END), 0),
     COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0) FROM sized";
 const WORKING_SESSIONS_SELECT: &str = "SELECT session_key FROM agent_needs_input
-    WHERE working = 1 AND updated_at > ?3 - 120
+    WHERE working = 1 AND (updated_at > ?3 - 120 OR
+      CASE WHEN typeof(attention_json)='text' AND length(CAST(attention_json AS BLOB))<=32768
+        THEN CASE WHEN json_valid(attention_json) THEN json_extract(attention_json,'$.children_working') END
+      END = 1)
     ORDER BY updated_at DESC, substr(CAST(session_key AS BLOB), 1, ?2), rowid LIMIT ?1";
 
 const AGENT_SESSIONS_BOUNDED_PREFLIGHT: &str = "WITH selected AS MATERIALIZED (
@@ -7800,13 +7808,15 @@ impl Db {
     }
 
     /// hook 기반 "작업 중"(v32) 세션 키. stale(2분 초과)은 제외 — Stop 유실(Ctrl-C 등)
-    /// 시 자기치유(병렬 리뷰 H1: 창이 길면 IdleHeuristic을 눌러 고착 표시). 실제 작업
-    /// 중엔 PreToolUse가 툴 호출마다 updated_at을 갱신한다.
+    /// 시 자기치유한다. 명시적인 background child lifecycle은 종료까지 유지한다.
     pub fn list_working_sessions(&self) -> anyhow::Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
             "SELECT session_key FROM agent_needs_input
              WHERE working = 1
-               AND updated_at > CAST(strftime('%s','now') AS INTEGER) - 120",
+               AND (updated_at > CAST(strftime('%s','now') AS INTEGER) - 120 OR
+                 CASE WHEN typeof(attention_json)='text' AND length(CAST(attention_json AS BLOB))<=32768
+                   THEN CASE WHEN json_valid(attention_json) THEN json_extract(attention_json,'$.children_working') END
+                 END = 1)",
         )?;
         let rows = stmt.query_map([], |row| row.get(0))?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)

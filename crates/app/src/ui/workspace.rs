@@ -10412,9 +10412,8 @@ fn word_range_at(
     Some((base + start, base + end))
 }
 
-/// regex/휴리스틱 상태와 transcript 기반 활동(옵션2)을 병합한다. 승인/오류/완료는
-/// transcript에 없는 '주의' 신호라 regex를 우선하고, 그 외(실행/대기/유휴/미보고)는
-/// 더 정확한 transcript 활동으로 덮어쓴다.
+/// 요청/오류는 우선한다. 현재 hook 작업(자식 포함)은 오래된 완료보다 강하고,
+/// hook이 없을 때 transcript 활동과 화면 상태를 사용한다.
 fn merge_agent_status(
     regex: Option<runtime::SessionStatus>,
     activity: Option<crate::agent_transcript::AgentActivity>,
@@ -10439,6 +10438,11 @@ fn merge_agent_status(
     if matches!(regex, Some(S::Error | S::Waiting | S::NeedsApproval)) {
         return regex;
     }
+    // Current hook activity includes background children. An older parent Stop or
+    // a screen fragment containing "finished" must not override that live work.
+    if hook_working {
+        return Some(S::Running);
+    }
     // Stop hook = 턴 완료. UserPromptSubmit/PreToolUse가 clear하므로 재개 시 즉시 해제.
     // transcript activity(Stop 직후 잠깐 Working으로 남음)보다 우선한다.
     if turn_done {
@@ -10446,12 +10450,6 @@ fn merge_agent_status(
     }
     if matches!(regex, Some(S::Done)) {
         return regex;
-    }
-    // hook "작업 중"(v32, cmux식): UserPromptSubmit/PreToolUse가 턴 경계에서 즉시 기록 —
-    // transcript(1.5s 폴링 + 활성 전용)보다 빠르고 warm에서도 동작한다. 화면 regex의
-    // 대기/승인(위)은 hook이 놓치는 프롬프트를 잡는 fallback이라 여전히 우선한다.
-    if hook_working {
-        return Some(S::Running);
     }
     match activity {
         Some(AgentActivity::Working) => Some(S::Running),
@@ -11023,8 +11021,7 @@ mod tests {
         );
     }
 
-    /// hook "작업 중"(v32) 병합 우선순위: 확정 상태(승인대기/오류/완료/화면 대기)가
-    /// 이기고, 그 외엔 hook working이 transcript(지연·활성 전용)보다 우선한다.
+    /// 승인·오류·화면 대기가 우선하고, 현재 hook 작업은 오래된 완료보다 우선한다.
     #[test]
     fn merge_agent_status_hook_working_우선순위() {
         use crate::agent_transcript::AgentActivity;
@@ -11038,7 +11035,7 @@ mod tests {
             merge_agent_status(None, Some(AgentActivity::Idle), false, false, true, false),
             Some(S::Running)
         );
-        // 확정 상태가 우선: needs_input / regex Error / turn_done / 화면 대기(regex)
+        // 요청/오류는 우선하지만, fresh working은 부모 턴의 오래된 완료보다 우선한다.
         assert_eq!(
             merge_agent_status(None, None, true, false, true, false),
             Some(S::NeedsApproval)
@@ -11049,7 +11046,18 @@ mod tests {
         );
         assert_eq!(
             merge_agent_status(None, None, false, true, true, false),
-            Some(S::Done)
+            Some(S::Running)
+        );
+        assert_eq!(
+            merge_agent_status(
+                Some(S::Done),
+                Some(AgentActivity::Idle),
+                false,
+                false,
+                true,
+                false
+            ),
+            Some(S::Running)
         );
         assert_eq!(
             merge_agent_status(Some(S::Waiting), None, false, false, true, false),

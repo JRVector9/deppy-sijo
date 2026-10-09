@@ -98,6 +98,15 @@ pub fn normalize(v: &Value, at_micros: i64) -> Option<AgentAttentionEvent> {
             _ => return None,
         },
         "stop" => K::Completed,
+        "subagentstart" | "subagentstop" => {
+            field(v, &["agent_id"])?;
+            request = "lifecycle".into();
+            if name == "subagentstart" {
+                K::Working
+            } else {
+                K::Cancelled
+            }
+        }
         "stopfailure" | "stopcancelled" | "interrupt" => K::Cancelled,
         "sessionend" => K::SessionEnd,
         _ => return None,
@@ -430,6 +439,244 @@ mod tests {
             db.record_agent_attention(KEY, &e).unwrap();
         }
         super::reconcile_claude_results(db, KEY, &v, at);
+    }
+
+    #[test]
+    fn background_children_keep_session_running_until_the_last_child_stops() {
+        let d = db();
+        hook(
+            &d,
+            json!({"session_id":"native","hook_event_name":"UserPromptSubmit","prompt_id":"turn"}),
+            1,
+        );
+        for (child, at) in [("a", 2), ("b", 3)] {
+            hook(
+                &d,
+                json!({"session_id":"native","hook_event_name":"SubagentStart","agent_id":child}),
+                at,
+            );
+        }
+        hook(
+            &d,
+            json!({"session_id":"native","hook_event_name":"Stop","prompt_id":"turn"}),
+            4,
+        );
+        assert_eq!(d.list_working_sessions().unwrap(), vec![KEY]);
+        assert!(d.list_turn_done_sessions().unwrap().is_empty());
+        hook(
+            &d,
+            json!({"session_id":"native","hook_event_name":"SubagentStop","agent_id":"a"}),
+            5,
+        );
+        assert_eq!(d.list_working_sessions().unwrap(), vec![KEY]);
+        assert!(d.list_turn_done_sessions().unwrap().is_empty());
+        hook(
+            &d,
+            json!({"session_id":"native","hook_event_name":"SubagentStop","agent_id":"b"}),
+            6,
+        );
+        assert!(d.list_working_sessions().unwrap().is_empty());
+        let completed = d.list_turn_done_sessions().unwrap();
+        assert_eq!(completed.len(), 1);
+        d.clear_agent_turn_done(KEY, completed[0].1).unwrap();
+        hook(
+            &d,
+            json!({"session_id":"native","hook_event_name":"SubagentStop","agent_id":"b"}),
+            7,
+        );
+        assert!(
+            d.list_turn_done_sessions().unwrap().is_empty(),
+            "duplicate child stop must not restore an acknowledged completion"
+        );
+        hook(
+            &d,
+            json!({"session_id":"native","hook_event_name":"SubagentStart","agent_id":"a"}),
+            8,
+        );
+        hook(
+            &d,
+            json!({"session_id":"native","hook_event_name":"SubagentStop","agent_id":"a"}),
+            5,
+        );
+        assert_eq!(
+            d.list_working_sessions().unwrap(),
+            vec![KEY],
+            "an old exit must not stop the resumed child"
+        );
+        hook(
+            &d,
+            json!({"session_id":"native","hook_event_name":"SubagentStop","agent_id":"a"}),
+            9,
+        );
+        let resumed = d.list_turn_done_sessions().unwrap();
+        assert_eq!(resumed.len(), 1);
+        assert!(resumed[0].1 > completed[0].1);
+        hook(
+            &d,
+            json!({"session_id":"native","hook_event_name":"SubagentStart","agent_id":"a"}),
+            8,
+        );
+        assert!(
+            d.list_working_sessions().unwrap().is_empty(),
+            "a delayed start must not reopen an exited child"
+        );
+    }
+
+    #[test]
+    fn background_child_tool_results_do_not_finish_the_child_between_tools() {
+        let d = db();
+        hook(
+            &d,
+            json!({"session_id":"native","hook_event_name":"UserPromptSubmit"}),
+            1,
+        );
+        // Legacy sessions may already be running without a SubagentStart hook.
+        hook(
+            &d,
+            json!({"session_id":"native","agent_id":"a","hook_event_name":"PreToolUse","tool_use_id":"tool","tool_name":"Bash"}),
+            2,
+        );
+        hook(
+            &d,
+            json!({"session_id":"native","hook_event_name":"Stop"}),
+            3,
+        );
+        hook(
+            &d,
+            json!({"session_id":"native","agent_id":"a","hook_event_name":"PostToolUse","tool_use_id":"tool","tool_name":"Bash"}),
+            4,
+        );
+        assert_eq!(d.list_working_sessions().unwrap(), vec![KEY]);
+        assert!(d.list_turn_done_sessions().unwrap().is_empty());
+        hook(
+            &d,
+            json!({"session_id":"native","hook_event_name":"SubagentStop","agent_id":"a"}),
+            5,
+        );
+        assert!(d.list_working_sessions().unwrap().is_empty());
+        assert_eq!(d.list_turn_done_sessions().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn background_legacy_child_first_question_keeps_running_after_the_answer() {
+        let d = db();
+        hook(
+            &d,
+            json!({"session_id":"native","hook_event_name":"UserPromptSubmit"}),
+            1,
+        );
+        // An already-running child may lack SubagentStart and first report a question.
+        hook(
+            &d,
+            json!({"session_id":"native","agent_id":"a","hook_event_name":"PreToolUse","tool_use_id":"q","tool_name":"AskUserQuestion"}),
+            2,
+        );
+        hook(
+            &d,
+            json!({"session_id":"native","hook_event_name":"Stop"}),
+            3,
+        );
+        hook(
+            &d,
+            json!({"session_id":"native","agent_id":"a","hook_event_name":"PostToolUse","tool_use_id":"q","tool_name":"AskUserQuestion"}),
+            4,
+        );
+        assert!(d.list_waiting_sessions().unwrap().is_empty());
+        assert_eq!(d.list_working_sessions().unwrap(), vec![KEY]);
+        assert!(d.list_turn_done_sessions().unwrap().is_empty());
+        hook(
+            &d,
+            json!({"session_id":"native","hook_event_name":"SubagentStop","agent_id":"a"}),
+            5,
+        );
+        assert!(d.list_working_sessions().unwrap().is_empty());
+        assert_eq!(d.list_turn_done_sessions().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn background_child_reconciled_result_does_not_reject_a_delayed_exit() {
+        let d = db();
+        let dir = std::env::temp_dir().join(format!("deppy-child-exit-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("native/subagents")).unwrap();
+        hook(
+            &d,
+            json!({"session_id":"native","hook_event_name":"UserPromptSubmit"}),
+            1,
+        );
+        hook(
+            &d,
+            json!({"session_id":"native","hook_event_name":"SubagentStart","agent_id":"a"}),
+            2,
+        );
+        hook(
+            &d,
+            json!({"session_id":"native","agent_id":"a","hook_event_name":"PreToolUse","tool_use_id":"q","tool_name":"Bash"}),
+            3,
+        );
+        hook(
+            &d,
+            json!({"session_id":"native","agent_id":"a","hook_event_name":"PermissionRequest","tool_name":"Bash"}),
+            3,
+        );
+        std::fs::write(
+            dir.join("native/subagents/agent-a.jsonl"),
+            json!({"message":{"content":[{"type":"tool_result","tool_use_id":"q","is_error":true}]}}).to_string() + "\n",
+        ).unwrap();
+        // The parent's newer hook recovers a result before the earlier child exit arrives.
+        hook(
+            &d,
+            json!({"session_id":"native","hook_event_name":"Stop","transcript_path":dir.join("native.jsonl")}),
+            5,
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(d.list_waiting_sessions().unwrap().is_empty());
+        assert_eq!(d.list_working_sessions().unwrap(), vec![KEY]);
+        hook(
+            &d,
+            json!({"session_id":"native","hook_event_name":"SubagentStop","agent_id":"a"}),
+            4,
+        );
+        assert!(d.list_working_sessions().unwrap().is_empty());
+        assert_eq!(d.list_turn_done_sessions().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn background_child_stop_preserves_a_resumed_parent_and_parent_question() {
+        let d = db();
+        hook(
+            &d,
+            json!({"session_id":"native","hook_event_name":"SubagentStart","agent_id":"a"}),
+            1,
+        );
+        hook(
+            &d,
+            json!({"session_id":"native","hook_event_name":"Stop"}),
+            2,
+        );
+        hook(
+            &d,
+            json!({"session_id":"native","hook_event_name":"UserPromptSubmit","prompt_id":"next"}),
+            3,
+        );
+        hook(
+            &d,
+            json!({"session_id":"native","hook_event_name":"PreToolUse","tool_use_id":"question","tool_name":"AskUserQuestion"}),
+            4,
+        );
+        hook(
+            &d,
+            json!({"session_id":"native","hook_event_name":"SubagentStop","agent_id":"a"}),
+            5,
+        );
+        assert_eq!(d.pending_agent_request_ids(KEY, "native").unwrap().len(), 1);
+        assert!(d.list_turn_done_sessions().unwrap().is_empty());
+        hook(
+            &d,
+            json!({"session_id":"native","hook_event_name":"PostToolUse","tool_use_id":"question","tool_name":"AskUserQuestion"}),
+            6,
+        );
+        assert_eq!(d.list_working_sessions().unwrap(), vec![KEY]);
+        assert!(d.list_turn_done_sessions().unwrap().is_empty());
     }
 
     #[test]

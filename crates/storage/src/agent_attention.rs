@@ -64,6 +64,9 @@ struct AttentionState {
     parent_working: Option<bool>,
     #[serde(default)]
     completion_deferred: bool,
+    /// Accepted child exits in this activity episode may arrive out of order.
+    #[serde(default)]
+    child_completed_at_micros: Option<i64>,
     #[serde(default)]
     children_working: bool,
     /// Actual child work/requests fence older exits; reconciled results use parent time
@@ -97,6 +100,9 @@ impl AttentionState {
         self.completed_turn = None;
         self.completed_at_micros = None;
         self.completion_deferred = false;
+        if self.child_completed_at_micros.is_some_and(|end| end <= at) {
+            self.child_completed_at_micros = None;
+        }
         // Child hooks can be saved before an older parent activity hook. Only
         // a later activity starts a new episode after an already proven result.
         if self.resolved_at_micros <= at {
@@ -458,6 +464,11 @@ impl Db {
                     && state.requests.iter().any(|r| {
                         r.id == event.request_id && r.kind != 0 && r.at <= event.at_micros
                     });
+                let repeated_result = kind == 0
+                    && state
+                        .requests
+                        .iter()
+                        .any(|r| r.id == event.request_id && r.kind == 0);
                 if let Some(request) = state.requests.iter_mut().find(|r| r.id == event.request_id)
                 {
                     if anonymous_request(&event.request_id) {
@@ -530,16 +541,29 @@ impl Db {
                     });
                 }
                 if kind == 0 {
-                    let finished = finished_request
+                    let mut finished = finished_request
                         || state
                             .active_tools
                             .iter()
                             .any(|(id, _)| id == &event.request_id);
-                    let finished_group = state
+                    let tracked_group = state
                         .tool_groups
                         .iter()
                         .find(|(id, _, _)| id == &event.request_id)
                         .map(|(_, group, input)| (group.clone(), input.clone()));
+                    let tracked_call = tracked_group.is_some();
+                    // Missing PreToolUse: a result with the same input digest can
+                    // resolve its permission alias. A tool name alone cannot.
+                    let finished_group = tracked_group.or_else(|| {
+                        if repeated_result {
+                            return None;
+                        }
+                        event
+                            .tool_group
+                            .clone()
+                            .zip(event.tool_input_hash.clone())
+                            .map(|(group, input)| (group, Some(input)))
+                    });
                     state.active_tools.retain(|(id, _)| id != &event.request_id);
                     state
                         .tool_groups
@@ -567,9 +591,11 @@ impl Db {
                             });
                             if base.starts_with("tool:")
                                 && request.tool_group.as_ref() == Some(&group)
+                                && (tracked_call || request.tool_input_hash == input)
                                 && !remaining
                                 && request.at <= event.at_micros
                             {
+                                finished |= request.kind != 0;
                                 finished_approval |= request.kind == 2;
                                 request.kind = 0;
                                 request.pending_count = 0;
@@ -680,7 +706,11 @@ impl Db {
                     done = true;
                     new_completion = true;
                     state.completed_turn = Some(turn);
-                    state.completed_at_micros = Some(event.at_micros);
+                    state.completed_at_micros = Some(
+                        event
+                            .at_micros
+                            .max(state.child_completed_at_micros.unwrap_or(0)),
+                    );
                 }
             }
             K::IdleObserved if latest => {
@@ -697,6 +727,19 @@ impl Db {
                         .any(|(child, at)| Some(child.as_str()) == owner && *at > event.at_micros)
                 {
                     return Ok(());
+                }
+                if child_exit
+                    && state
+                        .active_tools
+                        .iter()
+                        .any(|(id, _)| request_owner(id) == owner)
+                {
+                    state.child_completed_at_micros = Some(
+                        state
+                            .child_completed_at_micros
+                            .unwrap_or(0)
+                            .max(event.at_micros),
+                    );
                 }
                 let terminated_turn = if child_exit {
                     None
@@ -758,6 +801,24 @@ impl Db {
                 }
             }
             _ => {}
+        }
+        // An accepted question/approval also proves a live child when its Start
+        // hook was absent. Resolved tombstones must never reopen that lifetime.
+        if let Some(owner) = owner
+            && matches!(event.kind, K::ResponseRequired | K::ApprovalRequired)
+            && state
+                .requests
+                .iter()
+                .any(|r| r.id == event.request_id && r.kind != 0)
+        {
+            let lifecycle = format!("{owner}:lifecycle");
+            if !state.active_tools.iter().any(|(id, _)| id == &lifecycle) {
+                anyhow::ensure!(
+                    state.active_tool_count(true) < REQUESTS_MAX,
+                    "agent attention child lifecycle limit"
+                );
+                state.active_tools.push((lifecycle, None));
+            }
         }
         if ((event.kind == K::ResponseRequired && event.tool_group.is_some())
             || (event.kind == K::Working && (latest || owner.is_some())))
@@ -867,7 +928,8 @@ impl Db {
                 state
                     .completed_at_micros
                     .unwrap_or(event.at_micros)
-                    .max(event.at_micros),
+                    .max(event.at_micros)
+                    .max(state.child_completed_at_micros.unwrap_or(0)),
             );
         }
         state.prune_anonymous_history();
@@ -1181,6 +1243,17 @@ mod tests {
             } {
                 db.record_agent_attention(&key, next).unwrap();
             }
+            assert!(db.list_turn_done_sessions().unwrap().is_empty());
+            // The recovered result arrived later than the child's actual exit.
+            db.record_agent_attention(
+                &key,
+                &event(
+                    AttentionEventKind::Cancelled,
+                    "child:c:lifecycle",
+                    120_000_000,
+                ),
+            )
+            .unwrap();
             let snapshot = db
                 .apply_agent_state_job(&super::AgentStateJob::projection(ws))
                 .unwrap();
@@ -1266,6 +1339,16 @@ mod tests {
             ] {
                 db.record_agent_attention(&key, &next).unwrap();
             }
+            assert!(db.list_turn_done_sessions().unwrap().is_empty());
+            db.record_agent_attention(
+                &key,
+                &event(
+                    AttentionEventKind::Cancelled,
+                    "child:c:lifecycle",
+                    120_000_000,
+                ),
+            )
+            .unwrap();
             let snapshot = db
                 .apply_agent_state_job(&super::AgentStateJob::projection(&ws))
                 .unwrap();
@@ -1328,11 +1411,23 @@ mod tests {
                             ),
                         )
                         .unwrap();
+                        db.record_agent_attention(
+                            &key,
+                            &event(
+                                AttentionEventKind::Cancelled,
+                                "child:c:lifecycle",
+                                120_000_000,
+                            ),
+                        )
+                        .unwrap();
                         let snapshot = db
                             .apply_agent_state_job(&super::AgentStateJob::projection(ws))
                             .unwrap();
                         assert!(snapshot.waiting_sessions.is_empty());
-                        assert_eq!(snapshot.turn_done_sessions[0].1, 120_000_000);
+                        assert_eq!(snapshot.turn_done_sessions.len(), 1);
+                        // A late child request can defer a completion already
+                        // published; its final notification generation must grow.
+                        assert!(snapshot.turn_done_sessions[0].1 >= 120_000_000);
                         assert_eq!(snapshot.idle_sessions[0].1, 140, "{request}, {order:?}");
                         assert_eq!(snapshot.idle_sessions[0].2, 140_000_001);
                     }

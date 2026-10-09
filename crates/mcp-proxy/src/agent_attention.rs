@@ -442,6 +442,106 @@ mod tests {
     }
 
     #[test]
+    fn background_first_permission_without_pretooluse_resolves_its_alias() {
+        let d = db();
+        hook(
+            &d,
+            json!({"session_id":"native","hook_event_name":"UserPromptSubmit"}),
+            1,
+        );
+        hook(
+            &d,
+            json!({"session_id":"native","agent_id":"a","hook_event_name":"PermissionRequest","tool_name":"Bash","tool_input":{"command":"ls"}}),
+            2,
+        );
+        hook(
+            &d,
+            json!({"session_id":"native","hook_event_name":"Stop"}),
+            3,
+        );
+        hook(
+            &d,
+            json!({"session_id":"native","agent_id":"a","hook_event_name":"PostToolUse","tool_use_id":"q","tool_name":"Bash","tool_input":{"command":"ls"}}),
+            4,
+        );
+        assert!(d.list_waiting_sessions().unwrap().is_empty());
+        assert_eq!(d.list_working_sessions().unwrap(), vec![KEY]);
+        assert!(d.list_turn_done_sessions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn background_duplicate_result_does_not_clear_a_new_untracked_permission() {
+        let d = db();
+        for (name, id, at) in [
+            ("PreToolUse", Some("q1"), 2),
+            ("PermissionRequest", None, 3),
+            ("PostToolUse", Some("q1"), 4),
+            ("PermissionRequest", None, 5),
+            ("PostToolUse", Some("q1"), 6),
+        ] {
+            let mut v = json!({"session_id":"native","agent_id":"a","hook_event_name":name,"tool_name":"Bash","tool_input":{"command":"ls"}});
+            if let Some(id) = id {
+                v["tool_use_id"] = json!(id);
+            }
+            hook(&d, v, at);
+        }
+        assert_eq!(d.pending_agent_request_ids(KEY, "native").unwrap().len(), 1);
+        hook(
+            &d,
+            json!({"session_id":"native","agent_id":"a","hook_event_name":"PostToolUse","tool_use_id":"q2","tool_name":"Bash","tool_input":{"command":"ls"}}),
+            7,
+        );
+        assert!(d.list_waiting_sessions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn background_first_ungrouped_requests_keep_their_child_until_exit() {
+        for (request, response) in [
+            (
+                json!({"hook_event_name":"PermissionRequest","tool_use_id":"q","tool_name":"Bash"}),
+                json!({"hook_event_name":"PostToolUseFailure","tool_use_id":"q","tool_name":"Bash"}),
+            ),
+            (
+                json!({"hook_event_name":"Elicitation","mcp_server_name":"mcp"}),
+                json!({"hook_event_name":"ElicitationResult","mcp_server_name":"mcp"}),
+            ),
+            (
+                json!({"hook_event_name":"Notification","notification_type":"elicitation_dialog"}),
+                json!({"hook_event_name":"Notification","notification_type":"elicitation_response"}),
+            ),
+        ] {
+            let d = db();
+            hook(
+                &d,
+                json!({"session_id":"native","hook_event_name":"UserPromptSubmit"}),
+                1,
+            );
+            for (mut v, at) in [(request, 2), (response, 4)] {
+                if at == 4 {
+                    hook(
+                        &d,
+                        json!({"session_id":"native","hook_event_name":"Stop"}),
+                        3,
+                    );
+                }
+                v["session_id"] = json!("native");
+                v["agent_id"] = json!("a");
+                hook(&d, v, at);
+            }
+            assert!(d.list_waiting_sessions().unwrap().is_empty());
+            assert_eq!(d.list_working_sessions().unwrap(), vec![KEY]);
+            assert!(d.list_turn_done_sessions().unwrap().is_empty());
+            hook(
+                &d,
+                json!({"session_id":"native","hook_event_name":"SubagentStop","agent_id":"a"}),
+                5,
+            );
+            assert!(d.list_working_sessions().unwrap().is_empty());
+            assert_eq!(d.list_turn_done_sessions().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
     fn background_children_keep_session_running_until_the_last_child_stops() {
         let d = db();
         hook(

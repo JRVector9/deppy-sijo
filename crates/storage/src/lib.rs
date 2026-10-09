@@ -64,6 +64,7 @@ mod tests {
         let row = crate::PersistedActivityPane {
             workspace_id: "workspace".to_owned(),
             pane_id: "pane".to_owned(),
+            persistent_session_id: None,
             title: "title".to_owned(),
             cwd: "/tmp".to_owned(),
         };

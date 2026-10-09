@@ -22220,6 +22220,9 @@ impl App {
                             let session = entry.session?;
                             Some(SessionSeed {
                                 id: Some(session.0),
+                                selection_id: self.active.workspace_ui.mux().and_then(|mux| {
+                                    ui::inbox_waiting::find_persistent_session_id(mux, session)
+                                }),
                                 user_override: self
                                     .active
                                     .workspace_ui
@@ -22258,6 +22261,9 @@ impl App {
                                     let raw = rt.session_titles.get(s)?;
                                     Some(SessionSeed {
                                         id: None, // 표시 전용
+                                        selection_id: rt.workspace_ui.mux().and_then(|mux| {
+                                            ui::inbox_waiting::find_persistent_session_id(mux, *s)
+                                        }),
                                         user_override: None,
                                         title: self.activity_session_name(&ws.id, raw),
                                         status: None,
@@ -22276,6 +22282,7 @@ impl App {
                                 .flatten()
                                 .map(|row| SessionSeed {
                                     id: None, // 표시 전용
+                                    selection_id: row.persistent_session_id.clone(),
                                     user_override: None,
                                     title: self.activity_session_name(&ws.id, &row.title),
                                     status: None,
@@ -42833,6 +42840,7 @@ mod tests {
         let rows = vec![storage::PersistedActivityPane {
             workspace_id: "workspace-b".to_owned(),
             pane_id: "pane-exact".to_owned(),
+            persistent_session_id: None,
             title: "Saved".to_owned(),
             cwd: "/tmp/project".to_owned(),
         }];
@@ -50402,6 +50410,7 @@ mod tests {
         let panes = vec![storage::PersistedActivityPane {
             workspace_id: "workspace".to_owned(),
             pane_id: "pane".to_owned(),
+            persistent_session_id: None,
             title: raw.to_owned(),
             cwd: "/Users/jr/Desktop/Projects/deppy-sijo".to_owned(),
         }];
@@ -50425,6 +50434,7 @@ mod tests {
         let empty = vec![storage::PersistedActivityPane {
             workspace_id: "workspace".to_owned(),
             pane_id: "pane".to_owned(),
+            persistent_session_id: None,
             title: raw.to_owned(),
             cwd: String::new(),
         }];

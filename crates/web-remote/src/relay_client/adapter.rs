@@ -192,6 +192,7 @@ mod tests {
                 request: None,
                 reset: false,
                 anchor: None,
+                rows: None,
             },
             ClientMsg::Switch {
                 workspace: "other".to_owned(),

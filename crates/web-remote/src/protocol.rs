@@ -44,6 +44,8 @@ pub struct HistoryView {
     pub generation: String,
     pub first_line: String,
     pub total_lines: u32,
+    pub native_rows: u16,
+    pub live_first_line: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request: Option<u32>,
     pub expired: bool,
@@ -87,6 +89,8 @@ pub enum ClientMsg {
         reset: bool,
         #[serde(default)]
         anchor: Option<HistoryAnchorView>,
+        #[serde(default)]
+        rows: Option<u16>,
     },
     /// 시청 중 세션에 자유 텍스트 입력 (P6a — composer). 서버가 C0 제어문자를 걷어내고
     /// (\t 제외 — 제어 시퀀스는 named key로만), \n을 \r로 정규화하며, 여러 줄/대형
@@ -154,6 +158,10 @@ pub struct SessionView {
     /// 엉뚱한 세션이 잡힌다(P5 리뷰 P2에서 확인한 앨리어싱).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    /// Stable selection hint across workspace activation; only `id` can watch
+    /// or send input after current worker membership has been confirmed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selection_id: Option<String>,
     pub title: String,
     /// 감지된 상태(런타임 이벤트 유래). warm/유휴는 상태 추적이 없어 생략된다.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -281,8 +289,9 @@ pub enum ServerMsg {
         rows: u16,
         cursor: CursorView,
         alt: bool,
-        /// Display offset in rows; zero is live. Absolute return uses Scroll reset:true
-        /// so output arriving while a window is pinned cannot change its target.
+        /// Distance of the display window's end from the live source end; zero
+        /// is live for either native or expanded display rows. Absolute return
+        /// uses Scroll reset:true so output cannot change an anchored target.
         offset: i32,
         lines: Vec<LineView>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -473,13 +482,31 @@ pub fn encode_viewport_for_source(
         session,
         seq,
         snapshot,
-        if request.is_some() { None } else { baseline },
+        if request.is_some()
+            || baseline.is_some_and(|base| {
+                base.is_alt_screen != snapshot.is_alt_screen
+                    || base.scroll_offset != snapshot.scroll_offset
+                    || match (base.history, snapshot.history) {
+                        (Some(a), Some(b)) => {
+                            a.generation != b.generation || a.first_line != b.first_line
+                        }
+                        (None, None) => false,
+                        _ => true,
+                    }
+            })
+        {
+            None
+        } else {
+            baseline
+        },
     );
     if let ServerMsg::Viewport { history, .. } = &mut frame {
         *history = snapshot.history.map(|source| HistoryView {
             generation: format!("{namespace}:{}", source.generation),
             first_line: source.first_line.to_string(),
             total_lines: source.total_lines,
+            native_rows: source.native_rows,
+            live_first_line: source.live_first_line.to_string(),
             request,
             expired,
         });
@@ -506,6 +533,8 @@ mod tests {
             generation: 7,
             first_line: 100,
             total_lines: 10,
+            native_rows: 2,
+            live_first_line: 100,
         });
         let explicit = serde_json::to_value(encode_viewport_for_source(
             "uuid",
@@ -521,6 +550,15 @@ mod tests {
         assert_eq!(explicit["lines"].as_array().unwrap().len(), 2);
         assert_eq!(explicit["history"]["request"], 7);
         assert_eq!(explicit["history"]["generation"], "nonce:1:7");
+        assert_eq!(explicit["history"]["native_rows"], 2);
+        assert_eq!(explicit["history"]["live_first_line"], "100");
+        assert!(matches!(
+            ClientMsg::parse(r#"{"type":"scroll","session":"uuid","delta":0,"rows":256}"#).unwrap(),
+            ClientMsg::Scroll {
+                rows: Some(256),
+                ..
+            }
+        ));
         let passive = serde_json::to_value(encode_viewport_for_source(
             "uuid",
             2,
@@ -550,6 +588,8 @@ mod tests {
             generation: 7,
             first_line: 9_007_199_254_740_993,
             total_lines: 10,
+            native_rows: 2,
+            live_first_line: 9_007_199_254_740_993,
         });
         let value = serde_json::to_value(encode_viewport_for_source(
             "u7",
@@ -566,10 +606,58 @@ mod tests {
             "source identities must not lose JS integer precision"
         );
         assert_eq!(value["history"]["total_lines"], 10);
+        assert_eq!(value["history"]["live_first_line"], "9007199254740993");
         assert!(
             value["history"].get("request").is_none(),
             "passive frames never leak manual request metadata"
         );
+    }
+
+    #[test]
+    fn history_web_source_window_change_forces_keyframe_but_live_metadata_alone_keeps_delta() {
+        let mut base = snapshot(10, 4, vec![cell('x', WHITE, BLACK); 40]);
+        base.history = Some(runtime::TerminalHistoryMetadata {
+            generation: 7,
+            first_line: 100,
+            total_lines: 12,
+            native_rows: 2,
+            live_first_line: 102,
+        });
+        let mut shifted = base.clone();
+        shifted.history.as_mut().unwrap().first_line += 1;
+        shifted.history.as_mut().unwrap().live_first_line += 1;
+        let frame = serde_json::to_value(encode_viewport_for_source(
+            "uuid",
+            2,
+            &shifted,
+            Some(&base),
+            "nonce:1",
+            None,
+            false,
+        ))
+        .unwrap();
+        assert_eq!(
+            frame["keyframe"], true,
+            "equal cells at a new source window require all rows"
+        );
+        assert_eq!(frame["lines"].as_array().unwrap().len(), 4);
+        let mut metadata_only = base.clone();
+        metadata_only.history.as_mut().unwrap().live_first_line += 1;
+        metadata_only.history.as_mut().unwrap().total_lines += 1;
+        let frame = serde_json::to_value(encode_viewport_for_source(
+            "uuid",
+            3,
+            &metadata_only,
+            Some(&base),
+            "nonce:1",
+            None,
+            false,
+        ))
+        .unwrap();
+        assert_eq!(frame["keyframe"], false);
+        assert_eq!(frame["history"]["native_rows"], 2);
+        assert_eq!(frame["history"]["live_first_line"], "103");
+        assert!(frame["lines"].as_array().unwrap().is_empty());
     }
 
     #[test]
@@ -720,6 +808,7 @@ mod tests {
                 request: None,
                 reset: false,
                 anchor: None,
+                rows: None,
             }
         );
         // Input — submit 생략 시 false (삽입만)
@@ -1007,6 +1096,7 @@ mod tests {
                     state: "active",
                     sessions: vec![SessionView {
                         id: Some("u7".into()),
+                        selection_id: Some("u7".into()),
                         title: "claude".into(),
                         status: Some("needs_approval"),
                         agent: Some("Claude · sonnet · high".into()),
@@ -1021,6 +1111,7 @@ mod tests {
                     // 표시 전용 — id/status 없음(직렬화에서 생략된다)
                     sessions: vec![SessionView {
                         id: None,
+                        selection_id: Some("saved-pane".into()),
                         title: "deppy-mux".into(),
                         status: None,
                         agent: None,
@@ -1053,6 +1144,10 @@ mod tests {
         let warm_part = dash.split(r#""name":"source""#).nth(1).unwrap();
         assert!(!warm_part.contains(r#""id":"#), "{dash}");
         assert!(!warm_part.contains(r#""status":"#), "{dash}");
+        assert!(
+            warm_part.contains(r#""selection_id":"saved-pane""#),
+            "{dash}"
+        );
 
         let appr = ServerMsg::Approvals {
             pending: vec![ApprovalView {

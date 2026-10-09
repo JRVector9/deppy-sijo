@@ -231,6 +231,8 @@ fn stream_loop(
     // 입력 큐 압박 버전 (P6a) — watch 전환 시 리셋.
     let mut pressure_ver = 0u64;
     let mut control_ver = 0u64;
+    // Display geometry belongs to this socket and expires with its watch.
+    let mut history_rows: Option<u16> = None;
 
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -277,7 +279,11 @@ fn stream_loop(
                         &reply.uuid,
                         seq,
                         &snapshot,
-                        None,
+                        if reply.refresh {
+                            baseline.as_deref()
+                        } else {
+                            None
+                        },
                         &reply.namespace,
                         reply.request,
                         expired,
@@ -289,19 +295,30 @@ fn stream_loop(
                     baseline = Some(snapshot);
                 }
                 Err(reason) => {
-                    let frame = if let Some(request) = reply.request {
-                        ServerMsg::HistoryError {
-                            session: reply.uuid,
-                            request,
-                            reason,
-                        }
+                    if reason == "unavailable" {
+                        // Unsupported history must not hide a healthy native
+                        // stream behind repeated expansion queries.
+                        history_rows = None;
+                        viewport_seq = 0;
+                        baseline = None;
+                    }
+                    if reply.refresh {
+                        viewport_seq = 0;
                     } else {
-                        ServerMsg::Error {
-                            message: reason.into(),
+                        let frame = if let Some(request) = reply.request {
+                            ServerMsg::HistoryError {
+                                session: reply.uuid,
+                                request,
+                                reason,
+                            }
+                        } else {
+                            ServerMsg::Error {
+                                message: reason.into(),
+                            }
+                        };
+                        if ws.send(Message::Text(frame.encode().into())).is_err() {
+                            return;
                         }
-                    };
-                    if ws.send(Message::Text(frame.encode().into())).is_err() {
-                        return;
                     }
                 }
                 _ => {}
@@ -315,24 +332,36 @@ fn stream_loop(
             && let Some((version, snapshot, namespace)) =
                 dashboard.viewport_for_connection(&session, watch.generation, viewport_seq)
         {
-            let Some(seq) = wire_seq.checked_add(1) else {
-                return;
-            };
-            let frame = crate::protocol::encode_viewport_for_source(
-                &session,
-                seq,
-                &snapshot,
-                baseline.as_deref(),
-                &namespace,
-                None,
-                false,
-            );
-            if ws.send(Message::Text(frame.encode().into())).is_err() {
-                return;
+            if let Some(rows) = history_rows {
+                if dashboard.refresh_history(
+                    watch.connection,
+                    &session,
+                    watch.generation,
+                    rows,
+                    snapshot.history.map(|history| history.generation),
+                ) {
+                    viewport_seq = version;
+                }
+            } else {
+                let Some(seq) = wire_seq.checked_add(1) else {
+                    return;
+                };
+                let frame = crate::protocol::encode_viewport_for_source(
+                    &session,
+                    seq,
+                    &snapshot,
+                    baseline.as_deref(),
+                    &namespace,
+                    None,
+                    false,
+                );
+                if ws.send(Message::Text(frame.encode().into())).is_err() {
+                    return;
+                }
+                wire_seq = seq;
+                viewport_seq = version;
+                baseline = Some(snapshot);
             }
-            wire_seq = seq;
-            viewport_seq = version;
-            baseline = Some(snapshot);
         }
         // 입력 큐 압박 push (P6a) — composer 전송 버튼 게이트 신호.
         if let Some(session) = watch.watched.clone()
@@ -377,12 +406,14 @@ fn stream_loop(
                             viewport_seq = 0;
                             baseline = None;
                             pressure_ver = 0;
+                            history_rows = None;
                         }
                         Some(ClientMsg::Unwatch) => {
                             watch.set(None);
                             viewport_seq = 0;
                             baseline = None;
                             pressure_ver = 0;
+                            history_rows = None;
                         }
                         // 클라 렌더 상태 파손 — baseline을 버려 다음 프레임을 keyframe으로.
                         // seq도 리셋해 같은 슬롯(seq 불변)이라도 즉시 재전송되게 한다 (P5c).
@@ -403,6 +434,7 @@ fn stream_loop(
                             request,
                             reset,
                             anchor,
+                            rows,
                         }) => {
                             // The dashboard returns a correlated stale failure as well as
                             // checking the exact current watch before any worker query.
@@ -411,7 +443,7 @@ fn stream_loop(
                             } else {
                                 0
                             };
-                            dashboard.request_history(
+                            let accepted = dashboard.request_history(
                                 watch.connection,
                                 &session,
                                 generation,
@@ -420,8 +452,16 @@ fn stream_loop(
                                     request: request.map(std::num::NonZeroU32::get),
                                     reset,
                                     anchor,
+                                    rows,
                                 },
                             );
+                            if accepted && watch.is_current(&session) {
+                                let display_rows_changed = history_rows.is_some() || rows.is_some();
+                                history_rows = rows;
+                                if display_rows_changed {
+                                    viewport_seq = 0;
+                                }
+                            }
                         }
                         // 자유 텍스트 입력 (P6a) — 시청 중 세션에만. 정규화/제어문자
                         // strip/bracketed wrap은 브리지가 한다. 상한 초과는 버리고 로그만

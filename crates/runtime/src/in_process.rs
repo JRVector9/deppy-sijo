@@ -11132,11 +11132,20 @@ mod tests {
         for (operation_id, query, expected_offset) in [
             (11, terminal::TerminalHistoryQuery::live(), 0),
             (
+                13,
+                terminal::TerminalHistoryQuery {
+                    rows: Some(9),
+                    ..terminal::TerminalHistoryQuery::live()
+                },
+                0,
+            ),
+            (
                 12,
                 terminal::TerminalHistoryQuery {
                     anchor: Some(anchor),
                     delta: 2,
                     reset: false,
+                    rows: None,
                 },
                 5,
             ),
@@ -11164,6 +11173,8 @@ mod tests {
                 })
                 .expect("each immutable query must return its exact bounded window");
             assert_eq!(answer.scroll_offset, expected_offset);
+            assert_eq!(answer.rows, query.rows.unwrap_or(3));
+            assert_eq!(answer.history.unwrap().native_rows, 3);
             assert_eq!(
                 worker.sessions[&id]
                     .input_guard_snapshot()

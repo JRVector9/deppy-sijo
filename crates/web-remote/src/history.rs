@@ -19,6 +19,7 @@ pub(crate) struct HistoryRead {
     pub request: Option<u32>,
     pub reset: bool,
     pub anchor: Option<crate::protocol::HistoryAnchorView>,
+    pub rows: Option<u16>,
 }
 
 #[derive(Clone)]
@@ -36,6 +37,7 @@ pub(crate) struct HistoryReply {
     pub request: Option<u32>,
     pub namespace: String,
     pub result: Result<(Arc<TerminalViewportSnapshot>, bool), &'static str>,
+    pub refresh: bool,
     target: Option<HistoryTarget>,
 }
 
@@ -56,6 +58,7 @@ struct Pending {
     deadline: Instant,
     dirty: bool,
     source_generation: Option<u64>,
+    refresh: bool,
 }
 
 pub(crate) struct HistoryQueries {
@@ -134,13 +137,13 @@ impl HistoryQueries {
         target: Option<HistoryTarget>,
         query: Result<TerminalHistoryQuery, &'static str>,
         now: Instant,
-    ) {
+    ) -> bool {
         let Some(state) = self.connections.get_mut(&connection) else {
-            return;
+            return false;
         };
         if let Some(request) = request {
             if request == 0 || request <= state.last_request {
-                return;
+                return false;
             }
             state.last_request = request;
         }
@@ -155,9 +158,10 @@ impl HistoryQueries {
                 request,
                 namespace: String::new(),
                 result: Err("stale"),
+                refresh: false,
                 target: None,
             });
-            return;
+            return false;
         };
         let mut query = match query {
             Ok(query) => query,
@@ -167,9 +171,10 @@ impl HistoryQueries {
                     request,
                     namespace: target.namespace.clone(),
                     result: Err(reason),
+                    refresh: false,
                     target: Some(target),
                 });
-                return;
+                return false;
             }
         };
         if !query.reset && query.anchor.is_none() {
@@ -185,6 +190,7 @@ impl HistoryQueries {
             deadline: now + TIMEOUT,
             dirty: false,
             source_generation: None,
+            refresh: false,
         };
         let operation = self.start(pending);
         let state = self.connections.get_mut(&connection).unwrap();
@@ -196,9 +202,11 @@ impl HistoryQueries {
                 request,
                 namespace,
                 result: Err("capacity"),
+                refresh: false,
                 target: Some(target),
             });
         }
+        true
     }
 
     pub fn passive(&mut self, target: HistoryTarget, source_generation: Option<u64>, now: Instant) {
@@ -219,10 +227,57 @@ impl HistoryQueries {
             deadline: now + TIMEOUT,
             dirty: false,
             source_generation,
+            refresh: false,
         };
         if let Some(operation) = self.start(pending) {
             self.passive.insert(uuid, operation);
         }
+    }
+
+    /// Coalesced per-socket live reads use the same bounded operation slots as
+    /// explicit reads. They never replace an outstanding explicit history read.
+    pub fn refresh(
+        &mut self,
+        connection: u64,
+        target: HistoryTarget,
+        rows: u16,
+        source_generation: Option<u64>,
+        now: Instant,
+    ) -> bool {
+        let Some(state) = self.connections.get(&connection) else {
+            return false;
+        };
+        if let Some(operation) = state.pending {
+            if let Some(pending) = self
+                .pending
+                .get_mut(&operation)
+                .filter(|pending| pending.refresh)
+            {
+                pending.dirty = true;
+                pending.source_generation = source_generation;
+                return true;
+            }
+            return false;
+        }
+        let pending = Pending {
+            target,
+            connection: Some(connection),
+            request: None,
+            query: TerminalHistoryQuery {
+                rows: Some(rows),
+                ..TerminalHistoryQuery::live()
+            },
+            last_sent: now,
+            deadline: now + TIMEOUT,
+            dirty: false,
+            source_generation,
+            refresh: true,
+        };
+        let Some(operation) = self.start(pending) else {
+            return false;
+        };
+        self.connections.get_mut(&connection).unwrap().pending = Some(operation);
+        true
     }
 
     pub fn cancel_all_passive(&mut self) {
@@ -234,6 +289,38 @@ impl HistoryQueries {
     pub fn cancel_passive(&mut self, uuid: &str) {
         if let Some(operation) = self.passive.remove(uuid) {
             self.pending.remove(&operation);
+        }
+    }
+
+    /// Observe the worker's source before processing history answers in the
+    /// same drain. Waiting for a socket to poll the published viewport would
+    /// let an older generation's refresh escape first.
+    pub fn native_generation(&mut self, uuid: &str, generation: Option<u64>) {
+        let Some(generation) = generation else {
+            return;
+        };
+        for pending in self
+            .pending
+            .values_mut()
+            .filter(|pending| pending.refresh && pending.target.uuid == uuid)
+        {
+            if pending.source_generation != Some(generation) {
+                pending.source_generation = Some(generation);
+                pending.dirty = true;
+            }
+        }
+        for state in self.connections.values_mut() {
+            if state.reply.as_ref().is_some_and(|reply| {
+                reply.refresh
+                    && reply.uuid == uuid
+                    && reply.result.as_ref().is_ok_and(|(snapshot, _)| {
+                        snapshot
+                            .history
+                            .is_some_and(|history| history.generation != generation)
+                    })
+            }) {
+                state.reply = None;
+            }
         }
     }
 
@@ -253,6 +340,7 @@ impl HistoryQueries {
                     request: pending.request,
                     namespace: pending.target.namespace.clone(),
                     result: Err(reason),
+                    refresh: pending.refresh,
                     target: Some(pending.target),
                 });
             }
@@ -311,21 +399,42 @@ impl HistoryQueries {
         }
         let pending = self.pending.remove(operation_id).unwrap();
         if let Some(connection) = pending.connection {
+            let generation_changed = pending.refresh
+                && snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.history)
+                    .is_some_and(|history| {
+                        pending
+                            .source_generation
+                            .is_some_and(|source| source != history.generation)
+                    });
             let state = self
                 .connections
                 .get_mut(&connection)
                 .filter(|state| state.pending == Some(*operation_id))?;
             state.pending = None;
-            state.reply = Some(HistoryReply {
-                uuid: pending.target.uuid.clone(),
-                request: pending.request,
-                namespace: pending.target.namespace.clone(),
-                result: snapshot
-                    .clone()
-                    .map(|snapshot| (snapshot, *expired))
-                    .ok_or("unavailable"),
-                target: Some(pending.target),
-            });
+            if !generation_changed {
+                state.reply = Some(HistoryReply {
+                    uuid: pending.target.uuid.clone(),
+                    request: pending.request,
+                    namespace: pending.target.namespace.clone(),
+                    result: snapshot
+                        .clone()
+                        .map(|snapshot| (snapshot, *expired))
+                        .ok_or("unavailable"),
+                    refresh: pending.refresh,
+                    target: Some(pending.target.clone()),
+                });
+            }
+            if pending.refresh && (pending.dirty || generation_changed) {
+                self.refresh(
+                    connection,
+                    pending.target,
+                    pending.query.rows.unwrap(),
+                    pending.source_generation,
+                    now,
+                );
+            }
             None
         } else {
             let uuid = pending.target.uuid.clone();
@@ -361,7 +470,9 @@ impl HistoryQueries {
         if reply.target.as_ref().is_some_and(|target| !valid(target)) {
             reply.result = Err("stale");
         }
-        if let Ok((snapshot, expired)) = &reply.result {
+        if !reply.refresh
+            && let Ok((snapshot, expired)) = &reply.result
+        {
             state.cursor = if *expired {
                 None
             } else {
@@ -460,6 +571,8 @@ mod tests {
                 generation,
                 first_line,
                 total_lines: 10,
+                native_rows: 2,
+                live_first_line: first_line + offset as u64,
             }),
         })
     }
@@ -573,6 +686,7 @@ mod tests {
             anchor: None,
             delta: 3,
             reset: false,
+            rows: None,
         };
         queries.request(
             1,
@@ -745,6 +859,131 @@ mod tests {
         assert_eq!(uuid, "same-uuid");
         assert_eq!(live.history.unwrap().generation, 8);
         assert!(queries.pending.is_empty());
+    }
+
+    #[test]
+    fn history_web_expanded_live_refresh_is_bounded_per_connection_and_preserves_read_anchor() {
+        let now = Instant::now();
+        let captured = Arc::default();
+        let mut queries = HistoryQueries::default();
+        queries.register(1);
+        queries.register(2);
+        let source = target(1, 3, &captured);
+        assert!(queries.request(
+            1,
+            "same-uuid",
+            Some(1),
+            Some(source.clone()),
+            Ok(TerminalHistoryQuery::live()),
+            now
+        ));
+        queries.event(&answer(last_operation(&captured), 97, 3, 7), now);
+        queries.take_reply(1, |_| true).unwrap();
+        let anchor = queries.connections[&1].cursor;
+        assert!(queries.refresh(1, source.clone(), 12, Some(7), now));
+        let first_operation = last_operation(&captured);
+        assert!(queries.refresh(1, source.clone(), 12, Some(7), now));
+        assert_eq!(
+            queries.pending.len(),
+            1,
+            "output flood coalesces into one connection slot"
+        );
+        assert!(queries.refresh(2, source.clone(), 24, Some(7), now));
+        let second_operation = last_operation(&captured);
+        assert!(
+            matches!(captured.lock().unwrap().last().unwrap(), RuntimeCommand::QueryTerminalHistory { query, .. } if query.rows == Some(24))
+        );
+        queries.event(&answer(second_operation, 90, 0, 7), now);
+        assert!(queries.take_reply(2, |_| true).unwrap().refresh);
+        queries.event(&answer(first_operation, 100, 0, 7), now);
+        let refreshed = queries.take_reply(1, |_| true).unwrap();
+        assert!(refreshed.refresh);
+        assert_eq!(refreshed.request, None);
+        assert_eq!(
+            queries.connections[&1].cursor, anchor,
+            "passive updates cannot change legacy relative reads"
+        );
+        assert_eq!(
+            queries.pending.len(),
+            1,
+            "dirty read starts exactly one bounded successor"
+        );
+        let canceled = last_operation(&captured);
+        assert!(queries.request(
+            1,
+            "same-uuid",
+            Some(2),
+            Some(source.clone()),
+            Ok(TerminalHistoryQuery {
+                rows: Some(12),
+                delta: 1,
+                ..TerminalHistoryQuery::live()
+            }),
+            now
+        ));
+        assert!(
+            !queries.refresh(1, source.clone(), 12, Some(7), now),
+            "explicit query owns the connection slot"
+        );
+        queries.event(&answer(canceled, 200, 0, 7), now);
+        assert!(
+            queries.take_reply(1, |_| true).is_none(),
+            "late canceled refresh cannot overwrite explicit history"
+        );
+        assert!(
+            !queries.request(
+                1,
+                "same-uuid",
+                Some(1),
+                Some(source),
+                Ok(TerminalHistoryQuery::live()),
+                now
+            ),
+            "stale request cannot change window configuration"
+        );
+        queries.unwatch(1);
+        assert!(queries.pending.is_empty());
+        queries.disconnect(2);
+        assert_eq!(queries.connections.len(), 1);
+    }
+
+    #[test]
+    fn history_web_expanded_refresh_rejects_old_generation_and_reconnect_results() {
+        let now = Instant::now();
+        let captured = Arc::default();
+        let mut queries = HistoryQueries::default();
+        queries.register(1);
+        let source = target(1, 3, &captured);
+        assert!(queries.refresh(1, source.clone(), 12, Some(7), now));
+        let old = last_operation(&captured);
+        assert!(queries.refresh(1, source.clone(), 12, Some(8), now));
+        queries.event(&answer(old, 100, 0, 7), now);
+        assert!(
+            queries.take_reply(1, |_| true).is_none(),
+            "reset source fences old expanded frames"
+        );
+        let fresh = last_operation(&captured);
+        queries.event(&answer(fresh, 0, 0, 8), now);
+        assert_eq!(
+            queries
+                .take_reply(1, |_| true)
+                .unwrap()
+                .result
+                .unwrap()
+                .0
+                .history
+                .unwrap()
+                .generation,
+            8
+        );
+        assert!(queries.refresh(1, source, 12, Some(8), now));
+        let disconnected = last_operation(&captured);
+        queries.disconnect(1);
+        queries.register(1);
+        queries.event(&answer(disconnected, 200, 0, 8), now);
+        assert!(queries.take_reply(1, |_| true).is_none());
+        assert!(queries.pending.is_empty());
+        assert_eq!(queries.connections[&1].cursor, None);
     }
 
     #[test]

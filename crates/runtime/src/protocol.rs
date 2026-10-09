@@ -64,7 +64,8 @@ pub(crate) const PROTO_MAGIC: [u8; 4] = *b"DPRT";
 /// v24: direct terminal input mapped against live terminal modes on the worker.
 /// v25: worker-authoritative expiring terminal resize ownership and native deferral.
 /// v26: immutable history identities and correlated viewport queries.
-pub(crate) const PROTO_VERSION: u16 = 26;
+/// v27: bounded display history rows and distinct native/live window metadata.
+pub(crate) const PROTO_VERSION: u16 = 27;
 
 /// delta viewport 스트리밍 기능 비트 (§3.1).
 pub(crate) const FEAT_DELTA_VIEWPORT: u32 = 1 << 0;
@@ -588,6 +589,6 @@ mod tests {
         assert!(command_source.contains("SetScrollbackLimit"));
         assert!(event_source.contains("ScrollbackLimitApplied"));
         assert!(protocol_source.contains("**v13**"));
-        assert_eq!(PROTO_VERSION, 26);
+        assert_eq!(PROTO_VERSION, 27);
     }
 }

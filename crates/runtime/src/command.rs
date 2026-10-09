@@ -975,6 +975,9 @@ pub(crate) fn validate_host_command(command: &RuntimeCommand) -> Result<(), Runt
             if *operation_id == 0
                 || query.delta.unsigned_abs() > 100_000
                 || query.anchor.is_some_and(|anchor| anchor.generation == 0)
+                || query
+                    .rows
+                    .is_some_and(|rows| !(1..=terminal::HISTORY_QUERY_MAX_ROWS).contains(&rows))
             {
                 return Err(admission_error("runtime_terminal_history_invalid"));
             }
@@ -1727,6 +1730,7 @@ mod tests {
                 }),
                 delta: 100_000,
                 reset: false,
+                rows: Some(256),
             },
         };
         validate_host_command(&command).unwrap();
@@ -1751,6 +1755,18 @@ mod tests {
                     }),
                     delta,
                     reset: false,
+                    rows: None,
+                },
+            };
+            assert!(validate_host_command(&invalid).is_err());
+        }
+        for rows in [0, 257, u16::MAX] {
+            let invalid = RuntimeCommand::QueryTerminalHistory {
+                session: SessionId(7),
+                operation_id: 9,
+                query: terminal::TerminalHistoryQuery {
+                    rows: Some(rows),
+                    ..terminal::TerminalHistoryQuery::live()
                 },
             };
             assert!(validate_host_command(&invalid).is_err());

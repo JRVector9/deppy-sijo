@@ -251,6 +251,8 @@ impl AlacrittyBackend {
             generation,
             first_line: tail - offset.min(grid.history_size()) as u64,
             total_lines: (grid.history_size() + grid.screen_lines()).min(u32::MAX as usize) as u32,
+            native_rows: grid.screen_lines() as u16,
+            live_first_line: tail,
         }
     }
 
@@ -647,32 +649,54 @@ impl TerminalBackend for AlacrittyBackend {
     ) -> Option<crate::TerminalHistorySnapshot> {
         let grid = self.term.grid();
         let cols = grid.columns();
-        let rows = grid.screen_lines();
-        let count = cols.checked_mul(rows).filter(|count| *count <= 65_536)?;
+        let native_rows = grid.screen_lines();
         let alt = self.term.mode().contains(TermMode::ALT_SCREEN);
         let (generation, tail) = grid.history_identity();
         let floor = tail - grid.history_size() as u64;
+        // An expanded window is a read of real source rows, never a PTY resize
+        // or padded mobile screen. Alternate screens retain native geometry.
+        let requested = match query.rows {
+            Some(rows) if (1..=crate::history::HISTORY_QUERY_MAX_ROWS).contains(&rows) => {
+                usize::from(rows).min(crate::history::HISTORY_QUERY_MAX_CELLS.checked_div(cols)?)
+            }
+            Some(_) => return None,
+            None => native_rows,
+        };
+        let rows = if alt {
+            native_rows
+        } else {
+            requested.min(grid.history_size() + native_rows)
+        };
+        let count = cols
+            .checked_mul(rows)
+            .filter(|count| *count <= crate::history::HISTORY_QUERY_MAX_CELLS)?;
+        if rows == 0 {
+            return None;
+        }
+        let end = tail.checked_add(native_rows as u64)?;
+        let latest_first = end - rows as u64;
         let expired = !query.reset
             && query.anchor.is_some_and(|anchor| {
-                alt || anchor.generation != generation
-                    || !(floor..=tail).contains(&anchor.first_line)
+                alt || anchor.generation != generation || !(floor..end).contains(&anchor.first_line)
             });
-        let offset = if query.reset || expired || alt {
-            0
+        let first_line = if query.reset || expired || alt {
+            latest_first
         } else {
-            let base = query.anchor.map_or(tail, |anchor| anchor.first_line);
+            let base = query
+                .anchor
+                .map_or(latest_first, |anchor| anchor.first_line);
             // i128 permits ordinary overscroll below zero without unsigned underflow.
-            let desired =
-                (base as i128 - query.delta as i128).clamp(floor as i128, tail as i128) as u64;
-            (tail - desired) as usize
+            (base as i128 - query.delta as i128).clamp(floor as i128, latest_first as i128) as u64
         };
+        let offset = latest_first - first_line;
+        let grid_first = first_line as i128 - tail as i128;
         let mut scratch = Row::<AlacrittyCell>::new(cols);
         let colors = self.term.colors();
         let mut cells = Vec::with_capacity(count);
         let mut graphemes = Vec::new();
         for row in 0..rows {
             let line = grid.read_line(
-                alacritty_terminal::index::Line(row as i32 - offset as i32),
+                alacritty_terminal::index::Line((grid_first + row as i128) as i32),
                 &mut scratch,
             );
             for col in 0..cols {
@@ -688,7 +712,7 @@ impl TerminalBackend for AlacrittyBackend {
             }
         }
         let cursor = self.term.renderable_content().cursor;
-        let cursor_row = cursor.point.line.0 + offset as i32;
+        let cursor_row = cursor.point.line.0 as i128 - grid_first;
         let (shape, shape_visible) = map_cursor_shape(cursor.shape);
         Some(crate::TerminalHistorySnapshot {
             snapshot: TerminalViewportSnapshot {
@@ -699,7 +723,7 @@ impl TerminalBackend for AlacrittyBackend {
                     row: cursor_row.max(0) as u16,
                     shape,
                     visible: shape_visible
-                        && (0..rows as i32).contains(&cursor_row)
+                        && (0..rows as i128).contains(&cursor_row)
                         && self.term.mode().contains(TermMode::SHOW_CURSOR),
                 },
                 visible_cells: cells.into(),
@@ -713,7 +737,13 @@ impl TerminalBackend for AlacrittyBackend {
                     .and_then(|title| title.clone()),
                 scroll_offset: offset as i32,
                 is_alt_screen: alt,
-                history: Some(self.history_metadata_at(offset)),
+                history: Some(crate::TerminalHistoryMetadata {
+                    generation,
+                    first_line,
+                    total_lines: (grid.history_size() + native_rows).min(u32::MAX as usize) as u32,
+                    native_rows: native_rows as u16,
+                    live_first_line: tail,
+                }),
             },
             expired,
         })
@@ -1682,8 +1712,179 @@ mod tests {
                 anchor,
                 delta,
                 reset,
+                rows: None,
             })
             .unwrap()
+    }
+
+    fn history_window(
+        backend: &AlacrittyBackend,
+        rows: u16,
+        anchor: Option<crate::TerminalHistoryAnchor>,
+        delta: i32,
+    ) -> crate::TerminalHistorySnapshot {
+        backend
+            .history_snapshot(crate::TerminalHistoryQuery {
+                rows: Some(rows),
+                anchor,
+                delta,
+                reset: false,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn history_window_expands_real_rows_without_native_scroll_cursor_damage_or_cache_mutation() {
+        let mut backend = AlacrittyBackend::new(8, 3, 40);
+        for row in 0..20 {
+            feed(&mut backend, format!("{row:02}\r\n").as_bytes());
+        }
+        backend.scroll(4);
+        let native = backend.viewport_snapshot().unwrap();
+        let live = history_query(&backend, None, 0, true).snapshot;
+        let cache_key = backend.viewport_cache.borrow().key;
+        let cache_dirty = backend.viewport_cache.borrow().dirty.clone();
+        let native_cursor = backend.term.grid().cursor.point;
+        backend.term.reset_damage();
+        let expanded = history_window(&backend, 12, None, 0).snapshot;
+        assert_eq!(expanded.rows, 12);
+        assert_eq!(expanded.scroll_offset, 0);
+        assert_eq!(expanded.visible_cells.len(), 12 * 8);
+        assert_eq!(&expanded.visible_cells[9 * 8..], &live.visible_cells[..]);
+        let history = expanded.history.unwrap();
+        assert_eq!(history.native_rows, 3);
+        assert_eq!(history.live_first_line, live.history.unwrap().first_line);
+        assert_eq!(history.first_line + 9, history.live_first_line);
+        assert_eq!(expanded.cursor.row, live.cursor.row + 9);
+        assert_eq!(expanded.cursor.col, live.cursor.col);
+        assert_eq!(expanded.cursor.visible, live.cursor.visible);
+        assert_eq!(backend.term.grid().display_offset(), 4);
+        assert_eq!(backend.term.screen_lines(), 3);
+        assert_eq!(backend.term.grid().cursor.point, native_cursor);
+        match backend.term.damage() {
+            TermDamage::Partial(rows) => assert_eq!(rows.count(), 0),
+            TermDamage::Full => panic!("immutable query changed native damage"),
+        }
+        assert_eq!(backend.viewport_cache.borrow().key, cache_key);
+        assert_eq!(backend.viewport_cache.borrow().dirty, cache_dirty);
+        assert_eq!(
+            backend.viewport_snapshot().unwrap().visible_cells,
+            native.visible_cells
+        );
+
+        let anchor = history_anchor(&expanded);
+        let earlier = history_window(&backend, 12, Some(anchor), 3).snapshot;
+        assert_eq!(earlier.scroll_offset, 3);
+        assert_eq!(earlier.history.unwrap().first_line + 3, anchor.first_line);
+        feed(&mut backend, b"new\r\nnew\r\n");
+        let pinned = history_window(&backend, 12, Some(anchor), 0);
+        assert!(!pinned.expired);
+        assert_eq!(
+            pinned.snapshot.history.unwrap().first_line,
+            anchor.first_line
+        );
+        assert_eq!(
+            &pinned.snapshot.visible_cells[..9 * 8],
+            &expanded.visible_cells[..9 * 8],
+            "scrollback prefix remains stable; native live rows may still be written in place"
+        );
+        assert_eq!(pinned.snapshot.scroll_offset, 2);
+        let pinned_history = history_window(&backend, 12, Some(history_anchor(&earlier)), 0);
+        assert!(!pinned_history.expired);
+        assert_eq!(pinned_history.snapshot.visible_cells, earlier.visible_cells);
+        assert_eq!(pinned_history.snapshot.scroll_offset, 5);
+        assert_eq!(
+            history_window(&backend, 12, None, 0).snapshot.scroll_offset,
+            0
+        );
+    }
+
+    #[test]
+    fn history_window_smaller_than_native_preserves_live_suffix_and_anchor_beyond_native_top() {
+        let mut backend = AlacrittyBackend::new(8, 6, 20);
+        for row in 0..15 {
+            feed(&mut backend, format!("{row:02}\r\n").as_bytes());
+        }
+        let live = history_query(&backend, None, 0, true).snapshot;
+        let small = history_window(&backend, 2, None, 0).snapshot;
+        let anchor = history_anchor(&small);
+        assert_eq!(anchor.first_line, live.history.unwrap().first_line + 4);
+        assert_eq!(small.scroll_offset, 0);
+        assert_eq!(&small.visible_cells[..], &live.visible_cells[4 * 8..]);
+        let pinned = history_window(&backend, 2, Some(anchor), 0);
+        assert!(!pinned.expired);
+        assert_eq!(pinned.snapshot.visible_cells, small.visible_cells);
+        let up = history_window(&backend, 2, Some(anchor), 1);
+        assert!(!up.expired);
+        assert_eq!(up.snapshot.scroll_offset, 1);
+        assert_eq!(
+            up.snapshot.history.unwrap().first_line + 1,
+            anchor.first_line
+        );
+        let wider = history_window(&backend, 9, Some(anchor), 0);
+        assert!(!wider.expired);
+        assert_eq!(
+            wider.snapshot.scroll_offset, 0,
+            "changed size clamps the anchored top at live boundary"
+        );
+    }
+
+    #[test]
+    fn history_window_honors_row_cell_source_floor_trim_and_alternate_bounds() {
+        let mut backend = AlacrittyBackend::new(8, 3, 20);
+        assert_eq!(
+            history_window(&backend, 200, None, 0).snapshot.rows,
+            3,
+            "no invented source rows"
+        );
+        for row in 0..30 {
+            feed(&mut backend, format!("{row:02}\r\n").as_bytes());
+        }
+        let all = history_window(&backend, 256, None, 0).snapshot;
+        assert_eq!(all.rows, 23);
+        assert_eq!(all.rows as u32, all.history.unwrap().total_lines);
+        assert_eq!(all.scroll_offset, 0);
+        let loaded = history_window(&backend, 9, None, 2).snapshot;
+        let anchor = history_anchor(&loaded);
+        let oldest = history_window(&backend, 9, Some(anchor), 100_000).snapshot;
+        assert_eq!(
+            oldest.history.unwrap().first_line,
+            all.history.unwrap().first_line
+        );
+        assert_eq!(oldest.scroll_offset, 14);
+        backend.trim_scrollback(1);
+        let trimmed = history_window(&backend, 9, Some(anchor), 0);
+        assert!(trimmed.expired);
+        assert_eq!(trimmed.snapshot.rows, 4);
+        assert_eq!(trimmed.snapshot.scroll_offset, 0);
+        feed(&mut backend, b"\x1b[?1049h");
+        let alt = history_window(&backend, 200, None, 0).snapshot;
+        assert!(alt.is_alt_screen);
+        assert_eq!(alt.rows, 3);
+        assert_eq!(alt.scroll_offset, 0);
+        for rows in [0, 257, u16::MAX] {
+            assert!(
+                backend
+                    .history_snapshot(crate::TerminalHistoryQuery {
+                        rows: Some(rows),
+                        ..crate::TerminalHistoryQuery::live()
+                    })
+                    .is_none()
+            );
+        }
+        let mut wide = AlacrittyBackend::new(1024, 3, 300);
+        for _ in 0..100 {
+            feed(&mut wide, b"x\r\n");
+        }
+        let bounded = history_window(&wide, 256, None, 0).snapshot;
+        assert_eq!(bounded.rows, 64);
+        assert_eq!(bounded.visible_cells.len(), crate::HISTORY_QUERY_MAX_CELLS);
+        let native_tall = AlacrittyBackend::new(8, 300, 20);
+        assert_eq!(
+            history_query(&native_tall, None, 0, true).snapshot.rows,
+            300,
+            "old valid native frames retain their geometry"
+        );
     }
 
     #[test]

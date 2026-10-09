@@ -184,6 +184,9 @@ struct SessionEntry {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionSeed {
     pub id: Option<u64>,
+    /// Persistent pane UUID for selection after a workspace becomes active.
+    /// This never grants a viewing lease or an input target by itself.
+    pub selection_id: Option<String>,
     pub user_override: Option<SessionStatus>,
     pub title: String,
     pub status: Option<SessionStatus>,
@@ -402,6 +405,7 @@ fn workspace_views(
                 .map(|(id, entry)| SessionView {
                     // UUID가 없으면 표시 전용 — 폰은 u64를 모른다 (I1).
                     id: ids.uuid(*id).map(str::to_owned),
+                    selection_id: ids.uuid(*id).map(str::to_owned),
                     title: format!("세션 {id}"),
                     status: Some(status_str(projected_status(entry, hook.get(id)))),
                     agent: None,
@@ -428,6 +432,7 @@ fn workspace_views(
                             // 불가능하다 (I1). UUID가 없는 세션(persist 없음/레거시)은
                             // 표시 전용으로 강등된다.
                             id: ids.uuid(*id).map(str::to_owned),
+                            selection_id: ids.uuid(*id).map(str::to_owned),
                             title: seed
                                 .map(|s| s.title.clone())
                                 .unwrap_or_else(|| format!("세션 {id}")),
@@ -443,6 +448,7 @@ fn workspace_views(
                     .map(|s| SessionView {
                         // 표시 전용 — 이 워크스페이스의 워커가 없어 시청할 수 없다.
                         id: None,
+                        selection_id: s.selection_id.clone(),
                         title: s.title.clone(),
                         status: s.status.map(status_str),
                         agent: s.agent.clone(),
@@ -1011,12 +1017,13 @@ impl DashboardHandle {
         uuid: &str,
         watch: u64,
         read: HistoryRead,
-    ) {
+    ) -> bool {
         let HistoryRead {
             delta,
             request,
             reset,
             anchor,
+            rows,
         } = read;
         let mut inner = self.shared.inner.lock().expect("dashboard inner lock");
         let target = Self::resolve_watched(&inner, uuid, watch).and_then(|session| {
@@ -1029,24 +1036,70 @@ impl DashboardHandle {
                 sink,
             })
         });
-        let query = if reset {
-            Ok(runtime::TerminalHistoryQuery::live())
-        } else {
-            parse_history_anchor(
-                anchor.as_ref(),
-                target.as_ref().map(|target| target.namespace.as_str()),
-            )
-            .map(|anchor| runtime::TerminalHistoryQuery {
-                anchor,
-                delta: delta.clamp(-100_000, 100_000),
-                reset: false,
-            })
-        };
-        inner
-            .history_queries
-            .request(connection, uuid, request, target, query, Instant::now());
+        let query =
+            if rows.is_some_and(|rows| !(1..=runtime::HISTORY_QUERY_MAX_ROWS).contains(&rows)) {
+                Err("invalid_rows")
+            } else if reset {
+                Ok(runtime::TerminalHistoryQuery {
+                    rows,
+                    ..runtime::TerminalHistoryQuery::live()
+                })
+            } else {
+                parse_history_anchor(
+                    anchor.as_ref(),
+                    target.as_ref().map(|target| target.namespace.as_str()),
+                )
+                .map(|anchor| runtime::TerminalHistoryQuery {
+                    anchor,
+                    delta: delta.clamp(-100_000, 100_000),
+                    reset: false,
+                    rows,
+                })
+            };
+        let accepted =
+            inner
+                .history_queries
+                .request(connection, uuid, request, target, query, Instant::now());
         inner.dirty = true;
         self.shared.cvar.notify_all();
+        accepted
+    }
+
+    pub(crate) fn refresh_history(
+        &self,
+        connection: u64,
+        uuid: &str,
+        watch: u64,
+        rows: u16,
+        source_generation: Option<u64>,
+    ) -> bool {
+        let mut inner = self.shared.inner.lock().expect("dashboard inner lock");
+        let Some(session) = Self::resolve_watched(&inner, uuid, watch) else {
+            return false;
+        };
+        let Some(sink) = inner.command_sink.clone() else {
+            return false;
+        };
+        let target = HistoryTarget {
+            uuid: uuid.into(),
+            binding: inner.watch_generation,
+            watch,
+            session: SessionId(session),
+            namespace: format!("{}:{}", self.shared.history_nonce, inner.watch_generation),
+            sink,
+        };
+        let started = inner.history_queries.refresh(
+            connection,
+            target,
+            rows,
+            source_generation,
+            Instant::now(),
+        );
+        if started {
+            inner.dirty = true;
+            self.shared.cvar.notify_all();
+        }
+        started
     }
 
     pub(crate) fn history_reply(&self, connection: u64) -> Option<HistoryReply> {
@@ -1483,6 +1536,7 @@ fn history_viewport_event(
         if watch.session != Some(session.0) {
             return None;
         }
+        queries.native_generation(uuid, snapshot.history.map(|history| history.generation));
         if snapshot.scroll_offset == 0 {
             queries.cancel_passive(uuid);
             return Some((uuid.into(), Arc::clone(snapshot)));
@@ -1999,6 +2053,7 @@ mod tests {
         let (handle, thread) = DashboardHandle::spawn(None);
         handle.reseed_active_sessions(&[SessionSeed {
             id: Some(7),
+            selection_id: None,
             user_override: Some(SessionStatus::Idle),
             title: "agent".into(),
             status: Some(SessionStatus::Done),
@@ -2428,6 +2483,99 @@ mod tests {
     }
 
     #[test]
+    fn history_web_native_generation_fences_pending_and_queued_connection_refreshes() {
+        for reply_queued_first in [false, true] {
+            let (handle, thread) = DashboardHandle::spawn(None);
+            let connection = handle.register_connection();
+            let (sink, captured) = capture_sink();
+            handle.set_command_sink(sink);
+            seed_ids(&handle, &[7]);
+            let uuid = test_uuid(7);
+            let watch = handle.rebind_watch_for_connection(None, Some(&uuid), 0);
+            let native = |generation, alt| {
+                let RuntimeEvent::Viewport {
+                    session,
+                    snapshot,
+                    bracketed_paste,
+                } = viewport_event(7)
+                else {
+                    unreachable!()
+                };
+                let mut snapshot = (*snapshot).clone();
+                snapshot.is_alt_screen = alt;
+                snapshot.history = Some(runtime::TerminalHistoryMetadata {
+                    generation,
+                    first_line: 0,
+                    total_lines: 2,
+                    native_rows: 2,
+                    live_first_line: 0,
+                });
+                RuntimeEvent::Viewport {
+                    session,
+                    snapshot: Arc::new(snapshot),
+                    bracketed_paste,
+                }
+            };
+            let query_operation = || {
+                captured
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .rev()
+                    .find_map(|command| {
+                        if let RuntimeCommand::QueryTerminalHistory { operation_id, .. } = command {
+                            Some(*operation_id)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap()
+            };
+            let answer = |operation_id, generation, alt| {
+                let RuntimeEvent::Viewport { snapshot, .. } = native(generation, alt) else {
+                    unreachable!()
+                };
+                RuntimeEvent::TerminalHistoryResult {
+                    session: SessionId(7),
+                    operation_id,
+                    snapshot: Some(snapshot),
+                    expired: false,
+                }
+            };
+            handle.inject_event(native(7, false));
+            assert!(handle.refresh_history(connection.id(), &uuid, watch, 9, Some(7)));
+            let old = query_operation();
+            if reply_queued_first {
+                handle.inject_event(answer(old, 7, false));
+            }
+            // This uses the actual dashboard native-event handler, including
+            // the receiver drain's viewport-before-history ordering.
+            handle.inject_event(native(8, true));
+            if !reply_queued_first {
+                handle.inject_event(answer(old, 7, false));
+            }
+            assert!(
+                handle.history_reply(connection.id()).is_none(),
+                "old generation escaped the native event fence; queued_first={reply_queued_first}"
+            );
+            if reply_queued_first {
+                assert!(handle.refresh_history(connection.id(), &uuid, watch, 9, Some(8)));
+            }
+            let fresh = query_operation();
+            assert_ne!(fresh, old);
+            handle.inject_event(answer(fresh, 8, true));
+            let reply = handle.history_reply(connection.id()).unwrap();
+            let snapshot = reply.result.unwrap().0;
+            assert!(reply.refresh);
+            assert_eq!(snapshot.history.unwrap().generation, 8);
+            assert!(snapshot.is_alt_screen);
+            drop(connection);
+            handle.stop();
+            thread.join().unwrap();
+        }
+    }
+
+    #[test]
     fn mux는_세션_소속을_만든다() {
         // 제목은 앱 스냅샷(WorkspaceSeed) 몫 — mux는 소속(멤버십)만 정한다.
         let mut sessions = BTreeMap::new();
@@ -2481,6 +2629,7 @@ mod tests {
                 state: WorkspaceState::Active,
                 sessions: vec![SessionSeed {
                     id: Some(10),
+                    selection_id: Some(test_uuid(99)),
                     user_override: None,
                     title: "deppy-sijo".into(),
                     status: Some(SessionStatus::Running),
@@ -2495,6 +2644,7 @@ mod tests {
                 state: WorkspaceState::Warm,
                 sessions: vec![SessionSeed {
                     id: Some(10), // 앱이 실수로 id를 넣어도 브리지가 표시 전용으로 만든다
+                    selection_id: Some(test_uuid(20)),
                     user_override: None,
                     title: "deppy-mux".into(),
                     status: None,
@@ -2528,6 +2678,88 @@ mod tests {
         assert_eq!(views[1].state, "warm");
         assert_eq!(views[1].sessions[0].id, None);
         assert_eq!(views[1].sessions[0].title, "deppy-mux");
+        assert_eq!(
+            views[0].sessions[0].selection_id, views[0].sessions[0].id,
+            "active selection follows fresh worker membership, not stale app seed"
+        );
+        assert_eq!(
+            views[1].sessions[0].selection_id.as_deref(),
+            Some(test_uuid(20).as_str())
+        );
+        assert!(
+            ids.session(&test_uuid(20)).is_none(),
+            "saved selection metadata does not grant a runtime target"
+        );
+    }
+
+    #[test]
+    fn saved_selection_identity_resolves_after_activation_without_title_or_local_id_matching() {
+        let stable = test_uuid(20);
+        let mut workspace = WorkspaceSeed {
+            id: "target".into(),
+            name: "saved".into(),
+            current_directory: None,
+            state: WorkspaceState::Suspended,
+            sessions: vec![SessionSeed {
+                id: Some(10),
+                selection_id: Some(stable.clone()),
+                title: "same title".into(),
+                user_override: None,
+                status: None,
+                agent: None,
+                exited: false,
+            }],
+        };
+        let before = workspace_views(
+            &[workspace.clone()],
+            &BTreeMap::new(),
+            &IdMap::default(),
+            &BTreeMap::new(),
+        );
+        assert_eq!(
+            before[0].sessions[0].selection_id.as_deref(),
+            Some(stable.as_str())
+        );
+        assert!(before[0].sessions[0].id.is_none());
+        workspace.state = WorkspaceState::Active;
+        workspace.sessions[0].id = Some(70);
+        workspace.sessions[0].title = "renamed after restore".into();
+        let live = BTreeMap::from([
+            (
+                10,
+                SessionEntry {
+                    status: SessionStatus::Running,
+                    user_override: None,
+                    exited: false,
+                },
+            ),
+            (
+                70,
+                SessionEntry {
+                    status: SessionStatus::Running,
+                    user_override: None,
+                    exited: false,
+                },
+            ),
+        ]);
+        let mut ids = IdMap::default();
+        ids.insert(test_uuid(99), 10);
+        ids.insert(stable.clone(), 70);
+        let after = workspace_views(&[workspace], &live, &ids, &BTreeMap::new());
+        let selected: Vec<_> = after[0]
+            .sessions
+            .iter()
+            .filter(|view| view.selection_id.as_deref() == Some(stable.as_str()))
+            .collect();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id.as_deref(), Some(stable.as_str()));
+        assert_eq!(selected[0].title, "renamed after restore");
+        assert_eq!(ids.session(&stable), Some(70));
+        assert_ne!(
+            after[0].sessions[0].selection_id.as_deref(),
+            Some(stable.as_str()),
+            "old local id10 is a different fresh membership"
+        );
     }
 
     #[test]
@@ -3755,6 +3987,7 @@ mod tests {
             state: WorkspaceState::Active,
             sessions: vec![SessionSeed {
                 id: Some(7),
+                selection_id: None,
                 user_override: None,
                 title: "deppy-sijo".into(),
                 status,

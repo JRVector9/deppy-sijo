@@ -2711,6 +2711,8 @@ mod tests {
             generation: 7,
             first_line: u64::MAX - 10,
             total_lines: 10,
+            native_rows: 3,
+            live_first_line: u64::MAX - 10,
         });
         let delta = crate::protocol::diff_viewport(&base, &next).unwrap();
         assert!(delta.changed_rows.is_empty());
@@ -3039,14 +3041,14 @@ mod tests {
 
     #[test]
     fn v12_v13_peer_is_rejected_at_hello_before_event_decode() {
-        for version in [10, 12, 13, 17, 18, 19, 20, 21, 23, 24, 25] {
+        for version in [10, 12, 13, 17, 18, 19, 20, 21, 23, 24, 25, 26] {
             let old = ClientHello {
                 magic: PROTO_MAGIC,
                 proto_version: version,
                 features: CLIENT_FEATURES,
                 token: b"irrelevant".to_vec(),
             };
-            assert_eq!(PROTO_VERSION, 26);
+            assert_eq!(PROTO_VERSION, 27);
             assert!(!client_hello_matches_protocol(&old));
         }
     }

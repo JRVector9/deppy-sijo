@@ -1336,6 +1336,8 @@ impl std::fmt::Debug for AgentStateJob {
 pub struct PersistedActivityPane {
     pub workspace_id: String,
     pub pane_id: String,
+    /// sessions.id, distinct from mux_panes.id; absent for panes without a saved session.
+    pub persistent_session_id: Option<String>,
     pub title: String,
     pub cwd: String,
 }
@@ -2193,10 +2195,12 @@ const ACTIVITY_PANES_BOUNDED_PREFLIGHT: &str = "WITH selected AS MATERIALIZED (
               substr(CAST(pane.id AS BLOB), 1, ?2), pane.rowid LIMIT ?1
 ), sized AS MATERIALIZED (
     SELECT pane.workspace_id, pane.id AS pane_id, pane.created_at,
+           session.id AS persistent_session_id,
            COALESCE(NULLIF(pane.title, ''), NULLIF(session.title, ''), pane.id) AS title,
            COALESCE(session.cwd, '') AS cwd,
            length(CAST(pane.workspace_id AS BLOB))
              + length(CAST(pane.id AS BLOB))
+             + COALESCE(length(CAST(session.id AS BLOB)), 0)
              + length(CAST(COALESCE(NULLIF(pane.title, ''),
                                     NULLIF(session.title, ''), pane.id) AS BLOB))
              + length(CAST(COALESCE(session.cwd, '') AS BLOB)) AS row_bytes
@@ -2207,6 +2211,9 @@ SELECT COUNT(*), COALESCE(SUM(CASE WHEN
        typeof(workspace_id) != 'text'
        OR length(CAST(workspace_id AS BLOB)) NOT BETWEEN 1 AND ?2
     OR typeof(pane_id) != 'text' OR length(CAST(pane_id AS BLOB)) NOT BETWEEN 1 AND ?2
+    OR typeof(persistent_session_id) NOT IN ('null', 'text')
+       OR (typeof(persistent_session_id) = 'text'
+           AND length(CAST(persistent_session_id AS BLOB)) NOT BETWEEN 1 AND ?2)
     OR typeof(created_at) != 'text' OR length(CAST(created_at AS BLOB)) > ?3
     OR typeof(title) != 'text' OR length(CAST(title AS BLOB)) NOT BETWEEN 1 AND ?3
     OR typeof(cwd) != 'text' OR length(CAST(cwd AS BLOB)) > ?3
@@ -2214,7 +2221,7 @@ SELECT COUNT(*), COALESCE(SUM(CASE WHEN
     COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0) FROM sized";
 const ACTIVITY_PANES_BOUNDED_SELECT: &str = "SELECT pane.workspace_id, pane.id,
             COALESCE(NULLIF(pane.title, ''), NULLIF(session.title, ''), pane.id),
-            COALESCE(session.cwd, '')
+            COALESCE(session.cwd, ''), session.id
        FROM mux_panes pane
        LEFT JOIN sessions session ON session.id = pane.session_id
       ORDER BY substr(CAST(pane.workspace_id AS BLOB), 1, ?2),
@@ -2977,6 +2984,7 @@ fn agent_state_snapshot_retained_bytes(
     for row in &snapshot.activity_panes {
         checked_agent_state_string_capacity(&mut total, &row.workspace_id)?;
         checked_agent_state_string_capacity(&mut total, &row.pane_id)?;
+        checked_agent_state_optional_string_capacity(&mut total, &row.persistent_session_id)?;
         checked_agent_state_string_capacity(&mut total, &row.title)?;
         checked_agent_state_string_capacity(&mut total, &row.cwd)?;
     }
@@ -7298,7 +7306,7 @@ impl Db {
         let mut stmt = self.conn.prepare_cached(
             "SELECT p.workspace_id, p.id,
                     COALESCE(NULLIF(p.title, ''), NULLIF(s.title, ''), p.id),
-                    COALESCE(s.cwd, '')
+                    COALESCE(s.cwd, ''), s.id
                FROM mux_panes p
                LEFT JOIN sessions s ON s.id = p.session_id
               ORDER BY p.workspace_id, p.created_at, p.id",
@@ -7307,6 +7315,7 @@ impl Db {
             Ok(PersistedActivityPane {
                 workspace_id: row.get(0)?,
                 pane_id: row.get(1)?,
+                persistent_session_id: row.get(4)?,
                 title: row.get(2)?,
                 cwd: row.get(3)?,
             })
@@ -7360,6 +7369,8 @@ impl Db {
                 result.push(PersistedActivityPane {
                     workspace_id: workspace_id.to_owned(),
                     pane_id: pane_id.to_owned(),
+                    persistent_session_id: bounded_optional_text(row, 4, BOUNDED_ID_BYTES_MAX)?
+                        .map(str::to_owned),
                     title: title.to_owned(),
                     cwd: cwd.to_owned(),
                 });
@@ -9173,6 +9184,8 @@ impl Db {
                 result.push(PersistedActivityPane {
                     workspace_id: workspace_id.to_owned(),
                     pane_id: pane_id.to_owned(),
+                    persistent_session_id: bounded_optional_text(row, 4, BOUNDED_ID_BYTES_MAX)?
+                        .map(str::to_owned),
                     title: title.to_owned(),
                     cwd: cwd.to_owned(),
                 });
@@ -13848,6 +13861,7 @@ mod tests {
             vec![PersistedActivityPane {
                 workspace_id: ws.clone(),
                 pane_id: "pane-1".to_owned(),
+                persistent_session_id: Some("session-live".to_owned()),
                 title: "saved shell".to_owned(),
                 cwd: "/".to_owned(),
             }]
@@ -13855,11 +13869,30 @@ mod tests {
         assert_eq!(
             db.list_persisted_activity_panes_bounded(1).unwrap(),
             vec![PersistedActivityPane {
-                workspace_id: ws,
+                workspace_id: ws.clone(),
                 pane_id: "pane-1".to_owned(),
+                persistent_session_id: Some("session-live".to_owned()),
                 title: "saved shell".to_owned(),
                 cwd: "/".to_owned(),
             }]
+        );
+        // Pane identity and restored terminal session identity are deliberately distinct.
+        // The asynchronous projection used by App must carry the same session UUID.
+        let mut job = AgentStateJob::projection(&ws);
+        job.include_activity_panes = true;
+        let snapshot = db.apply_agent_state_job(&job).unwrap();
+        assert_eq!(snapshot.activity_panes.len(), 1);
+        assert_eq!(snapshot.activity_panes[0].pane_id, "pane-1");
+        assert_eq!(
+            snapshot.activity_panes[0].persistent_session_id.as_deref(),
+            Some("session-live")
+        );
+        assert_ne!(
+            snapshot.activity_panes[0].pane_id,
+            snapshot.activity_panes[0]
+                .persistent_session_id
+                .as_deref()
+                .unwrap()
         );
     }
 
@@ -13920,6 +13953,7 @@ mod tests {
         let rows = db.list_persisted_activity_panes_bounded(3).unwrap();
         assert_eq!(rows.len(), 3);
         assert!(rows.iter().all(|row| row.workspace_id == workspace_id));
+        assert!(rows.iter().all(|row| row.persistent_session_id.is_none()));
         assert_eq!(
             rows.iter()
                 .map(|row| row.pane_id.as_str())
@@ -16680,6 +16714,7 @@ mod tests {
             activity_panes: vec![PersistedActivityPane {
                 workspace_id: marker.to_owned(),
                 pane_id: marker.to_owned(),
+                persistent_session_id: Some(marker.to_owned()),
                 title: marker.to_owned(),
                 cwd: marker.to_owned(),
             }],

@@ -56,5 +56,6 @@ pub use viewport_snapshot::{
 pub use visible_cells::{VisibleCellIndex, VisibleCells};
 
 pub use history::{
-    TerminalHistoryAnchor, TerminalHistoryMetadata, TerminalHistoryQuery, TerminalHistorySnapshot,
+    HISTORY_QUERY_MAX_CELLS, HISTORY_QUERY_MAX_ROWS, TerminalHistoryAnchor,
+    TerminalHistoryMetadata, TerminalHistoryQuery, TerminalHistorySnapshot,
 };

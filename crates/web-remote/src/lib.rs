@@ -1425,13 +1425,129 @@ mod tests {
             (live_first - 3).to_string()
         );
         assert_eq!(next_second["offset"], 7);
+        // Display heights are socket-local; neither client resizes the native
+        // three-row PTY, and subsequent live pushes retain each expanded size.
+        send_text(&mut first, &serde_json::json!({"type":"scroll","session":uuid,"request":4,"delta":0,"reset":true,"rows":9}).to_string());
+        let expanded_first = read_window(&mut first, Some(4), 0, 0);
+        send_text(&mut second, &serde_json::json!({"type":"scroll","session":uuid,"request":3,"delta":0,"reset":true,"rows":6}).to_string());
+        let expanded_second = read_window(&mut second, Some(3), 0, 0);
+        for (frame, rows) in [(&expanded_first, 9u64), (&expanded_second, 6u64)] {
+            assert_eq!(frame["rows"], rows);
+            assert_eq!(frame["lines"].as_array().unwrap().len(), rows as usize);
+            assert_eq!(frame["history"]["native_rows"], 3);
+            assert_eq!(frame["offset"], 0);
+            let first_line = frame["history"]["first_line"]
+                .as_str()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap();
+            let live_first_line = frame["history"]["live_first_line"]
+                .as_str()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap();
+            assert_eq!(first_line + rows - 3, live_first_line);
+        }
+        // Replayed request numbers must not reconfigure a newer display height.
+        send_text(&mut first, &serde_json::json!({"type":"scroll","session":uuid,"request":1,"delta":0,"reset":true,"rows":200}).to_string());
+        worker
+            .send_command(runtime::RuntimeCommand::WriteInput {
+                session: id,
+                bytes: b"x\rx\r".to_vec(),
+            })
+            .unwrap();
+        wait_native(11);
+        let wide_first_line = expanded_first["history"]["first_line"]
+            .as_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        let wide_second_line = expanded_second["history"]["first_line"]
+            .as_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        let pushed_first = read_window(
+            &mut first,
+            None,
+            expanded_first["seq"].as_u64().unwrap(),
+            wide_first_line + 2,
+        );
+        let pushed_second = read_window(
+            &mut second,
+            None,
+            expanded_second["seq"].as_u64().unwrap(),
+            wide_second_line + 2,
+        );
+        assert_eq!(pushed_first["rows"], 9);
+        assert_eq!(pushed_second["rows"], 6);
+        assert_eq!(
+            pushed_first["keyframe"], true,
+            "same size with a new source start cannot use old row baseline"
+        );
+        assert_eq!(pushed_first["offset"], 0);
+        assert_eq!(pushed_second["offset"], 0);
+        send_text(&mut first, &serde_json::json!({"type":"scroll","session":uuid,"request":5,"delta":2,"rows":9,"anchor":anchor(&expanded_first)}).to_string());
+        let pinned_wide = read_window(&mut first, Some(5), 0, 0);
+        assert_eq!(pinned_wide["offset"], 4);
+        worker
+            .send_command(runtime::RuntimeCommand::WriteInput {
+                session: id,
+                bytes: b"x\r".to_vec(),
+            })
+            .unwrap();
+        wait_native(12);
+        let _latest_wide = read_window(
+            &mut first,
+            None,
+            pinned_wide["seq"].as_u64().unwrap(),
+            wide_first_line + 3,
+        );
+        send_text(&mut first, &serde_json::json!({"type":"scroll","session":uuid,"request":6,"delta":0,"rows":9,"anchor":anchor(&pinned_wide)}).to_string());
+        let preserved_wide = read_window(&mut first, Some(6), 0, 0);
+        assert_eq!(
+            preserved_wide["history"]["first_line"],
+            pinned_wide["history"]["first_line"]
+        );
+        assert_eq!(preserved_wide["lines"], pinned_wide["lines"]);
+        assert_eq!(preserved_wide["offset"], 5);
+        send_text(&mut first, &serde_json::json!({"type":"scroll","session":uuid,"request":7,"delta":0,"reset":true,"rows":2}).to_string());
+        let suffix = read_window(&mut first, Some(7), 0, 0);
+        assert_eq!(suffix["rows"], 2);
+        assert_eq!(suffix["history"]["native_rows"], 3);
+        assert_eq!(suffix["offset"], 0);
+        send_text(
+            &mut first,
+            &serde_json::json!({"type":"scroll","session":uuid,"request":8,"delta":0,"rows":0})
+                .to_string(),
+        );
+        let rejected =
+            read_frame_of_type(&mut first, "history_error", Duration::from_secs(5)).unwrap();
+        let rejected: serde_json::Value = serde_json::from_str(&rejected).unwrap();
+        assert_eq!(rejected["request"], 8);
+        assert_eq!(rejected["reason"], "invalid_rows");
+        send_text(&mut first, r#"{"type":"unwatch"}"#);
+        send_text(
+            &mut first,
+            &serde_json::json!({"type":"watch","session":uuid}).to_string(),
+        );
+        let rewatched = read_window(
+            &mut first,
+            None,
+            suffix["seq"].as_u64().unwrap(),
+            live_first + 7,
+        );
+        assert_eq!(
+            rewatched["rows"], 3,
+            "watch replacement releases connection display geometry"
+        );
         worker
             .send_command(runtime::RuntimeCommand::Scroll {
                 session: id,
                 delta: 0,
             })
             .unwrap();
-        wait_native(9);
+        wait_native(12);
         assert!(
             !captured
                 .lock()
@@ -1440,11 +1556,185 @@ mod tests {
                 .any(|command| matches!(command, runtime::RuntimeCommand::Scroll { .. })),
             "Web reads must never dispatch native Scroll"
         );
+        assert!(
+            !captured.lock().unwrap().iter().any(|command| matches!(
+                command,
+                runtime::RuntimeCommand::Resize { .. }
+                    | runtime::RuntimeCommand::ResizeTracked { .. }
+            )),
+            "history display sizes never dispatch a native resize"
+        );
         drop(first);
         drop(second);
         server.shutdown();
         worker.shutdown();
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn ws_history_unavailable_restores_native_stream_after_explicit_and_passive_failures() {
+        for explicit_failure in [true, false] {
+            let server = start(None);
+            let (command_tx, command_rx) = std::sync::mpsc::channel();
+            let operations = Arc::new(Mutex::new(std::collections::BTreeSet::new()));
+            let captured = Arc::clone(&operations);
+            server.set_runtime_command_sink(Arc::new(move |command| {
+                if let runtime::RuntimeCommand::QueryTerminalHistory { operation_id, .. } = &command
+                {
+                    captured.lock().unwrap().insert(*operation_id);
+                }
+                command_tx.send(command).unwrap();
+            }));
+            seed_ids(&server, &[7]);
+            let mut ws = ws_client_authed(server.local_addr());
+            send_text(&mut ws, r#"{"type":"watch","session":"uuid-7"}"#);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if matches!(
+                    command_rx
+                        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                        .unwrap(),
+                    runtime::RuntimeCommand::SetRemoteViewing { viewing: true, .. }
+                ) {
+                    break;
+                }
+            }
+            let native = |text| {
+                Arc::new(runtime::TerminalViewportSnapshot {
+                    cols: 10,
+                    rows: 2,
+                    cursor: runtime::CursorSnapshot {
+                        col: 0,
+                        row: 0,
+                        shape: runtime::CursorShape::Block,
+                        visible: true,
+                    },
+                    visible_cells: vec![
+                        runtime::TerminalCell::new(
+                            text,
+                            [255; 3],
+                            [0; 3],
+                            false,
+                            false,
+                            Default::default()
+                        );
+                        20
+                    ]
+                    .into(),
+                    graphemes: Default::default(),
+                    dirty_ranges: Vec::new(),
+                    title: None,
+                    scroll_offset: 0,
+                    is_alt_screen: false,
+                    history: None,
+                })
+            };
+            let inject_native = |text| {
+                server
+                    .core
+                    .dashboard()
+                    .inject_event(runtime::RuntimeEvent::Viewport {
+                        session: runtime::SessionId(7),
+                        snapshot: native(text),
+                        bracketed_paste: false,
+                    })
+            };
+            inject_native('a');
+            read_frame_of_type(&mut ws, "viewport", Duration::from_secs(3)).unwrap();
+            send_text(
+                &mut ws,
+                r#"{"type":"scroll","session":"uuid-7","request":1,"delta":0,"reset":true,"rows":9}"#,
+            );
+            let next_query = |previous| {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    if let runtime::RuntimeCommand::QueryTerminalHistory { operation_id, .. } =
+                        command_rx
+                            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                            .unwrap()
+                        && Some(operation_id) != previous
+                    {
+                        break operation_id;
+                    }
+                }
+            };
+            let explicit = next_query(None);
+            let failed = if explicit_failure {
+                explicit
+            } else {
+                let mut supported = (*native('a')).clone();
+                supported.history = Some(runtime::TerminalHistoryMetadata {
+                    generation: 7,
+                    first_line: 0,
+                    total_lines: 2,
+                    native_rows: 2,
+                    live_first_line: 0,
+                });
+                server.core.dashboard().inject_event(
+                    runtime::RuntimeEvent::TerminalHistoryResult {
+                        session: runtime::SessionId(7),
+                        operation_id: explicit,
+                        snapshot: Some(Arc::new(supported)),
+                        expired: false,
+                    },
+                );
+                let success =
+                    read_frame_of_type(&mut ws, "viewport", Duration::from_secs(3)).unwrap();
+                let success: serde_json::Value = serde_json::from_str(&success).unwrap();
+                assert_eq!(success["history"]["request"], 1);
+                next_query(Some(explicit))
+            };
+            server
+                .core
+                .dashboard()
+                .inject_event(runtime::RuntimeEvent::TerminalHistoryResult {
+                    session: runtime::SessionId(7),
+                    operation_id: failed,
+                    snapshot: None,
+                    expired: false,
+                });
+            if explicit_failure {
+                let error =
+                    read_frame_of_type(&mut ws, "history_error", Duration::from_secs(3)).unwrap();
+                let error: serde_json::Value = serde_json::from_str(&error).unwrap();
+                assert_eq!(error["request"], 1);
+                assert_eq!(error["reason"], "unavailable");
+            }
+            inject_native('b');
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let recovered = read_frame_of_type(
+                    &mut ws,
+                    "viewport",
+                    deadline.saturating_duration_since(Instant::now()),
+                )
+                .expect("unavailable history suppressed healthy native output");
+                let recovered: serde_json::Value = serde_json::from_str(&recovered).unwrap();
+                if recovered["lines"].as_array().unwrap().iter().any(|line| {
+                    line["runs"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|run| run["t"].as_str().unwrap().starts_with('b'))
+                }) {
+                    assert_eq!(recovered["rows"], 2);
+                    assert!(recovered.get("history").is_none());
+                    break;
+                }
+            }
+            send_text(&mut ws, r#"{"type":"request_keyframe"}"#);
+            let resync = read_frame_of_type(&mut ws, "viewport", Duration::from_secs(3)).unwrap();
+            let resync: serde_json::Value = serde_json::from_str(&resync).unwrap();
+            assert_eq!(resync["keyframe"], true);
+            assert!(resync.get("history").is_none());
+            assert_eq!(
+                operations.lock().unwrap().len(),
+                if explicit_failure { 1 } else { 2 },
+                "unsupported display reads must stop creating live refresh operations"
+            );
+            drop(ws);
+            server.shutdown();
+        }
     }
 
     #[test]
@@ -2191,6 +2481,7 @@ mod tests {
             &server,
             active_seed(vec![dashboard::SessionSeed {
                 id: Some(7),
+                selection_id: None,
                 user_override: None,
                 title: "claude".to_owned(),
                 status: Some(runtime::SessionStatus::NeedsApproval),
@@ -2240,6 +2531,7 @@ mod tests {
                     state: dashboard::WorkspaceState::Active,
                     sessions: vec![dashboard::SessionSeed {
                         id: Some(7),
+                        selection_id: None,
                         user_override: None,
                         title: "deppy-sijo".to_owned(),
                         status: Some(runtime::SessionStatus::Running),
@@ -2254,6 +2546,7 @@ mod tests {
                     state: dashboard::WorkspaceState::Warm,
                     sessions: vec![dashboard::SessionSeed {
                         id: None,
+                        selection_id: Some("saved-pane".to_owned()),
                         user_override: None,
                         title: "deppy-mux".to_owned(),
                         status: None,
@@ -2283,6 +2576,7 @@ mod tests {
             &server,
             active_seed(vec![dashboard::SessionSeed {
                 id: Some(1),
+                selection_id: None,
                 user_override: None,
                 title: "A".to_owned(),
                 status: Some(runtime::SessionStatus::NeedsApproval),
@@ -2301,6 +2595,7 @@ mod tests {
             &server,
             active_seed(vec![dashboard::SessionSeed {
                 id: Some(2),
+                selection_id: None,
                 user_override: None,
                 title: "B".to_owned(),
                 status: Some(runtime::SessionStatus::Error),

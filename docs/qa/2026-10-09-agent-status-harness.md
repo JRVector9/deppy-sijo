@@ -6,6 +6,8 @@ Source implementation, concrete review corrections and local verification are co
 
 Coverage remains69 provider scenarios/238 replay steps, nine PWA contracts, nine retained-hook/bounded-ingestion regressions and existing lifecycle/display/installer suites. Prior delegated PWA reports were matched against all four PR-unit commits and the2026-10-08 journal; no omitted work record was found. This is source verification, with no release, app restart, live hook installation, private transcript collection or hosted CI/mobile-device run. The limits below remain explicit.
 
+After the source-only verification phase, the user authorized a local rebuild/restart on2026-10-09. Delivered version **0.9.0** replaces0.8.7; native About and both bundle version fields were verified. See the current handoff for exact release/runtime evidence. This delivery does not turn fixture coverage into live-provider/mobile-device coverage.
+
 ## Scope and authority
 
 Session state is reduced in `storage::Db::record_agent_attention` and projected by the existing AgentStateWorker. Parent execution, live child lifetimes, questions, human approvals, answered requests, cancellation and proven completion are separate facts. A parent Stop cannot complete a live child. A tool result resolves only its owned request, not unrelated questions. Silence, a saved title, a restored database row or a stop gate alone is not proof of success.

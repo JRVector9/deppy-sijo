@@ -1,3 +1,25 @@
+# Completed: 0.9.0 local rebuild and authorized restart — 2026-10-09
+
+- Current objective fulfilled: user explicitly requested rebuild and restart after source fixes. App0.8.7→0.9.0 (minor increase because previously unshipped PWA/provider feature additions accompany fixes). Highest existing worktree/artifact version scan was0.8.7. Root Cargo workspace version and all27 inherited package Cargo.lock entries are0.9.0; dependency versions otherwise unchanged.
+- Product source commit c94a08f720cd90d3e80caf98a9322ba9903d2c08 includes recording27822baf and harnessc175073f. This release metadata commit records Cargo.toml/Cargo.lock/handoff and QA delivery note; Obsidian journal records the resulting release commit.
+- Actual offline optimized release package script passed, 1m25 build: /private/tmp/deppy-0.9.0-package-20261009.log. App+deppy-mcp-proxy rebuilt together; pinned cloudflared companion bundled; Developer ID Application VectorNine signing identity retained. Bundle and archive signature/architecture/plist/hash verification PASS under explicit local-development policy (no public notarization submission).
+- Copied isolated launch artifact: /Users/jr/Desktop/projects/deppy-sijo-performance/target/restart-0.9.0-20261009/Deppy Sijo.app. Verification log /private/tmp/deppy-0.9.0-restart-bundle-verify-20261009.log. CFBundleShortVersionString and CFBundleVersion both0.9.0.
+- Old PID71458 quit through native Cmd+Q and exited normally (no force kill); sole new PID86569 runs the exact0.9.0 restart bundle path. Actual native About dialog reported `Deppy Sijo Version 0.9.0 (0.9.0)`; dialog closed and main window responded. Runtime proof and binary SHA256s: /private/tmp/deppy-0.9.0-runtime-verification-20261009.json.19 session records restored; no agent prompt was sent for verification.
+- Modified source metadata only; previous final maintained605PASS/1ignored, App2817PASS/38ignored, web378PASS/10ignored and source review OK remain actual source evidence. No assertion of live verification for every provider/device. No source implementation remains and no push requested/performed.
+- Failed approach: metadata --no-deps did not refresh workspace lock versions; initial lock assertion failed. Actual Cargo package build resolved all27 entries to0.9.0 before compile, then explicit validation/diff confirmed only those version changes. Initial broad process inventory was overly verbose; subsequent PID/path checks were narrowly scoped. No failed check claimed passed.
+- Old0.8.7 isolated restart artifact retained. Nominal /Users/jr/Desktop/projects/deppy-sijo unrelated edits untouched. This is a local signed developer release, not a new publicly notarized distribution. A future restart needs a new explicit request; future changed artifact version must exceed0.9.0.
+- No required product/build/restart work remains. Release metadata and this handoff are committed as this phase; the Obsidian journal records the resulting commit and final clean status. Exact read-only continuation: `git status --short`; `git log -4 --oneline`; `cat /private/tmp/deppy-0.9.0-runtime-verification-20261009.json`. Do not restart again automatically.
+
+---
+
+# Authorized rebuild/restart active — 2026-10-09
+
+- User explicitly requests rebuild and restart now. Source implementation/review completed at c94a08f720cd90d3e80caf98a9322ba9903d2c08. Worktree /Users/jr/Desktop/projects/deppy-sijo-performance; nominal checkout has unrelated edits and is untouched.
+- Current running app PID71458 uses target/restart-0.8.7-20261008/Deppy Sijo.app, signed Developer ID VectorNine. Read-only existing worktree/source/bundle scan found highest shipped0.8.7. Increment workspace version0.8.7→0.9.0 (PWA usability feature additions plus status fixes) before delivery; retain inherited versions and update workspace lock entries.
+- Plan: locked offline release build/package App and mcp-proxy, pinned tunnel companion, preserve signing identity; verify reported binary version and both CFBundle versions0.9.0, signature and architecture. Build before quitting current app; graceful stop, then launch isolated new restart bundle, verify actual running path/window. Root serializes Cargo with existing tasktree gate lock and freezes source during build.
+- Local signed development rebuild, not a new public notarized distribution. Existing script supports explicit local mode; old running restart artifact retained for rollback. No new product code/agent prompts/private DB edits. Existing605/2817/378 final tests and source review OK are retained; do not rerun unrelated suites for a version-only change.
+- Remaining: lock/version validation, release bundle build/sign/check, authorized restart and verification, source version/handoff commit and Obsidian release record. No build/restart PASS claim yet. Exact next step: cargo metadata --offline --format-version1 --no-deps via serialized gate to refresh local package lock entries, then scripts/package-macos.sh under same lock with local signing policy.
+
 # Completed: provider status harness and PWA/runtime ownership — 2026-10-09
 
 ## Current objective and completion

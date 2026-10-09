@@ -10,9 +10,9 @@
 // keyframe이면 전체 행, 아니면 바뀐 행만. 기준 화면 없이 delta가 오면 재동기화를 요청한다.
 // 다른 세션의 잔여 프레임은 버린다.
 
-export const TERMINAL_FONT_MIN_PX = 8;
-export const TERMINAL_FONT_MAX_PX = 22;
-export const TERMINAL_FONT_DEFAULT_PX = 12;
+export const TERMINAL_FONT_MIN_PX = 12;
+export const TERMINAL_FONT_MAX_PX = 24;
+export const TERMINAL_FONT_DEFAULT_PX = 15;
 export const TERMINAL_LINE_HEIGHT_EM = 1.35;
 /// 폭 맞춤 계산용 추정 셀 폭(em). 실제 폰트 계량을 재지 않고 deppy-mux와 같은 값을 쓴다.
 const ESTIMATED_CELL_WIDTH_EM = 0.62;
@@ -85,7 +85,7 @@ export function createTerminalView({ mount, requestKeyframe }) {
     session: null,
     screen: null,
     fontSizePx: TERMINAL_FONT_DEFAULT_PX,
-    fitWidth: true,
+    fitWidth: false,
     readableWrap: false,
     rowElements: [],
   };
@@ -157,9 +157,9 @@ export function createTerminalView({ mount, requestKeyframe }) {
   }
 
   function renderScrollNote() {
-    const offset = state.screen?.offset | 0;
-    scrollNote.hidden = offset <= 0;
-    if (offset > 0) scrollNote.textContent = `↑ ${offset}줄 위 (Mac이 과거를 열람 중)`;
+    // Relay cannot reset Mac history. Its local bottom action is supplied by the
+    // shell and must not claim to navigate the server's read-only frame offset.
+    scrollNote.hidden = true;
   }
 
   function applyViewport(frame) {

@@ -196,6 +196,9 @@ export function createShell({ endpoint, socketFactory, identityStore = {loadOrCr
     terminal: null,
     /// 마지막 대시보드. 터미널 화면의 세션 전환과 종료 감지가 이걸 본다.
     workspaces: [],
+    workspaceQuery: "",
+    workspaceExpansions: new Map(),
+    sheetRestore: null,
     selectedWorkspace: null,
     /// 세션별 마지막 상태 — 상태가 "기다림/승인 필요/종료"로 바뀔 때만 토스트를 띄운다.
     sessionStatus: new Map(),
@@ -365,7 +368,7 @@ export function createShell({ endpoint, socketFactory, identityStore = {loadOrCr
     home.id = "relay-home";
     const topbar = element("header", "m-topbar");
     const brand = element("div", "m-brand");
-    brand.append(element("h1", "m-brand-title", "시조새"));
+    brand.append(element("h1", "m-brand-title", "워크스페이스"));
     const homeStatus = element("div", "m-brand-subtitle", "종단 간 암호화 · 보기 전용");
     homeStatus.id = "relay-home-status";
     brand.append(homeStatus);
@@ -377,7 +380,14 @@ export function createShell({ endpoint, socketFactory, identityStore = {loadOrCr
     actions.append(count, menuButton("relay-menu-button"));
     topbar.append(actions);
     home.append(topbar);
-    const list = element("div", "m-card-list");
+    const search = element("label", "m-workspace-search");
+    search.append(element("span", "", "⌕"));
+    const searchInput = element("input"); searchInput.type = "search";
+    searchInput.id = "relay-workspace-search"; searchInput.placeholder = "워크스페이스 또는 세션 검색";
+    searchInput.setAttribute("aria-label", "워크스페이스 또는 세션 검색");
+    searchInput.addEventListener("input", () => { state.workspaceQuery = searchInput.value; renderWorkspaceList(); });
+    search.append(searchInput); home.append(search);
+    const list = element("div", "relay-workspace-list");
     list.id = "relay-workspaces";
     list.setAttribute("aria-label", "워크스페이스 목록");
     home.append(list);
@@ -408,20 +418,26 @@ export function createShell({ endpoint, socketFactory, identityStore = {loadOrCr
     const chip = element("button", "m-term-chip", "");
     chip.type = "button";
     chip.id = "term-session-chip";
-    chip.setAttribute("aria-label", "다음 세션으로 전환");
+    chip.setAttribute("aria-label", "세션 선택");
+    chip.setAttribute("aria-haspopup", "dialog"); chip.setAttribute("aria-expanded", "false");
     chip.addEventListener("click", () => {
-      void cycleSession();
+      openSessionSheet();
     });
     termActions.append(chip, menuButton("term-menu-button"));
     head.append(back, title, termActions);
     terminal.append(head);
     const viewport = element("div", "m-term-viewport");
     viewport.id = "relay-viewport";
-    terminal.append(viewport);
+    const stage = element("div", "m-term-stage");
+    const bottom = element("button", "m-local-bottom", "↓ 맨 아래로");
+    bottom.type = "button"; bottom.id = "relay-bottom"; bottom.hidden = true;
+    bottom.addEventListener("click", () => { viewport.scrollTop = viewport.scrollHeight; syncLocalBottom(); });
+    viewport.addEventListener("scroll", syncLocalBottom);
+    stage.append(viewport, bottom); terminal.append(stage);
     terminal.append(composerBar());
     session.append(terminal);
 
-    session.append(menuPanel());
+    session.append(menuPanel(), sessionPanel());
     mount.append(session);
     state.terminal = createTerminalView({
       mount: viewport,
@@ -430,6 +446,21 @@ export function createShell({ endpoint, socketFactory, identityStore = {loadOrCr
       },
     });
     applyPrefs();
+    syncRelayViewport();
+    globalThis.visualViewport?.addEventListener("resize", syncRelayViewport, { signal: state.abort.signal });
+    globalThis.visualViewport?.addEventListener("scroll", syncRelayViewport, { signal: state.abort.signal });
+    globalThis.addEventListener("resize", syncRelayViewport, { signal: state.abort.signal });
+  }
+
+  function syncRelayViewport() {
+    const root = byId("relay-shell-root"); if (!root) return;
+    const viewport = globalThis.visualViewport;
+    const pinched = viewport && viewport.scale > 1.01;
+    root.style.setProperty("--relay-height", `${pinched ? globalThis.innerHeight : viewport?.height || globalThis.innerHeight}px`);
+    root.style.setProperty("--relay-width", `${pinched ? globalThis.innerWidth : viewport?.width || globalThis.innerWidth}px`);
+    root.style.setProperty("--relay-top", `${pinched ? 0 : viewport?.offsetTop || 0}px`);
+    root.style.setProperty("--relay-left", `${pinched ? 0 : viewport?.offsetLeft || 0}px`);
+    syncLocalBottom();
   }
 
   /// deppy-mux와 같은 작성기 바. 이 셸은 보기 전용이라 **전부 비활성**이며, 그 사실을 바 안의
@@ -442,12 +473,11 @@ export function createShell({ endpoint, socketFactory, identityStore = {loadOrCr
     attach.type = "button";
     attach.disabled = true;
     attach.setAttribute("aria-label", "파일 첨부 (보기 전용에서는 불가)");
-    const skills = element("button", "m-icon-button small", "/");
+    const skills = element("button", "m-icon-button small", "⌘");
     skills.type = "button";
     skills.disabled = true;
-    skills.setAttribute("aria-label", "스킬 (보기 전용에서는 불가)");
-    const input = element("input");
-    input.type = "text";
+    skills.setAttribute("aria-label", "터미널 보조 키 (보기 전용에서는 불가)");
+    const input = element("textarea"); input.rows = 1;
     input.disabled = true;
     input.placeholder = "보기 전용";
     input.setAttribute("aria-label", "입력 (보기 전용에서는 불가)");
@@ -455,7 +485,8 @@ export function createShell({ endpoint, socketFactory, identityStore = {loadOrCr
     send.type = "button";
     send.disabled = true;
     send.setAttribute("aria-label", "전송 (보기 전용에서는 불가)");
-    composer.append(attach, skills, input, send);
+    const box = element("div", "unified-inputbox"); box.append(input, skills);
+    composer.append(attach, box, send);
     bar.append(composer);
     return bar;
   }
@@ -466,16 +497,24 @@ export function createShell({ endpoint, socketFactory, identityStore = {loadOrCr
     button.id = id;
     button.setAttribute("aria-label", "메뉴");
     button.setAttribute("aria-expanded", "false");
-    button.addEventListener("click", () => toggleMenu());
+    button.addEventListener("click", () => toggleMenu(button));
     return button;
   }
 
   /// ⋯ 메뉴 — deppy-mux의 항목을 보기 전용 범위에서 그대로 둔다: 연결 상태, 글꼴 크기,
   /// 폭 맞춤, 읽기 좋은 줄바꿈, 워크스페이스 목록, 버전.
   function menuPanel() {
-    const panel = element("div", "m-menu");
-    panel.id = "relay-menu";
-    panel.hidden = true;
+    const backdrop = element("div", "m-sheet-backdrop"); backdrop.id = "relay-menu"; backdrop.hidden = true;
+    const sheet = element("section", "m-sheet"); sheet.setAttribute("role", "dialog");
+    sheet.setAttribute("aria-modal", "true"); sheet.setAttribute("aria-labelledby", "relay-settings-title");
+    const header = element("header", "m-sheet-title");
+    const title = element("h2", "", "터미널 설정"); title.id = "relay-settings-title";
+    const close = element("button", "m-icon-button", "×"); close.type = "button";
+    close.setAttribute("aria-label", "설정 닫기"); close.addEventListener("click", closeMenu);
+    header.append(title, close);
+    const panel = element("div", "m-sheet-content");
+    sheet.append(header, panel); backdrop.append(sheet);
+    bindSheet(backdrop, closeMenu);
 
     const status = element("div", "m-menu-section");
     status.append(element("div", "label", "연결 상태"));
@@ -515,19 +554,20 @@ export function createShell({ endpoint, socketFactory, identityStore = {loadOrCr
     panel.append(font);
 
     panel.append(
-      toggleRow("menu-fit-width", "폭 맞춤", () => {
+      toggleRow("menu-fit-width", "전체 화면 맞춤 (축소)", () => {
         state.prefs.fitWidth = !state.prefs.fitWidth;
         applyPrefs();
       }),
     );
     panel.append(
-      toggleRow("menu-readable-wrap", "읽기 좋은 줄바꿈", () => {
+      toggleRow("menu-readable-wrap", "읽기 줄바꿈", () => {
         state.prefs.readableWrap = !state.prefs.readableWrap;
         applyPrefs();
       }),
     );
+    panel.append(element("div", "m-menu-section", "보기 전용에서는 서버 이력 조회와 터미널 크기 변경을 지원하지 않습니다."));
     panel.append(element("div", "m-menu-version", `시조새 원격 · 프로토콜 v${PROTOCOL_VERSION}`));
-    return panel;
+    return backdrop;
   }
 
   function toggleRow(id, label, onToggle) {
@@ -540,17 +580,18 @@ export function createShell({ endpoint, socketFactory, identityStore = {loadOrCr
     return button;
   }
 
-  function toggleMenu() {
+  function toggleMenu(trigger) {
     const panel = byId("relay-menu");
     if (!panel) return;
-    if (panel.hidden) openMenu();
+    if (panel.hidden) openMenu(trigger);
     else closeMenu();
   }
 
-  function openMenu() {
+  function openMenu(trigger) {
     const panel = byId("relay-menu");
     if (!panel) return;
-    panel.hidden = false;
+    closeSessionSheet();
+    openSheet(panel, trigger);
     for (const id of ["relay-menu-button", "term-menu-button"]) {
       byId(id)?.setAttribute("aria-expanded", "true");
     }
@@ -562,7 +603,7 @@ export function createShell({ endpoint, socketFactory, identityStore = {loadOrCr
   function closeMenu() {
     const panel = byId("relay-menu");
     if (!panel) return;
-    panel.hidden = true;
+    hideSheet(panel);
     for (const id of ["relay-menu-button", "term-menu-button"]) {
       byId(id)?.setAttribute("aria-expanded", "false");
     }
@@ -597,6 +638,7 @@ export function createShell({ endpoint, socketFactory, identityStore = {loadOrCr
   }
 
   function unmountSession() {
+    closeMenu(); closeSessionSheet();
     state.terminal?.destroy?.();
     state.terminal = null;
     state.watching = null;
@@ -664,17 +706,7 @@ export function createShell({ endpoint, socketFactory, identityStore = {loadOrCr
       const label = count.lastChild;
       if (label) label.textContent = `${workspaces.length} workspaces`;
     }
-    const list = byId("relay-workspaces");
-    if (list) {
-      list.replaceChildren();
-      if (workspaces.length === 0) {
-        const note = element("div", "m-panel-note");
-        note.append(element("strong", "", "표시할 워크스페이스가 없습니다"));
-        note.append(document.createTextNode("Mac에서 워크스페이스를 열면 여기에 나타납니다."));
-        list.append(note);
-      }
-      for (const workspace of workspaces) list.append(workspaceCard(workspace));
-    }
+    renderWorkspaceList();
 
     // 보던 세션이 사라졌거나 끝났으면 터미널을 닫는다 — 빈 화면을 붙들고 있지 않는다.
     if (state.watching) {
@@ -720,52 +752,120 @@ export function createShell({ endpoint, socketFactory, identityStore = {loadOrCr
     state.sessionStatus = next;
   }
 
-  function workspaceCard(workspace) {
-    const sessions = Array.isArray(workspace.sessions) ? workspace.sessions : [];
-    const openable = watchable(workspace);
-    const card = element("button", `m-card${openable.length === 0 ? " idle" : ""}`);
-    card.type = "button";
-    card.dataset.workspace = String(workspace.id ?? "");
-    const body = element("span", "m-card-body");
-    body.append(element("span", "m-card-name", String(workspace.name ?? workspace.id ?? "")));
-    const completed = sessions.some((view) => statusOf(view) === "done" || statusOf(view) === "waiting");
-    if (completed) body.append(element("span", "m-done-tag", "완료"));
-    const agents = sessions
-      .map((view) => (typeof view.agent === "string" ? view.agent : ""))
-      .filter((agent, index, all) => agent && all.indexOf(agent) === index);
-    body.append(
-      element(
-        "span",
-        "m-card-path",
-        agents.length > 0
-          ? agents.join(" · ")
-          : workspace.state === "active"
-            ? "활성 워크스페이스"
-            : workspace.state === "warm"
-              ? "대기 중 — Mac에서 전환해야 볼 수 있습니다"
-              : "절전 중 — Mac에서 깨워야 볼 수 있습니다",
-      ),
-    );
-    const chips = element("span", "m-chip-row");
-    for (const view of sessions.slice(0, 3)) {
-      const chip = element("span", "m-chip");
-      chip.dataset.session = typeof view.id === "string" ? view.id : "";
-      chip.append(element("span", `m-dot ${dotFor(statusOf(view))}`));
-      chip.append(element("span", "", String(view.title ?? "세션")));
-      chips.append(chip);
+  const searchable = value => String(value ?? "").normalize("NFC").toLocaleLowerCase();
+  function sessionLabel(view, workspace) {
+    return view.exited ? "종료" : workspace.state !== "active"
+      ? (workspace.state === "warm" ? "대기 · 저장된 세션" : "절전 · 저장된 세션")
+      : STATUS_LABEL[statusOf(view)] || "상태 정보 없음";
+  }
+  function renderWorkspaceList() {
+    const list = byId("relay-workspaces"); if (!list) return;
+    const focus = list.contains(document.activeElement) ? { workspace: document.activeElement.dataset.workspace,
+      session: document.activeElement.dataset.session } : null;
+    const query = searchable(state.workspaceQuery.trim());
+    const alive = new Set(state.workspaces.map(workspace => workspace.id));
+    for (const id of state.workspaceExpansions.keys()) if (!alive.has(id)) state.workspaceExpansions.delete(id);
+    list.replaceChildren();
+    for (const workspace of state.workspaces) {
+      const match = searchable([workspace.name, workspace.current_directory].join(" ")).includes(query);
+      const sessions = (workspace.sessions || []).filter(view => !query || match
+        || searchable([view.title, view.agent, view.status, sessionLabel(view, workspace)].join(" ")).includes(query));
+      if (query && !match && !sessions.length) continue;
+      list.append(workspaceCard(workspace, sessions, !!query || (state.workspaceExpansions.has(workspace.id) ? state.workspaceExpansions.get(workspace.id) : workspace.state === "active")));
     }
-    if (sessions.length > 3) chips.append(element("span", "m-chip", `+${sessions.length - 3}`));
-    body.append(chips);
-    card.append(body);
-    card.append(element("span", "m-badge-count", String(sessions.length)));
-    card.addEventListener("click", () => {
-      if (openable.length === 0) {
-        toast("이 워크스페이스는 볼 수 없습니다", "Mac에서 활성 워크스페이스로 전환하세요");
-        return;
-      }
-      void openWorkspace(workspace, openable[0]);
+    if (!list.children.length) list.append(element("p", "relay-workspace-note", query ? "검색 결과가 없습니다." : "표시할 워크스페이스가 없습니다."));
+    if (focus?.session) list.querySelector(`[data-session="${CSS.escape(focus.session)}"]`)?.focus({ preventScroll: true });
+    else if (focus?.workspace) list.querySelector(`[data-workspace="${CSS.escape(focus.workspace)}"]`)?.focus({ preventScroll: true });
+  }
+  function workspaceCard(workspace, sessions, expanded) {
+    const card = element("section", "relay-workspace");
+    const head = element("button", "relay-workspace-head"); head.type = "button";
+    head.dataset.workspace = String(workspace.id ?? ""); head.setAttribute("aria-expanded", String(expanded));
+    const label = element("span", "relay-workspace-label");
+    label.append(element("strong", "", String(workspace.name ?? workspace.id ?? "")), element("small", "", `${(workspace.sessions || []).length}개 세션`));
+    head.append(label, element("span", workspace.state === "active" ? "active" : "", workspace.state === "active" ? "현재" : workspace.state === "warm" ? "대기" : "절전"), element("span", "", expanded ? "⌄" : "›"));
+    head.addEventListener("click", () => {
+      state.workspaceExpansions.set(workspace.id, !expanded); renderWorkspaceList();
     });
-    return card;
+    const body = element("div"); body.hidden = !expanded;
+    if (workspace.current_directory) body.append(element("p", "relay-workspace-path", workspace.current_directory));
+    for (const view of sessions) body.append(sessionRow(view, workspace));
+    if (workspace.state !== "active") body.append(element("p", "relay-workspace-note", "보기 전용입니다. Mac에서 이 워크스페이스로 전환해야 세션을 볼 수 있습니다."));
+    if (!sessions.length) body.append(element("p", "relay-workspace-note", "세션 없음"));
+    card.append(head, body); return card;
+  }
+  function sessionRow(view, workspace, inSheet = false) {
+    const row = element("button", "m-session-row"); row.type = "button";
+    row.dataset.session = typeof view.id === "string" ? view.id : "";
+    const status = workspace.state === "active" ? statusOf(view) : "dormant";
+    const copy = element("span", "session-name");
+    copy.append(element("strong", "title", view.title || "세션"), element("span", "session-meta", `${sessionLabel(view, workspace)} · ${view.agent || "터미널"}`));
+    row.append(element("span", `session-dot ${status}`), copy, element("span", "row-arrow", view.id === state.watching ? "✓" : "›"));
+    row.disabled = !watchable(workspace).some(candidate => candidate.id === view.id);
+    if (view.id === state.watching) row.setAttribute("aria-current", "true");
+    row.addEventListener("click", () => {
+      const freshWorkspace = state.workspaces.find(candidate => candidate.id === workspace.id);
+      const fresh = watchable(freshWorkspace).find(candidate => candidate.id === view.id);
+      if (!fresh) return;
+      if (inSheet) { closeSessionSheet(); void watchSession(fresh); }
+      else void openWorkspace(freshWorkspace, fresh);
+    });
+    return row;
+  }
+
+  function bindSheet(panel, close) {
+    panel.addEventListener("click", event => { if (event.target === panel) close(); });
+    panel.addEventListener("keydown", event => {
+      if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); close(); }
+      if (event.key !== "Tab") return;
+      const items = Array.from(panel.querySelectorAll("button,input,[tabindex='0']")).filter(node => !node.disabled && node.getClientRects().length);
+      const first = items[0], last = items[items.length - 1];
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+    });
+  }
+  function openSheet(panel, trigger = document.activeElement) {
+    document.activeElement?.blur?.();
+    const active = trigger;
+    const siblings = Array.from(panel.parentElement.children).filter(node => node !== panel).map(node => [node, node.inert]);
+    state.sheetRestore = { panel, active, siblings };
+    for (const [node] of siblings) node.inert = true;
+    panel.hidden = false; panel.querySelector("button")?.focus({ preventScroll: true });
+  }
+  function hideSheet(panel) {
+    if (panel.hidden) return;
+    panel.hidden = true;
+    const restore = state.sheetRestore; state.sheetRestore = null;
+    if (restore?.panel === panel) {
+      for (const [node, inert] of restore.siblings) node.inert = inert;
+      if (restore.active?.isConnected) restore.active.focus({ preventScroll: true });
+    }
+  }
+  function sessionPanel() {
+    const backdrop = element("div", "m-sheet-backdrop"); backdrop.id = "relay-session-sheet"; backdrop.hidden = true;
+    const panel = element("section", "m-sheet"); panel.setAttribute("role", "dialog"); panel.setAttribute("aria-modal", "true"); panel.setAttribute("aria-labelledby", "relay-session-title");
+    const header = element("header", "m-sheet-title"); const title = element("h2", "", "세션 선택"); title.id = "relay-session-title";
+    const close = element("button", "m-icon-button", "×"); close.type = "button"; close.setAttribute("aria-label", "세션 선택 닫기"); close.addEventListener("click", closeSessionSheet);
+    const list = element("div", "m-sheet-content"); list.id = "relay-session-list";
+    header.append(title, close); panel.append(header, list); backdrop.append(panel); bindSheet(backdrop, closeSessionSheet); return backdrop;
+  }
+  function openSessionSheet() {
+    const panel = byId("relay-session-sheet"); if (!panel || !state.selectedWorkspace) return;
+    if (!panel.hidden) { closeSessionSheet(); return; }
+    closeMenu(); renderSessionSheet(); openSheet(panel, byId("term-session-chip"));
+    byId("term-session-chip")?.setAttribute("aria-expanded", "true");
+  }
+  function renderSessionSheet() {
+    const list = byId("relay-session-list"); if (!list) return;
+    list.replaceChildren(); for (const view of state.selectedWorkspace?.sessions || []) list.append(sessionRow(view, state.selectedWorkspace, true));
+  }
+  function closeSessionSheet() {
+    const panel = byId("relay-session-sheet"); if (panel) hideSheet(panel);
+    byId("term-session-chip")?.setAttribute("aria-expanded", "false");
+  }
+  function syncLocalBottom() {
+    const viewport = byId("relay-viewport"), bottom = byId("relay-bottom");
+    if (viewport && bottom) bottom.hidden = !state.watching || viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight < 2;
   }
 
   // ── 터미널 화면 ──────────────────────────────────────────────────────────────────
@@ -779,7 +879,8 @@ export function createShell({ endpoint, socketFactory, identityStore = {loadOrCr
       const openable = watchable(workspace);
       const current = openable.find((view) => view.id === state.watching);
       chip.textContent = String(current?.title ?? "세션");
-      chip.disabled = openable.length < 2;
+      chip.disabled = openable.length === 0;
+      renderSessionSheet();
     }
   }
 
@@ -787,7 +888,7 @@ export function createShell({ endpoint, socketFactory, identityStore = {loadOrCr
     const terminal = byId("relay-terminal");
     const home = byId("relay-home");
     if (!terminal || !home || !state.terminal) return;
-    closeMenu();
+    closeMenu(); closeSessionSheet();
     state.selectedWorkspace = workspace;
     home.hidden = true;
     terminal.hidden = false;
@@ -808,13 +909,6 @@ export function createShell({ endpoint, socketFactory, identityStore = {loadOrCr
     await sendMessage({ type: "watch", session: view.id }).catch(() => undefined);
   }
 
-  async function cycleSession() {
-    const openable = watchable(state.selectedWorkspace);
-    if (openable.length < 2) return;
-    const index = openable.findIndex((view) => view.id === state.watching);
-    await watchSession(openable[(index + 1) % openable.length]);
-  }
-
   async function startWatching(session, label) {
     // 카드 밖에서 세션 id로 곧장 여는 경로(테스트·알림 딥링크). 그 세션이 속한 워크스페이스를 찾는다.
     const workspace = state.workspaces.find((candidate) =>
@@ -828,7 +922,7 @@ export function createShell({ endpoint, socketFactory, identityStore = {loadOrCr
   /// 터미널 화면을 닫고 목록으로. 뒤로 가기(popstate)로 왔으면 히스토리는 이미 소비됐다.
   async function stopWatching({ fromHistory }) {
     if (state.watching === null) return;
-    closeMenu();
+    closeMenu(); closeSessionSheet();
     const watched = state.watching;
     state.watching = null;
     state.terminal?.unwatch();
@@ -863,6 +957,7 @@ export function createShell({ endpoint, socketFactory, identityStore = {loadOrCr
     }
     // 다른 세션의 잔여 프레임은 렌더러가 스스로 버린다.
     state.terminal?.applyViewport(message);
+    syncLocalBottom();
   }
 
   async function activate() {
@@ -1228,7 +1323,7 @@ export function createShell({ endpoint, socketFactory, identityStore = {loadOrCr
 const PREFS_KEY = "deppy-relay-shell:prefs";
 
 function loadPrefs() {
-  const prefs = { fontSizePx: TERMINAL_FONT_DEFAULT_PX, fitWidth: true, readableWrap: false };
+  const prefs = { fontSizePx: TERMINAL_FONT_DEFAULT_PX, fitWidth: false, readableWrap: false };
   try {
     const raw = globalThis.localStorage?.getItem(PREFS_KEY);
     const stored = raw ? JSON.parse(raw) : null;

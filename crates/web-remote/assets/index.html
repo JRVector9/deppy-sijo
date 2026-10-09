@@ -22,7 +22,7 @@
   <main id="dashboard-shell" class="app m-screen">
     <header class="brand m-topbar">
       <div class="m-brand">
-        <h1 class="m-brand-title">시조새</h1>
+        <h1 class="m-brand-title">워크스페이스</h1>
         <p id="status-text" class="m-brand-subtitle">연결 중…</p>
       </div>
       <div class="m-topbar-actions">
@@ -62,6 +62,7 @@
       <p id="approvals-empty" class="empty">대기 중인 승인이 없습니다.</p>
     </section>
 
+    <label class="m-workspace-search"><span aria-hidden="true">⌕</span><input id="workspace-search" type="search" placeholder="워크스페이스 또는 세션 검색" aria-label="워크스페이스 또는 세션 검색" autocomplete="off"></label>
     <section class="panel workspace-panel" aria-labelledby="sessions-title">
       <h2 id="sessions-title" class="sr-only" tabindex="-1">워크스페이스</h2>
       <ul id="sessions" class="sessions"></ul>
@@ -82,13 +83,16 @@
         </p>
       </div>
       <div class="viewer-actions">
-        <button id="viewer-session-chip" class="m-term-chip" type="button" aria-label="다음 세션으로 전환">세션</button>
+        <button id="viewer-session-chip" class="m-term-chip" type="button" aria-label="세션 선택" aria-haspopup="dialog" aria-expanded="false" aria-controls="viewer-session-sheet">세션</button>
         <button id="viewer-menu-button" class="m-icon-button small" type="button"
                 aria-label="터미널 메뉴" aria-expanded="false" aria-controls="viewer-menu"
                 aria-keyshortcuts="Control+Shift+M">⋯</button>
       </div>
     </header>
-    <div id="viewer-menu" class="m-menu viewer-menu" hidden>
+    <div id="viewer-menu" class="m-sheet-backdrop" hidden>
+      <section class="m-sheet viewer-menu" role="dialog" aria-modal="true" aria-labelledby="viewer-settings-title" tabindex="-1">
+        <header class="m-sheet-title"><h2 id="viewer-settings-title">터미널 설정</h2><button id="viewer-menu-close" class="m-icon-button" type="button" aria-label="설정 닫기">×</button></header>
+        <div class="m-sheet-content">
       <div class="m-menu-section"><span class="label">연결 상태</span><span id="viewer-menu-status" class="value">연결 중</span></div>
       <div class="viewer-font-controls">
         <div class="m-menu-row"><span>글자 크기</span><output id="viewer-font-size" class="mono">15px</output></div>
@@ -123,12 +127,20 @@
       <p id="viewer-resize-status" class="viewer-resize-status" role="status">원격 터미널 크기를 그대로 표시합니다.</p>
       <button id="viewer-menu-keys" class="m-menu-button" type="button">터미널 특수키</button>
       <button id="viewer-menu-approvals" class="m-menu-button" type="button" disabled>승인 대기</button>
+            </div>
+      </section>
+    </div>
+    <div id="viewer-session-sheet" class="m-sheet-backdrop" hidden>
+      <section class="m-sheet" role="dialog" aria-modal="true" aria-labelledby="viewer-session-sheet-title" tabindex="-1">
+        <header class="m-sheet-title"><div><h2 id="viewer-session-sheet-title">세션 선택</h2><p id="viewer-session-workspace"></p></div><button id="viewer-session-close" class="m-icon-button" type="button" aria-label="세션 선택 닫기">×</button></header>
+        <ul id="viewer-session-list" class="m-sheet-content ws-sessions"></ul>
+      </section>
     </div>
     <div id="viewer-stage" class="viewer-stage">
       <div class="viewer-wrap"><canvas id="viewer-canvas" aria-label="원격 터미널 화면"></canvas></div>
       <div id="viewer-scroll-note" class="viewer-scroll-note" hidden>
         <span id="viewer-offset-text"></span>
-        <button id="viewer-bottom" type="button">현재 화면으로</button>
+        <button id="viewer-bottom" type="button">↓ 맨 아래로</button>
       </div>
       <div id="viewer-connection-overlay" class="viewer-overlay" aria-hidden="true" hidden>
         <strong id="viewer-overlay-title">연결 중</strong>
@@ -139,48 +151,23 @@
     </div>
     <footer class="viewer-controls">
       <p id="composer-note" class="composer-note" hidden></p>
-      <div class="viewer-input-modes" role="group" aria-label="입력 방식">
-        <button id="viewer-mode-direct" type="button" aria-pressed="true">터미널</button>
-        <button id="viewer-mode-composer" type="button" aria-pressed="false">작성</button>
-      </div>
-      <div id="direct-controls" class="direct-controls">
-        <div class="direct-accessories" role="group" aria-label="터미널 보조 키">
-          <button id="direct-ctrl" type="button" aria-pressed="false">Ctrl</button>
-          <button id="direct-alt" type="button" aria-pressed="false">Alt</button>
-          <button type="button" data-direct-key="esc">Esc</button>
-          <button type="button" data-direct-key="tab">Tab</button>
-          <button type="button" data-direct-key="left">←</button>
-          <button type="button" data-direct-key="up">↑</button>
-          <button type="button" data-direct-key="down">↓</button>
-          <button type="button" data-direct-key="right">→</button>
-          <button type="button" data-direct-key="backspace">⌫</button>
-          <button type="button" data-direct-key="enter">Enter</button>
-        </div>
-        <textarea id="direct-text" rows="1" aria-label="터미널에 직접 입력"
-                  aria-describedby="direct-focus-help"
-                  autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false"
-                  enterkeyhint="enter"></textarea>
-        <p id="direct-focus-help" class="direct-focus-help">Ctrl+Shift+M: 입력에서 나와 메뉴로 이동</p>
-      </div>
-      <div id="viewer-quick-actions" class="viewer-keys" role="group" aria-label="터미널 특수키" hidden>
-        <button type="button" data-key="esc">Esc</button>
-        <button type="button" data-key="tab">Tab</button>
-        <button type="button" data-key="up">↑</button>
-        <button type="button" data-key="down">↓</button>
-        <button type="button" data-key="left">←</button>
-        <button type="button" data-key="right">→</button>
-        <button type="button" data-key="ctrl_c">Ctrl‑C</button>
-        <button type="button" data-key="ctrl_d">Ctrl‑D</button>
+      <div id="viewer-quick-actions" class="viewer-keys" role="group" aria-label="터미널 보조 키" hidden>
+        <button id="direct-ctrl" type="button" aria-pressed="false">Ctrl</button>
+        <button id="direct-alt" type="button" aria-pressed="false">Alt</button>
+        <button type="button" data-key="esc">Esc</button><button type="button" data-key="tab">Tab</button>
+        <button type="button" data-key="up">↑</button><button type="button" data-key="down">↓</button>
+        <button type="button" data-key="left">←</button><button type="button" data-key="right">→</button>
+        <button type="button" data-key="ctrl_c">Ctrl-C</button><button type="button" data-key="ctrl_d">Ctrl-D</button>
         <button type="button" data-key="enter">Enter</button>
       </div>
-      <div class="composer m-composer" hidden>
-        <input id="composer-file" type="file" hidden
-               accept="image/png,image/jpeg,image/gif,image/webp,image/heic,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,.md">
+      <p id="input-keys-help" class="input-keys-help" hidden>보조 키만 즉시 전송합니다. 작성 중인 초안은 유지됩니다. Ctrl/Alt를 켠 다음 영문 키를 누르면 해당 키만 전송합니다.</p>
+      <div class="composer m-composer">
+        <input id="composer-file" type="file" hidden accept="image/png,image/jpeg,image/gif,image/webp,image/heic,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,.md">
         <button id="composer-attach" type="button" class="composer-attach" aria-label="파일 첨부">+</button>
-        <button id="viewer-quick-button" type="button" class="composer-quick" aria-label="터미널 특수키">/</button>
-        <textarea id="composer-text" rows="1" placeholder="메시지 입력…"
-                  aria-label="터미널에 보낼 메시지"
-                  autocapitalize="off" autocorrect="off" spellcheck="false"></textarea>
+        <div class="unified-inputbox">
+          <textarea id="composer-text" rows="1" placeholder="터미널에 입력…" aria-label="터미널에 입력" aria-describedby="input-keys-help" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="enter"></textarea>
+          <button id="viewer-quick-button" type="button" class="composer-quick" aria-label="터미널 보조 키 펼치기" aria-expanded="false" aria-controls="viewer-quick-actions">⌘</button>
+        </div>
         <button id="composer-send" type="button" aria-label="전송">↵</button>
       </div>
     </footer>

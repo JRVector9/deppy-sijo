@@ -860,3 +860,45 @@
   color: var(--m-muted);
   font-size: 12px;
 }
+
+/* Approved full-width mobile session rows and bottom panels. */
+.m-workspace-search { display: flex; align-items: center; gap: 8px; margin: 0 16px 14px; min-height: 44px; padding: 0 10px; border: 1px solid #383838; border-radius: 9px; background: #111; color: #bcbcbc; }
+.m-workspace-search input { width: 100%; min-width: 0; height: 44px; border: 0; background: transparent; color: var(--m-text); font: inherit; font-size: 16px; outline: 0; }
+.m-workspace-search input::placeholder { color: #b3b3b3; }
+.m-session-row { display: flex; align-items: center; gap: 10px; width: 100%; min-height: 76px; padding: 13px 16px; border: 0; border-bottom: 1px solid #232323; border-radius: 0; background: #080808; color: var(--m-text); font: inherit; text-align: left; cursor: pointer; }
+.m-session-row:hover { background: #191919; }
+.m-session-row:disabled { color: var(--m-muted); cursor: default; }
+.session-name { display: flex; flex: 1; flex-direction: column; min-width: 0; }
+.m-session-row .title { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; font-size: 14px; line-height: 20px; font-weight: 500; }
+.session-meta { display: block; margin-top: 5px; color: var(--m-muted); font-size: 12px; line-height: 17px; }
+.session-meta .agent { font-size: 12px; }
+.session-dot { flex: none; width: 7px; height: 7px; border-radius: 50%; background: #898989; }
+.session-dot.running, .session-dot.done { background: var(--m-green); }
+.session-dot.waiting, .session-dot.needs_approval { background: var(--m-amber); }
+.session-dot.error { background: var(--m-red); }
+.session-status.running { color: var(--m-green); }
+.session-status.waiting, .session-status.needs_approval { color: var(--m-amber); }
+.row-arrow { flex: none; font-size: 20px; color: #aaa; }
+.m-session-row[aria-current="true"] .row-arrow { color: var(--m-green); }
+.m-sheet-backdrop { position: absolute; inset: 0; z-index: 40; display: flex; align-items: flex-end; background: #0008; }
+.m-sheet-backdrop[hidden] { display: none !important; }
+.m-sheet { display: flex; flex-direction: column; width: 100%; max-height: 80%; min-height: 0; padding-bottom: max(8px, env(safe-area-inset-bottom)); border-top: 1px solid #494949; border-radius: 15px 15px 0 0; background: #141414; color: var(--m-text); overflow: hidden; }
+.m-sheet-title { display: flex; flex: none; align-items: center; gap: 12px; padding: 10px 12px 8px 16px; border-bottom: 1px solid #333; }
+.m-sheet-title h2, .m-sheet-title > div { flex: 1; margin: 0; font-size: 16px; line-height: 22px; font-weight: 650; }
+.m-sheet-title p { margin-top: 3px; color: var(--m-muted); font-size: 12px; font-weight: 400; }
+.m-sheet-title .m-icon-button { width: 44px; height: 44px; border: 0; background: transparent; font-size: 22px; }
+.m-sheet-content { min-height: 0; overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; }
+.m-sheet-content .m-session-row { background: transparent; }
+.m-sheet-content .m-menu-button, .m-sheet-content .m-menu-toggle { min-height: 56px; margin: 0; padding: 14px 16px; border: 0; border-bottom: 1px solid #303030; border-radius: 0; background: transparent; font-size: 14px; }
+.m-sheet-content .m-menu-steps button { min-width: 44px; min-height: 44px; font-size: 15px; }
+.m-sheet-content .m-menu-section { margin: 0; padding: 14px 16px; border-bottom: 1px solid #303030; border-radius: 0; background: transparent; font-size: 12px; }
+.m-sheet-content .m-menu-section > span.label + span.value { margin-left: 8px; }
+.m-term-chip { position: relative; display: block; flex: none; height: 44px; min-width: 0; max-width: calc(var(--viewer-width, var(--relay-width, 100vw)) * .42); padding: 0 26px 0 9px; border-radius: 9px; font-size: 12px; }
+.m-term-chip::after { content: "⌄"; position: absolute; top: 50%; right: 9px; width: 12px; transform: translateY(-50%); color: var(--m-text); text-align: center; pointer-events: none; }
+button, input, textarea { touch-action: manipulation; }
+button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px solid var(--m-blue); outline-offset: 2px; }
+.unified-inputbox textarea:focus-visible { outline: 0; }
+
+/* Fixed-size Relay cells keep their native width available for horizontal pan. */
+.m-term-grid { max-width: none; }
+.m-term-grid.fit, .m-term-grid.wrap { max-width: 100%; }

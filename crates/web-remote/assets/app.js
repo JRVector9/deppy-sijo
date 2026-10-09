@@ -80,7 +80,6 @@
   const viewerQuickActions = document.getElementById('viewer-quick-actions');
   const viewerMenuStatus = document.getElementById('viewer-menu-status');
   const viewerMenu = document.getElementById('viewer-menu');
-  const viewerHeader = document.querySelector('.viewer-header');
   const viewerStage = document.getElementById('viewer-stage');
   const viewerFontSmaller = document.getElementById('viewer-font-smaller');
   const viewerFontLarger = document.getElementById('viewer-font-larger');
@@ -115,7 +114,49 @@
   }
 
   const closeDashboardMenu = attachMenu('dashboard-menu-button', 'dashboard-menu');
-  const closeViewerMenu = attachMenu('viewer-menu-button', 'viewer-menu');
+  const sheetClosers = [];
+  function attachSheet(buttonId, panelId, closeId) {
+    const trigger = document.getElementById(buttonId);
+    const panel = document.getElementById(panelId);
+    const dialog = panel.querySelector('[role="dialog"]');
+    let restoreFocus = null;
+    let restoreInert = [];
+    const close = (restore = true) => {
+      if (panel.hidden) return;
+      panel.hidden = true;
+      trigger.setAttribute('aria-expanded', 'false');
+      for (const [element, inert] of restoreInert) element.inert = inert;
+      restoreInert = [];
+      if (restore && restoreFocus?.isConnected) restoreFocus.focus({ preventScroll: true });
+    };
+    const open = () => {
+      for (const closer of sheetClosers) closer(false);
+      restoreFocus = trigger;
+      document.activeElement?.blur?.();
+      restoreInert = Array.from(panel.parentElement.children).filter(child => child !== panel)
+        .map(child => [child, child.inert]);
+      for (const [element] of restoreInert) element.inert = true;
+      panel.hidden = false;
+      trigger.setAttribute('aria-expanded', 'true');
+      document.getElementById(closeId).focus({ preventScroll: true });
+    };
+    trigger.addEventListener('click', () => panel.hidden ? open() : close());
+    document.getElementById(closeId).addEventListener('click', () => close());
+    panel.addEventListener('click', event => { if (event.target === panel) close(); });
+    panel.addEventListener('keydown', event => {
+      if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); close(); }
+      if (event.key !== 'Tab') return;
+      const focusable = Array.from(dialog.querySelectorAll('button,input,[tabindex="0"]'))
+        .filter(element => !element.disabled && !element.hidden && element.getClientRects().length);
+      const first = focusable[0], last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+    });
+    sheetClosers.push(close);
+    return close;
+  }
+  const closeViewerMenu = attachSheet('viewer-menu-button', 'viewer-menu', 'viewer-menu-close');
+  const closeSessionSheet = attachSheet('viewer-session-chip', 'viewer-session-sheet', 'viewer-session-close');
   function showApprovals() {
     approvalPanel.hidden = !approvalPanel.hidden;
     closeDashboardMenu();
@@ -131,6 +172,8 @@
   function toggleQuickActions() {
     const previousWrapHeight = viewer.wrap.clientHeight;
     viewerQuickActions.hidden = !viewerQuickActions.hidden;
+    document.getElementById('input-keys-help').hidden = viewerQuickActions.hidden;
+    document.getElementById('viewer-quick-button').setAttribute('aria-expanded', String(!viewerQuickActions.hidden));
     closeViewerMenu();
     scheduleViewerRenderForLayoutChange(previousWrapHeight);
   }
@@ -359,7 +402,7 @@
           retireResizeControl();
           retireHistory();
           stopAllKeyRepeats();
-          resetDirectInput();
+          resetInputContext();
         }
         inputBlocked = closing;
         for (const button of viewer.keys) button.disabled = closing;
@@ -371,8 +414,9 @@
           retireResizeControl();
           retireHistory();
           stopAllKeyRepeats();
-          resetDirectInput();
+          resetInputContext();
           cancelActiveUpload();
+          cancelWorkspaceSelection();
           for (const sessionId of Array.from(recentSentBySession.keys())) {
             restoreDraft(
               sessionId === viewer.watching
@@ -390,7 +434,7 @@
       // 컨트롤/작성기 높이 상한은 이 셸만의 것이다(시청 전용 셸에는 컨트롤이 없다).
       viewportSynced: (width, height) => {
         const controlsMaxHeightPx = Math.max(88, Math.floor(height * 0.45)) + 'px';
-        const composerMaxHeightPx = height <= 500 ? '66px' : '130px';
+        const composerMaxHeightPx = '132px';
         if (viewer.el.style.getPropertyValue('--viewer-controls-max-height')
             !== controlsMaxHeightPx) {
           viewer.el.style.setProperty('--viewer-controls-max-height', controlsMaxHeightPx);
@@ -406,17 +450,21 @@
         positionViewerMenu();
         refreshMobileResizeLayout(metrics);
       },
+      historyRowsChanged: queueDesiredHistoryRows,
+      historyNavigate: navigateHistory,
       pan: queueScroll,
       resetPan: resetScroll,
       searchChanged: syncViewerSearch,
       readingChanged: handleReadingChanged,
       resumeHistory: () => sendHistoryRequest('reset', 0),
       beforeOpen: () => {
+        closeViewerMenu(false);
+        closeSessionSheet(false);
         retireResizeControl();
         retireHistory();
         resizeLayout = null;
         stopAllKeyRepeats();
-        resetDirectInput();
+        resetInputContext();
         preserveComposerDraftForTransition();
         cancelActiveUpload();
         cancelPendingUploadSelection();
@@ -428,9 +476,10 @@
       },
       afterOpen: () => updateComposerEnabled(),
       beforeRequestClose: () => {
+        cancelWorkspaceSelection();
         retireResizeControl();
         retireHistory();
-        resetDirectInput();
+        resetInputContext();
         cancelActiveUpload();
         cancelPendingUploadSelection();
       },
@@ -447,8 +496,11 @@
         retireResizeControl();
         retireHistory();
         resizeLayout = null;
-        closeViewerMenu();
+        closeViewerMenu(false);
+        closeSessionSheet(false);
         viewerQuickActions.hidden = true;
+        document.getElementById('input-keys-help').hidden = true;
+        document.getElementById('viewer-quick-button').setAttribute('aria-expanded', 'false');
         composerRecoveryWarningSession = null;
         composerSession = null;
         composerText.value = '';
@@ -662,11 +714,7 @@
   // reading without changing its metrics or receiving a server frame.
   viewer.wrap.addEventListener('scroll', reevaluateResizeReading);
 
-  function positionViewerMenu(height = viewer.el.clientHeight) {
-    const top = viewerHeader.offsetHeight + 4;
-    viewerMenu.style.setProperty('--viewer-menu-top', top + 'px');
-    viewerMenu.style.setProperty('--viewer-menu-max-height', Math.max(1, height - top - 8) + 'px');
-  }
+  function positionViewerMenu() { /* Sheets follow the visualViewport-sized viewer. */ }
 
   function syncViewerReadabilityControls() {
     const { fontSize, overview, readableWrap } = viewer.settings();
@@ -750,24 +798,25 @@
     viewerTitle.textContent = workspace?.name || '워크스페이스';
     viewerSessionChip.textContent = session?.title || '세션';
     const available = (workspace?.sessions || []).filter((item) => item.id && !item.exited);
-    viewerSessionChip.disabled = available.length < 2;
+    viewerSessionChip.disabled = available.length === 0;
+    renderSessionSheet(workspace);
   }
 
-  function openViewer(sessionId, title) {
+  function openViewer(sessionId, title, fromWorkspaceSelection = false) {
+    if (!fromWorkspaceSelection) cancelWorkspaceSelection();
     const opened = openCoreViewer(sessionId, title);
     if (opened) updateViewerHeading(sessionId);
     return opened;
   }
 
-  viewerSessionChip.addEventListener('click', () => {
-    const workspace = lastWorkspaces.find((item) =>
-      (item.sessions || []).some((session) => session.id === viewer.watching));
-    const available = (workspace?.sessions || []).filter((item) => item.id && !item.exited);
-    if (available.length < 2) return;
-    const current = available.findIndex((session) => session.id === viewer.watching);
-    const next = available[(current + 1) % available.length];
-    openViewer(next.id, next.title || '세션');
-  });
+  function renderSessionSheet(workspace) {
+    const list = document.getElementById('viewer-session-list');
+    document.getElementById('viewer-session-workspace').textContent = workspace?.name || '';
+    const focusedSession = list.contains(document.activeElement) ? document.activeElement.dataset.sessionId : null;
+    list.replaceChildren();
+    for (const session of workspace?.sessions || []) list.appendChild(sessionRow(session, workspace, true));
+    if (focusedSession) list.querySelector(`[data-session-id="${CSS.escape(focusedSession)}"]`)?.focus({ preventScroll: true });
+  }
 
   // ── 스크롤백 열람 — 코어가 해석한 팬 제스처를 줄 단위 delta로 바꿔 보낸다 (양수 = 과거로).
   // 60ms마다 표시 중인 기록 위치에서 이동한다. 소켓별 요청과 표시 anchor는
@@ -783,6 +832,37 @@
   const HISTORY_REQUEST_MAX = 0xffffffff;
   const HISTORY_TIMEOUT_MS = 5000;
   const HISTORY_DELTA_CAP = 100000;
+  let desiredHistoryRows = 0;
+  let requestedHistoryRows = 0; // Last correlated successful rows request, never a sent-only request.
+  let layoutHistoryAttempts = 0;
+  let layoutRetryFollow = false;
+  let historyRowsTimer = null;
+  let desiredHistoryTarget = null;
+
+  function queueDesiredHistoryRows(rows) {
+    if (!Number.isFinite(rows)) return;
+    const nextRows = Math.max(1, Math.min(256, Math.trunc(rows)));
+    if (nextRows !== desiredHistoryRows) layoutHistoryAttempts = 0;
+    desiredHistoryRows = nextRows;
+    desiredHistoryTarget = { socket: ws, session: viewer.watching, epoch: historyEpoch };
+    clearTimeout(historyRowsTimer);
+    historyRowsTimer = setTimeout(flushDesiredHistoryRows, 100);
+  }
+
+  function flushDesiredHistoryRows() {
+    historyRowsTimer = null;
+    if (!historyTargetCurrent(desiredHistoryTarget) || !historyReady() || !viewer.screen
+        || historyPending || viewer.getHistoryState().expired || !desiredHistoryRows || desiredHistoryRows === requestedHistoryRows
+        || layoutHistoryAttempts >= 2) return;
+    sendHistoryRequest('layout', 0, desiredHistoryRows, 'layout');
+  }
+
+  function navigateHistory({ delta, rows, reason = 'edge' }) {
+    if (!Number.isFinite(delta) || !historyReady()) return;
+    if (historyPending) return; // Core retries an edge once the current correlated window settles.
+    layoutRetryFollow = false;
+    sendHistoryRequest('manual', delta, rows, reason);
+  }
 
   function historyTargetCurrent(target) {
     return !!target && target.socket === ws && target.session === viewer.watching
@@ -798,7 +878,7 @@
       && state.pendingRequest === historyPending.request ? historyPending : null;
     const bottom = document.getElementById('viewer-bottom');
     bottom.disabled = !!(pending && pending.kind === 'reset');
-    bottom.textContent = bottom.disabled ? '현재 화면 확인 중…' : '현재 화면으로';
+    bottom.textContent = bottom.disabled ? '현재 화면 확인 중…' : '↓ 맨 아래로';
     viewerReadingStatus.textContent = historyNotice || (pending
       ? (pending.kind === 'reset' ? '현재 화면을 확인 중입니다…' : '기록을 불러오는 중입니다…')
       : state.expired ? '불러온 기록이 만료되었습니다. 현재 화면으로 돌아갈 수 있습니다.'
@@ -820,21 +900,40 @@
       viewer.cancelHistoryWindow(previous.request);
     }
     syncHistoryUi();
+    if (note && previous?.kind === 'layout' && historyTargetCurrent(previous)) {
+      queueMicrotask(() => { if (!historyRowsTimer) flushDesiredHistoryRows(); });
+    }
   }
 
   function retireHistory() {
     cancelHistoryRequest();
     historyEpoch++;
+    clearTimeout(historyRowsTimer);
+    historyRowsTimer = null;
+    desiredHistoryTarget = null;
+    desiredHistoryRows = requestedHistoryRows = layoutHistoryAttempts = 0;
+    layoutRetryFollow = false;
     viewerCopyStatus.textContent = '';
   }
 
   function handleReadingChanged(state) {
+    // A user gesture can stop following while the automatic request is still
+    // pending. Revoke its retry intent; request cancellation after an error has
+    // pendingRequest=null and may retain the original one-retry live intent.
+    if (historyPending?.kind === 'layout' && historyTargetCurrent(historyPending)
+        && state.pendingRequest === historyPending.request && state.followingLive === false) {
+      layoutRetryFollow = false;
+    }
+    let completed = false;
     if (historyPending && state.pendingRequest !== historyPending.request) {
       const matchedSuccess = historyCompleting && historyCompleting.context === historyPending && historyCompleting.success;
+      if (matchedSuccess && historyPending.rows) requestedHistoryRows = historyPending.rows;
       clearHistoryPending(!matchedSuccess); // Keep an unsent gesture increment after its earlier ACK.
+      completed = true;
     }
     syncHistoryUi(state);
     reevaluateResizeReading();
+    if (completed) queueMicrotask(() => { if (!historyRowsTimer) flushDesiredHistoryRows(); });
   }
 
   function handleHistoryError(msg) {
@@ -850,7 +949,7 @@
     cancelHistoryRequest(notes[msg.reason] || '기록 요청을 완료하지 못했습니다. 다시 요청하세요.');
   }
 
-  function sendHistoryRequest(kind, increment) {
+  function sendHistoryRequest(kind, increment, rows = desiredHistoryRows || viewer.getDesiredHistoryRows?.(), reason = kind) {
     if (!historyReady()) return false;
     const socket = ws;
     const previous = historyPending;
@@ -858,7 +957,10 @@
     const state = viewer.getHistoryState();
     const anchor = wave ? wave.anchor : typeof state.generation === 'string' && typeof state.firstLine === 'string'
       ? { generation: state.generation, first_line: state.firstLine } : null;
-    const delta = kind === 'reset' ? 0 : Math.max(-HISTORY_DELTA_CAP, Math.min(HISTORY_DELTA_CAP, (wave?.delta || 0) + increment));
+    if (kind === 'layout' && layoutHistoryAttempts === 0) layoutRetryFollow = viewer.followingLive;
+    const follow = kind === 'reset' || (kind === 'layout' && (viewer.followingLive || layoutRetryFollow));
+    const boundedRows = Number.isFinite(rows) ? Math.max(1, Math.min(256, Math.trunc(rows))) : undefined;
+    const delta = follow ? 0 : Math.max(-HISTORY_DELTA_CAP, Math.min(HISTORY_DELTA_CAP, (wave?.delta || 0) + increment));
     const sequence = historyRequests.get(socket) || 0;
     if (sequence >= HISTORY_REQUEST_MAX) {
       disconnect(); setViewerConnection('connecting'); connect();
@@ -868,19 +970,22 @@
     }
     const request = sequence + 1;
     historyRequests.set(socket, request);
-    const context = { socket, session: viewer.watching, epoch: historyEpoch, request, kind, anchor, delta,
+    if (kind === 'layout') layoutHistoryAttempts++;
+    if (kind === 'reset') layoutHistoryAttempts = 0;
+    const context = { socket, session: viewer.watching, epoch: historyEpoch, request, kind, anchor, delta, rows: boundedRows,
       deadline: wave ? wave.deadline : Date.now() + HISTORY_TIMEOUT_MS, timer: null };
     if (previous) clearTimeout(previous.timer);
     historyPending = context;
     historyNotice = '';
-    const message = { type: 'scroll', session: context.session, delta, request, reset: kind === 'reset' };
-    if (kind === 'manual' && anchor) message.anchor = anchor;
+    const message = { type: 'scroll', session: context.session, delta, request, reset: follow };
+    if (boundedRows) message.rows = boundedRows;
+    if (!follow && anchor) message.anchor = anchor;
     try { socket.send(JSON.stringify(message)); } catch (_) {
       historyPending = previous;
       cancelHistoryRequest('연결이 바뀌어 기록을 요청하지 못했습니다. 다시 요청하세요.');
       return false;
     }
-    if (!viewer.expectHistoryWindow(request)) {
+    if (!viewer.expectHistoryWindow(request, { reason, rows: boundedRows, preservePosition: kind !== 'reset', follow })) {
       cancelHistoryRequest('기록 요청을 확인하지 못했습니다. 다시 요청하세요.');
       return false;
     }
@@ -893,6 +998,7 @@
   }
 
   function queueScroll(lines) {
+    layoutRetryFollow = false;
     if (!historyReady() || !Number.isFinite(lines)) return;
     scrollAcc = Math.max(-HISTORY_DELTA_CAP, Math.min(HISTORY_DELTA_CAP, scrollAcc + lines));
     if (scrollTimer) return;
@@ -925,14 +1031,9 @@
   document.getElementById('viewer-bottom').addEventListener('click', resumeCurrent);
   window.addEventListener('pagehide', retireHistory);
 
-  function sendKey(key, target = directTarget()) {
-    if (!remoteInputReady()) return;
-    if (inputMode === 'direct') {
-      const ctrl = key === 'ctrl_c' || key === 'ctrl_d';
-      sendDirectKey(ctrl ? key.slice(-1) : key, { ctrl }, target);
-      return;
-    }
-    if (send({ type: 'key', session: viewer.watching, key })) resumeCurrent();
+  function sendKey(key, target = inputTarget()) {
+    const ctrl = key === 'ctrl_c' || key === 'ctrl_d';
+    return sendInputKey(ctrl ? key.slice(-1) : key, { ctrl }, target);
   }
 
   // ── composer (P6b) — 자유 입력. 행동 계약:
@@ -940,29 +1041,18 @@
   //   2) 전송 시점에 target을 캡처한다 — 전송 중 세션이 바뀌어도 캡처된 세션으로만 간다.
   //   3) 전송 실패(WS 미연결)면 draft를 비우지 않는다.
   //   4) 큐 압박(InputPressure) 중에는 전송을 막고 배지로 알린다.
-  const composerText = document.getElementById('composer-text');
+  let composerText = document.getElementById('composer-text');
   const composerSend = document.getElementById('composer-send');
   const composerNote = document.getElementById('composer-note');
   const composerAttach = document.getElementById('composer-attach');
   const composerFile = document.getElementById('composer-file');
   const composer = document.querySelector('.composer');
-  let directText = document.getElementById('direct-text');
-  const directControls = document.getElementById('direct-controls');
-  const directButtons = Array.from(directControls.querySelectorAll('button'));
   const directCtrl = document.getElementById('direct-ctrl');
   const directAlt = document.getElementById('direct-alt');
-  const modeDirect = document.getElementById('viewer-mode-direct');
-  const modeComposer = document.getElementById('viewer-mode-composer');
-  const INPUT_MODE_KEY = 'deppy.inputMode';
-  let inputMode = 'direct';
-  try { if (localStorage.getItem(INPUT_MODE_KEY) === 'composer') inputMode = 'composer'; } catch (_) {}
-  const DIRECT_CONTEXT = '\u200b';
-  let directGeneration = 0;
-  let directComposition = null;
-  let pendingDirectComposition = null;
-  let directCompositionTimer = null;
-  let directEditGuard = null;
-  let directEditGuardTimer = null;
+  let inputGeneration = 0;
+  let inputComposition = null;
+  let compositionSettling = false;
+  let compositionTimer = null;
   let directCtrlArmed = false;
   let directAltArmed = false;
   let inputBlocked = false;
@@ -1025,9 +1115,7 @@
 
   function preserveComposerDraftForTransition() {
     if (!composerSession) return;
-    const outgoing = lastSessions.find((session) => session.id === composerSession);
-    if (outgoing && outgoing.exited) discardSessionDraft(composerSession);
-    else saveComposerDraft();
+    saveComposerDraft();
   }
 
   function loadComposerDraft(sessionId) {
@@ -1122,8 +1210,8 @@
     const previousWrapHeight = viewer.wrap.clientHeight;
     composerText.style.height = 'auto';
     // 최대 5행 — 그 이상은 내부 스크롤
-    const max = 5 * 22 + 16;
-    composerText.style.height = Math.min(composerText.scrollHeight, max) + 'px';
+    const max = 5 * 22 + 22;
+    composerText.style.height = Math.max(44, Math.min(composerText.scrollHeight, max)) + 'px';
     scheduleViewerRenderForLayoutChange(previousWrapHeight);
   }
 
@@ -1146,6 +1234,8 @@
 
   function remoteInputReady() {
     return !!viewer.watching
+      && !!ws && ws.readyState === WebSocket.OPEN
+      && composerSession === viewer.watching
       && !viewer.closing
       && !document.hidden
       && viewer.connection === 'connected'
@@ -1156,14 +1246,10 @@
 
   function updateComposerEnabled() {
     const ready = remoteInputReady();
-    if (!ready && (directComposition || pendingDirectComposition || directCtrlArmed || directAltArmed)) {
-      resetDirectInput();
-    }
-    composerSend.disabled = !ready || inputMode !== 'composer';
-    composerText.disabled = !ready || inputMode !== 'composer';
-    composerAttach.disabled = !ready || inputMode !== 'composer' || uploadBusy;
-    directText.disabled = !ready || inputMode !== 'direct';
-    for (const button of directButtons) button.disabled = !ready || inputMode !== 'direct';
+    if (!ready && (inputComposition || compositionSettling || directCtrlArmed || directAltArmed)) resetInputContext();
+    composerSend.disabled = !ready || !composerText.value || !!inputComposition || compositionSettling;
+    composerText.disabled = !ready;
+    composerAttach.disabled = !ready || uploadBusy;
     for (const button of viewer.keys) button.disabled = !ready;
     syncResizeControl();
   }
@@ -1171,8 +1257,8 @@
   function sendComposer() {
     // (2) 전송 시점 target 캡처 — 이후 전환돼도 이 세션으로만 간다.
     const target = viewer.watching;
-    if (!target || !remoteInputReady() || inputMode !== 'composer') return;
-    const text = composerText.value;
+    if (!target || !remoteInputReady() || inputComposition || compositionSettling) return;
+    const text = composerText.value.normalize('NFC');
     if (!text) return;
     const inputMessage = { type: 'input', session: target, text, submit: true };
     const serializedInput = JSON.stringify(inputMessage);
@@ -1195,7 +1281,9 @@
     composerRecoveryWarningSession = null;
     setComposerNote('');
     composerText.value = '';
+    saveComposerDraft();
     autoGrow();
+    updateComposerEnabled();
   }
 
   /// 큐 거부로 유실된 입력을 composer로 되돌린다(사용자가 재타이핑하지 않게).
@@ -1269,7 +1357,8 @@
       case 'admission_denied':
         // Mode refresh can transiently deny an operation without entering the PTY queue.
         // Preserve a separate queue_full lock, and keep interrupts available otherwise.
-        setComposerNote('터미널 상태를 갱신 중이라 입력이 전달되지 않았습니다 — 다시 입력하세요');
+        if (!restoreDraft('터미널 상태를 갱신 중이라 입력이 전달되지 않았습니다. 초안을 복원했습니다.', msg.session))
+          setComposerNote('터미널 상태를 갱신 중이라 입력이 전달되지 않았습니다 — 다시 입력하세요');
         break;
       default:
         inputBlocked = queued > 0;
@@ -1364,12 +1453,13 @@
       // 기존 입력에 이어 붙인다(신뢰경계: value 대입만 — innerHTML 아님). 사용자가 문맥과
       // 함께 전송한다(데스크톱 이미지 paste와 동일 종단 — 에이전트가 경로를 읽는다).
       const separator = composerText.value && !/\s$/.test(composerText.value) ? '\n' : '';
-      const nextComposerValue = composerText.value + separator + result.path + ' ';
+      const nextComposerValue = composerText.value + separator + result.path.normalize('NFC') + ' ';
       if (nextComposerValue.length > MAX_DRAFT_CHARS) {
         setComposerNote('입력이 너무 길어 업로드 경로를 추가하지 않았습니다');
         return;
       }
       composerText.value = nextComposerValue;
+      saveComposerDraft();
       autoGrow();
       setComposerNote('');
     } catch (error) {
@@ -1408,390 +1498,160 @@
     beginSelectedUpload(uploadSession, file);
   });
 
-  function resetDirectText() {
-    // Soft keyboards need an editable character to produce Backspace on an idle field.
-    directText.value = DIRECT_CONTEXT;
-    directText.setSelectionRange(1, 1);
-  }
-
-  function clearDirectEditGuard() {
-    clearTimeout(directEditGuardTimer);
-    directEditGuardTimer = null;
-    directEditGuard = null;
-  }
-
-  function guardDirectEdit(kind, text = '') {
-    clearDirectEditGuard();
-    directEditGuard = { kind, text };
-    directEditGuardTimer = setTimeout(clearDirectEditGuard, 0);
-  }
-
-  function resetDirectModifiers() {
+  function resetInputModifiers() {
     directCtrlArmed = false;
     directAltArmed = false;
     directCtrl.setAttribute('aria-pressed', 'false');
     directAlt.setAttribute('aria-pressed', 'false');
   }
 
-  function resetDirectInput() {
-    directGeneration++;
-    clearTimeout(directCompositionTimer);
-    directCompositionTimer = null;
-    directComposition = null;
-    pendingDirectComposition = null;
-    clearDirectEditGuard();
-    resetDirectModifiers();
-    // Retire the native IME target as well as timers. Late browser input from its old
-    // composition must never become a new session/mode/connection's terminal input.
-    const freshInput = directText.cloneNode(false);
-    directText.replaceWith(freshInput);
-    directText = freshInput;
-    resetDirectText();
+  function resetInputContext() {
+    inputGeneration++;
+    clearTimeout(compositionTimer);
+    inputComposition = null;
+    compositionSettling = false;
+    resetInputModifiers();
+    // Keep the buffered value but retire the native IME element. Late events belong
+    // to the detached input and cannot append to a different session's draft.
+    const replacement = composerText.cloneNode(false);
+    replacement.value = composerText.value;
+    composerText.replaceWith(replacement);
+    composerText = replacement;
   }
 
-  function directTarget() {
-    return { session: viewer.watching, socket: ws, element: directText, generation: directGeneration,
+  function inputTarget() {
+    return { session: viewer.watching, socket: ws, element: composerText, generation: inputGeneration,
       ctrl: directCtrlArmed, alt: directAltArmed };
   }
 
-  function directTargetReady(target) {
-    return inputMode === 'direct' && target.session === viewer.watching
-      && target.socket === ws && target.generation === directGeneration
-      && target.element === directText
-      && !!ws && ws.readyState === WebSocket.OPEN && remoteInputReady();
+  function inputTargetReady(target) {
+    return target.session === viewer.watching && target.socket === ws
+      && target.generation === inputGeneration && target.element === composerText && remoteInputReady();
   }
 
-  function sendDirectText(text, paste = false, target = directTarget()) {
-    if (!text || !directTargetReady(target)) return false;
-    if (!paste && (target.ctrl || target.alt)) {
-      return sendDirectKey(text, { ctrl: target.ctrl, alt: target.alt }, target);
-    }
-    const serialized = JSON.stringify({ type: 'direct_input', session: target.session, text, paste });
-    if (utf8Encoder.encode(text).byteLength > MAX_INPUT_BYTES
-        || utf8Encoder.encode(serialized).byteLength > MAX_INPUT_FRAME_BYTES) {
-      setComposerNote('입력이 너무 큽니다 (256KB 초과)');
-      return false;
-    }
-    if (paste) resetDirectModifiers();
-    const sent = sendSerialized(serialized);
-    if (sent) resumeCurrent();
-    else setComposerNote('직접 입력을 보내지 못했습니다. 연결을 확인하고 다시 입력하세요.');
-    return sent;
-  }
-
-  function flushDirectComposition(end = directText.value.length, preserveText = false) {
-    const pending = pendingDirectComposition;
-    if (!pending) return;
-    clearTimeout(directCompositionTimer);
-    directCompositionTimer = null;
-    pendingDirectComposition = null;
-    const value = directText.value;
-    const suffix = pending.suffix && value.endsWith(pending.suffix) ? pending.suffix.length : 0;
-    const text = value.slice(pending.start, Math.max(pending.start, Math.min(end, value.length - suffix)));
-    if (text) sendDirectText(text, false, pending.target);
-    if (!preserveText && !directComposition) {
-      resetDirectText();
-      guardDirectEdit('composition', text);
-    }
-  }
-
-  function sendDirectKey(key, modifiers = {}, target = directTarget()) {
-    if (!directTargetReady(target)) return false;
-    const ctrl = !!(modifiers.ctrl || target.ctrl);
-    const alt = !!(modifiers.alt || target.alt);
-    const shift = !!modifiers.shift;
+  function sendInputKey(key, modifiers = {}, target = inputTarget()) {
+    if (!inputTargetReady(target)) return false;
+    const ctrl = !!(modifiers.ctrl || target.ctrl), alt = !!(modifiers.alt || target.alt);
     const interrupt = (key === 'esc' && !ctrl) || (ctrl && /^[cCdD]$/.test(key));
-    if (interrupt && (directComposition || pendingDirectComposition)) {
-      resetDirectInput();
-      target = directTarget();
-      directText.focus({ preventScroll: true });
-    } else flushDirectComposition();
-    if (directComposition || !directTargetReady(target)) return false;
+    if (inputComposition || compositionSettling) {
+      if (!interrupt) {
+        setComposerNote('한글 조합을 마친 뒤 보조 키를 다시 누르세요. 초안은 전송되지 않습니다.');
+        return false;
+      }
+      // An explicit interrupt retires the IME target, preserves its buffered DOM
+      // value, and sends only the key. A late composition event cannot submit it.
+      resetInputContext();
+      target = inputTarget();
+      saveComposerDraft();
+      autoGrow();
+      composerText.focus({ preventScroll: true });
+      updateComposerEnabled();
+    }
     const ascii = key.length === 1 && /^[\x20-\x7e]$/.test(key);
     const named = ['enter', 'backspace', 'tab', 'esc', 'up', 'down', 'left', 'right',
       'home', 'end', 'delete', 'insert', 'page_up', 'page_down'].includes(key);
     const validCtrlAscii = /^[a-zA-Z @2\[3\\4\]5^6_7?8]$/.test(key);
     if ((!named && !(ascii && (ctrl || alt))) || (ascii && ctrl && !validCtrlAscii)
         || (ctrl && ['enter', 'tab', 'esc'].includes(key))) {
-      resetDirectModifiers();
+      resetInputModifiers();
       setComposerNote('지원하지 않는 Ctrl/Alt 키 조합입니다');
       return false;
     }
-    resetDirectModifiers();
-    const sent = send({ type: 'direct_key', session: target.session, key, ctrl, alt, shift, meta: false });
-    if (sent) resumeCurrent();
+    resetInputModifiers();
+    const sent = send({ type: 'direct_key', session: target.session, key, ctrl, alt,
+      shift: !!modifiers.shift, meta: false });
+    if (sent) {
+      resumeCurrent();
+      if (composerText.value) setComposerNote('보조 키만 전송했습니다. 작성 중인 초안은 유지됩니다.');
+    }
     return sent;
   }
 
-  function applyInputMode() {
-    const previousWrapHeight = viewer.wrap.clientHeight;
-    const direct = inputMode === 'direct';
-    directControls.hidden = !direct;
-    composer.hidden = direct;
-    modeDirect.setAttribute('aria-pressed', String(direct));
-    modeComposer.setAttribute('aria-pressed', String(!direct));
-    updateComposerEnabled();
-    if (!direct) autoGrow();
-    scheduleViewerRenderForLayoutChange(previousWrapHeight);
-  }
-
-  function setInputMode(mode) {
-    if (inputMode !== mode) {
-      saveComposerDraft();
-      resetDirectInput();
-      stopAllKeyRepeats();
-      inputMode = mode;
-      try { localStorage.setItem(INPUT_MODE_KEY, mode); } catch (_) {}
-      applyInputMode();
-    }
-    if (remoteInputReady()) (mode === 'direct' ? directText : composerText).focus({ preventScroll: true });
-  }
-
-  modeDirect.addEventListener('click', () => setInputMode('direct'));
-  modeComposer.addEventListener('click', () => setInputMode('composer'));
   for (const [button, modifier] of [[directCtrl, 'ctrl'], [directAlt, 'alt']]) {
+    button.addEventListener('pointerdown', event => event.preventDefault());
     button.addEventListener('click', () => {
-      if (!directTargetReady(directTarget())) return;
+      if (!remoteInputReady() || inputComposition || compositionSettling) return;
       if (modifier === 'ctrl') directCtrlArmed = !directCtrlArmed;
       else directAltArmed = !directAltArmed;
       button.setAttribute('aria-pressed', String(modifier === 'ctrl' ? directCtrlArmed : directAltArmed));
-      directText.focus({ preventScroll: true });
+      composerText.focus({ preventScroll: true });
     });
   }
-  for (const button of directButtons) button.addEventListener('pointerdown', (event) => event.preventDefault());
 
-  const DIRECT_KEY_NAMES = { Enter: 'enter', Backspace: 'backspace', Tab: 'tab', Escape: 'esc',
-    ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right', Home: 'home', End: 'end',
-    Delete: 'delete', Insert: 'insert', PageUp: 'page_up', PageDown: 'page_down' };
-  const DIRECT_EDIT_KEYS = { deleteContentBackward: 'backspace', deleteContentForward: 'delete',
-    insertLineBreak: 'enter', insertParagraph: 'enter' };
-  function matchingDirectEdit(event) {
-    const guard = directEditGuard;
-    return guard && (guard.kind === DIRECT_EDIT_KEYS[event.inputType]
-      || (guard.kind === 'paste' && event.inputType === 'insertFromPaste')
-      || (guard.kind === 'text' && event.inputType === 'insertText' && event.data === guard.text)
-      || (guard.kind === 'composition' && event.inputType === 'insertCompositionText' && event.data === guard.text));
+  function onBufferedInput(type, handler) {
+    composer.addEventListener(type, event => { if (event.target === composerText) handler(event); }, true);
   }
-
-  function onDirectInput(type, handler) {
-    directControls.addEventListener(type, (event) => {
-      if (event.target === directText) handler(event);
-    }, true);
-  }
-
-  onDirectInput('keydown', (event) => {
+  onBufferedInput('compositionstart', () => {
+    if (!remoteInputReady()) return;
+    clearTimeout(compositionTimer);
+    compositionSettling = false;
+    inputComposition = inputTarget();
+    updateComposerEnabled();
+  });
+  onBufferedInput('compositionend', () => {
+    if (!inputComposition) return;
+    const target = inputComposition;
+    inputComposition = null;
+    compositionSettling = true;
+    compositionTimer = setTimeout(() => {
+      if (!inputTargetReady(target)) return;
+      compositionSettling = false;
+      saveComposerDraft();
+      autoGrow();
+      updateComposerEnabled();
+    }, 0);
+  });
+  onBufferedInput('input', () => {
+    if (composerRecoveryWarningSession) { composerRecoveryWarningSession = null; setComposerNote(''); }
+    saveComposerDraft();
+    autoGrow();
+    updateComposerEnabled();
+  });
+  onBufferedInput('keydown', event => {
+    if (event.isComposing || event.keyCode === 229 || inputComposition || compositionSettling) return;
     if (event.ctrlKey && event.shiftKey && !event.altKey && !event.metaKey
         && (event.key.toLowerCase() === 'm' || event.code === 'KeyM')) {
       event.preventDefault();
-      stopAllKeyRepeats();
-      resetDirectInput();
       document.getElementById('viewer-menu-button').focus({ preventScroll: true });
-      return;
-    }
-    clearDirectEditGuard();
-    if (event.isComposing || event.keyCode === 229 || directComposition) return;
-    if (event.metaKey || event.getModifierState('AltGraph')
-        || (event.ctrlKey && event.key.toLowerCase() === 'v')) return;
-    const key = DIRECT_KEY_NAMES[event.key];
-    if (key || ((event.ctrlKey || event.altKey) && event.key.length === 1)) {
+    } else if (event.key === 'Enter' && !event.shiftKey) {
       event.preventDefault();
-      sendDirectKey(key || event.key, { ctrl: event.ctrlKey, alt: event.altKey, shift: event.shiftKey });
-      if (['enter', 'backspace', 'delete'].includes(key)) guardDirectEdit(key);
-      else if (!key) guardDirectEdit('text', event.key);
-    } else flushDirectComposition();
-  });
-  onDirectInput('compositionstart', () => {
-    if (!directTargetReady(directTarget())) return;
-    const start = directText.selectionStart;
-    flushDirectComposition(start, true);
-    clearDirectEditGuard();
-    directComposition = { target: directTarget(), start,
-      suffix: directText.value.slice(directText.selectionEnd), implicit: false };
-  });
-  onDirectInput('compositionend', () => {
-    if (!directComposition) return;
-    pendingDirectComposition = directComposition;
-    directComposition = null;
-    // Read the settled DOM range: Korean consonants can move into the next syllable.
-    directCompositionTimer = setTimeout(() => flushDirectComposition(), 0);
-  });
-  onDirectInput('beforeinput', (event) => {
-    if (!directTargetReady(directTarget())) {
-      event.preventDefault();
-      return;
-    }
-    if (directComposition || event.isComposing) return;
-    if (matchingDirectEdit(event)) {
-      event.preventDefault();
-      return;
-    }
-    clearDirectEditGuard();
-    const key = DIRECT_EDIT_KEYS[event.inputType];
-    if (key && event.cancelable) {
-      event.preventDefault();
-      sendDirectKey(key);
-      guardDirectEdit(key);
-    } else if (event.inputType === 'insertFromPaste' && event.data !== null && event.cancelable) {
-      event.preventDefault();
-      flushDirectComposition();
-      sendDirectText(event.data, true);
-      resetDirectText();
-      guardDirectEdit('paste');
-    }
-  });
-  onDirectInput('input', (event) => {
-    if (!directTargetReady(directTarget())) {
-      resetDirectText();
-      return;
-    }
-    if (event.isComposing) {
-      if (!directComposition) directComposition = { target: directTarget(),
-        start: directText.value.startsWith(DIRECT_CONTEXT) ? 1 : 0, suffix: '', implicit: true };
-      return;
-    }
-    if (directComposition) {
-      if (directComposition.implicit) {
-        pendingDirectComposition = directComposition;
-        directComposition = null;
-        flushDirectComposition();
-      }
-      return;
-    }
-    if (pendingDirectComposition) return;
-    if (matchingDirectEdit(event)) {
-      resetDirectText();
-      return;
-    }
-    const key = DIRECT_EDIT_KEYS[event.inputType];
-    if (key) sendDirectKey(key);
-    else {
-      const value = directText.value;
-      sendDirectText(value.startsWith(DIRECT_CONTEXT) ? value.slice(1) : value, event.inputType === 'insertFromPaste');
-    }
-    resetDirectText();
-  });
-  onDirectInput('paste', (event) => {
-    if (!event.clipboardData) return; // beforeinput/input provide the browser paste fallback.
-    event.preventDefault();
-    if (!directTargetReady(directTarget())) return;
-    flushDirectComposition();
-    const text = event.clipboardData.getData('text/plain');
-    if (directComposition) resetDirectInput();
-    sendDirectText(text, true);
-    resetDirectText();
-    guardDirectEdit('paste');
-  });
-  onDirectInput('focus', () => {
-    if (!directComposition) directText.setSelectionRange(directText.value.length, directText.value.length);
-  });
-  onDirectInput('click', () => {
-    if (!directComposition) directText.setSelectionRange(directText.value.length, directText.value.length);
-  });
-  window.addEventListener('pagehide', resetDirectInput);
-  resetDirectInput();
-  applyInputMode();
-
-  composerText.addEventListener('input', () => {
-    if (composerRecoveryWarningSession) {
-      composerRecoveryWarningSession = null;
-      setComposerNote('');
-    }
-    autoGrow();
-  });
-  composerText.addEventListener('keydown', (e) => {
-    // 모바일: Enter는 줄바꿈(오전송 방지). 데스크톱 브라우저: Cmd/Ctrl-Enter로 전송.
-    // IME 조합 중(한글 등)에는 전송하지 않는다 — 미확정 텍스트가 나간다 (리뷰 P3-5).
-    if (e.isComposing || e.keyCode === 229) return;
-    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
-      e.preventDefault();
       sendComposer();
+    } else if (!event.metaKey && !event.getModifierState('AltGraph') && event.key.length === 1
+        && (directCtrlArmed || directAltArmed)) {
+      event.preventDefault();
+      sendInputKey(event.key);
     }
   });
+  // Soft-keyboard beforeinput line breaks remain editable newlines; only explicit
+  // Enter keydown and the send button submit the buffered value.
+  composerSend.addEventListener('pointerdown', event => event.preventDefault());
   composerSend.addEventListener('click', sendComposer);
+  window.addEventListener('pagehide', resetInputContext);
 
-  // 특수키 행 — 누르는 즉시 전송(composer 미경유). 화살표는 길게 눌러 반복.
-  for (const btn of document.querySelectorAll('.viewer-keys button, .direct-accessories button[data-direct-key]')) {
-    const key = btn.dataset.key || btn.dataset.directKey;
-    let repeatTarget = null;
-    const sendButtonKey = () => {
-      if (btn.dataset.directKey) sendDirectKey(key, {}, repeatTarget || directTarget());
-      else sendKey(key, repeatTarget || directTarget());
-    };
-    let repeatTimer = null;
-    let repeatInterval = null;
-    let repeated = false;
-    let pointerActive = false;
-    const stopRepeat = () => {
-      clearTimeout(repeatTimer);
-      clearInterval(repeatInterval);
-      repeatTimer = null;
-      repeatInterval = null;
-    };
-    keyRepeatCancels.push(() => {
-      repeated = repeated || pointerActive || !!repeatTarget;
-      pointerActive = false;
-      repeatTarget = null;
-      stopRepeat();
+  for (const btn of document.querySelectorAll('.viewer-keys button[data-key]')) {
+    const key = btn.dataset.key;
+    let repeatTarget = null, repeatTimer = null, repeatInterval = null, repeated = false;
+    const stopRepeat = () => { clearTimeout(repeatTimer); clearInterval(repeatInterval); repeatTimer = repeatInterval = null; };
+    keyRepeatCancels.push(() => { repeated = repeated || !!repeatTarget; repeatTarget = null; stopRepeat(); });
+    btn.addEventListener('pointerdown', event => {
+      event.preventDefault();
+      repeatTarget = inputTarget();
+      repeated = false;
+      if (['up', 'down', 'left', 'right'].includes(key)) {
+        stopRepeat();
+        repeatTimer = setTimeout(() => { repeatInterval = setInterval(() => {
+          repeated = true; sendKey(key, repeatTarget);
+        }, 120); }, 400);
+      }
     });
-    // 반복이 발화했으면 뒤따르는 click을 무시한다 — 아니면 목표에서 한 칸 오버슛한다
-    // (claude 메뉴 ↑↓ 선택이 핵심 사용례라 치명적, 리뷰 P3-4).
+    btn.addEventListener('pointerup', stopRepeat);
+    for (const name of ['pointerleave', 'pointercancel']) btn.addEventListener(name, () => {
+      repeated = true; repeatTarget = null; stopRepeat();
+    });
     btn.addEventListener('click', () => {
-      if (repeated) {
-        repeated = false;
-        repeatTarget = null;
-        return;
-      }
-      sendButtonKey();
-      repeatTarget = null;
+      if (!repeated) sendKey(key, repeatTarget || inputTarget());
+      repeated = false; repeatTarget = null;
     });
-    if (key === 'esc' || key === 'ctrl_c' || key === 'ctrl_d') {
-      btn.addEventListener('pointerdown', (event) => {
-        if (inputMode !== 'direct') return;
-        // Interrupt intent starts at press-down: blur or an already pending IME
-        // timer must not commit a candidate while the user holds this button.
-        event.preventDefault();
-        if (!directTargetReady(directTarget())) return;
-        if (directComposition || pendingDirectComposition) {
-          resetDirectInput();
-          directText.focus({ preventScroll: true });
-        }
-        repeatTarget = directTarget();
-        pointerActive = true;
-        repeated = false;
-      });
-      btn.addEventListener('pointerup', () => { pointerActive = false; });
-      btn.addEventListener('pointercancel', () => {
-        repeated = repeated || pointerActive || !!repeatTarget;
-        pointerActive = false;
-        repeatTarget = null;
-      });
-    }
-    if (key === 'up' || key === 'down' || key === 'left' || key === 'right') {
-      const startRepeat = () => {
-        repeatTarget = directTarget();
-        pointerActive = true;
-        stopRepeat();
-        repeated = false;
-        repeatTimer = setTimeout(() => {
-          repeatInterval = setInterval(() => {
-            repeated = true;
-            sendButtonKey();
-          }, 120);
-        }, 400);
-      };
-      btn.addEventListener('pointerdown', startRepeat);
-      btn.addEventListener('pointerup', () => {
-        pointerActive = false;
-        stopRepeat();
-      });
-      for (const eventName of ['pointerleave', 'pointercancel']) {
-        btn.addEventListener(eventName, () => {
-          pointerActive = false;
-          stopRepeat();
-          repeated = false;
-        });
-      }
-    }
   }
 
   function renderApprovals(pending) {
@@ -1973,166 +1833,162 @@
     }, 6000);
   }
 
-  // 워크스페이스별 세션 목록. 활성 워크스페이스의 세션만 id가 있어 시청/입력이 가능하고,
-  // 대기/절전은 표시 전용이다(세션 id가 worker-로컬이라 다른 워크스페이스 id로 시청하면
-  // 엉뚱한 세션이 잡힌다 — 서버가 id 자체를 안 보낸다). 이름은 데스크톱 활동 패널과 같은
-  // 프로젝트명 규칙으로 서버가 해석해 보낸다.
+  const workspaceExpansions = new Map();
+  let pendingWorkspaceSelection = null;
+  let workspaceSelectionTimer = null;
+  function cancelWorkspaceSelection(note = '') {
+    clearTimeout(workspaceSelectionTimer); workspaceSelectionTimer = null;
+    pendingWorkspaceSelection = null;
+    if (note) showNotice(note);
+  }
+  function selectDormantSession(workspace, session) {
+    cancelWorkspaceSelection();
+    const stable = typeof session.selection_id === 'string' && session.selection_id ? session.selection_id : null;
+    if (stable) {
+      pendingWorkspaceSelection = { socket: ws, workspace: workspace.id, selection: stable };
+      workspaceSelectionTimer = setTimeout(() => cancelWorkspaceSelection('워크스페이스 전환을 확인하지 못했습니다. 세션을 다시 선택하세요.'), 15000);
+    }
+    if (!send({ type: 'switch', workspace: workspace.id })) {
+      cancelWorkspaceSelection('연결이 바뀌어 워크스페이스를 전환하지 못했습니다. 다시 선택하세요.'); return;
+    }
+    showNotice(stable ? 'Mac 워크스페이스도 전환됩니다. 선택한 세션을 준비하고 있습니다.'
+      : 'Mac 워크스페이스가 전환됩니다. 전환 후 세션을 선택하세요.');
+  }
+  function consumeWorkspaceSelection() {
+    const pending = pendingWorkspaceSelection;
+    if (!pending) return;
+    if (pending.socket !== ws || !isCurrentSocket(pending.socket)) { cancelWorkspaceSelection(); return; }
+    const workspace = lastWorkspaces.find(candidate => candidate.id === pending.workspace);
+    if (!workspace) { cancelWorkspaceSelection('선택한 워크스페이스가 없어 세션 전환을 취소했습니다.'); return; }
+    const session = workspace.sessions?.find(candidate => candidate.selection_id === pending.selection);
+    if (!session || session.exited) { cancelWorkspaceSelection('선택한 세션이 없어 전환을 취소했습니다.'); return; }
+    if (workspace.state !== 'active' || !session.id) return;
+    cancelWorkspaceSelection();
+    openViewer(session.id, session.title || '세션', true);
+  }
+  const workspaceSearch = document.getElementById('workspace-search');
+  const searchable = value => String(value || '').normalize('NFC').toLocaleLowerCase();
+  function sessionStatusLabel(session, workspace) {
+    if (session.exited) return '종료';
+    if (workspace.state !== 'active') return workspace.state === 'warm' ? '대기 · 저장된 세션' : '절전 · 저장된 세션';
+    return STATUS_LABEL[session.status] || session.status || '상태 정보 없음';
+  }
+  function matchesSession(session, workspace, query) {
+    return searchable([session.title, session.agent, session.status, sessionStatusLabel(session, workspace)].join(' ')).includes(query);
+  }
+  workspaceSearch.addEventListener('input', () => renderWorkspaceList());
+
   function renderWorkspaces(workspaces, resource) {
     lastWorkspaces = workspaces;
     workspaceCount.textContent = workspaces.length + ' 워크스페이스';
     if (viewer.watching) updateViewerHeading(viewer.watching);
     if (resource) lastResource = resource;
-    lastSessions = workspaces.flatMap((ws) => ws.sessions || []).filter((s) => s.id);
-    for (const session of lastSessions) {
-      if (session.exited) discardSessionDraft(session.id);
-    }
+    lastSessions = workspaces.flatMap(workspace => workspace.sessions || []).filter(session => session.id);
+    consumeWorkspaceSelection();
     const endedSession = viewer.watching;
-    const watched = endedSession
-      ? lastSessions.find((session) => session.id === endedSession)
-      : null;
+    const watched = endedSession ? lastSessions.find(session => session.id === endedSession) : null;
     if (endedSession && (!watched || watched.exited)) {
       queueMicrotask(() => {
         if (viewer.watching !== endedSession) return;
-        requestCloseViewer({
-          rerender: true,
-          notice: '선택한 세션이 종료되었습니다 — 세션 목록으로 돌아왔습니다.',
-          discardDraft: !!(watched && watched.exited),
-        });
+        requestCloseViewer({ rerender: true,
+          notice: '선택한 세션이 종료되었습니다. 작성 중인 초안은 이 세션에 보관했습니다.', discardDraft: false });
       });
     }
-    // 그룹별로 "세션 없음"을 표시하므로, 전역 안내는 워크스페이스가 하나도 없을 때만.
-    sessionsEmpty.hidden = workspaces.length > 0;
-    sessionsEl.textContent = '';
-
-    for (const ws of workspaces) {
-      const group = document.createElement('li');
-      group.className = 'ws-group m-card';
-
-      const head = document.createElement('div');
-      head.className = 'ws-head m-card-body';
-      const open = document.createElement('button');
-      open.type = 'button';
-      open.className = 'ws-open';
-      const name = document.createElement('span');
-      name.className = 'ws-name m-card-name';
-      name.textContent = ws.name || ws.id;
-      open.appendChild(name);
-      const firstSession = (ws.sessions || []).find((session) => session.id && !session.exited);
-      open.disabled = ws.state === 'active' && !firstSession;
-      open.addEventListener('click', () => {
-        if (ws.state === 'active' && firstSession) openViewer(firstSession.id, firstSession.title || '세션');
-        else if (ws.state !== 'active') send({ type: 'switch', workspace: ws.id });
-      });
-      group.addEventListener('click', (event) => {
-        if (!event.target.closest('button, .ws-sessions')) open.click();
-      });
-      head.appendChild(open);
-      if (ws.current_directory) {
-        const path = document.createElement('span');
-        path.className = 'ws-path m-card-path';
-        path.textContent = ws.current_directory;
-        head.appendChild(path);
-      }
-      const state = document.createElement('span');
-      state.className = 'ws-state ' + (ws.state || 'suspended');
-      state.textContent = WORKSPACE_STATE_LABEL[ws.state] || ws.state || '';
-      head.appendChild(state);
-      // 비활성(대기/절전) 워크스페이스는 "이어서 작업" — 데스크탑 active를 이 워크스페이스로
-      // 전환시켜(하드 미러) 폰에서 그대로 이어서 작업한다. 대기는 즉시, 절전은 깨우기.
-      // 낙관적 disable은 하지 않는다 — 성공하면 프레임이 active로 바뀌어 버튼이 사라지고,
-      // 상한 초과로 거부되면 서버 notice 배너가 사유를 알린다(둘 다 재렌더로 자연 반영).
-      if (ws.state && ws.state !== 'active') {
-        const enter = document.createElement('button');
-        enter.type = 'button';
-        enter.className = 'ws-enter';
-        enter.textContent = '이어서 작업';
-        enter.addEventListener('click', () => {
-          send({ type: 'switch', workspace: ws.id });
-        });
-        head.appendChild(enter);
-      }
-      const count = document.createElement('span');
-      count.className = 'm-badge-count';
-      count.textContent = String((ws.sessions || []).length);
-      group.appendChild(head);
-      group.appendChild(count);
-
-      const list = document.createElement('ul');
-      list.className = 'ws-sessions m-chip-row';
-      for (const s of ws.sessions || []) {
-        list.appendChild(sessionRow(s, ws));
-      }
-      if (!(ws.sessions || []).length) {
-        const empty = document.createElement('p');
-        empty.className = 'empty';
-        empty.textContent = '세션 없음';
-        group.appendChild(empty);
-      }
-      group.appendChild(list);
-      sessionsEl.appendChild(group);
+    renderWorkspaceList();
+    if (lastResource) {
+      const cpu = lastResource.cpu != null ? lastResource.cpu.toFixed(0) + '%' : '—';
+      resourceEl.textContent = 'CPU ' + cpu + ' · RAM ' + (lastResource.rss_mb || 0) + 'MB';
     }
-
-    if (resource) {
-      const cpu = resource.cpu != null ? resource.cpu.toFixed(0) + '%' : '—';
-      resourceEl.textContent = 'CPU ' + cpu + ' · RAM ' + (resource.rss_mb || 0) + 'MB';
-    } else {
-      resourceEl.textContent = '';
-    }
-    // 알림 딥링크 대기분이 있으면 목록 도착 시점에 소비한다 (P6c).
     consumePendingWatch(lastSessions);
   }
 
-  function sessionRow(s, ws) {
-    const li = document.createElement('li');
-    li.className = 'session m-chip';
-
-    // 이름 + (있으면) 돌고 있는 에이전트 요약 — 2줄. 둘 다 textContent로만 삽입한다.
-    const nameBox = document.createElement('span');
-    nameBox.className = 'session-name';
-    const title = document.createElement('span');
-    title.className = 'title';
-    title.textContent = s.title || '세션';
-    nameBox.appendChild(title);
-    if (s.agent) {
-      const agent = document.createElement('span');
-      agent.className = 'agent';
-      agent.textContent = s.agent;
-      nameBox.appendChild(agent);
-    }
-    li.appendChild(nameBox);
-
-    // 상태는 활성 워크스페이스만 감지된다(warm/유휴는 감지 워커가 안 돈다).
-    if (s.exited || s.status) {
-      const badge = document.createElement('span');
-      const status = s.exited ? 'done' : s.status;
-      badge.className = 'badge ' + status;
-      badge.textContent = STATUS_LABEL[status] || status;
-      li.appendChild(badge);
-    }
-
-    if (s.id && !s.exited) {
-      const viewBtn = document.createElement('button');
-      viewBtn.type = 'button';
-      viewBtn.className = 'view-btn';
-      viewBtn.dataset.sessionId = s.id;
-      viewBtn.textContent = s.id === viewer.watching ? '보는 중' : '열기';
-      viewBtn.disabled = s.id === viewer.watching;
-      viewBtn.addEventListener('click', () => {
-        openViewer(s.id, s.title || '세션');
-        renderWorkspaces(lastWorkspaces, lastResource); // "보는 중" 배지 갱신
+  function renderWorkspaceList() {
+    const query = searchable(workspaceSearch.value.trim());
+    const focused = sessionsEl.contains(document.activeElement) ? {
+      session: document.activeElement.dataset.sessionId, workspace: document.activeElement.dataset.workspaceId,
+    } : null;
+    const alive = new Set(lastWorkspaces.map(workspace => workspace.id));
+    for (const id of workspaceExpansions.keys()) if (!alive.has(id)) workspaceExpansions.delete(id);
+    sessionsEl.replaceChildren();
+    let matched = 0;
+    for (const workspace of lastWorkspaces) {
+      const groupMatches = searchable([workspace.name, workspace.current_directory].join(' ')).includes(query);
+      const sessions = (workspace.sessions || []).filter(session => !query || groupMatches || matchesSession(session, workspace, query));
+      if (query && !groupMatches && !sessions.length) continue;
+      matched++;
+      const expanded = !!query || (workspaceExpansions.has(workspace.id) ? workspaceExpansions.get(workspace.id) : workspace.state === 'active');
+      const group = document.createElement('li'); group.className = 'ws-group';
+      const head = document.createElement('button'); head.type = 'button'; head.className = 'ws-head';
+      head.dataset.workspaceId = workspace.id; head.setAttribute('aria-expanded', String(expanded));
+      const label = document.createElement('span'); label.className = 'ws-label';
+      const name = document.createElement('strong'); name.className = 'ws-name'; name.textContent = workspace.name || workspace.id;
+      const count = document.createElement('small'); count.textContent = (workspace.sessions || []).length + '개 세션';
+      label.append(name, count);
+      const state = document.createElement('span'); state.className = 'ws-state ' + (workspace.state || 'suspended');
+      state.textContent = workspace.state === 'active' ? '현재' : WORKSPACE_STATE_LABEL[workspace.state] || '절전';
+      const chevron = document.createElement('span'); chevron.className = 'ws-chevron'; chevron.textContent = expanded ? '⌄' : '›'; chevron.setAttribute('aria-hidden', 'true');
+      head.append(label, state, chevron);
+      head.addEventListener('click', () => {
+        workspaceExpansions.set(workspace.id, !expanded); renderWorkspaceList();
       });
-      li.appendChild(viewBtn);
-      li.addEventListener('click', (event) => {
-        if (!event.target.closest('button')) viewBtn.click();
-      });
-    } else if (!s.id) {
-      // 표시 전용 — 이 워크스페이스로 전환해야 볼 수 있다.
-      const note = document.createElement('span');
-      note.className = 'view-note';
-      note.textContent = ws.state === 'warm' ? '대기' : '절전';
-      li.appendChild(note);
+      group.append(head);
+      const body = document.createElement('div'); body.hidden = !expanded;
+      if (workspace.current_directory) {
+        const path = document.createElement('p'); path.className = 'ws-path'; path.textContent = workspace.current_directory; body.append(path);
+      }
+      const list = document.createElement('ul'); list.className = 'ws-sessions';
+      for (const session of sessions) list.append(sessionRow(session, workspace));
+      body.append(list);
+      if (!sessions.length) {
+        const empty = document.createElement('p'); empty.className = 'workspace-note'; empty.textContent = '세션 없음'; body.append(empty);
+      }
+      if (workspace.state !== 'active') {
+        const note = document.createElement('p'); note.className = 'workspace-note';
+        note.textContent = '세션을 누르면 Mac 워크스페이스도 전환됩니다.'; body.append(note);
+      }
+      group.append(body); sessionsEl.append(group);
     }
-    return li;
+    sessionsEmpty.hidden = matched > 0;
+    sessionsEmpty.textContent = query ? '검색 결과가 없습니다.' : '연결할 워크스페이스가 없습니다.';
+    if (focused?.session) sessionsEl.querySelector(`[data-session-id="${CSS.escape(focused.session)}"]`)?.focus({ preventScroll: true });
+    else if (focused?.workspace) sessionsEl.querySelector(`[data-workspace-id="${CSS.escape(focused.workspace)}"]`)?.focus({ preventScroll: true });
+  }
+
+  function sessionRow(session, workspace, inSheet = false) {
+    const item = document.createElement('li');
+    const row = document.createElement('button'); row.type = 'button'; row.className = 'session view-btn m-session-row';
+    if (session.id) row.dataset.sessionId = session.id;
+    if (session.selection_id) row.dataset.selectionId = session.selection_id;
+    const dormant = workspace.state !== 'active';
+    const status = session.exited ? 'done' : dormant ? 'dormant' : session.status || 'idle';
+    const dot = document.createElement('span'); dot.className = 'session-dot ' + status; dot.setAttribute('aria-hidden', 'true');
+    const nameBox = document.createElement('span'); nameBox.className = 'session-name';
+    const title = document.createElement('strong'); title.className = 'title'; title.textContent = session.title || '세션';
+    const meta = document.createElement('span'); meta.className = 'session-meta';
+    const agent = document.createElement('span'); agent.className = 'agent'; agent.textContent = session.agent || '터미널';
+    const badge = document.createElement('span'); badge.className = 'session-status ' + status; badge.textContent = sessionStatusLabel(session, workspace);
+    meta.append(badge, document.createTextNode(' · '), agent); nameBox.append(title, meta);
+    const arrow = document.createElement('span'); arrow.className = 'row-arrow'; arrow.setAttribute('aria-hidden', 'true');
+    arrow.textContent = session.id === viewer.watching ? '✓' : '›';
+    if (session.id === viewer.watching) row.setAttribute('aria-current', 'true');
+    row.disabled = !!session.exited || (!dormant && !session.id);
+    row.append(dot, nameBox, arrow);
+    row.addEventListener('click', () => {
+      const freshWorkspace = lastWorkspaces.find(candidate => candidate.id === workspace.id);
+      if (!freshWorkspace) return;
+      if (freshWorkspace.state !== 'active') {
+        workspaceExpansions.set(workspace.id, true);
+        selectDormantSession(freshWorkspace, session);
+        return;
+      }
+      const fresh = freshWorkspace.sessions?.find(candidate => candidate.id === session.id);
+      if (!fresh?.id || fresh.exited) return;
+      if (inSheet) closeSessionSheet(false);
+      if (fresh.id !== viewer.watching) openViewer(fresh.id, fresh.title || '세션');
+      else if (inSheet) viewerSessionChip.focus({ preventScroll: true });
+      renderWorkspaceList();
+    });
+    item.append(row); return item;
   }
 
   // P3: iOS 설치 안내 — iOS Safari이고 아직 설치(standalone) 전일 때만 노출. 닫으면 억제한다.

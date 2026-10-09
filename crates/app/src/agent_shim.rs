@@ -104,6 +104,31 @@ fn observer_settings(command: &str, grok: bool) -> serde_json::Value {
     serde_json::json!({"hooks":hooks})
 }
 
+fn codex_hook_args(hooks_dir: &std::path::Path) -> String {
+    const EVENTS: &[&str] = &[
+        "SessionStart",
+        "PermissionRequest",
+        "UserPromptSubmit",
+        "PreToolUse",
+        "PostToolUse",
+        "Interrupt",
+        "SubagentStart",
+        "SubagentStop",
+        "Stop",
+        "SessionEnd",
+    ];
+    let command = hooks_dir
+        .join("deppy-hook-observe.sh")
+        .display()
+        .to_string();
+    let mut args = String::from("--enable hooks --dangerously-bypass-hook-trust");
+    for event in EVENTS {
+        args.push_str(&format!(
+            " -c 'hooks.{event}=[{{hooks=[{{type=\"command\",command='\\''{command}'\\'',timeout=10}}]}}]'"));
+    }
+    args
+}
+
 /// shim/hook 스크립트/claude 설정을 (재)생성한다. 매 시작 호출 — idempotent.
 pub fn install(db_path: &std::path::Path, proxy_bin: &str) -> anyhow::Result<()> {
     let Some(root) = root() else { return Ok(()) };
@@ -122,13 +147,22 @@ pub fn install(db_path: &std::path::Path, proxy_bin: &str) -> anyhow::Result<()>
     // (스크립트명, proxy --event 값)
     const EVENTS: &[(&str, &str)] = &[
         ("observe", "observe"),
+        ("kimi-observe", "observe"),
         ("session-start", "session-start"),
         ("needs-input", "needs-input"),
         ("clear", "clear"),
         ("turn-done", "turn-done"),
     ];
     for (name, ev) in EVENTS {
-        let script = format!("#!/bin/sh\nexec {}\n", hook_command(proxy_bin, db_path, ev));
+        let provider = if *name == "kimi-observe" {
+            " --provider kimi"
+        } else {
+            ""
+        };
+        let script = format!(
+            "#!/bin/sh\nexec {}{provider} \"$@\"\n",
+            hook_command(proxy_bin, db_path, ev)
+        );
         write_executable(&hooks.join(format!("deppy-hook-{name}.sh")), &script)?;
     }
     let hook = |name: &str| {
@@ -159,23 +193,7 @@ pub fn install(db_path: &std::path::Path, proxy_bin: &str) -> anyhow::Result<()>
     write_executable(&shims.join("claude"), &claude_shim)?;
 
     // codex shim — cmux와 동일한 per-invocation hook 주입 + bypass(프롬프트 없음).
-    let codex_events: &[(&str, &str, u32)] = &[
-        ("SessionStart", "observe", 10),
-        ("PermissionRequest", "observe", 10),
-        ("UserPromptSubmit", "observe", 10),
-        ("PreToolUse", "observe", 10),
-        ("PostToolUse", "observe", 10),
-        ("Interrupt", "observe", 10),
-        ("Stop", "observe", 10),
-        ("SessionEnd", "observe", 10),
-    ];
-    let mut codex_args = String::from("--enable hooks --dangerously-bypass-hook-trust");
-    for (event, name, timeout) in codex_events {
-        codex_args.push_str(&format!(
-            " -c 'hooks.{event}=[{{hooks=[{{type=\"command\",command='\\''{}'\\'',timeout={timeout}}}]}}]'",
-            hook(name)
-        ));
-    }
+    let codex_args = codex_hook_args(&hooks);
     let codex_shim = format!(
         "{strip}REAL_AGENT=\"${{DEPPY_AGENT_EXECUTABLE:-codex}}\"\nunset DEPPY_AGENT_EXECUTABLE\nexec \"$REAL_AGENT\" {codex_args} \"$@\"\n"
     );
@@ -198,6 +216,11 @@ pub fn install(db_path: &std::path::Path, proxy_bin: &str) -> anyhow::Result<()>
     if let Err(error) = install_kimi_hooks(&hooks) {
         tracing::warn!("kimi hook 설치 실패(다른 에이전트는 정상): {error:#}");
     }
+    if let Some(home) = crate::paths::home_dir()
+        && let Err(error) = update_cursor_hooks(&home.join(".cursor/hooks.json"), &hooks, true)
+    {
+        tracing::warn!("cursor hook 설치 실패: {error:#}");
+    }
     Ok(())
 }
 
@@ -206,6 +229,12 @@ pub fn remove() -> anyhow::Result<()> {
     // 우리 디렉터리를 지우기 **전에** 남의 config에서 우리 흔적을 걷어낸다.
     if let Err(error) = remove_kimi_hooks() {
         tracing::warn!("kimi hook 제거 실패: {error:#}");
+    }
+    if let (Some(home), Some(root)) = (crate::paths::home_dir(), root())
+        && let Err(error) =
+            update_cursor_hooks(&home.join(".cursor/hooks.json"), &root.join("hooks"), false)
+    {
+        tracing::warn!("cursor hook 제거 실패: {error:#}");
     }
     if let Some(home) = crate::paths::home_dir() {
         let file = home.join(".grok/hooks/deppy-status.json");
@@ -227,6 +256,108 @@ fn remove_launch_shims(root: &std::path::Path) -> anyhow::Result<()> {
     // 실행 중인 Claude/Codex는 시작할 때 받은 hook 경로를 계속 호출한다.
     // 설정을 끈 뒤에도 그 프로세스의 요청 해제 이벤트는 받아야 하므로 hooks와
     // Claude 설정 파일은 보존한다. statusline/zdot도 별도 기능의 소유물이다.
+    Ok(())
+}
+
+const CURSOR_EVENTS: &[&str] = &[
+    "sessionStart",
+    "sessionEnd",
+    "beforeSubmitPrompt",
+    "preToolUse",
+    "postToolUse",
+    "postToolUseFailure",
+    "beforeShellExecution",
+    "afterShellExecution",
+    "beforeMCPExecution",
+    "afterMCPExecution",
+    "stop",
+];
+
+fn cursor_observer_command(hooks_dir: &std::path::Path, event: &str) -> String {
+    let script = crate::agent_hooks::sh_quote(
+        &hooks_dir
+            .join("deppy-hook-observe.sh")
+            .display()
+            .to_string(),
+    );
+    let response = if event == "beforeSubmitPrompt" {
+        r#"{"continue":true}"#
+    } else if matches!(
+        event,
+        "preToolUse" | "beforeShellExecution" | "beforeMCPExecution"
+    ) {
+        r#"{"permission":"allow"}"#
+    } else {
+        "{}"
+    };
+    // The observer never makes a policy decision. Consume stdin and return the
+    // neutral schema even when a retained script cannot start its proxy.
+    format!(
+        "if [ -x {script} ]; then {script} --cursor-event {event} >/dev/null 2>&1 || :; fi; cat >/dev/null; printf '%s\\n' '{response}'"
+    )
+}
+
+fn apply_cursor_hooks(
+    mut root: serde_json::Value,
+    hooks_dir: &std::path::Path,
+    install: bool,
+) -> anyhow::Result<serde_json::Value> {
+    anyhow::ensure!(root.is_object(), "cursor_hook_config_not_object");
+    anyhow::ensure!(
+        root.get("version").is_none_or(|v| v.as_u64() == Some(1)),
+        "cursor_hook_config_version_unsupported"
+    );
+    if root.get("hooks").is_none() {
+        root["hooks"] = serde_json::json!({});
+    }
+    let hooks = root["hooks"]
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("cursor_hook_config_hooks_invalid"))?;
+    let owned: std::collections::HashSet<String> = CURSOR_EVENTS
+        .iter()
+        .map(|event| cursor_observer_command(hooks_dir, event))
+        .collect();
+    for value in hooks.values_mut() {
+        let entries = value
+            .as_array_mut()
+            .ok_or_else(|| anyhow::anyhow!("cursor_hook_config_event_invalid"))?;
+        entries.retain(|entry| {
+            !entry
+                .get("command")
+                .and_then(|v| v.as_str())
+                .is_some_and(|c| owned.contains(c))
+        });
+    }
+    if install {
+        for event in CURSOR_EVENTS {
+            let entries = hooks
+                .entry((*event).to_owned())
+                .or_insert_with(|| serde_json::json!([]));
+            entries.as_array_mut().unwrap().push(serde_json::json!({"command":cursor_observer_command(hooks_dir, event),"timeout":10}));
+        }
+        root["version"] = 1.into();
+    }
+    Ok(root)
+}
+
+fn update_cursor_hooks(
+    config: &std::path::Path,
+    hooks_dir: &std::path::Path,
+    install: bool,
+) -> anyhow::Result<()> {
+    use crate::agent_hooks::{HOOK_CONFIG_BYTES_MAX, read_hook_config_bounded, write_atomic};
+    let text = read_hook_config_bounded(config, HOOK_CONFIG_BYTES_MAX)?;
+    let root = match text.as_deref() {
+        Some(text) => serde_json::from_str(text)?,
+        None if install && config.parent().is_some_and(|p| p.is_dir()) => {
+            serde_json::json!({"version":1})
+        }
+        None => return Ok(()),
+    };
+    let updated = apply_cursor_hooks(root.clone(), hooks_dir, install)?;
+    if root != updated {
+        write_atomic(config, &updated)?;
+    }
     Ok(())
 }
 
@@ -291,7 +422,16 @@ fn apply_kimi_hooks(
     install: bool,
 ) -> anyhow::Result<String> {
     let mut doc = text.parse::<toml_edit::DocumentMut>()?;
-    let marker = hooks_dir.display().to_string();
+    let owned: std::collections::HashSet<String> = [
+        "observe",
+        "kimi-observe",
+        "clear",
+        "needs-input",
+        "turn-done",
+    ]
+    .iter()
+    .map(|name| kimi_hook_command(hooks_dir, name))
+    .collect();
     let table = doc
         .entry("hooks")
         .or_insert(toml_edit::Item::ArrayOfTables(Default::default()));
@@ -301,7 +441,7 @@ fn apply_kimi_hooks(
     entries.retain(|t| {
         !t.get("command")
             .and_then(|c| c.as_str())
-            .is_some_and(|c| c.contains(&marker))
+            .is_some_and(|c| owned.contains(c))
     });
     if install {
         for (event, script) in kimi_hook_entries(hooks_dir) {
@@ -321,32 +461,218 @@ fn apply_kimi_hooks(
 
 /// Kimi 이벤트 → deppy hook 스크립트. claude/codex 매핑과 같은 의미로 맞춘다.
 ///
-/// `PermissionRequest`가 claude의 `Notification`(= 사람을 막는 순간)에 해당한다.
-/// `StopFailure`는 넣지 않는다 — 실패로 끝난 턴을 '완료'로 칠하면 오류가 묻힌다.
+/// 요청별 관찰기로 질문·승인·결과·취소를 독립적으로 기록한다.
+/// 이름만 있는 자식 이벤트는 소유권을 추측하지 않아 등록하지 않는다.
 fn kimi_hook_entries(hooks_dir: &std::path::Path) -> Vec<(String, String)> {
     const EVENTS: &[(&str, &str)] = &[
-        ("UserPromptSubmit", "clear"),
-        ("PreToolUse", "clear"),
-        ("PermissionRequest", "needs-input"),
-        ("Stop", "turn-done"),
+        ("SessionStart", "kimi-observe"),
+        ("UserPromptSubmit", "kimi-observe"),
+        ("TurnStarted", "kimi-observe"),
+        ("PreToolUse", "kimi-observe"),
+        ("PostToolUse", "kimi-observe"),
+        ("PostToolUseFailure", "kimi-observe"),
+        ("PermissionRequest", "kimi-observe"),
+        ("PermissionResult", "kimi-observe"),
+        ("Notification", "kimi-observe"),
+        ("Stop", "kimi-observe"),
+        ("StopFailure", "kimi-observe"),
+        ("Interrupt", "kimi-observe"),
+        ("SessionEnd", "kimi-observe"),
     ];
     EVENTS
         .iter()
-        .map(|(event, name)| {
-            let script = hooks_dir.join(format!("deppy-hook-{name}.sh"));
-            let script = script.display();
-            (
-                (*event).to_owned(),
-                format!("if [ -x '{script}' ]; then exec '{script}'; fi"),
-            )
-        })
+        .map(|(event, name)| ((*event).to_owned(), kimi_hook_command(hooks_dir, name)))
         .collect()
+}
+
+fn kimi_hook_command(hooks_dir: &std::path::Path, name: &str) -> String {
+    let script = crate::agent_hooks::sh_quote(
+        &hooks_dir
+            .join(format!("deppy-hook-{name}.sh"))
+            .display()
+            .to_string(),
+    );
+    format!("if [ -x {script} ]; then exec {script}; fi")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_status_harness_cursor_retained_script_with_missing_proxy_is_neutral() {
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-cursor-missing-proxy-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_executable(
+            &dir.join("deppy-hook-observe.sh"),
+            "#!/bin/sh\nexec /nonexistent/deppy-proxy \"$@\"\n",
+        )
+        .unwrap();
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(cursor_observer_command(&dir, "preToolUse"))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let v: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(v["permission"], "allow");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn agent_status_harness_kimi_config_preserves_commands_merely_mentioning_hook_directory() {
+        let text = "[[hooks]]\nevent = \"Stop\"\ncommand = \"printf /fixture/hooks/deppy-hook-observe.sh.audit\"\n";
+        let installed = apply_kimi_hooks(text, Path::new("/fixture/hooks"), true).unwrap();
+        assert!(installed.contains("printf /fixture/hooks/deppy-hook-observe.sh.audit"));
+        let removed = apply_kimi_hooks(&installed, Path::new("/fixture/hooks"), false).unwrap();
+        assert!(removed.contains("printf /fixture/hooks/deppy-hook-observe.sh.audit"));
+    }
+
+    #[test]
+    fn agent_status_harness_cursor_config_preserves_similar_foreign_executables() {
+        let foreign = "/fixture/hooks/deppy-hook-observe.sh.audit";
+        let root = serde_json::json!({"version":1,"hooks":{"stop":[{"command":foreign}]}});
+        let installed = apply_cursor_hooks(root, Path::new("/fixture/hooks"), true).unwrap();
+        assert_eq!(installed["hooks"]["stop"][0]["command"], foreign);
+        let removed = apply_cursor_hooks(installed, Path::new("/fixture/hooks"), false).unwrap();
+        assert_eq!(
+            removed["hooks"]["stop"],
+            serde_json::json!([{"command":foreign}])
+        );
+    }
+
+    #[test]
+    fn agent_status_harness_cursor_config_io_is_bounded_and_preserves_invalid_files() {
+        let dir =
+            std::env::temp_dir().join(format!("deppy-cursor-config-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("hooks.json");
+        let hooks = dir.join("deppy/hooks");
+        std::fs::write(
+            &config,
+            r#"{"version":1,"hooks":{"stop":[{"command":"other"}]}}"#,
+        )
+        .unwrap();
+        update_cursor_hooks(&config, &hooks, true).unwrap();
+        let installed = std::fs::read(&config).unwrap();
+        update_cursor_hooks(&config, &hooks, true).unwrap();
+        assert_eq!(std::fs::read(&config).unwrap(), installed);
+        update_cursor_hooks(&config, &hooks, false).unwrap();
+        let removed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+        assert_eq!(
+            removed["hooks"]["stop"],
+            serde_json::json!([{"command":"other"}])
+        );
+        for invalid in [
+            r#"{"version":2}"#.to_owned(),
+            r#"{"version":1,"hooks":{"stop":{}}}"#.to_owned(),
+            "{".to_owned(),
+            " ".repeat(crate::agent_hooks::HOOK_CONFIG_BYTES_MAX + 1),
+        ] {
+            std::fs::write(&config, &invalid).unwrap();
+            assert!(update_cursor_hooks(&config, &hooks, true).is_err());
+            assert_eq!(std::fs::read_to_string(&config).unwrap(), invalid);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn agent_status_harness_codex_registers_parent_and_owned_child_lifecycles() {
+        let args = codex_hook_args(Path::new("/fixture/hooks"));
+        for event in [
+            "SessionStart",
+            "UserPromptSubmit",
+            "SubagentStart",
+            "SubagentStop",
+            "PermissionRequest",
+            "PostToolUse",
+            "Interrupt",
+            "Stop",
+            "SessionEnd",
+        ] {
+            assert!(args.contains(&format!("hooks.{event}=")), "missing {event}");
+        }
+    }
+
+    #[test]
+    fn agent_status_harness_cursor_missing_script_returns_neutral_valid_json() {
+        for event in CURSOR_EVENTS {
+            let output = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(cursor_observer_command(
+                    Path::new("/nonexistent/deppy/hooks"),
+                    event,
+                ))
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            let v: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            if *event == "beforeSubmitPrompt" {
+                assert_eq!(v["continue"], true);
+            }
+            if matches!(
+                *event,
+                "preToolUse" | "beforeShellExecution" | "beforeMCPExecution"
+            ) {
+                assert_eq!(v["permission"], "allow");
+            }
+        }
+    }
+
+    #[test]
+    fn agent_status_harness_cursor_config_preserves_other_hooks_and_is_idempotent() {
+        let root = serde_json::json!({"version":1,"extra":"preserved","hooks":{
+            "preToolUse":[{"command":"third-party","matcher":"Read"}],
+            "stop":[{"command":cursor_observer_command(Path::new("/fixture/hooks"), "stop")}]
+        }});
+        let path = Path::new("/fixture/hooks");
+        let once = apply_cursor_hooks(root.clone(), path, true).unwrap();
+        assert_eq!(once["hooks"]["preToolUse"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            once["hooks"]["preToolUse"][0],
+            root["hooks"]["preToolUse"][0]
+        );
+        assert_eq!(apply_cursor_hooks(once.clone(), path, true).unwrap(), once);
+        let removed = apply_cursor_hooks(once, path, false).unwrap();
+        assert_eq!(removed["hooks"]["preToolUse"], root["hooks"]["preToolUse"]);
+        assert_eq!(removed["extra"], "preserved");
+        assert!(removed["hooks"]["stop"].as_array().unwrap().is_empty());
+        assert!(apply_cursor_hooks(serde_json::json!({"version":2}), path, true).is_err());
+    }
+
+    #[test]
+    fn agent_status_harness_kimi_installs_request_observer_for_supported_events() {
+        let entries = kimi_hook_entries(Path::new("/fixture/hooks"));
+        for required in [
+            "SessionStart",
+            "TurnStarted",
+            "PreToolUse",
+            "PostToolUse",
+            "PostToolUseFailure",
+            "PermissionRequest",
+            "PermissionResult",
+            "Notification",
+            "Stop",
+            "StopFailure",
+            "Interrupt",
+            "SessionEnd",
+        ] {
+            let (_, command) = entries
+                .iter()
+                .find(|(event, _)| event == required)
+                .unwrap_or_else(|| panic!("missing observer event {required}"));
+            assert!(
+                command.contains("deppy-hook-kimi-observe.sh"),
+                "{required}: legacy flag cannot retain request ownership"
+            );
+        }
+    }
 
     #[test]
     fn 설정을_꺼도_실행중인_세션의_hook과_다른_앱_파일은_보존한다() {
@@ -467,24 +793,14 @@ timeout = 10
             once.contains("/Users/x/.orca/agent-hooks/kimi-hook.sh"),
             "다른 도구가 심은 hook을 지우면 그 도구가 조용히 망가진다"
         );
-        // command 하나가 스크립트를 두 번 언급한다(존재 가드 + exec) — 4항목 × 2.
-        assert_eq!(once.matches("deppy-hook-").count(), 8, "넷을 심는다");
-        for event in [
-            "UserPromptSubmit",
-            "PreToolUse",
-            "PermissionRequest",
-            "Stop",
-        ] {
-            assert!(once.contains(event), "{event} 항목이 빠졌다");
-        }
-        assert!(
-            once.contains("deppy-hook-needs-input.sh"),
-            "사람을 막는 순간(PermissionRequest)이 needs-input으로 가야 히어로 큐에 선다"
+        assert_eq!(
+            once.matches("deppy-hook-").count(),
+            26,
+            "13 observers with existence guards"
         );
-        assert!(
-            !once.contains("StopFailure"),
-            "실패로 끝난 턴을 '완료'로 칠하면 오류가 묻힌다"
-        );
+        assert!(once.contains("deppy-hook-kimi-observe.sh"));
+        assert!(!once.contains("deppy-hook-needs-input.sh"));
+        assert!(once.contains("StopFailure")); // Cancelled, never success.
 
         // 앱은 시작마다 install을 부른다 — 두 번째 호출이 항목을 늘리면 안 된다.
         let twice = apply_kimi_hooks(&once, hooks, true).unwrap();
@@ -510,7 +826,7 @@ timeout = 10
     #[test]
     fn kimi_hook_command는_스크립트가_없으면_조용히_성공한다() {
         let entries = kimi_hook_entries(Path::new("/nonexistent/hooks"));
-        assert_eq!(entries.len(), 4);
+        assert_eq!(entries.len(), 13);
         // 문자열 모양만 보면 놓친다 — 실제로 sh가 0으로 끝나는지 확인한다.
         for (event, command) in &entries {
             let status = std::process::Command::new("/bin/sh")

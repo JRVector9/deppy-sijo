@@ -25,6 +25,17 @@ jobs:
       - name: 송수신 순서, 재접속 등록, 신원 고정과 대기열 상한
         run: node --test web/relay-shell/tests/*.test.mjs
 
+  agent-status-harness:
+    name: Agent status ownership and provider replay
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Claude, Codex, Kimi, Grok, Cursor and terminal display contracts
+        run: scripts/verify-agent-status.sh
+
   fast-checks:
     name: Format, boundary, and diff checks
     runs-on: ubuntu-latest

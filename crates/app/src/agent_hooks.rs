@@ -19,7 +19,7 @@ use serde_json::Value;
 /// 우리 hook 항목을 식별하는 커맨드 마커.
 const MARKER: &str = "--deppy-hook";
 /// Third-party hook settings are control data; refuse bulk files before JSON/TOML allocation.
-const HOOK_CONFIG_BYTES_MAX: usize = 1024 * 1024;
+pub(crate) const HOOK_CONFIG_BYTES_MAX: usize = 1024 * 1024;
 
 fn open_hook_config_read_only(path: &Path) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
@@ -41,7 +41,10 @@ fn open_hook_config_read_only(path: &Path) -> std::io::Result<std::fs::File> {
     options.open(path)
 }
 
-fn read_hook_config_bounded(path: &Path, max_bytes: usize) -> anyhow::Result<Option<String>> {
+pub(crate) fn read_hook_config_bounded(
+    path: &Path,
+    max_bytes: usize,
+) -> anyhow::Result<Option<String>> {
     let before = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -134,7 +137,7 @@ fn is_ours(entry: &Value) -> bool {
 }
 
 /// 설정 JSON을 원자적으로 쓴다 (tmp+rename).
-fn write_atomic(path: &std::path::Path, root: &Value) -> anyhow::Result<()> {
+pub(crate) fn write_atomic(path: &std::path::Path, root: &Value) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|_| anyhow::anyhow!("agent_hook_directory_create_failed"))?;

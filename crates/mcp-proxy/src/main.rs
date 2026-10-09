@@ -277,14 +277,83 @@ fn deny_proxy_session_pending(
 /// claude/codex hook 수신: `--db <path> --event <needs-input|clear>`, 세션은 env
 /// DEPPY_SESSION_ID(=pane_id). needsInput을 DB에 set/clear하고 즉시 종료한다.
 /// **hook은 절대 에이전트를 막으면 안 되므로** 뭐가 없거나 실패해도 조용히 성공 반환한다.
+fn hook_observer_response(cursor_event: Option<&str>) -> &'static str {
+    match cursor_event {
+        Some("beforeSubmitPrompt") => r#"{"continue":true}"#,
+        Some("preToolUse" | "beforeShellExecution" | "beforeMCPExecution" | "subagentStart") => {
+            r#"{"permission":"allow"}"#
+        }
+        _ => "{}",
+    }
+}
+
+fn tag_hook_provider(mut v: serde_json::Value, provider: Option<&str>) -> serde_json::Value {
+    if provider == Some("kimi") {
+        v["client_type"] = "kimi_code_cli".into();
+    }
+    v
+}
+
+fn hook_is_child(v: &serde_json::Value) -> bool {
+    let kimi_main = v.get("client_type").and_then(|v| v.as_str()) == Some("kimi_code_cli")
+        && v.get("agent_id").and_then(|v| v.as_str()) == Some("main");
+    [
+        "agent_id",
+        "subagent_id",
+        "subagentId",
+        "subagentType",
+        "parent_conversation_id",
+    ]
+    .iter()
+    .any(|key| v.get(key).is_some() && !(kimi_main && *key == "agent_id"))
+        || v.get("hook_event_name")
+            .or_else(|| v.get("hookEventName"))
+            .and_then(|v| v.as_str())
+            .is_some_and(|name| name.to_ascii_lowercase().starts_with("subagent"))
+}
+
+fn hook_binding(v: &serde_json::Value) -> Option<(&str, &str, &str)> {
+    if !agent_attention::identity_metadata_valid(v) || hook_is_child(v) {
+        return None;
+    }
+    let sid = v
+        .get("conversation_id")
+        .or_else(|| v.get("session_id"))
+        .or_else(|| v.get("sessionId"))?
+        .as_str()?;
+    let path = v
+        .get("transcript_path")
+        .or_else(|| v.get("transcriptPath"))?
+        .as_str()?;
+    if sid.is_empty() || path.is_empty() {
+        return None;
+    }
+    let kind = if v.get("conversation_id").is_some() {
+        "cursor"
+    } else if path.contains("/.codex/") {
+        "codex"
+    } else if path.contains("/.grok/") {
+        "grok"
+    } else if path.contains("/.kimi-code/") {
+        "kimi"
+    } else {
+        "claude"
+    };
+    Some((kind, sid, path))
+}
+
 fn run_hooks(args: &[String]) -> anyhow::Result<()> {
     let mut db_path: Option<std::path::PathBuf> = None;
     let mut event: Option<String> = None;
+    let mut cursor_event: Option<String> = None;
+    let mut provider: Option<String> = None;
     let mut it = args.iter();
     while let Some(flag) = it.next() {
         match flag.as_str() {
             "--db" => db_path = it.next().map(std::path::PathBuf::from),
             "--event" => event = it.next().cloned(),
+            "--cursor-event" => cursor_event = it.next().cloned(),
+            "--provider" => provider = it.next().cloned(),
             _ => {}
         }
     }
@@ -296,11 +365,11 @@ fn run_hooks(args: &[String]) -> anyhow::Result<()> {
         .map(|d| d.as_micros().min(i64::MAX as u128) as i64)
         .unwrap_or(1);
     let mut input = std::io::stdin().lock();
-    let parsed = hook_payload::read(&mut input);
+    let parsed = hook_payload::read(&mut input).map(|v| tag_hook_provider(v, provider.as_deref()));
     // 파싱 상한을 넘겨도 writer가 broken pipe로 실패하지 않도록 끝까지 비운다.
     let _ = std::io::copy(&mut input, &mut std::io::sink());
-    // codex는 hook stdout이 유효 JSON이길 기대 — 무슨 일이 있어도 '{}' 출력.
-    println!("{{}}");
+    // 관찰기가 permission gate를 차단하지 않도록 파싱/DB 실패에도 중립 응답한다.
+    println!("{}", hook_observer_response(cursor_event.as_deref()));
     let Some(session_key) = std::env::var("DEPPY_SESSION_ID")
         .ok()
         .filter(|s| !s.is_empty())
@@ -338,9 +407,13 @@ fn run_hooks(args: &[String]) -> anyhow::Result<()> {
             let _ = db.set_agent_turn_done(&session_key);
         }
         // 어떤 이벤트든 payload에 (session_id, transcript_path)가 오면 최신 바인딩으로 갱신.
-        if let Some(v) = parsed.as_ref() {
+        if let Some(v) = parsed
+            .as_ref()
+            .filter(|v| agent_attention::identity_metadata_valid(v) && !hook_is_child(v))
+        {
             let sid = v
-                .get("session_id")
+                .get("conversation_id")
+                .or_else(|| v.get("session_id"))
                 .or_else(|| v.get("sessionId"))
                 .and_then(|x| x.as_str());
             let path = v
@@ -354,24 +427,14 @@ fn run_hooks(args: &[String]) -> anyhow::Result<()> {
             // 경로가 없을 때만 세션 id로 인덱스를 뒤진다 — 인덱스가 풀어주지 못하면
             // 바인딩하지 않는다(추측 경로로 묶으면 엉뚱한 세션 상태를 보여준다).
             if path.is_none()
+                && v.get("conversation_id").is_none()
                 && v.get("hookEventName").is_none()
                 && let Some(sid) = sid
                 && let Some(resolved) = kimi_transcript_path(sid)
             {
                 let _ = db.upsert_hook_session(&session_key, "kimi", sid, &resolved);
             }
-            if let (Some(sid), Some(path)) = (sid, path) {
-                // kind는 transcript 경로로 판별한다. 폴백이 claude라 새 에이전트를
-                // 안 넣으면 **전부 claude로 기록**돼 카드가 거짓말을 한다.
-                let kind = if path.contains("/.codex/") {
-                    "codex"
-                } else if path.contains("/.grok/") {
-                    "grok"
-                } else if path.contains("/.kimi-code/") {
-                    "kimi"
-                } else {
-                    "claude"
-                };
+            if let Some((kind, sid, path)) = hook_binding(v) {
                 let _ = db.upsert_hook_session(&session_key, kind, sid, path);
             }
             if event == "observe"
@@ -608,6 +671,49 @@ mod tests {
     use std::io::Write;
 
     use super::*;
+
+    #[test]
+    fn agent_status_harness_malformed_child_owner_never_rebinds_parent() {
+        for owner in [
+            serde_json::json!(7),
+            serde_json::json!(false),
+            serde_json::Value::Null,
+        ] {
+            let v = serde_json::json!({"agent_id":owner,"session_id":"native","transcript_path":"/home/.codex/child.jsonl"});
+            assert!(hook_binding(&v).is_none());
+        }
+    }
+
+    #[test]
+    fn agent_status_harness_binding_never_rebinds_parent_to_child() {
+        for child in ["agent_id", "subagent_id", "subagentId", "subagentType"] {
+            let mut v = serde_json::json!({"session_id":"child", "transcript_path":"/home/.codex/child.jsonl"});
+            v[child] = "child".into();
+            assert!(hook_binding(&v).is_none(), "{child}");
+        }
+        let v = serde_json::json!({"conversation_id":"parent", "transcript_path":"/home/.cursor/parent.txt"});
+        assert_eq!(
+            hook_binding(&v),
+            Some(("cursor", "parent", "/home/.cursor/parent.txt"))
+        );
+    }
+    #[test]
+    fn agent_status_harness_cursor_observer_never_blocks_or_requests_permission() {
+        for event in [
+            "preToolUse",
+            "beforeShellExecution",
+            "beforeMCPExecution",
+            "subagentStart",
+        ] {
+            let v: serde_json::Value =
+                serde_json::from_str(hook_observer_response(Some(event))).unwrap();
+            assert_eq!(v["permission"], "allow", "{event}");
+        }
+        let v: serde_json::Value =
+            serde_json::from_str(hook_observer_response(Some("beforeSubmitPrompt"))).unwrap();
+        assert_eq!(v["continue"], true);
+        assert_eq!(hook_observer_response(None), "{}");
+    }
 
     struct TraceWriter(Arc<Mutex<Vec<u8>>>);
 

@@ -65,19 +65,28 @@ impl<'de> Visitor<'de> for Shape {
 
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
         let mut result = Map::new();
+        let mut input_aliases = 0_u8;
         while let Some(key) = map.next_key::<String>()? {
             if key.len() > 128 {
                 return Err(serde::de::Error::custom("hook metadata key limit"));
             }
             if matches!(self, Self::Hook) && matches!(key.as_str(), "tool_input" | "toolInput") {
-                if result.contains_key("tool_input_hash") {
+                let alias = if key == "tool_input" { 1 } else { 2 };
+                if input_aliases & alias != 0 {
                     return Err(serde::de::Error::custom("duplicate tool input"));
                 }
+                input_aliases |= alias;
                 let hash = map.next_value_seed(InputDigest(0))?;
-                result.insert(
-                    "tool_input_hash".into(),
-                    hash.map_or(Value::Null, |h| Value::String(format!("{h:016x}"))),
-                );
+                let hash = hash.map_or(Value::Null, |h| Value::String(format!("{h:016x}")));
+                if let Some(previous) = result.get("tool_input_hash") {
+                    // Grok emits both spellings. Preserve matching aliases while
+                    // refusing conflicting digests and duplicate identical keys.
+                    if previous != &hash {
+                        return Err(serde::de::Error::custom("conflicting tool input aliases"));
+                    }
+                } else {
+                    result.insert("tool_input_hash".into(), hash);
+                }
                 continue;
             }
             let child = match (self, key.as_str()) {
@@ -88,6 +97,9 @@ impl<'de> Visitor<'de> for Shape {
                     Self::Hook,
                     "session_id"
                     | "sessionId"
+                    | "conversation_id"
+                    | "generation_id"
+                    | "parent_conversation_id"
                     | "hook_event_name"
                     | "hookEventName"
                     | "tool_use_id"
@@ -98,7 +110,13 @@ impl<'de> Visitor<'de> for Shape {
                     | "tool_name"
                     | "toolName"
                     | "agent_id"
+                    | "subagent_id"
+                    | "subagentId"
                     | "subagentType"
+                    | "client_type"
+                    | "status"
+                    | "phase"
+                    | "is_interrupt"
                     | "turn_id"
                     | "turnId"
                     | "prompt_id"
@@ -130,6 +148,18 @@ impl<'de> Visitor<'de> for Shape {
             }
         }
         Ok(Value::Object(result))
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Value, E> {
+        Ok(Value::Number(value.into()))
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Value, E> {
+        Ok(Value::Number(value.into()))
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Value, E> {
+        Ok(Value::Bool(value))
     }
 
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
@@ -256,6 +286,15 @@ pub fn input_hash(value: &Value) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn agent_status_harness_dual_input_aliases_match_and_conflicting_or_duplicate_keys_fail() {
+        let raw = r#"{"toolInput":{"a":1,"b":2},"tool_input":{"b":2,"a":1},"tool_use_id":"call"}"#;
+        assert!(read(raw.as_bytes()).unwrap()["tool_input_hash"].is_string());
+        assert!(read(br#"{"toolInput":{"a":1},"tool_input":{"a":2}}"#.as_slice()).is_none());
+        assert!(read(br#"{"tool_input":{},"tool_input":{}}"#.as_slice()).is_none());
+        assert!(read(br#"{"session_id":"a","session_id":"b"}"#.as_slice()).is_none());
+    }
 
     #[test]
     fn 입력_해시는_객체_순서와_파싱_경로에_독립적이다() {

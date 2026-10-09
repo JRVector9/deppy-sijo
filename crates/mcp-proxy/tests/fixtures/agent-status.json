@@ -1,0 +1,4522 @@
+[
+  {
+    "provider": "claude",
+    "name": "turn-tool-result-completion-and-reopen",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PreToolUse",
+          "turn_id": "turn",
+          "tool_use_id": "q",
+          "tool_name": "Bash"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 3,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PostToolUse",
+          "turn_id": "turn",
+          "tool_use_id": "q",
+          "tool_name": "Bash"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 4,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "Stop",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": true,
+          "pending": 0,
+          "idle": 4
+        }
+      },
+      {
+        "at": 5,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "Stop",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": true,
+          "pending": 0,
+          "idle": 4
+        },
+        "reopen": true
+      },
+      {
+        "at": 6,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "next"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "claude",
+    "name": "question-survives-unrelated-output",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PreToolUse",
+          "turn_id": "turn",
+          "tool_use_id": "question",
+          "tool_name": "AskUserQuestion"
+        },
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": true,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        }
+      },
+      {
+        "at": 3,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PreToolUse",
+          "turn_id": "turn",
+          "tool_use_id": "tool",
+          "tool_name": "Bash"
+        },
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": true,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        }
+      },
+      {
+        "at": 4,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PostToolUse",
+          "turn_id": "turn",
+          "tool_use_id": "tool",
+          "tool_name": "Bash"
+        },
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": true,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        }
+      },
+      {
+        "at": 5,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PostToolUse",
+          "turn_id": "turn",
+          "tool_use_id": "question",
+          "tool_name": "AskUserQuestion"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 6,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "Stop",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": true,
+          "pending": 0,
+          "idle": 6
+        }
+      }
+    ]
+  },
+  {
+    "provider": "claude",
+    "name": "unrelated-session-result-cannot-close-question",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PreToolUse",
+          "turn_id": "turn",
+          "tool_use_id": "q",
+          "tool_name": "AskUserQuestion"
+        },
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": true,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        }
+      },
+      {
+        "at": 3,
+        "payload": {
+          "session_id": "other",
+          "hook_event_name": "PostToolUse",
+          "turn_id": "turn",
+          "tool_use_id": "q",
+          "tool_name": "AskUserQuestion"
+        },
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": true,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "claude",
+    "name": "unknown-events-do-not-change-live-status",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "unknown-event",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        },
+        "accepted": false
+      }
+    ]
+  },
+  {
+    "provider": "claude",
+    "name": "approval-is-independent-of-an-unrelated-tool",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PermissionRequest",
+          "turn_id": "turn",
+          "tool_use_id": "q",
+          "tool_name": "Bash"
+        },
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": false,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        }
+      },
+      {
+        "at": 3,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PreToolUse",
+          "turn_id": "turn",
+          "tool_use_id": "other",
+          "tool_name": "Read"
+        },
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": false,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        }
+      },
+      {
+        "at": 4,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PostToolUse",
+          "turn_id": "turn",
+          "tool_use_id": "other",
+          "tool_name": "Read"
+        },
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": false,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        }
+      },
+      {
+        "at": 5,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PostToolUse",
+          "turn_id": "turn",
+          "tool_use_id": "q",
+          "tool_name": "Bash"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "claude",
+    "name": "interrupt-is-not-success",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "Interrupt",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 3,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "Stop",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "claude",
+    "name": "failure-is-not-success",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "StopFailure",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 3,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "Stop",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "claude",
+    "name": "parallel-children-outlive-parent",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "SubagentStart",
+          "turn_id": "turn",
+          "agent_id": "a"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 3,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "SubagentStart",
+          "turn_id": "turn",
+          "agent_id": "b"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 4,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "Stop",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 5,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "SubagentStop",
+          "turn_id": "turn",
+          "agent_id": "a"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 6,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "SubagentStop",
+          "turn_id": "turn",
+          "agent_id": "b"
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": true,
+          "pending": 0,
+          "idle": 6
+        }
+      }
+    ]
+  },
+  {
+    "provider": "claude",
+    "name": "session-end-clears-requests-and-ignores-late-output",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PreToolUse",
+          "turn_id": "turn",
+          "tool_use_id": "q",
+          "tool_name": "AskUserQuestion"
+        },
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": true,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        }
+      },
+      {
+        "at": 3,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "SessionEnd",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 4,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PostToolUse",
+          "turn_id": "turn",
+          "tool_use_id": "q",
+          "tool_name": "AskUserQuestion"
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "codex",
+    "name": "turn-tool-result-completion-and-reopen",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PreToolUse",
+          "turn_id": "turn",
+          "tool_use_id": "q",
+          "tool_name": "Bash"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 3,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PostToolUse",
+          "turn_id": "turn",
+          "tool_use_id": "q",
+          "tool_name": "Bash"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 4,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "Stop",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": true,
+          "pending": 0,
+          "idle": 4
+        }
+      },
+      {
+        "at": 5,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "Stop",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": true,
+          "pending": 0,
+          "idle": 4
+        },
+        "reopen": true
+      },
+      {
+        "at": 6,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "next"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "codex",
+    "name": "question-survives-unrelated-output",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PreToolUse",
+          "turn_id": "turn",
+          "tool_use_id": "question",
+          "tool_name": "AskUserQuestion"
+        },
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": true,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        }
+      },
+      {
+        "at": 3,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PreToolUse",
+          "turn_id": "turn",
+          "tool_use_id": "tool",
+          "tool_name": "Bash"
+        },
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": true,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        }
+      },
+      {
+        "at": 4,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PostToolUse",
+          "turn_id": "turn",
+          "tool_use_id": "tool",
+          "tool_name": "Bash"
+        },
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": true,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        }
+      },
+      {
+        "at": 5,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PostToolUse",
+          "turn_id": "turn",
+          "tool_use_id": "question",
+          "tool_name": "AskUserQuestion"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 6,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "Stop",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": true,
+          "pending": 0,
+          "idle": 6
+        }
+      }
+    ]
+  },
+  {
+    "provider": "codex",
+    "name": "unrelated-session-result-cannot-close-question",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PreToolUse",
+          "turn_id": "turn",
+          "tool_use_id": "q",
+          "tool_name": "AskUserQuestion"
+        },
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": true,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        }
+      },
+      {
+        "at": 3,
+        "payload": {
+          "session_id": "other",
+          "hook_event_name": "PostToolUse",
+          "turn_id": "turn",
+          "tool_use_id": "q",
+          "tool_name": "AskUserQuestion"
+        },
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": true,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "codex",
+    "name": "unknown-events-do-not-change-live-status",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "unknown-event",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        },
+        "accepted": false
+      }
+    ]
+  },
+  {
+    "provider": "codex",
+    "name": "approval-is-independent-of-an-unrelated-tool",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PermissionRequest",
+          "turn_id": "turn",
+          "tool_use_id": "q",
+          "tool_name": "Bash"
+        },
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": false,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        }
+      },
+      {
+        "at": 3,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PreToolUse",
+          "turn_id": "turn",
+          "tool_use_id": "other",
+          "tool_name": "Read"
+        },
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": false,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        }
+      },
+      {
+        "at": 4,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PostToolUse",
+          "turn_id": "turn",
+          "tool_use_id": "other",
+          "tool_name": "Read"
+        },
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": false,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        }
+      },
+      {
+        "at": 5,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PostToolUse",
+          "turn_id": "turn",
+          "tool_use_id": "q",
+          "tool_name": "Bash"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "codex",
+    "name": "interrupt-is-not-success",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "Interrupt",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 3,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "Stop",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "codex",
+    "name": "failure-is-not-success",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "StopFailure",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 3,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "Stop",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "codex",
+    "name": "parallel-children-outlive-parent",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "SubagentStart",
+          "turn_id": "turn",
+          "agent_id": "a"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 3,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "SubagentStart",
+          "turn_id": "turn",
+          "agent_id": "b"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 4,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "Stop",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 5,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "SubagentStop",
+          "turn_id": "turn",
+          "agent_id": "a"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 6,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "SubagentStop",
+          "turn_id": "turn",
+          "agent_id": "b"
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": true,
+          "pending": 0,
+          "idle": 6
+        }
+      }
+    ]
+  },
+  {
+    "provider": "codex",
+    "name": "session-end-clears-requests-and-ignores-late-output",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PreToolUse",
+          "turn_id": "turn",
+          "tool_use_id": "q",
+          "tool_name": "AskUserQuestion"
+        },
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": true,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        }
+      },
+      {
+        "at": 3,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "SessionEnd",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 4,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PostToolUse",
+          "turn_id": "turn",
+          "tool_use_id": "q",
+          "tool_name": "AskUserQuestion"
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "kimi",
+    "name": "turn-tool-result-completion-and-reopen",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "turn",
+          "client_type": "kimi_code_cli"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PreToolUse",
+          "turn_id": "turn",
+          "client_type": "kimi_code_cli",
+          "tool_use_id": "q",
+          "tool_name": "Bash"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 3,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PostToolUse",
+          "turn_id": "turn",
+          "client_type": "kimi_code_cli",
+          "tool_use_id": "q",
+          "tool_name": "Bash"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 4,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "Stop",
+          "turn_id": "turn",
+          "client_type": "kimi_code_cli"
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": true,
+          "pending": 0,
+          "idle": 4
+        }
+      },
+      {
+        "at": 5,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "Stop",
+          "turn_id": "turn",
+          "client_type": "kimi_code_cli"
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": true,
+          "pending": 0,
+          "idle": 4
+        },
+        "reopen": true
+      },
+      {
+        "at": 6,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "next",
+          "client_type": "kimi_code_cli"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "kimi",
+    "name": "question-survives-unrelated-output",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "turn",
+          "client_type": "kimi_code_cli"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PreToolUse",
+          "turn_id": "turn",
+          "client_type": "kimi_code_cli",
+          "tool_use_id": "question",
+          "tool_name": "AskUserQuestion"
+        },
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": true,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        }
+      },
+      {
+        "at": 3,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PreToolUse",
+          "turn_id": "turn",
+          "client_type": "kimi_code_cli",
+          "tool_use_id": "tool",
+          "tool_name": "Bash"
+        },
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": true,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        }
+      },
+      {
+        "at": 4,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PostToolUse",
+          "turn_id": "turn",
+          "client_type": "kimi_code_cli",
+          "tool_use_id": "tool",
+          "tool_name": "Bash"
+        },
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": true,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        }
+      },
+      {
+        "at": 5,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PostToolUse",
+          "turn_id": "turn",
+          "client_type": "kimi_code_cli",
+          "tool_use_id": "question",
+          "tool_name": "AskUserQuestion"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 6,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "Stop",
+          "turn_id": "turn",
+          "client_type": "kimi_code_cli"
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": true,
+          "pending": 0,
+          "idle": 6
+        }
+      }
+    ]
+  },
+  {
+    "provider": "kimi",
+    "name": "unrelated-session-result-cannot-close-question",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "turn",
+          "client_type": "kimi_code_cli"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PreToolUse",
+          "turn_id": "turn",
+          "client_type": "kimi_code_cli",
+          "tool_use_id": "q",
+          "tool_name": "AskUserQuestion"
+        },
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": true,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        }
+      },
+      {
+        "at": 3,
+        "payload": {
+          "session_id": "other",
+          "hook_event_name": "PostToolUse",
+          "turn_id": "turn",
+          "client_type": "kimi_code_cli",
+          "tool_use_id": "q",
+          "tool_name": "AskUserQuestion"
+        },
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": true,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "kimi",
+    "name": "unknown-events-do-not-change-live-status",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "turn",
+          "client_type": "kimi_code_cli"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "unknown-event",
+          "turn_id": "turn",
+          "client_type": "kimi_code_cli"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        },
+        "accepted": false
+      }
+    ]
+  },
+  {
+    "provider": "kimi",
+    "name": "approval-is-independent-of-an-unrelated-tool",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "turn",
+          "client_type": "kimi_code_cli"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PermissionRequest",
+          "turn_id": "turn",
+          "client_type": "kimi_code_cli",
+          "tool_use_id": "q",
+          "tool_name": "Bash"
+        },
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": false,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        }
+      },
+      {
+        "at": 3,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PreToolUse",
+          "turn_id": "turn",
+          "client_type": "kimi_code_cli",
+          "tool_use_id": "other",
+          "tool_name": "Read"
+        },
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": false,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        }
+      },
+      {
+        "at": 4,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PostToolUse",
+          "turn_id": "turn",
+          "client_type": "kimi_code_cli",
+          "tool_use_id": "other",
+          "tool_name": "Read"
+        },
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": false,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        }
+      },
+      {
+        "at": 5,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PostToolUse",
+          "turn_id": "turn",
+          "client_type": "kimi_code_cli",
+          "tool_use_id": "q",
+          "tool_name": "Bash"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "kimi",
+    "name": "interrupt-is-not-success",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "turn",
+          "client_type": "kimi_code_cli"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "Interrupt",
+          "turn_id": "turn",
+          "client_type": "kimi_code_cli"
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 3,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "Stop",
+          "turn_id": "turn",
+          "client_type": "kimi_code_cli"
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "kimi",
+    "name": "failure-is-not-success",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "turn",
+          "client_type": "kimi_code_cli"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "StopFailure",
+          "turn_id": "turn",
+          "client_type": "kimi_code_cli"
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 3,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "Stop",
+          "turn_id": "turn",
+          "client_type": "kimi_code_cli"
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "claude",
+    "name": "compatibility-id-based-parallel-children",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "SubagentStart",
+          "turn_id": "turn",
+          "agent_id": "a"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 3,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "SubagentStart",
+          "turn_id": "turn",
+          "agent_id": "b"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 4,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "Stop",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 5,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "SubagentStop",
+          "turn_id": "turn",
+          "agent_id": "a"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 6,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "SubagentStop",
+          "turn_id": "turn",
+          "agent_id": "b"
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": true,
+          "pending": 0,
+          "idle": 6
+        }
+      }
+    ]
+  },
+  {
+    "provider": "kimi",
+    "name": "session-end-clears-requests-and-ignores-late-output",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "turn",
+          "client_type": "kimi_code_cli"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PreToolUse",
+          "turn_id": "turn",
+          "client_type": "kimi_code_cli",
+          "tool_use_id": "q",
+          "tool_name": "AskUserQuestion"
+        },
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": true,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        }
+      },
+      {
+        "at": 3,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "SessionEnd",
+          "turn_id": "turn",
+          "client_type": "kimi_code_cli"
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 4,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PostToolUse",
+          "turn_id": "turn",
+          "client_type": "kimi_code_cli",
+          "tool_use_id": "q",
+          "tool_name": "AskUserQuestion"
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "cursor",
+    "name": "turn-tool-result-completion-and-reopen",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "conversation_id": "native",
+          "generation_id": "turn",
+          "hook_event_name": "beforeSubmitPrompt"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "conversation_id": "native",
+          "generation_id": "turn",
+          "hook_event_name": "preToolUse",
+          "tool_use_id": "q",
+          "tool_name": "Bash"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 3,
+        "payload": {
+          "conversation_id": "native",
+          "generation_id": "turn",
+          "hook_event_name": "postToolUse",
+          "tool_use_id": "q",
+          "tool_name": "Bash"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 4,
+        "payload": {
+          "conversation_id": "native",
+          "generation_id": "turn",
+          "hook_event_name": "stop",
+          "status": "completed"
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": true,
+          "pending": 0,
+          "idle": 4
+        }
+      },
+      {
+        "at": 5,
+        "payload": {
+          "conversation_id": "native",
+          "generation_id": "turn",
+          "hook_event_name": "stop",
+          "status": "completed"
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": true,
+          "pending": 0,
+          "idle": 4
+        },
+        "reopen": true
+      },
+      {
+        "at": 6,
+        "payload": {
+          "conversation_id": "native",
+          "generation_id": "next",
+          "hook_event_name": "beforeSubmitPrompt"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "cursor",
+    "name": "question-survives-unrelated-output",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "conversation_id": "native",
+          "generation_id": "turn",
+          "hook_event_name": "beforeSubmitPrompt"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "conversation_id": "native",
+          "generation_id": "turn",
+          "hook_event_name": "preToolUse",
+          "tool_use_id": "question",
+          "tool_name": "AskUserQuestion"
+        },
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": true,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        }
+      },
+      {
+        "at": 3,
+        "payload": {
+          "conversation_id": "native",
+          "generation_id": "turn",
+          "hook_event_name": "preToolUse",
+          "tool_use_id": "tool",
+          "tool_name": "Bash"
+        },
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": true,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        }
+      },
+      {
+        "at": 4,
+        "payload": {
+          "conversation_id": "native",
+          "generation_id": "turn",
+          "hook_event_name": "postToolUse",
+          "tool_use_id": "tool",
+          "tool_name": "Bash"
+        },
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": true,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        }
+      },
+      {
+        "at": 5,
+        "payload": {
+          "conversation_id": "native",
+          "generation_id": "turn",
+          "hook_event_name": "postToolUse",
+          "tool_use_id": "question",
+          "tool_name": "AskUserQuestion"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 6,
+        "payload": {
+          "conversation_id": "native",
+          "generation_id": "turn",
+          "hook_event_name": "stop",
+          "status": "completed"
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": true,
+          "pending": 0,
+          "idle": 6
+        }
+      }
+    ]
+  },
+  {
+    "provider": "cursor",
+    "name": "unrelated-session-result-cannot-close-question",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "conversation_id": "native",
+          "generation_id": "turn",
+          "hook_event_name": "beforeSubmitPrompt"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "conversation_id": "native",
+          "generation_id": "turn",
+          "hook_event_name": "preToolUse",
+          "tool_use_id": "q",
+          "tool_name": "AskUserQuestion"
+        },
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": true,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        }
+      },
+      {
+        "at": 3,
+        "payload": {
+          "conversation_id": "other",
+          "generation_id": "turn",
+          "hook_event_name": "postToolUse",
+          "tool_use_id": "q",
+          "tool_name": "AskUserQuestion"
+        },
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": true,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "cursor",
+    "name": "unknown-events-do-not-change-live-status",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "conversation_id": "native",
+          "generation_id": "turn",
+          "hook_event_name": "beforeSubmitPrompt"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "conversation_id": "native",
+          "generation_id": "turn",
+          "hook_event_name": "unknown-event"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        },
+        "accepted": false
+      }
+    ]
+  },
+  {
+    "provider": "kimi",
+    "name": "turn-started-and-permission-result",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "TurnStarted",
+          "turn_id": "turn",
+          "client_type": "kimi_code_cli"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PermissionRequest",
+          "turn_id": "turn",
+          "client_type": "kimi_code_cli",
+          "tool_call_id": "q",
+          "tool_name": "Bash"
+        },
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": false,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        }
+      },
+      {
+        "at": 3,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PermissionResult",
+          "turn_id": "turn",
+          "client_type": "kimi_code_cli",
+          "tool_call_id": "q",
+          "tool_name": "Bash"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 4,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "Stop",
+          "turn_id": "turn",
+          "client_type": "kimi_code_cli"
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": true,
+          "pending": 0,
+          "idle": 4
+        }
+      }
+    ]
+  },
+  {
+    "provider": "kimi",
+    "name": "queued-prompt-does-not-reset-an-active-question",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "turn",
+          "client_type": "kimi_code_cli"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PreToolUse",
+          "turn_id": "turn",
+          "client_type": "kimi_code_cli",
+          "tool_call_id": "q",
+          "tool_name": "AskUserQuestion"
+        },
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": true,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        }
+      },
+      {
+        "at": 3,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptQueued",
+          "turn_id": "turn",
+          "client_type": "kimi_code_cli"
+        },
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": true,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        },
+        "accepted": false
+      },
+      {
+        "at": 4,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PostToolUse",
+          "turn_id": "turn",
+          "client_type": "kimi_code_cli",
+          "tool_call_id": "q",
+          "tool_name": "AskUserQuestion"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "cursor",
+    "name": "stop-aborted-is-not-success",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "conversation_id": "native",
+          "generation_id": "turn",
+          "hook_event_name": "beforeSubmitPrompt"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "conversation_id": "native",
+          "generation_id": "turn",
+          "hook_event_name": "stop",
+          "status": "aborted"
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "cursor",
+    "name": "stop-error-is-not-success",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "conversation_id": "native",
+          "generation_id": "turn",
+          "hook_event_name": "beforeSubmitPrompt"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "conversation_id": "native",
+          "generation_id": "turn",
+          "hook_event_name": "stop",
+          "status": "error"
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "cursor",
+    "name": "late-response-does-not-reopen-completion",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "conversation_id": "native",
+          "generation_id": "turn",
+          "hook_event_name": "beforeSubmitPrompt"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "conversation_id": "native",
+          "generation_id": "turn",
+          "hook_event_name": "stop",
+          "status": "completed"
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": true,
+          "pending": 0,
+          "idle": 2
+        }
+      },
+      {
+        "at": 3,
+        "payload": {
+          "conversation_id": "native",
+          "generation_id": "turn",
+          "hook_event_name": "afterAgentResponse"
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": true,
+          "pending": 0,
+          "idle": 2
+        },
+        "accepted": false
+      }
+    ]
+  },
+  {
+    "provider": "cursor",
+    "name": "legacy-shell-events-do-not-invent-approval",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "conversation_id": "native",
+          "generation_id": "turn",
+          "hook_event_name": "beforeSubmitPrompt"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "conversation_id": "native",
+          "generation_id": "turn",
+          "hook_event_name": "beforeShellExecution",
+          "command": "ls"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 3,
+        "payload": {
+          "conversation_id": "native",
+          "generation_id": "turn",
+          "hook_event_name": "afterShellExecution",
+          "command": "ls"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 4,
+        "payload": {
+          "conversation_id": "native",
+          "generation_id": "turn",
+          "hook_event_name": "stop",
+          "status": "completed"
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": true,
+          "pending": 0,
+          "idle": 4
+        }
+      }
+    ]
+  },
+  {
+    "provider": "grok",
+    "name": "dual-key-tool-aliases-preserve-valid-metadata",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "sessionId": "native",
+          "hookEventName": "user_prompt_submit"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "sessionId": "native",
+          "hookEventName": "pre_tool_use",
+          "hook_event_name": "PreToolUse",
+          "session_id": "native",
+          "toolName": "run_terminal_command",
+          "tool_name": "run_terminal_command",
+          "toolUseId": "q",
+          "tool_use_id": "q",
+          "toolInput": {
+            "command": "ls"
+          },
+          "tool_input": {
+            "command": "ls"
+          }
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 3,
+        "payload": {
+          "sessionId": "native",
+          "hookEventName": "post_tool_use",
+          "hook_event_name": "PostToolUse",
+          "session_id": "native",
+          "toolName": "run_terminal_command",
+          "tool_name": "run_terminal_command",
+          "toolUseId": "q",
+          "tool_use_id": "q",
+          "toolInput": {
+            "command": "ls"
+          },
+          "tool_input": {
+            "command": "ls"
+          }
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "grok",
+    "name": "permission-notification-waits-for-owned-result",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "sessionId": "native",
+          "hookEventName": "user_prompt_submit"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "sessionId": "native",
+          "hookEventName": "pre_tool_use",
+          "toolUseId": "q",
+          "toolName": "run_terminal_command"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 3,
+        "payload": {
+          "sessionId": "native",
+          "hookEventName": "notification",
+          "notificationType": "permission_prompt"
+        },
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": false,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        }
+      },
+      {
+        "at": 4,
+        "payload": {
+          "sessionId": "native",
+          "hookEventName": "post_tool_use",
+          "toolUseId": "q",
+          "toolName": "run_terminal_command"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "grok",
+    "name": "stop_failure-is-not-success",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "sessionId": "native",
+          "hookEventName": "user_prompt_submit",
+          "promptId": "turn"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "sessionId": "native",
+          "hookEventName": "stop_failure",
+          "promptId": "turn"
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "grok",
+    "name": "stop_cancelled-is-not-success",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "sessionId": "native",
+          "hookEventName": "user_prompt_submit",
+          "promptId": "turn"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "sessionId": "native",
+          "hookEventName": "stop_cancelled",
+          "promptId": "turn"
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "grok",
+    "name": "unconfirmed-quiet-notification-is-not-success",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "sessionId": "native",
+          "hookEventName": "user_prompt_submit"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "sessionId": "native",
+          "hookEventName": "notification",
+          "notificationType": "idle_prompt"
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "grok",
+    "name": "child-teardown-cannot-end-parent",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "sessionId": "native",
+          "hookEventName": "user_prompt_submit"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "sessionId": "native",
+          "hookEventName": "session_end",
+          "subagentType": "explore"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        },
+        "accepted": false
+      }
+    ]
+  },
+  {
+    "provider": "kimi",
+    "name": "numeric-turn-ids-from-modern-kimi",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "TurnStarted",
+          "turn_id": 1,
+          "client_type": "kimi_code_cli"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PermissionRequest",
+          "turn_id": 1,
+          "client_type": "kimi_code_cli",
+          "tool_call_id": "q",
+          "tool_name": "Bash"
+        },
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": false,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        }
+      },
+      {
+        "at": 3,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PermissionResult",
+          "turn_id": 1,
+          "client_type": "kimi_code_cli",
+          "tool_call_id": "q",
+          "tool_name": "Bash"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 4,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "Stop",
+          "turn_id": 1,
+          "client_type": "kimi_code_cli"
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": true,
+          "pending": 0,
+          "idle": 4
+        }
+      }
+    ]
+  },
+  {
+    "provider": "kimi",
+    "name": "modern-kimi-main-agent-id-is-not-child",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "TurnStarted",
+          "turn_id": 1,
+          "client_type": "kimi_code_cli"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PermissionRequest",
+          "turn_id": 1,
+          "client_type": "kimi_code_cli",
+          "tool_call_id": "q",
+          "tool_name": "Bash",
+          "agent_id": "main"
+        },
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": false,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        }
+      },
+      {
+        "at": 3,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PermissionResult",
+          "turn_id": 1,
+          "client_type": "kimi_code_cli",
+          "tool_call_id": "q",
+          "tool_name": "Bash",
+          "agent_id": "main"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 4,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "Stop",
+          "turn_id": 1,
+          "client_type": "kimi_code_cli"
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": true,
+          "pending": 0,
+          "idle": 4
+        }
+      }
+    ]
+  },
+  {
+    "provider": "grok",
+    "name": "grok-gate-only-child-events-do-not-create-immortal-lifetime",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "sessionId": "native",
+          "hookEventName": "user_prompt_submit"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "sessionId": "native",
+          "hookEventName": "subagent_start",
+          "subagentType": "explore",
+          "hook_event_name": "SubagentStart",
+          "subagentId": "child"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        },
+        "accepted": false
+      }
+    ]
+  },
+  {
+    "provider": "grok",
+    "name": "journal-confirms-only-completed",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "sessionId": "native",
+          "hookEventName": "user_prompt_submit",
+          "promptId": "turn"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "sessionId": "native",
+          "hookEventName": "notification",
+          "notificationType": "task_complete",
+          "promptId": "turn",
+          "cwd": "/fixture"
+        },
+        "grok_journal": [
+          {
+            "type": "turn_started"
+          },
+          {
+            "type": "turn_ended",
+            "outcome": "completed"
+          }
+        ],
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": true,
+          "pending": 0,
+          "idle": 2
+        }
+      }
+    ]
+  },
+  {
+    "provider": "grok",
+    "name": "journal-confirms-only-cancelled",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "sessionId": "native",
+          "hookEventName": "user_prompt_submit",
+          "promptId": "turn"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "sessionId": "native",
+          "hookEventName": "notification",
+          "notificationType": "task_complete",
+          "promptId": "turn",
+          "cwd": "/fixture"
+        },
+        "grok_journal": [
+          {
+            "type": "turn_started"
+          },
+          {
+            "type": "turn_ended",
+            "outcome": "cancelled"
+          }
+        ],
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "claude",
+    "name": "malformed-payload-is-ignored-without-state-change",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": null,
+        "raw_payload": "{\"session_id\":\"native\",\"session_id\":\"other\",\"hook_event_name\":\"Stop\"}",
+        "accepted": false,
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 3,
+        "payload": null,
+        "raw_payload": "{\"broken\":",
+        "accepted": false,
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "codex",
+    "name": "malformed-payload-is-ignored-without-state-change",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": null,
+        "raw_payload": "{\"session_id\":\"native\",\"session_id\":\"other\",\"hook_event_name\":\"Stop\"}",
+        "accepted": false,
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 3,
+        "payload": null,
+        "raw_payload": "{\"broken\":",
+        "accepted": false,
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "kimi",
+    "name": "malformed-payload-is-ignored-without-state-change",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "turn",
+          "client_type": "kimi_code_cli"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": null,
+        "raw_payload": "{\"session_id\":\"native\",\"session_id\":\"other\",\"hook_event_name\":\"Stop\"}",
+        "accepted": false,
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 3,
+        "payload": null,
+        "raw_payload": "{\"broken\":",
+        "accepted": false,
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "grok",
+    "name": "malformed-payload-is-ignored-without-state-change",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "sessionId": "native",
+          "hookEventName": "user_prompt_submit"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": null,
+        "raw_payload": "{\"session_id\":\"native\",\"session_id\":\"other\",\"hook_event_name\":\"Stop\"}",
+        "accepted": false,
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 3,
+        "payload": null,
+        "raw_payload": "{\"broken\":",
+        "accepted": false,
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "cursor",
+    "name": "malformed-payload-is-ignored-without-state-change",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "conversation_id": "native",
+          "generation_id": "turn",
+          "hook_event_name": "beforeSubmitPrompt"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": null,
+        "raw_payload": "{\"session_id\":\"native\",\"session_id\":\"other\",\"hook_event_name\":\"Stop\"}",
+        "accepted": false,
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 3,
+        "payload": null,
+        "raw_payload": "{\"broken\":",
+        "accepted": false,
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "kimi",
+    "name": "child-tool-without-exit-must-not-create-immortal-lifetime",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "client_type": "kimi_code_cli",
+          "hook_event_name": "TurnStarted",
+          "turn_id": 1
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "session_id": "native",
+          "client_type": "kimi_code_cli",
+          "hook_event_name": "PreToolUse",
+          "agent_id": "a",
+          "tool_call_id": "call",
+          "tool_name": "Bash"
+        },
+        "accepted": false,
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 3,
+        "payload": {
+          "session_id": "native",
+          "client_type": "kimi_code_cli",
+          "hook_event_name": "PostToolUse",
+          "agent_id": "a",
+          "tool_call_id": "call",
+          "tool_name": "Bash"
+        },
+        "accepted": false,
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 4,
+        "payload": {
+          "session_id": "native",
+          "client_type": "kimi_code_cli",
+          "hook_event_name": "Stop",
+          "turn_id": 1
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": true,
+          "pending": 0,
+          "idle": 4
+        }
+      }
+    ]
+  },
+  {
+    "provider": "claude",
+    "name": "invalid-owner-type-int",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "Stop",
+          "turn_id": "turn",
+          "agent_id": 7
+        },
+        "accepted": false,
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "claude",
+    "name": "invalid-owner-type-bool",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "Stop",
+          "turn_id": "turn",
+          "agent_id": false
+        },
+        "accepted": false,
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "claude",
+    "name": "invalid-owner-type-NoneType",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "Stop",
+          "turn_id": "turn",
+          "agent_id": null
+        },
+        "accepted": false,
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "claude",
+    "name": "invalid-owner-type-list",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "Stop",
+          "turn_id": "turn",
+          "agent_id": []
+        },
+        "accepted": false,
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "claude",
+    "name": "invalid-owner-type-dict",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "Stop",
+          "turn_id": "turn",
+          "agent_id": {}
+        },
+        "accepted": false,
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "cursor",
+    "name": "unknown-stop-status-cannot-prove-completion",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "conversation_id": "native",
+          "hook_event_name": "beforeSubmitPrompt",
+          "generation_id": "turn"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "conversation_id": "native",
+          "hook_event_name": "stop",
+          "generation_id": "turn",
+          "status": "unknown"
+        },
+        "accepted": false,
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "kimi",
+    "name": "malformed-scalar-root-cannot-panic-provider-tagging",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "TurnStarted",
+          "turn_id": 1
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": null,
+        "raw_payload": "true",
+        "accepted": false,
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "claude",
+    "name": "malformed-id-turn_id-True",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "Stop",
+          "turn_id": true
+        },
+        "accepted": false,
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "claude",
+    "name": "malformed-id-turn_id--1",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "Stop",
+          "turn_id": -1
+        },
+        "accepted": false,
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "claude",
+    "name": "malformed-id-tool_use_id-7",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "Stop",
+          "tool_use_id": 7
+        },
+        "accepted": false,
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "cursor",
+    "name": "unidentified-child-teardown-cannot-end-parent",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "conversation_id": "native",
+          "hook_event_name": "beforeSubmitPrompt",
+          "generation_id": "turn"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "conversation_id": "child",
+          "parent_conversation_id": "native",
+          "hook_event_name": "sessionEnd"
+        },
+        "accepted": false,
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "claude",
+    "name": "rejected-owner-cannot-reconcile-parent-question",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PreToolUse",
+          "tool_name": "AskUserQuestion",
+          "tool_use_id": "q"
+        },
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": true,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        }
+      },
+      {
+        "at": 3,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PostToolBatch",
+          "agent_id": 7,
+          "tool_calls": [
+            {
+              "tool_use_id": "q"
+            }
+          ]
+        },
+        "accepted": false,
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": true,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        }
+      },
+      {
+        "at": 4,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PostToolBatch",
+          "tool_calls": [
+            {
+              "tool_use_id": "q"
+            }
+          ]
+        },
+        "accepted": false,
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "claude",
+    "name": "control-turn-alias-cannot-reconcile-parent-question",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PreToolUse",
+          "tool_name": "AskUserQuestion",
+          "tool_use_id": "q"
+        },
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": true,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        }
+      },
+      {
+        "at": 3,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PostToolBatch",
+          "tool_calls": [
+            {
+              "tool_use_id": "q"
+            }
+          ],
+          "turnId": "\n"
+        },
+        "accepted": false,
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": true,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        }
+      },
+      {
+        "at": 4,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PostToolBatch",
+          "tool_calls": [
+            {
+              "tool_use_id": "q"
+            }
+          ],
+          "turnId": "turn"
+        },
+        "accepted": false,
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "claude",
+    "name": "oversized-turn-alias-cannot-reconcile-parent-question",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "turn"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PreToolUse",
+          "tool_name": "AskUserQuestion",
+          "tool_use_id": "q"
+        },
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": true,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        }
+      },
+      {
+        "at": 3,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PostToolBatch",
+          "tool_calls": [
+            {
+              "tool_use_id": "q"
+            }
+          ],
+          "turnId": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        },
+        "accepted": false,
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": true,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        }
+      },
+      {
+        "at": 4,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PostToolBatch",
+          "tool_calls": [
+            {
+              "tool_use_id": "q"
+            }
+          ],
+          "turnId": "turn"
+        },
+        "accepted": false,
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      }
+    ]
+  },
+  {
+    "provider": "claude",
+    "name": "stale-numeric-turn-alias-cannot-reconcile-current-question",
+    "steps": [
+      {
+        "at": 1,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "9"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 2,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "Interrupt",
+          "turn_id": "9"
+        },
+        "expected": {
+          "working": false,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 3,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "UserPromptSubmit",
+          "turn_id": "10"
+        },
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      },
+      {
+        "at": 4,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PreToolUse",
+          "tool_name": "AskUserQuestion",
+          "tool_use_id": "q",
+          "turnId": 10
+        },
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": true,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        }
+      },
+      {
+        "at": 5,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PostToolBatch",
+          "tool_calls": [
+            {
+              "tool_use_id": "q"
+            }
+          ],
+          "turnId": 9
+        },
+        "accepted": false,
+        "expected": {
+          "working": true,
+          "waiting": true,
+          "response": true,
+          "done": false,
+          "pending": 1,
+          "idle": null
+        }
+      },
+      {
+        "at": 6,
+        "payload": {
+          "session_id": "native",
+          "hook_event_name": "PostToolBatch",
+          "tool_calls": [
+            {
+              "tool_use_id": "q"
+            }
+          ],
+          "turnId": 10
+        },
+        "accepted": false,
+        "expected": {
+          "working": true,
+          "waiting": false,
+          "response": false,
+          "done": false,
+          "pending": 0,
+          "idle": null
+        }
+      }
+    ]
+  }
+]

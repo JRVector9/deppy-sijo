@@ -29,10 +29,18 @@ fn field<'a>(v: &'a Value, names: &[&str]) -> Option<&'a str> {
 }
 
 pub fn normalize(v: &Value, at_micros: i64) -> Option<AgentAttentionEvent> {
-    if field(v, &["subagentType"]).is_some() {
+    if !observer_metadata_valid(v) {
         return None;
     }
-    let native = field(v, &["session_id", "sessionId"])?;
+    let native = field(
+        v,
+        &[
+            "parent_conversation_id",
+            "session_id",
+            "sessionId",
+            "conversation_id",
+        ],
+    )?;
     let name = field(v, &["hook_event_name", "hookEventName"])?
         .replace('_', "")
         .to_ascii_lowercase();
@@ -68,7 +76,8 @@ pub fn normalize(v: &Value, at_micros: i64) -> Option<AgentAttentionEvent> {
     }
     let kind = match name.as_str() {
         "sessionstart" => K::SessionStart,
-        "userpromptsubmit" => K::TurnStart,
+        "userpromptsubmit" | "turnstarted" | "beforesubmitprompt" => K::TurnStart,
+        "beforeshellexecution" | "beforemcpexecution" => K::Working,
         "pretooluse" => {
             if question {
                 K::ResponseRequired
@@ -76,7 +85,12 @@ pub fn normalize(v: &Value, at_micros: i64) -> Option<AgentAttentionEvent> {
                 K::Working
             }
         }
-        "posttooluse" | "posttoolusefailure" | "permissiondenied" => K::Resolved,
+        "posttooluse"
+        | "posttoolusefailure"
+        | "permissiondenied"
+        | "permissionresult"
+        | "aftershellexecution"
+        | "aftermcpexecution" => K::Resolved,
         "permissionrequest" => K::ApprovalRequired,
         "elicitation" => K::ResponseRequired,
         "elicitationresult" => K::Resolved,
@@ -97,9 +111,27 @@ pub fn normalize(v: &Value, at_micros: i64) -> Option<AgentAttentionEvent> {
             }
             _ => return None,
         },
+        "stop"
+            if v.get("is_interrupt").and_then(Value::as_bool) == Some(true)
+                || (v.get("conversation_id").is_some()
+                    && matches!(
+                        field(v, &["status"]),
+                        Some("aborted" | "cancelled" | "error")
+                    )) =>
+        {
+            K::Cancelled
+        }
+        "stop"
+            if v.get("conversation_id").is_some() && field(v, &["status"]) != Some("completed") =>
+        {
+            return None;
+        }
         "stop" => K::Completed,
         "subagentstart" | "subagentstop" => {
-            field(v, &["agent_id"])?;
+            child_identity(v)?;
+            if name == "subagentstop" && field(v, &["phase"]) == Some("gate") {
+                return None;
+            }
             request = "lifecycle".into();
             if name == "subagentstart" {
                 K::Working
@@ -111,7 +143,7 @@ pub fn normalize(v: &Value, at_micros: i64) -> Option<AgentAttentionEvent> {
         "sessionend" => K::SessionEnd,
         _ => return None,
     };
-    let kind = if field(v, &["agent_id"]).is_some() {
+    let kind = if child_identity(v).is_some() {
         match kind {
             K::ResponseRequired | K::ApprovalRequired | K::Resolved | K::Working => kind,
             K::Cancelled | K::SessionEnd => K::Cancelled,
@@ -121,7 +153,7 @@ pub fn normalize(v: &Value, at_micros: i64) -> Option<AgentAttentionEvent> {
         kind
     };
     let request = scoped_request_id(v, &request);
-    let turn_id = field(v, &["turn_id", "turnId", "promptId", "prompt_id"]).map(str::to_owned);
+    let turn_id = canonical_turn_id(v);
     let tool_group = (!tool.is_empty()).then(|| {
         let mut hash = std::collections::hash_map::DefaultHasher::new();
         tool.hash(&mut hash);
@@ -135,18 +167,116 @@ pub fn normalize(v: &Value, at_micros: i64) -> Option<AgentAttentionEvent> {
         at_micros,
         tool_group,
         tool_input_hash: tool_input_hash(v),
-        child_id: field(v, &["agent_id"]).map(str::to_owned),
+        child_id: child_identity(v).map(str::to_owned),
     })
 }
 
 fn scoped_request_id(v: &Value, id: &str) -> String {
-    if let Some(agent) = field(v, &["agent_id"]) {
+    if let Some(agent) = child_identity(v) {
         let mut hash = std::collections::hash_map::DefaultHasher::new();
         agent.hash(&mut hash);
         format!("child:{:016x}:{id}", hash.finish())
     } else {
         id.to_owned()
     }
+}
+
+fn observer_metadata_valid(v: &Value) -> bool {
+    identity_metadata_valid(v)
+        && field(v, &["subagentType"]).is_none()
+        && !(field(v, &["client_type"]) == Some("kimi_code_cli") && child_identity(v).is_some())
+        && !(field(v, &["parent_conversation_id"]).is_some() && child_identity(v).is_none())
+}
+
+fn valid_hook_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 256 && !id.chars().any(char::is_control)
+}
+
+fn canonical_turn_id(v: &Value) -> Option<String> {
+    [
+        "turn_id",
+        "turnId",
+        "promptId",
+        "prompt_id",
+        "generation_id",
+    ]
+    .iter()
+    .find_map(|key| {
+        v.get(key).and_then(|id| {
+            id.as_str()
+                .filter(|id| valid_hook_id(id))
+                .map(str::to_owned)
+                .or_else(|| id.as_u64().map(|n| n.to_string()))
+        })
+    })
+}
+
+pub(crate) fn identity_metadata_valid(v: &Value) -> bool {
+    for key in [
+        "turn_id",
+        "turnId",
+        "promptId",
+        "prompt_id",
+        "generation_id",
+    ] {
+        if let Some(id) = v.get(key)
+            && !id.is_null()
+            && id.as_str().is_none_or(|id| !valid_hook_id(id))
+            && id.as_u64().is_none()
+        {
+            return false;
+        }
+    }
+    for key in [
+        "session_id",
+        "sessionId",
+        "conversation_id",
+        "tool_use_id",
+        "toolUseId",
+        "call_id",
+        "tool_call_id",
+        "elicitation_id",
+    ] {
+        if let Some(id) = v.get(key)
+            && !id.is_null()
+            && id.as_str().is_none_or(|id| !valid_hook_id(id))
+        {
+            return false;
+        }
+    }
+    let mut identity: Option<&str> = None;
+    for key in [
+        "agent_id",
+        "subagent_id",
+        "subagentId",
+        "subagentType",
+        "parent_conversation_id",
+    ] {
+        if let Some(value) = v.get(key) {
+            let Some(id) = value.as_str().filter(|id| valid_hook_id(id)) else {
+                return false;
+            };
+            if matches!(key, "agent_id" | "subagent_id" | "subagentId") {
+                if id.len() > 128
+                    || !id
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                {
+                    return false;
+                }
+                if identity.is_some_and(|previous| previous != id) {
+                    return false;
+                }
+                identity = Some(id);
+            }
+        }
+    }
+    true
+}
+
+pub(crate) fn child_identity(v: &Value) -> Option<&str> {
+    field(v, &["agent_id", "subagent_id", "subagentId"])
+        .filter(|id| !(field(v, &["client_type"]) == Some("kimi_code_cli") && *id == "main"))
 }
 
 /// 실행 전 거절·실행 중 취소는 결과 훅 대신 tool_result에 남는다.
@@ -182,6 +312,9 @@ fn claude_finished_requests(text: &str, pending: &[String], context: &Value) -> 
 }
 
 pub fn reconcile_claude_results(db: &storage::Db, key: &str, v: &Value, at: i64) {
+    if !observer_metadata_valid(v) {
+        return;
+    }
     let Some(native) = field(v, &["session_id"]) else {
         return;
     };
@@ -255,7 +388,7 @@ pub fn reconcile_claude_results(db: &storage::Db, key: &str, v: &Value, at: i64)
             key,
             &AgentAttentionEvent {
                 native_session_id: native.into(),
-                turn_id: field(v, &["turn_id"]).map(str::to_owned),
+                turn_id: canonical_turn_id(v),
                 request_id: id,
                 kind: K::Resolved,
                 at_micros: at,
@@ -319,6 +452,9 @@ fn bounded_tail(path: &std::path::Path) -> Option<String> {
 }
 
 pub fn reconcile_codex_results(db: &storage::Db, key: &str, v: &Value, at: i64) {
+    if !observer_metadata_valid(v) {
+        return;
+    }
     let Some(native) = field(v, &["session_id"]) else {
         return;
     };
@@ -346,7 +482,7 @@ pub fn reconcile_codex_results(db: &storage::Db, key: &str, v: &Value, at: i64) 
             key,
             &AgentAttentionEvent {
                 native_session_id: native.into(),
-                turn_id: field(v, &["turn_id"]).map(str::to_owned),
+                turn_id: canonical_turn_id(v),
                 request_id: id,
                 kind: K::Resolved,
                 at_micros: at,
@@ -379,6 +515,13 @@ fn grok_completed(text: &str) -> bool {
 }
 
 pub fn confirm_grok_completion(v: &Value, event: &mut AgentAttentionEvent) {
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    confirm_grok_completion_in(v, event, std::path::Path::new(&home));
+}
+
+fn confirm_grok_completion_in(v: &Value, event: &mut AgentAttentionEvent, home: &std::path::Path) {
     if v.get("hookEventName").is_none() || !matches!(event.kind, K::IdleObserved | K::Completed) {
         return;
     }
@@ -398,9 +541,6 @@ pub fn confirm_grok_completion(v: &Value, event: &mut AgentAttentionEvent) {
     {
         return;
     }
-    let Some(home) = std::env::var_os("HOME") else {
-        return;
-    };
     let encoded = cwd
         .bytes()
         .map(|b| {
@@ -411,7 +551,7 @@ pub fn confirm_grok_completion(v: &Value, event: &mut AgentAttentionEvent) {
             }
         })
         .collect::<String>();
-    let path = std::path::PathBuf::from(home)
+    let path = home
         .join(".grok/sessions")
         .join(encoded)
         .join(&event.native_session_id)
@@ -420,6 +560,10 @@ pub fn confirm_grok_completion(v: &Value, event: &mut AgentAttentionEvent) {
         event.kind = K::Completed;
     }
 }
+
+#[cfg(test)]
+#[path = "agent_status_harness.rs"]
+mod agent_status_harness;
 
 #[cfg(test)]
 mod tests {

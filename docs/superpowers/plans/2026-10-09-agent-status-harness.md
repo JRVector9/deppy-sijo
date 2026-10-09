@@ -43,7 +43,7 @@ Files: modify `.github/workflows/build-test.yml`; add `scripts/verify-agent-stat
 - [x] Provide one local command for storage lifecycle, provider replay, terminal status detector and App display precedence; fail on any regression and emit named cases. No app launch or live provider prompts.
 - [x] Add a named agent-status harness CI job using the same test scopes and retain ordinary full macOS tests.
 - [x] Run actual local gates, source-only Codex review and necessary corrections, then commit/journal the harness unit.
-- [ ] Report verified coverage and material unverified/live-provider limitations. Source version stays0.8.7; a later delivered app requires a version increase and explicit restart authorization.
+- [x] Report verified coverage and material unverified/live-provider limitations. Source version stays0.8.7; a later delivered app requires a version increase and explicit restart authorization.
 
 ## Exact local commands
 
@@ -51,10 +51,10 @@ All local Cargo calls must use `/private/tmp/deppy-audit-nine-pr-20261004/cargo_
 
 ## Task 5 — Close the discovered PWA status parity gap
 
-Files: `crates/web-remote/src/{repository.rs,dashboard.rs,lib.rs}`, `crates/app/src/app.rs`; extend the maintained gate.
+Files: `crates/web-remote/src/{repository.rs,dashboard.rs,lib.rs}`, App/workspace and shared session status; runtime token/spawn validation, storage projection/reducer, proxy retained-hook reader/adapter; extend the maintained gate.
 
-- [ ] Reproduce raw runtime Done versus live hook child Working through the dashboard and App-owned repository.
-- [ ] Read a bounded status-only projection in the dashboard worker, independently of GUI frames. Preserve raw terminal/process observations separately from hook facts.
-- [ ] Bind reads explicitly to workspace/worker generation; discard results when reconnect/switch invalidates the owner. Never hold the dashboard input mutex across database reads.
-- [ ] Test parent/child/question/approval/exit/manual overrides, hidden-window updates, reused numeric IDs and blocked-query reconnect; run affected gates and prescribed source review.
-- [ ] Correct findings, commit/journal this separate source unit, and update coverage/limits/handoff. No release or restart.
+- [x] Reproduce raw runtime Done versus live hook child Working through the dashboard and App-owned repository.
+- [x] Read a bounded status-only projection in the dashboard worker, independently of GUI frames. Preserve raw terminal/process observations separately from hook facts.
+- [x] Bind reads explicitly to workspace/worker generation; discard results when reconnect/switch invalidates the owner. Never hold the dashboard input mutex across database reads.
+- [x] Test parent/child/question/approval/exit/manual overrides, hidden-window updates, reused numeric IDs and blocked-query reconnect; run affected gates and prescribed source review. Actual findings corrected; final narrow correction review OK, final maintained605PASS/1ignored and full App/web/strict/boundary checks PASS.
+- [x] Correct findings, commit/journal this separate source unit, and update coverage/limits/handoff. Source unit includes its final plan and handoff; journal records the resulting commit. No release or restart.

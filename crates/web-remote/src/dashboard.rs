@@ -168,6 +168,7 @@ fn pressure_reason(reason: runtime::PtyInputRejectReason) -> &'static str {
 #[derive(Debug, Clone, PartialEq)]
 struct SessionEntry {
     status: SessionStatus,
+    user_override: Option<SessionStatus>,
     /// SessionExited/Restored 관측 — 완료 배지.
     exited: bool,
 }
@@ -183,6 +184,7 @@ struct SessionEntry {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionSeed {
     pub id: Option<u64>,
+    pub user_override: Option<SessionStatus>,
     pub title: String,
     pub status: Option<SessionStatus>,
     /// 돌고 있는 에이전트 요약("Claude · sonnet · high"). 앱의 감지 결과 — 활성
@@ -285,11 +287,23 @@ fn apply_event(
             true
         }
         RuntimeEvent::SessionStatusViewChanged { session, view } => {
-            sessions.entry(session.0).or_insert_with(new_entry).status = view.status;
+            let entry = sessions.entry(session.0).or_insert_with(new_entry);
+            entry.status = view.detected_status;
+            entry.user_override = view.user_override;
             true
         }
-        RuntimeEvent::SessionExited { session, .. }
-        | RuntimeEvent::SessionRestored { session, .. } => {
+        RuntimeEvent::SessionExited { session, exit_code } => {
+            let entry = sessions.entry(session.0).or_insert_with(new_entry);
+            entry.exited = true;
+            entry.user_override = None;
+            entry.status = if exit_code.is_some_and(|code| code != 0) {
+                SessionStatus::Error
+            } else {
+                SessionStatus::Done
+            };
+            true
+        }
+        RuntimeEvent::SessionRestored { session, .. } => {
             let entry = sessions.entry(session.0).or_insert_with(new_entry);
             entry.exited = true;
             entry.status = SessionStatus::Done;
@@ -311,6 +325,7 @@ fn apply_event(
 fn new_entry() -> SessionEntry {
     SessionEntry {
         status: SessionStatus::Running,
+        user_override: None,
         exited: false,
     }
 }
@@ -346,10 +361,33 @@ fn resource_view(snapshot: &ProcessResourceSnapshot) -> ResourceView {
 /// - **활성 워크스페이스**: 소속·상태는 이벤트 맵이 근거(프레임 독립 — 창이 숨겨져도
 ///   흐른다). 제목은 앱 스냅샷에서 가져오고(없으면 "세션 N" 폴백), 시청 가능(id 포함).
 /// - **warm/유휴**: 앱 스냅샷 그대로 — 표시 전용(id 없음).
+fn projected_status(
+    entry: &SessionEntry,
+    hook: Option<&crate::repository::AgentStatusRecord>,
+) -> SessionStatus {
+    if entry.exited {
+        return entry.status;
+    }
+    let facts = hook.copied().unwrap_or_default();
+    entry
+        .user_override
+        .or_else(|| {
+            SessionStatus::from_attention(
+                Some(entry.status),
+                facts.waiting,
+                facts.response,
+                facts.working,
+                facts.done,
+            )
+        })
+        .unwrap_or(entry.status)
+}
+
 fn workspace_views(
     workspaces: &[WorkspaceSeed],
     live: &BTreeMap<u64, SessionEntry>,
     ids: &IdMap,
+    hook: &BTreeMap<u64, crate::repository::AgentStatusRecord>,
 ) -> Vec<WorkspaceView> {
     // 앱 스냅샷이 아직 없는데(웹서버 기동 직후 첫 프레임 전) 라이브 세션이 있으면,
     // 세션이 통째로 안 보이는 것보다 이름 없는 활성 워크스페이스로라도 보여준다.
@@ -365,7 +403,7 @@ fn workspace_views(
                     // UUID가 없으면 표시 전용 — 폰은 u64를 모른다 (I1).
                     id: ids.uuid(*id).map(str::to_owned),
                     title: format!("세션 {id}"),
-                    status: Some(status_str(entry.status)),
+                    status: Some(status_str(projected_status(entry, hook.get(id)))),
                     agent: None,
                     exited: entry.exited,
                 })
@@ -393,7 +431,7 @@ fn workspace_views(
                             title: seed
                                 .map(|s| s.title.clone())
                                 .unwrap_or_else(|| format!("세션 {id}")),
-                            status: Some(status_str(entry.status)),
+                            status: Some(status_str(projected_status(entry, hook.get(id)))),
                             agent: seed.and_then(|s| s.agent.clone()),
                             exited: entry.exited,
                         }
@@ -445,6 +483,9 @@ struct Inner {
     workspaces: Vec<WorkspaceSeed>,
     resource: Option<ResourceView>,
     last_poll: Instant,
+    status_workspace: Option<String>,
+    status_runtime: Option<String>,
+    hook_status: BTreeMap<u64, crate::repository::AgentStatusRecord>,
     /// 웹푸시 발송 싱크(P4). 이벤트 drain 시 세션 상태 전이(입력대기/완료)를 넘긴다 —
     /// 승인 발송은 push가 DB를 직접 폴링하므로 여기서 넘기지 않는다. None이면 푸시 비활성.
     push_sink: Option<crate::push::PushHandle>,
@@ -559,6 +600,9 @@ impl DashboardHandle {
                 workspaces: Vec::new(),
                 resource: None,
                 last_poll: Instant::now() - POLL_INTERVAL,
+                status_workspace: None,
+                status_runtime: None,
+                hook_status: BTreeMap::new(),
                 push_sink: None,
                 command_sink: None,
                 switch_sink: None,
@@ -620,11 +664,35 @@ impl DashboardHandle {
     /// 해제를 보내지 않아도 TTL(≤45s)로 원복된다(Warm 전환 직후라 유계 허용).
     /// 폰 시청자는 프레임이 멎으므로 새 세션 목록에서 다시 선택한다.
     pub fn set_runtime_binding(&self, receiver: RuntimeEventReceiver, sink: Option<CommandSink>) {
+        self.replace_runtime_binding(None, None, receiver, sink);
+    }
+
+    pub fn set_runtime_binding_for_workspace(
+        &self,
+        workspace: String,
+        runtime: String,
+        receiver: RuntimeEventReceiver,
+        sink: Option<CommandSink>,
+    ) {
+        self.replace_runtime_binding(Some(workspace), Some(runtime), receiver, sink);
+    }
+
+    fn replace_runtime_binding(
+        &self,
+        workspace: Option<String>,
+        runtime: Option<String>,
+        receiver: RuntimeEventReceiver,
+        sink: Option<CommandSink>,
+    ) {
         {
             let mut inner = self.shared.inner.lock().expect("dashboard inner lock");
             Self::clear_watch_state(&mut inner, &self.shared);
             inner.ids.clear();
             inner.sessions.clear();
+            inner.hook_status.clear();
+            inner.status_workspace = workspace;
+            inner.status_runtime = runtime;
+            inner.force_poll = true;
             inner.receiver = Some(receiver);
             inner.command_sink = sink;
             inner.needs_initial_mux = true;
@@ -1098,6 +1166,7 @@ impl DashboardHandle {
                             id,
                             SessionEntry {
                                 status: seed.status.unwrap_or(SessionStatus::Running),
+                                user_override: seed.user_override,
                                 exited: seed.exited,
                             },
                         )
@@ -1713,13 +1782,50 @@ fn run(shared: &Arc<Shared>) {
         if should_poll {
             inner.last_poll = Instant::now();
             shared.poll_count.fetch_add(1, Ordering::SeqCst);
-            match shared.repository.as_ref() {
-                Some(repository) => match repository.list_pending_approvals(PENDING_APPROVAL_LIMIT)
-                {
-                    Ok(rows) => approvals = Some(approval_views(rows, &inner.ids)),
-                    Err(e) => tracing::warn!("web-remote 승인 목록 폴링 실패: {e:#}"),
-                },
+            // Repository I/O never holds the input/rebind mutex. Returned rows belong
+            // to this exact workspace/runtime generation, not a reused numeric ID.
+            let generation = inner.watch_generation;
+            let workspace = inner.status_workspace.clone();
+            let runtime = inner.status_runtime.clone();
+            drop(inner);
+            let approval_rows = shared
+                .repository
+                .as_ref()
+                .map(|repository| repository.list_pending_approvals(PENDING_APPROVAL_LIMIT));
+            let hook_rows =
+                workspace
+                    .as_deref()
+                    .zip(runtime.as_deref())
+                    .and_then(|(workspace, runtime)| {
+                        shared
+                            .repository
+                            .as_ref()
+                            .map(|repository| repository.list_agent_status(workspace, runtime))
+                    });
+            inner = shared.inner.lock().expect("dashboard inner lock");
+            if generation != inner.watch_generation
+                || workspace != inner.status_workspace
+                || runtime != inner.status_runtime
+            {
+                inner.dirty = true;
+                inner.dashboard_dirty |= rebuild_dashboard;
+                continue;
+            }
+            match approval_rows {
+                Some(Ok(rows)) => approvals = Some(approval_views(rows, &inner.ids)),
+                Some(Err(error)) => tracing::warn!("web-remote 승인 목록 폴링 실패: {error:#}"),
                 None => approvals = Some(Vec::new()),
+            }
+            match hook_rows {
+                Some(Ok(rows)) if rows.len() <= crate::repository::AGENT_STATUS_LIMIT => {
+                    let facts: BTreeMap<_, _> =
+                        rows.into_iter().map(|row| (row.session, row)).collect();
+                    rebuild_dashboard |= facts != inner.hook_status;
+                    inner.hook_status = facts;
+                }
+                Some(Err(error)) => tracing::warn!("web-remote 상태 폴링 실패: {error:#}"),
+                Some(Ok(_)) => tracing::warn!("web-remote 상태 행 제한 초과"),
+                None => {}
             }
         }
 
@@ -1749,7 +1855,12 @@ fn run(shared: &Arc<Shared>) {
             let dash_json = (rebuild_dashboard || should_poll).then(|| {
                 shared.dash_build_count.fetch_add(1, Ordering::SeqCst);
                 ServerMsg::Dashboard {
-                    workspaces: workspace_views(&inner.workspaces, &inner.sessions, &inner.ids),
+                    workspaces: workspace_views(
+                        &inner.workspaces,
+                        &inner.sessions,
+                        &inner.ids,
+                        &inner.hook_status,
+                    ),
                     resource: inner.resource.clone(),
                     notice: inner.notice.clone(),
                 }
@@ -1822,6 +1933,404 @@ mod tests {
                 focused_pane: Some(runtime::MuxPaneId("p-1".into())),
             }),
         }
+    }
+
+    #[test]
+    fn agent_status_harness_live_child_overrides_parent_done_in_pwa() {
+        let mut ids = IdMap::default();
+        ids.insert("pane".into(), 1);
+        let live = BTreeMap::from([(
+            1,
+            SessionEntry {
+                status: SessionStatus::Done,
+                user_override: None,
+                exited: false,
+            },
+        )]);
+        let hook = BTreeMap::from([(
+            1,
+            crate::repository::AgentStatusRecord {
+                session: 1,
+                working: true,
+                ..Default::default()
+            },
+        )]);
+        let views = workspace_views(&[], &live, &ids, &hook);
+        assert_eq!(views[0].sessions[0].status, Some("running"));
+    }
+
+    #[test]
+    fn agent_status_harness_request_error_override_and_exit_precedence() {
+        use crate::repository::AgentStatusRecord as F;
+        let mut entry = new_entry();
+        let mut facts = F {
+            working: true,
+            done: true,
+            waiting: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            projected_status(&entry, Some(&facts)),
+            SessionStatus::NeedsApproval
+        );
+        facts.response = true;
+        assert_eq!(
+            projected_status(&entry, Some(&facts)),
+            SessionStatus::Waiting
+        );
+        facts.waiting = false;
+        facts.response = false;
+        entry.status = SessionStatus::Error;
+        assert_eq!(projected_status(&entry, Some(&facts)), SessionStatus::Error);
+        entry.status = SessionStatus::Done;
+        assert_eq!(
+            projected_status(&entry, Some(&facts)),
+            SessionStatus::Running
+        );
+        entry.user_override = Some(SessionStatus::Idle);
+        assert_eq!(projected_status(&entry, Some(&facts)), SessionStatus::Idle);
+        entry.exited = true;
+        entry.status = SessionStatus::Error;
+        assert_eq!(projected_status(&entry, Some(&facts)), SessionStatus::Error);
+    }
+
+    #[test]
+    fn agent_status_harness_existing_user_override_survives_subscription_seed() {
+        let (handle, thread) = DashboardHandle::spawn(None);
+        handle.reseed_active_sessions(&[SessionSeed {
+            id: Some(7),
+            user_override: Some(SessionStatus::Idle),
+            title: "agent".into(),
+            status: Some(SessionStatus::Done),
+            agent: None,
+            exited: false,
+        }]);
+        let inner = handle.shared.inner.lock().unwrap();
+        let facts = crate::repository::AgentStatusRecord {
+            session: 7,
+            working: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            projected_status(&inner.sessions[&7], Some(&facts)),
+            SessionStatus::Idle
+        );
+        drop(inner);
+        handle.stop();
+        thread.join().unwrap();
+    }
+
+    fn wait_harness_status(handle: &DashboardHandle, expected: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some((_, frame)) = handle.dashboard_if_newer(0) {
+                let value: serde_json::Value = serde_json::from_str(&frame).unwrap();
+                if value["workspaces"][0]["sessions"][0]["status"].as_str() == Some(expected) {
+                    return;
+                }
+            }
+            assert!(Instant::now() < deadline, "missing status {expected}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn agent_status_harness_real_repository_updates_without_gui_frames() {
+        use storage::{AgentAttentionEvent as E, AttentionEventKind as K};
+        let (mut runtime, directory) = direct_test_runtime();
+        let path = directory.join("metadata.sqlite3");
+        let db = storage::Db::open(&path).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as i64;
+        let event = |kind, request: &str, child: Option<&str>, offset| E {
+            native_session_id: "native".into(),
+            runtime_instance: Some(runtime.instance_token().to_owned()),
+            turn_id: Some("turn".into()),
+            request_id: request.into(),
+            kind,
+            at_micros: now + offset,
+            tool_group: None,
+            tool_input_hash: None,
+            child_id: child.map(str::to_owned),
+        };
+        db.record_agent_attention("ws:7", &event(K::TurnStart, "", None, 0))
+            .unwrap();
+        db.record_agent_attention(
+            "ws:7",
+            &event(K::Working, "child:a:lifecycle", Some("a"), 1),
+        )
+        .unwrap();
+        db.record_agent_attention("ws:7", &event(K::Completed, "", None, 2))
+            .unwrap();
+        let repository = crate::repository::StorageTestRepository::open(&path);
+        let (handle, thread) = DashboardHandle::spawn(Some(repository));
+        handle.set_runtime_binding_for_workspace(
+            "ws".into(),
+            runtime.instance_token().to_owned(),
+            runtime.subscribe_with_wake_background(handle.wake_fn()),
+            None,
+        );
+        handle.inject_event(mux_event(&[(7, "agent")]));
+        handle.inject_event(RuntimeEvent::SessionStatusChanged {
+            session: SessionId(7),
+            status: SessionStatus::Done,
+        });
+        let connection = handle.register_connection();
+        wait_harness_status(&handle, "running");
+        db.record_agent_attention(
+            "ws:7",
+            &event(K::ResponseRequired, "child:a:q", Some("a"), 3),
+        )
+        .unwrap();
+        wait_harness_status(&handle, "waiting");
+        db.record_agent_attention("ws:7", &event(K::Resolved, "child:a:q", Some("a"), 4))
+            .unwrap();
+        wait_harness_status(&handle, "running");
+        db.record_agent_attention(
+            "ws:7",
+            &event(K::Cancelled, "child:a:lifecycle", Some("a"), 5),
+        )
+        .unwrap();
+        wait_harness_status(&handle, "done");
+        handle.inject_event(RuntimeEvent::SessionStatusViewChanged {
+            session: SessionId(7),
+            view: runtime::SessionStatusView::detected(
+                SessionStatus::Done,
+                runtime::StatusSource::ScreenText,
+                None,
+                Some(SessionStatus::Idle),
+            ),
+        });
+        wait_harness_status(&handle, "idle");
+        handle.inject_event(RuntimeEvent::SessionExited {
+            session: SessionId(7),
+            exit_code: Some(1),
+        });
+        wait_harness_status(&handle, "error");
+        drop(connection);
+        handle.stop();
+        thread.join().unwrap();
+        runtime.shutdown();
+        drop(db);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn agent_status_harness_blocked_read_does_not_block_input_or_rebind_and_discards_old_owner() {
+        use storage::{AgentAttentionEvent as E, AttentionEventKind as K};
+        let (mut runtime, directory) = direct_test_runtime();
+        let path = directory.join("metadata.sqlite3");
+        let db = storage::Db::open(&path).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as i64;
+        db.record_agent_attention(
+            "old:7",
+            &E {
+                native_session_id: "native".into(),
+                runtime_instance: Some(runtime.instance_token().to_owned()),
+                turn_id: None,
+                request_id: "q".into(),
+                kind: K::ResponseRequired,
+                at_micros: now,
+                tool_group: None,
+                tool_input_hash: None,
+                child_id: None,
+            },
+        )
+        .unwrap();
+        let repository = crate::repository::StorageTestRepository::open(&path);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        repository
+            .status_pauses
+            .lock()
+            .unwrap()
+            .push_back(crate::repository::StatusReadPause {
+                started: started_tx,
+                release: release_rx,
+            });
+        let (handle, thread) = DashboardHandle::spawn(Some(repository));
+        let (sink, captured) = capture_sink();
+        handle.set_runtime_binding_for_workspace(
+            "old".into(),
+            runtime.instance_token().to_owned(),
+            runtime.subscribe_with_wake_background(handle.wake_fn()),
+            Some(sink.clone()),
+        );
+        handle.inject_event(mux_event(&[(7, "old")]));
+        let connection = handle.register_connection();
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let before = Instant::now();
+        handle.rebind_watch(None, Some(&test_uuid(7)));
+        handle.send_key(&test_uuid(7), "esc");
+        assert!(
+            captured
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| matches!(c, RuntimeCommand::WriteInput { .. }))
+        );
+        handle.set_runtime_binding_for_workspace(
+            "new".into(),
+            runtime.instance_token().to_owned(),
+            runtime.subscribe_with_wake_background(handle.wake_fn()),
+            Some(sink),
+        );
+        handle.inject_event(mux_event(&[(7, "new")]));
+        handle.inject_event(RuntimeEvent::SessionStatusChanged {
+            session: SessionId(7),
+            status: SessionStatus::Idle,
+        });
+        assert!(
+            before.elapsed() < Duration::from_secs(1),
+            "repository held input/rebind lock"
+        );
+        assert!(handle.shared.inner.lock().unwrap().hook_status.is_empty());
+        release_tx.send(()).unwrap();
+        wait_harness_status(&handle, "idle");
+        assert!(
+            handle.shared.inner.lock().unwrap().hook_status.is_empty(),
+            "old workspace result applied to reused numeric ID"
+        );
+        drop(connection);
+        handle.stop();
+        thread.join().unwrap();
+        runtime.shutdown();
+        drop(db);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn agent_status_harness_same_workspace_rebind_rejects_captured_old_generation() {
+        use storage::{AgentAttentionEvent as E, AttentionEventKind as K};
+        let (mut runtime, directory) = direct_test_runtime();
+        let path = directory.join("metadata.sqlite3");
+        let db = storage::Db::open(&path).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as i64;
+        let event = |native: &str, kind, offset| E {
+            native_session_id: native.into(),
+            runtime_instance: Some(runtime.instance_token().to_owned()),
+            turn_id: None,
+            request_id: "q".into(),
+            kind,
+            at_micros: now + offset,
+            tool_group: None,
+            tool_input_hash: None,
+            child_id: None,
+        };
+        db.record_agent_attention("ws:7", &event("old", K::ResponseRequired, 0))
+            .unwrap();
+        let repository = crate::repository::StorageTestRepository::open(&path);
+        let (first_started, first_wait) = std::sync::mpsc::channel();
+        let (first_release, first_block) = std::sync::mpsc::channel();
+        let (second_started, second_wait) = std::sync::mpsc::channel();
+        let (second_release, second_block) = std::sync::mpsc::channel();
+        repository.status_pauses.lock().unwrap().extend([
+            crate::repository::StatusReadPause {
+                started: first_started,
+                release: first_block,
+            },
+            crate::repository::StatusReadPause {
+                started: second_started,
+                release: second_block,
+            },
+        ]);
+        let (handle, thread) = DashboardHandle::spawn(Some(repository));
+        handle.set_runtime_binding_for_workspace(
+            "ws".into(),
+            runtime.instance_token().to_owned(),
+            runtime.subscribe_with_wake_background(handle.wake_fn()),
+            None,
+        );
+        handle.inject_event(mux_event(&[(7, "old")]));
+        let connection = handle.register_connection();
+        first_wait.recv_timeout(Duration::from_secs(5)).unwrap();
+        handle.set_runtime_binding_for_workspace(
+            "ws".into(),
+            runtime.instance_token().to_owned(),
+            runtime.subscribe_with_wake_background(handle.wake_fn()),
+            None,
+        );
+        handle.inject_event(mux_event(&[(7, "new")]));
+        db.record_agent_attention("ws:7", &event("new", K::SessionStart, 1))
+            .unwrap();
+        db.record_agent_attention("ws:7", &event("new", K::TurnStart, 2))
+            .unwrap();
+        first_release.send(()).unwrap();
+        second_wait.recv_timeout(Duration::from_secs(5)).unwrap();
+        // Fresh query is paused too: the old captured question must never have
+        // been published, even though workspace string and numeric ID match.
+        assert!(handle.shared.inner.lock().unwrap().hook_status.is_empty());
+        if let Some((_, frame)) = handle.dashboard_if_newer(0) {
+            assert!(
+                !frame.contains("\"waiting\""),
+                "old generation question published: {frame}"
+            );
+        }
+        second_release.send(()).unwrap();
+        wait_harness_status(&handle, "running");
+        assert!(!handle.shared.inner.lock().unwrap().hook_status[&7].waiting);
+        drop(connection);
+        handle.stop();
+        thread.join().unwrap();
+        runtime.shutdown();
+        drop(db);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn agent_status_harness_fresh_runtime_does_not_inherit_persisted_question_without_new_hook() {
+        use storage::{AgentAttentionEvent as E, AttentionEventKind as K};
+        let (mut runtime, directory) = direct_test_runtime();
+        let path = directory.join("metadata.sqlite3");
+        let db = storage::Db::open(&path).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as i64;
+        db.record_agent_attention(
+            "ws:7",
+            &E {
+                native_session_id: "old-native".into(),
+                runtime_instance: Some("old-runtime".into()),
+                turn_id: None,
+                request_id: "q".into(),
+                kind: K::ResponseRequired,
+                at_micros: now,
+                tool_group: None,
+                tool_input_hash: None,
+                child_id: None,
+            },
+        )
+        .unwrap();
+        let repository = crate::repository::StorageTestRepository::open(&path);
+        let (handle, thread) = DashboardHandle::spawn(Some(repository));
+        handle.set_runtime_binding_for_workspace(
+            "ws".into(),
+            runtime.instance_token().to_owned(),
+            runtime.subscribe_with_wake_background(handle.wake_fn()),
+            None,
+        );
+        handle.inject_event(mux_event(&[(7, "new-shell")]));
+        handle.inject_event(RuntimeEvent::SessionStatusChanged {
+            session: SessionId(7),
+            status: SessionStatus::Idle,
+        });
+        let connection = handle.register_connection();
+        wait_harness_status(&handle, "idle");
+        drop(connection);
+        handle.stop();
+        thread.join().unwrap();
+        runtime.shutdown();
+        drop(db);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -1960,6 +2469,7 @@ mod tests {
             10,
             SessionEntry {
                 status: SessionStatus::NeedsApproval,
+                user_override: None,
                 exited: false,
             },
         );
@@ -1971,6 +2481,7 @@ mod tests {
                 state: WorkspaceState::Active,
                 sessions: vec![SessionSeed {
                     id: Some(10),
+                    user_override: None,
                     title: "deppy-sijo".into(),
                     status: Some(SessionStatus::Running),
                     agent: Some("Claude · sonnet · high".into()),
@@ -1984,6 +2495,7 @@ mod tests {
                 state: WorkspaceState::Warm,
                 sessions: vec![SessionSeed {
                     id: Some(10), // 앱이 실수로 id를 넣어도 브리지가 표시 전용으로 만든다
+                    user_override: None,
                     title: "deppy-mux".into(),
                     status: None,
                     agent: None,
@@ -1994,7 +2506,7 @@ mod tests {
         // I1: 활성 세션의 UUID 매핑(MuxUpdated 유래)이 있어야 시청 가능한 id가 나온다
         let mut ids = IdMap::default();
         ids.insert(test_uuid(10), 10);
-        let views = workspace_views(&seeds, &live, &ids);
+        let views = workspace_views(&seeds, &live, &ids, &BTreeMap::new());
         assert_eq!(views.len(), 2);
         // 활성: 라이브 상태(needs_approval) + 앱이 해석한 표시명
         assert_eq!(
@@ -3243,6 +3755,7 @@ mod tests {
             state: WorkspaceState::Active,
             sessions: vec![SessionSeed {
                 id: Some(7),
+                user_override: None,
                 title: "deppy-sijo".into(),
                 status,
                 agent: None,
@@ -3264,7 +3777,12 @@ mod tests {
         // 상태는 여전히 done이어야 한다 — 표시명만 갱신된다
         let views = {
             let inner = handle.shared.inner.lock().unwrap();
-            workspace_views(&inner.workspaces, &inner.sessions, &inner.ids)
+            workspace_views(
+                &inner.workspaces,
+                &inner.sessions,
+                &inner.ids,
+                &BTreeMap::new(),
+            )
         };
         assert_eq!(views[0].sessions[0].status, Some("done"), "상태가 되돌아감");
         assert_eq!(views[0].sessions[0].title, "deppy-sijo (2)");

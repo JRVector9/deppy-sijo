@@ -96,6 +96,35 @@ impl SessionStatusView {
 }
 
 impl SessionStatus {
+    /// Confirmed requests/errors and live hook work precede older completion.
+    /// None leaves transcript/terminal fallback to the caller.
+    pub fn from_attention(
+        detected: Option<Self>,
+        waiting: bool,
+        response: bool,
+        working: bool,
+        done: bool,
+    ) -> Option<Self> {
+        if waiting || response {
+            Some(if response {
+                Self::Waiting
+            } else {
+                Self::NeedsApproval
+            })
+        } else if matches!(
+            detected,
+            Some(Self::Error | Self::Waiting | Self::NeedsApproval)
+        ) {
+            detected
+        } else if working {
+            Some(Self::Running)
+        } else if done || detected == Some(Self::Done) {
+            Some(Self::Done)
+        } else {
+            None
+        }
+    }
+
     /// 표시 우선순위 (높을수록 주의 필요) — UI가 여러 pane 상태를 요약할 때 사용.
     pub fn urgency(&self) -> u8 {
         priority(*self)

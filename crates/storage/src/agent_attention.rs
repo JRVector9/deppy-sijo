@@ -20,6 +20,7 @@ pub enum AttentionEventKind {
 }
 
 pub struct AgentAttentionEvent {
+    pub runtime_instance: Option<String>,
     pub native_session_id: String,
     pub turn_id: Option<String>,
     pub request_id: String,
@@ -44,6 +45,8 @@ struct SavedAttention {
 
 #[derive(Default, Serialize, Deserialize)]
 struct AttentionState {
+    #[serde(default)]
+    runtime_instance: Option<String>,
     native_session_id: String,
     generation: i64,
     last_activity: i64,
@@ -163,6 +166,13 @@ fn child_lifecycle(id: &str) -> bool {
 fn anonymous_request(id: &str) -> bool {
     let base = request_owner(id).map_or(id, |owner| &id[owner.len() + 1..]);
     base.starts_with("elicitation:")
+}
+
+fn legacy_request(id: &str) -> bool {
+    let base = request_owner(id).map_or(id, |owner| &id[owner.len() + 1..]);
+    ["legacy:", "elicitation:legacy:", "tool:legacy:"]
+        .iter()
+        .any(|prefix| base.starts_with(prefix))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -303,12 +313,29 @@ impl Db {
         key: &str,
         event: &AgentAttentionEvent,
     ) -> anyhow::Result<()> {
+        self.record_agent_attention_with_message(key, event, None)
+    }
+
+    pub fn record_agent_attention_with_message(
+        &self,
+        key: &str,
+        event: &AgentAttentionEvent,
+        message: Option<&str>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            message.is_none_or(|text| bounded_text_is_valid(text, BOUNDED_MESSAGE_BYTES_MAX)),
+            BOUNDED_WRITE_INPUT_INVALID
+        );
         use AttentionEventKind as K;
         let prefix = bounded_session_key_prefix(key)?;
         let valid_id =
             |s: &str| !s.is_empty() && s.len() <= 256 && !s.chars().any(char::is_control);
         anyhow::ensure!(
             valid_id(&event.native_session_id)
+                && event
+                    .runtime_instance
+                    .as_deref()
+                    .is_none_or(|id| valid_id(id) && id.len() <= 128)
                 && event.turn_id.as_deref().is_none_or(valid_id)
                 && (event.request_id.is_empty() || valid_id(&event.request_id))
                 && event.tool_group.as_deref().is_none_or(valid_id)
@@ -368,6 +395,7 @@ impl Db {
             }
             state = AttentionState {
                 native_session_id: event.native_session_id.clone(),
+                runtime_instance: event.runtime_instance.clone(),
                 generation: event.at_micros,
                 ..AttentionState::default()
             };
@@ -375,9 +403,13 @@ impl Db {
             done = false;
         } else if state.native_session_id.is_empty() {
             state.native_session_id.clone_from(&event.native_session_id);
+            state.runtime_instance.clone_from(&event.runtime_instance);
         } else if state.native_session_id != event.native_session_id
             || event.at_micros < state.generation
         {
+            return Ok(());
+        }
+        if state.runtime_instance != event.runtime_instance {
             return Ok(());
         }
         let owner = request_owner(&event.request_id);
@@ -603,19 +635,30 @@ impl Db {
                             }
                         }
                     }
+                    let legacy = legacy_request(&event.request_id);
+                    let notification_name = if legacy {
+                        "legacy:notification:permission"
+                    } else {
+                        "notification:permission"
+                    };
                     let notification = owner.map_or_else(
-                        || "notification:permission".to_owned(),
-                        |owner| format!("{owner}:notification:permission"),
+                        || notification_name.to_owned(),
+                        |owner| format!("{owner}:{notification_name}"),
                     );
                     // 구체적인 승인을 해제했다면 무관한 자동 실행이 알림을 붙잡지 않는다.
                     // 알림만 있던 경로는 기존처럼 해당 소유자의 모든 실행 결과를 기다린다.
                     if finished
                         && (finished_approval
                             || !state.active_tools.iter().any(|(id, _)| {
-                                request_owner(id) == owner && !id.ends_with(":lifecycle")
+                                request_owner(id) == owner
+                                    && legacy_request(id) == legacy
+                                    && !id.ends_with(":lifecycle")
                             }))
                         && !state.requests.iter().any(|r| {
-                            r.kind == 2 && r.id != notification && request_owner(&r.id) == owner
+                            r.kind == 2
+                                && r.id != notification
+                                && request_owner(&r.id) == owner
+                                && legacy_request(&r.id) == legacy
                         })
                     {
                         for r in &mut state.requests {
@@ -1006,15 +1049,33 @@ impl Db {
         let updated = now.max(previous_at);
         tx.execute("INSERT INTO agent_needs_input
             (session_key,waiting,working,turn_done,updated_at,message,response_required,attention_json,attention_revision,idle_since,idle_generation)
-            VALUES (?1,?2,?3,?4,?5,NULL,?6,?7,?8,?9,?10)
+            VALUES (?1,?2,?3,?4,?5,?11,?6,?7,?8,?9,?10)
             ON CONFLICT(session_key) DO UPDATE SET waiting=excluded.waiting,working=excluded.working,
-            turn_done=excluded.turn_done,updated_at=excluded.updated_at,message=NULL,
+            turn_done=excluded.turn_done,updated_at=excluded.updated_at,message=excluded.message,
             response_required=excluded.response_required,attention_json=excluded.attention_json,attention_revision=excluded.attention_revision,idle_since=excluded.idle_since,idle_generation=excluded.idle_generation",
-            rusqlite::params![key,waiting,working,done,updated,response && !approval,json,completion_generation,idle_since,idle_generation])?;
+            rusqlite::params![key,waiting,working,done,updated,response && !approval,json,completion_generation,idle_since,idle_generation,message.filter(|_| waiting)])?;
         evict_hook_state_prefix_overflow(&tx, HookStateTable::NeedsInput, prefix, key)?;
         evict_hook_state_overflow(&tx, HookStateTable::NeedsInput, key)?;
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn agent_attention_native_for_runtime(
+        &self,
+        key: &str,
+        runtime: &str,
+    ) -> anyhow::Result<Option<String>> {
+        bounded_session_key_prefix(key)?;
+        anyhow::ensure!(
+            !runtime.is_empty() && runtime.len() <= 128 && !runtime.chars().any(char::is_control),
+            "invalid_attention_runtime"
+        );
+        let json: Option<Option<String>> = self.conn.query_row("SELECT CASE WHEN typeof(attention_json)='text' AND length(CAST(attention_json AS BLOB))<=32768 THEN attention_json END FROM agent_needs_input WHERE session_key=?1", [key], |row| row.get(0)).optional()?;
+        let Some(json) = json.flatten() else {
+            return Ok(None);
+        };
+        let state: AttentionState = serde_json::from_str(&json)?;
+        Ok((state.runtime_instance.as_deref() == Some(runtime)).then_some(state.native_session_id))
     }
 
     pub fn pending_agent_request_ids(
@@ -2116,9 +2177,71 @@ mod tests {
         }
     }
 
+    #[test]
+    fn agent_status_harness_runtime_projection_rejects_legacy_and_foreign_incarnations() {
+        let db = Db::open_in_memory().unwrap();
+        let mut old = event(AttentionEventKind::ResponseRequired, "q", 1_000_000);
+        db.record_agent_attention(KEY, &old).unwrap();
+        let mut job = AgentStateJob::projection("00000000-0000-0000-0000-000000000001");
+        job.include_hook_status = false;
+        job.include_agent_sessions = false;
+        job.include_structured_threads = false;
+        job.include_archived_threads = false;
+        assert!(
+            db.apply_agent_state_job_for_runtime(&job, "new")
+                .unwrap()
+                .waiting_sessions
+                .is_empty()
+        );
+        old.kind = AttentionEventKind::SessionStart;
+        old.at_micros = 2_000_000;
+        old.runtime_instance = Some("old".into());
+        db.record_agent_attention(KEY, &old).unwrap();
+        old.kind = AttentionEventKind::ResponseRequired;
+        old.at_micros = 3_000_000;
+        db.record_agent_attention(KEY, &old).unwrap();
+        assert_eq!(
+            db.apply_agent_state_job_for_runtime(&job, "old")
+                .unwrap()
+                .response_sessions,
+            vec![KEY]
+        );
+        assert!(
+            db.apply_agent_state_job_for_runtime(&job, "new")
+                .unwrap()
+                .waiting_sessions
+                .is_empty()
+        );
+        old.kind = AttentionEventKind::SessionStart;
+        old.at_micros = 4_000_000;
+        old.runtime_instance = Some("new".into());
+        db.record_agent_attention(KEY, &old).unwrap();
+        old.kind = AttentionEventKind::ResponseRequired;
+        old.at_micros = 5_000_000;
+        db.record_agent_attention(KEY, &old).unwrap();
+        old.kind = AttentionEventKind::Resolved;
+        old.at_micros = 6_000_000;
+        old.runtime_instance = Some("old".into());
+        db.record_agent_attention(KEY, &old).unwrap();
+        assert_eq!(
+            db.apply_agent_state_job_for_runtime(&job, "new")
+                .unwrap()
+                .response_sessions,
+            vec![KEY]
+        );
+        assert!(
+            db.apply_agent_state_job_for_runtime(&job, "old")
+                .unwrap()
+                .waiting_sessions
+                .is_empty()
+        );
+        assert!(db.apply_agent_state_job_for_runtime(&job, "").is_err());
+    }
+
     fn event(kind: AttentionEventKind, id: &str, at: i64) -> AgentAttentionEvent {
         AgentAttentionEvent {
             native_session_id: "native-1".into(),
+            runtime_instance: None,
             request_id: id.into(),
             turn_id: Some("turn-1".into()),
             kind,

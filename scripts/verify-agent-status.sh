@@ -17,3 +17,5 @@ run_cargo test --locked "${extra[@]}" -q -p mcp-proxy -- --nocapture
 run_cargo test --locked "${extra[@]}" -q -p session status::tests
 run_cargo test --locked "${extra[@]}" -q -p deppy-sijo --bin deppy-sijo agent_shim::tests
 run_cargo test --locked "${extra[@]}" -q -p deppy-sijo --bin deppy-sijo merge_agent_status
+run_cargo test --locked "${extra[@]}" -q -p web-remote --lib agent_status_harness
+run_cargo test --locked "${extra[@]}" -q -p runtime agent_status_harness

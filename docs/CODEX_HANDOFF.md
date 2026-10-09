@@ -1,3 +1,114 @@
+# Completed: provider status harness and PWA/runtime ownership — 2026-10-09
+
+## Current objective and completion
+
+Requested source work is complete: fix status/subagent recording defects, research cmux/Orca/provider contracts, maintain Claude/Codex/Kimi/Grok/Cursor replay and CI gate, and close the discovered PWA parity/old-runtime ownership/retained-hook gaps. Latest user asks to finish promptly. No remaining required source work; do not expand the investigation. Recording unit27822baf and harness unitc175073f are already committed/journaled; this source unit commits the final PWA/runtime/legacy corrections and this handoff. Prior PWA delegates were audited against all4 PR-unit commits and journal; no omitted record found.
+
+## Modified files in this source unit
+
+- App: crates/app/src/app.rs, crates/app/src/ui/workspace.rs; shared status: crates/session/src/status.rs.
+- Runtime: crates/runtime/src/command.rs, crates/runtime/src/in_process.rs.
+- Storage: crates/storage/src/agent_attention.rs, crates/storage/src/db.rs, crates/storage/tests/background_agent_lifecycle.rs.
+- Observer: crates/mcp-proxy/src/agent_attention.rs, crates/mcp-proxy/src/hook_payload.rs, crates/mcp-proxy/src/main.rs.
+- PWA: crates/web-remote/src/dashboard.rs, crates/web-remote/src/lib.rs, crates/web-remote/src/repository.rs.
+- Maintained script, QA inventory, implementation plan and this handoff (18 paths total).
+
+## Key decisions
+
+Keep execution, children, pending requests, process exit and manual override as separate facts; use shared pure display precedence. PWA reads bounded status-only facts outside its input mutex, fences workspace/watch generation, and filters an explicit runtime UUID inside the projection transaction. Shell/agent/respawn inherit the trusted DEPPY_RUNTIME_ID; JSON cannot choose it. Warm rebind retains owner, replacement runtime changes it. Old state is not fresh evidence.
+
+Retained parent hooks use the reducer with the current owner and bounded notice; genuinely empty input retains compatibility, rejected data never mutates state. Stable separate legacy request IDs retain elicitation-count/tool-fingerprint semantics and Working/Resolved identity. Exact Working clear preserves other questions. Legacy permission notification completion waits for its owned parallel calls and preserves independent modern notification/tools. Missing provider child identity/termination is not invented; documented terminal fallback remains.
+
+## Actual final tests and review
+
+- Final closeout wrapper exited0: /private/tmp/deppy-agent-status-closeout-20261009.log. Maintained scripts/verify-agent-status.sh605PASS/1ignored: storage426unit+8integration, proxy108, session37, App shim13/merger2, PWA9, runtime2.
+- Same final source full App2817PASS/38ignored; full web378PASS/10ignored; strict storage/proxy/App/web all-target Clippy, fmt and xtask check-boundary PASS. Unchanged runtime full379PASS and earlier strict six-package checks retain their recorded evidence.
+- Corpus69named/238steps; nine PWA and nine retained-hook/bounded-ingestion contracts. Final narrow gpt-6.1-sol/xhigh source review exited0/CONCLUSION OK: /private/tmp/deppy-agent-status-legacy-notification-review-20261009.txt. Reviewer executed no tests.
+- git diff --check and bash -n scripts/verify-agent-status.sh PASS; inspect final commit/status after journal.
+
+## Failed approaches, corrected
+
+Naive ID hashing erased anonymous counting and permission aliases; generic Working clear removed another legacy question; Working/Resolved IDs differed and could exhaust tool capacity. Actual semantic RED4PASS/3FAIL → proxy107GREEN. Subsequent notification review found stale approval after completion; actual RED0PASS/1FAIL → targetedGREEN1, then finalproxy108. Stable semantic namespaces and namespace-scoped notification cleanup corrected these. Earlier fresh-runtime inheritance, rejected-input/no-body conflation, parallel request alias and fixture setup/oracle failures remain in chronological evidence below; failed batches are not passes.
+
+## Remaining limits and next commands
+
+No required source implementation remains. No app was stopped/launched, no artifact shipped, no live config/private DB changed, no push performed. Source version0.8.7 remains for source-only work. A separately authorized changed local release must increase version above all shipped versions and verify binary/bundle metadata; restart requires current explicit request. Hosted CI, actual mobile hardware and every future provider schema are unverified; QA records unsupported child telemetry honestly.
+
+Exact read-only continuation commands, cwd /Users/jr/Desktop/projects/deppy-sijo-performance:
+- git status --short
+- git log -3 --oneline
+- sed -n '1,85p' docs/qa/2026-10-09-agent-status-harness.md
+
+Only when another source change justifies a new gate: DEPPY_CARGO_GATE=/private/tmp/deppy-audit-nine-pr-20261004/cargo_gate.py DEPPY_CARGO_OFFLINE=1 scripts/verify-agent-status.sh. Root serializes Cargo and freezes Rust/fixtures. Do not run dev-run.sh from this handoff.
+
+---
+
+# Historical phase evidence (superseded by completed state above)
+
+# Final notification correction validated; closeout active — 2026-10-09
+
+- Prior narrow review confirmed earlier semantic fixes, then found legacy permission notification remained after its tool completed. Actual named RED0PASS/1FAIL. A stable legacy:notification:permission ID and namespace-scoped reducer cleanup now preserve modern requests/tools and wait for all owned parallel legacy calls. Regression includes two legacy calls plus modern notification/live tool. Targeted GREEN1, strict storage/proxy all-target Clippy/fmt PASS (legacy-notification-green log).
+- Final read-only gpt-6.1-sol/xhigh correction review /private/tmp/deppy-agent-status-legacy-notification-review-20261009.{prompt,log,txt} active. Final maintained script plus full App/web and strict affected/boundary gate active in /private/tmp/deppy-agent-status-closeout-20261009.log. No PASS claimed for active checks. Prior maintained604PASS/1ignored is before this last correction; final script expected605 but count actual log after exit.
+- Finish these actual final checks/review, canonical QA/plan/handoff, scoped source commit and Obsidian journal. Do not expand investigation or launch/restart/release/push. Root owns Cargo and freezes Rust/fixtures while gates run. Source0.8.7; no artifact delivered.
+
+# Final legacy semantic correction validated — 2026-10-09
+
+- Latest user wants prompt completion; core implementation is done. Do not expand investigation. Final narrow review and maintained script are active; finish concrete corrections, commit/journal and report.
+- Last focused review found namespace hashing erased anonymous elicitation counting and permission fingerprint alias semantics. Actual added RED4PASS/3FAIL also proved Working clear removed an unrelated legacy question. Retained semantic prefixes elicitation:legacy:/tool:legacy:, namespaced tool groups and mapped Working/Resolved consistently; Working clear only resolves its exact owned request. Three new regressions cover anonymous balance, missing tool start and 70 tool cycles while preserving another question.
+- Actual final proxy107PASS/1ignored, strict proxy all-target Clippy/fmt PASS, exit0 /private/tmp/deppy-agent-status-legacy-semantics-green-20261009.log. Earlier full web378/runtime379/App2817, storage434 and strict six-package/boundary scopes remain valid for unchanged code. Final maintained script and narrow source review still pending, not claimed passed.
+- Next: inspect /private/tmp/deppy-agent-status-final-maintained-20261009.log and /private/tmp/deppy-agent-status-legacy-semantics-review-20261009.txt; update canonical final QA/plan/handoff, scoped Korean commit and Obsidian journal, verify clean git status. No app restart, release or push. Source0.8.7 remains; all current18 paths are this owned source unit. Freeze Rust/fixtures while Cargo runs.
+
+# Legacy boundary GREEN tests; lint correction — 2026-10-09
+
+- Actual legacy boundary suite104PASS/1ignored; Clippy stopped on old read() becoming production-dead after classified reader. Classified reader now wraps existing read(), retaining its original bounded parser and avoiding dead API. Added clear-result Working signal to preserve existing flag semantics and assertion, plus real empty-input classification assertion. Stable per-request legacy namespace/hash preserves q1/q2 independence; rejected data cannot enter no-body path. No green2 or source final clean claim yet.
+
+# Rejected-input and exact legacy result corrections — 2026-10-09
+
+- Focused legacy source review NEEDS_FIX2: normalized Resolved clear kept legacy waiting; parser rejection treated as no-body and could mutate parent. Actual separate RED0PASS/1FAIL for each in legacy-result-red and legacy-rejected-red logs. Added parallel legacy request ID test actual RED0PASS/1FAIL too (single fixed alias conflated q1/q2). Corrected legacy mapping keeps stable bounded per-request IDs in own namespace; result-shaped clear resolves its exact owned request, generic working/new-turn clear resolves only legacy-owned pending entries, preserving modern questions/children.
+- Bounded reader now classifies absent vs rejected without retaining body (counts consumed bytes and I/O failure); main passes rejection to legacy handler, which skips before any DB mutation. Empty stdin still supports trusted legacy compatibility. Existing parse metadata/depth/byte budgets and complete writer drain remain. Ownership/source token checks unchanged. Green/source re-review pending; no claimed final OK yet.
+- Previous final App2817 and six-package strict Clippy/fmt/boundary completed PASS before these proxy-only changes; maintain evidence scopes. Last maintained script598PASS/1ignored was before this final correction; reexecute after green. New core helper extends record message bounded preview in same transaction, preserves current-native lookup; no app restart/release/push/live DB/config change.
+
+# Final maintained gate passed; focused legacy review/checks pending — 2026-10-09
+
+- scripts/verify-agent-status.sh actual final-token+legacy version exited0 /private/tmp/deppy-agent-status-maintained-owned-final-20261009.log: storage434, proxy101PASS1ignored (69cases/238steps plus2 legacy tests), session37, App shim scope/merge2, PWA9, runtime2. Parse exact App shim count from log before aggregate. Actual legacy no-body case preserves unrelated modern question and child lifetime; child/malformed legacy flags ignored. Previous correction green2 storage434/proxy100, strict proxy/storage Clippy/fmt PASS; test compile/setup/clear failures recorded above, not hidden.
+- Final focused source review running session2935 /private/tmp/deppy-agent-status-legacy-owner-review-20261009.{prompt,log,txt}; no clean final claim yet. Final App + six-package all-target strict Clippy/fmt/boundary gate running session (tool result86854 was prior completed gate; latest new gate exact log final-checks). Freeze all source until exit. Prior owned product gate web378/runtime379/App2817 + boundary actual PASS (3574/48ignored).
+- Need inspect final review and gate, correct any concrete residual finding, update QA/plan/handoff to final consolidated state, commit all PWA/runtime/legacy source files+maintained script as separate source unit, write Obsidian journal and clean git status. No restart/release/push/live private config/DB/prompts. Core c175073f and first27822baf already reviewed/committed/journaled; source0.8.7.
+
+# Legacy owned-hook correction active — 2026-10-09
+
+- Final owned product full gate actually passed: web378/runtime379/App2817 (3574PASS/48ignored), boundary PASS; previous six-package strict Clippy/fmt. Focused owner source review NEEDS_FIX1 medium: fresh retained needs-input/clear/turn-done flags write attention_json=NULL, so runtime filtering excluded valid current-hook status. Added helper regression; first test compile failed using storage test-only open_in_memory, switched real temporary Db. Actual RED2 0PASS/1FAIL (owned waiting missing).
+- Legacy trusted-token flags now enter the actual reducer, bootstrap explicit runtime/native ownership when old installation omitted SessionStart, ignore child/malformed ownership, preserve bounded waiting notice in same record transaction, keep no-token old flags backward compatible. No-body legacy hooks use existing owned native or a runtime-scoped synthetic native. Initial green failed1 on clear (TurnStart without new turn ID does not resolve a pending request); use one owned legacy:attention request and exact clear result before working/new turn, keeping unrelated modern/child requests intact. Corrected green2/full proxy+storage/strict checks pending.
+- No runtime release/restart/push/live config/DB mutation. Next: inspect gate, add no-body/child/unrelated-request cases if needed, focused legacy source re-review then final maintained gate, scoped commit and journal PWA/runtime source unit. Root serializes Cargo and freezes source. Core c175073f remains committed/journaled; source0.8.7.
+
+# Runtime ownership contracts and strict checks green — 2026-10-09
+
+- Final correction RED fresh-runtime0PASS/1FAIL reproduced inherited old question. Explicit UUID runtime ownership fixes it; actual initial ownership gate PWA9/storage433/proxy99PASS1ignored. Added storage current/legacy/foreign-token projection regression PASS1. Runtime extra internal-env budget and one stable token per shell tests PASS2; strict storage/runtime/proxy/web/session/App all-target Clippy and fmt passed actual green3 exit0. Earlier runtime test setup used nonexistent helper/store/method, compile failed twice; corrected to existing admission_worker/RecordingResolver/shell_with_session, no failed batch PASS claimed.
+- Source read-only focused ownership review running session37848 /private/tmp/deppy-agent-status-pwa-owner-review-20261009.{prompt,log,txt}. Full final web/runtime/App regressions + maintained script next. Source frozen during Cargo. Need exact review/exit inspection before commit/journal; no source unit complete claim yet.
+- Shared metadata carries runtime_instance from trusted DEPPY_RUNTIME_ID env after bounded parsing (payload cannot set it); stored field optional backwards compatible. All real shell/agent/respawn inherit same current client token. Storage owner filter runs inside same projection transaction; legacy or other-token rows do not attach to fresh PWA shell, and foreign-token result cannot resolve current request. Rebind generation guards still prevent old query publication. No restart/release/push/live config/DB change; source0.8.7.
+
+# Explicit runtime ownership correction — 2026-10-09
+
+- PWA full source review NEEDS_FIX1 medium: a fresh post-rebind query could inherit persisted ws:number attention from a prior runtime. Reproduced actual RED0PASS/1FAIL in pwa-runtime-owner-red log with old question and new shell, no new hook. Avoid timestamp/GUI heuristics: each InProcess runtime gets stable UUID token inherited by shell/agent/respawn env DEPPY_RUNTIME_ID; observer tags bounded context, state records optional runtime_instance. Foreign-token results cannot mutate a current state; legacy/missing-token facts are not confirmed current PWA evidence.
+- Storage apply_agent_state_job_for_runtime filters ownership inside the same transaction as attention projection, avoiding a snapshot/filter race and extra prompt/body exposure. App-owned port and explicit binding carry actual runtime token; warm rebind retains it, recreated worker changes it. No schema migration (backward-compatible optional attention JSON field); desktop ordinary projection retained. PWA may use terminal fallback until fresh trusted hooks arrive.
+- Initial ownership GREEN actual PWA9PASS, storage433PASS, proxy99PASS/1ignored. Added storage stale-token/legacy/current proof and runtime token env/budget regressions; full affected gate next. Earlier maintained script actual exit0 before ownership correction, not final-version evidence. New review/maintained gate required before commit/journal.
+- Changed source now also runtime command.rs/in_process.rs, storage attention/db/integration helper, proxy context/normalizer alongside PWA/app/session/script. No live app/config/DB/prompts/restart/release/push. Core c175073f already committed/journaled; next source unit remains uncommitted. Root sole Cargo owner, freeze source during gate.
+
+# Same-workspace generation regression refinement — 2026-10-09
+
+- Extended captured-return test isolates runtime generation from workspace identity and holds fresh query too, preventing an old waiting frame from being briefly hidden by the next poll. First actual run7PASS/1FAIL because test native switch omitted SessionStart (storage correctly ignores foreign native TurnStart); added actual SessionStart then TurnStart. No production bug or PASS claimed for that failed oracle. Test-only pause now holds returned real DB rows, not a pre-read delay. Full prior product gate remains valid; new test/seam and strict web checks pending.
+
+# PWA full gate passed; review pending — 2026-10-09
+
+- /private/tmp/deppy-agent-status-pwa-full-20261009.log actually completed all commands: web376PASS/10ignored, session status37PASS, App2817PASS/38ignored, strict web/session/App all-target Clippy, fmt and boundary PASS. 3230 passed combined; verify ignored sum from log before final reporting. Source-only reviewer running session24187 /private/tmp/deppy-agent-status-pwa-review-20261009.{prompt,log,txt}; no final clean claim yet.
+- Root may add same-workspace epoch-only blocked-return regression to complement existing cross-workspace blocked read proof; no production change planned absent concrete review evidence. Need execute maintained script with final PWA scope, inspect source review, correct any findings, commit/journal PWA separate unit. Core commit c175073f already reviewed/journaled, previous27822baf preserved. No restart/release/push; source0.8.7.
+
+# PWA parity contracts green; full gate/review next — 2026-10-09
+
+- Core provider harness committed c175073f and Obsidian journal written (2026-10-09 제공자 상태 계약과 소유권 회귀 harness.md); no push/release/restart. Core69cases/238steps; final focused review OK and proxy99PASS/1ignored + strict proxy Clippy/fmt. Existing child-record correction27822baf retained.
+- PWA initial prototypes RED0PASS/2FAIL now implemented. First scripted compile failed duplicate struct field; corrected; initial-green2 actual2PASS. Extended real temp DB/worker contracts actual6PASS in pwa-contracts-green log: hidden/no-GUI child/request/completion, input/rebind during paused query, reused numeric ID old-owner rejection, process error/manual override, input+union bound. Added pre-subscription override seed regression and raw detected accessor before full gate.
+- Separate source files app.rs, ui/workspace.rs, session/status.rs, web-remote dashboard.rs/lib.rs/repository.rs and maintained script. Status-only App-owned projection; explicit workspace+runtime generation; repository I/O outside input mutex; separate raw/manual/exited/facts; same pure SessionStatus attention precedence as desktop, transcript fallback retained. No concrete storage dependency introduced into production web crate. Prescribed read-only source review/full affected gate next; freeze source during Cargo.
+- Exact next command: cargo_gate.py --batch with web-remote all tests, session status::tests, full App, strict affected Clippy/fmt/boundary; named maintained gate scripts/verify-agent-status.sh now includes PWA contracts. Inspect actual exit/review before commit/journal. No live hooks/config/DB/app modified.
+
 # Core harness reviewed; PWA implementation active — 2026-10-09
 
 - Core corpus69cases/238steps (recheck exact fixture count), proxy99PASS/1ignored plus strict Clippy/fmt actual green3 exit0. Final focused ID-boundary source review OK; earlier two numeric-case oracle failures corrected to a genuine cancelled-generation case, not hidden. All previous broader adapter/installer source review findings corrected and verified. Core ready for scoped commit/journal.

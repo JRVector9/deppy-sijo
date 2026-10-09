@@ -5244,6 +5244,22 @@ impl WorkspaceUi {
         self.sessions.get(&session).and_then(|view| view.status)
     }
 
+    pub fn last_session_detected_status(&self, session: SessionId) -> Option<SessionStatus> {
+        self.sessions.get(&session).and_then(|view| {
+            view.status_view
+                .as_ref()
+                .map(|status| status.detected_status)
+                .or(view.status)
+        })
+    }
+
+    pub fn last_session_user_override(&self, session: SessionId) -> Option<SessionStatus> {
+        self.sessions
+            .get(&session)
+            .and_then(|view| view.status_view.as_ref())
+            .and_then(|view| view.user_override)
+    }
+
     /// 세션에서 감지된 에이전트 종류 — 셸이거나 미감지면 None.
     /// warm으로 내려가도 agent_info는 마지막 감지값을 유지한다(위 agent_line_for 주석).
     pub fn agent_provider_for(
@@ -10424,32 +10440,10 @@ fn merge_agent_status(
 ) -> Option<runtime::SessionStatus> {
     use crate::agent_transcript::AgentActivity;
     use runtime::SessionStatus as S;
-    // 확정된 미응답 요청은 오래된 Working 레코드나 병렬 작업으로 해제하지 않는다.
-    if needs_input {
-        return Some(if needs_response {
-            S::Waiting
-        } else {
-            S::NeedsApproval
-        });
-    }
-    // 명시적 오류는 완료보다 우선 — Stop은 모든 턴 종료에 오므로 turn_done이 error를
-    // 가리면 실패한 턴이 '완료(바이올렛)'로 위장된다(codex 리뷰).
-    // 완료 직후 계획 선택창을 여는 CLI도 있으므로 현재 화면의 요청을 먼저 보인다.
-    if matches!(regex, Some(S::Error | S::Waiting | S::NeedsApproval)) {
-        return regex;
-    }
-    // Current hook activity includes background children. An older parent Stop or
-    // a screen fragment containing "finished" must not override that live work.
-    if hook_working {
-        return Some(S::Running);
-    }
-    // Stop hook = 턴 완료. UserPromptSubmit/PreToolUse가 clear하므로 재개 시 즉시 해제.
-    // transcript activity(Stop 직후 잠깐 Working으로 남음)보다 우선한다.
-    if turn_done {
-        return Some(S::Done);
-    }
-    if matches!(regex, Some(S::Done)) {
-        return regex;
+    if let Some(status) =
+        S::from_attention(regex, needs_input, needs_response, hook_working, turn_done)
+    {
+        return Some(status);
     }
     match activity {
         Some(AgentActivity::Working) => Some(S::Running),

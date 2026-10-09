@@ -228,6 +228,18 @@ impl WebRemoteServer {
         self.core.dashboard().set_runtime_binding(receiver, sink);
     }
 
+    pub fn set_runtime_binding_for_workspace(
+        &self,
+        workspace: String,
+        runtime: String,
+        receiver: runtime::RuntimeEventReceiver,
+        sink: Option<dashboard::CommandSink>,
+    ) {
+        self.core
+            .dashboard()
+            .set_runtime_binding_for_workspace(workspace, runtime, receiver, sink);
+    }
+
     /// web → runtime 명령 싱크를 붙인다 (P5b — 시청 lease 전송용, receiver와 같은 시점에
     /// 교체). 미설정이면 터미널 뷰어만 비활성 — 대시보드/승인은 그대로 동작한다.
     #[cfg(test)]
@@ -2179,6 +2191,7 @@ mod tests {
             &server,
             active_seed(vec![dashboard::SessionSeed {
                 id: Some(7),
+                user_override: None,
                 title: "claude".to_owned(),
                 status: Some(runtime::SessionStatus::NeedsApproval),
                 agent: Some("Claude · sonnet · high".to_owned()),
@@ -2227,6 +2240,7 @@ mod tests {
                     state: dashboard::WorkspaceState::Active,
                     sessions: vec![dashboard::SessionSeed {
                         id: Some(7),
+                        user_override: None,
                         title: "deppy-sijo".to_owned(),
                         status: Some(runtime::SessionStatus::Running),
                         agent: Some("Codex · gpt-5.5 · high".to_owned()),
@@ -2240,6 +2254,7 @@ mod tests {
                     state: dashboard::WorkspaceState::Warm,
                     sessions: vec![dashboard::SessionSeed {
                         id: None,
+                        user_override: None,
                         title: "deppy-mux".to_owned(),
                         status: None,
                         agent: None,
@@ -2268,6 +2283,7 @@ mod tests {
             &server,
             active_seed(vec![dashboard::SessionSeed {
                 id: Some(1),
+                user_override: None,
                 title: "A".to_owned(),
                 status: Some(runtime::SessionStatus::NeedsApproval),
                 agent: None,
@@ -2285,6 +2301,7 @@ mod tests {
             &server,
             active_seed(vec![dashboard::SessionSeed {
                 id: Some(2),
+                user_override: None,
                 title: "B".to_owned(),
                 status: Some(runtime::SessionStatus::Error),
                 agent: None,

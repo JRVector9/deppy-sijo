@@ -8226,6 +8226,27 @@ impl Db {
     /// backing capacities are measured before commit. If either stage or commit fails, all job
     /// mutations roll back.
     pub fn apply_agent_state_job(&self, job: &AgentStateJob) -> anyhow::Result<AgentStateSnapshot> {
+        self.apply_agent_state_job_inner(job, None)
+    }
+
+    /// Explicit runtime ownership is required for consumers with worker-local numeric IDs.
+    pub fn apply_agent_state_job_for_runtime(
+        &self,
+        job: &AgentStateJob,
+        runtime: &str,
+    ) -> anyhow::Result<AgentStateSnapshot> {
+        anyhow::ensure!(
+            !runtime.is_empty() && runtime.len() <= 128 && !runtime.chars().any(char::is_control),
+            "invalid_attention_runtime"
+        );
+        self.apply_agent_state_job_inner(job, Some(runtime))
+    }
+
+    fn apply_agent_state_job_inner(
+        &self,
+        job: &AgentStateJob,
+        runtime: Option<&str>,
+    ) -> anyhow::Result<AgentStateSnapshot> {
         let workspace_prefix = validate_agent_state_job(job)?;
         let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
             .map_err(|_| anyhow::anyhow!(AGENT_STATE_PERSIST_FAILED))?;
@@ -9161,7 +9182,7 @@ impl Db {
             Vec::new()
         };
 
-        let snapshot = AgentStateSnapshot {
+        let mut snapshot = AgentStateSnapshot {
             hook_sessions,
             statuslines,
             waiting_sessions,
@@ -9176,6 +9197,36 @@ impl Db {
             work_turns,
             activity_panes,
         };
+        if let Some(runtime) = runtime {
+            let mut stmt = tx.prepare("SELECT CASE WHEN typeof(attention_json)='text' AND length(CAST(attention_json AS BLOB))<=32768 AND json_valid(attention_json) THEN json_extract(attention_json,'$.runtime_instance')=?2 ELSE 0 END FROM agent_needs_input WHERE session_key=?1")?;
+            let mut failure = None;
+            let mut owned = |key: &str| {
+                if !key.starts_with(&workspace_prefix) {
+                    return false;
+                }
+                match stmt
+                    .query_row(rusqlite::params![key, runtime], |row| {
+                        row.get::<_, Option<bool>>(0)
+                    })
+                    .optional()
+                {
+                    Ok(Some(Some(true))) => true,
+                    Ok(_) => false,
+                    Err(error) => {
+                        failure = Some(error);
+                        false
+                    }
+                }
+            };
+            snapshot.waiting_sessions.retain(|(key, _)| owned(key));
+            snapshot.response_sessions.retain(|key| owned(key));
+            snapshot.turn_done_sessions.retain(|(key, _)| owned(key));
+            snapshot.idle_sessions.retain(|(key, _, _)| owned(key));
+            snapshot.working_sessions.retain(|key| owned(key));
+            if let Some(error) = failure {
+                return Err(error.into());
+            }
+        }
         let actual_retained_bytes = agent_state_snapshot_retained_bytes(&snapshot)
             .map_err(|_| anyhow::anyhow!(AGENT_STATE_SNAPSHOT_INVALID))?;
         anyhow::ensure!(

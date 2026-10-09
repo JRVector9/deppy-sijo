@@ -146,6 +146,7 @@ fn enqueue_durable_event(
 }
 
 pub struct InProcessRuntimeClient {
+    instance_token: String,
     /// shutdown 시 None — drop되면 worker가 Disconnected로 종료한다
     command_tx: Option<SyncSender<QueuedRuntimeCommand>>,
     command_budget: Arc<RuntimeCommandQueueBudget>,
@@ -286,6 +287,8 @@ impl InProcessRuntimeClient {
         static RUN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = RUN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let run_logs_root = logs_root.join(format!("run-{run_ms}-{}-{seq}", std::process::id()));
+        let instance_token = uuid::Uuid::new_v4().to_string();
+        let worker_instance_token = instance_token.clone();
         let (command_tx, command_rx) = sync_channel(IN_PROCESS_CMD_QUEUE_CAP);
         let command_budget = Arc::new(RuntimeCommandQueueBudget::default());
         let subscribers: Arc<Mutex<Vec<Subscriber>>> = Arc::default();
@@ -311,6 +314,7 @@ impl InProcessRuntimeClient {
                 let (archive_disk_bytes, archive_root_identity) =
                     scan_archive_usage_snapshot(&logs_root);
                 Worker {
+                    instance_token: worker_instance_token,
                     command_rx,
                     subscribers: worker_subscribers,
                     batch: Duration::from_millis(output_batch_ms.max(1)),
@@ -379,6 +383,7 @@ impl InProcessRuntimeClient {
             .map_err(|_| anyhow::anyhow!("runtime_worker_thread_spawn_failed"))?;
         let worker_thread = Some(worker.thread().clone());
         Ok(Self {
+            instance_token,
             command_tx: Some(command_tx),
             command_budget,
             subscribers,
@@ -386,6 +391,10 @@ impl InProcessRuntimeClient {
             worker_thread,
             shutdown_flag,
         })
+    }
+
+    pub fn instance_token(&self) -> &str {
+        &self.instance_token
     }
 
     /// worker로 명령을 보내는 복제 가능한 싱크 (P5b — 웹 계층 등 다른 스레드용).
@@ -895,6 +904,7 @@ struct LazyWorkspaceRestore {
 }
 
 struct Worker {
+    instance_token: String,
     command_rx: Receiver<QueuedRuntimeCommand>,
     subscribers: Arc<Mutex<Vec<Subscriber>>>,
     batch: Duration,
@@ -2908,6 +2918,7 @@ impl Worker {
                 // 앱이 직접 띄운 에이전트에도 needsInput hook 키를 주입한다(셸과 동일 —
                 // 안 하면 Agents UI 실행 세션은 needsInput 미반영, codex Medium).
                 env.push(("DEPPY_SESSION_ID".to_owned(), self.session_key(id)));
+                env.push(("DEPPY_RUNTIME_ID".to_owned(), self.instance_token.clone()));
                 let spec = CommandSpec {
                     program: command,
                     args,
@@ -3688,6 +3699,8 @@ impl Worker {
         let mut spec = self.shell.clone();
         spec.env
             .push(("DEPPY_SESSION_ID".to_owned(), self.session_key(id)));
+        spec.env
+            .push(("DEPPY_RUNTIME_ID".to_owned(), self.instance_token.clone()));
         // 워크스페이스 기본 env(.env 자동 주입). The complete secret set is resolved and
         // protected before spawn; partial injection would silently change command semantics.
         spec.env.extend(self.default_env_plain.iter().cloned());
@@ -4261,6 +4274,7 @@ impl Worker {
         let id = SessionId(self.next_id);
         self.next_id += 1;
         env.push(("DEPPY_SESSION_ID".to_owned(), self.session_key(id)));
+        env.push(("DEPPY_RUNTIME_ID".to_owned(), self.instance_token.clone()));
         let spec = CommandSpec {
             program: command,
             args,
@@ -7128,6 +7142,7 @@ mod tests {
             .flatten();
         (
             Worker {
+                instance_token: uuid::Uuid::new_v4().to_string(),
                 command_rx,
                 subscribers,
                 batch: Duration::from_millis(5),
@@ -9390,10 +9405,42 @@ mod tests {
     }
 
     #[test]
+    fn agent_status_harness_shell_inherits_one_stable_runtime_token() {
+        let (worker, _events) = admission_worker(
+            Arc::new(RecordingResolver {
+                calls: Mutex::new(Vec::new()),
+                value: None,
+            }),
+            "runtime-token",
+        );
+        let (first, _) = worker.shell_with_session(SessionId(1)).unwrap();
+        let (second, _) = worker.shell_with_session(SessionId(2)).unwrap();
+        let token = |spec: &CommandSpec| {
+            spec.env
+                .iter()
+                .find(|(key, _)| key == "DEPPY_RUNTIME_ID")
+                .unwrap()
+                .1
+                .clone()
+        };
+        assert_eq!(token(&first), worker.instance_token);
+        assert_eq!(token(&first), token(&second));
+        assert_eq!(
+            first
+                .env
+                .iter()
+                .filter(|(key, _)| key == "DEPPY_RUNTIME_ID")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn in_process_command_queue_full은_err로_surface된다() {
         let (tx, rx) = sync_channel(1);
         let command_budget = Arc::new(RuntimeCommandQueueBudget::default());
         let mut client = InProcessRuntimeClient {
+            instance_token: uuid::Uuid::new_v4().to_string(),
             command_tx: Some(tx),
             command_budget: Arc::clone(&command_budget),
             subscribers: Arc::default(),
@@ -9440,6 +9487,7 @@ mod tests {
         let (tx, rx) = sync_channel(1);
         let budget = Arc::new(RuntimeCommandQueueBudget::default());
         let mut client = InProcessRuntimeClient {
+            instance_token: uuid::Uuid::new_v4().to_string(),
             command_tx: Some(tx),
             command_budget: Arc::clone(&budget),
             subscribers: Arc::default(),

@@ -11,6 +11,7 @@ fn db() -> Db {
 fn event(kind: K, request: &str, at: i64) -> AgentAttentionEvent {
     AgentAttentionEvent {
         native_session_id: "native".into(),
+        runtime_instance: None,
         turn_id: Some("turn".into()),
         request_id: request.into(),
         kind,

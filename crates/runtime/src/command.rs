@@ -272,9 +272,17 @@ pub(crate) fn validate_launch_spec_with_internal_env(
     let mut external_items = 0usize;
     let mut external_bytes = 0usize;
     let mut internal_items = 0usize;
+    let mut runtime_items = 0usize;
     for (key, value) in env {
         if !validate_env_key(key) || !bounded_nul_free(value, ENV_VALUE_BYTES_MAX, false) {
             return Err(admission_error("runtime_env_plain_invalid"));
+        }
+        if key == "DEPPY_RUNTIME_ID" {
+            runtime_items += 1;
+            if runtime_items > 1 || !bounded_nul_free(value, 128, true) {
+                return Err(admission_error("runtime_internal_env_invalid"));
+            }
+            continue;
         }
         if key == internal_key {
             internal_items = internal_items
@@ -2302,6 +2310,22 @@ mod tests {
                 credential_ids: vec!["x".to_owned(); SEED_CREDENTIAL_ITEMS_MAX + 1],
             })
             .is_err()
+        );
+    }
+
+    #[test]
+    fn agent_status_harness_runtime_token_keeps_external_budget_and_rejects_duplicates() {
+        let mut env = vec![("K".to_owned(), String::new()); ENV_ITEMS_MAX];
+        env.push(("DEPPY_SESSION_ID".into(), "ws:1".into()));
+        env.push(("DEPPY_RUNTIME_ID".into(), "runtime-token".into()));
+        assert!(
+            validate_launch_spec_with_internal_env("x", &[], &env, None, "DEPPY_SESSION_ID")
+                .is_ok()
+        );
+        env.push(("DEPPY_RUNTIME_ID".into(), "other-runtime".into()));
+        assert!(
+            validate_launch_spec_with_internal_env("x", &[], &env, None, "DEPPY_SESSION_ID")
+                .is_err()
         );
     }
 

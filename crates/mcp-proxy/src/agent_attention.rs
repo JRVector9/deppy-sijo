@@ -161,6 +161,7 @@ pub fn normalize(v: &Value, at_micros: i64) -> Option<AgentAttentionEvent> {
     });
     Some(AgentAttentionEvent {
         native_session_id: native.into(),
+        runtime_instance: field(v, &["runtime_instance"]).map(str::to_owned),
         turn_id,
         request_id: request,
         kind,
@@ -228,6 +229,7 @@ pub(crate) fn identity_metadata_valid(v: &Value) -> bool {
         }
     }
     for key in [
+        "runtime_instance",
         "session_id",
         "sessionId",
         "conversation_id",
@@ -388,6 +390,7 @@ pub fn reconcile_claude_results(db: &storage::Db, key: &str, v: &Value, at: i64)
             key,
             &AgentAttentionEvent {
                 native_session_id: native.into(),
+                runtime_instance: field(v, &["runtime_instance"]).map(str::to_owned),
                 turn_id: canonical_turn_id(v),
                 request_id: id,
                 kind: K::Resolved,
@@ -482,6 +485,7 @@ pub fn reconcile_codex_results(db: &storage::Db, key: &str, v: &Value, at: i64) 
             key,
             &AgentAttentionEvent {
                 native_session_id: native.into(),
+                runtime_instance: field(v, &["runtime_instance"]).map(str::to_owned),
                 turn_id: canonical_turn_id(v),
                 request_id: id,
                 kind: K::Resolved,

@@ -287,6 +287,144 @@ fn hook_observer_response(cursor_event: Option<&str>) -> &'static str {
     }
 }
 
+fn legacy_request_id(id: &str) -> String {
+    if id == "notification:permission" {
+        return "legacy:notification:permission".into();
+    }
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    id.hash(&mut hash);
+    // Keep the reducer's anonymous-count and permission-alias semantics while
+    // separating retained hooks from modern request IDs.
+    let prefix = if id.starts_with("elicitation:") {
+        "elicitation:legacy:"
+    } else if id.starts_with("tool:") {
+        "tool:legacy:"
+    } else {
+        "legacy:"
+    };
+    format!("{prefix}{:016x}", hash.finish())
+}
+
+fn record_legacy_hook(
+    db: &storage::Db,
+    key: &str,
+    event: &str,
+    metadata: Option<&serde_json::Value>,
+    runtime: Option<&str>,
+    at: i64,
+    input_rejected: bool,
+) -> anyhow::Result<()> {
+    if input_rejected {
+        return Ok(());
+    }
+    let message = metadata
+        .and_then(|v| v.get("message"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|message| !message.is_empty());
+    let Some(runtime) = runtime else {
+        return match event {
+            "needs-input" => db.set_agent_needs_input(key, true, message),
+            "clear" => db.set_agent_needs_input(key, false, message),
+            _ => db.set_agent_turn_done(key),
+        };
+    };
+    let mut v = metadata.cloned().unwrap_or_else(|| serde_json::json!({}));
+    if !agent_attention::identity_metadata_valid(&v) || hook_is_child(&v) {
+        return Ok(());
+    }
+    let existing = db.agent_attention_native_for_runtime(key, runtime)?;
+    let native = ["session_id", "sessionId", "conversation_id"]
+        .iter()
+        .find_map(|name| v.get(name).and_then(serde_json::Value::as_str))
+        .map(str::to_owned)
+        .or_else(|| existing.clone())
+        .unwrap_or_else(|| format!("legacy:{runtime}"));
+    v["session_id"] = native.clone().into();
+    v["runtime_instance"] = runtime.into();
+    let attention = agent_attention::normalize(&v, at).or_else(|| {
+        v["hook_event_name"] = match event {
+            "needs-input" => "PermissionRequest",
+            "clear" => "UserPromptSubmit",
+            _ => "Stop",
+        }
+        .into();
+        agent_attention::normalize(&v, at)
+    });
+    let Some(mut attention) = attention else {
+        return Ok(());
+    };
+    // A trusted current-runtime legacy hook can bootstrap ownership even when
+    // an older installation omitted SessionStart. Do not adopt a foreign child.
+    if existing.as_deref() != Some(native.as_str()) {
+        let mut start = storage::AgentAttentionEvent {
+            native_session_id: native,
+            runtime_instance: Some(runtime.into()),
+            turn_id: None,
+            request_id: String::new(),
+            kind: storage::AttentionEventKind::SessionStart,
+            at_micros: at,
+            tool_group: None,
+            tool_input_hash: None,
+            child_id: None,
+        };
+        db.record_agent_attention(key, &start)?;
+        start.at_micros = at.saturating_add(1);
+        attention.at_micros = start.at_micros;
+    }
+    if matches!(
+        attention.kind,
+        storage::AttentionEventKind::ResponseRequired
+            | storage::AttentionEventKind::ApprovalRequired
+            | storage::AttentionEventKind::Resolved
+            | storage::AttentionEventKind::Working
+    ) {
+        attention.request_id = legacy_request_id(&attention.request_id);
+    }
+    attention.tool_group = attention.tool_group.as_deref().map(legacy_request_id);
+    if event == "clear"
+        && matches!(
+            attention.kind,
+            storage::AttentionEventKind::Working | storage::AttentionEventKind::TurnStart
+        )
+    {
+        for id in db.pending_agent_request_ids(key, &attention.native_session_id)? {
+            let owned = ["legacy:", "elicitation:legacy:", "tool:legacy:"]
+                .iter()
+                .any(|prefix| id.starts_with(prefix));
+            if !owned
+                || (attention.kind == storage::AttentionEventKind::Working
+                    && id != attention.request_id)
+            {
+                continue;
+            }
+            let resolved = storage::AgentAttentionEvent {
+                native_session_id: attention.native_session_id.clone(),
+                runtime_instance: attention.runtime_instance.clone(),
+                turn_id: attention.turn_id.clone(),
+                request_id: id,
+                kind: storage::AttentionEventKind::Resolved,
+                at_micros: attention.at_micros,
+                tool_group: None,
+                tool_input_hash: None,
+                child_id: None,
+            };
+            db.record_agent_attention(key, &resolved)?;
+        }
+    }
+    agent_attention::confirm_grok_completion(&v, &mut attention);
+    db.record_agent_attention_with_message(key, &attention, message)?;
+    if event == "clear" && attention.kind == storage::AttentionEventKind::Resolved {
+        attention.kind = storage::AttentionEventKind::Working;
+        attention.request_id.clear();
+        attention.tool_group = None;
+        attention.tool_input_hash = None;
+        db.record_agent_attention(key, &attention)?;
+    }
+    Ok(())
+}
+
 fn tag_hook_provider(mut v: serde_json::Value, provider: Option<&str>) -> serde_json::Value {
     if provider == Some("kimi") {
         v["client_type"] = "kimi_code_cli".into();
@@ -364,8 +502,19 @@ fn run_hooks(args: &[String]) -> anyhow::Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_micros().min(i64::MAX as u128) as i64)
         .unwrap_or(1);
+    let runtime_token = std::env::var("DEPPY_RUNTIME_ID").ok().filter(|token| {
+        !token.is_empty() && token.len() <= 128 && !token.chars().any(char::is_control)
+    });
     let mut input = std::io::stdin().lock();
-    let parsed = hook_payload::read(&mut input).map(|v| tag_hook_provider(v, provider.as_deref()));
+    let hook_read = hook_payload::read_classified(&mut input);
+    let input_rejected = hook_read.rejected;
+    let parsed = hook_read.value.map(|v| {
+        let mut v = tag_hook_provider(v, provider.as_deref());
+        if let Some(token) = &runtime_token {
+            v["runtime_instance"] = serde_json::Value::String(token.clone());
+        }
+        v
+    });
     // 파싱 상한을 넘겨도 writer가 broken pipe로 실패하지 않도록 끝까지 비운다.
     let _ = std::io::copy(&mut input, &mut std::io::sink());
     // 관찰기가 permission gate를 차단하지 않도록 파싱/DB 실패에도 중립 응답한다.
@@ -390,21 +539,16 @@ fn run_hooks(args: &[String]) -> anyhow::Result<()> {
                 agent_attention::reconcile_codex_results(&db, &session_key, v, at_micros);
                 agent_attention::reconcile_claude_results(&db, &session_key, v, at_micros);
             }
-        } else if event == "needs-input" || event == "clear" {
-            // claude Notification hook은 payload.message에 대기 사유를 싣는다
-            // ("Claude needs your permission to use Bash"). 벨 인박스가 이 문구를
-            // 헤드라인으로 쓴다 — 로그 tail은 TUI 재그리기라 상태줄이 섞인다(2026-07-17).
-            // 문구를 안 싣는 에이전트는 None → 인박스가 tail로 폴백한다.
-            let message = parsed
-                .as_ref()
-                .and_then(|v| v.get("message"))
-                .and_then(|m| m.as_str())
-                .map(str::trim)
-                .filter(|m| !m.is_empty());
-            let _ = db.set_agent_needs_input(&session_key, event == "needs-input", message);
-        } else if event == "turn-done" {
-            // Stop hook = 턴 완료 → 상태 레일 '완료(바이올렛)' 트랜지언트 트리거.
-            let _ = db.set_agent_turn_done(&session_key);
+        } else if matches!(event.as_str(), "needs-input" | "clear" | "turn-done") {
+            let _ = record_legacy_hook(
+                &db,
+                &session_key,
+                &event,
+                parsed.as_ref(),
+                runtime_token.as_deref(),
+                at_micros,
+                input_rejected,
+            );
         }
         // 어떤 이벤트든 payload에 (session_id, transcript_path)가 오면 최신 바인딩으로 갱신.
         if let Some(v) = parsed
@@ -671,6 +815,489 @@ mod tests {
     use std::io::Write;
 
     use super::*;
+
+    #[test]
+    fn agent_status_harness_legacy_flags_keep_fresh_runtime_ownership_and_message() {
+        let path = std::env::temp_dir().join(format!(
+            "deppy-legacy-owner-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let db = storage::Db::open(&path).unwrap();
+        let workspace = "00000000-0000-0000-0000-000000000001";
+        let key = format!("{workspace}:7");
+        let mut job = storage::AgentStateJob::projection(workspace);
+        job.include_hook_status = false;
+        job.include_agent_sessions = false;
+        job.include_structured_threads = false;
+        job.include_archived_threads = false;
+        let metadata = serde_json::json!({"session_id":"native", "message":"permission needed"});
+        record_legacy_hook(
+            &db,
+            &key,
+            "needs-input",
+            Some(&metadata),
+            Some("R"),
+            1_000_000,
+            false,
+        )
+        .unwrap();
+        let snapshot = db.apply_agent_state_job_for_runtime(&job, "R").unwrap();
+        assert_eq!(
+            snapshot.waiting_sessions,
+            vec![(key.clone(), Some("permission needed".into()))]
+        );
+        record_legacy_hook(
+            &db,
+            &key,
+            "clear",
+            Some(&metadata),
+            Some("R"),
+            2_000_000,
+            false,
+        )
+        .unwrap();
+        let snapshot = db.apply_agent_state_job_for_runtime(&job, "R").unwrap();
+        assert!(snapshot.waiting_sessions.is_empty());
+        assert_eq!(snapshot.working_sessions, vec![key.clone()]);
+        record_legacy_hook(
+            &db,
+            &key,
+            "turn-done",
+            Some(&metadata),
+            Some("R"),
+            3_000_000,
+            false,
+        )
+        .unwrap();
+        let snapshot = db.apply_agent_state_job_for_runtime(&job, "R").unwrap();
+        assert_eq!(snapshot.turn_done_sessions.len(), 1);
+        assert!(snapshot.working_sessions.is_empty());
+        assert!(
+            db.apply_agent_state_job_for_runtime(&job, "other")
+                .unwrap()
+                .turn_done_sessions
+                .is_empty()
+        );
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn agent_status_harness_legacy_without_payload_preserves_other_question_and_child() {
+        let empty = hook_payload::read_classified(std::io::empty());
+        assert!(!empty.rejected && empty.value.is_none());
+        let path = std::env::temp_dir().join(format!(
+            "deppy-legacy-isolation-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let db = storage::Db::open(&path).unwrap();
+        let workspace = "00000000-0000-0000-0000-000000000001";
+        let key = format!("{workspace}:7");
+        let mut job = storage::AgentStateJob::projection(workspace);
+        job.include_hook_status = false;
+        job.include_agent_sessions = false;
+        job.include_structured_threads = false;
+        job.include_archived_threads = false;
+        record_legacy_hook(&db, &key, "needs-input", None, Some("R"), 1_000_000, false).unwrap();
+        record_legacy_hook(&db, &key, "clear", None, Some("R"), 2_000_000, false).unwrap();
+        assert!(
+            db.apply_agent_state_job_for_runtime(&job, "R")
+                .unwrap()
+                .waiting_sessions
+                .is_empty()
+        );
+        let child = serde_json::json!({"session_id":"legacy:R","runtime_instance":"R","agent_id":"a","hook_event_name":"SubagentStart"});
+        db.record_agent_attention(
+            &key,
+            &agent_attention::normalize(&child, 3_000_000).unwrap(),
+        )
+        .unwrap();
+        let question = serde_json::json!({"session_id":"legacy:R","runtime_instance":"R","hook_event_name":"PreToolUse","tool_name":"AskUserQuestion","tool_use_id":"other-question"});
+        db.record_agent_attention(
+            &key,
+            &agent_attention::normalize(&question, 4_000_000).unwrap(),
+        )
+        .unwrap();
+        record_legacy_hook(&db, &key, "needs-input", None, Some("R"), 5_000_000, false).unwrap();
+        record_legacy_hook(&db, &key, "clear", None, Some("R"), 6_000_000, false).unwrap();
+        assert_eq!(
+            db.pending_agent_request_ids(&key, "legacy:R").unwrap(),
+            vec!["other-question"]
+        );
+        record_legacy_hook(&db, &key, "turn-done", None, Some("R"), 7_000_000, false).unwrap();
+        let before = db.apply_agent_state_job_for_runtime(&job, "R").unwrap();
+        assert_eq!(before.response_sessions, vec![key.clone()]);
+        assert_eq!(before.working_sessions, vec![key.clone()]);
+        assert!(before.turn_done_sessions.is_empty());
+        record_legacy_hook(
+            &db,
+            &key,
+            "turn-done",
+            Some(&child),
+            Some("R"),
+            8_000_000,
+            false,
+        )
+        .unwrap();
+        let malformed = serde_json::json!({"session_id":"legacy:R", "turnId":"\n"});
+        record_legacy_hook(
+            &db,
+            &key,
+            "clear",
+            Some(&malformed),
+            Some("R"),
+            9_000_000,
+            false,
+        )
+        .unwrap();
+        assert!(before == db.apply_agent_state_job_for_runtime(&job, "R").unwrap());
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn agent_status_harness_legacy_result_clear_resolves_its_own_response() {
+        let path = std::env::temp_dir().join(format!(
+            "deppy-legacy-response-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let db = storage::Db::open(&path).unwrap();
+        let workspace = "00000000-0000-0000-0000-000000000001";
+        let key = format!("{workspace}:7");
+        let question = serde_json::json!({"session_id":"native", "hook_event_name":"Elicitation", "elicitation_id":"q"});
+        record_legacy_hook(
+            &db,
+            &key,
+            "needs-input",
+            Some(&question),
+            Some("R"),
+            1_000_000,
+            false,
+        )
+        .unwrap();
+        let result = serde_json::json!({"session_id":"native", "hook_event_name":"ElicitationResult", "elicitation_id":"q"});
+        record_legacy_hook(
+            &db,
+            &key,
+            "clear",
+            Some(&result),
+            Some("R"),
+            2_000_000,
+            false,
+        )
+        .unwrap();
+        assert!(
+            db.pending_agent_request_ids(&key, "native")
+                .unwrap()
+                .is_empty()
+        );
+        let mut job = storage::AgentStateJob::projection("00000000-0000-0000-0000-000000000001");
+        job.include_hook_status = false;
+        job.include_agent_sessions = false;
+        job.include_structured_threads = false;
+        job.include_archived_threads = false;
+        assert_eq!(
+            db.apply_agent_state_job_for_runtime(&job, "R")
+                .unwrap()
+                .working_sessions,
+            vec![key]
+        );
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn agent_status_harness_rejected_legacy_payload_cannot_clear_parent() {
+        let path = std::env::temp_dir().join(format!(
+            "deppy-legacy-rejected-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let db = storage::Db::open(&path).unwrap();
+        let key = "00000000-0000-0000-0000-000000000001:7";
+        let metadata = serde_json::json!({"session_id":"native"});
+        record_legacy_hook(
+            &db,
+            key,
+            "needs-input",
+            Some(&metadata),
+            Some("R"),
+            1_000_000,
+            false,
+        )
+        .unwrap();
+        for raw in [
+            r#"{"session_id":"native","agent_id":"a","agent_id":"b"}"#,
+            "{broken-json",
+            "null",
+        ] {
+            let input = hook_payload::read_classified(raw.as_bytes());
+            assert!(input.rejected && input.value.is_none());
+            record_legacy_hook(
+                &db,
+                key,
+                "clear",
+                input.value.as_ref(),
+                Some("R"),
+                2_000_000,
+                input.rejected,
+            )
+            .unwrap();
+            assert!(
+                !db.pending_agent_request_ids(key, "native")
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn agent_status_harness_legacy_parallel_response_ids_are_independent() {
+        let path = std::env::temp_dir().join(format!(
+            "deppy-legacy-parallel-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let db = storage::Db::open(&path).unwrap();
+        let key = "00000000-0000-0000-0000-000000000001:7";
+        for (index, id) in ["q1", "q2"].into_iter().enumerate() {
+            let question = serde_json::json!({"session_id":"native", "hook_event_name":"Elicitation", "elicitation_id":id});
+            record_legacy_hook(
+                &db,
+                key,
+                "needs-input",
+                Some(&question),
+                Some("R"),
+                (index as i64 + 1) * 1_000_000,
+                false,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            db.pending_agent_request_ids(key, "native").unwrap().len(),
+            2
+        );
+        let result = serde_json::json!({"session_id":"native", "hook_event_name":"ElicitationResult", "elicitation_id":"q1"});
+        record_legacy_hook(
+            &db,
+            key,
+            "clear",
+            Some(&result),
+            Some("R"),
+            3_000_000,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            db.pending_agent_request_ids(key, "native").unwrap().len(),
+            1
+        );
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn agent_status_harness_legacy_anonymous_responses_keep_their_balance() {
+        let path = std::env::temp_dir().join(format!(
+            "deppy-legacy-anonymous-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let db = storage::Db::open(&path).unwrap();
+        let key = "00000000-0000-0000-0000-000000000001:7";
+        let mut payload = serde_json::json!({"session_id":"native", "hook_event_name":"Elicitation", "mcp_server_name":"server", "mode":"form"});
+        for at in [1_000_000, 2_000_000] {
+            record_legacy_hook(
+                &db,
+                key,
+                "needs-input",
+                Some(&payload),
+                Some("R"),
+                at,
+                false,
+            )
+            .unwrap();
+        }
+        payload["hook_event_name"] = "ElicitationResult".into();
+        record_legacy_hook(
+            &db,
+            key,
+            "clear",
+            Some(&payload),
+            Some("R"),
+            3_000_000,
+            false,
+        )
+        .unwrap();
+        assert!(
+            !db.pending_agent_request_ids(key, "native")
+                .unwrap()
+                .is_empty()
+        );
+        record_legacy_hook(
+            &db,
+            key,
+            "clear",
+            Some(&payload),
+            Some("R"),
+            4_000_000,
+            false,
+        )
+        .unwrap();
+        assert!(
+            db.pending_agent_request_ids(key, "native")
+                .unwrap()
+                .is_empty()
+        );
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn agent_status_harness_legacy_permission_alias_resolves_without_tool_start() {
+        let path = std::env::temp_dir().join(format!(
+            "deppy-legacy-alias-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let db = storage::Db::open(&path).unwrap();
+        let key = "00000000-0000-0000-0000-000000000001:7";
+        let mut payload = serde_json::json!({"session_id":"native", "hook_event_name":"PermissionRequest", "tool_name":"Bash", "tool_input":{"command":"pwd"}});
+        record_legacy_hook(
+            &db,
+            key,
+            "needs-input",
+            Some(&payload),
+            Some("R"),
+            1_000_000,
+            false,
+        )
+        .unwrap();
+        payload["hook_event_name"] = "PostToolUse".into();
+        payload["tool_use_id"] = "q".into();
+        record_legacy_hook(
+            &db,
+            key,
+            "clear",
+            Some(&payload),
+            Some("R"),
+            2_000_000,
+            false,
+        )
+        .unwrap();
+        assert!(
+            db.pending_agent_request_ids(key, "native")
+                .unwrap()
+                .is_empty()
+        );
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn agent_status_harness_legacy_tools_preserve_questions_and_release_capacity() {
+        let path = std::env::temp_dir().join(format!(
+            "deppy-legacy-tools-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let db = storage::Db::open(&path).unwrap();
+        let key = "00000000-0000-0000-0000-000000000001:7";
+        let question = serde_json::json!({"session_id":"native", "hook_event_name":"Elicitation", "elicitation_id":"question"});
+        record_legacy_hook(
+            &db,
+            key,
+            "needs-input",
+            Some(&question),
+            Some("R"),
+            1_000_000,
+            false,
+        )
+        .unwrap();
+        for i in 0..70 {
+            let mut payload = serde_json::json!({"session_id":"native", "hook_event_name":"PreToolUse", "tool_name":"Bash", "tool_use_id":format!("tool-{i}")});
+            let at = (i + 2) * 1_000_000;
+            record_legacy_hook(&db, key, "clear", Some(&payload), Some("R"), at, false).unwrap();
+            assert_eq!(
+                db.pending_agent_request_ids(key, "native").unwrap().len(),
+                1
+            );
+            payload["hook_event_name"] = "PostToolUse".into();
+            record_legacy_hook(&db, key, "clear", Some(&payload), Some("R"), at + 1, false)
+                .unwrap();
+        }
+        assert_eq!(
+            db.pending_agent_request_ids(key, "native").unwrap().len(),
+            1
+        );
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn agent_status_harness_legacy_notification_waits_for_owned_tools_only() {
+        let path = std::env::temp_dir().join(format!(
+            "deppy-legacy-notification-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let db = storage::Db::open(&path).unwrap();
+        let key = "00000000-0000-0000-0000-000000000001:7";
+        let notification = serde_json::json!({"session_id":"native", "hook_event_name":"Notification", "notification_type":"permission_prompt"});
+        record_legacy_hook(
+            &db,
+            key,
+            "needs-input",
+            Some(&notification),
+            Some("R"),
+            1_000_000,
+            false,
+        )
+        .unwrap();
+        let mut modern = notification.clone();
+        modern["runtime_instance"] = "R".into();
+        db.record_agent_attention(
+            key,
+            &agent_attention::normalize(&modern, 1_500_000).unwrap(),
+        )
+        .unwrap();
+        for (i, id) in ["q1", "q2"].into_iter().enumerate() {
+            let tool = serde_json::json!({"session_id":"native", "hook_event_name":"PreToolUse", "tool_name":"Bash", "tool_use_id":id});
+            record_legacy_hook(
+                &db,
+                key,
+                "clear",
+                Some(&tool),
+                Some("R"),
+                (i as i64 + 2) * 1_000_000,
+                false,
+            )
+            .unwrap();
+        }
+        let modern_tool = serde_json::json!({"session_id":"native", "runtime_instance":"R", "hook_event_name":"PreToolUse", "tool_name":"Bash", "tool_use_id":"modern"});
+        db.record_agent_attention(
+            key,
+            &agent_attention::normalize(&modern_tool, 3_500_000).unwrap(),
+        )
+        .unwrap();
+        for (i, id) in ["q1", "q2"].into_iter().enumerate() {
+            let result = serde_json::json!({"session_id":"native", "hook_event_name":"PostToolUse", "tool_name":"Bash", "tool_use_id":id});
+            record_legacy_hook(
+                &db,
+                key,
+                "clear",
+                Some(&result),
+                Some("R"),
+                (i as i64 + 4) * 1_000_000,
+                false,
+            )
+            .unwrap();
+            let pending = db.pending_agent_request_ids(key, "native").unwrap();
+            if i == 0 {
+                assert_eq!(pending.len(), 2);
+            } else {
+                assert_eq!(pending, vec!["notification:permission".to_owned()]);
+            }
+        }
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn agent_status_harness_malformed_child_owner_never_rebinds_parent() {

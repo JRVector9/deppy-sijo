@@ -71,10 +71,91 @@ pub enum SubscriptionUpsert {
 
 /// Persistence capability supplied by the application composition root.
 ///
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AgentStatusRecord {
+    pub session: u64,
+    pub waiting: bool,
+    pub response: bool,
+    pub working: bool,
+    pub done: bool,
+}
+
+pub const AGENT_STATUS_LIMIT: usize = 4096;
+
+/// Complete bounded facts for one runtime owner; foreign or noncanonical IDs are excluded.
+pub fn project_agent_status<'a>(
+    workspace: &str,
+    waiting: impl IntoIterator<Item = &'a str>,
+    response: impl IntoIterator<Item = &'a str>,
+    working: impl IntoIterator<Item = &'a str>,
+    done: impl IntoIterator<Item = &'a str>,
+) -> anyhow::Result<Vec<AgentStatusRecord>> {
+    anyhow::ensure!(
+        !workspace.is_empty()
+            && workspace.len() <= 256
+            && !workspace.contains(':')
+            && !workspace.chars().any(char::is_control),
+        "invalid_status_workspace"
+    );
+    let prefix = format!("{workspace}:");
+    let mut rows = std::collections::BTreeMap::<u64, AgentStatusRecord>::new();
+    for (kind, keys) in [
+        waiting
+            .into_iter()
+            .take(AGENT_STATUS_LIMIT + 1)
+            .collect::<Vec<_>>(),
+        response.into_iter().take(AGENT_STATUS_LIMIT + 1).collect(),
+        working.into_iter().take(AGENT_STATUS_LIMIT + 1).collect(),
+        done.into_iter().take(AGENT_STATUS_LIMIT + 1).collect(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        anyhow::ensure!(keys.len() <= AGENT_STATUS_LIMIT, "agent_status_input_limit");
+        for key in keys {
+            let Some(suffix) = key.strip_prefix(&prefix) else {
+                continue;
+            };
+            let Ok(session) = suffix.parse::<u64>() else {
+                continue;
+            };
+            if session.to_string() != suffix {
+                continue;
+            }
+            let row = rows.entry(session).or_insert(AgentStatusRecord {
+                session,
+                ..Default::default()
+            });
+            match kind {
+                0 => row.waiting = true,
+                1 => {
+                    row.waiting = true;
+                    row.response = true;
+                }
+                2 => row.working = true,
+                _ => row.done = true,
+            }
+            anyhow::ensure!(
+                rows.len() <= AGENT_STATUS_LIMIT,
+                "agent_status_output_limit"
+            );
+        }
+    }
+    Ok(rows.into_values().collect())
+}
+
 /// Implementations own and serialize their concrete connection. Calls occur only on the optional
 /// dashboard/push workers, never on the GUI render thread. Implementations must honor `limit`
 /// before materializing more rows than requested.
 pub trait WebRemoteRepository: Send + Sync {
+    fn list_agent_status(
+        &self,
+        _workspace: &str,
+        _runtime: &str,
+    ) -> anyhow::Result<Vec<AgentStatusRecord>> {
+        Ok(Vec::new())
+    }
+
     fn list_pending_approvals(&self, limit: usize) -> anyhow::Result<Vec<PendingApprovalRecord>>;
 
     fn resolve_approval(
@@ -110,6 +191,13 @@ pub trait WebRemoteRepository: Send + Sync {
 #[cfg(test)]
 pub(crate) struct StorageTestRepository {
     db: std::sync::Mutex<storage::Db>,
+    pub(crate) status_pauses: std::sync::Mutex<std::collections::VecDeque<StatusReadPause>>,
+}
+
+#[cfg(test)]
+pub(crate) struct StatusReadPause {
+    pub started: std::sync::mpsc::Sender<()>,
+    pub release: std::sync::mpsc::Receiver<()>,
 }
 
 #[cfg(test)]
@@ -117,12 +205,52 @@ impl StorageTestRepository {
     pub(crate) fn open(path: &std::path::Path) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
             db: std::sync::Mutex::new(storage::Db::open(path).expect("test repository open")),
+            status_pauses: std::sync::Mutex::default(),
         })
     }
 }
 
 #[cfg(test)]
 impl WebRemoteRepository for StorageTestRepository {
+    fn list_agent_status(
+        &self,
+        workspace: &str,
+        runtime: &str,
+    ) -> anyhow::Result<Vec<AgentStatusRecord>> {
+        let mut job = storage::AgentStateJob::projection(workspace);
+        job.include_hook_status = false;
+        job.include_agent_sessions = false;
+        job.include_structured_threads = false;
+        job.include_archived_threads = false;
+        let snapshot = self
+            .db
+            .lock()
+            .expect("test repository lock")
+            .apply_agent_state_job_for_runtime(&job, runtime)?;
+        let rows = project_agent_status(
+            workspace,
+            snapshot
+                .waiting_sessions
+                .iter()
+                .map(|(key, _)| key.as_str()),
+            snapshot.response_sessions.iter().map(String::as_str),
+            snapshot.working_sessions.iter().map(String::as_str),
+            snapshot
+                .turn_done_sessions
+                .iter()
+                .map(|(key, _)| key.as_str()),
+        )?;
+        let pause = self.status_pauses.lock().unwrap().pop_front();
+        if let Some(pause) = pause {
+            pause.started.send(()).unwrap();
+            pause
+                .release
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+        }
+        Ok(rows)
+    }
+
     fn list_pending_approvals(&self, limit: usize) -> anyhow::Result<Vec<PendingApprovalRecord>> {
         let page = self
             .db
@@ -216,6 +344,58 @@ impl WebRemoteRepository for StorageTestRepository {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_status_harness_projection_is_workspace_scoped_and_request_aware() {
+        let rows = project_agent_status(
+            "ws",
+            ["ws:1", "foreign:1", "ws:01"],
+            ["ws:1"],
+            ["ws:2", "foreign:2"],
+            ["ws:3"],
+        )
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                AgentStatusRecord {
+                    session: 1,
+                    waiting: true,
+                    response: true,
+                    ..Default::default()
+                },
+                AgentStatusRecord {
+                    session: 2,
+                    working: true,
+                    ..Default::default()
+                },
+                AgentStatusRecord {
+                    session: 3,
+                    done: true,
+                    ..Default::default()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn agent_status_harness_projection_stops_at_input_and_union_bounds() {
+        assert!(project_agent_status("ws", std::iter::repeat("ws:1"), [], [], []).is_err());
+        let keys: Vec<_> = (0..AGENT_STATUS_LIMIT + 1)
+            .map(|i| format!("ws:{i}"))
+            .collect();
+        assert!(
+            project_agent_status(
+                "ws",
+                keys[..2000].iter().map(String::as_str),
+                [],
+                keys[2000..].iter().map(String::as_str),
+                []
+            )
+            .is_err()
+        );
+        assert!(project_agent_status("", [], [], [], []).is_err());
+    }
 
     fn temp_db(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(

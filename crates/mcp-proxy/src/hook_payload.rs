@@ -190,6 +190,42 @@ pub fn read(reader: impl Read) -> Option<Value> {
     parse(reader, Shape::Hook)
 }
 
+pub struct HookRead {
+    pub value: Option<Value>,
+    pub rejected: bool,
+}
+
+/// Keep truly absent stdin distinct from invalid/oversized input, without retaining its body.
+pub fn read_classified(reader: impl Read) -> HookRead {
+    struct Counted<R> {
+        reader: R,
+        bytes: usize,
+        failed: bool,
+    }
+    impl<R: Read> Read for Counted<R> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            match self.reader.read(buffer) {
+                Ok(bytes) => {
+                    self.bytes = self.bytes.saturating_add(bytes);
+                    Ok(bytes)
+                }
+                Err(error) => {
+                    self.failed = true;
+                    Err(error)
+                }
+            }
+        }
+    }
+    let mut reader = Counted {
+        reader,
+        bytes: 0,
+        failed: false,
+    };
+    let value = read(&mut reader);
+    let rejected = value.is_none() && (reader.bytes > 0 || reader.failed);
+    HookRead { value, rejected }
+}
+
 pub fn transcript_row(text: &str) -> Option<Value> {
     parse(text.as_bytes(), Shape::Transcript)
 }

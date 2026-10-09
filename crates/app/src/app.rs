@@ -9646,6 +9646,34 @@ impl AppWebRemoteRepository {
 }
 
 impl web_remote::repository::WebRemoteRepository for AppWebRemoteRepository {
+    fn list_agent_status(
+        &self,
+        workspace: &str,
+        runtime: &str,
+    ) -> anyhow::Result<Vec<web_remote::repository::AgentStatusRecord>> {
+        let mut job = storage::AgentStateJob::projection(workspace);
+        job.include_hook_status = false;
+        job.include_agent_sessions = false;
+        job.include_structured_threads = false;
+        job.include_archived_threads = false;
+        let snapshot = self
+            .lock()?
+            .apply_agent_state_job_for_runtime(&job, runtime)?;
+        web_remote::repository::project_agent_status(
+            workspace,
+            snapshot
+                .waiting_sessions
+                .iter()
+                .map(|(key, _)| key.as_str()),
+            snapshot.response_sessions.iter().map(String::as_str),
+            snapshot.working_sessions.iter().map(String::as_str),
+            snapshot
+                .turn_done_sessions
+                .iter()
+                .map(|(key, _)| key.as_str()),
+        )
+    }
+
     fn list_pending_approvals(
         &self,
         limit: usize,
@@ -21594,7 +21622,12 @@ impl App {
             // 깨어나되(시청 프레임 라우팅), GUI repaint는 유발하지 않는다 (P5 리뷰 P1).
             .subscribe_with_wake_background(server.dashboard_wake());
         // UUID 맵·시청 상태·구독·명령 싱크를 하나의 worker binding으로 교체한다.
-        server.set_runtime_binding(receiver, self.active.runtime.command_sink());
+        server.set_runtime_binding_for_workspace(
+            self.active.id.clone(),
+            self.active.runtime.instance_token().to_owned(),
+            receiver,
+            self.active.runtime.command_sink(),
+        );
         // 구독 등록 직후 전체 워크스페이스 스냅샷을 시드한다 — 이벤트 스트림은 edge-trigger라,
         // 재구독한 대시보드는 과거 이력을 모른다. 시드가 없으면 이미 needs_approval로 정착한
         // 세션이 다음 상태 변화까지 "실행 중"으로 오표시된다(계획 P2 리뷰: 킬러 기능 훼손).
@@ -22122,8 +22155,12 @@ impl App {
                 .active
                 .runtime
                 .subscribe_with_wake_background(web.server.dashboard_wake());
-            web.server
-                .set_runtime_binding(receiver, self.active.runtime.command_sink());
+            web.server.set_runtime_binding_for_workspace(
+                self.active.id.clone(),
+                self.active.runtime.instance_token().to_owned(),
+                receiver,
+                self.active.runtime.command_sink(),
+            );
             // 재구독 직후 새 워크스페이스 스냅샷을 시드한다(start_web과 동일 이유 + 세션 맵
             // 통째 교체로 옛 워크스페이스 세션 정체/전환 레이스까지 해소 — P2 리뷰).
             let seeds = self.web_workspace_seed();
@@ -22154,9 +22191,8 @@ impl App {
     /// 활성 세션만 id를 싣는다(시청/입력 대상). warm/유휴는 표시 전용 — 세션 id는
     /// worker-로컬이라 다른 워크스페이스 id로 시청하면 엉뚱한 세션이 잡힌다(P5 리뷰 P2).
     ///
-    /// 활성 워크스페이스 상태는 런타임 감지 이벤트에서만 오므로(앱의 transcript/hook 병합은
-    /// 브리지에 안 보임) 병합 맵은 비워 넘겨 순수 감지 상태를 시드한다 — 브리지의 이벤트
-    /// 갱신과 일관된다. 브라우저는 innerHTML 금지라 제목 문자열은 그대로 안전하다.
+    /// 재구독 시 raw 감지와 수동 override만 시드한다. Hook 상태는 브리지가 별도로 DB에서
+    /// 읽고 병합하므로 GUI 프레임의 오래된 상태가 숨김 창의 라이브 갱신을 덮지 않는다. 브라우저는 innerHTML 금지라 제목 문자열은 그대로 안전하다.
     fn web_workspace_seed(&self) -> Vec<web_remote::dashboard::WorkspaceSeed> {
         use web_remote::dashboard::{SessionSeed, WorkspaceSeed, WorkspaceState};
         let empty_activity = std::collections::HashMap::new();
@@ -22184,10 +22220,15 @@ impl App {
                             let session = entry.session?;
                             Some(SessionSeed {
                                 id: Some(session.0),
+                                user_override: self
+                                    .active
+                                    .workspace_ui
+                                    .last_session_user_override(session),
                                 title: entry.title,
-                                status: Some(
-                                    entry.status.unwrap_or(runtime::SessionStatus::Running),
-                                ),
+                                status: self
+                                    .active
+                                    .workspace_ui
+                                    .last_session_detected_status(session),
                                 // 돌고 있는 에이전트("Claude · sonnet · high") — 사이드바
                                 // 2행과 같은 원천(agent_detect). 셸이면 None.
                                 agent: entry.agent_line,
@@ -22217,6 +22258,7 @@ impl App {
                                     let raw = rt.session_titles.get(s)?;
                                     Some(SessionSeed {
                                         id: None, // 표시 전용
+                                        user_override: None,
                                         title: self.activity_session_name(&ws.id, raw),
                                         status: None,
                                         agent: rt.workspace_ui.agent_line_for(*s),
@@ -22234,6 +22276,7 @@ impl App {
                                 .flatten()
                                 .map(|row| SessionSeed {
                                     id: None, // 표시 전용
+                                    user_override: None,
                                     title: self.activity_session_name(&ws.id, &row.title),
                                     status: None,
                                     agent: None, // 절전 — 에이전트 죽음

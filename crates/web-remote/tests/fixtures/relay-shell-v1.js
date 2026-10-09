@@ -419,11 +419,11 @@ async function flow() {
   // 진입 화면 — 워크스페이스 카드. 터미널 화면은 아직 **실제로** 감춰져 있어야 한다.
   const home = document.getElementById("relay-home");
   const terminal = document.getElementById("relay-terminal");
-  const cards = document.querySelectorAll("#relay-workspaces .m-card");
+  const cards = document.querySelectorAll("#relay-workspaces .relay-workspace");
   eq(cards.length, 2, "one card per workspace");
-  eq(cards[0].querySelector(".m-card-name").textContent, "deppy-sijo", "card name");
-  eq(cards[0].querySelector(".m-badge-count").textContent, "2", "session count badge");
-  eq(cards[0].querySelectorAll(".m-chip").length, 2, "one chip per session");
+  eq(cards[0].querySelector(".relay-workspace-label strong").textContent, "deppy-sijo", "card name");
+  eq(cards[0].querySelector(".relay-workspace-label small").textContent, "2개 세션", "session count badge");
+  eq(cards[0].querySelectorAll(".m-session-row").length, 2, "one chip per session");
   eq(document.getElementById("relay-count").textContent, "2 workspaces", "workspace pill");
   // `hidden` 속성이 저자 CSS의 display를 실제로 이기는지 — 이기지 못하면 빈 터미널이 목록을 덮는다.
   eq(getComputedStyle(terminal).display, "none", "hidden terminal must not paint");
@@ -438,7 +438,7 @@ async function flow() {
         ciphertext: sent[index].payload,
       }),
     );
-  cards[0].click();
+  cards[0].querySelector(".m-session-row").click();
   await waitFor(() => sent.length >= 6, "watch ciphertext");
   eq(sent[5].frameType, C.FRAME_TYPE.CIPHERTEXT, "watch is ciphertext");
   eq(await openFromMac(5), '{"type":"watch","session":"s1"}', "watch plaintext");
@@ -448,7 +448,7 @@ async function flow() {
   eq(document.getElementById("term-session-chip").textContent, "codex", "session chip");
 
   // 시청 불가 워크스페이스는 열리지 않는다(토스트만).
-  cards[1].click();
+  cards[1].querySelector(".m-session-row")?.click();
   await new Promise((resolve) => realSetTimeout(resolve, 30));
   eq(sent.length, 6, "an unwatchable workspace sends nothing");
 
@@ -505,13 +505,13 @@ async function flow() {
     "ok    ",
     "untouched row kept",
   );
-  ok(!document.querySelector(".m-term-scroll-note").hidden, "scrollback note shown");
+  ok(document.querySelector(".m-term-scroll-note").hidden, "obsolete historical banner remains hidden");
 
   // ⋯ 메뉴 — 표시 설정만 있고 입력 수단은 없다.
   document.getElementById("term-menu-button").click();
   const menu = document.getElementById("relay-menu");
   ok(!menu.hidden, "menu opens");
-  eq(getComputedStyle(menu).display, "block", "open menu paints");
+  eq(getComputedStyle(menu).display, "flex", "bottom sheet paints");
   document.getElementById("menu-readable-wrap").click();
   eq(
     document.getElementById("menu-readable-wrap").getAttribute("aria-pressed"),
@@ -528,7 +528,7 @@ async function flow() {
   );
 
   // 작성기 바는 자리에 있지만 전부 비활성이다 — 보기 전용.
-  const composerControls = document.querySelectorAll(".m-composer button, .m-composer input");
+  const composerControls = document.querySelectorAll(".m-composer button, .m-composer textarea");
   eq(composerControls.length, 4, "composer keeps the deppy-mux layout");
   ok(
     Array.from(composerControls).every((control) => control.disabled),

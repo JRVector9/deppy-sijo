@@ -60,8 +60,10 @@
         check(!viewer.scrollNote.hidden, 'paused current-screen action remains available');
         const after = viewer.wrap.getBoundingClientRect();
         for (const key of ['top', 'left', 'width', 'height']) near(after[key], before[key], 'note must not change terminal bounds during selection ' + key);
-        check(viewer.scrollNote.getBoundingClientRect().bottom <= after.top,
-          'status/action rail must never obstruct selected terminal text');
+        const action = viewer.resumeFollowButton.getBoundingClientRect();
+        const stageBounds = viewer.wrap.parentElement.getBoundingClientRect();
+        check(action.right <= stageBounds.right && action.bottom <= stageBounds.bottom && action.left >= stageBounds.left,
+          'floating bottom action remains inside terminal bounds without a reserved row');
         check(viewer.textLayer.contains(document.elementFromPoint(point.x, point.y)), 'first-row pointer remains on terminal while note is visible');
       }
       window.getSelection().removeAllRanges(); applyFrame(layoutFrame(0)); viewer.resumeFollow(); await settle();
@@ -73,9 +75,9 @@
       const textHeightBeforeExpiry = viewer.textLayer.getBoundingClientRect().height;
       near(stageBeforeExpiry.width, 320, 'narrow terminal stage starts at shell width');
       viewer.handleViewport({...layoutFrame(0), history: {generation: '2', first_line: '100', total_lines: 20, expired: false}}); await settle();
-      check(viewer.getHistoryState().expired && viewer.offsetText.textContent.includes('만료'), 'passive generation change shows real long expiry label');
-      viewer.offsetText.textContent += ' ' + viewer.offsetText.textContent;
-      near(stage.getBoundingClientRect().width, stageBeforeExpiry.width, 'long expiry rail must not widen narrow terminal stage');
+      check(viewer.getHistoryState().expired && viewer.getHistoryState().historyMessage.includes('만료'), 'passive generation change retains expiry status without a banner');
+      check(viewer.resumeFollowButton.textContent.includes('맨 아래로'), 'expired retained source keeps the compact bottom action');
+      near(stage.getBoundingClientRect().width, stageBeforeExpiry.width, 'expiry must not widen narrow terminal stage');
       check(viewer.resumeFollowButton.getBoundingClientRect().right <= viewer.el.getBoundingClientRect().right,
         'long expiry label must not clip current-screen action at 320px');
       const wrapAfterExpiry = viewer.wrap.getBoundingClientRect();

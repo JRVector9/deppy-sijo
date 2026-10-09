@@ -1,10 +1,62 @@
-# PWA redesign approved: PR plan and parallel implementation active — 2026-10-10
+# PWA 통합 모바일 시안 구현 완료 — 2026-10-10
 
-- Latest user explicitly approves the exact HTML design and requests PR-unit plan/parallel subagents using sol6.1/xhigh, verifying model availability, and no other skills. Do not apply any additional skill or approval gate. Product implementation is now authorized. No app restart/release/push authorized.
-- Plan: docs/superpowers/plans/2026-10-10-pwa-unified-mobile.md. PR1 backend Rust history range, PR2 shared renderer, PR3 mobile shell/input/UI, PR4 root integration/QA. Strict disjoint file ownership; root alone owns common docs/git/Cargo gates. Existing original/revised mockup files and spec are current task-owned untracked artifacts.
-- Source starting point d8445b5c0d03c3004f3f570bb4762f8d0cf5b800, workspace version0.9.0. Existing model tool catalog advertises gpt-6.1-sol and xhigh; actual requested-model spawn validation is next. CLI0.161.0 supports explicit --model/config but no CLI model fallback is needed. Never silently switch model/effort.
-- Actual requested-model spawn succeeded: /root/unified_backend, /root/unified_renderer, /root/unified_mobile_ui all explicit gpt-6.1-sol/xhigh/forknone. Old completed pwa agents are not reused with unknown model settings. Approved contract now in plan: optional query rows, native_rows/live_first_line metadata, latest offset0 end-distance, connection-local expanded passive frames; root approved and shared with both peers. Renderer/shell hooks agreed; root adds pwa_unified_chrome.rs runner for new distinct fixtures. Test files pending; no test executed/passed yet.
-- Exact next: agents implement owned paths and request targeted checks; root finishes independent docs/test integration and serializes Cargo only when source stable. Do not edit agent paths concurrently. Nominal /Users/jr/Desktop/projects/deppy-sijo unrelated work remains untouched.
+## 현재 목표와 결과
+
+사용자가 승인한 `docs/mockups/pwa-mobile-unified-input-2026-10-10.html`과 설계를 PR 단위로 계획하고 병렬 구현하는 작업을 완료했다. 세 서브에이전트 실제 spawn 및 CLI 독립 리뷰 모두 `gpt-6.1-sol` / reasoning effort `xhigh`를 명시하고 확인했다. 추가 스킬 사용 없음. 구현 소스는 `/Users/jr/Desktop/projects/deppy-sijo-performance`, branch `feat/audit-nine-pr-v0.6.0-20261004`; nominal checkout의 다른 작업은 변경하지 않았다.
+
+## 완료한 PR 단위와 수정 파일
+
+- 계획/시안 `055bcec4`: 승인 HTML·설계·PR 계획. 시작 소스 `d8445b5c`.
+- PR1 `9edb041b`: terminal3/runtime5/web backend6/app1/storage2, 총17Rust 파일. native PTY와 독립된 유계 표시 이력 및 metadata/passive refresh/query fences. App/storage의 안정된 dormant session UUID producer 포함.
+- PR2 `0a0f01cd`: `web/shared/viewer-core.js`, `.css`, 새 `pwa-unified-renderer.js`. 가용 높이 전체/연속 이력/읽기 위치/선택·검색 보존 및 floating bottom 버튼.
+- PR3 `80db4539`: loopback assets3/shared mobile-theme1/Relay3/새 `pwa-unified-mobile-ui.js`, 총8파일. 한 buffered 입력창/IME·전송·세션 초안, 모바일 workspace/session 전체 행과 bottomsheet, actual viewport header 및 dropdown 표시.
+- PR4 본 최종 통합 커밋 (`test(pwa): 시안 회귀와 통합 검증 기록`): `static_srv.rs` test-contract, 기존 `mobile-shell-parity.js`, `mobile-usability.js`, `relay-shell-v1.js`, `viewer-reading-contract.js`, 새 `pwa_unified_chrome.rs`, 계획/QA/이 handoff. 최종 커밋 ID는 `git log -1 --oneline`로 확인한다.
+
+## 핵심 설계
+
+- optional rows1..256, frame65536cells, cache512rows/65536cells/canvas8Mi pixels. native_rows/live_first_line은 표시 구간과 native/live origin을 구분하며 exact decimal identity를 사용한다. 조회로 native rows/cursor/scroll/damage/cache/alternate screen을 바꾸지 않는다. Runtime binary wire26→27, JSON5의 optional extension은 기존 요청과 호환된다.
+- 확대 프레임은 socket/watch/session/binding/generation을 fence하고 native delta baseline과 섞지 않는다. 불가한 이력은 정상 native live로 복귀하고 timeout은 bounded retry한다. 과거를 읽는 동안 disjoint passive/늦은 layout 응답은 읽던 window/selection을 대체하지 않는다. 재연결 때 동일 geometry라도 desired rows를 다시 전달한다.
+- 입력창44px/16px에서 최대132px(5줄) 후 내부 스크롤. Enter 명시 전송/ShiftEnter 개행/IMEEnter 보호. 특수키만 기존 direct-key 계약을 사용하며 자유 텍스트는 buffered다. NFC 경로, per-session draft/journal/ACK/pressure/retired IME/socket/session 보호를 유지한다.
+- workspace search·기본 active 펼침·refresh state·full-width76px row/14px2줄 title/12px status-agent, bottom chooser/settings. dormant selection은 실제 saved sessions.id를 fresh dashboard UUID와 연결하며 pane id/title/index/local u64를 기준으로 고르지 않는다. Relay는 기존 읽기 allowlist를 유지한다.
+
+## 실제 실행한 검사
+
+- terminal133PASS4ignored, runtime379PASS, storage426PASS: `/private/tmp/deppy-unified-rust-full-20261010.log`.
+- App main2817PASS38ignored/integration39PASS3ignored, 5패키지 strict alltargets Clippy 및 fmt PASS: `/private/tmp/deppy-unified-app-strict-20261010.log`.
+- 마지막 backend 수정 후 Web lib364PASS1ignored/새2회귀PASS/check-boundaryPASS: `/private/tmp/deppy-unified-backend-review-green-20261010.log` exit0.
+- Chromium9targets10tests와 web/App strict alltargets Clippy/fmt/check-boundary 모두 PASS: `/private/tmp/deppy-unified-browser-final-20261010.log` exit0. 마지막 header CSS 후 affected5tests PASS (`visual-final` log); 최종 dropdown CSS 후 unified2/parity/Relay4tests PASS (`picker-final` log), 모두 exit0.
+- 독립 Chromium renderer111/UI95/legacy usability187/history89/reading182/readability113checks PASS. Relay Node16PASS. root/agent 구문·diff check PASS.
+- read-only CLI Rust2medium/JS high+medium을 수정했다. 4건 focused 재검토 `/private/tmp/deppy-unified-fix-review-20261010.txt`는 exit0/OK no residual findings. 이후 작은 실제 시안 CSS 보정은 root diff 대조·Chromium 재검증했다.
+- production HTML/JS/CSS + isolated FakeSocket을 CDP390×844로 촬영·대조했다. innerWidth/clientWidth/scrollWidth 모두390, terminal53loaded rows로 가용 높이를 채움; workspace/full rows,5줄 입력,settings bottomsheet/header42%/44px 및⌄ 정상. `/private/tmp/deppy-unified-actual-{terminal,workspace,long,settings}-20261010.png`.
+
+## 실패한 접근과 수정
+
+초기 backend oracle는 새 native output의 blank행까지 불변이라고 가정해 실패했고 stable 역사 prefix/역사12행 equality로 고쳤다. App `--lib`는 binary-only라 명령 실패; 실제 package test로 수정했다. xtask `boundary`는 잘못된 subcommand였고 `check-boundary` 실제 PASS로 수정했다. 기존 UI fixtures의 direct realtime/native-offset/reserved rail/고정-timer 가정을 실제 buffered/correlated history ACK/floating bottom으로 이관했다. 실패한 gate tail을 성공으로 표시하지 않았다.
+
+처음 screenshot은 fixture의 held-history 플래그를 물려받아 sparse해 보였고 preview flag를 해제했다. headless Chrome `--window-size390`은 layout minimum500이라390 capture가 목록을 잘랐지만 실제 CSS overflow는 아니었다. CDP true390 emulation으로 정정했다. 이와 별개로 실제 visualViewport<layoutwidth의 header vw cap 과대 문제는 실제 viewer 폭 기준42%로 수정·회귀했다.
+
+## 남은 범위와 다음 명령
+
+요청한 소스 구현·코드 리뷰·자동 회귀·시안 대조·PR 단위 로컬 커밋은 완료했다. 실제 iPhone/Safari·Android 설치형 PWA/OS키보드·clipboard·longpress는 이번 격리 Chromium 검증과 구분하여 미검증이다. QA: `docs/qa/2026-10-10-pwa-unified-mobile.md`에 실행별 scope/재현 명령을 기록했다.
+
+앱을 중지/재실행하거나 변경 artifact를 출시·배포·푸시하지 않았다. source app version0.9.0은 유지한다. 후속 changed local release 요청은 최신 shipped보다 큰 새 버전과 binary/bundle version 검증이 필요하며, 앱 restart는 현재 작업의 명시 요청이 필요하다.
+
+다음 agent의 read-only 확인 명령 (cwd `/Users/jr/Desktop/projects/deppy-sijo-performance`):
+
+```sh
+git status --short
+git log -5 --oneline
+sed -n '1,110p' docs/qa/2026-10-10-pwa-unified-mobile.md
+```
+
+추가 변경이 회귀를 필요로 할 때만 root가 Cargo를 직렬 실행한다:
+
+```sh
+python3 /private/tmp/deppy-audit-nine-pr-20261004/cargo_gate.py test -q -p web-remote --test pwa_unified_chrome -- --ignored --test-threads=1
+python3 /private/tmp/deppy-audit-nine-pr-20261004/cargo_gate.py run -q -p xtask -- check-boundary
+```
+
+`dev-run.sh`를 이 handoff의 자동 다음 단계로 실행하지 않는다. Approved mockup preview loopback8767은 기존 시안용 서버다.
 
 ---
 

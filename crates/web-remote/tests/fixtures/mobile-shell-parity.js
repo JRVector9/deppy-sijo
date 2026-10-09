@@ -60,7 +60,7 @@ async function run() {
     'two-column mobile top bar');
   check(document.querySelector('.ws-group .ws-name').textContent === 'Design', 'workspace card');
   check(document.querySelector('.ws-group .ws-path').textContent === '/Users/jr/Design', 'workspace path');
-  check(document.querySelectorAll('.ws-group .session').length === 2, 'terminal chips');
+  check(document.querySelectorAll('.ws-group .session').length === 2, 'full-width session rows');
   check(!document.getElementById('approval-toggle').hidden, 'pending approval indicator');
   check(document.getElementById('approval-panel').hidden, 'approval panel initially collapsed');
   document.getElementById('approval-toggle').click();
@@ -69,12 +69,11 @@ async function run() {
   check(mobileSent.some((frame) => frame.type === 'resolve' && frame.id === 'a-1' && frame.allowed),
     'approval action stays connected');
   document.getElementById('approval-toggle').click();
-  document.querySelector('.ws-group').click();
-  check(!document.getElementById('viewer').hidden, 'terminal opens from workspace card');
+  document.querySelector('.session[data-session-id="s-1"]').click();
+  check(!document.getElementById('viewer').hidden, 'terminal opens from the chosen session row');
   check(document.getElementById('viewer-title').textContent === 'Design', 'terminal workspace title');
   check(document.getElementById('viewer-session-chip').textContent === 'Claude', 'terminal title chip');
-  document.getElementById('viewer-mode-composer').click();
-  check(getComputedStyle(document.querySelector('.composer')).display === 'grid', 'compact four-column composer');
+  check(document.querySelectorAll('#viewer textarea').length === 1 && !document.querySelector('[id^=viewer-mode-]'), 'one unified buffered input');
   const composer = document.getElementById('composer-text');
   composer.value = '모바일 입력';
   composer.dispatchEvent(new Event('input', { bubbles: true }));
@@ -85,7 +84,9 @@ async function run() {
   document.getElementById('viewer-quick-button').click();
   check(!document.getElementById('viewer-quick-actions').hidden, 'quick actions open from slash');
   document.getElementById('viewer-session-chip').click();
-  check(document.getElementById('viewer-session-chip').textContent === 'Codex', 'terminal cycles');
+  check(!document.getElementById('viewer-session-sheet').hidden && document.getElementById('viewer-session-chip').textContent === 'Claude', 'chip opens selection sheet without changing session');
+  document.querySelector('#viewer-session-list [data-session-id="s-2"]').click();
+  check(document.getElementById('viewer-session-chip').textContent === 'Codex', 'chosen session opens');
   check(mobileSent.some((frame) => frame.type === 'watch' && frame.session === 's-2'), 'cycled watch sent');
   check(getComputedStyle(document.getElementById('viewer')).backgroundColor === 'rgb(5, 5, 5)', 'terminal shell theme');
   document.body.dataset.status = 'ok';

@@ -62,4 +62,15 @@
 - 세 서브에이전트 실제 spawn 성공: unified_backend, unified_renderer, unified_mobile_ui, 모두 model=gpt-6.1-sol/reasoning_effort=xhigh/fork_turns=none. 도구에서 지원하는 모델을 지정했고 다른 모델로 대체하지 않았다.
 - PR1 계약 승인: Scroll optional rows1..256, frame bounds65536cells/available source rows; latest offset0 is end-distance from live tail. metadata native_rows/live_first_line separates native dimensions/live origin from loaded frame first_line/rows. Anchor preserves top on row change. Alt native-only. Runtime wire26→27. Backend connection-local widened passive frames keep native baseline separate.
 - PR2/3 API: historyRowsChanged(rows,metrics), historyNavigate({delta,rows,reason}); getDesiredHistoryRows(); expectHistoryWindow(request,{reason,rows,preservePosition,follow}); getHistoryState adds followingLive/offLatest/desiredRows/cachedRows/historyMessage. Legacy hooks retain compatibility; expanded metadata opts into cache.
-- Root added distinct Chromium runner pwa_unified_chrome.rs with success markers PWA_UNIFIED_RENDERER_OK:/PWA_UNIFIED_MOBILE_UI_OK:. Fixture implementations pending; no test passed claim yet.
+- Root integrated distinct Chromium runner pwa_unified_chrome.rs with success markers PWA_UNIFIED_RENDERER_OK:/PWA_UNIFIED_MOBILE_UI_OK:. 최종9target10test 실제 PASS, 전체 affected Rust suite/strict Clippy/fmt/check-boundary PASS. QA에 실행별 scope와 실패했던 명령/수정 oracle를 기록했다.
+- PR1 완료·커밋9edb041b: backend14파일과 root app/storage identity producer3파일. PR2 완료·커밋0a0f01cd: 공용 core2파일과 renderer fixture. PR3 완료·커밋80db4539: 통합 입력/모바일 워크스페이스/하단 패널/Relay/독립 UI95checks. PR4는 본 계획과 QA/handoff, 신규 Chromium wrapper와 기존4fixture/static source-contract 통합을 최종 커밋한다.
+- 독립 exact-model CLI 리뷰 발견4건은 실제 회귀로 수정했고 최종 focused review OK/no residual. 공개 PR/푸시/앱 재시작/빌드 배포 없음.
+
+## 최종 완료 기록
+
+- [x] PR1 backend: bounded independent display rows와 immutable native 계약, 새 native-generation/unsupported-history 회귀, UUID 기반 inactive selection producer 완료.
+- [x] PR2 renderer: 전체 가용 높이, 연속 이력/reading identity, floating bottom, native/history delta fences와 cache/canvas 상한 완료.
+- [x] PR3 mobile UI: 한 입력창/44px·최대5줄/IME·초안·ACK, 검색·76px 전체 세션 행·14px2줄 title, chooser/settings bottomsheet, actual visualViewport42% header와⌄ 완료.
+- [x] PR4 root: 독립 리뷰4건 수정/최종 OK, 전체 relevant Rust suites·strict Clippy·fmt·boundary, Chromium10tests와 마지막 affected5/4tests PASS, actualCDP390px production-assets 시안 대조, QA/handoff 완료.
+
+설치형 PWA 실제 휴대폰은 이번 자동 검증 범위 밖이다. 제품 앱 실행 빌드/재시작/배포/푸시 없이 소스 PR 단위 커밋을 완료한다. 앱 source0.9.0, runtime wire27, JSON5 optional-extension 계약이며 후속 변경 artifact 출시는 새 앱 버전이 필요하다.

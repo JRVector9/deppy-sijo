@@ -1,3 +1,16 @@
+# main 착지·Git 패널 v2·CI 단축 완료 — 2026-10-11 (Claude Code)
+
+- 이제 `main` = performance 브랜치(`feat/audit-nine-pr-v0.6.0-20261004`). 착지는 PR CI 통과 뒤 `git push origin <sha>:main` fast-forward로 한다(SHA 보존, PR 자동 merged). GitHub 「Rebase and merge」는 SHA를 다시 만들어 쓰지 않는다. 착지 뒤 performance 브랜치도 같은 SHA로 맞춘다.
+- performance → main(#216, `3da20810`). 직전 수정: `scripts/verify-agent-status.sh`가 macOS bash 3.2에서 빈 배열로 멈추던 것(`${extra[@]+"${extra[@]}"}`).
+- runtime `세션과_layout이_영속된다` 경쟁 수정(#218, `84477aa4`): 바로 끝나는 `echo` 에이전트의 exit 처리가 pane·탭을 닫고 탭 0개 layout을 다시 저장해 확인보다 먼저 끝났다. `read line`으로 살려 두고 확인 뒤 WriteInput으로 끝낸다. 확인 전 500ms 지연으로 RED 재현, 수정본 30/30.
+- 닫은 PR: #199~#204(head가 SHA 그대로 main에 포함, 추가 코드·테스트 1:1 대조), #188은 자동. 브랜치는 남김.
+- Git 패널 v2 스택(#209~#215)을 SessionAuxView 구조로 이식해 착지(`34edcda5`). 커밋 파일 요청은 세션 보조 뷰의 `git_commit_files_generation` 칸을 따로 쓴다 — 리뷰 수정의 App 전역 `GitPanelIoGenerations`·`GitPanelIoKind`는 없앴다. 완료·재시도 큐 탈락·선택 없을 때 diff 비우기·키 막기는 모두 `self.session_aux.current`/`view` 기준. 실행 중 0.10.2 앱에는 없다(반영하려면 버전 올려 재빌드).
+- CI 단축(#219, `f9288c2c`): macOS 테스트를 cargo-nextest 0.9.148 병렬로 돈다(`.config/nextest.toml` `ci` 프로필 — 실패 모아 보기, 재시도 2회·FLAKY 표시, pty 지연 테스트 2개 단독). 「Agent status ownership and provider replay」는 macOS job 안의 같은 이름 step이다 — 범위 `AGENT_STATUS_TESTS`는 `scripts/verify-agent-status.sh`와 같게 유지한다(622개). 모든 변경이 `docs/` 아래(`docs/build/` 제외)인 PR은 macOS job을 건너뛴다. macOS job 약 10~12분 → 6분 30초 안팎(PR·main 실측), PR당 macOS job 2 → 1. doctest는 0개라 nextest만 돈다 — doctest가 생기면 `cargo test --doc`를 더한다.
+- 알려진 flaky(재시도로 흡수, 로그에 FLAKY): pty `고립된_1바이트_echo는_coalesce_대기_전체를_지불하지_않는다`(1.9ms 상한), agent-mcp `actual_http_auth_origin_initialize_and_answer_tool_discovery`(ConnectionReset).
+- 이 세션 로컬 환경에서 `cargo test`로 돌리면 agent_detect 프로세스 테스트 3개가 main에서도 실패한다(환경 제약). nextest와 CI에서는 통과.
+
+---
+
 # 0.10.2 패키지 빌드·검증 완료 — 2026-10-11 (Claude Code)
 
 - 사용자가 /permissions로 「Build signed 0.10.2 release bundle」 승인 → `CARGO_NET_OFFLINE=true DEPPY_REQUIRE_TRUSTED_SIGNING=0 DEPPY_ALLOW_UNTRUSTED_SIGNING=1 sh scripts/package-macos.sh` exit0. 로그 `/private/tmp/deppy-0.10.2-package-20261011.log`.

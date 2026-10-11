@@ -1,3 +1,16 @@
+# 0.10.2 커밋 분리·검사 완료, 패키징은 사용자 실행 대기 — 2026-10-11 (Claude Code)
+
+- 사용자: Codex R1~R6 수정 완료 확인 후 「다음 단계 진행해」(배포 순서 ②③). restart 요청 없음 → 재실행 안 함.
+- 버전 0.10.1 → 0.10.2(patch). 미커밋 tree를 작성자·기능별 7커밋으로 분리(작업 트리 미변경, index만 사용): 998544b6 이력 구조(Codex) → be2747d8 PWA(Codex) → ee1789ef 독립 세션 제목(Codex, Cargo.lock은 libc만) → 3728936e 창 리사이즈(Claude) → 3eb11ef4 이력 제목·검색 정렬(Claude) → 5f2441ef 조사·검토 문서(Codex) → 7e28ab6a release 0.10.2. HEAD tree = 검사한 working tree. 중간 4커밋 각각 `cargo check --workspace --all-targets --locked` exit0(임시 worktree, 삭제함).
+- 커밋 직전 gate: fmt check, xtask check-boundary, clippy --workspace --all-targets -D warnings, test --workspace --no-fail-fast 5144 PASS/0 FAIL/62 ignored, Chromium PWA 9 PASS, relay node test, diff check PASS.
+- gate에서 찾은 것: ① `web-remote static_srv::tests::전체화면_렌더러는_visual_viewport와_단일_frame_스케줄러를_사용한다` — Codex PWA의 맞춤 식 변경(가로 열 너비만) 뒤 원본 고정 marker 갱신 누락. 새 식 marker + 높이 기준 축소 금지 assert로 갱신(PWA 커밋에 포함). ② `mobile_usability_chrome`이 부하 중 1회 2.85s에 `retained offset-zero current action sends an absolute correlated reset`로 실패, 이후 단독 2회·전체 1회 모두 PASS(29s) — 타이밍 flaky로 기록, 제품 수정 없음.
+- DB: ee1789ef가 migration 1건(agent_hook_sessions nullable 2열). 0.10.2로 연 DB는 0.10.1이 열지 않음(ensure_not_ahead). 되돌리려면 migration 직전 자동 백업 `.sqlite3.bak` 사용.
+- 패키징: `scripts/package-macos.sh`(DEPPY_ALLOW_UNTRUSTED_SIGNING=1)는 auto mode 분류기가 다시 거부 → 우회 안 함. release 바이너리는 `cargo build --release -p deppy-sijo -p mcp-proxy`로 선행(exit0, 44s). 사용자가 같은 package 명령을 직접 실행해야 함. 그 뒤 bundle 버전·서명 검증, 재실행은 명시 요청 시.
+- 미추적: docs/mockups/git-panel-redesign-2026-10-11.html, docs/superpowers/plans/2026-10-11-git-panel-v2.md — PR #209와 동일 내용이라 이 줄에 커밋하지 않음.
+- 다음 결정(사용자): ④ 이 줄 → main 착지 여부 ⑤ Git 스택(#210~#215) SessionAuxView 포팅.
+
+---
+
 # 독립 세션 제목 후속 6건 수정·root 통합 검증 완료 — 2026-10-11
 
 - 현재 요청 완료: 사용자 「발견한 결함 전부 서브에이전트 병렬로 수정」. 3명(gpt-6.1-sol/xhigh)이 소유 파일을 나눠 구현했고 root가 모든 변경 및 인터페이스를 리뷰했다. canonical performance, HEAD799fae89 + 기존 dirty tree 유지. 다른 Claude Code history/Git/resize 변경 보존. desktop composer/status/input_admission 제품 코드는 조사-only 요청 유지.

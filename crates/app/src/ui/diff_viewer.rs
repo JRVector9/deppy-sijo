@@ -336,6 +336,10 @@ pub struct DiffViewerUi {
     /// 헤더 버튼이 낸 App intent — app.rs 소스 고정 테스트가 `render` 호출 모양을 묶어
     /// 두어 반환값을 바꿀 수 없으므로, App이 render 직후 [`Self::take_action`]으로 꺼낸다.
     action: Option<crate::ui::git_panel::GitPanelAction>,
+    /// 작업 트리가 깨끗할 때 파일을 고르지 않은 자리에 보일 브랜치 요약(2026-10-11 PR 3) —
+    /// App이 매 프레임 render 직전에 [`Self::set_clean_summary`]로 넣는다. None이면 예전
+    /// 안내 한 줄.
+    clean_summary: Option<crate::ui::git_panel::GitCleanSummary>,
 }
 
 impl DiffViewerUi {
@@ -388,6 +392,25 @@ impl DiffViewerUi {
         self.action.take()
     }
 
+    /// 깨끗할 때 요약 — git 패널 스냅샷에서 App이 받아(`GitPanelUi::clean_summary`) 매
+    /// 프레임 render 직전에 넣는다. 파일을 연 뒤에는 그리지 않는다.
+    pub fn set_clean_summary(&mut self, summary: Option<crate::ui::git_panel::GitCleanSummary>) {
+        self.clean_summary = summary;
+    }
+
+    /// 변경(hunk) 이동 — 헤더 ↑↓ 버튼과 N/P 키가 같이 쓴다. 양 끝에서 멈추고, 실제로
+    /// 옮겼을 때만 다음 프레임 스크롤 대상을 세운다.
+    fn step_hunk(&mut self, step: isize) {
+        let Some(last) = self.hunk_starts.len().checked_sub(1) else {
+            return;
+        };
+        let next = self.current_hunk.saturating_add_signed(step).min(last);
+        if next != self.current_hunk {
+            self.current_hunk = next;
+            self.scroll_to_row = self.hunk_starts.get(next).copied();
+        }
+    }
+
     /// `search`는 (질의, 그 본문 기준 활성 일치 인덱스) — App이 소유한
     /// `AuxSearchState`에서 뽑아 넘긴다. `None`이면 보조 검색이 꺼져 있거나 이 diff
     /// 본문이 대상이 아니라는 뜻이라 강조 없이 예전처럼 그린다.
@@ -399,11 +422,26 @@ impl DiffViewerUi {
     ) {
         // 파일이 한 번도 선택되지 않았으면(Git 보조 본문이 방금 열렸거나 목록에서 아직
         // 아무 행도 클릭하지 않았으면) 안내 한 줄만 보인다 — 헤더·hunk 이동은 파일이
-        // 선택된 뒤에나 의미가 있다(스펙 §8-3).
+        // 선택된 뒤에나 의미가 있다(스펙 §8-3). 작업 트리가 깨끗하면 그 대신 브랜치
+        // 요약을 보인다(2026-10-11 PR 3).
         let Some(mode) = self.mode else {
-            ui.weak(catalog.t("git.diff.empty", &[]));
+            match &self.clean_summary {
+                Some(summary) => clean_summary_view(ui, summary, catalog),
+                None => {
+                    ui.weak(catalog.t("git.diff.empty", &[]));
+                }
+            }
             return;
         };
+        // ── N/P: 다음/이전 변경(2026-10-11 PR 3) — 헤더 ↑↓와 같은 이동. 텍스트 입력
+        // 포커스·IME 조합 중이면 그 입력의 키라 건드리지 않고, 변경이 없으면 소비하지 않는다.
+        if !self.hunk_starts.is_empty()
+            && let Some(step) =
+                crate::ui::git_panel::git_key_step(ui.ctx(), egui::Key::P, egui::Key::N)
+        {
+            crate::ui::git_panel::consume_git_keys(ui.ctx(), egui::Key::P, egui::Key::N);
+            self.step_hunk(step);
+        }
         // ── 헤더: 경로 · 모드 라벨 · hunk ↑↓ ────────────────────────────
         ui.horizontal(|ui| {
             // 폴더는 흐리게, 파일명은 강하게 — 긴 경로에서도 어떤 파일인지 먼저 읽힌다.
@@ -430,10 +468,8 @@ impl DiffViewerUi {
                     .small_button("↓")
                     .on_hover_text(catalog.t("git.hunk.next", &[]))
                     .clicked()
-                    && self.current_hunk + 1 < self.hunk_starts.len()
                 {
-                    self.current_hunk += 1;
-                    self.scroll_to_row = self.hunk_starts.get(self.current_hunk).copied();
+                    self.step_hunk(1);
                 }
                 if !self.hunk_starts.is_empty() {
                     ui.weak(catalog.t(
@@ -448,10 +484,8 @@ impl DiffViewerUi {
                     .small_button("↑")
                     .on_hover_text(catalog.t("git.hunk.prev", &[]))
                     .clicked()
-                    && self.current_hunk > 0
                 {
-                    self.current_hunk -= 1;
-                    self.scroll_to_row = self.hunk_starts.get(self.current_hunk).copied();
+                    self.step_hunk(-1);
                 }
             });
         });
@@ -604,6 +638,55 @@ impl DiffViewerUi {
             ui.weak(catalog.t("diff.truncated", &[]));
         }
     }
+}
+
+/// 작업 트리가 깨끗하고 고른 파일이 없을 때의 diff 영역(2026-10-11 PR 3) — 안내 한 줄
+/// 대신 브랜치 요약: 보낼/받을 커밋 수(둘 다 0이면 원격과 같음)와 커밋 탭 안내. 업스트림이
+/// 없으면 셀 수 없는 이유를 보이고, 비어 있을 커밋 탭은 가리키지 않는다. 색은 브랜치
+/// 카드 배지와 같다(보낼=성공색, 받을=경고색).
+fn clean_summary_view(
+    ui: &mut egui::Ui,
+    summary: &crate::ui::git_panel::GitCleanSummary,
+    catalog: &i18n::Catalog,
+) {
+    let tokens = crate::ui::designall::tokens(ui.visuals());
+    ui.add_space(8.0);
+    egui::Frame::NONE
+        .stroke(egui::Stroke::new(1.0, tokens.separator))
+        .corner_radius(egui::CornerRadius::same(8))
+        .inner_margin(egui::Margin::same(14))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.colored_label(tokens.success, "✓");
+                ui.strong(catalog.t("diff.clean", &[]));
+            });
+            ui.add_space(6.0);
+            let Some(upstream) = summary.upstream.as_deref() else {
+                ui.colored_label(tokens.warning, catalog.t("git.upstream_none", &[]));
+                ui.weak(catalog.t("git.branch.no_upstream_hint", &[]));
+                return;
+            };
+            if summary.ahead == 0 && summary.behind == 0 {
+                ui.label(catalog.t("git.branch.in_sync", &[]));
+            } else {
+                ui.horizontal_wrapped(|ui| {
+                    let ahead = summary.ahead.to_string();
+                    let behind = summary.behind.to_string();
+                    ui.colored_label(
+                        tokens.success,
+                        catalog.t("git.summary.ahead", &[("count", &ahead)]),
+                    );
+                    ui.weak("·");
+                    ui.colored_label(
+                        tokens.warning,
+                        catalog.t("git.summary.behind", &[("count", &behind)]),
+                    );
+                });
+            }
+            ui.add_space(4.0);
+            ui.weak(catalog.t("git.summary.commits_hint", &[("base", upstream)]));
+        });
 }
 
 #[cfg(test)]
@@ -1137,5 +1220,159 @@ index 111..222 100644
         // 다음 파일을 열 때 App이 대상을 넣지 않으면 이전 파일 경로가 남으면 안 된다.
         viewer.open("b.rs".to_owned(), DiffMode::Working);
         assert_eq!(viewer.path_target, None);
+    }
+
+    // ── PR 3: N/P 변경 이동·깨끗할 때 요약(2026-10-11 계획 §3) ──────────────────
+
+    #[test]
+    fn kittest_n_p_키는_hunk_버튼과_같이_옮기고_경계에서_멈춘다() {
+        use egui_kittest::kittest::Queryable;
+
+        let mut viewer = DiffViewerUi::default();
+        viewer.open("src/big.rs".to_owned(), DiffMode::Working);
+        viewer.set_view(큰_두_hunk_뷰());
+        let mut harness = harness_for(viewer);
+        harness.run();
+
+        // P: 이미 첫 변경이라 하한에서 멈춘다.
+        harness.key_press(egui::Key::P);
+        harness.run();
+        assert_eq!(harness.state().current_hunk, 0);
+
+        // N: 다음 변경으로 실제로 스크롤한다(↓ 버튼과 같다).
+        harness.key_press(egui::Key::N);
+        harness.run();
+        assert_eq!(harness.state().current_hunk, 1);
+        assert!(
+            harness
+                .query_by_label_contains("둘째_hunk_고유_행")
+                .is_some()
+        );
+        harness.get_by_label("Change 2/2");
+
+        // 다시 N: 마지막 변경이라 상한에서 멈춘다.
+        harness.key_press(egui::Key::N);
+        harness.run();
+        assert_eq!(harness.state().current_hunk, 1);
+
+        // ⌘P 같은 단축키는 건드리지 않는다.
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::P);
+        harness.run();
+        assert_eq!(harness.state().current_hunk, 1);
+
+        harness.key_press(egui::Key::P);
+        harness.run();
+        assert_eq!(harness.state().current_hunk, 0);
+    }
+
+    #[test]
+    fn kittest_텍스트_입력_포커스나_ime_조합_중에는_n_p를_무시한다() {
+        // (뷰어, 검색 입력, 검색창 포커스 여부)
+        type State = (DiffViewerUi, String, bool);
+        let mut viewer = DiffViewerUi::default();
+        viewer.open("src/big.rs".to_owned(), DiffMode::Working);
+        viewer.set_view(큰_두_hunk_뷰());
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, state: &mut State| {
+                let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+                let (viewer, search, focused) = state;
+                if *focused {
+                    ui.text_edit_singleline(search).request_focus();
+                }
+                viewer.render(ui, &catalog, None);
+            },
+            (viewer, String::new(), true),
+        );
+        harness.run();
+        harness.key_press(egui::Key::N);
+        harness.run();
+        assert_eq!(harness.state().0.current_hunk, 0, "검색창에 쓰는 n이다");
+
+        // 포커스를 빼도 IME 조합 중인 프레임의 키는 조합 입력이다.
+        harness.state_mut().2 = false;
+        harness.run();
+        harness.input_mut().events.extend([
+            egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: "ㅜ".to_owned(),
+                active_range_chars: None,
+            }),
+            egui::Event::Key {
+                key: egui::Key::N,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        harness.run();
+        assert_eq!(harness.state().0.current_hunk, 0);
+
+        harness.key_press(egui::Key::N);
+        harness.run();
+        assert_eq!(harness.state().0.current_hunk, 1);
+    }
+
+    #[test]
+    fn kittest_깨끗하고_고른_파일이_없으면_브랜치_요약을_보인다() {
+        use crate::ui::git_panel::GitCleanSummary;
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let t = |key: &str| catalog.t(key, &[]);
+        let ahead = |count: &str| catalog.t("git.summary.ahead", &[("count", count)]);
+        let behind = |count: &str| catalog.t("git.summary.behind", &[("count", count)]);
+        let hint = |base: &str| catalog.t("git.summary.commits_hint", &[("base", base)]);
+        let harness_with = |summary: Option<GitCleanSummary>| {
+            let mut viewer = DiffViewerUi::default();
+            viewer.set_clean_summary(summary);
+            let mut harness = harness_for(viewer);
+            harness.run();
+            harness
+        };
+        let summary = |upstream: Option<&str>, ahead: u32, behind: u32| GitCleanSummary {
+            upstream: upstream.map(Into::into),
+            ahead,
+            behind,
+        };
+
+        // 보낼·받을 커밋 — 개수와 커밋 탭 안내. 예전 안내 한 줄은 없다.
+        let harness = harness_with(Some(summary(Some("origin/main"), 3, 1)));
+        harness.get_by_label(&t("diff.clean"));
+        harness.get_by_label(&ahead("3"));
+        harness.get_by_label(&behind("1"));
+        harness.get_by_label(&hint("origin/main"));
+        assert!(harness.query_by_label(&t("git.diff.empty")).is_none());
+        assert!(harness.query_by_label(&t("git.branch.in_sync")).is_none());
+
+        // 받을 커밋만 있어도 둘 다 숫자로 보인다.
+        let harness = harness_with(Some(summary(Some("origin/main"), 0, 2)));
+        harness.get_by_label(&ahead("0"));
+        harness.get_by_label(&behind("2"));
+
+        // 원격과 같음.
+        let harness = harness_with(Some(summary(Some("origin/main"), 0, 0)));
+        harness.get_by_label(&t("git.branch.in_sync"));
+        harness.get_by_label(&hint("origin/main"));
+        assert!(harness.query_by_label(&ahead("0")).is_none());
+
+        // 업스트림 없음 — 셀 수 없는 이유를 보이고, 비어 있을 커밋 탭은 가리키지 않는다.
+        let harness = harness_with(Some(summary(None, 0, 0)));
+        harness.get_by_label(&t("git.upstream_none"));
+        harness.get_by_label(&t("git.branch.no_upstream_hint"));
+        assert!(harness.query_by_label_contains("Commits tab").is_none());
+
+        // 요약이 없으면(깨끗하지 않음·스냅샷 전) 예전 안내 한 줄.
+        let harness = harness_with(None);
+        harness.get_by_label(&t("git.diff.empty"));
+        assert!(harness.query_by_label(&t("diff.clean")).is_none());
+
+        // 파일을 고르면 요약 대신 그 diff다.
+        let mut viewer = DiffViewerUi::default();
+        viewer.set_clean_summary(Some(summary(Some("origin/main"), 3, 1)));
+        viewer.open("src/a.rs".to_owned(), DiffMode::Branch);
+        let mut harness = harness_for(viewer);
+        harness.run();
+        harness.get_by_label("a.rs");
+        assert!(harness.query_by_label(&t("diff.clean")).is_none());
     }
 }

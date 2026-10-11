@@ -835,6 +835,15 @@ pub struct GitPanelUi {
     /// 지금 보이는 목록 탭. 스냅샷을 새로 받아도 유지하고, `reset_git_surfaces`에서
     /// 패널과 함께 변경 탭으로 돌아간다.
     tab: GitPanelTab,
+    /// 「목록 / 폴더별」(2026-10-11 PR 3) — 변경·커밋 탭이 같은 보기를 쓴다.
+    layout: GitListLayout,
+    /// 폴더별에서 접은 폴더 — 탭마다 따로다(`*_show_all`과 같은 짝). 사용자가 누른 만큼만
+    /// 늘고 `reset_git_surfaces`에서 패널과 함께 비워진다.
+    changes_collapsed_dirs: std::collections::HashSet<String>,
+    committed_collapsed_dirs: std::collections::HashSet<String>,
+    /// 첫 파일 자동 선택 대기(2026-10-11 PR 3) — 스냅샷이 오면 켜지고 다음 렌더가 한 번
+    /// 소비한다. 고른 파일이 이미 있으면(사용자든 자동이든) 소비만 하고 고르지 않는다.
+    auto_select_pending: bool,
 }
 
 /// 목록 탭(2026-10-11 PR 2) — 예전 접는 섹션 세 개를 대신한다.
@@ -846,6 +855,25 @@ enum GitPanelTab {
     Worktrees,
 }
 
+/// 변경·커밋 탭 파일 행의 보기(2026-10-11 PR 3) — 폴더별은 폴더 머리 아래에 파일명만 둔다.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum GitListLayout {
+    #[default]
+    Flat,
+    Folders,
+}
+
+/// 작업 트리가 깨끗할 때 파일을 고르지 않은 diff 영역이 보일 브랜치 요약(2026-10-11 PR 3).
+/// `DiffViewerUi::render` 시그니처가 소스 고정이라 App이 [`GitPanelUi::clean_summary`]로
+/// 받아 `DiffViewerUi::set_clean_summary`로 넘긴다.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitCleanSummary {
+    /// None = 업스트림 없음(보낼/받을 커밋을 셀 수 없다).
+    pub upstream: Option<String>,
+    pub ahead: u32,
+    pub behind: u32,
+}
+
 impl GitPanelUi {
     pub fn set_loading(&mut self) {
         self.loading = true;
@@ -853,6 +881,8 @@ impl GitPanelUi {
 
     pub fn set_snapshot(&mut self, result: Result<GitPanelSnapshot, GitPanelErrorCode>) {
         self.loading = false;
+        // 고른 파일이 있는지는 render가 본다 — 선택을 지키는 새로고침은 켜져도 고르지 않는다.
+        self.auto_select_pending = result.is_ok();
         self.snapshot = Some(result);
     }
 
@@ -905,6 +935,16 @@ impl GitPanelUi {
             .map(|row| GitPathTarget::for_row(&snap.repo_root, row))
     }
 
+    /// 깨끗할 때 diff 영역 요약 — 스냅샷이 있고 작업 중 변경이 없을 때만 Some.
+    pub fn clean_summary(&self) -> Option<GitCleanSummary> {
+        let snap = self.snapshot.as_ref()?.as_ref().ok()?;
+        snap.changes.is_empty().then(|| GitCleanSummary {
+            upstream: snap.upstream.clone(),
+            ahead: snap.ahead,
+            behind: snap.behind,
+        })
+    }
+
     /// `filter`: 보조 검색 좌측 목록 필터(2026-08-18 스펙) — 빈 문자열이면 필터 없음.
     /// 변경·커밋 탭의 파일 행만 `rel_path` 기준으로 거르고, 커밋 목록과 워크트리 탭은
     /// 그대로 둔다(경로 목록이라 검색 대상이 아니고, 통째로 사라지면 혼란스럽다).
@@ -926,6 +966,10 @@ impl GitPanelUi {
             selected,
             commit_list,
             tab,
+            layout,
+            changes_collapsed_dirs,
+            committed_collapsed_dirs,
+            auto_select_pending,
         } = self;
         let snap = match snapshot.as_ref() {
             None => {
@@ -987,15 +1031,108 @@ impl GitPanelUi {
         // ── 합계 줄: 지금 탭의 파일 행(거른 뒤) ─────────────────────────
         match *tab {
             GitPanelTab::Changes => {
-                totals_line(ui, &filtered_changes, changes_show_all, tokens, catalog);
+                totals_line(
+                    ui,
+                    &filtered_changes,
+                    changes_show_all,
+                    layout,
+                    tokens,
+                    catalog,
+                );
             }
             GitPanelTab::Commits => {
-                totals_line(ui, &filtered_committed, committed_show_all, tokens, catalog);
+                totals_line(
+                    ui,
+                    &filtered_committed,
+                    committed_show_all,
+                    layout,
+                    tokens,
+                    catalog,
+                );
             }
             GitPanelTab::Worktrees => {}
         }
 
+        // ── 지금 탭의 목록 줄(폴더 머리 + 파일 행) — 그리기와 ↑↓ 이동이 같은 목록을 쓴다 ──
         let current = *tab;
+        let (items, tab_mode) = match current {
+            GitPanelTab::Changes => (
+                list_items(
+                    &filtered_changes,
+                    *layout,
+                    *changes_show_all,
+                    changes_collapsed_dirs,
+                ),
+                crate::ui::diff_viewer::DiffMode::Working,
+            ),
+            GitPanelTab::Commits => (
+                list_items(
+                    &filtered_committed,
+                    *layout,
+                    *committed_show_all,
+                    committed_collapsed_dirs,
+                ),
+                crate::ui::diff_viewer::DiffMode::Branch,
+            ),
+            GitPanelTab::Worktrees => (Vec::new(), crate::ui::diff_viewer::DiffMode::Working),
+        };
+
+        // ── 첫 파일 자동 선택(2026-10-11 PR 3): 스냅샷이 오고 고른 파일이 없으면 변경 탭의
+        // 보이는 첫 파일을 한 번 연다. 변경이 없거나 다른 탭이면 고르지 않는다(탭을 넘기지
+        // 않는다). 같은 프레임의 다른 의도(⟳ 등)가 먼저고, 그 새로고침의 스냅샷이 다시 켠다.
+        if std::mem::take(auto_select_pending)
+            && current == GitPanelTab::Changes
+            && selected.is_none()
+            && action.is_none()
+            && let Some(row) = items.iter().find_map(|item| match item {
+                ListItem::File(row) => Some(*row),
+                ListItem::Folder { .. } => None,
+            })
+        {
+            *selected = Some((row.rel_path.clone(), tab_mode));
+            action = Some(GitPanelAction::ShowFileDiff {
+                rel_path: row.rel_path.clone(),
+                mode: tab_mode,
+            });
+        }
+
+        // ── ↑↓: 지금 탭의 보이는 파일 행을 표시 순서로 옮겨 다니며 그 diff를 연다
+        // (2026-10-11 PR 3). 이동할 행이 없으면 키를 소비하지 않는다.
+        let mut reveal = false;
+        if let Some(step) = git_key_step(ui.ctx(), egui::Key::ArrowUp, egui::Key::ArrowDown) {
+            // 위 목록 줄의 파일 행(접은 폴더 제외), 커밋 탭이면 이어서 펼친 커밋의 파일 행.
+            let mut nav: Vec<(&str, crate::ui::diff_viewer::DiffMode)> = items
+                .iter()
+                .filter_map(|item| match item {
+                    ListItem::File(row) => Some((row.rel_path.as_str(), tab_mode)),
+                    ListItem::Folder { .. } => None,
+                })
+                .collect();
+            if current == GitPanelTab::Commits
+                && let Some((sha, rows)) = commit_list.expanded_files()
+                && snap.commits.iter().any(|commit| commit.sha == sha)
+            {
+                nav.extend(rows.iter().map(|row| {
+                    (
+                        row.rel_path.as_str(),
+                        crate::ui::diff_viewer::DiffMode::Commit(sha),
+                    )
+                }));
+            }
+            if !nav.is_empty() {
+                consume_git_keys(ui.ctx(), egui::Key::ArrowUp, egui::Key::ArrowDown);
+                if let Some(next) = step_selection(&nav, selected.as_ref(), step) {
+                    let (rel_path, mode) = nav[next];
+                    *selected = Some((rel_path.to_owned(), mode));
+                    action = Some(GitPanelAction::ShowFileDiff {
+                        rel_path: rel_path.to_owned(),
+                        mode,
+                    });
+                    reveal = true;
+                }
+            }
+        }
+
         egui::ScrollArea::vertical()
             .id_salt(("git-panel-tab-scroll", current))
             .auto_shrink([false, false])
@@ -1014,10 +1151,12 @@ impl GitPanelUi {
                         ui,
                         catalog,
                         &snap.repo_root,
-                        visible_rows(&filtered_changes, *changes_show_all),
+                        &items,
                         "changes",
-                        crate::ui::diff_viewer::DiffMode::Working,
+                        tab_mode,
+                        changes_collapsed_dirs,
                         selected,
+                        reveal,
                         &mut action,
                     );
                 }
@@ -1045,10 +1184,12 @@ impl GitPanelUi {
                             ui,
                             catalog,
                             &snap.repo_root,
-                            visible_rows(&filtered_committed, *committed_show_all),
+                            &items,
                             "committed",
-                            crate::ui::diff_viewer::DiffMode::Branch,
+                            tab_mode,
+                            committed_collapsed_dirs,
                             selected,
+                            reveal,
                             &mut action,
                         );
                     }
@@ -1060,6 +1201,7 @@ impl GitPanelUi {
                         snap,
                         commit_list,
                         selected,
+                        reveal,
                         &mut action,
                     );
                 }
@@ -1361,12 +1503,14 @@ fn tab_bar(
     });
 }
 
-/// 탭 아래 합계 줄 — 「N개 파일 · +a −d」(거른 뒤 행 기준). 행이 표시 상한을 넘으면
-/// 오른쪽에 「모두 보기」 토글(예전 섹션 머리에 있던 것). 행이 없으면 그리지 않는다.
+/// 탭 아래 합계 줄 — 「N개 파일 · +a −d」(거른 뒤 행 기준). 오른쪽 끝에 「목록 / 폴더별」
+/// (2026-10-11 PR 3), 행이 표시 상한을 넘으면 그 왼쪽에 「모두 보기」 토글(예전 섹션 머리에
+/// 있던 것). 행이 없으면 그리지 않는다.
 fn totals_line(
     ui: &mut egui::Ui,
     rows: &[&GitFileRow],
     show_all: &mut bool,
+    layout: &mut GitListLayout,
     tokens: crate::ui::designall::Tokens,
     catalog: &i18n::Catalog,
 ) {
@@ -1381,16 +1525,29 @@ fn totals_line(
         ui.weak("·");
         ui.colored_label(stat_color(tokens, true), format!("+{adds}"));
         ui.colored_label(stat_color(tokens, false), format!("−{dels}"));
-        if rows.len() > SECTION_COLLAPSED_ROWS {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // 오른쪽부터 그린다 — 「목록」「폴더별」 순으로 보인다.
+            for (value, key) in [
+                (GitListLayout::Folders, "git.layout.folders"),
+                (GitListLayout::Flat, "git.layout.flat"),
+            ] {
+                if ui
+                    .selectable_label(*layout == value, catalog.t(key, &[]))
+                    .clicked()
+                {
+                    *layout = value;
+                }
+            }
+            if rows.len() > SECTION_COLLAPSED_ROWS {
+                ui.add_space(6.0);
                 if ui
                     .selectable_label(*show_all, catalog.t("git.show_all", &[]))
                     .clicked()
                 {
                     *show_all = !*show_all;
                 }
-            });
-        }
+            }
+        });
     });
 }
 
@@ -1403,33 +1560,254 @@ fn visible_rows<'a, 'r>(rows: &'a [&'r GitFileRow], show_all: bool) -> &'a [&'r 
     }
 }
 
-/// 변경·커밋 탭의 파일 행. 호출부는 거르기 전 목록이 비어 있지 않을 때만 부른다 —
-/// 그래서 0행이면 필터가 다 걸러낸 것이고, 「왜 안 보이지」가 되지 않게 안내 한 줄을
-/// 둔다(2026-08-18 스펙 §좌측 목록 필터).
+/// 변경·커밋 탭 목록의 한 줄(2026-10-11 PR 3) — 폴더별 보기의 폴더 머리 또는 파일 행.
+/// 그리기와 ↑↓ 이동이 같은 목록을 써서 화면 순서와 이동 순서가 어긋나지 않는다.
+#[derive(Debug)]
+enum ListItem<'r> {
+    /// `dir`는 루트면 빈 문자열. `count`는 그 폴더의(거른 뒤) 전체 파일 수다 — 접었거나
+    /// 「모두 보기」 전이라 일부만 보여도 같다.
+    Folder {
+        dir: &'r str,
+        count: usize,
+        collapsed: bool,
+    },
+    File(&'r GitFileRow),
+}
+
+/// 파일 행을 폴더(디렉터리)별로 묶는다 — 폴더는 처음 나온 순서, 폴더 안 파일은 입력
+/// (porcelain·name-status) 순서 그대로. 루트의 파일은 빈 폴더("")에 묶인다.
+fn group_by_folder<'r>(rows: &[&'r GitFileRow]) -> Vec<(&'r str, Vec<&'r GitFileRow>)> {
+    let mut groups: Vec<(&'r str, Vec<&'r GitFileRow>)> = Vec::new();
+    let mut index: std::collections::HashMap<&'r str, usize> = std::collections::HashMap::new();
+    for &row in rows {
+        let (_, dir) = split_row_path(&row.rel_path);
+        let at = *index.entry(dir).or_insert_with(|| {
+            groups.push((dir, Vec::new()));
+            groups.len() - 1
+        });
+        groups[at].1.push(row);
+    }
+    groups
+}
+
+/// 지금 탭의 목록 줄. 「모두 보기」 전 상한(SECTION_COLLAPSED_ROWS)은 두 보기 모두 **파일
+/// 행만** 그 보기의 표시 순서로 센다 — 폴더 머리는 세지 않고, 접은 폴더의 파일도 자리를
+/// 차지한다. 그래서 「모두 보기」가 나타나는 조건(거른 뒤 파일 수 > 상한)이 두 보기에서
+/// 같고, 폴더를 접어도 상한 뒤의 파일이 앞으로 당겨지지 않는다. 상한 안에 파일이 하나도
+/// 들지 않는 폴더는 머리째 빠진다.
+fn list_items<'r>(
+    rows: &[&'r GitFileRow],
+    layout: GitListLayout,
+    show_all: bool,
+    collapsed: &std::collections::HashSet<String>,
+) -> Vec<ListItem<'r>> {
+    if layout == GitListLayout::Flat {
+        return visible_rows(rows, show_all)
+            .iter()
+            .copied()
+            .map(ListItem::File)
+            .collect();
+    }
+    let mut budget = if show_all {
+        usize::MAX
+    } else {
+        SECTION_COLLAPSED_ROWS
+    };
+    let mut items = Vec::new();
+    for (dir, files) in group_by_folder(rows) {
+        if budget == 0 {
+            break;
+        }
+        let is_collapsed = collapsed.contains(dir);
+        items.push(ListItem::Folder {
+            dir,
+            count: files.len(),
+            collapsed: is_collapsed,
+        });
+        let shown = files.len().min(budget);
+        budget -= shown;
+        if !is_collapsed {
+            items.extend(files[..shown].iter().copied().map(ListItem::File));
+        }
+    }
+    items
+}
+
+/// ↑↓ 한 번의 다음 선택 — `nav`(표시 순서의 보이는 파일 행) 안의 인덱스. 선택이 없거나
+/// `nav` 밖이면(접은 폴더·다른 탭) 방향과 상관없이 첫 행이고, 양 끝에서는 멈춘다. 옮길
+/// 곳이 없으면(같은 행) None — 같은 파일의 diff를 다시 열지 않는다.
+fn step_selection(
+    nav: &[(&str, crate::ui::diff_viewer::DiffMode)],
+    selected: Option<&(String, crate::ui::diff_viewer::DiffMode)>,
+    step: isize,
+) -> Option<usize> {
+    let last = nav.len().checked_sub(1)?;
+    if step == 0 {
+        return None;
+    }
+    let current = selected.and_then(|(path, mode)| {
+        nav.iter()
+            .position(|(row_path, row_mode)| row_path == path && row_mode == mode)
+    });
+    let next = match current {
+        None => 0,
+        Some(at) => at.saturating_add_signed(step).min(last),
+    };
+    (current != Some(next)).then_some(next)
+}
+
+/// Git 본문 키(↑↓·N/P)로 받을 눌림인가 — ⌘·Ctrl·Alt가 함께 눌렸으면 다른 단축키라
+/// 세지 않는다(Shift는 대문자 N처럼 같은 키로 본다). 길게 눌러 반복되는 눌림도 센다.
+fn is_plain_press(event: &egui::Event, key: egui::Key) -> bool {
+    matches!(
+        event,
+        egui::Event::Key { key: pressed, pressed: true, modifiers, .. }
+            if *pressed == key
+                && !(modifiers.alt || modifiers.ctrl || modifiers.command || modifiers.mac_cmd)
+    )
+}
+
+/// Git 보조 본문 키 한 쌍(↑/↓, P/N)의 이번 프레임 순이동 — `next` 눌림 +1, `prev` −1.
+/// 눌림이 없거나 받을 수 없는 프레임이면 None. 이 본문이 보이는 프레임에는 터미널이
+/// 입력 소유자가 아니므로(2026-08-15 스펙 §8-3) 남은 소유자는 텍스트 입력(보조 검색창
+/// 등)이다 — 그 포커스나 IME 조합 중이면 받지 않는다. 입력은 건드리지 않는다: 쓰기로
+/// 했으면 [`consume_git_keys`]로 지우고, 쓸 데가 없으면 다른 소비자에게 남긴다.
+pub(crate) fn git_key_step(ctx: &egui::Context, prev: egui::Key, next: egui::Key) -> Option<isize> {
+    if ctx.text_edit_focused() || terminal::renderer_egui::frame_has_active_preedit(ctx) {
+        return None;
+    }
+    let (back, forward) = ctx.input(|input| {
+        input.events.iter().fold((0, 0), |(back, forward), event| {
+            (
+                back + isize::from(is_plain_press(event, prev)),
+                forward + isize::from(is_plain_press(event, next)),
+            )
+        })
+    });
+    (back + forward > 0).then_some(forward - back)
+}
+
+/// [`git_key_step`]이 센 눌림을 이번 프레임 입력에서 지운다.
+pub(crate) fn consume_git_keys(ctx: &egui::Context, prev: egui::Key, next: egui::Key) {
+    ctx.input_mut(|input| {
+        input
+            .events
+            .retain(|event| !is_plain_press(event, prev) && !is_plain_press(event, next));
+    });
+}
+
+/// 변경·커밋 탭의 목록 줄(폴더 머리 + 파일 행). 호출부는 거르기 전 목록이 비어 있지 않을
+/// 때만 부른다 — 그래서 0줄이면 필터가 다 걸러낸 것이고, 「왜 안 보이지」가 되지 않게
+/// 안내 한 줄을 둔다(2026-08-18 스펙 §좌측 목록 필터). 폴더 머리를 누르면 그 탭의
+/// `collapsed_dirs`에서 접힘을 뒤집고, 묶음 안의 파일 행은 들여 쓰고 폴더를 숨긴다.
 #[allow(clippy::too_many_arguments)]
 fn render_file_rows(
     ui: &mut egui::Ui,
     catalog: &i18n::Catalog,
     repo_root: &Path,
-    rows: &[&GitFileRow],
+    items: &[ListItem<'_>],
     salt: &str,
     mode: crate::ui::diff_viewer::DiffMode,
+    collapsed_dirs: &mut std::collections::HashSet<String>,
     selected: &mut Option<(String, crate::ui::diff_viewer::DiffMode)>,
+    reveal: bool,
     action: &mut Option<GitPanelAction>,
 ) {
-    if rows.is_empty() {
+    if items.is_empty() {
         ui.weak(catalog.t("search.no_match", &[]));
         return;
     }
     let tokens = crate::ui::designall::tokens(ui.visuals());
-    for row in rows {
+    // 폴더별 보기는 언제나 폴더 머리로 시작한다.
+    let grouped = matches!(items.first(), Some(ListItem::Folder { .. }));
+    let options = FileRowOptions {
+        hide_dir: grouped,
+        reveal_selected: reveal,
+    };
+    for item in items {
+        let row = match item {
+            ListItem::Folder {
+                dir,
+                count,
+                collapsed,
+            } => {
+                // 누르면 접힘을 뒤집는다 — 접혀 있었으면 지워서 펴고, 아니면 넣어서 접는다.
+                if folder_header(
+                    ui,
+                    ("git-panel-folder", salt, *dir),
+                    dir,
+                    *count,
+                    *collapsed,
+                ) && !collapsed_dirs.remove(*dir)
+                {
+                    collapsed_dirs.insert((*dir).to_owned());
+                }
+                continue;
+            }
+            ListItem::File(row) => row,
+        };
         let id_salt = ("git-panel-row", salt, row.rel_path.as_str());
-        if let Some(clicked) =
-            file_row(ui, id_salt, repo_root, row, mode, selected, tokens, catalog)
-        {
+        let clicked = if grouped {
+            ui.indent(
+                ("git-panel-folder-row", salt, row.rel_path.as_str()),
+                |ui| {
+                    file_row(
+                        ui, id_salt, repo_root, row, mode, selected, options, tokens, catalog,
+                    )
+                },
+            )
+            .inner
+        } else {
+            file_row(
+                ui, id_salt, repo_root, row, mode, selected, options, tokens, catalog,
+            )
+        };
+        if let Some(clicked) = clicked {
             *action = Some(clicked);
         }
     }
+}
+
+/// 폴더별 묶음의 머리 행 — 접기 표시(∨/›, 커밋 행과 같은 글자) · 폴더 경로(넘치면 말줄임,
+/// 루트는 「.」) · 파일 수. 누른 프레임에 true. 파일 행과 같은 scope 패턴이고 접근성
+/// 이름은 탭 버튼처럼 「폴더 개수」다.
+fn folder_header(
+    ui: &mut egui::Ui,
+    id_salt: impl egui::AsIdSalt,
+    dir: &str,
+    count: usize,
+    collapsed: bool,
+) -> bool {
+    let label = if dir.is_empty() { "." } else { dir };
+    let scope = ui.scope_builder(
+        egui::UiBuilder::new()
+            .id_salt(id_salt)
+            .sense(egui::Sense::click()),
+        |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.weak(if collapsed { "›" } else { "∨" });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.weak(count.to_string());
+                    // 개수를 뺀 남은 폭에 왼쪽부터 그리고, 넘치면 말줄임한다.
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add(egui::Label::new(egui::RichText::new(label).weak()).truncate());
+                    });
+                });
+            });
+        },
+    );
+    let response = scope
+        .response
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            format!("{label} {count}"),
+        )
+    });
+    response.clicked()
 }
 
 /// 작업 트리가 깨끗할 때의 카드 — 보낼 커밋이 있으면 커밋 탭으로 가는 링크를 둔다.
@@ -1482,6 +1860,15 @@ fn truncation_banner(
     ui.add_space(4.0);
 }
 
+/// 파일 행 표시 옵션(2026-10-11 PR 3).
+#[derive(Clone, Copy)]
+struct FileRowOptions {
+    /// 폴더별 묶음 안 — 머리가 폴더를 보이므로 행에서는 폴더를 숨긴다.
+    hide_dir: bool,
+    /// ↑↓로 선택을 옮긴 프레임 — 선택 행이 스크롤 밖이면 보이게 끌어온다.
+    reveal_selected: bool,
+}
+
 /// 파일 행 하나 — 상태 배지·파일명·줄인 폴더·증감, 선택이면 면과 2pt accent 레일.
 /// 변경/브랜치 커밋 섹션과 커밋별 파일 목록이 같이 쓴다. 클릭하면 선택으로 기록하고
 /// 그 모드의 `ShowFileDiff`를, 우클릭 메뉴에서 고르면 그 경로 동작을 돌려준다.
@@ -1493,6 +1880,7 @@ fn file_row(
     row: &GitFileRow,
     mode: crate::ui::diff_viewer::DiffMode,
     selected: &mut Option<(String, crate::ui::diff_viewer::DiffMode)>,
+    options: FileRowOptions,
     tokens: crate::ui::designall::Tokens,
     catalog: &i18n::Catalog,
 ) -> Option<GitPanelAction> {
@@ -1521,7 +1909,7 @@ fn file_row(
             ui.horizontal(|ui| {
                 status_badge(ui, row.status, tokens, catalog);
                 ui.label(name);
-                if !dir.is_empty() {
+                if !dir.is_empty() && !options.hide_dir {
                     ui.weak(short_dir(dir));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1551,6 +1939,9 @@ fn file_row(
             egui::pos2(rect.left() + 2.0, rect.bottom()),
         );
         ui.painter().rect_filled(rail, 0.0, tokens.accent);
+        if options.reveal_selected {
+            response.scroll_to_me(None);
+        }
     }
     // 접근성 이름을 rel_path로 명시한다 — kittest가 Role::Button + 이
     // 라벨로 행 전체(자식 Label이 아니라)를 정확히 겨냥할 수 있다.
@@ -1608,12 +1999,26 @@ impl CommitListState {
         self.loaded = Some((sha, CommitFilesState::Loading));
         Some(GitPanelAction::LoadCommitFiles { sha })
     }
+
+    /// 펼쳤고 파일 목록까지 받은 커밋과 그 파일 — 커밋 탭 ↑↓가 브랜치 파일 다음에 이어
+    /// 간다(2026-10-11 PR 3). 불러오는 중·실패면 파일 행이 없으니 None.
+    fn expanded_files(&self) -> Option<(CommitSha, &[GitFileRow])> {
+        let sha = self.expanded?;
+        match &self.loaded {
+            Some((loaded, CommitFilesState::Ready(files))) if *loaded == sha => {
+                Some((sha, files.rows.as_slice()))
+            }
+            _ => None,
+        }
+    }
 }
 
 /// 커밋 탭의 브랜치 커밋 파일 행 아래 커밋 목록 — 행: ›/∨ · sha(모노, accent) ·
 /// 제목(말줄임, 전체는 hover) · 상대 시각. 커밋 행 클릭은 펼침을 토글하고, 펼친 커밋의
 /// 파일 행 클릭은 그 커밋 기준 diff를 연다. 좌측 목록 필터는 걸지 않는다(파일 경로
-/// 필터라 커밋은 대상이 아니다 — 워크트리 탭과 같은 규칙).
+/// 필터라 커밋은 대상이 아니다 — 워크트리 탭과 같은 규칙). `reveal`: ↑↓로 선택을 옮긴
+/// 프레임(펼친 커밋의 파일 행도 ↑↓ 대상이다, 2026-10-11 PR 3).
+#[allow(clippy::too_many_arguments)]
 fn render_commit_list(
     ui: &mut egui::Ui,
     catalog: &i18n::Catalog,
@@ -1621,6 +2026,7 @@ fn render_commit_list(
     snap: &GitPanelSnapshot,
     state: &mut CommitListState,
     selected: &mut Option<(String, crate::ui::diff_viewer::DiffMode)>,
+    reveal: bool,
     action: &mut Option<GitPanelAction>,
 ) {
     if snap.commits.is_empty() {
@@ -1691,6 +2097,7 @@ fn render_commit_list(
                     commit.sha,
                     state,
                     selected,
+                    reveal,
                     action,
                 );
             });
@@ -1714,6 +2121,7 @@ fn render_commit_files(
     sha: CommitSha,
     state: &CommitListState,
     selected: &mut Option<(String, crate::ui::diff_viewer::DiffMode)>,
+    reveal: bool,
     action: &mut Option<GitPanelAction>,
 ) {
     let files = match &state.loaded {
@@ -1731,12 +2139,16 @@ fn render_commit_files(
         ui.weak(catalog.t("git.commit.files_empty", &[]));
     }
     let mode = crate::ui::diff_viewer::DiffMode::Commit(sha);
+    let options = FileRowOptions {
+        hide_dir: false,
+        reveal_selected: reveal,
+    };
     for row in &files.rows {
         // 변경/브랜치 커밋 섹션과 같은 행(배지·줄인 폴더·선택 강조).
         let id_salt = ("git-panel-commit-file", sha.as_str(), row.rel_path.as_str());
-        if let Some(clicked) =
-            file_row(ui, id_salt, repo_root, row, mode, selected, tokens, catalog)
-        {
+        if let Some(clicked) = file_row(
+            ui, id_salt, repo_root, row, mode, selected, options, tokens, catalog,
+        ) {
             *action = Some(clicked);
         }
     }
@@ -3053,7 +3465,7 @@ mod tests {
             changes: rows,
             ..Default::default()
         }));
-        egui_kittest::Harness::new_ui_state(
+        let mut harness = egui_kittest::Harness::new_ui_state(
             |ui, state: &mut PathMenuState| {
                 let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
                 if let Some(action) = state.panel.render(ui, &catalog, "") {
@@ -3073,7 +3485,10 @@ mod tests {
                 actions: Vec::new(),
                 copied: Vec::new(),
             },
-        )
+        );
+        // 생성 프레임의 첫 파일 자동 선택(2026-10-11 PR 3)은 메뉴 동작과 무관하다.
+        harness.state_mut().actions.clear();
+        harness
     }
 
     fn open_row_menu(harness: &mut egui_kittest::Harness<'static, PathMenuState>, rel_path: &str) {
@@ -3676,5 +4091,652 @@ mod tests {
         harness.get_by_label(&catalog.t("git.files.total", &[("count", "2")]));
         harness.get_by_label("+7");
         harness.get_by_label("−3");
+    }
+
+    // ── PR 3: 탐색 효율(2026-10-11 계획 §3) ─────────────────────────────────
+
+    /// 목록 줄을 읽기 쉬운 글자로 — 폴더 머리는 `[폴더 개수]`(접힘이면 ` 접힘`), 파일은 경로.
+    fn describe(items: &[ListItem<'_>]) -> Vec<String> {
+        items
+            .iter()
+            .map(|item| match item {
+                ListItem::Folder {
+                    dir,
+                    count,
+                    collapsed,
+                } => format!("[{dir} {count}{}]", if *collapsed { " 접힘" } else { "" }),
+                ListItem::File(row) => row.rel_path.clone(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn 폴더별_묶기는_처음_나온_폴더_순서와_폴더_안_파일_순서를_지킨다() {
+        let rows = [
+            file_row("src/ui/a.rs", 'M', 1, 0),
+            file_row("README.md", 'M', 1, 0),
+            file_row("src/b.rs", 'M', 1, 0),
+            file_row("src/ui/c.rs", 'M', 1, 0),
+        ];
+        let refs: Vec<&GitFileRow> = rows.iter().collect();
+        let groups = group_by_folder(&refs);
+        let groups: Vec<(&str, Vec<&str>)> = groups
+            .iter()
+            .map(|(dir, files)| {
+                (
+                    *dir,
+                    files.iter().map(|row| row.rel_path.as_str()).collect(),
+                )
+            })
+            .collect();
+        // 루트 파일은 빈 폴더("")에 묶인다.
+        assert_eq!(
+            groups,
+            vec![
+                ("src/ui", vec!["src/ui/a.rs", "src/ui/c.rs"]),
+                ("", vec!["README.md"]),
+                ("src", vec!["src/b.rs"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn 폴더별_목록은_접은_폴더의_파일을_숨기고_표시_상한은_파일_행만_센다() {
+        // a 폴더 6개 + b 폴더 6개 = 12개. 상한(10)은 파일 행만 센다 — 머리 행은 세지 않는다.
+        let rows: Vec<GitFileRow> = (0..6)
+            .map(|i| file_row(&format!("a/{i}.rs"), 'M', 1, 0))
+            .chain((0..6).map(|i| file_row(&format!("b/{i}.rs"), 'M', 1, 0)))
+            .collect();
+        let refs: Vec<&GitFileRow> = rows.iter().collect();
+        let files = |dir: &str, range: std::ops::Range<usize>| -> Vec<String> {
+            range.map(|i| format!("{dir}/{i}.rs")).collect()
+        };
+        let expected = |parts: Vec<Vec<String>>| -> Vec<String> { parts.concat() };
+        let none = std::collections::HashSet::new();
+
+        // 목록 보기 — 예전과 같이 앞 10개, 머리 행 없음.
+        assert_eq!(
+            describe(&list_items(&refs, GitListLayout::Flat, false, &none)),
+            expected(vec![files("a", 0..6), files("b", 0..4)])
+        );
+        // 폴더별 — 같은 10개 파일(a 6 + b 4)이 머리 아래에 묶인다. 머리의 개수는 그
+        // 폴더의(거른 뒤) 전체 파일 수다.
+        assert_eq!(
+            describe(&list_items(&refs, GitListLayout::Folders, false, &none)),
+            expected(vec![
+                vec!["[a 6]".into()],
+                files("a", 0..6),
+                vec!["[b 6]".into()],
+                files("b", 0..4),
+            ])
+        );
+        // a를 접으면 a의 파일 행만 사라진다. 접은 파일도 상한 자리를 차지한다 — 접는다고
+        // 「모두 보기」 뒤의 파일이 앞으로 당겨지지 않는다(목록 보기와 같은 10개 기준).
+        let collapsed: std::collections::HashSet<String> = ["a".to_owned()].into();
+        assert_eq!(
+            describe(&list_items(
+                &refs,
+                GitListLayout::Folders,
+                false,
+                &collapsed
+            )),
+            expected(vec![
+                vec!["[a 6 접힘]".into(), "[b 6]".into()],
+                files("b", 0..4),
+            ])
+        );
+        // 「모두 보기」면 전부. 접힘은 그대로.
+        assert_eq!(
+            describe(&list_items(&refs, GitListLayout::Folders, true, &collapsed)),
+            expected(vec![
+                vec!["[a 6 접힘]".into(), "[b 6]".into()],
+                files("b", 0..6),
+            ])
+        );
+        // 목록 보기는 접힘을 모른다.
+        assert_eq!(
+            list_items(&refs, GitListLayout::Flat, false, &collapsed).len(),
+            SECTION_COLLAPSED_ROWS
+        );
+        // 상한 안에 파일이 하나도 들지 않는 폴더는 머리째 빠진다 — a 6 + b 4가 정확히 10이면
+        // 그 뒤 c는 머리도 없다.
+        let c = file_row("c/0.rs", 'M', 1, 0);
+        let mut exact: Vec<&GitFileRow> = refs[..10].to_vec();
+        exact.push(&c);
+        assert_eq!(
+            describe(&list_items(&exact, GitListLayout::Folders, false, &none)),
+            expected(vec![
+                vec!["[a 6]".into()],
+                files("a", 0..6),
+                vec!["[b 4]".into()],
+                files("b", 0..4),
+            ])
+        );
+    }
+
+    #[test]
+    fn 선택_이동은_표시_순서를_따르고_양_끝에서_멈춘다() {
+        use crate::ui::diff_viewer::DiffMode::{Branch, Working};
+
+        let nav = [("a.rs", Branch), ("b.rs", Branch), ("a.rs", Working)];
+        let sel = |path: &str, mode| Some((path.to_owned(), mode));
+        // 선택이 없거나 이 목록 밖이면(접은 폴더·다른 탭) 방향과 상관없이 첫 행.
+        assert_eq!(step_selection(&nav, None, 1), Some(0));
+        assert_eq!(step_selection(&nav, None, -1), Some(0));
+        assert_eq!(
+            step_selection(&nav, sel("zzz.rs", Working).as_ref(), 1),
+            Some(0)
+        );
+        // 같은 경로라도 모드가 다르면 다른 행이다.
+        assert_eq!(
+            step_selection(&nav, sel("a.rs", Branch).as_ref(), 1),
+            Some(1)
+        );
+        assert_eq!(
+            step_selection(&nav, sel("b.rs", Branch).as_ref(), 1),
+            Some(2)
+        );
+        assert_eq!(
+            step_selection(&nav, sel("a.rs", Working).as_ref(), -5),
+            Some(0)
+        );
+        // 끝에서는 멈춘다 — 같은 파일을 다시 열지 않는다(None).
+        assert_eq!(step_selection(&nav, sel("a.rs", Working).as_ref(), 1), None);
+        assert_eq!(step_selection(&nav, sel("a.rs", Branch).as_ref(), -1), None);
+        assert_eq!(step_selection(&nav, None, 0), None);
+        assert_eq!(step_selection(&[], None, 1), None);
+    }
+
+    #[test]
+    fn git_본문_키는_보조키나_ime_조합이_있으면_받지_않는다() {
+        use egui::Key::{ArrowDown, ArrowUp, N};
+
+        let ctx = egui::Context::default();
+        let key = |key, modifiers| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        };
+        let step = |events: Vec<egui::Event>| {
+            let mut out = None;
+            ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| out = git_key_step(ui.ctx(), ArrowUp, ArrowDown),
+            )
+            .drop_without_applying_deltas();
+            out
+        };
+        let none = egui::Modifiers::NONE;
+        assert_eq!(step(vec![]), None);
+        assert_eq!(step(vec![key(ArrowDown, none)]), Some(1));
+        assert_eq!(step(vec![key(ArrowUp, none)]), Some(-1));
+        // 한 프레임에 여러 번 눌렸으면 모두 센다.
+        assert_eq!(
+            step(vec![key(ArrowDown, none), key(ArrowDown, none)]),
+            Some(2)
+        );
+        // 다른 키는 세지 않는다.
+        assert_eq!(step(vec![key(N, none)]), None);
+        // ⌘·Ctrl·Alt와 함께 누른 것은 다른 단축키다.
+        for modifiers in [
+            egui::Modifiers::COMMAND,
+            egui::Modifiers::CTRL,
+            egui::Modifiers::ALT,
+        ] {
+            assert_eq!(step(vec![key(ArrowDown, modifiers)]), None);
+        }
+        // IME 조합 중이면 같은 프레임의 키는 조합 입력이다.
+        let preedit = egui::Event::Ime(egui::ImeEvent::Preedit {
+            text: "ㅜ".to_owned(),
+            active_range_chars: None,
+        });
+        assert_eq!(step(vec![preedit, key(ArrowDown, none)]), None);
+    }
+
+    /// PR 3 키·자동 선택 kittest 공용 상태 — 낸 액션을 모두 모으고, 패널을 그린 뒤 ↓
+    /// 눌림이 입력에 남았는지(= 패널이 소비하지 않았는지)를 누적한다. `search_focused`면
+    /// 패널 앞에 보조 검색창 같은 TextEdit을 그리고 포커스를 준다.
+    struct NavState {
+        panel: GitPanelUi,
+        filter: &'static str,
+        search: String,
+        search_focused: bool,
+        actions: Vec<GitPanelAction>,
+        down_left: bool,
+    }
+
+    fn nav_harness(snapshot: GitPanelSnapshot) -> egui_kittest::Harness<'static, NavState> {
+        let mut panel = GitPanelUi::default();
+        panel.set_snapshot(Ok(snapshot));
+        egui_kittest::Harness::new_ui_state(
+            |ui, state: &mut NavState| {
+                let catalog = en();
+                if state.search_focused {
+                    ui.text_edit_singleline(&mut state.search).request_focus();
+                }
+                if let Some(action) = state.panel.render(ui, &catalog, state.filter) {
+                    state.actions.push(action);
+                }
+                state.down_left |= ui.input(|input| input.key_pressed(egui::Key::ArrowDown));
+            },
+            NavState {
+                panel,
+                filter: "",
+                search: String::new(),
+                search_focused: false,
+                actions: Vec::new(),
+                down_left: false,
+            },
+        )
+    }
+
+    fn show(path: &str, mode: crate::ui::diff_viewer::DiffMode) -> GitPanelAction {
+        GitPanelAction::ShowFileDiff {
+            rel_path: path.to_owned(),
+            mode,
+        }
+    }
+
+    fn press(harness: &mut egui_kittest::Harness<'static, NavState>, key: egui::Key) {
+        harness.key_press(key);
+        harness.run();
+    }
+
+    #[test]
+    fn kittest_폴더별은_폴더_머리_아래_파일명만_보이고_탭마다_따로_접힌다() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = en();
+        let mut harness = panel_harness(
+            GitPanelSnapshot {
+                branch: "feat".into(),
+                upstream: Some("origin/main".into()),
+                changes: vec![
+                    file_row("crates/app/src/ui/a.rs", 'M', 1, 0),
+                    file_row("README.md", 'M', 1, 0),
+                    file_row("crates/app/src/ui/b.rs", 'M', 1, 0),
+                ],
+                committed: vec![file_row("crates/app/src/ui/a.rs", 'M', 1, 0)],
+                ..Default::default()
+            },
+            "",
+        );
+        harness.run();
+
+        // 목록(기본) — 행마다 줄인 폴더가 붙고 폴더 머리는 없다.
+        assert_eq!(harness.query_all_by_label("…/src/ui").count(), 2);
+        assert!(
+            harness
+                .query_by_role_and_label(Role::Button, "crates/app/src/ui 2")
+                .is_none()
+        );
+
+        // 폴더별 — 처음 나온 폴더 순서로 머리(폴더 경로 · 개수) 아래에 파일명만.
+        harness
+            .get_by_label(&catalog.t("git.layout.folders", &[]))
+            .click();
+        harness.run();
+        harness.get_by_role_and_label(Role::Button, "crates/app/src/ui 2");
+        harness.get_by_role_and_label(Role::Button, ". 1");
+        assert!(
+            harness.query_by_label("…/src/ui").is_none(),
+            "묶음 안의 파일 행은 폴더를 다시 보이지 않는다"
+        );
+        // 파일 행은 같은 file_row라 접근성 이름(rel_path)·파일명이 그대로다.
+        harness.get_by_role_and_label(Role::Button, "crates/app/src/ui/a.rs");
+        harness.get_by_label("a.rs");
+
+        // 머리를 누르면 그 폴더의 파일 행만 접힌다.
+        harness
+            .get_by_role_and_label(Role::Button, "crates/app/src/ui 2")
+            .click();
+        harness.run();
+        assert!(
+            harness
+                .query_by_role_and_label(Role::Button, "crates/app/src/ui/a.rs")
+                .is_none()
+        );
+        harness.get_by_role_and_label(Role::Button, "README.md");
+        harness.get_by_role_and_label(Role::Button, "crates/app/src/ui 2");
+
+        // 묶기 보기는 두 탭이 같이 쓰고, 접힘은 탭마다 따로다.
+        harness.state_mut().panel.tab = GitPanelTab::Commits;
+        harness.run();
+        harness.get_by_role_and_label(Role::Button, "crates/app/src/ui 1");
+        harness.get_by_role_and_label(Role::Button, "crates/app/src/ui/a.rs");
+
+        // 변경 탭으로 돌아와 다시 펴면 파일 행이 돌아온다.
+        harness.state_mut().panel.tab = GitPanelTab::Changes;
+        harness.run();
+        harness
+            .get_by_role_and_label(Role::Button, "crates/app/src/ui 2")
+            .click();
+        harness.run();
+        harness.get_by_role_and_label(Role::Button, "crates/app/src/ui/b.rs");
+
+        // 목록으로 돌아가면 폴더가 다시 행에 붙는다.
+        harness
+            .get_by_label(&catalog.t("git.layout.flat", &[]))
+            .click();
+        harness.run();
+        assert_eq!(harness.query_all_by_label("…/src/ui").count(), 2);
+    }
+
+    #[test]
+    fn kittest_화살표는_보이는_파일을_표시_순서로_옮기고_접은_폴더는_건너뛴다() {
+        use crate::ui::diff_viewer::DiffMode::Working;
+        use egui::Key::{ArrowDown, ArrowUp};
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = en();
+        let mut harness = nav_harness(GitPanelSnapshot {
+            branch: "main".into(),
+            changes: vec![
+                file_row("src/a.rs", 'M', 1, 0),
+                file_row("docs/c.md", 'M', 1, 0),
+                file_row("src/b.rs", 'M', 1, 0),
+            ],
+            ..Default::default()
+        });
+        harness.run();
+        // 첫 파일은 자동 선택된다 — 거기서 출발한다.
+        assert_eq!(harness.state().actions, vec![show("src/a.rs", Working)]);
+
+        // 목록: 입력 순서(a → c → b)로 내려가고 끝에서 멈춘다. 쓴 키는 소비한다.
+        press(&mut harness, ArrowDown);
+        assert!(
+            !harness.state().down_left,
+            "쓴 ↓는 다른 소비자에게 새지 않는다"
+        );
+        press(&mut harness, ArrowDown);
+        press(&mut harness, ArrowDown);
+        assert_eq!(
+            harness.state().actions,
+            vec![
+                show("src/a.rs", Working),
+                show("docs/c.md", Working),
+                show("src/b.rs", Working),
+            ]
+        );
+        assert_eq!(
+            harness.state().panel.selected,
+            Some(("src/b.rs".to_owned(), Working))
+        );
+
+        // ⌘↓ 같은 단축키는 건드리지 않는다.
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, ArrowDown);
+        harness.run();
+        assert_eq!(harness.state().actions.len(), 3);
+        assert!(
+            harness.state().down_left,
+            "보조키가 있는 ↓는 소비하지 않는다"
+        );
+
+        // 폴더별: src(a, b) → docs(c) 순서로 묶인다 — 이동도 그 순서를 따른다.
+        harness
+            .get_by_label(&catalog.t("git.layout.folders", &[]))
+            .click();
+        harness.run();
+        harness.state_mut().actions.clear();
+        press(&mut harness, ArrowUp);
+        press(&mut harness, ArrowDown);
+        press(&mut harness, ArrowDown);
+        assert_eq!(
+            harness.state().actions,
+            vec![
+                show("src/a.rs", Working),
+                show("src/b.rs", Working),
+                show("docs/c.md", Working),
+            ]
+        );
+
+        // src를 접으면 그 파일은 이동 대상이 아니다 — c에서 ↑는 갈 곳이 없다.
+        harness.get_by_role_and_label(Role::Button, "src 2").click();
+        harness.run();
+        press(&mut harness, ArrowUp);
+        assert_eq!(harness.state().actions.len(), 3);
+        // 선택이 접힌 폴더 안이면 ↓는 보이는 첫 행으로 간다.
+        harness.state_mut().panel.selected = Some(("src/a.rs".to_owned(), Working));
+        press(&mut harness, ArrowDown);
+        assert_eq!(
+            harness.state().actions.last(),
+            Some(&show("docs/c.md", Working))
+        );
+    }
+
+    #[test]
+    fn kittest_커밋_탭의_화살표는_브랜치_파일_다음에_펼친_커밋_파일로_간다() {
+        use crate::ui::diff_viewer::DiffMode::{Branch, Commit};
+        use egui::Key::ArrowDown;
+
+        let sha = CommitSha::parse("a1b2c3d").unwrap();
+        let mut harness = nav_harness(GitPanelSnapshot {
+            branch: "feat".into(),
+            upstream: Some("origin/main".into()),
+            committed: vec![file_row("src/branch.rs", 'M', 1, 0)],
+            commits: vec![GitCommitRow {
+                sha,
+                subject: "첫 커밋".into(),
+                time: 0,
+            }],
+            worktrees: vec![worktree("/repo", true), worktree("/repo/wt", false)],
+            ..Default::default()
+        });
+        {
+            let panel = &mut harness.state_mut().panel;
+            panel.tab = GitPanelTab::Commits;
+            panel.commit_list.toggle(sha);
+            panel.set_commit_files(
+                sha,
+                Ok(GitCommitFiles {
+                    rows: vec![file_row("src/commit_only.rs", 'A', 3, 0)],
+                    truncated: false,
+                }),
+            );
+        }
+        harness.run();
+        assert!(
+            harness.state().actions.is_empty(),
+            "변경이 없으면 자동 선택도 없다"
+        );
+
+        press(&mut harness, ArrowDown);
+        press(&mut harness, ArrowDown);
+        press(&mut harness, ArrowDown);
+        assert_eq!(
+            harness.state().actions,
+            vec![
+                show("src/branch.rs", Branch),
+                show("src/commit_only.rs", Commit(sha)),
+            ]
+        );
+
+        // 워크트리 탭에는 파일 행이 없다 — ↓를 소비하지 않는다.
+        harness.state_mut().panel.tab = GitPanelTab::Worktrees;
+        harness.run();
+        harness.state_mut().down_left = false;
+        press(&mut harness, ArrowDown);
+        assert!(harness.state().down_left);
+        assert_eq!(harness.state().actions.len(), 2);
+    }
+
+    #[test]
+    fn kittest_텍스트_입력에_포커스가_있으면_화살표를_가로채지_않는다() {
+        use crate::ui::diff_viewer::DiffMode::Working;
+        use egui::Key::ArrowDown;
+
+        let mut harness = nav_harness(GitPanelSnapshot {
+            branch: "main".into(),
+            changes: vec![
+                file_row("src/a.rs", 'M', 1, 0),
+                file_row("src/b.rs", 'M', 1, 0),
+            ],
+            ..Default::default()
+        });
+        harness.run();
+        assert_eq!(harness.state().actions, vec![show("src/a.rs", Working)]);
+
+        // 보조 검색창에 포커스 — ↓는 그 입력의 키다.
+        harness.state_mut().search_focused = true;
+        harness.run();
+        assert!(harness.ctx.text_edit_focused());
+        press(&mut harness, ArrowDown);
+        assert_eq!(harness.state().actions.len(), 1);
+        assert_eq!(
+            harness.state().panel.selected,
+            Some(("src/a.rs".to_owned(), Working))
+        );
+
+        // 포커스가 빠지면 다시 목록이 받는다.
+        harness.state_mut().search_focused = false;
+        harness.run();
+        assert!(!harness.ctx.text_edit_focused());
+        press(&mut harness, ArrowDown);
+        assert_eq!(
+            harness.state().actions,
+            vec![show("src/a.rs", Working), show("src/b.rs", Working)]
+        );
+    }
+
+    #[test]
+    fn kittest_스냅샷이_오면_변경_탭의_첫_파일을_한_번만_자동_선택한다() {
+        use crate::ui::diff_viewer::DiffMode::Working;
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+
+        let snapshot = || GitPanelSnapshot {
+            branch: "feat".into(),
+            upstream: Some("origin/main".into()),
+            changes: vec![
+                file_row("src/a.rs", 'M', 1, 0),
+                file_row("src/b.rs", 'M', 1, 0),
+            ],
+            committed: vec![file_row("src/c.rs", 'M', 1, 0)],
+            ..Default::default()
+        };
+        let mut harness = nav_harness(snapshot());
+        harness.run();
+        assert_eq!(harness.state().actions, vec![show("src/a.rs", Working)]);
+        assert_eq!(
+            harness.state().panel.selected,
+            Some(("src/a.rs".to_owned(), Working))
+        );
+
+        // 프레임이 더 돌아도, 선택을 지키는 새로고침이 와도 다시 내지 않는다.
+        harness.run();
+        harness.state_mut().panel.set_snapshot(Ok(snapshot()));
+        harness.run();
+        assert_eq!(harness.state().actions.len(), 1);
+
+        // 사용자가 고른 파일은 새로고침이 덮지 않는다.
+        harness
+            .get_by_role_and_label(Role::Button, "src/b.rs")
+            .click();
+        harness.run();
+        harness.state_mut().panel.set_snapshot(Ok(snapshot()));
+        harness.run();
+        assert_eq!(
+            harness.state().actions,
+            vec![show("src/a.rs", Working), show("src/b.rs", Working)]
+        );
+
+        // reset_git_surfaces처럼 패널을 새로 만들면 다음 스냅샷에서 다시 한 번 고른다.
+        harness.state_mut().panel = GitPanelUi::default();
+        harness.state_mut().panel.set_snapshot(Ok(snapshot()));
+        harness.run();
+        harness.run();
+        assert_eq!(
+            harness.state().actions,
+            vec![
+                show("src/a.rs", Working),
+                show("src/b.rs", Working),
+                show("src/a.rs", Working),
+            ]
+        );
+    }
+
+    #[test]
+    fn kittest_자동_선택은_필터를_거쳐_보이는_첫_파일을_고른다() {
+        use crate::ui::diff_viewer::DiffMode::Working;
+
+        // 필터가 걸린 채 스냅샷이 온다(하네스는 만들 때 한 프레임을 그린다).
+        let mut harness = nav_harness(GitPanelSnapshot {
+            branch: "main".into(),
+            ..Default::default()
+        });
+        harness.state_mut().filter = "docs";
+        harness.state_mut().panel.set_snapshot(Ok(GitPanelSnapshot {
+            branch: "main".into(),
+            changes: vec![
+                file_row("src/a.rs", 'M', 1, 0),
+                file_row("docs/b.md", 'M', 1, 0),
+            ],
+            ..Default::default()
+        }));
+        harness.run();
+        assert_eq!(harness.state().actions, vec![show("docs/b.md", Working)]);
+    }
+
+    #[test]
+    fn kittest_변경이_없으면_자동_선택하지_않고_커밋_탭으로_넘어가지_않는다() {
+        use crate::ui::diff_viewer::DiffMode::Working;
+
+        let clean = GitPanelSnapshot {
+            branch: "feat".into(),
+            upstream: Some("origin/main".into()),
+            ahead: 1,
+            committed: vec![file_row("src/c.rs", 'M', 1, 0)],
+            ..Default::default()
+        };
+        let mut harness = nav_harness(clean.clone());
+        harness.run();
+        assert!(harness.state().actions.is_empty());
+        assert_eq!(harness.state().panel.tab, GitPanelTab::Changes);
+        assert_eq!(harness.state().panel.selected, None);
+
+        // 아무것도 고르지 않은 채 변경이 생기면 그 스냅샷에서 고른다 — 덮을 사용자 선택이 없다.
+        harness.state_mut().panel.set_snapshot(Ok(GitPanelSnapshot {
+            changes: vec![file_row("src/new.rs", 'M', 1, 0)],
+            ..clean
+        }));
+        harness.run();
+        assert_eq!(harness.state().actions, vec![show("src/new.rs", Working)]);
+    }
+
+    #[test]
+    fn 깨끗함_요약은_작업_트리가_깨끗한_스냅샷에서만_있다() {
+        let mut panel = GitPanelUi::default();
+        assert_eq!(panel.clean_summary(), None, "스냅샷 전");
+        panel.set_snapshot(Ok(GitPanelSnapshot {
+            branch: "feat".into(),
+            upstream: Some("origin/main".into()),
+            ahead: 3,
+            behind: 1,
+            committed: vec![file_row("src/c.rs", 'M', 1, 0)],
+            ..Default::default()
+        }));
+        assert_eq!(
+            panel.clean_summary(),
+            Some(GitCleanSummary {
+                upstream: Some("origin/main".into()),
+                ahead: 3,
+                behind: 1,
+            })
+        );
+        panel.set_snapshot(Ok(GitPanelSnapshot {
+            branch: "feat".into(),
+            changes: vec![file_row("src/a.rs", 'M', 1, 0)],
+            ..Default::default()
+        }));
+        assert_eq!(panel.clean_summary(), None, "변경이 있으면 요약이 아니다");
+        panel.set_snapshot(Err(GitPanelErrorCode::NoRepo));
+        assert_eq!(panel.clean_summary(), None);
     }
 }

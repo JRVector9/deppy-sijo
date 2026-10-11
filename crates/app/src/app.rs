@@ -20337,6 +20337,11 @@ impl App {
                 .id_salt("git_diff_pane_tab"),
         );
         detail.set_clip_rect(diff_rect.intersect(ui.clip_rect()));
+        // 깨끗할 때 diff 영역 요약(PR 3) — render 호출 모양은 소스 고정이라 setter로 넘긴다.
+        // 매 프레임 넘겨 새로고침·세션 전환 뒤에도 옛 요약이 남지 않는다.
+        let view = &mut self.session_aux.current;
+        view.diff_viewer_ui
+            .set_clean_summary(view.git_panel_ui.clean_summary());
         let search = self.session_aux.current.aux_search.is_active().then_some((
             self.session_aux.current.aux_search.query.as_str(),
             self.session_aux.current.aux_search.active,
@@ -49080,6 +49085,37 @@ mod tests {
                 "self.session_aux.current.diff_viewer_ui.render(&mutdetail,text,search);"
             ),
             "diff 뷰어는 aux_search에서 뽑은 search를 써야 한다"
+        );
+    }
+
+    /// 깨끗할 때 diff 영역 요약(2026-10-11 PR 3) — `render` 호출 모양이 위 테스트로 고정돼
+    /// 있어 인자를 늘리지 않고, App이 diff render 직전에 git 패널 스냅샷에서 뽑은 요약을
+    /// setter로 넘긴다. 매 프레임 넘겨야 새로고침·워크스페이스 전환 뒤에도 옛 요약이 안 남는다.
+    #[test]
+    fn git_본문은_diff_render_직전에_깨끗함_요약을_넘긴다() {
+        let source = include_str!("app.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let git_body = squeeze_ws(
+            production
+                .split_once("fn render_git_tab_body(")
+                .unwrap()
+                .1
+                .split_once("fn reveal_terminal_view_for_aux_tab(")
+                .expect("다음 함수 경계가 있어야 한다")
+                .0,
+        );
+        let setter = git_body
+            .find("set_clean_summary(view.git_panel_ui.clean_summary())")
+            .expect("diff 뷰어에 git 패널의 깨끗함 요약을 넘겨야 한다");
+        let list = git_body
+            .find(".git_panel_ui .render(&mut list, text, filter);")
+            .expect("목록 render가 있어야 한다");
+        let detail = git_body
+            .find(".diff_viewer_ui .render(&mut detail, text, search);")
+            .expect("diff render가 있어야 한다");
+        assert!(
+            list < setter && setter < detail,
+            "요약은 이 프레임의 목록 render 뒤, diff render 앞에서 넘겨야 한다"
         );
     }
 

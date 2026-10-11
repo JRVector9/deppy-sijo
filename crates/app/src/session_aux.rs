@@ -174,6 +174,18 @@ mod tests {
         assert!(views.current.document_ids.is_empty());
     }
     #[test]
+    fn git_results_drop_only_when_the_same_kind_is_reissued() {
+        let mut views = SessionAuxViews::default();
+        views.switch(scope(1, 1));
+        views.current.git_generation = Some(1);
+        views.current.git_commit_files_generation = Some(2);
+        // A newer snapshot supersedes only the older snapshot.
+        views.current.git_generation = Some(3);
+        assert!(views.git_result_owner(1).is_none());
+        assert!(views.git_result_owner(2).is_some());
+        assert!(views.git_result_owner(3).is_some());
+    }
+    #[test]
     fn session_aux_retains_live_or_open_documents_only() {
         let mut views = SessionAuxViews::default();
         views.switch(scope(1, 1));

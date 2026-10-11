@@ -71,6 +71,12 @@ impl CommitSha {
         // parse가 ASCII 16진수만 담으므로 실패하지 않는다.
         std::str::from_utf8(&self.hex[..usize::from(self.len)]).unwrap_or_default()
     }
+
+    /// 화면용 앞 7자 — git에는 항상 전체 값(`as_str`)을 넘긴다.
+    pub fn short(&self) -> &str {
+        let text = self.as_str();
+        &text[..text.len().min(7)]
+    }
 }
 
 impl std::fmt::Debug for CommitSha {
@@ -105,6 +111,9 @@ pub struct GitPanelSnapshot {
     pub repo_root: PathBuf,
     pub branch: String,
     pub upstream: Option<String>,
+    /// `upstream`이 추적 브랜치가 아니라 `origin/HEAD` 폴백인가 — 그때 ahead/behind는
+    /// push·pull로 맞출 「보낼/받을 커밋」이 아니라 기준 대비 앞섬·뒤짐이다.
+    pub upstream_fallback: bool,
     pub ahead: u32,
     pub behind: u32,
     pub changes: Vec<GitFileRow>,
@@ -145,7 +154,20 @@ fn merge_status_rows(porcelain_z: &str, numstat: &str) -> (Vec<GitFileRow>, bool
         if x == 'R' || x == 'C' {
             let _ = fields.next();
         }
-        let status = if x == '?' {
+        // unmerged 짝(git-status(1) Short Format 표)은 X·Y 어느 쪽을 골라도 충돌을 못 보인다.
+        let unmerged = matches!(
+            (x, y),
+            ('D', 'D')
+                | ('A', 'U')
+                | ('U', 'D')
+                | ('U', 'A')
+                | ('D', 'U')
+                | ('A', 'A')
+                | ('U', 'U')
+        );
+        let status = if unmerged {
+            'U'
+        } else if x == '?' {
             '?'
         } else if y != ' ' {
             y // 워킹트리 우선 (스펙 §3)
@@ -169,34 +191,54 @@ fn merge_status_rows(porcelain_z: &str, numstat: &str) -> (Vec<GitFileRow>, bool
     (rows, truncated)
 }
 
-/// `diff --numstat` 한 줄 = "adds\tdels\tpath" (바이너리는 "-\t-").
-fn parse_numstat(numstat: &str) -> std::collections::HashMap<String, (Option<u32>, Option<u32>)> {
+/// `diff --numstat -z` 파싱 — 항목 = "adds\tdels\tpath\0"(바이너리는 "-\t-"). rename/copy는
+/// 경로 칸이 비고 다음 두 NUL 필드가 원경로·새 경로다(새 경로로 센다). `-z` 없이 받으면
+/// 한글·공백·제어문자 경로가 C-quote(`"\355…"`)돼 porcelain 경로와 짝지어지지 않았다.
+fn parse_numstat(numstat_z: &str) -> std::collections::HashMap<String, (Option<u32>, Option<u32>)> {
     let mut out = std::collections::HashMap::new();
-    for line in numstat.lines() {
-        let mut parts = line.splitn(3, '\t');
+    let mut fields = numstat_z.split('\0');
+    while let Some(head) = fields.next() {
+        let mut parts = head.splitn(3, '\t');
         let (Some(a), Some(d), Some(path)) = (parts.next(), parts.next(), parts.next()) else {
             continue;
+        };
+        let path = if path.is_empty() {
+            let _source = fields.next();
+            match fields.next() {
+                Some(destination) => destination,
+                None => break,
+            }
+        } else {
+            path
         };
         out.insert(path.to_owned(), (a.parse().ok(), d.parse().ok()));
     }
     out
 }
 
-/// committed 섹션: `diff --numstat base..HEAD` + `diff --name-status base..HEAD` 병합.
+/// committed 섹션: `diff --numstat -z base..HEAD` + `diff --name-status -z base..HEAD` 병합.
 /// name-status 등장 순서를 유지한다. 반환하는 bool의 의미는 merge_status_rows와
 /// 같다 — 정확히 상한만큼이면 false, 하나라도 더 버렸으면 true.
-fn merge_committed_rows(numstat: &str, name_status: &str) -> (Vec<GitFileRow>, bool) {
-    let counts = parse_numstat(numstat);
+fn merge_committed_rows(numstat_z: &str, name_status_z: &str) -> (Vec<GitFileRow>, bool) {
+    let counts = parse_numstat(numstat_z);
     let mut rows = Vec::new();
     let mut truncated = false;
-    for line in name_status.lines() {
-        let mut parts = line.splitn(2, '\t');
-        let (Some(status), Some(path)) = (parts.next(), parts.next()) else {
+    // 항목 = "상태\0경로\0", rename/copy는 "R100\0원경로\0새경로\0"(새 경로를 쓴다).
+    let mut fields = name_status_z.split('\0');
+    while let Some(status) = fields.next() {
+        if status.is_empty() {
             continue;
+        }
+        let Some(mut path) = fields.next() else {
+            break;
         };
-        // rename 라인("R100\told\tnew")은 마지막 필드가 새 경로다.
-        let path = path.rsplit('\t').next().unwrap_or(path);
         let status = status.chars().next().unwrap_or('M');
+        if status == 'R' || status == 'C' {
+            let Some(destination) = fields.next() else {
+                break;
+            };
+            path = destination;
+        }
         if rows.len() >= MAX_PANEL_FILES {
             truncated = true;
             break;
@@ -267,7 +309,7 @@ fn parse_worktree_list(porcelain: &str, repo_root: &Path) -> (Vec<GitWorktreeRow
     (rows, truncated)
 }
 
-/// `git log -z --format=%h%x00%s%x00%ct` 파싱 — 필드도 항목도 NUL로 끝나므로 NUL로만
+/// `git log -z --format=%H%x00%s%x00%ct` 파싱 — 필드도 항목도 NUL로 끝나므로 NUL로만
 /// 나누면 제목에 탭·따옴표·유니코드가 있어도 안 어긋난다(git은 커밋 메시지에 NUL을
 /// 허용하지 않는다). 순서는 git log 출력(최신순) 그대로다. sha·시각이 손상된 항목은
 /// 건너뛰고, 반환하는 bool은 상한(MAX_BRANCH_COMMITS) 때문에 항목을 실제로 버렸는지다.
@@ -379,15 +421,10 @@ fn status_badge_style(
     }
 }
 
-/// 18pt 색 배지 하나. hover 전용 sense라 행 클릭을 가로채지 않는다.
-fn status_badge(
-    ui: &mut egui::Ui,
-    status: char,
-    tokens: crate::ui::designall::Tokens,
-    catalog: &i18n::Catalog,
-) {
-    let (letter, color, key) = status_badge_style(status, tokens);
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+/// 18pt 색 배지 하나. hover 전용 sense라 행 클릭을 가로채지 않고, 설명은 행 hover가 맡는다.
+fn status_badge(ui: &mut egui::Ui, status: char, tokens: crate::ui::designall::Tokens) {
+    let (letter, color, _) = status_badge_style(status, tokens);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
     ui.painter()
         .rect_filled(rect, 4.0, color.gamma_multiply(0.16));
     ui.painter().text(
@@ -397,7 +434,6 @@ fn status_badge(
         egui::FontId::monospace(10.5),
         color,
     );
-    response.on_hover_text(catalog.t(key, &[]));
 }
 
 /// 경로 동작(경로 복사·세션에 경로 넣기·Finder에서 보기)의 대상 파일 — 행 우클릭 메뉴와
@@ -527,6 +563,33 @@ pub enum GitPanelErrorCode {
 }
 
 /// 세션 cwd에서 패널 스냅샷을 수집한다. **App host 스레드에서만 부른다**(blocking git).
+/// 비교 기준 — 추적 브랜치(`@{u}`), 없으면 `origin/HEAD`(기본 브랜치) 폴백(스펙 §3).
+/// bool은 폴백인지다. 스냅샷과 브랜치 diff가 같은 기준을 써야 커밋 탭의 파일이 열린다.
+fn resolve_upstream(
+    run: impl Fn(&[&str]) -> Result<(String, bool), GitPanelErrorCode>,
+) -> Option<(String, bool)> {
+    let trimmed = |out: Result<(String, bool), GitPanelErrorCode>| {
+        out.ok()
+            .map(|(text, _)| text.trim().to_owned())
+            .filter(|text| !text.is_empty())
+    };
+    trimmed(run(&[
+        "rev-parse",
+        "--abbrev-ref",
+        "--symbolic-full-name",
+        "@{u}",
+    ]))
+    .map(|upstream| (upstream, false))
+    .or_else(|| {
+        trimmed(run(&[
+            "symbolic-ref",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ]))
+        .map(|upstream| (upstream, true))
+    })
+}
+
 pub fn collect_snapshot(cwd: &Path) -> Result<GitPanelSnapshot, GitPanelErrorCode> {
     let repo_root =
         crate::git_cli::repo_root(cwd, GIT_TIMEOUT).map_err(|_| GitPanelErrorCode::NoRepo)?;
@@ -546,16 +609,10 @@ pub fn collect_snapshot(cwd: &Path) -> Result<GitPanelSnapshot, GitPanelErrorCod
     };
 
     // 업스트림: 추적 브랜치 → origin/HEAD 폴백 → None(스펙 §3).
-    let upstream = run(&["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
-        .ok()
-        .map(|(s, _)| s.trim().to_owned())
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            run(&["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
-                .ok()
-                .map(|(s, _)| s.trim().to_owned())
-                .filter(|s| !s.is_empty())
-        });
+    let (upstream, upstream_fallback) = match resolve_upstream(run) {
+        Some((upstream, fallback)) => (Some(upstream), fallback),
+        None => (None, false),
+    };
 
     let (mut ahead, mut behind) = (0, 0);
     let mut committed = Vec::new();
@@ -572,8 +629,8 @@ pub fn collect_snapshot(cwd: &Path) -> Result<GitPanelSnapshot, GitPanelErrorCod
         if let Ok((base, _)) = run(&["merge-base", upstream, "HEAD"]) {
             let base = base.trim().to_owned();
             let range = format!("{base}..HEAD");
-            let (numstat, t1) = run(&["diff", "--no-ext-diff", "--numstat", &range])?;
-            let (names, t2) = run(&["diff", "--no-ext-diff", "--name-status", &range])?;
+            let (numstat, t1) = run(&["diff", "--no-ext-diff", "--numstat", "-z", &range])?;
+            let (names, t2) = run(&["diff", "--no-ext-diff", "--name-status", "-z", &range])?;
             let (rows, rows_truncated) = merge_committed_rows(&numstat, &names);
             committed = rows;
             committed_truncated = t1 || t2 || rows_truncated;
@@ -582,7 +639,17 @@ pub fn collect_snapshot(cwd: &Path) -> Result<GitPanelSnapshot, GitPanelErrorCod
             // 넘쳤는지를 가를 수 있다(2026-10-11 PR 4).
             let max_count = format!("--max-count={}", MAX_BRANCH_COMMITS + 1);
             if let Ok((log, log_truncated)) =
-                run(&["log", "-z", &max_count, "--format=%h%x00%s%x00%ct", &range])
+                // 전체 sha(`%H`) — 짧은 sha는 같은 이름의 브랜치나 나중의 충돌로 다른 커밋을
+                // 가리킬 수 있다. `log.showSignature` 설정이 서명 검증 문구를 stdout에
+                // 섞으면 sha 파싱이 깨져 커밋이 빠지므로 끈다(2026-10-11 리뷰).
+                run(&[
+                    "log",
+                    "-z",
+                    "--no-show-signature",
+                    &max_count,
+                    "--format=%H%x00%s%x00%ct",
+                    &range,
+                ])
             {
                 let (rows, rows_truncated) = parse_branch_commits(&log);
                 commits = rows;
@@ -592,7 +659,7 @@ pub fn collect_snapshot(cwd: &Path) -> Result<GitPanelSnapshot, GitPanelErrorCod
     }
 
     let (porcelain, t3) = run(&["status", "--porcelain", "-z", "-uall"])?;
-    let (numstat, t4) = run(&["diff", "--no-ext-diff", "--numstat", "HEAD"])?;
+    let (numstat, t4) = run(&["diff", "--no-ext-diff", "--numstat", "-z", "HEAD"])?;
     let (changes, changes_rows_truncated) = merge_status_rows(&porcelain, &numstat);
     let changes_truncated = t3 || t4 || changes_rows_truncated;
 
@@ -617,6 +684,7 @@ pub fn collect_snapshot(cwd: &Path) -> Result<GitPanelSnapshot, GitPanelErrorCod
         repo_root,
         branch,
         upstream,
+        upstream_fallback,
         ahead,
         behind,
         changes,
@@ -731,9 +799,8 @@ fn collect_file_diff(
             Ok(parse_unified(&text, truncated))
         }
         DiffMode::Branch => {
-            let (upstream, _) =
-                run(&["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])?;
-            let (base, _) = run(&["merge-base", upstream.trim(), "HEAD"])?;
+            let (upstream, _) = resolve_upstream(run).ok_or(GitPanelErrorCode::CollectionFailed)?;
+            let (base, _) = run(&["merge-base", upstream.as_str(), "HEAD"])?;
             let range = format!("{}..HEAD", base.trim());
             let (text, truncated) = run(&["diff", "--no-ext-diff", &range, "--", rel_path])?;
             Ok(parse_unified(&text, truncated))
@@ -772,8 +839,10 @@ fn collect_commit_files(cwd: &Path, sha: CommitSha) -> Result<GitCommitFiles, Gi
                 "--no-ext-diff",
                 "--first-parent",
                 format,
+                "-z",
                 "--format=",
                 sha.as_str(),
+                "--",
             ],
             GIT_TIMEOUT,
             MAX_LIST_BYTES,
@@ -844,6 +913,9 @@ pub struct GitPanelUi {
     /// 첫 파일 자동 선택 대기(2026-10-11 PR 3) — 스냅샷이 오면 켜지고 다음 렌더가 한 번
     /// 소비한다. 고른 파일이 이미 있으면(사용자든 자동이든) 소비만 하고 고르지 않는다.
     auto_select_pending: bool,
+    /// 다른 입력(교차 워크스페이스의 붙인 터미널)이 키를 쥐고 있다 — ↑↓를 건드리지 않는다.
+    /// App이 매 프레임 render 전에 넘긴다.
+    keys_blocked: bool,
 }
 
 /// 목록 탭(2026-10-11 PR 2) — 예전 접는 섹션 세 개를 대신한다.
@@ -877,13 +949,52 @@ pub struct GitCleanSummary {
 impl GitPanelUi {
     pub fn set_loading(&mut self) {
         self.loading = true;
+        // 새 스냅샷이 오는 중이다 — 낡은 스냅샷으로 고르면 그 파일 diff 요청이 새 스냅샷과
+        // 겹친다. 새 스냅샷이 도착하면 다시 켜진다.
+        self.auto_select_pending = false;
+    }
+
+    /// 다른 입력이 키를 쥐고 있는지 — App이 render 전에 넘긴다.
+    pub fn set_keys_blocked(&mut self, blocked: bool) {
+        self.keys_blocked = blocked;
+    }
+
+    /// 오른쪽 diff가 보여 주는 파일이 있는가 — 없으면 App이 diff 뷰어를 비운다.
+    pub fn has_selection(&self) -> bool {
+        self.selected.is_some()
     }
 
     pub fn set_snapshot(&mut self, result: Result<GitPanelSnapshot, GitPanelErrorCode>) {
         self.loading = false;
+        // 다른 repo로 바뀌었다(세션 「변경 보기」 등) — 옛 repo 경로의 선택·펼친 커밋이 남으면
+        // 새 repo의 같은 경로 행이 선택으로 보인다. App은 같은 조건에서 diff 뷰어를 비운다.
+        if let (Some(previous), Ok(next)) = (self.repo_root(), result.as_ref())
+            && previous != next.repo_root.as_path()
+        {
+            self.selected = None;
+            self.commit_list = CommitListState::default();
+        }
+        // 고른 파일이 커밋 등으로 그 목록에서 사라졌으면 선택을 비운다 — 남으면 사라진 파일의
+        // diff가 남고 다음 변경도 자동으로 열리지 않는다. 커밋 파일은 스냅샷 밖이라 그대로다.
+        if let (Some((path, mode)), Ok(next)) = (self.selected.as_ref(), result.as_ref()) {
+            use crate::ui::diff_viewer::DiffMode;
+            let rows = match mode {
+                DiffMode::Working => Some(&next.changes),
+                DiffMode::Branch => Some(&next.committed),
+                DiffMode::Commit(_) => None,
+            };
+            if rows.is_some_and(|rows| !rows.iter().any(|row| &row.rel_path == path)) {
+                self.selected = None;
+            }
+        }
         // 고른 파일이 있는지는 render가 본다 — 선택을 지키는 새로고침은 켜져도 고르지 않는다.
         self.auto_select_pending = result.is_ok();
         self.snapshot = Some(result);
+    }
+
+    /// 지금 스냅샷의 repo 루트 — 다른 repo의 스냅샷이 왔는지 가르는 데 쓴다.
+    fn repo_root(&self) -> Option<&Path> {
+        Some(self.snapshot.as_ref()?.as_ref().ok()?.repo_root.as_path())
     }
 
     /// `LoadCommitFiles`의 결과 — 지금 기다리는 커밋의 것만 받고, 다른 커밋으로 넘어간
@@ -970,6 +1081,7 @@ impl GitPanelUi {
             changes_collapsed_dirs,
             committed_collapsed_dirs,
             auto_select_pending,
+            keys_blocked,
         } = self;
         let snap = match snapshot.as_ref() {
             None => {
@@ -1099,7 +1211,9 @@ impl GitPanelUi {
         // ── ↑↓: 지금 탭의 보이는 파일 행을 표시 순서로 옮겨 다니며 그 diff를 연다
         // (2026-10-11 PR 3). 이동할 행이 없으면 키를 소비하지 않는다.
         let mut reveal = false;
-        if let Some(step) = git_key_step(ui.ctx(), egui::Key::ArrowUp, egui::Key::ArrowDown) {
+        if !*keys_blocked
+            && let Some(step) = git_key_step(ui.ctx(), egui::Key::ArrowUp, egui::Key::ArrowDown)
+        {
             // 위 목록 줄의 파일 행(접은 폴더 제외), 커밋 탭이면 이어서 펼친 커밋의 파일 행.
             let mut nav: Vec<(&str, crate::ui::diff_viewer::DiffMode)> = items
                 .iter()
@@ -1214,6 +1328,8 @@ impl GitPanelUi {
                                 .id_salt(("git-panel-worktree", row.path.as_str()))
                                 .sense(egui::Sense::click()),
                             |ui| {
+                                // 글자 선택을 끈다 — 선택 가능한 Label이 행 클릭을 가로챘다(2026-10-11 리뷰).
+                                ui.style_mut().interaction.selectable_labels = false;
                                 ui.set_width(ui.available_width());
                                 ui.horizontal(|ui| {
                                     ui.label(&row.name);
@@ -1309,11 +1425,26 @@ fn branch_card(
             });
             ui.horizontal_wrapped(|ui| match snap.upstream.as_deref() {
                 Some(upstream) => {
+                    // 추적 브랜치가 아니라 기본 브랜치 폴백이면 push·pull로 맞출 수 있는
+                    // 「보낼/받을 커밋」이 아니다 — 업스트림 없음을 알리고 기준 대비로 센다.
+                    let (ahead_key, behind_key, same_key) = if snap.upstream_fallback {
+                        no_upstream_pill(ui, tokens, catalog);
+                        (
+                            "git.branch.ahead_base",
+                            "git.branch.behind_base",
+                            "git.branch.same_as_base",
+                        )
+                    } else {
+                        (
+                            "git.branch.ahead",
+                            "git.branch.behind",
+                            "git.branch.in_sync",
+                        )
+                    };
                     ui.weak("→");
                     ui.add(egui::Label::new(egui::RichText::new(upstream).monospace()).truncate());
                     if snap.ahead > 0 {
-                        let text =
-                            catalog.t("git.branch.ahead", &[("count", &snap.ahead.to_string())]);
+                        let text = catalog.t(ahead_key, &[("count", &snap.ahead.to_string())]);
                         pill(
                             ui,
                             text,
@@ -1323,8 +1454,7 @@ fn branch_card(
                         );
                     }
                     if snap.behind > 0 {
-                        let text =
-                            catalog.t("git.branch.behind", &[("count", &snap.behind.to_string())]);
+                        let text = catalog.t(behind_key, &[("count", &snap.behind.to_string())]);
                         pill(
                             ui,
                             text,
@@ -1334,24 +1464,31 @@ fn branch_card(
                         );
                     }
                     if snap.ahead == 0 && snap.behind == 0 {
-                        let text = catalog.t("git.branch.in_sync", &[]);
+                        let text = catalog.t(same_key, &[]);
                         let fill = tokens.input_background;
                         pill(ui, text, tokens.muted_text, fill, egui::Stroke::NONE);
                     }
                 }
-                None => {
-                    pill(
-                        ui,
-                        catalog.t("git.upstream_none", &[]),
-                        tokens.warning,
-                        egui::Color32::TRANSPARENT,
-                        egui::Stroke::new(1.0, tokens.warning.gamma_multiply(0.5)),
-                    )
-                    .on_hover_text(catalog.t("git.branch.no_upstream_hint", &[]));
-                }
+                None => no_upstream_pill(ui, tokens, catalog),
             });
         });
     action
+}
+
+/// 「업스트림 없음」 경고 배지 — hover로 push하면 추적 브랜치가 생긴다는 이유를 보인다.
+fn no_upstream_pill(
+    ui: &mut egui::Ui,
+    tokens: crate::ui::designall::Tokens,
+    catalog: &i18n::Catalog,
+) {
+    pill(
+        ui,
+        catalog.t("git.upstream_none", &[]),
+        tokens.warning,
+        egui::Color32::TRANSPARENT,
+        egui::Stroke::new(1.0, tokens.warning.gamma_multiply(0.5)),
+    )
+    .on_hover_text(catalog.t("git.branch.no_upstream_hint", &[]));
 }
 
 /// 브랜치 카드의 상태 배지 — 둥근 면(또는 테두리)과 글자를 직접 칠한다. hover 전용
@@ -1590,11 +1727,9 @@ fn group_by_folder<'r>(rows: &[&'r GitFileRow]) -> Vec<(&'r str, Vec<&'r GitFile
     groups
 }
 
-/// 지금 탭의 목록 줄. 「모두 보기」 전 상한(SECTION_COLLAPSED_ROWS)은 두 보기 모두 **파일
-/// 행만** 그 보기의 표시 순서로 센다 — 폴더 머리는 세지 않고, 접은 폴더의 파일도 자리를
-/// 차지한다. 그래서 「모두 보기」가 나타나는 조건(거른 뒤 파일 수 > 상한)이 두 보기에서
-/// 같고, 폴더를 접어도 상한 뒤의 파일이 앞으로 당겨지지 않는다. 상한 안에 파일이 하나도
-/// 들지 않는 폴더는 머리째 빠진다.
+/// 지금 탭의 목록 줄. 「모두 보기」 전 상한(SECTION_COLLAPSED_ROWS)은 두 보기 모두 **보이는
+/// 파일 행만** 그 보기의 표시 순서로 센다 — 폴더 머리와 접은 폴더의 파일은 세지 않는다.
+/// 상한이 다 차면 그 뒤 폴더는 머리째 빠지고 「모두 보기」로 펼친다.
 fn list_items<'r>(
     rows: &[&'r GitFileRow],
     layout: GitListLayout,
@@ -1624,11 +1759,13 @@ fn list_items<'r>(
             count: files.len(),
             collapsed: is_collapsed,
         });
+        // 접은 폴더의 파일은 보이지 않으니 상한을 쓰지 않는다 — 접으면 그 자리를 다음 폴더가 쓴다.
+        if is_collapsed {
+            continue;
+        }
         let shown = files.len().min(budget);
         budget -= shown;
-        if !is_collapsed {
-            items.extend(files[..shown].iter().copied().map(ListItem::File));
-        }
+        items.extend(files[..shown].iter().copied().map(ListItem::File));
     }
     items
 }
@@ -1673,7 +1810,11 @@ fn is_plain_press(event: &egui::Event, key: egui::Key) -> bool {
 /// 등)이다 — 그 포커스나 IME 조합 중이면 받지 않는다. 입력은 건드리지 않는다: 쓰기로
 /// 했으면 [`consume_git_keys`]로 지우고, 쓸 데가 없으면 다른 소비자에게 남긴다.
 pub(crate) fn git_key_step(ctx: &egui::Context, prev: egui::Key, next: egui::Key) -> Option<isize> {
-    if ctx.text_edit_focused() || terminal::renderer_egui::frame_has_active_preedit(ctx) {
+    // 열린 팝업(행 우클릭 메뉴·콤보)이 있으면 그 팝업의 키다 — 뒤의 선택·diff를 옮기지 않는다.
+    if ctx.text_edit_focused()
+        || terminal::renderer_egui::frame_has_active_preedit(ctx)
+        || ctx.any_popup_open()
+    {
         return None;
     }
     let (back, forward) = ctx.input(|input| {
@@ -1784,6 +1925,8 @@ fn folder_header(
             .id_salt(id_salt)
             .sense(egui::Sense::click()),
         |ui| {
+            // 글자 선택을 끈다 — 선택 가능한 Label이 행 클릭을 가로챘다(2026-10-11 리뷰).
+            ui.style_mut().interaction.selectable_labels = false;
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 ui.weak(if collapsed { "›" } else { "∨" });
@@ -1855,7 +1998,11 @@ fn truncation_banner(
         .inner_margin(egui::Margin::symmetric(10, 6))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(catalog.t("diff.truncated", &[]));
+            // 행 상한(512)이나 바이트 상한으로 잘렸다 — 「git diff」가 아니라 목록 안내다.
+            ui.label(catalog.t(
+                "git.list.truncated",
+                &[("count", &MAX_PANEL_FILES.to_string())],
+            ));
         });
     ui.add_space(4.0);
 }
@@ -1905,13 +2052,13 @@ fn file_row(
             .id_salt(id_salt)
             .sense(egui::Sense::click()),
         |ui| {
+            // 글자 선택을 끈다 — egui Label은 기본이 선택 가능이라 click을 감지해 파일명·폴더
+            // 글자 위의 클릭·우클릭·hover를 행 대신 가로챘다(2026-10-11 리뷰).
+            ui.style_mut().interaction.selectable_labels = false;
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                status_badge(ui, row.status, tokens, catalog);
-                ui.label(name);
-                if !dir.is_empty() && !options.hide_dir {
-                    ui.weak(short_dir(dir));
-                }
+                // 증감을 오른쪽부터 먼저 놓고, 남은 폭에 배지·파일명·폴더를 말줄임으로 그린다 —
+                // 좁은 패널에서 긴 이름이 증감 숫자를 덮거나 밖으로 밀지 않게.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(d) = row.dels.filter(|d| *d > 0) {
                         ui.colored_label(stat_color(tokens, false), format!("−{d}"));
@@ -1919,15 +2066,36 @@ fn file_row(
                     if let Some(a) = row.adds.filter(|a| *a > 0) {
                         ui.colored_label(stat_color(tokens, true), format!("+{a}"));
                     }
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        status_badge(ui, row.status, tokens);
+                        ui.add(egui::Label::new(name).truncate());
+                        if !dir.is_empty() && !options.hide_dir {
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(short_dir(dir)).weak())
+                                    .truncate(),
+                            );
+                        }
+                    });
                 });
             });
         },
     );
+    // 상태 설명은 배지가 아니라 행 hover에 둔다 — 배지에도 두면 두 말풍선이 같은 자리에 겹쳤다.
+    let (_, _, status_key) = status_badge_style(row.status, tokens);
     let response = toggle
         .response
         .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text(row.rel_path.as_str());
+        .on_hover_text(format!("{} · {}", catalog.t(status_key, &[]), row.rel_path));
     let rect = response.rect;
+    if response.has_focus() {
+        // Tab으로 옮긴 키보드 포커스가 보이게 한다.
+        ui.painter().rect_stroke(
+            rect,
+            4.0,
+            egui::Stroke::new(1.0, tokens.accent),
+            egui::StrokeKind::Inside,
+        );
+    }
     if let Some(fill) = crate::ui::designall::row_fill(tokens, is_selected, response.hovered()) {
         ui.painter()
             .set(background, egui::Shape::rect_filled(rect, 4.0, fill));
@@ -2047,11 +2215,13 @@ fn render_commit_list(
                 .id_salt(("git-panel-commit", commit.sha.as_str()))
                 .sense(egui::Sense::click()),
             |ui| {
+                // 글자 선택을 끈다 — 선택 가능한 Label이 행 클릭을 가로챘다(2026-10-11 리뷰).
+                ui.style_mut().interaction.selectable_labels = false;
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
                     ui.weak(if open { "∨" } else { "›" });
                     ui.label(
-                        egui::RichText::new(commit.sha.as_str())
+                        egui::RichText::new(commit.sha.short())
                             .monospace()
                             .color(tokens.accent),
                     );
@@ -2079,7 +2249,7 @@ fn render_commit_list(
             egui::WidgetInfo::labeled(
                 egui::WidgetType::Button,
                 ui.is_enabled(),
-                format!("{} {}", commit.sha.as_str(), commit.subject),
+                format!("{} {}", commit.sha.short(), commit.subject),
             )
         });
         if response.clicked()
@@ -2153,7 +2323,10 @@ fn render_commit_files(
         }
     }
     if files.truncated {
-        ui.weak(catalog.t("diff.truncated", &[]));
+        ui.weak(catalog.t(
+            "git.list.truncated",
+            &[("count", &MAX_PANEL_FILES.to_string())],
+        ));
     }
 }
 
@@ -2165,7 +2338,9 @@ mod tests {
     fn porcelain과_numstat을_경로로_병합한다() {
         // porcelain -z: "XY path\0" 반복. rename은 "R  new\0old\0".
         let porcelain = " M a.rs\0?? new.txt\0R  moved.rs\0old.rs\0MM both.rs\0";
-        let numstat = "3\t1\ta.rs\n456\t221\tmoved.rs\n-\t-\tbin.png\n2\t0\tboth.rs\n";
+        // numstat -z: "adds\tdels\tpath\0", rename은 경로 칸이 비고 "\0old\0new\0"가 따른다.
+        let numstat = "3\t1\ta.rs\x00456\t221\t\0old.rs\0moved.rs\0-\t-\tbin.png\x00\
+                       2\t0\tboth.rs\0";
         let (rows, truncated) = merge_status_rows(porcelain, numstat);
         // 순서는 porcelain 등장 순서를 유지한다.
         assert_eq!(rows.len(), 4);
@@ -2196,13 +2371,43 @@ mod tests {
         );
     }
 
+    /// 충돌(unmerged) 항목은 XY가 AA·DD·UD처럼 보여 워킹트리(Y) 우선 규칙으로는 「추가」·
+    /// 「삭제」 배지가 됐다 — 충돌인데 평범한 추가로 보이고, UD/DD는 삭제로 판정돼 경로
+    /// 동작까지 막혔다(2026-10-11 리뷰). unmerged 짝은 모두 'U'다.
+    #[test]
+    fn 충돌_항목은_xy와_무관하게_충돌_상태다() {
+        let porcelain = "AA both.rs\0UD ours.rs\0DU theirs.rs\0DD gone.rs\0UU edit.rs\0\
+                         AU a.rs\0UA b.rs\0 M plain.rs\0";
+        let (rows, _) = merge_status_rows(porcelain, "");
+        let statuses: Vec<(&str, char)> = rows
+            .iter()
+            .map(|row| (row.rel_path.as_str(), row.status))
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![
+                ("both.rs", 'U'),
+                ("ours.rs", 'U'),
+                ("theirs.rs", 'U'),
+                ("gone.rs", 'U'),
+                ("edit.rs", 'U'),
+                ("a.rs", 'U'),
+                ("b.rs", 'U'),
+                ("plain.rs", 'M'),
+            ]
+        );
+    }
+
     #[test]
     fn numstat만_있는_경로는_committed_파서가_그대로_담는다() {
         // committed 섹션: numstat + name-status 병합. 바이너리는 "-\t-".
-        let numstat = "12\t13\tsrc/ui/workspace.rs\n-\t-\tassets/logo.png\n";
-        let name_status = "M\tsrc/ui/workspace.rs\nA\tassets/logo.png\n";
+        // -z: numstat "adds\tdels\tpath\0", name-status "상태\0경로\0"(rename은 "R100\0old\0new\0").
+        let numstat = "12\t13\tsrc/ui/workspace.rs\0-\t-\tassets/logo.png\x00\
+                       5\t0\t\0old name.rs\0새 이름.rs\0";
+        let name_status =
+            "M\0src/ui/workspace.rs\0A\0assets/logo.png\0R100\0old name.rs\0새 이름.rs\0";
         let (rows, truncated) = merge_committed_rows(numstat, name_status);
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 3);
         assert!(!truncated);
         assert_eq!(
             (
@@ -2221,6 +2426,11 @@ mod tests {
                 rows[1].dels
             ),
             ("assets/logo.png", 'A', None, None)
+        );
+        // rename은 새 경로로, 증감도 새 경로에 짝지어진다.
+        assert_eq!(
+            (rows[2].rel_path.as_str(), rows[2].status, rows[2].adds),
+            ("새 이름.rs", 'R', Some(5))
         );
     }
 
@@ -2253,7 +2463,7 @@ mod tests {
     fn merge_committed_rows는_상한에_정확히_닿으면_잘림이_아니다() {
         let mut name_status = String::new();
         for i in 0..MAX_PANEL_FILES {
-            name_status.push_str(&format!("M\tf{i}.rs\n"));
+            name_status.push_str(&format!("M\0f{i}.rs\0"));
         }
         let (rows, truncated) = merge_committed_rows("", &name_status);
         assert_eq!(rows.len(), MAX_PANEL_FILES);
@@ -2264,7 +2474,7 @@ mod tests {
     fn merge_committed_rows는_상한을_하나_넘으면_잘린다() {
         let mut name_status = String::new();
         for i in 0..(MAX_PANEL_FILES + 1) {
-            name_status.push_str(&format!("M\tf{i}.rs\n"));
+            name_status.push_str(&format!("M\0f{i}.rs\0"));
         }
         let (rows, truncated) = merge_committed_rows("", &name_status);
         assert_eq!(rows.len(), MAX_PANEL_FILES);
@@ -2541,6 +2751,109 @@ mod tests {
         std::fs::remove_dir_all(&clone_dir).ok();
     }
 
+    /// 테스트용 — origin을 흉내내는 로컬 repo를 clone하고 커밋 작성자를 설정한다.
+    fn clone_with_upstream(origin: &std::path::Path, tag: &str) -> std::path::PathBuf {
+        let clone_dir = std::env::temp_dir().join(format!(
+            "deppy-gitpanel-clone-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        crate::git_cli::run_git(
+            origin.parent().unwrap(),
+            &[
+                "clone",
+                "-q",
+                origin.to_str().unwrap(),
+                clone_dir.to_str().unwrap(),
+            ],
+            T,
+        )
+        .unwrap();
+        crate::git_cli::run_git(&clone_dir, &["config", "user.email", "t@t"], T).unwrap();
+        crate::git_cli::run_git(&clone_dir, &["config", "user.name", "t"], T).unwrap();
+        clone_dir
+    }
+
+    /// 한글·공백 경로를 `-z` 없이 받으면 git이 C-quote(`"\355…"`)해 돌려줘 행 경로·증감·
+    /// diff·경로 동작이 전부 어긋났다(2026-10-11 리뷰). numstat/name-status를 `-z`로 받는다.
+    #[test]
+    fn 한글_경로도_변경_브랜치_커밋_파일에서_원래_경로로_읽는다() {
+        use crate::ui::diff_viewer::DiffMode;
+
+        let origin = temp_repo("origin-utf8");
+        std::fs::write(origin.join("기본.rs"), "one\n").unwrap();
+        commit_all(&origin, "c1");
+        let clone_dir = clone_with_upstream(&origin, "utf8");
+        std::fs::write(clone_dir.join("한글 파일.rs"), "a\nb\n").unwrap();
+        commit_all(&clone_dir, "add korean");
+        std::fs::write(clone_dir.join("기본.rs"), "one\ntwo\n").unwrap();
+
+        let snap = collect_snapshot(&clone_dir).expect("collect");
+        let change = snap
+            .changes
+            .iter()
+            .find(|row| row.rel_path == "기본.rs")
+            .expect("변경 행은 원래 경로여야 한다");
+        assert_eq!(change.adds, Some(1), "변경 증감이 경로와 짝지어져야 한다");
+        let committed = snap
+            .committed
+            .iter()
+            .find(|row| row.rel_path == "한글 파일.rs")
+            .expect("브랜치 커밋 행은 원래 경로여야 한다");
+        assert_eq!(committed.adds, Some(2));
+
+        let sha = snap.commits[0].sha;
+        let files = collect_commit_files(&clone_dir, sha).expect("commit files");
+        assert_eq!(files.rows[0].rel_path, "한글 파일.rs");
+        assert_eq!(files.rows[0].adds, Some(2));
+        let view =
+            collect_file_diff(&clone_dir, "한글 파일.rs", DiffMode::Commit(sha)).expect("diff");
+        assert!(
+            !view.hunks.is_empty(),
+            "원래 경로로 커밋 diff를 찾아야 한다"
+        );
+        std::fs::remove_dir_all(&origin).ok();
+        std::fs::remove_dir_all(&clone_dir).ok();
+    }
+
+    /// 추적 브랜치 없는 새 브랜치는 `origin/HEAD`를 기준으로 쓰고 그 사실을 표시한다. 브랜치
+    /// 커밋 파일의 diff도 같은 기준을 써야 한다 — 예전 diff는 `@{u}`만 봐서 열리지 않았다.
+    #[test]
+    fn 추적_브랜치가_없으면_origin_head를_기준으로_쓰고_diff도_열린다() {
+        use crate::ui::diff_viewer::DiffMode;
+
+        let origin = temp_repo("origin-fallback");
+        std::fs::write(origin.join("f.rs"), "one\n").unwrap();
+        commit_all(&origin, "c1");
+        let clone_dir = clone_with_upstream(&origin, "fallback");
+        crate::git_cli::run_git(&clone_dir, &["switch", "-q", "-c", "feat/local"], T).unwrap();
+        std::fs::write(clone_dir.join("f.rs"), "one\ntwo\n").unwrap();
+        commit_all(&clone_dir, "local work");
+
+        let snap = collect_snapshot(&clone_dir).expect("collect");
+        assert!(
+            snap.upstream
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("origin/")
+        );
+        assert!(
+            snap.upstream_fallback,
+            "추적 브랜치가 아닌 폴백임을 표시해야 한다"
+        );
+        assert_eq!(snap.committed.len(), 1);
+        let view = collect_file_diff(&clone_dir, "f.rs", DiffMode::Branch).expect("branch diff");
+        assert!(
+            !view.hunks.is_empty(),
+            "폴백 기준으로 브랜치 diff가 열려야 한다"
+        );
+        std::fs::remove_dir_all(&origin).ok();
+        std::fs::remove_dir_all(&clone_dir).ok();
+    }
+
     // ── 브랜치 커밋 목록(2026-10-11 PR 4) ─────────────────────────────
 
     /// `git log -z --format=%h%x00%s%x00%ct` 한 항목 — 필드도 항목도 NUL로 끝난다(실측).
@@ -2679,19 +2992,22 @@ mod tests {
         assert_eq!(subjects, vec!["둘째 로컬 작업 ✓", "첫 로컬\t작업"]);
         assert!(!snap.commits_truncated);
         let head = crate::git_cli::run_git(&clone_dir, &["rev-parse", "HEAD"], T).unwrap();
-        assert!(
-            head.starts_with(snap.commits[0].sha.as_str()),
-            "첫 항목은 HEAD다: {head} / {:?}",
-            snap.commits[0].sha
+        // 전체 sha로 담는다 — 짧은 sha는 같은 이름의 브랜치나 나중의 충돌로 다른 커밋을
+        // 가리킬 수 있다(2026-10-11 리뷰). 화면에는 앞 7자만 보인다.
+        assert_eq!(
+            snap.commits[0].sha.as_str(),
+            head.trim(),
+            "첫 항목은 HEAD다"
         );
+        assert_eq!(snap.commits[0].sha.short(), &head.trim()[..7]);
         assert!(snap.commits.iter().all(|c| c.time > 0));
         std::fs::remove_dir_all(&origin).ok();
         std::fs::remove_dir_all(&clone_dir).ok();
     }
 
-    /// 커밋 목록과 같은 형태(`%h`)의 HEAD sha.
+    /// 커밋 목록과 같은 형태(전체 sha)의 HEAD.
     fn head_sha(repo: &std::path::Path) -> CommitSha {
-        let out = crate::git_cli::run_git(repo, &["rev-parse", "--short", "HEAD"], T).unwrap();
+        let out = crate::git_cli::run_git(repo, &["rev-parse", "HEAD"], T).unwrap();
         CommitSha::parse(out.trim()).unwrap()
     }
 
@@ -3391,6 +3707,41 @@ mod tests {
         }
     }
 
+    /// 다른 repo의 스냅샷이 오면(세션 「변경 보기」로 repo 전환) 옛 repo 경로의 선택과
+    /// 펼친 커밋을 비운다 — 남으면 다른 repo의 같은 경로 행이 선택으로 보였다(2026-10-11 리뷰).
+    /// 같은 repo의 새로고침은 선택을 그대로 둔다.
+    #[test]
+    fn 다른_repo_스냅샷이_오면_선택과_펼친_커밋을_비운다() {
+        use crate::ui::diff_viewer::DiffMode;
+
+        let snapshot = |root: &str| GitPanelSnapshot {
+            repo_root: PathBuf::from(root),
+            branch: "main".into(),
+            changes: vec![file_row("src/main.rs", 'M', 1, 0)],
+            ..Default::default()
+        };
+        let sha = CommitSha::parse("a1b2c3d").unwrap();
+        let mut panel = GitPanelUi::default();
+        panel.set_snapshot(Ok(snapshot("/repo/a")));
+        panel.selected = Some(("src/main.rs".into(), DiffMode::Working));
+        panel.commit_list.toggle(sha);
+
+        panel.set_snapshot(Ok(snapshot("/repo/a")));
+        assert!(
+            panel.selected.is_some(),
+            "같은 repo 새로고침이 선택을 지웠다"
+        );
+        assert_eq!(panel.repo_root(), Some(Path::new("/repo/a")));
+
+        panel.set_snapshot(Ok(snapshot("/repo/b")));
+        assert_eq!(
+            panel.selected, None,
+            "다른 repo로 바뀌었는데 옛 선택이 남았다"
+        );
+        assert_eq!(panel.commit_list.expanded, None);
+        assert_eq!(panel.repo_root(), Some(Path::new("/repo/b")));
+    }
+
     #[test]
     fn path_target은_모드_섹션의_행으로_대상을_만든다() {
         use crate::ui::diff_viewer::DiffMode;
@@ -3935,6 +4286,36 @@ mod tests {
         harness.get_by_role_and_label(Role::Button, "src/working.rs");
     }
 
+    /// 추적 브랜치가 없어 `origin/HEAD`로 폴백한 기준은 「보낼/받을 커밋」이 아니다 — push·pull로
+    /// 맞춰지지 않는다(2026-10-11 리뷰). 업스트림 없음 경고와 「기준 대비」 중립 배지를 보인다.
+    #[test]
+    fn kittest_폴백_기준은_보낼_받을_대신_기준_대비로_보인다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = en();
+        let mut harness = panel_harness(
+            GitPanelSnapshot {
+                branch: "feat/local".into(),
+                upstream: Some("origin/main".into()),
+                upstream_fallback: true,
+                ahead: 2,
+                behind: 1,
+                ..Default::default()
+            },
+            "",
+        );
+        harness.run();
+        harness.get_by_label(&catalog.t("git.upstream_none", &[]));
+        harness.get_by_label(&catalog.t("git.branch.ahead_base", &[("count", "2")]));
+        harness.get_by_label(&catalog.t("git.branch.behind_base", &[("count", "1")]));
+        assert!(
+            harness
+                .query_by_label(&catalog.t("git.branch.ahead", &[("count", "2")]))
+                .is_none(),
+            "폴백 기준에 「보낼 커밋」을 보였다"
+        );
+    }
+
     #[test]
     fn kittest_브랜치_카드는_보낼_받을_커밋과_업스트림_상태를_배지로_보인다() {
         use egui::accesskit::Role;
@@ -4042,7 +4423,10 @@ mod tests {
         use egui_kittest::kittest::Queryable;
 
         let catalog = en();
-        let truncated = catalog.t("diff.truncated", &[]);
+        let truncated = catalog.t(
+            "git.list.truncated",
+            &[("count", &MAX_PANEL_FILES.to_string())],
+        );
         let snap = GitPanelSnapshot {
             branch: "main".into(),
             upstream: Some("origin/main".into()),
@@ -4170,8 +4554,8 @@ mod tests {
                 files("b", 0..4),
             ])
         );
-        // a를 접으면 a의 파일 행만 사라진다. 접은 파일도 상한 자리를 차지한다 — 접는다고
-        // 「모두 보기」 뒤의 파일이 앞으로 당겨지지 않는다(목록 보기와 같은 10개 기준).
+        // a를 접으면 a의 파일 행이 사라지고 그 자리를 다음 폴더가 쓴다 — 접은 파일이 상한을
+        // 차지하면 접어도 다른 폴더가 보이지 않았다(2026-10-11 리뷰).
         let collapsed: std::collections::HashSet<String> = ["a".to_owned()].into();
         assert_eq!(
             describe(&list_items(
@@ -4182,7 +4566,7 @@ mod tests {
             )),
             expected(vec![
                 vec!["[a 6 접힘]".into(), "[b 6]".into()],
-                files("b", 0..4),
+                files("b", 0..6),
             ])
         );
         // 「모두 보기」면 전부. 접힘은 그대로.
@@ -4333,6 +4717,176 @@ mod tests {
                 down_left: false,
             },
         )
+    }
+
+    /// 교차 워크스페이스에서 붙인 터미널이 키를 쥐고 있으면 Git 목록은 ↑↓를 건드리지 않는다
+    /// — 셸 history의 ↑가 Git 선택을 옮기고 diff를 요청했다(2026-10-11 리뷰).
+    #[test]
+    fn kittest_다른_터미널이_키를_쥐면_화살표를_건드리지_않는다() {
+        let mut harness = nav_harness(GitPanelSnapshot {
+            branch: "main".into(),
+            changes: vec![file_row("a.rs", 'M', 1, 0), file_row("b.rs", 'M', 1, 0)],
+            ..Default::default()
+        });
+        harness.run();
+        harness.state_mut().actions.clear();
+        harness.state_mut().down_left = false;
+        harness.state_mut().panel.set_keys_blocked(true);
+        press(&mut harness, egui::Key::ArrowDown);
+        assert!(
+            harness.state().actions.is_empty(),
+            "막힌 키로 선택을 옮겼다"
+        );
+        assert!(harness.state().down_left, "막혔으면 키를 소비하지 않는다");
+    }
+
+    /// 고른 파일이 커밋 등으로 목록에서 사라지면 선택을 비운다 — 남으면 오른쪽에 사라진
+    /// 파일의 diff가 남고 다음 변경도 자동으로 열리지 않았다(2026-10-11 리뷰).
+    #[test]
+    fn kittest_고른_파일이_사라지면_선택을_비우고_다음_파일을_연다() {
+        use crate::ui::diff_viewer::DiffMode;
+
+        let snapshot = |paths: &[&str]| GitPanelSnapshot {
+            branch: "main".into(),
+            changes: paths.iter().map(|path| file_row(path, 'M', 1, 0)).collect(),
+            ..Default::default()
+        };
+        let mut harness = nav_harness(snapshot(&["a.rs", "b.rs"]));
+        harness.run();
+        assert_eq!(
+            harness.state().panel.selected,
+            Some(("a.rs".into(), DiffMode::Working))
+        );
+        harness.state_mut().actions.clear();
+
+        harness
+            .state_mut()
+            .panel
+            .set_snapshot(Ok(snapshot(&["b.rs"])));
+        assert!(
+            !harness.state().panel.has_selection(),
+            "사라진 파일이 선택으로 남았다"
+        );
+        harness.run();
+        assert_eq!(
+            harness.state().actions,
+            vec![show("b.rs", DiffMode::Working)]
+        );
+    }
+
+    /// 새 스냅샷을 요청하면(⟳·탭 재활성) 기다리던 자동 선택을 거둔다 — 낡은 스냅샷 기준으로
+    /// 고르면 그 파일 diff 요청이 새 스냅샷과 겹쳤다(2026-10-11 리뷰).
+    #[test]
+    fn 새_스냅샷을_요청하면_기다리던_자동_선택을_거둔다() {
+        let mut panel = GitPanelUi::default();
+        panel.set_snapshot(Ok(GitPanelSnapshot::default()));
+        assert!(panel.auto_select_pending);
+        panel.set_loading();
+        assert!(!panel.auto_select_pending);
+    }
+
+    /// 행 글자(파일명·커밋 제목)를 눌러도 행이 눌려야 한다 — egui Label은 기본이 글자 선택
+    /// 가능이라 click을 감지해 행 위에서 가로챘다(2026-10-11 리뷰: 긴 제목의 커밋 행은 71곳 중
+    /// 6곳만 반응). kittest `click()`은 그 노드 가운데에 실제 포인터를 누른다.
+    #[test]
+    fn kittest_행_글자를_눌러도_행이_눌린다() {
+        use crate::ui::diff_viewer::DiffMode;
+        use egui_kittest::kittest::Queryable;
+
+        let sha = CommitSha::parse("a1b2c3d").unwrap();
+        let mut harness = nav_harness(GitPanelSnapshot {
+            branch: "main".into(),
+            upstream: Some("origin/main".into()),
+            changes: vec![
+                file_row("src/a.rs", 'M', 1, 0),
+                file_row("src/b.rs", 'M', 1, 0),
+            ],
+            commits: vec![GitCommitRow {
+                sha,
+                subject: "글자를 눌러도 펼쳐지는 커밋 제목".into(),
+                time: 0,
+            }],
+            ..Default::default()
+        });
+        harness.run();
+        harness.state_mut().actions.clear();
+
+        harness.get_by_label("b.rs").click();
+        harness.run();
+        assert_eq!(
+            harness.state().actions,
+            vec![show("src/b.rs", DiffMode::Working)],
+            "파일명 글자를 눌렀는데 행이 반응하지 않았다"
+        );
+
+        harness.state_mut().panel.tab = GitPanelTab::Commits;
+        harness.run();
+        harness.state_mut().actions.clear();
+        harness
+            .get_by_label("글자를 눌러도 펼쳐지는 커밋 제목")
+            .click();
+        harness.run();
+        assert_eq!(
+            harness.state().actions,
+            vec![GitPanelAction::LoadCommitFiles { sha }],
+            "커밋 제목 글자를 눌렀는데 펼쳐지지 않았다"
+        );
+    }
+
+    /// 좁은 패널(240pt)에서 긴 파일명은 말줄임되고 증감 숫자는 패널 안에 남는다 — 예전 행은
+    /// 줄바꿈 없는 가로 행이라 폴더가 「+120」을 덮고 「−45」가 잘렸다(2026-10-11 리뷰).
+    #[test]
+    fn kittest_좁은_패널에서도_증감이_패널_안에_남는다() {
+        use egui_kittest::kittest::Queryable;
+
+        let mut panel = GitPanelUi::default();
+        panel.set_snapshot(Ok(GitPanelSnapshot {
+            branch: "main".into(),
+            changes: vec![file_row(
+                "crates/app/src/ui/workspace_session_controller.rs",
+                'M',
+                120,
+                45,
+            )],
+            ..Default::default()
+        }));
+        let width = 240.0;
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(width, 300.0))
+            .build_ui_state(
+                |ui, panel: &mut GitPanelUi| {
+                    panel.render(ui, &en(), "");
+                },
+                panel,
+            );
+        harness.run();
+        // 합계 줄에도 같은 숫자가 있다 — 행 안의 것을 고른다.
+        let row = harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::Button,
+                "crates/app/src/ui/workspace_session_controller.rs",
+            )
+            .rect();
+        let in_row = |label: &str| {
+            harness
+                .query_all_by_label(label)
+                .map(|node| node.rect())
+                .find(|rect| row.contains(rect.center()))
+                .unwrap_or_else(|| panic!("행 안에 {label}가 없다"))
+        };
+        let adds = in_row("+120");
+        let dels = in_row("−45");
+        assert!(
+            dels.right() <= width + 0.5,
+            "「−45」가 패널 밖으로 밀렸다: {dels:?}"
+        );
+        let name = harness
+            .get_by_label("workspace_session_controller.rs")
+            .rect();
+        assert!(
+            name.right() <= adds.left() + 0.5,
+            "파일명이 증감 숫자를 덮었다: {name:?} / {adds:?}"
+        );
     }
 
     fn show(path: &str, mode: crate::ui::diff_viewer::DiffMode) -> GitPanelAction {

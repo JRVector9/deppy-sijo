@@ -340,6 +340,8 @@ pub struct DiffViewerUi {
     /// App이 매 프레임 render 직전에 [`Self::set_clean_summary`]로 넣는다. None이면 예전
     /// 안내 한 줄.
     clean_summary: Option<crate::ui::git_panel::GitCleanSummary>,
+    /// 다른 입력(교차 워크스페이스의 붙인 터미널)이 키를 쥐고 있다 — N/P를 건드리지 않는다.
+    keys_blocked: bool,
 }
 
 impl DiffViewerUi {
@@ -398,6 +400,11 @@ impl DiffViewerUi {
         self.clean_summary = summary;
     }
 
+    /// 다른 입력이 키를 쥐고 있는지 — App이 render 전에 넘긴다.
+    pub fn set_keys_blocked(&mut self, blocked: bool) {
+        self.keys_blocked = blocked;
+    }
+
     /// 변경(hunk) 이동 — 헤더 ↑↓ 버튼과 N/P 키가 같이 쓴다. 양 끝에서 멈추고, 실제로
     /// 옮겼을 때만 다음 프레임 스크롤 대상을 세운다.
     fn step_hunk(&mut self, step: isize) {
@@ -436,6 +443,7 @@ impl DiffViewerUi {
         // ── N/P: 다음/이전 변경(2026-10-11 PR 3) — 헤더 ↑↓와 같은 이동. 텍스트 입력
         // 포커스·IME 조합 중이면 그 입력의 키라 건드리지 않고, 변경이 없으면 소비하지 않는다.
         if !self.hunk_starts.is_empty()
+            && !self.keys_blocked
             && let Some(step) =
                 crate::ui::git_panel::git_key_step(ui.ctx(), egui::Key::P, egui::Key::N)
         {
@@ -449,15 +457,32 @@ impl DiffViewerUi {
                 .rel_path
                 .rsplit_once('/')
                 .unwrap_or(("", self.rel_path.as_str()));
+            // 폴더(흐리게)와 파일명(강하게)을 한 라벨로 — 따로 그리면 사이에 틈이 생겼다.
+            let mut path = egui::text::LayoutJob::default();
+            let style = ui.style();
             if !dir.is_empty() {
-                ui.label(egui::RichText::new(format!("{dir}/")).monospace().weak());
+                egui::RichText::new(format!("{dir}/"))
+                    .monospace()
+                    .weak()
+                    .append_to(
+                        &mut path,
+                        style,
+                        egui::FontSelection::Default,
+                        egui::Align::Center,
+                    );
             }
-            ui.label(egui::RichText::new(name).monospace().strong());
+            egui::RichText::new(name).monospace().strong().append_to(
+                &mut path,
+                style,
+                egui::FontSelection::Default,
+                egui::Align::Center,
+            );
+            ui.label(path);
             let mode_label = match mode {
                 DiffMode::Branch => catalog.t("git.mode.branch", &[]),
                 DiffMode::Working => catalog.t("git.mode.working", &[]),
                 // 어느 커밋의 diff인지 헤더에서 바로 읽히게 sha를 함께 보인다.
-                DiffMode::Commit(sha) => catalog.t("git.mode.commit", &[("sha", sha.as_str())]),
+                DiffMode::Commit(sha) => catalog.t("git.mode.commit", &[("sha", sha.short())]),
             };
             ui.weak(mode_label);
             if self.view.is_none() {
@@ -938,6 +963,25 @@ index 111..222 100644
         );
     }
 
+    /// 붙인 터미널이 키를 쥐고 있으면 N/P로 변경 위치를 옮기지 않는다 — `npm`을 치면 diff가
+    /// 움직였다(2026-10-11 리뷰).
+    #[test]
+    fn kittest_다른_터미널이_키를_쥐면_n_p를_건드리지_않는다() {
+        let mut viewer = DiffViewerUi::default();
+        viewer.open("src/big.rs".to_owned(), DiffMode::Working);
+        viewer.set_view(큰_두_hunk_뷰());
+        viewer.set_keys_blocked(true);
+        let mut harness = harness_for(viewer);
+        harness.run();
+        harness.key_press(egui::Key::N);
+        harness.run();
+        assert_eq!(
+            harness.state().current_hunk,
+            0,
+            "막힌 N으로 변경 위치를 옮겼다"
+        );
+    }
+
     #[test]
     fn kittest_헤더는_파일명과_변경_위치를_보여_준다() {
         use egui_kittest::kittest::Queryable;
@@ -948,8 +992,8 @@ index 111..222 100644
         let mut harness = harness_for(viewer);
         harness.run();
 
-        assert!(harness.query_by_label("big.rs").is_some());
-        assert!(harness.query_by_label("src/deep/").is_some());
+        // 폴더와 파일명은 한 줄 라벨이다 — 따로 그리면 「src/deep/ big.rs」처럼 틈이 생겼다.
+        assert!(harness.query_by_label("src/deep/big.rs").is_some());
         assert!(harness.query_by_label("Change 1/2").is_some());
         harness.get_by_label("↓").click();
         harness.run();
@@ -1372,7 +1416,7 @@ index 111..222 100644
         viewer.open("src/a.rs".to_owned(), DiffMode::Branch);
         let mut harness = harness_for(viewer);
         harness.run();
-        harness.get_by_label("a.rs");
+        harness.get_by_label("src/a.rs");
         assert!(harness.query_by_label(&t("diff.clean")).is_none());
     }
 }

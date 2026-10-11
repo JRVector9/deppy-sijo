@@ -12660,6 +12660,15 @@ fn reset_git_surfaces(
     *git_panel_cwd = None;
 }
 
+/// 「Finder에서 보기」가 열 폴더 — 파일이 든 폴더, 그 폴더가 없으면(커밋 뒤 지워졌거나
+/// 옮겨졌다) 남아 있는 가장 가까운 상위 폴더다. 클릭 한 번에 stat 몇 번이다.
+fn existing_reveal_folder(path: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .skip(1)
+        .find(|dir| dir.is_dir())
+        .map(Path::to_path_buf)
+}
+
 /// 워크스페이스 전환 시 원문 뷰어 IO 요청을 무효화한다(항목 2) — `transcript_generation`을
 /// 올려, 이미 in-flight이거나 `pending_app_host_action` 슬롯에 들어간 이전 워크스페이스의
 /// 원문 읽기가 완료돼도 세대 검사(`generation == self.transcript_generation`)에 걸려
@@ -15409,6 +15418,11 @@ impl App {
                     match completion.result {
                         ui::git_panel::GitPanelIoResult::Snapshot(result) => {
                             view.git_panel_ui.set_snapshot(result);
+                            // 패널이 선택을 비웠으면(다른 repo로 전환, 고른 파일이 사라짐) 그
+                            // 파일의 diff·경로 버튼도 비운다 — diff는 선택한 파일만 연다.
+                            if !view.git_panel_ui.has_selection() {
+                                view.diff_viewer_ui = ui::diff_viewer::DiffViewerUi::default();
+                            }
                         }
                         ui::git_panel::GitPanelIoResult::FileDiff(result) => match result {
                             Ok(diff) => view.diff_viewer_ui.set_view(diff),
@@ -20221,12 +20235,23 @@ impl App {
 
     /// Git 보조 탭 본문 — 좌 목록 / 우 diff 마스터-디테일(스펙 §8-3). 이력 본문
     /// (`render_work_history_tab_body`)과 같은 자리에 같은 규칙으로 그린다.
+    /// `keys_blocked`: 교차 워크스페이스의 붙인 터미널이 이번 프레임 키를 쥐고 있다 — 그
+    /// 터미널의 ↑↓·N/P를 Git 목록·diff가 가로채지 않게 넘긴다(2026-10-11 리뷰).
     fn render_git_tab_body(
         &mut self,
         ui: &mut egui::Ui,
         body: egui::Rect,
         text: &i18n::Catalog,
+        keys_blocked: bool,
     ) -> Option<ui::git_panel::GitPanelAction> {
+        self.session_aux
+            .current
+            .git_panel_ui
+            .set_keys_blocked(keys_blocked);
+        self.session_aux
+            .current
+            .diff_viewer_ui
+            .set_keys_blocked(keys_blocked);
         // 보조 검색 바 — render_work_history_tab_body와 같은 규칙. total/truncated는
         // 우측 diff 뷰어의 `search_summary()`(직전 프레임 캐시)에서 가져온다.
         let (search_total, search_truncated) =
@@ -35511,7 +35536,12 @@ impl eframe::App for App {
                     }
                     if let Some(body) = primary_output.aux_body_rect {
                         if git_tab_active {
-                            git_panel_action = self.render_git_tab_body(&mut primary, body, &text);
+                            git_panel_action = self.render_git_tab_body(
+                                &mut primary,
+                                body,
+                                &text,
+                                matches!(current_owner, FrameTerminalOwner::Attached(_)),
+                            );
                         } else if document_tab_active {
                             self.render_document_tab_body_safely(&mut primary, body, &text);
                         } else {
@@ -35555,7 +35585,7 @@ impl eframe::App for App {
                     }
                     if let Some(body) = primary_output.aux_body_rect {
                         if git_tab_active {
-                            git_panel_action = self.render_git_tab_body(ui, body, &text);
+                            git_panel_action = self.render_git_tab_body(ui, body, &text, false);
                         } else if document_tab_active {
                             self.render_document_tab_body_safely(ui, body, &text);
                         } else {
@@ -35774,10 +35804,9 @@ impl eframe::App for App {
             // 파일이 든 폴더를 연다.
             Some(ui::git_panel::GitPanelAction::RevealInFinder { path }) => {
                 if self.pending_app_host_action.is_none()
-                    && let Some(folder) = path.parent()
+                    && let Some(folder) = existing_reveal_folder(&path)
                 {
-                    self.pending_app_host_action =
-                        Some(AppHostIoAction::OpenPath(folder.to_path_buf()));
+                    self.pending_app_host_action = Some(AppHostIoAction::OpenPath(folder));
                     ui.ctx().request_repaint();
                 }
             }
@@ -46475,6 +46504,67 @@ mod tests {
     /// 올려 이전 워크스페이스의 in-flight 완료가 새 화면에 반영되지 않게 막는다.
     /// 문자열 존재만 보는 소스 스캔이 아니라 `remote_target()` 같은 실제 공개 동작으로
     /// 검증한다 — 리셋 전에는 remote 정보가 있고, 리셋 후에는 없어야 한다.
+    /// 스냅샷 뒤 패널에 선택이 없으면(다른 repo로 전환, 고른 파일이 사라짐) diff 뷰어를 비운다
+    /// (2026-10-11 리뷰). 붙인 터미널이 키를 쥐면 Git 본문에 키를 막으라고 넘긴다. App은
+    /// 테스트에서 만들 수 없어 소스로 고정한다.
+    #[test]
+    fn git_스냅샷이_다른_repo면_diff_뷰어를_비운다() {
+        let source = include_str!("app.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let arm = squeeze_ws(
+            production
+                .split_once("ui::git_panel::GitPanelIoResult::Snapshot(result) => {")
+                .expect("스냅샷 완료 처리가 있어야 한다")
+                .1
+                .split_once("ui::git_panel::GitPanelIoResult::FileDiff(result)")
+                .expect("다음 arm 경계")
+                .0,
+        );
+        assert!(arm.contains("if !view.git_panel_ui.has_selection() {"));
+        assert!(arm.contains("view.diff_viewer_ui = ui::diff_viewer::DiffViewerUi::default();"));
+        let body = squeeze_ws(
+            production
+                .split_once("fn render_git_tab_body(")
+                .unwrap()
+                .1
+                .split_once("let (search_total, search_truncated)")
+                .unwrap()
+                .0,
+        );
+        assert!(body.contains(".git_panel_ui .set_keys_blocked(keys_blocked);"));
+        assert!(body.contains(".diff_viewer_ui .set_keys_blocked(keys_blocked);"));
+        assert!(
+            squeeze_ws(production)
+                .contains("matches!(current_owner, FrameTerminalOwner::Attached(_)),"),
+            "붙인 터미널이 키를 쥐면 Git 본문의 키를 막아야 한다"
+        );
+    }
+
+    /// 커밋 뒤에 지워졌거나 옮겨진 파일은 그 폴더도 없을 수 있다 — 「Finder에서 보기」는 남아
+    /// 있는 가장 가까운 상위 폴더를 연다(2026-10-11 리뷰: 없는 폴더를 열어 아무 일도 없었다).
+    #[test]
+    fn finder_대상은_남아_있는_가장_가까운_상위_폴더다() {
+        let root = std::env::temp_dir().join(format!(
+            "deppy-reveal-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("kept")).unwrap();
+        assert_eq!(
+            existing_reveal_folder(&root.join("kept/file.rs")),
+            Some(root.join("kept"))
+        );
+        assert_eq!(
+            existing_reveal_folder(&root.join("kept/gone/deeper/file.rs")),
+            Some(root.join("kept")),
+            "없는 폴더 대신 남아 있는 상위 폴더를 열어야 한다"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn reset_git_surfaces는_스냅샷_diff_세대_cwd를_모두_비운다() {
         let mut git_panel_ui = ui::git_panel::GitPanelUi::default();
@@ -46493,6 +46583,7 @@ mod tests {
             worktrees_truncated: false,
             commits: Vec::new(),
             commits_truncated: false,
+            upstream_fallback: false,
         }));
         assert!(
             git_panel_ui.remote_target().is_some(),
@@ -46913,8 +47004,8 @@ mod tests {
             );
         }
         assert!(
-            git_reveal.contains("path.parent()"),
-            "파일을 OS로 열지 않고 그 파일이 든 폴더를 연다"
+            git_reveal.contains("existing_reveal_folder(&path)"),
+            "파일을 OS로 열지 않고 그 파일이 든(없으면 남은 상위) 폴더를 연다"
         );
 
         // diff 헤더 버튼: 파일을 열 때 대상을 넘기고, render 직후 intent를 꺼낸다.

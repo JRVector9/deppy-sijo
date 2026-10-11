@@ -4,11 +4,11 @@
 
 ## 완료 기준
 
-- [ ] PR1: 환경파일·수동 API 통합 목록, 원본 표시, 명시적 수정, 숨김 값 더블클릭 및 버튼 복사. 실제 clipboard intent, 프로젝트/revision fencing, 빈 수정값 유지, 실패 안내.
-- [ ] PR2: 개발/운영 scope, dotenv와 PEM 파일 원본/앱 보관 원본 구분, 활성 화면과 무관한 bounded 감시·재시작/잠자기 복귀 재검사, last-good 유지·누락·충돌 표시, metadata 원장.
-- [ ] PR3: 저장 가능한 빌드 명령, CLI wrapper/앱 연결 실행, 최신 원본 preflight, 실행 snapshot 고정, 사용 이름·버전·시각 기록. 프로젝트 프로그램/agent 인증 scope 보존.
-- [ ] PR4: GitHub 인증 credential과 정확한 Repository/Environment/Organization 목적지 연결, 암호화 전송, 자동 전송 opt-in, durable 재시도 큐·remote 최신 revision fencing, 외부 변경 시 값 미확인/자동 전송 보류.
-- [ ] PR5: storage/worker/transport/UI end-to-end 회귀·보안·격리·실패/순서/재시작 테스트, 시안의 표/상세/모달/버튼 규격 대조, 코드 리뷰 결과 수정, 문서/일지/커밋.
+- [x] PR1: 환경파일·수동 API 통합 목록, 원본 표시, 명시적 수정, 숨김 값 더블클릭 및 버튼 복사. 실제 clipboard intent, 프로젝트/revision fencing, 빈 수정값 유지, 실패 안내.
+- [x] PR2: 개발/운영 scope, dotenv와 PEM 파일 원본/앱 보관 원본 구분, 활성 화면과 무관한 bounded 감시·재시작/잠자기 복귀 재검사, last-good 유지·누락·충돌 표시, metadata 원장.
+- [x] PR3: 저장 가능한 빌드 명령, CLI wrapper/앱 연결 실행, 최신 원본 preflight, 실행 snapshot 고정, 사용 이름·버전·시각 기록. 프로젝트 프로그램/agent 인증 scope 보존.
+- [x] PR4: GitHub 인증 credential과 정확한 Repository/Environment/Organization 목적지 연결, 암호화 전송, 자동 전송 opt-in, durable 재시도 큐·remote 최신 revision fencing, 외부 변경 시 값 미확인/자동 전송 보류.
+- [x] PR5: storage/worker/transport/UI end-to-end 회귀·보안·격리·실패/순서/재시작 테스트, 시안의 표/상세/모달/버튼 규격 대조, 코드 리뷰 결과 수정, 문서/일지/커밋.
 
 ## 파일 소유권
 
@@ -40,3 +40,7 @@ UI: 승인 HTML `docs/mockups/project-keys-proposal-2026-10-12.html`에 맞춘 �
 ## 재점검 표
 
 각 완료 기준별 구현 위치/실행 test/결과/누락 항목을 `docs/qa/2026-10-12-project-key-management-acceptance.md`에 기록한다. 테스트가 없다면 PASS로 표시하지 않는다. 덜 구현된 항목은 다시 구현/검증한 뒤 종료한다.
+
+## 최종 검증
+
+2026-10-12: [수용표](../../qa/2026-10-12-project-key-management-acceptance.md)33/33행 PASS. 전체 nextest5366PASS/63skipped, normal check·strict lint·boundary·deps·fmt PASS, isolated 실제 UI PNG export1PASS. 개발/운영·원본·빌드·GitHub·기존 설정 호환을 재검토하고 발견된 결함을 회귀 검증했다. 실행 앱·사용자 실키는 변경하지 않았으며 릴리스 build/배포/재시작은 포함하지 않는다.

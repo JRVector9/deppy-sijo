@@ -1480,3 +1480,15 @@ history.session = Session {id}
 history.state.unknown = Current state unverified
 history.scope.context = Current session: {session}
 history.detail.start_unknown = Start time not recorded · date and order use the last saved time
+
+history.view.threads = Group by thread
+history.view.timeline = Timeline
+history.filters.more = More filters
+history.project.all = Project: all
+history.project.selected = Project: {project}
+history.thread.count = Threads {threads} · Tasks {turns}
+history.thread.continuation = Continue
+history.detail.this_instruction = This instruction
+history.detail.context = Previous context · same session
+history.detail.context_empty = No earlier saved instructions
+history.project.unknown = Project not recorded

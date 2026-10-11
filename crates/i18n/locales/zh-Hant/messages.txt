@@ -1480,3 +1480,15 @@ history.session = 工作階段 {id}
 history.state.unknown = 目前狀態未確認
 history.scope.context = 目前工作階段：{session}
 history.detail.start_unknown = 未記錄開始時間 · 日期與排序採用最後儲存時間
+
+history.view.threads = 依執行緒分組
+history.view.timeline = 時間順序
+history.filters.more = 更多篩選
+history.project.all = 專案：全部
+history.project.selected = 專案：{project}
+history.thread.count = 執行緒 {threads} · 工作 {turns}
+history.thread.continuation = 繼續
+history.detail.this_instruction = 本次指令
+history.detail.context = 先前脈絡 · 同一工作階段
+history.detail.context_empty = 沒有先前儲存的指令
+history.project.unknown = 未記錄專案

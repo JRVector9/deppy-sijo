@@ -1480,3 +1480,15 @@ history.session = セッション {id}
 history.state.unknown = 現在の状態は未確認
 history.scope.context = 現在表示中のセッション：{session}
 history.detail.start_unknown = 開始時刻は未記録 · 日付と並び順には最終保存時刻を使用
+
+history.view.threads = スレッド別
+history.view.timeline = 時系列
+history.filters.more = 追加フィルター
+history.project.all = プロジェクト: すべて
+history.project.selected = プロジェクト: {project}
+history.thread.count = スレッド {threads} · 作業 {turns}
+history.thread.continuation = 続き
+history.detail.this_instruction = 今回の指示
+history.detail.context = 前の流れ · 同じセッション
+history.detail.context_empty = 以前の保存済み指示はありません
+history.project.unknown = プロジェクト未記録

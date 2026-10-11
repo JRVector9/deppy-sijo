@@ -1655,6 +1655,17 @@ fn copy_button(
     label_key: &str,
     text: &str,
 ) {
+    copy_button_control(ui, catalog, id, label_key, text, None);
+}
+
+fn copy_button_control(
+    ui: &mut egui::Ui,
+    catalog: &i18n::Catalog,
+    id: egui::Id,
+    label_key: &str,
+    text: &str,
+    minimum_height: Option<f32>,
+) {
     let now = ui.input(|input| input.time);
     let copied_at = ui.ctx().data(|data| data.get_temp::<f64>(id));
     let feedback_remaining = copied_at
@@ -1666,7 +1677,15 @@ fn copy_button(
     } else {
         catalog.t(label_key, &[])
     };
-    if ui.small_button(label).clicked() {
+    let response = if let Some(height) = minimum_height {
+        ui.add(
+            egui::Button::new(egui::RichText::new(label).size(12.0))
+                .min_size(egui::vec2(0.0, height)),
+        )
+    } else {
+        ui.small_button(label)
+    };
+    if response.clicked() {
         ui.ctx().copy_text(bounded_clipboard_text(text));
         ui.ctx().data_mut(|data| data.insert_temp(id, now));
         ui.ctx()

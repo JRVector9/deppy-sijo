@@ -1480,3 +1480,15 @@ history.session = 세션 {id}
 history.state.unknown = 현재 상태 미확인
 history.scope.context = 지금 보고 있는 세션: {session}
 history.detail.start_unknown = 시작 시각 미기록 · 날짜와 정렬에 마지막 저장 시각 사용
+
+history.view.threads = 스레드로 묶기
+history.view.timeline = 시간순
+history.filters.more = 추가 필터
+history.project.all = 프로젝트: 전체
+history.project.selected = 프로젝트: {project}
+history.thread.count = 스레드 {threads} · 작업 {turns}
+history.thread.continuation = 이어서
+history.detail.this_instruction = 이번 지시
+history.detail.context = 앞선 흐름 · 같은 세션
+history.detail.context_empty = 앞선 저장 지시가 없습니다
+history.project.unknown = 프로젝트 미기록

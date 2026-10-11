@@ -1,6 +1,12 @@
 #[path = "workspace_env.rs"]
 mod workspace_env;
 pub use workspace_env::CredentialEnvBinding;
+#[path = "project_keys.rs"]
+mod project_keys;
+pub use project_keys::{
+    ProjectKeyFileJournal, ProjectKeyFileJournalPhase, ProjectKeyValueCommit,
+    ProjectKeyWorkspaceIdentity,
+};
 #[path = "agent_attention.rs"]
 mod agent_attention;
 #[path = "workspace_identity.rs"]
@@ -910,6 +916,8 @@ CREATE INDEX idx_relay_devices_recency
      ALTER TABLE agent_hook_sessions ADD COLUMN task_prompt_execution_stamp TEXT
        CHECK(task_prompt_execution_stamp IS NULL OR (typeof(task_prompt_execution_stamp)='text'
          AND length(CAST(task_prompt_execution_stamp AS BLOB)) <= 4096));",
+    // Append-only: project/environment key metadata and durable value-free GitHub delivery.
+    project_keys::MIGRATION,
 ];
 
 /// 옵션2: 저장된 에이전트 세션 한 행 — 재시작 복원 시 native resume에 쓴다.
@@ -5956,6 +5964,14 @@ impl Db {
         {
             return Ok(false);
         }
+        let journal_live: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM project_key_file_journals WHERE protected_slot=?1)",
+            [&candidate.physical_slot],
+            |r| r.get(0),
+        )?;
+        if journal_live {
+            return Ok(false);
+        }
         let references: i64 = tx.query_row(
             "SELECT COUNT(*) FROM credentials WHERE keyring_username = ?1",
             [&candidate.physical_slot],
@@ -5992,6 +6008,14 @@ impl Db {
     ) -> anyhow::Result<bool> {
         validate_owned_physical_secret_slot(logical_id, physical_slot)?;
         let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let journal_live: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM project_key_file_journals WHERE protected_slot=?1)",
+            [physical_slot],
+            |r| r.get(0),
+        )?;
+        if journal_live {
+            return Ok(false);
+        }
         let Some((stored_logical_id, state)) =
             Self::physical_secret_slot_ledger_state(&tx, physical_slot)?
         else {
@@ -6735,6 +6759,7 @@ impl Db {
                 "DELETE FROM credentials WHERE id = ?1
                    AND NOT EXISTS (SELECT 1 FROM env_vars WHERE credential_id = ?1)
                    AND NOT EXISTS (SELECT 1 FROM workspace_credential_env WHERE credential_id = ?1)
+                   AND NOT EXISTS (SELECT 1 FROM project_keys WHERE credential_id = ?1 OR auth_credential_id = ?1 OR source_baseline_credential_id = ?1)
                    AND NOT EXISTS (
                        SELECT 1
                        FROM mcp_servers, json_each(COALESCE(mcp_servers.env_credentials_json, '{}'))
@@ -6766,6 +6791,7 @@ impl Db {
                 "DELETE FROM credentials WHERE id = ?1 AND keyring_username = ?2
                    AND NOT EXISTS (SELECT 1 FROM env_vars WHERE credential_id = ?1)
                    AND NOT EXISTS (SELECT 1 FROM workspace_credential_env WHERE credential_id = ?1)
+                   AND NOT EXISTS (SELECT 1 FROM project_keys WHERE credential_id = ?1 OR auth_credential_id = ?1 OR source_baseline_credential_id = ?1)
                    AND NOT EXISTS (
                        SELECT 1
                        FROM mcp_servers, json_each(COALESCE(mcp_servers.env_credentials_json, '{}'))
@@ -6870,6 +6896,8 @@ impl Db {
                 "SELECT 1 FROM env_vars WHERE credential_id = ?1
                  UNION ALL
                  SELECT 1 FROM workspace_credential_env WHERE credential_id = ?1
+                 UNION ALL
+                 SELECT 1 FROM project_keys WHERE credential_id = ?1 OR auth_credential_id = ?1 OR source_baseline_credential_id = ?1
                  UNION ALL
                  SELECT 1
                  FROM mcp_servers, json_each(COALESCE(mcp_servers.env_credentials_json, '{}'))
@@ -11796,13 +11824,24 @@ impl Db {
         value: &EnvValue,
     ) -> anyhow::Result<()> {
         Self::validate_env_var_for_persistence(key, value)?;
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        Self::upsert_env_var_in_transaction(&tx, profile_id, key, value)?;
+        tx.commit()
+            .context("env var upsert transaction commit failed")
+    }
+    /// The caller has already validated the value; keep admission and publication in its transaction.
+    fn upsert_env_var_in_transaction(
+        conn: &Connection,
+        profile_id: &str,
+        key: &str,
+        value: &EnvValue,
+    ) -> anyhow::Result<()> {
         let (kind, plain_value, credential_id) = match value {
             EnvValue::Plain(v) => ("plain", Some(v.as_str()), None),
             EnvValue::Secret { credential_id } => ("secret", None, Some(credential_id.as_str())),
         };
-        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        settings_env_var_write_admission(&tx, profile_id, key, kind, plain_value, credential_id)?;
-        tx
+        settings_env_var_write_admission(conn, profile_id, key, kind, plain_value, credential_id)?;
+        conn
             .execute(
                 "INSERT INTO env_vars (id, profile_id, key, kind, plain_value, credential_id, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6,
@@ -11822,8 +11861,7 @@ impl Db {
                 ),
             )
             .with_context(|| format!("env var 저장 실패: {key}"))?;
-        tx.commit()
-            .context("env var upsert transaction commit failed")
+        Ok(())
     }
 
     pub fn list_env_vars(&self, profile_id: &str) -> anyhow::Result<Vec<EnvVarRow>> {

@@ -2,6 +2,10 @@
 //! SQLite metadata·rotation·encrypted raw log(기본 비활성 — 7장)는 후속 PR.
 
 mod db;
+pub use db::{
+    ProjectKeyFileJournal, ProjectKeyFileJournalPhase, ProjectKeyValueCommit,
+    ProjectKeyWorkspaceIdentity,
+};
 mod task_prompt;
 pub use db::{
     AGENT_STATE_BINDING_ROWS_MAX, AGENT_STATE_EXACT_MUTATIONS_MAX, AGENT_STATE_JOB_BYTES_MAX,

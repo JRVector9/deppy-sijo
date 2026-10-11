@@ -4,6 +4,7 @@ pub mod credential_env;
 pub mod env_sources;
 pub mod fs;
 pub mod process_identity;
+pub mod project_keys;
 pub mod time;
 
 /// runtime 내부 세션 식별자. 영속 id(sessions 테이블)와의 매핑은 PR-08.

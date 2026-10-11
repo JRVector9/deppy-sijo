@@ -8,7 +8,7 @@ use std::time::Duration;
 /// 섹션당 수집 상한 — diff_panel의 MAX_DIFF_FILES와 같은 값(512). 표시 기본값은
 /// SECTION_COLLAPSED_ROWS이고 「모두 보기」로 펼친다.
 pub const MAX_PANEL_FILES: usize = 512;
-/// 접힘 상태에서 섹션당 보여주는 행 수 — orca 스크린샷 기준 한 화면 분량.
+/// 「모두 보기」 전 탭당 보여주는 파일 행 수 — orca 스크린샷 기준 한 화면 분량.
 pub const SECTION_COLLAPSED_ROWS: usize = 10;
 /// 워크트리 목록 상한 — 목록은 사람이 훑는 것이라 32면 충분하고, 초과분은 잘림 표시만 한다.
 pub const MAX_WORKTREE_ROWS: usize = 32;
@@ -301,7 +301,7 @@ fn worktree_path_is_spawnable(path: &str) -> bool {
     !path.is_empty() && path.len() <= WORKTREE_PATH_MAX_BYTES && !path.as_bytes().contains(&0)
 }
 
-/// 워크트리가 메인 하나뿐이면 섹션을 그리지 않는다 — 정보가 0이다.
+/// 워크트리가 메인 하나뿐이면 워크트리 탭을 그리지 않는다 — 정보가 0이다.
 fn worktree_section_visible(snapshot: &GitPanelSnapshot) -> bool {
     snapshot.worktrees.len() > 1
 }
@@ -337,8 +337,8 @@ fn short_dir(dir: &str) -> std::borrow::Cow<'_, str> {
 /// 좌측 목록 필터 — `rel_path`가 `filter`에 대소문자 무시로 걸리는 행만 남긴다
 /// (2026-08-18 스펙 §좌측 목록 필터). 빈 `filter`는 필터 없음과 같아 전부 통과시킨다
 /// — `aux_search::contains_match`는 빈 needle이면 항상 거짓을 돌려주므로 이 분기가
-/// 없으면 필터가 없을 때도 전부 걸러진다. `changes`/`committed` 섹션에만 쓰고
-/// 워크트리 섹션에는 쓰지 않는다(경로 목록이라 검색 대상이 아니다).
+/// 없으면 필터가 없을 때도 전부 걸러진다. `changes`/`committed` 행에만 쓰고
+/// 워크트리 탭에는 쓰지 않는다(경로 목록이라 검색 대상이 아니다).
 fn filter_file_rows<'a>(rows: &'a [GitFileRow], filter: &str) -> Vec<&'a GitFileRow> {
     rows.iter()
         .filter(|row| {
@@ -827,14 +827,23 @@ pub struct GitPanelUi {
     loading: bool,
     changes_show_all: bool,
     committed_show_all: bool,
-    changes_collapsed: bool,
-    committed_collapsed: bool,
-    worktrees_collapsed: bool,
     /// 오른쪽 diff가 보여 주는 파일 — 이 패널이 `ShowFileDiff`를 낼 때 기록한다.
     /// diff 뷰어를 여는 경로가 그 액션 하나뿐이고 두 UI는 `reset_git_surfaces`에서
     /// 함께 초기화되므로 따로 동기화할 필요가 없다. 같은 경로도 모드가 다르면 다른 행이다.
     selected: Option<(String, crate::ui::diff_viewer::DiffMode)>,
     commit_list: CommitListState,
+    /// 지금 보이는 목록 탭. 스냅샷을 새로 받아도 유지하고, `reset_git_surfaces`에서
+    /// 패널과 함께 변경 탭으로 돌아간다.
+    tab: GitPanelTab,
+}
+
+/// 목록 탭(2026-10-11 PR 2) — 예전 접는 섹션 세 개를 대신한다.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+enum GitPanelTab {
+    #[default]
+    Changes,
+    Commits,
+    Worktrees,
 }
 
 impl GitPanelUi {
@@ -897,18 +906,15 @@ impl GitPanelUi {
     }
 
     /// `filter`: 보조 검색 좌측 목록 필터(2026-08-18 스펙) — 빈 문자열이면 필터 없음.
-    /// `changes`/`committed` 행만 `rel_path` 기준으로 거르고, 워크트리 섹션은 그대로
-    /// 둔다(경로 목록이라 검색 대상이 아니고, 통째로 사라지면 혼란스럽다).
+    /// 변경·커밋 탭의 파일 행만 `rel_path` 기준으로 거르고, 커밋 목록과 워크트리 탭은
+    /// 그대로 둔다(경로 목록이라 검색 대상이 아니고, 통째로 사라지면 혼란스럽다).
     pub fn render(
         &mut self,
         ui: &mut egui::Ui,
         catalog: &i18n::Catalog,
         filter: &str,
     ) -> Option<GitPanelAction> {
-        // `section` 클로저 매개변수용 — 전체 경로로 쓰면 rustfmt가 클로저 전체를 다시
-        // 들여써 무관한 행까지 diff에 섞인다.
-        use crate::ui::diff_viewer::DiffMode;
-        // 필드별로 분해해 빌린다 — snapshot은 &만 필요하고 changes_collapsed 등은
+        // 필드별로 분해해 빌린다 — snapshot은 &만 필요하고 show_all·tab 등은
         // 동시에 &mut가 필요해, self를 통째로 들고 있으면(예전엔 self.snapshot을
         // clone()해 이 충돌을 피했다) 프레임마다 최대 ~1056개 String을 복제했다
         // (중요 리뷰 지적 5번). 필드마다 서로 다른 경로라 disjoint borrow로 풀린다.
@@ -917,11 +923,9 @@ impl GitPanelUi {
             loading,
             changes_show_all,
             committed_show_all,
-            changes_collapsed,
-            committed_collapsed,
-            worktrees_collapsed,
             selected,
             commit_list,
+            tab,
         } = self;
         let snap = match snapshot.as_ref() {
             None => {
@@ -944,156 +948,111 @@ impl GitPanelUi {
         };
 
         let tokens = crate::ui::designall::tokens(ui.visuals());
-        let mut action = None;
-        let filter_active = !filter.is_empty();
+        let mut action = branch_card(ui, snap, tokens, catalog);
+        ui.add_space(6.0);
+
         let filtered_changes = filter_file_rows(&snap.changes, filter);
         let filtered_committed = filter_file_rows(&snap.committed, filter);
 
-        // ── 헤더: 브랜치 / → upstream ↑a ↓b ↗ ──────────────────────────
-        ui.strong(&snap.branch);
-        ui.horizontal(|ui| {
-            match snap.upstream.as_deref() {
-                Some(upstream) => {
-                    ui.weak("→");
-                    ui.monospace(upstream);
-                    if snap.ahead > 0 {
-                        ui.colored_label(stat_color(tokens, true), format!("↑{}", snap.ahead));
-                    }
-                    if snap.behind > 0 {
-                        ui.colored_label(stat_color(tokens, false), format!("↓{}", snap.behind));
-                    }
-                    // remote가 GitHub일 때만 보인다(스펙 §4 숨김 조건). 계획서 원안은
-                    // upstream만으로 항상 그렸는데, collect_snapshot이 이미
-                    // remote_https_base로 이 조건을 계산해 두므로 그걸 쓴다
-                    // (2026-08-15 조정 — 타입 계약은 그대로, 렌더 조건만 보강).
-                    if snap.remote_https_base.is_some()
-                        && ui
-                            .small_button("↗")
-                            .on_hover_text(catalog.t("git.open_remote", &[]))
-                            .clicked()
-                    {
-                        action = Some(GitPanelAction::OpenRemoteBranch);
-                    }
-                }
-                None => {
-                    ui.weak(catalog.t("git.upstream_none", &[]));
-                }
-            }
-            if ui
-                .small_button("⟳")
-                .on_hover_text(catalog.t("diff.refresh", &[]))
-                .clicked()
-            {
-                action = Some(GitPanelAction::Refresh);
-            }
-        });
-        ui.separator();
+        // ── 탭: 변경 / 커밋 / 워크트리 ──────────────────────────────────
+        // 워크트리 탭은 예전 섹션과 같은 조건으로 숨긴다. 새로고침으로 숨은 탭에 머물게
+        // 되면(워크트리가 하나만 남음) 빈 화면 대신 변경 탭으로 돌린다.
+        let worktrees_visible = worktree_section_visible(snap);
+        if *tab == GitPanelTab::Worktrees && !worktrees_visible {
+            *tab = GitPanelTab::Changes;
+        }
+        // 변경 개수는 거른 뒤 기준(예전 섹션 머리와 같다). 커밋·워크트리는 필터 대상이 아니다.
+        let mut tabs = vec![
+            (
+                GitPanelTab::Changes,
+                catalog.t("git.tab.changes", &[]),
+                tab_count(filtered_changes.len(), snap.changes_truncated),
+            ),
+            (
+                GitPanelTab::Commits,
+                catalog.t("git.tab.commits", &[]),
+                tab_count(snap.commits.len(), snap.commits_truncated),
+            ),
+        ];
+        if worktrees_visible {
+            tabs.push((
+                GitPanelTab::Worktrees,
+                catalog.t("git.section.worktrees", &[]),
+                tab_count(snap.worktrees.len(), snap.worktrees_truncated),
+            ));
+        }
+        tab_bar(ui, tab, &tabs, tokens);
+        ui.add_space(4.0);
 
-        // ── 섹션 2개 ─────────────────────────────────────────────────
-        let section = |ui: &mut egui::Ui,
-                       title_key: &str,
-                       rows: &[&GitFileRow],
-                       collapsed: &mut bool,
-                       show_all: &mut bool,
-                       mode: crate::ui::diff_viewer::DiffMode,
-                       action: &mut Option<GitPanelAction>,
-                       selected: &mut Option<(String, DiffMode)>| {
-            ui.horizontal(|ui| {
-                let arrow = if *collapsed { "›" } else { "∨" };
-                if ui
-                    .selectable_label(
-                        false,
-                        format!("{arrow} {} {}", catalog.t(title_key, &[]), rows.len()),
-                    )
-                    .clicked()
-                {
-                    *collapsed = !*collapsed;
-                }
-                if !*collapsed && rows.len() > SECTION_COLLAPSED_ROWS {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let label = catalog.t("git.show_all", &[]);
-                        if ui.selectable_label(*show_all, label).clicked() {
-                            *show_all = !*show_all;
-                        }
-                    });
-                }
-            });
-            if *collapsed {
-                return;
+        // ── 합계 줄: 지금 탭의 파일 행(거른 뒤) ─────────────────────────
+        match *tab {
+            GitPanelTab::Changes => {
+                totals_line(ui, &filtered_changes, changes_show_all, tokens, catalog);
             }
-            let visible = if *show_all {
-                rows.len()
-            } else {
-                rows.len().min(SECTION_COLLAPSED_ROWS)
-            };
-            for row in &rows[..visible] {
-                let id_salt = ("git-panel-row", title_key, row.rel_path.as_str());
-                if let Some(clicked) = file_row(
-                    ui,
-                    id_salt,
-                    &snap.repo_root,
-                    row,
-                    mode,
-                    selected,
-                    tokens,
-                    catalog,
-                ) {
-                    *action = Some(clicked);
-                }
+            GitPanelTab::Commits => {
+                totals_line(ui, &filtered_committed, committed_show_all, tokens, catalog);
             }
-        };
+            GitPanelTab::Worktrees => {}
+        }
 
+        let current = *tab;
         egui::ScrollArea::vertical()
+            .id_salt(("git-panel-tab-scroll", current))
             .auto_shrink([false, false])
-            .show(ui, |ui| {
-                if filter_active {
-                    // 필터가 걸려 있는데 두 섹션 모두 0행이면 안내 한 줄(2026-08-18 스펙
-                    // §좌측 목록 필터) — "왜 안 보이지"가 되지 않게.
-                    if filtered_changes.is_empty() && filtered_committed.is_empty() {
-                        ui.weak(catalog.t("search.no_match", &[]));
-                        // 워크트리 섹션에는 필터와 무관하게 정보가 있을 수 있다 — 여기서
-                        // 돌아가면 그 섹션까지 감춘다(diff.clean과 같은 처리, 스펙 §8-4).
-                        if !worktree_section_visible(snap) {
-                            return;
+            .show(ui, |ui| match current {
+                GitPanelTab::Changes => {
+                    if snap.changes.is_empty() {
+                        if clean_card(ui, snap.ahead, tokens, catalog) {
+                            *tab = GitPanelTab::Commits;
                         }
-                    }
-                } else if snap.changes.is_empty() && snap.committed.is_empty() {
-                    ui.weak(catalog.t("diff.clean", &[]));
-                    // 워크트리 섹션에는 clean과 무관하게 정보가 있을 수 있다 — 여기서
-                    // 돌아가면 그 섹션까지 감춘다(스펙 §8-4).
-                    if !worktree_section_visible(snap) {
                         return;
                     }
+                    if snap.changes_truncated {
+                        truncation_banner(ui, tokens, catalog);
+                    }
+                    render_file_rows(
+                        ui,
+                        catalog,
+                        &snap.repo_root,
+                        visible_rows(&filtered_changes, *changes_show_all),
+                        "changes",
+                        crate::ui::diff_viewer::DiffMode::Working,
+                        selected,
+                        &mut action,
+                    );
                 }
-                section(
-                    ui,
-                    "git.section.changes",
-                    &filtered_changes,
-                    changes_collapsed,
-                    changes_show_all,
-                    crate::ui::diff_viewer::DiffMode::Working,
-                    &mut action,
-                    selected,
-                );
-                if snap.changes_truncated {
-                    ui.weak(catalog.t("diff.truncated", &[]));
-                }
-                ui.add_space(6.0);
-                section(
-                    ui,
-                    "git.section.committed",
-                    &filtered_committed,
-                    committed_collapsed,
-                    committed_show_all,
-                    crate::ui::diff_viewer::DiffMode::Branch,
-                    &mut action,
-                    selected,
-                );
-                if snap.committed_truncated {
-                    ui.weak(catalog.t("diff.truncated", &[]));
-                }
-                // 브랜치 커밋 목록 — 파일 행 아래, 섹션을 접으면 함께 숨는다(2026-10-11 PR 4).
-                if !*committed_collapsed {
+                GitPanelTab::Commits => {
+                    let Some(upstream) = snap.upstream.as_deref() else {
+                        // 비교할 기준이 없으면 브랜치 커밋을 셀 수 없다(collect_snapshot).
+                        ui.weak(catalog.t("git.branch.no_upstream_hint", &[]));
+                        return;
+                    };
+                    // 소제목 — 이 탭의 파일이 「브랜치 커밋」(Branch 모드 diff)이고 기준이 무엇인지.
+                    ui.horizontal_wrapped(|ui| {
+                        ui.weak(catalog.t("git.section.committed", &[]));
+                        ui.weak("·");
+                        ui.weak(catalog.t("git.commits.since", &[("base", upstream)]));
+                    });
+                    if snap.committed.is_empty() && snap.commits.is_empty() {
+                        ui.weak(catalog.t("git.commits.empty", &[]));
+                        return;
+                    }
+                    if snap.committed_truncated {
+                        truncation_banner(ui, tokens, catalog);
+                    }
+                    if !snap.committed.is_empty() {
+                        render_file_rows(
+                            ui,
+                            catalog,
+                            &snap.repo_root,
+                            visible_rows(&filtered_committed, *committed_show_all),
+                            "committed",
+                            crate::ui::diff_viewer::DiffMode::Branch,
+                            selected,
+                            &mut action,
+                        );
+                    }
+                    // 브랜치 커밋 목록 — 파일 행 아래(2026-10-11 PR 4).
                     render_commit_list(
                         ui,
                         catalog,
@@ -1104,82 +1063,423 @@ impl GitPanelUi {
                         &mut action,
                     );
                 }
-
-                // ── 섹션 3: 워크트리 ─────────────────────────────────────────
-                if worktree_section_visible(snap) {
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        let arrow = if *worktrees_collapsed { "›" } else { "∨" };
-                        if ui
-                            .selectable_label(
-                                false,
-                                format!(
-                                    "{arrow} {} {}",
-                                    catalog.t("git.section.worktrees", &[]),
-                                    snap.worktrees.len()
-                                ),
-                            )
-                            .clicked()
-                        {
-                            *worktrees_collapsed = !*worktrees_collapsed;
-                        }
-                    });
-                    if !*worktrees_collapsed {
-                        for row in &snap.worktrees {
-                            // 파일 행과 같은 패턴 — 자식 Label이 클릭을 삼키지 않도록
-                            // 스코프 자체를 하나의 논리 위젯으로 만든다(위 file row 주석 참고).
-                            let scope = ui.scope_builder(
-                                egui::UiBuilder::new()
-                                    .id_salt(("git-panel-worktree", row.path.as_str()))
-                                    .sense(egui::Sense::click()),
-                                |ui| {
-                                    ui.set_width(ui.available_width());
-                                    ui.horizontal(|ui| {
-                                        ui.label(&row.name);
-                                        match row.branch.as_deref() {
-                                            Some(branch) => ui.weak(branch),
-                                            None => {
-                                                ui.weak(catalog.t("git.worktree.detached", &[]))
-                                            }
-                                        };
-                                        if row.current {
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    ui.weak(catalog.t("git.worktree.current", &[]))
-                                                },
-                                            );
-                                        }
-                                    });
-                                },
-                            );
-                            let response = scope
-                                .response
-                                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                .on_hover_text(catalog.t("git.worktree.open_hint", &[]));
-                            // 접근성 이름을 경로로 명시한다 — kittest가 Role::Button + 이
-                            // 라벨로 행 전체를 정확히 겨냥할 수 있다(위 file row 주석과 동일 이유).
-                            response.widget_info(|| {
-                                egui::WidgetInfo::labeled(
-                                    egui::WidgetType::Button,
-                                    ui.is_enabled(),
-                                    row.path.as_str(),
-                                )
-                            });
-                            if response.clicked() && worktree_path_is_spawnable(&row.path) {
-                                action = Some(GitPanelAction::OpenWorktreeShell {
-                                    path: row.path.clone(),
+                GitPanelTab::Worktrees => {
+                    for row in &snap.worktrees {
+                        // 파일 행과 같은 패턴 — 자식 Label이 클릭을 삼키지 않도록
+                        // 스코프 자체를 하나의 논리 위젯으로 만든다(위 file row 주석 참고).
+                        let scope = ui.scope_builder(
+                            egui::UiBuilder::new()
+                                .id_salt(("git-panel-worktree", row.path.as_str()))
+                                .sense(egui::Sense::click()),
+                            |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.horizontal(|ui| {
+                                    ui.label(&row.name);
+                                    match row.branch.as_deref() {
+                                        Some(branch) => ui.weak(branch),
+                                        None => ui.weak(catalog.t("git.worktree.detached", &[])),
+                                    };
+                                    if row.current {
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| ui.weak(catalog.t("git.worktree.current", &[])),
+                                        );
+                                    }
                                 });
-                            }
+                            },
+                        );
+                        let response = scope
+                            .response
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .on_hover_text(catalog.t("git.worktree.open_hint", &[]));
+                        // 접근성 이름을 경로로 명시한다 — kittest가 Role::Button + 이
+                        // 라벨로 행 전체를 정확히 겨냥할 수 있다(위 file row 주석과 동일 이유).
+                        response.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::Button,
+                                ui.is_enabled(),
+                                row.path.as_str(),
+                            )
+                        });
+                        if response.clicked() && worktree_path_is_spawnable(&row.path) {
+                            action = Some(GitPanelAction::OpenWorktreeShell {
+                                path: row.path.clone(),
+                            });
                         }
-                        if snap.worktrees_truncated {
-                            ui.weak(catalog.t("git.worktrees_truncated", &[]));
-                        }
+                    }
+                    if snap.worktrees_truncated {
+                        ui.weak(catalog.t("git.worktrees_truncated", &[]));
                     }
                 }
             });
         action
     }
+}
+
+/// 브랜치 카드 — 1줄: 브랜치명(모노, 넘치면 말줄임) + ↗·⟳, 2줄: `→ upstream`과 보낼/받을
+/// 커밋 배지(2026-10-11 시안). ↑3·↓1 색 숫자만으로는 의미가 읽히지 않았고, 업스트림
+/// 없음은 회색 한 줄이라 지나치기 쉬웠다.
+fn branch_card(
+    ui: &mut egui::Ui,
+    snap: &GitPanelSnapshot,
+    tokens: crate::ui::designall::Tokens,
+    catalog: &i18n::Catalog,
+) -> Option<GitPanelAction> {
+    let mut action = None;
+    egui::Frame::NONE
+        .stroke(egui::Stroke::new(1.0, tokens.separator))
+        .corner_radius(egui::CornerRadius::same(8))
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .small_button("⟳")
+                        .on_hover_text(catalog.t("diff.refresh", &[]))
+                        .clicked()
+                    {
+                        action = Some(GitPanelAction::Refresh);
+                    }
+                    // upstream이 있고 remote가 GitHub일 때만 보인다(스펙 §4 숨김 조건).
+                    // collect_snapshot이 remote_https_base로 이 조건을 계산해 둔다
+                    // (2026-08-15 조정 — 카드로 옮기면서 조건은 그대로).
+                    if snap.upstream.is_some()
+                        && snap.remote_https_base.is_some()
+                        && ui
+                            .small_button("↗")
+                            .on_hover_text(catalog.t("git.open_remote", &[]))
+                            .clicked()
+                    {
+                        action = Some(GitPanelAction::OpenRemoteBranch);
+                    }
+                    // 버튼을 뺀 남은 폭에 왼쪽부터 그리고, 넘치면 말줄임한다 — egui Label은
+                    // 잘린 글자의 전체를 hover로 보여 준다.
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&snap.branch).monospace().strong(),
+                            )
+                            .truncate(),
+                        );
+                    });
+                });
+            });
+            ui.horizontal_wrapped(|ui| match snap.upstream.as_deref() {
+                Some(upstream) => {
+                    ui.weak("→");
+                    ui.add(egui::Label::new(egui::RichText::new(upstream).monospace()).truncate());
+                    if snap.ahead > 0 {
+                        let text =
+                            catalog.t("git.branch.ahead", &[("count", &snap.ahead.to_string())]);
+                        pill(
+                            ui,
+                            text,
+                            tokens.success,
+                            tokens.success.gamma_multiply(0.14),
+                            egui::Stroke::NONE,
+                        );
+                    }
+                    if snap.behind > 0 {
+                        let text =
+                            catalog.t("git.branch.behind", &[("count", &snap.behind.to_string())]);
+                        pill(
+                            ui,
+                            text,
+                            tokens.warning,
+                            tokens.warning.gamma_multiply(0.14),
+                            egui::Stroke::NONE,
+                        );
+                    }
+                    if snap.ahead == 0 && snap.behind == 0 {
+                        let text = catalog.t("git.branch.in_sync", &[]);
+                        let fill = tokens.input_background;
+                        pill(ui, text, tokens.muted_text, fill, egui::Stroke::NONE);
+                    }
+                }
+                None => {
+                    pill(
+                        ui,
+                        catalog.t("git.upstream_none", &[]),
+                        tokens.warning,
+                        egui::Color32::TRANSPARENT,
+                        egui::Stroke::new(1.0, tokens.warning.gamma_multiply(0.5)),
+                    )
+                    .on_hover_text(catalog.t("git.branch.no_upstream_hint", &[]));
+                }
+            });
+        });
+    action
+}
+
+/// 브랜치 카드의 상태 배지 — 둥근 면(또는 테두리)과 글자를 직접 칠한다. hover 전용
+/// sense라 클릭을 받지 않고, 접근성 이름은 배지 글자다.
+fn pill(
+    ui: &mut egui::Ui,
+    text: String,
+    color: egui::Color32,
+    fill: egui::Color32,
+    stroke: egui::Stroke,
+) -> egui::Response {
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.clone(), egui::FontId::proportional(11.5), color);
+    let size = egui::vec2(galley.size().x + 14.0, 20.0);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
+    ui.painter()
+        .rect(rect, 10.0, fill, stroke, egui::StrokeKind::Inside);
+    ui.painter()
+        .galley(rect.center() - galley.size() / 2.0, galley, color);
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), &text));
+    response
+}
+
+/// 탭 개수 배지 글자 — 상한에 잘린 목록은 개수가 하한이라 「+」를 붙인다(시안의 512+).
+fn tab_count(count: usize, truncated: bool) -> String {
+    if truncated {
+        format!("{count}+")
+    } else {
+        count.to_string()
+    }
+}
+
+/// 탭 버튼 줄 — 한 줄을 채우는 세그먼트, 이름 옆에 개수 배지. 지금 탭은 선택 면과 2pt
+/// accent 밑줄(시안의 segtabs). 탭마다 글자 폭에 남는 폭을 똑같이 나눠 더한다 — 시안처럼
+/// 똑같은 폭으로 자르면 300pt 목록에서 「워크트리」·「ワークツリー」가 몇 pt 모자라
+/// 다음 줄로 밀렸다. 글자 폭 합이 줄보다 넓을 때만 다음 줄로 넘긴다.
+/// 접근성 이름은 「이름 개수」다.
+fn tab_bar(
+    ui: &mut egui::Ui,
+    current: &mut GitPanelTab,
+    tabs: &[(GitPanelTab, String, String)],
+    tokens: crate::ui::designall::Tokens,
+) {
+    const HEIGHT: f32 = 28.0;
+    const GAP: f32 = 1.0;
+    const PADDING: f32 = 12.0;
+    const BADGE_GAP: f32 = 5.0;
+    // 글자를 먼저 배치해 탭마다 필요한 폭을 안다.
+    let laid_out: Vec<_> = tabs
+        .iter()
+        .map(|(value, name, count)| {
+            let is_current = *current == *value;
+            let text_color = if is_current {
+                tokens.text
+            } else {
+                tokens.muted_text
+            };
+            let name_galley = ui.painter().layout_no_wrap(
+                name.clone(),
+                egui::FontId::proportional(13.0),
+                text_color,
+            );
+            let count_galley = ui.painter().layout_no_wrap(
+                count.clone(),
+                egui::FontId::proportional(11.0),
+                tokens.text,
+            );
+            let badge = egui::vec2((count_galley.size().x + 10.0).max(20.0), 18.0);
+            let content = name_galley.size().x + BADGE_GAP + badge.x;
+            (is_current, name_galley, count_galley, badge, content)
+        })
+        .collect();
+    let natural: f32 = laid_out
+        .iter()
+        .map(|(.., content)| content + PADDING)
+        .sum::<f32>()
+        + GAP * (tabs.len() as f32 - 1.0);
+    let extra = ((ui.available_width() - natural) / tabs.len() as f32)
+        .max(0.0)
+        .floor();
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(GAP, GAP);
+        for (
+            index,
+            ((value, name, count), (is_current, name_galley, count_galley, badge, content)),
+        ) in tabs.iter().zip(laid_out).enumerate()
+        {
+            let (rect, response) = ui.allocate_exact_size(
+                egui::vec2(content + PADDING + extra, HEIGHT),
+                egui::Sense::click(),
+            );
+            // 바깥 끝 탭만 모서리를 둥글린다 — 붙은 세그먼트 하나처럼 보인다.
+            let mut corner = egui::CornerRadius::ZERO;
+            if index == 0 {
+                (corner.nw, corner.sw) = (6, 6);
+            }
+            if index + 1 == tabs.len() {
+                (corner.ne, corner.se) = (6, 6);
+            }
+            let fill = if is_current {
+                tokens.selected_background
+            } else if response.hovered() {
+                tokens.hover_background
+            } else {
+                tokens.input_background
+            };
+            let painter = ui.painter();
+            painter.rect_filled(rect, corner, fill);
+            if is_current {
+                let underline = egui::Rect::from_min_max(
+                    egui::pos2(rect.left(), rect.bottom() - 2.0),
+                    rect.right_bottom(),
+                );
+                painter.rect_filled(underline, corner, tokens.accent);
+            }
+            let left = rect.center().x - content / 2.0;
+            let badge_rect = egui::Rect::from_min_size(
+                egui::pos2(
+                    left + name_galley.size().x + BADGE_GAP,
+                    rect.center().y - badge.y / 2.0,
+                ),
+                badge,
+            );
+            let name_pos = egui::pos2(left, rect.center().y - name_galley.size().y / 2.0);
+            painter.galley(name_pos, name_galley, tokens.text);
+            painter.rect_filled(badge_rect, 9.0, tokens.separator);
+            painter.galley(
+                badge_rect.center() - count_galley.size() / 2.0,
+                count_galley,
+                tokens.text,
+            );
+            response.widget_info(|| {
+                egui::WidgetInfo::selected(
+                    egui::WidgetType::Button,
+                    ui.is_enabled(),
+                    is_current,
+                    format!("{name} {count}"),
+                )
+            });
+            if response
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .clicked()
+            {
+                *current = *value;
+            }
+        }
+    });
+}
+
+/// 탭 아래 합계 줄 — 「N개 파일 · +a −d」(거른 뒤 행 기준). 행이 표시 상한을 넘으면
+/// 오른쪽에 「모두 보기」 토글(예전 섹션 머리에 있던 것). 행이 없으면 그리지 않는다.
+fn totals_line(
+    ui: &mut egui::Ui,
+    rows: &[&GitFileRow],
+    show_all: &mut bool,
+    tokens: crate::ui::designall::Tokens,
+    catalog: &i18n::Catalog,
+) {
+    if rows.is_empty() {
+        return;
+    }
+    // 512행 × u32 증감 합은 u32를 넘을 수 있다.
+    let adds: u64 = rows.iter().filter_map(|row| row.adds).map(u64::from).sum();
+    let dels: u64 = rows.iter().filter_map(|row| row.dels).map(u64::from).sum();
+    ui.horizontal(|ui| {
+        ui.weak(catalog.t("git.files.total", &[("count", &rows.len().to_string())]));
+        ui.weak("·");
+        ui.colored_label(stat_color(tokens, true), format!("+{adds}"));
+        ui.colored_label(stat_color(tokens, false), format!("−{dels}"));
+        if rows.len() > SECTION_COLLAPSED_ROWS {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .selectable_label(*show_all, catalog.t("git.show_all", &[]))
+                    .clicked()
+                {
+                    *show_all = !*show_all;
+                }
+            });
+        }
+    });
+}
+
+/// 「모두 보기」를 켜지 않았으면 표시 상한(SECTION_COLLAPSED_ROWS)까지만 남긴다.
+fn visible_rows<'a, 'r>(rows: &'a [&'r GitFileRow], show_all: bool) -> &'a [&'r GitFileRow] {
+    if show_all {
+        rows
+    } else {
+        &rows[..rows.len().min(SECTION_COLLAPSED_ROWS)]
+    }
+}
+
+/// 변경·커밋 탭의 파일 행. 호출부는 거르기 전 목록이 비어 있지 않을 때만 부른다 —
+/// 그래서 0행이면 필터가 다 걸러낸 것이고, 「왜 안 보이지」가 되지 않게 안내 한 줄을
+/// 둔다(2026-08-18 스펙 §좌측 목록 필터).
+#[allow(clippy::too_many_arguments)]
+fn render_file_rows(
+    ui: &mut egui::Ui,
+    catalog: &i18n::Catalog,
+    repo_root: &Path,
+    rows: &[&GitFileRow],
+    salt: &str,
+    mode: crate::ui::diff_viewer::DiffMode,
+    selected: &mut Option<(String, crate::ui::diff_viewer::DiffMode)>,
+    action: &mut Option<GitPanelAction>,
+) {
+    if rows.is_empty() {
+        ui.weak(catalog.t("search.no_match", &[]));
+        return;
+    }
+    let tokens = crate::ui::designall::tokens(ui.visuals());
+    for row in rows {
+        let id_salt = ("git-panel-row", salt, row.rel_path.as_str());
+        if let Some(clicked) =
+            file_row(ui, id_salt, repo_root, row, mode, selected, tokens, catalog)
+        {
+            *action = Some(clicked);
+        }
+    }
+}
+
+/// 작업 트리가 깨끗할 때의 카드 — 보낼 커밋이 있으면 커밋 탭으로 가는 링크를 둔다.
+/// 링크를 누른 프레임에 true.
+fn clean_card(
+    ui: &mut egui::Ui,
+    ahead: u32,
+    tokens: crate::ui::designall::Tokens,
+    catalog: &i18n::Catalog,
+) -> bool {
+    let mut to_commits = false;
+    ui.add_space(8.0);
+    egui::Frame::NONE
+        .stroke(egui::Stroke::new(1.0, tokens.separator))
+        .corner_radius(egui::CornerRadius::same(8))
+        .inner_margin(egui::Margin::same(14))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.vertical_centered(|ui| {
+                ui.label(egui::RichText::new("✓").size(20.0).color(tokens.success));
+                ui.label(catalog.t("diff.clean", &[]));
+                if ahead > 0
+                    && ui
+                        .link(catalog.t("git.clean.view_ahead", &[("count", &ahead.to_string())]))
+                        .clicked()
+                {
+                    to_commits = true;
+                }
+            });
+        });
+    to_commits
+}
+
+/// 상한(MAX_PANEL_FILES)·바이트 상한에 잘린 목록의 배너 — 예전엔 목록 끝의 흐린 한
+/// 줄이라 긴 목록에서 보이지 않았다(2026-10-11 시안). 목록 위에 경고 테두리로 둔다.
+fn truncation_banner(
+    ui: &mut egui::Ui,
+    tokens: crate::ui::designall::Tokens,
+    catalog: &i18n::Catalog,
+) {
+    egui::Frame::NONE
+        .fill(tokens.warning.gamma_multiply(0.08))
+        .stroke(egui::Stroke::new(1.0, tokens.warning))
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin::symmetric(10, 6))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(catalog.t("diff.truncated", &[]));
+        });
+    ui.add_space(4.0);
 }
 
 /// 파일 행 하나 — 상태 배지·파일명·줄인 폴더·증감, 선택이면 면과 2pt accent 레일.
@@ -1310,10 +1610,10 @@ impl CommitListState {
     }
 }
 
-/// 「브랜치에 COMMIT 됨」 파일 행 아래의 커밋 목록 — 행: ›/∨ · sha(모노, accent) ·
+/// 커밋 탭의 브랜치 커밋 파일 행 아래 커밋 목록 — 행: ›/∨ · sha(모노, accent) ·
 /// 제목(말줄임, 전체는 hover) · 상대 시각. 커밋 행 클릭은 펼침을 토글하고, 펼친 커밋의
 /// 파일 행 클릭은 그 커밋 기준 diff를 연다. 좌측 목록 필터는 걸지 않는다(파일 경로
-/// 필터라 커밋은 대상이 아니다 — 워크트리 섹션과 같은 규칙).
+/// 필터라 커밋은 대상이 아니다 — 워크트리 탭과 같은 규칙).
 fn render_commit_list(
     ui: &mut egui::Ui,
     catalog: &i18n::Catalog,
@@ -2168,6 +2468,8 @@ mod tests {
             }],
             ..Default::default()
         }));
+        // 커밋 목록은 커밋 탭에 있다(2026-10-11 PR 2).
+        panel.tab = GitPanelTab::Commits;
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
         let mut harness = egui_kittest::Harness::new_ui_state(
             |ui, state: &mut State| {
@@ -2442,6 +2744,8 @@ mod tests {
         let mut panel = GitPanelUi::default();
         panel.set_snapshot(Ok(GitPanelSnapshot {
             branch: "main".into(),
+            // 브랜치 커밋은 upstream 기준으로만 수집된다(collect_snapshot).
+            upstream: Some("origin/main".into()),
             changes: vec![row("src/a.rs"), row("src/b.rs")],
             committed: vec![row("src/a.rs")],
             ..Default::default()
@@ -2469,11 +2773,11 @@ mod tests {
             ))
         );
 
-        // 같은 경로라도 브랜치 커밋 섹션의 행은 다른 선택이다.
+        // 같은 경로라도 커밋 탭의 브랜치 커밋 행은 다른 선택이다.
+        harness.state_mut().panel.tab = GitPanelTab::Commits;
+        harness.run();
         harness
-            .query_all_by_role_and_label(egui::accesskit::Role::Button, "src/a.rs")
-            .nth(1)
-            .unwrap()
+            .get_by_role_and_label(egui::accesskit::Role::Button, "src/a.rs")
             .click();
         harness.run();
         assert_eq!(
@@ -2513,6 +2817,7 @@ mod tests {
             ],
             ..Default::default()
         }));
+        panel.tab = GitPanelTab::Worktrees;
 
         let mut harness = egui_kittest::Harness::new_ui_state(
             |ui, state: &mut State| {
@@ -2544,26 +2849,53 @@ mod tests {
     }
 
     #[test]
-    fn 워크트리가_하나면_섹션을_숨긴다() {
-        // 정보가 0인 섹션은 그리지 않는다(스펙 §8-4).
-        let mut snap = GitPanelSnapshot {
+    fn kittest_워크트리가_하나면_탭을_숨긴다() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+
+        // 정보가 0인 탭은 그리지 않는다(스펙 §8-4 — 예전 섹션 숨김과 같은 조건).
+        let catalog = en();
+        let one = GitPanelSnapshot {
             branch: "main".into(),
+            worktrees: vec![worktree("/repo", true)],
             ..Default::default()
         };
-        snap.worktrees = vec![GitWorktreeRow {
-            path: "/repo".into(),
-            name: "repo".into(),
-            branch: Some("main".into()),
-            current: true,
-        }];
-        assert!(!worktree_section_visible(&snap));
-        snap.worktrees.push(GitWorktreeRow {
+        assert!(!worktree_section_visible(&one));
+        let mut harness = panel_harness(one.clone(), "");
+        harness.run();
+        assert!(
+            harness
+                .query_by_role_and_label(
+                    Role::Button,
+                    &tab_label(&catalog, "git.section.worktrees", "1")
+                )
+                .is_none(),
+            "워크트리가 메인 하나뿐이면 탭이 없다"
+        );
+
+        let mut two = one.clone();
+        two.worktrees.push(GitWorktreeRow {
             path: "/repo/wt".into(),
             name: "wt".into(),
             branch: None,
             current: false,
         });
-        assert!(worktree_section_visible(&snap));
+        assert!(worktree_section_visible(&two));
+        harness.state_mut().panel.set_snapshot(Ok(two));
+        harness.run();
+        harness
+            .get_by_role_and_label(
+                Role::Button,
+                &tab_label(&catalog, "git.section.worktrees", "2"),
+            )
+            .click();
+        harness.run();
+        assert_eq!(harness.state().panel.tab, GitPanelTab::Worktrees);
+
+        // 새로고침으로 하나만 남으면 숨은 탭에 머물지 않고 변경 탭으로 돌아간다.
+        harness.state_mut().panel.set_snapshot(Ok(one));
+        harness.run();
+        assert_eq!(harness.state().panel.tab, GitPanelTab::Changes);
     }
 
     #[test]
@@ -2876,36 +3208,33 @@ mod tests {
         assert!(filter_file_rows(&rows, "zzz-no-match").is_empty());
     }
 
+    // 예전 섹션 머리의 「∨ Changes 1」 개수가 이제 변경 탭 버튼의 개수다 — 거른 뒤
+    // 기준이라는 의미는 그대로다(2026-10-11 PR 2).
     #[test]
-    fn kittest_필터는_변경_사항_행과_헤더_개수를_거른_뒤_기준으로_보여준다() {
+    fn kittest_필터는_변경_탭_행과_탭_개수를_거른_뒤_기준으로_보여준다() {
         use egui_kittest::kittest::Queryable;
 
-        let mut panel = GitPanelUi::default();
-        panel.set_snapshot(Ok(GitPanelSnapshot {
-            branch: "main".into(),
-            changes: vec![
-                GitFileRow {
-                    rel_path: "src/app.rs".into(),
-                    status: 'M',
-                    adds: Some(1),
-                    dels: None,
-                },
-                GitFileRow {
-                    rel_path: "README.md".into(),
-                    status: 'M',
-                    adds: None,
-                    dels: Some(2),
-                },
-            ],
-            ..Default::default()
-        }));
-
-        let mut harness = egui_kittest::Harness::new_ui_state(
-            |ui, panel: &mut GitPanelUi| {
-                let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
-                panel.render(ui, &catalog, "readme");
+        let catalog = en();
+        let mut harness = panel_harness(
+            GitPanelSnapshot {
+                branch: "main".into(),
+                changes: vec![
+                    GitFileRow {
+                        rel_path: "src/app.rs".into(),
+                        status: 'M',
+                        adds: Some(1),
+                        dels: None,
+                    },
+                    GitFileRow {
+                        rel_path: "README.md".into(),
+                        status: 'M',
+                        adds: None,
+                        dels: Some(2),
+                    },
+                ],
+                ..Default::default()
             },
-            panel,
+            "readme",
         );
         harness.run();
 
@@ -2914,8 +3243,11 @@ mod tests {
             harness.query_by_label("src/app.rs").is_none(),
             "필터에 걸리지 않는 행은 보이면 안 된다"
         );
-        // 섹션 헤더 개수는 거른 뒤(1) 기준이어야 한다 — 원래 2행 중 1행만 남았다.
-        harness.get_by_label("∨ Changes 1");
+        // 탭 개수는 거른 뒤(1) 기준이어야 한다 — 원래 2행 중 1행만 남았다.
+        harness.get_by_role_and_label(
+            egui::accesskit::Role::Button,
+            &tab_label(&catalog, "git.tab.changes", "1"),
+        );
     }
 
     #[test]
@@ -2934,19 +3266,13 @@ mod tests {
         // 「모두 보기」가 보일 상한(10)을 넘지만, 거른 뒤(1) 기준이면 안 보여야 한다.
         rows[0].rel_path = "only-match.rs".into();
 
-        let mut panel = GitPanelUi::default();
-        panel.set_snapshot(Ok(GitPanelSnapshot {
-            branch: "main".into(),
-            changes: rows,
-            ..Default::default()
-        }));
-
-        let mut harness = egui_kittest::Harness::new_ui_state(
-            |ui, panel: &mut GitPanelUi| {
-                let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
-                panel.render(ui, &catalog, "only-match");
+        let mut harness = panel_harness(
+            GitPanelSnapshot {
+                branch: "main".into(),
+                changes: rows,
+                ..Default::default()
             },
-            panel,
+            "only-match",
         );
         harness.run();
 
@@ -2955,84 +3281,400 @@ mod tests {
             harness.query_by_label("Show all").is_none(),
             "거른 뒤 1행뿐이면 「모두 보기」가 보이면 안 된다"
         );
+
+        // 필터를 풀면 11행이라 상한(10)까지만 보이고, 합계 줄의 「모두 보기」가 나머지를 편다.
+        harness.state_mut().filter = "";
+        harness.run();
+        let last = format!("keep{SECTION_COLLAPSED_ROWS}.rs");
+        assert!(harness.query_by_label(&last).is_none());
+        harness.get_by_label("Show all").click();
+        harness.run();
+        harness.get_by_label(&last);
     }
 
+    // 예전엔 「두 섹션 모두」 0행일 때 패널 전체에 안내 한 줄이었다. 탭으로 나뉜 뒤에는
+    // 지금 탭의 파일 행이 모두 걸러지면 그 탭에 안내 한 줄이 보인다(2026-10-11 PR 2).
     #[test]
-    fn kittest_필터가_두_섹션_모두_걸러내면_안내_한_줄만_보인다() {
+    fn kittest_필터가_탭의_파일을_모두_걸러내면_안내_한_줄이_보인다() {
         use egui_kittest::kittest::Queryable;
 
-        let mut panel = GitPanelUi::default();
-        panel.set_snapshot(Ok(GitPanelSnapshot {
-            branch: "main".into(),
-            changes: vec![GitFileRow {
-                rel_path: "src/a.rs".into(),
-                status: 'M',
-                adds: Some(1),
-                dels: None,
-            }],
-            ..Default::default()
-        }));
-
-        let mut harness = egui_kittest::Harness::new_ui_state(
-            |ui, panel: &mut GitPanelUi| {
-                let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
-                panel.render(ui, &catalog, "zzz-no-match");
+        let catalog = en();
+        let sha = CommitSha::parse("a1b2c3d").unwrap();
+        let mut harness = panel_harness(
+            GitPanelSnapshot {
+                branch: "feat".into(),
+                upstream: Some("origin/main".into()),
+                changes: vec![GitFileRow {
+                    rel_path: "src/a.rs".into(),
+                    status: 'M',
+                    adds: Some(1),
+                    dels: None,
+                }],
+                committed: vec![file_row("src/b.rs", 'M', 1, 0)],
+                commits: vec![GitCommitRow {
+                    sha,
+                    subject: "커밋".into(),
+                    time: 0,
+                }],
+                ..Default::default()
             },
-            panel,
+            "zzz-no-match",
         );
         harness.run();
 
-        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
         harness.get_by_label(&catalog.t("search.no_match", &[]));
         assert!(
             harness.query_by_label("src/a.rs").is_none(),
             "걸러진 행은 보이면 안 된다"
         );
+
+        harness.state_mut().panel.tab = GitPanelTab::Commits;
+        harness.run();
+        harness.get_by_label(&catalog.t("search.no_match", &[]));
+        assert!(
+            harness.query_by_label("src/b.rs").is_none(),
+            "커밋 탭의 브랜치 커밋 파일도 필터 대상이다"
+        );
+        // 커밋 목록은 파일 경로 필터 대상이 아니다.
+        harness.get_by_role_and_label(egui::accesskit::Role::Button, "a1b2c3d 커밋");
     }
 
     #[test]
     fn kittest_필터는_워크트리_행을_거르지_않는다() {
         use egui_kittest::kittest::Queryable;
 
-        let mut panel = GitPanelUi::default();
-        panel.set_snapshot(Ok(GitPanelSnapshot {
-            branch: "main".into(),
-            changes: vec![GitFileRow {
-                rel_path: "src/a.rs".into(),
-                status: 'M',
-                adds: Some(1),
-                dels: None,
-            }],
-            worktrees: vec![
-                GitWorktreeRow {
-                    path: "/repo".into(),
-                    name: "repo".into(),
-                    branch: Some("main".into()),
-                    current: true,
-                },
-                GitWorktreeRow {
-                    path: "/repo/wt".into(),
-                    name: "wt".into(),
-                    branch: Some("feat/x".into()),
-                    current: false,
-                },
-            ],
-            ..Default::default()
-        }));
-
-        let mut harness = egui_kittest::Harness::new_ui_state(
-            |ui, panel: &mut GitPanelUi| {
-                let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
-                panel.render(ui, &catalog, "zzz-no-match");
+        let catalog = en();
+        let mut harness = panel_harness(
+            GitPanelSnapshot {
+                branch: "main".into(),
+                changes: vec![GitFileRow {
+                    rel_path: "src/a.rs".into(),
+                    status: 'M',
+                    adds: Some(1),
+                    dels: None,
+                }],
+                worktrees: vec![worktree("/repo", true), worktree("/repo/wt", false)],
+                ..Default::default()
             },
-            panel,
+            "zzz-no-match",
         );
         harness.run();
 
-        // 필터가 걸려도 워크트리 섹션은 필터하지 않는다(2026-08-18 스펙 §좌측 목록
+        // 필터가 걸려도 워크트리 탭은 필터하지 않는다(2026-08-18 스펙 §좌측 목록
         // 필터) — 경로 목록이라 검색 대상이 아니고, 통째로 사라지면 혼란스럽다.
+        // 탭 개수도 거르지 않은 2다.
+        harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::Button,
+                &tab_label(&catalog, "git.section.worktrees", "2"),
+            )
+            .click();
+        harness.run();
         harness
             .get_by_role_and_label(egui::accesskit::Role::Button, "/repo/wt")
             .click();
+        harness.run();
+        assert_eq!(
+            harness.state().action,
+            Some(GitPanelAction::OpenWorktreeShell {
+                path: "/repo/wt".to_owned()
+            })
+        );
+    }
+
+    // ── 브랜치 카드와 탭(2026-10-11 PR 2) ─────────────────────────────
+
+    fn en() -> i18n::Catalog {
+        i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap()
+    }
+
+    /// 탭·카드 kittest 공용 상태 — 필터를 바꿔 가며 같은 패널을 다시 그릴 수 있다.
+    struct PanelState {
+        panel: GitPanelUi,
+        filter: &'static str,
+        action: Option<GitPanelAction>,
+    }
+
+    fn panel_harness(
+        snapshot: GitPanelSnapshot,
+        filter: &'static str,
+    ) -> egui_kittest::Harness<'static, PanelState> {
+        let mut panel = GitPanelUi::default();
+        panel.set_snapshot(Ok(snapshot));
+        egui_kittest::Harness::new_ui_state(
+            |ui, state: &mut PanelState| {
+                let catalog = en();
+                if let Some(action) = state.panel.render(ui, &catalog, state.filter) {
+                    state.action = Some(action);
+                }
+            },
+            PanelState {
+                panel,
+                filter,
+                action: None,
+            },
+        )
+    }
+
+    fn worktree(path: &str, current: bool) -> GitWorktreeRow {
+        GitWorktreeRow {
+            path: path.into(),
+            name: path.rsplit('/').next().unwrap_or(path).into(),
+            branch: Some("main".into()),
+            current,
+        }
+    }
+
+    /// 탭 버튼의 접근성 이름 — 「이름 개수」.
+    fn tab_label(catalog: &i18n::Catalog, key: &str, count: &str) -> String {
+        format!("{} {count}", catalog.t(key, &[]))
+    }
+
+    #[test]
+    fn kittest_탭을_바꾸면_그_탭의_행만_보인다() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = en();
+        let sha = CommitSha::parse("a1b2c3d").unwrap();
+        let mut harness = panel_harness(
+            GitPanelSnapshot {
+                branch: "feat".into(),
+                upstream: Some("origin/main".into()),
+                changes: vec![file_row("src/working.rs", 'M', 1, 0)],
+                committed: vec![file_row("src/branch.rs", 'M', 2, 0)],
+                commits: vec![GitCommitRow {
+                    sha,
+                    subject: "첫 커밋".into(),
+                    time: 0,
+                }],
+                worktrees: vec![worktree("/repo", true), worktree("/repo/wt", false)],
+                ..Default::default()
+            },
+            "",
+        );
+        harness.run();
+
+        // 기본은 변경 탭 — 작업 중 변경 파일만 보인다.
+        assert_eq!(harness.state().panel.tab, GitPanelTab::Changes);
+        harness.get_by_role_and_label(Role::Button, "src/working.rs");
+        assert!(
+            harness
+                .query_by_role_and_label(Role::Button, "src/branch.rs")
+                .is_none()
+        );
+        assert!(
+            harness
+                .query_by_role_and_label(Role::Button, "a1b2c3d 첫 커밋")
+                .is_none()
+        );
+        assert!(
+            harness
+                .query_by_role_and_label(Role::Button, "/repo/wt")
+                .is_none()
+        );
+
+        // 커밋 탭 — 소제목(브랜치 커밋 · 기준) 아래 브랜치 커밋 파일과 커밋 목록.
+        harness
+            .get_by_role_and_label(Role::Button, &tab_label(&catalog, "git.tab.commits", "1"))
+            .click();
+        harness.run();
+        assert_eq!(harness.state().panel.tab, GitPanelTab::Commits);
+        harness.get_by_label(&catalog.t("git.section.committed", &[]));
+        harness.get_by_label(&catalog.t("git.commits.since", &[("base", "origin/main")]));
+        harness.get_by_role_and_label(Role::Button, "src/branch.rs");
+        harness.get_by_role_and_label(Role::Button, "a1b2c3d 첫 커밋");
+        assert!(
+            harness
+                .query_by_role_and_label(Role::Button, "src/working.rs")
+                .is_none()
+        );
+
+        // 워크트리 탭.
+        harness
+            .get_by_role_and_label(
+                Role::Button,
+                &tab_label(&catalog, "git.section.worktrees", "2"),
+            )
+            .click();
+        harness.run();
+        assert_eq!(harness.state().panel.tab, GitPanelTab::Worktrees);
+        harness.get_by_role_and_label(Role::Button, "/repo/wt");
+        assert!(
+            harness
+                .query_by_role_and_label(Role::Button, "src/branch.rs")
+                .is_none()
+        );
+        assert!(
+            harness
+                .query_by_role_and_label(Role::Button, "a1b2c3d 첫 커밋")
+                .is_none()
+        );
+
+        // 변경 탭으로 돌아온다.
+        harness
+            .get_by_role_and_label(Role::Button, &tab_label(&catalog, "git.tab.changes", "1"))
+            .click();
+        harness.run();
+        assert_eq!(harness.state().panel.tab, GitPanelTab::Changes);
+        harness.get_by_role_and_label(Role::Button, "src/working.rs");
+    }
+
+    #[test]
+    fn kittest_브랜치_카드는_보낼_받을_커밋과_업스트림_상태를_배지로_보인다() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = en();
+        let ahead = |count: &str| catalog.t("git.branch.ahead", &[("count", count)]);
+        let behind = |count: &str| catalog.t("git.branch.behind", &[("count", count)]);
+        let in_sync = catalog.t("git.branch.in_sync", &[]);
+        let no_upstream = catalog.t("git.upstream_none", &[]);
+        let snap = |upstream: Option<&str>, ahead: u32, behind: u32| GitPanelSnapshot {
+            branch: "feat/card".into(),
+            upstream: upstream.map(Into::into),
+            ahead,
+            behind,
+            remote_https_base: Some("https://github.com/o/r".into()),
+            ..Default::default()
+        };
+
+        // 보낼·받을 커밋이 둘 다 있으면 배지 둘 — 「원격과 같음」은 없다.
+        let mut harness = panel_harness(snap(Some("origin/feat/card"), 3, 1), "");
+        harness.run();
+        harness.get_by_label("feat/card");
+        harness.get_by_label("origin/feat/card");
+        harness.get_by_label(&ahead("3"));
+        harness.get_by_label(&behind("1"));
+        assert!(harness.query_by_label(&in_sync).is_none());
+        assert!(harness.query_by_label(&no_upstream).is_none());
+        // GitHub remote에 upstream이 있으면 ↗가 보인다(기존 규칙).
+        harness.get_by_role_and_label(Role::Button, "↗");
+        harness.get_by_role_and_label(Role::Button, "⟳");
+
+        // 받을 커밋만 있으면 그 배지만.
+        let mut harness = panel_harness(snap(Some("origin/feat/card"), 0, 2), "");
+        harness.run();
+        harness.get_by_label(&behind("2"));
+        assert!(harness.query_by_label(&ahead("0")).is_none());
+        assert!(harness.query_by_label(&in_sync).is_none());
+
+        // 둘 다 0이면 중립 배지 하나.
+        let mut harness = panel_harness(snap(Some("origin/feat/card"), 0, 0), "");
+        harness.run();
+        harness.get_by_label(&in_sync);
+        assert!(harness.query_by_label(&ahead("0")).is_none());
+        assert!(harness.query_by_label(&behind("0")).is_none());
+
+        // 업스트림 없음 — 경고 배지와 hover 이유. 보낼/받을/같음 배지와 ↗는 없다.
+        let mut harness = panel_harness(snap(None, 0, 0), "");
+        harness.run();
+        assert!(harness.query_by_label(&in_sync).is_none());
+        assert!(harness.query_by_role_and_label(Role::Button, "↗").is_none());
+        harness.get_by_role_and_label(Role::Button, "⟳");
+        harness.get_by_label(&no_upstream).hover();
+        harness.run();
+        harness.get_by_label(&catalog.t("git.branch.no_upstream_hint", &[]));
+    }
+
+    #[test]
+    fn kittest_깨끗하면_카드를_보이고_보낼_커밋_링크는_커밋_탭으로_간다() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = en();
+        let view_ahead = |count: &str| catalog.t("git.clean.view_ahead", &[("count", count)]);
+        let mut harness = panel_harness(
+            GitPanelSnapshot {
+                branch: "feat".into(),
+                upstream: Some("origin/feat".into()),
+                ahead: 2,
+                committed: vec![file_row("src/branch.rs", 'M', 1, 0)],
+                ..Default::default()
+            },
+            "",
+        );
+        harness.run();
+        harness.get_by_label(&catalog.t("diff.clean", &[]));
+        assert!(
+            harness
+                .query_by_label(&catalog.t("git.files.total", &[("count", "0")]))
+                .is_none(),
+            "파일이 없으면 합계 줄도 없다"
+        );
+        harness.get_by_label(&view_ahead("2")).click();
+        harness.run();
+        assert_eq!(harness.state().panel.tab, GitPanelTab::Commits);
+        harness.get_by_role_and_label(Role::Button, "src/branch.rs");
+
+        // 보낼 커밋이 없으면 링크도 없다.
+        let mut harness = panel_harness(
+            GitPanelSnapshot {
+                branch: "main".into(),
+                upstream: Some("origin/main".into()),
+                ..Default::default()
+            },
+            "",
+        );
+        harness.run();
+        harness.get_by_label(&catalog.t("diff.clean", &[]));
+        assert!(harness.query_by_label(&view_ahead("0")).is_none());
+    }
+
+    #[test]
+    fn kittest_512_상한에_잘린_목록은_배너와_개수_뒤_더하기로_알린다() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = en();
+        let truncated = catalog.t("diff.truncated", &[]);
+        let snap = GitPanelSnapshot {
+            branch: "main".into(),
+            upstream: Some("origin/main".into()),
+            changes: vec![file_row("a.rs", 'M', 1, 0)],
+            changes_truncated: true,
+            committed: vec![file_row("b.rs", 'M', 1, 0)],
+            ..Default::default()
+        };
+        let mut harness = panel_harness(snap.clone(), "");
+        harness.run();
+        harness.get_by_label(&truncated);
+        // 버린 행이 있으니 개수는 하한이다.
+        harness.get_by_role_and_label(Role::Button, &tab_label(&catalog, "git.tab.changes", "1+"));
+
+        // 커밋 탭의 파일은 잘리지 않았다 — 배너가 없다.
+        harness.state_mut().panel.tab = GitPanelTab::Commits;
+        harness.run();
+        assert!(harness.query_by_label(&truncated).is_none());
+
+        harness.state_mut().panel.set_snapshot(Ok(GitPanelSnapshot {
+            committed_truncated: true,
+            ..snap
+        }));
+        harness.run();
+        harness.get_by_label(&truncated);
+    }
+
+    #[test]
+    fn kittest_합계_줄은_거른_뒤_파일_수와_증감을_더한다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = en();
+        let mut harness = panel_harness(
+            GitPanelSnapshot {
+                branch: "main".into(),
+                changes: vec![
+                    file_row("src/a.rs", 'M', 3, 1),
+                    file_row("src/b.rs", 'M', 4, 2),
+                    file_row("docs/c.md", 'M', 100, 100),
+                ],
+                ..Default::default()
+            },
+            "src/",
+        );
+        harness.run();
+        harness.get_by_label(&catalog.t("git.files.total", &[("count", "2")]));
+        harness.get_by_label("+7");
+        harness.get_by_label("−3");
     }
 }

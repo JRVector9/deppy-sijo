@@ -35,6 +35,18 @@ pub struct EnvironmentPrefill {
 }
 
 impl EnvironmentPrefill {
+    pub(crate) fn is_api(&self) -> bool {
+        matches!(
+            self.kind,
+            EnvironmentSelectionKind::ApiName | EnvironmentSelectionKind::ApiValue
+        )
+    }
+    /// Move the one-shot prefill into the project-key editor without copying it
+    /// into a metadata snapshot or retaining a second secret draft.
+    pub(crate) fn into_parts(self) -> (EnvironmentSelectionKind, SensitiveInput) {
+        (self.kind, self.value)
+    }
+
     pub fn from_selection(kind: EnvironmentSelectionKind, text: &str) -> Option<Self> {
         kind.accepts(text).then(|| Self {
             kind,
@@ -404,6 +416,32 @@ pub(super) fn field_label(ui: &mut egui::Ui, catalog: &i18n::Catalog, key: &str)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn api_prefill_keeps_free_form_label_in_legacy_flow() {
+        let prefill =
+            EnvironmentPrefill::from_selection(EnvironmentSelectionKind::ApiName, "내 API")
+                .unwrap();
+        assert!(prefill.is_api());
+        let mut view = EnvironmentUi::default();
+        let mut env = EnvProfilesUi::new();
+        let mut credentials = CredentialsUi::new();
+        view.queue_prefill("origin".into(), prefill);
+        let loaded = CredentialsSnapshot::try_new(2, vec![]).unwrap();
+        assert!(
+            view.prepare_classic(&mut env, &ready("origin"), &mut credentials, &loaded)
+                .is_some()
+        );
+        assert!(view.pending_prefill.is_none());
+        assert!(
+            !EnvironmentPrefill::from_selection(
+                EnvironmentSelectionKind::VariableName,
+                "API_TOKEN"
+            )
+            .unwrap()
+            .is_api()
+        );
+    }
 
     #[test]
     fn environment_classic_prefill_waits_for_snapshots_and_is_consumed_once() {

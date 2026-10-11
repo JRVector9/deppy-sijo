@@ -1078,6 +1078,7 @@ impl crate::dotenv_sync::DotenvRepository for AppDotenvRepository<'_> {
             .map(|row| crate::dotenv_sync::DotenvProfile {
                 id: row.id,
                 kind: row.kind,
+                is_production: row.is_production,
             })
             .collect())
     }
@@ -1115,6 +1116,18 @@ impl crate::dotenv_sync::DotenvRepository for AppDotenvRepository<'_> {
             .collect())
     }
 
+    fn project_key_managed_dotenv_names(
+        &mut self,
+        workspace_id: &str,
+    ) -> anyhow::Result<std::collections::HashSet<String>> {
+        project_key_managed_dotenv_names(self.0, workspace_id)
+    }
+    fn project_key_managed_profile_variables(
+        &mut self,
+        workspace_id: &str,
+    ) -> anyhow::Result<std::collections::HashSet<(String, String)>> {
+        project_key_managed_profile_variables(self.0, workspace_id)
+    }
     fn plain_env_value_allowed(&mut self, key: &str, value: &str) -> bool {
         Db::validate_env_var_for_persistence(key, &crate::env::EnvValue::Plain(value.to_owned()))
             .is_ok()
@@ -1129,6 +1142,18 @@ impl crate::dotenv_sync::DotenvRepository for AppDotenvRepository<'_> {
         Db::upsert_env_var(self.0, profile_id, key, value)
     }
 
+    fn upsert_unmanaged_env_var(
+        &mut self,
+        profile_id: &str,
+        key: &str,
+        value: &crate::env::EnvValue,
+    ) -> anyhow::Result<bool> {
+        self.0
+            .project_key_dotenv_upsert_unmanaged(profile_id, key, value)
+    }
+    fn delete_unmanaged_env_var(&mut self, profile_id: &str, key: &str) -> anyhow::Result<bool> {
+        self.0.project_key_dotenv_delete_unmanaged(profile_id, key)
+    }
     fn delete_env_var(&mut self, profile_id: &str, key: &str) -> anyhow::Result<()> {
         Db::delete_env_var(self.0, profile_id, key)
     }
@@ -1138,7 +1163,74 @@ impl crate::dotenv_sync::DotenvRepository for AppDotenvRepository<'_> {
     }
 }
 
-fn sync_workspace_dotenv_at_root(
+pub(crate) fn project_key_managed_dotenv_names(
+    db: &Db,
+    workspace_id: &str,
+) -> anyhow::Result<std::collections::HashSet<String>> {
+    let environment = deppy_core::project_keys::KeyEnvironment::Development;
+    let keys = db.project_key_list(workspace_id, environment)?;
+    let managed: std::collections::HashSet<_> = db
+        .project_key_managed_ids(workspace_id, environment)?
+        .into_iter()
+        .collect();
+    Ok(keys
+        .into_iter()
+        .filter(|key| {
+            managed.contains(&key.id)
+                && key
+                    .legacy_reference
+                    .as_deref()
+                    .is_some_and(|reference| reference.starts_with("env_var:"))
+                && matches!(
+                    key.source,
+                    deppy_core::project_keys::KeySource::Dotenv { .. }
+                )
+        })
+        .map(|key| key.name)
+        .collect())
+}
+
+pub(crate) fn project_key_managed_profile_variables(
+    db: &Db,
+    workspace_id: &str,
+) -> anyhow::Result<std::collections::HashSet<(String, String)>> {
+    use deppy_core::project_keys::{KeyEnvironment, KeySource};
+    // Legacy migration writes .env before its old-row cleanup. A reserved file must remain
+    // untouched until the project-key journal has published or restored the complete source.
+    anyhow::ensure!(
+        !db.project_key_file_journal_source_pending(
+            workspace_id,
+            KeyEnvironment::Development,
+            &KeySource::Dotenv {
+                file: ".env".into()
+            },
+        )?,
+        "project_key_source_changed"
+    );
+    let mut managed = std::collections::HashSet::new();
+    for environment in [KeyEnvironment::Development, KeyEnvironment::Production] {
+        let keys = db.project_key_list(workspace_id, environment)?;
+        let managed_ids: std::collections::HashSet<_> = db
+            .project_key_managed_ids(workspace_id, environment)?
+            .into_iter()
+            .collect();
+        for key in keys {
+            if managed_ids.contains(&key.id)
+                && let Some(profile) = db.project_key_legacy_env_profile(
+                    workspace_id,
+                    environment,
+                    &key.id,
+                    key.revision,
+                )?
+            {
+                managed.insert((profile, key.name));
+            }
+        }
+    }
+    Ok(managed)
+}
+
+pub(crate) fn sync_workspace_dotenv_at_root(
     db: &mut Db,
     secret_store: &dyn secret::SecretStore,
     redaction: &secret::RedactionService,
@@ -1146,9 +1238,45 @@ fn sync_workspace_dotenv_at_root(
     root: &Path,
 ) -> anyhow::Result<Option<crate::dotenv_sync::DotenvSyncReport>> {
     let files = db.env_source_files(workspace_id)?;
-    let Some(plan) = crate::dotenv_sync::load_workspace_dotenv_plan_for_files(root, &files)? else {
+    for file in &files {
+        if db.project_key_file_journal_source_pending(
+            workspace_id,
+            deppy_core::project_keys::KeyEnvironment::Development,
+            &deppy_core::project_keys::KeySource::Dotenv { file: file.clone() },
+        )? {
+            anyhow::bail!("project_key_source_changed");
+        }
+    }
+    let mut excluded = Vec::new();
+    let environment = deppy_core::project_keys::KeyEnvironment::Development;
+    let keys = db.project_key_list(workspace_id, environment)?;
+    let managed: std::collections::HashSet<_> = db
+        .project_key_managed_ids(workspace_id, environment)?
+        .into_iter()
+        .collect();
+    for key in keys {
+        if managed.contains(&key.id)
+            && let deppy_core::project_keys::KeySource::Dotenv { file } = key.source
+        {
+            excluded.push((file, key.name));
+        }
+    }
+    for omission in db.project_key_source_exclusions(
+        workspace_id,
+        deppy_core::project_keys::KeyEnvironment::Development,
+    )? {
+        if let deppy_core::project_keys::KeySource::Dotenv { file } = omission.source
+            && !excluded.contains(&(file.clone(), omission.name.clone()))
+        {
+            excluded.push((file, omission.name));
+        }
+    }
+    let Some(entries) =
+        runtime::dotenv::read_dotenv_files_bounded_excluding(root, &files, &excluded)?
+    else {
         return Ok(None);
     };
+    let plan = crate::dotenv_sync::DotenvSyncPlan::from_entries(entries)?;
     crate::dotenv_sync::apply_workspace_dotenv_plan(
         &mut AppDotenvRepository(db),
         secret_store,
@@ -1516,6 +1644,7 @@ fn dotenv_environment_revision(
     if let Some(source) = &payload.dotenv_source {
         source.root.hash(&mut hash);
         source.files.hash(&mut hash);
+        source.excluded_names.hash(&mut hash);
     }
     hash.finish()
 }
@@ -3165,6 +3294,73 @@ fn cross_workspace_restore_command(pane: runtime::MuxPaneId) -> runtime::Runtime
     runtime::RuntimeCommand::RestoreWorkspacePane { pane }
 }
 
+fn project_keys_service_factory(db_path: PathBuf) -> crate::project_keys::service::ServiceFactory {
+    Arc::new(move || {
+        let db = crate::project_keys::service::storage_error(Db::open(&db_path))?;
+        Ok(crate::project_keys::service::ProjectKeysService {
+            db,
+            secrets: Arc::new(KeyringSecretStore),
+        })
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn project_keys_test_service(
+    path: &Path,
+    secrets: Arc<dyn secret::SecretStore>,
+) -> Result<
+    crate::project_keys::service::ProjectKeysService,
+    crate::project_keys::contracts::ProjectKeysError,
+> {
+    Ok(crate::project_keys::service::ProjectKeysService {
+        db: crate::project_keys::service::storage_error(Db::open(path))?,
+        secrets,
+    })
+}
+
+fn new_project_keys_worker(
+    db_path: PathBuf,
+    ctx: egui::Context,
+) -> crate::project_keys::worker::ProjectKeysWorker {
+    #[cfg(test)]
+    {
+        let _ = (db_path, ctx);
+        crate::project_keys::worker::ProjectKeysWorker::dormant_for_tests()
+    }
+    #[cfg(not(test))]
+    crate::project_keys::worker::ProjectKeysWorker::spawn_with_factory(
+        project_keys_service_factory(db_path),
+        Arc::new(crate::project_keys::process::NativeClipboard),
+        Arc::new(crate::project_keys::process::NativeProcessRunner::default()),
+        move || ctx.request_repaint(),
+    )
+}
+
+pub(crate) fn run_project_keys_cli(
+    arguments: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Result<Option<i32>, crate::project_keys::contracts::ProjectKeysError> {
+    use crate::project_keys::{cli::CliAction, contracts::ProjectKeysError};
+    match crate::project_keys::cli::dispatch(arguments)? {
+        CliAction::Gui => Ok(None),
+        CliAction::Print(text) => {
+            println!("{text}");
+            Ok(Some(0))
+        }
+        CliAction::Run(request) => {
+            let paths = crate::paths::AppPaths::init().map_err(|_| ProjectKeysError::Storage)?;
+            secret::init_platform_store().map_err(|_| ProjectKeysError::Locked)?;
+            let service = project_keys_service_factory(paths.data_dir.join("metadata.sqlite3"))()?;
+            let runner = crate::project_keys::process::NativeProcessRunner::for_cli();
+            let result = crate::project_keys::cli::run(request, &service, &runner);
+            if runner.was_cancelled() {
+                Ok(Some(130))
+            } else {
+                result.map(Some)
+            }
+        }
+    }
+}
+
 struct AppDotenvResource {
     db_path: PathBuf,
     db: Option<Db>,
@@ -3641,7 +3837,9 @@ fn load_dotenv_default_env(db: &Db, workspace_id: &str) -> anyhow::Result<(EnvPa
     if let Some(profile) = db
         .list_env_profiles_bounded(workspace_id, ENV_PROFILE_PROJECTION_MAX)?
         .into_iter()
-        .find(|profile| profile.kind == crate::dotenv_sync::DOTENV_PROFILE_KIND)
+        .find(|profile| {
+            profile.kind == crate::dotenv_sync::DOTENV_PROFILE_KIND && !profile.is_production
+        })
     {
         for var in db.list_env_vars_bounded(&profile.id, ENV_VARIABLE_PROJECTION_MAX)? {
             match var.value {
@@ -3653,6 +3851,98 @@ fn load_dotenv_default_env(db: &Db, workspace_id: &str) -> anyhow::Result<(EnvPa
         }
     }
     Ok((env_plain, env_secrets))
+}
+
+/// Metadata-only projection after the worker has refreshed originals. Existing advanced bindings
+/// remain separate; managed names never fall back to old dotenv rows or ambient shell values.
+pub(crate) fn project_keys_legacy_default_overlay(
+    context: (&Db, &dyn secret::SecretStore),
+    workspace: &str,
+    env_plain: &mut EnvPairs,
+    env_secrets: &mut EnvPairs,
+    api_secrets: &mut EnvPairs,
+    source_failed: bool,
+) -> anyhow::Result<Vec<String>> {
+    use deppy_core::project_keys::*;
+    let (db, secret_store) = context;
+    let keys = db.project_key_list(workspace, KeyEnvironment::Development)?;
+    let managed: std::collections::HashSet<_> = db
+        .project_key_managed_ids(workspace, KeyEnvironment::Development)?
+        .into_iter()
+        .collect();
+    let settings = db.project_key_settings(workspace, KeyEnvironment::Development)?;
+    let mut excluded = std::collections::BTreeSet::new();
+    let mut managed_legacy = std::collections::BTreeSet::new();
+    let mut effective = std::collections::BTreeMap::<String, ProjectKey>::new();
+    for mut key in keys {
+        if !managed.contains(&key.id) {
+            continue;
+        }
+        if key.usage != KeyUsage::LegacyAgent {
+            if key.source.is_file() && key.legacy_reference.is_none() {
+                excluded.insert(key.name);
+            }
+            continue;
+        }
+        managed_legacy.insert(key.name.clone());
+        excluded.insert(key.name.clone());
+        if key.source.is_file() {
+            let Some(index) = settings
+                .sources
+                .iter()
+                .position(|source| source == &key.source)
+            else {
+                continue;
+            };
+            key.source_priority = index as i32 + 1;
+        }
+        if effective
+            .get(&key.name)
+            .is_none_or(|old| old.source_priority < key.source_priority)
+        {
+            effective.insert(key.name.clone(), key);
+        }
+    }
+    for omission in db.project_key_source_exclusions(workspace, KeyEnvironment::Development)? {
+        excluded.insert(omission.name);
+    }
+    env_plain.retain(|(name, _)| !excluded.contains(name));
+    env_secrets.retain(|(name, _)| !excluded.contains(name));
+    api_secrets.retain(|(name, _)| !managed_legacy.contains(name));
+    for key in effective.into_values() {
+        if !(source_failed && key.source.is_file())
+            && key.storage_state == KeyStorageState::Stored
+            && key.last_good_revision == Some(key.revision)
+            && let Some(id) = key.credential_id.as_ref()
+        {
+            if key.kind == KeyKind::Configuration {
+                let scope = crate::project_keys::contracts::ProjectKeysScope {
+                    workspace_id: workspace.into(),
+                    environment: KeyEnvironment::Development,
+                };
+                let value = crate::project_keys::service::read_project_key_bundle(
+                    db,
+                    secret_store,
+                    &scope,
+                    &key,
+                )
+                .map_err(|_| anyhow::anyhow!("project_key_operation_failed"))?
+                .into_parts()
+                .0;
+                let value = value.into_string();
+                Db::validate_env_var_for_persistence(
+                    &key.name,
+                    &crate::env::EnvValue::Plain(value.clone()),
+                )?;
+                env_plain.push((key.name, value));
+            } else if key.source == KeySource::Vault {
+                api_secrets.push((key.name, id.clone()));
+            } else {
+                env_secrets.push((key.name, id.clone()));
+            }
+        }
+    }
+    Ok(excluded.into_iter().collect())
 }
 
 fn execute_dotenv_sync_job(
@@ -3670,7 +3960,8 @@ fn execute_dotenv_sync_job(
         .env_source_files(&job.workspace_id)
         .map_err(|_| crate::dotenv_sync::DotenvWorkerErrorCode::ExecuteFailed)?;
     let baseline = dotenv_state_for_sources(job.root.as_deref(), &source_files);
-    let selection = Some(runtime::dotenv::DotenvSourceSelection {
+    let mut selection = Some(runtime::dotenv::DotenvSourceSelection {
+        excluded_names: Vec::new(),
         root: job.root.clone(),
         files: source_files.clone(),
     });
@@ -3678,7 +3969,7 @@ fn execute_dotenv_sync_job(
         if !job.force && job.previous_state == Some(baseline) {
             return Ok(None);
         }
-        let api_secrets = db
+        let mut api_secrets = db
             .list_credential_env_bindings(&job.workspace_id)?
             .into_iter()
             .map(|binding| (binding.env_name, binding.credential_id))
@@ -3700,6 +3991,16 @@ fn execute_dotenv_sync_job(
         };
         // API 조회 성공과 파일 동기화 실패를 분리한다. 보관된 dotenv 값은 주입하지 않는다.
         let source = (|| -> anyhow::Result<_> {
+            #[cfg(not(test))]
+            let service = project_keys_service_factory(resource.db_path.clone())()
+                .map_err(|_| anyhow::anyhow!("project_key_operation_failed"))?;
+            #[cfg(not(test))]
+            service
+                .root_handle(&crate::project_keys::contracts::ProjectKeysScope {
+                    workspace_id: job.workspace_id.clone(),
+                    environment: deppy_core::project_keys::KeyEnvironment::Development,
+                })
+                .map_err(|_| anyhow::anyhow!("project_key_operation_failed"))?;
             if job.migrate_legacy && source_files == Db::default_env_source_files() {
                 let mut repository = AppDotenvRepository(db);
                 crate::dotenv_sync::migrate_legacy_profiles_to_dotenv(
@@ -3716,6 +4017,13 @@ fn execute_dotenv_sync_job(
                 &job.workspace_id,
                 root,
             )?;
+            #[cfg(not(test))]
+            service
+                .refresh_scope(&crate::project_keys::contracts::ProjectKeysScope {
+                    workspace_id: job.workspace_id.clone(),
+                    environment: deppy_core::project_keys::KeyEnvironment::Development,
+                })
+                .map_err(|_| anyhow::anyhow!("project_key_operation_failed"))?;
             let (env_plain, env_secrets) = if report.is_some() {
                 load_dotenv_default_env(db, &job.workspace_id)?
             } else {
@@ -3723,7 +4031,7 @@ fn execute_dotenv_sync_job(
             };
             Ok((report, env_plain, env_secrets))
         })();
-        let (source_failed, report, env_plain, env_secrets) = match source {
+        let (source_failed, report, mut env_plain, mut env_secrets) = match source {
             Ok((report, plain, secrets)) => (false, report, plain, secrets),
             Err(_) => {
                 tracing::warn!(
@@ -3733,6 +4041,17 @@ fn execute_dotenv_sync_job(
                 (true, None, Vec::new(), Vec::new())
             }
         };
+        let excluded = project_keys_legacy_default_overlay(
+            (db, &KeyringSecretStore),
+            &job.workspace_id,
+            &mut env_plain,
+            &mut env_secrets,
+            &mut api_secrets,
+            source_failed,
+        )?;
+        if let Some(selection) = &mut selection {
+            selection.excluded_names = excluded;
+        }
         let mut payload = DotenvSyncPayload {
             secret_versions: Vec::new(),
             revision: 0,
@@ -4122,13 +4441,16 @@ fn validate_settings_registration(
 }
 
 fn prepare_agent_launch(
-    db: &Db,
+    context: (&Db, &dyn secret::SecretStore),
     workspace_id: &str,
     agent_id: &str,
     profile_id: Option<&str>,
     runtime_workspace_id: String,
     extra_arg: Option<Arc<str>>,
 ) -> anyhow::Result<PreparedAgentLaunch> {
+    // Production callers run inside SettingsSnapshotWorker. The UI receives only the completed
+    // bounded launch projection; protected Configuration reads never occur in render/dispatch.
+    let (db, secret_store) = context;
     let rows = db.settings_agent_launch_rows(workspace_id, agent_id, profile_id)?;
     let agent = rows.agent.context("settings_agent_missing")?;
     // extra_arg(배치 스폰 렌더된 프롬프트, PR-S2)도 같은 바이트 상한에 포함시켜, 설정
@@ -4149,13 +4471,70 @@ fn prepare_agent_launch(
 
     let mut env_plain = Vec::new();
     let mut env_secrets = Vec::new();
-    if profile_id.is_some() {
-        anyhow::ensure!(rows.profile.is_some(), "settings_profile_not_owned");
+    if let Some(profile_id) = profile_id {
+        use deppy_core::project_keys::*;
+        let profile = rows.profile.context("settings_profile_not_owned")?;
+        let environment = if profile.is_production || profile.kind == "production" {
+            KeyEnvironment::Production
+        } else {
+            KeyEnvironment::Development
+        };
+        let keys = db.project_key_list(workspace_id, environment)?;
+        let scope = crate::project_keys::contracts::ProjectKeysScope {
+            workspace_id: workspace_id.into(),
+            environment,
+        };
         for var in rows.env_vars {
             match var.value {
                 crate::env::EnvValue::Plain(value) => env_plain.push((var.key, value)),
                 crate::env::EnvValue::Secret { credential_id } => {
-                    env_secrets.push((var.key, credential_id));
+                    let mut configuration = None;
+                    for key in &keys {
+                        if key.name == var.key
+                            && key.kind == KeyKind::Configuration
+                            && key.usage == KeyUsage::LegacyAgent
+                            && key.credential_id.as_deref() == Some(&credential_id)
+                            && db
+                                .project_key_legacy_env_profile(
+                                    workspace_id,
+                                    environment,
+                                    &key.id,
+                                    key.revision,
+                                )?
+                                .as_deref()
+                                == Some(profile_id)
+                        {
+                            anyhow::ensure!(
+                                configuration.is_none(),
+                                "settings_configuration_ambiguous"
+                            );
+                            configuration = Some(key);
+                        }
+                    }
+                    if let Some(key) = configuration {
+                        anyhow::ensure!(
+                            key.storage_state == KeyStorageState::Stored
+                                && key.last_good_revision == Some(key.revision),
+                            "settings_configuration_unavailable"
+                        );
+                        let value = crate::project_keys::service::read_project_key_bundle(
+                            db,
+                            secret_store,
+                            &scope,
+                            key,
+                        )
+                        .map_err(|_| anyhow::anyhow!("settings_configuration_unavailable"))?
+                        .into_parts()
+                        .0
+                        .into_string();
+                        Db::validate_env_var_for_persistence(
+                            &var.key,
+                            &crate::env::EnvValue::Plain(value.clone()),
+                        )?;
+                        env_plain.push((var.key, value));
+                    } else {
+                        env_secrets.push((var.key, credential_id));
+                    }
                 }
             }
         }
@@ -4216,7 +4595,7 @@ fn prepare_quick_agent_launch(
     Db::validate_agent_args_for_persistence(&agent_args)?;
     db.upsert_builtin_agent_config(kind.stable_config_id(), kind.label(), &agent_command)?;
     let mut prepared = prepare_agent_launch(
-        db,
+        (db, &KeyringSecretStore),
         workspace_id,
         kind.stable_config_id(),
         None,
@@ -4852,7 +5231,7 @@ fn execute_settings_job_with_repair(
             extra_arg,
         } => SettingsOutcomeKind::AgentLaunchPrepared(
             prepare_agent_launch(
-                db,
+                (db, &KeyringSecretStore),
                 &workspace_id,
                 &agent_id,
                 profile_id.as_deref(),
@@ -9951,6 +10330,13 @@ pub struct App {
     /// Agents/Environment leaf가 읽는 immutable snapshot과 mutation intent를 전담한다.
     /// 첫 설정 요청에서만 thread/SQLite connection을 만들고 30초 idle이면 둘 다 회수한다.
     settings_snapshot_worker: SettingsSnapshotWorker,
+    project_keys_worker: crate::project_keys::worker::ProjectKeysWorker,
+    project_keys_ui: ui::project_keys::ProjectKeysUi,
+    project_keys_scope: Option<crate::project_keys::contracts::ProjectKeysScope>,
+    project_keys_snapshot: Option<Arc<crate::project_keys::contracts::ProjectKeysSnapshot>>,
+    pending_project_keys:
+        std::collections::VecDeque<crate::project_keys::contracts::ProjectKeysIntent>,
+    project_keys_legacy_advanced: bool,
     /// Render/logic producers stage at most one settings job; worker spawn/send/join happens only
     /// from logic on the next tick.
     pending_settings_job: Option<SettingsJob>,
@@ -16107,6 +16493,7 @@ impl App {
             egui_ctx.clone(),
             secret_repair,
         );
+        let project_keys_worker = new_project_keys_worker(db_path.clone(), egui_ctx.clone());
         let launcher_ctx = egui_ctx.clone();
         let agent_model_workers = std::array::from_fn(|index| {
             let ctx = egui_ctx.clone();
@@ -16331,6 +16718,12 @@ impl App {
             pending_env_secret_reveal: None,
             env_secret_generation: 0,
             settings_snapshot_worker,
+            project_keys_worker,
+            project_keys_ui: Default::default(),
+            project_keys_scope: None,
+            project_keys_snapshot: None,
+            pending_project_keys: Default::default(),
+            project_keys_legacy_advanced: false,
             pending_settings_job: None,
             settings_snapshot_generation: 0,
             settings_snapshot_revision: 0,
@@ -24811,7 +25204,8 @@ impl App {
             || self.cross_workspace_open_warning.is_some()
             || (self.settings_open
                 && (self.env_project_close_confirm.is_some()
-                    || self.env_profiles_ui.has_pending_confirmation()))
+                    || self.env_profiles_ui.has_pending_confirmation()
+                    || self.project_keys_ui.has_dialog()))
             || !self.document_pending_confirms.is_empty()
             || self
                 .file_tree
@@ -28436,7 +28830,108 @@ impl App {
     }
 
     /// 탐색이나 닫기에서만 초안과 이전 화면의 공개 요청을 정리한다.
+    fn pump_project_keys(&mut self) {
+        use crate::project_keys::contracts::*;
+        if self.settings_open && self.settings_category == ui::settings::Category::Environment {
+            let workspace_id = self
+                .settings_workspace_id
+                .clone()
+                .unwrap_or_else(|| self.active.id.clone());
+            if self
+                .project_keys_scope
+                .as_ref()
+                .is_none_or(|scope| scope.workspace_id != workspace_id)
+            {
+                self.project_keys_scope = Some(ProjectKeysScope {
+                    workspace_id,
+                    environment: deppy_core::project_keys::KeyEnvironment::Development,
+                });
+                self.project_keys_snapshot = None;
+            }
+        }
+        // Select the requested scope before admitting queued side effects from any prior frame.
+        if let Some(scope) = self.project_keys_scope.clone()
+            && self.project_keys_worker.select_scope(scope).is_err()
+        {
+            self.egui_ctx.request_repaint();
+            return;
+        }
+        while let Some(intent) = self.pending_project_keys.pop_front() {
+            match intent {
+                ProjectKeysIntent::SelectScope(scope) => {
+                    self.settings_workspace_id = Some(scope.workspace_id.clone());
+                    if self
+                        .project_keys_worker
+                        .select_scope(scope.clone())
+                        .is_err()
+                    {
+                        self.pending_project_keys
+                            .push_front(ProjectKeysIntent::SelectScope(scope));
+                        self.egui_ctx.request_repaint();
+                        return;
+                    }
+                    self.project_keys_scope = Some(scope);
+                    self.project_keys_snapshot = None;
+                }
+                ProjectKeysIntent::Request {
+                    fence,
+                    action: ProjectKeysAction::LegacyAdvanced,
+                } => {
+                    self.project_keys_legacy_advanced = true;
+                    self.project_keys_ui.apply_ack(&ProjectKeysAck {
+                        fence,
+                        result: Ok(ProjectKeysAckPayload::Done),
+                    });
+                }
+                ProjectKeysIntent::Request { fence, action } => {
+                    if let Err(ack) = self.project_keys_worker.try_request(fence, action) {
+                        self.project_keys_ui.apply_ack(&ack);
+                    }
+                }
+            }
+        }
+        if let Some(scope) = self.project_keys_scope.clone() {
+            let generation = self.project_keys_worker.select_scope(scope.clone());
+            if generation.is_err() {
+                self.egui_ctx.request_repaint();
+            }
+            if let Some(snapshot) = self.project_keys_worker.snapshot().filter(|snapshot| {
+                snapshot.scope == scope
+                    && generation
+                        .as_ref()
+                        .is_ok_and(|generation| snapshot.generation == *generation)
+            }) {
+                self.project_keys_ui.prepare(&snapshot);
+                self.project_keys_snapshot = Some(snapshot);
+            }
+        }
+        while let Some(ack) = self.project_keys_worker.try_ack() {
+            if matches!(ack.result, Ok(ProjectKeysAckPayload::RuntimeChanged)) {
+                self.workspace_environment_changed(&ack.fence.scope.workspace_id);
+                self.refresh_env_profile_ui(&ack.fence.scope.workspace_id);
+                self.invalidate_env_api_projects();
+            }
+            if let Ok(ProjectKeysAckPayload::DeletedKey { usage, .. }) = &ack.result {
+                if *usage == deppy_core::project_keys::KeyUsage::LegacyAgent {
+                    self.workspace_environment_changed(&ack.fence.scope.workspace_id);
+                }
+                self.refresh_env_profile_ui(&ack.fence.scope.workspace_id);
+                self.invalidate_env_api_projects();
+            }
+            if let Ok(ProjectKeysAckPayload::SavedKey(key)) = &ack.result {
+                if key.usage == deppy_core::project_keys::KeyUsage::LegacyAgent {
+                    self.workspace_environment_changed(&key.workspace_id);
+                }
+                self.refresh_env_profile_ui(&key.workspace_id);
+                self.invalidate_env_api_projects();
+            }
+            self.project_keys_ui.apply_ack(&ack);
+        }
+    }
+
     fn reset_environment_view_state(&mut self) {
+        self.project_keys_ui.reset();
+        self.project_keys_snapshot = None;
         self.environment_ui
             .reset(&mut self.env_profiles_ui, &mut self.credentials_ui);
         self.pending_env_secret_reveal = None;
@@ -32527,6 +33022,17 @@ impl App {
     /// eframe renderer feature와 무관한 공통 종료 경로. `App::on_exit` 시그니처만
     /// `glow` feature에 따라 달라지므로 실제 정리는 여기 한 번만 유지한다.
     fn shutdown_on_exit(&mut self) {
+        // Actual exit waits for native child cancellation, receipt finalization, and PEM RAII.
+        // UI ticks and AppDrop never wait for worker IO.
+        if !self
+            .project_keys_worker
+            .shutdown(std::time::Duration::from_secs(5))
+        {
+            tracing::warn!(
+                error_code = "project_key_shutdown_incomplete",
+                "project key worker shutdown did not settle within its deadline"
+            );
+        }
         revoke_followup_authorizations(
             &mut self.pty_followup,
             &self.pending_prompt_deliveries,
@@ -32814,6 +33320,7 @@ impl eframe::App for App {
     // 스킵 판단에 쓰는 바로 그 신호(minimized OR occluded — macOS는 occluded로 갱신되어
     // minimized 미갱신 문제를 피한다). None(미보고)이면 안전하게 Active 유지.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.pump_project_keys();
         self.prune_session_aux_views();
         self.pump_scrollback_policy(ctx);
         self.pump_prompt_library_save();
@@ -36358,7 +36865,25 @@ impl eframe::App for App {
             if let Some((origin_workspace, request)) = environment_request {
                 let current_cwd = request.current_cwd(&self.session_cwds).map(str::to_owned);
                 if let Some(prefill) = request.prefill {
-                    self.environment_ui.queue_prefill(selected, prefill);
+                    // API selections preserve the legacy free-form credential label/value contract.
+                    if prefill.is_api() {
+                        self.environment_ui.queue_prefill(selected.clone(), prefill);
+                        self.project_keys_legacy_advanced = true;
+                    } else {
+                        let (kind, value) = prefill.into_parts();
+                        if let Ok(value) =
+                            crate::project_keys::contracts::SensitiveDraft::new(value.into_inner())
+                        {
+                            self.project_keys_ui.prefill(kind, value);
+                            self.project_keys_legacy_advanced = false;
+                            self.project_keys_scope =
+                                Some(crate::project_keys::contracts::ProjectKeysScope {
+                                    workspace_id: selected,
+                                    environment:
+                                        deppy_core::project_keys::KeyEnvironment::Development,
+                                });
+                        }
+                    }
                 }
                 // 폴더 등록 배너는 기존 활성 프로젝트 전용 동선을 유지한다.
                 if origin_workspace == self.active.id
@@ -36606,6 +37131,8 @@ impl eframe::App for App {
             self.settings_snapshot_pending || self.pending_settings_job.is_some(),
         );
         let mut connector_intent: Option<connector_contract::ConnectorIntent> = None;
+        let mut project_keys_intents = Vec::new();
+        let project_keys_snapshot = self.project_keys_snapshot.clone();
         // .env 라이브 반영 토글(E5 ⑨) — 클로저 안에서 편집하고 밖에서 저장/적용.
         let mut env_live_reload_toggle = self.config.ui.env_live_reload;
         // 저장된 보기 선택과 무관하게 기존 화면을 사용한다. 새 화면 코드는 복구용으로 보관한다.
@@ -36722,279 +37249,313 @@ impl eframe::App for App {
                             .render(ui, self.connector_snapshot_reader.snapshot());
                     }
                     C::Environment => {
-                        // 이 화면은 참조 목업처럼 전용 monospace grid를 사용한다.
-                        let style = ui.style_mut();
-                        style
-                            .text_styles
-                            .insert(egui::TextStyle::Body, egui::FontId::monospace(14.0));
-                        style
-                            .text_styles
-                            .insert(egui::TextStyle::Button, egui::FontId::monospace(13.0));
-                        style
-                            .text_styles
-                            .insert(egui::TextStyle::Small, egui::FontId::monospace(12.0));
-                        if !environment_classic_view {
-                            style
-                                .text_styles
-                                .insert(egui::TextStyle::Body, egui::FontId::proportional(14.0));
-                            style
-                                .text_styles
-                                .insert(egui::TextStyle::Button, egui::FontId::proportional(13.0));
-                            style
-                                .text_styles
-                                .insert(egui::TextStyle::Small, egui::FontId::proportional(12.0));
+                        if let Some(view) = ui::settings::take_environment_search_view(ui.ctx()) {
+                            self.project_keys_legacy_advanced = match view {
+                                ui::settings::EnvironmentSearchView::ProjectKeys => false,
+                                ui::settings::EnvironmentSearchView::Advanced => true,
+                            };
                         }
-                        ui.painter()
-                            .rect_filled(ui.clip_rect(), 0.0, ui.visuals().panel_fill);
-                        // 프로젝트 rail은 전용 renderer가 배경을 그린다.
-                        // T1: 우클릭 진입 시 감지한 세션 폴더 배너 — cwd가 어떤 워크스페이스에도
-                        // 속하지 않으면 새 프로젝트 등록, 활성 워크스페이스가 경로 미설정이면
-                        // 이 폴더 지정 CTA. 클릭 시 기존 ws_create/SetProjectPath 흐름 재사용.
-                        let mut banner_used = false;
-                        let mut banner_register_requested = false;
-                        if settings_env_wsid.as_deref() == Some(wsid.as_str())
-                            && let Some(banner) = &self.env_session_banner
-                        {
-                            let show_register = !banner.registered;
-                            let show_set_path = env_project_root.is_none();
-                            if show_register || show_set_path {
-                                egui::Frame::NONE
-                                    .inner_margin(egui::Margin::symmetric(14, 8))
-                                    .show(ui, |ui| {
-                                        ui.horizontal_wrapped(|ui| {
-                                            let display =
-                                                ui::env_project_list::display_project_path(
-                                                    &banner.cwd.to_string_lossy(),
-                                                );
-                                            ui.label(text.t(
-                                                "env.session_cwd.detected",
-                                                &[("path", &display)],
-                                            ));
-                                            if show_register
-                                                && ui
-                                                    .add_enabled(
-                                                        !banner.registration_pending,
-                                                        egui::Button::new(text.t(
-                                                            if banner.registration_pending {
-                                                                "workspace.add.opening"
-                                                            } else {
-                                                                "env.session_cwd.register"
-                                                            },
-                                                            &[],
-                                                        )),
-                                                    )
-                                                    .clicked()
-                                            {
-                                                settings_ws_create = Some(banner.cwd.clone());
-                                                banner_register_requested = true;
-                                            }
-                                            if show_set_path
-                                                && ui
-                                                    .add_enabled(
-                                                        !banner.registration_pending,
-                                                        egui::Button::new(
-                                                            text.t(
+                        if !self.project_keys_legacy_advanced {
+                            if let Some(snapshot) = project_keys_snapshot.as_deref() {
+                                project_keys_intents
+                                    .extend(self.project_keys_ui.show(ui, snapshot, &text));
+                            } else {
+                                ui.add(egui::Spinner::new());
+                                ui.label(text.t("env.background.loading", &[]));
+                            }
+                        } else {
+                            if ui
+                                .button(text.t("project_keys.back_to_keys", &[]))
+                                .clicked()
+                            {
+                                self.project_keys_legacy_advanced = false;
+                            }
+                            // 이 화면은 참조 목업처럼 전용 monospace grid를 사용한다.
+                            let style = ui.style_mut();
+                            style
+                                .text_styles
+                                .insert(egui::TextStyle::Body, egui::FontId::monospace(14.0));
+                            style
+                                .text_styles
+                                .insert(egui::TextStyle::Button, egui::FontId::monospace(13.0));
+                            style
+                                .text_styles
+                                .insert(egui::TextStyle::Small, egui::FontId::monospace(12.0));
+                            if !environment_classic_view {
+                                style.text_styles.insert(
+                                    egui::TextStyle::Body,
+                                    egui::FontId::proportional(14.0),
+                                );
+                                style.text_styles.insert(
+                                    egui::TextStyle::Button,
+                                    egui::FontId::proportional(13.0),
+                                );
+                                style.text_styles.insert(
+                                    egui::TextStyle::Small,
+                                    egui::FontId::proportional(12.0),
+                                );
+                            }
+                            ui.painter()
+                                .rect_filled(ui.clip_rect(), 0.0, ui.visuals().panel_fill);
+                            // 프로젝트 rail은 전용 renderer가 배경을 그린다.
+                            // T1: 우클릭 진입 시 감지한 세션 폴더 배너 — cwd가 어떤 워크스페이스에도
+                            // 속하지 않으면 새 프로젝트 등록, 활성 워크스페이스가 경로 미설정이면
+                            // 이 폴더 지정 CTA. 클릭 시 기존 ws_create/SetProjectPath 흐름 재사용.
+                            let mut banner_used = false;
+                            let mut banner_register_requested = false;
+                            if settings_env_wsid.as_deref() == Some(wsid.as_str())
+                                && let Some(banner) = &self.env_session_banner
+                            {
+                                let show_register = !banner.registered;
+                                let show_set_path = env_project_root.is_none();
+                                if show_register || show_set_path {
+                                    egui::Frame::NONE
+                                        .inner_margin(egui::Margin::symmetric(14, 8))
+                                        .show(ui, |ui| {
+                                            ui.horizontal_wrapped(|ui| {
+                                                let display =
+                                                    ui::env_project_list::display_project_path(
+                                                        &banner.cwd.to_string_lossy(),
+                                                    );
+                                                ui.label(text.t(
+                                                    "env.session_cwd.detected",
+                                                    &[("path", &display)],
+                                                ));
+                                                if show_register
+                                                    && ui
+                                                        .add_enabled(
+                                                            !banner.registration_pending,
+                                                            egui::Button::new(text.t(
+                                                                if banner.registration_pending {
+                                                                    "workspace.add.opening"
+                                                                } else {
+                                                                    "env.session_cwd.register"
+                                                                },
+                                                                &[],
+                                                            )),
+                                                        )
+                                                        .clicked()
+                                                {
+                                                    settings_ws_create = Some(banner.cwd.clone());
+                                                    banner_register_requested = true;
+                                                }
+                                                if show_set_path
+                                                    && ui
+                                                        .add_enabled(
+                                                            !banner.registration_pending,
+                                                            egui::Button::new(text.t(
                                                                 "env.session_cwd.set_project",
                                                                 &[],
-                                                            ),
-                                                        ),
-                                                    )
-                                                    .clicked()
-                                            {
-                                                env_action = Some(
-                                                    ui::env_profiles::EnvAction::SetProjectPath(
-                                                        banner.cwd.clone(),
-                                                    ),
-                                                );
-                                                banner_used = true;
-                                            }
-                                        });
-                                        if let Some(error) = banner.registration_error {
-                                            ui.colored_label(
-                                                ui.visuals().error_fg_color,
-                                                text.t(
-                                                    if error == SettingsErrorCode::WorkspaceIdentity
-                                                    {
-                                                        "workspace.add.folder_identity_conflict"
-                                                    } else {
-                                                        "workspace.add.registration_failed"
-                                                    },
-                                                    &[],
-                                                ),
-                                            );
-                                        }
-                                    });
-                                ui.separator();
-                            }
-                        }
-                        if banner_used {
-                            self.env_session_banner = None;
-                        } else if banner_register_requested
-                            && let Some(banner) = self.env_session_banner.as_mut()
-                        {
-                            banner.registration_pending = true;
-                            banner.registration_error = None;
-                        }
-                        // 전체 가용 높이를 **먼저** 캡처해 좌측 리스트/우측 스크롤에 강제한다
-                        // — horizontal 안에서 available_height가 줄어 리스트가 수십 px로
-                        // 잘리던 회귀 방지(2026-07-09 스크린샷).
-                        let full_h = ui.available_height();
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 0.0;
-                            ui.set_min_height(full_h);
-                            let project_list_style =
-                                ui::env_project_list::EnvProjectListStyle::for_available_width(
-                                    ui.available_width(),
-                                );
-                            match ui::env_project_list::render_with_style(
-                                ui,
-                                env_api_projects,
-                                settings_env_wsid.as_deref().unwrap_or(""),
-                                &text,
-                                &project_list_style,
-                            ) {
-                                ui::env_project_list::EnvProjectListAction::None => {}
-                                ui::env_project_list::EnvProjectListAction::Select(id) => {
-                                    settings_workspace_select = Some(id);
-                                }
-                                ui::env_project_list::EnvProjectListAction::AddRequested => {
-                                    settings_folder_picker_requested = true;
-                                }
-                                ui::env_project_list::EnvProjectListAction::CloseRequested(id) => {
-                                    // Environment 목록에서만 닫는 확인 모달. workspace DB,
-                                    // sidebar 표시 상태, runtime/session은 건드리지 않는다.
-                                    let name = env_api_projects
-                                        .iter()
-                                        .find(|p| p.id == id)
-                                        .map(|p| p.name.clone())
-                                        .unwrap_or_default();
-                                    self.env_project_close_confirm = Some((id, name));
-                                }
-                            }
-                            // 리스트/상세 경계 — separator(6px 스트립)는 우측에 배경
-                            // 띠를 남겼다(codex Low) → 1px vline으로 대체.
-                            {
-                                let h = ui.available_height();
-                                let (r, _) = ui
-                                    .allocate_exact_size(egui::vec2(1.0, h), egui::Sense::hover());
-                                ui.painter().vline(
-                                    r.center().x,
-                                    r.y_range(),
-                                    egui::Stroke::new(
-                                        1.0,
-                                        ui.visuals().widgets.noninteractive.bg_stroke.color,
-                                    ),
-                                );
-                            }
-                            // 우측은 React의 flex column과 동일: 68px 고정 헤더 + body만 scroll.
-                            ui.vertical(|ui| {
-                                ui.spacing_mut().item_spacing.y = 0.0;
-                                ui.set_min_height(full_h);
-                                ui.set_width(ui.available_width());
-                                if settings_env_api_project.is_none() {
-                                    return;
-                                }
-                                render_env_api_project_header(
-                                    ui,
-                                    settings_env_api_project.as_ref(),
-                                    &mut env_action,
-                                    &mut workspace_rename,
-                                    &mut self.env_api_project_edit,
-                                    &text,
-                                );
-                                egui::ScrollArea::vertical()
-                                    .id_salt("env_api_detail_scroll")
-                                    .auto_shrink([false, false])
-                                    .max_height((full_h - 68.0).max(0.0))
-                                    .show(ui, |ui| {
-                                        ui.set_width(ui.available_width());
-                                        egui::Frame::NONE
-                                            .inner_margin(egui::Margin {
-                                                left: 14,
-                                                right: 14,
-                                                top: 0,
-                                                bottom: 12,
-                                            })
-                                            .show(ui, |ui| {
-                                                if env_project_rows_loading {
-                                                    ui.horizontal(|ui| {
-                                                        ui.add(egui::Spinner::new().size(12.0));
-                                                        ui.weak(
-                                                            text.t("env.background.loading", &[]),
-                                                        );
-                                                    });
-                                                } else if env_project_rows_failed {
-                                                    ui.colored_label(
-                                                        ui.visuals().error_fg_color,
-                                                        text.t("env.background.load_failed", &[]),
-                                                    );
-                                                }
-
-                                                if !environment_classic_view {
-                                                    let (next_env, next_credential) =
-                                                        self.environment_ui.contents(
-                                                            ui,
-                                                            &mut self.env_profiles_ui,
-                                                            &self.env_profiles_snapshot,
-                                                            &mut self.credentials_ui,
-                                                            &self.credentials_snapshot,
-                                                            &application_view,
-                                                            &text,
-                                                            &mut env_live_reload_toggle,
-                                                        );
-                                                    if next_env.is_some() {
-                                                        env_action = next_env;
-                                                    }
-                                                    credentials_intent = next_credential;
-                                                } else {
-                                                    let prefill_focus =
-                                                        self.environment_ui.prepare_classic(
-                                                            &mut self.env_profiles_ui,
-                                                            &self.env_profiles_snapshot,
-                                                            &mut self.credentials_ui,
-                                                            &self.credentials_snapshot,
-                                                        );
-                                                    ui::env_profiles::render_application_status(
-                                                        ui,
-                                                        &application_view,
-                                                        &text,
-                                                    );
-                                                    if let Some(action) =
-                                                        self.env_profiles_ui.contents_compact(
-                                                            ui,
-                                                            &self.env_profiles_snapshot,
-                                                            &text,
+                                                            )),
                                                         )
-                                                    {
-                                                        env_action = Some(action);
-                                                    }
-
-                                                    credentials_intent =
-                                                        self.credentials_ui.contents_compact(
-                                                            ui,
-                                                            &self.credentials_snapshot,
-                                                            &text,
-                                                        );
-                                                    if let Some(id) = prefill_focus {
-                                                        ui.memory_mut(|memory| {
-                                                            memory.request_focus(id)
-                                                        });
-                                                    }
-
-                                                    // .env 라이브 반영 토글(E5 ⑨ — 옵트인).
-                                                    ui.add_space(14.0);
-                                                    ui.checkbox(
-                                                        &mut env_live_reload_toggle,
-                                                        text.t("env.live_reload", &[]),
-                                                    )
-                                                    .on_hover_text(
-                                                        text.t("env.live_reload_hint", &[]),
+                                                        .clicked()
+                                                {
+                                                    env_action = Some(
+                                                        ui::env_profiles::EnvAction::SetProjectPath(
+                                                            banner.cwd.clone(),
+                                                        ),
                                                     );
+                                                    banner_used = true;
                                                 }
                                             });
-                                    });
+                                            if let Some(error) = banner.registration_error {
+                                                ui.colored_label(
+                                                    ui.visuals().error_fg_color,
+                                                    text.t(
+                                                        if error
+                                                            == SettingsErrorCode::WorkspaceIdentity
+                                                        {
+                                                            "workspace.add.folder_identity_conflict"
+                                                        } else {
+                                                            "workspace.add.registration_failed"
+                                                        },
+                                                        &[],
+                                                    ),
+                                                );
+                                            }
+                                        });
+                                    ui.separator();
+                                }
+                            }
+                            if banner_used {
+                                self.env_session_banner = None;
+                            } else if banner_register_requested
+                                && let Some(banner) = self.env_session_banner.as_mut()
+                            {
+                                banner.registration_pending = true;
+                                banner.registration_error = None;
+                            }
+                            // 전체 가용 높이를 **먼저** 캡처해 좌측 리스트/우측 스크롤에 강제한다
+                            // — horizontal 안에서 available_height가 줄어 리스트가 수십 px로
+                            // 잘리던 회귀 방지(2026-07-09 스크린샷).
+                            let full_h = ui.available_height();
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 0.0;
+                                ui.set_min_height(full_h);
+                                let project_list_style =
+                                    ui::env_project_list::EnvProjectListStyle::for_available_width(
+                                        ui.available_width(),
+                                    );
+                                match ui::env_project_list::render_with_style(
+                                    ui,
+                                    env_api_projects,
+                                    settings_env_wsid.as_deref().unwrap_or(""),
+                                    &text,
+                                    &project_list_style,
+                                ) {
+                                    ui::env_project_list::EnvProjectListAction::None => {}
+                                    ui::env_project_list::EnvProjectListAction::Select(id) => {
+                                        settings_workspace_select = Some(id);
+                                    }
+                                    ui::env_project_list::EnvProjectListAction::AddRequested => {
+                                        settings_folder_picker_requested = true;
+                                    }
+                                    ui::env_project_list::EnvProjectListAction::CloseRequested(
+                                        id,
+                                    ) => {
+                                        // Environment 목록에서만 닫는 확인 모달. workspace DB,
+                                        // sidebar 표시 상태, runtime/session은 건드리지 않는다.
+                                        let name = env_api_projects
+                                            .iter()
+                                            .find(|p| p.id == id)
+                                            .map(|p| p.name.clone())
+                                            .unwrap_or_default();
+                                        self.env_project_close_confirm = Some((id, name));
+                                    }
+                                }
+                                // 리스트/상세 경계 — separator(6px 스트립)는 우측에 배경
+                                // 띠를 남겼다(codex Low) → 1px vline으로 대체.
+                                {
+                                    let h = ui.available_height();
+                                    let (r, _) = ui.allocate_exact_size(
+                                        egui::vec2(1.0, h),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter().vline(
+                                        r.center().x,
+                                        r.y_range(),
+                                        egui::Stroke::new(
+                                            1.0,
+                                            ui.visuals().widgets.noninteractive.bg_stroke.color,
+                                        ),
+                                    );
+                                }
+                                // 우측은 React의 flex column과 동일: 68px 고정 헤더 + body만 scroll.
+                                ui.vertical(|ui| {
+                                    ui.spacing_mut().item_spacing.y = 0.0;
+                                    ui.set_min_height(full_h);
+                                    ui.set_width(ui.available_width());
+                                    if settings_env_api_project.is_none() {
+                                        return;
+                                    }
+                                    render_env_api_project_header(
+                                        ui,
+                                        settings_env_api_project.as_ref(),
+                                        &mut env_action,
+                                        &mut workspace_rename,
+                                        &mut self.env_api_project_edit,
+                                        &text,
+                                    );
+                                    egui::ScrollArea::vertical()
+                                        .id_salt("env_api_detail_scroll")
+                                        .auto_shrink([false, false])
+                                        .max_height((full_h - 68.0).max(0.0))
+                                        .show(ui, |ui| {
+                                            ui.set_width(ui.available_width());
+                                            egui::Frame::NONE
+                                                .inner_margin(egui::Margin {
+                                                    left: 14,
+                                                    right: 14,
+                                                    top: 0,
+                                                    bottom: 12,
+                                                })
+                                                .show(ui, |ui| {
+                                                    if env_project_rows_loading {
+                                                        ui.horizontal(|ui| {
+                                                            ui.add(egui::Spinner::new().size(12.0));
+                                                            ui.weak(
+                                                                text.t(
+                                                                    "env.background.loading",
+                                                                    &[],
+                                                                ),
+                                                            );
+                                                        });
+                                                    } else if env_project_rows_failed {
+                                                        ui.colored_label(
+                                                            ui.visuals().error_fg_color,
+                                                            text.t(
+                                                                "env.background.load_failed",
+                                                                &[],
+                                                            ),
+                                                        );
+                                                    }
+
+                                                    if !environment_classic_view {
+                                                        let (next_env, next_credential) =
+                                                            self.environment_ui.contents(
+                                                                ui,
+                                                                &mut self.env_profiles_ui,
+                                                                &self.env_profiles_snapshot,
+                                                                &mut self.credentials_ui,
+                                                                &self.credentials_snapshot,
+                                                                &application_view,
+                                                                &text,
+                                                                &mut env_live_reload_toggle,
+                                                            );
+                                                        if next_env.is_some() {
+                                                            env_action = next_env;
+                                                        }
+                                                        credentials_intent = next_credential;
+                                                    } else {
+                                                        let prefill_focus =
+                                                            self.environment_ui.prepare_classic(
+                                                                &mut self.env_profiles_ui,
+                                                                &self.env_profiles_snapshot,
+                                                                &mut self.credentials_ui,
+                                                                &self.credentials_snapshot,
+                                                            );
+                                                        ui::env_profiles::render_application_status(
+                                                            ui,
+                                                            &application_view,
+                                                            &text,
+                                                        );
+                                                        if let Some(action) =
+                                                            self.env_profiles_ui.contents_compact(
+                                                                ui,
+                                                                &self.env_profiles_snapshot,
+                                                                &text,
+                                                            )
+                                                        {
+                                                            env_action = Some(action);
+                                                        }
+
+                                                        credentials_intent =
+                                                            self.credentials_ui.contents_compact(
+                                                                ui,
+                                                                &self.credentials_snapshot,
+                                                                &text,
+                                                            );
+                                                        if let Some(id) = prefill_focus {
+                                                            ui.memory_mut(|memory| {
+                                                                memory.request_focus(id)
+                                                            });
+                                                        }
+
+                                                        // .env 라이브 반영 토글(E5 ⑨ — 옵트인).
+                                                        ui.add_space(14.0);
+                                                        ui.checkbox(
+                                                            &mut env_live_reload_toggle,
+                                                            text.t("env.live_reload", &[]),
+                                                        )
+                                                        .on_hover_text(
+                                                            text.t("env.live_reload_hint", &[]),
+                                                        );
+                                                    }
+                                                });
+                                        });
+                                });
                             });
-                        });
+                        }
                     }
                     C::Agents => {
                         agents_intent = self.agents_ui.contents(ui, &self.agents_snapshot, &text);
@@ -37029,6 +37590,21 @@ impl eframe::App for App {
                 }
             },
         );
+        for intent in project_keys_intents {
+            if self.pending_project_keys.len() < 16 {
+                self.pending_project_keys.push_back(intent);
+                ui.ctx().request_repaint();
+            } else if let crate::project_keys::contracts::ProjectKeysIntent::Request {
+                fence, ..
+            } = intent
+            {
+                self.project_keys_ui
+                    .apply_ack(&crate::project_keys::contracts::ProjectKeysAck {
+                        fence,
+                        result: Err(crate::project_keys::contracts::ProjectKeysError::Busy),
+                    });
+            }
+        }
         if cloud_coordinates_before
             != (
                 self.cloud_agent.port,
@@ -43268,8 +43844,7 @@ mod tests {
 
         let logic = source
             .split_once(
-                "    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.prune_session_aux_views();",
+                "    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {",
             )
             .and_then(|(_, tail)| tail.split_once("mem_pressure_monitor"))
             .map(|(body, _)| body)
@@ -52741,6 +53316,22 @@ mod tests {
         let path = temp_db_path("sources-worker");
         let db = Db::open(&path).unwrap();
         let workspace = db.create_workspace("sources-worker").unwrap();
+        let production = db
+            .insert_env_profile(&workspace, ".env.production", "dotenv")
+            .unwrap();
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE env_profiles SET is_production=1 WHERE id=?1",
+                [&production],
+            )
+            .unwrap();
+        db.upsert_env_var(
+            &production,
+            "PORT",
+            &crate::env::EnvValue::Plain("production".into()),
+        )
+        .unwrap();
         let dir =
             std::env::temp_dir().join(format!("deppy-sources-worker-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -52765,6 +53356,16 @@ mod tests {
         assert_eq!(outcome.source_files, vec!["service.env"]);
         let mut payload = outcome.payload.unwrap();
         assert_eq!(payload.env_plain, vec![("PORT".into(), "selected".into())]);
+        assert_eq!(
+            resource
+                .db
+                .as_ref()
+                .unwrap()
+                .list_env_vars(&production)
+                .unwrap()[0]
+                .value,
+            crate::env::EnvValue::Plain("production".into())
+        );
         assert!(!payload.source_failed);
         configure_dotenv_live_reload(&mut payload, true, Some(&dir));
         assert_eq!(payload.env_plain.last().unwrap().1, "0");
@@ -52970,6 +53571,65 @@ mod tests {
             Arc::new(DeferredSecretRepair::empty()),
         );
         assert!(worker.slot.is_none());
+    }
+
+    #[test]
+    fn project_keys_explicit_profile_preserves_short_configuration_and_precedence() {
+        let fixture = crate::project_keys::tests::Fixture::new();
+        let db = &fixture.service.db;
+        let workspace = &fixture.scope.workspace_id;
+        let profile = db
+            .insert_env_profile(workspace, "selected", "custom")
+            .unwrap();
+        db.upsert_env_var(&profile, "FLAG", &crate::env::EnvValue::Plain("1".into()))
+            .unwrap();
+        let other_profile = db.insert_env_profile(workspace, "other", "custom").unwrap();
+        db.upsert_env_var(
+            &other_profile,
+            "FLAG",
+            &crate::env::EnvValue::Plain("2".into()),
+        )
+        .unwrap();
+        fixture.service.refresh_scope(&fixture.scope).unwrap();
+        db.upsert_builtin_agent_config("fixture-agent", "fixture", "/bin/sh")
+            .unwrap();
+        let prepared = prepare_agent_launch(
+            (db, fixture.store.as_ref()),
+            workspace,
+            "fixture-agent",
+            Some(&profile),
+            workspace.clone(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(prepared.env_plain, vec![("FLAG".into(), "1".into())]);
+        assert!(prepared.env_secrets.is_empty());
+        let other = prepare_agent_launch(
+            (db, fixture.store.as_ref()),
+            workspace,
+            "fixture-agent",
+            Some(&other_profile),
+            workspace.clone(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(other.env_plain, vec![("FLAG".into(), "2".into())]);
+        fixture
+            .store
+            .1
+            .store(true, std::sync::atomic::Ordering::Release);
+        assert!(
+            prepare_agent_launch(
+                (db, fixture.store.as_ref()),
+                workspace,
+                "fixture-agent",
+                Some(&profile),
+                workspace.clone(),
+                None,
+            )
+            .is_err(),
+            "locked protected configuration cannot fall back to old or unclassified values"
+        );
     }
 
     #[test]

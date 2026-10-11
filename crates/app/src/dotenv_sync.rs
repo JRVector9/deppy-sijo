@@ -165,6 +165,7 @@ pub const DOTENV_SKIPPED_KEYS_MAX: usize = 32;
 pub struct DotenvProfile {
     pub id: String,
     pub kind: String,
+    pub is_production: bool,
 }
 
 /// Environment variable projection used by dotenv orchestration.
@@ -298,6 +299,20 @@ pub trait DotenvRepository {
         &mut self,
         limit: usize,
     ) -> anyhow::Result<std::collections::HashSet<String>>;
+    /// Exact managed dotenv bindings are owned by the revision-fenced project-key writer.
+    fn project_key_managed_dotenv_names(
+        &mut self,
+        _workspace_id: &str,
+    ) -> anyhow::Result<std::collections::HashSet<String>> {
+        Ok(std::collections::HashSet::new())
+    }
+    /// Protected/explicitly managed legacy variables must remain in their original profile.
+    fn project_key_managed_profile_variables(
+        &mut self,
+        _workspace_id: &str,
+    ) -> anyhow::Result<std::collections::HashSet<(String, String)>> {
+        Ok(std::collections::HashSet::new())
+    }
     fn plain_env_value_allowed(&mut self, key: &str, value: &str) -> bool;
     fn upsert_env_var(
         &mut self,
@@ -305,6 +320,19 @@ pub trait DotenvRepository {
         key: &str,
         value: &EnvValue,
     ) -> anyhow::Result<()>;
+    fn upsert_unmanaged_env_var(
+        &mut self,
+        profile_id: &str,
+        key: &str,
+        value: &EnvValue,
+    ) -> anyhow::Result<bool> {
+        self.upsert_env_var(profile_id, key, value)?;
+        Ok(true)
+    }
+    fn delete_unmanaged_env_var(&mut self, profile_id: &str, key: &str) -> anyhow::Result<bool> {
+        self.delete_env_var(profile_id, key)?;
+        Ok(true)
+    }
     fn delete_env_var(&mut self, profile_id: &str, key: &str) -> anyhow::Result<()>;
     fn delete_env_profile(&mut self, profile_id: &str) -> anyhow::Result<()>;
 }
@@ -333,6 +361,17 @@ impl std::fmt::Debug for DotenvSyncPlan {
 }
 
 impl DotenvSyncPlan {
+    pub(crate) fn from_entries(entries: Vec<(String, String)>) -> anyhow::Result<Self> {
+        let value_bytes = entries.iter().map(|(_, value)| value.len()).sum::<usize>();
+        anyhow::ensure!(
+            entries.len() <= DOTENV_ENTRIES_MAX && value_bytes <= DOTENV_TOTAL_BYTES_MAX,
+            ERROR_DOTENV_BYTES
+        );
+        Ok(Self {
+            entries,
+            value_bytes,
+        })
+    }
     #[cfg(test)]
     pub fn entry_count(&self) -> usize {
         self.entries.len()
@@ -1118,16 +1157,20 @@ pub fn migrate_legacy_profiles_to_dotenv(
     let legacy: Vec<_> = repository
         .list_env_profiles(workspace_id, DOTENV_PROFILE_SCAN_MAX)?
         .into_iter()
-        .filter(|p| p.kind != DOTENV_PROFILE_KIND)
+        .filter(|p| p.kind != DOTENV_PROFILE_KIND && p.kind != "production" && !p.is_production)
         .collect();
     if legacy.is_empty() {
         return Ok(0);
     }
+    let managed = repository.project_key_managed_profile_variables(workspace_id)?;
     let mut migrated = 0usize;
     for profile in &legacy {
         let vars = repository.list_env_vars(&profile.id, DOTENV_VARIABLE_SCAN_MAX)?;
         let mut remaining = vars.len();
         for var in &vars {
+            if managed.contains(&(profile.id.clone(), var.key.clone())) {
+                continue;
+            }
             let value = match &var.value {
                 EnvValue::Plain(v) => v.clone(),
                 EnvValue::Secret { credential_id } => {
@@ -1180,7 +1223,7 @@ pub fn remove_workspace_dotenv(
     let Some(profile) = repository
         .list_env_profiles(workspace_id, DOTENV_PROFILE_SCAN_MAX)?
         .into_iter()
-        .find(|p| p.kind == DOTENV_PROFILE_KIND)
+        .find(|p| p.kind == DOTENV_PROFILE_KIND && !p.is_production)
     else {
         return Ok(0);
     };
@@ -1236,6 +1279,7 @@ pub fn load_workspace_dotenv_plan(root: &Path) -> anyhow::Result<Option<DotenvSy
     load_workspace_dotenv_plan_for_files(root, &deppy_core::env_sources::default_files())
 }
 
+#[cfg(test)]
 pub fn load_workspace_dotenv_plan_for_files(
     root: &Path,
     files: &[String],
@@ -1279,9 +1323,13 @@ pub fn apply_workspace_dotenv_plan(
     // Secure the complete bounded secret set before the first persistence/keyring mutation. If
     // even one value cannot enter the rotating redaction corpus, every previously acquired lease
     // drops here and the dotenv profile remains untouched.
+    let managed = repository.project_key_managed_dotenv_names(workspace_id)?;
     let mut prepared = Vec::with_capacity(plan.entries.len());
     let mut skipped_keys: Vec<String> = Vec::new();
     for (key, value) in plan.entries {
+        if managed.contains(&key) {
+            continue;
+        }
         // Secret classification must match storage validation: a value the repository refuses to
         // persist as plain is prepared through the same redacted physical-slot path.
         // 마스킹할 수 없는 값은 비밀로 다룰 수 없다(2026-08-21).
@@ -1357,7 +1405,7 @@ pub fn apply_workspace_dotenv_plan(
     let profile_id = match repository
         .list_env_profiles(workspace_id, DOTENV_PROFILE_SCAN_MAX)?
         .into_iter()
-        .find(|p| p.kind == DOTENV_PROFILE_KIND)
+        .find(|p| p.kind == DOTENV_PROFILE_KIND && !p.is_production)
     {
         Some(p) => p.id,
         None => {
@@ -1405,22 +1453,26 @@ pub fn apply_workspace_dotenv_plan(
                     }
                 },
             };
-            if repository
-                .upsert_env_var(
-                    &profile_id,
-                    key,
-                    &EnvValue::Secret {
-                        credential_id: credential_id.clone(),
-                    },
-                )
-                .is_err()
-            {
-                if let Some(created) = newly_created.as_ref()
-                    && let Err(error) = retire_dotenv_credential(repository, secret_store, created)
-                {
-                    warn_secret_failure("bind_rollback", secret_error_code(&error));
+            match repository.upsert_unmanaged_env_var(
+                &profile_id,
+                key,
+                &EnvValue::Secret {
+                    credential_id: credential_id.clone(),
+                },
+            ) {
+                Ok(true) => {}
+                result => {
+                    if let Some(created) = newly_created.as_ref()
+                        && let Err(error) =
+                            retire_dotenv_credential(repository, secret_store, created)
+                    {
+                        warn_secret_failure("bind_rollback", secret_error_code(&error));
+                    }
+                    if result.is_err() {
+                        return Err(static_secret_error(ERROR_SECRET_ENV_BIND));
+                    }
+                    continue;
                 }
-                return Err(static_secret_error(ERROR_SECRET_ENV_BIND));
             }
             report.upserted += 1;
         } else if let PreparedDotenvValue::Plain(value) = value {
@@ -1443,7 +1495,13 @@ pub fn apply_workspace_dotenv_plan(
                 }
                 _ => None,
             };
-            repository.upsert_env_var(&profile_id, key, &EnvValue::Plain(value.clone()))?;
+            if !repository.upsert_unmanaged_env_var(
+                &profile_id,
+                key,
+                &EnvValue::Plain(value.clone()),
+            )? {
+                continue;
+            }
             if let Some(target) = replaced_secret
                 && let Err(error) = retire_dotenv_credential(repository, secret_store, &target)
             {
@@ -1455,6 +1513,9 @@ pub fn apply_workspace_dotenv_plan(
 
     // 병합 결과에서 사라진 키 제거 (+ 이 profile 전용 credential 정리).
     for var in &existing {
+        if managed.contains(&var.key) {
+            continue;
+        }
         if prepared.iter().any(|(k, _)| k == &var.key) {
             continue;
         }
@@ -1472,7 +1533,9 @@ pub fn apply_workspace_dotenv_plan(
         } else {
             None
         };
-        repository.delete_env_var(&profile_id, &var.key)?;
+        if !repository.delete_unmanaged_env_var(&profile_id, &var.key)? {
+            continue;
+        }
         if let Some(target) = cleanup_target
             && let Err(error) = retire_dotenv_credential(repository, secret_store, &target)
         {
@@ -2757,6 +2820,7 @@ mod tests {
                 .map(|row| DotenvProfile {
                     id: row.id,
                     kind: row.kind,
+                    is_production: row.is_production,
                 })
                 .collect())
         }
@@ -2797,6 +2861,18 @@ mod tests {
                 .collect())
         }
 
+        fn project_key_managed_dotenv_names(
+            &mut self,
+            workspace_id: &str,
+        ) -> anyhow::Result<std::collections::HashSet<String>> {
+            crate::app::project_key_managed_dotenv_names(self, workspace_id)
+        }
+        fn project_key_managed_profile_variables(
+            &mut self,
+            workspace_id: &str,
+        ) -> anyhow::Result<std::collections::HashSet<(String, String)>> {
+            crate::app::project_key_managed_profile_variables(self, workspace_id)
+        }
         fn plain_env_value_allowed(&mut self, key: &str, value: &str) -> bool {
             Db::validate_env_var_for_persistence(key, &EnvValue::Plain(value.to_owned())).is_ok()
         }
@@ -2810,6 +2886,21 @@ mod tests {
             Db::upsert_env_var(self, profile_id, key, value)
         }
 
+        fn upsert_unmanaged_env_var(
+            &mut self,
+            profile_id: &str,
+            key: &str,
+            value: &EnvValue,
+        ) -> anyhow::Result<bool> {
+            self.project_key_dotenv_upsert_unmanaged(profile_id, key, value)
+        }
+        fn delete_unmanaged_env_var(
+            &mut self,
+            profile_id: &str,
+            key: &str,
+        ) -> anyhow::Result<bool> {
+            self.project_key_dotenv_delete_unmanaged(profile_id, key)
+        }
         fn delete_env_var(&mut self, profile_id: &str, key: &str) -> anyhow::Result<()> {
             Db::delete_env_var(self, profile_id, key)
         }

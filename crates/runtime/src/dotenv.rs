@@ -17,6 +17,9 @@ pub const DOTENV_FILE_NAMES: [&str; 2] = [".env", ".env.local"];
 pub struct DotenvSourceSelection {
     pub root: Option<std::path::PathBuf>,
     pub files: Vec<String>,
+    /// Managed or explicitly deleted names may not fall back to a restored file or ambient shell.
+    #[serde(default)]
+    pub excluded_names: Vec<String>,
 }
 
 const ERROR_INPUT_BYTES: &str = "dotenv_input_bytes_exceeded";
@@ -164,6 +167,24 @@ pub fn read_dotenv_files_bounded(
     root: &Path,
     files: &[String],
 ) -> anyhow::Result<Option<Vec<(String, String)>>> {
+    read_dotenv_files_bounded_excluding(root, files, &[])
+}
+
+/// Source/name exclusions are applied before merging, so an excluded later source permits the
+/// remaining selected source to supply that name. All inputs still share the original budgets.
+pub fn read_dotenv_files_bounded_excluding(
+    root: &Path,
+    files: &[String],
+    exclusions: &[(String, String)],
+) -> anyhow::Result<Option<Vec<(String, String)>>> {
+    anyhow::ensure!(
+        exclusions.len() <= 512
+            && exclusions.iter().all(|(file, name)| {
+                deppy_core::env_sources::valid_files(std::slice::from_ref(file))
+                    && deppy_core::credential_env::valid_name(name)
+            }),
+        "dotenv_exclusions_invalid"
+    );
     anyhow::ensure!(
         deppy_core::env_sources::valid_files(files),
         "env_source_name_invalid"
@@ -183,6 +204,12 @@ pub fn read_dotenv_files_bounded(
         let parsed = parse_dotenv_bounded(&content, remaining_entries)?;
         remaining_entries -= parsed.len();
         for (key, value) in parsed {
+            if exclusions
+                .iter()
+                .any(|(file, excluded)| file == name && excluded == &key)
+            {
+                continue;
+            }
             if let Some(index) = positions.get(&key).copied() {
                 merged[index].1 = value;
             } else {

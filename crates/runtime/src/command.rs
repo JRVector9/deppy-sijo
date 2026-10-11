@@ -491,6 +491,13 @@ pub(crate) fn runtime_command_retained_bytes(
                 for file in &source.files {
                     retained_string(&mut total, file)?;
                 }
+                retained_add(
+                    &mut total,
+                    source.excluded_names.capacity() * std::mem::size_of::<String>(),
+                )?;
+                for name in &source.excluded_names {
+                    retained_string(&mut total, name)?;
+                }
             }
             retained_env(&mut total, secret_versions)?;
             retained_env(&mut total, env_plain)?;
@@ -670,6 +677,12 @@ pub(crate) fn canonicalize_host_command(command: &mut RuntimeCommand) {
                     canonicalize_string(file);
                 }
                 source.files = std::mem::take(&mut source.files)
+                    .into_boxed_slice()
+                    .into_vec();
+                for name in &mut source.excluded_names {
+                    canonicalize_string(name);
+                }
+                source.excluded_names = std::mem::take(&mut source.excluded_names)
                     .into_boxed_slice()
                     .into_vec();
             }
@@ -933,6 +946,14 @@ pub(crate) fn validate_host_command(command: &RuntimeCommand) -> Result<(), Runt
                 }
                 storage::Db::validate_env_source_files(&source.files)
                     .map_err(|_| admission_error("runtime_env_sources_invalid"))?;
+                if source.excluded_names.len() > 512
+                    || source
+                        .excluded_names
+                        .iter()
+                        .any(|name| !deppy_core::credential_env::valid_name(name))
+                {
+                    return Err(admission_error("runtime_env_exclusions_invalid"));
+                }
             }
             if secret_versions.len() > ENV_ITEMS_MAX
                 || secret_versions.iter().any(|(id, generation)| {

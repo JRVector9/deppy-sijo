@@ -35,6 +35,7 @@ pub mod notes;
 pub mod notifications;
 pub mod popup;
 pub(crate) mod ports;
+pub(crate) mod project_keys;
 pub mod prompt_palette;
 pub(crate) mod resource_manager;
 pub(crate) mod session_close_dialogs;

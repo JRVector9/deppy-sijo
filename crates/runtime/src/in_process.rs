@@ -1444,7 +1444,18 @@ impl Worker {
         )?;
         let (mut resolved_secrets, leases) = self.resolve_secret_env(all_secrets)?;
         let launch_secret_env = resolved_secrets.split_off(default_secret_count);
-        let mut env = self.default_env_plain.clone();
+        let mut env = self
+            .dotenv_source
+            .as_ref()
+            .map(|source| {
+                source
+                    .excluded_names
+                    .iter()
+                    .map(|name| (name.clone(), String::new()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        env.extend(self.default_env_plain.iter().cloned());
         env.extend(resolved_secrets);
         env.extend(launch_plain);
         env.extend(launch_secret_env);
@@ -3712,6 +3723,16 @@ impl Worker {
             .push(("DEPPY_RUNTIME_ID".to_owned(), self.instance_token.clone()));
         // 워크스페이스 기본 env(.env 자동 주입). The complete secret set is resolved and
         // protected before spawn; partial injection would silently change command semantics.
+        if let Some(source) = &self.dotenv_source {
+            spec.env
+                .retain(|(name, _)| !source.excluded_names.contains(name));
+            spec.env.extend(
+                source
+                    .excluded_names
+                    .iter()
+                    .map(|name| (name.clone(), String::new())),
+            );
+        }
         spec.env.extend(self.default_env_plain.iter().cloned());
         let (secret_env, leases) = self.resolve_secret_env(secrets)?;
         spec.env.extend(secret_env);
@@ -3944,6 +3965,10 @@ impl Worker {
                 // 앱이 확정한 라이브 반영 제어값은 복원 파일로 덮어쓰지 않는다.
                 key != "DEPPY_ENV_LIVE_RELOAD"
                     && key != "DEPPY_PROJECT_ROOT"
+                    && self
+                        .dotenv_source
+                        .as_ref()
+                        .is_none_or(|source| !source.excluded_names.contains(key))
                     && !self
                         .default_api_secrets
                         .iter()
@@ -7897,6 +7922,7 @@ mod tests {
         std::fs::write(dir.join(".env"), "PORT=default\n").unwrap();
         std::fs::write(dir.join(".env.dev"), "PORT=selected\n").unwrap();
         worker.dotenv_source = Some(crate::dotenv::DotenvSourceSelection {
+            excluded_names: Vec::new(),
             root: Some(dir.clone()),
             files: vec![".env.dev".into()],
         });
@@ -7908,6 +7934,90 @@ mod tests {
         assert!(worker.restored_dotenv_for_session(&dir).is_empty());
         worker.dotenv_source.as_mut().unwrap().root = None;
         assert!(worker.restored_dotenv_for_session(&dir).is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn project_keys_managed_defaults_scrub_fallback_and_reach_actual_shell() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: Some("current-protected-value".into()),
+        });
+        let (mut worker, _events) = admission_worker(resolver, "managed-project-keys");
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-project-key-runtime-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(
+            dir.join(".env"),
+            "TOKEN=raw-stale-fallback\nBUILD_ONLY=raw-build-value\n",
+        )
+        .unwrap();
+        worker.dotenv_source = Some(crate::dotenv::DotenvSourceSelection {
+            root: Some(dir.clone()),
+            files: vec![".env".into()],
+            excluded_names: vec!["TOKEN".into(), "BUILD_ONLY".into()],
+        });
+        assert!(worker.restored_dotenv_for_session(&dir).is_empty());
+        let marker = dir.join("child-env");
+        let marker_string = marker.to_string_lossy().into_owned();
+        worker.shell = spec(
+            "/bin/sh",
+            &[
+                "-c",
+                "printf '%s\n%s' \"$TOKEN\" \"$BUILD_ONLY\" > \"$1\"",
+                "fixture",
+                &marker_string,
+            ],
+        );
+        worker
+            .shell
+            .env
+            .push(("TOKEN".into(), "old-shell-value".into()));
+        worker
+            .shell
+            .env
+            .push(("BUILD_ONLY".into(), "old-shell-build-value".into()));
+        worker.handle_command(RuntimeCommand::SetSessionDefaultEnv {
+            environment_revision: Some(41),
+            secret_versions: Vec::new(),
+            dotenv_source: worker.dotenv_source.clone(),
+            env_plain: Vec::new(),
+            env_secrets: vec![("TOKEN".into(), "owned-current".into())],
+            api_secrets: Vec::new(),
+        });
+        let (command, _leases) = worker.shell_with_session(SessionId(17)).unwrap();
+        let (_agent, _leases) = worker.prepare_agent_env(Vec::new(), Vec::new()).unwrap();
+        assert_eq!(
+            _agent
+                .iter()
+                .rev()
+                .find(|(name, _)| name == "TOKEN")
+                .unwrap()
+                .1,
+            "current-protected-value"
+        );
+        let child = worker
+            .spawn_session(
+                SessionId(17),
+                session::SessionKind::Shell,
+                &command,
+                80,
+                24,
+                100,
+            )
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !marker.exists() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            "current-protected-value\n"
+        );
+        drop(child);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

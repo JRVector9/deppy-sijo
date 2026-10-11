@@ -778,6 +778,19 @@ fn nav(
                     for hit in content_hits.iter().filter(|hit| hit.category == cat) {
                         if nav_search_hit(ui, &hit.title) {
                             requested_category = Some(cat);
+                            if cat == Category::Environment {
+                                let view = if hit.key.starts_with("project_keys.") {
+                                    EnvironmentSearchView::ProjectKeys
+                                } else {
+                                    EnvironmentSearchView::Advanced
+                                };
+                                ui.ctx().data_mut(|data| {
+                                    data.insert_temp(
+                                        egui::Id::new("settings_environment_search_view"),
+                                        view,
+                                    );
+                                });
+                            }
                         }
                     }
                 }
@@ -1029,6 +1042,7 @@ fn management_search_category(key: &str) -> Option<Category> {
     } else if key.starts_with("connector.") || key.starts_with("connectors.") {
         Some(Category::Connectors)
     } else if key.starts_with("env.")
+        || key.starts_with("project_keys.")
         || searchable_credential_key(key)
         || key == "workspace.manager.new_hint"
     {
@@ -1042,6 +1056,21 @@ fn management_search_category(key: &str) -> Option<Category> {
     } else {
         None
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EnvironmentSearchView {
+    ProjectKeys,
+    Advanced,
+}
+
+pub(crate) fn take_environment_search_view(ctx: &egui::Context) -> Option<EnvironmentSearchView> {
+    ctx.data_mut(|data| {
+        let id = egui::Id::new("settings_environment_search_view");
+        let view = data.get_temp(id);
+        data.remove::<EnvironmentSearchView>(id);
+        view
+    })
 }
 
 fn searchable_credential_key(key: &str) -> bool {
@@ -4837,6 +4866,54 @@ mod tests {
                     .any(|hit| hit.category == category && hit.title == expected),
                 "{query}: matching setting was omitted from search"
             );
+        }
+    }
+
+    #[test]
+    fn 설정_검색은_프로젝트_키_관리의_제목과_설명도_찾는다() {
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        for key in [
+            "project_keys.title",
+            "project_keys.secret_name",
+            "project_keys.secret_name_hint",
+        ] {
+            let text = catalog.t(key, &[]);
+            assert!(
+                settings_content_hits(&text, &catalog)
+                    .iter()
+                    .any(|hit| hit.key == key && hit.category == super::Category::Environment),
+                "{key} was omitted from project-key settings search"
+            );
+        }
+    }
+
+    #[test]
+    fn 설정_검색은_프로젝트_키와_기존_고급_화면을_정확히_선택한다() {
+        for (key, expected) in [
+            (
+                "project_keys.title",
+                super::EnvironmentSearchView::ProjectKeys,
+            ),
+            ("env.live_reload", super::EnvironmentSearchView::Advanced),
+        ] {
+            let catalog = i18n::Catalog::load("ko-KR").unwrap();
+            let title = catalog.t(key, &[]);
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(260.0, 900.0))
+                .build_ui_state(
+                    |ui, state: &mut (String, Option<super::EnvironmentSearchView>)| {
+                        let _ = nav(ui, super::Category::Environment, 0, &mut state.0, &catalog);
+                        if let Some(view) = super::take_environment_search_view(ui.ctx()) {
+                            state.1 = Some(view);
+                        }
+                    },
+                    (title.clone(), None),
+                );
+            harness.run();
+            harness.get_by_label(&title).click();
+            harness.run();
+            assert_eq!(harness.state().1, Some(expected));
+            assert_eq!(super::take_environment_search_view(&harness.ctx), None);
         }
     }
 

@@ -17,22 +17,35 @@ pub(crate) fn probe(path: &Path) -> Option<FolderIdentity> {
         .custom_flags(libc::O_DIRECTORY | libc::O_NONBLOCK)
         .open(path)
         .ok()?;
+    let identity = from_handle(&folder)?;
+    // The descriptor binds UUID and inode to one object. Reject a path replaced
+    // between opening it and returning its identity to the registration worker.
+    let current = std::fs::metadata(path).ok()?;
+    if current.dev() as i64 != identity.anchor.dev || current.ino() as i64 != identity.anchor.ino {
+        return None;
+    }
+    Some(identity)
+}
+
+#[cfg(unix)]
+pub(crate) fn from_handle(folder: &std::fs::File) -> Option<FolderIdentity> {
+    use std::os::unix::fs::MetadataExt;
     let metadata = folder.metadata().ok()?;
     if !metadata.is_dir() {
         return None;
     }
-    let anchor = storage::WorkspaceFolderAnchor {
-        dev: metadata.dev() as i64,
-        ino: metadata.ino() as i64,
-    };
-    let volume = volume_uuid(&folder);
-    // The descriptor binds UUID and inode to one object. Reject a path replaced
-    // between opening it and returning its identity to the registration worker.
-    let current = std::fs::metadata(path).ok()?;
-    if current.dev() != metadata.dev() || current.ino() != metadata.ino() {
-        return None;
-    }
-    Some(FolderIdentity { anchor, volume })
+    Some(FolderIdentity {
+        anchor: storage::WorkspaceFolderAnchor {
+            dev: metadata.dev() as i64,
+            ino: metadata.ino() as i64,
+        },
+        volume: volume_uuid(folder),
+    })
+}
+
+#[cfg(not(unix))]
+pub(crate) fn from_handle(_folder: &std::fs::File) -> Option<FolderIdentity> {
+    None
 }
 
 #[cfg(not(unix))]

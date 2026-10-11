@@ -16,6 +16,8 @@ bench-alloc = []
 render-glow = ["eframe/glow"]
 
 [dependencies]
+base64 = "0.22"
+crypto_box = { version = "0.9.1", features = ["seal"] }
 agent-mcp = { path = "../agent-mcp" }
 eframe = { workspace = true }
 egui = { workspace = true }
@@ -151,7 +153,6 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
-base64 = "0.22"
 sha2.workspace = true
 # 실제 앱 생성 경로의 Keychain 접근을 counting store로 검증한다.
 keyring-core = { workspace = true }

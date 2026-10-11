@@ -52,6 +52,7 @@ mod perf;
 mod port_inventory;
 mod proc_info;
 mod process_storm;
+mod project_keys;
 mod prompt_library;
 mod prompt_library_worker;
 mod provider_usage_command;
@@ -81,6 +82,14 @@ fn main() -> anyhow::Result<()> {
     // Install before paths, logging, config, or any worker can panic. Payloads may contain user
     // data; early static diagnostics can be dropped before tracing is ready, but never exposed.
     panic_policy::install_sanitized_panic_hook();
+    match app::run_project_keys_cli(std::env::args_os()) {
+        Ok(Some(exit_code)) => std::process::exit(exit_code),
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+    }
     // 스크롤백 해제(hidden/exited 전환) 시 mimalloc이 붙잡은 페이지를 OS로 반환하도록
     // runtime에 purge 훅을 건다. worker 스레드가 스크롤백을 해제한 직후 이 훅을 부른다
     // (mimalloc은 명시적 purge 없이는 자동 반환하지 않음 — 실측). worker보다 먼저 등록.

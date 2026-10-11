@@ -435,9 +435,13 @@ impl WorkHistoryUi {
                             action = Some(WorkHistoryAction::Refresh);
                         }
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            // 「작업」 화면 제목(fleet.rs header의 ui.heading)과 같은 서체·크기.
+                            // browser_style이 이 화면의 Heading을 덮어쓰므로 전역 style에서 읽는다.
                             ui.label(
                                 egui::RichText::new(catalog.t("history.browser.title", &[]))
-                                    .size(21.0)
+                                    .font(
+                                        egui::TextStyle::Heading.resolve(&ui.ctx().global_style()),
+                                    )
                                     .strong(),
                             );
                             ui.add(
@@ -466,7 +470,8 @@ impl WorkHistoryUi {
                     ui.add_sized(
                         [width, CONTROL_HEIGHT],
                         egui::TextEdit::singleline(&mut self.query)
-                            .hint_text(catalog.t("history.search", &[])),
+                            .hint_text(catalog.t("history.search", &[]))
+                            .vertical_align(egui::Align::Center),
                     );
                     self.browser_status_controls(ui, catalog, counts);
                     self.browser_project_control(ui, &snapshot, catalog);

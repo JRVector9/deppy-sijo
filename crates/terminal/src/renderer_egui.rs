@@ -527,10 +527,14 @@ pub fn draw_with_preedit(
         selection,
         snapshot_gen,
         false,
+        true,
     )
 }
 
 /// Crop a retained grid during transient Composer growth without resizing the PTY.
+///
+/// `fit_wider_grid`가 false면 pane보다 넓은 grid도 축소하지 않고 원래 크기로 좌상단에
+/// 고정해 자른다 — 호출측이 곧 PTY 크기를 pane에 맞추는 창 리사이즈 단계 사이에 쓴다.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_with_preedit_in_viewport(
     ui: &mut egui::Ui,
@@ -542,6 +546,7 @@ pub fn draw_with_preedit_in_viewport(
     selection: Option<(usize, usize)>,
     snapshot_gen: u64,
     crop_retained_grid: bool,
+    fit_wider_grid: bool,
 ) -> RenderOutput {
     let font_id = egui::FontId::monospace(metrics.font_size);
     let cell = cell_size(ui.ctx(), metrics);
@@ -564,7 +569,11 @@ pub fn draw_with_preedit_in_viewport(
     // 보존된 cols가 pane보다 넓으면 그리드만 균일 축소해 한 화면에 담는다(우측 열 잘림
     // 방지). font_size·cell·font_id는 **원래 값 그대로** 두고 마지막에 shape 구간만
     // 변환하므로 행 갤리 캐시와 글리프 아틀라스가 재사용된다.
-    let scale = fit_width_scale(avail.x, cell.x, snapshot.cols);
+    let scale = if fit_wider_grid {
+        fit_width_scale(avail.x, cell.x, snapshot.cols)
+    } else {
+        1.0
+    };
     // Resize 적용 전 snapshot이 좁더라도 배경과 입력 영역은 pane 전체를 사용한다.
     let render_width = if avail.x.is_finite() {
         avail.x.max(0.0)
@@ -1999,6 +2008,7 @@ mod tests {
                     None,
                     next_gen(),
                     true,
+                    true,
                 );
                 measured = Some((output.origin, output.cell_size, output.response.rect));
             })
@@ -2020,6 +2030,7 @@ mod tests {
                     false,
                     None,
                     next_gen(),
+                    true,
                     true,
                 );
                 assert!((output.origin.y - output.response.rect.top()).abs() < 0.01);
@@ -2992,6 +3003,113 @@ mod tests {
             (marker.min - marker_rect.min).length() < 0.01
                 && (marker.width() - marker_rect.width()).abs() < 0.01,
             "인접 shape가 함께 변환됐다: {marker:?} != {marker_rect:?}"
+        );
+    }
+
+    /// 창 리사이즈 단계 사이(호출측이 곧 PTY 크기를 pane에 맞춘다)에는 넓은 grid를
+    /// 축소하지 않는다. 단계마다 배율이 바뀌어 글자가 출렁이고, 축소 중에는 매 프레임
+    /// 갤리를 복제·변환하는 비용이 들었다. 원래 크기로 좌상단에 고정하고 넘치는 열은 잘린다.
+    #[test]
+    fn 축소를_끄면_넓은_grid를_원래_크기로_좌상단에_고정한다() {
+        let cols = 40u16;
+        let line = "M".repeat(cols as usize);
+        let snapshot = snap(cols, 2, &[&line, &line]);
+        let ctx = egui::Context::default();
+        let mut cache = TerminalRenderCache::default();
+        let mut measured = None;
+        let mut full = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let pane = egui::Rect::from_min_size(egui::pos2(20.0, 10.0), egui::vec2(160.0, 200.0));
+            let mut pane_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(pane)
+                    .layout(egui::Layout::top_down(egui::Align::LEFT)),
+            );
+            let base_cell = cell_size(pane_ui.ctx(), m(13.0, 1.0));
+            let output = draw_with_preedit_in_viewport(
+                &mut pane_ui,
+                &snapshot,
+                m(13.0, 1.0),
+                &mut cache,
+                None,
+                false,
+                None,
+                next_gen(),
+                false,
+                false,
+            );
+            measured = Some((
+                output.response.rect,
+                output.origin,
+                output.cell_size,
+                base_cell,
+            ));
+        });
+        full.textures_delta.clear();
+        let (rect, origin, cell, base_cell) = measured.expect("terminal should be rendered");
+        assert!(
+            base_cell.x * f32::from(cols) > rect.width(),
+            "전제: grid가 pane보다 넓어야 한다"
+        );
+        assert_eq!(cell, base_cell, "축소를 껐는데 셀이 줄었다");
+        assert!((origin.x - rect.left() - HORIZONTAL_PADDING).abs() < 0.01);
+        assert!((origin.y - rect.top()).abs() < 0.01, "세로도 위에 고정한다");
+    }
+
+    /// 창 리사이즈 단계 사이의 실제 조합(`crop=true`, `fit=false`) — 행이 pane보다 많으면
+    /// 원래 크기를 유지한 채 커서 행이 보이도록 세로로 민다(2026-10-11 리뷰: 이 경로가
+    /// 테스트되지 않았다).
+    #[test]
+    fn 축소_없이_자를_때_넘치는_행은_커서가_보이게_민다() {
+        let cols = 20u16;
+        let rows = 40u16;
+        let lines: Vec<String> = (0..rows).map(|i| format!("line {i}")).collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let mut snapshot = snap(cols, rows, &refs);
+        snapshot.cursor.visible = true;
+        snapshot.cursor.row = rows - 1;
+        let ctx = egui::Context::default();
+        let mut cache = TerminalRenderCache::default();
+        let mut measured = None;
+        let mut full = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let pane = egui::Rect::from_min_size(egui::pos2(20.0, 10.0), egui::vec2(400.0, 200.0));
+            let mut pane_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(pane)
+                    .layout(egui::Layout::top_down(egui::Align::LEFT)),
+            );
+            let base_cell = cell_size(pane_ui.ctx(), m(13.0, 1.0));
+            let output = draw_with_preedit_in_viewport(
+                &mut pane_ui,
+                &snapshot,
+                m(13.0, 1.0),
+                &mut cache,
+                None,
+                false,
+                None,
+                next_gen(),
+                true,
+                false,
+            );
+            measured = Some((
+                output.response.rect,
+                output.origin,
+                output.cell_size,
+                base_cell,
+            ));
+        });
+        full.textures_delta.clear();
+        let (rect, origin, cell, base_cell) = measured.expect("terminal should be rendered");
+        assert_eq!(cell, base_cell, "잘라 그릴 때 셀을 줄이면 안 된다");
+        assert!(
+            base_cell.y * f32::from(rows) > rect.height(),
+            "전제: 행이 pane보다 많아야 한다"
+        );
+        assert!(origin.y < rect.top(), "넘치는 행을 커서 쪽으로 밀지 않았다");
+        let cursor_bottom = origin.y + base_cell.y * f32::from(rows);
+        assert!(
+            (cursor_bottom - rect.bottom()).abs() < base_cell.y,
+            "마지막 행(커서)이 pane 아래에 맞춰지지 않았다: {cursor_bottom} vs {}",
+            rect.bottom()
         );
     }
 

@@ -1559,7 +1559,7 @@ impl Worker {
                         if let Some(active) = self.sessions.get_mut(&session) {
                             active.mark_full_dirty();
                         }
-                        self.push_watched_viewports();
+                        self.push_viewports(Some(session));
                     }
                     return;
                 }
@@ -1610,6 +1610,13 @@ impl Worker {
             .expect("위에서 세션 존재 확인");
         let applied = active.resize_checked(cols, rows);
         let actual = active.grid_dimensions();
+        // legacy Resize와 같은 규칙 — hidden/exited 세션만 cache class 재적용으로 스크롤백을
+        // 해제한다. 보이는 세션까지 매번 mi_collect를 부르면 창 드래그의 단계마다 전체
+        // 힙 수집이 돈다.
+        let freed_scrollback = matches!(
+            active.cache_class(),
+            TerminalCacheClass::Hidden | TerminalCacheClass::Exited
+        );
         let result = match applied {
             Ok(applied) => {
                 if let Some(event) = applied.cache_event {
@@ -1665,9 +1672,11 @@ impl Worker {
         if result.is_ok() {
             self.save_terminal_size(session, cols, rows);
         }
-        crate::signal_memory_released();
+        if freed_scrollback {
+            crate::signal_memory_released();
+        }
         self.emit_resize_result(session, token, result);
-        self.push_watched_viewports();
+        self.push_viewports(Some(session));
     }
 
     fn terminal_control_state(&self, session: SessionId) -> crate::TerminalControlState {
@@ -4792,6 +4801,12 @@ impl Worker {
     }
 
     fn push_watched_viewports(&mut self) {
+        self.push_viewports(None);
+    }
+
+    /// `only`가 있으면 그 세션이 보이는 대상일 때 그 화면만 보낸다 — tracked resize는 그
+    /// pane의 grid만 바꾸므로 보이는 pane 전부를 매 단계 다시 스냅샷할 필요가 없다.
+    fn push_viewports(&mut self, only: Option<SessionId>) {
         // Warm이면 GUI 몫(watched)은 멈추지만(§14.1 — snapshot 생성 금지, 세션 pump는
         // 계속), 원격 시청 lease 세션은 계속 스냅샷을 생성한다 — 시청 승격은 스냅샷
         // 생성만 허용하고 egui repaint는 유발하지 않는다 (P5a). lease 0이면 기존과 동일.
@@ -4805,6 +4820,9 @@ impl Worker {
             if !targets.contains(&session) {
                 targets.push(session);
             }
+        }
+        if let Some(only) = only {
+            targets.retain(|session| *session == only);
         }
         // 아카이브된 세션의 pane이 보이면(또는 원격 시청이면) 먼저 복원한다 — 복원 직후
         // dirty라 아래 루프가 같은 tick에 Viewport를 push한다 ("연결 중…" 공백 없음).
@@ -11808,6 +11826,61 @@ mod tests {
                 _ => None,
             });
         }
+    }
+
+    /// 창 드래그의 한 단계는 그 pane의 grid만 바꾼다. 적용 직후에는 그 세션의 화면만
+    /// 다시 보낸다 — 보이는 pane을 전부 다시 스냅샷하면 pane N개를 함께 끄는 드래그가
+    /// 단계마다 N개(전체 N²) 스냅샷을 만든다.
+    #[test]
+    #[cfg(unix)]
+    fn tracked_resize는_적용한_세션의_화면만_다시_보낸다() {
+        let mut harness = UnattachedHarness::new("tracked-resize-push-scope");
+        let first = harness.spawn_attached();
+        let pane = harness
+            .worker
+            .mux
+            .snapshot(|_| None)
+            .focused_pane
+            .expect("focused pane");
+        harness.worker.handle_command(RuntimeCommand::SplitPane {
+            pane,
+            direction: mux::SplitDirection::Horizontal,
+            scrollback_lines: 100,
+        });
+        let second = harness
+            .events
+            .try_iter()
+            .find_map(|event| match event {
+                RuntimeEvent::ShellSpawned { session } => Some(session),
+                _ => None,
+            })
+            .expect("split shell");
+        let watched = harness.worker.mux.watched_sessions();
+        assert!(watched.contains(&first) && watched.contains(&second));
+        harness._viewports.lock().expect("viewports lock").clear();
+
+        harness
+            .worker
+            .handle_command(RuntimeCommand::ResizeTracked {
+                session: first,
+                token: crate::ResizeToken {
+                    owner: [1; 16],
+                    generation: 1,
+                    owner_epoch: 1,
+                },
+                cols: 100,
+                rows: 30,
+            });
+
+        let viewports = harness._viewports.lock().expect("viewports lock");
+        assert!(
+            viewports.contains_key(&first),
+            "적용한 세션의 화면은 바로 보내야 한다"
+        );
+        assert!(
+            !viewports.contains_key(&second),
+            "크기가 그대로인 pane까지 다시 스냅샷했다"
+        );
     }
 
     #[test]

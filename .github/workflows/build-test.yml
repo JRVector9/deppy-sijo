@@ -25,16 +25,35 @@ jobs:
       - name: 송수신 순서, 재접속 등록, 신원 고정과 대기열 상한
         run: node --test web/relay-shell/tests/*.test.mjs
 
-  agent-status-harness:
-    name: Agent status ownership and provider replay
-    runs-on: macos-latest
+  # 문서만 바꾼 PR은 macOS 빌드·테스트를 건너뛴다. `docs/build/`는 xtask가 읽으므로
+  # 코드로 본다. 그 밖의 `.md`(배포 README 등)도 테스트가 읽어 코드로 본다.
+  changes:
+    name: Detect code changes
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.diff.outputs.code }}
     steps:
       - uses: actions/checkout@v4
-      - name: Install pinned Rust toolchain
-        run: rustup show
-      - uses: Swatinem/rust-cache@v2
-      - name: Claude, Codex, Kimi, Grok, Cursor and terminal display contracts
-        run: scripts/verify-agent-status.sh
+        with:
+          fetch-depth: 2
+      - id: diff
+        name: 문서 밖 변경이 있는지 확인
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # PR 머지 커밋의 첫 부모가 base다 — PR이 실제로 바꾼 파일만 본다.
+          changed=$(git diff --name-only HEAD^1 HEAD)
+          printf '%s\n' "$changed"
+          if printf '%s\n' "$changed" | grep -qvE '^docs/' \
+            || printf '%s\n' "$changed" | grep -qE '^docs/build/'; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
 
   fast-checks:
     name: Format, boundary, and diff checks
@@ -70,16 +89,33 @@ jobs:
 
   build-test:
     name: Build, clippy, and test (macOS)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: macos-15
+    env:
+      # scripts/verify-agent-status.sh와 같은 범위다. 둘 중 하나를 바꾸면 다른 쪽도 맞춘다.
+      AGENT_STATUS_TESTS: >-
+        package(storage) | package(mcp-proxy)
+        | (package(session) & test(status::tests))
+        | (binary_id(deppy-sijo::bin/deppy-sijo) & (test(agent_shim::tests) | test(merge_agent_status)))
+        | (binary_id(web-remote) & test(agent_status_harness))
+        | (package(runtime) & test(agent_status_harness))
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned Rust toolchain
         run: rustup show
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.148
       # 프로덕션 바이너리와 **테스트 코드까지** 함께 본다. --bin만 보면 테스트에
       # 쌓인 위반이 게이트를 통과해 계속 늘어난다(2026-08-11 정리 시점 4건이 쌓여
       # 있었고, 그중 하나는 #[test] 중복이라 테스트가 조용히 죽을 수 있는 종류였다).
       - name: cargo clippy --workspace --all-targets -- -D warnings
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: cargo test --workspace
-        run: cargo test --workspace --locked -- --test-threads=1
+      # 상태 검사 범위를 먼저, 같은 이름으로 돌려 실패가 어느 쪽인지 바로 보이게 한다.
+      - name: Agent status ownership and provider replay
+        run: cargo nextest run --workspace --locked --profile ci -E "$AGENT_STATUS_TESTS"
+      # 지금 doctest는 0개다 — nextest는 doctest를 돌리지 않으니 생기면 `cargo test --doc`를 더한다.
+      - name: cargo nextest run --workspace
+        run: cargo nextest run --workspace --locked --profile ci -E "not ($AGENT_STATUS_TESTS)"

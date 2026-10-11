@@ -11,7 +11,9 @@ run_cargo() {
 }
 extra=()
 if [[ "${DEPPY_CARGO_OFFLINE:-0}" == "1" ]]; then extra+=(--offline); fi
-# One corpus, used unchanged locally and in the named macOS CI job.
+# One corpus for local runs. CI runs the same scopes as the named
+# "Agent status ownership and provider replay" step (AGENT_STATUS_TESTS in
+# .github/workflows/build-test.yml); keep the two in sync.
 run_cargo test --locked ${extra[@]+"${extra[@]}"} -q -p storage
 run_cargo test --locked ${extra[@]+"${extra[@]}"} -q -p mcp-proxy -- --nocapture
 run_cargo test --locked ${extra[@]+"${extra[@]}"} -q -p session status::tests

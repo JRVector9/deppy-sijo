@@ -1,0 +1,17 @@
+# CI 테스트 실행 설정 — .github/workflows/build-test.yml의 macOS job이 `--profile ci`로 쓴다.
+# nextest는 테스트마다 프로세스를 따로 띄워 병렬로 돌리므로 테스트 사이의 전역 상태가
+# 섞이지 않는다. 예전 `cargo test -- --test-threads=1`(한 줄 실행)보다 실행 시간이 짧다.
+
+[profile.ci]
+# 한 테스트가 실패해도 나머지를 끝까지 돌려 실패 목록을 한 번에 보인다.
+fail-fast = false
+# 공유 러너의 일시적 부하로 흔들리는 타이밍 테스트를 다시 돌린다. 재시도로 통과한
+# 테스트는 결과에 FLAKY로 남아 숨겨지지 않는다.
+retries = 2
+failure-output = "immediate-final"
+
+# 지연 시간을 직접 재는 테스트는 다른 테스트와 함께 돌면 부하로 측정값이 흔들린다.
+# 러너의 모든 스레드를 잡아 단독으로 돌린다.
+[[profile.ci.overrides]]
+filter = 'package(pty) & test(/^tests::(고립된_1바이트_echo는_coalesce_대기_전체를_지불하지_않는다|대량_출력은_coalesce_wait을_1ms로_낮춰도_소수_청크로_뭉친다)$/)'
+threads-required = "num-test-threads"

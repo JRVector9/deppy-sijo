@@ -31,7 +31,7 @@
 | 44 | 프로젝트 키 추가·수정 | 480pt 공용 셸·숨김 새 값·빈 입력 유지·원본·사용처 | `crates/app/src/ui/project_keys.rs` |
 | 45 | 원본 파일 연결·가져오기 | 480pt 공용 셸·파일 종류/경로·자동 보관·환경 분리 | `crates/app/src/ui/project_keys.rs` |
 | 46 | GitHub 목적지 연결 | 480pt 공용 셸·인증·정확한 범위·자동 전송 opt-in | `crates/app/src/ui/project_keys.rs` |
-| 47 | 빌드 연결 | 480pt 공용 셸·저장 명령/경로·snapshot 사용 기록 | `crates/app/src/ui/project_keys.rs` |
+| 47 | 빌드 연결 | 480pt 공용 셸·프로그램/개별 인수/경로·snapshot 사용 기록 | `crates/app/src/ui/project_keys.rs` |
 | 48 | 프로젝트 키 관리 연결 삭제 | 480pt 공용 확인·원본/원격 유지 안내 | `crates/app/src/ui/project_keys.rs` |
 | 49 | 키 원본 충돌 해결 | 480pt 공용 셸·원본/보관 선택·버전 재확인 | `crates/app/src/ui/project_keys.rs` |
 
@@ -47,6 +47,7 @@ AI 세션 시작 런처는 기존 전용 레이아웃을 유지한다. macOS 기
 | `PopupSpec` / `show` / `body` | `shell.rs` | 모달 배경, 폭, 제목·설명·닫기, 고정 머리글과 스크롤 본문 |
 | `field` / `text_input` / `path_input` / `segmented_choice` | `fields.rs` | 레이블·힌트, 36pt 입력, 경로와 찾아보기 행, 두 선택지 |
 | `choice_input` | `fields.rs` | 36pt 선택 입력, 공용 테두리·폰트·배경 |
+| `MaskedSecretBuffer` / `secret_input` | `fields.rs` | widget에는 마스크만 전달, 36pt/여러 행 80pt·거절한 선택 교체 원복; 초안 수명은 호출자 소유 |
 | `popover` / `popover_frame` / `body_with_max_height` | `shell.rs` | 모달과 같은 머리글·팔레트, 앵커 팝오버와 높이 제한 |
 | `information` / `InformationSpec` | `information.rs` | 420pt 정보 안내·공용 notice와 닫기 동작 |
 | `list_row` / `list_actions` | `list.rs` | 목록 표면·줄바꿈 행·34pt 버튼 배치 |

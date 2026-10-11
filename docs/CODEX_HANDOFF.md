@@ -1,3 +1,300 @@
+# 독립 세션 제목 후속 6건 수정·root 통합 검증 완료 — 2026-10-11
+
+- 현재 요청 완료: 사용자 「발견한 결함 전부 서브에이전트 병렬로 수정」. 3명(gpt-6.1-sol/xhigh)이 소유 파일을 나눠 구현했고 root가 모든 변경 및 인터페이스를 리뷰했다. canonical performance, HEAD799fae89 + 기존 dirty tree 유지. 다른 Claude Code history/Git/resize 변경 보존. desktop composer/status/input_admission 제품 코드는 조사-only 요청 유지.
+- R1/R4: exact pane/provider/native prompt 저장, human transport를 preview 전에 정규화하고 UTF-8 256B 경계 절단. Grok camel/snake 이벤트, Kimi index, path-free exact-provider, TTL도 실제 RED 후 수정. original input/transcript 미변경. Claude/Codex/Grok dedicated observe scripts의 --provider 등록 연결과 generic/Kimi 보존까지 검증.
+- R2/R6: 공유 core native ancestor stamp(runtime token, max32 PID/raw birth identity, JSON4096B)로 현재 실행 귀속 검증. binding/prompt stamp 분리, legacy unstamped live row 제외, Linux raw ticks vs epoch 비교 제거. VerifiedHookBinding을 worker까지 전달해 같은 Codex TUI의 resume/fork/new thread 전환 수용. fast/full cache 교체/PID 재사용/원래 proof birth 보존.
+- R3/R5: 검증된 첫 snapshot부터 지시 반영, cached prompt prune 후 동일본문 복구, 다른 execution/runtime/workspace/kind/birth 차단. shim은 첫 positional 명령만 helper 분류, 옵션값/optional prompt/--/빈문자/따옴표·개행/구버전·remote·중복 flag의 exact argv 유지.
+- root 최종 gate 실제 exit0: App2845PASS/0FAIL/38ignored, storage432PASS, MCPunit108PASS/1ignored + 실제proxy통합8PASS, core11PASS/doc0, App4통합경계39PASS. 합계 중복 제외3443PASS/0FAIL/39ignored. strict alltargets Clippy(App/storage/MCP/core -Dwarnings), cargo fmt all check, git diff check PASS. focused24/detector74/shim16은 전체App에 포함. `/private/tmp/deppy-title-orchestrator-final-20261011.log`. tested13파일 source SHA256은 fmt 이후부터 완료까지 불변; manifest `/private/tmp/deppy-title-orchestrator-{test,final}-source-20261011.json`.
+- 수정 파일: app/{agent_detect.rs,agent_detect_worker.rs,proc_info.rs,app.rs,agent_shim.rs}; core/{Cargo.toml,src/lib.rs,src/process_identity.rs}; storage/src/db.rs; mcp-proxy/src/{main.rs,hook_payload.rs} 및 새 tests/hook_task_prompt.rs; Cargo.lock(core libc만 추가, 기존0.10.1 변화 보존); 제목 plan/기존 QA/review/새 fixes QA/이 handoff. schema nullable stamp2개 migration/SELECT/preflight/retained heap도 검증.
+- 실패 기록: 각 행동 RED에서 provider/longwrapped/initial snapshot/sameprompt reinsertion/Codex transition/Linuxclock/Grok/path-free/TTL/heap 누락 확인. 준비 compile(package/privateAPI/type/usize)와 storage source-law wrapper 검사 실패는 보완 후 최종전체gate 통과. 자세한 개별 로그/결과는 `docs/qa/2026-10-11-independent-agent-session-titles-fixes.md` 및 아래 진행 기록.
+- 남은 구현 없음. 전달 범위는 source/격리 테스트. 실제 사용자 CLI thread switch, Linux host E2E/installed iOS PWA는 미검증. 사용자DB/실제 설치shim/config/PTY/앱 실행을 변경하지 않음. 재시작/릴리스/커밋/푸시 없음, version0.10.1 유지. 다음 changedartifact 전달은 최신 shipped보다 version증가+binary/bundle검증, restart는 해당 작업 명시요청 필요.
+- 다음 agent exact(cwd performance): `cat AGENTS.md`; `sed -n '1,30p' docs/CODEX_HANDOFF.md`; `git status --short`; `git diff --stat`; `cat docs/qa/2026-10-11-independent-agent-session-titles-fixes.md`; `git diff --check`. 새로운 변경/실패가 없다면 같은 suite 반복 불필요. build/restart 요청이 오면 기존dirty 작성자 경계 보존 및 버전 규칙부터 확인. 자동 dev-run.sh 금지.
+
+---
+
+# 독립 세션 제목 후속 6건 병렬 수정 진행 — 2026-10-11
+
+- 현재 요청: 발견한 결함 전부를 서브에이전트 병렬 수정, root가 각 변경 코드 리뷰/통합 검증/최종 보고. 수정 대상은 후속 리뷰 R1~R6. canonical source `/Users/jr/Desktop/projects/deppy-sijo-performance` 유지. 실행앱0.10.1/사용자DB/설치shim/PTY 미변경; restart/release/commit/push 요청 없음. desktop composer는 이전 조사·PR계획만 유지.
+- 담당/충돌 방지: `title_storage_fix` R1/R4(db.rs, mcp-proxy main.rs 및 필요한 hook_payload.rs); `title_execution_fix` R2/R6(agent_detect.rs, 필요시 proc_info.rs); `title_projection_fix` R3/R5(app.rs, agent_shim.rs). 전원 gpt-6.1-sol/xhigh. root만 문서/handoff 편집. 다른 Claude Code history/Git/resize dirty 보존.
+- 설계 검토 진행: exact(session_key,provider,native ID) 저장, 정상 human text의 UTF-8 256B preview. 현재 실행의 thread 전환과 stale hook을 구분하는 provenance 계약을 소유자끼리 먼저 합의. prompt 보존 행의 updated_at만으로 과거 지시를 새 실행으로 인정하면 안 되는 점도 점검.
+- 의미 있는 RED 실행: storage provider/257B 0PASS/2FAIL, 실제 proxy→DB provider/긴 wrapped 한글 0PASS/2FAIL(exit101); shim resume ID review 0PASS/1FAIL(exit101). R5 수정 후 agent_shim15PASS(18개 exact-argv 시나리오 포함). root 최종 통합 검증 전이므로 전체 완료 판정은 아직 안 함. 기존3411/PWA9PASS는 별도 기록.
+- 합의한 provenance: core 공유 HookExecutionStamp(runtime token, 최대32개 kernel PID+raw birth ancestor identities, 4096B 제한). receiver가 ps 없이 native ancestry를 기록; app/worker는 현재 감지 실행과 token을 검증. Linux raw ticks는 identity equality에만 사용, epoch 비교 제거. binding stamp와 prompt stamp를 분리하고 nullable legacy row는 live fail-closed. db migration/SELECT/preflight bytebudget도 갱신. agent_execution이 core/proc_info/detector/worker를, storage가 schema/proxy를, projection이 app/shim을 소유.
+- 진행 검사: core11PASS/doc0, 저장 focused6PASS·실제proxy통합6PASS. 실제 detector RED는18PASS/3FAIL(R2/R6 및R3), DB projection RED1PASS/2FAIL(첫 snapshot, prune후동일지시복구). root 코드 리뷰에서 Grok event alias/경로없는 지시의 fresh binding stamp/24h 조회 TTL 누락도 발견해 같은 저장 경로에서 회귀·수정 중.
+- 3명 담당 구현/회귀 완료 후 root가 제품 코드를 고정했다. 마지막 provider producer RED0PASS/1FAIL 뒤 dedicated Claude/Codex/Grok observe scripts를 생성·등록, Kimi 및 generic legacy/cursor 유지. 실제 생성 script→fake proxy의 exactargv/path-freeJSON 검증 포함 shim16PASS. R3 first/repeated/동일지시재삽입/DB scope24PASS. 모든 담당 파일 root diff 리뷰 완료.
+- root 최종 통합 gate 현재 실행 중: `/private/tmp/deppy-title-orchestrator-final-20261011.log`, exec session81080. fmt(all)→전체 App bin→storage lib→MCP(통합포함)→core→App4통합경계→strict alltargets Clippy(App/storage/MCP/core -Dwarnings)→fmtcheck. formatter는 마지막 shim 코드만 정규화했고 테스트 source hash는 `/private/tmp/deppy-title-orchestrator-test-source-20261011.json`에 저장. final gate 결과 확정 전 완료 claim 금지.
+- 담당 저장 전체 최종 gate: storage432PASS/0FAIL, MCPunit108PASS/0FAIL/1ignored + 실제proxy통합7PASS, strict Clippy(storage/MCP alltargets -Dwarnings)/ownedfmt/diffcheck PASS. TTL actualproxy RED0PASS/1FAIL 뒤 exactprompt UPDATE가 updated_at도 갱신하도록 수정. `/private/tmp/deppy-title-storage-proxy-final-fixed-20261011.log` exit0. source-law scan은 실제 guarded with_execution 구현으로 연결했고 prefix 행위 회귀 유지.
+- 추가 인터페이스 검토: 기존 generic observe script는 Claude/Codex/Grok 종류를 명시하지 않아 경로 없는 UserPrompt를 새 exactprovider 수신기가 거절할 수 있음. projection/shim 담당이 별도 provider observe scripts와 등록 연결을 RED/green으로 보완 중. generic legacy/cursor 소비자는 보존. user config 실제설치 없음.
+- 중간 실패: `-p app` package명 오류→`-p deppy-sijo`; DB private cfg(test) open API→public unique temporary Db::open, collection type 추론 누락→명시; migration pragma usize→i64. 이들은 compile/preparation 실패라 RED로 세지 않음. storage 전체431PASS/1FAIL은 기존 SQL source-law가 legacy wrapper 이름을 검사하는 문제→실제 guard 구현명을 검사하도록 수정 예정. 최종 통합 PASS는 아직 없음.
+- 실패/성공 로그: `/private/tmp/deppy-title-storage-red-20261011.log`, `/private/tmp/deppy-title-proxy-red-20261011.log`, `/private/tmp/deppy-title-storage-proxy-green-fixed-20261011.log`, `/private/tmp/deppy-title-storage-proxy-final-20261011.log`; 다른 담당 로그 경로는 최종 보고에서 확인. 다음: 각 담당 녹색 회귀와 root code review, stable full App/storage/MCP/core+통합 경계/strict Clippy.
+- 다음 명령(cwd performance): `git status --short`; `git diff --stat`; `cat docs/qa/2026-10-11-independent-agent-session-titles-review.md`; cargo는 `python3 /private/tmp/deppy-audit-nine-pr-20261004/cargo_gate.py`만 사용. app binary-only라 `test -p deppy-sijo --bin deppy-sijo` 사용. dev-run.sh/자동 launch 금지.
+
+---
+
+# Git 패널 스택 push·PR, 배포 순서 점검 — 2026-10-11 (Claude Code)
+
+- 사용자 「git 스택 push하고 PR 만들자」, 「codex 작업 확인하고 배포 순서 보고」. 제품 코드·이 트리 미변경(이 handoff만). restart/version 변경 없음.
+- 리뷰 수정 3커밋을 1커밋으로 합침(트리 동일 확인, 3622f581 → f3ba062b). push 후 PR: #209 docs(base main), stacked #210 PR1(main) → #211 PR4 → #212 PR5 → #213 PR2 → #214 PR3 → #215 리뷰 반영. 각 PR 1커밋. main CI는 9/11부터 failure(기존 실패), PR macOS job도 같은 이유로 실패할 가능성.
+- 배포 구조: 실행 앱(0.10.1)은 이 트리 = `feat/audit-nine-pr-v0.6.0-20261004`(main보다 163커밋 앞, 원격보다 10커밋 앞) + 대규모 미커밋에서 빌드. main은 0.1.0.
+- Git 스택을 799fae89에 시험 cherry-pick(임시 worktree, 삭제함): PR1·PR4 깨끗, PR5부터 app.rs 충돌 — 이 줄은 git/diff/aux_search 상태를 `session_aux::SessionAuxView`(세션별, `git_generation`/`git_diff_generation`)로 옮겼다. 리뷰 수정의 `GitPanelIoGenerations`는 이름 바꾸기가 아니라 SessionAuxView 구조로 다시 설계해야 한다.
+- Codex 상태: 이력 구조(0.10.0)·PWA 4건 완료, 독립 세션 제목/binding 구현 후 재리뷰에서 미수정 결함 R1~R6(high 2) — 수정 요청 대기. Codex 11:52 전체 App 2838 PASS에 리사이즈 수정 포함(파일 11:38).
+- 권장 순서(사용자 결정 대기): ① Codex R1~R6 수정 ② 이 트리 미커밋을 기능·작성자별 커밋 후 push ③ 커밋 HEAD로 0.10.2 빌드·명시 요청 시 재실행 ④ 이 줄 → main 착지 여부 결정 ⑤ Git 스택을 그 위로 rebase(SessionAuxView 포팅 1회) → 머지 → 0.11.0.
+
+---
+
+# 독립 세션 제목 후속 코드 리뷰 완료 — 2026-10-11
+
+- 사용자 현재요청 「코드 리뷰해」. 직전제목binding4파일+PWAassets를검토했고 제품코드/repo tests/userDB/shim/PTY/app/version/commit/push 미변경. 문서만추가. PID21173/0.10.1 유지. 기존composer분석만규칙유지. 다른작업자history/Git/resize보존.
+- 기존완료판단정정: 앞선3411/PWA9PASS는사실이나 providerDB저장/최초Hooks조회/TUI내thread전환경로가빠졌다. 실제재현확인된미수정6건. 보고서 docs/qa/2026-10-11-independent-agent-session-titles-review.md, 이전제목QA에followup링크추가.
+- R1 high db.rs7679 UPDATEkind=claude만: 실제compiledDb로Claude성공/CodexGrokKimi는Ok이지만promptNone. app4providerprojection에는연결되지않음.
+- R2 high agent_detect.rs980 resume최초argvID가현재hookthread변경을거절;626 deterministiccache가옛ID계속반환. actualproductionmodulecopy+realproc_info/transcript+isolatedvalid2rollouts/syntheticps+realprobePID/birth로fullscan2회둘다옛ID. Codex0.162.1primarysession_lifecycle의같은Appthreadswitch확인. 사용자CLI전환E2E미실행.
+- R3 medium app.rs10848 firstprojectionfreshclear→observed만등록→동일poll3회에도fresh없음. actualproductionfunction추출Rustprobe확인. 이미birth검증된initialnewprompt도빠지므로startup/sharedfiletitle문제.
+- R4 medium db.rs7674 humanprompt>256B전체거절;proxy결과무시/oldprompt보존. actualDb새480B한글promptErr→oldtask남음. 이것은제목저장문제, desktop입력전송원인이라고주장금지.
+- R5 medium agent_shim.rs147 allargshelper검사→validresumeIDreview/forkIDapp-server의prompt가helper로오인→no-daemon0. actualshell판정copy+fakeCLI3case검증. localresumehelp에optionalPROMPT확인.
+- R6 medium agent_detect.rs132 Linux rawboottick ProcessBirth.seconds vs DBUnixepochseconds비교;sourceproc_info87/88및fixture한시간전hooktrue확인. LinuxhostE2E미검증. macsame초제외는명시적보수정책으로별도결함미계수.
+- Evidence /private/tmp/deppy-independent-title-review-xzs1dw3g: storage_probe/cold_prompt_probe/cache_probe compile/runexit0;shim-probe3casesexec0;provenance sourcehash+linkedrlibs. initialprobeextractgenericmarker잘못찾아substring실패→준비스크립트정정후실행,제품수정없음. 이전fullsuite반복안함;gitdiffcheck0. PWAsource추가확정결함없음/기존Chromium9PASS참고, iOS미검증. subagent/directcodexexec/review없음.
+- 남은작업(아직수정요청없음): 저장R1+R4→실행identity/cacheR2+R6→firstprojectionR3→shimparserR5, 실제endtoendfixture추가. QA에PR순서정리. 이번응답은reviewfindings보고만.
+- 다음agent exact(cwdperformance): cat AGENTS.md; sed -n '1,32p' docs/CODEX_HANDOFF.md; git status --short; cat docs/qa/2026-10-11-independent-agent-session-titles-review.md; cat /private/tmp/deppy-independent-title-review-xzs1dw3g/storage_probe.log; cat /private/tmp/deppy-independent-title-review-xzs1dw3g/cache-probe.log; git diff --check. 사용자현재restart요청없으면dev-run.sh금지. 모델규칙gpt6.1-sol xhigh/서브에이전트현재불필요.
+
+---
+
+# 독립 세션 제목·PWA 수정/검증 완료 — 2026-10-11
+
+- 현재 objective 완료 범위: (1) desktop composer 시작 입력 조사/PR 계획만, (2) PWA 모바일4건 source 구현/Chromium9PASS, (3) 후속 Design 같은workspace/provider 독립세션 title/native binding root cause 수정. 실행앱PID21173/0.10.1 유지. 실제prompt/사용자DB/설치shim 변경, restart/release/commit/push 없음.
+- 확정 원인: Codex TUI의 열린rollout이 없을 때 cwd최신rollout을 선택. read-only 실제DB의2pane가 동일ID로 함께이동하지만 actual61978bare/19752resume ID는상이. shareddaemon CLI0.162.1에서writer가TUI에없음. 공유대화보호가작업문구를삭제해Design·1/2generic. cmux hooks/nativeID+surface/liveprocess/resumeverification primary reference 적용. QA docs/qa/2026-10-11-independent-agent-session-titles.md 및 PR1~3 계획 완료.
+- 변경: Codex/Grok cwd live폴백/Codex이력cwd폴백제거. exactresumeUUID/forksource배제/helper분류제외/유일writablelsof/ID파일명검사. staleCodexhook의resume/forkID검증. 모든4provider pane별지시. currentkind/processbirth이후hook만override, rawboundedhistorymap공유대화방어. 미확인pane과거문구/context삭제, binding을UI보다먼저적용. 중복CodexsavedID자동resumequarantine, 명시공유resume은Codexfork/Claudefork. supportedlocalCodexshim만no-daemon, 구버전/remote/helper/중복/args보존. DBupdated_at조회추가(스키마변경없음).
+- 수정파일(제목): crates/app/src/{agent_detect.rs,agent_shim.rs,app.rs}, crates/storage/src/db.rs, 제목QA/plan/handoff. PWA파일/테스트/limits는 docs/qa/2026-10-11-pwa-mobile-layout-fixes.md. Composer문서만: docs/qa/2026-10-11-composer-startup-input-investigation.md, docs/superpowers/plans/2026-10-11-composer-startup-input-pr-plan.md. 다른Claudehistory/Git/resize dirty는보존. desktopcomposer/status/input_admission 제품코드 미수정.
+- 최종실행: independent_17PASS(신규9; 전체App에포함), App2838PASS/0FAIL/38ignored, storage426PASS/0FAIL, mcp-proxy108PASS/0FAIL/1ignored, integrationagent_state_boundary4/dotenv5/lazy15/logging15=39PASS. 중복빼합계3411PASS. PWAChromium별도9PASS. strictClippy App/storage/MCP alltargets-Dwarnings/fmt PASS; diffcheck exit0. 로그 /private/tmp/deppy-independent-title-{final-review,verified-gate,boundaries}-20261011.log; 마지막gate exit0. 전체workspace/ignored전체검사라고주장금지.
+- 실패기록: binary-only앱--lib실행불가→--bin정정. actual-lsoffixture/var vs /private/varalias로2836PASS/1FAIL→fixturecanonicalize해통과. strictClippy deadGrokhelper→test전용cfg로제한. 최종review 새Codexhook검증회귀는수정전0PASS/1FAIL(hook-redlog), 수정후PASS. 기능약화로oracle를통과시킨것아님.
+- 남은구현없음. 전달한계: 검증불가 기존bareCodex는generic(다른대화추측금지), 오염된legacy원래ID를DB만으로역추정안함. 수정한source의live사용자앱/설치iOS PWA/사용자prompt E2E미검증. restart현재요청없음. changedartifact전달요청시0.10.1보다큰버전, binary/bundle검증필수.
+- 다음agent먼저(cwd /Users/jr/Desktop/projects/deppy-sijo-performance): cat AGENTS.md; sed -n '1,65p' docs/CODEX_HANDOFF.md; git status --short; git diff --stat; cat docs/qa/2026-10-11-independent-agent-session-titles.md; git diff --check. 새변경/실패없으면동일suite반복불필요. 변경해회귀필요할때 cargo_gate.py test -p deppy-sijo independent_ -- --test-threads=1, 또는 QA에기록한fullbatch. 사용자명시restart없이는 scripts/dev-run.sh실행금지.
+
+---
+
+# 독립세션 제목/binding 구현·회귀 검증 진행 — 2026-10-11
+
+- PWA4건source/Chromium9PASS 완료. desktopcomposer 조사/PR계획만 유지하며 input_admission/composer/status 제품수정 없음. 실행앱PID21173/0.10.1 유지, 실제prompt전송/restart/release/commit/push 없음.
+- 확정rootcause: `agent_detect.rs` Codex cwd최신rollout 폴백. actualDesign2CLI PID61978·19752는 각자zsh51396·60099를거쳐App21173소속. bare+resume nativeID01a121af... 다르지만 저장2paneID가동시에01a128ae...→01a128af...로변함. 둘다openrollout없음; 같은cwd의PID32412는별도node_repl쪽app-server(helper,App소속아님). 현재codex0.162.1help에sharedbackground/no-daemon및fork지원. 근거primary cmuxdocs/wrapper/livePIDbinding/resumeverifier와OpenAI0.162.1cli.rs확인. QA작성예정.
+- 구현: Codex/Grok livecwd폴백·Codex원문cwd폴백 제거. CodexexactresumeUUID분류(fork원본ID배제)/helperapp-server배제. lsofFfan의유일한writablefile만소유증거(read-onlypeer·다중writer제외). CodexbindingID=filenameID확인.
+- app: nativeID가맞는panehook/persistedprompt를모든4provider에적용. HookSessionRow에기존DBupdated_at를노출(스키마변경없음), 현재processkind/birth이후시간만activeoverride허용. rawhook_binding_history는별도boundedmap으로닫힌peer공유파일귀속방어유지. fullbindingpass미확인pane의이전작업text/context삭제; 최신binding을display전에적용. legacyduplicateCodex저장ID는auto-resumequarantine(둘다idle), 명시적resume에서다른pane와공유면Codexfork/Claude--fork-session으로독립화.
+- Codexshim: 지원localTUI만no-daemon주입, CLIhelpcapability확인; oldCLI/remote/helper/중복flag/원래args보존. 실제user실행환경/shim파일미수정. 새실행때적용.
+- 수정파일: `crates/app/src/{agent_detect.rs,agent_shim.rs,app.rs}`, `crates/storage/src/db.rs`, title계획/QA/handoff. 다른Claudehistory/resize/Git작업보존. rootsource수정필요파일만; cargo fmtall후기존dirty파일변화는동시Clauderesize후속반영과구분.
+- 실행검사: initialfmt/checkapp+storage--testsPASS; focusedindependent_15PASS(신규7포함), agent_detect70PASS/1ignored, agent_shim14PASS. `/private/tmp/deppy-independent-title-first-tests-20261011.log` exit0.
+- 실패: finalgate를--libdeppy-sijo로시도했으나binary-onlypackage라실행불가, --bindeppy-sijo로정정. fullApp2836PASS/1FAIL/38ignored: 새actual-lsof테스트가macOS/var→/private/var임시경로alias를고려하지않아None. productionlogical+canonicalroot검사는이미존재; testfixture의root를canonicalize해보완. finalfullApp/storage/mcp-proxy/clippy검사재실행대기. log `/private/tmp/deppy-independent-title-final-gate-20261011.log`.
+- 남은것: 수정actual-lsof재현통과확인→fullApp/storage/MCP및strictclippy→diff검토/QA/handoff완료. freshhook없는기존bareCodex의진짜대화ID는추측불가, genericlabel유지(다른작업표시금지). 이미오바인딩된사용자DB는수동변경하지않음. 새source실행/실제sessiontitles복구는미검증이며restart명시요청필요.
+- 다음정확한명령(cwdperformance): `python3 /private/tmp/deppy-audit-nine-pr-20261004/cargo_gate.py --batch '[["fmt","--all"],["test","-p","deppy-sijo","independent_codex_writer_uses_real_lsof_access_fields","--","--test-threads=1"]]'`; 이후 `test -p deppy-sijo --bin deppy-sijo -- --test-threads=1`, `test -p storage --lib -- --test-threads=1`, `test -p mcp-proxy -- --test-threads=1`, `clippy -p deppy-sijo -p storage -p mcp-proxy --all-targets -- -D warnings`. scripts/dev-run.sh실행금지.
+
+---
+
+# Git 패널 PR 스택·리뷰 반영, 리사이즈 리뷰 반영 — 2026-10-11 (Claude Code, 오케스트레이터)
+
+- Git 패널 개선(시안 docs/mockups/git-panel-redesign-2026-10-11.html, 계획 docs/superpowers/plans/2026-10-11-git-panel-v2.md)을 서브에이전트(opus xhigh) 병렬로 구현하고 오케스트레이터가 리뷰·rebase·커밋. 별도 worktree, origin/main 9432d33d 기준 stacked, push/PR 없음.
+  - docs: `deppy-sijo-git-v2-docs` feat/git-panel-v2-docs 3a28b953(시안+계획).
+  - 스택(`deppy-sijo-git-v2-pr3` feat/git-panel-v2-review-fixes): PR1 a27713ae → PR4 572dca9d → PR5 0ea33bad → PR2 c6f0f991 → PR3 7f80b3dc → fix 762479c3(경로 -z·전체 sha·서명·충돌·origin/HEAD 폴백·IO 종류별 세대·repo 전환·Finder) → fix 89552723(붙인 터미널 키 소유·팝업·사라진 선택·자동선택 경합·접은 폴더 상한) → fix 3622f581(행 글자 클릭·말풍선·좁은 폭·헤더 경로·문구). 브랜치 pr1/pr4/pr5/pr2/pr3는 각 커밋을 가리킨다.
+  - 리뷰: 데이터/IO, UI/i18n, PR3 전담 리뷰 3개 + 리사이즈 리뷰 1개. 검증된 지적은 실패 테스트 먼저 → 수정, 일부는 되돌려 실패 재확인(mutation). 최종 스택 gate: fmt/clippy -D warnings/i18n-check/check-boundary/build PASS, test 2316 PASS·1 FAIL.
+  - 기존 main 실패(이번 변경 무관, PR1 단독에서도 동일): `ui::workspace::tests::attached_without_snapshot은…`(116 vs 80), `tests/dotenv_launch_boundary.rs::agent_resume_write_input_process_exception_is_explicitly_tracked`.
+  - 미반영 후속: 커밋/브랜치 rename diff에 원경로 미전달(main 기존), host IO 단일 슬롯에서 Finder 클릭 드롭(main 기존), pathspec magic 리터럴화, Finder는 파일 강조(open -R) 아님, 탭 바 180pt 줄바꿈 다듬기.
+- 리사이즈(이 트리, 미커밋): 리뷰 반영으로 `SessionView::live_resize_clip` + 판정에 split 최종 대기 제외(한 단계 안 축소/잘라그리기 혼재 제거), 넘어간 드래그 단계의 빈 후보는 hard deadline에도 올리지 않음, 테스트 4개 추가(renderer crop+no-fit 포함). 스펙 08-18 「2026-10-11 리뷰 반영」 절. workspace 360 PASS(당시), terminal 135, runtime 380 PASS, terminal/runtime clippy PASS.
+  - 주의: 다른 세션이 이 트리에서 동시에 작업 중(agent_detect.rs·app.rs `hook_binding_history`·web-remote 자산). 그 진행 중 코드 때문에 지금 app crate가 컴파일되지 않아 app 전체 test/clippy를 마지막에 다시 돌리지 못했다. 그 작업이 끝난 뒤 `cargo_gate.py test -q -p deppy-sijo`로 재확인 필요.
+  - 남은 비용(미적용): 적용된 단계마다 `save_terminal_size` 파일 쓰기 — 런타임 루프에서 안정 후 1회로 모으기.
+- 다음: 사용자 결정 — 스택 push/PR 생성 여부, 재빌드·재실행(0.10.2) 요청 시 app 컴파일 정상화 확인 후 진행.
+
+---
+
+# PWA 완료 → 독립 세션 제목/binding 수정 착수 — 2026-10-11
+
+- PWA 사용자4건 source 구현/리뷰 완료. actual Chromium9PASS/0FAIL, Node syntax/diff check exit0. 상세파일/명령/실패oracle/한계: `docs/qa/2026-10-11-pwa-mobile-layout-fixes.md`. 실행0.10.1 앱은 재시작하지 않아 미반영. 제품 배포/commit/push 없음.
+- 현재목표: Design 같은workspace/agent 독립session의 작업제목/binding 버그 조사·수정. GitHubcmux primary source 참고 명시요청. read-onlymetadata DB에2pane 동일CodexID 저장됨. root cause확정 전 process identity/rollout selection/worker/title projection 추적. Desktop composer는 분석문서/PR계획만이며 수정금지 유지.
+- 수정파일(PWA): `crates/web-remote/assets/{app.css,app.js,index.html}`, `web/shared/{viewer-core.js,viewer-core.css,mobile-theme.css}`, `web/relay-shell/{relay-shell.css,relay-shell.js}`, fixtures `{mobile-usability,pwa-unified-mobile-ui,viewer-readability-contract,relay-shell-v1}.js`, PWA계획/QA/handoff. 다른 dirty desktop history/resize 파일보존.
+- 다음명령(cwdperformance): `sed -n '1,240p' crates/app/src/agent_detect.rs`; `rg -n 'agent_detect|agent_sessions|session_title' crates/app/src`; cmux GitHub 조사. 실행app재시작 금지.
+
+---
+
+# PWA 모바일 공간·맞춤 수정 진행 — 2026-10-11
+
+- 입력 거절 조사는 QA/PR 계획 작성·재검토 완료. source module 직접 재현2개 exit0, 기존 runtime 입력 보호7PASS. 최초 dirty producer는 실제 로그에 없어 미확정. desktop composer 제품 코드 변경 금지 유지.
+- 후속 사용자 명시 구현4건: 기본 document 가로 이동 차단, 더보기 화면 검색 제거, phone fit 가로 활용 개선, terminal header 두줄→한줄 및 축소. 계획 `docs/superpowers/plans/2026-10-11-pwa-mobile-layout-fixes.md`.
+- 원인: shared core overview가 width와 전체 history height 중 작은 비율을 사용; 긴 history가 가로까지 축소. phone resize는 overview/readable/retained reading일 때 suspend하며 acquire grant가 이 모드를 해소하지 않음. UI header는 workspace와 connection을 두줄로 그린다.
+- 변경 예정: web shared core/theme/CSS, loopback assets, Relay headerCSS, 관련 Chromium fixtures. 기존 다른 Claude 작업의 app/runtime/terminal 변경은 건드리지 않는다. restart/release/commit/push 요청 없음.
+- 다음: production PWA assets 수정 → isolated browser geometry/input/reading/lease 회귀 → QA/handoff. `scripts/dev-run.sh` 실행 금지.
+- PWA assets 구현 완료: document clip, loopback loaded-screen 검색 제거, width fit+vertical history/anchors, 실제 scaled glyph 높이의 bounded history rows, phone grant 후 live grid/32열 font 조정, shared45px한줄 header. loopback production UI+renderer Chromium2PASS. 최초 mobile_usability는 tiny stage 때 canvas가0높이로 옛 font인 oracle32 vs actual33으로 FAIL; configured font를 직접 측정하는 oracle로 수정. 최종 Chromium 전체 회귀 진행 중(log `/private/tmp/deppy-pwa-mobile-layout-final-20261011.log`). product resize/lease 규칙은 유지.
+- PWA 종료 후 사용자 후속: Design 같은workspace/agent라도 세션독립 title/binding 수정, GitHubcmux 참고. read-onlyDB에서 Design pane2개가 같은CodexID `01a128ae-f2ff-7a41-9961-ed85ecea10e5`로 저장됨을 발견. root cause로 단정 전 cwd rollout 탐지·identity 확인 필요. PWA 끝난 뒤 착수. 별도 restart 요청 없음.
+
+---
+
+# 하단 컴포저 시작 직후 입력 거절 조사·PR 계획 완료 — 2026-10-11
+
+- 현재 목표: 사용자의 「수정하지 말고 원인만 찾고 PR 단위 정리」. 후속 기준은 「같은 문장이라도 새로 작성·전송하면 새 입력」. 제품 코드/앱 버전 변경·재시작·사용자 에이전트에 시험 전송·commit/push 금지. 조사 문서와 계획만 작성한다.
+- 실행 상태: PID21173, `target/restart-0.10.1-20261011/Deppy Sijo.app`, 0.10.1. source base799fae89 + 다른 Claude 작업의 dirty tree; 후속 resize 수정은 실행 artifact와 구분. composer.rs/status.rs/input_admission.rs/agent_detect.rs는 이 조사에서 수정하지 않았다.
+- 확인: 실제 `logs/app.log.2026-10-11` L46–50, KST10:57:32.400–10:57:34.449에 `ExplicitPrompt/Codex/accepted_input_draft` 5회. runtime이 PTY enqueue 전에 AdmissionDenied를 반환하는 지점까지 확정. 이 로그에는 session/operation/이전 입력 intent가 없어, 최초 flag 생성 입력을 이번 사건과 100% 연계할 수는 없다.
+- 실제 제품 status.rs를 임시 Rust probe에서 직접 로드해 detector 재현 exit0. 실제 input_admission.rs + 정확한 session 의존성 fingerprint의 rlib + 별도 /bin/cat PTY로 guard 재현 exit0. Codex Shift+Up/Down → dirty=true → redraw/turn-start에도 유지 → Empty/Placeholder 모두 명시적 새 전송 거절. Ctrl+U 후 redraw는 Empty면 허용하나 Placeholder면 거절. 같은 본문 두 번과 완전한 bracketed-paste+CR은 정상 상태. 사용자 세션 입력/수정은 없음.
+- 증거: `/private/tmp/deppy-composer-startup-investigation-jop_yiyy/{detector_probe.rs,probe.log,provenance.json,guard_probe.rs,guard-probe.log,guard-provenance.json}`. 첫 guard compile은 서로 다른 Cargo dependency cohort rlib 선택으로 타입 불일치 실패; .fingerprint/lib-session.json의 정확한 fingerprint로 교정 후 compile/probe exit0. 제품 변경으로 해결한 것이 아니다.
+- 추가 코드 확인: UI can_send는 target 존재만 확인, 실행 감지가 없는 Agent는 UnconfirmedAi로 snapshot돼 후단 거절(준비 대기 없음). 단일 controller action slot이 occupied인 경우도 즉시 거절. 이들은 시작 시점 실패 경로이나 실제 5회 로그의 원인으로 단정하지 않는다.
+- UI 읽기 확인: nomorevibe/Design 두 세션 화면을 관찰했고 native Codex placeholder를 확인. 당시 두 Design의 현재 화면은 사건 시점과 다르므로 사건 당시 editor 상태로 소급하지 않는다. 입력/전송 안 함; 원래 nomorevibe 화면으로 복원.
+- 완료: 기존 runtime 테스트 바이너리 관련 입력 보호 회귀7PASS/0FAIL, `runtime-existing-results.json`에 필터/결과/hash 기록. QA `docs/qa/2026-10-11-composer-startup-input-investigation.md`와 PR1진단/PR2draft판정/PR3startup준비/PR4새요청·harness 계획 `docs/superpowers/plans/2026-10-11-composer-startup-input-pr-plan.md` 작성. 한 번 더 소스/재현/문서 대조 후 line 위치와 설명 수정. 최초 dirty 생성 입력은 사건 로그에 없으므로 100%확정 주장 금지. 입력 기능 구현 미착수, 승인 범위는 계획까지.
+- 후속 사용자 작업: PWA 가로 document 이동 방지, 더보기 화면 검색 제거, 휴대폰 맞춤 너비 개선, terminal 도구/상태 영역 한줄·높이 축소. 이것은 별도로 구현 요청 받았으므로 해당 PWA UI만 수정한다. composer 버그 제품 코드 수정·자동 재시작 금지.
+- 다음 agent 정확한 읽기 명령(cwd performance): `git status --short`; `git diff -- crates/app/src/app.rs crates/runtime/src/in_process.rs`; `cat /private/tmp/deppy-composer-startup-investigation-jop_yiyy/guard-probe.log`; `sed -n '243,285p' crates/runtime/src/input_admission.rs`; `sed -n '456,540p' crates/session/src/status.rs`.
+
+---
+
+# 이력 제목 재수정, Git PR 계획, 리사이즈 결함 수정·부드럽게 — 2026-10-11 (Claude Code)
+
+- 사용자 정정: 이력 제목은 사이드 레일 라벨이 아니라 「작업」 화면 제목(fleet.rs `ui.heading`, 전역 Heading 18pt)과 같아야 한다 → `browser.rs` 제목을 `TextStyle::Heading.resolve(&ctx.global_style())`로. offscreen render로 확인(QA asset 폴더는 백업 후 원복).
+- Git 계획: `docs/superpowers/plans/2026-10-11-git-panel-v2.md` — PR0 문서, PR1 상세 TDD(선택 강조·상태 배지·short_dir·diff 헤더, render 시그니처 유지), PR2~5 범위·수용기준, 쓰기 동작 보류. git_panel/diff_viewer는 origin/main과 동일, PR은 origin/main worktree에서.
+- **0.10.1 결함:** `observe_resize_applied`가 `resize_desired == target`일 때만 true → 드래그 중 단계 viewport를 handle_events에서 drop → fence 후보 없음 → 드래그 중 화면 정지. 수정: 토큰·목표 일치 시 true. 회귀 테스트(handle_events 수준) 수정 전 FAIL 확인.
+- 부드럽게/자원: `retained_grid_awaits_local_resize`(로컬·불일치·split drag/원격/실패 아님)일 때 renderer `fit_wider_grid=false`(축소 없이 좌상단 고정, 커서 쪽 세로 pan). runtime tracked resize의 `signal_memory_released()`를 hidden/exited일 때만. 근거: kitty/ghostty/rio/wezterm 좌상단 고정, egui-wgpu macOS jitter fix 이미 적용. 스펙 08-18 문서에 「2026-10-11 보완」 절.
+- 미적용 후속: DEC 2026 sync timeout(ESU 없는 BSU → 2MiB까지 정지, 런타임 deadline 깨우기 필요) 후 `CLAUDE_CODE_FORCE_SYNC_OUTPUT=1` 검토; resize 단계마다 모든 보이는 pane 재스냅샷(push_watched_viewports) 축소.
+- gate: fmt check, clippy -p deppy-sijo -p terminal -p runtime --all-targets -D warnings, test terminal 134 / deppy-sijo 2826 / runtime 379 PASS(0 FAIL), `cargo build -p deppy-sijo -p mcp-proxy` PASS. version 0.10.1 그대로(미배포), 실행 중 앱은 결함 있는 0.10.1(PID 21173). 재빌드·재실행은 새 요청 필요(그때 0.10.2).
+
+---
+
+# 0.10.1 재빌드·명시적 재실행 완료 — 2026-10-11 (Claude Code)
+
+- 사용자 `재빌드 하고 재실행해`. 버전 0.10.0 → 0.10.1(patch: 이력 제목·검색 정렬 수정, 창 리사이즈 실시간 반영). 최고 기존 worktree/artifact 0.10.0 확인. root `Cargo.toml` + `Cargo.lock` workspace 27 entries만 변경(외부 dependency 불변). source base 799fae89 + 미커밋 working tree. commit/push 안 함.
+- 실패 접근: `scripts/package-macos.sh`(DEPPY_ALLOW_UNTRUSTED_SIGNING=1)를 Claude Code auto mode 분류기가 거부 → 우회하지 않고 `cargo build --release`만 선행, 사용자가 권한 승인 후 같은 명령 직접 실행. package verification OK(Developer ID Application VectorNine / ZDTU5LS35K, 로컬 개발 번들, 공증 없음).
+- isolated copy `target/restart-0.10.1-20261011/Deppy Sijo.app`: 세 실행 파일 SHA256 원본과 동일, `codesign --verify --deep --strict` OK, CFBundleShortVersionString·CFBundleVersion 0.10.1. 0.10.0 restart artifact 보존.
+- 기존 PID 11026에 `tell application id "app.vector9.deppy-sijo" to quit`(정상 quit) → 약 1초 후 종료, force kill 없음. `open`으로 새 번들 실행 → PID 21173, LaunchServices bundle path·Version 0.10.1, 19초 이상 유지 확인. About 대화상자·세션 복원 개수·창 드래그 육안 검증은 하지 않았다.
+- 다음 read-only: `ps -o pid=,etime=,comm= -p 21173`; `lsappinfo list | grep -A3 "pid = 21173"`. 이후 자동 restart 금지. 다음 changed release는 >0.10.1.
+
+---
+
+# 이력 제목·검색 정렬, Git 시안, 창 리사이즈 실시간 반영 — 2026-10-11 (Claude Code)
+
+- 요청 3건(사용자): 작업 이력 상단 제목을 사이드 레일 「작업」 라벨과 같은 서체·크기로, 검색창 텍스트 세로 중앙, Git 패널 개선 HTML 시안; 이어서 "창 크기 조절 중에도 내부 콘텐츠가 바로 따라오게". commit/push/restart/version 변경 요청 없음, 수행 안 함. 실행 중 앱(0.10.0) 그대로.
+- 이력: `browser.rs` 제목 `size(21)` → `fonts::sidebar_font(ctx, 12.0)`(레일 nav_row와 동일, 사용자 선택). 검색 TextEdit에 `vertical_align(Center)` — egui 0.35 hint atom은 LEFT_TOP이지만 AtomLayout이 블록 전체를 align2로 배치해 placeholder도 중앙.
+- Git 시안: `docs/mockups/git-panel-redesign-2026-10-11.html`(제안/지금 화면 비교, 탭형·섹션형, 6개 상황). 제품 코드 미적용. 쓰기 동작(stage/commit/push)은 08-15 스펙의 읽기 전용 결정 때문에 「보류·결정 필요」로만 표기.
+- 창 리사이즈: 원인은 `workspace.rs` 120ms 디바운스 + viewport 정지 조건 + fence 승격 조건(`resize_desired == target`)으로 드래그 중 PTY 크기·표시가 모두 고정. `queue_terminal_resize_live`로 교체 — 직전 단계가 적용·표시되면 바로 최신 목표 전송, 진행 중이면 건너뜀(`SessionView::live_resize_step_pending`). settle은 목표가 옮겨 가도 적용된 단계의 안정 화면 승격. `RESIZE_DRAG_DEBOUNCE`, `pending_resize_target` 제거. pane divider drag 계약(08-24 A)은 변경 없음. 스펙 `docs/superpowers/specs/2026-08-18-resize-flicker.md`에 10-11 절 추가.
+- 테스트: 디바운스 계약 테스트 3개를 live 테스트 3개로 교체, 큐 압력·attached pane·external geometry 테스트 갱신. 옛 settle 조건으로 되돌리면 새 fence 테스트가 실패하는 것 확인 후 복원. 최종 gate: fmt check / clippy -p deppy-sijo --all-targets -D warnings / test -p deppy-sijo 2824 PASS·0 FAIL·38 ignored(+통합 전부 PASS), `cargo build -p deppy-sijo -p mcp-proxy` PASS.
+- 미검증: 실제 앱 창 드래그 육안 확인(재실행 요청 없음). 남은 비용은 드래그 중 단계마다 자식 TUI의 SIGWINCH 재그리기 — Claude/Codex 세션을 띄운 채 확인 필요. 깜빡이면 단계 최소 간격 추가가 다음 후보.
+- 다음 read-only(cwd performance): `git diff --stat`; `git diff crates/app/src/ui/workspace.rs`; `sed -n '/2026-10-11 변경/,$p' docs/superpowers/specs/2026-08-18-resize-flicker.md`. 자동 `dev-run.sh` 금지.
+
+---
+
+# 0.10.0 재빌드·명시적 재실행 완료 — 2026-10-11
+
+- 사용자 `재빌드하고 재실행해` 완료. source performance / base 799fae89de82ec9a0e57104b47d18cf20d274186 + 미커밋 history/release working tree. nominal checkout/별도API문서/시안자료 보존. commit/push 요청 없음, 수행 안 함.
+- 현재 source/release version0.10.0(0.9.0→0.10.0 minor: Claude 이력 구조 및 앞선 미출시 PWA 통합 feature). 최고기존 worktree/artifact0.9.0 확인. Cargo.toml canonical version 및27inherited workspace Cargo.lock packages 증가; dependencies unchanged.
+- offline optimized App+mcp-proxy package 실제PASS(exit0), compile1m27s, `/private/tmp/deppy-0.10.0-package-20261011.log`. pinned cloudflared 포함, 기존 Developer ID Application VectorNine/TeamZDTU5LS35K 유지. signature/architecture/plist/archive hash gate PASS. 로컬signed development artifact이며 public notarization submission 없음.
+- isolated newbundle `target/restart-0.10.0-20261011/Deppy Sijo.app`: copy SHA256 불변/서명 검증PASS,CFBundleShortVersionString와CFBundleVersion 모두0.10.0. `/private/tmp/deppy-0.10.0-restart-bundle-verify-20261011.log`. old0.9.0 restart artifact 보존.
+- oldPID86569 정상 native Cmd+Q 후 실제종료(강제kill없음). sole newPID11026 exact0.10.0 restart executablepath 확인. actual native About `Deppy Sijo Version 0.10.0 (0.10.0)` 확인/닫음,main window응답/세션18복원 확인. prompt전송/사용자DB 수정 없음. 모든 provider liveE2E를 주장하지 않는다.
+- build source hashes/lock metadata `/private/tmp/deppy-0.10.0-build-source-20261011.json`,runtime proof `/private/tmp/deppy-0.10.0-runtime-verification-20261011.json`. basecommit+dirty provenance를 명시한다. 새releaseQA `docs/qa/2026-10-11-v0.10.0-local-rebuild.md`.
+- 이번 수정 Cargo.toml/Cargo.lock/이handoff/newreleaseQA. product검사는 이전실제 history67PASS/render1PASS/i18n8PASS/Clippy/fmt 결과를 유지,version-only로관련없는suite반복 안 함. 최종 diff check PASS.
+- 실패접근: CUA changed-app guard→freshfullAX로복구; optional launch_app 미제공→documented getApp(fullpath) launch;stale Aboutmenu와JSbinding→freshstate/explicitvar. 모두최종정상종료/launch/About/main검증으로복구.
+- 요청build/restart 필수작업 없음. 다음 read-only(cwd performance): `git status --short`; `cat docs/qa/2026-10-11-v0.10.0-local-rebuild.md`; `ps -o pid=,stat=,comm= -p 11026`; `git diff --check`. 이후자동restart금지(새current명시요청필요). changed artifact 다음release는>0.10.0 및version검증필수.
+
+---
+
+# Claude 이력 구조 채택 완료 — 2026-10-11
+
+- 현재 목표: 사용자 `Claude 시안 구조 채택해서 다시 업데이트해`. canonical source performance HEAD799fae89/0.9.0이며 소스 구현과 격리 QA/실제 렌더 대조 완료. 변경 release/commit/push/restart 요청 없음. nominal checkout/API 문서/지난 UI자료 보존. 추가 스킬/서브에이전트 없음.
+- 완료: default thread/time/card, 대표 제목+저장 결과 한 줄+project/branch+상태 개수/추가필터, 상세 상단 metadata/이번 지시+직전3흐름/하단 고정 action,32:68 기본 split(저장값 우선), scoped37/26/39/68pt geometry, localized pane title. 정확한 activation/diff/transcript/copy/verified-state 계약 보존.
+- owner=(workspace,pane,kind,agent_session_id); title/context/metadata는 anchor 시점 이전으로 제한한다. path/model 변경 시 branch/effort 초기화. 새 요약·번역·PR count 생성 안 함. context click은 local filters를 해제해 정확한 턴을 유지하고 외부 aux filter 밖의 버튼은 비활성화.
+- 이번 수정: `crates/app/src/ui/work_history/browser.rs`, 새 `browser/thread.rs`, `crates/app/src/app.rs`의 split helper/그 회귀 및 주석,5locale11keys, 새 `docs/mockups/work-history-claude-applied-2026-10-11.html`+`work-history-claude-2026-10-11-assets/`, QA `docs/qa/2026-10-11-work-history-claude-implementation.md`, 이 handoff. 이전 작업의 공유 copy helper `work_history.rs` 수정과 기존 applied/parity/QA 문서도 dirty 상태로 보존한다.
+- 최종 실행: history67PASS/0FAIL/1ignored, offscreen render1PASS, App+i18n strict all-targets Clippy/fmt PASS(exit0), `/private/tmp/deppy-history-claude-final-20261011.log`. Split1PASS/i18n8PASS는 `green2` log. Node script/unique IDs/탭 targets/6개localimage참조/크기JSON PASS; diff check PASS.320×568~1100pt project/고정action bounds,긴결과300줄/30repaint,owner/future/metadata/정확한context activation/원문요청/card scope 등 회귀.
+- 실패 원인과 수정: lifetime 누락→명시; nested root Combo/menu close 정책 실패→inline 펼침; narrow additional Combo overflow→세로배치; main project Combo child layout wrap 실패→148pt 공간확인/다음행;320copy footer→두줄; sparse metadata의branch 다른project 상속→path/model 경계fold. 중간60/4,64/2,64/3 실패는 모두 기록하고 최종PASS와 구분했다.
+- 실제 PNG1100/1440/390pt view_image 대조. 새HTML HTTP200 및 native Chrome 별도창 AX/스크린샷으로 확인; 좁은화면탭→두이미지·selected,스레드탭복귀를 실제클릭 검증. 시간순/크기/맞춤HTML 버튼은 이번native클릭 미검증(제품time전환은Rust회귀PASS). 페이지 `http://127.0.0.1:8767/work-history-claude-applied-2026-10-11.html` 열어둠.
+- 완료 범위는 소스·격리제품UI QA. 실행중앱 재시작/live session E2E/changedartifact 출시 안 함. version0.9.0 유지. 후속 release 시 최신shipped보다 높은 버전 및 binary/bundle 검증이 필요하고 restart는 현재 명시 요청이 필요하다. 요청 작업 남은 구현 없음.
+- 다음 agent 먼저(cwd performance): `git status --short`; `git diff --stat`; `cat docs/qa/2026-10-11-work-history-claude-implementation.md`; `git diff --check`. 추가변경이 회귀를 필요로할 때만 `python3 /private/tmp/deppy-audit-nine-pr-20261004/cargo_gate.py test -q -p deppy-sijo ui::work_history:: -- --test-threads=1`; PNG생성이 필요할 때만 같은gate `test -q -p deppy-sijo approved_history_render_evidence -- --ignored --test-threads=1`. 자동 `dev-run.sh` 금지.
+
+---
+
+# Claude 이력 구조 채택 구현 중 — 2026-10-11
+
+- 요청: 링크 시안의 구조를 채택해 이력 화면을 업데이트한다. canonical performance HEAD799fae89/version0.9.0 + 앞선 history 수정 보존. restart/release/commit/push 요청 없음. 서브에이전트/추가 스킬 없음.
+- 구현 계획: owner=(workspace,pane,provider,agent_session_id)로 기본 thread list와 시간순 선택, 과거 선택 턴 이후 제목/흐름 제외, bounded 저장 응답 한 줄, project/branch 및 translated pane title. 상세는 metadata/대표 제목/이번 지시+직전3흐름/결과, action/copy footer 고정. 기존 정확한 activation/transcript/verified state 및 보조 필터/card 유지.
+- 원문 첫 문장 추출은 번역을 생성하지 않는다. PR/테스트 수는 확인된 저장 데이터 없으면 만들지 않는다. UI read-only projection만 추가하고 저장 schema나 agent 실행 경로는 변경하지 않는다.
+- 완료: 새 `browser/thread.rs` owner projection과 과거 제목/앞선3개/유계 markdown preview,5locale11keys, UI 기본thread/time/card/project+counts 및 추가필터, 상세상단metadata/context/고정action footer, display_pane_title 적용.
+- 중간 history 검사: lifetime 명시 누락 E0106 수정 후60PASS/4FAIL/1ignored. 메뉴가 scope Combo 클릭 때 닫히는 것과 default menu style18pt,320pt copy footer overflow를 발견했다. CloseOnClickOutside + history scoped style, narrow footer2줄로 수정했다. 이 실패를 PASS로 기록하지 않는다. `/private/tmp/deppy-history-claude-tests-20261011.log`.
+- 신규 context-click→exact Activate/project filter/thread-time toggle/localized title 회귀 추가. 전체 work_history 재검사 중. 다음: PASS 확인 → opt-in actual render/fixture → i18n/strict Clippy/fmt → actual HTML/QA/handoff.
+
+- 최신 중간 재검사64PASS/2FAIL/1ignored (`/private/tmp/deppy-history-claude-tests-final-20261011.log`)는 nested menu+Combo root popup 교체로 scope 선택2건이 실패했다. 메뉴 close_behavior만 바꾸는 접근은 해결하지 못했다. 추가필터는 버튼으로 inline 확장하는 구조로 수정해 각 Combo의 root popup을 보존한다(Escape/버튼으로 접힘).
+- sparse continuation의 cwd/branch/model/effort를 같은 owner의 과거 기록에서만 보완하는 borrowed `thread::context` 추가. branch는 effective cwd,effort는 effective model 일치 경계를 유지한다. 필터와 상세/그룹 metadata에서 사용하며 identity/status/summary는 바꾸지 않는다. future/other-owner/다른project와 정확한activation 회귀 추가.
+- actual render fixture를3threads/8turns,짧은후속지시+직전3흐름+3project로 교체. source code 경로만 변경하고 아직 실행한 render를 PASS로 기록하지 않는다. 다음 focused history/i18n → isolated PNG → strict Clippy → HTML/QA.
+
+- source-focused 첫64PASS/3FAIL은 좁은 추가필터 가로 overflow와 test query 중복이었다. 좁은 추가필터를 세로 배치하고 project 선택은 Role Button으로 정확히 지정했다. `green2` 실행은 history67PASS/0FAIL/1ignored, split1PASS, i18n8PASS(exit0). 긴 결과에도 footer 고정과 context→query 해제→exact turn 검증.
+- metadata path/model 변경을 사이에 둔 branch/effort의 잘못된 상속을 막도록 과거 순서 fold로 수정했다. preview는 fenced code 전체를 제외한다. 그 수정 후 `validation` 실행 history67PASS/0FAIL/1ignored, isolated render1PASS, App+i18n strict alltargets Clippy PASS(exit0).
+
+- 실제 PNG 대조에서390pt project Combo가 오른쪽에 `…`로 잘리는 것을 발견했다. Button과 다른 Combo child layout의 wrap 원인이며 명시적인148pt 공간 확인/다음행 배치로 수정했다.320×568과 project field bounds 회귀를 추가한다. 이 마지막 조정 뒤 검사·PNG·Clippy를 재실행할 예정이다.
+
+---
+
+# Claude 링크 이력 시안과 현재 구현 대조 완료 — 2026-10-11
+
+- 현재 요청: https://claude.ai/artifact/1NHCPjiQ2nHnQgWDv5tvEX#page-dcb81aee8d83 와 현재 구현을 비교한다. 제품 변경 추가 요청/재시작은 이 turn에서 없음.
+- Native Chrome에서 해당 URL을 새 tab으로 열고 실제 AX/screenshot의 두 artboard(제안/지금 화면)를 확인했다. 제안은 스레드 묶음/대표 제목, 개별 턴 결과 한 줄, 프로젝트/브랜치, 상단 상세 metadata, 직전3개 흐름, 하단 action bar이다. App source/실제 offscreen PNG와 대조했다. web open은 접근 실패했고 CUA로 확인했다. canvas60% screenshot을 원본 CSS 수치로 단정하지 않는다.
+- 직전 수정은 10월8일 repo HTML 기준이다. 현재 default browser는 날짜별 flat row/instruction 첫 줄/summary 원문/cwd·branch 접힘이다. 이 링크 시안의 정보 구조는 구현되지 않았다. 기존 카드 그룹 helpers는 존재하지만 새 제안과 같은 thread/preview UI가 아니다.
+- 별도 실제 버그 경로: app.rs:20022 raw pane.title → browser.rs:1170 raw 표시; workspace.rs:9929의 display_pane_title을 거치지 않는다. 이번 turn은 비교만 수행해 아직 고치지 않았다.
+- 결과 문서 `docs/qa/2026-10-11-work-history-claude-comparison.md`. 기존 제품 수정/HTML/PNG/API 보고서 보존. 제품 코드/test/version/commit/push/restart 없음. 지난62PASS/offscreen1PASS/strict Clippy는 이전 시안 크기 적용의 검증이며 이번 링크 구현을 증명하지 않는다.
+- 비교 요청 완료. 후속 구현 요청 시 링크를 기준으로 thread/title+result/project metadata → 상세맥락+액션 → geometry/ownership 검증 순으로 진행한다. group ownership/workspace/provider/pane와 과거턴 시간 경계를 유지해야 한다. 요약 첫 문장 추출은 한국어 번역을 대신하지 않으며 사실 확인 없는 PR/파일/테스트 카운트를 만들지 않는다.
+- 다음 agent read-only(cwd performance): `git status --short`; `cat docs/qa/2026-10-11-work-history-claude-comparison.md`; `sed -n '19996,20078p' crates/app/src/app.rs`; `sed -n '935,1195p' crates/app/src/ui/work_history/browser.rs`. 현재 앱 재실행 요청 없이 dev-run.sh 실행 금지.
+
+---
+
+# 승인 이력 시안과 실제 컴포넌트 크기 대조·수정 완료 — 2026-10-10
+
+- 현재 요청: `docs/mockups/work-history-proposal-2026-10-08.html`의 버튼·입력·목록/상세 여백과 크기를 실제 이력 화면에 최대한 동일하게 구현한다. 앞선 turn에서 원본 시안을 native Chrome 새 창으로 열어 실제 AX/스크린샷을 확인했다(127.0.0.1:8767). 원본은 변경하지 않는다.
+- canonical source `/Users/jr/Desktop/projects/deppy-sijo-performance`, HEAD799fae89/version0.9.0. 시작 상태는 이전 API 보고서의 handoff 수정/HTML untracked만 있었다. 그 작업을 보존한다. 이번 요청에 app restart/release/commit/push 없음. 추가 스킬/서브에이전트 사용 없음.
+- 원인: `ui/work_history/browser.rs`는 row68pt만 지정하고 title/body/meta/control은 전역 egui 기본 크기와 스타일을 상속했다. row text가 상단에 붙고 하단 여백이 남으며 실제 기본 버튼/selection은 승인 HTML과 다르다. HTML14pt body/12pt meta, 37pt 일반 버튼, 26pt copy/정렬, 68pt row, 24pt header/20pt list/26pt detail 수평 여백을 로컬 contract로 사용한다. 글자 높이와 전체 행 높이를 함께 맞추고 시간은 우측에 분리한다.
+- 계획: history에만 scoped typography/control palette 적용 → toolbar/list-header/row/detail 컴포넌트와 선택선·구분선 대조 → 기존 action/selection/narrow/transcript 계약 회귀 및 실제 offscreen egui render 측정 → 원본과 수정 후 화면을 비교하는 HTML 증거/QA와 handoff 갱신. API 기능이나 다른 앱 전역 style을 수정하지 않는다.
+- 수정 전 offscreen 실제 렌더 테스트 `approved_history_render_evidence -- --ignored --test-threads=1` 1PASS/0FAIL을 실행했고, 기존 적용 화면 3개를 새 `docs/mockups/work-history-parity-2026-10-10-assets/before-*.png`로 보존했다. 로그 `/private/tmp/deppy-history-parity-before-20261010.log`. 앱은 실행하지 않았다.
+- `browser.rs`에 이력 전용 scoped typography/palette, toolbar/list header/detail 크기, 2줄 row/우측 시간/선택 stripe, underline tabs, heading 우측 copy 버튼을 적용했다. `work_history.rs` copy helper는 기존 카드의 크기/feedback/clip 계약을 보존하면서 browser의 지정 높이만 받는다. 명시된 사용자 split 폭을 존중하고 자동 기본은 승인 시안의 1:1.1 비율을 사용한다.
+- 최종 `ui::work_history::`62PASS/0FAIL/1ignored, actual offscreen renderer1PASS/0FAIL. `/private/tmp/deppy-history-parity-{tests,render}-final-20261010.log`. 실제 control rect37/26/39pt, left-aligned row21+18pt/68pt/하단12pt,320/390/760/900/1100pt containment 및 기존 action/copy/selection/card/transcript/긴 상세 bounds 검증. raw row/meta/시간의 실제 좌표를 검사한다. strict App all-targets Clippy PASS(exit0), `/private/tmp/deppy-history-parity-clippy-20261010.log`; 최종 fmt --check/git diff --check PASS(exit0).
+- 새 comparison HTML `docs/mockups/work-history-parity-2026-10-10.html`, actual before/after PNG7개+measurement JSON, QA `docs/qa/2026-10-10-work-history-parity.md`. 원본 보존. 기존 applied screenshot3개를 업데이트하고 applied HTML에 후속 비교 링크를 추가했다. Node syntax/IDs/tabs/local assets/JSON 높이 PASS, native Chrome 전용 새 창에서 loopback8767 페이지와 AX image/크기표를 확인했다. 후속 tab 클릭은 stale element/cgWindowNotFound 때문에 미검증.
+- 현재 요청의 소스 구현·회귀·실제 렌더 대조·HTML은 완료. 남은 필수 소스 작업 없음. 소스-only 버전0.9.0 유지. 앱 restart/release 요청이 없으므로 `dev-run.sh` 실행 금지. commit/push는 요청되지 않았고 하지 않았다.
+- 다음 agent의 read-only 확인(cwd performance): `git status --short`; `git diff --check`; `cat docs/qa/2026-10-10-work-history-parity.md`; `cat docs/mockups/work-history-parity-2026-10-10-assets/measurements.json`. 제품 릴리스 요청 시에만 새 patch version>0.9.0과 binary/bundle version 검증을 수행하며 현재 작업의 명시적인 restart 요청이 있어야 앱을 실행한다.
+
+- 중간 검사: existing `approved_history`10PASS/1ignored, offscreen render1PASS 실행. 렌더에서 `Ui::place`가 row text를 중앙 정렬하는 것을 발견해 top-down child로 왼쪽을 고정했다. 일반 버튼은 원본CSS의 21line+14padding+2border=37pt를 기준으로 보정했다.
+- 새 geometry/320–1100pt containment를 포함한 `ui::work_history::`63tests는61PASS/1FAIL/1ignored. 320pt에서 provider 뒤의 Frame statusgroup이 자동 줄바꿈되지 않고 화면 우측을 넘었다. group 폭 사전 측정과 `end_row`/내부 wrap으로 수정하고 최종 검사 PASS했다. 추가 oracle는 parent padding/narrow mode 및 duplicate 완료 label을 고려하도록 수정했다. 실패 로그 `/private/tmp/deppy-history-parity-tests-20261010.log`.
+
+---
+
+# 환경설정 API 구현 검토와 HTML 사용 보고서 완료 — 2026-10-10
+
+## 현재 목표
+
+사용자 요청: 환경설정의 API 관련 실제 구현과 사용 방법을 검토하고, 잘못된 부분·개선점을 HTML로 보고한다. 현재 요청은 조사/보고이며 제품 수정·커밋·푸시·앱 재시작·릴리스를 요청하지 않았다. canonical source는 `/Users/jr/Desktop/projects/deppy-sijo-performance`, source HEAD `799fae89`, version0.9.0. nominal checkout은 변경하지 않는다. 추가 스킬/서브에이전트 사용 없음.
+
+## 완료한 조사와 결정
+
+- native CUA로 실행 중인 앱의 설정→환경 및 API→API 추가 폼을 열어 확인하고 설정 창을 닫았다. 빈 폼만 열었으며 키 입력/표시/저장/삭제·사용자 에이전트 입력·앱 중지/재실행은 하지 않았다. 실제 화면은 공급자/라벨/종류/비밀키 표인 classic이다. `app.rs:36384`가 의도적으로 classic을 고정하며 modern 서비스 선택 화면은 비활성 보관 코드다.
+- API credential은 Keychain physical bundle + DB metadata/logical pointer/프로젝트 env binding으로 저장된다. `provider`/`kind`는 자동 HTTP 연결·모델 선택 설정이 아니다. env binding이 있을 때 해당 프로젝트의 새 shell/agent에 전달되며 기존 프로세스는 그대로다. 사용자 지정 Codex LLM 키/endpoint/wire 설정은 별도 기능이다.
+- 확인된 문제: 저장·연결은 nonempty만 요구하지만 실행 redaction은 최소6UTF-8 bytes여서 1–5byte 연결 키는 전체 새 실행을 막는다. 참조 중인 키 삭제는 DB가 안전하게 거절하지만 UI는 이유 없이 일반 실패를 보여준다. 환경 이름 중복 등 오류의 구체적인 원인과 입력 위치 안내가 부족하다. API 연결 시 live reload를 runtime이 꺼도 UI checkbox는 설정값만 표시한다.
+- 개선점: double-click 수정의 발견성, 공급자와 실제 환경변수 이름 구분, 실제 적용 상태 및 공급자 인증 검사 구분. 프로젝트 API는 provider별 agent 필터 없이 전달되므로 대상 프로세스 범위 설정을 제안한다. Anthropic 공식 문서가 ANTHROPIC_API_KEY 우선 인증/API 종량제 전환을 명시하므로 이를 사용 안내에 포함한다. 실제 과금/인증 실패를 관찰했다고 주장하지 않는다.
+
+## 실제 실행한 테스트
+
+root serialized Cargo helper의 8개 focused filter, 총40PASS/0FAIL. log: `/private/tmp/deppy-api-settings-review-tests-20261010.log`. 각 `cargo test -q -p ... FILTER -- --test-threads=1`을 `python3 /private/tmp/deppy-audit-nine-pr-20261004/cargo_gate.py`로 실행:
+
+- storage `credential_env`3, `credential_edit`2
+- secret `too_short_execution_secret_fails_closed`1
+- runtime `credential_env`3
+- deppy-sijo `credential_edit`2, `ui::credentials::tests::`22, `credential_env`1, `environment_application::tests::`6
+
+기존 isolated DB/fake secret/test-keyring tests이다. 실제 공급자 API 요청/사용자 Keychain 쓰기/새 live session 실행은 검증하지 않았다. 짧은 키 문제는 저장→실행 소스 경로 대조 및 기존 redaction fail-closed 테스트 근거이며 실제 사용자 설정에 짧은 키를 등록해 재현하지 않았다.
+
+## 수정 파일 / 완료한 HTML 검증 / 다음 명령
+
+수정 파일은 이 handoff와 새 `docs/reviews/2026-10-10-api-settings-review.html` 두 개다. HTML에 실제 classic 등록 사용 절차, 필드 의미, 적용 시점/우선순위, 수정/연결 해제/삭제, 확인된 문제4개와 개선 제안2개, 소스 근거·정확한 테스트 명령·공식 문서 링크를 포함했다. 공급자2개/보관·연결·키교체3상황의 설명용 로컬 demo와 print 버튼이 있다. 실제 키/사용자 환경 screenshot/외부 API 요청을 포함하지 않는다. 정식 UI 레이블 `Agent 환경 연결`을 ko-KR messages.txt와 대조해 정정했다.
+
+- Node vm inline script1개 syntax PASS, unique IDs17개/내부 anchor 연결 PASS. git diff --check PASS.
+- native Chrome 새 창에서 `http://127.0.0.1:8768/2026-10-10-api-settings-review.html`을 열었다. 실제 AX에 보고서 제목·사용 절차·전체6개 findings·40PASS 표와 초기 demo가 나타남을 확인했고 screenshot에서 desktop 레이아웃을 확인했다.
+- browser connector가 없어 createBrowserTab 실패 후 native Chrome으로 성공했다. 후속 demo 클릭/모바일 확인은 CUA cgWindowNotFound 때문에 완료하지 못했다. 앱명/번들 ID 재선택·JS reset에도 같은 오류였다. 이를 interaction/mobile PASS로 주장하지 않는다. 최초 설정 탐색의 잘못된 좌표 해석은 fresh screenshot 픽셀 좌표로 바로잡았다.
+- preview server는 127.0.0.1:8768, docs/reviews만 서빙하는 python http.server, session17972이다. 문서는 단독 로컬 파일로도 열 수 있다.
+
+요청한 구현 검토/사용법/개선점 HTML 보고는 완료했다. 제품 코드 수정/키 변경/앱 restart/release/버전 증가/commit/push는 하지 않았다. 사용자에게 4개 문제를 요약하고 HTML 파일 링크를 제공한다. 실제 공급자 인증·과금 및 사용자 Keychain write/live 새 실행은 미검증이다.
+
+다음 read-only 명령(cwd performance):
+
+```sh
+git status --short
+git diff --check
+sed -n '1,95p' docs/CODEX_HANDOFF.md
+rg -n 'test result:|cargo gate command:' /private/tmp/deppy-api-settings-review-tests-20261010.log
+```
+
+후속 제품 수정 요청 시 보고서 문제1·3 공통 검증/typed 오류 → 문제2·4 참조/effective 상태 → 제안5·6 적용 범위/수정 진입 순서를 참고한다. 이 보고서의 기존40PASS는 저장→실행 짧은 키의 새 end-to-end 재현 테스트를 대신하지 않는다. dev-run.sh 자동 실행 금지.
+
+---
+
 # PWA 통합 모바일 시안 구현 완료 — 2026-10-10
 
 ## 현재 목표와 결과

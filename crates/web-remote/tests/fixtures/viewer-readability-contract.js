@@ -167,13 +167,15 @@
     near(viewer.getCellMetrics().fontSize, 24, 'font setting must reach renderer');
     viewer.setFontSize(NaN);
     check(viewer.settings().fontSize === 24, 'invalid font must preserve current value');
+    viewer.handleViewport({ ...frame(), rows: 200 });
     viewer.setOverview(true);
     await settle();
     check(viewer.settings().overview === true, 'explicit overview setting');
     check(viewer.followingLive === true, 'overview layout clamping must preserve live following');
     check(viewer.getCellMetrics().fontSize < 12, 'overview may shrink independently of readable setting');
     check(viewer.canvas.getBoundingClientRect().width <= viewer.wrap.clientWidth + 1, 'overview width must fit');
-    check(viewer.canvas.getBoundingClientRect().height <= viewer.wrap.clientHeight + 1, 'overview height must fit');
+    check(viewer.canvas.getBoundingClientRect().height > viewer.wrap.clientHeight, 'width fit keeps tall native output vertically scrollable');
+    check(viewer.getDesiredHistoryRows() >= Math.min(256, Math.ceil(viewer.wrap.clientHeight / viewer.getCellMetrics().cellHeight)), 'fit history requests fill the actual rendered height');
     const restored = createViewer().settings();
     check(restored.fontSize === 24 && restored.overview === true, 'device settings must restore from storage');
     viewer.setOverview(false);

@@ -446,6 +446,12 @@ async function flow() {
   eq(getComputedStyle(terminal).display, "flex", "terminal visible while watching");
   eq(document.getElementById("term-name").textContent, "deppy-sijo", "terminal header name");
   eq(document.getElementById("term-session-chip").textContent, "codex", "session chip");
+  const terminalHead = terminal.querySelector(".m-term-head");
+  eq(terminalHead.getBoundingClientRect().height, 45, "compact Relay header height");
+  const nameBounds = document.getElementById("term-name").getBoundingClientRect();
+  const statusBounds = document.getElementById("term-status").getBoundingClientRect();
+  ok(Math.abs((nameBounds.top + nameBounds.bottom - statusBounds.top - statusBounds.bottom) / 2) < 1,
+    "Relay workspace and connection share one line");
 
   // 시청 불가 워크스페이스는 열리지 않는다(토스트만).
   cards[1].querySelector(".m-session-row")?.click();

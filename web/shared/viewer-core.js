@@ -319,8 +319,10 @@ export function createViewer(options = {}) {
 
   function getDesiredHistoryRows() {
     const cells = measureCells();
-    const visible = Math.max(1, Math.ceil(viewer.wrap.clientHeight / cells.cellHeight));
     const cols = viewer.screen ? viewer.screen.cols : wireScreen ? wireScreen.cols : 1;
+    const scale = prefs.overview && viewer.wrap.clientWidth > 0
+      ? viewer.wrap.clientWidth / (cols * cells.cellWidth) : 1;
+    const visible = Math.max(1, Math.ceil(viewer.wrap.clientHeight / (cells.cellHeight * scale)));
     const limit = Math.max(1, Math.min(256, Math.floor(MAX_HISTORY_CELLS / Math.max(1, cols))));
     desiredHistoryRows = Math.min(limit, visible + Math.max(4, Math.ceil(visible / 2)));
     return desiredHistoryRows;
@@ -345,7 +347,7 @@ export function createViewer(options = {}) {
 
   function capturePositionAnchor() {
     const screen = viewer.screen;
-    if (!expandedHistory(screen) || prefs.overview || !textRows.length) return null;
+    if (!expandedHistory(screen) || !textRows.length) return null;
     const top = viewer.wrap.scrollTop;
     const row = textRows.find(node => node.offsetTop + node.offsetHeight > top) || textRows.at(-1);
     return row ? { generation: screen.history.generation, identity: row.dataset.identity,
@@ -414,7 +416,7 @@ export function createViewer(options = {}) {
   }
 
   function requestHistoryNavigation(direction, reason = 'scroll') {
-    if (!hooks.historyNavigate || !expandedHistory(viewer.screen) || prefs.overview
+    if (!hooks.historyNavigate || !expandedHistory(viewer.screen)
         || pendingHistoryRequest !== null || waitingForResume || expiredHistory || getSelectedText()
         || viewer.connection !== 'connected') return false;
     const rows = getDesiredHistoryRows(), screen = viewer.screen;
@@ -431,7 +433,7 @@ export function createViewer(options = {}) {
   }
 
   function preloadHistoryAtPosition() {
-    if (!viewer.screen || viewer.followingLive || prefs.overview) return;
+    if (!viewer.screen || viewer.followingLive) return;
     const threshold = Math.max(getCellMetrics().cellHeight * 3, viewer.wrap.clientHeight / 2);
     if (viewer.wrap.scrollTop <= threshold) requestHistoryNavigation(1);
     else if (viewer.wrap.scrollTop + viewer.wrap.clientHeight >= viewer.wrap.scrollHeight - threshold
@@ -520,7 +522,7 @@ export function createViewer(options = {}) {
   }
 
   function rememberLocalPosition() {
-    if (viewer.watching && !prefs.overview && !restoreLocalPosition) {
+    if (viewer.watching && !restoreLocalPosition) {
       localPositions.set(positionKey(viewer.watching), {
         left: viewer.wrap.scrollLeft, top: viewer.wrap.scrollTop, follow: viewer.followingLive,
         anchor: capturePositionAnchor(),
@@ -591,6 +593,7 @@ export function createViewer(options = {}) {
     overview = !!overview;
     if (overview === prefs.overview) return;
     rememberLocalPosition();
+    const anchor = viewer.followingLive ? null : capturePositionAnchor();
     if (overview && prefs.readableWrap) {
       prefs.readableWrap = false;
       viewer.wrap.classList.remove('readable');
@@ -598,7 +601,8 @@ export function createViewer(options = {}) {
     }
     prefs.overview = overview;
     viewer.wrap.classList.toggle('overview', overview);
-    if (!overview) restoreLocalPosition = true;
+    restoreLocalPosition = true;
+    if (anchor) pendingPositionAnchor = anchor;
     resetPan();
     savePreferences();
   }
@@ -657,7 +661,7 @@ export function createViewer(options = {}) {
   }
 
   viewer.wrap.addEventListener('scroll', () => {
-    if (restoreLocalPosition || prefs.overview) return;
+    if (restoreLocalPosition) return;
     const position = scrollGeometry();
     const samePosition = automaticPosition && position.left === automaticPosition.left
       && position.top === automaticPosition.top;
@@ -1036,7 +1040,7 @@ export function createViewer(options = {}) {
       dy = totalY; // retain distance accumulated before the direction/threshold settled
     }
     if (touchGesture.axis !== 'vertical') return;
-    if (!dy || getSelectedText() || (!prefs.overview && !atHistoryEdge(dy)) || !hooks.pan) return;
+    if (!dy || getSelectedText() || !atHistoryEdge(dy) || !hooks.pan) return;
     e.preventDefault(); // viewport edge → connection-local history supplied by host
     // 손가락을 아래로 끌면(dy>0) 과거로 — 콘텐츠가 손가락을 따라온다.
     pan(dy / (viewer.cellH || 16));
@@ -1049,7 +1053,7 @@ export function createViewer(options = {}) {
     if (!e.deltaY || Math.abs(e.deltaX) > Math.abs(e.deltaY) || getSelectedText() || !hooks.pan) return;
     const pixels = e.deltaY * (e.deltaMode === 1 ? (viewer.cellH || 16)
       : e.deltaMode === 2 ? viewer.wrap.clientHeight : 1);
-    if (!prefs.overview && !atHistoryEdge(-pixels)) return;
+    if (!atHistoryEdge(-pixels)) return;
     e.preventDefault();
     // 휠 위(deltaY<0) = 과거로(양수 delta).
     pan(-pixels / (viewer.cellH || 16));
@@ -1132,10 +1136,9 @@ export function createViewer(options = {}) {
       pendingPositionAnchor = localPositions.get(positionKey(viewer.watching))?.anchor || capturePositionAnchor();
     }
     const measured = measureCells();
-    const scale = prefs.overview ? Math.min(1,
-      availableWidth / (screen.cols * measured.cellWidth),
-      availableHeight / (screen.rows * measured.cellHeight),
-    ) : 1;
+    // Fit the native columns to the available width. History length must
+    // never shrink glyphs; long output remains vertically scrollable.
+    const scale = prefs.overview ? availableWidth / (screen.cols * measured.cellWidth) : 1;
     const cellW = measured.cellWidth * scale;
     const cellH = measured.cellHeight * scale;
     const fontSize = prefs.fontSize * scale;
@@ -1158,13 +1161,13 @@ export function createViewer(options = {}) {
     canvas.style.width = cssWidth + 'px';
     canvas.style.height = cssHeight + 'px';
     renderTextLayer(screen, cssWidth, cssHeight, cellW, cellH, fontSize);
-    if (restoreLocalPosition && !prefs.overview) {
+    if (restoreLocalPosition) {
       // New dimensions must be installed before the browser can restore an overflow position.
       const position = localPositions.get(positionKey(viewer.watching)) || { left: 0, top: 0 };
       if (!restorePositionAnchor(position.anchor)) setLocalPosition(position.left, position.top);
       restoreLocalPosition = false;
     }
-    if (pendingPositionAnchor && !prefs.overview) {
+    if (pendingPositionAnchor) {
       restorePositionAnchor(pendingPositionAnchor);
       pendingPositionAnchor = null;
       rememberLocalPosition();
@@ -1496,7 +1499,7 @@ export function createViewer(options = {}) {
   }
 
   function followLiveOutput(screen, cellW, cellH) {
-    if (!viewer.followingLive || retainedDisplay || prefs.overview || screen.offset > 0 || getSelectedText()) return;
+    if (!viewer.followingLive || retainedDisplay || screen.offset > 0 || getSelectedText()) return;
     if (prefs.readableWrap) {
       const last = textRows.findLast(row => row.textContent.trim());
       if (last) setLocalPosition(0, Math.max(0, last.offsetTop + last.offsetHeight - viewer.wrap.clientHeight));

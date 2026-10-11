@@ -24,6 +24,7 @@
   --m-blue: #77a8ff;
   --m-terminal: #030303;
   --m-terminal-line: #181818;
+  --m-terminal-header-height: 45px;
   --m-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
     "D2Coding", monospace;
   --m-sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo",
@@ -902,3 +903,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 /* Fixed-size Relay cells keep their native width available for horizontal pan. */
 .m-term-grid { max-width: none; }
 .m-term-grid.fit, .m-term-grid.wrap { max-width: 100%; }
+
+/* The document stays in the phone bounds; terminal viewports own all panning. */
+html, body { width: 100%; max-width: 100%; overflow-x: hidden; overscroll-behavior-x: none; }
+@supports (overflow: clip) { html, body { overflow-x: clip; } }
+.m-screen, .m-term-shell, .session-host { min-width: 0; }

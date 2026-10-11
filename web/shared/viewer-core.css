@@ -54,7 +54,7 @@ body.viewer-open { overflow: hidden; overscroll-behavior: none; }
 }
 .viewer-wrap canvas { display: block; flex: none; touch-action: pan-x pan-y pinch-zoom; }
 .viewer-wrap.overview {
-  display: flex; align-items: center; justify-content: center; overflow: hidden;
+  display: block; overflow-x: hidden; overflow-y: auto;
 }
 .viewer-text-layer {
   position: absolute; left: 0; top: 0; z-index: 1;
@@ -66,7 +66,7 @@ body.viewer-open { overflow: hidden; overscroll-behavior: none; }
 .viewer-text-cell { display: inline-block; vertical-align: top; }
 .viewer-wrap:not(.readable) .viewer-text-cell { color: transparent !important; background: transparent !important; }
 .viewer-text-cell::selection { color: #ffffff; background: rgba(60, 120, 210, 0.7); }
-.viewer-wrap.overview .viewer-text-layer { left: 50%; top: 50%; transform: translate(-50%, -50%); }
+.viewer-wrap.overview .viewer-text-layer { left: 0; top: 0; transform: none; }
 .viewer-wrap.readable canvas { display: none; }
 .viewer-wrap.readable .viewer-text-layer { position: relative; }
 .viewer-wrap.readable .viewer-text-row {

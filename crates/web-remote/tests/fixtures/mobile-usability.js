@@ -127,8 +127,6 @@ function usabilitySwitchSession() {
 
 async function runMobileReadingChecks() {
   const wrapToggle = usabilityById('viewer-readable-wrap');
-  const search = usabilityById('viewer-search-text');
-  const count = usabilityById('viewer-search-count');
   const copy = usabilityById('viewer-copy-selection');
   const note = usabilityById('viewer-reading-status');
   const wrap = document.querySelector('.viewer-wrap');
@@ -151,7 +149,6 @@ async function runMobileReadingChecks() {
     document.dispatchEvent(new Event('selectionchange'));
     return selection.toString();
   };
-  const find = (value) => { search.value = value; search.dispatchEvent(new Event('input', { bubbles: true })); };
   const pan = (rows) => {
     wrap.scrollTop = rows > 0 ? 0 : wrap.scrollHeight;
     wrap.dispatchEvent(new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaY: -rows, deltaMode: 1 }));
@@ -169,28 +166,20 @@ async function runMobileReadingChecks() {
   const selected = select(); copy.click(); await sleep(20);
   usabilityCheck(selected === '한글🙂' && copied[0] === selected && usabilityById('viewer-copy-status').textContent.includes('복사했습니다'),
     'explicit copy uses exactly the selected Unicode terminal text');
-  find('alpha'); usabilityCheck(count.textContent === '1 / 3', 'literal case-insensitive search counts loaded rows');
-  usabilityById('viewer-search-next').click(); usabilityCheck(count.textContent === '2 / 3', 'search next advances one loaded match');
-  usabilityById('viewer-search-prev').click(); usabilityCheck(count.textContent === '1 / 3', 'search previous returns to loaded match');
-  usabilityCheck(window.getSelection().toString() === selected && usabilityById('viewer-search-scope').textContent.includes('불러온 범위'),
-    'search preserves copy selection and visibly limits its scope');
-  find('<b>'); usabilityCheck(count.textContent === '1 / 1' && !layer.querySelector('b'), 'HTML-like search remains literal text');
-  find('not present'); usabilityCheck(count.textContent.includes('없습니다'), 'no-match search is honest');
-  search.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, cancelable: true, key: 'Escape', isComposing: true, keyCode: 229 }));
-  usabilityCheck(search.value === 'not present', 'search IME Escape does not discard the composing query');
-  usabilityById('viewer-search-clear').click(); usabilityCheck(search.value === '' && count.textContent === '', 'clear resets query and count');
+  usabilityCheck(!usabilityById('viewer-search-text') && !document.querySelector('.viewer-search-controls'), 'loaded-screen search is removed from the menu');
+  usabilityCheck(!layer.querySelector('b'), 'terminal HTML-like text remains literal');
   clipboardOutcome = 'fail'; copy.click(); await sleep(20);
   usabilityCheck(usabilityById('viewer-copy-status').textContent.includes('권한'), 'clipboard rejection offers native-copy recovery');
   window.getSelection().removeAllRanges(); copy.click(); await sleep(20);
   usabilityCheck(copied.length === 2, 'empty selection never writes to clipboard');
-  select(); usabilityById('viewer-privacy-curtain').hidden = false; copy.click(); find('alpha');
-  usabilityCheck(copied.length === 2 && count.textContent === '', 'privacy protects explicit copy and search');
+  select(); usabilityById('viewer-privacy-curtain').hidden = false; copy.click();
+  usabilityCheck(copied.length === 2, 'privacy protects explicit copy');
   usabilityById('viewer-privacy-curtain').hidden = true;
   wrapToggle.click(); await usabilitySettle();
   usabilityCheck(wrapToggle.getAttribute('aria-pressed') === 'true' && getComputedStyle(usabilityById('viewer-canvas')).display === 'none', 'readable wrap is explicit');
   usabilityById('viewer-overview').click(); await usabilitySettle();
   usabilityCheck(wrapToggle.getAttribute('aria-pressed') === 'false' && usabilityById('viewer-overview').getAttribute('aria-pressed') === 'true', 'overview and readable wrap are exclusive');
-  usabilityById('viewer-overview').click();
+  usabilityById('viewer-overview').click(); await usabilitySettle();
   mobileHistoryAutoReply = false;
   usabilityById('viewer-bottom').click();
   let sent = take();
@@ -202,7 +191,7 @@ async function runMobileReadingChecks() {
   frame(reset.request); await usabilitySettle();
   usabilityCheck(!usabilityById('viewer-bottom').disabled, 'matching current reply completes reset and clears pending UI');
   pan(5); await sleep(); sent = take();
-  usabilityCheck(sent.length === 1 && sent[0].delta === 5 && sent[0].anchor?.first_line === '10000' && sent[0].anchor.generation === '1', 'relative history captures displayed anchor');
+  usabilityCheck(sent.length === 1 && sent[0].delta === 5 && sent[0].anchor?.first_line === '10000' && sent[0].anchor.generation === '1', 'relative history captures displayed anchor: ' + JSON.stringify(sent) + ' selection=' + window.getSelection().toString() + ' scroll=' + wrap.scrollTop);
   const firstPan = sent[0]; pan(3); await sleep(); sent = take();
   usabilityCheck(sent.length === 1 && sent[0].delta === 8 && sent[0].request > firstPan.request && sent[0].anchor.first_line === '10000', 'in-flight history wave accumulates movement from one displayed base');
   const lastPan = sent[0]; frame(firstPan.request, '9995', 'OLD'); frame(undefined, '10000', 'PASSIVE'); await usabilitySettle();
@@ -214,12 +203,12 @@ async function runMobileReadingChecks() {
   usabilityCheck(sent.length === 1 && sent[0].delta === 3 && sent[0].anchor.first_line === '9990', 'matching ACK before coalesced flush preserves unsent increment from newly displayed base');
   frame(sent[0].request, '9987', 'CONTINUED'); await usabilitySettle();
   usabilityById('viewer-bottom').click(); const canceledReset = take()[0];
-  find('CONTINUED');
-  usabilityCheck(!usabilityById('viewer-bottom').disabled, 'new search cancels pending reset and restores current action');
+  select(); window.getSelection().removeAllRanges();
+  usabilityCheck(!usabilityById('viewer-bottom').disabled, 'new text selection cancels pending reset and restores current action');
   pan(4); await sleep(); sent = take();
   usabilityCheck(sent.length === 1 && sent[0].anchor.first_line === '9987' && sent[0].delta === 4, 'relative pan after canceled server reset starts from retained displayed source');
   frame(canceledReset.request); frame(sent[0].request, '9983', 'AFTER CANCEL'); await usabilitySettle();
-  usabilityCheck(layer.textContent.includes('AFTER CANCEL') && search.value === '', 'matching source replacement clears old search without canceled reset jump');
+  usabilityCheck(layer.textContent.includes('AFTER CANCEL'), 'matching source replacement preserves canceled reset position');
   usabilityById('viewer-bottom').click(); const failed = take()[0];
   mobileUsabilitySocket.message({ type: 'history_error', session: 's-1', request: failed.request - 1, reason: 'unavailable' });
   usabilityCheck(usabilityById('viewer-bottom').disabled, 'unrelated query error cannot cancel current reset');
@@ -243,22 +232,22 @@ async function runMobileReadingChecks() {
     const input = usabilityById('composer-text'); input.value = text;
     input.dispatchEvent(new Event('input', { bubbles: true }));
   };
-  select(); find('alpha');
+  select();
   const composingInput = usabilityById('composer-text');
   composingInput.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true })); editDraft('ㅎ');
   composingInput.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, cancelable: true, key: 'Enter', isComposing: true }));
-  usabilityCheck(take().length === 0 && search.value === 'alpha', 'buffered unconfirmed IME preserves reading without reset');
+  usabilityCheck(take().length === 0 && !usabilityById('viewer-scroll-note').hidden, 'buffered unconfirmed IME preserves reading without reset');
   editDraft('한'); composingInput.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: '한' })); await sleep(20);
   const compositionScrolls = take();
-  usabilityCheck(compositionScrolls.every(f => !f.reset && f.delta === 0 && f.anchor?.first_line === '10000') && search.value === 'alpha', 'confirmed text stays in the unified draft: ' + JSON.stringify(compositionScrolls) + ' search=' + search.value);
+  usabilityCheck(compositionScrolls.every(f => !f.reset && f.delta === 0 && f.anchor?.first_line === '10000') && !usabilityById('viewer-scroll-note').hidden, 'confirmed text stays in the unified draft: ' + JSON.stringify(compositionScrolls));
   composingInput.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, cancelable: true, key: 'Enter' }));
   sent = take(); inputReset = sent[0];
-  usabilityCheck(sent.length === 1 && inputReset.reset && search.value === '', 'explicit buffered Enter resumes current exactly once');
+  usabilityCheck(sent.length === 1 && inputReset.reset, 'explicit buffered Enter resumes current exactly once');
   frame(inputReset.request); await usabilitySettle();
-  select(); find('alpha'); const loadedBeforeFailure = layer.textContent; mobileInputSendFailure = true;
+  select(); const loadedBeforeFailure = layer.textContent; mobileInputSendFailure = true;
   editDraft('초안'); usabilityById('composer-send').click();
   const composer = usabilityById('composer-text');
-  usabilityCheck(composer.value === '초안' && take().length === 0 && search.value === 'alpha' && layer.textContent === loadedBeforeFailure,
+  usabilityCheck(composer.value === '초안' && take().length === 0 && !usabilityById('viewer-scroll-note').hidden && layer.textContent === loadedBeforeFailure,
     'failed buffered transport preserves draft and reading');
   mobileInputSendFailure = false;
   const originalFetch = window.fetch;
@@ -269,10 +258,10 @@ async function runMobileReadingChecks() {
     usabilityById('composer-file').files = files.files;
     usabilityById('composer-file').dispatchEvent(new Event('change', { bubbles: true })); await sleep(20);
   } finally { window.fetch = originalFetch; }
-  usabilityCheck(composer.value.includes('/tmp/mobile-attachment.txt') && search.value === 'alpha' && take().length === 0,
+  usabilityCheck(composer.value.includes('/tmp/mobile-attachment.txt') && !usabilityById('viewer-scroll-note').hidden && take().length === 0,
     'upload path insertion edits the independent draft without resuming reading');
   usabilityById('composer-send').click(); sent = take();
-  usabilityCheck(sent.length === 1 && sent[0].reset && search.value === '', 'successful committed composer resumes current once');
+  usabilityCheck(sent.length === 1 && sent[0].reset, 'successful committed composer resumes current once');
   frame(sent[0].request); await usabilitySettle();
   wrapToggle.click(); await usabilitySettle(); wrapToggle.click();
   usabilityCheck(!usabilityById('viewer-scroll-note').hidden && !usabilityById('viewer-bottom').disabled, 'leaving readable mode stays pinned until explicit current recovery');
@@ -323,9 +312,8 @@ async function runMobileResizeChecks() {
   const expectedGrid = () => {
     const stage = usabilityById('viewer-stage');
     const font = Number(usabilityById('viewer-font-size').textContent.replace('px', ''));
-    const canvas = usabilityById('viewer-canvas');
     const measure = document.createElement('canvas').getContext('2d');
-    measure.font = canvas.getContext('2d').font;
+    measure.font = font + 'px ui-monospace, Menlo, monospace';
     const width = measure.measureText('M'.repeat(32)).width / 32;
     const cols = Math.max(32, Math.min(400, Math.floor(stage.clientWidth / width)));
     return { cols, rows: Math.max(2, Math.min(200, Math.floor(65536 / cols), Math.floor(stage.clientHeight / Math.ceil(font * 1.4)))) };
@@ -427,13 +415,11 @@ async function runMobileResizeChecks() {
   mobileUsabilitySocket.message({ type: 'viewport', session: 's-1', keyframe: true,
     cols: 32, rows: 2, lines: [], cursor: null, offset: 0 });
   await usabilitySettle();
-  const fittingFont = usabilityFont();
   usabilityById('viewer-overview').click(); await usabilitySettle();
-  usabilityCheck(Math.abs(usabilityFont() - fittingFont) < 0.01, 'overview regression has scale one and unchanged stage metrics');
+  usabilityCheck(Math.abs(usabilityById('viewer-canvas').getBoundingClientRect().width - document.querySelector('.viewer-wrap').clientWidth) < 1, 'width fit uses the full available terminal width');
   acquire = action('acquire'); response(acquire, true); await sleep();
-  usabilityCheck(take().length === 0, 'grant during fitting overview still suspends resize');
-  usabilityById('viewer-overview').click(); await sleep();
-  await expectResize(acquire, 'leaving fitting overview explicitly schedules the first granted size');
+  usabilityCheck(usabilityById('viewer-overview').getAttribute('aria-pressed') === 'false', 'phone-fit grant exits the local fit mode');
+  await expectResize(acquire, 'phone-fit grant explicitly schedules the first granted size');
   viewport(550, 700); await sleep(70); usabilityById('viewer-overview').click(); await sleep();
   usabilityCheck(take().length === 0, 'entering fitting overview cancels prior pending geometry');
   usabilityById('viewer-overview').click(); await sleep(); await expectResize(acquire, 'leaving fitting overview reevaluates pending geometry');
@@ -474,7 +460,7 @@ async function runMobileResizeChecks() {
   usabilityCheck(usabilityById('viewer-stage').clientHeight > 0 && document.querySelector('.viewer-wrap').clientHeight === 0,
     'keyboard recovery changes physical geometry while scrollbar-constrained inner geometry stays zero');
   const tiny = await expectResize(acquire, 'tiny keyboard viewport recovery');
-  usabilityCheck(tiny.cols === 32 && tiny.rows === 2, 'positive tiny stage uses the protocol minimum geometry');
+  usabilityCheck(tiny.cols >= 32 && tiny.rows === 2, 'positive tiny stage preserves the protocol minima and fits its configured font');
 
   mobileUsabilitySocket.message({ type: 'input_pressure', session: 's-1', reason: 'queue_full', queued: 1 });
   viewport(430, 844);
@@ -637,8 +623,8 @@ async function runMobileUsability() {
   const fontLabel = usabilityById('viewer-font-size');
   const overview = usabilityById('viewer-overview');
   usabilityCheck(smaller && larger && fontLabel && overview, 'readability controls must exist');
-  usabilityCheck(usabilityById('viewer-readable-wrap') && usabilityById('viewer-search-text')
-    && usabilityById('viewer-copy-selection'), 'reading, loaded-window search and explicit selected-copy controls must exist');
+  usabilityCheck(usabilityById('viewer-readable-wrap') && !usabilityById('viewer-search-text')
+    && usabilityById('viewer-copy-selection'), 'reading and copy remain while loaded-window search is removed');
   const restored = sessionStorage.getItem('mobile-usability-restore') === 'yes';
   usabilityCheck(fontLabel.textContent === (restored ? '17px' : '15px'), 'configured font default/restoration');
   usabilityCheck(overview.getAttribute('aria-pressed') === String(restored), 'explicit overview default/restoration');

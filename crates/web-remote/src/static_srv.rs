@@ -575,9 +575,7 @@ mod tests {
             "viewer.el.style.setProperty('--viewer-controls-max-height'",
             "viewer.el.style.setProperty('--viewer-composer-max-height'",
             "measuringContext.measureText('M'.repeat(32)).width / 32",
-            "const scale = prefs.overview ? Math.min(1,",
-            "availableHeight / (screen.rows * measured.cellHeight)",
-            ") : 1;",
+            "const scale = prefs.overview ? availableWidth / (screen.cols * measured.cellWidth) : 1;",
             "const MAX_CANVAS_PIXELS = 8 * 1024 * 1024",
             "viewerScreenRevision += 1",
             "if (renderKey === lastViewerRenderKey) return;",
@@ -594,6 +592,10 @@ mod tests {
         assert!(
             !js.contains("drawScreen()"),
             "legacy direct drawScreen call이 남아 있음"
+        );
+        assert!(
+            !js.contains("availableHeight / (screen.rows * measured.cellHeight)"),
+            "맞춤 보기는 가로 열 너비로만 축소한다 — 긴 이력이 글자를 줄이면 안 됨"
         );
         assert!(
             !js.contains("if (hasViewerResizeObserver) return;"),

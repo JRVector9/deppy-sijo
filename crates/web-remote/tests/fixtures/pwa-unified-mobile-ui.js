@@ -34,14 +34,14 @@
     emit(type, value = {}) { for (const fn of this.listeners.get(type) || []) fn(value); }
     message(frame) { this.emit('message', { data: JSON.stringify(frame) }); }
     dashboard() { this.message({ type: 'dashboard', workspaces: unifiedMobileWorkspaces }); }
-    viewport(session, request, requestedRows = 4, reset = true, anchor, delta = 0) {
+    viewport(session, request, requestedRows = 4, reset = true, anchor, delta = 0, cols = 80, nativeRows = 4) {
       const rows = Math.max(1, Math.min(256, requestedRows));
       const first = reset ? 10020n - BigInt(rows) : BigInt(anchor?.first_line || 10016) - BigInt(delta);
       const tail = first + BigInt(rows);
-      this.message({ type: 'viewport', session, seq: request || 1, keyframe: true, cols: 80, rows,
+      this.message({ type: 'viewport', session, seq: request || 1, keyframe: true, cols, rows,
         offset: Number(10020n - tail), alt: false, cursor: { row: rows - 1, col: 2, visible: true },
         lines: Array.from({ length: rows }, (_, row) => ({ row, runs: [{ s: 0, t: `${first + BigInt(row)} 한글 terminal line` }] })),
-        history: { generation: '1', first_line: String(first), live_first_line: '10016', native_rows: 4,
+        history: { generation: '1', first_line: String(first), live_first_line: String(10020n - BigInt(nativeRows)), native_rows: nativeRows,
           total_lines: 5000, request, expired: false } });
     }
     send(raw) {
@@ -50,6 +50,9 @@
       unifiedMobileSent.push(frame); this.sent.push(frame);
       if (frame.type === 'auth') setTimeout(() => { this.message({ type: 'welcome', v: frame.v }); this.dashboard(); }, 5);
       if (frame.type === 'watch') setTimeout(() => this.viewport(frame.session), 5);
+      if (frame.type === 'resize_control') setTimeout(() => this.message({ type: 'terminal_control', session: frame.session,
+        request: frame.request, owned: frame.action === 'acquire', reason: frame.action === 'acquire' ? 'owned' : 'released' }), 5);
+      if (frame.type === 'resize') setTimeout(() => this.viewport(frame.session, undefined, frame.rows, true, undefined, 0, frame.cols, frame.rows), 5);
       if (frame.type === 'scroll' && unifiedMobileHoldHistory) { unifiedMobileHeldHistory.push(frame); return; }
       if (frame.type === 'scroll') setTimeout(() => {
         if (unifiedMobileHistoryFailures > 0) {
@@ -119,6 +122,10 @@
     check(unifiedMobileSent.at(-1).type === 'switch' && unifiedMobileSent.at(-1).workspace === 'ws-warm', 'dormant row requests exact workspace only');
     check(!unifiedMobileSent.some(frame => frame.type === 'watch'), 'dormant saved title never chooses guessed session');
     search.value = ''; search.dispatchEvent(new Event('input'));
+    unifiedMobileWorkspaces[0].name = '긴워크스페이스이름'.repeat(40);
+    unifiedMobileSocket.dashboard();
+    window.scrollTo(1000, 0);
+    check(window.scrollX === 0 && document.documentElement.scrollWidth <= window.innerWidth, 'long workspace content cannot pan the document horizontally');
     const row = document.querySelector('#sessions [data-session-id="session-a"]');
     check(row.getBoundingClientRect().height >= 76, 'session touch row at least76px');
     check(getComputedStyle(row.querySelector('.title')).fontSize === '14px', 'session title14px');
@@ -131,6 +138,7 @@
     unifiedMobileSocket.dashboard(); await sleep(20);
     check(!unifiedMobileSent.some(frame => frame.type === 'watch' && frame.session === 'stable-warm'), 'manual session navigation cancels pending dormant handoff');
     Object.assign(warm, savedWarm); unifiedMobileSocket.dashboard();
+    check(!$('viewer-search-text') && !document.querySelector('.viewer-search-controls'), 'loaded-screen search has no menu DOM');
     check(document.querySelectorAll('#viewer textarea').length === 1, 'single visible buffered input DOM');
     check(!$('viewer-mode-direct') && !$('direct-text'), 'mode split removed');
     check(getComputedStyle($('composer-text')).fontSize === '16px', 'input16px');
@@ -270,9 +278,32 @@
       check(bounds.width === width && bounds.height === height, `${width}x${height} viewport shell fills available bounds`);
       check($('viewer-session-chip').getBoundingClientRect().width <= width * .42 + 1 && $('viewer-menu-button').getBoundingClientRect().width === 44, `${width}x${height} header picker and settings retain approved widths`);
       check($('composer-text').getBoundingClientRect().bottom <= bounds.bottom + 1, `${width}x${height} input stays inside shell`);
+      const head = document.querySelector('.viewer-header');
+      check(head.getBoundingClientRect().height <= 45.1, `${width}x${height} compact terminal header`);
+      const titleRect = $('viewer-title').getBoundingClientRect(), statusRect = $('viewer-connection').getBoundingClientRect();
+      check(Math.abs((titleRect.top + titleRect.bottom) / 2 - (statusRect.top + statusRect.bottom) / 2) < 1, `${width}x${height} workspace and connection share one line`);
       check($('viewer-stage').getBoundingClientRect().height > 0, `${width}x${height} terminal keeps positive height`);
     }
     unifiedMobileViewport.width = 390; unifiedMobileViewport.height = 844; unifiedMobileViewport.dispatchEvent(new Event('resize')); await sleep(350);
+    await selectSession('session-a');
+    unifiedMobileSocket.viewport('session-a', undefined, 200); await sleep(80);
+    $('viewer-overview').click(); await sleep(80);
+    const fitCanvas = $('viewer-canvas'), fitWrap = document.querySelector('.viewer-wrap');
+    check(Math.abs(fitCanvas.getBoundingClientRect().width - fitWrap.clientWidth) < 1, 'long history fits the full phone width');
+    check(fitCanvas.getBoundingClientRect().height > fitWrap.clientHeight && fitWrap.scrollHeight > fitWrap.clientHeight, 'long history scrolls vertically without shrinking to its height');
+    unifiedMobileViewport.width = 320; unifiedMobileViewport.height = 568; unifiedMobileViewport.dispatchEvent(new Event('resize')); await sleep(350);
+    while (!$('viewer-font-larger').disabled) $('viewer-font-larger').click(); await sleep(100);
+    const beforePhoneFit = unifiedMobileSent.length;
+    $('viewer-resize-control').click();
+    await waitFor(() => unifiedMobileSent.slice(beforePhoneFit).some(frame => frame.type === 'resize'), 'phone-fit granted geometry');
+    await sleep(350);
+    const phoneResize = unifiedMobileSent.slice(beforePhoneFit).find(frame => frame.type === 'resize');
+    const phoneWrap = document.querySelector('.viewer-wrap');
+    const phoneWidth = $('viewer-canvas').getBoundingClientRect().width;
+    check(phoneResize.cols >= 32 && phoneResize.session === 'session-a', 'phone-fit retains the exact native session and minimum columns');
+    check($('viewer-overview').getAttribute('aria-pressed') === 'false' && $('viewer-readable-wrap').getAttribute('aria-pressed') === 'false', 'phone fit exits stale presentation modes');
+    check(phoneWidth <= phoneWrap.clientWidth + 1 && phoneWidth >= phoneWrap.clientWidth - phoneWidth / phoneResize.cols - 1, 'owned phone geometry fills available width within one native cell');
+    $('viewer-resize-control').click(); await sleep(50);
     $('viewer-back').click(); await waitFor(() => $('viewer').hidden, 'close before dormant switch');
     document.querySelector('[data-workspace-id="ws-warm"]').click();
     const dormant = document.querySelector('#sessions [data-selection-id="stable-warm"]');

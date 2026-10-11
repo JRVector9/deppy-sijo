@@ -554,7 +554,7 @@ export function createShell({ endpoint, socketFactory, identityStore = {loadOrCr
     panel.append(font);
 
     panel.append(
-      toggleRow("menu-fit-width", "전체 화면 맞춤 (축소)", () => {
+      toggleRow("menu-fit-width", "가로 너비 맞춤", () => {
         state.prefs.fitWidth = !state.prefs.fitWidth;
         applyPrefs();
       }),

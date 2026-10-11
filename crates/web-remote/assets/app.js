@@ -90,8 +90,6 @@
   const viewerResizeStatus = document.getElementById('viewer-resize-status');
   const viewerReadableWrap = document.getElementById('viewer-readable-wrap');
   const viewerReadableState = document.getElementById('viewer-readable-state');
-  const viewerSearchText = document.getElementById('viewer-search-text');
-  const viewerSearchCount = document.getElementById('viewer-search-count');
   const viewerCopyStatus = document.getElementById('viewer-copy-status');
   const viewerReadingStatus = document.getElementById('viewer-reading-status');
 
@@ -454,7 +452,6 @@
       historyNavigate: navigateHistory,
       pan: queueScroll,
       resetPan: resetScroll,
-      searchChanged: syncViewerSearch,
       readingChanged: handleReadingChanged,
       resumeHistory: () => sendHistoryRequest('reset', 0),
       beforeOpen: () => {
@@ -674,7 +671,15 @@
       if (context.reason !== 'pending') context.acceptGrant = false;
     }
     syncResizeControl();
-    if (granted) scheduleMobileResize(); // Renew/error ACKs preserve geometry deduplication.
+    if (granted) {
+      // This explicit phone-fit grant selects the live, readable terminal size.
+      // Stale/denied grants must not change presentation or the reading position.
+      viewer.setOverview(false);
+      viewer.setReadableWrap(false);
+      viewer.resumeFollow();
+      syncViewerReadabilityControls();
+      refreshMobileResizeLayout();
+    } // Renew/error ACKs preserve geometry deduplication.
   }
 
   function scheduleMobileResize() {
@@ -692,6 +697,13 @@
     if (!metrics || metrics.stageWidth <= 0 || metrics.stageHeight <= 0
         || metrics.cellWidth <= 0 || metrics.cellHeight <= 0
         || Math.abs(metrics.fontSize - configuredFont) > 0.01) return;
+    // At least 32 native columns are required. A large font must not make
+    // that minimum wider than the phone; wait for the new measured font frame.
+    if (metrics.stageWidth < 32 * metrics.cellWidth && configuredFont > 12) {
+      viewer.setFontSize(Math.max(12, Math.floor(configuredFont * metrics.stageWidth / (32 * metrics.cellWidth))));
+      syncViewerReadabilityControls();
+      return;
+    }
     const cols = Math.max(32, Math.min(400, Math.floor(metrics.stageWidth / metrics.cellWidth)));
     const rows = Math.max(2, Math.min(200, Math.floor(65536 / cols), Math.floor(metrics.stageHeight / metrics.cellHeight)));
     const geometry = cols + 'x' + rows;
@@ -747,26 +759,6 @@
     syncViewerReadabilityControls();
     refreshMobileResizeLayout();
   });
-  function syncViewerSearch(result) {
-    viewerSearchText.value = result.query;
-    viewerSearchCount.textContent = result.query ? (result.total ? `${result.index} / ${result.total}` : '일치하는 텍스트가 없습니다.') : '';
-  }
-  const findLoadedText = (direction = 1) => syncViewerSearch(viewer.findText(viewerSearchText.value, direction));
-  viewerSearchText.addEventListener('input', () => findLoadedText());
-  viewerSearchText.addEventListener('keydown', (event) => {
-    if (event.isComposing || event.keyCode === 229) return;
-    if (event.key === 'Enter') {
-      event.preventDefault();
-      findLoadedText(event.shiftKey ? -1 : 1);
-    } else if (event.key === 'Escape') {
-      event.preventDefault();
-      event.stopPropagation();
-      viewer.clearSearch();
-    }
-  });
-  document.getElementById('viewer-search-prev').addEventListener('click', () => findLoadedText(-1));
-  document.getElementById('viewer-search-next').addEventListener('click', () => findLoadedText(1));
-  document.getElementById('viewer-search-clear').addEventListener('click', () => viewer.clearSearch());
   const copySelection = document.getElementById('viewer-copy-selection');
   let copyRequest = 0;
   copySelection.addEventListener('pointerdown', (event) => event.preventDefault());

@@ -1,3 +1,18 @@
+# 프로젝트 키 관리 수정 보고·HTML 제안 완료 — 2026-10-12 (Codex)
+
+- 현재 목표/범위: 사용자 환경/API 기능 의도(프로젝트 API/GitHub 키를 쉽게 저장, 원본 교체 후 자동 갱신, 빌드 시 최신 사용)를 재검토하고 수정 사항·UI 개선안 제시. 추가 요청: 기존 키 수정과 키 값 더블클릭 복사. 제품 구현/실키 변경/재시작/커밋·푸시 요청은 이번 작업에 없음.
+- 기준: canonical performance HEAD29c16836, Cargo0.10.3. 실제 실행은 PID21173의 restart-0.10.1-20261011 번들. source와 running version을 구분. 시작 시 tracked/untracked clean.
+- 완료: read-only DB 메타데이터에서 nomorevibe dotenv 프로필1/환경변수14/secret참조8/수동API binding0 확인(값·masked_hint·keyring pointer·oauth_json 조회 안 함). dotenv 키가 API 목록에서 제외되고 환경 행에는 수정/복사 intent가 없는 흐름을 확인. 수동 API의 제한된 행 더블클릭 편집 backend는 존재. 자동 dotenv 보관·회전·watcher도 존재하므로 기능 부재로 과장하지 않음.
+- 결정: 원본/환경/사용처가 보이는 통합 목록, 명시적 수정, 값 영역 더블클릭 복사, 독립 변경 감시와 last-good 보존, 연결된 빌드 snapshot/사용 기록. GitHub 인증/PAT·App client secret·PEM·Actions destination 역할 구분. GitHub 원격 Secret값/개인키 재조회 불가(공식 문서 확인) → 로컬원본 보관/명시적 outbound/외부 변경 필요 상태. PEM 파일 원본은 현재 single-line dotenv 쓰기 경로와 별도 계약 필요.
+- 수정 파일(문서만): docs/mockups/project-keys-proposal-2026-10-12.html, docs/investigations/2026-10-12-project-key-management-review.md, docs/CODEX_HANDOFF.md. 기존 릴리스·다른 작업 핸드오프 보존.
+- 검증 실행: node --check /private/tmp/deppy-project-keys-proposal-script.js exit0(재실행 포함); Python HTMLParser IDs/local links/no persistence-network-clipboard writes PASS; git diff --check exit0. native Chrome CUA에서 합성 키 수정/더블클릭 복사/원본 갱신/충돌 보류·해결/전송 실패·재시도/빌드 사용버전 표시 확인. 실제 Keychain/.env/GitHub/clipboard 변경 없음. Cargo tests/build 실행 안 함.
+- 실패/한계: browser provider iab/chrome unavailable → native Chrome 새 탭으로 시안 표시. 초기 앱 getApp bundle ID ambiguous → ps로 running path 확인 후 선택. 일부 native 자동화는 user-changed/AX 대상 변화로 미확인; 최신 AX 개별 재실행한 결과만 PASS 기재. 시안의 충돌 해결 버튼이 일반 status로 없어지던 문제 수정·재확인. 정확한 viewport390/800/1440 자동계측 미실행. 실제 제품 UI에서 키 수정/복사 실험 안 함. 사용자 Chrome 조작과 경쟁하지 않도록 추가 조작 중단.
+- 남은 일: 제안 승인/추가 구현 요청 시 PR1 통합 목록·수정·복사 → PR2 원본 모델/PEM/독립 감시 → PR3 빌드 → PR4 GitHub → PR5 harness. PR3/4 병렬은 PR2 계약 확정 후. 앱 재실행은 이후 task의 명시 요청만. 제품 전달 전 version bump/번들 확인.
+- HTML 표시: http://127.0.0.1:8878/mockups/project-keys-proposal-2026-10-12.html. docs-only localhost server exec session64366, python3 -m http.server 8878 --bind 127.0.0.1 --directory docs. 실제 앱 종료하지 않음.
+- 다음 에이전트 정확한 명령: cd /Users/jr/Desktop/projects/deppy-sijo-performance; git status --short; git diff -- docs/CODEX_HANDOFF.md; cat AGENTS.md; cat docs/investigations/2026-10-12-project-key-management-review.md; node --check /private/tmp/deppy-project-keys-proposal-script.js. HTML 수정 후 inline script를 다시 추출해야 node check가 최신 문서 검사다. 서브에이전트/CLI 리뷰를 요청받으면 gpt-6.1-sol/xhigh 규칙 유지.
+
+---
+
 # 0.10.3 릴리스 빌드·검증 — 2026-10-11 (Claude Code)
 
 - 사용자 「0.10.3으로 버전 올려서 빌드해」. 0.10.2 → 0.10.3(patch). `Cargo.toml` 버전과 `Cargo.lock` 워크스페이스 크레이트 27개 버전 줄만 바뀜.

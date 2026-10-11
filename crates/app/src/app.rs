@@ -20345,7 +20345,13 @@ impl App {
             .current
             .diff_viewer_ui
             .render(&mut detail, text, search);
-        action
+        // diff 헤더 경로 버튼(PR 5) intent — render 호출 모양은 소스 고정이라 반환값을
+        // 늘리지 않고 render 직후 accessor로 꺼낸다. 매 프레임 꺼내야 다음 프레임에 안 남는다.
+        self.session_aux
+            .current
+            .diff_viewer_ui
+            .take_action()
+            .or(action)
     }
 
     /// 보조 본문(이력·Git)이 보이려면 중앙이 Terminal 뷰여야 한다 — 홈/작업 페이지
@@ -35701,10 +35707,11 @@ impl eframe::App for App {
                 self.open_git_panel_remote(ui.ctx());
             }
             Some(ui::git_panel::GitPanelAction::ShowFileDiff { rel_path, mode }) => {
-                self.session_aux
-                    .current
-                    .diff_viewer_ui
-                    .open(rel_path.clone(), mode);
+                let view = &mut self.session_aux.current;
+                view.diff_viewer_ui.open(rel_path.clone(), mode);
+                // 헤더 경로 버튼(PR 5)의 대상 — 스냅샷 repo_root를 아는 git 패널에서 받는다.
+                view.diff_viewer_ui
+                    .set_path_target(view.git_panel_ui.path_target(&rel_path, mode));
                 // 지금 패널이 보여주는 repo(`git_panel_cwd`)의 파일이다 — 포커스 세션을
                 // 다시 묻지 않는다(항목 3, Refresh와 같은 규칙).
                 self.request_git_panel_io_at(
@@ -35735,6 +35742,39 @@ impl eframe::App for App {
                     self.session_aux.current.git_panel_cwd.clone(),
                     ui::git_panel::GitPanelIoRequest::CommitFiles { sha },
                 );
+            }
+            // 「세션에 경로 넣기」(2026-10-11 PR 5) — 파일 트리 「터미널에 경로 삽입」
+            // (`SidebarAction::InsertPath`)과 같은 단계다: 포커스된 pane의 세션에 같은
+            // 붙여넣기 바이트로 WriteInput을 올린다. 경로는 leaf가 검증한 절대 경로다.
+            Some(ui::git_panel::GitPanelAction::InsertPath { path }) => {
+                match self.active.workspace_ui.focused_session() {
+                    Some(session) => {
+                        let bracketed = self.active.workspace_ui.session_bracketed_paste(session);
+                        let shell_kind = self.active.workspace_ui.session_shell_kind(session);
+                        let bytes =
+                            ui::workspace::path_insert_paste_bytes(&path, shell_kind, bracketed);
+                        self.stage_workspace_controller_action(WorkspaceControllerAction::Runtime(
+                            runtime::RuntimeCommand::WriteInput { session, bytes },
+                        ));
+                        // Git 본문이 터미널을 가리고 있어 넣은 경로가 안 보인다 — 워크트리
+                        // 셸 열기처럼 세션 탭으로 물러나 바로 이어 쓰게 한다(탭은 남는다).
+                        self.session_aux.current.git_tab =
+                            self.session_aux.current.git_tab.on_session_tab_click();
+                    }
+                    None => tracing::info!("경로 삽입: 활성 터미널 세션 없음 — 무시"),
+                }
+            }
+            // 「Finder에서 보기」 — 세션 「Finder에서 폴더 열기」와 같은 자리
+            // (`AppHostIoAction::OpenPath`)다. 파일을 `open`하면 기본 앱이 열리므로 그
+            // 파일이 든 폴더를 연다.
+            Some(ui::git_panel::GitPanelAction::RevealInFinder { path }) => {
+                if self.pending_app_host_action.is_none()
+                    && let Some(folder) = path.parent()
+                {
+                    self.pending_app_host_action =
+                        Some(AppHostIoAction::OpenPath(folder.to_path_buf()));
+                    ui.ctx().request_repaint();
+                }
             }
             None => {}
         }
@@ -46788,6 +46828,107 @@ mod tests {
         assert!(
             !handler.contains("CreateWorktree") && !handler.contains("RemoveWorktree"),
             "이번 범위는 기존 워크트리로 들어가는 것뿐이다"
+        );
+    }
+
+    /// Git 경로 동작(2026-10-11 PR 5)은 새 삽입·열기 로직을 만들지 않는다 — 「세션에 경로
+    /// 넣기」는 파일 트리 「터미널에 경로 삽입」(`SidebarAction::InsertPath`)과 같은
+    /// 붙여넣기 바이트·WriteInput 단계를, 「Finder에서 보기」는 세션 「Finder에서 폴더
+    /// 열기」와 같은 `AppHostIoAction::OpenPath` 자리를 쓴다. 테스트에서 App 전체를 만들 수
+    /// 없어(DB·runtime·keyring 합성 루트) 위 Git 액션 배선 테스트들처럼 소스로 고정한다.
+    #[test]
+    fn git_경로_동작은_파일_트리_삽입과_finder_열기_경로를_그대로_쓴다() {
+        let source = include_str!("app.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let between = |start: &str, end: &str| -> String {
+            squeeze_ws(
+                production
+                    .split_once(start)
+                    .unwrap_or_else(|| panic!("시작 경계가 있어야 한다: {start}"))
+                    .1
+                    .split_once(end)
+                    .unwrap_or_else(|| panic!("끝 경계가 있어야 한다: {end}"))
+                    .0,
+            )
+        };
+
+        let tree_insert = between(
+            "Some(ui::file_tree::SidebarAction::InsertPath(path)) => {",
+            "Some(ui::file_tree::SidebarAction::CdPath(path))",
+        );
+        let git_insert = between(
+            "Some(ui::git_panel::GitPanelAction::InsertPath { path }) => {",
+            "Some(ui::git_panel::GitPanelAction::RevealInFinder { path }) => {",
+        );
+        for step in [
+            "self.active.workspace_ui.session_bracketed_paste(session)",
+            "self.active.workspace_ui.session_shell_kind(session)",
+            "ui::workspace::path_insert_paste_bytes(",
+            "runtime::RuntimeCommand::WriteInput { session, bytes }",
+            "self.stage_workspace_controller_action(",
+        ] {
+            assert!(
+                tree_insert.contains(step),
+                "기준인 파일 트리 InsertPath 단계가 바뀌었다: {step}"
+            );
+            assert!(
+                git_insert.contains(step),
+                "세션에 경로 넣기는 파일 트리와 같은 단계를 거쳐야 한다: {step}"
+            );
+        }
+        // Git 본문이 터미널을 가리므로 넣은 뒤 세션 탭으로 물러나야 결과가 보인다.
+        assert!(
+            git_insert.contains(
+                "self.session_aux.current.git_tab = \
+                 self.session_aux.current.git_tab.on_session_tab_click();"
+            ),
+            "세션에 경로 넣기 뒤에는 세션 탭으로 물러나야 한다"
+        );
+
+        let session_finder = between(
+            "Some(ui::workspace::SessionFolderRequest::OpenInFinder(session)) => {",
+            "None => {}",
+        );
+        let git_reveal = between(
+            "Some(ui::git_panel::GitPanelAction::RevealInFinder { path }) => {",
+            "\n            None => {}",
+        );
+        for step in [
+            "self.pending_app_host_action.is_none()",
+            "Some(AppHostIoAction::OpenPath(",
+            "ui.ctx().request_repaint()",
+        ] {
+            assert!(
+                session_finder.contains(step),
+                "기준인 세션 Finder 열기 단계가 바뀌었다: {step}"
+            );
+            assert!(
+                git_reveal.contains(step),
+                "Finder에서 보기는 세션 Finder 열기와 같은 자리를 써야 한다: {step}"
+            );
+        }
+        assert!(
+            git_reveal.contains("path.parent()"),
+            "파일을 OS로 열지 않고 그 파일이 든 폴더를 연다"
+        );
+
+        // diff 헤더 버튼: 파일을 열 때 대상을 넘기고, render 직후 intent를 꺼낸다.
+        let show_file_diff = between(
+            "Some(ui::git_panel::GitPanelAction::ShowFileDiff { rel_path, mode }) => {",
+            "Some(ui::git_panel::GitPanelAction::OpenWorktreeShell",
+        );
+        assert!(
+            show_file_diff
+                .contains("set_path_target(view.git_panel_ui.path_target(&rel_path, mode))"),
+            "diff 헤더 경로 버튼은 git 패널 스냅샷 기준 대상을 받아야 한다"
+        );
+        let after_diff_render = between(
+            ".diff_viewer_ui\n            .render(&mut detail, text, search);",
+            "fn reveal_terminal_view_for_aux_tab(",
+        );
+        assert!(
+            after_diff_render.contains(".diff_viewer_ui .take_action()"),
+            "diff 헤더 버튼 intent는 render 직후 accessor로 꺼내야 한다"
         );
     }
 

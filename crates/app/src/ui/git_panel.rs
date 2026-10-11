@@ -98,10 +98,10 @@ pub struct GitCommitFiles {
 #[derive(Clone, Debug, Default)]
 pub struct GitPanelSnapshot {
     // 스펙 §2 데이터 모델의 일부 — 수집 시점의 `git_cli::repo_root` 결과를 그대로
-    // 담아 둔다. 렌더는 상대 경로(rel_path)만 쓰고, 파일 diff 수집은 App이 넘긴
-    // cwd로 repo_root를 다시 구해(collect_file_diff) 이 필드를 재사용하지 않는다.
-    // 소비자가 없어도 스냅샷 모델의 일부로 유지한다 — 2026-08-15.
-    #[allow(dead_code)]
+    // 담아 둔다. 목록은 상대 경로(rel_path)로 그리고, 경로 동작(우클릭 메뉴·diff 헤더의
+    // 경로 복사·세션에 넣기·Finder, 2026-10-11 PR 5)이 이 값 + rel_path로 절대 경로를
+    // 만든다. 파일 diff 수집은 App이 넘긴 cwd로 repo_root를 다시 구해(collect_file_diff)
+    // 이 필드를 쓰지 않는다.
     pub repo_root: PathBuf,
     pub branch: String,
     pub upstream: Option<String>,
@@ -398,6 +398,102 @@ fn status_badge(
         color,
     );
     response.on_hover_text(catalog.t(key, &[]));
+}
+
+/// 경로 동작(경로 복사·세션에 경로 넣기·Finder에서 보기)의 대상 파일 — 행 우클릭 메뉴와
+/// diff 헤더 버튼이 같이 쓴다(2026-10-11 PR 5). 복사는 leaf가 끝내고(파일 트리
+/// 「경로 복사」와 같은 `ctx.copy_text`), 나머지 둘은 App intent로 올린다.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitPathTarget {
+    /// 스냅샷의 repo_root + rel_path.
+    pub abs_path: PathBuf,
+    /// 'D' 행 — 그 경로에 파일이 없어 세션에 넣기·Finder는 끈다(복사는 남긴다).
+    pub deleted: bool,
+}
+
+impl GitPathTarget {
+    fn for_row(repo_root: &Path, row: &GitFileRow) -> Self {
+        Self {
+            abs_path: repo_root.join(&row.rel_path),
+            deleted: row.status == 'D',
+        }
+    }
+
+    /// 클립보드에 넣을 문자열 — 파일 트리 「경로 복사」와 같은 `display()` 표기.
+    pub fn copy_text(&self) -> String {
+        self.abs_path.display().to_string()
+    }
+
+    /// 「세션에 경로 넣기」 intent. 삭제된 파일이거나 파일 트리의 경로 검증
+    /// (`FileTreePathPayload::try_new` — NUL·길이 상한)을 못 넘으면 None이고 버튼을 끈다.
+    pub fn insert_action(&self) -> Option<GitPanelAction> {
+        self.existing_path()
+            .map(|path| GitPanelAction::InsertPath { path })
+    }
+
+    /// 「Finder에서 보기」 intent — 끄는 조건은 [`Self::insert_action`]과 같다.
+    pub fn reveal_action(&self) -> Option<GitPanelAction> {
+        self.existing_path()
+            .map(|path| GitPanelAction::RevealInFinder { path })
+    }
+
+    fn existing_path(&self) -> Option<PathBuf> {
+        if self.deleted {
+            return None;
+        }
+        crate::ui::file_tree::FileTreePathPayload::try_new(self.abs_path.clone())
+            .ok()
+            .map(crate::ui::file_tree::FileTreePathPayload::into_path)
+    }
+}
+
+/// 파일 행 우클릭 메뉴(2026-10-11 PR 5) — 경로 복사 · 세션에 경로 넣기 · Finder에서 보기.
+/// 행 렌더(PR 2가 다시 짠다)와 섞이지 않게 별도 함수로 두고 행 응답에 호출 하나로 붙인다.
+fn file_row_context_menu(
+    response: &egui::Response,
+    repo_root: &Path,
+    row: &GitFileRow,
+    catalog: &i18n::Catalog,
+) -> Option<GitPanelAction> {
+    let mut action = None;
+    response.context_menu(|ui| {
+        let target = GitPathTarget::for_row(repo_root, row);
+        if ui
+            .button(catalog.t("git.path.copy", &[]))
+            .on_hover_text(catalog.t("git.path.copy_hint", &[]))
+            .clicked()
+        {
+            ui.ctx().copy_text(target.copy_text());
+            ui.close();
+        }
+        let insert = target.insert_action();
+        if ui
+            .add_enabled(
+                insert.is_some(),
+                egui::Button::new(catalog.t("git.path.insert", &[])),
+            )
+            .on_hover_text(catalog.t("git.path.insert_hint", &[]))
+            .on_disabled_hover_text(catalog.t("git.path.deleted", &[]))
+            .clicked()
+        {
+            action = insert;
+            ui.close();
+        }
+        let reveal = target.reveal_action();
+        if ui
+            .add_enabled(
+                reveal.is_some(),
+                egui::Button::new(catalog.t("git.path.reveal", &[])),
+            )
+            .on_hover_text(catalog.t("git.path.reveal_hint", &[]))
+            .on_disabled_hover_text(catalog.t("git.path.deleted", &[]))
+            .clicked()
+        {
+            action = reveal;
+            ui.close();
+        }
+    });
+    action
 }
 
 /// `git remote get-url origin` 출력을 OWNER/REPO 기준 GitHub HTTPS URL로 정규화한다.
@@ -712,6 +808,17 @@ pub enum GitPanelAction {
     LoadCommitFiles {
         sha: CommitSha,
     },
+    /// 「세션에 경로 넣기」(2026-10-11 PR 5) — App이 파일 트리 「터미널에 경로 삽입」
+    /// (`SidebarAction::InsertPath`)과 같은 경로로 포커스 세션에 넣는다. `path`는
+    /// repo_root 기준 절대 경로이고 [`GitPathTarget::insert_action`]이 검증한 값이다.
+    InsertPath {
+        path: PathBuf,
+    },
+    /// 「Finder에서 보기」 — App이 세션 「Finder에서 폴더 열기」와 같은 자리
+    /// (`AppHostIoAction::OpenPath`)로 이 파일이 든 폴더를 연다.
+    RevealInFinder {
+        path: PathBuf,
+    },
 }
 
 #[derive(Default)]
@@ -764,6 +871,29 @@ impl GitPanelUi {
         let snap = self.snapshot.as_ref()?.as_ref().ok()?;
         let base = snap.remote_https_base.clone()?;
         Some((base, snap.branch.clone()))
+    }
+
+    /// diff 헤더 경로 버튼이 쓸 대상 — 지금 스냅샷에서 그 모드 섹션의 행을 찾아 절대
+    /// 경로와 삭제 여부를 만든다. 행이 없으면(스냅샷이 그새 바뀌었으면) None.
+    pub fn path_target(
+        &self,
+        rel_path: &str,
+        mode: crate::ui::diff_viewer::DiffMode,
+    ) -> Option<GitPathTarget> {
+        use crate::ui::diff_viewer::DiffMode;
+        let snap = self.snapshot.as_ref()?.as_ref().ok()?;
+        let rows = match mode {
+            DiffMode::Working => &snap.changes,
+            DiffMode::Branch => &snap.committed,
+            // 펼친 커밋의 파일 목록 — 불러오기 전이거나 다른 커밋이면 대상이 없다.
+            DiffMode::Commit(sha) => match &self.commit_list.loaded {
+                Some((loaded, CommitFilesState::Ready(files))) if *loaded == sha => &files.rows,
+                _ => return None,
+            },
+        };
+        rows.iter()
+            .find(|row| row.rel_path == rel_path)
+            .map(|row| GitPathTarget::for_row(&snap.repo_root, row))
     }
 
     /// `filter`: 보조 검색 좌측 목록 필터(2026-08-18 스펙) — 빈 문자열이면 필터 없음.
@@ -898,7 +1028,16 @@ impl GitPanelUi {
             };
             for row in &rows[..visible] {
                 let id_salt = ("git-panel-row", title_key, row.rel_path.as_str());
-                if let Some(clicked) = file_row(ui, id_salt, row, mode, selected, tokens, catalog) {
+                if let Some(clicked) = file_row(
+                    ui,
+                    id_salt,
+                    &snap.repo_root,
+                    row,
+                    mode,
+                    selected,
+                    tokens,
+                    catalog,
+                ) {
                     *action = Some(clicked);
                 }
             }
@@ -1045,10 +1184,12 @@ impl GitPanelUi {
 
 /// 파일 행 하나 — 상태 배지·파일명·줄인 폴더·증감, 선택이면 면과 2pt accent 레일.
 /// 변경/브랜치 커밋 섹션과 커밋별 파일 목록이 같이 쓴다. 클릭하면 선택으로 기록하고
-/// 그 모드의 `ShowFileDiff`를 돌려준다.
+/// 그 모드의 `ShowFileDiff`를, 우클릭 메뉴에서 고르면 그 경로 동작을 돌려준다.
+#[allow(clippy::too_many_arguments)]
 fn file_row(
     ui: &mut egui::Ui,
     id_salt: impl egui::AsIdSalt,
+    repo_root: &Path,
     row: &GitFileRow,
     mode: crate::ui::diff_viewer::DiffMode,
     selected: &mut Option<(String, crate::ui::diff_viewer::DiffMode)>,
@@ -1121,6 +1262,9 @@ fn file_row(
             row.rel_path.as_str(),
         )
     });
+    if let Some(menu) = file_row_context_menu(&response, repo_root, row, catalog) {
+        return Some(menu);
+    }
     if !response.clicked() {
         return None;
     }
@@ -1239,7 +1383,16 @@ fn render_commit_list(
         }
         if state.expanded == Some(commit.sha) {
             ui.indent(("git-panel-commit-files", commit.sha.as_str()), |ui| {
-                render_commit_files(ui, catalog, tokens, commit.sha, state, selected, action);
+                render_commit_files(
+                    ui,
+                    catalog,
+                    tokens,
+                    &snap.repo_root,
+                    commit.sha,
+                    state,
+                    selected,
+                    action,
+                );
             });
         }
     }
@@ -1252,10 +1405,12 @@ fn render_commit_list(
 }
 
 /// 펼친 커밋의 파일 행 — 불러오는 중·실패·바뀐 파일 없음 안내를 포함한다.
+#[allow(clippy::too_many_arguments)]
 fn render_commit_files(
     ui: &mut egui::Ui,
     catalog: &i18n::Catalog,
     tokens: crate::ui::designall::Tokens,
+    repo_root: &Path,
     sha: CommitSha,
     state: &CommitListState,
     selected: &mut Option<(String, crate::ui::diff_viewer::DiffMode)>,
@@ -1279,7 +1434,9 @@ fn render_commit_files(
     for row in &files.rows {
         // 변경/브랜치 커밋 섹션과 같은 행(배지·줄인 폴더·선택 강조).
         let id_salt = ("git-panel-commit-file", sha.as_str(), row.rel_path.as_str());
-        if let Some(clicked) = file_row(ui, id_salt, row, mode, selected, tokens, catalog) {
+        if let Some(clicked) =
+            file_row(ui, id_salt, repo_root, row, mode, selected, tokens, catalog)
+        {
             *action = Some(clicked);
         }
     }
@@ -2415,6 +2572,261 @@ mod tests {
         assert!(!worktree_path_is_spawnable(&long));
         assert!(!worktree_path_is_spawnable("/repo/\0bad"));
         assert!(worktree_path_is_spawnable("/repo/wt"));
+    }
+
+    // ── PR 5: 경로 동작(2026-10-11 계획 §3) ─────────────────────────────
+
+    fn path_row(rel_path: &str, status: char) -> GitFileRow {
+        GitFileRow {
+            rel_path: rel_path.into(),
+            status,
+            adds: None,
+            dels: None,
+        }
+    }
+
+    #[test]
+    fn 경로_대상은_repo_root와_rel_path로_절대_경로를_만든다() {
+        let root = Path::new("/Users/me/내 저장소");
+        let target = GitPathTarget::for_row(root, &path_row("src/한글 파일 (1).rs", 'M'));
+        assert_eq!(
+            target.abs_path,
+            PathBuf::from("/Users/me/내 저장소/src/한글 파일 (1).rs")
+        );
+        assert!(!target.deleted);
+        assert_eq!(
+            target.copy_text(),
+            "/Users/me/내 저장소/src/한글 파일 (1).rs"
+        );
+        // 폴더 없는 최상위 파일도 같은 규칙이다.
+        let top = GitPathTarget::for_row(root, &path_row("Cargo.toml", '?'));
+        assert_eq!(
+            top.abs_path,
+            PathBuf::from("/Users/me/내 저장소/Cargo.toml")
+        );
+    }
+
+    #[test]
+    fn 삭제된_행은_세션에_넣기와_finder를_끄고_복사만_남긴다() {
+        let root = Path::new("/repo");
+        let deleted = GitPathTarget::for_row(root, &path_row("gone.rs", 'D'));
+        assert!(deleted.deleted);
+        assert_eq!(deleted.insert_action(), None);
+        assert_eq!(deleted.reveal_action(), None);
+        assert_eq!(deleted.copy_text(), "/repo/gone.rs");
+
+        let kept = GitPathTarget::for_row(root, &path_row("kept.rs", 'M'));
+        assert_eq!(
+            kept.insert_action(),
+            Some(GitPanelAction::InsertPath {
+                path: PathBuf::from("/repo/kept.rs")
+            })
+        );
+        assert_eq!(
+            kept.reveal_action(),
+            Some(GitPanelAction::RevealInFinder {
+                path: PathBuf::from("/repo/kept.rs")
+            })
+        );
+    }
+
+    #[test]
+    fn 파일_트리_경로_검증을_못_넘으면_세션에_넣기와_finder를_끈다() {
+        // FileTreePathPayload::try_new와 같은 검증 — 상한(32KiB) 초과·NUL 경로는
+        // App 경계를 넘기지 않는다.
+        for abs_path in [
+            PathBuf::from(format!("/{}", "a".repeat(32 * 1024))),
+            PathBuf::from("/repo/a\0b"),
+        ] {
+            let target = GitPathTarget {
+                abs_path,
+                deleted: false,
+            };
+            assert_eq!(target.insert_action(), None);
+            assert_eq!(target.reveal_action(), None);
+        }
+    }
+
+    #[test]
+    fn path_target은_모드_섹션의_행으로_대상을_만든다() {
+        use crate::ui::diff_viewer::DiffMode;
+
+        let mut panel = GitPanelUi::default();
+        panel.set_snapshot(Ok(GitPanelSnapshot {
+            repo_root: PathBuf::from("/repo"),
+            changes: vec![path_row("a.rs", 'D')],
+            committed: vec![path_row("a.rs", 'M')],
+            ..Default::default()
+        }));
+        // 같은 경로라도 모드마다 다른 섹션의 행이다 — 워킹트리에선 지웠고 브랜치에선 고쳤다.
+        assert_eq!(
+            panel.path_target("a.rs", DiffMode::Working),
+            Some(GitPathTarget {
+                abs_path: PathBuf::from("/repo/a.rs"),
+                deleted: true,
+            })
+        );
+        assert_eq!(
+            panel.path_target("a.rs", DiffMode::Branch),
+            Some(GitPathTarget {
+                abs_path: PathBuf::from("/repo/a.rs"),
+                deleted: false,
+            })
+        );
+        assert_eq!(panel.path_target("missing.rs", DiffMode::Working), None);
+    }
+
+    #[test]
+    fn path_target은_펼친_커밋의_파일로도_대상을_만든다() {
+        use crate::ui::diff_viewer::DiffMode;
+
+        let sha = CommitSha::parse("a1b2c3d").unwrap();
+        let mut panel = GitPanelUi::default();
+        panel.set_snapshot(Ok(GitPanelSnapshot {
+            repo_root: PathBuf::from("/repo"),
+            ..Default::default()
+        }));
+        // 불러오기 전에는 대상이 없다.
+        assert_eq!(panel.path_target("b.rs", DiffMode::Commit(sha)), None);
+        panel.commit_list.toggle(sha);
+        panel.set_commit_files(
+            sha,
+            Ok(GitCommitFiles {
+                rows: vec![path_row("b.rs", 'M')],
+                truncated: false,
+            }),
+        );
+        assert_eq!(
+            panel.path_target("b.rs", DiffMode::Commit(sha)),
+            Some(GitPathTarget {
+                abs_path: PathBuf::from("/repo/b.rs"),
+                deleted: false,
+            })
+        );
+        let other = CommitSha::parse("ffff000").unwrap();
+        assert_eq!(panel.path_target("b.rs", DiffMode::Commit(other)), None);
+    }
+
+    struct PathMenuState {
+        panel: GitPanelUi,
+        actions: Vec<GitPanelAction>,
+        copied: Vec<String>,
+    }
+
+    fn path_menu_harness(rows: Vec<GitFileRow>) -> egui_kittest::Harness<'static, PathMenuState> {
+        let mut panel = GitPanelUi::default();
+        panel.set_snapshot(Ok(GitPanelSnapshot {
+            repo_root: PathBuf::from("/Users/me/my repo"),
+            branch: "main".into(),
+            changes: rows,
+            ..Default::default()
+        }));
+        egui_kittest::Harness::new_ui_state(
+            |ui, state: &mut PathMenuState| {
+                let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+                if let Some(action) = state.panel.render(ui, &catalog, "") {
+                    state.actions.push(action);
+                }
+                // work_history 카드 복사 테스트와 같은 관례 — 이 프레임의 복사 명령을 모은다.
+                ui.ctx().output(|output| {
+                    for command in &output.commands {
+                        if let egui::OutputCommand::CopyText(text) = command {
+                            state.copied.push(text.clone());
+                        }
+                    }
+                });
+            },
+            PathMenuState {
+                panel,
+                actions: Vec::new(),
+                copied: Vec::new(),
+            },
+        )
+    }
+
+    fn open_row_menu(harness: &mut egui_kittest::Harness<'static, PathMenuState>, rel_path: &str) {
+        use egui_kittest::kittest::Queryable;
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, rel_path)
+            .click_secondary();
+        harness.run();
+    }
+
+    #[test]
+    fn kittest_행_우클릭_메뉴는_경로_복사_세션에_넣기_finder를_낸다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let copy = catalog.t("git.path.copy", &[]);
+        let mut harness = path_menu_harness(vec![path_row("src/한글 파일.rs", 'M')]);
+        harness.run();
+
+        // 경로 복사 — App intent 없이 leaf가 절대 경로를 클립보드에 넣고 메뉴를 닫는다.
+        open_row_menu(&mut harness, "src/한글 파일.rs");
+        harness.get_by_label(&copy).click();
+        harness.run();
+        assert_eq!(
+            harness.state().copied,
+            vec!["/Users/me/my repo/src/한글 파일.rs".to_owned()]
+        );
+        assert!(harness.state().actions.is_empty());
+        assert!(
+            harness.query_by_label(&copy).is_none(),
+            "메뉴가 닫혀야 한다"
+        );
+
+        open_row_menu(&mut harness, "src/한글 파일.rs");
+        harness
+            .get_by_label(&catalog.t("git.path.insert", &[]))
+            .click();
+        harness.run();
+        open_row_menu(&mut harness, "src/한글 파일.rs");
+        harness
+            .get_by_label(&catalog.t("git.path.reveal", &[]))
+            .click();
+        harness.run();
+
+        let path = PathBuf::from("/Users/me/my repo/src/한글 파일.rs");
+        assert_eq!(
+            harness.state().actions,
+            vec![
+                GitPanelAction::InsertPath { path: path.clone() },
+                GitPanelAction::RevealInFinder { path },
+            ]
+        );
+    }
+
+    #[test]
+    fn kittest_삭제된_행의_메뉴는_복사만_동작한다() {
+        use egui_kittest::kittest::{NodeT, Queryable};
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut harness = path_menu_harness(vec![path_row("gone.rs", 'D')]);
+        harness.run();
+
+        for key in ["git.path.insert", "git.path.reveal"] {
+            // egui 메뉴는 안쪽 클릭(꺼진 항목 포함)에도 닫히므로 항목마다 다시 연다.
+            open_row_menu(&mut harness, "gone.rs");
+            let label = catalog.t(key, &[]);
+            let item = harness.get_by_label(&label);
+            assert!(
+                item.accesskit_node().is_disabled(),
+                "{key}는 삭제된 파일에서 꺼져 있어야 한다"
+            );
+            item.click();
+            harness.run();
+        }
+        assert!(harness.state().actions.is_empty());
+
+        open_row_menu(&mut harness, "gone.rs");
+        harness
+            .get_by_label(&catalog.t("git.path.copy", &[]))
+            .click();
+        harness.run();
+        assert_eq!(
+            harness.state().copied,
+            vec!["/Users/me/my repo/gone.rs".to_owned()]
+        );
     }
 
     // ── Task 2: 좌측 목록 필터(2026-08-18 계획) ─────────────────────────

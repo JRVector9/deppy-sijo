@@ -330,6 +330,12 @@ pub struct DiffViewerUi {
     /// 사용자가 본문을 자유롭게 스크롤할 수 없다(hunk ↑↓의 `scroll_to_row`와 같은
     /// 문제의식).
     search_scroll_key: Option<(String, usize)>,
+    /// 헤더 경로 버튼(경로 복사·세션에 넣기·Finder, 2026-10-11 PR 5)의 대상 — App이
+    /// `open` 직후 [`Self::set_path_target`]으로 넣는다. None이면 버튼 줄을 그리지 않는다.
+    path_target: Option<crate::ui::git_panel::GitPathTarget>,
+    /// 헤더 버튼이 낸 App intent — app.rs 소스 고정 테스트가 `render` 호출 모양을 묶어
+    /// 두어 반환값을 바꿀 수 없으므로, App이 render 직후 [`Self::take_action`]으로 꺼낸다.
+    action: Option<crate::ui::git_panel::GitPanelAction>,
 }
 
 impl DiffViewerUi {
@@ -347,6 +353,8 @@ impl DiffViewerUi {
         // 깨지므로 함께 비운다.
         self.search_cache = SearchCache::default();
         self.search_scroll_key = None;
+        // 경로 대상도 파일마다 다르다 — App이 다시 넣지 않으면 버튼 줄이 사라진다.
+        self.path_target = None;
     }
 
     pub fn set_view(&mut self, view: FileDiffView) {
@@ -367,6 +375,17 @@ impl DiffViewerUi {
     /// 보일 수 있다 — 1프레임 지연, 계획 Task 4 보고 참고).
     pub fn search_summary(&self) -> (usize, bool) {
         (self.search_cache.total, self.search_cache.truncated)
+    }
+
+    /// 헤더 경로 버튼의 대상 — 스냅샷의 repo_root를 아는 쪽(git 패널)에서 App이 받아
+    /// `open` 직후 넣는다. `open`이 비우므로 부르지 않으면 버튼 줄이 없다.
+    pub fn set_path_target(&mut self, target: Option<crate::ui::git_panel::GitPathTarget>) {
+        self.path_target = target;
+    }
+
+    /// 헤더 버튼이 남긴 intent를 꺼낸다 — App이 매 프레임 `render` 직후 부른다.
+    pub fn take_action(&mut self) -> Option<crate::ui::git_panel::GitPanelAction> {
+        self.action.take()
     }
 
     /// `search`는 (질의, 그 본문 기준 활성 일치 인덱스) — App이 소유한
@@ -436,6 +455,43 @@ impl DiffViewerUi {
                 }
             });
         });
+        // ── 경로 동작: 경로 복사 · 세션에 넣기 · Finder (2026-10-11 시안) ─────────
+        // 복사는 여기서 끝내고, 나머지 둘은 App이 render 직후 take_action으로 꺼낸다.
+        if let Some(target) = &self.path_target {
+            ui.horizontal(|ui| {
+                if ui
+                    .small_button(catalog.t("git.path.copy", &[]))
+                    .on_hover_text(catalog.t("git.path.copy_hint", &[]))
+                    .clicked()
+                {
+                    ui.ctx().copy_text(target.copy_text());
+                }
+                let insert = target.insert_action();
+                if ui
+                    .add_enabled(
+                        insert.is_some(),
+                        egui::Button::new(catalog.t("git.path.insert_short", &[])).small(),
+                    )
+                    .on_hover_text(catalog.t("git.path.insert_hint", &[]))
+                    .on_disabled_hover_text(catalog.t("git.path.deleted", &[]))
+                    .clicked()
+                {
+                    self.action = insert;
+                }
+                let reveal = target.reveal_action();
+                if ui
+                    .add_enabled(
+                        reveal.is_some(),
+                        egui::Button::new(catalog.t("git.path.reveal_short", &[])).small(),
+                    )
+                    .on_hover_text(catalog.t("git.path.reveal_hint", &[]))
+                    .on_disabled_hover_text(catalog.t("git.path.deleted", &[]))
+                    .clicked()
+                {
+                    self.action = reveal;
+                }
+            });
+        }
         ui.separator();
 
         let Some(view) = self.view.as_ref() else {
@@ -941,5 +997,145 @@ index 111..222 100644
                 .is_some(),
             "일치가 있는(가상화로 초기엔 안 보이던) 행으로 첫 렌더에서 스크롤돼야 한다"
         );
+    }
+
+    // ── PR 5: 헤더 경로 버튼(2026-10-11 계획 §3) ────────────────────────────
+
+    struct PathButtonsState {
+        viewer: DiffViewerUi,
+        actions: Vec<crate::ui::git_panel::GitPanelAction>,
+        copied: Vec<String>,
+    }
+
+    fn path_buttons_harness(
+        target: Option<crate::ui::git_panel::GitPathTarget>,
+    ) -> egui_kittest::Harness<'static, PathButtonsState> {
+        let mut viewer = DiffViewerUi::default();
+        viewer.open("src/한글 파일.rs".to_owned(), DiffMode::Working);
+        viewer.set_path_target(target);
+        viewer.set_view(parse_unified(SAMPLE, false));
+        egui_kittest::Harness::new_ui_state(
+            |ui, state: &mut PathButtonsState| {
+                let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+                state.viewer.render(ui, &catalog, None);
+                // App(render_git_tab_body)이 render 직후 꺼내는 것과 같은 순서.
+                if let Some(action) = state.viewer.take_action() {
+                    state.actions.push(action);
+                }
+                ui.ctx().output(|output| {
+                    for command in &output.commands {
+                        if let egui::OutputCommand::CopyText(text) = command {
+                            state.copied.push(text.clone());
+                        }
+                    }
+                });
+            },
+            PathButtonsState {
+                viewer,
+                actions: Vec::new(),
+                copied: Vec::new(),
+            },
+        )
+    }
+
+    #[test]
+    fn kittest_헤더_경로_버튼은_복사하고_intent를_take_action으로_넘긴다() {
+        use crate::ui::git_panel::{GitPanelAction, GitPathTarget};
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let path = std::path::PathBuf::from("/Users/me/my repo/src/한글 파일.rs");
+        let mut harness = path_buttons_harness(Some(GitPathTarget {
+            abs_path: path.clone(),
+            deleted: false,
+        }));
+        harness.run();
+
+        // 경로 복사는 leaf가 끝낸다 — App intent는 없다.
+        harness
+            .get_by_label(&catalog.t("git.path.copy", &[]))
+            .click();
+        harness.run();
+        assert_eq!(
+            harness.state().copied,
+            vec!["/Users/me/my repo/src/한글 파일.rs".to_owned()]
+        );
+        assert!(harness.state().actions.is_empty());
+
+        harness
+            .get_by_label(&catalog.t("git.path.insert_short", &[]))
+            .click();
+        harness.run();
+        harness
+            .get_by_label(&catalog.t("git.path.reveal_short", &[]))
+            .click();
+        harness.run();
+        // 한 번 꺼낸 intent는 다음 프레임에 다시 나오지 않는다.
+        harness.run();
+        assert_eq!(
+            harness.state().actions,
+            vec![
+                GitPanelAction::InsertPath { path: path.clone() },
+                GitPanelAction::RevealInFinder { path },
+            ]
+        );
+    }
+
+    #[test]
+    fn kittest_삭제된_파일의_헤더는_세션에_넣기와_finder를_끈다() {
+        use crate::ui::git_panel::GitPathTarget;
+        use egui_kittest::kittest::{NodeT, Queryable};
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut harness = path_buttons_harness(Some(GitPathTarget {
+            abs_path: std::path::PathBuf::from("/repo/gone.rs"),
+            deleted: true,
+        }));
+        harness.run();
+
+        for key in ["git.path.insert_short", "git.path.reveal_short"] {
+            let label = catalog.t(key, &[]);
+            let button = harness.get_by_label(&label);
+            assert!(
+                button.accesskit_node().is_disabled(),
+                "{key}는 삭제된 파일에서 꺼져 있어야 한다"
+            );
+            button.click();
+            harness.run();
+        }
+        assert!(harness.state().actions.is_empty());
+
+        harness
+            .get_by_label(&catalog.t("git.path.copy", &[]))
+            .click();
+        harness.run();
+        assert_eq!(harness.state().copied, vec!["/repo/gone.rs".to_owned()]);
+    }
+
+    #[test]
+    fn kittest_경로_대상이_없으면_헤더_버튼을_그리지_않는다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut harness = path_buttons_harness(None);
+        harness.run();
+        assert!(
+            harness
+                .query_by_label(&catalog.t("git.path.copy", &[]))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn open은_이전_파일의_경로_대상을_비운다() {
+        let mut viewer = DiffViewerUi::default();
+        viewer.open("a.rs".to_owned(), DiffMode::Working);
+        viewer.set_path_target(Some(crate::ui::git_panel::GitPathTarget {
+            abs_path: std::path::PathBuf::from("/repo/a.rs"),
+            deleted: false,
+        }));
+        // 다음 파일을 열 때 App이 대상을 넣지 않으면 이전 파일 경로가 남으면 안 된다.
+        viewer.open("b.rs".to_owned(), DiffMode::Working);
+        assert_eq!(viewer.path_target, None);
     }
 }

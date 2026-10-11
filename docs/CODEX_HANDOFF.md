@@ -1,3 +1,16 @@
+# 프로젝트 키 관리 main 착지·0.11.0 재실행 — 2026-10-12 (Claude Code)
+
+- 사용자 「추가로 작업한게 있는데 메인에 머지하고 재빌드하고 재실행해」. 대상은 로컬 performance에만 있던 Codex 프로젝트 키 커밋 7개(2606857e..1d17a029, 52파일). 재실행은 이번 작업의 명시 요청이다.
+- DB 확인: `project_keys::MIGRATION`은 append-only(새 테이블·인덱스·트리거만, 기존 행 변경 없음). storage-core가 마이그레이션 전 `metadata.sqlite3.bak`을 만들고, 예전 앱은 `ensure_not_ahead`로 새 DB를 열지 않는다 → 0.10.x로 되돌리려면 백업 복원이 필요하다.
+- 버전 0.10.3 → 0.11.0(새 기능·DB·runtime wire 27→28이라 minor). `Cargo.lock`은 워크스페이스 27개 버전 줄만 바뀜. `cargo metadata --offline`은 aarch64 빌드에 안 쓰는 `curve25519-dalek-derive` 다운로드로 exit 101이었지만 lock 갱신과 오프라인 패키징은 정상.
+- PR #223(7bacc4d3): 첫 macOS 실행은 4696 PASS / 1 FAIL — 기존 pty `고립된_1바이트_echo…` 지연 임계값(중앙값 ≈2ms > 1.9ms)이 재시도 3회 모두 실패. `crates/pty`는 변경 없음. 실패 작업만 재실행 → 8개 검사 모두 PASS(macOS 10m17s). main·원격/로컬 performance 모두 7bacc4d3.
+- 번들: `CARGO_NET_OFFLINE=true DEPPY_REQUIRE_TRUSTED_SIGNING=0 DEPPY_ALLOW_UNTRUSTED_SIGNING=1 sh scripts/package-macos.sh` exit 0(log `/private/tmp/deppy-0.11.0-package-20261012.log`). 0.11.0/0.11.0, `app.vector9.deppy-sijo`, codesign strict OK, Team ZDTU5LS35K, `deppy-sijo --version` = 0.11.0. 공증 안 한 로컬 개발 번들.
+- 재실행: `target/restart-0.11.0-20261012/Deppy Sijo.app`로 ditto 복사(실행 파일 3개 SHA256 일치, codesign strict OK) → 기존 PID 21173(0.10.1)에 `tell application id "app.vector9.deppy-sijo" to quit` → 약 2초 후 정상 종료(force kill 없음) → `open` → PID 8569, LaunchServices Version 0.11.0, 20초 이상 유지.
+- 실DB 읽기 전용 확인: `~/Library/Application Support/app.vector9.deppy-sijo/metadata.sqlite3` user_version 48→50, `project_key%` 테이블 10개, `PRAGMA quick_check` ok, `.bak`은 v48. 키 값·secret 컬럼은 조회하지 않음. 창 UI·세션 복원 개수·프로젝트 키 화면은 육안 확인하지 않았다.
+- 남은 일: pty echo 지연 테스트가 느린 macOS 러너에서 재시도 3회를 다 실패할 수 있다(이번 1회). 원격 runtime 피어는 wire 28이라 앱과 함께 갱신돼야 한다.
+
+---
+
 # 프로젝트 키 관리 전체 구현 진행 — 2026-10-12 (Codex)
 
 ## 최종 구현·재검토 완료

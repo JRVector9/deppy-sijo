@@ -1,6 +1,6 @@
 # 공용 팝업 디자인과 구현 규칙
 
-기준 시안: [43개 팝업 사례](../mockups/shared-popup-components-2026-09-30.html). 이 문서는 새 팝업을 만들거나 기존 팝업을 옮길 때 사용하는 구현 계약이다. 사례 번호는 시안의 왼쪽 목록과 전체 표에서 같다.
+기준 시안: [49개 팝업 사례](../mockups/shared-popup-components-2026-09-30.html). 이 문서는 새 팝업을 만들거나 기존 팝업을 옮길 때 사용하는 구현 계약이다. 사례 번호는 시안의 왼쪽 목록과 전체 표에서 같다.
 
 ## 적용 범위
 
@@ -24,10 +24,16 @@
 | 27 | 외부 수정 문서 다시 불러오기 | 공용 팝업 · 다시 불러오기/취소 | `crates/app/src/ui/document_dialogs.rs` |
 | 28 | 문서 탭 한도 | 공용 Info 팝업 | `crates/app/src/ui/document_dialogs.rs` |
 | 29 | 프로젝트 폴더 이동 | 공용 팝업 · 이전/현재 경로·접수/실패 상태 | `crates/app/src/ui/document_dialogs.rs` |
-| 43 | 기존 워크스페이스 재연결 | 공용 확인 팝업 · 선택 폴더 표시·명시적 승인 | `crates/app/src/app.rs` · `ui/popup/confirmation.rs` |
-| 30–32 | 프롬프트 라이브러리·변경사항·세션 관리 | 공용 중앙 이동·크기 조절 셸과 본문 여백 | `ui/prompt_palette.rs` · `ui/diff_panel.rs` · `ui/agent_sessions.rs` |
-| 33–35 | 이벤트 적체·워크스페이스 한도·셀 열기 실패 | 공용 Info 팝업 · 순차 안내 | `crates/app/src/ui/popup/information.rs` · 호출자 `app.rs` |
-| 37 포트 | 포트 관리 목록 | 공용 앵커 팝오버 · 목록 행·스크롤·고정 푸터 | `crates/app/src/ui/ports.rs` · 호출자 `ui/agent_terminal.rs` |
+| 30 | 기존 워크스페이스 재연결 | 공용 확인 팝업 · 선택 폴더 표시·명시적 승인 | `crates/app/src/app.rs` · `ui/popup/confirmation.rs` |
+| 31–33 | 프롬프트 라이브러리·변경사항·세션 관리 | 공용 중앙 이동·크기 조절 셸과 본문 여백 | `ui/prompt_palette.rs` · `ui/diff_panel.rs` · `ui/agent_sessions.rs` |
+| 34–36 | 이벤트 적체·워크스페이스 한도·셀 열기 실패 | 공용 Info 팝업 · 순차 안내 | `crates/app/src/ui/popup/information.rs` · 호출자 `app.rs` |
+| 38 포트 | 포트 관리 목록 | 공용 앵커 팝오버 · 목록 행·스크롤·고정 푸터 | `crates/app/src/ui/ports.rs` · 호출자 `ui/agent_terminal.rs` |
+| 44 | 프로젝트 키 추가·수정 | 480pt 공용 셸·숨김 새 값·빈 입력 유지·원본·사용처 | `crates/app/src/ui/project_keys.rs` |
+| 45 | 원본 파일 연결·가져오기 | 480pt 공용 셸·파일 종류/경로·자동 보관·환경 분리 | `crates/app/src/ui/project_keys.rs` |
+| 46 | GitHub 목적지 연결 | 480pt 공용 셸·인증·정확한 범위·자동 전송 opt-in | `crates/app/src/ui/project_keys.rs` |
+| 47 | 빌드 연결 | 480pt 공용 셸·저장 명령/경로·snapshot 사용 기록 | `crates/app/src/ui/project_keys.rs` |
+| 48 | 프로젝트 키 관리 연결 삭제 | 480pt 공용 확인·원본/원격 유지 안내 | `crates/app/src/ui/project_keys.rs` |
+| 49 | 키 원본 충돌 해결 | 480pt 공용 셸·원본/보관 선택·버전 재확인 | `crates/app/src/ui/project_keys.rs` |
 
 AI 세션 시작 런처는 기존 전용 레이아웃을 유지한다. macOS 기본 파일 선택창과 별도 설정 창에도 이 팝업 셸을 씌우지 않는다. 나머지 사례는 실제로 변경할 때 이 문서의 규칙과 시안을 비교해 적용한다. 번호만으로 아직 구현됐다고 간주하지 않는다.
 
@@ -98,7 +104,7 @@ let close_requested = popup::show(ctx, popup::PopupSpec {
 
 - 새 폴더·새 파일은 이름 입력에 바로 초점을 주고, Enter는 만들기, Esc·취소·닫기는 입력을 버린다. 파일 트리 행을 밀지 않도록 모달은 트리 레이아웃 밖에 둔다.
 - 워크스페이스 추가는 `내 폴더`/`GitHub 저장소` 선택, URL·저장 위치·폴더 이름의 초안, 복제 상태와 오류를 기존 `WorkspaceAddUi`가 관리한다. 하단의 주 동작은 선택 방식에 맞춰 바뀐다. 복제 중에는 닫기를 막고 복제 취소만 허용한다.
-- 로컬 폴더 등록은 열린 디렉터리 descriptor에서 dev/inode와 macOS 볼륨 UUID를 같은 객체 기준으로 읽어 settings worker에서 저장한다. 기존 UUID와 inode가 일치하면 장치 번호 변경을 허용한다. 과거 UUID 증명이 없는 기존 경로는 inode가 같고 현재 UUID를 읽을 수 있어도 자동 연결하지 않는다. 선택한 폴더를 사례43 공용 확인창에 표시하고, 사용자가 다시 연결을 누른 경우에만 원래 probe의 dev/inode/UUID를 worker에서 재검사한 뒤 기존 workspace에 연결한다. 다른 UUID·inode 또는 UUID 조회 불가 시 계속 거부한다. 설정의 명시적 프로젝트 경로 재연결은 같은 경로/dev/inode여도 이전 증명을 트랜잭션 안에서 교체한다.
+- 로컬 폴더 등록은 열린 디렉터리 descriptor에서 dev/inode와 macOS 볼륨 UUID를 같은 객체 기준으로 읽어 settings worker에서 저장한다. 기존 UUID와 inode가 일치하면 장치 번호 변경을 허용한다. 과거 UUID 증명이 없는 기존 경로는 inode가 같고 현재 UUID를 읽을 수 있어도 자동 연결하지 않는다. 선택한 폴더를 사례30 공용 확인창에 표시하고, 사용자가 다시 연결을 누른 경우에만 원래 probe의 dev/inode/UUID를 worker에서 재검사한 뒤 기존 workspace에 연결한다. 다른 UUID·inode 또는 UUID 조회 불가 시 계속 거부한다. 설정의 명시적 프로젝트 경로 재연결은 같은 경로/dev/inode여도 이전 증명을 트랜잭션 안에서 교체한다.
 - 시안의 01번은 GitHub 입력 상태를 보여주는 예시다. 실제 첫 선택은 기존과 같이 `내 폴더`이며, 사용자가 GitHub를 누르면 저장소 입력으로 전환한다.
 - URL 아래에는 지원 형식 안내를 표시한다. 하단 단축키는 생성 창에서 `Enter 만들기 · Esc 닫기`, 워크스페이스 추가에서 `Esc 닫기`다. 워크스페이스 복제는 버튼으로 시작하므로 Enter 실행이라고 표기하지 않는다.
 - 모달 UI 안에서 디스크·네트워크 작업을 시작하거나 동기 대기하지 않는다. 호출자가 의도를 받아 기존 작업 경로로 보낸다.
@@ -173,7 +179,7 @@ Deppy를 실행하거나 재실행하는 것은 별도 명시적 요청이 있�
 
 ## 중앙에서 열리는 이동·크기 조절 창 (2026-10-05)
 
-[승인된 HTML 시안](../mockups/fleet-centered-resizable-popups-2026-10-05.html)을18–20,06·22,30–32에 적용한다. 기본 다음 단계620×560pt, 브로드캐스트680×560pt, 일괄 시작520×440pt. 각 창의 고유 ID와 native Resize 상태로 크기를 유지하며, 열 때 native CENTER_CENTER pivot을 화면 중앙에 둔다. 이동한 위치는 열린 동안 유지하고 재열기 시 중앙으로 돌아온다. 측정 크기를 다시 기본 크기로 넣는 반복 보정이나 영구 repaint 타이머를 만들지 않는다.
+[승인된 HTML 시안](../mockups/fleet-centered-resizable-popups-2026-10-05.html)을18–20,06·22,31–33에 적용한다. 기본 다음 단계620×560pt, 브로드캐스트680×560pt, 일괄 시작520×440pt. 각 창의 고유 ID와 native Resize 상태로 크기를 유지하며, 열 때 native CENTER_CENTER pivot을 화면 중앙에 둔다. 이동한 위치는 열린 동안 유지하고 재열기 시 중앙으로 돌아온다. 측정 크기를 다시 기본 크기로 넣는 반복 보정이나 영구 repaint 타이머를 만들지 않는다.
 
 공통 창 셸은18pt 제목·13pt 본문·22pt 좌우 여백·36pt 선택 입력·34pt 동작을 사용한다. 입력 창18–20·06·22는 본문만 스크롤하고 하단 버튼을 고정한다. 라이브러리·변경사항·세션 관리의 내부 목록/분할/동작은 각 호출자가 유지한다. 기존 런처·OS 선택창·앵커 메뉴와 관련 없는 승인/확인창은 이번 이동형 창 변경에 포함하지 않는다. 입력 소유권과 Esc는 기존 호출자 정책을 유지한다.
 

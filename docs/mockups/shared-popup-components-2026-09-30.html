@@ -232,6 +232,16 @@
       settings: info('설정 창', '현재는 별도 macOS 창으로 열립니다.', '이 화면 전체를 작은 공용 팝업으로 바꾸지 않습니다. 내부의 드롭다운과 확인 UI만 공용 규칙을 따를 수 있습니다.'),
       native_picker: info('macOS 파일·폴더 선택기', '워크스페이스·저장 위치·파일 선택에 사용됩니다.', '운영체제 기본 Finder 선택창은 OS 표준 UI를 유지합니다. 공용 팝업은 이 선택창을 여는 버튼까지만 담당합니다.')
     });
+    Object.assign(views, {
+      project_key_edit: { width: 480, title: '프로젝트 키 수정', subtitle: 'nomorevibe · 개발 · GITHUB_APP_PRIVATE_KEY', body: `<div class="field"><label>키 이름</label><input value="GITHUB_APP_PRIVATE_KEY" readonly></div><div class="field"><label>새 키 값</label><textarea rows="3" autocomplete="off" placeholder="비워 두면 기존 값 유지 · 예시 화면에 실제 키를 입력하지 마세요"></textarea></div><div class="field"><label>원본</label><select><option>개인키 파일 · keys/github-app.pem</option><option>앱 보관함</option></select></div><div class="field"><label>사용처</label><select><option>로컬 빌드</option><option>보관만</option></select></div><div class="notice"><span class="symbol">ⓘ</span><span>파일 변경과 Keychain 보관을 확인한 후 저장 완료로 표시합니다.</span></div>`, footer: `<span class="footnote">Esc 취소</span>${buttons('저장')}` },
+      project_key_source: { width: 480, title: '원본 파일 연결', subtitle: 'nomorevibe · 개발', body: `<div class="field"><label>종류</label><select><option>환경파일</option><option>PEM 개인키 파일</option></select></div><div class="field"><label>원본 경로</label><div class="path-input"><input value=".env.local"><button class="btn" type="button" data-toast="실제 앱에서는 파일 선택기로 연결할 원본을 지정합니다.">찾아보기</button></div></div><div class="check-row"><input type="checkbox" checked><span>연결한 파일의 변경값 자동 보관</span></div><div class="notice"><span class="symbol">ⓘ</span><span>개발·운영 원본은 따로 관리합니다. 누락되거나 비어 있는 파일로 기존 보관값을 지우지 않습니다.</span></div>`, footer: buttons('연결·가져오기') },
+      project_key_github: { width: 480, title: 'GitHub 목적지 연결', subtitle: 'GITHUB_TOKEN · 원격 Secret 값은 다시 조회할 수 없습니다.', body: `<div class="field"><label>인증</label><select><option>GitHub CLI 로그인 계정</option><option>저장한 token 참조</option></select></div><div class="field"><label>범위</label><select><option>Repository</option><option>Environment</option><option>Organization</option></select></div><div class="field"><label>저장소</label><input value="example/nomorevibe"></div><div class="field"><label>Secret 이름</label><input value="GITHUB_TOKEN"></div><div class="check-row"><input type="checkbox"><span>변경값 자동 전송</span></div><div class="notice"><span class="symbol">ⓘ</span><span>외부 변경을 감지하면 자동 전송을 보류합니다. 재시도 결과는 해당 키·버전에만 반영합니다.</span></div>`, footer: buttons('연결 저장') },
+      project_key_build: { width: 480, title: '빌드 연결', subtitle: 'nomorevibe · 개발', body: `<div class="field"><label>빌드 이름</label><input value="프로젝트 빌드"></div><div class="field"><label>실행 명령</label><input value="pnpm build"></div><div class="field"><label>실행 경로</label><input value="."></div><div class="notice"><span class="symbol">ⓘ</span><span>실행 직전 최신 원본을 확인합니다. 사용한 키 이름·버전·시각을 기록하고 비밀 값은 기록하지 않습니다.</span></div>`, footer: buttons('연결 저장') }
+    });
+    Object.assign(views, {
+      project_key_delete: confirm('프로젝트 키 삭제', 'nomorevibe · 개발 · GITHUB_TOKEN', '이 프로젝트·환경의 관리 연결을 삭제합니다. 원본 파일과 GitHub Secret 삭제는 별도로 수행합니다.', '관리 연결 삭제'),
+      project_key_conflict: { width: 480, title: '키 원본 충돌 해결', subtitle: 'nomorevibe · 개발 · GITHUB_TOKEN', body: `<div class="notice danger-note"><span class="symbol">!</span><span>원본 파일과 앱 보관값이 함께 변경되었습니다. 어느 값을 유지할지 선택하세요.</span></div><div class="field"><label>유지할 값</label><select><option>원본 파일의 현재 값</option><option>앱 보관함의 현재 값</option></select></div><div class="notice"><span class="symbol">ⓘ</span><span>비밀 값은 표시하지 않습니다. 처리 직전 원본과 보관 버전을 다시 확인합니다.</span></div>`, footer: buttons('선택한 값 유지') }
+    });
     const caseGroups = [
       ['생성·편집', [
         ['workspace', '워크스페이스 추가', '공용 Modal · 열기 완료 후 전용 런처', 'crates/app/src/workspace_add.rs'],
@@ -287,6 +297,14 @@
         ['pane_menu', '셀·세션 상황 메뉴', '상황 메뉴 Popup', 'crates/app/src/ui/workspace.rs:8455'],
         ['settings', '설정', '별도 macOS 창', 'crates/app/src/ui/settings.rs:322'],
         ['native_picker', '파일·폴더 선택', 'macOS 기본 선택창', 'crates/app/src/app.rs:13793']
+      ]],
+      ['프로젝트 키 관리', [
+        ['project_key_edit', '프로젝트 키 추가·수정', '공용 Modal · 480pt · 숨김 입력 · 고정 footer', 'crates/app/src/ui/project_keys.rs'],
+        ['project_key_source', '원본 파일 연결·가져오기', '공용 Modal · 480pt · 개발/운영 분리', 'crates/app/src/ui/project_keys.rs'],
+        ['project_key_github', 'GitHub 목적지 연결', '공용 Modal · 480pt · 인증/범위/자동 전송', 'crates/app/src/ui/project_keys.rs'],
+        ['project_key_build', '빌드 연결', '공용 Modal · 480pt · 명령/경로/실행 기록', 'crates/app/src/ui/project_keys.rs'],
+        ['project_key_delete', '프로젝트 키 관리 연결 삭제', '공용 Modal · 480pt · 대상별 확인', 'crates/app/src/ui/project_keys.rs'],
+        ['project_key_conflict', '키 원본 충돌 해결', '공용 Modal · 480pt · 비밀 값 제외·선택 확인', 'crates/app/src/ui/project_keys.rs']
       ]]
     ];
     for (const [category, cases] of caseGroups) {

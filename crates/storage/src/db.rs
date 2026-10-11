@@ -11,6 +11,7 @@ use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
+use deppy_core::process_identity::HookExecutionStamp;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use sha2::{Digest as _, Sha256};
 
@@ -901,6 +902,14 @@ CREATE INDEX idx_relay_devices_recency
     "ALTER TABLE agent_sessions ADD COLUMN task_prompt TEXT
        CHECK(task_prompt IS NULL OR (typeof(task_prompt)='text'
          AND length(CAST(task_prompt AS BLOB)) <= 256));",
+    // Binding and prompt events have independent execution ownership. Legacy rows
+    // remain unverified; a fresh binding cannot refresh an older prompt's proof.
+    "ALTER TABLE agent_hook_sessions ADD COLUMN execution_stamp TEXT
+       CHECK(execution_stamp IS NULL OR (typeof(execution_stamp)='text'
+         AND length(CAST(execution_stamp AS BLOB)) <= 4096));
+     ALTER TABLE agent_hook_sessions ADD COLUMN task_prompt_execution_stamp TEXT
+       CHECK(task_prompt_execution_stamp IS NULL OR (typeof(task_prompt_execution_stamp)='text'
+         AND length(CAST(task_prompt_execution_stamp AS BLOB)) <= 4096));",
 ];
 
 /// 옵션2: 저장된 에이전트 세션 한 행 — 재시작 복원 시 native resume에 쓴다.
@@ -1847,7 +1856,9 @@ const HOOK_SESSIONS_PREFIX_PREFLIGHT: &str = "WITH selected AS MATERIALIZED (
     SELECT hook.*, length(CAST(hook.session_key AS BLOB)) + length(CAST(hook.kind AS BLOB))
          + length(CAST(hook.agent_session_id AS BLOB))
          + length(CAST(hook.transcript_path AS BLOB))
-         + COALESCE(length(CAST(hook.task_prompt AS BLOB)), 0) AS row_bytes
+         + COALESCE(length(CAST(hook.task_prompt AS BLOB)), 0)
+         + COALESCE(length(CAST(hook.execution_stamp AS BLOB)), 0)
+         + COALESCE(length(CAST(hook.task_prompt_execution_stamp AS BLOB)), 0) AS row_bytes
       FROM selected JOIN agent_hook_sessions hook ON hook.rowid = selected.rowid
 )
 SELECT COUNT(*), COALESCE(SUM(CASE WHEN
@@ -1858,10 +1869,15 @@ SELECT COUNT(*), COALESCE(SUM(CASE WHEN
     OR typeof(transcript_path) != 'text' OR length(CAST(transcript_path AS BLOB)) > ?4
     OR (task_prompt IS NOT NULL AND (typeof(task_prompt) != 'text'
        OR length(CAST(task_prompt AS BLOB)) > 256))
+    OR (execution_stamp IS NOT NULL AND (typeof(execution_stamp) != 'text'
+       OR length(CAST(execution_stamp AS BLOB)) > 4096))
+    OR (task_prompt_execution_stamp IS NOT NULL AND (typeof(task_prompt_execution_stamp) != 'text'
+       OR length(CAST(task_prompt_execution_stamp AS BLOB)) > 4096))
     OR typeof(updated_at) != 'integer' OR row_bytes > ?5 THEN 1 ELSE 0 END), 0),
     COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0) FROM sized";
 const HOOK_SESSIONS_PREFIX_SELECT: &str =
-    "SELECT session_key, kind, agent_session_id, transcript_path, task_prompt
+    "SELECT session_key, kind, agent_session_id, transcript_path, task_prompt, updated_at,
+            execution_stamp, task_prompt_execution_stamp
     FROM agent_hook_sessions
     WHERE updated_at > ?4 - 86400
       AND substr(CAST(session_key AS BLOB), 1, length(CAST(?1 AS BLOB))) = CAST(?1 AS BLOB)
@@ -2289,6 +2305,36 @@ fn bounded_limit_plus_one(limit: usize, max: usize) -> anyhow::Result<i64> {
 
 fn bounded_text_is_valid(value: &str, max_bytes: usize) -> bool {
     value.len() <= max_bytes && !value.as_bytes().contains(&0)
+}
+
+fn encode_hook_execution_stamp(
+    stamp: Option<&HookExecutionStamp>,
+) -> anyhow::Result<Option<String>> {
+    stamp
+        .map(|stamp| {
+            anyhow::ensure!(stamp.is_valid(), BOUNDED_WRITE_INPUT_INVALID);
+            let json = serde_json::to_string(stamp)?;
+            anyhow::ensure!(
+                bounded_text_is_valid(&json, 4096),
+                BOUNDED_WRITE_INPUT_INVALID
+            );
+            Ok(json)
+        })
+        .transpose()
+}
+
+fn read_hook_execution_stamp(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+) -> anyhow::Result<Option<HookExecutionStamp>> {
+    bounded_optional_text(row, index, 4096)?
+        .map(|json| {
+            let stamp: HookExecutionStamp = serde_json::from_str(json)
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_ROW_INVALID))?;
+            anyhow::ensure!(stamp.is_valid(), BOUNDED_READ_ROW_INVALID);
+            Ok(stamp)
+        })
+        .transpose()
 }
 
 fn bounded_input_row_bytes(fields: &[&str]) -> anyhow::Result<usize> {
@@ -2920,6 +2966,14 @@ fn agent_state_snapshot_retained_bytes(
         checked_agent_state_string_capacity(&mut total, &row.kind)?;
         checked_agent_state_string_capacity(&mut total, &row.agent_session_id)?;
         checked_agent_state_string_capacity(&mut total, &row.transcript_path)?;
+        checked_agent_state_optional_string_capacity(&mut total, &row.task_prompt)?;
+        for stamp in [&row.execution_stamp, &row.task_prompt_execution_stamp]
+            .into_iter()
+            .flatten()
+        {
+            checked_agent_state_string_capacity(&mut total, &stamp.runtime_instance)?;
+            checked_agent_state_vec_allocation(&mut total, &stamp.ancestors)?;
+        }
     }
     checked_agent_state_vec_allocation(&mut total, &snapshot.statuslines)?;
     for row in &snapshot.statuslines {
@@ -3342,6 +3396,9 @@ pub struct HookSessionRow {
     pub agent_session_id: String,
     pub transcript_path: String,
     pub task_prompt: Option<String>,
+    pub updated_at: i64,
+    pub execution_stamp: Option<HookExecutionStamp>,
+    pub task_prompt_execution_stamp: Option<HookExecutionStamp>,
 }
 
 /// claude statusLine 표시 정보 한 행 (v17).
@@ -7613,6 +7670,23 @@ impl Db {
         agent_session_id: &str,
         transcript_path: &str,
     ) -> anyhow::Result<()> {
+        self.upsert_hook_session_with_execution(
+            session_key,
+            kind,
+            agent_session_id,
+            transcript_path,
+            None,
+        )
+    }
+
+    pub fn upsert_hook_session_with_execution(
+        &self,
+        session_key: &str,
+        kind: &str,
+        agent_session_id: &str,
+        transcript_path: &str,
+        execution_stamp: Option<&HookExecutionStamp>,
+    ) -> anyhow::Result<()> {
         let workspace_prefix = bounded_session_key_prefix(session_key)?;
         anyhow::ensure!(
             bounded_id_is_valid(agent_session_id)
@@ -7621,23 +7695,41 @@ impl Db {
                 && bounded_text_is_valid(transcript_path, BOUNDED_TEXT_BYTES_MAX),
             BOUNDED_WRITE_INPUT_INVALID
         );
-        bounded_input_row_bytes(&[session_key, kind, agent_session_id, transcript_path])?;
+        let execution_stamp = encode_hook_execution_stamp(execution_stamp)?;
+        bounded_input_row_bytes(&[
+            session_key,
+            kind,
+            agent_session_id,
+            transcript_path,
+            execution_stamp.as_deref().unwrap_or_default(),
+        ])?;
         let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
             .map_err(|_| anyhow::anyhow!(BOUNDED_WRITE_FAILED))?;
         tx.execute(
             "INSERT INTO agent_hook_sessions
-                 (session_key, kind, agent_session_id, transcript_path, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, CAST(strftime('%s','now') AS INTEGER))
+                 (session_key, kind, agent_session_id, transcript_path, updated_at, execution_stamp)
+                 VALUES (?1, ?2, ?3, ?4, CAST(strftime('%s','now') AS INTEGER), ?5)
                  ON CONFLICT(session_key) DO UPDATE SET
                    task_prompt = CASE
                      WHEN agent_hook_sessions.kind = excluded.kind
                       AND agent_hook_sessions.agent_session_id = excluded.agent_session_id
                      THEN agent_hook_sessions.task_prompt ELSE NULL END,
+                   task_prompt_execution_stamp = CASE
+                     WHEN agent_hook_sessions.kind = excluded.kind
+                      AND agent_hook_sessions.agent_session_id = excluded.agent_session_id
+                     THEN agent_hook_sessions.task_prompt_execution_stamp ELSE NULL END,
                    kind = excluded.kind,
                    agent_session_id = excluded.agent_session_id,
                    transcript_path = excluded.transcript_path,
+                   execution_stamp = excluded.execution_stamp,
                    updated_at = excluded.updated_at",
-            rusqlite::params![session_key, kind, agent_session_id, transcript_path],
+            rusqlite::params![
+                session_key,
+                kind,
+                agent_session_id,
+                transcript_path,
+                execution_stamp
+            ],
         )
         .map_err(|_| anyhow::anyhow!(BOUNDED_WRITE_FAILED))?;
         evict_hook_state_prefix_overflow(
@@ -7652,39 +7744,72 @@ impl Db {
         Ok(())
     }
 
-    /// Store only the prompt observed by this pane's Claude hook, never by shared transcript ID.
+    /// Store only the prompt observed by this exact pane/provider/native binding.
     pub fn record_hook_task_prompt(
         &self,
         session_key: &str,
+        kind: &str,
         agent_session_id: &str,
         prompt: &str,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
+        self.record_hook_task_prompt_with_execution(
+            session_key,
+            kind,
+            agent_session_id,
+            prompt,
+            None,
+        )
+    }
+
+    pub fn record_hook_task_prompt_with_execution(
+        &self,
+        session_key: &str,
+        kind: &str,
+        agent_session_id: &str,
+        prompt: &str,
+        execution_stamp: Option<&HookExecutionStamp>,
+    ) -> anyhow::Result<bool> {
         bounded_session_key_prefix(session_key)?;
         anyhow::ensure!(
-            bounded_id_is_valid(agent_session_id) && !prompt.is_empty(),
+            bounded_id_is_valid(agent_session_id)
+                && !kind.is_empty()
+                && bounded_text_is_valid(kind, BOUNDED_TEXT_BYTES_MAX)
+                && !prompt.is_empty(),
             BOUNDED_WRITE_INPUT_INVALID
         );
         // Normalize transport metadata before applying the existing 256-byte title budget.
         // Wrapped internal events must leave the previous pane task intact.
         let Some(prompt) = task_prompt_text(prompt) else {
-            return Ok(());
+            return Ok(false);
         };
+        anyhow::ensure!(!prompt.as_bytes().contains(&0), BOUNDED_WRITE_INPUT_INVALID);
+        // Truncate only the human preview, at a UTF-8 boundary. The original input
+        // and transcript are never rewritten by this title projection.
+        let mut end = prompt.len().min(256);
+        while !prompt.is_char_boundary(end) {
+            end -= 1;
+        }
+        let prompt = &prompt[..end];
         anyhow::ensure!(
-            bounded_text_is_valid(prompt.as_ref(), 256),
+            !prompt.is_empty() && bounded_text_is_valid(prompt, 256),
             BOUNDED_WRITE_INPUT_INVALID
         );
-        self.conn.execute(
-            "UPDATE agent_hook_sessions SET task_prompt = ?3
-             WHERE session_key = ?1 AND kind = 'claude' AND agent_session_id = ?2",
-            rusqlite::params![session_key, agent_session_id, prompt.as_ref()],
+        let execution_stamp = encode_hook_execution_stamp(execution_stamp)?;
+        let changed = self.conn.execute(
+            "UPDATE agent_hook_sessions SET task_prompt = ?4, task_prompt_execution_stamp = ?5,
+                 execution_stamp = COALESCE(?5, execution_stamp),
+                 updated_at = CAST(strftime('%s','now') AS INTEGER)
+             WHERE session_key = ?1 AND kind = ?2 AND agent_session_id = ?3",
+            rusqlite::params![session_key, kind, agent_session_id, prompt, execution_stamp],
         )?;
-        Ok(())
+        Ok(changed != 0)
     }
 
     /// hook이 보고한 바인딩 목록 (최근 24h — 죽은 세션 행이 영원히 남지 않게).
     pub fn list_hook_sessions(&self) -> anyhow::Result<Vec<HookSessionRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT session_key, kind, agent_session_id, transcript_path, task_prompt FROM agent_hook_sessions
+            "SELECT session_key, kind, agent_session_id, transcript_path, task_prompt, updated_at,
+                    execution_stamp, task_prompt_execution_stamp FROM agent_hook_sessions
              WHERE updated_at > strftime('%s','now') - 86400",
         )?;
         let rows = stmt
@@ -7695,6 +7820,11 @@ impl Db {
                     agent_session_id: r.get(2)?,
                     transcript_path: r.get(3)?,
                     task_prompt: r.get(4)?,
+                    updated_at: r.get(5)?,
+                    execution_stamp: read_hook_execution_stamp(r, 6)
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    task_prompt_execution_stamp: read_hook_execution_stamp(r, 7)
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -7765,6 +7895,9 @@ impl Db {
                     )?
                     .to_owned(),
                     task_prompt: bounded_optional_text(row, 4, 256)?.map(str::to_owned),
+                    updated_at: bounded_integer(row, 5)?,
+                    execution_stamp: read_hook_execution_stamp(row, 6)?,
+                    task_prompt_execution_stamp: read_hook_execution_stamp(row, 7)?,
                 });
             }
         }
@@ -8827,6 +8960,9 @@ impl Db {
                     )?
                     .to_owned(),
                     task_prompt: bounded_optional_text(row, 4, 256)?.map(str::to_owned),
+                    updated_at: bounded_integer(row, 5)?,
+                    execution_stamp: read_hook_execution_stamp(row, 6)?,
+                    task_prompt_execution_stamp: read_hook_execution_stamp(row, 7)?,
                 });
             }
             result
@@ -15333,6 +15469,294 @@ mod tests {
     }
 
     #[test]
+    fn independent_hook_task_prompt_persists_each_provider_through_bounded_snapshot() {
+        let db = Db::open_in_memory().unwrap();
+        let workspace = db.create_workspace("hook-provider-titles").unwrap();
+        for (pane, kind) in [(1, "claude"), (2, "codex"), (3, "grok"), (4, "kimi")] {
+            let key = format!("{workspace}:{pane}");
+            db.upsert_hook_session(&key, kind, "same-native", "/tmp/shared.jsonl")
+                .unwrap();
+            let prompt = format!("{kind} 작업을 고쳐");
+            db.record_hook_task_prompt(&key, kind, "same-native", &prompt)
+                .unwrap();
+            let row = db
+                .apply_agent_state_job(&AgentStateJob::projection(&workspace))
+                .unwrap()
+                .hook_sessions
+                .into_iter()
+                .find(|row| row.session_key == key)
+                .unwrap();
+            assert_eq!(row.task_prompt.as_deref(), Some(prompt.as_str()), "{kind}");
+        }
+    }
+
+    #[test]
+    fn independent_hook_task_prompt_updates_long_korean_at_utf8_byte_boundaries() {
+        let db = Db::open_in_memory().unwrap();
+        let workspace = db.create_workspace("hook-long-titles").unwrap();
+        let key = format!("{workspace}:1");
+        db.upsert_hook_session(&key, "claude", "native", "/tmp/native.jsonl")
+            .unwrap();
+        db.record_hook_task_prompt(&key, "claude", "native", "old task")
+            .unwrap();
+        for (prompt, expected) in [
+            ("a".repeat(256), "a".repeat(256)),
+            ("a".repeat(257), "a".repeat(256)),
+            (
+                format!("{}a", "가".repeat(85)),
+                format!("{}a", "가".repeat(85)),
+            ),
+            ("가".repeat(160), "가".repeat(85)),
+            (
+                format!("{}😀", "가".repeat(84)),
+                format!("{}😀", "가".repeat(84)),
+            ),
+            (format!("{}😀", "가".repeat(85)), "가".repeat(85)),
+        ] {
+            let original = prompt.clone();
+            db.record_hook_task_prompt(&key, "claude", "native", &prompt)
+                .unwrap();
+            let row = db
+                .list_hook_sessions_for_prefix_bounded(&format!("{workspace}:"), 1)
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert_eq!(row.task_prompt.as_deref(), Some(expected.as_str()));
+            assert!(expected.len() <= 256);
+            assert_eq!(prompt, original);
+        }
+        assert!(
+            db.record_hook_task_prompt(&key, "claude", "native", &format!("{}\0", "a".repeat(300)))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn independent_hook_task_prompt_requires_exact_provider_native_and_pane() {
+        let db = Db::open_in_memory().unwrap();
+        let workspace = db.create_workspace("hook-exact-provider").unwrap();
+        let first = format!("{workspace}:1");
+        let second = format!("{workspace}:2");
+        for key in [&first, &second] {
+            db.upsert_hook_session(key, "codex", "shared-native", "/tmp/native.jsonl")
+                .unwrap();
+            assert!(
+                db.record_hook_task_prompt(key, "codex", "shared-native", "current task")
+                    .unwrap()
+            );
+        }
+        for (key, kind, native) in [
+            (first.as_str(), "claude", "shared-native"),
+            (first.as_str(), "grok", "shared-native"),
+            (first.as_str(), "kimi", "shared-native"),
+            (first.as_str(), "codex", "old-native"),
+            ("missing-workspace:1", "codex", "shared-native"),
+        ] {
+            assert!(
+                !db.record_hook_task_prompt(key, kind, native, "stale task")
+                    .unwrap()
+            );
+        }
+        assert!(
+            db.record_hook_task_prompt(&first, "codex", "shared-native", "first pane task")
+                .unwrap()
+        );
+        let rows = db.list_hook_sessions().unwrap();
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.session_key == first)
+                .unwrap()
+                .task_prompt
+                .as_deref(),
+            Some("first pane task")
+        );
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.session_key == second)
+                .unwrap()
+                .task_prompt
+                .as_deref(),
+            Some("current task")
+        );
+    }
+
+    #[test]
+    fn independent_hook_execution_stamps_preserve_prompt_owner_and_count_retained_heap() {
+        use deppy_core::process_identity::{ProcessBirth, ProcessIdentity};
+        let stamp = |pid| HookExecutionStamp {
+            runtime_instance: "isolated-runtime".to_owned(),
+            ancestors: vec![ProcessIdentity {
+                pid,
+                birth: ProcessBirth {
+                    seconds: 100,
+                    microseconds: 1,
+                },
+            }],
+        };
+        let db = Db::open_in_memory().unwrap();
+        let workspace = db.create_workspace("hook-execution-stamps").unwrap();
+        let key = format!("{workspace}:1");
+        let old = stamp(10);
+        let new = stamp(20);
+        db.upsert_hook_session_with_execution(
+            &key,
+            "codex",
+            "native",
+            "/tmp/native.jsonl",
+            Some(&old),
+        )
+        .unwrap();
+        assert!(
+            db.record_hook_task_prompt_with_execution(
+                &key,
+                "codex",
+                "native",
+                "old task",
+                Some(&old)
+            )
+            .unwrap()
+        );
+        db.upsert_hook_session_with_execution(
+            &key,
+            "codex",
+            "native",
+            "/tmp/native.jsonl",
+            Some(&new),
+        )
+        .unwrap();
+        let snapshot = db
+            .apply_agent_state_job(&AgentStateJob::projection(&workspace))
+            .unwrap();
+        let row = &snapshot.hook_sessions[0];
+        assert_eq!(row.execution_stamp.as_ref(), Some(&new));
+        assert_eq!(row.task_prompt_execution_stamp.as_ref(), Some(&old));
+        assert_eq!(row.task_prompt.as_deref(), Some("old task"));
+        let expected_heap = row.task_prompt.as_ref().unwrap().capacity()
+            + row
+                .execution_stamp
+                .as_ref()
+                .unwrap()
+                .runtime_instance
+                .capacity()
+            + row.execution_stamp.as_ref().unwrap().ancestors.capacity()
+                * std::mem::size_of::<ProcessIdentity>()
+            + row
+                .task_prompt_execution_stamp
+                .as_ref()
+                .unwrap()
+                .runtime_instance
+                .capacity()
+            + row
+                .task_prompt_execution_stamp
+                .as_ref()
+                .unwrap()
+                .ancestors
+                .capacity()
+                * std::mem::size_of::<ProcessIdentity>();
+        let mut without_metadata = snapshot.clone();
+        without_metadata.hook_sessions[0].task_prompt = None;
+        without_metadata.hook_sessions[0].execution_stamp = None;
+        without_metadata.hook_sessions[0].task_prompt_execution_stamp = None;
+        assert_eq!(
+            snapshot.retained_bytes() - without_metadata.retained_bytes(),
+            expected_heap
+        );
+        assert!(
+            db.record_hook_task_prompt_with_execution(
+                &key,
+                "codex",
+                "native",
+                "old task",
+                Some(&new)
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            db.list_hook_sessions().unwrap()[0]
+                .task_prompt_execution_stamp
+                .as_ref(),
+            Some(&new)
+        );
+        db.upsert_hook_session_with_execution(
+            &key,
+            "codex",
+            "new-native",
+            "/tmp/new.jsonl",
+            Some(&new),
+        )
+        .unwrap();
+        let row = db
+            .list_hook_sessions_for_prefix_bounded(&format!("{workspace}:"), 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(row.task_prompt, None);
+        assert_eq!(row.task_prompt_execution_stamp, None);
+    }
+
+    #[test]
+    fn independent_hook_execution_stamp_reads_reject_oversized_or_invalid_json() {
+        let db = Db::open_in_memory().unwrap();
+        let workspace = db.create_workspace("hook-stamp-read-limits").unwrap();
+        let key = format!("{workspace}:1");
+        db.upsert_hook_session(&key, "codex", "native", "/tmp/native.jsonl")
+            .unwrap();
+        db.conn
+            .pragma_update(None, "ignore_check_constraints", true)
+            .unwrap();
+        for field in ["execution_stamp", "task_prompt_execution_stamp"] {
+            for invalid in ["x".repeat(4097), "{}".to_owned()] {
+                db.conn
+                    .execute(
+                        &format!("UPDATE agent_hook_sessions SET {field}=?1 WHERE session_key=?2"),
+                        (&invalid, &key),
+                    )
+                    .unwrap();
+                assert!(
+                    db.list_hook_sessions_for_prefix_bounded(&format!("{workspace}:"), 1)
+                        .is_err()
+                );
+                assert!(
+                    db.apply_agent_state_job(&AgentStateJob::projection(&workspace))
+                        .is_err()
+                );
+                assert!(db.list_hook_sessions().is_err());
+            }
+            db.conn
+                .execute(
+                    &format!("UPDATE agent_hook_sessions SET {field}=NULL WHERE session_key=?1"),
+                    [&key],
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn independent_hook_execution_migration_keeps_legacy_prompts_unverified_after_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "deppy-hook-stamp-migration-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let legacy = rusqlite::Connection::open(&path).unwrap();
+        for migration in &MIGRATIONS[..MIGRATIONS.len() - 1] {
+            legacy.execute_batch(migration).unwrap();
+        }
+        legacy
+            .pragma_update(None, "user_version", (MIGRATIONS.len() - 1) as i64)
+            .unwrap();
+        legacy.execute("INSERT INTO agent_hook_sessions (session_key,kind,agent_session_id,transcript_path,task_prompt,updated_at) VALUES ('workspace:1','codex','native','/tmp/native.jsonl','legacy task',CAST(strftime('%s','now') AS INTEGER))", []).unwrap();
+        drop(legacy);
+        let db = Db::open(&path).unwrap();
+        let row = db.list_hook_sessions().unwrap().pop().unwrap();
+        assert_eq!(row.task_prompt.as_deref(), Some("legacy task"));
+        assert_eq!(row.execution_stamp, None);
+        assert_eq!(row.task_prompt_execution_stamp, None);
+        assert_eq!(Db::read_user_version(&db.conn).unwrap(), MIGRATIONS.len());
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn 같은_native_id를_공유해도_hook_작업_입력은_pane별로_분리된다() {
         let db = Db::open_in_memory().unwrap();
         let workspace = db.create_workspace("hook-prompts").unwrap();
@@ -15342,9 +15766,9 @@ mod tests {
             db.upsert_hook_session(key, "claude", "shared", "/tmp/shared.jsonl")
                 .unwrap();
         }
-        db.record_hook_task_prompt(&first, "shared", "첫 작업")
+        db.record_hook_task_prompt(&first, "claude", "shared", "첫 작업")
             .unwrap();
-        db.record_hook_task_prompt(&second, "shared", "둘째 작업")
+        db.record_hook_task_prompt(&second, "claude", "shared", "둘째 작업")
             .unwrap();
         // 일반 hook 갱신은 현재 pane의 미리보기를 지우지 않는다.
         db.upsert_hook_session(&first, "claude", "shared", "/tmp/shared.jsonl")
@@ -15361,7 +15785,7 @@ mod tests {
         // 과거 ID가 보낸 지연 hook은 새 바인딩의 작업 제목을 다시 덮을 수 없다.
         db.upsert_hook_session(&first, "claude", "forked", "/tmp/forked.jsonl")
             .unwrap();
-        db.record_hook_task_prompt(&first, "shared", "오래된 작업")
+        db.record_hook_task_prompt(&first, "claude", "shared", "오래된 작업")
             .unwrap();
         let first_row = db
             .list_hook_sessions()
@@ -15382,6 +15806,7 @@ mod tests {
             .unwrap();
         db.record_hook_task_prompt(
             &key,
+            "claude",
             "native",
             "<pasted_content id=\"e89a\">실제 작업을 고쳐",
         )
@@ -15392,6 +15817,7 @@ mod tests {
         );
         db.record_hook_task_prompt(
             &key,
+            "claude",
             "native",
             "<pasted_content id='x'>첫 지시</pasted_content>\n추가 지시",
         )
@@ -15403,7 +15829,7 @@ mod tests {
         // Transport bytes must not consume the human title budget.
         let wrapped = format!("<pasted_content id='{}'>실제 작업을 고쳐", "x".repeat(240));
         assert!(wrapped.len() > 256);
-        db.record_hook_task_prompt(&key, "native", &wrapped)
+        db.record_hook_task_prompt(&key, "claude", "native", &wrapped)
             .unwrap();
         for internal in [
             "<task-notification>internal",
@@ -15412,7 +15838,7 @@ mod tests {
             "<pasted_content id='x'><task-notification>internal</task-notification></pasted_content>",
         ] {
             assert!(!task_prompt_is_displayable(internal));
-            db.record_hook_task_prompt(&key, "native", internal)
+            db.record_hook_task_prompt(&key, "claude", "native", internal)
                 .unwrap();
             assert_eq!(
                 db.list_hook_sessions().unwrap()[0].task_prompt.as_deref(),
@@ -15428,7 +15854,7 @@ mod tests {
         let key = format!("{workspace}:4");
         db.upsert_hook_session(&key, "claude", "native", "/tmp/native.jsonl")
             .unwrap();
-        db.record_hook_task_prompt(&key, "native", "실제 진행 중인 작업")
+        db.record_hook_task_prompt(&key, "claude", "native", "실제 진행 중인 작업")
             .unwrap();
 
         for internal in [
@@ -15436,7 +15862,7 @@ mod tests {
             "<agent-message from=\"subagent\"> [Subagent hand-back] internal",
             "Another Claude session sent a message: <agent-message from=\"subagent\"> internal",
         ] {
-            db.record_hook_task_prompt(&key, "native", internal)
+            db.record_hook_task_prompt(&key, "claude", "native", internal)
                 .unwrap();
             assert!(!task_prompt_is_displayable(internal));
         }
@@ -16690,6 +17116,9 @@ mod tests {
                 agent_session_id: marker.to_owned(),
                 transcript_path: marker.to_owned(),
                 task_prompt: Some(marker.to_owned()),
+                updated_at: 1,
+                execution_stamp: None,
+                task_prompt_execution_stamp: None,
             }],
             statuslines: vec![StatuslineRow {
                 session_key: marker.to_owned(),
@@ -24026,7 +24455,7 @@ mod tests {
             assert_eq!(body.matches("bounded_snapshot_epoch(&tx)?").count(), 1);
         }
         for method in [
-            "upsert_hook_session",
+            "upsert_hook_session_with_execution",
             "set_agent_needs_input",
             "set_agent_turn_done",
             "clear_agent_turn_done",

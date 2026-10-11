@@ -13,7 +13,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use runtime::SessionId;
 
-use crate::agent_detect::{self, AgentBinding, AgentDisplay, AgentKind, RunningAgent};
+use crate::agent_detect::{
+    self, AgentBinding, AgentDisplay, AgentKind, RunningAgent, VerifiedHookBinding,
+};
 use crate::agent_transcript::{self, AgentActivity, MAX_RECENT_TRANSCRIPT_TURNS, TranscriptTurn};
 
 const BINDING_INTERVAL: Duration = Duration::from_millis(2500);
@@ -54,7 +56,7 @@ fn tier_intervals(hidden: bool) -> (Duration, Duration) {
 type InputSnapshot = (
     u64,
     Vec<(SessionId, u32)>,
-    HashMap<SessionId, AgentBinding>,
+    HashMap<SessionId, VerifiedHookBinding>,
     bool,
 );
 
@@ -110,7 +112,7 @@ impl DetectInput {
         &self,
         epoch: u64,
         sessions: Vec<(SessionId, u32)>,
-        overrides: &HashMap<SessionId, AgentBinding>,
+        overrides: &HashMap<SessionId, VerifiedHookBinding>,
         hidden: bool,
     ) -> Result<(), DetectInputError> {
         let limit_error = if sessions.len() > MAX_DETECT_SESSIONS {
@@ -420,7 +422,7 @@ trait DetectionBackend: Send + 'static {
     fn binding_pass(
         &mut self,
         sessions: &[(SessionId, u32)],
-        overrides: &HashMap<SessionId, AgentBinding>,
+        overrides: &HashMap<SessionId, VerifiedHookBinding>,
     ) -> BindingPass;
 
     fn activity_pass(
@@ -618,7 +620,7 @@ impl DetectionBackend for ProductionBackend {
     fn binding_pass(
         &mut self,
         sessions: &[(SessionId, u32)],
-        overrides: &HashMap<SessionId, AgentBinding>,
+        overrides: &HashMap<SessionId, VerifiedHookBinding>,
     ) -> BindingPass {
         let detected = agent_detect::detect_cached(
             sessions,
@@ -1156,7 +1158,7 @@ mod tests {
         fn binding_pass(
             &mut self,
             sessions: &[(SessionId, u32)],
-            _overrides: &HashMap<SessionId, AgentBinding>,
+            _overrides: &HashMap<SessionId, VerifiedHookBinding>,
         ) -> BindingPass {
             let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
             if call == 0 {
@@ -1350,7 +1352,16 @@ mod tests {
     fn 동일_입력은_generation과_arc를_교체하지_않는다() {
         let input = DetectInput::new();
         let sessions = vec![(SessionId(1), 10)];
-        let overrides = HashMap::from([(SessionId(1), binding(SessionId(1)))]);
+        let overrides = HashMap::from([(
+            SessionId(1),
+            VerifiedHookBinding {
+                binding: binding(SessionId(1)),
+                execution: crate::agent_detect::AgentExecutionIdentity::fixture(
+                    AgentKind::Codex,
+                    10,
+                ),
+            },
+        )]);
         input
             .publish(3, sessions.clone(), &overrides, false)
             .expect("first publish");

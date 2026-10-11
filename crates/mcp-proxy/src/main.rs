@@ -505,6 +505,9 @@ fn run_hooks(args: &[String]) -> anyhow::Result<()> {
     let runtime_token = std::env::var("DEPPY_RUNTIME_ID").ok().filter(|token| {
         !token.is_empty() && token.len() <= 128 && !token.chars().any(char::is_control)
     });
+    let execution_stamp = runtime_token
+        .as_deref()
+        .and_then(deppy_core::process_identity::HookExecutionStamp::capture);
     let mut input = std::io::stdin().lock();
     let hook_read = hook_payload::read_classified(&mut input);
     let input_rejected = hook_read.rejected;
@@ -570,22 +573,59 @@ fn run_hooks(args: &[String]) -> anyhow::Result<()> {
             // 아래 (sid, path) 쌍이 성립하지 않아 바인딩이 하나도 기록되지 않았다.
             // 경로가 없을 때만 세션 id로 인덱스를 뒤진다 — 인덱스가 풀어주지 못하면
             // 바인딩하지 않는다(추측 경로로 묶으면 엉뚱한 세션 상태를 보여준다).
+            let explicit_provider = provider
+                .as_deref()
+                .filter(|kind| matches!(*kind, "claude" | "codex" | "grok" | "kimi" | "cursor"));
+            let mut binding = hook_binding(v)
+                .filter(|(kind, _, _)| explicit_provider.is_none_or(|provider| provider == *kind))
+                .map(|(kind, sid, path)| (kind, sid, path.to_owned()));
             if path.is_none()
+                && explicit_provider == Some("kimi")
                 && v.get("conversation_id").is_none()
                 && v.get("hookEventName").is_none()
                 && let Some(sid) = sid
                 && let Some(resolved) = kimi_transcript_path(sid)
             {
-                let _ = db.upsert_hook_session(&session_key, "kimi", sid, &resolved);
+                binding = Some(("kimi", sid, resolved));
             }
-            if let Some((kind, sid, path)) = hook_binding(v) {
-                let _ = db.upsert_hook_session(&session_key, kind, sid, path);
-            }
+            let prompt_provider = if let Some((kind, sid, path)) = binding {
+                db.upsert_hook_session_with_execution(
+                    &session_key,
+                    kind,
+                    sid,
+                    &path,
+                    execution_stamp.as_ref(),
+                )
+                .is_ok()
+                .then_some(kind)
+            } else if path.is_none() {
+                // A path-free prompt may update a pre-existing exact binding
+                // only when the installed hook command identifies its provider.
+                explicit_provider
+            } else {
+                None
+            };
             if event == "observe"
-                && v.get("hook_event_name").and_then(|x| x.as_str()) == Some("UserPromptSubmit")
-                && let (Some(sid), Some(prompt)) = (sid, v.get("prompt").and_then(|x| x.as_str()))
+                && v.get("hook_event_name")
+                    .or_else(|| v.get("hookEventName"))
+                    .and_then(|x| x.as_str())
+                    .is_some_and(|name| {
+                        name.replace('_', "")
+                            .eq_ignore_ascii_case("UserPromptSubmit")
+                    })
+                && let (Some(kind), Some(sid), Some(prompt)) = (
+                    prompt_provider,
+                    sid,
+                    v.get("prompt").and_then(|x| x.as_str()),
+                )
             {
-                let _ = db.record_hook_task_prompt(&session_key, sid, prompt);
+                let _ = db.record_hook_task_prompt_with_execution(
+                    &session_key,
+                    kind,
+                    sid,
+                    prompt,
+                    execution_stamp.as_ref(),
+                );
             }
         }
     }

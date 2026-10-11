@@ -39,6 +39,12 @@ impl<'de> Visitor<'de> for Shape {
 
     fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Value, E> {
         if matches!(self, Self::Preview) {
+            // Normalize transport/internal envelopes before consuming the human
+            // preview budget. The transient input still has the 8 MiB read cap;
+            // only the bounded preview is retained in the metadata object.
+            let Some(value) = storage::task_prompt_text(value) else {
+                return Ok(Value::Null);
+            };
             let mut preview = String::new();
             for c in value.chars() {
                 let c = if c.is_whitespace() || c.is_control() {

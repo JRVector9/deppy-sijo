@@ -9844,7 +9844,7 @@ struct AgentDetectInputSnapshot {
     epoch: u64,
     sessions: Vec<(runtime::SessionId, u32)>,
     hook_overrides:
-        std::collections::HashMap<runtime::SessionId, crate::agent_detect::AgentBinding>,
+        std::collections::HashMap<runtime::SessionId, crate::agent_detect::VerifiedHookBinding>,
     hidden: bool,
 }
 
@@ -10357,6 +10357,9 @@ pub struct App {
     /// 렌더 중 초당 수십 회가 된다. 캐시를 워커 입력에 재사용.
     last_hook_query: std::time::Instant,
     hook_overrides:
+        std::collections::HashMap<runtime::SessionId, crate::agent_detect::VerifiedHookBinding>,
+    /// Recent pane identities also protect attribution after a peer pane closes.
+    hook_binding_history:
         std::collections::HashMap<runtime::SessionId, crate::agent_detect::AgentBinding>,
     hook_task_prompts: std::collections::HashMap<runtime::SessionId, (String, String)>,
     fresh_hook_task_prompts: std::collections::HashMap<runtime::SessionId, (String, String)>,
@@ -10736,6 +10739,23 @@ fn display_for(
     display
 }
 
+fn clear_unbound_agent_activity(
+    info: &mut std::collections::HashMap<
+        (u64, runtime::SessionId),
+        crate::agent_detect::AgentDisplay,
+    >,
+    instance: u64,
+    bindings: &std::collections::HashMap<runtime::SessionId, crate::agent_detect::AgentBinding>,
+) {
+    for ((rt, session), display) in info {
+        if *rt == instance && !bindings.contains_key(session) {
+            display.last_agent_summary = None;
+            display.user_instruction = None;
+            display.context_pct = None;
+        }
+    }
+}
+
 /// 프로세스로 감지한 에이전트 종류를 표시 정보에 반영한다.
 fn merge_detected_kinds(
     info: &mut std::collections::HashMap<runtime::SessionId, crate::agent_detect::AgentDisplay>,
@@ -10805,28 +10825,106 @@ fn trusted_pane_task_prompt<'a>(
 ) -> Option<std::borrow::Cow<'a, str>> {
     let binding = bindings.get(&session)?;
     let (native_id, prompt) = prompts.get(&session)?;
-    (binding.kind == crate::agent_detect::AgentKind::Claude && binding.session_id == *native_id)
+    (binding.session_id == *native_id)
         .then(|| storage::task_prompt_text(prompt))
         .flatten()
 }
 
-/// Ignore hook rows inherited from a previous process: runtime SessionId can be reused.
+#[derive(Default)]
+struct PaneHookProjection {
+    history: std::collections::HashMap<runtime::SessionId, crate::agent_detect::AgentBinding>,
+    overrides:
+        std::collections::HashMap<runtime::SessionId, crate::agent_detect::VerifiedHookBinding>,
+    prompts: std::collections::HashMap<runtime::SessionId, (String, String)>,
+}
+
+/// Binding events and user prompts have independent execution ownership: a fresh
+/// SessionStart must not authorize a prompt retained from an older CLI execution.
+fn project_pane_hooks(
+    workspace_id: &str,
+    runtime_instance: u64,
+    runtime_token: &str,
+    kinds: &std::collections::HashMap<(u64, runtime::SessionId), crate::agent_detect::RunningAgent>,
+    rows: &[storage::HookSessionRow],
+) -> PaneHookProjection {
+    let prefix = format!("{workspace_id}:");
+    let mut projection = PaneHookProjection::default();
+    for row in rows {
+        let Some(session) = row
+            .session_key
+            .strip_prefix(&prefix)
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(runtime::SessionId)
+        else {
+            continue;
+        };
+        let Some(kind) = crate::agent_detect::kind_from_str(&row.kind) else {
+            continue;
+        };
+        let binding = crate::agent_detect::AgentBinding {
+            kind,
+            session_id: row.agent_session_id.clone(),
+            transcript: PathBuf::from(&row.transcript_path),
+        };
+        projection.history.insert(session, binding.clone());
+        let Some(running) = kinds.get(&(runtime_instance, session)) else {
+            continue;
+        };
+        let Some(execution) = running.execution.filter(|_| running.kind == kind) else {
+            continue;
+        };
+        let Some(verified) = row.execution_stamp.as_ref().and_then(|stamp| {
+            crate::agent_detect::VerifiedHookBinding::try_new(
+                binding,
+                execution,
+                stamp,
+                runtime_token,
+            )
+        }) else {
+            continue;
+        };
+        if let Some(prompt) = row.task_prompt.as_ref()
+            && row
+                .task_prompt_execution_stamp
+                .as_ref()
+                .is_some_and(|stamp| execution.accepts_hook_stamp(stamp, runtime_token))
+        {
+            projection
+                .prompts
+                .insert(session, (row.agent_session_id.clone(), prompt.clone()));
+        }
+        projection.overrides.insert(session, verified);
+    }
+    projection
+}
+
+fn retain_current_hook_prompts(
+    prompts: &mut std::collections::HashMap<runtime::SessionId, (String, String)>,
+    overrides: &std::collections::HashMap<
+        runtime::SessionId,
+        crate::agent_detect::VerifiedHookBinding,
+    >,
+    kinds: &std::collections::HashMap<runtime::SessionId, crate::agent_detect::RunningAgent>,
+) {
+    prompts.retain(|session, (native_id, _)| {
+        overrides.get(session).is_some_and(|verified| {
+            verified.binding.session_id == *native_id
+                && kinds.get(session).is_some_and(|running| {
+                    running.kind == verified.binding.kind
+                        && running.execution == Some(verified.execution)
+                        && verified.execution.is_current()
+                })
+        })
+    });
+}
+
+/// Inputs have already passed both binding and prompt execution ownership checks.
 fn refresh_fresh_hook_prompts(
     observed: &mut std::collections::HashMap<runtime::SessionId, (String, String)>,
     fresh: &mut std::collections::HashMap<runtime::SessionId, (String, String)>,
     next: std::collections::HashMap<runtime::SessionId, (String, String)>,
-    had_projection: bool,
 ) {
-    if had_projection {
-        fresh.retain(|session, value| next.get(session) == Some(value));
-        for (session, value) in &next {
-            if observed.get(session) != Some(value) {
-                fresh.insert(*session, value.clone());
-            }
-        }
-    } else {
-        fresh.clear();
-    }
+    *fresh = next.clone();
     *observed = next;
 }
 
@@ -10837,8 +10935,7 @@ fn persisted_pane_task_prompt<'a>(
     forked_from: Option<&str>,
 ) -> Option<std::borrow::Cow<'a, str>> {
     let row = saved.get(pane_id)?;
-    (binding.kind == crate::agent_detect::AgentKind::Claude
-        && row.kind == "claude"
+    (row.kind == agent_kind_id(binding.kind)
         && (row.session_id == binding.session_id || forked_from == Some(row.session_id.as_str())))
     .then_some(row.task_prompt.as_deref())
     .flatten()
@@ -10854,10 +10951,7 @@ fn apply_pane_task_prompts(
 ) {
     if !hook_projection_ready {
         for (session, display) in displays {
-            if bindings
-                .get(session)
-                .is_some_and(|binding| binding.kind == crate::agent_detect::AgentKind::Claude)
-            {
+            if bindings.contains_key(session) {
                 display.last_agent_summary = None;
                 display.user_instruction = trusted_pane_task_prompt(*session, bindings, prompts)
                     .map(std::borrow::Cow::into_owned);
@@ -10882,15 +10976,27 @@ fn apply_pane_task_prompts(
     }
 }
 
-/// 저장된 동일 Claude 대화를 둘 이상의 pane이 복원하면 첫 pane만 원본 ID를
-/// 유지하고 나머지는 `--fork-session`으로 독립시킨다. 이미 다른 pane에서 실행
-/// 중이면 pane 정렬 순서와 관계없이 새 복원 쪽을 fork한다.
-fn fork_shared_claude_resume(
+fn ambiguous_saved_codex_binding(
+    target: &storage::AgentSessionRow,
+    saved: &std::collections::HashMap<String, storage::AgentSessionRow>,
+) -> bool {
+    target.kind == "codex"
+        && saved.values().any(|row| {
+            row.pane_id != target.pane_id
+                && row.kind == target.kind
+                && row.session_id == target.session_id
+        })
+}
+
+/// Restore independent conversations: Claude uses `--fork-session`, Codex uses `fork`.
+/// Only the first pane keeps the source ID. If another pane is already running,
+/// the new resume forks regardless of pane order.
+fn fork_shared_native_resume(
     target: &storage::AgentSessionIdentity,
     saved: &std::collections::HashMap<String, storage::AgentSessionRow>,
     other_running: bool,
 ) -> bool {
-    target.kind == "claude"
+    matches!(target.kind.as_str(), "claude" | "codex")
         && (other_running
             || saved.values().any(|row| {
                 row.kind == target.kind
@@ -12407,11 +12513,10 @@ fn git_tab_list_width(body_width: f32) -> f32 {
     (body_width * 0.4).clamp(GIT_TAB_LIST_MIN_WIDTH, FIXED)
 }
 
-/// 이력 보조 본문 좌측 카드 목록 폭 — `git_tab_list_width`와 같은 규칙(스펙 §2-1)이지만
-/// 카드가 git 파일 행보다 정보가 많아 하한을 조금 크게 잡는다(220 vs 180).
+/// Claude 이력 구조의 기본 목록 폭은 32%, 상세는 나머지다.
+/// 저장된 split 폭은 aux_split_width에서 우선하며 목록 하한은 220pt다.
 pub(crate) fn history_tab_list_width(body_width: f32) -> f32 {
-    const FIXED: f32 = 360.0;
-    (body_width * 0.4).clamp(HISTORY_TAB_LIST_MIN_WIDTH, FIXED)
+    (body_width * 0.32).max(HISTORY_TAB_LIST_MIN_WIDTH)
 }
 
 /// 이력·Git 우측 상세(원문/diff)가 완전히 가려지지 않게 남겨두는 최소 폭 — 사용자가
@@ -16408,6 +16513,7 @@ impl App {
             }),
             last_hook_query: std::time::Instant::now(),
             hook_overrides: std::collections::HashMap::new(),
+            hook_binding_history: std::collections::HashMap::new(),
             hook_task_prompts: std::collections::HashMap::new(),
             fresh_hook_task_prompts: std::collections::HashMap::new(),
             hook_projection_ready: false,
@@ -17193,7 +17299,7 @@ impl App {
         let now = deppy_core::time::unix_secs_i64();
         let instance = self.active.runtime_instance;
         let shared_transcripts =
-            shared_agent_transcript_sessions(&self.agent_bindings, &self.hook_overrides);
+            shared_agent_transcript_sessions(&self.agent_bindings, &self.hook_binding_history);
         let mut rows = Vec::new();
         for (session, recent) in turns {
             let Some(binding) = self.agent_bindings.get(session) else {
@@ -17401,7 +17507,7 @@ impl App {
         }
         let now = deppy_core::time::unix_secs_i64();
         let shared_transcripts =
-            shared_agent_transcript_sessions(&self.agent_bindings, &self.hook_overrides);
+            shared_agent_transcript_sessions(&self.agent_bindings, &self.hook_binding_history);
         let mut rows = Vec::new();
         for (session, binding) in &self.agent_bindings {
             if shared_transcripts.contains(session) {
@@ -18106,35 +18212,19 @@ impl App {
         };
         match section {
             crate::agent_state_worker::AgentStateSection::Hooks => {
-                self.hook_overrides = snapshot
-                    .hook_sessions
-                    .iter()
-                    .filter_map(|row| {
-                        Some((
-                            session_id(&row.session_key)?,
-                            crate::agent_detect::AgentBinding {
-                                kind: crate::agent_detect::kind_from_str(&row.kind)?,
-                                session_id: row.agent_session_id.clone(),
-                                transcript: PathBuf::from(&row.transcript_path),
-                            },
-                        ))
-                    })
-                    .collect();
-                let new_prompts: std::collections::HashMap<_, _> = snapshot
-                    .hook_sessions
-                    .iter()
-                    .filter_map(|row| {
-                        Some((
-                            session_id(&row.session_key)?,
-                            (row.agent_session_id.clone(), row.task_prompt.clone()?),
-                        ))
-                    })
-                    .collect();
+                let hooks = project_pane_hooks(
+                    &self.agent_state_scope.workspace_id,
+                    self.active.runtime_instance,
+                    self.active.runtime.instance_token(),
+                    &self.agent_kinds,
+                    &snapshot.hook_sessions,
+                );
+                self.hook_binding_history = hooks.history;
+                self.hook_overrides = hooks.overrides;
                 refresh_fresh_hook_prompts(
                     &mut self.hook_task_prompts,
                     &mut self.fresh_hook_task_prompts,
-                    new_prompts,
-                    self.hook_projection_ready,
+                    hooks.prompts,
                 );
                 self.hook_projection_ready = true;
                 let prompt_sync_needed = self.active.workspace_ui.mux().is_some_and(|mux| {
@@ -18495,13 +18585,13 @@ impl App {
                 .unwrap_or_default();
             let other_running = self.agent_bindings.iter().any(|(session, binding)| {
                 *session != result.session
-                    && binding.kind == crate::agent_detect::AgentKind::Claude
+                    && agent_kind_id(binding.kind) == result.identity.kind
                     && binding.session_id == result.identity.session_id
             });
-            let fork_claude =
-                fork_shared_claude_resume(&result.identity, &self.restore_agents, other_running);
+            let fork_native =
+                fork_shared_native_resume(&result.identity, &self.restore_agents, other_running);
             let command = match result.identity.kind.as_str() {
-                "claude" if fork_claude => format!(
+                "claude" if fork_native => format!(
                     "{cd_prefix}claude --fork-session --resume {}\n",
                     result.identity.session_id
                 ),
@@ -18509,6 +18599,9 @@ impl App {
                     "{cd_prefix}claude --resume {}\n",
                     result.identity.session_id
                 ),
+                "codex" if fork_native => {
+                    format!("{cd_prefix}codex fork {}\n", result.identity.session_id)
+                }
                 "codex" => format!("{cd_prefix}codex resume {}\n", result.identity.session_id),
                 "grok" => format!("{cd_prefix}grok --resume {}\n", result.identity.session_id),
                 _ => continue,
@@ -18524,7 +18617,7 @@ impl App {
                 .is_ok()
             {
                 self.resumed_panes.insert(result.pane_id.clone());
-                if fork_claude {
+                if fork_native {
                     self.forked_resume_origins
                         .insert(result.pane_id.clone(), result.identity.session_id.clone());
                 }
@@ -18756,6 +18849,7 @@ impl App {
             agent_hook_query_due(sessions.len(), self.last_hook_query.elapsed());
         if sessions.is_empty() {
             self.hook_overrides.clear();
+            self.hook_binding_history.clear();
             self.hook_task_prompts.clear();
             self.fresh_hook_task_prompts.clear();
             self.hook_projection_ready = false;
@@ -18838,6 +18932,9 @@ impl App {
             self.agent_info.retain(|(rt, session), _| {
                 *rt != instance || live_detect_sessions.contains(session)
             });
+            if let Some(bindings) = latest_bindings.as_ref() {
+                clear_unbound_agent_activity(&mut self.agent_info, instance, bindings);
+            }
             for (session, mut display) in info {
                 if let Some(previous) = self.agent_info.get(&(instance, session)) {
                     let same_binding = latest_bindings.as_ref().is_none_or(|bindings| {
@@ -18849,6 +18946,14 @@ impl App {
             }
         }
         if let Some(kinds) = latest_kinds {
+            // A pane may restart the same native conversation between Hooks polls.
+            // Its prior prompt remains cached only while its authoring execution matches.
+            retain_current_hook_prompts(&mut self.hook_task_prompts, &self.hook_overrides, &kinds);
+            retain_current_hook_prompts(
+                &mut self.fresh_hook_task_prompts,
+                &self.hook_overrides,
+                &kinds,
+            );
             let previous_for_instance: std::collections::HashMap<
                 runtime::SessionId,
                 crate::agent_detect::RunningAgent,
@@ -18926,6 +19031,17 @@ impl App {
                     .map(|(session, running)| ((instance, session), running)),
             );
         }
+        let has_new_bindings = latest_bindings.is_some();
+        if should_process_agent_bindings(
+            has_new_bindings,
+            self.restore_loaded_for.as_deref(),
+            &self.active.id,
+            bounded_refresh_due,
+        ) {
+            let bindings = latest_bindings.unwrap_or_else(|| self.agent_bindings.clone());
+            self.agent_bindings = bindings.clone();
+            self.process_agent_bindings(&bindings);
+        }
         // 에이전트 표시정보 최종본(claude는 statusLine으로 effort/model/context 병합) →
         // WorkspaceUi. statuslines가 매 1s 갱신되므로 매 poll에서 병합해 최신을 반영한다.
         self.push_agent_display();
@@ -18969,17 +19085,6 @@ impl App {
                 crate::agent_state_worker::AgentStateSection::Attention,
                 AppAgentStateProjectionKind::Attention,
             );
-        }
-        let has_new_bindings = latest_bindings.is_some();
-        if should_process_agent_bindings(
-            has_new_bindings,
-            self.restore_loaded_for.as_deref(),
-            &self.active.id,
-            bounded_refresh_due,
-        ) {
-            let bindings = latest_bindings.unwrap_or_else(|| self.agent_bindings.clone());
-            self.agent_bindings = bindings.clone();
-            self.process_agent_bindings(&bindings);
         }
         if let Some(turns) = latest_work_turns {
             self.stage_detected_work_history(&turns);
@@ -19037,7 +19142,7 @@ impl App {
         apply_pane_task_prompts(
             &mut merged,
             &self.agent_bindings,
-            &self.hook_overrides,
+            &self.hook_binding_history,
             &prompts,
             self.hook_projection_ready,
         );
@@ -19445,6 +19550,17 @@ impl App {
                         continue;
                     }
                     AutoResumeDecision::Resume => {}
+                }
+                if ambiguous_saved_codex_binding(&saved, &self.restore_agents) {
+                    // Legacy cwd inference can have assigned someone else's thread to both panes.
+                    // Leave the restored terminals idle instead of executing that checkpoint twice.
+                    self.resumed_panes.insert(pane_key);
+                    tracing::warn!(
+                        kind = "agent_resume",
+                        error_code = "ambiguous_codex_checkpoint",
+                        "automatic resume skipped an ambiguous saved Codex binding"
+                    );
+                    continue;
                 }
                 if !persisted_agent_kind_is_resumable(&saved.kind) {
                     self.resumed_panes.insert(pane_key);
@@ -19907,9 +20023,8 @@ impl App {
 
     /// 이력 본문 — 좌 카드 목록 / 우 원문 마스터-디테일(2026-08-15 Task 10, 스펙 §2-1).
     /// **세션 pane의 body rect 그대로**에 그린다. 탭 스트립은 WorkspaceUi가 이미 잘라낸
-    /// 뒤 넘긴 rect라, 여기서 헤더 높이를 다시 빼지 않는다. 폭 규칙·구분선 관례는
-    /// `render_git_tab_body`와 같다 — 카드가 git 파일 행보다 정보가 많아 하한만 다르다
-    /// (`history_tab_list_width`).
+    /// 뒤 넘긴 rect라, 여기서 헤더 높이를 다시 빼지 않는다. 구분선 관례는 Git과
+    /// 같고 기본 폭은 `history_tab_list_width`의 목록32%/상세68%를 사용한다.
     fn render_work_history_tab_body(
         &mut self,
         ui: &mut egui::Ui,
@@ -19960,7 +20075,8 @@ impl App {
             ""
         };
 
-        let shared = shared_agent_transcript_sessions(&self.agent_bindings, &self.hook_overrides);
+        let shared =
+            shared_agent_transcript_sessions(&self.agent_bindings, &self.hook_binding_history);
         let mux = self.active.workspace_ui.mux();
         let panes: std::collections::HashMap<_, _> = mux
             .into_iter()
@@ -24367,6 +24483,7 @@ impl App {
         let mut old = std::mem::replace(&mut self.active, new_active);
         self.sync_session_aux_scope();
         self.hook_overrides.clear();
+        self.hook_binding_history.clear();
         self.hook_task_prompts.clear();
         self.fresh_hook_task_prompts.clear();
         self.hook_projection_ready = false;
@@ -33675,7 +33792,7 @@ impl eframe::App for App {
         // 작업인지 판별할 수 없다. 각 행에는 중복된 작업 문구 대신 고유한 pane 번호를
         // 표시한다. 사용자 지정 제목은 session_headline이 그대로 우선한다.
         let shared_transcripts =
-            shared_agent_transcript_sessions(&self.agent_bindings, &self.hook_overrides);
+            shared_agent_transcript_sessions(&self.agent_bindings, &self.hook_binding_history);
         let mut shared_ordinal = 0usize;
         for entry in &mut terminal_sessions {
             if entry.session.is_some_and(|session| {
@@ -43775,26 +43892,506 @@ mod tests {
     }
 
     #[test]
-    fn 재시작_전_hook_기록은_새_runtime_id의_작업_제목을_덮지_않는다() {
+    fn independent_verified_first_hook_prompt_is_visible_before_the_second_poll() {
         let session = runtime::SessionId(2);
         let mut observed = HashMap::new();
         let mut fresh = HashMap::new();
-        refresh_fresh_hook_prompts(
-            &mut observed,
-            &mut fresh,
-            HashMap::from([(session, ("shared".into(), "옛 pane 작업".into()))]),
-            false,
+        let verified = HashMap::from([(
+            session,
+            ("native-current".into(), "빠르게 보낸 첫 작업".into()),
+        )]);
+        refresh_fresh_hook_prompts(&mut observed, &mut fresh, verified.clone());
+        assert_eq!(fresh.get(&session), verified.get(&session));
+        for _ in 0..3 {
+            refresh_fresh_hook_prompts(&mut observed, &mut fresh, verified.clone());
+            assert_eq!(fresh.get(&session), verified.get(&session));
+        }
+    }
+
+    #[test]
+    fn independent_db_hook_projection_accepts_first_verified_prompt_for_each_provider() {
+        use crate::agent_detect::{AgentDisplay, AgentExecutionIdentity, AgentKind, RunningAgent};
+        use deppy_core::process_identity::HookExecutionStamp;
+
+        let path = temp_db_path("independent-first-hook-projection");
+        let db = storage::Db::open(&path).unwrap();
+        let workspace = db.create_workspace("first-hook-prompts").unwrap();
+        let instance = 7;
+        let token = "first-hook-runtime";
+        let mut kinds = HashMap::new();
+        let mut expected = HashMap::new();
+        for (index, (provider, kind)) in [
+            ("claude", AgentKind::Claude),
+            ("codex", AgentKind::Codex),
+            ("grok", AgentKind::Grok),
+            ("kimi", AgentKind::Kimi),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let session = runtime::SessionId(index as u64 + 1);
+            let execution =
+                AgentExecutionIdentity::fixture_current(kind, std::process::id()).unwrap();
+            let stamp = HookExecutionStamp {
+                runtime_instance: token.into(),
+                ancestors: vec![execution.process_identity()],
+            };
+            let key = format!("{workspace}:{}", session.0);
+            let native = format!("native-{provider}");
+            let prompt = format!("{provider} 첫 작업");
+            db.upsert_hook_session_with_execution(
+                &key,
+                provider,
+                &native,
+                "/fixture/shared.jsonl",
+                Some(&stamp),
+            )
+            .unwrap();
+            assert!(
+                db.record_hook_task_prompt_with_execution(
+                    &key,
+                    provider,
+                    &native,
+                    &prompt,
+                    Some(&stamp),
+                )
+                .unwrap()
+            );
+            // A closed peer's raw binding makes transcript text ambiguous. The
+            // pane's first verified prompt must still be available for its title.
+            db.upsert_hook_session(
+                &format!("{workspace}:{}", index + 101),
+                provider,
+                &native,
+                "/fixture/shared.jsonl",
+            )
+            .unwrap();
+            kinds.insert(
+                (instance, session),
+                RunningAgent {
+                    kind,
+                    execution: Some(execution),
+                    model: None,
+                    effort: None,
+                },
+            );
+            expected.insert(session, (native, prompt));
+        }
+        let snapshot = db
+            .apply_agent_state_job(&storage::AgentStateJob::projection(&workspace))
+            .unwrap();
+        let mut observed = HashMap::new();
+        let mut fresh = HashMap::new();
+        for poll in 0..4 {
+            let hooks =
+                project_pane_hooks(&workspace, instance, token, &kinds, &snapshot.hook_sessions);
+            let bindings = hooks
+                .overrides
+                .iter()
+                .map(|(session, verified)| (*session, verified.binding.clone()))
+                .collect::<HashMap<_, _>>();
+            refresh_fresh_hook_prompts(&mut observed, &mut fresh, hooks.prompts);
+            assert_eq!(
+                fresh, expected,
+                "first and repeated DB snapshots: poll {poll}"
+            );
+            let mut displays = expected
+                .keys()
+                .map(|session| {
+                    (
+                        *session,
+                        AgentDisplay {
+                            kind: bindings[session].kind,
+                            model: None,
+                            effort: None,
+                            context_pct: None,
+                            last_agent_summary: Some("다른 pane 응답".into()),
+                            user_instruction: None,
+                        },
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            apply_pane_task_prompts(&mut displays, &bindings, &hooks.history, &fresh, true);
+            for (session, (_, prompt)) in &expected {
+                assert_eq!(
+                    displays[session].user_instruction.as_deref(),
+                    Some(prompt.as_str())
+                );
+                assert_eq!(displays[session].last_agent_summary, None);
+            }
+        }
+        drop(db);
+        remove_sqlite_files(&path);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn independent_db_hook_projection_rejects_old_execution_and_accepts_the_same_new_prompt() {
+        use crate::agent_detect::{AgentExecutionIdentity, AgentKind, RunningAgent};
+        use deppy_core::process_identity::HookExecutionStamp;
+
+        struct LiveProcess(std::process::Child);
+        impl Drop for LiveProcess {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let process = LiveProcess(
+            std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .spawn()
+                .unwrap(),
         );
+        let kind = AgentKind::Codex;
+        let old_execution =
+            AgentExecutionIdentity::fixture_current(kind, std::process::id()).unwrap();
+        let execution = AgentExecutionIdentity::fixture_current(kind, process.0.id()).unwrap();
+        let stamp = |execution: AgentExecutionIdentity| HookExecutionStamp {
+            runtime_instance: "stable-runtime".into(),
+            ancestors: vec![execution.process_identity()],
+        };
+        let old_stamp = stamp(old_execution);
+        let current_stamp = stamp(execution);
+        let path = temp_db_path("independent-reused-hook-execution");
+        let db = storage::Db::open(&path).unwrap();
+        let workspace = db.create_workspace("reused-hook-pane").unwrap();
+        let session = runtime::SessionId(1);
+        let key = format!("{workspace}:1");
+        let prompt = "반복한 같은 작업";
+        db.upsert_hook_session_with_execution(
+            &key,
+            "codex",
+            "same-native",
+            "/fixture/same.jsonl",
+            Some(&old_stamp),
+        )
+        .unwrap();
+        assert!(
+            db.record_hook_task_prompt_with_execution(
+                &key,
+                "codex",
+                "same-native",
+                prompt,
+                Some(&old_stamp)
+            )
+            .unwrap()
+        );
+        db.upsert_hook_session_with_execution(
+            &key,
+            "codex",
+            "same-native",
+            "/fixture/same.jsonl",
+            Some(&current_stamp),
+        )
+        .unwrap();
+        let kinds = HashMap::from([(
+            (8, session),
+            RunningAgent {
+                kind,
+                execution: Some(execution),
+                model: None,
+                effort: None,
+            },
+        )]);
+        let snapshot = db
+            .apply_agent_state_job(&storage::AgentStateJob::projection(&workspace))
+            .unwrap();
+        assert_eq!(
+            snapshot.hook_sessions[0].task_prompt.as_deref(),
+            Some(prompt)
+        );
+        let hooks = project_pane_hooks(
+            &workspace,
+            8,
+            "stable-runtime",
+            &kinds,
+            &snapshot.hook_sessions,
+        );
+        assert!(hooks.overrides.contains_key(&session));
+        assert!(
+            hooks.prompts.is_empty(),
+            "new binding event must not authorize its old prompt"
+        );
+        let mut observed = HashMap::from([(session, ("same-native".into(), prompt.into()))]);
+        let mut fresh = observed.clone();
+        refresh_fresh_hook_prompts(&mut observed, &mut fresh, hooks.prompts);
         assert!(fresh.is_empty());
-        refresh_fresh_hook_prompts(
-            &mut observed,
-            &mut fresh,
-            HashMap::from([(session, ("shared".into(), "현재 pane 작업".into()))]),
-            true,
+        assert!(
+            db.record_hook_task_prompt_with_execution(
+                &key,
+                "codex",
+                "same-native",
+                prompt,
+                Some(&current_stamp)
+            )
+            .unwrap()
         );
+        let snapshot = db
+            .apply_agent_state_job(&storage::AgentStateJob::projection(&workspace))
+            .unwrap();
+        let hooks = project_pane_hooks(
+            &workspace,
+            8,
+            "stable-runtime",
+            &kinds,
+            &snapshot.hook_sessions,
+        );
+        refresh_fresh_hook_prompts(&mut observed, &mut fresh, hooks.prompts);
+        assert_eq!(fresh[&session].1, prompt);
+        let current_kinds = HashMap::from([(session, kinds[&(8, session)].clone())]);
+        retain_current_hook_prompts(&mut fresh, &hooks.overrides, &current_kinds);
+        assert_eq!(fresh[&session].1, prompt);
+        let replacement_kinds = HashMap::from([(
+            session,
+            RunningAgent {
+                execution: Some(old_execution),
+                ..current_kinds[&session].clone()
+            },
+        )]);
+        retain_current_hook_prompts(&mut fresh, &hooks.overrides, &replacement_kinds);
+        assert!(
+            fresh.is_empty(),
+            "detecting another CLI must invalidate the cached prompt immediately"
+        );
+        let hooks = project_pane_hooks(
+            &workspace,
+            8,
+            "stable-runtime",
+            &kinds,
+            &snapshot.hook_sessions,
+        );
+        refresh_fresh_hook_prompts(&mut observed, &mut fresh, hooks.prompts);
+        assert_eq!(
+            fresh.get(&session).map(|value| value.1.as_str()),
+            Some(prompt),
+            "an unchanged, reverified prompt must return after execution pruning"
+        );
+        drop(db);
+        remove_sqlite_files(&path);
+    }
+
+    #[test]
+    fn independent_db_hook_projection_isolates_workspace_runtime_kind_and_process_birth() {
+        use crate::agent_detect::{AgentExecutionIdentity, AgentKind, RunningAgent};
+        use deppy_core::process_identity::HookExecutionStamp;
+
+        let path = temp_db_path("independent-workspace-hook-projection");
+        let db = storage::Db::open(&path).unwrap();
+        let first = db.create_workspace("first-hook-workspace").unwrap();
+        let second = db.create_workspace("second-hook-workspace").unwrap();
+        let session = runtime::SessionId(1);
+        let execution =
+            AgentExecutionIdentity::fixture_current(AgentKind::Claude, std::process::id()).unwrap();
+        let stamp = HookExecutionStamp {
+            runtime_instance: "current-runtime".into(),
+            ancestors: vec![execution.process_identity()],
+        };
+        for (workspace, prompt) in [
+            (&first, "첫 workspace 작업"),
+            (&second, "둘째 workspace 작업"),
+        ] {
+            let key = format!("{workspace}:1");
+            db.upsert_hook_session_with_execution(
+                &key,
+                "claude",
+                "same-native",
+                "/fixture/same.jsonl",
+                Some(&stamp),
+            )
+            .unwrap();
+            assert!(
+                db.record_hook_task_prompt_with_execution(
+                    &key,
+                    "claude",
+                    "same-native",
+                    prompt,
+                    Some(&stamp)
+                )
+                .unwrap()
+            );
+        }
+        let kinds = HashMap::from([(
+            (9, session),
+            RunningAgent {
+                kind: AgentKind::Claude,
+                execution: Some(execution),
+                model: None,
+                effort: None,
+            },
+        )]);
+        let mut rows = db.list_hook_sessions().unwrap();
+        let hooks = project_pane_hooks(&second, 9, "current-runtime", &kinds, &rows);
+        assert_eq!(hooks.history.len(), 1);
+        assert_eq!(hooks.prompts[&session].1, "둘째 workspace 작업");
+        assert!(
+            project_pane_hooks(&second, 10, "current-runtime", &kinds, &rows)
+                .prompts
+                .is_empty()
+        );
+        assert!(
+            project_pane_hooks(&second, 9, "previous-runtime", &kinds, &rows)
+                .overrides
+                .is_empty()
+        );
+        let wrong_kind = HashMap::from([(
+            (9, session),
+            RunningAgent {
+                kind: AgentKind::Codex,
+                ..kinds[&(9, session)].clone()
+            },
+        )]);
+        assert!(
+            project_pane_hooks(&second, 9, "current-runtime", &wrong_kind, &rows)
+                .overrides
+                .is_empty()
+        );
+        let row = rows
+            .iter_mut()
+            .find(|row| row.session_key == format!("{second}:1"))
+            .unwrap();
+        row.task_prompt_execution_stamp
+            .as_mut()
+            .unwrap()
+            .runtime_instance = "previous-runtime".into();
+        let hooks = project_pane_hooks(&second, 9, "current-runtime", &kinds, &rows);
+        assert!(hooks.overrides.contains_key(&session));
+        assert!(
+            hooks.prompts.is_empty(),
+            "a prompt from another runtime remains stale after current SessionStart"
+        );
+        let row = rows
+            .iter_mut()
+            .find(|row| row.session_key == format!("{second}:1"))
+            .unwrap();
+        row.task_prompt_execution_stamp
+            .as_mut()
+            .unwrap()
+            .runtime_instance = "current-runtime".into();
+        row.task_prompt_execution_stamp.as_mut().unwrap().ancestors[0]
+            .birth
+            .seconds += 1;
+        let hooks = project_pane_hooks(&second, 9, "current-runtime", &kinds, &rows);
+        assert!(hooks.overrides.contains_key(&session));
+        assert!(
+            hooks.prompts.is_empty(),
+            "a reused PID with another birth cannot own this prompt"
+        );
+        let row = rows
+            .iter_mut()
+            .find(|row| row.session_key == format!("{second}:1"))
+            .unwrap();
+        row.execution_stamp = None;
+        row.task_prompt_execution_stamp = Some(stamp);
+        assert!(
+            project_pane_hooks(&second, 9, "current-runtime", &kinds, &rows)
+                .prompts
+                .is_empty(),
+            "legacy binding rows remain unverified even with a prompt stamp"
+        );
+        drop(db);
+        remove_sqlite_files(&path);
+    }
+
+    #[test]
+    fn 재시작_전_hook_기록은_새_runtime_id의_작업_제목을_덮지_않는다() {
+        use crate::agent_detect::{AgentExecutionIdentity, AgentKind, RunningAgent};
+        use deppy_core::process_identity::HookExecutionStamp;
+
+        let path = temp_db_path("independent-legacy-hook-prompt");
+        let db = storage::Db::open(&path).unwrap();
+        let workspace = db.create_workspace("legacy-hook-prompt").unwrap();
+        let session = runtime::SessionId(2);
+        let key = format!("{workspace}:2");
+        let execution =
+            AgentExecutionIdentity::fixture_current(AgentKind::Claude, std::process::id()).unwrap();
+        let kinds = HashMap::from([(
+            (10, session),
+            RunningAgent {
+                kind: AgentKind::Claude,
+                execution: Some(execution),
+                model: None,
+                effort: None,
+            },
+        )]);
+        let stamp = HookExecutionStamp {
+            runtime_instance: "new-runtime".into(),
+            ancestors: vec![execution.process_identity()],
+        };
+        db.upsert_hook_session(&key, "claude", "shared", "/fixture/shared.jsonl")
+            .unwrap();
+        assert!(
+            db.record_hook_task_prompt(&key, "claude", "shared", "옛 pane 작업")
+                .unwrap()
+        );
+        let mut observed = HashMap::new();
+        let mut fresh = HashMap::new();
+        let snapshot = db
+            .apply_agent_state_job(&storage::AgentStateJob::projection(&workspace))
+            .unwrap();
+        let hooks = project_pane_hooks(
+            &workspace,
+            10,
+            "new-runtime",
+            &kinds,
+            &snapshot.hook_sessions,
+        );
+        refresh_fresh_hook_prompts(&mut observed, &mut fresh, hooks.prompts);
+        assert!(fresh.is_empty());
+        db.upsert_hook_session_with_execution(
+            &key,
+            "claude",
+            "shared",
+            "/fixture/shared.jsonl",
+            Some(&stamp),
+        )
+        .unwrap();
+        let snapshot = db
+            .apply_agent_state_job(&storage::AgentStateJob::projection(&workspace))
+            .unwrap();
+        assert_eq!(
+            snapshot.hook_sessions[0].task_prompt.as_deref(),
+            Some("옛 pane 작업")
+        );
+        let hooks = project_pane_hooks(
+            &workspace,
+            10,
+            "new-runtime",
+            &kinds,
+            &snapshot.hook_sessions,
+        );
+        assert!(hooks.overrides.contains_key(&session));
+        refresh_fresh_hook_prompts(&mut observed, &mut fresh, hooks.prompts);
+        assert!(
+            fresh.is_empty(),
+            "fresh SessionStart must not launder a legacy task prompt"
+        );
+        assert!(
+            db.record_hook_task_prompt_with_execution(
+                &key,
+                "claude",
+                "shared",
+                "현재 pane 작업",
+                Some(&stamp)
+            )
+            .unwrap()
+        );
+        let snapshot = db
+            .apply_agent_state_job(&storage::AgentStateJob::projection(&workspace))
+            .unwrap();
+        let hooks = project_pane_hooks(
+            &workspace,
+            10,
+            "new-runtime",
+            &kinds,
+            &snapshot.hook_sessions,
+        );
+        refresh_fresh_hook_prompts(&mut observed, &mut fresh, hooks.prompts);
         assert_eq!(fresh[&session].1, "현재 pane 작업");
-        refresh_fresh_hook_prompts(&mut observed, &mut fresh, HashMap::new(), true);
+        refresh_fresh_hook_prompts(&mut observed, &mut fresh, HashMap::new());
         assert!(fresh.is_empty());
+        drop(db);
+        remove_sqlite_files(&path);
     }
 
     #[test]
@@ -43932,9 +44529,114 @@ mod tests {
             session_id: "shared".to_owned(),
         };
 
-        assert!(!fork_shared_claude_resume(&target("pane-a"), &saved, false));
-        assert!(fork_shared_claude_resume(&target("pane-b"), &saved, false));
-        assert!(fork_shared_claude_resume(&target("pane-a"), &saved, true));
+        assert!(!fork_shared_native_resume(&target("pane-a"), &saved, false));
+        assert!(fork_shared_native_resume(&target("pane-b"), &saved, false));
+        assert!(fork_shared_native_resume(&target("pane-a"), &saved, true));
+    }
+
+    #[test]
+    fn independent_provider_titles_use_each_panes_own_native_id_and_prompt() {
+        use crate::agent_detect::{AgentBinding, AgentDisplay, AgentKind};
+        for kind in [
+            AgentKind::Claude,
+            AgentKind::Codex,
+            AgentKind::Grok,
+            AgentKind::Kimi,
+        ] {
+            let first = runtime::SessionId(1);
+            let second = runtime::SessionId(2);
+            let binding = |id: &str| AgentBinding {
+                kind,
+                session_id: id.into(),
+                transcript: PathBuf::from("/same/workspace/log.jsonl"),
+            };
+            let bindings = HashMap::from([(first, binding("first")), (second, binding("second"))]);
+            let prompts = HashMap::from([
+                (first, ("first".into(), "첫 작업".into())),
+                (second, ("second".into(), "다른 작업".into())),
+            ]);
+            let display = || AgentDisplay {
+                kind,
+                model: None,
+                effort: None,
+                context_pct: None,
+                last_agent_summary: None,
+                user_instruction: None,
+            };
+            let mut displays = HashMap::from([(first, display()), (second, display())]);
+            apply_pane_task_prompts(&mut displays, &bindings, &bindings, &prompts, true);
+            assert_eq!(
+                displays[&first].user_instruction.as_deref(),
+                Some("첫 작업"),
+                "{kind:?}"
+            );
+            assert_eq!(
+                displays[&second].user_instruction.as_deref(),
+                Some("다른 작업"),
+                "{kind:?}"
+            );
+            let stale = HashMap::from([(second, ("first".into(), "다른 세션의 내용".into()))]);
+            assert!(trusted_pane_task_prompt(second, &bindings, &stale).is_none());
+        }
+    }
+
+    #[test]
+    fn independent_unconfirmed_binding_clears_only_active_sessions_source_text() {
+        use crate::agent_detect::{AgentBinding, AgentDisplay, AgentKind};
+        let session = runtime::SessionId(1);
+        let peer = runtime::SessionId(2);
+        let display = || AgentDisplay {
+            kind: AgentKind::Codex,
+            model: Some("model".into()),
+            effort: Some("xhigh".into()),
+            context_pct: Some(42),
+            last_agent_summary: Some("잘못 연결된 응답".into()),
+            user_instruction: Some("잘못 연결된 요청".into()),
+        };
+        let mut info = HashMap::from([
+            ((7, session), display()),
+            ((7, peer), display()),
+            ((8, session), display()),
+        ]);
+        let bindings = HashMap::from([(
+            peer,
+            AgentBinding {
+                kind: AgentKind::Codex,
+                session_id: "verified".into(),
+                transcript: PathBuf::from("/verified.jsonl"),
+            },
+        )]);
+        clear_unbound_agent_activity(&mut info, 7, &bindings);
+        assert!(info[&(7, session)].last_agent_summary.is_none());
+        assert!(info[&(7, session)].user_instruction.is_none());
+        assert!(info[&(7, session)].context_pct.is_none());
+        assert_eq!(info[&(7, session)].effort.as_deref(), Some("xhigh"));
+        assert!(info[&(7, peer)].last_agent_summary.is_some());
+        assert!(info[&(8, session)].last_agent_summary.is_some());
+    }
+
+    #[test]
+    fn independent_legacy_codex_checkpoint_is_not_automatically_shared() {
+        let row = |pane: &str, id: &str| storage::AgentSessionRow {
+            pane_id: pane.into(),
+            kind: "codex".into(),
+            session_id: id.into(),
+            task_prompt: None,
+        };
+        let first = row("a", "shared");
+        let second = row("b", "shared");
+        let mut saved = HashMap::from([("a".into(), first.clone()), ("b".into(), second.clone())]);
+        assert!(ambiguous_saved_codex_binding(&first, &saved));
+        assert!(ambiguous_saved_codex_binding(&second, &saved));
+        saved.insert("b".into(), row("b", "independent"));
+        assert!(!ambiguous_saved_codex_binding(&first, &saved));
+        let target = storage::AgentSessionIdentity {
+            pane_id: "b".into(),
+            kind: "codex".into(),
+            session_id: "shared".into(),
+        };
+        assert!(fork_shared_native_resume(&target, &saved, false));
+        assert!(fork_shared_native_resume(&target, &saved, true));
     }
 
     #[test]
@@ -45510,12 +46212,11 @@ mod tests {
         );
     }
 
-    /// 이력 보조 본문 좌측 카드 목록 폭 — git과 같은 규칙이지만 카드 정보량 때문에
-    /// 하한이 220pt로 조금 더 크다(2026-08-15 Task 10, 스펙 §2-1).
+    /// 기본 이력 split은 Claude 구조의 목록32%와 상세68%를 사용한다.
     #[test]
-    fn 이력_본문은_목록_360에_원문_나머지다() {
-        assert_eq!(history_tab_list_width(1400.0), 360.0);
-        assert_eq!(history_tab_list_width(700.0), 280.0, "좁으면 40%");
+    fn 이력_본문은_목록_32퍼센트에_상세_나머지다() {
+        assert_eq!(history_tab_list_width(1400.0), 448.0);
+        assert_eq!(history_tab_list_width(700.0), 224.0, "좁아도 32%");
         assert_eq!(
             history_tab_list_width(400.0),
             220.0,

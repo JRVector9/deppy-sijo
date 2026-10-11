@@ -3,8 +3,8 @@
 //!
 //! - **claude**: argv의 `--session-id`/`--resume` 또는 pane별 hook에서 세션ID를 얻는다.
 //!   cwd의 최신 파일은 같은 폴더의 다른 대화일 수 있으므로 바인딩 근거로 쓰지 않는다.
-//! - **codex**: argv에 세션ID가 없어 프로세스 cwd(lsof)로 rollout(session_meta.cwd)을 매칭한다.
-//! - **grok**: `active_sessions.json`의 pid를 우선하고, 없으면 cwd의 최신 세션으로 제한해 매칭한다.
+//! - **codex**: pane hook, 명시적 resume ID 또는 유일한 writable rollout으로만 바인딩한다.
+//! - **grok**: `active_sessions.json`의 pid 또는 pane hook으로만 바인딩한다.
 //!
 //! ps 트리 순회는 resource_monitor와 같은 `ps -axo` 방식을 따른다(재사용 패턴).
 
@@ -74,6 +74,33 @@ impl std::fmt::Debug for AgentBinding {
     }
 }
 
+/// A pane hook attributed to a specific live CLI by the receiver's kernel ancestry.
+/// This proof travels with the override so argv from startup cannot pin a later thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedHookBinding {
+    pub(crate) binding: AgentBinding,
+    pub(crate) execution: AgentExecutionIdentity,
+}
+
+impl VerifiedHookBinding {
+    pub(crate) fn try_new(
+        binding: AgentBinding,
+        execution: AgentExecutionIdentity,
+        stamp: &deppy_core::process_identity::HookExecutionStamp,
+        runtime_instance: &str,
+    ) -> Option<Self> {
+        (binding.kind == execution.kind && execution.accepts_hook_stamp(stamp, runtime_instance))
+            .then_some(Self { binding, execution })
+    }
+
+    fn matches_cached_owner(&self, entry: &CacheEntry) -> bool {
+        self.binding == entry.binding
+            && self.execution.pid == entry.owner_pid
+            && Some(self.execution.birth) == entry.owner_start_time
+            && self.execution.is_current()
+    }
+}
+
 struct ProcRow {
     pid: u32,
     ppid: Option<u32>,
@@ -124,6 +151,23 @@ impl AgentExecutionIdentity {
             birth: crate::proc_info::pid_start_time(pid)?,
             process_group: crate::proc_info::pid_process_group(pid)?,
         })
+    }
+
+    pub(crate) fn process_identity(self) -> deppy_core::process_identity::ProcessIdentity {
+        deppy_core::process_identity::ProcessIdentity {
+            pid: self.pid,
+            birth: self.birth,
+        }
+    }
+
+    pub(crate) fn accepts_hook_stamp(
+        self,
+        stamp: &deppy_core::process_identity::HookExecutionStamp,
+        runtime_instance: &str,
+    ) -> bool {
+        stamp.runtime_instance == runtime_instance
+            && stamp.contains(self.process_identity())
+            && self.is_current()
     }
 
     pub(crate) fn is_current(self) -> bool {
@@ -543,7 +587,7 @@ pub fn detect_kinds(
 
 pub fn detect_cached(
     sessions: &[(SessionId, u32)],
-    overrides: &HashMap<SessionId, AgentBinding>,
+    overrides: &HashMap<SessionId, VerifiedHookBinding>,
     cache: &mut BindingCache,
     process_cache: &mut ProcessRowsCache,
 ) -> DetectedAgents {
@@ -564,7 +608,10 @@ pub fn detect_cached(
     if !safety_net_elapsed(cache, has_heuristic)
         && sessions.iter().all(|(sid, _)| {
             cache.entries.get(sid).is_some_and(|entry| {
-                owner_still_alive(entry) && overrides.get(sid).is_none_or(|b| *b == entry.binding)
+                owner_still_alive(entry)
+                    && overrides
+                        .get(sid)
+                        .is_none_or(|hook| hook.matches_cached_owner(entry))
             })
         })
     {
@@ -590,13 +637,17 @@ pub fn detect_cached(
         // Codex를 종료한 뒤 Claude를 실행할 수 있으므로, 살아 있는 에이전트의 종류까지 hook
         // 기록과 일치할 때만 사용한다. 종류가 다르면 오래된 hook을 무시하고 아래 탐색으로
         // 현재 에이전트를 다시 바인딩한다(2026-07-20 실증).
-        if let Some(b) = overrides.get(sid)
+        if let Some(hook) = overrides.get(sid)
+            && let b = &hook.binding
             && valid_binding(b)
-            && let Some(owner) = find_agent_pid(*shell_pid, rows, b.kind)
-            && rows
-                .iter()
-                .find(|row| row.pid == owner)
-                .is_some_and(|row| hook_binding_matches_command(b, &row.command))
+            && hook.execution.kind == b.kind
+            && hook.execution.is_current()
+            && let owner = hook.execution.pid
+            && descendant_pids(*shell_pid, rows).contains(&owner)
+            && agent_pid_matches_kind(owner, b.kind, rows)
+            && rows.iter().find(|row| row.pid == owner).is_some_and(|row| {
+                b.kind == AgentKind::Codex || hook_binding_matches_command(b, &row.command)
+            })
         {
             let running = kinds.get(sid).filter(|r| r.kind == b.kind);
             cache.entries.insert(
@@ -604,7 +655,8 @@ pub fn detect_cached(
                 CacheEntry {
                     binding: b.clone(),
                     owner_pid: owner,
-                    owner_start_time: crate::proc_info::pid_start_time(owner),
+                    // Never replace the proven birth with a later PID occupant's birth.
+                    owner_start_time: Some(hook.execution.birth),
                     deterministic: true,
                     model: running.and_then(|r| r.model.clone()),
                     effort: running.and_then(|r| r.effort.clone()),
@@ -618,9 +670,11 @@ pub fn detect_cached(
         // 바인딩은 lsof로 결정적 업그레이드를 시도한다(작업 중 rollout이 열리면 정확한
         // 파일로 교체).
         if let Some(entry) = cache.entries.get(sid)
+            && owner_still_alive(entry)
             && agent_pid_matches_kind(entry.owner_pid, entry.binding.kind, rows)
         {
             let owner_pid = entry.owner_pid;
+            let owner_start_time = entry.owner_start_time;
             let det = entry.deterministic;
             let binding = entry.binding.clone();
             let upgraded = (!det)
@@ -633,7 +687,7 @@ pub fn detect_cached(
                     CacheEntry {
                         binding: upgraded.clone(),
                         owner_pid,
-                        owner_start_time: crate::proc_info::pid_start_time(owner_pid),
+                        owner_start_time,
                         deterministic: true,
                         model: running.and_then(|r| r.model.clone()),
                         effort: running.and_then(|r| r.effort.clone()),
@@ -647,7 +701,7 @@ pub fn detect_cached(
                     CacheEntry {
                         binding: binding.clone(),
                         owner_pid,
-                        owner_start_time: crate::proc_info::pid_start_time(owner_pid),
+                        owner_start_time,
                         deterministic: det,
                         model: running.and_then(|r| r.model.clone()),
                         effort: running.and_then(|r| r.effort.clone()),
@@ -737,6 +791,7 @@ impl std::fmt::Debug for AgentDisplay {
 /// 셸 자손 중 hook 바인딩과 같은 종류의 에이전트 프로세스가 있으면 그 pid를 돌려준다.
 /// 종류를 대조하지 않으면 같은 PTY에서 Codex → Claude 전환 시 오래된 Codex hook이 새
 /// Claude 프로세스를 자신의 owner로 오인한다.
+#[cfg(test)]
 fn find_agent_pid(shell_pid: u32, rows: &[ProcRow], expected: AgentKind) -> Option<u32> {
     let descendants = descendant_pids(shell_pid, rows);
     rows.iter()
@@ -840,7 +895,36 @@ fn classify(command: &str) -> Option<(AgentKind, Option<String>)> {
         return Some((AgentKind::Claude, claude_session_id(command)));
     }
     if is("codex") {
-        return Some((AgentKind::Codex, None));
+        let mut args = codex_command_args(command);
+        let mode = codex_positional(&mut args);
+        if matches!(
+            mode,
+            Some(
+                "app-server"
+                    | "exec"
+                    | "e"
+                    | "review"
+                    | "apply"
+                    | "agents"
+                    | "login"
+                    | "logout"
+                    | "mcp"
+                    | "mcp-server"
+                    | "completion"
+                    | "debug"
+                    | "sandbox"
+                    | "features"
+                    | "cloud"
+            )
+        ) {
+            return None;
+        }
+        let id = (mode == Some("resume"))
+            .then(|| codex_positional(&mut args))
+            .flatten()
+            .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+            .map(str::to_owned);
+        return Some((AgentKind::Codex, id));
     }
     // Kimi는 런처가 `kimi`로 띄우지만 실제 워커 프로세스명은 `kimi-code`다
     // (2026-08-09 실측: pid 21295 `kimi`, pid 27534 `kimi-code`가 함께 뜬다).
@@ -889,9 +973,64 @@ fn claude_command_session_id(command: &str) -> Option<String> {
     None
 }
 
-/// hook 레코드는 pane에 남아 있어도 그 pane의 Claude 프로세스는 새 대화로 바뀔 수 있다.
+fn codex_command_args(command: &str) -> std::str::SplitWhitespace<'_> {
+    let mut args = command.split_whitespace();
+    while args
+        .next()
+        .is_some_and(|arg| Path::new(arg).file_name().is_none_or(|n| n != "codex"))
+    {}
+    args
+}
+
+/// `ps` has no quoting metadata: an unrecognised positional fails closed.
+fn codex_positional<'a>(args: &mut std::str::SplitWhitespace<'a>) -> Option<&'a str> {
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            return None;
+        }
+        if matches!(
+            arg,
+            "-c" | "--config"
+                | "-m"
+                | "--model"
+                | "-p"
+                | "--profile"
+                | "-C"
+                | "--cd"
+                | "--enable"
+                | "--disable"
+                | "-a"
+                | "--ask-for-approval"
+                | "-s"
+                | "--sandbox"
+                | "--remote"
+                | "--remote-auth-token-env"
+                | "--add-dir"
+                | "--local-provider"
+                | "-i"
+                | "--image"
+        ) {
+            args.next()?;
+        } else if !arg.starts_with('-') {
+            return Some(arg);
+        }
+    }
+    None
+}
+
+/// hook 레코드는 pane에 남아 있어도 그 pane의 프로세스는 새 대화로 바뀔 수 있다.
 /// 명시적 resume ID와 다르거나 fork의 원본 ID인 오래된 hook은 새 프로세스에 적용하지 않는다.
 fn hook_binding_matches_command(binding: &AgentBinding, command: &str) -> bool {
+    if binding.kind == AgentKind::Codex {
+        let mut args = codex_command_args(command);
+        let mode = codex_positional(&mut args);
+        let declared = codex_positional(&mut args).filter(|id| uuid::Uuid::parse_str(id).is_ok());
+        return match mode {
+            Some("resume") => declared.is_none_or(|id| id == binding.session_id),
+            Some("fork") => declared != Some(binding.session_id.as_str()),
+            _ => true,
+        };
+    }
     if binding.kind != AgentKind::Claude {
         return true;
     }
@@ -958,12 +1097,19 @@ fn valid_transcript_path(kind: AgentKind, path: &Path) -> bool {
 fn valid_binding(binding: &AgentBinding) -> bool {
     valid_session_id(&binding.session_id)
         && valid_transcript_path(binding.kind, &binding.transcript)
+        && (binding.kind != AgentKind::Codex
+            || binding
+                .transcript
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(agent_transcript::codex_session_id)
+                .as_deref()
+                == Some(binding.session_id.as_str()))
 }
 
 /// 감지된 에이전트를 실제 transcript 파일로 확정한다. 두 번째 반환값 = 결정적 여부:
-/// argv 세션ID(Claude)·lsof 열린 파일(Codex)은 결정적, 일부 provider의 cwd 매칭은 휴리스틱(오바인딩 가능 —
-/// 2026-07-07 실증: 프로세스 cwd(/Users)와 rollout 기록 cwd(arteawiki)가 다르거나, 같은
-/// cwd 다중 세션이 최신 쪽으로 모임). find_agent가 결정적 후보를 우선한다.
+/// argv 세션ID·유일한 writable 파일·provider의 pid 매핑만 허용한다.
+/// cwd는 같은 프로젝트의 서로 다른 대화를 구분할 수 없으므로 근거가 아니다.
 fn bind_transcript(
     kind: AgentKind,
     sid_hint: Option<String>,
@@ -989,18 +1135,8 @@ fn bind_transcript(
                     true,
                 ));
             }
-            // fallback: 프로세스 cwd의 세션 디렉터리 중 최신 — 휴리스틱(codex cwd 폴백과
-            // 같은 한계: 같은 cwd 다중 세션이면 최신 쪽으로 모인다).
-            let cwd = process_cwd(pid, budget)?;
-            let (session_id, transcript) = find_grok_transcript_by_cwd(&cwd)?;
-            Some((
-                AgentBinding {
-                    kind,
-                    session_id,
-                    transcript,
-                },
-                false,
-            ))
+            // A directory identifies a project, never a conversation.
+            None
         }
         AgentKind::Claude => {
             // argv의 명시적 ID만 사용한다. 같은 cwd의 최신 mtime transcript는
@@ -1038,17 +1174,15 @@ fn bind_transcript(
                     true,
                 ));
             }
-            // fallback: cwd 매칭 스캔 — 휴리스틱. codex는 rollout을 항상 열어두지 않아
-            // (실증: idle fresh 세션은 닫혀 있음) lsof가 자주 miss라 필요하다.
-            let cwd = process_cwd(pid, budget)?;
-            let (session_id, transcript) = find_codex_transcript(&cwd)?;
+            let session_id = sid_hint?;
+            let transcript = TranscriptFinder::new().find(AgentKind::Codex, &session_id)?;
             Some((
                 AgentBinding {
                     kind,
                     session_id,
                     transcript,
                 },
-                false,
+                true,
             ))
         }
     }
@@ -1380,36 +1514,12 @@ fn find_claude_transcript(session_id: &str) -> Option<PathBuf> {
     None
 }
 
-/// cwd로 codex rollout을 찾는다 — session_meta.cwd가 일치하는 것 중 가장 최근.
-fn find_codex_transcript(cwd: &str) -> Option<(String, PathBuf)> {
-    if !valid_absolute_path(cwd) {
-        return None;
-    }
-    let root = crate::paths::home_dir()?.join(".codex/sessions");
-    let mut files = Vec::new();
-    if !collect_jsonl(&root, &mut files) {
-        return None;
-    }
-    files.sort_by_cached_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
-    for p in files.iter().rev().take(64) {
-        if transcript_cwd(p).as_deref() == Some(cwd)
-            && let Some(session_id) = p
-                .file_name()
-                .and_then(|name| name.to_str())
-                .and_then(agent_transcript::codex_session_id)
-        {
-            return Some((session_id, p.clone()));
-        }
-    }
-    None
-}
-
 /// 저장된 이력 행(kind + 세션ID [+ cwd])에서 transcript 파일을 찾는다. 세션이 이미
 /// 끝났어도 파일은 남으므로 원문 보기가 이걸 쓴다(2026-08-15).
 ///
 /// Codex는 `TranscriptFinder::find`가 이미 `~/.codex/sessions`를 역순(최신 먼저) 스캔해
-/// 세션ID로 직접 매칭한다(위 `TranscriptFinder` 문서 참고) — 그걸 그대로 우선 쓰고,
-/// 스캔 상한에 걸리는 등 못 찾을 때만 행의 cwd로 `find_codex_transcript`에 폴백한다.
+/// 세션ID로 직접 매칭한다(위 `TranscriptFinder` 문서 참고). ID를 찾지 못해도 같은
+/// cwd의 다른 대화를 열지 않는다.
 ///
 /// **모든 kind를 덮어야 한다.** 하나라도 해석기 없이 `None`으로 두면 그 에이전트로 돌린
 /// 이력은 원문 보기가 통째로 죽는데, 화면에는 「파일을 찾지 못했습니다」만 떠서 원인이
@@ -1422,13 +1532,11 @@ fn find_codex_transcript(cwd: &str) -> Option<(String, PathBuf)> {
 pub(crate) fn transcript_path_for(
     kind: AgentKind,
     session_id: &str,
-    cwd: Option<&str>,
+    _cwd: Option<&str>,
 ) -> Option<PathBuf> {
     match kind {
         AgentKind::Claude => find_claude_transcript(session_id),
-        AgentKind::Codex => TranscriptFinder::new()
-            .find(AgentKind::Codex, session_id)
-            .or_else(|| cwd.and_then(|cwd| find_codex_transcript(cwd).map(|(_, path)| path))),
+        AgentKind::Codex => TranscriptFinder::new().find(AgentKind::Codex, session_id),
         AgentKind::Kimi => find_kimi_transcript(session_id),
         AgentKind::Grok => find_grok_transcript(session_id),
     }
@@ -1561,15 +1669,7 @@ fn find_grok_transcript(session_id: &str) -> Option<PathBuf> {
     None
 }
 
-/// cwd의 세션 디렉터리 중 **가장 최근에 갱신된** 것 — 휴리스틱 폴백.
-fn find_grok_transcript_by_cwd(cwd: &str) -> Option<(String, PathBuf)> {
-    if !valid_absolute_path(cwd) {
-        return None;
-    }
-    let dir = grok_sessions_root()?.join(grok_encode_cwd(cwd));
-    find_grok_transcript_in(&dir, MAX_DIRECTORY_ENTRIES)
-}
-
+#[cfg(test)]
 fn find_grok_transcript_in(dir: &Path, max_entries: usize) -> Option<(String, PathBuf)> {
     let mut entries = std::fs::read_dir(dir).ok()?;
     let mut best: Option<(std::time::SystemTime, String, PathBuf)> = None;
@@ -1994,23 +2094,46 @@ fn codex_open_rollout(pid: u32, budget: &mut DetectionBudget) -> Option<PathBuf>
     let pid = pid.to_string();
     let out = run_command_bounded(
         Path::new("lsof"),
-        &["-a", "-p", &pid, "-Fn"],
+        &["-a", "-p", &pid, "-Ffan"],
         MAX_LSOF_STDOUT_BYTES,
     )
     .ok()?;
     let logical_root = crate::paths::home_dir()?.join(".codex/sessions");
     let canonical_root = std::fs::canonicalize(&logical_root).ok()?;
-    out.lines()
-        .filter_map(|l| l.strip_prefix('n'))
-        .filter(|path| valid_absolute_path(path))
-        .map(Path::new)
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "jsonl")
-                && (path.starts_with(&logical_root) || path.starts_with(&canonical_root))
-        })
-        .find(|path| valid_transcript_path(AgentKind::Codex, path))
-        .map(PathBuf::from)
+    codex_writable_rollout(&out, |path| {
+        (path.starts_with(&logical_root) || path.starts_with(&canonical_root))
+            && valid_transcript_path(AgentKind::Codex, path)
+    })
+}
+
+/// Reading another conversation is not ownership. More than one writer is ambiguous.
+#[cfg(any(unix, test))]
+fn codex_writable_rollout(out: &str, allowed: impl Fn(&Path) -> bool) -> Option<PathBuf> {
+    let mut writable = false;
+    let mut found = None;
+    for line in out.lines() {
+        if line.starts_with('f') {
+            writable = false;
+        }
+        if let Some(access) = line.strip_prefix('a') {
+            writable = matches!(access, "w" | "u");
+        }
+        if let Some(path) = line.strip_prefix('n')
+            && writable
+            && valid_absolute_path(path)
+            && Path::new(path)
+                .extension()
+                .is_some_and(|ext| ext == "jsonl")
+            && allowed(Path::new(path))
+        {
+            let path = PathBuf::from(path);
+            if found.as_ref().is_some_and(|previous| *previous != path) {
+                return None;
+            }
+            found = Some(path);
+        }
+    }
+    found
 }
 
 #[cfg(not(unix))]
@@ -2134,12 +2257,6 @@ pub(crate) fn project_display_name(
     }
     // Folder 스타일 또는 저장소 밖 — 현재 폴더명.
     path.file_name().map(|n| n.to_string_lossy().into_owned())
-}
-
-/// 프로세스의 cwd — 감지 pass의 lsof 호출 예산을 공유한다.
-fn process_cwd(pid: u32, budget: &mut DetectionBudget) -> Option<String> {
-    budget.consume_lsof()?;
-    session_cwds(&[pid]).remove(&pid)
 }
 
 /// 셸 pid의 모든 자손 pid 집합 (resource_monitor와 동일한 BFS).
@@ -2890,7 +3007,13 @@ mod tests {
         };
         let mut process_cache = sentinel_process_cache();
         let sessions = [(sid, self_pid)];
-        let overrides = HashMap::from([(sid, test_binding("new-from-hook"))]);
+        let overrides = HashMap::from([(
+            sid,
+            VerifiedHookBinding {
+                binding: test_binding("new-from-hook"),
+                execution: AgentExecutionIdentity::capture(AgentKind::Codex, self_pid).unwrap(),
+            },
+        )]);
 
         let _ = detect_cached(&sessions, &overrides, &mut cache, &mut process_cache);
 
@@ -3525,6 +3648,367 @@ mod tests {
         let (kind, sid) = classify("node /opt/homebrew/bin/codex --enable hooks").unwrap();
         assert_eq!(kind, AgentKind::Codex);
         assert_eq!(sid, None);
+    }
+
+    #[test]
+    fn independent_codex_identity_requires_exact_resume_or_owned_writer() {
+        let first = "01a121af-61f8-7153-940a-c992a3ce66f0";
+        let second = "01a128af-52e4-7fe2-9ac6-afe1019682bb";
+        assert_eq!(
+            classify(&format!("codex resume {first}"))
+                .unwrap()
+                .1
+                .as_deref(),
+            Some(first)
+        );
+        assert_eq!(
+            classify(&format!("node /bin/codex -m model resume {second}"))
+                .unwrap()
+                .1
+                .as_deref(),
+            Some(second)
+        );
+        for command in [
+            "codex",
+            "codex resume --last",
+            "codex resume",
+            "codex -- prompt resume abc",
+            "codex -c model=resume",
+            "codex fork 01a121af-61f8-7153-940a-c992a3ce66f0",
+        ] {
+            assert_eq!(classify(command).unwrap().1, None, "{command}");
+        }
+        assert!(classify("codex app-server --listen stdio://").is_none());
+        assert!(classify("node /bin/codex -c foo=bar app-server").is_none());
+        for helper in ["review", "apply", "agents", "sandbox", "features", "cloud"] {
+            assert!(classify(&format!("codex {helper}")).is_none());
+        }
+        let same_dir = PathBuf::from("/isolated/same-project");
+        let paths = [first, second]
+            .map(|id| same_dir.join(format!("rollout-2026-10-11T00-00-00-{id}.jsonl")));
+        let mut finder = TranscriptFinder {
+            codex_files: Some(paths.to_vec()),
+        };
+        assert_eq!(finder.find(AgentKind::Codex, first), Some(paths[0].clone()));
+        assert_eq!(
+            finder.find(AgentKind::Codex, second),
+            Some(paths[1].clone())
+        );
+        assert_eq!(
+            finder.find(AgentKind::Codex, "00000000-0000-0000-0000-000000000000"),
+            None
+        );
+    }
+
+    #[test]
+    fn independent_codex_writer_ignores_read_only_peer_and_ambiguous_writers() {
+        let own = "/isolated/own.jsonl";
+        let peer = "/isolated/peer.jsonl";
+        let fields = format!("p42\nf3\nar\nn{peer}\nf4\naw\nn{own}\n");
+        assert_eq!(
+            codex_writable_rollout(&fields, |_| true),
+            Some(PathBuf::from(own))
+        );
+        assert_eq!(
+            codex_writable_rollout(&format!("f3\nar\nn{peer}\n"), |_| true),
+            None
+        );
+        assert_eq!(
+            codex_writable_rollout(&format!("{fields}f5\nau\nn{peer}\n"), |_| true),
+            None
+        );
+        assert_eq!(codex_writable_rollout(&fields, |_| false), None);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn independent_codex_writer_uses_real_lsof_access_fields() {
+        let root = std::env::temp_dir().join(format!("deppy-writer-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let peer = root.join("peer.jsonl");
+        let own = root.join("own.jsonl");
+        std::fs::write(&peer, "peer").unwrap();
+        let reader = std::fs::File::open(&peer).unwrap();
+        let writer = std::fs::File::create(&own).unwrap();
+        let pid = std::process::id().to_string();
+        let out = run_command_bounded(
+            Path::new("lsof"),
+            &["-a", "-p", &pid, "-Ffan"],
+            MAX_LSOF_STDOUT_BYTES,
+        )
+        .unwrap();
+        assert_eq!(
+            codex_writable_rollout(&out, |path| path.starts_with(&root)),
+            Some(own)
+        );
+        drop(reader);
+        drop(writer);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn independent_hook_rows_require_current_execution_and_runtime() {
+        use deppy_core::process_identity::HookExecutionStamp;
+        let execution =
+            AgentExecutionIdentity::capture(AgentKind::Codex, std::process::id()).unwrap();
+        let stamp = HookExecutionStamp {
+            runtime_instance: "current-runtime".into(),
+            ancestors: vec![
+                deppy_core::process_identity::ProcessIdentity {
+                    pid: if std::process::id() == 42 { 43 } else { 42 },
+                    birth: crate::proc_info::ProcessBirth {
+                        seconds: 1,
+                        microseconds: 0,
+                    },
+                },
+                execution.process_identity(),
+            ],
+        };
+        assert!(execution.accepts_hook_stamp(&stamp, "current-runtime"));
+        assert!(!execution.accepts_hook_stamp(&stamp, "old-runtime"));
+        let mut stale = stamp.clone();
+        stale.ancestors[1].birth.seconds += 1;
+        assert!(!execution.accepts_hook_stamp(&stale, "current-runtime"));
+        stale.ancestors[1] = execution.process_identity();
+        stale.ancestors[1].pid = i32::MAX as u32;
+        assert!(!execution.accepts_hook_stamp(&stale, "current-runtime"));
+        stale.ancestors.clear();
+        assert!(!execution.accepts_hook_stamp(&stale, "current-runtime"));
+    }
+
+    #[test]
+    fn independent_linux_birth_ticks_do_not_authorize_an_old_epoch_hook() {
+        use deppy_core::process_identity::{HookExecutionStamp, ProcessIdentity};
+        let current = AgentExecutionIdentity::fixture(AgentKind::Codex, 3600).process_identity();
+        let old_hook = HookExecutionStamp {
+            runtime_instance: "linux-runtime".into(),
+            ancestors: vec![ProcessIdentity {
+                pid: current.pid,
+                birth: crate::proc_info::ProcessBirth {
+                    seconds: 1800,
+                    microseconds: 0,
+                },
+            }],
+        };
+        assert!(!old_hook.contains(current));
+        let current_hook = HookExecutionStamp {
+            ancestors: vec![current],
+            ..old_hook
+        };
+        assert!(current_hook.contains(current));
+    }
+
+    #[test]
+    fn independent_current_execution_hook_replaces_codex_resume_cache() {
+        const FIXTURE_ENV: &str = "DEPPY_TITLE_EXECUTION_FIXTURE_ROOT";
+        const TEST_NAME: &str =
+            "agent_detect::tests::independent_current_execution_hook_replaces_codex_resume_cache";
+        let Ok(root) = std::env::var(FIXTURE_ENV) else {
+            let root = std::env::temp_dir()
+                .join(format!("deppy-title-execution-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST_NAME, "--nocapture"])
+                .env("HOME", &root)
+                .env(FIXTURE_ENV, &root)
+                .output()
+                .unwrap();
+            std::fs::remove_dir_all(&root).unwrap();
+            assert!(
+                result.status.success(),
+                "isolated detector regression failed: {}{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        };
+        let home = PathBuf::from(root);
+        assert_eq!(crate::paths::home_dir().unwrap(), home);
+        let ids = [
+            "01a121af-61f8-7153-940a-c992a3ce66f0",
+            "01a128af-52e4-7fe2-9ac6-afe1019682bb",
+        ];
+        let directory = home.join(".codex/sessions/2026/10/11");
+        std::fs::create_dir_all(&directory).unwrap();
+        let bindings = ids.map(|id| {
+            let path = directory.join(format!("rollout-2026-10-11T00-00-00-{id}.jsonl"));
+            std::fs::write(
+                &path,
+                format!(
+                    "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":\"{}\"}}}}\n",
+                    home.display()
+                ),
+            )
+            .unwrap();
+            let binding = AgentBinding {
+                kind: AgentKind::Codex,
+                session_id: id.into(),
+                transcript: path,
+            };
+            assert!(valid_binding(&binding));
+            binding
+        });
+        let owner = std::process::id();
+        let execution = AgentExecutionIdentity::capture(AgentKind::Codex, owner).unwrap();
+        let sid = SessionId(1);
+        let shell = 424_242;
+        let mut cache = BindingCache {
+            entries: HashMap::from([(
+                sid,
+                fresh_cache_entry(bindings[0].clone(), owner, execution.birth),
+            )]),
+            last_full_scan: None,
+        };
+        let mut process_cache = ProcessRowsCache {
+            rows: vec![ProcRow {
+                pid: owner,
+                ppid: Some(shell),
+                command: format!("codex resume {}", ids[0]),
+            }],
+            fetched_at: Some(Instant::now()),
+            ttl: Duration::from_secs(60),
+        };
+        let stamp = deppy_core::process_identity::HookExecutionStamp {
+            runtime_instance: "isolated-runtime".into(),
+            ancestors: vec![execution.process_identity()],
+        };
+        for command in [
+            format!("codex resume {}", ids[0]),
+            format!("codex fork {}", ids[0]),
+            "codex".into(),
+        ] {
+            process_cache.rows[0].command = command;
+            for binding in [&bindings[1], &bindings[0], &bindings[1]] {
+                let hook = VerifiedHookBinding::try_new(
+                    binding.clone(),
+                    execution,
+                    &stamp,
+                    "isolated-runtime",
+                )
+                .unwrap();
+                let overrides = HashMap::from([(sid, hook)]);
+                for force_full_scan in [true, false, true] {
+                    if force_full_scan {
+                        cache.last_full_scan = None;
+                    }
+                    let detected =
+                        detect_cached(&[(sid, shell)], &overrides, &mut cache, &mut process_cache);
+                    assert_eq!(detected.bindings.get(&sid), Some(binding));
+                    assert_eq!(cache.entries[&sid].binding, *binding);
+                }
+            }
+        }
+
+        process_cache.rows[0].command = format!("codex resume {}", ids[0]);
+        cache.entries.insert(
+            sid,
+            fresh_cache_entry(bindings[0].clone(), owner, execution.birth),
+        );
+        let mut wrong_runtime = stamp.clone();
+        wrong_runtime.runtime_instance = "old-runtime".into();
+        assert!(
+            VerifiedHookBinding::try_new(
+                bindings[1].clone(),
+                execution,
+                &wrong_runtime,
+                "isolated-runtime"
+            )
+            .is_none()
+        );
+        let mut old_execution_stamp = stamp.clone();
+        old_execution_stamp.ancestors[0].birth.seconds += 1;
+        assert!(
+            VerifiedHookBinding::try_new(
+                bindings[1].clone(),
+                execution,
+                &old_execution_stamp,
+                "isolated-runtime"
+            )
+            .is_none()
+        );
+
+        // Even a well-formed proof for a live peer execution cannot cross the pane's process tree.
+        let mut peer = std::process::Command::new("sh")
+            .args(["-c", "read value"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let peer_execution = AgentExecutionIdentity::capture(AgentKind::Codex, peer.id()).unwrap();
+        let peer_stamp = deppy_core::process_identity::HookExecutionStamp {
+            runtime_instance: "isolated-runtime".into(),
+            ancestors: vec![peer_execution.process_identity()],
+        };
+        let peer_hook = VerifiedHookBinding::try_new(
+            bindings[1].clone(),
+            peer_execution,
+            &peer_stamp,
+            "isolated-runtime",
+        )
+        .unwrap();
+        let other_shell = shell + 1;
+        process_cache.rows.push(ProcRow {
+            pid: peer.id(),
+            ppid: Some(other_shell),
+            command: "codex".into(),
+        });
+        cache.last_full_scan = None;
+        let result = detect_cached(
+            &[(sid, shell)],
+            &HashMap::from([(sid, peer_hook)]),
+            &mut cache,
+            &mut process_cache,
+        );
+        assert_eq!(result.bindings.get(&sid), Some(&bindings[0]));
+        drop(peer.stdin.take());
+        assert!(peer.wait().is_ok());
+
+        // A full scan must reject PID reuse as strictly as the cheap cache path.
+        let old_birth = crate::proc_info::ProcessBirth {
+            seconds: execution.birth.seconds + 1,
+            ..execution.birth
+        };
+        cache.entries.insert(
+            sid,
+            fresh_cache_entry(bindings[1].clone(), owner, old_birth),
+        );
+        cache.last_full_scan = None;
+        let result = detect_cached(
+            &[(sid, shell)],
+            &HashMap::new(),
+            &mut cache,
+            &mut process_cache,
+        );
+        assert_eq!(result.bindings.get(&sid), Some(&bindings[0]));
+        assert_eq!(cache.entries[&sid].owner_start_time, Some(execution.birth));
+    }
+
+    #[test]
+    fn independent_codex_hook_rejects_other_resume_and_fork_source() {
+        let own = "01a121af-61f8-7153-940a-c992a3ce66f0";
+        let peer = "01a128af-52e4-7fe2-9ac6-afe1019682bb";
+        let binding = AgentBinding {
+            kind: AgentKind::Codex,
+            session_id: own.into(),
+            transcript: PathBuf::from("/isolated/own.jsonl"),
+        };
+        assert!(!hook_binding_matches_command(
+            &binding,
+            &format!("codex resume {peer}")
+        ));
+        assert!(hook_binding_matches_command(
+            &binding,
+            &format!("codex -c key=value resume {own}")
+        ));
+        assert!(!hook_binding_matches_command(
+            &binding,
+            &format!("node /bin/codex fork {own}")
+        ));
+        assert!(hook_binding_matches_command(
+            &binding,
+            &format!("codex fork {peer}")
+        ));
+        assert!(hook_binding_matches_command(&binding, "codex"));
     }
 
     /// Kimi는 런처가 `kimi`로 띄우는데 **실제 워커 프로세스명은 `kimi-code`**다

@@ -104,6 +104,46 @@ fn observer_settings(command: &str, grok: bool) -> serde_json::Value {
     serde_json::json!({"hooks":hooks})
 }
 
+fn provider_observer_settings(hooks: &std::path::Path, grok: bool) -> serde_json::Value {
+    let script = if grok {
+        "deppy-hook-grok-observe.sh"
+    } else {
+        "deppy-hook-claude-observe.sh"
+    };
+    observer_settings(&hooks.join(script).display().to_string(), grok)
+}
+
+const HOOK_EVENTS: &[(&str, &str)] = &[
+    ("observe", "observe"),
+    ("claude-observe", "observe"),
+    ("codex-observe", "observe"),
+    ("grok-observe", "observe"),
+    ("kimi-observe", "observe"),
+    ("session-start", "session-start"),
+    ("needs-input", "needs-input"),
+    ("clear", "clear"),
+    ("turn-done", "turn-done"),
+];
+
+fn hook_event_script(
+    proxy_bin: &str,
+    db_path: &std::path::Path,
+    name: &str,
+    event: &str,
+) -> String {
+    let provider = match name {
+        "claude-observe" => " --provider claude",
+        "codex-observe" => " --provider codex",
+        "grok-observe" => " --provider grok",
+        "kimi-observe" => " --provider kimi",
+        _ => "",
+    };
+    format!(
+        "#!/bin/sh\nexec {}{provider} \"$@\"\n",
+        hook_command(proxy_bin, db_path, event)
+    )
+}
+
 fn codex_hook_args(hooks_dir: &std::path::Path) -> String {
     const EVENTS: &[&str] = &[
         "SessionStart",
@@ -118,7 +158,7 @@ fn codex_hook_args(hooks_dir: &std::path::Path) -> String {
         "SessionEnd",
     ];
     let command = hooks_dir
-        .join("deppy-hook-observe.sh")
+        .join("deppy-hook-codex-observe.sh")
         .display()
         .to_string();
     let mut args = String::from("--enable hooks --dangerously-bypass-hook-trust");
@@ -127,6 +167,50 @@ fn codex_hook_args(hooks_dir: &std::path::Path) -> String {
             " -c 'hooks.{event}=[{{hooks=[{{type=\"command\",command='\\''{command}'\\'',timeout=10}}]}}]'"));
     }
     args
+}
+
+#[cfg(unix)]
+fn codex_shim(hooks: &std::path::Path) -> String {
+    let isolation = r#"
+# A shared Codex daemon cannot inherit a different pane's hook environment.
+# Older CLIs and explicit remote/helper commands keep their original invocation.
+DEPPY_LOCAL_TUI=1
+DEPPY_HAS_NO_DAEMON=0
+DEPPY_SKIP_VALUE=0
+DEPPY_COMMAND_POSITION=1
+for DEPPY_ARG in "$@"; do
+    if [ "$DEPPY_SKIP_VALUE" = 1 ]; then DEPPY_SKIP_VALUE=0; continue; fi
+    case "$DEPPY_ARG" in
+        --) break ;;
+        --no-daemon) DEPPY_HAS_NO_DAEMON=1 ;;
+        --remote) DEPPY_LOCAL_TUI=0; DEPPY_SKIP_VALUE=1 ;;
+        --remote=*) DEPPY_LOCAL_TUI=0 ;;
+        -c|--config|-m|--model|-p|--profile|-C|--cd|--enable|--disable|-a|--ask-for-approval|-s|--sandbox|--add-dir|--local-provider|-i|--image|--remote-auth-token-env) DEPPY_SKIP_VALUE=1 ;;
+        --help|-h|--version|-V) DEPPY_LOCAL_TUI=0 ;;
+        -*) ;;
+        *)
+            if [ "$DEPPY_COMMAND_POSITION" = 1 ]; then
+                DEPPY_COMMAND_POSITION=0
+                case "$DEPPY_ARG" in
+                    app-server|exec|e|review|apply|a|agents|login|logout|mcp|mcp-server|plugin|remote-control|app|completion|update|doctor|debug|sandbox|features|cloud|queue|archive|delete|migrate-rollouts|unarchive|exec-server|help) DEPPY_LOCAL_TUI=0 ;;
+                esac
+            fi
+            ;;
+    esac
+done
+if [ "$DEPPY_LOCAL_TUI" = 1 ] && [ "$DEPPY_HAS_NO_DAEMON" = 0 ]; then
+    DEPPY_CODEX_HELP="$("$REAL_AGENT" --help 2>/dev/null)"
+    case "$DEPPY_CODEX_HELP" in
+        *--no-daemon*) set -- --no-daemon "$@" ;;
+    esac
+fi
+unset DEPPY_LOCAL_TUI DEPPY_HAS_NO_DAEMON DEPPY_SKIP_VALUE DEPPY_COMMAND_POSITION DEPPY_ARG DEPPY_CODEX_HELP
+"#;
+    format!(
+        "{}REAL_AGENT=\"${{DEPPY_AGENT_EXECUTABLE:-codex}}\"\nunset DEPPY_AGENT_EXECUTABLE\n{isolation}exec \"$REAL_AGENT\" {} \"$@\"\n",
+        shim_header(),
+        codex_hook_args(hooks)
+    )
 }
 
 /// shim/hook 스크립트/claude 설정을 (재)생성한다. 매 시작 호출 — idempotent.
@@ -145,35 +229,12 @@ pub fn install(db_path: &std::path::Path, proxy_bin: &str) -> anyhow::Result<()>
 
     // ── hook 이벤트 스크립트 (codex TOML command로 공백 없는 경로가 필요) ──
     // (스크립트명, proxy --event 값)
-    const EVENTS: &[(&str, &str)] = &[
-        ("observe", "observe"),
-        ("kimi-observe", "observe"),
-        ("session-start", "session-start"),
-        ("needs-input", "needs-input"),
-        ("clear", "clear"),
-        ("turn-done", "turn-done"),
-    ];
-    for (name, ev) in EVENTS {
-        let provider = if *name == "kimi-observe" {
-            " --provider kimi"
-        } else {
-            ""
-        };
-        let script = format!(
-            "#!/bin/sh\nexec {}{provider} \"$@\"\n",
-            hook_command(proxy_bin, db_path, ev)
-        );
+    for (name, ev) in HOOK_EVENTS {
+        let script = hook_event_script(proxy_bin, db_path, name, ev);
         write_executable(&hooks.join(format!("deppy-hook-{name}.sh")), &script)?;
     }
-    let hook = |name: &str| {
-        hooks
-            .join(format!("deppy-hook-{name}.sh"))
-            .display()
-            .to_string()
-    };
-
     // ── claude: --settings 오버레이 파일 (사용자 settings.json 무변경) ──
-    let mut claude_settings = observer_settings(&hook("observe"), false);
+    let mut claude_settings = provider_observer_settings(&hooks, false);
     claude_settings["statusLine"] =
         serde_json::json!({ "type":"command", "command":statusline_command(proxy_bin,db_path) });
     let settings_path = root.join("claude-hook-settings.json");
@@ -193,11 +254,7 @@ pub fn install(db_path: &std::path::Path, proxy_bin: &str) -> anyhow::Result<()>
     write_executable(&shims.join("claude"), &claude_shim)?;
 
     // codex shim — cmux와 동일한 per-invocation hook 주입 + bypass(프롬프트 없음).
-    let codex_args = codex_hook_args(&hooks);
-    let codex_shim = format!(
-        "{strip}REAL_AGENT=\"${{DEPPY_AGENT_EXECUTABLE:-codex}}\"\nunset DEPPY_AGENT_EXECUTABLE\nexec \"$REAL_AGENT\" {codex_args} \"$@\"\n"
-    );
-    write_executable(&shims.join("codex"), &codex_shim)?;
+    write_executable(&shims.join("codex"), &codex_shim(&hooks))?;
 
     // Grok은 공식 전역 훅 디렉터리의 Deppy 파일만 관리한다. 다른 앱의 훅은 보존한다.
     if let Some(home) = crate::paths::home_dir() {
@@ -205,7 +262,7 @@ pub fn install(db_path: &std::path::Path, proxy_bin: &str) -> anyhow::Result<()>
         std::fs::create_dir_all(&dir)?;
         let file = dir.join("deppy-status.json");
         let staged = dir.join("deppy-status.json.tmp");
-        let settings = observer_settings(&hook("observe"), true);
+        let settings = provider_observer_settings(&hooks, true);
         std::fs::write(&staged, serde_json::to_vec_pretty(&settings)?)?;
         std::fs::rename(staged, file)?;
     }
@@ -598,6 +655,295 @@ mod tests {
         ] {
             assert!(args.contains(&format!("hooks.{event}=")), "missing {event}");
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn independent_provider_observers_forward_path_free_payloads_with_explicit_provider() {
+        use std::io::Write as _;
+
+        let root =
+            std::env::temp_dir().join(format!("deppy-provider-observers-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let proxy = root.join("proxy with spaces");
+        let record = root.join("record");
+        let received = root.join("received");
+        let db = root.join("db with ' quote.sqlite");
+        write_executable(
+            &proxy,
+            r#"#!/bin/sh
+printf '%s\000' "$@" > "$DEPPY_TEST_RECORD"
+cat > "$DEPPY_TEST_RECEIVED"
+"#,
+        )
+        .unwrap();
+        let payload = br#"{"sessionId":"native-fixture","hookEventName":"UserPromptSubmit","prompt":"synthetic fixture input"}"#;
+        for provider in ["claude", "codex", "grok", "kimi"] {
+            let name = format!("{provider}-observe");
+            let script = root.join(format!("deppy-hook-{name}.sh"));
+            write_executable(
+                &script,
+                &hook_event_script(proxy.to_str().unwrap(), &db, &name, "observe"),
+            )
+            .unwrap();
+            let mut child = std::process::Command::new(&script)
+                .env("DEPPY_TEST_RECORD", &record)
+                .env("DEPPY_TEST_RECEIVED", &received)
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(payload).unwrap();
+            assert!(child.wait().unwrap().success(), "{provider}");
+            let bytes = std::fs::read(&record).unwrap();
+            let args = bytes
+                .strip_suffix(&[0])
+                .unwrap()
+                .split(|byte| *byte == 0)
+                .map(|arg| std::str::from_utf8(arg).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                args,
+                [
+                    "hooks",
+                    "--db",
+                    db.to_str().unwrap(),
+                    "--event",
+                    "observe",
+                    "--deppy-hook",
+                    "--provider",
+                    provider
+                ],
+                "explicit producer provider: {provider}"
+            );
+            assert_eq!(
+                std::fs::read(&received).unwrap(),
+                payload,
+                "path-free payload remains exact: {provider}"
+            );
+            assert!(
+                HOOK_EVENTS.contains(&(name.as_str(), "observe")),
+                "provider script is installed: {provider}"
+            );
+        }
+        for (grok, provider) in [(false, "claude"), (true, "grok")] {
+            let settings = provider_observer_settings(&root, grok);
+            assert_eq!(
+                settings["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],
+                root.join(format!("deppy-hook-{provider}-observe.sh"))
+                    .to_str()
+                    .unwrap()
+            );
+        }
+        assert!(codex_hook_args(&root).contains("deppy-hook-codex-observe.sh"));
+        assert!(
+            !hook_event_script(proxy.to_str().unwrap(), &db, "observe", "observe")
+                .contains("--provider"),
+            "generic legacy/Cursor observer stays provider-neutral"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn independent_codex_shim_isolates_local_panes_and_preserves_compatibility() {
+        let root =
+            std::env::temp_dir().join(format!("deppy-codex-isolation-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let real = root.join("real-codex");
+        let shim = root.join("codex");
+        let record = root.join("record");
+        write_executable(
+            &real,
+            r#"#!/bin/sh
+if [ "$1" = --help ]; then
+    [ "$DEPPY_TEST_NEW_CLI" = 1 ] && printf '%s\n' '--no-daemon'
+    exit 0
+fi
+printf '%s\n' "$DEPPY_SESSION_ID" "$@" > "$DEPPY_TEST_RECORD"
+"#,
+        )
+        .unwrap();
+        write_executable(&shim, &codex_shim(&root.join("hooks"))).unwrap();
+        let id = "01a121af-61f8-7153-940a-c992a3ce66f0";
+        for (pane, args, supported, expected_count) in [
+            ("workspace:1", vec![], true, 1),
+            ("workspace:2", vec!["resume", id], true, 1),
+            ("workspace:3", vec!["fork", id], true, 1),
+            ("workspace:4", vec!["--no-daemon", "resume", id], true, 1),
+            (
+                "workspace:5",
+                vec!["--remote", "ws://example.invalid", "resume", id],
+                true,
+                0,
+            ),
+            ("workspace:6", vec!["exec", "test"], true, 0),
+            ("workspace:7", vec!["resume", id], false, 0),
+            (
+                "workspace:8",
+                vec!["-c", "key=app-server", "resume", id],
+                true,
+                1,
+            ),
+        ] {
+            let result = std::process::Command::new(&shim)
+                .args(&args)
+                .env("DEPPY_AGENT_EXECUTABLE", &real)
+                .env("DEPPY_SESSION_ID", pane)
+                .env("DEPPY_TEST_NEW_CLI", if supported { "1" } else { "0" })
+                .env("DEPPY_TEST_RECORD", &record)
+                .env_remove("DEPPY_SHIM_GUARD")
+                .status()
+                .unwrap();
+            assert!(result.success(), "{pane}");
+            let recorded = std::fs::read_to_string(&record).unwrap();
+            let lines: Vec<_> = recorded.lines().collect();
+            assert_eq!(lines[0], pane);
+            assert_eq!(
+                lines.iter().filter(|arg| **arg == "--no-daemon").count(),
+                expected_count,
+                "{pane}"
+            );
+            assert!(recorded.contains("hooks.SessionStart="));
+            assert!(lines.ends_with(&args), "user args preserved: {pane}");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn independent_codex_shim_classifies_command_position_without_rewriting_prompt_arguments() {
+        let root =
+            std::env::temp_dir().join(format!("deppy-codex-arguments-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let real = root.join("real-codex");
+        let shim = root.join("codex");
+        let record = root.join("record");
+        write_executable(
+            &real,
+            r#"#!/bin/sh
+if [ "$1" = --help ]; then
+    [ "$DEPPY_TEST_NEW_CLI" = 1 ] && printf '%s\n' '--no-daemon'
+    exit 0
+fi
+printf '%s\000' "$@" > "$DEPPY_TEST_RECORD"
+"#,
+        )
+        .unwrap();
+        write_executable(&shim, &codex_shim(&root.join("hooks"))).unwrap();
+        let id = "01a121af-61f8-7153-940a-c992a3ce66f0";
+        for (name, args, supported, inject) in [
+            (
+                "resume helper-named prompt",
+                vec!["resume", id, "review"],
+                true,
+                true,
+            ),
+            (
+                "fork helper-named prompt",
+                vec!["fork", id, "app-server"],
+                true,
+                true,
+            ),
+            (
+                "resume helper-named session",
+                vec!["resume", "review", "app-server"],
+                true,
+                true,
+            ),
+            (
+                "prompt with shell characters",
+                vec!["resume", id, "review 'quoted' \"text\"\n$HOME `literal`"],
+                true,
+                true,
+            ),
+            ("empty prompt argument", vec!["resume", id, ""], true, true),
+            (
+                "option value before command",
+                vec!["--remote-auth-token-env", "review", "resume", id],
+                true,
+                true,
+            ),
+            (
+                "option value after command",
+                vec!["resume", "--model", "review", id, "app-server"],
+                true,
+                true,
+            ),
+            (
+                "attached option value",
+                vec!["--config=key=review", "fork", id, "app-server"],
+                true,
+                true,
+            ),
+            (
+                "delimiter prompt",
+                vec!["resume", id, "--", "--remote"],
+                true,
+                true,
+            ),
+            ("delimiter helper prompt", vec!["--", "review"], true, true),
+            (
+                "existing isolation flag",
+                vec!["resume", id, "--no-daemon", "review"],
+                true,
+                false,
+            ),
+            (
+                "flag text in prompt",
+                vec!["resume", id, "--", "--no-daemon"],
+                true,
+                true,
+            ),
+            ("helper command", vec!["review", "resume"], true, false),
+            (
+                "new helper command",
+                vec!["remote-control", "status"],
+                true,
+                false,
+            ),
+            ("helper alias", vec!["a", "resume"], true, false),
+            (
+                "remote endpoint",
+                vec!["resume", "--remote", "ws://example.invalid", id, "review"],
+                true,
+                false,
+            ),
+            (
+                "attached remote endpoint",
+                vec!["--remote=ws://example.invalid", "fork", id, "app-server"],
+                true,
+                false,
+            ),
+            ("old CLI prompt", vec!["resume", id, "review"], false, false),
+        ] {
+            let result = std::process::Command::new(&shim)
+                .args(&args)
+                .env("DEPPY_AGENT_EXECUTABLE", &real)
+                .env("DEPPY_TEST_NEW_CLI", if supported { "1" } else { "0" })
+                .env("DEPPY_TEST_RECORD", &record)
+                .env_remove("DEPPY_SHIM_GUARD")
+                .status()
+                .unwrap();
+            assert!(result.success(), "{name}");
+            let bytes = std::fs::read(&record).unwrap();
+            let recorded: Vec<_> = bytes
+                .strip_suffix(&[0])
+                .unwrap()
+                .split(|byte| *byte == 0)
+                .map(|arg| std::str::from_utf8(arg).unwrap())
+                .collect();
+            assert!(recorded.ends_with(&args), "exact user arguments: {name}");
+            let injected_prefix = &recorded[..recorded.len() - args.len()];
+            assert_eq!(
+                injected_prefix
+                    .iter()
+                    .filter(|arg| **arg == "--no-daemon")
+                    .count(),
+                usize::from(inject),
+                "{name}"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

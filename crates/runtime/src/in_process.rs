@@ -14912,12 +14912,15 @@ mod tests {
         // 참고), "pane→session_id 참조가 저장됐는지"는 세션이 살아 있는 동안(exit
         // 전에) 확인해야 한다 — attach_in_new_tab 직후 emit_mux_snapshot이 이미
         // save_layout을 거치므로 AgentSpawned를 받은 시점에 이미 반영돼 있다.
+        // 스크립트는 입력 한 줄을 받을 때까지 끝나지 않는다 — 바로 끝나는 명령이면
+        // 런타임이 exit을 먼저 처리해(pane·탭 닫힘 → 탭 0개 layout 재저장) 느린 CI에서
+        // 아래 확인이 탭 0개를 읽었다 (2026-10-11). 확인한 뒤 입력을 보내 끝낸다.
         // "exit 상태가 영속되는지"는 그 뒤 exit을 기다려 별도로 확인한다.
         client
-            .send_command(spawn_agent_cmd("echo persist-ok", None, None))
+            .send_command(spawn_agent_cmd("read line; echo persist-ok", None, None))
             .unwrap();
-        probe.wait_for(Duration::from_secs(15), |e| match e {
-            RuntimeEvent::AgentSpawned { .. } => Some(()),
+        let session = probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::AgentSpawned { session } => Some(*session),
             _ => None,
         });
         // mux layout: window/tab/pane가 저장되고 pane이 영속 session id를 참조
@@ -14933,6 +14936,12 @@ mod tests {
                 .unwrap();
             assert_eq!(pane_session, persisted_id);
         }
+        client
+            .send_command(RuntimeCommand::WriteInput {
+                session,
+                bytes: b"\r".to_vec(),
+            })
+            .unwrap();
         probe.wait_for(Duration::from_secs(15), |e| match e {
             RuntimeEvent::SessionExited { .. } => Some(()),
             _ => None,

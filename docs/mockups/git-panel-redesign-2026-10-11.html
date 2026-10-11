@@ -1,0 +1,630 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Git 패널 개선안</title>
+<style>
+:root{
+  color-scheme:dark;
+  --page:#0b0d10;--bg:#111418;--panel:#181c22;--chrome:#181b20;--input:#20262e;--line:#303640;
+  --text:#dce0e6;--muted:#929ca9;--faint:#6b7480;--accent:#22bfd0;--sel:#1c303a;--hover:#222a33;
+  --good:#42c7a2;--warn:#e6ae56;--bad:#ef6671;--blue:#6aa7ff;
+  --mono:"SF Mono",ui-monospace,Menlo,monospace;
+  font:14px/1.5 -apple-system,BlinkMacSystemFont,"Apple SD Gothic Neo","Noto Sans KR",sans-serif;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--page);color:var(--text)}
+button,select{font:inherit;color:inherit}
+button{cursor:pointer}
+.hidden{display:none!important}
+
+/* 시안 머리말 */
+.proposal{display:flex;flex-wrap:wrap;gap:16px 24px;align-items:flex-end;justify-content:space-between;padding:22px 24px 16px}
+.proposal h1{margin:0 0 4px;font-size:20px}
+.proposal p{margin:0;color:var(--muted);font-size:13px;max-width:640px}
+.choices{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:6px;overflow:hidden;background:var(--input)}
+.seg button{border:0;background:transparent;padding:6px 12px;font-size:13px;color:var(--muted)}
+.seg button+button{border-left:1px solid var(--line)}
+.seg button[aria-pressed=true]{background:var(--sel);color:var(--text);box-shadow:inset 0 -2px var(--accent)}
+.choices label{font-size:13px;color:var(--muted);display:flex;gap:6px;align-items:center}
+.choices select{background:var(--input);border:1px solid var(--line);border-radius:6px;padding:5px 8px}
+
+/* 앱 셸 */
+.shell{margin:0 24px;height:660px;display:grid;grid-template-columns:72px minmax(0,1fr);border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--bg)}
+.rail{background:var(--chrome);border-right:1px solid var(--line);display:flex;flex-direction:column;gap:12px;padding-top:12px}
+.rail span{height:44px;display:flex;flex-direction:column;align-items:center;justify-content:center;font-size:12px;color:var(--muted);line-height:1.2;margin:0 4px}
+.rail span b{font-size:16px;font-weight:400}
+.rail span.active{color:var(--text);background:var(--sel);box-shadow:inset 2px 0 var(--accent)}
+.main{display:flex;flex-direction:column;min-width:0;min-height:0}
+.tabbar{height:34px;flex:none;display:flex;align-items:stretch;background:var(--chrome);border-bottom:1px solid var(--line);font-size:13px}
+.tabbar span{display:flex;align-items:center;padding:0 14px;color:var(--muted);border-right:1px solid var(--line)}
+.tabbar span.active{color:var(--text);background:var(--bg);box-shadow:inset 0 2px var(--accent)}
+.body{flex:1;min-height:0;display:grid;grid-template-columns:300px 1px minmax(0,1fr)}
+.vsep{background:var(--line)}
+
+/* 좌측 목록 */
+.list{display:flex;flex-direction:column;min-height:0;min-width:0}
+.branch-card{flex:none;margin:12px 12px 8px;padding:10px 12px;border:1px solid var(--line);border-radius:8px;background:var(--panel)}
+.bline{display:flex;align-items:center;gap:8px;min-width:0}
+.bname{font:600 13px var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0}
+.track{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:6px;font-size:12px;color:var(--muted)}
+.track .up{font-family:var(--mono)}
+.pill{display:inline-flex;align-items:center;gap:3px;height:20px;padding:0 7px;border-radius:10px;font-size:11.5px;font-variant-numeric:tabular-nums;border:1px solid transparent}
+.pill.ahead{color:var(--good);background:rgba(66,199,162,.12)}
+.pill.behind{color:var(--warn);background:rgba(230,174,86,.12)}
+.pill.none{color:var(--warn);border-color:rgba(230,174,86,.45)}
+.pill.ok{color:var(--muted);background:var(--input)}
+.bfoot{display:flex;align-items:center;justify-content:space-between;margin-top:8px;font-size:11.5px;color:var(--faint)}
+.ibtn{height:26px;min-width:26px;padding:0 8px;border:1px solid var(--line);border-radius:5px;background:var(--input);font-size:12px;color:var(--muted)}
+.ibtn:hover{color:var(--text);background:var(--hover)}
+.segtabs{flex:none;display:grid;grid-template-columns:repeat(3,1fr);margin:0 12px;border:1px solid var(--line);border-radius:6px;overflow:hidden}
+.segtabs button{border:0;background:var(--input);height:30px;font-size:13px;color:var(--muted);display:flex;align-items:center;justify-content:center;gap:6px}
+.segtabs button+button{border-left:1px solid var(--line)}
+.segtabs button[aria-selected=true]{background:var(--sel);color:var(--text);box-shadow:inset 0 -2px var(--accent)}
+.cnt{min-width:20px;height:18px;padding:0 5px;border-radius:9px;background:var(--line);color:var(--text);font-size:11px;line-height:18px;font-variant-numeric:tabular-nums;text-align:center}
+.tools{flex:none;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px 12px 6px;font-size:12px;color:var(--muted)}
+.tools .seg button{padding:2px 9px;font-size:12px}
+.rows{flex:1;min-height:0;overflow:auto;padding:0 6px 8px}
+.lfoot{flex:none;border-top:1px solid var(--line);padding:6px 12px;font-size:11.5px;color:var(--faint);display:flex;gap:10px;flex-wrap:wrap}
+kbd{font:11px var(--mono);border:1px solid var(--line);border-bottom-width:2px;border-radius:4px;padding:0 4px;color:var(--muted)}
+
+.frow{width:100%;display:grid;grid-template-columns:20px minmax(0,auto) minmax(0,1fr) auto;align-items:center;gap:8px;height:32px;padding:0 8px 0 10px;border:0;border-radius:5px;background:transparent;text-align:left;position:relative}
+.frow:hover{background:var(--hover)}
+.frow.sel{background:var(--sel)}
+.frow.sel::before{content:"";position:absolute;left:0;top:4px;bottom:4px;width:2px;border-radius:1px;background:var(--accent)}
+.frow.indent{padding-left:26px}
+.fname{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:13.5px}
+.fdir{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:12px;color:var(--faint)}
+.fstat{display:flex;align-items:center;gap:6px;font:11.5px var(--mono)}
+.add{color:var(--good)}.del{color:var(--bad)}
+.bar{display:inline-flex;gap:1px}.bar i{width:5px;height:8px;border-radius:1px;background:var(--line)}
+.bar i.a{background:var(--good)}.bar i.d{background:var(--bad)}
+.sb{width:18px;height:18px;border-radius:4px;display:inline-flex;align-items:center;justify-content:center;font:700 10.5px var(--mono)}
+.s-M{color:var(--warn);background:rgba(230,174,86,.14)}
+.s-A{color:var(--good);background:rgba(66,199,162,.14)}
+.s-D{color:var(--bad);background:rgba(239,102,113,.14)}
+.s-R{color:var(--blue);background:rgba(106,167,255,.14)}
+.s-U{color:#fff;background:var(--bad)}
+.s-Q{color:var(--muted);background:var(--input)}
+.dirrow{width:100%;display:flex;align-items:center;gap:6px;height:28px;padding:0 8px;border:0;background:transparent;color:var(--muted);font-size:12px;text-align:left;border-radius:5px}
+.dirrow:hover{background:var(--hover)}
+.chev{display:inline-block;width:12px;transition:transform .12s;color:var(--faint)}
+.closed .chev{transform:rotate(-90deg)}
+.subhead{display:flex;align-items:center;justify-content:space-between;padding:10px 8px 4px;font-size:12px;color:var(--muted)}
+.tag{font-size:10.5px;padding:1px 6px;border-radius:8px;border:1px solid rgba(34,191,208,.5);color:var(--accent)}
+.commit{width:100%;display:grid;grid-template-columns:12px auto minmax(0,1fr) auto;gap:8px;align-items:center;min-height:40px;padding:4px 8px;border:0;border-radius:5px;background:transparent;text-align:left}
+.commit:hover{background:var(--hover)}
+.sha{font:12px var(--mono);color:var(--accent)}
+.cmsg{font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.when{font-size:11.5px;color:var(--faint);white-space:nowrap}
+.sechead{width:100%;display:flex;align-items:center;gap:8px;height:34px;margin-top:6px;padding:0 8px;border:0;border-bottom:1px solid var(--line);background:transparent;font-size:13px;font-weight:600;text-align:left}
+.wt{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:2px 10px;align-items:center;padding:8px 10px;border-radius:6px;border:1px solid transparent}
+.wt:hover{background:var(--hover)}
+.wt.cur{border-color:var(--line);background:var(--panel)}
+.wt b{font-weight:600;font-size:13.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.wt .br{font:12px var(--mono);color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.wt .pth{grid-column:1/-1;font-size:11.5px;color:var(--faint);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.badge{font-size:11px;padding:1px 7px;border-radius:9px;background:rgba(34,191,208,.14);color:var(--accent)}
+.card{margin:16px 8px;padding:18px 16px;border:1px dashed var(--line);border-radius:8px;text-align:center;color:var(--muted);font-size:13px}
+.card b{display:block;color:var(--text);font-size:14px;margin-bottom:4px}
+.card .ico{font-size:22px;color:var(--good);display:block;margin-bottom:6px}
+.card a{color:var(--accent);cursor:pointer}
+.banner{margin:6px 8px;padding:8px 10px;border:1px solid var(--warn);border-radius:6px;background:rgba(230,174,86,.08);font-size:12px;color:var(--text)}
+.skel{height:32px;margin:4px 8px;border-radius:5px;background:linear-gradient(90deg,var(--panel),var(--hover),var(--panel));background-size:200% 100%;animation:sh 1.2s infinite}
+@keyframes sh{to{background-position:-200% 0}}
+
+/* 우측 diff */
+.detail{display:flex;flex-direction:column;min-width:0;min-height:0}
+.dhead{flex:none;padding:12px 16px 10px;border-bottom:1px solid var(--line);display:flex;flex-direction:column;gap:8px}
+.dpath{display:flex;align-items:center;gap:8px;min-width:0}
+.dpath .dir{color:var(--faint);font:12.5px var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;flex:0 1 auto}
+.dpath strong{font:600 14px var(--mono);white-space:nowrap}
+.dmeta{display:flex;flex-wrap:wrap;align-items:center;gap:8px;font-size:12px;color:var(--muted)}
+.mode{height:24px;display:inline-flex;align-items:center;padding:0 8px;border-radius:5px;background:var(--input);border:1px solid var(--line)}
+.hnav{display:inline-flex;align-items:center;gap:4px;margin-left:auto}
+.hnav span{font-variant-numeric:tabular-nums;min-width:62px;text-align:center}
+.dacts{display:flex;gap:6px}
+.dbody{flex:1;min-height:0;overflow:auto;font:12.5px/20px var(--mono)}
+.dl{display:grid;grid-template-columns:44px 44px 18px minmax(0,1fr);white-space:pre}
+.dl .n{color:var(--faint);text-align:right;padding-right:8px;user-select:none}
+.dl .g{text-align:center;user-select:none}
+.dl.a{background:rgba(66,199,162,.10)}.dl.a .g{color:var(--good)}
+.dl.d{background:rgba(239,102,113,.10)}.dl.d .g{color:var(--bad)}
+.hh{display:flex;align-items:center;gap:8px;padding:2px 12px;color:var(--muted);background:var(--panel);border-top:1px solid var(--line);border-bottom:1px solid var(--line);font-size:12px;white-space:nowrap;overflow:hidden}
+.hh.cur{box-shadow:inset 2px 0 var(--accent);color:var(--text)}
+.gap{padding:2px 12px 2px 106px;color:var(--faint);font-size:12px}
+.dempty{margin:auto;max-width:360px;text-align:center;color:var(--muted);font-size:13px;padding:24px}
+.dempty b{display:block;color:var(--text);font-size:15px;margin-bottom:6px}
+.sum{margin:20px 16px;display:grid;gap:10px}
+.sum .box{border:1px solid var(--line);border-radius:8px;background:var(--panel);padding:12px 14px}
+.sum .k{font-size:12px;color:var(--muted)}
+.sum .v{font-size:15px;margin-top:2px}
+.toptiles{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+
+/* 지금 화면 재현 */
+.cur-list{padding:10px 12px;font-size:14px;overflow:auto;flex:1}
+.cur-list .weak{color:var(--muted)}
+.cur-row{display:flex;gap:8px;align-items:center;height:24px;white-space:nowrap;overflow:hidden}
+.cur-row .r{margin-left:auto;display:flex;gap:6px;font:12px var(--mono)}
+.cur-sec{margin-top:6px;height:24px;display:flex;align-items:center}
+.cur-btn{font-size:11px;border:1px solid var(--line);border-radius:3px;padding:0 4px;color:var(--muted)}
+.callout{position:absolute;max-width:220px;padding:6px 8px;border-radius:6px;background:#3a2a10;border:1px solid var(--warn);font-size:11.5px;color:#f7dcae;line-height:1.4;z-index:2}
+
+/* 컨텍스트 메뉴, 토스트 */
+.menu{position:fixed;z-index:20;min-width:190px;padding:4px;border:1px solid var(--line);border-radius:7px;background:var(--panel);box-shadow:0 8px 24px rgba(0,0,0,.45)}
+.menu button{display:flex;width:100%;justify-content:space-between;gap:16px;border:0;background:transparent;padding:6px 10px;border-radius:4px;font-size:13px;text-align:left}
+.menu button:hover{background:var(--sel)}
+.menu kbd{border:0;color:var(--faint)}
+.toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);padding:8px 14px;border-radius:6px;background:var(--panel);border:1px solid var(--line);font-size:13px;z-index:30}
+
+/* 설명 */
+.notes{padding:28px 24px 48px;max-width:1180px}
+.notes h2{font-size:17px;margin:0 0 4px}
+.notes>p{margin:0 0 16px;color:var(--muted);font-size:13px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;vertical-align:top;padding:9px 10px;border-bottom:1px solid var(--line)}
+th{color:var(--muted);font-weight:500;font-size:12px}
+td:first-child{white-space:nowrap;color:var(--muted)}
+.pri{font-size:11px;padding:1px 7px;border-radius:9px;white-space:nowrap}
+.p1{background:rgba(66,199,162,.14);color:var(--good)}
+.p2{background:rgba(34,191,208,.14);color:var(--accent)}
+.p3{background:var(--input);color:var(--muted)}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px;margin-top:20px}
+.grid2 section{border:1px solid var(--line);border-radius:8px;padding:12px 14px;background:var(--bg)}
+.grid2 h3{margin:0 0 6px;font-size:14px}
+.grid2 p,.grid2 li{font-size:13px;color:var(--muted);margin:0}
+.grid2 ul{margin:0;padding-left:18px}
+
+.back{display:none}
+@media (max-width:760px){
+  .proposal{padding:16px}
+  .shell{margin:0 16px;grid-template-columns:minmax(0,1fr);height:620px}
+  .rail{display:none}
+  .body{grid-template-columns:minmax(0,1fr)}
+  .vsep{display:none}
+  .body .detail{display:none}
+  .body.mobile-detail .list{display:none}
+  .body.mobile-detail .detail{display:flex}
+  .back{display:inline-flex}
+  .toptiles{grid-template-columns:minmax(0,1fr)}
+  .notes{padding:24px 16px 40px}
+  td:first-child{white-space:normal}
+}
+</style>
+</head>
+<body>
+<header class="proposal">
+  <div>
+    <h1>Git 패널 개선안</h1>
+    <p>예시 데이터로 만든 HTML 시안이며 제품에는 아직 적용하지 않았습니다. 파일 선택, 탭 전환, 폴더별 묶기, 우클릭 메뉴, <kbd>↑</kbd><kbd>↓</kbd> 파일 이동, <kbd>N</kbd>/<kbd>P</kbd> 변경 이동을 직접 써 볼 수 있습니다.</p>
+  </div>
+  <div class="choices">
+    <div class="seg" role="group" aria-label="비교"><button data-compare="proposal" aria-pressed="true">제안</button><button data-compare="current" aria-pressed="false">지금 화면</button></div>
+    <div class="seg" role="group" aria-label="목록 구성"><button data-layout="tabs" aria-pressed="true">탭형 · 권장</button><button data-layout="sections" aria-pressed="false">섹션형</button></div>
+    <label>상황 <select id="scenario">
+      <option value="normal">변경 있음</option>
+      <option value="clean">작업 트리 깨끗함</option>
+      <option value="noupstream">업스트림 없음</option>
+      <option value="truncated">변경이 너무 많음</option>
+      <option value="loading">불러오는 중</option>
+      <option value="norepo">git 저장소 아님</option>
+    </select></label>
+  </div>
+</header>
+
+<div class="shell">
+  <aside class="rail" aria-hidden="true">
+    <span><b>⌂</b>홈</span><span><b>▦</b>작업</span><span><b>◷</b>이력</span><span class="active"><b>⑂</b>Git</span><span><b>✦</b>AI</span>
+  </aside>
+  <main class="main">
+    <div class="tabbar" aria-hidden="true"><span>deppy-sijo-performance</span><span>이력</span><span class="active">Git</span></div>
+    <div class="body" id="body">
+      <section class="list" id="list" aria-label="Git 목록"></section>
+      <div class="vsep"></div>
+      <section class="detail" id="detail" aria-label="변경 내용"></section>
+    </div>
+  </main>
+</div>
+
+<section class="notes">
+  <h2>무엇을 바꾸나</h2>
+  <p>지금 화면은 정보는 다 있지만 위계와 상태가 글자 한 줄씩으로만 표현됩니다. 아래 표의 1차 항목은 이미 수집 중인 데이터만으로 구현할 수 있습니다.</p>
+  <table>
+    <thead><tr><th>지금 불편한 점</th><th>제안</th><th>범위</th></tr></thead>
+    <tbody>
+      <tr><td>오른쪽 diff가 어느 파일인지 목록에서 안 보임</td><td>선택 행에 면 + accent 레일(사이드 레일과 같은 규칙). diff 헤더에 상태 배지와 폴더/파일명 분리</td><td><span class="pri p1">1차 · 기존 데이터</span></td></tr>
+      <tr><td>상태가 <code>M</code> <code>A</code> <code>?</code> 글자뿐이라 읽기 어려움</td><td>색 배지(수정·추가·삭제·이름 변경·새 파일·충돌)와 hover 설명. 증감은 숫자 + 5칸 막대</td><td><span class="pri p1">1차 · 기존 데이터</span></td></tr>
+      <tr><td>섹션 머리 <code>∨ 변경 사항 8</code>이 파일 행과 같은 무게, 「브랜치에 COMMIT 됨」 표기 혼용</td><td>변경 / 커밋 / 워크트리 3탭과 개수 배지. 용어는 「브랜치 커밋」으로 통일. 섹션형은 대안으로 남김</td><td><span class="pri p1">1차 · 기존 데이터</span></td></tr>
+      <tr><td>깊은 경로가 <code>crates/…</code>로 잘려 서로 구분 안 됨</td><td>폴더 앞부분을 줄여 끝 두 단계만 표시(<code>…/ui/work_history</code>). 「폴더별」 토글로 디렉터리 묶음</td><td><span class="pri p1">1차 · 기존 데이터</span></td></tr>
+      <tr><td>↑3 ↓1이 색 숫자만이라 의미가 불분명. 업스트림 없음은 회색 한 줄</td><td>「↑3 보낼 커밋」「↓1 받을 커밋」 배지. 업스트림 없음은 경고 배지와 이유</td><td><span class="pri p1">1차 · 기존 데이터</span></td></tr>
+      <tr><td>diff 모드가 영어(<code>working diff</code>)이고 비교 기준이 안 보임</td><td>「작업 중 변경 · HEAD 대비」「브랜치 비교 · origin/main…HEAD」와 「변경 2/3」 위치 표시</td><td><span class="pri p1">1차 · i18n</span></td></tr>
+      <tr><td>탭을 열면 오른쪽이 안내 한 줄뿐</td><td>첫 파일 자동 선택. 깨끗할 때는 브랜치 요약(보낼 커밋, 마지막 커밋)</td><td><span class="pri p1">1차 · 기존 데이터</span></td></tr>
+      <tr><td>마우스로만 이동</td><td><kbd>↑</kbd><kbd>↓</kbd> 파일, <kbd>N</kbd>/<kbd>P</kbd> 변경 이동. 목록 하단에 단축키 안내</td><td><span class="pri p1">1차</span></td></tr>
+      <tr><td>어느 커밋이 무엇을 바꿨는지 알 수 없음</td><td>커밋 탭에 브랜치 전체 파일 아래로 커밋 목록, 펼치면 커밋별 파일</td><td><span class="pri p2">2차 · git log 수집 추가</span></td></tr>
+      <tr><td>보고 나서 할 수 있는 동작이 없음</td><td>우클릭과 diff 헤더에 경로 복사, 세션에 경로 넣기(파일 트리의 InsertPath 재사용), Finder에서 보기</td><td><span class="pri p2">2차 · 기존 intent 재사용</span></td></tr>
+      <tr><td>스테이지·커밋·push</td><td>2026-08-15 스펙에서 읽기 전용으로 결정한 범위라 이 시안에서는 넣지 않았습니다. 필요하면 별도로 결정해 주세요</td><td><span class="pri p3">보류 · 결정 필요</span></td></tr>
+    </tbody>
+  </table>
+  <div class="grid2">
+    <section><h3>배치는 유지</h3><p>2차 스펙의 목록 300pt + diff 마스터-디테일, 보조 탭 기구, 읽기 전용 원칙은 그대로입니다. 760pt 미만에서는 작업 이력처럼 목록 → 상세로 넘어가고 「← 목록」으로 돌아옵니다.</p></section>
+    <section><h3>작업 이력 화면과 같은 체계</h3><ul><li>토큰: 작업 이력 브라우저의 dark 팔레트</li><li>크기: 본문 14 / 메타 12 / 컨트롤 37·26 / 파일 행 32pt</li><li>선택: 면 + 왼쪽 2pt accent 레일</li></ul></section>
+    <section><h3>egui 구현 메모</h3><ul><li>탭: 작업 이력 뷰 전환과 같은 selectable Button</li><li>배지·막대: painter 사각형 + 텍스트, 행 전체는 기존 scope_builder 클릭 패턴</li><li>선택 파일: GitPanelUi가 diff 대상 경로를 받아 행 강조</li></ul></section>
+  </div>
+</section>
+
+<script>
+const DATA = {
+  branch: 'feat/git-panel-v2',
+  upstream: 'origin/feat/git-panel-v2',
+  base: 'origin/main',
+  ahead: 3,
+  behind: 1,
+  refreshed: '08:12',
+  changes: [
+    {p: 'crates/app/src/ui/git_panel.rs', s: 'M', a: 184, d: 62},
+    {p: 'crates/app/src/ui/git_panel/commit_list.rs', s: 'A', a: 96, d: 0},
+    {p: 'crates/app/src/ui/diff_viewer.rs', s: 'M', a: 41, d: 9},
+    {p: 'crates/app/src/ui/legacy_diff_window.rs', s: 'D', a: 0, d: 120},
+    {p: 'crates/app/src/ui/work_history/browser.rs', s: 'M', a: 3, d: 2},
+    {p: 'crates/i18n/locales/ko-KR/messages.txt', s: 'M', a: 14, d: 2},
+    {p: 'crates/i18n/locales/en-US/messages.txt', s: 'R', a: 14, d: 2},
+    {p: 'docs/mockups/git-panel-redesign-2026-10-11.html', s: '?', a: null, d: null},
+  ],
+  branchFiles: [
+    {p: 'crates/app/src/ui/git_panel.rs', s: 'M', a: 178, d: 111},
+    {p: 'crates/app/src/ui/designall.rs', s: 'M', a: 12, d: 3},
+    {p: 'docs/superpowers/specs/2026-10-11-git-panel-v2.md', s: 'A', a: 88, d: 0},
+  ],
+  commits: [
+    {sha: 'a1b2c3d', msg: 'feat(git): 브랜치 카드와 상태 배지', when: '2시간 전', files: [
+      {p: 'crates/app/src/ui/git_panel.rs', s: 'M', a: 120, d: 40},
+      {p: 'crates/app/src/ui/designall.rs', s: 'M', a: 12, d: 3}]},
+    {sha: '9f8e7d6', msg: 'refactor(git): 섹션 머리를 탭으로 바꾼다', when: '어제 18:40', files: [
+      {p: 'crates/app/src/ui/git_panel.rs', s: 'M', a: 58, d: 71}]},
+    {sha: '4c5d6e7', msg: 'docs: Git 패널 2차 스펙', when: '어제 11:02', files: [
+      {p: 'docs/superpowers/specs/2026-10-11-git-panel-v2.md', s: 'A', a: 88, d: 0}]},
+  ],
+  worktrees: [
+    {name: 'deppy-sijo-performance', branch: 'feat/git-panel-v2', path: '~/projects/deppy-sijo-performance', current: true},
+    {name: 'deppy-sijo', branch: 'main', path: '~/projects/deppy-sijo'},
+    {name: 'deppy-sijo-cloud-agent-mcp', branch: 'feat/cloud-agent-mcp', path: '~/projects/deppy-sijo-cloud-agent-mcp'},
+    {name: 'deppy-sijo-perf-baseline', branch: null, sha: '78f054b9', path: '~/projects/deppy-sijo-perf-baseline'},
+  ],
+};
+const STATUS = {M: '수정', A: '추가', D: '삭제', R: '이름 변경', '?': '새 파일 (추적 안 함)', U: '충돌'};
+
+const st = {
+  compare: 'proposal', layout: 'tabs', scenario: 'normal', tab: 'changes', group: 'flat',
+  sel: null, hunk: 0, openCommits: new Set(['a1b2c3d']), closedDirs: new Set(), closedSecs: new Set(),
+};
+const $ = s => document.querySelector(s);
+const $$ = s => [...document.querySelectorAll(s)];
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+
+function split(p) {
+  const i = p.lastIndexOf('/');
+  return i < 0 ? ['', p] : [p.slice(0, i), p.slice(i + 1)];
+}
+// 폴더 앞부분을 줄여 끝 두 단계만 남긴다.
+function shortDir(dir) {
+  const parts = dir.split('/').filter(Boolean);
+  return parts.length > 2 ? '…/' + parts.slice(-2).join('/') : dir;
+}
+function changes() {
+  if (st.scenario === 'clean') return [];
+  if (st.scenario === 'truncated') {
+    const many = [];
+    for (let i = 0; i < 40; i++) many.push({p: `web/generated/locale/chunk-${String(i).padStart(3, '0')}.json`, s: i % 7 ? 'M' : 'A', a: 20 + i, d: i % 5});
+    return DATA.changes.concat(many);
+  }
+  return DATA.changes;
+}
+function selKey(sel) { return sel ? `${sel.kind}|${sel.sha || ''}|${sel.p}` : ''; }
+function findFile(sel) {
+  if (!sel) return null;
+  if (sel.kind === 'change') return changes().find(f => f.p === sel.p);
+  if (sel.kind === 'branch') return DATA.branchFiles.find(f => f.p === sel.p);
+  const c = DATA.commits.find(c => c.sha === sel.sha);
+  return c && c.files.find(f => f.p === sel.p);
+}
+
+function bar(f) {
+  if (f.a == null) return '';
+  const total = f.a + f.d || 1;
+  const adds = Math.round(5 * f.a / total);
+  let html = '';
+  for (let i = 0; i < 5; i++) html += `<i class="${i < adds ? 'a' : 'd'}"></i>`;
+  return `<span class="bar" aria-hidden="true">${html}</span>`;
+}
+function stat(f) {
+  if (f.a == null) return '<span class="fstat" style="color:var(--faint)">새 파일</span>';
+  return `<span class="fstat">${f.a ? `<span class="add">+${f.a}</span>` : ''}${f.d ? `<span class="del">−${f.d}</span>` : ''}${bar(f)}</span>`;
+}
+function badge(s) { return `<span class="sb s-${s === '?' ? 'Q' : s}" title="${esc(STATUS[s])}">${s === '?' ? 'N' : s}</span>`; }
+function fileRow(f, kind, sha, opts = {}) {
+  const [dir, name] = split(f.p);
+  const sel = selKey(st.sel) === selKey({kind, sha, p: f.p});
+  return `<button class="frow${sel ? ' sel' : ''}${opts.indent ? ' indent' : ''}" role="option" aria-selected="${sel}" data-kind="${kind}" data-sha="${sha || ''}" data-p="${esc(f.p)}" title="${esc(f.p)}">
+    ${badge(f.s)}<span class="fname">${esc(name)}</span><span class="fdir">${opts.indent ? '' : esc(shortDir(dir))}</span>${stat(f)}</button>`;
+}
+function fileRows(files, kind, sha) {
+  if (st.group === 'flat') return files.map(f => fileRow(f, kind, sha)).join('');
+  const groups = new Map();
+  files.forEach(f => { const d = split(f.p)[0] || '.'; if (!groups.has(d)) groups.set(d, []); groups.get(d).push(f); });
+  let html = '';
+  for (const [dir, list] of groups) {
+    const key = `${kind}|${sha || ''}|${dir}`;
+    const closed = st.closedDirs.has(key);
+    html += `<button class="dirrow${closed ? ' closed' : ''}" data-dir="${esc(key)}"><span class="chev">▾</span><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(dir)}</span><span class="cnt" style="margin-left:auto">${list.length}</span></button>`;
+    if (!closed) html += list.map(f => fileRow(f, kind, sha, {indent: true})).join('');
+  }
+  return html;
+}
+function totals(files) {
+  let a = 0, d = 0;
+  files.forEach(f => { a += f.a || 0; d += f.d || 0; });
+  return `${files.length}개 파일 · <span class="add">+${a}</span> <span class="del">−${d}</span>`;
+}
+
+function branchCard() {
+  const noUp = st.scenario === 'noupstream';
+  const track = noUp
+    ? `<span class="pill none" title="push하면 추적 브랜치가 생기고 보낼/받을 커밋을 셀 수 있습니다">업스트림 없음</span><span>비교 기준 ${esc(DATA.base)}</span>`
+    : `<span>→</span><span class="up">${esc(DATA.upstream)}</span>
+       ${DATA.ahead ? `<span class="pill ahead" title="아직 push하지 않은 커밋">↑${DATA.ahead} 보낼 커밋</span>` : ''}
+       ${DATA.behind ? `<span class="pill behind" title="원격에만 있는 커밋">↓${DATA.behind} 받을 커밋</span>` : ''}
+       ${!DATA.ahead && !DATA.behind ? '<span class="pill ok">원격과 같음</span>' : ''}`;
+  return `<div class="branch-card">
+    <div class="bline"><span aria-hidden="true" style="color:var(--accent)">⑂</span><span class="bname" title="${esc(DATA.branch)}">${esc(DATA.branch)}</span>
+      <button class="ibtn" data-toast="GitHub 브랜치 페이지를 엽니다" title="GitHub에서 열기">↗</button>
+      <button class="ibtn" data-toast="git 상태를 다시 읽습니다" title="새로고침">⟳</button></div>
+    <div class="track">${track}</div>
+    <div class="bfoot"><span>${DATA.refreshed} 갱신</span><span>워크트리 ${DATA.worktrees.length}개 중 현재</span></div>
+  </div>`;
+}
+function changesBody() {
+  const files = changes();
+  if (!files.length) {
+    return `<div class="card"><span class="ico">✓</span><b>작업 트리가 깨끗합니다</b>커밋하지 않은 변경이 없습니다.<br>${DATA.ahead ? `보낼 커밋 ${DATA.ahead}개 · <a data-goto="commits">커밋 탭에서 보기</a>` : ''}</div>`;
+  }
+  const banner = st.scenario === 'truncated'
+    ? '<div class="banner">변경 파일이 512개를 넘어 앞의 512개만 표시합니다. 전체 목록은 터미널에서 <code>git status</code>로 확인하세요.</div>' : '';
+  return banner + fileRows(files, 'change');
+}
+function commitsBody() {
+  let html = `<div class="subhead"><span>브랜치 전체 · ${esc(DATA.base)} 이후</span><span>${DATA.branchFiles.length}개 파일</span></div>`;
+  html += fileRows(DATA.branchFiles, 'branch');
+  html += `<div class="subhead"><span>커밋 ${DATA.commits.length}개</span><span class="tag" title="git log 수집을 추가해야 합니다">2차</span></div>`;
+  for (const c of DATA.commits) {
+    const open = st.openCommits.has(c.sha);
+    html += `<button class="commit${open ? '' : ' closed'}" data-commit="${c.sha}"><span class="chev">▾</span><span class="sha">${c.sha}</span><span class="cmsg" title="${esc(c.msg)}">${esc(c.msg)}</span><span class="when">${esc(c.when)}</span></button>`;
+    if (open) html += c.files.map(f => fileRow(f, 'commit', c.sha, {indent: true})).join('');
+  }
+  return html;
+}
+function worktreesBody() {
+  return DATA.worktrees.map(w => `<div class="wt${w.current ? ' cur' : ''}">
+      <b>${esc(w.name)}</b>${w.current ? '<span class="badge">현재</span>' : `<button class="ibtn" data-toast="${esc(w.name)}에서 새 세션을 엽니다">세션 열기</button>`}
+      <span class="br">${w.branch ? '⑂ ' + esc(w.branch) : '분리됨 · ' + esc(w.sha)}</span><span></span>
+      <span class="pth">${esc(w.path)}</span></div>`).join('');
+}
+
+function listFooter() {
+  return '<div class="lfoot"><span><kbd>↑</kbd><kbd>↓</kbd> 파일</span><span><kbd>N</kbd><kbd>P</kbd> 변경</span><span>우클릭 · 경로 동작</span></div>';
+}
+function groupTools(summary) {
+  return `<div class="tools"><span>${summary}</span><div class="seg" role="group" aria-label="묶기">
+    <button data-group="flat" aria-pressed="${st.group === 'flat'}">목록</button><button data-group="tree" aria-pressed="${st.group === 'tree'}">폴더별</button></div></div>`;
+}
+
+function renderList() {
+  const list = $('#list');
+  if (st.compare === 'current') { list.innerHTML = currentList(); return; }
+  if (st.scenario === 'norepo') {
+    list.innerHTML = '<div class="card" style="margin:16px 12px"><b>git 저장소가 아닙니다</b>이 세션의 작업 폴더<br><code>~/Downloads/notes</code><br>에서 git 저장소를 찾지 못했습니다.</div>';
+    return;
+  }
+  if (st.scenario === 'loading') {
+    list.innerHTML = '<div style="padding:12px">' + '<div class="skel" style="height:86px;margin:0 0 10px"></div>' + '<div class="skel"></div>'.repeat(7) + '</div>';
+    return;
+  }
+  const files = changes();
+  const head = branchCard();
+  if (st.layout === 'tabs') {
+    const tabs = [['changes', '변경', st.scenario === 'truncated' ? '512+' : files.length], ['commits', '커밋', DATA.commits.length], ['worktrees', '워크트리', DATA.worktrees.length]];
+    const tabHtml = `<div class="segtabs" role="tablist">${tabs.map(([k, label, n]) => `<button role="tab" data-tab="${k}" aria-selected="${st.tab === k}">${label}<span class="cnt">${n}</span></button>`).join('')}</div>`;
+    let tools = '', body = '';
+    if (st.tab === 'changes') { tools = files.length ? groupTools(totals(files)) : '<div class="tools"></div>'; body = changesBody(); }
+    if (st.tab === 'commits') { tools = groupTools(`${DATA.ahead}개 커밋 · ${esc(DATA.base)} 대비`); body = commitsBody(); }
+    if (st.tab === 'worktrees') { tools = '<div class="tools"><span>클릭하면 그 폴더에서 새 세션을 엽니다</span></div>'; body = worktreesBody(); }
+    list.innerHTML = head + tabHtml + tools + `<div class="rows" role="listbox" aria-label="파일">${body}</div>` + listFooter();
+  } else {
+    const sec = (key, label, n, body) => {
+      const closed = st.closedSecs.has(key);
+      return `<button class="sechead${closed ? ' closed' : ''}" data-sec="${key}"><span class="chev">▾</span>${label}<span class="cnt">${n}</span></button>${closed ? '' : body}`;
+    };
+    list.innerHTML = head + groupTools(files.length ? totals(files) : '변경 없음') + `<div class="rows" role="listbox" aria-label="파일">
+      ${sec('changes', '변경', st.scenario === 'truncated' ? '512+' : files.length, changesBody())}
+      ${sec('commits', '브랜치 커밋', DATA.commits.length, commitsBody())}
+      ${sec('worktrees', '워크트리', DATA.worktrees.length, worktreesBody())}</div>` + listFooter();
+  }
+}
+
+// 지금 화면(git_panel.rs render)의 구조를 그대로 옮긴 비교용 재현.
+function currentList() {
+  const files = changes();
+  const row = f => { const [dir, name] = split(f.p); return `<div class="cur-row"><span>${esc(name)}</span><span class="weak" style="overflow:hidden;text-overflow:ellipsis">${esc(dir)}</span><span class="r">${f.a ? `<span class="add">+${f.a}</span>` : ''}${f.d ? `<span class="del">−${f.d}</span>` : ''}<span>${f.s}</span></span></div>`; };
+  const shown = files.slice(0, 10);
+  return `<div class="cur-list" style="position:relative">
+    <div style="font-weight:600">${esc(DATA.branch)}</div>
+    <div class="cur-row">${st.scenario === 'noupstream' ? '<span class="weak">업스트림 없음</span>' : `<span class="weak">→</span><span style="font:12px var(--mono)">${esc(DATA.upstream)}</span><span class="add">↑${DATA.ahead}</span><span class="del">↓${DATA.behind}</span><span class="cur-btn">↗</span>`}<span class="cur-btn">⟳</span></div>
+    <hr style="border:0;border-top:1px solid var(--line);margin:6px 0">
+    ${files.length ? `<div class="cur-sec">∨ 변경 사항 ${files.length}${files.length > 10 ? '<span class="weak" style="margin-left:auto">모두 보기</span>' : ''}</div>${shown.map(row).join('')}` : '<div class="weak">변경 없음 — 작업 트리가 깨끗합니다</div>'}
+    <div class="cur-sec" style="margin-top:12px">∨ 브랜치에 COMMIT 됨 ${DATA.branchFiles.length}</div>${DATA.branchFiles.map(row).join('')}
+    <div class="cur-sec" style="margin-top:12px">∨ 워크트리 ${DATA.worktrees.length}</div>
+    ${DATA.worktrees.map(w => `<div class="cur-row"><span>${esc(w.name)}</span><span class="weak">${esc(w.branch || '분리됨')}</span>${w.current ? '<span class="r weak">현재</span>' : ''}</div>`).join('')}
+    <div class="callout" style="left:150px;top:96px">선택한 파일이 목록에 표시되지 않습니다</div>
+    <div class="callout" style="left:120px;top:170px">경로가 잘려 같은 폴더끼리 구분하기 어렵습니다</div>
+  </div>`;
+}
+
+function diffLines(f, sel) {
+  const [, name] = split(f.p);
+  if (f.s === 'D') return [{h: '@@ -1,6 +0,0 @@ 파일 삭제', lines: [['d', 1, null, '//! 플로팅 diff 창 — 작업 이력 「변경 보기」 전용.'], ['d', 2, null, 'use egui::Window;'], ['d', 3, null, ''], ['d', 4, null, 'pub struct LegacyDiffWindow {'], ['d', 5, null, '    open: bool,'], ['d', 6, null, '}']]}];
+  if (f.a == null || f.s === 'A') return [{h: '@@ -0,0 +1,7 @@ 새 파일', lines: [['a', null, 1, `// ${name}`], ['a', null, 2, ''], ['a', null, 3, 'pub struct CommitRow {'], ['a', null, 4, '    pub sha: String,'], ['a', null, 5, '    pub subject: String,'], ['a', null, 6, '    pub files: Vec<GitFileRow>,'], ['a', null, 7, '}']]}];
+  if (f.p.endsWith('git_panel.rs')) return [
+    {h: '@@ -566,9 +566,14 @@ pub fn render(', lines: [['c', 566, 566, '        // ── 헤더: 브랜치 / → upstream ↑a ↓b ↗ ──'], ['d', 567, null, '        ui.strong(&snap.branch);'], ['a', null, 567, '        branch_card(ui, snap, tokens, catalog, &mut action);'], ['a', null, 568, '        let tab = view_tabs(ui, &mut self.tab, counts, catalog);'], ['c', 568, 569, '        ui.horizontal(|ui| {'], ['c', 569, 570, '            match snap.upstream.as_deref() {']], gapAfter: 41},
+    {h: '@@ -611,7 +617,12 @@ let section = |ui: &mut egui::Ui,', lines: [['c', 611, 617, '            for row in &rows[..visible] {'], ['d', 612, null, '                ui.label(name);'], ['d', 613, null, '                ui.weak(dir);'], ['a', null, 618, '                let selected = self.selected.as_deref() == Some(row.rel_path.as_str());'], ['a', null, 619, '                status_badge(ui, row.status, tokens);'], ['a', null, 620, '                ui.label(name);'], ['a', null, 621, '                ui.weak(short_dir(dir));'], ['c', 614, 622, '                ui.with_layout(']], gapAfter: 88},
+    {h: '@@ -702,4 +715,6 @@ egui::ScrollArea::vertical()', lines: [['c', 702, 715, '                if snap.changes_truncated {'], ['a', null, 716, '                    // 상한을 넘은 경우 배너로 알린다.'], ['a', null, 717, '                    truncated_banner(ui, catalog);'], ['c', 703, 718, '                }']]},
+  ];
+  if (f.p.endsWith('.txt')) return [{h: '@@ -84,6 +84,10 @@', lines: [['c', 84, 84, 'git.binary = 바이너리 파일'], ['d', 85, null, 'git.mode.working = working diff'], ['d', 86, null, 'git.mode.branch = branch diff'], ['a', null, 85, 'git.mode.working = 작업 중 변경 · HEAD 대비'], ['a', null, 86, 'git.mode.branch = 브랜치 비교 · {base}…HEAD'], ['a', null, 87, 'git.tab.changes = 변경'], ['a', null, 88, 'git.tab.commits = 커밋'], ['c', 87, 89, 'git.diff.empty = 파일을 선택하면 변경 내용이 여기에 표시됩니다']]}];
+  return [
+    {h: '@@ -12,6 +12,8 @@', lines: [['c', 12, 12, `// ${name}`], ['d', 13, null, 'let label = mode_label(mode);'], ['a', null, 13, 'let label = catalog.t(mode_key(mode), &[("base", base)]);'], ['a', null, 14, 'let position = hunk_position(current, total);'], ['c', 14, 15, 'ui.horizontal(|ui| {']], gapAfter: 23},
+    {h: '@@ -40,4 +42,5 @@', lines: [['c', 40, 42, '    fn render(&mut self) {'], ['a', null, 43, '        self.sync_selection();'], ['c', 41, 44, '    }']]},
+  ];
+}
+
+function renderDetail() {
+  const det = $('#detail');
+  if (st.compare === 'current') { det.innerHTML = currentDetail(); return; }
+  if (st.scenario === 'norepo' || st.scenario === 'loading') {
+    det.innerHTML = `<div class="dempty">${st.scenario === 'loading' ? '<b>git 상태를 읽는 중</b>완료되면 첫 파일을 자동으로 엽니다.' : '<b>표시할 변경이 없습니다</b>git 저장소가 있는 폴더에서 세션을 열면 이곳에 변경이 표시됩니다.'}</div>`;
+    return;
+  }
+  const f = findFile(st.sel);
+  if (!f) {
+    det.innerHTML = `<div class="sum">
+      <div class="toptiles">
+        <div class="box"><div class="k">커밋하지 않은 변경</div><div class="v">없음</div></div>
+        <div class="box"><div class="k">보낼 커밋</div><div class="v add">${DATA.ahead}개</div></div>
+        <div class="box"><div class="k">받을 커밋</div><div class="v" style="color:var(--warn)">${DATA.behind}개</div></div>
+      </div>
+      <div class="box"><div class="k">마지막 커밋</div><div class="v"><span class="sha">${DATA.commits[0].sha}</span> ${esc(DATA.commits[0].msg)}</div><div class="k" style="margin-top:4px">${DATA.commits[0].when} · ${DATA.commits[0].files.length}개 파일</div></div>
+      <div class="box"><div class="k">다음에 할 일</div><div class="v" style="font-size:13px">왼쪽 「커밋」 탭에서 ${esc(DATA.base)} 대비 바뀐 파일을 검토할 수 있습니다.</div></div>
+    </div>`;
+    return;
+  }
+  const hunks = diffLines(f, st.sel);
+  st.hunk = Math.min(st.hunk, hunks.length - 1);
+  const [dir, name] = split(f.p);
+  const mode = st.sel.kind === 'change'
+    ? '작업 중 변경 · HEAD 대비'
+    : st.sel.kind === 'branch' ? `브랜치 비교 · ${DATA.base}…HEAD` : `커밋 ${st.sel.sha}`;
+  let body = '';
+  hunks.forEach((h, i) => {
+    body += `<div class="hh${i === st.hunk ? ' cur' : ''}" id="hunk-${i}">${esc(h.h)}</div>`;
+    body += h.lines.map(([t, o, n, text]) => `<div class="dl ${t === 'a' ? 'a' : t === 'd' ? 'd' : ''}"><span class="n">${o ?? ''}</span><span class="n">${n ?? ''}</span><span class="g">${t === 'a' ? '+' : t === 'd' ? '−' : ' '}</span><span>${esc(text)}</span></div>`).join('');
+    if (h.gapAfter) body += `<div class="gap">⋯ 변경 없는 ${h.gapAfter}행</div>`;
+  });
+  det.innerHTML = `<div class="dhead">
+      <div class="dpath"><button class="ibtn back" data-back>← 목록</button>${badge(f.s)}<span class="dir">${esc(dir ? dir + '/' : '')}</span><strong>${esc(name)}</strong></div>
+      <div class="dmeta"><span class="mode">${esc(mode)}</span>${f.a != null ? stat(f) : '<span>추적하지 않는 새 파일</span>'}
+        <span class="hnav"><button class="ibtn" data-hunk="-1" title="이전 변경 (P)">↑</button><span>변경 ${st.hunk + 1}/${hunks.length}</span><button class="ibtn" data-hunk="1" title="다음 변경 (N)">↓</button></span></div>
+      <div class="dacts"><button class="ibtn" data-toast="경로를 복사했습니다">경로 복사</button><button class="ibtn" data-toast="세션 입력창에 경로를 넣었습니다">세션에 넣기</button><button class="ibtn" data-toast="Finder에서 파일을 보여 줍니다">Finder</button></div>
+    </div><div class="dbody" id="dbody">${body}</div>`;
+}
+function currentDetail() {
+  const f = findFile(st.sel);
+  if (!f) return '<div style="padding:12px 16px;color:var(--muted)">파일을 선택하면 변경 내용이 여기에 표시됩니다</div>';
+  const hunks = diffLines(f, st.sel);
+  let body = '';
+  hunks.forEach(h => {
+    body += h.lines.map(([t, o, n, text]) => `<div class="dl ${t === 'a' ? 'a' : t === 'd' ? 'd' : ''}"><span class="n">${o ?? ''}</span><span class="n">${n ?? ''}</span><span class="g">${t === 'a' ? '+' : t === 'd' ? '-' : ' '}</span><span>${esc(text)}</span></div>`).join('');
+    if (h.gapAfter) body += `<div class="gap">⋯ ${h.gapAfter}행</div>`;
+  });
+  return `<div style="display:flex;gap:8px;align-items:center;padding:8px 12px;border-bottom:1px solid var(--line)"><span style="font:12.5px var(--mono)">${esc(f.p)}</span><span style="color:var(--muted)">(${st.sel.kind === 'change' ? 'working diff' : 'branch diff'})</span><span style="margin-left:auto" class="cur-btn">↑</span><span class="cur-btn">↓</span></div><div class="dbody">${body}</div>`;
+}
+
+function visibleRows() { return $$('#list .frow'); }
+function firstSelectable() {
+  if (st.tab === 'changes' && changes().length) return {kind: 'change', p: changes()[0].p};
+  if (st.tab === 'commits') return {kind: 'branch', p: DATA.branchFiles[0].p};
+  return null;
+}
+function render() {
+  $('#body').classList.toggle('mobile-detail', !!st.mobileDetail);
+  renderList();
+  renderDetail();
+}
+function select(sel, fromKey) {
+  st.sel = sel; st.hunk = 0; st.mobileDetail = !fromKey || st.mobileDetail;
+  render();
+  const row = $$('#list .frow').find(r => selKey({kind: r.dataset.kind, sha: r.dataset.sha || undefined, p: r.dataset.p}) === selKey(sel));
+  row && row.scrollIntoView({block: 'nearest'});
+}
+function moveHunk(delta) {
+  const f = findFile(st.sel);
+  if (!f || st.compare === 'current') return;
+  const n = diffLines(f, st.sel).length;
+  st.hunk = Math.max(0, Math.min(n - 1, st.hunk + delta));
+  renderDetail();
+  const el = document.getElementById('hunk-' + st.hunk);
+  el && el.scrollIntoView({block: 'start', behavior: 'smooth'});
+}
+function toast(msg) {
+  $$('.toast').forEach(t => t.remove());
+  const t = document.createElement('div');
+  t.className = 'toast'; t.role = 'status'; t.textContent = '시안: ' + msg;
+  document.body.append(t);
+  setTimeout(() => t.remove(), 2000);
+}
+function closeMenu() { $$('.menu').forEach(m => m.remove()); }
+
+document.addEventListener('click', e => {
+  const t = e.target.closest('button,a');
+  if (!e.target.closest('.menu')) closeMenu();
+  if (!t) return;
+  const d = t.dataset;
+  if (d.compare) { st.compare = d.compare; $$('[data-compare]').forEach(b => b.setAttribute('aria-pressed', b === t)); render(); }
+  else if (d.layout) { st.layout = d.layout; $$('[data-layout]').forEach(b => b.setAttribute('aria-pressed', b === t)); render(); }
+  else if (d.tab) { st.tab = d.tab; if (!findFile(st.sel) || (d.tab === 'changes') !== (st.sel.kind === 'change')) { st.sel = firstSelectable() || st.sel; st.hunk = 0; } render(); }
+  else if (d.group) { st.group = d.group; render(); }
+  else if (d.dir) { st.closedDirs.has(d.dir) ? st.closedDirs.delete(d.dir) : st.closedDirs.add(d.dir); renderList(); }
+  else if (d.sec) { st.closedSecs.has(d.sec) ? st.closedSecs.delete(d.sec) : st.closedSecs.add(d.sec); renderList(); }
+  else if (d.commit) { st.openCommits.has(d.commit) ? st.openCommits.delete(d.commit) : st.openCommits.add(d.commit); renderList(); }
+  else if (d.kind) { select({kind: d.kind, sha: d.sha || undefined, p: d.p}); }
+  else if (d.hunk) { moveHunk(+d.hunk); }
+  else if (d.goto) { st.tab = d.goto; st.sel = firstSelectable(); render(); }
+  else if ('back' in d) { st.mobileDetail = false; render(); }
+  else if (d.toast) { toast(d.toast); closeMenu(); }
+});
+document.addEventListener('contextmenu', e => {
+  const row = e.target.closest('#list .frow');
+  if (!row || st.compare === 'current') return;
+  e.preventDefault();
+  closeMenu();
+  const m = document.createElement('div');
+  m.className = 'menu';
+  m.innerHTML = `<button data-toast="경로를 복사했습니다">경로 복사<kbd>⌘C</kbd></button><button data-toast="세션 입력창에 경로를 넣었습니다">세션에 경로 넣기</button><button data-toast="Finder에서 파일을 보여 줍니다">Finder에서 보기</button><button data-toast="파일 트리에서 위치를 표시합니다">파일 트리에서 찾기</button>`;
+  m.style.left = Math.min(e.clientX, innerWidth - 210) + 'px';
+  m.style.top = Math.min(e.clientY, innerHeight - 160) + 'px';
+  document.body.append(m);
+});
+document.addEventListener('keydown', e => {
+  if (e.target.closest('input,select,textarea') || e.metaKey || e.ctrlKey || e.altKey) return;
+  if (e.key === 'Escape') { closeMenu(); return; }
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    const rows = visibleRows();
+    if (!rows.length) return;
+    e.preventDefault();
+    let i = rows.findIndex(r => r.classList.contains('sel'));
+    i = i < 0 ? 0 : Math.max(0, Math.min(rows.length - 1, i + (e.key === 'ArrowDown' ? 1 : -1)));
+    const r = rows[i];
+    select({kind: r.dataset.kind, sha: r.dataset.sha || undefined, p: r.dataset.p}, true);
+  } else if (e.key === 'n' || e.key === 'N') { moveHunk(1); }
+  else if (e.key === 'p' || e.key === 'P') { moveHunk(-1); }
+});
+$('#scenario').addEventListener('change', e => {
+  st.scenario = e.target.value; st.mobileDetail = false; st.hunk = 0;
+  st.tab = 'changes';
+  st.sel = firstSelectable();
+  render();
+});
+
+st.sel = firstSelectable();
+render();
+</script>
+</body>
+</html>

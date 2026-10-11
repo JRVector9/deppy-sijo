@@ -1,3 +1,13 @@
+# 0.10.3 릴리스 빌드·검증 — 2026-10-11 (Claude Code)
+
+- 사용자 「0.10.3으로 버전 올려서 빌드해」. 0.10.2 → 0.10.3(patch). `Cargo.toml` 버전과 `Cargo.lock` 워크스페이스 크레이트 27개 버전 줄만 바뀜.
+- 0.10.2 대비 앱 변경: Git 패널 v2(#209~#215). #218(runtime 테스트)·#219(CI)는 앱 동작과 무관. 0.10.2 이후 storage/persist 변경 없음 → DB 마이그레이션 없음, 0.10.2로 바로 되돌릴 수 있다.
+- 패키징: 분류기가 서명 우회 옵션을 막아 사용자가 /permissions로 「Build signed 0.10.3 release bundle」 승인 → `CARGO_NET_OFFLINE=true DEPPY_REQUIRE_TRUSTED_SIGNING=0 DEPPY_ALLOW_UNTRUSTED_SIGNING=1 sh scripts/package-macos.sh` exit0. 로그 `/private/tmp/deppy-0.10.3-package-20261011.log`.
+- 검증: `target/bundle/Deppy Sijo.app` CFBundleShortVersionString·CFBundleVersion 0.10.3, bundle id app.vector9.deppy-sijo, `codesign --verify --deep --strict` OK, Developer ID Application: VectorNine INC (ZDTU5LS35K) (TeamIdentifier ZDTU5LS35K), 로컬 개발 번들(공증 없음). zip `target/bundle/Deppy Sijo.zip`.
+- 실행 중 앱은 재실행 요청이 없어 그대로 둠.
+
+---
+
 # main 착지·Git 패널 v2·CI 단축 완료 — 2026-10-11 (Claude Code)
 
 - 이제 `main` = performance 브랜치(`feat/audit-nine-pr-v0.6.0-20261004`). 착지는 PR CI 통과 뒤 `git push origin <sha>:main` fast-forward로 한다(SHA 보존, PR 자동 merged). GitHub 「Rebase and merge」는 SHA를 다시 만들어 쓰지 않는다. 착지 뒤 performance 브랜치도 같은 SHA로 맞춘다.

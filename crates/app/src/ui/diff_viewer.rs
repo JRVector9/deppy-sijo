@@ -33,6 +33,8 @@ pub struct DiffHunk {
 pub enum DiffMode {
     Working,
     Branch,
+    /// 커밋 하나가 바꾼 내용 — 커밋 목록에서 펼친 파일 행이 연다(2026-10-11 PR 4).
+    Commit(crate::ui::git_panel::CommitSha),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -394,11 +396,13 @@ impl DiffViewerUi {
                 ui.label(egui::RichText::new(format!("{dir}/")).monospace().weak());
             }
             ui.label(egui::RichText::new(name).monospace().strong());
-            let mode_key = match mode {
-                DiffMode::Branch => "git.mode.branch",
-                DiffMode::Working => "git.mode.working",
+            let mode_label = match mode {
+                DiffMode::Branch => catalog.t("git.mode.branch", &[]),
+                DiffMode::Working => catalog.t("git.mode.working", &[]),
+                // 어느 커밋의 diff인지 헤더에서 바로 읽히게 sha를 함께 보인다.
+                DiffMode::Commit(sha) => catalog.t("git.mode.commit", &[("sha", sha.as_str())]),
             };
-            ui.weak(catalog.t(mode_key, &[]));
+            ui.weak(mode_label);
             if self.view.is_none() {
                 return;
             }
@@ -775,6 +779,24 @@ index 111..222 100644
         harness.get_by_label("↓").click();
         harness.run();
         assert_eq!(harness.state().current_hunk, 1);
+    }
+
+    #[test]
+    fn kittest_커밋_diff_헤더는_어느_커밋인지_보여_준다() {
+        use egui_kittest::kittest::Queryable;
+
+        let sha = crate::ui::git_panel::CommitSha::parse("a1b2c3d").unwrap();
+        let mut viewer = DiffViewerUi::default();
+        viewer.open("src/lib.rs".to_owned(), DiffMode::Commit(sha));
+        viewer.set_view(큰_두_hunk_뷰());
+        let mut harness = harness_for(viewer);
+        harness.run();
+
+        assert!(
+            harness
+                .query_by_label("Commit a1b2c3d · vs parent")
+                .is_some()
+        );
     }
 
     #[test]

@@ -1835,7 +1835,8 @@ fn render_centered_message(ui: &mut egui::Ui, message: String) {
     });
 }
 
-fn relative_age_text(catalog: &i18n::Catalog, updated_at: i64, now: i64) -> String {
+/// Git 패널 커밋 목록(git_panel.rs)도 같은 상대 시각 표기를 쓴다.
+pub(crate) fn relative_age_text(catalog: &i18n::Catalog, updated_at: i64, now: i64) -> String {
     let seconds = now.saturating_sub(updated_at).max(0);
     if seconds < 60 {
         catalog.t("history.time.just_now", &[])
@@ -1851,7 +1852,7 @@ fn relative_age_text(catalog: &i18n::Catalog, updated_at: i64, now: i64) -> Stri
     }
 }
 
-fn unix_now() -> i64 {
+pub(crate) fn unix_now() -> i64 {
     let seconds = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()

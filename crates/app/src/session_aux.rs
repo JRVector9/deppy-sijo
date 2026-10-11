@@ -21,6 +21,7 @@ pub(crate) struct SessionAuxView {
     pub git_tab_split_width: Option<f32>,
     pub git_generation: Option<u64>,
     pub git_diff_generation: Option<u64>,
+    pub git_commit_files_generation: Option<u64>,
     pub work_history_ui: ui::work_history::WorkHistoryUi,
     pub work_history_tab: ui::workspace::PaneAuxTabState,
     pub work_history_tab_split_width: Option<f32>,
@@ -34,6 +35,15 @@ pub(crate) struct SessionAuxView {
     pub aux_search: ui::aux_search::AuxSearchState,
 }
 impl SessionAuxView {
+    /// Snapshot, file diff and commit files keep separate slots so one kind never drops another.
+    fn owns_git_generation(&self, generation: u64) -> bool {
+        [
+            self.git_generation,
+            self.git_diff_generation,
+            self.git_commit_files_generation,
+        ]
+        .contains(&Some(generation))
+    }
     fn close_document(&mut self, id: ui::workspace::DocumentTabId) {
         let Some(index) = self
             .document_ids
@@ -79,14 +89,12 @@ impl SessionAuxViews {
         }
     }
     pub fn git_result_owner(&mut self, generation: u64) -> Option<&mut SessionAuxView> {
-        if self.current.git_generation == Some(generation)
-            || self.current.git_diff_generation == Some(generation)
-        {
+        if self.current.owns_git_generation(generation) {
             return Some(&mut self.current);
         }
-        self.parked.values_mut().find(|view| {
-            view.git_generation == Some(generation) || view.git_diff_generation == Some(generation)
-        })
+        self.parked
+            .values_mut()
+            .find(|view| view.owns_git_generation(generation))
     }
     pub fn transcript_result_owner(&mut self, generation: u64) -> Option<&mut SessionAuxView> {
         if self.current.transcript_generation == Some(generation) {
@@ -126,6 +134,7 @@ mod tests {
         views.current.active_document = Some(ui::workspace::DocumentTabId(3));
         views.current.git_generation = Some(8);
         views.current.git_diff_generation = Some(10);
+        views.current.git_commit_files_generation = Some(11);
         views.current.transcript_generation = Some(9);
         views.switch(scope(1, 2));
         assert!(!views.current.git_tab.is_open());
@@ -139,6 +148,10 @@ mod tests {
         assert!(
             views.git_result_owner(10).is_some(),
             "diff must not cancel a pending snapshot"
+        );
+        assert!(
+            views.git_result_owner(11).is_some(),
+            "a file diff must not cancel a pending commit-files load"
         );
         assert!(views.git_result_owner(7).is_none());
         views.close_document(ui::workspace::DocumentTabId(3));

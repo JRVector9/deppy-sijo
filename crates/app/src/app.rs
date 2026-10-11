@@ -13299,6 +13299,9 @@ enum AppHostIoFallback {
         /// 원 요청이 FileDiff였는지 — 폴백 완료를 같은 결과 변형(Snapshot/FileDiff)으로
         /// 되돌려야 App이 올바른 화면(사이드바 스냅샷 vs diff 뷰어)에 오류를 반영한다.
         is_file_diff: bool,
+        /// 원 요청이 CommitFiles였으면 그 sha — 같은 커밋 자리로 오류를 돌려야 펼친
+        /// 커밋이 「불러오는 중」에 멈추지 않는다(2026-10-11 PR 4).
+        commit_files: Option<ui::git_panel::CommitSha>,
     },
     Transcript {
         generation: u64,
@@ -13395,6 +13398,10 @@ impl AppHostIoFallback {
                     intent.request,
                     ui::git_panel::GitPanelIoRequest::FileDiff { .. }
                 ),
+                commit_files: match intent.request {
+                    ui::git_panel::GitPanelIoRequest::CommitFiles { sha } => Some(sha),
+                    _ => None,
+                },
             },
             AppHostIoAction::Transcript {
                 generation,
@@ -13511,9 +13518,15 @@ impl AppHostIoFallback {
             Self::GitPanel {
                 generation,
                 is_file_diff,
+                commit_files,
             } => AppHostIoCompletion::GitPanel(ui::git_panel::GitPanelIoCompletion {
                 generation,
-                result: if is_file_diff {
+                result: if let Some(sha) = commit_files {
+                    ui::git_panel::GitPanelIoResult::CommitFiles {
+                        sha,
+                        result: Err(ui::git_panel::GitPanelErrorCode::CollectionFailed),
+                    }
+                } else if is_file_diff {
                     ui::git_panel::GitPanelIoResult::FileDiff(Err(
                         ui::git_panel::GitPanelErrorCode::CollectionFailed,
                     ))
@@ -15403,6 +15416,9 @@ impl App {
                                 .diff_viewer_ui
                                 .set_view(ui::diff_viewer::FileDiffView::default()),
                         },
+                        ui::git_panel::GitPanelIoResult::CommitFiles { sha, result } => {
+                            view.git_panel_ui.set_commit_files(sha, result);
+                        }
                     }
                     self.egui_ctx.request_repaint();
                 }
@@ -19809,6 +19825,12 @@ impl App {
                             ui::git_panel::GitPanelIoRequest::FileDiff { .. } => view
                                 .diff_viewer_ui
                                 .set_view(ui::diff_viewer::FileDiffView::default()),
+                            ui::git_panel::GitPanelIoRequest::CommitFiles { sha } => {
+                                view.git_panel_ui.set_commit_files(
+                                    sha,
+                                    Err(ui::git_panel::GitPanelErrorCode::CollectionFailed),
+                                )
+                            }
                         }
                     }
                 }
@@ -19858,6 +19880,7 @@ impl App {
             // repo를 못 찾았다 — 고정도 함께 푼다(옛 repo에 붙잡히지 않게).
             self.session_aux.current.git_generation = None;
             self.session_aux.current.git_diff_generation = None;
+            self.session_aux.current.git_commit_files_generation = None;
             self.session_aux.current.git_panel_cwd = None;
             self.session_aux
                 .current
@@ -19867,11 +19890,17 @@ impl App {
         };
         self.git_panel_generation = self.git_panel_generation.wrapping_add(1).max(1);
         let snapshot = matches!(request, ui::git_panel::GitPanelIoRequest::Snapshot);
-        if snapshot {
-            self.session_aux.current.git_generation = Some(self.git_panel_generation);
-        } else {
-            self.session_aux.current.git_diff_generation = Some(self.git_panel_generation);
-        }
+        // 종류마다 따로 기록한다 — 커밋을 펼친 직후 파일을 눌러도 커밋 파일 결과가
+        // 버려지지 않는다(2026-10-11 PR 4).
+        let view = &mut self.session_aux.current;
+        let slot = match &request {
+            ui::git_panel::GitPanelIoRequest::Snapshot => &mut view.git_generation,
+            ui::git_panel::GitPanelIoRequest::FileDiff { .. } => &mut view.git_diff_generation,
+            ui::git_panel::GitPanelIoRequest::CommitFiles { .. } => {
+                &mut view.git_commit_files_generation
+            }
+        };
+        *slot = Some(self.git_panel_generation);
         let action = AppHostIoAction::GitPanel(ui::git_panel::GitPanelIoIntent {
             generation: self.git_panel_generation,
             cwd: cwd.clone(),
@@ -35699,6 +35728,14 @@ impl eframe::App for App {
                     cwd: Some(path),
                 });
             }
+            Some(ui::git_panel::GitPanelAction::LoadCommitFiles { sha }) => {
+                // 지금 패널이 보여주는 repo의 커밋이다 — ShowFileDiff와 같은 규칙(항목 3).
+                self.request_git_panel_io_at(
+                    ui.ctx(),
+                    self.session_aux.current.git_panel_cwd.clone(),
+                    ui::git_panel::GitPanelIoRequest::CommitFiles { sha },
+                );
+            }
             None => {}
         }
         // 작업함 페이지에서 세션 점프 — 터미널로 복귀한 뒤 기존 알림 네비게이션 경로
@@ -46409,6 +46446,8 @@ mod tests {
             remote_https_base: Some("https://github.com/o/r".to_owned()),
             worktrees: Vec::new(),
             worktrees_truncated: false,
+            commits: Vec::new(),
+            commits_truncated: false,
         }));
         assert!(
             git_panel_ui.remote_target().is_some(),
@@ -46586,6 +46625,69 @@ mod tests {
                 && !show_file_diff.contains("self.request_git_panel_io(ui.ctx()"),
             "파일 diff 재요청이 포커스 세션 기준 헬퍼로 되돌아가면 안 된다"
         );
+    }
+
+    /// 커밋 펼침의 파일 로드(2026-10-11 PR 4)는 ShowFileDiff와 같은 규칙으로 지금
+    /// 보여주는 repo(`git_panel_cwd`)에서 돌고, 완료는 패널의 그 커밋 자리로 돌아간다.
+    #[test]
+    fn git_panel_커밋_파일_로드는_고정된_cwd로_요청하고_결과를_패널에_돌린다() {
+        let source = include_str!("app.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let handler = production
+            .split_once("Some(ui::git_panel::GitPanelAction::LoadCommitFiles { sha }) => {")
+            .expect("LoadCommitFiles 핸들러가 있어야 한다")
+            .1
+            .split_once("\n            None => {}")
+            .expect("match arm이 None으로 끝나야 한다")
+            .0;
+        assert!(
+            handler.contains("self.session_aux.current.git_panel_cwd.clone()")
+                && handler.contains("ui::git_panel::GitPanelIoRequest::CommitFiles { sha }"),
+            "커밋 파일은 지금 보여주는 repo cwd로 요청해야 한다"
+        );
+        assert!(
+            !handler.contains("self.focused_session_repo_cwd()")
+                && !handler.contains("self.request_git_panel_io(ui.ctx()"),
+            "포커스 세션 기준 헬퍼로 가면 다른 repo의 커밋을 찾는다"
+        );
+        // match arm 끝(첫 `}`)에서 자른다 — 뒤따르는 다른 arm이 딸려 들어오지 않게.
+        let completion = production
+            .split_once("ui::git_panel::GitPanelIoResult::CommitFiles { sha, result } => {")
+            .expect("CommitFiles 완료 처리가 있어야 한다")
+            .1
+            .split_once('}')
+            .expect("arm이 닫혀야 한다")
+            .0;
+        assert!(
+            completion.contains("view.git_panel_ui.set_commit_files(sha, result);"),
+            "완료는 요청한 sha와 함께 패널에 돌려줘야 한다"
+        );
+    }
+
+    /// host 작업이 결과 없이 끝나도(패닉 등) 커밋 파일 요청은 **같은 커밋 자리**로
+    /// 실패를 돌린다 — 스냅샷 실패로 바꾸면 패널 전체가 오류가 되고 펼친 커밋은
+    /// 「불러오는 중」에 멈춘다.
+    #[test]
+    fn git_panel_커밋_파일_요청의_폴백은_같은_커밋으로_실패를_돌린다() {
+        let sha = ui::git_panel::CommitSha::parse("a1b2c3d").unwrap();
+        let completion = AppHostIoFallback::for_action(&AppHostIoAction::GitPanel(
+            ui::git_panel::GitPanelIoIntent {
+                generation: 7,
+                cwd: PathBuf::from("/repo"),
+                request: ui::git_panel::GitPanelIoRequest::CommitFiles { sha },
+            },
+        ))
+        .into_completion();
+        assert!(matches!(
+            completion,
+            AppHostIoCompletion::GitPanel(ui::git_panel::GitPanelIoCompletion {
+                generation: 7,
+                result: ui::git_panel::GitPanelIoResult::CommitFiles {
+                    sha: failed,
+                    result: Err(ui::git_panel::GitPanelErrorCode::CollectionFailed),
+                },
+            }) if failed == sha
+        ));
     }
 
     /// `focused_session_repo_cwd`의 doc은 한때 "ShowFocusedDiff·ShowDiff{session} 둘 다

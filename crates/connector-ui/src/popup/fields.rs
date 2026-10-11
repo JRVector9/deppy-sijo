@@ -38,7 +38,11 @@ pub fn choice_input<R>(
 }
 
 /// A complete input control, not just a preferred size on the parent Ui.
-pub fn text_input(ui: &mut egui::Ui, draft: &mut String, hint: &str) -> egui::Response {
+pub fn text_input(
+    ui: &mut egui::Ui,
+    draft: &mut dyn egui::TextBuffer,
+    hint: &str,
+) -> egui::Response {
     ui.scope(|ui| {
         let colors = palette(ui);
         ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
@@ -65,13 +69,166 @@ pub fn text_input(ui: &mut egui::Ui, draft: &mut String, hint: &str) -> egui::Re
     .inner
 }
 
+/// A bounded editor projection: egui sees masks, while character-index edits
+/// update the caller's secret. Undo/previous-text snapshots never receive values.
+pub struct MaskedSecretBuffer<'a> {
+    value: &'a mut String,
+    mask: String,
+    max_bytes: usize,
+    rejected: bool,
+    backup: Option<SecretBackup>,
+}
+struct SecretBackup(String);
+fn wipe(text: &mut String) {
+    unsafe {
+        let bytes = text.as_mut_vec();
+        for index in 0..bytes.capacity() {
+            std::ptr::write_volatile(bytes.as_mut_ptr().add(index), 0);
+        }
+        bytes.set_len(0);
+    }
+}
+impl Drop for SecretBackup {
+    fn drop(&mut self) {
+        wipe(&mut self.0);
+    }
+}
+impl<'a> MaskedSecretBuffer<'a> {
+    pub fn new(value: &'a mut String, max_bytes: usize) -> Self {
+        Self {
+            mask: "•".repeat(value.chars().count()),
+            value,
+            max_bytes,
+            rejected: false,
+            backup: None,
+        }
+    }
+    fn begin_edit(&mut self) {
+        if self.backup.is_none() {
+            self.backup = Some(SecretBackup(self.value.clone()));
+        }
+    }
+    fn rebuild(&mut self) {
+        self.mask = "•".repeat(self.value.chars().count());
+    }
+    /// Rejected replacement restores the entire value, including deleted selection.
+    pub fn finish(self) -> bool {
+        self.rejected
+    }
+}
+impl Drop for MaskedSecretBuffer<'_> {
+    fn drop(&mut self) {
+        if self.rejected
+            && let Some(backup) = &mut self.backup
+        {
+            wipe(self.value);
+            *self.value = std::mem::take(&mut backup.0);
+        }
+    }
+}
+impl egui::TextBuffer for MaskedSecretBuffer<'_> {
+    fn type_id(&self) -> std::any::TypeId {
+        std::any::TypeId::of::<MaskedSecretBuffer<'static>>()
+    }
+    fn is_mutable(&self) -> bool {
+        true
+    }
+    fn as_str(&self) -> &str {
+        &self.mask
+    }
+    fn insert_text(&mut self, text: &str, index: egui::text::CharIndex) -> usize {
+        if self.rejected
+            || text.contains('\0')
+            || text.len() > self.max_bytes.saturating_sub(self.value.len())
+        {
+            self.rejected = true;
+            return 0;
+        }
+        self.begin_edit();
+        let count = self.value.insert_text(text, index);
+        self.rebuild();
+        count
+    }
+    fn delete_char_range(&mut self, range: std::ops::Range<egui::text::CharIndex>) {
+        if self.rejected {
+            return;
+        }
+        self.begin_edit();
+        self.value.delete_char_range(range);
+        self.rebuild();
+    }
+    // Undo is disabled. A mask snapshot must never replace the actual value.
+    fn replace_with(&mut self, _: &str) {}
+    fn take(&mut self) -> String {
+        self.mask.clone()
+    }
+}
+
+/// Shared secret field. Callers clear the secret and widget state on close.
+pub fn secret_input(
+    ui: &mut egui::Ui,
+    draft: &mut MaskedSecretBuffer<'_>,
+    id: egui::Id,
+    hint: &str,
+    multiline: bool,
+) -> egui::Response {
+    // Undo carries masks only; clear it on both sides so mask edits cannot undo
+    // a secret edit. This does not claim to wipe OS/input-event memory.
+    let clear_undo = |ctx: &egui::Context| {
+        if let Some(mut state) = egui::text_edit::TextEditState::load(ctx, id) {
+            state.clear_undoer();
+        }
+    };
+    clear_undo(ui.ctx());
+    let response = ui
+        .scope(|ui| {
+            let colors = palette(ui);
+            ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+            let widgets = &mut ui.visuals_mut().widgets;
+            for visual in [
+                &mut widgets.inactive,
+                &mut widgets.hovered,
+                &mut widgets.active,
+            ] {
+                visual.bg_stroke = egui::Stroke::new(1.0, colors.border);
+                visual.corner_radius = egui::CornerRadius::same(3);
+                visual.expansion = 0.0;
+            }
+            let edit = if multiline {
+                egui::TextEdit::multiline(draft).desired_rows(3)
+            } else {
+                egui::TextEdit::singleline(draft)
+            };
+            ui.add_sized(
+                [
+                    ui.available_width(),
+                    if multiline { 80.0 } else { INPUT_HEIGHT },
+                ],
+                edit.id(id)
+                    .password(true)
+                    .font(egui::FontId::proportional(13.0))
+                    .margin(egui::Margin::symmetric(10, 8))
+                    .background_color(colors.input)
+                    .text_color(colors.text)
+                    .hint_text(hint),
+            )
+        })
+        .inner;
+    clear_undo(ui.ctx());
+    response
+}
+
 pub struct PathInputResponse {
     pub input: egui::Response,
     pub browse: egui::Response,
 }
 
 /// Same input and action components, with the path occupying the remaining row.
-pub fn path_input(ui: &mut egui::Ui, draft: &mut String, browse_label: &str) -> PathInputResponse {
+pub fn path_input(
+    ui: &mut egui::Ui,
+    draft: &mut dyn egui::TextBuffer,
+    browse_label: &str,
+) -> PathInputResponse {
     let button_width = super::actions::button_width(ui, browse_label);
     if ui.available_width() < button_width + 7.0 + 24.0 {
         let input = text_input(ui, draft, "");
@@ -197,4 +354,61 @@ pub fn segmented_choice<T: Copy + Eq>(
                 }
             });
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secret_input_removes_undo_and_uses_shared_dimensions() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("bounded-secret-field");
+        let cursor = egui::text::CCursorRange::one(egui::text::CCursor::new(0));
+        let mut state = egui::text_edit::TextEditState::default();
+        let mut undoer = state.undoer();
+        undoer.feed_state(0.0, &(cursor, "old-secret".into()));
+        undoer.feed_state(1.0, &(cursor, "new-secret".into()));
+        state.set_undoer(undoer);
+        state.store(&ctx, id);
+        let mut draft = "test-secret".to_owned();
+        let mut height = 0.0;
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                let mut buffer = MaskedSecretBuffer::new(&mut draft, 256);
+                height = secret_input(ui, &mut buffer, id, "Secret", false)
+                    .rect
+                    .height();
+            });
+        })
+        .drop_without_applying_deltas();
+        assert_eq!(height, INPUT_HEIGHT);
+        let stored = egui::text_edit::TextEditState::load(&ctx, id).unwrap();
+        assert!(!stored.undoer().has_undo(&(cursor, draft)));
+    }
+
+    #[test]
+    fn secret_projection_masks_multilingual_edits_and_rolls_back_rejected_selection() {
+        use egui::TextBuffer;
+        let mut value = "한a😀글".to_owned();
+        {
+            let mut buffer = MaskedSecretBuffer::new(&mut value, 16);
+            assert_eq!(buffer.as_str(), "••••");
+            buffer.delete_char_range(egui::text::CharIndex(1)..egui::text::CharIndex(3));
+            assert_eq!(buffer.insert_text("é", egui::text::CharIndex(1)), 1);
+            assert_eq!(buffer.as_str(), "•••");
+            assert!(!buffer.finish());
+        }
+        assert_eq!(value, "한é글");
+        {
+            let mut buffer = MaskedSecretBuffer::new(&mut value, 16);
+            buffer.delete_char_range(egui::text::CharIndex(0)..egui::text::CharIndex(3));
+            assert_eq!(
+                buffer.insert_text(&"x".repeat(17), egui::text::CharIndex(0)),
+                0
+            );
+            assert!(buffer.finish());
+        }
+        assert_eq!(value, "한é글");
+    }
 }

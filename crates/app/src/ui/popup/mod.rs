@@ -11,9 +11,10 @@ pub use confirmation::{
     ConfirmationChoice, ConfirmationSpec, confirmation, confirmation_for_target,
 };
 pub use connector_ui::popup::{
-    ActionTone, NoticeTone, PopupSpec, WindowSpec, action_button, body, body_with_max_height,
-    choice_input, field, fixed_window, footer, list_actions, list_row, notice, path_input, popover,
-    popover_frame, segmented_choice, show, text_input, window, window_body,
+    ActionTone, MaskedSecretBuffer, NoticeTone, PopupSpec, WindowSpec, action_button, body,
+    body_with_max_height, choice_input, field, fixed_window, footer, list_actions, list_row,
+    notice, path_input, popover, popover_frame, secret_input, segmented_choice, show, text_input,
+    window, window_body,
 };
 pub(crate) use connector_ui::popup::{modal_input_blocked, prepare_target, set_pending_modal};
 pub use information::{InformationSpec, information};

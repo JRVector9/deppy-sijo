@@ -7,7 +7,9 @@ mod shell;
 mod window;
 
 pub use actions::{ActionTone, action_button, footer};
-pub use fields::{choice_input, field, path_input, segmented_choice, text_input};
+pub use fields::{
+    MaskedSecretBuffer, choice_input, field, path_input, secret_input, segmented_choice, text_input,
+};
 pub use list::{list_actions, list_row};
 pub use notice::{NoticeTone, notice};
 pub use shell::{

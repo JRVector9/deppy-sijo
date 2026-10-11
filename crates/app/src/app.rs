@@ -19628,9 +19628,9 @@ impl App {
         let Some(mux) = self.active.workspace_ui.mux().cloned() else {
             return false;
         };
-        if pane_of_session(&mux, session).is_none() {
+        let Some(pane) = pane_of_session(&mux, session) else {
             return false;
-        }
+        };
         let Some(target) = archived_resume_targets_from_mux(
             &mux,
             &self.archived_agent_resume,
@@ -19661,6 +19661,12 @@ impl App {
             }
             return true;
         }
+        let running = self
+            .agent_bindings
+            .iter()
+            .filter(|(other, _)| **other != session)
+            .map(|(_, binding)| (agent_kind_id(binding.kind), binding.session_id.as_str()));
+        let (extra_args, fork_origin) = archived_respawn_args(row, extra_args, running);
         let command = runtime::RuntimeCommand::RespawnArchivedAgent {
             session,
             extra_args,
@@ -19668,11 +19674,16 @@ impl App {
             rows: 24,
             scrollback_lines: self.config.terminal.scrollback_lines as usize,
         };
-        self.stage_dotenv_continuation(
-            self.active.runtime_instance,
-            PendingDotenvContinuation::RuntimeCommand(command),
-        )
-        .is_ok()
+        let staged = self
+            .stage_dotenv_continuation(
+                self.active.runtime_instance,
+                PendingDotenvContinuation::RuntimeCommand(command),
+            )
+            .is_ok();
+        if staged && let Some(origin) = fork_origin {
+            self.forked_resume_origins.insert(pane.0, origin);
+        }
+        staged
     }
 
     /// PR-resume-without-pane(2026-08-19): work history 카드에서 「이어서 하기」를
@@ -38506,6 +38517,35 @@ fn archived_agent_row_for_session<'a>(
         .find(|pane| pane.session_id == Some(session))
         .and_then(|pane| pane.persistent_session_id.as_deref())
         .and_then(|persistent_id| rows.get(persistent_id))
+}
+
+/// 열람 전용 pane 「이어서 실행」의 최종 인자. 셸 복원(`fork_shared_native_resume`)처럼
+/// 다른 pane이 이미 같은 대화를 실행 중이면 두 프로세스가 한 대화를 이어 쓰지 않게 새 ID로
+/// fork한다 — 먼저 실행한 pane만 원본을 잇는다. 최근 폴더 재개(`-c`)는 어느 대화가 열릴지
+/// 모르므로 같은 provider가 실행 중이면 fork한다(2026-10-12: 두 pane이 `-c`로 한 대화에 붙음).
+/// fork를 실측하지 못한 CLI는 기존 인자를 쓴다. 두 번째 값은 정확 재개를 fork한 원본 ID.
+fn archived_respawn_args<'a>(
+    row: Option<&storage::ArchivedAgentResumeRow>,
+    extra_args: Vec<String>,
+    running: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> (Vec<String>, Option<String>) {
+    let Some(row) = row else {
+        return (extra_args, None);
+    };
+    let binding = row.kind.as_deref().zip(row.session_id.as_deref());
+    let Some(target) = crate::agent_resume::resume_target(&row.agent_id, binding) else {
+        return (extra_args, None);
+    };
+    if !running
+        .into_iter()
+        .any(|(kind, session_id)| target.may_share_running(kind, session_id))
+    {
+        return (extra_args, None);
+    }
+    match crate::agent_resume::fork_resume_plan(&row.agent_id, binding) {
+        Some(plan) => (plan.into_extra_args(), target.session_id),
+        None => (extra_args, None),
+    }
 }
 
 /// PTY 「이어서 하기」가 만들려는 codex resume이 App Server가 이미 writer로 붙잡고 있는
@@ -57427,6 +57467,76 @@ mod tests {
 
         // 알 수 없는 session에는 아무 것도 못 찾는다(다른 pane/mux 상태).
         assert!(archived_agent_row_for_session(&mux, &rows, runtime::SessionId(404)).is_none());
+    }
+
+    /// 2026-10-12 실사례: 같은 대화가 저장된 열람 전용 pane 두 개를 차례로 「이어서 실행」하면
+    /// 먼저 실행한 pane만 원본을 잇고, 나중 pane은 새 ID로 fork한다.
+    #[test]
+    fn archived_respawn은_실행_중인_같은_대화를_fork해_한_대화를_둘이_잇지_않는다() {
+        let shared = "240ec284-0fd0-4e44-8336-18f5cc5f88fe";
+        let row = archived_resume_row(
+            "persistent-b",
+            "deppy-builtin-claude",
+            Some(("claude", shared)),
+        );
+        let base = || vec!["--resume".to_owned(), shared.to_owned()];
+
+        let (first, origin) = archived_respawn_args(Some(&row), base(), []);
+        assert_eq!(first, base());
+        assert_eq!(origin, None);
+
+        let (second, origin) = archived_respawn_args(Some(&row), base(), [("claude", shared)]);
+        assert_eq!(second, ["--fork-session", "--resume", shared]);
+        assert_eq!(origin.as_deref(), Some(shared));
+
+        // 다른 대화나 다른 provider가 실행 중이면 원본을 그대로 잇는다.
+        let (other, origin) = archived_respawn_args(
+            Some(&row),
+            base(),
+            [("claude", "other-session"), ("codex", shared)],
+        );
+        assert_eq!(other, base());
+        assert_eq!(origin, None);
+
+        let codex = archived_resume_row(
+            "persistent-c",
+            "deppy-builtin-codex",
+            Some(("codex", "thread-x")),
+        );
+        let (forked, origin) = archived_respawn_args(
+            Some(&codex),
+            vec!["resume".to_owned(), "thread-x".to_owned()],
+            [("codex", "thread-x")],
+        );
+        assert_eq!(forked, ["fork", "thread-x"]);
+        assert_eq!(origin.as_deref(), Some("thread-x"));
+    }
+
+    /// 0.10.1이 claude pane에 외부 codex ID를 붙인 행은 최근 폴더 재개(`-c`)가 된다. 같은
+    /// provider가 이미 실행 중이면 `-c`가 그 대화를 집어 오므로 fork하고, 원본 ID는 모른다.
+    #[test]
+    fn archived_respawn은_최근_폴더_재개도_같은_provider가_실행_중이면_fork한다() {
+        let row = archived_resume_row(
+            "persistent-a",
+            "deppy-builtin-claude",
+            Some(("codex", "01a128ab-3838-7be3-a2d3-4353f0a44f65")),
+        );
+        let base = || vec!["-c".to_owned()];
+
+        let (alone, origin) = archived_respawn_args(Some(&row), base(), [("codex", "x")]);
+        assert_eq!(alone, ["-c"]);
+        assert_eq!(origin, None);
+
+        let (forked, origin) = archived_respawn_args(Some(&row), base(), [("claude", "any")]);
+        assert_eq!(forked, ["-c", "--fork-session"]);
+        assert_eq!(origin, None);
+
+        // fork를 실측하지 못한 CLI와 메타데이터 없는 pane은 기존 인자를 그대로 쓴다.
+        let grok = archived_resume_row("persistent-g", "deppy-builtin-grok", None);
+        let (unchanged, _) = archived_respawn_args(Some(&grok), base(), [("grok", "any")]);
+        assert_eq!(unchanged, ["-c"]);
+        let (no_row, _) = archived_respawn_args(None, base(), [("claude", "any")]);
+        assert_eq!(no_row, ["-c"]);
     }
 
     /// dispatch_respawn_archived_agent가 기대는 판정 — App Server writer 충돌은

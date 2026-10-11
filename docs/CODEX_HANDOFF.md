@@ -1,3 +1,15 @@
+# 열람 전용 agent pane 「이어서 실행」 중복 대화 fork — 2026-10-12 (Claude Code)
+
+- 사용자 보고: 0.11.0 재실행 뒤 「가장 마지막 상태가 저장되었다가 재시작되지 않는 것 같다」 → 「원인 찾으면 바로 수정해」.
+- 실DB(읽기 전용)·로그 확인: 종료 시 저장(탭18/pane19/layout, 세션 4개 exited)은 정상. Design(`colon35/Design`) pane 두 개의 `agent_sessions`가 종료 49초 전(08:22:08) 같은 초에 둘 다 외부 codex-tui 세션 `01a128ab…`(VS Code 쪽, Deppy pane 아님, 아직 실행 중)로 덮였다. 원래 claude 240ec284.
+- 원인 1(오염): 실행 중이던 0.10.1의 Codex cwd fallback(`find_codex_transcript`: 최근 rollout 중 cwd 같은 것, 소유 확인 없음)과 `codex` 보조 프로세스 분류. **ee1789ef(0.10.2)에서 이미 고쳐짐** — rollout writer 소유/`codex resume <id>` 필요, app-server/exec/mcp 제외, hook 조상 증명. 0.11.0에 포함.
+- 원인 2(이번 수정): 재시작 시 agent pane은 설계상 열람 전용(99c74cea PR-A2)이고 「이어서 실행」(`dispatch_respawn_archived_agent`)은 셸 복원 경로의 `fork_shared_native_resume` 같은 중복 방지가 없었다. provider 불일치 binding은 `-c`로 강등돼 두 pane이 50초 간격으로 각각 `claude -c` → 같은 대화 240ec284에 둘 다 붙었다. 지금 DB도 두 pane이 240ec284라 다음 재시작에서 `--resume 240ec284` 두 번이 될 상태였다.
+- 수정: `agent_resume::{resume_target, fork_resume_plan}`(+`ResumeTarget::may_share_running`, `resolve_resume`로 판정 공유)와 app `archived_respawn_args`. 다른 pane이 같은 대화(정확 재개는 같은 ID, `-c`/`resume --last`는 같은 provider)를 실행 중이면 Claude `--fork-session --resume <id>`/`-c --fork-session`, Codex `fork <id>`/`fork --last`. 먼저 실행한 pane만 원본을 잇는다. 정확 재개 fork는 `forked_resume_origins`에 원본을 남겨 셸 경로와 같게 task prompt를 넘기지 않는다. Kimi/Grok/Qwen은 fork 미실측이라 기존 인자 유지. 플래그 실측: Claude 2.1.296 `--help`, Codex 0.162.1 `fork --help`.
+- 검증: `cargo test -p deppy-sijo --bin deppy-sijo -- agent_resume archived_ fork_shared resume_plan` 18 PASS(새 4개 포함), `cargo fmt --check` OK, `cargo clippy -p deppy-sijo --all-targets -- -D warnings` 0건. 전체 회귀는 PR CI.
+- 한계: 이미 오염된 행의 원래 대화를 되살리지 않는다(알 수 없음). Work History 「새 pane에서 이어서 하기」 경로는 pane이 없는 대화 전용이라 범위 밖. 앱 재빌드·재실행·버전 올림은 이번 요청에 없어 하지 않았다. 사용자 현재 실행 중인 Design pane 두 개는 여전히 같은 Claude 대화를 함께 쓰고 있다.
+
+---
+
 # 프로젝트 키 관리 main 착지·0.11.0 재실행 — 2026-10-12 (Claude Code)
 
 - 사용자 「추가로 작업한게 있는데 메인에 머지하고 재빌드하고 재실행해」. 대상은 로컬 performance에만 있던 Codex 프로젝트 키 커밋 7개(2606857e..1d17a029, 52파일). 재실행은 이번 작업의 명시 요청이다.

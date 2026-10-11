@@ -40,6 +40,26 @@ impl ResumePlan {
     }
 }
 
+/// 재개가 이어 쓸 대화. 정확 재개는 그 native ID, 최근 폴더 재개(`session_id: None`)는
+/// 같은 provider의 「가장 최근 대화」라서 어느 대화가 열릴지 미리 알 수 없다.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ResumeTarget {
+    pub(crate) kind: &'static str,
+    pub(crate) session_id: Option<String>,
+}
+
+impl ResumeTarget {
+    /// 다른 pane이 실행 중인 `kind`/`session_id` 대화를 이 재개가 이어 쓸 수 있는지.
+    /// 최근 폴더 재개는 같은 provider의 실행 중 대화를 집어 올 수 있으므로 겹친다고 본다.
+    pub(crate) fn may_share_running(&self, kind: &str, session_id: &str) -> bool {
+        self.kind == kind
+            && self
+                .session_id
+                .as_deref()
+                .is_none_or(|own| own == session_id)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ResumeProvider {
     Claude,
@@ -92,6 +112,30 @@ impl ResumeProvider {
             Self::Kimi => vec!["--session".to_owned(), session_id.to_owned()],
         }
     }
+
+    fn kind_id(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Kimi => "kimi",
+            Self::Grok => "grok",
+            Self::QwenCode => "qwen-code",
+        }
+    }
+
+    /// 같은 대화를 새 ID로 갈라 이어간다. Claude 2.1.296 `--help` 실측: `--fork-session`은
+    /// `--resume`/`--continue`와 함께 쓴다. Codex 0.162.1 `fork --help` 실측:
+    /// `fork [SESSION_ID]`, ID 없이는 `--last`. 실측하지 못한 CLI는 None.
+    fn fork_args(self, session_id: Option<&str>) -> Option<Vec<String>> {
+        let args: Vec<&str> = match (self, session_id) {
+            (Self::Claude, Some(id)) => vec!["--fork-session", "--resume", id],
+            (Self::Claude, None) => vec!["-c", "--fork-session"],
+            (Self::Codex, Some(id)) => vec!["fork", id],
+            (Self::Codex, None) => vec!["fork", "--last"],
+            (Self::Kimi | Self::Grok | Self::QwenCode, _) => return None,
+        };
+        Some(args.into_iter().map(str::to_owned).collect())
+    }
 }
 
 fn native_session_id_is_valid(session_id: &str) -> bool {
@@ -104,30 +148,62 @@ fn native_session_id_is_valid(session_id: &str) -> bool {
 /// built-in agent의 provider와 binding kind가 다르면 오래되거나 잘못된 binding으로 보고
 /// 무시한다. custom agent는 검증된 binding kind가 유일한 provider 근거다.
 pub(crate) fn resume_plan(agent_id: &str, binding: Option<(&str, &str)>) -> ResumePlan {
+    match resolve_resume(agent_id, binding) {
+        None => ResumePlan {
+            mode: ResumeMode::Unsupported,
+            extra_args: Vec::new(),
+        },
+        Some((provider, Some(session_id))) => ResumePlan {
+            mode: ResumeMode::Exact,
+            extra_args: provider.exact_args(session_id),
+        },
+        Some((provider, None)) => ResumePlan {
+            mode: ResumeMode::RecentInCwd,
+            extra_args: provider.recent_args(),
+        },
+    }
+}
+
+/// `resume_plan`이 이어 쓸 대화. 지원하지 않는 agent는 None.
+pub(crate) fn resume_target(agent_id: &str, binding: Option<(&str, &str)>) -> Option<ResumeTarget> {
+    resolve_resume(agent_id, binding).map(|(provider, session_id)| ResumeTarget {
+        kind: provider.kind_id(),
+        session_id: session_id.map(str::to_owned),
+    })
+}
+
+/// 다른 pane이 같은 대화를 이어 쓰고 있을 때 쓰는 `resume_plan`의 fork판. 같은 대화를 두
+/// 프로세스가 이어 쓰지 않도록 새 ID로 갈라 이어간다. fork를 실측하지 못한 CLI는 None.
+pub(crate) fn fork_resume_plan(
+    agent_id: &str,
+    binding: Option<(&str, &str)>,
+) -> Option<ResumePlan> {
+    let (provider, session_id) = resolve_resume(agent_id, binding)?;
+    Some(ResumePlan {
+        mode: if session_id.is_some() {
+            ResumeMode::Exact
+        } else {
+            ResumeMode::RecentInCwd
+        },
+        extra_args: provider.fork_args(session_id)?,
+    })
+}
+
+/// 재개할 provider와 정확 재개 ID(provider와 맞는 유효한 binding일 때만).
+fn resolve_resume<'a>(
+    agent_id: &str,
+    binding: Option<(&str, &'a str)>,
+) -> Option<(ResumeProvider, Option<&'a str>)> {
     let persisted_provider = ResumeProvider::from_agent_id(agent_id);
     let binding = binding.and_then(|(kind, session_id)| {
         let provider = ResumeProvider::from_kind(kind)?;
         native_session_id_is_valid(session_id).then_some((provider, session_id))
     });
-    let provider = persisted_provider.or_else(|| binding.map(|(provider, _)| provider));
-    let Some(provider) = provider else {
-        return ResumePlan {
-            mode: ResumeMode::Unsupported,
-            extra_args: Vec::new(),
-        };
-    };
-    if let Some((binding_provider, session_id)) = binding
-        && binding_provider == provider
-    {
-        return ResumePlan {
-            mode: ResumeMode::Exact,
-            extra_args: provider.exact_args(session_id),
-        };
-    }
-    ResumePlan {
-        mode: ResumeMode::RecentInCwd,
-        extra_args: provider.recent_args(),
-    }
+    let provider = persisted_provider.or_else(|| binding.map(|(provider, _)| provider))?;
+    let session_id = binding
+        .filter(|(binding_provider, _)| *binding_provider == provider)
+        .map(|(_, session_id)| session_id);
+    Some((provider, session_id))
 }
 
 #[cfg(test)]
@@ -221,5 +297,84 @@ mod tests {
         let unsupported = resume_plan("custom-agent", None);
         assert_eq!(unsupported.mode, ResumeMode::Unsupported);
         assert!(unsupported.extra_args.is_empty());
+    }
+
+    #[test]
+    fn fork_재개는_실측한_claude와_codex만_새_id로_갈라_잇는다() {
+        let cases = [
+            (
+                "deppy-builtin-claude",
+                Some(("claude", "240ec284-0fd0-4e44-8336-18f5cc5f88fe")),
+                ResumeMode::Exact,
+                vec![
+                    "--fork-session",
+                    "--resume",
+                    "240ec284-0fd0-4e44-8336-18f5cc5f88fe",
+                ],
+            ),
+            (
+                "deppy-builtin-claude",
+                None,
+                ResumeMode::RecentInCwd,
+                vec!["-c", "--fork-session"],
+            ),
+            (
+                "deppy-builtin-codex",
+                Some(("codex", "01a128ab-3838-7be3-a2d3-4353f0a44f65")),
+                ResumeMode::Exact,
+                vec!["fork", "01a128ab-3838-7be3-a2d3-4353f0a44f65"],
+            ),
+            (
+                "deppy-builtin-codex",
+                None,
+                ResumeMode::RecentInCwd,
+                vec!["fork", "--last"],
+            ),
+        ];
+        for (agent_id, binding, mode, expected) in cases {
+            let plan = fork_resume_plan(agent_id, binding).expect(agent_id);
+            assert_eq!(plan.mode, mode, "{agent_id}");
+            assert_eq!(plan.extra_args, expected, "{agent_id}");
+        }
+
+        // 2026-10-12 실사례: claude pane에 외부 codex ID가 붙은 binding은 provider가 달라
+        // 정확 재개 대상이 아니다 — fork도 최근 대화 fork로 강등한다.
+        let mismatched = fork_resume_plan(
+            "deppy-builtin-claude",
+            Some(("codex", "01a128ab-3838-7be3-a2d3-4353f0a44f65")),
+        )
+        .unwrap();
+        assert_eq!(mismatched.extra_args, ["-c", "--fork-session"]);
+
+        for agent_id in [
+            "deppy-builtin-kimi",
+            "deppy-builtin-grok",
+            "deppy-builtin-qwen-code",
+            "custom-agent",
+        ] {
+            assert_eq!(fork_resume_plan(agent_id, None), None, "{agent_id}");
+        }
+    }
+
+    #[test]
+    fn resume_target은_정확_id끼리만_겹치고_최근_재개는_같은_provider와_겹친다() {
+        let exact = resume_target("deppy-builtin-claude", Some(("claude", "a"))).unwrap();
+        assert_eq!(
+            exact,
+            ResumeTarget {
+                kind: "claude",
+                session_id: Some("a".to_owned())
+            }
+        );
+        assert!(exact.may_share_running("claude", "a"));
+        assert!(!exact.may_share_running("claude", "b"));
+        assert!(!exact.may_share_running("codex", "a"));
+
+        let recent = resume_target("deppy-builtin-claude", Some(("codex", "a"))).unwrap();
+        assert_eq!(recent.session_id, None);
+        assert!(recent.may_share_running("claude", "anything"));
+        assert!(!recent.may_share_running("codex", "a"));
+
+        assert_eq!(resume_target("custom-agent", None), None);
     }
 }

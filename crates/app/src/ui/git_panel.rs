@@ -232,6 +232,17 @@ fn split_row_path(rel_path: &str) -> (&str, &str) {
     }
 }
 
+/// 목록용 폴더 표시 — 끝 두 단계만 남기고 앞은 「…/」로 줄인다. 300pt 목록에서
+/// 앞부분부터 잘리면 `crates/…`만 남아 같은 저장소의 파일끼리 구분되지 않았다
+/// (2026-10-11 시안). 전체 경로는 행 hover와 diff 헤더에 그대로 있다.
+fn short_dir(dir: &str) -> std::borrow::Cow<'_, str> {
+    let mut parts = dir.rsplitn(3, '/');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(last), Some(second), Some(_)) => format!("…/{second}/{last}").into(),
+        _ => dir.into(),
+    }
+}
+
 /// 좌측 목록 필터 — `rel_path`가 `filter`에 대소문자 무시로 걸리는 행만 남긴다
 /// (2026-08-18 스펙 §좌측 목록 필터). 빈 `filter`는 필터 없음과 같아 전부 통과시킨다
 /// — `aux_search::contains_match`는 빈 needle이면 항상 거짓을 돌려주므로 이 분기가
@@ -257,6 +268,45 @@ fn stat_color(tokens: crate::ui::designall::Tokens, positive: bool) -> egui::Col
     } else {
         tokens.error
     }
+}
+
+/// porcelain 상태 문자 → (배지 글자, 색, hover 설명 i18n 키). 행 끝의 `M`·`?` 글자만으로는
+/// 의미가 읽히지 않아(2026-10-11 시안) 행 앞의 색 배지와 설명으로 바꾼다.
+fn status_badge_style(
+    status: char,
+    tokens: crate::ui::designall::Tokens,
+) -> (char, egui::Color32, &'static str) {
+    match status {
+        'M' => ('M', tokens.warning, "git.status.modified"),
+        'A' => ('A', tokens.success, "git.status.added"),
+        'D' => ('D', tokens.error, "git.status.deleted"),
+        'R' => ('R', tokens.accent, "git.status.renamed"),
+        'C' => ('C', tokens.accent, "git.status.copied"),
+        'U' => ('U', tokens.error, "git.status.conflict"),
+        '?' => ('N', tokens.muted_text, "git.status.untracked"),
+        other => (other, tokens.muted_text, "git.status.other"),
+    }
+}
+
+/// 18pt 색 배지 하나. hover 전용 sense라 행 클릭을 가로채지 않는다.
+fn status_badge(
+    ui: &mut egui::Ui,
+    status: char,
+    tokens: crate::ui::designall::Tokens,
+    catalog: &i18n::Catalog,
+) {
+    let (letter, color, key) = status_badge_style(status, tokens);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+    ui.painter()
+        .rect_filled(rect, 4.0, color.gamma_multiply(0.16));
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        letter,
+        egui::FontId::monospace(10.5),
+        color,
+    );
+    response.on_hover_text(catalog.t(key, &[]));
 }
 
 /// `git remote get-url origin` 출력을 OWNER/REPO 기준 GitHub HTTPS URL로 정규화한다.
@@ -501,6 +551,10 @@ pub struct GitPanelUi {
     changes_collapsed: bool,
     committed_collapsed: bool,
     worktrees_collapsed: bool,
+    /// 오른쪽 diff가 보여 주는 파일 — 이 패널이 `ShowFileDiff`를 낼 때 기록한다.
+    /// diff 뷰어를 여는 경로가 그 액션 하나뿐이고 두 UI는 `reset_git_surfaces`에서
+    /// 함께 초기화되므로 따로 동기화할 필요가 없다. 같은 경로도 모드가 다르면 다른 행이다.
+    selected: Option<(String, crate::ui::diff_viewer::DiffMode)>,
 }
 
 impl GitPanelUi {
@@ -531,6 +585,9 @@ impl GitPanelUi {
         catalog: &i18n::Catalog,
         filter: &str,
     ) -> Option<GitPanelAction> {
+        // `section` 클로저 매개변수용 — 전체 경로로 쓰면 rustfmt가 클로저 전체를 다시
+        // 들여써 무관한 행까지 diff에 섞인다.
+        use crate::ui::diff_viewer::DiffMode;
         // 필드별로 분해해 빌린다 — snapshot은 &만 필요하고 changes_collapsed 등은
         // 동시에 &mut가 필요해, self를 통째로 들고 있으면(예전엔 self.snapshot을
         // clone()해 이 충돌을 피했다) 프레임마다 최대 ~1056개 String을 복제했다
@@ -543,6 +600,7 @@ impl GitPanelUi {
             changes_collapsed,
             committed_collapsed,
             worktrees_collapsed,
+            selected,
         } = self;
         let snap = match snapshot.as_ref() {
             None => {
@@ -617,7 +675,8 @@ impl GitPanelUi {
                        collapsed: &mut bool,
                        show_all: &mut bool,
                        mode: crate::ui::diff_viewer::DiffMode,
-                       action: &mut Option<GitPanelAction>| {
+                       action: &mut Option<GitPanelAction>,
+                       selected: &mut Option<(String, DiffMode)>| {
             ui.horizontal(|ui| {
                 let arrow = if *collapsed { "›" } else { "∨" };
                 if ui
@@ -648,6 +707,11 @@ impl GitPanelUi {
             };
             for row in &rows[..visible] {
                 let (name, dir) = split_row_path(&row.rel_path);
+                let is_selected = selected
+                    .as_ref()
+                    .is_some_and(|(path, m)| path == &row.rel_path && *m == mode);
+                // 배경은 행 크기를 안 뒤에 칠해야 하므로 자리만 먼저 잡는다(글자 아래에 깔림).
+                let background = ui.painter().add(egui::Shape::Noop);
                 // 계획서 원안은 `ui.horizontal(..).response.interact(Sense::click())`로
                 // 행 전체를 클릭 가능하게 했는데, kittest로 돌려보면 자식 Label의
                 // 텍스트 자체를 클릭했을 때 부모로 새지 않는다 — egui는 포인터 아래
@@ -665,14 +729,14 @@ impl GitPanelUi {
                     |ui| {
                         ui.set_width(ui.available_width());
                         ui.horizontal(|ui| {
+                            status_badge(ui, row.status, tokens, catalog);
                             ui.label(name);
                             if !dir.is_empty() {
-                                ui.weak(dir);
+                                ui.weak(short_dir(dir));
                             }
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    ui.monospace(row.status.to_string());
                                     if let Some(d) = row.dels.filter(|d| *d > 0) {
                                         ui.colored_label(
                                             stat_color(tokens, false),
@@ -689,17 +753,35 @@ impl GitPanelUi {
                 );
                 let response = toggle
                     .response
-                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text(row.rel_path.as_str());
+                let rect = response.rect;
+                if let Some(fill) =
+                    crate::ui::designall::row_fill(tokens, is_selected, response.hovered())
+                {
+                    ui.painter()
+                        .set(background, egui::Shape::rect_filled(rect, 4.0, fill));
+                }
+                if is_selected {
+                    // 사이드 레일 선택과 같은 2pt accent 레일.
+                    let rail = egui::Rect::from_min_max(
+                        rect.left_top(),
+                        egui::pos2(rect.left() + 2.0, rect.bottom()),
+                    );
+                    ui.painter().rect_filled(rail, 0.0, tokens.accent);
+                }
                 // 접근성 이름을 rel_path로 명시한다 — kittest가 Role::Button + 이
                 // 라벨로 행 전체(자식 Label이 아니라)를 정확히 겨냥할 수 있다.
                 response.widget_info(|| {
-                    egui::WidgetInfo::labeled(
+                    egui::WidgetInfo::selected(
                         egui::WidgetType::Button,
                         ui.is_enabled(),
+                        is_selected,
                         row.rel_path.as_str(),
                     )
                 });
                 if response.clicked() {
+                    *selected = Some((row.rel_path.clone(), mode));
                     *action = Some(GitPanelAction::ShowFileDiff {
                         rel_path: row.rel_path.clone(),
                         mode,
@@ -738,6 +820,7 @@ impl GitPanelUi {
                     changes_show_all,
                     crate::ui::diff_viewer::DiffMode::Working,
                     &mut action,
+                    selected,
                 );
                 if snap.changes_truncated {
                     ui.weak(catalog.t("diff.truncated", &[]));
@@ -751,6 +834,7 @@ impl GitPanelUi {
                     committed_show_all,
                     crate::ui::diff_viewer::DiffMode::Branch,
                     &mut action,
+                    selected,
                 );
                 if snap.committed_truncated {
                     ui.weak(catalog.t("diff.truncated", &[]));
@@ -963,6 +1047,14 @@ mod tests {
         assert_eq!(split_row_path("Cargo.toml"), ("Cargo.toml", ""));
     }
 
+    #[test]
+    fn short_dir는_끝_두_단계만_남기고_앞을_줄인다() {
+        assert_eq!(short_dir("crates/app/src/ui"), "…/src/ui");
+        assert_eq!(short_dir("crates/app"), "crates/app");
+        assert_eq!(short_dir("src"), "src");
+        assert_eq!(short_dir(""), "");
+    }
+
     // 중요 리뷰 지적 4번 회귀 — ahead/behind·+/− 색은 designall::tokens에서만
     // 고른 값이라 라이트/다크 둘 다 자동으로 성립해야 한다(transcript_viewer.rs
     // 역할별_배경_테스트와 같은 관례). agent_visuals::status_color는 dark_mode
@@ -994,6 +1086,44 @@ mod tests {
             crate::ui::designall::DARK.error,
             crate::ui::designall::LIGHT.error,
             "다크/라이트 팔레트는 서로 달라야 한다"
+        );
+    }
+
+    #[test]
+    fn 상태_배지는_porcelain_문자를_색과_설명_키로_바꾼다() {
+        let tokens = crate::ui::designall::DARK;
+        assert_eq!(
+            status_badge_style('M', tokens),
+            ('M', tokens.warning, "git.status.modified")
+        );
+        assert_eq!(
+            status_badge_style('A', tokens),
+            ('A', tokens.success, "git.status.added")
+        );
+        assert_eq!(
+            status_badge_style('D', tokens),
+            ('D', tokens.error, "git.status.deleted")
+        );
+        assert_eq!(
+            status_badge_style('R', tokens),
+            ('R', tokens.accent, "git.status.renamed")
+        );
+        assert_eq!(
+            status_badge_style('C', tokens),
+            ('C', tokens.accent, "git.status.copied")
+        );
+        assert_eq!(
+            status_badge_style('U', tokens),
+            ('U', tokens.error, "git.status.conflict")
+        );
+        // untracked는 `?` 대신 「새 파일」의 N으로 보인다.
+        assert_eq!(
+            status_badge_style('?', tokens),
+            ('N', tokens.muted_text, "git.status.untracked")
+        );
+        assert_eq!(
+            status_badge_style('T', tokens),
+            ('T', tokens.muted_text, "git.status.other")
         );
     }
 
@@ -1349,6 +1479,66 @@ mod tests {
                 mode: crate::ui::diff_viewer::DiffMode::Working,
             }),
             "변경 사항 행 클릭은 Working 모드 ShowFileDiff를 내야 한다"
+        );
+    }
+
+    #[test]
+    fn kittest_클릭한_파일은_모드까지_구분해_선택으로_남는다() {
+        use egui_kittest::kittest::Queryable;
+
+        struct State {
+            panel: GitPanelUi,
+        }
+
+        let row = |path: &str| GitFileRow {
+            rel_path: path.into(),
+            status: 'M',
+            adds: Some(1),
+            dels: Some(1),
+        };
+        let mut panel = GitPanelUi::default();
+        panel.set_snapshot(Ok(GitPanelSnapshot {
+            branch: "main".into(),
+            changes: vec![row("src/a.rs"), row("src/b.rs")],
+            committed: vec![row("src/a.rs")],
+            ..Default::default()
+        }));
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, state: &mut State| {
+                let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+                state.panel.render(ui, &catalog, "");
+            },
+            State { panel },
+        );
+        harness.run();
+
+        harness
+            .query_all_by_role_and_label(egui::accesskit::Role::Button, "src/b.rs")
+            .next()
+            .unwrap()
+            .click();
+        harness.run();
+        assert_eq!(
+            harness.state().panel.selected,
+            Some((
+                "src/b.rs".to_owned(),
+                crate::ui::diff_viewer::DiffMode::Working
+            ))
+        );
+
+        // 같은 경로라도 브랜치 커밋 섹션의 행은 다른 선택이다.
+        harness
+            .query_all_by_role_and_label(egui::accesskit::Role::Button, "src/a.rs")
+            .nth(1)
+            .unwrap()
+            .click();
+        harness.run();
+        assert_eq!(
+            harness.state().panel.selected,
+            Some((
+                "src/a.rs".to_owned(),
+                crate::ui::diff_viewer::DiffMode::Branch
+            ))
         );
     }
 

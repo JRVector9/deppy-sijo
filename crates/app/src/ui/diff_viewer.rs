@@ -385,12 +385,20 @@ impl DiffViewerUi {
         };
         // ── 헤더: 경로 · 모드 라벨 · hunk ↑↓ ────────────────────────────
         ui.horizontal(|ui| {
-            ui.monospace(&self.rel_path);
+            // 폴더는 흐리게, 파일명은 강하게 — 긴 경로에서도 어떤 파일인지 먼저 읽힌다.
+            let (dir, name) = self
+                .rel_path
+                .rsplit_once('/')
+                .unwrap_or(("", self.rel_path.as_str()));
+            if !dir.is_empty() {
+                ui.label(egui::RichText::new(format!("{dir}/")).monospace().weak());
+            }
+            ui.label(egui::RichText::new(name).monospace().strong());
             let mode_key = match mode {
                 DiffMode::Branch => "git.mode.branch",
                 DiffMode::Working => "git.mode.working",
             };
-            ui.weak(format!("({})", catalog.t(mode_key, &[])));
+            ui.weak(catalog.t(mode_key, &[]));
             if self.view.is_none() {
                 return;
             }
@@ -403,6 +411,15 @@ impl DiffViewerUi {
                 {
                     self.current_hunk += 1;
                     self.scroll_to_row = self.hunk_starts.get(self.current_hunk).copied();
+                }
+                if !self.hunk_starts.is_empty() {
+                    ui.weak(catalog.t(
+                        "git.hunk.position",
+                        &[
+                            ("current", &(self.current_hunk + 1).to_string()),
+                            ("total", &self.hunk_starts.len().to_string()),
+                        ],
+                    ));
                 }
                 if ui
                     .small_button("↑")
@@ -758,6 +775,24 @@ index 111..222 100644
         harness.get_by_label("↓").click();
         harness.run();
         assert_eq!(harness.state().current_hunk, 1);
+    }
+
+    #[test]
+    fn kittest_헤더는_파일명과_변경_위치를_보여_준다() {
+        use egui_kittest::kittest::Queryable;
+
+        let mut viewer = DiffViewerUi::default();
+        viewer.open("src/deep/big.rs".to_owned(), DiffMode::Working);
+        viewer.set_view(큰_두_hunk_뷰());
+        let mut harness = harness_for(viewer);
+        harness.run();
+
+        assert!(harness.query_by_label("big.rs").is_some());
+        assert!(harness.query_by_label("src/deep/").is_some());
+        assert!(harness.query_by_label("Change 1/2").is_some());
+        harness.get_by_label("↓").click();
+        harness.run();
+        assert!(harness.query_by_label("Change 2/2").is_some());
     }
 
     /// [`diff_row_job`]이 프리픽스(행번호)와 본문을 하나의 job으로 합칠 때, 일치하지

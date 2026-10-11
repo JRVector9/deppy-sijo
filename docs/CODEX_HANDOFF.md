@@ -1,3 +1,12 @@
+# 0.10.2 패키지 빌드·검증 완료 — 2026-10-11 (Claude Code)
+
+- 사용자가 /permissions로 「Build signed 0.10.2 release bundle」 승인 → `CARGO_NET_OFFLINE=true DEPPY_REQUIRE_TRUSTED_SIGNING=0 DEPPY_ALLOW_UNTRUSTED_SIGNING=1 sh scripts/package-macos.sh` exit0. 로그 `/private/tmp/deppy-0.10.2-package-20261011.log`.
+- 0.10.1 → 0.10.2. source commit 149b150f(= release 7e28ab6a + handoff 문서), tracked 변경 0, origin push 완료. 변경 요약: 독립 세션 제목·대화 묶기(DB migration 1건), PWA 모바일 수정, 창 리사이즈 리뷰 반영, 이력 제목·검색 정렬.
+- 검증: `target/bundle/Deppy Sijo.app` CFBundleShortVersionString·CFBundleVersion 0.10.2, bundle id app.vector9.deppy-sijo, `codesign --verify --deep --strict` OK, Developer ID Application VectorNine INC (ZDTU5LS35K), 로컬 개발 번들(공증 없음). zip `target/bundle/Deppy Sijo.zip`.
+- 실행 중 앱은 0.10.1 그대로(재실행 요청 없음). 재실행 시 DB migration이 적용되어 0.10.1로 되돌리려면 `.sqlite3.bak` 복원 필요.
+
+---
+
 # 0.10.2 커밋 분리·검사 완료, 패키징은 사용자 실행 대기 — 2026-10-11 (Claude Code)
 
 - 사용자: Codex R1~R6 수정 완료 확인 후 「다음 단계 진행해」(배포 순서 ②③). restart 요청 없음 → 재실행 안 함.

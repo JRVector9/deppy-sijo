@@ -19667,6 +19667,7 @@ impl App {
         .remove(&session) else {
             return false;
         };
+        let relaunch_kind = target.relaunch;
         let Some(extra_args) = target.extra_args else {
             return false;
         };
@@ -19692,10 +19693,21 @@ impl App {
         let running = self.running_resume_targets(Some(session), Some(&pane.0));
         let respawn = archived_respawn_args(row, extra_args, &running);
         let env_plain = self.archived_respawn_env(row);
+        // pane의 마지막 에이전트가 처음 띄운 에이전트와 다르면 그 에이전트의 런처 명령으로
+        // 이번만 띄운다(세션 행은 그대로라 다음 재시작도 마지막 binding으로 다시 고른다).
+        let (relaunch_command, relaunch_args) = match relaunch_kind {
+            Some(kind) => match self.archived_launch(kind) {
+                Some(launch) => (Some(launch.command), launch.args),
+                None => return false,
+            },
+            None => (None, Vec::new()),
+        };
         let command = runtime::RuntimeCommand::RespawnArchivedAgent {
             session,
             extra_args: respawn.extra_args,
             env_plain,
+            relaunch_command,
+            relaunch_args,
             cols: 80,
             rows: 24,
             scrollback_lines: self.config.terminal.scrollback_lines as usize,
@@ -19724,18 +19736,22 @@ impl App {
         &self,
         row: Option<&storage::ArchivedAgentResumeRow>,
     ) -> Vec<(String, String)> {
-        let Some(kind) = row
-            .and_then(|row| crate::agent_launcher::AgentKind::from_stable_config_id(&row.agent_id))
-        else {
+        let Some(row) = row else {
             return Vec::new();
         };
-        let Some(agent) = self
-            .agent_launcher_snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.find(kind))
-        else {
-            return Vec::new();
-        };
+        let binding = row.kind.as_deref().zip(row.session_id.as_deref());
+        let agent_id =
+            crate::agent_resume::switched_agent_id(&row.agent_id, binding).unwrap_or(&row.agent_id);
+        crate::agent_launcher::AgentKind::from_stable_config_id(agent_id)
+            .and_then(|kind| self.archived_launch(kind))
+            .map(|launch| launch.env)
+            .unwrap_or_default()
+    }
+
+    /// 런처가 새 실행에 쓰는 명령·인자(에이전트가 끝나면 셸로 넘어가는 래퍼 포함)와 env.
+    /// 감지 전이면 None.
+    fn archived_launch(&self, kind: crate::agent_launcher::AgentKind) -> Option<ArchivedLaunch> {
+        let agent = self.agent_launcher_snapshot.as_ref()?.find(kind)?;
         let shim = (self.config.ui.agent_status_hooks && kind.supports_deppy_shim())
             .then(crate::agent_shim::shim_dir)
             .flatten()
@@ -19745,9 +19761,12 @@ impl App {
             effort: None,
             yolo: false,
         };
-        crate::agent_launcher::build_launch_spec(agent, options, shim.as_deref())
-            .map(|spec| spec.into_parts().3)
-            .unwrap_or_default()
+        let (_, command, args, env) =
+            crate::agent_launcher::build_launch_spec(agent, options, shim.as_deref())
+                .ok()?
+                .into_parts();
+        let (command, args) = crate::agent_launcher::wrap_agent_then_shell(command, args);
+        Some(ArchivedLaunch { command, args, env })
     }
 
     /// 다른 pane이 지금 잇고 있는 대화 — 감지된 binding과, 아직 binding이 안 잡힌 직전
@@ -38698,13 +38717,15 @@ fn archived_respawn_args(
         return unchanged(extra_args, None);
     };
     let binding = row.kind.as_deref().zip(row.session_id.as_deref());
-    let Some(target) = crate::agent_resume::resume_target(&row.agent_id, binding) else {
+    let agent_id =
+        crate::agent_resume::switched_agent_id(&row.agent_id, binding).unwrap_or(&row.agent_id);
+    let Some(target) = crate::agent_resume::resume_target(agent_id, binding) else {
         return unchanged(extra_args, None);
     };
     if !running.iter().any(|other| target.may_share(other)) {
         return unchanged(extra_args, Some(target));
     }
-    match crate::agent_resume::fork_resume_plan(&row.agent_id, binding) {
+    match crate::agent_resume::fork_resume_plan(agent_id, binding) {
         Some(plan) => ArchivedRespawnArgs {
             extra_args: plan.into_extra_args(),
             fork_origin: target.session_id,
@@ -38712,6 +38733,13 @@ fn archived_respawn_args(
         },
         None => unchanged(extra_args, Some(target)),
     }
+}
+
+/// 런처가 새 실행에 쓰는 명령·인자(래퍼 포함)와 env.
+struct ArchivedLaunch {
+    command: String,
+    args: Vec<String>,
+    env: Vec<(String, String)>,
 }
 
 /// 「이어서 실행」의 최종 인자와 기록할 값.
@@ -38768,6 +38796,8 @@ struct ArchivedResumeTarget {
     presentation: ArchivedResumePresentation,
     /// None means the action must not dispatch. Some(empty) is an intentional new run.
     extra_args: Option<Vec<String>>,
+    /// pane의 마지막 에이전트가 처음 띄운 에이전트와 다르면 그 에이전트로 이번만 다시 띄운다.
+    relaunch: Option<crate::agent_launcher::AgentKind>,
 }
 
 enum AppWorkHistoryActivation {
@@ -38843,22 +38873,27 @@ fn archived_resume_target(
     row: &storage::ArchivedAgentResumeRow,
     detection: Option<&crate::agent_launcher::DetectionSnapshot>,
 ) -> ArchivedResumeTarget {
-    if let Some(kind) = crate::agent_launcher::AgentKind::from_stable_config_id(&row.agent_id) {
+    let binding = row.kind.as_deref().zip(row.session_id.as_deref());
+    // pane의 마지막 대화가 다른 내장 에이전트 것이면 그 에이전트로 잇는다.
+    let switched = crate::agent_resume::switched_agent_id(&row.agent_id, binding);
+    let agent_id = switched.unwrap_or(&row.agent_id);
+    if let Some(kind) = crate::agent_launcher::AgentKind::from_stable_config_id(agent_id) {
         let Some(detection) = detection else {
             return ArchivedResumeTarget {
                 presentation: ArchivedResumePresentation::Checking,
                 extra_args: None,
+                relaunch: None,
             };
         };
         if detection.find(kind).is_none() {
             return ArchivedResumeTarget {
                 presentation: ArchivedResumePresentation::Unavailable,
                 extra_args: None,
+                relaunch: None,
             };
         }
     }
-    let binding = row.kind.as_deref().zip(row.session_id.as_deref());
-    let plan = crate::agent_resume::resume_plan(&row.agent_id, binding);
+    let plan = crate::agent_resume::resume_plan(agent_id, binding);
     let presentation = match plan.mode {
         crate::agent_resume::ResumeMode::Exact => ArchivedResumePresentation::Exact,
         crate::agent_resume::ResumeMode::RecentInCwd => ArchivedResumePresentation::RecentInCwd,
@@ -38867,6 +38902,7 @@ fn archived_resume_target(
     ArchivedResumeTarget {
         presentation,
         extra_args: Some(plan.into_extra_args()),
+        relaunch: switched.and_then(crate::agent_launcher::AgentKind::from_stable_config_id),
     }
 }
 
@@ -57614,6 +57650,71 @@ mod tests {
         assert_eq!(target.extra_args, Some(Vec::new()));
     }
 
+    /// 2026-10-12: Claude로 띄운 pane에서 Claude를 끝내고 Codex를 실행했는데, 재시작 뒤
+    /// 「이어서 실행」이 Claude를 다시 띄웠다. pane의 마지막 binding 에이전트로 잇는다.
+    #[test]
+    fn archived_resume은_pane의_마지막_에이전트가_다르면_그_에이전트로_잇는다() {
+        let mux = archived_resume_test_mux("persistent-agent");
+        let thread = "01a12d60-aa70-7932-925e-ec06ec9521e1";
+        let rows = HashMap::from([(
+            "persistent-agent".to_owned(),
+            archived_resume_row(
+                "persistent-agent",
+                "deppy-builtin-claude",
+                Some(("codex", thread)),
+            ),
+        )]);
+        let claude_only = crate::agent_launcher::DetectionSnapshot::from_test_agents([(
+            crate::agent_launcher::AgentKind::Claude,
+            PathBuf::from("/opt/claude"),
+        )]);
+        let target = archived_resume_targets_from_mux(&mux, &rows, Some(&claude_only))
+            .remove(&runtime::SessionId(9))
+            .unwrap();
+        assert_eq!(
+            target.presentation,
+            ArchivedResumePresentation::Unavailable,
+            "이을 에이전트(Codex)가 없으면 엉뚱한 Claude로 바꾸지 않는다"
+        );
+
+        let both = crate::agent_launcher::DetectionSnapshot::from_test_agents([
+            (
+                crate::agent_launcher::AgentKind::Claude,
+                PathBuf::from("/opt/claude"),
+            ),
+            (
+                crate::agent_launcher::AgentKind::Codex,
+                PathBuf::from("/opt/codex"),
+            ),
+        ]);
+        let target = archived_resume_targets_from_mux(&mux, &rows, Some(&both))
+            .remove(&runtime::SessionId(9))
+            .unwrap();
+        assert_eq!(target.presentation, ArchivedResumePresentation::Exact);
+        assert_eq!(
+            target.extra_args,
+            Some(vec!["resume".to_owned(), thread.to_owned()])
+        );
+        assert_eq!(
+            target.relaunch,
+            Some(crate::agent_launcher::AgentKind::Codex)
+        );
+
+        // 같은 에이전트의 binding이면 저장된 실행 그대로 정확 재개.
+        let same = HashMap::from([(
+            "persistent-agent".to_owned(),
+            archived_resume_row(
+                "persistent-agent",
+                "deppy-builtin-claude",
+                Some(("claude", "240ec284-0fd0-4e44-8336-18f5cc5f88fe")),
+            ),
+        )]);
+        let target = archived_resume_targets_from_mux(&mux, &same, Some(&both))
+            .remove(&runtime::SessionId(9))
+            .unwrap();
+        assert_eq!(target.relaunch, None);
+    }
+
     // resume_without_pane_plan (PR-resume-without-pane) — 살아 있는 pane 없이도
     // 「이어서 하기」가 가능한지 판정하는 순수 함수. mux/pane 상태를 받지 않는다는
     // 점이 위 archived_resume_targets_from_mux 계열과의 핵심 차이다.
@@ -57779,15 +57880,11 @@ mod tests {
         assert_eq!(forked.fork_origin.as_deref(), Some("thread-x"));
     }
 
-    /// 0.10.1이 claude pane에 외부 codex ID를 붙인 행은 최근 폴더 재개(`-c`)가 된다. 같은
-    /// provider가 이미 실행 중이면 `-c`가 그 대화를 집어 오므로 fork하고, 원본 ID는 모른다.
+    /// binding이 없는 pane은 최근 폴더 재개(`-c`)다. 같은 provider가 이미 실행 중이면 `-c`가
+    /// 그 대화를 집어 오므로 fork하고, 원본 ID는 모른다.
     #[test]
     fn archived_respawn은_최근_폴더_재개도_같은_provider가_실행_중이면_fork한다() {
-        let row = archived_resume_row(
-            "persistent-a",
-            "deppy-builtin-claude",
-            Some(("codex", "01a128ab-3838-7be3-a2d3-4353f0a44f65")),
-        );
+        let row = archived_resume_row("persistent-a", "deppy-builtin-claude", None);
         let base = || vec!["-c".to_owned()];
 
         let alone = archived_respawn_args(Some(&row), base(), &[running("codex", "x")]);
@@ -57805,6 +57902,19 @@ mod tests {
         let no_row = archived_respawn_args(None, base(), &[running("claude", "any")]);
         assert_eq!(no_row.extra_args, ["-c"]);
         assert_eq!(no_row.continues, None);
+
+        // Claude로 띄웠지만 마지막에 Codex를 쓴 pane은 Codex 기준으로 겹침을 본다.
+        let switched = archived_resume_row(
+            "persistent-s",
+            "deppy-builtin-claude",
+            Some(("codex", "thread-s")),
+        );
+        let forked = archived_respawn_args(
+            Some(&switched),
+            vec!["resume".to_owned(), "thread-s".to_owned()],
+            &[running("codex", "thread-s")],
+        );
+        assert_eq!(forked.extra_args, ["fork", "thread-s"]);
     }
 
     /// 직전 재개 기록은 TTL 안에서만 실행 중으로 보고, 같은 pane의 새 기록이 옛 기록을 바꾼다.

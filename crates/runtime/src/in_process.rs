@@ -3476,6 +3476,8 @@ impl Worker {
                 session,
                 extra_args,
                 env_plain,
+                relaunch_command,
+                relaunch_args,
                 cols,
                 rows,
                 scrollback_lines,
@@ -3489,8 +3491,11 @@ impl Worker {
                 }
                 self.respawn_archived_agent(
                     session,
-                    extra_args,
-                    env_plain,
+                    ArchivedRespawnLaunch {
+                        extra_args,
+                        env_plain,
+                        relaunch: relaunch_command.map(|command| (command, relaunch_args)),
+                    },
                     cols,
                     rows,
                     scrollback_lines,
@@ -4234,12 +4239,16 @@ impl Worker {
     fn respawn_archived_agent(
         &mut self,
         session: SessionId,
-        extra_args: Vec<String>,
-        env_plain: Vec<(String, String)>,
+        launch: ArchivedRespawnLaunch,
         cols: u16,
         rows: u16,
         scrollback_lines: usize,
     ) {
+        let ArchivedRespawnLaunch {
+            extra_args,
+            env_plain,
+            relaunch,
+        } = launch;
         let Some(pane_id) = self
             .mux
             .panes
@@ -4304,8 +4313,15 @@ impl Worker {
             self.reject_session_capacity(SpawnKind::Agent, correlation_id);
             return;
         }
-        // 예전 판 래퍼가 저장돼 있어도 지금 판으로 실행한다(폴백 셸의 셸 통합 복원).
-        crate::agent_wrapper::refresh_agent_wrapper(&command, &mut args);
+        // pane의 마지막 에이전트가 다르면 앱이 준 명령으로 이번만 띄운다(행은 그대로).
+        let (command, mut args) = match relaunch {
+            Some(relaunch) => relaunch,
+            None => {
+                // 예전 판 래퍼가 저장돼 있어도 지금 판으로 실행한다(폴백 셸의 셸 통합 복원).
+                crate::agent_wrapper::refresh_agent_wrapper(&command, &mut args);
+                (command, args)
+            }
+        };
         args.extend(extra_args);
         // 런처가 감지한 PATH·실행 파일을 이번 실행에 다시 준다(세션 행에는 env가 없다).
         let (mut env, redaction_leases) = match self.prepare_agent_env(env_plain, Vec::new()) {
@@ -6280,6 +6296,14 @@ fn exited_to_archive_for_budget(
         }
     }
     out
+}
+
+/// 열람 전용 agent pane 재실행 입력(`RuntimeCommand::RespawnArchivedAgent`에서 온 값).
+struct ArchivedRespawnLaunch {
+    extra_args: Vec<String>,
+    env_plain: Vec<(String, String)>,
+    /// pane의 마지막 에이전트가 다를 때 이번만 쓸 명령·인자.
+    relaunch: Option<(String, Vec<String>)>,
 }
 
 #[cfg(test)]
@@ -15983,6 +16007,8 @@ mod tests {
                 rows: 24,
                 scrollback_lines: 100,
                 env_plain: Vec::new(),
+                relaunch_args: Vec::new(),
+                relaunch_command: None,
             })
             .unwrap();
 
@@ -16187,6 +16213,8 @@ mod tests {
                 cols: 80,
                 rows: 24,
                 scrollback_lines: 100,
+                relaunch_args: Vec::new(),
+                relaunch_command: None,
             })
             .unwrap();
         let respawned = probe.wait_for(Duration::from_secs(15), |event| match event {
@@ -16203,6 +16231,85 @@ mod tests {
         });
         drop(probe);
         drop(client);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// pane의 마지막 에이전트가 처음 띄운 에이전트와 다르면 앱이 준 명령으로 이번만 띄우고,
+    /// 세션 행(처음 띄운 에이전트)은 그대로 둔다.
+    #[test]
+    #[cfg(unix)]
+    fn respawn_archived_agent는_바꾼_명령으로_띄우고_세션_행은_그대로_둔다() {
+        let dir = unique_test_dir("respawn-relaunch");
+        let db_path = dir.join("metadata.sqlite3");
+        let workspace_id = "ws-respawn-relaunch";
+        let persistent_id = "respawn-relaunch-session";
+        create_persist_db(&db_path, workspace_id);
+        seed_persisted_agent_session_pane(
+            &db_path,
+            workspace_id,
+            persistent_id,
+            "cfg-sf03",
+            "/bin/echo",
+            vec!["stored-arg".to_owned()],
+            persist::SESSION_STATUS_EXITED,
+            "/tmp",
+        );
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            dir.join("logs"),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+            Some(crate::persistence::PersistConfig {
+                db_path: db_path.clone(),
+                workspace_id: workspace_id.to_owned(),
+            }),
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::RestoreWorkspace)
+            .unwrap();
+        let archived = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::MuxUpdated { snapshot } => snapshot
+                .tabs
+                .iter()
+                .flat_map(|tab| &tab.panes)
+                .find_map(|pane| pane.session_id),
+            _ => None,
+        });
+        client
+            .send_command(RuntimeCommand::RespawnArchivedAgent {
+                session: archived,
+                extra_args: vec!["resume-arg".to_owned()],
+                env_plain: Vec::new(),
+                relaunch_command: Some("/bin/echo".to_owned()),
+                relaunch_args: vec!["relaunched".to_owned()],
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        let respawned = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::AgentSpawned { session } => Some(*session),
+            _ => None,
+        });
+        let text = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::Viewport {
+                session, snapshot, ..
+            } if *session == respawned => {
+                let text = snapshot_text(snapshot, 0);
+                text.contains("relaunched").then_some(text)
+            }
+            _ => None,
+        });
+        assert_eq!(text, "relaunched resume-arg");
+        drop(probe);
+        drop(client);
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let rows = persist::load_sessions(&conn, workspace_id).unwrap();
+        assert_eq!(rows[0].args, vec!["stored-arg".to_owned()], "행은 그대로");
+        drop(conn);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -16274,6 +16381,8 @@ mod tests {
                 rows: 24,
                 scrollback_lines: 100,
                 env_plain: Vec::new(),
+                relaunch_args: Vec::new(),
+                relaunch_command: None,
             })
             .unwrap();
         probe.wait_for(Duration::from_secs(15), |event| match event {
@@ -16354,6 +16463,8 @@ mod tests {
                 rows: 24,
                 scrollback_lines: 100,
                 env_plain: Vec::new(),
+                relaunch_args: Vec::new(),
+                relaunch_command: None,
             })
             .unwrap();
         // 2) 존재한 적 없는 session id — pane이 없으므로 거부돼야 한다.
@@ -16365,6 +16476,8 @@ mod tests {
                 rows: 24,
                 scrollback_lines: 100,
                 env_plain: Vec::new(),
+                relaunch_args: Vec::new(),
+                relaunch_command: None,
             })
             .unwrap();
         // DurableEventBarrier로 위 두 명령의 이벤트가 이미 큐에 들어왔음을 보장한 뒤
@@ -18035,6 +18148,8 @@ mod tests {
                 rows: 24,
                 scrollback_lines: 100,
                 env_plain: Vec::new(),
+                relaunch_args: Vec::new(),
+                relaunch_command: None,
             })
             .unwrap();
         let new_session = probe.wait_for(Duration::from_secs(15), |event| match event {

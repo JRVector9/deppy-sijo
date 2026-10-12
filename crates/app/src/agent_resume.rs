@@ -123,6 +123,16 @@ impl ResumeProvider {
         }
     }
 
+    fn builtin_agent_id(self) -> &'static str {
+        match self {
+            Self::Claude => "deppy-builtin-claude",
+            Self::Codex => "deppy-builtin-codex",
+            Self::Kimi => "deppy-builtin-kimi",
+            Self::Grok => "deppy-builtin-grok",
+            Self::QwenCode => "deppy-builtin-qwen-code",
+        }
+    }
+
     fn kind_id(self) -> &'static str {
         match self {
             Self::Claude => "claude",
@@ -172,6 +182,20 @@ pub(crate) fn resume_plan(agent_id: &str, binding: Option<(&str, &str)>) -> Resu
             extra_args: provider.recent_args(),
         },
     }
+}
+
+/// 처음 띄운 내장 에이전트가 끝난 뒤 그 pane의 셸에서 다른 내장 에이전트를 실행해 binding이
+/// 그쪽으로 바뀌었으면 그 에이전트의 설정 id. 재시작 뒤 「이어서 실행」이 처음 띄운 에이전트가
+/// 아니라 pane의 마지막 대화를 잇게 한다(2026-10-12). 같은 에이전트이거나 사용자 정의 agent면
+/// None — 사용자 정의 agent는 이미 binding 종류를 provider로 쓴다.
+pub(crate) fn switched_agent_id(
+    agent_id: &str,
+    binding: Option<(&str, &str)>,
+) -> Option<&'static str> {
+    let spawned = ResumeProvider::from_agent_id(agent_id)?;
+    let (kind, session_id) = binding?;
+    let bound = ResumeProvider::from_kind(kind)?;
+    (bound != spawned && native_session_id_is_valid(session_id)).then(|| bound.builtin_agent_id())
 }
 
 /// `resume_plan`이 이어 쓸 대화. 지원하지 않는 agent는 None.
@@ -364,6 +388,31 @@ mod tests {
         ] {
             assert_eq!(fork_resume_plan(agent_id, None), None, "{agent_id}");
         }
+    }
+
+    #[test]
+    fn pane의_마지막_binding이_다른_내장_에이전트면_그_에이전트로_잇는다() {
+        let codex = Some(("codex", "01a12d60-aa70-7932-925e-ec06ec9521e1"));
+        assert_eq!(
+            switched_agent_id("deppy-builtin-claude", codex),
+            Some("deppy-builtin-codex")
+        );
+        let agent_id = switched_agent_id("deppy-builtin-claude", codex).unwrap();
+        assert_eq!(
+            resume_plan(agent_id, codex).extra_args,
+            ["resume", "01a12d60-aa70-7932-925e-ec06ec9521e1"]
+        );
+        // 같은 에이전트·사용자 정의 agent·잘못된 ID·binding 없음은 바꾸지 않는다.
+        assert_eq!(
+            switched_agent_id("deppy-builtin-claude", Some(("claude", "x"))),
+            None
+        );
+        assert_eq!(switched_agent_id("custom-agent", codex), None);
+        assert_eq!(
+            switched_agent_id("deppy-builtin-claude", Some(("codex", ""))),
+            None
+        );
+        assert_eq!(switched_agent_id("deppy-builtin-claude", None), None);
     }
 
     #[test]

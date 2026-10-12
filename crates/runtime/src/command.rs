@@ -470,10 +470,14 @@ pub(crate) fn runtime_command_retained_bytes(
         RuntimeCommand::RespawnArchivedAgent {
             extra_args,
             env_plain,
+            relaunch_command,
+            relaunch_args,
             ..
         } => {
             retained_strings(&mut total, extra_args)?;
             retained_env(&mut total, env_plain)?;
+            retained_optional_string(&mut total, relaunch_command)?;
+            retained_strings(&mut total, relaunch_args)?;
         }
         RuntimeCommand::SplitPane { pane, .. }
         | RuntimeCommand::ClosePane { pane }
@@ -667,10 +671,14 @@ pub(crate) fn canonicalize_host_command(command: &mut RuntimeCommand) {
         RuntimeCommand::RespawnArchivedAgent {
             extra_args,
             env_plain,
+            relaunch_command,
+            relaunch_args,
             ..
         } => {
             canonicalize_strings(extra_args);
             canonicalize_env(env_plain);
+            canonicalize_optional_string(relaunch_command);
+            canonicalize_strings(relaunch_args);
         }
         RuntimeCommand::SplitPane { pane, .. }
         | RuntimeCommand::ClosePane { pane }
@@ -1061,12 +1069,22 @@ pub(crate) fn validate_host_command(command: &RuntimeCommand) -> Result<(), Runt
             scrollback_lines,
             extra_args,
             env_plain,
+            relaunch_command,
+            relaunch_args,
             ..
         } => {
-            if !dimensions_are_valid(*cols, *rows) || *scrollback_lines > SCROLLBACK_LINES_MAX {
+            if !dimensions_are_valid(*cols, *rows)
+                || *scrollback_lines > SCROLLBACK_LINES_MAX
+                || relaunch_command
+                    .as_deref()
+                    .is_some_and(|command| !bounded_nul_free(command, COMMAND_BYTES_MAX, true))
+                || (relaunch_command.is_none() && !relaunch_args.is_empty())
+            {
                 return Err(admission_error("runtime_command_respawn_archived_invalid"));
             }
-            validate_args(extra_args)?;
+            // 실제 argv(바꾼 명령의 인자 + 이어가기 인자) 한도로 검사한다.
+            let argv: Vec<String> = relaunch_args.iter().chain(extra_args).cloned().collect();
+            validate_args(&argv)?;
             validate_env_entries(env_plain, &[])?;
         }
         RuntimeCommand::Scroll { .. }
@@ -1335,6 +1353,11 @@ pub enum RuntimeCommand {
         /// 이번 실행의 일반 env(런처가 감지한 PATH·`DEPPY_AGENT_EXECUTABLE`). 세션 행에는
         /// env가 없어, 비우면 Finder로 띄운 앱의 최소 PATH에서 shim이 진짜 CLI를 못 찾았다.
         env_plain: Vec<(String, String)>,
+        /// 이 pane의 마지막 에이전트가 처음 띄운 에이전트와 다를 때(Claude로 띄운 pane에서
+        /// Codex를 실행 등) 이번 실행에만 쓰는 명령·인자. 세션 행(처음 띄운 에이전트)은
+        /// 바꾸지 않는다 — 다음 재시작도 그 pane의 마지막 binding으로 다시 고른다.
+        relaunch_command: Option<String>,
+        relaunch_args: Vec<String>,
         cols: u16,
         rows: u16,
         scrollback_lines: usize,
@@ -1652,6 +1675,8 @@ impl std::fmt::Debug for RuntimeCommand {
                 session,
                 extra_args,
                 env_plain,
+                relaunch_command,
+                relaunch_args,
                 cols,
                 rows,
                 scrollback_lines,
@@ -1660,6 +1685,8 @@ impl std::fmt::Debug for RuntimeCommand {
                 .field("session", session)
                 .field("extra_args_count", &extra_args.len())
                 .field("env_plain_count", &env_plain.len())
+                .field("relaunch", &relaunch_command.is_some())
+                .field("relaunch_args_count", &relaunch_args.len())
                 .field("cols", cols)
                 .field("rows", rows)
                 .field("scrollback_lines", scrollback_lines)
@@ -2854,6 +2881,8 @@ mod tests {
             rows: 24,
             scrollback_lines: 100,
             env_plain: Vec::new(),
+            relaunch_args: Vec::new(),
+            relaunch_command: None,
         }
     }
 
@@ -2868,6 +2897,8 @@ mod tests {
                 rows: 24,
                 scrollback_lines: 100,
                 env_plain: Vec::new(),
+                relaunch_args: Vec::new(),
+                relaunch_command: None,
             },
             RuntimeCommand::RespawnArchivedAgent {
                 session: SessionId(1),
@@ -2876,6 +2907,8 @@ mod tests {
                 rows: 24,
                 scrollback_lines: 100,
                 env_plain: Vec::new(),
+                relaunch_args: Vec::new(),
+                relaunch_command: None,
             },
             RuntimeCommand::RespawnArchivedAgent {
                 session: SessionId(1),
@@ -2884,6 +2917,8 @@ mod tests {
                 rows: 24,
                 scrollback_lines: SCROLLBACK_LINES_MAX + 1,
                 env_plain: Vec::new(),
+                relaunch_args: Vec::new(),
+                relaunch_command: None,
             },
         ] {
             assert!(validate_host_command(&invalid).is_err());

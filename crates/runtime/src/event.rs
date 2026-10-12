@@ -278,6 +278,13 @@ pub enum RuntimeEvent {
         snapshot: Option<Arc<TerminalViewportSnapshot>>,
         expired: bool,
     },
+    /// 터미널 제목(OSC 0/2) 변경 — 화면에 보이는지와 무관하게 모든 세션에서 낸다.
+    /// Viewport는 보이는 pane에만 가므로, 다른 탭·대기 워크스페이스의 에이전트 작업 표시는
+    /// 이 이벤트로 제목을 받는다. 로컬 UI 전용 — 원격 wire에는 보내지 않는다.
+    SessionTitleChanged {
+        session: SessionId,
+        title: Option<String>,
+    },
 }
 
 impl RuntimeEvent {
@@ -573,6 +580,7 @@ mod tests {
                 "TerminalControlResult",
                 "ResizeDeferred",
                 "TerminalHistoryResult",
+                "SessionTitleChanged",
             ]
         );
     }

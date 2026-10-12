@@ -1,3 +1,20 @@
+# 어떤 진입 경로든 에이전트 상태 노출 — 2차 리뷰 반영 — 2026-10-12 (Claude Code)
+
+- 사용자: 「이어서 하기가 아니라 새 세션(터미널에서 직접)·런처 등 어떤 경우에도 세션의 에이전트 상태가 제대로 노출돼야」. 진입 경로별 병렬 리뷰 3개(앱 시작 경로 / 터미널 직접 / 상태 표시 화면).
+- 고친 것:
+  - **제목 작업이 보이는 탭에서만 나옴(07060046 미완)**: UI가 숨은 세션 snapshot을 버리고 runtime은 보이는 탭에만 Viewport를 보낸다. 게다가 제품 기본 엔진(Alacritty)은 `title_changed`가 늘 false였다. → `TerminalBackend::title()`, Alacritty 제목 변경 플래그, `Session::take_title_change`(1 KiB 상한), runtime `RuntimeEvent::SessionTitleChanged`(모든 세션, enum 끝에 추가, 원격 wire 제외 → 프로토콜 버전 그대로), `SessionView::terminal_title`(숨겨도 유지, 활성·warm 경로 모두).
+  - **Codex 사용자 조치 대기가 「실행 중」**: 제목 `[ ! ]`/`[ . ] Action Required`를 `StatusDetector::on_title`이 승인 필요로(표시가 사라지면 해제). 실제 PTY 테스트로 확인.
+  - **끝난 에이전트·셸 제목이 작업으로 표시(07060046)**: `agent_executions`(살아 있는 에이전트 실행)가 있을 때만 제목을 작업으로 쓴다.
+  - **제목 해석**: 종류별 — Codex는 마지막 프로젝트 칸을 늘 뗌(하위 폴더·`-C`), Claude는 칸을 안 뗌, Grok `… - grok` 형식, 일반 이름·`claude agents`·셸 preexec 명령 줄(`codex resume`, `claude --resume …`) 제외.
+  - **Claude `--resume X` 뒤 TUI 안 `/clear`·`/resume`**: 실행 스탬프로 증명된 hook은 argv ID와 달라도 따른다(fork 원본 ID만 거름).
+  - **shim guard 상속(4e8aae7c 회귀)**: 에이전트 안에서 띄운 Deppy pane의 claude/codex가 exit 127 → `DEPPY_SHIM_GUARD`/`DEPPY_AGENT_EXECUTABLE`을 PTY 상속 제거 목록에.
+  - **shim 우선순위 1회만**: zsh `precmd` 끝에서 다시 맨 앞으로(`$?` 보존).
+  - **과잉 fork(fb5d00da)**: 어느 대화를 집었는지 모르는 최근 재개 기록은 정확 재개를 막지 않는다.
+- 남긴 것(보고): hookless Codex는 「완료」 없이 지시 대기까지만, PWA/Relay에 작업 문구 칸 없음·warm 상태 None, 사이드바(요약 우선)와 Fleet(지시 우선) 순서 차이, Qwen 등 미분류 에이전트 종류 표시 없음, pane 저장 binding이 다른 에이전트로 바뀌어도 남음, 공유 대화 판정 24시간 전체 기록 기준. 별도 동작 결함: 「이어서 실행」이 런처 env(PATH·`DEPPY_AGENT_EXECUTABLE`)를 잃어 Finder 실행 앱에서 exit 127 가능, Work History 새 pane 재개가 재개 인자를 저장(`resume X resume X`)·래퍼 없음·다른 대화 ID를 쓸 수 있음, tmux 안 에이전트 감지 불가.
+- 검증: 전체 lib 테스트 terminal 136 / session 78 / runtime 386 / pty 45 PASS(새 테스트: Alacritty 제목 플래그, 제목 승인 필요 2, runtime 제목 이벤트+승인 필요 실제 PTY, 원격 wire 제외). 앱 116 PASS(종류별 제목 해석, 숨은 탭·warm 제목 작업과 에이전트 종료 후 미표시, zsh precmd 재배치·`$?` 보존·ksharrays, Claude hook, 재개 충돌 규칙). fmt OK, `clippy -p terminal -p session -p pty -p runtime -p deppy-sijo --all-targets -D warnings` 0건, `xtask check-boundary` OK. 실제 앱 재빌드·재실행은 요청 없어 안 함.
+
+---
+
 # 직접 실행한 agent가 상태 hook 없이 도는 문제 — 2026-10-12 (Claude Code)
 
 - 사용자 보고(스크린샷): 사이드바 세션이 「실행 중 · Codex」만 보이고 진행 중인 작업이 안 나온다.

@@ -57,13 +57,15 @@ impl ResumeTarget {
         }
     }
 
-    /// 두 재개가 같은 대화를 이어 쓸 수 있는지. 최근 폴더 재개는 같은 provider의 어느 대화든
-    /// 집어 올 수 있으므로 겹친다고 본다.
+    /// 이 재개가 `other`가 잇는 대화를 함께 이어 쓰게 되는지. 이 재개가 최근 폴더 재개면
+    /// 같은 provider의 어느 대화든 집어 올 수 있어 겹친다. 정확 재개는 `other`가 같은 ID일
+    /// 때만 겹친다 — `other`가 어느 대화를 집었는지 모르는 최근 재개 기록이면 막지 않는다.
     pub(crate) fn may_share(&self, other: &Self) -> bool {
         self.kind == other.kind
             && match (&self.session_id, &other.session_id) {
                 (Some(own), Some(other)) => own == other,
-                _ => true,
+                (None, _) => true,
+                (Some(_), None) => false,
             }
     }
 }
@@ -382,9 +384,10 @@ mod tests {
         assert_eq!(recent.session_id, None);
         assert!(recent.may_share(&ResumeTarget::running("claude", "anything")));
         assert!(!recent.may_share(&ResumeTarget::running("codex", "a")));
-        // 아직 binding이 없는 다른 최근 폴더 재개와도 겹친다.
+        // 아직 binding이 없는 다른 최근 폴더 재개와도 겹친다. 정확 재개는 상대가 어느 대화를
+        // 집었는지 모르는 최근 재개 기록 때문에 fork하지 않는다(리뷰: 60초 과잉 fork).
         assert!(recent.may_share(&recent));
-        assert!(exact.may_share(&recent));
+        assert!(!exact.may_share(&recent));
 
         assert_eq!(resume_target("custom-agent", None), None);
     }

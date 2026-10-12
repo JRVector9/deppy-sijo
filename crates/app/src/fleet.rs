@@ -305,24 +305,70 @@ pub fn task_preview(
 /// 에이전트(직접 친 `codex resume` 등)도 진행 중인 작업을 보여줄 수 있다. 제목은 그 pane의
 /// PTY가 낸 것이라 다른 pane이나 외부 세션의 대화가 섞이지 않는다.
 ///
-/// 2026-10-12 실측 형식 — Codex: `⠹ <제목> | <폴더>`, 승인 대기 `[ ! ] Action Required |
-/// <제목> | <폴더>`, 제목 전 `⠹ <폴더>`. Claude Code: `◐ <요약>`/`✳ <요약>`, 요약 전
-/// `✳ Claude Code`. 상태 기호·끝의 폴더 칸·일반 이름은 작업이 아니므로 버린다.
-pub fn task_from_terminal_title(title: &str, folder: Option<&str>) -> Option<String> {
-    const GENERIC_TITLES: [&str; 3] = ["Claude Code", "Codex", "OpenAI Codex"];
+/// 형식은 에이전트마다 다르다(2026-10-12 pane 로그 실측):
+/// - Codex: `⠹ <제목> | <프로젝트>`, 승인 대기 `[ ! ] Action Required | <제목> | <프로젝트>`,
+///   제목 전 `⠹ <프로젝트>`. 마지막 칸은 늘 프로젝트명(없으면 폴더명)이라 cwd와 달라도 뗀다.
+/// - Claude Code: `◐ <요약>`/`✳ <요약>`, 요약 전 `✳ Claude Code`.
+/// - Grok: `<제목> - grok`, 작업 중 `⠹ - <상태> - <제목> - grok`.
+///
+/// 상태 기호·프로젝트 칸·일반 이름·셸이 띄운 명령 줄은 작업이 아니므로 버린다.
+pub fn task_from_terminal_title(
+    title: &str,
+    folder: Option<&str>,
+    kind: crate::agent_detect::AgentKind,
+) -> Option<String> {
+    use crate::agent_detect::AgentKind;
     let title = title.trim();
-    let task = match title.rsplit_once(" | ") {
-        // Codex는 마지막 칸에 폴더명을 붙인다. 폴더를 알면 같을 때만 뗀다.
-        Some((head, last)) if folder.is_none_or(|folder| last.trim() == folder) => {
-            strip_title_status(head)
+    let task = match kind {
+        AgentKind::Codex => match title.rsplit_once(" | ") {
+            Some((head, _project)) => strip_title_status(head),
+            // 프로젝트 칸만 있으면 아직 대화 제목이 없다.
+            None => "",
+        },
+        AgentKind::Grok => {
+            let rest = strip_title_status(title);
+            let rest = rest
+                .strip_suffix(" - grok")
+                .or_else(|| rest.strip_suffix(" - Grok"))
+                .unwrap_or(rest);
+            match rest.strip_prefix("- ") {
+                // `- <상태> - <제목>`: 앞의 상태 칸을 뗀다.
+                Some(status_and_task) => status_and_task
+                    .split_once(" - ")
+                    .map_or("", |(_, task)| task.trim()),
+                None => rest,
+            }
         }
-        _ => strip_title_status(title),
+        AgentKind::Claude | AgentKind::Kimi => strip_title_status(title),
     };
-    let is_generic = GENERIC_TITLES
+    (!task.is_empty() && !is_generic_agent_title(task, folder)).then(|| task.to_owned())
+}
+
+/// 제목이 작업이 아니라 에이전트·폴더 이름이거나 셸이 띄운 명령 줄이다.
+fn is_generic_agent_title(task: &str, folder: Option<&str>) -> bool {
+    const GENERIC_TITLES: [&str; 7] = [
+        "Claude Code",
+        "Claude",
+        "Codex",
+        "OpenAI Codex",
+        "Grok",
+        "Kimi",
+        "Kimi Code",
+    ];
+    const AGENT_COMMANDS: [&str; 4] = ["claude", "codex", "grok", "kimi"];
+    let lower = task.to_lowercase();
+    GENERIC_TITLES
         .iter()
         .any(|generic| task.eq_ignore_ascii_case(generic))
-        || folder.is_some_and(|folder| task == folder);
-    (!task.is_empty() && !is_generic).then(|| task.to_owned())
+        || folder.is_some_and(|folder| task == folder)
+        // Claude agents 보기: `1 awaiting input · claude agents`
+        || lower.ends_with("claude agents")
+        // 셸 테마의 preexec 제목(`codex resume`, `claude --resume <id>`)
+        || AGENT_COMMANDS.iter().any(|command| {
+            lower
+                .strip_prefix(command)
+                .is_some_and(|rest| rest.starts_with(' '))
+        })
 }
 
 /// 제목 앞의 진행 표시(점자 스피너·원 기호 등)와 `[ ! ] Action Required |` 같은 상태 칸.
@@ -429,50 +475,54 @@ mod tests {
 
     /// 2026-10-12 사용자 pane 로그의 실제 제목들.
     #[test]
-    fn 터미널_제목에서_상태_기호와_폴더_칸을_떼고_작업만_남긴다() {
+    fn 터미널_제목에서_상태_기호와_프로젝트_칸을_떼고_작업만_남긴다() {
+        use crate::agent_detect::AgentKind::{Claude, Codex, Grok};
         let cases = [
             (
                 "⠹ 검토해 PF별 개선사항 보고 | Design",
                 Some("Design"),
+                Codex,
                 Some("검토해 PF별 개선사항 보고"),
             ),
             (
                 "검토해 PF별 개선사항 보고 | Design",
-                Some("Design"),
+                None,
+                Codex,
                 Some("검토해 PF별 개선사항 보고"),
             ),
             (
                 "[ ! ] Action Required | 프로젝트 실행 | anydoc",
                 Some("anydoc"),
+                Codex,
                 Some("프로젝트 실행"),
             ),
+            // 리뷰 지적: 하위 폴더·`codex -C`에서는 프로젝트명이 cwd 폴더와 다르다.
+            ("⠹ X | Serenity", Some("app"), Codex, Some("X")),
             (
-                "[ . ] Action Required | 프로젝트 실행 | anydoc",
-                None,
-                Some("프로젝트 실행"),
+                "[ . ] Action Required | X | anydoc",
+                Some("web"),
+                Codex,
+                Some("X"),
             ),
             (
                 "◐ 코인 검색 화면 겹침 수정",
                 None,
+                Claude,
                 Some("코인 검색 화면 겹침 수정"),
             ),
+            // Claude 요약의 ` | `는 제목의 일부다.
+            ("✳ Fix A | B", Some("B"), Claude, Some("Fix A | B")),
+            ("Fix login - grok", None, Grok, Some("Fix login")),
             (
-                "✳ 코인 검색 화면 겹침 수정",
-                Some("coin"),
-                Some("코인 검색 화면 겹침 수정"),
-            ),
-            // 폴더를 모르면 Codex 관례대로 마지막 칸을 폴더로 본다.
-            (
-                "⠋ 재실행하고 경계 마감 | FieldAI",
+                "⠹ - Waiting for response… - Fix login - grok",
                 None,
-                Some("재실행하고 경계 마감"),
+                Grok,
+                Some("Fix login"),
             ),
-            // 마지막 칸이 이 pane의 폴더가 아니면 제목의 일부다.
-            ("A | B", Some("Design"), Some("A | B")),
         ];
-        for (title, folder, expected) in cases {
+        for (title, folder, kind, expected) in cases {
             assert_eq!(
-                task_from_terminal_title(title, folder).as_deref(),
+                task_from_terminal_title(title, folder, kind).as_deref(),
                 expected,
                 "{title}"
             );
@@ -480,17 +530,30 @@ mod tests {
     }
 
     #[test]
-    fn 제목이_아직_없거나_일반_이름이면_작업으로_보지_않는다() {
-        for (title, folder) in [
-            ("⠹ anydoc", Some("anydoc")),
-            ("anydoc", Some("anydoc")),
-            ("⠹ ⠧ | anydoc", Some("anydoc")),
-            ("✳ Claude Code", None),
-            ("codex", None),
-            ("", None),
-            ("[ ! ] Action Required", None),
+    fn 제목이_아직_없거나_일반_이름이나_명령_줄이면_작업으로_보지_않는다() {
+        use crate::agent_detect::AgentKind::{Claude, Codex, Grok};
+        for (title, folder, kind) in [
+            ("⠹ anydoc", Some("anydoc"), Codex),
+            ("⠹ Serenity", Some("app"), Codex),
+            ("⠹ ⠧ | anydoc", Some("anydoc"), Codex),
+            ("⠏ | Serenity", Some("app"), Codex),
+            ("✳ Claude Code", None, Claude),
+            ("1 awaiting input · claude agents", None, Claude),
+            (
+                "claude --resume 240ec284-0fd0-4e44-8336-18f5cc5f88fe",
+                None,
+                Claude,
+            ),
+            ("codex resume", None, Codex),
+            ("grok", None, Grok),
+            ("", None, Claude),
+            ("[ ! ] Action Required", None, Codex),
         ] {
-            assert_eq!(task_from_terminal_title(title, folder), None, "{title}");
+            assert_eq!(
+                task_from_terminal_title(title, folder, kind),
+                None,
+                "{title}"
+            );
         }
     }
 

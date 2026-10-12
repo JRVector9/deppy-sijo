@@ -252,6 +252,11 @@ pub const INHERITED_AGENT_SESSION_VARS: &[&str] = &[
     "DEPPY_SHELL_ZDOTDIR",
     "DEPPY_SHELL_USER_ZDOTDIR",
     "DEPPY_SHIM_DIR",
+    // Deppy shim이 진짜 CLI에 넘기는 값 — shim으로 띄운 에이전트 안에서 Deppy를 다시 띄우면
+    // 상속돼, 그 Deppy pane에서 친 claude/codex가 "real binary not found"로 끝났다.
+    // 앱이 띄우는 실행은 spec env로 다시 넣는다.
+    "DEPPY_SHIM_GUARD",
+    "DEPPY_AGENT_EXECUTABLE",
     // Codex — 부모 스레드 식별자와 내부 오버라이드.
     "CODEX_THREAD_ID",
     "CODEX_INTERNAL_ORIGINATOR_OVERRIDE",

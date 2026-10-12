@@ -39,8 +39,8 @@ pub(crate) fn composed_cell(base: char, zerowidth: Option<&[char]>) -> (char, Op
     (base, Some(text))
 }
 
-/// 터미널 질의 응답을 수집한다 (PtyWrite + OSC 색상 질의).
-/// title/bell 이벤트는 PR-10/13에서 소비 예정 — 현재는 무시.
+/// 터미널 질의 응답과 OSC 제목을 수집한다 (PtyWrite + OSC 색상 질의 + 제목).
+/// bell 이벤트는 PR-10/13에서 소비 예정 — 현재는 무시.
 /// ColorRequest는 팔레트 참조가 필요해 feed()에서 해석한다.
 type ColorFormatter = std::sync::Arc<dyn Fn(Rgb) -> String + Sync + Send + 'static>;
 
@@ -56,6 +56,8 @@ struct CollectingListener {
     pty_response_events: std::sync::Arc<std::sync::Mutex<Vec<PtyResponseEvent>>>,
     /// OSC 0/2로 프로그램이 설정한 터미널 제목(현재 값). 세션 이름 동적 표시에 쓴다.
     title: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// 마지막 feed 이후 제목 이벤트가 있었는지 — `TerminalChangeSet::title_changed`.
+    title_changed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl EventListener for CollectingListener {
@@ -72,8 +74,16 @@ impl EventListener for CollectingListener {
                 .expect("pty response events lock")
                 .push(PtyResponseEvent::ColorRequest(index, formatter)),
             // OSC 0/2 제목 — 최신 값 보관, 리셋이면 비운다.
-            Event::Title(t) => *self.title.lock().expect("title lock") = Some(t),
-            Event::ResetTitle => *self.title.lock().expect("title lock") = None,
+            Event::Title(t) => {
+                *self.title.lock().expect("title lock") = Some(t);
+                self.title_changed
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            Event::ResetTitle => {
+                *self.title.lock().expect("title lock") = None;
+                self.title_changed
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             _ => {}
         }
     }
@@ -618,8 +628,11 @@ impl TerminalBackend for AlacrittyBackend {
                 self.term.mode().contains(TermMode::SHOW_CURSOR),
                 self.term.cursor_style(),
             ) != cursor_before,
-            // title/bell 이벤트 소비는 PR-10/13에서
-            title_changed: false,
+            // bell 이벤트 소비는 PR-10/13에서
+            title_changed: self
+                .listener
+                .title_changed
+                .swap(false, std::sync::atomic::Ordering::Relaxed),
             bell: false,
             pty_responses,
         })
@@ -747,6 +760,15 @@ impl TerminalBackend for AlacrittyBackend {
             },
             expired,
         })
+    }
+
+    fn title(&self) -> Option<String> {
+        self.listener
+            .title
+            .lock()
+            .ok()
+            .and_then(|title| title.clone())
+            .filter(|title| !title.is_empty())
     }
 
     fn viewport_metadata(&self) -> Option<crate::TerminalViewportMetadata> {
@@ -3104,5 +3126,22 @@ mod tests {
         // 직렬화가 패닉 없이 되고 최근 줄을 담는다(재활용이 최근 내용을 안 깨뜨림).
         let dump = String::from_utf8_lossy(&a.serialize_scrollback().unwrap()).into_owned();
         assert!(dump.contains("row599"), "최근 줄이 직렬화에 없음");
+    }
+
+    /// 제품 기본 엔진에서도 OSC 제목 변경을 알린다 — 숨은 세션의 에이전트 작업 표시가
+    /// 이 신호로 제목을 다시 읽는다(2026-10-12).
+    #[test]
+    fn osc_제목_변경은_한_번만_알리고_현재_제목을_읽을_수_있다() {
+        let mut backend = AlacrittyBackend::new(40, 5, 100);
+        assert_eq!(backend.title(), None);
+        let changes = backend
+            .feed(b"\x1b]0;\xe2\xa0\xb9 task | proj\x07")
+            .unwrap();
+        assert!(changes.title_changed);
+        assert_eq!(backend.title().as_deref(), Some("\u{2839} task | proj"));
+        assert!(!backend.feed(b"plain output").unwrap().title_changed);
+        let reset = backend.feed(b"\x1b]0;\x07").unwrap();
+        assert!(reset.title_changed);
+        assert_eq!(backend.title(), None, "빈 제목은 없음으로 본다");
     }
 }

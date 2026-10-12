@@ -134,8 +134,19 @@ fi
 
 # 사용자 .zshrc가 실제 claude/codex 경로를 PATH 앞에 다시 넣어도 상태 hook shim을 맨 앞에 둔다.
 # 사용자 rc가 켠 옵션(ksharrays 등)이 배열 해석을 바꾸지 않게 zsh 기본 옵션 안에서 고친다.
+# mise·direnv·nvm처럼 프롬프트마다 PATH를 바꾸는 도구 뒤에도 유지되게 precmd 끝에서 다시 본다.
 if [[ -n "${DEPPY_SHIM_DIR:-}" && -d "$DEPPY_SHIM_DIR" ]]; then
-  () { emulate -L zsh; path=("$DEPPY_SHIM_DIR" "${(@)path:#$DEPPY_SHIM_DIR}"); }
+  # 뒤에 도는 프롬프트 마크 훅이 직전 명령의 종료 코드($?)를 그대로 읽게 보존한다.
+  __deppy_shim_first() {
+    local __deppy_status=$?
+    emulate -L zsh
+    if [[ "${path[1]}" != "$DEPPY_SHIM_DIR" ]]; then
+      path=("$DEPPY_SHIM_DIR" "${(@)path:#$DEPPY_SHIM_DIR}")
+    fi
+    return $__deppy_status
+  }
+  __deppy_shim_first
+  autoload -Uz add-zsh-hook 2>/dev/null && add-zsh-hook precmd __deppy_shim_first
 fi
 
 # ── deppy prompt marks (OSC 133 — 셸 통합 1단계. zsh 전용, bash/fish는 후속) ──
@@ -530,6 +541,12 @@ print -r -- "value:$PLAIN deleted:${+REMOVE_ME}"
 builtin source "$TEST_RC"
 print -r -- "codex:$(whence -p codex)"
 print -r -- "path:$PATH"
+if (( ${+functions[__deppy_shim_first]} )); then
+  # 프롬프트마다 PATH를 바꾸는 도구(mise 등) 뒤에도 shim이 맨 앞으로 돌아오고 $?는 보존된다.
+  path=("$HOME/bin" "${(@)path:#$HOME/bin}")
+  (exit 7); __deppy_shim_first; print -r -- "status:$?"
+  print -r -- "precmd:${PATH%%:*}"
+fi
 "#;
         let run = |user_rc: &str, shim_dir: Option<&Path>| {
             std::fs::write(user.join(".zshrc"), user_rc).unwrap();
@@ -564,6 +581,11 @@ print -r -- "path:$PATH"
                     shims.display(),
                     real_bin.display()
                 )),
+                "{user_rc}: {with_shim}"
+            );
+            assert!(with_shim.contains("status:7\n"), "{user_rc}: {with_shim}");
+            assert!(
+                with_shim.contains(&format!("precmd:{}\n", shims.display())),
                 "{user_rc}: {with_shim}"
             );
         }

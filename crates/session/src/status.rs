@@ -255,6 +255,18 @@ static BUILTIN: std::sync::LazyLock<BuiltinPatterns> = std::sync::LazyLock::new(
     }
 });
 
+/// Codex TUI가 사용자 조치를 기다릴 때의 제목 표시: `[ ! ] Action Required | …`,
+/// 깜빡임 프레임 `[ . ] Action Required | …`.
+fn title_needs_action(title: &str) -> bool {
+    let Some(rest) = title.trim_start().strip_prefix('[') else {
+        return false;
+    };
+    let Some((badge, tail)) = rest.split_once(']') else {
+        return false;
+    };
+    badge.trim().chars().count() <= 1 && tail.trim_start().starts_with("Action Required")
+}
+
 fn priority(status: SessionStatus) -> u8 {
     match status {
         SessionStatus::Error => 4,
@@ -339,6 +351,10 @@ pub struct StatusDetector {
     input_sequence: InputSequence,
     source: StatusSource,
     stats: StatusDetectorStats,
+    /// 터미널 제목이 사용자 조치 필요를 알린다(Codex `[ ! ] Action Required | …`).
+    title_needs_action: bool,
+    /// 현재 NeedsApproval이 제목에서 왔다 — 제목 표시가 사라지면 해제한다.
+    title_derived: bool,
 }
 
 impl StatusDetector {
@@ -363,7 +379,17 @@ impl StatusDetector {
             input_sequence: InputSequence::Ground,
             source: StatusSource::IdleHeuristic,
             stats: StatusDetectorStats::default(),
+            title_needs_action: false,
+            title_derived: false,
         }
+    }
+
+    /// 터미널 제목(OSC 0/2) 변경을 반영한다. Codex는 승인·질문으로 사용자 조치를 기다리는
+    /// 동안 제목 앞에 `[ ! ] Action Required`/`[ . ] Action Required`를 깜빡인다. 그 화면
+    /// 문구(`? 1 question … to answer` 등)는 내장 패턴에 없고 제목 갱신이 출력을 계속 만들어
+    /// idle도 오지 않아, 몇 시간이고 「실행 중」으로 보였다(2026-10-12 pane 로그).
+    pub fn on_title(&mut self, title: Option<&str>) {
+        self.title_needs_action = title.is_some_and(title_needs_action);
     }
 
     /// 호출측이 `screen_text()`를 만들기 전에 묻는 비용 게이트.
@@ -729,6 +755,22 @@ impl StatusDetector {
                 self.status = SessionStatus::Running;
                 self.source = StatusSource::ScreenText;
                 self.screen_derived = false;
+            }
+        }
+        // 제목의 사용자 조치 표시 — 화면 프롬프트처럼 표시가 있는 동안만 유지(transient).
+        if self.title_needs_action {
+            if priority(SessionStatus::NeedsApproval) >= priority(self.status)
+                || self.screen_derived
+            {
+                self.status = SessionStatus::NeedsApproval;
+                self.source = StatusSource::ScreenText;
+                self.title_derived = true;
+            }
+        } else if self.title_derived {
+            self.title_derived = false;
+            if self.status == SessionStatus::NeedsApproval && !self.screen_derived {
+                self.status = SessionStatus::Running;
+                self.source = StatusSource::ScreenText;
             }
         }
         // idle: 어떤 신호도 없고 출력이 멎었으면 입력 대기 추정 (약한 신호 — 출력으로 해제)
@@ -1318,5 +1360,57 @@ mod tests {
         // 개행이 오면 그 라인은 정상 평가된다(기능 회귀 없음)
         d.on_output(b"\nProceed? [y/n]\n");
         assert_eq!(d.status, SessionStatus::NeedsApproval);
+    }
+
+    /// 2026-10-12 pane 로그: Codex가 질문 답을 기다리며 몇 시간 동안 제목에
+    /// `[ ! ]`/`[ . ] Action Required`를 깜빡였지만 「실행 중」으로 보였다.
+    #[test]
+    fn codex_제목의_action_required는_표시가_있는_동안_승인_필요다() {
+        let mut d = StatusDetector::new(StatusPatterns::compile(None, None, None, None));
+        d.on_title(Some("⠹ 검토해 PF별 개선사항 보고 | Design"));
+        assert_eq!(
+            d.evaluate(None),
+            None,
+            "작업 중 제목은 상태를 바꾸지 않는다"
+        );
+
+        d.on_title(Some(
+            "[ ! ] Action Required | 검토해 PF별 개선사항 보고 | Design",
+        ));
+        assert_eq!(d.evaluate(None), Some(SessionStatus::NeedsApproval));
+        d.on_title(Some(
+            "[ . ] Action Required | 검토해 PF별 개선사항 보고 | Design",
+        ));
+        d.on_output(b"x");
+        assert_eq!(
+            d.evaluate(None),
+            None,
+            "깜빡임 프레임도 같은 상태를 유지한다"
+        );
+
+        d.on_title(Some("⠹ 검토해 PF별 개선사항 보고 | Design"));
+        assert_eq!(d.evaluate(None), Some(SessionStatus::Running));
+        d.on_title(None);
+        assert_eq!(d.evaluate(None), None);
+    }
+
+    #[test]
+    fn action_required_표시만_사용자_조치로_본다() {
+        for title in [
+            "[ ! ] Action Required | 프로젝트 실행 | anydoc",
+            "[ . ] Action Required",
+            "[!] Action Required | x",
+        ] {
+            assert!(title_needs_action(title), "{title}");
+        }
+        for title in [
+            "Action Required 설명서 작성",
+            "[ !! ] Action Required",
+            "⠹ [ ! ] Action Required | x",
+            "✳ Claude Code",
+            "",
+        ] {
+            assert!(!title_needs_action(title), "{title}");
+        }
     }
 }

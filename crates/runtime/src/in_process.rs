@@ -5070,6 +5070,19 @@ impl Worker {
             if !deferred_log.is_empty() {
                 deferred_logs.push((active_id, deferred_log));
             }
+            // 터미널 제목은 보이는지와 무관하게 알린다 — 숨은 세션의 에이전트 작업·상태 표시.
+            if let Some(title) = active.take_title_change() {
+                if let Some(detector) = self.detectors.get_mut(&active.id()) {
+                    detector.on_title(title.as_deref());
+                }
+                events.push((
+                    RuntimeEvent::SessionTitleChanged {
+                        session: active.id(),
+                        title,
+                    },
+                    true,
+                ));
+            }
             // 2·3단: 화면 텍스트 패턴 + idle — batch 주기, 경량 grid 조회
             // (snapshot 미생성 — hidden 세션 규칙, PR-12).
             // 종료된 세션은 감지 중단 — 단, 종료 tick에서는 마지막 출력의
@@ -12859,6 +12872,43 @@ mod tests {
         probe.wait_for(Duration::from_secs(15), |e| match e {
             RuntimeEvent::SessionStatusChanged {
                 status: session::SessionStatus::Waiting,
+                ..
+            } => Some(()),
+            _ => None,
+        });
+    }
+
+    /// 2026-10-12: Codex가 사용자 조치를 기다리며 제목에 `[ ! ] Action Required`를 띄우면
+    /// 제목 이벤트가 나가고 상태는 승인 필요가 된다. 제목 이벤트는 Viewport와 달리 보이는지와
+    /// 무관하게 나가므로 다른 탭·대기 워크스페이스에서도 작업과 상태를 보인다.
+    #[test]
+    #[cfg(unix)]
+    fn 터미널_제목은_이벤트로_나가고_action_required는_승인_필요다() {
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("title-event"),
+            RedactionService::new(),
+            pty::default_shell(),
+            None,
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(spawn_agent_cmd(
+                "printf '\\033]0;\\342\\240\\271 리뷰 | proj\\007'; sleep 1; printf '\\033]0;[ ! ] Action Required | 리뷰 | proj\\007'; sleep 3",
+                None,
+                None,
+            ))
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::SessionTitleChanged {
+                title: Some(title), ..
+            } if title == "\u{2839} 리뷰 | proj" => Some(()),
+            _ => None,
+        });
+        probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::SessionStatusChanged {
+                status: session::SessionStatus::NeedsApproval,
                 ..
             } => Some(()),
             _ => None,

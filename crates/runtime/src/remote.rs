@@ -740,15 +740,16 @@ fn drain_receiver_into_outbound(
     let mut source = OutboundDrain::Open;
     loop {
         match receiver.try_recv_durable() {
-            // ResourceUsage/PtyInputPressure/SessionStatusViewChanged는 로컬 UI
-            // telemetry/additive status view — 원격 피어에 보내지 않는다.
+            // ResourceUsage/PtyInputPressure/SessionStatusViewChanged/SessionTitleChanged는
+            // 로컬 UI telemetry/additive view — 원격 피어에 보내지 않는다.
             // postcard append-only는 기존 variant discriminant를 보존할 뿐, 구버전
             // 피어가 모르는 새 variant를 디코드하게 해 주지 않는다(수신 즉시 decode
             // 실패 → 접속 종료). 버전 협상으로 게이트하기 전까지 wire에서 제외 (codex).
             Ok(
                 RuntimeEvent::ResourceUsage { .. }
                 | RuntimeEvent::PtyInputPressure { .. }
-                | RuntimeEvent::SessionStatusViewChanged { .. },
+                | RuntimeEvent::SessionStatusViewChanged { .. }
+                | RuntimeEvent::SessionTitleChanged { .. },
             ) => {}
             Ok(event) => outbound.enqueue(event)?,
             Err(TryRecvError::Empty) => break,
@@ -3838,6 +3839,11 @@ mod tests {
             view: session::SessionStatusView::process_exit(session::SessionStatus::Done),
         })
         .unwrap();
+        tx.send(RuntimeEvent::SessionTitleChanged {
+            session: SessionId(1),
+            title: Some("⠹ task | project".to_owned()),
+        })
+        .unwrap();
         tx.send(RuntimeEvent::SessionStatusChanged {
             session: SessionId(1),
             status: session::SessionStatus::Done,
@@ -3905,6 +3911,7 @@ mod tests {
             RuntimeEvent::ResizeDeferred { .. } => "ResizeDeferred",
             RuntimeEvent::TerminalHistoryResult { .. } => "TerminalHistoryResult",
             RuntimeEvent::SessionInputSubmitted { .. } => "SessionInputSubmitted",
+            RuntimeEvent::SessionTitleChanged { .. } => "SessionTitleChanged",
         }
     }
 

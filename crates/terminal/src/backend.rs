@@ -205,6 +205,12 @@ pub trait TerminalBackend {
     }
     fn external_surface(&self) -> Option<TerminalExternalSurfaceHandle>;
 
+    /// 현재 터미널 제목(OSC 0/2). 셀 snapshot 없이 읽는다 — 화면에 안 보이는 세션의
+    /// 에이전트 작업·상태 표시에 쓴다. 빈 제목은 None.
+    fn title(&self) -> Option<String> {
+        self.viewport_snapshot().and_then(|snapshot| snapshot.title)
+    }
+
     fn scroll(&mut self, delta: i32);
 
     /// 스크롤백에서 맨 아래(라이브 화면)로 복귀한다. 기본 구현은 큰 음수 delta

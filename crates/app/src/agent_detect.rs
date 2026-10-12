@@ -1018,8 +1018,10 @@ fn codex_positional<'a>(args: &mut std::str::SplitWhitespace<'a>) -> Option<&'a 
     None
 }
 
-/// hook 레코드는 pane에 남아 있어도 그 pane의 프로세스는 새 대화로 바뀔 수 있다.
-/// 명시적 resume ID와 다르거나 fork의 원본 ID인 오래된 hook은 새 프로세스에 적용하지 않는다.
+/// 실행 스탬프로 이 프로세스가 보낸 것이 증명된 hook을 그 프로세스의 명령 줄과 대조한다.
+/// fork는 원본 ID에서 새 ID를 만들므로 원본 ID hook은 적용하지 않는다. Codex의 명시적
+/// resume ID는 대화를 고정한다. Claude는 `--resume X`로 시작해도 TUI 안의 `/clear`·`/resume`
+/// 으로 대화를 바꾸므로 argv의 ID보다 hook이 보고한 현재 대화를 따른다(2026-10-12 리뷰).
 fn hook_binding_matches_command(binding: &AgentBinding, command: &str) -> bool {
     if binding.kind == AgentKind::Codex {
         let mut args = codex_command_args(command);
@@ -1034,14 +1036,13 @@ fn hook_binding_matches_command(binding: &AgentBinding, command: &str) -> bool {
     if binding.kind != AgentKind::Claude {
         return true;
     }
-    let declared = claude_command_session_id(command);
     if command
         .split_whitespace()
         .any(|token| token == "--fork-session")
     {
-        return declared.as_deref() != Some(binding.session_id.as_str());
+        return claude_command_session_id(command).as_deref() != Some(binding.session_id.as_str());
     }
-    declared.is_none_or(|id| id == binding.session_id)
+    true
 }
 
 fn valid_session_id(value: &str) -> bool {
@@ -3623,13 +3624,15 @@ mod tests {
     }
 
     #[test]
-    fn 오래된_claude_hook은_다른_resume이나_fork에_적용하지_않는다() {
+    fn claude_hook은_fork_원본만_거르고_tui_안에서_바꾼_대화는_따른다() {
         let binding = AgentBinding {
             kind: AgentKind::Claude,
             session_id: "old-session".to_owned(),
             transcript: PathBuf::from("/tmp/old-session.jsonl"),
         };
-        assert!(!hook_binding_matches_command(
+        // `claude --resume other-session` 뒤 `/resume old-session`·`/clear` — 실행 스탬프가
+        // 이 프로세스의 hook임을 증명하므로 argv의 첫 대화가 아니라 hook의 대화를 따른다.
+        assert!(hook_binding_matches_command(
             &binding,
             "claude --resume other-session"
         ));

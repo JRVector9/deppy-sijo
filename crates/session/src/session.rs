@@ -94,7 +94,15 @@ pub struct Session {
     cache_class: TerminalCacheClass,
     /// OSC 133 프롬프트 마크 (셸 통합 1단계) — pump의 출력 스트림에서 스캔한다.
     prompt_marks: PromptMarks,
+    /// 마지막으로 읽은 터미널 제목(OSC 0/2, 유계). 화면에 안 보이는 세션도 에이전트 작업·
+    /// 상태를 보이도록 runtime이 변경을 이벤트로 내보낸다.
+    title: Option<String>,
+    /// `title`이 바뀐 뒤 아직 `take_title_change`로 가져가지 않았다.
+    title_dirty: bool,
 }
+
+/// 세션 제목 상한 — 화면 표시는 160자로 줄이므로 넉넉하되 유계로 둔다.
+pub const SESSION_TITLE_BYTES_MAX: usize = 1024;
 
 impl Session {
     pub const INPUT_GUARD_OUTPUT_MAX_BYTES: usize = FEED_PER_PUMP_CAP;
@@ -164,6 +172,8 @@ impl Session {
             exit_wait_ticks: 0,
             cache_class: TerminalCacheClass::Visible,
             prompt_marks: PromptMarks::default(),
+            title: None,
+            title_dirty: false,
         })
     }
 
@@ -217,6 +227,8 @@ impl Session {
             exit_wait_ticks: 0,
             cache_class: TerminalCacheClass::Exited,
             prompt_marks: PromptMarks::default(),
+            title: None,
+            title_dirty: false,
         }
     }
 
@@ -328,6 +340,9 @@ impl Session {
                     self.prompt_marks.scan(&chunk);
                     match self.backend.feed(&chunk) {
                         Ok(changes) => {
+                            if changes.title_changed {
+                                self.refresh_title();
+                            }
                             if !changes.dirty_rows.is_empty()
                                 || changes.cursor_changed
                                 || changes.title_changed
@@ -447,6 +462,33 @@ impl Session {
     }
 
     /// status detector용 경량 화면 텍스트 (snapshot 미생성 — PR-12 hidden 규칙).
+    /// 현재 터미널 제목(OSC 0/2). 빈 제목은 None.
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
+    /// 지난 호출 이후 제목이 바뀌었으면 새 제목(지워졌으면 `Some(None)`)을 한 번 돌려준다.
+    pub fn take_title_change(&mut self) -> Option<Option<String>> {
+        std::mem::take(&mut self.title_dirty).then(|| self.title.clone())
+    }
+
+    fn refresh_title(&mut self) {
+        let title = self.backend.title().map(|mut title| {
+            if title.len() > SESSION_TITLE_BYTES_MAX {
+                let mut end = SESSION_TITLE_BYTES_MAX;
+                while !title.is_char_boundary(end) {
+                    end -= 1;
+                }
+                title.truncate(end);
+            }
+            title
+        });
+        if title != self.title {
+            self.title = title;
+            self.title_dirty = true;
+        }
+    }
+
     pub fn screen_text(&self) -> String {
         self.backend.screen_text()
     }

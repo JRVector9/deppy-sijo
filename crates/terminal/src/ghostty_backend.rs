@@ -225,6 +225,14 @@ impl TerminalBackend for GhosttyBackend {
         TerminalRenderModel::CellGrid
     }
 
+    fn title(&self) -> Option<String> {
+        self.term
+            .title()
+            .ok()
+            .filter(|title| !title.is_empty())
+            .map(str::to_owned)
+    }
+
     fn viewport_metadata(&self) -> Option<crate::TerminalViewportMetadata> {
         Some(crate::TerminalViewportMetadata {
             scroll_offset: self.scroll_offset(),

@@ -2546,6 +2546,9 @@ struct InitialSnapshotFence {
 #[derive(Default)]
 struct SessionView {
     snapshot: Option<Arc<TerminalViewportSnapshot>>,
+    /// 마지막 터미널 제목(OSC 0/2). snapshot과 달리 탭이 숨겨져도 지우지 않는다 —
+    /// runtime은 보이는지와 무관하게 `SessionTitleChanged`를 낸다.
+    terminal_title: Option<String>,
     /// 스냅샷 세대 — 새 스냅샷을 받을 때마다 +1. 렌더러가 "이 스냅샷의 dirty를 이미
     /// 소비했는지" 판정해, 새 출력이 없는 repaint에서 전 행을 다시 shaping하지 않게 한다
     /// (2026-07-14 실측: idle repaint마다 rows_rebuilt≈전체 행 — 캐시 무효화 버그).
@@ -5215,12 +5218,7 @@ impl WorkspaceUi {
             display.last_agent_summary.as_deref(),
         )
         .or_else(|| {
-            let title = self.session_osc_title(Some(session))?;
-            let folder = self
-                .session_cwds
-                .get(&session)
-                .and_then(|cwd| Path::new(cwd).file_name()?.to_str());
-            let task = crate::fleet::task_from_terminal_title(&title, folder)?;
+            let task = self.session_title_task(session, display.kind)?;
             crate::fleet::task_preview(state, Some(&task), None)
         })
     }
@@ -5339,12 +5337,28 @@ impl WorkspaceUi {
         })
     }
 
-    /// 세션의 현재 OSC 제목(있으면).
+    /// 세션의 현재 OSC 제목(있으면). 숨은 세션도 `SessionTitleChanged`로 받은 값이 있다.
     fn session_osc_title(&self, session: Option<SessionId>) -> Option<String> {
-        session
-            .and_then(|s| self.sessions.get(&s))
-            .and_then(|v| v.snapshot.as_ref())
-            .and_then(|s| s.title.clone())
+        let view = session.and_then(|s| self.sessions.get(&s))?;
+        view.terminal_title
+            .clone()
+            .or_else(|| view.snapshot.as_ref().and_then(|s| s.title.clone()))
+    }
+
+    /// 살아 있는 에이전트 실행이 터미널 제목에 띄운 작업. 에이전트가 끝난 셸의 제목(vim,
+    /// 셸 테마의 명령 줄, 지워지지 않은 이전 에이전트 제목)은 작업으로 보지 않는다.
+    fn session_title_task(
+        &self,
+        session: SessionId,
+        kind: crate::agent_detect::AgentKind,
+    ) -> Option<String> {
+        self.agent_executions.get(&session)?;
+        let title = self.session_osc_title(Some(session))?;
+        let folder = self
+            .session_cwds
+            .get(&session)
+            .and_then(|cwd| Path::new(cwd).file_name()?.to_str());
+        crate::fleet::task_from_terminal_title(&title, folder, kind)
     }
 
     /// 모든 세션의 터미널 렌더 캐시를 비운다 — 테마 변경 시 stale galley(옛 폰트
@@ -5549,6 +5563,11 @@ impl WorkspaceUi {
                             view.last_submission_at_micros
                                 .map_or(*at_micros, |previous| previous.max(*at_micros)),
                         );
+                    }
+                }
+                RuntimeEvent::SessionTitleChanged { session, title } => {
+                    if self.session_alive(*session) {
+                        self.sessions.entry(*session).or_default().terminal_title = title.clone();
                     }
                 }
                 RuntimeEvent::SessionStatusChanged { session, status } => {
@@ -6042,6 +6061,11 @@ impl WorkspaceUi {
                             view.last_submission_at_micros
                                 .map_or(*at_micros, |previous| previous.max(*at_micros)),
                         );
+                    }
+                }
+                RuntimeEvent::SessionTitleChanged { session, title } => {
+                    if self.session_alive(*session) {
+                        self.sessions.entry(*session).or_default().terminal_title = title.clone();
                     }
                 }
                 RuntimeEvent::SessionStatusChanged { session, status } => {
@@ -9352,13 +9376,10 @@ impl WorkspaceUi {
                 let info = pane.session_id.and_then(|s| self.agent_info.get(&s));
                 // 요약/요청이 없다는 이유로 새 세션으로 단정하지 않는다.
                 // transcript 미확인 세션도 기존 프로젝트/상태 설명을 유지한다.
-                let title_task = osc.as_deref().and_then(|title| {
-                    let folder = pane
-                        .session_id
-                        .and_then(|s| self.session_cwds.get(&s))
-                        .and_then(|cwd| Path::new(cwd).file_name()?.to_str());
-                    crate::fleet::task_from_terminal_title(title, folder)
-                });
+                let title_task = pane
+                    .session_id
+                    .zip(info)
+                    .and_then(|(session, display)| self.session_title_task(session, display.kind));
                 let (agent_line, status_label, status_line) = match info {
                     Some(d) => (
                         Some(agent_info_line(d)),
@@ -23955,6 +23976,69 @@ https://example.test/login \
         );
         assert!(ui.sessions.get(&SessionId(1)).unwrap().restored_readonly);
         assert!(!ui.sessions.get(&SessionId(2)).unwrap().restored_readonly);
+    }
+
+    /// 2026-10-12 리뷰: 제목 작업이 보이는 탭에서만 나왔다. 숨은 탭·대기 워크스페이스도
+    /// `SessionTitleChanged`로 작업을 보이고, 에이전트가 끝나면 남은 제목을 쓰지 않는다.
+    #[test]
+    fn 숨은_세션도_터미널_제목의_작업을_보이고_에이전트가_끝나면_쓰지_않는다() {
+        let catalog = catalog();
+        let codex = crate::agent_detect::AgentDisplay {
+            kind: crate::agent_detect::AgentKind::Codex,
+            model: None,
+            effort: None,
+            context_pct: None,
+            last_agent_summary: None,
+            user_instruction: None,
+        };
+        let running = crate::agent_surface::AgentVisualState::Active;
+        let hidden = SessionId(2);
+        let execution = crate::agent_detect::AgentExecutionIdentity::fixture(
+            crate::agent_detect::AgentKind::Codex,
+            42,
+        );
+        let title = || RuntimeEvent::SessionTitleChanged {
+            session: hidden,
+            title: Some("⠹ 검토해 PF별 개선사항 보고 | Design".to_owned()),
+        };
+        let mux = || {
+            mux(
+                "a",
+                vec![
+                    tab(
+                        "a",
+                        vec![pane("pa", SessionId(1))],
+                        LayoutNode::Pane(pane_id("pa")),
+                    ),
+                    tab(
+                        "b",
+                        vec![pane("pb", hidden)],
+                        LayoutNode::Pane(pane_id("pb")),
+                    ),
+                ],
+                "pa",
+            )
+        };
+
+        // 대기 워크스페이스 경로와 활성 워크스페이스의 숨은 탭 경로 모두.
+        let mut warm = WorkspaceUi::new();
+        warm.apply_warm_events(&[RuntimeEvent::MuxUpdated { snapshot: mux() }], &catalog);
+        warm.apply_warm_events(&[title()], &catalog);
+        let mut active = WorkspaceUi::new();
+        active.handle_events(&[RuntimeEvent::MuxUpdated { snapshot: mux() }], &catalog);
+        active.handle_events(&[title()], &catalog);
+
+        for ui in [&mut warm, &mut active] {
+            ui.set_agent_info(std::collections::HashMap::from([(hidden, codex.clone())]));
+            ui.set_agent_executions(std::collections::HashMap::from([(hidden, execution)]));
+            assert_eq!(
+                ui.agent_task_line_for(hidden, running).as_deref(),
+                Some("검토해 PF별 개선사항 보고")
+            );
+            // 에이전트가 끝나 실행이 사라지면 남은 제목은 작업이 아니다.
+            ui.set_agent_executions(std::collections::HashMap::new());
+            assert_eq!(ui.agent_task_line_for(hidden, running), None);
+        }
     }
 
     fn restored_archived_resume_harness(

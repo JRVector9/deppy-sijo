@@ -3042,14 +3042,14 @@ mod tests {
 
     #[test]
     fn v12_v13_peer_is_rejected_at_hello_before_event_decode() {
-        for version in [10, 12, 13, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28] {
+        for version in [10, 12, 13, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29] {
             let old = ClientHello {
                 magic: PROTO_MAGIC,
                 proto_version: version,
                 features: CLIENT_FEATURES,
                 token: b"irrelevant".to_vec(),
             };
-            assert_eq!(PROTO_VERSION, 29);
+            assert_eq!(PROTO_VERSION, 30);
             assert!(!client_hello_matches_protocol(&old));
         }
     }

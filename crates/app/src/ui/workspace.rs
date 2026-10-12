@@ -2126,6 +2126,8 @@ pub struct WorkspaceUi {
         std::collections::HashMap<SessionId, crate::agent_detect::AgentExecutionIdentity>,
     /// transcript·hook 연동이 없는 그 밖의 에이전트(Qwen·Gemini 등) — 프로세스로 감지한 종류.
     other_agent_kinds: std::collections::HashMap<SessionId, crate::agent_launcher::AgentKind>,
+    /// 그 밖의 에이전트가 처음 감지됐을 때의 터미널 제목 — 그 뒤에 바뀐 제목만 작업으로 쓴다.
+    other_agent_title_baseline: std::collections::HashMap<SessionId, Option<String>>,
     selected_agent_prompts: VecDeque<SelectedAgentPrompt>,
     /// PR-3: 세션별로 영속된 에이전트 종류("claude"/"codex"/"kimi" — App이 pane_id
     /// 키인 persisted_agents에서 세션 키로 바꿔 매 갱신마다 set). 「다시 실행」 버튼
@@ -3185,6 +3187,7 @@ impl WorkspaceUi {
             agent_info: std::collections::HashMap::new(),
             agent_executions: std::collections::HashMap::new(),
             other_agent_kinds: std::collections::HashMap::new(),
+            other_agent_title_baseline: std::collections::HashMap::new(),
             selected_agent_prompts: VecDeque::new(),
             archived_resume_presentation: std::collections::HashMap::new(),
             pending_pastes: VecDeque::new(),
@@ -5172,7 +5175,22 @@ impl WorkspaceUi {
         &mut self,
         kinds: std::collections::HashMap<SessionId, crate::agent_launcher::AgentKind>,
     ) {
+        // 새로 감지된 에이전트는 그 시점의 제목을 기준으로 둔다 — 제목을 안 쓰는 에이전트가
+        // 이전 프로그램이 남긴 제목(앞선 Claude의 `✳ …` 등)을 작업으로 물려받지 않게.
+        self.other_agent_title_baseline
+            .retain(|session, _| kinds.contains_key(session));
+        for session in kinds.keys() {
+            if !self.other_agent_title_baseline.contains_key(session) {
+                let baseline = self.session_osc_title(Some(*session));
+                self.other_agent_title_baseline.insert(*session, baseline);
+            }
+        }
         self.other_agent_kinds = kinds;
+    }
+
+    /// 연동 없는 그 밖의 에이전트가 지금 이 세션에서 돌고 있는지.
+    pub(crate) fn has_other_agent(&self, session: SessionId) -> bool {
+        self.other_agent_kinds.contains_key(&session)
     }
 
     pub(crate) fn set_agent_executions(
@@ -5204,6 +5222,9 @@ impl WorkspaceUi {
     /// 안 지움), 활동 패널·PWA가 비활성 워크스페이스의 에이전트 정보를 보여줄 수 있다
     /// (2026-07-13 방안①). 절전되면 workspace_ui째로 사라져 자연히 표시 안 된다.
     pub fn agent_line_for(&self, session: SessionId) -> Option<String> {
+        if let Some(kind) = self.other_agent_kinds.get(&session) {
+            return Some(kind.label().to_owned());
+        }
         self.agent_info.get(&session).map(agent_info_line)
     }
 
@@ -5222,10 +5243,14 @@ impl WorkspaceUi {
         session: SessionId,
         state: crate::agent_surface::AgentVisualState,
     ) -> Option<String> {
-        let Some(display) = self.agent_info.get(&session) else {
-            // 연동 없는 그 밖의 에이전트(Qwen 등)는 터미널 제목의 작업만 있다.
-            let task = self.session_title_task(session, None)?;
-            return crate::fleet::task_preview(state, Some(&task), None);
+        // 연동 없는 그 밖의 에이전트(Qwen 등)는 터미널 제목의 작업만 있다. 지금 돌고 있으면
+        // 같은 pane의 이전 연동 에이전트 표시보다 우선한다.
+        let display = match self.agent_info.get(&session) {
+            Some(display) if !self.other_agent_kinds.contains_key(&session) => display,
+            _ => {
+                let task = self.session_title_task(session, None)?;
+                return crate::fleet::task_preview(state, Some(&task), None);
+            }
         };
         crate::fleet::task_preview(
             state,
@@ -5372,6 +5397,14 @@ impl WorkspaceUi {
             None => self.other_agent_kinds.get(&session).map(|_| ())?,
         }
         let title = self.session_osc_title(Some(session))?;
+        if kind.is_none()
+            && self
+                .other_agent_title_baseline
+                .get(&session)
+                .is_some_and(|baseline| baseline.as_deref() == Some(title.as_str()))
+        {
+            return None;
+        }
         let folder = self
             .session_cwds
             .get(&session)
@@ -9391,14 +9424,19 @@ impl WorkspaceUi {
                 // 사용자 이름 판별은 자동 프로젝트/OSC 제목으로 바꾸기 전에 한다.
                 let title_is_custom = !is_default_session_title(&pane.title);
                 // 이름 유무에 따라 같은 두 줄 안에서 작업과 모델 정보의 위치를 바꾼다.
-                let info = pane.session_id.and_then(|s| self.agent_info.get(&s));
-                // 요약/요청이 없다는 이유로 새 세션으로 단정하지 않는다.
-                // transcript 미확인 세션도 기존 프로젝트/상태 설명을 유지한다.
+                // 그 밖의 에이전트가 지금 돌면(감지기가 연동 에이전트가 없음을 보장한다) 이전
+                // 연동 에이전트의 남은 표시보다 우선한다 — Claude를 끝내고 Qwen을 띄운 pane이
+                // 계속 Claude로 보였다(2026-10-12 리뷰).
                 let other_agent = pane
                     .session_id
                     .and_then(|s| self.other_agent_kinds.get(&s))
-                    .copied()
-                    .filter(|_| info.is_none());
+                    .copied();
+                let info = pane
+                    .session_id
+                    .and_then(|s| self.agent_info.get(&s))
+                    .filter(|_| other_agent.is_none());
+                // 요약/요청이 없다는 이유로 새 세션으로 단정하지 않는다.
+                // transcript 미확인 세션도 기존 프로젝트/상태 설명을 유지한다.
                 let title_task = pane.session_id.and_then(|session| match info {
                     Some(display) => self.session_title_task(session, Some(display.kind)),
                     None if other_agent.is_some() => self.session_title_task(session, None),
@@ -24109,25 +24147,40 @@ https://example.test/login \
             }],
             &catalog,
         );
-        ui.handle_events(
-            &[RuntimeEvent::SessionTitleChanged {
-                session,
-                title: Some("⠹ 로그인 화면 수정".to_owned()),
-            }],
-            &catalog,
-        );
+        let title = |text: &str| RuntimeEvent::SessionTitleChanged {
+            session,
+            title: Some(text.to_owned()),
+        };
+        // 이전 Claude가 남긴 제목과 표시(agent_info)가 있는 pane에서 Qwen을 띄운 상황.
+        ui.handle_events(&[title("✳ 이전 Claude 작업")], &catalog);
+        ui.set_agent_info(std::collections::HashMap::from([(
+            session,
+            crate::agent_detect::AgentDisplay {
+                kind: crate::agent_detect::AgentKind::Claude,
+                model: Some("opus".to_owned()),
+                effort: None,
+                context_pct: None,
+                last_agent_summary: None,
+                user_instruction: None,
+            },
+        )]));
         let running = crate::agent_surface::AgentVisualState::Active;
-        assert_eq!(ui.agent_task_line_for(session, running), None);
         ui.set_other_agent_kinds(std::collections::HashMap::from([(
             session,
             crate::agent_launcher::AgentKind::QwenCode,
         )]));
+        // 리뷰 지적: 지금 도는 Qwen이 이전 Claude 표시보다 우선한다.
+        assert_eq!(ui.agent_line_for(session).as_deref(), Some("Qwen Code"));
+        // 감지 시점에 이미 있던 제목은 이전 프로그램 것이라 작업으로 쓰지 않는다.
+        assert_eq!(ui.agent_task_line_for(session, running), None);
+        ui.handle_events(&[title("⠹ 로그인 화면 수정")], &catalog);
         assert_eq!(
             ui.agent_task_line_for(session, running).as_deref(),
             Some("로그인 화면 수정")
         );
         ui.set_other_agent_kinds(std::collections::HashMap::new());
         assert_eq!(ui.agent_task_line_for(session, running), None);
+        assert_eq!(ui.agent_line_for(session).as_deref(), Some("Claude · opus"));
     }
 
     fn restored_archived_resume_harness(

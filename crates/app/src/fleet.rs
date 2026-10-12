@@ -352,7 +352,7 @@ pub fn task_from_terminal_title(
 
 /// 제목이 작업이 아니라 에이전트·폴더 이름이거나 셸이 띄운 명령 줄이다.
 fn is_generic_agent_title(task: &str, folder: Option<&str>) -> bool {
-    const GENERIC_TITLES: [&str; 7] = [
+    const GENERIC_TITLES: [&str; 17] = [
         "Claude Code",
         "Claude",
         "Codex",
@@ -360,20 +360,50 @@ fn is_generic_agent_title(task: &str, folder: Option<&str>) -> bool {
         "Grok",
         "Kimi",
         "Kimi Code",
+        "Gemini",
+        "Gemini CLI",
+        "Qwen",
+        "Qwen Code",
+        "OpenCode",
+        "Aider",
+        "Goose",
+        "Amp",
+        "Cursor",
+        "Copilot",
     ];
-    const AGENT_COMMANDS: [&str; 4] = ["claude", "codex", "grok", "kimi"];
+    const AGENT_COMMANDS: [&str; 12] = [
+        "claude",
+        "codex",
+        "grok",
+        "kimi",
+        "gemini",
+        "qwen",
+        "opencode",
+        "aider",
+        "goose",
+        "amp",
+        "cursor-agent",
+        "copilot",
+    ];
     let lower = task.to_lowercase();
-    GENERIC_TITLES
-        .iter()
-        .any(|generic| task.eq_ignore_ascii_case(generic))
+    let generic = |text: &str| {
+        GENERIC_TITLES
+            .iter()
+            .any(|generic| text.eq_ignore_ascii_case(generic))
+    };
+    generic(task)
         || folder.is_some_and(|folder| task == folder)
+        // `Gemini - <폴더>`·`Qwen - <폴더>`처럼 에이전트 이름 뒤에 폴더만 붙인 제목
+        || task
+            .split_once(" - ")
+            .is_some_and(|(head, _)| generic(head.trim()))
         // Claude agents 보기: `1 awaiting input · claude agents`
         || lower.ends_with("claude agents")
-        // 셸 테마의 preexec 제목(`codex resume`, `claude --resume <id>`)
+        // 셸 테마의 preexec 제목(`codex resume`, `claude --resume <id>`, 맨 `qwen`)
         || AGENT_COMMANDS.iter().any(|command| {
             lower
                 .strip_prefix(command)
-                .is_some_and(|rest| rest.starts_with(' '))
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
         })
 }
 
@@ -409,7 +439,9 @@ fn strip_title_status(title: &str) -> &str {
                 | '○'
                 | '◇'
                 | '◆'
-                | '⏺',
+                | '⏺'
+                | '✦'
+                | '✋',
             ) => rest = chars.as_str().trim_start(),
             _ => return rest.trim_end(),
         }
@@ -557,6 +589,29 @@ mod tests {
         ] {
             assert_eq!(
                 task_from_terminal_title(title, folder, Some(kind)),
+                None,
+                "{title}"
+            );
+        }
+    }
+
+    /// 연동 없는 에이전트(kind None)의 제목: 에이전트 이름·폴더·명령 줄은 작업이 아니다.
+    #[test]
+    fn 그_밖의_에이전트_제목은_일반_해석으로_작업만_남긴다() {
+        assert_eq!(
+            task_from_terminal_title("✦ 로그인 화면 수정", Some("app"), None).as_deref(),
+            Some("로그인 화면 수정")
+        );
+        for title in [
+            "Gemini - app",
+            "Qwen - app",
+            "qwen",
+            "gemini --yolo",
+            "aider --model sonnet",
+            "app",
+        ] {
+            assert_eq!(
+                task_from_terminal_title(title, Some("app"), None),
                 None,
                 "{title}"
             );

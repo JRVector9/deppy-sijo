@@ -47,6 +47,9 @@ pub enum StatusSource {
     ScreenText,
     IdleHeuristic,
     UserOverride,
+    /// 에이전트 TUI의 터미널 제목(Codex `Action Required`, 작업 중 스피너가 멈춘 턴 완료).
+    /// hook 턴 종료처럼 화면 상태로만 쓰고 완료 알림은 띄우지 않는다.
+    TerminalTitle,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -371,6 +374,9 @@ pub struct StatusDetector {
     title_turn_done: bool,
     /// 현재 Done이 제목의 턴 종료에서 왔다 — 제목이 다시 작업 중이 되면 해제한다.
     title_done_derived: bool,
+    /// 사용자가 지시를 보낸 뒤의 턴이다. Codex는 시작·재개 중에도 스피너를 띄워, 첫 지시
+    /// 전에 거짓 완료가 났다(2026-10-12 리뷰, pane 로그).
+    turn_armed: bool,
 }
 
 impl StatusDetector {
@@ -400,6 +406,7 @@ impl StatusDetector {
             title_working: false,
             title_turn_done: false,
             title_done_derived: false,
+            turn_armed: false,
         }
     }
 
@@ -415,7 +422,7 @@ impl StatusDetector {
         let working = title.is_some_and(title_shows_work);
         if working {
             self.title_turn_done = false;
-        } else if self.title_working && !needs_action && title.is_some() {
+        } else if self.title_working && !needs_action && title.is_some() && self.turn_armed {
             // 제목을 지운 것은 에이전트 종료 쪽 신호다(종료 코드가 따로 상태를 정한다).
             self.title_turn_done = true;
         }
@@ -646,6 +653,10 @@ impl StatusDetector {
         self.scanned = 0;
         // 입력도 활동이다 — idle 타이머 리셋 (즉시 Waiting 재발화 방지)
         self.last_output = Instant::now();
+        // 지시를 보냈으니 다음 스피너 정지는 이 턴의 완료다. 이전 턴의 정지 표시는 버린다.
+        self.turn_armed = true;
+        self.title_turn_done = false;
+        self.title_done_derived = false;
     }
 
     /// hook이 보고한 새 턴 시작(UserPromptSubmit/PreToolUse) — 입력과 동일한 리셋이다.
@@ -670,6 +681,8 @@ impl StatusDetector {
         self.source = StatusSource::ProcessExit;
         self.screen_derived = false;
         self.idle_waiting = false;
+        self.title_done_derived = false;
+        self.title_turn_done = false;
     }
 
     /// output chunk 수신 — stream line regex 단계.
@@ -771,7 +784,9 @@ impl StatusDetector {
                     .any(|(status, line)| *status == c.status && line.starts_with(&c.prefix))
             });
             if let Some(status) = best {
-                if priority(status) > priority(self.status) || self.screen_derived {
+                // 제목의 턴 완료 뒤 한 tick 늦게 그려진 질문·승인 화면도 그 완료를 덮는다.
+                let title_done = self.title_done_derived && self.status == SessionStatus::Done;
+                if priority(status) > priority(self.status) || self.screen_derived || title_done {
                     self.status = status;
                     self.source = StatusSource::ScreenText;
                     // Done/Error는 결과 상태 — stream 매치처럼 latch한다.
@@ -794,14 +809,14 @@ impl StatusDetector {
                 || self.screen_derived
             {
                 self.status = SessionStatus::NeedsApproval;
-                self.source = StatusSource::ScreenText;
+                self.source = StatusSource::TerminalTitle;
                 self.title_derived = true;
             }
         } else if self.title_derived {
             self.title_derived = false;
             if self.status == SessionStatus::NeedsApproval && !self.screen_derived {
                 self.status = SessionStatus::Running;
-                self.source = StatusSource::ScreenText;
+                self.source = StatusSource::TerminalTitle;
             }
         }
         // 제목의 턴 종료 — 결과 상태라 Done/Error처럼 latch(입력·다음 턴 시작으로 해제).
@@ -809,17 +824,19 @@ impl StatusDetector {
             && matches!(self.status, SessionStatus::Running | SessionStatus::Idle)
         {
             self.status = SessionStatus::Done;
-            self.source = StatusSource::ScreenText;
+            self.source = StatusSource::TerminalTitle;
             self.screen_derived = false;
             self.idle_waiting = false;
             self.title_done_derived = true;
+            self.turn_armed = false;
         } else if self.title_working
             && self.title_done_derived
             && self.status == SessionStatus::Done
         {
             // 입력 없이 다음 턴이 시작됐다(대기열·자동 진행) — 다시 실행 중.
             self.status = SessionStatus::Running;
-            self.source = StatusSource::ScreenText;
+            self.source = StatusSource::TerminalTitle;
+            self.turn_armed = true;
         }
         if self.status != SessionStatus::Done {
             self.title_done_derived = false;
@@ -846,6 +863,7 @@ fn status_confidence(source: StatusSource) -> f32 {
         StatusSource::ProcessExit | StatusSource::UserOverride => 1.0,
         StatusSource::StreamRegex => 0.9,
         StatusSource::ScreenText => 0.8,
+        StatusSource::TerminalTitle => 0.7,
         StatusSource::IdleHeuristic => 0.4,
     }
 }
@@ -857,6 +875,7 @@ fn status_source_reason(source: StatusSource) -> &'static str {
         StatusSource::ScreenText => "screen_text",
         StatusSource::IdleHeuristic => "idle_heuristic",
         StatusSource::UserOverride => "user_override",
+        StatusSource::TerminalTitle => "terminal_title",
     }
 }
 
@@ -1455,7 +1474,17 @@ mod tests {
             None,
             "작업한 적 없는 정지 제목은 완료가 아니다"
         );
+        // 리뷰 지적: Codex 시작·재개 중 스피너는 턴이 아니다 — 지시 전엔 완료가 아니다.
+        d.on_title(Some("⠙ anydoc"));
+        d.on_title(Some("anydoc"));
+        assert_eq!(
+            d.evaluate(None),
+            None,
+            "첫 지시 전 부팅 스피너는 완료가 아니다"
+        );
 
+        d.on_input();
+        let _ = d.evaluate(None);
         d.on_title(Some("⠹ 검토 | Design"));
         d.on_title(Some("⠸ 검토 | Design"));
         assert_eq!(d.evaluate(None), None);
@@ -1475,6 +1504,41 @@ mod tests {
         d.on_title(Some("◐ 수정"));
         d.on_title(Some("[ ! ] Action Required | 수정 | Design"));
         assert_eq!(d.evaluate(None), Some(SessionStatus::NeedsApproval));
+        assert_eq!(d.status_view(None).source, StatusSource::TerminalTitle);
+    }
+
+    /// 리뷰 지적: Claude는 질문 상자를 띄우며 제목을 멈춘다. 다음 tick에 그려진 질문 화면이
+    /// 제목 완료를 덮어야 한다. 종료 신호 뒤에는 스피너가 와도 종료 상태를 되돌리지 않는다.
+    #[test]
+    fn 제목_완료는_늦게_그려진_질문_화면에_밀리고_종료_뒤엔_되돌리지_않는다() {
+        let mut d = StatusDetector::new(StatusPatterns::compile(None, None, None, None));
+        d.on_input();
+        let _ = d.evaluate(None);
+        d.on_title(Some("◐ 확인"));
+        d.on_title(Some("✳ 확인"));
+        assert_eq!(d.evaluate(None), Some(SessionStatus::Done));
+        assert_eq!(d.status_view(None).source, StatusSource::TerminalTitle);
+        assert_eq!(
+            d.evaluate(Some(
+                "Which option?\n❯ 1. A\nEnter to select · ↑/↓ to navigate · Esc to cancel"
+            )),
+            Some(SessionStatus::Waiting)
+        );
+
+        let mut exited = StatusDetector::new(StatusPatterns::compile(None, None, None, None));
+        exited.on_input();
+        let _ = exited.evaluate(None);
+        exited.on_title(Some("⠹ 작업"));
+        exited.on_title(Some("작업 | p"));
+        assert_eq!(exited.evaluate(None), Some(SessionStatus::Done));
+        exited.note_exit_sentinel(1);
+        assert_eq!(exited.evaluate(None), Some(SessionStatus::Error));
+        exited.on_title(Some("⠹ 작업"));
+        assert_eq!(
+            exited.evaluate(None),
+            None,
+            "종료 상태는 스피너로 풀리지 않는다"
+        );
     }
 
     #[test]

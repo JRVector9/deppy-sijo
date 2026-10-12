@@ -2452,6 +2452,27 @@ mod tests {
         );
     }
 
+    /// pane의 마지막 에이전트로 다시 띄우는 명령은 명령 없이 인자만 오거나 NUL을 품으면 거절한다.
+    #[test]
+    fn respawn_relaunch_fields_are_validated() {
+        let respawn =
+            |command: Option<&str>, args: Vec<String>| RuntimeCommand::RespawnArchivedAgent {
+                session: SessionId(1),
+                extra_args: vec!["resume".to_owned(), "x".to_owned()],
+                env_plain: Vec::new(),
+                relaunch_command: command.map(str::to_owned),
+                relaunch_args: args,
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            };
+        assert!(validate_host_command(&respawn(Some("/bin/sh"), vec!["-c".to_owned()])).is_ok());
+        assert!(validate_host_command(&respawn(None, Vec::new())).is_ok());
+        assert!(validate_host_command(&respawn(None, vec!["-c".to_owned()])).is_err());
+        assert!(validate_host_command(&respawn(Some("/bin/s\0h"), Vec::new())).is_err());
+        assert!(validate_host_command(&respawn(Some(""), Vec::new())).is_err());
+    }
+
     /// 폴백 셸 전달 값은 runtime 몫이라 외부 256개 한도에 꽉 찬 실행도 받아들인다.
     #[test]
     fn post_agent_shell_env_keeps_external_budget_and_bounds_its_own_count() {

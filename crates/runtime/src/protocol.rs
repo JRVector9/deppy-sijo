@@ -67,7 +67,8 @@ pub(crate) const PROTO_MAGIC: [u8; 4] = *b"DPRT";
 /// v27: bounded display history rows and distinct native/live window metadata.
 /// v28: bounded project-key exclusions in DotenvSourceSelection prevent inherited/source fallback.
 /// v29: SpawnAgent `transient_args` (not persisted) and RespawnArchivedAgent `env_plain`.
-pub(crate) const PROTO_VERSION: u16 = 29;
+/// v30: RespawnArchivedAgent `relaunch_command`/`relaunch_args` (pane의 마지막 에이전트로 재실행).
+pub(crate) const PROTO_VERSION: u16 = 30;
 
 /// delta viewport 스트리밍 기능 비트 (§3.1).
 pub(crate) const FEAT_DELTA_VIEWPORT: u32 = 1 << 0;
@@ -593,6 +594,7 @@ mod tests {
         assert!(protocol_source.contains("**v13**"));
         assert!(command_source.contains("excluded_names"));
         assert!(command_source.contains("transient_args"));
-        assert_eq!(PROTO_VERSION, 29);
+        assert!(command_source.contains("relaunch_command"));
+        assert_eq!(PROTO_VERSION, 30);
     }
 }

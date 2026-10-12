@@ -542,20 +542,33 @@ fn other_agent_kinds_from_rows(
             rows.iter()
                 .filter(|row| descendants.contains(&row.pid))
                 .find_map(|row| {
-                    let names: Vec<&str> = row
-                        .command
-                        .split_whitespace()
-                        .take(2)
-                        .filter_map(|token| Path::new(token).file_name()?.to_str())
-                        .collect();
+                    let name = other_agent_program_name(&row.command)?;
                     others
                         .iter()
                         .copied()
-                        .find(|kind| names.contains(&kind.detect_command()))
+                        .find(|kind| kind.detect_command() == name)
                 })
                 .map(|kind| (*sid, kind))
         })
         .collect()
+}
+
+/// 프로세스가 실행하는 프로그램 이름. 인터프리터(node·python 등)로 스크립트를 실행하면 그
+/// 스크립트 이름이다. argv[1]을 무조건 보면 `ssh amp`·`vim gemini`·`make goose`처럼 인자로 쓴
+/// 이름까지 에이전트로 잡았다(2026-10-12 리뷰).
+fn other_agent_program_name(command: &str) -> Option<&str> {
+    let mut tokens = command.split_whitespace();
+    let program = Path::new(tokens.next()?).file_name()?.to_str()?;
+    let interpreter = matches!(
+        program,
+        "node" | "nodejs" | "bun" | "deno" | "sh" | "bash" | "zsh"
+    ) || program.starts_with("python");
+    if !interpreter {
+        return Some(program);
+    }
+    // 인터프리터 플래그(`node --no-warnings x`)는 건너뛴다.
+    let script = tokens.find(|token| !token.starts_with('-'))?;
+    Path::new(script).file_name()?.to_str()
 }
 
 /// kind별 **강도 플래그 이름**. `agent_launcher`가 실제로 붙이는 이름과 짝이 맞아야 한다 —
@@ -4115,6 +4128,28 @@ mod tests {
             "Claude가 도는 세션은 연동 쪽"
         );
         assert_eq!(others.get(&SessionId(4)), None, "에이전트가 아닌 프로그램");
+
+        // 리뷰 지적: 인자로 쓴 이름은 에이전트가 아니다. 인터프리터의 스크립트만 본다.
+        for (command, program) in [
+            ("ssh amp", "ssh"),
+            ("vim /Users/jr/bin/gemini", "vim"),
+            ("make goose", "make"),
+            ("less qwen", "less"),
+        ] {
+            assert_eq!(
+                other_agent_program_name(command),
+                Some(program),
+                "{command}"
+            );
+        }
+        assert_eq!(
+            other_agent_program_name("node --no-warnings /opt/homebrew/bin/gemini -y"),
+            Some("gemini")
+        );
+        assert_eq!(
+            other_agent_program_name("/usr/bin/python3 /Users/jr/.local/bin/aider"),
+            Some("aider")
+        );
     }
 
     #[test]

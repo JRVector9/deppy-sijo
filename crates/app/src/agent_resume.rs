@@ -165,8 +165,9 @@ fn native_session_id_is_valid(session_id: &str) -> bool {
 }
 
 /// 저장된 agent 설정과 선택적인 CLI-native binding으로 정확/최근 재개 계획을 만든다.
-/// built-in agent의 provider와 binding kind가 다르면 오래되거나 잘못된 binding으로 보고
-/// 무시한다. custom agent는 검증된 binding kind가 유일한 provider 근거다.
+/// built-in agent의 provider와 binding kind가 다르면 이 계획에서는 무시한다 — pane의 마지막
+/// 에이전트로 바꿔 잇는 판단은 `switched_agent_id`가 따로 한다. custom agent는 검증된
+/// binding kind가 유일한 provider 근거다.
 pub(crate) fn resume_plan(agent_id: &str, binding: Option<(&str, &str)>) -> ResumePlan {
     match resolve_resume(agent_id, binding) {
         None => ResumePlan {
@@ -192,10 +193,14 @@ pub(crate) fn switched_agent_id(
     agent_id: &str,
     binding: Option<(&str, &str)>,
 ) -> Option<&'static str> {
-    let spawned = ResumeProvider::from_agent_id(agent_id)?;
+    // 내장 에이전트만 바꾼다(재개를 지원하지 않는 Cursor 등 포함). 사용자 정의 agent는
+    // binding 종류를 provider로 쓴다.
+    crate::agent_launcher::AgentKind::from_stable_config_id(agent_id)?;
+    let spawned = ResumeProvider::from_agent_id(agent_id);
     let (kind, session_id) = binding?;
     let bound = ResumeProvider::from_kind(kind)?;
-    (bound != spawned && native_session_id_is_valid(session_id)).then(|| bound.builtin_agent_id())
+    (Some(bound) != spawned && native_session_id_is_valid(session_id))
+        .then(|| bound.builtin_agent_id())
 }
 
 /// `resume_plan`이 이어 쓸 대화. 지원하지 않는 agent는 None.
@@ -233,7 +238,14 @@ fn resolve_resume<'a>(
         let provider = ResumeProvider::from_kind(kind)?;
         native_session_id_is_valid(session_id).then_some((provider, session_id))
     });
-    let provider = persisted_provider.or_else(|| binding.map(|(provider, _)| provider))?;
+    // 재개를 지원하지 않는 내장 에이전트(Cursor 등)에 다른 provider의 binding이 있어도 그
+    // provider의 재개 인자를 붙이지 않는다 — `cursor-agent … resume <codex id>`가 됐다.
+    let builtin = crate::agent_launcher::AgentKind::from_stable_config_id(agent_id).is_some();
+    let provider = persisted_provider.or_else(|| {
+        (!builtin)
+            .then(|| binding.map(|(provider, _)| provider))
+            .flatten()
+    })?;
     let session_id = binding
         .filter(|(binding_provider, _)| *binding_provider == provider)
         .map(|(_, session_id)| session_id);
@@ -322,6 +334,18 @@ mod tests {
         }
     }
 
+    /// 리뷰(실DB): Cursor pane에 codex binding이 있으면 `cursor-agent … resume <codex id>`를
+    /// 실행했다. 재개를 지원하지 않는 내장 에이전트는 남의 재개 인자를 붙이지 않는다.
+    #[test]
+    fn 재개_미지원_내장_에이전트는_다른_provider의_재개_인자를_붙이지_않는다() {
+        let plan = resume_plan(
+            "deppy-builtin-cursor",
+            Some(("codex", "01a0e853-0000-7000-8000-000000000000")),
+        );
+        assert_eq!(plan.mode, ResumeMode::Unsupported);
+        assert!(plan.extra_args.is_empty());
+    }
+
     #[test]
     fn custom_agent는_검증된_binding이_있을_때만_exact_resume한다() {
         let exact = resume_plan("custom-agent", Some(("claude", "custom-session")));
@@ -408,6 +432,11 @@ mod tests {
             None
         );
         assert_eq!(switched_agent_id("custom-agent", codex), None);
+        // 재개를 지원하지 않는 내장 에이전트도 마지막 binding 에이전트로 바꾼다.
+        assert_eq!(
+            switched_agent_id("deppy-builtin-cursor", codex),
+            Some("deppy-builtin-codex")
+        );
         assert_eq!(
             switched_agent_id("deppy-builtin-claude", Some(("codex", ""))),
             None

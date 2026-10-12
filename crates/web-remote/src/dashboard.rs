@@ -342,7 +342,19 @@ fn new_entry() -> SessionEntry {
 /// UUID를 모르는 세션(persist 없음)은 알림을 보내지 않는다 — 열어봐야 엉뚱한 곳이다.
 fn forward_to_push(push: &crate::push::PushHandle, ids: &IdMap, event: &RuntimeEvent) {
     let (session, status) = match event {
+        // 완료는 출처가 실린 상태 보기 이벤트로만 판단한다(런타임은 두 이벤트를 짝으로 낸다).
+        // 제목 스피너가 멈춘 턴 완료는 hook 턴 종료처럼 알리지 않는다.
+        RuntimeEvent::SessionStatusChanged {
+            status: SessionStatus::Done,
+            ..
+        } => return,
         RuntimeEvent::SessionStatusChanged { session, status } => (session.0, *status),
+        RuntimeEvent::SessionStatusViewChanged { view, .. }
+            if view.status == SessionStatus::Done
+                && view.source == runtime::StatusSource::TerminalTitle =>
+        {
+            return;
+        }
         RuntimeEvent::SessionStatusViewChanged { session, view } => (session.0, view.status),
         RuntimeEvent::SessionExited { session, .. } => (session.0, SessionStatus::Done),
         _ => return,

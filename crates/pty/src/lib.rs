@@ -3038,8 +3038,9 @@ mod tests {
     /// 실측(2026-08-18, docs/performance/2026-08-18-input-latency.md): `PTY_COALESCE_WAIT_MS`
     /// 2ms일 때 30샘플 전부 2.18~2.33ms(중앙값 2.28ms) — 뒤에 더 올 데이터가 없는데도
     /// 코얼레싱 대기를 매번 타임아웃까지 그대로 지불했다. 1ms로 낮춘 뒤 중앙값 1.19ms.
-    /// 이 테스트는 중앙값이 옛 동작(2ms 이상)으로 되돌아가지 않는지만 고정한다 — CI
-    /// 스케줄링 지터를 흡수하도록 널널한 상한(1.9ms)을 쓴다.
+    /// 옛 동작은 **모든** 샘플이 대기를 지불해 가장 빠른 샘플도 2.18ms 이상이었다. 그래서
+    /// 최솟값으로 회귀를 잡는다 — 중앙값은 공유 CI 러너의 스케줄링 지터로 2ms 근처까지
+    /// 밀려 회귀 없이도 자주 실패했다(2026-10-12 CI: 최솟값 1.2~1.4ms, 중앙값 ≈2.0ms).
     #[test]
     fn 고립된_1바이트_echo는_coalesce_대기_전체를_지불하지_않는다() {
         let mut session = spawn("/bin/cat", &[]);
@@ -3065,10 +3066,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         latencies.sort();
-        let median = latencies[latencies.len() / 2];
+        let fastest = latencies[0];
         assert!(
-            median < Duration::from_micros(1_900),
-            "고립 echo 중앙값이 옛 coalesce 대기(2ms)만큼 지연됨: {latencies:?}",
+            fastest < Duration::from_micros(1_900),
+            "가장 빠른 고립 echo도 옛 coalesce 대기(2ms)만큼 지연됨: {latencies:?}",
         );
         session.kill().unwrap();
     }

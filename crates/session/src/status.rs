@@ -267,6 +267,16 @@ fn title_needs_action(title: &str) -> bool {
     badge.trim().chars().count() <= 1 && tail.trim_start().starts_with("Action Required")
 }
 
+/// 에이전트 TUI가 제목 앞에 띄우는 작업 중 표시: Codex·Grok 점자 스피너(U+2800–28FF),
+/// Claude Code 반원 스피너(`◐◑◒◓`). 쉬는 동안은 `✳`이나 표시 없음.
+fn title_shows_work(title: &str) -> bool {
+    title
+        .trim_start()
+        .chars()
+        .next()
+        .is_some_and(|ch| matches!(ch, '\u{2801}'..='\u{28ff}' | '◐' | '◑' | '◒' | '◓'))
+}
+
 fn priority(status: SessionStatus) -> u8 {
     match status {
         SessionStatus::Error => 4,
@@ -355,6 +365,12 @@ pub struct StatusDetector {
     title_needs_action: bool,
     /// 현재 NeedsApproval이 제목에서 왔다 — 제목 표시가 사라지면 해제한다.
     title_derived: bool,
+    /// 제목이 작업 중 표시(스피너)를 띄우고 있다.
+    title_working: bool,
+    /// 작업 중 제목이 멈췄다 — 다음 평가에서 이번 턴을 완료로 본다.
+    title_turn_done: bool,
+    /// 현재 Done이 제목의 턴 종료에서 왔다 — 제목이 다시 작업 중이 되면 해제한다.
+    title_done_derived: bool,
 }
 
 impl StatusDetector {
@@ -381,6 +397,9 @@ impl StatusDetector {
             stats: StatusDetectorStats::default(),
             title_needs_action: false,
             title_derived: false,
+            title_working: false,
+            title_turn_done: false,
+            title_done_derived: false,
         }
     }
 
@@ -388,8 +407,20 @@ impl StatusDetector {
     /// 동안 제목 앞에 `[ ! ] Action Required`/`[ . ] Action Required`를 깜빡인다. 그 화면
     /// 문구(`? 1 question … to answer` 등)는 내장 패턴에 없고 제목 갱신이 출력을 계속 만들어
     /// idle도 오지 않아, 몇 시간이고 「실행 중」으로 보였다(2026-10-12 pane 로그).
+    ///
+    /// 작업 중 표시(Codex·Grok 점자 스피너, Claude `◐◑◒◓`)가 멈추면 턴이 끝난 것이다.
+    /// hook이 없는 에이전트도 「지시 대기」(10초 idle) 대신 바로 「완료」가 된다.
     pub fn on_title(&mut self, title: Option<&str>) {
-        self.title_needs_action = title.is_some_and(title_needs_action);
+        let needs_action = title.is_some_and(title_needs_action);
+        let working = title.is_some_and(title_shows_work);
+        if working {
+            self.title_turn_done = false;
+        } else if self.title_working && !needs_action && title.is_some() {
+            // 제목을 지운 것은 에이전트 종료 쪽 신호다(종료 코드가 따로 상태를 정한다).
+            self.title_turn_done = true;
+        }
+        self.title_working = working;
+        self.title_needs_action = needs_action;
     }
 
     /// 호출측이 `screen_text()`를 만들기 전에 묻는 비용 게이트.
@@ -772,6 +803,26 @@ impl StatusDetector {
                 self.status = SessionStatus::Running;
                 self.source = StatusSource::ScreenText;
             }
+        }
+        // 제목의 턴 종료 — 결과 상태라 Done/Error처럼 latch(입력·다음 턴 시작으로 해제).
+        if std::mem::take(&mut self.title_turn_done)
+            && matches!(self.status, SessionStatus::Running | SessionStatus::Idle)
+        {
+            self.status = SessionStatus::Done;
+            self.source = StatusSource::ScreenText;
+            self.screen_derived = false;
+            self.idle_waiting = false;
+            self.title_done_derived = true;
+        } else if self.title_working
+            && self.title_done_derived
+            && self.status == SessionStatus::Done
+        {
+            // 입력 없이 다음 턴이 시작됐다(대기열·자동 진행) — 다시 실행 중.
+            self.status = SessionStatus::Running;
+            self.source = StatusSource::ScreenText;
+        }
+        if self.status != SessionStatus::Done {
+            self.title_done_derived = false;
         }
         // idle: 어떤 신호도 없고 출력이 멎었으면 입력 대기 추정 (약한 신호 — 출력으로 해제)
         self.stats.idle_evaluations += 1;
@@ -1392,6 +1443,38 @@ mod tests {
         assert_eq!(d.evaluate(None), Some(SessionStatus::Running));
         d.on_title(None);
         assert_eq!(d.evaluate(None), None);
+    }
+
+    /// hook 없는 Codex·Claude도 제목 스피너가 멈추면 턴 완료다(전에는 10초 뒤 지시 대기뿐).
+    #[test]
+    fn 제목_스피너가_멈추면_완료이고_입력이나_다음_턴에_해제된다() {
+        let mut d = StatusDetector::new(StatusPatterns::compile(None, None, None, None));
+        d.on_title(Some("검토 | Design"));
+        assert_eq!(
+            d.evaluate(None),
+            None,
+            "작업한 적 없는 정지 제목은 완료가 아니다"
+        );
+
+        d.on_title(Some("⠹ 검토 | Design"));
+        d.on_title(Some("⠸ 검토 | Design"));
+        assert_eq!(d.evaluate(None), None);
+        d.on_title(Some("검토 | Design"));
+        assert_eq!(d.evaluate(None), Some(SessionStatus::Done));
+
+        // 입력 없이 다음 턴이 시작되면 다시 실행 중.
+        d.on_title(Some("⠋ 검토 | Design"));
+        assert_eq!(d.evaluate(None), Some(SessionStatus::Running));
+        d.on_title(Some("✳ 검토"));
+        assert_eq!(d.evaluate(None), Some(SessionStatus::Done));
+        // 사용자 입력도 해제한다.
+        d.on_input();
+        assert_eq!(d.evaluate(None), Some(SessionStatus::Running));
+
+        // 사용자 조치 대기로 바뀐 것은 턴 완료가 아니다.
+        d.on_title(Some("◐ 수정"));
+        d.on_title(Some("[ ! ] Action Required | 수정 | Design"));
+        assert_eq!(d.evaluate(None), Some(SessionStatus::NeedsApproval));
     }
 
     #[test]

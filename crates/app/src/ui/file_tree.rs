@@ -6312,13 +6312,11 @@ fn inactive_session_context_menu_items(
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct InactiveSessionMenuStyle {
-    min_width: f32,
     wrap_mode: egui::TextWrapMode,
 }
 
 fn inactive_session_menu_style() -> InactiveSessionMenuStyle {
     InactiveSessionMenuStyle {
-        min_width: super::context_menu::MIN_WIDTH,
         wrap_mode: egui::TextWrapMode::Extend,
     }
 }
@@ -6329,7 +6327,6 @@ fn live_session_context_menu_items<R>(
 ) -> egui::InnerResponse<R> {
     let menu_style = inactive_session_menu_style();
     super::context_menu::scope(ui, |ui| {
-        ui.set_min_width(menu_style.min_width);
         ui.style_mut().wrap_mode = Some(menu_style.wrap_mode);
         add_items(ui)
     })
@@ -15360,7 +15357,8 @@ mod tests {
         );
 
         harness.run();
-        assert!(harness.state().0 >= super::super::context_menu::MIN_WIDTH);
+        // 100pt 부모에 눌려 줄바꿈하지 않고 항목 길이만큼 넓어진다.
+        assert!(harness.state().0 > 100.0);
         assert!(harness.state().1, "menu scope did not use Extend wrapping");
         assert!(
             harness.state().2,
@@ -16596,7 +16594,6 @@ mod tests {
     fn inactive_session_menu_keeps_korean_labels_on_one_line() {
         let style = inactive_session_menu_style();
 
-        assert!((180.0..=205.0).contains(&style.min_width));
         assert_eq!(style.wrap_mode, egui::TextWrapMode::Extend);
     }
 

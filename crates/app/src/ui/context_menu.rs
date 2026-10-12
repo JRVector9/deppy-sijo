@@ -1,8 +1,9 @@
 //! Compact, title-free context menus. Callers own targets and effects.
 use egui::{Atom, Button, InnerResponse, Response, Ui, WidgetText};
 
-pub(crate) const MIN_WIDTH: f32 = 192.0;
-pub(crate) const ROW_GAP: f32 = 3.0;
+// 메뉴 폭은 고정 최소값 없이 가장 긴 항목에 맞춘다(2026-10-12 사용자: 짧은 메뉴에 빈 여백).
+pub(crate) const ROW_GAP: f32 = 7.0;
+const CORNER_RADIUS: u8 = 2;
 
 #[derive(Clone, Copy)]
 pub(crate) enum Icon {
@@ -27,6 +28,7 @@ fn compact_style(style: &mut egui::Style) {
     style.wrap_mode = Some(egui::TextWrapMode::Extend);
     style.spacing.item_spacing = egui::vec2(6.0, ROW_GAP);
     style.spacing.menu_margin = egui::Margin::same(4);
+    style.visuals.menu_corner_radius = egui::CornerRadius::same(CORNER_RADIUS);
 }
 
 pub(crate) fn show<R>(
@@ -44,16 +46,12 @@ pub(crate) fn show<R>(
     {
         popup = popup.open_memory(Some(egui::SetOpenCommand::Bool(true)));
     }
-    popup.show(|ui| {
-        ui.set_min_width(MIN_WIDTH);
-        contents(ui)
-    })
+    popup.show(contents)
 }
 
 pub(crate) fn scope<R>(ui: &mut Ui, contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R> {
     ui.scope(|ui| {
         compact_style(ui.style_mut());
-        ui.set_min_width(MIN_WIDTH);
         contents(ui)
     })
 }
@@ -101,10 +99,7 @@ pub(crate) fn submenu<R>(
 ) {
     let (response, _) = egui::containers::menu::SubMenuButton::new((icon_atom(ui), text.into()))
         .config(egui::containers::menu::MenuConfig::new().style(compact_style))
-        .ui(ui, |ui| {
-            ui.set_min_width(MIN_WIDTH);
-            contents(ui)
-        });
+        .ui(ui, contents);
     paint_icon(ui, &response, icon, false);
 }
 
@@ -249,5 +244,82 @@ fn paint_icon(ui: &Ui, response: &Response, icon: Icon, danger: bool) {
             line((8.0, 10.0), (5.0, 13.0));
             line((10.0, 13.0), (14.0, 13.0));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui_kittest::kittest::Queryable;
+
+    fn open_menu(labels: &'static [&'static str]) -> (egui::Rect, Vec<egui::Rect>) {
+        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
+            let target = ui.add(egui::Label::new("target").sense(egui::Sense::click()));
+            show(&target, |ui| {
+                for label in labels {
+                    let _ = button(ui, *label, Icon::Folder);
+                }
+            });
+        });
+        super::super::context_menu_audit::prepare(&harness.ctx);
+        harness.run();
+        let target = harness.get_by_label("target").rect().center();
+        harness.event(egui::Event::PointerMoved(target));
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos: target,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+            harness.step();
+        }
+        harness.run();
+        let menu = harness.ctx.memory(|memory| {
+            let layer = memory
+                .areas()
+                .top_layer_id(egui::Order::Foreground)
+                .expect("menu layer");
+            memory.area_rect(layer.id).expect("menu bounds")
+        });
+        let rows = labels
+            .iter()
+            .map(|label| harness.get_by_label(label).rect())
+            .collect();
+        (menu, rows)
+    }
+
+    /// 2026-10-12 사용자: 짧은 메뉴에 고정 최소 폭(192pt)만큼 빈 여백이 남았다. 메뉴는 가장 긴
+    /// 항목에 맞추고, 행 사이는 이전(3pt)보다 4pt 넓힌다.
+    #[test]
+    fn 메뉴_폭은_가장_긴_항목에_맞추고_행_간격을_넓힌다() {
+        let (menu, rows) = open_menu(&["새 폴더"]);
+        // 좌우 여백(menu_margin 4)과 테두리(1)만 남는다.
+        assert!(
+            (menu.width() - rows[0].width() - 10.0).abs() <= 1.0,
+            "menu {menu:?} row {:?}",
+            rows[0]
+        );
+        assert!(
+            menu.width() < 150.0,
+            "short menu kept a fixed width: {menu:?}"
+        );
+
+        let (wide, wide_rows) = open_menu(&["새 폴더", "파일 트리를 이 폴더로 이동"]);
+        assert!(wide.width() > menu.width());
+        assert!(wide_rows.iter().all(|row| wide.contains_rect(*row)));
+        let gap = wide_rows[1].top() - wide_rows[0].bottom();
+        assert!((gap - ROW_GAP).abs() < 0.5, "row gap {gap}");
+        assert_eq!(ROW_GAP, 7.0);
+    }
+
+    #[test]
+    fn 메뉴_모서리는_2pt로_둥글린다() {
+        let mut style = egui::Style::default();
+        compact_style(&mut style);
+        assert_eq!(
+            style.visuals.menu_corner_radius,
+            egui::CornerRadius::same(2)
+        );
     }
 }

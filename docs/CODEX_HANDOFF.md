@@ -1,3 +1,15 @@
+# 직접 실행한 agent가 상태 hook 없이 도는 문제 — 2026-10-12 (Claude Code)
+
+- 사용자 보고(스크린샷): 사이드바 세션이 「실행 중 · Codex」만 보이고 진행 중인 작업이 안 나온다.
+- 실제 상태: Design·nomorevibe pane은 Claude가 끝난 뒤의 폴백 셸(SHLVL=3)에서 사용자가 `codex resume`을 직접 실행. 두 프로세스 env에 `ZDOTDIR`·shim PATH가 없고 argv에 hook 인자도 없음 → Deppy hook 미보고. Codex 0.162.1은 rollout을 열어 두지 않고 `codex resume`(선택 화면)은 ID 인자가 없어 ee1789ef 이후 감지기도 binding을 못 만든다 → 작업 문구가 비었다. `~/.codex/hooks.json`은 Orca 것이라 무관.
+- 원인 1: 래퍼 `exec "${SHELL}"`의 폴백 셸이 에이전트 env(launch PATH, `ZDOTDIR` 없음)를 그대로 물려받는다. 셸 pane의 `extra_env`(shim PATH·ZDOTDIR)는 `prepare_agent_env`에 들어가지 않는다.
+- 원인 2: 일반 셸 pane도 사용자 `.zshrc`의 `export PATH="$HOME/.local/bin:$PATH"`가 shim 앞에 실제 CLI를 둔다(실측: `whence -p codex` → `~/.local/bin/codex`).
+- 수정: 래퍼 스크립트를 runtime `agent_wrapper`로 옮겨(`agent_then_shell_script`, `DRAIN_PENDING_TTY_INPUT`, `AGENT_SESSION_WRAPPER_NAME`) 앱 새 실행과 runtime 재실행이 같은 판을 쓴다. 재실행은 DB에 저장된 옛 래퍼를 지금 판으로 바꾼다. runtime은 에이전트 env에 셸 통합 값을 에이전트가 읽지 않는 `DEPPY_SHELL_ZDOTDIR`/`DEPPY_SHELL_USER_ZDOTDIR`와 `DEPPY_SHIM_DIR`로 넘기고, 래퍼는 에이전트가 끝난 뒤에만 `ZDOTDIR`를 되살려 셸을 연다. 앱 셸 env에 `DEPPY_SHIM_DIR` 추가, zsh 통합 `.zshrc`는 사용자 `.zshrc` 뒤 shim을 PATH 맨 앞으로 옮긴다(hook OFF면 변수 없음 → 그대로).
+- 검증: runtime `agent_wrapper` 3개(실제 `/bin/sh`로 에이전트엔 ZDOTDIR 없음·폴백 셸엔 복원 확인 포함)+respawn/spawn_agent 16 PASS. 앱 `agent_launcher::`/`env_reload::`(실제 zsh로 shim 우선 확인)/`agent_resume`/`archived_`/`shim` 112 PASS. 실제 사용자 `~/.zshrc`로 새 통합 e2e: `codex`/`claude` → `~/.deppy-sijo/shims/*`(현재는 `~/.local/bin/*`). fmt OK, `clippy -p runtime -p deppy-sijo --all-targets -D warnings` 0건, `xtask check-boundary` OK.
+- 한계: 지금 떠 있는 폴백 셸·codex 프로세스는 바뀌지 않는다(새 셸/재실행부터). zsh 전용(bash는 기존 PATH 주입만). 앱 재빌드·재실행·버전 올림은 이번 요청에 없어 하지 않았다.
+
+---
+
 # 열람 전용 agent pane 「이어서 실행」 중복 대화 fork — 2026-10-12 (Claude Code)
 
 - 사용자 보고: 0.11.0 재실행 뒤 「가장 마지막 상태가 저장되었다가 재시작되지 않는 것 같다」 → 「원인 찾으면 바로 수정해」.

@@ -155,51 +155,6 @@ const GROK_45_EFFORTS: &[ReasoningEffort] = &[
     ReasoningEffort::High,
 ];
 
-/// 에이전트가 끝나면 그 자리에 평범한 셸을 얹는 래퍼.
-///
-/// `stty sane` 뒤의 드레인 한 줄이 핵심이다. 에이전트 TUI는 터미널에 커서 위치(CPR
-/// `ESC[2;1R`), 전경·배경색(OSC 10/11), 장치 속성(DA `ESC[?6c`)을 **질의**하고, 우리
-/// 터미널이 그 **응답을 PTY 입력 쪽으로 되돌려 쓴다**. 에이전트가 응답을 읽기 전에
-/// 끝나면 그 바이트가 입력 버퍼에 남아, 뒤이어 뜬 셸이 사용자가 타이핑한 것으로
-/// 읽는다 — 실제로 `zsh: command not found: 1R10`처럼 깨진 명령이 실행됐다
-/// (2026-08-19 사용자 보고).
-///
-/// `stty sane`은 **모드만 되돌릴 뿐 남은 입력을 버리지 않는다**. 그래서 비정규 모드로
-/// 잠깐 두고(`min 0 time 1` = 최대 0.1초, 없으면 즉시 반환) 남은 바이트를 `dd`로 읽어
-/// 버린다. 그동안 `-echo`라 그 바이트가 화면에 얼룩으로 찍히지도 않는다. 실측으로
-/// 두 효과를 모두 확인했다(실제 CPR/OSC/DA 시퀀스를 PTY에 주입 → 잔여 입력 없음,
-/// 화면 출력 없음). `stty`가 없거나 실패하면 `&&`로 건너뛰어 기존 동작 그대로다.
-/// 남은 터미널 질의 응답을 버리는 조각. 스크립트와 테스트가 **같은 문자열**을 쓰도록
-/// 상수로 둔다 — 한쪽만 고치면 회귀를 못 잡는다.
-///
-/// `time 0`(기다리지 않음)인 이유: 이 드레인은 **이미 버퍼에 있는 것만** 버려야 한다.
-/// `time 1`(0.1초 대기)로 두면 그 사이에 사용자가 친 글자까지 함께 삼킨다 — 실측으로
-/// 확인했다(에이전트 종료 50ms 뒤 타이핑: `time 1`은 삼킴, `time 0`은 살아남음).
-/// 질의 응답은 우리 터미널이 질의를 파싱하는 즉시(= 에이전트가 살아 있을 때) 써 넣으므로
-/// 이 시점엔 이미 버퍼에 있고, `time 0`으로도 그대로 걸린다(실측: 잔여 입력 없음).
-#[cfg(unix)]
-const DRAIN_PENDING_TTY_INPUT: &str =
-    "stty -icanon -echo min 0 time 0 2>/dev/null && dd of=/dev/null bs=4096 count=1 2>/dev/null";
-
-/// `"$@"` 직후 `$?`(에이전트의 진짜 종료 코드 — 뒤이어 붙는 폴백 셸의 것이 아니다)를
-/// 잡아 sentinel 파일에 남긴다. 파일명은 이 래퍼 셸 자신의 PID(`$$`)로 결정되는데, 그
-/// PID는 runtime이 `process_identity()`로 이미 알고 있는 값과 정확히 같은 프로세스를
-/// 가리킨다(PTY가 직접 스폰하는 게 바로 이 `/bin/sh`) — 그래서 새 IPC 없이 파일 하나로
-/// 만난다. 경로 계산은 `session::agent_exit_sentinel_path`와 이 접두사를 공유한다
-/// (`DRAIN_PENDING_TTY_INPUT`과 같은 관례 — 한쪽만 고치면 서로 못 찾는다).
-///
-/// **화면에는 아무것도 안 남는다** — `printf`는 파일로만 쓰고, 실패해도(temp dir 없음
-/// 등) `|| true`로 조용히 넘어가 기존 동작(폴백 셸 진입)을 막지 않는다. 세션 로그
-/// redaction과도 무관하다 — PTY로 나가는 바이트가 아니라 파일 시스템 쓰기라 로그에
-/// 찍힐 게 없다.
-#[cfg(unix)]
-fn agent_then_shell_script() -> String {
-    let prefix = runtime::AGENT_EXIT_SENTINEL_PREFIX;
-    format!(
-        r#""$@"; __deppy_exit=$?; printf '%s' "$__deppy_exit" > "${{TMPDIR:-/tmp}}/{prefix}$$" 2>/dev/null || true; stty sane 2>/dev/null || true; {DRAIN_PENDING_TTY_INPUT}; stty sane 2>/dev/null || true; unset DEPPY_AGENT_EXECUTABLE DEPPY_SHIM_GUARD; exec "${{SHELL:-/bin/sh}}""#
-    )
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum AgentKind {
     Claude,
@@ -974,8 +929,8 @@ impl LaunchSpec {
 pub(crate) fn wrap_agent_then_shell(command: String, args: Vec<String>) -> (String, Vec<String>) {
     let mut wrapped_args = Vec::with_capacity(args.len() + 4);
     wrapped_args.push("-c".to_owned());
-    wrapped_args.push(agent_then_shell_script());
-    wrapped_args.push("deppy-agent-session".to_owned());
+    wrapped_args.push(runtime::agent_then_shell_script());
+    wrapped_args.push(runtime::AGENT_SESSION_WRAPPER_NAME.to_owned());
     wrapped_args.push(command);
     wrapped_args.extend(args);
     ("/bin/sh".to_owned(), wrapped_args)
@@ -1421,6 +1376,8 @@ fn valid_executable_string(path: &Path) -> Result<String, LaunchSpecErrorCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use runtime::{DRAIN_PENDING_TTY_INPUT, agent_then_shell_script};
 
     #[test]
     fn catalog_refresh_older_detection_cannot_consume_reopen_probes() {

@@ -2935,6 +2935,7 @@ impl Worker {
                     };
                 let id = SessionId(self.next_id);
                 self.next_id += 1;
+                env.extend(crate::agent_wrapper::post_agent_shell_env(&self.shell.env));
                 // 앱이 직접 띄운 에이전트에도 needsInput hook 키를 주입한다(셸과 동일 —
                 // 안 하면 Agents UI 실행 세션은 needsInput 미반영, codex Medium).
                 env.push(("DEPPY_SESSION_ID".to_owned(), self.session_key(id)));
@@ -4288,6 +4289,8 @@ impl Worker {
             self.reject_session_capacity(SpawnKind::Agent, correlation_id);
             return;
         }
+        // 예전 판 래퍼가 저장돼 있어도 지금 판으로 실행한다(폴백 셸의 셸 통합 복원).
+        crate::agent_wrapper::refresh_agent_wrapper(&command, &mut args);
         args.extend(extra_args);
         let (mut env, redaction_leases) = match self.prepare_agent_env(Vec::new(), Vec::new()) {
             Ok(prepared) => prepared,
@@ -4307,6 +4310,7 @@ impl Worker {
             .or_else(|| self.shell.cwd.clone());
         let id = SessionId(self.next_id);
         self.next_id += 1;
+        env.extend(crate::agent_wrapper::post_agent_shell_env(&self.shell.env));
         env.push(("DEPPY_SESSION_ID".to_owned(), self.session_key(id)));
         env.push(("DEPPY_RUNTIME_ID".to_owned(), self.instance_token.clone()));
         let spec = CommandSpec {

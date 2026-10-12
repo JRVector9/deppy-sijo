@@ -132,6 +132,11 @@ if [[ -f "$ZDOTDIR/.zshrc" ]]; then
 fi
 # 여기서부터 ZDOTDIR는 사용자 값 — 중첩 zsh는 재주입되지 않는다.
 
+# 사용자 .zshrc가 실제 claude/codex 경로를 PATH 앞에 다시 넣어도 상태 hook shim을 맨 앞에 둔다.
+if [[ -n "${DEPPY_SHIM_DIR:-}" && -d "$DEPPY_SHIM_DIR" ]]; then
+  path=("$DEPPY_SHIM_DIR" "${(@)path:#${(b)DEPPY_SHIM_DIR}}")
+fi
+
 # ── deppy prompt marks (OSC 133 — 셸 통합 1단계. zsh 전용, bash/fish는 후속) ──
 # 세션(워커)이 출력 스트림에서 133;A를 스캔해 프롬프트 점프(⌘⇧↑/↓)에 쓴다.
 # 이미 다른 셸 통합(iTerm2 등)이 등록한 훅이 OSC 133을 쏘면 중복 마크를 피해
@@ -494,6 +499,68 @@ print -r -- "value:$PLAIN deleted:${+REMOVE_ME}"
         assert!(text.contains("token:initial-protected-value"), "{text}");
         assert!(text.contains("public:initial-public-value"), "{text}");
         assert!(text.contains("value:second-value deleted:0"), "{text}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 2026-10-12: 사용자 .zshrc의 `export PATH="$HOME/.local/bin:$PATH"`가 shim을 가려
+    /// 직접 친 codex가 hook 없이 실행됐다. 통합 .zshrc는 사용자 설정 뒤 shim을 맨 앞에 둔다.
+    #[test]
+    fn 셸_통합은_사용자_zshrc_뒤에도_shim을_path_맨_앞에_둔다() {
+        if !Path::new("/bin/zsh").exists() {
+            return;
+        }
+        let dir = temp_path("shim-first");
+        let user = dir.join("user");
+        let real_bin = user.join("bin");
+        let shims = dir.join("shims");
+        std::fs::create_dir_all(&real_bin).unwrap();
+        std::fs::create_dir_all(&shims).unwrap();
+        for bin in [real_bin.join("codex"), shims.join("codex")] {
+            std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        std::fs::write(user.join(".zshrc"), "export PATH=\"$HOME/bin:$PATH\"\n").unwrap();
+        let rc = dir.join("test.zshrc");
+        std::fs::write(&rc, ZSHRC).unwrap();
+        let script = r#"
+builtin source "$TEST_RC"
+print -r -- "codex:$(whence -p codex)"
+hits=(${(M)path:#$DEPPY_SHIM_DIR})
+print -r -- "shims:${#hits}"
+"#;
+        let run = |shim_dir: Option<&Path>| {
+            let mut command = std::process::Command::new("/bin/zsh");
+            command
+                .arg("-fc")
+                .arg(script)
+                .env("HOME", &user)
+                .env("DEPPY_USER_ZDOTDIR", &user)
+                .env("TEST_RC", &rc)
+                .env("PATH", format!("{}:/usr/bin:/bin", shims.display()));
+            match shim_dir {
+                Some(shim_dir) => command.env("DEPPY_SHIM_DIR", shim_dir),
+                None => command.env_remove("DEPPY_SHIM_DIR"),
+            };
+            String::from_utf8_lossy(&command.output().unwrap().stdout).into_owned()
+        };
+
+        let with_shim = run(Some(&shims));
+        assert!(
+            with_shim.contains(&format!("codex:{}", shims.join("codex").display())),
+            "{with_shim}"
+        );
+        assert!(with_shim.contains("shims:1"), "{with_shim}");
+
+        // hook이 꺼져 DEPPY_SHIM_DIR가 없으면 사용자 PATH 순서를 그대로 둔다.
+        let without_shim = run(None);
+        assert!(
+            without_shim.contains(&format!("codex:{}", real_bin.join("codex").display())),
+            "{without_shim}"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -22013,6 +22013,8 @@ impl App {
         };
         let path = std::env::var("PATH").unwrap_or_default();
         env.push(("PATH".to_owned(), format!("{}:{path}", dir.display())));
+        // 사용자 .zshrc가 실제 CLI 경로를 PATH 앞에 다시 넣어도 zsh 통합이 shim을 맨 앞에 둔다.
+        env.push(("DEPPY_SHIM_DIR".to_owned(), dir.display().to_string()));
         env
     }
 

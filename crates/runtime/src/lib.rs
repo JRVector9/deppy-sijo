@@ -2,6 +2,7 @@
 //! UI는 RuntimeCommand를 보내고 RuntimeEvent를 받는다 —
 //! SessionManager/PTY/terminal backend를 직접 만지지 않는다.
 
+mod agent_wrapper;
 mod client;
 mod command;
 pub mod dotenv;
@@ -83,6 +84,9 @@ pub use terminal::{
     TerminalHistoryQuery, TerminalViewportSnapshot,
 };
 
+pub use agent_wrapper::AGENT_SESSION_WRAPPER_NAME;
+#[cfg(unix)]
+pub use agent_wrapper::{DRAIN_PENDING_TTY_INPUT, agent_then_shell_script};
 pub use session::{
     AGENT_EXIT_SENTINEL_PREFIX, SessionStatus, SessionStatusView, StatusConfidence, StatusSource,
     UserStatusOverride, agent_exit_sentinel_path,

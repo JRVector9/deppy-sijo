@@ -5202,6 +5202,7 @@ impl WorkspaceUi {
 
     /// Fleet 카드용 한 줄 작업 설명. `agent_info`는 warm 전환 뒤에도 마지막
     /// transcript 설명을 보존하므로 완료/종료 카드에도 새 파일 I/O 없이 쓸 수 있다.
+    /// hook·transcript 연결이 없는 에이전트는 그 pane의 터미널 제목에서 작업을 읽는다.
     pub fn agent_task_line_for(
         &self,
         session: SessionId,
@@ -5213,6 +5214,15 @@ impl WorkspaceUi {
             display.user_instruction.as_deref(),
             display.last_agent_summary.as_deref(),
         )
+        .or_else(|| {
+            let title = self.session_osc_title(Some(session))?;
+            let folder = self
+                .session_cwds
+                .get(&session)
+                .and_then(|cwd| Path::new(cwd).file_name()?.to_str());
+            let task = crate::fleet::task_from_terminal_title(&title, folder)?;
+            crate::fleet::task_preview(state, Some(&task), None)
+        })
     }
 
     pub fn last_input_submission(&self, session: SessionId) -> Option<i64> {
@@ -9342,12 +9352,20 @@ impl WorkspaceUi {
                 let info = pane.session_id.and_then(|s| self.agent_info.get(&s));
                 // 요약/요청이 없다는 이유로 새 세션으로 단정하지 않는다.
                 // transcript 미확인 세션도 기존 프로젝트/상태 설명을 유지한다.
+                let title_task = osc.as_deref().and_then(|title| {
+                    let folder = pane
+                        .session_id
+                        .and_then(|s| self.session_cwds.get(&s))
+                        .and_then(|cwd| Path::new(cwd).file_name()?.to_str());
+                    crate::fleet::task_from_terminal_title(title, folder)
+                });
                 let (agent_line, status_label, status_line) = match info {
                     Some(d) => (
                         Some(agent_info_line(d)),
                         Some(session_status_label(status, catalog)),
                         Some(agent_activity_line(
                             d,
+                            title_task.as_deref(),
                             project_context.as_deref(),
                             status,
                             catalog,
@@ -10159,8 +10177,11 @@ fn session_status_label(status: Option<runtime::SessionStatus>, catalog: &i18n::
     catalog.t(key, &[])
 }
 
+/// `title_task`는 hook·transcript 연결이 없는 에이전트가 터미널 제목에 띄운 작업이다
+/// (`crate::fleet::task_from_terminal_title`). 프로젝트명보다 실제 작업에 가깝다.
 fn agent_activity_line(
     display: &crate::agent_detect::AgentDisplay,
+    title_task: Option<&str>,
     project_context: Option<&str>,
     status: Option<runtime::SessionStatus>,
     catalog: &i18n::Catalog,
@@ -10178,6 +10199,9 @@ fn agent_activity_line(
         .filter(|instruction| !instruction.trim().is_empty())
     {
         return instruction.to_owned();
+    }
+    if let Some(task) = title_task.filter(|task| !task.trim().is_empty()) {
+        return task.to_owned();
     }
     if let Some(project) = project_context.filter(|project| !project.trim().is_empty()) {
         return project.to_owned();
@@ -18175,6 +18199,7 @@ mod tests {
         assert_eq!(
             agent_activity_line(
                 &display,
+                None,
                 Some("deppy-sijo"),
                 Some(SessionStatus::Running),
                 &catalog
@@ -18189,6 +18214,7 @@ mod tests {
         assert_eq!(
             agent_activity_line(
                 &waiting_for_first_response,
+                None,
                 Some("deppy-sijo"),
                 Some(SessionStatus::Running),
                 &catalog
@@ -18203,11 +18229,23 @@ mod tests {
         assert_eq!(
             agent_activity_line(
                 &no_transcript_context,
+                None,
                 Some("deppy-sijo"),
                 Some(SessionStatus::Running),
                 &catalog
             ),
             "deppy-sijo"
+        );
+        // 2026-10-12: hook 없이 직접 실행한 codex도 터미널 제목의 작업을 프로젝트명보다 먼저 보인다.
+        assert_eq!(
+            agent_activity_line(
+                &no_transcript_context,
+                Some("검토해 PF별 개선사항 보고"),
+                Some("deppy-sijo"),
+                Some(SessionStatus::Running),
+                &catalog
+            ),
+            "검토해 PF별 개선사항 보고"
         );
         assert_eq!(
             session_status_label(Some(SessionStatus::Idle), &catalog),

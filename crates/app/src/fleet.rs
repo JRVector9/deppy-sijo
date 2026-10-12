@@ -301,6 +301,69 @@ pub fn task_preview(
     Some(preview)
 }
 
+/// 에이전트 TUI가 터미널 제목(OSC 0/2)에 띄운 작업 제목. hook·transcript 연결이 없는
+/// 에이전트(직접 친 `codex resume` 등)도 진행 중인 작업을 보여줄 수 있다. 제목은 그 pane의
+/// PTY가 낸 것이라 다른 pane이나 외부 세션의 대화가 섞이지 않는다.
+///
+/// 2026-10-12 실측 형식 — Codex: `⠹ <제목> | <폴더>`, 승인 대기 `[ ! ] Action Required |
+/// <제목> | <폴더>`, 제목 전 `⠹ <폴더>`. Claude Code: `◐ <요약>`/`✳ <요약>`, 요약 전
+/// `✳ Claude Code`. 상태 기호·끝의 폴더 칸·일반 이름은 작업이 아니므로 버린다.
+pub fn task_from_terminal_title(title: &str, folder: Option<&str>) -> Option<String> {
+    const GENERIC_TITLES: [&str; 3] = ["Claude Code", "Codex", "OpenAI Codex"];
+    let title = title.trim();
+    let task = match title.rsplit_once(" | ") {
+        // Codex는 마지막 칸에 폴더명을 붙인다. 폴더를 알면 같을 때만 뗀다.
+        Some((head, last)) if folder.is_none_or(|folder| last.trim() == folder) => {
+            strip_title_status(head)
+        }
+        _ => strip_title_status(title),
+    };
+    let is_generic = GENERIC_TITLES
+        .iter()
+        .any(|generic| task.eq_ignore_ascii_case(generic))
+        || folder.is_some_and(|folder| task == folder);
+    (!task.is_empty() && !is_generic).then(|| task.to_owned())
+}
+
+/// 제목 앞의 진행 표시(점자 스피너·원 기호 등)와 `[ ! ] Action Required |` 같은 상태 칸.
+fn strip_title_status(title: &str) -> &str {
+    let mut rest = title.trim();
+    loop {
+        if let Some(after) = rest.strip_prefix('[')
+            && let Some((badge, tail)) = after.split_once(']')
+            && badge.trim().chars().count() <= 1
+        {
+            let Some((_, task)) = tail.split_once(" | ") else {
+                return "";
+            };
+            rest = task.trim_start();
+            continue;
+        }
+        let mut chars = rest.chars();
+        match chars.next() {
+            Some(
+                '\u{2800}'..='\u{28ff}'
+                | '◐'
+                | '◑'
+                | '◒'
+                | '◓'
+                | '✳'
+                | '✻'
+                | '✽'
+                | '✶'
+                | '✢'
+                | '·'
+                | '●'
+                | '○'
+                | '◇'
+                | '◆'
+                | '⏺',
+            ) => rest = chars.as_str().trim_start(),
+            _ => return rest.trim_end(),
+        }
+    }
+}
+
 /// A borrowed ordering for painting; session titles and task text stay in their source vector.
 pub fn group_session_refs(sessions: &[FleetSession]) -> [Vec<&FleetSession>; 4] {
     let mut groups: [Vec<&FleetSession>; 4] = Default::default();
@@ -363,6 +426,73 @@ pub fn format_blocked_duration(now: i64, since: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 2026-10-12 사용자 pane 로그의 실제 제목들.
+    #[test]
+    fn 터미널_제목에서_상태_기호와_폴더_칸을_떼고_작업만_남긴다() {
+        let cases = [
+            (
+                "⠹ 검토해 PF별 개선사항 보고 | Design",
+                Some("Design"),
+                Some("검토해 PF별 개선사항 보고"),
+            ),
+            (
+                "검토해 PF별 개선사항 보고 | Design",
+                Some("Design"),
+                Some("검토해 PF별 개선사항 보고"),
+            ),
+            (
+                "[ ! ] Action Required | 프로젝트 실행 | anydoc",
+                Some("anydoc"),
+                Some("프로젝트 실행"),
+            ),
+            (
+                "[ . ] Action Required | 프로젝트 실행 | anydoc",
+                None,
+                Some("프로젝트 실행"),
+            ),
+            (
+                "◐ 코인 검색 화면 겹침 수정",
+                None,
+                Some("코인 검색 화면 겹침 수정"),
+            ),
+            (
+                "✳ 코인 검색 화면 겹침 수정",
+                Some("coin"),
+                Some("코인 검색 화면 겹침 수정"),
+            ),
+            // 폴더를 모르면 Codex 관례대로 마지막 칸을 폴더로 본다.
+            (
+                "⠋ 재실행하고 경계 마감 | FieldAI",
+                None,
+                Some("재실행하고 경계 마감"),
+            ),
+            // 마지막 칸이 이 pane의 폴더가 아니면 제목의 일부다.
+            ("A | B", Some("Design"), Some("A | B")),
+        ];
+        for (title, folder, expected) in cases {
+            assert_eq!(
+                task_from_terminal_title(title, folder).as_deref(),
+                expected,
+                "{title}"
+            );
+        }
+    }
+
+    #[test]
+    fn 제목이_아직_없거나_일반_이름이면_작업으로_보지_않는다() {
+        for (title, folder) in [
+            ("⠹ anydoc", Some("anydoc")),
+            ("anydoc", Some("anydoc")),
+            ("⠹ ⠧ | anydoc", Some("anydoc")),
+            ("✳ Claude Code", None),
+            ("codex", None),
+            ("", None),
+            ("[ ! ] Action Required", None),
+        ] {
+            assert_eq!(task_from_terminal_title(title, folder), None, "{title}");
+        }
+    }
 
     #[test]
     fn running_card_names_the_current_user_task() {

@@ -133,8 +133,9 @@ fi
 # 여기서부터 ZDOTDIR는 사용자 값 — 중첩 zsh는 재주입되지 않는다.
 
 # 사용자 .zshrc가 실제 claude/codex 경로를 PATH 앞에 다시 넣어도 상태 hook shim을 맨 앞에 둔다.
+# 사용자 rc가 켠 옵션(ksharrays 등)이 배열 해석을 바꾸지 않게 zsh 기본 옵션 안에서 고친다.
 if [[ -n "${DEPPY_SHIM_DIR:-}" && -d "$DEPPY_SHIM_DIR" ]]; then
-  path=("$DEPPY_SHIM_DIR" "${(@)path:#${(b)DEPPY_SHIM_DIR}}")
+  () { emulate -L zsh; path=("$DEPPY_SHIM_DIR" "${(@)path:#$DEPPY_SHIM_DIR}"); }
 fi
 
 # ── deppy prompt marks (OSC 133 — 셸 통합 1단계. zsh 전용, bash/fish는 후속) ──
@@ -523,16 +524,15 @@ print -r -- "value:$PLAIN deleted:${+REMOVE_ME}"
                 std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
             }
         }
-        std::fs::write(user.join(".zshrc"), "export PATH=\"$HOME/bin:$PATH\"\n").unwrap();
         let rc = dir.join("test.zshrc");
         std::fs::write(&rc, ZSHRC).unwrap();
         let script = r#"
 builtin source "$TEST_RC"
 print -r -- "codex:$(whence -p codex)"
-hits=(${(M)path:#$DEPPY_SHIM_DIR})
-print -r -- "shims:${#hits}"
+print -r -- "path:$PATH"
 "#;
-        let run = |shim_dir: Option<&Path>| {
+        let run = |user_rc: &str, shim_dir: Option<&Path>| {
+            std::fs::write(user.join(".zshrc"), user_rc).unwrap();
             let mut command = std::process::Command::new("/bin/zsh");
             command
                 .arg("-fc")
@@ -540,23 +540,36 @@ print -r -- "shims:${#hits}"
                 .env("HOME", &user)
                 .env("DEPPY_USER_ZDOTDIR", &user)
                 .env("TEST_RC", &rc)
-                .env("PATH", format!("{}:/usr/bin:/bin", shims.display()));
+                .env("PATH", format!("{}:/usr/bin:/bin", shims.display()))
+                .env_remove("DEPPY_ENV_LIVE_RELOAD")
+                .env_remove("DEPPY_PROJECT_ROOT");
             match shim_dir {
                 Some(shim_dir) => command.env("DEPPY_SHIM_DIR", shim_dir),
                 None => command.env_remove("DEPPY_SHIM_DIR"),
             };
             String::from_utf8_lossy(&command.output().unwrap().stdout).into_owned()
         };
+        let prepend = "export PATH=\"$HOME/bin:$PATH\"\n";
 
-        let with_shim = run(Some(&shims));
-        assert!(
-            with_shim.contains(&format!("codex:{}", shims.join("codex").display())),
-            "{with_shim}"
-        );
-        assert!(with_shim.contains("shims:1"), "{with_shim}");
+        // 사용자 rc가 ksharrays를 켜 둬도 PATH 나머지를 잃지 않는다(리뷰 지적 재현).
+        for user_rc in [prepend.to_owned(), format!("setopt ksharrays\n{prepend}")] {
+            let with_shim = run(&user_rc, Some(&shims));
+            assert!(
+                with_shim.contains(&format!("codex:{}", shims.join("codex").display())),
+                "{user_rc}: {with_shim}"
+            );
+            assert!(
+                with_shim.contains(&format!(
+                    "path:{}:{}:/usr/bin:/bin\n",
+                    shims.display(),
+                    real_bin.display()
+                )),
+                "{user_rc}: {with_shim}"
+            );
+        }
 
         // hook이 꺼져 DEPPY_SHIM_DIR가 없으면 사용자 PATH 순서를 그대로 둔다.
-        let without_shim = run(None);
+        let without_shim = run(prepend, None);
         assert!(
             without_shim.contains(&format!("codex:{}", real_bin.join("codex").display())),
             "{without_shim}"

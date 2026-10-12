@@ -6,7 +6,19 @@
 - 원인 2: 일반 셸 pane도 사용자 `.zshrc`의 `export PATH="$HOME/.local/bin:$PATH"`가 shim 앞에 실제 CLI를 둔다(실측: `whence -p codex` → `~/.local/bin/codex`).
 - 수정: 래퍼 스크립트를 runtime `agent_wrapper`로 옮겨(`agent_then_shell_script`, `DRAIN_PENDING_TTY_INPUT`, `AGENT_SESSION_WRAPPER_NAME`) 앱 새 실행과 runtime 재실행이 같은 판을 쓴다. 재실행은 DB에 저장된 옛 래퍼를 지금 판으로 바꾼다. runtime은 에이전트 env에 셸 통합 값을 에이전트가 읽지 않는 `DEPPY_SHELL_ZDOTDIR`/`DEPPY_SHELL_USER_ZDOTDIR`와 `DEPPY_SHIM_DIR`로 넘기고, 래퍼는 에이전트가 끝난 뒤에만 `ZDOTDIR`를 되살려 셸을 연다. 앱 셸 env에 `DEPPY_SHIM_DIR` 추가, zsh 통합 `.zshrc`는 사용자 `.zshrc` 뒤 shim을 PATH 맨 앞으로 옮긴다(hook OFF면 변수 없음 → 그대로).
 - 검증: runtime `agent_wrapper` 3개(실제 `/bin/sh`로 에이전트엔 ZDOTDIR 없음·폴백 셸엔 복원 확인 포함)+respawn/spawn_agent 16 PASS. 앱 `agent_launcher::`/`env_reload::`(실제 zsh로 shim 우선 확인)/`agent_resume`/`archived_`/`shim` 112 PASS. 실제 사용자 `~/.zshrc`로 새 통합 e2e: `codex`/`claude` → `~/.deppy-sijo/shims/*`(현재는 `~/.local/bin/*`). fmt OK, `clippy -p runtime -p deppy-sijo --all-targets -D warnings` 0건, `xtask check-boundary` OK.
-- 한계: 지금 떠 있는 폴백 셸·codex 프로세스는 바뀌지 않는다(새 셸/재실행부터). zsh 전용(bash는 기존 PATH 주입만). 앱 재빌드·재실행·버전 올림은 이번 요청에 없어 하지 않았다.
+- 한계: 지금 떠 있는 폴백 셸·codex 프로세스는 바뀌지 않는다(새 셸/재실행부터). 앱 재빌드·재실행·버전 올림은 이번 요청에 없어 하지 않았다.
+
+## 후속: hook 없이도 작업 문구 표시 + 병렬 코드 리뷰 반영
+
+- 사용자 「이어서 실행 안 해도 당연히 작업 문구가 보여야」 → hook·binding 없이도 보이게 했다. Codex 0.162 TUI(`--no-daemon` 없이)는 화면만 맡고 대화는 공유 daemon(`codex app-server --managed-daemon`, VS Code 등도 붙음)에서 돈다 — TUI는 rollout을 열지 않고 `~/.codex/logs_2.sqlite`에도 thread_id를 남기지 않아 pane↔대화 소유 증명이 불가능. 대신 TUI가 자기 PTY에 내는 터미널 제목(OSC 0)을 쓴다: Codex `⠹ <제목> | <폴더>`/`[ ! ] Action Required | <제목> | <폴더>`, Claude `◐/✳ <요약>`(pane 로그 실측). `fleet::task_from_terminal_title`이 상태 기호·끝 폴더 칸·일반 이름(`✳ Claude Code`, 제목 전 `⠹ <폴더>`)을 버린다. 사이드바 `agent_activity_line`(요약 → 지시 → **제목 작업** → 프로젝트명)과 Fleet `agent_task_line_for` 폴백에 연결. 그 pane PTY가 낸 값이라 다른 pane·외부 세션이 섞이지 않는다.
+- 리뷰(서브에이전트 3개, opus) 반영:
+  - zsh 통합 PATH 재배치가 사용자 rc의 `ksharrays`에서 PATH를 2칸으로 잘랐다(재현 확인) → `() { emulate -L zsh; … }` 안에서 하고 `(b)` 제거. 테스트가 PATH 전체와 ksharrays 경우를 확인.
+  - 비zsh 폴백 셸도 shim을 쓰게 래퍼가 `DEPPY_SHIM_DIR`를 PATH 앞에 둔다(zsh는 통합이 중복 제거).
+  - 폴백 셸 전달 env 3개를 runtime 몫으로 외부 256개 예산에서 뺐다(`POST_AGENT_SHELL_ENV_NAMES`, 자체 상한 3). 에이전트 안에서 띄운 Deppy가 부모 값을 쓰지 않게 `pty::INHERITED_AGENT_SESSION_VARS`에 추가.
+  - 「이어서 실행」 경합: binding 감지(2.5초 주기) 전에 두 pane을 연달아 누르면 둘 다 원본을 이었다 → 원본을 잇게 보낸 재개를 60초 동안 실행 중으로 기록(`archived_respawns_in_flight`, 최대 64, 복원 재적재 때 비움). Work History 「새 pane에서 이어서 하기」도 같은 규칙으로 fork.
+  - 래퍼 테스트가 새로 쓴 실행 파일을 바로 exec하던 것(ETXTBSY 위험)을 stdin 명령 `/bin/sh`로 바꿨다. 옮긴 뒤 낡은 주석 2곳 수정.
+  - 남긴 것: 최근 폴더 재개(`-c`)가 다른 폴더의 같은 provider에도 fork(보수적), zsh 재배치는 rc 시점 1회(이후 precmd가 PATH를 바꾸면 다시 가려질 수 있음), 사용자 정의 agent가 우연히 래퍼 모양이면 스크립트가 바뀜(가능성 낮음), Work History 새 pane 경로의 기존 `resume X` 이중 덧붙임.
+- 검증: runtime 19(`agent_wrapper`·env 예산·respawn/spawn_agent), pty 1(상속 변수 제거), 앱 186 PASS/3 ignored(`agent_resume`·`archived_`·`fleet::`·`env_reload::`·`agent_launcher::`·`agent_info_line`·`shim`). fmt OK, `clippy -p runtime -p pty -p session -p deppy-sijo --all-targets -D warnings` 0건, `xtask check-boundary` OK.
 
 ---
 

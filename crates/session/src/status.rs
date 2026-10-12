@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// 에이전트 종료 코드 sentinel 파일 이름 접두사. `agent_launcher`의 래퍼 스크립트(셸)와
+/// 에이전트 종료 코드 sentinel 파일 이름 접두사. runtime `agent_wrapper`의 래퍼 스크립트(셸)와
 /// runtime worker(Rust) 양쪽이 **같은 문자열**로 파일 경로를 계산해야 하므로 상수로 공유한다
 /// (`DRAIN_PENDING_TTY_INPUT`과 같은 관례) — 한쪽만 고치면 sentinel을 서로 못 찾는다.
 pub const AGENT_EXIT_SENTINEL_PREFIX: &str = "deppy-agent-exit-";

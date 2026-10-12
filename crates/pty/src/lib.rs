@@ -247,6 +247,11 @@ pub const INHERITED_AGENT_SESSION_VARS: &[&str] = &[
     "CLAUDE_PID",
     // 부모 세션의 추론 강도 — 상속되면 사용자가 고르지 않은 값으로 에이전트가 뜬다.
     "CLAUDE_EFFORT",
+    // Deppy runtime이 폴백 셸에 넘기는 값 — 에이전트 안에서 띄운 Deppy가 부모 값을 쓰지 않게
+    // 지우고 spec env로만 다시 넣는다(runtime agent_wrapper).
+    "DEPPY_SHELL_ZDOTDIR",
+    "DEPPY_SHELL_USER_ZDOTDIR",
+    "DEPPY_SHIM_DIR",
     // Codex — 부모 스레드 식별자와 내부 오버라이드.
     "CODEX_THREAD_ID",
     "CODEX_INTERNAL_ORIGINATOR_OVERRIDE",

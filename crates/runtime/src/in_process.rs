@@ -12865,8 +12865,8 @@ mod tests {
         });
     }
 
-    /// agent_launcher::wrap_agent_then_shell이 만드는 것과 동등한 스크립트(app crate라
-    /// 여기서 직접 참조는 못 하지만 같은 형태)로 exit sentinel 경로를 진짜 PTY로 고정한다.
+    /// `agent_wrapper::agent_then_shell_script`와 같은 형태의 스크립트(폴백 셸만 sleep으로
+    /// 바꾼 것)로 exit sentinel 경로를 진짜 PTY로 고정한다.
     /// 폴백 셸은 일부러 오래 살려 둔다(sleep) — SessionExited가 오기 훨씬 전에, 에이전트
     /// 자신의 종료 코드(0이 아님)로 Error가 즉시 반영돼야 한다는 게 이 테스트의 요점.
     #[test]

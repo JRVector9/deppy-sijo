@@ -257,6 +257,8 @@ pub(crate) fn validate_launch_spec(
 /// Launch specs reserve exactly one runtime-owned environment slot outside the external 256-item
 /// admission budget. This keeps an exact-limit caller valid after `DEPPY_SESSION_ID` injection,
 /// while still bounding and validating the internal key/value before process creation.
+/// The post-agent fallback-shell values (`agent_wrapper::POST_AGENT_SHELL_ENV_NAMES`) are also
+/// runtime-owned and bounded by their own small count.
 pub(crate) fn validate_launch_spec_with_internal_env(
     program: &str,
     args: &[String],
@@ -273,6 +275,7 @@ pub(crate) fn validate_launch_spec_with_internal_env(
     let mut external_bytes = 0usize;
     let mut internal_items = 0usize;
     let mut runtime_items = 0usize;
+    let mut shell_items = 0usize;
     for (key, value) in env {
         if !validate_env_key(key) || !bounded_nul_free(value, ENV_VALUE_BYTES_MAX, false) {
             return Err(admission_error("runtime_env_plain_invalid"));
@@ -280,6 +283,13 @@ pub(crate) fn validate_launch_spec_with_internal_env(
         if key == "DEPPY_RUNTIME_ID" {
             runtime_items += 1;
             if runtime_items > 1 || !bounded_nul_free(value, 128, true) {
+                return Err(admission_error("runtime_internal_env_invalid"));
+            }
+            continue;
+        }
+        if crate::agent_wrapper::POST_AGENT_SHELL_ENV_NAMES.contains(&key.as_str()) {
+            shell_items += 1;
+            if shell_items > crate::agent_wrapper::POST_AGENT_SHELL_ENV_NAMES.len() {
                 return Err(admission_error("runtime_internal_env_invalid"));
             }
             continue;
@@ -2360,6 +2370,25 @@ mod tests {
                 .is_ok()
         );
         env.push(("DEPPY_RUNTIME_ID".into(), "other-runtime".into()));
+        assert!(
+            validate_launch_spec_with_internal_env("x", &[], &env, None, "DEPPY_SESSION_ID")
+                .is_err()
+        );
+    }
+
+    /// 폴백 셸 전달 값은 runtime 몫이라 외부 256개 한도에 꽉 찬 실행도 받아들인다.
+    #[test]
+    fn post_agent_shell_env_keeps_external_budget_and_bounds_its_own_count() {
+        let mut env = vec![("K".to_owned(), String::new()); ENV_ITEMS_MAX];
+        env.push(("DEPPY_SESSION_ID".into(), "ws:1".into()));
+        for name in crate::agent_wrapper::POST_AGENT_SHELL_ENV_NAMES {
+            env.push((name.to_owned(), "/h/value".into()));
+        }
+        assert!(
+            validate_launch_spec_with_internal_env("x", &[], &env, None, "DEPPY_SESSION_ID")
+                .is_ok()
+        );
+        env.push(("DEPPY_SHIM_DIR".into(), "/h/again".into()));
         assert!(
             validate_launch_spec_with_internal_env("x", &[], &env, None, "DEPPY_SESSION_ID")
                 .is_err()

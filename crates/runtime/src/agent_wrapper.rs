@@ -12,8 +12,16 @@ const POST_AGENT_SHELL_ENV: [(&str, &str); 2] = [
     ("DEPPY_USER_ZDOTDIR", "DEPPY_SHELL_USER_ZDOTDIR"),
 ];
 
-/// 일반 셸 pane과 같은 shim 우선 순위를 쓰도록 Deppy zsh 통합이 읽는 shim 디렉터리.
+/// 일반 셸 pane과 같은 shim 우선 순위를 쓰도록 폴백 셸 PATH 앞에 둘 shim 디렉터리.
 const SHIM_DIR_ENV: &str = "DEPPY_SHIM_DIR";
+
+/// runtime이 에이전트 env에 넣는 폴백 셸 전달 값. 외부 env 예산(256개) 밖의 runtime 몫이고,
+/// 부모 Deppy에서 상속된 값은 PTY spawn 때 지운다(`pty::INHERITED_AGENT_SESSION_VARS`).
+pub(crate) const POST_AGENT_SHELL_ENV_NAMES: [&str; 3] = [
+    "DEPPY_SHELL_ZDOTDIR",
+    "DEPPY_SHELL_USER_ZDOTDIR",
+    SHIM_DIR_ENV,
+];
 
 /// 에이전트가 끝나면 그 자리에 평범한 셸을 얹는 래퍼.
 ///
@@ -53,13 +61,14 @@ pub const DRAIN_PENDING_TTY_INPUT: &str =
 /// redaction과도 무관하다 — PTY로 나가는 바이트가 아니라 파일 시스템 쓰기라 로그에
 /// 찍힐 게 없다.
 ///
-/// 폴백 셸은 에이전트 env를 물려받으므로 셸 통합(`ZDOTDIR`)을 `DEPPY_SHELL_*`에서 되살린
-/// 뒤 연다. 안 하면 그 셸에서 직접 친 `claude`/`codex`가 shim을 거치지 않아 hook이 없다.
+/// 폴백 셸은 에이전트 env를 물려받으므로 셸 통합(`ZDOTDIR`)을 `DEPPY_SHELL_*`에서 되살리고
+/// shim을 PATH 앞에 둔 뒤 연다. 안 하면 그 셸에서 직접 친 `claude`/`codex`가 shim을 거치지
+/// 않아 hook이 없다. zsh 통합은 사용자 rc 뒤에 shim을 다시 맨 앞으로 옮기고 중복을 지운다.
 #[cfg(unix)]
 pub fn agent_then_shell_script() -> String {
     let prefix = session::AGENT_EXIT_SENTINEL_PREFIX;
     format!(
-        r#""$@"; __deppy_exit=$?; printf '%s' "$__deppy_exit" > "${{TMPDIR:-/tmp}}/{prefix}$$" 2>/dev/null || true; stty sane 2>/dev/null || true; {DRAIN_PENDING_TTY_INPUT}; stty sane 2>/dev/null || true; unset DEPPY_AGENT_EXECUTABLE DEPPY_SHIM_GUARD; if [ -n "${{DEPPY_SHELL_ZDOTDIR:-}}" ]; then ZDOTDIR="$DEPPY_SHELL_ZDOTDIR"; export ZDOTDIR; fi; if [ -n "${{DEPPY_SHELL_USER_ZDOTDIR:-}}" ]; then DEPPY_USER_ZDOTDIR="$DEPPY_SHELL_USER_ZDOTDIR"; export DEPPY_USER_ZDOTDIR; fi; unset DEPPY_SHELL_ZDOTDIR DEPPY_SHELL_USER_ZDOTDIR; exec "${{SHELL:-/bin/sh}}""#
+        r#""$@"; __deppy_exit=$?; printf '%s' "$__deppy_exit" > "${{TMPDIR:-/tmp}}/{prefix}$$" 2>/dev/null || true; stty sane 2>/dev/null || true; {DRAIN_PENDING_TTY_INPUT}; stty sane 2>/dev/null || true; unset DEPPY_AGENT_EXECUTABLE DEPPY_SHIM_GUARD; if [ -n "${{DEPPY_SHELL_ZDOTDIR:-}}" ]; then ZDOTDIR="$DEPPY_SHELL_ZDOTDIR"; export ZDOTDIR; fi; if [ -n "${{DEPPY_SHELL_USER_ZDOTDIR:-}}" ]; then DEPPY_USER_ZDOTDIR="$DEPPY_SHELL_USER_ZDOTDIR"; export DEPPY_USER_ZDOTDIR; fi; unset DEPPY_SHELL_ZDOTDIR DEPPY_SHELL_USER_ZDOTDIR; if [ -n "${{DEPPY_SHIM_DIR:-}}" ] && [ -d "$DEPPY_SHIM_DIR" ]; then PATH="$DEPPY_SHIM_DIR:$PATH"; export PATH; fi; exec "${{SHELL:-/bin/sh}}""#
     )
 }
 
@@ -151,10 +160,11 @@ mod tests {
     }
 
     /// 실제 `/bin/sh`로 래퍼를 돌려 확인한다 — 에이전트에는 `ZDOTDIR`가 없고, 폴백 셸에는
-    /// 되살아나며 전달 이름은 남지 않는다.
+    /// 되살아나며 shim이 PATH 맨 앞에 오고 전달 이름은 남지 않는다. 폴백 셸은 stdin으로
+    /// 명령을 받는 `/bin/sh`라 실행 파일을 새로 쓰지 않는다(ETXTBSY 경합 없음).
     #[test]
     fn 폴백_셸만_셸_통합_env를_되살려_연다() {
-        use std::os::unix::fs::PermissionsExt as _;
+        use std::io::Write as _;
         let dir = std::env::temp_dir().join(format!(
             "deppy-agent-wrapper-{}-{}",
             std::process::id(),
@@ -163,16 +173,10 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let fallback_shell = dir.join("fallback-shell");
-        std::fs::write(
-            &fallback_shell,
-            "#!/bin/sh\nprintf 'shell:%s:%s:%s' \"${ZDOTDIR:-none}\" \"${DEPPY_USER_ZDOTDIR:-none}\" \"${DEPPY_SHELL_ZDOTDIR:-gone}\"\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&fallback_shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let shims = dir.join("shims");
+        std::fs::create_dir_all(&shims).unwrap();
 
-        let output = std::process::Command::new("/bin/sh")
+        let mut child = std::process::Command::new("/bin/sh")
             .arg("-c")
             .arg(agent_then_shell_script())
             .arg(AGENT_SESSION_WRAPPER_NAME)
@@ -183,16 +187,31 @@ mod tests {
             .env_remove("DEPPY_USER_ZDOTDIR")
             .env("DEPPY_SHELL_ZDOTDIR", "/h/.deppy-sijo/zdot")
             .env("DEPPY_SHELL_USER_ZDOTDIR", "/h/custom")
-            .env("SHELL", &fallback_shell)
+            .env("DEPPY_SHIM_DIR", &shims)
+            .env("PATH", "/usr/bin:/bin")
+            .env("SHELL", "/bin/sh")
             .env("TMPDIR", &dir)
-            .stdin(std::process::Stdio::null())
-            .output()
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
             .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(
+                b"printf 'shell:%s:%s:%s:%s:%s' \"${ZDOTDIR:-none}\" \"${DEPPY_USER_ZDOTDIR:-none}\" \"${DEPPY_SHELL_ZDOTDIR:-gone}\" \"${DEPPY_SHELL_USER_ZDOTDIR:-gone}\" \"$PATH\"; exit\n",
+            )
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
         std::fs::remove_dir_all(&dir).ok();
 
         assert_eq!(
             String::from_utf8_lossy(&output.stdout),
-            "agent:none|shell:/h/.deppy-sijo/zdot:/h/custom:gone"
+            format!(
+                "agent:none|shell:/h/.deppy-sijo/zdot:/h/custom:gone:gone:{}:/usr/bin:/bin",
+                shims.display()
+            )
         );
     }
 }

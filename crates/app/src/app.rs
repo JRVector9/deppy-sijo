@@ -10863,6 +10863,9 @@ pub struct App {
     resumed_panes: std::collections::HashSet<String>,
     /// Original native ID for an app-initiated Claude resume fork, until the new binding saves.
     forked_resume_origins: std::collections::HashMap<String, String>,
+    /// 「이어서 실행」으로 원본 대화를 잇게 보낸 재개. 감지 워커가 binding을 잡기 전(2.5초 주기,
+    /// 시작 직후 지연)에 다른 pane이 같은 대화를 또 잇지 않게 잠깐 실행 중으로 본다.
+    archived_respawns_in_flight: Vec<ArchivedRespawnInFlight>,
     resume_probe_pending_panes: std::collections::HashSet<String>,
     /// 알림 클릭으로 다른 workspace 전환 후, mux 재구성되면 이동할 (workspace, session).
     pending_focus: Option<(String, u64, runtime::SessionId)>,
@@ -16971,6 +16974,7 @@ impl App {
             global_resumable_panes: std::collections::HashSet::new(),
             resumed_panes: std::collections::HashSet::new(),
             forked_resume_origins: std::collections::HashMap::new(),
+            archived_respawns_in_flight: Vec::new(),
             resume_probe_pending_panes: std::collections::HashSet::new(),
             pending_focus: None,
             pending_resume_agent: None,
@@ -18822,6 +18826,7 @@ impl App {
                 self.restore_loaded_for = Some(self.active.id.clone());
                 self.resumed_panes.clear();
                 self.forked_resume_origins.clear();
+                self.archived_respawns_in_flight.clear();
                 self.push_archived_resume_presentation();
                 self.push_agent_display();
             }
@@ -19661,15 +19666,11 @@ impl App {
             }
             return true;
         }
-        let running = self
-            .agent_bindings
-            .iter()
-            .filter(|(other, _)| **other != session)
-            .map(|(_, binding)| (agent_kind_id(binding.kind), binding.session_id.as_str()));
-        let (extra_args, fork_origin) = archived_respawn_args(row, extra_args, running);
+        let running = self.running_resume_targets(Some(session), Some(&pane.0));
+        let respawn = archived_respawn_args(row, extra_args, &running);
         let command = runtime::RuntimeCommand::RespawnArchivedAgent {
             session,
-            extra_args,
+            extra_args: respawn.extra_args,
             cols: 80,
             rows: 24,
             scrollback_lines: self.config.terminal.scrollback_lines as usize,
@@ -19680,10 +19681,63 @@ impl App {
                 PendingDotenvContinuation::RuntimeCommand(command),
             )
             .is_ok();
-        if staged && let Some(origin) = fork_origin {
-            self.forked_resume_origins.insert(pane.0, origin);
+        if staged {
+            if let Some(continued) = respawn.continues {
+                self.record_archived_respawn(Some(pane.0.clone()), continued);
+            }
+            if let Some(origin) = respawn.fork_origin {
+                self.forked_resume_origins.insert(pane.0, origin);
+            }
         }
         staged
+    }
+
+    /// 다른 pane이 지금 잇고 있는 대화 — 감지된 binding과, 아직 binding이 안 잡힌 직전
+    /// 「이어서 실행」. `own_session`/`own_pane`은 이번에 재개할 자기 자신이라 뺀다.
+    fn running_resume_targets(
+        &self,
+        own_session: Option<runtime::SessionId>,
+        own_pane: Option<&str>,
+    ) -> Vec<crate::agent_resume::ResumeTarget> {
+        let now = std::time::Instant::now();
+        self.agent_bindings
+            .iter()
+            .filter(|(other, _)| Some(**other) != own_session)
+            .map(|(_, binding)| {
+                crate::agent_resume::ResumeTarget::running(
+                    agent_kind_id(binding.kind),
+                    &binding.session_id,
+                )
+            })
+            .chain(
+                self.archived_respawns_in_flight
+                    .iter()
+                    .filter(|entry| {
+                        entry.is_current(now)
+                            && own_pane.is_none_or(|own| entry.pane.as_deref() != Some(own))
+                    })
+                    .map(|entry| entry.target.clone()),
+            )
+            .collect()
+    }
+
+    fn record_archived_respawn(
+        &mut self,
+        pane: Option<String>,
+        target: crate::agent_resume::ResumeTarget,
+    ) {
+        let now = std::time::Instant::now();
+        let in_flight = &mut self.archived_respawns_in_flight;
+        // 같은 pane의 이전 기록만 바꾼다. Work History 새 pane(None)끼리는 서로 다른 재개다.
+        in_flight.retain(|entry| entry.is_current(now) && (pane.is_none() || entry.pane != pane));
+        if in_flight.len() >= ARCHIVED_RESPAWN_IN_FLIGHT_MAX {
+            in_flight.remove(0);
+        }
+        in_flight.push(ArchivedRespawnInFlight {
+            pane,
+            target,
+            started_at: now,
+        });
     }
 
     /// PR-resume-without-pane(2026-08-19): work history 카드에서 「이어서 하기」를
@@ -19745,7 +19799,16 @@ impl App {
             return false;
         };
         let (_, command, mut args, env_plain) = spec.into_parts();
-        args.extend(extra_args);
+        // 다른 pane이 같은 대화를 잇고 있으면 「이어서 실행」과 같은 규칙으로 fork한다.
+        let binding = Some((kind.id(), native_session_id));
+        let target = crate::agent_resume::resume_target(kind.stable_config_id(), binding);
+        let running = self.running_resume_targets(None, None);
+        let forked = target
+            .as_ref()
+            .filter(|target| running.iter().any(|other| target.may_share(other)))
+            .and_then(|_| crate::agent_resume::fork_resume_plan(kind.stable_config_id(), binding));
+        let continues = target.filter(|_| forked.is_none());
+        args.extend(forked.map_or(extra_args, crate::agent_resume::ResumePlan::into_extra_args));
         let runtime_command = runtime::RuntimeCommand::SpawnAgent {
             agent_config_id: Some(kind.stable_config_id().to_owned()),
             cols: 80,
@@ -19760,7 +19823,11 @@ impl App {
             error_regex: None,
             done_regex: None,
         };
-        self.active.runtime.send_command(runtime_command).is_ok()
+        let sent = self.active.runtime.send_command(runtime_command).is_ok();
+        if sent && let Some(continued) = continues {
+            self.record_archived_respawn(None, continued);
+        }
+        sent
     }
 
     fn pty_agent_surfaces(
@@ -38525,28 +38592,63 @@ fn archived_agent_row_for_session<'a>(
 /// 다른 pane이 이미 같은 대화를 실행 중이면 두 프로세스가 한 대화를 이어 쓰지 않게 새 ID로
 /// fork한다 — 먼저 실행한 pane만 원본을 잇는다. 최근 폴더 재개(`-c`)는 어느 대화가 열릴지
 /// 모르므로 같은 provider가 실행 중이면 fork한다(2026-10-12: 두 pane이 `-c`로 한 대화에 붙음).
-/// fork를 실측하지 못한 CLI는 기존 인자를 쓴다. 두 번째 값은 정확 재개를 fork한 원본 ID.
-fn archived_respawn_args<'a>(
+/// fork를 실측하지 못한 CLI는 기존 인자를 쓴다.
+fn archived_respawn_args(
     row: Option<&storage::ArchivedAgentResumeRow>,
     extra_args: Vec<String>,
-    running: impl IntoIterator<Item = (&'a str, &'a str)>,
-) -> (Vec<String>, Option<String>) {
+    running: &[crate::agent_resume::ResumeTarget],
+) -> ArchivedRespawnArgs {
+    let unchanged = |extra_args, continues| ArchivedRespawnArgs {
+        extra_args,
+        fork_origin: None,
+        continues,
+    };
     let Some(row) = row else {
-        return (extra_args, None);
+        return unchanged(extra_args, None);
     };
     let binding = row.kind.as_deref().zip(row.session_id.as_deref());
     let Some(target) = crate::agent_resume::resume_target(&row.agent_id, binding) else {
-        return (extra_args, None);
+        return unchanged(extra_args, None);
     };
-    if !running
-        .into_iter()
-        .any(|(kind, session_id)| target.may_share_running(kind, session_id))
-    {
-        return (extra_args, None);
+    if !running.iter().any(|other| target.may_share(other)) {
+        return unchanged(extra_args, Some(target));
     }
     match crate::agent_resume::fork_resume_plan(&row.agent_id, binding) {
-        Some(plan) => (plan.into_extra_args(), target.session_id),
-        None => (extra_args, None),
+        Some(plan) => ArchivedRespawnArgs {
+            extra_args: plan.into_extra_args(),
+            fork_origin: target.session_id,
+            continues: None,
+        },
+        None => unchanged(extra_args, Some(target)),
+    }
+}
+
+/// 「이어서 실행」의 최종 인자와 기록할 값.
+#[derive(Debug, PartialEq, Eq)]
+struct ArchivedRespawnArgs {
+    extra_args: Vec<String>,
+    /// 정확 재개를 fork했을 때의 원본 native ID.
+    fork_origin: Option<String>,
+    /// fork하지 않고 원본(또는 최근) 대화를 잇는 경우 그 대화.
+    continues: Option<crate::agent_resume::ResumeTarget>,
+}
+
+/// binding이 잡히기 전의 「이어서 실행」을 실행 중으로 보는 시간. 감지 주기(2.5초)와 시작
+/// 직후 대기보다 넉넉하다. 그 뒤에는 감지된 binding만 본다.
+const ARCHIVED_RESPAWN_IN_FLIGHT_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+const ARCHIVED_RESPAWN_IN_FLIGHT_MAX: usize = 64;
+
+#[derive(Debug)]
+struct ArchivedRespawnInFlight {
+    /// 열람 전용 pane 재개면 그 pane, Work History 새 pane이면 None.
+    pane: Option<String>,
+    target: crate::agent_resume::ResumeTarget,
+    started_at: std::time::Instant,
+}
+
+impl ArchivedRespawnInFlight {
+    fn is_current(&self, now: std::time::Instant) -> bool {
+        now.duration_since(self.started_at) < ARCHIVED_RESPAWN_IN_FLIGHT_TTL
     }
 }
 
@@ -57471,6 +57573,10 @@ mod tests {
         assert!(archived_agent_row_for_session(&mux, &rows, runtime::SessionId(404)).is_none());
     }
 
+    fn running(kind: &'static str, session_id: &str) -> crate::agent_resume::ResumeTarget {
+        crate::agent_resume::ResumeTarget::running(kind, session_id)
+    }
+
     /// 2026-10-12 실사례: 같은 대화가 저장된 열람 전용 pane 두 개를 차례로 「이어서 실행」하면
     /// 먼저 실행한 pane만 원본을 잇고, 나중 pane은 새 ID로 fork한다.
     #[test]
@@ -57483,35 +57589,47 @@ mod tests {
         );
         let base = || vec!["--resume".to_owned(), shared.to_owned()];
 
-        let (first, origin) = archived_respawn_args(Some(&row), base(), []);
-        assert_eq!(first, base());
-        assert_eq!(origin, None);
+        let first = archived_respawn_args(Some(&row), base(), &[]);
+        assert_eq!(first.extra_args, base());
+        assert_eq!(first.fork_origin, None);
+        // 원본을 잇는 재개는 binding이 잡히기 전까지 실행 중으로 기록할 대상이다.
+        let continued = first.continues.expect("원본을 잇는다");
+        assert_eq!(continued.session_id.as_deref(), Some(shared));
 
-        let (second, origin) = archived_respawn_args(Some(&row), base(), [("claude", shared)]);
-        assert_eq!(second, ["--fork-session", "--resume", shared]);
-        assert_eq!(origin.as_deref(), Some(shared));
+        let second = archived_respawn_args(Some(&row), base(), &[running("claude", shared)]);
+        assert_eq!(second.extra_args, ["--fork-session", "--resume", shared]);
+        assert_eq!(second.fork_origin.as_deref(), Some(shared));
+        assert_eq!(
+            second.continues, None,
+            "fork한 대화는 새 ID라 기록하지 않는다"
+        );
+
+        // 리뷰 지적: 감지 주기(2.5초) 전에 연달아 누르면 binding이 아직 없다. 직전 재개
+        // 기록(continues)만으로도 fork해야 한다.
+        let racing = archived_respawn_args(Some(&row), base(), &[continued]);
+        assert_eq!(racing.extra_args, ["--fork-session", "--resume", shared]);
 
         // 다른 대화나 다른 provider가 실행 중이면 원본을 그대로 잇는다.
-        let (other, origin) = archived_respawn_args(
+        let other = archived_respawn_args(
             Some(&row),
             base(),
-            [("claude", "other-session"), ("codex", shared)],
+            &[running("claude", "other-session"), running("codex", shared)],
         );
-        assert_eq!(other, base());
-        assert_eq!(origin, None);
+        assert_eq!(other.extra_args, base());
+        assert_eq!(other.fork_origin, None);
 
         let codex = archived_resume_row(
             "persistent-c",
             "deppy-builtin-codex",
             Some(("codex", "thread-x")),
         );
-        let (forked, origin) = archived_respawn_args(
+        let forked = archived_respawn_args(
             Some(&codex),
             vec!["resume".to_owned(), "thread-x".to_owned()],
-            [("codex", "thread-x")],
+            &[running("codex", "thread-x")],
         );
-        assert_eq!(forked, ["fork", "thread-x"]);
-        assert_eq!(origin.as_deref(), Some("thread-x"));
+        assert_eq!(forked.extra_args, ["fork", "thread-x"]);
+        assert_eq!(forked.fork_origin.as_deref(), Some("thread-x"));
     }
 
     /// 0.10.1이 claude pane에 외부 codex ID를 붙인 행은 최근 폴더 재개(`-c`)가 된다. 같은
@@ -57525,20 +57643,35 @@ mod tests {
         );
         let base = || vec!["-c".to_owned()];
 
-        let (alone, origin) = archived_respawn_args(Some(&row), base(), [("codex", "x")]);
-        assert_eq!(alone, ["-c"]);
-        assert_eq!(origin, None);
+        let alone = archived_respawn_args(Some(&row), base(), &[running("codex", "x")]);
+        assert_eq!(alone.extra_args, ["-c"]);
+        assert_eq!(alone.fork_origin, None);
 
-        let (forked, origin) = archived_respawn_args(Some(&row), base(), [("claude", "any")]);
-        assert_eq!(forked, ["-c", "--fork-session"]);
-        assert_eq!(origin, None);
+        let forked = archived_respawn_args(Some(&row), base(), &[running("claude", "any")]);
+        assert_eq!(forked.extra_args, ["-c", "--fork-session"]);
+        assert_eq!(forked.fork_origin, None);
 
         // fork를 실측하지 못한 CLI와 메타데이터 없는 pane은 기존 인자를 그대로 쓴다.
         let grok = archived_resume_row("persistent-g", "deppy-builtin-grok", None);
-        let (unchanged, _) = archived_respawn_args(Some(&grok), base(), [("grok", "any")]);
-        assert_eq!(unchanged, ["-c"]);
-        let (no_row, _) = archived_respawn_args(None, base(), [("claude", "any")]);
-        assert_eq!(no_row, ["-c"]);
+        let unchanged = archived_respawn_args(Some(&grok), base(), &[running("grok", "any")]);
+        assert_eq!(unchanged.extra_args, ["-c"]);
+        let no_row = archived_respawn_args(None, base(), &[running("claude", "any")]);
+        assert_eq!(no_row.extra_args, ["-c"]);
+        assert_eq!(no_row.continues, None);
+    }
+
+    /// 직전 재개 기록은 TTL 안에서만 실행 중으로 보고, 같은 pane의 새 기록이 옛 기록을 바꾼다.
+    #[test]
+    fn archived_respawn_in_flight은_ttl_안에서만_유효하다() {
+        let now = std::time::Instant::now();
+        let entry = ArchivedRespawnInFlight {
+            pane: Some("pane-a".to_owned()),
+            target: running("claude", "x"),
+            started_at: now,
+        };
+        assert!(entry.is_current(now));
+        assert!(entry.is_current(now + ARCHIVED_RESPAWN_IN_FLIGHT_TTL / 2));
+        assert!(!entry.is_current(now + ARCHIVED_RESPAWN_IN_FLIGHT_TTL));
     }
 
     /// dispatch_respawn_archived_agent가 기대는 판정 — App Server writer 충돌은

@@ -49,14 +49,22 @@ pub(crate) struct ResumeTarget {
 }
 
 impl ResumeTarget {
-    /// 다른 pane이 실행 중인 `kind`/`session_id` 대화를 이 재개가 이어 쓸 수 있는지.
-    /// 최근 폴더 재개는 같은 provider의 실행 중 대화를 집어 올 수 있으므로 겹친다고 본다.
-    pub(crate) fn may_share_running(&self, kind: &str, session_id: &str) -> bool {
-        self.kind == kind
-            && self
-                .session_id
-                .as_deref()
-                .is_none_or(|own| own == session_id)
+    /// 감지된 실행 중 binding의 대화.
+    pub(crate) fn running(kind: &'static str, session_id: &str) -> Self {
+        Self {
+            kind,
+            session_id: Some(session_id.to_owned()),
+        }
+    }
+
+    /// 두 재개가 같은 대화를 이어 쓸 수 있는지. 최근 폴더 재개는 같은 provider의 어느 대화든
+    /// 집어 올 수 있으므로 겹친다고 본다.
+    pub(crate) fn may_share(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && match (&self.session_id, &other.session_id) {
+                (Some(own), Some(other)) => own == other,
+                _ => true,
+            }
     }
 }
 
@@ -366,14 +374,17 @@ mod tests {
                 session_id: Some("a".to_owned())
             }
         );
-        assert!(exact.may_share_running("claude", "a"));
-        assert!(!exact.may_share_running("claude", "b"));
-        assert!(!exact.may_share_running("codex", "a"));
+        assert!(exact.may_share(&ResumeTarget::running("claude", "a")));
+        assert!(!exact.may_share(&ResumeTarget::running("claude", "b")));
+        assert!(!exact.may_share(&ResumeTarget::running("codex", "a")));
 
         let recent = resume_target("deppy-builtin-claude", Some(("codex", "a"))).unwrap();
         assert_eq!(recent.session_id, None);
-        assert!(recent.may_share_running("claude", "anything"));
-        assert!(!recent.may_share_running("codex", "a"));
+        assert!(recent.may_share(&ResumeTarget::running("claude", "anything")));
+        assert!(!recent.may_share(&ResumeTarget::running("codex", "a")));
+        // 아직 binding이 없는 다른 최근 폴더 재개와도 겹친다.
+        assert!(recent.may_share(&recent));
+        assert!(exact.may_share(&recent));
 
         assert_eq!(resume_target("custom-agent", None), None);
     }

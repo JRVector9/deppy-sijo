@@ -118,6 +118,8 @@ struct ProcRow {
 pub struct DetectedAgents {
     pub bindings: HashMap<SessionId, AgentBinding>,
     pub kinds: HashMap<SessionId, RunningAgent>,
+    /// transcript·hook 연동이 없는 그 밖의 에이전트(Qwen·Gemini 등) — 종류 표시만.
+    pub others: HashMap<SessionId, crate::agent_launcher::AgentKind>,
 }
 
 /// 프로세스만으로 알아낸 세션의 에이전트. transcript도 statusLine도 필요 없다.
@@ -514,6 +516,48 @@ fn agent_kinds_from_rows(
         .collect()
 }
 
+/// 연동 에이전트(Claude·Codex·Kimi·Grok)가 없는 세션에서 런처가 아는 그 밖의 에이전트
+/// CLI를 프로세스 이름으로 찾는다(Qwen `qwen`, Gemini `gemini` 등 — 런처 감지 명령과 같다).
+/// transcript·hook 연동이 없어 종류 표시에만 쓴다. 터미널에서 직접 실행해도 잡힌다.
+fn other_agent_kinds_from_rows(
+    sessions: &[(SessionId, u32)],
+    rows: &[ProcRow],
+    linked: &HashMap<SessionId, RunningAgent>,
+) -> HashMap<SessionId, crate::agent_launcher::AgentKind> {
+    use crate::agent_launcher::AgentKind as Launcher;
+    let others: Vec<Launcher> = Launcher::ALL
+        .into_iter()
+        .filter(|kind| {
+            !matches!(
+                kind,
+                Launcher::Claude | Launcher::Codex | Launcher::Kimi | Launcher::Grok
+            )
+        })
+        .collect();
+    sessions
+        .iter()
+        .filter(|(sid, _)| !linked.contains_key(sid))
+        .filter_map(|(sid, shell_pid)| {
+            let descendants = descendant_pids(*shell_pid, rows);
+            rows.iter()
+                .filter(|row| descendants.contains(&row.pid))
+                .find_map(|row| {
+                    let names: Vec<&str> = row
+                        .command
+                        .split_whitespace()
+                        .take(2)
+                        .filter_map(|token| Path::new(token).file_name()?.to_str())
+                        .collect();
+                    others
+                        .iter()
+                        .copied()
+                        .find(|kind| names.contains(&kind.detect_command()))
+                })
+                .map(|kind| (*sid, kind))
+        })
+        .collect()
+}
+
 /// kind별 **강도 플래그 이름**. `agent_launcher`가 실제로 붙이는 이름과 짝이 맞아야 한다 —
 /// 어긋나면 강도가 조용히 `None`이 된다(2026-09-03: Grok이 그 상태였다. 런처는
 /// `--reasoning-effort`를 붙이는데 여기서는 `--effort`를 찾고 있었고, Grok은 transcript
@@ -620,7 +664,12 @@ pub fn detect_cached(
             .map(|(sid, _)| (*sid, cache.entries[sid].binding.clone()))
             .collect();
         let kinds = kinds_from_cache(sessions, cache);
-        return DetectedAgents { bindings, kinds };
+        // 모든 세션이 연동 에이전트로 캐시돼 있으니 그 밖의 에이전트는 없다.
+        return DetectedAgents {
+            bindings,
+            kinds,
+            others: HashMap::new(),
+        };
     }
     // 여기 도달하면 이번 tick은 전체 탐색이다 — 안전망 시각을 갱신한다.
     cache.last_full_scan = Some(Instant::now());
@@ -632,6 +681,7 @@ pub fn detect_cached(
     // 캐시 항목에도 함께 싣는다(같은 kind일 때만 — 세션에 에이전트가 둘 이상이면
     // agent_kinds_from_rows가 고른 첫 후보가 find_agent의 "최적" 후보와 다를 수 있다).
     let kinds = agent_kinds_from_rows(sessions, rows);
+    let others = other_agent_kinds_from_rows(sessions, rows, &kinds);
     for (sid, shell_pid) in sessions {
         // hook(SessionStart 등)이 보고한 바인딩이 있으면 그것이 결정적이다. 단 같은 pane에서
         // Codex를 종료한 뒤 Claude를 실행할 수 있으므로, 살아 있는 에이전트의 종류까지 hook
@@ -736,6 +786,7 @@ pub fn detect_cached(
     DetectedAgents {
         bindings: out,
         kinds,
+        others,
     }
 }
 
@@ -4025,6 +4076,45 @@ mod tests {
 
         let (worker, _) = classify("kimi-code").unwrap();
         assert_eq!(worker, AgentKind::Kimi, "워커 프로세스명을 놓치면 안 된다");
+    }
+
+    /// 2026-10-12: Qwen 등 연동 없는 에이전트는 종류조차 표시되지 않았다. 런처 감지 명령과
+    /// 같은 이름으로 잡되, 연동 에이전트가 도는 세션은 그쪽이 우선이다.
+    #[test]
+    fn 연동_없는_에이전트도_프로세스_이름으로_종류를_잡는다() {
+        use crate::agent_launcher::AgentKind as Launcher;
+        let row = |pid: u32, ppid: u32, command: &str| ProcRow {
+            pid,
+            ppid: Some(ppid),
+            command: command.into(),
+        };
+        let rows = vec![
+            row(100, 1, "/bin/zsh"),
+            row(101, 100, "node /opt/homebrew/bin/gemini --yolo"),
+            row(200, 1, "/bin/zsh"),
+            row(201, 200, "/Users/jr/.local/bin/qwen"),
+            row(300, 1, "/bin/zsh"),
+            row(301, 300, "/Users/jr/.local/bin/claude --model opus"),
+            row(302, 300, "/opt/homebrew/bin/gemini"),
+            row(400, 1, "/bin/zsh"),
+            row(401, 400, "vim notes.md"),
+        ];
+        let sessions = [
+            (SessionId(1), 100),
+            (SessionId(2), 200),
+            (SessionId(3), 300),
+            (SessionId(4), 400),
+        ];
+        let linked = agent_kinds_from_rows(&sessions, &rows);
+        let others = other_agent_kinds_from_rows(&sessions, &rows, &linked);
+        assert_eq!(others.get(&SessionId(1)), Some(&Launcher::Gemini));
+        assert_eq!(others.get(&SessionId(2)), Some(&Launcher::QwenCode));
+        assert_eq!(
+            others.get(&SessionId(3)),
+            None,
+            "Claude가 도는 세션은 연동 쪽"
+        );
+        assert_eq!(others.get(&SessionId(4)), None, "에이전트가 아닌 프로그램");
     }
 
     #[test]

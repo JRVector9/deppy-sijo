@@ -225,6 +225,8 @@ pub struct DetectOutcome {
     /// transcript 없이 프로세스만으로 판정한 세션별 에이전트 종류. 방금 띄워 아직
     /// 대화를 시작하지 않은 에이전트는 `bindings`에 없으므로 이쪽으로 잡는다.
     pub agent_kinds: Option<HashMap<SessionId, RunningAgent>>,
+    /// 연동 없는 그 밖의 에이전트 종류(Qwen·Gemini 등) — 바인딩 tier에서만.
+    pub other_agents: Option<HashMap<SessionId, crate::agent_launcher::AgentKind>>,
 }
 
 struct MailboxState {
@@ -294,7 +296,11 @@ impl OutcomeMailbox {
                     || outcome
                         .agent_kinds
                         .as_ref()
-                        .is_some_and(|value| current.agent_kinds.as_ref() != Some(value));
+                        .is_some_and(|value| current.agent_kinds.as_ref() != Some(value))
+                    || outcome
+                        .other_agents
+                        .as_ref()
+                        .is_some_and(|value| current.other_agents.as_ref() != Some(value));
                 if !changed {
                     return PublishResult::Unchanged;
                 }
@@ -312,6 +318,9 @@ impl OutcomeMailbox {
                 }
                 if outcome.agent_kinds.is_none() {
                     outcome.agent_kinds.clone_from(&current.agent_kinds);
+                }
+                if outcome.other_agents.is_none() {
+                    outcome.other_agents.clone_from(&current.other_agents);
                 }
             }
             if current.as_ref() == &outcome {
@@ -414,6 +423,7 @@ struct BindingPass {
     agent_info: HashMap<SessionId, AgentDisplay>,
     work_turns: Option<HashMap<SessionId, Vec<TranscriptTurn>>>,
     agent_kinds: HashMap<SessionId, RunningAgent>,
+    other_agents: HashMap<SessionId, crate::agent_launcher::AgentKind>,
 }
 
 trait DetectionBackend: Send + 'static {
@@ -631,6 +641,7 @@ impl DetectionBackend for ProductionBackend {
         let agent_detect::DetectedAgents {
             bindings,
             kinds: agent_kinds,
+            others: other_agents,
         } = detected;
         let (activity, agent_info, work_turns) =
             compute_activity_and_info(&bindings, &mut self.transcript_cache);
@@ -647,6 +658,7 @@ impl DetectionBackend for ProductionBackend {
             agent_info,
             work_turns: Some(work_turns),
             agent_kinds,
+            other_agents,
         }
     }
 
@@ -746,6 +758,7 @@ fn run_worker<B: DetectionBackend>(
                             agent_info: Some(HashMap::new()),
                             work_turns: Some(HashMap::new()),
                             agent_kinds: Some(HashMap::new()),
+                            other_agents: Some(HashMap::new()),
                         },
                     )
                 {
@@ -799,6 +812,7 @@ fn run_worker<B: DetectionBackend>(
                     agent_info: Some(pass.agent_info),
                     work_turns: pass.work_turns,
                     agent_kinds: Some(pass.agent_kinds),
+                    other_agents: Some(pass.other_agents),
                 },
             ) {
                 break;
@@ -825,6 +839,7 @@ fn run_worker<B: DetectionBackend>(
                     agent_info: None,
                     work_turns: None,
                     agent_kinds: None,
+                    other_agents: None,
                 },
             ) {
                 break;
@@ -854,6 +869,7 @@ fn run_worker<B: DetectionBackend>(
                     agent_info: None,
                     work_turns: None,
                     agent_kinds: Some(kinds),
+                    other_agents: None,
                 },
             ) {
                 break;
@@ -1136,6 +1152,7 @@ mod tests {
                 },
             )])),
             work_turns: Some(HashMap::from([(session, vec![work_turn(1)])])),
+            other_agents: None,
         }
     }
 
@@ -1208,6 +1225,7 @@ mod tests {
                         .collect(),
                 ),
                 bindings,
+                other_agents: HashMap::new(),
             }
         }
 
@@ -1271,6 +1289,7 @@ mod tests {
                 agent_info: None,
                 work_turns: None,
                 agent_kinds: Some(kimi.clone()),
+                other_agents: None,
             }),
             PublishResult::Changed
         ));
@@ -1298,6 +1317,7 @@ mod tests {
                 agent_info: None,
                 work_turns: None,
                 agent_kinds: None,
+                other_agents: None,
             }),
             PublishResult::Changed
         ));
@@ -1409,6 +1429,7 @@ mod tests {
             agent_info: None,
             work_turns: None,
             agent_kinds: None,
+            other_agents: None,
         };
         assert!(matches!(mailbox.publish(partial), PublishResult::Changed));
         let merged = receiver.try_recv().expect("merged outcome");
@@ -1427,6 +1448,7 @@ mod tests {
             agent_info: None,
             work_turns: None,
             agent_kinds: None,
+            other_agents: None,
         };
         assert!(matches!(
             mailbox.publish(unchanged),
@@ -1455,6 +1477,7 @@ mod tests {
             agent_info: None,
             work_turns: None,
             agent_kinds: None,
+            other_agents: None,
         };
         assert!(matches!(mailbox.publish(fresh), PublishResult::Changed));
 
@@ -1607,6 +1630,7 @@ mod tests {
                         .collect(),
                 ),
                 bindings,
+                other_agents: HashMap::new(),
             },
             &sessions,
         );
@@ -1630,6 +1654,7 @@ mod tests {
             agent_info: HashMap::new(),
             work_turns: Some(HashMap::from([(session, turns)])),
             agent_kinds: HashMap::new(),
+            other_agents: HashMap::new(),
         };
         let exact = (0..MAX_RECENT_TRANSCRIPT_TURNS).map(work_turn).collect();
         let exact = bound_pass(make_pass(exact), &sessions);

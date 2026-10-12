@@ -19339,6 +19339,7 @@ impl App {
         let mut latest_cwds = None;
         let mut latest_info = None;
         let mut latest_kinds = None;
+        let mut latest_others = None;
         let mut latest_work_turns = None;
         if let Ok(outcome) = self.agent_detect_rx.try_recv()
             && outcome.epoch == self.agent_detect_epoch
@@ -19357,6 +19358,9 @@ impl App {
             if outcome.agent_kinds.is_some() {
                 latest_kinds = outcome.agent_kinds.clone();
             }
+            if outcome.other_agents.is_some() {
+                latest_others = outcome.other_agents.clone();
+            }
             if outcome.work_turns.is_some() {
                 latest_work_turns = outcome.work_turns.clone();
             }
@@ -19366,6 +19370,9 @@ impl App {
         // 다른(warm) instance의 보존값을 건드리지 않는다. 이 outcome은 epoch 검사를
         // 통과했으므로 항상 현재 self.active의 세션 집합을 가리킨다.
         let instance = self.active.runtime_instance;
+        if let Some(others) = latest_others {
+            self.active.workspace_ui.set_other_agent_kinds(others);
+        }
         if let Some(info) = latest_info {
             // 감지 결과에 없는 세션의 마지막 표시값을 **지우지 않는다**. 워커의 pass는
             // MAX_DETECT_SESSIONS로 잘리고(agent_detect_worker::bound_pass) 대기 세션은

@@ -343,7 +343,7 @@ impl AgentKind {
         }
     }
 
-    const fn detect_command(self) -> &'static str {
+    pub(crate) const fn detect_command(self) -> &'static str {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",

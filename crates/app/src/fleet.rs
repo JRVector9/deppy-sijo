@@ -312,13 +312,19 @@ pub fn task_preview(
 /// - Grok: `<제목> - grok`, 작업 중 `⠹ - <상태> - <제목> - grok`.
 ///
 /// 상태 기호·프로젝트 칸·일반 이름·셸이 띄운 명령 줄은 작업이 아니므로 버린다.
+/// `kind`가 None이면 연동 없는 그 밖의 에이전트 — 상태 기호만 떼는 일반 해석.
 pub fn task_from_terminal_title(
     title: &str,
     folder: Option<&str>,
-    kind: crate::agent_detect::AgentKind,
+    kind: Option<crate::agent_detect::AgentKind>,
 ) -> Option<String> {
     use crate::agent_detect::AgentKind;
     let title = title.trim();
+    let Some(kind) = kind else {
+        let task = strip_title_status(title);
+        return (!task.is_empty() && !is_generic_agent_title(task, folder))
+            .then(|| task.to_owned());
+    };
     let task = match kind {
         AgentKind::Codex => match title.rsplit_once(" | ") {
             Some((head, _project)) => strip_title_status(head),
@@ -522,7 +528,7 @@ mod tests {
         ];
         for (title, folder, kind, expected) in cases {
             assert_eq!(
-                task_from_terminal_title(title, folder, kind).as_deref(),
+                task_from_terminal_title(title, folder, Some(kind)).as_deref(),
                 expected,
                 "{title}"
             );
@@ -550,7 +556,7 @@ mod tests {
             ("[ ! ] Action Required", None, Codex),
         ] {
             assert_eq!(
-                task_from_terminal_title(title, folder, kind),
+                task_from_terminal_title(title, folder, Some(kind)),
                 None,
                 "{title}"
             );

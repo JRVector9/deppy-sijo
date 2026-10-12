@@ -1,3 +1,13 @@
+# 0.12.0 재실행·「이어서 실행」 첫 에이전트 재개 조사 — 2026-10-12 (Claude Code)
+
+- 사용자 「재빌드하고 재실행해」. 원래 체크아웃(`feat/fleet-one-list-and-relay-wip`, 마이그레이션 38)은 실제 DB(`user_version` 50)를 forward-only 가드로 거부해 실행 불가 — DB는 건드리지 않음. 사용자 선택으로 이 트리에서 실행.
+- 버전 0.11.0 → 0.12.0(08:05 0.11.0 번들 이후 feat 포함 커밋 `07060046`·`5f19379d`·`93b96622` 등이 들어와 minor). `Cargo.lock`은 워크스페이스 27줄만. 소스 `d5f88b35` + 버전 변경.
+- 실행: `scripts/dev-run.sh --release`(Developer ID, identifier `app.vector9.deppy-sijo`), `--version` 0.12.0, PID 48518. `package-macos.sh`의 로컬 개발 플래그는 자동 권한 검사가 거부해 이번엔 번들을 만들지 않았다(`target/release/deppy-sijo` 직접 실행).
+- 「이어서 실행이 종료 직전 대화가 아니라 처음 에이전트 대화로 뜬다」 조사: Claude로 띄운 `Design`·`nomorevibe` pane에서 사용자가 Codex로 바꿔 쓰다(`01a128ab` 14:28, `01a128ca` 13:51 마지막 기록) 재시작했더니 Claude(`240ec284`·`113b810f`)가 떴다. 재시작 시점의 binding은 이전 빌드가 남긴 것 — 08:22 백업에서 `nomorevibe` pane은 Codex가 그 폴더에서 10-11 11:39부터 돌았는데도 Claude binding(10-11 09:56) 그대로였고, `Design`은 Claude pane 두 개(`622d9033`·`7b5da262`)가 같은 Codex ID에 묶여 있었다(공유 binding → `archived_resume_target`이 전환을 막고 Claude `-c`로 떨어짐). 0.12.0은 두 pane 모두 Codex binding을 pane 하나씩에 기록 중(14:44:38, 14:51:21) — 다음 재시작에서 Codex로 잇는지 확인 필요(재시작은 새 명시 요청 필요).
+- 기각한 가설: `hook_binding_matches_command`의 Codex `resume X` 고정은 원인이 아니다 — `detect_cached`가 Codex hook엔 이 대조를 적용하지 않고(`b.kind == Codex ||`), TUI 안 `/new` 전환 수용은 `independent_current_execution_hook_replaces_codex_resume_cache`가 고정한다.
+
+---
+
 # 남은 상태 문제 3건 — 완료 판정·그 밖의 에이전트·pane 에이전트 전환 — 2026-10-12 (Claude Code)
 
 - 사용자 「남은 문제 해결해」. 한 PR에 커밋 3개.

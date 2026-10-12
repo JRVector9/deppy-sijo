@@ -1,3 +1,13 @@
+# 남은 상태 문제 3건 — 완료 판정·그 밖의 에이전트·pane 에이전트 전환 — 2026-10-12 (Claude Code)
+
+- 사용자 「남은 문제 해결해」. 한 PR에 커밋 3개.
+- **hook 없는 에이전트의 「완료」**(5f19379d): `StatusDetector::on_title`이 작업 중 표시(Codex·Grok 점자 스피너, Claude `◐◑◒◓`)가 멈춘 비어 있지 않은 제목을 턴 완료로 보고 Done을 latch. 입력·다음 턴 스피너로 Running. Action Required·제목 지움(종료)은 제외. 데스크톱 알림은 기존 상태 변화 경로라 hook 턴 종료와 겹치지 않는다(hook 턴 종료는 원래 토스트가 없다).
+- **연동 없는 에이전트 종류·작업**(93b96622): 감지 바인딩 tier가 런처 감지 명령과 같은 프로세스 이름(qwen·gemini·opencode·aider·goose·amp·cursor-agent·copilot, argv 앞 두 토큰 파일명)으로 그 밖의 에이전트를 찾는다(연동 에이전트가 도는 세션 제외). `DetectedAgents.others`→`DetectOutcome.other_agents`(바인딩 tier만, 나머지는 이월)→`WorkspaceUi::set_other_agent_kinds`. 사이드바·Fleet·PWA에 종류 라벨, 상태, 제목 작업(일반 해석 `task_from_terminal_title(…, None)`). 감지 종류 enum(4종)은 바꾸지 않았다.
+- **pane 에이전트 전환**(0e756daa): Claude로 띄운 pane에서 Codex로 바꿔 쓰다 재시작하면 「이어서 실행」이 Claude를 다시 띄웠다. `agent_resume::switched_agent_id` — binding이 다른 내장 에이전트면 그 에이전트로 정확 재개(설치돼 있지 않으면 Unavailable). `RespawnArchivedAgent.relaunch_command/args`로 런처 명령(래퍼 포함)을 이번 실행에만 쓰고 세션 행은 그대로(`sessions.agent_id`는 `agent_configs` 외래 키 — runtime이 바꾸지 않는다). wire v29 안에서 추가(v29는 아직 배포 빌드 없음). 0.10.1 시절 오염된 binding(외부 codex ID)이 남은 pane이면 그 대화로 재개를 시도할 수 있다 — 0.10.2부터는 binding이 실행 증거로만 기록된다.
+- 검증: session 79 / runtime 389 / web-remote 364(+통합) / 앱 3030 PASS(이번엔 로컬 `agent_detect` 환경 실패도 없음). 새 테스트: 제목 스피너 완료·해제·Action Required 제외, 그 밖의 에이전트 프로세스 감지(Gemini·Qwen, Claude 세션 제외)와 제목 작업, Claude pane+Codex binding → Codex 정확 재개(미설치면 Unavailable), runtime 바꾼 명령 재실행과 행 보존(실제 PTY). fmt OK, `clippy -p session -p runtime -p web-remote -p deppy-sijo --all-targets -D warnings` 0건, `xtask check-boundary` OK.
+
+---
+
 # 재개 경로 결함·PWA 작업 문구·공유 대화 판정 — 2026-10-12 (Claude Code)
 
 - 사용자 「리뷰 다 끝나면 바로 고쳐」 — 2차 리뷰의 남은 지적을 고친다(#227 위에 쌓음).

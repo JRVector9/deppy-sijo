@@ -3,8 +3,16 @@
 - 사용자 「남은 문제 해결해」. 한 PR에 커밋 3개.
 - **hook 없는 에이전트의 「완료」**(5f19379d): `StatusDetector::on_title`이 작업 중 표시(Codex·Grok 점자 스피너, Claude `◐◑◒◓`)가 멈춘 비어 있지 않은 제목을 턴 완료로 보고 Done을 latch. 입력·다음 턴 스피너로 Running. Action Required·제목 지움(종료)은 제외. 데스크톱 알림은 기존 상태 변화 경로라 hook 턴 종료와 겹치지 않는다(hook 턴 종료는 원래 토스트가 없다).
 - **연동 없는 에이전트 종류·작업**(93b96622): 감지 바인딩 tier가 런처 감지 명령과 같은 프로세스 이름(qwen·gemini·opencode·aider·goose·amp·cursor-agent·copilot, argv 앞 두 토큰 파일명)으로 그 밖의 에이전트를 찾는다(연동 에이전트가 도는 세션 제외). `DetectedAgents.others`→`DetectOutcome.other_agents`(바인딩 tier만, 나머지는 이월)→`WorkspaceUi::set_other_agent_kinds`. 사이드바·Fleet·PWA에 종류 라벨, 상태, 제목 작업(일반 해석 `task_from_terminal_title(…, None)`). 감지 종류 enum(4종)은 바꾸지 않았다.
-- **pane 에이전트 전환**(0e756daa): Claude로 띄운 pane에서 Codex로 바꿔 쓰다 재시작하면 「이어서 실행」이 Claude를 다시 띄웠다. `agent_resume::switched_agent_id` — binding이 다른 내장 에이전트면 그 에이전트로 정확 재개(설치돼 있지 않으면 Unavailable). `RespawnArchivedAgent.relaunch_command/args`로 런처 명령(래퍼 포함)을 이번 실행에만 쓰고 세션 행은 그대로(`sessions.agent_id`는 `agent_configs` 외래 키 — runtime이 바꾸지 않는다). wire v29 안에서 추가(v29는 아직 배포 빌드 없음). 0.10.1 시절 오염된 binding(외부 codex ID)이 남은 pane이면 그 대화로 재개를 시도할 수 있다 — 0.10.2부터는 binding이 실행 증거로만 기록된다.
+- **pane 에이전트 전환**(4abbe07d): Claude로 띄운 pane에서 Codex로 바꿔 쓰다 재시작하면 「이어서 실행」이 Claude를 다시 띄웠다. `agent_resume::switched_agent_id` — binding이 다른 내장 에이전트면 그 에이전트로 정확 재개(설치돼 있지 않으면 처음 에이전트로 — 후속 참고). `RespawnArchivedAgent.relaunch_command/args`로 런처 명령(래퍼 포함)을 이번 실행에만 쓰고 세션 행은 그대로(`sessions.agent_id`는 `agent_configs` 외래 키 — runtime이 바꾸지 않는다). wire v30(후속 참고). 0.10.1 시절 오염된 binding(외부 codex ID)이 남은 pane이면 그 대화로 재개를 시도할 수 있다 — 0.10.2부터는 binding이 실행 증거로만 기록된다.
 - 검증: session 79 / runtime 389 / web-remote 364(+통합) / 앱 3030 PASS(이번엔 로컬 `agent_detect` 환경 실패도 없음). 새 테스트: 제목 스피너 완료·해제·Action Required 제외, 그 밖의 에이전트 프로세스 감지(Gemini·Qwen, Claude 세션 제외)와 제목 작업, Claude pane+Codex binding → Codex 정확 재개(미설치면 Unavailable), runtime 바꾼 명령 재실행과 행 보존(실제 PTY). fmt OK, `clippy -p session -p runtime -p web-remote -p deppy-sijo --all-targets -D warnings` 0건, `xtask check-boundary` OK.
+
+## 후속: 「한번더 코드리뷰해봐」 — 병렬 리뷰 3개(완료 판정 / 그 밖의 에이전트 / pane 전환) 반영
+
+- **완료 판정**: 실행 직후 첫 입력 전 스피너→정지(부팅 화면)를 턴 완료로 보던 것 → 입력이 들어온 턴(`turn_armed`)에서만 제목 완료. 제목 완료 뒤 화면이 승인 대기면 화면이 이긴다. 종료 sentinel 뒤 늦은 스피너가 실행 중으로 되돌리지 않게 제목 상태를 비운다. 출처 `StatusSource::TerminalTitle`(enum 끝) — 제목만으로 본 완료는 데스크톱 알림·Web Push를 띄우지 않는다(hook 턴 종료와 같은 취급).
+- **그 밖의 에이전트**: 감지가 argv 두 번째 토큰까지 보던 것(`ssh amp`, `vim …/gemini`를 에이전트로 봄) → argv[0], 인터프리터(node·bun·deno·python·sh 등)면 첫 비옵션 인자 파일명만. 같은 세션에 낡은 Claude 표시 정보가 남아도 그 밖의 에이전트가 이긴다. 감지 시점의 제목(실행 전 셸 제목)은 작업으로 쓰지 않는다. 일반 제목 목록에 Gemini·Qwen 등 추가.
+- **pane 전환**: 바꿀 에이전트가 설치돼 있지 않으면 Unavailable로 막던 것 → 처음 띄운 에이전트로 잇는다. 같은 대화 ID가 여러 pane에 저장돼 있으면(0.10.1 오염 형태) 바꾸지 않는다. hook 없는 에이전트로 바꾼 pane에 이전 binding이 남던 것 → 다른 종류(또는 그 밖의 에이전트)가 돌고 자기 binding이 없으면 이전 binding을 지운다(`stale_pane_bindings`, 셸만 남으면 유지). Work History 카드 종류 비교가 바꾼 에이전트 기준. 사용자 정의 agent ID에 내장 binding이 붙어 있으면 그 provider로 재개하지 않는다.
+- runtime wire 29 → 30: v29가 #228로 main에 들어간 뒤 `RespawnArchivedAgent` 모양이 바뀌었다(`relaunch_command`/`relaunch_args`). 원격 피어는 같은 빌드로 갱신.
+- 남긴 것(보고): 바꾼 에이전트 이름을 「이어서 실행」 버튼에 표시하지 않음, 바꾼 에이전트는 런처 기본 옵션으로 뜸(처음 pane 실행 옵션은 이전 에이전트 것), 그 밖의 에이전트 감지는 프로세스 이름 목록 기준.
 
 ---
 

@@ -2698,6 +2698,7 @@ mod http_end_to_end_tests {
             approval_regex: None,
             error_regex: None,
             done_regex: None,
+            transient_args: Vec::new(),
         })
         .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);

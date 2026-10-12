@@ -170,6 +170,10 @@ pub struct SessionView {
     /// 결과(agent_detect)다. 감지 워커는 활성 워크스페이스만 돌므로 warm/유휴는 없다.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// 에이전트가 지금 하는 작업 한 줄 — 데스크톱 Fleet 카드와 같은 원천(hook 지시·응답 요약,
+    /// 없으면 에이전트가 터미널 제목에 띄운 작업).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
     /// 종료(SessionExited/Restored 관측) — 완료 배지용.
     pub exited: bool,
 }
@@ -1101,6 +1105,7 @@ mod tests {
                         status: Some("needs_approval"),
                         agent: Some("Claude · sonnet · high".into()),
                         exited: false,
+                        task: None,
                     }],
                 },
                 WorkspaceView {
@@ -1116,6 +1121,7 @@ mod tests {
                         status: None,
                         agent: None,
                         exited: false,
+                        task: None,
                     }],
                 },
             ],

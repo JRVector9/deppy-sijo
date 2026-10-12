@@ -1866,7 +1866,7 @@
     return STATUS_LABEL[session.status] || session.status || '상태 정보 없음';
   }
   function matchesSession(session, workspace, query) {
-    return searchable([session.title, session.agent, session.status, sessionStatusLabel(session, workspace)].join(' ')).includes(query);
+    return searchable([session.title, session.agent, session.task, session.status, sessionStatusLabel(session, workspace)].join(' ')).includes(query);
   }
   workspaceSearch.addEventListener('input', () => renderWorkspaceList());
 
@@ -1960,6 +1960,8 @@
     const agent = document.createElement('span'); agent.className = 'agent'; agent.textContent = session.agent || '터미널';
     const badge = document.createElement('span'); badge.className = 'session-status ' + status; badge.textContent = sessionStatusLabel(session, workspace);
     meta.append(badge, document.createTextNode(' · '), agent); nameBox.append(title, meta);
+    // 에이전트가 지금 하는 작업 — 데스크톱 Fleet 카드와 같은 원천.
+    if (session.task) { const task = document.createElement('span'); task.className = 'session-task'; task.textContent = session.task; nameBox.append(task); }
     const arrow = document.createElement('span'); arrow.className = 'row-arrow'; arrow.setAttribute('aria-hidden', 'true');
     arrow.textContent = session.id === viewer.watching ? '✓' : '›';
     if (session.id === viewer.watching) row.setAttribute('aria-current', 'true');

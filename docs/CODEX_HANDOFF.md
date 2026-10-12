@@ -1,3 +1,17 @@
+# 재개 경로 결함·PWA 작업 문구·공유 대화 판정 — 2026-10-12 (Claude Code)
+
+- 사용자 「리뷰 다 끝나면 바로 고쳐」 — 2차 리뷰의 남은 지적을 고친다(#227 위에 쌓음).
+- **「이어서 실행」이 런처 env를 잃음**: runtime 재실행이 `prepare_agent_env(빈 값)`라 PATH·`DEPPY_AGENT_EXECUTABLE`이 없어, Finder로 띄운 앱(PATH=/usr/bin:/bin…)에서 shim이 진짜 CLI를 못 찾고 exit 127. → `RuntimeCommand::RespawnArchivedAgent.env_plain`, 앱 `archived_respawn_env`가 런처 감지 결과로 `build_launch_spec` env를 만든다.
+- **이번 실행 인자를 세션 행에 저장**: Work History 새 pane 재개가 `resume X`를, 배치 스폰이 프롬프트를 args에 넣어 영속 → 재시작 뒤 「이어서 실행」이 `codex … resume X resume X`(실패)·프롬프트 재전송. → `SpawnAgent.transient_args`(spawn argv에만 붙고 `sessions.args_json`엔 안 남음, 합친 argv로 한도 검증), `PreparedAgentLaunch.transient_args`. `with_right_split`은 transient가 있으면 거절(옆 분할 명령에 칸 없음 — 앱은 panic 대신 실행 실패 처리).
+- **Work History 새 pane 재개**: 래퍼 없이 떠서 완료·오류·폴백 셸이 없었고 dotenv 단계를 건너뛰었다 → `wrap_agent_then_shell` + `stage_dotenv_continuation`. 카드의 대화 대신 pane의 최신 binding을 열던 것 → 카드의 `agent_session_id`.
+- **공유 대화 판정 과대**: hook history가 지난 24시간 모든 실행의 `workspace:N` 행을 넣어, 세션 번호가 같은 지금 pane을 「공유」로 보고 작업 문구를 숨겼다 → 이번 runtime 실행 토큰이 찍힌 hook만.
+- **PWA·Relay 작업 문구**: `SessionView.task`(데스크톱 Fleet과 같은 `agent_task_line_for`), PWA·Relay 행에 한 줄 표시. 대기 워크스페이스 상태 표시는 승인된 모바일 디자인(「저장된 세션은 실행 중을 주장하지 않는다」, Chrome fixture)에 맞춰 넣지 않았다.
+- runtime wire 28 → 29 (`SpawnAgent.transient_args`, `RespawnArchivedAgent.env_plain`). 원격 피어는 같은 빌드로 갱신.
+- 남긴 것: pane 저장 binding이 다른 에이전트로 바뀐 경우(그 pane은 처음 띄운 에이전트 기준으로 재개된다 — pane별 현재 에이전트를 저장하는 모델 변경이 필요), hookless Codex의 「완료」, 미분류 에이전트(Qwen 등) 종류 표시, Claude 대화의 cwd(새 pane은 워크스페이스 폴더에서 뜬다).
+- 검증: runtime lib 388 PASS(transient 미영속·respawn env 실제 PTY 테스트, v29 postcard golden 갱신), pty 45 PASS, web-remote 전체 PASS + Chrome PWA fixture 2 PASS(작업 줄 표시 확인 추가, `--ignored`로 실행), Relay node 16 PASS, 앱 3011 PASS / 15 FAIL(`agent_detect::tests` — #227 기준에서도 같은 15개가 로컬 `cargo test`에서만 실패, CI nextest는 통과하는 환경 문제). fmt OK, `clippy -p terminal -p session -p pty -p runtime -p web-remote -p deppy-sijo --all-targets -D warnings` 0건, `xtask check-boundary` OK.
+
+---
+
 # 어떤 진입 경로든 에이전트 상태 노출 — 2차 리뷰 반영 — 2026-10-12 (Claude Code)
 
 - 사용자: 「이어서 하기가 아니라 새 세션(터미널에서 직접)·런처 등 어떤 경우에도 세션의 에이전트 상태가 제대로 노출돼야」. 진입 경로별 병렬 리뷰 3개(앱 시작 경로 / 터미널 직접 / 상태 표시 화면).

@@ -193,6 +193,8 @@ pub struct SessionSeed {
     /// 돌고 있는 에이전트 요약("Claude · sonnet · high"). 앱의 감지 결과 — 활성
     /// 워크스페이스만 감지 워커가 돌므로 warm/유휴는 None.
     pub agent: Option<String>,
+    /// 에이전트가 지금 하는 작업 한 줄(데스크톱 Fleet 카드와 같은 원천).
+    pub task: Option<String>,
     pub exited: bool,
 }
 
@@ -409,6 +411,7 @@ fn workspace_views(
                     title: format!("세션 {id}"),
                     status: Some(status_str(projected_status(entry, hook.get(id)))),
                     agent: None,
+                    task: None,
                     exited: entry.exited,
                 })
                 .collect(),
@@ -438,6 +441,7 @@ fn workspace_views(
                                 .unwrap_or_else(|| format!("세션 {id}")),
                             status: Some(status_str(projected_status(entry, hook.get(id)))),
                             agent: seed.and_then(|s| s.agent.clone()),
+                            task: seed.and_then(|s| s.task.clone()),
                             exited: entry.exited,
                         }
                     })
@@ -452,6 +456,7 @@ fn workspace_views(
                         title: s.title.clone(),
                         status: s.status.map(status_str),
                         agent: s.agent.clone(),
+                        task: s.task.clone(),
                         exited: s.exited,
                     })
                     .collect()
@@ -2059,6 +2064,7 @@ mod tests {
             status: Some(SessionStatus::Done),
             agent: None,
             exited: false,
+            task: None,
         }]);
         let inner = handle.shared.inner.lock().unwrap();
         let facts = crate::repository::AgentStatusRecord {
@@ -2635,6 +2641,7 @@ mod tests {
                     status: Some(SessionStatus::Running),
                     agent: Some("Claude · sonnet · high".into()),
                     exited: false,
+                    task: None,
                 }],
             },
             WorkspaceSeed {
@@ -2650,6 +2657,7 @@ mod tests {
                     status: None,
                     agent: None,
                     exited: false,
+                    task: None,
                 }],
             },
         ];
@@ -2708,6 +2716,7 @@ mod tests {
                 status: None,
                 agent: None,
                 exited: false,
+                task: None,
             }],
         };
         let before = workspace_views(
@@ -3117,6 +3126,7 @@ mod tests {
                 approval_regex: None,
                 error_regex: None,
                 done_regex: None,
+                transient_args: Vec::new(),
             })
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -3440,6 +3450,7 @@ mod tests {
                     approval_regex: None,
                     error_regex: None,
                     done_regex: None,
+                    transient_args: Vec::new(),
                 })
                 .unwrap();
             client
@@ -3993,6 +4004,7 @@ mod tests {
                 status,
                 agent: None,
                 exited: false,
+                task: None,
             }],
         };
         // 재구독 시점: Running으로 시드

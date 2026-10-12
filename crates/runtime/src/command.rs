@@ -399,6 +399,9 @@ pub(crate) fn runtime_command_retained_bytes(
     if let RuntimeCommand::SpawnAgentBeside { pane, .. } = command {
         retained_string(&mut total, &pane.0)?;
     }
+    if let RuntimeCommand::SpawnAgent { transient_args, .. } = command {
+        retained_strings(&mut total, transient_args)?;
+    }
     match command {
         RuntimeCommand::SpawnAgent {
             agent_config_id,
@@ -464,8 +467,13 @@ pub(crate) fn runtime_command_retained_bytes(
         RuntimeCommand::SeedRedaction { credential_ids } => {
             retained_strings(&mut total, credential_ids)?;
         }
-        RuntimeCommand::RespawnArchivedAgent { extra_args, .. } => {
+        RuntimeCommand::RespawnArchivedAgent {
+            extra_args,
+            env_plain,
+            ..
+        } => {
             retained_strings(&mut total, extra_args)?;
+            retained_env(&mut total, env_plain)?;
         }
         RuntimeCommand::SplitPane { pane, .. }
         | RuntimeCommand::ClosePane { pane }
@@ -588,6 +596,9 @@ fn canonicalize_mux_tab_id(id: &mut MuxTabId) {
 /// events are rebuilt with length-bound backing allocations. Validation must run first; this is
 /// capacity canonicalization only and does not alter command semantics or wire representation.
 pub(crate) fn canonicalize_host_command(command: &mut RuntimeCommand) {
+    if let RuntimeCommand::SpawnAgent { transient_args, .. } = command {
+        canonicalize_strings(transient_args);
+    }
     if let RuntimeCommand::SpawnAgentBeside { pane, .. } = command {
         canonicalize_mux_pane_id(pane);
     }
@@ -653,8 +664,13 @@ pub(crate) fn canonicalize_host_command(command: &mut RuntimeCommand) {
         RuntimeCommand::SeedRedaction { credential_ids } => {
             canonicalize_strings(credential_ids);
         }
-        RuntimeCommand::RespawnArchivedAgent { extra_args, .. } => {
+        RuntimeCommand::RespawnArchivedAgent {
+            extra_args,
+            env_plain,
+            ..
+        } => {
             canonicalize_strings(extra_args);
+            canonicalize_env(env_plain);
         }
         RuntimeCommand::SplitPane { pane, .. }
         | RuntimeCommand::ClosePane { pane }
@@ -781,6 +797,17 @@ pub(crate) fn validate_host_command(command: &RuntimeCommand) -> Result<(), Runt
             "runtime_command_spawn_agent_target_invalid",
         ));
     }
+    // 실제 argv는 `args` 뒤에 이번 실행 인자가 붙은 것 — 한도는 합친 argv에 건다.
+    if let RuntimeCommand::SpawnAgent {
+        args,
+        transient_args,
+        ..
+    } = command
+        && !transient_args.is_empty()
+    {
+        let argv: Vec<String> = args.iter().chain(transient_args).cloned().collect();
+        validate_args(&argv)?;
+    }
     match command {
         RuntimeCommand::SpawnShell {
             cols,
@@ -804,6 +831,7 @@ pub(crate) fn validate_host_command(command: &RuntimeCommand) -> Result<(), Runt
             approval_regex,
             error_regex,
             done_regex,
+            ..
         }
         | RuntimeCommand::SpawnAgentBeside {
             cols,
@@ -1032,12 +1060,14 @@ pub(crate) fn validate_host_command(command: &RuntimeCommand) -> Result<(), Runt
             rows,
             scrollback_lines,
             extra_args,
+            env_plain,
             ..
         } => {
             if !dimensions_are_valid(*cols, *rows) || *scrollback_lines > SCROLLBACK_LINES_MAX {
                 return Err(admission_error("runtime_command_respawn_archived_invalid"));
             }
             validate_args(extra_args)?;
+            validate_env_entries(env_plain, &[])?;
         }
         RuntimeCommand::Scroll { .. }
         | RuntimeCommand::KillSession { .. }
@@ -1104,6 +1134,10 @@ pub enum RuntimeCommand {
         approval_regex: Option<String>,
         error_regex: Option<String>,
         done_regex: Option<String>,
+        /// 이번 실행에만 `args` 뒤에 붙이고 세션 행(sessions.args_json)에는 남기지 않는 인자
+        /// — 이어가기·fork 인자, 한 번만 보낼 프롬프트. 남기면 「이어서 실행」이 저장된 인자
+        /// 뒤에 이어가기 인자를 또 붙여 `codex … resume X resume X`가 됐다(2026-10-12 리뷰).
+        transient_args: Vec<String>,
     },
     WriteInput {
         session: SessionId,
@@ -1298,6 +1332,9 @@ pub enum RuntimeCommand {
         /// 한다 — 저장된 launch spec 자체(영속 args)는 바뀌지 않는다(재실행을 거듭해도
         /// 인자가 누적되지 않게).
         extra_args: Vec<String>,
+        /// 이번 실행의 일반 env(런처가 감지한 PATH·`DEPPY_AGENT_EXECUTABLE`). 세션 행에는
+        /// env가 없어, 비우면 Finder로 띄운 앱의 최소 PATH에서 shim이 진짜 CLI를 못 찾았다.
+        env_plain: Vec<(String, String)>,
         cols: u16,
         rows: u16,
         scrollback_lines: usize,
@@ -1417,6 +1454,7 @@ impl std::fmt::Debug for RuntimeCommand {
                 approval_regex,
                 error_regex,
                 done_regex,
+                ..
             }
             | RuntimeCommand::SpawnAgentBeside {
                 cols,
@@ -1613,6 +1651,7 @@ impl std::fmt::Debug for RuntimeCommand {
             RuntimeCommand::RespawnArchivedAgent {
                 session,
                 extra_args,
+                env_plain,
                 cols,
                 rows,
                 scrollback_lines,
@@ -1620,6 +1659,7 @@ impl std::fmt::Debug for RuntimeCommand {
                 .debug_struct("RespawnArchivedAgent")
                 .field("session", session)
                 .field("extra_args_count", &extra_args.len())
+                .field("env_plain_count", &env_plain.len())
                 .field("cols", cols)
                 .field("rows", rows)
                 .field("scrollback_lines", scrollback_lines)
@@ -1670,6 +1710,8 @@ impl std::fmt::Debug for RuntimeCommand {
 
 impl RuntimeCommand {
     /// Converts only an agent launch; all launch fields are moved without cloning secrets.
+    /// 이번 실행에만 붙는 인자(`transient_args`)가 있는 실행은 옆 분할 명령에 그 칸이 없어
+    /// 바꾸지 않는다 — 조용히 버리면 이어가기 인자가 사라진다.
     pub fn with_right_split(
         self,
         pane: MuxPaneId,
@@ -1688,7 +1730,8 @@ impl RuntimeCommand {
                 approval_regex,
                 error_regex,
                 done_regex,
-            } => Ok(Self::SpawnAgentBeside {
+                transient_args,
+            } if transient_args.is_empty() => Ok(Self::SpawnAgentBeside {
                 pane,
                 cols,
                 rows,
@@ -1737,6 +1780,7 @@ impl RuntimeCommand {
                     approval_regex,
                     error_regex,
                     done_regex,
+                    transient_args: Vec::new(),
                 },
                 Some(pane),
             ),
@@ -1910,6 +1954,7 @@ mod tests {
             approval_regex: None,
             error_regex: None,
             done_regex: None,
+            transient_args: Vec::new(),
         }
     }
 
@@ -2006,6 +2051,7 @@ mod tests {
             approval_regex: None,
             error_regex: None,
             done_regex: None,
+            transient_args: Vec::new(),
         };
         let input = RuntimeCommand::WriteInput {
             session: SessionId(7),
@@ -2054,11 +2100,13 @@ mod tests {
             approval_regex: None,
             error_regex: None,
             done_regex: None,
+            transient_args: Vec::new(),
         };
 
+        // wire v29: 끝에 `transient_args`(빈 Vec = 길이 0) 1바이트가 붙는다.
         assert_eq!(
             postcard::to_allocvec(&command).unwrap(),
-            vec![1, 1, 1, 0, 1, 1, b'a', 1, b'x', 0, 0, 0, 0, 0, 0, 0]
+            vec![1, 1, 1, 0, 1, 1, b'a', 1, b'x', 0, 0, 0, 0, 0, 0, 0, 0]
         );
     }
 
@@ -2077,6 +2125,7 @@ mod tests {
             approval_regex: None,
             error_regex: None,
             done_regex: None,
+            transient_args: Vec::new(),
         };
 
         assert!(validate_host_command(&command_with("a".repeat(128))).is_ok());
@@ -2571,6 +2620,7 @@ mod tests {
             approval_regex: Some("x".repeat(REGEX_BYTES_MAX)),
             error_regex: Some("x".repeat(REGEX_BYTES_MAX)),
             done_regex: Some("x".repeat(REGEX_BYTES_MAX)),
+            transient_args: Vec::new(),
         };
 
         let retention = prepare_runtime_command_for_retention(&mut command).unwrap();
@@ -2615,6 +2665,7 @@ mod tests {
             approval_regex: None,
             error_regex: None,
             done_regex: None,
+            transient_args: Vec::new(),
         };
         assert!(validate_host_command(&agent).is_ok());
         canonicalize_host_command(&mut agent);
@@ -2802,6 +2853,7 @@ mod tests {
             cols: 80,
             rows: 24,
             scrollback_lines: 100,
+            env_plain: Vec::new(),
         }
     }
 
@@ -2815,6 +2867,7 @@ mod tests {
                 cols: 0,
                 rows: 24,
                 scrollback_lines: 100,
+                env_plain: Vec::new(),
             },
             RuntimeCommand::RespawnArchivedAgent {
                 session: SessionId(1),
@@ -2822,6 +2875,7 @@ mod tests {
                 cols: TERMINAL_DIMENSION_MAX + 1,
                 rows: 24,
                 scrollback_lines: 100,
+                env_plain: Vec::new(),
             },
             RuntimeCommand::RespawnArchivedAgent {
                 session: SessionId(1),
@@ -2829,6 +2883,7 @@ mod tests {
                 cols: 80,
                 rows: 24,
                 scrollback_lines: SCROLLBACK_LINES_MAX + 1,
+                env_plain: Vec::new(),
             },
         ] {
             assert!(validate_host_command(&invalid).is_err());

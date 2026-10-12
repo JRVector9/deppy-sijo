@@ -23073,6 +23073,7 @@ https://example.test/login \
                 approval_regex: None,
                 error_regex: None,
                 done_regex: None,
+                transient_args: Vec::new(),
             })
             .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);

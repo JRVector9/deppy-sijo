@@ -66,7 +66,8 @@ pub(crate) const PROTO_MAGIC: [u8; 4] = *b"DPRT";
 /// v26: immutable history identities and correlated viewport queries.
 /// v27: bounded display history rows and distinct native/live window metadata.
 /// v28: bounded project-key exclusions in DotenvSourceSelection prevent inherited/source fallback.
-pub(crate) const PROTO_VERSION: u16 = 28;
+/// v29: SpawnAgent `transient_args` (not persisted) and RespawnArchivedAgent `env_plain`.
+pub(crate) const PROTO_VERSION: u16 = 29;
 
 /// delta viewport 스트리밍 기능 비트 (§3.1).
 pub(crate) const FEAT_DELTA_VIEWPORT: u32 = 1 << 0;
@@ -591,6 +592,7 @@ mod tests {
         assert!(event_source.contains("ScrollbackLimitApplied"));
         assert!(protocol_source.contains("**v13**"));
         assert!(command_source.contains("excluded_names"));
-        assert_eq!(PROTO_VERSION, 28);
+        assert!(command_source.contains("transient_args"));
+        assert_eq!(PROTO_VERSION, 29);
     }
 }

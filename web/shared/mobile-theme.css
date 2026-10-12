@@ -873,6 +873,7 @@
 .m-session-row .title { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; font-size: 14px; line-height: 20px; font-weight: 500; }
 .session-meta { display: block; margin-top: 5px; color: var(--m-muted); font-size: 12px; line-height: 17px; }
 .session-meta .agent { font-size: 12px; }
+.session-task { display: block; margin-top: 3px; overflow: hidden; color: var(--m-muted); font-size: 12px; line-height: 17px; text-overflow: ellipsis; white-space: nowrap; }
 .session-dot { flex: none; width: 7px; height: 7px; border-radius: 50%; background: #898989; }
 .session-dot.running, .session-dot.done { background: var(--m-green); }
 .session-dot.waiting, .session-dot.needs_approval { background: var(--m-amber); }

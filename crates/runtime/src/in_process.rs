@@ -2891,7 +2891,13 @@ impl Worker {
                 approval_regex,
                 error_regex,
                 done_regex,
+                transient_args,
             } => {
+                // 세션 행에는 이번 실행에만 붙는 인자를 빼고 남긴다 — 「이어서 실행」이 저장된
+                // 인자 뒤에 이어가기 인자를 다시 붙이므로 겹치지 않게.
+                let persisted_args = args.clone();
+                let mut args = args;
+                args.extend(transient_args);
                 let correlation_id = agent_config_id
                     .as_ref()
                     .map(|id| AgentConfigCorrelationId::from_validated(id.clone()));
@@ -2996,7 +3002,7 @@ impl Worker {
                                 agent_config_id,
                                 AGENT_TITLE_ID,
                                 &spec.program,
-                                &spec.args,
+                                &persisted_args,
                                 &Self::spawn_cwd_string(&spec.cwd),
                                 waiting_regex,
                                 approval_regex,
@@ -3469,6 +3475,7 @@ impl Worker {
             RuntimeCommand::RespawnArchivedAgent {
                 session,
                 extra_args,
+                env_plain,
                 cols,
                 rows,
                 scrollback_lines,
@@ -3480,7 +3487,14 @@ impl Worker {
                     });
                     return;
                 }
-                self.respawn_archived_agent(session, extra_args, cols, rows, scrollback_lines);
+                self.respawn_archived_agent(
+                    session,
+                    extra_args,
+                    env_plain,
+                    cols,
+                    rows,
+                    scrollback_lines,
+                );
             }
         }
     }
@@ -4221,6 +4235,7 @@ impl Worker {
         &mut self,
         session: SessionId,
         extra_args: Vec<String>,
+        env_plain: Vec<(String, String)>,
         cols: u16,
         rows: u16,
         scrollback_lines: usize,
@@ -4292,7 +4307,8 @@ impl Worker {
         // 예전 판 래퍼가 저장돼 있어도 지금 판으로 실행한다(폴백 셸의 셸 통합 복원).
         crate::agent_wrapper::refresh_agent_wrapper(&command, &mut args);
         args.extend(extra_args);
-        let (mut env, redaction_leases) = match self.prepare_agent_env(Vec::new(), Vec::new()) {
+        // 런처가 감지한 PATH·실행 파일을 이번 실행에 다시 준다(세션 행에는 env가 없다).
+        let (mut env, redaction_leases) = match self.prepare_agent_env(env_plain, Vec::new()) {
             Ok(prepared) => prepared,
             Err(_) => {
                 self.emit(RuntimeEvent::SpawnFailed {
@@ -7467,6 +7483,7 @@ mod tests {
             approval_regex: None,
             error_regex: None,
             done_regex: None,
+            transient_args: Vec::new(),
         }
     }
 
@@ -7797,6 +7814,7 @@ mod tests {
                 approval_regex: None,
                 error_regex: None,
                 done_regex: None,
+                transient_args: Vec::new(),
             })
             .unwrap();
         probe.wait_for(Duration::from_secs(15), |event| match event {
@@ -12205,6 +12223,7 @@ mod tests {
                 approval_regex: None,
                 error_regex: None,
                 done_regex: None,
+                transient_args: Vec::new(),
             })
             .unwrap();
         let waited = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -12307,6 +12326,7 @@ mod tests {
                 approval_regex: None,
                 error_regex: None,
                 done_regex: None,
+                transient_args: Vec::new(),
             })
             .unwrap();
         probe.wait_for(Duration::from_secs(15), |event| match event {
@@ -12358,6 +12378,7 @@ mod tests {
             approval_regex: None,
             error_regex: None,
             done_regex: None,
+            transient_args: Vec::new(),
         })
         .unwrap();
 
@@ -12424,6 +12445,7 @@ mod tests {
             approval_regex: None,
             error_regex: None,
             done_regex: None,
+            transient_args: Vec::new(),
         })
         .unwrap();
         let session = probe.wait_for(Duration::from_secs(15), |event| match event {
@@ -12470,6 +12492,7 @@ mod tests {
                 approval_regex: None,
                 error_regex: None,
                 done_regex: None,
+                transient_args: Vec::new(),
             })
             .unwrap();
         // resolve 실패 → SpawnFailed. Adapter error/credential coordinates are
@@ -12524,6 +12547,7 @@ mod tests {
                 approval_regex: None,
                 error_regex: None,
                 done_regex: None,
+                transient_args: Vec::new(),
             })
             .unwrap();
         let session = probe.wait_for(Duration::from_secs(15), |event| match event {
@@ -12580,6 +12604,7 @@ mod tests {
                 approval_regex: None,
                 error_regex: None,
                 done_regex: None,
+                transient_args: Vec::new(),
             })
             .unwrap();
         probe.wait_for(Duration::from_secs(15), |event| match event {
@@ -12658,6 +12683,7 @@ mod tests {
                 approval_regex: None,
                 error_regex: None,
                 done_regex: None,
+                transient_args: Vec::new(),
             })
             .unwrap_err();
         assert_eq!(error.to_string(), "runtime_command_spawn_agent_invalid");
@@ -12714,6 +12740,7 @@ mod tests {
                 approval_regex: None,
                 error_regex: None,
                 done_regex: None,
+                transient_args: Vec::new(),
             })
             .unwrap();
         let session = probe.wait_for(Duration::from_secs(15), |e| match e {
@@ -12846,6 +12873,7 @@ mod tests {
             approval_regex: None,
             error_regex: None,
             done_regex: done.map(str::to_owned),
+            transient_args: Vec::new(),
         }
     }
 
@@ -12953,6 +12981,7 @@ mod tests {
                 approval_regex: None,
                 error_regex: None,
                 done_regex: None,
+                transient_args: Vec::new(),
             })
             .unwrap();
         let session = probe.wait_for(Duration::from_secs(15), |e| match e {
@@ -14902,6 +14931,7 @@ mod tests {
                 approval_regex: None,
                 error_regex: Some("FATAL".into()),
                 done_regex: None,
+                transient_args: Vec::new(),
             })
             .unwrap();
         let session = probe.wait_for(Duration::from_secs(15), |event| match event {
@@ -15952,6 +15982,7 @@ mod tests {
                 cols: 80,
                 rows: 24,
                 scrollback_lines: 100,
+                env_plain: Vec::new(),
             })
             .unwrap();
 
@@ -16027,6 +16058,154 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// 2026-10-12 리뷰: Work History 새 pane 재개가 `resume X`를 세션 행에 남겨, 재시작 뒤
+    /// 「이어서 실행」이 `resume X resume X`를 만들었다. 이번 실행 인자는 행에 남기지 않는다.
+    #[test]
+    #[cfg(unix)]
+    fn spawn_agent의_transient_args는_실행에만_붙고_세션_행에는_남지_않는다() {
+        let dir = unique_test_dir("spawn-transient");
+        let db_path = dir.join("metadata.sqlite3");
+        let workspace_id = "ws-spawn-transient";
+        create_persist_db(&db_path, workspace_id);
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            dir.join("logs"),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+            Some(crate::persistence::PersistConfig {
+                db_path: db_path.clone(),
+                workspace_id: workspace_id.to_owned(),
+            }),
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::SpawnAgent {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+                agent_config_id: Some("cfg-sf03".to_owned()),
+                command: "/bin/echo".to_owned(),
+                args: vec!["stored-arg".to_owned()],
+                env_plain: Vec::new(),
+                env_secrets: Vec::new(),
+                waiting_regex: None,
+                approval_regex: None,
+                error_regex: None,
+                done_regex: None,
+                transient_args: vec!["transient-arg".to_owned()],
+            })
+            .unwrap();
+        let session = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::AgentSpawned { session } => Some(*session),
+            _ => None,
+        });
+        let text = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::Viewport {
+                session: viewed,
+                snapshot,
+                ..
+            } if *viewed == session => {
+                let text = snapshot_text(snapshot, 0);
+                text.contains("stored-arg").then_some(text)
+            }
+            _ => None,
+        });
+        assert_eq!(text, "stored-arg transient-arg", "이번 실행에는 붙는다");
+        drop(probe);
+        drop(client);
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let rows = persist::load_sessions(&conn, workspace_id).unwrap();
+        let agent = rows
+            .iter()
+            .find(|row| row.command == "/bin/echo")
+            .expect("agent row");
+        assert_eq!(
+            agent.args,
+            vec!["stored-arg".to_owned()],
+            "행에는 남지 않는다"
+        );
+        drop(conn);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 2026-10-12 리뷰: 「이어서 실행」이 런처 env를 잃어, Finder로 띄운 앱의 최소 PATH에서
+    /// shim이 진짜 CLI를 못 찾았다. 앱이 넘긴 env가 재실행 프로세스에 들어간다.
+    #[test]
+    #[cfg(unix)]
+    fn respawn_archived_agent는_앱이_넘긴_실행_env를_쓴다() {
+        let dir = unique_test_dir("respawn-env");
+        let db_path = dir.join("metadata.sqlite3");
+        let workspace_id = "ws-respawn-env";
+        let persistent_id = "respawn-env-session";
+        create_persist_db(&db_path, workspace_id);
+        seed_persisted_agent_session_pane(
+            &db_path,
+            workspace_id,
+            persistent_id,
+            "cfg-sf03",
+            "/bin/sh",
+            vec![
+                "-c".to_owned(),
+                "printf 'env=%s' \"$DEPPY_RESPAWN_TEST_ENV\"".to_owned(),
+            ],
+            persist::SESSION_STATUS_EXITED,
+            "/tmp",
+        );
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            dir.join("logs"),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+            Some(crate::persistence::PersistConfig {
+                db_path: db_path.clone(),
+                workspace_id: workspace_id.to_owned(),
+            }),
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::RestoreWorkspace)
+            .unwrap();
+        let archived = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::MuxUpdated { snapshot } => snapshot
+                .tabs
+                .iter()
+                .flat_map(|tab| &tab.panes)
+                .find_map(|pane| pane.session_id),
+            _ => None,
+        });
+        client
+            .send_command(RuntimeCommand::RespawnArchivedAgent {
+                session: archived,
+                extra_args: Vec::new(),
+                env_plain: vec![(
+                    "DEPPY_RESPAWN_TEST_ENV".to_owned(),
+                    "from-launcher".to_owned(),
+                )],
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        let respawned = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::AgentSpawned { session } => Some(*session),
+            _ => None,
+        });
+        probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::Viewport {
+                session, snapshot, ..
+            } if *session == respawned => snapshot_text(snapshot, 0)
+                .contains("env=from-launcher")
+                .then_some(()),
+            _ => None,
+        });
+        drop(probe);
+        drop(client);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// PR-2: 재실행이 PTY spawn 단계에서 실패하면 이전 archived pane/세션/영속 행이
     /// 그대로 보존돼야 한다 — 「다시 실행」 실패가 열람 전용 화면을 잃게 하면 안 된다.
     #[cfg(unix)]
@@ -16094,6 +16273,7 @@ mod tests {
                 cols: 80,
                 rows: 24,
                 scrollback_lines: 100,
+                env_plain: Vec::new(),
             })
             .unwrap();
         probe.wait_for(Duration::from_secs(15), |event| match event {
@@ -16173,6 +16353,7 @@ mod tests {
                 cols: 80,
                 rows: 24,
                 scrollback_lines: 100,
+                env_plain: Vec::new(),
             })
             .unwrap();
         // 2) 존재한 적 없는 session id — pane이 없으므로 거부돼야 한다.
@@ -16183,6 +16364,7 @@ mod tests {
                 cols: 80,
                 rows: 24,
                 scrollback_lines: 100,
+                env_plain: Vec::new(),
             })
             .unwrap();
         // DurableEventBarrier로 위 두 명령의 이벤트가 이미 큐에 들어왔음을 보장한 뒤
@@ -17852,6 +18034,7 @@ mod tests {
                 cols: 80,
                 rows: 24,
                 scrollback_lines: 100,
+                env_plain: Vec::new(),
             })
             .unwrap();
         let new_session = probe.wait_for(Duration::from_secs(15), |event| match event {

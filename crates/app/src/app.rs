@@ -3739,6 +3739,9 @@ struct PreparedAgentLaunch {
     agent_config_id: String,
     command: String,
     args: Vec<String>,
+    /// 이번 실행에만 붙이고 세션 행에 남기지 않는 인자(배치 스폰 프롬프트) — 「이어서 실행」이
+    /// 저장된 인자를 다시 쓸 때 같은 프롬프트를 재전송하지 않게 한다.
+    transient_args: Vec<String>,
     env_plain: Vec<(String, String)>,
     env_secrets: Vec<(String, String)>,
     waiting_regex: Option<String>,
@@ -4564,16 +4567,18 @@ fn prepare_agent_launch(
 
     // extra_arg(있으면)는 설정 args 뒤에 위치 인자로 덧붙인다 — `claude "<prompt>"` /
     // `codex "<prompt>"`와 동일한 형태로 각 CLI가 초기 프롬프트로 즉시 받는다(PR-S2).
-    let mut args = agent.args;
-    if let Some(extra) = extra_arg {
-        args.push(extra.to_string());
-    }
+    // 세션 행에는 남기지 않는다 — 재시작 뒤 「이어서 실행」이 프롬프트를 다시 보내지 않게.
+    let args = agent.args;
+    let transient_args = extra_arg
+        .map(|extra| vec![extra.to_string()])
+        .unwrap_or_default();
 
     Ok(PreparedAgentLaunch {
         runtime_workspace_id,
         agent_config_id: agent.id,
         command: agent.command,
         args,
+        transient_args,
         env_plain,
         env_secrets,
         waiting_regex: agent.waiting_regex,
@@ -11255,7 +11260,16 @@ fn project_pane_hooks(
             session_id: row.agent_session_id.clone(),
             transcript: PathBuf::from(&row.transcript_path),
         };
-        projection.history.insert(session, binding.clone());
+        // 공유 대화 판정은 이번 runtime 실행의 hook만 본다. 세션 번호는 실행마다 다시 시작해
+        // 이전 실행의 `workspace:3` 기록이 지금의 다른 pane 3을 「공유」로 만들어, 정상적으로
+        // 이어간 대화의 작업 문구까지 숨겼다(2026-10-12 리뷰).
+        if row
+            .execution_stamp
+            .as_ref()
+            .is_some_and(|stamp| stamp.runtime_instance == runtime_token)
+        {
+            projection.history.insert(session, binding.clone());
+        }
         let Some(running) = kinds.get(&(runtime_instance, session)) else {
             continue;
         };
@@ -17227,6 +17241,7 @@ impl App {
             approval_regex: None,
             error_regex: None,
             done_regex: None,
+            transient_args: Vec::new(),
         };
         if self
             .stage_dotenv_continuation(
@@ -17357,6 +17372,7 @@ impl App {
             approval_regex: None,
             error_regex: None,
             done_regex: None,
+            transient_args: Vec::new(),
         };
         if self
             .stage_dotenv_continuation(
@@ -19668,9 +19684,11 @@ impl App {
         }
         let running = self.running_resume_targets(Some(session), Some(&pane.0));
         let respawn = archived_respawn_args(row, extra_args, &running);
+        let env_plain = self.archived_respawn_env(row);
         let command = runtime::RuntimeCommand::RespawnArchivedAgent {
             session,
             extra_args: respawn.extra_args,
+            env_plain,
             cols: 80,
             rows: 24,
             scrollback_lines: self.config.terminal.scrollback_lines as usize,
@@ -19690,6 +19708,39 @@ impl App {
             }
         }
         staged
+    }
+
+    /// 런처가 새 실행에 넣는 PATH·실행 파일 env. 세션 행에는 env가 없어, 비우면 Finder로 띄운
+    /// 앱의 최소 PATH에서 shim이 진짜 CLI를 못 찾았다(exit 127). 감지 전이면 비운다 — 그때는
+    /// `archived_resume_target`이 실행 자체를 보류한다.
+    fn archived_respawn_env(
+        &self,
+        row: Option<&storage::ArchivedAgentResumeRow>,
+    ) -> Vec<(String, String)> {
+        let Some(kind) = row
+            .and_then(|row| crate::agent_launcher::AgentKind::from_stable_config_id(&row.agent_id))
+        else {
+            return Vec::new();
+        };
+        let Some(agent) = self
+            .agent_launcher_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.find(kind))
+        else {
+            return Vec::new();
+        };
+        let shim = (self.config.ui.agent_status_hooks && kind.supports_deppy_shim())
+            .then(crate::agent_shim::shim_dir)
+            .flatten()
+            .map(|directory| directory.join(kind.id()));
+        let options = crate::agent_launcher::LaunchOptions {
+            model: String::new(),
+            effort: None,
+            yolo: false,
+        };
+        crate::agent_launcher::build_launch_spec(agent, options, shim.as_deref())
+            .map(|spec| spec.into_parts().3)
+            .unwrap_or_default()
     }
 
     /// 다른 pane이 지금 잇고 있는 대화 — 감지된 binding과, 아직 binding이 안 잡힌 직전
@@ -19798,7 +19849,7 @@ impl App {
         else {
             return false;
         };
-        let (_, command, mut args, env_plain) = spec.into_parts();
+        let (_, command, args, env_plain) = spec.into_parts();
         // 다른 pane이 같은 대화를 잇고 있으면 「이어서 실행」과 같은 규칙으로 fork한다.
         let binding = Some((kind.id(), native_session_id));
         let target = crate::agent_resume::resume_target(kind.stable_config_id(), binding);
@@ -19808,7 +19859,12 @@ impl App {
             .filter(|target| running.iter().any(|other| target.may_share(other)))
             .and_then(|_| crate::agent_resume::fork_resume_plan(kind.stable_config_id(), binding));
         let continues = target.filter(|_| forked.is_none());
-        args.extend(forked.map_or(extra_args, crate::agent_resume::ResumePlan::into_extra_args));
+        let resume_args =
+            forked.map_or(extra_args, crate::agent_resume::ResumePlan::into_extra_args);
+        // 런처 실행과 같이 에이전트가 끝나면 셸로 넘어가는 래퍼로 감싼다 — 완료·오류 상태와
+        // 폴백 셸이 생긴다. 이어가기 인자는 세션 행에 남기지 않는다(재시작 뒤 「이어서 실행」이
+        // 다시 붙이므로 `resume X resume X`가 됐다).
+        let (command, args) = crate::agent_launcher::wrap_agent_then_shell(command, args);
         let runtime_command = runtime::RuntimeCommand::SpawnAgent {
             agent_config_id: Some(kind.stable_config_id().to_owned()),
             cols: 80,
@@ -19822,12 +19878,18 @@ impl App {
             approval_regex: None,
             error_regex: None,
             done_regex: None,
+            transient_args: resume_args,
         };
-        let sent = self.active.runtime.send_command(runtime_command).is_ok();
-        if sent && let Some(continued) = continues {
+        let staged = self
+            .stage_dotenv_continuation(
+                self.active.runtime_instance,
+                PendingDotenvContinuation::RuntimeCommand(runtime_command),
+            )
+            .is_ok();
+        if staged && let Some(continued) = continues {
             self.record_archived_respawn(None, continued);
         }
-        sent
+        staged
     }
 
     fn pty_agent_surfaces(
@@ -20518,10 +20580,9 @@ impl App {
         // PR-resume-without-pane: 이력 행의 kind + agent_sessions 바인딩만으로 정확한
         // 재개가 가능한지 마지막으로 확인한다. pane_id는 mux 존재와 무관하게 워크스페이스
         // 전체에서 로드된 값이라(§resume_without_pane_plan 문서) 여기까지 와도 유효하다.
-        let binding = self
-            .restore_agents
-            .get(&row.pane_id)
-            .map(|saved| (saved.kind.as_str(), saved.session_id.as_str()));
+        // 이 카드의 대화를 잇는다. pane의 최신 binding은 이후 다른 대화로 바뀌었을 수 있다
+        // (2026-10-12 리뷰: 예전 카드가 그 pane의 최신 대화를 열었다).
+        let binding = Some((row.kind.as_str(), row.agent_session_id.as_str()));
         let native_session_id = binding.map(|(_, session_id)| session_id.to_owned());
         match (resume_without_pane_plan(kind, binding), native_session_id) {
             (Some(extra_args), Some(native_session_id)) => {
@@ -22889,6 +22950,10 @@ impl App {
                                 // 돌고 있는 에이전트("Claude · sonnet · high") — 사이드바
                                 // 2행과 같은 원천(agent_detect). 셸이면 None.
                                 agent: entry.agent_line,
+                                task: self.active.workspace_ui.agent_task_line_for(
+                                    session,
+                                    crate::agent_surface::AgentVisualState::from_pty(entry.status),
+                                ),
                                 exited: self.active.live.exited_sessions.contains(&session),
                             })
                         })
@@ -22901,9 +22966,8 @@ impl App {
                         sessions,
                     };
                 }
-                // 대기(warm)/절전 — 감지 워커가 안 돌아 상태는 없다. 이름만 활동 패널과 동일 규칙.
-                // 대기는 에이전트가 살아있어 마지막 감지 정보를 유지·표시하고(방안①), 절전은 죽어
-                // 표시하지 않는다.
+                // 대기(warm)/절전 — 이름은 활동 패널과 동일 규칙. 대기는 에이전트가 살아 있어
+                // 마지막 감지 정보와 작업을 유지·표시하고(방안①), 절전은 죽어 표시하지 않는다.
                 let (state, sessions): (WorkspaceState, Vec<SessionSeed>) =
                     match self.warm.get(&ws.id) {
                         Some(rt) => {
@@ -22920,8 +22984,16 @@ impl App {
                                         }),
                                         user_override: None,
                                         title: self.activity_session_name(&ws.id, raw),
+                                        // 승인된 모바일 디자인: 저장된(대기) 세션은 실행 중을
+                                        // 주장하지 않는다 — 상태는 싣지 않고 작업만 보인다.
                                         status: None,
                                         agent: rt.workspace_ui.agent_line_for(*s),
+                                        task: rt.workspace_ui.agent_task_line_for(
+                                            *s,
+                                            crate::agent_surface::AgentVisualState::from_pty(
+                                                rt.workspace_ui.last_session_detected_status(*s),
+                                            ),
+                                        ),
                                         exited: false,
                                     })
                                 })
@@ -22941,6 +23013,7 @@ impl App {
                                     title: self.activity_session_name(&ws.id, &row.title),
                                     status: None,
                                     agent: None, // 절전 — 에이전트 죽음
+                                    task: None,
                                     exited: false,
                                 })
                                 .collect();
@@ -29328,11 +29401,22 @@ impl App {
             approval_regex: prepared.approval_regex,
             error_regex: prepared.error_regex,
             done_regex: prepared.done_regex,
+            transient_args: prepared.transient_args,
         };
         let command = match split_target {
-            Some(target) => command
-                .with_right_split(target.pane)
-                .expect("prepared agent command"),
+            Some(target) => match command.with_right_split(target.pane) {
+                Ok(command) => command,
+                // 옆 분할 명령에는 이번 실행 인자 칸이 없다 — 인자를 버리지 않고 실행을 거절한다.
+                Err(_) => {
+                    if let Some(ticket_id) = ticket_id {
+                        self.approval_launch_tracker.cancel(ticket_id);
+                    }
+                    if let Some(request_id) = launcher_request_id {
+                        self.fail_agent_launcher_request(request_id);
+                    }
+                    return false;
+                }
+            },
             None => command,
         };
         let runtime_instance = self.active.runtime_instance;
@@ -41113,7 +41197,7 @@ mod tests {
                     waiting_regex: None,
                     approval_regex: None,
                     error_regex: None,
-                    done_regex: None,
+                    done_regex: None, transient_args: Vec::new(),
                 })
                 .unwrap();
             let mut events = Vec::new();
@@ -42846,6 +42930,7 @@ mod tests {
             approval_regex: None,
             error_regex: None,
             done_regex: None,
+            transient_args: Vec::new(),
         };
         let fresh = (false, None);
         for command in [agent, runtime::RuntimeCommand::RestoreWorkspace] {
@@ -43660,6 +43745,7 @@ mod tests {
                 approval_regex: None,
                 error_regex: None,
                 done_regex: None,
+                transient_args: Vec::new(),
             },
             approval_ticket: Some(1),
             launcher_request_id: Some(2),
@@ -44738,6 +44824,43 @@ mod tests {
         }
     }
 
+    /// 2026-10-12 리뷰: 세션 번호는 실행마다 다시 시작해, 이전 실행의 같은 번호 기록이 지금
+    /// pane을 「공유 대화」로 만들어 작업 문구를 숨겼다. 이번 실행의 기록만 공유로 본다.
+    #[test]
+    fn 이전_runtime_실행의_hook_기록은_공유_대화_판정에_넣지_않는다() {
+        use deppy_core::process_identity::HookExecutionStamp;
+        let row = |key: &str, token: Option<&str>| storage::HookSessionRow {
+            session_key: format!("ws:{key}"),
+            kind: "claude".to_owned(),
+            agent_session_id: "240ec284-0fd0-4e44-8336-18f5cc5f88fe".to_owned(),
+            transcript_path: "/fixture/240ec284.jsonl".to_owned(),
+            task_prompt: None,
+            updated_at: 0,
+            execution_stamp: token.map(|token| HookExecutionStamp {
+                runtime_instance: token.to_owned(),
+                ancestors: Vec::new(),
+            }),
+            task_prompt_execution_stamp: None,
+        };
+        let kinds = HashMap::new();
+        let previous_run = project_pane_hooks(
+            "ws",
+            1,
+            "current-run",
+            &kinds,
+            &[row("3", Some("previous-run")), row("4", None)],
+        );
+        assert!(previous_run.history.is_empty());
+        let current_run = project_pane_hooks(
+            "ws",
+            1,
+            "current-run",
+            &kinds,
+            &[row("3", Some("current-run"))],
+        );
+        assert!(current_run.history.contains_key(&runtime::SessionId(3)));
+    }
+
     #[test]
     fn independent_db_hook_projection_accepts_first_verified_prompt_for_each_provider() {
         use crate::agent_detect::{AgentDisplay, AgentExecutionIdentity, AgentKind, RunningAgent};
@@ -44789,11 +44912,13 @@ mod tests {
             );
             // A closed peer's raw binding makes transcript text ambiguous. The
             // pane's first verified prompt must still be available for its title.
-            db.upsert_hook_session(
+            // 같은 runtime 실행의 기록이라 공유 판정에 들어간다.
+            db.upsert_hook_session_with_execution(
                 &format!("{workspace}:{}", index + 101),
                 provider,
                 &native,
                 "/fixture/shared.jsonl",
+                Some(&stamp),
             )
             .unwrap();
             kinds.insert(
@@ -52114,6 +52239,7 @@ mod tests {
                     approval_regex: None,
                     error_regex: None,
                     done_regex: None,
+                    transient_args: Vec::new(),
                 },
                 approval_ticket: None,
                 launcher_request_id: None,
@@ -53758,6 +53884,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(other.env_plain, vec![("FLAG".into(), "2".into())]);
+        // 배치 스폰 프롬프트는 이번 실행에만 붙고 세션 행(args)에는 남지 않는다 — 재시작 뒤
+        // 「이어서 실행」이 같은 프롬프트를 다시 보내지 않게(2026-10-12 리뷰).
+        let batch = prepare_agent_launch(
+            (db, fixture.store.as_ref()),
+            workspace,
+            "fixture-agent",
+            Some(&profile),
+            workspace.clone(),
+            Some(Arc::from("do the batch task")),
+        )
+        .unwrap();
+        assert!(!batch.args.iter().any(|arg| arg == "do the batch task"));
+        assert_eq!(batch.transient_args, vec!["do the batch task".to_owned()]);
         fixture
             .store
             .1
@@ -53888,6 +54027,7 @@ mod tests {
             approval_regex: None,
             error_regex: None,
             done_regex: None,
+            transient_args: Vec::new(),
         }
         .with_right_split(runtime::MuxPaneId("anchor".to_owned()))
         .unwrap();

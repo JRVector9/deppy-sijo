@@ -800,6 +800,7 @@ export function createShell({ endpoint, socketFactory, identityStore = {loadOrCr
     const status = workspace.state === "active" ? statusOf(view) : "dormant";
     const copy = element("span", "session-name");
     copy.append(element("strong", "title", view.title || "세션"), element("span", "session-meta", `${sessionLabel(view, workspace)} · ${view.agent || "터미널"}`));
+    if (view.task) copy.append(element("span", "session-task", view.task));
     row.append(element("span", `session-dot ${status}`), copy, element("span", "row-arrow", view.id === state.watching ? "✓" : "›"));
     row.disabled = !watchable(workspace).some(candidate => candidate.id === view.id);
     if (view.id === state.watching) row.setAttribute("aria-current", "true");

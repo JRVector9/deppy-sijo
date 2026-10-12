@@ -1249,7 +1249,7 @@ mod tests {
         worker.send_command(runtime::RuntimeCommand::SpawnAgent {
             cols: 32, rows: 3, scrollback_lines: 100, agent_config_id: None,
             command: "/bin/sh".into(), args: vec!["-c".into(), r"stty -echo; printf '00\r\n01\r\n02\r\n03\r\n04\r\n05\r\n06\r\n07\r\n08\r\n09\r\n'; while IFS= read -r line; do printf 'same\r\n'; done".into()],
-            env_plain: Vec::new(), env_secrets: Vec::new(), waiting_regex: None, approval_regex: None, error_regex: None, done_regex: None,
+            env_plain: Vec::new(), env_secrets: Vec::new(), waiting_regex: None, approval_regex: None, error_regex: None, done_regex: None, transient_args: Vec::new(),
         }).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut identity = None;
@@ -1784,6 +1784,7 @@ mod tests {
                 approval_regex: None,
                 error_regex: None,
                 done_regex: None,
+                transient_args: Vec::new(),
             })
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -2487,6 +2488,7 @@ mod tests {
                 status: Some(runtime::SessionStatus::NeedsApproval),
                 agent: Some("Claude · sonnet · high".to_owned()),
                 exited: false,
+                task: None,
             }]),
         );
         let mut ws = ws_client_authed(addr);
@@ -2537,6 +2539,7 @@ mod tests {
                         status: Some(runtime::SessionStatus::Running),
                         agent: Some("Codex · gpt-5.5 · high".to_owned()),
                         exited: false,
+                        task: None,
                     }],
                 },
                 dashboard::WorkspaceSeed {
@@ -2552,6 +2555,7 @@ mod tests {
                         status: None,
                         agent: None,
                         exited: false,
+                        task: None,
                     }],
                 },
             ],
@@ -2582,6 +2586,7 @@ mod tests {
                 status: Some(runtime::SessionStatus::NeedsApproval),
                 agent: None,
                 exited: false,
+                task: None,
             }]),
         );
         let mut ws = ws_client_authed(addr);
@@ -2601,6 +2606,7 @@ mod tests {
                 status: Some(runtime::SessionStatus::Error),
                 agent: None,
                 exited: false,
+                task: None,
             }]),
         );
         let frame = wait_dashboard_frame(&mut ws, r#""id":"uuid-2""#)

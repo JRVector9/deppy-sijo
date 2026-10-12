@@ -2429,7 +2429,7 @@ mod tests {
             command: "/bin/sh".into(), args: vec!["-c".into(),
                 r#"sleep 30 & owner=$!; printf 'OWNER:%s\r\n❯ ' "$owner"; wait "$owner"; printf '\r\nFALLBACK\r\n❯ '; exec /bin/cat"#.into()],
             env_plain: vec![], env_secrets: vec![], waiting_regex: None, approval_regex: None,
-            error_regex: None, done_regex: None,
+            error_regex: None, done_regex: None, transient_args: Vec::new(),
         }).unwrap();
         let session = wait(&rx, &mut seen, |event| match event {
             RuntimeEvent::AgentSpawned { session } => Some(*session),

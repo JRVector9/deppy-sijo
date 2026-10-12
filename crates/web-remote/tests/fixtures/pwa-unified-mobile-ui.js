@@ -16,7 +16,7 @@
   Object.defineProperty(window, 'visualViewport', { get: () => unifiedMobileViewport });
   globalThis.unifiedMobileWorkspaces = [
     { id: 'ws-active', name: '현재 프로젝트', current_directory: '/projects/한글', state: 'active', sessions: [
-      { id: 'session-a', title: '모바일 통합 입력과 긴 제목의 줄바꿈을 검증하는 세션 · 세션별 초안과 한글 경로 보존', agent: 'Codex · GPT', status: 'running', exited: false },
+      { id: 'session-a', title: '모바일 통합 입력과 긴 제목의 줄바꿈을 검증하는 세션 · 세션별 초안과 한글 경로 보존', agent: 'Codex · GPT', task: '검토해 PF별 개선사항 보고', status: 'running', exited: false },
       { id: 'session-b', title: '한글 경로 입력', agent: 'Claude', status: 'waiting', exited: false },
     ] },
     { id: 'ws-warm', name: '대기 프로젝트', current_directory: '/projects/archive', state: 'warm', sessions: [
@@ -131,6 +131,8 @@
     check(getComputedStyle(row.querySelector('.title')).fontSize === '14px', 'session title14px');
     check(getComputedStyle(row.querySelector('.agent')).fontSize === '12px', 'agent12px');
     check(row.querySelector('.session-meta').firstElementChild.classList.contains('session-status'), 'status precedes agent as approved');
+    check(row.querySelector('.session-task')?.textContent === '검토해 PF별 개선사항 보고', 'agent task line shows under the session');
+    check(getComputedStyle(row.querySelector('.session-task')).whiteSpace === 'nowrap', 'task line stays one line');
     check(getComputedStyle(row.querySelector('.title')).webkitLineClamp === '2', 'title max2lines');
     row.click(); await waitFor(() => !$('composer-text').disabled, 'viewer ready');
     const warm = unifiedMobileWorkspaces[1], savedWarm = structuredClone(warm);

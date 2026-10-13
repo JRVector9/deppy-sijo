@@ -38,6 +38,7 @@ struct Pending {
 }
 struct Access {
     connection_id: String,
+    display_name: String,
     issued_at: u64,
     input: bool,
     expires: u64,
@@ -45,6 +46,7 @@ struct Access {
 }
 struct Refresh {
     connection_id: String,
+    display_name: String,
     client: String,
     resource: String,
     input: bool,
@@ -100,7 +102,7 @@ impl OAuth {
         let access = self.access.get(key).filter(|access| now < access.expires)?;
         Some(crate::Principal {
             id: access.connection_id.clone(),
-            name: "OAuth connection".into(),
+            name: access.display_name.clone(),
             auth_kind: crate::AuthKind::OAuth,
             input_scope: access.input,
             authenticated_at: access.issued_at,
@@ -400,6 +402,7 @@ impl OAuth {
                 }
                 let (
                     connection_id,
+                    display_name,
                     input,
                     refresh_input,
                     expiry,
@@ -430,6 +433,7 @@ impl OAuth {
                         }
                         (
                             f.connection_id.clone(),
+                            self.clients[&client].name.clone(),
                             f.input,
                             f.input,
                             expires,
@@ -468,6 +472,7 @@ impl OAuth {
                         }
                         (
                             r.connection_id.clone(),
+                            r.display_name.clone(),
                             input,
                             r.input,
                             r.expires,
@@ -505,6 +510,7 @@ impl OAuth {
                     hash(&access),
                     Access {
                         connection_id: connection_id.clone(),
+                        display_name: display_name.clone(),
                         issued_at: now,
                         input,
                         expires: now + ttl,
@@ -515,6 +521,7 @@ impl OAuth {
                     hash(&refresh),
                     Refresh {
                         connection_id,
+                        display_name,
                         client,
                         resource,
                         input: refresh_input,
@@ -681,6 +688,104 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned()
+    }
+    #[test]
+    fn cloud_management_oauth_names_follow_approved_clients_and_refresh() {
+        let mut oauth = OAuth::new(secret::RedactionService::new());
+        let mut grants = Vec::new();
+        for name in ["Review Bot", "Build Bot"] {
+            let registration =
+                json!({"client_name":name,"redirect_uris":["https://client.example/callback"]})
+                    .to_string();
+            let client = json_body(
+                route(
+                    &mut oauth,
+                    "POST",
+                    "/oauth/register",
+                    "",
+                    &registration,
+                    100,
+                )
+                .0,
+            )["client_id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let verifier = "x".repeat(43);
+            let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(&verifier));
+            let query = url::form_urlencoded::Serializer::new(String::new())
+                .extend_pairs([
+                    ("client_id", client.as_str()),
+                    ("redirect_uri", "https://client.example/callback"),
+                    ("resource", "https://deppy.example/mcp"),
+                    ("response_type", "code"),
+                    ("code_challenge_method", "S256"),
+                    ("code_challenge", challenge.as_str()),
+                ])
+                .finish();
+            assert_eq!(
+                route(&mut oauth, "GET", "/oauth/authorize", &query, "", 101)
+                    .0
+                    .status,
+                200
+            );
+            let approval = oauth.approvals(101).pop().unwrap();
+            assert_eq!(approval.client_name, name);
+            assert!(oauth.approve(&approval.id, true, 102));
+            let (redirect, headers) = route(
+                &mut oauth,
+                "GET",
+                "/oauth/authorize",
+                &format!("request={}", approval.id),
+                "",
+                103,
+            );
+            assert_eq!(redirect.status, 303);
+            let location = &headers.iter().find(|(key, _)| key == "Location").unwrap().1;
+            let code = url::Url::parse(location)
+                .unwrap()
+                .query_pairs()
+                .find(|(key, _)| key == "code")
+                .unwrap()
+                .1
+                .into_owned();
+            let body = url::form_urlencoded::Serializer::new(String::new())
+                .extend_pairs([
+                    ("grant_type", "authorization_code"),
+                    ("client_id", client.as_str()),
+                    ("redirect_uri", "https://client.example/callback"),
+                    ("resource", "https://deppy.example/mcp"),
+                    ("code", code.as_str()),
+                    ("code_verifier", verifier.as_str()),
+                ])
+                .finish();
+            let tokens = json_body(route(&mut oauth, "POST", "/oauth/token", "", &body, 104).0);
+            let principal = oauth
+                .principal_key(&hash(tokens["access_token"].as_str().unwrap()), 104)
+                .unwrap();
+            grants.push((client, tokens, principal, name));
+        }
+        assert_ne!(grants[0].2.id, grants[1].2.id);
+        for (client, tokens, original, name) in grants {
+            assert_eq!(original.name, name, "approved label is display metadata");
+            let body = url::form_urlencoded::Serializer::new(String::new())
+                .extend_pairs([
+                    ("grant_type", "refresh_token"),
+                    ("client_id", client.as_str()),
+                    ("resource", "https://deppy.example/mcp"),
+                    ("refresh_token", tokens["refresh_token"].as_str().unwrap()),
+                ])
+                .finish();
+            let refreshed = json_body(route(&mut oauth, "POST", "/oauth/token", "", &body, 105).0);
+            let principal = oauth
+                .principal_key(&hash(refreshed["access_token"].as_str().unwrap()), 105)
+                .unwrap();
+            assert_eq!(
+                principal.id, original.id,
+                "refresh preserves UUID authority"
+            );
+            assert_eq!(principal.name, name, "refresh preserves approved label");
+        }
     }
     #[test]
     fn redirect_bounds_reject_before_consent_and_allow_encoded_state() {

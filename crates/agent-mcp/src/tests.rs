@@ -891,7 +891,7 @@ fn queued_oauth_request_is_invalid_after_access_refresh() {
         "POST",
         "/oauth/register",
         "application/json",
-        r#"{"redirect_uris":["https://client.example/callback"]}"#,
+        r#"{"client_name":"Queue Bot","redirect_uris":["https://client.example/callback"]}"#,
         None,
     );
     let client = body(&r)["client_id"].as_str().unwrap().to_owned();
@@ -914,6 +914,7 @@ fn queued_oauth_request_is_invalid_after_access_refresh() {
         200
     );
     let approval = server.auth.approvals().pop().unwrap();
+    assert_eq!(approval.client_name, "Queue Bot");
     assert!(server.auth.approve(&approval.id, true));
     let (_, r) = wire(
         addr,
@@ -965,6 +966,12 @@ fn queued_oauth_request_is_invalid_after_access_refresh() {
     assert!(pending.live(&server.auth));
     assert!(pending.input_scope);
     let connection_id = pending.principal.id.clone();
+    assert_eq!(pending.principal.name, "Queue Bot");
+    assert!(
+        server
+            .auth
+            .rename_connection(&connection_id, "Owner queue label")
+    );
     let access_expiry = now() + 3600;
     assert!(server.auth.current(pending.epoch, access_expiry));
     assert!(!server.auth.current_access(
@@ -999,6 +1006,18 @@ fn queued_oauth_request_is_invalid_after_access_refresh() {
         .authenticate_principal(&format!("Bearer {refreshed_access}"), now())
         .unwrap();
     assert_eq!(refreshed_principal.id, connection_id);
+    assert_eq!(refreshed_principal.name, "Owner queue label");
+    assert_eq!(
+        server
+            .auth
+            .connections()
+            .iter()
+            .find(|info| info.principal.id == connection_id)
+            .unwrap()
+            .principal
+            .name,
+        "Owner queue label"
+    );
     assert!(!refreshed_principal.input_scope);
     assert!(
         server

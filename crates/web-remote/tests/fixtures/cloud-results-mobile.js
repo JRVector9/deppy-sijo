@@ -92,6 +92,15 @@
     document.documentElement.style.width = '390px'; await sleep(30);
     check(panel.scrollWidth <= panel.clientWidth + 1, '390px results have no horizontal overflow');
     check(!panel.querySelector('script,img') && !window.cloudInjected, 'untrusted titles and bodies render as text');
+    const answerRunSecret = 'fixture-answer-run-secret-123456789';
+    cloudSnapshot.answers[0].run_id = answerRunSecret; cloudSnapshot.answers[0].run_label = '[REDACTED]'; cloudSocket.snapshot();
+    const answerCard = () => panel.querySelector('[data-cloud-answer="answer-a"]');
+    check(answerCard().querySelector('[data-cloud-key="answer-report"]').textContent.includes('[REDACTED]') && !answerCard().textContent.includes(answerRunSecret), 'answer run identity uses its safe display label');
+    delete cloudSnapshot.answers[0].run_label; cloudSocket.snapshot();
+    check(answerCard().querySelector('[data-cloud-key="answer-report"]').textContent.includes('연결된 작업') && !answerCard().textContent.includes(answerRunSecret), 'older server without a safe run label never displays the raw run identity');
+    delete cloudSnapshot.answers[0].run_id; cloudSocket.snapshot();
+    check(answerCard().querySelector('[data-cloud-key="answer-report"]').textContent.includes('작업 ID 없음'), 'answer without a linked run keeps its missing ID label');
+    cloudSnapshot.answers[0].run_id = 'run-a'; cloudSnapshot.answers[0].run_label = 'run-a'; cloudSocket.snapshot();
     check(panel.textContent.includes('클라우드 보고') && panel.textContent.includes('로컬 터미널'), 'cloud and local states are independent labels');
     check(panel.textContent.includes('보고가 오래됨') && panel.textContent.includes('상태 미확인'), 'stale unknown remains explicit');
     check(panel.textContent.includes('최근 항목'), 'bounded history is disclosed');

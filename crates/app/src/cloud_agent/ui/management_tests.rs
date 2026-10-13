@@ -411,6 +411,287 @@ fn management_ui_scoped_answer_navigation_and_widgets_isolate_duplicate_external
     harness.get_by_label("Research Bot's own answer");
 }
 
+const LATE_NOTIFY_FIRST: &str = "fixture-notify-access-token-123456789";
+const LATE_NOTIFY_SECOND: &str = "fixture-notify-replaced-token-987654321";
+const LATE_NOTIFY_RAW: &str = "First: fixture-notify-\naccess-token-123456789. Second: fixture-notify-\nreplaced-token-987654321.";
+const LATE_NOTIFY_FIRST_MASKED: &str =
+    "First: [REDACTED]. Second: fixture-notify-\nreplaced-token-987654321.";
+const LATE_NOTIFY_BOTH_MASKED: &str = "First: [REDACTED]. Second: [REDACTED].";
+
+fn late_secret_notify_fixture() -> (CloudAgent, Target, String) {
+    late_secret_notify_fixture_with_run(LATE_NOTIFY_FIRST)
+}
+
+fn late_secret_notify_fixture_with_run(run_id: &str) -> (CloudAgent, Target, String) {
+    use crate::cloud_history_worker::{Job, ResultKind};
+    let (mut bridge, target, connection, _, _) = connection_fixture();
+    let operation = "late-notify-answer";
+    let key = agent_mcp::operation_key(&connection, operation).unwrap();
+    let token = bridge.operation_token();
+    assert!(
+        bridge
+            .history
+            .request(
+                token,
+                Job::ClaimScoped {
+                    id: operation.into(),
+                    tool: "notify".into(),
+                    args: serde_json::json!({"message":LATE_NOTIFY_RAW}),
+                    workspace: target.workspace.clone(),
+                    session: target.id.clone(),
+                    context: agent_mcp::OperationContext {
+                        connection_id: connection.clone(),
+                        operation_id: operation.into(),
+                        run_id: Some(run_id.into()),
+                        generation: target.generation.clone(),
+                    },
+                }
+            )
+            .is_ok()
+    );
+    assert!(matches!(
+        bridge.history.wait().unwrap().result,
+        ResultKind::ClaimScoped(Ok(agent_mcp::Claim::New))
+    ));
+    let token = bridge.operation_token();
+    assert!(
+        bridge
+            .history
+            .request(
+                token,
+                Job::FinishScoped {
+                    id: operation.into(),
+                    connection_id: connection,
+                    outcome: serde_json::json!({"status":"stored"}),
+                    message: LATE_NOTIFY_RAW.into(),
+                }
+            )
+            .is_ok()
+    );
+    assert!(matches!(
+        bridge.history.wait().unwrap().result,
+        ResultKind::FinishScoped(Ok(()))
+    ));
+    // Reuse the actual OpenPage/bootstrap path before either credential exists.
+    bridge.history_initialized = false;
+    bridge.drain_history(|_, _| panic!("notify bootstrap must not enter terminal input"));
+    assert_eq!(bridge.cloud_answers()[0].message, LATE_NOTIFY_RAW);
+    assert_eq!(bridge.cloud_answers()[0].id, key);
+    (bridge, target, key)
+}
+
+#[test]
+fn late_secret_notify_cloud_snapshot_rescrubs_loaded_history_and_replacement() {
+    let (bridge, target, key) = late_secret_notify_fixture();
+    let first = secret::SecretString::new(LATE_NOTIFY_FIRST.into());
+    let first_lease = bridge.redaction.acquire_execution_lease(&[&first]).unwrap();
+    let snapshot = bridge.cloud_snapshot();
+    let answer = &snapshot.answers[0];
+    assert_eq!(answer.body, LATE_NOTIFY_FIRST_MASKED);
+    assert_eq!(answer.id, key);
+    assert_eq!(answer.workspace_id, target.workspace);
+    assert_eq!(answer.session_id, target.id);
+    assert_eq!(answer.generation, target.generation);
+    assert_eq!(answer.run_id.as_deref(), Some(LATE_NOTIFY_FIRST));
+    drop(first_lease);
+    let second = secret::SecretString::new(LATE_NOTIFY_SECOND.into());
+    let _second_lease = bridge
+        .redaction
+        .acquire_execution_lease(&[&second])
+        .unwrap();
+    assert_eq!(
+        bridge.cloud_snapshot().answers[0].body,
+        LATE_NOTIFY_BOTH_MASKED
+    );
+}
+
+#[test]
+fn late_secret_notify_settings_masks_display_and_actual_copy_after_replacement() {
+    let (mut bridge, _, key) = late_secret_notify_fixture();
+    bridge.selected_record = Some(key);
+    let mut harness = harness(bridge);
+    harness.get_by_label(LATE_NOTIFY_RAW);
+    let first = secret::SecretString::new(LATE_NOTIFY_FIRST.into());
+    let first_lease = harness
+        .state()
+        .redaction
+        .acquire_execution_lease(&[&first])
+        .unwrap();
+    harness.run();
+    harness.get_by_label(LATE_NOTIFY_FIRST_MASKED);
+    assert!(harness.query_by_label(LATE_NOTIFY_RAW).is_none());
+    harness.get_by_label("Copy answer").click();
+    harness.run();
+    let copies = harness.ctx.data_mut(|data| {
+        data.get_temp::<Vec<String>>(egui::Id::new("test-cloud-clipboard-copies"))
+            .unwrap_or_default()
+    });
+    assert_eq!(
+        copies.last().map(String::as_str),
+        Some(LATE_NOTIFY_FIRST_MASKED)
+    );
+    drop(first_lease);
+    let second = secret::SecretString::new(LATE_NOTIFY_SECOND.into());
+    let _second_lease = harness
+        .state()
+        .redaction
+        .acquire_execution_lease(&[&second])
+        .unwrap();
+    harness.run();
+    harness.get_by_label(LATE_NOTIFY_BOTH_MASKED);
+    harness.get_by_label("Copy answer").click();
+    harness.run();
+    let copies = harness.ctx.data_mut(|data| {
+        data.get_temp::<Vec<String>>(egui::Id::new("test-cloud-clipboard-copies"))
+            .unwrap_or_default()
+    });
+    assert_eq!(
+        copies.last().map(String::as_str),
+        Some(LATE_NOTIFY_BOTH_MASKED)
+    );
+}
+
+#[test]
+fn late_secret_notify_session_safe_view_masks_display_and_actual_copy() {
+    let (bridge, target, _) = late_secret_notify_fixture();
+    let catalog = i18n::Catalog::load("en-US").unwrap();
+    let mut selected = None;
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size(egui::vec2(900.0, 700.0))
+        .build_ui_state(
+            move |ui, state: &mut (CloudAgent, Vec<String>)| {
+                let answers = state.0.cloud_answers();
+                crate::ui::cloud_answer::contents(
+                    ui,
+                    &answers,
+                    &target.id,
+                    &mut selected,
+                    &catalog,
+                );
+                state.1.extend(ui.ctx().output(|output| {
+                    output
+                        .commands
+                        .iter()
+                        .filter_map(|command| {
+                            if let egui::OutputCommand::CopyText(text) = command {
+                                Some(text.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                }));
+            },
+            (bridge, Vec::new()),
+        );
+    harness.get_by_label(LATE_NOTIFY_RAW);
+    let first = secret::SecretString::new(LATE_NOTIFY_FIRST.into());
+    let first_lease = harness
+        .state()
+        .0
+        .redaction
+        .acquire_execution_lease(&[&first])
+        .unwrap();
+    harness.run();
+    harness.get_by_label(LATE_NOTIFY_FIRST_MASKED);
+    assert!(harness.query_by_label(LATE_NOTIFY_RAW).is_none());
+    harness.get_by_label("Copy answer").click();
+    harness.run();
+    assert_eq!(
+        harness.state().1.last().map(String::as_str),
+        Some(LATE_NOTIFY_FIRST_MASKED)
+    );
+    drop(first_lease);
+    let second = secret::SecretString::new(LATE_NOTIFY_SECOND.into());
+    let _second_lease = harness
+        .state()
+        .0
+        .redaction
+        .acquire_execution_lease(&[&second])
+        .unwrap();
+    harness.run();
+    harness.get_by_label(LATE_NOTIFY_BOTH_MASKED);
+    harness.get_by_label("Copy answer").click();
+    harness.run();
+    assert_eq!(
+        harness.state().1.last().map(String::as_str),
+        Some(LATE_NOTIFY_BOTH_MASKED)
+    );
+}
+
+#[test]
+fn late_secret_notify_run_label_snapshot_masks_display_preserves_reference() {
+    let (bridge, _, _) = late_secret_notify_fixture();
+    let first = secret::SecretString::new(LATE_NOTIFY_FIRST.into());
+    let _lease = bridge.redaction.acquire_execution_lease(&[&first]).unwrap();
+    let answer = &bridge.cloud_snapshot().answers[0];
+    assert_eq!(answer.run_id.as_deref(), Some(LATE_NOTIFY_FIRST));
+    assert_eq!(answer.run_label.as_deref(), Some("[REDACTED]"));
+}
+
+#[test]
+fn late_secret_notify_run_label_snapshot_expands_mask_without_changing_reference() {
+    let value = "abcxyz";
+    let run_id = format!("{value}-").repeat(18);
+    let (bridge, _, _) = late_secret_notify_fixture_with_run(&run_id);
+    let secret = secret::SecretString::new(value.into());
+    let _lease = bridge
+        .redaction
+        .acquire_execution_lease(&[&secret])
+        .unwrap();
+    let snapshot = bridge.cloud_snapshot();
+    let answer = &snapshot.answers[0];
+    assert_eq!(answer.run_id.as_deref(), Some(run_id.as_str()));
+    let label = answer.run_label.as_deref().unwrap();
+    assert_eq!(label, "[REDACTED]-".repeat(18));
+    assert!(snapshot.validate().is_ok());
+}
+
+#[test]
+fn late_secret_notify_run_label_session_header_masks_display_preserves_reference() {
+    let (bridge, target, _) = late_secret_notify_fixture();
+    let catalog = i18n::Catalog::load("en-US").unwrap();
+    let header = |run: &str| {
+        format!(
+            "{} · Review Bot · {run} · {}",
+            catalog.t("cloud.history_answer", &[]),
+            crate::ui::notifications::relative_time_label(&catalog, 0),
+        )
+    };
+    let raw_header = header(LATE_NOTIFY_FIRST);
+    let masked_header = header("[REDACTED]");
+    let mut selected = None;
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size(egui::vec2(900.0, 700.0))
+        .build_ui_state(
+            move |ui, bridge: &mut CloudAgent| {
+                let answers = bridge.cloud_answers();
+                crate::ui::cloud_answer::contents(
+                    ui,
+                    &answers,
+                    &target.id,
+                    &mut selected,
+                    &catalog,
+                );
+            },
+            bridge,
+        );
+    harness.get_by_label(&raw_header);
+    let first = secret::SecretString::new(LATE_NOTIFY_FIRST.into());
+    let _lease = harness
+        .state()
+        .redaction
+        .acquire_execution_lease(&[&first])
+        .unwrap();
+    harness.run();
+    harness.get_by_label(&masked_header);
+    assert!(harness.query_by_label(&raw_header).is_none());
+    assert_eq!(
+        harness.state().cloud_answers()[0].run.as_deref(),
+        Some(LATE_NOTIFY_FIRST)
+    );
+}
+
 fn management_call(
     bridge: &mut CloudAgent,
     target: &Target,
@@ -448,6 +729,10 @@ fn management_call(
 }
 
 fn running_fixture() -> (CloudAgent, Target, String, String) {
+    running_fixture_with_id("review-run")
+}
+
+fn running_fixture_with_id(run_id: &str) -> (CloudAgent, Target, String, String) {
     let (mut bridge, target, review, _, token) = connection_fixture();
     bridge
         .set_connection_access(&review, &target, true, false)
@@ -458,7 +743,7 @@ fn running_fixture() -> (CloudAgent, Target, String, String) {
         &token,
         "start_run",
         serde_json::json!({
-            "session_id":target.id,"generation":target.generation,"run_id":"review-run","title":"Inspect project","instruction":"Read the project and report findings"
+            "session_id":target.id,"generation":target.generation,"run_id":run_id,"title":"Inspect project","instruction":"Read the project and report findings"
         }),
     );
     management_call(
@@ -467,10 +752,143 @@ fn running_fixture() -> (CloudAgent, Target, String, String) {
         &token,
         "update_run",
         serde_json::json!({
-            "session_id":target.id,"generation":target.generation,"run_id":"review-run","state":"running","progress":37,"message":"Inspecting dependencies"
+            "session_id":target.id,"generation":target.generation,"run_id":run_id,"state":"running","progress":37,"message":"Inspecting dependencies"
         }),
     );
     (bridge, target, review, token)
+}
+
+#[test]
+fn late_secret_run_reference_footer_masks_display_preserves_identity() {
+    let (bridge, target, connection, _) = running_fixture_with_id(LATE_NOTIFY_FIRST);
+    let raw_footer = format!("{connection} · {LATE_NOTIFY_FIRST}");
+    let masked_footer = format!("{connection} · [REDACTED]");
+    let mut harness = harness(bridge);
+    harness
+        .get_by_label("Inspect project · Running · Review Bot")
+        .click();
+    harness.run();
+    harness.get_by_label(&raw_footer);
+    let first = secret::SecretString::new(LATE_NOTIFY_FIRST.into());
+    let _lease = harness
+        .state()
+        .redaction
+        .acquire_execution_lease(&[&first])
+        .unwrap();
+    harness.run();
+    harness.get_by_label(&masked_footer);
+    assert!(harness.query_by_label(&raw_footer).is_none());
+    let run = &harness.state().cloud_runs()[0];
+    assert_eq!(run.id, LATE_NOTIFY_FIRST);
+    assert_eq!(run.connection_id, connection);
+    assert_eq!(run.workspace, target.workspace);
+    assert_eq!(run.session, target.id);
+}
+
+#[test]
+fn late_secret_run_reference_hover_masks_display_preserves_identity() {
+    let (bridge, _, connection, _) = running_fixture_with_id(LATE_NOTIFY_FIRST);
+    let raw_footer = format!("{connection} · {LATE_NOTIFY_FIRST}");
+    let masked_footer = format!("{connection} · [REDACTED]");
+    let mut harness = harness(bridge);
+    harness
+        .get_by_label("Inspect project · Running · Review Bot")
+        .click();
+    harness.run();
+    let first = secret::SecretString::new(LATE_NOTIFY_FIRST.into());
+    let _lease = harness
+        .state()
+        .redaction
+        .acquire_execution_lease(&[&first])
+        .unwrap();
+    harness.run();
+    let footer = if harness.query_by_label(&masked_footer).is_some() {
+        &masked_footer
+    } else {
+        &raw_footer
+    };
+    harness.get_by_label(footer).hover();
+    harness.run();
+    harness.get_by_label(&format!("{connection}\n[REDACTED]"));
+    assert!(
+        harness
+            .query_by_label(&format!("{connection}\n{LATE_NOTIFY_FIRST}"))
+            .is_none()
+    );
+    assert_eq!(harness.state().cloud_runs()[0].id, LATE_NOTIFY_FIRST);
+}
+
+#[test]
+fn management_ui_late_secret_registration_masks_display_copy_and_links() {
+    let (mut bridge, target, _, token) = running_fixture();
+    let first = "fixture-secret-access-token-123456789";
+    let second = "fixture-replaced-access-token-987654321";
+    let result = "First: fixture-secret-\naccess-token-123456789. Second: fixture-replaced-\naccess-token-987654321.";
+    let exact_uri = "https://example.test/safe-report?q=exact%2Fpath#part";
+    management_call(
+        &mut bridge,
+        &target,
+        &token,
+        "update_run",
+        serde_json::json!({
+            "session_id":target.id,"generation":target.generation,"run_id":"review-run","state":"completed","message":"Stored before credentials are loaded","result":result,
+            "artifacts":[
+                {"label":"Safe report","uri":exact_uri},
+                {"label":"Credential-bearing report","uri":format!("https://example.test/{first}")}
+            ]
+        }),
+    );
+    let mut harness = harness(bridge);
+    harness
+        .get_by_label("Inspect project · Completed · Review Bot")
+        .click();
+    harness.run();
+    harness.get_by_label(result);
+    let first_secret = secret::SecretString::new(first.into());
+    let first_lease = harness
+        .state()
+        .redaction
+        .acquire_execution_lease(&[&first_secret])
+        .unwrap();
+    harness.run();
+    let first_expected = "First: [REDACTED]. Second: fixture-replaced-\naccess-token-987654321.";
+    harness.get_by_label(first_expected);
+    assert!(
+        harness
+            .query_by_label("Credential-bearing report")
+            .is_none()
+    );
+    harness.get_by_label("Copy result").click();
+    harness.run();
+    let copies = harness.ctx.data_mut(|data| {
+        data.get_temp::<Vec<String>>(egui::Id::new("test-cloud-clipboard-copies"))
+            .unwrap_or_default()
+    });
+    assert_eq!(copies.last().map(String::as_str), Some(first_expected));
+    drop(first_lease);
+    let second_secret = secret::SecretString::new(second.into());
+    let _second_lease = harness
+        .state()
+        .redaction
+        .acquire_execution_lease(&[&second_secret])
+        .unwrap();
+    harness.run();
+    let expected = "First: [REDACTED]. Second: [REDACTED].";
+    harness.get_by_label(expected);
+    harness.get_by_label("Copy result").click();
+    harness.run();
+    let copies = harness.ctx.data_mut(|data| {
+        data.get_temp::<Vec<String>>(egui::Id::new("test-cloud-clipboard-copies"))
+            .unwrap_or_default()
+    });
+    assert_eq!(copies.last().map(String::as_str), Some(expected));
+    harness.get_by_label("Safe report").click();
+    harness.run();
+    let opened = harness.ctx.data_mut(|data| {
+        data.get_temp::<Vec<String>>(egui::Id::new("test-cloud-open-urls"))
+            .unwrap_or_default()
+    });
+    assert_eq!(opened, vec![exact_uri]);
 }
 
 #[test]

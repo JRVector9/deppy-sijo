@@ -630,8 +630,28 @@ impl CloudAgent {
             })
             .min()
     }
-    pub fn cloud_runs(&self) -> &[CloudRun] {
-        &self.management.runs
+    pub fn cloud_runs(&self) -> Vec<CloudRun> {
+        // Credentials can be loaded after history bootstrap or replaced later.
+        // Every operator/publication view must use the current secret corpus.
+        self.management
+            .runs
+            .iter()
+            .cloned()
+            .map(|run| self.scrub_cloud_run(run))
+            .collect()
+    }
+    pub(super) fn has_cloud_runs(&self) -> bool {
+        !self.management.runs.is_empty()
+    }
+    pub(super) fn management_run_accepts_input(&self, connection: &str, id: &str) -> bool {
+        self.management.runs.iter().any(|run| {
+            run.connection_id == connection
+                && run.id == id
+                && matches!(
+                    run.state,
+                    RunState::Queued | RunState::Running | RunState::Waiting
+                )
+        })
     }
     pub fn request_run_cancel(&mut self, connection: &str, id: &str) -> Result<(), String> {
         let run = self
@@ -1189,6 +1209,150 @@ mod tests {
         assert_eq!(
             snapshot.runs[0].artifacts[0].label, expected,
             "publication artifact label"
+        );
+    }
+    fn late_secret_fixture() -> (CloudAgent, Target) {
+        let (mut bridge, target) = setup();
+        let first = "fixture-secret-access-token-123456789";
+        let second = "fixture-replaced-access-token-987654321";
+        let text = "Report: fixture-secret-\naccess-token-123456789 / fixture-replaced-\naccess-token-987654321";
+        let mut run = CloudRun::new(
+            "late-secret-run",
+            agent_mcp::LEGACY_CONNECTION_ID,
+            first,
+            &target.workspace,
+            &target.id,
+            &target.generation,
+            text,
+            text,
+            now() as i64,
+        )
+        .unwrap();
+        run.message = text.into();
+        run.result = Some(text.into());
+        run.artifacts = vec![
+            agent_mcp::ArtifactReference {
+                label: format!("Safe report {first} / {second}"),
+                uri: "https://example.test/safe-report?q=exact%2Fpath#part".into(),
+            },
+            agent_mcp::ArtifactReference {
+                label: "First unsafe report".into(),
+                uri: format!("https://example.test/{first}"),
+            },
+            agent_mcp::ArtifactReference {
+                label: "Second unsafe report".into(),
+                uri: format!("https://example.test/{second}"),
+            },
+        ];
+        let token = bridge.operation_token();
+        assert!(bridge.history.request(token, Job::SaveRun { run }).is_ok());
+        assert!(matches!(
+            bridge.history.wait().unwrap().result,
+            ResultKind::SaveRun(Ok(()))
+        ));
+        bridge.management.bootstrap_started = false;
+        bridge.poll_management();
+        bridge.drain_history(|_, _| panic!("legacy bootstrap must not emit input"));
+        assert_eq!(bridge.cloud_runs()[0].title, text);
+        (bridge, target)
+    }
+    #[test]
+    fn late_secret_registration_rescrubs_cached_run_views() {
+        let (bridge, _) = late_secret_fixture();
+        let secret = secret::SecretString::new("fixture-secret-access-token-123456789".into());
+        let _lease = bridge
+            .redaction
+            .acquire_execution_lease(&[&secret])
+            .unwrap();
+        let runs = bridge.cloud_runs();
+        let run = &runs[0];
+        let expected = "Report: [REDACTED] / fixture-replaced-\naccess-token-987654321";
+        assert_eq!(run.connection_name, "[REDACTED]");
+        for text in [&run.title, &run.instruction, &run.message] {
+            assert_eq!(text, expected);
+        }
+        assert_eq!(run.result.as_deref(), Some(expected));
+        assert_eq!(run.artifacts.len(), 2);
+        assert_eq!(
+            run.artifacts[0].label,
+            "Safe report [REDACTED] / fixture-replaced-access-token-987654321"
+        );
+        assert_eq!(
+            run.artifacts[0].uri,
+            "https://example.test/safe-report?q=exact%2Fpath#part"
+        );
+        assert_eq!(run.artifacts[1].label, "Second unsafe report");
+    }
+    #[test]
+    fn late_secret_registration_rescrubs_cloud_snapshot() {
+        let (bridge, _) = late_secret_fixture();
+        let secret = secret::SecretString::new("fixture-secret-access-token-123456789".into());
+        let _lease = bridge
+            .redaction
+            .acquire_execution_lease(&[&secret])
+            .unwrap();
+        let snapshot = bridge.cloud_snapshot();
+        let run = &snapshot.runs[0];
+        let expected = "Report: [REDACTED] / fixture-replaced-\naccess-token-987654321";
+        assert_eq!(run.title, expected);
+        assert_eq!(run.message, expected);
+        assert_eq!(run.result.as_deref(), Some(expected));
+        assert_eq!(run.connection_name, "[REDACTED]");
+        assert_eq!(run.artifacts.len(), 2);
+        assert_eq!(
+            run.artifacts[0].label,
+            "Safe report [REDACTED] / fixture-replaced-access-token-987654321"
+        );
+        assert_eq!(
+            run.artifacts[0].uri,
+            "https://example.test/safe-report?q=exact%2Fpath#part"
+        );
+        assert!(
+            !snapshot.runs[0]
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.uri.contains(secret.expose()))
+        );
+    }
+    #[test]
+    fn late_secret_replacement_rescrubs_loaded_views_and_get_reply() {
+        let (mut bridge, target) = late_secret_fixture();
+        let first = secret::SecretString::new("fixture-secret-access-token-123456789".into());
+        let first_lease = bridge.redaction.acquire_execution_lease(&[&first]).unwrap();
+        let args = json!({"session_id":target.id,"generation":target.generation,"run_id":"late-secret-run"});
+        let first_reply = call(&mut bridge, Some(&target), "get_run", args.clone()).unwrap();
+        assert_eq!(first_reply["run"]["connection_name"], "[REDACTED]");
+        drop(first_lease);
+        let second = secret::SecretString::new("fixture-replaced-access-token-987654321".into());
+        let _second_lease = bridge
+            .redaction
+            .acquire_execution_lease(&[&second])
+            .unwrap();
+        let runs = bridge.cloud_runs();
+        let snapshot = bridge.cloud_snapshot();
+        let reply = call(&mut bridge, Some(&target), "get_run", args).unwrap();
+        let expected = "Report: [REDACTED] / [REDACTED]";
+        assert_eq!(runs[0].title, expected, "previously loaded native view");
+        assert_eq!(snapshot.runs[0].title, expected, "publication before Get");
+        assert_eq!(runs[0].instruction, expected);
+        assert_eq!(runs[0].message, expected);
+        assert_eq!(runs[0].result.as_deref(), Some(expected));
+        assert_eq!(runs[0].artifacts.len(), 1);
+        assert_eq!(
+            runs[0].artifacts[0].label,
+            "Safe report [REDACTED] / [REDACTED]"
+        );
+        assert_eq!(
+            runs[0].artifacts[0].uri,
+            "https://example.test/safe-report?q=exact%2Fpath#part"
+        );
+        for field in ["title", "instruction", "message", "result"] {
+            assert_eq!(reply["run"][field], expected, "Get {field}");
+        }
+        assert_eq!(reply["run"]["artifacts"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            reply["run"]["artifacts"][0]["uri"],
+            runs[0].artifacts[0].uri
         );
     }
     #[test]

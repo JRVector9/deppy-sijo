@@ -105,6 +105,7 @@ impl CloudAgent {
     }
     pub fn cloud_snapshot(&self) -> CloudSnapshot {
         let infos = self.connection_infos();
+        let runs = self.cloud_runs();
         let mut snapshot = CloudSnapshot {
             captured_at: now() as i64,
             ..Default::default()
@@ -137,8 +138,7 @@ impl CloudAgent {
                 expires_at: Some(info.principal.expires_at as i64),
             })
             .collect();
-        snapshot.runs = self
-            .cloud_runs()
+        snapshot.runs = runs
             .iter()
             .take(MAX_CLOUD_ROWS)
             .map(|run| {
@@ -204,29 +204,38 @@ impl CloudAgent {
                     .connection_id
                     .as_deref()
                     .unwrap_or(agent_mcp::LEGACY_CONNECTION_ID);
+                let display_text = |text: &str| {
+                    let mut text = self.redaction.redact_wrapped_text(text);
+                    super::truncate_utf8(&mut text, 512);
+                    text
+                };
                 CloudAnswerView {
                     id: agent_mcp::operation_key(connection, &record.id)
                         .unwrap_or_else(|_| record.id.clone()),
                     connection_id: connection.into(),
-                    connection_name: infos
-                        .iter()
-                        .find(|i| i.principal.id == connection)
-                        .map(|i| self.redact(&i.principal.name))
-                        .unwrap_or_else(|| connection.into()),
+                    connection_name: display_text(
+                        infos
+                            .iter()
+                            .find(|i| i.principal.id == connection)
+                            .map(|i| i.principal.name.as_str())
+                            .unwrap_or(connection),
+                    ),
                     workspace_id: record.workspace.clone(),
                     session_id: record.session.clone(),
                     generation: record
                         .generation
                         .clone()
                         .unwrap_or_else(|| "unknown".into()),
-                    title: self
-                        .targets
-                        .iter()
-                        .find(|t| t.id == record.session)
-                        .map(|t| self.redact(&t.title))
-                        .unwrap_or_else(|| record.session.clone()),
-                    body: self.redact(&record.message),
+                    title: display_text(
+                        self.targets
+                            .iter()
+                            .find(|t| t.id == record.session)
+                            .map(|t| t.title.as_str())
+                            .unwrap_or(&record.session),
+                    ),
+                    body: self.redaction.redact_wrapped_text(&record.message),
                     run_id: record.run_id.clone(),
+                    run_label: record.run_id.as_deref().map(display_text),
                     created_at: record.created,
                     artifacts: Vec::new(),
                 }
@@ -250,8 +259,7 @@ impl CloudAgent {
             })
             .unwrap_or_default();
         snapshot.truncated = self.history_truncated || infos.len() > MAX_CLOUD_ROWS;
-        snapshot.truncated |= self
-            .cloud_runs()
+        snapshot.truncated |= runs
             .iter()
             .take(MAX_CLOUD_ROWS)
             .zip(&snapshot.runs)

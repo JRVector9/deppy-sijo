@@ -75,6 +75,9 @@ pub struct CloudAnswerView {
     pub title: String,
     pub body: String,
     pub run_id: Option<String>,
+    /// Safe display text; the original run ID remains an opaque routing reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_label: Option<String>,
     pub created_at: i64,
     pub artifacts: Vec<CloudArtifactView>,
 }
@@ -445,6 +448,7 @@ impl CloudSnapshot {
             }
             fields(&[&answer.title, &answer.connection_name], 512)?;
             fields(&[&answer.body], MAX_CLOUD_TEXT_BYTES)?;
+            fields(&[answer.run_label.as_deref().unwrap_or_default()], 512)?;
             artifacts(&answer.artifacts)?;
         }
         for approval in &self.approvals {
@@ -820,6 +824,38 @@ mod tests {
         for credential in ["token", "fingerprint", "bearer", "client_secret"] {
             assert!(!frame.contains(&format!("\"{credential}\"")));
         }
+    }
+
+    #[test]
+    fn answer_display_label_has_separate_budget_and_legacy_default() {
+        let mut snapshot = CloudSnapshot {
+            answers: vec![CloudAnswerView {
+                id: "answer".into(),
+                connection_id: "actor".into(),
+                workspace_id: "workspace".into(),
+                session_id: "session".into(),
+                generation: "generation".into(),
+                run_id: Some("original-run".into()),
+                run_label: Some("[REDACTED]".repeat(51)),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let frame: serde_json::Value =
+            serde_json::from_str(&snapshot.encode_frame(false, false).unwrap()).unwrap();
+        assert_eq!(frame["snapshot"]["answers"][0]["run_id"], "original-run");
+        assert_eq!(
+            frame["snapshot"]["answers"][0]["run_label"],
+            "[REDACTED]".repeat(51)
+        );
+        snapshot.answers[0].run_label = Some("가".repeat(171));
+        assert_eq!(snapshot.validate(), Err(CloudSnapshotError::FieldTooLarge));
+        snapshot.answers[0].run_label = None;
+        let legacy = serde_json::to_value(&snapshot.answers[0]).unwrap();
+        assert!(legacy.get("run_label").is_none());
+        let restored: CloudAnswerView = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.run_label, None);
+        assert_eq!(restored.run_id.as_deref(), Some("original-run"));
     }
 
     #[test]

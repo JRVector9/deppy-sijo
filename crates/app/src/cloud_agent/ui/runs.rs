@@ -45,7 +45,7 @@ impl CloudAgent {
         let query = state.search.trim().to_lowercase();
         let runs = self
             .cloud_runs()
-            .iter()
+            .into_iter()
             .take(100)
             .filter(|run| {
                 matches!(state.filter, Filter::All)
@@ -68,11 +68,10 @@ impl CloudAgent {
                     .iter()
                     .any(|text| text.to_lowercase().contains(&query))
             })
-            .cloned()
             .collect::<Vec<_>>();
         if runs.is_empty() {
             ui.weak(catalog.t(
-                if self.cloud_runs().is_empty() {
+                if !self.has_cloud_runs() {
                     "cloud.runs_empty"
                 } else {
                     "cloud.runs_no_match"
@@ -147,10 +146,18 @@ impl CloudAgent {
                             }
                             ui.weak(catalog.t("cloud.run_navigation_hint", &[]));
                             ui.add(
-                                egui::Label::new(format!("{} · {}", run.connection_id, run.id))
-                                    .truncate(),
+                                egui::Label::new(self.redaction.redact_wrapped_text(&format!(
+                                    "{} · {}",
+                                    run.connection_id, run.id
+                                )))
+                                .truncate(),
                             )
-                            .on_hover_text(format!("{}\n{}", run.connection_id, run.id));
+                            .on_hover_text(
+                                self.redaction.redact_wrapped_text(&format!(
+                                    "{}\n{}",
+                                    run.connection_id, run.id
+                                )),
+                            );
                             if let Some(target) = self.targets.iter().find(|target| {
                                 target.id == run.session
                                     && target.generation == run.generation
@@ -190,15 +197,15 @@ impl CloudAgent {
                             if let Some(result) = &run.result {
                                 ui.label(result);
                                 if ui.button(catalog.t("cloud.run_copy_result", &[])).clicked() {
-                                    ui.ctx().copy_text(result.clone());
+                                    ui.ctx()
+                                        .copy_text(self.redaction.redact_wrapped_text(result));
                                 }
                             }
-                            for artifact in run
-                                .artifacts
-                                .iter()
-                                .take(16)
-                                .filter(|artifact| artifact.validate().is_ok())
-                            {
+                            for artifact in run.artifacts.iter().take(16).filter(|artifact| {
+                                artifact.validate().is_ok()
+                                    && self.redaction.redact_wrapped_text(&artifact.uri)
+                                        == artifact.uri
+                            }) {
                                 ui.hyperlink_to(&artifact.label, &artifact.uri);
                             }
                             if run.cancel_acknowledged_at.is_some() {

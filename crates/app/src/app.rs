@@ -16980,7 +16980,12 @@ impl App {
             ollama_detect_rx: None,
             agent_sessions_was_open: false,
             cloud_agent,
-            notifications_ui: ui::notifications::NotificationsUi::new(),
+            notifications_ui: ui::notifications::NotificationsUi::with_cloud_redactor(
+                std::sync::Arc::new({
+                    let redaction = redaction.clone();
+                    move |text| redaction.redact_wrapped_text(text)
+                }),
+            ),
             inbox_waiting_ui: ui::inbox_waiting::InboxWaitingUi::new(),
             // 히스토리 파일은 앱 데이터 디렉터리(= 메타데이터 파일과 같은 폴더) 아래.
             composer,
@@ -27449,8 +27454,9 @@ impl App {
                 .cloud_agent
                 .poll_history(|_, _| Err("connection_stopped_no_effect".into()));
             self.apply_cloud_answer_notices(ctx, notices);
+            let answers = self.cloud_agent.cloud_answers();
             for rt in std::iter::once(&mut self.active).chain(self.warm.values_mut()) {
-                rt.workspace_ui.cloud_answers = self.cloud_agent.answers.clone();
+                rt.workspace_ui.cloud_answers = answers.clone();
             }
             return;
         }
@@ -27674,8 +27680,9 @@ impl App {
             self.cloud_agent.handle(req, &mut send);
         }
         self.apply_cloud_answer_notices(ctx, notices);
+        let answers = self.cloud_agent.cloud_answers();
         for rt in std::iter::once(&mut self.active).chain(self.warm.values_mut()) {
-            rt.workspace_ui.cloud_answers = self.cloud_agent.answers.clone();
+            rt.workspace_ui.cloud_answers = answers.clone();
         }
     }
 

@@ -335,9 +335,11 @@ impl CloudAgent {
                     };
                     ui.label(catalog.t(status, &[]));
                     if !record.message.is_empty() {
-                        ui.label(&record.message);
+                        let message = self.redaction.redact_wrapped_text(&record.message);
+                        ui.label(&message);
                         if ui.button(catalog.t("cloud.copy_answer", &[])).clicked() {
-                            ui.ctx().copy_text(record.message.clone());
+                            ui.ctx()
+                                .copy_text(self.redaction.redact_wrapped_text(&message));
                         }
                     }
                 });

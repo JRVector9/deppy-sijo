@@ -172,7 +172,7 @@ export function createCloudResultsView({ host, send, navigate = () => {}, beginN
     if (['all','results'].includes(filter.value)) for (const answer of rows(snapshot.answers).filter(matches)) {
       const card = node('article', 'cloud-card', undefined, JSON.stringify(['answer',answer.connection_id,answer.id])); card.dataset.cloudAnswer = answer.id;
       card.append(node('h3', '', answer.title || '저장 답변')); source(card, answer);
-      card.append(node('p', 'cloud-source', '에이전트 자체 답변 · ' + (answer.run_id || '작업 ID 없음'), 'answer-report'));
+      card.append(node('p', 'cloud-source', '에이전트 자체 답변 · ' + (answer.run_label || (answer.run_id ? '연결된 작업' : '작업 ID 없음')), 'answer-report'));
       card.append(node('p', 'cloud-body', answer.body)); artifacts(card, answer.artifacts); originalActions(card, answer, false); desired.append(card); count++;
     }
     if (!count) desired.append(node('p', 'cloud-empty', search.value ? '검색 결과가 없습니다.' : '저장된 클라우드 작업이 없습니다.'));

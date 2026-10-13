@@ -177,7 +177,7 @@ pub struct CloudAgent {
     finish_queue: std::collections::VecDeque<(u64, Job)>,
     records: Vec<Record>,
     pub history_truncated: bool,
-    pub answers: std::sync::Arc<[crate::ui::cloud_answer::Answer]>,
+    answers: std::sync::Arc<[crate::ui::cloud_answer::Answer]>,
     pending: HashMap<String, PendingInput>,
     redaction: secret::RedactionService,
     token_lease: Option<secret::RedactionLease>,
@@ -294,6 +294,7 @@ impl CloudAgent {
                             .unwrap_or_else(|| agent_mcp::LEGACY_CONNECTION_ID.into())
                     }),
                 run: r.run_id.clone(),
+                run_label: r.run_id.clone(),
                 session: r.session.clone(),
                 created: r.created,
                 message: r.message.clone(),
@@ -301,6 +302,25 @@ impl CloudAgent {
             .collect::<Vec<_>>()
             .into();
         self.records = rows;
+    }
+    pub fn cloud_answers(&self) -> std::sync::Arc<[crate::ui::cloud_answer::Answer]> {
+        // History can be loaded before credentials are registered or replaced.
+        // Preserve routing identities while refreshing each display field.
+        self.answers
+            .iter()
+            .cloned()
+            .map(|mut answer| {
+                answer.message = self.redaction.redact_wrapped_text(&answer.message);
+                answer.connection = self.redaction.redact_wrapped_text(&answer.connection);
+                answer.run_label = answer.run.as_deref().map(|run| {
+                    let mut label = self.redaction.redact_wrapped_text(run);
+                    truncate_utf8(&mut label, 512);
+                    label
+                });
+                answer
+            })
+            .collect::<Vec<_>>()
+            .into()
     }
     fn operation_token(&mut self) -> u64 {
         self.next_operation = self
@@ -847,7 +867,7 @@ impl CloudAgent {
         }
     }
     pub fn needs_target_projection(&self) -> bool {
-        self.server.is_some() || !self.claims.is_empty() || !self.cloud_runs().is_empty()
+        self.server.is_some() || !self.claims.is_empty() || self.has_cloud_runs()
     }
     pub fn next_request(&self) -> Option<Request> {
         self.server.as_ref()?.requests.try_recv().ok()
@@ -1372,18 +1392,9 @@ impl CloudAgent {
             return Err("run_not_loaded_or_not_owned".into());
         }
         if (input || req.tool == "acquire_control")
-            && run_id.as_ref().is_some_and(|id| {
-                !self.cloud_runs().iter().any(|run| {
-                    run.id == *id
-                        && run.connection_id == req.principal.id
-                        && matches!(
-                            run.state,
-                            agent_mcp::RunState::Queued
-                                | agent_mcp::RunState::Running
-                                | agent_mcp::RunState::Waiting
-                        )
-                })
-            })
+            && run_id
+                .as_ref()
+                .is_some_and(|id| !self.management_run_accepts_input(&req.principal.id, id))
         {
             return Err("run_not_loaded_or_not_owned".into());
         }
@@ -1468,11 +1479,15 @@ impl CloudAgent {
             if message.contains('\0') {
                 return Err("invalid_message".into());
             }
-            let clean: String = message
+            // Mask before stripping ANSI, then mask again after controls can
+            // join secret fragments. Keep the existing bounded output policy.
+            let redacted = self.redaction.redact_wrapped_text(message);
+            let plain = crate::agent_model_probe::strip_ansi(&redacted);
+            let clean: String = plain
                 .chars()
                 .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
                 .collect();
-            let mut clean = self.redact(&clean);
+            let mut clean = self.redaction.redact_wrapped_text(&clean);
             truncate_utf8(&mut clean, agent_mcp::MAX_ANSWER);
             Some(clean)
         } else {
@@ -2090,6 +2105,123 @@ mod integration_tests {
             });
             assert_eq!(rx.recv().unwrap().unwrap(), rejected);
         }
+    }
+    #[test]
+    fn late_secret_notify_answer_projection_preserves_identity_and_rescrubs_display_and_run_label()
+    {
+        let mut bridge = CloudAgent::memory();
+        let first = "fixture-secret-access-token-123456789";
+        let second = "fixture-replaced-access-token-987654321";
+        let message = "First: fixture-secret-\naccess-token-123456789. Second: fixture-replaced-\naccess-token-987654321.";
+        bridge.install_history(
+            1,
+            vec![Record {
+                id: first.into(),
+                tool: "notify".into(),
+                workspace: "workspace".into(),
+                session: first.into(),
+                created: now() as i64,
+                outcome: r#"{"status":"stored"}"#.into(),
+                message: message.into(),
+                connection_id: Some(first.into()),
+                run_id: Some(first.into()),
+                generation: Some("generation".into()),
+                sequence: 1,
+            }],
+        );
+        let raw = bridge.cloud_answers();
+        assert_eq!(raw[0].message, message);
+        assert_eq!(raw[0].connection, first);
+        assert_eq!(raw[0].run_label.as_deref(), Some(first));
+        let first_secret = secret::SecretString::new(first.into());
+        let first_lease = bridge
+            .redaction
+            .acquire_execution_lease(&[&first_secret])
+            .unwrap();
+        let first_view = bridge.cloud_answers();
+        assert_eq!(first_view[0].connection, "[REDACTED]");
+        assert_eq!(first_view[0].run_label.as_deref(), Some("[REDACTED]"));
+        let snapshot = bridge.cloud_snapshot();
+        assert_eq!(snapshot.answers[0].connection_name, "[REDACTED]");
+        assert_eq!(snapshot.answers[0].title, "[REDACTED]");
+        assert_eq!(snapshot.answers[0].connection_id, first);
+        assert_eq!(snapshot.answers[0].session_id, first);
+        assert_eq!(
+            first_view[0].message,
+            "First: [REDACTED]. Second: fixture-replaced-\naccess-token-987654321."
+        );
+        drop(first_lease);
+        let second_secret = secret::SecretString::new(second.into());
+        let _second_lease = bridge
+            .redaction
+            .acquire_execution_lease(&[&second_secret])
+            .unwrap();
+        let current = bridge.cloud_answers();
+        assert_eq!(current[0].message, "First: [REDACTED]. Second: [REDACTED].");
+        assert_eq!(current[0].connection, "[REDACTED]");
+        assert_eq!(current[0].run_label.as_deref(), Some("[REDACTED]"));
+        for view in [&first_view[0], &current[0]] {
+            assert_eq!(view.id, raw[0].id);
+            assert_eq!(view.session, raw[0].session);
+            assert_eq!(view.run, raw[0].run);
+            assert_eq!(view.created, raw[0].created);
+        }
+        assert_eq!(
+            bridge.answers[0].message, message,
+            "retain the source cache"
+        );
+    }
+    #[test]
+    fn notify_known_wrapped_secret_masks_claim_finish_notice_and_history() {
+        assert_notify_message_scrubbed("fixture-secret-\r\naccess-token-123456789");
+    }
+    #[test]
+    fn notify_known_mixed_control_ansi_secret_masks_claim_finish_notice_and_history() {
+        assert_notify_message_scrubbed(
+            "fixture-secret-\x07\x1b[31m\r\naccess-token-123456789\x1b[0m",
+        );
+    }
+    fn assert_notify_message_scrubbed(obfuscated: &str) {
+        let (mut bridge, target) = setup();
+        let secret = secret::SecretString::new("fixture-secret-access-token-123456789".into());
+        let _lease = bridge
+            .redaction
+            .acquire_execution_lease(&[&secret])
+            .unwrap();
+        let message = format!("Answer: {obfuscated}");
+        let (request, reply) = request(
+            &bridge,
+            "notify",
+            json!({"session_id":target.id,"generation":target.generation,"operation_id":"known-secret-answer","message":message}),
+        );
+        bridge.handle(request, |_, _| panic!("notify must never enter PTY input"));
+        let completion = bridge.history.wait().unwrap();
+        assert!(matches!(
+            completion.result,
+            ResultKind::Claim(_) | ResultKind::ClaimScoped(_)
+        ));
+        bridge.complete_history(
+            completion,
+            &mut |_, _| panic!("notify must never dispatch input"),
+            &mut Vec::new(),
+        );
+        let notices = bridge.drain_history(|_, _| panic!("notify must never type"));
+        assert_eq!(reply.recv().unwrap().unwrap()["status"], "stored");
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].message, "Answer: [REDACTED]");
+        let record = &bridge.records[0];
+        assert_eq!(record.message, "Answer: [REDACTED]", "SQLite readback");
+        assert_eq!(record.id, "known-secret-answer");
+        assert_eq!(record.session, target.id);
+        assert_eq!(
+            record.generation.as_deref(),
+            Some(target.generation.as_str())
+        );
+        assert_eq!(bridge.cloud_answers()[0].message, "Answer: [REDACTED]");
+        assert_eq!(
+            bridge.cloud_snapshot().answers[0].body,
+            "Answer: [REDACTED]"
+        );
     }
     #[test]
     fn pr9_notify_own_answer_stays_original_after_switch_and_connection_stop() {

@@ -9,15 +9,15 @@ use terminal::policy::{
 /// `SettingsDetailShell`/`SettingsRow`/control 목업이 공유하는 타이포 토큰.
 /// 참조 화면의 Settings Detail Font Map(15/14/13/14px)을 한 곳에서 강제한다.
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct SettingsTypography {
-    page_title: f32,
-    section_title: f32,
-    row_title: f32,
-    row_description: f32,
-    control: f32,
+pub(crate) struct SettingsTypography {
+    pub(crate) page_title: f32,
+    pub(crate) section_title: f32,
+    pub(crate) row_title: f32,
+    pub(crate) row_description: f32,
+    pub(crate) control: f32,
 }
 
-const SETTINGS_TYPE: SettingsTypography = SettingsTypography {
+pub(crate) const SETTINGS_TYPE: SettingsTypography = SettingsTypography {
     page_title: 15.0,
     section_title: 14.0,
     row_title: 14.0,
@@ -27,19 +27,19 @@ const SETTINGS_TYPE: SettingsTypography = SettingsTypography {
 
 /// 참조 React 컴포넌트의 logical px 치수.
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct SettingsDetailMetrics {
-    pad_x: f32,
-    pad_top: f32,
-    pad_bottom: f32,
-    row_height: f32,
-    control_column: f32,
-    column_gap: f32,
-    control_height: f32,
+pub(crate) struct SettingsDetailMetrics {
+    pub(crate) pad_x: f32,
+    pub(crate) pad_top: f32,
+    pub(crate) pad_bottom: f32,
+    pub(crate) row_height: f32,
+    pub(crate) control_column: f32,
+    pub(crate) column_gap: f32,
+    pub(crate) control_height: f32,
     select_width: f32,
     segment_width: f32,
 }
 
-const SETTINGS_DETAIL: SettingsDetailMetrics = SettingsDetailMetrics {
+pub(crate) const SETTINGS_DETAIL: SettingsDetailMetrics = SettingsDetailMetrics {
     pad_x: 26.0,
     pad_top: 20.0,
     pad_bottom: 40.0,
@@ -435,7 +435,7 @@ pub fn show(
                             };
 
                             apply_component_style(ui);
-                            if matches!(*category, Category::Environment) {
+                            if matches!(*category, Category::Environment | Category::CloudAgents) {
                                 render_detail(ui);
                             } else {
                                 egui::ScrollArea::vertical()
@@ -590,7 +590,7 @@ pub(crate) fn apply_settings_palette(ui: &mut egui::Ui) {
 
 /// 관리/모니터 패널의 버튼·입력을 설정 가이드의 sharp egui 룰로 통일한다.
 /// 1px border, radius 0, control text 14px에 맞춘다.
-fn apply_component_style(ui: &mut egui::Ui) {
+pub(crate) fn apply_component_style(ui: &mut egui::Ui) {
     let spacing = ui.spacing_mut();
     spacing.interact_size.y = CONTROL_HEIGHT;
     spacing.button_padding = egui::vec2(10.0, 5.0);

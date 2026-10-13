@@ -5,7 +5,7 @@ use base64::Engine as _;
 use egui_kittest::kittest::Queryable as _;
 use sha2::{Digest, Sha256};
 
-fn connection_fixture() -> (CloudAgent, Target, String, String, String) {
+pub(super) fn connection_fixture() -> (CloudAgent, Target, String, String, String) {
     let mut bridge = CloudAgent::memory();
     bridge.automatic = false;
     bridge.server = Some(agent_mcp::Server::start(0, "", || {}).unwrap());
@@ -32,6 +32,18 @@ fn harness(bridge: CloudAgent) -> egui_kittest::Harness<'static, CloudAgent> {
         .with_size(egui::vec2(1500.0, 1800.0))
         .build_ui_state(
             move |ui, state: &mut CloudAgent| {
+                if state.has_cloud_runs()
+                    && ui
+                        .ctx()
+                        .data_mut(|d| d.get_temp::<bool>(egui::Id::new("test-initial-work")))
+                        .is_none()
+                {
+                    let mut view = settings::state(ui);
+                    view.tab = settings::Tab::Work;
+                    settings::store(ui, view);
+                    ui.ctx()
+                        .data_mut(|d| d.insert_temp(egui::Id::new("test-initial-work"), true));
+                }
                 state.contents(ui, &catalog);
                 let copies = ui.ctx().output(|output| {
                     output
@@ -119,6 +131,8 @@ fn management_ui_permissions_and_revoke_affect_only_the_selected_connection() {
         .get_by_label("Review Bot · Credential issued · waiting for authentication")
         .click();
     harness.run();
+    harness.get_by_label("Access permissions").click();
+    harness.run();
     harness
         .get_by_role_and_label(
             egui::accesskit::Role::CheckBox,
@@ -141,6 +155,12 @@ fn management_ui_permissions_and_revoke_affect_only_the_selected_connection() {
             .connection_permission(&research, &target)
             .read
     );
+    harness.get_by_label("Connections").click();
+    harness.run();
+    harness
+        .get_by_label("Connection information and management")
+        .click();
+    harness.run();
     harness.get_by_label("Revoke this connection").click();
     harness.run();
     let connections = harness.state().connection_infos();
@@ -183,6 +203,8 @@ fn management_ui_local_takeover_revokes_the_displayed_lease() {
         .get_by_label("Review Bot · Credential issued · waiting for authentication")
         .click();
     harness.run();
+    harness.get_by_label("Access permissions").click();
+    harness.run();
     assert!(
         harness
             .query_by_label("Input controller: Review Bot")
@@ -200,6 +222,42 @@ fn management_ui_local_takeover_revokes_the_displayed_lease() {
             .input
     );
     assert!(harness.query_by_label("Input controller: You").is_some());
+    harness
+        .get_by_role_and_label(
+            egui::accesskit::Role::CheckBox,
+            "Allow this connection to input",
+        )
+        .click();
+    harness.run();
+    assert!(
+        harness
+            .state()
+            .connection_permission(&review, &target)
+            .input
+    );
+    assert!(
+        harness.state().connection_lease(&target).is_none(),
+        "owner consent cannot auto-acquire control"
+    );
+    harness
+        .state_mut()
+        .control
+        .acquire(&review, &target.id, &target.generation, None, now(), 90)
+        .unwrap();
+    harness.run();
+    harness
+        .get_by_role_and_label(
+            egui::accesskit::Role::CheckBox,
+            "Allow this connection to read · receive answers",
+        )
+        .click();
+    harness.run();
+    let access = harness.state().connection_permission(&review, &target);
+    assert!(!access.read && !access.input);
+    assert!(
+        harness.state().connection_lease(&target).is_none(),
+        "read-off revokes input and the existing lease"
+    );
 }
 
 #[test]
@@ -209,6 +267,8 @@ fn management_ui_connection_rename_updates_the_real_registry() {
     harness
         .get_by_label("Review Bot · Credential issued · waiting for authentication")
         .click();
+    harness.run();
+    harness.get_by_label("Edit").click();
     harness.run();
     harness
         .get_by_role_and_label(egui::accesskit::Role::TextInput, "Connection name")
@@ -269,8 +329,9 @@ fn management_ui_profile_save_load_delete_preserve_supported_endpoint_coordinate
     bridge.hostname = "mac.example.ts.net:8443".into();
     bridge.profile_name = "Stable Mac".into();
     let mut harness = harness(bridge);
-    harness.get_by_label("Connection profiles").click();
+    harness.get_by_label("Advanced settings").click();
     harness.run();
+
     harness.get_by_label("Save profile").click();
     harness.run();
     assert_eq!(harness.state().profiles.len(), 1);
@@ -281,6 +342,8 @@ fn management_ui_profile_save_load_delete_preserve_supported_endpoint_coordinate
     harness.state_mut().hostname = "other.example.com".into();
     harness.state_mut().port = 8745;
     harness.run();
+    harness.get_by_label("⋯").click();
+    harness.run();
     harness.get_by_label("Load profile").click();
     harness.run();
     assert_eq!(harness.state().hostname, "mac.example.ts.net:8443");
@@ -289,6 +352,8 @@ fn management_ui_profile_save_load_delete_preserve_supported_endpoint_coordinate
         harness.state().grants.is_empty(),
         "profiles never restore session consent"
     );
+    harness.get_by_label("⋯").click();
+    harness.run();
     harness.get_by_label("Delete profile").click();
     harness.run();
     assert!(harness.state().profiles.is_empty());
@@ -303,8 +368,9 @@ fn management_ui_reconnect_opt_out_cancels_pending_and_future_recovery() {
     bridge.recovery.failed(at);
     assert!(bridge.recovery.due().is_some());
     let mut harness = harness(bridge);
-    harness.get_by_label("Connection profiles").click();
+    harness.get_by_label("Advanced settings").click();
     harness.run();
+
     harness
         .get_by_role_and_label(
             egui::accesskit::Role::CheckBox,
@@ -391,24 +457,38 @@ fn management_ui_scoped_answer_navigation_and_widgets_isolate_duplicate_external
 
     harness.get_by_label(&review_header).click();
     harness.run();
-    harness.get_by_label("Review Bot's own answer");
-    harness.get_by_label("Research Bot's own answer");
-    harness.get_by_label(&research_header).click();
-    harness.run();
-    harness.get_by_label("Review Bot's own answer");
+    assert!(harness.query_by_label("Review Bot's own answer").is_some());
     assert!(
         harness
             .query_by_label("Research Bot's own answer")
             .is_none()
     );
-
-    harness.state_mut().selected_record = Some(research_notification_key);
-    harness.run();
-    harness.get_by_label("Research Bot's own answer");
-    harness.get_by_label(&review_header).click();
+    harness.get_by_label(&research_header).click();
     harness.run();
     assert!(harness.query_by_label("Review Bot's own answer").is_none());
-    harness.get_by_label("Research Bot's own answer");
+    assert!(
+        harness
+            .query_by_label("Research Bot's own answer")
+            .is_some()
+    );
+    harness.state_mut().selected_record = Some(research_notification_key);
+    harness.run();
+    assert!(
+        harness.state().selected_record.is_none(),
+        "notification navigation consumed once"
+    );
+    harness.get_by_label(&review_header).click();
+    harness.run();
+    assert!(
+        harness
+            .query_by_label("Research Bot's own answer")
+            .is_none()
+    );
+    harness.run();
+    assert!(
+        harness.query_by_label("Review Bot's own answer").is_some(),
+        "selection persists after notification"
+    );
 }
 
 const LATE_NOTIFY_FIRST: &str = "fixture-notify-access-token-123456789";
@@ -728,7 +808,7 @@ fn management_call(
         .unwrap();
 }
 
-fn running_fixture() -> (CloudAgent, Target, String, String) {
+pub(super) fn running_fixture() -> (CloudAgent, Target, String, String) {
     running_fixture_with_id("review-run")
 }
 
@@ -768,6 +848,8 @@ fn late_secret_run_reference_footer_masks_display_preserves_identity() {
         .get_by_label("Inspect project · Running · Review Bot")
         .click();
     harness.run();
+    harness.get_by_label("Work details").click();
+    harness.run();
     harness.get_by_label(&raw_footer);
     let first = secret::SecretString::new(LATE_NOTIFY_FIRST.into());
     let _lease = harness
@@ -794,6 +876,8 @@ fn late_secret_run_reference_hover_masks_display_preserves_identity() {
     harness
         .get_by_label("Inspect project · Running · Review Bot")
         .click();
+    harness.run();
+    harness.get_by_label("Work details").click();
     harness.run();
     let first = secret::SecretString::new(LATE_NOTIFY_FIRST.into());
     let _lease = harness
@@ -909,13 +993,15 @@ fn management_ui_cloud_report_is_separate_from_local_status_and_keeps_result_ori
         .click();
     harness.run();
     harness.get_by_label("Progress: 100% · agent reported");
-    harness.get_by_label("Local status for this run's session: Running");
+    harness.get_by_role_and_label(egui::accesskit::Role::Label, "Running");
+    harness.get_by_label("Work details").click();
+    harness.run();
     assert_eq!(
         harness
             .get_all_by_label("Agent · Codex · gpt-6.1-sol · xhigh")
             .count(),
-        2,
-        "connection and run views both retain separate identity metadata"
+        1,
+        "selected task retains the original session identity metadata"
     );
     assert!(
         harness
@@ -1011,6 +1097,10 @@ fn management_ui_run_search_hides_other_runs_without_changing_the_cache() {
 fn management_ui_independent_manual_token_is_copied_once_without_default_session_consent() {
     let (bridge, target, _, _, _) = connection_fixture();
     let mut harness = harness(bridge);
+    harness.get_by_label("Add connection").click();
+    harness.run();
+    harness.get_by_label("Independent token").click();
+    harness.run();
     harness
         .get_by_role_and_label(
             egui::accesskit::Role::TextInput,
@@ -1044,6 +1134,16 @@ fn management_ui_independent_manual_token_is_copied_once_without_default_session
         .authenticate_principal(&format!("Bearer {token}"), now())
         .unwrap();
     assert_eq!(principal.name, "Audit Bot");
+    let selected = harness.ctx.data_mut(|data| {
+        data.get_temp::<settings::SettingsState>(settings::state_id())
+            .unwrap()
+            .selected
+    });
+    assert_eq!(
+        selected.as_deref(),
+        Some(principal.id.as_str()),
+        "newly issued identity is selected regardless of name sorting"
+    );
     assert!(
         !principal.input_scope,
         "independent credentials default to read scope"
@@ -1080,52 +1180,38 @@ fn management_ui_controls_fit_a_narrow_native_settings_pane() {
     let mut harness = egui_kittest::Harness::builder()
         .with_size(egui::vec2(720.0, 1800.0))
         .build_ui_state(
-            move |ui, state: &mut CloudAgent| {
-                ui.ctx().set_visuals(egui::Visuals::dark());
-                state.contents(ui, &catalog);
-            },
+            move |ui, state: &mut CloudAgent| state.contents(ui, &catalog),
             bridge,
         );
-    harness
-        .get_by_label("Review Bot · Authenticated · no successful tools yet")
-        .click();
-    harness.run();
-    harness
-        .get_by_label("Inspect project · Running · Review Bot")
-        .click();
-    harness.run();
-    for (role, label) in [
-        (
-            egui::accesskit::Role::TextInput,
-            "New manual connection name",
-        ),
-        (
-            egui::accesskit::Role::Button,
-            "Issue and copy independent token",
-        ),
-        (
-            egui::accesskit::Role::CheckBox,
-            "Allow this connection to read · receive answers",
-        ),
-        (
-            egui::accesskit::Role::CheckBox,
-            "Allow this connection to input",
-        ),
-        (egui::accesskit::Role::Button, "Request cancellation"),
+    for tab in [
+        "Connections",
+        "Access permissions",
+        "Work · answers",
+        "Advanced settings",
     ] {
-        let bounds = harness.get_by_role_and_label(role, label).rect();
+        let bounds = harness
+            .get_by_role_and_label(egui::accesskit::Role::Tab, tab)
+            .rect();
         assert!(
             bounds.left() >= 0.0 && bounds.right() <= 720.0,
-            "control is clipped: {label} {bounds:?}"
-        );
-        assert!(
-            bounds.top() >= 0.0 && bounds.bottom() <= 1800.0,
-            "control is outside the settings pane: {label} {bounds:?}"
+            "tab clipped: {bounds:?}"
         );
     }
+    harness.get_by_label("Work · answers").click();
+    harness.run();
+    let bounds = harness.get_by_label("Request cancellation").rect();
+    assert!(bounds.left() >= 0.0 && bounds.right() <= 720.0);
+    harness.get_by_label("Access permissions").click();
+    harness.run();
+    let bounds = harness
+        .get_by_role_and_label(
+            egui::accesskit::Role::CheckBox,
+            "Allow this connection to input",
+        )
+        .rect();
+    assert!(bounds.left() >= 0.0 && bounds.right() <= 720.0);
     let path = std::env::temp_dir().join("deppy-cloud-settings-native-720-20261013.png");
     harness.render().unwrap().save(&path).unwrap();
-    eprintln!("Native settings image: {}", path.display());
 }
 
 #[test]

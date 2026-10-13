@@ -109,6 +109,52 @@ impl CloudArtifactView {
 /// immediately before applying its effect.
 pub type CloudControlSink = Arc<dyn Fn(CloudControlRequest) -> bool + Send + Sync>;
 
+/// Actual App-observed navigation outcome, independent of queue admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudNavigationOutcome {
+    Opened,
+    Unavailable,
+    TimedOut,
+    Superseded,
+    Rejected,
+}
+
+/// Transport-owned nonblocking reply callback; request IDs never grant authority.
+pub type CloudNavigationCallback = Arc<dyn Fn(CloudNavigationOutcome) + Send + Sync>;
+
+pub struct CloudNavigationReply {
+    authority: Arc<CloudControlAuthority>,
+    callback: CloudNavigationCallback,
+    deadline: Instant,
+}
+
+impl CloudNavigationReply {
+    pub fn finish(self, outcome: CloudNavigationOutcome) {
+        // Completion may outlive the five-second admission deadline, but never
+        // the original socket/principal, policy epoch, expiry or core lifetime.
+        if self.fence_valid()
+            && (self.authority.revalidate)() == Some(self.authority.policy)
+            && self.fence_valid()
+        {
+            (self.callback)(outcome);
+        }
+    }
+
+    fn fence_valid(&self) -> bool {
+        let authority = &self.authority;
+        authority.active.load(Ordering::SeqCst)
+            && (authority.core_alive)()
+            && Instant::now() < self.deadline
+            && authority.policy.permissions.allows(RelayAction::View)
+            && authority.policy.permissions.allows(RelayAction::Switch)
+            && authority
+                .policy
+                .expires_at
+                .is_none_or(|expiry| cloud_unix_seconds() < expiry)
+    }
+}
+
 /// Current trusted authority, obtained from the transport's authenticated principal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CloudControlPolicy {
@@ -182,6 +228,7 @@ impl CloudControlOriginGuard {
             intent,
             authority: self.authority.clone(),
             deadline: Instant::now() + Duration::from_secs(5),
+            navigation_callback: None,
         };
         request
             .authorized_at(core_id, Instant::now(), cloud_unix_seconds())
@@ -201,6 +248,7 @@ pub struct CloudControlRequest {
     intent: CloudControlIntent,
     authority: Arc<CloudControlAuthority>,
     deadline: Instant,
+    navigation_callback: Option<CloudNavigationCallback>,
 }
 
 impl std::fmt::Debug for CloudControlRequest {
@@ -213,6 +261,23 @@ impl std::fmt::Debug for CloudControlRequest {
 }
 
 impl CloudControlRequest {
+    pub(crate) fn set_navigation_callback(&mut self, callback: CloudNavigationCallback) {
+        if matches!(self.intent, CloudControlIntent::Navigate { .. }) {
+            self.navigation_callback = Some(callback);
+        }
+    }
+
+    /// Take once before consuming the authority envelope. This cannot authorize an effect.
+    pub fn take_navigation_reply(&mut self) -> Option<CloudNavigationReply> {
+        self.navigation_callback
+            .take()
+            .map(|callback| CloudNavigationReply {
+                authority: self.authority.clone(),
+                callback,
+                deadline: self.deadline + Duration::from_secs(35),
+            })
+    }
+
     pub fn intent(&self) -> &CloudControlIntent {
         &self.intent
     }
@@ -532,6 +597,100 @@ mod tests {
             snapshot.runs[0].local_status = Some(state.into());
             assert_eq!(snapshot.validate(), Ok(()), "{state}");
         }
+    }
+
+    #[test]
+    fn navigation_reply_reports_observed_completion_and_fences_old_origin() {
+        let core = crate::session_core::SessionCore::spawn(None);
+        let current = Arc::new(std::sync::Mutex::new(Some(control_policy())));
+        let policy = current.clone();
+        let guard = core.dashboard().cloud_control_origin(
+            CloudControlOrigin::DirectWeb { connection_id: 1 },
+            control_policy(),
+            Arc::new(move || *policy.lock().unwrap()),
+        );
+        let (request_tx, request_rx) = std::sync::mpsc::sync_channel(4);
+        core.set_cloud_control_sink(Arc::new(move |request| {
+            request_tx.try_send(request).is_ok()
+        }));
+        let (tx, rx) = std::sync::mpsc::sync_channel(4);
+        for outcome in [
+            CloudNavigationOutcome::Opened,
+            CloudNavigationOutcome::Unavailable,
+            CloudNavigationOutcome::TimedOut,
+            CloudNavigationOutcome::Superseded,
+            CloudNavigationOutcome::Rejected,
+        ] {
+            let tx = tx.clone();
+            assert!(
+                core.dashboard()
+                    .request_cloud_control_with_navigation_reply(
+                        &guard,
+                        CloudControlIntent::Navigate {
+                            workspace_id: "workspace".into(),
+                            session_id: "session".into()
+                        },
+                        Arc::new(move |outcome| {
+                            let _ = tx.try_send(outcome);
+                        }),
+                    )
+            );
+            let mut request = request_rx.recv().unwrap();
+            let reply = request.take_navigation_reply().unwrap();
+            assert!(request.take_navigation_reply().is_none());
+            assert!(
+                rx.try_recv().is_err(),
+                "admission must not report completion"
+            );
+            assert!(core.authorize_cloud_control(request).is_some());
+            reply.finish(outcome);
+            assert_eq!(
+                rx.recv_timeout(Duration::from_millis(100)).unwrap(),
+                outcome
+            );
+        }
+        for invalidation in 0..4 {
+            *current.lock().unwrap() = Some(control_policy());
+            let tx = tx.clone();
+            assert!(
+                core.dashboard()
+                    .request_cloud_control_with_navigation_reply(
+                        &guard,
+                        CloudControlIntent::Navigate {
+                            workspace_id: "workspace".into(),
+                            session_id: "session".into()
+                        },
+                        Arc::new(move |outcome| {
+                            let _ = tx.try_send(outcome);
+                        }),
+                    )
+            );
+            let mut request = request_rx.recv().unwrap();
+            let mut reply = request.take_navigation_reply().unwrap();
+            assert!(core.authorize_cloud_control(request).is_some());
+            match invalidation {
+                0 => {
+                    current
+                        .lock()
+                        .unwrap()
+                        .as_mut()
+                        .unwrap()
+                        .authorization_epoch[15] += 1
+                }
+                1 => {
+                    current.lock().unwrap().as_mut().unwrap().permissions =
+                        crate::relay::contract::RelayPermissions::default()
+                }
+                2 => reply.deadline = Instant::now(),
+                _ => guard.revoke(),
+            }
+            reply.finish(CloudNavigationOutcome::Opened);
+            assert!(
+                rx.try_recv().is_err(),
+                "obsolete activation received a result"
+            );
+        }
+        core.shutdown();
     }
 
     #[test]

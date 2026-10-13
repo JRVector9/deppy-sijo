@@ -26,6 +26,7 @@ export function createCloudResultsView({ host, send, navigate = () => {}, beginN
   const list = node('div', 'cloud-results-list');
   panel.append(heading, help, toolbar, status, retained, list); host.append(toggle, panel);
   let snapshot = null, canControl = false, canApprove = false, sequence = 0;
+  let navigationNotice = null;
   const pending = new Map();
   const actionBindings = new WeakMap();
   const rows = value => Array.isArray(value) ? value.slice(0, 100) : [];
@@ -53,14 +54,18 @@ export function createCloudResultsView({ host, send, navigate = () => {}, beginN
     if (!(intent.action === 'approve_connection' ? canApprove : canControl)) return;
     const request = sequence = sequence >= 0xffffffff ? 1 : sequence + 1;
     if (send({ type:'cloud_control', request, intent }) === false) { status.textContent = '연결을 확인하고 다시 요청하세요.'; return; }
-    if (intent.action === 'navigate') { cancelNavigation(); beginNavigation(); }
+    if (intent.action === 'navigate') {
+      cancelNavigation(); beginNavigation();
+      navigationNotice = { request, state:'pending', text:'원래 세션 이동을 요청했습니다. Mac의 확인을 기다립니다.' };
+    } else if (navigationNotice?.state === 'failed') navigationNotice = null;
     button.disabled = true;
     const timer = setTimeout(() => {
+      if (intent.action === 'navigate') { failNavigation(request, 'timed_out'); return; }
       if (!pending.delete(request)) return;
       status.textContent = '요청 접수를 확인하지 못했습니다. 최신 상태를 확인하세요.'; render();
     }, 15000);
     pending.set(request, { key:keyOf(intent), timer, intent });
-    status.textContent = '요청을 보냈습니다. 최신 상태로 결과를 확인합니다.';
+    status.textContent = navigationNotice?.text || '요청을 보냈습니다. 최신 상태로 결과를 확인합니다.';
   });
   function reconcile(parent, desired) {
     const key = (child, index) => child.nodeType === 1 ? child.dataset.cloudKey : '#text:' + index;
@@ -187,23 +192,56 @@ export function createCloudResultsView({ host, send, navigate = () => {}, beginN
       if (entry.intent.action !== 'navigate') continue;
       clearTimeout(entry.timer); pending.delete(request);
     }
+    navigationNotice = null;
+  }
+  function failNavigation(request, reason) {
+    if (navigationNotice?.request !== request || !['pending','opened'].includes(navigationNotice.state)) return false;
+    const entry = pending.get(request);
+    if (entry) { clearTimeout(entry.timer); pending.delete(request); }
+    const messages = {
+      unavailable:'원래 세션을 열지 못했습니다. 세션이 닫혔거나 없어졌습니다. 저장된 결과는 계속 확인할 수 있습니다.',
+      timed_out:'원래 세션 이동을 확인하는 시간이 초과되었습니다. 최신 세션 상태를 확인하고 다시 시도하세요.',
+      superseded:'새 이동 요청으로 원래 세션 이동이 취소되었습니다. 저장된 결과는 계속 확인할 수 있습니다.',
+      rejected:'원래 세션 이동이 거절되었습니다. 연결 권한과 세션 상태를 확인하세요.',
+    };
+    navigationNotice = { request, state:'failed', text:messages[reason] || messages.unavailable };
+    status.textContent = navigationNotice.text; render();
+    return true;
   }
   function resetConnection() {
     canControl = canApprove = false;
     for (const entry of pending.values()) clearTimeout(entry.timer);
-    pending.clear(); status.textContent = '연결 끊김 · 마지막 수신 상태'; render();
+    pending.clear(); navigationNotice = null; status.textContent = '연결 끊김 · 마지막 수신 상태'; render();
   }
   function accept(message) {
     if (message.type === 'cloud_snapshot') {
       snapshot = message.snapshot || {}; canControl = message.can_control === true; canApprove = message.can_approve === true;
-      status.textContent = canControl ? '연결됨 · 요청은 Mac에서 권한을 확인합니다.' : canApprove ? '승인 허용 · 터미널 읽기 전용' : '읽기 전용 · 연결된 기기의 권한으로 표시합니다.'; render(); return;
+      status.textContent = navigationNotice?.text || (canControl ? '연결됨 · 요청은 Mac에서 권한을 확인합니다.' : canApprove ? '승인 허용 · 터미널 읽기 전용' : '읽기 전용 · 연결된 기기의 권한으로 표시합니다.'); render(); return;
+    }
+    if (message.type === 'cloud_navigation_result') {
+      const entry = pending.get(message.request);
+      if (!entry || entry.intent.action !== 'navigate' || navigationNotice?.request !== message.request) return;
+      if (['unavailable','timed_out','superseded','rejected'].includes(message.status)) { failNavigation(message.request, message.status); return; }
+      if (message.status !== 'opened') return;
+      clearTimeout(entry.timer); pending.delete(message.request);
+      navigationNotice = { request:message.request, state:'opened', text:'Mac에서 원래 세션을 열었습니다. 화면을 연결합니다.' };
+      status.textContent = navigationNotice.text;
+      navigate(entry.intent, message.request); render(); return;
     }
     if (message.type !== 'cloud_control_result') return;
     const entry = pending.get(message.request); if (!entry) return;
+    if (entry.intent.action === 'navigate') {
+      if (message.status !== 'queued') { failNavigation(message.request, 'rejected'); return; }
+      if (!entry.accepted) {
+        clearTimeout(entry.timer); entry.accepted = true;
+        entry.timer = setTimeout(() => failNavigation(message.request, 'timed_out'), 40000);
+      }
+      navigationNotice.text = '원래 세션 이동이 접수되었습니다. Mac의 이동 결과를 기다립니다.';
+      status.textContent = navigationNotice.text; render(); return;
+    }
     clearTimeout(entry.timer); pending.delete(message.request);
     status.textContent = message.status === 'queued' ? '요청 접수됨 · 최신 상태와 에이전트 확인을 기다립니다.' : '요청이 거절되었습니다. 최신 권한과 대상을 확인하세요.';
-    if (message.status === 'queued' && entry.intent.action === 'navigate') navigate(entry.intent);
     render();
   }
-  return { accept, resetConnection, cancelNavigation, panel, toggle };
+  return { accept, resetConnection, cancelNavigation, failNavigation, panel, toggle };
 }

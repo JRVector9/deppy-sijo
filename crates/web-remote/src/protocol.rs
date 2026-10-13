@@ -281,6 +281,11 @@ pub enum ServerMsg {
     },
     /// Receipt is mailbox admission, not successful execution or cancellation.
     CloudControlResult { request: u32, status: &'static str },
+    /// App-observed final activation result, sent only to the requesting socket.
+    CloudNavigationResult {
+        request: u32,
+        status: crate::cloud::CloudNavigationOutcome,
+    },
     /// 인증 성공 직후 1회.
     Welcome { v: u32 },
     /// 워크스페이스별 세션 목록 + 리소스 스냅샷. 활성 워크스페이스의 상태는 런타임

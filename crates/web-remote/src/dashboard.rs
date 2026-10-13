@@ -651,9 +651,30 @@ impl DashboardHandle {
         origin: &crate::cloud::CloudControlOriginGuard,
         intent: crate::cloud::CloudControlIntent,
     ) -> bool {
-        let Some(request) = origin.issue(self.cloud_control_core_id(), intent) else {
+        self.request_cloud_control_reply(origin, intent, None)
+    }
+
+    pub(crate) fn request_cloud_control_with_navigation_reply(
+        &self,
+        origin: &crate::cloud::CloudControlOriginGuard,
+        intent: crate::cloud::CloudControlIntent,
+        callback: crate::cloud::CloudNavigationCallback,
+    ) -> bool {
+        self.request_cloud_control_reply(origin, intent, Some(callback))
+    }
+
+    fn request_cloud_control_reply(
+        &self,
+        origin: &crate::cloud::CloudControlOriginGuard,
+        intent: crate::cloud::CloudControlIntent,
+        callback: Option<crate::cloud::CloudNavigationCallback>,
+    ) -> bool {
+        let Some(mut request) = origin.issue(self.cloud_control_core_id(), intent) else {
             return false;
         };
+        if let Some(callback) = callback {
+            request.set_navigation_callback(callback);
+        }
         let sink = self
             .shared
             .cloud_sink

@@ -235,6 +235,9 @@ fn stream_loop(
     watch: &mut WatchBinding<'_>,
     origin: &crate::cloud::CloudControlOriginGuard,
 ) {
+    // Replies are socket-local and bounded; the UI thread never blocks on a peer.
+    let (navigation_tx, navigation_rx) =
+        std::sync::mpsc::sync_channel::<(u32, crate::cloud::CloudNavigationOutcome)>(16);
     let mut last_dash = 0u64;
     let mut last_appr = 0u64;
     let mut last_cloud = 0u64;
@@ -253,6 +256,22 @@ fn stream_loop(
     loop {
         if stop.load(Ordering::SeqCst) {
             return;
+        }
+
+        for _ in 0..16 {
+            let Ok((request, status)) = navigation_rx.try_recv() else {
+                break;
+            };
+            if ws
+                .send(Message::Text(
+                    ServerMsg::CloudNavigationResult { request, status }
+                        .encode()
+                        .into(),
+                ))
+                .is_err()
+            {
+                return;
+            }
         }
 
         // 발행 스냅샷이 갱신됐으면(버전 증가) 전송. 실패(피어 종료)는 루프 종료.
@@ -419,10 +438,23 @@ fn stream_loop(
                         Some(ClientMsg::CloudControl { request, intent }) => {
                             let status = if request == 0 || !intent.validate() {
                                 "invalid"
-                            } else if dashboard.request_cloud_control(origin, intent) {
-                                "queued"
                             } else {
-                                "rejected"
+                                let accepted = if matches!(
+                                    &intent,
+                                    crate::cloud::CloudControlIntent::Navigate { .. }
+                                ) {
+                                    let tx = navigation_tx.clone();
+                                    dashboard.request_cloud_control_with_navigation_reply(
+                                        origin,
+                                        intent,
+                                        Arc::new(move |outcome| {
+                                            let _ = tx.try_send((request, outcome));
+                                        }),
+                                    )
+                                } else {
+                                    dashboard.request_cloud_control(origin, intent)
+                                };
+                                if accepted { "queued" } else { "rejected" }
                             };
                             if ws
                                 .send(Message::Text(

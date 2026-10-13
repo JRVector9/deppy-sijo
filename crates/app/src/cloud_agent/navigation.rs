@@ -70,6 +70,24 @@ impl CloudAgent {
     }
 }
 
+/// Only bounded outcome codes cross the transport; internal errors stay native.
+pub(crate) fn navigation_outcome(
+    result: &Result<(), String>,
+) -> web_remote::cloud::CloudNavigationOutcome {
+    use web_remote::cloud::CloudNavigationOutcome;
+    match result.as_ref().map_err(String::as_str) {
+        Ok(()) => CloudNavigationOutcome::Opened,
+        Err("session_activation_timed_out") => CloudNavigationOutcome::TimedOut,
+        Err("navigation_superseded") => CloudNavigationOutcome::Superseded,
+        Err(
+            "workspace_activation_rejected"
+            | "session_activation_rejected"
+            | "navigation_id_exhausted",
+        ) => CloudNavigationOutcome::Rejected,
+        Err(_) => CloudNavigationOutcome::Unavailable,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

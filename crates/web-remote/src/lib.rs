@@ -767,6 +767,59 @@ mod tests {
     }
 
     #[test]
+    fn cloud_navigation_completion_returns_only_to_requesting_websocket() {
+        let server = start(None);
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        server.set_cloud_control_sink(Arc::new(move |request| tx.try_send(request).is_ok()));
+        let mut owner = ws_client_authed(server.local_addr());
+        let mut other = ws_client_authed(server.local_addr());
+        for (id, outcome, status) in [
+            (
+                41,
+                cloud::CloudNavigationOutcome::Unavailable,
+                "unavailable",
+            ),
+            (42, cloud::CloudNavigationOutcome::Opened, "opened"),
+        ] {
+            let text = format!(
+                r#"{{"type":"cloud_control","request":{id},"intent":{{"action":"navigate","workspace_id":"workspace-original","session_id":"session-original"}}}}"#
+            );
+            send_text(&mut owner, &text);
+            let mut request = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let reply = request
+                .take_navigation_reply()
+                .expect("navigation needs observed-result transport");
+            assert!(server.core().authorize_cloud_control(request).is_some());
+            // Complete before the next WS tick: admission must still precede completion.
+            reply.finish(outcome);
+            let admission =
+                read_frame_of_type(&mut owner, "cloud_control_result", Duration::from_secs(2))
+                    .unwrap();
+            assert!(admission.contains("queued"));
+            let result = read_frame_of_type(
+                &mut owner,
+                "cloud_navigation_result",
+                Duration::from_secs(2),
+            )
+            .unwrap();
+            let result: serde_json::Value = serde_json::from_str(&result).unwrap();
+            assert_eq!(result["request"], id);
+            assert_eq!(result["status"], status);
+        }
+        assert!(
+            read_frame_of_type(
+                &mut other,
+                "cloud_navigation_result",
+                Duration::from_millis(400)
+            )
+            .is_none()
+        );
+        drop(owner);
+        drop(other);
+        server.shutdown();
+    }
+
+    #[test]
     fn cloud_control_queued_before_direct_server_stop_cannot_execute_on_shared_core() {
         let core = session_core::SessionCore::spawn(None);
         let server = WebRemoteServer::serve_with_core(

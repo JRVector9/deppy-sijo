@@ -327,6 +327,7 @@
         break;
       case 'cloud_snapshot':
       case 'cloud_control_result':
+      case 'cloud_navigation_result':
         cloudResults.accept(msg);
         break;
       case 'viewport':
@@ -1760,15 +1761,31 @@
   // 재배정)이라, 대시보드에 실재하는 id일 때만 자동 시청한다(스테일 알림 방어).
   let pendingWatch = null;
   let pendingWatchDeadline = 0;
+  let pendingWatchTimer = null;
   // 세션 식별자는 **영속 UUID 문자열**이다 (I1) — 재시작해도 같은 세션을 가리킨다.
   // 그래도 기한을 둔다: 이미 끝난 세션의 알림을 한참 뒤 탭하면 조용히 폐기한다.
   const PENDING_WATCH_TTL_MS = 30_000;
 
-  function cancelPendingWatch() { pendingWatch = null; pendingWatchDeadline = 0; }
+  function cancelPendingWatch() {
+    clearTimeout(pendingWatchTimer); pendingWatchTimer = null;
+    pendingWatch = null; pendingWatchDeadline = 0;
+  }
   function cancelCloudNavigation() { cancelPendingWatch(); cloudResults.cancelNavigation(); }
-  function setPendingWatch(session, workspace = null) {
-    pendingWatch = { session, workspace, socket: workspace ? ws : null };
+  function failPendingCloudWatch(pending, reason) {
+    cancelPendingWatch();
+    if (pending.cloudRequest && cloudResults.failNavigation(pending.cloudRequest, reason)) {
+      showNotice(reason === 'timed_out' ? '원래 세션 화면 연결 시간이 초과되었습니다. 저장된 결과를 확인하세요.'
+        : '원래 세션을 열지 못했습니다. 저장된 결과는 계속 확인할 수 있습니다.');
+    }
+  }
+  function setPendingWatch(session, workspace = null, cloudRequest = null) {
+    cancelPendingWatch();
+    const pending = { session, workspace, socket: workspace ? ws : null, cloudRequest };
+    pendingWatch = pending;
     pendingWatchDeadline = Date.now() + PENDING_WATCH_TTL_MS;
+    if (cloudRequest) pendingWatchTimer = setTimeout(() => {
+      if (pendingWatch === pending) failPendingCloudWatch(pending, 'timed_out');
+    }, PENDING_WATCH_TTL_MS);
   }
   {
     const watchParam = params.get('watch');
@@ -1797,14 +1814,18 @@
     const pending = pendingWatch;
     if (!pending) return false;
     if (Date.now() > pendingWatchDeadline || (pending.workspace && pending.socket !== ws)) {
-      cancelPendingWatch(); return false;
+      if (pending.socket === ws) failPendingCloudWatch(pending, 'timed_out');
+      else cancelPendingWatch();
+      return false;
     }
     if (viewer.closing) return false;
     const workspace = pending.workspace && lastWorkspaces.find(item => item.id === pending.workspace);
+    if (pending.cloudRequest && !workspace) { failPendingCloudWatch(pending, 'unavailable'); return false; }
     if (pending.workspace && (!workspace || workspace.state !== 'active')) return false;
     const target = (workspace ? workspace.sessions || [] : sessions).find(session => session.id === pending.session || (workspace && session.selection_id === pending.session));
     if (!target?.id || target.exited) {
-      if (target?.exited) cancelPendingWatch();
+      if (pending.cloudRequest && (target?.exited || (workspace?.state === 'active' && !target))) failPendingCloudWatch(pending, 'unavailable');
+      else if (target?.exited) cancelPendingWatch();
       return false;
     }
     if (target.id === viewer.watching) { cancelPendingWatch(); return true; }
@@ -1877,14 +1898,14 @@
       workspacePanel.hidden = open;
     },
     beginNavigation() { cancelPendingWatch(); cancelWorkspaceSelection(); },
-    navigate(intent) {
-      // Watch only a current, verified UUID after the App admits navigation.
+    navigate(intent, request) {
+      // Watch only a current UUID after the App observes successful activation.
       const workspace = lastWorkspaces.find(item => item.id === intent.workspace_id);
       const session = workspace?.sessions?.find(item => item.id === intent.session_id || item.selection_id === intent.session_id);
       if (workspace?.state === 'active' && session?.id && !session.exited) {
         openViewer(session.id, session.title || '원래 세션');
       } else {
-        setPendingWatch(intent.session_id, intent.workspace_id);
+        setPendingWatch(intent.session_id, intent.workspace_id, request);
         showNotice('원래 워크스페이스와 세션을 준비하고 있습니다.');
       }
     },

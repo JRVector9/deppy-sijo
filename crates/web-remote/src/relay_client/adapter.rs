@@ -156,7 +156,9 @@ impl RelayMessageAdapter {
                     && (snapshot.approvals.is_empty()
                         || self.permissions.allows(RelayAction::Approval))
             }
-            ServerMsg::CloudControlResult { .. } => self.permissions.allows(RelayAction::View),
+            ServerMsg::CloudControlResult { .. } | ServerMsg::CloudNavigationResult { .. } => {
+                self.permissions.allows(RelayAction::View)
+            }
             ServerMsg::TerminalControl { .. } | ServerMsg::HistoryError { .. } => false,
             ServerMsg::Approvals { .. } => self.permissions.allows(RelayAction::Approval),
             ServerMsg::Welcome { .. }

@@ -2,6 +2,13 @@
   localStorage.setItem('deppy.webToken', 'cloud-mobile-isolated');
   globalThis.cloudSent = [];
   globalThis.cloudErrors = [];
+  globalThis.cloudNavigationTimers = [];
+  const nativeSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = (callback, delay, ...args) => {
+    const timer = nativeSetTimeout(callback, delay, ...args);
+    if ([30000, 40000].includes(delay)) cloudNavigationTimers.push({ delay, fire() { clearTimeout(timer); callback(...args); } });
+    return timer;
+  };
   window.addEventListener('error', event => cloudErrors.push(event.message));
   globalThis.cloudSnapshot = {
     captured_at: 100, truncated: true,
@@ -28,7 +35,10 @@
         this.message({ type: 'dashboard', workspaces: [{ id: 'ws-original', name: '원래 프로젝트', state: 'active', sessions: [{ id: 'session-original', title: '원래 세션', status: 'waiting' }] }] });
         this.snapshot();
       }, 5);
-      if (frame.type === 'cloud_control' && !globalThis.cloudHoldReceipts) setTimeout(() => this.message({ type: 'cloud_control_result', request: frame.request, status: 'queued' }), 5);
+      if (frame.type === 'cloud_control' && !globalThis.cloudHoldReceipts) setTimeout(() => {
+        this.message({ type: 'cloud_control_result', request: frame.request, status: 'queued' });
+        if (frame.intent.action === 'navigate' && !globalThis.cloudHoldNavigationResults) this.message({ type:'cloud_navigation_result', request:frame.request, status:'opened' });
+      }, 5);
     }
     close() { this.readyState = 3; this.emit('close'); }
   }
@@ -136,6 +146,73 @@
     const count = cloudSent.length; panel.querySelector('[data-cloud-action="revoke_connection"]').click();
     check(cloudSent.length === count, 'disabled control creates no effect');
     cloudSocket.snapshot(true, true);
+    const navigation = () => panel.querySelector('[data-cloud-run="run-a"] [data-cloud-action="navigate"]');
+    const watchCountBeforeResults = cloudSent.filter(frame => frame.type === 'watch').length;
+    const feedback = () => panel.querySelector('.cloud-feedback').textContent;
+    const originalDashboard = sessions => cloudSocket.message({ type:'dashboard', workspaces:[{ id:'ws-original', name:'원래 프로젝트', state:'active', sessions }] });
+    globalThis.cloudHoldNavigationResults = true;
+    navigation().click(); await sleep(25);
+    const admissionOnly = latest().request;
+    check(cloudSent.filter(frame => frame.type === 'watch').length === watchCountBeforeResults && navigation().disabled, 'queued navigation waits for final result and keeps its control pending');
+    cloudSocket.snapshot();
+    check(navigation().disabled, 'snapshot cannot complete an admitted navigation');
+    panel.querySelector('[data-cloud-run="run-a"] [data-cloud-action="take_control"]').click(); await sleep(25); cloudSocket.snapshot();
+    check(navigation().disabled && feedback().includes('이동이 접수되었습니다'), 'other controls preserve pending navigation correlation');
+    cloudSocket.message({ type:'cloud_navigation_result', request:admissionOnly, status:'unavailable' });
+    check(feedback().includes('원래 세션을 열지 못했습니다') && !navigation().disabled && !panel.hidden, 'unavailable original reports failure and preserves results');
+    const unavailable = feedback(); cloudSocket.snapshot();
+    check(feedback() === unavailable, 'navigation failure survives recurring snapshots');
+    cloudSocket.message({ type:'cloud_navigation_result', request:admissionOnly, status:'opened' });
+    check(cloudSent.filter(frame => frame.type === 'watch').length === watchCountBeforeResults, 'late opened result cannot revive a failed navigation');
+    panel.querySelector('[data-cloud-run="run-a"] [data-cloud-action="take_control"]').click();
+    check(feedback().includes('요청을 보냈습니다'), 'new control request dismisses the previous navigation failure');
+    await sleep(25);
+    check(feedback().includes('요청 접수됨'), 'new control admission shows its own feedback');
+    cloudSocket.snapshot();
+    check(!feedback().includes('원래 세션을 열지 못했습니다'), 'snapshot cannot restore a navigation failure dismissed by a new control');
+    for (const finalStatus of ['timed_out','superseded','rejected']) {
+      navigation().click(); await sleep(25);
+      cloudSocket.message({ type:'cloud_navigation_result', request:latest().request, status:finalStatus });
+      check(feedback().includes(finalStatus === 'timed_out' ? '시간' : finalStatus === 'superseded' ? '취소' : '권한'), 'explicit final navigation failure: ' + finalStatus);
+    }
+    navigation().click(); await sleep(25);
+    const timedRequest = latest().request;
+    check(cloudNavigationTimers.at(-1)?.delay === 40000, 'admitted navigation has a bounded 40-second final result deadline');
+    const finalTimerCount = cloudNavigationTimers.length;
+    cloudSocket.message({ type:'cloud_control_result', request:timedRequest, status:'queued' });
+    check(cloudNavigationTimers.length === finalTimerCount, 'duplicate admission cannot extend the final result deadline');
+    cloudNavigationTimers.at(-1).fire();
+    check(feedback().includes('시간') && !navigation().disabled, 'missing final result reports timeout');
+    cloudSocket.message({ type:'cloud_navigation_result', request:timedRequest, status:'opened' });
+    check(cloudSent.filter(frame => frame.type === 'watch').length === watchCountBeforeResults, 'timed out navigation rejects late success');
+    originalDashboard([]);
+    navigation().click(); await sleep(25);
+    cloudSocket.message({ type:'cloud_navigation_result', request:latest().request, status:'opened' });
+    panel.querySelector('[data-cloud-run="run-a"] [data-cloud-action="take_control"]').click(); await sleep(25); cloudSocket.snapshot();
+    originalDashboard([{ id:'session-original', title:'원래 세션', exited:true }]);
+    check(feedback().includes('원래 세션을 열지 못했습니다') && !panel.hidden, 'closed target during post-result dashboard synchronization reports failure');
+    check(document.getElementById('notice-banner').textContent.includes('열지 못했습니다'), 'closed synchronization replaces its preparation banner with failure');
+    const closedFeedback = feedback(); cloudSocket.snapshot();
+    check(feedback() === closedFeedback, 'post-result closed failure survives snapshots');
+    originalDashboard([]);
+    navigation().click(); await sleep(25);
+    cloudSocket.message({ type:'cloud_navigation_result', request:latest().request, status:'opened' });
+    check(cloudNavigationTimers.at(-1)?.delay === 30000, 'post-result dashboard synchronization has a bounded deadline');
+    cloudNavigationTimers.at(-1).fire();
+    check(feedback().includes('시간') && !panel.hidden, 'post-result dashboard synchronization timeout reports failure without requiring another dashboard');
+    originalDashboard([{ id:'session-original', title:'원래 세션', status:'waiting' }]);
+    check(cloudSent.filter(frame => frame.type === 'watch').length === watchCountBeforeResults, 'expired synchronization cannot follow a later dashboard');
+    const timeoutFeedback = feedback();
+    navigator.serviceWorker.dispatchEvent(new MessageEvent('message', { data:{ type:'watch', session:'missing-notification-session' } }));
+    const actualNow = Date.now; Date.now = () => actualNow() + 31000;
+    originalDashboard([]); Date.now = actualNow;
+    check(feedback() === timeoutFeedback, 'notification deep-link timeout retains its silent discard policy');
+    navigation().click(); await sleep(25);
+    cloudSocket.message({ type:'cloud_navigation_result', request:latest().request, status:'opened' });
+    originalDashboard([]);
+    check(feedback().includes('원래 세션을 열지 못했습니다'), 'missing target after observed opening reports failure');
+    originalDashboard([{ id:'session-original', title:'원래 세션', status:'waiting' }]);
+    globalThis.cloudHoldNavigationResults = false;
     panel.querySelector('[data-cloud-run="run-a"] [data-cloud-action="navigate"]').click();
     check(latest().intent.workspace_id === 'ws-original' && latest().intent.session_id === 'session-original', 'navigation carries exact original target');
     document.getElementById('viewer-back').click(); await sleep(30);
@@ -152,7 +229,7 @@
     document.getElementById('viewer-back').click(); await sleep(30); dashboard();
     globalThis.cloudHoldReceipts = true;
     panel.querySelector('[data-cloud-run="run-a"] [data-cloud-action="navigate"]').click(); const obsoleteRequest = latest().request;
-    selectOther(); cloudSocket.message({ type:'cloud_control_result', request:obsoleteRequest, status:'queued' }); dashboard('active'); await sleep(25);
+    selectOther(); cloudSocket.message({ type:'cloud_control_result', request:obsoleteRequest, status:'queued' }); cloudSocket.message({ type:'cloud_navigation_result', request:obsoleteRequest, status:'opened' }); dashboard('active'); await sleep(25);
     check(lastWatch() === 'session-other', 'late navigation receipt cannot supersede a newer selection');
     document.getElementById('viewer-back').click(); await sleep(30); dashboard(); globalThis.cloudHoldReceipts = false;
     panel.querySelector('[data-cloud-run="run-a"] [data-cloud-action="navigate"]').click(); await sleep(25);
@@ -167,8 +244,10 @@
     document.getElementById('viewer-back').click(); await sleep(30); dashboard();
     panel.querySelector('[data-cloud-run="run-a"] [data-cloud-action="navigate"]').click(); await sleep(25);
     const disconnected = cloudSocket;
+    const disconnectedRequest = latest().request;
     const originalWatchCount = cloudSent.filter(frame => frame.type === 'watch' && frame.session === 'session-original').length;
     disconnected.close(); await waitFor(() => cloudSocket !== disconnected && cloudSocket.readyState === 1, 'new socket'); await sleep(40);
+    cloudSocket.message({ type:'cloud_navigation_result', request:disconnectedRequest, status:'opened' });
     check(cloudSent.filter(frame => frame.type === 'watch' && frame.session === 'session-original').length === originalWatchCount, 'disconnected navigation never follows into a new socket');
     check(!cloudSent.some(frame => ['input','direct_input','key','direct_key'].includes(frame.type)), 'cloud operator controls never send terminal input');
     check(cloudErrors.length === 0, 'production shell has no browser errors: ' + cloudErrors.join('; '));

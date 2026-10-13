@@ -2015,6 +2015,7 @@ const PRIMARY_PANE_MATERIALIZATION_TIMEOUT: std::time::Duration =
 
 struct PendingCloudNavigation {
     intent: crate::cloud_agent::navigation::RunNavigation,
+    reply: Option<web_remote::cloud::CloudNavigationReply>,
     pane: runtime::MuxPaneId,
     runtime_instance: u64,
     started: std::time::Instant,
@@ -27300,8 +27301,7 @@ impl App {
             } else if activation_pending {
                 self.cancel_cloud_navigation_focus(&pending);
             }
-            self.cloud_agent
-                .finish_run_navigation(&pending.intent, result);
+            self.finish_cloud_navigation(&pending.intent, result, pending.reply);
             self.egui_ctx.request_repaint();
         } else {
             self.pending_cloud_navigation = Some(pending);
@@ -27327,45 +27327,64 @@ impl App {
             self.cancel_terminal_focus_intents();
         }
     }
+    fn finish_cloud_navigation(
+        &mut self,
+        navigation: &crate::cloud_agent::navigation::RunNavigation,
+        result: Result<(), String>,
+        reply: Option<web_remote::cloud::CloudNavigationReply>,
+    ) {
+        if let Some(reply) = reply {
+            reply.finish(crate::cloud_agent::navigation::navigation_outcome(&result));
+        }
+        self.cloud_agent.finish_run_navigation(navigation, result);
+    }
+
     fn start_cloud_navigation(
         &mut self,
         navigation: crate::cloud_agent::navigation::RunNavigation,
+        reply: Option<web_remote::cloud::CloudNavigationReply>,
     ) {
         if let Some(previous) = self.pending_cloud_navigation.take() {
             self.cancel_cloud_navigation_focus(&previous);
-            self.cloud_agent
-                .finish_run_navigation(&previous.intent, Err("navigation_superseded".into()));
+            self.finish_cloud_navigation(
+                &previous.intent,
+                Err("navigation_superseded".into()),
+                previous.reply,
+            );
         }
         match self.navigate_cloud_original_session(&navigation.workspace, &navigation.session) {
             Ok((pane, runtime_instance)) => {
                 self.pending_cloud_navigation = Some(PendingCloudNavigation {
                     intent: navigation,
+                    reply,
                     pane,
                     runtime_instance,
                     started: std::time::Instant::now(),
                 })
             }
-            Err(error) => self
-                .cloud_agent
-                .finish_run_navigation(&navigation, Err(error)),
+            Err(error) => self.finish_cloud_navigation(&navigation, Err(error), reply),
         }
     }
     fn drain_cloud_operator_requests(&mut self) {
         if let Some(navigation) = self.cloud_agent.take_run_navigation() {
-            self.start_cloud_navigation(navigation);
+            self.start_cloud_navigation(navigation, None);
         }
         self.poll_cloud_navigation();
 
         use web_remote::cloud::CloudControlIntent;
         for _ in 0..16 {
-            let Some(request) = self.cloud_agent.next_operator_intent() else {
+            let Some(mut request) = self.cloud_agent.next_operator_intent() else {
                 break;
             };
+            let reply = request.take_navigation_reply();
             let Some(intent) = self
                 .session_core
                 .as_ref()
                 .and_then(|core| core.authorize_cloud_control(request))
             else {
+                if let Some(reply) = reply {
+                    reply.finish(web_remote::cloud::CloudNavigationOutcome::Rejected);
+                }
                 continue;
             };
             match intent {
@@ -27418,13 +27437,20 @@ impl App {
                 } => {
                     // Apply under the just-validated operator authority in this frame, while
                     // retaining the same observed-focus completion as native navigation.
-                    if self
+                    match self
                         .cloud_agent
                         .request_run_navigation(&workspace_id, &session_id)
-                        .is_ok()
-                        && let Some(navigation) = self.cloud_agent.take_run_navigation()
                     {
-                        self.start_cloud_navigation(navigation);
+                        Ok(_) => {
+                            if let Some(navigation) = self.cloud_agent.take_run_navigation() {
+                                self.start_cloud_navigation(navigation, reply);
+                            }
+                        }
+                        Err(_) => {
+                            if let Some(reply) = reply {
+                                reply.finish(web_remote::cloud::CloudNavigationOutcome::Rejected);
+                            }
+                        }
                     }
                 }
             }

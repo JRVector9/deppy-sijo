@@ -1,0 +1,244 @@
+   Compiling web-remote v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/web-remote)
+   Compiling agent-mcp v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/agent-mcp)
+   Compiling deppy-sijo v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 30.41s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-d0c94c47049f5fdd)
+
+running 3 tests
+test cloud_agent::integration_tests::late_secret_notify_answer_projection_preserves_identity_and_rescrubs_display_and_run_label ... FAILED
+test cloud_agent::ui::management_tests::late_secret_notify_run_label_snapshot_masks_display_preserves_reference ... FAILED
+test cloud_agent::ui::management_tests::late_secret_notify_run_label_session_header_masks_display_preserves_reference ... FAILED
+
+failures:
+
+---- cloud_agent::integration_tests::late_secret_notify_answer_projection_preserves_identity_and_rescrubs_display_and_run_label stdout ----
+
+thread 'cloud_agent::integration_tests::late_secret_notify_answer_projection_preserves_identity_and_rescrubs_display_and_run_label' (23636099) panicked at crates/app/src/cloud_agent.rs:2138:9:
+assertion `left == right` failed
+  left: Some("fixture-secret-access-token-123456789")
+ right: Some("[REDACTED]")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- cloud_agent::ui::management_tests::late_secret_notify_run_label_snapshot_masks_display_preserves_reference stdout ----
+
+thread 'cloud_agent::ui::management_tests::late_secret_notify_run_label_snapshot_masks_display_preserves_reference' (23636101) panicked at crates/app/src/cloud_agent/ui/management_tests.rs:625:5:
+assertion `left == right` failed
+  left: Some("fixture-notify-access-token-123456789")
+ right: Some("[REDACTED]")
+
+---- cloud_agent::ui::management_tests::late_secret_notify_run_label_session_header_masks_display_preserves_reference stdout ----
+
+thread 'cloud_agent::ui::management_tests::late_secret_notify_run_label_session_header_masks_display_preserves_reference' (23636100) panicked at crates/app/src/cloud_agent/ui/management_tests.rs:665:13:
+No nodes found matching the query:
+By {
+    label: "Cloud answer · Review Bot · [REDACTED] · just now",
+}
+
+On node:
+Node {
+    id: NodeId(
+        TreeIndex(
+            0,
+        ),
+        #13826925289788388,
+    ),
+    role: Window,
+    focused: true,
+    hidden: false,
+    disabled: false,
+    children: [
+        Node {
+            id: NodeId(
+                TreeIndex(
+                    0,
+                ),
+                #18356943641707106210,
+            ),
+            role: GenericContainer,
+            focused: false,
+            hidden: false,
+            disabled: false,
+            children: [
+                Node {
+                    id: NodeId(
+                        TreeIndex(
+                            0,
+                        ),
+                        #17717534622495252412,
+                    ),
+                    role: GenericContainer,
+                    focused: false,
+                    hidden: false,
+                    disabled: false,
+                    children: [
+                        Node {
+                            id: NodeId(
+                                TreeIndex(
+                                    0,
+                                ),
+                                #15707054694645992835,
+                            ),
+                            role: GenericContainer,
+                            focused: false,
+                            hidden: false,
+                            disabled: false,
+                            children: [
+                                Node {
+                                    id: NodeId(
+                                        TreeIndex(
+                                            0,
+                                        ),
+                                        #17970341196664973444,
+                                    ),
+                                    role: GenericContainer,
+                                    focused: false,
+                                    hidden: false,
+                                    disabled: false,
+                                    children: [
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #8714522455845931962,
+                                            ),
+                                            role: GenericContainer,
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [
+                                                Node {
+                                                    id: NodeId(
+                                                        TreeIndex(
+                                                            0,
+                                                        ),
+                                                        #10978825285480028651,
+                                                    ),
+                                                    role: GenericContainer,
+                                                    focused: false,
+                                                    hidden: false,
+                                                    disabled: false,
+                                                    children: [
+                                                        Node {
+                                                            id: NodeId(
+                                                                TreeIndex(
+                                                                    0,
+                                                                ),
+                                                                #9954797178961051019,
+                                                            ),
+                                                            role: Button,
+                                                            label: "Cloud answer · Review Bot · fixture-notify-access-token-123456789 · just now",
+                                                            focused: false,
+                                                            hidden: false,
+                                                            disabled: false,
+                                                            children: [],
+                                                        },
+                                                        Node {
+                                                            id: NodeId(
+                                                                TreeIndex(
+                                                                    0,
+                                                                ),
+                                                                #13469840653692588432,
+                                                            ),
+                                                            role: GenericContainer,
+                                                            focused: false,
+                                                            hidden: false,
+                                                            disabled: false,
+                                                            children: [
+                                                                Node {
+                                                                    id: NodeId(
+                                                                        TreeIndex(
+                                                                            0,
+                                                                        ),
+                                                                        #12970915844135942897,
+                                                                    ),
+                                                                    role: GenericContainer,
+                                                                    focused: false,
+                                                                    hidden: false,
+                                                                    disabled: false,
+                                                                    children: [
+                                                                        Node {
+                                                                            id: NodeId(
+                                                                                TreeIndex(
+                                                                                    0,
+                                                                                ),
+                                                                                #17869300431841806907,
+                                                                            ),
+                                                                            role: Label,
+                                                                            value: "First: [REDACTED]. Second: fixture-notify-\nreplaced-token-987654321.",
+                                                                            focused: false,
+                                                                            hidden: false,
+                                                                            disabled: false,
+                                                                            children: [
+                                                                                Node {
+                                                                                    id: NodeId(
+                                                                                        TreeIndex(
+                                                                                            0,
+                                                                                        ),
+                                                                                        #16488064755954165729,
+                                                                                    ),
+                                                                                    role: TextRun,
+                                                                                    value: "First: [REDACTED]. Second: fixture-notify-\n",
+                                                                                    focused: false,
+                                                                                    hidden: false,
+                                                                                    disabled: false,
+                                                                                    children: [],
+                                                                                },
+                                                                                Node {
+                                                                                    id: NodeId(
+                                                                                        TreeIndex(
+                                                                                            0,
+                                                                                        ),
+                                                                                        #10998973527765755105,
+                                                                                    ),
+                                                                                    role: TextRun,
+                                                                                    value: "replaced-token-987654321.",
+                                                                                    focused: false,
+                                                                                    hidden: false,
+                                                                                    disabled: false,
+                                                                                    children: [],
+                                                                                },
+                                                                            ],
+                                                                        },
+                                                                        Node {
+                                                                            id: NodeId(
+                                                                                TreeIndex(
+                                                                                    0,
+                                                                                ),
+                                                                                #6240282903262235465,
+                                                                            ),
+                                                                            role: Button,
+                                                                            label: "Copy answer",
+                                                                            focused: false,
+                                                                            hidden: false,
+                                                                            disabled: false,
+                                                                            children: [],
+                                                                        },
+                                                                    ],
+                                                                },
+                                                            ],
+                                                        },
+                                                    ],
+                                                },
+                                            ],
+                                        },
+                                    ],
+                                },
+                            ],
+                        },
+                    ],
+                },
+            ],
+        },
+    ],
+}
+
+
+failures:
+    cloud_agent::integration_tests::late_secret_notify_answer_projection_preserves_identity_and_rescrubs_display_and_run_label
+    cloud_agent::ui::management_tests::late_secret_notify_run_label_session_header_masks_display_preserves_reference
+    cloud_agent::ui::management_tests::late_secret_notify_run_label_snapshot_masks_display_preserves_reference
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 3178 filtered out; finished in 0.04s
+
+error: test failed, to rerun pass `-p deppy-sijo --bin deppy-sijo`

@@ -1,0 +1,34 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.18s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-d0c94c47049f5fdd)
+
+running 28 tests
+test ui::notifications::tests::native_intent의_각_field와_total_byte_budget은_fail_closed다 ... ok
+test ui::notifications::tests::production_leaf에는_platform_notification_effect가_없다 ... ok
+test ui::notifications::tests::agent_vanished도_oversized_title은_거부한다 ... ok
+test ui::notifications::tests::invalid_or_oversized_payload는_history와_intent를_만들지_않는다 ... ok
+test ui::notifications::tests::status_알림은_message_id를_저장한다 ... ok
+test ui::notifications::tests::exit_알림과_status_중복_방지 ... ok
+test ui::notifications::tests::native_intent_queue는_최근_고정용량만_유지한다 ... ok
+test ui::notifications::tests::agent_vanished은_native_intent만_내고_history에는_안_올린다 ... ok
+test ui::notifications::tests::pty_provider_badge는_status와_exit_경로에서_보존된다 ... ok
+test ui::notifications::tests::structured_active와_idle은_알림이_아니다 ... ok
+test ui::notifications::cloud_answer_tests::late_secret_notify_notifications_pending_native_intents_rescrub_each_delivery ... ok
+test ui::notifications::tests::history는_100개로_유계다 ... ok
+test ui::notifications::cloud_answer_tests::late_secret_notify_notifications_known_corpus_masks_before_clipping ... ok
+test ui::notifications::tests::running_복귀는_알림_아님 ... ok
+test ui::notifications::tests::native_io_오류_알림은_중복을_합치고_보관량을_제한한다 ... ok
+test ui::notifications::tests::structured_duplicate_status는_한번만_알린다 ... ok
+test ui::notifications::cloud_answer_tests::cloud_answer_keeps_stable_identity_without_suppressing_pty_completion ... ok
+test ui::notifications::tests::relative_time_label은_구간별_로케일_문구를_낸다 ... ok
+test ui::notifications::tests::retain은_결과상태_유지하고_진행형만_정리 ... ok
+test ui::notifications::tests::상태_알림은_native_intent로만_발행된다 ... ok
+test ui::notifications::tests::상태_중복은_history와_native_intent_모두_억제한다 ... ok
+test ui::notifications::tests::structured_status_알림은_target과_source를_보존한다 ... ok
+test ui::notifications::tests::상태전이_알림의_중복_억제는_유지된다 ... ok
+test ui::notifications::tests::같은_세션의_연속_mcp승인은_매번_알린다 ... ok
+test ui::notifications::tests::다른_workspace의_같은_세션id는_별개_알림 ... ok
+test ui::notifications::tests::unread는_읽은_옛항목과_무관하게_pruning에_정합 ... ok
+test ui::notifications::tests::센터가_열려있어도_생성시엔_안읽음 ... ok
+test ui::notifications::cloud_answer_tests::late_secret_notify_notifications_cached_fragments_mask_both_ui_surfaces_and_keep_target ... ok
+
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 3157 filtered out; finished in 0.02s

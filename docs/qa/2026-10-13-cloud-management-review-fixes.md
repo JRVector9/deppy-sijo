@@ -1,5 +1,7 @@
 # 클라우드 관리 리뷰 7건 수정·검증
 
+**후속 독립 리뷰와 수정:** 기존 검증에 포함되지 않은 늦은 키 등록·clock 샘플 실패·PWA 이동 실패 안내의 잔여3건을 [2차 리뷰](../reviews/2026-10-13-cloud-management-fixes-rereview.md)에서 확인했다. 이후 모두 수정·교차 리뷰·회귀 검증했고, 최신 결과는 [잔여3건 수정 QA](2026-10-13-cloud-residual-fixes.md)에 기록했다. 아래 PASS는 최초7건 수정 때 실행한 범위의 역사적 결과다.
+
 2026-10-13. [원본 리뷰](../reviews/2026-10-13-cloud-agent-management-parallel-review.md)의 R1–R7을 모두 수정했다. 기준은 `fcf237f7`, canonical worktree는 `/Users/jr/Desktop/projects/deppy-sijo-performance`이다. 세 작업자를 **gpt-6.1-sol / xhigh / fork none**로 실행하고 파일 소유권을 분리했다. Root가 공통 App 계약을 통합하고 실제 검사 및 최종 리뷰를 수행했다.
 
 ## 수정 결과

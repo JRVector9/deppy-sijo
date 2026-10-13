@@ -1,0 +1,26 @@
+   Compiling web-remote v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/web-remote)
+   Compiling agent-mcp v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/agent-mcp)
+   Compiling deppy-sijo v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 15.51s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-d0c94c47049f5fdd)
+
+running 1 test
+test cloud_agent::integration_tests::late_secret_notify_answer_projection_preserves_identity_and_rescrubs_display_and_run_label ... FAILED
+
+failures:
+
+---- cloud_agent::integration_tests::late_secret_notify_answer_projection_preserves_identity_and_rescrubs_display_and_run_label stdout ----
+
+thread 'cloud_agent::integration_tests::late_secret_notify_answer_projection_preserves_identity_and_rescrubs_display_and_run_label' (24031070) panicked at crates/app/src/cloud_agent.rs:2144:9:
+assertion `left == right` failed
+  left: "fixture-secret-access-token-123456789"
+ right: "[REDACTED]"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    cloud_agent::integration_tests::late_secret_notify_answer_projection_preserves_identity_and_rescrubs_display_and_run_label
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3184 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p deppy-sijo --bin deppy-sijo`

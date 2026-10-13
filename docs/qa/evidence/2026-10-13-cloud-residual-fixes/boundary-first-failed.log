@@ -1,0 +1,5 @@
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running `target/debug/xtask check-boundary`
+VIOLATION: crates/app/src/ui/notifications.rs: production syntax boundary violation: 'mcp::' (leaf UI must not access the MCP transport crate)
+VIOLATION: crates/app/src/ui/notifications.rs: production syntax boundary violation: 'secret::' (leaf UI must not access the secret crate)
+Error: check-boundary 실패: 2건

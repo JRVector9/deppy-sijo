@@ -191,6 +191,18 @@ fn redesign_native_geometry_and_reference_images() {
                     "row height mismatch: {row:?}"
                 );
             }
+            if tab == Tab::Permissions {
+                for key in ["cloud.connection_read", "cloud.connection_input"] {
+                    let label = i18n::Catalog::load("ko-KR").unwrap().t(key, &[]);
+                    let hit = harness
+                        .get_by_role_and_label(egui::accesskit::Role::CheckBox, &label)
+                        .rect();
+                    assert!(
+                        (hit.width() - 34.0).abs() < 0.1 && (hit.height() - 34.0).abs() < 0.1,
+                        "permission hit area does not match the 34px label: {hit:?}"
+                    );
+                }
+            }
             if tab == Tab::Work {
                 let bar = harness
                     .get_by_role_and_label(
@@ -409,6 +421,8 @@ fn redesign_initial_verifying_failed_and_expired_states_render_the_actual_regist
             "verifying" => bridge.connection = crate::cloud_agent::Connection::Verifying,
             "failure" => bridge.error = Some("tunnel_fixture_failure".into()),
             "expired" => {
+                bridge.automatic = false;
+                bridge.connection = crate::cloud_agent::Connection::Ready;
                 bridge.server.as_mut().unwrap().auth =
                     std::sync::Arc::new(agent_mcp::Auth::new_at(
                         agent_mcp::now().saturating_sub(agent_mcp::TOKEN_TTL + 1),
@@ -501,6 +515,8 @@ fn redesign_actual_oauth_request_requires_inspection_and_never_grants_session_ac
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     assert_eq!(server.auth.approvals().len(), 1);
     bridge.server = Some(server);
+    bridge.automatic = false;
+    bridge.connection = crate::cloud_agent::Connection::Ready;
     bridge.set_targets(vec![crate::cloud_agent::Target::fixture(
         "approval-session",
         "approval-generation",

@@ -89,9 +89,9 @@ impl CloudAgent {
                 let columns = [
                     width * 0.38,
                     width * 0.16,
-                    60.0,
-                    60.0,
-                    width * (1.0 - 0.38 - 0.16) - 120.0,
+                    80.0,
+                    80.0,
+                    width * (1.0 - 0.38 - 0.16) - 160.0,
                 ];
                 let header = ui
                     .allocate_exact_size(egui::vec2(width, 34.0), egui::Sense::hover())
@@ -111,11 +111,20 @@ impl CloudAgent {
                         ui,
                         egui::Rect::from_min_size(
                             egui::pos2(x, header.top() + 8.0),
-                            egui::vec2(columns[index] - 8.0, 24.0),
+                            egui::vec2(
+                                columns[index] - if matches!(index, 2 | 3) { 0.0 } else { 8.0 },
+                                24.0,
+                            ),
                         ),
                         ("cloud-table-header", index),
                     );
-                    layout::hint(&mut cell, catalog.t(key, &[]));
+                    if matches!(index, 2 | 3) {
+                        cell.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                            layout::hint(ui, catalog.t(key, &[]));
+                        });
+                    } else {
+                        layout::hint(&mut cell, catalog.t(key, &[]));
+                    }
                     x += columns[index];
                 }
                 layout::line(ui);
@@ -130,8 +139,31 @@ impl CloudAgent {
                             cells.push(layout::child(
                                 ui,
                                 egui::Rect::from_min_size(
-                                    egui::pos2(x, rect.top() + 6.0),
-                                    egui::vec2(*w - 8.0, 56.0),
+                                    egui::pos2(
+                                        x + if matches!(index, 2 | 3) {
+                                            (*w - layout::CONTROL_HEIGHT) / 2.0
+                                        } else {
+                                            0.0
+                                        },
+                                        rect.top()
+                                            + if matches!(index, 2 | 3) {
+                                                (68.0 - layout::CONTROL_HEIGHT) / 2.0
+                                            } else {
+                                                6.0
+                                            },
+                                    ),
+                                    egui::vec2(
+                                        if matches!(index, 2 | 3) {
+                                            layout::CONTROL_HEIGHT
+                                        } else {
+                                            *w - 8.0
+                                        },
+                                        if matches!(index, 2 | 3) {
+                                            layout::CONTROL_HEIGHT
+                                        } else {
+                                            56.0
+                                        },
+                                    ),
                                 ),
                                 ("cloud-permission-cell", index),
                             ));
@@ -162,10 +194,14 @@ impl CloudAgent {
                         let permission = self.connection_permission(&info.principal.id, &target);
                         let mut read = active && permission.read;
                         let mut input = active && permission.input;
-                        let read_response = cells[2].add_enabled(
-                            active && target.live,
-                            egui::Checkbox::without_text(&mut read),
-                        );
+                        let read_response = cells[2]
+                            .add_enabled_ui(active && target.live, |ui| {
+                                ui.add_sized(
+                                    egui::vec2(layout::CONTROL_HEIGHT, layout::CONTROL_HEIGHT),
+                                    egui::Checkbox::without_text(&mut read),
+                                )
+                            })
+                            .inner;
                         read_response.widget_info(|| {
                             egui::WidgetInfo::selected(
                                 egui::WidgetType::Checkbox,
@@ -190,7 +226,13 @@ impl CloudAgent {
                         let input_enabled =
                             active && target.live && read && info.principal.input_scope;
                         let input_response = cells[3]
-                            .add_enabled(input_enabled, egui::Checkbox::without_text(&mut input));
+                            .add_enabled_ui(input_enabled, |ui| {
+                                ui.add_sized(
+                                    egui::vec2(layout::CONTROL_HEIGHT, layout::CONTROL_HEIGHT),
+                                    egui::Checkbox::without_text(&mut input),
+                                )
+                            })
+                            .inner;
                         input_response.widget_info(|| {
                             egui::WidgetInfo::selected(
                                 egui::WidgetType::Checkbox,

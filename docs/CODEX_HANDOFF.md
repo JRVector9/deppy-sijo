@@ -1,3 +1,18 @@
+# 에이전트 연결 설정 시안 적용 — 완료, 2026-10-13 (Codex)
+
+- 현재 목표/상태: 사용자 승인 HTML 시안대로 에이전트 연결 설정 native UI 구현·코드 리뷰·실제 렌더 대조 완료. canonical `/Users/jr/Desktop/projects/deppy-sijo-performance`, 기존 branch 유지, baseline70380aea. 소스51b23890 및2fd73a5b(권한80px열/34px hitarea·중앙 정렬). 원래 dirty checkout 및 untracked active-work HTML 보존. push/restart/release 요청 없음.
+- 완료: 연결/접근권한/작업답변/고급설정 4tab,80/43/35px 고정shell·본문scroll, list/detail 및 narrowstack. 34px control/68px 최소rows/26pxpad/8pxgap/15-14-13type·HTML dark/light palette. auth/public/tool 관측·actor별read/input/lease·cancel/navigation·profile·legacy 기능 유지. 18actualnativePNG(1090/710,dark/light,empty/verifying/failure/expired/expiredpermissions/real loopbackOAuthapproval), QA HTML/Markdown·evidence·plan 완료. 브라우저/native 글꼴 pixel100% 동일성을 주장하지않음.
+- 수정 파일: cloud_agent ui.rs, ui/{settings,runs,management_tests}; ui/settings.rs metrics exposure/hostscroll; 신규 ui/{layout,connections,permissions,advanced,history,redesign_tests};5locale. 승인HTML·plan·QA/gallery/evidence/images·handoff. app/runtime/authcontroller/backend source변경 없음.
+- 실제 최종검사: fullCloudAgent161PASS/3existingignored (`/private/tmp/deppy-cloud-settings-final-geometry-verified.log`), commonsettings37PASS, i18n8PASS/doc0 =206PASS. 이후 testfixture 서비스coordinates 보정 후 affectedUI44PASS. 마지막 권한헤더정렬 UI44 최종PASS(`/private/tmp/deppy-cloud-settings-ui-final-aligned.log`). strictApp+i18nalltargets-Dwarnings 실제exit0;fmtcheck/boundary/diff0. docgalleryJS node--check0. HTMLproto기존JS syntax0.
+- 독립review: gpt-6.1-sol/xhigh CLIreview--uncommitted session55150 실제exit0, 최종“no remaining actionable defects”; reviewerUI44/i18n8/fmt/diff실행. full로그 `/private/tmp/deppy-cloud-settings-redesign-review.log`, 결론evidence보존. 이후 권한치수·헤더정렬만Root추가코드대조/전체Cloud및UI44·hitarea34x34·strict재검증.
+- 실제RED→수정: 탭/초기연결0/2→GREEN2; TextEdit34·arrowfocus3/2→GREEN5; review3문제RED5/3(긴detail버튼clip,알림다음frame소실,latentactorconsent)→UI40GREEN; answerconnection-name검색0/1→finalGREEN; narrowdescriptionclip0/1→finalGREEN. 새manual sorted-lastlegacy선택0/1→전후ID差로수정. 기존 late-secret/footer/hover/nav/cancel 회귀보존.
+- 실패접근: TextEdit.min_size.y egui0.36.1에서무시→add_sized; custom/nativearrow중복→consume+move_focusNone; RTLbarelayout높이소모→horizontalwrapper; 상세420pxchildclip→부모viewportYclip; 초기testhelper삭제→HEAD복원. WidgetInfo API/NodeTimport/temporaryborrow compile실패는behaviorRED로세지않고수정후gate재실행. 첫strictcollapsible-if1건→동등let-chain수정후GREEN. 문서staged diffcheck는 증거로그EOF빈줄로exit2→EOF빈줄만정리하고전체문서diff재검사후커밋교정(검사결과내용불변).
+- 제한/릴리스: source/test0.12.1, 사용자용 appartifact를 build/package/deploy/launch하지않았으므로versionbump없음. 실제외부provider로그인/publictunnel/userDB/userclipboard/실앱interaction은미실행. Native검증은productionegui·loopbackauth·SQLite/history/realqueuedPTYharness. 다음사용자release는lastshipped보다높은버전+bundle검증필수, 현재restart미승인.
+- 남은: 승인된 구현/검토 잔여 없음. 소스·QA/evidence/gallery/handoff 확정, 사용자 최종보고. 원래 HTMLserver8794session15836 유지. gallery `docs/qa/cloud-settings-redesign-2026-10-13.html`, 검증MD `docs/qa/2026-10-13-cloud-settings-redesign.md`. 새 사용자용 release/restart는 별도 현재 요청 필요.
+- 다음agent정확명령: `cat AGENTS.md`; `head -n 14 docs/CODEX_HANDOFF.md`; `git status --short`; `git diff`; `tail -n 7 /private/tmp/deppy-cloud-settings-ui-final-aligned.log`; `git log -4 --oneline`; `git diff --exit-code -- crates web`; `cat docs/qa/2026-10-13-cloud-settings-redesign.md`. 필요할 때 evidence README의 검증명령을 사용. 명시적현재restart요청없이는dev-run.sh/app종료·launch금지.
+
+---
+
 # 2차 리뷰 잔여 3건 수정 — 완료, 2026-10-13 (Codex)
 
 - 현재 목표/상태: 사용자 “코드 수정해”에 따른 N1/N2/N3 수정·영속 회귀·독립 교차 리뷰·소스 커밋 완료. 기준 bf13eb48, canonical `/Users/jr/Desktop/projects/deppy-sijo-performance`, branch `feat/audit-nine-pr-v0.6.0-20261004`. 원래 dirty deppy-sijo 및 기존 untracked `docs/mockups/active-work-visibility-2026-10-12.html` 보존. 재실행/push/release 없음.

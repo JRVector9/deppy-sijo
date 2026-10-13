@@ -1,0 +1,47 @@
+   Compiling deppy-sijo v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 13.46s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-d0c94c47049f5fdd)
+
+running 40 tests
+test cloud_agent::ui::management_tests::late_secret_notify_run_label_snapshot_masks_display_preserves_reference ... ok
+test cloud_agent::ui::management_tests::late_secret_notify_run_label_snapshot_expands_mask_without_changing_reference ... ok
+test cloud_agent::ui::management_tests::late_secret_notify_cloud_snapshot_rescrubs_loaded_history_and_replacement ... ok
+test cloud_agent::ui::management_tests::late_secret_notify_run_label_session_header_masks_display_preserves_reference ... ok
+test cloud_agent::ui::management_tests::late_secret_notify_session_safe_view_masks_display_and_actual_copy ... ok
+test cloud_agent::ui::management_tests::management_ui_closed_original_navigation_reports_failure_and_keeps_results ... ok
+test cloud_agent::ui::management_tests::management_ui_issued_credential_waits_for_actual_authentication ... ok
+test cloud_agent::ui::management_tests::late_secret_notify_settings_masks_display_and_actual_copy_after_replacement ... ok
+test cloud_agent::ui::management_tests::management_ui_navigation_queues_the_original_workspace_and_session ... ok
+test cloud_agent::ui::management_tests::management_ui_original_navigation_reports_observed_success ... ok
+test cloud_agent::ui::management_tests::management_ui_new_operator_navigation_does_not_leave_the_old_request_opening ... ok
+test cloud_agent::ui::management_tests::management_ui_expired_connection_explains_reauthentication_without_restoring_input ... ok
+test cloud_agent::ui::management_tests::late_secret_run_reference_footer_masks_display_preserves_identity ... ok
+test cloud_agent::ui::management_tests::management_ui_cancel_request_stays_running_until_the_agent_acknowledges ... ok
+test cloud_agent::ui::management_tests::management_ui_cloud_report_is_separate_from_local_status_and_keeps_result_origin ... ok
+test cloud_agent::ui::management_tests::management_ui_late_secret_registration_masks_display_copy_and_links ... ok
+test cloud_agent::ui::management_tests::late_secret_run_reference_hover_masks_display_preserves_identity ... ok
+test cloud_agent::ui::management_tests::management_ui_local_takeover_revokes_the_displayed_lease ... ok
+test cloud_agent::ui::redesign_tests::redesign_long_detail_actions_remain_visible_after_body_scroll ... ok
+test cloud_agent::ui::management_tests::management_ui_independent_manual_token_is_copied_once_without_default_session_consent ... ok
+test cloud_agent::ui::management_tests::management_ui_connection_rename_updates_the_real_registry ... ok
+test cloud_agent::ui::redesign_tests::redesign_initial_screen_explains_connecting_without_showing_credential_forms ... ok
+test cloud_agent::ui::redesign_tests::redesign_search_input_keeps_the_same_height_as_buttons ... ok
+test cloud_agent::ui::redesign_tests::redesign_actor_reclaim_removes_latent_consent_after_session_takeover ... ok
+test cloud_agent::ui::management_tests::management_ui_reconnect_opt_out_cancels_pending_and_future_recovery ... ok
+test cloud_agent::ui::management_tests::management_ui_run_search_hides_other_runs_without_changing_the_cache ... ok
+test cloud_agent::ui::management_tests::management_ui_profile_save_load_delete_preserve_supported_endpoint_coordinates ... ok
+test cloud_agent::ui::redesign_tests::redesign_notification_clears_old_search_and_keeps_answer_visible ... ok
+test cloud_agent::ui::redesign_tests::redesign_tabs_show_only_the_selected_task_and_keep_actions_reachable ... ok
+test cloud_agent::ui::redesign_tests::redesign_arrow_navigation_moves_focus_with_the_selected_tab ... ok
+test cloud_agent::ui::tests::setup_state_copy_instruction_delivers_multiline_bounds_and_receipt_contract ... ok
+test cloud_agent::ui::management_tests::management_ui_scoped_answer_navigation_and_widgets_isolate_duplicate_external_ids ... ok
+test cloud_agent::ui::management_tests::management_ui_permissions_and_revoke_affect_only_the_selected_connection ... ok
+test cloud_agent::ui::tests::setup_state_manual_endpoint_does_not_claim_public_verification ... ok
+test cloud_agent::ui::tests::setup_state_local_listener_does_not_claim_public_or_client_connection ... ok
+test cloud_agent::ui::tests::answer_navigation_is_one_shot_and_keeps_the_user_selection ... ok
+test cloud_agent::ui::tests::setup_state_public_readiness_keeps_client_registration_separate ... ok
+test cloud_agent::ui::tests::setup_state_manual_local_only_preserves_local_url_and_token_controls ... ok
+test cloud_agent::ui::management_tests::management_ui_controls_fit_a_narrow_native_settings_pane ... ok
+test cloud_agent::ui::redesign_tests::redesign_native_geometry_and_reference_images ... ok
+
+test result: ok. 40 passed; 0 failed; 0 ignored; 0 measured; 3147 filtered out; finished in 9.99s

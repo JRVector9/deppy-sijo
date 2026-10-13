@@ -13,6 +13,14 @@
 
 - PR1 완료: UI 실제 RED 0/4 → GREEN11 PASS(추가 manual-local URL 숨김 회귀 RED0/1→GREEN 포함), i18n8 PASS. HTML Chrome 1440/900/390 overflow/JS 오류 없음. Root 실제 source diff 대조 + `codex exec -m gpt-6.1-sol -c model_reasoning_effort=xhigh --sandbox read-only` 독립 PR1 리뷰 완료, concrete defects 없음(`/private/tmp/deppy-cloud-pr1-review-20261013.txt`). 첫 기능 커밋은 PR1 소유 파일만, Record additive fixture4필드는 index에서 제외. 연결관리/run/profile UI 후속은 동일 소유자에게 재배정. PWA 실제 Rust RED40 missing API → GREEN5 PASS, 모바일22→24 checks와 Relay Node16 PASS. History targeted receipt 실제RED1 FAIL(다른 pane 권한으로 원본receipt조회) 후 production수정대기. App management RED 첫 compile는 새 Effect::History test match2누락으로blocked, root수정후재실행중; 행동RED로 주장하지 않음.
 
+
+- 통합 단계 갱신: root는 connection ACL/단일 writer lease/actual runtime InputPermit 회수, scope별 operation key·receipt, async CloudRun·취소/heartbeat, bounded terminal history cursor, nonsecret profile/reconnect/wake revalidation, PWA snapshot/operator intent를 연결했다. 새 수동 credential 발급은 actor별 auth/일회성 clipboard용 반환·redaction lease만 보관하며 기본 Target 권한은 denied. App/output/control/continuity/access/pwa/config/bridge_tests는 root 소유, async management helper는 domain에게 추가 위임했다. 실제 App GREEN은 아직 완료 아님.
+- 실제 검증 추가: PWA normal suite391 PASS/13ignored, 실제 Chrome 선택6 PASS, 모바일 production fixture26 checks/RelayNode16 PASS, web-remote strictclippy0, isolatedrelay-shell build/digest PASS. domain 독립 CLI 리뷰 2건(최대 크기 run 복원 metadata 증가·큰 escaped 답변 page workerbudget)을 회귀RED4FAIL→GREEN4PASS로 수정; history14PASS/1ignored. UI 연결관리 actualRED10PASS7FAIL 후 구현, run UI3새회귀는 아직 행동RED 미실행. Root bridge4회귀는 작성 후 컴파일 수리 중이며 테스트 통과로 주장하지 않음.
+- 실패/검토: App helper initial 행동RED3FAIL(즉시ACK/cache·revoke-before-save·pendingbound) 이후 구현; 후속 compile은 UI age u64/i64, E0716 temporary와 root fixture auth hash 형식 오류로 blocked→소유자 수정. PWA 독립 CLI 리뷰1 medium: pending original-session navigation이 후속 사용자 선택을 덮음; 아직 수정 전. 독립리뷰 출력 /private/tmp/deppy-cloud-{foundation,pwa,pr1}-review-20261013.txt. Auth 후속 fixed-code/schema tests는 의도된RED 상태, production mapping 수정 전.
+- 다음: Cargo exclusive slot domain App helper/worker gate→auth RED/GREEN/full agent-mcp→UI run/issuer RED/GREEN→root full cloud_agent/worker/config/answer gates. 모든 root/App source는 domain compile 동안 freeze. PWA navigation 회귀/수정·App 소스 독립 CLI review·strictlint/fmt/boundary·남은 PR단위 커밋/Obsidian journal/plan checklist. PR1 commit35e8a264, docs19fa8df3. No push/release/restart. 미추적 기존 active-work HTML 보존.
+
+- PR6 웹 계층 리뷰 완료: 독립소스 리뷰 medium1(PWA 대기 원본세션 이동)이 실제 Chrome production fixture RED1FAIL→GREEN31checks로 수정. 최신 명시 선택·새 이동 요청·늦은 ACK·다른 workspace·socketdisconnect 모두 이전 이동을 취소/격리. JS syntax/RelayNode16PASS 재확인. Rust391PASS/13ignored·Chrome6PASS·strictwebclippy0는 소유자 최종소스에서 실행했으며 후속 JS 수정 뒤 fixture31을 재실행. 웹 모델/frontend는 별도 의미 단위로 먼저커밋, native PR6 snapshot/intent통합은 App 최종gate 후커밋.
+
 ---
 
 # 0.12.1 재실행 — 2026-10-13 (Claude Code)

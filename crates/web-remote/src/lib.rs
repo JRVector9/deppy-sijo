@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 
+pub mod cloud;
 pub mod dashboard;
 mod history;
 pub mod http;
@@ -251,6 +252,17 @@ impl WebRemoteServer {
     /// 한 번 주입한다(app 레벨이라 워커별 교체 불필요). 미설정이면 폰 Switch가 무시된다.
     pub fn set_switch_sink(&self, sink: dashboard::SwitchSink) {
         self.core.dashboard().set_switch_sink(sink);
+    }
+
+    pub fn set_cloud_control_sink(&self, sink: cloud::CloudControlSink) {
+        self.core.set_cloud_control_sink(sink);
+    }
+
+    pub fn publish_cloud_snapshot(
+        &self,
+        snapshot: cloud::CloudSnapshot,
+    ) -> Result<(), cloud::CloudSnapshotError> {
+        self.core.publish_cloud_snapshot(snapshot)
     }
 
     /// 폰에 띄울 일시 안내 배너를 세팅/해제한다 (미러 진입 상한 초과 등 — I1b-2).
@@ -693,6 +705,66 @@ mod tests {
     use tungstenite::protocol::{Role, WebSocket};
 
     const TEST_TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn cloud_snapshot_and_controls_require_operator_authentication() {
+        let server = start(None);
+        server
+            .publish_cloud_snapshot(cloud::CloudSnapshot {
+                runs: vec![cloud::CloudRunView {
+                    id: "run-original".into(),
+                    connection_id: "actor-original".into(),
+                    workspace_id: "workspace-original".into(),
+                    session_id: "session-original".into(),
+                    generation: "generation-original".into(),
+                    state: "running".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .unwrap();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        server.set_cloud_control_sink(Arc::new(move |intent| tx.try_send(intent).is_ok()));
+        let mut unauth = ws_client(server.local_addr());
+        send_text(
+            &mut unauth,
+            r#"{"type":"cloud_control","request":1,"intent":{"action":"cancel_run","connection_id":"actor-original","run_id":"run-original"}}"#,
+        );
+        assert!(read_frame_of_type(&mut unauth, "error", Duration::from_secs(2)).is_some());
+        assert!(rx.try_recv().is_err());
+        let mut owner = ws_client_authed(server.local_addr());
+        let snapshot =
+            read_frame_of_type(&mut owner, "cloud_snapshot", Duration::from_secs(2)).unwrap();
+        assert!(snapshot.contains("session-original") && snapshot.contains("actor-original"));
+        send_text(
+            &mut owner,
+            r#"{"type":"cloud_control","request":1,"intent":{"action":"take_control","session_id":"session-original","generation":""}}"#,
+        );
+        let invalid =
+            read_frame_of_type(&mut owner, "cloud_control_result", Duration::from_secs(2)).unwrap();
+        assert!(invalid.contains("invalid"));
+        assert!(
+            rx.try_recv().is_err(),
+            "invalid identity reached owner sink"
+        );
+        send_text(
+            &mut owner,
+            r#"{"type":"cloud_control","request":2,"intent":{"action":"cancel_run","connection_id":"actor-original","run_id":"run-original"}}"#,
+        );
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            cloud::CloudControlIntent::CancelRun {
+                connection_id: "actor-original".into(),
+                run_id: "run-original".into()
+            }
+        );
+        let reply =
+            read_frame_of_type(&mut owner, "cloud_control_result", Duration::from_secs(2)).unwrap();
+        assert!(reply.contains("queued"));
+        drop(owner);
+        drop(unauth);
+        server.shutdown();
+    }
 
     fn start(allowed_host: Option<&str>) -> WebRemoteServer {
         start_with_db(allowed_host, None)

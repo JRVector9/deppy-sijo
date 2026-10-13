@@ -20,6 +20,8 @@ const VIEWER_CORE_CSS_LEN: usize = include_str!("../../../web/shared/viewer-core
 const APP_JS_BUNDLE: &str = concat!(
     include_str!("../../../web/shared/viewer-core.js"),
     "\n",
+    include_str!("../../../web/shared/cloud-results.js"),
+    "\n",
     include_str!("../assets/app.js"),
 );
 const APP_CSS_BUNDLE: &str = concat!(
@@ -29,6 +31,8 @@ const APP_CSS_BUNDLE: &str = concat!(
     // 갈라지지 않게 하려는 것이다. 뷰어 코어 **뒤**에 온다: 앞부분 슬라이스가 곧 뷰어 코어
     // 소스라는 규약(`viewer_core_css`)을 깨지 않기 위해서다.
     include_str!("../../../web/shared/mobile-theme.css"),
+    "\n",
+    include_str!("../../../web/shared/cloud-results.css"),
     "\n",
     include_str!("../assets/app.css"),
 );

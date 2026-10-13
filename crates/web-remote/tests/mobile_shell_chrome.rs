@@ -4,8 +4,16 @@ mod chrome_support;
 use chrome_support::{StaticFiles, StaticServer};
 
 const INDEX: &str = include_str!("../assets/index.html");
-const APP_JS: &str = include_str!("../assets/app.js");
-const APP_CSS: &str = include_str!("../assets/app.css");
+const APP_JS: &str = concat!(
+    include_str!("../../../web/shared/cloud-results.js"),
+    "\n",
+    include_str!("../assets/app.js")
+);
+const APP_CSS: &str = concat!(
+    include_str!("../../../web/shared/cloud-results.css"),
+    "\n",
+    include_str!("../assets/app.css")
+);
 const VIEWER_JS: &str = include_str!("../../../web/shared/viewer-core.js");
 const VIEWER_CSS: &str = include_str!("../../../web/shared/viewer-core.css");
 const THEME_CSS: &str = include_str!("../../../web/shared/mobile-theme.css");

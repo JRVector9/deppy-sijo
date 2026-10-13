@@ -538,6 +538,8 @@ struct Inner {
 /// 접속 스레드가 소켓으로 밀어낼 발행 스냅샷. 버전이 오르면 push 대상.
 #[derive(Default)]
 struct Published {
+    cloud_version: u64,
+    cloud_frames: [String; 4],
     dashboard_json: String,
     dash_version: u64,
     approvals_json: String,
@@ -551,6 +553,7 @@ struct Published {
 }
 
 struct Shared {
+    cloud_sink: Mutex<Option<crate::cloud::CloudControlSink>>,
     history_nonce: String,
     inner: Mutex<Inner>,
     published: Mutex<Published>,
@@ -607,10 +610,76 @@ impl Drop for ConnectionGuard {
 }
 
 impl DashboardHandle {
+    pub fn set_cloud_control_sink(&self, sink: crate::cloud::CloudControlSink) {
+        *self.shared.cloud_sink.lock().expect("cloud sink lock") = Some(sink);
+    }
+
+    /// This route only queues a typed owner intent; it never calls a runtime sink.
+    pub fn request_cloud_control(&self, intent: crate::cloud::CloudControlIntent) -> bool {
+        if !intent.validate() {
+            return false;
+        }
+        let sink = self
+            .shared
+            .cloud_sink
+            .lock()
+            .expect("cloud sink lock")
+            .clone();
+        sink.is_some_and(|sink| sink(intent))
+    }
+
+    pub fn publish_cloud_snapshot(
+        &self,
+        snapshot: crate::cloud::CloudSnapshot,
+    ) -> Result<(), crate::cloud::CloudSnapshotError> {
+        // Encode before acquiring the slot. An invalid update cannot evict good data.
+        let frames = [
+            snapshot.encode_frame(false, false)?,
+            snapshot.encode_frame(true, false)?,
+            snapshot.encode_frame(false, true)?,
+            snapshot.encode_frame(true, true)?,
+        ];
+        let mut published = self.shared.published.lock().expect("published lock");
+        if published.cloud_frames != frames {
+            published.cloud_frames = frames;
+            published.cloud_version = published.cloud_version.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    pub fn cloud_snapshot_if_newer(&self, last: u64) -> Option<(u64, String)> {
+        self.cloud_snapshot_for_permissions(
+            last,
+            crate::relay::contract::RelayPermissions::new(true, true, true),
+        )
+    }
+
+    /// Device scope is applied to the exact same authoritative publication.
+    pub fn cloud_snapshot_for_permissions(
+        &self,
+        last: u64,
+        permissions: crate::relay::contract::RelayPermissions,
+    ) -> Option<(u64, String)> {
+        use crate::relay::contract::RelayAction;
+        if !permissions.allows(RelayAction::View) {
+            return None;
+        }
+        let index = usize::from(permissions.allows(RelayAction::Input))
+            + 2 * usize::from(permissions.allows(RelayAction::Approval));
+        let published = self.shared.published.lock().expect("published lock");
+        (published.cloud_version > last).then(|| {
+            (
+                published.cloud_version,
+                published.cloud_frames[index].clone(),
+            )
+        })
+    }
+
     /// 브리지 스레드를 띄운다. 저장소 포트가 있으면 승인 대시보드를 활성화한다. 반환된
     /// JoinHandle은 서버가 소유해 shutdown 시 join한다.
     pub fn spawn(repository: Option<Arc<dyn WebRemoteRepository>>) -> (Self, JoinHandle<()>) {
         let shared = Arc::new(Shared {
+            cloud_sink: Mutex::new(None),
             history_nonce: uuid::Uuid::new_v4().simple().to_string(),
             inner: Mutex::new(Inner {
                 dirty: false,

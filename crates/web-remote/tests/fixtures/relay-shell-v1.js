@@ -429,6 +429,30 @@ async function flow() {
   eq(getComputedStyle(terminal).display, "none", "hidden terminal must not paint");
   eq(getComputedStyle(home).display, "flex", "home screen visible");
 
+  // Same cloud model arrives inside the already authenticated encrypted channel.
+  const cloudFrame = await macChannel.seal(new TextEncoder().encode(JSON.stringify({
+    type: "cloud_snapshot", can_control: true, can_approve: true,
+    snapshot: {
+      runs: [{ id: "cloud-original-run", connection_id: "cloud-original-actor", connection_name: "클라우드 연구자",
+        workspace_id: "ws-1", session_id: "s1", generation: "original-generation", title: "원래 클라우드 작업",
+        state: "unknown", stale: true, local_status: "waiting", message: "보고 확인 필요" }],
+      connections: [], answers: [], approvals: [{ id: "private-approval", connection_name: "비공개 승인 이름" }],
+    },
+  })));
+  deliver(C.FRAME_TYPE.CIPHERTEXT, connection, cloudFrame.ciphertext, cloudFrame.sequence);
+  await waitFor(() => !document.getElementById("relay-cloud-results-toggle").hidden, "encrypted cloud results");
+  document.getElementById("relay-cloud-results-toggle").click();
+  const cloudPanel = document.getElementById("relay-cloud-results");
+  ok(cloudPanel.textContent.includes("클라우드 보고") && cloudPanel.textContent.includes("로컬 터미널"), "Relay preserves separate cloud and local states");
+  ok(cloudPanel.textContent.includes("보고가 오래됨") && cloudPanel.textContent.includes("상태 미확인"), "Relay preserves stale/unknown reports");
+  ok(!cloudPanel.textContent.includes("비공개 승인 이름"), "view-only shell never displays ungranted approvals");
+  ok([...cloudPanel.querySelectorAll("[data-cloud-action]")].every(button => button.disabled), "view-only shell disables cloud effects despite offered control flags");
+  const previousWidth = document.documentElement.style.width;
+  document.documentElement.style.width = "390px";
+  ok(cloudPanel.scrollWidth <= cloudPanel.clientWidth + 1, "390px Relay cloud results stay inside mobile width");
+  document.documentElement.style.width = previousWidth;
+  document.getElementById("relay-cloud-results-toggle").click();
+
   // 카드 → 터미널 화면 + watch.
   const openFromMac = async (index) =>
     new TextDecoder().decode(

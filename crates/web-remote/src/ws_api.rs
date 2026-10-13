@@ -222,6 +222,7 @@ fn stream_loop(
 ) {
     let mut last_dash = 0u64;
     let mut last_appr = 0u64;
+    let mut last_cloud = 0u64;
     let mut last_ping = Instant::now();
     // 시청 화면 상태 (P5c) — 접속별 baseline. 없으면 다음 프레임은 keyframe.
     // watch 전환·RequestKeyframe에서 리셋한다 (remote.rs §4.4-5 관례).
@@ -251,6 +252,12 @@ fn stream_loop(
                 return;
             }
             last_appr = version;
+        }
+        if let Some((version, json)) = dashboard.cloud_snapshot_if_newer(last_cloud) {
+            if ws.send(Message::Text(json.into())).is_err() {
+                return;
+            }
+            last_cloud = version;
         }
 
         if let Some((version, json, keyframe)) =
@@ -394,6 +401,25 @@ fn stream_loop(
                     );
                 } else {
                     match ClientMsg::parse(text.as_str()) {
+                        Some(ClientMsg::CloudControl { request, intent }) => {
+                            let status = if request == 0 || !intent.validate() {
+                                "invalid"
+                            } else if dashboard.request_cloud_control(intent) {
+                                "queued"
+                            } else {
+                                "rejected"
+                            };
+                            if ws
+                                .send(Message::Text(
+                                    ServerMsg::CloudControlResult { request, status }
+                                        .encode()
+                                        .into(),
+                                ))
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
                         Some(ClientMsg::Resolve {
                             id,
                             allowed,

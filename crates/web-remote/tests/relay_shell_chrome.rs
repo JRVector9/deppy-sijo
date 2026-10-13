@@ -64,6 +64,13 @@ fn shell_files(fixture: &serde_json::Value) -> StaticFiles {
         "/mobile-theme.css".to_owned(),
         ("text/css", read(&shared.join("mobile-theme.css"))),
     );
+    for (name, mime) in [
+        ("cloud-results.js", "text/javascript"),
+        ("cloud-results.css", "text/css"),
+    ] {
+        files.insert(format!("/{name}"), (mime, read(&shared.join(name))));
+        files.insert(format!("/shared/{name}"), (mime, read(&shared.join(name))));
+    }
     let index = String::from_utf8(read(&shell.join("index.html"))).expect("index.html utf-8");
     let boot = "<script type=\"module\" src=\"./relay-shell.js\"></script>";
     assert!(index.contains(boot), "index.html must boot relay-shell.js");

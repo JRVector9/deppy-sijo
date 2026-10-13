@@ -261,6 +261,8 @@
       const wasCurrent = ws === socket;
       if (wasCurrent) ws = null;
       if (!wasCurrent || intentionallyClosedSockets.has(socket)) return;
+      cancelPendingWatch();
+      cloudResults.resetConnection();
       setStatus('bad', '연결 끊김 — 재연결 중…');
       setViewerConnection('reconnecting');
       scheduleReconnect();
@@ -281,6 +283,8 @@
   }
 
   function disconnect() {
+    cancelPendingWatch();
+    cloudResults.resetConnection();
     retireResizeControl();
     retireHistory();
     manualClose = true;
@@ -320,6 +324,10 @@
         break;
       case 'approvals':
         renderApprovals(msg.pending || []);
+        break;
+      case 'cloud_snapshot':
+      case 'cloud_control_result':
+        cloudResults.accept(msg);
         break;
       case 'viewport':
         historyCompleting = historyPending && historyTargetCurrent(historyPending)
@@ -473,6 +481,7 @@
       },
       afterOpen: () => updateComposerEnabled(),
       beforeRequestClose: () => {
+        cancelCloudNavigation();
         cancelWorkspaceSelection();
         retireResizeControl();
         retireHistory();
@@ -795,6 +804,7 @@
   }
 
   function openViewer(sessionId, title, fromWorkspaceSelection = false) {
+    cancelCloudNavigation();
     if (!fromWorkspaceSelection) cancelWorkspaceSelection();
     const opened = openCoreViewer(sessionId, title);
     if (opened) updateViewerHeading(sessionId);
@@ -1754,8 +1764,10 @@
   // 그래도 기한을 둔다: 이미 끝난 세션의 알림을 한참 뒤 탭하면 조용히 폐기한다.
   const PENDING_WATCH_TTL_MS = 30_000;
 
-  function setPendingWatch(session) {
-    pendingWatch = session;
+  function cancelPendingWatch() { pendingWatch = null; pendingWatchDeadline = 0; }
+  function cancelCloudNavigation() { cancelPendingWatch(); cloudResults.cancelNavigation(); }
+  function setPendingWatch(session, workspace = null) {
+    pendingWatch = { session, workspace, socket: workspace ? ws : null };
     pendingWatchDeadline = Date.now() + PENDING_WATCH_TTL_MS;
   }
   {
@@ -1782,25 +1794,21 @@
 
   /// 딥링크 대상이 현재 세션 목록에 있으면 시청을 시작한다(1회성).
   function consumePendingWatch(sessions) {
-    if (!pendingWatch) return false;
-    if (Date.now() > pendingWatchDeadline) {
-      pendingWatch = null;
-      return false;
+    const pending = pendingWatch;
+    if (!pending) return false;
+    if (Date.now() > pendingWatchDeadline || (pending.workspace && pending.socket !== ws)) {
+      cancelPendingWatch(); return false;
     }
     if (viewer.closing) return false;
-    if (pendingWatch === viewer.watching) {
-      pendingWatch = null;
-      return true;
-    }
-    const target = sessions.find((session) => session.id === pendingWatch);
-    if (!target || target.exited) {
-      if (target && target.exited) pendingWatch = null;
+    const workspace = pending.workspace && lastWorkspaces.find(item => item.id === pending.workspace);
+    if (pending.workspace && (!workspace || workspace.state !== 'active')) return false;
+    const target = (workspace ? workspace.sessions || [] : sessions).find(session => session.id === pending.session || (workspace && session.selection_id === pending.session));
+    if (!target?.id || target.exited) {
+      if (target?.exited) cancelPendingWatch();
       return false;
     }
-    const id = pendingWatch;
-    if (!openViewer(id, target.title || ('세션 ' + id))) return false;
-    pendingWatch = null;
-    return true;
+    if (target.id === viewer.watching) { cancelPendingWatch(); return true; }
+    return openViewer(target.id, target.title || ('세션 ' + target.id));
   }
 
   const WORKSPACE_STATE_LABEL = { active: '활성', warm: '대기', suspended: '절전' };
@@ -1834,6 +1842,7 @@
     if (note) showNotice(note);
   }
   function selectDormantSession(workspace, session) {
+    cancelCloudNavigation();
     cancelWorkspaceSelection();
     const stable = typeof session.selection_id === 'string' && session.selection_id ? session.selection_id : null;
     if (stable) {
@@ -1859,6 +1868,29 @@
     openViewer(session.id, session.title || '세션', true);
   }
   const workspaceSearch = document.getElementById('workspace-search');
+  const workspacePanel = document.querySelector('.workspace-panel');
+  const cloudResults = createCloudResultsView({
+    host: dashboardShell,
+    send,
+    onVisibility(open) {
+      workspaceSearch.closest('label').hidden = open;
+      workspacePanel.hidden = open;
+    },
+    beginNavigation() { cancelPendingWatch(); cancelWorkspaceSelection(); },
+    navigate(intent) {
+      // Watch only a current, verified UUID after the App admits navigation.
+      const workspace = lastWorkspaces.find(item => item.id === intent.workspace_id);
+      const session = workspace?.sessions?.find(item => item.id === intent.session_id || item.selection_id === intent.session_id);
+      if (workspace?.state === 'active' && session?.id && !session.exited) {
+        openViewer(session.id, session.title || '원래 세션');
+      } else {
+        setPendingWatch(intent.session_id, intent.workspace_id);
+        showNotice('원래 워크스페이스와 세션을 준비하고 있습니다.');
+      }
+    },
+  });
+  dashboardShell.insertBefore(cloudResults.toggle, workspaceSearch.closest('label'));
+  dashboardShell.insertBefore(cloudResults.panel, workspaceSearch.closest('label'));
   const searchable = value => String(value || '').normalize('NFC').toLocaleLowerCase();
   function sessionStatusLabel(session, workspace) {
     if (session.exited) return '종료';
@@ -1970,6 +2002,7 @@
     row.addEventListener('click', () => {
       const freshWorkspace = lastWorkspaces.find(candidate => candidate.id === workspace.id);
       if (!freshWorkspace) return;
+      cancelCloudNavigation();
       if (freshWorkspace.state !== 'active') {
         workspaceExpansions.set(workspace.id, true);
         selectDormantSession(freshWorkspace, session);

@@ -1,0 +1,21 @@
+
+running 2 tests
+original_masked=true; filtered_masked=false; reconstructed_secret=true
+wrapped_api_masked=true; stream_masked=false; reconstructed_secret=true
+
+thread 'new_run_control_filter_must_preserve_secret_masking' (18815016) panicked at /private/tmp/deppy-cloud-review-redaction-order-20261013.rs:18:5:
+run filter order leaked a reconstructible synthetic registered secret
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'new_run_multiline_text_must_use_complete_wrapped_masking' (18815017) panicked at /private/tmp/deppy-cloud-review-redaction-order-20261013.rs:29:5:
+run multiline text leaked a reconstructible synthetic registered secret
+test new_run_control_filter_must_preserve_secret_masking ... FAILED
+test new_run_multiline_text_must_use_complete_wrapped_masking ... FAILED
+
+failures:
+
+failures:
+    new_run_control_filter_must_preserve_secret_masking
+    new_run_multiline_text_must_use_complete_wrapped_masking
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

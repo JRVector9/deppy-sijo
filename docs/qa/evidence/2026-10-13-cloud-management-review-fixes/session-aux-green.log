@@ -1,0 +1,9 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.18s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-d0c94c47049f5fdd)
+
+running 3 tests
+test session_aux::tests::git_results_drop_only_when_the_same_kind_is_reissued ... ok
+test session_aux::tests::session_aux_retains_live_or_open_documents_only ... ok
+test session_aux::tests::session_aux_switch_restores_views_and_routes_late_results ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 3158 filtered out; finished in 0.00s

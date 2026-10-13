@@ -1,0 +1,3 @@
+CLOUD_RESULTS_MOBILE_ERROR:Error: timestamp-only snapshot destroys focus/selection: {"before":{"focus":true,"selection":"보고 연결이 끊김"},"after":{"focus":false,"connected":false,"selection":""}}
+    at check (http://127.0.0.1:53686/fixture.js:42:55)
+    at http://127.0.0.1:53686/fixture.js:57:5

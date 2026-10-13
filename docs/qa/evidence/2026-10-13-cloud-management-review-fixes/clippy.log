@@ -1,0 +1,6 @@
+    Checking web-remote v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/web-remote)
+    Checking i18n v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/i18n)
+    Checking connector-ui v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/connector-ui)
+    Checking agent-mcp v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/agent-mcp)
+    Checking deppy-sijo v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/app)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 35.41s

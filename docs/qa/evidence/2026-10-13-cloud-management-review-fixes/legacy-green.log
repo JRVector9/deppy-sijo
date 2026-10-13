@@ -1,0 +1,9 @@
+   Compiling deppy-sijo v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.46s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-d0c94c47049f5fdd)
+
+running 2 tests
+test cloud_agent::management::tests::legacy_wrapped_run_is_redacted_on_bootstrap_get_and_publication ... ok
+test cloud_agent::management::tests::legacy_wrapped_receipt_is_redacted_on_management_lookup ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 3159 filtered out; finished in 0.02s

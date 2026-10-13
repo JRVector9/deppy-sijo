@@ -727,24 +727,25 @@ impl CloudAgent {
             (&mut run.instruction, 8192),
             (&mut run.message, 4096),
         ] {
-            *text = self.redact(text);
+            *text = self.redaction.redact_wrapped_text(text);
             truncate_utf8(text, limit);
         }
         if let Some(result) = &mut run.result {
-            *result = self.redact(result);
+            *result = self.redaction.redact_wrapped_text(result);
             truncate_utf8(result, agent_mcp::MAX_ANSWER);
         }
         run.artifacts.retain_mut(|artifact| {
-            artifact.label = self.redact(&artifact.label);
+            artifact.label = self.redaction.redact_wrapped_text(&artifact.label);
             // A redacted URL would name a different clickable destination.
             // Preserve the exact safe URI or omit the reference entirely.
-            self.redact(&artifact.uri) == artifact.uri && artifact.validate().is_ok()
+            self.redaction.redact_wrapped_text(&artifact.uri) == artifact.uri
+                && artifact.validate().is_ok()
         });
         run
     }
     fn scrub_management_value(&self, value: Value) -> Value {
         match value {
-            Value::String(text) => Value::String(self.redact(&text)),
+            Value::String(text) => Value::String(self.redaction.redact_wrapped_text(&text)),
             Value::Array(values) => Value::Array(
                 values
                     .into_iter()
@@ -754,7 +755,12 @@ impl CloudAgent {
             Value::Object(values) => Value::Object(
                 values
                     .into_iter()
-                    .map(|(key, value)| (self.redact(&key), self.scrub_management_value(value)))
+                    .map(|(key, value)| {
+                        (
+                            self.redaction.redact_wrapped_text(&key),
+                            self.scrub_management_value(value),
+                        )
+                    })
                     .collect(),
             ),
             other => other,
@@ -764,11 +770,15 @@ impl CloudAgent {
         if text.len() > max || text.contains('\0') {
             return Err("run_text_too_large_or_invalid".into());
         }
-        let clean: String = text
+        // Keep ANSI boundaries intact until complete and wrapped secrets are masked.
+        let redacted = self.redaction.redact_wrapped_text(text);
+        let plain = crate::agent_model_probe::strip_ansi(&redacted);
+        let clean: String = plain
             .chars()
             .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
             .collect();
-        let clean = self.redact(&clean);
+        // Removing controls can join secret fragments, including wrapped ones.
+        let clean = self.redaction.redact_wrapped_text(&clean);
         if clean.len() > max {
             return Err("run_text_too_large_or_invalid".into());
         }
@@ -1102,6 +1112,253 @@ mod tests {
             panic!("persisted run");
         };
         assert!(!serde_json::to_string(run).unwrap().contains(sensitive));
+    }
+    fn assert_obfuscated_run_fields_are_redacted(obfuscated: &str) {
+        let (mut bridge, target) = setup();
+        let secret = secret::SecretString::new("fixture-secret-access-token-123456789".into());
+        let _lease = bridge
+            .redaction
+            .acquire_execution_lease(&[&secret])
+            .unwrap();
+        let text = format!("Report: {obfuscated}");
+        let expected = "Report: [REDACTED]";
+        let registered = call(
+            &mut bridge,
+            Some(&target),
+            "start_run",
+            json!({"session_id":target.id,"generation":target.generation,"run_id":"run","title":text,"instruction":text}),
+        )
+        .unwrap();
+        assert_eq!(registered["run"]["title"], expected, "start response title");
+        assert_eq!(
+            registered["run"]["instruction"], expected,
+            "start response instruction"
+        );
+        let updated = call(
+            &mut bridge,
+            Some(&target),
+            "update_run",
+            json!({"session_id":target.id,"generation":target.generation,"run_id":"run","state":"running","message":text,"result":text,"artifacts":[{"label":text,"uri":"https://example.test/result"}]}),
+        )
+        .unwrap();
+        assert_eq!(
+            updated["run"]["message"], expected,
+            "update response message"
+        );
+        assert_eq!(updated["run"]["result"], expected, "update response result");
+        assert_eq!(
+            updated["run"]["artifacts"][0]["label"], expected,
+            "update response artifact label"
+        );
+
+        let token = bridge.operation_token();
+        assert!(
+            bridge
+                .history
+                .request(
+                    token,
+                    Job::GetRun {
+                        id: "run".into(),
+                        connection_id: agent_mcp::LEGACY_CONNECTION_ID.into(),
+                    },
+                )
+                .is_ok()
+        );
+        let saved = bridge.history.wait().unwrap();
+        let ResultKind::GetRun(Ok(Some(run))) = saved.result else {
+            panic!("persisted run");
+        };
+        assert_eq!(run.title, expected, "SQLite title");
+        assert_eq!(run.instruction, expected, "SQLite instruction");
+        assert_eq!(run.message, expected, "SQLite message");
+        assert_eq!(run.result.as_deref(), Some(expected), "SQLite result");
+        assert_eq!(run.artifacts[0].label, expected, "SQLite artifact label");
+        assert_eq!(
+            serde_json::to_value(&bridge.cloud_runs()[0]).unwrap(),
+            serde_json::to_value(run).unwrap(),
+            "native cache matches the durably sanitized run"
+        );
+        let snapshot = bridge.cloud_snapshot();
+        assert_eq!(snapshot.runs[0].title, expected, "publication title");
+        assert_eq!(snapshot.runs[0].message, expected, "publication message");
+        assert_eq!(
+            snapshot.runs[0].result.as_deref(),
+            Some(expected),
+            "publication result"
+        );
+        assert_eq!(
+            snapshot.runs[0].artifacts[0].label, expected,
+            "publication artifact label"
+        );
+    }
+    #[test]
+    fn run_fields_redact_ansi_before_sqlite_and_publication() {
+        assert_obfuscated_run_fields_are_redacted("fixture-secret-\x1b[31maccess-token-123456789");
+    }
+    #[test]
+    fn run_fields_redact_wrapped_before_sqlite_and_publication() {
+        assert_obfuscated_run_fields_are_redacted("fixture-secret-\r\naccess-token-123456789");
+    }
+    #[test]
+    fn run_fields_redact_control_normalization_before_sqlite_and_publication() {
+        assert_obfuscated_run_fields_are_redacted("fixture-secret-\x07access-token-123456789");
+        assert_obfuscated_run_fields_are_redacted("fixture-secret-\x07\r\naccess-token-123456789");
+    }
+    #[test]
+    fn run_fields_redact_mixed_controls_and_ansi_before_sqlite_and_publication() {
+        for text in [
+            "fixture-secret-\x07\x1b[31maccess-token-123456789",
+            "fixture-secret-\x07\x1b]0;temporary title\x07access-token-123456789",
+            "fixture-secret-\x07\x1b]0;temporary title\x1b\\access-token-123456789",
+        ] {
+            assert_obfuscated_run_fields_are_redacted(text);
+        }
+    }
+    #[test]
+    fn legacy_wrapped_run_is_redacted_on_bootstrap_get_and_publication() {
+        let (mut bridge, target) = setup();
+        let secret = secret::SecretString::new("fixture-secret-access-token-123456789".into());
+        let _lease = bridge
+            .redaction
+            .acquire_execution_lease(&[&secret])
+            .unwrap();
+        let text = "Report: fixture-secret-\naccess-token-123456789";
+        let expected = "Report: [REDACTED]";
+        let mut run = CloudRun::new(
+            "legacy-run",
+            agent_mcp::LEGACY_CONNECTION_ID,
+            "Legacy",
+            &target.workspace,
+            &target.id,
+            &target.generation,
+            text,
+            text,
+            now() as i64,
+        )
+        .unwrap();
+        run.message = text.into();
+        run.result = Some(text.into());
+        run.artifacts = vec![
+            agent_mcp::ArtifactReference {
+                label: "Unsafe legacy URI".into(),
+                uri: "https://example.test/fixture-secret-\naccess-token-123456789".into(),
+            },
+            agent_mcp::ArtifactReference {
+                label: "Safe legacy URI".into(),
+                uri: "https://example.test/safe-report".into(),
+            },
+        ];
+        let token = bridge.operation_token();
+        assert!(bridge.history.request(token, Job::SaveRun { run }).is_ok());
+        assert!(matches!(
+            bridge.history.wait().unwrap().result,
+            ResultKind::SaveRun(Ok(()))
+        ));
+
+        bridge.management.bootstrap_started = false;
+        bridge.poll_management();
+        bridge.drain_history(|_, _| panic!("legacy run bootstrap must not emit input"));
+        let cached = &bridge.cloud_runs()[0];
+        assert_eq!(cached.title, expected, "bootstrap/native title");
+        assert_eq!(cached.instruction, expected, "bootstrap/native instruction");
+        assert_eq!(cached.message, expected, "bootstrap/native message");
+        assert_eq!(
+            cached.result.as_deref(),
+            Some(expected),
+            "bootstrap/native result"
+        );
+        assert_eq!(cached.artifacts.len(), 1, "omit changed legacy URI");
+        assert_eq!(cached.artifacts[0].uri, "https://example.test/safe-report");
+        let response = call(
+            &mut bridge,
+            Some(&target),
+            "get_run",
+            json!({"session_id":target.id,"generation":target.generation,"run_id":"legacy-run"}),
+        )
+        .unwrap();
+        for field in ["title", "instruction", "message", "result"] {
+            assert_eq!(response["run"][field], expected, "get_run {field}");
+        }
+        assert_eq!(response["run"]["artifacts"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            response["run"]["artifacts"][0]["uri"],
+            "https://example.test/safe-report"
+        );
+        let snapshot = bridge.cloud_snapshot();
+        assert_eq!(snapshot.runs[0].title, expected, "publication title");
+        assert_eq!(snapshot.runs[0].message, expected, "publication message");
+        assert_eq!(
+            snapshot.runs[0].result.as_deref(),
+            Some(expected),
+            "publication result"
+        );
+        assert_eq!(snapshot.runs[0].artifacts.len(), 1);
+        assert_eq!(
+            snapshot.runs[0].artifacts[0].uri,
+            "https://example.test/safe-report"
+        );
+    }
+    #[test]
+    fn legacy_wrapped_receipt_is_redacted_on_management_lookup() {
+        let (mut bridge, target) = setup();
+        let secret = secret::SecretString::new("fixture-secret-access-token-123456789".into());
+        let _lease = bridge
+            .redaction
+            .acquire_execution_lease(&[&secret])
+            .unwrap();
+        let text = "Report: fixture-secret-\naccess-token-123456789";
+        let token = bridge.operation_token();
+        assert!(
+            bridge
+                .history
+                .request(
+                    token,
+                    Job::ClaimScoped {
+                        id: "legacy-receipt".into(),
+                        tool: "start_run".into(),
+                        args: json!({}),
+                        workspace: target.workspace.clone(),
+                        session: target.id.clone(),
+                        context: agent_mcp::OperationContext {
+                            connection_id: agent_mcp::LEGACY_CONNECTION_ID.into(),
+                            operation_id: "legacy-receipt".into(),
+                            run_id: Some("legacy-run".into()),
+                            generation: target.generation.clone(),
+                        },
+                    }
+                )
+                .is_ok()
+        );
+        assert!(matches!(
+            bridge.history.wait().unwrap().result,
+            ResultKind::ClaimScoped(Ok(agent_mcp::Claim::New))
+        ));
+        let token = bridge.operation_token();
+        assert!(
+            bridge.history.request(token, Job::FinishScoped {
+                id: "legacy-receipt".into(),
+                connection_id: agent_mcp::LEGACY_CONNECTION_ID.into(),
+                outcome: json!({"status":"stored","message":text,"result":{"text":text},"artifacts":[{"label":text}]}),
+                message: "Historical receipt".into(),
+            }).is_ok()
+        );
+        assert!(matches!(
+            bridge.history.wait().unwrap().result,
+            ResultKind::FinishScoped(Ok(()))
+        ));
+        let response = call(
+            &mut bridge,
+            Some(&target),
+            "get_operation",
+            json!({"session_id":target.id,"generation":target.generation,"operation_id":"legacy-receipt"}),
+        )
+        .unwrap();
+        assert_eq!(response["receipt"]["message"], "Report: [REDACTED]");
+        assert_eq!(response["receipt"]["result"]["text"], "Report: [REDACTED]");
+        assert_eq!(
+            response["receipt"]["artifacts"][0]["label"],
+            "Report: [REDACTED]"
+        );
     }
     #[test]
     fn artifact_update_rejects_a_credential_uri_before_durable_mutation() {

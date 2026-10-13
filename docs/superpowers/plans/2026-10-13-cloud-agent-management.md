@@ -50,40 +50,40 @@ No owner edits another owner's file without root's explicit handoff. `lib.rs` mo
 
 ## PR 2 — connection identity, permissions and control
 
-- [ ] RED: refresh keeps one principal; revoke A leaves B active; unauthenticated/client-supplied names cannot become authority.
-- [ ] RED: same external operation ID belongs independently to two actors; A cannot read B receipt or target; session generation change invalidates permission; local takeover invalidates waiting input.
-- [ ] Implement registry, per-connection scopes/grants, explicit input lease and expiry; expose owner actions and settings list.
-- [ ] GREEN: OAuth/HTTP and actual PTY admission fixtures for independent/different sessions and same-session control conflict.
-- [ ] Root review and commit with regression evidence.
+- [x] RED: refresh keeps one principal; revoke A leaves B active; unauthenticated/client-supplied names cannot become authority.
+- [x] RED: same external operation ID belongs independently to two actors; A cannot read B receipt or target; session generation change invalidates permission; local takeover invalidates waiting input.
+- [x] Implement registry, per-connection scopes/grants, explicit input lease and expiry; expose owner actions and settings list.
+- [x] GREEN: OAuth/HTTP and actual PTY admission fixtures for independent/different sessions and same-session control conflict.
+- [x] Root review and commit with regression evidence.
 
 ## PR 3 — cloud runs and authoritative status
 
-- [ ] RED: queue receipt does not complete a run; terminal transitions are legal; actor/session/generation ownership fences apply; heartbeat expiry/restored unfinished run becomes stale/unknown.
-- [ ] Persist bounded cloud runs and artifact references through the worker; implement additive run tools and original-session notify linkage.
-- [ ] Display cloud reported phase separately from local terminal state. Cancellation request/ack, input revocation and Ctrl+C remain distinct.
-- [ ] GREEN: two concurrent runs, reused IDs, report loss, delayed notify, restart, wrong actor and original-pane result fixtures.
-- [ ] Root review and commit.
+- [x] RED: queue receipt does not complete a run; terminal transitions are legal; actor/session/generation ownership fences apply; heartbeat expiry/restored unfinished run becomes stale/unknown.
+- [x] Persist bounded cloud runs and artifact references through the worker; implement additive run tools and original-session notify linkage.
+- [x] Display cloud reported phase separately from local terminal state. Cancellation request/ack, input revocation and Ctrl+C remain distinct.
+- [x] GREEN: two concurrent runs, reused IDs, report loss, delayed notify, restart, wrong actor and original-pane result fixtures.
+- [x] Root review and commit.
 
 ## PR 4 — history, freshness and receipts
 
-- [ ] RED: viewport alone cannot supply older errors; bounded history cursor/reset/truncation is explicit; scoped receipt lookup has zero effects and no cross-client disclosure.
-- [ ] Add generation-scoped terminal history effect/reply and freshness metadata, operation lookup, normalized error fields and bounded poll budget.
-- [ ] GREEN: output beyond screen, redaction, Unicode/bounds, lost replies, unknown receipt and polling contention while UI/other actor remains responsive.
-- [ ] Root review and commit.
+- [x] RED: viewport alone cannot supply older errors; bounded history cursor/reset/truncation is explicit; scoped receipt lookup has zero effects and no cross-client disclosure.
+- [x] Add generation-scoped terminal history effect/reply and freshness metadata, operation lookup, normalized error fields and bounded poll budget.
+- [x] GREEN: output beyond screen, redaction, Unicode/bounds, lost replies, unknown receipt and polling contention while UI/other actor remains responsive.
+- [x] Root review and commit.
 
 ## PR 5 — connection continuity
 
-- [ ] RED: profile roundtrip never persists a bearer/approval; bounded retry resets at success, stops on explicit disconnect/auth expiry, and never repeats input.
-- [ ] Add named non-secret profiles, stable-host mode, expiry/re-auth UI, wake/health revalidation and capped backoff.
-- [ ] GREEN: simulated tunnel failure, sleep-sized heartbeat gap, rotation/expiry, explicit stop, changed URL and changed generation.
-- [ ] Root review and commit.
+- [x] RED: profile roundtrip never persists a bearer/approval; bounded retry resets at success, stops on explicit disconnect/auth expiry, and never repeats input.
+- [x] Add named non-secret profiles, stable-host mode, expiry/re-auth UI, wake/health revalidation and capped backoff.
+- [x] GREEN: simulated tunnel failure, sleep-sized heartbeat gap, rotation/expiry, explicit stop, changed URL and changed generation.
+- [x] Root review and commit.
 
 ## PR 6 — results and PWA
 
-- [ ] RED: desktop/mobile snapshots retain the original session/actor/run and contain no credentials; web controls require existing operator auth and go through App validation.
-- [ ] Add searchable/filterable bounded run/result history and artifact links, desktop source labels, mobile cloud results/control view and pane navigation.
-- [ ] GREEN: operator-authenticated WebSocket fixtures and narrow/mobile browser tests, stale/unknown/cancel displays, API compatibility harness for old and new tools.
-- [ ] Root review, final suite/clippy/fmt/boundary checks, commit; provider account certification status remains explicit.
+- [x] RED: desktop/mobile snapshots retain the original session/actor/run and contain no credentials; web controls require existing operator auth and go through App validation.
+- [x] Add searchable/filterable bounded run/result history and artifact links, desktop source labels, mobile cloud results/control view and pane navigation.
+- [x] GREEN: operator-authenticated WebSocket fixtures and narrow/mobile browser tests, stale/unknown/cancel displays, API compatibility harness for old and new tools.
+- [x] Root review, final suite/clippy/fmt/boundary checks, commit; provider account certification status remains explicit.
 
 ## Commands and review gates
 
@@ -108,4 +108,10 @@ Actual source diffs are reviewed by root and a `codex exec/review` call with the
 - [x] Current source, release handoff, git state and approved review checked.
 - [x] Contracts, ownership, dependencies and six delivery units recorded.
 - [x] Dispatch three parallel owners; root integrates only after contracts are published.
-- [ ] Track per-PR code review, executed checks and commit SHAs in handoff.
+- [x] Track per-PR code review, executed checks and commit SHAs in handoff.
+
+## Final delivery — 2026-10-13
+
+- PR1 source `35e8a264`; PR6 web layer `1878a449`; output-secret regression fixes `2fdf4a4d`; internal runtime ID compatibility `1dd6d16d`; reviewed native/auth/domain/PWA integration `9d0ed76b`. Initial plan `19fa8df3`.
+- PR2–6 cross-crate principal/request/run/worker/operator contracts land atomically in the integration commit so the retained history is compilable; secret/runtime and the earlier independent web layer remain separate coherent units.
+- Final executed evidence and account-testing limits: [acceptance report](../../qa/2026-10-13-cloud-agent-management.md). All approved implementation work and root reviews are complete. No push, product release artifact or app restart was performed.

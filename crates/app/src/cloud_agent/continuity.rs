@@ -150,7 +150,8 @@ impl Recovery {
     }
     pub fn frame(&mut self, clocks: Option<ClockSample>) -> bool {
         let Some(clocks) = clocks else {
-            self.last_sample = None;
+            // A failed read cannot rule out suspend. Keep the last verified
+            // sample so the next valid frame can still detect accumulated sleep.
             return false;
         };
         let Some(last) = self.last_sample.replace(clocks) else {
@@ -214,10 +215,25 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_or_backward_clocks_reset_the_baseline_without_idle_revalidation() {
+    fn unavailable_sample_preserves_known_baseline_for_later_suspend_detection() {
         let mut recovery = Recovery::default();
         assert!(!recovery.frame(clocks(100, 50)));
         assert!(!recovery.frame(None));
+        assert!(recovery.frame(clocks(140, 51)));
+        assert!(!recovery.frame(clocks(150, 61)));
+    }
+
+    #[test]
+    fn unavailable_sample_preserves_known_baseline_without_inventing_idle_suspend() {
+        let mut recovery = Recovery::default();
+        assert!(!recovery.frame(clocks(100, 50)));
+        assert!(!recovery.frame(None));
+        assert!(!recovery.frame(clocks(220, 170)));
+    }
+
+    #[test]
+    fn backward_clocks_reset_the_baseline_without_idle_revalidation() {
+        let mut recovery = Recovery::default();
         assert!(!recovery.frame(clocks(1000, 60)));
         assert!(!recovery.frame(clocks(900, 30)));
         assert!(!recovery.frame(clocks(910, 40)));

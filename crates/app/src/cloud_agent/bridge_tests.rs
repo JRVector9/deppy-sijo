@@ -443,6 +443,84 @@ fn normal_idle_frame_gap_preserves_approved_input_and_control_lease() {
 }
 
 #[test]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+fn unavailable_frame_clock_rejects_fresh_legacy_input_before_next_sample() {
+    check_unavailable_frame_clock_rejects_fresh_input(false);
+}
+
+#[test]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+fn unavailable_frame_clock_rejects_fresh_named_input_before_next_sample() {
+    check_unavailable_frame_clock_rejects_fresh_input(true);
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+fn check_unavailable_frame_clock_rejects_fresh_input(named: bool) {
+    let (mut bridge, target) = setup();
+    let actor = if named {
+        client(&bridge, "Resume bot")
+    } else {
+        Client {
+            id: agent_mcp::LEGACY_CONNECTION_ID.into(),
+            bearer: bridge
+                .server
+                .as_ref()
+                .unwrap()
+                .auth
+                .token_for_user()
+                .as_str()
+                .into(),
+        }
+    };
+    bridge
+        .set_connection_access(&actor.id, &target, true, true)
+        .unwrap();
+    let (mut lease_request, _) = request(&bridge, &actor, "acquire_control", json!({}));
+    if !named {
+        lease_request.access_key = None;
+    }
+    bridge
+        .acquire_lease(&lease_request, &target, None, 120)
+        .unwrap();
+    bridge.observe_continuity(Some(continuity::ClockSample {
+        continuous: Duration::from_secs(100),
+        awake: Duration::from_secs(50),
+    }));
+    bridge.observe_continuity(None);
+
+    // A new request can sample valid clocks after resume, before the next App
+    // frame compares them with the pre-suspend baseline. Its own fresh sample
+    // cannot prove that the previous input approval survived sleep safely.
+    assert!(continuity::clock_sample().is_some());
+    let (mut req, rx) = request(
+        &bridge,
+        &actor,
+        "send_text",
+        json!({"session_id":target.id,"generation":target.generation,"operation_id":"fresh-after-clock-failure","text":"unexpected input"}),
+    );
+    if !named {
+        req.access_key = None;
+    }
+    let mut dispatched = 0;
+    bridge.handle_and_drain(req, |_, _| {
+        dispatched += 1;
+        Err("unexpected_input_dispatch".into())
+    });
+    let result = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(dispatched, 0, "unknown frame clocks must fence fresh input");
+    assert_eq!(result.unwrap_err(), "input_not_allowed_or_session_exited");
+    assert!(bridge.connection_permission(&actor.id, &target).read);
+    assert!(!bridge.connection_permission(&actor.id, &target).input);
+    assert!(bridge.connection_lease(&target).is_none());
+    assert!(bridge.lease_permits.is_empty());
+    bridge.observe_continuity(Some(continuity::ClockSample {
+        continuous: Duration::from_secs(140),
+        awake: Duration::from_secs(51),
+    }));
+    assert!(!bridge.connection_permission(&actor.id, &target).input);
+}
+
+#[test]
 fn auth_rotation_retires_old_named_permissions_without_exhausting_capacity() {
     let (mut bridge, _) = setup();
     let targets: Vec<_> = (0..MAX_TARGETS)

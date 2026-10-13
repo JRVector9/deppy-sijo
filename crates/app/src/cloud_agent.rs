@@ -761,9 +761,14 @@ impl CloudAgent {
         self.recovery.start(enabled && self.automatic);
     }
     fn observe_continuity(&mut self, clocks: Option<continuity::ClockSample>) {
-        if self.recovery.frame(clocks) && self.server.is_some() {
+        let resumed = self.recovery.frame(clocks);
+        let unknown =
+            cfg!(any(target_os = "macos", target_os = "linux", windows)) && clocks.is_none();
+        if (resumed || unknown) && self.server.is_some() {
+            // A fresh request may sample good clocks before the next App frame
+            // verifies the old baseline. Retire existing input consent now.
             self.take_control();
-            if let Some(tunnel) = &self.tunnel {
+            if resumed && let Some(tunnel) = &self.tunnel {
                 tunnel.revalidate();
                 self.connection = Connection::Verifying;
             }
@@ -2858,6 +2863,14 @@ mod guarded_input_tests {
     fn queued_named_input_after_resume_before_app_frame_is_rejected() {
         check_queued_input_rejection(&["client_wake_before_app"]);
     }
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    fn unavailable_frame_clock_rejects_already_queued_legacy_and_named_input() {
+        check_queued_input_rejection(&[
+            "frame_clock_unavailable",
+            "client_frame_clock_unavailable",
+        ]);
+    }
     fn check_queued_input_rejection(actions: &[&str]) {
         for &action in actions {
             let root =
@@ -3043,6 +3056,9 @@ mod guarded_input_tests {
                     }));
                 }
                 "wake_before_app" | "client_wake_before_app" => {}
+                "frame_clock_unavailable" | "client_frame_clock_unavailable" => {
+                    b.observe_continuity(None);
+                }
                 "reenable" => {
                     b.take_control();
                     b.allow_input(&t.id, true);

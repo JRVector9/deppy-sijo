@@ -1,3 +1,37 @@
+# 클라우드 관리 PR 1–6 병렬 구현 — 진행 중, 2026-10-13 (Codex)
+
+- 목표: 사용자가 보고서의 PR 1–6 구현·서브에이전트 병렬 작업·오케스트레이터 리뷰 후 커밋을 승인. 기준 `3ac1f61f`/0.12.1, 이 worktree에서 작업. 앱 재실행·푸시·제품 릴리스는 요청 없음.
+- 계획: `docs/superpowers/plans/2026-10-13-cloud-agent-management.md`. 모델은 세 작업자 모두 명시적 `gpt-6.1-sol`, effort `xhigh`, fork none. 소유권: `/root/cloud_auth` server/oauth/lib/tests; `/root/cloud_domain` management/history/history_worker; `/root/cloud_settings` cloud UI/locales/guides/new mockup; root App bridge/control/config/app integration 및 리뷰/커밋. 다른 소유 파일 수정 금지, Cargo는 root가 슬롯 직렬화.
+- 계약: `Principal {id,name,auth_kind,input_scope,authenticated_at,expires_at}`, `LEGACY_CONNECTION_ID="manual-legacy"`; OAuth/신규 bearer는 별도 인증 연결 ID, refresh 중 유지. 새 작업 영속 키는 연결별 scope, 기존 legacy operation tombstone 유지. `OperationContext {connection_id,operation_id,run_id:Option<String>,generation}`; run/cancel/status와 async history worker에 추가 변형. 제어 lease TTL 1–120초, App가 revoke한 epoch의 runtime permit을 실제 큐 입장까지 회수.
+- 완료/검증: 승인 보고서·실행 계획 기록, 분리 작업자 3개 실행. auth 소유자가 `CARGO_BUILD_JOBS=2 cargo test --locked -p agent-mcp cloud_management_` RED 실행 exit101: start_run 미존재·retryable/effect 정보 미존재·domain migration table count0vs2의 3개 실제 행동 실패. root 순수 control 상태는 타입 부재 RED 확인 후 `/private/tmp/deppy-cloud-control-harness-20261013.rs`를 rustc test로 컴파일, 4 PASS(다른 봇 권한 분리/generation fence, 동일 세션 단일 제어권/다른 세션 독립, lease 만료/회수 후 epoch 재사용 불가, 같은 봇의 다른 run 인계·read-only 차단). 아직 Cargo App 통합/최종 green 완료 아님.
+- 실패한 접근: control.rs를 직접 rustc crate root로 컴파일하면 pub(super) 경계 오류. 경로 모듈 wrapper로 테스트해 수정; standalone test에는 아직 App에서 쓸 API dead-code 경고가 있으며 최종 workspace clippy까지 완료했다고 주장하지 않음.
+- 현재 변경: 보고서/계획/handoff, 신규 cloud_agent/control.rs; 소유자 변경은 git status로 확인. 기존 `docs/mockups/active-work-visibility-2026-10-12.html` 보존. 테스트는 실 사용자 DB/터미널/토큰에 접근하지 않음.
+- 남음: auth/domain 계약 구현 완료 후 root App Request 필드·ACL/lease/run/receipt/output integration; UI PR1 red/green과 커밋; 프로필·복구, PWA 결과/명시적 관리 intents; local HTTP/PTY/browser harness 및 모델 지정 CLI 코드 리뷰; PR별 커밋·일지. 실제 제공자 계정 인증 완료와 local fixtures를 혼동하지 않음.
+- 다음 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-performance`; `cat AGENTS.md`; `head -n 30 docs/CODEX_HANDOFF.md`; `git status --short`; `cat docs/superpowers/plans/2026-10-13-cloud-agent-management.md`; live agents 상태/메시지 확인. Cargo 작업 슬롯은 root와 협의하고 workspace fmt를 병렬 수행하지 말 것.
+
+---
+
+# 0.12.1 재실행 — 2026-10-13 (Claude Code)
+
+- 버전: 0.12.0 → 0.12.1(patch, `3ac1f61f`). 변경 요약: 우클릭 메뉴 폭을 가장 긴 항목에 맞추고 행 간격 3→7pt, 모서리 2pt, Git 패널 파일 행 메뉴도 공용 스타일 사용(`5cdafd3f`).
+- 재실행(사용자 명시 요청): `cargo build -p deppy-sijo -p mcp-proxy --release` → 기존 PID 48518(0.12.0, 번들 없는 `target/release/deppy-sijo`)에 `NSRunningApplication.terminate`(quit Apple event) → 2초 내 정상 종료, force kill 없음 → `scripts/dev-run.sh --release` → PID 865, `--version` `Deppy Sijo 0.12.1`, codesign identifier `app.vector9.deppy-sijo`/Team ZDTU5LS35K, 10초 이상 유지. 번들은 만들지 않아 `CFBundleShortVersionString` 검증 대상 없음.
+- 「이어서 실행」 확인 준비: 종료 전후 `agent_sessions`(pane·kind·session 앞 8자리만 읽음) 변화 없음. `Design` pane `7b5da262`→codex `01a128ab`, `nomorevibe` pane `722c86d1`→codex `01a128ca`, 둘 다 pane 하나에만 묶임(공유 binding 아님). 시작 시 에이전트를 자동으로 띄우지 않으므로 실제로 Codex로 잇는지는 사용자가 버튼을 눌러야 확인된다.
+- 핸드오프의 Codex 2026-10-13 항목(미커밋)은 건드리지 않음.
+
+# 클라우드 에이전트 연결 기능 검토 보고서 — 2026-10-13 (Codex)
+
+- 현재 목표: dot·Meta Muse·Grok Bot 등 클라우드 에이전트 연결의 부족한 점, 우선 개선 사항, 다음 단계 업데이트를 보고. 이번 요청은 조사·보고이며 제품 구현·재실행 요청이 아니다.
+- 완료: 현재 사용 기준인 이 트리 `6bf56f53`/0.12.0의 MCP·OAuth·공유 권한·입력·화면 조회·history worker·답변 UI·PWA 경로를 검토하고 공식 제품/MCP/Cloudflare 문서와 대조. `docs/reviews/2026-10-13-cloud-agent-product-gap-review.md`에 우선순위 9항목, 이미 구현된 기반, 제공자별 미검증 범위, PR 1–6 계획과 완료 시나리오, 차기 기능을 기록.
+- 관찰: PID 48518은 127.0.0.1:8737/8739 수신. 2026-10-13 05:24 KST 읽기 전용 SQLite 집계에서 `send_text` 3건 모두 `queued`, `notify` 0건. 입력·대화·화면·토큰·fingerprint 원문은 읽지 않음. `queued`는 실행/완료 증거가 아니며 notify 부재도 작업 실패 증거가 아님. 현재 저장 모델로는 제공자별 책임과 외부 작업 완료를 알 수 없음.
+- 핵심 판단: 기존 UUID/generation fencing, 입력 권한 회수, PKCE/refresh, durable operation_id, multiline paste, 자동 터널 준비 검사, 비동기 이력 저장은 유지. 부족한 것은 연결별 주체/권한/입력 제어권, 클라우드 작업 생명주기, 과거 출력과 freshness, 접수 조회, 연결 연속성, 실제 연결 성공 표시, 작업별 결과/PWA, 제공자별 E2E 증거. `MCP 연결됨`은 실제 봇 인증 성공까지 확인하지 않음. 재시작 후 승인 해제는 의도된 정책이며 장기 사용 개선 시 묵시적으로 전체 복원하면 안 됨.
+- 수정 파일: 위 보고서와 이 handoff만. 기존 미추적 `docs/mockups/active-work-visibility-2026-10-12.html`은 건드리지 않음. 원래 `/Users/jr/Desktop/projects/deppy-sijo` 체크아웃도 변경하지 않음.
+- 검증: 소스/공식 자료 대조와 read-only runtime 메타데이터 집계 실행. `git diff --check` exit 0, 보고서 159줄·명시적 소스 앵커 10개 존재/줄 번호 검증·후행 공백 없음 확인. Cargo 테스트·제공자 계정별 E2E·입력 충돌/절전 재현·재빌드·재실행 미수행. `cargo nextest --version`은 nextest 미설치로 exit 101; 제품 테스트 실패 아님.
+- 실패/제한: 원래 worktree는 현재 실행 DB/소스와 달라 검토 기준으로 쓰지 않음. 일부 광범위 rg/read 출력이 잘려 필요한 소스 구간을 좁혀 재조회. history worker 테스트의 숫자 100을 실제 목록 한도로 해석하지 않음; 실제 이력 조회 SQL은 최근 일반 작업 500건과 보존 답변 100건. dot/Muse의 임의 MCP 등록 방식은 공식 제품 소개만으로 확인되지 않아 호환성 확정하지 않음.
+- 남은 작업: 사용자에게 보고. 이후 구현 요청 시 보고서의 PR 범위를 선택해 진행하며, 인증된 연결/권한 계약부터 고정. 실제 제공자 연결 검증과 불명확한 입력 자동 재실행 방지 시나리오가 필요. 이번 조사로 코드 수정·커밋·푸시·앱 재실행을 승인받은 것으로 간주하지 않음.
+- 다음 에이전트 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-performance`, `cat AGENTS.md`, `head -n 35 docs/CODEX_HANDOFF.md`, `git status --short`, `git diff -- docs/CODEX_HANDOFF.md`, `cat docs/reviews/2026-10-13-cloud-agent-product-gap-review.md`. 구현 테스트의 통과 여부는 해당 시점에 실제 명령을 실행한 결과로 기록.
+
+---
+
 # 0.12.0 재실행·「이어서 실행」 첫 에이전트 재개 조사 — 2026-10-12 (Claude Code)
 
 - 사용자 「재빌드하고 재실행해」. 원래 체크아웃(`feat/fleet-one-list-and-relay-wip`, 마이그레이션 38)은 실제 DB(`user_version` 50)를 forward-only 가드로 거부해 실행 불가 — DB는 건드리지 않음. 사용자 선택으로 이 트리에서 실행.

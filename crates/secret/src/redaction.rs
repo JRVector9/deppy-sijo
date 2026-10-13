@@ -13,10 +13,27 @@ const REPLACEMENT: &[u8] = b"[REDACTED]";
 const MIN_SECRET_LEN: usize = 6;
 const DEFAULT_GRACE: Duration = Duration::from_secs(30);
 const MAX_JSON_DEPTH: usize = 64;
+const MAX_WRAPPED_TEXT_BYTES: usize = 1024 * 1024;
 
 #[cfg(test)]
 thread_local! {
     static REDACT_BUFFER_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static WRAPPED_MATCH_WORK: std::cell::Cell<(usize, usize)> = const {
+        std::cell::Cell::new((0, usize::MAX))
+    };
+}
+
+#[cfg(test)]
+fn record_wrapped_work(work: usize) {
+    WRAPPED_MATCH_WORK.with(|state| {
+        let (total, budget) = state.get();
+        let total = total.saturating_add(work);
+        assert!(
+            total <= budget,
+            "wrapped matching exceeded linear work budget"
+        );
+        state.set((total, budget));
+    });
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -569,6 +586,269 @@ impl RedactionService {
             carry: Vec::new(),
         }
     }
+
+    /// Redacts complete terminal text, including secrets split by rendered CR/LF row breaks.
+    ///
+    /// Exact and ANSI-insensitive matches are retained. A second, conservative pass ignores
+    /// CR/LF in both text and patterns, but replaces only the matching original byte spans, so
+    /// unrelated rows remain intact. Matching uses the same active and grace-retired corpus as
+    /// streaming redaction. Nonempty input over 1 MiB or an unsafe corpus fails closed.
+    /// This snapshot API does not change the line-sensitive streaming API.
+    pub fn redact_wrapped_text(&self, text: &str) -> String {
+        self.redact_wrapped(text, false)
+    }
+
+    /// Redacts terminal text that may be clipped at a viewport or history-page boundary.
+    ///
+    /// In addition to complete matches, masks a leading pattern suffix, trailing pattern prefix,
+    /// or an entire fragment found inside a registered pattern. Even a one-character overlap is
+    /// ambiguous and is masked. Unmatched original text is retained; the same 1 MiB input bound
+    /// and corpus fail-closed rules as [`Self::redact_wrapped_text`] apply.
+    pub fn redact_wrapped_fragment(&self, text: &str) -> String {
+        self.redact_wrapped(text, true)
+    }
+
+    fn redact_wrapped(&self, text: &str, fragment: bool) -> String {
+        if text.is_empty() {
+            return String::new();
+        }
+        if text.len() > MAX_WRAPPED_TEXT_BYTES {
+            return String::from_utf8_lossy(REPLACEMENT).into_owned();
+        }
+        let now = self.inner.clock.now();
+        let mut patterns = self.inner.patterns.lock().expect("redaction patterns lock");
+        patterns.prune(now);
+        if patterns.fail_closed {
+            return String::from_utf8_lossy(REPLACEMENT).into_owned();
+        }
+        if patterns.entries.is_empty() {
+            return text.to_owned();
+        }
+        let buffer = text.as_bytes();
+        let (mut stripped, mut index_map) = strip_ansi_with_map(buffer);
+        // Store one maximum end per original start instead of allocating one span per match.
+        // Even a repetitive input with many overlapping patterns uses O(input length) memory.
+        let mut match_ends = vec![0; buffer.len()];
+        for pattern in &patterns.entries {
+            mark_mapped_matches(
+                &stripped,
+                &index_map,
+                pattern.bytes.as_slice(),
+                &mut match_ends,
+            );
+        }
+        let original_len = stripped.len();
+        let mut compact_len = 0;
+        for read in 0..stripped.len() {
+            if !matches!(stripped[read], b'\r' | b'\n') {
+                stripped[compact_len] = stripped[read];
+                index_map[compact_len] = index_map[read];
+                compact_len += 1;
+            }
+        }
+        stripped.truncate(compact_len);
+        index_map.truncate(compact_len);
+        let boundaries = (fragment && !stripped.is_empty())
+            .then(|| FragmentBoundaries::new(&stripped, patterns.max_len));
+        for pattern in &patterns.entries {
+            let bytes = pattern.bytes.as_slice();
+            let pattern_has_newlines = bytes.iter().any(|byte| matches!(byte, b'\r' | b'\n'));
+            if compact_len == original_len && !pattern_has_newlines && boundaries.is_none() {
+                continue;
+            }
+            let compact_pattern = if pattern_has_newlines {
+                std::borrow::Cow::Owned(
+                    bytes
+                        .iter()
+                        .copied()
+                        .filter(|byte| !matches!(byte, b'\r' | b'\n'))
+                        .collect::<Vec<_>>(),
+                )
+            } else {
+                std::borrow::Cow::Borrowed(bytes)
+            };
+            if compact_len < original_len || pattern_has_newlines {
+                mark_mapped_matches(&stripped, &index_map, &compact_pattern, &mut match_ends);
+            }
+            if let Some(boundaries) = &boundaries {
+                boundaries.mark(&compact_pattern, &index_map, &mut match_ends);
+            }
+        }
+        expand_utf8_spans(text, &mut match_ends);
+        String::from_utf8_lossy(&replace_marked_spans(buffer, &match_ends)).into_owned()
+    }
+}
+
+struct FragmentBoundaries<'a> {
+    prefix: &'a [u8],
+    prefix_table: Vec<usize>,
+    reversed_suffix: Vec<u8>,
+    suffix_table: Vec<usize>,
+}
+
+impl<'a> FragmentBoundaries<'a> {
+    fn new(text: &'a [u8], max_pattern_len: usize) -> Self {
+        // No partial match can exceed the largest registered pattern. Tables stay bounded by
+        // both the input ceiling and the corpus, and are computed once for the whole corpus.
+        let keep = text.len().min(max_pattern_len);
+        let prefix = &text[..keep];
+        let reversed_suffix = text[text.len() - keep..]
+            .iter()
+            .rev()
+            .copied()
+            .collect::<Vec<_>>();
+        Self {
+            prefix,
+            prefix_table: prefix_table(prefix),
+            suffix_table: prefix_table(&reversed_suffix),
+            reversed_suffix,
+        }
+    }
+
+    fn mark(&self, pattern: &[u8], index_map: &[usize], match_ends: &mut [usize]) {
+        let (prefix_len, contains_whole) =
+            matching_suffix(self.prefix, &self.prefix_table, pattern.iter().copied());
+        if contains_whole && self.prefix.len() == index_map.len() {
+            mark_origin_span(index_map, 0, index_map.len(), match_ends);
+            return;
+        }
+        if prefix_len > 0 {
+            mark_origin_span(index_map, 0, prefix_len, match_ends);
+        }
+        let (suffix_len, _) = matching_suffix(
+            &self.reversed_suffix,
+            &self.suffix_table,
+            pattern.iter().rev().copied(),
+        );
+        if suffix_len > 0 {
+            mark_origin_span(
+                index_map,
+                index_map.len() - suffix_len,
+                index_map.len(),
+                match_ends,
+            );
+        }
+    }
+}
+
+fn prefix_table(pattern: &[u8]) -> Vec<usize> {
+    let mut table = vec![0; pattern.len()];
+    for position in 1..pattern.len() {
+        let mut matched = table[position - 1];
+        while matched > 0 && pattern[position] != pattern[matched] {
+            matched = table[matched - 1];
+        }
+        if pattern[position] == pattern[matched] {
+            matched += 1;
+        }
+        table[position] = matched;
+    }
+    table
+}
+
+fn matching_suffix(
+    needle: &[u8],
+    table: &[usize],
+    input: impl Iterator<Item = u8>,
+) -> (usize, bool) {
+    if needle.is_empty() {
+        return (0, false);
+    }
+    let mut matched = 0;
+    let mut contains_whole = false;
+    for byte in input {
+        while matched > 0 && (matched == needle.len() || needle[matched] != byte) {
+            matched = table[matched - 1];
+        }
+        if needle[matched] == byte {
+            matched += 1;
+        }
+        contains_whole |= matched == needle.len();
+    }
+    (matched, contains_whole)
+}
+
+fn mark_origin_span(index_map: &[usize], start: usize, end: usize, match_ends: &mut [usize]) {
+    let original_start = index_map[start];
+    match_ends[original_start] = match_ends[original_start].max(index_map[end - 1] + 1);
+}
+
+fn mark_mapped_matches(text: &[u8], index_map: &[usize], pattern: &[u8], match_ends: &mut [usize]) {
+    // A registered literal-newline secret becomes empty in the compact pass. Its exact-pass
+    // match is already marked; an empty compact pattern must not create an origin span.
+    if pattern.is_empty() || text.len() < pattern.len() {
+        return;
+    }
+    // KMP retains the matched prefix after each hit, so overlapping occurrences do not restart
+    // a long window comparison. Building the table and scanning take O(pattern + text) work.
+    let table = prefix_table(pattern);
+    let mut matched = 0;
+    #[cfg(test)]
+    let mut comparisons = 3 * pattern.len(); // Prefix-table construction has a 3M upper bound.
+    for (position, &byte) in text.iter().enumerate() {
+        while matched > 0 {
+            #[cfg(test)]
+            {
+                comparisons += 1;
+            }
+            if pattern[matched] == byte {
+                break;
+            }
+            matched = table[matched - 1];
+        }
+        #[cfg(test)]
+        {
+            comparisons += 1;
+        }
+        if pattern[matched] == byte {
+            matched += 1;
+        }
+        if matched == pattern.len() {
+            let end = position + 1;
+            mark_origin_span(index_map, end - pattern.len(), end, match_ends);
+            matched = table[matched - 1];
+        }
+    }
+    #[cfg(test)]
+    record_wrapped_work(comparisons);
+}
+
+fn expand_utf8_spans(text: &str, match_ends: &mut [usize]) {
+    // A malformed ANSI escape can consume only the leading byte of a Unicode scalar. Fold
+    // byte-level matches onto original character boundaries before cutting the original text.
+    for (start, scalar) in text.char_indices() {
+        let mut end = match_ends[start];
+        for inner_end in &mut match_ends[start + 1..start + scalar.len_utf8()] {
+            end = end.max(std::mem::take(inner_end));
+        }
+        if end > start {
+            while !text.is_char_boundary(end) {
+                end += 1;
+            }
+            match_ends[start] = end;
+        }
+    }
+}
+
+fn replace_marked_spans(buffer: &[u8], match_ends: &[usize]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(buffer.len());
+    let mut cursor = 0;
+    for (start, &initial_end) in match_ends.iter().enumerate() {
+        if start < cursor || initial_end <= start {
+            continue;
+        }
+        let mut end = initial_end;
+        let mut next = start + 1;
+        while next <= end && next < match_ends.len() {
+            end = end.max(match_ends[next]);
+            next += 1;
+        }
+        out.extend_from_slice(&buffer[cursor..start]);
+        out.extend_from_slice(REPLACEMENT);
+        cursor = end;
+    }
+    out.extend_from_slice(&buffer[cursor..]);
+    out
 }
 
 fn extract_bounded_json_string_values(
@@ -1342,6 +1622,240 @@ mod tests {
         }
         out.extend(redactor.flush());
         out
+    }
+
+    #[test]
+    fn wrapped_terminal_secret_is_not_reconstructible_after_redaction() {
+        let token = "0123456789abcdef".repeat(4);
+        let service = service_with(&token);
+        let rows = token
+            .as_bytes()
+            .chunks(20)
+            .map(|row| std::str::from_utf8(row).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let snapshot = format!("unrelated heading\n{rows}\nunrelated footer");
+        let redacted = service.redact_wrapped_text(&snapshot);
+        assert!(
+            !redacted.replace(['\r', '\n'], "").contains(&token),
+            "rendered row breaks must not make a registered token reconstructible"
+        );
+        assert_eq!(redacted, "unrelated heading\n[REDACTED]\nunrelated footer");
+    }
+
+    #[test]
+    fn wrapped_text_merges_overlapping_patterns_and_self_overlaps() {
+        let service = service_with("abcdefghi");
+        service.register(&SecretString::new("defghijkl".into()));
+        assert_eq!(
+            service.redact_wrapped_text("heading\nabc\r\ndef\nghi\r\njkl\nfooter"),
+            "heading\n[REDACTED]\nfooter"
+        );
+        assert_eq!(
+            service_with("abcabc").redact_wrapped_text("before\nab\ncab\ncabc\nafter"),
+            "before\n[REDACTED]\nafter"
+        );
+    }
+
+    #[test]
+    fn wrapped_text_preserves_unrelated_unicode_rows_and_uses_ansi_mapping() {
+        let service = service_with("비밀🔒token");
+        assert_eq!(
+            service.redact_wrapped_text("상태\n비\x1b[31m밀\r\n🔒\x1b[0mto\nken\n결과"),
+            "상태\n[REDACTED]\n결과"
+        );
+        let unrelated = "상태\r\n\x1b[31mno secret here\x1b[0m\n결과\n";
+        assert_eq!(service.redact_wrapped_text(unrelated), unrelated);
+    }
+
+    #[test]
+    fn wrapped_text_retains_exact_patterns_with_literal_newlines() {
+        let service = service_with("abc\ndef");
+        for text in ["first\nabc\ndef\nlast", "first\na\nbc\r\nde\nf\nlast"] {
+            assert_eq!(service.redact_wrapped_text(text), "first\n[REDACTED]\nlast");
+        }
+    }
+
+    #[test]
+    fn wrapped_review_compacted_literal_newline_secret_inside_single_line_is_redacted() {
+        let service = service_with("abc\ndef");
+        assert_eq!(
+            service.redact_wrapped_text("before abcdef after"),
+            "before [REDACTED] after"
+        );
+        assert_eq!(
+            service.redact_wrapped_fragment("before abcdef after"),
+            "before [REDACTED] after"
+        );
+    }
+
+    #[test]
+    fn wrapped_review_production_overlap_corpus_stays_within_linear_matching_work() {
+        let service = RedactionService::new();
+        for length in 32_719..=32_768 {
+            service
+                .register_permanent(&SecretString::new("a".repeat(length)))
+                .unwrap();
+        }
+        let stats = service.corpus_stats();
+        assert!(stats.items <= RedactionCorpusLimits::PRODUCTION.max_items);
+        assert!(stats.bytes <= RedactionCorpusLimits::PRODUCTION.max_bytes);
+        let text = "a".repeat(MAX_WRAPPED_TEXT_BYTES);
+        let budget = 8 * (text.len() * stats.items + stats.bytes);
+        WRAPPED_MATCH_WORK.with(|state| state.set((0, budget)));
+        assert_eq!(service.redact_wrapped_text(&text), "[REDACTED]");
+        WRAPPED_MATCH_WORK.with(|state| state.set((0, usize::MAX)));
+    }
+
+    #[test]
+    fn wrapped_text_newline_only_patterns_are_safe_and_exact_matches_remain_redacted() {
+        for pattern in ["\n".repeat(6), "\r".repeat(6), "\r\n".repeat(3)] {
+            let service = service_with(&pattern);
+            assert_eq!(
+                service.redact_wrapped_text(&format!("before{pattern}after")),
+                "before[REDACTED]after"
+            );
+            for text in ["before\nmiddle\r\nafter", "\n", "\r\n", ""] {
+                assert_eq!(service.redact_wrapped_text(text), text);
+            }
+        }
+    }
+
+    #[test]
+    fn wrapped_fragment_two_pages_cannot_reconstruct_a_registered_secret() {
+        let token = "0123456789abcdef".repeat(4);
+        let service = service_with(&token);
+        let older = format!("{}\n{}", &token[..20], &token[20..40]);
+        let newer = format!("{}\n{}", &token[40..60], &token[60..]);
+        let joined = format!(
+            "{}{}",
+            service.redact_wrapped_fragment(&older),
+            service.redact_wrapped_fragment(&newer)
+        )
+        .replace(['\r', '\n'], "");
+        assert!(
+            !joined.contains(&token),
+            "separate pages exposed the whole token"
+        );
+        assert_eq!(service.redact_wrapped_fragment(&older), "[REDACTED]");
+        assert_eq!(service.redact_wrapped_fragment(&newer), "[REDACTED]");
+    }
+
+    #[test]
+    fn wrapped_fragment_covers_middle_pages_and_tiny_fragments() {
+        let token = format!("begin-{}-end", "0123456789abcdef".repeat(8));
+        let service = service_with(&token);
+        let pages = token.as_bytes().chunks(32).collect::<Vec<_>>();
+        assert!(pages.len() >= 3);
+        for page in pages {
+            let wrapped = page
+                .chunks(16)
+                .map(|row| std::str::from_utf8(row).unwrap())
+                .collect::<Vec<_>>()
+                .join("\r\n");
+            assert_eq!(service.redact_wrapped_fragment(&wrapped), "[REDACTED]");
+        }
+        for fragment in ["b", "e", "0", "-"] {
+            assert_eq!(service.redact_wrapped_fragment(fragment), "[REDACTED]");
+        }
+    }
+
+    #[test]
+    fn wrapped_fragment_unicode_ansi_edges_preserve_unrelated_rows() {
+        let service = service_with("비밀🔒token-result");
+        assert_eq!(
+            service.redact_wrapped_fragment("상태\n비\x1b[31m밀\r\n🔒\x1b[0mtoken-"),
+            "상태\n[REDACTED]"
+        );
+        assert_eq!(
+            service.redact_wrapped_fragment("result\n끝"),
+            "[REDACTED]\n끝"
+        );
+        for fragment in ["비", "🔒", "t"] {
+            assert_eq!(service.redact_wrapped_fragment(fragment), "[REDACTED]");
+        }
+        let unrelated = "상태\r\n! no secret here !\n끝";
+        assert_eq!(service.redact_wrapped_fragment(unrelated), unrelated);
+    }
+
+    #[test]
+    fn wrapped_fragment_malformed_ansi_never_splits_original_unicode_scalars() {
+        for (secret, fragment) in [("zzzzé", "\x1bé"), ("aaaaあ", "\x1b€")] {
+            let service = service_with(secret);
+            assert_eq!(service.redact_wrapped_fragment(fragment), "\x1b[REDACTED]");
+            assert_eq!(service.redact_wrapped_text(fragment), fragment);
+            let unrelated = "\x1bö unrelated\nfinal!";
+            assert_eq!(service.redact_wrapped_fragment(unrelated), unrelated);
+        }
+    }
+
+    #[test]
+    fn wrapped_text_matches_registered_encoded_variants() {
+        let secret = "비밀 +token\"";
+        let service = service_with(secret);
+        for variant in [
+            base64_encode(secret.as_bytes()),
+            url_encode(secret.as_bytes(), false),
+            form_encode(secret.as_bytes(), true, false, false),
+            json_escape_unicode(secret, false),
+        ] {
+            let wrapped = variant
+                .as_bytes()
+                .chunks(4)
+                .map(|row| std::str::from_utf8(row).unwrap())
+                .collect::<Vec<_>>()
+                .join("\r\n");
+            assert_eq!(
+                service.redact_wrapped_text(&format!("before\n{wrapped}\nafter")),
+                "before\n[REDACTED]\nafter"
+            );
+        }
+    }
+
+    #[test]
+    fn wrapped_text_uses_active_and_retired_leases_and_fails_closed() {
+        let (service, clock) = bounded_service(256, 256 * 1024, Duration::from_secs(10));
+        let secret = SecretString::new("rotating-secret-token".into());
+        let lease = service.acquire_rotating(&secret).unwrap();
+        let text = "before\nrotating-\r\nsecret-token\nafter";
+        assert_eq!(
+            service.redact_wrapped_text(text),
+            "before\n[REDACTED]\nafter"
+        );
+        drop(lease);
+        assert_eq!(
+            service.redact_wrapped_text(text),
+            "before\n[REDACTED]\nafter"
+        );
+        clock.advance(Duration::from_secs(10));
+        assert_eq!(service.redact_wrapped_text(text), text);
+        assert_eq!(service.corpus_stats(), RedactionCorpusStats::default());
+
+        let (unsafe_service, _) = bounded_service(1, 4_096, Duration::ZERO);
+        unsafe_service.register(&SecretString::new("unprotectable-corpus-secret".into()));
+        assert_eq!(
+            unsafe_service.redact_wrapped_text("unrelated\ntext"),
+            "[REDACTED]"
+        );
+        assert!(unsafe_service.redact_wrapped_text("").is_empty());
+    }
+
+    #[test]
+    fn wrapped_text_input_limit_fails_closed_without_changing_normal_streams() {
+        let service = RedactionService::new();
+        let exact = "x".repeat(MAX_WRAPPED_TEXT_BYTES);
+        assert_eq!(service.redact_wrapped_text(&exact), exact);
+        assert_eq!(service.redact_wrapped_text(&(exact + "x")), "[REDACTED]");
+
+        let service = service_with("wrap-secret-token");
+        assert_eq!(
+            redact_all(&mut service.stream_redactor(), &[b"wrap-secret-\ntoken"]),
+            b"wrap-secret-\ntoken"
+        );
+        assert_eq!(
+            redact_all(&mut service.stream_redactor(), &[b"wrap-secret-", b"token"]),
+            REPLACEMENT
+        );
     }
 
     #[test]

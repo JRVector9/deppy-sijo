@@ -1,5 +1,15 @@
 //! Settings leaf: captures intents and edits in-memory consent; no network or disk effects.
 use super::{Action, CloudAgent};
+
+const CLOUD_AGENT_INSTRUCTIONS: &str = concat!(
+    "Use Deppy's MCP connector. First call list_sessions and keep the exact original session_id/generation for every call, even when Deppy's active tab changes. ",
+    "Read the selected session with read_output; its cached screen may be stale, and a quiet screen or screen:null does not prove completion. Respect retry_after_ms and cursor/reset. ",
+    "Do not send terminal input unless input_allowed is true. Use send_text for a single line without controls (maximum 8192 UTF-8 bytes); submit=false only types and submit=true sends Enter. ",
+    "Use paste_text for multiline text or tabs only when paste_bracketed and paste_ai_confirmed are true. Its maximum is 32768 UTF-8 bytes; serialized arguments and the complete HTTP JSON body each have a 65536-byte limit, so JSON escaping can reject earlier. LF/CRLF and tabs are allowed with verified bracketed paste; standalone CR, ESC and other controls are rejected. submit defaults false; true admits the body and one separate Enter together. Respect existing AI drafts/dialogs and no-effect rejections; never bypass them. ",
+    "Use send_ctrl_c only for an explicitly authorized interrupt. Use a unique operation_id per action; retry the exact same tool and arguments only with the same operation_id. A queued receipt confirms PTY queue admission, not command execution or task completion. If delivery is unknown, do not automatically replay input or create a new ID. ",
+    "After every completed analysis/task, call notify with YOUR OWN complete final answer (maximum 16384 UTF-8 bytes), including when no terminal input was sent. A stored receipt confirms the answer was saved. Keep the original session_id/generation for this answer. Limits count UTF-8 bytes, not characters."
+);
+
 impl CloudAgent {
     pub fn contents(&mut self, ui: &mut egui::Ui, catalog: &i18n::Catalog) {
         ui.heading(catalog.t("cloud.title", &[]));
@@ -39,19 +49,37 @@ impl CloudAgent {
             ))
             .weak(),
         );
+        if let Some(server) = &self.server {
+            ui.label(catalog.t(
+                "cloud.local_ready",
+                &[("port", &server.addr.port().to_string())],
+            ));
+        }
         if running {
             let key = match self.connection {
                 super::Connection::Preparing => "cloud.preparing",
                 super::Connection::Verifying => "cloud.verifying",
                 super::Connection::Stopping => "cloud.stopping",
-                _ => "cloud.ready",
+                super::Connection::Ready if self.automatic && self.generated_hostname.is_some() => {
+                    "cloud.ready"
+                }
+                _ if !self.automatic && !self.hostname.trim().is_empty() => {
+                    "cloud.manual_unverified"
+                }
+                _ => "cloud.local_only",
             };
             ui.horizontal(|ui| {
-                if !self.ready() {
+                if matches!(
+                    self.connection,
+                    super::Connection::Preparing
+                        | super::Connection::Verifying
+                        | super::Connection::Stopping
+                ) {
                     ui.spinner();
                 }
                 ui.label(catalog.t(key, &[]));
             });
+            ui.weak(catalog.t("cloud.client_setup_hint", &[]));
         }
         ui.horizontal(|ui| {
             if ui
@@ -75,15 +103,33 @@ impl CloudAgent {
                 self.take_control();
             }
         });
-        if let (Some(s), Some(endpoint)) = (&self.server, self.endpoint()) {
+        let connector_endpoint = self.endpoint().filter(|endpoint| {
+            !self.automatic
+                || (endpoint.starts_with("https://")
+                    && self.connection == super::Connection::Ready
+                    && self.generated_hostname.is_some())
+        });
+        if let (Some(s), Some(endpoint)) = (&self.server, connector_endpoint) {
+            let public = endpoint.starts_with("https://");
             ui.horizontal(|ui| {
+                ui.label(catalog.t(
+                    if public {
+                        "cloud.public_url"
+                    } else {
+                        "cloud.local_url"
+                    },
+                    &[],
+                ));
                 ui.monospace(&endpoint);
                 if ui.button(catalog.t("cloud.copy_url", &[])).clicked() {
                     ui.ctx().copy_text(endpoint);
                 }
             });
-            if !self.automatic {
-                ui.label(egui::RichText::new(format!("http://{}/mcp", s.addr)).weak());
+            if !self.automatic && public {
+                ui.horizontal(|ui| {
+                    ui.weak(catalog.t("cloud.local_url", &[]));
+                    ui.weak(format!("http://{}/mcp", s.addr));
+                });
             }
             ui.label(
                 catalog.t(
@@ -229,7 +275,7 @@ impl CloudAgent {
             .button(catalog.t("cloud.copy_instruction", &[]))
             .clicked()
         {
-            ui.ctx().copy_text("Use Deppy's MCP connector. First call list_sessions and use the exact session_id and generation. Read the selected session with read_output. Do not type unless input_allowed is true. send_text submit=false only types; submit=true sends Enter. Use one unique operation_id per action and reuse it only for the same action; never retry unknown input with a new ID. After every completed analysis/task, call notify with YOUR OWN complete final answer, including when no terminal command was sent. Keep the original session_id/generation even when Deppy's active tab changes.".into());
+            ui.ctx().copy_text(CLOUD_AGENT_INSTRUCTIONS.into());
         }
         ui.label(catalog.t("cloud.answer_hint", &[]));
         ui.heading(catalog.t("cloud.history", &[]));
@@ -289,6 +335,146 @@ impl CloudAgent {
 mod tests {
     use super::*;
     use egui_kittest::kittest::Queryable as _;
+    #[test]
+    fn setup_state_local_listener_does_not_claim_public_or_client_connection() {
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        let mut bridge = CloudAgent::memory();
+        bridge.server =
+            Some(agent_mcp::Server::start(0, "starting.trycloudflare.com", || {}).unwrap());
+        let local = format!(
+            "Local MCP server ready · 127.0.0.1:{}",
+            bridge.server.as_ref().unwrap().addr.port()
+        );
+        bridge.connection = super::super::Connection::Verifying;
+        let harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1400.0, 1000.0))
+            .build_ui_state(
+                move |ui, state: &mut CloudAgent| state.contents(ui, &catalog),
+                bridge,
+            );
+        assert!(harness.query_by_label(&local).is_some());
+        assert!(harness.query_by_label("Verifying public URL…").is_some());
+        assert!(harness.query_by_label("Public MCP URL verified").is_none());
+        assert!(harness.query_by_label("MCP connected").is_none());
+        assert!(harness.query_by_label("Copy URL").is_none());
+    }
+    #[test]
+    fn setup_state_public_readiness_keeps_client_registration_separate() {
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        let mut bridge = CloudAgent::memory();
+        bridge.server =
+            Some(agent_mcp::Server::start(0, "ready.trycloudflare.com", || {}).unwrap());
+        bridge.generated_hostname = Some("ready.trycloudflare.com".into());
+        bridge.connection = super::super::Connection::Ready;
+        let harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1400.0, 1000.0))
+            .build_ui_state(
+                move |ui, state: &mut CloudAgent| state.contents(ui, &catalog),
+                bridge,
+            );
+        assert!(harness.query_by_label("Public MCP URL verified").is_some());
+        assert!(
+            harness
+                .query_by_label("Server readiness does not confirm a bot connection. Register the URL in your connector, authenticate, then call list_sessions.")
+                .is_some()
+        );
+        assert!(
+            harness
+                .query_by_label("https://ready.trycloudflare.com/mcp")
+                .is_some()
+        );
+        assert!(harness.query_by_label("Copy URL").is_some());
+        assert!(harness.query_by_label("MCP connected").is_none());
+    }
+    #[test]
+    fn setup_state_manual_endpoint_does_not_claim_public_verification() {
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        let mut bridge = CloudAgent::memory();
+        bridge.automatic = false;
+        bridge.hostname = "deppy.example.com".into();
+        bridge.server = Some(agent_mcp::Server::start(0, &bridge.hostname, || {}).unwrap());
+        bridge.connection = super::super::Connection::Ready;
+        let harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1400.0, 1000.0))
+            .build_ui_state(
+                move |ui, state: &mut CloudAgent| state.contents(ui, &catalog),
+                bridge,
+            );
+        assert!(
+            harness
+                .query_by_label("Fixed public URL configured · check your tunnel and connector")
+                .is_some()
+        );
+        assert!(harness.query_by_label("Public MCP URL verified").is_none());
+        assert!(
+            harness
+                .query_by_label("https://deppy.example.com/mcp")
+                .is_some()
+        );
+    }
+    #[test]
+    fn setup_state_manual_local_only_preserves_local_url_and_token_controls() {
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        let mut bridge = CloudAgent::memory();
+        bridge.automatic = false;
+        bridge.server = Some(agent_mcp::Server::start(0, "", || {}).unwrap());
+        bridge.connection = super::super::Connection::Ready;
+        let local = format!("http://{}/mcp", bridge.server.as_ref().unwrap().addr);
+        let harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1400.0, 1000.0))
+            .build_ui_state(
+                move |ui, state: &mut CloudAgent| state.contents(ui, &catalog),
+                bridge,
+            );
+        assert!(harness.query_by_label("Local URL").is_some());
+        assert!(harness.query_by_label(&local).is_some());
+        assert!(harness.query_by_label("Copy URL").is_some());
+        assert!(harness.query_by_label("Copy token").is_some());
+        assert!(harness.query_by_label("Connector URL").is_none());
+        assert!(harness.query_by_label("Public MCP URL verified").is_none());
+    }
+    #[test]
+    fn setup_state_copy_instruction_delivers_multiline_bounds_and_receipt_contract() {
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        let button = catalog.t("cloud.copy_instruction", &[]);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1400.0, 1000.0))
+            .build_ui_state(
+                move |ui, state: &mut (CloudAgent, Option<String>)| {
+                    state.0.contents(ui, &catalog);
+                    ui.ctx().output(|output| {
+                        for command in &output.commands {
+                            if let egui::OutputCommand::CopyText(text) = command {
+                                state.1 = Some(text.clone());
+                            }
+                        }
+                    });
+                },
+                (CloudAgent::memory(), None),
+            );
+        harness.get_by_label(&button).click();
+        harness.run();
+        let copied = harness.state().1.as_ref().expect("instruction copied");
+        for contract in [
+            "paste_text",
+            "UTF-8 bytes",
+            "8192",
+            "32768",
+            "16384",
+            "65536",
+            "same operation_id",
+            "queued",
+            "stored",
+            "unknown",
+            "notify",
+            "original session_id/generation",
+        ] {
+            assert!(
+                copied.contains(contract),
+                "missing copied contract: {contract}"
+            );
+        }
+    }
     #[test]
     fn shared_rows_show_session_agent_model_and_effort_with_shell_fallback() {
         let catalog = i18n::Catalog::load("ko-KR").unwrap();

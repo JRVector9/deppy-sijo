@@ -9,6 +9,10 @@
 - 남음: auth/domain 계약 구현 완료 후 root App Request 필드·ACL/lease/run/receipt/output integration; UI PR1 red/green과 커밋; 프로필·복구, PWA 결과/명시적 관리 intents; local HTTP/PTY/browser harness 및 모델 지정 CLI 코드 리뷰; PR별 커밋·일지. 실제 제공자 계정 인증 완료와 local fixtures를 혼동하지 않음.
 - 다음 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-performance`; `cat AGENTS.md`; `head -n 30 docs/CODEX_HANDOFF.md`; `git status --short`; `cat docs/superpowers/plans/2026-10-13-cloud-agent-management.md`; live agents 상태/메시지 확인. Cargo 작업 슬롯은 root와 협의하고 workspace fmt를 병렬 수행하지 말 것.
 
+- 단계 갱신(09:30 KST): auth 최종 `CARGO_BUILD_JOBS=2 cargo test --locked -p agent-mcp` 실제 57 PASS/1 ignored. domain focused history 11 PASS/1 ignored, management 7 PASS; exact GetRun beyond100 RED→GREEN. UI PR1 `setup_state_` 실제 compile 성공 뒤 0 PASS/4 FAIL(표시 3개 및 copied instruction paste_text 누락), GREEN 작업 중. PWA 작업자 gpt-6.1-sol/xhigh 추가, web-remote/shared frontend/relay shell 소유; generation String 계약. domain는 신규 App management.rs async run/receipt helper로 재배정, root controller/control/output/config/app 독점 유지. Cargo UI→PWA 순서, root 독립 auth/domain CLI 소스 리뷰 실행 중(최종 결과 아직 없음). mockup 실제 Chrome 1440/900/390 검사 overflow/JS error 없음, 실 계정 검증은 아님.
+
+- PR1 완료: UI 실제 RED 0/4 → GREEN11 PASS(추가 manual-local URL 숨김 회귀 RED0/1→GREEN 포함), i18n8 PASS. HTML Chrome 1440/900/390 overflow/JS 오류 없음. Root 실제 source diff 대조 + `codex exec -m gpt-6.1-sol -c model_reasoning_effort=xhigh --sandbox read-only` 독립 PR1 리뷰 완료, concrete defects 없음(`/private/tmp/deppy-cloud-pr1-review-20261013.txt`). 첫 기능 커밋은 PR1 소유 파일만, Record additive fixture4필드는 index에서 제외. 연결관리/run/profile UI 후속은 동일 소유자에게 재배정. PWA 실제 Rust RED40 missing API → GREEN5 PASS, 모바일22→24 checks와 Relay Node16 PASS. History targeted receipt 실제RED1 FAIL(다른 pane 권한으로 원본receipt조회) 후 production수정대기. App management RED 첫 compile는 새 Effect::History test match2누락으로blocked, root수정후재실행중; 행동RED로 주장하지 않음.
+
 ---
 
 # 0.12.1 재실행 — 2026-10-13 (Claude Code)

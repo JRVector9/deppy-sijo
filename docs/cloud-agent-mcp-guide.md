@@ -1,6 +1,6 @@
-# Grok와 Cloud Agent의 Deppy 세션 사용
+# 클라우드 에이전트의 Deppy 세션 사용
 
-Deppy에서 사용자가 공유한 원래 터미널 세션의 입력과 출력을 사용한다. Grok bot과 Cloud Agent는 자신의 최종 답변을 `notify`로 그 세션에 남긴다. 답변은 해당 세션의 로컬 이력과 알림 센터에 저장된다. 터미널 stdin에 답변을 쓰지 않는다.
+Deppy에서 사용자가 공유한 원래 터미널 세션의 입력과 출력을 사용한다. 연결한 에이전트는 자신의 최종 답변을 `notify`로 그 세션에 남긴다. 답변은 해당 세션의 로컬 이력과 알림 센터에 저장된다. 터미널 stdin에 답변을 쓰지 않는다. 설정의 **에이전트 작업 지시문 복사**는 이 계약을 공통 지시문으로 제공한다. 제공자별 실제 계정 인증 상태는 [연결 안내의 호환성 표](cloud-agent-mcp.md#제공자-호환성과-실제-계정-검증)를 확인한다.
 
 1. `list_sessions`에서 공유된 `session_id`와 `generation`을 보관한다. `input_allowed`는 사용자 입력 허용과 OAuth 입력 범위를 함께 반영한다. `paste_bracketed`는 현재 관측한 DEC 2004 모드이며, `paste_ai_confirmed`는 AI 실행 정체성이 확보되어 있는지 보여준다. 이 값들은 관측값이다. 입력 시 다시 검사한다.
 2. `read_output`으로 최근 관측된 화면을 읽는다. `lossless:false`, `may_be_stale:true`를 고려한다. `screen:null`은 캐시가 같다는 뜻이다. 새 출력이 없다는 증거나 턴 완료 신호가 아니다. `retry_after_ms` 뒤 다시 읽고 반환된 cursor를 사용할 수 있다. 신뢰할 수 있는 턴 완료 경계나 stdout 전체 로그를 제공하지 않는다.
@@ -36,7 +36,7 @@ Deppy에서 사용자가 공유한 원래 터미널 세션의 입력과 출력�
     "session_id": "<원래 UUID>",
     "generation": "<원래 generation>",
     "operation_id": "<답변 저장 작업의 고유 ID>",
-    "message": "Grok 또는 Cloud Agent가 직접 작성한 최종 답변"
+    "message": "연결한 에이전트가 직접 작성한 최종 답변"
   }
 }
 ```

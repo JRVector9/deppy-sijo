@@ -43,10 +43,10 @@ No owner edits another owner's file without root's explicit handoff. `lib.rs` mo
 
 ## PR 1 — setup state and guidance
 
-- [ ] Test that starting a local listener never labels a provider authenticated; automatic public readiness and client activity are separate.
-- [ ] Use native shared UI components and add `paste_text`/byte limits/receipt rules to the common copied instruction.
-- [ ] Describe automatic URL default and stable manual endpoints; record provider compatibility matrix with actual evidence status.
-- [ ] Root review, targeted UI test + i18n checks, commit.
+- [x] Test that starting a local listener never labels a provider authenticated; automatic public readiness and client activity are separate.
+- [x] Use native shared UI components and add `paste_text`/byte limits/receipt rules to the common copied instruction.
+- [x] Describe automatic URL default and stable manual endpoints; record provider compatibility matrix with actual evidence status.
+- [x] Root review, targeted UI test + i18n checks, commit.
 
 ## PR 2 — connection identity, permissions and control
 
@@ -107,5 +107,5 @@ Actual source diffs are reviewed by root and a `codex exec/review` call with the
 
 - [x] Current source, release handoff, git state and approved review checked.
 - [x] Contracts, ownership, dependencies and six delivery units recorded.
-- [ ] Dispatch three parallel owners; root integrates only after contracts are published.
+- [x] Dispatch three parallel owners; root integrates only after contracts are published.
 - [ ] Track per-PR code review, executed checks and commit SHAs in handoff.

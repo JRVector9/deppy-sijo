@@ -4,16 +4,19 @@
 
 1. **설정 → 클라우드 에이전트**를 엽니다.
 2. 기본 로컬 포트는 `8739`입니다. 모바일 웹 기능과 독립된 포트입니다.
-3. 공개 터널의 HTTPS 호스트를 입력합니다. `deppy.example.com` 또는 `mac.example.ts.net:8443`처럼 **호스트와 선택적 포트만** 입력합니다.
-4. **MCP 연결 켜기**를 누릅니다. 서버는 `127.0.0.1`에서만 수신합니다.
+3. 기본 선택인 **자동 주소 생성**을 사용합니다. 배포 앱에 포함된 연결 도우미가 임시 HTTPS 주소를 만들므로 별도 터널 설치나 계정이 필요하지 않습니다. 도우미가 없는 개발 빌드는 고정 주소를 직접 연결하거나 도우미가 포함된 앱을 사용합니다.
+4. **MCP 서버 켜기**를 누릅니다. 서버는 `127.0.0.1`에서만 수신합니다. **로컬 MCP 서버 준비**와 **공개 MCP 주소 확인됨**은 서버·주소 준비 상태이며 봇의 인증이나 도구 호출 성공을 뜻하지 않습니다.
 5. 원하는 세션에 **읽기 · 답변 수신**을 켭니다. 다른 워크스페이스의 세션도 개별 선택할 수 있습니다.
-6. **주소 복사**로 커넥터를 등록합니다. OAuth 커넥터는 Mac의 이 설정 화면에서 승인합니다. Bearer 커넥터는 **토큰 복사**를 사용합니다. 입력이 필요하면 그 세션의 **입력 허용**도 켭니다.
+6. **주소 복사**로 봇의 MCP 커넥터에 `/mcp` 주소를 등록합니다. OAuth 커넥터는 Mac의 이 설정 화면에서 승인합니다. Bearer 커넥터는 **토큰 복사**를 사용합니다. 입력이 필요하면 그 세션의 **입력 허용**도 켭니다.
+7. 봇에게 `list_sessions`를 호출하도록 요청하고 선택한 세션이 반환되는지 확인합니다. URL 등록, 인증, 도구 호출은 공개 주소 준비와 별개의 단계입니다. 초기 확인을 위해 터미널에 시험 명령을 보낼 필요는 없습니다.
 
-포트와 공개 호스트만 설정에 저장합니다. 서버, 토큰, 공유·입력 권한은 앱 재시작 시 자동으로 켜지지 않습니다. 토큰은 24시간 뒤 만료되고, 연결 끄기나 토큰 재발급으로 즉시 폐기됩니다. 재발급하면 입력 권한도 해제됩니다.
+포트·공개 호스트·주소 방식만 설정에 저장합니다. 서버, 토큰, 공유·입력 권한은 앱 재시작 시 자동으로 켜지지 않습니다. 토큰은 24시간 뒤 만료되고, 연결 끄기나 토큰 재발급으로 즉시 폐기됩니다. 재발급하면 입력 권한도 해제됩니다.
 
 ## HTTPS 터널
 
-공개 URL이 있어야 클라우드에서 로컬 Mac으로 접속할 수 있습니다. Deppy는 터널이나 클라우드 서버를 자동으로 설치·배포하지 않습니다. 아래 둘 중 하나만 구성하세요.
+공개 URL이 있어야 클라우드에서 로컬 Mac으로 접속할 수 있습니다. 기본 자동 모드는 포함된 도우미로 Cloudflare Quick Tunnel을 관리합니다. 임시 주소는 다시 연결하면 바뀔 수 있으므로 커넥터 URL도 갱신해야 합니다. Quick Tunnel은 가동 시간을 보장하지 않고 SSE를 지원하지 않습니다. 현재 Deppy의 POST JSON 응답에는 SSE가 필요하지 않습니다. [Cloudflare Quick Tunnel 안내](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/)
+
+같은 주소를 계속 사용하려면 **고정 주소 직접 연결**을 선택합니다. `deppy.example.com` 또는 `mac.example.ts.net:8443`처럼 **호스트와 선택적 포트만** 입력하고 아래 방법 중 하나로 HTTPS 터널을 별도로 구성합니다. 이 모드에서 서버 시작은 로컬 수신만 확인합니다. 공개 터널의 도달 여부와 실제 커넥터 등록은 사용자가 확인해야 합니다. 고정 주소만으로 Mac의 잠자기·앱 종료를 해결하지는 않습니다.
 
 ### Cloudflare named Tunnel
 
@@ -28,7 +31,7 @@ ingress:
 
 Deppy의 공개 호스트는 `deppy.example.com`, 커넥터 주소는 `https://deppy.example.com/mcp`입니다. 브라우저 로그인 페이지를 요구하는 Cloudflare Access 정책은 봇의 Bearer 인증과 별도로 호환되는지 확인해야 합니다. [공식 Tunnel 안내](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/)
 
-개발용 Quick Tunnel은 URL이 바뀌므로 반복 사용에는 named Tunnel을 권장합니다. 이 구현은 POST JSON 응답을 사용하며 SSE를 요구하지 않습니다.
+Named Tunnel의 공개 호스트와 Deppy에 입력한 호스트를 일치시킵니다. 이 구현은 POST JSON 응답을 사용하며 SSE를 요구하지 않습니다.
 
 ### Tailscale Funnel
 
@@ -55,7 +58,7 @@ MCP 주소는 `/mcp`입니다. 커넥터는 401의 `WWW-Authenticate`에서 보�
 
 지원 흐름은 공개 클라이언트 동적 등록(DCR), authorization-code/S256, refresh-token, 정확한 redirect/resource 결합입니다. Client ID Metadata Documents, 기밀 클라이언트의 client-secret 인증, 브라우저 CORS 클라이언트는 지원하지 않습니다. [MCP 인증 규격](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization)
 
-## 그록봇 등록과 자체 답변 받기
+## 커넥터 등록과 에이전트 자체 답변 받기
 
 Bearer 헤더를 지원하는 MCP 커넥터에 URL을 등록하고 인증을 다음 형태로 설정합니다.
 
@@ -65,7 +68,7 @@ Authorization: Bearer <Deppy에서 복사한 토큰>
 
 Grok 웹의 Custom MCP 등록 경로는 [공식 커넥터 안내](https://docs.x.ai/grok/connectors)를 참고하세요. Grok 웹의 지원 여부와 사용 중인 Grok Bot의 커넥터 기능은 따로 확인해야 합니다. OAuth 커넥터는 아래 승인 흐름을 사용합니다. 실제 Grok Bot 계정 등록은 해당 계정과 공개 터널에서 별도로 확인해야 합니다.
 
-Deppy의 **그록봇 작업 지시문 복사**를 눌러 봇의 지시문/스킬에 붙여넣습니다. 핵심 지시:
+Deppy의 **에이전트 작업 지시문 복사**를 눌러 봇의 지시문/스킬에 붙여넣습니다. 복사문은 `send_text`와 `paste_text` 선택, UTF-8 바이트 한도, 동일 작업 수신증 처리, 원래 세션으로의 `notify` 반환을 함께 안내합니다. 핵심 지시:
 
 > 세션 목록에서 선택한 session_id와 generation을 유지한다. 작업 또는 분석을 마칠 때, 터미널 명령을 보내지 않았더라도 자신의 최종 답변 전체를 notify 도구로 Deppy에 보낸다.
 
@@ -111,7 +114,22 @@ Grok bot과 Cloud Agent 모두 같은 흐름을 사용합니다. [명시적 붙�
 
 Mac이나 Deppy가 꺼져 있으면 연결은 실패합니다. 봇은 나중에 다시 연결할 수 있으나 새 토큰 등록과 공유 선택이 필요합니다. Mac 종료 중 보낸 답변을 중계 서버에 보관하지 않습니다.
 
-## 검증
+## 제공자 호환성과 실제 계정 검증
+
+2026-10-13 기준으로 **아래 제공자의 실제 계정과 Deppy 연결의 호환성은 모두 미검증**입니다. 공식 기능 설명, 로컬 자동화 테스트, 실제 제공자 계정 연결 증거를 구분합니다. 서비스 이름은 OpenAI dot, Meta Muse, Grok Bot으로 해석했습니다. 동명 서비스는 별도 확인이 필요합니다.
+
+| 제공자 | 공식 자료에서 확인한 범위 | 실제 계정 연결 검증 상태 | 실제 계정에서 확인할 항목 |
+| --- | --- | --- | --- |
+| OpenAI dot | 클라우드 컴퓨터·연결 앱·작업 사용 | 미검증 · 임의 Deppy MCP 등록 경로 미확인 | 커넥터 등록, 인증 방식, 권한, 갱신, `notify` 반환 |
+| Meta Muse | 자체 VM·브라우저·연결 앱·장기 작업 | 미검증 · 임의 Deppy MCP 등록 경로 미확인 | 공개 MCP 등록 가능 여부, 인증 정책, 도구 호출, 결과 반환 |
+| Grok Bot | MCP 서버·플러그인·스킬 지원 | 미검증 · Deppy 실제 계정 테스트 미실행 | URL 등록, OAuth 또는 Bearer, 갱신, multiline, `notify`, 재연결 |
+| Grok 웹 Custom MCP | 공개 MCP URL 등록과 인증 흐름 | 미검증 · Grok Bot과 별도 제품 | 해당 계정의 인증 방식, 여섯 도구 탐색, 호출·답변 저장 |
+
+공식 자료: [OpenAI dot 안내](https://help.openai.com/en/articles/20001530-getting-started-with-your-dot), [Meta Muse 발표](https://about.fb.com/news/2026/09/introducing-muse-personal-ai-agent/), [Grok Bot 가이드](https://x.ai/bot/guides/grok-bot-101), [Grok 웹 커넥터 안내](https://docs.x.ai/grok/connectors). 이 자료만으로 Deppy OAuth·도구 호출·응답 반환의 호환성을 보장하지 않습니다.
+
+실제 계정 연결 검증 기록에는 제공자·제품·계정 플랜(비밀 값 제외), 검증 날짜·앱 버전, URL 등록·인증·`list_sessions`·`read_output`·승인된 입력·`notify`·만료/갱신·재연결 각각의 결과를 남깁니다. 현재 완료된 연결 검증 기록은 없습니다.
+
+## 자동화 검증 범위
 
 ```sh
 cargo test -p agent-mcp
@@ -121,6 +139,6 @@ cargo test -p i18n
 cargo build -p deppy-sijo --release
 ```
 
-테스트는 로컬 OAuth/HTTP→App→실제 PTY 입력 수락→실행 출력→봇 자체 답변을 확인하며, 권한/중복 수신/보존/egui 표시를 검사합니다. 실제 Grok Bot 계정 등록·인터넷 터널·봇의 도구 호출 준수 여부는 사용자 환경에서 별도로 연결 확인해야 합니다.
+저장소의 테스트는 로컬 OAuth/HTTP→App→테스트 PTY 입력 수락→실행 출력→테스트 에이전트 자체 답변, 권한·중복 수신·보존·egui 표시를 대상으로 합니다. 이 문서의 명령 목록은 실행 결과 보고가 아닙니다. 해당 변경의 실제 실행 결과는 프로젝트 handoff에 기록합니다. 실제 제공자 계정 등록·인터넷 터널·봇의 도구 호출 준수 여부는 위 표의 별도 검증 대상입니다.
 
 runtime wire 버전은22입니다. paste의 모드 입장 조건은 로컬 전용이며 wire 버전을 추가 변경하지 않습니다. 별도 runtime 피어를 사용한다면 같은 버전으로 빌드해야 하며, 이전 버전은 handshake에서 거부됩니다. SSH 터미널 세션은 기존 로컬 runtime의 PTY를 계속 사용합니다.

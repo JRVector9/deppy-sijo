@@ -1,5 +1,7 @@
+use crate::{AuthKind, ConnectionInfo, ConnectionState, LEGACY_CONNECTION_ID, Principal};
 use serde_json::{Value, json};
 use std::{
+    collections::HashMap,
     io::{BufReader, Read},
     net::{SocketAddr, TcpListener, TcpStream},
     sync::{
@@ -27,6 +29,22 @@ struct Credential {
     epoch: u64,
     expires: u64,
     oauth: crate::oauth::OAuth,
+    manual: HashMap<String, ManualAccess>,
+    connections: HashMap<String, ConnectionInfo>,
+    budgets: HashMap<String, CallBudget>,
+    redaction: secret::RedactionService,
+}
+struct ManualAccess {
+    principal: Principal,
+    _lease: secret::RedactionLease,
+}
+#[derive(Default)]
+struct CallBudget {
+    epoch: u64,
+    window: u64,
+    polls: u8,
+    active: u8,
+    active_polls: u8,
 }
 pub struct Auth(Mutex<Credential>);
 impl Auth {
@@ -34,11 +52,16 @@ impl Auth {
         Self::with_redaction(time, secret::RedactionService::new())
     }
     fn with_redaction(time: u64, redaction: secret::RedactionService) -> Self {
+        let principal = legacy_principal(time);
         Self(Mutex::new(Credential {
             token: make_token(),
             epoch: 1,
             expires: time + TOKEN_TTL,
-            oauth: crate::oauth::OAuth::new(redaction),
+            oauth: crate::oauth::OAuth::new(redaction.clone()),
+            manual: HashMap::new(),
+            connections: HashMap::from([(principal.id.clone(), ConnectionInfo::new(principal))]),
+            budgets: HashMap::new(),
+            redaction,
         }))
     }
     pub fn token_for_user(&self) -> Zeroizing<String> {
@@ -50,6 +73,12 @@ impl Auth {
     pub fn rotate_at(&self, time: u64) {
         let mut c = self.0.lock().unwrap();
         c.oauth.clear();
+        c.manual.clear();
+        c.connections.clear();
+        c.budgets.clear();
+        let principal = legacy_principal(time);
+        c.connections
+            .insert(principal.id.clone(), ConnectionInfo::new(principal));
         c.token = make_token();
         c.epoch += 1;
         c.expires = time + TOKEN_TTL;
@@ -59,25 +88,217 @@ impl Auth {
         c.epoch += 1;
         c.expires = 0;
         c.oauth.clear();
+        c.manual.clear();
+        for info in c.connections.values_mut() {
+            info.state = ConnectionState::Revoked;
+        }
         c.token = Zeroizing::new(String::new());
     }
     pub fn authenticate(&self, header: &str, time: u64) -> Option<u64> {
         self.authenticate_scoped(header, time)
             .map(|(epoch, _, _)| epoch)
     }
-    fn authenticate_scoped(&self, header: &str, time: u64) -> Option<(u64, bool, Option<String>)> {
+    pub fn authenticate_principal(&self, header: &str, time: u64) -> Option<Principal> {
+        self.authenticate_scoped(header, time)
+            .map(|(_, principal, _)| principal)
+    }
+    fn authenticate_scoped(
+        &self,
+        header: &str,
+        time: u64,
+    ) -> Option<(u64, Principal, Option<String>)> {
         let supplied = header.strip_prefix("Bearer ")?;
-        let c = self.0.lock().ok()?;
+        let mut c = self.0.lock().ok()?;
         if time >= c.expires || supplied.is_empty() {
             return None;
         }
-        if bool::from(c.token.as_bytes().ct_eq(supplied.as_bytes())) {
-            return Some((c.epoch, true, None));
+        let (mut principal, key) = if bool::from(c.token.as_bytes().ct_eq(supplied.as_bytes())) {
+            (
+                c.connections.get(LEGACY_CONNECTION_ID)?.principal.clone(),
+                None,
+            )
+        } else {
+            let key = crate::oauth::hash(supplied);
+            let principal = c
+                .manual
+                .get(&key)
+                .filter(|a| time < a.principal.expires_at)
+                .map(|a| a.principal.clone())
+                .or_else(|| c.oauth.principal_key(&key, time))?;
+            (principal, Some(key))
+        };
+        if c.connections
+            .get(&principal.id)
+            .is_some_and(|info| info.state == ConnectionState::Revoked)
+        {
+            return None;
         }
-        let key = crate::oauth::hash(supplied);
-        c.oauth
-            .authenticate_key(&key, time)
-            .map(|input| (c.epoch, input, Some(key)))
+        principal.authenticated_at = time;
+        let connection_expiry = c
+            .oauth
+            .connection_expiry(&principal.id)
+            .unwrap_or(principal.expires_at);
+        if !c.connections.contains_key(&principal.id) && !make_registry_room(&mut c, time) {
+            return None;
+        }
+        let info = c
+            .connections
+            .entry(principal.id.clone())
+            .or_insert_with(|| ConnectionInfo::new(principal.clone()));
+        principal.name.clone_from(&info.principal.name);
+        let last_authenticated_at = info.last_authenticated_at.unwrap_or(0).max(time);
+        info.principal = principal.clone();
+        info.principal.authenticated_at = last_authenticated_at;
+        info.principal.expires_at = connection_expiry;
+        info.last_authenticated_at = Some(last_authenticated_at);
+        info.state = ConnectionState::Active;
+        Some((c.epoch, principal, key))
+    }
+    pub fn connections(&self) -> Vec<ConnectionInfo> {
+        self.connections_at(now())
+    }
+    pub fn connections_at(&self, time: u64) -> Vec<ConnectionInfo> {
+        let c = self.0.lock().unwrap();
+        let mut connections: Vec<_> = c
+            .connections
+            .values()
+            .cloned()
+            .map(|mut info| {
+                if info.state != ConnectionState::Revoked && time >= info.principal.expires_at {
+                    info.state = ConnectionState::Expired;
+                }
+                info
+            })
+            .collect();
+        connections.sort_by(|a, b| a.principal.id.cmp(&b.principal.id));
+        connections
+    }
+    pub fn rename_connection(&self, id: &str, name: &str) -> bool {
+        if !crate::principal::valid_connection_name(name) {
+            return false;
+        }
+        let mut c = self.0.lock().unwrap();
+        let Some(info) = c.connections.get_mut(id) else {
+            return false;
+        };
+        info.principal.name = name.trim().to_owned();
+        true
+    }
+    /// Revoke only this credential-issued connection. Serialized with queue admission.
+    pub fn revoke_connection(&self, id: &str) -> bool {
+        let mut c = self.0.lock().unwrap();
+        let Some(info) = c.connections.get_mut(id) else {
+            return false;
+        };
+        info.state = ConnectionState::Revoked;
+        c.manual.retain(|_, access| access.principal.id != id);
+        c.oauth.revoke_connection(id);
+        true
+    }
+    /// Local-owner API: the returned credential is shown once and never enters a snapshot.
+    pub fn mint_manual_connection(
+        &self,
+        name: &str,
+        input_scope: bool,
+        time: u64,
+    ) -> Option<(Principal, Zeroizing<String>)> {
+        if !crate::principal::valid_connection_name(name) {
+            return None;
+        }
+        let mut c = self.0.lock().ok()?;
+        if time >= c.expires {
+            return None;
+        }
+        c.manual
+            .retain(|_, access| time < access.principal.expires_at);
+        if c.manual.len() >= 32 || !make_registry_room(&mut c, time) {
+            return None;
+        }
+        let token = make_token();
+        let secret = secret::SecretString::new(token.to_string());
+        let lease = c.redaction.acquire_execution_lease(&[&secret]).ok()?;
+        let principal = Principal {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.trim().into(),
+            auth_kind: AuthKind::ManualBearer,
+            input_scope,
+            authenticated_at: time,
+            expires_at: c.expires,
+        };
+        c.connections
+            .insert(principal.id.clone(), ConnectionInfo::new(principal.clone()));
+        c.manual.insert(
+            crate::oauth::hash(&token),
+            ManualAccess {
+                principal: principal.clone(),
+                _lease: lease,
+            },
+        );
+        Some((principal, token))
+    }
+    fn observe_initialize(&self, id: &str) {
+        if let Some(info) = self.0.lock().unwrap().connections.get_mut(id) {
+            info.last_initialize_at = Some(now());
+        }
+    }
+    fn observe_tool_success(&self, id: &str, epoch: u64) {
+        let mut c = self.0.lock().unwrap();
+        if c.epoch != epoch {
+            return;
+        }
+        if let Some(info) = c
+            .connections
+            .get_mut(id)
+            .filter(|info| info.state != ConnectionState::Revoked)
+        {
+            info.last_tool_success_at = Some(now());
+        }
+    }
+    fn begin_call(&self, id: &str, poll: bool, epoch: u64) -> bool {
+        let mut c = self.0.lock().unwrap();
+        if c.epoch != epoch
+            || c.connections
+                .get(id)
+                .is_none_or(|info| info.state == ConnectionState::Revoked)
+        {
+            return false;
+        }
+        let budget = c.budgets.entry(id.into()).or_default();
+        if budget.epoch != epoch {
+            *budget = CallBudget {
+                epoch,
+                ..Default::default()
+            };
+        }
+        let time = now();
+        if budget.window != time {
+            budget.window = time;
+            budget.polls = 0;
+        }
+        if budget.active >= 2 || (poll && (budget.active_polls >= 1 || budget.polls >= 8)) {
+            return false;
+        }
+        budget.active += 1;
+        if poll {
+            budget.active_polls += 1;
+            budget.polls += 1;
+        }
+        true
+    }
+    fn end_call(&self, id: &str, poll: bool, epoch: u64) {
+        if let Some(budget) = self
+            .0
+            .lock()
+            .unwrap()
+            .budgets
+            .get_mut(id)
+            .filter(|budget| budget.epoch == epoch)
+        {
+            budget.active = budget.active.saturating_sub(1);
+            if poll {
+                budget.active_polls = budget.active_polls.saturating_sub(1);
+            }
+        }
     }
     pub fn approvals(&self) -> Vec<crate::Approval> {
         let mut c = self.0.lock().unwrap();
@@ -104,9 +325,14 @@ impl Auth {
         let response = {
             let mut c = self.0.lock().unwrap();
             let expiry = c.expires;
-            c.oauth.route(h, body, base, now(), expiry, headers, &|| {
+            let time = now();
+            let response = c.oauth.route(h, body, base, time, expiry, headers, &|| {
                 notification_requested.set(true);
-            })
+            });
+            if h.path == "/oauth/token" && response.status == 200 {
+                sync_oauth_connections(&mut c, time);
+            }
+            response
         };
         if notification_requested.get() {
             wake();
@@ -114,7 +340,8 @@ impl Auth {
         response
     }
     pub fn current(&self, epoch: u64, time: u64) -> bool {
-        self.current_access(epoch, None, time)
+        let c = self.0.lock().unwrap();
+        c.epoch == epoch && time < c.expires
     }
     pub fn current_access(&self, epoch: u64, access_key: Option<&str>, time: u64) -> bool {
         let c = self.0.lock().unwrap();
@@ -137,7 +364,75 @@ impl Auth {
 fn credential_is_current(c: &Credential, epoch: u64, access_key: Option<&str>, time: u64) -> bool {
     c.epoch == epoch
         && time < c.expires
-        && access_key.is_none_or(|key| c.oauth.authenticate_key(key, time).is_some())
+        && match access_key {
+            None => c
+                .connections
+                .get(LEGACY_CONNECTION_ID)
+                .is_some_and(|info| info.state != ConnectionState::Revoked),
+            Some(key) => {
+                c.manual
+                    .get(key)
+                    .is_some_and(|access| time < access.principal.expires_at)
+                    || c.oauth.authenticate_key(key, time).is_some()
+            }
+        }
+}
+fn legacy_principal(time: u64) -> Principal {
+    Principal {
+        id: LEGACY_CONNECTION_ID.into(),
+        name: "Shared manual bearer".into(),
+        auth_kind: AuthKind::ManualBearer,
+        input_scope: true,
+        authenticated_at: time,
+        expires_at: time + TOKEN_TTL,
+    }
+}
+fn sync_oauth_connections(c: &mut Credential, time: u64) {
+    let principals = c.oauth.live_principals(time);
+    for mut principal in principals {
+        if !c.connections.contains_key(&principal.id) && !make_registry_room(c, time) {
+            continue;
+        }
+        principal.expires_at = c
+            .oauth
+            .connection_expiry(&principal.id)
+            .unwrap_or(principal.expires_at);
+        let info = c
+            .connections
+            .entry(principal.id.clone())
+            .or_insert_with(|| ConnectionInfo::new(principal.clone()));
+        principal.name.clone_from(&info.principal.name);
+        let updated = info.last_authenticated_at.is_none()
+            || principal.authenticated_at > info.principal.authenticated_at;
+        principal.authenticated_at = principal
+            .authenticated_at
+            .max(info.principal.authenticated_at);
+        info.principal = principal;
+        if updated {
+            info.last_authenticated_at = Some(info.last_authenticated_at.unwrap_or(0).max(time));
+        }
+    }
+}
+fn make_registry_room(c: &mut Credential, time: u64) -> bool {
+    if c.connections.len() < 65 {
+        return true;
+    }
+    let retired = c
+        .connections
+        .iter()
+        .filter(|(id, info)| {
+            id.as_str() != LEGACY_CONNECTION_ID
+                && (info.state == ConnectionState::Revoked || time >= info.principal.expires_at)
+        })
+        .min_by_key(|(_, info)| info.principal.authenticated_at)
+        .map(|(id, _)| id.clone());
+    if let Some(id) = retired {
+        c.connections.remove(&id);
+        c.budgets.remove(&id);
+        true
+    } else {
+        false
+    }
 }
 fn make_token() -> Zeroizing<String> {
     Zeroizing::new(format!(
@@ -150,7 +445,8 @@ fn make_token() -> Zeroizing<String> {
 // No Debug: args may contain secrets and private answers.
 pub struct Request {
     pub epoch: u64,
-    /// OAuth token fingerprint; manual bearer requests are bound by epoch alone.
+    pub principal: Principal,
+    /// Non-secret credential fingerprint; the legacy bearer is bound by epoch and its connection state.
     pub access_key: Option<String>,
     pub input_scope: bool,
     pub deadline: Instant,
@@ -210,9 +506,10 @@ impl Server {
                             }
                             let _ = stream.set_write_timeout(Some(REQUEST_TIMEOUT));
                             if active.load(Ordering::Acquire) >= 4 {
-                                let _ = http::write_response(
+                                let _ = http::write_response_with_headers(
                                     &mut stream,
-                                    &Response::plain(503, "busy"),
+                                    &busy_response(),
+                                    &[("Retry-After".into(), "1".into())],
                                 );
                                 continue;
                             }
@@ -274,7 +571,7 @@ impl Drop for Server {
         }
     }
 }
-fn valid_public_host(host: &str) -> bool {
+pub fn valid_public_host(host: &str) -> bool {
     if host.is_empty() {
         return true;
     }
@@ -399,7 +696,7 @@ fn process(
     if head.header_count("authorization") != 1 {
         return Response::plain(401, "bearer_token_required");
     }
-    let Some((epoch, input_scope, access_key)) =
+    let Some((epoch, principal, access_key)) =
         auth.authenticate_scoped(head.header("authorization").unwrap_or(""), now())
     else {
         return Response::plain(401, "invalid_or_expired_token");
@@ -460,6 +757,7 @@ fn process(
     }
     let result = match method {
         "initialize" => {
+            auth.observe_initialize(&principal.id);
             let version = v["params"]["protocolVersion"].as_str().unwrap_or("");
             let version = if supported(version) {
                 version
@@ -480,6 +778,14 @@ fn process(
                         | "paste_text"
                         | "send_ctrl_c"
                         | "notify"
+                        | "start_run"
+                        | "update_run"
+                        | "get_run"
+                        | "list_runs"
+                        | "read_history"
+                        | "get_operation"
+                        | "acquire_control"
+                        | "release_control"
                 )
             }) else {
                 return rpc_error(id, -32602, "unknown_tool");
@@ -488,23 +794,52 @@ fn process(
             if !args.is_object() {
                 return rpc_error(id, -32602, "invalid_arguments");
             }
+            let poll = matches!(
+                tool,
+                "list_sessions"
+                    | "read_output"
+                    | "read_history"
+                    | "get_run"
+                    | "list_runs"
+                    | "get_operation"
+            );
+            if !auth.begin_call(&principal.id, poll, epoch) {
+                headers.push(("Retry-After".into(), "1".into()));
+                return tool_response(id, Err("poll_budget_no_effect".into()));
+            }
+            let connection_id = principal.id.clone();
             let (reply, rx) = mpsc::sync_channel(1);
             let req = Request {
                 epoch,
                 access_key,
-                input_scope,
+                input_scope: principal.input_scope,
+                principal,
                 deadline: Instant::now() + Duration::from_secs(3),
                 tool: tool.into(),
                 args,
                 reply,
             };
             if tx.try_send(req).is_err() {
+                auth.end_call(&connection_id, poll, epoch);
+                headers.push(("Retry-After".into(), "1".into()));
                 return tool_response(id, Err("busy_no_effect".into()));
             }
             wake();
-            let result = rx
-                .recv_timeout(Duration::from_secs(3))
-                .unwrap_or_else(|_| Err("outcome_unknown_do_not_retry_input".into()));
+            let result = rx.recv_timeout(Duration::from_secs(3)).unwrap_or_else(|_| {
+                Err(if poll {
+                    "timeout_no_effect"
+                } else {
+                    "outcome_unknown_do_not_retry_input"
+                }
+                .into())
+            });
+            auth.end_call(&connection_id, poll, epoch);
+            if result
+                .as_ref()
+                .is_ok_and(|value| !tool_payload_is_error(value))
+            {
+                auth.observe_tool_success(&connection_id, epoch);
+            }
             return tool_response(id, result);
         }
         _ => return rpc_error(id, -32601, "method_not_found"),
@@ -512,14 +847,21 @@ fn process(
     json_response(json!({"jsonrpc":"2.0","id":id,"result":result}))
 }
 fn tool_response(id: Value, result: Result<Value, String>) -> Response {
-    let error = result.is_err()
-        || result
-            .as_ref()
-            .is_ok_and(|v| matches!(v["status"].as_str(), Some("rejected" | "unknown")));
-    let payload = result.unwrap_or_else(|e| json!({"error":e}));
+    let error = result.is_err() || result.as_ref().is_ok_and(tool_payload_is_error);
+    let payload = crate::protocol::normalize_tool_payload(
+        result.unwrap_or_else(|error| crate::protocol::error_payload(&error)),
+    );
     json_response(
         json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":payload.to_string()}],"isError":error}}),
     )
+}
+fn tool_payload_is_error(value: &Value) -> bool {
+    value.get("error").is_some() || matches!(value["status"].as_str(), Some("rejected" | "unknown"))
+}
+fn busy_response() -> Response {
+    let mut response = json_response(crate::protocol::error_payload("busy_no_effect"));
+    response.status = 503;
+    response
 }
 fn rpc_error(id: Value, code: i32, message: &str) -> Response {
     json_response(json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}}))
@@ -704,5 +1046,128 @@ mod oauth_lock_tests {
             }
             thread::sleep(Duration::from_millis(5));
         }
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use sha2::{Digest, Sha256};
+
+    #[test]
+    fn cloud_management_oauth_sync_preserves_last_verified_authentication() {
+        let auth = Auth::new_at(100);
+        let mut credential = auth.0.lock().unwrap();
+        let headers = std::cell::RefCell::new(vec![]);
+        let base = "https://deppy.example";
+        let resource = format!("{base}/mcp");
+        let route =
+            |oauth: &mut crate::oauth::OAuth, method: &str, target: &str, body: &str, time: u64| {
+                let wire = format!(
+                    "{method} {target} HTTP/1.1\r\nHost: deppy.example\r\nContent-Type: {}\r\n\r\n",
+                    if target == "/oauth/register" {
+                        "application/json"
+                    } else {
+                        "application/x-www-form-urlencoded"
+                    }
+                );
+                let head = http::read_request_head(&mut BufReader::new(wire.as_bytes())).unwrap();
+                let mut headers = headers.borrow_mut();
+                headers.clear();
+                oauth.route(
+                    &head,
+                    body.as_bytes(),
+                    base,
+                    time,
+                    100 + TOKEN_TTL,
+                    &mut headers,
+                    &|| {},
+                )
+            };
+        let registration = route(
+            &mut credential.oauth,
+            "POST",
+            "/oauth/register",
+            r#"{"redirect_uris":["https://client.example/callback"]}"#,
+            100,
+        );
+        let registration: Value = serde_json::from_slice(&registration.body).unwrap();
+        let client = registration["client_id"].as_str().unwrap();
+        let verifier = "v".repeat(43);
+        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(&verifier));
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs([
+                ("client_id", client),
+                ("redirect_uri", "https://client.example/callback"),
+                ("resource", &resource),
+                ("response_type", "code"),
+                ("code_challenge_method", "S256"),
+                ("code_challenge", &challenge),
+            ])
+            .finish();
+        assert_eq!(
+            route(
+                &mut credential.oauth,
+                "GET",
+                &format!("/oauth/authorize?{query}"),
+                "",
+                101
+            )
+            .status,
+            200
+        );
+        let approval = credential.oauth.approvals(101).pop().unwrap();
+        assert!(credential.oauth.approve(&approval.id, true, 102));
+        assert_eq!(
+            route(
+                &mut credential.oauth,
+                "GET",
+                &format!("/oauth/authorize?request={}", approval.id),
+                "",
+                103
+            )
+            .status,
+            303
+        );
+        let location = headers
+            .borrow()
+            .iter()
+            .find(|(name, _)| name == "Location")
+            .unwrap()
+            .1
+            .clone();
+        let code = url::Url::parse(&location)
+            .unwrap()
+            .query_pairs()
+            .find(|(name, _)| name == "code")
+            .unwrap()
+            .1
+            .into_owned();
+        let form = url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs([
+                ("grant_type", "authorization_code"),
+                ("client_id", client),
+                ("resource", &resource),
+                ("redirect_uri", "https://client.example/callback"),
+                ("code", &code),
+                ("code_verifier", &verifier),
+            ])
+            .finish();
+        let response = route(&mut credential.oauth, "POST", "/oauth/token", &form, 104);
+        let tokens: Value = serde_json::from_slice(&response.body).unwrap();
+        sync_oauth_connections(&mut credential, 104);
+        drop(credential);
+        let principal = auth
+            .authenticate_principal(
+                &format!("Bearer {}", tokens["access_token"].as_str().unwrap()),
+                110,
+            )
+            .unwrap();
+        let mut credential = auth.0.lock().unwrap();
+        sync_oauth_connections(&mut credential, 111);
+        let info = credential.connections.get(&principal.id).unwrap();
+        assert_eq!(info.principal.authenticated_at, 110);
+        assert_eq!(info.last_authenticated_at, Some(110));
     }
 }

@@ -752,8 +752,8 @@ mod tests {
             r#"{"type":"cloud_control","request":2,"intent":{"action":"cancel_run","connection_id":"actor-original","run_id":"run-original"}}"#,
         );
         assert_eq!(
-            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            cloud::CloudControlIntent::CancelRun {
+            rx.recv_timeout(Duration::from_secs(2)).unwrap().intent(),
+            &cloud::CloudControlIntent::CancelRun {
                 connection_id: "actor-original".into(),
                 run_id: "run-original".into()
             }
@@ -764,6 +764,41 @@ mod tests {
         drop(owner);
         drop(unauth);
         server.shutdown();
+    }
+
+    #[test]
+    fn cloud_control_queued_before_direct_server_stop_cannot_execute_on_shared_core() {
+        let core = session_core::SessionCore::spawn(None);
+        let server = WebRemoteServer::serve_with_core(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            ServeOptions {
+                token: TEST_TOKEN.into(),
+                allowed_host: None,
+                repository: None,
+                vapid: None,
+                uploads_dir: None,
+            },
+            core.clone(),
+        )
+        .unwrap();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        core.set_cloud_control_sink(Arc::new(move |request| tx.try_send(request).is_ok()));
+        let mut owner = ws_client_authed(server.local_addr());
+        send_text(
+            &mut owner,
+            r#"{"type":"cloud_control","request":1,"intent":{"action":"revoke_connection","connection_id":"actor-original"}}"#,
+        );
+        let request = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(
+            request.origin(),
+            cloud::CloudControlOrigin::DirectWeb { .. }
+        ));
+        server.shutdown();
+        assert!(
+            core.authorize_cloud_control(request).is_none(),
+            "stopped web transport retained an owner capability"
+        );
+        core.shutdown();
     }
 
     fn start(allowed_host: Option<&str>) -> WebRemoteServer {

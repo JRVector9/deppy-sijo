@@ -614,18 +614,53 @@ impl DashboardHandle {
         *self.shared.cloud_sink.lock().expect("cloud sink lock") = Some(sink);
     }
 
-    /// This route only queues a typed owner intent; it never calls a runtime sink.
-    pub fn request_cloud_control(&self, intent: crate::cloud::CloudControlIntent) -> bool {
-        if !intent.validate() {
+    /// Creates a guard only after the caller authenticates a current principal.
+    pub fn cloud_control_origin(
+        &self,
+        origin: crate::cloud::CloudControlOrigin,
+        policy: crate::cloud::CloudControlPolicy,
+        revalidate: crate::cloud::CloudControlRevalidator,
+    ) -> crate::cloud::CloudControlOriginGuard {
+        let weak = Arc::downgrade(&self.shared);
+        crate::cloud::CloudControlOriginGuard::new(
+            self.shared.history_nonce.clone(),
+            origin,
+            policy,
+            Arc::new(move || {
+                weak.upgrade()
+                    .is_some_and(|shared| !shared.stop.load(Ordering::SeqCst))
+            }),
+            revalidate,
+        )
+    }
+
+    pub(crate) fn cloud_control_core_id(&self) -> &str {
+        &self.shared.history_nonce
+    }
+
+    pub(crate) fn authorize_cloud_control(
+        &self,
+        request: crate::cloud::CloudControlRequest,
+    ) -> Option<crate::cloud::CloudControlIntent> {
+        request.authorize(self.cloud_control_core_id())
+    }
+
+    /// Queue admission only; the App rechecks the envelope before each effect.
+    pub fn request_cloud_control(
+        &self,
+        origin: &crate::cloud::CloudControlOriginGuard,
+        intent: crate::cloud::CloudControlIntent,
+    ) -> bool {
+        let Some(request) = origin.issue(self.cloud_control_core_id(), intent) else {
             return false;
-        }
+        };
         let sink = self
             .shared
             .cloud_sink
             .lock()
             .expect("cloud sink lock")
             .clone();
-        sink.is_some_and(|sink| sink(intent))
+        sink.is_some_and(|sink| sink(request))
     }
 
     pub fn publish_cloud_snapshot(

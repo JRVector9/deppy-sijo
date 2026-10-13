@@ -9473,8 +9473,10 @@ struct RelayDashboardSink {
     viewport_seq: u64,
     baseline: Option<Arc<runtime::TerminalViewportSnapshot>>,
     last_dash: u64,
+    last_cloud: u64,
     route: relay_protocol::RouteId,
     principal: Option<web_remote::relay::repository::RelayDeviceRecord>,
+    cloud_control_origin: Option<web_remote::cloud::CloudControlOriginGuard>,
     control_outbound: Vec<Vec<u8>>,
     pending_verifier: Option<[u8; 32]>,
     registration_deadline: Option<u64>,
@@ -9511,8 +9513,10 @@ impl RelayDashboardSink {
             viewport_seq: 0,
             baseline: None,
             last_dash: 0,
+            last_cloud: 0,
             route,
             principal: None,
+            cloud_control_origin: None,
             control_outbound: Vec::new(),
             pending_verifier: None,
             registration_deadline: None,
@@ -9533,6 +9537,7 @@ impl RelayDashboardSink {
         self.gate.activate(channel);
         self.handshake.activated();
         self.last_dash = 0;
+        self.last_cloud = 0;
         self.viewport_seq = 0;
         self.registration_ready = known;
         self.registration_deadline = (!known).then(|| unix_now_secs().saturating_add(30));
@@ -9544,8 +9549,38 @@ impl RelayDashboardSink {
             "route_id": relay_hex(self.route.as_bytes()),
             "expires_at": device.device_expires_at(),
         });
+        let expected = device.clone();
+        let repository = Arc::clone(&self.repository);
+        self.cloud_control_origin = Some(self.core.dashboard().cloud_control_origin(
+            web_remote::cloud::CloudControlOrigin::RelayDevice {
+                device_id: device.device_id(),
+                channel_id: self.active_connection.expect("activated channel"),
+            },
+            web_remote::cloud::CloudControlPolicy {
+                authorization_epoch: *device.authorization_epoch(),
+                permissions: device.permissions(),
+                expires_at: Some(device.device_expires_at()),
+            },
+            Arc::new(move || {
+                let current = repository.device(expected.device_id()).ok()??;
+                if !current.is_admitted(expected.identity_public_sec1(), unix_now_secs())
+                    || current.authorization_epoch() != expected.authorization_epoch()
+                    || current.issued_at() != expected.issued_at()
+                    || current.device_expires_at() != expected.device_expires_at()
+                    || current.permissions() != expected.permissions()
+                {
+                    return None;
+                }
+                Some(web_remote::cloud::CloudControlPolicy {
+                    authorization_epoch: *current.authorization_epoch(),
+                    permissions: current.permissions(),
+                    expires_at: Some(current.device_expires_at()),
+                })
+            }),
+        ));
         self.principal = Some(device);
         if !self.queue_control(&message) {
+            self.cloud_control_origin = None;
             self.gate.deactivate();
         }
     }
@@ -9762,6 +9797,15 @@ impl RelayDashboardSink {
                         self.viewport_seq = 0;
                         self.baseline = None;
                     }
+                    web_remote::protocol::ClientMsg::CloudControl { request, intent } => {
+                        let queued = self.cloud_control_origin.as_ref().is_some_and(|origin| {
+                            self.core.dashboard().request_cloud_control(origin, intent)
+                        });
+                        let message = serde_json::json!({"type":"cloud_control_result","request":request,"status":if queued {"queued"} else {"rejected"}});
+                        if !self.queue_control(&message) {
+                            return web_remote::relay_client::SinkOutcome::CloseChannel;
+                        }
+                    }
                     // 클라 렌더 상태 파손 — baseline을 버려 다음 프레임을 keyframe으로.
                     web_remote::protocol::ClientMsg::RequestKeyframe => {
                         self.viewport_seq = 0;
@@ -9789,6 +9833,7 @@ impl RelayDashboardSink {
     /// 활성 채널로 나갈 화면. web 전송과 같은 스냅샷·같은 인코더이며, 봉인만 다르다.
     fn push_view(&mut self, frames: &mut Vec<Vec<u8>>) {
         if !self.principal_is_current() {
+            self.cloud_control_origin = None;
             self.gate.deactivate();
             return;
         }
@@ -9801,6 +9846,17 @@ impl RelayDashboardSink {
             };
             frames.push(frame);
             self.last_dash = version;
+        }
+        if let Some((version, json)) = self
+            .core
+            .dashboard()
+            .cloud_snapshot_for_permissions(self.last_cloud, self.permissions.permissions())
+        {
+            let Some(frame) = self.gate.seal(json.as_bytes()) else {
+                return;
+            };
+            frames.push(frame);
+            self.last_cloud = version;
         }
         if let Some(session) = self.watched.clone()
             && self
@@ -9904,6 +9960,7 @@ impl web_remote::relay_client::RelayFrameSink for RelayDashboardSink {
     }
 
     fn session_started(&mut self) {
+        self.cloud_control_origin = None;
         self.handshake.session_started();
         // 위반 계수는 **상대별**이다. 이월하면 예산을 소진한 기기 뒤에 붙은 다른 기기가
         // 첫 거부에서 곧바로 채널을 잃는다.
@@ -9918,6 +9975,7 @@ impl web_remote::relay_client::RelayFrameSink for RelayDashboardSink {
     }
 
     fn session_ended(&mut self) {
+        self.cloud_control_origin = None;
         self.gate.deactivate();
         self.handshake.session_ended();
         self.mailbox.clear();
@@ -9985,6 +10043,7 @@ impl web_remote::relay_client::RelayFrameSink for RelayDashboardSink {
             None => {}
         }
         if self.gate.is_active() && !self.principal_is_current() {
+            self.cloud_control_origin = None;
             self.gate.deactivate();
             self.control_outbound.clear();
         }
@@ -16615,6 +16674,8 @@ impl App {
         cloud_agent.port = config.cloud_agent.port.max(1024);
         cloud_agent.hostname = config.cloud_agent.public_host.chars().take(259).collect();
         cloud_agent.automatic = config.cloud_agent.automatic;
+        cloud_agent.reconnect = config.cloud_agent.reconnect;
+        cloud_agent.profiles = config.cloud_agent.profiles.clone();
         let composer_history_path = db_path
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
@@ -22453,6 +22514,8 @@ impl App {
             return Arc::clone(core);
         }
         let core = web_remote::session_core::SessionCore::spawn_with_push(repository, vapid);
+        core.set_cloud_control_sink(self.cloud_agent.operator_sink(self.egui_ctx.clone()));
+        let _ = core.publish_cloud_snapshot(self.cloud_agent.cloud_snapshot());
         self.session_core = Some(Arc::clone(&core));
         core
     }
@@ -27110,8 +27173,100 @@ impl App {
         }
     }
 
+    fn navigate_cloud_original_session(&mut self, workspace: &str, session: &str) {
+        let pane = self
+            .persisted_activity_panes
+            .get(workspace)
+            .and_then(|rows| {
+                rows.iter()
+                    .find(|row| row.persistent_session_id.as_deref() == Some(session))
+            })
+            .and_then(|row| row.pane_id.parse::<uuid::Uuid>().ok())
+            .map(|id| runtime::MuxPaneId(id.to_string()));
+        if let Some(pane) = pane {
+            self.settings_open = false;
+            self.activate_persisted_session(workspace, pane);
+        }
+    }
+    fn drain_cloud_operator_requests(&mut self) {
+        if let Some((workspace, session)) = self.cloud_agent.take_run_navigation() {
+            self.navigate_cloud_original_session(&workspace, &session);
+        }
+
+        use web_remote::cloud::CloudControlIntent;
+        for _ in 0..16 {
+            let Some(request) = self.cloud_agent.next_operator_intent() else {
+                break;
+            };
+            let Some(intent) = self
+                .session_core
+                .as_ref()
+                .and_then(|core| core.authorize_cloud_control(request))
+            else {
+                continue;
+            };
+            match intent {
+                CloudControlIntent::RevokeConnection { connection_id } => {
+                    self.cloud_agent.revoke_connection(&connection_id)
+                }
+                CloudControlIntent::TakeControl {
+                    session_id,
+                    generation,
+                } => {
+                    if let Some(target) = self.cloud_agent.operator_target(&session_id, &generation)
+                    {
+                        let current =
+                            std::iter::once(&self.active)
+                                .chain(self.warm.values())
+                                .any(|rt| {
+                                    cloud_agent_mux(rt).is_some_and(|mux| {
+                                        crate::cloud_agent::target_matches(
+                                            &target,
+                                            rt.runtime_instance,
+                                            &rt.id,
+                                            mux,
+                                            false,
+                                            false,
+                                        )
+                                    })
+                                });
+                        if current {
+                            self.cloud_agent.take_session_control(&target);
+                        }
+                    }
+                }
+                CloudControlIntent::CancelRun {
+                    connection_id,
+                    run_id,
+                } => {
+                    if let Err(code) = self.cloud_agent.request_run_cancel(&connection_id, &run_id)
+                    {
+                        self.cloud_agent.error = Some(code);
+                    }
+                }
+                CloudControlIntent::ApproveConnection { approval_id, allow } => {
+                    if let Some(server) = &self.cloud_agent.server {
+                        server.auth.approve(&approval_id, allow);
+                    }
+                }
+                CloudControlIntent::Navigate {
+                    workspace_id,
+                    session_id,
+                } => {
+                    self.navigate_cloud_original_session(&workspace_id, &session_id);
+                }
+            }
+        }
+    }
+
     fn pump_cloud_agent(&mut self, ctx: &egui::Context) {
+        self.drain_cloud_operator_requests();
         self.cloud_agent.apply_action(ctx);
+        if let Some(core) = &self.session_core {
+            self.cloud_agent.publish_cloud_snapshot(core);
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        }
+
         if self.settings_open && self.settings_category == ui::settings::Category::CloudAgents {
             self.cloud_agent
                 .refresh_ended_sessions(ctx, &self.db_path, |path| {
@@ -27160,9 +27315,11 @@ impl App {
                         .iter()
                         .rev()
                         .find_map(|e| {
-                            e.viewport()
-                                .filter(|(sid, _, _, _)| *sid == session)
-                                .map(|(_, snap, _, _)| crate::cloud_agent::screen_text(snap))
+                            e.viewport().filter(|(sid, _, _, _)| *sid == session).map(
+                                |(_, snap, _, _)| {
+                                    crate::cloud_agent::screen_text_with_truncation(snap).0
+                                },
+                            )
                         })
                         .or_else(|| rt.workspace_ui.cloud_agent_screen(session))
                 } else {
@@ -27200,6 +27357,9 @@ impl App {
                         || rt.live.session_kinds.get(&session) == Some(&runtime::SpawnKind::Agent),
                     bracketed_paste: rt.workspace_ui.session_bracketed_paste(session),
                     screen,
+                    screen_observed_at: self
+                        .cloud_agent
+                        .observed_screen_at(rt.runtime_instance, session),
                 });
             }
         }
@@ -27250,6 +27410,14 @@ impl App {
                         .send_guarded_input_batch(target.session, operation_id, parts, admission)
                         .map_err(|_| "runtime_queue_rejected_no_effect".to_string());
                 }
+                crate::cloud_agent::Effect::History {
+                    operation_id,
+                    query,
+                } => runtime::RuntimeCommand::QueryTerminalHistory {
+                    session: target.session,
+                    operation_id,
+                    query,
+                },
                 crate::cloud_agent::Effect::Watch => runtime::RuntimeCommand::SetRemoteViewing {
                     session: target.session,
                     viewing: true,
@@ -27261,6 +27429,9 @@ impl App {
                 .map_err(|_| "runtime_queue_rejected_no_effect".to_string())
         };
         let notices = self.cloud_agent.poll_history(&mut send);
+        if let Some(after) = self.cloud_agent.management_poll_after() {
+            ctx.request_repaint_after(after);
+        }
         // Bounded frame work; HTTP wakes the App and each request has a deadline.
         for _ in 0..16 {
             let Some(req) = self.cloud_agent.next_request() else {
@@ -37466,6 +37637,8 @@ impl eframe::App for App {
             self.cloud_agent.port,
             self.cloud_agent.hostname.clone(),
             self.cloud_agent.automatic,
+            self.cloud_agent.reconnect,
+            self.cloud_agent.profiles.clone(),
         );
         let mut out = ui::settings::show(
             ui.ctx(),
@@ -37855,11 +38028,15 @@ impl eframe::App for App {
                 self.cloud_agent.port,
                 self.cloud_agent.hostname.clone(),
                 self.cloud_agent.automatic,
+                self.cloud_agent.reconnect,
+                self.cloud_agent.profiles.clone(),
             )
         {
             self.config.cloud_agent.port = self.cloud_agent.port;
             self.config.cloud_agent.public_host = self.cloud_agent.hostname.clone();
             self.config.cloud_agent.automatic = self.cloud_agent.automatic;
+            self.config.cloud_agent.reconnect = self.cloud_agent.reconnect;
+            self.config.cloud_agent.profiles = self.cloud_agent.profiles.clone();
             out.config_changed = true;
         }
         if let Some(intent) = connector_intent {

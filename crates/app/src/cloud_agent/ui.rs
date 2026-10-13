@@ -1,5 +1,7 @@
-//! Settings leaf: captures intents and edits in-memory consent; no network or disk effects.
+//! Settings leaf: captures owner intents; durable operations use the App controller.
 use super::{Action, CloudAgent};
+mod runs;
+mod settings;
 
 const CLOUD_AGENT_INSTRUCTIONS: &str = concat!(
     "Use Deppy's MCP connector. First call list_sessions and keep the exact original session_id/generation for every call, even when Deppy's active tab changes. ",
@@ -7,8 +9,14 @@ const CLOUD_AGENT_INSTRUCTIONS: &str = concat!(
     "Do not send terminal input unless input_allowed is true. Use send_text for a single line without controls (maximum 8192 UTF-8 bytes); submit=false only types and submit=true sends Enter. ",
     "Use paste_text for multiline text or tabs only when paste_bracketed and paste_ai_confirmed are true. Its maximum is 32768 UTF-8 bytes; serialized arguments and the complete HTTP JSON body each have a 65536-byte limit, so JSON escaping can reject earlier. LF/CRLF and tabs are allowed with verified bracketed paste; standalone CR, ESC and other controls are rejected. submit defaults false; true admits the body and one separate Enter together. Respect existing AI drafts/dialogs and no-effect rejections; never bypass them. ",
     "Use send_ctrl_c only for an explicitly authorized interrupt. Use a unique operation_id per action; retry the exact same tool and arguments only with the same operation_id. A queued receipt confirms PTY queue admission, not command execution or task completion. If delivery is unknown, do not automatically replay input or create a new ID. ",
-    "After every completed analysis/task, call notify with YOUR OWN complete final answer (maximum 16384 UTF-8 bytes), including when no terminal input was sent. A stored receipt confirms the answer was saved. Keep the original session_id/generation for this answer. Limits count UTF-8 bytes, not characters."
+    "After every completed analysis/task, call notify with YOUR OWN complete final answer (maximum 16384 UTF-8 bytes), including when no terminal input was sent. A stored receipt confirms the answer was saved. Keep the original session_id/generation for this answer. Limits count UTF-8 bytes, not characters. ",
+    "New connection identities require explicit owner consent for reading and separately for input; authentication alone grants neither. Legacy tools remain available. For tracked work, call start_run with a unique run_id, title and optional instruction (8192 UTF-8 bytes); registration is not completion. Keep the exact original session_id/generation and run_id. Before input from a new connection, call acquire_control for the approved session with run_id when applicable and ttl_seconds of 1..120; check the lease and renew before it expires. Never invent a connection identity or borrow another connection's lease. Use release_control when finished. ",
+    "Report work through update_run: queued/running/waiting/completed/failed/cancelled, optional progress 0..100, message (4096 UTF-8 bytes), result (16384 UTF-8 bytes), and up to 16 actually produced HTTP(S) artifact links. Progress is your report, not independent verification. Send heartbeat updates while working; missing updates become unknown, never automatically completed. Use get_run/list_runs to check cancellation requests, stop your own work and acknowledge with update_run state=cancelled. A cancellation request is not Ctrl+C or input permission revocation. Include run_id on input and notify when tracking work; still send your own final answer to the original session. ",
+    "After a lost receipt, use get_operation with the original session_id/generation and operation_id to inspect the existing result without repeating input. Unknown delivery must not be replayed. Use read_history with the original session_id/generation, cursor and max_bytes at most 65536; handle reset/truncation and observation time, respect polling hints, and keep reads bounded."
 );
+
+#[cfg(test)]
+mod management_tests;
 
 impl CloudAgent {
     pub fn contents(&mut self, ui: &mut egui::Ui, catalog: &i18n::Catalog) {
@@ -49,6 +57,7 @@ impl CloudAgent {
             ))
             .weak(),
         );
+        self.profile_settings(ui, catalog);
         if let Some(server) = &self.server {
             ui.label(catalog.t(
                 "cloud.local_ready",
@@ -192,6 +201,8 @@ impl CloudAgent {
                 });
             }
         }
+        self.connection_settings(ui, catalog);
+        self.run_settings(ui, catalog);
         ui.separator();
         ui.heading(catalog.t("cloud.sessions", &[]));
         ui.label(catalog.t("cloud.permission_hint", &[]));
@@ -286,7 +297,15 @@ impl CloudAgent {
         // leave scrolling and collapsing under the user's control.
         let selected_record = self.selected_record.take();
         for record in &self.records {
-            let selected = selected_record.as_deref() == Some(record.id.as_str());
+            let record_key = agent_mcp::operation_key(
+                record
+                    .connection_id
+                    .as_deref()
+                    .unwrap_or(agent_mcp::LEGACY_CONNECTION_ID),
+                &record.id,
+            )
+            .unwrap_or_else(|_| record.id.clone());
+            let selected = selected_record.as_deref() == Some(record_key.as_str());
             let kind = match record.tool.as_str() {
                 "notify" => "cloud.history_answer",
                 "send_ctrl_c" => "cloud.history_interrupt",
@@ -302,7 +321,7 @@ impl CloudAgent {
                 record.session.chars().take(8).collect::<String>()
             );
             let response = egui::CollapsingHeader::new(title)
-                .id_salt(&record.id)
+                .id_salt(&record_key)
                 .open(if selected { Some(true) } else { None })
                 .show(ui, |ui| {
                     ui.weak(format!("{} / {}", record.workspace, record.session));
@@ -468,6 +487,13 @@ mod tests {
             "unknown",
             "notify",
             "original session_id/generation",
+            "start_run",
+            "acquire_control",
+            "release_control",
+            "update_run",
+            "get_operation",
+            "read_history",
+            "explicit owner consent",
         ] {
             assert!(
                 copied.contains(contract),
@@ -578,6 +604,10 @@ mod tests {
         bridge.records = (0..40)
             .map(|index| agent_mcp::Record {
                 id: format!("answer-{index}"),
+                connection_id: None,
+                run_id: None,
+                generation: None,
+                sequence: 0,
                 tool: "notify".into(),
                 workspace: "workspace".into(),
                 session: format!("{index:08}"),

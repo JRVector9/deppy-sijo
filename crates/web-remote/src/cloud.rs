@@ -2,6 +2,10 @@
 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use crate::relay::contract::{ConnectionId, DeviceId, RelayAction, RelayPermissions};
 
 pub const MAX_CLOUD_ROWS: usize = 100;
 pub const MAX_CLOUD_TEXT_BYTES: usize = 32 * 1024;
@@ -87,8 +91,171 @@ pub struct CloudArtifactView {
     pub uri: String,
 }
 
+impl CloudArtifactView {
+    pub fn validate(&self) -> Result<(), CloudSnapshotError> {
+        artifacts(std::slice::from_ref(self))
+    }
+}
+
 /// Nonblocking App-owned bounded mailbox. True means queue admission only.
-pub type CloudControlSink = Arc<dyn Fn(CloudControlIntent) -> bool + Send + Sync>;
+/// The App must consume each request through `SessionCore::authorize_cloud_control`
+/// immediately before applying its effect.
+pub type CloudControlSink = Arc<dyn Fn(CloudControlRequest) -> bool + Send + Sync>;
+
+/// Current trusted authority, obtained from the transport's authenticated principal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CloudControlPolicy {
+    pub authorization_epoch: [u8; 16],
+    pub permissions: RelayPermissions,
+    pub expires_at: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloudControlOrigin {
+    DirectWeb {
+        connection_id: u64,
+    },
+    RelayDevice {
+        device_id: DeviceId,
+        channel_id: ConnectionId,
+    },
+}
+
+/// Returns None when the original authenticated principal is no longer current.
+pub type CloudControlRevalidator = Arc<dyn Fn() -> Option<CloudControlPolicy> + Send + Sync>;
+
+struct CloudControlAuthority {
+    core_id: String,
+    origin: CloudControlOrigin,
+    policy: CloudControlPolicy,
+    active: AtomicBool,
+    core_alive: Arc<dyn Fn() -> bool + Send + Sync>,
+    revalidate: CloudControlRevalidator,
+}
+
+/// One authenticated transport activation. Replacing or dropping this guard
+/// permanently invalidates every request queued from that activation.
+pub struct CloudControlOriginGuard {
+    authority: Arc<CloudControlAuthority>,
+}
+
+impl CloudControlOriginGuard {
+    pub(crate) fn new(
+        core_id: String,
+        origin: CloudControlOrigin,
+        policy: CloudControlPolicy,
+        core_alive: Arc<dyn Fn() -> bool + Send + Sync>,
+        revalidate: CloudControlRevalidator,
+    ) -> Self {
+        Self {
+            authority: Arc::new(CloudControlAuthority {
+                core_id,
+                origin,
+                policy,
+                active: AtomicBool::new(true),
+                core_alive,
+                revalidate,
+            }),
+        }
+    }
+
+    pub fn revoke(&self) {
+        self.authority.active.store(false, Ordering::SeqCst);
+    }
+
+    pub(crate) fn issue(
+        &self,
+        core_id: &str,
+        intent: CloudControlIntent,
+    ) -> Option<CloudControlRequest> {
+        if !intent.validate() || self.authority.core_id != core_id {
+            return None;
+        }
+        let request = CloudControlRequest {
+            intent,
+            authority: self.authority.clone(),
+            deadline: Instant::now() + Duration::from_secs(5),
+        };
+        request
+            .authorized_at(core_id, Instant::now(), cloud_unix_seconds())
+            .then_some(request)
+    }
+}
+
+impl Drop for CloudControlOriginGuard {
+    fn drop(&mut self) {
+        self.revoke();
+    }
+}
+
+/// Trusted, non-serializable, single-use authority envelope. Clients send only
+/// an intent; the authenticated transport constructs this private envelope.
+pub struct CloudControlRequest {
+    intent: CloudControlIntent,
+    authority: Arc<CloudControlAuthority>,
+    deadline: Instant,
+}
+
+impl std::fmt::Debug for CloudControlRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CloudControlRequest")
+            .field("intent", &self.intent)
+            .field("origin", &self.authority.origin)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CloudControlRequest {
+    pub fn intent(&self) -> &CloudControlIntent {
+        &self.intent
+    }
+    pub fn origin(&self) -> &CloudControlOrigin {
+        &self.authority.origin
+    }
+
+    pub(crate) fn authorize(self, core_id: &str) -> Option<CloudControlIntent> {
+        self.authorized_at(core_id, Instant::now(), cloud_unix_seconds())
+            .then_some(self.intent)
+    }
+
+    fn authorized_at(&self, core_id: &str, now: Instant, unix_seconds: u64) -> bool {
+        if !self.fence_valid(core_id, now, unix_seconds) {
+            return false;
+        }
+        if (self.authority.revalidate)() != Some(self.authority.policy) {
+            return false;
+        }
+        // The callback can take time or revoke this activation/core. Sample
+        // both clocks and all local fences again after it returns.
+        self.fence_valid(core_id, now, unix_seconds)
+    }
+
+    fn fence_valid(&self, core_id: &str, now: Instant, unix_seconds: u64) -> bool {
+        let authority = &self.authority;
+        let required = match &self.intent {
+            CloudControlIntent::Navigate { .. } => RelayAction::Switch,
+            CloudControlIntent::ApproveConnection { .. } => RelayAction::Approval,
+            _ => RelayAction::Input,
+        };
+        authority.core_id == core_id
+            && (authority.core_alive)()
+            && authority.active.load(Ordering::SeqCst)
+            && self.intent.validate()
+            && authority.policy.permissions.allows(RelayAction::View)
+            && authority.policy.permissions.allows(required)
+            && Instant::now().max(now) < self.deadline
+            && authority
+                .policy
+                .expires_at
+                .is_none_or(|expires| cloud_unix_seconds().max(unix_seconds) < expires)
+    }
+}
+
+fn cloud_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(u64::MAX, |value| value.as_secs())
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
@@ -292,6 +459,288 @@ impl CloudSnapshot {
 mod tests {
     use super::*;
 
+    fn control_policy() -> CloudControlPolicy {
+        CloudControlPolicy {
+            authorization_epoch: [3; 16],
+            permissions: crate::relay::contract::RelayPermissions::new(true, true, true),
+            expires_at: None,
+        }
+    }
+    fn control_intent() -> CloudControlIntent {
+        CloudControlIntent::RevokeConnection {
+            connection_id: "actor-original".into(),
+        }
+    }
+    fn queued_control(
+        core: &crate::session_core::SessionCore,
+        guard: &CloudControlOriginGuard,
+    ) -> CloudControlRequest {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        core.set_cloud_control_sink(Arc::new(move |request| tx.try_send(request).is_ok()));
+        assert!(
+            core.dashboard()
+                .request_cloud_control(guard, control_intent())
+        );
+        rx.try_recv().unwrap()
+    }
+
+    #[test]
+    fn cloud_control_mailbox_rechecks_revocation_epoch_and_permissions_at_drain() {
+        let core = crate::session_core::SessionCore::spawn(None);
+        let current = Arc::new(std::sync::Mutex::new(Some(control_policy())));
+        let policy = current.clone();
+        let guard = core.dashboard().cloud_control_origin(
+            CloudControlOrigin::DirectWeb { connection_id: 1 },
+            control_policy(),
+            Arc::new(move || *policy.lock().unwrap()),
+        );
+        let current_request = queued_control(&core, &guard);
+        assert_eq!(
+            core.authorize_cloud_control(current_request),
+            Some(control_intent())
+        );
+        let request = queued_control(&core, &guard);
+        *current.lock().unwrap() = None;
+        assert!(
+            core.authorize_cloud_control(request).is_none(),
+            "revoked origin kept a queued effect"
+        );
+        *current.lock().unwrap() = Some(control_policy());
+        let request = queued_control(&core, &guard);
+        // A change in the second half must invalidate the full relay epoch.
+        current
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .authorization_epoch[15] += 1;
+        assert!(
+            core.authorize_cloud_control(request).is_none(),
+            "renewed auth admitted an old effect"
+        );
+        *current.lock().unwrap() = Some(control_policy());
+        let request = queued_control(&core, &guard);
+        current.lock().unwrap().as_mut().unwrap().permissions =
+            crate::relay::contract::RelayPermissions::default();
+        assert!(
+            core.authorize_cloud_control(request).is_none(),
+            "permission downgrade kept a queued effect"
+        );
+        core.shutdown();
+    }
+
+    #[test]
+    fn cloud_control_mailbox_rejects_dropped_origin_and_replaced_core() {
+        let core = crate::session_core::SessionCore::spawn(None);
+        let guard = core.dashboard().cloud_control_origin(
+            CloudControlOrigin::DirectWeb { connection_id: 1 },
+            control_policy(),
+            Arc::new(|| Some(control_policy())),
+        );
+        let request = queued_control(&core, &guard);
+        drop(guard);
+        assert!(core.authorize_cloud_control(request).is_none());
+        let guard = core.dashboard().cloud_control_origin(
+            CloudControlOrigin::DirectWeb { connection_id: 1 },
+            control_policy(),
+            Arc::new(|| Some(control_policy())),
+        );
+        let request = queued_control(&core, &guard);
+        let next_core = crate::session_core::SessionCore::spawn(None);
+        assert!(next_core.authorize_cloud_control(request).is_none());
+        let request = queued_control(&core, &guard);
+        core.shutdown();
+        assert!(core.authorize_cloud_control(request).is_none());
+        next_core.shutdown();
+    }
+
+    #[test]
+    fn cloud_control_mailbox_honors_deadline_and_checks_after_slow_revalidation() {
+        let core = crate::session_core::SessionCore::spawn(None);
+        let guard = core.dashboard().cloud_control_origin(
+            CloudControlOrigin::DirectWeb { connection_id: 1 },
+            control_policy(),
+            Arc::new(|| Some(control_policy())),
+        );
+        let mut request = queued_control(&core, &guard);
+        request.deadline = std::time::Instant::now();
+        assert!(core.authorize_cloud_control(request).is_none());
+        let revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let callback_revoked = revoked.clone();
+        let guard = core.dashboard().cloud_control_origin(
+            CloudControlOrigin::DirectWeb { connection_id: 2 },
+            control_policy(),
+            Arc::new(move || {
+                if callback_revoked.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Some(control_policy())
+            }),
+        );
+        let mut request = queued_control(&core, &guard);
+        request.deadline = std::time::Instant::now() + std::time::Duration::from_millis(5);
+        revoked.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            core.authorize_cloud_control(request).is_none(),
+            "deadline expired inside authorizer callback"
+        );
+        core.shutdown();
+    }
+
+    #[test]
+    fn cloud_control_mailbox_requires_current_origin_permission_and_device_expiry() {
+        let core = crate::session_core::SessionCore::spawn(None);
+        core.set_cloud_control_sink(Arc::new(|_| true));
+        let policy = CloudControlPolicy {
+            permissions: crate::relay::contract::RelayPermissions::default(),
+            ..control_policy()
+        };
+        let guard = core.dashboard().cloud_control_origin(
+            CloudControlOrigin::DirectWeb { connection_id: 1 },
+            policy,
+            Arc::new(move || Some(policy)),
+        );
+        assert!(
+            !core
+                .dashboard()
+                .request_cloud_control(&guard, control_intent())
+        );
+        let expires = cloud_unix_seconds() + 100;
+        let policy = CloudControlPolicy {
+            expires_at: Some(expires),
+            ..control_policy()
+        };
+        let guard = core.dashboard().cloud_control_origin(
+            CloudControlOrigin::RelayDevice {
+                device_id: crate::relay::contract::DeviceId::from_bytes([4; 16]),
+                channel_id: crate::relay::contract::ConnectionId::from_bytes([5; 16]),
+            },
+            policy,
+            Arc::new(move || Some(policy)),
+        );
+        let request = queued_control(&core, &guard);
+        assert!(
+            !request.authorized_at(
+                core.dashboard().cloud_control_core_id(),
+                std::time::Instant::now(),
+                expires
+            ),
+            "expired device kept a queued effect"
+        );
+        core.shutdown();
+    }
+
+    #[test]
+    fn cloud_control_mailbox_rechecks_guard_and_core_after_revalidation() {
+        let core = crate::session_core::SessionCore::spawn(None);
+        let armed = Arc::new(AtomicBool::new(false));
+        let arm = armed.clone();
+        let guard: Arc<CloudControlOriginGuard> =
+            Arc::new_cyclic(|weak: &std::sync::Weak<CloudControlOriginGuard>| {
+                let weak = weak.clone();
+                core.dashboard().cloud_control_origin(
+                    CloudControlOrigin::DirectWeb { connection_id: 1 },
+                    control_policy(),
+                    Arc::new(move || {
+                        if arm.load(Ordering::SeqCst) {
+                            weak.upgrade().unwrap().revoke();
+                        }
+                        Some(control_policy())
+                    }),
+                )
+            });
+        let request = queued_control(&core, &guard);
+        armed.store(true, Ordering::SeqCst);
+        assert!(
+            core.authorize_cloud_control(request).is_none(),
+            "guard revoked inside callback still authorized"
+        );
+
+        let armed = Arc::new(AtomicBool::new(false));
+        let arm = armed.clone();
+        let shutdown = core.clone();
+        let guard = core.dashboard().cloud_control_origin(
+            CloudControlOrigin::DirectWeb { connection_id: 2 },
+            control_policy(),
+            Arc::new(move || {
+                if arm.load(Ordering::SeqCst) {
+                    shutdown.shutdown();
+                }
+                Some(control_policy())
+            }),
+        );
+        let request = queued_control(&core, &guard);
+        armed.store(true, Ordering::SeqCst);
+        assert!(
+            core.authorize_cloud_control(request).is_none(),
+            "core stopped inside callback still authorized"
+        );
+    }
+
+    #[test]
+    fn cloud_control_mailbox_requires_exact_permissions_and_intent_scope() {
+        use crate::relay::contract::RelayPermissions;
+        let core = crate::session_core::SessionCore::spawn(None);
+        core.set_cloud_control_sink(Arc::new(|_| true));
+        for (permissions, navigate, approve, mutate) in [
+            (RelayPermissions::default(), false, false, false),
+            (
+                RelayPermissions::new(false, true, true),
+                false,
+                false,
+                false,
+            ),
+            (RelayPermissions::new(true, false, true), false, true, false),
+            (RelayPermissions::new(true, true, false), true, false, true),
+        ] {
+            let policy = CloudControlPolicy {
+                permissions,
+                ..control_policy()
+            };
+            let guard = core.dashboard().cloud_control_origin(
+                CloudControlOrigin::DirectWeb { connection_id: 1 },
+                policy,
+                Arc::new(move || Some(policy)),
+            );
+            for (intent, expected) in [
+                (
+                    CloudControlIntent::Navigate {
+                        workspace_id: "w".into(),
+                        session_id: "s".into(),
+                    },
+                    navigate,
+                ),
+                (
+                    CloudControlIntent::ApproveConnection {
+                        approval_id: "a".into(),
+                        allow: true,
+                    },
+                    approve,
+                ),
+                (control_intent(), mutate),
+            ] {
+                assert_eq!(
+                    core.dashboard().request_cloud_control(&guard, intent),
+                    expected
+                );
+            }
+        }
+        let current = Arc::new(std::sync::Mutex::new(Some(control_policy())));
+        let state = current.clone();
+        let guard = core.dashboard().cloud_control_origin(
+            CloudControlOrigin::DirectWeb { connection_id: 2 },
+            control_policy(),
+            Arc::new(move || *state.lock().unwrap()),
+        );
+        let request = queued_control(&core, &guard);
+        current.lock().unwrap().as_mut().unwrap().permissions =
+            control_policy().permissions.with_upload(true);
+        assert!(
+            core.authorize_cloud_control(request).is_none(),
+            "unrelated permission change reused original authorization"
+        );
+    }
+
     fn run() -> CloudRunView {
         CloudRunView {
             id: "run-a".into(),
@@ -388,6 +837,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(snapshot.validate(), Ok(()));
+        assert_eq!(snapshot.runs[0].artifacts[0].validate(), Ok(()));
         for uri in [
             "https://user:password@example.com/proof",
             "javascript:alert(1)",
@@ -396,6 +846,10 @@ mod tests {
             snapshot.runs[0].artifacts[0].uri = uri.into();
             assert_eq!(
                 snapshot.validate(),
+                Err(CloudSnapshotError::InvalidArtifact)
+            );
+            assert_eq!(
+                snapshot.runs[0].artifacts[0].validate(),
                 Err(CloudSnapshotError::InvalidArtifact)
             );
         }

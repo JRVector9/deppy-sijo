@@ -11,6 +11,7 @@
 //! 스냅샷만 갱신하며, 이 스레드가 tick마다 버전을 비교해 push한다.
 
 use std::net::TcpStream;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -57,7 +58,7 @@ pub fn serve(
     head: &RequestHead,
     token: &str,
     dashboard: &DashboardHandle,
-    stop: &AtomicBool,
+    stop: &Arc<AtomicBool>,
 ) {
     // 핸드셰이크 필수 헤더 검증 — key 부재/버전 불일치는 400.
     let Some(key) = head.header("sec-websocket-key") else {
@@ -109,6 +110,19 @@ pub fn serve(
 
     // 2) 등록(연결 수 +1, 즉시 폴링) — Drop 시 자동 해제. 이후 스냅샷 스트림.
     let guard = dashboard.register_connection();
+    let policy = crate::cloud::CloudControlPolicy {
+        authorization_epoch: [1; 16],
+        permissions: crate::relay::contract::RelayPermissions::new(true, true, true),
+        expires_at: None,
+    };
+    let stopped = stop.clone();
+    let origin = dashboard.cloud_control_origin(
+        crate::cloud::CloudControlOrigin::DirectWeb {
+            connection_id: guard.id(),
+        },
+        policy,
+        Arc::new(move || (!stopped.load(Ordering::SeqCst)).then_some(policy)),
+    );
     if ws
         .send(Message::Text(
             ServerMsg::Welcome {
@@ -130,7 +144,7 @@ pub fn serve(
         generation: 0,
         connection: guard.id(),
     };
-    stream_loop(&mut ws, dashboard, stop, &mut watch);
+    stream_loop(&mut ws, dashboard, stop, &mut watch, &origin);
     drop(watch);
     let _ = ws.close(None);
     let _ = ws.flush();
@@ -219,6 +233,7 @@ fn stream_loop(
     dashboard: &DashboardHandle,
     stop: &AtomicBool,
     watch: &mut WatchBinding<'_>,
+    origin: &crate::cloud::CloudControlOriginGuard,
 ) {
     let mut last_dash = 0u64;
     let mut last_appr = 0u64;
@@ -404,7 +419,7 @@ fn stream_loop(
                         Some(ClientMsg::CloudControl { request, intent }) => {
                             let status = if request == 0 || !intent.validate() {
                                 "invalid"
-                            } else if dashboard.request_cloud_control(intent) {
+                            } else if dashboard.request_cloud_control(origin, intent) {
                                 "queued"
                             } else {
                                 "rejected"

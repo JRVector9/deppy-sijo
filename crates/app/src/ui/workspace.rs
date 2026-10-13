@@ -9660,7 +9660,7 @@ impl WorkspaceUi {
             .get(&session)?
             .snapshot
             .as_ref()
-            .map(|s| crate::cloud_agent::screen_text(s))
+            .map(|s| crate::cloud_agent::screen_text_with_truncation(s).0)
     }
 
     pub fn session_bracketed_paste(&self, session: SessionId) -> bool {

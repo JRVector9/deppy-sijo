@@ -190,6 +190,27 @@ pub struct CloudAgentConfig {
     pub port: u16,
     pub public_host: String,
     pub automatic: bool,
+    pub reconnect: bool,
+    pub profiles: Vec<CloudConnectionProfile>,
+}
+
+/// Coordinates only: credentials and session approvals never enter a profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloudConnectionProfile {
+    pub name: String,
+    pub port: u16,
+    pub public_host: String,
+    pub automatic: bool,
+}
+impl CloudConnectionProfile {
+    pub fn valid(&self) -> bool {
+        !self.name.trim().is_empty()
+            && self.name.len() <= 80
+            && !self.name.chars().any(char::is_control)
+            && self.port >= 1024
+            && agent_mcp::valid_public_host(&self.public_host)
+    }
 }
 impl Default for CloudAgentConfig {
     fn default() -> Self {
@@ -197,6 +218,8 @@ impl Default for CloudAgentConfig {
             port: 8739,
             public_host: String::new(),
             automatic: true,
+            reconnect: false,
+            profiles: Vec::new(),
         }
     }
 }
@@ -208,6 +231,8 @@ impl<'de> Deserialize<'de> for CloudAgentConfig {
             port: u16,
             public_host: String,
             automatic: Option<bool>,
+            reconnect: bool,
+            profiles: Vec<CloudConnectionProfile>,
         }
         impl Default for Stored {
             fn default() -> Self {
@@ -216,6 +241,8 @@ impl<'de> Deserialize<'de> for CloudAgentConfig {
                     port: config.port,
                     public_host: config.public_host,
                     automatic: None,
+                    reconnect: false,
+                    profiles: Vec::new(),
                 }
             }
         }
@@ -225,6 +252,13 @@ impl<'de> Deserialize<'de> for CloudAgentConfig {
             port: stored.port,
             public_host: stored.public_host,
             automatic,
+            reconnect: stored.reconnect,
+            profiles: stored
+                .profiles
+                .into_iter()
+                .filter(CloudConnectionProfile::valid)
+                .take(8)
+                .collect(),
         })
     }
 }

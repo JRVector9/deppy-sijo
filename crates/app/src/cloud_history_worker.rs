@@ -1,7 +1,10 @@
 //! App-owned bounded SQLite actor. Jobs never contain runtime handles or input callbacks.
 //! Claim commits before App is allowed to dispatch an effect. Drop drains admitted DB jobs;
 //! closing the result receiver releases publication without running any terminal input.
-use agent_mcp::{Claim, History, Record};
+use agent_mcp::{
+    Claim, CloudRun, History, HistoryPage, HistoryQuery, OperationContext, Record, RunPage,
+    RunQuery,
+};
 use serde_json::Value;
 use std::{
     path::PathBuf,
@@ -20,7 +23,17 @@ pub(crate) const MAX_ARGS: usize = 64 * 1024;
 const RECEIPT_BYTES: usize = 2048;
 
 pub(crate) enum Job {
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Legacy worker compatibility fixtures")
+    )]
     Open,
+    OpenPage,
+    RecentPage,
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Legacy worker compatibility fixtures")
+    )]
     Claim {
         id: String,
         tool: String,
@@ -33,12 +46,60 @@ pub(crate) enum Job {
         outcome: Value,
         message: String,
     },
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Legacy worker compatibility fixtures")
+    )]
     Recent,
+    ClaimScoped {
+        id: String,
+        tool: String,
+        args: Value,
+        workspace: String,
+        session: String,
+        context: OperationContext,
+    },
+    FinishScoped {
+        id: String,
+        connection_id: String,
+        outcome: Value,
+        message: String,
+    },
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Legacy worker compatibility fixtures")
+    )]
+    Lookup {
+        id: String,
+        connection_id: String,
+    },
+    LookupTarget {
+        id: String,
+        connection_id: String,
+        workspace: String,
+        session: String,
+        generation: String,
+    },
+    SaveRun {
+        run: CloudRun,
+    },
+    GetRun {
+        id: String,
+        connection_id: String,
+    },
+    ListRuns {
+        query: RunQuery,
+    },
+    // Additive actor-scoped paging API; the desktop currently uses snapshot pages.
+    #[allow(dead_code)]
+    Query {
+        query: HistoryQuery,
+    },
 }
 impl Job {
     fn charge(&self) -> Option<usize> {
         Some(match self {
-            Self::Open | Self::Recent => SNAPSHOT_BYTES,
+            Self::Open | Self::Recent | Self::OpenPage | Self::RecentPage => SNAPSHOT_BYTES,
             Self::Claim {
                 id,
                 tool,
@@ -71,14 +132,108 @@ impl Job {
                 }
                 id.len() + receipt + message.len() + RECEIPT_BYTES
             }
+            Self::ClaimScoped {
+                id,
+                tool,
+                args,
+                workspace,
+                session,
+                context,
+            } => {
+                context.validate().ok()?;
+                let args = serde_json::to_vec(args).ok()?.len();
+                if args > MAX_ARGS
+                    || id != &context.operation_id
+                    || tool.len() > 64
+                    || workspace.len() > 128
+                    || session.len() > 128
+                {
+                    return None;
+                }
+                args + tool.len()
+                    + workspace.len()
+                    + session.len()
+                    + serde_json::to_vec(context).ok()?.len()
+                    + id.len()
+                    + RECEIPT_BYTES
+                    + 1024
+            }
+            Self::FinishScoped {
+                id,
+                connection_id,
+                outcome,
+                message,
+            } => {
+                agent_mcp::operation_key(connection_id, id).ok()?;
+                let receipt = serde_json::to_vec(outcome).ok()?.len();
+                if receipt > RECEIPT_BYTES || message.len() > agent_mcp::MAX_ANSWER {
+                    return None;
+                }
+                id.len() + connection_id.len() + receipt + message.len() + RECEIPT_BYTES + 1024
+            }
+            Self::Lookup { id, connection_id } => {
+                agent_mcp::operation_key(connection_id, id).ok()?;
+                id.len() + connection_id.len() + RECEIPT_BYTES + 1024
+            }
+            Self::LookupTarget {
+                id,
+                connection_id,
+                workspace,
+                session,
+                generation,
+            } => {
+                agent_mcp::operation_key(connection_id, id).ok()?;
+                if [workspace, session, generation].into_iter().any(|value| {
+                    value.is_empty() || value.len() > 128 || value.chars().any(char::is_control)
+                }) {
+                    return None;
+                }
+                id.len()
+                    + connection_id.len()
+                    + workspace.len()
+                    + session.len()
+                    + generation.len()
+                    + RECEIPT_BYTES
+                    + 1024
+            }
+            Self::SaveRun { run } => {
+                run.validate().ok()?;
+                serde_json::to_vec(run).ok()?.len() + 1024
+            }
+            Self::GetRun { id, connection_id } => {
+                if [id, connection_id].into_iter().any(|value| {
+                    value.is_empty() || value.len() > 128 || value.chars().any(char::is_control)
+                }) {
+                    return None;
+                }
+                id.len() + connection_id.len() + agent_mcp::MAX_RUN_BYTES + 1024
+            }
+            Self::ListRuns { query } => {
+                query.validate().ok()?;
+                query.max_bytes + serde_json::to_vec(query).ok()?.len() + 1024
+            }
+            Self::Query { query } => {
+                query.validate().ok()?;
+                query.max_bytes + serde_json::to_vec(query).ok()?.len() + 1024
+            }
         })
     }
 }
 pub(crate) enum ResultKind {
     Open(Result<Vec<Record>, ()>),
+    OpenPage(Result<HistoryPage, ()>),
+    RecentPage(Result<HistoryPage, ()>),
     Claim(Result<Claim, ()>),
     Finish(Result<(), ()>),
     Recent(Result<Vec<Record>, ()>),
+    ClaimScoped(Result<Claim, ()>),
+    FinishScoped(Result<(), ()>),
+    Lookup(Result<Option<Value>, ()>),
+    LookupTarget(Result<Option<Value>, ()>),
+    SaveRun(Result<(), ()>),
+    GetRun(Result<Option<Box<CloudRun>>, ()>),
+    ListRuns(Result<RunPage, ()>),
+    Query(Result<HistoryPage, ()>),
 }
 pub(crate) struct Completion {
     pub token: u64,
@@ -147,6 +302,16 @@ impl HistoryWorker {
                         .ok();
                     }
                     let result = match job {
+                        Job::OpenPage => ResultKind::OpenPage(
+                            db.as_ref()
+                                .ok_or(())
+                                .and_then(|db| db.recent_page(SNAPSHOT_BYTES).map_err(|_| ())),
+                        ),
+                        Job::RecentPage => ResultKind::RecentPage(
+                            db.as_ref()
+                                .ok_or(())
+                                .and_then(|db| db.recent_page(SNAPSHOT_BYTES).map_err(|_| ())),
+                        ),
                         Job::Open => ResultKind::Open(
                             db.as_ref()
                                 .ok_or(())
@@ -175,6 +340,68 @@ impl HistoryWorker {
                             db.as_ref()
                                 .ok_or(())
                                 .and_then(|db| db.finish(&id, &outcome, &message).map_err(|_| ())),
+                        ),
+                        Job::ClaimScoped {
+                            id,
+                            tool,
+                            args,
+                            workspace,
+                            session,
+                            context,
+                        } => ResultKind::ClaimScoped(db.as_ref().ok_or(()).and_then(|db| {
+                            db.claim_scoped(&id, &tool, &args, &workspace, &session, &context)
+                                .map_err(|_| ())
+                        })),
+                        Job::FinishScoped {
+                            id,
+                            connection_id,
+                            outcome,
+                            message,
+                        } => ResultKind::FinishScoped(db.as_ref().ok_or(()).and_then(|db| {
+                            db.finish_scoped(&id, &connection_id, &outcome, &message)
+                                .map_err(|_| ())
+                        })),
+                        Job::Lookup { id, connection_id } => {
+                            ResultKind::Lookup(db.as_ref().ok_or(()).and_then(|db| {
+                                db.get_operation(&id, &connection_id).map_err(|_| ())
+                            }))
+                        }
+                        Job::LookupTarget {
+                            id,
+                            connection_id,
+                            workspace,
+                            session,
+                            generation,
+                        } => ResultKind::LookupTarget(db.as_ref().ok_or(()).and_then(|db| {
+                            db.get_operation_for_target(
+                                &id,
+                                &connection_id,
+                                &workspace,
+                                &session,
+                                &generation,
+                            )
+                            .map_err(|_| ())
+                        })),
+                        Job::SaveRun { run } => ResultKind::SaveRun(
+                            db.as_ref()
+                                .ok_or(())
+                                .and_then(|db| db.save_run(&run).map_err(|_| ())),
+                        ),
+                        Job::GetRun { id, connection_id } => ResultKind::GetRun(
+                            db.as_ref()
+                                .ok_or(())
+                                .and_then(|db| db.get_run(&connection_id, &id).map_err(|_| ()))
+                                .map(|run| run.map(Box::new)),
+                        ),
+                        Job::ListRuns { query } => ResultKind::ListRuns(
+                            db.as_ref()
+                                .ok_or(())
+                                .and_then(|db| db.list_runs(&query).map_err(|_| ())),
+                        ),
+                        Job::Query { query } => ResultKind::Query(
+                            db.as_ref()
+                                .ok_or(())
+                                .and_then(|db| db.query(&query).map_err(|_| ())),
                         ),
                     };
                     if result_tx
@@ -291,6 +518,232 @@ mod tests {
             worker.request(token, job).is_ok(),
             "known-unsent actor admission"
         );
+    }
+    #[test]
+    fn cloud_management_actor_scopes_receipts_and_persists_runs_without_effects() {
+        let mut worker = HistoryWorker::new(None, || {});
+        let context = agent_mcp::OperationContext {
+            connection_id: "actor-a".into(),
+            operation_id: "same-id".into(),
+            run_id: Some("run".into()),
+            generation: "g".into(),
+        };
+        request(
+            &mut worker,
+            1,
+            Job::ClaimScoped {
+                id: "same-id".into(),
+                tool: "notify".into(),
+                args: json!({"message":"answer"}),
+                workspace: "w".into(),
+                session: "s".into(),
+                context,
+            },
+        );
+        assert!(matches!(
+            worker.wait().unwrap().result,
+            ResultKind::ClaimScoped(Ok(Claim::New))
+        ));
+        request(
+            &mut worker,
+            2,
+            Job::FinishScoped {
+                id: "same-id".into(),
+                connection_id: "actor-a".into(),
+                outcome: json!({"status":"stored"}),
+                message: "answer".into(),
+            },
+        );
+        assert!(matches!(
+            worker.wait().unwrap().result,
+            ResultKind::FinishScoped(Ok(()))
+        ));
+        request(
+            &mut worker,
+            3,
+            Job::Lookup {
+                id: "same-id".into(),
+                connection_id: "actor-b".into(),
+            },
+        );
+        assert!(matches!(
+            worker.wait().unwrap().result,
+            ResultKind::Lookup(Ok(None))
+        ));
+        let run = agent_mcp::CloudRun::new(
+            "run",
+            "actor-a",
+            "A",
+            "w",
+            "s",
+            "g",
+            "title",
+            "instruction",
+            100,
+        )
+        .unwrap();
+        request(&mut worker, 4, Job::SaveRun { run });
+        assert!(matches!(
+            worker.wait().unwrap().result,
+            ResultKind::SaveRun(Ok(()))
+        ));
+        request(
+            &mut worker,
+            5,
+            Job::ListRuns {
+                query: agent_mcp::RunQuery::default(),
+            },
+        );
+        let result = worker.wait().unwrap();
+        let ResultKind::ListRuns(Ok(page)) = &result.result else {
+            panic!("run page");
+        };
+        assert_eq!(page.runs.len(), 1);
+        assert_eq!(page.runs[0].state, agent_mcp::RunState::Queued);
+        drop(result);
+        request(
+            &mut worker,
+            6,
+            Job::GetRun {
+                id: "run".into(),
+                connection_id: "actor-a".into(),
+            },
+        );
+        assert!(matches!(
+            worker.wait().unwrap().result,
+            ResultKind::GetRun(Ok(Some(_)))
+        ));
+        request(
+            &mut worker,
+            7,
+            Job::GetRun {
+                id: "run".into(),
+                connection_id: "actor-b".into(),
+            },
+        );
+        assert!(matches!(
+            worker.wait().unwrap().result,
+            ResultKind::GetRun(Ok(None))
+        ));
+        assert_eq!(worker.retained_bytes(), 0);
+    }
+    #[test]
+    fn history_page_snapshot_keeps_valid_newlines_and_reports_retained_memory_truncation() {
+        let mut worker = HistoryWorker::new(None, || {});
+        let mut token = 0;
+        for (count, tool) in [(100, "notify"), (300, "send_text")] {
+            for index in 0..count {
+                let id = format!("{tool}-{index}");
+                request(
+                    &mut worker,
+                    token,
+                    Job::Claim {
+                        id: id.clone(),
+                        tool: tool.into(),
+                        args: json!({}),
+                        workspace: "w".into(),
+                        session: "s".into(),
+                    },
+                );
+                token += 1;
+                assert!(matches!(
+                    worker.wait().unwrap().result,
+                    ResultKind::Claim(Ok(Claim::New))
+                ));
+                request(
+                    &mut worker,
+                    token,
+                    Job::Finish {
+                        id,
+                        outcome: json!({"status":"stored"}),
+                        message: "\n".repeat(agent_mcp::MAX_ANSWER),
+                    },
+                );
+                token += 1;
+                assert!(matches!(
+                    worker.wait().unwrap().result,
+                    ResultKind::Finish(Ok(()))
+                ));
+            }
+            let job = if tool == "notify" {
+                Job::OpenPage
+            } else {
+                Job::RecentPage
+            };
+            request(&mut worker, token, job);
+            token += 1;
+            let snapshot = worker.wait().unwrap();
+            let page = match &snapshot.result {
+                ResultKind::OpenPage(Ok(page)) | ResultKind::RecentPage(Ok(page)) => page,
+                _ => panic!("valid snapshots must produce a page"),
+            };
+            assert_eq!(worker.retained_bytes(), SNAPSHOT_BYTES);
+            assert_eq!(
+                page.records
+                    .iter()
+                    .filter(|row| row.tool == "notify")
+                    .count(),
+                100
+            );
+            assert!(
+                page.records
+                    .iter()
+                    .all(|row| row.message.len() == agent_mcp::MAX_ANSWER)
+            );
+            assert_eq!(page.truncated, tool != "notify");
+            if page.truncated {
+                assert!(page.records.len() < 400);
+            } else {
+                assert_eq!(page.records.len(), 100);
+            }
+            assert!(worker.request(token, Job::RecentPage).is_err());
+            drop(snapshot);
+            assert_eq!(worker.retained_bytes(), 0);
+        }
+    }
+    #[test]
+    fn cloud_management_actor_rejects_oversized_context_run_and_query_before_admission() {
+        let mut worker = HistoryWorker::new(None, || {});
+        let mut run = agent_mcp::CloudRun::new(
+            "run",
+            "actor-a",
+            "A",
+            "w",
+            "s",
+            "g",
+            "title",
+            "instruction",
+            100,
+        )
+        .unwrap();
+        run.instruction = "x".repeat(8193);
+        assert!(worker.request(1, Job::SaveRun { run }).is_err());
+        assert!(
+            worker
+                .request(
+                    2,
+                    Job::ListRuns {
+                        query: agent_mcp::RunQuery {
+                            limit: 101,
+                            ..agent_mcp::RunQuery::default()
+                        }
+                    }
+                )
+                .is_err()
+        );
+        assert!(
+            worker
+                .request(
+                    3,
+                    Job::Lookup {
+                        id: "id".into(),
+                        connection_id: "x".repeat(129)
+                    }
+                )
+                .is_err()
+        );
+        assert_eq!(worker.retained_bytes(), 0);
+        assert!(worker.handle.is_none(), "invalid jobs must not open any DB");
     }
     #[test]
     fn pr7_actor_is_inert_then_opens_on_worker_and_wakes_after_publication() {

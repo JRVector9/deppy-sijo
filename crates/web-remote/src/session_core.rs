@@ -76,6 +76,14 @@ impl SessionCore {
         self.dashboard.set_cloud_control_sink(sink);
     }
 
+    /// Consume immediately before the App applies a queued operator effect.
+    pub fn authorize_cloud_control(
+        &self,
+        request: crate::cloud::CloudControlRequest,
+    ) -> Option<crate::cloud::CloudControlIntent> {
+        self.dashboard.authorize_cloud_control(request)
+    }
+
     pub fn publish_cloud_snapshot(
         &self,
         snapshot: crate::cloud::CloudSnapshot,

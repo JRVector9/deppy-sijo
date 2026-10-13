@@ -22,6 +22,7 @@ struct Client {
     approved: bool,
 }
 struct Flow {
+    connection_id: String,
     client: String,
     redirect: String,
     resource: String,
@@ -36,11 +37,14 @@ struct Pending {
     denied: bool,
 }
 struct Access {
+    connection_id: String,
+    issued_at: u64,
     input: bool,
     expires: u64,
     _lease: std::sync::Arc<secret::RedactionLease>,
 }
 struct Refresh {
+    connection_id: String,
     client: String,
     resource: String,
     input: bool,
@@ -92,6 +96,38 @@ impl OAuth {
             .filter(|a| now < a.expires)
             .map(|a| a.input)
     }
+    pub fn principal_key(&self, key: &str, now: u64) -> Option<crate::Principal> {
+        let access = self.access.get(key).filter(|access| now < access.expires)?;
+        Some(crate::Principal {
+            id: access.connection_id.clone(),
+            name: "OAuth connection".into(),
+            auth_kind: crate::AuthKind::OAuth,
+            input_scope: access.input,
+            authenticated_at: access.issued_at,
+            expires_at: access.expires,
+        })
+    }
+    pub fn connection_expiry(&self, id: &str) -> Option<u64> {
+        self.refresh
+            .values()
+            .filter(|refresh| refresh.connection_id == id)
+            .map(|refresh| refresh.expires)
+            .max()
+    }
+    pub fn live_principals(&self, now: u64) -> Vec<crate::Principal> {
+        self.access
+            .keys()
+            .filter_map(|key| self.principal_key(key, now))
+            .collect()
+    }
+    pub fn revoke_connection(&mut self, id: &str) {
+        self.access.retain(|_, access| access.connection_id != id);
+        self.refresh
+            .retain(|_, refresh| refresh.connection_id != id);
+        self.codes.retain(|_, flow| flow.connection_id != id);
+        self.pending
+            .retain(|_, pending| pending.flow.connection_id != id);
+    }
     pub fn approvals(&mut self, now: u64) -> Vec<Approval> {
         self.prune(now);
         self.pending
@@ -138,6 +174,7 @@ impl OAuth {
         let code = token();
         p.flow.expires = (now + 60).min(client.expires);
         let flow = Flow {
+            connection_id: p.flow.connection_id.clone(),
             client: p.flow.client.clone(),
             redirect: p.flow.redirect.clone(),
             resource: p.flow.resource.clone(),
@@ -332,6 +369,7 @@ impl OAuth {
                     id.clone(),
                     Pending {
                         flow: Flow {
+                            connection_id: uuid::Uuid::new_v4().to_string(),
                             client: q["client_id"].clone(),
                             redirect,
                             resource,
@@ -360,10 +398,15 @@ impl OAuth {
                 if !self.clients.contains_key(&client) || q.get("resource") != Some(&resource) {
                     return error(400, "invalid_grant");
                 }
-                let (input, refresh_input, expiry, code_key, refresh_key, replaced_access) = match q
-                    .get("grant_type")
-                    .map(String::as_str)
-                {
+                let (
+                    connection_id,
+                    input,
+                    refresh_input,
+                    expiry,
+                    code_key,
+                    refresh_key,
+                    replaced_access,
+                ) = match q.get("grant_type").map(String::as_str) {
                     Some("authorization_code") => {
                         let key = hash(q.get("code").map(String::as_str).unwrap_or(""));
                         let Some(f) = self.codes.get(&key) else {
@@ -385,7 +428,15 @@ impl OAuth {
                         if self.access.len() >= 32 || self.refresh.len() >= 32 {
                             return error(503, "token_capacity");
                         }
-                        (f.input, f.input, expires, Some(key), None, None)
+                        (
+                            f.connection_id.clone(),
+                            f.input,
+                            f.input,
+                            expires,
+                            Some(key),
+                            None,
+                            None,
+                        )
                     }
                     Some("refresh_token") => {
                         let key = hash(q.get("refresh_token").map(String::as_str).unwrap_or(""));
@@ -416,6 +467,7 @@ impl OAuth {
                             return error(503, "token_capacity");
                         }
                         (
+                            r.connection_id.clone(),
                             input,
                             r.input,
                             r.expires,
@@ -452,6 +504,8 @@ impl OAuth {
                 self.access.insert(
                     hash(&access),
                     Access {
+                        connection_id: connection_id.clone(),
+                        issued_at: now,
                         input,
                         expires: now + ttl,
                         _lease: lease.clone(),
@@ -460,6 +514,7 @@ impl OAuth {
                 self.refresh.insert(
                     hash(&refresh),
                     Refresh {
+                        connection_id,
                         client,
                         resource,
                         input: refresh_input,
@@ -596,6 +651,7 @@ mod tests {
         o.codes.insert(
             hash(id),
             Flow {
+                connection_id: uuid::Uuid::new_v4().to_string(),
                 client: client.into(),
                 redirect: "https://client.example/callback".into(),
                 resource: "https://deppy.example/mcp".into(),
@@ -709,6 +765,10 @@ mod tests {
         let mut o = OAuth::new(secret::RedactionService::new());
         let client = registered(&mut o);
         let mut tokens = issue_scoped(&mut o, &client, "input-code", true);
+        let identity = o
+            .principal_key(&hash(tokens["access_token"].as_str().unwrap()), 102)
+            .unwrap()
+            .id;
         for (scope, time, input) in [
             (Some("deppy.input deppy.read"), 103, true),
             (Some("deppy.read"), 104, false),
@@ -732,6 +792,13 @@ mod tests {
                 Some(input)
             );
             assert_eq!(
+                o.principal_key(&hash(tokens["access_token"].as_str().unwrap()), time)
+                    .unwrap()
+                    .id,
+                identity,
+                "refresh must preserve the credential-issued connection"
+            );
+            assert_eq!(
                 tokens["scope"],
                 if input {
                     "deppy.read deppy.input"
@@ -740,6 +807,47 @@ mod tests {
                 }
             );
         }
+    }
+    #[test]
+    fn cloud_management_oauth_revoke_one_grant_keeps_other_grants_and_rejects_refresh() {
+        let mut oauth = OAuth::new(secret::RedactionService::new());
+        let client = registered(&mut oauth);
+        let a = issue_scoped(&mut oauth, &client, "grant-a", true);
+        let b = issue_scoped(&mut oauth, &client, "grant-b", true);
+        let principal_a = oauth
+            .principal_key(&hash(a["access_token"].as_str().unwrap()), 102)
+            .unwrap();
+        let principal_b = oauth
+            .principal_key(&hash(b["access_token"].as_str().unwrap()), 102)
+            .unwrap();
+        assert_ne!(
+            principal_a.id, principal_b.id,
+            "one client registration may authorize independent grants"
+        );
+        oauth.revoke_connection(&principal_a.id);
+        assert!(
+            oauth
+                .authenticate(a["access_token"].as_str().unwrap(), 103)
+                .is_none()
+        );
+        assert_eq!(
+            oauth.authenticate(b["access_token"].as_str().unwrap(), 103),
+            Some(true)
+        );
+        let body = url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs([
+                ("grant_type", "refresh_token"),
+                ("client_id", &client),
+                ("resource", "https://deppy.example/mcp"),
+                ("refresh_token", a["refresh_token"].as_str().unwrap()),
+            ])
+            .finish();
+        assert_eq!(
+            route(&mut oauth, "POST", "/oauth/token", "", &body, 103)
+                .0
+                .status,
+            400
+        );
     }
     #[test]
     fn refresh_scope_rejects_expansion_and_unknown_without_consuming_grant() {

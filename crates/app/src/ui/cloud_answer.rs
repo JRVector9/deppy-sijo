@@ -3,6 +3,8 @@
 pub struct Answer {
     pub id: String,
     pub session: String,
+    pub connection: String,
+    pub run: Option<String>,
     pub created: i64,
     pub message: String,
 }
@@ -35,8 +37,13 @@ pub fn contents(
             for (index, r) in answers.iter().enumerate() {
                 let reveal = selected_id.as_deref() == Some(r.id.as_str());
                 let response = egui::CollapsingHeader::new(format!(
-                    "{} · {}",
+                    "{} · {}{} · {}",
                     catalog.t("cloud.history_answer", &[]),
+                    r.connection,
+                    r.run
+                        .as_deref()
+                        .map(|run| format!(" · {run}"))
+                        .unwrap_or_default(),
                     crate::ui::notifications::relative_time_label(
                         catalog,
                         deppy_core::time::unix_secs_i64() - r.created
@@ -70,6 +77,8 @@ mod tests {
         let records = vec![Answer {
             id: "answer".into(),
             session: "original".into(),
+            connection: "Grok".into(),
+            run: Some("run-original".into()),
             created: deppy_core::time::unix_secs_i64(),
             message: "Grok final answer".into(),
         }];

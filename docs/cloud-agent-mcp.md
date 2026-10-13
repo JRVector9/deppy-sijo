@@ -96,6 +96,11 @@ Grok bot과 Cloud Agent 모두 같은 흐름을 사용합니다. [명시적 붙�
 | `paste_text` | 명시적 여러 줄 붙여넣기·선택적 Enter | 위 식별자, `operation_id`, `text`, `submit` |
 | `send_ctrl_c` | Ctrl+C 한 번 보내기 | 위 식별자, `operation_id` |
 | `notify` | 봇 자체 답변 저장·알림 | 위 식별자, `operation_id`, `message` |
+| `start_run` / `update_run` | 원래 세션에 작업 등록·상태 보고 | `session_id`, `generation`, `run_id`, 제목 또는 상태·진행률·결과 |
+| `get_run` / `list_runs` | 자신의 작업·취소 요청 조회 | 원래 세션·작업 ID 또는 제한된 목록 조건 |
+| `acquire_control` / `release_control` | 허용받은 세션의 단일 입력 제어 임대 | 원래 세션·generation, 선택적 `run_id`, 임대 시 `ttl_seconds` 1–120 |
+| `get_operation` | 입력을 다시 보내지 않고 자신의 수신증 조회 | 원래 세션·generation, 동일 `operation_id` |
+| `read_history` | 제한된 출력 이력 읽기 | 원래 세션·generation, 선택적 cursor, `max_bytes` 최대 65536 |
 
 - `submit` 기본값은 `false`입니다. `send_text`는 개행·탭·ESC·제어문자를 거부합니다. `paste_text`는 확인된 DEC 2004 모드에서 LF·CRLF·탭을 허용하며, 단독 CR·ESC·나머지 제어문자는 거부합니다. Enter는 `submit=true`, Ctrl+C는 별도 도구로만 보냅니다.
 - `send_text`는 최대 8 KiB, `paste_text`는 최대 32 KiB, 답변은 최대 16 KiB의 UTF-8 바이트입니다. paste의 직렬화한 arguments와 전체 HTTP 요청은 각각 64 KiB 제한이 있어 JSON 이스케이프나 봉투 때문에 먼저 거부될 수 있습니다. 등록된 비밀은 화면과 수신 답변에서 가립니다.
@@ -107,6 +112,16 @@ Grok bot과 Cloud Agent 모두 같은 흐름을 사용합니다. [명시적 붙�
 - 화면 읽기는 최신 가시 화면 스냅샷입니다. 모든 stdout 바이트를 빠짐없이 전달하는 로그 스트림은 아닙니다. 커서가 달라지면 새 화면을 반환하고, `reset=true`이면 화면을 다시 동기화하세요. 응답은 최신 관측 캐시이며 `may_be_stale=true`와 `refresh_requested=true`를 명시합니다. `screen:null`은 캐시가 동일하다는 뜻일 뿐 새 출력이 없다는 확인이 아닙니다. `retry_after_ms` 뒤 다시 읽으면 비동기 갱신 화면을 받을 수 있습니다.
 - 읽을 때 기존 15초 원격 화면 표시 임대를 갱신하므로 숨겨진 warm 워크스페이스도 화면을 갱신합니다. 탭 전환을 강요하지 않습니다.
 - 세션 종료·새 런타임 복원으로 generation이 바뀌면 입력을 거부하고 공유 권한을 다시 받아야 합니다.
+
+## 설정에서 연결과 작업 관리
+
+**연결 목록**은 발급된 인증 정보와 실제 인증·초기화·성공한 도구 호출을 구분합니다. 제공자의 이름이나 MCP 서버 준비 표시만으로 실제 계정 연결이 검증되지는 않습니다. OAuth 승인 후 해당 연결을 선택하거나, 수동 Bearer 커넥터마다 이름을 정해 **독립 토큰 발급 및 복사**를 사용하세요. 토큰은 발급 시 한 번 클립보드에 복사하며, 프로필이나 연결 목록에는 저장·표시하지 않습니다. 입력 범위는 기본적으로 꺼져 있고, 범위를 포함해 발급해도 세션별 입력 권한은 따로 승인해야 합니다.
+
+연결을 선택한 뒤 세션별 읽기·답변 수신과 입력을 각각 허용합니다. 단일 입력 제어 임대의 소유자와 만료 시간이 표시됩니다. **이 세션의 입력 제어 회수**는 그 세션의 입력 권한과 임대를 철회하며, 실행 중인 명령에 Ctrl+C를 보내지는 않습니다. **이 연결 철회**는 선택한 인증 연결을 철회합니다. 기존 공유 Bearer와 여섯 도구도 유지하지만, 새 연결은 명시적인 사용자 동의가 필요합니다.
+
+**클라우드 작업**은 에이전트가 보고한 상태·진행률·최근 보고 시각을 표시합니다. 원래 세션의 로컬 AI 상태와 별도로 보며, 진행률 100%나 조용한 화면을 자동 완료 판단에 사용하지 않습니다. 결과와 실제 산출물 링크, 원래 워크스페이스·세션·generation을 확인할 수 있습니다. **원래 세션으로 이동**은 이 보고에 저장된 워크스페이스와 세션을 열며 입력 권한을 추가하지 않습니다. 세션이 없으면 오류를 표시하고 보고의 원래 대상은 유지합니다. 검색과 상태 필터는 제한된 최근 캐시를 대상으로 합니다. **취소 요청** 뒤에도 에이전트가 승인하기 전까지 실행 상태를 유지합니다. 입력 제어 회수, 작업 취소 요청, Ctrl+C는 서로 다른 동작입니다.
+
+**연결 프로필**에는 이름·포트·호스트·자동/고정 주소 방식만 저장합니다. 서버를 중지한 뒤 프로필을 불러오고, 커넥터 인증과 세션 권한을 다시 확인하세요. 일시적인 네트워크 오류의 자동 주소 복구는 선택적으로 활성화할 수 있으며 횟수가 제한됩니다. 주소 변경은 커넥터에 반영해야 하고, 인증 만료나 직접 중지는 사용자 조치가 필요합니다. 이전 입력·권한은 자동 복원하지 않습니다. 자세한 흐름은 [연결별 권한·작업·이력 안내](cloud-agent-mcp-guide.md)를 참고하세요.
 
 ## 로컬 저장과 재연결
 
@@ -123,7 +138,7 @@ Mac이나 Deppy가 꺼져 있으면 연결은 실패합니다. 봇은 나중에 
 | OpenAI dot | 클라우드 컴퓨터·연결 앱·작업 사용 | 미검증 · 임의 Deppy MCP 등록 경로 미확인 | 커넥터 등록, 인증 방식, 권한, 갱신, `notify` 반환 |
 | Meta Muse | 자체 VM·브라우저·연결 앱·장기 작업 | 미검증 · 임의 Deppy MCP 등록 경로 미확인 | 공개 MCP 등록 가능 여부, 인증 정책, 도구 호출, 결과 반환 |
 | Grok Bot | MCP 서버·플러그인·스킬 지원 | 미검증 · Deppy 실제 계정 테스트 미실행 | URL 등록, OAuth 또는 Bearer, 갱신, multiline, `notify`, 재연결 |
-| Grok 웹 Custom MCP | 공개 MCP URL 등록과 인증 흐름 | 미검증 · Grok Bot과 별도 제품 | 해당 계정의 인증 방식, 여섯 도구 탐색, 호출·답변 저장 |
+| Grok 웹 Custom MCP | 공개 MCP URL 등록과 인증 흐름 | 미검증 · Grok Bot과 별도 제품 | 해당 계정의 인증 방식, 도구 탐색·권한·작업 보고·답변 저장 |
 
 공식 자료: [OpenAI dot 안내](https://help.openai.com/en/articles/20001530-getting-started-with-your-dot), [Meta Muse 발표](https://about.fb.com/news/2026/09/introducing-muse-personal-ai-agent/), [Grok Bot 가이드](https://x.ai/bot/guides/grok-bot-101), [Grok 웹 커넥터 안내](https://docs.x.ai/grok/connectors). 이 자료만으로 Deppy OAuth·도구 호출·응답 반환의 호환성을 보장하지 않습니다.
 
@@ -141,4 +156,4 @@ cargo build -p deppy-sijo --release
 
 저장소의 테스트는 로컬 OAuth/HTTP→App→테스트 PTY 입력 수락→실행 출력→테스트 에이전트 자체 답변, 권한·중복 수신·보존·egui 표시를 대상으로 합니다. 이 문서의 명령 목록은 실행 결과 보고가 아닙니다. 해당 변경의 실제 실행 결과는 프로젝트 handoff에 기록합니다. 실제 제공자 계정 등록·인터넷 터널·봇의 도구 호출 준수 여부는 위 표의 별도 검증 대상입니다.
 
-runtime wire 버전은22입니다. paste의 모드 입장 조건은 로컬 전용이며 wire 버전을 추가 변경하지 않습니다. 별도 runtime 피어를 사용한다면 같은 버전으로 빌드해야 하며, 이전 버전은 handshake에서 거부됩니다. SSH 터미널 세션은 기존 로컬 runtime의 PTY를 계속 사용합니다.
+현재 소스의 runtime wire 버전은30입니다(`crates/runtime/src/protocol.rs`). 별도 runtime 피어를 사용한다면 같은 버전으로 빌드해야 하며, 이전 버전은 handshake에서 거부됩니다. MCP 도구·DB 스키마 버전은 runtime wire와 별도로 관리합니다. SSH 터미널 세션은 기존 로컬 runtime의 PTY를 계속 사용합니다.

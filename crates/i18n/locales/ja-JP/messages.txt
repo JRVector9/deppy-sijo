@@ -1804,3 +1804,11 @@ project_keys.change_value = 値を保存
 project_keys.change_storage = 保存状態変更
 project_keys.change_remote = GitHub状態変更
 project_keys.remote_only_hint = ローカル値なしでGitHubの送信先を記録します。コピー・ビルド・送信にはローカルキーが必要です。保存後に送信先を設定してください。
+
+cloud.local_agent = エージェント · {agent}
+cloud.local_shell = シェル
+cloud.local_exited = 終了
+cloud.local_unknown = 観測情報なし
+cloud.local_observed = 状態観測 · {age} 前
+cloud.local_observation_unknown = 状態の観測時刻なし
+cloud.run_navigation_opened = 元のセッションを開きました。

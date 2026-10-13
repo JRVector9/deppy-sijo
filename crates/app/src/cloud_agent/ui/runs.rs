@@ -14,6 +14,7 @@ struct RunsState {
     search: String,
     filter: Filter,
     notice: Option<(String, String, &'static str, Option<String>)>,
+    navigation_notice: Option<(String, String, u64)>,
 }
 
 impl CloudAgent {
@@ -123,16 +124,25 @@ impl CloudAgent {
                                 .button(catalog.t("cloud.run_open_original", &[]))
                                 .clicked()
                             {
-                                let error = self
-                                    .request_run_navigation(&run.workspace, &run.session)
-                                    .err();
-                                let key = if error.is_some() {
-                                    "cloud.run_navigation_failed"
-                                } else {
-                                    "cloud.run_navigation_queued"
-                                };
-                                state.notice =
-                                    Some((run.connection_id.clone(), run.id.clone(), key, error));
+                                state.notice = None;
+                                match self.request_run_navigation(&run.workspace, &run.session) {
+                                    Ok(request) => {
+                                        state.navigation_notice = Some((
+                                            run.connection_id.clone(),
+                                            run.id.clone(),
+                                            request,
+                                        ))
+                                    }
+                                    Err(error) => {
+                                        state.navigation_notice = None;
+                                        state.notice = Some((
+                                            run.connection_id.clone(),
+                                            run.id.clone(),
+                                            "cloud.run_navigation_failed",
+                                            Some(error),
+                                        ));
+                                    }
+                                }
                                 ui.ctx().request_repaint();
                             }
                             ui.weak(catalog.t("cloud.run_navigation_hint", &[]));
@@ -146,10 +156,13 @@ impl CloudAgent {
                                     && target.generation == run.generation
                                     && target.workspace == run.workspace
                             }) {
-                                if let Some(local) = &target.agent_line {
-                                    ui.weak(
-                                        catalog.t("cloud.run_local_status", &[("status", local)]),
-                                    );
+                                ui.weak(catalog.t(
+                                    "cloud.run_local_status",
+                                    &[("status", &target.local_status_label(catalog))],
+                                ));
+                                ui.weak(target.local_observation_label(catalog));
+                                if let Some(agent) = &target.agent_line {
+                                    ui.weak(catalog.t("cloud.local_agent", &[("agent", agent)]));
                                 }
                                 if let Some(observed) = target.screen_observed_at {
                                     let age = crate::ui::notifications::relative_time_label(
@@ -220,6 +233,22 @@ impl CloudAgent {
                                 let response = ui.label(catalog.t(key, &[]));
                                 if let Some(code) = error {
                                     response.on_hover_text(code);
+                                }
+                            }
+                            if let Some((connection, id, request)) = &state.navigation_notice
+                                && connection == &run.connection_id
+                                && id == &run.id
+                            {
+                                let (key, error) = match self.run_navigation_result(*request) {
+                                    Some(Ok(())) => ("cloud.run_navigation_opened", None),
+                                    Some(Err(error)) => {
+                                        ("cloud.run_navigation_failed", Some(error))
+                                    }
+                                    None => ("cloud.run_navigation_queued", None),
+                                };
+                                let response = ui.label(catalog.t(key, &[]));
+                                if let Some(error) = error {
+                                    response.on_hover_text(error);
                                 }
                             }
                             ui.weak(catalog.t("cloud.run_cancel_hint", &[]));

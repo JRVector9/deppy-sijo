@@ -4,6 +4,61 @@ use agent_mcp::{AuthKind, ConnectionState, RunState, now};
 use std::sync::Arc;
 use web_remote::cloud::*;
 
+impl super::Target {
+    /// Reuse the App's visual-state contract; provider/model text is identity only.
+    pub(crate) fn local_status_name(&self) -> Option<&'static str> {
+        use crate::agent_surface::AgentVisualState as State;
+        if !self.live {
+            return Some("exited");
+        }
+        match State::from_pty_with_agent(self.local_status, self.local_agent_present) {
+            State::Active => Some("running"),
+            State::NeedsResponse => Some("waiting"),
+            State::Waiting => Some("needs_approval"),
+            State::Idle => Some("idle"),
+            State::Error => Some("error"),
+            State::Complete => Some("done"),
+            State::Off
+                if !self.local_agent_present
+                    && (!self.known_ai
+                        || self.local_status == Some(runtime::SessionStatus::Idle)) =>
+            {
+                Some("shell")
+            }
+            State::Off => None,
+        }
+    }
+
+    pub(crate) fn local_status_label(&self, catalog: &i18n::Catalog) -> String {
+        let key = match self.local_status_name() {
+            Some("running") => "status.running",
+            Some("waiting") => "status.waiting",
+            Some("needs_approval") => "status.needs_approval",
+            Some("idle") => "status.idle",
+            Some("error") => "status.error",
+            Some("done") => "status.done",
+            Some("exited") => "cloud.local_exited",
+            Some("shell") => "cloud.local_shell",
+            _ => "cloud.local_unknown",
+        };
+        catalog.t(key, &[])
+    }
+
+    pub(crate) fn local_observation_label(&self, catalog: &i18n::Catalog) -> String {
+        let Some(observed) = self
+            .local_status_observed_at
+            .filter(|_| self.local_status_name().is_some())
+        else {
+            return catalog.t("cloud.local_observation_unknown", &[]);
+        };
+        let age = crate::ui::notifications::relative_time_label(
+            catalog,
+            i64::try_from(now().saturating_sub(observed)).unwrap_or(i64::MAX),
+        );
+        catalog.t("cloud.local_observed", &[("age", &age)])
+    }
+}
+
 fn last_connection_activity(info: &agent_mcp::ConnectionInfo) -> Option<i64> {
     [
         info.last_tool_success_at,
@@ -86,46 +141,57 @@ impl CloudAgent {
             .cloud_runs()
             .iter()
             .take(MAX_CLOUD_ROWS)
-            .map(|run| CloudRunView {
-                id: run.id.clone(),
-                connection_id: run.connection_id.clone(),
-                connection_name: self.redact(&run.connection_name),
-                workspace_id: run.workspace.clone(),
-                session_id: run.session.clone(),
-                generation: run.generation.clone(),
-                title: self.redact(&run.title),
-                state: serde_json::to_value(run.state)
-                    .ok()
-                    .and_then(|v| v.as_str().map(str::to_owned))
-                    .unwrap_or_else(|| "unknown".into()),
-                message: self.redact(&run.message),
-                progress: run.progress,
-                local_status: self
-                    .targets
-                    .iter()
-                    .find(|t| t.id == run.session && t.generation == run.generation)
-                    .and_then(|t| t.agent_line.as_deref())
-                    .map(|line| {
-                        let mut text = self.redact(line);
-                        super::truncate_utf8(&mut text, 64);
-                        text
-                    }),
-                created_at: run.created,
-                updated_at: run.updated,
-                stale: run.state == RunState::Unknown,
-                result: run.result.as_deref().map(|result| self.redact(result)),
-                artifacts: run
-                    .artifacts
-                    .iter()
-                    .filter(|a| a.validate().is_ok() && self.redact(&a.uri) == a.uri)
-                    .map(|a| CloudArtifactView {
-                        label: self.redact(&a.label),
-                        uri: a.uri.clone(),
-                    })
-                    .filter(|a| a.validate().is_ok())
-                    .collect(),
-                cancel_requested_at: run.cancel_requested_at,
-                cancel_acknowledged_at: run.cancel_acknowledged_at,
+            .map(|run| {
+                let target = self.targets.iter().find(|target| {
+                    target.workspace == run.workspace
+                        && target.id == run.session
+                        && target.generation == run.generation
+                });
+                CloudRunView {
+                    id: run.id.clone(),
+                    connection_id: run.connection_id.clone(),
+                    connection_name: self.redact(&run.connection_name),
+                    workspace_id: run.workspace.clone(),
+                    session_id: run.session.clone(),
+                    generation: run.generation.clone(),
+                    title: self.redact(&run.title),
+                    state: serde_json::to_value(run.state)
+                        .ok()
+                        .and_then(|v| v.as_str().map(str::to_owned))
+                        .unwrap_or_else(|| "unknown".into()),
+                    message: self.redact(&run.message),
+                    progress: run.progress,
+                    agent_line: target.and_then(|target| target.agent_line.as_deref()).map(
+                        |line| {
+                            let mut text = self.redact(line);
+                            super::truncate_utf8(&mut text, 512);
+                            text
+                        },
+                    ),
+                    local_status: target
+                        .and_then(super::Target::local_status_name)
+                        .map(str::to_owned),
+                    local_status_observed_at: target
+                        .filter(|target| target.local_status_name().is_some())
+                        .and_then(|target| target.local_status_observed_at)
+                        .and_then(|observed| i64::try_from(observed).ok()),
+                    created_at: run.created,
+                    updated_at: run.updated,
+                    stale: run.state == RunState::Unknown,
+                    result: run.result.as_deref().map(|result| self.redact(result)),
+                    artifacts: run
+                        .artifacts
+                        .iter()
+                        .filter(|a| a.validate().is_ok() && self.redact(&a.uri) == a.uri)
+                        .map(|a| CloudArtifactView {
+                            label: self.redact(&a.label),
+                            uri: a.uri.clone(),
+                        })
+                        .filter(|a| a.validate().is_ok())
+                        .collect(),
+                    cancel_requested_at: run.cancel_requested_at,
+                    cancel_acknowledged_at: run.cancel_acknowledged_at,
+                }
             })
             .collect();
         snapshot.answers = self
@@ -229,6 +295,101 @@ impl CloudAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn registered_run(target: &super::super::Target) -> CloudAgent {
+        let mut bridge = CloudAgent::memory();
+        bridge.server = Some(agent_mcp::Server::start(0, "", || {}).unwrap());
+        bridge.set_targets(vec![target.clone()]);
+        bridge.share(target, true);
+        let auth = &bridge.server.as_ref().unwrap().auth;
+        let header = format!("Bearer {}", auth.token_for_user().as_str());
+        let (reply, receiver) = std::sync::mpsc::sync_channel(1);
+        let request = agent_mcp::Request {
+            epoch: auth.authenticate(&header, now()).unwrap(),
+            principal: auth.authenticate_principal(&header, now()).unwrap(),
+            access_key: None,
+            input_scope: true,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(3),
+            tool: "start_run".into(),
+            args: serde_json::json!({"session_id":target.id,"generation":target.generation,"run_id":"observed-run","title":"Observed status"}),
+            reply,
+        };
+        assert!(
+            bridge
+                .prepare_management(&request, Some(target))
+                .unwrap()
+                .is_none()
+        );
+        bridge.drain_history(|_, _| panic!("run registration has no terminal effect"));
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap()
+                .is_ok()
+        );
+        bridge
+    }
+    #[test]
+    fn local_runtime_status_is_independent_of_model_identity() {
+        let mut target = super::super::Target::fixture("observed-session", "generation-original");
+        target.agent_line = Some("Codex · gpt-6.1-sol · xhigh".into());
+        target.known_ai = true;
+        target.local_agent_present = true;
+        target.local_status_observed_at = Some(123);
+        let mut bridge = registered_run(&target);
+        for (status, expected) in [
+            (Some(runtime::SessionStatus::Running), Some("running")),
+            (Some(runtime::SessionStatus::Waiting), Some("waiting")),
+            (
+                Some(runtime::SessionStatus::NeedsApproval),
+                Some("needs_approval"),
+            ),
+            (Some(runtime::SessionStatus::Idle), Some("idle")),
+            (Some(runtime::SessionStatus::Error), Some("error")),
+            (Some(runtime::SessionStatus::Done), Some("done")),
+            (None, None),
+        ] {
+            target.local_status = status;
+            bridge.set_targets(vec![target.clone()]);
+            let snapshot = bridge.cloud_snapshot();
+            assert_eq!(
+                snapshot.runs[0].local_status.as_deref(),
+                expected,
+                "{status:?}"
+            );
+            assert_eq!(snapshot.runs[0].agent_line, target.agent_line);
+            assert_eq!(
+                snapshot.runs[0].local_status_observed_at,
+                expected.map(|_| 123)
+            );
+            assert_eq!(
+                snapshot.runs[0].state, "queued",
+                "local state cannot rewrite the cloud report"
+            );
+        }
+        target.live = false;
+        bridge.set_targets(vec![target.clone()]);
+        assert_eq!(
+            bridge.cloud_snapshot().runs[0].local_status.as_deref(),
+            Some("exited")
+        );
+        target.live = true;
+        target.known_ai = false;
+        target.local_agent_present = false;
+        target.agent_line = None;
+        target.local_status = Some(runtime::SessionStatus::Idle);
+        bridge.set_targets(vec![target.clone()]);
+        assert_eq!(
+            bridge.cloud_snapshot().runs[0].local_status.as_deref(),
+            Some("shell")
+        );
+        target.known_ai = true;
+        bridge.set_targets(vec![target]);
+        assert_eq!(
+            bridge.cloud_snapshot().runs[0].local_status.as_deref(),
+            Some("shell"),
+            "safety classification cannot keep a disappeared agent visually idle"
+        );
+    }
     #[test]
     fn app_operator_mailbox_rechecks_the_origin_after_queue_admission() {
         let bridge = CloudAgent::memory();

@@ -1,8 +1,9 @@
 // Shared operator results view. This view only emits App-owned cloud intents.
 export function createCloudResultsView({ host, send, navigate = () => {}, beginNavigation = () => {}, onVisibility = () => {}, prefix = 'cloud' }) {
-  const node = (tag, className, text) => {
+  const node = (tag, className, text, key = className || tag) => {
     const element = document.createElement(tag);
     if (className) element.className = className;
+    element.dataset.cloudKey = key;
     if (text !== undefined) element.textContent = String(text);
     return element;
   };
@@ -26,10 +27,11 @@ export function createCloudResultsView({ host, send, navigate = () => {}, beginN
   panel.append(heading, help, toolbar, status, retained, list); host.append(toggle, panel);
   let snapshot = null, canControl = false, canApprove = false, sequence = 0;
   const pending = new Map();
+  const actionBindings = new WeakMap();
   const rows = value => Array.isArray(value) ? value.slice(0, 100) : [];
   const normalize = value => String(value || '').normalize('NFC').toLocaleLowerCase();
   const stateLabels = { queued:'접수됨', running:'진행 중', waiting:'대기 중', completed:'완료 보고', failed:'실패 보고', cancelled:'취소 보고', unknown:'상태 미확인' };
-  const localLabels = { running:'실행 중', waiting:'입력 대기', needs_approval:'승인 필요', idle:'유휴', error:'오류', done:'완료 관측' };
+  const localLabels = { running:'실행 중', waiting:'입력 대기', needs_approval:'승인 필요', idle:'유휴', error:'오류', done:'완료 관측', exited:'종료됨', shell:'셸' };
   const connectionLabels = { active:'인증됨', waiting:'인증 대기', revoked:'취소됨', expired:'인증 만료' };
   const scopeLabel = value => ['input','read+input'].includes(value) ? '입력 허용' : '읽기 전용';
   const matches = row => !search.value || normalize([row.title,row.body,row.result,row.message,row.name,row.connection_name,row.id,row.connection_id,row.workspace_id,row.session_id].join(' ')).includes(normalize(search.value));
@@ -38,27 +40,78 @@ export function createCloudResultsView({ host, send, navigate = () => {}, beginN
   function action(label, intent, allowed = canControl) {
     const button = node('button', '', label); button.type = 'button'; button.dataset.cloudAction = intent.action;
     button.disabled = !allowed || Array.from(pending.values()).some(entry => entry.key === keyOf(intent));
-    button.addEventListener('click', () => {
-      if (button.disabled || !snapshot || pending.size >= 16) return;
-      const request = sequence = sequence >= 0xffffffff ? 1 : sequence + 1;
-      if (send({ type:'cloud_control', request, intent }) === false) { status.textContent = '연결을 확인하고 다시 요청하세요.'; return; }
-      if (intent.action === 'navigate') { cancelNavigation(); beginNavigation(); }
-      button.disabled = true;
-      const timer = setTimeout(() => {
-        if (!pending.delete(request)) return;
-        status.textContent = '요청 접수를 확인하지 못했습니다. 최신 상태를 확인하세요.'; render();
-      }, 15000);
-      pending.set(request, { key:keyOf(intent), timer, intent });
-      status.textContent = '요청을 보냈습니다. 최신 상태로 결과를 확인합니다.';
-    });
+    button.dataset.cloudKey = JSON.stringify([intent.action, intent.allow]);
+    actionBindings.set(button, { intent, allowed });
     return button;
+  }
+  list.addEventListener('click', event => {
+    const button = event.target.closest('button[data-cloud-action]');
+    const binding = button && actionBindings.get(button);
+    if (!binding || button.disabled || !binding.allowed || !snapshot || pending.size >= 16) return;
+    const { intent } = binding;
+    // Retained buttons consume current authority and current target bindings.
+    if (!(intent.action === 'approve_connection' ? canApprove : canControl)) return;
+    const request = sequence = sequence >= 0xffffffff ? 1 : sequence + 1;
+    if (send({ type:'cloud_control', request, intent }) === false) { status.textContent = '연결을 확인하고 다시 요청하세요.'; return; }
+    if (intent.action === 'navigate') { cancelNavigation(); beginNavigation(); }
+    button.disabled = true;
+    const timer = setTimeout(() => {
+      if (!pending.delete(request)) return;
+      status.textContent = '요청 접수를 확인하지 못했습니다. 최신 상태를 확인하세요.'; render();
+    }, 15000);
+    pending.set(request, { key:keyOf(intent), timer, intent });
+    status.textContent = '요청을 보냈습니다. 최신 상태로 결과를 확인합니다.';
+  });
+  function reconcile(parent, desired) {
+    const key = (child, index) => child.nodeType === 1 ? child.dataset.cloudKey : '#text:' + index;
+    const current = new Map();
+    for (const [index, child] of Array.from(parent.childNodes).entries()) {
+      const identity = key(child, index);
+      if (!current.has(identity)) current.set(identity, []);
+      current.get(identity).push(child);
+    }
+    let cursor = parent.firstChild;
+    for (const [index, fresh] of Array.from(desired.childNodes).entries()) {
+      const identity = key(fresh, index);
+      let retained = current.get(identity)?.shift();
+      if (!retained || retained.nodeName !== fresh.nodeName) {
+        retained?.remove(); retained = fresh;
+      }
+      else if (fresh.nodeType === 3) {
+        if (retained.nodeValue !== fresh.nodeValue) retained.nodeValue = fresh.nodeValue;
+      } else {
+        for (const attribute of Array.from(retained.attributes)) {
+          if (!fresh.hasAttribute(attribute.name)) retained.removeAttribute(attribute.name);
+        }
+        for (const attribute of fresh.attributes) {
+          if (retained.getAttribute(attribute.name) !== attribute.value) retained.setAttribute(attribute.name, attribute.value);
+        }
+        if (actionBindings.has(fresh)) actionBindings.set(retained, actionBindings.get(fresh));
+        reconcile(retained, fresh);
+      }
+      if (retained !== cursor) parent.insertBefore(retained, cursor);
+      cursor = retained.nextSibling;
+    }
+    for (const remaining of current.values()) for (const obsolete of remaining) obsolete.remove();
+  }
+  function updateList(desired) {
+    const focused = list.contains(document.activeElement) ? document.activeElement : null;
+    const selection = window.getSelection();
+    const selected = selection && list.contains(selection.anchorNode) && list.contains(selection.focusNode)
+      ? { anchor:selection.anchorNode, anchorOffset:selection.anchorOffset, focus:selection.focusNode, focusOffset:selection.focusOffset } : null;
+    reconcile(list, desired);
+    if (focused?.isConnected && !focused.disabled && document.activeElement !== focused) focused.focus({ preventScroll:true });
+    if (selected?.anchor.isConnected && selected.focus.isConnected) {
+      const limit = point => point.nodeType === 3 ? point.length : point.childNodes.length;
+      selection.setBaseAndExtent(selected.anchor, Math.min(selected.anchorOffset, limit(selected.anchor)), selected.focus, Math.min(selected.focusOffset, limit(selected.focus)));
+    }
   }
   function artifacts(card, references) {
     for (const reference of rows(references).slice(0, 16)) {
       let url;
       try { url = new URL(reference.uri); } catch { continue; }
       if (!['https:','http:'].includes(url.protocol) || url.username || url.password || !url.hostname) continue;
-      const link = node('a', 'cloud-artifact', reference.label || '결과물'); link.href = url.href; link.target = '_blank'; link.rel = 'noopener noreferrer';
+      const link = node('a', 'cloud-artifact', reference.label || '결과물', url.href); link.href = url.href; link.target = '_blank'; link.rel = 'noopener noreferrer';
       card.append(link);
     }
   }
@@ -76,50 +129,54 @@ export function createCloudResultsView({ host, send, navigate = () => {}, beginN
     card.append(actions);
   }
   function render() {
-    list.replaceChildren();
     if (!snapshot) return;
+    const desired = node('div');
     toggle.hidden = false;
     retained.textContent = snapshot.truncated ? '최근 항목만 표시합니다. 각 목록 최대 100개입니다.' : '최근 작업과 저장 답변 · 각 목록 최대 100개';
     let count = 0;
     if (filter.value === 'all') {
       for (const connection of rows(snapshot.connections).filter(matches)) {
-        const card = node('article', 'cloud-card cloud-connection');
+        const card = node('article', 'cloud-card cloud-connection', undefined, 'connection:' + connection.id);
         card.append(node('h3', '', connection.name || connection.id));
         card.append(node('p', 'cloud-source', '클라우드 연결 · ' + (connectionLabels[connection.state] || connection.state || '상태 미확인') + ' · ' + scopeLabel(connection.input_scope)));
         card.append(action('연결 취소', { action:'revoke_connection', connection_id:connection.id }, canControl && connection.state !== 'revoked'));
-        list.append(card); count++;
+        desired.append(card); count++;
       }
       for (const approval of (canApprove ? rows(snapshot.approvals) : []).filter(matches)) {
-        const card = node('article', 'cloud-card'); card.append(node('h3', '', '연결 승인 · ' + approval.connection_name));
+        const card = node('article', 'cloud-card', undefined, 'approval:' + approval.id); card.append(node('h3', '', '연결 승인 · ' + approval.connection_name));
         card.append(node('p', 'cloud-source', '요청 범위 · ' + scopeLabel(approval.scope)));
         const actions = node('div', 'cloud-actions');
         actions.append(action('연결 승인', { action:'approve_connection', approval_id:approval.id, allow:true }, canApprove), action('거절', { action:'approve_connection', approval_id:approval.id, allow:false }, canApprove));
-        card.append(actions); list.append(card); count++;
+        card.append(actions); desired.append(card); count++;
       }
     }
     for (const run of rows(snapshot.runs).filter(matches)) {
       if (filter.value === 'active' && terminal(run)) continue;
       if (filter.value === 'results' && !run.result && !rows(run.artifacts).length) continue;
       if (filter.value === 'unknown' && run.state !== 'unknown' && !run.stale) continue;
-      const card = node('article', 'cloud-card'); card.dataset.cloudRun = run.id;
+      const card = node('article', 'cloud-card', undefined, JSON.stringify(['run',run.connection_id,run.id])); card.dataset.cloudRun = run.id;
       card.append(node('h3', '', run.title || run.id)); source(card, run);
       const reported = stateLabels[run.state] || '상태 미확인';
       card.append(node('p', 'cloud-reported', '클라우드 보고 · ' + reported + (run.progress === undefined || run.progress === null ? '' : ' · ' + run.progress + '%')));
-      card.append(node('p', 'cloud-local', '로컬 터미널 · ' + (localLabels[run.local_status] || run.local_status || '관측 정보 없음')));
+      if (run.agent_line) card.append(node('p', 'cloud-agent', '로컬 에이전트 · ' + run.agent_line));
+      card.append(node('p', 'cloud-local', '로컬 터미널 · ' + (localLabels[run.local_status] || '관측 정보 없음')));
+      const observed = Number.isSafeInteger(run.local_status_observed_at) && run.local_status_observed_at >= 0 ? new Date(run.local_status_observed_at * 1000) : null;
+      card.append(node('p', 'cloud-local-observed', observed && Number.isFinite(observed.getTime()) ? '관측 시각 · ' + observed.toLocaleString() : '관측 시각 정보 없음'));
       if (run.stale) card.append(node('p', 'cloud-warning', '보고가 오래됨 · 결과 확인 필요'));
       if (run.cancel_acknowledged_at) card.append(node('p', 'cloud-cancel', '취소 확인됨 · 에이전트 확인 보고'));
       else if (run.cancel_requested_at) card.append(node('p', 'cloud-cancel', '취소 요청됨 · 에이전트 확인 대기'));
-      if (run.message) card.append(node('p', 'cloud-body', run.message));
-      if (run.result) card.append(node('p', 'cloud-body', run.result));
-      artifacts(card, run.artifacts); originalActions(card, run, true); list.append(card); count++;
+      if (run.message) card.append(node('p', 'cloud-body', run.message, 'message'));
+      if (run.result) card.append(node('p', 'cloud-body', run.result, 'result'));
+      artifacts(card, run.artifacts); originalActions(card, run, true); desired.append(card); count++;
     }
     if (['all','results'].includes(filter.value)) for (const answer of rows(snapshot.answers).filter(matches)) {
-      const card = node('article', 'cloud-card'); card.dataset.cloudAnswer = answer.id;
+      const card = node('article', 'cloud-card', undefined, JSON.stringify(['answer',answer.connection_id,answer.id])); card.dataset.cloudAnswer = answer.id;
       card.append(node('h3', '', answer.title || '저장 답변')); source(card, answer);
-      card.append(node('p', 'cloud-source', '에이전트 자체 답변 · ' + (answer.run_id || '작업 ID 없음')));
-      card.append(node('p', 'cloud-body', answer.body)); artifacts(card, answer.artifacts); originalActions(card, answer, false); list.append(card); count++;
+      card.append(node('p', 'cloud-source', '에이전트 자체 답변 · ' + (answer.run_id || '작업 ID 없음'), 'answer-report'));
+      card.append(node('p', 'cloud-body', answer.body)); artifacts(card, answer.artifacts); originalActions(card, answer, false); desired.append(card); count++;
     }
-    if (!count) list.append(node('p', 'cloud-empty', search.value ? '검색 결과가 없습니다.' : '저장된 클라우드 작업이 없습니다.'));
+    if (!count) desired.append(node('p', 'cloud-empty', search.value ? '검색 결과가 없습니다.' : '저장된 클라우드 작업이 없습니다.'));
+    updateList(desired);
   }
   toggle.addEventListener('click', () => {
     panel.hidden = !panel.hidden; toggle.setAttribute('aria-expanded', String(!panel.hidden)); onVisibility(!panel.hidden);

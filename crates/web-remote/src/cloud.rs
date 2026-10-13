@@ -49,7 +49,11 @@ pub struct CloudRunView {
     pub state: String,
     pub message: String,
     pub progress: Option<u8>,
+    /// Provider/model identity, separate from the observed execution state.
+    pub agent_line: Option<String>,
     pub local_status: Option<String>,
+    /// Source observation time; absent when the App has no reliable timestamp.
+    pub local_status_observed_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
     pub stale: bool,
@@ -400,6 +404,25 @@ impl CloudSnapshot {
                 MAX_CLOUD_TEXT_BYTES,
             )?;
             fields(&[run.local_status.as_deref().unwrap_or_default()], 64)?;
+            fields(&[run.agent_line.as_deref().unwrap_or_default()], 512)?;
+            if run.local_status.as_deref().is_some_and(|state| {
+                !matches!(
+                    state,
+                    "running"
+                        | "waiting"
+                        | "needs_approval"
+                        | "idle"
+                        | "error"
+                        | "done"
+                        | "exited"
+                        | "shell"
+                )
+            }) || run
+                .local_status_observed_at
+                .is_some_and(|at| at < 0 || run.local_status.is_none())
+            {
+                return Err(CloudSnapshotError::InvalidValue);
+            }
             if !matches!(
                 run.state.as_str(),
                 "queued" | "running" | "waiting" | "completed" | "failed" | "cancelled" | "unknown"
@@ -482,6 +505,29 @@ mod tests {
                 .request_cloud_control(guard, control_intent())
         );
         rx.try_recv().unwrap()
+    }
+
+    #[test]
+    fn local_execution_status_rejects_model_identity() {
+        let mut snapshot = CloudSnapshot {
+            runs: vec![run()],
+            ..Default::default()
+        };
+        snapshot.runs[0].local_status = Some("Codex · gpt-6.1-sol · xhigh".into());
+        assert_eq!(snapshot.validate(), Err(CloudSnapshotError::InvalidValue));
+        for state in [
+            "running",
+            "waiting",
+            "needs_approval",
+            "idle",
+            "error",
+            "done",
+            "exited",
+            "shell",
+        ] {
+            snapshot.runs[0].local_status = Some(state.into());
+            assert_eq!(snapshot.validate(), Ok(()), "{state}");
+        }
     }
 
     #[test]

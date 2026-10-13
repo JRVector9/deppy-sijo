@@ -1804,3 +1804,11 @@ project_keys.change_value = 值已儲存
 project_keys.change_storage = 儲存狀態已變更
 project_keys.change_remote = GitHub 狀態已變更
 project_keys.remote_only_hint = 僅記錄 GitHub 目標，不儲存本機值。複製、建置與傳送需要本機金鑰。儲存後請設定準確的目標。
+
+cloud.local_agent = 代理 · {agent}
+cloud.local_shell = Shell
+cloud.local_exited = 已結束
+cloud.local_unknown = 未觀測
+cloud.local_observed = 狀態觀測 · {age} 前
+cloud.local_observation_unknown = 狀態觀測時間不可用
+cloud.run_navigation_opened = 已開啟原始工作階段。

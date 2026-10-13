@@ -2013,6 +2013,35 @@ struct PendingPrimaryPaneActivation {
 const PRIMARY_PANE_MATERIALIZATION_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(10);
 
+struct PendingCloudNavigation {
+    intent: crate::cloud_agent::navigation::RunNavigation,
+    pane: runtime::MuxPaneId,
+    runtime_instance: u64,
+    started: std::time::Instant,
+}
+
+fn cloud_navigation_completion(
+    exact_runtime: bool,
+    original_present: bool,
+    focused: bool,
+    activation_pending: bool,
+    elapsed: std::time::Duration,
+) -> Option<Result<(), String>> {
+    if !exact_runtime {
+        return Some(Err("navigation_superseded".into()));
+    }
+    if !original_present {
+        return Some(Err("session_changed_or_closed".into()));
+    }
+    if focused && !activation_pending {
+        return Some(Ok(()));
+    }
+    if elapsed >= std::time::Duration::from_secs(30) {
+        return Some(Err("session_activation_timed_out".into()));
+    }
+    None
+}
+
 /// warm(비활성) 워크스페이스 행의 「이어가기」 — `switch_workspace` 직후 새 활성
 /// 워크스페이스의 `restore_agents`가 비동기로 채워지길 기다리는 지연 실행 대상
 /// (2026-08-20). `PendingPaneFocus`와 같은 이유로 `runtime_instance`까지 확인한다 —
@@ -10945,6 +10974,7 @@ pub struct App {
     pending_resume_agent: Option<PendingResumeAgent>,
     /// 저장 세션 선택 시 정확한 pane이 materialize될 때까지 유지하는 포커스 intent.
     pending_pane_focus: Option<PendingPaneFocus>,
+    pending_cloud_navigation: Option<PendingCloudNavigation>,
     /// 저장 pane의 dotenv 완료, targeted restore, materialization, focus, full restore를
     /// 한 명령씩 재시도하는 최신 activation. generation은 늦은 worker 완료를 차단한다.
     pending_primary_pane_activation: Option<PendingPrimaryPaneActivation>,
@@ -17059,6 +17089,7 @@ impl App {
             pending_resume_agent: None,
             pending_pane_focus: None,
             pending_primary_pane_activation: None,
+            pending_cloud_navigation: None,
             pending_workspace_restore_delivery: std::collections::HashMap::with_capacity(
                 PENDING_WORKSPACE_RESTORE_DELIVERY_CAP,
             ),
@@ -27173,7 +27204,11 @@ impl App {
         }
     }
 
-    fn navigate_cloud_original_session(&mut self, workspace: &str, session: &str) {
+    fn navigate_cloud_original_session(
+        &mut self,
+        workspace: &str,
+        session: &str,
+    ) -> Result<(runtime::MuxPaneId, u64), String> {
         let pane = self
             .persisted_activity_panes
             .get(workspace)
@@ -27182,16 +27217,139 @@ impl App {
                     .find(|row| row.persistent_session_id.as_deref() == Some(session))
             })
             .and_then(|row| row.pane_id.parse::<uuid::Uuid>().ok())
-            .map(|id| runtime::MuxPaneId(id.to_string()));
-        if let Some(pane) = pane {
-            self.settings_open = false;
-            self.activate_persisted_session(workspace, pane);
+            .map(|id| runtime::MuxPaneId(id.to_string()))
+            .ok_or_else(|| "session_changed_or_closed".to_owned())?;
+        if !self.workspaces.iter().any(|row| row.id == workspace)
+            || !self
+                .persisted_activity_panes
+                .get(workspace)
+                .is_some_and(|rows| persisted_pane_is_current(rows, &pane))
+        {
+            return Err("stale_catalog_identity".into());
+        }
+        self.activate_persisted_session(workspace, pane.clone());
+        if self.active.id != workspace {
+            return Err("workspace_activation_rejected".into());
+        }
+        let materialized = cloud_agent_mux(&self.active).is_some_and(|mux| {
+            mux.tabs.iter().flat_map(|tab| &tab.panes).any(|row| {
+                row.id == pane
+                    && row.session_id.is_some()
+                    && row.persistent_session_id.as_deref() == Some(session)
+            })
+        });
+        if !materialized
+            && self.pending_pane_focus.is_none()
+            && self.pending_primary_pane_activation.is_none()
+        {
+            return Err("session_activation_rejected".into());
+        }
+        Ok((pane, self.active.runtime_instance))
+    }
+
+    fn poll_cloud_navigation(&mut self) {
+        let Some(pending) = self.pending_cloud_navigation.take() else {
+            return;
+        };
+        let original_present = self
+            .persisted_activity_panes
+            .get(&pending.intent.workspace)
+            .is_some_and(|rows| {
+                rows.iter().any(|row| {
+                    row.pane_id == pending.pane.0
+                        && row.persistent_session_id.as_deref()
+                            == Some(pending.intent.session.as_str())
+                })
+            });
+        let focused = cloud_agent_mux(&self.active).is_some_and(|mux| {
+            mux.focused_pane.as_ref() == Some(&pending.pane)
+                && mux.tabs.iter().flat_map(|tab| &tab.panes).any(|pane| {
+                    pane.id == pending.pane
+                        && pane.session_id.is_some()
+                        && pane.persistent_session_id.as_deref()
+                            == Some(pending.intent.session.as_str())
+                })
+        });
+        let activation_pending = self.pending_pane_focus.as_ref().is_some_and(|focus| {
+            focus.pane == pending.pane && focus.runtime_instance == pending.runtime_instance
+        }) || self.pending_primary_pane_activation.as_ref().is_some_and(
+            |activation| {
+                activation.pane == pending.pane
+                    && activation.runtime_instance == pending.runtime_instance
+            },
+        );
+        if let Some(result) = cloud_navigation_completion(
+            self.active.id == pending.intent.workspace
+                && self.active.runtime_instance == pending.runtime_instance,
+            original_present,
+            focused,
+            activation_pending,
+            pending.started.elapsed(),
+        ) {
+            if result.is_ok() {
+                self.sync_session_aux_scope();
+                self.reveal_terminal_session();
+                if self.settings_category == ui::settings::Category::CloudAgents {
+                    self.settings_open = false;
+                }
+            } else if activation_pending {
+                self.cancel_cloud_navigation_focus(&pending);
+            }
+            self.cloud_agent
+                .finish_run_navigation(&pending.intent, result);
+            self.egui_ctx.request_repaint();
+        } else {
+            self.pending_cloud_navigation = Some(pending);
+            self.egui_ctx
+                .request_repaint_after(std::time::Duration::from_millis(100));
+        }
+    }
+    fn cancel_cloud_navigation_focus(&mut self, pending: &PendingCloudNavigation) {
+        // Cancel only the restoration/focus that belongs to the superseded cloud request.
+        // A failed replacement must not let the previous activation focus its old pane later.
+        let owns_focus = self.pending_pane_focus.as_ref().is_some_and(|focus| {
+            focus.workspace_id == pending.intent.workspace
+                && focus.runtime_instance == pending.runtime_instance
+                && focus.pane == pending.pane
+        }) || self.pending_primary_pane_activation.as_ref().is_some_and(
+            |activation| {
+                activation.workspace_id == pending.intent.workspace
+                    && activation.runtime_instance == pending.runtime_instance
+                    && activation.pane == pending.pane
+            },
+        );
+        if owns_focus {
+            self.cancel_terminal_focus_intents();
+        }
+    }
+    fn start_cloud_navigation(
+        &mut self,
+        navigation: crate::cloud_agent::navigation::RunNavigation,
+    ) {
+        if let Some(previous) = self.pending_cloud_navigation.take() {
+            self.cancel_cloud_navigation_focus(&previous);
+            self.cloud_agent
+                .finish_run_navigation(&previous.intent, Err("navigation_superseded".into()));
+        }
+        match self.navigate_cloud_original_session(&navigation.workspace, &navigation.session) {
+            Ok((pane, runtime_instance)) => {
+                self.pending_cloud_navigation = Some(PendingCloudNavigation {
+                    intent: navigation,
+                    pane,
+                    runtime_instance,
+                    started: std::time::Instant::now(),
+                })
+            }
+            Err(error) => self
+                .cloud_agent
+                .finish_run_navigation(&navigation, Err(error)),
         }
     }
     fn drain_cloud_operator_requests(&mut self) {
-        if let Some((workspace, session)) = self.cloud_agent.take_run_navigation() {
-            self.navigate_cloud_original_session(&workspace, &session);
+        if let Some(navigation) = self.cloud_agent.take_run_navigation() {
+            self.start_cloud_navigation(navigation);
         }
+        self.poll_cloud_navigation();
 
         use web_remote::cloud::CloudControlIntent;
         for _ in 0..16 {
@@ -27253,7 +27411,16 @@ impl App {
                     workspace_id,
                     session_id,
                 } => {
-                    self.navigate_cloud_original_session(&workspace_id, &session_id);
+                    // Apply under the just-validated operator authority in this frame, while
+                    // retaining the same observed-focus completion as native navigation.
+                    if self
+                        .cloud_agent
+                        .request_run_navigation(&workspace_id, &session_id)
+                        .is_ok()
+                        && let Some(navigation) = self.cloud_agent.take_run_navigation()
+                    {
+                        self.start_cloud_navigation(navigation);
+                    }
                 }
             }
         }
@@ -27298,6 +27465,59 @@ impl App {
                 .find(|w| w.id == rt.id)
                 .map(Self::workspace_display_name)
                 .unwrap_or_else(|| rt.id.clone());
+            // Use the same detector/hook/transcript merge as sidebar and Fleet, including warm
+            // workspace hooks. Provider/model text is display metadata, never execution state.
+            let local_entries = if rt.id == self.active.id {
+                rt.workspace_ui.session_entries(
+                    &self.i18n,
+                    &self.agent_activity,
+                    &self.agent_needs_input,
+                    &self.agent_responses,
+                    &self.agent_turn_done,
+                    &self.agent_working,
+                )
+            } else {
+                let waiting = self
+                    .global_waiting
+                    .iter()
+                    .filter(|(workspace, _, _)| workspace == &rt.id)
+                    .map(|(_, session, _)| *session)
+                    .collect();
+                let responses = self
+                    .global_responses
+                    .iter()
+                    .filter(|(workspace, _)| workspace == &rt.id)
+                    .map(|(_, session)| *session)
+                    .collect();
+                let working = self
+                    .global_working
+                    .iter()
+                    .filter(|(workspace, _)| workspace == &rt.id)
+                    .map(|(_, session)| *session)
+                    .collect();
+                let done = self
+                    .global_turn_done
+                    .iter()
+                    .filter(|((workspace, _), _)| workspace == &rt.id)
+                    .map(|((_, session), at)| (*session, *at))
+                    .collect();
+                rt.workspace_ui.session_entries(
+                    &self.i18n,
+                    &std::collections::HashMap::new(),
+                    &waiting,
+                    &responses,
+                    &done,
+                    &working,
+                )
+            };
+            let local_statuses: std::collections::HashMap<_, _> = local_entries
+                .into_iter()
+                .filter_map(|entry| {
+                    entry
+                        .session
+                        .map(|session| (session, (entry.status, entry.agent_line.is_some())))
+                })
+                .collect();
             for pane in mux.tabs.iter().flat_map(|tab| &tab.panes) {
                 if targets.len() == 256 {
                     break;
@@ -27341,6 +27561,20 @@ impl App {
                         .workspace_ui
                         .agent_line_for(session)
                         .map(|line| line.chars().take(512).collect()),
+                    local_status: local_statuses.get(&session).and_then(|(status, _)| *status),
+                    local_agent_present: local_statuses
+                        .get(&session)
+                        .is_some_and(|(_, present)| *present),
+                    // Confirmed idle episodes carry Unix seconds; turn_done contains a revision
+                    // and is not a timestamp. Publication time must not refresh warm status.
+                    local_status_observed_at: local_statuses
+                        .get(&session)
+                        .filter(|(status, _)| *status == Some(runtime::SessionStatus::Done))
+                        .and_then(|_| self.global_idle_since.get(&(rt.id.clone(), session)))
+                        .filter(|(_, generation)| {
+                            self.idle_completion_is_current(&rt.id, session, *generation)
+                        })
+                        .and_then(|(at, _)| u64::try_from(*at).ok()),
                     runtime: rt.runtime_instance,
                     session,
                     pane: pane.id.clone(),
@@ -40372,6 +40606,36 @@ fn pty_shortcut_missing_feedback(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cloud_navigation_completion_reports_closed_superseded_and_bounded_failure() {
+        use std::time::Duration;
+        assert_eq!(
+            super::cloud_navigation_completion(true, false, false, false, Duration::ZERO),
+            Some(Err("session_changed_or_closed".into()))
+        );
+        assert_eq!(
+            super::cloud_navigation_completion(false, true, true, false, Duration::ZERO),
+            Some(Err("navigation_superseded".into()))
+        );
+        assert!(
+            super::cloud_navigation_completion(true, true, false, false, Duration::from_secs(1))
+                .is_none(),
+            "FocusPane admission is not an observed activation; allow the mux event to arrive"
+        );
+        assert!(
+            super::cloud_navigation_completion(true, true, true, true, Duration::from_secs(1))
+                .is_none(),
+            "a materialized pane still undergoing restore is not completed"
+        );
+        assert_eq!(
+            super::cloud_navigation_completion(true, true, false, true, Duration::from_secs(30)),
+            Some(Err("session_activation_timed_out".into()))
+        );
+        assert_eq!(
+            super::cloud_navigation_completion(true, true, true, false, Duration::from_secs(2)),
+            Some(Ok(()))
+        );
+    }
     #[test]
     fn pr10_busy_deadline_does_not_request_immediate_idle_repaint() {
         let ctx = egui::Context::default();

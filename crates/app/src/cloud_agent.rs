@@ -5,6 +5,7 @@ mod bridge_tests;
 mod continuity;
 mod control;
 mod management;
+pub(crate) mod navigation;
 mod output;
 mod pwa;
 mod tunnel;
@@ -26,6 +27,9 @@ pub struct Target {
     pub workspace_name: String,
     pub title: String,
     pub agent_line: Option<String>,
+    pub local_status: Option<runtime::SessionStatus>,
+    pub local_status_observed_at: Option<u64>,
+    pub local_agent_present: bool,
     pub runtime: u64,
     pub session: runtime::SessionId,
     pub pane: runtime::MuxPaneId,
@@ -114,6 +118,7 @@ struct PendingClaim {
     answer: Option<String>,
     context: agent_mcp::OperationContext,
     lease_epoch: Option<u64>,
+    continuity: Option<continuity::ClockSample>,
 }
 struct PendingFinish {
     reply: Option<mpsc::SyncSender<Result<Value, String>>>,
@@ -155,7 +160,8 @@ pub struct CloudAgent {
     last_cloud_publish: Option<Instant>,
     screens: HashMap<String, Screen>,
     screen_observations: HashMap<(u64, runtime::SessionId), u64>,
-    native_navigation: Option<(String, String)>,
+    native_navigation: Option<navigation::RunNavigation>,
+    navigation_state: navigation::NavigationState,
     history: HistoryWorker,
     history_ready: bool,
     history_initialized: bool,
@@ -230,6 +236,7 @@ impl CloudAgent {
             screens: HashMap::new(),
             screen_observations: HashMap::new(),
             native_navigation: None,
+            navigation_state: navigation::NavigationState::default(),
             history,
             history_ready: false,
             history_initialized: false,
@@ -341,19 +348,6 @@ impl CloudAgent {
             }
             self.screen_observations.insert(key, at);
         }
-    }
-    pub fn request_run_navigation(&mut self, workspace: &str, session: &str) -> Result<(), String> {
-        if [workspace, session]
-            .iter()
-            .any(|id| id.is_empty() || id.len() > 128 || id.chars().any(char::is_control))
-        {
-            return Err("invalid_session_id".into());
-        }
-        self.native_navigation = Some((workspace.into(), session.into()));
-        Ok(())
-    }
-    pub(crate) fn take_run_navigation(&mut self) -> Option<(String, String)> {
-        self.native_navigation.take()
     }
     pub fn wants_screen(&self, id: &str) -> bool {
         self.server.is_some() && self.grants.contains_key(id)
@@ -766,17 +760,20 @@ impl CloudAgent {
         self.reconnect = enabled;
         self.recovery.start(enabled && self.automatic);
     }
-    pub fn apply_action(&mut self, ctx: &egui::Context) {
-        if !self.reconnect || !self.automatic {
-            self.recovery.stop();
-        }
-        if self.recovery.frame(Instant::now()) && self.server.is_some() {
+    fn observe_continuity(&mut self, clocks: Option<continuity::ClockSample>) {
+        if self.recovery.frame(clocks) && self.server.is_some() {
             self.take_control();
             if let Some(tunnel) = &self.tunnel {
                 tunnel.revalidate();
                 self.connection = Connection::Verifying;
             }
         }
+    }
+    pub fn apply_action(&mut self, ctx: &egui::Context) {
+        if !self.reconnect || !self.automatic {
+            self.recovery.stop();
+        }
+        self.observe_continuity(continuity::clock_sample());
         self.poll_connection(ctx);
         let retry = self.action.is_none() && !self.busy() && self.recovery.retry(Instant::now());
         if retry {
@@ -833,6 +830,8 @@ impl CloudAgent {
                     }
                     ctx.request_repaint_after(std::time::Duration::from_secs(agent_mcp::TOKEN_TTL));
                 }
+                let revoked = self.control.retire_auth_connections();
+                self.revoke_leases(revoked);
                 self.take_control();
                 self.reveal = false;
             }
@@ -1111,6 +1110,7 @@ impl CloudAgent {
             let auth = claim.auth;
             let epoch = claim.request.epoch;
             let access_key = claim.request.access_key;
+            let accepted_clock = claim.continuity;
             let execution = if paste { claim.target.execution } else { None };
             let lease_expires = claim.lease_epoch.and_then(|epoch| {
                 self.control
@@ -1120,11 +1120,13 @@ impl CloudAgent {
             });
             let mut admission =
                 runtime::InputAdmission::new(claim.permit, claim.request.deadline, move |write| {
-                    if lease_expires.is_none_or(|expiry| now() < expiry)
+                    if continuity::input_current(accepted_clock)
+                        && lease_expires.is_none_or(|expiry| now() < expiry)
                         && execution.is_none_or(AgentExecutionIdentity::is_current)
                     {
                         auth.admit_current_access(epoch, access_key.as_deref(), &mut || {
-                            if lease_expires.is_none_or(|expiry| now() < expiry)
+                            if continuity::input_current(accepted_clock)
+                                && lease_expires.is_none_or(|expiry| now() < expiry)
                                 && execution.is_none_or(AgentExecutionIdentity::is_current)
                             {
                                 write();
@@ -1570,6 +1572,7 @@ impl CloudAgent {
                 answer,
                 context,
                 lease_epoch: lease.map(|l| l.epoch),
+                continuity: continuity::clock_sample(),
             },
         );
         Ok(None)
@@ -1726,6 +1729,9 @@ impl Target {
             workspace_name: "workspace".into(),
             title: "session".into(),
             agent_line: None,
+            local_status: None,
+            local_status_observed_at: None,
+            local_agent_present: false,
             runtime: 1,
             session: runtime::SessionId(1),
             pane: runtime::MuxPaneId::new(),
@@ -2828,7 +2834,7 @@ mod guarded_input_tests {
     }
     #[test]
     fn queued_cloud_input_is_cancelled_before_pty_admission() {
-        for action in [
+        check_queued_input_rejection(&[
             "take_control",
             "unshare",
             "disable",
@@ -2841,7 +2847,19 @@ mod guarded_input_tests {
             "client_lease_expire",
             "client_lease_shorten",
             "wake",
-        ] {
+            "client_wake",
+        ]);
+    }
+    #[test]
+    fn queued_legacy_input_after_resume_before_app_frame_is_rejected() {
+        check_queued_input_rejection(&["wake_before_app"]);
+    }
+    #[test]
+    fn queued_named_input_after_resume_before_app_frame_is_rejected() {
+        check_queued_input_rejection(&["client_wake_before_app"]);
+    }
+    fn check_queued_input_rejection(actions: &[&str]) {
+        for &action in actions {
             let root =
                 std::env::temp_dir().join(format!("deppy-guarded-input-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&root).unwrap();
@@ -2968,7 +2986,17 @@ mod guarded_input_tests {
                 reply: req.reply.clone(),
             };
             let connection = req.principal.id.clone();
-            b.handle_and_drain(req, |t, e| match e {
+            b.handle(req, |_, _| panic!("input must wait for the durable claim"));
+            if action.ends_with("wake_before_app") {
+                // Simulate the exact native-clock evidence of a suspend after
+                // acceptance. The queued runtime resumes before any App frame.
+                let current = continuity::clock_sample().unwrap();
+                b.claims.values_mut().next().unwrap().continuity = Some(continuity::ClockSample {
+                    continuous: current.continuous - Duration::from_secs(2),
+                    awake: current.awake,
+                });
+            }
+            b.drain_history(|t, e| match e {
                 Effect::Input {
                     operation_id,
                     bytes,
@@ -3004,10 +3032,17 @@ mod guarded_input_tests {
                 }
                 "client_revoke" => b.revoke_connection(&connection),
                 "client_lease_expire" => std::thread::sleep(Duration::from_millis(1100)),
-                "wake" => {
-                    b.recovery.frame(Instant::now() - Duration::from_secs(31));
-                    b.apply_action(&egui::Context::default());
+                "wake" | "client_wake" => {
+                    b.observe_continuity(Some(continuity::ClockSample {
+                        continuous: Duration::from_secs(100),
+                        awake: Duration::from_secs(50),
+                    }));
+                    b.observe_continuity(Some(continuity::ClockSample {
+                        continuous: Duration::from_secs(140),
+                        awake: Duration::from_secs(51),
+                    }));
                 }
+                "wake_before_app" | "client_wake_before_app" => {}
                 "reenable" => {
                     b.take_control();
                     b.allow_input(&t.id, true);

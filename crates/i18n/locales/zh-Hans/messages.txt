@@ -1804,3 +1804,11 @@ project_keys.change_value = 值已保存
 project_keys.change_storage = 保存状态已变更
 project_keys.change_remote = GitHub 状态已变更
 project_keys.remote_only_hint = 仅记录 GitHub 目标，不保存本地值。复制、构建和发送需要本地密钥。保存后请配置准确的目标。
+
+cloud.local_agent = 智能体 · {agent}
+cloud.local_shell = Shell
+cloud.local_exited = 已退出
+cloud.local_unknown = 未观测
+cloud.local_observed = 状态观测 · {age} 前
+cloud.local_observation_unknown = 状态观测时间不可用
+cloud.run_navigation_opened = 已打开原始会话。

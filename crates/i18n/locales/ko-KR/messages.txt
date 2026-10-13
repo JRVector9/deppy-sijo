@@ -1804,3 +1804,11 @@ project_keys.change_value = 값 보관
 project_keys.change_storage = 보관 상태 변경
 project_keys.change_remote = GitHub 상태 변경
 project_keys.remote_only_hint = 로컬 값 없이 GitHub 대상을 기록합니다. 복사·빌드·전송에는 로컬 키가 필요합니다. 저장한 다음 정확한 전송 대상을 설정하세요.
+
+cloud.local_agent = 에이전트 · {agent}
+cloud.local_shell = 셸
+cloud.local_exited = 종료됨
+cloud.local_unknown = 관측 정보 없음
+cloud.local_observed = 상태 관측 · {age} 전
+cloud.local_observation_unknown = 상태 관측 시각 없음
+cloud.run_navigation_opened = 원래 세션을 열었습니다.

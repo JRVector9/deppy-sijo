@@ -422,6 +422,102 @@ fn rotated_independent_credentials_do_not_exhaust_issuance_capacity() {
 }
 
 #[test]
+fn normal_idle_frame_gap_preserves_approved_input_and_control_lease() {
+    let (mut bridge, target) = setup();
+    let actor = client(&bridge, "Idle bot");
+    bridge
+        .set_connection_access(&actor.id, &target, true, true)
+        .unwrap();
+    let (req, _) = request(&bridge, &actor, "acquire_control", json!({}));
+    let lease = bridge.acquire_lease(&req, &target, None, 120).unwrap();
+    bridge.observe_continuity(Some(continuity::ClockSample {
+        continuous: Duration::from_secs(100),
+        awake: Duration::from_secs(50),
+    }));
+    bridge.observe_continuity(Some(continuity::ClockSample {
+        continuous: Duration::from_secs(220),
+        awake: Duration::from_secs(170),
+    }));
+    assert!(bridge.connection_permission(&actor.id, &target).input);
+    assert_eq!(bridge.connection_lease(&target).unwrap().epoch, lease.epoch);
+}
+
+#[test]
+fn auth_rotation_retires_old_named_permissions_without_exhausting_capacity() {
+    let (mut bridge, _) = setup();
+    let targets: Vec<_> = (0..MAX_TARGETS)
+        .map(|index| Target::fixture(&format!("session-{index}"), "generation"))
+        .collect();
+    bridge.set_targets(targets.clone());
+    for cycle in 0..4 {
+        for index in 0..8 {
+            let actor = client(&bridge, &format!("cycle-{cycle}-bot-{index}"));
+            for target in &targets {
+                bridge
+                    .set_connection_access(&actor.id, target, true, false)
+                    .unwrap_or_else(|error| {
+                        panic!("cycle {cycle}, bot {index}, {}: {error}", target.id)
+                    });
+            }
+        }
+        let obsolete: Vec<_> = bridge
+            .connection_infos()
+            .into_iter()
+            .filter(|info| info.principal.id != agent_mcp::LEGACY_CONNECTION_ID)
+            .map(|info| info.principal.id)
+            .collect();
+        bridge.action = Some(Action::Rotate);
+        bridge.apply_action(&egui::Context::default());
+        for id in obsolete {
+            assert!(
+                !bridge.connection_permission(&id, &targets[0]).read,
+                "rotation must remove the retired principal's permission"
+            );
+        }
+    }
+}
+
+#[test]
+fn auth_rotation_preserves_effective_legacy_read_consent_and_denials() {
+    for (read, explicit, revoked) in [
+        (true, false, false),
+        (true, true, false),
+        (false, true, false),
+        (false, false, true),
+    ] {
+        let (mut bridge, target) = setup();
+        bridge.share(&target, true);
+        if explicit {
+            bridge
+                .set_connection_access(agent_mcp::LEGACY_CONNECTION_ID, &target, read, false)
+                .unwrap();
+        }
+        if revoked {
+            bridge.revoke_connection(agent_mcp::LEGACY_CONNECTION_ID);
+        }
+        let actor = client(&bridge, "Before rotation");
+        bridge
+            .set_connection_access(&actor.id, &target, true, true)
+            .unwrap();
+        let (req, _) = request(&bridge, &actor, "acquire_control", json!({}));
+        bridge.acquire_lease(&req, &target, None, 120).unwrap();
+        bridge.action = Some(Action::Rotate);
+        bridge.apply_action(&egui::Context::default());
+        assert_eq!(
+            bridge
+                .connection_permission(agent_mcp::LEGACY_CONNECTION_ID, &target)
+                .read,
+            read,
+            "legacy read consent must survive rotation without widening"
+        );
+        assert!(!bridge.connection_permission(&actor.id, &target).input);
+        assert!(bridge.connection_lease(&target).is_none());
+        assert!(bridge.lease_permits.is_empty());
+        assert!(bridge.grants.contains_key(&target.id));
+    }
+}
+
+#[test]
 fn rendered_wrapped_credentials_are_redacted_before_cloud_snapshot_byte_limits() {
     use terminal::TerminalBackend;
     let (bridge, _) = setup();

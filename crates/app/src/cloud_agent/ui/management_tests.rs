@@ -20,6 +20,8 @@ fn connection_fixture() -> (CloudAgent, Target, String, String, String) {
     let mut target = Target::fixture("review-session", "generation-1");
     target.title = "Review pane".into();
     target.agent_line = Some("Codex · gpt-6.1-sol · xhigh".into());
+    target.known_ai = true;
+    target.local_status = Some(runtime::SessionStatus::Running);
     bridge.set_targets(vec![target.clone()]);
     (bridge, target, review.id, research.id, token.to_string())
 }
@@ -489,7 +491,20 @@ fn management_ui_cloud_report_is_separate_from_local_status_and_keeps_result_ori
         .click();
     harness.run();
     harness.get_by_label("Progress: 100% · agent reported");
-    harness.get_by_label("Local status for this run's session: Codex · gpt-6.1-sol · xhigh");
+    harness.get_by_label("Local status for this run's session: Running");
+    assert_eq!(
+        harness
+            .get_all_by_label("Agent · Codex · gpt-6.1-sol · xhigh")
+            .count(),
+        2,
+        "connection and run views both retain separate identity metadata"
+    );
+    assert!(
+        harness
+            .get_all_by_label("Status observation time unavailable")
+            .count()
+            >= 1
+    );
     harness.get_by_label("Found the dependency issue");
     // egui's selectable link text is exposed as a Label; verify the actual link intent.
     harness.get_by_label("Review report").click();
@@ -708,10 +723,9 @@ fn management_ui_navigation_queues_the_original_workspace_and_session() {
     harness.run();
     harness.get_by_label("Open original session").click();
     harness.run();
-    assert_eq!(
-        harness.state_mut().take_run_navigation(),
-        Some((original.workspace.clone(), original.id.clone()))
-    );
+    let request = harness.state_mut().take_run_navigation().unwrap();
+    assert_eq!(request.workspace, original.workspace);
+    assert_eq!(request.session, original.id);
     assert!(
         harness.state_mut().take_run_navigation().is_none(),
         "native navigation intent is consumed once"
@@ -727,4 +741,74 @@ fn management_ui_navigation_queues_the_original_workspace_and_session() {
             .input,
         "navigation grants no input permission"
     );
+}
+
+#[test]
+fn management_ui_closed_original_navigation_reports_failure_and_keeps_results() {
+    let (bridge, _, _, _) = running_fixture();
+    let mut harness = harness(bridge);
+    harness
+        .get_by_label("Inspect project · Running · Review Bot")
+        .click();
+    harness.run();
+    harness.get_by_label("Open original session").click();
+    harness.run();
+    let request = harness.state_mut().take_run_navigation().unwrap();
+    harness
+        .state_mut()
+        .finish_run_navigation(&request, Err("session_changed_or_closed".into()));
+    harness.run();
+    assert!(
+        harness
+            .query_by_label("Opening the original session…")
+            .is_none()
+    );
+    harness.get_by_label("Could not open the original session. It may have been closed; the report remains available.");
+    harness.get_by_label("Inspect project · Running · Review Bot");
+}
+
+#[test]
+fn management_ui_original_navigation_reports_observed_success() {
+    let (bridge, _, _, _) = running_fixture();
+    let mut harness = harness(bridge);
+    harness
+        .get_by_label("Inspect project · Running · Review Bot")
+        .click();
+    harness.run();
+    harness.get_by_label("Open original session").click();
+    harness.run();
+    let request = harness.state_mut().take_run_navigation().unwrap();
+    harness.state_mut().finish_run_navigation(&request, Ok(()));
+    harness.run();
+    assert!(
+        harness
+            .query_by_label("Opening the original session…")
+            .is_none()
+    );
+    harness.get_by_label("Opened the original session.");
+}
+
+#[test]
+fn management_ui_new_operator_navigation_does_not_leave_the_old_request_opening() {
+    let (bridge, _, _, _) = running_fixture();
+    let mut harness = harness(bridge);
+    harness
+        .get_by_label("Inspect project · Running · Review Bot")
+        .click();
+    harness.run();
+    harness.get_by_label("Open original session").click();
+    harness.run();
+    let previous = harness.state_mut().take_run_navigation().unwrap();
+    harness
+        .state_mut()
+        .request_run_navigation("another-workspace", "missing-session")
+        .unwrap();
+    harness.state_mut().finish_run_navigation(&previous, Ok(()));
+    harness.run();
+    assert!(
+        harness
+            .query_by_label("Opening the original session…")
+            .is_none()
+    );
+    harness.get_by_label("Could not open the original session. It may have been closed; the report remains available.");
 }

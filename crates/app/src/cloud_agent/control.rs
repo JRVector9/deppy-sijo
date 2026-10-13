@@ -234,6 +234,15 @@ impl ControlManager {
         self.remove_leases(|_| true)
     }
 
+    pub fn retire_auth_connections(&mut self) -> Vec<u64> {
+        // Auth rotation removes all named principals. Keep only the legacy ACLs
+        // and its explicit revocation marker so rotation cannot widen consent.
+        let legacy = self.legacy_connection.as_deref();
+        self.permissions
+            .retain(|(connection, _), _| legacy == Some(connection.as_str()));
+        self.take_control()
+    }
+
     pub fn retain_targets(&mut self, targets: &[(&str, &str)]) -> Vec<u64> {
         self.permissions.retain(|(_, session), permission| {
             targets.contains(&(session.as_str(), permission.generation.as_str()))
@@ -380,5 +389,39 @@ mod tests {
             .set_access("a", "readonly", "g", true, false)
             .unwrap();
         assert!(control.acquire("a", "readonly", "g", None, 11, 30).is_err());
+    }
+
+    #[test]
+    fn auth_rotation_retires_named_acl_and_epochs_without_widening_legacy_access() {
+        let mut control = ControlManager::with_legacy_connection("legacy");
+        control
+            .set_access("legacy", "allowed", "g", true, false)
+            .unwrap();
+        control
+            .set_access("legacy", "denied", "g", false, false)
+            .unwrap();
+        control
+            .set_access("old-bot", "allowed", "g", true, true)
+            .unwrap();
+        let first = control
+            .acquire("old-bot", "allowed", "g", None, 10, 120)
+            .unwrap()
+            .lease;
+        assert_eq!(control.retire_auth_connections(), vec![first.epoch]);
+        assert!(control.allows("legacy", "allowed", "g", false));
+        assert!(!control.allows("legacy", "allowed", "g", true));
+        assert!(!control.allows("legacy", "denied", "g", false));
+        assert!(!control.allows("old-bot", "allowed", "g", false));
+        control
+            .set_access("new-bot", "allowed", "g", true, true)
+            .unwrap();
+        let second = control
+            .acquire("new-bot", "allowed", "g", None, 11, 120)
+            .unwrap()
+            .lease;
+        assert_ne!(second.epoch, first.epoch);
+        control.revoke_connection("legacy");
+        control.retire_auth_connections();
+        assert!(!control.allows("legacy", "never-consented", "g", false));
     }
 }

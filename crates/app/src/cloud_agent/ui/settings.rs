@@ -296,9 +296,12 @@ impl CloudAgent {
                     for target in self.targets.clone() {
                         ui.push_id((&info.principal.id, &target.id, &target.generation), |ui| {
                             ui.label(format!("{} · {}", target.workspace_name, target.title));
-                            if let Some(local) = &target.agent_line {
-                                ui.weak(catalog.t("cloud.local_status", &[("status", local)]));
+                            if let Some(agent) = &target.agent_line {
+                                ui.weak(catalog.t("cloud.local_agent", &[("agent", agent)]));
                             }
+                            let local = target.local_status_label(catalog);
+                            ui.weak(catalog.t("cloud.local_status", &[("status", &local)]));
+                            ui.weak(target.local_observation_label(catalog));
                             let permission =
                                 self.connection_permission(&info.principal.id, &target);
                             let mut read = active && permission.read;
@@ -410,5 +413,51 @@ fn activity_key(info: &ConnectionInfo) -> &'static str {
             "cloud.activity_authenticated"
         }
         ConnectionState::Active => "cloud.activity_waiting",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui_kittest::kittest::Queryable as _;
+
+    #[test]
+    fn native_connection_status_displays_runtime_observation_separately_from_identity() {
+        let mut bridge = CloudAgent::memory();
+        bridge.server = Some(agent_mcp::Server::start(0, "", || {}).unwrap());
+        let mut target =
+            crate::cloud_agent::Target::fixture("native-session", "generation-original");
+        target.agent_line = Some("Codex · gpt-6.1-sol · xhigh".into());
+        target.known_ai = true;
+        target.local_agent_present = true;
+        target.local_status = Some(runtime::SessionStatus::Running);
+        bridge.set_targets(vec![target.clone()]);
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1200.0, 1800.0))
+            .build_ui_state(
+                move |ui, bridge: &mut CloudAgent| {
+                    bridge.connection_settings(ui, &catalog);
+                },
+                bridge,
+            );
+        harness.get_by_label("Local session status: Running");
+        harness.get_by_label("Agent · Codex · gpt-6.1-sol · xhigh");
+        assert!(
+            harness
+                .query_by_label("Local session status: Codex · gpt-6.1-sol · xhigh")
+                .is_none()
+        );
+        harness.get_by_label("Status observation time unavailable");
+        target.local_status = Some(runtime::SessionStatus::NeedsApproval);
+        harness.state_mut().set_targets(vec![target.clone()]);
+        harness.run();
+        harness.get_by_label("Local session status: Approval required");
+        target.local_agent_present = false;
+        target.agent_line = None;
+        target.local_status = Some(runtime::SessionStatus::Idle);
+        harness.state_mut().set_targets(vec![target]);
+        harness.run();
+        harness.get_by_label("Local session status: Shell");
     }
 }

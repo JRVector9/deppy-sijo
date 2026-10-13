@@ -1804,3 +1804,11 @@ project_keys.change_value = Value stored
 project_keys.change_storage = Store status changed
 project_keys.change_remote = GitHub status changed
 project_keys.remote_only_hint = This records a GitHub destination without a local value. Copying, building and sending need a local key. Save, then configure the exact destination.
+
+cloud.local_agent = Agent · {agent}
+cloud.local_shell = Shell
+cloud.local_exited = Exited
+cloud.local_unknown = Not observed
+cloud.local_observed = Status observed · {age} ago
+cloud.local_observation_unknown = Status observation time unavailable
+cloud.run_navigation_opened = Opened the original session.

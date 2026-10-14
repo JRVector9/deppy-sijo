@@ -11310,7 +11310,13 @@ mod tests {
                 .unwrap();
         }
         worker.sessions.get_mut(&id).unwrap().scroll(3);
-        let native = worker.sessions[&id].input_guard_snapshot().unwrap();
+        let native = worker
+            .sessions
+            .get_mut(&id)
+            .unwrap()
+            .take_snapshot()
+            .unwrap();
+        worker.sessions.get_mut(&id).unwrap().mark_full_dirty();
         let metadata = native.history.unwrap();
         let anchor = terminal::TerminalHistoryAnchor {
             generation: metadata.generation,
@@ -11367,7 +11373,8 @@ mod tests {
                     .input_guard_snapshot()
                     .unwrap()
                     .scroll_offset,
-                3
+                0,
+                "input admission always reads live while the native viewport stays scrolled"
             );
         }
         let still_dirty = worker
@@ -14179,6 +14186,164 @@ mod tests {
             worker.admit_input_batch_checked(id, &[b"must-not-send", b"\r"], Some(&admission)),
             Err(pty::PtyInputRejectReason::AdmissionDenied)
         );
+    }
+
+    #[cfg(unix)]
+    fn scrolled_composer_worker(editor: &str, historical_dialog: bool) -> (Worker, u32) {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, _events) = admission_worker(resolver, "composer-scrollback");
+        let id = SessionId(1);
+        let live = Session::spawn_with_spec(
+            id,
+            session::SessionKind::Agent,
+            &spec(
+                "/bin/sh",
+                &["-c", "stty raw -echo; printf READY; exec /bin/cat"],
+            ),
+            80,
+            24,
+            100,
+        )
+        .unwrap();
+        let group = live.process_identity().process_group.unwrap();
+        worker.sessions.insert(id, live);
+        worker.detectors.insert(
+            id,
+            session::StatusDetector::new(session::StatusPatterns::compile(
+                Some("STREAM-WAIT"),
+                None,
+                None,
+                None,
+            )),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !worker.sessions[&id].screen_text().contains("READY") {
+            assert!(Instant::now() < deadline);
+            let effects = worker.collect_session_pump_effects(&[id], false, true);
+            worker.finish_session_pump_effects(effects);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // A former selection dialog lives only in history, never in the live editor.
+        let history = if historical_dialog {
+            "old choice: Enter to select\r\n"
+        } else {
+            "old completed output\r\n"
+        }
+        .repeat(50);
+        let ansi = format!("\x1b[2J\x1b[H{history}\x1b[2J\x1b[H\x1b[?2004h{editor}");
+        worker
+            .sessions
+            .get_mut(&id)
+            .unwrap()
+            .replay_ansi(&mut ansi.as_bytes())
+            .unwrap();
+        (worker, group)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn composer_scrollback_submit_uses_live_editor_and_preserves_viewport() {
+        for (provider, editor) in [
+            (crate::AgentPromptKind::Claude, "❯ "),
+            (
+                crate::AgentPromptKind::Codex,
+                "› \x1b[2mAsk Codex to do anything\x1b[0m\r\x1b[2C",
+            ),
+        ] {
+            for offset in [5, i32::MAX] {
+                let (mut worker, group) = scrolled_composer_worker(editor, true);
+                let id = SessionId(1);
+                worker
+                    .detectors
+                    .get_mut(&id)
+                    .unwrap()
+                    .on_output(b"STREAM-WAIT\n");
+                worker.sessions.get_mut(&id).unwrap().scroll(offset);
+                let before = worker
+                    .sessions
+                    .get_mut(&id)
+                    .unwrap()
+                    .take_snapshot()
+                    .unwrap();
+                assert!(before.scroll_offset > 0);
+                assert!(snapshot_contains(&before, "Enter to select"));
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let admission =
+                    crate::InputAdmission::new(crate::InputPermit::new(), deadline, |write| {
+                        write()
+                    })
+                    .with_agent_guard(crate::AgentInputGuard {
+                        foreground_process_group: group,
+                        provider,
+                        intent: crate::AgentInputIntent::ExplicitPrompt,
+                    });
+                let prompt = format!("{}\nSCROLLED-COMPOSER-END", "한글 새 입력 ".repeat(200));
+                let body = format!("\x1b[200~{prompt}\x1b[201~");
+                assert_eq!(
+                    worker.admit_input_batch_checked(
+                        id,
+                        &[body.as_bytes(), b"\r"],
+                        Some(&admission)
+                    ),
+                    Ok(()),
+                    "history and an offscreen cursor must not veto a ready live editor"
+                );
+                let after = worker
+                    .sessions
+                    .get_mut(&id)
+                    .unwrap()
+                    .take_snapshot()
+                    .unwrap();
+                assert_eq!(after.scroll_offset, before.scroll_offset);
+                assert_eq!(after.visible_cells, before.visible_cells);
+                while !worker.sessions[&id]
+                    .screen_text()
+                    .contains("SCROLLED-COMPOSER-END")
+                {
+                    assert!(Instant::now() < deadline, "prompt must reach the owned PTY");
+                    let effects = worker.collect_session_pump_effects(&[id], false, true);
+                    worker.finish_session_pump_effects(effects);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn composer_scrollback_still_protects_live_drafts_and_choice_dialogs() {
+        for (provider, editor) in [
+            (crate::AgentPromptKind::Claude, "❯ existing native draft"),
+            (crate::AgentPromptKind::Codex, "› existing native draft"),
+            (crate::AgentPromptKind::Codex, "› Yes\r\nEnter to select"),
+            (
+                crate::AgentPromptKind::Claude,
+                "❯ \r\n  continuation draft\r\n────────────────────\x1b[1;3H",
+            ),
+        ] {
+            let (mut worker, group) = scrolled_composer_worker(editor, false);
+            let id = SessionId(1);
+            // Unlike the ready test, history itself has no dialog here. It must
+            // neither hide a live draft nor grant input over a live choice dialog.
+            worker.sessions.get_mut(&id).unwrap().scroll(5);
+            let admission = crate::InputAdmission::new(
+                crate::InputPermit::new(),
+                Instant::now() + Duration::from_secs(5),
+                |write| write(),
+            )
+            .with_agent_guard(crate::AgentInputGuard {
+                foreground_process_group: group,
+                provider,
+                intent: crate::AgentInputIntent::ExplicitPrompt,
+            });
+            assert_eq!(
+                worker.admit_input_batch_checked(id, &[b"must-not-send", b"\r"], Some(&admission)),
+                Err(pty::PtyInputRejectReason::AdmissionDenied),
+            );
+        }
     }
 
     #[test]

@@ -186,6 +186,16 @@ pub trait TerminalBackend {
 
     fn viewport_snapshot(&self) -> Option<TerminalViewportSnapshot>;
 
+    /// Admission-time native screen and cursor, independent of scrollback navigation.
+    /// Must not move the viewport or consume render damage. Engines without a live
+    /// cell read can use their viewport only while it is at the bottom.
+    fn input_snapshot(&self) -> Option<TerminalViewportSnapshot> {
+        self.history_snapshot(crate::TerminalHistoryQuery::live())
+            .map(|live| live.snapshot)
+            .or_else(|| self.viewport_snapshot())
+            .filter(|snapshot| snapshot.scroll_offset == 0)
+    }
+
     /// Unsupported engines return no window without reading native render state.
     fn history_snapshot(
         &self,

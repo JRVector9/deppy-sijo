@@ -1,3 +1,17 @@
+# 스크롤백 열람 중 하단 컴포저 입력 거절 — 소스 수정 완료, 2026-10-14 (Codex)
+
+- 현재 목표: 사용자 새 요청(스크롤이 맨 아래가 아닐 때 하단 입력이 안 됨)의 원인을 재현·수정·검증. canonical performance, baseline6a06d319, 기존 untracked active-work HTML/원래 checkout dirty 보존. 현재 재실행/배포/push 요청 없음.
+- 확인 원인: Session::input_guard_snapshot이 backend.viewport_snapshot을 읽어 역사 화면과 viewport 커서를 AgentInputGuard에 전달. prompt_row는 scroll_offset!=0을 Unknown으로 판정하고 choice_dialog는 화면 밖 커서의 잘못된 범위를 현재 선택창으로 취급. 실제 10월14일 로그03:33:52~55Z의 Codex ExplicitPrompt 거절7건 모두 current_choice_dialog. 사용자 내용/DB/PTY 입력은 읽거나 변경하지 않음.
+- 구현: TerminalBackend::input_snapshot 계약 및 Alacritty native grid/실제 cursor 직접 읽기. Session guard만 새 입력용 경로 사용, live 근거 미지원은 명시적 live_screen_unavailable 거절. viewport cache/dirty/scroll을 이동·소비하지 않고 native 전체 geometry·style·grapheme 유지. 앱 전송/저장/재시도/identity/권한 정책 유지.
+- 회귀: 별도 /bin/cat PTY의 Claude/Codex·짧은/깊은 스크롤·과거 선택창·긴 한글 실제전달 및 현재 초안/선택창 보호. Session에 live screen/스타일·500x132큰 grid·scroll/cache/damage 보존; terminal vi cursor 및 alt screen 추가. 기존 history query 테스트의 viewport용 input_guard 읽기를 올바른 native snapshot+dirty 복구로 교정, 최종 live guard offset0/native offset3·query dirty 보존 확인.
+- 실제 결과: runtime RED0PASS/2FAIL→GREEN2PASS; session RED0PASS/1FAIL(offset200 vs0). 첫 fullruntime391PASS/2FAIL(위 계약변경 test+수정없는macOS footprint비교); test용 viewport 소비자 교정 후 runtime392PASS/1FAIL(footprint만). footprint 단독0PASS/1FAIL, baseline6a06d319 대비 해당 파일 diff없음. terminal137PASS/4existingignored、session81PASS/doc0、App composer97PASS = 고유707PASS/1FAIL. 마지막 500x132 fixture 보정 후 session81 재통과. fullruntime가 통과했다고 주장하지 않음. 4crate alltargets strictclippy-Dwarnings/fmt/boundary/diff 실제exit0. Root 전체diff/호출부대조 완료, 추가 확정결함 없음.
+- 결정: 입력 근거는 현재 native screen이어야 하며 사용자의 scroll 위치를 이동시키거나 pending render damage를 소비하지 않는다. 프롬프트/전송 내용 검증이나 자동 재전송 정책은 변경하지 않는다.
+- 수정 파일: terminal/backend.rs、alacritty_backend.rs；session/session.rs；runtime/input_admission.rs、in_process.rs；QA `docs/qa/2026-10-14-composer-scroll-input.md` 및 이 handoff. full/RED/isolated/App/clippy/boundary 실제로그 `/private/tmp/deppy-composer-scroll-*.log`. QA에 명령·결과·실패·검증 제한 기록.
+- 실패 접근/남은 범위: 최초 fullruntime의 기존 history test가 viewport와 live 입력 helper를 혼용해 1FAIL → 테스트의 viewport 근거를 native snapshot으로 교정. macOS footprint<RSS 가정 실패는 그대로 보고하며 관련 제품 코드 미변경. 승인된 기본backend 버그 수정 잔여 없음. 실험 Ghostty 등 live cell read를 제공하지 않는 backend의 scrolled admission은 허용을 보장하지 않음. 실제 사용자 CLI E2E/release/push/restart 없음. source/test0.12.1 유지; 다음 사용자용 artifact 배포는 last-shipped보다 높은 버전 및 binary/bundle 검증 필수.
+- 다음 정확한 명령: canonical cwd에서 `cat AGENTS.md`; `head -n 16 docs/CODEX_HANDOFF.md`; `git status --short`; `git log -2 --oneline`; `cat docs/qa/2026-10-14-composer-scroll-input.md`. 재검사가 필요하면 QA의 실제 명령 사용. scripts/dev-run.sh/앱 종료·launch는 현재 별도 명시 요청 없이 금지.
+
+---
+
 # 에이전트 연결 설정 시안 적용 — 완료, 2026-10-13 (Codex)
 
 - 현재 목표/상태: 사용자 승인 HTML 시안대로 에이전트 연결 설정 native UI 구현·코드 리뷰·실제 렌더 대조 완료. canonical `/Users/jr/Desktop/projects/deppy-sijo-performance`, 기존 branch 유지, baseline70380aea. 소스51b23890 및2fd73a5b(권한80px열/34px hitarea·중앙 정렬). 원래 dirty checkout 및 untracked active-work HTML 보존. push/restart/release 요청 없음.

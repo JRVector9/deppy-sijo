@@ -778,6 +778,53 @@ impl TerminalBackend for AlacrittyBackend {
         })
     }
 
+    fn input_snapshot(&self) -> Option<TerminalViewportSnapshot> {
+        let grid = self.term.grid();
+        let cols = grid.columns();
+        let rows = grid.screen_lines();
+        let colors = self.term.colors();
+        let mut cells = Vec::with_capacity(cols * rows);
+        let mut graphemes = Vec::new();
+        // Native screen rows are uncompressed. Read them directly without touching
+        // the viewport cache, render damage, or the history-query display budget.
+        for row in 0..rows {
+            let line = &grid[alacritty_terminal::index::Line(row as i32)];
+            for col in 0..cols {
+                let (cell, text) =
+                    snapshot_cell(&line[alacritty_terminal::index::Column(col)], colors);
+                if let Some(text) = text {
+                    graphemes.push(CellGrapheme {
+                        index: row * cols + col,
+                        text,
+                    });
+                }
+                cells.push(cell);
+            }
+        }
+        // A navigation/vi cursor is not the editor cursor that will receive input.
+        let cursor = grid.cursor.point;
+        let (shape, shape_visible) = map_cursor_shape(self.term.cursor_style().shape);
+        Some(TerminalViewportSnapshot {
+            cols: cols as u16,
+            rows: rows as u16,
+            cursor: CursorSnapshot {
+                col: cursor.column.0 as u16,
+                row: cursor.line.0.max(0) as u16,
+                shape,
+                visible: shape_visible
+                    && (0..rows as i32).contains(&cursor.line.0)
+                    && self.term.mode().contains(TermMode::SHOW_CURSOR),
+            },
+            visible_cells: cells.into(),
+            graphemes: crate::share_cell_graphemes(graphemes),
+            dirty_ranges: Vec::new(),
+            title: self.title(),
+            scroll_offset: 0,
+            is_alt_screen: self.term.mode().contains(TermMode::ALT_SCREEN),
+            history: Some(self.history_metadata_at(0)),
+        })
+    }
+
     fn viewport_snapshot(&self) -> Option<TerminalViewportSnapshot> {
         let cols = self.term.columns();
         let rows = self.term.screen_lines();
@@ -1514,6 +1561,34 @@ fn serialize_scrollback_bounded(
 mod tests {
     use super::*;
     use crate::backend::TerminalBackend;
+
+    #[test]
+    fn input_snapshot_uses_native_cursor_in_vi_mode_and_alternate_screen() {
+        let mut backend = AlacrittyBackend::new(80, 4, 100);
+        feed(&mut backend, "past output\r\n".repeat(20).as_bytes());
+        feed(
+            &mut backend,
+            "\x1b[2J\x1b[H› \x1b[2mAsk Codex\x1b[0m\r\x1b[2C".as_bytes(),
+        );
+        let live = backend.input_snapshot().unwrap();
+        backend.scroll(5);
+        backend.term.toggle_vi_mode();
+        let viewport = backend.viewport_snapshot().unwrap();
+        assert_eq!(viewport.scroll_offset, 5);
+        let input = backend.input_snapshot().unwrap();
+        assert_eq!(input.cursor, live.cursor);
+        assert_eq!(input.visible_cells, live.visible_cells);
+        assert_eq!(input.scroll_offset, 0);
+        assert_eq!(backend.viewport_snapshot().unwrap().cursor, viewport.cursor);
+
+        feed(&mut backend, "\x1b[?1049h\x1b[2J\x1b[H❯ draft".as_bytes());
+        let input = backend.input_snapshot().unwrap();
+        assert!(input.is_alt_screen);
+        assert_eq!(input.visible_cells[0].c, '❯');
+        assert_eq!(input.visible_cells[2].c, 'd');
+        assert_eq!((input.cursor.col, input.cursor.row), (7, 0));
+        assert!(input.cursor.visible);
+    }
 
     /// 스크롤백 메모리 산정 근거 — Cell/Row 크기와 라인당 바이트를 출력한다(수동).
     /// `cargo test -p terminal size_probe -- --ignored --nocapture`

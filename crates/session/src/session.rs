@@ -436,9 +436,9 @@ impl Session {
         Some(snapshot)
     }
 
-    /// One admission-time viewport read; does not consume dirty ranges or publish hidden panes.
+    /// One admission-time live-screen read; preserves scroll position and pending render damage.
     pub fn input_guard_snapshot(&self) -> Option<TerminalViewportSnapshot> {
-        self.backend.viewport_snapshot()
+        self.backend.input_snapshot()
     }
 
     /// Reads a source window without consuming native dirty ranges or moving its viewport.
@@ -855,6 +855,55 @@ fn dirty_rows_to_ranges(dirty_rows: &mut Vec<u16>, cols: u16, rows: u16) -> Vec<
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn input_guard_reads_live_screen_without_moving_or_consuming_scrolled_view() {
+        for (cols, rows) in [(80, 24), (500, 132)] {
+            let ansi = format!(
+                "{}\x1b[2J\x1b[H› \x1b[2mAsk Codex\x1b[0m\r\n한글\x1b[1;3H",
+                "past output\r\n".repeat(200),
+            );
+            let mut session = Session::restore_archived(
+                SessionId(1),
+                SessionKind::Agent,
+                cols,
+                rows,
+                1000,
+                Some(0),
+                &mut ansi.as_bytes(),
+            );
+            let live = session.input_guard_snapshot().unwrap();
+            assert_eq!(live.scroll_offset, 0);
+            session.scroll(i32::MAX);
+            let before = session.take_snapshot().unwrap();
+            assert!(before.scroll_offset > 0);
+            session
+                .replay_ansi(&mut b"\x1b[2;5Hchanged\x1b[1;3H".as_slice())
+                .unwrap();
+            assert!(session.dirty);
+            let input = session.input_guard_snapshot().unwrap();
+            assert!(
+                session.dirty,
+                "input inspection must preserve pending render damage"
+            );
+            assert_eq!(input.scroll_offset, 0);
+            assert_eq!((input.cols, input.rows), (cols, rows));
+            assert_eq!((input.cursor.col, input.cursor.row), (2, 0));
+            assert!(input.cursor.visible);
+            assert_eq!(input.visible_cells[0].c, '›');
+            assert!(
+                input.visible_cells[2]
+                    .attrs()
+                    .contains(terminal::CellAttrs::DIM)
+            );
+            assert_eq!(input.visible_cells[usize::from(cols)].c, '한');
+            assert_eq!(input.visible_cells[usize::from(cols) + 4].c, 'c');
+            let after = session.take_snapshot().unwrap();
+            assert_eq!(after.scroll_offset, before.scroll_offset);
+            assert_eq!(after.visible_cells, before.visible_cells);
+            assert!(!after.dirty_ranges.is_empty());
+        }
+    }
 
     struct SnapshotCountingBackend {
         inner: terminal::AlacrittyBackend,

@@ -248,13 +248,13 @@ impl AgentInputGuard {
         let Some(detector) = detector else {
             return self.deny("detector_unavailable");
         };
-        let snapshot = active.input_guard_snapshot();
-        if snapshot.as_ref().is_some_and(choice_dialog) {
+        let Some(snapshot) = active.input_guard_snapshot() else {
+            return self.deny("live_screen_unavailable");
+        };
+        if choice_dialog(&snapshot) {
             return self.deny("current_choice_dialog");
         }
-        let row = snapshot.as_ref().map_or(PromptRow::Unknown, |snapshot| {
-            prompt_row(snapshot, self.provider)
-        });
+        let row = prompt_row(&snapshot, self.provider);
         if self.intent != AgentInputIntent::ExplicitAppend
             && detector.has_input_draft()
             && !(self.intent == AgentInputIntent::ExplicitPrompt

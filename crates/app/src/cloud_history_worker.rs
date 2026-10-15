@@ -21,6 +21,7 @@ pub(crate) const MAX_BYTES: usize = 4 * 1024 * 1024;
 const SNAPSHOT_BYTES: usize = 3 * 1024 * 1024;
 pub(crate) const MAX_ARGS: usize = 64 * 1024;
 const RECEIPT_BYTES: usize = 2048;
+const COMPLETION_RECEIPT_BYTES: usize = 4096;
 
 pub(crate) enum Job {
     #[cfg_attr(
@@ -180,7 +181,30 @@ impl Job {
                 }
                 id.len() + connection_id.len() + receipt + message.len() + RECEIPT_BYTES + 1024
             }
-            Self::ClaimCompletion { .. } | Self::FinishCompletion { .. } => RECEIPT_BYTES,
+            Self::ClaimCompletion {
+                tool,
+                args,
+                identity,
+            } => {
+                identity.validate().ok()?;
+                let args = serde_json::to_vec(args).ok()?.len();
+                if args > MAX_ARGS || tool.len() > 64 {
+                    return None;
+                }
+                args + tool.len() + identity.encoded_len().ok()? + RECEIPT_BYTES + 1024
+            }
+            Self::FinishCompletion { identity, receipt } => {
+                identity.validate().ok()?;
+                if identity != &receipt.identity {
+                    return None;
+                }
+                let bytes = serde_json::to_vec(receipt).ok()?.len();
+                if bytes > COMPLETION_RECEIPT_BYTES {
+                    return None;
+                }
+                receipt.validate().ok()?;
+                identity.encoded_len().ok()? + bytes + 1024
+            }
             Self::Lookup { id, connection_id } => {
                 agent_mcp::operation_key(connection_id, id).ok()?;
                 id.len() + connection_id.len() + RECEIPT_BYTES + 1024
@@ -373,8 +397,19 @@ impl HistoryWorker {
                             db.finish_scoped(&id, &connection_id, &outcome, &message)
                                 .map_err(|_| ())
                         })),
-                        Job::ClaimCompletion { .. } => ResultKind::ClaimCompletion(Err(())),
-                        Job::FinishCompletion { .. } => ResultKind::FinishCompletion(Err(())),
+                        Job::ClaimCompletion {
+                            tool,
+                            args,
+                            identity,
+                        } => ResultKind::ClaimCompletion(db.as_ref().ok_or(()).and_then(|db| {
+                            db.claim_completion_scoped(&tool, &args, &identity)
+                                .map_err(|_| ())
+                        })),
+                        Job::FinishCompletion { identity, receipt } => {
+                            ResultKind::FinishCompletion(db.as_ref().ok_or(()).and_then(|db| {
+                                db.finish_completion(&identity, &receipt).map_err(|_| ())
+                            }))
+                        }
                         Job::Lookup { id, connection_id } => {
                             ResultKind::Lookup(db.as_ref().ok_or(()).and_then(|db| {
                                 db.get_operation(&id, &connection_id).map_err(|_| ())

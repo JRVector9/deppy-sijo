@@ -820,6 +820,7 @@ fn management_call(
         tool: tool.into(),
         args,
         reply,
+        deferred: None,
     };
     assert!(
         bridge

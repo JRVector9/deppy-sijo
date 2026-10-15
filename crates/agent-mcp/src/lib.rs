@@ -1,5 +1,11 @@
 //! Local, explicitly shared terminal MCP bridge. All effects stay on the App thread.
+mod completion;
 mod history;
+pub use completion::{
+    COMPLETION_RECEIPT_TTL, CompletionDeliveryEvent, CompletionDeliveryState, CompletionIdentity,
+    CompletionPermit, CompletionReceipt, CompletionScope, DeferredTransport,
+    MAX_COMPLETION_EVENT_BYTES, MAX_COMPLETION_RECEIPTS, MAX_COMPLETION_WATCHES,
+};
 mod management;
 mod oauth;
 mod principal;
@@ -159,5 +165,7 @@ pub fn tools() -> Value {
     json!({"tools":result})
 }
 
+#[cfg(test)]
+mod completion_tests;
 #[cfg(test)]
 mod tests;

@@ -1,6 +1,6 @@
 use super::*;
 
-fn completion_http(
+pub(super) fn completion_http(
     server: &Server,
     token: &str,
     method: &str,
@@ -33,20 +33,22 @@ fn completion_http(
     (status, head, String::from_utf8(body).unwrap())
 }
 
-fn completion_header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+pub(super) fn completion_header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
     head.lines().find_map(|line| {
         let (key, value) = line.split_once(':')?;
         key.eq_ignore_ascii_case(name).then_some(value.trim())
     })
 }
 
-fn completion_initialize(server: &Server, token: &str) -> String {
+pub(super) fn completion_initialize(server: &Server, token: &str) -> String {
     let (status, head, body) = completion_http(
         server,
         token,
         "POST",
         "",
-        Some(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"synthetic-completion-client","version":"1"}}})),
+        Some(
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"synthetic-completion-client","version":"1"}}}),
+        ),
     );
     assert_eq!(status, 200, "{body}");
     assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["id"], 1);

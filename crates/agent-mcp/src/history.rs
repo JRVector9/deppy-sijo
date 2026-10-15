@@ -105,6 +105,27 @@ fn record_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Record> {
     })
 }
 impl History {
+    pub fn claim_completion_scoped(
+        &self,
+        _tool: &str,
+        _args: &Value,
+        _identity: &crate::CompletionIdentity,
+    ) -> anyhow::Result<Claim> {
+        anyhow::bail!("completion_ledger_unavailable")
+    }
+    pub fn finish_completion(
+        &self,
+        _identity: &crate::CompletionIdentity,
+        _receipt: &crate::CompletionReceipt,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("completion_ledger_unavailable")
+    }
+    pub fn get_completion(
+        &self,
+        _identity: &crate::CompletionIdentity,
+    ) -> anyhow::Result<Option<crate::CompletionReceipt>> {
+        anyhow::bail!("completion_ledger_unavailable")
+    }
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         // Do not follow a user-controlled symlink to an unrelated DB.
         if let Ok(meta) = std::fs::symlink_metadata(path) {

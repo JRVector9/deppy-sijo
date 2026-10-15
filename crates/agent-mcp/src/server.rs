@@ -457,6 +457,7 @@ pub struct Request {
     pub tool: String,
     pub args: Value,
     pub reply: SyncSender<Result<Value, String>>,
+    pub deferred: Option<crate::DeferredTransport>,
 }
 impl Request {
     pub fn live(&self, auth: &Auth) -> bool {
@@ -468,6 +469,7 @@ pub struct Server {
     pub addr: SocketAddr,
     pub auth: Arc<Auth>,
     pub requests: Receiver<Request>,
+    pub delivery_events: Receiver<crate::CompletionDeliveryEvent>,
     stop: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
     public_host: Arc<std::sync::RwLock<String>>,
@@ -492,6 +494,11 @@ impl Server {
         let addr = listener.local_addr()?;
         let auth = Arc::new(Auth::with_redaction(now(), redaction));
         let stop = Arc::new(AtomicBool::new(false));
+        let (completion, delivery_events) = crate::completion::CompletionLane::new(
+            &auth,
+            stop.clone(),
+            auth.0.lock().unwrap().redaction.clone(),
+        );
         let (tx, requests) = mpsc::sync_channel(16);
         let (a, s, w) = (auth.clone(), stop.clone(), Arc::new(wake));
         let host = Arc::new(std::sync::RwLock::new(public_host.to_owned()));
@@ -526,18 +533,19 @@ impl Server {
                                 continue;
                             }
                             active.fetch_add(1, Ordering::AcqRel);
-                            let (a, tx, w, active, host) = (
+                            let (a, tx, w, active, host, completion) = (
                                 a.clone(),
                                 tx.clone(),
                                 w.clone(),
                                 active.clone(),
                                 host.clone(),
+                                completion.clone(),
                             );
                             thread::spawn(move || {
                                 let _ = stream.set_read_timeout(Some(REQUEST_TIMEOUT));
                                 let _ = stream.set_write_timeout(Some(REQUEST_TIMEOUT));
                                 let public = host.read().unwrap().clone();
-                                handle(&mut stream, addr, &public, &a, &tx, &*w);
+                                handle(&mut stream, addr, &public, &a, &tx, &*w, completion);
                                 active.fetch_sub(1, Ordering::AcqRel);
                             });
                         }
@@ -552,6 +560,7 @@ impl Server {
             addr,
             auth,
             requests,
+            delivery_events,
             stop,
             worker: Some(worker),
             public_host,
@@ -618,12 +627,24 @@ fn handle(
     auth: &Auth,
     tx: &SyncSender<Request>,
     wake: &dyn Fn(),
+    completion: Arc<crate::completion::CompletionLane>,
 ) {
     let mut metadata = ResponseMetadata {
         headers: Vec::new(),
         unread_bytes: MAX_UNREAD_REQUEST_BYTES,
+        completion: Some(completion.clone()),
+        deferred: None,
     };
     let response = process(stream, addr, public, auth, tx, wake, &mut metadata);
+    if let Some(id) = metadata.deferred {
+        if !stream
+            .try_clone()
+            .is_ok_and(|socket| completion.attach(&id, socket))
+        {
+            completion.abandon_reader(&id);
+        }
+        return;
+    }
     if http::write_response_with_headers(stream, &response, &metadata.headers).is_ok() {
         close_response(
             stream,
@@ -636,6 +657,8 @@ fn handle(
 struct ResponseMetadata {
     headers: Vec<(String, String)>,
     unread_bytes: usize,
+    completion: Option<Arc<crate::completion::CompletionLane>>,
+    deferred: Option<String>,
 }
 
 /// Closing a socket with an unread request body can reset it and discard the
@@ -813,15 +836,53 @@ fn process(
     else {
         return Response::plain(401, "invalid_or_expired_token");
     };
-    if head.method != "POST" {
-        return Response::plain(405, "POST_required; SSE_not_enabled");
-    }
     if head.header_count("mcp-protocol-version") > 1
         || head
             .header("mcp-protocol-version")
             .is_some_and(|v| !supported(v))
     {
         return Response::plain(400, "unsupported_protocol");
+    }
+    let owner = crate::completion::TransportOwner {
+        connection_id: principal.id.clone(),
+        epoch,
+        access_key: access_key.clone(),
+    };
+    if head.header_count("mcp-session-id") > 1 || head.header_count("last-event-id") > 1 {
+        return Response::plain(400, "invalid_transport_headers");
+    }
+    let transport_session = head.header("mcp-session-id").map(str::to_owned);
+    if let Some(session) = &transport_session
+        && !metadata
+            .completion
+            .as_ref()
+            .is_some_and(|lane| lane.owns_session(&owner, session))
+    {
+        return Response::plain(404, "transport_session_not_found");
+    }
+    if head.method == "GET" {
+        let Some(cursor) = head.header("last-event-id") else {
+            return Response::plain(405, "POST_required; resume_cursor_required");
+        };
+        if !head
+            .header("accept")
+            .is_some_and(|v| v.contains("text/event-stream"))
+        {
+            return Response::plain(400, "accept_event_stream_required");
+        }
+        let (Some(session), Some(lane)) = (&transport_session, &metadata.completion) else {
+            return Response::plain(404, "transport_stream_not_found");
+        };
+        return match lane.resume(&owner, session, cursor) {
+            Ok(id) => {
+                metadata.deferred = Some(id);
+                Response::plain(202, "")
+            }
+            Err(status) => Response::plain(status, "transport_stream_not_found"),
+        };
+    }
+    if head.method != "POST" {
+        return Response::plain(405, "POST_required");
     }
     if head.header_count("content-type") != 1
         || head
@@ -870,6 +931,15 @@ fn process(
     let result = match method {
         "initialize" => {
             auth.observe_initialize(&principal.id);
+            if transport_session.is_some() {
+                return Response::plain(400, "initialize_requires_new_transport_session");
+            }
+            if let Some(lane) = &metadata.completion {
+                let Some(session) = lane.initialize(owner.clone(), principal.expires_at) else {
+                    return Response::plain(503, "transport_session_capacity");
+                };
+                metadata.headers.push(("MCP-Session-Id".into(), session));
+            }
             let version = v["params"]["protocolVersion"].as_str().unwrap_or("");
             let version = if supported(version) {
                 version
@@ -921,6 +991,17 @@ fn process(
             }
             let connection_id = principal.id.clone();
             let (reply, rx) = mpsc::sync_channel(1);
+            let (handoff, deferred_rx) = mpsc::sync_channel(1);
+            let deferred = metadata
+                .completion
+                .as_ref()
+                .map(|lane| crate::DeferredTransport {
+                    lane: lane.clone(),
+                    owner,
+                    session: transport_session,
+                    request_id: id.clone(),
+                    handoff,
+                });
             let req = Request {
                 epoch,
                 access_key,
@@ -930,6 +1011,7 @@ fn process(
                 tool: tool.into(),
                 args,
                 reply,
+                deferred,
             };
             if tx.try_send(req).is_err() {
                 auth.end_call(&connection_id, poll, epoch);
@@ -937,14 +1019,41 @@ fn process(
                 return tool_response(id, Err("busy_no_effect".into()));
             }
             wake();
-            let result = rx.recv_timeout(Duration::from_secs(3)).unwrap_or_else(|_| {
-                Err(if poll {
-                    "timeout_no_effect"
-                } else {
-                    "outcome_unknown_do_not_retry_input"
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let result = loop {
+                if let Ok(stream) = deferred_rx.try_recv()
+                    && let Some(lane) = &metadata.completion
+                {
+                    auth.end_call(&connection_id, poll, epoch);
+                    if lane.begin(&stream, rx) {
+                        metadata.deferred = Some(stream);
+                        return Response::plain(202, "");
+                    }
+                    return tool_response(id, Err("completion_transport_closed_no_effect".into()));
                 }
-                .into())
-            });
+                match rx.recv_timeout(Duration::from_millis(5)) {
+                    Ok(result) => break result,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        // Reserve sends its handoff before the App may drop/send its reply.
+                        if deferred_rx.try_recv().is_ok() {
+                            return tool_response(
+                                id,
+                                Err("completion_transport_closed_no_effect".into()),
+                            );
+                        }
+                        break Err("outcome_unknown_do_not_retry_input".into());
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) if Instant::now() < deadline => {}
+                    Err(_) => {
+                        break Err(if poll {
+                            "timeout_no_effect"
+                        } else {
+                            "outcome_unknown_do_not_retry_input"
+                        }
+                        .into());
+                    }
+                }
+            };
             auth.end_call(&connection_id, poll, epoch);
             if result
                 .as_ref()
@@ -959,13 +1068,14 @@ fn process(
     json_response(json!({"jsonrpc":"2.0","id":id,"result":result}))
 }
 fn tool_response(id: Value, result: Result<Value, String>) -> Response {
+    json_response(tool_rpc_value(id, result))
+}
+pub(crate) fn tool_rpc_value(id: Value, result: Result<Value, String>) -> Value {
     let error = result.is_err() || result.as_ref().is_ok_and(tool_payload_is_error);
     let payload = crate::protocol::normalize_tool_payload(
         result.unwrap_or_else(|error| crate::protocol::error_payload(&error)),
     );
-    json_response(
-        json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":payload.to_string()}],"isError":error}}),
-    )
+    json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":payload.to_string()}],"isError":error}})
 }
 fn tool_payload_is_error(value: &Value) -> bool {
     value.get("error").is_some() || matches!(value["status"].as_str(), Some("rejected" | "unknown"))
@@ -1022,6 +1132,8 @@ mod deadline_tests {
             let mut metadata = ResponseMetadata {
                 headers: Vec::new(),
                 unread_bytes: MAX_UNREAD_REQUEST_BYTES,
+                completion: None,
+                deferred: None,
             };
             assert_eq!(
                 process(&mut stream, addr, "", &auth, &tx, &|| {}, &mut metadata).status,

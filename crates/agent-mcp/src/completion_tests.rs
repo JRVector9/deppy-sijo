@@ -1,0 +1,344 @@
+use super::*;
+use std::{
+    io::{BufRead, BufReader, Read, Write},
+    net::{Shutdown, TcpStream},
+    time::{Duration, Instant},
+};
+
+fn scope(operation: &str) -> CompletionScope {
+    CompletionScope {
+        workspace: "synthetic-workspace".into(),
+        session_id: format!("synthetic-session-{operation}"),
+        generation: "synthetic-generation".into(),
+        operation_id: operation.into(),
+        run_id: Some("synthetic-run".into()),
+    }
+}
+fn identity(operation: &str) -> CompletionIdentity {
+    CompletionIdentity {
+        connection_id: "synthetic-actor".into(),
+        transport_session_id: uuid::Uuid::new_v4().to_string(),
+        stream_id: uuid::Uuid::new_v4().to_string(),
+        request_id: json!(77),
+        auth_epoch: 1,
+        scope: scope(operation),
+    }
+}
+fn receipt(identity: CompletionIdentity) -> CompletionReceipt {
+    let at = now();
+    CompletionReceipt {
+        event_id: identity.event_id(),
+        identity,
+        admission: json!({"status":"queued","admission":"pty_queue","completion":"not_confirmed"}),
+        outcome: json!({"status":"completed","local_turn_completed":true,"source":"verified_native_turn","observed_at":at}),
+        created_at: at,
+        completed_at: Some(at),
+        expires_at: at + COMPLETION_RECEIPT_TTL,
+    }
+}
+fn post(server: &Server, token: &str, session: &str, operation: &str) -> TcpStream {
+    let mut socket = TcpStream::connect(server.addr).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let body = json!({"jsonrpc":"2.0","id":77,"method":"tools/call","params":{"name":"send_text","arguments":{"session_id":scope(operation).session_id,"generation":"synthetic-generation","operation_id":operation,"text":"synthetic prompt","submit":true}}}).to_string();
+    write!(socket, "POST /mcp HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {token}\r\nMCP-Session-Id: {session}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", server.addr, body.len()).unwrap();
+    socket
+}
+fn next_request(server: &Server) -> Request {
+    server
+        .requests
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap()
+}
+fn sse_head(socket: TcpStream) -> BufReader<TcpStream> {
+    let mut reader = BufReader::new(socket);
+    let mut head = String::new();
+    loop {
+        let mut line = String::new();
+        assert!(reader.read_line(&mut line).unwrap() > 0);
+        head.push_str(&line);
+        assert!(head.len() <= 8192);
+        if line == "\r\n" {
+            break;
+        }
+    }
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(
+        crate::tests::completion_header(&head, "content-type"),
+        Some("text/event-stream")
+    );
+    reader
+}
+fn event(reader: &mut impl BufRead) -> String {
+    let mut value = String::new();
+    while !value.ends_with("\n\n") {
+        let mut line = String::new();
+        assert!(
+            reader.read_line(&mut line).unwrap() > 0,
+            "SSE ended before event: {value}"
+        );
+        value.push_str(&line);
+        assert!(value.len() <= MAX_COMPLETION_EVENT_BYTES);
+    }
+    value
+}
+fn resume(server: &Server, token: &str, session: &str, cursor: &str) -> TcpStream {
+    let mut socket = TcpStream::connect(server.addr).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    write!(socket, "GET /mcp HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {token}\r\nMCP-Session-Id: {session}\r\nLast-Event-ID: {cursor}\r\nAccept: text/event-stream\r\n\r\n", server.addr).unwrap();
+    socket
+}
+
+#[test]
+fn completion_stream_fast_final_uses_original_post_and_owned_replay() {
+    let server = Server::start(0, "", || {}).unwrap();
+    let token = server.auth.token_for_user();
+    let session = crate::tests::completion_initialize(&server, &token);
+    let socket = post(&server, &token, &session, "fast");
+    let req = next_request(&server);
+    let identity = req
+        .deferred
+        .as_ref()
+        .unwrap()
+        .reserve(scope("fast"), CompletionPermit::new())
+        .unwrap();
+    let expected = receipt(identity.clone());
+    expected.validate().unwrap();
+    // The final result may already be available when the HTTP worker sees handoff.
+    req.reply.try_send(Ok(expected.tool_result())).unwrap();
+    let mut reader = sse_head(socket);
+    let prime = event(&mut reader);
+    assert!(prime.contains(&format!("id: {}:0\n", identity.stream_id)));
+    let final_event = event(&mut reader);
+    assert!(final_event.contains(&format!("id: {}\n", expected.event_id)));
+    let response: Value = serde_json::from_str(
+        final_event
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(response["id"], 77);
+    let payload: Value =
+        serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(payload["local_completion"]["local_turn_completed"], true);
+    let mut eof = String::new();
+    reader.read_to_string(&mut eof).unwrap();
+    assert!(eof.is_empty());
+    let mut replay = sse_head(resume(
+        &server,
+        &token,
+        &session,
+        &format!("{}:0", identity.stream_id),
+    ));
+    event(&mut replay);
+    assert_eq!(
+        event(&mut replay),
+        final_event,
+        "same durable event ID and original request ID"
+    );
+    let foreign_session = crate::tests::completion_initialize(&server, &token);
+    assert_eq!(
+        crate::tests::completion_http(
+            &server,
+            &token,
+            "GET",
+            &format!(
+                "MCP-Session-Id: {foreign_session}\r\nLast-Event-ID: {}:0\r\n",
+                identity.stream_id
+            ),
+            None
+        )
+        .0,
+        404
+    );
+    assert!(
+        server.requests.try_recv().is_err(),
+        "replay must not enqueue input"
+    );
+}
+
+#[test]
+fn completion_stream_disconnect_retains_original_receiver_and_revoke_blocks_replay() {
+    let server = Server::start(0, "", || {}).unwrap();
+    let token = server.auth.token_for_user();
+    let session = crate::tests::completion_initialize(&server, &token);
+    let socket = post(&server, &token, &session, "disconnect");
+    let req = next_request(&server);
+    let permit = CompletionPermit::new();
+    let identity = req
+        .deferred
+        .as_ref()
+        .unwrap()
+        .reserve(scope("disconnect"), permit.clone())
+        .unwrap();
+    let mut reader = sse_head(socket);
+    event(&mut reader);
+    reader.get_ref().shutdown(Shutdown::Both).unwrap();
+    drop(reader);
+    req.reply
+        .try_send(Ok(receipt(identity.clone()).tool_result()))
+        .unwrap();
+    let end = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Ok(event) = server
+            .delivery_events
+            .recv_timeout(Duration::from_millis(50))
+            && event.identity == identity
+            && event.state == CompletionDeliveryState::Disconnected
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < end,
+            "original disconnect must release the reader without dropping its result"
+        );
+    }
+    let mut replay = sse_head(resume(
+        &server,
+        &token,
+        &session,
+        &format!("{}:0", identity.stream_id),
+    ));
+    event(&mut replay);
+    assert!(event(&mut replay).contains("local_turn_completed"));
+    permit.revoke();
+    assert_eq!(
+        crate::tests::completion_http(
+            &server,
+            &token,
+            "GET",
+            &format!(
+                "MCP-Session-Id: {session}\r\nLast-Event-ID: {}:0\r\n",
+                identity.stream_id
+            ),
+            None
+        )
+        .0,
+        404
+    );
+    assert!(server.requests.try_recv().is_err());
+}
+
+#[test]
+fn completion_stream_waits_do_not_consume_http_or_actor_call_budgets() {
+    let server = Server::start(0, "", || {}).unwrap();
+    let token = server.auth.token_for_user();
+    let session = crate::tests::completion_initialize(&server, &token);
+    let mut held = Vec::new();
+    for index in 0..5 {
+        let op = format!("wait-{index}");
+        let socket = post(&server, &token, &session, &op);
+        let req = next_request(&server);
+        req.deferred
+            .as_ref()
+            .unwrap()
+            .reserve(scope(&op), CompletionPermit::new())
+            .unwrap();
+        let mut reader = sse_head(socket);
+        event(&mut reader);
+        held.push((reader, req.reply));
+    }
+    let (status, _, body) = crate::tests::completion_http(
+        &server,
+        &token,
+        "POST",
+        &format!("MCP-Session-Id: {session}\r\n"),
+        Some(json!({"jsonrpc":"2.0","id":99,"method":"ping"})),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["id"], 99);
+    assert_eq!(held.len(), 5);
+}
+
+#[test]
+fn completion_ledger_atomic_claim_capacity_preserves_no_effect() {
+    let db = History::open_memory().unwrap();
+    for index in 0..MAX_COMPLETION_WATCHES {
+        let id = identity(&format!("op-{index}"));
+        assert_eq!(
+            db.claim_completion_scoped("send_text", &json!({"text":"synthetic"}), &id)
+                .unwrap(),
+            Claim::New
+        );
+    }
+    let rejected = identity("over-capacity");
+    assert!(
+        db.claim_completion_scoped("send_text", &json!({"text":"synthetic"}), &rejected)
+            .is_err()
+    );
+    assert!(
+        db.get_operation("over-capacity", &rejected.connection_id)
+            .unwrap()
+            .is_none(),
+        "capacity rejection must roll back the operation claim too"
+    );
+}
+
+#[test]
+fn completion_ledger_final_is_immutable_private_and_preserves_public_admission() {
+    let db = History::open_memory().unwrap();
+    let id = identity("immutable");
+    let expected = receipt(id.clone());
+    db.claim_completion_scoped("send_text", &json!({"text":"synthetic"}), &id)
+        .unwrap();
+    db.finish_completion(&id, &expected).unwrap();
+    db.finish_completion(&id, &expected).unwrap();
+    assert_eq!(db.get_completion(&id).unwrap(), Some(expected.clone()));
+    let ordinary = db
+        .get_operation("immutable", &id.connection_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        ordinary, expected.admission,
+        "get_operation is admission-only even after final completion"
+    );
+    assert!(ordinary.get("event_id").is_none());
+    let mut wrong = id.clone();
+    wrong.transport_session_id = uuid::Uuid::new_v4().to_string();
+    assert!(db.get_completion(&wrong).unwrap().is_none());
+    assert!(
+        db.finish_completion(&wrong, &receipt(wrong.clone()))
+            .is_err()
+    );
+    let mut changed = expected;
+    changed.outcome = json!({"status":"completed","source":"different-proof"});
+    assert!(db.finish_completion(&id, &changed).is_err());
+}
+
+#[test]
+fn completion_ledger_restart_marks_pending_unknown_without_changing_admission() {
+    let directory =
+        std::env::temp_dir().join(format!("deppy-completion-ledger-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&directory).unwrap();
+    let path = directory.join("synthetic.sqlite");
+    let id = identity("restart");
+    let admission = receipt(id.clone()).admission;
+    {
+        let db = History::open(&path).unwrap();
+        db.claim_completion_scoped("send_text", &json!({"text":"synthetic"}), &id)
+            .unwrap();
+        db.finish_scoped("restart", &id.connection_id, &admission, "")
+            .unwrap();
+    }
+    {
+        let restored = History::open(&path).unwrap();
+        let result = restored
+            .get_completion(&id)
+            .unwrap()
+            .expect("pending original identity needs an explicit restart outcome");
+        assert_eq!(result.outcome["status"], "unknown");
+        assert_eq!(result.event_id, id.event_id());
+        assert_eq!(
+            restored
+                .get_operation("restart", &id.connection_id)
+                .unwrap(),
+            Some(admission)
+        );
+    }
+    std::fs::remove_file(path).unwrap();
+    std::fs::remove_dir(directory).unwrap();
+}

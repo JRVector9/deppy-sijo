@@ -551,11 +551,13 @@ fn validate_event(event: &RuntimeEvent) -> Result<(), &'static str> {
             return Err("agent_config_id가 비었거나 상한/NUL 규칙 위반");
         }
         RuntimeEvent::SessionInputAccepted {
+            session,
             sequence,
             operation_id,
             at_micros,
             ..
-        } if *sequence == 0
+        } if session.0 == 0
+            || *sequence == 0
             || *at_micros <= 0
             || operation_id.as_deref().is_some_and(|id| {
                 id.strip_prefix('@').unwrap_or(id).is_empty()
@@ -3183,7 +3185,7 @@ mod tests {
         ] {
             assert!(
                 validate_event(&invalid).is_err(),
-                "invalid accepted input evidence"
+                "invalid accepted input evidence must be rejected"
             );
         }
     }

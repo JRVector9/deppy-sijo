@@ -244,6 +244,10 @@ impl AgentInputGuard {
         active: &session::Session,
         detector: Option<&session::StatusDetector>,
     ) -> bool {
+        if self.intent == AgentInputIntent::TrackedPrompt && self.provider != AgentPromptKind::Codex
+        {
+            return self.deny("tracked_prompt_provider_unsupported");
+        }
         if active.foreground_process_group() != Some(self.foreground_process_group) {
             return self.deny("foreground_changed");
         }
@@ -287,6 +291,10 @@ impl AgentInputGuard {
             PromptRow::Empty => true,
             PromptRow::Draft if self.intent == AgentInputIntent::ExplicitAppend => true,
             PromptRow::Draft => self.deny("visible_input_draft"),
+            PromptRow::Placeholder if self.intent == AgentInputIntent::TrackedPrompt => true,
+            PromptRow::Unknown if self.intent == AgentInputIntent::TrackedPrompt => {
+                self.deny("tracked_prompt_editor_unverified")
+            }
             PromptRow::Placeholder | PromptRow::Unknown
                 if self.intent != AgentInputIntent::AutomaticPrompt =>
             {

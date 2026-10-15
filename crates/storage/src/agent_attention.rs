@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 const STATE_BYTES_MAX: usize = 32 * 1024;
 const REQUESTS_MAX: usize = 64;
+const NATIVE_PROMPT_DIGEST_TTL_MICROS: i64 = 60 * 60 * 1_000_000;
 
 /// Full submitted UTF-8 prompt, with terminal line endings canonicalized only.
 /// Never use the shortened, whitespace-normalized display title for this evidence.
@@ -35,7 +36,8 @@ pub struct NativeTurnProof {
     pub turn_id: String,
     pub started_at_micros: i64,
     pub start_execution_stamp: HookExecutionStamp,
-    pub prompt_digest: String,
+    #[serde(default)]
+    pub prompt_digest: Option<String>,
     pub transcript_path: String,
     pub completed: Option<NativeTurnCompletionProof>,
     pub completion_revision: i64,
@@ -81,11 +83,9 @@ impl NativeTurnProof {
             && self.started_at_micros >= self.session_generation
             && self.start_execution_stamp.is_valid()
             && self.start_execution_stamp.runtime_instance == self.runtime_instance
-            && self.prompt_digest.len() == 64
-            && self
-                .prompt_digest
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
+            && self.prompt_digest.as_deref().is_none_or(|digest| {
+                digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
             && valid_native_transcript_path(&self.transcript_path, &self.native_session_id)
             && self.completed.as_ref().is_none_or(|end| {
                 end.at_micros >= self.started_at_micros
@@ -116,47 +116,76 @@ struct NativeTurnObservation<'a> {
     transcript_path: &'a str,
 }
 
-/// Bounded global projection. Called inside the existing attention snapshot transaction.
+/// Retired sessions are included; ordinary UI fields and revisions are never changed.
+/// The caller throttles this globally bounded maintenance to once per minute per Db.
+pub(super) fn scrub_native_prompt_digests_in(
+    tx: &rusqlite::Transaction<'_>,
+    now_micros: i64,
+) -> anyhow::Result<()> {
+    let cutoff = now_micros.saturating_sub(NATIVE_PROMPT_DIGEST_TTL_MICROS);
+    tx.execute(
+        "UPDATE agent_needs_input SET attention_json=json_set(attention_json,'$.native_turn_proof.prompt_digest',NULL)
+         WHERE rowid IN (
+           SELECT rowid FROM agent_needs_input
+           WHERE CASE WHEN typeof(attention_json)='text'
+               AND length(CAST(attention_json AS BLOB))<=32768 AND json_valid(attention_json)
+             THEN json_type(attention_json,'$.native_turn_proof.prompt_digest')='text'
+               AND json_type(attention_json,'$.native_turn_proof.started_at_micros')='integer'
+               AND json_extract(attention_json,'$.native_turn_proof.started_at_micros')>0
+               AND json_extract(attention_json,'$.native_turn_proof.started_at_micros')<=?1
+             ELSE 0 END
+           LIMIT 256
+         )",
+        [cutoff],
+    )?;
+    Ok(())
+}
+
+/// Exact requested-key projection; malformed optional evidence is omitted, never fatal to UI.
 pub(super) fn native_turn_proofs_in(
     tx: &rusqlite::Transaction<'_>,
+    keys: &[String],
     budget: usize,
 ) -> anyhow::Result<Vec<NativeTurnProof>> {
-    const MAX: usize = 256;
-    const SELECT: &str = "SELECT session_key, attention_json FROM agent_needs_input
-        WHERE instr(attention_json,'\"native_turn_proof\":{')>0 ORDER BY session_key LIMIT 257";
-    let (count, bytes, largest, key_bytes): (i64, i64, i64, i64) = tx.query_row(
-        &format!("SELECT count(*),coalesce(sum(length(CAST(attention_json AS BLOB))),0),coalesce(max(length(CAST(attention_json AS BLOB))),0),coalesce(max(length(CAST(session_key AS BLOB))),0) FROM ({SELECT})"),
-        [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    if keys.is_empty() || budget < std::mem::size_of::<NativeTurnProof>() {
+        return Ok(Vec::new());
+    }
+    let mut result = Vec::new();
+    let mut stmt = tx.prepare(
+        "SELECT CASE WHEN typeof(attention_json)='text'
+        AND length(CAST(attention_json AS BLOB))<=32768 THEN attention_json ELSE NULL END
+        FROM agent_needs_input WHERE session_key=?1",
     )?;
-    anyhow::ensure!(
-        count >= 0
-            && count as usize <= MAX
-            && largest <= STATE_BYTES_MAX as i64
-            && key_bytes <= BOUNDED_ID_BYTES_MAX as i64
-            && bytes >= 0
-            && bytes as usize <= budget,
-        "native_turn_projection_limit"
-    );
-    let mut result = Vec::with_capacity(count as usize);
-    let mut stmt = tx.prepare(SELECT)?;
-    let mut rows = stmt.query([])?;
-    while let Some(row) = rows.next()? {
-        let key: String = row.get(0)?;
-        let state: AttentionState = serde_json::from_str(&row.get::<_, String>(1)?)
-            .map_err(|_| anyhow::anyhow!("native_turn_projection_invalid"))?;
+    for key in keys {
+        let Some(json) = stmt
+            .query_row([key], |row| row.get::<_, Option<String>>(0))
+            .optional()?
+            .flatten()
+        else {
+            continue;
+        };
+        let Ok(state) = serde_json::from_str::<AttentionState>(&json) else {
+            continue;
+        };
         let Some(proof) = state.native_turn_proof else {
             continue;
         };
-        anyhow::ensure!(
-            proof.is_valid()
-                && proof.session_key == key
-                && state.runtime_instance.as_deref() == Some(&proof.runtime_instance)
-                && state.native_session_id == proof.native_session_id
-                && state.generation == proof.session_generation
-                && state.current_turn.as_ref() == Some(&proof.turn_id),
-            "native_turn_projection_invalid"
-        );
+        if !(proof.is_valid()
+            && proof.session_key == *key
+            && state.runtime_instance.as_deref() == Some(&proof.runtime_instance)
+            && state.native_session_id == proof.native_session_id
+            && state.generation == proof.session_generation
+            && state.current_turn.as_ref() == Some(&proof.turn_id))
+        {
+            continue;
+        }
         result.push(proof);
+        let mut retained = 0;
+        if checked_native_turn_retained_bytes(&mut retained, &result).is_err() || retained > budget
+        {
+            result.pop();
+            result.shrink_to_fit();
+        }
     }
     Ok(result)
 }
@@ -913,7 +942,7 @@ impl Db {
                         turn_id: turn.clone(),
                         started_at_micros: event.at_micros,
                         start_execution_stamp: observation.stamp.clone(),
-                        prompt_digest: digest.to_owned(),
+                        prompt_digest: Some(digest.to_owned()),
                         transcript_path: observation.transcript_path.to_owned(),
                         completed: None,
                         completion_revision: revision,
@@ -924,7 +953,10 @@ impl Db {
                     };
                     if let Some(previous) = previous_proof.filter(|previous| {
                         previous.turn_id == *turn
-                            && previous.prompt_digest == digest
+                            && previous
+                                .prompt_digest
+                                .as_deref()
+                                .is_none_or(|old| old == digest)
                             && previous.runtime_instance == proof.runtime_instance
                             && previous.transcript_path == proof.transcript_path
                     }) {
@@ -1475,7 +1507,10 @@ mod tests {
         let snapshot = db.apply_agent_state_job(&job).unwrap();
         let proof = &snapshot.native_turns[0];
         assert_eq!(proof.turn_id, "own-turn");
-        assert_eq!(proof.prompt_digest, digest);
+        assert!(
+            proof.prompt_digest.is_none(),
+            "old temporary digest has expired"
+        );
         assert_eq!(proof.started_at_micros, 2);
         assert_eq!(proof.completed.as_ref().unwrap().at_micros, 3);
         assert_eq!(proof.completion_revision, revision);
@@ -1577,7 +1612,11 @@ mod tests {
         let digest = native_prompt_digest("full prompt");
         let selected = format!("{workspace}:258");
         for pane in 1..=258 {
-            let key = format!("{workspace}:{pane}");
+            let key = if pane == 258 {
+                selected.clone()
+            } else {
+                format!("{}:1", uuid::Uuid::from_u128(1000 + pane))
+            };
             for (kind, at) in [
                 (AttentionEventKind::SessionStart, 1),
                 (AttentionEventKind::TurnStart, 2),

@@ -77,6 +77,7 @@ impl std::fmt::Debug for EnvValue {
 pub struct Db {
     conn: Connection,
     authorization_db_identity: String,
+    native_digest_cleanup_at: std::cell::Cell<Option<i64>>,
 }
 
 pub use crate::task_prompt::{task_prompt_is_displayable, task_prompt_text};
@@ -2790,6 +2791,10 @@ fn canonicalize_agent_state_job(job: &mut AgentStateJob) {
         canonicalize_agent_state_string(workspace_id);
     }
     canonicalize_agent_state_vec(&mut job.structured_workspace_ids);
+    for key in &mut job.native_turn_keys {
+        canonicalize_agent_state_string(key);
+    }
+    canonicalize_agent_state_vec(&mut job.native_turn_keys);
 
     if let Some(reconcile) = &mut job.binding_reconcile {
         for pane_id in &mut reconcile.live_pane_ids {
@@ -2906,6 +2911,10 @@ fn agent_state_job_retained_bytes(
     for workspace_id in &job.structured_workspace_ids {
         checked_agent_state_string_capacity(&mut total, workspace_id)?;
     }
+    checked_agent_state_vec_allocation(&mut total, &job.native_turn_keys)?;
+    for key in &job.native_turn_keys {
+        checked_agent_state_string_capacity(&mut total, key)?;
+    }
     if let Some(reconcile) = &job.binding_reconcile {
         checked_agent_state_vec_allocation(&mut total, &reconcile.live_pane_ids)?;
         for pane_id in &reconcile.live_pane_ids {
@@ -2985,11 +2994,11 @@ fn checked_native_turn_retained_bytes(
             &proof.runtime_instance,
             &proof.native_session_id,
             &proof.turn_id,
-            &proof.prompt_digest,
             &proof.transcript_path,
         ] {
             checked_agent_state_string_capacity(total, value)?;
         }
+        checked_agent_state_optional_string_capacity(total, &proof.prompt_digest)?;
         for stamp in std::iter::once(&proof.start_execution_stamp)
             .chain(proof.completed.as_ref().map(|end| &end.execution_stamp))
         {
@@ -3119,6 +3128,17 @@ fn validate_agent_state_job(job: &AgentStateJob) -> anyhow::Result<String> {
     let workspace_prefix = format!("{}:", job.workspace_id);
 
     let mut retained_input_bytes = job.workspace_id.len();
+    anyhow::ensure!(job.native_turn_keys.len() <= 256, AGENT_STATE_INPUT_INVALID);
+    let mut native_keys = std::collections::HashSet::with_capacity(job.native_turn_keys.len());
+    for key in &job.native_turn_keys {
+        anyhow::ensure!(
+            bounded_session_key_prefix(key).is_ok() && native_keys.insert(key.as_str()),
+            AGENT_STATE_INPUT_INVALID
+        );
+        retained_input_bytes = retained_input_bytes
+            .checked_add(key.len())
+            .ok_or_else(|| anyhow::anyhow!(AGENT_STATE_INPUT_INVALID))?;
+    }
     anyhow::ensure!(
         !job.structured_workspace_ids.is_empty()
             && job.structured_workspace_ids.len() <= AGENT_STATE_STRUCTURED_WORKSPACE_MAX,
@@ -5583,6 +5603,7 @@ impl Db {
         Ok(Self {
             conn,
             authorization_db_identity,
+            native_digest_cleanup_at: std::cell::Cell::new(None),
         })
     }
 
@@ -5592,6 +5613,7 @@ impl Db {
         Ok(Self {
             conn,
             authorization_db_identity: format!("memory:{}", uuid::Uuid::new_v4()),
+            native_digest_cleanup_at: std::cell::Cell::new(None),
         })
     }
 
@@ -8941,16 +8963,7 @@ impl Db {
         } else {
             None
         };
-        let native_turns = if job.include_attention {
-            agent_attention::native_turn_proofs_in(&tx, job.snapshot_bytes_max)?
-        } else {
-            Vec::new()
-        };
-        let mut native_turn_bytes = 0;
-        checked_native_turn_retained_bytes(&mut native_turn_bytes, &native_turns)
-            .map_err(|_| anyhow::anyhow!(AGENT_STATE_SNAPSHOT_INVALID))?;
         let logical_retained_bytes = [
-            native_turn_bytes,
             idle_probe
                 .as_ref()
                 .map_or(0, |(probe, _, _)| probe.retained_bytes),
@@ -8992,6 +9005,29 @@ impl Db {
             logical_retained_bytes <= job.snapshot_bytes_max,
             AGENT_STATE_SNAPSHOT_INVALID
         );
+        let digest_cleanup_at = snapshot_epoch
+            .filter(|now| {
+                job.include_attention
+                    && self
+                        .native_digest_cleanup_at
+                        .get()
+                        .is_none_or(|last| *now >= last.saturating_add(60))
+            })
+            .filter(|now| now.checked_mul(1_000_000).is_some())
+            .filter(|now| {
+                agent_attention::scrub_native_prompt_digests_in(&tx, *now * 1_000_000).is_ok()
+            });
+        let native_turns = if job.include_attention {
+            agent_attention::native_turn_proofs_in(
+                &tx,
+                &job.native_turn_keys,
+                job.snapshot_bytes_max
+                    .saturating_sub(logical_retained_bytes),
+            )
+            .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
 
         let hook_sessions = if let Some((hook_probe, _, sql_limit, snapshot_epoch)) =
             &hook_status_probes
@@ -9451,14 +9487,22 @@ impl Db {
                 return Err(error.into());
             }
         }
-        let actual_retained_bytes = agent_state_snapshot_retained_bytes(&snapshot)
+        let mut actual_retained_bytes = agent_state_snapshot_retained_bytes(&snapshot)
             .map_err(|_| anyhow::anyhow!(AGENT_STATE_SNAPSHOT_INVALID))?;
+        if actual_retained_bytes > job.snapshot_bytes_max && !snapshot.native_turns.is_empty() {
+            snapshot.native_turns = Vec::new();
+            actual_retained_bytes = agent_state_snapshot_retained_bytes(&snapshot)
+                .map_err(|_| anyhow::anyhow!(AGENT_STATE_SNAPSHOT_INVALID))?;
+        }
         anyhow::ensure!(
             actual_retained_bytes <= job.snapshot_bytes_max,
             AGENT_STATE_SNAPSHOT_INVALID
         );
         tx.commit()
             .map_err(|_| anyhow::anyhow!(AGENT_STATE_PERSIST_FAILED))?;
+        if let Some(now) = digest_cleanup_at {
+            self.native_digest_cleanup_at.set(Some(now));
+        }
         Ok(snapshot)
     }
 

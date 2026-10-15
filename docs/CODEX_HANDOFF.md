@@ -1,3 +1,12 @@
+# 최종 인계 — 제품 완료, 증거 PR236
+
+- 제품 구현·교차리뷰·실제 검증·main 반영·0.13.0 package 검증은 모두 완료됐다. 제품PR235/main0b54b888, 검증headfa2c2489. 상세명령/수치/미검증범위는 바로아래와 QAguide/package-result.json을 기준으로 한다. 새제품수정·재빌드·재실행은 필요하지 않다.
+- 이 문서 snapshot 시점 최종 evidence-only **PR236** (`docs/cloud-completion-release-verified-20261015`) CI/main반영중. 독립 GPT-6.1-Sol/xhigh 최종문서검토는 근거불일치없음, 이전3개문서지적해결, evidence42개SHA일치를확인했다. source/Cargo/앱변경없음.
+- Current objective/remaining: PR236의 실제검사확인후merge하고완료보고만 남음. 다음agent는 `gh pr view 236 --repo JRVector9/deppy-sijo --json state,headRefOid,statusCheckRollup,mergeCommit` 먼저실행. 이미MERGED이면 제품작업을반복하지말것. OPEN이면 exacthead의실행검사성공과 docs-onlymacOS SKIPPED를구분해확인후 `gh pr merge 236 --repo JRVector9/deppy-sijo --merge --match-head-commit <headRefOid>`; fetch/ff로동기화. merge후외부PR상태가이snapshot보다최신권위다.
+- Current checkout docs branch, clean commit예정; 원 dirty worktree는그대로보존. source/version/artifact는앞선productcommit동일. 기존PTY CI1flaky와local5PASS/실provider·SSE터널제한을최종보고에서숨기지말것. 모든Cargo/SDK/package는종료했고 앱은실행하지않음.
+
+---
+
 # 클라우드 자동 완료 반환 — main·0.13.0 빌드 완료, 최종 증거 문서 반영 중
 
 - Current objective: 승인된 feature 구현/교차리뷰/실제 테스트/PR235 main merge/0.13.0 사용자용 local-development 빌드 검증 완료. 이제 최종 evidence-only 문서를 main에 반영하고 완료 보고. 앱 stop/launch/restart 권한 없음, 실제로 하지 않음.
